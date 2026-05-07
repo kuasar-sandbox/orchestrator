@@ -14,7 +14,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-BIN="$REPO_ROOT/bin"
+BIN="${BIN:-$REPO_ROOT/bin}"
 
 skip() {
     echo

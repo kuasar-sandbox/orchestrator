@@ -9,7 +9,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-BIN="$PROJECT_ROOT/bin"
+BIN="${BIN:-$PROJECT_ROOT/bin}"
 TMPDIR=$(mktemp -d /tmp/acc-cache-e2e-XXXXXX)
 KEY=$(openssl rand -hex 32)
 

@@ -10,7 +10,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-BIN="$PROJECT_ROOT/bin"
+BIN="${BIN:-$PROJECT_ROOT/bin}"
 WORKDIR=$(mktemp -d /tmp/acc-dedup-XXXXXX)
 STORE="$WORKDIR/store"
 KEY=$(openssl rand -hex 32)
