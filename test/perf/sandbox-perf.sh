@@ -21,8 +21,8 @@ set -uo pipefail
 
 ITERS="${PERF_ITERS:-5}"
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-SRC_BIN="$REPO_ROOT/bin"
-BIN_CACHE="${PERF_BIN_CACHE:-/tmp/perf-bin}"
+SRC_BIN="${BIN:-$REPO_ROOT/bin}"
+BIN_CACHE="${PERF_BIN_CACHE:-/tmp/perf-bin-$(uname -m)}"
 OUT="${PERF_OUT:-$REPO_ROOT/test/results/sandbox-perf.txt}"
 SCENARIOS="${PERF_SCENARIOS:-cold cold-manifest}"
 
