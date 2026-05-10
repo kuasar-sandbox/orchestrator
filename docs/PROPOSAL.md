@@ -802,7 +802,7 @@ SnapStart：同一 Manifest，恢复 N 次。Warm Pool：每个 Manifest 恢复�
 
 **职责**：提供轻量 VM 运行环境，包括 VMM 选型与定制、Guest 启动模型和确定性配置。是块设备代理（§6.9）、快照代理（§6.10）和密度控制器（§6.12）的运行基础。
 
-> 实施层面详见 `docs/sandbox-design.md`（sandbox-ctl 控制平面、vhost-user-blk Go backend、uffd handler、sandbox-init Guest PID 1、CH patch 范围、sandbox.snapshot 文件格式）。
+> 实施层面详见 `docs/sandbox.md`（sandbox-ctl 控制平面、vhost-user-blk Go backend、uffd handler、sandbox-init Guest PID 1、CH patch 范围、`<sid>.snapshot` 文件格式）。
 
 **VMM 选型**：候选为 Firecracker 和 Cloud Hypervisor，均基于 Rust / rust-vmm crates，代码规模相当（~50k 行），均使用 KVM 硬件虚拟化。方案核心能力要求与两者现状：
 
