@@ -66,11 +66,13 @@ ensure_image() {
 STORE_PORT=$(free_port)
 cat > "$WORKDIR/store-ctl.yaml" <<EOF
 listen: 127.0.0.1:$STORE_PORT
-root: $STORE
-generation: G1
-verify_content_key: true
+backend: fs
+fs:
+  root: $STORE
+  verify_content_key: true
 EOF
-"$BIN/store-ctl" serve --config "$WORKDIR/store-ctl.yaml" >"$STORE_LOG" 2>&1 &
+"$BIN/store-ctl" init --config "$WORKDIR/store-ctl.yaml" --generation G1 >>"$STORE_LOG" 2>&1
+"$BIN/store-ctl" serve --config "$WORKDIR/store-ctl.yaml" >>"$STORE_LOG" 2>&1 &
 STORE_PID=$!
 # Poll the gRPC port for readiness.
 for i in 1 2 3 4 5; do

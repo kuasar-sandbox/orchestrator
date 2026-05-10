@@ -40,6 +40,13 @@ SRC_BIN="${BIN:-$REPO_ROOT/bin}"
 BIN_CACHE="${PERF_BIN_CACHE:-/tmp/perf-bin-$(uname -m)}"
 OUT="${PERF_OUT:-$REPO_ROOT/test/results/sandbox-perf-manifest.txt}"
 IMAGE="${IMAGE:-python:3.12-slim}"
+# Self-elevate: tap creation, cgroup writes, vsock all need root. Done
+# here (after prereq checks) so /dev/kvm-missing and missing-binary cases
+# still fast-fail without prompting for sudo.
+if [ "$(id -u)" -ne 0 ]; then
+    exec sudo -nE "$0" "$@"
+fi
+
 TAP_NAME="${TAP_NAME:-sb-tap0}"
 
 mkdir -p "$(dirname "$OUT")"
@@ -68,8 +75,15 @@ require "$BIN/manifest-ctl"
 require "$BIN/flatten-ctl"
 require "$VMLINUX"
 
-ip link show "$TAP_NAME" >/dev/null 2>&1 || { echo "TAP $TAP_NAME missing" >&2; exit 1; }
 [ "$(id -u)" -eq 0 ] || { echo "must run as root" >&2; exit 1; }
+TAP_CREATED_BY_TEST=0
+if ! ip link show "$TAP_NAME" >/dev/null 2>&1; then
+    [ "$(id -u)" -eq 0 ] || { echo "$0: must run as root to create $TAP_NAME" >&2; exit 1; }
+    ip tuntap add dev "$TAP_NAME" mode tap
+    ip addr add 169.254.1.0/31 dev "$TAP_NAME"
+    ip link set "$TAP_NAME" up
+    TAP_CREATED_BY_TEST=1
+fi
 
 # Defensive: any prior failed run may have left CH zombies attached
 # to the TAP. Clean them up before we start. (Use a unique CH binary
@@ -90,6 +104,7 @@ cleanup() {
         wait "$pid" 2>/dev/null
     done
     if [ -n "${PERF_KEEP:-}" ]; then echo "kept: $WORK" >&2; else rm -rf "$WORK"; fi
+    [ "$TAP_CREATED_BY_TEST" = "1" ] && ip link del "$TAP_NAME" 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -370,9 +385,9 @@ run_cold_iter() {
         t0=$(date +%s%N)
         timeout 90 "$BIN/sandbox-ctl" run \
             --config "$d/sandbox.yaml" \
-            --accelerator-config "$WORK/accelerator.yaml" \
+            --manifest-config "$WORK/accelerator.yaml" \
             --ch-binary "$BIN/cloud-hypervisor" \
-            --runtime-root "$d/runtime" \
+            --run-dir "$d/runtime" \
             --sandbox-id "perf-c-$i" \
             --stats-json "$stats" \
             > "$log" 2>&1
@@ -432,9 +447,9 @@ start_long_sandbox() {
         rm -f "$log"
         "$BIN/sandbox-ctl" run \
             --config "$d/sandbox.yaml" \
-            --accelerator-config "$WORK/accelerator.yaml" \
+            --manifest-config "$WORK/accelerator.yaml" \
             --ch-binary "$BIN/cloud-hypervisor" \
-            --runtime-root "$d/runtime" \
+            --run-dir "$d/runtime" \
             --sandbox-id "$sid" \
             > "$log" 2>&1 &
         sbpid=$!
@@ -481,7 +496,7 @@ run_upload_iter() {
         --sandbox-id "$(basename "$d" | sed 's/long-//')" \
         --output "$out" \
         --upload \
-        --runtime-root "$d/runtime" \
+        --run-dir "$d/runtime" \
         --resume=true 2>"$snap_log")
     local t_end=$(date +%s%N)
     local wall_ms
@@ -531,9 +546,9 @@ run_restore_iter() {
         "$BIN/sandbox-ctl" restore \
             --snapshot "manifest://$snap_key" \
             --config "$d/host.yaml" \
-            --accelerator-config "$WORK/accelerator.yaml" \
+            --manifest-config "$WORK/accelerator.yaml" \
             --ch-binary "$BIN/cloud-hypervisor" \
-            --runtime-root "$d/runtime" \
+            --run-dir "$d/runtime" \
             --sandbox-id "perf-r-$tag-$i" \
             --stats-json "$stats" \
             > "$log" 2>&1 &

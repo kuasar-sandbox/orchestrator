@@ -7,11 +7,11 @@
 #   2. Cold-start sandbox running a python TICK counter (file:// blk0)
 #   3. Wait for TICK 10 in stdout
 #   4. sandbox-ctl snapshot --upload  → emits snapshot manifest key
-#   5. Tear down sandbox
-#   6. sandbox-ctl restore --snapshot manifest://<hex> + accelerator-config
-#   7. Verify restored sandbox reaches TICK > snapshot tick (vCPU resumed)
-#   8. Snapshot again with --upload → second-pass dedup ratio
-#   9. Print perf metrics: dedup ratio, lazy-load ratio, restore wallclock
+#      (--resume=false default destroys sandbox after dump)
+#   5. sandbox-ctl run --restore manifest://<hex> + manifest-config
+#   6. Verify restored sandbox reaches TICK > snapshot tick (vCPU resumed)
+#   7. Snapshot again with --upload → second-pass dedup ratio
+#   8. Print perf metrics: dedup ratio, lazy-load ratio, restore wallclock
 
 set -euo pipefail
 
@@ -34,8 +34,22 @@ for b in cloud-hypervisor sandbox-ctl sandbox-init sandbox-runtime.erofs flatten
 done
 VMLINUX="${VMLINUX:-$BIN/vmlinux}"
 [ -f "$VMLINUX" ] || skip "no vmlinux at $VMLINUX"
+# Self-elevate: tap creation, cgroup writes, vsock all need root. Done
+# here (after prereq checks) so /dev/kvm-missing and missing-binary cases
+# still fast-fail without prompting for sudo.
+if [ "$(id -u)" -ne 0 ]; then
+    exec sudo -nE "$0" "$@"
+fi
+
 TAP_NAME="${TAP_NAME:-sb-tap0}"
-ip link show "$TAP_NAME" >/dev/null 2>&1 || skip "TAP $TAP_NAME missing"
+TAP_CREATED_BY_TEST=0
+if ! ip link show "$TAP_NAME" >/dev/null 2>&1; then
+    [ "$(id -u)" -eq 0 ] || { echo "$0: must run as root to create $TAP_NAME" >&2; exit 1; }
+    ip tuntap add dev "$TAP_NAME" mode tap
+    ip addr add 169.254.1.0/31 dev "$TAP_NAME"
+    ip link set "$TAP_NAME" up
+    TAP_CREATED_BY_TEST=1
+fi
 [ "$(id -u)" -eq 0 ] || skip "must run as root (cgroup + uffd)"
 
 WORK="$(mktemp -d /tmp/e2e-snap-upload-XXXXXX)"
@@ -46,6 +60,7 @@ cleanup() {
         wait "$pid" 2>/dev/null || true
     done
     if [ -n "${E2E_KEEP:-}" ]; then echo "kept: $WORK"; else rm -rf "$WORK"; fi
+    [ "$TAP_CREATED_BY_TEST" = "1" ] && ip link del "$TAP_NAME" 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -173,9 +188,9 @@ SID1="up1-$$"
 mkdir -p "$WORK/runtime/$SID1"
 "$BIN/sandbox-ctl" run \
     --config "$WORK/sandbox.yaml" \
-    --accelerator-config "$WORK/accelerator.yaml" \
+    --manifest-config "$WORK/accelerator.yaml" \
     --ch-binary "$BIN/cloud-hypervisor" \
-    --runtime-root "$WORK/runtime" \
+    --run-dir "$WORK/runtime" \
     --sandbox-id "$SID1" \
     > "$LOG1" 2>&1 &
 SBPID1=$!
@@ -195,10 +210,8 @@ SNAP1_LOG="$WORK/snap1.log"
 T_UP1_BEG=$(date +%s%N)
 SNAP_MKEY=$("$BIN/sandbox-ctl" snapshot \
     --sandbox-id "$SID1" \
-    --output "$WORK/snap1-out" \
     --upload \
-    --runtime-root "$WORK/runtime" \
-    --resume=false 2>"$SNAP1_LOG")
+    --run-dir "$WORK/runtime" 2>"$SNAP1_LOG")
 T_UP1_END=$(date +%s%N)
 UP1_MS=$(( (T_UP1_END - T_UP1_BEG) / 1000000 ))
 
@@ -206,7 +219,7 @@ UP1_MS=$(( (T_UP1_END - T_UP1_BEG) / 1000000 ))
 echo "==> upload OK in ${UP1_MS} ms; snapshot manifest key=$SNAP_MKEY"
 cat "$SNAP1_LOG" | sed 's/^/    /'
 
-kill -TERM "$SBPID1" 2>/dev/null || true
+# --resume=false (default) shuts CH down; sandbox-ctl run1 returns naturally.
 wait "$SBPID1" 2>/dev/null || true
 
 # ---- restore from manifest:// ------------------------------------------------
@@ -217,10 +230,9 @@ DIFF_RESTORE="$WORK/runtime/blk1-restore.diff"
 truncate -s 1G "$DIFF_RESTORE"
 mkfs.ext4 -q -F "$DIFF_RESTORE"
 
+# Restore-mode sandbox.yaml: capacity / runtime / base auto-derived
+# from snapshot.cfg per docs §11.0; only network + overlay.diff required.
 cat > "$WORK/host.yaml" <<EOF
-resources:
-  capacity:    { cpu: 1, memory: 512MiB }
-  allocatable: { cpu: 1, memory: 512MiB }
 network:
   tap: $TAP_NAME
   interface: eth0
@@ -229,27 +241,22 @@ network:
 boot:
   kernel: file://$VMLINUX
   runtime: file://$BIN/sandbox-runtime.erofs
-  cmdline: "console=hvc0 printk.time=1"
   root:
-    base: file://$BLK0_EROFS
     overlay:
       diff: file://$DIFF_RESTORE
       size: 1GiB
-launch:
-  args: ["-c", "import time; time.sleep(60)"]
-  restart: never
 EOF
 
 LOG2="$WORK/run2.log"
 SID2="up2-$$"
 mkdir -p "$WORK/runtime/$SID2"
 T_RES_BEG=$(date +%s%N)
-"$BIN/sandbox-ctl" restore \
-    --snapshot "manifest://$SNAP_MKEY" \
+"$BIN/sandbox-ctl" run \
+    --restore "manifest://$SNAP_MKEY" \
     --config "$WORK/host.yaml" \
-    --accelerator-config "$WORK/accelerator.yaml" \
+    --manifest-config "$WORK/accelerator.yaml" \
     --ch-binary "$BIN/cloud-hypervisor" \
-    --runtime-root "$WORK/runtime" \
+    --run-dir "$WORK/runtime" \
     --sandbox-id "$SID2" \
     > "$LOG2" 2>&1 &
 SBPID2=$!
@@ -284,10 +291,8 @@ SNAP2_LOG="$WORK/snap2.log"
 T_UP2_BEG=$(date +%s%N)
 SNAP2_MKEY=$("$BIN/sandbox-ctl" snapshot \
     --sandbox-id "$SID2" \
-    --output "$WORK/snap2-out" \
     --upload \
-    --runtime-root "$WORK/runtime" \
-    --resume=false 2>"$SNAP2_LOG")
+    --run-dir "$WORK/runtime" 2>"$SNAP2_LOG")
 T_UP2_END=$(date +%s%N)
 UP2_MS=$(( (T_UP2_END - T_UP2_BEG) / 1000000 ))
 
@@ -295,7 +300,7 @@ UP2_MS=$(( (T_UP2_END - T_UP2_BEG) / 1000000 ))
 echo "==> upload #2 OK in ${UP2_MS} ms; snapshot manifest key=$SNAP2_MKEY"
 cat "$SNAP2_LOG" | sed 's/^/    /'
 
-kill -TERM "$SBPID2" 2>/dev/null || true
+# --resume=false destroys sandbox; sandbox-ctl run2 returns.
 wait "$SBPID2" 2>/dev/null || true
 
 # ---- perf summary --------------------------------------------------------
@@ -308,10 +313,10 @@ echo "    snapshot --upload #1 wallclock:  ${UP1_MS} ms"
 echo "    restore manifest:// → first TICK: ${RESTORE_MS} ms"
 echo "    snapshot --upload #2 wallclock:  ${UP2_MS} ms (same content, expect high dedup)"
 echo
-echo "    snap1 dedup line: $(grep -oE 'snapshot total=[0-9]+ dedup=[0-9]+' $SNAP1_LOG | head -1)"
-echo "    snap1 disk dedup: $(grep -oE 'disk total=[0-9]+ dedup=[0-9]+' $SNAP1_LOG | head -1)"
-echo "    snap2 dedup line: $(grep -oE 'snapshot total=[0-9]+ dedup=[0-9]+' $SNAP2_LOG | head -1)"
-echo "    snap2 disk dedup: $(grep -oE 'disk total=[0-9]+ dedup=[0-9]+' $SNAP2_LOG | head -1)"
+echo "    snap1 dedup line:   $(grep -oE 'snapshot total=[0-9]+ dedup=[0-9]+' $SNAP1_LOG | head -1)"
+echo "    snap1 overlay dedup: $(grep -oE 'overlay total=[0-9]+ dedup=[0-9]+' $SNAP1_LOG | head -1)"
+echo "    snap2 dedup line:   $(grep -oE 'snapshot total=[0-9]+ dedup=[0-9]+' $SNAP2_LOG | head -1)"
+echo "    snap2 overlay dedup: $(grep -oE 'overlay total=[0-9]+ dedup=[0-9]+' $SNAP2_LOG | head -1)"
 
 echo
 echo "==> e2e_sandbox_upload_restore: OK"

@@ -51,8 +51,22 @@ for b in cloud-hypervisor sandbox-ctl sandbox-init sandbox-runtime.erofs flatten
 done
 VMLINUX="${VMLINUX:-$BIN/vmlinux}"
 [ -f "$VMLINUX" ] || skip "no vmlinux at $VMLINUX"
+# Self-elevate: tap creation, cgroup writes, vsock all need root. Done
+# here (after prereq checks) so /dev/kvm-missing and missing-binary cases
+# still fast-fail without prompting for sudo.
+if [ "$(id -u)" -ne 0 ]; then
+    exec sudo -nE "$0" "$@"
+fi
+
 TAP_NAME="${TAP_NAME:-sb-tap0}"
-ip link show "$TAP_NAME" >/dev/null 2>&1 || skip "TAP $TAP_NAME missing"
+TAP_CREATED_BY_TEST=0
+if ! ip link show "$TAP_NAME" >/dev/null 2>&1; then
+    [ "$(id -u)" -eq 0 ] || { echo "$0: must run as root to create $TAP_NAME" >&2; exit 1; }
+    ip tuntap add dev "$TAP_NAME" mode tap
+    ip addr add 169.254.1.0/31 dev "$TAP_NAME"
+    ip link set "$TAP_NAME" up
+    TAP_CREATED_BY_TEST=1
+fi
 command -v docker >/dev/null 2>&1 || skip "docker not on PATH"
 command -v mkfs.ext4 >/dev/null 2>&1 || skip "mkfs.ext4 not on PATH"
 command -v python3 >/dev/null 2>&1 || skip "python3 not on PATH"
@@ -65,6 +79,7 @@ cleanup() {
         wait "$pid" 2>/dev/null || true
     done
     if [ -n "${E2E_KEEP:-}" ]; then echo "kept: $WORK"; else rm -rf "$WORK"; fi
+    [ "$TAP_CREATED_BY_TEST" = "1" ] && ip link del "$TAP_NAME" 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -229,7 +244,16 @@ for i in $(seq 1 "$N"); do
     cat > "$WORK/sb-$i.yaml" <<EOF
 resources:
   capacity:    { cpu: 2, memory: 8GiB }
-  allocatable: { cpu: 0.1, memory: 128MiB }
+  # 1 GiB allocatable (overridable via WARMPOOL_ALLOCATABLE_MEM) gives
+  # python:3.12-slim and the host-side cgroup enough headroom on dev
+  # hosts. Production target spec (128 MiB) lives in
+  # e2e_sandbox_cold_target.sh; this test focuses on dedup quality and
+  # does not exercise the resource-tight path.
+  # cpu must equal capacity.cpu unless a cgroup_path is set; the dedup
+  # test exercises the snapshot/quiesce path, not CPU-resource control,
+  # so setting fractional cpu here just requires extra cgroup wiring
+  # (provisioned in e2e_sandbox_cold_target.sh). Match capacity here.
+  allocatable: { cpu: 2, memory: ${WARMPOOL_ALLOCATABLE_MEM:-1GiB} }
 network:
   tap: $TAP_NAME
   interface: eth0
@@ -238,7 +262,11 @@ network:
 boot:
   kernel: file://$VMLINUX
   runtime: file://$BIN/sandbox-runtime.erofs
-  cmdline: "console=hvc0 printk.time=1"
+  # nokaslr + norandmaps disable kernel/user ASLR. Required for the
+  # PROPOSAL §4 ">90% dedup" target — without them the kernel image
+  # base + user mmap layout differ per boot, defeating chunk-level
+  # cross-instance dedup.
+  cmdline: "console=hvc0 printk.time=1 nokaslr norandmaps"
   root:
     base: file://$BLK0_EROFS
     overlay:
@@ -253,9 +281,9 @@ EOF
     echo "    cold-starting (sid=$SID)"
     "$BIN/sandbox-ctl" run \
         --config "$WORK/sb-$i.yaml" \
-        --accelerator-config "$WORK/accelerator.yaml" \
+        --manifest-config "$WORK/accelerator.yaml" \
         --ch-binary "$BIN/cloud-hypervisor" \
-        --runtime-root "$WORK/runtime" \
+        --run-dir "$WORK/runtime" \
         --sandbox-id "$SID" \
         > "$LOG" 2>&1 &
     SBPID=$!
@@ -283,7 +311,7 @@ EOF
         --sandbox-id "$SID" \
         --output "$WORK/snap-$i-out" \
         --upload \
-        --runtime-root "$WORK/runtime" \
+        --run-dir "$WORK/runtime" \
         --resume=false 2>"$SNAP_LOG")
     [ ${#SNAP_MKEY} -eq 64 ] || { echo "FAIL: bad SNAP_MKEY for sandbox $i: '$SNAP_MKEY'"; cat "$SNAP_LOG"; exit 1; }
     SNAP_MKEYS[i]="$SNAP_MKEY"

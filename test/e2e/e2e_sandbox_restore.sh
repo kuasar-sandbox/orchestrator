@@ -3,13 +3,14 @@
 # e2e_sandbox_restore.sh — chained:
 #   1. Cold-start sandbox running a python TICK counter
 #   2. Wait until counter reaches a known value (e.g. TICK 10)
-#   3. snapshot the sandbox to <out>/sandbox.snapshot + disk.ext4
-#   4. Tear down the sandbox
-#   5. restore from the snapshot — vCPU should resume the counter
-#   6. Confirm the restored process keeps counting from where it
+#   3. snapshot the sandbox to <out>/<sid>.snapshot + <sha256>.overlay
+#      (--resume=false default destroys sandbox after dump)
+#   4. Run --restore=<file> to resume; vCPU should resume the counter
+#   5. Confirm the restored process keeps counting from where it
 #      stopped (TICK 10+, increases over time)
 #
-# This validates that vCPU + memory + disk all restored correctly.
+# This validates that vCPU + memory + disk all restored correctly via
+# the unified `sandbox-ctl run --restore=` path.
 
 set -euo pipefail
 
@@ -29,12 +30,26 @@ for b in cloud-hypervisor sandbox-ctl sandbox-init sandbox-runtime.erofs flatten
 done
 VMLINUX="${VMLINUX:-$BIN/vmlinux}"
 [ -f "$VMLINUX" ] || skip "no vmlinux at $VMLINUX"
+# Self-elevate: tap creation, cgroup writes, vsock all need root. Done
+# here (after prereq checks) so /dev/kvm-missing and missing-binary cases
+# still fast-fail without prompting for sudo.
+if [ "$(id -u)" -ne 0 ]; then
+    exec sudo -nE "$0" "$@"
+fi
+
 TAP_NAME="${TAP_NAME:-sb-tap0}"
-ip link show "$TAP_NAME" >/dev/null 2>&1 || skip "TAP $TAP_NAME missing"
+TAP_CREATED_BY_TEST=0
+if ! ip link show "$TAP_NAME" >/dev/null 2>&1; then
+    [ "$(id -u)" -eq 0 ] || { echo "$0: must run as root to create $TAP_NAME" >&2; exit 1; }
+    ip tuntap add dev "$TAP_NAME" mode tap
+    ip addr add 169.254.1.0/31 dev "$TAP_NAME"
+    ip link set "$TAP_NAME" up
+    TAP_CREATED_BY_TEST=1
+fi
 if [ "$(id -u)" -ne 0 ]; then skip "must run as root"; fi
 
 WORK="$(mktemp -d /tmp/e2e-restore-XXXXXX)"
-trap '[ -n "${E2E_KEEP:-}" ] && echo "kept: $WORK" || rm -rf "$WORK"' EXIT
+trap '[ -n "${E2E_KEEP:-}" ] && echo "kept: $WORK" || rm -rf "$WORK"; [ "$TAP_CREATED_BY_TEST" = "1" ] && ip link del "$TAP_NAME" 2>/dev/null; true' EXIT
 
 IMAGE="${IMAGE:-python:3.12-slim}"
 BLK0_IMAGE="${BLK0_IMAGE:-}"
@@ -84,7 +99,7 @@ mkdir -p "$RUNTIME_ROOT/$SID1"
 "$BIN/sandbox-ctl" run \
     --config "$WORK/sandbox.yaml" \
     --ch-binary "$BIN/cloud-hypervisor" \
-    --runtime-root "$RUNTIME_ROOT" \
+    --run-dir "$RUNTIME_ROOT" \
     --sandbox-id "$SID1" \
     > "$LOG1" 2>&1 &
 SBPID1=$!
@@ -105,17 +120,18 @@ PRE_SNAP_TICK=$(grep -oE "^TICK [0-9]+" "$LOG1" | tail -1 | awk '{print $2}')
 echo "==> guest at TICK $PRE_SNAP_TICK; taking snapshot"
 
 OUT="$WORK/snap-out"
+mkdir -p "$OUT"
 "$BIN/sandbox-ctl" snapshot \
     --sandbox-id "$SID1" \
     --output "$OUT" \
-    --runtime-root "$RUNTIME_ROOT" \
-    --resume=false 2>&1 | tee "$WORK/snap.log"
+    --run-dir "$RUNTIME_ROOT" 2>&1 | tee "$WORK/snap.log"
 
-# Tear down run1.
-kill -TERM "$SBPID1" 2>/dev/null || true
+# --resume=false (default) shuts CH down via /vm.shutdown; sandbox-ctl
+# run1 returns naturally. wait() not kill().
 wait "$SBPID1" 2>/dev/null || true
 
-[ -f "$OUT/sandbox.snapshot" ] || { echo "FAIL: no snapshot file"; exit 1; }
+SNAP_FILE="$OUT/$SID1.snapshot"
+[ -f "$SNAP_FILE" ] || { echo "FAIL: no $SID1.snapshot"; ls -la "$OUT"; exit 1; }
 
 # Restore — needs a fresh blk1.diff (the snapshotted disk goes in as
 # overlay base; new run gets a clean diff).
@@ -123,10 +139,11 @@ DIFF_RESTORE="$WORK/runtime/blk1-restore.diff"
 truncate -s 1G "$DIFF_RESTORE"
 mkfs.ext4 -q -F "$DIFF_RESTORE"
 
+# Host yaml for restore: capacity/runtime/base/overlay.base must match
+# snapshot.cfg per docs §11.0. Easiest is to omit them — applyrules
+# will auto-fill from snapshot.cfg using the bundle dir to resolve
+# basenames. We only need network.tap and overlay.diff.
 cat > "$WORK/host.yaml" <<EOF
-resources:
-  capacity:    { cpu: 1, memory: 512MiB }
-  allocatable: { cpu: 1, memory: 512MiB }
 network:
   tap: $TAP_NAME
   interface: eth0
@@ -135,25 +152,21 @@ network:
 boot:
   kernel: file://$VMLINUX
   runtime: file://$BIN/sandbox-runtime.erofs
-  cmdline: "console=hvc0 printk.time=1"
   root:
     base: file://$BLK0_IMAGE
     overlay:
       diff: file://$DIFF_RESTORE
       size: 1GiB
-launch:
-  args: ["-c", "import time; time.sleep(60)"]
-  restart: never
 EOF
 
 LOG2="$WORK/run2.log"
 SID2="r2-$$"
 mkdir -p "$RUNTIME_ROOT/$SID2"
-"$BIN/sandbox-ctl" restore \
-    --snapshot "$OUT/sandbox.snapshot" \
+"$BIN/sandbox-ctl" run \
+    --restore "$SNAP_FILE" \
     --config "$WORK/host.yaml" \
     --ch-binary "$BIN/cloud-hypervisor" \
-    --runtime-root "$RUNTIME_ROOT" \
+    --run-dir "$RUNTIME_ROOT" \
     --sandbox-id "$SID2" \
     > "$LOG2" 2>&1 &
 SBPID2=$!
@@ -163,7 +176,7 @@ WANT_TICK=$((PRE_SNAP_TICK + 3))
 for i in $(seq 1 600); do
     if grep -qE "^TICK $WANT_TICK[[:space:]]*$" "$LOG2" 2>/dev/null; then break; fi
     if ! kill -0 "$SBPID2" 2>/dev/null; then
-        echo "==> sandbox-ctl restore exited early"; tail -50 "$LOG2"; exit 1
+        echo "==> sandbox-ctl run --restore exited early"; tail -50 "$LOG2"; exit 1
     fi
     sleep 0.05
 done
@@ -180,3 +193,4 @@ else
     tail -40 "$LOG2"
     exit 1
 fi
+

@@ -111,6 +111,32 @@ EOF
 
 COMMON="--config $TMPDIR/accelerator.yaml"
 
+# manifest-ctl no longer accepts --cache-endpoint flag override. Build a
+# variant of the YAML with a specific cache.endpoint on demand and pass
+# --config to manifest-ctl explicitly.
+accel_cfg_for_cache() {
+    local ep="$1"
+    local out="$TMPDIR/accelerator-cache-$(echo "$ep" | tr ':.' '__').yaml"
+    cat > "$out" <<EOF
+manifest:
+  key: "$KEY"
+store:
+  endpoint: 127.0.0.1:$STORE_PORT
+  pool: 2
+  timeout: 5s
+chunk:
+  mode: cdc
+crypto:
+  chunk: aes
+  manifest: aes
+cache:
+  endpoint: $ep
+  pool: 2
+  timeout: 5s
+EOF
+    echo "$out"
+}
+
 # Store test data via store-ctl.
 echo ""
 echo "=== Ingest test data (via store-ctl) ==="
@@ -245,7 +271,7 @@ PIDS+=($!)
 wait_ready "127.0.0.1:$TIERED_HEALTH_PORT"
 
 # Load via cache (first read — cold, fills embedded from origin).
-"$BIN/manifest-ctl" load $COMMON --cache-endpoint "127.0.0.1:$TIERED_PORT" \
+"$BIN/manifest-ctl" load --config "$(accel_cfg_for_cache "127.0.0.1:$TIERED_PORT")" \
     --manifest "$TMPDIR/test.manifest" --output "$TMPDIR/test-cached.bin" --no-progress 2>&1
 CACHED_HASH=$(sha256sum "$TMPDIR/test-cached.bin" | awk '{print $1}')
 assert_eq "$ORIG_HASH" "$CACHED_HASH" "tiered load roundtrip (cold)"
@@ -253,7 +279,7 @@ assert_eq "$ORIG_HASH" "$CACHED_HASH" "tiered load roundtrip (cold)"
 # ============================================================
 echo ""
 echo "=== Test 6: tiered mode — warm read (second load hits embedded cache) ==="
-"$BIN/manifest-ctl" load $COMMON --cache-endpoint "127.0.0.1:$TIERED_PORT" \
+"$BIN/manifest-ctl" load --config "$(accel_cfg_for_cache "127.0.0.1:$TIERED_PORT")" \
     --manifest "$TMPDIR/test.manifest" --output "$TMPDIR/test-warm.bin" --no-progress 2>&1
 WARM_HASH=$(sha256sum "$TMPDIR/test-warm.bin" | awk '{print $1}')
 assert_eq "$ORIG_HASH" "$WARM_HASH" "tiered load roundtrip (warm)"
@@ -348,7 +374,7 @@ PIDS+=($!)
 wait_ready "127.0.0.1:$EC_TIERED_HEALTH_PORT"
 
 # Load through EC tiered cache.
-"$BIN/manifest-ctl" load $COMMON --cache-endpoint "127.0.0.1:$EC_TIERED_PORT" \
+"$BIN/manifest-ctl" load --config "$(accel_cfg_for_cache "127.0.0.1:$EC_TIERED_PORT")" \
     --manifest "$TMPDIR/test.manifest" --output "$TMPDIR/test-ec.bin" --no-progress 2>&1
 EC_HASH=$(sha256sum "$TMPDIR/test-ec.bin" | awk '{print $1}')
 assert_eq "$ORIG_HASH" "$EC_HASH" "tiered+EC load roundtrip"
@@ -361,7 +387,7 @@ SHARD1_PID_IDX=3
 kill "${PIDS[$SHARD1_PID_IDX]}" 2>/dev/null; wait "${PIDS[$SHARD1_PID_IDX]}" 2>/dev/null || true
 
 # Second load (warm from embedded + EC with 1 node down — should still work).
-"$BIN/manifest-ctl" load $COMMON --cache-endpoint "127.0.0.1:$EC_TIERED_PORT" \
+"$BIN/manifest-ctl" load --config "$(accel_cfg_for_cache "127.0.0.1:$EC_TIERED_PORT")" \
     --manifest "$TMPDIR/test.manifest" --output "$TMPDIR/test-ec-1down.bin" --no-progress 2>&1
 DOWN1_HASH=$(sha256sum "$TMPDIR/test-ec-1down.bin" | awk '{print $1}')
 assert_eq "$ORIG_HASH" "$DOWN1_HASH" "tiered+EC load with 1 shard down"
@@ -432,7 +458,7 @@ wait_ready "127.0.0.1:$FRONT_HEALTH_PORT"
 
 # Cold read through front: fill chain runs all the way to origin and
 # writes back through upstream into remote.
-"$BIN/manifest-ctl" load $COMMON --cache-endpoint "127.0.0.1:$FRONT_PORT" \
+"$BIN/manifest-ctl" load --config "$(accel_cfg_for_cache "127.0.0.1:$FRONT_PORT")" \
     --manifest "$TMPDIR/test.manifest" --output "$TMPDIR/test-upstream.bin" --no-progress 2>&1
 UP_HASH=$(sha256sum "$TMPDIR/test-upstream.bin" | awk '{print $1}')
 assert_eq "$ORIG_HASH" "$UP_HASH" "upstream tier read-through (cold)"
@@ -441,7 +467,7 @@ assert_eq "$ORIG_HASH" "$UP_HASH" "upstream tier read-through (cold)"
 # makeCacheReader has no local-store fall-through — if writeback did
 # not populate remote, the next load fails with "chunk not found".
 kill $FRONT_PID 2>/dev/null; wait $FRONT_PID 2>/dev/null || true
-"$BIN/manifest-ctl" load $COMMON --cache-endpoint "127.0.0.1:$REMOTE_PORT" \
+"$BIN/manifest-ctl" load --config "$(accel_cfg_for_cache "127.0.0.1:$REMOTE_PORT")" \
     --manifest "$TMPDIR/test.manifest" --output "$TMPDIR/test-from-remote.bin" --no-progress 2>&1
 REM_HASH=$(sha256sum "$TMPDIR/test-from-remote.bin" | awk '{print $1}')
 assert_eq "$ORIG_HASH" "$REM_HASH" "upstream tier writeback populated remote"

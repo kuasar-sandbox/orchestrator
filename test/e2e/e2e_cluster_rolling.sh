@@ -104,6 +104,31 @@ crypto:
 EOF
 COMMON="--config $TMPDIR/accelerator.yaml"
 
+# manifest-ctl no longer accepts --cache-endpoint flag override. Build
+# a YAML variant on demand and pass --config explicitly.
+accel_cfg_for_cache() {
+    local ep="$1"
+    local out="$TMPDIR/accelerator-cache-$(echo "$ep" | tr ':.' '__').yaml"
+    cat > "$out" <<EOF
+manifest:
+  key: "$KEY"
+store:
+  endpoint: 127.0.0.1:$STORE_PORT
+  pool: 2
+  timeout: 5s
+chunk:
+  mode: cdc
+crypto:
+  chunk: aes
+  manifest: aes
+cache:
+  endpoint: $ep
+  pool: 2
+  timeout: 5s
+EOF
+    echo "$out"
+}
+
 # ============================================================
 # 6 shard peers
 # ============================================================
@@ -202,7 +227,7 @@ echo "  $N manifests stored."
 # gets its 5 shards distributed and filled on {p1..p5}.
 echo "=== Pre-warm: load each manifest through tiered (populates EC cache) ==="
 for i in $(seq 1 $N); do
-    "$BIN/manifest-ctl" load $COMMON --cache-endpoint "127.0.0.1:$TIERED_PORT" \
+    "$BIN/manifest-ctl" load --config "$(accel_cfg_for_cache "127.0.0.1:$TIERED_PORT")" \
         --manifest "$TMPDIR/val-$i.manifest" --output "$TMPDIR/val-$i.prewarm" \
         --no-progress 2>/dev/null
 done
@@ -226,7 +251,7 @@ sleep 1
 echo "=== Read $N keys after membership change ==="
 all_match=1
 for i in $(seq 1 $N); do
-    "$BIN/manifest-ctl" load $COMMON --cache-endpoint "127.0.0.1:$TIERED_PORT" \
+    "$BIN/manifest-ctl" load --config "$(accel_cfg_for_cache "127.0.0.1:$TIERED_PORT")" \
         --manifest "$TMPDIR/val-$i.manifest" --output "$TMPDIR/val-$i.postswap" \
         --no-progress 2>/dev/null
     h=$(sha256sum "$TMPDIR/val-$i.postswap" | awk '{print $1}')
@@ -250,7 +275,7 @@ echo "=== Second SIGHUP (idempotent-ish: membership {s2..s6} again) ==="
 kill -HUP "$TIERED_PID"
 sleep 0.5
 # Reads should still work.
-"$BIN/manifest-ctl" load $COMMON --cache-endpoint "127.0.0.1:$TIERED_PORT" \
+"$BIN/manifest-ctl" load --config "$(accel_cfg_for_cache "127.0.0.1:$TIERED_PORT")" \
     --manifest "$TMPDIR/val-1.manifest" --output "$TMPDIR/val-1.idem" \
     --no-progress 2>/dev/null
 h=$(sha256sum "$TMPDIR/val-1.idem" | awk '{print $1}')

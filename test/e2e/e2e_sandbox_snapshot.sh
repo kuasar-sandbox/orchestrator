@@ -8,9 +8,9 @@
 #      under sandbox-ctl run (background)
 #   2. Wait until guest is past phase 2 (sees a marker line in log)
 #   3. Run sandbox-ctl snapshot --sandbox-id <sid> --output <out>
-#   4. Verify <out>/sandbox.snapshot exists, is sparse, contains
-#      memory + ZIP at end with config.json/state.json/sandbox.cfg
-#   5. Verify <out>/disk.ext4 exists and is sparse
+#   4. Verify <out>/<sid>.snapshot exists, is sparse, contains
+#      memory + ZIP at end with config.json/state.json/snapshot.cfg
+#   5. Verify <out>/<sha256>.overlay exists and is sparse
 #   6. Tear down sandbox
 
 set -euo pipefail
@@ -31,8 +31,22 @@ for b in cloud-hypervisor sandbox-ctl sandbox-init sandbox-runtime.erofs flatten
 done
 VMLINUX="${VMLINUX:-$BIN/vmlinux}"
 [ -f "$VMLINUX" ] || skip "no vmlinux at $VMLINUX"
+# Self-elevate: tap creation, cgroup writes, vsock all need root. Done
+# here (after prereq checks) so /dev/kvm-missing and missing-binary cases
+# still fast-fail without prompting for sudo.
+if [ "$(id -u)" -ne 0 ]; then
+    exec sudo -nE "$0" "$@"
+fi
+
 TAP_NAME="${TAP_NAME:-sb-tap0}"
-ip link show "$TAP_NAME" >/dev/null 2>&1 || skip "TAP $TAP_NAME missing"
+TAP_CREATED_BY_TEST=0
+if ! ip link show "$TAP_NAME" >/dev/null 2>&1; then
+    [ "$(id -u)" -eq 0 ] || { echo "$0: must run as root to create $TAP_NAME" >&2; exit 1; }
+    ip tuntap add dev "$TAP_NAME" mode tap
+    ip addr add 169.254.1.0/31 dev "$TAP_NAME"
+    ip link set "$TAP_NAME" up
+    TAP_CREATED_BY_TEST=1
+fi
 
 # Need root to make /run/<sid>/ctl.sock + uffd usable.
 if [ "$(id -u)" -ne 0 ]; then
@@ -40,7 +54,7 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 WORK="$(mktemp -d /tmp/e2e-snapshot-XXXXXX)"
-trap '[ -n "${E2E_KEEP:-}" ] && echo "kept: $WORK" || rm -rf "$WORK"' EXIT
+trap '[ -n "${E2E_KEEP:-}" ] && echo "kept: $WORK" || rm -rf "$WORK"; [ "$TAP_CREATED_BY_TEST" = "1" ] && ip link del "$TAP_NAME" 2>/dev/null; true' EXIT
 
 IMAGE="${IMAGE:-python:3.12-slim}"
 BLK0_IMAGE="${BLK0_IMAGE:-}"
@@ -91,7 +105,7 @@ mkdir -p "$RUNTIME_ROOT/$SID"
 "$BIN/sandbox-ctl" run \
     --config "$WORK/sandbox.yaml" \
     --ch-binary "$BIN/cloud-hypervisor" \
-    --runtime-root "$RUNTIME_ROOT" \
+    --run-dir "$RUNTIME_ROOT" \
     --sandbox-id "$SID" \
     > "$LOG" 2>&1 &
 SBPID=$!
@@ -115,7 +129,8 @@ mkdir -p "$OUT"
 "$BIN/sandbox-ctl" snapshot \
     --sandbox-id "$SID" \
     --output "$OUT" \
-    --runtime-root "$RUNTIME_ROOT" 2>&1 | tee "$WORK/snap.log"
+    --run-dir "$RUNTIME_ROOT" \
+    --resume 2>&1 | tee "$WORK/snap.log"
 
 # Tear down sandbox
 kill -TERM "$SBPID" 2>/dev/null || true
@@ -123,19 +138,21 @@ wait "$SBPID" 2>/dev/null || true
 
 # Validate outputs
 echo "==> validating snapshot bundle"
-[ -f "$OUT/sandbox.snapshot" ] || { echo "FAIL: no sandbox.snapshot"; exit 1; }
-[ -f "$OUT/disk.ext4" ]        || { echo "FAIL: no disk.ext4";       exit 1; }
+SNAP_FILE="$OUT/$SID.snapshot"
+[ -f "$SNAP_FILE" ] || { echo "FAIL: no $SID.snapshot"; ls -la "$OUT"; exit 1; }
+OVERLAY_FILE=$(ls "$OUT"/*.overlay 2>/dev/null | head -1)
+[ -n "$OVERLAY_FILE" ] && [ -f "$OVERLAY_FILE" ] || { echo "FAIL: no <sha256>.overlay"; ls -la "$OUT"; exit 1; }
 
 # Sizes
-SNAP_LOGICAL=$(stat -c%s "$OUT/sandbox.snapshot")
-SNAP_PHYS=$(($(stat -c%b "$OUT/sandbox.snapshot") * 512))
-DISK_LOGICAL=$(stat -c%s "$OUT/disk.ext4")
-DISK_PHYS=$(($(stat -c%b "$OUT/disk.ext4") * 512))
+SNAP_LOGICAL=$(stat -c%s "$SNAP_FILE")
+SNAP_PHYS=$(($(stat -c%b "$SNAP_FILE") * 512))
+DISK_LOGICAL=$(stat -c%s "$OVERLAY_FILE")
+DISK_PHYS=$(($(stat -c%b "$OVERLAY_FILE") * 512))
 
-echo "    sandbox.snapshot: logical=$(numfmt --to=iec $SNAP_LOGICAL) physical=$(numfmt --to=iec $SNAP_PHYS)"
-echo "    disk.ext4:        logical=$(numfmt --to=iec $DISK_LOGICAL) physical=$(numfmt --to=iec $DISK_PHYS)"
+echo "    $SID.snapshot:   logical=$(numfmt --to=iec $SNAP_LOGICAL) physical=$(numfmt --to=iec $SNAP_PHYS)"
+echo "    $(basename $OVERLAY_FILE): logical=$(numfmt --to=iec $DISK_LOGICAL) physical=$(numfmt --to=iec $DISK_PHYS)"
 
-# sandbox.snapshot logical = ramSize (512 MiB) + ZIP (~tens of KB)
+# <sid>.snapshot logical = ramSize (512 MiB) + ZIP (~tens of KB)
 # physical should be much smaller (only resident pages + ZIP)
 if [ "$SNAP_PHYS" -ge "$SNAP_LOGICAL" ]; then
     echo "==> WARN: snapshot not sparse (phys >= logical) — fs may not preserve sparseness"
@@ -147,21 +164,30 @@ fi
 # Validate ZIP at end (memory section + ZIP). unzip warns about the
 # memory prefix and returns non-zero, but stdout is correct — capture
 # once and grep without piping unzip's exit code into the conditional.
-ZIP_LIST=$(unzip -l "$OUT/sandbox.snapshot" 2>&1 || true)
-for need in "config.json" "state.json" "sandbox.cfg"; do
+ZIP_LIST=$(unzip -l "$SNAP_FILE" 2>&1 || true)
+for need in "config.json" "state.json" "snapshot.cfg"; do
     if ! grep -qF "$need" <<<"$ZIP_LIST"; then
         echo "==> FAIL: trailing ZIP missing $need"
         echo "$ZIP_LIST" | head -20
         exit 1
     fi
 done
-echo "==> PASS: trailing ZIP contains config.json, state.json, sandbox.cfg"
+echo "==> PASS: trailing ZIP contains config.json, state.json, snapshot.cfg"
 
-# Validate disk.ext4 is recognizable
-if command -v file >/dev/null && file "$OUT/disk.ext4" 2>&1 | grep -qiE "ext4|ext.* filesystem"; then
-    echo "==> PASS: disk.ext4 is ext4 filesystem"
+# Validate <sha256>.overlay basename matches its content sha256
+OVERLAY_BASENAME=$(basename "$OVERLAY_FILE" .overlay)
+ACTUAL_SHA=$(sha256sum "$OVERLAY_FILE" | awk '{print $1}')
+if [ "$OVERLAY_BASENAME" != "$ACTUAL_SHA" ]; then
+    echo "==> FAIL: overlay basename '$OVERLAY_BASENAME' != sha256 '$ACTUAL_SHA'"
+    exit 1
+fi
+echo "==> PASS: overlay basename matches content sha256"
+
+# Validate overlay is recognizable as ext4
+if command -v file >/dev/null && file "$OVERLAY_FILE" 2>&1 | grep -qiE "ext4|ext.* filesystem"; then
+    echo "==> PASS: overlay is ext4 filesystem"
 else
-    echo "==> WARN: disk.ext4 not recognized as ext4 by file(1)"
+    echo "==> WARN: overlay not recognized as ext4 by file(1)"
 fi
 
 echo "==> e2e_sandbox_snapshot: OK"

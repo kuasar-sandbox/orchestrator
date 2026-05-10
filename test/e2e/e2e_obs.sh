@@ -115,7 +115,7 @@ OBS_AK="${OBS_AK:-}" OBS_SK="${OBS_SK:-}" \
     "$BIN/store-ctl" serve --config "$WORK/store-ctl.yaml" \
     >"$WORK/store.log" 2>&1 &
 STORE_PID=$!
-trap "kill $STORE_PID 2>/dev/null; rm -rf $WORK" EXIT
+trap "kill $STORE_PID 2>/dev/null || true; rm -rf $WORK" EXIT
 
 for _ in 1 2 3 4 5 6 7 8 9 10; do
     if (echo >/dev/tcp/127.0.0.1/${STORE_PORT}) 2>/dev/null; then

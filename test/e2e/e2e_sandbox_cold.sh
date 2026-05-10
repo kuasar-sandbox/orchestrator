@@ -55,12 +55,26 @@ done
 VMLINUX="${VMLINUX:-$BIN/vmlinux}"
 [ -f "$VMLINUX" ] || skip "no vmlinux at $VMLINUX (run 'make vmlinux' or set VMLINUX env var)"
 
+# Self-elevate: tap creation, cgroup writes, vsock all need root. Done
+# here (after prereq checks) so /dev/kvm-missing and missing-binary cases
+# still fast-fail without prompting for sudo.
+if [ "$(id -u)" -ne 0 ]; then
+    exec sudo -nE "$0" "$@"
+fi
+
 TAP_NAME="${TAP_NAME:-sb-tap0}"
-ip link show "$TAP_NAME" >/dev/null 2>&1 || skip "TAP interface $TAP_NAME does not exist (host platform must pre-create)"
+TAP_CREATED_BY_TEST=0
+if ! ip link show "$TAP_NAME" >/dev/null 2>&1; then
+    [ "$(id -u)" -eq 0 ] || { echo "$0: must run as root to create $TAP_NAME" >&2; exit 1; }
+    ip tuntap add dev "$TAP_NAME" mode tap
+    ip addr add 169.254.1.0/31 dev "$TAP_NAME"
+    ip link set "$TAP_NAME" up
+    TAP_CREATED_BY_TEST=1
+fi
 
 # ---- prepare blk0 (python:3.12-slim → erofs with appended config.json) ----
 WORK="$(mktemp -d /tmp/e2e-sandbox-XXXXXX)"
-trap '[ -n "${E2E_KEEP:-}" ] && echo "kept work dir: $WORK" || rm -rf "$WORK"' EXIT
+trap '[ -n "${E2E_KEEP:-}" ] && echo "kept work dir: $WORK" || rm -rf "$WORK"; [ "$TAP_CREATED_BY_TEST" = "1" ] && ip link del "$TAP_NAME" 2>/dev/null; true' EXIT
 
 BLK0_IMAGE="${BLK0_IMAGE:-}"
 if [ -z "$BLK0_IMAGE" ]; then
@@ -141,7 +155,7 @@ STATS_JSON="${PERF_STATS_JSON:-$WORK/stats.json}"
 timeout 60 "$BIN/sandbox-ctl" run \
     --config "$WORK/sandbox.yaml" \
     --ch-binary "$BIN/cloud-hypervisor" \
-    --runtime-root "$WORK/runtime" \
+    --run-dir "$WORK/runtime" \
     --stats-json "$STATS_JSON" \
     > "$LOG" 2>&1 &
 SBPID=$!

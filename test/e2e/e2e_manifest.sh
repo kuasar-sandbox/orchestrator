@@ -109,6 +109,55 @@ crypto:
   manifest: aes
 EOF
 
+# Manifest config no longer accepts CLI flag overrides (--chunk-mode,
+# --crypto-chunk, etc. were removed). Pre-render the alternate configs
+# the test cases below need, and pass --config explicitly per case.
+cat > "$TMPDIR/accelerator-fixed.yaml" <<EOF
+manifest:
+  key: "$KEY"
+store:
+  endpoint: 127.0.0.1:$STORE_PORT
+  pool: 2
+  timeout: 10s
+chunk:
+  mode: fixed
+  fixed:
+    size: 512KiB
+crypto:
+  chunk: aes
+  manifest: aes
+EOF
+
+cat > "$TMPDIR/accelerator-fixed-64k.yaml" <<EOF
+manifest:
+  key: "$KEY"
+store:
+  endpoint: 127.0.0.1:$STORE_PORT
+  pool: 2
+  timeout: 10s
+chunk:
+  mode: fixed
+  fixed:
+    size: 64KiB
+crypto:
+  chunk: aes
+  manifest: aes
+EOF
+
+cat > "$TMPDIR/accelerator-fake.yaml" <<EOF
+manifest:
+  key: "$KEY"
+store:
+  endpoint: 127.0.0.1:$STORE_PORT
+  pool: 2
+  timeout: 10s
+chunk:
+  mode: cdc
+crypto:
+  chunk: fake
+  manifest: fake
+EOF
+
 COMMON="--config $TMPDIR/accelerator.yaml"
 
 # Ensure both images are available locally before any test starts;
@@ -253,7 +302,7 @@ fi
 # ============================================================
 echo ""
 echo "=== Test 9: Fixed chunking vs CDC ==="
-"$BIN/manifest-ctl" store $COMMON --input "$TMPDIR/image-a.erofs" --manifest "$TMPDIR/image-a-fixed.manifest" --chunk-mode fixed --no-progress 2>&1
+"$BIN/manifest-ctl" store --config "$TMPDIR/accelerator-fixed.yaml" --input "$TMPDIR/image-a.erofs" --manifest "$TMPDIR/image-a-fixed.manifest" --no-progress 2>&1
 OUTPUT=$("$BIN/manifest-ctl" diff "$TMPDIR/image-a.manifest" "$TMPDIR/image-a-fixed.manifest" 2>&1)
 echo "  $OUTPUT" | head -5
 ok "CDC vs fixed diff completed"
@@ -261,10 +310,10 @@ ok "CDC vs fixed diff completed"
 # ============================================================
 echo ""
 echo "=== Test 10: Fake crypto roundtrip ==="
-"$BIN/manifest-ctl" store $COMMON --input "$TMPDIR/image-a.erofs" --manifest "$TMPDIR/image-a-fake.manifest" \
-    --crypto-chunk fake --crypto-manifest fake --crypto-fake --no-progress 2>&1
-"$BIN/manifest-ctl" load $COMMON --manifest "$TMPDIR/image-a-fake.manifest" --output "$TMPDIR/image-a-fake-restored.erofs" \
-    --crypto-chunk fake --crypto-manifest fake --crypto-fake --no-progress 2>&1
+"$BIN/manifest-ctl" store --config "$TMPDIR/accelerator-fake.yaml" --input "$TMPDIR/image-a.erofs" --manifest "$TMPDIR/image-a-fake.manifest" \
+    --crypto-fake --no-progress 2>&1
+"$BIN/manifest-ctl" load --config "$TMPDIR/accelerator-fake.yaml" --manifest "$TMPDIR/image-a-fake.manifest" --output "$TMPDIR/image-a-fake-restored.erofs" \
+    --crypto-fake --no-progress 2>&1
 
 H4=$(sha256sum "$TMPDIR/image-a-fake-restored.erofs" | awk '{print $1}')
 assert_eq "$H1" "$H4" "fake crypto store → load roundtrip matches"
@@ -310,8 +359,7 @@ dd if=/dev/zero    of="$SPARSE" bs=1M count=7 seek=1 conv=notrunc status=none
 SPARSE_HASH=$(sha256sum "$SPARSE" | awk '{print $1}')
 
 # Use fixed chunking so we can predict counts: 8 MiB / 64 KiB = 128 chunks total.
-"$BIN/manifest-ctl" store $COMMON --no-progress \
-    --chunk-mode fixed --chunk-fixed-size 64KiB \
+"$BIN/manifest-ctl" store --config "$TMPDIR/accelerator-fixed-64k.yaml" --no-progress \
     --input "$SPARSE" --manifest "$TMPDIR/sparse.manifest" 2>"$TMPDIR/sparse-store.stderr"
 
 # Parse the "chunks: N (stored S, dedup D, zero W)" summary line.
@@ -368,9 +416,8 @@ HOLED_ALLOC=$((HOLED_BLOCKS * HOLED_BSIZE))
 echo "  source: apparent=8MiB allocated=$HOLED_ALLOC bytes"
 
 # Store with --detect-holes; fixed chunking so we can predict counts.
-"$BIN/manifest-ctl" store $COMMON --no-progress \
-    --detect-holes --chunk-mode fixed --chunk-fixed-size 64KiB \
-    --input "$HOLED" --manifest "$TMPDIR/holed.manifest" 2>"$TMPDIR/holed-store.stderr"
+"$BIN/manifest-ctl" store --config "$TMPDIR/accelerator-fixed-64k.yaml" --no-progress \
+    --detect-holes --input "$HOLED" --manifest "$TMPDIR/holed.manifest" 2>"$TMPDIR/holed-store.stderr"
 
 # Verify the manifest carries holes.
 HOLE_LINE=$(grep -E '^holes:' "$TMPDIR/holed-store.stderr" | head -1)
