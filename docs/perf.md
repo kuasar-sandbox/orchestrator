@@ -378,9 +378,10 @@ t=60s: avail=2615 MiB (基本不再下降)
 ```
 
 第一次 active 周期会把高水位 fault 进 host 内存,后续 idle 段即使 Python 释放,
-balloon free_page_reporting **不会立即回收**——guest kernel page reclaim 周期
-+ glibc 堆碎片决定回收速率,实测 60 s 内回收量 ~30 MiB(占释放量 <20%)。
-所以 steady-state Δ MemAvail/sb ≈ **此前观测到的 active 峰值**,而非平均。
+balloon **不会立即回收**——host 端 BalloonController 的反馈环周期 5 s + 单步
+≤ 256 MiB,guest kernel page reclaim 周期 + glibc 堆碎片再叠加一层延迟,实测
+60 s 内回收量 ~30 MiB(占释放量 <20%)。所以 steady-state Δ MemAvail/sb ≈
+**此前观测到的 active 峰值**,而非平均。
 
 **controller 事件延迟特征**:
 
@@ -423,15 +424,18 @@ peak_resident_per_sandbox 与 workload 行为耦合,见下表
 - 8 个 active 沙箱(memory-zone=1024 MiB,R=128–256 MiB)Δ MemAvail/sb ≈
   189 MiB,与 R 区间一致,与 zone size 无关
 
-**balloon free_page_reporting 的局限**(为什么不能让占用回到 idle 水平):
+**balloon 回收的局限**(为什么不能让占用回到 idle 水平):
 
 1. 回收链路长:Python `del held` → glibc 不一定立即 munmap(堆碎片) → 即使
-   munmap,guest kernel 也不会立即把页加入 free_list → balloon 周期 poll →
-   报告给 host → host kernel 把 memfd 中对应页 punch_hole
-2. 实测 60 s 内回收 <20% 释放量;如果 active 周期间隔 < balloon 完整 cycle,
+   munmap,guest kernel 也不会立即把页加入 free_list → guest /proc/meminfo
+   的 MemAvailable 才上升 → guest 5 s 推 mem_report → host 端 BalloonController
+   `MaxStep ≤ 256 MiB` 单步推 inflate target → guest balloon 驱动响应 inflate
+   → CH 在 memfd 上 punch_hole + madvise
+2. 实测 60 s 内回收 <20% 释放量;如果 active 周期间隔 < 反馈环完整 cycle,
    实际接近**永远不回收**
-3. 即使全程 idle 等几分钟后回收效率高(50–70%),也只在主机内存有压力时
-   才会触发(WSL2 没有压力 → 回收懒)
+3. 即使全程 idle 等几分钟后回收效率高(50–70%),也要求 BalloonController 把
+   target 持续抬到 `Capacity − TargetFreeBuffer`,该过程受 stale-guard 与
+   Slack(默认 32 MiB)节流
 
 **结论**:memory-zone size 是单沙箱 cap(防失控),不是密度筹划单位。密度
 规划应基于**该应用类型的 peak working set 实测值**(从 cgroup `memory.current`
@@ -452,18 +456,22 @@ P99 读),不要看 memory-zone。
 - **让客户应用尽快释放峰值后的内存**:active 周期结束后立刻 `del`/`gc.collect()`
   + 调用 `malloc_trim(0)` 提示 glibc 归还页给 kernel;否则 balloon 看不到这些页
 
-**3.5.2 balloon `free_page_reporting=on` + `deflate_on_oom=on`**
+**3.5.2 host-driven balloon + `deflate_on_oom=on`**
 
-CH 命令行已默认开启;前者让 guest kernel 把空闲页主动让回 host,后者让 guest
-在内部 OOM 时先 deflate balloon 抢救。两者缺一不可:
-- 只开 free_page_reporting:guest 内部 OOM 时 balloon 不让步 → 应用进程被 kill
-- 只开 deflate_on_oom:idle 沙箱不释放空闲内存 → 密度提不上
+平台 CH 命令行采用 `--balloon size=0[,deflate_on_oom=on]`,host 端
+BalloonController 通过 `/vm.resize` 周期推 inflate target(详见 sandbox.md
+§9.3);`deflate_on_oom` 让 guest 在内部 OOM 时先释放 balloon 抢救。两者缺
+一不可:
+- 只开 host-driven inflate:guest 内部 OOM 时 balloon 不让步 → 应用进程被 kill
+- 只开 deflate_on_oom:host 没有 inflate 信号 → 沙箱永不让出空闲内存 → 密度
+  提不上
 
 balloon 是密度的**唯一**弹性来源,但它不快。两个层次的对策:
 - **调度层面**:不要把 active 周期密集排布——让相邻 active 之间有 ≥1 min 的真
-  idle gap,balloon 才能回收上一轮峰值
-- **内核层面**:guest 升级到 Linux 6.x 的 page-reporting v2 把回收延迟拉低到
-  秒级（待评估验证）
+  idle gap,反馈环才能把上一轮峰值收回
+- **参数层面**:BalloonController 的 `Interval` / `MaxStep` / `TargetFreeBuffer`
+  可调,缩短 Interval / 加大 MaxStep 让回收更激进,代价是 mmu_notifier
+  广播突发增大(详见 sandbox.md §9.3 的 stale-guard / Slack 设计)
 
 **3.5.3 controller 水位**(`high_factor` / `low_factor` / `emergency_factor`)
 
@@ -575,7 +583,8 @@ cache-ctl 预算(典型 1–2 GiB),否则 cache 增长会挤掉沙箱内存。
 ## 4. 长期方向
 
 - **多 vCPU 高并发 fault 测试**:当前数据是 1 vCPU,fault 几乎无并发竞态;
-  4-8 vCPU 下需要测 batch 行为 + EVENT_REMOVE 在 balloon-active 场景下的速率
+  4-8 vCPU 下需要测 batch 行为 + EVENT_REMOVE 在 host-driven balloon inflate
+  场景下的突发速率(每 5 s tick + MaxStep 256 MiB)
 - **生产 NVMe + 真 KVM 实测**:本数据来自 WSL2 嵌套 KVM,有 ~2× 抖动;
   native Linux + NVMe 跑一遍可确认绝对数量级,尤其 hot-L1 restore 中位数稳定后
   会接近 file:// 基线

@@ -178,7 +178,7 @@ Agent RL 训练需要与真实环境交互——环境即沙箱。行业典型�
 
 使用 microVM 级 VMM（Firecracker 或 Cloud Hypervisor），最小化设备集和每 VM 进程开销（3-13 MiB 量级）。VM 内不使用容器运行时，展平镜像直接作为 VM rootfs，定制 init 直接拉起客户应用进程。
 
-VM 创建时以最小内存启动（预置充满的 balloon），宿主侧控制器采集各 VM 内存消耗，以 PID 等控制算法协调 balloon 调整，逐步释放更多内存。叠加 KSM 内存页合并、cgroup 水位控制、userfaultfd handler 注入分配延迟等手段综合控制节点级内存密度。CPU 通过 cgroup quota 动态调整。
+VM 启动时 balloon=0（Guest 看到声明规格的完整容量），settled 之后宿主侧控制器周期性采集 Guest 的 MemAvailable，根据反馈策略通过 vm.resize 推 balloon 的 inflate target，把闲置物理内存回收回宿主。叠加 KSM 内存页合并、cgroup 水位控制、userfaultfd handler 注入分配延迟等手段综合控制节点级内存密度。CPU 通过 cgroup quota 动态调整。
 
 快照恢复路径下 VM 内存按需加载（userfaultfd），物理页面仅在访问时分配，初始工作集约 25%——天然减少物理页面占用。
 
@@ -865,10 +865,10 @@ Guest Agent 作为宿主侧的通用控制通道，响应快照准备、命令�
 │                        Density Control                            │
 │                                                                   │
 │  ┌─ Per-VM ───────────────────────────────────────────────────┐   │
-│  │  Balloon (virtio-balloon)                                  │   │
-│  │    Boot: balloon inflated → min usable memory              │   │
-│  │    Runtime: deflate on demand → release more memory        │   │
-│  │    Free page reporting → host reclaim unused pages         │   │
+│  │  Balloon (virtio-balloon, host-driven)                     │   │
+│  │    Boot: balloon size=0 → guest sees full capacity         │   │
+│  │    Guest agent reports MemAvailable periodically           │   │
+│  │    Host drives vm.resize → reclaim unused pages            │   │
 │  └────────────────────────────────────────────┬───────────────┘   │
 │                                                │                  │
 │  ┌─ Node-level ───────────────────────────────▼───────────────┐   │
@@ -895,7 +895,7 @@ Guest Agent 作为宿主侧的通用控制通道，响应快照准备、命令�
 └───────────────────────────────────────────────────────────────────┘
 ```
 
-Balloon 控制器采集所有 VM 的内存消耗统计并以 PID 等控制算法全局协调——目标是每个 VM 按实际需求获得物理内存，而非按固定规格预分配。KSM 在宿主内核层面合并跨 VM 的相同物理页面，对确定性配置下的 SnapStart/Warm Pool 实例（§6.11 保证 >90% 内存一致性）尤为有效。当节点内存压力升高时，cgroup 水位触发 balloon 扩容或调度迁移决策；Snapshot Agent（§6.10）的 userfaultfd handler 可降低页面加载频率，对 VM 形成背压，延缓内存增长速率。
+Balloon 控制器周期性从 Guest 拉取 MemAvailable/MemTotal（短连接 vsock 上报），按反馈策略推 balloon 的 inflate target——目标是每个 VM 按实际需求保留物理内存，把闲置部分回收，而非按固定规格预分配。KSM 在宿主内核层面合并跨 VM 的相同物理页面，对确定性配置下的 SnapStart/Warm Pool 实例（§6.11 保证 >90% 内存一致性）尤为有效。当节点内存压力升高时，cgroup 水位触发 balloon 扩容或调度迁移决策；Snapshot Agent（§6.10）的 userfaultfd handler 可降低页面加载频率，对 VM 形成背压，延缓内存增长速率。
 
 CPU 通过 cgroup quota 动态调整可用时间（0.01C 粒度），Guest 无感知，无需 CPU 热插拔。
 
@@ -1289,7 +1289,7 @@ L2-快照集群 20-30 节点 × 5 GiB/s = 100-150 GiB/s，22 GiB/s 利用率 ~15
 
 **功能**：
 
-- Balloon 控制器：采集各 VM 内存统计，PID 算法全局协调 balloon 调整
+- Balloon 控制器：周期性拉取各 VM MemAvailable，反馈策略驱动 vm.resize 推 balloon inflate target
 - KSM 配置与监控
 - Cgroup 水位监控与响应
 - 与 Snapshot Agent（§10.2.3）协调 uffd 背压
