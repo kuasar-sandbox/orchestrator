@@ -147,7 +147,7 @@ if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
     docker pull "$IMAGE" >/dev/null
 fi
 BLK0_EROFS="$WORK/blk0.erofs"
-docker save "$IMAGE" | "$BIN/flatten-ctl" --output "$BLK0_EROFS" --no-progress
+docker save "$IMAGE" | "$BIN/flatten-ctl" export --output "$BLK0_EROFS" --no-progress
 
 mkdir -p "$WORK/runtime"
 DIFF_FILE="$WORK/runtime/blk1.diff"
@@ -230,9 +230,14 @@ DIFF_RESTORE="$WORK/runtime/blk1-restore.diff"
 truncate -s 1G "$DIFF_RESTORE"
 mkfs.ext4 -q -F "$DIFF_RESTORE"
 
-# Restore-mode sandbox.yaml: capacity / runtime / base auto-derived
-# from snapshot.cfg per docs §11.0; only network + overlay.diff required.
+# Restore-mode sandbox.yaml: capacity must match snapshot.cfg (declared
+# explicitly, same as the cold yaml). The bundle was manifest:// loaded
+# (snapshotPath=""), so ApplyRules requires host yaml to provide every
+# file:// ref from snapshot.cfg explicitly — here runtime and root.base.
 cat > "$WORK/host.yaml" <<EOF
+resources:
+  capacity:    { cpu: 1, memory: 512MiB }
+  allocatable: { cpu: 1, memory: 512MiB }
 network:
   tap: $TAP_NAME
   interface: eth0
@@ -242,6 +247,7 @@ boot:
   kernel: file://$VMLINUX
   runtime: file://$BIN/sandbox-runtime.erofs
   root:
+    base: file://$BLK0_EROFS
     overlay:
       diff: file://$DIFF_RESTORE
       size: 1GiB

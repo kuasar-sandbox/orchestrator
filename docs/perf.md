@@ -208,7 +208,7 @@ manifest:// 唯一可量化的"成本"是 cold L1 状态下额外 ~330 ms 启动
   已被 handler 装入 inode),不投 uffd 事件
 
 **GC 压力门槛**:manifest:// 路径的 alloc 受两条规则约束(实施在 `pkg/cache`
-与 `pkg/crypto`):
+与 `pkg/manifest/crypto`):
 - 解密走原地 XOR(`DecryptInPlace`),不为每个 chunk 分配新 plaintext 缓冲
 - wire 客户端通过 `cache.NewPool` 复用 ciphertext 缓冲区
 
@@ -576,9 +576,11 @@ cache-ctl 预算(典型 1–2 GiB),否则 cache 增长会挤掉沙箱内存。
   WSL distro 内进行
 - shared memfd 的 `Δ used` 在 `free -m` 中表现保守(只算 private),真实占用
   要看 `MemAvailable` 下降量
-- guest 内 Python 输出经 `console=hvc0 + --console tty` 不进入 sandbox-ctl
-  stdout(只到 TTY),perf harness 因此**不依赖** Python 输出做断言,完全
-  依赖 audit.log + cgroup events
+- guest 内核 dmesg(`console=hvc0`)与应用 stdout 是两条独立的道:dmesg 经 CH
+  `--console tty` 落到 sandbox-ctl 给 CH 的匿名管道(`run --console` 决定去向),
+  应用 stdin/stdout/stderr 经 vsock stdio MUX 转发(默认 pipe 模式:应用 stdout →
+  sandbox-ctl stdout)。perf harness 仍主要依赖 audit.log + cgroup events 做断言,
+  应用 stdout 可用作辅助信号
 
 ## 4. 长期方向
 

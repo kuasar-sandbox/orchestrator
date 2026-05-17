@@ -129,7 +129,7 @@ if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
     docker pull "$IMAGE"
 fi
 BLK0="$WORK/blk0.erofs"
-docker save "$IMAGE" | "$BIN/flatten-ctl" --output "$BLK0" --no-progress
+docker save "$IMAGE" | "$BIN/flatten-ctl" export --output "$BLK0" --no-progress
 
 # ---------- cgroup parent ----------
 

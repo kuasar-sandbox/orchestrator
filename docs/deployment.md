@@ -195,7 +195,7 @@ yaml 显式 access_key/secret_key  →  ~/.obsconfig  →  AWS SDK 默认凭证�
 | 进程 | 类型 | 用途 |
 |---|---|---|
 | `flatten-ctl` | CLI(一次性)| OCI / docker bundle → 确定性 EROFS,逐字节可重现 |
-| `manifest-ctl` | CLI(一次性)| `store --put-manifest`:分块 + 加密 + 写远端 |
+| `manifest-ctl` | CLI(一次性)| `store`:分块 + 加密 + 写远端 + 上传 manifest |
 | `store-ctl` | daemon(sidecar)| 把 manifest-ctl 的 gRPC `Put` 写到 region OBS |
 
 ### 5.2 流水
@@ -205,11 +205,11 @@ yaml 显式 access_key/secret_key  →  ~/.obsconfig  →  AWS SDK 默认凭证�
             │
             │  tenant image pull credentials + customer encryption keys
             ▼
-   flatten-ctl  (CLI)
-            │  stdout:  deterministic EROFS
+   flatten-ctl export  (CLI)
+            │  stdout:  deterministic EROFS  (或 --upload 直接 → manifest key)
             ▼
-   manifest-ctl  store --put-manifest
-            │  gRPC 127.0.0.1:7060
+   manifest-ctl  store
+            │  gRPC 127.0.0.1:7100         (stdout: hex manifest key)
             ▼
    store-ctl  (sidecar)
             │  HTTPS

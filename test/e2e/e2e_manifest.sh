@@ -173,7 +173,7 @@ echo "  $IMAGE_A and $IMAGE_B available locally"
 # ============================================================
 echo ""
 echo "=== Test 1: Flatten $IMAGE_A ==="
-docker save "$IMAGE_A" | "$BIN/flatten-ctl" --output "$TMPDIR/image-a.erofs" --no-progress 2>&1
+docker save "$IMAGE_A" | "$BIN/flatten-ctl" export --output "$TMPDIR/image-a.erofs" --no-progress 2>&1
 SIZE=$(stat --printf="%s" "$TMPDIR/image-a.erofs" 2>/dev/null || stat -f "%z" "$TMPDIR/image-a.erofs")
 if [ "$SIZE" -gt 0 ]; then
     ok "flatten produced $SIZE bytes"
@@ -194,7 +194,7 @@ fi
 
 # `flatten-ctl info --json` should report a valid erofs_size and a
 # non-null Architecture (Docker images we test with always carry it).
-INFO_JSON=$("$BIN/flatten-ctl" info --json "$TMPDIR/image-a.erofs")
+INFO_JSON=$("$BIN/flatten-ctl" info --json --input "$TMPDIR/image-a.erofs")
 EROFS_SIZE=$(echo "$INFO_JSON" | python3 -c 'import sys,json; print(json.load(sys.stdin)["erofs_size"])')
 ARCH=$(echo "$INFO_JSON" | python3 -c 'import sys,json; print(json.load(sys.stdin)["config"].get("Architecture",""))')
 if [ "$EROFS_SIZE" -gt 0 ] && [ "$EROFS_SIZE" -lt "$SIZE" ]; then
@@ -289,7 +289,7 @@ assert_eq "$H1" "$H3" "get-manifest | load pipeline matches original"
 # ============================================================
 echo ""
 echo "=== Test 8: Cross-image diff ($IMAGE_A vs $IMAGE_B) ==="
-docker save "$IMAGE_B" | "$BIN/flatten-ctl" --output "$TMPDIR/image-b.erofs" --no-progress 2>&1
+docker save "$IMAGE_B" | "$BIN/flatten-ctl" export --output "$TMPDIR/image-b.erofs" --no-progress 2>&1
 "$BIN/manifest-ctl" store $COMMON --input "$TMPDIR/image-b.erofs" --manifest "$TMPDIR/image-b.manifest" --no-progress 2>&1
 OUTPUT=$("$BIN/manifest-ctl" diff "$TMPDIR/image-a.manifest" "$TMPDIR/image-b.manifest" 2>&1)
 echo "  $OUTPUT" | head -5

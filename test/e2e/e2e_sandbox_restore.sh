@@ -59,7 +59,7 @@ if [ -z "$BLK0_IMAGE" ]; then
         docker pull "$IMAGE" >/dev/null
     fi
     BLK0_IMAGE="$WORK/blk0.erofs"
-    docker save "$IMAGE" | "$BIN/flatten-ctl" --output "$BLK0_IMAGE" --no-progress
+    docker save "$IMAGE" | "$BIN/flatten-ctl" export --output "$BLK0_IMAGE" --no-progress
 fi
 
 mkdir -p "$WORK/runtime"
@@ -139,11 +139,13 @@ DIFF_RESTORE="$WORK/runtime/blk1-restore.diff"
 truncate -s 1G "$DIFF_RESTORE"
 mkfs.ext4 -q -F "$DIFF_RESTORE"
 
-# Host yaml for restore: capacity/runtime/base/overlay.base must match
-# snapshot.cfg per docs §11.0. Easiest is to omit them — applyrules
-# will auto-fill from snapshot.cfg using the bundle dir to resolve
-# basenames. We only need network.tap and overlay.diff.
+# Host yaml for restore: capacity/runtime/base must match snapshot.cfg
+# per docs §11.0 — declare them explicitly (same as the cold yaml).
+# overlay.base is always taken from snapshot.cfg (host value ignored).
 cat > "$WORK/host.yaml" <<EOF
+resources:
+  capacity:    { cpu: 1, memory: 512MiB }
+  allocatable: { cpu: 1, memory: 512MiB }
 network:
   tap: $TAP_NAME
   interface: eth0

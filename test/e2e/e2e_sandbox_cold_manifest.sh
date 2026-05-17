@@ -178,7 +178,7 @@ fi
 
 BLK0_EROFS="$WORK/blk0.erofs"
 echo "==> docker save $IMAGE | flatten-ctl > $BLK0_EROFS"
-docker save "$IMAGE" | "$BIN/flatten-ctl" --output "$BLK0_EROFS" --no-progress
+docker save "$IMAGE" | "$BIN/flatten-ctl" export --output "$BLK0_EROFS" --no-progress
 
 # Cache-ctl runs in-band with store-ctl as the read tier here; ingest
 # always writes through the store directly (Filler path). The first

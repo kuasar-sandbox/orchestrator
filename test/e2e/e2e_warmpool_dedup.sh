@@ -167,8 +167,8 @@ if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
     docker pull "$IMAGE" >/dev/null
 fi
 BLK0_EROFS="$WORK/blk0.erofs"
-echo "==> docker save $IMAGE | flatten-ctl --output blk0.erofs"
-docker save "$IMAGE" | "$BIN/flatten-ctl" --output "$BLK0_EROFS" --no-progress
+echo "==> docker save $IMAGE | flatten-ctl export --output blk0.erofs"
+docker save "$IMAGE" | "$BIN/flatten-ctl" export --output "$BLK0_EROFS" --no-progress
 
 # Single ingest of blk0 → manifest. Each sandbox references this same
 # manifest at boot via boot.root.base = manifest://<BLK0_MKEY>.
@@ -304,12 +304,14 @@ EOF
     fi
     echo "    reached TICK $TICKS, taking snapshot"
 
-    # snapshot --upload returns 64-hex on stdout. --resume=false leaves
-    # the sandbox paused so we tear down rather than letting it resume.
+    # snapshot --upload returns the 64-hex manifest key on stdout.
+    # --output and --upload are mutually exclusive; we only need the key,
+    # so --upload only. --resume=false destroys the sandbox after the
+    # snapshot (sandbox-ctl run exits on its own; the kill below is a no-op
+    # backstop).
     SNAP_LOG="$WORK/snap-$i.log"
     SNAP_MKEY=$("$BIN/sandbox-ctl" snapshot \
         --sandbox-id "$SID" \
-        --output "$WORK/snap-$i-out" \
         --upload \
         --run-dir "$WORK/runtime" \
         --resume=false 2>"$SNAP_LOG")
