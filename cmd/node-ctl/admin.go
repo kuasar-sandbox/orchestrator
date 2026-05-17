@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/fullof-work/mass-sandbox/pkg/config"
 	"github.com/fullof-work/mass-sandbox/pkg/nodectl"
+	"github.com/fullof-work/mass-sandbox/pkg/util"
 )
 
 func adminClient(socketPath string) (*nodectl.Client, error) {
@@ -57,7 +57,7 @@ func grantCmd(args []string) int {
 		fmt.Fprintln(os.Stderr, "--memory required")
 		return 2
 	}
-	delta, err := config.ParseSize(*memSize)
+	delta, err := util.ParseSize(*memSize)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 2
@@ -93,7 +93,7 @@ func reclaimCmd(args []string) int {
 		fmt.Fprintln(os.Stderr, "--memory required")
 		return 2
 	}
-	target, err := config.ParseSize(*memSize)
+	target, err := util.ParseSize(*memSize)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 2

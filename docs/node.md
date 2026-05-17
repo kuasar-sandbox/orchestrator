@@ -273,7 +273,7 @@ Admit            (capacity, floor, startup_budget_memory, allocatable_at_snapsho
 Settled          (token, current_rss, current_cpu_usec)        # 进入 settled 通知
                  → Ack
                  # 触发时机:冷启动收到 launch hello 之后;
-                 #            恢复 SendRestore 返回 nil 之后
+                 #            恢复收到 guest 的 restore_ack 之后
 
 RequestBudget    (token, current_alloc, requested_delta, urgency, reason)
                  → BudgetResponse (granted_delta, new_allocatable, cooldown_ms)
@@ -387,7 +387,7 @@ sandbox-ctl 启动 CH(cgroup join → memfd → ...)
  │  若 sandbox-ctl 在 startup_ttl(默认 5 分钟)内不发 Settled
  │   → 控制器视为创建失败,自动 release reservation
  ▼
-launch hello(冷启动)/ SendRestore 返回 nil(恢复)
+launch hello(冷启动)/ restore_ack(恢复)
  │
  ▼
 sandbox-ctl 发 Settled(token, current_rss, current_cpu_usec)
