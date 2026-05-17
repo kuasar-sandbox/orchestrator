@@ -6,7 +6,7 @@ import (
 	"runtime"
 	"time"
 
-	"github.com/fullof-work/mass-sandbox/pkg/config"
+	"github.com/fullof-work/mass-sandbox/pkg/util"
 	"gopkg.in/yaml.v3"
 )
 
@@ -164,7 +164,7 @@ func (c *DaemonConfig) Resolve() (*Resolved, error) {
 		}
 		out.PhysicalMemory = mem
 	} else {
-		mem, err := config.ParseSize(c.Resources.PhysicalMemory)
+		mem, err := util.ParseSize(c.Resources.PhysicalMemory)
 		if err != nil {
 			return nil, fmt.Errorf("physical_memory: %w", err)
 		}
@@ -182,7 +182,7 @@ func (c *DaemonConfig) Resolve() (*Resolved, error) {
 		out.PhysicalCPU = uint64(cores) * 1000
 	}
 
-	hostMem, err := config.ParseSize(c.Resources.HostReserved.Memory)
+	hostMem, err := util.ParseSize(c.Resources.HostReserved.Memory)
 	if err != nil {
 		return nil, fmt.Errorf("host_reserved.memory: %w", err)
 	}
