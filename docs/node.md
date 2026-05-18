@@ -287,6 +287,11 @@ Heartbeat        (token, current_rss, current_cpu_usec, recent_high_count,
 
 Release          (token, reason)                                # reason ∈ {normal, error, ...}
                  → Ack
+
+Reattach         (token, current_state)                         # 断线重连后重新绑定(§5.3)
+                 → ReattachResponse (status, allocatable)
+                   status ∈ {ok, unknown_token};控制器以 sandbox-ctl
+                   上报的 current_state 为准同步该 reservation
 ```
 
 通知(控制器推,sandbox-ctl 接):
