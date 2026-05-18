@@ -46,7 +46,7 @@ UDS)协作。本文档定义这些进程在生产部署中的归属、责任边�
 
 | 进程 | 监听 | 协议 | 用途 |
 |---|---|---|---|
-| `store-ctl` | `127.0.0.1:7060` | gRPC | `Put` / `Get` / `GetSalt`(本机 cache-ctl + manifest-ctl 调用)|
+| `store-ctl` | `127.0.0.1:7100` | gRPC | `Put` / `Get` / `GetSalt`(本机 cache-ctl + manifest-ctl 调用)|
 | `store-ctl` | `127.0.0.1:7061` | gRPC health | 探针 |
 | `cache-ctl tiered` | `127.0.0.1:7070` | wire(自定义二进制 TCP)| 数据面:`sandbox-ctl` / `manifest-ctl` 拉 chunk |
 | `cache-ctl tiered` | `127.0.0.1:7071` | gRPC | health / `ping` / `info` |
@@ -55,6 +55,11 @@ UDS)协作。本文档定义这些进程在生产部署中的归属、责任边�
 
 `cache-ctl tiered` 的 EC 客户端通过节点对外网络拨号 L2 cluster 节点的 `7070`
 端口(详见 §3)。除此之外 compute 节点上没有任何**对外**的服务端口。
+
+运维侧:`/run/<sid>/ctl.sock` 除了承载 snapshot,也是 `sandbox-ctl exec
+--sandbox-id <sid> -- CMD` 的入口——在不打断应用的前提下进入一个运行中的
+沙箱排障(命令跑在应用的命名空间内,如 `docker exec`)。完整规格见
+[`docs/sandbox.md`](sandbox.md) §2.4。
 
 ### 2.3 持久化与运行时目录
 
@@ -115,7 +120,7 @@ RAM 工作集)。**overlay-ext4 模板必须复制一份**——它是沙箱写�
 - **per-sandbox MANIFEST_CONFIG**:每沙箱用各自租户的客户密钥;orchestrator-agent
   从平台管理面取密钥,落地为 `/run/<sid>/manifest.yaml`,生命周期跟沙箱走
 - **共享格式**:`manifest-ctl` 与 `sandbox-ctl` 用**同一**配置格式;两者都
-  **只**连本机 store-ctl(`127.0.0.1:7060`)+ 本机 cache-ctl(`127.0.0.1:7070`),
+  **只**连本机 store-ctl(`127.0.0.1:7100`)+ 本机 cache-ctl(`127.0.0.1:7070`),
   yaml 里的 endpoint 写 loopback
 - **不**走 env、不走全局默认:loader 要求显式 flag 指定路径(详见
   `docs/manifest.md` §3 loader 契约)
@@ -254,7 +259,7 @@ yaml 显式 access_key/secret_key  →  ~/.obsconfig  →  AWS SDK 默认凭证�
    │   sandbox-ctl  ── wire ObjectGet :7070 ──►  cache-ctl  tiered                                    │
    │                                                  │   L1 RocksDB                                  │
    │                                                  ├── wire EC fan-out (5 shards) ──► (L2 cluster) │
-   │                                                  └── origin gRPC :7060 ──► store-ctl  (sidecar)  │
+   │                                                  └── origin gRPC :7100 ──► store-ctl  (sidecar)  │
    │                                                                                       │          │
    │                                                                                       ▼  HTTPS   │
    │                                                                                   (OBS bucket)   │
@@ -289,7 +294,7 @@ yaml 显式 access_key/secret_key  →  ~/.obsconfig  →  AWS SDK 默认凭证�
    │           │  tenant pull credentials + customer encryption keys                                  │
    │           ▼                                                                                      │
    │   flatten-ctl  (CLI)  ── stdout EROFS ──►  manifest-ctl  (CLI)                                   │
-   │                                                  │  gRPC 127.0.0.1:7060                          │
+   │                                                  │  gRPC 127.0.0.1:7100                          │
    │                                                  ▼                                               │
    │                                             store-ctl  (sidecar)                                 │
    │                                                  │                                               │
@@ -391,7 +396,7 @@ Region 级:         OBS 桶 + 平台 / 展平管理面
 
 | 进程 | 配置位置 | 部署惯例 | Schema 文档 |
 |---|---|---|---|
-| `store-ctl` | `--config <path>` | `listen: 127.0.0.1:7060`(节点本机)| [`docs/store.md`](store.md) §3 |
+| `store-ctl` | `--config <path>` | `listen: 127.0.0.1:7100`(节点本机)| [`docs/store.md`](store.md) §3 |
 | `cache-ctl tiered` | `--config <path>` | `listen: 127.0.0.1:7070`(节点本机);`tiers[].cluster.peers` 写本 AZ L2 全集群 | [`docs/cache.md`](cache.md) §3.4 |
 | `cache-ctl shard` | `--config <path>` | `listen: 0.0.0.0:7070`(对外服务)| [`docs/cache.md`](cache.md) §3.3 |
 | `node-ctl daemon` | `/etc/node-ctl/node-ctl.yaml` | `listen: /run/sandbox-resource.sock` | [`docs/node.md`](node.md) §3 |

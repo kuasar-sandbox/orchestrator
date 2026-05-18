@@ -237,6 +237,13 @@ host 多次 snapshot 同内容 → 同名覆盖。
 I/O,~10 s 量级。本设计的 sandbox-ctl 持有 memfd + SEEK_DATA/HOLE 扫驻留页 =
 47 MiB 单次写,~1 GB/s 顺序写盘 = ~50 ms,**~200× I/O 减少**。
 
+`--upload`(入 store 而非落盘)路径的瓶颈在 chunk ingest 的网络往返,不在
+本地写盘:ingest 的 derive/encrypt/`Put` 现按 store 客户端连接池(`store.pool`)
+并发,而非串行单 `Put`(机制见 [`manifest.md`](manifest.md) §4.7)。多 GiB
+内存段上传由此从"串行往返累加"变为"池并发",壁钟随 `store.pool` 近似线性
+下降,直到打满 store-ctl 或带宽;`sandbox-ctl snapshot` 期间 stderr 打 ingest
+进度 + 收尾吞吐 profile 行(见 [`sandbox.md`](sandbox.md) §2.3)。
+
 ### 2.5 Restore 本地文件(基线)
 
 | 阶段 | 时间 |
