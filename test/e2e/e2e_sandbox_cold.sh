@@ -88,7 +88,7 @@ if [ -z "$BLK0_IMAGE" ]; then
     docker save "$IMAGE" | "$BIN/flatten-ctl" export --output "$BLK0_IMAGE" --no-progress
     echo "==> blk0 erofs ready ($(du -h "$BLK0_IMAGE" | cut -f1))"
     echo "==> appended config preview:"
-    "$BIN/flatten-ctl" info --input "$BLK0_IMAGE" 2>&1 | sed 's/^/    /' | head -20 || true
+    "$BIN/flatten-ctl" info "$BLK0_IMAGE" 2>&1 | sed 's/^/    /' | head -20 || true
 fi
 
 # ---- prepare sandbox.yaml -------------------------------------------------

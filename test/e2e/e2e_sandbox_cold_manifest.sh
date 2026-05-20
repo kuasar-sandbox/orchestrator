@@ -6,7 +6,7 @@
 # Pipeline:
 #   1. Spin up store-ctl and cache-ctl daemons.
 #   2. flatten-ctl python:3.12-slim → erofs (with appended config.json).
-#   3. manifest-ctl store --put-manifest → ingest erofs into store, emit
+#   3. manifest-ctl store → ingest erofs into store, emit
 #      a 32-byte hex manifest content key.
 #   4. Write sandbox.yaml with boot.root.base: manifest://<hex>.
 #   5. sandbox-ctl run pulls the manifest blob, decodes, builds a Fetcher,
@@ -162,7 +162,7 @@ cache:
   endpoint: 127.0.0.1:$CACHE_PORT
   pool: 4
   timeout: 5s
-chunk:
+chunker:
   mode: cdc
 crypto:
   chunk: aes
@@ -183,9 +183,9 @@ docker save "$IMAGE" | "$BIN/flatten-ctl" export --output "$BLK0_EROFS" --no-pro
 # Cache-ctl runs in-band with store-ctl as the read tier here; ingest
 # always writes through the store directly (Filler path). The first
 # sandbox-ctl read populates the cache.
-echo "==> manifest-ctl store --put-manifest"
-MKEY=$("$BIN/manifest-ctl" store --config "$WORK/accelerator.yaml" \
-    --input "$BLK0_EROFS" --put-manifest --no-progress)
+echo "==> manifest-ctl store"
+MKEY=$("$BIN/manifest-ctl" store --manifest-config "$WORK/accelerator.yaml" \
+    --no-progress "$BLK0_EROFS")
 echo "    blk0 manifest key: $MKEY"
 [ ${#MKEY} -eq 64 ] || { echo "FAIL: manifest key length ${#MKEY} != 64 hex chars"; exit 1; }
 
@@ -279,12 +279,12 @@ END_MS=$(ms_delta "$T0_NS" "$T_END_NS")
 echo "    T0 → sandbox-ctl exit:               ${END_MS} ms"
 
 # Confirm manifest:// path actually engaged: sandbox-ctl logs
-# "accelerator runtime: store=... cache=... crypto=..." once it dialled
+# "manifest fetcher: store=... cache=... crypto=..." once it dialled
 # the daemons.
-if grep -q "accelerator runtime: store=" "$LOG"; then
-    echo "==> PASS: accelerator runtime engaged (manifest:// path verified)"
+if grep -q "manifest fetcher: store=" "$LOG"; then
+    echo "==> PASS: manifest fetcher engaged (manifest:// path verified)"
 else
-    echo "==> FAIL: accelerator runtime log line missing — manifest:// path may not have been used"
+    echo "==> FAIL: manifest fetcher log line missing — manifest:// path may not have been used"
     exit 1
 fi
 

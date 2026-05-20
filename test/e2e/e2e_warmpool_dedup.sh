@@ -153,7 +153,7 @@ cache:
   endpoint: 127.0.0.1:$CACHE_PORT
   pool: 4
   timeout: 10s
-chunk:
+chunker:
   mode: cdc
 crypto:
   chunk: aes
@@ -174,10 +174,9 @@ docker save "$IMAGE" | "$BIN/flatten-ctl" export --output "$BLK0_EROFS" --no-pro
 # manifest at boot via boot.root.base = manifest://<BLK0_MKEY>.
 echo "==> ingest blk0 → store"
 BLK0_MKEY=$("$BIN/manifest-ctl" store \
-    --config "$WORK/accelerator.yaml" \
-    --input "$BLK0_EROFS" \
-    --put-manifest \
-    --no-progress)
+    --manifest-config "$WORK/accelerator.yaml" \
+    --no-progress \
+    "$BLK0_EROFS")
 [ ${#BLK0_MKEY} -eq 64 ] || { echo "FAIL: bad BLK0_MKEY length=${#BLK0_MKEY}"; exit 1; }
 echo "    blk0 manifest key: $BLK0_MKEY"
 
@@ -328,10 +327,9 @@ EOF
     # so we can manifest-diff it against other sandboxes' overlays.
     echo "    ingest blk1 overlay → store"
     BLK1_MKEY=$("$BIN/manifest-ctl" store \
-        --config "$WORK/accelerator.yaml" \
-        --input "$DIFF_FILE" \
-        --put-manifest \
-        --no-progress)
+        --manifest-config "$WORK/accelerator.yaml" \
+        --no-progress \
+        "$DIFF_FILE")
     [ ${#BLK1_MKEY} -eq 64 ] || { echo "FAIL: bad BLK1_MKEY for sandbox $i: '$BLK1_MKEY'"; exit 1; }
     BLK1_MKEYS[i]="$BLK1_MKEY"
     echo "    blk1 manifest:     $BLK1_MKEY"
@@ -344,15 +342,15 @@ echo "==> pulling manifests from store to local files"
 LOCAL="$WORK/manifests"
 mkdir -p "$LOCAL"
 "$BIN/manifest-ctl" get-manifest \
-    --config "$WORK/accelerator.yaml" \
-    --key "$BLK0_MKEY" --output "$LOCAL/blk0.manifest"
+    --manifest-config "$WORK/accelerator.yaml" \
+    --output "$LOCAL/blk0.manifest" "$BLK0_MKEY"
 for i in $(seq 1 "$N"); do
     "$BIN/manifest-ctl" get-manifest \
-        --config "$WORK/accelerator.yaml" \
-        --key "${SNAP_MKEYS[i]}" --output "$LOCAL/snap-$i.manifest"
+        --manifest-config "$WORK/accelerator.yaml" \
+        --output "$LOCAL/snap-$i.manifest" "${SNAP_MKEYS[i]}"
     "$BIN/manifest-ctl" get-manifest \
-        --config "$WORK/accelerator.yaml" \
-        --key "${BLK1_MKEYS[i]}" --output "$LOCAL/blk1-$i.manifest"
+        --manifest-config "$WORK/accelerator.yaml" \
+        --output "$LOCAL/blk1-$i.manifest" "${BLK1_MKEYS[i]}"
 done
 
 # ---- pairwise diff matrices --------------------------------------------
@@ -458,7 +456,7 @@ total_chunks_in_store_alt=$(find "$WORK/store-data/chunk" -type f 2>/dev/null | 
 [ "$total_chunks_in_store" -eq 0 ] && total_chunks_in_store="$total_chunks_in_store_alt"
 sum_per_manifest=0
 for f in "$LOCAL/blk0.manifest" "${BLK1_FILES[@]}" "${SNAP_FILES[@]}"; do
-    n=$("$BIN/manifest-ctl" info --manifest "$f" 2>/dev/null | awk '/^chunk count:/ {print $3; exit}')
+    n=$("$BIN/manifest-ctl" info "$f" 2>/dev/null | awk '/^chunk count:/ {print $3; exit}')
     if [ -n "$n" ] && [ "$n" -eq "$n" ] 2>/dev/null; then
         sum_per_manifest=$((sum_per_manifest + n))
     fi

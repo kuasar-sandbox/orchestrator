@@ -96,13 +96,13 @@ store:
   endpoint: 127.0.0.1:$STORE_PORT
   pool: 2
   timeout: 5s
-chunk:
+chunker:
   mode: cdc
 crypto:
   chunk: aes
   manifest: aes
 EOF
-COMMON="--config $TMPDIR/accelerator.yaml"
+COMMON="--manifest-config $TMPDIR/accelerator.yaml"
 
 # manifest-ctl no longer accepts --cache-endpoint flag override. Build
 # a YAML variant on demand and pass --config explicitly.
@@ -116,7 +116,7 @@ store:
   endpoint: 127.0.0.1:$STORE_PORT
   pool: 2
   timeout: 5s
-chunk:
+chunker:
   mode: cdc
 crypto:
   chunk: aes
@@ -211,25 +211,23 @@ wait_ready "127.0.0.1:$TIERED_HEALTH_PORT"
 # shards land on {p1..p5}). Record original SHA256 of each blob.
 # ============================================================
 N=20
-declare -a MANIFESTS=()
+declare -a MKEYS=()
 declare -a ORIG_HASHES=()
 echo "=== Populating $N keys into EC cluster {s1..s5} ==="
 for i in $(seq 1 $N); do
     dd if=/dev/urandom of="$TMPDIR/val-$i.bin" bs=1024 count=32 2>/dev/null
-    "$BIN/manifest-ctl" store $COMMON --input "$TMPDIR/val-$i.bin" \
-        --manifest "$TMPDIR/val-$i.manifest" --no-progress 2>/dev/null
-    MANIFESTS+=("$TMPDIR/val-$i.manifest")
+    MKEYS+=("$("$BIN/manifest-ctl" store $COMMON --no-progress "$TMPDIR/val-$i.bin" 2>/dev/null)")
     ORIG_HASHES+=("$(sha256sum $TMPDIR/val-$i.bin | awk '{print $1}')")
 done
-echo "  $N manifests stored."
+echo "  $N manifest keys stored."
 
 # Pre-warm the EC tier: read all N through tiered client so each key
 # gets its 5 shards distributed and filled on {p1..p5}.
 echo "=== Pre-warm: load each manifest through tiered (populates EC cache) ==="
 for i in $(seq 1 $N); do
-    "$BIN/manifest-ctl" load --config "$(accel_cfg_for_cache "127.0.0.1:$TIERED_PORT")" \
-        --manifest "$TMPDIR/val-$i.manifest" --output "$TMPDIR/val-$i.prewarm" \
-        --no-progress 2>/dev/null
+    "$BIN/manifest-ctl" load --manifest-config "$(accel_cfg_for_cache "127.0.0.1:$TIERED_PORT")" \
+        --output "$TMPDIR/val-$i.prewarm" \
+        --no-progress "${MKEYS[$((i-1))]}" 2>/dev/null
 done
 ok "$N keys prewarmed through EC tier"
 
@@ -251,9 +249,9 @@ sleep 1
 echo "=== Read $N keys after membership change ==="
 all_match=1
 for i in $(seq 1 $N); do
-    "$BIN/manifest-ctl" load --config "$(accel_cfg_for_cache "127.0.0.1:$TIERED_PORT")" \
-        --manifest "$TMPDIR/val-$i.manifest" --output "$TMPDIR/val-$i.postswap" \
-        --no-progress 2>/dev/null
+    "$BIN/manifest-ctl" load --manifest-config "$(accel_cfg_for_cache "127.0.0.1:$TIERED_PORT")" \
+        --output "$TMPDIR/val-$i.postswap" \
+        --no-progress "${MKEYS[$((i-1))]}" 2>/dev/null
     h=$(sha256sum "$TMPDIR/val-$i.postswap" | awk '{print $1}')
     if [ "$h" != "${ORIG_HASHES[$((i-1))]}" ]; then
         fail "key $i hash mismatch after membership swap"
@@ -275,9 +273,9 @@ echo "=== Second SIGHUP (idempotent-ish: membership {s2..s6} again) ==="
 kill -HUP "$TIERED_PID"
 sleep 0.5
 # Reads should still work.
-"$BIN/manifest-ctl" load --config "$(accel_cfg_for_cache "127.0.0.1:$TIERED_PORT")" \
-    --manifest "$TMPDIR/val-1.manifest" --output "$TMPDIR/val-1.idem" \
-    --no-progress 2>/dev/null
+"$BIN/manifest-ctl" load --manifest-config "$(accel_cfg_for_cache "127.0.0.1:$TIERED_PORT")" \
+    --output "$TMPDIR/val-1.idem" \
+    --no-progress "${MKEYS[0]}" 2>/dev/null
 h=$(sha256sum "$TMPDIR/val-1.idem" | awk '{print $1}')
 assert_eq "${ORIG_HASHES[0]}" "$h" "second SIGHUP leaves reads working"
 

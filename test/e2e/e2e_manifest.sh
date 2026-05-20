@@ -102,7 +102,7 @@ store:
   endpoint: 127.0.0.1:$STORE_PORT
   pool: 2
   timeout: 10s
-chunk:
+chunker:
   mode: cdc
 crypto:
   chunk: aes
@@ -111,7 +111,7 @@ EOF
 
 # Manifest config no longer accepts CLI flag overrides (--chunk-mode,
 # --crypto-chunk, etc. were removed). Pre-render the alternate configs
-# the test cases below need, and pass --config explicitly per case.
+# the test cases below need, and pass --manifest-config explicitly per case.
 cat > "$TMPDIR/accelerator-fixed.yaml" <<EOF
 manifest:
   key: "$KEY"
@@ -119,7 +119,7 @@ store:
   endpoint: 127.0.0.1:$STORE_PORT
   pool: 2
   timeout: 10s
-chunk:
+chunker:
   mode: fixed
   fixed:
     size: 512KiB
@@ -135,7 +135,7 @@ store:
   endpoint: 127.0.0.1:$STORE_PORT
   pool: 2
   timeout: 10s
-chunk:
+chunker:
   mode: fixed
   fixed:
     size: 64KiB
@@ -151,14 +151,14 @@ store:
   endpoint: 127.0.0.1:$STORE_PORT
   pool: 2
   timeout: 10s
-chunk:
+chunker:
   mode: cdc
 crypto:
   chunk: fake
   manifest: fake
 EOF
 
-COMMON="--config $TMPDIR/accelerator.yaml"
+COMMON="--manifest-config $TMPDIR/accelerator.yaml"
 
 # Ensure both images are available locally before any test starts;
 # eager-pull avoids dragging a multi-minute `docker pull` progress
@@ -194,7 +194,7 @@ fi
 
 # `flatten-ctl info --json` should report a valid erofs_size and a
 # non-null Architecture (Docker images we test with always carry it).
-INFO_JSON=$("$BIN/flatten-ctl" info --json --input "$TMPDIR/image-a.erofs")
+INFO_JSON=$("$BIN/flatten-ctl" info --json "$TMPDIR/image-a.erofs")
 EROFS_SIZE=$(echo "$INFO_JSON" | python3 -c 'import sys,json; print(json.load(sys.stdin)["erofs_size"])')
 ARCH=$(echo "$INFO_JSON" | python3 -c 'import sys,json; print(json.load(sys.stdin)["config"].get("Architecture",""))')
 if [ "$EROFS_SIZE" -gt 0 ] && [ "$EROFS_SIZE" -lt "$SIZE" ]; then
@@ -223,8 +223,11 @@ fi
 # ============================================================
 echo ""
 echo "=== Test 2: Store + roundtrip ==="
-"$BIN/manifest-ctl" store $COMMON --input "$TMPDIR/image-a.erofs" --manifest "$TMPDIR/image-a.manifest" --no-progress 2>&1
-"$BIN/manifest-ctl" load $COMMON --manifest "$TMPDIR/image-a.manifest" --output "$TMPDIR/image-a-restored.erofs" --no-progress 2>&1
+# store ingests the image, uploads its manifest, and prints the hex
+# manifest content key on stdout (the summary goes to stderr).
+MKEY_A=$("$BIN/manifest-ctl" store $COMMON --no-progress "$TMPDIR/image-a.erofs")
+echo "  image-a manifest key: $MKEY_A"
+"$BIN/manifest-ctl" load $COMMON --output "$TMPDIR/image-a-restored.erofs" --no-progress "$MKEY_A"
 
 H1=$(sha256sum "$TMPDIR/image-a.erofs" | awk '{print $1}')
 H2=$(sha256sum "$TMPDIR/image-a-restored.erofs" | awk '{print $1}')
@@ -233,8 +236,8 @@ assert_eq "$H1" "$H2" "store → load roundtrip matches"
 # ============================================================
 echo ""
 echo "=== Test 3: Dedup (same image stored twice) ==="
-OUTPUT=$("$BIN/manifest-ctl" store $COMMON --input "$TMPDIR/image-a.erofs" --manifest "$TMPDIR/image-a-dup.manifest" --no-progress 2>&1)
-STORED=$(echo "$OUTPUT" | grep "stored" | grep -oP 'stored \K[0-9]+')
+OUTPUT=$("$BIN/manifest-ctl" store $COMMON --no-progress "$TMPDIR/image-a.erofs" 2>&1)
+STORED=$(echo "$OUTPUT" | grep "chunks:" | grep -oP 'stored=\K[0-9]+')
 if [ "$STORED" = "0" ]; then
     ok "100% dedup on second store (0 new chunks)"
 else
@@ -243,8 +246,8 @@ fi
 
 # ============================================================
 echo ""
-echo "=== Test 4: Info ==="
-OUTPUT=$("$BIN/manifest-ctl" info --manifest "$TMPDIR/image-a.manifest" 2>&1)
+echo "=== Test 4: Info (via manifest:// fetch) ==="
+OUTPUT=$("$BIN/manifest-ctl" info $COMMON "manifest://$MKEY_A" 2>&1)
 if echo "$OUTPUT" | grep -q "chunk mode"; then
     ok "info shows chunk mode"
 else
@@ -259,7 +262,7 @@ fi
 # ============================================================
 echo ""
 echo "=== Test 5: Verify ==="
-OUTPUT=$("$BIN/manifest-ctl" verify $COMMON --manifest "$TMPDIR/image-a.manifest" --no-progress 2>&1)
+OUTPUT=$("$BIN/manifest-ctl" verify $COMMON --no-progress "$MKEY_A" 2>&1)
 if echo "$OUTPUT" | grep -q "failed: 0"; then
     ok "verify passed with 0 failures"
 else
@@ -268,29 +271,35 @@ fi
 
 # ============================================================
 echo ""
-echo "=== Test 6: Put-manifest + get-manifest roundtrip ==="
-MKEY=$("$BIN/manifest-ctl" put-manifest $COMMON --input "$TMPDIR/image-a.manifest")
-echo "  Manifest content key: $MKEY"
-"$BIN/manifest-ctl" get-manifest $COMMON --key "$MKEY" --output "$TMPDIR/image-a-from-store.manifest"
-
+echo "=== Test 6: get-manifest (idempotent blob retrieval + materialize) ==="
+# store already uploaded the manifest; get-manifest pulls the raw blob
+# back by key. Fetching twice must yield byte-identical blobs. The
+# first copy doubles as the on-disk manifest used by the diff tests.
+"$BIN/manifest-ctl" get-manifest $COMMON --output "$TMPDIR/image-a.manifest" "$MKEY_A"
+"$BIN/manifest-ctl" get-manifest $COMMON --output "$TMPDIR/image-a-again.manifest" "$MKEY_A"
 HM1=$(sha256sum "$TMPDIR/image-a.manifest" | awk '{print $1}')
-HM2=$(sha256sum "$TMPDIR/image-a-from-store.manifest" | awk '{print $1}')
-assert_eq "$HM1" "$HM2" "put-manifest → get-manifest roundtrip matches"
+HM2=$(sha256sum "$TMPDIR/image-a-again.manifest" | awk '{print $1}')
+assert_eq "$HM1" "$HM2" "get-manifest twice yields byte-identical blob"
 
 # ============================================================
 echo ""
-echo "=== Test 7: Get-manifest → load pipeline ==="
-"$BIN/manifest-ctl" get-manifest $COMMON --key "$MKEY" | \
-    "$BIN/manifest-ctl" load $COMMON --output "$TMPDIR/image-a-pipe.erofs" --no-progress 2>&1
-
-H3=$(sha256sum "$TMPDIR/image-a-pipe.erofs" | awk '{print $1}')
-assert_eq "$H1" "$H3" "get-manifest | load pipeline matches original"
+echo "=== Test 7: get-manifest | info - (stdin manifest inspection) ==="
+# load takes a key, not a manifest blob, so the old get-manifest|load
+# pipe no longer applies. Pipe the fetched blob into info's stdin path
+# instead to prove it is a well-formed manifest.
+OUTPUT=$("$BIN/manifest-ctl" get-manifest $COMMON "$MKEY_A" | "$BIN/manifest-ctl" info -)
+if echo "$OUTPUT" | grep -q "chunk count"; then
+    ok "get-manifest | info - parses the piped manifest blob"
+else
+    fail "info - failed to parse piped manifest blob"
+fi
 
 # ============================================================
 echo ""
 echo "=== Test 8: Cross-image diff ($IMAGE_A vs $IMAGE_B) ==="
 docker save "$IMAGE_B" | "$BIN/flatten-ctl" export --output "$TMPDIR/image-b.erofs" --no-progress 2>&1
-"$BIN/manifest-ctl" store $COMMON --input "$TMPDIR/image-b.erofs" --manifest "$TMPDIR/image-b.manifest" --no-progress 2>&1
+MKEY_B=$("$BIN/manifest-ctl" store $COMMON --no-progress "$TMPDIR/image-b.erofs")
+"$BIN/manifest-ctl" get-manifest $COMMON --output "$TMPDIR/image-b.manifest" "$MKEY_B"
 OUTPUT=$("$BIN/manifest-ctl" diff "$TMPDIR/image-a.manifest" "$TMPDIR/image-b.manifest" 2>&1)
 echo "  $OUTPUT" | head -5
 if echo "$OUTPUT" | grep -q "shared"; then
@@ -302,7 +311,8 @@ fi
 # ============================================================
 echo ""
 echo "=== Test 9: Fixed chunking vs CDC ==="
-"$BIN/manifest-ctl" store --config "$TMPDIR/accelerator-fixed.yaml" --input "$TMPDIR/image-a.erofs" --manifest "$TMPDIR/image-a-fixed.manifest" --no-progress 2>&1
+MKEY_FIXED=$("$BIN/manifest-ctl" store --manifest-config "$TMPDIR/accelerator-fixed.yaml" --no-progress "$TMPDIR/image-a.erofs")
+"$BIN/manifest-ctl" get-manifest $COMMON --output "$TMPDIR/image-a-fixed.manifest" "$MKEY_FIXED"
 OUTPUT=$("$BIN/manifest-ctl" diff "$TMPDIR/image-a.manifest" "$TMPDIR/image-a-fixed.manifest" 2>&1)
 echo "  $OUTPUT" | head -5
 ok "CDC vs fixed diff completed"
@@ -310,45 +320,30 @@ ok "CDC vs fixed diff completed"
 # ============================================================
 echo ""
 echo "=== Test 10: Fake crypto roundtrip ==="
-"$BIN/manifest-ctl" store --config "$TMPDIR/accelerator-fake.yaml" --input "$TMPDIR/image-a.erofs" --manifest "$TMPDIR/image-a-fake.manifest" \
-    --crypto-fake --no-progress 2>&1
-"$BIN/manifest-ctl" load --config "$TMPDIR/accelerator-fake.yaml" --manifest "$TMPDIR/image-a-fake.manifest" --output "$TMPDIR/image-a-fake-restored.erofs" \
-    --crypto-fake --no-progress 2>&1
+# crypto mode comes from the config (chunk: fake / manifest: fake);
+# there is no per-invocation --crypto-fake flag.
+MKEY_FAKE=$("$BIN/manifest-ctl" store --manifest-config "$TMPDIR/accelerator-fake.yaml" --no-progress "$TMPDIR/image-a.erofs")
+"$BIN/manifest-ctl" load --manifest-config "$TMPDIR/accelerator-fake.yaml" --output "$TMPDIR/image-a-fake-restored.erofs" --no-progress "$MKEY_FAKE"
 
 H4=$(sha256sum "$TMPDIR/image-a-fake-restored.erofs" | awk '{print $1}')
 assert_eq "$H1" "$H4" "fake crypto store → load roundtrip matches"
 
 # ============================================================
 echo ""
-echo "=== Test 11: Full pipeline (store → put-manifest → get-manifest → load) ==="
-MKEY2=$(cat "$TMPDIR/image-a.erofs" | \
-    "$BIN/manifest-ctl" store $COMMON --no-progress | \
-    "$BIN/manifest-ctl" put-manifest $COMMON)
-echo "  Pipeline manifest key: $MKEY2"
-"$BIN/manifest-ctl" get-manifest $COMMON --key "$MKEY2" | \
-    "$BIN/manifest-ctl" load $COMMON --output "$TMPDIR/image-a-fullpipe.erofs" --no-progress 2>&1
+echo "=== Test 11: stdin store + load roundtrip ==="
+# store reads the image from stdin (no positional input) and prints the
+# manifest key; load reconstructs by key. This is the one-step model —
+# no separate put-manifest stage.
+MKEY_PIPE=$(cat "$TMPDIR/image-a.erofs" | "$BIN/manifest-ctl" store $COMMON --no-progress)
+echo "  stdin-store manifest key: $MKEY_PIPE"
+"$BIN/manifest-ctl" load $COMMON --output "$TMPDIR/image-a-fullpipe.erofs" --no-progress "$MKEY_PIPE"
 
 H5=$(sha256sum "$TMPDIR/image-a-fullpipe.erofs" | awk '{print $1}')
-assert_eq "$H1" "$H5" "full pipeline roundtrip matches"
+assert_eq "$H1" "$H5" "stdin store + load roundtrip matches original"
 
 # ============================================================
 echo ""
-echo "=== Test 12: Short-form roundtrip (store --put-manifest + load --get-manifest) ==="
-# store --put-manifest: Manifest 直接落 Store，stdout 是 hex key。
-# 注意：Manifest 的 sealed key table 使用 AES-GCM，nonce 随机化，所以每次
-# store 产出的 manifest bytes 都不同 → content key 也不同。这不是 bug，
-# 只是说"两次 store 同一内容会得到两个不同的 manifest key"，语义等价即可。
-MKEY3=$("$BIN/manifest-ctl" store $COMMON --no-progress \
-    --input "$TMPDIR/image-a.erofs" --put-manifest)
-echo "  Short-form manifest key: $MKEY3"
-"$BIN/manifest-ctl" load $COMMON --no-progress \
-    --get-manifest "$MKEY3" --output "$TMPDIR/image-a-shortform.erofs"
-H6=$(sha256sum "$TMPDIR/image-a-shortform.erofs" | awk '{print $1}')
-assert_eq "$H1" "$H6" "short-form roundtrip matches original"
-
-# ============================================================
-echo ""
-echo "=== Test 13: Sparse file roundtrip (zero-block optimization) ==="
+echo "=== Test 12: Sparse file roundtrip (zero-block optimization) ==="
 # 8 MiB sparse file: 1 MiB random data + 7 MiB zeros. Verify the
 # all-zero optimization path: most chunks are IsZero, manifest size is
 # small (compressed key table), and round-trip reconstructs identical
@@ -359,13 +354,13 @@ dd if=/dev/zero    of="$SPARSE" bs=1M count=7 seek=1 conv=notrunc status=none
 SPARSE_HASH=$(sha256sum "$SPARSE" | awk '{print $1}')
 
 # Use fixed chunking so we can predict counts: 8 MiB / 64 KiB = 128 chunks total.
-"$BIN/manifest-ctl" store --config "$TMPDIR/accelerator-fixed-64k.yaml" --no-progress \
-    --input "$SPARSE" --manifest "$TMPDIR/sparse.manifest" 2>"$TMPDIR/sparse-store.stderr"
+MKEY_SPARSE=$("$BIN/manifest-ctl" store --manifest-config "$TMPDIR/accelerator-fixed-64k.yaml" --no-progress \
+    "$SPARSE" 2>"$TMPDIR/sparse-store.stderr")
 
-# Parse the "chunks: N (stored S, dedup D, zero W)" summary line.
+# Parse the "chunks: stored=S dedup=D zero=W" summary line.
 SUMMARY=$(grep -E '^chunks:' "$TMPDIR/sparse-store.stderr" | head -1)
-ZERO_W=$(echo "$SUMMARY" | sed -E 's/.*zero ([0-9]+).*/\1/')
-STORED_S=$(echo "$SUMMARY" | sed -E 's/.*stored ([0-9]+).*/\1/')
+ZERO_W=$(echo "$SUMMARY" | sed -E 's/.*zero=([0-9]+).*/\1/')
+STORED_S=$(echo "$SUMMARY" | sed -E 's/.*stored=([0-9]+).*/\1/')
 echo "  sparse store summary: $SUMMARY"
 if [ -z "$ZERO_W" ] || [ "$ZERO_W" -lt 100 ]; then
     fail "expected ≥100 zero chunks for 7/8 MiB sparse file (got: '$ZERO_W')"
@@ -373,14 +368,14 @@ else
     ok "sparse ingest: $ZERO_W zero chunks detected, $STORED_S stored"
 fi
 
-# info command must also report zero chunks count > 0.
-"$BIN/manifest-ctl" info --manifest "$TMPDIR/sparse.manifest" > "$TMPDIR/sparse-info.txt"
+# Materialize the manifest blob; info must report the same zero count.
+"$BIN/manifest-ctl" get-manifest $COMMON --output "$TMPDIR/sparse.manifest" "$MKEY_SPARSE"
+"$BIN/manifest-ctl" info "$TMPDIR/sparse.manifest" > "$TMPDIR/sparse-info.txt"
 INFO_ZERO=$(grep -E '^zero chunks:' "$TMPDIR/sparse-info.txt" | sed -E 's/zero chunks:\s+([0-9]+).*/\1/')
 assert_eq "$ZERO_W" "$INFO_ZERO" "info reports same zero count as store summary"
 
-# Round-trip: load and compare SHA256.
-"$BIN/manifest-ctl" load $COMMON --no-progress \
-    --manifest "$TMPDIR/sparse.manifest" --output "$TMPDIR/sparse.rt"
+# Round-trip: load by key and compare SHA256.
+"$BIN/manifest-ctl" load $COMMON --no-progress --output "$TMPDIR/sparse.rt" "$MKEY_SPARSE"
 RT_HASH=$(sha256sum "$TMPDIR/sparse.rt" | awk '{print $1}')
 assert_eq "$SPARSE_HASH" "$RT_HASH" "sparse file roundtrip matches"
 
@@ -400,7 +395,7 @@ fi
 
 # ============================================================
 echo ""
-echo "=== Test 14: Sparse file with holes (--detect-holes + --hole=zero/punch) ==="
+echo "=== Test 13: Sparse file with holes (--detect-holes + --hole=zero/punch) ==="
 # 8 MiB sparse file: 1 MiB random + 7 MiB hole. truncate creates a
 # real filesystem hole (not zero-fill); dd at offset 0 writes the
 # leading data without touching the trailing hole region.
@@ -416,29 +411,25 @@ HOLED_ALLOC=$((HOLED_BLOCKS * HOLED_BSIZE))
 echo "  source: apparent=8MiB allocated=$HOLED_ALLOC bytes"
 
 # Store with --detect-holes; fixed chunking so we can predict counts.
-"$BIN/manifest-ctl" store --config "$TMPDIR/accelerator-fixed-64k.yaml" --no-progress \
-    --detect-holes --input "$HOLED" --manifest "$TMPDIR/holed.manifest" 2>"$TMPDIR/holed-store.stderr"
+MKEY_HOLED=$("$BIN/manifest-ctl" store --manifest-config "$TMPDIR/accelerator-fixed-64k.yaml" --no-progress \
+    --detect-holes "$HOLED" 2>"$TMPDIR/holed-store.stderr")
 
-# Verify the manifest carries holes.
-HOLE_LINE=$(grep -E '^holes:' "$TMPDIR/holed-store.stderr" | head -1)
-if [ -z "$HOLE_LINE" ]; then
-    fail "store summary missing 'holes:' line — --detect-holes ineffective"
-else
-    ok "store detected holes: $HOLE_LINE"
-fi
-
-# info also reports the hole.
-"$BIN/manifest-ctl" info --manifest "$TMPDIR/holed.manifest" > "$TMPDIR/holed-info.txt"
+# info is the source of truth for hole extents: the store summary
+# carries no holes line, so we materialize the manifest and read its
+# holes count back — which transitively proves --detect-holes recorded
+# them at ingest.
+"$BIN/manifest-ctl" get-manifest $COMMON --output "$TMPDIR/holed.manifest" "$MKEY_HOLED"
+"$BIN/manifest-ctl" info "$TMPDIR/holed.manifest" > "$TMPDIR/holed-info.txt"
 INFO_HOLES=$(grep -E '^holes:' "$TMPDIR/holed-info.txt" | sed -E 's/holes:\s+([0-9]+).*/\1/')
 if [ "$INFO_HOLES" -lt 1 ]; then
-    fail "info shows holes=$INFO_HOLES, expected ≥1"
+    fail "info shows holes=$INFO_HOLES, expected ≥1 (--detect-holes ineffective)"
 else
-    ok "info reports $INFO_HOLES hole extent(s)"
+    ok "store --detect-holes recorded $INFO_HOLES hole extent(s) (via info)"
 fi
 
 # Default --hole=error rejects the manifest.
 if "$BIN/manifest-ctl" load $COMMON --no-progress \
-        --manifest "$TMPDIR/holed.manifest" --output "$TMPDIR/holed-error.out" 2>"$TMPDIR/holed-load-err.stderr"; then
+        --output "$TMPDIR/holed-error.out" "$MKEY_HOLED" 2>"$TMPDIR/holed-load-err.stderr"; then
     fail "default --hole=error should have failed but did not"
 else
     ok "default policy rejected manifest with hole"
@@ -446,13 +437,13 @@ fi
 
 # --hole=zero: synthesize zeros for hole region, output bytes-equal to source.
 "$BIN/manifest-ctl" load $COMMON --no-progress --hole=zero \
-    --manifest "$TMPDIR/holed.manifest" --output "$TMPDIR/holed-zero.out" 2>&1 >/dev/null
+    --output "$TMPDIR/holed-zero.out" "$MKEY_HOLED" 2>&1 >/dev/null
 ZERO_HASH=$(sha256sum "$TMPDIR/holed-zero.out" | awk '{print $1}')
 assert_eq "$HOLED_HASH" "$ZERO_HASH" "--hole=zero output bytes-equal to sparse source"
 
 # --hole=punch: output should be a sparse file (allocation < apparent size).
 "$BIN/manifest-ctl" load $COMMON --no-progress --hole=punch \
-    --manifest "$TMPDIR/holed.manifest" --output "$TMPDIR/holed-punch.out" 2>&1 >/dev/null
+    --output "$TMPDIR/holed-punch.out" "$MKEY_HOLED" 2>&1 >/dev/null
 PUNCH_HASH=$(sha256sum "$TMPDIR/holed-punch.out" | awk '{print $1}')
 assert_eq "$HOLED_HASH" "$PUNCH_HASH" "--hole=punch output bytes-equal to sparse source"
 PUNCH_BLOCKS=$(stat -c '%b' "$TMPDIR/holed-punch.out")

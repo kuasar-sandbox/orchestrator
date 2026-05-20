@@ -102,7 +102,7 @@ store:
   endpoint: 127.0.0.1:${STORE_PORT}
   pool: 2
   timeout: 30s
-chunk:
+chunker:
   mode: cdc
 crypto:
   chunk: aes
@@ -134,15 +134,15 @@ fi
 dd if=/dev/urandom of="$WORK/payload.bin" bs=4096 count=64 status=none
 ORIG_HASH=$(sha256sum "$WORK/payload.bin" | awk '{print $1}')
 
-echo "==> manifest-ctl store --put-manifest"
-MKEY=$("$BIN/manifest-ctl" store --config "$WORK/accelerator.yaml" \
-    --input "$WORK/payload.bin" --put-manifest --no-progress)
+echo "==> manifest-ctl store"
+MKEY=$("$BIN/manifest-ctl" store --manifest-config "$WORK/accelerator.yaml" \
+    --no-progress "$WORK/payload.bin")
 [ ${#MKEY} -eq 64 ] || { echo "FAIL: bad manifest key length ${#MKEY}"; exit 1; }
 echo "    manifest key: $MKEY"
 
 echo "==> manifest-ctl load (round-trip via OBS)"
-"$BIN/manifest-ctl" load --config "$WORK/accelerator.yaml" \
-    --get-manifest "$MKEY" --output "$WORK/restored.bin" --no-progress
+"$BIN/manifest-ctl" load --manifest-config "$WORK/accelerator.yaml" \
+    --output "$WORK/restored.bin" --no-progress "$MKEY"
 RESTORED_HASH=$(sha256sum "$WORK/restored.bin" | awk '{print $1}')
 
 if [ "$ORIG_HASH" != "$RESTORED_HASH" ]; then
@@ -155,9 +155,9 @@ echo "    PASS: round-trip hash matches"
 
 # ─── dedup verification ────────────────────────────────────────────────
 echo "==> dedup: store same payload again, expect 0 new chunks"
-OUT=$("$BIN/manifest-ctl" store --config "$WORK/accelerator.yaml" \
-    --input "$WORK/payload.bin" --manifest "$WORK/dup.manifest" --no-progress 2>&1)
-STORED=$(echo "$OUT" | grep "chunks:" | grep -oP 'stored \K[0-9]+' || echo "?")
+OUT=$("$BIN/manifest-ctl" store --manifest-config "$WORK/accelerator.yaml" \
+    --no-progress "$WORK/payload.bin" 2>&1)
+STORED=$(echo "$OUT" | grep "chunks:" | grep -oP 'stored=\K[0-9]+' || echo "?")
 if [ "$STORED" = "0" ]; then
     echo "    PASS: dedup hit (0 new chunks on second store)"
 else
@@ -167,8 +167,8 @@ fi
 
 # ─── manifest verify (re-decrypt + re-hash every chunk) ────────────────
 echo "==> manifest verify (round-trip every chunk via OBS)"
-"$BIN/manifest-ctl" verify --config "$WORK/accelerator.yaml" \
-    --manifest "$WORK/dup.manifest" --no-progress
+"$BIN/manifest-ctl" verify --manifest-config "$WORK/accelerator.yaml" \
+    --no-progress "$MKEY"
 
 # ─── self-cleanup ──────────────────────────────────────────────────────
 # Wipe the per-run prefix so concurrent / repeat runs don't accumulate

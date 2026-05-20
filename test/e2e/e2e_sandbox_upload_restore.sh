@@ -134,7 +134,7 @@ cache:
   endpoint: 127.0.0.1:$CACHE_PORT
   pool: 4
   timeout: 10s
-chunk:
+chunker:
   mode: cdc
 crypto:
   chunk: aes
