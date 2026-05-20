@@ -388,21 +388,21 @@ Generation G3 (salt_3): Alpine chunk → hash_C → Nodes {5, 11, 19}
 
 ```
   ┌──────────────────────────────────────────────────────────────────────────────────────────┐
-  │ Platform side  (out of scope)                                                            │
-  │   orchestration agent   ·   sandbox mgmt platform   ·   image registry                   │
+  │ Platform mgmt plane  (out of scope)                                                      │
+  │   sandbox mgmt platform   /   image flatten mgmt   /   image registry                    │
   ├──────────────────────────────────────────────────────────────────────────────────────────┤
   │ This solution                                                                            │
-  │   Sandbox & VMM       sandbox control · VMM · Guest runtime · on-demand block/snapshot   │
-  │                       · density & resource control                                       │
-  │   Data acceleration   ingest · chunk · encrypt · manifest · content-addressed store      │
-  │                       · tiered cache                                                     │
+  │   Sandbox & VMM       sandbox control / VMM / Guest runtime / on-demand block/snapshot   │
+  │                       / density & resource control                                       │
+  │   Data acceleration   ingest / chunk / encrypt / manifest / content-addressed store      │
+  │                       / tiered cache                                                     │
   ├──────────────────────────────────────────────────────────────────────────────────────────┤
   │ Infrastructure                                                                           │
-  │   compute · KVM · object storage · network                                               │
+  │   compute / KVM / object storage / network                                               │
   └──────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-本方案覆盖沙箱运行与数据按需加载与访问加速两层。向上对接平台侧（沙箱编排代理、沙箱管理平台、容器镜像仓库，均为本方案外）；与平台侧的契约为：平台侧下发 per-沙箱配置与密钥、准备写层模板、拉起与回收沙箱。向下消费 KVM、对象存储与网络。平台侧不需要了解分块、加密、缓存与 VMM 实现细节。
+本方案覆盖沙箱运行与数据按需加载与访问加速两层。向上对接平台管理面（沙箱管理平台、容器镜像仓库，本方案外）；二者由部署在每个节点上的沙箱编排代理衔接——该代理由平台侧 nacre-agent 演进、本方案不实现，负责从管理面取回 per-沙箱配置与密钥、准备写层模板、调用 run 拉起沙箱、回传生命周期事件。向下消费 KVM、对象存储与网络。本方案不要求平台侧了解分块、加密、缓存与 VMM 实现细节。
 
 本方案支持两条运行时路径（块设备路径 vhost-user-blk、快照路径 userfaultfd）和三种启动模式（镜像冷启动、SnapStart、Warm Pool），共享同一套基础设施——内容分块、收敛加密、内容寻址存储、分层缓存和清单。
 
@@ -411,36 +411,39 @@ Generation G3 (salt_3): Alpine chunk → hash_C → Nodes {5, 11, 19}
 总体架构按节点角色组织。计算节点承载沙箱运行与本地缓存；可用区内部署二级缓存集群；区域内部署对象存储与代管理；镜像展平在独立的数据面节点池完成。
 
 ```{.small}
-              ┌── Platform side  (out of scope) ───────────────────────────────────────────────────────┐
-              │   orchestration agent     ·     sandbox mgmt platform     ·     image registry         │
-              └────────────────────────────────────────────────────────────────────────────────────────┘
-                config / boot / restore │                                               ingest    │
-                                        ▼                                                         ▼
-  ┌── Compute node  (×N per AZ) ───────────────────────────────────────────────┐  ┌── Image flatten  (pool) ───────┐
-  │                                                                            │  │                                │
-  │  node resource control (node-ctl role)                                     │  │  image flatten                 │
-  │    admission · quota · reclaim · persist · scan recovery                   │  │        │                       │
-  │         ▲ resource proto                                                   │  │        ▼                       │
-  │         ▼                                                                  │  │  write path                    │
-  │  sandbox control (one per sandbox)                                         │  │    chunk · encrypt · dedup     │
-  │    block dev agent · snapshot agent · unified memory · balloon · handshake │  └────────────────────────────────┘
-  │         │ drive VM                        │ fetch / store                  │                  │
-  │         ▼                                 ▼                                │                  │
-  │    sandbox ×N: VMM + Guest runtime    tiered cache L1 (local) + CA store   │                  │
-  │                                                                            │                  │
-  └────────────────────────────────────────────────────────────────────────────┘                  │
-                                        │                                           chunks /      │
-                               L1 miss  │                                           manifest      │
-                                        │                                                         │
-                                        ▼                                                         ▼
-      ┌── AZ ────────────────────────────────────────┐    ┌── Region ────────────────────────────────────────────────┐
-      │                                              │miss│                                                          │
-      │   L2 cache cluster                           │──► │  object store (L3)                                       │
-      │   EC 4-of-5 · consistent hash                │    │  encrypted chunks & manifests · generational layout      │
-      └──────────────────────────────────────────────┘    │  GC & generation mgmt service  (control plane):          │
-                                                          │  rotation · migration · reclaim · ops                    │
-                                                          └──────────────────────────────────────────────────────────┘
+        ┌── Platform mgmt plane  (out of scope) ───────────────────────────────────────────────────────────┐
+        │   sandbox mgmt platform      /      image flatten mgmt      /      image registry                │
+        └──────────────────────────────────────────────────────────────────────────────────────────────────┘
+      per-sandbox config & keys             │                                         flatten task    │
+                                            ▼                                                         ▼
+  ┌── Compute node  (×N per AZ) ───────────────────────────────────────────────────────┐  ┌── Image flatten  (pool) ─┐
+  │                                                                                    │  │                          │
+  │  orchestration agent  (out of scope / nacre-agent)                                 │  │  image flatten           │
+  │    lands per-sandbox config & keys / prepares write-layer / invokes run            │  │        │                 │
+  │        │ run                                                                       │  │        ▼                 │
+  │        ▼                                                                           │  │  write path              │
+  │  sandbox control (one per sandbox)   ◄─ proto ─►   node resource control           │  │  chunk / encrypt / dedup │
+  │    block dev / snapshot / unified memory /      admission / quota /                │  └──────────────────────────┘
+  │    balloon reclaim / handshake                  reclaim / persist  (node-ctl)      │              │
+  │        │ drive VM                        │ fetch / store                           │              │
+  │        ▼                                 ▼                                         │              │
+  │  sandbox ×N: VMM + Guest runtime     tiered cache L1 (local) + CA store            │              │
+  │                                                                                    │              │
+  └────────────────────────────────────────────────────────────────────────────────────┘              │
+                                        L1 miss   │                                                   │   chunks /
+                                                  │                                                   │   manifest
+                                                  │                                                   │
+                                                  ▼                                                   ▼
+      ┌── AZ ──────────────────────────────────────────┐    ┌── Region ──────────────────────────────────────────────┐
+      │                                                │miss│                                                        │
+      │   L2 cache cluster                             │──► │  object store (L3)                                     │
+      │   EC 4-of-5 / consistent hash                  │    │  encrypted chunks & manifests / generational layout    │
+      └────────────────────────────────────────────────┘    │  GC & generation mgmt service  (control plane):        │
+                                                            │  rotation / migration / reclaim / ops                  │
+                                                            └────────────────────────────────────────────────────────┘
 ```
+
+沙箱编排代理（nacre-agent）部署在每个计算节点上、与沙箱控制同处一节点，本方案外；它从平台管理面取回 per-沙箱配置与密钥、准备写层模板、调用 run 拉起沙箱，是管理面与沙箱控制之间的衔接，不属于平台层。
 
 分层缓存（L1/L2）是可替换的访问加速层：可由 SFS Turbo（支持 OBS 访问加速的托管 NAS 服务）承担，由托管服务提供对对象存储的近端加速，无需自建缓存集群。GC 与代管理服务作用于对象存储，处于控制平面，不在读写数据热路径上。
 
@@ -861,9 +864,9 @@ SnapStart：同一 Manifest，恢复 N 次。Warm Pool：每个 Manifest 恢复�
 │                                                                       │
 │  Cross-cutting                                                        │
 │    KSM: cross-VM identical-page merge (host kernel)                   │
-│    Cgroup watermark backpressure · uffd page-load backpressure        │
+│    Cgroup watermark backpressure / uffd page-load backpressure        │
 │                                                                       │
-│  Modes: no-cgroup · static · dynamic                                  │
+│  Modes: no-cgroup / static / dynamic                                  │
 │  CPU: cgroup weight + quota, no hotplug                               │
 └───────────────────────────────────────────────────────────────────────┘
 ```
@@ -1157,7 +1160,7 @@ L2-快照集群 20-30 节点 × 5 GiB/s = 100-150 GiB/s，22 GiB/s 利用率 ~15
 - **二级缓存集群**（AZ 级，约 100-200 节点）：缓存代理 shard 形态，纠删码 + 一致性哈希。
 - **镜像展平数据面节点**（独立池）：容器镜像展平 + 清单服务客户端 + 存储代理。
 
-区域级为对象存储与 GC 与代管理服务。数据通路：客户端（沙箱控制 / 清单服务客户端 / 容器镜像展平）→ 缓存代理 → 存储代理 → 对象存储；缓存全部未命中时经存储代理回退到对象存储。平台侧的沙箱编排代理与沙箱管理平台为本方案外。
+区域级为对象存储与 GC 与代管理服务。数据通路：客户端（沙箱控制 / 清单服务客户端 / 容器镜像展平）→ 缓存代理 → 存储代理 → 对象存储；缓存全部未命中时经存储代理回退到对象存储。沙箱编排代理（nacre-agent，本方案外）也部署在计算节点上、与沙箱控制同节点，作为平台管理面与沙箱控制的衔接；沙箱管理平台与容器镜像仓库为平台侧远端服务，本方案外。
 
 ### §10.2 沙箱控制（sandbox-ctl）
 
@@ -1309,7 +1312,21 @@ L2-快照集群 20-30 节点 × 5 GiB/s = 100-150 GiB/s，22 GiB/s 利用率 ~15
 - 虚拟磁盘后端库（运行时由沙箱控制承载）
 - 配置加载（显式指定，无自动查找）
 
-### §10.13 交付节奏
+### §10.13 沙箱编排代理（nacre-agent，本方案外）
+
+**定位**：部署在每个计算节点上的数据面衔接组件，由平台侧 nacre-agent 演进而来，本方案不实现，仅定义接口契约。它把平台管理面下发的实例配置与密钥落地，准备好写层模板后拉起沙箱，并回传生命周期事件——是平台管理面与沙箱控制之间的桥梁，与沙箱控制同处一节点。
+
+**功能要点**：
+
+- 与平台管理面对接，拉取 per-沙箱实例配置与客户密钥
+- 为每个沙箱生成各自的沙箱配置与清单配置
+- 选定并复制写层模板
+- 调用 run 命令拉起沙箱
+- 把生命周期事件回传管理面
+
+**接口契约边界**：管理面 → 编排代理（下发配置与密钥）；编排代理 → 沙箱控制（run 拉起）；编排代理 → 管理面（回传生命周期）。平台侧按此契约在 nacre-agent 上演进实现后，端到端发放流程方可跑通。
+
+### §10.14 交付节奏
 
 各模块按依赖关系排序交付，运行时通过接口协作：
 
