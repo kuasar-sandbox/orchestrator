@@ -80,7 +80,7 @@ CONCS="${CONCS:-1 2 4 8}"
 EC_DATA="${EC_DATA:-4}"
 EC_PARITY="${EC_PARITY:-1}"
 
-SSH_OPTS="${SSH_OPTS:--o ConnectTimeout=5 -o StrictHostKeyChecking=no -o BatchMode=yes}"
+SSH_OPTS="${SSH_OPTS:--o ConnectTimeout=30 -o StrictHostKeyChecking=no -o BatchMode=yes}"
 
 # Fixed port plan (single-topology-per-host assumption):
 SHARD_PORT=17070

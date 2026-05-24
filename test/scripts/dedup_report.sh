@@ -90,13 +90,13 @@ store:
   endpoint: 127.0.0.1:$STORE_PORT
   pool: 2
   timeout: 30s
-chunk:
+chunker:
   mode: cdc
 crypto:
   chunk: aes
   manifest: aes
 EOF
-CFG="--config $WORKDIR/config.yaml"
+CFG="--manifest-config $WORKDIR/config.yaml"
 
 # ═══════════════════════════════════════════════════════════════
 # Phase 0: Ensure all images exist locally (pull on miss)
@@ -130,19 +130,21 @@ for i in $(seq 0 $((N-1))); do
     # consumes it. Both stderr streams are left intact so any failure
     # (corrupted image, flatten crash, rocks I/O error) surfaces as
     # real output instead of as a silent erofs_size=0 downstream.
-    docker save "$img" | "$BIN/flatten-ctl" --output "$WORKDIR/$tag.erofs" --no-progress
+    docker save "$img" | "$BIN/flatten-ctl" export --output "$WORKDIR/$tag.erofs" --no-progress
     erofs_size=$(stat --printf="%s" "$WORKDIR/$tag.erofs" 2>/dev/null || stat -f "%z" "$WORKDIR/$tag.erofs")
 
-    # Ingest
-    output=$("$BIN/manifest-ctl" store $CFG --input "$WORKDIR/$tag.erofs" --manifest "$WORKDIR/$tag.manifest" --no-progress 2>&1)
-    "$BIN/manifest-ctl" info --manifest "$WORKDIR/$tag.manifest"
+    # Ingest: store prints the manifest key on stdout and a
+    # "chunks: stored=S dedup=D zero=W" summary on stderr. Materialize the
+    # manifest blob too so the pairwise diff matrix can read it locally.
+    key=$("$BIN/manifest-ctl" store $CFG --no-progress "$WORKDIR/$tag.erofs" 2>"$WORKDIR/$tag.store.err")
+    "$BIN/manifest-ctl" get-manifest $CFG --output "$WORKDIR/$tag.manifest" "$key"
 
-    chunks=$(echo "$output" | grep "chunks:" | grep -oP 'chunks:\s+\K[0-9]+')
-    stored=$(echo "$output" | grep "stored" | grep -oP 'stored \K[0-9]+')
-    dedup=$(echo "$output" | grep "dedup" | grep -oP 'dedup \K[0-9]+')
-    zero=$(echo "$output" | grep "zero" | grep -oP 'zero \K[0-9]+')
-    stored_bytes_line=$(echo "$output" | grep "stored bytes:")
-    stored_b=$(echo "$stored_bytes_line" | grep -oP '[\d.]+\s+\w+iB' | head -1)
+    summary=$(grep -E '^chunks:' "$WORKDIR/$tag.store.err" | head -1)
+    stored=$(echo "$summary" | grep -oP 'stored=\K[0-9]+')
+    dedup=$(echo "$summary" | grep -oP 'dedup=\K[0-9]+')
+    zero=$(echo "$summary" | grep -oP 'zero=\K[0-9]+')
+    chunks=$(( stored + dedup + zero ))
+    stored_b=$(grep 'stored bytes:' "$WORKDIR/$tag.store.err" | grep -oP '[\d.]+\s+\w+iB' | head -1)
 
     NAMES[$i]="$img"
     EROFS_SIZES[$i]="$erofs_size"

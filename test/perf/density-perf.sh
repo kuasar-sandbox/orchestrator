@@ -152,7 +152,7 @@ if ! [ -f "$BLK0" ]; then
     if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
         docker pull "$IMAGE"
     fi
-    docker save "$IMAGE" | "$BIN/flatten-ctl" --output "$BLK0" --no-progress >/dev/null
+    docker save "$IMAGE" | "$BIN/flatten-ctl" export --output "$BLK0" --no-progress >/dev/null
 fi
 
 [ -d /sys/fs/cgroup/sandboxes ] || mkdir /sys/fs/cgroup/sandboxes
@@ -303,6 +303,10 @@ done
 
 # ---- shut down ----
 shutdown_t0=$(date +%s.%N)
+# Best-effort shutdown: workloads may have already self-exited at dur, so
+# their sandbox-ctl PIDs (and CH processes) can be gone — kill/pkill of an
+# absent target must not abort the harness under `set -e`.
+set +e
 for p in "${SB_PIDS[@]}"; do
     kill -TERM "$p" 2>/dev/null
 done
@@ -313,6 +317,7 @@ done
 for sid in "${SB_SIDS[@]}"; do
     pkill -KILL -f "cloud-hypervisor.*--api-socket /run/$sid/" 2>/dev/null
 done
+set -e
 shutdown_t1=$(date +%s.%N)
 
 # ---- aggregate ----
