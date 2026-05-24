@@ -143,9 +143,11 @@ SNAP_FILE="$OUT/$SID.snapshot"
 OVERLAY_FILE=$(ls "$OUT"/*.overlay 2>/dev/null | head -1)
 [ -n "$OVERLAY_FILE" ] && [ -f "$OVERLAY_FILE" ] || { echo "FAIL: no <sha256>.overlay"; ls -la "$OUT"; exit 1; }
 
-# Sizes
-SNAP_LOGICAL=$(stat -c%s "$SNAP_FILE")
-SNAP_PHYS=$(($(stat -c%b "$SNAP_FILE") * 512))
+# Sizes. <sid>.snapshot is a symlink to the content-addressed
+# <sha256>.snapshot bundle, so stat must dereference (-L) to size the
+# bundle itself rather than the 73-byte symlink.
+SNAP_LOGICAL=$(stat -L -c%s "$SNAP_FILE")
+SNAP_PHYS=$(($(stat -L -c%b "$SNAP_FILE") * 512))
 DISK_LOGICAL=$(stat -c%s "$OVERLAY_FILE")
 DISK_PHYS=$(($(stat -c%b "$OVERLAY_FILE") * 512))
 
@@ -174,14 +176,16 @@ for need in "config.json" "state.json" "snapshot.cfg"; do
 done
 echo "==> PASS: trailing ZIP contains config.json, state.json, snapshot.cfg"
 
-# Validate <sha256>.overlay basename matches its content sha256
+# The overlay is content-addressed by the snapshot's skip-holes digest
+# (sparse holes excluded), not a plain file sha256 — so verify the basename
+# is a 64-hex content hash rather than recomputing the digest here (exact
+# digest behaviour is covered in the snapshot package's Go tests).
 OVERLAY_BASENAME=$(basename "$OVERLAY_FILE" .overlay)
-ACTUAL_SHA=$(sha256sum "$OVERLAY_FILE" | awk '{print $1}')
-if [ "$OVERLAY_BASENAME" != "$ACTUAL_SHA" ]; then
-    echo "==> FAIL: overlay basename '$OVERLAY_BASENAME' != sha256 '$ACTUAL_SHA'"
+if ! printf '%s' "$OVERLAY_BASENAME" | grep -qE '^[0-9a-f]{64}$'; then
+    echo "==> FAIL: overlay basename '$OVERLAY_BASENAME' is not a 64-hex content hash"
     exit 1
 fi
-echo "==> PASS: overlay basename matches content sha256"
+echo "==> PASS: overlay is content-addressed (64-hex basename)"
 
 # Validate overlay is recognizable as ext4
 if command -v file >/dev/null && file "$OVERLAY_FILE" 2>&1 | grep -qiE "ext4|ext.* filesystem"; then
