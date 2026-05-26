@@ -227,14 +227,14 @@ total_alloc > 30 MiB` 应被发现。
 |---|---:|---|
 | pause + Quiesce | 3-6 ms | 0 |
 | CH dump (config.json + state.json) | 30-50 ms | ~90 KB |
-| overlay stream-hash + sparse copy | ≤ 8 ms | 600 KiB 物理 / 1 GiB 逻辑 |
+| overlay sparse copy + 跳空洞 hash | ≤ 8 ms | 600 KiB 物理 / 1 GiB 逻辑 |
 | memfd sparse copy + ZIP append | 10-20 ms | 47-54 MiB 物理 / 512 MiB 逻辑 |
 | **总 dump 时间** | **43-72 ms** | |
 
 输出:`<sid>.snapshot` 逻辑 513 MiB / 物理 48-52 MiB(91% 稀疏);
 `<sha256>.overlay` 逻辑 1 GiB / 物理 600 KiB(99.9% 稀疏)。
-overlay 文件名内嵌的 sha256 是字节级整文件 hash(sparse hole = 0),
-host 多次 snapshot 同内容 → 同名覆盖。
+overlay / snapshot 文件名内嵌的 sha256 是跳空洞的 extent 摘要(见
+[`sandbox.md`](sandbox.md) §6.1),host 多次 snapshot 同内容 → 同名覆盖。
 
 **对比"CH 写 memory-ranges + sandbox-ctl 读再上传"路径**:该路径 = 24 GiB
 I/O,~10 s 量级。本设计的 sandbox-ctl 持有 memfd + SEEK_DATA/HOLE 扫驻留页 =
