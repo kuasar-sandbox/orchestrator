@@ -241,7 +241,7 @@ timeout 90 "$BIN/sandbox-ctl" run \
     --config "$WORK/sandbox.yaml" \
     --manifest-config "$WORK/accelerator.yaml" \
     --ch-binary "${CH_BINARY:-$BIN/cloud-hypervisor}" \
-    --run-dir "$WORK/runtime" \
+    --run-root "$WORK/runtime" \
     --stats-json "$STATS_JSON" \
     > "$LOG" 2>&1 &
 SBPID=$!

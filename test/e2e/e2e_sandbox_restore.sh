@@ -99,7 +99,7 @@ mkdir -p "$RUNTIME_ROOT/$SID1"
 "$BIN/sandbox-ctl" run \
     --config "$WORK/sandbox.yaml" \
     --ch-binary "$BIN/cloud-hypervisor" \
-    --run-dir "$RUNTIME_ROOT" \
+    --run-root "$RUNTIME_ROOT" \
     --sandbox-id "$SID1" \
     > "$LOG1" 2>&1 &
 SBPID1=$!
@@ -124,7 +124,7 @@ mkdir -p "$OUT"
 "$BIN/sandbox-ctl" snapshot \
     --sandbox-id "$SID1" \
     --output "$OUT" \
-    --run-dir "$RUNTIME_ROOT" 2>&1 | tee "$WORK/snap.log"
+    --run-root "$RUNTIME_ROOT" 2>&1 | tee "$WORK/snap.log"
 
 # --resume=false (default) shuts CH down via /vm.shutdown; sandbox-ctl
 # run1 returns naturally. wait() not kill().
@@ -168,7 +168,7 @@ mkdir -p "$RUNTIME_ROOT/$SID2"
     --restore "$SNAP_FILE" \
     --config "$WORK/host.yaml" \
     --ch-binary "$BIN/cloud-hypervisor" \
-    --run-dir "$RUNTIME_ROOT" \
+    --run-root "$RUNTIME_ROOT" \
     --sandbox-id "$SID2" \
     > "$LOG2" 2>&1 &
 SBPID2=$!

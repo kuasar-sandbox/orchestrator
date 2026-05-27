@@ -387,7 +387,7 @@ run_cold_iter() {
             --config "$d/sandbox.yaml" \
             --manifest-config "$WORK/accelerator.yaml" \
             --ch-binary "$BIN/cloud-hypervisor" \
-            --run-dir "$d/runtime" \
+            --run-root "$d/runtime" \
             --sandbox-id "perf-c-$i" \
             --stats-json "$stats" \
             > "$log" 2>&1
@@ -449,7 +449,7 @@ start_long_sandbox() {
             --config "$d/sandbox.yaml" \
             --manifest-config "$WORK/accelerator.yaml" \
             --ch-binary "$BIN/cloud-hypervisor" \
-            --run-dir "$d/runtime" \
+            --run-root "$d/runtime" \
             --sandbox-id "$sid" \
             > "$log" 2>&1 &
         sbpid=$!
@@ -496,7 +496,7 @@ run_upload_iter() {
         --sandbox-id "$(basename "$d" | sed 's/long-//')" \
         --output "$out" \
         --upload \
-        --run-dir "$d/runtime" \
+        --run-root "$d/runtime" \
         --resume=true 2>"$snap_log")
     local t_end=$(date +%s%N)
     local wall_ms
@@ -548,7 +548,7 @@ run_restore_iter() {
             --config "$d/host.yaml" \
             --manifest-config "$WORK/accelerator.yaml" \
             --ch-binary "$BIN/cloud-hypervisor" \
-            --run-dir "$d/runtime" \
+            --run-root "$d/runtime" \
             --sandbox-id "perf-r-$tag-$i" \
             --stats-json "$stats" \
             > "$log" 2>&1 &

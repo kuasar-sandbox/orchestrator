@@ -155,7 +155,7 @@ STATS_JSON="${PERF_STATS_JSON:-$WORK/stats.json}"
 timeout 60 "$BIN/sandbox-ctl" run \
     --config "$WORK/sandbox.yaml" \
     --ch-binary "$BIN/cloud-hypervisor" \
-    --run-dir "$WORK/runtime" \
+    --run-root "$WORK/runtime" \
     --stats-json "$STATS_JSON" \
     > "$LOG" 2>&1 &
 SBPID=$!

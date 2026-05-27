@@ -105,7 +105,7 @@ mkdir -p "$RUNTIME_ROOT/$SID"
 "$BIN/sandbox-ctl" run \
     --config "$WORK/sandbox.yaml" \
     --ch-binary "$BIN/cloud-hypervisor" \
-    --run-dir "$RUNTIME_ROOT" \
+    --run-root "$RUNTIME_ROOT" \
     --sandbox-id "$SID" \
     > "$LOG" 2>&1 &
 SBPID=$!
@@ -129,7 +129,7 @@ mkdir -p "$OUT"
 "$BIN/sandbox-ctl" snapshot \
     --sandbox-id "$SID" \
     --output "$OUT" \
-    --run-dir "$RUNTIME_ROOT" \
+    --run-root "$RUNTIME_ROOT" \
     --resume 2>&1 | tee "$WORK/snap.log"
 
 # Tear down sandbox

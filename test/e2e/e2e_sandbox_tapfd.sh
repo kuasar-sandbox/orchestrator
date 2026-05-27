@@ -115,7 +115,7 @@ SID="tapfd-e2e"
 LOG="$WORK/cold.log"
 mkdir -p "$WORK/runtime/$SID"
 timeout 120 "$BIN/sandbox-ctl" run --config "$WORK/cold.yaml" \
-    --ch-binary "$BIN/cloud-hypervisor" --run-dir "$WORK/runtime" --sandbox-id "$SID" \
+    --ch-binary "$BIN/cloud-hypervisor" --run-root "$WORK/runtime" --sandbox-id "$SID" \
     > "$LOG" 2>&1 &
 RUNPID=$!
 
@@ -132,7 +132,7 @@ ping_guest 169.254.1.1 && ok "host pinged guest 169.254.1.1 over the vnet_hdr fd
 
 # snapshot the running VM (default --resume=false shuts it down → run exits)
 SNAP="$WORK/snap"; mkdir -p "$SNAP"
-"$BIN/sandbox-ctl" snapshot --sandbox-id "$SID" --output "$SNAP" --run-dir "$WORK/runtime" \
+"$BIN/sandbox-ctl" snapshot --sandbox-id "$SID" --output "$SNAP" --run-root "$WORK/runtime" \
     >"$WORK/snap.log" 2>&1 && ok "snapshot taken" || { echo "--- snap.log ---"; cat "$WORK/snap.log"; bad "snapshot failed"; }
 wait "$RUNPID" 2>/dev/null || true
 SNAP_FILE="$SNAP/$SID.snapshot"
@@ -146,7 +146,7 @@ if [ -f "$SNAP_FILE" ]; then
     write_yaml "$WORK/restore.yaml" "169.254.4.1" "$DIFF1" "169.254.4.0/31" 0
     SIDR="tapfd-e2e-r"; RLOG="$WORK/restore.log"; mkdir -p "$WORK/runtime2/$SIDR"
     timeout 120 "$BIN/sandbox-ctl" run --restore "$SNAP_FILE" --config "$WORK/restore.yaml" \
-        --ch-binary "$BIN/cloud-hypervisor" --run-dir "$WORK/runtime2" --sandbox-id "$SIDR" \
+        --ch-binary "$BIN/cloud-hypervisor" --run-root "$WORK/runtime2" --sandbox-id "$SIDR" \
         > "$RLOG" 2>&1 &
     RPID=$!
     wait_marker "restore network re-applied|restore notify acked|VM resumed" "$RLOG" "$RPID" \

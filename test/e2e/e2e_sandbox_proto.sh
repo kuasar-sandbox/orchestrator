@@ -118,7 +118,7 @@ set +e
 timeout 30 "$BIN/sandbox-ctl" run \
     --config "$WORK/sandbox.yaml" \
     --ch-binary "$BIN/cloud-hypervisor" \
-    --run-dir "$WORK/runtime" \
+    --run-root "$WORK/runtime" \
     --stats-json "$STATS_JSON" \
     > "$LOG" 2>&1
 EXIT=$?

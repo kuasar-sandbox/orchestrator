@@ -205,7 +205,7 @@ mkdir -p "$WORK/runtime/$SID1"
     --config "$WORK/sandbox.yaml" \
     --manifest-config "$WORK/accelerator.yaml" \
     --ch-binary "$BIN/cloud-hypervisor" \
-    --run-dir "$WORK/runtime" \
+    --run-root "$WORK/runtime" \
     --sandbox-id "$SID1" \
     > "$LOG1" 2>&1 &
 SBPID1=$!
@@ -226,7 +226,7 @@ T_UP1_BEG=$(date +%s%N)
 SNAP_MKEY=$("$BIN/sandbox-ctl" snapshot \
     --sandbox-id "$SID1" \
     --upload \
-    --run-dir "$WORK/runtime" 2>"$SNAP1_LOG")
+    --run-root "$WORK/runtime" 2>"$SNAP1_LOG")
 T_UP1_END=$(date +%s%N)
 UP1_MS=$(( (T_UP1_END - T_UP1_BEG) / 1000000 ))
 
@@ -279,7 +279,7 @@ T_RES_BEG=$(date +%s%N)
     --config "$WORK/host.yaml" \
     --manifest-config "$WORK/accelerator.yaml" \
     --ch-binary "$BIN/cloud-hypervisor" \
-    --run-dir "$WORK/runtime" \
+    --run-root "$WORK/runtime" \
     --sandbox-id "$SID2" \
     > "$LOG2" 2>&1 &
 SBPID2=$!
@@ -315,7 +315,7 @@ T_UP2_BEG=$(date +%s%N)
 SNAP2_MKEY=$("$BIN/sandbox-ctl" snapshot \
     --sandbox-id "$SID2" \
     --upload \
-    --run-dir "$WORK/runtime" 2>"$SNAP2_LOG")
+    --run-root "$WORK/runtime" 2>"$SNAP2_LOG")
 T_UP2_END=$(date +%s%N)
 UP2_MS=$(( (T_UP2_END - T_UP2_BEG) / 1000000 ))
 
@@ -370,7 +370,7 @@ T_RES2_BEG=$(date +%s%N)
     --config "$WORK/host2.yaml" \
     --manifest-config "$WORK/accelerator.yaml" \
     --ch-binary "$BIN/cloud-hypervisor" \
-    --run-dir "$WORK/runtime" \
+    --run-root "$WORK/runtime" \
     --sandbox-id "$SID3" \
     --stats-json "$WORK/stats3.json" \
     > "$LOG3" 2>&1 &
@@ -413,7 +413,7 @@ SNAP3_LOG="$WORK/snap3.log"
 SNAP3_MKEY=$("$BIN/sandbox-ctl" snapshot \
     --sandbox-id "$SID3" \
     --upload \
-    --run-dir "$WORK/runtime" 2>"$SNAP3_LOG")
+    --run-root "$WORK/runtime" 2>"$SNAP3_LOG")
 [ ${#SNAP3_MKEY} -eq 64 ] || { echo "FAIL: snapshot 3 manifest key length=${#SNAP3_MKEY}"; cat "$SNAP3_LOG"; exit 1; }
 SNAP3_TICK=$(grep -oE "^TICK [0-9]+" "$LOG3" | tail -1 | awk '{print $2}')
 echo "==> upload #3 OK; snap#3 key=$SNAP3_MKEY (frozen at TICK $SNAP3_TICK)"
@@ -449,7 +449,7 @@ T_RES3_BEG=$(date +%s%N)
     --config "$WORK/host3.yaml" \
     --manifest-config "$WORK/accelerator.yaml" \
     --ch-binary "$BIN/cloud-hypervisor" \
-    --run-dir "$WORK/runtime" \
+    --run-root "$WORK/runtime" \
     --sandbox-id "$SID4" \
     > "$LOG4" 2>&1 &
 SBPID4=$!

@@ -92,7 +92,7 @@ EOF
 LOG1="$WORK/run1.log"; SID1="rf1-$$"; RUNTIME_ROOT="$WORK/runtime"
 mkdir -p "$RUNTIME_ROOT/$SID1"
 "$BIN/sandbox-ctl" run --config "$WORK/sandbox.yaml" --ch-binary "$BIN/cloud-hypervisor" \
-    --run-dir "$RUNTIME_ROOT" --sandbox-id "$SID1" > "$LOG1" 2>&1 &
+    --run-root "$RUNTIME_ROOT" --sandbox-id "$SID1" > "$LOG1" 2>&1 &
 SBPID1=$!
 
 echo "==> waiting for TICK 10 (pre-snapshot, expect ID=none)..."
@@ -106,7 +106,7 @@ PRE=$(grep -oE "^TICK [0-9]+" "$LOG1" | tail -1 | awk '{print $2}')
 echo "==> at TICK $PRE ID=none; snapshotting"
 
 OUT="$WORK/snap-out"; mkdir -p "$OUT"
-"$BIN/sandbox-ctl" snapshot --sandbox-id "$SID1" --output "$OUT" --run-dir "$RUNTIME_ROOT" 2>&1 | tee "$WORK/snap.log"
+"$BIN/sandbox-ctl" snapshot --sandbox-id "$SID1" --output "$OUT" --run-root "$RUNTIME_ROOT" 2>&1 | tee "$WORK/snap.log"
 wait "$SBPID1" 2>/dev/null || true
 SNAP_FILE="$OUT/$SID1.snapshot"
 [ -f "$SNAP_FILE" ] || { echo "FAIL: no snapshot"; exit 1; }
@@ -132,7 +132,7 @@ EOF
 
 LOG2="$WORK/run2.log"; SID2="rf2-$$"; mkdir -p "$RUNTIME_ROOT/$SID2"
 "$BIN/sandbox-ctl" run --restore "$SNAP_FILE" --config "$WORK/host.yaml" \
-    --ch-binary "$BIN/cloud-hypervisor" --run-dir "$RUNTIME_ROOT" --sandbox-id "$SID2" > "$LOG2" 2>&1 &
+    --ch-binary "$BIN/cloud-hypervisor" --run-root "$RUNTIME_ROOT" --sandbox-id "$SID2" > "$LOG2" 2>&1 &
 SBPID2=$!
 
 echo "==> waiting for restored app to print ID=clone-42..."

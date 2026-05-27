@@ -98,7 +98,7 @@ LOG1="$WORK/c1.sandbox.log"
 timeout 30 "$BIN/sandbox-ctl" run \
     --config "$WORK/c1.yaml" \
     --ch-binary "$BIN/cloud-hypervisor" \
-    --run-dir "$WORK/runtime" \
+    --run-root "$WORK/runtime" \
     --sandbox-id "stdio-c1-$$" \
     --stdout-to "$OUT1" \
     > "$LOG1" 2>&1 || true
@@ -123,7 +123,7 @@ OUT2="$WORK/c2.stdout"
 timeout 30 "$BIN/sandbox-ctl" run \
     --config "$WORK/c2.yaml" \
     --ch-binary "$BIN/cloud-hypervisor" \
-    --run-dir "$WORK/runtime" \
+    --run-root "$WORK/runtime" \
     --sandbox-id "stdio-c2-$$" \
     --stdout=false \
     > "$OUT2" 2>&1 || true
@@ -142,7 +142,7 @@ OUT3="$WORK/c3.stdout"
 timeout 30 "$BIN/sandbox-ctl" run \
     --config "$WORK/c3.yaml" \
     --ch-binary "$BIN/cloud-hypervisor" \
-    --run-dir "$WORK/runtime" \
+    --run-root "$WORK/runtime" \
     --sandbox-id "stdio-c3-$$" \
     > "$OUT3" 2>&1 || true
 

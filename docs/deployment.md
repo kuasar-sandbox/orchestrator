@@ -51,12 +51,12 @@ UDS)协作。本文档定义这些进程在生产部署中的归属、责任边�
 | `cache-ctl tiered` | `127.0.0.1:7070` | wire(自定义二进制 TCP)| 数据面:`sandbox-ctl` / `manifest-ctl` 拉 chunk |
 | `cache-ctl tiered` | `127.0.0.1:7071` | gRPC | health / `ping` / `info` |
 | `node-ctl daemon` | `/run/sandbox-resource.sock` | UDS,自定义协议 | 沙箱资源协议(`sandbox-ctl` 拨号目标)|
-| `sandbox-ctl` | `/run/<sid>/*.sock` | UDS | sandbox 内部:`ch.sock` / `blk{0,1}.sock` / `uffd.sock` / `ctl.sock` / `vsock.sock`(+ `_5000`)|
+| `sandbox-ctl` | `/run/sandbox/<sid>/*.sock` | UDS | sandbox 内部:`ch.sock` / `blk{0,1}.sock` / `uffd.sock` / `ctl.sock` / `vsock.sock`(+ `_5000`)|
 
 `cache-ctl tiered` 的 EC 客户端通过节点对外网络拨号 L2 cluster 节点的 `7070`
 端口(详见 §3)。除此之外 compute 节点上没有任何**对外**的服务端口。
 
-运维侧:`/run/<sid>/ctl.sock` 除了承载 snapshot,也是 `sandbox-ctl exec
+运维侧:`/run/sandbox/<sid>/ctl.sock` 除了承载 snapshot,也是 `sandbox-ctl exec
 --sandbox-id <sid> -- CMD` 的入口——在不打断应用的前提下进入一个运行中的
 沙箱排障(命令跑在应用的命名空间内,如 `docker exec`)。完整规格见
 [`docs/sandbox.md`](sandbox.md) §2.4。
@@ -67,9 +67,13 @@ UDS)协作。本文档定义这些进程在生产部署中的归属、责任边�
 /var/store/                          store-ctl 用 fs backend 时的本地数据(开发用;生产用 obs)
 /var/cache/accel-l1/                 cache-ctl tiered 的 L1 RocksDB(典型 SSD 1 TiB)
 /run/node-ctl/                       node-ctl audit + state(tmpfs)
-/run/<sid>/                          每沙箱运行时目录:socket、blk1.diff、配置(tmpfs)
-/var/lib/sandbox/<sid>/snap/         snapshot 中转(本地 NVMe)
+/run/sandbox/<sid>/                  每沙箱运行时目录:socket + snap-stage/snap-state(CH 元数据中转,tmpfs)
+/var/lib/sandbox/<sid>/              每沙箱磁盘目录:overlay 写层 <sid>.overlay.diff(本地 NVMe)
 ```
+
+run 根(`/run/sandbox`,tmpfs)与 base 根(`/var/lib/sandbox`,磁盘)分离:可写
+overlay 层必须落盘,不能用 tmpfs。两者分别由 `--run-root`/`SANDBOX_RUN_ROOT`、
+`--base-root`/`SANDBOX_BASE_ROOT` 覆盖。快照**产物**另由 `--output` 指定目录(磁盘)。
 
 ### 2.4 节点共享资源目录
 
@@ -95,15 +99,16 @@ boot:
   runtime: file:///opt/sandbox/runtime/v1/sandbox-runtime.erofs
   root:
     overlay:
-      diff: file:///run/<sid>/blk1.diff   # 沙箱独占,见下
+      # diff 省略 → 自动落在 /var/lib/sandbox/<sid>/<sid>.overlay.diff(磁盘)
+      diff_template: file:///opt/sandbox/overlay-templates/basic-1G.ext4  # 见下
 ```
 
 **复制约定**:`sandbox-runtime.erofs` 与 `vmlinux` **不复制**——`sandbox-ctl`
 让 CH 以只读 mmap / 直接打开方式使用(DAX 共享 host page cache,N 个沙箱共一份
-RAM 工作集)。**overlay-ext4 模板必须复制一份**——它是沙箱写层,运行期会被
-修改。复制由 `orchestrator-agent` 在 `sandbox-ctl run` 之前完成(典型用
-`cp --reflink=auto` 走 reflink 落 NVMe);`sandbox-ctl` 不负责选模板、不负责
-复制,只按 `boot.root.overlay.diff` URL 打开既有文件。
+RAM 工作集)。**overlay 写层**是沙箱独占、运行期被修改的可写盘:`diff` 省略时
+`sandbox-ctl` 自动在 base 目录(磁盘)创建,并在 `diff_template` 给定时从模板
+**稀疏复制**一份预格式化 ext4(无需 orchestrator 预先 `cp`)。显式给定 `diff`
+则按该路径打开既有文件、不复制、不删除。
 
 ### 2.5 per-sandbox 配置下发
 
@@ -118,7 +123,7 @@ RAM 工作集)。**overlay-ext4 模板必须复制一份**——它是沙箱写�
 要点:
 
 - **per-sandbox MANIFEST_CONFIG**:每沙箱用各自租户的客户密钥;orchestrator-agent
-  从平台管理面取密钥,落地为 `/run/<sid>/manifest.yaml`,生命周期跟沙箱走
+  从平台管理面取密钥,落地为 `/run/sandbox/<sid>/manifest.yaml`,生命周期跟沙箱走
 - **共享格式**:`manifest-ctl` 与 `sandbox-ctl` 用**同一**配置格式;两者都
   **只**连本机 store-ctl(`127.0.0.1:7100`)+ 本机 cache-ctl(`127.0.0.1:7070`),
   yaml 里的 endpoint 写 loopback
@@ -400,7 +405,7 @@ Region 级:         OBS 桶 + 平台 / 展平管理面
 | `cache-ctl tiered` | `--config <path>` | `listen: 127.0.0.1:7070`(节点本机);`tiers[].cluster.peers` 写本 AZ L2 全集群 | [`docs/cache.md`](cache.md) §3.4 |
 | `cache-ctl shard` | `--config <path>` | `listen: 0.0.0.0:7070`(对外服务)| [`docs/cache.md`](cache.md) §3.3 |
 | `node-ctl daemon` | `/etc/node-ctl/node-ctl.yaml` | `listen: /run/sandbox-resource.sock` | [`docs/node.md`](node.md) §3 |
-| `sandbox-ctl run` | `--config <path>`(`SANDBOX_CONFIG`)+ `--manifest-config <path>`(`MANIFEST_CONFIG`)| **per-sandbox**,由 `orchestrator-agent` 生成,落在 `/run/<sid>/` | [`docs/sandbox.md`](sandbox.md) §3 |
+| `sandbox-ctl run` | `--config <path>`(`SANDBOX_CONFIG`)+ `--manifest-config <path>`(`MANIFEST_CONFIG`)| **per-sandbox**,由 `orchestrator-agent` 生成,落在 `/run/sandbox/<sid>/` | [`docs/sandbox.md`](sandbox.md) §3 |
 | `manifest-ctl` | `--manifest-config <path>`(`MANIFEST_CONFIG`)| 与 `sandbox-ctl` 共享格式;只连本机 store-ctl + cache-ctl | [`docs/manifest.md`](manifest.md) §3 |
 | `flatten-ctl` | 仅 CLI flag(无 yaml)| 仅在镜像展平数据面节点使用 | [`docs/flatten.md`](flatten.md) §2 |
 

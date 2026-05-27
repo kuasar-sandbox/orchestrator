@@ -282,7 +282,7 @@ EOF
         --config "$WORK/sb-$i.yaml" \
         --manifest-config "$WORK/accelerator.yaml" \
         --ch-binary "$BIN/cloud-hypervisor" \
-        --run-dir "$WORK/runtime" \
+        --run-root "$WORK/runtime" \
         --sandbox-id "$SID" \
         > "$LOG" 2>&1 &
     SBPID=$!
@@ -312,7 +312,7 @@ EOF
     SNAP_MKEY=$("$BIN/sandbox-ctl" snapshot \
         --sandbox-id "$SID" \
         --upload \
-        --run-dir "$WORK/runtime" \
+        --run-root "$WORK/runtime" \
         --resume=false 2>"$SNAP_LOG")
     [ ${#SNAP_MKEY} -eq 64 ] || { echo "FAIL: bad SNAP_MKEY for sandbox $i: '$SNAP_MKEY'"; cat "$SNAP_LOG"; exit 1; }
     SNAP_MKEYS[i]="$SNAP_MKEY"

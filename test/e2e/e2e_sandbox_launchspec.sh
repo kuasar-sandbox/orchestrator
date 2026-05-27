@@ -133,7 +133,7 @@ set +e
 timeout 60 "$BIN/sandbox-ctl" run \
     --config "$WORK/sandbox.yaml" \
     --ch-binary "$BIN/cloud-hypervisor" \
-    --run-dir "$WORK/runtime" \
+    --run-root "$WORK/runtime" \
     > "$LOG" 2>&1
 EXIT=$?
 set -e
