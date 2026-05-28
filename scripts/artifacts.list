@@ -1,0 +1,13 @@
+sandbox-deps        mkfs.erofs
+sandbox-deps        vmlinux
+sandbox-deps        cloud-hypervisor
+sandbox-accelerator manifest-ctl
+sandbox-accelerator store-ctl
+sandbox-accelerator cache-ctl
+sandbox-builder     flatten-ctl
+sandbox-runtime     sandbox-ctl
+sandbox-runtime     sandbox-init
+sandbox-runtime     sandbox-runtime.erofs
+sandbox-sentinel    node-ctl
+sandbox-vswitch     vswitch-ctl
+sandbox-vswitch     tapfd-get

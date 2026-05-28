@@ -1,0 +1,41 @@
+# sandbox cold-start perf — 2026-05-24T03:27:17Z
+# repo: /mnt/d/Development/agentcore-research/container-accelerator-research
+# bin cache: /tmp/perf-bin-x86_64
+# iters: 5
+
+==> [file://] iter 1/5
+    wall=493ms internal=332ms faults=74 batch_avg=168 lazy=9.5% blk0_p50=7.4us gc=1 alloc=9.6MiB
+==> [file://] iter 2/5
+    wall=491ms internal=321ms faults=74 batch_avg=168 lazy=9.5% blk0_p50=5.2us gc=1 alloc=9.6MiB
+==> [file://] iter 3/5
+    wall=491ms internal=332ms faults=75 batch_avg=166 lazy=9.5% blk0_p50=6.5us gc=1 alloc=9.6MiB
+==> [file://] iter 4/5
+    wall=468ms internal=287ms faults=74 batch_avg=168 lazy=9.5% blk0_p50=5.3us gc=1 alloc=9.6MiB
+==> [file://] iter 5/5
+    wall=478ms internal=305ms faults=75 batch_avg=166 lazy=9.5% blk0_p50=5.2us gc=1 alloc=9.6MiB
+
+[file://] N=5
+  wallclock T0→exit:    median=491ms  min=468ms  max=493ms
+  sandbox-ctl internal: median=321ms (excl. bash + exec)
+  uffd faults / batch:  faults=74 batch_avg=168 batch_max=256
+  uffd lazy-load:       resident=12492/131072 pages = 9.53%  (zeroed=12492 copied=0)
+  blk0 read:            reqs=217 p50=5.3µs p99=96.0µs load_coverage=7.02%
+  go runtime:           goroutines=12 numGC=1 pause_total=0.19ms heap_alloc=9422KiB total_alloc=9.6MiB mallocs=6768
+==> [manifest://] iter 1/5
+    wall=882ms internal=703ms faults=74 batch_avg=172 lazy=9.7% blk0_p50=1152.9us gc=17 alloc=155.3MiB
+==> [manifest://] iter 2/5
+    wall=777ms internal=614ms faults=74 batch_avg=171 lazy=9.7% blk0_p50=1122.0us gc=18 alloc=155.7MiB
+==> [manifest://] iter 3/5
+    wall=736ms internal=566ms faults=74 batch_avg=169 lazy=9.6% blk0_p50=1000.0us gc=16 alloc=148.4MiB
+==> [manifest://] iter 4/5
+    wall=734ms internal=553ms faults=74 batch_avg=169 lazy=9.6% blk0_p50=1089.7us gc=17 alloc=149.1MiB
+==> [manifest://] iter 5/5
+    wall=1033ms internal=844ms faults=74 batch_avg=172 lazy=9.7% blk0_p50=1472.9us gc=18 alloc=157.5MiB
+
+[manifest://] N=5
+  wallclock T0→exit:    median=777ms  min=734ms  max=1033ms
+  sandbox-ctl internal: median=614ms (excl. bash + exec)
+  uffd faults / batch:  faults=74 batch_avg=171 batch_max=256
+  uffd lazy-load:       resident=12727/131072 pages = 9.71%  (zeroed=12727 copied=0)
+  blk0 read:            reqs=212 p50=1122.0µs p99=5714.8µs load_coverage=7.02%
+  go runtime:           goroutines=14 numGC=17 pause_total=1.64ms heap_alloc=12764KiB total_alloc=155.3MiB mallocs=10927
