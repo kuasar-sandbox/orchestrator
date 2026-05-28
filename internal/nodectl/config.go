@@ -6,7 +6,7 @@ import (
 	"runtime"
 	"time"
 
-	"github.com/fullof-work/mass-sandbox/pkg/util"
+	"github.com/kuasar-sandbox/sandbox-sentinel/internal/util"
 	"gopkg.in/yaml.v3"
 )
 

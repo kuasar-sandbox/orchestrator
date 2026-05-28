@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/fullof-work/mass-sandbox/pkg/nodectl"
+	"github.com/kuasar-sandbox/sandbox-sentinel/internal/nodectl"
 )
 
 func statusCmd(args []string) int {

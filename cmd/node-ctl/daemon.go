@@ -7,7 +7,7 @@ import (
 	"os"
 	"time"
 
-	"github.com/fullof-work/mass-sandbox/pkg/nodectl"
+	"github.com/kuasar-sandbox/sandbox-sentinel/internal/nodectl"
 )
 
 func daemonCmd(args []string) int {

@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/fullof-work/mass-sandbox/pkg/nodectl"
-	"github.com/fullof-work/mass-sandbox/pkg/util"
+	"github.com/kuasar-sandbox/sandbox-sentinel/internal/nodectl"
+	"github.com/kuasar-sandbox/sandbox-sentinel/internal/util"
 )
 
 func adminClient(socketPath string) (*nodectl.Client, error) {
