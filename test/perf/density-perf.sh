@@ -1,53 +1,69 @@
 #!/usr/bin/env bash
 #
-# density-perf.sh — sandbox-resource-control perf harness.
+# density-perf.sh — sandbox resource-control density harness, human-readable.
 #
-# Spins up a node-ctl daemon + N sandboxes running the shared
-# test/perf/workload.py model, samples controller events and host memory,
-# emits JSON for downstream analysis (test/results/density-perf-N{N}.json
-# by default; PERF_OUT overrides).
+# Spins up node-ctl + N sandboxes, runs the shared test/perf/workload.py
+# inside each guest, and prints a live progress line every 5s plus a
+# multi-section report at the end. Output is for humans (terminal + a
+# .txt mirror under test/results/); no JSON.
 #
-# Knobs (all env-driven so the same script profiles different setups):
+# Guest workload (test/perf/workload.py — pulled verbatim into each sandbox):
 #
-#   N                 number of concurrent sandboxes (default 8)
-#   MEM_MIB           per-sandbox memory-zone size MiB (default 256)
-#   FLOOR_MIB         per-sandbox allocatable floor MiB (default 64)
-#   BURST_MIB         per-sandbox startup_burst MiB (default = FLOOR_MIB)
-#   CAP_MIB           per-sandbox capacity MiB (default = MEM_MIB)
-#   MODE              workload mode: cycles | pareto | idle (default cycles)
-#   WL_DURATION       seconds (default 30)
-#   WL_CYCLES         (cycles mode) cycles per duration (default 4)
-#   WL_RMIN_MIB       active phase rss min (default 64)
-#   WL_RMAX_MIB       active phase rss max (default 192)
-#   WL_LAMBDA         (pareto) Poisson events/s (default 0.5)
-#   WL_ALPHA          (pareto) shape (default 1.5)
-#   WL_XMIN           (pareto) x_min seconds (default 1.0)
-#   PHYS_MEM          node-ctl physical_memory (default auto-from-host)
-#   HOST_RES_MEM      node-ctl host_reserved.memory (default 1GiB)
-#   PHYS_CPU          node-ctl physical_cpu (default 8)
-#   HOST_RES_CPU      node-ctl host_reserved.cpu (default 1)
-#   HIGH_FACTOR       node-ctl high_factor (default 0.85)
-#   LOW_FACTOR        node-ctl low_factor (default 0.70)
-#   EMERG_FACTOR      node-ctl emergency_factor (default 0.05)
-#   GRANT_PER_SEC_FACTOR  node-ctl rate_limits factor (default 0.20)
-#   RECOVER_DUR       node-ctl dampening recover_duration (default 30s)
-#   STAGGER_S         seconds between consecutive sandbox launches (default 0)
-#   IMAGE             docker image (default python:3.12-slim)
-#   WORK              workdir for transient logs (default /tmp/density-perf-XXXXXX)
-#   PERF_OUT          aggregated JSON output path
-#                     (default $REPO_ROOT/test/results/density-perf-N{N}.json)
+#   MODE=cycles  default. Deterministic grow/rest: each guest grows RSS
+#                from WL_RMIN_MIB to WL_RMAX_MIB then releases, WL_CYCLES
+#                times across WL_DURATION. Reproducible signal — best for
+#                regression tracking. (Default 4 cycles in 30s, 64→192 MiB.)
+#   MODE=pareto  Closer to real agent traffic: Poisson(λ=WL_LAMBDA) arrivals
+#                with Pareto(α=WL_ALPHA, xmin=WL_XMIN) active durations.
+#                Needs longer windows (≥5 min) for stable percentiles.
+#   MODE=idle    Boot then sleep — measures the per-sandbox baseline cost
+#                (kernel + sandbox-init + idle CH) without workload pressure.
 #
-# Transient outputs in $WORK:
-#   daemon.log                    controller daemon stdout
-#   audit.log                     controller audit (admit/release/reclaim)
-#   sb-perf-N.log per sandbox     sandbox-ctl stdout
-#   sb-perf-N.cgroup-events       memory.events.local snapshot at end
+# Pages are dirtied with 0xff in 4 MiB chunks so anonymous RSS actually
+# faults in on the host UFFD path (otherwise the kernel would defer faults
+# and the harness would under-count true memory cost).
 #
-# Persistent output (under test/results/, matches sandbox-perf{,-manifest}.sh):
-#   density-perf-N{N}.json        aggregated metrics
+# Verdict (printed at end):
+#   PASS      all N admitted, 0 rejects, 0 OOMs
+#   DEGRADED  any rejects but 0 OOMs (admission backpressure worked)
+#   FAIL      any OOM kill (controller didn't reclaim in time)
 #
-# Skips on missing kvm/root/docker/binaries (REQUIRE_KVM=1 turns skip
-# into failure).
+# Knobs (env-driven; only the bracketed group of node-ctl tuning is
+# normally left at defaults — set them only when probing the controller).
+#
+#   Sandbox shape
+#     N              concurrent sandboxes (default 8)
+#     MEM_MIB        per-sandbox memory zone (default 256)
+#     FLOOR_MIB      per-sandbox allocatable floor (default 64)
+#     BURST_MIB      per-sandbox startup_burst (default = FLOOR_MIB)
+#     CAP_MIB        per-sandbox capacity (default = MEM_MIB)
+#
+#   Workload
+#     MODE           cycles | pareto | idle (default cycles)
+#     WL_DURATION    workload run seconds (default 30)
+#     WL_RMIN_MIB    active phase rss min (default 64)
+#     WL_RMAX_MIB    active phase rss max (default 192)
+#     WL_CYCLES      (cycles) cycles per duration (default 4)
+#     WL_LAMBDA      (pareto) Poisson events/s (default 0.5)
+#     WL_ALPHA       (pareto) Pareto shape (default 1.5)
+#     WL_XMIN        (pareto) Pareto x_min seconds (default 1.0)
+#
+#   Launch + workspace
+#     STAGGER_S      seconds between consecutive sandbox launches (default 0)
+#     IMAGE          docker image for guest rootfs (default python:3.12-slim)
+#     WORK           workdir for daemon/sandbox logs (default /tmp/density-perf-XXX)
+#     PERF_KEEP=1    don't delete WORK on exit (default: delete)
+#
+#   node-ctl controller [advanced]
+#     PHYS_MEM, HOST_RES_MEM, PHYS_CPU, HOST_RES_CPU,
+#     HIGH_FACTOR, LOW_FACTOR, EMERG_FACTOR, GRANT_PER_SEC_FACTOR, RECOVER_DUR
+#
+# Report sink:
+#   test/results/density-perf-N{N}.txt (PERF_OUT overrides) — final report
+#   verbatim mirror; live PROGRESS lines go to stderr only.
+#
+# Skips on missing kvm/root/docker/binaries; REQUIRE_KVM=1 turns skip into
+# hard failure (CI gate).
 
 set -euo pipefail
 
@@ -67,16 +83,13 @@ skip() {
 
 [ -e /dev/kvm ] || skip "/dev/kvm not present"
 [ -r /dev/kvm ] && [ -w /dev/kvm ] || skip "/dev/kvm not accessible"
-# Self-elevate: tap creation, cgroup writes, vsock all need root. Done
-# here (after prereq checks) so /dev/kvm-missing and missing-binary cases
-# still fast-fail without prompting for sudo.
 if [ "$(id -u)" -ne 0 ]; then
     exec sudo -nE "$0" "$@"
 fi
 
-command -v docker >/dev/null 2>&1 || skip "docker not available"
+command -v docker   >/dev/null 2>&1 || skip "docker not available"
 command -v mkfs.ext4 >/dev/null 2>&1 || skip "mkfs.ext4 not on PATH"
-command -v python3 >/dev/null 2>&1 || skip "python3 not on PATH"
+command -v python3  >/dev/null 2>&1 || skip "python3 not on PATH"
 
 for b in sandbox-ctl node-ctl sandbox-init sandbox-runtime.erofs flatten-ctl cloud-hypervisor; do
     [ -e "$BIN/$b" ] || skip "missing $BIN/$b — run 'make build cloud-hypervisor'"
@@ -111,28 +124,64 @@ EMERG_FACTOR="${EMERG_FACTOR:-0.05}"
 GRANT_PER_SEC_FACTOR="${GRANT_PER_SEC_FACTOR:-0.20}"
 RECOVER_DUR="${RECOVER_DUR:-30s}"
 STAGGER_S="${STAGGER_S:-0}"
+TICK_S=5
 
 WORK="${WORK:-$(mktemp -d /tmp/density-perf-XXXXXX)}"
 mkdir -p "$WORK"
+OUT="${PERF_OUT:-$REPO_ROOT/test/results/density-perf-N${N}.txt}"
+mkdir -p "$(dirname "$OUT")"
+
 DAEMON_PID=""
 declare -a SB_PIDS=()
 declare -a SB_SIDS=()
 
+# Graceful sandbox-ctl shutdown. sandbox-ctl owns the CH lifecycle: on
+# SIGTERM it forwards SIGTERM to CH, waits chShutdownGrace=5s, then
+# SIGKILLs CH and tears down tap / run dir / cgroup.
+#
+# Project policy: NEVER strong-kill sandbox-ctl from the script. SIGKILL
+# orphans CH (leaked tap/run/cgroup) and silently masks sandbox-ctl bugs.
+# If sandbox-ctl doesn't exit within the timeout, leave it for human
+# investigation — print a loud WARN with the exact cleanup commands.
+#
+# Timeout 60s: under heavy oversubscription (e.g. MEM_MIB=8192 N=8 on
+# 8GiB host), the host page-fault path saturates uffd handlers and the
+# Go scheduler delays sandbox-ctl's shutdown goroutine — observed 5s
+# chShutdownGrace expanding to ~11s wallclock. 60s = generous slack.
+stop_sandbox_ctl() {
+    local pid="$1" sid="${2:-?}" waited=0 timeout=60
+    kill -TERM "$pid" 2>/dev/null || { wait "$pid" 2>/dev/null; return 0; }
+    while [ "$waited" -lt "$timeout" ]; do
+        kill -0 "$pid" 2>/dev/null || { wait "$pid" 2>/dev/null; return 0; }
+        sleep 1
+        waited=$((waited + 1))
+    done
+    echo "WARN: sandbox-ctl pid=$pid sid=$sid did not exit within ${timeout}s of SIGTERM" >&2
+    echo "WARN: leaving it running per project policy (no script-level SIGKILL of sandbox-ctl)" >&2
+    echo "WARN: this is a sandbox-ctl bug (likely scheduler starvation under host oversubscribe)" >&2
+    echo "WARN: manual cleanup if needed:" >&2
+    echo "WARN:   sudo kill -KILL $pid" >&2
+    echo "WARN:   sudo pkill -KILL -f 'cloud-hypervisor.*--net tap=${sid}-tap'" >&2
+    echo "WARN:   sudo ip link delete ${sid}-tap; sudo rmdir /sys/fs/cgroup/sandboxes/${sid}" >&2
+    return 1
+}
+
 cleanup_all() {
     set +e
-    for p in "${SB_PIDS[@]}"; do
-        kill -TERM "$p" 2>/dev/null
+    # Graceful stop, in parallel — each sandbox-ctl runs its own CH teardown.
+    # Track the helper subshell PIDs so we can `wait` on just those (bare
+    # `wait` would also block on $DAEMON_PID which is still alive at this
+    # point — that's the next step's job).
+    local stop_pids=()
+    for i in "${!SB_PIDS[@]}"; do
+        stop_sandbox_ctl "${SB_PIDS[$i]}" "${SB_SIDS[$i]}" &
+        stop_pids+=($!)
     done
-    sleep 2
-    for p in "${SB_PIDS[@]}"; do
-        kill -KILL "$p" 2>/dev/null
-        wait "$p" 2>/dev/null
-    done
+    for p in "${stop_pids[@]}"; do wait "$p" 2>/dev/null; done
     for sid in "${SB_SIDS[@]}"; do
-        pkill -KILL -f "cloud-hypervisor.*--api-socket /run/$sid/" 2>/dev/null
         rmdir "/sys/fs/cgroup/sandboxes/$sid" 2>/dev/null
         ip link delete "${sid}-tap" 2>/dev/null
-        rm -rf "/run/$sid" 2>/dev/null
+        rm -rf "/run/sandbox/$sid" 2>/dev/null
     done
     if [ -n "$DAEMON_PID" ]; then
         kill -TERM "$DAEMON_PID" 2>/dev/null
@@ -141,14 +190,19 @@ cleanup_all() {
     if [ -z "${PERF_KEEP:-}" ]; then
         rm -rf "$WORK"
     else
-        echo "kept work dir: $WORK"
+        echo "kept work dir: $WORK" >&2
     fi
     set -e
 }
 trap cleanup_all EXIT
 
-echo "==> density-perf: N=$N MEM=${MEM_MIB}MiB floor=${FLOOR_MIB}MiB mode=$MODE dur=${WL_DURATION}s"
-echo "    pool=$PHYS_MEM (host_reserved=$HOST_RES_MEM) high=$HIGH_FACTOR low=$LOW_FACTOR emerg=$EMERG_FACTOR"
+# ---- workload description (used in both SETUP block and the report) ----
+case "$MODE" in
+    cycles) WORKLOAD_DESC="'cycles' — each guest grows RSS ${WL_RMIN_MIB}→${WL_RMAX_MIB} MiB then releases, ${WL_CYCLES}× over ${WL_DURATION}s (deterministic)";;
+    pareto) WORKLOAD_DESC="'pareto' — Poisson(λ=${WL_LAMBDA}/s) arrivals, Pareto(α=${WL_ALPHA}, xmin=${WL_XMIN}s) active durations, RSS ${WL_RMIN_MIB}-${WL_RMAX_MIB} MiB";;
+    idle)   WORKLOAD_DESC="'idle' — boot then sleep ${WL_DURATION}s (per-sandbox baseline cost, no workload)";;
+    *)      WORKLOAD_DESC="'$MODE' — see test/perf/workload.py";;
+esac
 
 # ---- prepare blk0 ----
 BLK0="$WORK/blk0.erofs"
@@ -245,19 +299,70 @@ logging:
   audit_path: $WORK/audit.log
 EOF
 
+# ---- helpers: snapshot host avail / controller counters / cgroup events ----
+read_avail() { awk '/MemAvailable:/ {printf "%d", $2/1024}' /proc/meminfo; }
+
+# Counters: admits / rejects from audit + daemon log; reclaims from audit;
+# grants / settled from daemon. We use `grep | wc -l` (not `grep -c`)
+# because `grep -c` outputs "0" on zero matches but ALSO exits 1, which
+# would chain into `|| echo 0` and emit a SECOND "0" — the caller's word-
+# splitting would then take 0-match fields as TWO array entries and shift
+# every subsequent counter by one position. wc -l always succeeds, emits
+# exactly one number per invocation; safe under set -e.
+count() { grep -E "$1" "$2" 2>/dev/null | wc -l; }
+snapshot_counters() {
+    local admits reclaims grants settled rejects
+    admits=$(  count 'admit'        "$WORK/audit.log" )
+    reclaims=$(count '^[^ ]* reclaim' "$WORK/audit.log" )
+    grants=$(  count ' grant '      "$WORK/daemon.log")
+    settled=$( count ' settled '    "$WORK/daemon.log")
+    rejects=$( count 'rejected'     "$WORK/daemon.log")
+    echo "$admits $reclaims $grants $settled $rejects"
+}
+snapshot_cgroup() {
+    local total_high=0 total_oom=0 h o sid f
+    for sid in "${SB_SIDS[@]}"; do
+        f="/sys/fs/cgroup/sandboxes/$sid/memory.events.local"
+        [ -f "$f" ] || continue
+        h=$(awk '$1=="high" {print $2}' "$f"); h=${h:-0}
+        o=$(awk '$1=="oom"  {print $2}' "$f"); o=${o:-0}
+        total_high=$((total_high+h))
+        total_oom=$((total_oom+o))
+    done
+    echo "$total_high $total_oom"
+}
+
+# ---- helper: print the BANNER/SETUP/BOOT sections (only once, into log+tee) ----
+say()  { printf '%s\n' "$*"      | tee -a "$OUT"; }
+sayf() { printf "$@"             | tee -a "$OUT"; }
+
+: > "$OUT"   # truncate
+
+say "============================================================"
+say " density-perf:  N=$N sandboxes,  workload=$MODE,  dur=${WL_DURATION}s"
+say "============================================================"
+say ""
+say " SETUP"
+say "   per-sandbox:  zone=${MEM_MIB} MiB  floor=${FLOOR_MIB} MiB  burst=${BURST_MIB} MiB  cap=${CAP_MIB} MiB"
+say "   node pool:    ${PHYS_MEM} (host_reserved=${HOST_RES_MEM}, host_cpu=${PHYS_CPU}/${HOST_RES_CPU} reserved)"
+say "   watermarks:   high=${HIGH_FACTOR}  low=${LOW_FACTOR}  emergency=${EMERG_FACTOR}"
+say "   workload:     $WORKLOAD_DESC"
+say ""
+
+# ---- spin up node-ctl daemon ----
 "$BIN/node-ctl" daemon --config "$WORK/node-ctl.yaml" >"$WORK/daemon.log" 2>&1 &
 DAEMON_PID=$!
 for _ in 1 2 3 4 5 6 7 8 9 10; do
     [ -S "$WORK/sandbox-resource.sock" ] && break
     sleep 0.2
 done
-[ -S "$WORK/sandbox-resource.sock" ] || { echo "daemon did not bind socket" >&2; exit 1; }
+[ -S "$WORK/sandbox-resource.sock" ] || { say " FATAL: node-ctl daemon did not bind socket"; exit 1; }
 
-# ---- baseline host memory ----
-host_baseline_used=$(free -m | awk '/^Mem:/ {print $3}')
-host_baseline_avail=$(awk '/MemAvailable:/ {printf "%d", $2/1024}' /proc/meminfo)
+# ---- baseline host memory (taken AFTER daemon up, BEFORE first sandbox) ----
+host_baseline_avail=$(read_avail)
 
 # ---- launch sandboxes ----
+say " BOOT"
 launch_t0=$(date +%s.%N)
 for i in $(seq 1 "$N"); do
     sid="sb-perf-$i"
@@ -274,146 +379,160 @@ for i in $(seq 1 "$N"); do
         --ch-binary "$BIN/cloud-hypervisor" \
         >"$WORK/$sid.log" 2>&1 &
     SB_PIDS+=("$!")
-    if [ "$STAGGER_S" != "0" ]; then
-        sleep "$STAGGER_S"
-    fi
+    [ "$STAGGER_S" != "0" ] && sleep "$STAGGER_S"
 done
 launch_t1=$(date +%s.%N)
 launch_wall=$(awk -v a="$launch_t0" -v b="$launch_t1" 'BEGIN{printf "%.3f", b-a}')
-echo "    launched $N in ${launch_wall}s"
 
-# ---- wait workload + watch host memory ----
-echo "    waiting ${WL_DURATION}s for workloads"
-sample_t=()
-sample_avail=()
-sample_used=()
+# Give the daemon a moment to log admit events for the just-launched sandboxes.
+sleep 1
+boot_counters=( $(snapshot_counters) )
+sayf "   launched %d sandboxes in %.2fs (stagger=%ss)\n" "$N" "$launch_wall" "$STAGGER_S"
+sayf "   admitted by node-ctl: %d of %d  (rejected: %d)\n" \
+    "${boot_counters[0]}" "$N" "${boot_counters[4]}"
+say ""
+
+# ---- monitor loop (each tick prints to stderr only — keeps OUT clean) ----
+# The primary table is cumulative-only (count snapshots per tick); deltas
+# and anomalies (admit / grant / reclaim / reject / oom / high spikes)
+# are inlined into a variable-width "notes" column at row end. Pure ASCII
+# in header strings to keep printf %s byte-counts == visual columns.
+echo " PROGRESS (every ${TICK_S}s — host MemAvailable + node-ctl counters; deltas in notes)" >&2
+ROW_FMT="  %-5s   %5s   %5s    %-5s   %4s   %4s   %3s   %3s    %s\n"
+printf "$ROW_FMT" "time" "avail" "dMiB" "adm/N" "grnt" "rclm" "rej" "oom" "notes" >&2
+
+prev_avail=$host_baseline_avail
+prev_counters=( $(snapshot_counters) )
+prev_cg=( $(snapshot_cgroup) )
+min_avail=$host_baseline_avail        # tracks the worst (lowest) host avail
+                                       # — RESULT uses it for peak per-sandbox cost
+                                       # rather than the misleading end-of-run value
+                                       # (page cache rebounds after workload drains)
+
 elapsed=0
 while [ "$elapsed" -lt "$WL_DURATION" ]; do
-    avail=$(awk '/MemAvailable:/ {printf "%d", $2/1024}' /proc/meminfo)
-    used=$(free -m | awk '/^Mem:/ {print $3}')
-    sample_t+=("$elapsed")
-    sample_avail+=("$avail")
-    sample_used+=("$used")
-    sleep 5
-    elapsed=$((elapsed+5))
+    sleep "$TICK_S"
+    elapsed=$((elapsed + TICK_S))
+
+    avail=$(read_avail)
+    counters=( $(snapshot_counters) )   # admits reclaims grants settled rejects
+    cg=( $(snapshot_cgroup) )           # high oom
+
+    [ "$avail" -lt "$min_avail" ] && min_avail=$avail
+
+    d_avail=$((avail - prev_avail))
+    d_admits=$(( counters[0] - prev_counters[0] ))
+    d_reclaims=$((counters[1] - prev_counters[1] ))
+    d_grants=$(( counters[2] - prev_counters[2] ))
+    d_rejects=$((counters[4] - prev_counters[4] ))
+    d_high=$((   cg[0]       - prev_cg[0] ))
+    d_oom=$((    cg[1]       - prev_cg[1] ))
+
+    # Assemble inline notes. Only deltas that fired this tick (and OOM/REJ
+    # / high spikes) show up — quiet ticks have an empty notes column.
+    notes=""
+    [ "$d_admits"   -gt 0 ]    && notes="$notes +${d_admits}adm"
+    [ "$d_grants"   -gt 0 ]    && notes="$notes +${d_grants}grnt"
+    [ "$d_reclaims" -gt 0 ]    && notes="$notes +${d_reclaims}rclm"
+    [ "$d_rejects"  -gt 0 ]    && notes="$notes +${d_rejects}REJ"
+    [ "$d_oom"      -gt 0 ]    && notes="$notes +${d_oom}OOM!"
+    [ "$d_high"     -gt 1000 ] && notes="$notes +${d_high}high"
+    notes="${notes# }"
+
+    adm_s="${counters[0]}/${N}"
+    printf "$ROW_FMT" \
+        "t+${elapsed}s" "$avail" "$d_avail" \
+        "$adm_s" "${counters[2]}" "${counters[1]}" "${counters[4]}" "${cg[1]}" \
+        "$notes" >&2
+
+    prev_avail=$avail
+    prev_counters=( "${counters[@]}" )
+    prev_cg=( "${cg[@]}" )
 done
 
-# ---- collect cgroup events ----
-for sid in "${SB_SIDS[@]}"; do
-    if [ -f "/sys/fs/cgroup/sandboxes/$sid/memory.events.local" ]; then
-        cp "/sys/fs/cgroup/sandboxes/$sid/memory.events.local" "$WORK/$sid.cgroup-events"
-    fi
+# ---- shut down sandboxes via sandbox-ctl graceful path (parallel) ----
+# workloads may have already self-exited at WL_DURATION — stop_sandbox_ctl
+# handles the no-op case (kill -TERM of a dead PID returns silently).
+# Track stop subshell PIDs so we only wait on those, not on $DAEMON_PID
+# (still alive — cleanup_all takes it down later).
+# Note: `|| true` is required even with `2>/dev/null` because the latter
+# only masks stderr, not the exit code. wait returns the subshell's exit
+# (1 if stop_sandbox_ctl timed out; 127 if already reaped) and set -e
+# would otherwise abort the script before RESULT renders.
+stop_pids=()
+for i in "${!SB_PIDS[@]}"; do
+    stop_sandbox_ctl "${SB_PIDS[$i]}" "${SB_SIDS[$i]}" &
+    stop_pids+=($!)
 done
+for p in "${stop_pids[@]}"; do wait "$p" 2>/dev/null || true; done
 
-# ---- shut down ----
-shutdown_t0=$(date +%s.%N)
-# Best-effort shutdown: workloads may have already self-exited at dur, so
-# their sandbox-ctl PIDs (and CH processes) can be gone — kill/pkill of an
-# absent target must not abort the harness under `set -e`.
-set +e
-for p in "${SB_PIDS[@]}"; do
-    kill -TERM "$p" 2>/dev/null
-done
-sleep 5
-for p in "${SB_PIDS[@]}"; do
-    kill -KILL "$p" 2>/dev/null
-done
-for sid in "${SB_SIDS[@]}"; do
-    pkill -KILL -f "cloud-hypervisor.*--api-socket /run/$sid/" 2>/dev/null
-done
-set -e
-shutdown_t1=$(date +%s.%N)
+# ---- final aggregate (after the workload window closes) ----
+final_counters=( $(snapshot_counters) )
+final_cg=( $(snapshot_cgroup) )
 
-# ---- aggregate ----
-audits=$(grep -c admit "$WORK/audit.log" 2>/dev/null) || audits=0
-reclaims=$(grep -c "^[^ ]* reclaim" "$WORK/audit.log" 2>/dev/null) || reclaims=0
-grants=$(grep -c " grant " "$WORK/daemon.log" 2>/dev/null) || grants=0
-settled=$(grep -c " settled " "$WORK/daemon.log" 2>/dev/null) || settled=0
-rejects=$(grep -c "rejected" "$WORK/daemon.log" 2>/dev/null) || rejects=0
+final_admits=${final_counters[0]}
+final_reclaims=${final_counters[1]}
+final_grants=${final_counters[2]}
+final_settled=${final_counters[3]}
+final_rejects=${final_counters[4]}
+final_high=${final_cg[0]}
+final_oom=${final_cg[1]}
+final_avail=$(read_avail)
+peak_drop=$((host_baseline_avail - min_avail))
+post_drop=$((host_baseline_avail - final_avail))
+peak_per_sb=$(awk -v d="$peak_drop" -v n="$N" 'BEGIN{printf "%.1f", d/n}')
+post_per_sb=$(awk -v d="$post_drop" -v n="$N" 'BEGIN{printf "%.1f", d/n}')
+projected=$(awk -v a="$min_avail" -v p="$peak_per_sb" 'BEGIN{
+    if (p > 0.5) printf "%d", a/p; else print "n/a (per-sandbox cost too small to project)"
+}')
 
-# Per-sandbox cgroup events.
-total_high=0
-total_oom=0
-for sid in "${SB_SIDS[@]}"; do
-    f="$WORK/$sid.cgroup-events"
-    [ -f "$f" ] || continue
-    h=$(awk '$1=="high" {print $2}' "$f"); h=${h:-0}
-    o=$(awk '$1=="oom" {print $2}' "$f"); o=${o:-0}
-    total_high=$((total_high+h))
-    total_oom=$((total_oom+o))
-done
+# Verdict.
+if [ "$final_oom" -gt 0 ]; then
+    verdict="FAIL"
+    verdict_reason="$final_oom cgroup OOM kill(s) — controller did not reclaim in time"
+elif [ "$final_rejects" -gt 0 ]; then
+    verdict="DEGRADED"
+    verdict_reason="$final_rejects admission rejection(s) — controller refused some sandboxes (backpressure worked, target not met)"
+elif [ "$final_admits" -lt "$N" ]; then
+    verdict="DEGRADED"
+    verdict_reason="only $final_admits of $N admitted (no rejections logged either — check daemon.log)"
+else
+    verdict="PASS"
+    verdict_reason="all $N admitted, 0 rejects, 0 OOMs"
+fi
 
-# Output JSON. Default lands in test/results/ so it survives $WORK cleanup
-# and is consistent with sandbox-perf{,-manifest}.sh; PERF_OUT overrides.
-OUT="${PERF_OUT:-$REPO_ROOT/test/results/density-perf-N${N}.json}"
-mkdir -p "$(dirname "$OUT")"
-out="$OUT"
-{
-    echo "{"
-    echo "  \"n\": $N,"
-    echo "  \"mode\": \"$MODE\","
-    echo "  \"mem_zone_mib\": $MEM_MIB,"
-    echo "  \"floor_mib\": $FLOOR_MIB,"
-    echo "  \"burst_mib\": $BURST_MIB,"
-    echo "  \"cap_mib\": $CAP_MIB,"
-    echo "  \"workload\": {"
-    echo "    \"duration_s\": $WL_DURATION,"
-    echo "    \"cycles\": $WL_CYCLES,"
-    echo "    \"rmin_mib\": $WL_RMIN_MIB,"
-    echo "    \"rmax_mib\": $WL_RMAX_MIB,"
-    echo "    \"lambda\": $WL_LAMBDA,"
-    echo "    \"alpha\": $WL_ALPHA,"
-    echo "    \"xmin\": $WL_XMIN"
-    echo "  },"
-    echo "  \"controller\": {"
-    echo "    \"physical_memory\": \"$PHYS_MEM\","
-    echo "    \"host_reserved_memory\": \"$HOST_RES_MEM\","
-    echo "    \"high_factor\": $HIGH_FACTOR,"
-    echo "    \"low_factor\": $LOW_FACTOR,"
-    echo "    \"emergency_factor\": $EMERG_FACTOR,"
-    echo "    \"grant_per_sec_factor\": $GRANT_PER_SEC_FACTOR,"
-    echo "    \"recover_duration\": \"$RECOVER_DUR\""
-    echo "  },"
-    echo "  \"results\": {"
-    echo "    \"launch_wall_s\": $launch_wall,"
-    echo "    \"audit_admits\": $audits,"
-    echo "    \"audit_reclaims\": $reclaims,"
-    echo "    \"daemon_grants\": $grants,"
-    echo "    \"daemon_settled\": $settled,"
-    echo "    \"daemon_rejects\": $rejects,"
-    echo "    \"cgroup_high_total\": $total_high,"
-    echo "    \"cgroup_oom_total\": $total_oom,"
-    echo "    \"host_baseline_used_mib\": $host_baseline_used,"
-    echo "    \"host_baseline_avail_mib\": $host_baseline_avail,"
-    echo "    \"host_samples\": ["
-    for j in "${!sample_t[@]}"; do
-        comma=","
-        [ "$j" = "$((${#sample_t[@]}-1))" ] && comma=""
-        echo "      {\"t_s\": ${sample_t[$j]}, \"avail_mib\": ${sample_avail[$j]}, \"used_mib\": ${sample_used[$j]}}$comma"
-    done
-    echo "    ]"
-    echo "  }"
-    echo "}"
-} > "$out"
-
-echo
-echo "==> density-perf summary"
-python3 -c "
-import json
-d = json.load(open('$out'))
-r = d['results']
-print(f'  N={d[\"n\"]} mode={d[\"mode\"]} mem_zone={d[\"mem_zone_mib\"]}MiB floor={d[\"floor_mib\"]}MiB burst={d[\"burst_mib\"]}MiB')
-print(f'  launch_wall={r[\"launch_wall_s\"]}s')
-print(f'  controller: admits={r[\"audit_admits\"]} settled={r[\"daemon_settled\"]} grants={r[\"daemon_grants\"]} reclaims={r[\"audit_reclaims\"]} rejects={r[\"daemon_rejects\"]}')
-print(f'  cgroup totals: high={r[\"cgroup_high_total\"]} oom={r[\"cgroup_oom_total\"]}')
-samples = r['host_samples']
-if samples:
-    avail0, availN = samples[0]['avail_mib'], samples[-1]['avail_mib']
-    used0, usedN = samples[0]['used_mib'], samples[-1]['used_mib']
-    print(f'  host avail: {avail0} → {availN} MiB (Δ={availN-avail0:+d})')
-    print(f'  host used:  {used0} → {usedN} MiB (Δ={usedN-used0:+d})')
-    base = d['results']['host_baseline_avail_mib']
-    per_sb = (base - availN) / d['n'] if d['n'] else 0
-    print(f'  Δ MemAvailable / sandbox = {per_sb:.1f} MiB')
-"
-echo "  full json: $out"
+# ---- RESULT section ----
+say ""
+say " RESULT       verdict: $verdict"
+say "              ($verdict_reason)"
+say ""
+say "   density"
+sayf "     peak per-sandbox cost:           ~%s MiB MemAvailable\n" "$peak_per_sb"
+sayf "       (at peak pressure: %d MiB drop across %d sandboxes; baseline=%d → min=%d)\n" \
+    "$peak_drop" "$N" "$host_baseline_avail" "$min_avail"
+sayf "     after-release per-sandbox:       ~%s MiB MemAvailable\n" "$post_per_sb"
+sayf "       (end of window: %d MiB drop; workload drained + page reclaim active)\n" "$post_drop"
+sayf "     projected ceiling (peak basis):  ~%s sandboxes\n" "$projected"
+say ""
+say "   admission"
+sayf "     %d admitted / %d rejected\n" "$final_admits" "$final_rejects"
+sayf "     %d settled at shutdown / %d burst grants total\n" "$final_settled" "$final_grants"
+say ""
+say "   pressure"
+sayf "     cgroup memory.high events: %s across %d sandboxes\n" "$final_high" "$N"
+if [ "$MODE" = "cycles" ] && [ "$final_high" -gt 0 ]; then
+    say  "       (expected for 'cycles' workload that hovers near the floor;"
+    say  "        non-zero ≠ failure — the only true failure signal is OOM)"
+fi
+sayf "     cgroup OOM kills:          %d\n" "$final_oom"
+sayf "     controller reclaims:       %d (burst-grant pullbacks)\n" "$final_reclaims"
+say ""
+say "   notes"
+say "     host 'used' is NOT reported — page cache movement makes it noisy and"
+say "     not attributable to sandboxes. MemAvailable is the right density metric."
+say ""
+say " ARTIFACTS    $WORK/"
+say "   daemon.log  audit.log  sb-perf-{1..$N}.{log,cgroup-events}"
+say ""
+say "============================================================"
+echo "  full report: $OUT" >&2

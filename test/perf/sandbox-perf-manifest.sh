@@ -133,26 +133,38 @@ free_port() {
 # releasing the TAP attachment held by CH (TAP teardown is async on
 # CH process exit; the next iter would otherwise EBUSY on tap_open).
 kill_and_wait() {
-    local pid="$1"
+    # Graceful sandbox-ctl shutdown. sandbox-ctl owns the CH lifecycle
+    # (forwards SIGTERM to CH, waits chShutdownGrace=5s, then SIGKILLs
+    # CH + tears down tap/run dir).
+    #
+    # Project policy: NEVER strong-kill sandbox-ctl. SIGKILL orphans CH
+    # (leaked tap/run/cgroup) and silently masks sandbox-ctl bugs. If
+    # sandbox-ctl doesn't exit within the timeout, leave it for human
+    # investigation — print a loud WARN with the exact cleanup commands.
+    #
+    # Timeout 60s: under heavy oversubscribe the Go scheduler can delay
+    # shutdown goroutines (observed 5s expanding to ~11s wallclock).
+    local pid="$1" waited=0 timeout=60
     [ -n "$pid" ] || return 0
-    kill -TERM "$pid" 2>/dev/null || true
-    for _ in $(seq 1 50); do
-        kill -0 "$pid" 2>/dev/null || break
-        sleep 0.1
+    kill -TERM "$pid" 2>/dev/null || { wait "$pid" 2>/dev/null; return 0; }
+    while [ "$waited" -lt "$timeout" ]; do
+        kill -0 "$pid" 2>/dev/null || { wait "$pid" 2>/dev/null; break; }
+        sleep 1
+        waited=$((waited+1))
     done
     if kill -0 "$pid" 2>/dev/null; then
-        kill -KILL "$pid" 2>/dev/null || true
-        for _ in $(seq 1 30); do
-            kill -0 "$pid" 2>/dev/null || break
-            sleep 0.1
-        done
+        echo "WARN: sandbox-ctl pid=$pid did not exit within ${timeout}s of SIGTERM" >&2
+        echo "WARN: leaving it running per project policy (no script-level SIGKILL of sandbox-ctl)" >&2
+        echo "WARN: manual cleanup if needed: sudo kill -KILL $pid" >&2
+        # Skip TAP bounce — without sandbox-ctl exit the TAP may still be
+        # held; let the next iter's tap_open surface the error rather
+        # than masking it here.
+        return 1
     fi
-    # Defensive: pkill any CH that survived the sandbox-ctl exit.
-    # In rare cases a re-parented CH stays alive after sandbox-ctl
-    # forwarded SIGTERM (race or signal masked). Killing by binary
-    # path is safe because $BIN is the per-run cache dir.
-    pkill -9 -f "$BIN/cloud-hypervisor" 2>/dev/null || true
     # TAP link bounce to force kernel cleanup of any TAP attachment.
+    # sandbox-ctl's CH teardown already releases the TAP, but the kernel's
+    # deferred unbind can briefly hold the fd, EBUSY'ing the next iter's
+    # tap_open. A down/up bounce is cheap insurance.
     ip link set "$TAP_NAME" down 2>/dev/null || true
     ip link set "$TAP_NAME" up 2>/dev/null || true
     sleep 0.3

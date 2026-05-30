@@ -80,32 +80,25 @@ cleanup_all() {
     if [ "${TEST_FAILED:-0}" = "1" ]; then
         dump_logs_on_fail
     fi
-    for pid in "${SANDBOX_PIDS[@]}"; do
-        kill -TERM "$pid" 2>/dev/null
+    # Stop every sandbox-ctl in parallel via shutdown_sandbox (defined
+    # below) — each runs its own CH teardown over a 15s grace, no script
+    # SIGKILL of sandbox-ctl or pkill of cloud-hypervisor. Track helper
+    # subshell PIDs so we only wait on those (bare `wait` would also
+    # block on $DAEMON_PID which we take down two steps later).
+    local stop_pids=()
+    for i in "${!SANDBOX_PIDS[@]}"; do
+        shutdown_sandbox "${SANDBOX_PIDS[$i]}" "${SANDBOX_SIDS[$i]:-?}" &
+        stop_pids+=($!)
     done
-    # Race: SIGTERM may not reach hung CH; wait briefly then force.
-    local _w=0
-    while [ "$_w" -lt 5 ]; do
-        local _alive=0
-        for pid in "${SANDBOX_PIDS[@]}"; do
-            kill -0 "$pid" 2>/dev/null && _alive=1
-        done
-        [ "$_alive" -eq 0 ] && break
-        sleep 1; _w=$((_w+1))
-    done
-    for pid in "${SANDBOX_PIDS[@]}"; do
-        kill -KILL "$pid" 2>/dev/null
-        wait "$pid" 2>/dev/null
-    done
+    for p in "${stop_pids[@]}"; do wait "$p" 2>/dev/null; done
     if [ -n "$DAEMON_PID" ]; then
         kill -TERM "$DAEMON_PID" 2>/dev/null
         wait "$DAEMON_PID" 2>/dev/null
     fi
     for sid in "${SANDBOX_SIDS[@]}"; do
-        pkill -KILL -f "cloud-hypervisor.*--api-socket /run/$sid/" 2>/dev/null
         rmdir "/sys/fs/cgroup/sandboxes/$sid" 2>/dev/null
         ip link delete "${sid}-tap" 2>/dev/null
-        rm -rf "/run/$sid" 2>/dev/null
+        rm -rf "/run/sandbox/$sid" 2>/dev/null
     done
     if [ -n "${E2E_KEEP:-}" ]; then
         echo "kept work dir: $WORK"
@@ -309,26 +302,33 @@ EOF
 
 # ---------- Phase A: auto resource allocation ----------
 
-# Note: we don't wait for sandbox-ctl run to exit cleanly because guest
-# reboot path through vhost-user-blk has reconnect edge-cases unrelated
-# to resource control. Instead we let the workload run for its declared
-# duration + a margin, inspect cgroup + audit.log post-conditions, then
-# SIGTERM the sandbox.
+# Graceful sandbox-ctl shutdown. sandbox-ctl owns the CH lifecycle: on
+# SIGTERM it forwards SIGTERM to CH, waits chShutdownGrace=5s, then
+# SIGKILLs CH and tears down tap / run dir / cgroup.
+#
+# Project policy: NEVER strong-kill sandbox-ctl from the script. SIGKILL
+# orphans CH (leaked tap/run/cgroup) and silently masks sandbox-ctl bugs.
+# If sandbox-ctl doesn't exit within the timeout, leave it for human
+# investigation — print a loud WARN with the exact cleanup commands.
+#
+# Timeout 60s: under heavy oversubscription the host uffd path can
+# starve sandbox-ctl's Go scheduler — observed 5s chShutdownGrace
+# expanding to ~11s wallclock. 60s = generous slack.
 shutdown_sandbox() {
-    local pid="$1" sid="${2:-}"
-    kill -TERM "$pid" 2>/dev/null || true
-    local waited=0
-    while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt 15 ]; do
+    local pid="$1" sid="${2:-?}" waited=0 timeout=60
+    kill -TERM "$pid" 2>/dev/null || { wait "$pid" 2>/dev/null; return 0; }
+    while [ "$waited" -lt "$timeout" ]; do
+        kill -0 "$pid" 2>/dev/null || { wait "$pid" 2>/dev/null; return 0; }
         sleep 1
         waited=$((waited+1))
     done
-    kill -KILL "$pid" 2>/dev/null || true
-    wait "$pid" 2>/dev/null || true
-    # SIGKILL on sandbox-ctl doesn't propagate to CH child; nuke any
-    # cloud-hypervisor still attached to this sandbox's API socket.
-    if [ -n "$sid" ]; then
-        pkill -KILL -f "cloud-hypervisor.*--api-socket /run/$sid/" 2>/dev/null || true
-    fi
+    echo "WARN: sandbox-ctl pid=$pid sid=$sid did not exit within ${timeout}s of SIGTERM" >&2
+    echo "WARN: leaving it running per project policy (no script-level SIGKILL of sandbox-ctl)" >&2
+    echo "WARN: manual cleanup if needed:" >&2
+    echo "WARN:   sudo kill -KILL $pid" >&2
+    echo "WARN:   sudo pkill -KILL -f 'cloud-hypervisor.*--net tap=${sid}-tap'" >&2
+    echo "WARN:   sudo ip link delete ${sid}-tap; sudo rmdir /sys/fs/cgroup/sandboxes/${sid}" >&2
+    return 1
 }
 
 phase_a() {
