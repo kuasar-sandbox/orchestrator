@@ -52,11 +52,22 @@ TAP_NAME="${TAP_NAME:-sb-tap0}"
 mkdir -p "$(dirname "$OUT")"
 mkdir -p "$BIN_CACHE"
 
+# Defensive pre-clean: a prior failed run may have left long-running daemons
+# (cache-ctl / store-ctl) or CH zombies still executing from $BIN_CACHE. The
+# cp below would then fail with "Text file busy" and silently leave a stale
+# cached binary. Kill anything from $BIN_CACHE before copying.
+echo "==> pre-clean stale perf daemons (cache-ctl / store-ctl / cloud-hypervisor)" >&2
+pkill -9 -f "$BIN_CACHE/cloud-hypervisor" 2>/dev/null || true
+pkill -9 -f "$BIN_CACHE/cache-ctl"        2>/dev/null || true
+pkill -9 -f "$BIN_CACHE/store-ctl"        2>/dev/null || true
+sleep 0.5
+
 # Fast-path binaries to /tmp to skip WSL2 drvfs exec overhead.
 echo "==> caching binaries to $BIN_CACHE" >&2
 for b in cloud-hypervisor sandbox-ctl sandbox-init sandbox-runtime.erofs flatten-ctl manifest-ctl store-ctl cache-ctl mkfs.erofs vmlinux; do
     if [ -e "$SRC_BIN/$b" ]; then
-        cp -u "$SRC_BIN/$b" "$BIN_CACHE/$b"
+        cp -u "$SRC_BIN/$b" "$BIN_CACHE/$b" \
+          || { echo "FATAL: cp $b → $BIN_CACHE failed (still busy?)" >&2; exit 1; }
     fi
 done
 BIN="$BIN_CACHE"
@@ -85,11 +96,11 @@ if ! ip link show "$TAP_NAME" >/dev/null 2>&1; then
     TAP_CREATED_BY_TEST=1
 fi
 
-# Defensive: any prior failed run may have left CH zombies attached
-# to the TAP. Clean them up before we start. (Use a unique CH binary
-# path or pkill on cloud-hypervisor; we picked the binary cache path
-# so this is bounded to perf-runs.)
-echo "==> defensive pre-clean of stale cloud-hypervisor processes" >&2
+# CH zombies still attached to the TAP from a prior failed run would
+# wedge subsequent tap_open(). The daemon pre-clean above already killed
+# anything from $BIN_CACHE; this is a belt-and-braces re-sweep after the
+# require() gate, in case the user pointed BIN at a non-$BIN_CACHE path.
+echo "==> defensive re-sweep of stale cloud-hypervisor processes" >&2
 pkill -9 -f "$BIN/cloud-hypervisor" 2>/dev/null || true
 sleep 0.5
 
@@ -245,12 +256,15 @@ if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
     docker pull "$IMAGE" >/dev/null
 fi
 BLK0_EROFS="$WORK/blk0.erofs"
-echo "==> docker save | flatten-ctl > $BLK0_EROFS" >&2
-docker save "$IMAGE" | "$BIN/flatten-ctl" --output "$BLK0_EROFS" --no-progress
+echo "==> docker save | flatten-ctl export > $BLK0_EROFS" >&2
+docker save "$IMAGE" | "$BIN/flatten-ctl" export --output "$BLK0_EROFS" --no-progress
+[ -s "$BLK0_EROFS" ] || { echo "FATAL: blk0 erofs empty (docker save | flatten-ctl failed)" >&2; exit 1; }
 
-echo "==> manifest-ctl store --put-manifest" >&2
-MKEY=$("$BIN/manifest-ctl" store --config "$WORK/accelerator.yaml" \
-    --input "$BLK0_EROFS" --put-manifest --no-progress)
+echo "==> manifest-ctl store $BLK0_EROFS" >&2
+MKEY=$("$BIN/manifest-ctl" store --manifest-config "$WORK/accelerator.yaml" \
+    --no-progress "$BLK0_EROFS") \
+  || { echo "FATAL: manifest-ctl store failed" >&2; exit 1; }
+[ -n "$MKEY" ] || { echo "FATAL: manifest-ctl returned empty key" >&2; exit 1; }
 echo "    blk0 manifest key: $MKEY" >&2
 
 # ---- per-scenario sandbox.yaml templates --------------------------------
@@ -767,5 +781,15 @@ print("    upload={}ms total={} dedup={}".format(int(r["wall_ms"]), r["snap_tota
     echo
     echo "==> done"
 } | tee "$OUT"
+
+# Sanity: any scenario with zero successful iterations means the run is broken
+# (build/env/regression). The body's `|| continue` swallows per-iter failures
+# by design, so this is the only gate that turns systemic breakage into a
+# non-zero exit. `grep -c` exits 1 on zero matches; the wrapper makes that ok.
+zero=$(grep -cE '^\[.*\] N=0' "$OUT" || true)
+if [ "$zero" -gt 0 ]; then
+    echo "FATAL: $zero scenario(s) produced N=0 samples — see $OUT" >&2
+    exit 1
+fi
 
 echo "==> report saved to $OUT" >&2

@@ -4,8 +4,8 @@
 #
 # Spins up a node-ctl daemon + N sandboxes running the shared
 # test/perf/workload.py model, samples controller events and host memory,
-# emits JSON for downstream analysis (test/perf/density-perf-N{N}.json
-# under $WORK).
+# emits JSON for downstream analysis (test/results/density-perf-N{N}.json
+# by default; PERF_OUT overrides).
 #
 # Knobs (all env-driven so the same script profiles different setups):
 #
@@ -33,13 +33,17 @@
 #   RECOVER_DUR       node-ctl dampening recover_duration (default 30s)
 #   STAGGER_S         seconds between consecutive sandbox launches (default 0)
 #   IMAGE             docker image (default python:3.12-slim)
-#   WORK              workdir (default /tmp/density-perf-XXXXXX)
+#   WORK              workdir for transient logs (default /tmp/density-perf-XXXXXX)
+#   PERF_OUT          aggregated JSON output path
+#                     (default $REPO_ROOT/test/results/density-perf-N{N}.json)
 #
-# Outputs in $WORK:
+# Transient outputs in $WORK:
 #   daemon.log                    controller daemon stdout
 #   audit.log                     controller audit (admit/release/reclaim)
 #   sb-perf-N.log per sandbox     sandbox-ctl stdout
 #   sb-perf-N.cgroup-events       memory.events.local snapshot at end
+#
+# Persistent output (under test/results/, matches sandbox-perf{,-manifest}.sh):
 #   density-perf-N{N}.json        aggregated metrics
 #
 # Skips on missing kvm/root/docker/binaries (REQUIRE_KVM=1 turns skip
@@ -339,8 +343,11 @@ for sid in "${SB_SIDS[@]}"; do
     total_oom=$((total_oom+o))
 done
 
-# Output JSON.
-out="$WORK/density-perf-N${N}.json"
+# Output JSON. Default lands in test/results/ so it survives $WORK cleanup
+# and is consistent with sandbox-perf{,-manifest}.sh; PERF_OUT overrides.
+OUT="${PERF_OUT:-$REPO_ROOT/test/results/density-perf-N${N}.json}"
+mkdir -p "$(dirname "$OUT")"
+out="$OUT"
 {
     echo "{"
     echo "  \"n\": $N,"
