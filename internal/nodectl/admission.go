@@ -244,10 +244,10 @@ func (a *AdmissionController) processQueue() {
 			resp.QueuePosAtIn = int64(head.queuedPos)
 			_ = WriteMessage(head.conn, resp)
 			// Conn left open: caller will continue to use it for RPC.
-			if a.auditor != nil {
-				a.auditor.Logf("admit_from_queue sid=%s waited_ms=%d",
-					head.req.SandboxID, resp.QueuedForMs)
-			}
+			// No separate audit event here — the canonical `admit token=...`
+			// line was already emitted by buildAdmitOK (via processFn).
+			// The fact that this admit came from the queue is reflected in
+			// the response's QueuedForMs metadata that the client logs.
 			continue
 
 		case OutcomeLongTermReject:
