@@ -35,7 +35,8 @@
 #     N              concurrent sandboxes (default 8)
 #     MEM_MIB        per-sandbox memory zone (default 256)
 #     FLOOR_MIB      per-sandbox allocatable floor (default 64)
-#     BURST_MIB      per-sandbox startup_burst (default = FLOOR_MIB)
+#     BURST_MIB      per-sandbox startup memory request (default = FLOOR_MIB)
+#                    NOTE: yaml field is `resources.startup.memory` (was startup_burst)
 #     CAP_MIB        per-sandbox capacity (default = MEM_MIB)
 #
 #   Workload
@@ -56,7 +57,9 @@
 #
 #   node-ctl controller [advanced]
 #     PHYS_MEM, HOST_RES_MEM, PHYS_CPU, HOST_RES_CPU,
-#     HIGH_FACTOR, LOW_FACTOR, EMERG_FACTOR, GRANT_PER_SEC_FACTOR, RECOVER_DUR
+#     HIGH_FACTOR, LOW_FACTOR, EMERG_FACTOR, STARTUP_FACTOR,
+#     GRANT_PER_SEC_FACTOR, RECOVER_DUR,
+#     ADM_RATE, ADM_BURST   # admission token bucket; node.md defaults 4/16
 #
 # Report sink:
 #   test/results/density-perf-N{N}.txt (PERF_OUT overrides) — final report
@@ -119,6 +122,9 @@ HOST_RES_MEM="${HOST_RES_MEM:-1GiB}"
 PHYS_CPU="${PHYS_CPU:-$(nproc)}"
 HOST_RES_CPU="${HOST_RES_CPU:-1}"
 HIGH_FACTOR="${HIGH_FACTOR:-0.85}"
+STARTUP_FACTOR="${STARTUP_FACTOR:-0.50}"
+ADM_RATE="${ADM_RATE:-4}"
+ADM_BURST="${ADM_BURST:-16}"
 LOW_FACTOR="${LOW_FACTOR:-0.70}"
 EMERG_FACTOR="${EMERG_FACTOR:-0.05}"
 GRANT_PER_SEC_FACTOR="${GRANT_PER_SEC_FACTOR:-0.20}"
@@ -233,7 +239,7 @@ resources:
   control:
     cgroup_path: /sys/fs/cgroup/sandboxes/${sid}
     controller: $WORK/sandbox-resource.sock
-  startup_burst:
+  startup:
     memory: ${BURST_MIB}MiB
 network:
   tap: ${sid}-tap
@@ -283,14 +289,15 @@ watermarks:
   high_factor: $HIGH_FACTOR
   low_factor: $LOW_FACTOR
   emergency_factor: $EMERG_FACTOR
+  startup_factor: $STARTUP_FACTOR
 rate_limits:
   memory_grant_per_sec_factor: $GRANT_PER_SEC_FACTOR
 admission:
-  rate: 100
-  burst: 100
-  max_concurrent_creating: 100
-  startup_ttl: 120s
+  rate: $ADM_RATE
+  burst: $ADM_BURST
+  startup_ttl: 30s
   queue_ttl: 30s
+  queue_max_depth: 256
 dampening:
   recover_duration: $RECOVER_DUR
   cooldown_periods: 5
