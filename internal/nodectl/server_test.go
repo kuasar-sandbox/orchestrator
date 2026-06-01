@@ -21,14 +21,17 @@ func startTestServer(t *testing.T, physMem uint64) (*Server, *Client, func()) {
 		HighFactor:              0.85,
 		LowFactor:               0.70,
 		EmergencyFactor:         0.05,
+		StartupFactor:           0.50,
 	})
 	admission := NewAdmissionController(AdmissionPolicy{
-		Rate:                  100,
-		Burst:                 100,
-		MaxConcurrentCreating: 100,
-		StartupTTL:            5 * time.Minute,
-		QueueTTL:              60 * time.Second,
+		Rate:          100,
+		Burst:         100,
+		StartupTTL:    5 * time.Minute,
+		QueueTTL:      60 * time.Second,
+		QueueMaxDepth: 256,
 	})
+	admission.SetWiring(state, nil, t.Logf,
+		func(p *PendingAdmit) (*Message, error) { return nil, nil })
 	allocator := NewAllocator(AllocatorPolicy{
 		MemoryGrantPerSecBytes: 1 << 30, // 1 GiB/s for tests
 		MinGrantStep:           1 << 20,
@@ -214,13 +217,19 @@ func TestServer_PersistAcrossRestart(t *testing.T) {
 			HighFactor:              0.85,
 			LowFactor:               0.70,
 			EmergencyFactor:         0.05,
+			StartupFactor:           0.50,
 		})
 		// Try to load any prior state.
 		persister := &Persister{Path: statePath}
 		if prev, err := persister.Load(); err == nil && prev != nil {
 			state.Reservations = prev.Reservations
 		}
-		admission := NewAdmissionController(AdmissionPolicy{Rate: 100, Burst: 100, MaxConcurrentCreating: 100, StartupTTL: time.Minute})
+		admission := NewAdmissionController(AdmissionPolicy{
+			Rate: 100, Burst: 100, StartupTTL: time.Minute,
+			QueueTTL: 60 * time.Second, QueueMaxDepth: 256,
+		})
+		admission.SetWiring(state, nil, t.Logf,
+			func(p *PendingAdmit) (*Message, error) { return nil, nil })
 		allocator := NewAllocator(AllocatorPolicy{MemoryGrantPerSecBytes: 1 << 30, MinGrantStep: 1 << 20, MaxGrantStep: 1 << 30})
 		s := &Server{
 			Path: sock, State: state,

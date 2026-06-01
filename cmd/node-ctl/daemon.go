@@ -72,6 +72,21 @@ func daemonCmd(args []string) int {
 		return 1
 	}
 
+	// Wire admission worker. processFn is invoked by the worker when a
+	// queued head can finally be admitted; it builds the reservation +
+	// AdmitResponse using the same buildAdmitOK path as the synchronous
+	// admit route. The conn from the pending entry stays open — the
+	// serveConn loop continues reading messages once the worker writes
+	// the response.
+	admission.SetWiring(state, auditor,
+		func(f string, a ...any) { log.Printf("[node-ctl admit] "+f, a...) },
+		func(p *nodectl.PendingAdmit) (*nodectl.Message, error) {
+			return srv.BuildAdmitOKFromQueue(p)
+		},
+	)
+	admission.Run()
+	defer admission.Stop()
+
 	ctx, cancel := signalContext()
 	defer cancel()
 

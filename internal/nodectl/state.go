@@ -63,6 +63,15 @@ type Reservation struct {
 	Capacity          Resources `json:"capacity"`
 	Floor             Resources `json:"floor"`
 	AllocatableNowMem uint64    `json:"allocatable_now_mem"`
+
+	// EffectiveStartupBudget is what admission charged against startup_pool
+	// on admit: max(yaml.startup, yaml.allocatable, allocatable_at_snapshot).
+	// Returned to startup_pool on the first stage transition that leaves the
+	// pre-settled set (StageAdmitted/Creating/Startup/Restoring) — typically
+	// at Settled, or earlier on Release-before-Settled. Distinct from
+	// AllocatableNowMem (main-pool charge), which keeps tracking grow/shrink.
+	EffectiveStartupBudget uint64 `json:"effective_startup_budget,omitempty"`
+
 	Stage             string    `json:"stage"`
 	StageEnteredAt    time.Time `json:"stage_entered_at"`
 	LastHeartbeatAt   time.Time `json:"last_heartbeat_at"`
@@ -78,12 +87,15 @@ type Reservation struct {
 	Conn net.Conn `json:"-"`
 }
 
-// Watermarks captures the four water-mark fractions of allocatable_pool.
+// Watermarks captures the water-mark fractions of allocatable_pool.
+// StartupFactor sizes the startup_pool sub-budget (admission charges
+// effective_startup_budget against it; released on Settled).
 type Watermarks struct {
 	OperationalMarginFactor float64 `json:"operational_margin_factor"`
 	HighFactor              float64 `json:"high_factor"`
 	LowFactor               float64 `json:"low_factor"`
 	EmergencyFactor         float64 `json:"emergency_factor"`
+	StartupFactor           float64 `json:"startup_factor"`
 }
 
 // State is the in-memory snapshot mirrored to /run/node-ctl/state.json.
@@ -135,6 +147,35 @@ func (s *State) NodeAllocated() Resources {
 	for _, r := range s.Reservations {
 		out.MemoryBytes += r.AllocatableNowMem
 		out.CPUMilli += r.Floor.CPUMilli // CPU does not burst; floor is the budget
+	}
+	return out
+}
+
+// StartupPoolBytes returns the startup-phase sub-budget cap. Caller
+// must hold the lock.
+func (s *State) StartupPoolBytes() uint64 {
+	return uint64(float64(s.AllocatablePool.MemoryBytes) * s.Wm.StartupFactor)
+}
+
+// IsPreSettled reports whether a stage is still in the admission's
+// startup window (admit charged effective_startup_budget against
+// startup_pool, not yet released).
+func IsPreSettled(stage string) bool {
+	switch stage {
+	case StageAdmitted, StageCreating, StageStartup, StageRestoring:
+		return true
+	}
+	return false
+}
+
+// StartupInFlightLocked sums effective_startup_budget across reservations
+// still in a pre-settled stage. Caller must hold the lock.
+func (s *State) StartupInFlightLocked() uint64 {
+	var out uint64
+	for _, r := range s.Reservations {
+		if IsPreSettled(r.Stage) {
+			out += r.EffectiveStartupBudget
+		}
 	}
 	return out
 }

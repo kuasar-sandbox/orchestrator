@@ -40,6 +40,12 @@ type WatermarksConfig struct {
 	HighFactor              float64 `yaml:"high_factor"`
 	LowFactor               float64 `yaml:"low_factor"`
 	EmergencyFactor         float64 `yaml:"emergency_factor"`
+	// StartupFactor sets startup_pool = allocatable_pool × this.
+	// Admission's per-sandbox effective_startup_budget is capped against
+	// this sub-pool so startup-phase reservations cannot eat the whole
+	// allocatable pool, leaving headroom for steady-state grants.
+	// Must be > emergency_factor and ≤ 1.0.
+	StartupFactor float64 `yaml:"startup_factor"`
 }
 
 type RateLimitsConfig struct {
@@ -47,11 +53,17 @@ type RateLimitsConfig struct {
 }
 
 type AdmissionConfig struct {
-	Rate                  int    `yaml:"rate"`
-	Burst                 int    `yaml:"burst"`
-	MaxConcurrentCreating int    `yaml:"max_concurrent_creating"`
-	StartupTTL            string `yaml:"startup_ttl"`
-	QueueTTL              string `yaml:"queue_ttl"`
+	Rate            int    `yaml:"rate"`
+	Burst           int    `yaml:"burst"`
+	StartupTTL      string `yaml:"startup_ttl"`
+	QueueTTL        string `yaml:"queue_ttl"`
+	QueueMaxDepth   int    `yaml:"queue_max_depth"`
+
+	// MaxConcurrentCreating is deprecated as of the queue-based admission
+	// rewrite — concurrency is now bounded by startup_pool budget rather
+	// than a hardcoded count. Field retained for yaml backwards-compat
+	// (warn on parse if set); admission ignores the value.
+	MaxConcurrentCreating int `yaml:"max_concurrent_creating,omitempty"`
 }
 
 type DampeningConfig struct {
@@ -98,16 +110,17 @@ func DefaultConfig() *DaemonConfig {
 			HighFactor:              0.85,
 			LowFactor:               0.70,
 			EmergencyFactor:         0.05,
+			StartupFactor:           0.50,
 		},
 		RateLimits: RateLimitsConfig{
 			MemoryGrantPerSecFactor: 0.05,
 		},
 		Admission: AdmissionConfig{
-			Rate:                  4,
-			Burst:                 16,
-			MaxConcurrentCreating: 16,
-			StartupTTL:            "300s",
-			QueueTTL:              "60s",
+			Rate:          4,
+			Burst:         16,
+			StartupTTL:    "30s",
+			QueueTTL:      "30s",
+			QueueMaxDepth: 256,
 		},
 		Dampening: DampeningConfig{
 			RecoverDuration: "60s",
@@ -196,6 +209,13 @@ func (c *DaemonConfig) Resolve() (*Resolved, error) {
 		HighFactor:              c.Watermarks.HighFactor,
 		LowFactor:               c.Watermarks.LowFactor,
 		EmergencyFactor:         c.Watermarks.EmergencyFactor,
+		StartupFactor:           c.Watermarks.StartupFactor,
+	}
+	if out.Watermarks.StartupFactor <= out.Watermarks.EmergencyFactor ||
+		out.Watermarks.StartupFactor > 1.0 {
+		return nil, fmt.Errorf("watermarks.startup_factor (%g) must satisfy "+
+			"emergency_factor (%g) < startup_factor ≤ 1.0",
+			out.Watermarks.StartupFactor, out.Watermarks.EmergencyFactor)
 	}
 
 	pool := uint64(float64(out.PhysicalMemory-out.HostReserved.MemoryBytes) *
@@ -210,12 +230,16 @@ func (c *DaemonConfig) Resolve() (*Resolved, error) {
 	if err != nil {
 		return nil, fmt.Errorf("admission.queue_ttl: %w", err)
 	}
+	queueDepth := c.Admission.QueueMaxDepth
+	if queueDepth <= 0 {
+		queueDepth = 256
+	}
 	out.Admission = AdmissionPolicy{
-		Rate:                  c.Admission.Rate,
-		Burst:                 c.Admission.Burst,
-		MaxConcurrentCreating: c.Admission.MaxConcurrentCreating,
-		StartupTTL:            startupTTL,
-		QueueTTL:              queueTTL,
+		Rate:          c.Admission.Rate,
+		Burst:         c.Admission.Burst,
+		StartupTTL:    startupTTL,
+		QueueTTL:      queueTTL,
+		QueueMaxDepth: queueDepth,
 	}
 
 	out.Allocator = AllocatorPolicy{

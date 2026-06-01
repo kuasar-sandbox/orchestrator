@@ -146,16 +146,17 @@ watermarks:
   high_factor: 0.85
   low_factor: 0.70
   emergency_factor: 0.05
+  startup_factor: 0.50                 # startup_pool = allocatable_pool × 此值
 
 rate_limits:
   memory_grant_per_sec_factor: 0.05    # × allocatable_pool_mem
 
 admission:
-  rate: 4                              # /s
-  burst: 16
-  max_concurrent_creating: 16
-  startup_ttl: 300s
-  queue_ttl: 60s
+  rate: 4                              # /s — admission token bucket 填充
+  burst: 16                            # admission token bucket 容量
+  startup_ttl: 30s                     # admit → settled 上限
+  queue_ttl: 30s                       # 短期阻塞排队上限
+  queue_max_depth: 256                 # 队列容量,超即立 reject queue_full
 
 dampening:                              # 振荡阻尼,不进 sandbox.yaml
   recover_duration: 60s                # burst → settled 观察期
@@ -181,12 +182,13 @@ logging:
 | `watermarks.high_factor` | 0.85 | red 区起点 |
 | `watermarks.low_factor` | 0.70 | yellow 区起点 |
 | `watermarks.emergency_factor` | 0.05 | 紧急池,仅 urgency=high 申请可触 |
+| `watermarks.startup_factor` | 0.50 | startup_pool = allocatable_pool × 此值,bounds admission 阶段累计 effective_startup_budget,留 steady-state grant 用 |
 | `rate_limits.memory_grant_per_sec_factor` | 0.05 | 内存仲裁限速:每秒总扩展量 ≤ allocatable_pool × 此值 |
 | `admission.rate` | 4 | Admit 速率,token bucket 装填速率(/s) |
-| `admission.burst` | 16 | Admit 速率,token bucket 容量 |
-| `admission.max_concurrent_creating` | 16 | 已 admit 但未到 settled 的沙箱数上限 |
-| `admission.startup_ttl` | 300s | sandbox-ctl 必须在此时间内进入 settled |
-| `admission.queue_ttl` | 60s | Admit 排队上限 |
+| `admission.burst` | 16 | Admit token bucket 容量(注:与 sandbox.yaml `resources.startup` 同字面但语义不同) |
+| `admission.startup_ttl` | 30s | sandbox-ctl 必须在此时间内进入 settled,否则 IdleSweeper 释放 reservation |
+| `admission.queue_ttl` | 30s | 短期阻塞排队最长等待,超时 → reject `queue_ttl` |
+| `admission.queue_max_depth` | 256 | 队列容量,超即立 reject `queue_full` |
 | `dampening.recover_duration` | 60s | burst → settled 观察期 |
 | `dampening.cooldown_periods` | 10 | × 100ms,burst → recover 判定门槛 |
 
@@ -217,10 +219,17 @@ operational_margin 即使在 critical 区也不被触动——节点的"绝对�
 high_watermark   = allocatable_pool × 85%
 low_watermark    = allocatable_pool × 70%
 emergency_pool   = allocatable_pool × 5%
+startup_pool     = allocatable_pool × 50%   # admission 阶段累计上界
 ```
 
 `emergency_pool` 仅响应 urgency=high(oom 类紧急申请),正常仲裁动用前 95%
 预算。
+
+`startup_pool` 是 admission 单独跟踪的 sub-budget:所有 pre-settled stage
+的 reservation `effective_startup_budget` 累计不能超过 startup_pool。这是
+**用 budget 替代过去 hardcoded `max_concurrent_creating`** 的方式,把并发由
+"个数硬限"变成"内存硬限"——同样的 startup_pool 容下若干个小 sandbox 或
+单个大 sandbox,自然 throttle。
 
 水位区间行为:
 
@@ -230,6 +239,10 @@ emergency_pool   = allocatable_pool × 5%
 | **yellow** | [low, high] | 接受 | 渐进收回(10s 周期) | FIFO 限速批 |
 | **red** | (high, allocatable_pool − emergency_pool] | **拒绝新沙箱** | 强制收回最旧 settled 沙箱超额 | 仅紧急批,普通申请排队 |
 | **critical** | 进入 emergency_pool | 拒绝 | 强制 + 最旧优先 | 仅 oom urgency 批 |
+
+注: zone red/critical 是系统保护性 reject——即使其他短期资源可缓解
+(token bucket / startup_pool),进入 red/critical 仍然立即拒绝,给系统
+recovery 留空间。
 
 CPU 维度水位**仅用于 admission**(`Σ allocatable.cpu_i ≤ allocatable_pool_cpu`),
 **不参与运行期 grant 排队与限速**——CPU 不动态分配。
@@ -265,10 +278,13 @@ sandbox-ctl 的对端**;`node-ctl` 是参考实现。
 
 ```
 Admit            (capacity, floor, startup_budget_memory, allocatable_at_snapshot?)
-                 → AdmitResponse (status, reservation_token, granted_initial_alloc, queued_eta_ms)
-                   status ∈ {admitted, queued, rejected}
-                   granted_initial_alloc:冷启动 = startup_budget_memory;
-                                          快照恢复 = allocatable_at_snapshot 或降级值
+                 → AdmitResponse (status, reservation_token, granted_initial_alloc,
+                                  reason?, queued_for_ms, queue_pos_at_in)
+                   status ∈ {admitted, rejected}        (queued 已废弃,server hold conn)
+                   granted_initial_alloc = max(startup_budget_memory, floor,
+                                               allocatable_at_snapshot)
+                   reason:rejected 时分类(详 §6.4)
+                   queued_for_ms / queue_pos_at_in:informational metadata
 
 Settled          (token, current_rss, current_cpu_usec)        # 进入 settled 通知
                  → Ack
@@ -315,10 +331,14 @@ UpdateConfig     (token, new_watermark_ratio, ...)             # 运维动态调
 **首次建连**:
 
 1. sandbox-ctl 拨 UDS,发 `Admit`
-2. 控制器检查水位 + concurrency + token bucket,返回 AdmitResponse
+2. 控制器评估请求:
+   - 通过 → 立即回 `status=admitted`
+   - 长期失败(drain / zone red/critical / 超 pool / 超 startup_pool)→ `status=rejected`
+   - 短期阻塞(token / main_headroom / startup_headroom)→ **不回应**,
+     conn 入服务端 FIFO queue;worker 在条件满足时回 `admitted`,
+     queue_ttl 超时回 `rejected`
 3. status=admitted:sandbox-ctl 持有 token,继续启动流程
-4. status=queued:sandbox-ctl 等到 queued_eta_ms 后重试
-5. status=rejected:sandbox-ctl 退出非零
+4. status=rejected:sandbox-ctl 退出非零(orchestrator 决定 retry / 换 host)
 
 **长连维持**:
 
@@ -356,30 +376,91 @@ UpdateConfig     (token, new_watermark_ratio, ...)             # 运维动态调
 
 ```
 T0  sandbox-ctl run --config xx.yaml
-T1  parse config, compute (capacity, floor, startup_burst.memory)
+T1  parse config, compute (capacity, floor, startup.memory)
     若 control.controller 为空 → 跳过 admit,跳到 T5
 T2  dial controller, send Admit
-T3  receive AdmitResponse
-T4  if rejected: exit 2(节点已满)
-T4' if queued:   sleep queued_eta_ms, retry from T2
-T4'' if admitted: continue
+T3  block read AdmitResponse(可能立即,也可能在 queue 中等待)
+T4  if rejected: exit 2(orchestrator 决定 retry / 换 host)
+T4' if admitted: continue(可能伴随 queued_for_ms > 0,仅作 log 用)
 T5  cgroup join(静态 cgroup / 动态控制模式写限制;无 cgroup 模式跳过)
 T6  ... 启动序列继续(详见 sandbox.md §冷启动数据流)
 ```
 
-`startup_burst.memory` 取自 sandbox.yaml(默认 = allocatable.memory),仅
-动态控制模式有意义。
+sandbox.yaml `resources.startup.memory` 是 sandbox 期望的 startup 阶段
+budget;默认 = allocatable.memory。admission 实际给出 `granted_initial_alloc
+= max(startup.memory, allocatable.memory, allocatable_at_snapshot)`,即
+三者最大,无降级。
 
-### 6.2 速率限制与并发限制
+### 6.2 决策矩阵
 
-控制器内部对 Admit 维护:
+每个 Admit 在 server 内部归一化:
 
-- **token bucket**:rate `R_admit`(默认 4 个/s),burst `B_admit`(默认 16)。
-  每 Admit 消耗 1 token;无 token 时排队
-- **concurrent counter**:`creating_count`(已 admit 但未到 settled 的沙箱数);
-  上限 `max_concurrent_creating`(默认 16)。超限的 Admit 排队
+```
+effective_startup_budget = max(
+    startup_budget_memory,      # 来自 sandbox.yaml resources.startup.memory
+    floor_memory_bytes,         # 来自 sandbox.yaml resources.allocatable.memory
+    allocatable_at_snapshot     # 仅 restore 路径,cold = 0
+)
+```
 
-排队策略:FIFO 队列,带 TTL(60 s)。超 TTL 的回 status=rejected。
+冷启动与恢复**走完全相同的决策路径**,差异由公式吸收。
+
+预检(立即 reject,不入队):
+
+| 条件 | reject 原因 |
+|---|---|
+| `effective_startup_budget == 0` | `invalid_burst` |
+| `effective_startup_budget > main_pool` | `exceeds_node_capacity`(永不可能) |
+| `effective_startup_budget > startup_pool` | `exceeds_startup_pool`(永不进 startup_pool) |
+
+主决策:
+
+| 失败原因 | 决策 | 类别 | 唤醒源 |
+|---|---|---|---|
+| drained | reject | long | — |
+| zone Red/Critical | reject | sys-protect | — |
+| `> main_headroom`(可装 pool 但暂缺) | **queue** | short | Settled / Release / Reclaim |
+| `> startup_headroom`(可装 startup_pool 但暂缺) | **queue** | short | Settled / pre-settled Release |
+| token bucket 空 | **queue** | short | one-shot token-refill timer |
+| `queue.depth ≥ queue_max_depth` | reject `queue_full` | overload | — |
+| 等待时间 > `queue_ttl` | reject `queue_ttl` | timeout | per-entry TTL timer |
+| 默认(全部通过) | admitted | — | — |
+
+并发不再由 hardcoded `max_concurrent_creating` 限,而是由 `startup_pool`
+budget 自然 throttle:每个 sandbox admission 占 `effective_startup_budget`
+在 startup_pool 内,Settled 时立即归还。
+
+### 6.3 队列协调机制
+
+服务端 FIFO 队列 + 持有连接 + 事件驱动 worker(单 goroutine)。
+
+**worker 主循环**只 select `wakeCh + shutdownCh`,无周期 timer:
+
+| Wake 来源 | 触发时机 |
+|---|---|
+| 入队 | server.handleAdmit 决策为 short-term block 时 |
+| Settled | sandbox-ctl 发 Settled message(main pool 收 burst→max(rss,floor);startup pool 收 effective_startup_budget→0)|
+| Release | sandbox-ctl 发 Release(pre-settled 时 startup pool 同步释放)|
+| Reclaim | 强制收回完成 |
+| **per-entry TTL** | 入队时 `time.AfterFunc(queue_ttl, pushWake)` |
+| **per-entry conn EOF** | 入队时启 reader goroutine,client 断连时 `pushWake` |
+| **one-shot token refill** | head 阻于 token bucket 时,worker 末尾 `AfterFunc(eta, pushWake)` |
+
+worker 处理:严格 FIFO。head 不通过即停,直到 wake 重试。worker 入口先取
+`queueMu`,再取 `State.Lock`(锁顺序固定避免死锁)。
+
+### 6.4 reject reason 分类
+
+| reason | 含义 | sandbox-ctl 行为 |
+|---|---|---|
+| `drained` | 控制器进入 drain 模式 | exit 非零;orchestrator 知节点不再接客 |
+| `zone_critical` | main pool 在 red/critical 区 | exit;orchestrator 换 host 或等其他 sandbox release |
+| `invalid_burst` | 请求 effective_burst 计算为 0 | 配置错(yaml 全空)|
+| `exceeds_node_capacity` | effective_burst > 节点总 pool | 配置错(永远塞不进这个节点)|
+| `exceeds_startup_pool` | effective_burst > startup_pool 上限 | startup_factor 配过小 / sandbox burst 配过大 |
+| `queue_full` | queue.depth ≥ queue_max_depth | 节点 admission 压力极大,orchestrator 换 host |
+| `queue_ttl` | 等待时间 > queue_ttl | 短期资源紧但 30s 内未缓解,orchestrator 决定 |
+| `queue_canceled` | 客户端断连或自身 TTL 触发 | 通常 client-side 已退出 |
 
 ### 6.3 reservation 生命周期与 token TTL
 

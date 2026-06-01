@@ -136,6 +136,14 @@ func (s *Server) serveConn(ctx context.Context, conn net.Conn) {
 			}
 			return
 		}
+		// Token discovery: an admit returning Queued is completed by the
+		// admission worker asynchronously, so the local token var may not
+		// be set when the next message arrives. Sync the local token from
+		// req.Token (which the client carries as its auth field on every
+		// non-Admit message) so handleConnDrop later finds the reservation.
+		if token == "" && req.Token != "" {
+			token = req.Token
+		}
 		resp := s.dispatch(conn, req, &token)
 		if resp != nil {
 			_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
@@ -182,108 +190,124 @@ func (s *Server) dispatch(conn net.Conn, req *Message, token *string) *Message {
 	}
 }
 
-// handleAdmit assigns a fresh token, builds a reservation, and inserts
-// into State if admission and water-mark both pass.
+// handleAdmit either admits the request immediately, rejects with a
+// long-term reason, or hands the conn over to the admission queue (in
+// which case it returns nil — the worker writes the response itself).
+//
+// Returning nil signals the serveConn loop to skip writing here; the
+// connection stays open and the admission worker is responsible for the
+// reply. The conn-EOF monitor cancels the queue entry if the client
+// disconnects while queued.
 func (s *Server) handleAdmit(conn net.Conn, req *Message, token *string) *Message {
-	dec := s.Admission.TryAdmit()
-	if dec.Status == StatusQueued {
-		return &Message{
-			Type:        TypeAdmitResponse,
-			Status:      StatusQueued,
-			QueuedETAMs: int64(dec.QueueWait / time.Millisecond),
-		}
-	}
-	if dec.Status == StatusRejected {
-		return &Message{
-			Type:   TypeAdmitResponse,
-			Status: StatusRejected,
-			Msg:    dec.RejectMsg,
+	oc := s.Admission.AnalyzeRequest(req)
+	switch oc.Status {
+	case OutcomeAdmitted:
+		if !s.Admission.ConsumeToken() {
+			// Race: another admit took the token. Re-evaluate (which may
+			// now be short-term-block → queue).
+			oc = s.Admission.AnalyzeRequest(req)
 		}
 	}
 
-	// Compute granted_initial_alloc and check zone.
-	requestedInitial := req.StartupBudgetMemory
-	if req.AllocatableAtSnapshot > 0 {
-		requestedInitial = req.AllocatableAtSnapshot
+	switch oc.Status {
+	case OutcomeAdmitted:
+		// Token already consumed above (or admit didn't need a token recheck).
+		resp, err := s.buildAdmitOK(conn, req, token)
+		if err != nil {
+			return &Message{
+				Type:   TypeAdmitResponse,
+				Status: StatusRejected,
+				Msg:    err.Error(),
+			}
+		}
+		return resp
+
+	case OutcomePreCheckReject, OutcomeLongTermReject:
+		return &Message{
+			Type:   TypeAdmitResponse,
+			Status: StatusRejected,
+			Reason: oc.RejectCode,
+			Msg:    oc.RejectMsg,
+		}
+
+	case OutcomeShortTermBlock:
+		entry, ok := s.Admission.Enqueue(req, conn)
+		if !ok {
+			return &Message{
+				Type:   TypeAdmitResponse,
+				Status: StatusRejected,
+				Reason: "queue_full",
+				Msg:    "admission queue at capacity",
+			}
+		}
+		s.Admission.MonitorConnEOF(entry)
+		if s.Auditor != nil {
+			s.Auditor.Logf("admit_queued sid=%s pos=%d block=%d",
+				req.SandboxID, entry.queuedPos, int(oc.Block))
+		}
+		// nil → serveConn loop skips this write; the admission worker
+		// will write Admitted/Rejected when the head is processed.
+		return nil
 	}
-	if requestedInitial == 0 {
-		requestedInitial = req.FloorMemoryBytes
-	}
+
+	// Defensive (unreachable).
+	return &Message{Type: TypeAdmitResponse, Status: StatusRejected, Msg: "unknown admission outcome"}
+}
+
+// BuildAdmitOKFromQueue is the adapter the admission worker calls when
+// it pops a queued head that now passes all checks. It bridges the
+// PendingAdmit-shaped argument to the per-request buildAdmitOK path so
+// queued and synchronous admits build reservations identically.
+func (s *Server) BuildAdmitOKFromQueue(p *PendingAdmit) (*Message, error) {
+	return s.buildAdmitOK(p.conn, p.req, nil)
+}
+
+// buildAdmitOK builds the Reservation, inserts it into State, returns
+// the AdmitResponse message. Caller has already token-consumed.
+func (s *Server) buildAdmitOK(conn net.Conn, req *Message, token *string) (*Message, error) {
+	ebudget := computeEffectiveStartupBudget(req)
 
 	s.State.Lock()
 	defer s.State.Unlock()
 
-	zone := s.State.MemoryZone()
-	pool := s.State.AllocatablePool.MemoryBytes
-	emerg := uint64(float64(pool) * s.State.Wm.EmergencyFactor)
-	allocated := s.State.NodeAllocated().MemoryBytes
-
-	switch zone {
-	case ZoneRed, ZoneCritical:
-		return &Message{
-			Type:   TypeAdmitResponse,
-			Status: StatusRejected,
-			Msg:    fmt.Sprintf("node in zone %s, refusing new admission", zone),
-		}
-	}
-
-	// Headroom that respects emergency_pool reservation.
-	headroom := uint64(0)
-	if pool > allocated+emerg {
-		headroom = pool - allocated - emerg
-	}
-	if requestedInitial > headroom {
-		// Try to fall back: snapshot restore tolerates degrading to
-		// memory_resident size; cold start does not. v1 tolerates only
-		// floor as the fallback for both — sandbox-ctl side handles the
-		// rest of the snapshot recovery logic per §13.3.
-		if req.FloorMemoryBytes <= headroom {
-			requestedInitial = req.FloorMemoryBytes
-		} else {
-			return &Message{
-				Type:   TypeAdmitResponse,
-				Status: StatusRejected,
-				Msg:    fmt.Sprintf("not enough memory headroom: have %d, need %d", headroom, req.FloorMemoryBytes),
-			}
-		}
-	}
-
 	t := NewToken()
 	res := &Reservation{
-		Token:             t,
-		SandboxID:         req.SandboxID,
-		CgroupPath:        req.CgroupPath,
-		Capacity:          Resources{MemoryBytes: req.CapacityMemoryBytes, CPUMilli: uint64(req.CapacityCPU) * 1000},
-		Floor:             Resources{MemoryBytes: req.FloorMemoryBytes, CPUMilli: uint64(req.FloorCPU * 1000)},
-		AllocatableNowMem: requestedInitial,
-		Stage:             StageAdmitted,
-		StageEnteredAt:    time.Now(),
-		LastHeartbeatAt:   time.Now(),
-		Conn:              conn,
+		Token:                  t,
+		SandboxID:              req.SandboxID,
+		CgroupPath:             req.CgroupPath,
+		Capacity:               Resources{MemoryBytes: req.CapacityMemoryBytes, CPUMilli: uint64(req.CapacityCPU) * 1000},
+		Floor:                  Resources{MemoryBytes: req.FloorMemoryBytes, CPUMilli: uint64(req.FloorCPU * 1000)},
+		AllocatableNowMem:      ebudget,
+		EffectiveStartupBudget: ebudget,
+		Stage:                  StageAdmitted,
+		StageEnteredAt:         time.Now(),
+		LastHeartbeatAt:        time.Now(),
+		Conn:                   conn,
 	}
 	if err := s.State.Insert(res); err != nil {
-		return &Message{Type: TypeAdmitResponse, Status: StatusRejected, Msg: err.Error()}
+		return nil, err
 	}
-	s.Admission.CountAdmit()
-	*token = t
+	if token != nil {
+		*token = t
+	}
 
 	if err := s.Persister.Flush(s.State); err != nil {
 		s.Logf("persister flush: %v", err)
 	}
 
-	s.Logf("admit %s sid=%s initial_alloc=%d zone=%s",
-		t[:8], req.SandboxID, requestedInitial, zone)
+	s.Logf("admit %s sid=%s initial_alloc=%d",
+		t[:8], req.SandboxID, ebudget)
 	if s.Auditor != nil {
-		s.Auditor.Logf("admit token=%s sid=%s initial_alloc=%d cap_mem=%d floor_mem=%d zone=%s",
-			t[:8], req.SandboxID, requestedInitial,
-			req.CapacityMemoryBytes, req.FloorMemoryBytes, zone)
+		s.Auditor.Logf("admit token=%s sid=%s initial_alloc=%d cap_mem=%d floor_mem=%d effective_startup=%d",
+			t[:8], req.SandboxID, ebudget,
+			req.CapacityMemoryBytes, req.FloorMemoryBytes, ebudget)
 	}
 	return &Message{
 		Type:                TypeAdmitResponse,
 		Token:               t,
 		Status:              StatusAdmitted,
-		GrantedInitialAlloc: requestedInitial,
-	}
+		GrantedInitialAlloc: ebudget,
+	}, nil
 }
 
 // handleReattach re-binds a connection to an existing reservation
@@ -304,19 +328,38 @@ func (s *Server) handleReattach(conn net.Conn, req *Message, token *string) *Mes
 
 func (s *Server) handleSettled(req *Message, token string) *Message {
 	s.State.Lock()
-	defer s.State.Unlock()
 	res := s.State.Lookup(token)
 	if res == nil {
+		s.State.Unlock()
 		return &Message{Type: TypeError, Msg: "no reservation"}
 	}
+
+	// 1. main-pool release: collapse AllocatableNowMem from the elevated
+	//    startup budget down to max(current_rss, floor). Steady-state grant
+	//    paths will pump it back up if needed.
+	floor := res.Floor.MemoryBytes
+	newAlloc := req.CurrentRSS
+	if newAlloc < floor {
+		newAlloc = floor
+	}
+	res.AllocatableNowMem = newAlloc
+
+	// 2. startup-pool release: the stage transition itself (admitted →
+	//    settled) takes res out of the pre-settled set, so StartupInFlight
+	//    accounting (derived) auto-decrements by res.EffectiveStartupBudget.
 	res.Stage = StageSettled
 	res.StageEnteredAt = time.Now()
 	res.LastHeartbeatAt = time.Now()
-	s.Admission.Settled()
+	s.State.Unlock()
+
+	// Wake the admission worker — main + startup pool both just got
+	// headroom back, queued admits may now fit.
+	s.Admission.PushWake()
+
 	if err := s.Persister.Flush(s.State); err != nil {
 		s.Logf("persister flush: %v", err)
 	}
-	s.Logf("settled %s sid=%s rss=%d", token[:8], res.SandboxID, req.CurrentRSS)
+	s.Logf("settled %s sid=%s rss=%d alloc=%d", token[:8], res.SandboxID, req.CurrentRSS, newAlloc)
 	return &Message{Type: TypeAck}
 }
 
@@ -432,22 +475,30 @@ func (s *Server) handleHeartbeat(req *Message, token string) *Message {
 
 func (s *Server) handleRelease(req *Message, token string) {
 	s.State.Lock()
-	defer s.State.Unlock()
 	res := s.State.Lookup(token)
 	if res == nil {
+		s.State.Unlock()
 		return
 	}
-	stage := res.Stage
-	s.Admission.Released(stage)
+	// Both main-pool and startup-pool accounting are derived from
+	// reservations + their Stage; removing the reservation here implicitly
+	// releases both. Wake admission so any short-term-blocked queued
+	// admit can re-evaluate against the freshly returned headroom.
+	wasPreSettled := IsPreSettled(res.Stage)
 	s.Allocator.CleanupHistory(token)
 	s.State.Remove(token)
+	s.State.Unlock()
+
+	s.Admission.PushWake()
+
 	if err := s.Persister.Flush(s.State); err != nil {
 		s.Logf("persister flush: %v", err)
 	}
-	s.Logf("release %s sid=%s reason=%s", token[:8], res.SandboxID, req.Reason)
+	s.Logf("release %s sid=%s reason=%s pre_settled=%v",
+		token[:8], res.SandboxID, req.Reason, wasPreSettled)
 	if s.Auditor != nil {
-		s.Auditor.Logf("release token=%s sid=%s reason=%s alloc_at_release=%d",
-			token[:8], res.SandboxID, req.Reason, res.AllocatableNowMem)
+		s.Auditor.Logf("release token=%s sid=%s reason=%s alloc_at_release=%d pre_settled=%v",
+			token[:8], res.SandboxID, req.Reason, res.AllocatableNowMem, wasPreSettled)
 	}
 }
 
@@ -602,16 +653,16 @@ func (i *IdleSweeper) sweep() {
 	i.State.Lock()
 	defer i.State.Unlock()
 
+	swept := false
 	for token, res := range i.State.Reservations {
 		// Creating-stage TTL.
-		if (res.Stage == StageAdmitted || res.Stage == StageCreating ||
-			res.Stage == StageStartup || res.Stage == StageRestoring) &&
+		if IsPreSettled(res.Stage) &&
 			now.Sub(res.StageEnteredAt) > i.StartupTTL {
 			i.Logf("sweep: token %s sid=%s exceeded startup TTL, releasing",
 				token[:8], res.SandboxID)
-			i.Admission.Released(res.Stage)
 			i.Allocator.CleanupHistory(token)
 			delete(i.State.Reservations, token)
+			swept = true
 			continue
 		}
 		// Heartbeat staleness — only when conn is gone (live conn keeps
@@ -620,10 +671,14 @@ func (i *IdleSweeper) sweep() {
 			now.Sub(res.LastHeartbeatAt) > 3*i.Heartbeat {
 			i.Logf("sweep: token %s sid=%s no heartbeat for %v, releasing",
 				token[:8], res.SandboxID, now.Sub(res.LastHeartbeatAt))
-			i.Admission.Released(res.Stage)
 			i.Allocator.CleanupHistory(token)
 			delete(i.State.Reservations, token)
+			swept = true
 		}
+	}
+	if swept {
+		// Headroom may have just opened up — wake admission worker.
+		i.Admission.PushWake()
 	}
 	if err := i.Persister.Flush(i.State); err != nil {
 		log.Printf("[node-ctl] sweep persist: %v", err)
