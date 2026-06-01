@@ -318,12 +318,15 @@ read_avail() { awk '/MemAvailable:/ {printf "%d", $2/1024}' /proc/meminfo; }
 # exactly one number per invocation; safe under set -e.
 count() { grep -E "$1" "$2" 2>/dev/null | wc -l; }
 snapshot_counters() {
+    # `admit token=` matches only the canonical success-admit event from
+    # buildAdmitOK (server.go); excludes admit_queued / admit_queue_*
+    # bookkeeping events that share the 'admit' substring.
     local admits reclaims grants settled rejects
-    admits=$(  count 'admit'        "$WORK/audit.log" )
-    reclaims=$(count '^[^ ]* reclaim' "$WORK/audit.log" )
-    grants=$(  count ' grant '      "$WORK/daemon.log")
-    settled=$( count ' settled '    "$WORK/daemon.log")
-    rejects=$( count 'rejected'     "$WORK/daemon.log")
+    admits=$(  count 'admit token='     "$WORK/audit.log" )
+    reclaims=$(count '^[^ ]* reclaim'   "$WORK/audit.log" )
+    grants=$(  count ' grant '          "$WORK/daemon.log")
+    settled=$( count ' settled '        "$WORK/daemon.log")
+    rejects=$( count 'rejected'         "$WORK/daemon.log")
     echo "$admits $reclaims $grants $settled $rejects"
 }
 snapshot_cgroup() {
