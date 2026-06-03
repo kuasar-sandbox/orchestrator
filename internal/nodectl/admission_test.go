@@ -253,9 +253,8 @@ func TestAdmission_QueueEnqueueAndCancel(t *testing.T) {
 	if a.QueueDepth() != 1 {
 		t.Errorf("queue depth=%d, want 1", a.QueueDepth())
 	}
-	// Cancel by closing client side; server-side will get a 0-byte Read
-	// in MonitorConnEOF... but we don't run the monitor in this test;
-	// invoke cancel directly.
+	// Production cancels via TTL or worker WriteMessage failure; here
+	// we invoke cancel() directly to drive the canceled-entry sweep.
 	entry.cancel()
 	select {
 	case <-entry.cancelCh:

@@ -240,13 +240,17 @@ func (s *Server) handleAdmit(conn net.Conn, req *Message, token *string) *Messag
 				Msg:    "admission queue at capacity",
 			}
 		}
-		s.Admission.MonitorConnEOF(entry)
 		if s.Auditor != nil {
 			s.Auditor.Logf("admit_queued sid=%s pos=%d block=%d",
 				req.SandboxID, entry.queuedPos, int(oc.Block))
 		}
 		// nil → serveConn loop skips this write; the admission worker
-		// will write Admitted/Rejected when the head is processed.
+		// will write Admitted/Rejected when the head is processed. The
+		// serveConn loop also resumes ReadMessage on this conn — so it
+		// is the sole reader; the queue must not race it with its own
+		// conn.Read (that bug caused 1-byte stream desync). Client EOF
+		// while queued is detected lazily via TTL expiry or worker
+		// WriteMessage failure.
 		return nil
 	}
 

@@ -68,8 +68,12 @@ type PendingAdmit struct {
 	queuedAt   time.Time
 	queuedPos  int         // queue depth at insertion (informational, for metadata)
 
-	// Closed by either the per-entry TTL timer or the conn-EOF reader
-	// goroutine. Worker checks on each sweep.
+	// Closed by the per-entry TTL timer. Worker checks on each sweep.
+	// Client-side disconnect is detected lazily: the worker's response
+	// WriteMessage fails with EPIPE, the conn is closed, and the just-
+	// inserted reservation (if any) is reaped by IdleSweeper StartupTTL.
+	// Proactive EOF read here is unsafe: it shares the conn with the
+	// post-admit serveConn read loop and would race for bytes.
 	cancelCh   chan struct{}
 	ttlTimer   *time.Timer
 	cancelOnce sync.Once // ensure cancelCh closed at most once
@@ -242,12 +246,23 @@ func (a *AdmissionController) processQueue() {
 			}
 			resp.QueuedForMs = int64(time.Since(head.queuedAt) / time.Millisecond)
 			resp.QueuePosAtIn = int64(head.queuedPos)
-			_ = WriteMessage(head.conn, resp)
-			// Conn left open: caller will continue to use it for RPC.
-			// No separate audit event here — the canonical `admit token=...`
-			// line was already emitted by buildAdmitOK (via processFn).
-			// The fact that this admit came from the queue is reflected in
-			// the response's QueuedForMs metadata that the client logs.
+			if err := WriteMessage(head.conn, resp); err != nil {
+				// Client gave up while queued; the reservation was just
+				// inserted by processFn. Close the conn so serveConn's
+				// reader path won't see it, and IdleSweeper's StartupTTL
+				// reaps the orphaned reservation.
+				_ = head.conn.Close()
+				if a.auditor != nil {
+					a.auditor.Logf("admit_queue_write_failed sid=%s err=%q",
+						head.req.SandboxID, err.Error())
+				}
+			}
+			// Conn left open on success: caller will continue to use it
+			// for RPC. No separate audit event here — the canonical
+			// `admit token=...` line was already emitted by buildAdmitOK
+			// (via processFn). The fact that this admit came from the
+			// queue is reflected in the response's QueuedForMs metadata
+			// that the client logs.
 			continue
 
 		case OutcomeLongTermReject:
@@ -537,18 +552,6 @@ func (a *AdmissionController) IsDrained() bool {
 	a.drainMu.Lock()
 	defer a.drainMu.Unlock()
 	return a.drained
-}
-
-// MonitorConnEOF starts a goroutine that watches conn for EOF and
-// cancels the pending entry when the client disconnects. Call after
-// Enqueue. Returns when conn closes (the goroutine is one-shot).
-func (a *AdmissionController) MonitorConnEOF(p *PendingAdmit) {
-	go func() {
-		buf := make([]byte, 1)
-		_, _ = p.conn.Read(buf) // expected: EOF or, rarely, a stray byte (protocol violation)
-		p.cancel()
-		a.pushWake()
-	}()
 }
 
 // QueueDepth returns the current queue length (for diagnostics).
