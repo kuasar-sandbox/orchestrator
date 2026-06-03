@@ -41,13 +41,21 @@
 #
 #   Workload
 #     MODE           cycles | pareto | idle (default cycles)
-#     WL_DURATION    workload run seconds (default 30)
+#     WL_DURATION    workload run seconds inside the guest (default 30)
 #     WL_RMIN_MIB    active phase rss min (default 64)
 #     WL_RMAX_MIB    active phase rss max (default 192)
 #     WL_CYCLES      (cycles) cycles per duration (default 4)
 #     WL_LAMBDA      (pareto) Poisson events/s (default 0.5)
 #     WL_ALPHA       (pareto) Pareto shape (default 1.5)
 #     WL_XMIN        (pareto) Pareto x_min seconds (default 1.0)
+#
+#   Test windows
+#     ADMIT_DEADLINE seconds an admit may sit in the queue before being
+#                    canceled; also the host-side observation window when
+#                    larger than WL_DURATION. Default = WL_DURATION (current
+#                    behavior). Raise for N>>startup_pool/burst so queued
+#                    admits get drained before TTL. Drives node-ctl
+#                    admission.queue_ttl in the emitted yaml.
 #
 #   Launch + workspace
 #     STAGGER_S      seconds between consecutive sandbox launches (default 0)
@@ -114,6 +122,11 @@ WL_RMAX_MIB="${WL_RMAX_MIB:-192}"
 WL_LAMBDA="${WL_LAMBDA:-0.5}"
 WL_ALPHA="${WL_ALPHA:-1.5}"
 WL_XMIN="${WL_XMIN:-1.0}"
+ADMIT_DEADLINE="${ADMIT_DEADLINE:-$WL_DURATION}"
+# Host-side observation runs for whichever is longer: workload duration or
+# the admit deadline. Default (ADMIT_DEADLINE unset) matches WL_DURATION
+# exactly so historical N=8 results stay comparable.
+OBSERVE_DURATION=$(( ADMIT_DEADLINE > WL_DURATION ? ADMIT_DEADLINE : WL_DURATION ))
 
 host_total_kib=$(awk '/MemTotal:/ {print $2}' /proc/meminfo)
 PHYS_MEM_DEFAULT="$((host_total_kib/1024))MiB"
@@ -156,12 +169,34 @@ declare -a SB_SIDS=()
 # chShutdownGrace expanding to ~11s wallclock. 60s = generous slack.
 stop_sandbox_ctl() {
     local pid="$1" sid="${2:-?}" waited=0 timeout=60
+    # Reap already-exited children first. A sandbox-ctl that exited
+    # naturally (e.g. its admit was queue-canceled and Run() returned
+    # an error long ago) is gone from /proc OR sits as a zombie in
+    # bash's job table. kill -0 is unreliable because zombies look
+    # "alive" — read /proc/$pid/stat directly.
+    if [ ! -d "/proc/$pid" ] || \
+       [ "$(awk '{print $3}' /proc/$pid/stat 2>/dev/null)" = "Z" ]; then
+        wait "$pid" 2>/dev/null
+        return 0
+    fi
     kill -TERM "$pid" 2>/dev/null || { wait "$pid" 2>/dev/null; return 0; }
     while [ "$waited" -lt "$timeout" ]; do
-        kill -0 "$pid" 2>/dev/null || { wait "$pid" 2>/dev/null; return 0; }
+        # Same as the entry check — kill -0 alone misses zombies.
+        if [ ! -d "/proc/$pid" ] || \
+           [ "$(awk '{print $3}' /proc/$pid/stat 2>/dev/null)" = "Z" ]; then
+            wait "$pid" 2>/dev/null
+            return 0
+        fi
         sleep 1
         waited=$((waited + 1))
     done
+    # 60s SIGTERM timeout — record the hang for the verdict.
+    # HANG_FILE is set by the main script before spawning stop_sandbox_ctl
+    # subshells. We can't rely on this subshell's exit code making it
+    # back via `wait`: bash auto-reaps background children in script mode
+    # (set +m), so the parent's later `wait $pid` returns 127 "no child"
+    # for any subshell that completed before the wait was called.
+    [ -n "${HANG_FILE:-}" ] && echo "$sid" >> "$HANG_FILE"
     echo "WARN: sandbox-ctl pid=$pid sid=$sid did not exit within ${timeout}s of SIGTERM" >&2
     echo "WARN: leaving it running per project policy (no script-level SIGKILL of sandbox-ctl)" >&2
     echo "WARN: this is a sandbox-ctl bug (likely scheduler starvation under host oversubscribe)" >&2
@@ -239,6 +274,10 @@ resources:
   control:
     cgroup_path: /sys/fs/cgroup/sandboxes/${sid}
     controller: $WORK/sandbox-resource.sock
+    sensor:
+      psi_some_stall_us: ${PSI_STALL_US:-10000}
+      psi_some_window_us: ${PSI_WINDOW_US:-1000000}
+      min_interval_ms: ${PSI_MIN_INT_MS:-100}
   startup:
     memory: ${BURST_MIB}MiB
 network:
@@ -296,7 +335,7 @@ admission:
   rate: $ADM_RATE
   burst: $ADM_BURST
   startup_ttl: 30s
-  queue_ttl: 30s
+  queue_ttl: ${ADMIT_DEADLINE}s
   queue_max_depth: 256
 dampening:
   recover_duration: $RECOVER_DUR
@@ -317,17 +356,38 @@ read_avail() { awk '/MemAvailable:/ {printf "%d", $2/1024}' /proc/meminfo; }
 # every subsequent counter by one position. wc -l always succeeds, emits
 # exactly one number per invocation; safe under set -e.
 count() { grep -E "$1" "$2" 2>/dev/null | wc -l; }
+
+# queue_depth derives "currently queued admits" from audit events: a sid
+# enters the queue on `admit_queued sid=X` and leaves it on either
+# `admit token=... sid=X` (granted) or `admit_queue_canceled sid=X`
+# (TTL / EOF). Awk maintains a per-sid set; END prints the residual.
+queue_depth() {
+    [ -f "$WORK/audit.log" ] || { echo 0; return; }
+    awk '
+/admit_queued/             { for(i=2;i<=NF;i++) if($i ~ /^sid=/) { q[substr($i,5)]=1; break } }
+/admit token=/             { for(i=2;i<=NF;i++) if($i ~ /^sid=/) { delete q[substr($i,5)];   break } }
+/admit_queue_canceled/     { for(i=2;i<=NF;i++) if($i ~ /^sid=/) { delete q[substr($i,5)];   break } }
+END                        { n=0; for(k in q) n++; print n }' "$WORK/audit.log"
+}
+
 snapshot_counters() {
     # `admit token=` matches only the canonical success-admit event from
     # buildAdmitOK (server.go); excludes admit_queued / admit_queue_*
     # bookkeeping events that share the 'admit' substring.
-    local admits reclaims grants settled rejects
-    admits=$(  count 'admit token='     "$WORK/audit.log" )
-    reclaims=$(count '^[^ ]* reclaim'   "$WORK/audit.log" )
-    grants=$(  count ' grant '          "$WORK/daemon.log")
-    settled=$( count ' settled '        "$WORK/daemon.log")
-    rejects=$( count 'rejected'         "$WORK/daemon.log")
-    echo "$admits $reclaims $grants $settled $rejects"
+    #
+    # `admit_queue_canceled` (audit.log) counts queued admits that were
+    # not admitted because of queue TTL expiry or client disconnect. It
+    # is distinct from `rejected` (controller-side refusal) — we sum
+    # them as "not admitted" in the verdict path.
+    local admits reclaims grants settled rejects canceled queued
+    admits=$(  count 'admit token='          "$WORK/audit.log" )
+    reclaims=$(count '^[^ ]* reclaim'        "$WORK/audit.log" )
+    grants=$(  count ' grant '               "$WORK/daemon.log")
+    settled=$( count ' settled '             "$WORK/daemon.log")
+    rejects=$( count 'rejected'              "$WORK/daemon.log")
+    canceled=$(count 'admit_queue_canceled ' "$WORK/audit.log" )
+    queued=$(queue_depth)
+    echo "$admits $reclaims $grants $settled $rejects $canceled $queued"
 }
 snapshot_cgroup() {
     local total_high=0 total_oom=0 h o sid f
@@ -357,6 +417,7 @@ say "   per-sandbox:  zone=${MEM_MIB} MiB  floor=${FLOOR_MIB} MiB  burst=${BURST
 say "   node pool:    ${PHYS_MEM} (host_reserved=${HOST_RES_MEM}, host_cpu=${PHYS_CPU}/${HOST_RES_CPU} reserved)"
 say "   watermarks:   high=${HIGH_FACTOR}  low=${LOW_FACTOR}  emergency=${EMERG_FACTOR}"
 say "   workload:     $WORKLOAD_DESC"
+say "   timing:       workload=${WL_DURATION}s  admit_deadline=${ADMIT_DEADLINE}s  observe=${OBSERVE_DURATION}s  (queue_ttl=${ADMIT_DEADLINE}s)"
 say ""
 
 # ---- spin up node-ctl daemon ----
@@ -408,8 +469,17 @@ say ""
 # are inlined into a variable-width "notes" column at row end. Pure ASCII
 # in header strings to keep printf %s byte-counts == visual columns.
 echo " PROGRESS (every ${TICK_S}s — host MemAvailable + node-ctl counters; deltas in notes)" >&2
-ROW_FMT="  %-5s   %5s   %5s    %-5s   %4s   %4s   %3s   %3s    %s\n"
-printf "$ROW_FMT" "time" "avail" "dMiB" "adm/N" "grnt" "rclm" "rej" "oom" "notes" >&2
+# Columns:
+#   adm/N  cumulative admits / target
+#   set    cumulative Settled events (admit→Settled transition)
+#   q      current queue depth (admits awaiting startup-pool / token slot)
+#   cnl    cumulative queue-canceled (TTL or client EOF)
+#   grnt   cumulative burst grants
+#   rclm   cumulative controller reclaims
+#   rej    cumulative rejects (long-term refusal)
+#   oom    cumulative cgroup OOM kills
+ROW_FMT="  %-5s   %5s   %5s    %-5s   %3s   %3s   %3s   %4s   %4s   %3s   %3s    %s\n"
+printf "$ROW_FMT" "time" "avail" "dMiB" "adm/N" "set" "q" "cnl" "grnt" "rclm" "rej" "oom" "notes" >&2
 
 prev_avail=$host_baseline_avail
 prev_counters=( $(snapshot_counters) )
@@ -420,28 +490,32 @@ min_avail=$host_baseline_avail        # tracks the worst (lowest) host avail
                                        # (page cache rebounds after workload drains)
 
 elapsed=0
-while [ "$elapsed" -lt "$WL_DURATION" ]; do
+while [ "$elapsed" -lt "$OBSERVE_DURATION" ]; do
     sleep "$TICK_S"
     elapsed=$((elapsed + TICK_S))
 
     avail=$(read_avail)
-    counters=( $(snapshot_counters) )   # admits reclaims grants settled rejects
+    counters=( $(snapshot_counters) )   # admits reclaims grants settled rejects canceled queued
     cg=( $(snapshot_cgroup) )           # high oom
 
     [ "$avail" -lt "$min_avail" ] && min_avail=$avail
 
     d_avail=$((avail - prev_avail))
-    d_admits=$(( counters[0] - prev_counters[0] ))
-    d_reclaims=$((counters[1] - prev_counters[1] ))
-    d_grants=$(( counters[2] - prev_counters[2] ))
-    d_rejects=$((counters[4] - prev_counters[4] ))
-    d_high=$((   cg[0]       - prev_cg[0] ))
-    d_oom=$((    cg[1]       - prev_cg[1] ))
+    d_admits=$((   counters[0] - prev_counters[0] ))
+    d_reclaims=$(( counters[1] - prev_counters[1] ))
+    d_grants=$((   counters[2] - prev_counters[2] ))
+    d_settled=$((  counters[3] - prev_counters[3] ))
+    d_rejects=$((  counters[4] - prev_counters[4] ))
+    d_canceled=$(( counters[5] - prev_counters[5] ))
+    d_high=$((     cg[0]       - prev_cg[0] ))
+    d_oom=$((      cg[1]       - prev_cg[1] ))
 
     # Assemble inline notes. Only deltas that fired this tick (and OOM/REJ
     # / high spikes) show up — quiet ticks have an empty notes column.
     notes=""
     [ "$d_admits"   -gt 0 ]    && notes="$notes +${d_admits}adm"
+    [ "$d_settled"  -gt 0 ]    && notes="$notes +${d_settled}set"
+    [ "$d_canceled" -gt 0 ]    && notes="$notes +${d_canceled}cnl"
     [ "$d_grants"   -gt 0 ]    && notes="$notes +${d_grants}grnt"
     [ "$d_reclaims" -gt 0 ]    && notes="$notes +${d_reclaims}rclm"
     [ "$d_rejects"  -gt 0 ]    && notes="$notes +${d_rejects}REJ"
@@ -452,7 +526,8 @@ while [ "$elapsed" -lt "$WL_DURATION" ]; do
     adm_s="${counters[0]}/${N}"
     printf "$ROW_FMT" \
         "t+${elapsed}s" "$avail" "$d_avail" \
-        "$adm_s" "${counters[2]}" "${counters[1]}" "${counters[4]}" "${cg[1]}" \
+        "$adm_s" "${counters[3]}" "${counters[6]}" "${counters[5]}" \
+        "${counters[2]}" "${counters[1]}" "${counters[4]}" "${cg[1]}" \
         "$notes" >&2
 
     prev_avail=$avail
@@ -470,11 +545,21 @@ done
 # (1 if stop_sandbox_ctl timed out; 127 if already reaped) and set -e
 # would otherwise abort the script before RESULT renders.
 stop_pids=()
+# stop_sandbox_ctl writes one line per hang to HANG_FILE (60s SIGTERM
+# timeout cases). We can't read the subshell's exit code via wait — in
+# script mode (set +m) bash auto-reaps completed background children,
+# so a later wait returns 127 "no such child" indistinguishably from
+# a real exit-1 hang.
+HANG_FILE=$(mktemp -t density-perf-hangs.XXXXXX)
+export HANG_FILE
 for i in "${!SB_PIDS[@]}"; do
     stop_sandbox_ctl "${SB_PIDS[$i]}" "${SB_SIDS[$i]}" &
     stop_pids+=($!)
 done
 for p in "${stop_pids[@]}"; do wait "$p" 2>/dev/null || true; done
+hangs=$(wc -l < "$HANG_FILE" 2>/dev/null || echo 0)
+rm -f "$HANG_FILE"
+unset HANG_FILE
 
 # ---- final aggregate (after the workload window closes) ----
 final_counters=( $(snapshot_counters) )
@@ -485,6 +570,8 @@ final_reclaims=${final_counters[1]}
 final_grants=${final_counters[2]}
 final_settled=${final_counters[3]}
 final_rejects=${final_counters[4]}
+final_canceled=${final_counters[5]}
+final_queued=${final_counters[6]}
 final_high=${final_cg[0]}
 final_oom=${final_cg[1]}
 final_avail=$(read_avail)
@@ -496,19 +583,29 @@ projected=$(awk -v a="$min_avail" -v p="$peak_per_sb" 'BEGIN{
     if (p > 0.5) printf "%d", a/p; else print "n/a (per-sandbox cost too small to project)"
 }')
 
-# Verdict.
+# Verdict. Order: OOM (FAIL) > hangs (DEGRADED) > rejections/cancellations
+# (DEGRADED) > admit gap (DEGRADED) > PASS. Hangs degrade because a
+# sandbox-ctl that ignores SIGTERM for 60s indicates a real bug, even
+# when admission itself worked.
 if [ "$final_oom" -gt 0 ]; then
     verdict="FAIL"
     verdict_reason="$final_oom cgroup OOM kill(s) — controller did not reclaim in time"
-elif [ "$final_rejects" -gt 0 ]; then
+elif [ "$hangs" -gt 0 ]; then
     verdict="DEGRADED"
-    verdict_reason="$final_rejects admission rejection(s) — controller refused some sandboxes (backpressure worked, target not met)"
+    verdict_reason="$hangs sandbox-ctl(s) did not exit within 60s of SIGTERM (see WARN above)"
+elif [ "$final_rejects" -gt 0 ] || [ "$final_canceled" -gt 0 ]; then
+    verdict="DEGRADED"
+    verdict_reason="$final_rejects rejection(s) + $final_canceled queue-cancellation(s); $final_admits of $N admitted"
 elif [ "$final_admits" -lt "$N" ]; then
     verdict="DEGRADED"
-    verdict_reason="only $final_admits of $N admitted (no rejections logged either — check daemon.log)"
+    if [ "$final_queued" -gt 0 ]; then
+        verdict_reason="only $final_admits of $N admitted; $final_queued still queued at observe end (raise ADMIT_DEADLINE, lower BURST_MIB, or pool/startup capacity exhausted by settled tenants)"
+    else
+        verdict_reason="only $final_admits of $N admitted (no rejections / cancellations / queue residue — check daemon.log + audit.log)"
+    fi
 else
     verdict="PASS"
-    verdict_reason="all $N admitted, 0 rejects, 0 OOMs"
+    verdict_reason="all $N admitted, 0 rejects, 0 cancels, 0 OOMs, 0 hangs"
 fi
 
 # ---- RESULT section ----
@@ -525,8 +622,10 @@ sayf "       (end of window: %d MiB drop; workload drained + page reclaim active
 sayf "     projected ceiling (peak basis):  ~%s sandboxes\n" "$projected"
 say ""
 say "   admission"
-sayf "     %d admitted / %d rejected\n" "$final_admits" "$final_rejects"
-sayf "     %d settled at shutdown / %d burst grants total\n" "$final_settled" "$final_grants"
+sayf "     %d admitted / %d rejected / %d queue-canceled / %d still queued\n" \
+    "$final_admits" "$final_rejects" "$final_canceled" "$final_queued"
+sayf "     %d settled at shutdown / %d burst grants total / %d sandbox-ctl hang(s)\n" \
+    "$final_settled" "$final_grants" "$hangs"
 say ""
 say "   pressure"
 sayf "     cgroup memory.high events: %s across %d sandboxes\n" "$final_high" "$N"
