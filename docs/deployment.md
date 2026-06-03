@@ -15,7 +15,7 @@ UDS)协作。本文档定义这些进程在生产部署中的归属、责任边�
 
 | 角色 | 集群规模 | 职责 | 关键进程 |
 |---|---|---|---|
-| Compute Node | 每 AZ 一集群,~5,000 节点 | 承载客户沙箱(microVM),每节点 ~3K microVM | `orchestrator-agent`、`node-ctl`、`cache-ctl tiered`、`store-ctl`(sidecar)、`sandbox-ctl × N` |
+| Compute Node | 每 AZ 一集群,~5,000 节点 | 承载客户沙箱(microVM),每节点 ~3K microVM | `orchestrator-ctl`、`node-ctl`、`cache-ctl tiered`、`store-ctl`(sidecar)、`sandbox-ctl × N` |
 | L2 Cache Cluster | 每 AZ 一集群,100-200 节点 | 分布式 EC 缓存(RS 4+1,Maglev 一致性哈希),吸收 L1 miss 把 L3 请求压到 < 0.1% | `cache-ctl shard` |
 
 **Region 级共享资源**(由各自的平台管理面运营,本方案不展开)
@@ -23,7 +23,7 @@ UDS)协作。本文档定义这些进程在生产部署中的归属、责任边�
 | 资源 | 用途 |
 |---|---|
 | OBS 桶 | L3 chunk 与 Manifest 持久化(`store-ctl` 后端) |
-| 平台管理面 | 沙箱实例调度、配置、租户管控 ↔ 与 compute 节点 `orchestrator-agent` 对话 |
+| 平台管理面 | 沙箱实例调度、配置、租户管控 ↔ 与 compute 节点 `platform-agent`(→ orchestrator-ctl) 对话 |
 | 镜像展平数据面节点(独立池) | 容器镜像拉取 + 确定性展平 + 写入 store(详见 §5) |
 | 镜像展平管理面 | 调度展平任务,向数据面下发凭据 |
 
@@ -33,11 +33,12 @@ UDS)协作。本文档定义这些进程在生产部署中的归属、责任边�
 
 | 进程 | 角色 | 数量 | 启停 | 本方案归属 |
 |---|---|---|---|---|
-| `orchestrator-agent` | 本机沙箱编排代理:与平台管理面对话,拉取沙箱实例配置 / 客户密钥,生成 per-sandbox `SANDBOX_CONFIG` + `MANIFEST_CONFIG`,fork-exec `sandbox-ctl run`,处理生命周期事件回传 | 单实例 | systemd | **本方案外**,接口契约见 §2.4 |
+| `orchestrator-ctl`(`serve`)| 本机沙箱编排 + e2b 兼容控制面:对外 e2b API,fork-exec `sandbox-ctl run`,经 vswitch 编排网络,反代 guest envd / floatingip,生命周期与 TTL | 单实例 | systemd | **本方案内**,`sandbox-orchestrator/docs/orchestrator.md` |
+| `platform-agent`| 打通平台管理面 ↔ orchestrator 的桥接(多节点);与 platform-service 协同实现平台功能 | 单实例 | systemd | **本方案外/未来** |
 | `node-ctl`(`daemon`)| 节点级资源仲裁:沙箱准入、内存预算分配、密度控制 | 单实例 | systemd | 本方案,`docs/node.md` |
-| `cache-ctl`(`mode: tiered`)| 节点本地数据入口:L1 RocksDB + EC 客户端(→ L2)+ L3 origin | 单实例 | systemd,先于 orchestrator-agent | 本方案,`docs/cache.md` |
+| `cache-ctl`(`mode: tiered`)| 节点本地数据入口:L1 RocksDB + EC 客户端(→ L2)+ L3 origin | 单实例 | systemd,先于 orchestrator-ctl | 本方案,`docs/cache.md` |
 | `store-ctl` | 本机 OBS 读写代理(sidecar);**所有**远端 OBS 流量走这里 | 单实例 | systemd | 本方案,`docs/store.md` |
-| `sandbox-ctl`(`run`) | 单个沙箱的控制平面(类 `runc run`);非 daemon | 每沙箱一个,~3K | 由 orchestrator-agent fork-exec | 本方案,`docs/sandbox.md` |
+| `sandbox-ctl`(`run`) | 单个沙箱的控制平面(类 `runc run`);非 daemon | 每沙箱一个,~3K | 由 orchestrator-ctl fork-exec | 本方案,`docs/sandbox.md` |
 | `cloud-hypervisor` | VMM(patched);`sandbox-ctl` 子进程 | 每沙箱一个 | `sandbox-ctl` 派生 | 本方案,`docs/cloud-hypervisor.md` |
 
 ### 2.2 端口与套接字
@@ -51,10 +52,14 @@ UDS)协作。本文档定义这些进程在生产部署中的归属、责任边�
 | `cache-ctl tiered` | `127.0.0.1:7070` | wire(自定义二进制 TCP)| 数据面:`sandbox-ctl` / `manifest-ctl` 拉 chunk |
 | `cache-ctl tiered` | `127.0.0.1:7071` | gRPC | health / `ping` / `info` |
 | `node-ctl daemon` | `/run/sandbox-resource.sock` | UDS,自定义协议 | 沙箱资源协议(`sandbox-ctl` 拨号目标)|
-| `sandbox-ctl` | `/run/sandbox/<sid>/*.sock` | UDS | sandbox 内部:`ch.sock` / `blk{0,1}.sock` / `uffd.sock` / `ctl.sock` / `vsock.sock`(+ `_5000`)|
+| `sandbox-ctl` | `/run/sandbox/<sid>/*.sock` | UDS | sandbox 内部:`ch.sock` / `blk{0,1}.sock` / `uffd.sock` / `ctl.sock` / `vsock.sock`(+ `_5000`);另写 `<sid>.pid`(config-socket 鉴别)、`<sid>.env`(`SANDBOX_ARGS`)|
+| `orchestrator-ctl` | `:443`(可配) | HTTPS/h2 | **对外** e2b 控制面 API + 沙箱数据面 proxy(`<port>-<sid>.<domain>`)|
+| `orchestrator-ctl` | `/run/orchestrator-ctl.socket` | UDS,framed JSON | config-socket:sandbox-ctl 启动时取 manifest_key/动态配置(SO_PEERCRED + `<sid>.pid` 鉴别)|
 
 `cache-ctl tiered` 的 EC 客户端通过节点对外网络拨号 L2 cluster 节点的 `7070`
-端口(详见 §3)。除此之外 compute 节点上没有任何**对外**的服务端口。
+端口(详见 §3)。**对外服务端口仅 `orchestrator-ctl` 一处**(e2b ingress);其余本机进程均 loopback/UDS。
+`sandbox-ctl` 由 `orchestrator-ctl` 经 systemd **模板单元 `sandbox-runner@<sid>.service`** 拉起
+(非自行 fork-exec;单元随发布包安装),完整设计见 `sandbox-orchestrator/docs/orchestrator.md` §5。
 
 运维侧:`/run/sandbox/<sid>/ctl.sock` 除了承载 snapshot,也是 `sandbox-ctl exec
 --sandbox-id <sid> -- CMD` 的入口——在不打断应用的前提下进入一个运行中的
@@ -112,7 +117,7 @@ RAM 工作集)。**overlay 写层**是沙箱独占、运行期被修改的可写
 
 ### 2.5 per-sandbox 配置下发
 
-每个沙箱有**独立的两份 yaml**,由 `orchestrator-agent` 在 fork-exec 之前生成
+每个沙箱有**独立的两份 yaml**,由 `orchestrator-ctl` 在 fork-exec 之前生成
 并通过 flag 传入:
 
 | 文件 | 内容 | 传入方式 | 文档 |
@@ -122,8 +127,10 @@ RAM 工作集)。**overlay 写层**是沙箱独占、运行期被修改的可写
 
 要点:
 
-- **per-sandbox MANIFEST_CONFIG**:每沙箱用各自租户的客户密钥;orchestrator-agent
-  从平台管理面取密钥,落地为 `/run/sandbox/<sid>/manifest.yaml`,生命周期跟沙箱走
+- **per-sandbox 密钥**:每沙箱用各自租户的客户密钥;orchestrator-ctl 经**共享**
+  `MANIFEST_CONFIG`(`manifest.key` 留空)+ per-沙箱 `MANIFEST_KEY` env 注入(e2b 路径下
+  `MANIFEST_KEY=SHA256(api_key)`),或由 platform-agent 从平台管理面取密钥落地
+  `/run/sandbox/<sid>/manifest.yaml`,生命周期跟沙箱走
 - **共享格式**:`manifest-ctl` 与 `sandbox-ctl` 用**同一**配置格式;两者都
   **只**连本机 store-ctl(`127.0.0.1:7100`)+ 本机 cache-ctl(`127.0.0.1:7070`),
   yaml 里的 endpoint 写 loopback
@@ -190,7 +197,7 @@ yaml 显式 access_key/secret_key  →  ~/.obsconfig  →  AWS SDK 默认凭证�
 
 均为 region 级、独立运营,本方案外。与本方案的接口:
 
-- 平台管理面 ↔ 各 compute 节点 `orchestrator-agent`:沙箱实例配置 / 客户密钥 /
+- 平台管理面 ↔ 各 compute 节点 `platform-agent`(→ orchestrator-ctl):沙箱实例配置 / 客户密钥 /
   生命周期事件
 - 镜像展平管理面 ↔ 镜像展平数据面节点(§5):租户镜像拉取凭据、客户加密
   凭据下发
@@ -204,7 +211,7 @@ yaml 显式 access_key/secret_key  →  ~/.obsconfig  →  AWS SDK 默认凭证�
 
 | 进程 | 类型 | 用途 |
 |---|---|---|
-| `flatten-ctl` | CLI(一次性)| OCI / docker bundle → 确定性 EROFS,逐字节可重现 |
+| `flatten-ctl` | CLI(一次性)| registry 镜像 / docker bundle → 确定性 EROFS,逐字节可重现;直接拉取镜像(本地 OCI-layout 缓存)、可经 Referrers 幂等跳过(详见 [`docs/flatten.md`](flatten.md) §2.4) |
 | `manifest-ctl` | CLI(一次性)| `store`:分块 + 加密 + 写远端 + 上传 manifest |
 | `store-ctl` | daemon(sidecar)| 把 manifest-ctl 的 gRPC `Put` 写到 region OBS |
 
@@ -232,7 +239,7 @@ yaml 显式 access_key/secret_key  →  ~/.obsconfig  →  AWS SDK 默认凭证�
 - **cache-ctl**:无读路径,装了空跑
 - **node-ctl**:不跑沙箱,不需要资源仲裁
 - **sandbox-ctl** / **cloud-hypervisor**:不跑沙箱
-- **orchestrator-agent**:这里由镜像展平管理面直接驱动
+- **orchestrator-ctl**:这里由镜像展平管理面直接驱动
 
 数据面节点上常驻只有 `store-ctl`;`flatten-ctl` + `manifest-ctl` 是按任务拉
 起的 CLI。
@@ -252,7 +259,7 @@ yaml 显式 access_key/secret_key  →  ~/.obsconfig  →  AWS SDK 默认凭证�
    │   (Platform Mgmt Plane, region)                                                                  │
    │           │  attach + per-sandbox SANDBOX_CONFIG / MANIFEST_CONFIG                               │
    │           ▼                                                                                      │
-   │   orchestrator-agent  ── fork-exec ──►  sandbox-ctl × ~3K  ── spawns ──►  cloud-hypervisor       │
+   │   orchestrator-ctl    ── fork-exec ──►  sandbox-ctl × ~3K  ── spawns ──►  cloud-hypervisor       │
    │                                                │                                  │              │
    │                                                │                                  ▼              │
    │                                                │                              guest VM           │
@@ -329,7 +336,7 @@ yaml 显式 access_key/secret_key  →  ~/.obsconfig  →  AWS SDK 默认凭证�
 4. `store-ctl`(sidecar)→ active generation 已 init,gRPC 健康
 5. `cache-ctl tiered` → 与 L2 peer 拨号、与本机 `store-ctl` origin 拨号成功
 6. `node-ctl daemon` → state 恢复或冷启
-7. `orchestrator-agent` → 与平台管理面 attach 后开始接受新沙箱
+7. `orchestrator-ctl` → e2b SDK 直连或 platform-agent attach 后开始接受新沙箱
 
 注:`cache-ctl tiered` 启动**不需要**等 L2 全员在线——tier chain 把瞬时
 故障层视作 miss 下穿(详见 `docs/cache.md` §错误模型)。**写**路径
@@ -341,8 +348,8 @@ yaml 显式 access_key/secret_key  →  ~/.obsconfig  →  AWS SDK 默认凭证�
 
 ### 7.2 关闭顺序(自顶向下)
 
-1. 平台管理面停止向该节点 `orchestrator-agent` 调度新沙箱
-2. `orchestrator-agent` 等待存量沙箱自然退出 / 主动 snapshot
+1. 平台管理面/客户端停止向该节点 `orchestrator-ctl` 调度新沙箱
+2. `orchestrator-ctl` 等待存量沙箱自然退出 / 主动 snapshot
 3. `node-ctl` → SIGTERM,persist 状态后退出
 4. `cache-ctl tiered` → SIGTERM,等 in-flight 请求结束,RocksDB flush
 5. `store-ctl` → 同上
@@ -359,7 +366,7 @@ tiered` 自己处理 L2 不可达。
 | 单 `cache-ctl shard` 节点崩溃 | RS 4+1 容 1 节点故障;L2 仍服务 | systemd 重启;tiered 端 Maglev 表在该 peer 不可达期间把请求路由到其余 4 + 1 parity |
 | 同 RS 组中 ≥ 2 `cache-ctl shard` 同时崩溃 | 部分 `(chunk, idx)` 落到 ≥ 2 故障 peer 上,该 chunk L2 miss | 读路径 fallthrough origin(慢但正确);避免方式:成员变更**一次只动 1 peer** |
 | `node-ctl` 崩溃 | 长连断,沙箱保持上次 grant 继续跑;新沙箱 admit 失败 | systemd 重启;`state.json` 在 tmpfs,扫 cgroup 重建 |
-| `orchestrator-agent` 崩溃 | 与平台管理面失联,新沙箱无法拉起;存量沙箱不受影响 | systemd 重启,重新 attach |
+| `orchestrator-ctl` 崩溃 | 北向 API 中断,新沙箱无法拉起;存量沙箱不受影响 | systemd 重启,扫 run_root/base_root 多信号对账重建状态 |
 | OBS 区域不可达 | 整 region L3 不可达 | 已 L1/L2 命中的沙箱继续跑;依赖新 L3 的写路径 / cold-image fault / 展平上传失败 |
 | compute node 整机故障 | 该节点全部沙箱失效 | 平台管理面调度走 |
 | L2 cluster > parity 同时故障 | L2 整体不可用 | tiered fallthrough origin(slow path 持续);恢复后自然恢复 |
@@ -371,7 +378,7 @@ tiered` 自己处理 L2 不可达。
 ```
 单机:  store-ctl       (fs backend, /var/store)
        cache-ctl       (mode: local,无 L2)
-       sandbox-ctl × N (orchestrator-agent 可省,手工 run)
+       sandbox-ctl × N (orchestrator-ctl 可省,手工 run)
 ```
 
 无 L2 cluster、无 OBS、无 node-ctl;`manifest-ctl` 走本机 `store-ctl` + `cache-ctl`。
@@ -387,7 +394,7 @@ Region 级:         OBS 桶 + 平台 / 展平管理面
 ```
 
 每 compute 节点跑:`store-ctl` + `cache-ctl tiered` + `node-ctl` +
-`orchestrator-agent` + `sandbox-ctl × ~3K`。
+`orchestrator-ctl` + `sandbox-ctl × ~3K`。
 
 ### 9.3 多 AZ
 
@@ -405,9 +412,9 @@ Region 级:         OBS 桶 + 平台 / 展平管理面
 | `cache-ctl tiered` | `--config <path>` | `listen: 127.0.0.1:7070`(节点本机);`tiers[].cluster.peers` 写本 AZ L2 全集群 | [`docs/cache.md`](cache.md) §3.4 |
 | `cache-ctl shard` | `--config <path>` | `listen: 0.0.0.0:7070`(对外服务)| [`docs/cache.md`](cache.md) §3.3 |
 | `node-ctl daemon` | `/etc/node-ctl/node-ctl.yaml` | `listen: /run/sandbox-resource.sock` | [`docs/node.md`](node.md) §3 |
-| `sandbox-ctl run` | `--config <path>`(`SANDBOX_CONFIG`)+ `--manifest-config <path>`(`MANIFEST_CONFIG`)| **per-sandbox**,由 `orchestrator-agent` 生成,落在 `/run/sandbox/<sid>/` | [`docs/sandbox.md`](sandbox.md) §3 |
+| `sandbox-ctl run` | `--config <path>`(`SANDBOX_CONFIG`)+ `--manifest-config <path>`(`MANIFEST_CONFIG`)| **per-sandbox**,由 `orchestrator-ctl` 生成,落在 `/run/sandbox/<sid>/` | [`docs/sandbox.md`](sandbox.md) §3 |
 | `manifest-ctl` | `--manifest-config <path>`(`MANIFEST_CONFIG`)| 与 `sandbox-ctl` 共享格式;只连本机 store-ctl + cache-ctl | [`docs/manifest.md`](manifest.md) §3 |
-| `flatten-ctl` | 仅 CLI flag(无 yaml)| 仅在镜像展平数据面节点使用 | [`docs/flatten.md`](flatten.md) §2 |
+| `flatten-ctl` | CLI flag + `--manifest-config`(`MANIFEST_CONFIG`,`--upload` 时)+ `--remote-config`(`REMOTE_CONFIG`,registry 源时);凭据走 `FLATTEN_REGISTRY_*` env | 仅在镜像展平数据面节点使用 | [`docs/flatten.md`](flatten.md) §2 |
 
 构建产物路径、跨架构、release 打包见 [`docs/build.md`](build.md);性能基线、
 回归 checklist 见 [`docs/perf.md`](perf.md)。
