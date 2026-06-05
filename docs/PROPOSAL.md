@@ -1,4 +1,4 @@
-# Container Accelerator 方案建议书 v1.3
+# Container Accelerator 方案建议书 v1.4
 
 ## §1 概述
 
@@ -1151,6 +1151,7 @@ L2-快照集群 20-30 节点 × 5 GiB/s = 100-150 GiB/s，22 GiB/s 利用率 ~15
 | §6.11 Guest 运行时 | Guest 控制（sandbox-init）+ Guest 内核（vmlinux） |
 | §6.11 内存统一持有、§6.12 密度与资源控制（每沙箱环） | 沙箱控制（sandbox-ctl） |
 | §6.12 密度与资源控制（节点环） | 节点资源控制器（node-ctl） |
+| §5.1 系统定位（节点北向入口，e2b 兼容 ingress） | 沙箱编排（orchestrator-ctl，§10.13） |
 
 ### §10.1 部署形态
 
@@ -1315,14 +1316,14 @@ L2-快照集群 20-30 节点 × 5 GiB/s = 100-150 GiB/s，22 GiB/s 利用率 ~15
 
 ### §10.13 沙箱编排（sandbox-orchestrator，本方案内）
 
-**定位**：计算节点上的单实例编排 daemon，对外提供一套 **e2b 兼容 API**，把节点沙箱以 e2b 协议暴露给客户端（未改造的 e2b SDK 可直连本机）。一身兼 e2b 的 api + orchestrator + proxy 三角色：控制面 REST 管沙箱生命周期、驱动沙箱控制（§10.2）拉起/快照/销毁、调 vswitch 编排网络、把数据面流量反代到 guest（envd 数据面经 vsock，用户服务经 floatingip）。产物二进制 `orchestrator-ctl`，`serve` 启动服务。完整设计见 `sandbox-orchestrator/docs/orchestrator.md`。
+**定位**：计算节点上的单实例编排 daemon，对外提供一套 **e2b 兼容 API**，把节点沙箱以 e2b 协议暴露给客户端（未改造的 e2b SDK 可直连本机）。一身兼 e2b 的 api + orchestrator + proxy 三角色：控制面 REST 管沙箱生命周期、驱动沙箱控制（§10.2）拉起/快照/销毁、调 vswitch 编排网络、把数据面流量反代到 guest（envd 数据面经 vsock，用户服务经 floatingip）。另经 **e2b 模板构建路径**（`flatten-ctl` 经 run-task）把客户镜像/快照入库为模板，e2b profile 复用注入 envd 的 `sandbox-runtime-e2b.erofs` 运行时制品。产物两个二进制：`orchestrator-ctl`（`serve` 启动服务）+ `e2b-key-ctl`（从 manifest_key 派生 api_key / 指纹）。完整设计见 `sandbox-orchestrator/docs/orchestrator.md`。
 
 **两类沙箱（profile）**：**e2b**（guest 内跑原版 envd，支持 fs/process/pty/runCode 数据面）与 **bare**（无 envd，仅经 floatingip 网络提供服务——即基础沙箱接上北向 API）。
 
 **功能要点**：
 
 - e2b 兼容控制面（create/connect/timeout/pause/kill/list/metrics），鉴权 `X-API-KEY`
-- 准入**不感知**：fork-exec `sandbox-ctl run` 即可，准入/配额在沙箱控制内部（§10.2/§10.3）
+- 准入**不感知**：经 run-task（systemd 模板单元 `sandbox-runner@<sid>`）启动 `sandbox-ctl run` 即可，准入/配额在沙箱控制内部（§10.2/§10.3）
 - per-沙箱生成 `SANDBOX_CONFIG`；共享 `MANIFEST_CONFIG`，客户密钥由 API key 派生经 `MANIFEST_KEY` 注入
 - 经 vswitch `attach/detach` 编排网络，floatingip 记入状态
 - guest 内原版 envd 经沙箱控制 `--connect`（vsock）反代；启动后调 envd `/init` 装载
@@ -1343,6 +1344,7 @@ L2-快照集群 20-30 节点 × 5 GiB/s = 100-150 GiB/s，22 GiB/s 利用率 ~15
 缓存代理（L1 本地 → L2 集群 → 查找链与回填）
 VMM 定制 → Guest 内核 → Guest 控制 → 沙箱控制（块设备 + 快照 + 内存持有 + 气球）
 节点资源控制器（准入 / 额度 / 回收 / 持久化）
+沙箱编排（e2b 兼容控制面 + envd-in-guest 反代 + 模板构建；经 run-task 驱动沙箱控制 / 容器镜像展平）
 ```
 
 关键路径：存储代理 → 公共库与清单服务客户端 → 缓存代理 → 沙箱控制（块设备/快照代理）。
@@ -1357,3 +1359,4 @@ VMM 定制 → Guest 内核 → Guest 控制 → 沙箱控制（块设备 + 快�
 | v1.1 | 2026-03-31 | chenxiaohui | 补充缓存填充路径、块设备快照能力、展平格式选型 |
 | v1.2 | 2026-04-03 | chenxiaohui | 补充 VMM 选型、高密度沙箱、密度控制器、Guest 环境设计 |
 | v1.3 | 2026-05-20 | chenxiaohui | 对齐系统架构与工程模块划分；性能改为端到端口径；§5/§10 按进程模块重构，逻辑组件与工程模块分离表述 |
+| v1.4 | 2026-06-04 | chenxiaohui | 新增节点沙箱编排（sandbox-orchestrator / orchestrator-ctl + e2b-key-ctl）：§5 系统定位/总体架构补 e2b 兼容 ingress；§10.13 沙箱编排（含 e2b 模板构建路径 + sandbox-runtime-e2b.erofs）；§10 逻辑→工程映射表与 §10.14 交付节奏补沙箱编排 |

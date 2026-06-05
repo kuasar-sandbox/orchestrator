@@ -9,15 +9,18 @@
 ```
 <release>/
 ├── bin/                       平台全部二进制（cloud-hypervisor / vmlinux /
-│                              mkfs.erofs / manifest-ctl / store-ctl / cache-ctl /
-│                              flatten-ctl / sandbox-ctl / sandbox-init /
-│                              sandbox-runtime.erofs / node-ctl / vswitch-ctl /
-│                              tapfd-get / *.erofs）
+│                              mkfs.erofs / fsck.erofs / envd / manifest-ctl /
+│                              store-ctl / cache-ctl / flatten-ctl / sandbox-ctl /
+│                              sandbox-init / node-ctl / vswitch-ctl / tapfd-get /
+│                              orchestrator-ctl / e2b-key-ctl /
+│                              sandbox-runtime.erofs / sandbox-runtime-e2b.erofs）
 ├── README.md                  项目入口
 ├── docs/                      系统设计 + 模块设计 + 部署 + 性能基线
+├── deploy/                    运维配置样例 + systemd 单元（orchestrator-ctl
+│                              config.example.yaml / orchestrator-ctl.service）
 └── test/
     ├── QUICKSTART.md          本文件
-    ├── e2e/                   18 个跨仓 e2e 脚本（一键跑，零环境变量）
+    ├── e2e/                   20 个跨仓 e2e 脚本（一键跑，零环境变量）
     └── perf/                  7 个性能/分析脚本
 ```
 
@@ -51,7 +54,7 @@ bash test/e2e/e2e_sandbox_cold.sh      # 冷启 python:3.12-slim 并验证退出
 for f in test/e2e/*.sh; do bash "$f" || break; done
 ```
 
-## 4. e2e 脚本清单（18 个）
+## 4. e2e 脚本清单（20 个）
 
 ### 沙箱生命周期
 
@@ -90,6 +93,13 @@ for f in test/e2e/*.sh; do bash "$f" || break; done
 | 脚本 | 验证内容 |
 |---|---|
 | `e2e_density.sh` | agent 间歇式三模式密度 e2e |
+
+### 沙箱编排 / e2b
+
+| 脚本 | 验证内容 |
+|---|---|
+| `e2e_orchestrator.sh` | orchestrator-ctl 单元自动安装 + e2b 控制面（`/health`、`X-API-KEY` 401）+ 构建 API |
+| `e2e_runtask.sh` | run-task 通用启动器 + `config`/`info` CLI（纯用户态，无 root/systemd/KVM）|
 
 ## 5. perf / 分析脚本清单（7 个）
 

@@ -7,12 +7,16 @@
 聚合成"下载即用"的大版本发布包。各能力拆分为独立演进的子仓，边界处只暴露薄的、命名
 具体的导入面（如 `pkg/manifest`、`pkg/tapfd`、`pkg/image`、`pkg/resource`）。
 
+核心能力：亚秒级冷启动与快照恢复、跨镜像/快照去重的存储加速、单节点数千沙箱的资源管控，
+并以单机 **e2b 兼容**的沙箱编排/ingress（未改造的 e2b SDK 可直连本机）对外提供北向入口。
+
 ## 子项目
 
 | 仓 | 角色 | 导出面 / 产物 |
 |---|---|---|
 | **kuasar-sandbox**（本仓） | 系统文档 + 发布聚合 + 跨仓 e2e/perf | `scripts/release.sh`、`docs/`、`test/` |
 | **sandbox-runtime** | microVM 生命周期引擎（host `sandbox-ctl` + guest `sandbox-init`）+ vhost 块后端 | `pkg/resource`（资源控制协议+Client） |
+| **sandbox-orchestrator** | 单机 e2b 兼容沙箱编排/ingress（控制面 + envd-in-guest 反代 + 模板构建） | `orchestrator-ctl` + `e2b-key-ctl`、`docs/orchestrator.md` |
 | **sandbox-accelerator** | 存储加速：内容寻址存储 + 分层缓存 + 收敛加密 | `pkg/manifest`、`pkg/{cache,store}/client` |
 | **sandbox-builder** | 镜像构建：OCI → EROFS 确定性展平 | `pkg/image`（读取展平镜像）+ `flatten-ctl` |
 | **sandbox-vswitch** | eBPF/TC 虚拟交换机 + tapfd 交接 | `pkg/tapfd`（fd 交接规约）+ `vswitch-ctl`/`tapfd-get` |
@@ -31,12 +35,16 @@
         ▲                    │              │
         │ pkg/image          │ pkg/tapfd    │ pkg/manifest
  sandbox-runtime ────────────┴──────────────┘              (T2)
-        ▲
-        │ pkg/resource
- sandbox-sentinel                                          (T3)
+        ▲                    ▲
+        │ pkg/resource       │ CLI/run-task: sandbox-ctl + vswitch-ctl + flatten-ctl
+ sandbox-sentinel    sandbox-orchestrator                  (T3)
 ```
 
-各导出面均为 **纯 Go、无 CGO**：`sandbox-runtime` 不会因依赖 accelerator/vswitch 而引入
+实线箭头是 **Go 导入边**；`sandbox-orchestrator` 不 import 任何兄弟仓（`CGO_ENABLED=0` 叶子），
+而是在计算节点上经 **run-task / CLI** 驱动 `sandbox-ctl`（拉起/快照沙箱）、`vswitch-ctl`（编排网络）、
+`flatten-ctl`（模板构建），并消费 `sandbox-runtime-e2b.erofs` 等运行期制品。
+
+各 Go 导出面均为 **纯 Go、无 CGO**：`sandbox-runtime` 不会因依赖 accelerator/vswitch 而引入
 rocksdb / eBPF（Go module-graph pruning + 后端隔离在各仓 `server`/`rocks`/`internal` 内）。
 唯一的 CGO 二进制是 accelerator 的 `cache-ctl`（静态链 librocksdb）。
 
@@ -57,18 +65,27 @@ go work sync          # 一次性，按内网 GOPROXY 对齐 go.sum
 go build ./...        # 任意子目录
 ```
 
+**完整构建入口（本仓 Makefile）**：`make build` 顺序编排各子仓构建（含 `sandbox-orchestrator`），
+按 `scripts/artifacts.list` 收集全部制品到 `bin/$(TARGET_ARCH)/`，并由 `sandbox-orchestrator` 的
+`sandbox-runtime-e2b` 目标把 envd 注入基础 runtime 装配出 `sandbox-runtime-e2b.erofs`：
+
+```bash
+make -C kuasar-sandbox build      # 全部子仓 + 装配 bin/（含 sandbox-runtime-e2b.erofs）
+make -C kuasar-sandbox release    # build 之后打包发布
+```
+
 **发布包（下载即用）**：
 
 ```bash
-kuasar-sandbox/scripts/release.sh v0.1.0               # 聚合 Go 二进制（已有原生件一并收集）
-kuasar-sandbox/scripts/release.sh v0.1.0 --with-natives # 连带构建 vmlinux/cloud-hypervisor/cache-ctl
+kuasar-sandbox/scripts/release.sh v0.1.0               # 聚合 bin/ + 精选 docs/ + 跨仓 e2e/perf + deploy/
 # → kuasar-sandbox/dist/kuasar-sandbox-v0.1.0-linux-<arch>.tar.gz
 ```
 
 ## 文档
 
 系统级文档在本仓 `docs/`（`PROPOSAL.md` 系统设计、`deployment.md` 部署拓扑、`perf.md` 性能基线）；
-模块文档随各自仓（如 `sandbox-runtime/docs/sandbox.md`、`sandbox-accelerator/docs/manifest.md`）。
+模块文档随各自仓（如 `sandbox-runtime/docs/sandbox.md`、`sandbox-accelerator/docs/manifest.md`、
+`sandbox-orchestrator/docs/orchestrator.md`）。
 
 ## 跨仓测试
 

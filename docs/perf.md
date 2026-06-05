@@ -3,18 +3,23 @@
 记录系统各路径(cache、sandbox、密度控制)的实测指标、可复现 harness、调优
 杠杆与已采纳/已验证的优化决策。
 
-测试环境基线:WSL2 嵌套 KVM,Linux 5.15.146.1,WSL2 嵌套 KVM 的 page-fault
-路径有 ~2× 抖动,native Linux 数字应明显更稳定且更优。
+测试环境基线:嵌套 KVM 开发环境(nested-KVM/WSL2 类)。此类环境的 page-fault
+路径有 ~2× 抖动,裸金属 native Linux + NVMe 数字应明显更稳定且更优。下列数字按
+技术事实记录,绝对量级以裸金属复测为准。
 
 测量入口:
 
+本仓(umbrella)聚合目标:
+
 ```bash
-make bench           # Go 微基准
-make perf            # 系统级 harness 全套(cache + sandbox + density)
-make perf-cache
+make bench           # Go 微基准(各 Go 子仓)
+make perf            # 系统级 harness 全套:accelerator perf-cache + perf-sandbox/-manifest/-density
 make perf-sandbox
 make perf-density
 ```
+
+`perf-cache` 由 `make perf` 内部委派给 `sandbox-accelerator`(本仓无同名目标);
+单独跑用 `make -C sandbox-accelerator perf-cache`。
 
 ## 1. cache 子系统
 
@@ -146,7 +151,7 @@ cache-ctl 实例累积)+ snapshot upload 两个 dedup 状态。
 | restore manifest:// **cold L1** | **472 ms** | 84 | 106 | 6.81% |
 | restore manifest:// **hot L1** | 158 / **904** / 1214 ms | 85 | 105 | 6.82% |
 
-restore hot-L1 的中位数偏高的原因:python TICK counter stdout flush + WSL2
+restore hot-L1 的中位数偏高的原因:python TICK counter stdout flush + 嵌套 KVM
 vCPU resume 抖动 + RocksDB compaction;min=158ms 反映真正的"chunk 全命中"
 路径(< file:// restore baseline 750ms)。
 
@@ -578,12 +583,12 @@ cache-ctl 预算(典型 1–2 GiB),否则 cache 增长会挤掉沙箱内存。
    重尾分布能暴露 `recover_duration` 与 `safety_margin` 的不当——表现为 grant
    抖动放大、cgroup high 累积
 
-### 3.7 已知噪声源(WSL2)
+### 3.7 已知噪声源(嵌套 KVM 开发环境)
 
 - vCPU resume / cold-start 有 ±300 ms 抖动 → settled latency 中位数稳定但 P99
   偏长,要 N≥10 取中位数才稳
-- WSL2 host 的 `MemAvailable` 受 Windows 主机 working-set 影响,采样应在专用
-  WSL distro 内进行
+- 嵌套虚拟化下宿主 `MemAvailable` 受外层宿主 working-set 影响,采样应在隔离的
+  专用环境内进行
 - shared memfd 的 `Δ used` 在 `free -m` 中表现保守(只算 private),真实占用
   要看 `MemAvailable` 下降量
 - guest 内核 dmesg(`console=hvc0`)与应用 stdout 是两条独立的道:dmesg 经 CH
@@ -597,8 +602,8 @@ cache-ctl 预算(典型 1–2 GiB),否则 cache 增长会挤掉沙箱内存。
 - **多 vCPU 高并发 fault 测试**:当前数据是 1 vCPU,fault 几乎无并发竞态;
   4-8 vCPU 下需要测 batch 行为 + EVENT_REMOVE 在 host-driven balloon inflate
   场景下的突发速率(每 5 s tick + MaxStep 256 MiB)
-- **生产 NVMe + 真 KVM 实测**:本数据来自 WSL2 嵌套 KVM,有 ~2× 抖动;
-  native Linux + NVMe 跑一遍可确认绝对数量级,尤其 hot-L1 restore 中位数稳定后
+- **生产 NVMe + 裸金属 KVM 实测**:本数据来自嵌套 KVM 开发环境,有 ~2× 抖动;
+  裸金属 native Linux + NVMe 跑一遍可确认绝对数量级,尤其 hot-L1 restore 中位数稳定后
   会接近 file:// 基线
 - **跨节点 manifest:// dedup 实测**:本数据是单节点。跨多节点 cache-ctl 集群
   + EC L2 + 共享 OBS,跨 sandbox 的 image-段 dedup 应 >70%
@@ -610,7 +615,7 @@ cache-ctl 预算(典型 1–2 GiB),否则 cache 增长会挤掉沙箱内存。
 ```bash
 go vet ./...
 make test
-bash test/e2e/e2e_cache.sh                # 13/13 PASS
+bash test/e2e/e2e_cache.sh                # cache-ctl + manifest-ctl 集成(脚本在 sandbox-accelerator)
 BENCH_SCENARIO=tiered-shard-l2 CLIENT_CORES=0-1 SERVER_CORES=2-7 \
     CONCS='1 2 4' PREFILL=500 DURATION=30s bash test/scripts/bench_cache.sh
 ```
@@ -632,7 +637,7 @@ make perf-sandbox
 改 `pkg/nodectl/*` 或 `pkg/sandbox/*` 中的资源控制路径时:
 
 ```bash
-make test-e2e-node-ctl
+make -C sandbox-sentinel test-e2e-node-ctl   # node-ctl 资源协议 e2e,sentinel 仓专有(未入 umbrella)
 make test-e2e-density
 make perf-density
 ```

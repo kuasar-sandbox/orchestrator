@@ -34,7 +34,7 @@ UDS)协作。本文档定义这些进程在生产部署中的归属、责任边�
 | 进程 | 角色 | 数量 | 启停 | 本方案归属 |
 |---|---|---|---|---|
 | `orchestrator-ctl`(`serve`)| 本机沙箱编排 + e2b 兼容控制面:对外 e2b API,经 `run-task`(systemd 单元)启动 `sandbox-ctl run`,经 vswitch 编排网络,反代 guest envd / floatingip,生命周期与 TTL | 单实例 | systemd | **本方案内**,`sandbox-orchestrator/docs/orchestrator.md` |
-| `platform-agent`| 打通平台管理面 ↔ orchestrator 的桥接(多节点);与 platform-service 协同实现平台功能 | 单实例 | systemd | **本方案外/未来** |
+| `platform-agent`| 打通平台管理面(区域级 platform-service) ↔ 本机 orchestrator-ctl 的桥接(多节点) | 单实例 | systemd | **本方案外/未来** |
 | `node-ctl`(`daemon`)| 节点级资源仲裁:沙箱准入、内存预算分配、密度控制 | 单实例 | systemd | 本方案,`docs/node.md` |
 | `cache-ctl`(`mode: tiered`)| 节点本地数据入口:L1 RocksDB + EC 客户端(→ L2)+ L3 origin | 单实例 | systemd,先于 orchestrator-ctl | 本方案,`docs/cache.md` |
 | `store-ctl` | 本机 OBS 读写代理(sidecar);**所有**远端 OBS 流量走这里 | 单实例 | systemd | 本方案,`docs/store.md` |
@@ -59,7 +59,10 @@ UDS)协作。本文档定义这些进程在生产部署中的归属、责任边�
 `cache-ctl tiered` 的 EC 客户端通过节点对外网络拨号 L2 cluster 节点的 `7070`
 端口(详见 §3)。**对外服务端口仅 `orchestrator-ctl` 一处**(e2b ingress);其余本机进程均 loopback/UDS。
 `sandbox-ctl` 由 `orchestrator-ctl` 经 systemd **模板单元 `sandbox-runner@<sid>.service`** 拉起
-(非自行 fork-exec;单元随发布包安装),完整设计见 `sandbox-orchestrator/docs/orchestrator.md` §5。
+(`StartUnit` → 单元内 `run-task` `execve` 为 `sandbox-ctl run`,非自行 fork-exec)。e2b 模板构建
+另走第二个模板单元 **`sandbox-builder@<bid>.service`**(同样经 `run-task` `execve` 为 `flatten-ctl`,
+镜像 → 确定性 EROFS 并入库)。两个模板单元由 `orchestrator-ctl serve` 启动时自动生成并安装
+(`install_units:false` 则交由运维带外管理),完整设计见 `sandbox-orchestrator/docs/orchestrator.md` §5/§11。
 
 运维侧:`/run/sandbox/<sid>/ctl.sock` 除了承载 snapshot,也是 `sandbox-ctl exec
 --sandbox-id <sid> -- CMD` 的入口——在不打断应用的前提下进入一个运行中的
@@ -261,7 +264,7 @@ yaml 显式 access_key/secret_key  →  ~/.obsconfig  →  AWS SDK 默认凭证�
    │   (Platform Mgmt Plane, region)                                                                  │
    │           │  attach + per-sandbox SANDBOX_CONFIG / MANIFEST_CONFIG                               │
    │           ▼                                                                                      │
-   │   orchestrator-ctl    ── fork-exec ──►  sandbox-ctl × ~3K  ── spawns ──►  cloud-hypervisor       │
+   │   orchestrator-ctl    ── StartUnit ──►  sandbox-ctl × ~3K  ── spawns ──►  cloud-hypervisor       │
    │                                                │                                  │              │
    │                                                │                                  ▼              │
    │                                                │                              guest VM           │
@@ -368,7 +371,7 @@ tiered` 自己处理 L2 不可达。
 | 单 `cache-ctl shard` 节点崩溃 | RS 4+1 容 1 节点故障;L2 仍服务 | systemd 重启;tiered 端 Maglev 表在该 peer 不可达期间把请求路由到其余 4 + 1 parity |
 | 同 RS 组中 ≥ 2 `cache-ctl shard` 同时崩溃 | 部分 `(chunk, idx)` 落到 ≥ 2 故障 peer 上,该 chunk L2 miss | 读路径 fallthrough origin(慢但正确);避免方式:成员变更**一次只动 1 peer** |
 | `node-ctl` 崩溃 | 长连断,沙箱保持上次 grant 继续跑;新沙箱 admit 失败 | systemd 重启;`state.json` 在 tmpfs,扫 cgroup 重建 |
-| `orchestrator-ctl` 崩溃 | 北向 API 中断,新沙箱无法拉起;存量沙箱不受影响 | systemd 重启,扫 run_root/base_root 多信号对账重建状态 |
+| `orchestrator-ctl` 崩溃 | 北向 API 中断,新沙箱无法拉起;存量沙箱不受影响 | systemd 重启;状态在 sqlite(`db_path`,默认 `<base_root>/orchestrator.db`)持久化,以 `ListUnitsByPatterns("sandbox-runner@*.service")` 的存活单元对账 sqlite `sandboxes` 表重挂(active+running⇒adopt 重武装 TTL;running 无单元⇒标 dead;`paused`/snapshot 记录保留可被 connect/auto-resume 拉起) |
 | OBS 区域不可达 | 整 region L3 不可达 | 已 L1/L2 命中的沙箱继续跑;依赖新 L3 的写路径 / cold-image fault / 展平上传失败 |
 | compute node 整机故障 | 该节点全部沙箱失效 | 平台管理面调度走 |
 | L2 cluster > parity 同时故障 | L2 整体不可用 | tiered fallthrough origin(slow path 持续);恢复后自然恢复 |
