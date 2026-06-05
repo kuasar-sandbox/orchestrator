@@ -595,7 +595,7 @@ func (s *Server) findBySandboxIDLocked(sid string) *Reservation {
 
 // handleConnDrop is invoked by the connection goroutine after EOF /
 // network error. Reservation is NOT immediately released — sandbox-ctl
-// may reconnect within the §11.3 window.
+// may reconnect within the reattach window.
 func (s *Server) handleConnDrop(token string) {
 	s.State.Lock()
 	defer s.State.Unlock()
