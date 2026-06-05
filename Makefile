@@ -35,7 +35,7 @@ export TARGET_ARCH
 BINDIR         := bin/$(TARGET_ARCH)
 SBIN           := $(abspath $(BINDIR))
 ARTIFACTS_LIST := scripts/artifacts.list
-GO_REPOS       := sandbox-accelerator sandbox-builder sandbox-runtime sandbox-sentinel sandbox-vswitch
+GO_REPOS       := sandbox-accelerator sandbox-builder sandbox-runtime sandbox-sentinel sandbox-vswitch sandbox-orchestrator
 
 # Cross-repo e2e tests this repo carries (each needs binaries from multiple
 # sub-repos: vmlinux/CH/mkfs.erofs from sandbox-deps, manifest-ctl/store-ctl/
@@ -45,7 +45,8 @@ UMBRELLA_E2E := \
   test-e2e-sandbox-cold test-e2e-sandbox-cold-manifest test-e2e-sandbox-cold-target \
   test-e2e-sandbox-diff-template test-e2e-sandbox-launchspec test-e2e-sandbox-proto \
   test-e2e-sandbox-restore test-e2e-sandbox-restore-files test-e2e-sandbox-snapshot \
-  test-e2e-sandbox-stdio test-e2e-sandbox-tapfd test-e2e-sandbox-upload-restore
+  test-e2e-sandbox-stdio test-e2e-sandbox-tapfd test-e2e-sandbox-upload-restore \
+  test-e2e-orchestrator test-e2e-runtask
 
 PERF_TARGETS := perf-sandbox perf-sandbox-manifest perf-density
 
@@ -58,7 +59,9 @@ all: build
 # Full platform build. Sub-repo order matters: sandbox-deps leads (mkfs.erofs
 # is needed by sandbox-runtime to pack the guest erofs). Each sub-repo's
 # `build` builds every binary it ships. After all sub-builds, `collect`
-# assembles every artifact under bin/$(TARGET_ARCH)/.
+# assembles every artifact under bin/$(TARGET_ARCH)/; then the e2b guest runtime
+# (sandbox-runtime-e2b.erofs) is assembled from the collected envd + base erofs +
+# erofs tools, and a second `collect` folds it into bin/$(TARGET_ARCH)/.
 build:
 	$(MAKE) -C $(ORG)/sandbox-deps build
 	$(MAKE) -C $(ORG)/sandbox-accelerator build
@@ -66,6 +69,9 @@ build:
 	$(MAKE) -C $(ORG)/sandbox-runtime build
 	$(MAKE) -C $(ORG)/sandbox-sentinel build
 	$(MAKE) -C $(ORG)/sandbox-vswitch build
+	$(MAKE) -C $(ORG)/sandbox-orchestrator build
+	@$(MAKE) collect
+	$(MAKE) -C $(ORG)/sandbox-orchestrator sandbox-runtime-e2b
 	@$(MAKE) collect
 
 # Assemble bin/$(TARGET_ARCH)/ from each sub-repo's per-arch bin per the
@@ -148,7 +154,7 @@ help:
 	@echo "  build         build every sub-repo + assemble bin/\$$(TARGET_ARCH)/ (multi-min cold)"
 	@echo "  collect       re-assemble bin/\$$(TARGET_ARCH)/ from existing sub-repo outputs"
 	@echo "  release       build + package dist/kuasar-sandbox-\$$(VERSION)-linux-\$$(TARGET_ARCH).tar.gz"
-	@echo "  test-e2e      aggregate: drive each sub-repo's test-e2e + run this repo's cross-repo e2e (16)"
+	@echo "  test-e2e      aggregate: drive each sub-repo's test-e2e + run this repo's cross-repo e2e (18)"
 	@echo "  test-e2e-<X>  one e2e sub-target (X in {manifest,obs,warmpool-dedup,density,sandbox-{cold,cold-manifest,..}})"
 	@echo "  perf          aggregate: accelerator perf-cache + this repo's perf-sandbox/-manifest/-density"
 	@echo "  bench         Go micro-benchmarks across every Go sub-repo"

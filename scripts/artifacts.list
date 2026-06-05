@@ -1,6 +1,8 @@
 sandbox-deps        mkfs.erofs
+sandbox-deps        fsck.erofs
 sandbox-deps        vmlinux
 sandbox-deps        cloud-hypervisor
+sandbox-deps        envd
 sandbox-accelerator manifest-ctl
 sandbox-accelerator store-ctl
 sandbox-accelerator cache-ctl
@@ -11,3 +13,6 @@ sandbox-runtime     sandbox-runtime.erofs
 sandbox-sentinel    node-ctl
 sandbox-vswitch     vswitch-ctl
 sandbox-vswitch     tapfd-get
+sandbox-orchestrator orchestrator-ctl
+sandbox-orchestrator e2b-key-ctl
+sandbox-orchestrator sandbox-runtime-e2b.erofs

@@ -54,6 +54,8 @@ DOCS=(
   "sandbox-runtime/docs/sandbox-runtime.md"
   # node controller
   "sandbox-sentinel/docs/node.md"
+  # node orchestrator (e2b-compatible ingress)
+  "sandbox-orchestrator/docs/orchestrator.md"
   # virtual switch — rename PROPOSAL.md to avoid collision with umbrella PROPOSAL.md
   "sandbox-vswitch/docs/PROPOSAL.md:vswitch.md"
   "sandbox-vswitch/docs/tapfd.md"
@@ -85,6 +87,8 @@ E2ES=(
   "kuasar-sandbox/test/e2e/e2e_sandbox_tapfd.sh"
   "kuasar-sandbox/test/e2e/e2e_sandbox_upload_restore.sh"
   "kuasar-sandbox/test/e2e/e2e_warmpool_dedup.sh"
+  "kuasar-sandbox/test/e2e/e2e_orchestrator.sh"
+  "kuasar-sandbox/test/e2e/e2e_runtask.sh"
   # accelerator (2)
   "sandbox-accelerator/test/e2e/e2e_cache.sh"
   "sandbox-accelerator/test/e2e/e2e_cluster_rolling.sh"
@@ -103,6 +107,14 @@ PERFS=(
   "sandbox-accelerator/test/scripts/dedup_report.sh"
 )
 
+# Deploy assets — operator-facing config + unit examples staged under
+# <release>/deploy/. orchestrator-ctl additionally self-installs its sandbox
+# template units at startup (see orchestrator.md §5).
+DEPLOYS=(
+  "sandbox-orchestrator/deploy/config.example.yaml"
+  "sandbox-orchestrator/deploy/orchestrator-ctl.service"
+)
+
 # ----------------------------------------------------------------------------
 # Pre-flight checks (fail early, list every missing input at once)
 # ----------------------------------------------------------------------------
@@ -112,7 +124,7 @@ missing=()
   || missing+=("$SRC_BIN (empty or absent — run \`make build\`)")
 [ -f "$UMBRELLA_DIR/README.md" ] || missing+=("$UMBRELLA_DIR/README.md")
 [ -f "$UMBRELLA_DIR/test/QUICKSTART.md" ] || missing+=("$UMBRELLA_DIR/test/QUICKSTART.md")
-for spec in "${DOCS[@]}" "${E2ES[@]}" "${PERFS[@]}"; do
+for spec in "${DOCS[@]}" "${E2ES[@]}" "${PERFS[@]}" "${DEPLOYS[@]}"; do
   src="${spec%%:*}"
   [ -f "$ORG/$src" ] || missing+=("$ORG/$src")
 done
@@ -127,7 +139,7 @@ fi
 # ----------------------------------------------------------------------------
 
 rm -rf "$OUT"
-mkdir -p "$OUT/bin" "$OUT/docs" "$OUT/test/e2e" "$OUT/test/perf"
+mkdir -p "$OUT/bin" "$OUT/docs" "$OUT/test/e2e" "$OUT/test/perf" "$OUT/deploy"
 
 cp -f "$SRC_BIN"/* "$OUT/bin/"
 cp -f "$UMBRELLA_DIR/README.md" "$OUT/README.md"
@@ -148,6 +160,7 @@ stage() {
 stage "$OUT/docs"      "${DOCS[@]}"
 stage "$OUT/test/e2e"  "${E2ES[@]}"
 stage "$OUT/test/perf" "${PERFS[@]}"
+stage "$OUT/deploy"    "${DEPLOYS[@]}"
 
 # ----------------------------------------------------------------------------
 # Tar + summary
@@ -162,3 +175,4 @@ echo "    docs/     ($(ls -1 "$OUT/docs" | wc -l) files)"
 ls -1 "$OUT/docs" | sed 's/^/                /'
 echo "    test/e2e/ ($(ls -1 "$OUT/test/e2e" | wc -l) scripts)"
 echo "    test/perf/ ($(ls -1 "$OUT/test/perf" | wc -l) scripts)"
+echo "    deploy/   ($(ls -1 "$OUT/deploy" | wc -l) files)"

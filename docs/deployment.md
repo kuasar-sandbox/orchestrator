@@ -33,12 +33,12 @@ UDS)协作。本文档定义这些进程在生产部署中的归属、责任边�
 
 | 进程 | 角色 | 数量 | 启停 | 本方案归属 |
 |---|---|---|---|---|
-| `orchestrator-ctl`(`serve`)| 本机沙箱编排 + e2b 兼容控制面:对外 e2b API,fork-exec `sandbox-ctl run`,经 vswitch 编排网络,反代 guest envd / floatingip,生命周期与 TTL | 单实例 | systemd | **本方案内**,`sandbox-orchestrator/docs/orchestrator.md` |
+| `orchestrator-ctl`(`serve`)| 本机沙箱编排 + e2b 兼容控制面:对外 e2b API,经 `run-task`(systemd 单元)启动 `sandbox-ctl run`,经 vswitch 编排网络,反代 guest envd / floatingip,生命周期与 TTL | 单实例 | systemd | **本方案内**,`sandbox-orchestrator/docs/orchestrator.md` |
 | `platform-agent`| 打通平台管理面 ↔ orchestrator 的桥接(多节点);与 platform-service 协同实现平台功能 | 单实例 | systemd | **本方案外/未来** |
 | `node-ctl`(`daemon`)| 节点级资源仲裁:沙箱准入、内存预算分配、密度控制 | 单实例 | systemd | 本方案,`docs/node.md` |
 | `cache-ctl`(`mode: tiered`)| 节点本地数据入口:L1 RocksDB + EC 客户端(→ L2)+ L3 origin | 单实例 | systemd,先于 orchestrator-ctl | 本方案,`docs/cache.md` |
 | `store-ctl` | 本机 OBS 读写代理(sidecar);**所有**远端 OBS 流量走这里 | 单实例 | systemd | 本方案,`docs/store.md` |
-| `sandbox-ctl`(`run`) | 单个沙箱的控制平面(类 `runc run`);非 daemon | 每沙箱一个,~3K | 由 orchestrator-ctl fork-exec | 本方案,`docs/sandbox.md` |
+| `sandbox-ctl`(`run`) | 单个沙箱的控制平面(类 `runc run`);非 daemon | 每沙箱一个,~3K | 由 orchestrator-ctl 经 run-task(systemd 单元)启动 | 本方案,`docs/sandbox.md` |
 | `cloud-hypervisor` | VMM(patched);`sandbox-ctl` 子进程 | 每沙箱一个 | `sandbox-ctl` 派生 | 本方案,`docs/cloud-hypervisor.md` |
 
 ### 2.2 端口与套接字
@@ -54,7 +54,7 @@ UDS)协作。本文档定义这些进程在生产部署中的归属、责任边�
 | `node-ctl daemon` | `/run/sandbox-resource.sock` | UDS,自定义协议 | 沙箱资源协议(`sandbox-ctl` 拨号目标)|
 | `sandbox-ctl` | `/run/sandbox/<sid>/*.sock` | UDS | sandbox 内部:`ch.sock` / `blk{0,1}.sock` / `uffd.sock` / `ctl.sock` / `vsock.sock`(+ `_5000`);另写 `<sid>.pid`(config-socket 鉴别)、`<sid>.env`(`SANDBOX_ARGS`)|
 | `orchestrator-ctl` | `:443`(可配) | HTTPS/h2 | **对外** e2b 控制面 API + 沙箱数据面 proxy(`<port>-<sid>.<domain>`)|
-| `orchestrator-ctl` | `/run/orchestrator-ctl.socket` | UDS,framed JSON | config-socket:sandbox-ctl 启动时取 manifest_key/动态配置(SO_PEERCRED + `<sid>.pid` 鉴别)|
+| `orchestrator-ctl` | `/run/sandbox/orchestrator.socket` | UDS,framed JSON | config-socket:run-task 启动时取 LaunchSpec(exec/args/workdir/env,密钥经 env)(SO_PEERCRED + `<id>.pid` 鉴别)|
 
 `cache-ctl tiered` 的 EC 客户端通过节点对外网络拨号 L2 cluster 节点的 `7070`
 端口(详见 §3)。**对外服务端口仅 `orchestrator-ctl` 一处**(e2b ingress);其余本机进程均 loopback/UDS。
@@ -117,8 +117,9 @@ RAM 工作集)。**overlay 写层**是沙箱独占、运行期被修改的可写
 
 ### 2.5 per-sandbox 配置下发
 
-每个沙箱有**独立的两份 yaml**,由 `orchestrator-ctl` 在 fork-exec 之前生成
-并通过 flag 传入:
+每个沙箱由 `orchestrator-ctl` 在启动单元前写一份 per-sandbox **`SANDBOX_CONFIG`**
+(`<sid>.yaml`,非密),搭配**共享**的 **`MANIFEST_CONFIG`**(`manifest.key` 留空)+
+per-沙箱 `MANIFEST_KEY` env;经 `run-task`(单元)以 flag 传入 sandbox-ctl:
 
 | 文件 | 内容 | 传入方式 | 文档 |
 |---|---|---|---|
@@ -129,7 +130,8 @@ RAM 工作集)。**overlay 写层**是沙箱独占、运行期被修改的可写
 
 - **per-sandbox 密钥**:每沙箱用各自租户的客户密钥;orchestrator-ctl 经**共享**
   `MANIFEST_CONFIG`(`manifest.key` 留空)+ per-沙箱 `MANIFEST_KEY` env 注入(e2b 路径下
-  `MANIFEST_KEY=SHA256(api_key)`),或由 platform-agent 从平台管理面取密钥落地
+  `MANIFEST_KEY` 为该租户 manifest 根密钥——orchestrator 从加密存储解出;**api_key 由它
+  派生**,见 `sandbox-orchestrator/docs/orchestrator.md` §7),或由 platform-agent 从平台管理面取密钥落地
   `/run/sandbox/<sid>/manifest.yaml`,生命周期跟沙箱走
 - **共享格式**:`manifest-ctl` 与 `sandbox-ctl` 用**同一**配置格式;两者都
   **只**连本机 store-ctl(`127.0.0.1:7100`)+ 本机 cache-ctl(`127.0.0.1:7070`),
@@ -414,7 +416,7 @@ Region 级:         OBS 桶 + 平台 / 展平管理面
 | `node-ctl daemon` | `/etc/node-ctl/node-ctl.yaml` | `listen: /run/sandbox-resource.sock` | [`docs/node.md`](node.md) §3 |
 | `sandbox-ctl run` | `--config <path>`(`SANDBOX_CONFIG`)+ `--manifest-config <path>`(`MANIFEST_CONFIG`)| **per-sandbox**,由 `orchestrator-ctl` 生成,落在 `/run/sandbox/<sid>/` | [`docs/sandbox.md`](sandbox.md) §3 |
 | `manifest-ctl` | `--manifest-config <path>`(`MANIFEST_CONFIG`)| 与 `sandbox-ctl` 共享格式;只连本机 store-ctl + cache-ctl | [`docs/manifest.md`](manifest.md) §3 |
-| `flatten-ctl` | CLI flag + `--manifest-config`(`MANIFEST_CONFIG`,`--upload` 时)+ `--remote-config`(`REMOTE_CONFIG`,registry 源时);凭据走 `FLATTEN_REGISTRY_*` env | 仅在镜像展平数据面节点使用 | [`docs/flatten.md`](flatten.md) §2 |
+| `flatten-ctl` | CLI flag + `--manifest-config`(`MANIFEST_CONFIG`,`--upload` 时)+ `--config`(`FLATTEN_CONFIG`,registry 源时);凭据走 `FLATTEN_REGISTRY_*` env | 仅在镜像展平数据面节点使用 | [`docs/flatten.md`](flatten.md) §2 |
 
 构建产物路径、跨架构、release 打包见 [`docs/build.md`](build.md);性能基线、
 回归 checklist 见 [`docs/perf.md`](perf.md)。
