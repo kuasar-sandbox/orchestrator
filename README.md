@@ -30,8 +30,11 @@ A node-level resource guardian for high-density microVM sandboxes.
 ## 构建
 
 ```bash
-make node-ctl
-make vet test
+make node-ctl            # 构建控制器 daemon(= make build / make all)
+make vet test            # 静态检查 + 单元测试
+make bench               # 基准(-bench=. -benchmem)
+make test-e2e            # e2e(= test-e2e-node-ctl;经 sandbox-runtime/pkg/resource inline-Go client)
+make clean               # 清理 bin/ build/
 ```
 
 协议契约与每沙箱状态机见 `docs/node.md`。

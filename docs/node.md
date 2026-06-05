@@ -74,11 +74,12 @@ sandbox-ctl 的对端;`node-ctl` 是参考实现。本文档同时定义协议�
 ### 2.2 `node-ctl daemon`
 
 ```
-node-ctl daemon [--config /etc/node-ctl/node-ctl.yaml]
+node-ctl daemon [--config /etc/node-ctl/node-ctl.yaml] [--listen /run/sandbox-resource.sock]
 ```
 
 启动 RPC server、admission controller、memory allocator、reclaim scheduler、
-state persister(`/run/node-ctl/state.json`)。systemd 单元入口。
+state persister(`/run/node-ctl/state.json`)。systemd 单元入口。`--listen`
+覆盖 yaml 的 `listen` 路径(为空则用 yaml 值)。
 
 ### 2.3 `node-ctl status`
 
@@ -266,7 +267,7 @@ CPU 维度水位**仅用于 admission**(`Σ allocatable.cpu_i ≤ allocatable_po
 
 ### 5.1 协议形态
 
-UDS,长度前缀(4 字节 BE uint32)+ JSON 消息——简单、调试友好、无外部依赖。
+UDS,长度前缀(4 字节 LE uint32)+ JSON 消息——简单、调试友好、无外部依赖。
 
 每个 sandbox-ctl 启动时 `Admit` 后建立长连,直到沙箱退出。连接生命周期与
 沙箱生命周期对齐。**控制器实现是协议的对端,任何遵循本节定义的实现都可作为
@@ -277,7 +278,8 @@ sandbox-ctl 的对端**;`node-ctl` 是参考实现。
 请求/响应对(sandbox-ctl 发,控制器答):
 
 ```
-Admit            (capacity, floor, startup_budget_memory, allocatable_at_snapshot?)
+Admit            (sandbox_id, capacity, floor, startup_budget_memory,
+                  allocatable_at_snapshot?, cgroup_path)
                  → AdmitResponse (status, reservation_token, granted_initial_alloc,
                                   reason?, queued_for_ms, queue_pos_at_in)
                    status ∈ {admitted, rejected}        (queued 已废弃,server hold conn)
@@ -285,6 +287,8 @@ Admit            (capacity, floor, startup_budget_memory, allocatable_at_snapsho
                                                allocatable_at_snapshot)
                    reason:rejected 时分类(详 §6.4)
                    queued_for_ms / queue_pos_at_in:informational metadata
+                 # sandbox_id 用作 admin 动词(grant/reclaim)的索引键;
+                 # cgroup_path 存入 reservation,供重启重建期交叉对账
 
 Settled          (token, current_rss, current_cpu_usec)        # 进入 settled 通知
                  → Ack
@@ -299,15 +303,36 @@ OOMReport        (token, oom_count, killed_pid, killed_rss)    # 紧急上报
 
 Heartbeat        (token, current_rss, current_cpu_usec, recent_high_count,
                   cpu_throttled_periods)                       # 30s 周期
-                 → Ack
+                 → Ack (new_allocatable)
+                   # Ack 回带权威 new_allocatable:active reclaimer 或 admin
+                   # 动词改过 allocatable_now 时,sandbox-ctl 在此取新值并落地
+                   # (cgroup memory.high + balloon resize)——reclaim/admin 的
+                   # 传播通道
 
 Release          (token, reason)                                # reason ∈ {normal, error, ...}
                  → Ack
 
-Reattach         (token, current_state)                         # 断线重连后重新绑定(§5.3)
-                 → ReattachResponse (status, allocatable)
-                   status ∈ {ok, unknown_token};控制器以 sandbox-ctl
-                   上报的 current_state 为准同步该 reservation
+Reattach         (token)                                        # 断线重连后重新绑定(§5.3)
+                 → Ack (new_allocatable)                        # 成功:回带当前 allocatable_now
+                 → Error "unknown token"                        # token 不存在
+```
+
+admin 动词(运维 CLI 发,控制器答;以 sandbox_id 而非 token 定位目标):
+
+```
+AdminStatus      ()                                             # node-ctl 经 RPC 查实时态
+                 → Ack (zone, node_allocated, allocatable_pool,
+                        reservation_count, drained)
+                   # state.json 不可直接访问时(如跨主机巡检)用
+
+AdminDrain       (drain)                                        # 背后 node-ctl drain
+                 → Ack (drained)
+
+AdminGrant       (sandbox_id, requested_delta)                  # 背后 node-ctl grant
+                 → Ack (granted_delta, new_allocatable)         # 绕过水位/限速
+
+AdminReclaim     (sandbox_id, target_allocatable)               # 背后 node-ctl reclaim
+                 → Ack (new_allocatable)                        # shrink-only,clamp 到 floor
 ```
 
 通知(控制器推,sandbox-ctl 接):
@@ -350,8 +375,8 @@ UpdateConfig     (token, new_watermark_ratio, ...)             # 运维动态调
 **重连**:
 
 - 连接断开,sandbox-ctl 退避重试(1s, 2s, 5s, 10s, 10s, ...)
-- 重连成功后发 `Reattach(token, current_state)`,控制器验证 token 找到
-  reservation,以 sandbox-ctl 上报为准同步状态
+- 重连成功后发 `Reattach(token)`,控制器验证 token 找到 reservation 后回
+  `Ack(new_allocatable)`,重新绑定连接;token 不存在则回 `Error "unknown token"`
 - 重连期间 sandbox-ctl 用最近一次 grant 状态继续运行(cgroup 不变、balloon
   不变),不主动调整资源
 
@@ -410,7 +435,7 @@ effective_startup_budget = max(
 | 条件 | reject 原因 |
 |---|---|
 | `effective_startup_budget == 0` | `invalid_burst` |
-| `effective_startup_budget > main_pool` | `exceeds_node_capacity`(永不可能) |
+| `effective_startup_budget > allocatable_pool` | `exceeds_node_capacity`(永不可能) |
 | `effective_startup_budget > startup_pool` | `exceeds_startup_pool`(永不进 startup_pool) |
 
 主决策:
@@ -456,28 +481,30 @@ worker 处理:严格 FIFO。head 不通过即停,直到 wake 重试。worker 入
 | `drained` | 控制器进入 drain 模式 | exit 非零;orchestrator 知节点不再接客 |
 | `zone_critical` | main pool 在 red/critical 区 | exit;orchestrator 换 host 或等其他 sandbox release |
 | `invalid_burst` | 请求 effective_burst 计算为 0 | 配置错(yaml 全空)|
-| `exceeds_node_capacity` | effective_burst > 节点总 pool | 配置错(永远塞不进这个节点)|
+| `exceeds_node_capacity` | effective_startup_budget > allocatable_pool | 配置错(永远塞不进这个节点)|
 | `exceeds_startup_pool` | effective_burst > startup_pool 上限 | startup_factor 配过小 / sandbox burst 配过大 |
 | `queue_full` | queue.depth ≥ queue_max_depth | 节点 admission 压力极大,orchestrator 换 host |
 | `queue_ttl` | 等待时间 > queue_ttl | 短期资源紧但 30s 内未缓解,orchestrator 决定 |
 | `queue_canceled` | 客户端断连或自身 TTL 触发 | 通常 client-side 已退出 |
+| `daemon_shutting_down` | daemon 停机时排空在队 admit | orchestrator 换 host |
 
-### 6.3 reservation 生命周期与 token TTL
+### 6.5 reservation 生命周期与 token TTL
 
 ```
 Admit (admitted)
- │  reservation 占用 startup_burst.memory,token 生成
+ │  reservation 占用 effective_startup_budget,token 生成
  │
  ▼
 sandbox-ctl 启动 CH(cgroup join → memfd → ...)
- │  若 sandbox-ctl 在 startup_ttl(默认 5 分钟)内不发 Settled
+ │  若 sandbox-ctl 在 startup_ttl(默认 30s)内不发 Settled
  │   → 控制器视为创建失败,自动 release reservation
  ▼
 launch hello(冷启动)/ restore_ack(恢复)
  │
  ▼
 sandbox-ctl 发 Settled(token, current_rss, current_cpu_usec)
- │  reservation 进入 settled,startup_burst 转 allocatable_now
+ │  reservation 进入 settled;allocatable_now 从 effective_startup_budget
+ │  收缩到 max(current_rss, floor),startup_pool 同步归还该 budget
  │
  ▼
 ... 后续 RequestBudget / Heartbeat / OOMReport ...
@@ -491,9 +518,9 @@ end
 
 **TTL 设计依据**:
 
-- `startup_ttl = 5min`:覆盖最坏冷启动(大镜像 + 慢网络下 manifest 恢复)。
-  生产典型冷启动 < 30 s
-- `queue_ttl = 60s`:Admit 排队太久无意义,上层调度器宁可换节点
+- `startup_ttl = 30s`:覆盖典型冷启动(大镜像 + 慢网络下 manifest 恢复)。
+  超时即视为创建失败,释放 reservation
+- `queue_ttl = 30s`:Admit 排队太久无意义,上层调度器宁可换节点
 
 ## 7. node-ctl 内部组织
 
@@ -579,8 +606,9 @@ node-ctl daemon
      sandbox.yaml 路径取得 sandbox sid + capacity,**临时收纳**为新
      reservation,等其重连
    - state.json 有但 cgroup 不存在:沙箱已死,丢弃 reservation
-4. **等待重连**:已知的活 reservation 各自标记 `awaiting_reattach`,从
-   sandbox-ctl 收到 Reattach 后转回正常状态。30 s 内未重连的视为死亡,丢弃
+4. **等待重连**:已知的活 reservation 暂无连接(`Conn=nil`),收到
+   sandbox-ctl 的 `Reattach(token)` 后回 `Ack(new_allocatable)` 重新绑定;
+   超过心跳过期阈值仍无重连的由 IdleSweeper 视为死亡丢弃
 5. **服务恢复**:期间控制器接受新 Admit 申请,但水位计算包含已知活沙箱的
    reservation(可能短暂超估,优先保守)
 
@@ -634,7 +662,7 @@ agent 应用的运行剖面输入规范(实测在 [`perf.md`](perf.md)):
   N_sandboxes               沙箱总数(扫描变量,32 / 64 / 128 / 256 / 512)
   capacity_each             (memory=8 GiB, cpu=2)
   floor_each                (memory=128 MiB, cpu=0.1)
-  startup_burst_memory      1 GiB
+  startup_budget_memory     1 GiB
 
 每沙箱状态机:
   state ∈ {idle, active}
