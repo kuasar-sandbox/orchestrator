@@ -70,7 +70,7 @@ DOCS=(
 # generates Go drivers via heredoc and runs them with `go run`, requiring a
 # checkout of sandbox-{sentinel,runtime} sources. Keep it in the source repo.
 E2ES=(
-  # umbrella (16)
+  # umbrella (18)
   "kuasar-sandbox/test/e2e/e2e_density.sh"
   "kuasar-sandbox/test/e2e/e2e_manifest.sh"
   "kuasar-sandbox/test/e2e/e2e_obs.sh"
@@ -113,6 +113,7 @@ PERFS=(
 DEPLOYS=(
   "sandbox-orchestrator/deploy/config.example.yaml"
   "sandbox-orchestrator/deploy/orchestrator-ctl.service"
+  "sandbox-orchestrator/deploy/orchestrator-proxy@.service"
 )
 
 # ----------------------------------------------------------------------------
