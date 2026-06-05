@@ -95,6 +95,11 @@ external 模式拓扑（数据面字节流**不经** orchestrator）：
 
 ### §3.1 控制面（orchestrator-ctl 自实现）
 
+`orchestrator-ctl` 的全部子命令：**`serve`**（启动 daemon，`--config`/`--proxy`/`--proxy-socket`）、
+**`proxy`**（external 模式独立数据面 worker，§2.1）、**`run-task`**（单元内通用启动器，§6，非给人用）、
+**`config`**（`--config` 规范化+校验、`--template` 输出带注释骨架、`-o` 写文件；对齐 `sandbox-ctl config`/`flatten-ctl config`）、
+**`manifest-key`**（`add`/`remove`/`check`/`list` 维护白名单，§7）、**`version`**。下表为 `serve` 提供的 e2b 控制面 HTTP 契约。
+
 基址 `https://api.<domain>`；鉴权 **`X-API-KEY`**（沙箱）/ **`Authorization: Bearer`**（构建，e2b CLI）。
 api_key 由 manifest_key 派生（`e2b-key-ctl gen-apikey`），orchestrator 经 §7 的 MAC 校验解析出租户——**无静态 api_keys 表**。
 
@@ -239,7 +244,7 @@ ExecStart 统一为 `orchestrator-ctl run-task`（通用子任务启动器，§6
 
 ## §9 状态存储与重启对账
 
-sqlite `/var/lib/sandbox/orchestrator.db`。
+sqlite，路径由 config `db_path` 配置（默认 `<base_root>/orchestrator.db`，如 `/var/lib/sandbox/orchestrator.db`）。
 
 `sandboxes`：`id(uuidv7) PK, template_id, state(running|paused|dead), deadline_unix, run_dir, base_dir,
 envd_uds, ci_uds, floatingip, vswitch_port, inner_ip, port_mac, manifest_key_hash, manifest_key_enc,
@@ -325,6 +330,38 @@ build-runtime-e2b.sh（sandbox-runtime-e2b.erofs；envd 注入 /opt/sandbox-runt
    └─ build(builds 表 + 资源池 + run-task→flatten-ctl(img,stdout→.result) + boot+snapshot(snp))
 ```
 
+## §16 配置（字段参考）
+
+完整可注释样例见 **`deploy/config.example.yaml`**（亦即 `orchestrator-ctl config --template` 的输出骨架），
+权威字段清单见 `internal/config/config.go`；daemon 的 systemd 单元见 **`deploy/orchestrator-ctl.service`**
+（`ExecStart=orchestrator-ctl serve --config /etc/orchestrator-ctl/config.yaml`）。**必填**仅 `domain` +
+`encryption_key`（或 `ORCHESTRATOR_ENCRYPTION_KEY` env）。以下为几处易混字段：
+
+| 字段 | 默认 | 说明 |
+|---|---|---|
+| `db_path` | `<base_root>/orchestrator.db` | sqlite 路径，**可配**（非固定 `/var/lib/sandbox/...`）；随 `base_root` 派生，亦可显式覆盖（§9） |
+| `sandbox_ctl_bin` / `vswitch_ctl_bin` / `flatten_ctl_bin` | `sandbox-ctl` / `vswitch-ctl` / `flatten-ctl`（PATH） | **三个生效的外部二进制覆盖**（裸名经 `exec_dir` 解析为绝对路径，§5）；用于测试钉版本 |
+| `metrics_listen` | `""`（关） | 可选 Prometheus 文本端点（`data_requests_total{result=…}`/`gateway_forward_total` 等，§2.1） |
+
+> `manifest_ctl_bin` / `mkfs_erofs_bin` / `fsck_erofs_bin` 字段虽存在（含默认值），但**当前未被引用**（`cfg.Bin()`
+> 仅对 sandbox-ctl/vswitch-ctl/flatten-ctl 调用；erofs 工具由 `deps/build-runtime-e2b.sh` 直接调），属 dead config，配置无效。
+
+## §17 如何测试
+
+跨仓 e2e 脚本集中在 umbrella **`kuasar-sandbox/test/e2e/`**（需多仓产物：vmlinux/CH/mkfs.erofs 等）：
+
+| 脚本 | 覆盖 | 运行 |
+|---|---|---|
+| `e2e_orchestrator.sh` | 单元自动安装 + 控制面（`/health`、`X-API-KEY` 401 路径）+ 构建 API（v3 register/trigger/status、跨 key 归属 404） | `make test-e2e-orchestrator` |
+| `e2e_runtask.sh` | run-task 通用启动器 + `config`/`info` CLI（纯用户态，无 root/systemd/KVM）：pidfile 锁、4B-LE 帧取 LaunchSpec、execve、`TASK_*` 清理 | `make test-e2e-runtask` |
+| `e2e_orchestrator_proxy.sh` | `proxy_mode=external` 全链路：serve（控制面）+ 独立 proxy worker（SO_REUSEPORT 数据面）+ routesync + 真实 microVM/envd，数据面**经 proxy** 走 | `bash test/e2e/e2e_orchestrator_proxy.sh` |
+| `e2e_build_real.sh` | 真实镜像 build 后端（store-ctl + 本地 zot）：register → trigger → poll 至 `status=ready` 出 persist id（暂无 e2b CLI） | `bash test/e2e/e2e_build_real.sh` |
+| `e2e_build_cli.sh` | 真实 `e2b template build`（未改造 CLI 2.10.3）经 `builder_image_uri_mask` 桥接到 flatten，跑到 ready 模板 | `bash test/e2e/e2e_build_cli.sh` |
+| `e2e_execute.sh` | 从已建模板冷启真实 microVM 并在 guest 内执行；pause(snapshot)→resume 全链路 | `bash test/e2e/e2e_execute.sh` |
+
+`make test-e2e-orchestrator` / `make test-e2e-runtask` 是 umbrella 已注册的聚合目标；其余四个脚本目前直接 `bash` 运行
+（未注册为 `make` 目标）。各 Go 仓单元测试经 `make test`（在对应仓或 umbrella）。
+
 ## 修订历史
 
 | 版本 | 日期 | 修改人 | 说明 |
@@ -334,5 +371,5 @@ build-runtime-e2b.sh（sandbox-runtime-e2b.erofs；envd 注入 /opt/sandbox-runt
 | v0.1 | 2026-06-03 | chenxiaohui | 初稿：e2b 兼容控制面 + envd-in-guest 代理 + e2b/bare 双 profile |
 | v0.2 | 2026-06-03 | chenxiaohui | systemd 模板单元 + config-socket 动态配置/密钥 + manifest_key 存 sqlite + auto-suspend/resume |
 | v0.3 | 2026-06-04 | chenxiaohui | config-socket 唯一配置通道（去 yaml/env/args）；cgroup-adopt（单元自身 cgroup）；单元启动自动生成安装（runner+builder）；归属校验全覆盖；构建改经 e2b v3 API + builds 表 + 资源池 + build-exec/flatten-ctl(--with-referer) + boot/snapshot；envd 嵌 `/opt/sandbox-runtime/bin/envd`（零 sandbox-init 改动）；templateID transient/persist 两形态；去 `build` CLI/metrics |
-| v0.5 | 2026-06-05 | chenxiaohui | 反转密钥模型：**manifest_key 为根密钥、api_key 由其派生**（`e2b_`+base64url(fp12‖ts4‖nonce4‖mac16)，e2b SDK 不校验格式已核源码）；manifest_key 字段 **AES-256-GCM 加密落盘** + `*_hash` 非唯一索引；新 `manifest_keys` 白名单表（create/build 查；其他操作不查）；config 去 `api_keys`、加 `encryption_key`(+`ORCHESTRATOR_ENCRYPTION_KEY` env，多键轮换)；新增 `orchestrator-ctl manifest-key {add|remove|check|list}` + 独立二进制 `e2b-key-ctl {gen-apikey|gen-key|fingerprint}`；403=非白名单 create/build、404=非属主 |
+| v0.5 | 2026-06-05 | chenxiaohui | 反转密钥模型：**manifest_key 为根密钥、api_key 由其派生**（`e2b_`+base64url(fp12‖ts4‖nonce4‖mac16)，e2b SDK 不校验格式已核源码——**已被 v0.7 取代：改 hex 编码，SDK 实校验 `/^e2b_[0-9a-f]+$/`**）；manifest_key 字段 **AES-256-GCM 加密落盘** + `*_hash` 非唯一索引；新 `manifest_keys` 白名单表（create/build 查；其他操作不查）；config 去 `api_keys`、加 `encryption_key`(+`ORCHESTRATOR_ENCRYPTION_KEY` env，多键轮换)；新增 `orchestrator-ctl manifest-key {add|remove|check|list}` + 独立二进制 `e2b-key-ctl {gen-apikey|gen-key|fingerprint}`；403=非白名单 create/build、404=非属主 |
 | v0.4 | 2026-06-04 | chenxiaohui | config-socket 改为通用 **run-task + LaunchSpec**（exec/args/workdir/env），非密配置回落文件、密钥走 env；sandbox-ctl 去 `--config-socket`（pkg/manifest 读 MANIFEST_KEY env）；单元 ExecStart 统一 `run-task`、`Type=exec`、pidfile `F_SETLK` 锁防重入跨 execve；去 `build-exec`（build 经 run-task→flatten-ctl，结果经 `StandardOutput=file` 捕获）；`build-runtime` 改 `deps/build-runtime-e2b.sh` 脚本；flatten-ctl 配置统一 `--config/FLATTEN_CONFIG`（artifact_type 常量、cache opt-in、referer.enabled、--platform）；新增 `sandbox-ctl info` / `flatten-ctl config` / `orchestrator-ctl config` |
