@@ -1,0 +1,38 @@
+# orchestrator-proxy@.service — external data-plane proxy worker (proxy_mode=external).
+#
+# Run one or more instances (orchestrator-proxy@1, @2, ...). All instances bind the
+# same data-plane port with SO_REUSEPORT (the kernel load-balances connections), and
+# each exposes its own route-sync UDS that the orchestrator dials. The orchestrator's
+# config.yaml must list those sockets:
+#
+#   proxy_mode: external
+#   proxy_sockets: [ /run/sandbox/proxy-1.sock, /run/sandbox/proxy-2.sock ]
+#
+# Operator-managed (the orchestrator does NOT auto-install this unit). The worker is
+# stateless: it serves only what the orchestrator pushes over the route-sync stream,
+# so a crash/restart re-syncs from scratch. It must run on the same node as the
+# orchestrator (it dials per-sandbox envd UDS / floatingip locally).
+[Unit]
+Description=kuasar orchestrator data-plane proxy %i
+After=network-online.target orchestrator-ctl.service
+Wants=network-online.target
+
+[Service]
+Type=exec
+# --data-listen is shared across workers (SO_REUSEPORT); --socket is per-worker and
+# must match an entry in the orchestrator's proxy_sockets. TLS is the same wildcard
+# cert the orchestrator serves (*.<domain>). The auth fallback applies only until the
+# orchestrator pushes its policy (data_plane_auth) over the route-sync handshake.
+ExecStart=/usr/bin/orchestrator-ctl proxy \
+  --socket=/run/sandbox/proxy-%i.sock \
+  --data-listen=:443 \
+  --tls-cert=/etc/orchestrator-ctl/tls/fullchain.pem \
+  --tls-key=/etc/orchestrator-ctl/tls/privkey.pem \
+  --auth=enforce \
+  --park-timeout=90s \
+  --metrics-listen=127.0.0.1:9090
+Restart=always
+RestartSec=1
+
+[Install]
+WantedBy=multi-user.target

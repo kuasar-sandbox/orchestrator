@@ -1,0 +1,208 @@
+// Command orchestrator-ctl is the single-node, e2b-compatible sandbox orchestrator.
+//
+//	orchestrator-ctl serve     --config <yaml>                          # run the daemon
+//	orchestrator-ctl run-task  --pidfile=<f> --config-socket=<uds> --config-id=<id>
+//	                                                                    # in-unit launcher (not for humans)
+//	orchestrator-ctl version
+//
+// Templates are built through the e2b API (POST /v3/templates ...), not a CLI.
+// sandbox-runtime-e2b.erofs is assembled by deps/build-runtime-e2b.sh (Makefile).
+package main
+
+import (
+	"context"
+	"flag"
+	"fmt"
+	"log/slog"
+	"net"
+	"net/http"
+	"os"
+	"os/signal"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/api"
+	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/config"
+	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/configsock"
+	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/launcher"
+	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/metrics"
+	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/orch"
+	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/proxy"
+	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/routesync"
+	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/secretbox"
+	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/store"
+	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/vswitch"
+)
+
+var version = "0.2.0-dev"
+
+func main() {
+	if len(os.Args) < 2 {
+		usage()
+	}
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	var err error
+	switch os.Args[1] {
+	case "serve":
+		err = serve(os.Args[2:], log)
+	case "proxy":
+		err = runProxy(os.Args[2:], log)
+	case "run-task":
+		err = runTask(os.Args[2:], log)
+	case "config":
+		err = configCmd(os.Args[2:], log)
+	case "manifest-key":
+		err = manifestKeyCmd(os.Args[2:], log)
+	case "version", "-v", "--version":
+		fmt.Println("orchestrator-ctl", version)
+	default:
+		usage()
+	}
+	if err != nil {
+		log.Error("orchestrator-ctl", "cmd", os.Args[1], "err", err)
+		os.Exit(1)
+	}
+}
+
+func usage() {
+	fmt.Fprintln(os.Stderr, "usage: orchestrator-ctl {serve|proxy|run-task|config|manifest-key|version} [flags]")
+	os.Exit(2)
+}
+
+func serve(args []string, log *slog.Logger) error {
+	fs := flag.NewFlagSet("serve", flag.ExitOnError)
+	cfgPath := fs.String("config", "/etc/orchestrator-ctl/config.yaml", "config file")
+	proxyMode := fs.String("proxy", "", "override proxy_mode: internal|external|off")
+	proxySock := fs.String("proxy-socket", "", "override proxy_sockets (comma-separated UDS, external mode)")
+	_ = fs.Parse(args)
+
+	cfg, err := config.Load(*cfgPath)
+	if err != nil {
+		return err
+	}
+	if *proxyMode != "" {
+		cfg.ProxyMode = *proxyMode
+	}
+	if *proxySock != "" {
+		cfg.ProxySockets = splitComma(*proxySock)
+	}
+	if err := cfg.ValidateProxy(); err != nil { // re-check after flag overrides
+		return err
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	box, err := secretbox.NewFromColonHex(cfg.EncryptionKeySpec())
+	if err != nil {
+		return err
+	}
+	st, err := store.Open(cfg.DBPath, box)
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+	if err := os.Chmod(cfg.DBPath, 0o600); err != nil {
+		log.Warn("chmod db", "err", err)
+	}
+
+	lc, err := launcher.NewSystemd(ctx)
+	if err != nil {
+		return err
+	}
+	defer lc.Close()
+
+	core := orch.New(cfg, st, lc, vswitch.New(cfg.Bin(cfg.VswitchCtl), cfg.Switch), log)
+	if err := core.InstallUnits(ctx); err != nil {
+		return err
+	}
+	if err := core.Reconcile(ctx); err != nil {
+		log.Warn("reconcile", "err", err)
+	}
+	go core.Reaper(ctx, 5*time.Second)
+	go core.BuildPool(ctx, 2*time.Second)
+
+	// task config-socket server (run-task pulls its LaunchSpec by config-id).
+	cs := configsock.New(cfg.ConfigSocket, core, log)
+	go func() {
+		if err := cs.Serve(ctx); err != nil {
+			log.Error("config-socket", "err", err)
+		}
+	}()
+
+	// Data-plane handler depends on proxy_mode: in-process proxy (internal),
+	// forward-to-worker gateway (external), or reject (off). External mode also
+	// starts the route-sync client that pushes the route table to each worker.
+	mx := metrics.New()
+	dataH := buildDataPlane(ctx, cfg, core, mx, log)
+
+	// North handler: api.<domain> -> control plane; <port>-<sid>.<domain> -> data plane.
+	apiH := api.New(core, cfg.Domain, log).Handler()
+	mux := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		host := r.Host
+		if i := strings.IndexByte(host, ':'); i >= 0 {
+			host = host[:i]
+		}
+		if host == "api."+cfg.Domain || strings.HasPrefix(host, "api.") {
+			apiH.ServeHTTP(w, r)
+			return
+		}
+		dataH.ServeHTTP(w, r)
+	})
+
+	if cfg.MetricsListen != "" {
+		go serveMetrics(ctx, cfg.MetricsListen, mx, log)
+	}
+	// Optional dedicated data-plane listener. In external mode the proxy workers
+	// own data_listen (SO_REUSEPORT), so the orchestrator does not bind it.
+	if cfg.ProxyMode != config.ProxyExternal && cfg.DataListen != "" {
+		ln, err := net.Listen("tcp", cfg.DataListen)
+		if err != nil {
+			return fmt.Errorf("data_listen %s: %w", cfg.DataListen, err)
+		}
+		log.Info("orchestrator-ctl data-plane listener", "data_listen", cfg.DataListen)
+		go func() {
+			if err := serveListener(ctx, ln, dataH, cfg.TLSCert, cfg.TLSKey, log); err != nil {
+				log.Error("data-plane listener", "err", err)
+			}
+		}()
+	}
+
+	if cfg.TLSCert == "" || cfg.TLSKey == "" {
+		log.Warn("serving plain HTTP (dev): point the SDK with E2B_API_URL/E2B_SANDBOX_URL")
+	}
+	ln, err := net.Listen("tcp", cfg.Listen)
+	if err != nil {
+		return fmt.Errorf("listen %s: %w", cfg.Listen, err)
+	}
+	log.Info("orchestrator-ctl serving", "listen", cfg.Listen, "domain", cfg.Domain, "proxy_mode", cfg.ProxyMode)
+	return serveListener(ctx, ln, mux, cfg.TLSCert, cfg.TLSKey, log)
+}
+
+// buildDataPlane wires the data-plane handler for the configured proxy_mode.
+func buildDataPlane(ctx context.Context, cfg *config.Config, core *orch.Orchestrator, mx *metrics.M, log *slog.Logger) http.Handler {
+	switch cfg.ProxyMode {
+	case config.ProxyOff:
+		return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			mx.Inc(`data_requests_total{result="off"}`)
+			http.Error(w, "data plane disabled (proxy_mode=off)", http.StatusNotImplemented)
+		})
+	case config.ProxyExternal:
+		rc := routesync.NewClient(cfg.ProxySockets, core, log)
+		go rc.Run(ctx)
+		log.Info("route-sync client started", "proxies", cfg.ProxySockets)
+		return newGateway(cfg.ProxySockets, mx, log)
+	default: // internal
+		return proxy.New(core, func() string { return cfg.DataPlaneAuth }, log, mx)
+	}
+}
+
+func splitComma(s string) []string {
+	var out []string
+	for _, p := range strings.Split(s, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}

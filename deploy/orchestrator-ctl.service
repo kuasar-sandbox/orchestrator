@@ -1,0 +1,16 @@
+# orchestrator-ctl daemon unit (the e2b-compatible ingress). It launches each
+# sandbox as a sandbox-runner@<sid>.service instance over systemd D-Bus, so it
+# needs the system bus and cgroup write access. Start after the data-plane daemons.
+[Unit]
+Description=kuasar sandbox-orchestrator (e2b-compatible ingress)
+After=network-online.target node-ctl.service cache-ctl.service store-ctl.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/orchestrator-ctl serve --config /etc/orchestrator-ctl/config.yaml
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

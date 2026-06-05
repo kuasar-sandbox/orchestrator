@@ -1,0 +1,66 @@
+# orchestrator-ctl configuration. See sandbox-orchestrator/docs/orchestrator.md.
+# The unmodified e2b SDK reaches this node via: E2B_DOMAIN=<domain> E2B_API_KEY=<key>
+# (dev: E2B_API_URL=http://host:3000 E2B_SANDBOX_URL=http://<port>-<sid>.host:3000).
+
+domain: sandboxes.example.com
+listen: ":443"                                       # dev: ":3000" (plain http)
+tls_cert: /etc/orchestrator-ctl/tls/fullchain.pem    # wildcard *.<domain> AND api.<domain>
+tls_key: /etc/orchestrator-ctl/tls/privkey.pem
+
+# Data-plane proxy. proxy_mode selects how sandbox traffic (<port>-<sid>.<domain>)
+# is served:
+#   internal (default) — in-process proxy (single binary, no extra moving parts).
+#   external           — offload the data plane to one or more orchestrator-ctl proxy
+#                        worker processes (deploy/orchestrator-proxy@.service). The
+#                        orchestrator pushes the route table to each over its UDS and
+#                        the workers own the data-plane port (SO_REUSEPORT); a data
+#                        request hitting the orchestrator is forwarded to a worker.
+#   off                — reject data-plane traffic on this node.
+# data_plane_auth: the proxy validates X-Access-Token (= envdAccessToken) against the
+# sandbox. enforce (default) rejects mismatches (401); log forwards but warns; off
+# disables it. park_timeout bounds how long a proxy holds a request while a route
+# syncs / a paused sandbox auto-resumes. metrics_listen serves Prometheus text.
+proxy_mode: internal
+# proxy_sockets: [ /run/sandbox/proxy-1.sock, /run/sandbox/proxy-2.sock ]   # external only
+# data_listen: ""                                    # dedicated data-plane addr; "" = share `listen`
+data_plane_auth: enforce
+park_timeout: 30s
+# metrics_listen: 127.0.0.1:9095                     # "" = metrics off
+
+# Secrets-at-rest. Per-tenant manifest keys are stored AES-256-GCM-encrypted under
+# encryption_key: ":"-separated 64-hex keys, first = active (new writes), rest =
+# standby (decrypt during rotation). Prefer the ORCHESTRATOR_ENCRYPTION_KEY env
+# (overrides this). Generate one: `openssl rand -hex 32`.
+encryption_key: "0000000000000000000000000000000000000000000000000000000000000000"
+# Which manifest keys may create sandboxes / build is the manifest_keys table —
+# managed out of band via `orchestrator-ctl manifest-key add|remove|check|list`.
+# e2b API keys are derived from a manifest key with `e2b-key-ctl gen-apikey`.
+
+# Paths
+run_root: /run/sandbox
+base_root: /var/lib/sandbox
+manifest_config: /opt/sandbox/manifest.yaml          # shared; manifest.key left empty (key via config-socket)
+runtime_e2b_erofs: /opt/sandbox/runtime/v1/sandbox-runtime-e2b.erofs
+runtime_erofs: /opt/sandbox/runtime/v1/sandbox-runtime.erofs
+kernel: /opt/sandbox/kernel/6.1/vmlinux
+config_socket: /run/sandbox/orchestrator.socket          # run-task fetches per-task LaunchSpecs here
+resource_socket: /run/sandbox-resource.sock          # sentinel UDS (sandbox-ctl dials it; "" = static cgroup)
+
+# Networking (vswitch)
+switch: sw0
+inner_cidr: 10.42.0.0/16
+
+# Sandbox spec defaults (e2b templates carry no size)
+default_vcpu: 2
+default_memory: 2GiB
+default_timeout_sec: 300
+
+# Systemd units (optional; defaults shown). orchestrator-ctl generates and installs
+# the runner + builder template units and their slices at startup, then daemon-reloads.
+# exec_dir (where sandbox-ctl / orchestrator-ctl live) defaults to the orchestrator
+# binary's own directory; set install_units: false to manage units out of band.
+# unit_dir: /etc/systemd/system
+# runner_unit: sandbox-runner@.service
+# builder_unit: sandbox-builder@.service
+# exec_dir: /opt/sandbox/bin
+# install_units: true
