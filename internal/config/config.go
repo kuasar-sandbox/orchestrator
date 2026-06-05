@@ -61,7 +61,7 @@ type Config struct {
 	// (boot.root.overlay.diff_template). Deployment-provided; e.g.
 	// /opt/sandbox/overlay-templates/basic-1G.ext4. Required for img templates.
 	OverlayDiffTemplate string `yaml:"overlay_diff_template"`
-	ConfigSocket        string `yaml:"config_socket"` // default /run/orchestrator-ctl.socket
+	ConfigSocket        string `yaml:"config_socket"` // default /run/sandbox/orchestrator.socket
 	DBPath              string `yaml:"db_path"`       // default <base_root>/orchestrator.db
 	// Networking (vswitch).
 	Switch    string `yaml:"switch"`     // vswitch name, e.g. "sw0"

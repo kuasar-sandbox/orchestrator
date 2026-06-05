@@ -4,7 +4,7 @@
 # e2b guest runtime:
 #   - sandbox-runtime-e2b   a base sandbox-runtime.erofs with envd injected at
 #                           /opt/sandbox-runtime/bin/envd (auto-bind-mounted into
-#                           the guest), via `orchestrator-ctl build-runtime`.
+#                           the guest), via `make sandbox-runtime-e2b`.
 # envd itself is a native dependency built by sandbox-deps (`make -C sandbox-deps
 # envd`), like cloud-hypervisor / mkfs.erofs.
 
