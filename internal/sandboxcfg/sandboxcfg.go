@@ -115,16 +115,22 @@ func restartPolicy(pr types.Profile) string {
 }
 
 // RestoreRef is the snapshot ref sandbox-ctl should restore from, or "" for a
-// cold boot. snp templates restore the build snapshot; a resumed sandbox restores
-// the latest pause snapshot.
+// cold boot. A resumed sandbox — regardless of its template kind — restores from
+// its latest pause snapshot; otherwise a snp template cold-starts by restoring its
+// build snapshot, and an img template cold-boots.
 func (p Params) RestoreRef() string {
-	if p.Template.Kind != types.KindSnp {
-		return ""
-	}
-	if p.Sandbox.SnapshotRef != "" { // resume from the latest pause snapshot
+	// Resume: a paused sandbox (img OR snp) has a pause snapshot to restore. This
+	// MUST be checked before the kind, else a paused img sandbox cold-boots and
+	// loses all guest state written since boot.
+	if p.Sandbox.SnapshotRef != "" {
 		return "manifest://" + p.Sandbox.SnapshotRef
 	}
-	return p.Template.ManifestRef()
+	// snp template cold-start = restore the build snapshot.
+	if p.Template.Kind == types.KindSnp {
+		return p.Template.ManifestRef()
+	}
+	// img template cold boot.
+	return ""
 }
 
 // ConnectSpecs are the UDS<->guest forwards sandbox-ctl should open. e2b exposes
