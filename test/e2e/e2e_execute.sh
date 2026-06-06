@@ -121,7 +121,7 @@ COPY niceshim /usr/bin/ionice
 COPY niceshim /usr/bin/nice
 RUN chmod +x /usr/bin/ionice /usr/bin/nice && (adduser -D -h /home/user user || useradd -m -d /home/user user)
 EOF
-docker build -t "$REF" -f "$WORK/Dockerfile.e2e" "$WORK" >"$WORK/imgbuild.log" 2>&1 || { cat "$WORK/imgbuild.log"; fail "docker build (e2b-compliant image)"; }
+docker build --network=none -t "$REF" -f "$WORK/Dockerfile.e2e" "$WORK" >"$WORK/imgbuild.log" 2>&1 || { cat "$WORK/imgbuild.log"; fail "docker build (e2b-compliant image)"; }
 TAGS+=("$REF")
 docker push "$REF" >"$WORK/push.log" 2>&1 || { cat "$WORK/push.log"; fail "docker push"; }
 echo "==> store-ctl + zot up; built+seeded $REF (user + ionice/nice shims)"
@@ -274,7 +274,15 @@ grep -q "$MARK" "$WORK/exec.out" || fail "guest command output missing $MARK (en
 grep -q 'EXIT_CODE 0' "$WORK/exec.out" || fail "guest command exit code != 0"
 echo "==> PASS: command executed in guest (saw $MARK, exit 0)"
 
-# ---- pause (snapshot+upload) -> resume -> re-exec --------------------------
+# ---- pause (snapshot+upload) -> resume -> verify state survived ------------
+# Write a marker file in the guest BEFORE pausing; after resume it must still be
+# there — proving both the snapshot/restore overlay AND that a resumed img sandbox
+# restores (not cold-boots). /home/user is user-owned (flatten preserves ownership).
+PERSIST="PERSIST_$MARK"
+python3 "$WORK/envd_exec.py" "$ENVD_SOCK" "$ENVD_TOKEN" "echo $PERSIST > /home/user/persist.txt; cat /home/user/persist.txt" > "$WORK/wr.out" 2>&1 || true
+grep -q "$PERSIST" "$WORK/wr.out" || { sed 's/^/  guest| /' "$WORK/wr.out"; fail "could not write /home/user/persist.txt as the guest user (ownership not preserved?)"; }
+echo "==> wrote /home/user/persist.txt in the guest (as user)"
+
 echo "==> pause (snapshot+upload) $SID"
 code=$(req POST "/sandboxes/$SID/pause" "$AK")
 if [ "$code" = "204" ]; then
@@ -283,10 +291,10 @@ if [ "$code" = "204" ]; then
     code=$(req POST "/sandboxes/$SID/connect" "$AK" '{"timeout":120}')
     [ "$code" = "200" ] || { cat "$WORK/resp.body"; fail "resume(connect)=$code (want 200)"; }
     for _ in $(seq 1 40); do [ -S "$ENVD_SOCK" ] && break; sleep 0.3; done
-    python3 "$WORK/envd_exec.py" "$ENVD_SOCK" "$ENVD_TOKEN" "echo RESUMED_$MARK; cat /etc/hostname" > "$WORK/exec2.out" 2>&1 || true
+    python3 "$WORK/envd_exec.py" "$ENVD_SOCK" "$ENVD_TOKEN" "cat /home/user/persist.txt" > "$WORK/exec2.out" 2>&1 || true
     sed 's/^/  guest2| /' "$WORK/exec2.out"
-    grep -q "RESUMED_$MARK" "$WORK/exec2.out" || fail "exec-after-resume failed (restored VM not responding)"
-    echo "==> PASS: resumed VM executed a command (full pause/resume lifecycle)"
+    grep -q "$PERSIST" "$WORK/exec2.out" || fail "pre-pause state LOST after resume (restore regressed to cold boot?)"
+    echo "==> PASS: pre-pause guest state survived resume (snapshot/restore + img-resume restore)"
 else
     echo "==> NOTE: pause=$code — snapshot error (diagnostic):"
     grep -iE 'snapshot|pause|api error' "$WORK/orch.log" | tail -10 | sed 's/^/  orch| /'
