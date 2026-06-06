@@ -10,6 +10,10 @@
 核心能力：亚秒级冷启动与快照恢复、跨镜像/快照去重的存储加速、单节点数千沙箱的资源管控，
 并以单机 **e2b 兼容**的沙箱编排/ingress（未改造的 e2b SDK 可直连本机）对外提供北向入口。
 
+> **快速体验（e2b demo）**：`make demo`（发布包内：`bash test/demo/demo_e2b.sh`）——用**未改造的
+> e2b CLI** 在本机走通「构建模板 → 启真实 microVM → guest 内执行 → 暂停/恢复 → 销毁」全链路；
+> `DEMO_PAUSE=1` 逐步暂停、可另开终端用 e2b CLI 手动操作。前置工具与说明见 [`test/demo/DEMO.md`](test/demo/DEMO.md)。
+
 ## 子项目
 
 | 仓 | 角色 | 导出面 / 产物 |

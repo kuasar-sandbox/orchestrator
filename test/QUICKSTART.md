@@ -20,8 +20,9 @@
 │                              config.example.yaml / orchestrator-ctl.service）
 └── test/
     ├── QUICKSTART.md          本文件
-    ├── e2e/                   20 个跨仓 e2e 脚本（一键跑，零环境变量）
-    └── perf/                  7 个性能/分析脚本
+    ├── e2e/                   24 个跨仓 e2e 脚本（一键跑，零环境变量）
+    ├── perf/                  7 个性能/分析脚本
+    └── demo/                  e2b 端到端演示（demo_e2b.sh + DEMO.md，最直观的"试一下"）
 ```
 
 `bin/` 的绝对路径会被所有 `e2e/*.sh`、`perf/*.sh` 通过相对路径
@@ -54,7 +55,7 @@ bash test/e2e/e2e_sandbox_cold.sh      # 冷启 python:3.12-slim 并验证退出
 for f in test/e2e/*.sh; do bash "$f" || break; done
 ```
 
-## 4. e2e 脚本清单（20 个）
+## 4. e2e 脚本清单（24 个）
 
 ### 沙箱生命周期
 
@@ -96,10 +97,23 @@ for f in test/e2e/*.sh; do bash "$f" || break; done
 
 ### 沙箱编排 / e2b
 
+**最直观：先跑 demo 看全链路** —— `bash test/demo/demo_e2b.sh`：用**未改造的 e2b CLI** 走通
+「构建模板 → 启真实 microVM → guest 内执行 → 暂停/恢复 → 销毁」；`DEMO_PAUSE=1` 可逐步暂停、
+另开终端用 e2b CLI 手动操作（脚本会打印凭据+CLI 配置）。详见 [`demo/DEMO.md`](demo/DEMO.md)。
+
+下表 e2e 为分项断言（回归用）：
+
 | 脚本 | 验证内容 |
 |---|---|
 | `e2e_orchestrator.sh` | orchestrator-ctl 单元自动安装 + e2b 控制面（`/health`、`X-API-KEY` 401）+ 构建 API |
 | `e2e_runtask.sh` | run-task 通用启动器 + `config`/`info` CLI（纯用户态，无 root/systemd/KVM）|
+| `e2e_build_real.sh` | 经原生 v3 API 真实展平构建（store+zot）→ ready 模板 |
+| `e2e_build_cli.sh` | **真实 e2b CLI** `template build` 端到端（client docker build+push → server flatten）|
+| `e2e_execute.sh` | 启真实 microVM（KVM）→ envd 内执行 → 暂停/恢复状态存活 → kill |
+| `e2e_orchestrator_proxy.sh` | external proxy（SO_REUSEPORT + routesync）+ 数据面 X-Access-Token + auto-resume |
+
+> **前置（比其他 e2e 重）**：demo 与 `e2e_build_*`/`e2e_execute`/`e2e_orchestrator_proxy` 另需
+> `e2b` CLI、`zot`、`docker`、`/dev/kvm`、`openssl`、`mkfs.ext4`；脚本会自检，缺失即 skip。
 
 ## 5. perf / 分析脚本清单（7 个）
 

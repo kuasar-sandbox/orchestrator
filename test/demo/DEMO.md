@@ -28,7 +28,9 @@
 ## 运行
 
 ```bash
-bash kuasar-sandbox/test/demo/demo_e2b.sh         # 以普通用户运行，脚本自动 sudo 重入
+make demo                                         # 开发树：build + 跑 demo（推荐）
+bash kuasar-sandbox/test/demo/demo_e2b.sh         # 或直接跑脚本（普通用户即可，自动 sudo 重入）
+# 发布包内：解包后于根目录 `bash test/demo/demo_e2b.sh`（BIN 自动解析到 ../bin）
 DEMO_PAUSE=1 bash …/test/demo/demo_e2b.sh         # 每步之间回车暂停（适合逐步讲解）
 DEMO_KEEP=1  bash …/test/demo/demo_e2b.sh         # 保留工作目录用于排查
 DOMAIN=my.demo E2E_IMAGE=python:3.12-slim bash …  # 自定义域名 / base 镜像
