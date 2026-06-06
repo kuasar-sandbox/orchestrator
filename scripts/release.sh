@@ -13,6 +13,8 @@
 #     test/e2e/            — cross-repo e2e scripts (all relocate-safe: each
 #                            uses ../../bin/ which lands on <release>/bin/)
 #     test/perf/           — perf + dedup helpers (same path convention)
+#     test/demo/           — the e2b end-to-end demo (demo_e2b.sh + DEMO.md):
+#                            the headline "try it" walkthrough, same path convention
 #
 # `make build` has already populated bin/$ARCH/ from scripts/artifacts.list
 # (single source of truth for binaries); this script just copies + tars.
@@ -70,7 +72,7 @@ DOCS=(
 # generates Go drivers via heredoc and runs them with `go run`, requiring a
 # checkout of sandbox-{sentinel,runtime} sources. Keep it in the source repo.
 E2ES=(
-  # umbrella (18)
+  # umbrella (22)
   "kuasar-sandbox/test/e2e/e2e_density.sh"
   "kuasar-sandbox/test/e2e/e2e_manifest.sh"
   "kuasar-sandbox/test/e2e/e2e_obs.sh"
@@ -89,6 +91,11 @@ E2ES=(
   "kuasar-sandbox/test/e2e/e2e_warmpool_dedup.sh"
   "kuasar-sandbox/test/e2e/e2e_orchestrator.sh"
   "kuasar-sandbox/test/e2e/e2e_runtask.sh"
+  # e2b build + execute (real e2b CLI / microVM; self-skip without their prereqs)
+  "kuasar-sandbox/test/e2e/e2e_build_real.sh"
+  "kuasar-sandbox/test/e2e/e2e_build_cli.sh"
+  "kuasar-sandbox/test/e2e/e2e_execute.sh"
+  "kuasar-sandbox/test/e2e/e2e_orchestrator_proxy.sh"
   # accelerator (2)
   "sandbox-accelerator/test/e2e/e2e_cache.sh"
   "sandbox-accelerator/test/e2e/e2e_cluster_rolling.sh"
@@ -116,6 +123,14 @@ DEPLOYS=(
   "sandbox-orchestrator/deploy/orchestrator-proxy@.service"
 )
 
+# The e2b end-to-end demo (script + guide) — the headline "try it" walkthrough.
+# Relocate-safe (demo_e2b.sh uses ../../bin). Heavier host prereqs than the e2e
+# (e2b CLI + zot + docker + /dev/kvm + openssl + mkfs.ext4); it checks + skips.
+DEMOS=(
+  "kuasar-sandbox/test/demo/demo_e2b.sh"
+  "kuasar-sandbox/test/demo/DEMO.md"
+)
+
 # ----------------------------------------------------------------------------
 # Pre-flight checks (fail early, list every missing input at once)
 # ----------------------------------------------------------------------------
@@ -125,9 +140,18 @@ missing=()
   || missing+=("$SRC_BIN (empty or absent — run \`make build\`)")
 [ -f "$UMBRELLA_DIR/README.md" ] || missing+=("$UMBRELLA_DIR/README.md")
 [ -f "$UMBRELLA_DIR/test/QUICKSTART.md" ] || missing+=("$UMBRELLA_DIR/test/QUICKSTART.md")
-for spec in "${DOCS[@]}" "${E2ES[@]}" "${PERFS[@]}" "${DEPLOYS[@]}"; do
+for spec in "${DOCS[@]}" "${E2ES[@]}" "${PERFS[@]}" "${DEPLOYS[@]}" "${DEMOS[@]}"; do
   src="${spec%%:*}"
   [ -f "$ORG/$src" ] || missing+=("$ORG/$src")
+done
+# Drift guard: every umbrella test/e2e/*.sh must be bundled (E2ES) or explicitly
+# excluded here — otherwise a newly-added e2e silently misses the release tarball.
+E2E_EXCLUDE=()   # add basenames intentionally kept out of the release, with a reason
+for f in "$UMBRELLA_DIR"/test/e2e/*.sh; do
+  b="$(basename "$f")"
+  printf '%s\n' "${E2ES[@]}" | grep -q "/$b\$" && continue
+  printf '%s\n' "${E2E_EXCLUDE[@]:-}" | grep -qx "$b" && continue
+  missing+=("test/e2e/$b — not in E2ES or E2E_EXCLUDE (release manifest drift)")
 done
 if [ "${#missing[@]}" -gt 0 ]; then
   echo "release.sh: missing inputs:" >&2
@@ -140,7 +164,7 @@ fi
 # ----------------------------------------------------------------------------
 
 rm -rf "$OUT"
-mkdir -p "$OUT/bin" "$OUT/docs" "$OUT/test/e2e" "$OUT/test/perf" "$OUT/deploy"
+mkdir -p "$OUT/bin" "$OUT/docs" "$OUT/test/e2e" "$OUT/test/perf" "$OUT/test/demo" "$OUT/deploy"
 
 cp -f "$SRC_BIN"/* "$OUT/bin/"
 cp -f "$UMBRELLA_DIR/README.md" "$OUT/README.md"
@@ -161,6 +185,7 @@ stage() {
 stage "$OUT/docs"      "${DOCS[@]}"
 stage "$OUT/test/e2e"  "${E2ES[@]}"
 stage "$OUT/test/perf" "${PERFS[@]}"
+stage "$OUT/test/demo" "${DEMOS[@]}"
 stage "$OUT/deploy"    "${DEPLOYS[@]}"
 
 # ----------------------------------------------------------------------------
@@ -176,4 +201,5 @@ echo "    docs/     ($(ls -1 "$OUT/docs" | wc -l) files)"
 ls -1 "$OUT/docs" | sed 's/^/                /'
 echo "    test/e2e/ ($(ls -1 "$OUT/test/e2e" | wc -l) scripts)"
 echo "    test/perf/ ($(ls -1 "$OUT/test/perf" | wc -l) scripts)"
+echo "    test/demo/ ($(ls -1 "$OUT/test/demo" | wc -l) files — e2b walkthrough)"
 echo "    deploy/   ($(ls -1 "$OUT/deploy" | wc -l) files)"
