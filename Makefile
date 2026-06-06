@@ -43,7 +43,8 @@ GO_REPOS       := sandbox-accelerator sandbox-builder sandbox-runtime sandbox-se
 UMBRELLA_E2E := \
   test-e2e-manifest test-e2e-obs test-e2e-warmpool-dedup test-e2e-density \
   test-e2e-sandbox-cold test-e2e-sandbox-cold-manifest test-e2e-sandbox-cold-target \
-  test-e2e-sandbox-diff-template test-e2e-sandbox-launchspec test-e2e-sandbox-proto \
+  test-e2e-sandbox-diff-template test-e2e-sandbox-launchspec test-e2e-sandbox-local-merge \
+  test-e2e-sandbox-proto \
   test-e2e-sandbox-restore test-e2e-sandbox-restore-files test-e2e-sandbox-snapshot \
   test-e2e-sandbox-stdio test-e2e-sandbox-tapfd test-e2e-sandbox-upload-restore \
   test-e2e-orchestrator test-e2e-runtask \
