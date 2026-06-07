@@ -116,7 +116,7 @@ func (o *Orchestrator) launch(ctx context.Context, sb *types.Sandbox, tmpl types
 			return fmt.Errorf("orch: mkdir %s: %w", d, err)
 		}
 	}
-	plainIP, cidrIP, err := o.allocInnerIP(ctx)
+	plainIP, cidrIP, err := o.allocInnerIP()
 	if err != nil {
 		return err
 	}
@@ -332,6 +332,7 @@ func (o *Orchestrator) sandboxParams(sb *types.Sandbox, tmpl types.TemplateID) s
 		OverlayDiffTpl: o.cfg.OverlayDiffTemplate,
 		TapFDExec:      o.vs.TapFDExec(sb.VswitchPort), EnvVars: sb.Env,
 		VCPU: o.cfg.DefaultVCPU, Memory: o.cfg.DefaultMemory, ControllerSocket: o.cfg.ResourceSocket,
+		Nexthop: o.innerGateway(),
 	}
 }
 
@@ -542,45 +543,35 @@ func (o *Orchestrator) envdInit(ctx context.Context, sb *types.Sandbox) error {
 	return nil
 }
 
-// allocInnerIP picks the next free guest inner IP in cfg.InnerCIDR (skipping the
-// network address and .1). Returns the plain IP (for vswitch attach) and the
-// CIDR form (for Network.IP).
-func (o *Orchestrator) allocInnerIP(ctx context.Context) (plain, cidr string, err error) {
+// allocInnerIP returns the guest's point-to-point inner IP and its CIDR. Every
+// sandbox shares the same link-local /31 (cfg.InnerCIDR, default 169.254.1.0/31):
+// the guest takes the upper address (.1), the vswitch the lower (.0 — the
+// default-route gateway, see innerGateway). Per-sandbox uniqueness comes from the
+// floating IP / slot, not the inner IP, so the /31 is reused for every sandbox
+// (the eBPF datapath keys on slot/ifindex and attach accepts a shared inner IP).
+func (o *Orchestrator) allocInnerIP() (plain, cidr string, err error) {
 	_, ipnet, err := net.ParseCIDR(o.cfg.InnerCIDR)
 	if err != nil {
 		return "", "", fmt.Errorf("orch: inner_cidr %q: %w", o.cfg.InnerCIDR, err)
 	}
-	used := map[string]bool{}
-	for _, st := range []types.State{types.StateRunning, types.StatePaused} {
-		list, _ := o.st.ListByState(ctx, st)
-		for _, sb := range list {
-			if sb.InnerIP == "" {
-				continue
-			}
-			if ip, _, e := net.ParseCIDR(sb.InnerIP); e == nil {
-				used[ip.String()] = true
-			}
-		}
+	ones, bits := ipnet.Mask.Size()
+	if bits-ones < 1 {
+		return "", "", fmt.Errorf("orch: inner_cidr %s too small (need /31 or wider)", o.cfg.InnerCIDR)
 	}
-	ones, _ := ipnet.Mask.Size()
-	ip := make(net.IP, len(ipnet.IP))
-	copy(ip, ipnet.IP)
-	incIP(ip)
-	incIP(ip) // skip network + .1 (gateway)
-	for ipnet.Contains(ip) {
-		if !used[ip.String()] {
-			return ip.String(), fmt.Sprintf("%s/%d", ip.String(), ones), nil
-		}
-		incIP(ip)
-	}
-	return "", "", fmt.Errorf("orch: inner_cidr %s exhausted", o.cfg.InnerCIDR)
+	guest := make(net.IP, len(ipnet.IP))
+	copy(guest, ipnet.IP)
+	guest[len(guest)-1] |= 1 // upper address of the /31 (lower is the gateway)
+	return guest.String(), fmt.Sprintf("%s/%d", guest.String(), ones), nil
 }
 
-func incIP(ip net.IP) {
-	for j := len(ip) - 1; j >= 0; j-- {
-		ip[j]++
-		if ip[j] != 0 {
-			break
-		}
+// innerGateway returns the guest's default-route next-hop: the lower address of the
+// inner /31 (cfg.InnerCIDR's network address, e.g. 169.254.1.0). The vswitch
+// ARP-proxies it, so the guest reaches everything off its /31 through it (the
+// proxy/floatingip reply path + egress via host NAT). "" if InnerCIDR is invalid.
+func (o *Orchestrator) innerGateway() string {
+	_, ipnet, err := net.ParseCIDR(o.cfg.InnerCIDR)
+	if err != nil {
+		return ""
 	}
+	return ipnet.IP.String() // lower address of the /31 = the gateway
 }

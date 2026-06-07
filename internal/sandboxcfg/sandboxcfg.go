@@ -26,6 +26,7 @@ type Params struct {
 	VCPU             int               // resources.capacity.cpu
 	Memory           string            // resources.capacity.memory, e.g. "2GiB"
 	ControllerSocket string            // resources.control.controller (sentinel UDS; "" = static cgroup)
+	Nexthop          string            // network.nexthop: default-route gateway (inner-CIDR .1); "" = no default route
 }
 
 // WriteYAML renders the SANDBOX_CONFIG and writes it to path (0600). The
@@ -44,12 +45,20 @@ func (p Params) BuildYAML() ([]byte, error) {
 	runtime := p.RuntimeBase
 	var launchExec string // bare: empty -> sandbox-init runs the flattened image's entrypoint
 	var launchArgs []string
+	var launchUser string // bare: empty -> sandbox-init falls back to image config User else root
 	if p.Template.Profile == types.ProfileE2B {
 		runtime = p.RuntimeE2B
 		// envd is injected at /opt/sandbox-runtime/bin/envd, which sandbox-init
 		// auto-bind-mounts into the guest at the same path (see build.Runtime).
 		launchExec = "/opt/sandbox-runtime/bin/envd"
 		launchArgs = []string{"-isnotfc", "-port", "49983"}
+		// envd is e2b infrastructure: it must run as root so it can setuid into
+		// the image's user when running workload commands. Without this, an image
+		// that sets Config.User (e.g. e2bdev/code-interpreter = user/1000) would
+		// launch envd non-root -> it lacks CAP_SETGID/SETUID -> every exec fails
+		// with EPERM ("fork/exec /bin/sh: operation not permitted"). The workload
+		// still runs as the image's user: the exec request carries the target user.
+		launchUser = "0:0"
 	}
 
 	// No cgroup_path here: the sandbox adopts its systemd unit's own cgroup via
@@ -84,6 +93,24 @@ func (p Params) BuildYAML() ([]byte, error) {
 	}
 	if p.Sandbox.InnerIP != "" {
 		network["ip"] = p.Sandbox.InnerIP // CIDR form
+		if p.Nexthop != "" {
+			// Default route via the inner-CIDR gateway (the reserved .1). The vswitch
+			// ARP-proxies it and extracts all off-subnet traffic, so this is what lets
+			// the guest reply to off-subnet sources (proxy/mgmt floatingip path) and
+			// egress to the internet (host NAT). Without it the guest can only reach
+			// its own /16 and every host->floatingip:port connection times out.
+			network["nexthop"] = p.Nexthop
+		}
+	}
+
+	launch := map[string]any{
+		"exec":    launchExec,
+		"args":    launchArgs,
+		"env":     p.EnvVars,
+		"restart": restartPolicy(p.Template.Profile),
+	}
+	if launchUser != "" {
+		launch["user"] = launchUser
 	}
 
 	doc := map[string]any{
@@ -98,12 +125,7 @@ func (p Params) BuildYAML() ([]byte, error) {
 			"runtime": "file://" + runtime,
 			"root":    root,
 		},
-		"launch": map[string]any{
-			"exec":    launchExec,
-			"args":    launchArgs,
-			"env":     p.EnvVars,
-			"restart": restartPolicy(p.Template.Profile),
-		},
+		"launch": launch,
 	}
 	return yaml.Marshal(doc)
 }

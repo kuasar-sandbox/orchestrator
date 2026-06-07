@@ -65,7 +65,7 @@ type Config struct {
 	DBPath              string `yaml:"db_path"`       // default <base_root>/orchestrator.db
 	// Networking (vswitch).
 	Switch    string `yaml:"switch"`     // vswitch name, e.g. "sw0"
-	InnerCIDR string `yaml:"inner_cidr"` // guest inner-IP pool, e.g. "10.42.0.0/16"
+	InnerCIDR string `yaml:"inner_cidr"` // guest inner-IP point-to-point /31, e.g. "169.254.1.0/31" (guest=.1, gateway=.0)
 	// Sandbox spec (e2b templates have no size; use node defaults).
 	DefaultVCPU   int    `yaml:"default_vcpu"`   // default 2
 	DefaultMemory string `yaml:"default_memory"` // default "2GiB"
@@ -147,7 +147,7 @@ func (c *Config) applyDefaults() {
 		c.DefaultTimeoutSec = 300
 	}
 	def(&c.Switch, "sw0")
-	def(&c.InnerCIDR, "10.42.0.0/16")
+	def(&c.InnerCIDR, "169.254.1.0/31")
 	// ResourceSocket is intentionally NOT defaulted: empty = static cgroup mode
 	// (the sandbox adopts its systemd unit's own cgroup via --cgroup-adopt). The
 	// sandbox-sentinel resource controller is opt-in; set resource_socket to enable.
