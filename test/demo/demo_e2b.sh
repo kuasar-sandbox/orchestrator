@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 #
 # demo_e2b.sh — end-to-end demonstration of the e2b-compatible sandbox host,
-# driven ENTIRELY by the unmodified e2b CLI (no SDK, no curl): build a template,
-# spawn a real microVM sandbox, run commands in it, pause/resume it (proving guest
-# state survives the snapshot round-trip), then kill it.
+# driven by the unmodified e2b CLI over the REAL e2b base image
+# (e2bdev/code-interpreter): build a template, spawn a real microVM, run commands,
+# expose a port + reach the network, pause/resume (state survives), then kill.
 #
-#   e2b template build         → flatten the client-built image into a template
+#   e2b template build         → flatten the real e2b image into a template
 #   e2b sandbox create -d      → boot a real cloud-hypervisor microVM
 #   e2b sandbox exec  … -- CMD  → run a command in the guest (through the proxy)
+#   port forward + egress       → host→guest via floatingip (sw0m0) + guest→internet (NAT)
 #   e2b sandbox pause / resume  → snapshot to the store / restore
 #   e2b sandbox list / kill     → lifecycle
 #
@@ -16,9 +17,13 @@
 # resolve locally with /etc/hosts + a self-signed *.<domain> TLS cert on :443, and
 # point the CLI with E2B_DOMAIN / E2B_API_KEY. Nothing about the CLI is modified.
 #
-# Requires: e2b CLI, systemd+root, /dev/kvm, docker, zot, store-ctl, mkfs.erofs,
-# openssl, the built kernel+runtime erofs in bin, and TCP :443 free. Run as a
-# normal user; it re-execs under sudo. Set DEMO_PAUSE=1 to step through manually.
+# Networking: vswitch is started with --mgmt-extract so the host gets a sw0m0 NIC
+# that reaches sandbox floatingips, plus host NAT (MASQUERADE) so sandboxes egress.
+#
+# Requires: e2b CLI, systemd+root, /dev/kvm, docker (with e2bdev/code-interpreter
+# cached), zot, store-ctl, mkfs.erofs, openssl, iptables, curl, sqlite3, the built
+# kernel+runtime erofs in bin, TCP :443 free. Run as a normal user; it re-execs
+# under sudo. Set DEMO_PAUSE=1 to step through (and drive the CLI from another term).
 
 set -euo pipefail
 
@@ -26,8 +31,9 @@ REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 BIN="${BIN:-$REPO_ROOT/bin}"
 DOMAIN="${DOMAIN:-sandboxes.demo.local}"
 TLS_PORT="${TLS_PORT:-443}"               # the CLI uses the implicit :443 for api/sandbox hosts
-E2E_IMAGE="${E2E_IMAGE:-test-app-a:latest}"
+E2E_IMAGE="${E2E_IMAGE:-e2bdev/code-interpreter:latest}"   # the real e2b base (cached locally)
 SWITCH="${SWITCH:-sw0}"; SW_NETNS="${SW_NETNS:-demo_sw}"
+SW_MGMT="${SW_MGMT:-sw0m0}"; FIP_CIDR="${FIP_CIDR:-100.100.96.0/20}"  # mgmt NIC + floating-IP range
 ZOT_BIN="${ZOT_BIN:-$(command -v zot || true)}"
 E2B_BIN="${E2B_BIN:-$(command -v e2b || true)}"
 
@@ -48,7 +54,7 @@ for b in orchestrator-ctl store-ctl flatten-ctl e2b-key-ctl vswitch-ctl cloud-hy
 [ -f "$BIN/vmlinux" ] && [ -f "$BIN/sandbox-runtime-e2b.erofs" ] || die "missing kernel/runtime erofs in $BIN"
 [ -n "$E2B_BIN" ] && [ -x "$E2B_BIN" ] || die "e2b CLI not on PATH"
 [ -n "$ZOT_BIN" ] && [ -x "$ZOT_BIN" ] || die "zot not on PATH"
-for t in docker openssl python3 ip; do command -v $t >/dev/null 2>&1 || die "$t not on PATH"; done
+for t in docker openssl python3 ip curl sqlite3 iptables; do command -v $t >/dev/null 2>&1 || die "$t not on PATH"; done
 command -v mkfs.erofs >/dev/null 2>&1 || [ -x "$BIN/mkfs.erofs" ] || die "mkfs.erofs not found"
 [ -d /run/systemd/system ] || die "systemd is not PID1"
 [ -e /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ] || die "/dev/kvm not available (rw)"
@@ -70,11 +76,17 @@ UNIT_DIR=/run/systemd/system
 UNITS=(sandbox-runner@.service sandbox-builder@.service sandbox-runner.slice sandbox-builder.slice)
 declare -a OURS=(); for u in "${UNITS[@]}"; do [ -e "$UNIT_DIR/$u" ] && die "$UNIT_DIR/$u exists; refusing to clobber"; OURS+=("$UNIT_DIR/$u"); done
 mkdir -p "$WORK/run" "$WORK/lib" "$WORK/store" "$WORK/zot/data" "$WORK/home"
-declare -a PIDS=() TAGS=()
+declare -a PIDS=() TAGS=() NAT_ADDED=()
 cleanup() {
     set +e; echo; echo "${c_dim}── teardown ──${c_off}"
     systemctl stop 'sandbox-runner@*.service' 'sandbox-builder@*.service' 2>/dev/null
     for p in "${PIDS[@]:-}"; do [ -n "$p" ] && kill "$p" 2>/dev/null; done
+    # remove ONLY the NAT rules we added (not pre-existing ones)
+    for r in "${NAT_ADDED[@]:-}"; do case "$r" in
+        r1) iptables -D FORWARD -o "$SW_MGMT" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null;;
+        r2) iptables -D FORWARD -i "$SW_MGMT" -j ACCEPT 2>/dev/null;;
+        r3) iptables -t nat -D POSTROUTING -s "$FIP_CIDR" -j MASQUERADE 2>/dev/null;;
+    esac; done
     "$BIN/vswitch-ctl" stop "$SWITCH" --force >/dev/null 2>&1
     ip netns del "$SW_NETNS" 2>/dev/null
     for u in "${OURS[@]:-}"; do [ -n "$u" ] && rm -f "$u"; done; systemctl daemon-reload 2>/dev/null
@@ -182,10 +194,22 @@ EOF
 # the switch (eBPF/TC) — created once, lives in the kernel
 "$BIN/vswitch-ctl" stop "$SWITCH" --force >/dev/null 2>&1 || true; ip netns del "$SW_NETNS" 2>/dev/null || true
 ip netns add "$SW_NETNS" 2>/dev/null || true
-say "vswitch-ctl start — eBPF/TC virtual switch for the sandbox data plane"
+say "vswitch-ctl start — eBPF/TC switch; --mgmt-extract adds host NIC $SW_MGMT (169.254.169.254) to reach sandbox floatingips"
 "$BIN/vswitch-ctl" start "$SWITCH" --netns="$SW_NETNS" --ports=64 --mac-addr=02:00:00:00:00:01 \
-    --floating-ip-base=100.100.96.0 --mode=tap >"$WORK/vswitch.log" 2>&1 || { cat "$WORK/vswitch.log"; die "vswitch start"; }
-ok "switch $SWITCH up"
+    --floating-ip-base=100.100.96.0 --mode=tap \
+    --mgmt-extract=:$SW_MGMT:169.254.169.254,0.0.0.0/0 >"$WORK/vswitch.log" 2>&1 || { cat "$WORK/vswitch.log"; die "vswitch start"; }
+ok "switch $SWITCH up (host mgmt NIC $SW_MGMT)"
+
+# Host NAT so sandboxes egress (internet) / inter-talk. Add idempotently and track
+# what we added so teardown removes only those (not pre-existing rules).
+say "host NAT (MASQUERADE $FIP_CIDR) so sandboxes reach the network via $SW_MGMT"
+iptables -C FORWARD -o "$SW_MGMT" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null \
+  || { iptables -A FORWARD -o "$SW_MGMT" -m state --state RELATED,ESTABLISHED -j ACCEPT && NAT_ADDED+=(r1); }
+iptables -C FORWARD -i "$SW_MGMT" -j ACCEPT 2>/dev/null \
+  || { iptables -A FORWARD -i "$SW_MGMT" -j ACCEPT && NAT_ADDED+=(r2); }
+iptables -t nat -C POSTROUTING -s "$FIP_CIDR" -j MASQUERADE 2>/dev/null \
+  || { iptables -t nat -A POSTROUTING -s "$FIP_CIDR" -j MASQUERADE && NAT_ADDED+=(r3); }
+ok "NAT ready (added: ${NAT_ADDED[*]:-none already present})"
 
 hosts_add "api.$DOMAIN"
 say "orchestrator-ctl serve — the e2b control plane + data-plane proxy (TLS :$TLS_PORT, Host-routed)"
@@ -216,42 +240,21 @@ pause
 # ===========================================================================
 banner "Build a template with the real 'e2b template build'"
 # ---------------------------------------------------------------------------
-# The base must live in a registry docker can pull (the CLI runs `docker build --pull`).
-# We make a minimal e2b-compliant image: a 'user' account + ionice/nice (envd wraps
-# guest commands as `ionice … nice … "$@"`, run as the default user).
-BASE_REF="127.0.0.1:$ZOT_PORT/base/app:v1"
-cat > "$WORK/niceshim" <<'SH'
-#!/bin/sh
-while [ $# -gt 0 ]; do case "$1" in -c|-n) shift 2;; -c*|-n*) shift;; --) shift; break;; *) break;; esac; done
-exec "$@"
-SH
-# the e2b CLI runs guest commands via /bin/bash -c "…"; alpine has none — shim to sh.
-# (a busybox symlink would fail: busybox dispatches on argv[0] and has no bash applet.)
-cat > "$WORK/bashshim" <<'SH'
-#!/bin/sh
-exec /bin/sh "$@"
-SH
-# Build the base with --network=none: build steps (RUN) run client-side without
-# needing docker's bridge (the eBPF switch tears docker0 down; this sidesteps it).
-cat > "$WORK/Dockerfile.base" <<EOF
-FROM $E2E_IMAGE
-COPY niceshim /usr/bin/ionice
-COPY niceshim /usr/bin/nice
-COPY bashshim /bin/bash
-RUN chmod +x /usr/bin/ionice /usr/bin/nice /bin/bash \\
- && (adduser -D -h /home/user user || useradd -m -d /home/user user) \\
- && echo "built-by-kuasar-demo (RUN step executed client-side)" > /etc/demo-stamp
-EOF
-say "the e2b base is itself a built image (a real RUN step adds the user, tools and a stamp):"
-sed 's/^/      /' "$WORK/Dockerfile.base"
-docker build --network=none -t "$BASE_REF" -f "$WORK/Dockerfile.base" "$WORK" >"$WORK/base.log" 2>&1 || { cat "$WORK/base.log"; die "seed base image"; }
-docker push "$BASE_REF" >>"$WORK/base.log" 2>&1 || { cat "$WORK/base.log"; die "push base"; }
-TAGS+=("$BASE_REF"); ok "base image built + pushed to zot: $BASE_REF"
+# The e2b CLI runs `docker build --pull`, so the FROM base must be pullable from a
+# registry. Seed the real e2b image into the local zot (just tag + push — it
+# already ships the e2b userland: user account, bash, ionice/nice, python, curl;
+# no shims). docker treats 127.0.0.1 as insecure, so the push needs no TLS.
+BASE_REF="127.0.0.1:$ZOT_PORT/e2b/base:v1"
+say "seed the real e2b image into zot (no build, no shims — it is already e2b-ready):"
+echo "${c_cmd}  \$ docker tag $E2E_IMAGE $BASE_REF && docker push $BASE_REF${c_off}"
+docker tag "$E2E_IMAGE" "$BASE_REF" && TAGS+=("$BASE_REF")
+docker push "$BASE_REF" >"$WORK/base.log" 2>&1 || { cat "$WORK/base.log"; die "push base to zot"; }
+ok "seeded $E2E_IMAGE → $BASE_REF"
 
 mkdir -p "$WORK/tmpl"; cat > "$WORK/tmpl/e2b.Dockerfile" <<EOF
 FROM $BASE_REF
 EOF
-say "template Dockerfile — 'e2b template build' will docker-build this, push it, and the node flattens the result into a microVM template:"
+say "template Dockerfile — 'e2b template build' docker-builds this, pushes it, and the node flattens the result into a microVM template:"
 sed 's/^/      /' "$WORK/tmpl/e2b.Dockerfile"
 echo "${c_cmd}  \$ e2b template build --name demo-app --dockerfile e2b.Dockerfile${c_off}"
 ( cd "$WORK/tmpl" && "$E2B_BIN" template build --name demo-app --dockerfile e2b.Dockerfile ) 2>&1 | sed 's/^/    /' | tee "$WORK/build.out"
@@ -280,14 +283,58 @@ banner "Run commands in the guest (e2b sandbox exec)"
 # ---------------------------------------------------------------------------
 # The e2b CLI runs the command through the guest's /bin/bash; pass a single string.
 # These run as the e2b default user 'user' (uid 1000) — the authentic default.
-show "who am I + kernel + a little arithmetic + the build stamp, in the guest (as the e2b default user)" \
-    "$E2B_BIN" sandbox exec "$SID" -- 'id; uname -sm; echo "2+2=$((2+2))"; cat /etc/demo-stamp'
+show "who am I + kernel + the real e2b image's python, in the guest (as default user 'user')" \
+    "$E2B_BIN" sandbox exec "$SID" -- 'id; uname -sm; python3 --version; grep ^PRETTY_NAME= /etc/os-release'
 echo
 # flatten preserves the image's ownership, so the e2b default user owns /home/user
 # and can write there (its default workdir) — no root needed.
 show "write a file in the guest home (proves the 'user' owns /home/user; survives pause/resume)" \
     "$E2B_BIN" sandbox exec "$SID" -- 'echo "hello from before the snapshot" > /home/user/state.txt; cat /home/user/state.txt'
 ok "command execution works end-to-end (CLI → proxy → envd → guest)"
+pause
+
+# ===========================================================================
+banner "网络：端口转发 (host→沙箱 floatingip) + 沙箱出网 (NAT)"
+# ---------------------------------------------------------------------------
+PFMARK="pf-ok-$RANDOM"
+say "在 guest 内起一个 HTTP 服务 (python3 -m http.server 8000, 后台), 服务 /home/user"
+echo "${c_cmd}  \$ e2b sandbox exec $SID -b -- 'cd /home/user && echo $PFMARK > pf.txt && python3 -m http.server 8000'${c_off}"
+"$E2B_BIN" sandbox exec "$SID" -b -- "cd /home/user && echo $PFMARK > pf.txt && python3 -m http.server 8000" >/dev/null 2>&1 || true
+sleep 2
+
+# (a) direct via the host mgmt NIC sw0m0 → the sandbox floatingip
+FIP="$(sqlite3 "$WORK/lib/orchestrator.db" "select floatingip from sandboxes where id='$SID'" 2>/dev/null)"
+INNER="$(sqlite3 "$WORK/lib/orchestrator.db" "select inner_ip from sandboxes where id='$SID'" 2>/dev/null)"
+say "沙箱 floatingip = ${FIP:-?}  inner = ${INNER:-?}  (host 经 $SW_MGMT 直达)"
+netdiag() {
+  echo "  ${c_cmd}--- NETDIAG host ---${c_off}"
+  ip -br addr show "$SW_MGMT"        2>&1 | sed 's/^/    sw0m0:    /'
+  ip route get "$FIP"                2>&1 | sed 's/^/    rt-get:   /'
+  ip route show 2>&1 | grep -E '100\.100|sw0m0' | sed 's/^/    rt:       /'
+  ip neigh show dev "$SW_MGMT"       2>&1 | sed 's/^/    neigh:    /'
+  echo "  ${c_cmd}--- NETDIAG guest (self-curl isolates server-up vs host-reach) ---${c_off}"
+  "$E2B_BIN" sandbox exec "$SID" -- 'echo "self-curl: $(curl -s --max-time 3 http://127.0.0.1:8000/pf.txt 2>&1)"; echo "route(/proc Iface Dest Gw …; default=Dest 00000000):"; cat /proc/net/route 2>/dev/null' \
+    2>&1 | grep -vE 'NODE_TLS|trace-warnings' | sed 's/^/    g: /' || true
+  echo "  ${c_cmd}--- vswitch.log tail ---${c_off}"; tail -12 "$WORK/vswitch.log" 2>/dev/null | sed 's/^/    vsw: /'
+}
+echo "${c_cmd}  \$ curl http://$FIP:8000/pf.txt${c_off}"
+out=""; for _ in $(seq 1 6); do out="$(curl -s --max-time 5 --noproxy '*' "http://$FIP:8000/pf.txt" 2>&1)" || true; [ "$out" = "$PFMARK" ] && break; sleep 1; done
+echo "    ${out:-<no response>}"
+if [ "$out" = "$PFMARK" ]; then ok "host→沙箱 floatingip:8000 直连成功 (经 $SW_MGMT)"
+else netdiag; [ -n "${DEMO_NETDIAG:-}" ] && say "直连 floatingip 失败 (NETDIAG 模式, 继续)" || die "直连 floatingip 失败: ${out:-<empty>}"; fi
+
+# (b) the e2b way: expose the port via the proxy <port>-<sid>.<domain>
+TOK="$(curl -sk --max-time 8 --noproxy '*' -H "X-API-KEY: $AK" "https://api.$DOMAIN/sandboxes/$SID" 2>/dev/null | grep -o '"envdAccessToken":"[^"]*"' | cut -d'"' -f4)"
+hosts_add "8000-$SID.$DOMAIN"
+echo "${c_cmd}  \$ curl -H 'X-Access-Token: …' https://8000-$SID.$DOMAIN/pf.txt${c_off}"
+out="$(curl -sk --max-time 8 --noproxy '*' -H "X-Access-Token: $TOK" "https://8000-$SID.$DOMAIN/pf.txt" 2>&1)" || true; echo "    ${out:-<no response>}"
+if [ "$out" = "$PFMARK" ]; then ok "e2b 暴露端口 https://8000-<sid>.<domain> (proxy→floatingip) 成功"
+else [ -n "${DEMO_NETDIAG:-}" ] && say "e2b 暴露端口失败 (NETDIAG 模式, 继续)" || die "e2b 暴露端口失败: ${out:-<empty>}"; fi
+
+# (c) sandbox egress via NAT MASQUERADE
+say "沙箱出网 (NAT MASQUERADE $FIP_CIDR): guest curl http://1.1.1.1"
+"$E2B_BIN" sandbox exec "$SID" -- 'curl -s -m10 -o /dev/null -w "egress HTTP %{http_code}\n" http://1.1.1.1' 2>&1 | grep -iE 'egress|HTTP' | sed 's/^/    /' | tee "$WORK/egress.out"
+grep -qE 'egress HTTP [23]' "$WORK/egress.out" && ok "沙箱出网成功 (NAT 生效)" || say "沙箱出网未成功 (host 无直连外网时正常; 非致命)"
 pause
 
 # ===========================================================================
