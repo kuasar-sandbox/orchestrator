@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -83,8 +84,8 @@ func (o *Orchestrator) Create(ctx context.Context, req api.CreateReq) (*types.Sa
 		ID:                 sid,
 		TemplateID:         req.TemplateID,
 		State:              types.StateRunning,
-		RunDir:             o.cfg.RunRoot + "/" + sid,
-		BaseDir:            o.cfg.BaseRoot + "/" + sid,
+		RunDir:             o.cfg.Paths.RunRoot + "/" + sid,
+		BaseDir:            o.cfg.Paths.BaseRoot + "/" + sid,
 		ManifestKey:        manifestKey,
 		EnvdAccessToken:    envdTok,
 		TrafficAccessToken: trafTok,
@@ -116,7 +117,7 @@ func (o *Orchestrator) launch(ctx context.Context, sb *types.Sandbox, tmpl types
 			return fmt.Errorf("orch: mkdir %s: %w", d, err)
 		}
 	}
-	plainIP, cidrIP, err := o.allocInnerIP()
+	plainIP, cidrIP, err := o.allocInnerIP(tmpl.Profile)
 	if err != nil {
 		return err
 	}
@@ -328,11 +329,13 @@ func (o *Orchestrator) sandboxConfigPath(sb *types.Sandbox) string {
 func (o *Orchestrator) sandboxParams(sb *types.Sandbox, tmpl types.TemplateID) sandboxcfg.Params {
 	return sandboxcfg.Params{
 		Sandbox: sb, Template: tmpl,
-		RuntimeE2B: o.cfg.RuntimeE2B, RuntimeBase: o.cfg.RuntimeBase, Kernel: o.cfg.Kernel,
-		OverlayDiffTpl: o.cfg.OverlayDiffTemplate,
+		RuntimeE2B: o.cfg.Sandbox.Boot.RuntimeE2B, RuntimeBase: o.cfg.Sandbox.Boot.RuntimeBase, Kernel: o.cfg.Sandbox.Boot.Kernel,
+		OverlayDiffTpl: o.cfg.Sandbox.Boot.OverlayDiffTemplate,
 		TapFDExec:      o.vs.TapFDExec(sb.VswitchPort), EnvVars: sb.Env,
-		VCPU: o.cfg.DefaultVCPU, Memory: o.cfg.DefaultMemory, ControllerSocket: o.cfg.ResourceSocket,
-		Nexthop: o.innerGateway(),
+		VCPU: o.cfg.Sandbox.Resources.VCPU, Memory: o.cfg.Sandbox.Resources.Memory, ControllerSocket: o.cfg.Sandbox.Resources.ControlSocket,
+		Nexthop:  o.innerGateway(tmpl.Profile),
+		Hostname: o.cfg.Sandbox.Network.Hostname,
+		DNS:      o.cfg.Sandbox.Network.DNS,
 	}
 }
 
@@ -369,14 +372,14 @@ func (o *Orchestrator) sandboxLaunchSpec(ctx context.Context, sid string) (*conf
 	}
 	p := o.sandboxParams(sb, tmpl)
 	// --run-root pins sandbox-ctl's socket/staging dir (ch.sock, ctl.sock, …) to the
-	// orchestrator's run root, so RunDir == cfg.RunRoot/<sid> and the snapshot client
-	// (also --run-root cfg.RunRoot) finds ctl.sock. Without it sandbox-ctl defaults to
+	// orchestrator's run root, so RunDir == cfg.Paths.RunRoot/<sid> and the snapshot client
+	// (also --run-root cfg.Paths.RunRoot) finds ctl.sock. Without it sandbox-ctl defaults to
 	// /run/sandbox, splitting the dirs (snapshot/pause then can't reach ctl.sock).
 	args := []string{
 		"run", "--sandbox-id", sb.ID,
 		"--config", o.sandboxConfigPath(sb),
-		"--manifest-config", o.cfg.ManifestCfg,
-		"--run-root", o.cfg.RunRoot,
+		"--manifest-config", o.cfg.ManifestConfig,
+		"--run-root", o.cfg.Paths.RunRoot,
 		"--cgroup-adopt",
 	}
 	if r := p.RestoreRef(); r != "" {
@@ -386,7 +389,7 @@ func (o *Orchestrator) sandboxLaunchSpec(ctx context.Context, sid string) (*conf
 		args = append(args, "--connect", c)
 	}
 	spec := &configsock.LaunchSpec{
-		Exec:    o.cfg.Bin(o.cfg.SandboxCtl),
+		Exec:    o.cfg.SandboxCtl(),
 		Args:    args,
 		Workdir: sb.RunDir,
 		Env:     map[string]string{"MANIFEST_KEY": sb.ManifestKey},
@@ -475,18 +478,63 @@ func (o *Orchestrator) teardown(ctx context.Context, sb *types.Sandbox) {
 
 // snapshot pauses+captures the running sandbox via sandbox-ctl and returns the
 // snapshot manifest key. The client dials <run-root>/<sid>/ctl.sock; the running
-// sandbox-ctl performs the manifest-store upload with its own boot-time config,
-// so the client only needs the resolved binary + the run root (not the default
-// /run/sandbox). stdout is the snapshot manifest key.
+// snapshot captures sb per the configured checkpoint mode and returns the restore
+// ref to persist: "manifest://<key>" (remote — portable) or a local bundle path
+// (local — node-bound; the default). sandbox-ctl performs the work with its own
+// boot-time manifest config; we pass the resolved binary + the run root.
 func (o *Orchestrator) snapshot(ctx context.Context, sb *types.Sandbox) (string, error) {
-	cmd := exec.CommandContext(ctx, o.cfg.Bin(o.cfg.SandboxCtl), "snapshot",
-		"--sandbox-id", sb.ID, "--upload", "--run-root", o.cfg.RunRoot)
+	if o.cfg.Checkpoint.Mode == config.CheckpointLocal {
+		return o.snapshotLocal(ctx, sb)
+	}
+	key, err := o.snapshotRemote(ctx, sb)
+	if err != nil {
+		return "", err
+	}
+	return "manifest://" + key, nil
+}
+
+// snapshotRemote uploads the snapshot to the manifest store; stdout is the bare
+// 64-hex manifest key. Used for remote checkpoints and (always) template builds.
+func (o *Orchestrator) snapshotRemote(ctx context.Context, sb *types.Sandbox) (string, error) {
+	cmd := exec.CommandContext(ctx, o.cfg.SandboxCtl(), "snapshot",
+		"--sandbox-id", sb.ID, "--upload", "--run-root", o.cfg.Paths.RunRoot)
 	var out, errb bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &errb
 	if err := cmd.Run(); err != nil {
 		return "", fmt.Errorf("orch: snapshot %s: %w: %s", sb.ID, err, errb.String())
 	}
 	return strings.TrimSpace(out.String()), nil
+}
+
+// snapshotLocal writes the snapshot bundle to checkpoint.local_dir/<sid>/ and
+// returns the bundle path (node-bound; restorable only on this node). The lower
+// chain (the base template) stays remote, carried by reference.
+func (o *Orchestrator) snapshotLocal(ctx context.Context, sb *types.Sandbox) (string, error) {
+	dir := filepath.Join(o.cfg.Checkpoint.LocalDir, sb.ID)
+	cmd := exec.CommandContext(ctx, o.cfg.SandboxCtl(), "snapshot",
+		"--sandbox-id", sb.ID, "--output", dir, "--run-root", o.cfg.Paths.RunRoot)
+	var errb bytes.Buffer
+	cmd.Stderr = &errb
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("orch: snapshot %s (local): %w: %s", sb.ID, err, errb.String())
+	}
+	return filepath.Join(dir, sb.ID+".snapshot"), nil
+}
+
+// promote uploads a LOCAL checkpoint bundle to the manifest store WITHOUT booting
+// (sandbox-ctl upload-snapshot), returning "manifest://<key>". The tenant key
+// rides in MANIFEST_KEY; the base lower chain must already be remote. Used by
+// export-sandbox to make a node-bound checkpoint portable.
+func (o *Orchestrator) promote(ctx context.Context, sb *types.Sandbox, localPath string) (string, error) {
+	cmd := exec.CommandContext(ctx, o.cfg.SandboxCtl(), "upload-snapshot",
+		localPath, "--manifest-config", o.cfg.ManifestConfig, "--quiet")
+	cmd.Env = append(os.Environ(), "MANIFEST_KEY="+sb.ManifestKey)
+	var out, errb bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &out, &errb
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("orch: promote %s: %w: %s", sb.ID, err, errb.String())
+	}
+	return strings.TrimSpace(out.String()), nil // manifest://<key>
 }
 
 // udsClient builds an HTTP client that dials a unix socket (the envd --connect UDS).
@@ -543,35 +591,31 @@ func (o *Orchestrator) envdInit(ctx context.Context, sb *types.Sandbox) error {
 	return nil
 }
 
-// allocInnerIP returns the guest's point-to-point inner IP and its CIDR. Every
-// sandbox shares the same link-local /31 (cfg.InnerCIDR, default 169.254.1.0/31):
-// the guest takes the upper address (.1), the vswitch the lower (.0 — the
-// default-route gateway, see innerGateway). Per-sandbox uniqueness comes from the
-// floating IP / slot, not the inner IP, so the /31 is reused for every sandbox
-// (the eBPF datapath keys on slot/ifindex and attach accepts a shared inner IP).
-func (o *Orchestrator) allocInnerIP() (plain, cidr string, err error) {
-	_, ipnet, err := net.ParseCIDR(o.cfg.InnerCIDR)
-	if err != nil {
-		return "", "", fmt.Errorf("orch: inner_cidr %q: %w", o.cfg.InnerCIDR, err)
+// profileNet returns the configured inner IP / gateway for a profile (e2b vs bare).
+func (o *Orchestrator) profileNet(p types.Profile) config.ProfileNet {
+	if p == types.ProfileBare {
+		return o.cfg.Sandbox.Network.Bare
 	}
-	ones, bits := ipnet.Mask.Size()
-	if bits-ones < 1 {
-		return "", "", fmt.Errorf("orch: inner_cidr %s too small (need /31 or wider)", o.cfg.InnerCIDR)
-	}
-	guest := make(net.IP, len(ipnet.IP))
-	copy(guest, ipnet.IP)
-	guest[len(guest)-1] |= 1 // upper address of the /31 (lower is the gateway)
-	return guest.String(), fmt.Sprintf("%s/%d", guest.String(), ones), nil
+	return o.cfg.Sandbox.Network.E2B
 }
 
-// innerGateway returns the guest's default-route next-hop: the lower address of the
-// inner /31 (cfg.InnerCIDR's network address, e.g. 169.254.1.0). The vswitch
-// ARP-proxies it, so the guest reaches everything off its /31 through it (the
-// proxy/floatingip reply path + egress via host NAT). "" if InnerCIDR is invalid.
-func (o *Orchestrator) innerGateway() string {
-	_, ipnet, err := net.ParseCIDR(o.cfg.InnerCIDR)
+// allocInnerIP returns the guest's inner IP (plain, for vswitch attach) and its CIDR
+// (for Network.IP) for the profile: e2b defaults to 169.254.0.21/30 (envd port-forward
+// needs the /30 + gateway), bare to 169.254.1.1/31. The inner IP is fixed per profile
+// — every sandbox reuses it; identity is the per-slot floating IP, and the eBPF
+// datapath keys on slot/ifindex (attach accepts a shared inner IP).
+func (o *Orchestrator) allocInnerIP(profile types.Profile) (plain, cidr string, err error) {
+	cidr = o.profileNet(profile).InnerIP
+	ip, _, err := net.ParseCIDR(cidr)
 	if err != nil {
-		return ""
+		return "", "", fmt.Errorf("orch: sandbox.network.%s.inner_ip %q: %w", profile, cidr, err)
 	}
-	return ipnet.IP.String() // lower address of the /31 = the gateway
+	return ip.String(), cidr, nil
+}
+
+// innerGateway returns the guest's default-route next-hop for the profile. The
+// vswitch ARP-proxies it, so the guest reaches everything off its subnet through it
+// (the proxy/floatingip reply path + egress via host NAT).
+func (o *Orchestrator) innerGateway(profile types.Profile) string {
+	return o.profileNet(profile).Nexthop
 }

@@ -51,50 +51,64 @@ func configCmd(args []string, _ *slog.Logger) error {
 // orchConfigSkeleton is the commented authoring template (see deploy/config.example.yaml).
 const orchConfigSkeleton = `# orchestrator-ctl config — orchestrator-ctl serve --config <this>.
 # The unmodified e2b SDK reaches this node via E2B_DOMAIN/E2B_API_KEY (dev:
-# E2B_API_URL/E2B_SANDBOX_URL http). Required: domain + encryption_key.
-domain: sandboxes.example.com
-listen: ":443"                                   # dev: ":3000" (plain http/h2c)
-tls_cert: /etc/orchestrator-ctl/tls/fullchain.pem
-tls_key: /etc/orchestrator-ctl/tls/privkey.pem
+# E2B_API_URL/E2B_SANDBOX_URL http). Required: api.domain + encryption_key.
+# Config is grouped by concern; external binaries (sandbox-ctl, vswitch-ctl,
+# flatten-ctl, …) are auto-discovered next to orchestrator-ctl then on PATH.
+api:
+  domain: sandboxes.example.com
+  listen: ":443"                                 # dev: ":3000" (plain http/h2c)
+  tls: { cert: /etc/orchestrator-ctl/tls/fullchain.pem, key: /etc/orchestrator-ctl/tls/privkey.pem }
+proxy:
+  mode: internal                                 # internal | external | off
+  auth: enforce                                  # off | log | enforce: validate X-Access-Token
+  # sockets: [/run/sandbox/proxy0.sock]          # external: routesync UDS the orchestrator dials
+  # data_listen: ":8443"                          # dedicated data-plane listener; "" = share api.listen
+  # park_timeout: 30s
+  # metrics_listen: ":9900"                       # optional Prometheus text endpoint
 # AES-256 keys for manifest keys at rest (":"-separated, first active). Prefer the
 # ORCHESTRATOR_ENCRYPTION_KEY env (overrides). Generate: e2b-key-ctl gen-key.
 encryption_key: "0000000000000000000000000000000000000000000000000000000000000000"
-# Allowlist (who may create/build) is the manifest_keys table: orchestrator-ctl
+# Shared remote manifest store (manifest.key empty; the tenant key arrives via env).
+manifest_config: /opt/sandbox/manifest.yaml
+# Allowlist (who may create/build/import) is the manifest_keys table: orchestrator-ctl
 # manifest-key add|remove|check|list. e2b API keys: e2b-key-ctl gen-apikey.
-# Paths
-run_root: /run/sandbox
-base_root: /var/lib/sandbox
-manifest_config: /opt/sandbox/manifest.yaml      # shared; manifest.key empty (key via env)
-runtime_e2b_erofs: /opt/sandbox/runtime/v1/sandbox-runtime-e2b.erofs
-runtime_erofs: /opt/sandbox/runtime/v1/sandbox-runtime.erofs
-kernel: /opt/sandbox/kernel/6.1/vmlinux
-# Pre-formatted empty ext4 seeding the cold-boot overlay upper (required for img
-# templates). Deployment-provided (mkfs.ext4 on a sparse file).
-overlay_diff_template: /opt/sandbox/overlay-templates/basic-1G.ext4
-config_socket: /run/sandbox/orchestrator.socket  # run-task fetches LaunchSpecs here
-# resource_socket: /run/sandbox-resource.sock    # sandbox-sentinel UDS (opt-in); omit = static cgroup
-# Networking (vswitch)
-switch: sw0
-inner_cidr: 10.42.0.0/16
-# Sandbox spec defaults (e2b templates carry no size)
-default_vcpu: 2
-default_memory: 2GiB
-default_timeout_sec: 300
-# Builder resource pool
-builder_max_concurrent: 2
-# builder_cpu_quota: "200%"                      # -> sandbox-builder.slice CPUQuota
-# builder_memory_max: "8G"                       # -> sandbox-builder.slice MemoryMax
-# Builder registry: where the e2b CLI pushes its client-built image (must match the
-# CLI's E2B_IMAGE_URI_MASK; {templateID}/{buildID} tokens). When a build trigger
-# omits fromImage, it is derived from this. builder_insecure_registry pulls over
-# plain HTTP (dev/local registry).
-# builder_image_uri_mask: "docker.sandboxes.example.com/e2b/custom-envs/{templateID}:{buildID}"
-# builder_insecure_registry: false
-# builder_platform: linux/amd64
-# Systemd units (optional; defaults shown). Generated + installed at startup.
-# unit_dir: /etc/systemd/system
-# runner_unit: sandbox-runner@.service
-# builder_unit: sandbox-builder@.service
-# exec_dir: /opt/sandbox/bin                     # default = orchestrator binary dir
-# install_units: true
+paths:
+  run_root: /run/sandbox
+  base_root: /var/lib/sandbox
+  config_socket: /run/sandbox/orchestrator.socket  # run-task fetches LaunchSpecs here
+  # db_path: /var/lib/sandbox/orchestrator.db    # default = <base_root>/orchestrator.db
+# units:                                          # systemd template units (defaults shown)
+#   dir: /etc/systemd/system
+#   runner: sandbox-runner@.service
+#   builder: sandbox-builder@.service
+#   install: true
+sandbox:                                          # sandbox-instance defaults
+  timeout_sec: 300
+  resources:
+    vcpu: 2
+    memory: 2GiB
+    # control_socket: /run/sandbox-resource.sock  # sandbox-sentinel UDS (opt-in); omit = static cgroup
+  network:
+    switch: sw0
+    hostname: sandbox                             # guest hostname (sethostname + /etc/hosts)
+    dns: [169.254.169.253]                        # /etc/resolv.conf nameserver(s) injected into the guest
+    e2b:  { inner_ip: 169.254.0.21/30, nexthop: 169.254.0.22 }   # e2b: /30 + gateway for envd port-forward
+    bare: { inner_ip: 169.254.1.1/31,  nexthop: 169.254.1.0 }
+  boot:
+    kernel: /opt/sandbox/kernel/6.1/vmlinux
+    runtime_e2b: /opt/sandbox/runtime/v1/sandbox-runtime-e2b.erofs
+    runtime_base: /opt/sandbox/runtime/v1/sandbox-runtime.erofs
+    # Pre-formatted empty ext4 seeding the cold-boot overlay upper (required for img templates).
+    overlay_diff_template: /opt/sandbox/overlay-templates/basic-1G.ext4
+builder:
+  max_concurrent: 2
+  # cpu_quota: "200%"                             # -> sandbox-builder.slice CPUQuota
+  # memory_max: "8G"                              # -> sandbox-builder.slice MemoryMax
+  # insecure_registry: false                      # pull base over plain HTTP (dev/local registry)
+  # platform: linux/amd64
+  # image_uri_mask must match the CLI's E2B_IMAGE_URI_MASK ({templateID}/{buildID} tokens):
+  # image_uri_mask: "docker.sandboxes.example.com/e2b/custom-envs/{templateID}:{buildID}"
+checkpoint:                                        # paused-state tiering
+  mode: local                                     # local (node-bound files) | remote (portable manifest)
+  local_dir: /var/lib/sandbox-saved
 `

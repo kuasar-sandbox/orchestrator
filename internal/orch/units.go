@@ -21,18 +21,18 @@ import (
 // Both run in their own cgroup (KillMode=control-group / a dedicated slice) so the
 // reaper and the builder resource pool can account and reclaim them.
 func (o *Orchestrator) InstallUnits(ctx context.Context) error {
-	if o.cfg.InstallUnits != nil && !*o.cfg.InstallUnits {
+	if o.cfg.Units.Install != nil && !*o.cfg.Units.Install {
 		return nil
 	}
 	files := map[string]string{
-		o.cfg.RunnerUnit:        o.runnerUnitFile(),
-		o.cfg.BuilderUnit:       o.builderUnitFile(),
+		o.cfg.Units.Runner:      o.runnerUnitFile(),
+		o.cfg.Units.Builder:     o.builderUnitFile(),
 		"sandbox-runner.slice":  sliceFile("kuasar sandbox runners", ""),
 		"sandbox-builder.slice": sliceFile("kuasar image builders", o.builderSliceCaps()),
 	}
 	changed := false
 	for name, content := range files {
-		path := filepath.Join(o.cfg.UnitDir, name)
+		path := filepath.Join(o.cfg.Units.Dir, name)
 		if old, err := os.ReadFile(path); err == nil && string(old) == content {
 			continue
 		}
@@ -71,8 +71,8 @@ Delegate=yes
 # --cgroup-adopt (in the launch spec) makes THIS unit's cgroup the sandbox resource
 # cgroup: sandbox-ctl + cloud-hypervisor share it, sentinel manages it in place, and
 # KillMode=control-group SIGKILLs the whole group on StopUnit.
-`, o.cfg.RunRoot, o.cfg.BaseRoot, o.cfg.RunRoot, o.cfg.RunRoot,
-		o.cfg.OrchestratorCtl, o.cfg.RunRoot, o.cfg.ConfigSocket)
+`, o.cfg.Paths.RunRoot, o.cfg.Paths.BaseRoot, o.cfg.Paths.RunRoot, o.cfg.Paths.RunRoot,
+		o.cfg.OrchestratorCtl(), o.cfg.Paths.RunRoot, o.cfg.Paths.ConfigSocket)
 }
 
 func (o *Orchestrator) builderUnitFile() string {
@@ -94,7 +94,7 @@ ExecStart=%s run-task --pidfile=%s/%%i/%%i.pid --config-socket=%s --config-id=bu
 TimeoutStartSec=1800
 KillMode=control-group
 Slice=sandbox-builder.slice
-`, o.cfg.RunRoot, o.cfg.RunRoot, o.cfg.OrchestratorCtl, o.cfg.RunRoot, o.cfg.ConfigSocket)
+`, o.cfg.Paths.RunRoot, o.cfg.Paths.RunRoot, o.cfg.OrchestratorCtl(), o.cfg.Paths.RunRoot, o.cfg.Paths.ConfigSocket)
 }
 
 func sliceFile(desc, caps string) string {
@@ -104,11 +104,11 @@ func sliceFile(desc, caps string) string {
 // builderSliceCaps renders the cgroup ceiling for the builder pool from config.
 func (o *Orchestrator) builderSliceCaps() string {
 	var b strings.Builder
-	if o.cfg.BuilderCPUQuota != "" {
-		fmt.Fprintf(&b, "CPUQuota=%s\n", o.cfg.BuilderCPUQuota)
+	if o.cfg.Builder.CPUQuota != "" {
+		fmt.Fprintf(&b, "CPUQuota=%s\n", o.cfg.Builder.CPUQuota)
 	}
-	if o.cfg.BuilderMemoryMax != "" {
-		fmt.Fprintf(&b, "MemoryMax=%s\n", o.cfg.BuilderMemoryMax)
+	if o.cfg.Builder.MemoryMax != "" {
+		fmt.Fprintf(&b, "MemoryMax=%s\n", o.cfg.Builder.MemoryMax)
 	}
 	return b.String()
 }
@@ -121,16 +121,16 @@ func instanceUnit(tmpl, id string) string {
 	return strings.TrimSuffix(tmpl, ".service") + id + ".service"
 }
 
-func (o *Orchestrator) runnerUnit(sid string) string  { return instanceUnit(o.cfg.RunnerUnit, sid) }
-func (o *Orchestrator) builderUnit(bid string) string { return instanceUnit(o.cfg.BuilderUnit, bid) }
+func (o *Orchestrator) runnerUnit(sid string) string  { return instanceUnit(o.cfg.Units.Runner, sid) }
+func (o *Orchestrator) builderUnit(bid string) string { return instanceUnit(o.cfg.Units.Builder, bid) }
 
 // runnerPattern is the ListUnitsByPatterns glob for live runner instances.
 func (o *Orchestrator) runnerPattern() string {
-	return strings.TrimSuffix(o.cfg.RunnerUnit, ".service") + "*.service"
+	return strings.TrimSuffix(o.cfg.Units.Runner, ".service") + "*.service"
 }
 
 // unitToSID extracts the sandbox id from a runner instance unit name.
 func (o *Orchestrator) unitToSID(name string) string {
-	name = strings.TrimPrefix(name, strings.TrimSuffix(o.cfg.RunnerUnit, ".service"))
+	name = strings.TrimPrefix(name, strings.TrimSuffix(o.cfg.Units.Runner, ".service"))
 	return strings.TrimSuffix(name, ".service")
 }

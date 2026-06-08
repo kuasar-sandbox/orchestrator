@@ -48,7 +48,7 @@ func manifestKeyCmd(args []string, _ *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	st, err := store.Open(cfg.DBPath, box)
+	st, err := store.Open(cfg.Paths.DBPath, box)
 	if err != nil {
 		return err
 	}

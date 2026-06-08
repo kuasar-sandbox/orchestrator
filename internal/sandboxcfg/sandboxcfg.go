@@ -8,6 +8,7 @@ package sandboxcfg
 
 import (
 	"os"
+	"strings"
 
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/types"
 	"gopkg.in/yaml.v3"
@@ -26,7 +27,9 @@ type Params struct {
 	VCPU             int               // resources.capacity.cpu
 	Memory           string            // resources.capacity.memory, e.g. "2GiB"
 	ControllerSocket string            // resources.control.controller (sentinel UDS; "" = static cgroup)
-	Nexthop          string            // network.nexthop: default-route gateway (inner-CIDR .1); "" = no default route
+	Nexthop          string            // network.nexthop: default-route gateway; "" = no default route
+	Hostname         string            // network.hostname: guest hostname (sethostname + /etc/hosts entry)
+	DNS              []string          // /etc/resolv.conf nameservers injected via files:
 }
 
 // WriteYAML renders the SANDBOX_CONFIG and writes it to path (0600). The
@@ -102,6 +105,15 @@ func (p Params) BuildYAML() ([]byte, error) {
 			network["nexthop"] = p.Nexthop
 		}
 	}
+	if p.Hostname != "" {
+		network["hostname"] = p.Hostname
+	}
+	// Provision /etc/hosts + /etc/resolv.conf into the guest via the files: mechanism
+	// (tmpfs+bind; applied at launch AND restore). Flattened docker images ship neither
+	// (docker injects them only at container runtime); without /etc/hosts the guest's
+	// getfqdn(hostname) stalls ~20s on DNS, breaking servers that resolve the hostname
+	// at startup (e.g. Python http.server.server_bind). See docs/orchestrator.md §10.
+	files := guestFiles(p.Hostname, p.DNS)
 
 	launch := map[string]any{
 		"exec":    launchExec,
@@ -127,7 +139,28 @@ func (p Params) BuildYAML() ([]byte, error) {
 		},
 		"launch": launch,
 	}
+	if len(files) > 0 {
+		doc["files"] = files
+	}
 	return yaml.Marshal(doc)
+}
+
+// guestFiles builds the files: entries provisioning /etc/hosts (so getfqdn(hostname)
+// resolves locally instead of stalling on DNS) and /etc/resolv.conf into the guest.
+func guestFiles(hostname string, dns []string) []map[string]any {
+	var files []map[string]any
+	if hostname != "" {
+		hosts := "127.0.0.1\tlocalhost\n127.0.1.1\t" + hostname + "\n::1\tlocalhost ip6-localhost ip6-loopback\n"
+		files = append(files, map[string]any{"path": "/etc/hosts", "content": hosts, "mode": "0644"})
+	}
+	if len(dns) > 0 {
+		var b strings.Builder
+		for _, ns := range dns {
+			b.WriteString("nameserver " + ns + "\n")
+		}
+		files = append(files, map[string]any{"path": "/etc/resolv.conf", "content": b.String(), "mode": "0644"})
+	}
+	return files
 }
 
 func restartPolicy(pr types.Profile) string {
@@ -144,8 +177,14 @@ func (p Params) RestoreRef() string {
 	// Resume: a paused sandbox (img OR snp) has a pause snapshot to restore. This
 	// MUST be checked before the kind, else a paused img sandbox cold-boots and
 	// loses all guest state written since boot.
-	if p.Sandbox.SnapshotRef != "" {
-		return "manifest://" + p.Sandbox.SnapshotRef
+	if ref := p.Sandbox.SnapshotRef; ref != "" {
+		// SnapshotRef is a full ref: "manifest://<key>" (remote checkpoint) or a
+		// local bundle path (local checkpoint). A scheme-less, non-path value is
+		// an older bare manifest key — treat it as manifest:// (back-compat).
+		if strings.Contains(ref, "://") || strings.HasPrefix(ref, "/") {
+			return ref
+		}
+		return "manifest://" + ref
 	}
 	// snp template cold-start = restore the build snapshot.
 	if p.Template.Kind == types.KindSnp {

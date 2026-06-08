@@ -54,6 +54,10 @@ func main() {
 		err = configCmd(os.Args[2:], log)
 	case "manifest-key":
 		err = manifestKeyCmd(os.Args[2:], log)
+	case "export-sandbox":
+		err = exportSandboxCmd(os.Args[2:], log)
+	case "import-sandbox":
+		err = importSandboxCmd(os.Args[2:], log)
 	case "version", "-v", "--version":
 		fmt.Println("orchestrator-ctl", version)
 	default:
@@ -66,7 +70,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: orchestrator-ctl {serve|proxy|run-task|config|manifest-key|version} [flags]")
+	fmt.Fprintln(os.Stderr, "usage: orchestrator-ctl {serve|proxy|run-task|config|manifest-key|export-sandbox|import-sandbox|version} [flags]")
 	os.Exit(2)
 }
 
@@ -82,10 +86,10 @@ func serve(args []string, log *slog.Logger) error {
 		return err
 	}
 	if *proxyMode != "" {
-		cfg.ProxyMode = *proxyMode
+		cfg.Proxy.Mode = *proxyMode
 	}
 	if *proxySock != "" {
-		cfg.ProxySockets = splitComma(*proxySock)
+		cfg.Proxy.Sockets = splitComma(*proxySock)
 	}
 	if err := cfg.ValidateProxy(); err != nil { // re-check after flag overrides
 		return err
@@ -97,12 +101,12 @@ func serve(args []string, log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	st, err := store.Open(cfg.DBPath, box)
+	st, err := store.Open(cfg.Paths.DBPath, box)
 	if err != nil {
 		return err
 	}
 	defer st.Close()
-	if err := os.Chmod(cfg.DBPath, 0o600); err != nil {
+	if err := os.Chmod(cfg.Paths.DBPath, 0o600); err != nil {
 		log.Warn("chmod db", "err", err)
 	}
 
@@ -112,7 +116,7 @@ func serve(args []string, log *slog.Logger) error {
 	}
 	defer lc.Close()
 
-	core := orch.New(cfg, st, lc, vswitch.New(cfg.Bin(cfg.VswitchCtl), cfg.Switch), log)
+	core := orch.New(cfg, st, lc, vswitch.New(cfg.VswitchCtl(), cfg.Sandbox.Network.Switch), log)
 	if err := core.InstallUnits(ctx); err != nil {
 		return err
 	}
@@ -123,7 +127,7 @@ func serve(args []string, log *slog.Logger) error {
 	go core.BuildPool(ctx, 2*time.Second)
 
 	// task config-socket server (run-task pulls its LaunchSpec by config-id).
-	cs := configsock.New(cfg.ConfigSocket, core, log)
+	cs := configsock.New(cfg.Paths.ConfigSocket, core, log)
 	go func() {
 		if err := cs.Serve(ctx); err != nil {
 			log.Error("config-socket", "err", err)
@@ -137,63 +141,63 @@ func serve(args []string, log *slog.Logger) error {
 	dataH := buildDataPlane(ctx, cfg, core, mx, log)
 
 	// North handler: api.<domain> -> control plane; <port>-<sid>.<domain> -> data plane.
-	apiH := api.New(core, cfg.Domain, log).Handler()
+	apiH := api.New(core, cfg.API.Domain, log).Handler()
 	mux := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		host := r.Host
 		if i := strings.IndexByte(host, ':'); i >= 0 {
 			host = host[:i]
 		}
-		if host == "api."+cfg.Domain || strings.HasPrefix(host, "api.") {
+		if host == "api."+cfg.API.Domain || strings.HasPrefix(host, "api.") {
 			apiH.ServeHTTP(w, r)
 			return
 		}
 		dataH.ServeHTTP(w, r)
 	})
 
-	if cfg.MetricsListen != "" {
-		go serveMetrics(ctx, cfg.MetricsListen, mx, log)
+	if cfg.Proxy.MetricsListen != "" {
+		go serveMetrics(ctx, cfg.Proxy.MetricsListen, mx, log)
 	}
 	// Optional dedicated data-plane listener. In external mode the proxy workers
 	// own data_listen (SO_REUSEPORT), so the orchestrator does not bind it.
-	if cfg.ProxyMode != config.ProxyExternal && cfg.DataListen != "" {
-		ln, err := net.Listen("tcp", cfg.DataListen)
+	if cfg.Proxy.Mode != config.ProxyExternal && cfg.Proxy.DataListen != "" {
+		ln, err := net.Listen("tcp", cfg.Proxy.DataListen)
 		if err != nil {
-			return fmt.Errorf("data_listen %s: %w", cfg.DataListen, err)
+			return fmt.Errorf("data_listen %s: %w", cfg.Proxy.DataListen, err)
 		}
-		log.Info("orchestrator-ctl data-plane listener", "data_listen", cfg.DataListen)
+		log.Info("orchestrator-ctl data-plane listener", "data_listen", cfg.Proxy.DataListen)
 		go func() {
-			if err := serveListener(ctx, ln, dataH, cfg.TLSCert, cfg.TLSKey, log); err != nil {
+			if err := serveListener(ctx, ln, dataH, cfg.API.TLS.Cert, cfg.API.TLS.Key, log); err != nil {
 				log.Error("data-plane listener", "err", err)
 			}
 		}()
 	}
 
-	if cfg.TLSCert == "" || cfg.TLSKey == "" {
+	if cfg.API.TLS.Cert == "" || cfg.API.TLS.Key == "" {
 		log.Warn("serving plain HTTP (dev): point the SDK with E2B_API_URL/E2B_SANDBOX_URL")
 	}
-	ln, err := net.Listen("tcp", cfg.Listen)
+	ln, err := net.Listen("tcp", cfg.API.Listen)
 	if err != nil {
-		return fmt.Errorf("listen %s: %w", cfg.Listen, err)
+		return fmt.Errorf("listen %s: %w", cfg.API.Listen, err)
 	}
-	log.Info("orchestrator-ctl serving", "listen", cfg.Listen, "domain", cfg.Domain, "proxy_mode", cfg.ProxyMode)
-	return serveListener(ctx, ln, mux, cfg.TLSCert, cfg.TLSKey, log)
+	log.Info("orchestrator-ctl serving", "listen", cfg.API.Listen, "domain", cfg.API.Domain, "proxy_mode", cfg.Proxy.Mode)
+	return serveListener(ctx, ln, mux, cfg.API.TLS.Cert, cfg.API.TLS.Key, log)
 }
 
 // buildDataPlane wires the data-plane handler for the configured proxy_mode.
 func buildDataPlane(ctx context.Context, cfg *config.Config, core *orch.Orchestrator, mx *metrics.M, log *slog.Logger) http.Handler {
-	switch cfg.ProxyMode {
+	switch cfg.Proxy.Mode {
 	case config.ProxyOff:
 		return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			mx.Inc(`data_requests_total{result="off"}`)
 			http.Error(w, "data plane disabled (proxy_mode=off)", http.StatusNotImplemented)
 		})
 	case config.ProxyExternal:
-		rc := routesync.NewClient(cfg.ProxySockets, core, log)
+		rc := routesync.NewClient(cfg.Proxy.Sockets, core, log)
 		go rc.Run(ctx)
-		log.Info("route-sync client started", "proxies", cfg.ProxySockets)
-		return newGateway(cfg.ProxySockets, mx, log)
+		log.Info("route-sync client started", "proxies", cfg.Proxy.Sockets)
+		return newGateway(cfg.Proxy.Sockets, mx, log)
 	default: // internal
-		return proxy.New(core, func() string { return cfg.DataPlaneAuth }, log, mx)
+		return proxy.New(core, func() string { return cfg.Proxy.Auth }, log, mx)
 	}
 }
 

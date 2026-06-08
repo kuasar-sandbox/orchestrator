@@ -1,66 +1,104 @@
 # orchestrator-ctl configuration. See sandbox-orchestrator/docs/orchestrator.md.
 # The unmodified e2b SDK reaches this node via: E2B_DOMAIN=<domain> E2B_API_KEY=<key>
 # (dev: E2B_API_URL=http://host:3000 E2B_SANDBOX_URL=http://<port>-<sid>.host:3000).
+#
+# Config is grouped by concern. External binaries (sandbox-ctl, vswitch-ctl,
+# flatten-ctl, …) are auto-discovered next to the orchestrator-ctl binary, then on
+# PATH — they are not configured here.
 
-domain: sandboxes.example.com
-listen: ":443"                                       # dev: ":3000" (plain http)
-tls_cert: /etc/orchestrator-ctl/tls/fullchain.pem    # wildcard *.<domain> AND api.<domain>
-tls_key: /etc/orchestrator-ctl/tls/privkey.pem
+# North control plane + TLS.
+api:
+  domain: sandboxes.example.com
+  listen: ":443"                                 # dev: ":3000" (plain http)
+  tls:
+    cert: /etc/orchestrator-ctl/tls/fullchain.pem   # wildcard *.<domain> AND api.<domain>
+    key: /etc/orchestrator-ctl/tls/privkey.pem
 
-# Data-plane proxy. proxy_mode selects how sandbox traffic (<port>-<sid>.<domain>)
-# is served:
+# Data-plane proxy. mode selects how sandbox traffic (<port>-<sid>.<domain>) is served:
 #   internal (default) — in-process proxy (single binary, no extra moving parts).
-#   external           — offload the data plane to one or more orchestrator-ctl proxy
-#                        worker processes (deploy/orchestrator-proxy@.service). The
-#                        orchestrator pushes the route table to each over its UDS and
-#                        the workers own the data-plane port (SO_REUSEPORT); a data
-#                        request hitting the orchestrator is forwarded to a worker.
+#   external           — offload to orchestrator-ctl proxy workers (deploy/
+#                        orchestrator-proxy@.service): the orchestrator pushes the
+#                        route table over each worker's UDS (sockets) and the workers
+#                        own the data-plane port (SO_REUSEPORT).
 #   off                — reject data-plane traffic on this node.
-# data_plane_auth: the proxy validates X-Access-Token (= envdAccessToken) against the
-# sandbox. enforce (default) rejects mismatches (401); log forwards but warns; off
-# disables it. park_timeout bounds how long a proxy holds a request while a route
-# syncs / a paused sandbox auto-resumes. metrics_listen serves Prometheus text.
-proxy_mode: internal
-# proxy_sockets: [ /run/sandbox/proxy-1.sock, /run/sandbox/proxy-2.sock ]   # external only
-# data_listen: ""                                    # dedicated data-plane addr; "" = share `listen`
-data_plane_auth: enforce
-park_timeout: 30s
-# metrics_listen: 127.0.0.1:9095                     # "" = metrics off
+# auth: the proxy validates X-Access-Token (= envdAccessToken) — enforce (default)
+# rejects mismatches (401); log warns but forwards; off disables. park_timeout bounds
+# how long a request is held while a route syncs / a paused sandbox auto-resumes.
+proxy:
+  mode: internal
+  auth: enforce
+  # sockets: [ /run/sandbox/proxy-1.sock, /run/sandbox/proxy-2.sock ]   # external only
+  # data_listen: ""                              # dedicated data-plane addr; "" = share api.listen
+  # park_timeout: 30s
+  # metrics_listen: 127.0.0.1:9095               # "" = metrics off
 
 # Secrets-at-rest. Per-tenant manifest keys are stored AES-256-GCM-encrypted under
 # encryption_key: ":"-separated 64-hex keys, first = active (new writes), rest =
 # standby (decrypt during rotation). Prefer the ORCHESTRATOR_ENCRYPTION_KEY env
-# (overrides this). Generate one: `openssl rand -hex 32`.
-encryption_key: "0000000000000000000000000000000000000000000000000000000000000000"
-# Which manifest keys may create sandboxes / build is the manifest_keys table —
-# managed out of band via `orchestrator-ctl manifest-key add|remove|check|list`.
+# (overrides this). Generate one: `openssl rand -hex 32`. Which manifest keys may
+# create/build/import is the manifest_keys table (orchestrator-ctl manifest-key …);
 # e2b API keys are derived from a manifest key with `e2b-key-ctl gen-apikey`.
+encryption_key: "0000000000000000000000000000000000000000000000000000000000000000"
 
-# Paths
-run_root: /run/sandbox
-base_root: /var/lib/sandbox
-manifest_config: /opt/sandbox/manifest.yaml          # shared; manifest.key left empty (key via config-socket)
-runtime_e2b_erofs: /opt/sandbox/runtime/v1/sandbox-runtime-e2b.erofs
-runtime_erofs: /opt/sandbox/runtime/v1/sandbox-runtime.erofs
-kernel: /opt/sandbox/kernel/6.1/vmlinux
-config_socket: /run/sandbox/orchestrator.socket          # run-task fetches per-task LaunchSpecs here
-resource_socket: /run/sandbox-resource.sock          # sentinel UDS (sandbox-ctl dials it; "" = static cgroup)
+# Shared remote manifest store (manifest.key left empty; the tenant key arrives via
+# env per task). A remote snapshot in this store is portable across nodes.
+manifest_config: /opt/sandbox/manifest.yaml
 
-# Networking (vswitch)
-switch: sw0
-inner_cidr: 10.42.0.0/16
+# Node-local directories / sockets.
+paths:
+  run_root: /run/sandbox                          # tmpfs run state
+  base_root: /var/lib/sandbox                     # persistent state
+  config_socket: /run/sandbox/orchestrator.socket # run-task fetches per-task LaunchSpecs here
+  # db_path: /var/lib/sandbox/orchestrator.db     # default = <base_root>/orchestrator.db
 
-# Sandbox spec defaults (e2b templates carry no size)
-default_vcpu: 2
-default_memory: 2GiB
-default_timeout_sec: 300
+# Systemd template units (generated + installed at startup, then daemon-reloaded).
+# units:
+#   dir: /etc/systemd/system
+#   runner: sandbox-runner@.service
+#   builder: sandbox-builder@.service
+#   install: true                                 # false = manage out of band
 
-# Systemd units (optional; defaults shown). orchestrator-ctl generates and installs
-# the runner + builder template units and their slices at startup, then daemon-reloads.
-# exec_dir (where sandbox-ctl / orchestrator-ctl live) defaults to the orchestrator
-# binary's own directory; set install_units: false to manage units out of band.
-# unit_dir: /etc/systemd/system
-# runner_unit: sandbox-runner@.service
-# builder_unit: sandbox-builder@.service
-# exec_dir: /opt/sandbox/bin
-# install_units: true
+# Sandbox-instance defaults.
+sandbox:
+  timeout_sec: 300                                # default TTL
+  resources:
+    vcpu: 2
+    memory: 2GiB
+    # control_socket: /run/sandbox-resource.sock  # sandbox-sentinel UDS (opt-in); omit = static cgroup
+  network:
+    switch: sw0
+    hostname: sandbox                             # guest hostname (sethostname + /etc/hosts entry)
+    dns: [169.254.169.253]                        # /etc/resolv.conf nameserver(s) injected into the guest
+    # Per-profile guest inner IP / default-route gateway (reused per profile; identity
+    # is the per-slot floating IP). e2b needs the /30 + gateway for envd port-forward.
+    e2b:  { inner_ip: 169.254.0.21/30, nexthop: 169.254.0.22 }
+    bare: { inner_ip: 169.254.1.1/31,  nexthop: 169.254.1.0 }
+  boot:
+    kernel: /opt/sandbox/kernel/6.1/vmlinux
+    runtime_e2b: /opt/sandbox/runtime/v1/sandbox-runtime-e2b.erofs
+    runtime_base: /opt/sandbox/runtime/v1/sandbox-runtime.erofs
+    # Pre-formatted empty ext4 seeding the cold-boot overlay upper (required for img templates).
+    overlay_diff_template: /opt/sandbox/overlay-templates/basic-1G.ext4
+
+# Build-instance settings. Concurrency is admitted in orchestrator-ctl; the CPU/
+# memory ceiling is applied to sandbox-builder.slice.
+builder:
+  max_concurrent: 2
+  # cpu_quota: "200%"                             # -> sandbox-builder.slice CPUQuota
+  # memory_max: "8G"                              # -> sandbox-builder.slice MemoryMax
+  # insecure_registry: false                      # pull base over plain HTTP (dev/local registry)
+  # platform: linux/amd64
+  # Where the e2b CLI pushes its client-built image (must match the CLI's
+  # E2B_IMAGE_URI_MASK; {templateID}/{buildID} tokens). When a build omits fromImage
+  # it is derived from this.
+  # image_uri_mask: "docker.sandboxes.example.com/e2b/custom-envs/{templateID}:{buildID}"
+
+# Paused-state tiering. On pause a sandbox's snapshot is written either to node-local
+# files (mode=local, default; restorable only on this node — matches the sandbox-bound
+# lifecycle) or straight to the remote manifest store (mode=remote; portable = a
+# template). A local checkpoint is promoted to remote on demand via
+# `orchestrator-ctl export-sandbox` (--to-template for a reusable template, or a
+# migration token to move the sandbox to another node).
+checkpoint:
+  mode: local
+  local_dir: /var/lib/sandbox-saved

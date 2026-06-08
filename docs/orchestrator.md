@@ -236,11 +236,29 @@ ExecStart 统一为 `orchestrator-ctl run-task`（通用子任务启动器，§6
 
 - create(img=冷启/snp=restore)、connect=resume、pause=snapshot、timeout=TTL→pause、kill。
 - **auto-suspend**：TTL/空闲 → reaper 触发运行中 sandbox-ctl 封快照、记 `snapshot_ref`、标 paused、StopUnit、detach。
+  封快照按 **`checkpoint.mode`**（§8.1）：`local`（默认）→ `snapshot --output` 落本机文件（`snapshot_ref`=本机 bundle 路径，节点绑定）；
+  `remote` → `snapshot --upload` 落远程 manifest（`snapshot_ref`=`manifest://<key>`，可移植）。
 - **auto-resume**：数据面流量打到 paused 沙箱 → orchestrator 读 sqlite → 建目录 + attach + `StartUnit` →
-  config-socket 下发 `restore=manifest://<snapshot_ref>` + key → sandbox-ctl 解封恢复。
+  config-socket 下发 `restore=<snapshot_ref>` + key → sandbox-ctl 解封恢复。`snapshot_ref` 为完整引用
+  （`manifest://<key>` 或本机路径），`sandbox-ctl run --restore` 两形态皆收（旧裸 key 行向后兼容补 `manifest://`）。
   - **单飞**：同一 sid 的并发数据面请求经 per-sid single-flight 合并为**一次** resume，杜绝重复 IP 分配 / attach / StartUnit 竞态。
   - **internal**：proxy 在请求内同步触发 resume（有界）。**external**：worker 经 routesync 上行 `Wake{sid}` → orchestrator 单飞 resume → 回灌 `Upsert(running)` → worker 解挂；resume 未在 `park_timeout` 内就绪 → worker 回 **503**（§2.1）。
 - 终态仅 `paused`(snapshot) / `dead`(kill/TTL/整机故障)。`kill` 在进程层经 StopUnit 生效，不受 guest 内 restart 策略阻挡。
+
+### §8.1 暂停态分层、转模板与跨机迁移（checkpoint / export-sandbox / import-sandbox）
+
+沙箱的 snapshot 有两态：**本机快照**=`snapshot --output` 落本机文件（节点绑定、只能本机 resume，恰合"沙箱附着宿主"）；
+**远程快照**=manifest（`--upload` 直传或晋升而得，**可移植、本质即模板**）。`checkpoint.mode` 选 pause 默认落地（默认 `local`）。
+全部基于现有 sandbox-ctl 原语（`snapshot --output|--upload`、`upload-snapshot <本机快照>`、`run --restore`），e2b API/CLI 零改动。
+
+- **晋升 / 转模板**：`orchestrator-ctl export-sandbox <sid> --to-template`（`E2B_API_KEY` 鉴权、须暂停）——若本机快照则先
+  `upload-snapshot` 晋升为远程 manifest（并 repoint 该行），随后**组装并打印自描述持久 id `<profile>-snp-<key>`**（**不写 builds 表**）。
+  之后 `e2b sandbox create <id>` 即从该快照扇出新沙箱（新 sid）。create 解密用的租户 key 仍由 api_key→白名单解析，故无需登记。
+- **迁移（同 sid 跨机）**：`export-sandbox <sid>`（不带 `--to-template`）确保远程后，导出**单行 base64 token**＝沙箱行
+  （含 env/metadata/deadline/数据面 token，**manifest_key 仅指纹、不含密钥**，附 runtime 摘要）；默认**回收源行**（move；`--keep-source`=拷贝）。
+  目标机 `import-sandbox <token>`：`E2B_API_KEY`→白名单解析租户 key（**须先 `manifest-key add`**，同 create 前置）、校验 token 指纹与本机
+  runtime 摘要一致，插入 paused 行 → `e2b sandbox resume <sid>` 在新机恢复。目标机须共享同一 `manifest_config`（远程 store）。
+  - 限制：token 不含系统密钥但携带沙箱自有 env/数据面 token，按"沙箱级敏感"对待；跨进程 export 删行后 daemon 缓存最终一致（resume 走 `st.Get`）。
 
 ## §9 状态存储与重启对账
 
@@ -265,6 +283,7 @@ status(registered|waiting|building|ready|error), reason, names_json, aliases_jso
 - **零 sandbox-init 改动**：`/opt/sandbox-runtime` 已被 sandbox-init **自动 bind-mount** 进 guest 同名路径，故 envd 在 guest 内即 `/opt/sandbox-runtime/bin/envd`，直接作 `launch.exec`：`launch.exec=/opt/sandbox-runtime/bin/envd -isnotfc -port 49983`、restart=always。
 - envd 是 **sandbox-deps** 的原生构建产物（与 cloud-hypervisor/vmlinux/mkfs.erofs 并列）：`make -C sandbox-deps envd` 经 `deps/build-envd.sh` 拉取 `e2b-dev/infra` 发布 tarball（默认 tag `2026.22`，`ENVD_TARBALL` 可覆盖）→ `build/tarball` 缓存 → extract 到 `build/src/e2b-infra` → `go build packages/envd` → `bin/<arch>/envd`。orchestrator 的 `make sandbox-runtime-e2b` 再把它（默认从 umbrella `bin/<arch>/envd`，`ENVD=` 可覆盖）注入裸 runtime。
 - **userland 门槛**（文档约束）：base/客户镜像须有 `bash`、`coreutils/util-linux`、**预建 `/init` 默认用户（默认 `user`，含 `/home/user`）**、`cgroup v2`、可写 `/run`。envd 跑每条 guest 进程时以默认用户、并包一层 `ionice -c 2 -n 4 nice -n N "$@"`（须有 `/usr/bin/{ionice,nice}`）——故缺用户或缺 util-linux/coreutils 会 `invalid default user` / `ionice: not found`（实测裸 alpine 两者皆缺）。
+- **guest 须有 `/etc/hosts`（实测根因，端口转发相关）**：展平的 docker 镜像**不带 `/etc/hosts`**（docker 仅容器运行时注入）。guest 内 `socket.getfqdn(hostname)`——许多服务器在 bind 后调它，如 Python `http.server.server_bind()` 恰在 `bind()` 与 `listen()` **之间**——查无本地条目即落到 DNS（`resolv.conf`，e2bdev=`1.1.1.1`），解析主机名 `sandbox` 阻塞 **~20s**（此间端口已 bind 但未 listen、`ss` 看不到 listener），令"host→floatingip 应用端口转发"看似失败。**已治本**：orchestrator 经 SANDBOX_CONFIG **既有 `files:` 机制**注入 `/etc/hosts`（含 `127.0.1.1 <hostname>` 条目）+ `/etc/resolv.conf`，并经 `network.hostname` sethostname（launch+restore 均生效），任何解析主机名的应用即时启动（实测 `getfqdn` 20.23s→0.01s）。guest DNS 由 `sandbox.network.dns`（默认 `169.254.169.253`）决定，该地址需部署侧路由到真实 DNS（demo 加一条 iptables DNAT 到本机首个 nameserver 以跑通）。
 - host 启动后调 envd **`POST /init`**（经 UDS）装 token/env/默认用户/workdir/时间。数据面 exec = `POST /process.Process/Start`（Connect-RPC，`X-Access-Token` 头 = create 返回的 `envdAccessToken`）。
 
 ## §11 模板构建（经 e2b API + builds 表 + 资源池）
@@ -333,18 +352,22 @@ build-runtime-e2b.sh（sandbox-runtime-e2b.erofs；envd 注入 /opt/sandbox-runt
 ## §16 配置（字段参考）
 
 完整可注释样例见 **`deploy/config.example.yaml`**（亦即 `orchestrator-ctl config --template` 的输出骨架），
-权威字段清单见 `internal/config/config.go`；daemon 的 systemd 单元见 **`deploy/orchestrator-ctl.service`**
-（`ExecStart=orchestrator-ctl serve --config /etc/orchestrator-ctl/config.yaml`）。**必填**仅 `domain` +
-`encryption_key`（或 `ORCHESTRATOR_ENCRYPTION_KEY` env）。以下为几处易混字段：
+权威结构见 `internal/config/config.go`；daemon 的 systemd 单元见 **`deploy/orchestrator-ctl.service`**
+（`ExecStart=orchestrator-ctl serve --config /etc/orchestrator-ctl/config.yaml`）。**配置按关注点分组**：
+`api`（控制面+TLS）、`proxy`（数据面）、`paths`、`units`、`sandbox`（实例级，子组 `resources`/`network`/`boot`）、
+`builder`、`checkpoint`（暂停态分层），外加顶层单值 `encryption_key` / `manifest_config`。**必填**仅
+`api.domain` + `encryption_key`（或 `ORCHESTRATOR_ENCRYPTION_KEY` env）。**外部二进制**
+（sandbox-ctl/vswitch-ctl/flatten-ctl/orchestrator-ctl）**不配置**——按"与 orchestrator-ctl 同目录 → PATH"
+自动发现（`cfg.Bin()`；erofs 工具由 `deps/build-runtime-e2b.sh` 直接调）。以下为几处要点：
 
 | 字段 | 默认 | 说明 |
 |---|---|---|
-| `db_path` | `<base_root>/orchestrator.db` | sqlite 路径，**可配**（非固定 `/var/lib/sandbox/...`）；随 `base_root` 派生，亦可显式覆盖（§9） |
-| `sandbox_ctl_bin` / `vswitch_ctl_bin` / `flatten_ctl_bin` | `sandbox-ctl` / `vswitch-ctl` / `flatten-ctl`（PATH） | **三个生效的外部二进制覆盖**（裸名经 `exec_dir` 解析为绝对路径，§5）；用于测试钉版本 |
-| `metrics_listen` | `""`（关） | 可选 Prometheus 文本端点（`data_requests_total{result=…}`/`gateway_forward_total` 等，§2.1） |
-
-> `manifest_ctl_bin` / `mkfs_erofs_bin` / `fsck_erofs_bin` 字段虽存在（含默认值），但**当前未被引用**（`cfg.Bin()`
-> 仅对 sandbox-ctl/vswitch-ctl/flatten-ctl 调用；erofs 工具由 `deps/build-runtime-e2b.sh` 直接调），属 dead config，配置无效。
+| `paths.db_path` | `<paths.base_root>/orchestrator.db` | sqlite 路径，可配；随 `base_root` 派生，亦可显式覆盖（§9） |
+| `sandbox.network.{e2b,bare}.{inner_ip,nexthop}` | e2b `169.254.0.21/30`+`169.254.0.22` ; bare `169.254.1.1/31`+`169.254.1.0` | **按 profile** 的 guest 内 IP/默认网关（每 profile 复用同一对、唯一身份是 floatingip）；e2b 用 **/30 + 网关**让 envd 端口转发可用 |
+| `sandbox.network.{hostname,dns}` | `sandbox` ; `[169.254.169.253]` | guest 主机名（`network.hostname`→sethostname）+ DNS；orchestrator 经 SANDBOX_CONFIG **`files:`** 注入 `/etc/hosts`（含 hostname 条目，治 getfqdn DNS 卡顿，见 §10）与 `/etc/resolv.conf`（launch+restore 均生效） |
+| `sandbox.resources.control_socket` | `""`（静态 cgroup） | sandbox-sentinel 资源控制 UDS（opt-in）；空=单元自身 cgroup |
+| `checkpoint.mode` | `local` | 暂停态落地：`local`=本机文件（`checkpoint.local_dir`，节点绑定）/ `remote`=远程 manifest（可移植=模板）。见 §8 |
+| `proxy.metrics_listen` | `""`（关） | 可选 Prometheus 文本端点（`data_requests_total{result=…}`/`gateway_forward_total` 等，§2.1） |
 
 ## §17 如何测试
 

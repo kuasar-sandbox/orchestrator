@@ -160,7 +160,7 @@ func (o *Orchestrator) ListTemplates(ctx context.Context, apiKey string) ([]*typ
 // Admission is a counting semaphore; the CAS on the build row lets a restarted
 // orchestrator (or a future multi-worker) race safely for each build.
 func (o *Orchestrator) BuildPool(ctx context.Context, interval time.Duration) {
-	sem := make(chan struct{}, o.cfg.BuilderMaxConcurrent)
+	sem := make(chan struct{}, o.cfg.Builder.MaxConcurrent)
 	t := time.NewTicker(interval)
 	defer t.Stop()
 	for {
@@ -215,7 +215,7 @@ func (o *Orchestrator) executeBuild(ctx context.Context, b *types.Build) {
 // (the manifest key) is captured by the unit's StandardOutput=file into
 // <bid>.result, read back here.
 func (o *Orchestrator) executeImage(ctx context.Context, b *types.Build) (string, error) {
-	dir := filepath.Join(o.cfg.RunRoot, b.BuildID)
+	dir := filepath.Join(o.cfg.Paths.RunRoot, b.BuildID)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", err
 	}
@@ -252,12 +252,12 @@ func (o *Orchestrator) executeSnapshot(ctx context.Context, b *types.Build, imgK
 		ID:          b.BuildID,
 		TemplateID:  imgTmpl.String(),
 		State:       types.StateRunning,
-		RunDir:      o.cfg.RunRoot + "/" + b.BuildID,
-		BaseDir:     o.cfg.BaseRoot + "/" + b.BuildID,
+		RunDir:      o.cfg.Paths.RunRoot + "/" + b.BuildID,
+		BaseDir:     o.cfg.Paths.BaseRoot + "/" + b.BuildID,
 		ManifestKey: b.ManifestKey,
 		Env:         map[string]string{},
-		EnvdUDS:     o.cfg.RunRoot + "/" + b.BuildID + "/envd.sock",
-		CiUDS:       o.cfg.RunRoot + "/" + b.BuildID + "/ci.sock",
+		EnvdUDS:     o.cfg.Paths.RunRoot + "/" + b.BuildID + "/envd.sock",
+		CiUDS:       o.cfg.Paths.RunRoot + "/" + b.BuildID + "/ci.sock",
 		CreatedUnix: time.Now().Unix(),
 	}
 	if b.StartCmd != "" {
@@ -267,7 +267,7 @@ func (o *Orchestrator) executeSnapshot(ctx context.Context, b *types.Build, imgK
 		o.teardown(context.Background(), sb)
 		return "", err
 	}
-	key, err := o.snapshot(ctx, sb)
+	key, err := o.snapshotRemote(ctx, sb)
 	o.teardown(context.Background(), sb)
 	_ = o.st.Delete(context.Background(), sb.ID)
 	if err != nil {
@@ -290,13 +290,13 @@ func (o *Orchestrator) buildLaunchSpec(ctx context.Context, bid string) (*config
 	if err != nil || b == nil {
 		return nil, "", false, err
 	}
-	dir := filepath.Join(o.cfg.RunRoot, bid)
+	dir := filepath.Join(o.cfg.Paths.RunRoot, bid)
 	spec := &configsock.LaunchSpec{
-		Exec: o.cfg.Bin(o.cfg.FlattenCtl),
+		Exec: o.cfg.FlattenCtl(),
 		Args: []string{
 			"export",
 			"--config", filepath.Join(dir, "flatten.yaml"),
-			"--manifest-config", o.cfg.ManifestCfg,
+			"--manifest-config", o.cfg.ManifestConfig,
 			"--upload", b.FromImage,
 		},
 		Workdir: dir,
@@ -314,11 +314,11 @@ func (o *Orchestrator) buildLaunchSpec(ctx context.Context, bid string) (*config
 func (o *Orchestrator) flattenConfigYAML(b *types.Build, runDir string) string {
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "tmpdir: %q\n", runDir)
-	if o.cfg.BuilderInsecure {
+	if o.cfg.Builder.InsecureRegistry {
 		sb.WriteString("insecure: true\n")
 	}
-	if o.cfg.BuilderPlatform != "" {
-		fmt.Fprintf(&sb, "platform: %q\n", o.cfg.BuilderPlatform)
+	if o.cfg.Builder.Platform != "" {
+		fmt.Fprintf(&sb, "platform: %q\n", o.cfg.Builder.Platform)
 	}
 	fmt.Fprintf(&sb, "referer:\n  enabled: true\n  key: %q\n  desc: %q\n", b.FromImage, b.FromImage)
 	return sb.String()
@@ -327,7 +327,7 @@ func (o *Orchestrator) flattenConfigYAML(b *types.Build, runDir string) string {
 // imageURIFromMask renders builder_image_uri_mask with the build's templateID +
 // buildID (the convention the e2b CLI pushed its client-built image under).
 func (o *Orchestrator) imageURIFromMask(templateID, buildID string) string {
-	m := o.cfg.BuilderImageURIMask
+	m := o.cfg.Builder.ImageURIMask
 	if m == "" {
 		return ""
 	}
