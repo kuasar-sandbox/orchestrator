@@ -146,23 +146,17 @@ truncate -s 1G "$OVL"
 echo "==> overlay diff_template: $OVL ($(du -h "$OVL" | cut -f1) on disk)"
 
 cat > "$WORK/config.yaml" <<EOF
-domain: $DOMAIN
-listen: ":$PORT"
+api: { domain: $DOMAIN, listen: ":$PORT" }
 encryption_key: "$ENC"
-run_root: $WORK/run
-base_root: $WORK/lib
 manifest_config: $WORK/manifest.yaml
-runtime_e2b_erofs: $BIN/sandbox-runtime-e2b.erofs
-runtime_erofs: $BIN/sandbox-runtime.erofs
-kernel: $BIN/vmlinux
-overlay_diff_template: $OVL
-config_socket: $WORK/orchestrator.socket
-switch: $SWITCH
-inner_cidr: 10.42.0.0/16
-unit_dir: $UNIT_DIR
-exec_dir: $BIN
-builder_insecure_registry: true
-default_timeout_sec: 120
+paths: { run_root: $WORK/run, base_root: $WORK/lib, config_socket: $WORK/orchestrator.socket }
+units: { dir: $UNIT_DIR }
+sandbox:
+  timeout_sec: 120
+  network: { switch: $SWITCH }
+  boot: { kernel: $BIN/vmlinux, runtime_e2b: $BIN/sandbox-runtime-e2b.erofs, runtime_base: $BIN/sandbox-runtime.erofs, overlay_diff_template: $OVL }
+builder: { insecure_registry: true }
+checkpoint: { mode: remote }
 EOF
 "$BIN/orchestrator-ctl" manifest-key add --config "$WORK/config.yaml" "$MK" >/dev/null || fail "manifest-key add"
 "$BIN/orchestrator-ctl" serve --config "$WORK/config.yaml" >"$WORK/orch.log" 2>&1 &

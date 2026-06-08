@@ -34,6 +34,7 @@ TLS_PORT="${TLS_PORT:-443}"               # the CLI uses the implicit :443 for a
 E2E_IMAGE="${E2E_IMAGE:-e2bdev/code-interpreter:latest}"   # the real e2b base (cached locally)
 SWITCH="${SWITCH:-sw0}"; SW_NETNS="${SW_NETNS:-demo_sw}"
 SW_MGMT="${SW_MGMT:-sw0m0}"; FIP_CIDR="${FIP_CIDR:-100.100.96.0/20}"  # mgmt NIC + floating-IP range
+GUEST_DNS="${GUEST_DNS:-169.254.169.253}"; HOST_DNS=""               # guest resolv.conf stub (DNAT'd to host DNS below)
 ZOT_BIN="${ZOT_BIN:-$(command -v zot || true)}"
 E2B_BIN="${E2B_BIN:-$(command -v e2b || true)}"
 
@@ -86,6 +87,7 @@ cleanup() {
         r1) iptables -D FORWARD -o "$SW_MGMT" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null;;
         r2) iptables -D FORWARD -i "$SW_MGMT" -j ACCEPT 2>/dev/null;;
         r3) iptables -t nat -D POSTROUTING -s "$FIP_CIDR" -j MASQUERADE 2>/dev/null;;
+        dns-*) iptables -t nat -D PREROUTING -d "$GUEST_DNS" -p "${r#dns-}" --dport 53 -j DNAT --to-destination "${HOST_DNS:-}:53" 2>/dev/null;;
     esac; done
     "$BIN/vswitch-ctl" stop "$SWITCH" --force >/dev/null 2>&1
     ip netns del "$SW_NETNS" 2>/dev/null
@@ -170,26 +172,35 @@ openssl req -x509 -newkey rsa:2048 -nodes -keyout "$WORK/tls.key" -out "$WORK/tl
 MASK="127.0.0.1:$ZOT_PORT/e2b/{templateID}:{buildID}"
 MK="$("$BIN/e2b-key-ctl" gen-key)"; ENC="$("$BIN/e2b-key-ctl" gen-key)"
 cat > "$WORK/config.yaml" <<EOF
-domain: $DOMAIN
-listen: ":$TLS_PORT"
-tls_cert: $WORK/tls.crt
-tls_key: $WORK/tls.key
+api:
+  domain: $DOMAIN
+  listen: ":$TLS_PORT"
+  tls: { cert: $WORK/tls.crt, key: $WORK/tls.key }
+proxy:
+  auth: enforce
 encryption_key: "$ENC"
-run_root: $WORK/run
-base_root: $WORK/lib
 manifest_config: $WORK/manifest.yaml
-runtime_e2b_erofs: $BIN/sandbox-runtime-e2b.erofs
-runtime_erofs: $BIN/sandbox-runtime.erofs
-kernel: $BIN/vmlinux
-overlay_diff_template: $OVL
-config_socket: $WORK/orchestrator.socket
-switch: $SWITCH
-unit_dir: $UNIT_DIR
-exec_dir: $BIN
-builder_insecure_registry: true
-builder_image_uri_mask: "$MASK"
-data_plane_auth: enforce
+paths:
+  run_root: $WORK/run
+  base_root: $WORK/lib
+  config_socket: $WORK/orchestrator.socket
+units:
+  dir: $UNIT_DIR
+sandbox:
+  network: { switch: $SWITCH }                 # e2b profile defaults: ip 169.254.0.21/30 nexthop .22; hostname/dns default + injected via files:
+  boot:
+    kernel: $BIN/vmlinux
+    runtime_e2b: $BIN/sandbox-runtime-e2b.erofs
+    runtime_base: $BIN/sandbox-runtime.erofs
+    overlay_diff_template: $OVL
+builder:
+  insecure_registry: true
+  image_uri_mask: "$MASK"
+checkpoint:
+  mode: local                                  # node-local snapshot files (default)
+  local_dir: $WORK/saved
 EOF
+# external binaries (sandbox-ctl/vswitch-ctl/…) auto-discovered next to orchestrator-ctl ($BIN)
 
 # the switch (eBPF/TC) — created once, lives in the kernel
 "$BIN/vswitch-ctl" stop "$SWITCH" --force >/dev/null 2>&1 || true; ip netns del "$SW_NETNS" 2>/dev/null || true
@@ -209,7 +220,21 @@ iptables -C FORWARD -i "$SW_MGMT" -j ACCEPT 2>/dev/null \
   || { iptables -A FORWARD -i "$SW_MGMT" -j ACCEPT && NAT_ADDED+=(r2); }
 iptables -t nat -C POSTROUTING -s "$FIP_CIDR" -j MASQUERADE 2>/dev/null \
   || { iptables -t nat -A POSTROUTING -s "$FIP_CIDR" -j MASQUERADE && NAT_ADDED+=(r3); }
-ok "NAT ready (added: ${NAT_ADDED[*]:-none already present})"
+# Guest DNS: the orchestrator injects /etc/resolv.conf -> $GUEST_DNS (a link-local
+# stub that needs routing to a real resolver). DNAT it to the host's first nameserver
+# so in-guest name resolution works. (Port-forward needs no DNS — /etc/hosts is
+# injected too — this just makes the guest resolver functional for the demo.)
+HOST_DNS="$(awk '/^nameserver/{print $2; exit}' /etc/resolv.conf 2>/dev/null)"
+if [ -n "$HOST_DNS" ]; then
+  for pr in udp tcp; do
+    iptables -t nat -C PREROUTING -d "$GUEST_DNS" -p $pr --dport 53 -j DNAT --to-destination "$HOST_DNS:53" 2>/dev/null \
+      || { iptables -t nat -A PREROUTING -d "$GUEST_DNS" -p $pr --dport 53 -j DNAT --to-destination "$HOST_DNS:53" && NAT_ADDED+=(dns-$pr); }
+  done
+  ok "NAT ready (added: ${NAT_ADDED[*]:-none already present}); guest DNS $GUEST_DNS → host $HOST_DNS"
+else
+  say "no host nameserver in /etc/resolv.conf — guest DNS ($GUEST_DNS) left unrouted (port-forward still works via /etc/hosts)"
+  ok "NAT ready (added: ${NAT_ADDED[*]:-none already present})"
+fi
 
 hosts_add "api.$DOMAIN"
 say "orchestrator-ctl serve — the e2b control plane + data-plane proxy (TLS :$TLS_PORT, Host-routed)"
@@ -298,9 +323,13 @@ banner "网络：端口转发 (host→沙箱 floatingip) + 沙箱出网 (NAT)"
 # ---------------------------------------------------------------------------
 PFMARK="pf-ok-$RANDOM"
 say "在 guest 内起一个 HTTP 服务 (python3 -m http.server 8000, 后台), 服务 /home/user"
+# /etc/hosts + /etc/resolv.conf are injected by the orchestrator via SANDBOX_CONFIG
+# files: (so getfqdn(hostname) resolves locally; without /etc/hosts http.server's
+# server_bind() stalls ~20s on DNS between bind() and listen()). Root cause + the
+# files:-based fix: docs/orchestrator.md §10. No in-guest workaround needed here.
 echo "${c_cmd}  \$ e2b sandbox exec $SID -b -- 'cd /home/user && echo $PFMARK > pf.txt && python3 -m http.server 8000'${c_off}"
 "$E2B_BIN" sandbox exec "$SID" -b -- "cd /home/user && echo $PFMARK > pf.txt && python3 -m http.server 8000" >/dev/null 2>&1 || true
-sleep 2
+sleep 3
 
 # (a) direct via the host mgmt NIC sw0m0 → the sandbox floatingip
 FIP="$(sqlite3 "$WORK/lib/orchestrator.db" "select floatingip from sandboxes where id='$SID'" 2>/dev/null)"
@@ -313,12 +342,12 @@ netdiag() {
   ip route show 2>&1 | grep -E '100\.100|sw0m0' | sed 's/^/    rt:       /'
   ip neigh show dev "$SW_MGMT"       2>&1 | sed 's/^/    neigh:    /'
   echo "  ${c_cmd}--- NETDIAG guest (self-curl isolates server-up vs host-reach) ---${c_off}"
-  "$E2B_BIN" sandbox exec "$SID" -- 'echo "self-curl: $(curl -s --max-time 3 http://127.0.0.1:8000/pf.txt 2>&1)"; echo "route(/proc Iface Dest Gw …; default=Dest 00000000):"; cat /proc/net/route 2>/dev/null' \
+  "$E2B_BIN" sandbox exec "$SID" -- 'echo "self-curl: $(curl -s --max-time 3 http://127.0.0.1:8000/pf.txt 2>&1)"; echo "listen-8000:"; (ss -ltn 2>/dev/null||netstat -ltn 2>/dev/null)|grep ":8000"||echo "(none)"; echo "http-proc:"; ps -eo pid,args 2>/dev/null|grep "http\.server"|grep -v grep||echo "(none)"; echo "getfqdn(ms):"; python3 -c "import socket,time;t=time.time();socket.getfqdn(chr(48)+\".0.0.0\");print(int((time.time()-t)*1000))" 2>&1; echo "hosts:"; cat /etc/hosts 2>&1; echo "route(default=Dest 00000000):"; cat /proc/net/route 2>/dev/null' \
     2>&1 | grep -vE 'NODE_TLS|trace-warnings' | sed 's/^/    g: /' || true
   echo "  ${c_cmd}--- vswitch.log tail ---${c_off}"; tail -12 "$WORK/vswitch.log" 2>/dev/null | sed 's/^/    vsw: /'
 }
 echo "${c_cmd}  \$ curl http://$FIP:8000/pf.txt${c_off}"
-out=""; for _ in $(seq 1 6); do out="$(curl -s --max-time 5 --noproxy '*' "http://$FIP:8000/pf.txt" 2>&1)" || true; [ "$out" = "$PFMARK" ] && break; sleep 1; done
+out=""; for _ in $(seq 1 8); do out="$(curl -s --max-time 5 --noproxy '*' "http://$FIP:8000/pf.txt" 2>&1)" || true; [ "$out" = "$PFMARK" ] && break; sleep 1; done
 echo "    ${out:-<no response>}"
 if [ "$out" = "$PFMARK" ]; then ok "host→沙箱 floatingip:8000 直连成功 (经 $SW_MGMT)"
 else netdiag; [ -n "${DEMO_NETDIAG:-}" ] && say "直连 floatingip 失败 (NETDIAG 模式, 继续)" || die "直连 floatingip 失败: ${out:-<empty>}"; fi

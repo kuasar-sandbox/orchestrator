@@ -84,19 +84,15 @@ req() {
 
 # ---- orchestrator config (dev http; transient paths) ----------------------
 cat > "$WORK/config.yaml" <<EOF
-domain: $DOMAIN
-listen: ":$PORT"
+api: { domain: $DOMAIN, listen: ":$PORT" }
 encryption_key: "$ENC"
-run_root: $WORK/run
-base_root: $WORK/lib
 manifest_config: $WORK/manifest.yaml
-runtime_e2b_erofs: $BIN/sandbox-runtime-e2b.erofs
-runtime_erofs: $BIN/sandbox-runtime.erofs
-kernel: $BIN/vmlinux
-config_socket: $WORK/orchestrator.socket
-switch: $SWITCH
-unit_dir: $UNIT_DIR
-exec_dir: $BIN
+paths: { run_root: $WORK/run, base_root: $WORK/lib, config_socket: $WORK/orchestrator.socket }
+units: { dir: $UNIT_DIR }
+sandbox:
+  network: { switch: $SWITCH }
+  boot: { kernel: $BIN/vmlinux, runtime_e2b: $BIN/sandbox-runtime-e2b.erofs, runtime_base: $BIN/sandbox-runtime.erofs }
+checkpoint: { mode: remote }
 EOF
 mkdir -p "$WORK/run" "$WORK/lib"
 # minimal shared manifest config (endpoints; key empty) so serve can read it

@@ -148,20 +148,16 @@ AK="$("$BIN/e2b-key-ctl" gen-apikey "$MK")"
 ENC="$("$BIN/e2b-key-ctl" gen-key)"
 
 cat > "$WORK/config.yaml" <<EOF
-domain: $DOMAIN
-listen: ":$PORT"
+api: { domain: $DOMAIN, listen: ":$PORT" }
 encryption_key: "$ENC"
-run_root: $WORK/run
-base_root: $WORK/lib
 manifest_config: $WORK/manifest.yaml
-runtime_e2b_erofs: $BIN/sandbox-runtime-e2b.erofs
-runtime_erofs: $BIN/sandbox-runtime.erofs
-kernel: $BIN/vmlinux
-config_socket: $WORK/orchestrator.socket
-switch: sw0
-unit_dir: $UNIT_DIR
-exec_dir: $BIN
-builder_insecure_registry: true
+paths: { run_root: $WORK/run, base_root: $WORK/lib, config_socket: $WORK/orchestrator.socket }
+units: { dir: $UNIT_DIR }
+sandbox:
+  network: { switch: sw0 }
+  boot: { kernel: $BIN/vmlinux, runtime_e2b: $BIN/sandbox-runtime-e2b.erofs, runtime_base: $BIN/sandbox-runtime.erofs }
+builder: { insecure_registry: true }
+checkpoint: { mode: remote }
 EOF
 
 "$BIN/orchestrator-ctl" manifest-key add --config "$WORK/config.yaml" "$MK" >/dev/null \
