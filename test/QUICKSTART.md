@@ -69,6 +69,7 @@ for f in test/e2e/*.sh; do bash "$f" || break; done
 | `e2e_sandbox_proto.sh` | host↔guest 双向 launch 协议 |
 | `e2e_sandbox_stdio.sh` | sandbox-ctl stdio 转发模型 |
 | `e2e_sandbox_tapfd.sh` | 网络来自 tapfd handoff 的沙箱启动 |
+| `e2e_sandbox_placeholder.sh` | launch.placeholder 空跑锚点：exec 驱动 + kill 锚点原地重启不 reboot |
 
 ### 快照 / 恢复
 
