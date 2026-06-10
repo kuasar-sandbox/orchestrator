@@ -158,7 +158,6 @@ sandbox:
 builder: { insecure_registry: true }
 checkpoint: { mode: remote }
 EOF
-"$BIN/orchestrator-ctl" manifest-key add --config "$WORK/config.yaml" "$MK" >/dev/null || fail "manifest-key add"
 "$BIN/orchestrator-ctl" serve --config "$WORK/config.yaml" >"$WORK/orch.log" 2>&1 &
 PIDS+=($!)
 for _ in $(seq 1 30); do
@@ -167,6 +166,7 @@ for _ in $(seq 1 30); do
     sleep 0.5
 done
 echo "==> orchestrator-ctl up (:$PORT)"
+"$BIN/orchestrator-ctl" manifest-key add --socket "$WORK/orchestrator.socket" "$MK" >/dev/null || fail "manifest-key add"
 
 # ---- build a ready template (native v3, proven) ---------------------------
 code=$(req POST /v3/templates "$AK" '{"name":"exec-tmpl"}')

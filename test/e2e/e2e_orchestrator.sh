@@ -101,9 +101,6 @@ manifest:
   key: ""
 EOF
 
-# Allowlist MK so it may create/build (manifest_keys table; the same DB serve uses).
-"$BIN/orchestrator-ctl" manifest-key add --config "$WORK/config.yaml" "$MK" >/dev/null || fail "manifest-key add failed"
-
 # ---- 2. start orchestrator-ctl serve --------------------------------------
 echo "==> orchestrator-ctl serve (dev http :$PORT, unit_dir=$UNIT_DIR)"
 "$BIN/orchestrator-ctl" serve --config "$WORK/config.yaml" >"$WORK/orch.log" 2>&1 &
@@ -114,14 +111,18 @@ for i in $(seq 1 30); do
     sleep 0.5
 done
 
+# Allowlist MK so it may create/build — now via serve's admin plane on the control
+# socket (the daemon owns the manifest_keys table), so it runs AFTER serve is up.
+"$BIN/orchestrator-ctl" manifest-key add --socket "$WORK/orchestrator.socket" "$MK" >/dev/null || fail "manifest-key add failed"
+
 # ---- 1. assert unit auto-install ------------------------------------------
 for u in sandbox-runner@.service sandbox-builder@.service sandbox-runner.slice sandbox-builder.slice; do
     [ -f "$UNIT_DIR/$u" ] || fail "unit $u was not generated into $UNIT_DIR"
 done
-grep -q "run-task .*--config-id=sandbox:" "$UNIT_DIR/sandbox-runner@.service" || fail "runner unit ExecStart is not run-task sandbox:"
-grep -q "run-task .*--config-id=build:"   "$UNIT_DIR/sandbox-builder@.service" || fail "builder unit ExecStart is not run-task build:"
+grep -q "run-sandbox .*--sandbox-id=" "$UNIT_DIR/sandbox-runner@.service" || fail "runner unit ExecStart is not run-sandbox"
+grep -q "run-builder .*--build-id="   "$UNIT_DIR/sandbox-builder@.service" || fail "builder unit ExecStart is not run-builder"
 grep -q "StandardOutput=file:"            "$UNIT_DIR/sandbox-builder@.service" || fail "builder unit missing StandardOutput=file (build-result capture)"
-echo "==> PASS: unit auto-install (runner+builder+slices; run-task launcher + build-result capture)"
+echo "==> PASS: unit auto-install (runner+builder+slices; run-sandbox/run-builder launchers + build-result capture)"
 
 # ---- 2. control plane: health + auth --------------------------------------
 code=$(req GET /health "")

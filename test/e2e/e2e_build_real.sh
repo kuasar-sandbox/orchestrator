@@ -9,7 +9,7 @@
 # What it exercises (the orchestrator's build backend, no e2b CLI yet):
 #   store-ctl (fs backend) ← flatten-ctl upload      (content store)
 #   zot (insecure 127.0.0.1) ← seeded base image     (registry pull)
-#   sandbox-builder@<bid>.service → run-task → flatten-ctl export --upload
+#   sandbox-builder@<bid>.service → run-builder → flatten-ctl export --upload
 #                                                    (systemd unit + config-socket)
 #   flatten-ctl stdout (manifest key) → <bid>.result → status=ready + persist id
 #
@@ -160,9 +160,6 @@ builder: { insecure_registry: true }
 checkpoint: { mode: remote }
 EOF
 
-"$BIN/orchestrator-ctl" manifest-key add --config "$WORK/config.yaml" "$MK" >/dev/null \
-    || fail "manifest-key add"
-
 "$BIN/orchestrator-ctl" serve --config "$WORK/config.yaml" >"$WORK/orch.log" 2>&1 &
 PIDS+=($!)
 for _ in $(seq 1 30); do
@@ -171,6 +168,7 @@ for _ in $(seq 1 30); do
     sleep 0.5
 done
 echo "==> orchestrator-ctl serve up (dev http :$PORT, insecure registry)"
+"$BIN/orchestrator-ctl" manifest-key add --socket "$WORK/orchestrator.socket" "$MK" >/dev/null || fail "manifest-key add"
 
 req() { # method path key [body]
     local method="$1" path="$2" key="$3" body="${4:-}"

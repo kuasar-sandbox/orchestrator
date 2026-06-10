@@ -106,9 +106,8 @@ for f in test/e2e/*.sh; do bash "$f" || break; done
 | 脚本 | 验证内容 |
 |---|---|
 | `e2e_orchestrator.sh` | orchestrator-ctl 单元自动安装 + e2b 控制面（`/health`、`X-API-KEY` 401）+ 构建 API |
-| `e2e_runtask.sh` | run-task 通用启动器 + `config`/`info` CLI（纯用户态，无 root/systemd/KVM）|
-| `e2e_build_real.sh` | 经原生 v3 API 真实展平构建（store+zot）→ ready 模板 |
-| `e2e_build_cli.sh` | **真实 e2b CLI** `template build` 端到端（client docker build+push → server flatten）|
+| `e2e_runtask.sh` | run-sandbox/run-builder 启动器 + `config`/`info` CLI（纯用户态，无 root/systemd/KVM）|
+| `e2e_build_real.sh` | 经原生 v3 API 真实展平构建（store+zot）→ ready 模板；SDK `from_image` 同款路径 |
 | `e2e_execute.sh` | 启真实 microVM（KVM）→ envd 内执行 → 暂停/恢复状态存活 → kill |
 | `e2e_orchestrator_proxy.sh` | external proxy（SO_REUSEPORT + routesync）+ 数据面 X-Access-Token + auto-resume |
 

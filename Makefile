@@ -48,7 +48,7 @@ UMBRELLA_E2E := \
   test-e2e-sandbox-restore test-e2e-sandbox-restore-files test-e2e-sandbox-snapshot \
   test-e2e-sandbox-stdio test-e2e-sandbox-tapfd test-e2e-sandbox-upload-restore \
   test-e2e-orchestrator test-e2e-runtask \
-  test-e2e-build-real test-e2e-build-cli test-e2e-execute test-e2e-orchestrator-proxy
+  test-e2e-build-real test-e2e-execute test-e2e-orchestrator-proxy
 
 PERF_TARGETS := perf-sandbox perf-sandbox-manifest perf-density
 
@@ -142,6 +142,7 @@ dedup-report:
 # (build template → boot microVM → exec → pause/resume → kill). DEMO_PAUSE=1 to
 # step through and drive the CLI from another terminal; see test/demo/DEMO.md.
 demo: build
+	BIN=$(SBIN) bash test/demo/demo_prep.sh   # persistent store/cache/registry (idempotent; honors REGISTRY=…)
 	BIN=$(SBIN) bash test/demo/demo_e2b.sh
 
 # ---------------------------------------------------------------------------

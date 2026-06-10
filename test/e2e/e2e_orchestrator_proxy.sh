@@ -174,7 +174,6 @@ sandbox:
 builder: { insecure_registry: true }
 checkpoint: { mode: remote }
 EOF
-"$BIN/orchestrator-ctl" manifest-key add --config "$WORK/config.yaml" "$MK" >/dev/null || fail "manifest-key add"
 
 # ---- start the proxy worker, then serve -----------------------------------
 echo "==> orchestrator-ctl proxy (data-plane :$PROXY_PORT, socket=$PROXY_SOCK)"
@@ -191,6 +190,7 @@ for _ in $(seq 1 30); do
     kill -0 "${PIDS[-1]}" 2>/dev/null || { dump_logs; skip "orchestrator exited"; }
     sleep 0.5
 done
+"$BIN/orchestrator-ctl" manifest-key add --socket "$WORK/orchestrator.socket" "$MK" >/dev/null || fail "manifest-key add"
 echo "==> control plane up; route-sync client dialing the proxy"
 
 # ---- build a ready e2b template (native v3) --------------------------------
