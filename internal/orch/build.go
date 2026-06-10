@@ -2,6 +2,7 @@ package orch
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/api"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/configsock"
+	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/regcreds"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/types"
 )
 
@@ -22,7 +24,7 @@ var hexKeyRe = regexp.MustCompile(`^[0-9a-f]{64}$`)
 // allowlist, and records a registered build. fromImage is pre-derived from
 // builder_image_uri_mask — the convention the e2b CLI pushes its client-built
 // image under ({templateID}/{buildID}); the v3 trigger may still override it.
-func (o *Orchestrator) newRegisteredBuild(ctx context.Context, apiKey, name string, tags []string, startCmd string) (*types.Build, error) {
+func (o *Orchestrator) newRegisteredBuild(ctx context.Context, apiKey, name string, tags []string) (*types.Build, error) {
 	manifestKey, err := o.resolveAllowed(ctx, apiKey)
 	if err != nil {
 		return nil, err
@@ -47,7 +49,6 @@ func (o *Orchestrator) newRegisteredBuild(ctx context.Context, apiKey, name stri
 		Kind:        types.KindImg,
 		Status:      types.BuildRegistered,
 		FromImage:   o.imageURIFromMask(templateID, bid.String()),
-		StartCmd:    startCmd,
 		Names:       nonEmpty(name),
 		Aliases:     append([]string{}, tags...),
 		CreatedUnix: time.Now().Unix(),
@@ -61,47 +62,13 @@ func (o *Orchestrator) newRegisteredBuild(ctx context.Context, apiKey, name stri
 // RegisterBuild handles POST /v3/templates (e2b v2 build system): record a
 // registered build; the base image + start command arrive at trigger time.
 func (o *Orchestrator) RegisterBuild(ctx context.Context, apiKey, name string, tags []string) (*types.Build, error) {
-	return o.newRegisteredBuild(ctx, apiKey, name, tags, "")
-}
-
-// CreateBuildV1 handles the deprecated v1 build system's POST /templates: the
-// build config (alias + start command) arrives at create time. The client then
-// pushes its image to the mask convention and starts the build with the no-body
-// POST /templates/{tid}/builds/{bid} (see StartBuild).
-func (o *Orchestrator) CreateBuildV1(ctx context.Context, apiKey, alias, startCmd string) (*types.Build, error) {
-	var tags []string
-	if alias != "" {
-		tags = []string{alias}
-	}
-	return o.newRegisteredBuild(ctx, apiKey, alias, tags, startCmd)
-}
-
-// StartBuild handles the v1 no-body POST /templates/{tid}/builds/{bid}: the build
-// was fully configured at create (fromImage from the mask, start command); flip
-// it to waiting for the build pool.
-func (o *Orchestrator) StartBuild(ctx context.Context, apiKey, tid, bid string) error {
-	b, err := o.st.GetBuild(ctx, bid)
-	if err != nil {
-		return err
-	}
-	if !ownsBuild(b, apiKey) || b.TemplateID != tid {
-		return api.ErrNotFound
-	}
-	if b.FromImage == "" {
-		return fmt.Errorf("build: fromImage is required (no builder_image_uri_mask configured)")
-	}
-	b.Kind = types.KindImg
-	if b.StartCmd != "" {
-		b.Kind = types.KindSnp
-	}
-	b.Status = types.BuildWaiting
-	return o.st.PutBuild(ctx, b)
+	return o.newRegisteredBuild(ctx, apiKey, name, tags)
 }
 
 // TriggerBuild handles POST /v2/templates/{tid}/builds/{bid}: record the base
 // image + start command, pick the kind (snp if a start command is set, else img),
 // and queue the build for the pool. Build steps are intentionally unsupported.
-func (o *Orchestrator) TriggerBuild(ctx context.Context, apiKey, tid, bid, fromImage, startCmd string) error {
+func (o *Orchestrator) TriggerBuild(ctx context.Context, apiKey, tid, bid, fromImage, startCmd string, auth api.BuildAuth) error {
 	b, err := o.st.GetBuild(ctx, bid)
 	if err != nil {
 		return err
@@ -123,8 +90,41 @@ func (o *Orchestrator) TriggerBuild(ctx context.Context, apiKey, tid, bid, fromI
 	if startCmd != "" {
 		b.Kind = types.KindSnp
 	}
+	if b.RegistryAuth, err = o.resolveBuildCreds(ctx, b, auth.PullToken, auth.RegistryUsername, auth.RegistryPassword); err != nil {
+		return err
+	}
 	b.Status = types.BuildWaiting
 	return o.st.PutBuild(ctx, b)
+}
+
+// resolveBuildCreds picks the registry pull credentials for this build and returns
+// them as a regcreds.Creds JSON ("" = anonymous), to be stored encrypted on the build
+// row and injected as FLATTEN_REGISTRY_* at flatten time. Precedence: the per-build
+// pull token (api_headers, opaque, manifest-key-sealed) > the SDK's fromImageRegistry
+// (cleartext username/password) > the tenant default (manifest_keys) > anonymous.
+func (o *Orchestrator) resolveBuildCreds(ctx context.Context, b *types.Build, pullToken, regUser, regPass string) (string, error) {
+	var creds regcreds.Creds
+	switch {
+	case pullToken != "":
+		c, err := regcreds.Open(b.ManifestKey, pullToken)
+		if err != nil {
+			return "", fmt.Errorf("build: pull token: %w", err)
+		}
+		creds = c
+	case regUser != "":
+		creds = regcreds.Creds{Username: regUser, Password: regPass}
+	default:
+		authJSON, err := o.st.RegistryAuthForKey(ctx, b.ManifestKey)
+		if err != nil {
+			return "", err
+		}
+		creds = regcreds.CredsForImage(authJSON, b.FromImage)
+	}
+	if creds.Empty() {
+		return "", nil
+	}
+	js, err := json.Marshal(creds)
+	return string(js), err
 }
 
 // BuildStatus handles GET /templates/{tid}/builds/{bid}/status.
@@ -152,6 +152,27 @@ func (o *Orchestrator) ListTemplates(ctx context.Context, apiKey string) ([]*typ
 		}
 	}
 	return out, nil
+}
+
+// resolveTemplateAlias maps a non-persist template reference — the transient register
+// id the SDK reports as BuildInfo.template_id, or a build name/alias — to its built
+// persist id. Returns "" if no ready build owned by this api key matches.
+func (o *Orchestrator) resolveTemplateAlias(ctx context.Context, apiKey, ref string) string {
+	builds, err := o.ListTemplates(ctx, apiKey)
+	if err != nil {
+		return ""
+	}
+	for _, b := range builds {
+		if ref == b.PersistID || ref == b.TemplateID {
+			return b.PersistID
+		}
+		for _, n := range append(append([]string{}, b.Names...), b.Aliases...) {
+			if n == ref {
+				return b.PersistID
+			}
+		}
+	}
+	return ""
 }
 
 // --- builder resource pool ---
@@ -210,7 +231,7 @@ func (o *Orchestrator) executeBuild(ctx context.Context, b *types.Build) {
 }
 
 // executeImage runs the image build in a sandbox-builder@<bid> unit (cgroup
-// accounting under sandbox-builder.slice). The unit's run-task pulls the build
+// accounting under sandbox-builder.slice). The unit's run-builder pulls the build
 // LaunchSpec over the config-socket and execs flatten-ctl; flatten-ctl's stdout
 // (the manifest key) is captured by the unit's StandardOutput=file into
 // <bid>.result, read back here.
@@ -291,6 +312,17 @@ func (o *Orchestrator) buildLaunchSpec(ctx context.Context, bid string) (*config
 		return nil, "", false, err
 	}
 	dir := filepath.Join(o.cfg.Paths.RunRoot, bid)
+	env := map[string]string{"MANIFEST_KEY": b.ManifestKey}
+	// Inject the resolved registry pull creds as FLATTEN_REGISTRY_* (token or basic)
+	// so flatten-ctl can pull from the tenant's (possibly private) registry.
+	if b.RegistryAuth != "" {
+		var c regcreds.Creds
+		if json.Unmarshal([]byte(b.RegistryAuth), &c) == nil {
+			for k, v := range c.FlattenEnv() {
+				env[k] = v
+			}
+		}
+	}
 	spec := &configsock.LaunchSpec{
 		Exec: o.cfg.FlattenCtl(),
 		Args: []string{
@@ -300,7 +332,7 @@ func (o *Orchestrator) buildLaunchSpec(ctx context.Context, bid string) (*config
 			"--upload", b.FromImage,
 		},
 		Workdir: dir,
-		Env:     map[string]string{"MANIFEST_KEY": b.ManifestKey},
+		Env:     env,
 	}
 	return spec, filepath.Join(dir, bid+".pid"), true, nil
 }

@@ -30,6 +30,7 @@ type Params struct {
 	Nexthop          string            // network.nexthop: default-route gateway; "" = no default route
 	Hostname         string            // network.hostname: guest hostname (sethostname + /etc/hosts entry)
 	DNS              []string          // /etc/resolv.conf nameservers injected via files:
+	MMDSEnabled      bool              // true => launch envd in FC mode (polls MMDS for the access-token hash); false => -isnotfc (non-secure)
 }
 
 // WriteYAML renders the SANDBOX_CONFIG and writes it to path (0600). The
@@ -54,7 +55,14 @@ func (p Params) BuildYAML() ([]byte, error) {
 		// envd is injected at /opt/sandbox-runtime/bin/envd, which sandbox-init
 		// auto-bind-mounts into the guest at the same path (see build.Runtime).
 		launchExec = "/opt/sandbox-runtime/bin/envd"
+		// FC mode (drop -isnotfc) when MMDS is enabled: envd then polls the metadata
+		// service for the access-token hash and accepts re-keying its token at /init.
+		// Otherwise -isnotfc: envd skips MMDS and runs non-secure (the orchestrator
+		// omits the access token from /init; the proxy alone gates the data plane).
 		launchArgs = []string{"-isnotfc", "-port", "49983"}
+		if p.MMDSEnabled {
+			launchArgs = []string{"-port", "49983"}
+		}
 		// envd is e2b infrastructure: it must run as root so it can setuid into
 		// the image's user when running workload commands. Without this, an image
 		// that sets Config.User (e.g. e2bdev/code-interpreter = user/1000) would

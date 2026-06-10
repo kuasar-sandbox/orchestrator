@@ -1,8 +1,9 @@
 // Command orchestrator-ctl is the single-node, e2b-compatible sandbox orchestrator.
 //
 //	orchestrator-ctl serve     --config <yaml>                          # run the daemon
-//	orchestrator-ctl run-task  --pidfile=<f> --config-socket=<uds> --config-id=<id>
-//	                                                                    # in-unit launcher (not for humans)
+//	orchestrator-ctl run-sandbox --pidfile=<f> --config-socket=<uds> --sandbox-id=<sid>
+//	orchestrator-ctl run-builder --pidfile=<f> --config-socket=<uds> --build-id=<bid>
+//	                                                                    # in-unit launchers (not for humans)
 //	orchestrator-ctl version
 //
 // Templates are built through the e2b API (POST /v3/templates ...), not a CLI.
@@ -27,6 +28,7 @@ import (
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/launcher"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/metrics"
+	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/mmds"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/orch"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/proxy"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/routesync"
@@ -48,8 +50,10 @@ func main() {
 		err = serve(os.Args[2:], log)
 	case "proxy":
 		err = runProxy(os.Args[2:], log)
-	case "run-task":
-		err = runTask(os.Args[2:], log)
+	case "run-sandbox":
+		err = runSandbox(os.Args[2:], log)
+	case "run-builder":
+		err = runBuilder(os.Args[2:], log)
 	case "config":
 		err = configCmd(os.Args[2:], log)
 	case "manifest-key":
@@ -70,7 +74,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: orchestrator-ctl {serve|proxy|run-task|config|manifest-key|export-sandbox|import-sandbox|version} [flags]")
+	fmt.Fprintln(os.Stderr, "usage: orchestrator-ctl {serve|proxy|run-sandbox|run-builder|config|manifest-key|export-sandbox|import-sandbox|version} [flags]")
 	os.Exit(2)
 }
 
@@ -126,8 +130,27 @@ func serve(args []string, log *slog.Logger) error {
 	go core.Reaper(ctx, 5*time.Second)
 	go core.BuildPool(ctx, 2*time.Second)
 
-	// task config-socket server (run-task pulls its LaunchSpec by config-id).
-	cs := configsock.New(cfg.Paths.ConfigSocket, core, log)
+	// North api handler (e2b control plane + export/import). Built once and shared by
+	// the TLS listener below and the local control socket's api plane. The node-uniform
+	// VM resources (vcpu/memory from config; disk = writable overlay seed) are surfaced
+	// in list/get responses, which the e2b SDK's ListedSandbox model requires.
+	diskMB := 0
+	if fi, err := os.Stat(cfg.Sandbox.Boot.OverlayDiffTemplate); err == nil {
+		diskMB = int(fi.Size() >> 20)
+	}
+	res := api.Resources{VCPU: cfg.Sandbox.Resources.VCPU, MemoryMB: cfg.Sandbox.Resources.MemoryMiB(), DiskMB: diskMB}
+	apiH := api.New(core, cfg.API.Domain, res, log).Handler()
+
+	// Local control socket: one UDS, three planes — task LaunchSpec (run-sandbox /
+	// run-builder; SO_PEERCRED pid == id pidfile), manifest-key management (admin plane, pid ∈
+	// admin_pidfile or, when unset, the socket's 0600 perms), and the api plane over
+	// plain h2c (X-API-KEY). See docs §6.
+	cs := configsock.New(cfg.Paths.ConfigSocket, configsock.Deps{
+		Provider:     core,
+		Admin:        core,
+		API:          apiH,
+		AdminPidfile: cfg.Paths.AdminPidfile,
+	}, log)
 	go func() {
 		if err := cs.Serve(ctx); err != nil {
 			log.Error("config-socket", "err", err)
@@ -141,7 +164,6 @@ func serve(args []string, log *slog.Logger) error {
 	dataH := buildDataPlane(ctx, cfg, core, mx, log)
 
 	// North handler: api.<domain> -> control plane; <port>-<sid>.<domain> -> data plane.
-	apiH := api.New(core, cfg.API.Domain, log).Handler()
 	mux := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		host := r.Host
 		if i := strings.IndexByte(host, ':'); i >= 0 {
@@ -168,6 +190,23 @@ func serve(args []string, log *slog.Logger) error {
 		go func() {
 			if err := serveListener(ctx, ln, dataH, cfg.API.TLS.Cert, cfg.API.TLS.Key, log); err != nil {
 				log.Error("data-plane listener", "err", err)
+			}
+		}()
+	}
+
+	// MMDS metadata service (mmds.enabled): re-keys envd (launched in FC mode) to fresh
+	// per-identity tokens at /init. Internal mode serves it here from the orchestrator's
+	// live sandbox set; external mode's proxy worker serves it from its synced route
+	// table (--mmds-listen). The host must redirect 169.254.169.254:80 -> mmds.listen.
+	if cfg.MMDS.Enabled && cfg.Proxy.Mode == config.ProxyInternal {
+		mln, err := net.Listen("tcp", cfg.MMDS.Listen)
+		if err != nil {
+			return fmt.Errorf("mmds listen %s: %w", cfg.MMDS.Listen, err)
+		}
+		log.Info("mmds metadata service", "listen", cfg.MMDS.Listen)
+		go func() {
+			if err := mmds.New(core, cfg.ParkTimeoutDur(), log).Serve(ctx, mln); err != nil {
+				log.Error("mmds service", "err", err)
 			}
 		}()
 	}

@@ -1,36 +1,53 @@
-// Package configsock implements the task config-socket: orchestrator-ctl run-task
-// dials it at startup to fetch a generic LaunchSpec (exec/args/workdir/env) for
-// its config-id, then exec-replaces into the target. The socket is the sole
-// channel for the secret-bearing env (manifest key); bulky non-secret config is a
-// plain file referenced by the spec's args. The caller is authenticated by
-// SO_PEERCRED peer pid against the config-id's pidfile (/run/sandbox/<id>/<id>.pid).
+// Package configsock implements the orchestrator's local control socket: a single
+// UDS that multiplexes three planes over HTTP (h2c, with HTTP/1.1 fallback), each
+// with its own authentication:
+//
+//   - task  (POST /internal/task/launchspec): orchestrator-ctl run-sandbox / run-builder
+//     fetch their generic LaunchSpec by config-id, then exec-replace into the target. Authed by
+//     SO_PEERCRED peer pid == the id's pidfile (/run/sandbox/<id>/<id>.pid).
+//   - admin (/internal/admin/manifest-keys): manifest-key allowlist management.
+//     Authed by SO_PEERCRED peer pid ∈ admin_pidfile (or, when that is unset, by the
+//     socket's 0600 permissions alone = same uid / root).
+//   - api   (everything else): the e2b-compatible control plane — the SAME
+//     http.Handler served over TLS at api.<domain> — reached locally over plain h2c
+//     and authed by X-API-KEY. Includes the export-sandbox / import-sandbox routes.
+//
+// The socket is the sole channel for the secret-bearing task env (manifest key);
+// bulky non-secret config is a plain file referenced by the spec's args.
 package configsock
 
 import (
 	"context"
-	"encoding/binary"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net"
+	"net/http"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
+	"time"
 
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/h2c"
 	"golang.org/x/sys/unix"
 )
 
-const maxFrame = 1 << 20 // 1 MiB
+// Plane paths. The task/admin planes live under /internal/ (a prefix the e2b SDK
+// never uses); every other path falls through to the api handler.
+const (
+	PathTaskLaunchSpec   = "/internal/task/launchspec"
+	PathAdminManifestKey = "/internal/admin/manifest-keys"
+)
 
-// Request is what a task client (orchestrator-ctl run-task) sends.
+// Request is what a task client (orchestrator-ctl run-sandbox / run-builder) sends.
 type Request struct {
 	ConfigID string `json:"config_id"`
 	Version  int    `json:"version"`
 }
 
-// LaunchSpec is the generic launch config run-task applies and then exec-replaces
+// LaunchSpec is the generic launch config the launcher applies and then exec-replaces
 // into: the absolute target binary, its args (after argv0), the working dir, and
 // env added to the inherited environment (secrets — e.g. MANIFEST_KEY — ride here,
 // never on disk).
@@ -48,18 +65,67 @@ type Provider interface {
 	LaunchSpecFor(ctx context.Context, configID string) (resp *LaunchSpec, pidFile string, ok bool, err error)
 }
 
+// AdminKeyInfo is one manifest-key allowlist entry (fingerprint only — never the key).
+type AdminKeyInfo struct {
+	Fingerprint string `json:"fingerprint"`
+	Label       string `json:"label"`
+	CreatedUnix int64  `json:"created_unix"`
+	ExpiresUnix int64  `json:"expires_unix"` // 0 = never expires
+}
+
+// Admin is the manifest-key allowlist management the admin plane exposes. Every
+// method returns the key's fingerprint (24-hex) so the daemon never echoes key
+// material back to the client.
+type Admin interface {
+	AddManifestKey(ctx context.Context, key, label string, ttlSec int64, registryAuth string) (added bool, fp string, err error)
+	RemoveManifestKey(ctx context.Context, key string) (removed bool, fp string, err error)
+	HasManifestKey(ctx context.Context, key string) (present bool, fp string, err error)
+	ListManifestKeys(ctx context.Context) ([]AdminKeyInfo, error)
+}
+
+// AdminKeyRequest / AdminKeyResponse are the admin-plane add/remove/check messages.
+type AdminKeyRequest struct {
+	Op           string `json:"op"` // add | remove | check
+	Key          string `json:"key"`
+	Label        string `json:"label,omitempty"`
+	TTLSeconds   int64  `json:"ttl_seconds,omitempty"`   // add: 0 = never expires
+	RegistryAuth string `json:"registry_auth,omitempty"` // add: tenant-default docker config.json
+}
+
+type AdminKeyResponse struct {
+	Op          string `json:"op"`
+	Fingerprint string `json:"fingerprint"`
+	Status      string `json:"status"` // added | exists | removed | absent | present
+	Error       string `json:"error,omitempty"`
+}
+
+// Deps wires the three planes for New.
+type Deps struct {
+	Provider     Provider     // task plane (LaunchSpec by config-id)
+	Admin        Admin        // admin plane (manifest-key allowlist)
+	API          http.Handler // api plane (e2b control plane + export/import); the fallback
+	AdminPidfile string       // optional PID allowlist gating the admin plane ("" => socket perms only)
+}
+
 type Server struct {
 	path string
-	prov Provider
+	deps Deps
 	log  *slog.Logger
-	ln   *net.UnixListener
 }
 
-func New(path string, prov Provider, log *slog.Logger) *Server {
-	return &Server{path: path, prov: prov, log: log}
+func New(path string, deps Deps, log *slog.Logger) *Server {
+	return &Server{path: path, deps: deps, log: log}
 }
 
-// Serve binds the UDS (0600) and accepts until ctx is cancelled.
+// peerPIDKey carries the SO_PEERCRED peer pid (captured at accept) into handlers.
+type peerPIDKey struct{}
+
+func peerFrom(ctx context.Context) (int, bool) {
+	v, ok := ctx.Value(peerPIDKey{}).(int)
+	return v, ok
+}
+
+// Serve binds the UDS (0600) and serves the three planes over h2c until ctx ends.
 func (s *Server) Serve(ctx context.Context) error {
 	_ = os.Remove(s.path)
 	ln, err := net.ListenUnix("unix", &net.UnixAddr{Name: s.path, Net: "unix"})
@@ -70,58 +136,77 @@ func (s *Server) Serve(ctx context.Context) error {
 		ln.Close()
 		return fmt.Errorf("configsock: chmod: %w", err)
 	}
-	s.ln = ln
-	go func() { <-ctx.Done(); ln.Close() }()
-	for {
-		c, err := ln.AcceptUnix()
-		if err != nil {
-			if ctx.Err() != nil {
-				return nil
+	srv := &http.Server{
+		Handler:           h2c.NewHandler(s.router(), &http2.Server{}),
+		ReadHeaderTimeout: 10 * time.Second,
+		// Capture the connecting process's pid via SO_PEERCRED at accept time so
+		// every request on the connection can be authorized by peer pid.
+		ConnContext: func(ctx context.Context, c net.Conn) context.Context {
+			if uc, ok := c.(*net.UnixConn); ok {
+				if pid, err := peerPID(uc); err == nil {
+					return context.WithValue(ctx, peerPIDKey{}, pid)
+				}
 			}
-			s.log.Warn("configsock accept", "err", err)
-			continue
-		}
-		go s.handle(ctx, c)
+			return ctx
+		},
 	}
+	go func() {
+		<-ctx.Done()
+		sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(sctx)
+	}()
+	if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
+		return err
+	}
+	return nil
 }
 
-func (s *Server) handle(ctx context.Context, c *net.UnixConn) {
-	defer c.Close()
-	pid, err := peerPID(c)
-	if err != nil {
-		s.log.Warn("configsock peercred", "err", err)
-		return
+func (s *Server) router() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST "+PathTaskLaunchSpec, s.handleTask)
+	mux.HandleFunc(PathAdminManifestKey, s.handleAdminKeys) // GET=list, POST=add/remove/check
+	// Everything else is the api plane (e2b control plane + export/import), authed
+	// by X-API-KEY inside the api handler. The "/internal/" routes above are more
+	// specific, so they win over this catch-all.
+	if s.deps.API != nil {
+		mux.Handle("/", s.deps.API)
 	}
-	req, err := readFrame[Request](c)
-	if err != nil {
-		s.log.Warn("configsock read", "err", err)
-		return
-	}
-	if err := writeFrame(c, s.resolve(ctx, req, pid)); err != nil {
-		s.log.Warn("configsock write", "err", err)
-	}
+	return mux
 }
 
-func (s *Server) resolve(ctx context.Context, req *Request, peer int) *LaunchSpec {
-	if req.ConfigID == "" {
-		return &LaunchSpec{Error: "bad request"}
+// --- task plane ---
+
+func (s *Server) handleTask(w http.ResponseWriter, r *http.Request) {
+	peer, ok := peerFrom(r.Context())
+	if !ok {
+		writeJSON(w, http.StatusForbidden, &LaunchSpec{Error: "no peer credentials"})
+		return
 	}
-	r, pidFile, ok, err := s.prov.LaunchSpecFor(ctx, req.ConfigID)
+	var req Request
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ConfigID == "" {
+		writeJSON(w, http.StatusBadRequest, &LaunchSpec{Error: "bad request"})
+		return
+	}
+	spec, pidFile, found, err := s.deps.Provider.LaunchSpecFor(r.Context(), req.ConfigID)
 	if err != nil {
 		s.log.Warn("configsock provider", "id", req.ConfigID, "err", err)
-		return &LaunchSpec{Error: "internal error"}
+		writeJSON(w, http.StatusInternalServerError, &LaunchSpec{Error: "internal error"})
+		return
 	}
-	if !ok {
-		return &LaunchSpec{Error: "unknown task"}
+	if !found {
+		writeJSON(w, http.StatusNotFound, &LaunchSpec{Error: "unknown task"})
+		return
 	}
-	if !s.authed(req.ConfigID, pidFile, peer) {
-		return &LaunchSpec{Error: "not authorized"}
+	if !s.taskAuthed(req.ConfigID, pidFile, peer) {
+		writeJSON(w, http.StatusForbidden, &LaunchSpec{Error: "not authorized"})
+		return
 	}
-	return r
+	writeJSON(w, http.StatusOK, spec)
 }
 
-// authed verifies the connecting pid matches the id's pidfile (SO_PEERCRED).
-func (s *Server) authed(id, pidFile string, peer int) bool {
+// taskAuthed verifies the connecting pid matches the id's pidfile (SO_PEERCRED).
+func (s *Server) taskAuthed(id, pidFile string, peer int) bool {
 	want, err := readPID(pidFile)
 	if err != nil {
 		s.log.Warn("configsock pidfile", "id", id, "err", err)
@@ -133,6 +218,97 @@ func (s *Server) authed(id, pidFile string, peer int) bool {
 	}
 	return true
 }
+
+// --- admin plane ---
+
+func (s *Server) handleAdminKeys(w http.ResponseWriter, r *http.Request) {
+	peer, ok := peerFrom(r.Context())
+	if !ok || !s.adminAuthed(peer) {
+		writeJSON(w, http.StatusForbidden, &AdminKeyResponse{Error: "not authorized (admin)"})
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		infos, err := s.deps.Admin.ListManifestKeys(r.Context())
+		if err != nil {
+			s.log.Warn("configsock admin list", "err", err)
+			writeJSON(w, http.StatusInternalServerError, &AdminKeyResponse{Error: "internal error"})
+			return
+		}
+		writeJSON(w, http.StatusOK, infos)
+	case http.MethodPost:
+		var req AdminKeyRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Key == "" {
+			writeJSON(w, http.StatusBadRequest, &AdminKeyResponse{Op: req.Op, Error: "key required"})
+			return
+		}
+		resp := s.adminOp(r.Context(), req)
+		code := http.StatusOK
+		if resp.Error != "" {
+			code = http.StatusBadRequest
+		}
+		writeJSON(w, code, resp)
+	default:
+		writeJSON(w, http.StatusMethodNotAllowed, &AdminKeyResponse{Error: "method not allowed"})
+	}
+}
+
+func (s *Server) adminOp(ctx context.Context, req AdminKeyRequest) *AdminKeyResponse {
+	out := &AdminKeyResponse{Op: req.Op}
+	switch req.Op {
+	case "add":
+		added, fp, err := s.deps.Admin.AddManifestKey(ctx, req.Key, req.Label, req.TTLSeconds, req.RegistryAuth)
+		if err != nil {
+			out.Error = err.Error()
+			return out
+		}
+		out.Fingerprint, out.Status = fp, statusWord(added, "added", "refreshed")
+	case "remove":
+		removed, fp, err := s.deps.Admin.RemoveManifestKey(ctx, req.Key)
+		if err != nil {
+			out.Error = err.Error()
+			return out
+		}
+		out.Fingerprint, out.Status = fp, statusWord(removed, "removed", "absent")
+	case "check":
+		present, fp, err := s.deps.Admin.HasManifestKey(ctx, req.Key)
+		if err != nil {
+			out.Error = err.Error()
+			return out
+		}
+		out.Fingerprint, out.Status = fp, statusWord(present, "present", "absent")
+	default:
+		out.Error = "unknown op (want add|remove|check)"
+	}
+	return out
+}
+
+// adminAuthed gates the admin plane: when admin_pidfile is set the peer pid must be
+// listed; otherwise the socket's 0600 perms (same uid / root) are the only gate.
+func (s *Server) adminAuthed(peer int) bool {
+	if s.deps.AdminPidfile == "" {
+		return true
+	}
+	pids, err := readPIDs(s.deps.AdminPidfile)
+	if err != nil {
+		s.log.Warn("configsock admin pidfile", "path", s.deps.AdminPidfile, "err", err)
+		return false
+	}
+	if slices.Contains(pids, peer) {
+		return true
+	}
+	s.log.Warn("configsock admin pid not allowlisted", "peer", peer, "pidfile", s.deps.AdminPidfile)
+	return false
+}
+
+func statusWord(b bool, yes, no string) string {
+	if b {
+		return yes
+	}
+	return no
+}
+
+// --- shared helpers ---
 
 // peerPID returns the connecting process's pid via SO_PEERCRED.
 func peerPID(c *net.UnixConn) (int, error) {
@@ -161,39 +337,30 @@ func readPID(path string) (int, error) {
 	return strconv.Atoi(strings.TrimSpace(string(b)))
 }
 
-func readFrame[T any](r io.Reader) (*T, error) {
-	var hdr [4]byte
-	if _, err := io.ReadFull(r, hdr[:]); err != nil {
+// readPIDs parses a multi-line PID allowlist (one PID per line; blank lines and
+// '#' comments ignored).
+func readPIDs(path string) ([]int, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
 		return nil, err
 	}
-	n := binary.LittleEndian.Uint32(hdr[:])
-	if n == 0 || n > maxFrame {
-		return nil, errors.New("configsock: bad frame length")
+	var pids []int
+	for _, line := range strings.Split(string(b), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		p, err := strconv.Atoi(line)
+		if err != nil {
+			return nil, fmt.Errorf("configsock: admin pidfile %s: bad pid %q", path, line)
+		}
+		pids = append(pids, p)
 	}
-	buf := make([]byte, n)
-	if _, err := io.ReadFull(r, buf); err != nil {
-		return nil, err
-	}
-	var v T
-	if err := json.Unmarshal(buf, &v); err != nil {
-		return nil, err
-	}
-	return &v, nil
+	return pids, nil
 }
 
-func writeFrame(w io.Writer, v any) error {
-	b, err := json.Marshal(v)
-	if err != nil {
-		return err
-	}
-	if len(b) > maxFrame {
-		return errors.New("configsock: response too large")
-	}
-	var hdr [4]byte
-	binary.LittleEndian.PutUint32(hdr[:], uint32(len(b)))
-	if _, err := w.Write(hdr[:]); err != nil {
-		return err
-	}
-	_, err = w.Write(b)
-	return err
+func writeJSON(w http.ResponseWriter, code int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	_ = json.NewEncoder(w).Encode(v)
 }

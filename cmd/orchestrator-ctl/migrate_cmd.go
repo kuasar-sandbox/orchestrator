@@ -1,96 +1,90 @@
 package main
 
 import (
-	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
-
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/config"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/orch"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/secretbox"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/store"
 )
 
-// exportSandboxCmd implements `orchestrator-ctl export-sandbox <sid>`. With
-// --to-template it promotes the paused sandbox's snapshot to a remote manifest and
-// prints the persist template id (fork/fan-out; usable via `e2b sandbox create`).
-// Otherwise it prints a one-line base64 migration token for `import-sandbox` on
-// another node (same-sid move). Auth: E2B_API_KEY env (must own the sandbox).
-func exportSandboxCmd(args []string, log *slog.Logger) error {
+// exportSandboxCmd implements `orchestrator-ctl export-sandbox <sid>` as a client of
+// the running serve daemon's api plane (POST /sandboxes/{id}/export over the local
+// control socket). With --to-template it promotes the paused sandbox's snapshot to a
+// remote manifest and prints the persist template id (fork; usable via `e2b sandbox
+// create`). Otherwise it prints a one-line base64 migration token for `import-sandbox`
+// on another node (same-sid move). Auth: E2B_API_KEY env (must own the sandbox).
+func exportSandboxCmd(args []string, _ *slog.Logger) error {
+	sid, rest := leadingPositional(args)
 	fs := flag.NewFlagSet("export-sandbox", flag.ContinueOnError)
-	cfgPath := fs.String("config", "", "orchestrator config YAML (or ORCHESTRATOR_CONFIG env)")
+	socket := fs.String("socket", "", "orchestrator control socket (or ORCHESTRATOR_SOCKET env)")
 	toTemplate := fs.Bool("to-template", false, "promote + print the persist template id (fork) instead of a migration token")
 	keepSource := fs.Bool("keep-source", false, "keep the source sandbox (copy) instead of relinquishing it (move)")
-	if err := fs.Parse(args); err != nil {
+	if err := fs.Parse(rest); err != nil {
 		return err
 	}
-	sid := fs.Arg(0)
 	if sid == "" {
-		return fmt.Errorf("usage: orchestrator-ctl export-sandbox <sid> [--to-template] [--keep-source] --config <cfg>")
+		sid = fs.Arg(0)
 	}
-	o, st, err := liteOrch(*cfgPath, log)
+	if sid == "" {
+		return fmt.Errorf("usage: orchestrator-ctl export-sandbox <sid> [--to-template] [--keep-source] [--socket S]")
+	}
+	apiKey := os.Getenv("E2B_API_KEY")
+	if apiKey == "" {
+		return fmt.Errorf("export-sandbox: E2B_API_KEY is required")
+	}
+	body := map[string]any{"toTemplate": *toTemplate, "keepSource": *keepSource}
+	code, resp, err := udsDo(resolveSocket(*socket), http.MethodPost,
+		"/sandboxes/"+sid+"/export", map[string]string{"X-API-KEY": apiKey}, body)
 	if err != nil {
 		return err
 	}
-	defer st.Close()
-	out, err := o.ExportSandbox(context.Background(), os.Getenv("E2B_API_KEY"), sid, *toTemplate, *keepSource)
-	if err != nil {
-		return err
+	if code != http.StatusOK {
+		return fmt.Errorf("export-sandbox: %s", apiMessage(resp))
 	}
-	fmt.Println(out)
+	var out struct {
+		Result string `json:"result"`
+	}
+	_ = json.Unmarshal(resp, &out)
+	fmt.Println(out.Result)
 	return nil
 }
 
-// importSandboxCmd implements `orchestrator-ctl import-sandbox <token>`: recreate a
-// paused sandbox from a migration token on this node (which must share the remote
-// store and have the tenant manifest-key added). Auth: E2B_API_KEY env.
-func importSandboxCmd(args []string, log *slog.Logger) error {
+// importSandboxCmd implements `orchestrator-ctl import-sandbox <token>` as a client of
+// the daemon's api plane (POST /sandboxes/import): recreate a paused sandbox from a
+// migration token on this node (which must share the remote store and have the tenant
+// manifest-key added). Auth: E2B_API_KEY env.
+func importSandboxCmd(args []string, _ *slog.Logger) error {
+	tok, rest := leadingPositional(args)
 	fs := flag.NewFlagSet("import-sandbox", flag.ContinueOnError)
-	cfgPath := fs.String("config", "", "orchestrator config YAML (or ORCHESTRATOR_CONFIG env)")
-	if err := fs.Parse(args); err != nil {
+	socket := fs.String("socket", "", "orchestrator control socket (or ORCHESTRATOR_SOCKET env)")
+	if err := fs.Parse(rest); err != nil {
 		return err
 	}
-	tok := fs.Arg(0)
 	if tok == "" {
-		return fmt.Errorf("usage: orchestrator-ctl import-sandbox <token> --config <cfg>")
+		tok = fs.Arg(0)
 	}
-	o, st, err := liteOrch(*cfgPath, log)
+	if tok == "" {
+		return fmt.Errorf("usage: orchestrator-ctl import-sandbox <token> [--socket S]")
+	}
+	apiKey := os.Getenv("E2B_API_KEY")
+	if apiKey == "" {
+		return fmt.Errorf("import-sandbox: E2B_API_KEY is required")
+	}
+	code, resp, err := udsDo(resolveSocket(*socket), http.MethodPost,
+		"/sandboxes/import", map[string]string{"X-API-KEY": apiKey}, map[string]any{"token": tok})
 	if err != nil {
 		return err
 	}
-	defer st.Close()
-	id, err := o.ImportSandbox(context.Background(), os.Getenv("E2B_API_KEY"), tok)
-	if err != nil {
-		return err
+	if code != http.StatusOK {
+		return fmt.Errorf("import-sandbox: %s", apiMessage(resp))
 	}
-	fmt.Fprintf(os.Stderr, "imported %s — resume on this node with: e2b sandbox resume %s\n", id, id)
-	fmt.Println(id)
+	var out struct {
+		SandboxID string `json:"sandboxID"`
+	}
+	_ = json.Unmarshal(resp, &out)
+	fmt.Fprintf(os.Stderr, "imported %s — resume on this node with: e2b sandbox resume %s\n", out.SandboxID, out.SandboxID)
+	fmt.Println(out.SandboxID)
 	return nil
-}
-
-// liteOrch builds an Orchestrator with only the store + config wired (no launcher
-// or vswitch — export/import touch neither). It runs alongside a live serve daemon
-// (SQLite WAL), like `manifest-key`.
-func liteOrch(cfgPath string, log *slog.Logger) (*orch.Orchestrator, *store.Store, error) {
-	if cfgPath == "" {
-		cfgPath = os.Getenv("ORCHESTRATOR_CONFIG")
-	}
-	if cfgPath == "" {
-		return nil, nil, fmt.Errorf("--config <file> (or ORCHESTRATOR_CONFIG) is required")
-	}
-	cfg, err := config.Load(cfgPath)
-	if err != nil {
-		return nil, nil, err
-	}
-	box, err := secretbox.NewFromColonHex(cfg.EncryptionKeySpec())
-	if err != nil {
-		return nil, nil, err
-	}
-	st, err := store.Open(cfg.Paths.DBPath, box)
-	if err != nil {
-		return nil, nil, err
-	}
-	return orch.New(cfg, st, nil, nil, log), st, nil
 }

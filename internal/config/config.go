@@ -11,6 +11,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -56,6 +58,9 @@ type Config struct {
 	Builder BuilderConfig `yaml:"builder"` // build-instance settings
 	// Checkpoint is the paused-state tiering policy (parallel to sandbox).
 	Checkpoint CheckpointConfig `yaml:"checkpoint"`
+	// MMDS is the optional envd metadata service (re-keys envd to fresh per-identity
+	// tokens). Disabled => envd runs non-secure and the proxy is the sole data-plane gate.
+	MMDS MMDSConfig `yaml:"mmds"`
 	// Singular top-level references.
 	EncryptionKey  string `yaml:"encryption_key"`  // manifest_key at-rest AES-256 (":"-sep, first active); or ORCHESTRATOR_ENCRYPTION_KEY env
 	ManifestConfig string `yaml:"manifest_config"` // remote manifest store config (path ref; shared by sandbox + builder)
@@ -88,12 +93,27 @@ type ProxyConfig struct {
 	MetricsListen string   `yaml:"metrics_listen"` // optional Prometheus text endpoint; "" = off
 }
 
+// MMDSConfig is the optional Firecracker-MMDS-v2 metadata service the orchestrator
+// serves so envd (run in FC mode, i.e. without -isnotfc) can re-key its access token
+// to a fresh per-identity value at /init — required for snapshot-fork data-plane auth.
+// enabled=false keeps envd in -isnotfc (non-secure); the proxy then enforces
+// X-Access-Token as the sole gate. The MMDS is hosted by the proxy component
+// (internal: serve binds Listen; external: the proxy worker via --mmds-listen). envd
+// hard-codes 169.254.169.254:80, so the vswitch's --mgmt-service translates that VIP to
+// Listen in its datapath (no iptables); a loopback Listen needs route_localnet=1 on the
+// mgmt dev.
+type MMDSConfig struct {
+	Enabled bool   `yaml:"enabled"` // false (default) => -isnotfc + proxy-only auth
+	Listen  string `yaml:"listen"`  // MMDS listener (the vswitch mgmt-service target); default 127.0.0.1:19254
+}
+
 // PathsConfig holds node-local directories and sockets.
 type PathsConfig struct {
 	RunRoot      string `yaml:"run_root"`      // default /run/sandbox (tmpfs)
 	BaseRoot     string `yaml:"base_root"`     // default /var/lib/sandbox (persistent)
 	DBPath       string `yaml:"db_path"`       // default <base_root>/orchestrator.db
 	ConfigSocket string `yaml:"config_socket"` // default /run/sandbox/orchestrator.socket
+	AdminPidfile string `yaml:"admin_pidfile"` // optional PID allowlist (multi-line) gating the socket admin plane; "" => socket perms (same-uid/root) only
 }
 
 // UnitsConfig manages the systemd template units (generated + installed at startup).
@@ -117,6 +137,39 @@ type ResourcesConfig struct {
 	VCPU          int    `yaml:"vcpu"`           // default 2
 	Memory        string `yaml:"memory"`         // default "2GiB"
 	ControlSocket string `yaml:"control_socket"` // sentinel resource-controller UDS; "" = static cgroup mode
+}
+
+// MemoryMiB parses Memory ("2GiB", "512MiB", "2G", "512M", or a plain byte count)
+// into whole MiB, for surfacing the VM's memory in e2b list/get responses. Returns
+// 0 if unset or unparseable (the value is informational, not an allocation knob).
+func (r ResourcesConfig) MemoryMiB() int { return parseMiB(r.Memory) }
+
+func parseMiB(s string) int {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0
+	}
+	mul := 1.0 / (1 << 20) // plain number = bytes -> MiB
+	for _, u := range []struct {
+		suf string
+		m   float64
+	}{
+		{"GiB", 1 << 10}, {"Gi", 1 << 10}, {"G", 1 << 10},
+		{"MiB", 1}, {"Mi", 1}, {"M", 1},
+		{"KiB", 1.0 / (1 << 10)}, {"Ki", 1.0 / (1 << 10)}, {"K", 1.0 / (1 << 10)},
+		{"B", 1.0 / (1 << 20)},
+	} {
+		if strings.HasSuffix(s, u.suf) {
+			s = strings.TrimSuffix(s, u.suf)
+			mul = u.m
+			break
+		}
+	}
+	v, err := strconv.ParseFloat(strings.TrimSpace(s), 64)
+	if err != nil {
+		return 0
+	}
+	return int(v * mul)
 }
 
 // NetworkConfig is the per-sandbox network: vswitch, guest hostname/DNS (provisioned
@@ -231,6 +284,7 @@ func (c *Config) applyDefaults() {
 	}
 	def(&c.Checkpoint.Mode, CheckpointLocal)
 	def(&c.Checkpoint.LocalDir, "/var/lib/sandbox-saved")
+	def(&c.MMDS.Listen, "127.0.0.1:19254")
 	if exe, err := os.Executable(); err == nil {
 		c.execDir = filepath.Dir(exe)
 	}
@@ -304,6 +358,13 @@ func (c *Config) ValidateProxy() error {
 	}
 	if c.Proxy.Mode == ProxyExternal && len(c.Proxy.Sockets) == 0 {
 		return fmt.Errorf("config: proxy.mode=external requires proxy.sockets (or --proxy-socket)")
+	}
+	// MMDS off => envd is non-secure, so the proxy must be the enforcing sole gate.
+	if !c.MMDS.Enabled && c.Proxy.Auth != AuthEnforce {
+		return fmt.Errorf("config: mmds.enabled=false requires proxy.auth=enforce (envd runs non-secure; the proxy is the only data-plane gate)")
+	}
+	if c.MMDS.Enabled && c.Proxy.Mode == ProxyOff {
+		return fmt.Errorf("config: mmds.enabled=true requires proxy.mode!=off (the MMDS service is hosted by the proxy)")
 	}
 	return nil
 }

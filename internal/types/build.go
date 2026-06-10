@@ -47,9 +47,10 @@ type Build struct {
 	ManifestKey string  // per-tenant manifest key (hex); ownership + crypto root
 	Profile     Profile // e2b (API builds are always e2b)
 	Kind        Kind    // img (flatten only) | snp (boot+snapshot)
-	FromImage   string  // OCI base image (the Dockerfile FROM)
-	StartCmd    string  // non-empty => snapshot build (kind=snp)
-	Status      BuildState
+	FromImage    string // OCI base image (the Dockerfile FROM)
+	RegistryAuth string // resolved registry pull creds (regcreds.Creds JSON; "" = anonymous), stored encrypted
+	StartCmd     string // non-empty => snapshot build (kind=snp)
+	Status       BuildState
 	Reason      string   // error detail
 	Names       []string // user-supplied name(s) + persist id (when ready)
 	Aliases     []string // user-supplied alias(es) + persist id (when ready)

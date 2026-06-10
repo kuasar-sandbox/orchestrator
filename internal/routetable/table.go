@@ -107,6 +107,32 @@ func (t *Table) Lookup(sid string) (routesync.RouteEntry, bool) {
 	return r, ok
 }
 
+// ByFloatingIP returns the running sandbox id whose floating IP matches ip — the lookup
+// the MMDS service parks around at PUT to map a guest's (SNAT'd) source IP to its id.
+// Implements mmds.Source (PUT stage) for the external proxy worker. Running only: a
+// paused sandbox's floating IP may be reused by a running one, so paused entries would
+// be ambiguous.
+func (t *Table) ByFloatingIP(ip string) (sandboxID string, ok bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for _, r := range t.routes {
+		if r.FloatingIP == ip && r.State == routesync.StateRunning {
+			return r.SandboxID, true
+		}
+	}
+	return "", false
+}
+
+// SandboxInfo returns sid's current template id + access token (mmds.Source, GET stage).
+func (t *Table) SandboxInfo(sid string) (templateID, accessToken string, ok bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if r, ok := t.routes[sid]; ok && r.State == routesync.StateRunning {
+		return r.TemplateID, r.AccessToken, true
+	}
+	return "", "", false
+}
+
 // Policy returns the last pushed policy.
 func (t *Table) Policy() routesync.Policy {
 	t.mu.Lock()

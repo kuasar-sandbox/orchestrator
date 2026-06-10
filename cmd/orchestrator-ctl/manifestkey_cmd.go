@@ -1,125 +1,97 @@
 package main
 
 import (
-	"context"
-	"encoding/hex"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"time"
 
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/apikey"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/config"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/secretbox"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/store"
+	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/configsock"
+	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/regcreds"
 )
 
+// buildRegistryAuth produces the tenant-default registry auth (a docker config.json)
+// from either a --registry-auth file or simple --registry-username/--password/--token
+// (auto-assembled under a catch-all "*" entry). Returns "" when none was given.
+func buildRegistryAuth(file, user, pass, token string) (string, error) {
+	if file != "" {
+		b, err := os.ReadFile(file)
+		if err != nil {
+			return "", fmt.Errorf("manifest-key: read --registry-auth: %w", err)
+		}
+		if err := regcreds.ValidateDockerAuth(string(b)); err != nil {
+			return "", err
+		}
+		return string(b), nil
+	}
+	if user != "" || token != "" {
+		return regcreds.AssembleDockerAuth(regcreds.Creds{Username: user, Password: pass, Token: token})
+	}
+	return "", nil
+}
+
 // manifestKeyCmd implements `orchestrator-ctl manifest-key {add|remove|check|list}`
-// — the create/build allowlist (the manifest_keys table). Keys are read from
-// positional args or the MANIFEST_KEY env; output is fingerprints only (the 24-hex
-// SHA256[:12] prefix), never the key material.
+// — the create/build allowlist (the manifest_keys table). It is a thin client of the
+// running serve daemon's admin plane (the local control socket): the daemon is the
+// sole owner of the table. Keys are read from positional args or the MANIFEST_KEY
+// env; output is fingerprints only (the 24-hex SHA256[:12] prefix), never the key.
+// Admin authorization is by SO_PEERCRED (admin_pidfile allowlist, or the socket's
+// 0600 perms — same uid / root — when admin_pidfile is unset).
 //
-//	orchestrator-ctl manifest-key add    [--label L] <MANIFEST_KEY>...
-//	orchestrator-ctl manifest-key remove                <MANIFEST_KEY>...
-//	orchestrator-ctl manifest-key check                 <MANIFEST_KEY>...
-//	orchestrator-ctl manifest-key list
+//	orchestrator-ctl manifest-key add    [--label L] [--socket S] <MANIFEST_KEY>...
+//	orchestrator-ctl manifest-key remove            [--socket S] <MANIFEST_KEY>...
+//	orchestrator-ctl manifest-key check             [--socket S] <MANIFEST_KEY>...
+//	orchestrator-ctl manifest-key list              [--socket S]
 func manifestKeyCmd(args []string, _ *slog.Logger) error {
 	if len(args) == 0 {
 		return fmt.Errorf("manifest-key: subcommand required: add|remove|check|list")
 	}
 	sub, rest := args[0], args[1:]
 	fs := flag.NewFlagSet("manifest-key "+sub, flag.ExitOnError)
-	cfgPath := fs.String("config", "/etc/orchestrator-ctl/config.yaml", "config file")
+	socket := fs.String("socket", "", "orchestrator control socket (or ORCHESTRATOR_SOCKET env)")
 	label := fs.String("label", "", "optional label (add)")
+	ttl := fs.Duration("ttl", 0, "add: expire the key after this duration (e.g. 24h); 0 = never. Re-adding refreshes it.")
+	regAuthFile := fs.String("registry-auth", "", "add: tenant-default registry creds as a docker config.json file")
+	regUser := fs.String("registry-username", "", "add: tenant-default registry username (assembles a catch-all auth)")
+	regPass := fs.String("registry-password", "", "add: tenant-default registry password")
+	regToken := fs.String("registry-token", "", "add: tenant-default registry bearer token (assembles a catch-all auth)")
 	_ = fs.Parse(rest)
+	sock := resolveSocket(*socket)
+
+	if sub == "list" {
+		return manifestKeyList(sock)
+	}
+	registryAuth, err := buildRegistryAuth(*regAuthFile, *regUser, *regPass, *regToken)
+	if err != nil {
+		return err
+	}
+
 	keys := fs.Args()
 	if len(keys) == 0 {
 		if v := os.Getenv("MANIFEST_KEY"); v != "" {
 			keys = []string{v}
 		}
 	}
-
-	cfg, err := config.Load(*cfgPath)
-	if err != nil {
-		return err
+	if len(keys) == 0 {
+		return fmt.Errorf("manifest-key %s: provide MANIFEST_KEY arg(s) or env", sub)
 	}
-	box, err := secretbox.NewFromColonHex(cfg.EncryptionKeySpec())
-	if err != nil {
-		return err
-	}
-	st, err := store.Open(cfg.Paths.DBPath, box)
-	if err != nil {
-		return err
-	}
-	defer st.Close()
-	ctx := context.Background()
-
 	switch sub {
-	case "add":
-		if len(keys) == 0 {
-			return fmt.Errorf("manifest-key add: provide MANIFEST_KEY arg(s) or env")
-		}
+	case "add", "remove", "check":
 		for _, k := range keys {
-			fp, err := fingerprintHex(k)
+			req := configsock.AdminKeyRequest{Op: sub, Key: k, Label: *label, TTLSeconds: int64(ttl.Seconds()), RegistryAuth: registryAuth}
+			code, body, err := udsDo(sock, http.MethodPost, configsock.PathAdminManifestKey, nil, req)
 			if err != nil {
 				return err
 			}
-			added, err := st.AddManifestKey(ctx, k, *label)
-			if err != nil {
-				return err
+			var resp configsock.AdminKeyResponse
+			_ = json.Unmarshal(body, &resp)
+			if code != http.StatusOK || resp.Error != "" {
+				return fmt.Errorf("manifest-key %s: %s", sub, firstNonEmpty(resp.Error, string(body)))
 			}
-			if added {
-				fmt.Printf("added    %s\n", fp)
-			} else {
-				fmt.Printf("exists   %s\n", fp)
-			}
-		}
-	case "remove":
-		if len(keys) == 0 {
-			return fmt.Errorf("manifest-key remove: provide MANIFEST_KEY arg(s) or env")
-		}
-		for _, k := range keys {
-			fp, err := fingerprintHex(k)
-			if err != nil {
-				return err
-			}
-			n, err := st.RemoveManifestKey(ctx, k)
-			if err != nil {
-				return err
-			}
-			if n > 0 {
-				fmt.Printf("removed  %s\n", fp)
-			} else {
-				fmt.Printf("absent   %s\n", fp)
-			}
-		}
-	case "check":
-		if len(keys) == 0 {
-			return fmt.Errorf("manifest-key check: provide MANIFEST_KEY arg(s) or env")
-		}
-		for _, k := range keys {
-			fp, err := fingerprintHex(k)
-			if err != nil {
-				return err
-			}
-			ok, err := st.HasManifestKey(ctx, k)
-			if err != nil {
-				return err
-			}
-			word := "absent"
-			if ok {
-				word = "present"
-			}
-			fmt.Printf("%-8s %s\n", word, fp)
-		}
-	case "list":
-		infos, err := st.ListManifestKeys(ctx)
-		if err != nil {
-			return err
-		}
-		for _, mi := range infos {
-			fmt.Printf("%s  %-24s  %s\n", mi.Hash, mi.Label, time.Unix(mi.CreatedUnix, 0).UTC().Format(time.RFC3339))
+			fmt.Printf("%-8s %s\n", resp.Status, resp.Fingerprint)
 		}
 	default:
 		return fmt.Errorf("manifest-key: unknown subcommand %q (want add|remove|check|list)", sub)
@@ -127,11 +99,25 @@ func manifestKeyCmd(args []string, _ *slog.Logger) error {
 	return nil
 }
 
-// fingerprintHex validates a 64-hex manifest key and returns its 24-hex fingerprint.
-func fingerprintHex(manifestKeyHex string) (string, error) {
-	raw, err := hex.DecodeString(manifestKeyHex)
-	if err != nil || len(raw) != 32 {
-		return "", fmt.Errorf("manifest-key: %q is not a 64-hex (32-byte) key", manifestKeyHex)
+func manifestKeyList(sock string) error {
+	code, body, err := udsDo(sock, http.MethodGet, configsock.PathAdminManifestKey, nil, nil)
+	if err != nil {
+		return err
 	}
-	return hex.EncodeToString(apikey.Fingerprint(raw)), nil
+	if code != http.StatusOK {
+		return fmt.Errorf("manifest-key list: %s", apiMessage(body))
+	}
+	var infos []configsock.AdminKeyInfo
+	if err := json.Unmarshal(body, &infos); err != nil {
+		return fmt.Errorf("manifest-key list: decode: %w", err)
+	}
+	for _, mi := range infos {
+		exp := "never"
+		if mi.ExpiresUnix > 0 {
+			exp = time.Unix(mi.ExpiresUnix, 0).UTC().Format(time.RFC3339)
+		}
+		fmt.Printf("%s  %-24s  created=%s  expires=%s\n", mi.Fingerprint, mi.Label,
+			time.Unix(mi.CreatedUnix, 0).UTC().Format(time.RFC3339), exp)
+	}
+	return nil
 }

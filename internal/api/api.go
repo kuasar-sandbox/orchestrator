@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/apikey"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/types"
@@ -23,6 +24,24 @@ var ErrNotFound = errors.New("sandbox not found")
 // ErrNotAllowed is returned by Create/RegisterBuild when the api key's manifest
 // key is not in the manifest_keys allowlist (=> 403).
 var ErrNotAllowed = errors.New("manifest key not allowed to create")
+
+// PullTokenHeader is the api_headers header carrying the opaque registry pull token.
+const PullTokenHeader = "X-Kuasar-Pull-Token"
+
+// MigrationTokenHeader is the api_headers header carrying an export-sandbox migration
+// token on connect/resume: an absent sandbox is auto-imported from it, then resumed.
+const MigrationTokenHeader = "X-Kuasar-Migration-Token"
+
+// BuildAuth carries the per-build registry pull credentials a build trigger may
+// supply: PullToken is the opaque, manifest-key-sealed token from the api_headers
+// X-Kuasar-Pull-Token (preferred); RegistryUsername/Password are the SDK's cleartext
+// from_image(username, password) (fromImageRegistry). Both empty => the tenant
+// default (manifest_keys) or anonymous applies. Resolved in Core.TriggerBuild.
+type BuildAuth struct {
+	PullToken        string
+	RegistryUsername string
+	RegistryPassword string
+}
 
 // CreateReq is the decoded POST /sandboxes body (subset the SDK sends).
 type CreateReq struct {
@@ -43,29 +62,45 @@ type Core interface {
 	Get(ctx context.Context, id, apiKey string) (*types.Sandbox, error)
 	List(ctx context.Context, apiKey, state string, limit int, cursor string) ([]*types.Sandbox, string, error)
 	Kill(ctx context.Context, id, apiKey string) (bool, error)
-	Connect(ctx context.Context, id, apiKey string, timeoutSec int) (*types.Sandbox, error)
+	Connect(ctx context.Context, id, apiKey, migrationToken string, timeoutSec int) (*types.Sandbox, error)
 	Pause(ctx context.Context, id, apiKey string) error // ErrAlreadyPaused / ErrNotFound
 	SetTimeout(ctx context.Context, id, apiKey string, timeoutSec int) (bool, error)
 
-	// Template builds. v2 build system (POST /v3/templates + POST /v2/.../builds);
-	// v1 build system (deprecated but still the CLI 2.10.3 default): POST /templates
-	// (config at create) + no-body POST /templates/{tid}/builds/{bid} (start).
+	// Template builds (e2b v2/v3 build system, what the SDK uses): POST /v3/templates
+	// (register name/cpu/memory) → POST /v2/templates/{tid}/builds/{bid} (start, carries
+	// fromImage + fromImageRegistry + steps) → GET …/status (poll). The node pulls +
+	// flattens the named image server-side — no client-side docker build/push.
 	RegisterBuild(ctx context.Context, apiKey, name string, tags []string) (*types.Build, error)
-	TriggerBuild(ctx context.Context, apiKey, templateID, buildID, fromImage, startCmd string) error
-	CreateBuildV1(ctx context.Context, apiKey, alias, startCmd string) (*types.Build, error)
-	StartBuild(ctx context.Context, apiKey, templateID, buildID string) error
+	TriggerBuild(ctx context.Context, apiKey, templateID, buildID, fromImage, startCmd string, auth BuildAuth) error
 	BuildStatus(ctx context.Context, apiKey, templateID, buildID string) (*types.Build, error)
 	ListTemplates(ctx context.Context, apiKey string) ([]*types.Build, error)
+
+	// Sandbox export/import (orchestrator extension to the e2b surface). Export turns
+	// a paused sandbox's remote snapshot into a reusable template (toTemplate) or a
+	// one-line base64 migration token; import recreates a paused sandbox from a token.
+	ExportSandbox(ctx context.Context, apiKey, sid string, toTemplate, keepSource bool) (string, error)
+	ImportSandbox(ctx context.Context, apiKey, token string) (string, error)
+}
+
+// Resources are the node-uniform VM resources surfaced in e2b list/get responses.
+// Every sandbox runs with the configured vcpu/memory (orch builds the launchspec
+// from the same config); DiskMB is the writable overlay seed. e2b's ListedSandbox
+// requires cpuCount/memoryMB/diskSizeMB, so the API must carry them.
+type Resources struct {
+	VCPU     int
+	MemoryMB int
+	DiskMB   int
 }
 
 type API struct {
 	core   Core
 	domain string
+	res    Resources
 	log    *slog.Logger
 }
 
-func New(core Core, domain string, log *slog.Logger) *API {
-	return &API{core: core, domain: domain, log: log}
+func New(core Core, domain string, res Resources, log *slog.Logger) *API {
+	return &API{core: core, domain: domain, res: res, log: log}
 }
 
 // Handler returns the routed http.Handler for api.<domain>.
@@ -83,12 +118,13 @@ func (a *API) Handler() http.Handler {
 	// treated identically to X-API-KEY (both derive the tenant via apikey).
 	mux.HandleFunc("POST /v3/templates", a.auth(a.registerTemplate))
 	mux.HandleFunc("POST /v2/templates/{tid}/builds/{bid}", a.auth(a.triggerBuild))
-	// v1 build system (deprecated; CLI 2.10.3 default): create carries the config,
-	// the no-body start kicks the (already image-pushed) build off.
-	mux.HandleFunc("POST /templates", a.auth(a.createTemplateV1))
-	mux.HandleFunc("POST /templates/{tid}/builds/{bid}", a.auth(a.startBuildV1))
 	mux.HandleFunc("GET /templates/{tid}/builds/{bid}/status", a.auth(a.buildStatus))
 	mux.HandleFunc("GET /templates", a.auth(a.listTemplates))
+	// Sandbox export / import (orchestrator extension; api-key authed like the rest,
+	// so it scopes to the caller's own sandboxes). Reached over both the TLS api
+	// listener and the local control socket's api plane.
+	mux.HandleFunc("POST /sandboxes/{id}/export", a.auth(a.exportSandbox))
+	mux.HandleFunc("POST /sandboxes/import", a.auth(a.importSandbox))
 	return mux
 }
 
@@ -183,9 +219,14 @@ func (a *API) connect(w http.ResponseWriter, r *http.Request) {
 		Timeout int `json:"timeout"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&body)
-	sb, err := a.core.Connect(r.Context(), r.PathValue("id"), apiKeyFrom(r.Context()), body.Timeout)
+	migrationToken := r.Header.Get(MigrationTokenHeader)
+	sb, err := a.core.Connect(r.Context(), r.PathValue("id"), apiKeyFrom(r.Context()), migrationToken, body.Timeout)
 	if err != nil {
-		a.fail(w, err)
+		if migrationToken != "" {
+			a.failMigrate(w, err) // surface the concrete import error (runtime mismatch, wrong tenant, …)
+		} else {
+			a.fail(w, err)
+		}
 		return
 	}
 	writeJSON(w, 200, a.sandboxResp(sb))
@@ -246,45 +287,6 @@ func (a *API) registerTemplate(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// createTemplateV1 handles the deprecated v1 POST /templates: the build config
-// arrives here (alias + start command); the dockerfile/cpu/memory are advisory
-// (the client docker-builds + pushes the image itself). Returns the ids the
-// client then pushes under and starts.
-func (a *API) createTemplateV1(w http.ResponseWriter, r *http.Request) {
-	var body struct {
-		Alias    string `json:"alias"`
-		Name     string `json:"name"`
-		StartCmd string `json:"start_cmd"`
-	}
-	_ = json.NewDecoder(r.Body).Decode(&body)
-	alias := body.Alias
-	if alias == "" {
-		alias = body.Name
-	}
-	b, err := a.core.CreateBuildV1(r.Context(), apiKeyFrom(r.Context()), alias, body.StartCmd)
-	if err != nil {
-		a.fail(w, err)
-		return
-	}
-	writeJSON(w, 202, map[string]any{
-		"templateID": b.TemplateID,
-		"buildID":    b.BuildID,
-		"public":     false,
-		"aliases":    b.Aliases,
-		"logsOffset": 0,
-	})
-}
-
-// startBuildV1 handles the v1 no-body POST /templates/{tid}/builds/{bid}.
-func (a *API) startBuildV1(w http.ResponseWriter, r *http.Request) {
-	err := a.core.StartBuild(r.Context(), apiKeyFrom(r.Context()), r.PathValue("tid"), r.PathValue("bid"))
-	if err != nil {
-		a.fail(w, err)
-		return
-	}
-	w.WriteHeader(202)
-}
-
 func (a *API) triggerBuild(w http.ResponseWriter, r *http.Request) {
 	// Accept both the simple shape ({fromImage,startCmd}) and the real e2b CLI
 	// body ({dockerfile,template_name,start_cmd,ready_cmd,cpu_count,memory_mb,
@@ -292,7 +294,11 @@ func (a *API) triggerBuild(w http.ResponseWriter, r *http.Request) {
 	// result to <mask>/{templateID}:{buildID}; it sends no image ref, so when
 	// fromImage is empty the orchestrator derives it from builder_image_uri_mask.
 	var body struct {
-		FromImage    string `json:"fromImage"`
+		FromImage         string `json:"fromImage"`
+		FromImageRegistry struct {
+			Username string `json:"username"`
+			Password string `json:"password"`
+		} `json:"fromImageRegistry"`
 		StartCmd     string `json:"startCmd"`
 		StartCmdE2B  string `json:"start_cmd"`
 		ReadyCmd     string `json:"ready_cmd"`
@@ -307,8 +313,13 @@ func (a *API) triggerBuild(w http.ResponseWriter, r *http.Request) {
 	if startCmd == "" {
 		startCmd = body.StartCmdE2B
 	}
+	auth := BuildAuth{
+		PullToken:        r.Header.Get(PullTokenHeader),
+		RegistryUsername: body.FromImageRegistry.Username,
+		RegistryPassword: body.FromImageRegistry.Password,
+	}
 	err := a.core.TriggerBuild(r.Context(), apiKeyFrom(r.Context()),
-		r.PathValue("tid"), r.PathValue("bid"), body.FromImage, startCmd)
+		r.PathValue("tid"), r.PathValue("bid"), body.FromImage, startCmd, auth)
 	if err != nil {
 		a.fail(w, err)
 		return
@@ -322,14 +333,26 @@ func (a *API) buildStatus(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, err)
 		return
 	}
+	// The Python SDK's BuildInfo.template_id is taken from this response's templateID,
+	// and that is what the caller then creates from — so once ready report the durable,
+	// self-describing persist id (the transient handle isn't creatable). logEntries +
+	// logs are required by the SDK's TemplateBuildInfo; reason is a BuildStatusReason
+	// object (omitted when empty).
+	tid := b.TemplateID
+	if b.PersistID != "" {
+		tid = b.PersistID
+	}
 	resp := map[string]any{
-		"templateID": b.TemplateID, // stays transient; the persist id rides in names+aliases
+		"templateID": tid,
 		"buildID":    b.BuildID,
 		"status":     b.Status.SDKStatus(),
-		"reason":     b.Reason,
-		"logs":       []string{}, // e2b CLI streams build logs from here (paginated by logsOffset)
+		"logs":       []string{}, // paginated by logsOffset
+		"logEntries": []any{},
 	}
-	if b.PersistID != "" { // surface the self-describing persist id once ready
+	if b.Reason != "" {
+		resp["reason"] = map[string]any{"message": b.Reason}
+	}
+	if b.PersistID != "" { // also surface names/aliases (the CLI reads the persist id here)
 		resp["names"] = b.Names
 		resp["aliases"] = b.Aliases
 	}
@@ -355,6 +378,53 @@ func (a *API) listTemplates(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	writeJSON(w, 200, out)
+}
+
+// --- sandbox export / import (orchestrator extension) ---
+
+func (a *API) exportSandbox(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		ToTemplate bool `json:"toTemplate"`
+		KeepSource bool `json:"keepSource"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	out, err := a.core.ExportSandbox(r.Context(), apiKeyFrom(r.Context()), r.PathValue("id"), body.ToTemplate, body.KeepSource)
+	if err != nil {
+		a.failMigrate(w, err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"result": out})
+}
+
+func (a *API) importSandbox(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Token string `json:"token"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Token == "" {
+		writeErr(w, 400, "token required")
+		return
+	}
+	id, err := a.core.ImportSandbox(r.Context(), apiKeyFrom(r.Context()), body.Token)
+	if err != nil {
+		a.failMigrate(w, err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"sandboxID": id})
+}
+
+// failMigrate surfaces export/import errors: these are operator/tenant tools, so the
+// concrete message (e.g. "pause X first", "runtime mismatch", "tenant key not on
+// this node") is returned rather than collapsed to a generic 500.
+func (a *API) failMigrate(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, ErrNotFound):
+		writeErr(w, 404, err.Error())
+	case errors.Is(err, ErrNotAllowed):
+		writeErr(w, 403, err.Error())
+	default:
+		a.log.Warn("migrate error", "err", err)
+		writeErr(w, 400, err.Error())
+	}
 }
 
 // --- response shaping ---
@@ -388,17 +458,33 @@ func (a *API) sandboxDetail(sb *types.Sandbox) map[string]any {
 	return d
 }
 
+// listed renders one item of GET /v2/sandboxes. The e2b SDK's ListedSandbox model
+// requires clientID/cpuCount/diskSizeMB/memoryMB/sandboxID/templateID/envdVersion/
+// state plus startedAt/endAt as ISO-8601 (it isoparse()s them) — a Unix int or a
+// missing field crashes next_items(). State is always running/paused here (dead rows
+// are deleted on kill), matching the SDK's SandboxState enum.
 func (a *API) listed(sb *types.Sandbox) map[string]any {
+	end := sb.DeadlineUnix
+	if end == 0 { // no deadline: report start so endAt is still a valid timestamp
+		end = sb.CreatedUnix
+	}
 	return map[string]any{
 		"sandboxID":   sb.ID,
 		"templateID":  sb.TemplateID,
+		"clientID":    "orchestrator",
 		"state":       string(sb.State),
-		"startedAt":   sb.CreatedUnix,
-		"endAt":       sb.DeadlineUnix,
-		"metadata":    sb.Metadata,
+		"cpuCount":    a.res.VCPU,
+		"memoryMB":    a.res.MemoryMB,
+		"diskSizeMB":  a.res.DiskMB,
 		"envdVersion": a.envdVersion(sb),
+		"startedAt":   isoUnix(sb.CreatedUnix),
+		"endAt":       isoUnix(end),
+		"metadata":    sb.Metadata,
 	}
 }
+
+// isoUnix formats a Unix-seconds timestamp as RFC3339 (ISO-8601) for the SDK.
+func isoUnix(sec int64) string { return time.Unix(sec, 0).UTC().Format(time.RFC3339) }
 
 func (a *API) fail(w http.ResponseWriter, err error) {
 	switch {

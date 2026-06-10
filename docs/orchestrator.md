@@ -7,8 +7,8 @@
 `@e2b/code-interpreter`）与 e2b CLI（`e2b template build`）可直接指向本机运行。一身兼 e2b 的三角色：
 
 - **api**：e2b 控制面 REST（沙箱生命周期、模板构建、鉴权）；
-- **orchestrator**：用 **systemd 模板单元** + 通用 **`run-task`** 启动器拉起 / 停止 `sandbox-ctl`（沙箱）与 `flatten-ctl`（构建），
-  调 `vswitch-ctl` 编排网络；run-task 经 **config-socket** 取通用 **LaunchSpec**（非密配置走文件、密钥走 env）后 `execve` 替换为目标进程；
+- **orchestrator**：用 **systemd 模板单元** + **`run-sandbox`/`run-builder`** 启动器拉起 / 停止 `sandbox-ctl`（沙箱）与 `flatten-ctl`（构建），
+  调 `vswitch-ctl` 编排网络；启动器经 **config-socket** 取通用 **LaunchSpec**（非密配置走文件、密钥走 env）后 `execve` 替换为目标进程；
 - **proxy**：把客户端到沙箱的数据面流量反代到 guest（envd 经 UDS，用户服务经 floatingip）。
 
 本方案新增组件，收编 PROPOSAL §10.13 / deployment §2.4 长期预留的"节点编排代理"槽位。
@@ -44,11 +44,11 @@
      │    建 /run/sandbox/<sid>/ + /var/lib/sandbox/<sid>/   (不预建 cgroup)
      │    vswitch-ctl attach <switch> → {port, floatingip, mac, ip}
      │    StartUnit(sandbox-runner@<sid>.service)
-     │    └ unit: orchestrator-ctl run-task --pidfile=… --config-socket=… --config-id=sandbox:%i
-     │         │ run-task 锁+写 <sid>.pid → 取 LaunchSpec → execve sandbox-ctl run --config <sid>.yaml (key 经 env) → 起 VM
+     │    └ unit: orchestrator-ctl run-sandbox --pidfile=… --config-socket=… --sandbox-id=%i
+     │         │ run-sandbox 锁+写 <sid>.pid → 取 LaunchSpec → execve sandbox-ctl run --config <sid>.yaml (key 经 env) → 起 VM
      │         │ (e2b) connect …:127.0.0.1:49983/49999 (UDS) → guest 原版 envd
      │    等就绪 → envd POST /init → 登记 sqlite + TTL
-     ├─ orchestrator (build):  builds 表排队 → 资源池准入 → 写 flatten.yaml → StartUnit(sandbox-builder@<bid>) → run-task → flatten-ctl (stdout→.result)
+     ├─ orchestrator (build):  builds 表排队 → 资源池准入 → 写 flatten.yaml → StartUnit(sandbox-builder@<bid>) → run-builder → flatten-ctl (stdout→.result)
      └─ proxy (数据面；部署形态见 §2.1)：解析 (sid,port) → 校验 X-Access-Token(§3.3) → 转发
           profile=e2b 且 port∈{49983,49999} → dial UDS(connect) → guest envd
           profile=bare 且 port∈{49983,49999} → 501 (no data-plane)
@@ -86,7 +86,7 @@ external 模式拓扑（数据面字节流**不经** orchestrator）：
 - **路由权威在 orchestrator**：worker 是缓存。create/resume/pause/kill 实时广播给所有 worker（Upsert/Delete）；
   worker 重启 → 自动重连 + 重取全量快照；订阅滞后 → orchestrator 断开该订阅，worker 重连重快照（有界内存、最终一致）。
 - **token 校验在 worker**（§3.3）：orchestrator 兜底转发时**不**校验，由 worker 校验。
-- **协议无 gRPC**：帧化 JSON over h2c（`[4B LE len][JSON]`，复用 `golang.org/x/net/http2`，与 §6 configsock 同款手写帧），零新依赖。
+- **协议无 gRPC**：帧化 JSON over h2c（`[4B LE len][JSON]`，复用 `golang.org/x/net/http2`），零新依赖。
 - **运营策略集中下推**：握手时 orchestrator 把 `Policy{domain, auth_mode, park_timeout}` 推给 worker（worker 的 `--auth` 仅为策略到达前的回退）。
 - **可观测**：`metrics_listen` 暴露 Prometheus 文本（`data_requests_total{result=…}`、`gateway_forward_total` 等）。
 - worker 由运维带外管理（`deploy/orchestrator-proxy@.service`），orchestrator **不**自动安装；worker 须与 orchestrator 同节点（本地 dial envd-UDS/floatingip）。
@@ -96,7 +96,7 @@ external 模式拓扑（数据面字节流**不经** orchestrator）：
 ### §3.1 控制面（orchestrator-ctl 自实现）
 
 `orchestrator-ctl` 的全部子命令：**`serve`**（启动 daemon，`--config`/`--proxy`/`--proxy-socket`）、
-**`proxy`**（external 模式独立数据面 worker，§2.1）、**`run-task`**（单元内通用启动器，§6，非给人用）、
+**`proxy`**（external 模式独立数据面 worker，§2.1）、**`run-sandbox`/`run-builder`**（单元内启动器，§6，非给人用）、
 **`config`**（`--config` 规范化+校验、`--template` 输出带注释骨架、`-o` 写文件；对齐 `sandbox-ctl config`/`flatten-ctl config`）、
 **`manifest-key`**（`add`/`remove`/`check`/`list` 维护白名单，§7）、**`version`**。下表为 `serve` 提供的 e2b 控制面 HTTP 契约。
 
@@ -140,8 +140,22 @@ envd 单端口 **49983**，H2C，Connect-RPC（proto 包无版本）：`process.
 ### §3.3 鉴权与两 token
 
 - 控制面 `X-API-KEY` / 构建面 `Bearer`：api_key 是 manifest_key 派生的 MAC 令牌（§7），orchestrator 据此解析租户并校验归属，无静态 api_keys。
-- **数据面 token = `envd_access_token`，头 `X-Access-Token`**（与原版 e2b 一致；secure 沙箱自 SDK v2.0.0 默认开，SDK 在每次数据面调用带此头）：create 铸造→envd `/init` 装→回 SDK。envd 在 guest 内自校验；**proxy 另行校验**（纵深防御，且 49999/用户端口 envd 不经手，仅 proxy 这一道）。校验模式 `data_plane_auth ∈ {off|log|enforce}`（默认 **enforce**）；**例外放行**：auth=off、route 无 token（bare）、envd 预签名文件 URL（带 `signature` query，由 envd 自验签）。external 模式校验在 worker（§2.1）。
+- **数据面 token = `envd_access_token`，头 `X-Access-Token`**（与原版 e2b 一致；secure 沙箱自 SDK v2.0.0 默认开，SDK 每次数据面调用带此头）：create 铸造 → 回 SDK。**proxy 校验** `X-Access-Token` 匹配该沙箱 token（`data_plane_auth ∈ {off|log|enforce}`，默认 **enforce**；external 模式在 worker，§2.1）。**例外放行**：auth=off、route 无 token（bare）、envd 预签名文件 URL（带 `signature` query，envd 自验签）。envd **是否另行**自校验此 token 由 `mmds.enabled` 决定（§3.3.1）；无论哪种姿态，envd 仅经 proxy 的 host-UDS 可达（控制口 49983/49999 走 connect-UDS，非 floatingip），沙箱间无通路。
 - create 响应仍返回 `trafficAccessToken`（SDK 兼容字段；非数据面强制头）。bare 无 envd：回 stub `envdVersion(≥0.1.0)` + 占位 token，数据面控制口 proxy 回 **501**。
+
+### §3.3.1 envd 鉴权姿态与快照扇出（`mmds.enabled`）
+
+快照扇出的子沙箱（`export-sandbox --to-template`，或任何 snp 模板 create）由内存恢复，其 envd 持**源**沙箱 token；`-isnotfc` 下 envd 不能把 token 改成新身份的值（envd `/init` 仅允许首设/重确认同 token/匹配 MMDS hash），会拒绝子沙箱数据面。单开关 `mmds.enabled` 选两种姿态，二者都让扇出沙箱数据面可用：
+
+| | `enabled=false`（默认） | `enabled=true` |
+|---|---|---|
+| envd 启动 | `-isnotfc` | FC 模式（去 `-isnotfc`） |
+| envd token | orchestrator 不下发（`/init` 省 `accessToken`）→ 非 secure | 经 MMDS 授权后 `/init` 重置为每身份新 token |
+| 数据面闸门 | 仅 proxy（须 `data_plane_auth=enforce`） | proxy + envd（纵深防御） |
+| 扇出 fork | ✅（envd 无 token 故不错配） | ✅（envd 重置为新 token） |
+
+- **proxy-only（默认）**：依赖 envd 仅经 proxy host-UDS 可达 + 沙箱间无通路 + host 信任边界；故 `enabled=false` 强制 `data_plane_auth=enforce`（proxy 是唯一外部闸门）。
+- **MMDS（`enabled=true`）**：orchestrator 在 **proxy 组件**内起 Firecracker MMDS v2（internal：serve 绑 `mmds.listen`；external：worker `--mmds-listen`）。两段式：**PUT `/latest/api/token`** 按请求**源 IP = 沙箱 floatingip**（vswitch mgmt-extract 已 SNAT）查路由表、**park 等到该沙箱注册上来**（复用数据面 park 语义；故 external 模式**无**"先注册后轮询"的时序约束），回一个 HMAC 签名、编码了沙箱 id 的 session token；**GET `/`** 校验并解码该 token（沙箱内代码不可信，**不**复读源 IP）取沙箱 id，回 `{instanceID,envID,accessTokenHash}`，`accessTokenHash = hex(sha512(token))`（= envd `keys.HashAccessTokenBytes`）。部署侧用 vswitch `--mgmt-service 169.254.169.254:80:<mmds.listen>` 把该 VIP 在 eBPF 数据面直译到 `mmds.listen`（**无 iptables**，且自动改写回程；loopback target 需 mgmt 设备 `route_localnet=1`），故本进程不占特权口、不需 root。要求 `proxy.mode≠off`（MMDS 寄宿 proxy）。
 
 ## §4 Profile 模型与 templateID（transient / persist 两形态，无 templates 表）
 
@@ -168,7 +182,7 @@ orchestrator-ctl `serve` 启动时**生成并安装**两个模板单元 + 两个
 [Service]
 Type=exec
 WorkingDirectory=/run/sandbox/%i
-ExecStart=<orchestrator-ctl> run-task --pidfile=/run/sandbox/%i/%i.pid --config-socket=/run/sandbox/orchestrator.socket --config-id=sandbox:%i
+ExecStart=<orchestrator-ctl> run-sandbox --pidfile=/run/sandbox/%i/%i.pid --config-socket=/run/sandbox/orchestrator.socket --sandbox-id=%i
 Restart=no                       # 一进程一沙箱、有状态：崩=该沙箱已死，不重试
 KillMode=control-group           # StopUnit 连 cloud-hypervisor 一并 SIGKILL（见 §5.1）
 TimeoutStopSec=20
@@ -185,17 +199,17 @@ Type=oneshot
 WorkingDirectory=/run/sandbox/%i
 StandardOutput=file:/run/sandbox/%i/%i.result   # 捕获 flatten-ctl stdout 的 manifest key
 StandardError=journal                           # 否则 StandardError 默认 inherit 会把 stderr 也写入 .result，污染 key
-ExecStart=<orchestrator-ctl> run-task --pidfile=/run/sandbox/%i/%i.pid --config-socket=/run/sandbox/orchestrator.socket --config-id=build:%i
+ExecStart=<orchestrator-ctl> run-builder --pidfile=/run/sandbox/%i/%i.pid --config-socket=/run/sandbox/orchestrator.socket --build-id=%i
 TimeoutStartSec=1800
 KillMode=control-group
 Slice=sandbox-builder.slice       # 资源池 cgroup 上限（builder_cpu_quota/builder_memory_max）
 ```
 
-ExecStart 统一为 `orchestrator-ctl run-task`（通用子任务启动器，§6）：锁+写 pidfile → 取 LaunchSpec →
+ExecStart 为 `orchestrator-ctl run-sandbox`（runner）/ `run-builder`（builder）（同框架，§6）：锁+写 pidfile → 取 LaunchSpec →
 `execve` 替换为目标（sandbox-ctl / flatten-ctl），目标**继承本 PID 与单元 cgroup**。`Type=exec` 故无需 sd_notify。
 
 - **create 流程**：建 `/run/sandbox/<sid>/`(tmpfs) + `/var/lib/sandbox/<sid>/`(disk) → `vswitch-ctl attach <switch>` →
-  **写 `<sid>.yaml`（非密 SANDBOX_CONFIG）** → `StartUnit("sandbox-runner@<sid>.service","replace")` → 等就绪 → envd `/init` → 登记 sqlite + 起 TTL。不预建 cgroup；密钥与 restore/connect 经 run-task 的 LaunchSpec 下发（§6）。
+  **写 `<sid>.yaml`（非密 SANDBOX_CONFIG）** → `StartUnit("sandbox-runner@<sid>.service","replace")` → 等就绪 → envd `/init` → 登记 sqlite + 起 TTL。不预建 cgroup；密钥与 restore/connect 经 run-sandbox 的 LaunchSpec 下发（§6）。
   - **冷启动可写上层**：img 冷启时 `<sid>.yaml` 的 `boot.root.overlay.diff_template` 取自 config `overlay_diff_template`——一块**预格式化空 ext4**（sandbox-ctl 稀疏复制为可写 upper；裸空 diff 非合法 fs 会被拒）。部署方提供（`mkfs.ext4` 于稀疏文件，如 `/opt/sandbox/overlay-templates/basic-1G.ext4`）；restore（snp/resume）不需要（overlay 链来自快照）。
 - **kill**：`StopUnit`（`KillMode=control-group` 连 CH 一并 SIGKILL）→ `ResetFailedUnit` → `vswitch-ctl detach <port>` → 删 run-dir → 标 dead。
 - **就绪**：`Type=exec`：exec 成功即视为启动；e2b 再轮询 envd `/health` 判数据面就绪。
@@ -208,18 +222,26 @@ ExecStart 统一为 `orchestrator-ctl run-task`（通用子任务启动器，§6
 它**接管自己所在 systemd 单元的 cgroup**作为沙箱资源 cgroup——读 `/proc/self/cgroup` 求出该路径、把 cloud-hypervisor 留在原地、自身也在其中。于是：
 
 - 一个单元 = 一个沙箱 cgroup；sentinel 在该路径上原地仲裁；`KillMode=control-group` 使 `StopUnit` 连 CH 一起 SIGKILL，**无需 orchestrator 排空/rmdir 安全网**。单元须 **`Delegate=yes`**：否则单元 cgroup 的控制器接口文件（`cpu.max`/`memory.max`）非本进程可写，`--cgroup-adopt` 写资源上限会 `permission denied`。
-- 代价：sandbox-ctl 与 CH 同处受限 cgroup，`memory.high` 节流存在死锁风险（见 `pkg/sandbox/cgroup.go` 头注）。采纳此模型并照常设 `memory.high`；`--cgroup-adopt` 在 run-task 下发的 LaunchSpec args 里，需要时去掉即退回旧的预建-cgroup 模式。
+- 代价：sandbox-ctl 与 CH 同处受限 cgroup，`memory.high` 节流存在死锁风险（见 `pkg/sandbox/cgroup.go` 头注）。采纳此模型并照常设 `memory.high`；`--cgroup-adopt` 在 run-sandbox 下发的 LaunchSpec args 里，需要时去掉即退回旧的预建-cgroup 模式。
 
-## §6 config-socket（run-task 取 LaunchSpec）
+## §6 本机控制 socket（task / admin / api 三面）
 
-- orchestrator 监听 UDS **`/run/sandbox/orchestrator.socket`**；framed JSON（`[4B LE len][JSON]`）。
-- **职责**：socket 不再下发"沙箱配置"，而是下发**通用启动规约 LaunchSpec**——run-task 据此 `execve` 替换为目标进程。非密的沙箱配置走文件（`<sid>.yaml`，orchestrator 启动前写好），密钥走 `LaunchSpec.env`。
+orchestrator 在 UDS **`/run/sandbox/orchestrator.socket`**（`paths.config_socket`，**0600**）跑一个 **h2c HTTP** 服务（兼容 HTTP/1.1）；单 socket 复用三个平面、各自鉴权；连接建立时经 **`SO_PEERCRED`** 取 peer pid 注入请求上下文。socket 0600 ⇒ 仅 daemon 同 uid / root 可连，各平面在此之上再细分。`/internal/*` 前缀 e2b SDK 永不使用、与 api 路径不冲突。
+
+**① task 平面** —— `POST /internal/task/launchspec`，下发**通用启动规约 LaunchSpec**（run-sandbox/run-builder 据此 `execve` 替换为目标进程；非密沙箱配置走文件 `<sid>.yaml`、密钥走 `LaunchSpec.env`）：
+
 - 协议：req `{config_id}`（`sandbox:<sid>` | `build:<bid>`）→ resp **LaunchSpec** `{exec, args, workdir, env}`：
   - sandbox：`exec=sandbox-ctl`，`args=[run --sandbox-id <sid> --config <rundir>/<sid>.yaml --manifest-config <shared> --run-root <run_root> --cgroup-adopt (--restore …) (--connect …)]`，`env={MANIFEST_KEY}`；`--run-root` 把 sandbox-ctl 的 socket/staging 目录（`ch.sock`/`ctl.sock`/…）钉到 orchestrator 的 run_root，使 RunDir == `<run_root>/<sid>`，pause/snapshot 客户端（同 `--run-root`）才能拨到 `ctl.sock`（否则 sandbox-ctl 默认 `/run/sandbox`，目录分裂、快照拨号失败）；
   - build：`exec=flatten-ctl`，`args=[export --config <rundir>/flatten.yaml --manifest-config <shared> --upload <fromImage>]`，`env={MANIFEST_KEY}`。
-- **run-task**（每个单元的 ExecStart，§5）：`--pidfile` 用 `fcntl(F_SETLK)` 排他锁防重入、写 PID、清 `FD_CLOEXEC` 使锁随 `execve` 存活（**不清理 pidfile**）→ 拨 socket 取 LaunchSpec → `chdir(workdir)` + 清 `TASK_*` env + 合 `spec.env` → `execve` 替换为目标（目标继承本 PID 与单元 cgroup）。
-- **鉴别**：`SO_PEERCRED` 取 peer pid ⟷ 读 `/run/sandbox/<id>/<id>.pid`（run-task 拨号前已写本 PID），相等即认证。**信任模型**：host-root 可信；租户代码在 guest 内、够不到 host UDS。
+- **run-sandbox / run-builder**（每个单元的 ExecStart，§5）：`--pidfile` 用 `fcntl(F_SETLK)` 排他锁防重入、写 PID、清 `FD_CLOEXEC` 使锁随 `execve` 存活（**不清理 pidfile**）→ 拨 socket 取 LaunchSpec → `chdir(workdir)` + 清 `TASK_*` env + 合 `spec.env` → `execve` 替换为目标（目标继承本 PID 与单元 cgroup）。
+- **鉴权**：peer pid ⟷ `/run/sandbox/<id>/<id>.pid`（启动器拨号前已写本 PID），相等即认证。
 - build 结果：flatten-ctl 把 manifest key 打到 stdout，单元 `StandardOutput=file:<rundir>/<bid>.result` 捕获，orchestrator 读回（§11）。
+
+**② admin 平面** —— `/internal/admin/manifest-keys`（`GET`=list，`POST {op:add|remove|check, key, label, ttl_seconds}`）：manifest-key 白名单管理（含 TTL，§7）。**鉴权**：配 `paths.admin_pidfile`（多行 PID 白名单、`#` 注释）则 peer pid 须在其中；未配则仅靠 socket 0600（同 uid/root）。`orchestrator-ctl manifest-key …` 即此平面客户端——**daemon 是 manifest_keys 表唯一写者**，CLI 不再开 DB（亦不读 config，仅需 `--socket`/`ORCHESTRATOR_SOCKET`）。
+
+**③ api 平面** —— 其余路径回落到 **e2b 控制面 handler**（与 TLS `api.listen` 同一 `http.Handler`，含 export/import 扩展），明文 h2c 暴露、**`X-API-KEY` 鉴权**。`export-sandbox`/`import-sandbox` CLI 即此平面客户端（§8.1）。
+
+**信任模型**：host-root / daemon-uid 可信；租户代码在 guest 内、够不到 host UDS。
 
 ## §7 密钥与归属模型（manifest_key 根密钥，加密存 sqlite）
 
@@ -227,14 +249,15 @@ ExecStart 统一为 `orchestrator-ctl run-task`（通用子任务启动器，§6
   `api_key = e2b_ + hex( fp(12)‖ts(4)‖nonce(4)‖mac(16) )`，`fp=SHA256(mk)[:12]`、`mac=HMAC-SHA256(mk, fp‖ts‖nonce)[:16]`（`e2b_`+72hex=**76 字符**）。**e2b SDK 校验 api_key 格式 `/^e2b_[0-9a-f]+$/`**（实测 CLI 2.10.3 内置 js-sdk 会拒绝非 hex，故用 hex 编码——非 base64url），orchestrator 另自校验 MAC（`internal/apikey`）。
 - **加密落盘**：`manifest_keys` / `sandboxes` / `builds` 表的 manifest_key 字段 **AES-256-GCM 加密**（`internal/secretbox`），另存 `manifest_key_hash = fp`（非唯一索引，快速匹配/排除）。加密密钥经 config `encryption_key` / env `ORCHESTRATOR_ENCRYPTION_KEY`（`:`-分隔多键、[0]活动、备用键解旧记录支持轮换）。
 - **鉴权解析**（短 hash 匹配 + 完整 MAC 校验）：api_key → 按 `fp` 命中行/白名单 → 解密 manifest_key → 重算 HMAC 比对：
-  - **create / build**：manifest_key 须在 `manifest_keys` 白名单（`orchestrator-ctl manifest-key add|remove|check|list`，输出仅指纹、绝不含 key），否则 **403**。
+  - **create / build**：manifest_key 须在 `manifest_keys` 白名单（`orchestrator-ctl manifest-key add|remove|check|list` —— 经本机控制 socket 的 **admin 平面**打到 serve daemon（§6），daemon 是该表唯一写者；输出仅指纹、绝不含 key），否则 **403**。`add --ttl <dur>` 设失效时间（如 `24h`；`0`/缺省=永不），**重复 add 刷新失效时间**（简化外部清理）；过期 key 即视为不在白名单（reaper 惰性 `PruneExpiredManifestKeys` 清理），`list` 显示 `expires`。另：行内可存**租户默认镜像拉取凭据**（`add --registry-auth <docker.json>` 或 `--registry-username/--password/--token` 自动组装、加密存 `registry_auth_enc`；构建拉取用，§11）。
   - **其他按 id / list 操作**：只对资源行自身的 manifest_key 校验，**不查 manifest_keys** —— 即清空白名单，存量 sandbox/build 仍可正常操作。
 - 收敛加密：manifest_key 只封 manifest 密钥表；chunk 加密 `SHA256(salt‖明文)`、与 key 无关 ⇒ **chunk 去重仍跨租户**；租户**不共享 key/模板**。
-- **key 不落明文**：sqlite 内加密；运行期只在 orchestrator 内存 + run-task LaunchSpec 帧 + sandbox-ctl/flatten-ctl 子进程 env（`MANIFEST_KEY`），`<sid>.yaml` 非密不含 key。auto-resume 从加密存储解出 key 解封（数据面唤醒无 api_key）。
+- **key 不落明文**：sqlite 内加密；运行期只在 orchestrator 内存 + 启动器 LaunchSpec 帧 + sandbox-ctl/flatten-ctl 子进程 env（`MANIFEST_KEY`），`<sid>.yaml` 非密不含 key。auto-resume 从加密存储解出 key 解封（数据面唤醒无 api_key）。
 
 ## §8 生命周期与状态机
 
 - create(img=冷启/snp=restore)、connect=resume、pause=snapshot、timeout=TTL→pause、kill。
+- **每实例配置覆盖（create 经 metadata，零 SDK/API 改动）**：create 可在 e2b `metadata` 里带保留键 **`kuasar-sandbox/config`**（值为 JSON 串，metadata 值本就是字符串），覆盖该沙箱的网络项——`hostname`/`dns`/`inner_ip`(CIDR)/`nexthop`/`transit_gateway_ip`/`transit_geneve_vni`/`transit_mac`（GENEVE 经 `vswitch-ctl attach --transit-*`）。空字段回落 profile/config 默认；仅做**格式校验、无白名单门**（沙箱以完整能力对外发布，平台自身亦经 sandbox API 管理）。metadata 持久化 → **resume 重新解析**、覆盖在沙箱全生命周期一致。实现：`internal/orch/override.go` `parseOverrides` → `launch`(allocInnerIP/`vswitch.AttachReq`) + `sandboxParams`(hostname/dns/nexthop)。
 - **auto-suspend**：TTL/空闲 → reaper 触发运行中 sandbox-ctl 封快照、记 `snapshot_ref`、标 paused、StopUnit、detach。
   封快照按 **`checkpoint.mode`**（§8.1）：`local`（默认）→ `snapshot --output` 落本机文件（`snapshot_ref`=本机 bundle 路径，节点绑定）；
   `remote` → `snapshot --upload` 落远程 manifest（`snapshot_ref`=`manifest://<key>`，可移植）。
@@ -251,14 +274,17 @@ ExecStart 统一为 `orchestrator-ctl run-task`（通用子任务启动器，§6
 **远程快照**=manifest（`--upload` 直传或晋升而得，**可移植、本质即模板**）。`checkpoint.mode` 选 pause 默认落地（默认 `local`）。
 全部基于现有 sandbox-ctl 原语（`snapshot --output|--upload`、`upload-snapshot <本机快照>`、`run --restore`），e2b API/CLI 零改动。
 
+`export-sandbox` / `import-sandbox` 两个 CLI 是 serve daemon **api 平面**的客户端（经本机控制 socket，§6；`POST /sandboxes/{id}/export`、`POST /sandboxes/import`，`X-API-KEY=E2B_API_KEY`，**不读 config、不开 DB**）——晋升/导出/插行全由 daemon 在进程内完成，故无第二写者。两接口在 TLS `api.listen` 上同样可达（api-key 已按租户隔离）。
+
 - **晋升 / 转模板**：`orchestrator-ctl export-sandbox <sid> --to-template`（`E2B_API_KEY` 鉴权、须暂停）——若本机快照则先
   `upload-snapshot` 晋升为远程 manifest（并 repoint 该行），随后**组装并打印自描述持久 id `<profile>-snp-<key>`**（**不写 builds 表**）。
   之后 `e2b sandbox create <id>` 即从该快照扇出新沙箱（新 sid）。create 解密用的租户 key 仍由 api_key→白名单解析，故无需登记。
 - **迁移（同 sid 跨机）**：`export-sandbox <sid>`（不带 `--to-template`）确保远程后，导出**单行 base64 token**＝沙箱行
   （含 env/metadata/deadline/数据面 token，**manifest_key 仅指纹、不含密钥**，附 runtime 摘要）；默认**回收源行**（move；`--keep-source`=拷贝）。
   目标机 `import-sandbox <token>`：`E2B_API_KEY`→白名单解析租户 key（**须先 `manifest-key add`**，同 create 前置）、校验 token 指纹与本机
-  runtime 摘要一致，插入 paused 行 → `e2b sandbox resume <sid>` 在新机恢复。目标机须共享同一 `manifest_config`（远程 store）。
-  - 限制：token 不含系统密钥但携带沙箱自有 env/数据面 token，按"沙箱级敏感"对待；跨进程 export 删行后 daemon 缓存最终一致（resume 走 `st.Get`）。
+  runtime 摘要一致，插入 paused 行 → `Sandbox.connect(<sid>)` 在新机恢复。目标机须共享同一 `manifest_config`（远程 store）。
+  - **一步迁移（推荐）**：`Sandbox.connect(<sid>, api_headers={"X-Kuasar-Migration-Token": <token>})`——目标机本地无此 sid 且带迁移 token 时，connect 在 resume 前**自动 import**（同上租户/指纹/runtime 校验，且 `token.ID` 须 == 连接的 sid，否则报错并回收误插行），迁移收敛为**单次 SDK 调用**；`import-sandbox` CLI 保留作显式预导入。
+  - 限制：token 不含系统密钥但携带沙箱自有 env/数据面 token，按"沙箱级敏感"对待。export/import 由 daemon 在进程内改表（无第二写者）；目标机须先 `manifest-key add` 本租户 key 且共享同一远程 store。
 
 ## §9 状态存储与重启对账
 
@@ -290,7 +316,7 @@ status(registered|waiting|building|ready|error), reason, names_json, aliases_jso
 
 构建经 **e2b API** 提交（无独立构建 CLI；客户用 `e2b template build`），落 `builds` 表，由资源池调度，分两类：
 
-- **镜像 build（img）**：无 `startCmd`。资源池准入 → orchestrator 写 `<rundir>/flatten.yaml`（`referer.enabled:true`、`key=fromImage`、`tmpdir=<rundir>`；按配置加 `insecure`/`platform`）→ `StartUnit(sandbox-builder@<bid>)` → 单元内 `run-task` 取 build LaunchSpec → `execve` 进 `flatten-ctl export --config <rundir>/flatten.yaml --manifest-config <shared> --upload <fromImage>`（`MANIFEST_KEY` 经 env）→ flatten-ctl 把 manifest 键打到 stdout、单元 `StandardOutput=file` 写 `<bid>.result` → orchestrator 读回 → persist id `<e2b-img-key>`。`referer.enabled` 走 flatten-ctl 的 OCI Referrers 幂等流：同 `(MANIFEST_KEY, key=fromImage)` 已存在则跳过重导出。
+- **镜像 build（img）**：无 `startCmd`。资源池准入 → orchestrator 写 `<rundir>/flatten.yaml`（`referer.enabled:true`、`key=fromImage`、`tmpdir=<rundir>`；按配置加 `insecure`/`platform`）→ `StartUnit(sandbox-builder@<bid>)` → 单元内 `run-builder` 取 build LaunchSpec → `execve` 进 `flatten-ctl export --config <rundir>/flatten.yaml --manifest-config <shared> --upload <fromImage>`（`MANIFEST_KEY` 经 env）→ flatten-ctl 把 manifest 键打到 stdout、单元 `StandardOutput=file` 写 `<bid>.result` → orchestrator 读回 → persist id `<e2b-img-key>`。`referer.enabled` 走 flatten-ctl 的 OCI Referrers 幂等流：同 `(MANIFEST_KEY, key=fromImage)` 已存在则跳过重导出。
 - **快照 build（snp）**：给 `startCmd`。先做 img，再以该 img 模板冷启一台 e2b 沙箱（走 `sandbox-runner@<bid>`）、
   等 envd 就绪、`sandbox-ctl snapshot --upload` → persist id `<e2b-snp-key>`，随后销毁临时沙箱。
 
@@ -299,10 +325,10 @@ status(registered|waiting|building|ready|error), reason, names_json, aliases_jso
 > **资源池**：`builder_max_concurrent`（默认 2）= orchestrator 内计数信号量准入，`waiting→building` 用 builds 表
 > CAS 抢占（多 worker/重启安全）；CPU/内存上限经 `sandbox-builder.slice` 的 `CPUQuota`/`MemoryMax` 施加（cgroup）。
 
-> **凭据/密钥不落盘**：registry 凭据走 `FLATTEN_REGISTRY_*` 环境；`MANIFEST_KEY` 经 run-task LaunchSpec→子进程 env；
-> `<rundir>/flatten.yaml` 仅含 referer（key/desc）+ tmpdir + insecure/platform，无秘密（artifact_type 为 flatten-ctl 固定常量）。
+> **镜像拉取凭据（三级、加密存、无 host 匹配于 token）**：build 触发时按优先级解析——**任务级 pull token**（SDK `api_headers` 头 `X-Kuasar-Pull-Token`，`e2b-key-ctl seal-pull-token` 用**租户 manifest_key 派生密钥**封装的不透明 `kpt_` 令牌，orchestrator 以该租户存量 key 解封）＞ SDK `fromImageRegistry`（`from_image(image,username,password)` 明文）＞**租户默认**（`manifest_keys.registry_auth_enc`，docker config.json；`manifest-key add --registry-auth <file>` 或 `--registry-username/--password/--token` 自动组装 catch-all `*`；按 fromImage host→`*`→首条取）＞匿名。解析结果（user/pass 或 bearer）**加密存 `builds.registry_auth_enc`**，flatten 时解出注入 `FLATTEN_REGISTRY_{USERNAME,PASSWORD|TOKEN}`（flatten-ctl `pkg/remote` 读）。
+> **不落盘**：凭据仅加密存库 + 运行期子进程 env；`MANIFEST_KEY` 同经 run-builder LaunchSpec→env；`<rundir>/flatten.yaml` 仅 referer（key/desc）+ tmpdir + insecure/platform，无秘密。
 
-> **运行时契约（已实测，`e2e_execute.sh`/`e2e_build_cli.sh`）**：snp build 的 boot→`sandbox-ctl snapshot --upload`→64-hex 键→persist；以及 pause(snapshot)→connect(resume)→restore 全链路均经真实 microVM + envd 跑通；`startCmd` 经 guest env `E2B_START_CMD` 交 envd。
+> **运行时契约（已实测，`e2e_execute.sh`/`e2e_build_real.sh`）**：snp build 的 boot→`sandbox-ctl snapshot --upload`→64-hex 键→persist；以及 pause(snapshot)→connect(resume)→restore 全链路均经真实 microVM + envd 跑通；`startCmd` 经 guest env `E2B_START_CMD` 交 envd。
 
 `sandbox-runtime-e2b.erofs` 由 `deps/build-runtime-e2b.sh`（Makefile `sandbox-runtime-e2b` 调用）纯 shell 经 `fsck.erofs --extract` → 注入 envd → `mkfs.erofs` 重打，**不再是 orchestrator-ctl 子命令**。
 
@@ -314,10 +340,10 @@ status(registered|waiting|building|ready|error), reason, names_json, aliases_jso
 
 | 对象 | 方式 | 说明 |
 |---|---|---|
-| `sandbox-ctl`(runtime) | 经 run-task(单元) `execve`：`run --config <sid>.yaml --manifest-config --cgroup-adopt`（key 经 env） | 非密配置文件 + 密钥 env；准入在其内部 |
+| `sandbox-ctl`(runtime) | 经 run-sandbox(单元) `execve`：`run --config <sid>.yaml --manifest-config --cgroup-adopt`（key 经 env） | 非密配置文件 + 密钥 env；准入在其内部 |
 | `node-ctl`(sentinel) | **无直接交互**；可选 `resource_socket` | 单元 cgroup 即沙箱 cgroup，sentinel 默认扫描原地仲裁。`resource_socket` **opt-in**（不配=静态 cgroup，单元自身 via `--cgroup-adopt`；配了才进 SANDBOX_CONFIG `resources.control.controller` 拨 sentinel） |
 | `vswitch-ctl`(vswitch) | CLI（须 `cfg.Bin` 解析路径）`attach <switch>`/`detach`；`TapFD.Exec` 绑 port | 交换机预先起好（`ip netns add <ns>` + `vswitch-ctl start <sw> --netns --ports --mac-addr --floating-ip-base`；交换机运行于内核态，非守护进程，清理 `vswitch-ctl stop`）；port 对外、slot 内部 |
-| `flatten-ctl`(builder) | 经 run-task(单元) `execve`：`export --config --manifest-config --upload`（referer.enabled 默认开；按配置 insecure/platform） | manifest key 不透明串；`MANIFEST_KEY` env；`fromImage` 可由 `builder_image_uri_mask` 推出（§11） |
+| `flatten-ctl`(builder) | 经 run-builder(单元) `execve`：`export --config --manifest-config --upload`（referer.enabled 默认开；按配置 insecure/platform） | manifest key 不透明串；`MANIFEST_KEY` env；`fromImage` 可由 `builder_image_uri_mask` 推出（§11） |
 | `fsck.erofs`/`mkfs.erofs`(deps) | CLI（`deps/build-runtime-e2b.sh`） | 确定性展平/重打 e2b runtime |
 | guest envd | UDS（经 sandbox-ctl `connect` 反代） | 原版不改；嵌于 `/opt/sandbox-runtime/bin/envd` |
 | systemd | D-Bus（StartUnit/StopUnit/ListUnits/Reload） | 进程管理 + 单元自装 |
@@ -340,13 +366,13 @@ routesync（external proxy，§2.1）：版本 1，帧 `[4B LE len][JSON]`，消
 build-runtime-e2b.sh（sandbox-runtime-e2b.erofs；envd 注入 /opt/sandbox-runtime/bin/envd 验证）
 └─ orchestrator-ctl: store(sqlite: sandboxes + builds)
    ├─ launcher(systemd D-Bus: Start/Stop/List/Reload) + 单元自动生成安装 + 目录 + vswitch attach/detach
-   ├─ config-socket(server: LaunchSpec(sandbox/build) + SO_PEERCRED·pidfile 鉴别) + run-task(锁 pidfile/execve)
+   ├─ config-socket(server: LaunchSpec(sandbox/build) + SO_PEERCRED·pidfile 鉴别) + run-sandbox/run-builder(锁 pidfile/execve)
    ├─ api(e2b 控制面 + 构建 v3 端点 + 鉴权 + 归属校验)
    ├─ provisioner(envd /init) + 就绪门
    ├─ proxy(L7 + h2c 上游 + 路由判据 + bare 501 + X-Access-Token 校验 + 单飞 resume)
    ├─ proxy 模式: internal | external(routesync serve↔worker 双向 h2c + worker SO_REUSEPORT + 兜底转发) | off
    ├─ reaper(TTL/auto-suspend) + proxy 触发 auto-resume + 重启对账
-   └─ build(builds 表 + 资源池 + run-task→flatten-ctl(img,stdout→.result) + boot+snapshot(snp))
+   └─ build(builds 表 + 资源池 + run-builder→flatten-ctl(img,stdout→.result) + boot+snapshot(snp))
 ```
 
 ## §16 配置（字段参考）
@@ -363,6 +389,8 @@ build-runtime-e2b.sh（sandbox-runtime-e2b.erofs；envd 注入 /opt/sandbox-runt
 | 字段 | 默认 | 说明 |
 |---|---|---|
 | `paths.db_path` | `<paths.base_root>/orchestrator.db` | sqlite 路径，可配；随 `base_root` 派生，亦可显式覆盖（§9） |
+| `paths.config_socket` | `/run/sandbox/orchestrator.socket` | 本机控制 socket（三平面 h2c：task/admin/api，§6）；run-sandbox/run-builder 与 manifest-key/export-sandbox/import-sandbox CLI 的连接点（CLI 经 `--socket`/`ORCHESTRATOR_SOCKET` 指向，不读 config） |
+| `paths.admin_pidfile` | `""`（仅 socket 0600） | 可选：admin 平面（manifest-key）的多行 PID 白名单（`#` 注释）；配置则 peer pid 须在其中，未配则仅靠 socket 同 uid/root 权限（§6） |
 | `sandbox.network.{e2b,bare}.{inner_ip,nexthop}` | e2b `169.254.0.21/30`+`169.254.0.22` ; bare `169.254.1.1/31`+`169.254.1.0` | **按 profile** 的 guest 内 IP/默认网关（每 profile 复用同一对、唯一身份是 floatingip）；e2b 用 **/30 + 网关**让 envd 端口转发可用 |
 | `sandbox.network.{hostname,dns}` | `sandbox` ; `[169.254.169.253]` | guest 主机名（`network.hostname`→sethostname）+ DNS；orchestrator 经 SANDBOX_CONFIG **`files:`** 注入 `/etc/hosts`（含 hostname 条目，治 getfqdn DNS 卡顿，见 §10）与 `/etc/resolv.conf`（launch+restore 均生效） |
 | `sandbox.resources.control_socket` | `""`（静态 cgroup） | sandbox-sentinel 资源控制 UDS（opt-in）；空=单元自身 cgroup |
@@ -376,10 +404,9 @@ build-runtime-e2b.sh（sandbox-runtime-e2b.erofs；envd 注入 /opt/sandbox-runt
 | 脚本 | 覆盖 | 运行 |
 |---|---|---|
 | `e2e_orchestrator.sh` | 单元自动安装 + 控制面（`/health`、`X-API-KEY` 401 路径）+ 构建 API（v3 register/trigger/status、跨 key 归属 404） | `make test-e2e-orchestrator` |
-| `e2e_runtask.sh` | run-task 通用启动器 + `config`/`info` CLI（纯用户态，无 root/systemd/KVM）：pidfile 锁、4B-LE 帧取 LaunchSpec、execve、`TASK_*` 清理 | `make test-e2e-runtask` |
+| `e2e_runtask.sh` | run-sandbox/run-builder 启动器 + `config`/`info` CLI（纯用户态，无 root/systemd/KVM）：pidfile 锁、HTTP 取 LaunchSpec、execve、`TASK_*` 清理 | `make test-e2e-runtask` |
 | `e2e_orchestrator_proxy.sh` | `proxy_mode=external` 全链路：serve（控制面）+ 独立 proxy worker（SO_REUSEPORT 数据面）+ routesync + 真实 microVM/envd，数据面**经 proxy** 走 | `bash test/e2e/e2e_orchestrator_proxy.sh` |
-| `e2e_build_real.sh` | 真实镜像 build 后端（store-ctl + 本地 zot）：register → trigger → poll 至 `status=ready` 出 persist id（暂无 e2b CLI） | `bash test/e2e/e2e_build_real.sh` |
-| `e2e_build_cli.sh` | 真实 `e2b template build`（未改造 CLI 2.10.3）经 `builder_image_uri_mask` 桥接到 flatten，跑到 ready 模板 | `bash test/e2e/e2e_build_cli.sh` |
+| `e2e_build_real.sh` | 真实镜像 build 后端（store-ctl + 本地 zot）：register → trigger（fromImage）→ poll 至 `status=ready` 出 persist id；e2b Python SDK `from_image` 走同款服务端展平路径 | `bash test/e2e/e2e_build_real.sh` |
 | `e2e_execute.sh` | 从已建模板冷启真实 microVM 并在 guest 内执行；pause(snapshot)→resume 全链路 | `bash test/e2e/e2e_execute.sh` |
 
 `make test-e2e-orchestrator` / `make test-e2e-runtask` 是 umbrella 已注册的聚合目标；其余四个脚本目前直接 `bash` 运行

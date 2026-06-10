@@ -70,7 +70,15 @@ func (o *Orchestrator) Create(ctx context.Context, req api.CreateReq) (*types.Sa
 	}
 	tmpl, err := types.ParseTemplateID(req.TemplateID)
 	if err != nil {
-		return nil, err
+		// Not a <profile>-<kind>-<key> id — resolve the transient register id the SDK
+		// reports (BuildInfo.template_id), or a build name/alias, to its persist id.
+		persist := o.resolveTemplateAlias(ctx, req.APIKey, req.TemplateID)
+		if persist == "" {
+			return nil, err
+		}
+		if tmpl, err = types.ParseTemplateID(persist); err != nil {
+			return nil, err
+		}
 	}
 	id, err := uuid.NewV7()
 	if err != nil {
@@ -82,7 +90,7 @@ func (o *Orchestrator) Create(ctx context.Context, req api.CreateReq) (*types.Sa
 
 	sb := &types.Sandbox{
 		ID:                 sid,
-		TemplateID:         req.TemplateID,
+		TemplateID:         tmpl.String(), // canonical persist id (resolved from a transient/alias ref)
 		State:              types.StateRunning,
 		RunDir:             o.cfg.Paths.RunRoot + "/" + sid,
 		BaseDir:            o.cfg.Paths.BaseRoot + "/" + sid,
@@ -107,9 +115,9 @@ func (o *Orchestrator) Create(ctx context.Context, req api.CreateReq) (*types.Sa
 }
 
 // launch prepares dirs + network, writes the sandbox config file, starts the unit
-// (orchestrator-ctl run-task -> sandbox-ctl), waits for readiness and provisions
+// (orchestrator-ctl run-sandbox -> sandbox-ctl), waits for readiness and provisions
 // envd. The non-secret config lands at <run-dir>/<sid>.yaml; the secret manifest
-// key rides in the run-task LaunchSpec env (LaunchSpecFor). The cgroup is the
+// key rides in the run-sandbox LaunchSpec env (LaunchSpecFor). The cgroup is the
 // unit's own (--cgroup-adopt). Used by Create and Connect(resume).
 func (o *Orchestrator) launch(ctx context.Context, sb *types.Sandbox, tmpl types.TemplateID) error {
 	for _, d := range []string{sb.RunDir, sb.BaseDir} {
@@ -117,17 +125,26 @@ func (o *Orchestrator) launch(ctx context.Context, sb *types.Sandbox, tmpl types
 			return fmt.Errorf("orch: mkdir %s: %w", d, err)
 		}
 	}
-	plainIP, cidrIP, err := o.allocInnerIP(tmpl.Profile)
+	ov, err := parseOverrides(sb.Metadata)
 	if err != nil {
 		return err
 	}
-	port, err := o.vs.Attach(ctx, plainIP)
+	plainIP, cidrIP, err := o.allocInnerIP(tmpl.Profile, ov.InnerIP)
+	if err != nil {
+		return err
+	}
+	port, err := o.vs.Attach(ctx, vswitch.AttachReq{
+		InnerIP:          plainIP,
+		TransitGatewayIP: ov.TransitGatewayIP,
+		TransitGeneveVNI: ov.TransitGeneveVNI,
+		TransitMAC:       ov.TransitMAC,
+	})
 	if err != nil {
 		return err
 	}
 	sb.VswitchPort, sb.FloatingIP, sb.PortMAC, sb.InnerIP = port.Port, port.FloatingIP, port.MAC, cidrIP
 
-	if err := o.sandboxParams(sb, tmpl).WriteYAML(o.sandboxConfigPath(sb)); err != nil {
+	if err := o.sandboxParams(sb, tmpl, ov).WriteYAML(o.sandboxConfigPath(sb)); err != nil {
 		return err
 	}
 	if err := o.st.Put(ctx, sb); err != nil {
@@ -139,7 +156,10 @@ func (o *Orchestrator) launch(ctx context.Context, sb *types.Sandbox, tmpl types
 		return err
 	}
 	if tmpl.Profile == types.ProfileE2B {
-		if err := o.waitReady(ctx, sb, 30*time.Second); err != nil {
+		// Headroom for a cold microVM boot + envd ready; FC mode (mmds.enabled) adds the
+		// MMDS poll handshake, and a remote-snapshot restore (migration/fork) is heavier
+		// than a warm img cold-boot.
+		if err := o.waitReady(ctx, sb, 60*time.Second); err != nil {
 			return err
 		}
 		if err := o.envdInit(ctx, sb); err != nil {
@@ -224,10 +244,27 @@ func (o *Orchestrator) pauseSandbox(ctx context.Context, sb *types.Sandbox) erro
 	return nil
 }
 
-func (o *Orchestrator) Connect(ctx context.Context, id, apiKey string, timeoutSec int) (*types.Sandbox, error) {
+func (o *Orchestrator) Connect(ctx context.Context, id, apiKey, migrationToken string, timeoutSec int) (*types.Sandbox, error) {
 	sb, err := o.st.Get(ctx, id)
 	if err != nil {
 		return nil, err
+	}
+	// Auto-migrate: connecting to a sandbox absent on this node with a migration
+	// token (api_headers X-Kuasar-Migration-Token) imports it (paused row) then
+	// resumes — one SDK call does export's counterpart. ImportSandbox checks the
+	// tenant key + token fingerprint + runtime digest.
+	if sb == nil && migrationToken != "" {
+		imported, ierr := o.ImportSandbox(ctx, apiKey, migrationToken)
+		if ierr != nil {
+			return nil, ierr
+		}
+		if imported != id {
+			_ = o.st.Delete(ctx, imported) // token was for a different sandbox; don't leave it
+			return nil, fmt.Errorf("connect %s: migration token is for sandbox %s", id, imported)
+		}
+		if sb, err = o.st.Get(ctx, id); err != nil {
+			return nil, err
+		}
 	}
 	if !ownsSandbox(sb, apiKey) {
 		return nil, api.ErrNotFound
@@ -326,21 +363,26 @@ func (o *Orchestrator) sandboxConfigPath(sb *types.Sandbox) string {
 	return sb.RunDir + "/" + sb.ID + ".yaml"
 }
 
-func (o *Orchestrator) sandboxParams(sb *types.Sandbox, tmpl types.TemplateID) sandboxcfg.Params {
+func (o *Orchestrator) sandboxParams(sb *types.Sandbox, tmpl types.TemplateID, ov sandboxOverride) sandboxcfg.Params {
+	dns := o.cfg.Sandbox.Network.DNS
+	if len(ov.DNS) > 0 {
+		dns = ov.DNS
+	}
 	return sandboxcfg.Params{
 		Sandbox: sb, Template: tmpl,
 		RuntimeE2B: o.cfg.Sandbox.Boot.RuntimeE2B, RuntimeBase: o.cfg.Sandbox.Boot.RuntimeBase, Kernel: o.cfg.Sandbox.Boot.Kernel,
 		OverlayDiffTpl: o.cfg.Sandbox.Boot.OverlayDiffTemplate,
 		TapFDExec:      o.vs.TapFDExec(sb.VswitchPort), EnvVars: sb.Env,
 		VCPU: o.cfg.Sandbox.Resources.VCPU, Memory: o.cfg.Sandbox.Resources.Memory, ControllerSocket: o.cfg.Sandbox.Resources.ControlSocket,
-		Nexthop:  o.innerGateway(tmpl.Profile),
-		Hostname: o.cfg.Sandbox.Network.Hostname,
-		DNS:      o.cfg.Sandbox.Network.DNS,
+		Nexthop:     firstNonEmpty(ov.Nexthop, o.innerGateway(tmpl.Profile)),
+		Hostname:    firstNonEmpty(ov.Hostname, o.cfg.Sandbox.Network.Hostname),
+		DNS:         dns,
+		MMDSEnabled: o.cfg.MMDS.Enabled,
 	}
 }
 
-// LaunchSpecFor resolves a run-task config-id ("sandbox:<sid>" | "build:<bid>")
-// to the LaunchSpec run-task exec-replaces into. The secret manifest key rides in
+// LaunchSpecFor resolves a launcher config-id ("sandbox:<sid>" | "build:<bid>")
+// to the LaunchSpec the launcher exec-replaces into. The secret manifest key rides in
 // LaunchSpec.Env; the bulky non-secret config is the file referenced by the args.
 func (o *Orchestrator) LaunchSpecFor(ctx context.Context, configID string) (*configsock.LaunchSpec, string, bool, error) {
 	kind, id, found := strings.Cut(configID, ":")
@@ -370,7 +412,11 @@ func (o *Orchestrator) sandboxLaunchSpec(ctx context.Context, sid string) (*conf
 	if err != nil {
 		return nil, "", false, err
 	}
-	p := o.sandboxParams(sb, tmpl)
+	ov, err := parseOverrides(sb.Metadata)
+	if err != nil {
+		return nil, "", false, err
+	}
+	p := o.sandboxParams(sb, tmpl, ov)
 	// --run-root pins sandbox-ctl's socket/staging dir (ch.sock, ctl.sock, …) to the
 	// orchestrator's run root, so RunDir == cfg.Paths.RunRoot/<sid> and the snapshot client
 	// (also --run-root cfg.Paths.RunRoot) finds ctl.sock. Without it sandbox-ctl defaults to
@@ -416,6 +462,11 @@ func (o *Orchestrator) Reaper(ctx context.Context, interval time.Duration) {
 						o.log.Warn("reaper pause", "sid", sb.ID, "err", err)
 					}
 				}
+			}
+			if n, err := o.st.PruneExpiredManifestKeys(ctx); err != nil {
+				o.log.Warn("reaper prune manifest keys", "err", err)
+			} else if n > 0 {
+				o.log.Info("reaper pruned expired manifest keys", "n", n)
 			}
 		}
 	}
@@ -463,6 +514,31 @@ func (o *Orchestrator) lookup(id string) *types.Sandbox {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	return o.reg[id]
+}
+
+// ByFloatingIP maps a guest's (SNAT'd) source floating IP to its running sandbox id,
+// for the in-process MMDS service (proxy_mode=internal). Implements mmds.Source (PUT
+// stage). Running only: a paused sandbox's slot/floating IP is freed and may be reused
+// by another running sandbox, so matching paused rows would be ambiguous.
+func (o *Orchestrator) ByFloatingIP(ip string) (sandboxID string, ok bool) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	for _, sb := range o.reg {
+		if sb.FloatingIP == ip && sb.State == types.StateRunning {
+			return sb.ID, true
+		}
+	}
+	return "", false
+}
+
+// SandboxInfo returns sid's current template id + access token (mmds.Source, GET stage).
+func (o *Orchestrator) SandboxInfo(sid string) (templateID, accessToken string, ok bool) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if sb, ok := o.reg[sid]; ok && sb.State == types.StateRunning {
+		return sb.TemplateID, sb.EnvdAccessToken, true
+	}
+	return "", "", false
 }
 
 func (o *Orchestrator) teardown(ctx context.Context, sb *types.Sandbox) {
@@ -526,8 +602,10 @@ func (o *Orchestrator) snapshotLocal(ctx context.Context, sb *types.Sandbox) (st
 // rides in MANIFEST_KEY; the base lower chain must already be remote. Used by
 // export-sandbox to make a node-bound checkpoint portable.
 func (o *Orchestrator) promote(ctx context.Context, sb *types.Sandbox, localPath string) (string, error) {
+	// Flags before the positional: sandbox-ctl upload-snapshot parses with Go's flag,
+	// which stops at the first positional — a leading <path> would drop --manifest-config.
 	cmd := exec.CommandContext(ctx, o.cfg.SandboxCtl(), "upload-snapshot",
-		localPath, "--manifest-config", o.cfg.ManifestConfig, "--quiet")
+		"--manifest-config", o.cfg.ManifestConfig, "--quiet", localPath)
 	cmd.Env = append(os.Environ(), "MANIFEST_KEY="+sb.ManifestKey)
 	var out, errb bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &errb
@@ -566,16 +644,23 @@ func (o *Orchestrator) waitReady(ctx context.Context, sb *types.Sandbox, timeout
 	return fmt.Errorf("orch: envd not ready for %s", sb.ID)
 }
 
-// envdInit provisions envd after boot/restore: sets the access token (first /init
-// under -isnotfc accepts it without MMDS), env vars, default user/workdir, time.
-// Body keys per envd spec (camelCase); success = 204.
+// envdInit provisions envd after boot/restore: env vars, default user/workdir, time,
+// and — only when MMDS is enabled — the access token. Body keys per envd spec
+// (camelCase); success = 204. With MMDS disabled (-isnotfc) we deliberately omit the
+// token so envd stays non-secure: pushing one would make envd reject snapshot forks
+// (whose restored envd holds the source token and can't be re-keyed under -isnotfc),
+// and the proxy already enforces X-Access-Token as the sole gate. With MMDS enabled
+// (FC mode) the metadata service authorizes this token's hash, so /init re-keys envd
+// to it — giving forks fresh per-identity tokens with envd-side enforcement too.
 func (o *Orchestrator) envdInit(ctx context.Context, sb *types.Sandbox) error {
 	payload := map[string]any{
-		"accessToken":    sb.EnvdAccessToken,
 		"envVars":        sb.Env,
 		"defaultUser":    "user",
 		"defaultWorkdir": "/home/user",
 		"timestamp":      time.Now().UTC().Format(time.RFC3339),
+	}
+	if o.cfg.MMDS.Enabled {
+		payload["accessToken"] = sb.EnvdAccessToken
 	}
 	body, _ := json.Marshal(payload)
 	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, "http://envd/init", bytes.NewReader(body))
@@ -600,15 +685,15 @@ func (o *Orchestrator) profileNet(p types.Profile) config.ProfileNet {
 }
 
 // allocInnerIP returns the guest's inner IP (plain, for vswitch attach) and its CIDR
-// (for Network.IP) for the profile: e2b defaults to 169.254.0.21/30 (envd port-forward
-// needs the /30 + gateway), bare to 169.254.1.1/31. The inner IP is fixed per profile
-// — every sandbox reuses it; identity is the per-slot floating IP, and the eBPF
-// datapath keys on slot/ifindex (attach accepts a shared inner IP).
-func (o *Orchestrator) allocInnerIP(profile types.Profile) (plain, cidr string, err error) {
-	cidr = o.profileNet(profile).InnerIP
+// (for Network.IP). override (the per-instance inner_ip, "" = none) wins over the
+// profile default: e2b 169.254.0.21/30 (envd port-forward needs the /30 + gateway),
+// bare 169.254.1.1/31. The inner IP is fixed per profile — every sandbox reuses it;
+// identity is the per-slot floating IP, and the eBPF datapath keys on slot/ifindex.
+func (o *Orchestrator) allocInnerIP(profile types.Profile, override string) (plain, cidr string, err error) {
+	cidr = firstNonEmpty(override, o.profileNet(profile).InnerIP)
 	ip, _, err := net.ParseCIDR(cidr)
 	if err != nil {
-		return "", "", fmt.Errorf("orch: sandbox.network.%s.inner_ip %q: %w", profile, cidr, err)
+		return "", "", fmt.Errorf("orch: sandbox inner_ip %q: %w", cidr, err)
 	}
 	return ip.String(), cidr, nil
 }

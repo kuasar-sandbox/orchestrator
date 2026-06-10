@@ -13,9 +13,10 @@ import (
 // no-op when install_units=false (operator manages units out of band).
 //
 //   - <runner>  (sandbox-runner@.service): one microVM sandbox; also runs snapshot
-//     builds. ExecStart=sandbox-ctl run, config pulled over the config-socket.
+//     builds. ExecStart=orchestrator-ctl run-sandbox (exec-replaces into sandbox-ctl
+//     run), config pulled over the config-socket.
 //   - <builder> (sandbox-builder@.service): one image build. ExecStart=orchestrator-ctl
-//     run-task, which pulls the build LaunchSpec (exec=flatten-ctl, MANIFEST_KEY in
+//     run-builder, which pulls the build LaunchSpec (exec=flatten-ctl, MANIFEST_KEY in
 //     env) over the config-socket and exec-replaces into flatten-ctl.
 //
 // Both run in their own cgroup (KillMode=control-group / a dedicated slice) so the
@@ -56,10 +57,10 @@ Description=kuasar sandbox %%i
 [Service]
 Type=exec
 WorkingDirectory=%s/%%i
-# run-task locks+writes the pidfile, pulls the launch spec (exec=sandbox-ctl, the
+# run-sandbox locks+writes the pidfile, pulls the launch spec (exec=sandbox-ctl, the
 # secret MANIFEST_KEY in env) over the config-socket, then exec-replaces into
 # sandbox-ctl so it inherits this PID + the unit cgroup (sandbox-ctl --cgroup-adopt).
-ExecStart=%s run-task --pidfile=%s/%%i/%%i.pid --config-socket=%s --config-id=sandbox:%%i
+ExecStart=%s run-sandbox --pidfile=%s/%%i/%%i.pid --config-socket=%s --sandbox-id=%%i
 # One process per sandbox, stateful: a crash means the sandbox is gone, not retryable.
 Restart=no
 KillMode=control-group
@@ -87,10 +88,10 @@ WorkingDirectory=%s/%%i
 # (StandardError defaults to inherit, which would mirror stdout into the file).
 StandardOutput=file:%s/%%i/%%i.result
 StandardError=journal
-# run-task pulls the build launch spec (exec=flatten-ctl, MANIFEST_KEY in env) over
+# run-builder pulls the build launch spec (exec=flatten-ctl, MANIFEST_KEY in env) over
 # the config-socket and exec-replaces into flatten-ctl (no on-disk secret). Runs in
 # this unit's cgroup under sandbox-builder.slice (pool accounting).
-ExecStart=%s run-task --pidfile=%s/%%i/%%i.pid --config-socket=%s --config-id=build:%%i
+ExecStart=%s run-builder --pidfile=%s/%%i/%%i.pid --config-socket=%s --build-id=%%i
 TimeoutStartSec=1800
 KillMode=control-group
 Slice=sandbox-builder.slice

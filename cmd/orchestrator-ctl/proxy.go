@@ -14,6 +14,7 @@ import (
 
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/config"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/metrics"
+	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/mmds"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/proxy"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/routetable"
@@ -39,6 +40,7 @@ func runProxy(args []string, log *slog.Logger) error {
 	auth := fs.String("auth", "", "data-plane auth until policy arrives: off|log|enforce (default enforce)")
 	park := fs.Duration("park-timeout", 30*time.Second, "max time to hold a request awaiting route/resume")
 	metricsListen := fs.String("metrics-listen", "", "optional Prometheus text endpoint, e.g. 127.0.0.1:9095")
+	mmdsListen := fs.String("mmds-listen", "", "MMDS metadata-service listen addr (e.g. :19254); empty = off. Set when serve has mmds.enabled, plus a host redirect of 169.254.169.254:80 -> this addr")
 	_ = fs.Parse(args)
 	if *socket == "" {
 		return fmt.Errorf("proxy: --socket is required")
@@ -87,6 +89,23 @@ func runProxy(args []string, log *slog.Logger) error {
 
 	if *metricsListen != "" {
 		go serveMetrics(ctx, *metricsListen, mx, log)
+	}
+
+	// MMDS metadata service: serve envd's access-token hash keyed by the guest's
+	// (SNAT'd) source floating IP, from the synced route table. Required when serve
+	// runs sandboxes in FC mode (mmds.enabled); the host redirects 169.254.169.254:80
+	// to this addr.
+	if *mmdsListen != "" {
+		mln, err := net.Listen("tcp", *mmdsListen)
+		if err != nil {
+			return fmt.Errorf("proxy: mmds listen %s: %w", *mmdsListen, err)
+		}
+		log.Info("proxy mmds metadata service", "mmds_listen", *mmdsListen)
+		go func() {
+			if err := mmds.New(tbl, *park, log).Serve(ctx, mln); err != nil {
+				log.Error("proxy: mmds service", "err", err)
+			}
+		}()
 	}
 
 	if *dataListen == "" {

@@ -48,8 +48,16 @@ manifest_config: /opt/sandbox/manifest.yaml
 paths:
   run_root: /run/sandbox                          # tmpfs run state
   base_root: /var/lib/sandbox                     # persistent state
-  config_socket: /run/sandbox/orchestrator.socket # run-task fetches per-task LaunchSpecs here
+  # Local control socket — one UDS, three planes over h2c: task LaunchSpec fetch
+  # (task), manifest-key allowlist (admin), and the e2b api plane (a plain-h2c twin of
+  # api.listen, incl. export/import). The manifest-key / export-sandbox / import-sandbox
+  # CLIs are clients of this socket — they do not open the DB or read this config.
+  config_socket: /run/sandbox/orchestrator.socket
   # db_path: /var/lib/sandbox/orchestrator.db     # default = <base_root>/orchestrator.db
+  # admin_pidfile gates the admin plane: when set, a manifest-key caller's peer pid must
+  # be listed (one per line; '#' comments ok). Unset (default) relies on the socket's
+  # 0600 perms (same uid / root). Set it to restrict admin to specific automation pids.
+  # admin_pidfile: /run/sandbox/orchestrator-admin.pids
 
 # Systemd template units (generated + installed at startup, then daemon-reloaded).
 # units:
@@ -102,3 +110,17 @@ builder:
 checkpoint:
   mode: local
   local_dir: /var/lib/sandbox-saved
+
+# mmds: optional envd metadata service for FC-mode token re-keying.
+#   disabled (default) — envd runs -isnotfc (non-secure); the proxy enforces
+#     X-Access-Token as the sole data-plane gate (so proxy.auth must be enforce).
+#     Snapshot forks still work (no envd token to mismatch).
+#   enabled — envd runs in FC mode and is re-keyed to a fresh per-identity token at
+#     /init via a Firecracker MMDS v2 service hosted in the proxy component (envd-side
+#     enforcement / defense-in-depth). The vswitch translates the metadata VIP to the
+#     listener: `vswitch-ctl start ... --mgmt-service 169.254.169.254:80:<listen>` (no
+#     iptables; a loopback listen needs route_localnet=1 on the mgmt dev). Requires
+#     proxy.mode != off; in external mode the worker serves it via --mmds-listen.
+# mmds:
+#   enabled: false
+#   listen: 127.0.0.1:19254

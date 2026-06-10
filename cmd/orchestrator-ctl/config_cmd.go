@@ -75,8 +75,9 @@ manifest_config: /opt/sandbox/manifest.yaml
 paths:
   run_root: /run/sandbox
   base_root: /var/lib/sandbox
-  config_socket: /run/sandbox/orchestrator.socket  # run-task fetches LaunchSpecs here
+  config_socket: /run/sandbox/orchestrator.socket  # local control socket: task + manifest-key admin + api plane (h2c)
   # db_path: /var/lib/sandbox/orchestrator.db    # default = <base_root>/orchestrator.db
+  # admin_pidfile: /run/sandbox/orchestrator-admin.pids  # PID allowlist for the admin plane; unset = socket 0600 perms (same uid/root)
 # units:                                          # systemd template units (defaults shown)
 #   dir: /etc/systemd/system
 #   runner: sandbox-runner@.service

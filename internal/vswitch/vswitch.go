@@ -1,6 +1,6 @@
 // Package vswitch wraps the vswitch-ctl CLI for per-sandbox port allocation.
 //
-//	attach <switch> --inner-ip=<ip> [--port=0]   -> JSON AttachOutput (tap mode: no --to-netns)
+//	attach <switch> --inner-ip=<ip> [--port=0] [--transit-*]  -> JSON AttachOutput (tap mode)
 //	open-port <switch> --port=<N>  (TAPFD_SOCKET) -> tap-fd handoff (Network.TapFD.Exec)
 //	detach <switch> --port=<N>                    -> plain text
 //
@@ -41,9 +41,29 @@ type CLI struct {
 
 func New(bin, sw string) *CLI { return &CLI{bin: bin, sw: sw} }
 
-// Attach allocates a tap port on the switch with the given guest inner IP (CIDR).
-func (c *CLI) Attach(ctx context.Context, innerIP string) (*Port, error) {
-	cmd := exec.CommandContext(ctx, c.bin, "attach", c.sw, "--inner-ip="+innerIP, "--port=0")
+// AttachReq is a per-sandbox attach: the guest inner IP (plain, not CIDR) plus
+// optional GENEVE transit parameters (tenant-network overlay) when overridden via
+// metadata (see internal/orch override). Zero-valued transit fields are omitted.
+type AttachReq struct {
+	InnerIP          string // plain inner IP, required
+	TransitGatewayIP string // GENEVE gateway IP
+	TransitGeneveVNI uint32 // GENEVE VNI
+	TransitMAC       string // transit destination MAC
+}
+
+// Attach allocates a tap port on the switch for the request's guest inner IP.
+func (c *CLI) Attach(ctx context.Context, req AttachReq) (*Port, error) {
+	args := []string{"attach", c.sw, "--inner-ip=" + req.InnerIP, "--port=0"}
+	if req.TransitGatewayIP != "" {
+		args = append(args, "--transit-gateway-ip="+req.TransitGatewayIP)
+	}
+	if req.TransitGeneveVNI != 0 {
+		args = append(args, "--transit-geneve-vni="+strconv.FormatUint(uint64(req.TransitGeneveVNI), 10))
+	}
+	if req.TransitMAC != "" {
+		args = append(args, "--transit-mac-addr="+req.TransitMAC)
+	}
+	cmd := exec.CommandContext(ctx, c.bin, args...)
 	var out, errb bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &errb
 	if err := cmd.Run(); err != nil {

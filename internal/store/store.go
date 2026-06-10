@@ -64,16 +64,19 @@ CREATE TABLE IF NOT EXISTS builds (
   reason            TEXT NOT NULL DEFAULT '',
   names_json        TEXT NOT NULL DEFAULT '[]',
   aliases_json      TEXT NOT NULL DEFAULT '[]',
-  created_unix      INTEGER NOT NULL
+  created_unix      INTEGER NOT NULL,
+  registry_auth_enc TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_builds_status ON builds(status);
 CREATE INDEX IF NOT EXISTS idx_builds_mkhash ON builds(manifest_key_hash);
 
 CREATE TABLE IF NOT EXISTS manifest_keys (
-  key_hash     TEXT NOT NULL,
-  key_enc      TEXT NOT NULL,
-  label        TEXT NOT NULL DEFAULT '',
-  created_unix INTEGER NOT NULL
+  key_hash          TEXT NOT NULL,
+  key_enc           TEXT NOT NULL,
+  label             TEXT NOT NULL DEFAULT '',
+  created_unix      INTEGER NOT NULL,
+  expires_unix      INTEGER NOT NULL DEFAULT 0,
+  registry_auth_enc TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_manifest_keys_hash ON manifest_keys(key_hash);
 `
@@ -291,13 +294,13 @@ func (s *Store) Delete(ctx context.Context, id string) error {
 // --- builds (also the template registry) ---
 
 var buildCols = `build_id,template_id,persist_id,manifest_key_hash,manifest_key_enc,profile,kind,
-  from_image,start_cmd,status,reason,names_json,aliases_json,created_unix`
+  from_image,start_cmd,status,reason,names_json,aliases_json,created_unix,registry_auth_enc`
 
 func (s *Store) scanBuild(row interface{ Scan(...any) error }) (*types.Build, error) {
 	var b types.Build
-	var profile, kind, status, names, aliases, mkHash, mkEnc string
+	var profile, kind, status, names, aliases, mkHash, mkEnc, raEnc string
 	if err := row.Scan(&b.BuildID, &b.TemplateID, &b.PersistID, &mkHash, &mkEnc, &profile, &kind,
-		&b.FromImage, &b.StartCmd, &status, &b.Reason, &names, &aliases, &b.CreatedUnix); err != nil {
+		&b.FromImage, &b.StartCmd, &status, &b.Reason, &names, &aliases, &b.CreatedUnix, &raEnc); err != nil {
 		return nil, err
 	}
 	mk, err := s.box.DecryptString(mkEnc)
@@ -305,29 +308,41 @@ func (s *Store) scanBuild(row interface{ Scan(...any) error }) (*types.Build, er
 		return nil, fmt.Errorf("store: decrypt manifest key for build %s: %w", b.BuildID, err)
 	}
 	b.ManifestKey = mk
+	if raEnc != "" {
+		if b.RegistryAuth, err = s.box.DecryptString(raEnc); err != nil {
+			return nil, fmt.Errorf("store: decrypt registry auth for build %s: %w", b.BuildID, err)
+		}
+	}
 	b.Profile, b.Kind, b.Status = types.Profile(profile), types.Kind(kind), types.BuildState(status)
 	b.Names, b.Aliases = ujs(names), ujs(aliases)
 	return &b, nil
 }
 
-// PutBuild upserts a build record (manifest key encrypted + hashed).
+// PutBuild upserts a build record (manifest key + registry auth encrypted at rest).
 func (s *Store) PutBuild(ctx context.Context, b *types.Build) error {
 	hash, enc, err := s.encField(b.ManifestKey)
 	if err != nil {
 		return fmt.Errorf("store: put build %s: %w", b.BuildID, err)
 	}
+	var raEnc string
+	if b.RegistryAuth != "" {
+		if raEnc, err = s.box.EncryptString(b.RegistryAuth); err != nil {
+			return fmt.Errorf("store: put build %s: encrypt registry auth: %w", b.BuildID, err)
+		}
+	}
 	_, err = s.db.ExecContext(ctx, `
 INSERT INTO builds (build_id,template_id,persist_id,manifest_key_hash,manifest_key_enc,profile,kind,
-  from_image,start_cmd,status,reason,names_json,aliases_json,created_unix)
-VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+  from_image,start_cmd,status,reason,names_json,aliases_json,created_unix,registry_auth_enc)
+VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 ON CONFLICT(build_id) DO UPDATE SET
   template_id=excluded.template_id, persist_id=excluded.persist_id,
   manifest_key_hash=excluded.manifest_key_hash, manifest_key_enc=excluded.manifest_key_enc,
   profile=excluded.profile, kind=excluded.kind, from_image=excluded.from_image,
   start_cmd=excluded.start_cmd, status=excluded.status, reason=excluded.reason,
-  names_json=excluded.names_json, aliases_json=excluded.aliases_json`,
+  names_json=excluded.names_json, aliases_json=excluded.aliases_json,
+  registry_auth_enc=excluded.registry_auth_enc`,
 		b.BuildID, b.TemplateID, b.PersistID, hash, enc, string(b.Profile), string(b.Kind),
-		b.FromImage, b.StartCmd, string(b.Status), b.Reason, mjs(b.Names), mjs(b.Aliases), b.CreatedUnix)
+		b.FromImage, b.StartCmd, string(b.Status), b.Reason, mjs(b.Names), mjs(b.Aliases), b.CreatedUnix, raEnc)
 	if err != nil {
 		return fmt.Errorf("store: put build %s: %w", b.BuildID, err)
 	}
@@ -384,25 +399,104 @@ type ManifestKeyInfo struct {
 	Hash        string // hex fingerprint (24 chars)
 	Label       string
 	CreatedUnix int64
+	ExpiresUnix int64 // 0 = never expires
 }
 
-// AddManifestKey inserts a manifest key (hex) into the allowlist if not already
-// present (dedup by decrypt-compare, since the short hash is non-unique). Returns
-// whether a new row was added.
-func (s *Store) AddManifestKey(ctx context.Context, manifestKeyHex, label string) (bool, error) {
-	if ok, err := s.HasManifestKey(ctx, manifestKeyHex); err != nil || ok {
-		return false, err
-	}
+// AddManifestKey inserts a manifest key (hex) into the allowlist, or refreshes it if
+// already present (dedup by decrypt-compare, since the short hash is non-unique).
+// ttlSec>0 sets expiry to now+ttlSec; ttlSec<=0 means never expires. registryAuthJSON
+// (a docker config.json; "" = leave) is the tenant's default pull credentials, stored
+// encrypted. Re-adding refreshes the expiry (and the label / registry auth if newly
+// given). Returns whether a NEW row was inserted (false = refreshed an existing one).
+func (s *Store) AddManifestKey(ctx context.Context, manifestKeyHex, label string, ttlSec int64, registryAuthJSON string) (bool, error) {
 	hash, enc, err := s.encField(manifestKeyHex)
 	if err != nil {
 		return false, err
 	}
+	var expires int64
+	if ttlSec > 0 {
+		expires = time.Now().Unix() + ttlSec
+	}
+	var raEnc string
+	if registryAuthJSON != "" {
+		if raEnc, err = s.box.EncryptString(registryAuthJSON); err != nil {
+			return false, err
+		}
+	}
+	rid, found, err := s.findManifestKeyRow(ctx, manifestKeyHex, hash)
+	if err != nil {
+		return false, err
+	}
+	if found { // re-add: always refresh expiry; update label / registry auth only if given
+		if _, err := s.db.ExecContext(ctx, `UPDATE manifest_keys SET expires_unix=? WHERE rowid=?`, expires, rid); err != nil {
+			return false, err
+		}
+		if label != "" {
+			if _, err := s.db.ExecContext(ctx, `UPDATE manifest_keys SET label=? WHERE rowid=?`, label, rid); err != nil {
+				return false, err
+			}
+		}
+		if registryAuthJSON != "" {
+			if _, err := s.db.ExecContext(ctx, `UPDATE manifest_keys SET registry_auth_enc=? WHERE rowid=?`, raEnc, rid); err != nil {
+				return false, err
+			}
+		}
+		return false, nil
+	}
 	if _, err := s.db.ExecContext(ctx,
-		`INSERT INTO manifest_keys (key_hash,key_enc,label,created_unix) VALUES (?,?,?,?)`,
-		hash, enc, label, time.Now().Unix()); err != nil {
+		`INSERT INTO manifest_keys (key_hash,key_enc,label,created_unix,expires_unix,registry_auth_enc) VALUES (?,?,?,?,?,?)`,
+		hash, enc, label, time.Now().Unix(), expires, raEnc); err != nil {
 		return false, fmt.Errorf("store: add manifest key: %w", err)
 	}
 	return true, nil
+}
+
+// RegistryAuthForKey returns the tenant's stored registry auth (docker config.json),
+// or "" if none. Matched by decrypt-compare (the hash is non-unique).
+func (s *Store) RegistryAuthForKey(ctx context.Context, manifestKeyHex string) (string, error) {
+	hash, err := ManifestKeyHash(manifestKeyHex)
+	if err != nil {
+		return "", err
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT key_enc,registry_auth_enc FROM manifest_keys WHERE key_hash=?`, hash)
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var keyEnc, raEnc string
+		if err := rows.Scan(&keyEnc, &raEnc); err != nil {
+			return "", err
+		}
+		if mk, err := s.box.DecryptString(keyEnc); err == nil && mk == manifestKeyHex {
+			if raEnc == "" {
+				return "", nil
+			}
+			return s.box.DecryptString(raEnc)
+		}
+	}
+	return "", rows.Err()
+}
+
+// findManifestKeyRow returns the rowid of the manifest_keys row whose decrypted key
+// equals manifestKeyHex (the hash is non-unique, so decrypt-compare is authoritative).
+func (s *Store) findManifestKeyRow(ctx context.Context, manifestKeyHex, hash string) (int64, bool, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT rowid,key_enc FROM manifest_keys WHERE key_hash=?`, hash)
+	if err != nil {
+		return 0, false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var rid int64
+		var enc string
+		if err := rows.Scan(&rid, &enc); err != nil {
+			return 0, false, err
+		}
+		if mk, err := s.box.DecryptString(enc); err == nil && mk == manifestKeyHex {
+			return rid, true, nil
+		}
+	}
+	return 0, false, rows.Err()
 }
 
 // HasManifestKey reports whether the manifest key (hex) is in the allowlist.
@@ -452,7 +546,7 @@ func (s *Store) RemoveManifestKey(ctx context.Context, manifestKeyHex string) (i
 
 // ListManifestKeys returns the allowlist as non-secret fingerprints + labels.
 func (s *Store) ListManifestKeys(ctx context.Context) ([]ManifestKeyInfo, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT key_hash,label,created_unix FROM manifest_keys ORDER BY created_unix ASC`)
+	rows, err := s.db.QueryContext(ctx, `SELECT key_hash,label,created_unix,expires_unix FROM manifest_keys ORDER BY created_unix ASC`)
 	if err != nil {
 		return nil, err
 	}
@@ -460,7 +554,7 @@ func (s *Store) ListManifestKeys(ctx context.Context) ([]ManifestKeyInfo, error)
 	var out []ManifestKeyInfo
 	for rows.Next() {
 		var mi ManifestKeyInfo
-		if err := rows.Scan(&mi.Hash, &mi.Label, &mi.CreatedUnix); err != nil {
+		if err := rows.Scan(&mi.Hash, &mi.Label, &mi.CreatedUnix, &mi.ExpiresUnix); err != nil {
 			return nil, err
 		}
 		out = append(out, mi)
@@ -468,11 +562,14 @@ func (s *Store) ListManifestKeys(ctx context.Context) ([]ManifestKeyInfo, error)
 	return out, rows.Err()
 }
 
-// AllowedManifestKeysByHash returns the decrypted manifest keys (hex) in the
-// allowlist whose hash matches — the candidate set the caller verifies an api key
-// against for create/build authorization.
+// AllowedManifestKeysByHash returns the decrypted, NON-EXPIRED manifest keys (hex) in
+// the allowlist whose hash matches — the candidate set the caller verifies an api key
+// against for create/build authorization. Expired rows (expires_unix>0 && <now) are
+// excluded (treated as not allowlisted); they linger until PruneExpiredManifestKeys.
 func (s *Store) AllowedManifestKeysByHash(ctx context.Context, hash string) ([]string, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT key_enc FROM manifest_keys WHERE key_hash=?`, hash)
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT key_enc FROM manifest_keys WHERE key_hash=? AND (expires_unix=0 OR expires_unix>?)`,
+		hash, time.Now().Unix())
 	if err != nil {
 		return nil, err
 	}
@@ -488,6 +585,19 @@ func (s *Store) AllowedManifestKeysByHash(ctx context.Context, hash string) ([]s
 		}
 	}
 	return out, rows.Err()
+}
+
+// PruneExpiredManifestKeys deletes expired allowlist rows (expires_unix>0 && <now).
+// Lazy cleanup called opportunistically by the reaper; expired keys are already
+// excluded from authorization by AllowedManifestKeysByHash.
+func (s *Store) PruneExpiredManifestKeys(ctx context.Context) (int64, error) {
+	res, err := s.db.ExecContext(ctx,
+		`DELETE FROM manifest_keys WHERE expires_unix>0 AND expires_unix<?`, time.Now().Unix())
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
 }
 
 // mustHash is HasManifestKey's helper; an invalid hex key yields a hash that
