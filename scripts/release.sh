@@ -58,8 +58,8 @@ DOCS=(
   "sandbox-sentinel/docs/node.md"
   # node orchestrator (e2b-compatible ingress)
   "sandbox-orchestrator/docs/orchestrator.md"
-  # virtual switch — rename PROPOSAL.md to avoid collision with umbrella PROPOSAL.md
-  "sandbox-vswitch/docs/PROPOSAL.md:vswitch.md"
+  # virtual switch
+  "sandbox-vswitch/docs/vswitch.md"
   "sandbox-vswitch/docs/tapfd.md"
   # platform native dependencies — VMM patches + guest kernel contracts
   "sandbox-deps/docs/cloud-hypervisor.md"
