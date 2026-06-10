@@ -20,7 +20,7 @@
 │                              config.example.yaml / orchestrator-ctl.service）
 └── test/
     ├── QUICKSTART.md          本文件
-    ├── e2e/                   24 个跨仓 e2e 脚本（一键跑，零环境变量）
+    ├── e2e/                   25 个跨仓 e2e 脚本（一键跑，零环境变量）
     ├── perf/                  7 个性能/分析脚本
     └── demo/                  e2b 端到端演示（demo_e2b.sh + DEMO.md，最直观的"试一下"）
 ```
@@ -55,7 +55,7 @@ bash test/e2e/e2e_sandbox_cold.sh      # 冷启 python:3.12-slim 并验证退出
 for f in test/e2e/*.sh; do bash "$f" || break; done
 ```
 
-## 4. e2e 脚本清单（24 个）
+## 4. e2e 脚本清单（25 个）
 
 ### 沙箱生命周期
 
@@ -70,6 +70,7 @@ for f in test/e2e/*.sh; do bash "$f" || break; done
 | `e2e_sandbox_stdio.sh` | sandbox-ctl stdio 转发模型 |
 | `e2e_sandbox_tapfd.sh` | 网络来自 tapfd handoff 的沙箱启动 |
 | `e2e_sandbox_placeholder.sh` | launch.placeholder 空跑锚点：exec 驱动 + kill 锚点原地重启不 reboot |
+| `e2e_sandbox_disks.sh` | boot.disks[] 多数据盘（单盘 + overlay）冷启挂载 + 快照/恢复数据存活 |
 
 ### 快照 / 恢复
 
