@@ -7,9 +7,7 @@
 路径有 ~2× 抖动,裸金属 native Linux + NVMe 数字应明显更稳定且更优。下列数字按
 技术事实记录,绝对量级以裸金属复测为准。
 
-测量入口:
-
-本仓(umbrella)聚合目标:
+测量入口(本仓 umbrella 聚合目标):
 
 ```bash
 make bench           # Go 微基准(各 Go 子仓)
@@ -50,7 +48,7 @@ p99.9 目标达成。p50 离 500 µs 仍有 ~270 µs 差距,来源是 loopback T
 内存 / pipeline),属传输层重设计。
 
 口径说明:此处 < 5 ms 是 cache-ctl 单进程 loopback 压测的 p99.9 目标;L2 集群
-对外读尾延迟的设计目标为 < 4 ms(见 cache.md 与 PROPOSAL.md §8)。
+对外读尾延迟的设计目标为 < 4 ms(见 cache.md 与 kuasar-sandbox.md §7.2)。
 
 ### 1.2 已采纳的优化(按 p50 改善顺序)
 
@@ -597,16 +595,15 @@ cache-ctl 预算(典型 1–2 GiB),否则 cache 增长会挤掉沙箱内存。
   sandbox-ctl stdout)。perf harness 仍主要依赖 audit.log + cgroup events 做断言,
   应用 stdout 可用作辅助信号
 
-## 4. 长期方向
+## 4. 已知测量局限
 
-- **多 vCPU 高并发 fault 测试**:当前数据是 1 vCPU,fault 几乎无并发竞态;
-  4-8 vCPU 下需要测 batch 行为 + EVENT_REMOVE 在 host-driven balloon inflate
-  场景下的突发速率(每 5 s tick + MaxStep 256 MiB)
-- **生产 NVMe + 裸金属 KVM 实测**:本数据来自嵌套 KVM 开发环境,有 ~2× 抖动;
-  裸金属 native Linux + NVMe 跑一遍可确认绝对数量级,尤其 hot-L1 restore 中位数稳定后
-  会接近 file:// 基线
-- **跨节点 manifest:// dedup 实测**:本数据是单节点。跨多节点 cache-ctl 集群
-  + EC L2 + 共享 OBS,跨 sandbox 的 image-段 dedup 应 >70%
+- **vCPU 并发**:当前数据是 1 vCPU,fault 几乎无并发竞态;4-8 vCPU 下的 batch
+  行为与 EVENT_REMOVE 在 host-driven balloon inflate 场景下的突发速率
+  (每 5 s tick + MaxStep 256 MiB)未覆盖
+- **环境口径**:本数据来自嵌套 KVM 开发环境,有 ~2× 抖动;绝对数量级以裸金属
+  native Linux + NVMe 为准,尤其 hot-L1 restore 中位数稳定后会接近 file:// 基线
+- **去重口径**:本数据是单节点;跨多节点 cache-ctl 集群 + EC L2 + 共享 OBS 的
+  跨 sandbox image-段 dedup(预期 >70%)未实测
 
 ## 5. 回归 checklist
 
@@ -649,4 +646,4 @@ make perf-density
 - [`cache.md`](cache.md) —— cache-ctl 架构,本文 §1 关注其运行特征
 - [`sandbox.md`](sandbox.md) —— sandbox-ctl 架构,本文 §2 关注其运行特征
 - [`node.md`](node.md) —— 节点资源控制器架构与协议规范
-- `PROPOSAL.md` §1 性能目标 —— 系统级 SLO 的来源
+- [`kuasar-sandbox.md`](kuasar-sandbox.md) §1.3 / §7 —— 系统级 SLO 与规模推算的来源

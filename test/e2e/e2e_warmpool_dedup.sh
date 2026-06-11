@@ -16,7 +16,7 @@
 #   memory snapshot     — one per sandbox, tests how similar the
 #                          guest RAM looks at the same TICK count
 #
-# Why this matters: PROPOSAL §performance targets >85% cross-image
+# Why this matters: kuasar-sandbox.md §7.3 targets >85% cross-image
 # dedup. Same-image / same-app dedup should comfortably exceed that;
 # this test exposes the actual number on real workloads.
 #
@@ -262,7 +262,7 @@ boot:
   kernel: file://$VMLINUX
   runtime: file://$BIN/sandbox-runtime.erofs
   # nokaslr + norandmaps disable kernel/user ASLR. Required for the
-  # PROPOSAL §4 ">90% dedup" target — without them the kernel image
+  # kuasar-sandbox.md §4.6 ">90% dedup" target — without them the kernel image
   # base + user mmap layout differ per boot, defeating chunk-level
   # cross-instance dedup.
   cmdline: "console=hvc0 printk.time=1 nokaslr norandmaps"

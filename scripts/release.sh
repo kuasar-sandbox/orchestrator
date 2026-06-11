@@ -42,7 +42,7 @@ OUT="$UMBRELLA_DIR/dist/$NAME"
 # Excluded (pure build workflow, not user-facing): sandbox-deps/docs/build.md.
 DOCS=(
   # umbrella system-level
-  "kuasar-sandbox/docs/PROPOSAL.md"
+  "kuasar-sandbox/docs/kuasar-sandbox.md"
   "kuasar-sandbox/docs/deployment.md"
   "kuasar-sandbox/docs/perf.md"
   # storage accelerator

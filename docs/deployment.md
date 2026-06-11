@@ -1,8 +1,8 @@
 # deployment — 部署拓扑与组件清单
 
-Mass Sandbox 由若干**独立部署的进程**组成,通过网络协议(gRPC / wire / vsock /
-UDS)协作。本文档定义这些进程在生产部署中的归属、责任边界、配置入口与启停
-依赖,供运维与 SRE 使用。
+kuasar-sandbox 平台由若干**独立部署的进程**组成,通过网络协议(gRPC / wire /
+vsock / UDS)协作。本文档定义这些进程在生产部署中的归属、责任边界、配置入口与
+启停依赖,供运维与 SRE 使用。
 
 各模块的 CLI、配置 schema、内部设计在自己的文档里(`docs/<模块>.md`);本文档
 **不**重复这些细节,只回答"东西在哪、彼此怎么找到对方、谁先起谁后起"。
@@ -18,7 +18,7 @@ UDS)协作。本文档定义这些进程在生产部署中的归属、责任边�
 | Compute Node | 每 AZ 一集群,~5,000 节点 | 承载客户沙箱(microVM),每节点 ~3K microVM | `orchestrator-ctl`、`node-ctl`、`cache-ctl tiered`、`store-ctl`(sidecar)、`sandbox-ctl × N` |
 | L2 Cache Cluster | 每 AZ 一集群,100-200 节点 | 分布式 EC 缓存(RS 4+1,Maglev 一致性哈希),吸收 L1 miss 把 L3 请求压到 < 0.1% | `cache-ctl shard` |
 
-**Region 级共享资源**(由各自的平台管理面运营,本方案不展开)
+**Region 级共享资源**(由各自的平台管理面运营,平台外)
 
 | 资源 | 用途 |
 |---|---|
@@ -31,15 +31,15 @@ UDS)协作。本文档定义这些进程在生产部署中的归属、责任边�
 
 ### 2.1 常驻进程
 
-| 进程 | 角色 | 数量 | 启停 | 本方案归属 |
+| 进程 | 角色 | 数量 | 启停 | 归属 |
 |---|---|---|---|---|
-| `orchestrator-ctl`(`serve`)| 本机沙箱编排 + e2b 兼容控制面:对外 e2b API,经 `run-task`(systemd 单元)启动 `sandbox-ctl run`,经 vswitch 编排网络,反代 guest envd / floatingip,生命周期与 TTL | 单实例 | systemd | **本方案内**,`sandbox-orchestrator/docs/orchestrator.md` |
-| `platform-agent`| 打通平台管理面(区域级 platform-service) ↔ 本机 orchestrator-ctl 的桥接(多节点) | 单实例 | systemd | **本方案外/未来** |
-| `node-ctl`(`daemon`)| 节点级资源仲裁:沙箱准入、内存预算分配、密度控制 | 单实例 | systemd | 本方案,`docs/node.md` |
-| `cache-ctl`(`mode: tiered`)| 节点本地数据入口:L1 RocksDB + EC 客户端(→ L2)+ L3 origin | 单实例 | systemd,先于 orchestrator-ctl | 本方案,`docs/cache.md` |
-| `store-ctl` | 本机 OBS 读写代理(sidecar);**所有**远端 OBS 流量走这里 | 单实例 | systemd | 本方案,`docs/store.md` |
-| `sandbox-ctl`(`run`) | 单个沙箱的控制平面(类 `runc run`);非 daemon | 每沙箱一个,~3K | 由 orchestrator-ctl 经 run-task(systemd 单元)启动 | 本方案,`docs/sandbox.md` |
-| `cloud-hypervisor` | VMM(patched);`sandbox-ctl` 子进程 | 每沙箱一个 | `sandbox-ctl` 派生 | 本方案,`docs/cloud-hypervisor.md` |
+| `orchestrator-ctl`(`serve`)| 本机沙箱编排 + e2b 兼容控制面:对外 e2b API,经 `run-task`(systemd 单元)启动 `sandbox-ctl run`,经 vswitch 编排网络,反代 guest envd / floatingip,生命周期与 TTL | 单实例 | systemd | 平台内,`sandbox-orchestrator/docs/orchestrator.md` |
+| `platform-agent`| 打通平台管理面(区域级 platform-service) ↔ 本机 orchestrator-ctl 的桥接(多节点) | 单实例 | systemd | **平台外** |
+| `node-ctl`(`daemon`)| 节点级资源仲裁:沙箱准入、内存预算分配、密度控制 | 单实例 | systemd | 平台内,`docs/node.md` |
+| `cache-ctl`(`mode: tiered`)| 节点本地数据入口:L1 RocksDB + EC 客户端(→ L2)+ L3 origin | 单实例 | systemd,先于 orchestrator-ctl | 平台内,`docs/cache.md` |
+| `store-ctl` | 本机 OBS 读写代理(sidecar);**所有**远端 OBS 流量走这里 | 单实例 | systemd | 平台内,`docs/store.md` |
+| `sandbox-ctl`(`run`) | 单个沙箱的控制平面(类 `runc run`);非 daemon | 每沙箱一个,~3K | 由 orchestrator-ctl 经 run-task(systemd 单元)启动 | 平台内,`docs/sandbox.md` |
+| `cloud-hypervisor` | VMM(patched);`sandbox-ctl` 子进程 | 每沙箱一个 | `sandbox-ctl` 派生 | 平台内,`docs/cloud-hypervisor.md` |
 
 ### 2.2 端口与套接字
 
@@ -200,7 +200,7 @@ yaml 显式 access_key/secret_key  →  ~/.obsconfig  →  AWS SDK 默认凭证�
 
 ### 4.2 平台管理面 / 镜像展平管理面
 
-均为 region 级、独立运营,本方案外。与本方案的接口:
+均为 region 级、独立运营,平台外。与平台的接口:
 
 - 平台管理面 ↔ 各 compute 节点 `platform-agent`(→ orchestrator-ctl):沙箱实例配置 / 客户密钥 /
   生命周期事件
@@ -404,7 +404,7 @@ Region 级:         OBS 桶 + 平台 / 展平管理面
 ### 9.3 多 AZ
 
 每 AZ 独立 compute 集群 + L2 cluster;region 级共享同一组 OBS 桶。Compute
-节点的 `cache-ctl tiered` 配置只列本 AZ L2 peer,minimize cross-AZ 流量。
+节点的 `cache-ctl tiered` 配置只列本 AZ L2 peer,最小化跨 AZ 流量。
 跨 AZ 去重在 OBS 桶级别天然达成(同 manifest → 同 chunk 密文哈希)。
 
 ## 10. 配置入口速查
@@ -426,7 +426,7 @@ Region 级:         OBS 桶 + 平台 / 展平管理面
 
 ## 11. See Also
 
-- [`docs/PROPOSAL.md`](PROPOSAL.md) — 系统级方案与业务模型
+- [`docs/kuasar-sandbox.md`](kuasar-sandbox.md) — 系统设计总览:业务目标、子系统分工、端到端数据流
 - [`docs/sandbox.md`](sandbox.md) — compute node 上 `sandbox-ctl` 的完整生命周期
 - [`docs/cache.md`](cache.md) §3.1 — `local` / `shard` / `tiered` 三形态选择;§4.9 Maglev 一致性哈希
 - [`docs/store.md`](store.md) — 后端选择(fs / obs)与代轮转

@@ -1,97 +1,77 @@
 # kuasar-sandbox
 
-面向大规模 Serverless / Agent 场景的 microVM 沙箱平台：亚秒级冷启动与快照恢复、
-跨镜像/快照去重的存储加速、单节点数千沙箱的资源管控。
+面向大规模 Serverless / Agent 场景的 microVM 沙箱平台:亚秒级冷启动与快照恢复、
+跨镜像/快照内容级去重的存储加速、单节点数千沙箱的密度与资源管控,并以单机
+**e2b 兼容**的沙箱编排/ingress(未改造的 e2b SDK 可直连本机)对外提供北向入口。
 
-本仓是平台的**主项目**：承载系统级设计文档、跨仓 e2e/perf 套件，以及把各子项目制品
-聚合成"下载即用"的大版本发布包。各能力拆分为独立演进的子仓，边界处只暴露薄的、命名
-具体的导入面（如 `pkg/manifest`、`pkg/tapfd`、`pkg/image`、`pkg/resource`）。
+本仓是平台的**主项目**:承载系统级设计文档、跨仓 e2e/perf 套件,以及把各子项目
+制品聚合成"下载即用"大版本发布包的完整构建入口。各能力拆分为独立演进的子仓,
+边界只暴露薄的、命名具体的纯 Go 导入面;子仓分工、依赖 DAG 与导出面规则见
+[docs/kuasar-sandbox.md](docs/kuasar-sandbox.md) §2。
 
-核心能力：亚秒级冷启动与快照恢复、跨镜像/快照去重的存储加速、单节点数千沙箱的资源管控，
-并以单机 **e2b 兼容**的沙箱编排/ingress（未改造的 e2b SDK 可直连本机）对外提供北向入口。
-
-> **快速体验（e2b demo）**：`make demo`（发布包内：`bash test/demo/demo_e2b.sh`）——用**未改造的
-> e2b CLI** 在本机走通「构建模板 → 启真实 microVM → guest 内执行 → 暂停/恢复 → 销毁」全链路；
-> `DEMO_PAUSE=1` 逐步暂停、可另开终端用 e2b CLI 手动操作。前置工具与说明见 [`test/demo/DEMO.md`](test/demo/DEMO.md)。
+> **快速体验(e2b demo)**:`make demo`(发布包内:先 `bash test/demo/demo_prep.sh`
+> 再 `bash test/demo/demo_e2b.sh`)——用**未改造的 e2b Python SDK** 在本机走通
+> "构建模板 → 启真实 microVM → guest 内执行 → 端口转发/出网 → 暂停/恢复 →
+> 快照转模板扇出 → 迁移 → 销毁"全链路;`DEMO_PAUSE=1` 逐步暂停、可另开终端用
+> SDK 手动操作。前置工具与说明见 [test/demo/DEMO.md](test/demo/DEMO.md)。
 
 ## 子项目
 
 | 仓 | 角色 | 导出面 / 产物 |
 |---|---|---|
-| **kuasar-sandbox**（本仓） | 系统文档 + 发布聚合 + 跨仓 e2e/perf | `scripts/release.sh`、`docs/`、`test/` |
-| **sandbox-runtime** | microVM 生命周期引擎（host `sandbox-ctl` + guest `sandbox-init`）+ vhost 块后端 | `pkg/resource`（资源控制协议+Client） |
-| **sandbox-orchestrator** | 单机 e2b 兼容沙箱编排/ingress（控制面 + envd-in-guest 反代 + 模板构建） | `orchestrator-ctl` + `e2b-key-ctl`、`docs/orchestrator.md` |
-| **sandbox-accelerator** | 存储加速：内容寻址存储 + 分层缓存 + 收敛加密 | `pkg/manifest`、`pkg/{cache,store}/client` |
-| **sandbox-builder** | 镜像构建：OCI → EROFS 确定性展平 | `pkg/image`（读取展平镜像）+ `flatten-ctl` |
-| **sandbox-vswitch** | eBPF/TC 虚拟交换机 + tapfd 交接 | `pkg/tapfd`（fd 交接规约）+ `vswitch-ctl`/`tapfd-get` |
-| **sandbox-sentinel** | 节点级资源守护（准入/分配/回收，3,000+ 密度） | `node-ctl` 守护进程 |
-| **sandbox-deps** | 原生依赖：vmlinux / cloud-hypervisor / mkfs.erofs | 构建脚本 + patches + configs |
-
-## 依赖关系（DAG，发布拓扑序）
-
-```
- sandbox-accelerator   sandbox-vswitch   sandbox-deps        (T0: 无内部依赖)
-        ▲   ▲                ▲
-        │   │ pkg/manifest   │ pkg/tapfd
-        │   └────────────────┼──────────────┐
-        │ pkg/manifest       │              │
- sandbox-builder ────────────┤              │              (T1)
-        ▲                    │              │
-        │ pkg/image          │ pkg/tapfd    │ pkg/manifest
- sandbox-runtime ────────────┴──────────────┘              (T2)
-        ▲                    ▲
-        │ pkg/resource       │ CLI/run-task: sandbox-ctl + vswitch-ctl + flatten-ctl
- sandbox-sentinel    sandbox-orchestrator                  (T3)
-```
-
-实线箭头是 **Go 导入边**；`sandbox-orchestrator` 不 import 任何兄弟仓（`CGO_ENABLED=0` 叶子），
-而是在计算节点上经 **run-task / CLI** 驱动 `sandbox-ctl`（拉起/快照沙箱）、`vswitch-ctl`（编排网络）、
-`flatten-ctl`（模板构建），并消费 `sandbox-runtime-e2b.erofs` 等运行期制品。
-
-各 Go 导出面均为 **纯 Go、无 CGO**：`sandbox-runtime` 不会因依赖 accelerator/vswitch 而引入
-rocksdb / eBPF（Go module-graph pruning + 后端隔离在各仓 `server`/`rocks`/`internal` 内）。
-唯一的 CGO 二进制是 accelerator 的 `cache-ctl`（静态链 librocksdb）。
+| **kuasar-sandbox**(本仓) | 系统文档 + 发布聚合 + 跨仓 e2e/perf | `scripts/release.sh`、`docs/`、`test/` |
+| **sandbox-runtime** | microVM 生命周期引擎(host `sandbox-ctl` + guest `sandbox-init`)+ vhost 块后端 | `pkg/resource`(资源控制协议+Client) |
+| **sandbox-orchestrator** | 单机 e2b 兼容沙箱编排/ingress(控制面 + envd-in-guest 反代 + 模板构建) | `orchestrator-ctl` + `e2b-key-ctl`、`sandbox-runtime-e2b.erofs` |
+| **sandbox-accelerator** | 存储加速:内容寻址存储 + 分层缓存 + 收敛加密 | `pkg/manifest`、`pkg/{cache,store}/client` |
+| **sandbox-builder** | 镜像构建:OCI → EROFS 确定性展平 | `pkg/image`(读取展平镜像)+ `flatten-ctl` |
+| **sandbox-vswitch** | eBPF/TC 虚拟交换机 + tapfd 交接 | `pkg/tapfd`(fd 交接规约)+ `vswitch-ctl`/`tapfd-get` |
+| **sandbox-sentinel** | 节点级资源守护(准入/分配/回收,3,000+ 密度) | `node-ctl` 守护进程 |
+| **sandbox-deps** | 原生依赖:vmlinux / cloud-hypervisor / mkfs.erofs | 构建脚本 + patches + configs |
 
 ## 构建
 
-**单仓（私网/离线，推荐的发布路径）**：每个仓 `go.mod` 用 `replace` 指向兄弟目录，clone
-全组织为兄弟目录后即可离线构建，无需 GOPROXY 或版本 tag：
+**完整构建入口(本仓 Makefile)**:`make build` 按依赖序编排全部子仓构建,按
+`scripts/artifacts.list` 收集制品到 `bin/$(TARGET_ARCH)/`,并装配出注入 envd 的
+`sandbox-runtime-e2b.erofs`:
+
+```bash
+make -C kuasar-sandbox all        # = build:全部子仓 + 装配 bin/
+make -C kuasar-sandbox release    # 打包 dist/kuasar-sandbox-<ver>-linux-<arch>.tar.gz
+make -C kuasar-sandbox help       # 全部目标(test-e2e / perf / bench / demo / ...)
+```
+
+发布包聚合 `bin/` + 精选 `docs/` + 跨仓 e2e/perf/demo 脚本 + `deploy/` 样例,
+解包即用(脚本经相对路径自动定位 `bin/`,见 `test/QUICKSTART.md`)。
+
+**单仓(私网/离线,发布路径)**:每个仓 `go.mod` 用 `replace` 指向兄弟目录,
+clone 全组织为兄弟目录后即可离线构建,无需 GOPROXY 或版本 tag:
 
 ```bash
 cd sandbox-runtime && GOWORK=off make build     # 同理各仓
 ```
 
-**统一开发（go.work）**：根 `go.work` 把所有 module 纳入一个工作区（IDE/跨仓改动友好）。
-首次需用内网 GOPROXY 拉取第三方依赖（工作区合并 MVS 会选取各仓要求的最高版本）：
-
-```bash
-go work sync          # 一次性，按内网 GOPROXY 对齐 go.sum
-go build ./...        # 任意子目录
-```
-
-**完整构建入口（本仓 Makefile）**：`make build` 顺序编排各子仓构建（含 `sandbox-orchestrator`），
-按 `scripts/artifacts.list` 收集全部制品到 `bin/$(TARGET_ARCH)/`，并由 `sandbox-orchestrator` 的
-`sandbox-runtime-e2b` 目标把 envd 注入基础 runtime 装配出 `sandbox-runtime-e2b.erofs`：
-
-```bash
-make -C kuasar-sandbox build      # 全部子仓 + 装配 bin/（含 sandbox-runtime-e2b.erofs）
-make -C kuasar-sandbox release    # build 之后打包发布
-```
-
-**发布包（下载即用）**：
-
-```bash
-kuasar-sandbox/scripts/release.sh v0.1.0               # 聚合 bin/ + 精选 docs/ + 跨仓 e2e/perf + deploy/
-# → kuasar-sandbox/dist/kuasar-sandbox-v0.1.0-linux-<arch>.tar.gz
-```
-
-## 文档
-
-系统级文档在本仓 `docs/`（`PROPOSAL.md` 系统设计、`deployment.md` 部署拓扑、`perf.md` 性能基线）；
-模块文档随各自仓（如 `sandbox-runtime/docs/sandbox.md`、`sandbox-accelerator/docs/manifest.md`、
-`sandbox-orchestrator/docs/orchestrator.md`）。
+**统一开发(go.work)**:org 根 `go.work` 把所有 module 纳入一个工作区,首次
+`go work sync` 对齐第三方依赖后任意子目录可 `go build ./...`。
 
 ## 跨仓测试
 
-`test/`（e2e + perf）是系统级集成套件（shell 驱动）。其构建步骤源自单体仓，迁入多仓后需对接
-`scripts/release.sh` 聚合出的 `dist/.../bin/` 作为被测二进制目录 —— 详见 `test/README.md`。
+`test/`(e2e + perf + demo)是系统级集成套件,覆盖需要多仓二进制协作的路径
+(真实 microVM 启动、快照/恢复、去重、密度、e2b 编排):
+
+```bash
+make -C kuasar-sandbox test-e2e          # 全部跨仓 e2e + 各子仓自有 e2e
+make -C kuasar-sandbox test-e2e-<name>   # 单个,如 test-e2e-sandbox-cold
+make -C kuasar-sandbox perf              # 性能 harness 全套
+```
+
+脚本清单、前置条件与排错见 [test/QUICKSTART.md](test/QUICKSTART.md)。
+
+## 文档
+
+- [docs/kuasar-sandbox.md](docs/kuasar-sandbox.md) — 系统设计总览:业务目标与
+  指标、子系统分工与依赖、端到端数据流、关键机制、安全模型、规模推算。
+- [docs/deployment.md](docs/deployment.md) — 部署拓扑与组件清单:进程归属、
+  端口、启停依赖、故障域。
+- [docs/perf.md](docs/perf.md) — 实测性能基线、回归 checklist 与调优杠杆。
+- 模块设计文档随各自仓(如 `sandbox-runtime/docs/sandbox.md`、
+  `sandbox-accelerator/docs/manifest.md`、`sandbox-orchestrator/docs/orchestrator.md`)。
