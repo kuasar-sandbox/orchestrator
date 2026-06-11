@@ -1,9 +1,13 @@
 // Command orchestrator-ctl is the single-node, e2b-compatible sandbox orchestrator.
 //
 //	orchestrator-ctl serve     --config <yaml>                          # run the daemon
+//	orchestrator-ctl proxy     --socket <uds> --data-listen <addr> ...  # external data-plane worker
 //	orchestrator-ctl run-sandbox --pidfile=<f> --config-socket=<uds> --sandbox-id=<sid>
 //	orchestrator-ctl run-builder --pidfile=<f> --config-socket=<uds> --build-id=<bid>
 //	                                                                    # in-unit launchers (not for humans)
+//	orchestrator-ctl config       [--template]                          # render skeleton / dump resolved config
+//	orchestrator-ctl manifest-key <add|list|remove> ...                 # tenant root-key whitelist (admin socket)
+//	orchestrator-ctl export-sandbox|import-sandbox ...                  # paused-snapshot egress / ingress
 //	orchestrator-ctl version
 //
 // Templates are built through the e2b API (POST /v3/templates ...), not a CLI.

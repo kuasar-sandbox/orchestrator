@@ -164,7 +164,7 @@ func (t *Table) Wake(sid string) {
 // Resolve returns a running route for sid, waiting up to the park timeout for the
 // route to sync / the sandbox to resume. It prompts a Wake when the sandbox is not
 // already running. ok=false means it did not become running in time (missing,
-// dead, or timed out) — the caller maps that to 404/503.
+// dead, or timed out) — the caller maps that to 404.
 func (t *Table) Resolve(ctx context.Context, sid string) (routesync.RouteEntry, bool) {
 	if !t.waitSynced(ctx) {
 		return routesync.RouteEntry{}, false

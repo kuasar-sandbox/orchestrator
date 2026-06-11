@@ -163,9 +163,6 @@ func (a *API) create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	req.APIKey = apiKeyFrom(r.Context())
-	if req.TimeoutSec <= 0 {
-		req.TimeoutSec = 15 // SDK default for create
-	}
 	sb, err := a.core.Create(r.Context(), req)
 	if err != nil {
 		a.fail(w, err)

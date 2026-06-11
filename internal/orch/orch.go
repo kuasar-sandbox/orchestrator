@@ -61,6 +61,9 @@ func New(cfg *config.Config, st *store.Store, lc launcher.Launcher, vs *vswitch.
 // --- api.Core ---
 
 func (o *Orchestrator) Create(ctx context.Context, req api.CreateReq) (*types.Sandbox, error) {
+	if req.TimeoutSec <= 0 {
+		req.TimeoutSec = o.cfg.Sandbox.TimeoutSec // default TTL (sandbox.timeout_sec)
+	}
 	manifestKey, err := o.resolveAllowed(ctx, req.APIKey)
 	if err != nil {
 		return nil, err
