@@ -72,7 +72,7 @@ DOCS=(
 # generates Go drivers via heredoc and runs them with `go run`, requiring a
 # checkout of sandbox-{sentinel,runtime} sources. Keep it in the source repo.
 E2ES=(
-  # umbrella (23)
+  # umbrella (25)
   "kuasar-sandbox/test/e2e/e2e_density.sh"
   "kuasar-sandbox/test/e2e/e2e_manifest.sh"
   "kuasar-sandbox/test/e2e/e2e_obs.sh"
@@ -80,8 +80,10 @@ E2ES=(
   "kuasar-sandbox/test/e2e/e2e_sandbox_cold_manifest.sh"
   "kuasar-sandbox/test/e2e/e2e_sandbox_cold_target.sh"
   "kuasar-sandbox/test/e2e/e2e_sandbox_diff_template.sh"
+  "kuasar-sandbox/test/e2e/e2e_sandbox_disks.sh"
   "kuasar-sandbox/test/e2e/e2e_sandbox_launchspec.sh"
   "kuasar-sandbox/test/e2e/e2e_sandbox_local_merge.sh"
+  "kuasar-sandbox/test/e2e/e2e_sandbox_placeholder.sh"
   "kuasar-sandbox/test/e2e/e2e_sandbox_proto.sh"
   "kuasar-sandbox/test/e2e/e2e_sandbox_restore.sh"
   "kuasar-sandbox/test/e2e/e2e_sandbox_restore_files.sh"
