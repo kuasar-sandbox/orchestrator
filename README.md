@@ -1,31 +1,29 @@
 # sandbox-sentinel
 
-A node-level resource guardian for high-density microVM sandboxes.
+节点级资源守护进程 `node-ctl`,是 [kuasar-sandbox](https://github.com/kuasar-sandbox/kuasar-sandbox)
+单节点 3,000+ 沙箱密度目标的准入与资源仲裁者:在固定 vCPU + cgroup 限额模型下,
+对超分内存做准入控制、burst 预算仲裁、settled 主动收缩与回收,并维护每沙箱
+reservation 记账、持久化与审计。
 
-节点级资源守护进程 `node-ctl`，是 [kuasar-sandbox](https://github.com/kuasar-sandbox/kuasar-sandbox)
-单节点 3,000+ 沙箱密度目标的准入与资源仲裁者：在固定 vCPU + cgroup 限额模型下做内存/CPU
-预算的准入控制、分配、回收，并维护每沙箱状态、持久化与审计。
+`sandbox-ctl`(`sandbox-runtime`)是客户端:冷启动/恢复前申请准入与初始预算,
+运行中上报 settled/heartbeat、按需 request-budget,结束时 release。`node-ctl`
+是服务端/控制器;任何遵循协议(`docs/node.md` §5)的实现都可作为对端,
+`node-ctl` 是参考实现。
 
-## 角色
+## 组成
 
-`sandbox-ctl`（`sandbox-runtime`）是**客户端**：冷启动/恢复前向 sentinel 申请准入与初始预算，
-运行中上报 settled/heartbeat、按需 request-budget，结束时 release。`node-ctl` 是**服务端/控制器**：
-
-| 组件 | 职责 |
-|---|---|
-| admission | 准入：容量/水位/floor 校验，admitted / queued / rejected |
-| allocator | 内存-CPU 预算分配与 watermark 管理 |
-| state | 每沙箱状态机 + reservation 记账 |
-| reclaim | 压力下的预算回收（带 deadline） |
-| persister / audit | 状态持久化 + 审计 |
+| 路径 | 角色 |
+| --- | --- |
+| `cmd/node-ctl` | CLI:`daemon`(systemd 单元入口)/ `status` / `list` / `drain` / `grant` / `reclaim` |
+| `internal/nodectl` | 控制器实现:RPC server、admission worker、memory allocator、active reclaimer、idle sweeper、state persister(布局见 `docs/node.md` §7) |
+| `internal/nodectl/resource_alias.go` | 把 `sandbox-runtime/pkg/resource` 的协议符号按本地名再导出,控制器与 CLI 无改动引用 |
 
 ## 与 sandbox-runtime 的关系
 
-资源控制协议（wire 格式 + `Client`）定义在 `sandbox-runtime/pkg/resource`（client 与 server 共用）。
-本仓的控制器 import 它实现 server 侧 —— 即 **`sandbox-sentinel` 依赖 `sandbox-runtime`**，
-`internal/nodectl/resource_alias.go` 把协议符号按本地名再导出，控制器与 CLI 无改动引用。
-
-纯 Go、`CGO_ENABLED=0`；除 `sandbox-runtime`（`replace => ../sandbox-runtime`）外无跨仓依赖。
+沙箱资源控制协议(wire 格式 + `Client`)的唯一定义点是
+`sandbox-runtime/pkg/resource`(client/server 共用),本仓 import 它实现 server
+侧——即 `sandbox-sentinel` 依赖 `sandbox-runtime`(`replace => ../sandbox-runtime`),
+除此之外无跨仓依赖。纯 Go,`CGO_ENABLED=0`。
 
 ## 构建
 
@@ -37,4 +35,7 @@ make test-e2e            # e2e(= test-e2e-node-ctl;经 sandbox-runtime/pkg/resou
 make clean               # 清理 bin/ build/
 ```
 
-协议契约与每沙箱状态机见 `docs/node.md`。
+## 文档
+
+- [docs/node.md](docs/node.md) — 设计与命令参考:资源预算与水位、沙箱资源控制
+  协议规范、创建期管控、可靠性、工作负载模型。

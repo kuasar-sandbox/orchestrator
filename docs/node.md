@@ -1,12 +1,12 @@
 # node — 节点资源控制器
 
-`node-ctl` 是节点级控制器的参考实现,作为 systemd-managed daemon 运行,跟
-节点上所有动态控制模式 sandbox-ctl 通过沙箱资源控制协议对话,完成跨沙箱
-仲裁、burst 申请、settled 收回、admission 控制。
+`node-ctl` 是节点级资源控制器,作为 systemd-managed daemon 运行,跟节点上
+所有动态控制模式 sandbox-ctl 通过沙箱资源控制协议对话,完成跨沙箱仲裁、
+burst 申请、settled 收回、admission 控制。
 
-控制器是协议的**对端角色**,不是某个具体进程。任何遵循协议的实现都可作为
-sandbox-ctl 的对端;`node-ctl` 是参考实现。本文档同时定义协议规范与 node-ctl
-的内部组织。
+控制器是协议的**对端角色**,不是某个具体进程:任何遵循 §5 定义的实现都可
+作为 sandbox-ctl 的对端,`node-ctl` 是参考实现。本文档同时定义协议规范与
+node-ctl 的内部组织。
 
 ## 1. 概述
 
@@ -52,8 +52,8 @@ sandbox-ctl 的对端;`node-ctl` 是参考实现。本文档同时定义协议�
 | 故障 | 直接影响 | 规避 / 自愈 |
 |------|---------|-------------|
 | controller 崩溃 | sandbox-ctl 长连断开;新沙箱 admit 失败 | systemd 重启;sandbox-ctl 退化无控制器继续跑 |
-| controller 状态文件损坏 | 重启时无法 fast-recovery | fallback:扫描 cgroup + 询问每个 sandbox-ctl 重建 |
-| sandbox-ctl 崩溃 | 沙箱按既有规则销毁 | controller 检测连接断 → 自动 release 该沙箱预留 |
+| controller 状态文件损坏 | 重启时无法恢复 reservation 记账 | 从空状态起,预算按 yaml 重算,等 sandbox-ctl 重连(§8.2) |
+| sandbox-ctl 崩溃 | 沙箱按既有规则销毁 | controller 检测连接断 → 保留 reservation 等 Reattach,心跳静默 90 s 后释放 |
 | controller ↔ sandbox-ctl 网络抖动 | RPC 超时 | 退避重连;期间 sandbox-ctl 用最近一次 grant 继续跑 |
 | 单沙箱 OOM | guest 内进程被 kill;deflate_on_oom 释放 balloon | 非平台级故障;controller 计 OOM 事件 |
 | host 物理 OOM | 内核 OOM killer 选目标 | 水位机制保证 node_allocated 始终 ≤ 物理可用,正常情况不应触发 |
@@ -77,9 +77,9 @@ sandbox-ctl 的对端;`node-ctl` 是参考实现。本文档同时定义协议�
 node-ctl daemon [--config /etc/node-ctl/node-ctl.yaml] [--listen /run/sandbox-resource.sock]
 ```
 
-启动 RPC server、admission controller、memory allocator、reclaim scheduler、
-state persister(`/run/node-ctl/state.json`)。systemd 单元入口。`--listen`
-覆盖 yaml 的 `listen` 路径(为空则用 yaml 值)。
+启动 RPC server、admission worker、memory allocator、active reclaimer、idle
+sweeper 与 state persister(§7)。systemd 单元入口。`--config` 省略时使用 §3.1
+的内建默认值;`--listen` 覆盖 yaml 的 `listen` 路径(为空则用 yaml 值)。
 
 ### 2.3 `node-ctl status`
 
@@ -87,8 +87,8 @@ state persister(`/run/node-ctl/state.json`)。systemd 单元入口。`--listen`
 node-ctl status [--state /run/node-ctl/state.json]
 ```
 
-读 state 文件,打印节点物理资源、已 reserve、burst 中的沙箱数量。只读,
-可与运行中的 daemon 共存。
+读 state 文件,打印水位区、节点预算、host 预留、运维容差、已分配量、利用率与
+reservation 数。只读,可与运行中的 daemon 共存。
 
 ### 2.4 `node-ctl list`
 
@@ -113,7 +113,8 @@ node-ctl drain [--socket /run/sandbox-resource.sock] [--disable]
 node-ctl grant <sid> --memory <size> [--socket /run/sandbox-resource.sock]
 ```
 
-绕过仲裁直接给某沙箱发放内存 budget,用于排查或紧急调度。
+绕过水位与限速,直接给某沙箱发放内存 budget(上限 clamp 到 capacity),用于排查
+或紧急调度;sandbox-ctl 经下次 Heartbeat 取得新值落地。
 
 ### 2.7 `node-ctl reclaim`
 
@@ -121,7 +122,8 @@ node-ctl grant <sid> --memory <size> [--socket /run/sandbox-resource.sock]
 node-ctl reclaim <sid> --memory <target> [--socket /run/sandbox-resource.sock]
 ```
 
-直接将某沙箱内存收缩到目标值,用于人工干预异常场景。
+直接将某沙箱 allocatable 收缩到目标值(shrink-only,clamp 到 floor;目标高于
+当前值时报错),用于人工干预异常场景;同样经 Heartbeat 传播。
 
 ## 3. 配置
 
@@ -132,7 +134,7 @@ node-ctl reclaim <sid> --memory <target> [--socket /run/sandbox-resource.sock]
 ```yaml
 listen: /run/sandbox-resource.sock
 state_path: /run/node-ctl/state.json   # tmpfs
-cgroup_scan_paths:                      # 重启恢复扫描路径
+cgroup_scan_paths:                      # (预留)重启对账扫描根
   - /sys/fs/cgroup/sandboxes
 
 resources:
@@ -174,21 +176,21 @@ logging:
 |---|---|---|
 | `listen` | `/run/sandbox-resource.sock` | UDS,sandbox-ctl 拨号目标 |
 | `state_path` | `/run/node-ctl/state.json` | tmpfs,daemon 重启快速恢复用 |
-| `cgroup_scan_paths` | `[/sys/fs/cgroup/sandboxes]` | 重启时扫已知活沙箱 |
+| `cgroup_scan_paths` | `[/sys/fs/cgroup/sandboxes]` | (预留)重启对账扫描根 |
 | `resources.physical_memory` | `auto` | 节点物理内存(`/proc/meminfo`)|
 | `resources.physical_cpu` | `auto` | 节点物理核数(`nproc`) |
-| `resources.host_reserved.memory` | (必填) | host 自身预留(kernel + cache-ctl + store-ctl + monitoring) |
-| `resources.host_reserved.cpu` | (必填) | 同上,CPU 维度 |
+| `resources.host_reserved.memory` | `16GiB` | host 自身预留(kernel + cache-ctl + store-ctl + monitoring),按节点实测覆盖(§10.2) |
+| `resources.host_reserved.cpu` | `1.5` | 同上,CPU 维度 |
 | `watermarks.operational_margin_factor` | 0.10 | 节点预算的 10%,容差,不参与分配 |
 | `watermarks.high_factor` | 0.85 | red 区起点 |
 | `watermarks.low_factor` | 0.70 | yellow 区起点 |
 | `watermarks.emergency_factor` | 0.05 | 紧急池,仅 urgency=high 申请可触 |
-| `watermarks.startup_factor` | 0.50 | startup_pool = allocatable_pool × 此值,bounds admission 阶段累计 effective_startup_budget,留 steady-state grant 用 |
+| `watermarks.startup_factor` | 0.50 | startup_pool = allocatable_pool × 此值;admission 阶段累计 effective_startup_budget 的上界,为 steady-state grant 留余量(约束:emergency_factor < startup_factor ≤ 1.0) |
 | `rate_limits.memory_grant_per_sec_factor` | 0.05 | 内存仲裁限速:每秒总扩展量 ≤ allocatable_pool × 此值 |
 | `admission.rate` | 4 | Admit 速率,token bucket 装填速率(/s) |
-| `admission.burst` | 16 | Admit token bucket 容量(注:与 sandbox.yaml `resources.startup` 同字面但语义不同) |
+| `admission.burst` | 16 | Admit token bucket 容量 |
 | `admission.startup_ttl` | 30s | sandbox-ctl 必须在此时间内进入 settled,否则 IdleSweeper 释放 reservation |
-| `admission.queue_ttl` | 30s | 短期阻塞排队最长等待,超时 → reject `queue_ttl` |
+| `admission.queue_ttl` | 30s | 短期阻塞排队最长等待,超时 → reject `queue_canceled` |
 | `admission.queue_max_depth` | 256 | 队列容量,超即立 reject `queue_full` |
 | `dampening.recover_duration` | 60s | burst → settled 观察期 |
 | `dampening.cooldown_periods` | 10 | × 100ms,burst → recover 判定门槛 |
@@ -226,42 +228,47 @@ startup_pool     = allocatable_pool × 50%   # admission 阶段累计上界
 `emergency_pool` 仅响应 urgency=high(oom 类紧急申请),正常仲裁动用前 95%
 预算。
 
-`startup_pool` 是 admission 单独跟踪的 sub-budget:所有 pre-settled stage
-的 reservation `effective_startup_budget` 累计不能超过 startup_pool。这是
-**用 budget 替代过去 hardcoded `max_concurrent_creating`** 的方式,把并发由
-"个数硬限"变成"内存硬限"——同样的 startup_pool 容下若干个小 sandbox 或
+`startup_pool` 是 admission 单独跟踪的 sub-budget:所有 pre-settled 阶段
+reservation 的 `effective_startup_budget` 累计不能超过 startup_pool。创建并发
+以"内存硬限"而非"个数硬限"表达——同样的 startup_pool 容下若干个小 sandbox 或
 单个大 sandbox,自然 throttle。
 
 水位区间行为:
 
-| 区间 | node_allocated 位置 | Admit | settled 主动收回 | burst 申请 |
-|------|---------------------|-------|-------------------|-----------|
-| **green** | < low_watermark | 接受 | 不主动 | 直接批 |
-| **yellow** | [low, high] | 接受 | 渐进收回(10s 周期) | FIFO 限速批 |
-| **red** | (high, allocatable_pool − emergency_pool] | **拒绝新沙箱** | 强制收回最旧 settled 沙箱超额 | 仅紧急批,普通申请排队 |
-| **critical** | 进入 emergency_pool | 拒绝 | 强制 + 最旧优先 | 仅 oom urgency 批 |
+| 区间 | node_allocated 位置 | Admit | settled 收缩 margin | burst 申请 |
+|------|---------------------|-------|---------------------|-----------|
+| **green** | < low_watermark | 接受 | ×1.25 | 限速批 |
+| **yellow** | [low, high) | 接受 | ×1.10 | 限速批 |
+| **red** | [high, pool − emergency_pool) | **拒绝**(`zone_critical`) | ×1.05 | 仅 urgency=high |
+| **critical** | ≥ pool − emergency_pool | 拒绝 | ×1.00 | 仅 urgency=high |
+
+settled 收缩由 Active Reclaimer 执行:每 10 s 扫一遍 settled reservation,把
+allocatable_now 收向 `max(floor, last_reported_rss × margin)`,margin 随水位区
+收紧;新值经 Heartbeat ack 的 `new_allocatable` 传到 sandbox-ctl 落地(§5.2)。
 
 注: zone red/critical 是系统保护性 reject——即使其他短期资源可缓解
 (token bucket / startup_pool),进入 red/critical 仍然立即拒绝,给系统
 recovery 留空间。
 
-CPU 维度水位**仅用于 admission**(`Σ allocatable.cpu_i ≤ allocatable_pool_cpu`),
-**不参与运行期 grant 排队与限速**——CPU 不动态分配。
+CPU 不参与水位决策:admission 与运行期仲裁均仅内存维度;控制器对 CPU 只做
+记账(reservation 按 floor.cpu 累计,`status` 可见)——CPU 不动态分配。
 
 ### 4.3 仲裁策略
 
-`RequestBudget` 队列(仅内存维度)按 `(urgency, fairness_score)` 二元组排序:
+`RequestBudget` 同步处理(仅内存维度),没有服务端 grant 队列——未获批的请求
+拿到 `cooldown_ms` 退避重试,期间沙箱在 cgroup memory.high PSI 反压下等待:
 
-- **urgency**:high(oom)> normal(throttled / high event)> low(预测)
-- **fairness_score**:本沙箱过去 60s 内 grant 总量,越多越靠后(防饥饿)
-
-仲裁限速:
-
-- 内存:每秒总扩展量 ≤ allocatable_pool × 5%
+- **urgency**:high(oom)绕过 token bucket 限速,且可动用 emergency_pool;
+  normal/low 在 red/critical 区直接得 0 + cooldown
+- **限速**:token bucket,每秒总扩展量 ≤ allocatable_pool ×
+  `memory_grant_per_sec_factor`;token 不足时按补给 ETA 回 cooldown_ms
+  (下限 50 ms)
+- **步长**:单次 grant clamp 到 [4 MiB, 512 MiB],且 ≤ capacity 余量与
+  zone headroom
 - CPU:无运行时仲裁
 
-限速是防惊群核心:即使 100 个沙箱同时 burst,grant 按队列序拉,被排队的沙箱
-继续在 cgroup memory.high PSI 反压下等额度,而不是同时全 grant 撞墙。
+限速是防惊群核心:即使 100 个沙箱同时 burst,每秒放出的总量有界,未获批的
+沙箱继续在 PSI 反压下退避重试,而不是同时全 grant 撞墙。
 
 ## 5. 沙箱资源控制协议
 
@@ -270,8 +277,8 @@ CPU 维度水位**仅用于 admission**(`Σ allocatable.cpu_i ≤ allocatable_po
 UDS,长度前缀(4 字节 LE uint32)+ JSON 消息——简单、调试友好、无外部依赖。
 
 每个 sandbox-ctl 启动时 `Admit` 后建立长连,直到沙箱退出。连接生命周期与
-沙箱生命周期对齐。**控制器实现是协议的对端,任何遵循本节定义的实现都可作为
-sandbox-ctl 的对端**;`node-ctl` 是参考实现。
+沙箱生命周期对齐。wire 格式与 `Client` 的唯一定义点是
+`sandbox-runtime/pkg/resource`,client/server 共用。
 
 ### 5.2 消息类型
 
@@ -280,15 +287,16 @@ sandbox-ctl 的对端**;`node-ctl` 是参考实现。
 ```
 Admit            (sandbox_id, capacity, floor, startup_budget_memory,
                   allocatable_at_snapshot?, cgroup_path)
-                 → AdmitResponse (status, reservation_token, granted_initial_alloc,
+                 → AdmitResponse (status, token, granted_initial_alloc,
                                   reason?, queued_for_ms, queue_pos_at_in)
-                   status ∈ {admitted, rejected}        (queued 已废弃,server hold conn)
+                   status ∈ {admitted, rejected}
+                   (queued 保留不用:短期阻塞时 server 持连不回应,§5.3)
                    granted_initial_alloc = max(startup_budget_memory, floor,
                                                allocatable_at_snapshot)
-                   reason:rejected 时分类(详 §6.4)
-                   queued_for_ms / queue_pos_at_in:informational metadata
+                   reason:rejected 时分类(§6.4)
+                   queued_for_ms / queue_pos_at_in:命中队列时回填的诊断元数据
                  # sandbox_id 用作 admin 动词(grant/reclaim)的索引键;
-                 # cgroup_path 存入 reservation,供重启重建期交叉对账
+                 # cgroup_path 存入 reservation 并随 state.json 持久化
 
 Settled          (token, current_rss, current_cpu_usec)        # 进入 settled 通知
                  → Ack
@@ -335,13 +343,14 @@ AdminReclaim     (sandbox_id, target_allocatable)               # 背后 node-ct
                  → Ack (new_allocatable)                        # shrink-only,clamp 到 floor
 ```
 
-通知(控制器推,sandbox-ctl 接):
+通知(控制器推,sandbox-ctl 接;wire 类型与 Client 回调已定义,node-ctl 当前
+不推送——主动收缩与 admin 改值统一经 Heartbeat ack 的 `new_allocatable` 传播):
 
 ```
-ReclaimRequest   (token, target_allocatable, deadline_ms)      # red 区强制收回
-                 sandbox-ctl 必须在 deadline 前到达 target
+ReclaimRequest   (token, target_allocatable, deadline_ms)      # 定向收回,deadline 前须到达 target
+                 → ReclaimDone (token)                          # sandbox-ctl 完成回执
 
-UpdateConfig     (token, new_watermark_ratio, ...)             # 运维动态调
+UpdateConfig     (token, ...)                                   # 运维动态调
 ```
 
 `token`:Admit 时由控制器生成的随机字符串,作为后续所有 RPC 的认证 + 索引。
@@ -738,4 +747,4 @@ cache-ctl / store-ctl 的资源占用是 host 预留的一部分,计入
 - [`cache.md`](cache.md) / [`store.md`](store.md) —— 资源预留计入 host_reserved
   的两个组件
 - [`perf.md`](perf.md) —— agent-intermittent 工作负载模型实测、密度调优
-- `PROPOSAL.md` §1 / §6.11 —— 高密度承载与超分场景的业务定位
+- `kuasar-sandbox/docs/kuasar-sandbox.md` §1.1 / §4.7 —— 高密度承载与超分场景的业务定位
