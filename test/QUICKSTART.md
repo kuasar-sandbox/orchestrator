@@ -9,7 +9,7 @@
 ```
 <release>/
 ├── bin/                       平台全部二进制(cloud-hypervisor / vmlinux /
-│                              mkfs.erofs / fsck.erofs / envd / manifest-ctl /
+│                              mkfs.erofs / fsck.erofs / tar / envd / manifest-ctl /
 │                              store-ctl / cache-ctl / flatten-ctl / sandbox-ctl /
 │                              sandbox-init / node-ctl / vswitch-ctl / tapfd-get /
 │                              orchestrator-ctl / e2b-key-ctl /
