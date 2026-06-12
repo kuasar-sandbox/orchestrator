@@ -159,7 +159,7 @@ run_until "$LOG1" SBPID1 "^TICK 10 $BLK0_OK\$"
 wait "$SBPID1" 2>/dev/null || true
 S1="$SNAPDIR/$SID1.snapshot"
 [ -e "$S1" ] || { echo "FAIL: no $S1"; cat "$WORK/snap1.log"; exit 1; }
-echo "    s1 from_refs: $("$BIN/sandbox-ctl" info "$S1" --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["FromRefs"] or [])')"
+echo "    s1 from_refs: $("$BIN/sandbox-ctl" info --json "$S1" | python3 -c 'import json,sys; print(json.load(sys.stdin)["FromRefs"] or [])')"
 
 # ---- phase 2: restore s1 (LOCAL) → snapshot --output (s2 = MERGE) --------
 echo "==> phase 2: restore s1 (local) → snapshot --output (s2, merge replaces s1)"
@@ -175,7 +175,7 @@ run_until "$LOG2" SBPID2 "^TICK $((S1_TICK+3)) $BLK0_OK\$"
 wait "$SBPID2" 2>/dev/null || true
 S2="$SNAPDIR/$SID2.snapshot"
 # THE KEY ASSERTION: s2 MERGED s1, so its from_refs is EMPTY (not [s1.snapshot]).
-S2_FROMREFS=$("$BIN/sandbox-ctl" info "$S2" --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["FromRefs"] or [])')
+S2_FROMREFS=$("$BIN/sandbox-ctl" info --json "$S2" | python3 -c 'import json,sys; print(json.load(sys.stdin)["FromRefs"] or [])')
 echo "    s2 from_refs: $S2_FROMREFS"
 [ "$S2_FROMREFS" = "[]" ] || { echo "FAIL: s2 from_refs=$S2_FROMREFS, want [] (merge should REPLACE s1, not stack it)"; exit 1; }
 
@@ -195,7 +195,7 @@ kill -TERM "$SBPID3" 2>/dev/null; wait "$SBPID3" 2>/dev/null || true   # infinit
 
 # ---- phase 4: upload-snapshot s2 (offline) → restore manifest:// ----------
 echo "==> phase 4: upload-snapshot s2 (offline, no boot) → restore from manifest://"
-MKEY=$("$BIN/sandbox-ctl" upload-snapshot "$S2" --manifest-config "$WORK/accelerator.yaml" --quiet)
+MKEY=$("$BIN/sandbox-ctl" upload-snapshot --manifest-config "$WORK/accelerator.yaml" --quiet "$S2")
 MKEY=${MKEY#manifest://}
 [ ${#MKEY} -eq 64 ] || { echo "FAIL: upload-snapshot key len=${#MKEY}, want 64"; exit 1; }
 echo "    uploaded s2 → manifest://$MKEY"
