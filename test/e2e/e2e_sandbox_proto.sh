@@ -69,7 +69,7 @@ if [ -z "$BLK0_IMAGE" ]; then
         echo "==> docker pull $IMAGE"
         docker pull "$IMAGE" >/dev/null
     fi
-    BLK0_IMAGE="$WORK/blk0.erofs"
+    BLK0_IMAGE="$WORK/blk0.img"
     echo "==> docker save $IMAGE | flatten-ctl export --output $BLK0_IMAGE"
     docker save "$IMAGE" | "$BIN/flatten-ctl" export --output "$BLK0_IMAGE" --no-progress
 fi

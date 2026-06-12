@@ -69,13 +69,15 @@ BLK0_IMAGE="${BLK0_IMAGE:-}"
 if [ -z "$BLK0_IMAGE" ]; then
     command -v docker >/dev/null 2>&1 || skip "docker not available; set BLK0_IMAGE="
     docker image inspect "$IMAGE" >/dev/null 2>&1 || docker pull "$IMAGE" >/dev/null
-    BLK0_IMAGE="$WORK/root.erofs"
+    BLK0_IMAGE="$WORK/root.img"
     docker save "$IMAGE" | "$BIN/flatten-ctl" export --output "$BLK0_IMAGE" --no-progress
 fi
 truncate -s 512M "$WORK/root-up.ext4"; mkfs.ext4 -q -F "$WORK/root-up.ext4"
 truncate -s 256M "$WORK/scratch.ext4"; mkfs.ext4 -q -F "$WORK/scratch.ext4"
 mkdir -p "$WORK/ds"; echo "DATASET-OK" > "$WORK/ds/DATASET-OK"
-"$BIN/mkfs.erofs" -T0 "$WORK/dataset.erofs" "$WORK/ds" >/dev/null 2>&1
+# disk artifacts are tarstream envelopes: build via flatten-ctl (dir source)
+MKFS_EROFS_PATH="$BIN/mkfs.erofs" "$BIN/flatten-ctl" export --no-progress \
+    --tmpdir "$WORK/tmp" --output "$WORK/dataset.img" "$WORK/ds"
 truncate -s 256M "$WORK/dataset-up.ext4"; mkfs.ext4 -q -F "$WORK/dataset-up.ext4"
 
 cat > "$WORK/cold.yaml" <<EOF
@@ -90,7 +92,7 @@ boot:
     overlay: { diff: file://$WORK/root-up.ext4, size: 512MiB }
   disks:
     - { name: scratch, diff_template: file://$WORK/scratch.ext4, diff_size: 256MiB }
-    - { name: dataset, base: file://$WORK/dataset.erofs, overlay: { diff_template: file://$WORK/dataset-up.ext4, diff_size: 256MiB } }
+    - { name: dataset, base: file://$WORK/dataset.img, overlay: { diff_template: file://$WORK/dataset-up.ext4, diff_size: 256MiB } }
 mounts:
   - { target: /scratch, type: disk, source: scratch }
   - { target: /data,    type: disk, source: dataset }
@@ -146,7 +148,7 @@ boot:
     overlay: { diff: file://$WORK/root-r.ext4, size: 512MiB }
   disks:
     - { name: scratch }
-    - { name: dataset, base: file://$WORK/dataset.erofs, overlay: { diff: file://$WORK/dataset-r.ext4, size: 256MiB } }
+    - { name: dataset, base: file://$WORK/dataset.img, overlay: { diff: file://$WORK/dataset-r.ext4, size: 256MiB } }
 EOF
 SID2=dk-2
 timeout 120 "$BIN/sandbox-ctl" run --restore "$SNAP" --config "$WORK/restore.yaml" --sandbox-id "$SID2" \

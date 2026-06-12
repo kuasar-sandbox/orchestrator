@@ -100,7 +100,7 @@ EOF
 
 # ---- guest base + TICK workload (writes /ticks.dat blk0 cold marker) ------
 if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then docker pull "$IMAGE" >/dev/null; fi
-BLK0_EROFS="$WORK/blk0.erofs"
+BLK0_EROFS="$WORK/blk0.img"
 docker save "$IMAGE" | "$BIN/flatten-ctl" export --output "$BLK0_EROFS" --no-progress
 mkdir -p "$WORK/runtime"; DIFF_FILE="$WORK/runtime/blk1.diff"
 truncate -s 1G "$DIFF_FILE"; mkfs.ext4 -q -F "$DIFF_FILE"
@@ -116,7 +116,13 @@ while True:
     print("TICK %d DISK blk0=%s" % (i, blk0), flush=True)
     i+=1
     time.sleep(0.25)'
-write_yaml() { # $1=out $2=hostname [$3=diff override]
+write_yaml() { # $1=out $2=hostname [$3=diff override] [$4=base override; "none" omits]
+    local base_line="    base: file://$BLK0_EROFS"
+    case "${4:-}" in
+    none) base_line="" ;;       # manifest:// snapshots carry their own base ref
+    "") ;;
+    *) base_line="    base: $4" ;;
+    esac
     cat > "$1" <<EOF
 resources:
   capacity:    { cpu: 1, memory: 512MiB }
@@ -127,7 +133,7 @@ boot:
   runtime: file://$BIN/sandbox-runtime.erofs
   cmdline: "console=hvc0 printk.time=1"
   root:
-    base: file://$BLK0_EROFS
+$base_line
     overlay: { diff: file://${3:-$DIFF_FILE}, size: 1GiB }
 launch:
   args: ["-c", $(python3 -c "import json,sys; print(json.dumps(sys.stdin.read()))" <<<"$PYTICK")]
@@ -195,11 +201,14 @@ kill -TERM "$SBPID3" 2>/dev/null; wait "$SBPID3" 2>/dev/null || true   # infinit
 
 # ---- phase 4: upload-snapshot s2 (offline) → restore manifest:// ----------
 echo "==> phase 4: upload-snapshot s2 (offline, no boot) → restore from manifest://"
+# upload-snapshot auto-uploads every local artifact the cfg references;
+# file:// refs resolve as bundle-dir siblings, so co-locate the base image.
+ln -f "$BLK0_EROFS" "$SNAPDIR/$(basename "$BLK0_EROFS")"
 MKEY=$("$BIN/sandbox-ctl" upload-snapshot --manifest-config "$WORK/accelerator.yaml" --quiet "$S2")
 MKEY=${MKEY#manifest://}
 [ ${#MKEY} -eq 64 ] || { echo "FAIL: upload-snapshot key len=${#MKEY}, want 64"; exit 1; }
 echo "    uploaded s2 → manifest://$MKEY"
-write_yaml "$WORK/host4.yaml" e2e-merge4 "$WORK/runtime/blk1-r4.diff"
+write_yaml "$WORK/host4.yaml" e2e-merge4 "$WORK/runtime/blk1-r4.diff" none
 truncate -s 1G "$WORK/runtime/blk1-r4.diff"
 LOG4="$WORK/run4.log"; SID4="m4-$$"; mkdir -p "$WORK/runtime/$SID4"
 "$BIN/sandbox-ctl" run --restore "manifest://$MKEY" --config "$WORK/host4.yaml" --manifest-config "$WORK/accelerator.yaml" \

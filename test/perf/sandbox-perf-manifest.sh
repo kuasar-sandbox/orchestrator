@@ -267,7 +267,7 @@ if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
     echo "==> docker pull $IMAGE" >&2
     docker pull "$IMAGE" >/dev/null
 fi
-BLK0_EROFS="$WORK/blk0.erofs"
+BLK0_EROFS="$WORK/blk0.img"
 echo "==> docker save | flatten-ctl export > $BLK0_EROFS" >&2
 docker save "$IMAGE" | "$BIN/flatten-ctl" export --output "$BLK0_EROFS" --no-progress
 [ -s "$BLK0_EROFS" ] || { echo "FATAL: blk0 erofs empty (docker save | flatten-ctl failed)" >&2; exit 1; }

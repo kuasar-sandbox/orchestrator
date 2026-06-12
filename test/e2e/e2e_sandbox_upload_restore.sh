@@ -150,7 +150,7 @@ EOF
 if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
     docker pull "$IMAGE" >/dev/null
 fi
-BLK0_EROFS="$WORK/blk0.erofs"
+BLK0_EROFS="$WORK/blk0.img"
 docker save "$IMAGE" | "$BIN/flatten-ctl" export --output "$BLK0_EROFS" --no-progress
 
 mkdir -p "$WORK/runtime"

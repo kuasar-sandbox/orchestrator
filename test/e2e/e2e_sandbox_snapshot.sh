@@ -64,7 +64,7 @@ if [ -z "$BLK0_IMAGE" ]; then
         echo "==> docker pull $IMAGE"
         docker pull "$IMAGE" >/dev/null
     fi
-    BLK0_IMAGE="$WORK/blk0.erofs"
+    BLK0_IMAGE="$WORK/blk0.img"
     docker save "$IMAGE" | "$BIN/flatten-ctl" export --output "$BLK0_IMAGE" --no-progress
 fi
 
@@ -143,55 +143,53 @@ SNAP_FILE="$OUT/$SID.snapshot"
 OVERLAY_FILE=$(ls "$OUT"/*.overlay 2>/dev/null | head -1)
 [ -n "$OVERLAY_FILE" ] && [ -f "$OVERLAY_FILE" ] || { echo "FAIL: no <sha256>.overlay"; ls -la "$OUT"; exit 1; }
 
-# Sizes. <sid>.snapshot is a symlink to the content-addressed
-# <sha256>.snapshot bundle, so stat must dereference (-L) to size the
-# bundle itself rather than the 73-byte symlink.
-SNAP_LOGICAL=$(stat -L -c%s "$SNAP_FILE")
-SNAP_PHYS=$(($(stat -L -c%b "$SNAP_FILE") * 512))
-DISK_LOGICAL=$(stat -c%s "$OVERLAY_FILE")
-DISK_PHYS=$(($(stat -c%b "$OVERLAY_FILE") * 512))
-
-echo "    $SID.snapshot:   logical=$(numfmt --to=iec $SNAP_LOGICAL) physical=$(numfmt --to=iec $SNAP_PHYS)"
-echo "    $(basename $OVERLAY_FILE): logical=$(numfmt --to=iec $DISK_LOGICAL) physical=$(numfmt --to=iec $DISK_PHYS)"
-
-# <sid>.snapshot logical = ramSize (512 MiB) + ZIP (~tens of KB)
-# physical should be much smaller (only resident pages + ZIP)
-if [ "$SNAP_PHYS" -ge "$SNAP_LOGICAL" ]; then
-    echo "==> WARN: snapshot not sparse (phys >= logical) — fs may not preserve sparseness"
+# Sizes. Artifacts are tarstream envelopes: the FILE is dense (size ≈
+# resident data + envelope), holes ride the envelope map. Sparseness
+# shows as file size ≪ the logical entry size (ramSize = 512 MiB).
+# <sid>.snapshot is a symlink — stat dereferences (-L).
+SNAP_BYTES=$(stat -L -c%s "$SNAP_FILE")
+DISK_BYTES=$(stat -c%s "$OVERLAY_FILE")
+echo "    $SID.snapshot:   artifact=$(numfmt --to=iec $SNAP_BYTES)"
+echo "    $(basename $OVERLAY_FILE): artifact=$(numfmt --to=iec $DISK_BYTES)"
+RAM_BYTES=$((512 * 1024 * 1024))
+if [ "$SNAP_BYTES" -ge "$RAM_BYTES" ]; then
+    echo "==> FAIL: snapshot artifact ($SNAP_BYTES) not smaller than ramSize ($RAM_BYTES) — holes not carried by the envelope?"
+    exit 1
 fi
-if [ "$SNAP_PHYS" -lt $((1 << 20)) ]; then
+if [ "$SNAP_BYTES" -lt $((1 << 20)) ]; then
     echo "==> FAIL: snapshot has < 1 MiB content (snapshot probably empty)"; exit 1
 fi
+echo "==> PASS: snapshot artifact carries only resident data ($(numfmt --to=iec $SNAP_BYTES) of $(numfmt --to=iec $RAM_BYTES) logical)"
 
-# Validate ZIP at end (memory section + ZIP). unzip warns about the
-# memory prefix and returns non-zero, but stdout is correct — capture
-# once and grep without piping unzip's exit code into the conditional.
-ZIP_LIST=$(unzip -l "$SNAP_FILE" 2>&1 || true)
-for need in "config.json" "state.json" "snapshot.cfg"; do
-    if ! grep -qF "$need" <<<"$ZIP_LIST"; then
-        echo "==> FAIL: trailing ZIP missing $need"
-        echo "$ZIP_LIST" | head -20
+# The artifact is a tar envelope; info reads snapshot.cfg through it
+# (the same path restore uses).
+INFO_JSON=$("$BIN/sandbox-ctl" info --json "$SNAP_FILE")
+grep -qF '"BaseRef"' <<<"$INFO_JSON" || { echo "==> FAIL: info --json missing BaseRef"; echo "$INFO_JSON" | head -10; exit 1; }
+echo "==> PASS: snapshot.cfg readable through the artifact (info --json)"
+
+# Content addressing: the basename IS the sha256 of the artifact bytes.
+for f in "$OVERLAY_FILE" "$(readlink -f "$SNAP_FILE")"; do
+    base=$(basename "$f"); base=${base%.*}
+    sum=$(sha256sum "$f" | cut -d' ' -f1)
+    if [ "$base" != "$sum" ]; then
+        echo "==> FAIL: $(basename $f) basename != sha256 of artifact bytes ($sum)"
         exit 1
     fi
 done
-echo "==> PASS: trailing ZIP contains config.json, state.json, snapshot.cfg"
+echo "==> PASS: artifacts are content-addressed by their own bytes"
 
-# The overlay is content-addressed by the snapshot's skip-holes digest
-# (sparse holes excluded), not a plain file sha256 — so verify the basename
-# is a 64-hex content hash rather than recomputing the digest here (exact
-# digest behaviour is covered in the snapshot package's Go tests).
-OVERLAY_BASENAME=$(basename "$OVERLAY_FILE" .overlay)
-if ! printf '%s' "$OVERLAY_BASENAME" | grep -qE '^[0-9a-f]{64}$'; then
-    echo "==> FAIL: overlay basename '$OVERLAY_BASENAME' is not a 64-hex content hash"
-    exit 1
-fi
-echo "==> PASS: overlay is content-addressed (64-hex basename)"
-
-# Validate overlay is recognizable as ext4
-if command -v file >/dev/null && file "$OVERLAY_FILE" 2>&1 | grep -qiE "ext4|ext.* filesystem"; then
-    echo "==> PASS: overlay is ext4 filesystem"
+# The envelope is a valid tar; the overlay entry holds an ext4 image.
+if command -v file >/dev/null && file -L "$SNAP_FILE" 2>&1 | grep -qiE "tar archive"; then
+    echo "==> PASS: snapshot artifact is a tar envelope"
 else
-    echo "==> WARN: overlay not recognized as ext4 by file(1)"
+    echo "==> WARN: file(1) did not recognize the artifact as tar"
+fi
+UNPACK="$WORK/unpack"; mkdir -p "$UNPACK"
+( cd "$UNPACK" && "$BIN/flatten-ctl" tar extract -f "$OVERLAY_FILE" )
+if command -v file >/dev/null && file "$UNPACK/overlay" 2>&1 | grep -qiE "ext4|ext.* filesystem"; then
+    echo "==> PASS: overlay entry is an ext4 filesystem"
+else
+    echo "==> WARN: unpacked overlay not recognized as ext4 by file(1)"
 fi
 
 echo "==> e2e_sandbox_snapshot: OK"

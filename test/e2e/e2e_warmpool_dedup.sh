@@ -166,8 +166,8 @@ if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
     echo "==> docker pull $IMAGE"
     docker pull "$IMAGE" >/dev/null
 fi
-BLK0_EROFS="$WORK/blk0.erofs"
-echo "==> docker save $IMAGE | flatten-ctl export --output blk0.erofs"
+BLK0_EROFS="$WORK/blk0.img"
+echo "==> docker save $IMAGE | flatten-ctl export --output blk0.img"
 docker save "$IMAGE" | "$BIN/flatten-ctl" export --output "$BLK0_EROFS" --no-progress
 
 # Single ingest of blk0 → manifest. Each sandbox references this same

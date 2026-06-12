@@ -74,6 +74,7 @@ build:
 	$(MAKE) -C $(ORG)/sandbox-orchestrator build
 	@$(MAKE) collect
 	$(MAKE) -C $(ORG)/sandbox-orchestrator sandbox-runtime-e2b
+	$(MAKE) -C $(ORG)/sandbox-orchestrator sandbox-runtime-builder
 	@$(MAKE) collect
 
 # Assemble bin/$(TARGET_ARCH)/ from each sub-repo's per-arch bin per the

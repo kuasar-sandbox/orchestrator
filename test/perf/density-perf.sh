@@ -246,7 +246,7 @@ case "$MODE" in
 esac
 
 # ---- prepare blk0 ----
-BLK0="$WORK/blk0.erofs"
+BLK0="$WORK/blk0.img"
 if ! [ -f "$BLK0" ]; then
     if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
         docker pull "$IMAGE"

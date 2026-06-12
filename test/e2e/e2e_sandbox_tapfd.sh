@@ -55,7 +55,7 @@ WORK="$(mktemp -d /tmp/e2e-tapfd-XXXXXX)"
 trap '[ -n "${E2E_KEEP:-}" ] && echo "kept: $WORK" || rm -rf "$WORK"; true' EXIT
 
 if [ -z "$BLK0_IMAGE" ]; then
-    BLK0_IMAGE="$WORK/blk0.erofs"
+    BLK0_IMAGE="$WORK/blk0.img"
     docker save python:3.12-slim | "$BIN/flatten-ctl" export --output "$BLK0_IMAGE" --no-progress
 fi
 echo "==> blk0: $BLK0_IMAGE"

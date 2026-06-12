@@ -121,7 +121,7 @@ echo "==> preparing blk0 from $IMAGE"
 if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
     docker pull "$IMAGE"
 fi
-BLK0="$WORK/blk0.erofs"
+BLK0="$WORK/blk0.img"
 docker save "$IMAGE" | "$BIN/flatten-ctl" export --output "$BLK0" --no-progress
 
 # ---------- cgroup parent ----------

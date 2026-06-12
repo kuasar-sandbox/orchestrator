@@ -50,7 +50,7 @@ BLK0_IMAGE="${BLK0_IMAGE:-}"
 if [ -z "$BLK0_IMAGE" ]; then
     command -v docker >/dev/null 2>&1 || skip "docker missing"
     docker image inspect "$IMAGE" >/dev/null 2>&1 || docker pull "$IMAGE" >/dev/null
-    BLK0_IMAGE="$WORK/blk0.erofs"
+    BLK0_IMAGE="$WORK/blk0.img"
     docker save "$IMAGE" | "$BIN/flatten-ctl" export --output "$BLK0_IMAGE" --no-progress
 fi
 
