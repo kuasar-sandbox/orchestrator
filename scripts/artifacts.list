@@ -1,6 +1,5 @@
 sandbox-deps        mkfs.erofs
 sandbox-deps        fsck.erofs
-sandbox-deps        tar
 sandbox-deps        vmlinux
 sandbox-deps        cloud-hypervisor
 sandbox-deps        envd
