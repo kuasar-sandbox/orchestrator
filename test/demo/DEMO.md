@@ -1,10 +1,11 @@
 # e2b 兼容沙箱主机 — 端到端演示
 
 `demo_e2b.sh` 用**未改造的 e2b Python SDK**(`pip install e2b e2b-code-interpreter`)把
-`sandbox-orchestrator` 的全链路跑一遍:`Template().from_image()` 构建模板(**节点服务端拉取 + 展平,
-客户端不再 docker build/push**)→ 启动真实 microVM → guest 内执行命令 → **端口转发 + 出网** →
-暂停/恢复 → **暂停态转模板扇出** → **一步迁移**(import+resume)→ 销毁。SDK 零修改,仅靠环境变量 +
-本机 `/etc/hosts` + 自签 TLS(`SSL_CERT_FILE`)指向本节点(与指向 e2b.dev 的方式一致)。
+`sandbox-orchestrator` 的全链路跑一遍:`Template().from_image()` 构建模板(**拉取 + 展平在构建沙箱
+microVM 内进行,客户端不再 docker build/push**)→ 启动真实 microVM → guest 内执行命令 →
+**端口转发 + 出网** → 暂停/恢复 → **暂停态转模板扇出** → **一步迁移**(import+resume)→ 销毁。
+SDK 零修改,仅靠环境变量 + 本机 `/etc/hosts` + 自签 TLS(`SSL_CERT_FILE`)指向本节点
+(与指向 e2b.dev 的方式一致)。
 
 **存储层是持久化前置**:内容存储(store-ctl)、本地 L1 缓存(cache-ctl,tiered rocksdb)、镜像仓库
 三者由 `demo_prep.sh` **起一次、常驻复用**(store/cache 监听 **UNIX socket**、不占端口;数据落
@@ -16,7 +17,7 @@
 |---|---|---|
 | 1 | (编排起栈) | orchestrator(TLS) + eBPF vswitch + host NAT;store/cache 经 UDS 复用 |
 | 2 | `e2b-key-ctl` + `manifest-key add` | 密钥模型:manifest_key 根密钥 → 派生 api_key → 白名单 + 租户镜像拉取凭据 |
-| 3 | `Template().from_image(ref).build()` | **节点**拉取该镜像(租户凭据)+ 展平为 microVM 模板;**无客户端 docker** |
+| 3 | `Template().from_image(ref).build()` | **构建沙箱**(microVM)内拉取该镜像(租户凭据、租户网络)+ 展平为模板;**无客户端 docker** |
 | 4 | `Sandbox.create(template)` | 从模板冷启真实 cloud-hypervisor microVM,guest 内 envd 就绪 |
 | 5 | `sbx.commands.run(…)` | guest 内执行命令(默认用户 `user`,可写 `/home/user`)经 proxy→envd |
 | 6 | `curl http://<floatingip>:port` / `https://<port>-<sid>.<domain>` | **端口转发** + **沙箱出网**(NAT) |
@@ -28,7 +29,8 @@
 ## 前置条件
 
 - 二进制(`make -C kuasar-sandbox build`):`orchestrator-ctl`、`store-ctl`、**`cache-ctl`**(CGO/rocksdb)、
-  `flatten-ctl`、`e2b-key-ctl`、`vswitch-ctl`、`cloud-hypervisor`、`vmlinux`、`sandbox-runtime-e2b.erofs`。
+  `flatten-ctl`、`e2b-key-ctl`、`vswitch-ctl`、`cloud-hypervisor`、`vmlinux`、`sandbox-runtime-e2b.erofs`、
+  `sandbox-runtime-builder.erofs`(`make sandbox-runtime-builder`;构建沙箱的 guest 运行时)。
 - 主机:**systemd 为 PID1 + root**(编排经 D-Bus 驱动单元;TLS :443;KVM);可读写 `/dev/kvm`。
 - **e2b Python SDK**:`pip install e2b e2b-code-interpreter`。
 - 工具:`python3`、`openssl`、`iproute2(ip)`、`curl`、`sqlite3`、`iptables`;`demo_prep.sh` 另需 `docker`(一次性把
@@ -93,8 +95,10 @@ e2b profile 的 guest 网卡是一个 link-local **inner IP** `169.254.0.21/30`�
 
 e2b SDK 用 `E2B_DOMAIN` 推出控制面 `https://api.<domain>` 与数据面 `https://<port>-<sid>.<domain>`:
 
-- `E2B_DOMAIN`/`E2B_API_KEY` 指向本节点;**构建直接 `from_image(<registry>/<image>)`**——节点服务端拉取并展平
+- `E2B_DOMAIN`/`E2B_API_KEY` 指向本节点;**构建直接 `from_image(<registry>/<image>)`**——构建沙箱内拉取并展平
   (凭据来自租户默认或任务级 token,见 orchestrator.md §11),**不再有客户端 docker build/push 或 `E2B_IMAGE_URI_MASK`**。
+  镜像 ref 须**从构建沙箱可达**:本地 zot 经 vswitch mgmt VIP(`169.254.169.254:<port>`)寻址(脚本自动改写),
+  第三方仓库经 NAT 出网直达。
 - 自签 `*.<domain>` 证书 + **`SSL_CERT_FILE=<cert>`**(httpx 信任)让 SDK 接受 TLS。
 - `/etc/hosts` 把 `api.<domain>` 与每个沙箱的 `49983/49999/<port>-<sid>.<domain>` 解析到 `127.0.0.1`(创建后加、退出删)。
 
@@ -102,12 +106,12 @@ e2b SDK 用 `E2B_DOMAIN` 推出控制面 `https://api.<domain>` 与数据面 `ht
 
 - **base 镜像须满足 e2b userland 约定**:有 `user` 账户、`/bin/bash`、`util-linux`/`coreutils`(envd 以默认用户、
   包一层 `ionice … nice …` 执行命令)。`e2bdev/code-interpreter` 本就具备;它由 `demo_prep.sh` seed 进仓库一次,
-  模板 `from_image` 直接命名它、节点拉取,无任何 shim/改写。
+  模板 `from_image` 直接命名它、构建沙箱内拉取,无任何 shim/改写。
 - **envd 以 root 运行**:envd 是 e2b 基础设施,须 root 才能 setuid 到镜像默认用户执行负载命令(e2b profile 固定
   `launch.user=0:0`,不沿用镜像 `Config.User`)。
 - **持久存储复用**:`demo_prep.sh` 的 store/cache/仓库常驻、数据落 `DEMO_DATA_DIR`(默认 `~/.cache/kuasar-demo`),
   跨多次演示去重缓存 → 复跑快;`demo_prep.sh reset` 清空重来。
 - **自签 TLS** 仅为本机演示;生产用通配 `*.<domain>` 正式证书(见 `sandbox-orchestrator/docs/orchestrator.md` §12)。
 
-自动化回归(断言版、非讲解版)见 `kuasar-sandbox/test/e2e/`:`e2e_build_real.sh`(经 v3 API 真实展平构建)与
-`e2e_execute.sh`(启动+执行+暂停/恢复状态存活)。
+自动化回归(断言版、非讲解版)见 `kuasar-sandbox/test/e2e/`:`e2e_run_builder.sh`(三阶段构建流水线:
+guest 内拉取展平 → steps → 模板快照 → 从产物模板 create)与 `e2e_execute.sh`(启动+执行+暂停/恢复状态存活)。

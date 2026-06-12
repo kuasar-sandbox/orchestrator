@@ -112,14 +112,16 @@ for f in test/e2e/*.sh; do bash "$f" || break; done
 |---|---|
 | `e2e_orchestrator.sh` | orchestrator-ctl 单元自动安装 + e2b 控制面(`/health`、`X-API-KEY` 401)+ 构建 API |
 | `e2e_runtask.sh` | run-sandbox/run-builder 启动器 + `config`/`info` CLI(纯用户态,无 root/systemd/KVM)|
-| `e2e_build_real.sh` | 经原生 v3 API 真实展平构建(store+zot)→ ready 模板;SDK `from_image` 同款路径(无需 KVM)|
+| `e2e_run_builder.sh` | 三阶段构建流水线(KVM):guest 内拉取展平 → steps → 模板快照;fromImage/fromTemplate 三链 + 从产物模板 create |
 | `e2e_execute.sh` | 启真实 microVM(KVM)→ envd 内执行 → 暂停/恢复状态存活 → kill |
 | `e2e_orchestrator_proxy.sh` | external proxy(SO_REUSEPORT + routesync)+ 数据面 X-Access-Token + auto-resume |
 
 > **前置(比其他 e2e 重)**:这组脚本另需 systemd 为 PID1 + root、`zot`、
-> `docker`;`e2e_execute`/`e2e_orchestrator_proxy` 还需 `/dev/kvm` 与
-> `mkfs.ext4`;demo 另需 e2b Python SDK(`pip install e2b e2b-code-interpreter`)、
-> `openssl`、`sqlite3`、`iptables`。脚本会自检,缺失即 skip。
+> `docker`;`e2e_run_builder`/`e2e_execute`/`e2e_orchestrator_proxy` 还需
+> `/dev/kvm` 与 `mkfs.ext4`(run_builder 另需 `bin/sandbox-runtime-builder.erofs`,
+> `make sandbox-runtime-builder` 产出);demo 另需 e2b Python SDK
+> (`pip install e2b e2b-code-interpreter`)、`openssl`、`sqlite3`、`iptables`。
+> 脚本会自检,缺失即 skip。
 
 ## 5. perf / 分析脚本清单
 

@@ -38,6 +38,7 @@ fail() { echo "==> FAIL: $*" >&2; exit 1; }
 for b in orchestrator-ctl sandbox-ctl flatten-ctl store-ctl e2b-key-ctl vswitch-ctl cloud-hypervisor; do [ -x "$BIN/$b" ] || skip "missing $BIN/$b"; done
 [ -f "$BIN/vmlinux" ] || skip "missing $BIN/vmlinux"
 [ -f "$BIN/sandbox-runtime-e2b.erofs" ] || skip "missing $BIN/sandbox-runtime-e2b.erofs"
+[ -f "$BIN/sandbox-runtime-builder.erofs" ] || skip "missing $BIN/sandbox-runtime-builder.erofs (make sandbox-runtime-builder)"
 command -v curl >/dev/null 2>&1 || skip "curl not on PATH"
 command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1 || skip "docker not usable"
 [ -n "$ZOT_BIN" ] && [ -x "$ZOT_BIN" ] || skip "zot not on PATH"
@@ -106,10 +107,12 @@ EOF
 "$BIN/store-ctl" serve --config "$WORK/store.yaml" >"$WORK/store-serve.log" 2>&1 &
 PIDS+=($!); wait_port 127.0.0.1 "$STORE_PORT" store-ctl
 
+# 0.0.0.0: the host pushes via 127.0.0.1; the BUILD SANDBOX pulls via the
+# vswitch mgmt VIP (guest loopback is not the host's).
 ZOT_PORT="$(free_port)"
 cat > "$WORK/zot.json" <<EOF
 { "storage": { "rootDirectory": "$WORK/zot/data", "dedupe": false, "gc": false },
-  "http": { "address": "127.0.0.1", "port": "$ZOT_PORT", "compat": ["docker2s2"] },
+  "http": { "address": "0.0.0.0", "port": "$ZOT_PORT", "compat": ["docker2s2"] },
   "log": { "level": "warn", "output": "$WORK/zot.log" } }
 EOF
 "$ZOT_BIN" serve "$WORK/zot.json" >"$WORK/zot.stdout" 2>&1 &
@@ -142,6 +145,20 @@ TAGS+=("$REF")
 docker push "$REF" >"$WORK/push.log" 2>&1 || { cat "$WORK/push.log"; fail "docker push"; }
 echo "==> store-ctl + zot up; built+seeded $REF"
 
+# ---- vswitch up ------------------------------------------------------------
+# BEFORE the build: the image pull runs INSIDE a build sandbox, so the build
+# needs a network slot and reaches zot via the mgmt VIP.
+MGMT_VIP="169.254.169.254"
+"$BIN/vswitch-ctl" stop "$SWITCH" --force >/dev/null 2>&1 || true
+ip netns del "$SW_NETNS" 2>/dev/null || true; ip netns del "$SWITCH" 2>/dev/null || true
+ip netns add "$SW_NETNS" 2>/dev/null || true
+"$BIN/vswitch-ctl" start "$SWITCH" --netns="$SW_NETNS" --ports=64 --mac-addr=02:00:00:00:00:01 \
+    --floating-ip-base=100.100.96.0 --mode=tap \
+    --mgmt-extract=:${SWITCH}m0:$MGMT_VIP,0.0.0.0/0 >"$WORK/vswitch-start.log" 2>&1 || { sed 's/^/  /' "$WORK/vswitch-start.log"; fail "vswitch start"; }
+SW_STARTED=1
+GUEST_REF="$MGMT_VIP:$ZOT_PORT/e2e/app:v1"
+echo "==> vswitch up (build sandboxes pull $GUEST_REF)"
+
 cat > "$WORK/manifest.yaml" <<EOF
 manifest: { key: "" }
 store: { endpoint: 127.0.0.1:$STORE_PORT, pool: 4, timeout: 30s }
@@ -158,6 +175,9 @@ MKFS_EXT4="$(command -v mkfs.ext4 || echo /sbin/mkfs.ext4)"
 OVL="$WORK/overlay-1G.ext4"
 truncate -s 1G "$OVL"
 "$MKFS_EXT4" -F -q -b 4096 "$OVL" >"$WORK/mkfs.log" 2>&1 || { cat "$WORK/mkfs.log"; fail "mkfs.ext4 overlay template"; }
+BLD="$WORK/builder-2G.ext4"   # build sandbox writable disk (pull cache + export scratch)
+truncate -s 2G "$BLD"
+"$MKFS_EXT4" -F -q -b 4096 "$BLD" >"$WORK/mkfs-bld.log" 2>&1 || { cat "$WORK/mkfs-bld.log"; fail "mkfs.ext4 builder template"; }
 
 # ---- orchestrator config: proxy_mode=external -----------------------------
 cat > "$WORK/config.yaml" <<EOF
@@ -171,7 +191,12 @@ sandbox:
   timeout_sec: 120
   network: { switch: $SWITCH }
   boot: { kernel: $BIN/vmlinux, runtime_e2b: $BIN/sandbox-runtime-e2b.erofs, runtime_base: $BIN/sandbox-runtime.erofs, overlay_diff_template: $OVL }
-builder: { insecure_registry: true }
+builder:
+  insecure_registry: true
+  runtime_builder: $BIN/sandbox-runtime-builder.erofs
+  diff_template: $BLD
+  vcpu: 1
+  memory: 1GiB
 checkpoint: { mode: remote }
 EOF
 
@@ -198,7 +223,7 @@ code=$(req POST /v3/templates "$AK" '{"name":"proxy-tmpl"}')
 [ "$code" = "202" ] || { cat "$WORK/resp.body"; fail "register=$code"; }
 TID=$(grep -o '"templateID":"[^"]*"' "$WORK/resp.body" | head -1 | cut -d'"' -f4)
 BID=$(grep -o '"buildID":"[^"]*"' "$WORK/resp.body" | head -1 | cut -d'"' -f4)
-code=$(req POST "/v2/templates/$TID/builds/$BID" "$AK" "{\"fromImage\":\"$REF\"}")
+code=$(req POST "/v2/templates/$TID/builds/$BID" "$AK" "{\"fromImage\":\"$GUEST_REF\"}")
 [ "$code" = "202" ] || { cat "$WORK/resp.body"; fail "trigger=$code"; }
 TEMPLATE=""
 for _ in $(seq 1 120); do
@@ -211,15 +236,6 @@ for _ in $(seq 1 120); do
 done
 [ -n "$TEMPLATE" ] || fail "build did not become ready"
 echo "==> built template: $TEMPLATE"
-
-# ---- vswitch up -----------------------------------------------------------
-"$BIN/vswitch-ctl" stop "$SWITCH" --force >/dev/null 2>&1 || true
-ip netns del "$SW_NETNS" 2>/dev/null || true; ip netns del "$SWITCH" 2>/dev/null || true
-ip netns add "$SW_NETNS" 2>/dev/null || true
-"$BIN/vswitch-ctl" start "$SWITCH" --netns="$SW_NETNS" --ports=64 --mac-addr=02:00:00:00:00:01 \
-    --floating-ip-base=100.100.96.0 --mode=tap >"$WORK/vswitch-start.log" 2>&1 || { sed 's/^/  /' "$WORK/vswitch-start.log"; fail "vswitch start"; }
-SW_STARTED=1
-echo "==> vswitch up"
 
 # ---- create the sandbox (boots the microVM; serve pushes the route) -------
 echo "==> POST /sandboxes (boot microVM from $TEMPLATE)"

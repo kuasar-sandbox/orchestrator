@@ -48,7 +48,7 @@ UMBRELLA_E2E := \
   test-e2e-sandbox-restore test-e2e-sandbox-restore-files test-e2e-sandbox-snapshot \
   test-e2e-sandbox-stdio test-e2e-sandbox-tapfd test-e2e-sandbox-upload-restore \
   test-e2e-orchestrator test-e2e-runtask \
-  test-e2e-build-real test-e2e-execute test-e2e-orchestrator-proxy
+  test-e2e-run-builder test-e2e-execute test-e2e-orchestrator-proxy
 
 PERF_TARGETS := perf-sandbox perf-sandbox-manifest perf-density
 
@@ -165,7 +165,7 @@ help:
 	@echo "  collect       re-assemble bin/\$$(TARGET_ARCH)/ from existing sub-repo outputs"
 	@echo "  release       build + package dist/kuasar-sandbox-\$$(VERSION)-linux-\$$(TARGET_ARCH).tar.gz"
 	@echo "  test-e2e      aggregate: drive each sub-repo's test-e2e + run this repo's cross-repo e2e (22)"
-	@echo "  test-e2e-<X>  one e2e sub-target (X in {manifest,obs,density,sandbox-{cold,..},orchestrator,build-cli,execute,..})"
+	@echo "  test-e2e-<X>  one e2e sub-target (X in {manifest,obs,density,sandbox-{cold,..},orchestrator,run-builder,execute,..})"
 	@echo "  demo          run the e2b end-to-end demo (test/demo/demo_e2b.sh; DEMO_PAUSE=1 to step through)"
 	@echo "  perf          aggregate: accelerator perf-cache + this repo's perf-sandbox/-manifest/-density"
 	@echo "  bench         Go micro-benchmarks across every Go sub-repo"

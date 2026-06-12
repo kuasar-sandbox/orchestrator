@@ -95,7 +95,7 @@ E2ES=(
   "kuasar-sandbox/test/e2e/e2e_orchestrator.sh"
   "kuasar-sandbox/test/e2e/e2e_runtask.sh"
   # e2b build + execute (real microVM / Python SDK; self-skip without their prereqs)
-  "kuasar-sandbox/test/e2e/e2e_build_real.sh"
+  "kuasar-sandbox/test/e2e/e2e_run_builder.sh"
   "kuasar-sandbox/test/e2e/e2e_execute.sh"
   "kuasar-sandbox/test/e2e/e2e_orchestrator_proxy.sh"
   # accelerator (2)

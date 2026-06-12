@@ -52,6 +52,7 @@ die()  { echo $'\e[1;31m'"  ✗ $*"$'\e[0m' >&2; exit 1; }
 # ---- prerequisites --------------------------------------------------------
 for b in orchestrator-ctl e2b-key-ctl vswitch-ctl cloud-hypervisor; do [ -x "$BIN/$b" ] || die "missing $BIN/$b — run 'make build'"; done
 [ -f "$BIN/vmlinux" ] && [ -f "$BIN/sandbox-runtime-e2b.erofs" ] || die "missing kernel/runtime erofs in $BIN"
+[ -f "$BIN/sandbox-runtime-builder.erofs" ] || die "missing $BIN/sandbox-runtime-builder.erofs — run 'make sandbox-runtime-builder' (builds run in-guest)"
 [ -S "${STORE_SOCK:-}" ] || die "store socket $STORE_SOCK absent — run demo_prep.sh"
 [ -S "${CACHE_SOCK:-}" ] || die "cache socket $CACHE_SOCK absent — run demo_prep.sh"
 [ -n "${REGISTRY:-}" ] && [ -n "${BASE_REF:-}" ] || die "REGISTRY/BASE_REF not set — run demo_prep.sh"
@@ -105,6 +106,8 @@ banner "Per-run node stack (orchestrator + eBPF switch; storage tier already up)
 say "overlay diff_template — pre-formatted empty ext4 seeding each cold boot's writable upper"
 MKFS_EXT4="$(command -v mkfs.ext4 || echo /sbin/mkfs.ext4)"; [ -x "$MKFS_EXT4" ] || die "mkfs.ext4 not found"
 OVL="$WORK/overlay-1G.ext4"; truncate -s 1G "$OVL"; "$MKFS_EXT4" -F -q -b 4096 "$OVL" >/dev/null 2>&1 || die "mkfs.ext4"
+say "builder diff_template — build-sandbox writable disk (pull cache + steps delta + export scratch; sparse)"
+BLD="$WORK/builder-8G.ext4"; truncate -s 8G "$BLD"; "$MKFS_EXT4" -F -q -b 4096 "$BLD" >/dev/null 2>&1 || die "mkfs.ext4 (builder)"
 
 say "self-signed *.$DOMAIN cert (SDK trusts it via SSL_CERT_FILE; data plane is https)"
 openssl req -x509 -newkey rsa:2048 -nodes -keyout "$WORK/tls.key" -out "$WORK/tls.crt" -days 2 \
@@ -145,7 +148,10 @@ sandbox:
     runtime_e2b: $BIN/sandbox-runtime-e2b.erofs
     runtime_base: $BIN/sandbox-runtime.erofs
     overlay_diff_template: $OVL
-builder: { insecure_registry: $INSECURE }   # no image_uri_mask: from_image names the image directly
+builder:                                    # no image_uri_mask: from_image names the image directly
+  insecure_registry: $INSECURE
+  runtime_builder: $BIN/sandbox-runtime-builder.erofs
+  diff_template: $BLD
 checkpoint: { mode: local, local_dir: $WORK/saved }
 EOF
 
@@ -202,13 +208,24 @@ say "another terminal can drive the SDK: ${c_cmd}source $CLI_ENV_FILE${c_off}${c
 pause
 
 # ===========================================================================
-banner "Build a template — Template().from_image(ref) (node pulls + flattens; no docker)"
+banner "Build a template — Template().from_image(ref) (pull + flatten run IN a build sandbox)"
 # ---------------------------------------------------------------------------
-say "the SDK names an image; the node pulls $BASE_REF (tenant creds) and flattens it into a microVM template:"
-echo "${c_cmd}  \$ python3 -c \"Template.build(Template().from_image('$BASE_REF'), name='demo-app')\"${c_off}"
+# The pull runs INSIDE the build microVM (tenant network), so the image ref
+# must be guest-reachable: a loopback-bound local zot is addressed via the
+# vswitch mgmt VIP instead (same host); third-party registries pass through.
+GUEST_BASE_REF="$BASE_REF"
+case "$BASE_REF" in
+  127.0.0.1:*|localhost:*)
+    GUEST_BASE_REF="169.254.169.254:${BASE_REF#*:}"
+    curl -fs --max-time 3 --noproxy '*' -o /dev/null "http://${GUEST_BASE_REF%%/*}/v2/" \
+      || die "registry $REGISTRY unreachable on the mgmt VIP — zot must bind 0.0.0.0; restart prep: demo_prep.sh stop && bash demo_prep.sh"
+    ;;
+esac
+say "the SDK names an image; a build sandbox pulls $GUEST_BASE_REF (tenant creds) and flattens it into a microVM template:"
+echo "${c_cmd}  \$ python3 -c \"Template.build(Template().from_image('$GUEST_BASE_REF'), name='demo-app')\"${c_off}"
 TEMPLATE="$(py <<PY
 from e2b import Template
-info = Template.build(Template().from_image("$BASE_REF"), name="demo-app", cpu_count=2, memory_mb=2048)
+info = Template.build(Template().from_image("$GUEST_BASE_REF"), name="demo-app", cpu_count=2, memory_mb=2048)
 print(info.template_id)
 PY
 )" || die "template build failed (see $WORK/orch.log)"
