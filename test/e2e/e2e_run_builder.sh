@@ -3,9 +3,10 @@
 # e2e_run_builder.sh — the orchestrator's three-phase build pipeline
 # (run-builder), end to end on real microVMs. Builds run INSIDE build
 # sandboxes: the base image is pulled + flattened in-guest over the tenant
-# network (zot reached via the vswitch mgmt NIC), steps execute via guest
-# exec sessions, and the template snapshot is taken from a production-runtime
-# VM. One orchestrator, three builds + one create:
+# network (zot reached via the vswitch mgmt NIC), steps and startCmd/readyCmd
+# run THROUGH ENVD (the e2b exec channel, /bin/bash -l -c), and the template
+# snapshot is taken from a production-runtime VM with the start command left
+# as an envd-managed process. One orchestrator, three builds + one create:
 #
 #   B1  fromImage (in-guest pull + flatten)                → e2b-img template
 #   B2  fromTemplate(B1, img) + steps + startCmd/readyCmd  → e2b-snp template
@@ -33,7 +34,9 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 BIN="${BIN:-$REPO_ROOT/bin}"
 DOMAIN="${DOMAIN:-sandboxes.e2e.local}"
-E2E_IMAGE="${E2E_IMAGE:-busybox:latest}"     # must have /bin/sh + adduser (busybox does)
+# Builds with steps/startCmd carry the e2b contract: envd runs them as
+# `/bin/bash -l -c` — the image must have bash (python:3.12-slim does).
+E2E_IMAGE="${E2E_IMAGE:-python:3.12-slim}"
 ZOT_BIN="${ZOT_BIN:-$(command -v zot || true)}"
 SWITCH="${SWITCH:-swbld}"; SW_NETNS="${SW_NETNS:-e2ebld_sw}"; SW_MGMT="${SW_MGMT:-swbldm0}"
 MGMT_VIP="169.254.169.254"                   # host-side mgmt NIC IP; guests route 0/0 here
@@ -280,7 +283,7 @@ B2_TID="$TID"; B2_BID="$BID"
 B2_BODY=$(cat <<EOF
 {"fromTemplate":"$B1_PERSIST",
  "steps":[
-   {"type":"RUN","args":["adduser -D user"]},
+   {"type":"RUN","args":["useradd -m -d /home/user user || adduser -D user"]},
    {"type":"RUN","args":["echo b2 > /etc/b2-marker"]},
    {"type":"ENV","args":["BUILT","yes"]},
    {"type":"WORKDIR","args":["/home/user"]}],
