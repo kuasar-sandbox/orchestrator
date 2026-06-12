@@ -10,7 +10,7 @@
 
 SHELL := /bin/bash
 
-.PHONY: all build orchestrator-ctl e2b-key-ctl sandbox-runtime-e2b \
+.PHONY: all build orchestrator-ctl e2b-key-ctl sandbox-runtime-e2b sandbox-runtime-builder \
         test vet bench test-e2e test-e2e-orchestrator test-e2e-proxy clean help
 
 # ---------------------------------------------------------------------------
@@ -45,6 +45,11 @@ ENVD         ?= ../kuasar-sandbox/bin/$(TARGET_ARCH)/envd
 FSCK         ?= ../kuasar-sandbox/bin/$(TARGET_ARCH)/fsck.erofs
 MKFS         ?= ../kuasar-sandbox/bin/$(TARGET_ARCH)/mkfs.erofs
 RUNTIME_E2B  ?= $(BINDIR)/sandbox-runtime-e2b.erofs
+# Extra inputs for `make sandbox-runtime-builder` (the build-sandbox guest
+# flavor: e2b + flatten-ctl + a static mkfs.erofs injected for in-guest use).
+FLATTEN_CTL     ?= ../kuasar-sandbox/bin/$(TARGET_ARCH)/flatten-ctl
+MKFS_GUEST      ?= ../kuasar-sandbox/bin/$(TARGET_ARCH)/mkfs.erofs
+RUNTIME_BUILDER ?= $(BINDIR)/sandbox-runtime-builder.erofs
 
 define link_bin
 @if [ "$(HOST_ARCH)" = "$(TARGET_ARCH)" ]; then \
@@ -78,6 +83,18 @@ sandbox-runtime-e2b:
 	  --fsck-erofs "$(FSCK)" --mkfs-erofs "$(MKFS)"
 	$(call link_bin,sandbox-runtime-e2b.erofs)
 
+# The build-sandbox guest flavor: e2b + flatten-ctl + mkfs.erofs under
+# /opt/sandbox-runtime/bin (auto-bind-mounted into the guest app root).
+sandbox-runtime-builder:
+	@[ -f "$(BASE_RUNTIME)" ] || { echo "missing base runtime: $(BASE_RUNTIME) (build sandbox-runtime first or set BASE_RUNTIME=...)" >&2; exit 1; }
+	@[ -f "$(ENVD)" ] || { echo "missing envd: $(ENVD) (run 'make -C sandbox-deps envd' or set ENVD=...)" >&2; exit 1; }
+	@[ -f "$(FLATTEN_CTL)" ] || { echo "missing flatten-ctl: $(FLATTEN_CTL) (build sandbox-builder first or set FLATTEN_CTL=...)" >&2; exit 1; }
+	@[ -f "$(MKFS_GUEST)" ] || { echo "missing mkfs.erofs: $(MKFS_GUEST) (run 'make -C sandbox-deps erofs' or set MKFS_GUEST=...)" >&2; exit 1; }
+	bash deps/build-runtime-builder.sh --base "$(BASE_RUNTIME)" --envd "$(ENVD)" \
+	  --flatten-ctl "$(FLATTEN_CTL)" --mkfs-binary "$(MKFS_GUEST)" --out "$(RUNTIME_BUILDER)" \
+	  --fsck-erofs "$(FSCK)" --mkfs-erofs "$(MKFS)"
+	$(call link_bin,sandbox-runtime-builder.erofs)
+
 test:
 	CGO_ENABLED=0 $(GO) test ./...
 
@@ -108,6 +125,7 @@ help:
 	@echo "sandbox-orchestrator. Targets:"
 	@echo "  build / orchestrator-ctl   build the e2b-compatible ingress daemon"
 	@echo "  sandbox-runtime-e2b        inject envd (from sandbox-deps) into a base sandbox-runtime.erofs"
+	@echo "  sandbox-runtime-builder    e2b flavor + flatten-ctl + mkfs.erofs (build-sandbox guest runtime)"
 	@echo "  test / vet / bench / clean"
 	@echo "  test-e2e[-orchestrator|-proxy]  run the umbrella e2e against assembled bin/"
 	@echo "  TARGET_ARCH                x86_64 (default) | aarch64"
