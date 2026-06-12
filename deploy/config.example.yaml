@@ -88,17 +88,36 @@ sandbox:
     # Pre-formatted empty ext4 seeding the cold-boot overlay upper (required for img templates).
     overlay_diff_template: /opt/sandbox/overlay-templates/basic-1G.ext4
 
-# Build-instance settings. Concurrency is admitted in orchestrator-ctl; the CPU/
-# memory ceiling is applied to sandbox-builder.slice.
+# Build-instance settings. Builds run INSIDE build sandboxes (tenant network +
+# isolation): image pull and step execution happen in microVMs booted from
+# runtime_builder; only artifact relay and the final uploads run on the host.
+# Concurrency is admitted in orchestrator-ctl; the CPU/memory ceiling is applied
+# to sandbox-builder.slice (the whole pipeline runs in the unit's cgroup).
 builder:
   max_concurrent: 2
+  # Build-sandbox guest runtime (e2b flavor + flatten-ctl + mkfs.erofs; built by
+  # the umbrella `make sandbox-runtime-builder`).
+  runtime_builder: /opt/sandbox/runtime/v1/sandbox-runtime-builder.erofs
+  # Pre-formatted ext4 seeding the build sandbox's writable disk (pull cache +
+  # steps delta + export scratch). Sparse; size it ~3x the largest expected image.
+  diff_template: /opt/sandbox/overlay-templates/builder-8G.ext4
+  # vcpu: 2                                       # per build-sandbox capacity
+  # memory: 4GiB
   # cpu_quota: "200%"                             # -> sandbox-builder.slice CPUQuota
   # memory_max: "8G"                              # -> sandbox-builder.slice MemoryMax
   # insecure_registry: false                      # pull base over plain HTTP (dev/local registry)
   # platform: linux/amd64
+  # Phase timeouts (seconds): in-guest pull+flatten, one RUN step, the readyCmd
+  # poll budget, the whole build (unit TimeoutStartSec = total + 60).
+  # pull_timeout_sec: 600
+  # step_timeout_sec: 600
+  # ready_timeout_sec: 120
+  # total_timeout_sec: 1800
   # Where the e2b CLI pushes its client-built image (must match the CLI's
   # E2B_IMAGE_URI_MASK; {templateID}/{buildID} tokens). When a build omits fromImage
-  # it is derived from this.
+  # it is derived from this. Must be reachable from INSIDE a build sandbox (the
+  # pull runs in the guest): a host-local registry must bind a non-loopback
+  # address and be named via the vswitch mgmt VIP.
   # image_uri_mask: "docker.sandboxes.example.com/e2b/custom-envs/{templateID}:{buildID}"
 
 # Paused-state tiering. On pause a sandbox's snapshot is written either to node-local

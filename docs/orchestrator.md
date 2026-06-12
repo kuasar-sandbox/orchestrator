@@ -88,10 +88,12 @@ orchestrator 补这一层,并刻意选择 **e2b 协议兼容**而非自定义 AP
       │   StartUnit(sandbox-builder@<bid>)    │   └──────────┬───────────────┘
       └──────┬───────────────┬────────────────┘              │
              │ D-Bus         │ UDS config-socket             │
-             ▼               ▼ (LaunchSpec, secrets in env)  │
-      systemd units    orchestrator-ctl run-sandbox /        │
-      + slices         run-builder → execve →                │
-                       sandbox-ctl run / flatten-ctl export  │
+             ▼               ▼ (LaunchSpec / BuildSpec,      │
+      systemd units            secrets in env)               │
+      + slices         run-sandbox → execve sandbox-ctl run  │
+                       run-builder → drives the 3-phase     │
+                         build (import/steps/template VMs    │
+                         as direct children, §11)            │
                              │                               │
                              ▼                               ▼
                        cloud-hypervisor microVM ◄── tap ── vswitch (eBPF)
@@ -193,11 +195,17 @@ orchestrator-ctl proxy --socket=<uds> [--data-listen=:443]
 
 ### 2.4 `orchestrator-ctl run-sandbox` / `run-builder`
 
-systemd 单元的 ExecStart,非给人用。两者共用同一骨架:`--pidfile` 以
-`fcntl(F_SETLK)` 排他锁防重入、写本 PID、清 `FD_CLOEXEC` 使锁随 `execve` 存活(不
-清理 pidfile)→ 拨 `--config-socket` 取 LaunchSpec(§6)→ `chdir(workdir)`、剥除
-`TASK_*` 引导变量、合入 `spec.env`(密钥)→ `execve` 替换为目标进程(`sandbox-ctl`
-/ `flatten-ctl`),目标继承本 PID 与单元 cgroup。
+systemd 单元的 ExecStart,非给人用。共用的进入骨架:`--pidfile` 以
+`fcntl(F_SETLK)` 排他锁防重入、写本 PID → 拨 `--config-socket` 取规约(§6)。
+之后两者分道:
+
+- **run-sandbox**:取 LaunchSpec → `chdir(workdir)`、剥除 `TASK_*` 引导变量、合入
+  `spec.env`(密钥)→ `execve` 替换为 `sandbox-ctl run`,目标继承本 PID 与单元
+  cgroup(锁 fd 已清 `FD_CLOEXEC`,随 execve 存活)。
+- **run-builder**:取 BuildSpec → **驻留**驱动三阶段构建流水线(§11):各阶段沙箱
+  (`sandbox-ctl run`)是它的直接子进程,整个构建计入本单元 cgroup;结束把结果 JSON
+  (`{image_key|snapshot_key, start_cmd, ready_cmd, error}`)打到 stdout,由单元
+  `StandardOutput=file:` 捕获为 `<bid>.result`。
 
 ```
 orchestrator-ctl run-sandbox --pidfile=<f> --config-socket=<uds> --sandbox-id=<sid>
@@ -303,7 +311,7 @@ orchestrator-ctl 同目录 → PATH"自动发现。
 | `units.runner` / `units.builder` | `sandbox-runner@.service` / `sandbox-builder@.service` | 模板单元名 |
 | `units.install` | `true` | `false` = 单元由运维带外管理,serve 不生成安装 |
 | `sandbox.timeout_sec` | `300` | 沙箱默认 TTL(秒) |
-| `sandbox.resources.vcpu` / `.memory` | `2` / `2GiB` | 每沙箱容量;同时回显在 e2b list/get 的 `cpuCount`/`memoryMB` |
+| `sandbox.resources.vcpu` / `.memory` | `2` / `2GiB` | 每沙箱容量;同时回显在 e2b list/get 的 `cpuCount`/`memoryMB`。**restore 类启动(snp 模板 create / resume / 迁移导入)按快照内 snapshot.cfg 的 capacity 覆盖**——快照自描述,可与本机默认不同(如构建预算下产出的模板) |
 | `sandbox.resources.control_socket` | 空 | sandbox-sentinel 资源控制 UDS,**opt-in**;空 = 静态 cgroup(单元自身,§5.1) |
 | `sandbox.network.switch` | `sw0` | vswitch 交换机名 |
 | `sandbox.network.hostname` | `sandbox` | guest 主机名:sethostname + `/etc/hosts` 条目(§10) |
@@ -316,7 +324,11 @@ orchestrator-ctl 同目录 → PATH"自动发现。
 | `builder.cpu_quota` / `.memory_max` | 空 | 施加到 `sandbox-builder.slice` 的 `CPUQuota`/`MemoryMax` |
 | `builder.insecure_registry` | `false` | 经明文 HTTP 拉取 base 镜像(dev/本机 registry) |
 | `builder.platform` | 空 | 拉取平台,如 `linux/amd64` |
-| `builder.image_uri_mask` | 空 | 客户端推送镜像的命名约定(含 `{templateID}`/`{buildID}` 占位,须与 e2b CLI 的 `E2B_IMAGE_URI_MASK` 一致);trigger 缺 `fromImage` 时据此推导(§11) |
+| `builder.image_uri_mask` | 空 | 客户端推送镜像的命名约定(含 `{templateID}`/`{buildID}` 占位,须与 e2b CLI 的 `E2B_IMAGE_URI_MASK` 一致);trigger 缺 `fromImage` 时据此推导;**须从构建沙箱内可达**——拉取在 guest 内进行(§11) |
+| `builder.runtime_builder` | – | 构建沙箱的 guest runtime erofs(e2b flavor + flatten-ctl + mkfs.erofs;umbrella `make sandbox-runtime-builder` 产出) |
+| `builder.diff_template` | – | 构建沙箱可写盘的预格式化 ext4(拉取缓存 + steps 增量 + 导出 scratch;稀疏文件,建议 ≥ 最大预期镜像的 3 倍) |
+| `builder.vcpu` / `.memory` | `2` / `4GiB` | 每台构建沙箱(阶段 microVM)的容量 |
+| `builder.{pull,step,ready,total}_timeout_sec` | `600`/`600`/`120`/`1800` | 阶段超时:guest 内拉取+展平、单条 RUN step、readyCmd 轮询预算、整个构建(单元 `TimeoutStartSec` = total+60) |
 | `checkpoint.mode` | `local` | 暂停态落地:`local` = 本机文件(节点绑定)/ `remote` = 远程 manifest(可移植 = 模板)(§8.1) |
 | `checkpoint.local_dir` | `/var/lib/sandbox-saved` | 本机快照目录(`mode=local`) |
 | `mmds.enabled` | `false` | envd 鉴权姿态开关(§9.4):false = `-isnotfc` + proxy 单闸门;true = FC 模式 + MMDS re-key |
@@ -362,8 +374,9 @@ envd,回占位 token,数据面控制端口 501。`trafficAccessToken` 为 SDK �
 | 操作 | 方法 + 路径 | 要点 |
 |---|---|---|
 | register | `POST /v3/templates` → 202 | body `{name, tags}`;回 `{templateID: transient-<uuidv7>, buildID, names, tags, aliases, public:false}` |
-| trigger | `POST /v2/templates/{tid}/builds/{bid}` → 202 | body 兼容 `{fromImage, fromImageRegistry{username,password}, startCmd}` 与 CLI 形态 `{dockerfile, template_name, start_cmd, ready_cmd}`;缺 `fromImage` 时由 `builder.image_uri_mask` 推出;`startCmd` 非空 ⇒ snp,否则 img;steps 不支持 |
+| trigger | `POST /v2/templates/{tid}/builds/{bid}` → 202 | body 兼容 `{fromImage, fromTemplate, fromImageRegistry{username,password}, steps[], startCmd, readyCmd}` 与 CLI 形态 `{start_cmd, ready_cmd, …}`;`fromImage`/`fromTemplate` 互斥,皆缺时由 `builder.image_uri_mask` 推 fromImage;steps 支持 `RUN/ENV/ARG/WORKDIR/USER`,**COPY → 501**(提交即拒);`startCmd` 非空或 fromTemplate ⇒ 暂记 snp(终态以流水线产物为准,§11),否则 img;fromTemplate 且无 steps 无 startCmd ⇒ 拒绝(无事可做) |
 | status | `GET /templates/{tid}/builds/{bid}/status` | 回 `{templateID, buildID, status, logs:[], logEntries:[]}` + 失败时 `reason{message}`;**进行中恒报 `building`**(registered/waiting/building 均映射,CLI wait 循环仅在 `building` 续轮询),终态 `ready`/`error`;ready 后 `templateID` 即报持久 id,并附 `names`/`aliases` |
+| files | `GET /templates/{tid}/files/{hash}` → **501** | COPY 步骤的构建文件上传流,未实现——与 trigger 侧的 COPY 拒绝呼应,响亮失败 |
 | list | `GET /templates` | 本租户 ready 模板;`templateID` 列为持久 id |
 
 ### 4.3 数据面协议(envd,本组件不实现、仅透传)
@@ -415,7 +428,7 @@ serve 启动时生成并安装两个模板单元 + 两个 slice(`sandbox-runner.
 `units.install: false` 则交由运维带外管理。ExecStart 里的 `orchestrator-ctl` 路径
 取自 serve 自身所在目录(自动发现,§3)。
 
-**runner 单元**(`%i` = sid;snp 构建的临时沙箱也走它):
+**runner 单元**(`%i` = sid):
 
 ```ini
 # sandbox-runner@.service (生成内容,路径按配置渲染)
@@ -438,17 +451,21 @@ Delegate=yes                # 委派控制器,--cgroup-adopt 才能写 cpu.max/m
 [Service]
 Type=oneshot
 WorkingDirectory=/run/sandbox/%i
-StandardOutput=file:/run/sandbox/%i/%i.result   # 捕获 flatten-ctl stdout 的 manifest key
-StandardError=journal                           # stderr 进 journal,不污染 .result
+StandardOutput=file:/run/sandbox/%i/%i.result   # 捕获 run-builder stdout 的构建结果 JSON
+StandardError=journal                           # 流水线进度/报错进 journal,不污染 .result
 ExecStart=<orchestrator-ctl> run-builder --pidfile=/run/sandbox/%i/%i.pid \
           --config-socket=/run/sandbox/orchestrator.socket --build-id=%i
-TimeoutStartSec=1800
+TimeoutStartSec=1860              # builder.total_timeout_sec + 60
 KillMode=control-group
 Slice=sandbox-builder.slice   # 构建池 cgroup 上限(builder.cpu_quota/memory_max)
 ```
 
-两单元的 ExecStart 都是启动器(§2.4):锁 pidfile → 取 LaunchSpec → `execve` 替换为
-目标,目标继承单元主 PID 与 cgroup;`Type=exec` 故无需 sd_notify。
+两单元的 ExecStart 都是启动器(§2.4),锁 pidfile 后经 config-socket 取规约,然后
+分道:runner `execve` 替换为 `sandbox-ctl run`(继承单元主 PID 与 cgroup,
+`Type=exec` 故无需 sd_notify);builder **驻留**驱动三阶段流水线(§11),阶段沙箱
+(`sandbox-ctl run` + cloud-hypervisor)是其直接子进程、整个构建计入本单元 cgroup,
+`Type=oneshot` 使 `StartUnit` 阻塞至流水线退出,`KillMode=control-group` 保证
+StopUnit/超时连阶段 VM 一并回收。
 
 - **kill**:`StopUnit`(连 CH 一并 SIGKILL)→ `ResetFailedUnit` → `vswitch-ctl detach`
   → 删运行目录 → 删库行。`kill` 在进程层生效,不受 guest 内 restart 策略阻挡。
@@ -480,24 +497,29 @@ serve 在 UDS `paths.config_socket`(默认 `/run/sandbox/orchestrator.socket`,**
 经 **`SO_PEERCRED`** 取 peer pid 注入请求上下文;socket 0600 ⇒ 仅同 uid / root 可连,
 各平面在此之上再细分。`/internal/*` 前缀 e2b SDK 永不使用,与 api 路径不冲突。
 
-**① task 平面** — `POST /internal/task/launchspec`:启动器(run-sandbox/run-builder)
-取**通用启动规约 LaunchSpec**。
+**① task 平面** — 启动器取工作规约,两条路径、同一鉴权:
 
-- 协议:req `{config_id}`(`sandbox:<sid>` | `build:<bid>`)→ resp
-  `{exec, args, workdir, env}`:
-  - sandbox:`exec=sandbox-ctl`,`args=[run --sandbox-id <sid> --config
-    <rundir>/<sid>.yaml --manifest-config <shared> --run-root <run_root>
-    --cgroup-adopt (--restore <ref>) (--connect <uds:ip:port>)…]`,
-    `env={MANIFEST_KEY}`。`--run-root` 把 sandbox-ctl 的 socket/staging 目录
-    (`ch.sock`/`ctl.sock`/…)钉到 orchestrator 的 run_root,pause/snapshot 客户端
-    (同 `--run-root`)才能拨到 `ctl.sock`。
-  - build:`exec=flatten-ctl`,`args=[export --config <rundir>/flatten.yaml
-    --manifest-config <shared> --upload <fromImage>]`,`env={MANIFEST_KEY,
-    FLATTEN_REGISTRY_*}`(§11)。
+- `POST /internal/task/launchspec`(run-sandbox;req `{config_id: "sandbox:<sid>"}`)
+  → **LaunchSpec** `{exec, args, workdir, env}`:`exec=sandbox-ctl`,
+  `args=[run --sandbox-id <sid> --config <rundir>/<sid>.yaml --manifest-config
+  <shared> --run-root <run_root> --cgroup-adopt (--restore <ref>)
+  (--connect <uds:ip:port>)…]`,`env={MANIFEST_KEY}`。`--run-root` 把 sandbox-ctl
+  的 socket/staging 目录(`ch.sock`/`ctl.sock`/…)钉到 orchestrator 的 run_root,
+  pause/snapshot 客户端(同 `--run-root`)才能拨到 `ctl.sock`。
+- `POST /internal/task/buildspec`(run-builder;req `{config_id: "build:<bid>"}`)
+  → **BuildSpec(构建工作单)**:`{build_id, workdir, from_image | from_template
+  (+kind), steps[], start_cmd, ready_cmd, env, paths, net, vcpu, memory,
+  mmds_enabled, envd_token, insecure, platform, timeouts}`——`env` 含
+  `MANIFEST_KEY` + 租户 `FLATTEN_*` 拉取凭据;`paths` 是宿主侧工件与工具
+  (kernel / runtime_e2b / runtime_builder / 两个 diff template / sandbox-ctl /
+  flatten-ctl / manifest-ctl / manifest_config);`net` 是 serve 预先 attach 的
+  网络槽(tapfd exec、mac、inner_ip、nexthop、hostname、dns),全构建复用。
+  run-builder 据此自建阶段沙箱(§11);仅在该构建单元运行期间可取(serve 持挂
+  pending 状态,单元退出即失效)。
 - **鉴权**:peer pid ⟷ `<rundir>/<id>/<id>.pid`(启动器拨号前已锁写本 PID),相等即
   认证。
-- 设计意图:**非密配置走文件**(`<sid>.yaml`/`flatten.yaml`)、**密钥走 LaunchSpec env**
-  ——秘密只在内存与 env 中,不落盘。
+- 设计意图:**非密配置走文件**(`<sid>.yaml`;构建的阶段 yaml 由 run-builder 写进
+  workdir)、**密钥走 spec env**——秘密只在内存与 env 中,不落盘。
 
 **② admin 平面** — `/internal/admin/manifest-keys`(`GET` = list,`POST
 {op: add|remove|check, key, label, ttl_seconds, registry_auth}`):manifest-key 白名单
@@ -778,34 +800,68 @@ envd 硬编码访问 `169.254.169.254:80`;部署侧用 vswitch
 - host 在 envd 就绪后调 **`POST /init`**(经 UDS):置 `envVars`、默认用户
   `user`/workdir `/home/user`、时间戳;仅 `mmds.enabled` 时携带 `accessToken`(§9.4)。
 
-## 11. 模板构建(经 e2b API + builds 表 + 资源池)
+## 11. 模板构建(三阶段流水线,构建在沙箱内进行)
 
-构建经 e2b API 提交(端点见 §4.2;无独立构建 CLI),落 `builds` 表,由资源池调度。
-服务端的工作是**拉取 + 展平一个已存在的镜像引用**(Dockerfile steps 不在服务端执行),
-分两类:
+构建经 e2b API 提交(端点见 §4.2;无独立构建 CLI),落 `builds` 表,由资源池调度,
+每个构建一个 `sandbox-builder@<bid>` 单元。**镜像拉取与 step 执行都发生在构建沙箱
+(microVM)内**——租户的网络流量与镜像内容不触宿主用户态,宿主侧只做工件接力与
+收尾上传。
 
-- **镜像 build(img,无 startCmd)**:池准入 → 写 `<rundir>/flatten.yaml`(referer
-  幂等流键 = fromImage、`tmpdir=<rundir>`,按配置加 `insecure`/`platform`)→
-  `StartUnit(sandbox-builder@<bid>)` → 单元内 `run-builder` 取 build LaunchSpec →
-  `execve` 进 `flatten-ctl export --config … --manifest-config … --upload <fromImage>`
-  (`MANIFEST_KEY` 经 env)→ flatten-ctl 把 manifest 键打到 stdout、单元
-  `StandardOutput=file` 写 `<bid>.result` → orchestrator 读回校验 64-hex → 持久 id
-  `e2b-img-<key>`。referer 幂等:同 `(MANIFEST_KEY, key=fromImage)` 已存在则跳过
-  重导出。
-- **快照 build(snp,有 startCmd)**:先做 img,再以该 img 冷启一台 e2b 沙箱(复用
-  `sandbox-runner@<bid>`,sid = bid)、等 envd 就绪、`sandbox-ctl snapshot --upload`
-  → 持久 id `e2b-snp-<key>`,随后销毁临时沙箱。startCmd 经 guest env `E2B_START_CMD`
-  传入,由 envd 侧契约消费。
+**serve 侧(每构建一次)**:建 workdir → `vswitch-ctl attach` 一个网络槽(整个构建
+复用,各阶段顺序交接 tapfd)→ 铸 envd token →(`mmds.enabled` 时)挂一行合成路由,
+让模板阶段 FC 模式的 envd 能按 floatingip 自解析 → `StartUnit`(oneshot,阻塞至
+流水线退出)→ 读 `<bid>.result` JSON → 终态落库:产物为快照 ⇒ `kind=snp`、为镜像 ⇒
+`img`,持久 id `e2b-<kind>-<key>` 写入 names/aliases。
+
+**单元内(run-builder,§2.4)** 依 BuildSpec(§6)最多跑三个阶段,每阶段一台
+microVM(`sandbox-ctl run` 直接子进程),exec 就绪探针 = guest 内
+`flatten-ctl mountpoint /.probe`:
+
+- **A import**(有 fromImage):**空**单盘沙箱——root 即 `builder.diff_template`
+  复制出的可写 ext4(无 base 镜像),`launch.placeholder` 锚定;guest runtime 用
+  **builder flavor**(`builder.runtime_builder`:e2b flavor + flatten-ctl +
+  mkfs.erofs,经 `/opt/sandbox-runtime` 投影进任意 rootfs)。guest 内
+  `flatten-ctl export --output - <fromImage>` 以租户凭据(`FLATTEN_*` 仅经 exec env
+  入 guest)拉取 + 展平,tarstream 镜像工件经 exec stdio 流回宿主 `workdir/image.img`。
+- **B steps**(有 steps):以 base 镜像为 root(本地工件或 `manifest://`)+ builder
+  runtime + 大可写 upper(同一 diff_template)。`RUN` 经 `sandbox-ctl exec` 逐条
+  执行,带宿主累积的 ENV/WORKDIR/USER 上下文(`ARG` 仅做 `${k}` 替换,不入镜像);
+  步完后宿主读 base 运行时配置、叠加累积 ENV/WORKDIR/USER 写回 guest,
+  `flatten-ctl mountpoint /.kuasar-build`(自绑挂载点)+ `export --skip-mounts
+  --runtime-config … --tmpdir /.kuasar-build --output - /` 导出新镜像工件流回——
+  挂载点自身与 `/opt/sandbox-runtime` 投影都是挂载,被 `--skip-mounts` 排除,导出
+  不自吞、工具链不进镜像。
+- **C template**(有 startCmd,显式或自 base 模板继承):**生产 e2b runtime** 冷启
+  最终镜像(runtime_ref 冻入快照——模板的子沙箱不得继承构建工具链),envd 为 app
+  (MMDS 姿态随部署,§9.4),`/init` 预置;startCmd 以 e2b 默认身份(`user`、
+  `/home/user`)`nohup` 派生进 guest(无宿主 stdio 耦合可活进快照),readyCmd 以
+  1s 间隔轮询至成功(无 readyCmd 则定额等待);`sandbox-ctl snapshot --output` 出
+  本地快照 bundle。
+
+**fromTemplate**:base 来自既有模板——img 模板直接用其镜像 key;snp 模板经
+`sandbox-ctl info --json manifest://<key>` 读 snapshot.cfg 取 `base_ref`,并继承
+metadata 里的 `e2b.start_cmd`/`e2b.ready_cmd`(请求显式给出者优先)。fromTemplate
+与 fromImage 互斥;fromTemplate 且无 steps 无 startCmd 拒绝(无事可做)。
+
+**收尾上传(平台凭据唯一出现点)**:img-only ⇒ `manifest-ctl store image.img`
+(stdout = 64-hex manifest key);产出快照 ⇒ **一条** `sandbox-ctl upload-snapshot
+<bundle>`——自动上传 snapshot.cfg 引用的全部本地工件(base 镜像、overlay)并把引用
+改写为 `manifest://`(runtime_ref 不动,宿主提供)。结果 JSON
+`{image_key|snapshot_key, start_cmd, ready_cmd, error}` 打 stdout → `<bid>.result`;
+快照模板的 start/ready 同时记进 snapshot.cfg metadata,模板自描述(fromTemplate
+继承与 create 都读它)。
 
 **fromImage 的来源**:trigger body 显式给出;或(e2b CLI 在客户端 `docker build` +
 `docker push` 到约定名、trigger 不带镜像引用的工作流)由 `builder.image_uri_mask`
-推出 `<mask>/{templateID}:{buildID}`——掩码须与 CLI 侧 `E2B_IMAGE_URI_MASK` 一致。
-两者皆缺则 trigger 报错。配本机/私网 registry 时设 `builder.insecure_registry`、
-`builder.platform`。
+推出 `<mask>/{templateID}:{buildID}`——掩码须与 CLI 侧 `E2B_IMAGE_URI_MASK` 一致,
+且**须从构建沙箱内可达**(拉取在 guest 内:本机 registry 须绑非环回地址、按
+vswitch mgmt VIP 寻址;第三方 registry 经 NAT 出网)。两者皆缺则 trigger 报错。
+配本机/私网 registry 时设 `builder.insecure_registry`、`builder.platform`。
 
 **资源池**:`builder.max_concurrent`(默认 2)= orchestrator 内计数信号量准入;
 `waiting → building` 用 builds 表 CAS 抢占(重启/多实例安全);CPU/内存上限经
-`sandbox-builder.slice` 的 `CPUQuota`/`MemoryMax` 施加(cgroup)。
+`sandbox-builder.slice` 的 `CPUQuota`/`MemoryMax` 施加(整条流水线都在单元 cgroup
+内,上限对阶段 VM 生效)。
 
 **镜像拉取凭据**(按优先级解析,无凭据则匿名):
 
@@ -817,9 +873,14 @@ envd 硬编码访问 `169.254.169.254:80`;部署侧用 vswitch
    `manifest-key add --registry-auth` 或 `--registry-username/--password/--token`
    自动组装 catch-all `*` 条目;按 fromImage host → `*` 匹配取条)。
 
-解析结果加密存 `builds.registry_auth_enc`,flatten 时解出注入
+解析结果加密存 `builds.registry_auth_enc`,构建时解出注入
 `FLATTEN_REGISTRY_{USERNAME,PASSWORD|TOKEN}`(flatten-ctl `pkg/remote` 读取,token
-优先)。凭据仅加密存库 + 运行期子进程 env;`<rundir>/flatten.yaml` 无秘密。
+优先),**经 exec env 进入 import 阶段的 guest——入 guest 的只有 `FLATTEN_*`,
+`MANIFEST_KEY` 永不入 guest**。凭据仅加密存库 + 运行期 env;workdir 里的阶段 yaml
+无秘密。
+
+**不支持**:COPY step(501,§4.2;构建文件上传流未实现)、step 级缓存(`force`
+字段接受但忽略,总是全量执行)、服务端 Dockerfile 解析(CLI 已在客户端展开为 steps)。
 
 ## 12. DNS / TLS
 
@@ -832,11 +893,12 @@ external worker 的 `--data-listen`),证书同一张。dev:`E2B_API_URL`/
 
 | 对象 | 方式 | 说明 |
 |---|---|---|
-| `sandbox-ctl`(runtime) | 经 run-sandbox(单元)`execve`:`run --config <sid>.yaml --manifest-config … --run-root … --cgroup-adopt [--restore] [--connect]`;另直接调 `snapshot --output`/`--upload`、`upload-snapshot` | 非密配置文件 + 密钥 env;资源准入在其内部 |
+| `sandbox-ctl`(runtime) | 经 run-sandbox(单元)`execve`:`run --config <sid>.yaml --manifest-config … --run-root … --cgroup-adopt [--restore] [--connect]`;run-builder 以直接子进程 `run` 阶段沙箱,经 `exec --user/--cwd/--env/--stdin-from/--stdout-to` 驱动 steps/startCmd 与工件流,收尾 `snapshot --output` / `upload-snapshot` / `info --json`;serve 调 `snapshot --upload`(pause) | 非密配置文件 + 密钥 env;资源准入在其内部 |
 | `node-ctl`(sentinel) | 无直接交互;可选 `sandbox.resources.control_socket` | 单元 cgroup 即沙箱 cgroup,sentinel 原地仲裁;不配 = 静态 cgroup(`--cgroup-adopt`),配了才进 SANDBOX_CONFIG `resources.control.controller` |
-| `vswitch-ctl`(vswitch) | CLI:`attach <switch> --inner-ip [--transit-*]` / `detach --port`;`open-port` 作 SANDBOX_CONFIG `network.tapfd.exec`(sandbox-ctl 执行,经 `TAPFD_SOCKET` 收 tap fd) | 交换机预先起好(`vswitch-ctl start`,内核态数据面);port 对外、slot 内部 |
-| `flatten-ctl`(builder) | 经 run-builder(单元)`execve`:`export --config --manifest-config --upload`(referer 幂等流) | manifest key 经 stdout 回收;`MANIFEST_KEY`/`FLATTEN_REGISTRY_*` 经 env |
-| `fsck.erofs`/`mkfs.erofs`(deps) | CLI(`deps/build-runtime-e2b.sh`) | 确定性重打 e2b runtime(§10) |
+| `vswitch-ctl`(vswitch) | CLI:`attach <switch> --inner-ip [--transit-*]` / `detach --port`;`open-port` 作 SANDBOX_CONFIG `network.tapfd.exec`(sandbox-ctl 执行,经 `TAPFD_SOCKET` 收 tap fd) | 交换机预先起好(`vswitch-ctl start`,内核态数据面);port 对外、slot 内部;一个构建复用一个槽 |
+| `flatten-ctl`(builder) | **guest 内**(builder runtime 自带,经 sandbox-ctl exec 驱动):`export --output -`(import 拉取 / steps 导出)、`mountpoint`;宿主侧:`info --json`(读镜像运行时配置,本地工件或 manifest://) | 租户 `FLATTEN_*` 仅经 exec env 入 guest;tarstream 镜像工件经 exec stdio 接力 |
+| `manifest-ctl`(accelerator) | `store <image.img>`(img-only 构建的收尾上传) | manifest key 经 stdout 回收;`MANIFEST_KEY` 经 env |
+| `fsck.erofs`/`mkfs.erofs`(deps) | CLI(`deps/build-runtime-e2b.sh`、`deps/build-runtime-builder.sh`) | 确定性重打 e2b / builder runtime(§10、§11) |
 | guest envd | UDS(sandbox-ctl `--connect` 映射) | 原版不改;协议 pin 见 §4.3/§4.5 |
 | systemd | D-Bus:StartUnit/StopUnit/ResetFailed/ListUnitsByPatterns/Reload | 进程管理 + 单元自装(§5) |
 | `orchestrator-ctl proxy`(external) | UDS routesync(双向 h2c 帧化 JSON)+ 兜底反代 | 同节点、运维带外起;数据口 SO_REUSEPORT 共享(§9.1) |
@@ -898,7 +960,7 @@ sandbox-runtime-e2b.erofs 等),均已注册为 umbrella make 目标,缺前置则
 |---|---|---|
 | `e2e_orchestrator.sh` | 单元自动安装 + 控制面(`/health`、401 路径)+ 构建 API 生命周期(register/trigger/status、跨 key 归属 404)+(有 KVM 时)bare create/list/kill | `test-e2e-orchestrator` |
 | `e2e_runtask.sh` | run-sandbox/run-builder 启动器(纯用户态,无 root/systemd/KVM):pidfile 锁/双起拒绝、HTTP 取 LaunchSpec、execve、`TASK_*` 剥除;`config` CLI 往返 | `test-e2e-runtask` |
-| `e2e_build_real.sh` | 真实镜像 build 后端(store-ctl + 本地 zot):register → trigger(fromImage)→ poll 至 `ready` 出持久 id | `test-e2e-build-real` |
+| `e2e_run_builder.sh` | 三阶段构建流水线(KVM + vswitch + store-ctl + zot,guest 经 mgmt VIP 拉取):fromImage → e2b-img;fromTemplate(img)+steps+startCmd → e2b-snp(manifest:// base、配置合并、snapshot.cfg metadata 断言);fromTemplate(snp)+steps → e2b-snp(start/ready 继承);再从产物模板 create/list/kill;COPY 与 files 端点 501 | `test-e2e-run-builder` |
 | `e2e_execute.sh` | 从已建模板冷启真实 microVM、guest 内 exec、pause(snapshot)→ resume 全链路 | `test-e2e-execute` |
 | `e2e_orchestrator_proxy.sh` | `proxy.mode=external` 全链路:serve + 独立 worker(SO_REUSEPORT)+ routesync + 真实 microVM/envd,数据面经 proxy 走(401/转发/wake/resume/metrics) | `test-e2e-orchestrator-proxy` |
 

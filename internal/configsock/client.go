@@ -51,3 +51,27 @@ func FetchLaunchSpec(socket, configID string) (*LaunchSpec, error) {
 	}
 	return &spec, nil
 }
+
+// FetchBuildSpec dials the config-socket and pulls the BuildSpec for
+// configID ("build:<bid>"). Same auth contract as FetchLaunchSpec.
+func FetchBuildSpec(socket, configID string) (*BuildSpec, error) {
+	body, _ := json.Marshal(Request{ConfigID: configID})
+	req, err := http.NewRequest(http.MethodPost, "http://localhost"+PathTaskBuildSpec, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := HTTPClient(socket).Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	var spec BuildSpec
+	if err := json.NewDecoder(resp.Body).Decode(&spec); err != nil {
+		return nil, fmt.Errorf("configsock: decode buildspec: %w", err)
+	}
+	if spec.Error != "" {
+		return nil, errors.New(spec.Error)
+	}
+	return &spec, nil
+}

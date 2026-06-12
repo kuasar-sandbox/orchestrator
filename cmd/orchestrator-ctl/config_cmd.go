@@ -101,13 +101,22 @@ sandbox:                                          # sandbox-instance defaults
     runtime_base: /opt/sandbox/runtime/v1/sandbox-runtime.erofs
     # Pre-formatted empty ext4 seeding the cold-boot overlay upper (required for img templates).
     overlay_diff_template: /opt/sandbox/overlay-templates/basic-1G.ext4
-builder:
+builder:                                           # builds run INSIDE build sandboxes
   max_concurrent: 2
+  runtime_builder: /opt/sandbox/runtime/v1/sandbox-runtime-builder.erofs  # build-sandbox guest runtime
+  diff_template: /opt/sandbox/overlay-templates/builder-8G.ext4  # build VM writable disk (pull cache + export scratch)
+  # vcpu: 2                                       # per build-sandbox capacity
+  # memory: 4GiB
   # cpu_quota: "200%"                             # -> sandbox-builder.slice CPUQuota
   # memory_max: "8G"                              # -> sandbox-builder.slice MemoryMax
   # insecure_registry: false                      # pull base over plain HTTP (dev/local registry)
   # platform: linux/amd64
-  # image_uri_mask must match the CLI's E2B_IMAGE_URI_MASK ({templateID}/{buildID} tokens):
+  # pull_timeout_sec: 600                         # in-guest pull+flatten | one RUN step |
+  # step_timeout_sec: 600                         # readyCmd poll | whole build
+  # ready_timeout_sec: 120
+  # total_timeout_sec: 1800
+  # image_uri_mask must match the CLI's E2B_IMAGE_URI_MASK ({templateID}/{buildID} tokens)
+  # AND be reachable from inside a build sandbox (the pull runs in the guest):
   # image_uri_mask: "docker.sandboxes.example.com/e2b/custom-envs/{templateID}:{buildID}"
 checkpoint:                                        # paused-state tiering
   mode: local                                     # local (node-bound files) | remote (portable manifest)

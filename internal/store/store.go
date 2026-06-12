@@ -59,7 +59,10 @@ CREATE TABLE IF NOT EXISTS builds (
   profile           TEXT NOT NULL,
   kind              TEXT NOT NULL,
   from_image        TEXT NOT NULL DEFAULT '',
+  from_template     TEXT NOT NULL DEFAULT '',
   start_cmd         TEXT NOT NULL DEFAULT '',
+  ready_cmd         TEXT NOT NULL DEFAULT '',
+  steps_json        TEXT NOT NULL DEFAULT '[]',
   status            TEXT NOT NULL,
   reason            TEXT NOT NULL DEFAULT '',
   names_json        TEXT NOT NULL DEFAULT '[]',
@@ -294,14 +297,19 @@ func (s *Store) Delete(ctx context.Context, id string) error {
 // --- builds (also the template registry) ---
 
 var buildCols = `build_id,template_id,persist_id,manifest_key_hash,manifest_key_enc,profile,kind,
-  from_image,start_cmd,status,reason,names_json,aliases_json,created_unix,registry_auth_enc`
+  from_image,from_template,start_cmd,ready_cmd,steps_json,status,reason,names_json,aliases_json,created_unix,registry_auth_enc`
 
 func (s *Store) scanBuild(row interface{ Scan(...any) error }) (*types.Build, error) {
 	var b types.Build
-	var profile, kind, status, names, aliases, mkHash, mkEnc, raEnc string
+	var profile, kind, status, names, aliases, mkHash, mkEnc, raEnc, steps string
 	if err := row.Scan(&b.BuildID, &b.TemplateID, &b.PersistID, &mkHash, &mkEnc, &profile, &kind,
-		&b.FromImage, &b.StartCmd, &status, &b.Reason, &names, &aliases, &b.CreatedUnix, &raEnc); err != nil {
+		&b.FromImage, &b.FromTemplate, &b.StartCmd, &b.ReadyCmd, &steps, &status, &b.Reason, &names, &aliases, &b.CreatedUnix, &raEnc); err != nil {
 		return nil, err
+	}
+	if steps != "" && steps != "[]" {
+		if err := json.Unmarshal([]byte(steps), &b.Steps); err != nil {
+			return nil, fmt.Errorf("store: build %s steps: %w", b.BuildID, err)
+		}
 	}
 	mk, err := s.box.DecryptString(mkEnc)
 	if err != nil {
@@ -330,19 +338,29 @@ func (s *Store) PutBuild(ctx context.Context, b *types.Build) error {
 			return fmt.Errorf("store: put build %s: encrypt registry auth: %w", b.BuildID, err)
 		}
 	}
+	stepsJSON := "[]"
+	if len(b.Steps) > 0 {
+		sj, jerr := json.Marshal(b.Steps)
+		if jerr != nil {
+			return fmt.Errorf("store: put build %s: steps: %w", b.BuildID, jerr)
+		}
+		stepsJSON = string(sj)
+	}
 	_, err = s.db.ExecContext(ctx, `
 INSERT INTO builds (build_id,template_id,persist_id,manifest_key_hash,manifest_key_enc,profile,kind,
-  from_image,start_cmd,status,reason,names_json,aliases_json,created_unix,registry_auth_enc)
-VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+  from_image,from_template,start_cmd,ready_cmd,steps_json,status,reason,names_json,aliases_json,created_unix,registry_auth_enc)
+VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 ON CONFLICT(build_id) DO UPDATE SET
   template_id=excluded.template_id, persist_id=excluded.persist_id,
   manifest_key_hash=excluded.manifest_key_hash, manifest_key_enc=excluded.manifest_key_enc,
   profile=excluded.profile, kind=excluded.kind, from_image=excluded.from_image,
-  start_cmd=excluded.start_cmd, status=excluded.status, reason=excluded.reason,
+  from_template=excluded.from_template, start_cmd=excluded.start_cmd,
+  ready_cmd=excluded.ready_cmd, steps_json=excluded.steps_json,
+  status=excluded.status, reason=excluded.reason,
   names_json=excluded.names_json, aliases_json=excluded.aliases_json,
   registry_auth_enc=excluded.registry_auth_enc`,
 		b.BuildID, b.TemplateID, b.PersistID, hash, enc, string(b.Profile), string(b.Kind),
-		b.FromImage, b.StartCmd, string(b.Status), b.Reason, mjs(b.Names), mjs(b.Aliases), b.CreatedUnix, raEnc)
+		b.FromImage, b.FromTemplate, b.StartCmd, b.ReadyCmd, stepsJSON, string(b.Status), b.Reason, mjs(b.Names), mjs(b.Aliases), b.CreatedUnix, raEnc)
 	if err != nil {
 		return fmt.Errorf("store: put build %s: %w", b.BuildID, err)
 	}

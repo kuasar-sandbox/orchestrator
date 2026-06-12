@@ -200,6 +200,9 @@ type BootConfig struct {
 
 // BuilderConfig is the build-instance settings. Concurrency is admitted in
 // orchestrator-ctl; the CPU/memory ceiling is applied to sandbox-builder.slice.
+// Builds run INSIDE build sandboxes (tenant network + isolation): import and
+// step execution happen in microVMs booted from runtime_builder; only artifact
+// streaming and the final uploads run on the host (run-builder).
 type BuilderConfig struct {
 	MaxConcurrent    int    `yaml:"max_concurrent"`    // default 2
 	CPUQuota         string `yaml:"cpu_quota"`         // e.g. "200%"; "" = unset
@@ -207,9 +210,27 @@ type BuilderConfig struct {
 	InsecureRegistry bool   `yaml:"insecure_registry"` // pull base images over plain HTTP (dev/local registry)
 	Platform         string `yaml:"platform"`          // e.g. "linux/amd64"; "" = host default
 	// ImageURIMask is the image the e2b CLI pushes its client-built rootfs to,
-	// with {templateID}/{buildID} tokens (must match the CLI's E2B_IMAGE_URI_MASK);
+	// with {templateID}/{buildID} tokens (must match the CLI's E2B_IMAGE_URI_MASK,
+	// AND be reachable from inside a build sandbox — the pull runs in the guest);
 	// when a build trigger omits fromImage, it is derived from this.
 	ImageURIMask string `yaml:"image_uri_mask"`
+
+	// RuntimeBuilder is the build-sandbox guest runtime erofs
+	// (sandbox-runtime-builder.erofs: e2b flavor + flatten-ctl + mkfs.erofs).
+	RuntimeBuilder string `yaml:"runtime_builder"`
+	// DiffTemplate is the pre-formatted ext4 seeding a build sandbox's
+	// writable disk (pull cache + steps delta + export scratch): size it
+	// 2-3x the largest expected image (the ext4 size is fixed at mkfs).
+	DiffTemplate string `yaml:"diff_template"`
+	// VCPU / Memory are the build sandbox's capacity (defaults 2 / "4GiB").
+	VCPU   int    `yaml:"vcpu"`
+	Memory string `yaml:"memory"`
+	// Phase timeouts (seconds): image pull+flatten, one RUN step, the
+	// readyCmd poll budget, and the whole build. Defaults 600/600/120/1800.
+	PullTimeoutSec  int `yaml:"pull_timeout_sec"`
+	StepTimeoutSec  int `yaml:"step_timeout_sec"`
+	ReadyTimeoutSec int `yaml:"ready_timeout_sec"`
+	TotalTimeoutSec int `yaml:"total_timeout_sec"`
 }
 
 // CheckpointConfig is the paused-state tiering policy. A sandbox pause writes its
@@ -279,6 +300,22 @@ func (c *Config) applyDefaults() {
 	def(&c.Sandbox.Network.E2B.Nexthop, "169.254.0.22")
 	def(&c.Sandbox.Network.Bare.InnerIP, "169.254.1.1/31")
 	def(&c.Sandbox.Network.Bare.Nexthop, "169.254.1.0")
+	def(&c.Builder.Memory, "4GiB")
+	if c.Builder.VCPU <= 0 {
+		c.Builder.VCPU = 2
+	}
+	if c.Builder.PullTimeoutSec <= 0 {
+		c.Builder.PullTimeoutSec = 600
+	}
+	if c.Builder.StepTimeoutSec <= 0 {
+		c.Builder.StepTimeoutSec = 600
+	}
+	if c.Builder.ReadyTimeoutSec <= 0 {
+		c.Builder.ReadyTimeoutSec = 120
+	}
+	if c.Builder.TotalTimeoutSec <= 0 {
+		c.Builder.TotalTimeoutSec = 1800
+	}
 	if c.Builder.MaxConcurrent <= 0 {
 		c.Builder.MaxConcurrent = 2
 	}
@@ -315,6 +352,7 @@ func (c *Config) Bin(name string) string {
 
 // Resolved external-binary paths (auto-discovered via Bin; not configurable).
 func (c *Config) SandboxCtl() string      { return c.Bin(BinSandboxCtl) }
+func (c *Config) ManifestCtl() string     { return c.Bin("manifest-ctl") }
 func (c *Config) VswitchCtl() string      { return c.Bin(BinVswitchCtl) }
 func (c *Config) FlattenCtl() string      { return c.Bin(BinFlattenCtl) }
 func (c *Config) OrchestratorCtl() string { return c.Bin(BinOrchestratorCtl) }

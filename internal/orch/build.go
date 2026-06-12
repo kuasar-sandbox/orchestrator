@@ -14,8 +14,10 @@ import (
 
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/api"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/configsock"
+	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/keys"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/regcreds"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/types"
+	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/vswitch"
 )
 
 var hexKeyRe = regexp.MustCompile(`^[0-9a-f]{64}$`)
@@ -68,7 +70,7 @@ func (o *Orchestrator) RegisterBuild(ctx context.Context, apiKey, name string, t
 // TriggerBuild handles POST /v2/templates/{tid}/builds/{bid}: record the base
 // image + start command, pick the kind (snp if a start command is set, else img),
 // and queue the build for the pool. Build steps are intentionally unsupported.
-func (o *Orchestrator) TriggerBuild(ctx context.Context, apiKey, tid, bid, fromImage, startCmd string, auth api.BuildAuth) error {
+func (o *Orchestrator) TriggerBuild(ctx context.Context, apiKey, tid, bid string, spec api.TriggerSpec, auth api.BuildAuth) error {
 	b, err := o.st.GetBuild(ctx, bid)
 	if err != nil {
 		return err
@@ -76,18 +78,44 @@ func (o *Orchestrator) TriggerBuild(ctx context.Context, apiKey, tid, bid, fromI
 	if !ownsBuild(b, apiKey) || b.TemplateID != tid {
 		return api.ErrNotFound
 	}
-	// The real e2b CLI pushes its client-built image to <mask>/{templateID}:{buildID}
-	// and sends no image ref; derive fromImage from the configured mask.
-	if fromImage == "" {
-		fromImage = o.imageURIFromMask(b.TemplateID, b.BuildID)
+	if spec.FromImage != "" && spec.FromTemplate != "" {
+		return fmt.Errorf("build: fromImage and fromTemplate are mutually exclusive")
 	}
-	if fromImage == "" {
-		return fmt.Errorf("build: fromImage is required (no builder_image_uri_mask configured)")
+	switch {
+	case spec.FromTemplate != "":
+		// Resolve the base template ref to its canonical persist id; the
+		// pipeline extracts the base image (and inherits start/ready) from
+		// its snapshot.cfg.
+		ref := o.resolveTemplateAlias(ctx, apiKey, spec.FromTemplate)
+		if _, perr := types.ParseTemplateID(ref); perr != nil {
+			return fmt.Errorf("build: fromTemplate %q: not a known template", spec.FromTemplate)
+		}
+		b.FromTemplate, b.FromImage = ref, ""
+		if len(spec.Steps) == 0 && spec.StartCmd == "" {
+			return fmt.Errorf("build: fromTemplate without steps or startCmd has nothing to do")
+		}
+	default:
+		// The real e2b CLI pushes its client-built image to <mask>/{templateID}:{buildID}
+		// and sends no image ref; derive fromImage from the configured mask
+		// (which must be reachable from INSIDE a build sandbox — the pull
+		// runs in the guest).
+		fromImage := spec.FromImage
+		if fromImage == "" {
+			fromImage = o.imageURIFromMask(b.TemplateID, b.BuildID)
+		}
+		if fromImage == "" {
+			return fmt.Errorf("build: fromImage is required (no builder_image_uri_mask configured)")
+		}
+		b.FromImage, b.FromTemplate = fromImage, ""
 	}
-	b.FromImage = fromImage
-	b.StartCmd = startCmd
+	b.Steps = spec.Steps
+	b.StartCmd = spec.StartCmd
+	b.ReadyCmd = spec.ReadyCmd
 	b.Kind = types.KindImg
-	if startCmd != "" {
+	if spec.StartCmd != "" || b.FromTemplate != "" {
+		// snp is provisional: the pipeline reports what it actually
+		// produced (fromTemplate may inherit start/ready) and the
+		// finalizer recomputes the kind from the result.
 		b.Kind = types.KindSnp
 	}
 	if b.RegistryAuth, err = o.resolveBuildCreds(ctx, b, auth.PullToken, auth.RegistryUsername, auth.RegistryPassword); err != nil {
@@ -211,10 +239,41 @@ func (o *Orchestrator) BuildPool(ctx context.Context, interval time.Duration) {
 	}
 }
 
+// buildResult is what run-builder prints on stdout (captured to
+// <bid>.result by the unit): the manifest keys of what the pipeline
+// actually produced, plus the effective start/ready commands
+// (fromTemplate inheritance resolves inside the pipeline).
+type buildResult struct {
+	ImageKey    string `json:"image_key,omitempty"`
+	SnapshotKey string `json:"snapshot_key,omitempty"`
+	StartCmd    string `json:"start_cmd,omitempty"`
+	ReadyCmd    string `json:"ready_cmd,omitempty"`
+	Error       string `json:"error,omitempty"`
+}
+
+// pendingBuild is the per-execution state BuildSpecFor serves while the
+// build unit runs: the pre-attached network slot + minted envd token.
+type pendingBuild struct {
+	build     *types.Build
+	workdir   string
+	tapExec   []string
+	mac       string
+	innerIP   string // CIDR
+	floating  string
+	envdToken string
+}
+
+// executeBuild runs the three-phase pipeline in a sandbox-builder@<bid>
+// unit: orchestrator-ctl run-builder fetches the BuildSpec over the
+// config-socket and drives import/steps/template sandboxes itself (as
+// direct children, in the unit's cgroup). This side owns what spans the
+// unit: the workdir, ONE vswitch slot the phases reuse sequentially,
+// and — for the template phase under mmds.enabled — a synthetic route
+// entry so the build sandbox's FC-mode envd can resolve itself.
 func (o *Orchestrator) executeBuild(ctx context.Context, b *types.Build) {
-	key, err := o.executeImage(ctx, b)
-	if err == nil && b.Kind == types.KindSnp {
-		key, err = o.executeSnapshot(ctx, b, key)
+	res, err := o.runBuildUnit(ctx, b)
+	if err == nil && res.Error != "" {
+		err = fmt.Errorf("%s", res.Error)
 	}
 	if err != nil {
 		b.Status, b.Reason = types.BuildError, err.Error()
@@ -222,99 +281,120 @@ func (o *Orchestrator) executeBuild(ctx context.Context, b *types.Build) {
 		o.log.Warn("build failed", "bid", b.BuildID, "err", err)
 		return
 	}
+	switch {
+	case res.SnapshotKey != "":
+		b.Kind = types.KindSnp
+		b.PersistID = types.TemplateID{Profile: b.Profile, Kind: types.KindSnp, Key: res.SnapshotKey}.String()
+	case res.ImageKey != "":
+		b.Kind = types.KindImg
+		b.PersistID = types.TemplateID{Profile: b.Profile, Kind: types.KindImg, Key: res.ImageKey}.String()
+	default:
+		b.Status, b.Reason = types.BuildError, "build produced no artifact"
+		_ = o.st.PutBuild(ctx, b)
+		return
+	}
+	b.StartCmd, b.ReadyCmd = res.StartCmd, res.ReadyCmd
 	b.Status = types.BuildReady
-	b.PersistID = types.TemplateID{Profile: b.Profile, Kind: b.Kind, Key: key}.String()
 	b.Names = appendUnique(b.Names, b.PersistID)
 	b.Aliases = appendUnique(b.Aliases, b.PersistID)
 	_ = o.st.PutBuild(ctx, b)
 	o.log.Info("build ready", "bid", b.BuildID, "template", b.PersistID)
 }
 
-// executeImage runs the image build in a sandbox-builder@<bid> unit (cgroup
-// accounting under sandbox-builder.slice). The unit's run-builder pulls the build
-// LaunchSpec over the config-socket and execs flatten-ctl; flatten-ctl's stdout
-// (the manifest key) is captured by the unit's StandardOutput=file into
-// <bid>.result, read back here.
-func (o *Orchestrator) executeImage(ctx context.Context, b *types.Build) (string, error) {
+func (o *Orchestrator) runBuildUnit(ctx context.Context, b *types.Build) (*buildResult, error) {
 	dir := filepath.Join(o.cfg.Paths.RunRoot, b.BuildID)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return "", err
+		return nil, err
 	}
 	defer os.RemoveAll(dir)
-	if err := os.WriteFile(filepath.Join(dir, "flatten.yaml"), []byte(o.flattenConfigYAML(b, dir)), 0o600); err != nil {
-		return "", err
+
+	// One network slot for the whole build; the phase sandboxes reuse it
+	// sequentially (tapfd handoff re-acquires the queue fd each boot).
+	plainIP, cidrIP, err := o.allocInnerIP(types.ProfileE2B, "")
+	if err != nil {
+		return nil, err
 	}
+	port, err := o.vs.Attach(ctx, vswitch.AttachReq{InnerIP: plainIP})
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = o.vs.Detach(context.Background(), port.Port) }()
+
+	envdTok, _ := keys.MintToken()
+	pend := &pendingBuild{
+		build: b, workdir: dir,
+		tapExec: o.vs.TapFDExec(port.Port), mac: port.MAC,
+		innerIP: cidrIP, floating: port.FloatingIP, envdToken: envdTok,
+	}
+	o.pendMu.Lock()
+	o.pend[b.BuildID] = pend
+	o.pendMu.Unlock()
+	defer func() {
+		o.pendMu.Lock()
+		delete(o.pend, b.BuildID)
+		o.pendMu.Unlock()
+	}()
+
+	// MMDS visibility for the template phase: a synthetic running route
+	// (FC-mode envd resolves {id, token-hash} by its floating IP).
+	if o.cfg.MMDS.Enabled {
+		row := &types.Sandbox{
+			ID: "build-" + b.BuildID, TemplateID: b.TemplateID,
+			State: types.StateRunning, FloatingIP: port.FloatingIP,
+			EnvdAccessToken: envdTok, ManifestKey: b.ManifestKey,
+			CreatedUnix: time.Now().Unix(),
+		}
+		o.cache(row)
+		o.publishUpsert(row)
+		defer func() {
+			o.uncache(row.ID)
+			o.publishDelete(row.ID)
+		}()
+	}
+
 	unit := o.builderUnit(b.BuildID)
 	_ = o.lc.ResetFailed(ctx, unit)
-	startErr := o.lc.Start(ctx, unit)
-	out, _ := os.ReadFile(filepath.Join(dir, b.BuildID+".result"))
-	key := strings.TrimSpace(string(out))
+	startErr := o.lc.Start(ctx, unit) // Type=oneshot: returns when run-builder exits
+	out, readErr := os.ReadFile(filepath.Join(dir, b.BuildID+".result"))
 	_ = o.lc.Stop(ctx, unit)
 	_ = o.lc.ResetFailed(ctx, unit)
-	if startErr != nil {
-		return "", startErr
-	}
-	if !hexKeyRe.MatchString(key) {
-		return "", fmt.Errorf("build: flatten-ctl output %q (want 64-hex key)", key)
-	}
-	return key, nil
-}
 
-// executeSnapshot boots the freshly-built image as an e2b sandbox keyed by the
-// build id (sandbox-runner@<bid>), waits for envd readiness, snapshots it and
-// returns the snapshot manifest key. The transient build sandbox is then removed.
-//
-// NOTE: warming the snapshot with the template start command depends on the
-// envd start-command contract; it is passed through the guest env (E2B_START_CMD)
-// for envd to pick up and should be verified against the running envd.
-func (o *Orchestrator) executeSnapshot(ctx context.Context, b *types.Build, imgKey string) (string, error) {
-	imgTmpl := types.TemplateID{Profile: types.ProfileE2B, Kind: types.KindImg, Key: imgKey}
-	sb := &types.Sandbox{
-		ID:          b.BuildID,
-		TemplateID:  imgTmpl.String(),
-		State:       types.StateRunning,
-		RunDir:      o.cfg.Paths.RunRoot + "/" + b.BuildID,
-		BaseDir:     o.cfg.Paths.BaseRoot + "/" + b.BuildID,
-		ManifestKey: b.ManifestKey,
-		Env:         map[string]string{},
-		EnvdUDS:     o.cfg.Paths.RunRoot + "/" + b.BuildID + "/envd.sock",
-		CiUDS:       o.cfg.Paths.RunRoot + "/" + b.BuildID + "/ci.sock",
-		CreatedUnix: time.Now().Unix(),
+	var res buildResult
+	if len(out) > 0 {
+		if jerr := json.Unmarshal(out, &res); jerr != nil {
+			return nil, fmt.Errorf("build: result file: %w (unit err: %v)", jerr, startErr)
+		}
 	}
-	if b.StartCmd != "" {
-		sb.Env["E2B_START_CMD"] = b.StartCmd
+	if startErr != nil {
+		if res.Error != "" {
+			return &res, nil // the pipeline reported its own failure
+		}
+		return nil, startErr
 	}
-	if err := o.launch(ctx, sb, imgTmpl); err != nil {
-		o.teardown(context.Background(), sb)
-		return "", err
+	if readErr != nil {
+		return nil, fmt.Errorf("build: no result file: %w", readErr)
 	}
-	key, err := o.snapshotRemote(ctx, sb)
-	o.teardown(context.Background(), sb)
-	_ = o.st.Delete(context.Background(), sb.ID)
-	if err != nil {
-		return "", err
-	}
-	if !hexKeyRe.MatchString(key) {
-		return "", fmt.Errorf("build: snapshot returned %q (want 64-hex key)", key)
-	}
-	return key, nil
+	return &res, nil
 }
 
 // --- configsock.Provider (build) ---
 
-// buildLaunchSpec resolves "build:<bid>" to the flatten-ctl export LaunchSpec.
-// The manifest key is the build owner (owner == SHA256(api_key) == manifest key);
-// the flatten config (referer keyed by the base image, ephemeral scratch) is
-// written under the build run dir by executeImage before the unit starts.
-func (o *Orchestrator) buildLaunchSpec(ctx context.Context, bid string) (*configsock.LaunchSpec, string, bool, error) {
-	b, err := o.st.GetBuild(ctx, bid)
-	if err != nil || b == nil {
-		return nil, "", false, err
+// BuildSpecFor resolves "build:<bid>" to the pipeline work order. Only
+// valid while executeBuild has the build pending (the unit is running).
+func (o *Orchestrator) BuildSpecFor(ctx context.Context, configID string) (*configsock.BuildSpec, string, bool, error) {
+	kind, bid, found := strings.Cut(configID, ":")
+	if !found || kind != "build" {
+		return nil, "", false, nil
 	}
-	dir := filepath.Join(o.cfg.Paths.RunRoot, bid)
+	o.pendMu.Lock()
+	pend := o.pend[bid]
+	o.pendMu.Unlock()
+	if pend == nil {
+		return nil, "", false, nil
+	}
+	b := pend.build
+
 	env := map[string]string{"MANIFEST_KEY": b.ManifestKey}
-	// Inject the resolved registry pull creds as FLATTEN_REGISTRY_* (token or basic)
-	// so flatten-ctl can pull from the tenant's (possibly private) registry.
 	if b.RegistryAuth != "" {
 		var c regcreds.Creds
 		if json.Unmarshal([]byte(b.RegistryAuth), &c) == nil {
@@ -323,37 +403,71 @@ func (o *Orchestrator) buildLaunchSpec(ctx context.Context, bid string) (*config
 			}
 		}
 	}
-	spec := &configsock.LaunchSpec{
-		Exec: o.cfg.FlattenCtl(),
-		Args: []string{
-			"export",
-			"--config", filepath.Join(dir, "flatten.yaml"),
-			"--manifest-config", o.cfg.ManifestConfig,
-			"--upload", b.FromImage,
-		},
-		Workdir: dir,
-		Env:     env,
+
+	var steps []configsock.BuildStep
+	for _, s := range b.Steps {
+		steps = append(steps, configsock.BuildStep{Type: s.Type, Args: s.Args})
 	}
-	return spec, filepath.Join(dir, bid+".pid"), true, nil
+	fromTemplate, fromTemplateKind := "", ""
+	if b.FromTemplate != "" {
+		t, err := types.ParseTemplateID(b.FromTemplate)
+		if err != nil {
+			return nil, "", false, err
+		}
+		fromTemplate, fromTemplateKind = t.Key, string(t.Kind)
+	}
+
+	spec := &configsock.BuildSpec{
+		BuildID:          b.BuildID,
+		Workdir:          pend.workdir,
+		FromImage:        b.FromImage,
+		FromTemplate:     fromTemplate,
+		FromTemplateKind: fromTemplateKind,
+		Steps:            steps,
+		StartCmd:         b.StartCmd,
+		ReadyCmd:         b.ReadyCmd,
+		Env:              env,
+		Paths: configsock.BuildPaths{
+			Kernel:         o.cfg.Sandbox.Boot.Kernel,
+			RuntimeE2B:     o.cfg.Sandbox.Boot.RuntimeE2B,
+			RuntimeBuilder: o.cfg.Builder.RuntimeBuilder,
+			OverlayDiffTpl: o.cfg.Sandbox.Boot.OverlayDiffTemplate,
+			BuilderDiffTpl: o.cfg.Builder.DiffTemplate,
+			SandboxCtl:     o.cfg.SandboxCtl(),
+			FlattenCtl:     o.cfg.FlattenCtl(),
+			ManifestCtl:    o.cfg.ManifestCtl(),
+			ManifestConfig: o.cfg.ManifestConfig,
+		},
+		Net: configsock.BuildNet{
+			TapFDExec: pend.tapExec,
+			MAC:       pend.mac,
+			InnerIP:   pend.innerIP,
+			Nexthop:   o.innerGateway(types.ProfileE2B),
+			Hostname:  "build-" + shortID(b.BuildID),
+			DNS:       o.cfg.Sandbox.Network.DNS,
+		},
+		VCPU:        o.cfg.Builder.VCPU,
+		Memory:      o.cfg.Builder.Memory,
+		MMDSEnabled: o.cfg.MMDS.Enabled,
+		EnvdToken:   pend.envdToken,
+		Insecure:    o.cfg.Builder.InsecureRegistry,
+		Platform:    o.cfg.Builder.Platform,
+		Timeouts: configsock.BuildTimeouts{
+			PullSec:  o.cfg.Builder.PullTimeoutSec,
+			StepSec:  o.cfg.Builder.StepTimeoutSec,
+			ReadySec: o.cfg.Builder.ReadyTimeoutSec,
+			TotalSec: o.cfg.Builder.TotalTimeoutSec,
+		},
+	}
+	return spec, filepath.Join(pend.workdir, b.BuildID+".pid"), true, nil
 }
 
-// --- helpers ---
-
-// flattenConfigYAML renders the per-build flatten config (FLATTEN_CONFIG): the
-// idempotent OCI-Referrers flow keyed by the base image, with scratch + the
-// ephemeral blob cache under the build run dir (cleaned with the dir). Registry
-// pull settings (insecure HTTP, platform) come from the orchestrator config.
-func (o *Orchestrator) flattenConfigYAML(b *types.Build, runDir string) string {
-	var sb strings.Builder
-	fmt.Fprintf(&sb, "tmpdir: %q\n", runDir)
-	if o.cfg.Builder.InsecureRegistry {
-		sb.WriteString("insecure: true\n")
+// shortID returns the first 8 chars (hostname-friendly handle).
+func shortID(s string) string {
+	if len(s) > 8 {
+		return s[:8]
 	}
-	if o.cfg.Builder.Platform != "" {
-		fmt.Fprintf(&sb, "platform: %q\n", o.cfg.Builder.Platform)
-	}
-	fmt.Fprintf(&sb, "referer:\n  enabled: true\n  key: %q\n  desc: %q\n", b.FromImage, b.FromImage)
-	return sb.String()
+	return s
 }
 
 // imageURIFromMask renders builder_image_uri_mask with the build's templateID +

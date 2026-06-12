@@ -3,8 +3,9 @@
 计算节点上的单实例编排 daemon,对外提供 **e2b 兼容 API**:未改造的 e2b SDK/CLI 直接
 指向本机即可 create/exec/pause/resume/kill microVM 沙箱、构建自定义模板。一身兼 e2b
 的 **api + orchestrator + proxy** 三角色——控制面 REST(沙箱生命周期 + 模板构建 +
-鉴权)、经 systemd 模板单元驱动 `sandbox-ctl`/`flatten-ctl`、把数据面流量反代到
-guest 内**原版 envd**(49983/Connect-RPC,经 UDS)或 floatingip 用户端口。是
+鉴权)、经 systemd 模板单元驱动沙箱与构建(模板构建在**构建沙箱** microVM 内拉取
+镜像、执行 steps,三阶段流水线)、把数据面流量反代到 guest 内**原版 envd**
+(49983/Connect-RPC,经 UDS)或 floatingip 用户端口。是
 [kuasar-sandbox](https://github.com/kuasar-sandbox/kuasar-sandbox) 平台的北向入口,
 独立演进。
 
@@ -21,11 +22,11 @@ floatingip 网络)。不感知资源仲裁(准入在 `sandbox-ctl` 内部);叶�
 | `internal/api` | e2b 控制面 REST(X-API-KEY 鉴权、export/import 扩展) |
 | `internal/orch` | 编排核心:生命周期、构建池、路由权威、单元生成、重启对账 |
 | `internal/proxy` `internal/routetable` `internal/routesync` | 数据面 L7 反代、worker 本地路由表(park/wake)、serve↔worker 路由同步协议(帧化 JSON over h2c) |
-| `internal/configsock` | 本机控制 socket:task(LaunchSpec)/ admin(manifest-key)/ api 三平面,SO_PEERCRED 鉴权 |
+| `internal/configsock` | 本机控制 socket:task(LaunchSpec/BuildSpec)/ admin(manifest-key)/ api 三平面,SO_PEERCRED 鉴权 |
 | `internal/apikey` `internal/secretbox` `internal/keys` `internal/regcreds` | api_key 派生 MAC、manifest_key 落盘 AES-GCM、数据面 token、镜像拉取凭据 |
 | `internal/config` `internal/sandboxcfg` `internal/store` | 配置加载、SANDBOX_CONFIG 渲染、sqlite 状态(sandboxes/builds/manifest_keys) |
 | `internal/mmds` `internal/metrics` `internal/launcher` `internal/vswitch` | MMDS 元数据服务(envd re-key)、Prometheus 文本、systemd D-Bus、vswitch-ctl 封装 |
-| `deps/build-runtime-e2b.sh` | 把 envd 注入基础 runtime → `sandbox-runtime-e2b.erofs`(确定性重打 + 2MiB 对齐) |
+| `deps/build-runtime-e2b.sh` `deps/build-runtime-builder.sh` | 把 envd(+构建工具链 flatten-ctl/mkfs.erofs)注入基础 runtime → `sandbox-runtime-{e2b,builder}.erofs`(确定性重打 + 2MiB 对齐) |
 | `deploy/` | 配置样例与 systemd 单元(`orchestrator-ctl.service`、`orchestrator-proxy@.service`) |
 
 ## 构建
@@ -34,6 +35,7 @@ floatingip 网络)。不感知资源仲裁(准入在 `sandbox-ctl` 内部);叶�
 make build                      # bin/<arch>/{orchestrator-ctl,e2b-key-ctl};纯 Go,CGO_ENABLED=0
 make build TARGET_ARCH=aarch64  # 交叉编译(别名 amd64 / arm64)
 make sandbox-runtime-e2b        # 注入 envd 的 guest runtime(需 sandbox-deps 的 envd/fsck.erofs/mkfs.erofs)
+make sandbox-runtime-builder    # 构建沙箱 guest runtime(e2b flavor + flatten-ctl + mkfs.erofs)
 make test                       # 单元测试;e2e 见 docs/orchestrator.md §15
 ```
 

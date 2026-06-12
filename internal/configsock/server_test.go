@@ -25,6 +25,13 @@ func (s stubProvider) LaunchSpecFor(_ context.Context, id string) (*LaunchSpec, 
 	return &LaunchSpec{Exec: "/bin/true", Args: []string{"a"}}, s.pidFile, true, nil
 }
 
+func (s stubProvider) BuildSpecFor(_ context.Context, id string) (*BuildSpec, string, bool, error) {
+	if id != "build:x" {
+		return nil, "", false, nil
+	}
+	return &BuildSpec{BuildID: "x", Workdir: "/tmp"}, s.pidFile, true, nil
+}
+
 type stubAdmin struct{ keys map[string]string }
 
 func (a *stubAdmin) AddManifestKey(_ context.Context, key, label string, _ int64, _ string) (bool, string, error) {

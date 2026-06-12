@@ -48,6 +48,9 @@ type Orchestrator struct {
 	subsMu sync.Mutex
 	subs   map[int]chan routesync.Event // route-change subscribers (routesync clients)
 	subSeq int
+
+	pendMu sync.Mutex
+	pend   map[string]*pendingBuild // builds whose unit is running (BuildSpecFor source)
 }
 
 func New(cfg *config.Config, st *store.Store, lc launcher.Launcher, vs *vswitch.CLI, log *slog.Logger) *Orchestrator {
@@ -55,6 +58,7 @@ func New(cfg *config.Config, st *store.Store, lc launcher.Launcher, vs *vswitch.
 		cfg: cfg, st: st, lc: lc, vs: vs, log: log,
 		reg:  map[string]*types.Sandbox{},
 		subs: map[int]chan routesync.Event{},
+		pend: map[string]*pendingBuild{},
 	}
 }
 
@@ -147,7 +151,18 @@ func (o *Orchestrator) launch(ctx context.Context, sb *types.Sandbox, tmpl types
 	}
 	sb.VswitchPort, sb.FloatingIP, sb.PortMAC, sb.InnerIP = port.Port, port.FloatingIP, port.MAC, cidrIP
 
-	if err := o.sandboxParams(sb, tmpl, ov).WriteYAML(o.sandboxConfigPath(sb)); err != nil {
+	p := o.sandboxParams(sb, tmpl, ov)
+	// A restore must declare the exact capacity the snapshot froze —
+	// snapshot.cfg is authoritative and the runtime refuses a mismatch
+	// rather than resize a resumed VM. Template snapshots are self-
+	// describing and may have been taken at a different budget than this
+	// node's create defaults (e.g. the build pipeline's builder.vcpu/memory).
+	if ref := p.RestoreRef(); ref != "" {
+		if cpu, mem, ok := o.snapshotCapacity(ctx, sb, ref); ok {
+			p.VCPU, p.Memory = cpu, mem
+		}
+	}
+	if err := p.WriteYAML(o.sandboxConfigPath(sb)); err != nil {
 		return err
 	}
 	if err := o.st.Put(ctx, sb); err != nil {
@@ -359,6 +374,38 @@ func (o *Orchestrator) resumeIfPaused(ctx context.Context, sid string) error {
 	return o.resume(ctx, sb)
 }
 
+// snapshotCapacity reads resources.capacity from a snapshot ref's embedded
+// snapshot.cfg (`sandbox-ctl info --json`; reads only the trailing ZIP, a few
+// KB even via manifest://). Returns ok=false on any failure — the launch then
+// proceeds with the node defaults and the runtime stays the enforcer.
+func (o *Orchestrator) snapshotCapacity(ctx context.Context, sb *types.Sandbox, ref string) (int, string, bool) {
+	args := []string{"info", "--json"}
+	if strings.HasPrefix(ref, "manifest://") {
+		args = append(args, "--manifest-config", o.cfg.ManifestConfig)
+	}
+	cmd := exec.CommandContext(ctx, o.cfg.SandboxCtl(), append(args, ref)...)
+	cmd.Env = append(os.Environ(), "MANIFEST_KEY="+sb.ManifestKey)
+	out, err := cmd.Output()
+	if err != nil {
+		o.log.Warn("snapshot capacity probe failed; using node defaults", "sid", sb.ID, "ref", ref, "err", err)
+		return 0, "", false
+	}
+	var cfg struct {
+		Resources struct {
+			Capacity struct {
+				CPU    int    `json:"CPU"`
+				Memory string `json:"Memory"`
+			} `json:"Capacity"`
+		} `json:"Resources"`
+	}
+	if err := json.Unmarshal(out, &cfg); err != nil ||
+		cfg.Resources.Capacity.CPU <= 0 || cfg.Resources.Capacity.Memory == "" {
+		o.log.Warn("snapshot capacity parse failed; using node defaults", "sid", sb.ID, "ref", ref, "err", err)
+		return 0, "", false
+	}
+	return cfg.Resources.Capacity.CPU, cfg.Resources.Capacity.Memory, true
+}
+
 // --- configsock.Provider ---
 
 // sandboxConfigPath is where the per-sandbox SANDBOX_CONFIG yaml is written.
@@ -395,9 +442,7 @@ func (o *Orchestrator) LaunchSpecFor(ctx context.Context, configID string) (*con
 	switch kind {
 	case "sandbox":
 		return o.sandboxLaunchSpec(ctx, id)
-	case "build":
-		return o.buildLaunchSpec(ctx, id)
-	default:
+	default: // builds use the buildspec plane (BuildSpecFor), not exec-replace
 		return nil, "", false, nil
 	}
 }

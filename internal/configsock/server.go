@@ -38,6 +38,7 @@ import (
 // never uses); every other path falls through to the api handler.
 const (
 	PathTaskLaunchSpec   = "/internal/task/launchspec"
+	PathTaskBuildSpec    = "/internal/task/buildspec"
 	PathAdminManifestKey = "/internal/admin/manifest-keys"
 )
 
@@ -63,6 +64,75 @@ type LaunchSpec struct {
 // authenticate the caller (SO_PEERCRED). ok=false means the id is unknown.
 type Provider interface {
 	LaunchSpecFor(ctx context.Context, configID string) (resp *LaunchSpec, pidFile string, ok bool, err error)
+	// BuildSpecFor resolves "build:<bid>" to the build pipeline spec the
+	// run-builder orchestrates (it does NOT exec-replace — the spec is a
+	// work order, not a launch).
+	BuildSpecFor(ctx context.Context, configID string) (resp *BuildSpec, pidFile string, ok bool, err error)
+}
+
+// BuildSpec is the work order orchestrator-ctl run-builder fetches for
+// "build:<bid>": everything the three-phase pipeline (import → steps →
+// template snapshot) needs. Secrets (manifest key, tenant registry
+// creds) ride here over the socket, never on disk.
+type BuildSpec struct {
+	BuildID          string            `json:"build_id"`
+	Workdir          string            `json:"workdir"` // build scratch dir (artifacts, run roots)
+	FromImage        string            `json:"from_image,omitempty"`
+	FromTemplate     string            `json:"from_template,omitempty"` // snapshot manifest key (hex) of the base template
+	FromTemplateKind string            `json:"from_template_kind,omitempty"`
+	Steps            []BuildStep       `json:"steps,omitempty"`
+	StartCmd         string            `json:"start_cmd,omitempty"`
+	ReadyCmd         string            `json:"ready_cmd,omitempty"`
+	Env              map[string]string `json:"env,omitempty"` // secret env: MANIFEST_KEY + FLATTEN_REGISTRY_* (guest exec gets only the FLATTEN_* subset)
+	Paths            BuildPaths        `json:"paths"`
+	Net              BuildNet          `json:"net"`
+	VCPU             int               `json:"vcpu"`
+	Memory           string            `json:"memory"`
+	MMDSEnabled      bool              `json:"mmds_enabled"`
+	EnvdToken        string            `json:"envd_token,omitempty"` // phase C envd /init token (mmds posture)
+	Insecure         bool              `json:"insecure,omitempty"`   // registry plain-HTTP/skip-TLS
+	Platform         string            `json:"platform,omitempty"`
+	Timeouts         BuildTimeouts     `json:"timeouts"`
+	Error            string            `json:"error,omitempty"`
+}
+
+// BuildStep mirrors types.TemplateStep (kept dependency-free here).
+type BuildStep struct {
+	Type string   `json:"type"`
+	Args []string `json:"args,omitempty"`
+}
+
+// BuildPaths is every host artifact/binary path the pipeline shells out to.
+type BuildPaths struct {
+	Kernel         string `json:"kernel"`
+	RuntimeE2B     string `json:"runtime_e2b"`     // phase C (production flavor — frozen into the template)
+	RuntimeBuilder string `json:"runtime_builder"` // phases A/B (toolchain flavor)
+	OverlayDiffTpl string `json:"overlay_diff_tpl"`
+	BuilderDiffTpl string `json:"builder_diff_tpl"`
+	SandboxCtl     string `json:"sandbox_ctl"`
+	FlattenCtl     string `json:"flatten_ctl"` // host-side: info --json over local artifacts
+	ManifestCtl    string `json:"manifest_ctl"`
+	ManifestConfig string `json:"manifest_config"`
+}
+
+// BuildNet is the ONE pre-attached vswitch slot the build's phase
+// sandboxes reuse sequentially (the tapfd handoff re-acquires the same
+// port's queue fd each boot).
+type BuildNet struct {
+	TapFDExec []string `json:"tapfd_exec"`
+	MAC       string   `json:"mac"`
+	InnerIP   string   `json:"inner_ip"` // CIDR
+	Nexthop   string   `json:"nexthop"`
+	Hostname  string   `json:"hostname"`
+	DNS       []string `json:"dns,omitempty"`
+}
+
+// BuildTimeouts are per-phase budgets in seconds.
+type BuildTimeouts struct {
+	PullSec  int `json:"pull_sec"`
+	StepSec  int `json:"step_sec"`
+	ReadySec int `json:"ready_sec"`
+	TotalSec int `json:"total_sec"`
 }
 
 // AdminKeyInfo is one manifest-key allowlist entry (fingerprint only — never the key).
@@ -165,6 +235,7 @@ func (s *Server) Serve(ctx context.Context) error {
 func (s *Server) router() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST "+PathTaskLaunchSpec, s.handleTask)
+	mux.HandleFunc("POST "+PathTaskBuildSpec, s.handleBuildTask)
 	mux.HandleFunc(PathAdminManifestKey, s.handleAdminKeys) // GET=list, POST=add/remove/check
 	// Everything else is the api plane (e2b control plane + export/import), authed
 	// by X-API-KEY inside the api handler. The "/internal/" routes above are more
@@ -200,6 +271,36 @@ func (s *Server) handleTask(w http.ResponseWriter, r *http.Request) {
 	}
 	if !s.taskAuthed(req.ConfigID, pidFile, peer) {
 		writeJSON(w, http.StatusForbidden, &LaunchSpec{Error: "not authorized"})
+		return
+	}
+	writeJSON(w, http.StatusOK, spec)
+}
+
+// handleBuildTask serves the build-spec plane: same auth as handleTask
+// (SO_PEERCRED pid == the build's pidfile), different payload.
+func (s *Server) handleBuildTask(w http.ResponseWriter, r *http.Request) {
+	peer, ok := peerFrom(r.Context())
+	if !ok {
+		writeJSON(w, http.StatusForbidden, &BuildSpec{Error: "no peer credentials"})
+		return
+	}
+	var req Request
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ConfigID == "" {
+		writeJSON(w, http.StatusBadRequest, &BuildSpec{Error: "bad request"})
+		return
+	}
+	spec, pidFile, found, err := s.deps.Provider.BuildSpecFor(r.Context(), req.ConfigID)
+	if err != nil {
+		s.log.Warn("configsock build provider", "id", req.ConfigID, "err", err)
+		writeJSON(w, http.StatusInternalServerError, &BuildSpec{Error: "internal error"})
+		return
+	}
+	if !found {
+		writeJSON(w, http.StatusNotFound, &BuildSpec{Error: "unknown build"})
+		return
+	}
+	if !s.taskAuthed(req.ConfigID, pidFile, peer) {
+		writeJSON(w, http.StatusForbidden, &BuildSpec{Error: "not authorized"})
 		return
 	}
 	writeJSON(w, http.StatusOK, spec)

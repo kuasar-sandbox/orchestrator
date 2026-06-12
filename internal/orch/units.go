@@ -15,9 +15,10 @@ import (
 //   - <runner>  (sandbox-runner@.service): one microVM sandbox; also runs snapshot
 //     builds. ExecStart=orchestrator-ctl run-sandbox (exec-replaces into sandbox-ctl
 //     run), config pulled over the config-socket.
-//   - <builder> (sandbox-builder@.service): one image build. ExecStart=orchestrator-ctl
-//     run-builder, which pulls the build LaunchSpec (exec=flatten-ctl, MANIFEST_KEY in
-//     env) over the config-socket and exec-replaces into flatten-ctl.
+//   - <builder> (sandbox-builder@.service): one template build. ExecStart=orchestrator-ctl
+//     run-builder, which pulls the BuildSpec (MANIFEST_KEY + tenant registry creds in
+//     env) over the config-socket and drives the three-phase pipeline itself
+//     (import/steps/template sandboxes as direct children; result JSON on stdout).
 //
 // Both run in their own cgroup (KillMode=control-group / a dedicated slice) so the
 // reaper and the builder resource pool can account and reclaim them.
@@ -83,19 +84,20 @@ Description=kuasar image build %%i
 [Service]
 Type=oneshot
 WorkingDirectory=%s/%%i
-# flatten-ctl's stdout (the 64-hex manifest key) is captured here for the orchestrator.
-# StandardError=journal keeps flatten-ctl's progress/errors OUT of the result file
+# run-builder's stdout (the result JSON) is captured here for the orchestrator.
+# StandardError=journal keeps pipeline progress/errors OUT of the result file
 # (StandardError defaults to inherit, which would mirror stdout into the file).
 StandardOutput=file:%s/%%i/%%i.result
 StandardError=journal
-# run-builder pulls the build launch spec (exec=flatten-ctl, MANIFEST_KEY in env) over
-# the config-socket and exec-replaces into flatten-ctl (no on-disk secret). Runs in
-# this unit's cgroup under sandbox-builder.slice (pool accounting).
+# run-builder pulls the BuildSpec (secrets in env, never on disk) over the
+# config-socket and drives the three-phase pipeline itself — its phase
+# sandboxes (sandbox-ctl run + cloud-hypervisor) are direct children, so the
+# whole build accounts to this unit's cgroup under sandbox-builder.slice.
 ExecStart=%s run-builder --pidfile=%s/%%i/%%i.pid --config-socket=%s --build-id=%%i
-TimeoutStartSec=1800
+TimeoutStartSec=%d
 KillMode=control-group
 Slice=sandbox-builder.slice
-`, o.cfg.Paths.RunRoot, o.cfg.Paths.RunRoot, o.cfg.OrchestratorCtl(), o.cfg.Paths.RunRoot, o.cfg.Paths.ConfigSocket)
+`, o.cfg.Paths.RunRoot, o.cfg.Paths.RunRoot, o.cfg.OrchestratorCtl(), o.cfg.Paths.RunRoot, o.cfg.Paths.ConfigSocket, o.cfg.Builder.TotalTimeoutSec+60)
 }
 
 func sliceFile(desc, caps string) string {

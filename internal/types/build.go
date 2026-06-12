@@ -39,6 +39,18 @@ func (s BuildState) SDKStatus() string {
 	}
 }
 
+// TemplateStep is one e2b v2 build step (TemplateStep in the e2b API):
+// RUN executes in the build sandbox; ENV/ARG/WORKDIR/USER are host-side
+// build-context transforms (ENV/WORKDIR/USER persist into the image's
+// runtime config, ARG only substitutes). COPY is rejected at submit
+// until the files endpoint exists.
+type TemplateStep struct {
+	Type      string   `json:"type"`
+	Args      []string `json:"args,omitempty"`
+	FilesHash string   `json:"filesHash,omitempty"`
+	Force     bool     `json:"force,omitempty"`
+}
+
 // Build is one template build, doubling as the template record.
 type Build struct {
 	BuildID     string  // e2b build id (uuidv7)
@@ -47,9 +59,12 @@ type Build struct {
 	ManifestKey string  // per-tenant manifest key (hex); ownership + crypto root
 	Profile     Profile // e2b (API builds are always e2b)
 	Kind        Kind    // img (flatten only) | snp (boot+snapshot)
-	FromImage    string // OCI base image (the Dockerfile FROM)
+	FromImage    string // OCI base image (the Dockerfile FROM); mutually exclusive with FromTemplate
+	FromTemplate string // base template ref (its snapshot cfg supplies the base image + start/ready defaults)
 	RegistryAuth string // resolved registry pull creds (regcreds.Creds JSON; "" = anonymous), stored encrypted
 	StartCmd     string // non-empty => snapshot build (kind=snp)
+	ReadyCmd     string // readiness probe run after StartCmd (poll until exit 0)
+	Steps        []TemplateStep
 	Status       BuildState
 	Reason      string   // error detail
 	Names       []string // user-supplied name(s) + persist id (when ready)

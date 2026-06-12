@@ -43,6 +43,15 @@ type BuildAuth struct {
 	RegistryPassword string
 }
 
+// TriggerSpec is the parsed build request (e2b TemplateBuildStartV2).
+type TriggerSpec struct {
+	FromImage    string
+	FromTemplate string
+	Steps        []types.TemplateStep
+	StartCmd     string
+	ReadyCmd     string
+}
+
 // CreateReq is the decoded POST /sandboxes body (subset the SDK sends).
 type CreateReq struct {
 	TemplateID string            `json:"templateID"`
@@ -71,7 +80,7 @@ type Core interface {
 	// fromImage + fromImageRegistry + steps) → GET …/status (poll). The node pulls +
 	// flattens the named image server-side — no client-side docker build/push.
 	RegisterBuild(ctx context.Context, apiKey, name string, tags []string) (*types.Build, error)
-	TriggerBuild(ctx context.Context, apiKey, templateID, buildID, fromImage, startCmd string, auth BuildAuth) error
+	TriggerBuild(ctx context.Context, apiKey, templateID, buildID string, spec TriggerSpec, auth BuildAuth) error
 	BuildStatus(ctx context.Context, apiKey, templateID, buildID string) (*types.Build, error)
 	ListTemplates(ctx context.Context, apiKey string) ([]*types.Build, error)
 
@@ -119,6 +128,7 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("POST /v3/templates", a.auth(a.registerTemplate))
 	mux.HandleFunc("POST /v2/templates/{tid}/builds/{bid}", a.auth(a.triggerBuild))
 	mux.HandleFunc("GET /templates/{tid}/builds/{bid}/status", a.auth(a.buildStatus))
+	mux.HandleFunc("GET /templates/{tid}/files/{hash}", a.auth(a.buildFiles))
 	mux.HandleFunc("GET /templates", a.auth(a.listTemplates))
 	// Sandbox export / import (orchestrator extension; api-key authed like the rest,
 	// so it scopes to the caller's own sandboxes). Reached over both the TLS api
@@ -292,15 +302,19 @@ func (a *API) triggerBuild(w http.ResponseWriter, r *http.Request) {
 	// fromImage is empty the orchestrator derives it from builder_image_uri_mask.
 	var body struct {
 		FromImage         string `json:"fromImage"`
+		FromTemplate      string `json:"fromTemplate"`
 		FromImageRegistry struct {
 			Username string `json:"username"`
 			Password string `json:"password"`
 		} `json:"fromImageRegistry"`
-		StartCmd     string `json:"startCmd"`
-		StartCmdE2B  string `json:"start_cmd"`
-		ReadyCmd     string `json:"ready_cmd"`
-		Dockerfile   string `json:"dockerfile"`
-		TemplateName string `json:"template_name"`
+		Steps        []types.TemplateStep `json:"steps"`
+		Force        bool                 `json:"force"`
+		StartCmd     string               `json:"startCmd"`
+		StartCmdE2B  string               `json:"start_cmd"`
+		ReadyCmd     string               `json:"readyCmd"`
+		ReadyCmdE2B  string               `json:"ready_cmd"`
+		Dockerfile   string               `json:"dockerfile"`
+		TemplateName string               `json:"template_name"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeErr(w, 400, "bad body")
@@ -310,18 +324,43 @@ func (a *API) triggerBuild(w http.ResponseWriter, r *http.Request) {
 	if startCmd == "" {
 		startCmd = body.StartCmdE2B
 	}
+	readyCmd := body.ReadyCmd
+	if readyCmd == "" {
+		readyCmd = body.ReadyCmdE2B
+	}
+	// COPY needs the build-files upload flow (the files endpoint below);
+	// reject at submit so the build fails fast and clearly.
+	for _, s := range body.Steps {
+		if strings.EqualFold(s.Type, "COPY") {
+			writeErr(w, 501, "COPY steps are not supported yet (build file uploads unavailable)")
+			return
+		}
+	}
 	auth := BuildAuth{
 		PullToken:        r.Header.Get(PullTokenHeader),
 		RegistryUsername: body.FromImageRegistry.Username,
 		RegistryPassword: body.FromImageRegistry.Password,
 	}
 	err := a.core.TriggerBuild(r.Context(), apiKeyFrom(r.Context()),
-		r.PathValue("tid"), r.PathValue("bid"), body.FromImage, startCmd, auth)
+		r.PathValue("tid"), r.PathValue("bid"), TriggerSpec{
+			FromImage:    body.FromImage,
+			FromTemplate: body.FromTemplate,
+			Steps:        body.Steps,
+			StartCmd:     startCmd,
+			ReadyCmd:     readyCmd,
+		}, auth)
 	if err != nil {
 		a.fail(w, err)
 		return
 	}
 	w.WriteHeader(202)
+}
+
+// buildFiles is the e2b v2 build-files endpoint (COPY sources by hash).
+// Not implemented: report so loudly — the trigger path also rejects COPY
+// steps at submit.
+func (a *API) buildFiles(w http.ResponseWriter, r *http.Request) {
+	writeErr(w, 501, "build file uploads are not supported yet")
 }
 
 func (a *API) buildStatus(w http.ResponseWriter, r *http.Request) {
