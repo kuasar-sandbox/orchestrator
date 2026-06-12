@@ -13,16 +13,25 @@ package main
 //	             network, flattens, and streams the tarstream image artifact
 //	             back over exec stdio.
 //	B steps    — an e2b-shaped sandbox whose root is the (local or template)
-//	             base image; RUN steps execute via sandbox-ctl exec with the
-//	             accumulated ENV/WORKDIR/USER context (ARG substitutes only);
-//	             then flatten-ctl exports the rootfs (its tmpdir/output home
-//	             is a self-bind mountpoint, excluded by --skip-mounts) and
-//	             streams the new image artifact back.
+//	             base image, with envd as the app; RUN steps execute THROUGH
+//	             ENVD (the e2b exec channel, envdExec) with the accumulated
+//	             ENV/WORKDIR/USER context seeded from the base image config
+//	             (ARG substitutes only); then flatten-ctl exports the rootfs
+//	             (its tmpdir/output home is a self-bind mountpoint, excluded
+//	             by --skip-mounts) and streams the new image artifact back.
 //	C template — a PRODUCTION-runtime sandbox cold-booted from the final
 //	             image (the runtime ref freezes into the snapshot — template
 //	             children must not inherit the builder toolchain); startCmd
-//	             launches detached in-guest, readyCmd polls to success, then
-//	             sandbox-ctl snapshot writes the local bundle.
+//	             launches THROUGH ENVD and stays an envd-MANAGED process in
+//	             the snapshot (the stream is held until ready, then dropped
+//	             — envd never kills on stream loss), readyCmd polls every 2s
+//	             to success, then sandbox-ctl snapshot writes the bundle.
+//
+// Two guest channels, deliberately distinct: e2b-SEMANTIC commands
+// (steps/startCmd/readyCmd) go through envd exactly as e2b's own template
+// build does; PLATFORM plumbing (flatten-ctl pulls/exports, config
+// injection, artifact streaming, probes) goes through sandbox-ctl exec,
+// which works on any rootfs and carries raw stdio.
 //
 // The finale uploads what was produced — platform credentials appear ONLY
 // here: an image-only build runs `manifest-ctl store image.img`; a snapshot
@@ -44,6 +53,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -257,7 +267,9 @@ func (p *buildPipeline) tenantEnv() []string {
 
 // --- phase B: steps --------------------------------------------------------
 
-// stepCtx is the Dockerfile-ish build context the host accumulates.
+// stepCtx is the Dockerfile-ish build context the host accumulates,
+// seeded from the base image's runtime config — RUN must see the image's
+// ENV/WORKDIR/USER exactly as `docker build` would.
 type stepCtx struct {
 	env     map[string]string // ENV: persisted into the image config
 	args    map[string]string // ARG: substitution only
@@ -265,20 +277,50 @@ type stepCtx struct {
 	user    string
 }
 
+func stepCtxFrom(base map[string]any) *stepCtx {
+	c := &stepCtx{env: map[string]string{}, args: map[string]string{}}
+	if envs, ok := base["Env"].([]any); ok {
+		for _, e := range envs {
+			if s, ok := e.(string); ok {
+				if k, v, ok := strings.Cut(s, "="); ok {
+					c.env[k] = v
+				}
+			}
+		}
+	}
+	if wd, ok := base["WorkingDir"].(string); ok {
+		c.workdir = wd
+	}
+	if u, ok := base["User"].(string); ok {
+		c.user = u
+	}
+	return c
+}
+
 func (p *buildPipeline) phaseSteps() error {
 	s := p.spec
-	sb, err := p.startSandbox("b", p.stepsYAML(), nil)
+	baseCfg, err := p.readBaseRuntimeConfig()
+	if err != nil {
+		return err
+	}
+	ctxv := stepCtxFrom(baseCfg)
+
+	envdUDS := filepath.Join(s.Workdir, "envd-steps.sock")
+	sb, err := p.startSandbox("b", p.stepsYAML(),
+		[]string{envdUDS + ":127.0.0.1:49983"})
 	if err != nil {
 		return err
 	}
 	defer sb.teardown()
-	if err := sb.waitExecReady(p.ctx, 90*time.Second); err != nil {
+	if err := p.waitEnvd(envdUDS, 90*time.Second); err != nil {
 		return err
 	}
 
-	ctxv := &stepCtx{env: map[string]string{}, args: map[string]string{}}
+	// RUN steps go through envd — the e2b exec channel (the step sandbox's
+	// envd is a plain build tool: -isnotfc, never /init-armed, no token).
+	sess := &envdExec{uds: envdUDS, log: p.log}
 	for i, st := range s.Steps {
-		if err := p.applyStep(sb, ctxv, i, st); err != nil {
+		if err := p.applyStep(sess, ctxv, i, st); err != nil {
 			return err
 		}
 	}
@@ -288,7 +330,7 @@ func (p *buildPipeline) phaseSteps() error {
 	if err := sb.exec(p.ctx, execOpts{}, guestFlatten, "mountpoint", "/.kuasar-build"); err != nil {
 		return fmt.Errorf("mountpoint: %w", err)
 	}
-	cfgJSON, err := p.mergedRuntimeConfig(ctxv)
+	cfgJSON, err := mergedRuntimeConfig(baseCfg, ctxv)
 	if err != nil {
 		return err
 	}
@@ -318,9 +360,11 @@ func (p *buildPipeline) phaseSteps() error {
 	return nil
 }
 
-// applyStep executes one build step. RUN goes to the guest; the rest
+// applyStep executes one build step. RUN goes to the guest through envd
+// (the e2b exec channel: /bin/bash -l -c with the accumulated context;
+// docker defaults — root, "/" — when the context has none); the rest
 // transform the host-side context.
-func (p *buildPipeline) applyStep(sb *phaseSandbox, c *stepCtx, i int, st configsock.BuildStep) error {
+func (p *buildPipeline) applyStep(sess *envdExec, c *stepCtx, i int, st configsock.BuildStep) error {
 	sub := func(v string) string { // ARG/ENV ${k} substitution
 		for k, val := range c.args {
 			v = strings.ReplaceAll(v, "${"+k+"}", val)
@@ -344,14 +388,15 @@ func (p *buildPipeline) applyStep(sb *phaseSandbox, c *stepCtx, i int, st config
 	case "RUN":
 		cmd := sub(strings.Join(st.Args, " "))
 		p.log.Info("step", "n", i, "run", cmd)
-		var env []string
-		for k, v := range c.env {
-			env = append(env, k+"="+v)
+		user, cwd := c.user, c.workdir
+		if user == "" {
+			user = "root"
 		}
-		ctx, cancel := context.WithTimeout(p.ctx, time.Duration(p.spec.Timeouts.StepSec)*time.Second)
-		defer cancel()
-		opts := execOpts{env: env, cwd: c.workdir, user: c.user}
-		if err := sb.exec(ctx, opts, "/bin/sh", "-c", cmd); err != nil {
+		if cwd == "" {
+			cwd = "/"
+		}
+		stepBudget := time.Duration(p.spec.Timeouts.StepSec) * time.Second
+		if err := sess.run(p.ctx, user, cwd, c.env, cmd, stepBudget, false); err != nil {
 			return fmt.Errorf("step %d (RUN %s): %w", i, cmd, err)
 		}
 	case "ENV":
@@ -378,10 +423,10 @@ func (p *buildPipeline) applyStep(sb *phaseSandbox, c *stepCtx, i int, st config
 	return nil
 }
 
-// mergedRuntimeConfig reads the base image's runtime config (through the
-// artifact or the manifest store) and overlays the accumulated
-// ENV/WORKDIR/USER.
-func (p *buildPipeline) mergedRuntimeConfig(c *stepCtx) ([]byte, error) {
+// readBaseRuntimeConfig reads the base image's runtime config (through
+// the local artifact or the manifest store). It both seeds the step
+// context and is the base the exported config merges onto.
+func (p *buildPipeline) readBaseRuntimeConfig() (map[string]any, error) {
 	target := p.baseRef
 	if p.imagePath != "" {
 		target = p.imagePath
@@ -402,23 +447,30 @@ func (p *buildPipeline) mergedRuntimeConfig(c *stepCtx) ([]byte, error) {
 	if err := json.Unmarshal(out, &info); err != nil {
 		return nil, fmt.Errorf("parse base runtime config: %w", err)
 	}
-	cfg := info.Config
-	if cfg == nil {
-		cfg = map[string]any{}
+	if info.Config == nil {
+		return map[string]any{}, nil
+	}
+	return info.Config, nil
+}
+
+// mergedRuntimeConfig overlays the accumulated context onto the base
+// config for the exported image. The step context was seeded from the
+// base, so its env is the full set; emit it sorted — map order would
+// make the artifact (and its manifest key) nondeterministic.
+func mergedRuntimeConfig(base map[string]any, c *stepCtx) ([]byte, error) {
+	cfg := make(map[string]any, len(base))
+	for k, v := range base {
+		cfg[k] = v
 	}
 	if len(c.env) > 0 {
-		var envs []string
-		if cur, ok := cfg["Env"].([]any); ok {
-			for _, e := range cur {
-				if s, ok := e.(string); ok {
-					if k, _, ok := strings.Cut(s, "="); !ok || c.env[k] == "" {
-						envs = append(envs, s)
-					}
-				}
-			}
+		keys := make([]string, 0, len(c.env))
+		for k := range c.env {
+			keys = append(keys, k)
 		}
-		for k, v := range c.env {
-			envs = append(envs, k+"="+v)
+		sort.Strings(keys)
+		envs := make([]string, 0, len(keys))
+		for _, k := range keys {
+			envs = append(envs, k+"="+c.env[k])
 		}
 		cfg["Env"] = envs
 	}
@@ -450,42 +502,49 @@ func (p *buildPipeline) phaseTemplate() (string, error) {
 		return "", fmt.Errorf("envd /init: %w", err)
 	}
 
-	// startCmd: detached in-guest (nohup + redirect — no host-side stdio
-	// coupling survives into the snapshot), e2b defaults (user "user",
-	// /home/user).
-	esc := strings.ReplaceAll(p.startCmd, "'", `'\''`)
-	start := fmt.Sprintf("nohup /bin/sh -lc '%s' >/tmp/.kuasar-start.log 2>&1 &", esc)
+	// startCmd through envd, the e2b way: launch, hold the stream while
+	// readiness is probed, then drop it — envd never kills a process for
+	// a lost stream, so the snapshot freezes it as an envd-MANAGED
+	// process (visible/connectable from sandboxes spawned off the
+	// template). e2b defaults: user "user", /home/user.
+	sess := &envdExec{uds: envdUDS, log: p.log}
+	if s.MMDSEnabled && s.EnvdToken != "" {
+		sess.token = s.EnvdToken // /init armed envd; RPCs need the token now
+	}
 	p.log.Info("template: starting", "cmd", p.startCmd)
-	if err := sb.exec(p.ctx, execOpts{user: "user", cwd: "/home/user"},
-		"/bin/sh", "-c", start); err != nil {
+	sc, err := sess.start(p.ctx, "user", "/home/user", nil, p.startCmd)
+	if err != nil {
 		return "", fmt.Errorf("startCmd: %w", err)
 	}
 
-	// readyCmd: poll to success; without one, settle for a fixed wait.
-	if p.readyCmd != "" {
-		deadline := time.Now().Add(time.Duration(s.Timeouts.ReadySec) * time.Second)
-		for {
-			err := sb.exec(p.ctx, execOpts{user: "user", cwd: "/home/user"},
-				"/bin/sh", "-lc", p.readyCmd)
-			if err == nil {
-				break
-			}
-			if time.Now().After(deadline) {
-				return "", fmt.Errorf("readyCmd never succeeded within %ds: %w", s.Timeouts.ReadySec, err)
-			}
-			select {
-			case <-p.ctx.Done():
-				return "", p.ctx.Err()
-			case <-time.After(time.Second):
-			}
+	// readyCmd: poll every 2s within the ready budget (e2b semantics; the
+	// default when a start command exists is e2b's `sleep 20`).
+	ready := p.readyCmd
+	if ready == "" {
+		ready = "sleep 20"
+	}
+	deadline := time.Now().Add(time.Duration(s.Timeouts.ReadySec) * time.Second)
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			_ = sc.stop()
+			return "", fmt.Errorf("readyCmd never succeeded within %ds", s.Timeouts.ReadySec)
 		}
-		p.log.Info("template: ready")
-	} else {
+		if err := sess.run(p.ctx, "user", "/home/user", nil, ready, remaining, true); err == nil {
+			break
+		}
 		select {
 		case <-p.ctx.Done():
+			_ = sc.stop()
 			return "", p.ctx.Err()
-		case <-time.After(10 * time.Second):
+		case <-time.After(2 * time.Second):
 		}
+	}
+	p.log.Info("template: ready")
+	// Release the stream; a start command that already FAILED fails the
+	// build (a clean early exit is fine — one-shot start commands).
+	if err := sc.stop(); err != nil {
+		return "", err
 	}
 
 	out, err := p.hostCmdEnv(s.Env, s.Paths.SandboxCtl, "snapshot",
@@ -680,13 +739,15 @@ func (sb *phaseSandbox) waitExecReady(ctx context.Context, timeout time.Duration
 	}
 }
 
+// execOpts shapes a sandbox-ctl exec invocation — the PLATFORM channel
+// (flatten-ctl pulls/exports, config injection, artifact streaming,
+// probes). e2b-semantic commands (steps/startCmd/readyCmd) go through
+// envd instead (envdExec).
 type execOpts struct {
-	env       []string // KEY=VALUE pairs forwarded as --env
-	cwd       string
-	user      string
-	stdoutTo  string // write command stdout to this host file (artifact streaming)
-	stdinFrom string // feed command stdin from this host file
-	quiet     bool   // suppress stderr (readiness probes)
+	env       []string // KEY=VALUE pairs forwarded as --env (tenant FLATTEN_*)
+	stdoutTo  string   // write command stdout to this host file (artifact streaming)
+	stdinFrom string   // feed command stdin from this host file
+	quiet     bool     // suppress stderr (readiness probes)
 }
 
 // exec runs one command in the guest via sandbox-ctl exec and returns the
@@ -695,12 +756,6 @@ func (sb *phaseSandbox) exec(ctx context.Context, o execOpts, argv ...string) er
 	args := []string{"exec", "--sandbox-id", sb.sid, "--run-root", sb.runRoot}
 	for _, e := range o.env {
 		args = append(args, "--env", e)
-	}
-	if o.cwd != "" {
-		args = append(args, "--cwd", o.cwd)
-	}
-	if o.user != "" {
-		args = append(args, "--user", o.user)
 	}
 	if o.stdoutTo != "" {
 		args = append(args, "--stdout-to", o.stdoutTo)
@@ -802,8 +857,11 @@ func (p *buildPipeline) importYAML() map[string]any {
 }
 
 // stepsYAML: the base image as root, a big writable upper (steps delta +
-// export scratch), the builder runtime for the toolchain, a placeholder
-// anchor (steps run via exec sessions).
+// export scratch), the builder runtime for the toolchain, and envd as
+// the app — RUN steps go through the e2b exec channel. This envd is a
+// build tool, not a tenant data plane: always -isnotfc, never
+// /init-armed (its in-memory state dies with the phase; its only disk
+// footprint, /run/e2b, sits on a tmpfs mount the export skips).
 func (p *buildPipeline) stepsYAML() map[string]any {
 	s := p.spec
 	doc := map[string]any{
@@ -819,7 +877,12 @@ func (p *buildPipeline) stepsYAML() map[string]any {
 				},
 			},
 		},
-		"launch": map[string]any{"placeholder": true},
+		"launch": map[string]any{
+			"exec":    "/opt/sandbox-runtime/bin/envd",
+			"args":    []string{"-isnotfc", "-port", "49983"},
+			"user":    "0:0",
+			"restart": "always",
+		},
 	}
 	if f := p.dnsFiles(); f != nil {
 		doc["files"] = f
