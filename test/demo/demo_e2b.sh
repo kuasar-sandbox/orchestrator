@@ -107,7 +107,9 @@ say "overlay diff_template — pre-formatted empty ext4 seeding each cold boot's
 MKFS_EXT4="$(command -v mkfs.ext4 || echo /sbin/mkfs.ext4)"; [ -x "$MKFS_EXT4" ] || die "mkfs.ext4 not found"
 OVL="$WORK/overlay-1G.ext4"; truncate -s 1G "$OVL"; "$MKFS_EXT4" -F -q -b 4096 "$OVL" >/dev/null 2>&1 || die "mkfs.ext4"
 say "builder diff_template — build-sandbox writable disk (pull cache + steps delta + export scratch; sparse)"
-BLD="$WORK/builder-8G.ext4"; truncate -s 8G "$BLD"; "$MKFS_EXT4" -F -q -b 4096 "$BLD" >/dev/null 2>&1 || die "mkfs.ext4 (builder)"
+# ~4x the unpacked base: blobs + unpacked tree + erofs output + mkfs chunk
+# staging coexist during the in-guest flatten (code-interpreter ≈ 3 GB).
+BLD="$WORK/builder-16G.ext4"; truncate -s 16G "$BLD"; "$MKFS_EXT4" -F -q -b 4096 "$BLD" >/dev/null 2>&1 || die "mkfs.ext4 (builder)"
 
 say "self-signed *.$DOMAIN cert (SDK trusts it via SSL_CERT_FILE; data plane is https)"
 openssl req -x509 -newkey rsa:2048 -nodes -keyout "$WORK/tls.key" -out "$WORK/tls.crt" -days 2 \
@@ -152,6 +154,8 @@ builder:                                    # no image_uri_mask: from_image name
   insecure_registry: $INSECURE
   runtime_builder: $BIN/sandbox-runtime-builder.erofs
   diff_template: $BLD
+  vcpu: 2                                   # build-VM budget: flatten streams, page cache reclaims —
+  memory: 2GiB                              # 2GiB suffices for a ~3GB base on a small demo host
 checkpoint: { mode: local, local_dir: $WORK/saved }
 EOF
 
