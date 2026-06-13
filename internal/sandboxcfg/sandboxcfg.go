@@ -132,6 +132,13 @@ func (p Params) BuildYAML() ([]byte, error) {
 	if launchUser != "" {
 		launch["user"] = launchUser
 	}
+	if p.Template.Profile == types.ProfileE2B {
+		// envd is not a PID-1-style reaper, so share sandbox-init's PID namespace: its
+		// PID 1 then collects the orphaned descendants of guest commands instead of them
+		// piling up as zombies under envd. Bare profiles keep the default private ns
+		// (the image's entrypoint is PID 1, like a container).
+		launch["pid_namespace"] = "shared"
+	}
 
 	doc := map[string]any{
 		"resources": map[string]any{
