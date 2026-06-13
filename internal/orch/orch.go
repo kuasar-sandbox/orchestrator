@@ -23,6 +23,7 @@ import (
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/api"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/config"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/configsock"
+	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/filestore"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/keys"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/launcher"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/proxy"
@@ -51,15 +52,26 @@ type Orchestrator struct {
 
 	pendMu sync.Mutex
 	pend   map[string]*pendingBuild // builds whose unit is running (BuildSpecFor source)
+
+	files *filestore.Store // COPY build-context object store; nil = unconfigured (COPY → 501)
 }
 
 func New(cfg *config.Config, st *store.Store, lc launcher.Launcher, vs *vswitch.CLI, log *slog.Logger) *Orchestrator {
-	return &Orchestrator{
+	o := &Orchestrator{
 		cfg: cfg, st: st, lc: lc, vs: vs, log: log,
 		reg:  map[string]*types.Sandbox{},
 		subs: map[int]chan routesync.Event{},
 		pend: map[string]*pendingBuild{},
 	}
+	if fc := cfg.Builder.FilesStorage; fc != nil {
+		fs, err := filestore.New(fc)
+		if err != nil {
+			log.Warn("builder.files_storage init failed; COPY steps will be rejected", "err", err)
+		} else {
+			o.files = fs
+		}
+	}
+	return o
 }
 
 // --- api.Core ---

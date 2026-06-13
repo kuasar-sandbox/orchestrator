@@ -231,6 +231,41 @@ type BuilderConfig struct {
 	StepTimeoutSec  int `yaml:"step_timeout_sec"`
 	ReadyTimeoutSec int `yaml:"ready_timeout_sec"`
 	TotalTimeoutSec int `yaml:"total_timeout_sec"`
+
+	// FilesStorage is the S3/OBS object store backing COPY build contexts:
+	// the client uploads the (gzipped tar) context straight to the bucket via
+	// a presigned PUT, and the build sandbox fetches it via a presigned GET.
+	// Unset → COPY steps are rejected (501). For local/single-node without a
+	// cloud object store, point it at a versitygw gateway. (§11)
+	FilesStorage *FilesStorageConfig `yaml:"files_storage"`
+}
+
+// FilesStorageConfig configures the COPY build-context object store. The
+// orchestrator only ever PRESIGNS (PUT for the client, GET for the build) and
+// HEADs (presence) — bytes never transit the control plane.
+type FilesStorageConfig struct {
+	Endpoint  string `yaml:"endpoint"`   // S3 endpoint; empty = AWS default
+	Region    string `yaml:"region"`     // e.g. "cn-north-4" / "us-east-1"
+	Bucket    string `yaml:"bucket"`      // required
+	Prefix    string `yaml:"prefix"`      // optional key prefix
+	AccessKey string `yaml:"access_key"`  // empty → AWS default chain (env / instance role)
+	SecretKey string `yaml:"secret_key"`  // paired with access_key
+	// ForcePathStyle selects path-style addressing (host/bucket/key). Default
+	// false (virtual-host, what AWS S3 / OBS use); versitygw / minio need true.
+	ForcePathStyle bool `yaml:"force_path_style"`
+	// PresignExpiry bounds the upload (PUT) URL the client receives; default
+	// 1h. The build-side GET is presigned for total_timeout_sec + headroom.
+	PresignExpiry string `yaml:"presign_expiry"`
+}
+
+// PresignExpiryDur parses presign_expiry (default 1h on empty / parse error).
+func (f *FilesStorageConfig) PresignExpiryDur() time.Duration {
+	if f.PresignExpiry != "" {
+		if d, err := time.ParseDuration(f.PresignExpiry); err == nil && d > 0 {
+			return d
+		}
+	}
+	return time.Hour
 }
 
 // CheckpointConfig is the paused-state tiering policy. A sandbox pause writes its
@@ -403,6 +438,9 @@ func (c *Config) ValidateProxy() error {
 	}
 	if c.MMDS.Enabled && c.Proxy.Mode == ProxyOff {
 		return fmt.Errorf("config: mmds.enabled=true requires proxy.mode!=off (the MMDS service is hosted by the proxy)")
+	}
+	if f := c.Builder.FilesStorage; f != nil && f.Bucket == "" {
+		return fmt.Errorf("config: builder.files_storage.bucket is required when files_storage is set")
 	}
 	return nil
 }

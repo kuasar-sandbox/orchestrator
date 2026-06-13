@@ -119,6 +119,20 @@ builder:
   # pull runs in the guest): a host-local registry must bind a non-loopback
   # address and be named via the vswitch mgmt VIP.
   # image_uri_mask: "docker.sandboxes.example.com/e2b/custom-envs/{templateID}:{buildID}"
+  # COPY build contexts: the client uploads the (gzipped tar) context straight to
+  # this S3/OBS bucket via a presigned PUT, the build sandbox fetches it via a
+  # presigned GET — bytes never transit the orchestrator. Unset → COPY steps are
+  # rejected (501). For local/single-node without a cloud object store, point it
+  # at a versitygw gateway (sandbox-deps: make versitygw).
+  # files_storage:
+  #   endpoint: https://obs.cn-north-4.example.com  # versitygw: http://127.0.0.1:7070
+  #   region: cn-north-4
+  #   bucket: kuasar-build-files
+  #   prefix: ""                       # optional key prefix
+  #   access_key: ""                   # empty → AWS default chain (env / instance role)
+  #   secret_key: ""
+  #   force_path_style: false          # versitygw / minio need true (AWS S3 / OBS: false)
+  #   presign_expiry: 1h               # upload-URL lifetime (GET uses total_timeout + 5m)
 
 # Paused-state tiering. On pause a sandbox's snapshot is written either to node-local
 # files (mode=local, default; restorable only on this node — matches the sandbox-bound

@@ -118,6 +118,16 @@ builder:                                           # builds run INSIDE build san
   # image_uri_mask must match the CLI's E2B_IMAGE_URI_MASK ({templateID}/{buildID} tokens)
   # AND be reachable from inside a build sandbox (the pull runs in the guest):
   # image_uri_mask: "docker.sandboxes.example.com/e2b/custom-envs/{templateID}:{buildID}"
+  # files_storage: COPY build contexts; client direct-uploads (presigned PUT) to
+  # this bucket, build fetches (presigned GET). Unset → COPY rejected (501).
+  # Local/single-node: point at versitygw (sandbox-deps: make versitygw).
+  # files_storage:
+  #   endpoint: https://obs.cn-north-4.example.com   # versitygw: http://127.0.0.1:7070
+  #   region: cn-north-4
+  #   bucket: kuasar-build-files                            # required
+  #   force_path_style: false                               # versitygw/minio need true
+  #   access_key: ""                                        # empty → AWS default chain
+  #   secret_key: ""
 checkpoint:                                        # paused-state tiering
   mode: local                                     # local (node-bound files) | remote (portable manifest)
   local_dir: /var/lib/sandbox-saved

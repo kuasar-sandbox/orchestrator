@@ -329,6 +329,7 @@ orchestrator-ctl 同目录 → PATH"自动发现。
 | `builder.diff_template` | – | 构建沙箱可写盘的预格式化 ext4(拉取缓存 + steps 增量 + 导出 scratch;稀疏文件,建议 ≥ 最大预期镜像的 3 倍) |
 | `builder.vcpu` / `.memory` | `2` / `4GiB` | 每台构建沙箱(阶段 microVM)的容量 |
 | `builder.{pull,step,ready,total}_timeout_sec` | `600`/`600`/`120`/`1800` | 阶段超时:guest 内拉取+展平、单条 RUN step(经 `Connect-Timeout-Ms` 同步到 guest 侧)、readyCmd 轮询预算(2s 间隔;缺省 readyCmd = `sleep 20`)、整个构建(单元 `TimeoutStartSec` = total+60) |
+| `builder.files_storage` | 空 | COPY 构建上下文的 S3/OBS 对象存储(子键 `endpoint`/`region`/`bucket`(必填)/`prefix`/`access_key`/`secret_key`/`force_path_style`/`presign_expiry`);空 = COPY 回 501。orchestrator 仅 presign + HEAD;`access_key` 空走 AWS 默认链;`force_path_style` 默认 false(versitygw/minio 置 true);`presign_expiry` 默认 1h(PUT;GET 用 total+5m)。本地/单机无云对象存储用 versitygw(§11) |
 | `checkpoint.mode` | `local` | 暂停态落地:`local` = 本机文件(节点绑定)/ `remote` = 远程 manifest(可移植 = 模板)(§8.1) |
 | `checkpoint.local_dir` | `/var/lib/sandbox-saved` | 本机快照目录(`mode=local`) |
 | `mmds.enabled` | `false` | envd 鉴权姿态开关(§9.4):false = `-isnotfc` + proxy 单闸门;true = FC 模式 + MMDS re-key |
@@ -374,9 +375,9 @@ envd,回占位 token,数据面控制端口 501。`trafficAccessToken` 为 SDK �
 | 操作 | 方法 + 路径 | 要点 |
 |---|---|---|
 | register | `POST /v3/templates` → 202 | body `{name, tags}`;回 `{templateID: transient-<uuidv7>, buildID, names, tags, aliases, public:false}` |
-| trigger | `POST /v2/templates/{tid}/builds/{bid}` → 202 | body 兼容 `{fromImage, fromTemplate, fromImageRegistry{username,password}, steps[], startCmd, readyCmd}` 与 CLI 形态 `{start_cmd, ready_cmd, …}`;`fromImage`/`fromTemplate` 互斥,皆缺时由 `builder.image_uri_mask` 推 fromImage;steps 支持 `RUN/ENV/ARG/WORKDIR/USER`,**COPY → 501**(提交即拒);`startCmd` 非空或 fromTemplate ⇒ 暂记 snp(终态以流水线产物为准,§11),否则 img;fromTemplate 且无 steps 无 startCmd ⇒ 拒绝(无事可做) |
+| trigger | `POST /v2/templates/{tid}/builds/{bid}` → 202 | body 兼容 `{fromImage, fromTemplate, fromImageRegistry{username,password}, steps[], startCmd, readyCmd}` 与 CLI 形态 `{start_cmd, ready_cmd, …}`;`fromImage`/`fromTemplate` 互斥,皆缺时由 `builder.image_uri_mask` 推 fromImage;steps 支持 `RUN/ENV/ARG/WORKDIR/USER/COPY`(COPY 须先经 files 端点上传 context:未配 files_storage→**501**、未上传→**400**,§11);`startCmd` 非空或 fromTemplate ⇒ 暂记 snp(终态以流水线产物为准,§11),否则 img;fromTemplate 且无 steps 无 startCmd ⇒ 拒绝(无事可做) |
 | status | `GET /templates/{tid}/builds/{bid}/status` | 回 `{templateID, buildID, status, logs:[], logEntries:[]}` + 失败时 `reason{message}`;**进行中恒报 `building`**(registered/waiting/building 均映射,CLI wait 循环仅在 `building` 续轮询),终态 `ready`/`error`;ready 后 `templateID` 即报持久 id,并附 `names`/`aliases` |
-| files | `GET /templates/{tid}/files/{hash}` → **501** | COPY 步骤的构建文件上传流,未实现——与 trigger 侧的 COPY 拒绝呼应,响亮失败 |
+| files | `GET /templates/{tid}/files/{hash}` → 201 | COPY context 上传协商:`tid→build→归属`校验后回 `{present, url}`——present 即对象已在桶(客户端跳过上传),url 为**直传桶的 presigned PUT**(字节不过控制面);未配 `files_storage`→**501**,未知/非属主 tid→**404**。详见 §11 |
 | list | `GET /templates` | 本租户 ready 模板;`templateID` 列为持久 id |
 
 ### 4.3 数据面协议(envd,数据面仅透传)
@@ -856,6 +857,31 @@ microVM(`sandbox-ctl run` 直接子进程);A 阶段就绪探针 = guest 内
 metadata 里的 `e2b.start_cmd`/`e2b.ready_cmd`(请求显式给出者优先)。fromTemplate
 与 fromImage 互斥;fromTemplate 且无 steps 无 startCmd 拒绝(无事可做)。
 
+**COPY/ADD step(构建上下文经对象存储直传)**:COPY 的本质是"把一份 tar 摊进
+rootfs"——文件系统操作,不是 e2b 进程语义,故走 sandbox-ctl exec + flatten-ctl(不经
+envd),且**镜像无需自带 tar/gzip**(flatten-ctl 纯 Go 解包,scratch/distroless 亦可
+COPY)。三段:
+
+1. **上传协商(files 端点,§4.2)**:客户端先 `GET /templates/{tid}/files/{hash}`,
+   服务端校验归属后回 `{present, url}`;`present=false` 时客户端把 **gzip(tar)** 上下文
+   经 presigned PUT **直传桶**(字节不过控制面,e2b SDK 同款裸 PUT)。对象 key =
+   `{prefix}/files/{aaaa}/{bb}/{uuid}/{hash}`(uuid=tid 的 uuidv7 部分;aaaa=uuid[0:4]
+   ~50 天、bb=uuid[4:6] ~5 小时,时间分桶散列前缀 + 便于按日期 GC)。隔离靠端点归属
+   校验:只为属主签当前 tid 路径的 URL,桶私有、客户端无凭据。
+2. **触发校验**:trigger 时每个 COPY 的 (tid,hash) 经 HeadObject 确认已上传——未配
+   `files_storage`→501,未上传→400,失败快。
+3. **构建期解包**:`BuildSpecFor` 为每个 COPY 预签 GET URL(TTL=total+5m,绑构建全程)。
+   run-builder:`http.Get`(平台取数,宿主侧)→ 宿主 gunzip → `sandbox-ctl exec
+   --stdin-from <tar> -- flatten-ctl tar extract --dense [--chown O][--chmod M]
+   <rule>`。rule 由 (src,dst)+context 条目派生(整根 `:dst/`、目录前缀 `src/:dst/`、
+   单文件 `src:out`;dst 相对则按累积 WORKDIR 解析,默认 `/`);owner 缺省 `0:0`
+   (Docker 语义,`--chown` 覆盖,名字在解包根的 /etc/passwd 解析);`--dense` 守稀疏
+   铁律(源码无权威洞元数据,零即数据)。单源 COPY(e2b executor 同限)。
+
+**对象存储(`builder.files_storage`,§3)**:S3/OBS;orchestrator 只 presign + HEAD,
+唯一 aws-sdk 落点;本地/单机无云对象存储时指向 versitygw(`sandbox-deps make
+versitygw`)。force_path_style 默认 false(虚拟主机式;versitygw/minio 置 true)。
+
 **收尾上传(平台凭据唯一出现点)**:img-only ⇒ `manifest-ctl store image.img`
 (stdout = 64-hex manifest key);产出快照 ⇒ **一条** `sandbox-ctl upload-snapshot
 <bundle>`——自动上传 snapshot.cfg 引用的全部本地工件(base 镜像、overlay)并把引用
@@ -892,8 +918,8 @@ vswitch mgmt VIP 寻址;第三方 registry 经 NAT 出网)。两者皆缺则 tri
 `MANIFEST_KEY` 永不入 guest**。凭据仅加密存库 + 运行期 env;workdir 里的阶段 yaml
 无秘密。
 
-**不支持**:COPY step(501,§4.2;构建文件上传流未实现)、step 级缓存(`force`
-字段接受但忽略,总是全量执行)、服务端 Dockerfile 解析(CLI 已在客户端展开为 steps)。
+**不支持**:多源 COPY(e2b executor 亦只取 src+dst)、step 级缓存(`force` 字段
+接受但忽略,总是全量执行)、服务端 Dockerfile 解析(CLI 已在客户端展开为 steps)。
 
 ## 12. DNS / TLS
 

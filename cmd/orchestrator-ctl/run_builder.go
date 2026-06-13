@@ -41,7 +41,9 @@ package main
 // the unit captures to <bid>.result for the orchestrator.
 
 import (
+	"archive/tar"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"flag"
@@ -52,6 +54,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -318,9 +321,12 @@ func (p *buildPipeline) phaseSteps() error {
 
 	// RUN steps go through envd — the e2b exec channel (the step sandbox's
 	// envd is a plain build tool: -isnotfc, never /init-armed, no token).
+	// COPY instead streams its context tar through sandbox-ctl exec into
+	// flatten-ctl (a platform filesystem op, not an e2b process) — sb carries
+	// that channel.
 	sess := &envdExec{uds: envdUDS, log: p.log}
 	for i, st := range s.Steps {
-		if err := p.applyStep(sess, ctxv, i, st); err != nil {
+		if err := p.applyStep(sb, sess, ctxv, i, st); err != nil {
 			return err
 		}
 	}
@@ -362,9 +368,10 @@ func (p *buildPipeline) phaseSteps() error {
 
 // applyStep executes one build step. RUN goes to the guest through envd
 // (the e2b exec channel: /bin/bash -l -c with the accumulated context;
-// docker defaults — root, "/" — when the context has none); the rest
-// transform the host-side context.
-func (p *buildPipeline) applyStep(sess *envdExec, c *stepCtx, i int, st configsock.BuildStep) error {
+// docker defaults — root, "/" — when the context has none); COPY streams
+// its tar through sandbox-ctl exec into flatten-ctl (sb); the rest transform
+// the host-side context.
+func (p *buildPipeline) applyStep(sb *phaseSandbox, sess *envdExec, c *stepCtx, i int, st configsock.BuildStep) error {
 	sub := func(v string) string { // ARG/ENV ${k} substitution
 		for k, val := range c.args {
 			v = strings.ReplaceAll(v, "${"+k+"}", val)
@@ -417,10 +424,188 @@ func (p *buildPipeline) applyStep(sess *envdExec, c *stepCtx, i int, st configso
 		if len(st.Args) > 0 {
 			c.user = sub(st.Args[0])
 		}
+	case "COPY", "ADD":
+		if err := p.applyCopy(sb, c, i, st, sub); err != nil {
+			return fmt.Errorf("step %d (COPY): %w", i, err)
+		}
 	default:
 		return fmt.Errorf("step %d: unsupported type %q", i, st.Type)
 	}
 	return nil
+}
+
+// applyCopy realizes a COPY/ADD step: fetch the context tar (presigned GET,
+// platform plumbing — host-side, no guest), then stream it through
+// sandbox-ctl exec into `flatten-ctl tar extract` (a filesystem op on any
+// rootfs; no tar/gzip needed in the image). The accumulated USER is NOT the
+// COPY owner — Docker COPY defaults to root unless --chown is given.
+func (p *buildPipeline) applyCopy(sb *phaseSandbox, c *stepCtx, i int, st configsock.BuildStep, sub func(string) string) error {
+	if len(st.Args) < 2 {
+		return fmt.Errorf("needs <src> <dst>")
+	}
+	if st.FilesHash == "" || st.FilesURL == "" {
+		return fmt.Errorf("no uploaded context (filesHash/url missing — files_storage configured?)")
+	}
+	rawTar, err := p.fetchCopyContext(st.FilesURL, st.FilesHash)
+	if err != nil {
+		return err
+	}
+	defer os.Remove(rawTar)
+
+	entries, err := peekTarEntries(rawTar)
+	if err != nil {
+		return fmt.Errorf("read context tar: %w", err)
+	}
+	rule, err := copyRule(sub(st.Args[0]), sub(st.Args[1]), c.workdir, entries)
+	if err != nil {
+		return err
+	}
+
+	owner := "0:0" // Docker COPY default; --chown overrides
+	if len(st.Args) >= 3 && sub(st.Args[2]) != "" {
+		owner = sub(st.Args[2])
+	}
+	args := []string{guestFlatten, "tar", "extract", "--dense", "--chown", owner}
+	if len(st.Args) >= 4 && sub(st.Args[3]) != "" {
+		args = append(args, "--chmod", sub(st.Args[3]))
+	}
+	args = append(args, rule)
+
+	p.log.Info("step", "n", i, "copy", st.Args[0]+" -> "+st.Args[1], "rule", rule, "owner", owner)
+	ctx, cancel := context.WithTimeout(p.ctx, time.Duration(p.spec.Timeouts.StepSec)*time.Second)
+	defer cancel()
+	return sb.exec(ctx, execOpts{stdinFrom: rawTar}, args...)
+}
+
+// fetchCopyContext downloads the gzipped context tar from the presigned GET
+// URL and gunzips it to a workdir file (flatten-ctl tar extract takes a plain
+// tar on stdin). The e2b SDK uploads w:gz; we strip the gzip host-side so the
+// image needs no gzip.
+func (p *buildPipeline) fetchCopyContext(url, hash string) (string, error) {
+	ctx, cancel := context.WithTimeout(p.ctx, time.Duration(p.spec.Timeouts.PullSec)*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return "", err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("fetch context: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		return "", fmt.Errorf("fetch context: status %d (%s)", resp.StatusCode, firstLine(body))
+	}
+	gz, err := gzip.NewReader(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("context not gzip: %w", err)
+	}
+	defer gz.Close()
+	out := filepath.Join(p.spec.Workdir, "copy-"+hash+".tar")
+	f, err := os.Create(out)
+	if err != nil {
+		return "", err
+	}
+	if _, err := io.Copy(f, gz); err != nil {
+		f.Close()
+		os.Remove(out)
+		return "", fmt.Errorf("gunzip context: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(out)
+		return "", err
+	}
+	return out, nil
+}
+
+// peekTarEntries lists the tar's member names (slash paths, "./" and root
+// dropped) so copyRule can tell a single file from a directory tree.
+func peekTarEntries(tarPath string) ([]string, error) {
+	f, err := os.Open(tarPath)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	tr := tar.NewReader(f)
+	var names []string
+	for {
+		h, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		n := path.Clean(strings.TrimPrefix(h.Name, "./"))
+		if n == "" || n == "." {
+			continue
+		}
+		names = append(names, n)
+	}
+	return names, nil
+}
+
+// copyRule maps a COPY (src,dst) + the context tar's entries to a
+// `flatten-ctl tar extract` rule, matching Docker/e2b semantics for the
+// single-source forms the e2b SDK emits (arcnames rooted at the build
+// context). dst resolves against the accumulated WORKDIR (default "/").
+// Multi-source COPY is unsupported (e2b's executor only reads src+dst).
+func copyRule(srcArg, dstArg, workdir string, entries []string) (string, error) {
+	srcPrefix := normalizeCopySrc(srcArg)
+
+	dstSlash := strings.HasSuffix(dstArg, "/") || dstArg == "." || dstArg == ".."
+	dst := dstArg
+	if !path.IsAbs(dst) {
+		base := workdir
+		if base == "" {
+			base = "/"
+		}
+		dst = path.Join(base, dst)
+	}
+	dst = path.Clean(dst) // absolute, no trailing slash
+
+	// Whole context (COPY . / COPY *): map the archive root under dst.
+	if srcPrefix == "" {
+		return ":" + dst + "/", nil
+	}
+	// Single file iff an entry equals srcPrefix and none nests under it.
+	exact, under := false, false
+	for _, e := range entries {
+		if e == srcPrefix {
+			exact = true
+		}
+		if strings.HasPrefix(e, srcPrefix+"/") {
+			under = true
+		}
+	}
+	if exact && !under {
+		out := dst
+		if dstSlash { // dst is a directory → keep the file's basename
+			out = path.Join(dst, path.Base(srcPrefix))
+		}
+		return srcPrefix + ":" + out, nil
+	}
+	if !under {
+		return "", fmt.Errorf("source %q not found in context", srcArg)
+	}
+	// Directory: strip the src prefix, place its contents under dst.
+	return srcPrefix + "/:" + dst + "/", nil
+}
+
+// normalizeCopySrc strips a trailing glob and surrounding slashes/"./",
+// yielding the tar path prefix to select ("" for the whole context).
+func normalizeCopySrc(s string) string {
+	if i := strings.IndexAny(s, "*?["); i >= 0 {
+		s = s[:i] // drop the glob tail; the SDK already expanded matches into the tar
+	}
+	s = strings.TrimPrefix(s, "./")
+	s = strings.Trim(s, "/")
+	s = path.Clean(s)
+	if s == "." || s == ".." {
+		return ""
+	}
+	return s
 }
 
 // readBaseRuntimeConfig reads the base image's runtime config (through

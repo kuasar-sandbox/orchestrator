@@ -100,6 +100,11 @@ type BuildSpec struct {
 type BuildStep struct {
 	Type string   `json:"type"`
 	Args []string `json:"args,omitempty"`
+	// COPY only: FilesHash identifies the uploaded context object; FilesURL is
+	// the presigned GET the build sandbox fetches it from (minted per build in
+	// BuildSpecFor, TTL covering the whole build).
+	FilesHash string `json:"files_hash,omitempty"`
+	FilesURL  string `json:"files_url,omitempty"`
 }
 
 // BuildPaths is every host artifact/binary path the pipeline shells out to.

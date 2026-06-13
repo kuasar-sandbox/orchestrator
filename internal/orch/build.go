@@ -68,8 +68,8 @@ func (o *Orchestrator) RegisterBuild(ctx context.Context, apiKey, name string, t
 }
 
 // TriggerBuild handles POST /v2/templates/{tid}/builds/{bid}: record the base
-// image + start command, pick the kind (snp if a start command is set, else img),
-// and queue the build for the pool. Build steps are intentionally unsupported.
+// image + steps + start command, pick the kind (snp if a start command is set,
+// else img), and queue the build for the pool.
 func (o *Orchestrator) TriggerBuild(ctx context.Context, apiKey, tid, bid string, spec api.TriggerSpec, auth api.BuildAuth) error {
 	b, err := o.st.GetBuild(ctx, bid)
 	if err != nil {
@@ -80,6 +80,28 @@ func (o *Orchestrator) TriggerBuild(ctx context.Context, apiKey, tid, bid string
 	}
 	if spec.FromImage != "" && spec.FromTemplate != "" {
 		return fmt.Errorf("build: fromImage and fromTemplate are mutually exclusive")
+	}
+	// COPY steps need files_storage configured AND the referenced context
+	// already uploaded (client → files endpoint → bucket). Verify both up
+	// front so the build fails fast instead of mid-pipeline.
+	for i := range spec.Steps {
+		if !strings.EqualFold(spec.Steps[i].Type, "COPY") {
+			continue
+		}
+		if o.files == nil {
+			return api.ErrFilesUnsupported
+		}
+		h := spec.Steps[i].FilesHash
+		if h == "" {
+			return fmt.Errorf("%w: COPY step %d has no filesHash", api.ErrBadRequest, i)
+		}
+		ok, ferr := o.files.Exists(ctx, b.TemplateID, h)
+		if ferr != nil {
+			return fmt.Errorf("build: check COPY context %s: %w", h, ferr)
+		}
+		if !ok {
+			return fmt.Errorf("%w: COPY context %s not uploaded (PUT it via the files endpoint first)", api.ErrBadRequest, h)
+		}
 	}
 	switch {
 	case spec.FromTemplate != "":
@@ -404,9 +426,20 @@ func (o *Orchestrator) BuildSpecFor(ctx context.Context, configID string) (*conf
 		}
 	}
 
+	// Presign each COPY context for the build's whole lifetime (it is signed
+	// now, when the unit starts and dials for the spec).
+	getTTL := time.Duration(o.cfg.Builder.TotalTimeoutSec+300) * time.Second
 	var steps []configsock.BuildStep
 	for _, s := range b.Steps {
-		steps = append(steps, configsock.BuildStep{Type: s.Type, Args: s.Args})
+		bs := configsock.BuildStep{Type: s.Type, Args: s.Args, FilesHash: s.FilesHash}
+		if s.FilesHash != "" && o.files != nil {
+			url, err := o.files.PresignGet(ctx, b.TemplateID, s.FilesHash, getTTL)
+			if err != nil {
+				return nil, "", false, fmt.Errorf("presign COPY context %s: %w", s.FilesHash, err)
+			}
+			bs.FilesURL = url
+		}
+		steps = append(steps, bs)
 	}
 	fromTemplate, fromTemplateKind := "", ""
 	if b.FromTemplate != "" {

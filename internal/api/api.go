@@ -25,6 +25,14 @@ var ErrNotFound = errors.New("sandbox not found")
 // key is not in the manifest_keys allowlist (=> 403).
 var ErrNotAllowed = errors.New("manifest key not allowed to create")
 
+// ErrFilesUnsupported is returned by FilesUpload / TriggerBuild when a COPY
+// step is used but builder.files_storage is unconfigured (=> 501).
+var ErrFilesUnsupported = errors.New("COPY build contexts unsupported (builder.files_storage not configured)")
+
+// ErrBadRequest maps a Core-side validation failure (e.g. a COPY referencing
+// an unuploaded context) to 400.
+var ErrBadRequest = errors.New("bad request")
+
 // PullTokenHeader is the api_headers header carrying the opaque registry pull token.
 const PullTokenHeader = "X-Kuasar-Pull-Token"
 
@@ -83,6 +91,11 @@ type Core interface {
 	TriggerBuild(ctx context.Context, apiKey, templateID, buildID string, spec TriggerSpec, auth BuildAuth) error
 	BuildStatus(ctx context.Context, apiKey, templateID, buildID string) (*types.Build, error)
 	ListTemplates(ctx context.Context, apiKey string) ([]*types.Build, error)
+	// FilesUpload backs GET /templates/{tid}/files/{hash} (COPY build contexts):
+	// resolves+authorizes the build, reports whether the object is already
+	// present, and returns a presigned PUT URL for the client to upload to.
+	// ErrFilesUnsupported when builder.files_storage is unconfigured.
+	FilesUpload(ctx context.Context, apiKey, templateID, hash string) (present bool, url string, err error)
 
 	// Sandbox export/import (orchestrator extension to the e2b surface). Export turns
 	// a paused sandbox's remote snapshot into a reusable template (toTemplate) or a
@@ -328,14 +341,9 @@ func (a *API) triggerBuild(w http.ResponseWriter, r *http.Request) {
 	if readyCmd == "" {
 		readyCmd = body.ReadyCmdE2B
 	}
-	// COPY needs the build-files upload flow (the files endpoint below);
-	// reject at submit so the build fails fast and clearly.
-	for _, s := range body.Steps {
-		if strings.EqualFold(s.Type, "COPY") {
-			writeErr(w, 501, "COPY steps are not supported yet (build file uploads unavailable)")
-			return
-		}
-	}
+	// COPY is gated in Core.TriggerBuild: it needs builder.files_storage AND
+	// each context object already uploaded (via the files endpoint) — a missing
+	// store maps to 501, a missing object to 400, both fail fast there.
 	auth := BuildAuth{
 		PullToken:        r.Header.Get(PullTokenHeader),
 		RegistryUsername: body.FromImageRegistry.Username,
@@ -350,17 +358,36 @@ func (a *API) triggerBuild(w http.ResponseWriter, r *http.Request) {
 			ReadyCmd:     readyCmd,
 		}, auth)
 	if err != nil {
-		a.fail(w, err)
+		switch {
+		case errors.Is(err, ErrFilesUnsupported):
+			writeErr(w, 501, err.Error())
+		case errors.Is(err, ErrBadRequest):
+			writeErr(w, 400, err.Error())
+		default:
+			a.fail(w, err)
+		}
 		return
 	}
 	w.WriteHeader(202)
 }
 
-// buildFiles is the e2b v2 build-files endpoint (COPY sources by hash).
-// Not implemented: report so loudly — the trigger path also rejects COPY
-// steps at submit.
+// buildFiles is the e2b v2 build-files endpoint (COPY contexts by hash): the
+// client GETs it to learn whether the context is already uploaded and, if not,
+// where to PUT it. Returns 201 {present, url}; the url is a presigned PUT
+// straight to the object store (bytes never transit here). 404 on unknown/
+// unowned template, 501 when files_storage is unconfigured.
 func (a *API) buildFiles(w http.ResponseWriter, r *http.Request) {
-	writeErr(w, 501, "build file uploads are not supported yet")
+	present, url, err := a.core.FilesUpload(r.Context(),
+		apiKeyFrom(r.Context()), r.PathValue("tid"), r.PathValue("hash"))
+	if err != nil {
+		if errors.Is(err, ErrFilesUnsupported) {
+			writeErr(w, 501, err.Error())
+			return
+		}
+		a.fail(w, err) // ErrNotFound → 404, ErrNotAllowed → 403, else 500
+		return
+	}
+	writeJSON(w, 201, map[string]any{"present": present, "url": url})
 }
 
 func (a *API) buildStatus(w http.ResponseWriter, r *http.Request) {

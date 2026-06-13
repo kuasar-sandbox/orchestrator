@@ -380,6 +380,22 @@ func (s *Store) GetBuild(ctx context.Context, buildID string) (*types.Build, err
 	return b, nil
 }
 
+// GetBuildByTemplateID looks a build up by its (transient) template id — the
+// handle the files endpoint receives (GET /templates/{tid}/files/{hash}), which
+// carries no build id. The transient template id is a per-build uuidv7, so this
+// is unique. Returns nil when unknown.
+func (s *Store) GetBuildByTemplateID(ctx context.Context, templateID string) (*types.Build, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT `+buildCols+` FROM builds WHERE template_id=?`, templateID)
+	b, err := s.scanBuild(row)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("store: get build by template %s: %w", templateID, err)
+	}
+	return b, nil
+}
+
 // BuildsByStatus returns builds in a given state (used by the builder pool + ListTemplates).
 func (s *Store) BuildsByStatus(ctx context.Context, status types.BuildState) ([]*types.Build, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT `+buildCols+` FROM builds WHERE status=? ORDER BY created_unix ASC`, string(status))
