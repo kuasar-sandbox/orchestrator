@@ -16,9 +16,13 @@
 #   B3  fromTemplate(B2, snp) + steps only                 → e2b-snp template
 #       extracts the base image from B2's snapshot.cfg and INHERITS its
 #       startCmd/readyCmd (reaching ready proves both ran)
+#   B4  COPY build context (versitygw; skipped if absent)  → e2b-img template
+#       files endpoint → presigned direct-to-bucket PUT → in-build extract via
+#       flatten-ctl; a RUN step asserts content + default/--chown ownership
 #   create from B3 → 201 → list → kill                     (the template restores)
 #
-# Plus the negative surface: COPY step → 501 at submit, files endpoint → 501.
+# Plus the negative surface: COPY without files_storage → 501; with it, a COPY
+# missing its filesHash → 400 and an un-uploaded context → 400.
 # Deep asserts via the artifact chain: B2's snapshot.cfg carries
 # e2b.start_cmd metadata + a manifest:// base whose image config holds the
 # merged ENV/WORKDIR; B3's RUN step only succeeds if B2's RUN persisted.
@@ -38,6 +42,14 @@ DOMAIN="${DOMAIN:-sandboxes.e2e.local}"
 # `/bin/bash -l -c` — the image must have bash (python:3.12-slim does).
 E2E_IMAGE="${E2E_IMAGE:-python:3.12-slim}"
 ZOT_BIN="${ZOT_BIN:-$(command -v zot || true)}"
+# versitygw (S3 gateway) backs COPY build contexts; absent → the COPY chain is
+# skipped (the rest still runs). Look in bin/, then the sandbox-deps bin (opt-in
+# `make versitygw`, not in the default umbrella collect), then PATH.
+if [ -z "${VGW_BIN:-}" ]; then
+    for cand in "${BIN:-}/versitygw" "$REPO_ROOT/../sandbox-deps/bin/versitygw" "$(command -v versitygw 2>/dev/null || true)"; do
+        [ -n "$cand" ] && [ -x "$cand" ] && { VGW_BIN="$cand"; break; }
+    done
+fi
 SWITCH="${SWITCH:-swbld}"; SW_NETNS="${SW_NETNS:-e2ebld_sw}"; SW_MGMT="${SW_MGMT:-swbldm0}"
 MGMT_VIP="169.254.169.254"                   # host-side mgmt NIC IP; guests route 0/0 here
 
@@ -79,7 +91,7 @@ for u in "${UNIT_NAMES[@]}"; do
     [ -e "$UNIT_DIR/$u" ] && skip "$UNIT_DIR/$u already exists (real deployment?); refusing to clobber"
     OURS+=("$UNIT_DIR/$u")
 done
-mkdir -p "$WORK/run" "$WORK/lib" "$WORK/saved" "$WORK/store" "$WORK/zot"
+mkdir -p "$WORK/run" "$WORK/lib" "$WORK/saved" "$WORK/store" "$WORK/zot" "$WORK/vgw"
 declare -a PIDS=() TAGS=()
 cleanup() {
     set +e
@@ -175,6 +187,35 @@ truncate -s 1G "$OVL" && "$MKFS_EXT4" -F -q -b 4096 "$OVL"
 BLDDIFF="$WORK/builder-2G.ext4"         # build VM writable disk (pull cache + steps delta + export scratch)
 truncate -s 2G "$BLDDIFF" && "$MKFS_EXT4" -F -q -b 4096 "$BLDDIFF"
 
+# ---- versitygw (S3 gateway for COPY build contexts; optional) ---------------
+# Backs builder.files_storage: the client direct-uploads a COPY context here
+# (presigned PUT) and the build sandbox fetches it (presigned GET). Bound to
+# 127.0.0.1 — both the client (this script) and the build-side fetch
+# (run-builder, host) reach it from the host. Absent → the COPY chain skips.
+VGW_AK="e2eaccess"; VGW_SK="e2esecretkey0123"; VGW_BUCKET="build-files"
+FILES_STORAGE_YAML=""
+if [ -n "$VGW_BIN" ] && [ -x "$VGW_BIN" ]; then
+    VGW_PORT="$(free_port)"
+    mkdir -p "$WORK/vgw/$VGW_BUCKET"   # posix backend: a bucket is a top-level dir
+    ROOT_ACCESS_KEY="$VGW_AK" ROOT_SECRET_KEY="$VGW_SK" \
+        "$VGW_BIN" --port "127.0.0.1:$VGW_PORT" posix "$WORK/vgw" >"$WORK/vgw.log" 2>&1 &
+    PIDS+=($!)
+    wait_port 127.0.0.1 "$VGW_PORT" versitygw
+    FILES_STORAGE_YAML=$(cat <<EOF
+  files_storage:
+    endpoint: http://127.0.0.1:$VGW_PORT
+    region: us-east-1
+    bucket: $VGW_BUCKET
+    access_key: $VGW_AK
+    secret_key: $VGW_SK
+    force_path_style: true
+EOF
+)
+    echo "==> versitygw up (127.0.0.1:$VGW_PORT, posix, bucket=$VGW_BUCKET) — COPY chain enabled"
+else
+    echo "==> versitygw absent — COPY chain will be skipped (set VGW_BIN or 'make versitygw')"
+fi
+
 # ---- tenant credentials + orchestrator --------------------------------------
 MK="$("$BIN/e2b-key-ctl" gen-key)"
 AK="$("$BIN/e2b-key-ctl" gen-apikey "$MK")"
@@ -204,6 +245,7 @@ builder:
   step_timeout_sec: 180
   ready_timeout_sec: 60
   total_timeout_sec: 1200
+$FILES_STORAGE_YAML
 checkpoint: { mode: local, local_dir: $WORK/saved }
 EOF
 
@@ -256,14 +298,23 @@ wait_ready() { # tid bid label → sets PERSIST (e2b-{img,snp}-<64hex>)
     diag "$bid"; fail "$label did not reach ready (last status=$status)"
 }
 
-# ---- negative surface: COPY → 501, files endpoint → 501 ---------------------
+# ---- negative surface: COPY gating depends on files_storage posture ---------
 register neg
-code=$(req POST "/v2/templates/$TID/builds/$BID" "$AK" \
-    "{\"fromImage\":\"$PULL_REF\",\"steps\":[{\"type\":\"COPY\",\"args\":[\"a\",\"b\"]}]}")
-[ "$code" = "501" ] || fail "COPY step trigger = $code (want 501)"
-code=$(req GET "/templates/$TID/files/deadbeef" "$AK")
-[ "$code" = "501" ] || fail "files endpoint = $code (want 501)"
-echo "==> PASS: COPY step and files endpoint report 501 (unsupported, loud)"
+if [ -z "$FILES_STORAGE_YAML" ]; then
+    # Unconfigured: COPY and the files endpoint are unsupported → 501 (loud).
+    code=$(req POST "/v2/templates/$TID/builds/$BID" "$AK" \
+        "{\"fromImage\":\"$PULL_REF\",\"steps\":[{\"type\":\"COPY\",\"args\":[\"a\",\"b\"],\"filesHash\":\"x\"}]}")
+    [ "$code" = "501" ] || fail "COPY trigger (no files_storage) = $code (want 501)"
+    code=$(req GET "/templates/$TID/files/deadbeef" "$AK")
+    [ "$code" = "501" ] || fail "files endpoint (no files_storage) = $code (want 501)"
+    echo "==> PASS: without files_storage, COPY + files endpoint report 501"
+else
+    # Configured: a COPY with no filesHash is a malformed request → 400.
+    code=$(req POST "/v2/templates/$TID/builds/$BID" "$AK" \
+        "{\"fromImage\":\"$PULL_REF\",\"steps\":[{\"type\":\"COPY\",\"args\":[\"a\",\"b\"]}]}")
+    [ "$code" = "400" ] || fail "COPY trigger (no filesHash) = $code (want 400)"
+    echo "==> PASS: COPY without a filesHash rejected (400); files-storage configured (B4 exercises it)"
+fi
 
 # ---- B1: fromImage → e2b-img -----------------------------------------------
 echo "==> B1: fromImage=$PULL_REF (in-guest pull + flatten)"
@@ -332,6 +383,73 @@ case "$B3_PERSIST" in e2b-snp-*) : ;; *) fail "B3 persist=$B3_PERSIST (want e2b-
 # AND the inherited startCmd/readyCmd ran on the new template VM.
 echo "==> PASS: B3 ready → $B3_PERSIST (base-image extraction + start/ready inheritance)"
 
+# ---- B4: COPY build context via files endpoint + presigned direct upload ----
+# Acts as the e2b client: GET the files endpoint (present=false) → PUT the
+# gzipped context straight to the bucket → GET again (present=true), then build
+# fromImage with COPY steps and assert (via a RUN step) that the files landed
+# with the right ownership. Skipped without versitygw.
+if [ -n "$FILES_STORAGE_YAML" ]; then
+    echo "==> B4: COPY build context (files endpoint → presigned PUT → in-build extract)"
+    register e2e-copy
+    B4_TID="$TID"; B4_BID="$BID"
+
+    # Build the COPY context: ./hello.txt + ./sub/nested.txt, gzipped tar with
+    # arcnames relative to the context (the e2b SDK's layout).
+    CTX="$WORK/ctx"; mkdir -p "$CTX/sub"
+    echo "COPY-MARKER-$RANDOM" > "$CTX/hello.txt"; MARKER="$(cat "$CTX/hello.txt")"
+    echo nested > "$CTX/sub/nested.txt"
+    ( cd "$CTX" && tar czf "$WORK/ctx.tgz" . )
+    HASH="$(sha256sum "$WORK/ctx.tgz" | cut -d' ' -f1)"
+
+    # 1. files endpoint: not present yet, returns a presigned PUT url.
+    code=$(req GET "/templates/$B4_TID/files/$HASH" "$AK")
+    [ "$code" = "201" ] || { cat "$WORK/resp.body"; fail "files GET = $code (want 201)"; }
+    # Parse with a real JSON reader (not grep): the presigned url carries '&',
+    # which stdlib json escapes to & — every real client (the e2b SDK)
+    # decodes it; a sed extraction would not.
+    present=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["present"])' "$WORK/resp.body")
+    [ "$present" = "False" ] || fail "files: expected present=false on first GET: $(cat "$WORK/resp.body")"
+    PUT_URL="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["url"])' "$WORK/resp.body")"
+    [ -n "$PUT_URL" ] || fail "files: no presigned url"
+
+    # 2. client uploads the context straight to the bucket (bytes skip the orchestrator).
+    pcode=$(curl -sS --noproxy '*' -o /dev/null -w '%{http_code}' -X PUT --data-binary @"$WORK/ctx.tgz" "$PUT_URL")
+    [ "$pcode" = "200" ] || fail "presigned PUT = $pcode (want 200)"
+
+    # 3. now present (idempotency: client skips re-upload).
+    code=$(req GET "/templates/$B4_TID/files/$HASH" "$AK")
+    [ "$code" = "201" ] || fail "files GET#2 = $code"
+    present=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["present"])' "$WORK/resp.body")
+    [ "$present" = "True" ] || fail "files: expected present=true after upload: $(cat "$WORK/resp.body")"
+    echo "==> PASS: files endpoint round-trip (present false→PUT→true; direct-to-bucket upload)"
+
+    # Negative: a COPY referencing an un-uploaded context → 400 at trigger.
+    code=$(req POST "/v2/templates/$B4_TID/builds/$B4_BID" "$AK" \
+        "{\"fromImage\":\"$PULL_REF\",\"steps\":[{\"type\":\"COPY\",\"args\":[\".\",\"/opt/x\"],\"filesHash\":\"deadbeefdeadbeef\"}]}")
+    [ "$code" = "400" ] || { cat "$WORK/resp.body"; fail "COPY w/ unuploaded context = $code (want 400)"; }
+    echo "==> PASS: COPY referencing an un-uploaded context rejected (400)"
+
+    # Real build: COPY whole context to /opt/ct (default owner 0:0), the single
+    # file to /opt/ct2/ with --chown 1000:1000, then RUN asserts presence+owner.
+    # Reaching ready proves the extract + ownership are correct.
+    B4_BODY=$(cat <<EOF
+{"fromImage":"$PULL_REF",
+ "steps":[
+   {"type":"COPY","args":[".","/opt/ct"],"filesHash":"$HASH"},
+   {"type":"COPY","args":["hello.txt","/opt/ct2/","1000:1000"],"filesHash":"$HASH"},
+   {"type":"RUN","args":["test \"\$(cat /opt/ct/hello.txt)\" = \"$MARKER\" && test -f /opt/ct/sub/nested.txt && test \"\$(stat -c %u:%g /opt/ct/hello.txt)\" = 0:0 && test \"\$(stat -c %u:%g /opt/ct2/hello.txt)\" = 1000:1000"]}]}
+EOF
+)
+    code=$(req POST "/v2/templates/$B4_TID/builds/$B4_BID" "$AK" "$B4_BODY")
+    [ "$code" = "202" ] || { cat "$WORK/resp.body"; fail "B4 trigger = $code (want 202)"; }
+    wait_ready "$B4_TID" "$B4_BID" B4
+    B4_PERSIST="$PERSIST"
+    case "$B4_PERSIST" in e2b-img-*) : ;; *) fail "B4 persist=$B4_PERSIST (want e2b-img-…)";; esac
+    echo "==> PASS: B4 ready → $B4_PERSIST (COPY extract + default/--chown ownership verified in-build)"
+else
+    echo "==> SKIP B4 COPY chain (no versitygw)"
+fi
+
 # ---- create a sandbox from the built template -------------------------------
 echo "==> create sandbox from $B3_PERSIST (snapshot restore path)"
 code=$(req POST /sandboxes "$AK" "{\"templateID\":\"$B3_PERSIST\",\"timeout\":60}")
@@ -349,4 +467,4 @@ objs=$(find "$WORK/store" -type f | wc -l)
 echo "==> store holds $objs object(s)"
 
 echo
-echo "==> e2e_run_builder: OK   (B1=$B1_PERSIST B2=$B2_PERSIST B3=$B3_PERSIST)"
+echo "==> e2e_run_builder: OK   (B1=$B1_PERSIST B2=$B2_PERSIST B3=$B3_PERSIST${B4_PERSIST:+ B4=$B4_PERSIST})"
