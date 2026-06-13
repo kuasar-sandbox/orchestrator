@@ -260,6 +260,11 @@ from e2b import Sandbox
 s = Sandbox.connect("$SID")
 r = s.commands.run("id; uname -sm; python3 --version; grep ^PRETTY_NAME= /etc/os-release")
 print(r.stdout.rstrip())
+# e2b sandboxes share sandbox-init's PID namespace (launch.pid_namespace=shared) so PID 1
+# reaps orphaned descendants of guest commands instead of them piling up as zombies under envd.
+init1 = s.commands.run("cat /proc/1/comm").stdout.strip()
+print("guest PID 1 (reaps orphaned descendants):", init1)
+assert init1 != "envd", f"e2b sandbox must share sandbox-init's PID ns (PID 1 = reaper, not envd); got {init1!r}"
 print("--- write a file that must survive pause/resume ---")
 s.commands.run("echo 'hello from before the snapshot' > /home/user/state.txt")
 print(s.commands.run("cat /home/user/state.txt").stdout.rstrip())
