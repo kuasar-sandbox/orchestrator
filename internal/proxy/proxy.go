@@ -67,6 +67,23 @@ func RouteForTarget(profile, envdUDS, ciUDS, floatingIP, accessToken string, por
 	return Route{Kind: KindTCP, Addr: fmt.Sprintf("%s:%d", floatingIP, port), AccessToken: accessToken}
 }
 
+// poolKey is the ReverseProxy Transport's idle-connection pool key for a route —
+// distinct per backend (floatingip:port for TCP, the UDS path for control) so a
+// kept-alive connection is NEVER reused across sandboxes/ports/UDS targets. The
+// real dial is DialContext's (from the route in context); this is only the pool
+// key (and the addr it ignores). A constant key here is the cross-route-reuse
+// bug: a port-forward could reuse an envd-control connection and hit envd.
+func poolKey(r Route) string {
+	switch r.Kind {
+	case KindTCP:
+		return r.Addr
+	case KindUDS:
+		return "uds." + strings.ReplaceAll(strings.Trim(r.UDS, "/"), "/", "-")
+	default:
+		return "sandbox"
+	}
+}
+
 type routeKey struct{}
 
 type Proxy struct {
@@ -104,7 +121,16 @@ func New(router Router, authMode func() string, log *slog.Logger, mx *metrics.M)
 	p.rp = &httputil.ReverseProxy{
 		Director: func(req *http.Request) {
 			req.URL.Scheme = "http"
-			req.URL.Host = "sandbox" // placeholder; real dial is via DialContext+route
+			// Key the idle-connection pool by the RESOLVED route. The Transport
+			// pools keep-alive connections by req.URL.Host; a single constant
+			// here let one sandbox's request reuse a kept-alive connection that
+			// DialContext had opened for a DIFFERENT route (e.g. a port-forward
+			// reusing an envd-control UDS connection from a prior exec → the
+			// request hits envd and 404s). DialContext still does the real dial
+			// from the route in context; the upstream Host header stays req.Host
+			// (the client's). Per-route keys confine reuse to the same backend.
+			r, _ := req.Context().Value(routeKey{}).(Route)
+			req.URL.Host = poolKey(r)
 		},
 		Transport:     tr,
 		FlushInterval: -1, // stream immediately (process.Start / WatchDir / files)
