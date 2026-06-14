@@ -7,6 +7,8 @@
 #   • local L1 cache (cache-ctl, tiered rocksdb L1 → store origin) on  $CACHE_SOCK
 #   • an image registry — either a third-party REGISTRY you point at, or a persistent
 #     local zot this script spins up — seeded once with the e2b base image.
+#   • versitygw (S3 gateway) on 127.0.0.1:$VGW_PORT, backing COPY build contexts
+#     (builder.files_storage) — optional; absent → the demo build omits COPY.
 #
 # Storage/cache bind UNIX sockets (no TCP port); their data lives under DEMO_DATA_DIR
 # (default ~/.cache/kuasar-demo), NOT a temp dir, so content survives across runs.
@@ -35,6 +37,20 @@ LOG_DIR="$DEMO_DATA_DIR/logs"
 E2E_IMAGE="${E2E_IMAGE:-e2bdev/code-interpreter:latest}"
 REGISTRY_NS="${REGISTRY_NS:-e2b}"
 ZOT_BIN="${ZOT_BIN:-$(command -v zot || true)}"
+# versitygw (S3 gateway) backs COPY build contexts (builder.files_storage). It is
+# opt-in (sandbox-deps `make versitygw`) and NOT in the umbrella bin, so locate it
+# like the e2e: $BIN, then the sibling sandbox-deps bin, then PATH. Absent → COPY
+# is disabled and demo_e2b.sh's build omits the COPY step (the rest still runs).
+if [ -z "${VGW_BIN:-}" ]; then
+    for cand in "$BIN/versitygw" "$REPO_ROOT/../sandbox-deps/bin/versitygw" "$(command -v versitygw 2>/dev/null || true)"; do
+        [ -n "$cand" ] && [ -x "$cand" ] && { VGW_BIN="$cand"; break; }
+    done
+fi
+VGW_PORT="${VGW_PORT:-5050}"
+VGW_BUCKET="${VGW_BUCKET:-build-files}"
+VGW_ACCESS_KEY="${VGW_ACCESS_KEY:-demoaccesskey}"
+VGW_SECRET_KEY="${VGW_SECRET_KEY:-demosecretkey0123456}"
+VGW_ENDPOINT=""
 
 c_ok=$'\e[1;32m'; c_dim=$'\e[2m'; c_off=$'\e[0m'; [ -t 1 ] || { c_ok=; c_dim=; c_off=; }
 say() { echo "${c_dim}  · $*${c_off}"; }
@@ -65,7 +81,7 @@ esac
 for b in store-ctl cache-ctl; do [ -x "$BIN/$b" ] || die "missing $BIN/$b — run 'make build' (cache-ctl needs CGO/rocksdb)"; done
 command -v docker >/dev/null 2>&1 || die "docker not on PATH (needed once to seed the base image into the registry)"
 [ "$(id -u)" -eq 0 ] || say "note: $RUN_DIR usually needs root; re-run under sudo if socket creation fails"
-mkdir -p "$DEMO_DATA_DIR" "$PID_DIR" "$LOG_DIR" "$DEMO_DATA_DIR/store" "$DEMO_DATA_DIR/cache-rocks" "$DEMO_DATA_DIR/zot" "$RUN_DIR"
+mkdir -p "$DEMO_DATA_DIR" "$PID_DIR" "$LOG_DIR" "$DEMO_DATA_DIR/store" "$DEMO_DATA_DIR/cache-rocks" "$DEMO_DATA_DIR/zot" "$DEMO_DATA_DIR/vgw" "$RUN_DIR"
 
 # ---- registry: third-party (REGISTRY set) or a persistent local zot -------
 REGISTRY_INSECURE="${REGISTRY_INSECURE:-}"
@@ -131,6 +147,24 @@ fi
 [ -S "$CACHE_SOCK" ] || die "cache-ctl did not bind $CACHE_SOCK (see $LOG_DIR/cache.log)"
 ok "cache-ctl (L1 tiered) on $CACHE_SOCK (rocks $DEMO_DATA_DIR/cache-rocks)"
 
+# ---- versitygw: S3 gateway for COPY build contexts (persistent; posix backend) --
+# The e2b SDK direct-uploads a COPY context here (presigned PUT) and the build
+# fetches it (presigned GET) — both from the host (127.0.0.1), so unlike zot it
+# needs NO guest reachability (run-builder fetches host-side, streams into guest).
+if [ -n "${VGW_BIN:-}" ]; then
+    if ! alive vgw; then
+        ROOT_ACCESS_KEY="$VGW_ACCESS_KEY" ROOT_SECRET_KEY="$VGW_SECRET_KEY" \
+            start vgw "$VGW_BIN" --port "127.0.0.1:$VGW_PORT" posix "$DEMO_DATA_DIR/vgw"
+        for _ in $(seq 1 40); do (exec 3<>"/dev/tcp/127.0.0.1/$VGW_PORT") 2>/dev/null && { exec 3>&- 3<&-; break; }; sleep 0.25; done
+    fi
+    mkdir -p "$DEMO_DATA_DIR/vgw/$VGW_BUCKET"   # posix backend: a bucket is a top-level dir
+    (exec 3<>"/dev/tcp/127.0.0.1/$VGW_PORT") 2>/dev/null && { exec 3>&- 3<&-; VGW_ENDPOINT="http://127.0.0.1:$VGW_PORT"; } \
+        || die "versitygw did not bind 127.0.0.1:$VGW_PORT (see $LOG_DIR/vgw.log)"
+    ok "versitygw (S3, COPY contexts) on $VGW_ENDPOINT (bucket $VGW_BUCKET, data $DEMO_DATA_DIR/vgw)"
+else
+    say "versitygw not found — COPY build contexts disabled (run 'make -C ../sandbox-deps versitygw'); the demo build will omit COPY"
+fi
+
 # ---- seed the base image into the registry (once; cached on reruns) --------
 if curl -s -o /dev/null -w '%{http_code}' ${REGISTRY_INSECURE:+} "http${REGISTRY_INSECURE:+}://$REGISTRY/v2/$REGISTRY_NS/base/manifests/v1" 2>/dev/null | grep -q '^200$'; then
     say "base image already in registry: $BASE_REF (cached)"
@@ -152,6 +186,11 @@ export REGISTRY_PASS='${REGISTRY_PASS:-}'
 export STORE_SOCK='$STORE_SOCK'
 export CACHE_SOCK='$CACHE_SOCK'
 export BASE_REF='$BASE_REF'
+export VGW_ENDPOINT='$VGW_ENDPOINT'
+export VGW_BUCKET='$VGW_BUCKET'
+export VGW_REGION='us-east-1'
+export VGW_ACCESS_KEY='$VGW_ACCESS_KEY'
+export VGW_SECRET_KEY='$VGW_SECRET_KEY'
 EOF
 echo
 ok "prep ready — run the demo (it reads $ENV_FILE automatically):"
