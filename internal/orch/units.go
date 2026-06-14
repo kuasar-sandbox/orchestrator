@@ -89,6 +89,11 @@ WorkingDirectory=%s/%%i
 # (StandardError defaults to inherit, which would mirror stdout into the file).
 StandardOutput=file:%s/%%i/%%i.result
 StandardError=journal
+# Builds are few and we want the FULL detail in the journal (every phase
+# sandbox console line + flatten/RUN progress); disable journald rate limiting
+# for this unit so no line is dropped. (Runner units keep the default limit —
+# thousands of sandboxes must not flood the journal.)
+LogRateLimitIntervalSec=0
 # run-builder pulls the BuildSpec (secrets in env, never on disk) over the
 # config-socket and drives the three-phase pipeline itself — its phase
 # sandboxes (sandbox-ctl run + cloud-hypervisor) are direct children, so the

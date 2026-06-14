@@ -8,6 +8,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -60,6 +61,14 @@ type TriggerSpec struct {
 	ReadyCmd     string
 }
 
+// BuildLogEntry is one build-progress line surfaced to the SDK (e2b BuildLogEntry:
+// {timestamp, level, message}). Level is one of debug|info|warn|error.
+type BuildLogEntry struct {
+	Timestamp time.Time
+	Level     string
+	Message   string
+}
+
 // CreateReq is the decoded POST /sandboxes body (subset the SDK sends).
 type CreateReq struct {
 	TemplateID string            `json:"templateID"`
@@ -90,6 +99,9 @@ type Core interface {
 	RegisterBuild(ctx context.Context, apiKey, name string, tags []string) (*types.Build, error)
 	TriggerBuild(ctx context.Context, apiKey, templateID, buildID string, spec TriggerSpec, auth BuildAuth) error
 	BuildStatus(ctx context.Context, apiKey, templateID, buildID string) (*types.Build, error)
+	// BuildLogs returns the build's progress log entries from offset onward
+	// (the SDK polls /status with ?logsOffset and streams them via on_build_logs).
+	BuildLogs(ctx context.Context, apiKey, templateID, buildID string, offset int) ([]BuildLogEntry, error)
 	ListTemplates(ctx context.Context, apiKey string) ([]*types.Build, error)
 	// FilesUpload backs GET /templates/{tid}/files/{hash} (COPY build contexts):
 	// resolves+authorizes the build, reports whether the object is already
@@ -405,12 +417,28 @@ func (a *API) buildStatus(w http.ResponseWriter, r *http.Request) {
 	if b.PersistID != "" {
 		tid = b.PersistID
 	}
+	// Build progress: the SDK polls with ?logsOffset (count already seen) and
+	// streams the new entries via on_build_logs. logEntries is structured;
+	// logs mirrors the messages (the SDK requires both fields).
+	offset, _ := strconv.Atoi(r.URL.Query().Get("logsOffset"))
+	entries, _ := a.core.BuildLogs(r.Context(), apiKeyFrom(r.Context()),
+		r.PathValue("tid"), r.PathValue("bid"), offset)
+	logEntries := make([]any, 0, len(entries))
+	logs := make([]string, 0, len(entries))
+	for _, e := range entries {
+		logEntries = append(logEntries, map[string]any{
+			"timestamp": e.Timestamp.UTC().Format(time.RFC3339Nano),
+			"level":     e.Level,
+			"message":   e.Message,
+		})
+		logs = append(logs, e.Message)
+	}
 	resp := map[string]any{
 		"templateID": tid,
 		"buildID":    b.BuildID,
 		"status":     b.Status.SDKStatus(),
-		"logs":       []string{}, // paginated by logsOffset
-		"logEntries": []any{},
+		"logs":       logs,
+		"logEntries": logEntries,
 	}
 	if b.Reason != "" {
 		resp["reason"] = map[string]any{"message": b.Reason}

@@ -42,6 +42,24 @@ const (
 	PathAdminManifestKey = "/internal/admin/manifest-keys"
 )
 
+// journald SYSLOG_IDENTIFIER tags the sandbox stack writes under (shared so the
+// producers — sandbox-ctl, the build pipeline — and the orchestrator's log query
+// all agree on one vocabulary). The producer writes the tag; journald auto-stamps
+// _SYSTEMD_UNIT (the writer's unit cgroup), so a tag+unit pair selects one stream.
+//
+//   - BuildLogTag ("build")   curated build progress under sandbox-builder@<bid>:
+//     run-builder's milestones + relayed RUN output + the phase sandboxes' own
+//     app stdio. This is the ONLY tag the orchestrator surfaces to the SDK.
+//   - RunnerLogTag ("sandbox") a live sandbox's app stdio under
+//     sandbox-runner@<sid>; host-only telemetry.
+//   - ConsoleTag ("console")  guest kernel dmesg, written by BOTH runner and
+//     builder sandboxes; host-only (deliberately NOT in the SDK build log).
+const (
+	BuildLogTag  = "build"
+	RunnerLogTag = "sandbox"
+	ConsoleTag   = "console"
+)
+
 // Request is what a task client (orchestrator-ctl run-sandbox / run-builder) sends.
 type Request struct {
 	ConfigID string `json:"config_id"`

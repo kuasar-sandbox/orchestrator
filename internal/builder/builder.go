@@ -69,6 +69,7 @@ type Result struct {
 type buildPipeline struct {
 	spec *configsock.BuildSpec
 	log  *slog.Logger
+	out  *buildJournal // curated build progress → journald SYSLOG_IDENTIFIER=build (SDK-visible)
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -82,13 +83,24 @@ type buildPipeline struct {
 
 const guestFlatten = "/opt/sandbox-runtime/bin/flatten-ctl"
 
+// journald SYSLOG_IDENTIFIER tags (shared contract with the orchestrator's log
+// query, defined in configsock): buildTag = curated build progress (SDK-visible),
+// consoleTag = guest kernel dmesg (host-only).
+const (
+	buildTag   = configsock.BuildLogTag
+	consoleTag = configsock.ConsoleTag
+)
+
 func (p *buildPipeline) run() (res Result) {
 	s := p.spec
 	p.ctx, p.cancel = context.WithTimeout(context.Background(),
 		time.Duration(s.Timeouts.TotalSec)*time.Second)
 	defer p.cancel()
+	p.out = newBuildJournal()
+	defer p.out.Close()
 	fail := func(err error) Result {
 		p.log.Error("build", "bid", s.BuildID, "err", err)
+		p.progress("build failed: %v", err) // surface the failure in the build log too
 		return Result{Error: err.Error()}
 	}
 

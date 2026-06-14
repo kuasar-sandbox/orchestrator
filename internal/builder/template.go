@@ -37,11 +37,11 @@ func (p *buildPipeline) phaseTemplate() (string, error) {
 	// a lost stream, so the snapshot freezes it as an envd-MANAGED
 	// process (visible/connectable from sandboxes spawned off the
 	// template). e2b defaults: user "user", /home/user.
-	sess := &envdExec{uds: envdUDS, log: p.log}
+	sess := &envdExec{uds: envdUDS, log: p.log, out: p.out}
 	if s.MMDSEnabled && s.EnvdToken != "" {
 		sess.token = s.EnvdToken // /init armed envd; RPCs need the token now
 	}
-	p.log.Info("template: starting", "cmd", p.startCmd)
+	p.progress("template: starting %s", p.startCmd)
 	sc, err := sess.start(p.ctx, "user", "/home/user", nil, p.startCmd)
 	if err != nil {
 		return "", fmt.Errorf("startCmd: %w", err)
@@ -70,7 +70,7 @@ func (p *buildPipeline) phaseTemplate() (string, error) {
 		case <-time.After(2 * time.Second):
 		}
 	}
-	p.log.Info("template: ready")
+	p.progress("template: ready")
 	// Release the stream; a start command that already FAILED fails the
 	// build (a clean early exit is fine — one-shot start commands).
 	if err := sc.stop(); err != nil {
@@ -86,7 +86,7 @@ func (p *buildPipeline) phaseTemplate() (string, error) {
 	if _, err := os.Stat(bundle); err != nil {
 		return "", fmt.Errorf("snapshot bundle missing: %w", err)
 	}
-	p.log.Info("template: snapshot taken", "bundle", bundle)
+	p.progress("template: snapshot taken")
 	return bundle, nil
 }
 
@@ -153,6 +153,7 @@ func udsHTTP(uds string) *http.Client {
 // --- finale: uploads ---------------------------------------------------------
 
 func (p *buildPipeline) uploadImage() (string, error) {
+	p.progress("uploading image to the content store")
 	out, err := p.hostCmdEnv(p.spec.Env, p.spec.Paths.ManifestCtl,
 		"store", "--no-progress", "--manifest-config", p.spec.Paths.ManifestConfig, p.imagePath)
 	if err != nil {
@@ -162,7 +163,7 @@ func (p *buildPipeline) uploadImage() (string, error) {
 	if len(key) != 64 {
 		return "", fmt.Errorf("manifest-ctl store output %q (want 64-hex key)", key)
 	}
-	p.log.Info("uploaded image", "key", key)
+	p.progress("uploaded image: %s", key)
 	return key, nil
 }
 
@@ -170,6 +171,7 @@ func (p *buildPipeline) uploadSnapshot(bundle string) (string, error) {
 	// upload-snapshot auto-uploads every local artifact the snapshot.cfg
 	// references (the base image is a bundle-dir sibling) and rewrites
 	// the refs to manifest:// — one command finishes the build.
+	p.progress("uploading template snapshot to the content store")
 	out, err := p.hostCmdEnv(p.spec.Env, p.spec.Paths.SandboxCtl,
 		"upload-snapshot", "--manifest-config", p.spec.Paths.ManifestConfig, "--quiet", bundle)
 	if err != nil {
@@ -180,6 +182,6 @@ func (p *buildPipeline) uploadSnapshot(bundle string) (string, error) {
 	if len(key) != 64 {
 		return "", fmt.Errorf("upload-snapshot output %q (want 64-hex key)", key)
 	}
-	p.log.Info("uploaded snapshot", "key", key)
+	p.progress("uploaded template snapshot: %s", key)
 	return key, nil
 }

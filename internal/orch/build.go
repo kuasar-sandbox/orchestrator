@@ -294,10 +294,20 @@ type pendingBuild struct {
 // entry so the build sandbox's FC-mode envd can resolve itself.
 func (o *Orchestrator) executeBuild(ctx context.Context, b *types.Build) {
 	res, err := o.runBuildUnit(ctx, b)
-	if err == nil && res.Error != "" {
-		err = fmt.Errorf("%s", res.Error)
-	}
-	if err != nil {
+	switch {
+	case err == nil && res.Error != "":
+		// The pipeline ran and reported its own failure. run-builder's fail()
+		// already wrote "build failed: <detail>" to the build log stream (tag
+		// build), which the SDK is streaming — so reason.message stays generic
+		// and the detail lives in the log, not a duplicated BuildException tail.
+		b.Status, b.Reason = types.BuildError, "build failed; see build logs"
+		_ = o.st.PutBuild(ctx, b)
+		o.log.Warn("build failed", "bid", b.BuildID, "err", res.Error)
+		return
+	case err != nil:
+		// Infrastructure failure: the pipeline never ran (or produced no
+		// result), so there is NO build log for it — surface the orchestrator-
+		// side error directly, it is the only signal.
 		b.Status, b.Reason = types.BuildError, err.Error()
 		_ = o.st.PutBuild(ctx, b)
 		o.log.Warn("build failed", "bid", b.BuildID, "err", err)

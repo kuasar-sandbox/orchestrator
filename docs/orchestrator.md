@@ -376,7 +376,7 @@ envd,回占位 token,数据面控制端口 501。`trafficAccessToken` 为 SDK �
 |---|---|---|
 | register | `POST /v3/templates` → 202 | body `{name, tags}`;回 `{templateID: transient-<uuidv7>, buildID, names, tags, aliases, public:false}` |
 | trigger | `POST /v2/templates/{tid}/builds/{bid}` → 202 | body 兼容 `{fromImage, fromTemplate, fromImageRegistry{username,password}, steps[], startCmd, readyCmd}` 与 CLI 形态 `{start_cmd, ready_cmd, …}`;`fromImage`/`fromTemplate` 互斥,皆缺时由 `builder.image_uri_mask` 推 fromImage;steps 支持 `RUN/ENV/ARG/WORKDIR/USER/COPY`(COPY 须先经 files 端点上传 context:未配 files_storage→**501**、未上传→**400**,§11);`startCmd` 非空或 fromTemplate ⇒ 暂记 snp(终态以流水线产物为准,§11),否则 img;fromTemplate 且无 steps 无 startCmd ⇒ 拒绝(无事可做) |
-| status | `GET /templates/{tid}/builds/{bid}/status` | 回 `{templateID, buildID, status, logs:[], logEntries:[]}` + 失败时 `reason{message}`;**进行中恒报 `building`**(registered/waiting/building 均映射,CLI wait 循环仅在 `building` 续轮询),终态 `ready`/`error`;ready 后 `templateID` 即报持久 id,并附 `names`/`aliases` |
+| status | `GET /templates/{tid}/builds/{bid}/status` | 回 `{templateID, buildID, status, logs:[], logEntries:[]}` + 失败时 `reason{message}`;`logs`/`logEntries` 取自 journald 构建流(tag build),按 `?logsOffset`(已读条数)分页,SDK `on_build_logs` 即据此流式输出(§11);**进行中恒报 `building`**(registered/waiting/building 均映射,CLI wait 循环仅在 `building` 续轮询),终态 `ready`/`error`;失败 `reason` 通用(详情在日志流);ready 后 `templateID` 即报持久 id,并附 `names`/`aliases` |
 | files | `GET /templates/{tid}/files/{hash}` → 201 | COPY context 上传协商:`tid→build→归属`校验后回 `{present, url}`——present 即对象已在桶(客户端跳过上传),url 为**直传桶的 presigned PUT**(字节不过控制面);未配 `files_storage`→**501**,未知/非属主 tid→**404**。详见 §11 |
 | list | `GET /templates` | 本租户 ready 模板;`templateID` 列为持久 id |
 
@@ -456,6 +456,7 @@ Type=oneshot
 WorkingDirectory=/run/sandbox/%i
 StandardOutput=file:/run/sandbox/%i/%i.result   # 捕获 run-builder stdout 的构建结果 JSON
 StandardError=journal                           # 流水线进度/报错进 journal,不污染 .result
+LogRateLimitIntervalSec=0                        # 构建少且要全量细节(每阶段控制台 + flatten/RUN 进度):关本单元限流不丢行(runner 单元保留默认限流,§5.2)
 ExecStart=<orchestrator-ctl> run-builder --pidfile=/run/sandbox/%i/%i.pid \
           --config-socket=/run/sandbox/orchestrator.socket --build-id=%i
 TimeoutStartSec=1860              # builder.total_timeout_sec + 60
@@ -492,6 +493,32 @@ orchestrator 不预建 cgroup、不做进程搬迁。LaunchSpec 给 sandbox-ctl 
   非本进程可写,`--cgroup-adopt` 写资源上限会 `permission denied`。
 - 代价:sandbox-ctl 与 CH 同处受限 cgroup,`memory.high` 节流存在死锁风险(见
   sandbox-runtime `pkg/sandbox/cgroup.go` 头注)。采纳此模型并照常设 `memory.high`。
+
+### 5.2 日志:journald 单汇 + 标签词表
+
+沙箱栈的 app stdio 与 guest 内核 dmesg 全部直写 journald(无临时日志文件),由
+`SYSLOG_IDENTIFIER` 标签区分;journald 按写入进程的 cgroup 自动盖 `_SYSTEMD_UNIT`,
+故"标签 + 单元"二元组即选定一路流。写者是 **sandbox-ctl** 的 stdio bridge
+(`--stdout-to/--stderr-to/--console journald=<tag>`,语义见 sandbox-runtime
+sandbox.md §2.2)与 run-builder(自身里程碑 + envd RUN 输出回放,`go-systemd/journal`
+纯 Go 直发):
+
+| 标签 | 写者 / 单元 | 内容 | 去向 |
+|---|---|---|---|
+| `sandbox` | runner 沙箱 / `sandbox-runner@<sid>` | 沙箱 app stdio | 仅宿主排障 |
+| `build` | builder 阶段沙箱 + run-builder / `sandbox-builder@<bid>` | 阶段 app stdio + 里程碑 + RUN 回放 + flatten 进度 | **SDK 构建日志**(§11);宿主亦可见 |
+| `console` | runner / builder 两类沙箱 | guest 内核 dmesg | **仅宿主**(故意不入 SDK 构建日志) |
+
+- **runner**:LaunchSpec(§6)给 sandbox-ctl 带 `--stdout-to journald=sandbox
+  --stderr-to journald=sandbox --console journald=console`;exec 替换后在 runner 单元
+  cgroup 内直写,标签自动归 `sandbox-runner@<sid>`。`journalctl -u
+  sandbox-runner@<sid>.service [SYSLOG_IDENTIFIER=sandbox|console]` 按沙箱取流。
+- **builder**:run-builder 给每台阶段沙箱带 `journald=build`(app)/`journald=console`
+  (内核);单元 `LogRateLimitIntervalSec=0` 保证不丢行(§5)。
+- **限流策略**:builder 单元关限流(构建少、要全量细节);runner 单元保留默认限流
+  (数千沙箱不得刷爆 journal)。
+- sandbox-ctl 自身进程日志(其 stderr)随单元落 journal 但**不带标签**——属宿主排障,
+  不进任何标签过滤流(也不入 .result:那是 run-builder stdout 专用)。
 
 ## 6. 本机控制 socket(task / admin / api 三平面)
 
@@ -889,6 +916,26 @@ versitygw`)。force_path_style 默认 false(虚拟主机式;versitygw/minio 置 
 `{image_key|snapshot_key, start_cmd, ready_cmd, error}` 打 stdout → `<bid>.result`;
 快照模板的 start/ready 同时记进 snapshot.cfg metadata,模板自描述(fromTemplate
 继承与 create 都读它)。
+
+**构建日志流(journald 单汇 → status API → SDK on_build_logs)**:构建进度对 SDK
+实时可见,零临时文件——全部写 journald 标签 `build`(机制 + 标签词表见 §5.2),
+orchestrator 按需查询单元日志回给 SDK。**写入**(tag build,单元
+`sandbox-builder@<bid>`):run-builder 里程碑(`import: pulling…`、`step N: RUN…`、
+`template: ready`、`uploading…`)经 `go-systemd/journal` 直发;RUN/startCmd 输出由
+持流的 run-builder 从 envd 流回放进同一汇(envd 自身无 journal);阶段 app stdio 由
+sandbox-ctl `--stdout-to/--stderr-to journald=build` 直写;flatten 拉取/导出进度经
+`sandbox-ctl exec --stderr-to journald=build`(去掉 `--no-progress`,故 SDK 见
+`pull: N/M layers`、`flatten: …` 滚动);失败时 run-builder 补写一行
+`build failed: <err>`。guest 内核 dmesg(tag console)与 sandbox-ctl 自身日志不在此
+过滤,SDK 见干净构建日志。**读取**:status(§4.2)按 `?logsOffset`(已读条数)分页;
+orchestrator `journalctl _SYSTEMD_UNIT=sandbox-builder@<bid>.service
+SYSLOG_IDENTIFIER=build --output=json` 取 MESSAGE/PRIORITY/时间戳,PRIORITY→e2b level
+(≤3 error、4 warn、≥7 debug、余 info),切片 `[offset:]` 回
+`{logs[], logEntries[{timestamp, level, message}]}`;尽力而为(非 systemd / 无日志 →
+空,不阻断 status)。CGO-free:sdjournal 读需 CGO,故 journalctl 子进程读、
+`go-systemd/journal` 纯 Go 写。**失败语义**:流水线失败 ⇒ `reason.message` 保持通用
+(`build failed; see build logs`),详情已在日志流里(零额外机制);基础设施失败
+(流水线未起、无 .result)无构建日志,`reason` 直陈宿主侧错误。
 
 **fromImage 的来源**:trigger body 显式给出;或(e2b CLI 在客户端 `docker build` +
 `docker push` 到约定名、trigger 不带镜像引用的工作流)由 `builder.image_uri_mask`

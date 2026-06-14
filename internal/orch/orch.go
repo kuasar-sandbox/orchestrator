@@ -487,6 +487,15 @@ func (o *Orchestrator) sandboxLaunchSpec(ctx context.Context, sid string) (*conf
 		"--manifest-config", o.cfg.ManifestConfig,
 		"--run-root", o.cfg.Paths.RunRoot,
 		"--cgroup-adopt",
+		// Route the sandbox's stdio + kernel dmesg to journald under this runner
+		// unit (sandbox-runner@<sid>): app stdout/stderr tagged "sandbox", guest
+		// dmesg tagged "console" — host-only telemetry, queryable per-sandbox via
+		// `journalctl -u sandbox-runner@<sid>.service [SYSLOG_IDENTIFIER=…]`.
+		// sandbox-ctl exec-replaces run-sandbox into this unit's cgroup, so
+		// journald stamps the right _SYSTEMD_UNIT automatically.
+		"--stdout-to", "journald=" + configsock.RunnerLogTag,
+		"--stderr-to", "journald=" + configsock.RunnerLogTag,
+		"--console", "journald=" + configsock.ConsoleTag,
 	}
 	if r := p.RestoreRef(); r != "" {
 		args = append(args, "--restore", r)

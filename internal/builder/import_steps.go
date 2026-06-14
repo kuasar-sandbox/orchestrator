@@ -31,7 +31,10 @@ func (p *buildPipeline) phaseImport() error {
 		return err
 	}
 
-	args := []string{"export", "--no-progress", "--tmpdir", "/pull"}
+	// No --no-progress: flatten-ctl's pull/flatten progress goes to the guest
+	// command stderr, which sandbox-ctl streams to journald=build (stdout is
+	// the artifact). So the SDK sees `pull: N/M layers`, `flatten: …` live.
+	args := []string{"export", "--tmpdir", "/pull"}
 	if s.Insecure {
 		args = append(args, "--insecure")
 	}
@@ -43,8 +46,8 @@ func (p *buildPipeline) phaseImport() error {
 	p.imagePath = filepath.Join(s.Workdir, "image.img")
 	ctx, cancel := context.WithTimeout(p.ctx, time.Duration(s.Timeouts.PullSec)*time.Second)
 	defer cancel()
-	p.log.Info("import: pulling in-guest", "image", s.FromImage)
-	if err := sb.exec(ctx, execOpts{env: p.tenantEnv(), stdoutTo: p.imagePath},
+	p.progress("import: pulling + flattening %s", s.FromImage)
+	if err := sb.exec(ctx, execOpts{env: p.tenantEnv(), stdoutTo: p.imagePath, stderrTo: "journald=" + buildTag},
 		append([]string{guestFlatten}, args...)...); err != nil {
 		return err
 	}
@@ -53,7 +56,7 @@ func (p *buildPipeline) phaseImport() error {
 	}
 	p.baseRef = "file://" + p.imagePath
 	p.overlayBase = "" // a freshly imported image is a complete base, no overlay lower
-	p.log.Info("import: image artifact ready", "path", p.imagePath)
+	p.progress("import: image artifact ready")
 	return nil
 }
 
@@ -125,7 +128,7 @@ func (p *buildPipeline) phaseSteps() error {
 	// COPY instead streams its context tar through sandbox-ctl exec into
 	// flatten-ctl (a platform filesystem op, not an e2b process) — sb carries
 	// that channel.
-	sess := &envdExec{uds: envdUDS, log: p.log}
+	sess := &envdExec{uds: envdUDS, log: p.log, out: p.out}
 	for i, st := range s.Steps {
 		if err := p.applyStep(sb, sess, ctxv, i, st); err != nil {
 			return err
@@ -152,9 +155,9 @@ func (p *buildPipeline) phaseSteps() error {
 	newImg := filepath.Join(s.Workdir, "image.new.img")
 	ctx, cancel := context.WithTimeout(p.ctx, time.Duration(s.Timeouts.PullSec)*time.Second)
 	defer cancel()
-	p.log.Info("steps: exporting rootfs")
-	if err := sb.exec(ctx, execOpts{stdoutTo: newImg},
-		guestFlatten, "export", "--no-progress", "--skip-mounts",
+	p.progress("steps: exporting rootfs")
+	if err := sb.exec(ctx, execOpts{stdoutTo: newImg, stderrTo: "journald=" + buildTag},
+		guestFlatten, "export", "--skip-mounts",
 		"--runtime-config", "/.kuasar-build/config.json",
 		"--tmpdir", "/.kuasar-build", "--output", "-", "/"); err != nil {
 		return err
@@ -196,7 +199,7 @@ func (p *buildPipeline) applyStep(sb *phaseSandbox, sess *envdExec, c *stepCtx, 
 	switch strings.ToUpper(st.Type) {
 	case "RUN":
 		cmd := sub(strings.Join(st.Args, " "))
-		p.log.Info("step", "n", i, "run", cmd)
+		p.progress("step %d: RUN %s", i, cmd)
 		user, cwd := c.user, c.workdir
 		if user == "" {
 			user = "root"
@@ -273,10 +276,10 @@ func (p *buildPipeline) applyCopy(sb *phaseSandbox, c *stepCtx, i int, st config
 	}
 	args = append(args, rule)
 
-	p.log.Info("step", "n", i, "copy", st.Args[0]+" -> "+st.Args[1], "rule", rule, "owner", owner)
+	p.progress("step %d: COPY %s -> %s (owner %s)", i, st.Args[0], st.Args[1], owner)
 	ctx, cancel := context.WithTimeout(p.ctx, time.Duration(p.spec.Timeouts.StepSec)*time.Second)
 	defer cancel()
-	return sb.exec(ctx, execOpts{stdinFrom: rawTar}, args...)
+	return sb.exec(ctx, execOpts{stdinFrom: rawTar, stderrTo: "journald=" + buildTag}, args...)
 }
 
 // fetchCopyContext downloads the gzipped context tar from the presigned GET

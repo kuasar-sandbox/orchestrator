@@ -23,7 +23,6 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -32,8 +31,9 @@ import (
 
 type envdExec struct {
 	uds   string
-	token string // X-Access-Token, once /init armed envd (mmds posture)
+	token string    // X-Access-Token, once /init armed envd (mmds posture)
 	log   *slog.Logger
+	out   io.Writer // RUN/startCmd output relay → build journal (tag build); nil = drop
 }
 
 // request opens one process.Start stream. timeout > 0 rides
@@ -186,10 +186,14 @@ func (e *envdExec) run(ctx context.Context, user, cwd string, env map[string]str
 		if err := json.Unmarshal(f.msg, &ev); err != nil {
 			continue
 		}
+		var out io.Writer
+		if !quiet {
+			out = e.out // forward RUN output to the build journal; quiet (probes/readyCmd) drops it
+		}
 		switch {
 		case ev.Event.Data != nil:
-			forwardOutput(ev.Event.Data.Stdout, &tail, quiet)
-			forwardOutput(ev.Event.Data.Stderr, &tail, quiet)
+			forwardOutput(ev.Event.Data.Stdout, &tail, out)
+			forwardOutput(ev.Event.Data.Stderr, &tail, out)
 		case ev.Event.End != nil:
 			exit, exited = ev.Event.End.ExitCode, true
 			if ev.Event.End.Error != nil {
@@ -265,8 +269,8 @@ func (e *envdExec) start(ctx context.Context, user, cwd string, env map[string]s
 			}
 			switch {
 			case ev.Event.Data != nil:
-				forwardOutput(ev.Event.Data.Stdout, &tail, false)
-				forwardOutput(ev.Event.Data.Stderr, &tail, false)
+				forwardOutput(ev.Event.Data.Stdout, &tail, e.out)
+				forwardOutput(ev.Event.Data.Stderr, &tail, e.out)
 			case ev.Event.End != nil:
 				// An early exit is fine when clean (one-shot start commands);
 				// a failure must fail the build (e2b does the same).
@@ -292,9 +296,10 @@ func (sc *startedCmd) stop() error {
 	return sc.exitErr
 }
 
-// forwardOutput decodes one base64 data chunk, mirrors it to stderr
-// (the journal) unless quiet, and keeps a bounded tail for errors.
-func forwardOutput(b64 string, tail *bytes.Buffer, quiet bool) {
+// forwardOutput decodes one base64 data chunk, relays it to out (the build
+// journal; nil = drop, e.g. readiness probes), and keeps a bounded tail for
+// error messages.
+func forwardOutput(b64 string, tail *bytes.Buffer, out io.Writer) {
 	if b64 == "" {
 		return
 	}
@@ -302,8 +307,8 @@ func forwardOutput(b64 string, tail *bytes.Buffer, quiet bool) {
 	if err != nil || len(data) == 0 {
 		return
 	}
-	if !quiet {
-		_, _ = os.Stderr.Write(data)
+	if out != nil {
+		_, _ = out.Write(data)
 	}
 	if tail.Len() > 4096 {
 		tail.Reset()

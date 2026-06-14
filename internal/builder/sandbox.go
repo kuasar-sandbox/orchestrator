@@ -43,7 +43,14 @@ func (p *buildPipeline) startSandbox(phase string, doc map[string]any, connect [
 		return nil, err
 	}
 
-	args := []string{"run", "--config", yamlPath, "--run-root", runRoot, "--sandbox-id", sid}
+	args := []string{"run", "--config", yamlPath, "--run-root", runRoot, "--sandbox-id", sid,
+		// App stdio + kernel dmesg → journald straight from sandbox-ctl (it's
+		// our child, in this unit's cgroup, so journald tags _SYSTEMD_UNIT=
+		// sandbox-builder@<bid>): app under "build" (SDK-visible build log),
+		// kernel under "console" (host-only). No per-phase log file.
+		"--stdout-to", "journald=" + buildTag,
+		"--stderr-to", "journald=" + buildTag,
+		"--console", "journald=" + consoleTag}
 	if strings.HasPrefix(p.baseRef, "manifest://") || s.FromTemplateKind != "" {
 		args = append(args, "--manifest-config", s.Paths.ManifestConfig)
 	}
@@ -52,19 +59,16 @@ func (p *buildPipeline) startSandbox(phase string, doc map[string]any, connect [
 	}
 	cmd := exec.Command(s.Paths.SandboxCtl, args...)
 	cmd.Env = append(os.Environ(), "MANIFEST_KEY="+s.Env["MANIFEST_KEY"])
-	logf, err := os.Create(filepath.Join(s.Workdir, phase+".log"))
-	if err != nil {
-		return nil, err
-	}
-	cmd.Stdout, cmd.Stderr = logf, logf
+	// sandbox-ctl's OWN logs (its process stdio; the app/kernel are off on
+	// journald) inherit run-builder's stderr → builder unit journal, untagged
+	// (host debug). NOT stdout: that is reserved for run-builder's result JSON.
+	cmd.Stdout, cmd.Stderr = os.Stderr, os.Stderr
 	if err := cmd.Start(); err != nil {
-		logf.Close()
 		return nil, fmt.Errorf("spawn sandbox-ctl: %w", err)
 	}
 	sb := &phaseSandbox{p: p, sid: sid, runRoot: runRoot, cmd: cmd, done: make(chan error, 1)}
 	go func() {
 		sb.done <- cmd.Wait()
-		logf.Close()
 	}()
 	p.log.Info("phase sandbox up", "phase", phase, "sid", sid)
 	return sb, nil
@@ -106,7 +110,8 @@ func (sb *phaseSandbox) waitExecReady(ctx context.Context, timeout time.Duration
 // envd instead (envdExec).
 type execOpts struct {
 	env       []string // KEY=VALUE pairs forwarded as --env (tenant FLATTEN_*)
-	stdoutTo  string   // write command stdout to this host file (artifact streaming)
+	stdoutTo  string   // --stdout-to: host file (artifact) or journald=<tag>
+	stderrTo  string   // --stderr-to: host file or journald=<tag> ("" = capture for the error tail)
 	stdinFrom string   // feed command stdin from this host file
 	quiet     bool     // suppress stderr (readiness probes)
 }
@@ -121,6 +126,11 @@ func (sb *phaseSandbox) exec(ctx context.Context, o execOpts, argv ...string) er
 	if o.stdoutTo != "" {
 		args = append(args, "--stdout-to", o.stdoutTo)
 	}
+	if o.stderrTo != "" {
+		// Guest stderr → its sink (e.g. journald=build). sandbox-ctl exec's
+		// own process stderr still lands in errBuf for a (generic) error tail.
+		args = append(args, "--stderr-to", o.stderrTo)
+	}
 	if o.stdinFrom != "" {
 		args = append(args, "--stdin-from", o.stdinFrom)
 	}
@@ -128,10 +138,10 @@ func (sb *phaseSandbox) exec(ctx context.Context, o execOpts, argv ...string) er
 	args = append(args, argv...)
 	cmd := exec.CommandContext(ctx, sb.p.spec.Paths.SandboxCtl, args...)
 	var errBuf bytes.Buffer
-	if !o.quiet {
-		cmd.Stderr = io.MultiWriter(os.Stderr, &errBuf)
-	} else {
+	if o.quiet {
 		cmd.Stderr = &errBuf
+	} else {
+		cmd.Stderr = io.MultiWriter(os.Stderr, &errBuf)
 	}
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("guest %s: %w (%s)", argv[0], err, firstLine(errBuf.Bytes()))
