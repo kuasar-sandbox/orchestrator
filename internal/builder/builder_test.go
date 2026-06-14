@@ -39,13 +39,19 @@ func TestParseTemplateDisk(t *testing.T) {
 		t.Errorf("no-overlay: base=%q overlay=%q, want manifest://eeee + empty", baseRef, overlayBase)
 	}
 
-	// chained overlay (base_from_refs) is refused, never silently dropped.
+	// chained overlay folds into a multi-key overlay.base, top-first
+	// ([overlay.base] ++ base_from_refs) — the order restore layers them, never
+	// an error and never a dropped layer.
 	chained := `{"Boot": {"Root": {
 		"BaseRef": "manifest://eeee",
-		"Overlay": {"Base": "manifest://ffff", "BaseFromRefs": ["manifest://gggg"]}
+		"Overlay": {"Base": "manifest://ffff", "BaseFromRefs": ["manifest://gggg", "manifest://hhhh"]}
 	}}}`
-	if _, _, _, err = parseTemplateDisk([]byte(chained)); err == nil {
-		t.Error("chained overlay: expected error, got nil")
+	_, overlayBase, _, err = parseTemplateDisk([]byte(chained))
+	if err != nil {
+		t.Fatalf("chained overlay: unexpected err: %v", err)
+	}
+	if overlayBase != "manifest://ffff:gggg:hhhh" {
+		t.Errorf("chained overlay fold = %q, want manifest://ffff:gggg:hhhh", overlayBase)
 	}
 
 	// missing base image ref is an error.

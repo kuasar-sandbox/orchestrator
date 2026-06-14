@@ -44,6 +44,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/configsock"
@@ -171,12 +172,14 @@ func (p *buildPipeline) resolveBase() error {
 
 // parseTemplateDisk extracts a base template's disk layout from its
 // `sandbox-ctl info --json` (the snapshot.cfg, §3.4): the erofs base image
-// (boot.root.base_ref) AND the accumulated overlay diff (boot.root.overlay.base)
-// — the read-only lower a fromTemplate cold-start MUST stack under its fresh
-// writable overlay, or the template's filesystem is lost. Returns the base ref,
-// the overlay-lower ref ("" when the template has no overlay), and the
-// passthrough metadata. info --json re-emits restore.SnapshotCfg by Go field
-// name, hence the BaseRef / Overlay / Base JSON keys.
+// (boot.root.base_ref) AND the accumulated overlay (boot.root.overlay) — the
+// read-only lower a fromTemplate cold-start MUST stack under its fresh writable
+// overlay, or the template's filesystem is lost. The overlay's captured top
+// (overlay.base) and its lower chain (overlay.base_from_refs) are folded into
+// one multi-key manifest ref (top-first, the order restore layers them) and
+// returned as overlayBase ("" when the template has no overlay). info --json
+// re-emits restore.SnapshotCfg by Go field name, hence the BaseRef / Overlay /
+// Base / BaseFromRefs JSON keys.
 func parseTemplateDisk(infoJSON []byte) (baseRef, overlayBase string, meta map[string]string, err error) {
 	var cfg struct {
 		Metadata map[string]string `json:"Metadata"`
@@ -197,14 +200,36 @@ func parseTemplateDisk(infoJSON []byte) (baseRef, overlayBase string, meta map[s
 		return "", "", nil, fmt.Errorf("no base image ref (boot.root.base_ref)")
 	}
 	if ov := cfg.Boot.Root.Overlay; ov != nil {
-		// Builder templates are always cold-booted (phase C), so their captured
-		// overlay is a single self-contained diff with an empty lower chain. A
-		// non-empty chain would need multi-layer (manifest://k1:k2) reconstruction
-		// the builder does not emit yet — refuse rather than silently drop layers.
-		if len(ov.BaseFromRefs) > 0 {
-			return "", "", nil, fmt.Errorf("chained overlay (base_from_refs) not supported for fromTemplate cold-start")
+		overlayBase, err = foldOverlayChain(ov.Base, ov.BaseFromRefs)
+		if err != nil {
+			return "", "", nil, err
 		}
-		overlayBase = ov.Base
 	}
 	return cfg.Boot.Root.BaseRef, overlayBase, cfg.Metadata, nil
+}
+
+// foldOverlayChain combines a snapshot.cfg overlay's captured top (overlay.base)
+// and its lower chain (overlay.base_from_refs) into one multi-key manifest ref
+// for a cold-start boot.root.overlay.base. The runtime layers manifest://k1:k2
+// top→bottom in list order (fetch.NewLayered), exactly the order snapshot.cfg
+// records ([overlay.base] ++ base_from_refs) and that restore's reconstructDisk
+// rebuilds — so this is a plain key concatenation, no reordering. Every layer
+// must be a manifest:// ref (an uploaded template's all are); a layer that is
+// itself multi-key is flattened in place.
+func foldOverlayChain(top string, chain []string) (string, error) {
+	var keys []string
+	for _, ref := range append([]string{top}, chain...) {
+		if ref == "" {
+			continue
+		}
+		hexes, ok := strings.CutPrefix(ref, "manifest://")
+		if !ok {
+			return "", fmt.Errorf("overlay layer %q is not a manifest:// ref (a fromTemplate base must be uploaded)", ref)
+		}
+		keys = append(keys, strings.Split(hexes, ":")...)
+	}
+	if len(keys) == 0 {
+		return "", nil
+	}
+	return "manifest://" + strings.Join(keys, ":"), nil
 }
