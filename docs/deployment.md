@@ -15,7 +15,7 @@ vsock / UDS)协作。本文档定义这些进程在生产部署中的归属、�
 
 | 角色 | 集群规模 | 职责 | 关键进程 |
 |---|---|---|---|
-| Compute Node | 每 AZ 一集群,~5,000 节点 | 承载客户沙箱(microVM),每节点 ~3K microVM | `orchestrator-ctl`、`node-ctl`、`cache-ctl tiered`、`store-ctl`(sidecar)、`sandbox-ctl × N` |
+| Compute Node | 每 AZ 一集群,~5,000 节点 | 承载客户沙箱(microVM),每节点 ~3K microVM;e2b 模板构建也在本节点的构建沙箱内进行(§5) | `orchestrator-ctl`、`node-ctl`、`cache-ctl tiered`、`store-ctl`(sidecar)、`sandbox-ctl × N` |
 | L2 Cache Cluster | 每 AZ 一集群,100-200 节点 | 分布式 EC 缓存(RS 4+1,Maglev 一致性哈希),吸收 L1 miss 把 L3 请求压到 < 0.1% | `cache-ctl shard` |
 
 **Region 级共享资源**(由各自的平台管理面运营,平台外)
@@ -23,9 +23,8 @@ vsock / UDS)协作。本文档定义这些进程在生产部署中的归属、�
 | 资源 | 用途 |
 |---|---|
 | OBS 桶 | L3 chunk 与 Manifest 持久化(`store-ctl` 后端) |
-| 平台管理面 | 沙箱实例调度、配置、租户管控 ↔ 与 compute 节点 `platform-agent`(→ orchestrator-ctl) 对话 |
-| 镜像展平数据面节点(独立池) | 容器镜像拉取 + 确定性展平 + 写入 store(详见 §5) |
-| 镜像展平管理面 | 调度展平任务,向数据面下发凭据 |
+| 平台管理面 | 沙箱实例调度、配置、租户管控、模板构建凭据(registry 拉取令牌 / 客户密钥)↔ 与 compute 节点 `platform-agent`(→ orchestrator-ctl) 对话 |
+| 容器镜像仓库 | 租户镜像来源;构建沙箱内 `flatten-ctl` 按需拉取(OCI v1.1,支持 Referrers) |
 
 ## 2. Compute Node
 
@@ -33,12 +32,12 @@ vsock / UDS)协作。本文档定义这些进程在生产部署中的归属、�
 
 | 进程 | 角色 | 数量 | 启停 | 归属 |
 |---|---|---|---|---|
-| `orchestrator-ctl`(`serve`)| 本机沙箱编排 + e2b 兼容控制面:对外 e2b API,经 `run-task`(systemd 单元)启动 `sandbox-ctl run`,经 vswitch 编排网络,反代 guest envd / floatingip,生命周期与 TTL | 单实例 | systemd | 平台内,`sandbox-orchestrator/docs/orchestrator.md` |
+| `orchestrator-ctl`(`serve`)| 本机沙箱编排 + e2b 兼容控制面:对外 e2b API,经模板单元 `sandbox-runner@<sid>`(`run-sandbox`)启动 `sandbox-ctl run`、`sandbox-builder@<bid>`(`run-builder`)驱动沙箱内构建,经 vswitch 编排网络,反代 guest envd / floatingip,生命周期与 TTL | 单实例 | systemd | 平台内,`sandbox-orchestrator/docs/orchestrator.md` |
 | `platform-agent`| 打通平台管理面(区域级 platform-service) ↔ 本机 orchestrator-ctl 的桥接(多节点) | 单实例 | systemd | **平台外** |
 | `node-ctl`(`daemon`)| 节点级资源仲裁:沙箱准入、内存预算分配、密度控制 | 单实例 | systemd | 平台内,`docs/node.md` |
 | `cache-ctl`(`mode: tiered`)| 节点本地数据入口:L1 RocksDB + EC 客户端(→ L2)+ L3 origin | 单实例 | systemd,先于 orchestrator-ctl | 平台内,`docs/cache.md` |
 | `store-ctl` | 本机 OBS 读写代理(sidecar);**所有**远端 OBS 流量走这里 | 单实例 | systemd | 平台内,`docs/store.md` |
-| `sandbox-ctl`(`run`) | 单个沙箱的控制平面(类 `runc run`);非 daemon | 每沙箱一个,~3K | 由 orchestrator-ctl 经 run-task(systemd 单元)启动 | 平台内,`docs/sandbox.md` |
+| `sandbox-ctl`(`run`) | 单个沙箱的控制平面(类 `runc run`);非 daemon | 每沙箱一个,~3K | 由 orchestrator-ctl 经 `sandbox-runner@<sid>` 单元(`run-sandbox`)启动 | 平台内,`docs/sandbox.md` |
 | `cloud-hypervisor` | VMM(patched);`sandbox-ctl` 子进程 | 每沙箱一个 | `sandbox-ctl` 派生 | 平台内,`docs/cloud-hypervisor.md` |
 
 ### 2.2 端口与套接字
@@ -54,15 +53,17 @@ vsock / UDS)协作。本文档定义这些进程在生产部署中的归属、�
 | `node-ctl daemon` | `/run/sandbox-resource.sock` | UDS,自定义协议 | 沙箱资源协议(`sandbox-ctl` 拨号目标)|
 | `sandbox-ctl` | `/run/sandbox/<sid>/*.sock` | UDS | sandbox 内部:`ch.sock` / `blk{0,1}.sock` / `uffd.sock` / `ctl.sock` / `vsock.sock`(+ `_5000`);另写 `<sid>.pid`(config-socket 鉴别)、`<sid>.env`(`SANDBOX_ARGS`)|
 | `orchestrator-ctl` | `:443`(可配) | HTTPS/h2 | **对外** e2b 控制面 API + 沙箱数据面 proxy(`<port>-<sid>.<domain>`)|
-| `orchestrator-ctl` | `/run/sandbox/orchestrator.socket` | UDS,framed JSON | config-socket:run-task 启动时取 LaunchSpec(exec/args/workdir/env,密钥经 env)(SO_PEERCRED + `<id>.pid` 鉴别)|
+| `orchestrator-ctl` | `/run/sandbox/orchestrator.socket` | UDS,framed JSON | config-socket(task/admin/api 三平面):`run-sandbox`/`run-builder` 启动时取 LaunchSpec / BuildSpec(exec/args/workdir/env,密钥经 env)(SO_PEERCRED + `<id>.pid` 鉴别)|
 
 `cache-ctl tiered` 的 EC 客户端通过节点对外网络拨号 L2 cluster 节点的 `7070`
 端口(详见 §3)。**对外服务端口仅 `orchestrator-ctl` 一处**(e2b ingress);其余本机进程均 loopback/UDS。
 `sandbox-ctl` 由 `orchestrator-ctl` 经 systemd **模板单元 `sandbox-runner@<sid>.service`** 拉起
-(`StartUnit` → 单元内 `run-task` `execve` 为 `sandbox-ctl run`,非自行 fork-exec)。e2b 模板构建
-另走第二个模板单元 **`sandbox-builder@<bid>.service`**(同样经 `run-task` `execve` 为 `flatten-ctl`,
-镜像 → 确定性 EROFS 并入库)。两个模板单元由 `orchestrator-ctl serve` 启动时自动生成并安装
-(`install_units:false` 则交由运维带外管理),完整设计见 `sandbox-orchestrator/docs/orchestrator.md` §5/§11。
+(`StartUnit` → 单元内 `run-sandbox` `execve` 为 `sandbox-ctl run`,非自行 fork-exec)。e2b 模板构建
+另走第二个模板单元 **`sandbox-builder@<bid>.service`**(单元内 `run-builder` **驻留驱动构建沙箱内的
+三阶段流水线** import / steps / template,每阶段一台 microVM 作其直接子进程;镜像拉取与 step 执行
+都在沙箱内,详见 §5 与 `sandbox-orchestrator/docs/orchestrator.md` §11)。两个模板单元由
+`orchestrator-ctl serve` 启动时自动生成并安装(`install_units:false` 则交由运维带外管理),完整设计见
+`sandbox-orchestrator/docs/orchestrator.md` §5/§11。
 
 运维侧:`/run/sandbox/<sid>/ctl.sock` 除了承载 snapshot,也是 `sandbox-ctl exec
 --sandbox-id <sid> -- CMD` 的入口——在不打断应用的前提下进入一个运行中的
@@ -122,7 +123,7 @@ RAM 工作集)。**overlay 写层**是沙箱独占、运行期被修改的可写
 
 每个沙箱由 `orchestrator-ctl` 在启动单元前写一份 per-sandbox **`SANDBOX_CONFIG`**
 (`<sid>.yaml`,非密),搭配**共享**的 **`MANIFEST_CONFIG`**(`manifest.key` 留空)+
-per-沙箱 `MANIFEST_KEY` env;经 `run-task`(单元)以 flag 传入 sandbox-ctl:
+per-沙箱 `MANIFEST_KEY` env;经 `run-sandbox`(单元)以 flag 传入 sandbox-ctl:
 
 | 文件 | 内容 | 传入方式 | 文档 |
 |---|---|---|---|
@@ -198,56 +199,49 @@ yaml 显式 access_key/secret_key  →  ~/.obsconfig  →  AWS SDK 默认凭证�
 每节点的 `store-ctl` sidecar 通过同一套凭据访问同一个桶——节点本身**无状态**,
 重启不丢数据。
 
-### 4.2 平台管理面 / 镜像展平管理面
+### 4.2 平台管理面
 
-均为 region 级、独立运营,平台外。与平台的接口:
+region 级、独立运营,平台外。与平台的接口:
 
 - 平台管理面 ↔ 各 compute 节点 `platform-agent`(→ orchestrator-ctl):沙箱实例配置 / 客户密钥 /
-  生命周期事件
-- 镜像展平管理面 ↔ 镜像展平数据面节点(§5):租户镜像拉取凭据、客户加密
-  凭据下发
+  生命周期事件 / 模板构建凭据(registry 拉取令牌、客户加密凭据)——构建在 compute 节点的
+  构建沙箱内进行(§5),无独立展平管理面/数据面池
 
-## 5. 镜像展平数据面节点
+## 5. 镜像构建(构建沙箱内三阶段)
 
-### 5.1 角色定位
+e2b 模板构建在 compute 节点上进行,**无独立展平池**:每个构建一个 `sandbox-builder@<bid>`
+单元(`run-builder` 驻留驱动),镜像拉取与 step 执行都在**构建沙箱(microVM)内**——租户网络
+流量与镜像内容不触宿主用户态,宿主侧只做工件接力与收尾上传。完整语义见
+`sandbox-orchestrator/docs/orchestrator.md` §11。
 
-独立池,与 compute node 不重叠。**纯写路径**——拉镜像、展平、写 OBS,**不读**
-已存 manifest,因此**不部署 cache-ctl**。
+### 5.1 三阶段流水
 
-| 进程 | 类型 | 用途 |
+`run-builder` 依 BuildSpec 最多跑三阶段,每阶段一台 `sandbox-ctl run` + cloud-hypervisor
+(都计入本单元 cgroup):
+
+| 阶段 | 触发 | 做什么 |
 |---|---|---|
-| `flatten-ctl` | CLI(一次性)| registry 镜像 / docker bundle → 确定性 EROFS,逐字节可重现;直接拉取镜像(本地 OCI-layout 缓存)、可经 Referrers 幂等跳过(详见 [`docs/flatten.md`](flatten.md) §2.4) |
-| `manifest-ctl` | CLI(一次性)| `store`:分块 + 加密 + 写远端 + 上传 manifest |
-| `store-ctl` | daemon(sidecar)| 把 manifest-ctl 的 gRPC `Put` 写到 region OBS |
+| A import | 有 fromImage | 空单盘沙箱 + **builder runtime flavor**(`sandbox-runtime-builder.erofs`:e2b flavor + flatten-ctl + mkfs.erofs);guest 内 `flatten-ctl export -` 以租户凭据拉取 + 确定性展平,tarstream 工件经 exec stdio 流回宿主 |
+| B steps | 有 steps | base 镜像 + builder runtime + 大可写层;**envd 为 app**,RUN/ENV/ARG/WORKDIR/USER 经 envd `process.Start` 执行(与 e2b 同形);导出新镜像工件 |
+| C template | 有 startCmd | 生产 e2b runtime 冷启最终镜像;startCmd 经 envd 启动、readyCmd 轮询;`sandbox-ctl snapshot` 出本地快照 bundle |
 
-### 5.2 流水
+两类 guest 信道刻意分离:e2b 语义(steps/startCmd/readyCmd)走 **envd**,平台机制(flatten 拉取/
+导出、配置注入、工件流回、就绪探针)走 **`sandbox-ctl exec`**。COPY 上下文经对象存储直传
+(`builder.files_storage`,presigned PUT/GET,字节不过控制面),构建期 `flatten-ctl tar extract`
+解包。
 
-```
-   Flatten Mgmt Plane  (region)
-            │
-            │  tenant image pull credentials + customer encryption keys
-            ▼
-   flatten-ctl export  (CLI)
-            │  stdout:  deterministic EROFS  (或 --upload 直接 → manifest key)
-            ▼
-   manifest-ctl  store
-            │  gRPC 127.0.0.1:7100         (stdout: hex manifest key)
-            ▼
-   store-ctl  (sidecar)
-            │  HTTPS
-            ▼
-   OBS bucket  (region)
-```
+### 5.2 收尾上传(平台凭据唯一出现点)
 
-### 5.3 不部署的组件
+阶段产物经宿主 workdir 顺序交接;终态:img ⇒ `manifest-ctl store image.img`(→ 64-hex manifest
+key)、快照 ⇒ 一条 `sandbox-ctl upload-snapshot <bundle>`(自动上传 snapshot.cfg 引用的本地工件
+并改写为 `manifest://`)。持久 id `e2b-<kind>-<key>`。本机 `store-ctl`(§2.1 sidecar)承载远端写。
 
-- **cache-ctl**:无读路径,装了空跑
-- **node-ctl**:不跑沙箱,不需要资源仲裁
-- **sandbox-ctl** / **cloud-hypervisor**:不跑沙箱
-- **orchestrator-ctl**:这里由镜像展平管理面直接驱动
+### 5.3 凭据与隔离
 
-数据面节点上常驻只有 `store-ctl`;`flatten-ctl` + `manifest-ctl` 是按任务拉
-起的 CLI。
+租户 registry 拉取凭据仅 `FLATTEN_*` 经 exec env 进入 import 阶段 guest;**`MANIFEST_KEY`
+永不入 guest**。凭据来源(任务级 pull token / SDK 明文 / 租户默认 `registry_auth_enc`)由
+orchestrator 解析,见 orchestrator.md §11。构建池上限由 `sandbox-builder.slice` 的
+`CPUQuota`/`MemoryMax` 施加,并发由 `builder.max_concurrent` 准入。
 
 ## 6. 全景拓扑
 
@@ -302,26 +296,24 @@ yaml 显式 access_key/secret_key  →  ~/.obsconfig  →  AWS SDK 默认凭证�
    └──────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 6.3 Image Flatten Data-Plane Node
+### 6.3 Image Build (in-sandbox, on Compute Node)
 
 ```
-   ┌─ Image Flatten Data-Plane Node  ( separate pool ) ───────────────────────────────────────────────┐
+   ┌─ Compute Node ── e2b template build  (§5) ───────────────────────────────────────────────────────┐
    │                                                                                                  │
-   │   (Flatten Mgmt Plane, region)                                                                   │
-   │           │  tenant pull credentials + customer encryption keys                                  │
-   │           ▼                                                                                      │
-   │   flatten-ctl  (CLI)  ── stdout EROFS ──►  manifest-ctl  (CLI)                                   │
-   │                                                  │  gRPC 127.0.0.1:7100                          │
-   │                                                  ▼                                               │
-   │                                             store-ctl  (sidecar)                                 │
-   │                                                  │                                               │
-   │                                                  ▼  HTTPS                                        │
-   │                                             (OBS bucket)                                         │
+   │   orchestrator-ctl  ── StartUnit ──►  sandbox-builder@<bid>  ( run-builder, resident )            │
+   │                                              │  drives 3 stage VMs (sandbox-ctl run + CH)         │
+   │                                              ▼                                                    │
+   │     A import ──► B steps ──► C template      ( guest: flatten-ctl / envd; tenant net stays in VM )│
+   │                                              │  image.img / snapshot bundle  (host workdir)       │
+   │                                              ▼                                                    │
+   │   manifest-ctl store  /  sandbox-ctl upload-snapshot  ──►  store-ctl  (sidecar)  ──► (OBS bucket) │
    │                                                                                                  │
    └──────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-无 `cache-ctl`、无 `node-ctl`、无 `sandbox-ctl`——纯写路径不需要(§5.3)。
+构建复用 compute 节点既有的 `store-ctl`(收尾上传)与 vswitch 网络槽(guest 拉取出网);
+无独立池、无额外常驻进程(§5)。
 
 ## 7. 启停依赖
 
@@ -347,9 +339,8 @@ yaml 显式 access_key/secret_key  →  ~/.obsconfig  →  AWS SDK 默认凭证�
 故障层视作 miss 下穿(详见 `docs/cache.md` §错误模型)。**写**路径
 (`manifest-ctl store` 直连 `store-ctl`)在 OBS / store-ctl 不可达时会失败。
 
-**镜像展平数据面节点(独立)**
-
-- `store-ctl`(sidecar)起来后,展平管理面随时可调度任务,无其他常驻依赖。
+模板构建复用 compute 节点的常驻进程(`orchestrator-ctl` + `store-ctl`),无独立启停依赖;
+`orchestrator-ctl` 就绪后即可经 e2b API 接受构建(§5)。
 
 ### 7.2 关闭顺序(自顶向下)
 
@@ -392,10 +383,9 @@ tiered` 自己处理 L2 不可达。
 ### 9.2 生产单 AZ
 
 ```
-Compute:           ~5,000 节点(每节点 ~3K microVM)
+Compute:           ~5,000 节点(每节点 ~3K microVM;e2b 模板构建在构建沙箱内)
 L2 Cache Cluster:  100-200 节点(RS 4+1,Maglev 全池放置)
-镜像展平数据面:    独立池,按吞吐扩
-Region 级:         OBS 桶 + 平台 / 展平管理面
+Region 级:         OBS 桶 + 平台管理面
 ```
 
 每 compute 节点跑:`store-ctl` + `cache-ctl tiered` + `node-ctl` +
@@ -419,7 +409,7 @@ Region 级:         OBS 桶 + 平台 / 展平管理面
 | `node-ctl daemon` | `/etc/node-ctl/node-ctl.yaml` | `listen: /run/sandbox-resource.sock` | [`docs/node.md`](node.md) §3 |
 | `sandbox-ctl run` | `--config <path>`(`SANDBOX_CONFIG`)+ `--manifest-config <path>`(`MANIFEST_CONFIG`)| **per-sandbox**,由 `orchestrator-ctl` 生成,落在 `/run/sandbox/<sid>/` | [`docs/sandbox.md`](sandbox.md) §3 |
 | `manifest-ctl` | `--manifest-config <path>`(`MANIFEST_CONFIG`)| 与 `sandbox-ctl` 共享格式;只连本机 store-ctl + cache-ctl | [`docs/manifest.md`](manifest.md) §3 |
-| `flatten-ctl` | CLI flag + `--manifest-config`(`MANIFEST_CONFIG`,`--upload` 时)+ `--config`(`FLATTEN_CONFIG`,registry 源时);凭据走 `FLATTEN_REGISTRY_*` env | 仅在镜像展平数据面节点使用 | [`docs/flatten.md`](flatten.md) §2 |
+| `flatten-ctl` | CLI flag + `--manifest-config`(`MANIFEST_CONFIG`,`--upload` 时)+ `--config`(`FLATTEN_CONFIG`,registry 源时);凭据走 `FLATTEN_REGISTRY_*` env | 经 builder runtime flavor 在构建沙箱 guest 内运行(`run-builder` 驱动,§5)| [`docs/flatten.md`](flatten.md) §2 |
 
 构建产物路径、跨架构、release 打包见 [`docs/build.md`](build.md);性能基线、
 回归 checklist 见 [`docs/perf.md`](perf.md)。

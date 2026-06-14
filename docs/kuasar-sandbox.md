@@ -78,7 +78,7 @@ Warm Pool),共享同一套基础设施:内容定义分块、收敛加密、内�
 ```
   ┌──────────────────────────────────────────────────────────────────────────────────────────┐
   │ Platform mgmt plane  (out of scope)                                                      │
-  │   sandbox mgmt platform   /   image flatten mgmt   /   image registry                    │
+  │   sandbox mgmt platform   /   image registry                                             │
   ├──────────────────────────────────────────────────────────────────────────────────────────┤
   │ This platform                                                                            │
   │   Sandbox & VMM       sandbox control / VMM / Guest runtime / on-demand block/snapshot   │
@@ -106,27 +106,27 @@ Warm Pool),共享同一套基础设施:内容定义分块、收敛加密、内�
 
 ```
         ┌── Platform mgmt plane  (out of scope) ───────────────────────────────────────────────────────────┐
-        │   sandbox mgmt platform      /      image flatten mgmt      /      image registry                │
+        │   sandbox mgmt platform      /      image registry                                              │
         └──────────────────────────────────────────────────────────────────────────────────────────────────┘
-      per-sandbox config & keys             │                                         flatten task    │
-                                            ▼                                                         ▼
-  ┌── Compute node  (×N per AZ) ───────────────────────────────────────────────────────┐  ┌── Image flatten  (pool) ─┐
-  │                                                                                    │  │                          │
-  │  orchestrator-ctl  (e2b-compatible ingress)                                        │  │  flatten-ctl             │
-  │    lands per-sandbox config & keys / prepares write-layer / invokes run            │  │        │                 │
-  │        │ run                                                                       │  │        ▼                 │
-  │        ▼                                                                           │  │  write path              │
-  │  sandbox control (one per sandbox)   ◄─ proto ─►   node resource control           │  │  chunk / encrypt / dedup │
-  │    block dev / snapshot / unified memory /      admission / quota /                │  └──────────────────────────┘
-  │    balloon reclaim / handshake                  reclaim / persist  (node-ctl)      │              │
-  │        │ drive VM                        │ fetch / store                           │              │
-  │        ▼                                 ▼                                         │              │
-  │  sandbox ×N: VMM + Guest runtime     tiered cache L1 (local) + CA store            │              │
-  │                                                                                    │              │
-  └────────────────────────────────────────────────────────────────────────────────────┘              │
-                                        L1 miss   │                                                   │   chunks /
-                                                  │                                                   │   manifest
-                                                  ▼                                                   ▼
+      per-sandbox config & keys / build creds   │
+                                                ▼
+  ┌── Compute node  (×N per AZ) ───────────────────────────────────────────────────────┐
+  │                                                                                    │
+  │  orchestrator-ctl  (e2b-compatible ingress)                                        │
+  │    lands per-sandbox config & keys / invokes run / drives in-sandbox build         │
+  │        │ run                                  │ build  (sandbox-builder@<bid>)     │
+  │        ▼                                      ▼                                    │
+  │  sandbox control (one per sandbox)   ◄─ proto ─►   node resource control           │
+  │    block dev / snapshot / unified memory /      admission / quota /                │
+  │    balloon reclaim / handshake                  reclaim / persist  (node-ctl)      │
+  │        │ drive VM                        │ fetch / store                           │
+  │        ▼                                 ▼                                         │
+  │  sandbox ×N: VMM + Guest runtime     tiered cache L1 (local) + CA store ──┐        │
+  │  (build: 3-stage build-sandbox →     flatten / chunk / encrypt in guest)  │        │
+  └──────────────────────────────────────────────────────────────────────────┼────────┘
+                                        L1 miss   │                           │ chunks /
+                                                  │                           │ manifest
+                                                  ▼                           ▼
       ┌── AZ ──────────────────────────────────────────┐    ┌── Region ──────────────────────────────────────────────┐
       │                                                │miss│                                                        │
       │   L2 cache cluster                             │──► │  object store (L3)                                     │
@@ -151,7 +151,7 @@ Warm Pool),共享同一套基础设施:内容定义分块、收敛加密、内�
 | **sandbox-builder** | 镜像构建:OCI → EROFS 确定性展平,远程拉取 + Referrers 幂等 | `flatten-ctl` | `pkg/image`(读取展平镜像) | `sandbox-builder/docs/flatten.md` |
 | **sandbox-vswitch** | eBPF/TC 虚拟交换机:单节点 4096 端口隔离网络 + tapfd 交接 | `vswitch-ctl`、`tapfd-get` | `pkg/tapfd`(fd 交接规约) | `sandbox-vswitch/docs/{vswitch,tapfd}.md` |
 | **sandbox-sentinel** | 节点级资源守护:准入/额度分配/主动回收(节点环) | `node-ctl` | — | `sandbox-sentinel/docs/node.md` |
-| **sandbox-orchestrator** | 单机沙箱编排 + e2b 兼容 ingress:控制面 REST、envd-in-guest 反代、模板构建、密钥派生 | `orchestrator-ctl`、`e2b-key-ctl`、`sandbox-runtime-e2b.erofs` | — | `sandbox-orchestrator/docs/orchestrator.md` |
+| **sandbox-orchestrator** | 单机沙箱编排 + e2b 兼容 ingress:控制面 REST、envd-in-guest 反代、模板构建(沙箱内三阶段)、密钥派生 | `orchestrator-ctl`、`e2b-key-ctl`、`sandbox-runtime-{e2b,builder}.erofs` | — | `sandbox-orchestrator/docs/orchestrator.md` |
 | **sandbox-deps** | 原生依赖:定制 Guest 内核、VMM 补丁、erofs 工具 | `vmlinux`、`cloud-hypervisor`、`mkfs.erofs` | 构建脚本 + patches + configs | `sandbox-deps/docs/{cloud-hypervisor,sandbox-kernel,build}.md` |
 
 ### 2.3 依赖关系
@@ -167,13 +167,14 @@ Warm Pool),共享同一套基础设施:内容定义分块、收敛加密、内�
         │ pkg/image          │ pkg/tapfd    │ pkg/manifest
  sandbox-runtime ────────────┴──────────────┘               (T2)
         ▲                    ▲
-        │ pkg/resource       │ CLI/run-task: sandbox-ctl + vswitch-ctl + flatten-ctl
+        │ pkg/resource       │ CLI: run-sandbox→sandbox-ctl + vswitch-ctl;run-builder→沙箱内 flatten-ctl
  sandbox-sentinel    sandbox-orchestrator                   (T3)
 ```
 
 实线是 Go 导入边。`sandbox-orchestrator` 不 import 任何兄弟仓(`CGO_ENABLED=0`
-叶子),在计算节点上经 run-task/CLI 驱动 `sandbox-ctl`(拉起/快照沙箱)、
-`vswitch-ctl`(编排网络)、`flatten-ctl`(模板构建)。各 Go 导出面均为纯 Go、
+叶子),在计算节点上经 `run-sandbox`/`run-builder` 驱动 `sandbox-ctl`(拉起/快照沙箱)、
+`vswitch-ctl`(编排网络);模板构建在构建沙箱内跑三阶段(`flatten-ctl` 经 builder runtime
+flavor 投影进 guest 执行,详见 `sandbox-orchestrator/docs/orchestrator.md` §11)。各 Go 导出面均为纯 Go、
 无 CGO;重后端(rocksdb/对象存储 SDK/eBPF)隔离在各仓 `server`/`rocks`/
 `internal` 内,不进入下游导入闭包。唯一 CGO 二进制是 accelerator 的
 `cache-ctl`(静态链 librocksdb)。
@@ -731,12 +732,11 @@ Cold boot (1 GiB image):                 Snapshot restore (512 MiB):
 
 - **计算节点**(~5,000/AZ):`orchestrator-ctl` + `node-ctl` + `cache-ctl tiered`
   + `store-ctl`(sidecar)+ `sandbox-ctl × ~3K`(每沙箱一进程,派生
-  `cloud-hypervisor`)。
+  `cloud-hypervisor`);e2b 模板构建在本节点的构建沙箱内进行(`sandbox-builder@<bid>`
+  → 三阶段,见 `deployment.md` §5),无独立展平池。
 - **L2 缓存集群**(AZ 级,100-200 节点):`cache-ctl shard`,RS 4+1 + Maglev
   一致性哈希,纯密文 KV。
-- **镜像展平数据面节点**(独立池):`flatten-ctl` + `manifest-ctl`(按任务拉起)
-  + `store-ctl`(sidecar),纯写路径。
-- **Region 级**:对象存储桶 + GC 与代管理(控制平面)+ 平台/展平管理面(平台外)。
+- **Region 级**:对象存储桶 + GC 与代管理(控制平面)+ 平台管理面(平台外)。
 
 开发/PoC 可单机运行:`store-ctl`(fs 后端)+ `cache-ctl local` + 手工
 `sandbox-ctl run`,无 L2/OBS/node-ctl(`deployment.md` §9.1)。
