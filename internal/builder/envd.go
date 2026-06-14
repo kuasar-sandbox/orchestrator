@@ -1,4 +1,4 @@
-package main
+package builder
 
 // Minimal Connect+JSON client for envd's process.Process/Start — the e2b
 // exec channel the build pipeline drives steps / startCmd / readyCmd
