@@ -104,6 +104,10 @@ func (p *buildPipeline) stepsYAML() map[string]any {
 			"args":    []string{"-isnotfc", "-port", "49983"},
 			"user":    "0:0",
 			"restart": "always",
+			// Share sandbox-init's PID namespace (as production does) so orphaned
+			// descendants of RUN steps are reaped by PID 1 rather than zombie-ing
+			// under envd during the build.
+			"pid_namespace": "shared",
 		},
 	}
 	if f := p.dnsFiles(); f != nil {
@@ -140,6 +144,12 @@ func (p *buildPipeline) templateYAML() map[string]any {
 			"args":    envdArgs,
 			"user":    "0:0",
 			"restart": "always",
+			// Production e2b posture (matches sandboxcfg's launch config): envd is
+			// not a PID-1-style reaper, so share sandbox-init's PID namespace —
+			// PID 1 reaps orphaned descendants of guest commands instead of them
+			// piling up as zombies under envd. The snapshot freezes this, so every
+			// sandbox created from the template inherits the reaper invariant.
+			"pid_namespace": "shared",
 		},
 	}
 	if f := p.dnsFiles(); f != nil {
