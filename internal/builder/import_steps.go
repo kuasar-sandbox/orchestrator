@@ -215,19 +215,23 @@ func (p *buildPipeline) applyStep(sb *phaseSandbox, sess *envdExec, c *stepCtx, 
 		k, v := kv()
 		if k != "" {
 			c.env[k] = v
+			p.progress("step %d: ENV %s=%s", i, k, v)
 		}
 	case "ARG":
 		k, v := kv()
 		if k != "" {
 			c.args[k] = v
+			p.progress("step %d: ARG %s=%s", i, k, v)
 		}
 	case "WORKDIR":
 		if len(st.Args) > 0 {
 			c.workdir = sub(st.Args[0])
+			p.progress("step %d: WORKDIR %s", i, c.workdir)
 		}
 	case "USER":
 		if len(st.Args) > 0 {
 			c.user = sub(st.Args[0])
+			p.progress("step %d: USER %s", i, c.user)
 		}
 	case "COPY", "ADD":
 		if err := p.applyCopy(sb, c, i, st, sub); err != nil {
