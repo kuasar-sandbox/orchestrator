@@ -225,11 +225,23 @@ case "$BASE_REF" in
       || die "registry $REGISTRY unreachable on the mgmt VIP — zot must bind 0.0.0.0; restart prep: demo_prep.sh stop && bash demo_prep.sh"
     ;;
 esac
-say "the SDK names an image; a build sandbox pulls $GUEST_BASE_REF (tenant creds) and flattens it into a microVM template:"
-echo "${c_cmd}  \$ python3 -c \"Template.build(Template().from_image('$GUEST_BASE_REF'), name='demo-app')\"${c_off}"
+say "the SDK names an image; a build sandbox pulls $GUEST_BASE_REF (tenant creds) and flattens it into a microVM template."
+say "on_build_logs streams the node's build journal (pull/flatten + each phase) live as it runs:"
+echo "${c_cmd}  \$ python3 -c \"Template.build(Template().from_image('$GUEST_BASE_REF'), name='demo-app', on_build_logs=...)\"${c_off}"
+# on_build_logs prints to STDERR so the live stream shows in the terminal without
+# polluting the template id captured from stdout below.
 TEMPLATE="$(py <<PY
+import sys
 from e2b import Template
-info = Template.build(Template().from_image("$GUEST_BASE_REF"), name="demo-app", cpu_count=2, memory_mb=2048)
+def show(e):
+    msg = e.message.rstrip()
+    if msg:
+        print("    · " + msg, file=sys.stderr, flush=True)
+info = Template.build(
+    Template().from_image("$GUEST_BASE_REF"),
+    name="demo-app", cpu_count=2, memory_mb=2048,
+    on_build_logs=show,
+)
 print(info.template_id)
 PY
 )" || die "template build failed (see $WORK/orch.log)"
