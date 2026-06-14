@@ -113,10 +113,11 @@ type buildPipeline struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	imagePath string // workdir/image.img once a local image exists
-	baseRef   string // phase B/C boot.root.base ("file://..." | "manifest://...")
-	startCmd  string // effective (request else template-inherited)
-	readyCmd  string
+	imagePath   string // workdir/image.img once a local image exists
+	baseRef     string // phase B/C boot.root.base ("file://..." | "manifest://...")
+	overlayBase string // phase B/C boot.root.overlay.base: fromTemplate's accumulated diff, stacked read-only under the fresh overlay ("" = none)
+	startCmd    string // effective (request else template-inherited)
+	readyCmd    string
 }
 
 const guestFlatten = "/opt/sandbox-runtime/bin/flatten-ctl"
@@ -186,36 +187,67 @@ func (p *buildPipeline) resolveBase() error {
 	case s.FromTemplateKind == "img":
 		p.baseRef = "manifest://" + s.FromTemplate
 		return nil
-	default: // snp: the snapshot.cfg names the image + carries start/ready
+	default: // snp: the snapshot.cfg names the base image + overlay diff + start/ready
 		out, err := p.hostCmdEnv(s.Env, p.spec.Paths.SandboxCtl,
 			"info", "--json", "--manifest-config", s.Paths.ManifestConfig,
 			"manifest://"+s.FromTemplate)
 		if err != nil {
 			return fmt.Errorf("read base template cfg: %w", err)
 		}
-		var cfg struct {
-			Metadata map[string]string `json:"Metadata"`
-			Boot     struct {
-				Root struct {
-					BaseRef string `json:"BaseRef"`
-				} `json:"Root"`
-			} `json:"Boot"`
+		baseRef, overlayBase, meta, err := parseTemplateDisk(out)
+		if err != nil {
+			return fmt.Errorf("base template %s: %w", s.FromTemplate, err)
 		}
-		if err := json.Unmarshal(out, &cfg); err != nil {
-			return fmt.Errorf("parse base template cfg: %w", err)
-		}
-		if cfg.Boot.Root.BaseRef == "" {
-			return fmt.Errorf("base template %s has no base image ref", s.FromTemplate)
-		}
-		p.baseRef = cfg.Boot.Root.BaseRef
+		p.baseRef = baseRef
+		p.overlayBase = overlayBase
 		if p.startCmd == "" {
-			p.startCmd = cfg.Metadata["e2b.start_cmd"]
+			p.startCmd = meta["e2b.start_cmd"]
 		}
 		if p.readyCmd == "" {
-			p.readyCmd = cfg.Metadata["e2b.ready_cmd"]
+			p.readyCmd = meta["e2b.ready_cmd"]
 		}
 		return nil
 	}
+}
+
+// parseTemplateDisk extracts a base template's disk layout from its
+// `sandbox-ctl info --json` (the snapshot.cfg, §3.4): the erofs base image
+// (boot.root.base_ref) AND the accumulated overlay diff (boot.root.overlay.base)
+// — the read-only lower a fromTemplate cold-start MUST stack under its fresh
+// writable overlay, or the template's filesystem is lost. Returns the base ref,
+// the overlay-lower ref ("" when the template has no overlay), and the
+// passthrough metadata. info --json re-emits restore.SnapshotCfg by Go field
+// name, hence the BaseRef / Overlay / Base JSON keys.
+func parseTemplateDisk(infoJSON []byte) (baseRef, overlayBase string, meta map[string]string, err error) {
+	var cfg struct {
+		Metadata map[string]string `json:"Metadata"`
+		Boot     struct {
+			Root struct {
+				BaseRef string `json:"BaseRef"`
+				Overlay *struct {
+					Base         string   `json:"Base"`
+					BaseFromRefs []string `json:"BaseFromRefs"`
+				} `json:"Overlay"`
+			} `json:"Root"`
+		} `json:"Boot"`
+	}
+	if err := json.Unmarshal(infoJSON, &cfg); err != nil {
+		return "", "", nil, fmt.Errorf("parse template cfg: %w", err)
+	}
+	if cfg.Boot.Root.BaseRef == "" {
+		return "", "", nil, fmt.Errorf("no base image ref (boot.root.base_ref)")
+	}
+	if ov := cfg.Boot.Root.Overlay; ov != nil {
+		// Builder templates are always cold-booted (phase C), so their captured
+		// overlay is a single self-contained diff with an empty lower chain. A
+		// non-empty chain would need multi-layer (manifest://k1:k2) reconstruction
+		// the builder does not emit yet — refuse rather than silently drop layers.
+		if len(ov.BaseFromRefs) > 0 {
+			return "", "", nil, fmt.Errorf("chained overlay (base_from_refs) not supported for fromTemplate cold-start")
+		}
+		overlayBase = ov.Base
+	}
+	return cfg.Boot.Root.BaseRef, overlayBase, cfg.Metadata, nil
 }
 
 // --- phase A: import -------------------------------------------------------
@@ -252,6 +284,7 @@ func (p *buildPipeline) phaseImport() error {
 		return fmt.Errorf("no image artifact produced")
 	}
 	p.baseRef = "file://" + p.imagePath
+	p.overlayBase = "" // a freshly imported image is a complete base, no overlay lower
 	p.log.Info("import: image artifact ready", "path", p.imagePath)
 	return nil
 }
@@ -363,6 +396,7 @@ func (p *buildPipeline) phaseSteps() error {
 		return err
 	}
 	p.baseRef = "file://" + p.imagePath
+	p.overlayBase = "" // the exported image flattens base+overlay+steps into one layer
 	return nil
 }
 
@@ -1041,6 +1075,18 @@ func (p *buildPipeline) importYAML() map[string]any {
 	return doc
 }
 
+// rootDoc renders boot.root for the steps/template phases: the base image plus
+// a writable overlay seeded from diffTpl. When building fromTemplate, the
+// template's accumulated overlay (p.overlayBase) is stacked read-only beneath
+// the fresh writable layer, so the build sees the template's filesystem.
+func (p *buildPipeline) rootDoc(diffTpl string) map[string]any {
+	overlay := map[string]any{"diff_template": diffTpl}
+	if p.overlayBase != "" {
+		overlay["base"] = p.overlayBase
+	}
+	return map[string]any{"base": p.baseRef, "overlay": overlay}
+}
+
 // stepsYAML: the base image as root, a big writable upper (steps delta +
 // export scratch), the builder runtime for the toolchain, and envd as
 // the app — RUN steps go through the e2b exec channel. This envd is a
@@ -1055,12 +1101,7 @@ func (p *buildPipeline) stepsYAML() map[string]any {
 		"boot": map[string]any{
 			"kernel":  "file://" + s.Paths.Kernel,
 			"runtime": "file://" + s.Paths.RuntimeBuilder,
-			"root": map[string]any{
-				"base": p.baseRef,
-				"overlay": map[string]any{
-					"diff_template": "file://" + s.Paths.BuilderDiffTpl,
-				},
-			},
+			"root":    p.rootDoc("file://" + s.Paths.BuilderDiffTpl),
 		},
 		"launch": map[string]any{
 			"exec":    "/opt/sandbox-runtime/bin/envd",
@@ -1096,12 +1137,7 @@ func (p *buildPipeline) templateYAML() map[string]any {
 		"boot": map[string]any{
 			"kernel":  "file://" + s.Paths.Kernel,
 			"runtime": "file://" + s.Paths.RuntimeE2B,
-			"root": map[string]any{
-				"base": p.baseRef,
-				"overlay": map[string]any{
-					"diff_template": "file://" + s.Paths.OverlayDiffTpl,
-				},
-			},
+			"root":    p.rootDoc("file://" + s.Paths.OverlayDiffTpl),
 		},
 		"launch": map[string]any{
 			"exec":    "/opt/sandbox-runtime/bin/envd",
