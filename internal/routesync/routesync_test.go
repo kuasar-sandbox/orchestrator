@@ -82,35 +82,44 @@ func recv[T any](t *testing.T, ch <-chan T, what string) T {
 // policy + initial route stream + bookmark + a delta downstream, and a wake upstream.
 func TestRouteSyncRoundtrip(t *testing.T) {
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	sock := filepath.Join(t.TempDir(), "p.sock")
+	sock := filepath.Join(t.TempDir(), "cfg.sock")
 	ln, err := net.Listen("unix", sock)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer ln.Close()
 
-	sink := newFakeSink()
-	wakes := &fakeWakes{ch: make(chan string, 1)}
-	srv := routesync.NewServer(sink, wakes, log)
-	httpSrv := &http.Server{Handler: h2c.NewHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get(routesync.SyncHeader) == "1" {
-			srv.ServeSync(w, r)
-			return
-		}
-		http.Error(w, "unexpected", http.StatusNotFound)
-	}), &http2.Server{})}
-	go httpSrv.Serve(ln)
-	defer httpSrv.Close()
-
+	// Orchestrator side: an h2c server that reads the Register frame then serves the
+	// stream — the config-socket plugin plane, minus auth.
 	src := &fakeSource{
 		sub:  make(chan routesync.Event, 4),
 		woke: make(chan string, 4),
 		pol:  routesync.Policy{Domain: "d", AuthMode: "enforce", ParkTimeoutMS: 1234},
 	}
-	cl := routesync.NewClient([]string{sock}, src, log)
+	httpSrv := &http.Server{Handler: h2c.NewHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reg, err := routesync.ReadRegister(r.Body)
+		if err != nil {
+			http.Error(w, "bad register", http.StatusBadRequest)
+			return
+		}
+		routesync.ServeStream(r.Context(), w, r.Body, src, reg, log)
+	}), &http2.Server{})}
+	go httpSrv.Serve(ln)
+	defer httpSrv.Close()
+
+	// Subscriber side: dial the UDS and register as a proxy (route_wake).
+	sink := newFakeSink()
+	wakes := &fakeWakes{ch: make(chan string, 1)}
+	dial := func(ctx context.Context) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, "unix", sock)
+	}
+	reg := routesync.Register{
+		Subscribe: &routesync.Subscribe{Kind: routesync.KindRouteWake},
+		Proxy:     &routesync.Proxy{Socket: routesync.Socket{Path: "/x"}},
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go cl.Run(ctx)
+	go routesync.NewSubscriber(dial, "px0", reg, sink, wakes, log).Run(ctx)
 
 	// Handshake policy, then the initial route set streams as upsert(s1) + bookmark.
 	if p := recv(t, sink.pol, "policy"); p.AuthMode != "enforce" || p.ParkTimeoutMS != 1234 {

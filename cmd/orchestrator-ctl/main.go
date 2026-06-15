@@ -35,7 +35,6 @@ import (
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/mmds"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/orch"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/proxy"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/secretbox"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/store"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/vswitch"
@@ -86,7 +85,6 @@ func serve(args []string, log *slog.Logger) error {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	cfgPath := fs.String("config", "/etc/orchestrator-ctl/config.yaml", "config file")
 	proxyMode := fs.String("proxy", "", "override proxy_mode: internal|external|off")
-	proxySock := fs.String("proxy-socket", "", "override proxy_sockets (comma-separated UDS, external mode)")
 	_ = fs.Parse(args)
 
 	cfg, err := config.Load(*cfgPath)
@@ -95,9 +93,6 @@ func serve(args []string, log *slog.Logger) error {
 	}
 	if *proxyMode != "" {
 		cfg.Proxy.Mode = *proxyMode
-	}
-	if *proxySock != "" {
-		cfg.Proxy.Sockets = splitComma(*proxySock)
 	}
 	if err := cfg.ValidateProxy(); err != nil { // re-check after flag overrides
 		return err
@@ -149,11 +144,18 @@ func serve(args []string, log *slog.Logger) error {
 	// run-builder; SO_PEERCRED pid == id pidfile), manifest-key management (admin plane, pid ∈
 	// admin_pidfile or, when unset, the socket's 0600 perms), and the api plane over
 	// plain h2c (X-API-KEY). See docs §6.
+	// The plugin registry is shared: the config-socket plugin plane Adds/Removes
+	// registrations (proxy workers, route observers); the external-mode gateway reads
+	// it to forward data-plane requests to a registered proxy worker.
+	plugins := configsock.NewRegistry()
 	cs := configsock.New(cfg.Paths.ConfigSocket, configsock.Deps{
-		Provider:     core,
-		Admin:        core,
-		API:          apiH,
-		AdminPidfile: cfg.Paths.AdminPidfile,
+		Provider:      core,
+		Admin:         core,
+		API:           apiH,
+		AdminPidfile:  cfg.Paths.AdminPidfile,
+		RouteSource:   core,
+		Plugins:       plugins,
+		PluginPidfile: cfg.Paths.PluginPidfile,
 	}, log)
 	go func() {
 		if err := cs.Serve(ctx); err != nil {
@@ -165,7 +167,7 @@ func serve(args []string, log *slog.Logger) error {
 	// forward-to-worker gateway (external), or reject (off). External mode also
 	// starts the route-sync client that pushes the route table to each worker.
 	mx := metrics.New()
-	dataH := buildDataPlane(ctx, cfg, core, mx, log)
+	dataH := buildDataPlane(cfg, core, plugins, mx, log)
 
 	// North handler: api.<domain> -> control plane; <port>-<sid>.<domain> -> data plane.
 	mux := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -227,7 +229,7 @@ func serve(args []string, log *slog.Logger) error {
 }
 
 // buildDataPlane wires the data-plane handler for the configured proxy_mode.
-func buildDataPlane(ctx context.Context, cfg *config.Config, core *orch.Orchestrator, mx *metrics.M, log *slog.Logger) http.Handler {
+func buildDataPlane(cfg *config.Config, core *orch.Orchestrator, plugins *configsock.Registry, mx *metrics.M, log *slog.Logger) http.Handler {
 	switch cfg.Proxy.Mode {
 	case config.ProxyOff:
 		return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -235,21 +237,11 @@ func buildDataPlane(ctx context.Context, cfg *config.Config, core *orch.Orchestr
 			http.Error(w, "data plane disabled (proxy_mode=off)", http.StatusNotImplemented)
 		})
 	case config.ProxyExternal:
-		rc := routesync.NewClient(cfg.Proxy.Sockets, core, log)
-		go rc.Run(ctx)
-		log.Info("route-sync client started", "proxies", cfg.Proxy.Sockets)
-		return newGateway(cfg.Proxy.Sockets, mx, log)
+		// Proxy workers register on the config-socket plugin plane (and stream the
+		// route table from there); the gateway forwards to the live registered set.
+		log.Info("external proxy mode: workers register on the config socket")
+		return newGateway(plugins, mx, log)
 	default: // internal
 		return proxy.New(core, func() string { return cfg.Proxy.Auth }, log, mx)
 	}
-}
-
-func splitComma(s string) []string {
-	var out []string
-	for _, p := range strings.Split(s, ",") {
-		if p = strings.TrimSpace(p); p != "" {
-			out = append(out, p)
-		}
-	}
-	return out
 }

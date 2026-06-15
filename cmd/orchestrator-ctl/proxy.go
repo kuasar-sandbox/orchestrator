@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
-	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -22,18 +21,26 @@ import (
 
 // runProxy is the external data-plane proxy worker (proxy_mode=external). It:
 //
-//   - serves an h2c UDS (--socket) the orchestrator dials: the route-sync stream
-//     (route table push + Wake) and the fallback data-forward path;
+//   - registers on the orchestrator's config-socket plugin plane (--config-socket,
+//     --id) and keeps its route table synced over that single held connection (route
+//     push down + Wake up — internal/routesync);
+//
+//   - serves an h2c UDS (--socket) for the data-plane requests the orchestrator's
+//     gateway forwards to it (it advertises this path to the orchestrator at
+//     registration);
 //
 //   - serves the data-plane ingress on --data-listen with SO_REUSEPORT (so several
 //     workers share one port), forwarding to envd UDS / floatingip from its synced
 //     route table, parking a request until the route is ready (Wake -> resume).
 //
-//     orchestrator-ctl proxy --socket=<uds> --data-listen=<addr> [--tls-cert --tls-key]
-//     [--auth=off|log|enforce] [--park-timeout=30s] [--metrics-listen=<addr>]
+//     orchestrator-ctl proxy --config-socket=<uds> --id=<name> --socket=<uds>
+//     --data-listen=<addr> [--tls-cert --tls-key] [--auth=off|log|enforce]
+//     [--park-timeout=30s] [--metrics-listen=<addr>] [--mmds-listen=<addr>]
 func runProxy(args []string, log *slog.Logger) error {
 	fs := flag.NewFlagSet("proxy", flag.ExitOnError)
-	socket := fs.String("socket", "", "routesync + fallback-forward UDS the orchestrator dials (required)")
+	configSocket := fs.String("config-socket", "", "orchestrator config-socket UDS to register + sync on (required)")
+	id := fs.String("id", "", "this proxy worker's plugin id, unique per worker (required)")
+	socket := fs.String("socket", "", "UDS this worker serves for gateway-forwarded data-plane requests (required)")
 	dataListen := fs.String("data-listen", "", "data-plane ingress addr, SO_REUSEPORT (e.g. :443); empty = UDS-only")
 	tlsCert := fs.String("tls-cert", "", "TLS cert for the data-plane listener (empty = h2c)")
 	tlsKey := fs.String("tls-key", "", "TLS key for the data-plane listener")
@@ -42,8 +49,8 @@ func runProxy(args []string, log *slog.Logger) error {
 	metricsListen := fs.String("metrics-listen", "", "optional Prometheus text endpoint, e.g. 127.0.0.1:9095")
 	mmdsListen := fs.String("mmds-listen", "", "MMDS metadata-service listen addr (e.g. :19254); empty = off. Set when serve has mmds.enabled, plus a host redirect of 169.254.169.254:80 -> this addr")
 	_ = fs.Parse(args)
-	if *socket == "" {
-		return fmt.Errorf("proxy: --socket is required")
+	if *configSocket == "" || *id == "" || *socket == "" {
+		return fmt.Errorf("proxy: --config-socket, --id and --socket are required")
 	}
 	authFallback := *auth
 	if authFallback == "" {
@@ -63,16 +70,21 @@ func runProxy(args []string, log *slog.Logger) error {
 		return authFallback
 	}
 	px := proxy.New(tableRouter{tbl}, authMode, log, mx)
-	rs := routesync.NewServer(tbl, tbl, log)
 
-	// UDS: route-sync stream (SyncHeader) + fallback data-forward (everything else).
-	udsMux := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get(routesync.SyncHeader) == "1" {
-			rs.ServeSync(w, r)
-			return
-		}
-		px.ServeHTTP(w, r)
-	})
+	// Register on the orchestrator's config-socket plugin plane and keep the route
+	// table synced over that held connection (the table is both the Sink and, since
+	// this is a proxy that resumes sandboxes, the WakeSource).
+	reg := routesync.Register{
+		Subscribe: &routesync.Subscribe{Kind: routesync.KindRouteWake},
+		Proxy:     &routesync.Proxy{Socket: routesync.Socket{Path: *socket}},
+		Mmds:      *mmdsListen != "",
+	}
+	dial := func(ctx context.Context) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, "unix", *configSocket)
+	}
+	go routesync.NewSubscriber(dial, *id, reg, tbl, tbl, log).Run(ctx)
+
+	// UDS: the data-plane requests the orchestrator's gateway forwards to this worker.
 	_ = os.Remove(*socket)
 	udsLn, err := net.Listen("unix", *socket)
 	if err != nil {
@@ -82,7 +94,7 @@ func runProxy(args []string, log *slog.Logger) error {
 		log.Warn("proxy: chmod socket", "err", err)
 	}
 	go func() {
-		if err := serveListener(ctx, udsLn, udsMux, "", "", log); err != nil {
+		if err := serveListener(ctx, udsLn, px, "", "", log); err != nil {
 			log.Error("proxy: uds server", "err", err)
 		}
 	}()
@@ -109,7 +121,7 @@ func runProxy(args []string, log *slog.Logger) error {
 	}
 
 	if *dataListen == "" {
-		log.Warn("proxy: no --data-listen; serving fallback-forward over UDS only", "socket", *socket)
+		log.Warn("proxy: no --data-listen; serving gateway-forward over UDS only", "socket", *socket)
 		<-ctx.Done()
 		return nil
 	}
@@ -117,8 +129,8 @@ func runProxy(args []string, log *slog.Logger) error {
 	if err != nil {
 		return fmt.Errorf("proxy: listen %s: %w", *dataListen, err)
 	}
-	log.Info("orchestrator-ctl proxy serving", "data_listen", *dataListen, "socket", *socket,
-		"tls", *tlsCert != "", "auth_fallback", authFallback)
+	log.Info("orchestrator-ctl proxy serving", "data_listen", *dataListen, "socket", *socket, "id", *id,
+		"config_socket", *configSocket, "tls", *tlsCert != "", "auth_fallback", authFallback)
 	return serveListener(ctx, dataLn, px, *tlsCert, *tlsKey, log)
 }
 

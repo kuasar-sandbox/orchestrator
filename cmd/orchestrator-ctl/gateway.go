@@ -8,26 +8,28 @@ import (
 	"net/http"
 	"net/http/httputil"
 
+	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/metrics"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/proxy"
 )
 
 // gateway is the external-mode fallback: when a data-plane request lands on the
 // orchestrator's own listener (rather than directly on a proxy worker's
-// data_listen), it is reverse-proxied to one of the proxy workers over its UDS.
-// The proxy then serves it from its synced route table exactly like a direct
-// request. Workers are picked by sandbox-id hash for connection affinity.
+// data_listen), it is reverse-proxied to one of the registered proxy workers over
+// its UDS. The proxy then serves it from its synced route table exactly like a
+// direct request. Workers are picked by sandbox-id hash over the live registered
+// set (from the plugin registry) for connection affinity.
 type gateway struct {
-	sockets []string
-	rp      *httputil.ReverseProxy
-	mx      *metrics.M
-	log     *slog.Logger
+	reg *configsock.Registry
+	rp  *httputil.ReverseProxy
+	mx  *metrics.M
+	log *slog.Logger
 }
 
 type gwSockKey struct{}
 
-func newGateway(sockets []string, mx *metrics.M, log *slog.Logger) *gateway {
-	g := &gateway{sockets: sockets, mx: mx, log: log}
+func newGateway(reg *configsock.Registry, mx *metrics.M, log *slog.Logger) *gateway {
+	g := &gateway{reg: reg, mx: mx, log: log}
 	tr := &http.Transport{
 		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 			sock, _ := ctx.Value(gwSockKey{}).(string)
@@ -53,13 +55,15 @@ func (g *gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad sandbox host", http.StatusBadRequest)
 		return
 	}
-	if len(g.sockets) == 0 {
-		http.Error(w, "no proxy workers", http.StatusBadGateway)
+	targets := g.reg.ProxyTargets()
+	if len(targets) == 0 {
+		g.mx.Inc(`gateway_forward_total{result="no_worker"}`)
+		http.Error(w, "no proxy workers registered", http.StatusBadGateway)
 		return
 	}
 	h := fnv.New32a()
 	_, _ = h.Write([]byte(sid))
-	sock := g.sockets[h.Sum32()%uint32(len(g.sockets))]
+	sock := targets[h.Sum32()%uint32(len(targets))]
 	g.mx.Inc(`gateway_forward_total{result="ok"}`)
 	ctx := context.WithValue(r.Context(), gwSockKey{}, sock)
 	g.rp.ServeHTTP(w, r.WithContext(ctx))

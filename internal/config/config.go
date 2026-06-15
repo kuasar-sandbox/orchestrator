@@ -85,12 +85,11 @@ type TLSConfig struct {
 // mode the orchestrator dials each sockets UDS and pushes the route table; the
 // proxy workers own the data-plane listener. data_listen "" shares api.listen.
 type ProxyConfig struct {
-	Mode          string   `yaml:"mode"`           // internal (default) | external | off
-	Sockets       []string `yaml:"sockets"`        // external: routesync UDS paths the orchestrator dials
-	DataListen    string   `yaml:"data_listen"`    // dedicated data-plane listener; "" = share api.listen
-	ParkTimeout   string   `yaml:"park_timeout"`   // hold a data-plane request awaiting route/resume; default 30s
-	Auth          string   `yaml:"auth"`           // off | log | enforce (default): validate X-Access-Token
-	MetricsListen string   `yaml:"metrics_listen"` // optional Prometheus text endpoint; "" = off
+	Mode          string `yaml:"mode"`           // internal (default) | external | off
+	DataListen    string `yaml:"data_listen"`    // dedicated data-plane listener; "" = share api.listen
+	ParkTimeout   string `yaml:"park_timeout"`   // hold a data-plane request awaiting route/resume; default 30s
+	Auth          string `yaml:"auth"`           // off | log | enforce (default): validate X-Access-Token
+	MetricsListen string `yaml:"metrics_listen"` // optional Prometheus text endpoint; "" = off
 }
 
 // MMDSConfig is the optional Firecracker-MMDS-v2 metadata service the orchestrator
@@ -112,8 +111,9 @@ type PathsConfig struct {
 	RunRoot      string `yaml:"run_root"`      // default /run/sandbox (tmpfs)
 	BaseRoot     string `yaml:"base_root"`     // default /var/lib/sandbox (persistent)
 	DBPath       string `yaml:"db_path"`       // default <base_root>/orchestrator.db
-	ConfigSocket string `yaml:"config_socket"` // default /run/sandbox/orchestrator.socket
-	AdminPidfile string `yaml:"admin_pidfile"` // optional PID allowlist (multi-line) gating the socket admin plane; "" => socket perms (same-uid/root) only
+	ConfigSocket  string `yaml:"config_socket"`  // default /run/sandbox/orchestrator.socket
+	AdminPidfile  string `yaml:"admin_pidfile"`  // optional PID allowlist (multi-line) gating the socket admin plane; "" => socket perms (same-uid/root) only
+	PluginPidfile string `yaml:"plugin_pidfile"` // optional PID allowlist (multi-line) gating the socket plugin plane (proxy/agent registration); "" => socket perms only
 }
 
 // UnitsConfig manages the systemd template units (generated + installed at startup).
@@ -429,9 +429,10 @@ func (c *Config) ValidateProxy() error {
 	default:
 		return fmt.Errorf("config: proxy.auth %q (want off|log|enforce)", c.Proxy.Auth)
 	}
-	if c.Proxy.Mode == ProxyExternal && len(c.Proxy.Sockets) == 0 {
-		return fmt.Errorf("config: proxy.mode=external requires proxy.sockets (or --proxy-socket)")
-	}
+	// proxy.mode=external needs no static socket list: proxy workers register
+	// themselves on the config-socket plugin plane (the gateway forwards to the
+	// live registered set), so there is nothing to require here.
+
 	// MMDS off => envd is non-secure, so the proxy must be the enforcing sole gate.
 	if !c.MMDS.Enabled && c.Proxy.Auth != AuthEnforce {
 		return fmt.Errorf("config: mmds.enabled=false requires proxy.auth=enforce (envd runs non-secure; the proxy is the only data-plane gate)")

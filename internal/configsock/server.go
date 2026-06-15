@@ -1,14 +1,19 @@
 // Package configsock implements the orchestrator's local control socket: a single
-// UDS that multiplexes three planes over HTTP (h2c, with HTTP/1.1 fallback), each
+// UDS that multiplexes several planes over HTTP (h2c, with HTTP/1.1 fallback), each
 // with its own authentication:
 //
-//   - task  (POST /internal/task/launchspec): orchestrator-ctl run-sandbox / run-builder
+//   - task   (POST /internal/task/launchspec): orchestrator-ctl run-sandbox / run-builder
 //     fetch their generic LaunchSpec by config-id, then exec-replace into the target. Authed by
 //     SO_PEERCRED peer pid == the id's pidfile (/run/sandbox/<id>/<id>.pid).
-//   - admin (/internal/admin/manifest-keys): manifest-key allowlist management.
+//   - admin  (/internal/admin/manifest-keys): manifest-key allowlist management.
 //     Authed by SO_PEERCRED peer pid ∈ admin_pidfile (or, when that is unset, by the
 //     socket's 0600 permissions alone = same uid / root).
-//   - api   (everything else): the e2b-compatible control plane — the SAME
+//   - plugin (PUT /internal/plugin/{id}/register): a subscriber (an external proxy
+//     worker, or a route observer such as the platform agent) registers its
+//     capabilities and holds the connection open as its route stream + lease (see
+//     internal/routesync). Authed by SO_PEERCRED peer pid ∈ plugin_pidfile (or socket
+//     perms when unset).
+//   - api    (everything else): the e2b-compatible control plane — the SAME
 //     http.Handler served over TLS at api.<domain> — reached locally over plain h2c
 //     and authed by X-API-KEY. Includes the export-sandbox / import-sandbox routes.
 //
@@ -32,6 +37,8 @@ import (
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
 	"golang.org/x/sys/unix"
+
+	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/routesync"
 )
 
 // Plane paths. The task/admin planes live under /internal/ (a prefix the e2b SDK
@@ -192,12 +199,15 @@ type AdminKeyResponse struct {
 	Error       string `json:"error,omitempty"`
 }
 
-// Deps wires the three planes for New.
+// Deps wires the planes for New.
 type Deps struct {
-	Provider     Provider     // task plane (LaunchSpec by config-id)
-	Admin        Admin        // admin plane (manifest-key allowlist)
-	API          http.Handler // api plane (e2b control plane + export/import); the fallback
-	AdminPidfile string       // optional PID allowlist gating the admin plane ("" => socket perms only)
+	Provider     Provider         // task plane (LaunchSpec by config-id)
+	Admin        Admin            // admin plane (manifest-key allowlist)
+	API          http.Handler     // api plane (e2b control plane + export/import); the fallback
+	AdminPidfile string           // optional PID allowlist gating the admin plane ("" => socket perms only)
+	RouteSource  routesync.Source // plugin plane: route authority a subscriber streams from (nil => plane off)
+	Plugins      *Registry        // plugin plane: live registration registry (shared with the gateway)
+	PluginPidfile string          // optional PID allowlist gating the plugin plane ("" => socket perms only)
 }
 
 type Server struct {
@@ -260,6 +270,9 @@ func (s *Server) router() http.Handler {
 	mux.HandleFunc("POST "+PathTaskLaunchSpec, s.handleTask)
 	mux.HandleFunc("POST "+PathTaskBuildSpec, s.handleBuildTask)
 	mux.HandleFunc(PathAdminManifestKey, s.handleAdminKeys) // GET=list, POST=add/remove/check
+	if s.deps.RouteSource != nil && s.deps.Plugins != nil {
+		mux.HandleFunc(routesync.PluginRegisterPattern, s.handlePluginRegister) // plugin plane: register + route stream
+	}
 	// Everything else is the api plane (e2b control plane + export/import), authed
 	// by X-API-KEY inside the api handler. The "/internal/" routes above are more
 	// specific, so they win over this catch-all.

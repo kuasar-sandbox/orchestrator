@@ -1,23 +1,29 @@
-// Package routesync is the orchestrator<->proxy route-distribution protocol used
-// in proxy_mode=external. The orchestrator (the route authority) dials each proxy
-// worker's UDS and runs a single long-lived, bidirectional stream over h2c:
+// Package routesync is the orchestrator's route-distribution protocol used in
+// proxy_mode=external (and by any other subscriber, e.g. a platform agent). A
+// subscriber registers on the orchestrator's config-socket plugin plane —
+// PUT /internal/plugin/{id}/register — and that single long-lived, bidirectional
+// h2c request carries the stream both ways:
 //
-//	orchestrator -> proxy :  Hello(policy) -> Upsert* -> Bookmark -> Upsert/Delete (live deltas)
-//	proxy -> orchestrator :  HelloAck       -> Wake(sid)          (data-plane traffic for a
-//	                                                               missing/paused sandbox)
+//	subscriber -> orchestrator :  Register(caps) -> Wake(sid)          (route_wake only: data-plane
+//	                                                                    traffic for a missing/paused sandbox)
+//	orchestrator -> subscriber :  Hello(policy)  -> Upsert* -> Bookmark -> Upsert/Delete (live deltas)
+//
+// The orchestrator is the route authority and the connection responder: it no longer
+// dials anyone. The subscriber (internal/routetable on a proxy worker; or an observer)
+// is the dialer + lease holder — the connection IS the registration. Closing it
+// deregisters; a second registration with the same id evicts (and closes) the first.
 //
 // The initial route set is streamed one Upsert per sandbox, then a Bookmark marks
 // "initial sync complete" — no materialized all-routes frame (bounded send-side
-// memory at high sandbox density). The proxy applies the stream against a sync
+// memory at high sandbox density). The subscriber applies the stream against a sync
 // generation and, on the Bookmark, drops entries it did not see this stream (which
 // recovers deletions that happened while it was disconnected — see internal/routetable).
 //
 // On a Wake the orchestrator resumes the sandbox (single-flight) and the resulting
 // Upsert flows back down, unparking the proxy's held request. The wire is
-// length-prefixed JSON frames (no gRPC/protobuf) — the same framing style as
-// internal/configsock, extended to a continuous stream. Transport is h2c so a
-// single request carries both directions full-duplex (golang.org/x/net/http2,
-// already a dependency).
+// length-prefixed JSON frames (no gRPC/protobuf) — the same framing style as the rest
+// of internal/configsock, extended to a continuous stream. Transport is h2c so the
+// single request carries both directions full-duplex (golang.org/x/net/http2).
 package routesync
 
 import (
@@ -27,15 +33,24 @@ import (
 	"io"
 )
 
-// Version is the protocol version exchanged in Hello/HelloAck.
+// Version is the protocol version exchanged in Hello/Register.
 const Version = 1
 
-// SyncHeader marks the bidi route-sync request on the proxy's UDS so it is routed
-// to the stream handler rather than the data-forward (fallback) data-plane handler.
-const SyncHeader = "X-Orch-Routesync"
+// PluginRegisterPattern is the config-socket route pattern (Go 1.22 method+wildcard)
+// a subscriber registers + opens its route stream on. PluginRegisterPath builds the
+// concrete path the subscriber dials.
+const PluginRegisterPattern = "PUT /internal/plugin/{id}/register"
 
-// SyncPath is the request path the orchestrator dials for the route-sync stream.
-const SyncPath = "/routesync"
+const pluginPathPrefix = "/internal/plugin/"
+
+// PluginRegisterPath is the registration path for a given plugin id.
+func PluginRegisterPath(id string) string { return pluginPathPrefix + id + "/register" }
+
+// Subscribe kinds (Register.Subscribe.Kind).
+const (
+	KindRoute     = "route"      // route stream only (observer)
+	KindRouteWake = "route_wake" // route stream + this subscriber issues Wakes (a proxy)
+)
 
 // RouteEntry.State values (mirror internal/types.State string values).
 const (
@@ -46,12 +61,12 @@ const (
 
 // Message types.
 const (
-	TypeHello    = "hello"     // orchestrator -> proxy (carries Policy)
-	TypeHelloAck = "hello_ack" // proxy -> orchestrator
-	TypeUpsert   = "upsert"    // orchestrator -> proxy (one route added/changed)
-	TypeDelete   = "delete"    // orchestrator -> proxy (one route removed)
-	TypeBookmark = "bookmark"  // orchestrator -> proxy (initial route stream complete; synced)
-	TypeWake     = "wake"      // proxy -> orchestrator (resume this sandbox)
+	TypeRegister = "register" // subscriber -> orchestrator (caps; first up-frame)
+	TypeHello    = "hello"    // orchestrator -> subscriber (carries Policy)
+	TypeUpsert   = "upsert"   // orchestrator -> subscriber (one route added/changed)
+	TypeDelete   = "delete"   // orchestrator -> subscriber (one route removed)
+	TypeBookmark = "bookmark" // orchestrator -> subscriber (initial route stream complete; synced)
+	TypeWake     = "wake"     // subscriber -> orchestrator (resume this sandbox)
 )
 
 // RouteEntry is the per-sandbox routing + auth state the orchestrator distributes
@@ -87,17 +102,57 @@ type Policy struct {
 // Msg is one wire message — a tagged union; exactly one payload field is set for a
 // given Type.
 type Msg struct {
-	Type  string      `json:"type"`
-	Hello *Hello      `json:"hello,omitempty"`
-	Route *RouteEntry `json:"route,omitempty"` // upsert
-	SID   string      `json:"sid,omitempty"`   // delete | wake
+	Type     string      `json:"type"`
+	Hello    *Hello      `json:"hello,omitempty"`    // hello (orchestrator -> subscriber)
+	Register *Register   `json:"register,omitempty"` // register (subscriber -> orchestrator, first up-frame)
+	Route    *RouteEntry `json:"route,omitempty"`    // upsert
+	SID      string      `json:"sid,omitempty"`      // delete | wake
 }
 
-// Hello is the first frame each side sends. The orchestrator's carries the Policy.
+// Hello is the orchestrator's first down-frame; it carries the operational Policy.
 type Hello struct {
 	Version int    `json:"version"`
-	Role    string `json:"role"` // "orchestrator" | "proxy"
 	Policy  Policy `json:"policy,omitempty"`
+}
+
+// Register is the subscriber's first up-frame: the capabilities it wants wired. The
+// capabilities are independent — the orchestrator wires each on its own and does not
+// enforce combinations (a proxy without subscribe, a subscribe without proxy, etc.
+// are all the subscriber's own call).
+type Register struct {
+	Subscribe *Subscribe `json:"subscribe,omitempty"` // route stream; nil = lease only (no routes)
+	Proxy     *Proxy     `json:"proxy,omitempty"`     // accepts gateway-forwarded data-plane requests
+	Mmds      bool       `json:"mmds,omitempty"`      // serves MMDS (the per-sandbox secret ships on every entry)
+}
+
+// Subscribe selects the route-stream flavor.
+type Subscribe struct {
+	Kind string `json:"kind"` // KindRoute | KindRouteWake
+}
+
+// Proxy declares the UDS the orchestrator's control-plane gateway forwards
+// data-plane requests to (this subscriber serves them from its synced table).
+type Proxy struct {
+	Socket Socket `json:"socket"`
+}
+
+type Socket struct {
+	Path string `json:"path"`
+}
+
+// subscribes reports whether the orchestrator should stream routes to this plugin.
+func (r Register) subscribes() bool { return r.Subscribe != nil }
+
+// handlesWake reports whether the subscriber issues Wakes (route_wake), so the
+// orchestrator acts on inbound Wake frames.
+func (r Register) handlesWake() bool { return r.Subscribe != nil && r.Subscribe.Kind == KindRouteWake }
+
+// SubscribeKind is the declared subscribe kind, or "" if not subscribing (for logs).
+func (r Register) SubscribeKind() string {
+	if r.Subscribe == nil {
+		return ""
+	}
+	return r.Subscribe.Kind
 }
 
 // Event is a route change the orchestrator publishes to the route-sync client,
