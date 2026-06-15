@@ -17,9 +17,11 @@ api:
 # Data-plane proxy. mode selects how sandbox traffic (<port>-<sid>.<domain>) is served:
 #   internal (default) — in-process proxy (single binary, no extra moving parts).
 #   external           — offload to orchestrator-ctl proxy workers (deploy/
-#                        orchestrator-proxy@.service): the orchestrator pushes the
-#                        route table over each worker's UDS (sockets) and the workers
-#                        own the data-plane port (SO_REUSEPORT).
+#                        orchestrator-proxy@.service): each worker registers on the
+#                        config-socket plugin plane + syncs the route table from it,
+#                        and they own the data-plane port (SO_REUSEPORT). No static
+#                        socket list — the orchestrator forwards by sandbox-id hash
+#                        over the live registered set.
 #   off                — reject data-plane traffic on this node.
 # auth: the proxy validates X-Access-Token (= envdAccessToken) — enforce (default)
 # rejects mismatches (401); log warns but forwards; off disables. park_timeout bounds
@@ -27,7 +29,6 @@ api:
 proxy:
   mode: internal
   auth: enforce
-  # sockets: [ /run/sandbox/proxy-1.sock, /run/sandbox/proxy-2.sock ]   # external only
   # data_listen: ""                              # dedicated data-plane addr; "" = share api.listen
   # park_timeout: 30s
   # metrics_listen: 127.0.0.1:9095               # "" = metrics off
@@ -48,16 +49,20 @@ manifest_config: /opt/sandbox/manifest.yaml
 paths:
   run_root: /run/sandbox                          # tmpfs run state
   base_root: /var/lib/sandbox                     # persistent state
-  # Local control socket — one UDS, three planes over h2c: task LaunchSpec fetch
-  # (task), manifest-key allowlist (admin), and the e2b api plane (a plain-h2c twin of
-  # api.listen, incl. export/import). The manifest-key / export-sandbox / import-sandbox
-  # CLIs are clients of this socket — they do not open the DB or read this config.
+  # Local control socket — one UDS, four planes over h2c: task LaunchSpec fetch (task),
+  # manifest-key allowlist (admin), proxy/agent registration + route stream (plugin),
+  # and the e2b api plane (a plain-h2c twin of api.listen, incl. export/import). The
+  # manifest-key / export-sandbox / import-sandbox CLIs and external proxy workers are
+  # clients of this socket — they do not open the DB or read this config.
   config_socket: /run/sandbox/orchestrator.socket
   # db_path: /var/lib/sandbox/orchestrator.db     # default = <base_root>/orchestrator.db
   # admin_pidfile gates the admin plane: when set, a manifest-key caller's peer pid must
   # be listed (one per line; '#' comments ok). Unset (default) relies on the socket's
   # 0600 perms (same uid / root). Set it to restrict admin to specific automation pids.
   # admin_pidfile: /run/sandbox/orchestrator-admin.pids
+  # plugin_pidfile gates the plugin plane (proxy/agent registration), same format as
+  # admin_pidfile. Unset relies on the socket's 0600 perms.
+  # plugin_pidfile: /run/sandbox/orchestrator-plugin.pids
 
 # Systemd template units (generated + installed at startup, then daemon-reloaded).
 # units:

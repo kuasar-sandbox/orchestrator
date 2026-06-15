@@ -21,8 +21,8 @@ floatingip 网络)。不感知资源仲裁(准入在 `sandbox-ctl` 内部);叶�
 | `cmd/e2b-key-ctl` | 纯派生凭据工具(无 DB/config):`gen-key` / `gen-apikey` / `fingerprint` / `seal-pull-token` |
 | `internal/api` | e2b 控制面 REST(X-API-KEY 鉴权、export/import 扩展) |
 | `internal/orch` | 编排核心:生命周期、构建池、路由权威、单元生成、重启对账 |
-| `internal/proxy` `internal/routetable` `internal/routesync` | 数据面 L7 反代、worker 本地路由表(park/wake)、serve↔worker 路由同步协议(帧化 JSON over h2c) |
-| `internal/configsock` | 本机控制 socket:task(LaunchSpec/BuildSpec)/ admin(manifest-key)/ api 三平面,SO_PEERCRED 鉴权 |
+| `internal/proxy` `internal/routetable` `internal/routesync` | 数据面 L7 反代(含 CONNECT 隧道)、订阅者本地路由表(park/wake、世代清扫)、订阅者→orchestrator 路由同步协议(注册 + bookmark,帧化 JSON over h2c) |
+| `internal/configsock` | 本机控制 socket:task(LaunchSpec/BuildSpec)/ admin(manifest-key)/ plugin(proxy·agent 注册 + 路由流)/ api 四平面,SO_PEERCRED 鉴权 |
 | `internal/apikey` `internal/secretbox` `internal/keys` `internal/regcreds` | api_key 派生 MAC、manifest_key 落盘 AES-GCM、数据面 token、镜像拉取凭据 |
 | `internal/config` `internal/sandboxcfg` `internal/store` | 配置加载、SANDBOX_CONFIG 渲染、sqlite 状态(sandboxes/builds/manifest_keys) |
 | `internal/mmds` `internal/metrics` `internal/launcher` `internal/vswitch` | MMDS 元数据服务(envd re-key)、Prometheus 文本、systemd D-Bus、vswitch-ctl 封装 |
