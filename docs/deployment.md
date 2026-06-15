@@ -53,7 +53,7 @@ vsock / UDS)协作。本文档定义这些进程在生产部署中的归属、�
 | `node-ctl daemon` | `/run/sandbox-resource.sock` | UDS,自定义协议 | 沙箱资源协议(`sandbox-ctl` 拨号目标)|
 | `sandbox-ctl` | `/run/sandbox/<sid>/*.sock` | UDS | sandbox 内部:`ch.sock` / `blk{0,1}.sock` / `uffd.sock` / `ctl.sock` / `vsock.sock`(+ `_5000`);另写 `<sid>.pid`(config-socket 鉴别)、`<sid>.env`(`SANDBOX_ARGS`)|
 | `orchestrator-ctl` | `:443`(可配) | HTTPS/h2 | **对外** e2b 控制面 API + 沙箱数据面 proxy(`<port>-<sid>.<domain>`)|
-| `orchestrator-ctl` | `/run/sandbox/orchestrator.socket` | UDS,framed JSON | config-socket(task/admin/api 三平面):`run-sandbox`/`run-builder` 启动时取 LaunchSpec / BuildSpec(exec/args/workdir/env,密钥经 env)(SO_PEERCRED + `<id>.pid` 鉴别)|
+| `orchestrator-ctl` | `/run/sandbox/orchestrator.socket` | UDS,framed JSON | config-socket(task/admin/plugin/api 四平面):`run-sandbox`/`run-builder` 取 LaunchSpec / BuildSpec(密钥经 env);external proxy / 平台 agent 经 plugin 平面注册并同步路由(SO_PEERCRED + `<id>.pid` / pidfile 鉴别)|
 
 `cache-ctl tiered` 的 EC 客户端通过节点对外网络拨号 L2 cluster 节点的 `7070`
 端口(详见 §3)。**对外服务端口仅 `orchestrator-ctl` 一处**(e2b ingress);其余本机进程均 loopback/UDS。

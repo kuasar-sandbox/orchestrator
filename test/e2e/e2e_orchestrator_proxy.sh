@@ -2,15 +2,17 @@
 #
 # e2e_orchestrator_proxy.sh — exercise proxy_mode=external end to end with REAL
 # components: orchestrator-ctl serve (control plane), a separate orchestrator-ctl
-# proxy worker (data plane, SO_REUSEPORT), the route-sync stream between them, a
-# REAL microVM sandbox with REAL envd, and data-plane traffic driven THROUGH the
-# proxy (not the orchestrator):
+# proxy worker (data plane, SO_REUSEPORT) that REGISTERS on the config-socket plugin
+# plane and syncs its route table from it, a REAL microVM sandbox with REAL envd, and
+# data-plane traffic driven THROUGH the proxy (not the orchestrator):
 #
-#   serve(proxy_mode=external) --proxy-socket=<uds>     # control plane on :PORT
-#   proxy --socket=<uds> --data-listen=:PROXY_PORT      # data plane, route-synced
-#   POST /sandboxes  -> real VM + envd ; serve pushes the route to the proxy
+#   serve(proxy_mode=external)                          # control plane on :PORT
+#   proxy --config-socket=<uds> --id=.. --socket=<uds> --data-listen=:PROXY_PORT
+#         # registers on the config-socket plugin plane + syncs the route table
+#   POST /sandboxes  -> real VM + envd ; serve streams the route to the proxy
 #   GET <proxy>/health (Host 49983-<sid>): no token -> 401 (enforce);
 #                                          right X-Access-Token -> forwarded to envd
+#   CONNECT through the proxy (token on the CONNECT) -> tunnel to envd (best-effort)
 #   GET <proxy> for an unknown sandbox -> wake -> 404 (orchestrator says gone)
 #   pause -> GET <proxy> -> wake -> auto-resume -> forwarded (best-effort)
 #   /metrics on the proxy reports data_requests_total
@@ -182,7 +184,7 @@ truncate -s 2G "$BLD"
 # ---- orchestrator config: proxy_mode=external -----------------------------
 cat > "$WORK/config.yaml" <<EOF
 api: { domain: $DOMAIN, listen: ":$PORT" }
-proxy: { mode: external, sockets: [ "$PROXY_SOCK" ], auth: enforce, park_timeout: 90s }
+proxy: { mode: external, auth: enforce, park_timeout: 90s }
 encryption_key: "$ENC"
 manifest_config: $WORK/manifest.yaml
 paths: { run_root: $WORK/run, base_root: $WORK/lib, config_socket: $WORK/orchestrator.socket }
@@ -200,13 +202,8 @@ builder:
 checkpoint: { mode: remote }
 EOF
 
-# ---- start the proxy worker, then serve -----------------------------------
-echo "==> orchestrator-ctl proxy (data-plane :$PROXY_PORT, socket=$PROXY_SOCK)"
-"$BIN/orchestrator-ctl" proxy --socket="$PROXY_SOCK" --data-listen="127.0.0.1:$PROXY_PORT" \
-    --auth=enforce --park-timeout=90s --metrics-listen="127.0.0.1:$METRICS_PORT" >"$WORK/proxy.log" 2>&1 &
-PIDS+=($!)
-wait_port 127.0.0.1 "$PROXY_PORT" proxy
-
+# ---- start serve (control plane), then the proxy worker -------------------
+# The proxy now DIALS serve's config-socket to register, so serve comes up first.
 echo "==> orchestrator-ctl serve (control :$PORT, proxy_mode=external)"
 "$BIN/orchestrator-ctl" serve --config "$WORK/config.yaml" >"$WORK/orch.log" 2>&1 &
 PIDS+=($!)
@@ -216,7 +213,14 @@ for _ in $(seq 1 30); do
     sleep 0.5
 done
 "$BIN/orchestrator-ctl" manifest-key add --socket "$WORK/orchestrator.socket" "$MK" >/dev/null || fail "manifest-key add"
-echo "==> control plane up; route-sync client dialing the proxy"
+
+echo "==> orchestrator-ctl proxy (registers on config-socket, data-plane :$PROXY_PORT)"
+"$BIN/orchestrator-ctl" proxy --config-socket="$WORK/orchestrator.socket" --id=proxy-1 \
+    --socket="$PROXY_SOCK" --data-listen="127.0.0.1:$PROXY_PORT" \
+    --auth=enforce --park-timeout=90s --metrics-listen="127.0.0.1:$METRICS_PORT" >"$WORK/proxy.log" 2>&1 &
+PIDS+=($!)
+wait_port 127.0.0.1 "$PROXY_PORT" proxy
+echo "==> control plane up; proxy registered on the config-socket plugin plane"
 
 # ---- build a ready e2b template (native v3) --------------------------------
 code=$(req POST /v3/templates "$AK" '{"name":"proxy-tmpl"}')
@@ -278,6 +282,16 @@ else echo "    (note: unknown-sandbox via proxy = $code; expected 404 after wake
 if curl -sS --noproxy '*' "http://127.0.0.1:$METRICS_PORT/metrics" 2>/dev/null | grep -q 'data_requests_total'; then
     echo "==> PASS: proxy /metrics reports data_requests_total"
 else echo "    (note: proxy /metrics did not report data_requests_total)"; fi
+
+# ---- (3b) CONNECT tunnel THROUGH the proxy to envd control (best-effort) ---
+# curl issues CONNECT 49983-<sid>.<domain>:49983 to the proxy (token on the CONNECT via
+# --proxy-header); the proxy auths + tunnels to the envd control UDS, then curl sends
+# GET /health over the tunnel. --proxytunnel/--proxy-header support varies by curl.
+cc=$(curl --proxytunnel -sS --noproxy '*' -x "http://127.0.0.1:$PROXY_PORT" \
+        --proxy-header "X-Access-Token: $ENVD_TOKEN" \
+        -o /dev/null -w '%{http_code}' "http://49983-$SID.$DOMAIN:49983/health" 2>/dev/null || true)
+if [ "$cc" = "204" ] || [ "$cc" = "200" ]; then echo "==> PASS: CONNECT tunnel through the proxy reached envd /health ($cc)"
+else echo "    (note: CONNECT tunnel check = ${cc:-err}; curl --proxytunnel/--proxy-header support varies)"; fi
 
 # ---- (4) auto-resume THROUGH the proxy (best-effort: needs snapshot) ------
 echo "==> pause $SID, then drive the proxy to trigger wake -> auto-resume"
