@@ -33,12 +33,11 @@ func routeEntry(sb *types.Sandbox) routesync.RouteEntry {
 func (o *Orchestrator) Snapshot(ctx context.Context) ([]routesync.RouteEntry, error) {
 	var out []routesync.RouteEntry
 	for _, st := range []types.State{types.StateRunning, types.StatePaused} {
-		list, err := o.st.ListByState(ctx, st)
-		if err != nil {
-			return nil, err
-		}
-		for _, sb := range list {
+		if err := o.st.RangeByState(ctx, st, func(sb *types.Sandbox) error {
 			out = append(out, routeEntry(sb))
+			return nil
+		}); err != nil {
+			return nil, err
 		}
 	}
 	return out, nil

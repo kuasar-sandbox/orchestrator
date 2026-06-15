@@ -523,13 +523,20 @@ func (o *Orchestrator) Reaper(ctx context.Context, interval time.Duration) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			running, _ := o.st.ListByState(ctx, types.StateRunning)
+			// Collect past-deadline sandboxes (read-only scan), then pause them
+			// after the scan — pauseSandbox writes the store, which must not run
+			// while RangeByState's read cursor is open.
 			now := time.Now().Unix()
-			for _, sb := range running {
+			var due []*types.Sandbox
+			_ = o.st.RangeByState(ctx, types.StateRunning, func(sb *types.Sandbox) error {
 				if sb.DeadlineUnix > 0 && now >= sb.DeadlineUnix {
-					if err := o.pauseSandbox(ctx, sb); err != nil {
-						o.log.Warn("reaper pause", "sid", sb.ID, "err", err)
-					}
+					due = append(due, sb)
+				}
+				return nil
+			})
+			for _, sb := range due {
+				if err := o.pauseSandbox(ctx, sb); err != nil {
+					o.log.Warn("reaper pause", "sid", sb.ID, "err", err)
 				}
 			}
 			if n, err := o.st.PruneExpiredManifestKeys(ctx); err != nil {
@@ -554,12 +561,21 @@ func (o *Orchestrator) Reconcile(ctx context.Context) error {
 			alive[o.unitToSID(u.Name)] = true
 		}
 	}
-	running, _ := o.st.ListByState(ctx, types.StateRunning)
-	for _, sb := range running {
+	// Adopt live sandboxes in-memory inline (o.cache is not a store write);
+	// collect the dead ones and tear them down after the scan, since teardown +
+	// SetState write the store and must not run while the read cursor is open.
+	var dead []*types.Sandbox
+	if err := o.st.RangeByState(ctx, types.StateRunning, func(sb *types.Sandbox) error {
 		if alive[sb.ID] {
 			o.cache(sb) // re-adopt: route + TTL already in store
-			continue
+		} else {
+			dead = append(dead, sb)
 		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	for _, sb := range dead {
 		o.log.Info("reconcile: dead sandbox", "sid", sb.ID)
 		o.teardown(ctx, sb)
 		_ = o.st.SetState(ctx, sb.ID, types.StateDead)

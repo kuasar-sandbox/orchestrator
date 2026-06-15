@@ -219,8 +219,11 @@ func (s *Store) Get(ctx context.Context, id string) (*types.Sandbox, error) {
 // the result to a manifest_key_hash (a fast, non-unique pre-filter — the caller
 // still verifies the api key per row); "" returns all (internal callers).
 func (s *Store) List(ctx context.Context, state, ownerHash string, limit int, cursor string) ([]*types.Sandbox, string, error) {
-	if limit <= 0 || limit > 1000 {
-		limit = 100
+	if limit <= 0 {
+		limit = 100 // default page
+	}
+	if limit > 1000 {
+		limit = 1000 // clamp to the max page (not down to the default)
 	}
 	q := `SELECT ` + cols + ` FROM sandboxes`
 	var args []any
@@ -268,10 +271,30 @@ func (s *Store) List(ctx context.Context, state, ownerHash string, limit int, cu
 	return out, next, rows.Err()
 }
 
-// ListByState returns all sandboxes in a state (used by the reaper/reconciler).
-func (s *Store) ListByState(ctx context.Context, state types.State) ([]*types.Sandbox, error) {
-	out, _, err := s.List(ctx, string(state), "", 1000, "")
-	return out, err
+// RangeByState calls fn for every sandbox in state, streaming rows (bounded
+// memory, no limit/cursor — the reaper / reconcile / route snapshot all need the
+// complete set, which the old paginated ListByState silently truncated at 1000).
+// fn MUST be read-only with respect to the store: collect what to act on and act
+// after Range returns (the read cursor is open for the whole scan; writing to the
+// same table mid-scan is only safe under WAL + a multi-conn pool, so the
+// read-only contract keeps callers correct regardless). A non-nil fn error stops
+// iteration and is returned.
+func (s *Store) RangeByState(ctx context.Context, state types.State, fn func(*types.Sandbox) error) error {
+	rows, err := s.db.QueryContext(ctx, `SELECT `+cols+` FROM sandboxes WHERE state=? ORDER BY id ASC`, string(state))
+	if err != nil {
+		return fmt.Errorf("store: range by state: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		sb, err := s.scan(rows)
+		if err != nil {
+			return err
+		}
+		if err := fn(sb); err != nil {
+			return err
+		}
+	}
+	return rows.Err()
 }
 
 func (s *Store) SetState(ctx context.Context, id string, st types.State) error {
