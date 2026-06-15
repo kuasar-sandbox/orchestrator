@@ -104,15 +104,7 @@ func New(router Router, authMode func() string, log *slog.Logger, mx *metrics.M)
 	tr := &http.Transport{
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			r, _ := ctx.Value(routeKey{}).(Route)
-			d := net.Dialer{}
-			switch r.Kind {
-			case KindUDS:
-				return d.DialContext(ctx, "unix", r.UDS)
-			case KindTCP:
-				return d.DialContext(ctx, "tcp", r.Addr)
-			default:
-				return nil, fmt.Errorf("proxy: no route in context")
-			}
+			return dialRoute(ctx, r)
 		},
 		ForceAttemptHTTP2:     false, // envd's h2c server also serves h1; h1 carries Connect streams
 		MaxIdleConnsPerHost:   64,
@@ -143,6 +135,10 @@ func New(router Router, authMode func() string, log *slog.Logger, mx *metrics.M)
 }
 
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodConnect {
+		p.serveConnect(w, r)
+		return
+	}
 	sid, port, ok := ParseSandbox(r)
 	if !ok {
 		p.mx.Inc(`data_requests_total{result="badrequest"}`)

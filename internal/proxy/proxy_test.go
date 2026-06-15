@@ -1,13 +1,16 @@
 package proxy_test
 
 import (
+	"bufio"
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/proxy"
@@ -110,6 +113,79 @@ func TestProxyForwardAndAuth(t *testing.T) {
 	if code, body := do("wrong", ""); code != 200 || body != "hello from envd" {
 		t.Fatalf("auth log forwards: code=%d body=%q", code, body)
 	}
+}
+
+// TestConnectTunnel drives an HTTP/1.1 CONNECT: the target host is ignored (only the
+// port is honored), the access token is enforced, and bytes splice both ways to the
+// resolved backend.
+func TestConnectTunnel(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	// Backend the tunnel splices to: a byte echo server.
+	backLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backLn.Close()
+	go func() {
+		for {
+			c, err := backLn.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) { defer c.Close(); _, _ = io.Copy(c, c) }(c)
+		}
+	}()
+
+	px := proxy.New(stubRouter{proxy.Route{Kind: proxy.KindTCP, Addr: backLn.Addr().String(), AccessToken: "tok"}},
+		func() string { return "enforce" }, log, nil)
+	ts := httptest.NewServer(px)
+	defer ts.Close()
+	_, bport, _ := net.SplitHostPort(backLn.Addr().String())
+
+	connect := func(token string) (int, net.Conn, *bufio.Reader) {
+		c, err := net.Dial("tcp", ts.Listener.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		var hdr strings.Builder
+		// Target host "ignored" proves the host is dropped; only :<bport> matters.
+		fmt.Fprintf(&hdr, "CONNECT ignored:%s HTTP/1.1\r\nHost: ignored:%s\r\nE2b-Sandbox-Id: s1\r\n", bport, bport)
+		if token != "" {
+			fmt.Fprintf(&hdr, "X-Access-Token: %s\r\n", token)
+		}
+		hdr.WriteString("\r\n")
+		if _, err := io.WriteString(c, hdr.String()); err != nil {
+			t.Fatal(err)
+		}
+		br := bufio.NewReader(c)
+		resp, err := http.ReadResponse(br, &http.Request{Method: http.MethodConnect})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resp.StatusCode, c, br
+	}
+
+	// Valid token: 200, and the tunnel echoes.
+	code, c, br := connect("tok")
+	if code != http.StatusOK {
+		t.Fatalf("CONNECT code = %d (want 200)", code)
+	}
+	if _, err := io.WriteString(c, "ping\n"); err != nil {
+		t.Fatal(err)
+	}
+	line, _ := br.ReadString('\n')
+	if strings.TrimSpace(line) != "ping" {
+		t.Fatalf("tunnel echo = %q (want ping)", line)
+	}
+	c.Close()
+
+	// Missing token in enforce mode: 401, no tunnel.
+	code, c2, _ := connect("")
+	if code != http.StatusUnauthorized {
+		t.Fatalf("CONNECT without token = %d (want 401)", code)
+	}
+	c2.Close()
 }
 
 func TestProxyNotFoundAndDeny(t *testing.T) {

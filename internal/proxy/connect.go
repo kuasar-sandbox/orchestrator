@@ -1,0 +1,157 @@
+package proxy
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"strconv"
+)
+
+// This file adds CONNECT tunneling to the data plane: a client opens a raw TCP
+// stream to a sandbox port. Per the data-plane model the CONNECT target HOST is
+// ignored (it is uniformly the sandbox's floating IP) and only the PORT is honored;
+// the sandbox id comes from E2b-Sandbox-Id (or the authority label). The route is
+// resolved + access-token-checked exactly like a forwarded request, then the client
+// connection is spliced to the backend. The same Tunnel primitive serves both the
+// proxy's direct ingress and the external-mode gateway's CONNECT relay.
+
+// dialRoute opens a connection to a resolved route's backend — the single dial used
+// by both the reverse-proxy Transport and CONNECT tunneling.
+func dialRoute(ctx context.Context, r Route) (net.Conn, error) {
+	d := net.Dialer{}
+	switch r.Kind {
+	case KindUDS:
+		return d.DialContext(ctx, "unix", r.UDS)
+	case KindTCP:
+		return d.DialContext(ctx, "tcp", r.Addr)
+	default:
+		return nil, fmt.Errorf("proxy: no dialable route in context")
+	}
+}
+
+// serveConnect handles a CONNECT request: resolve the sandbox + port, auth, dial the
+// backend, then splice. Mirrors ServeHTTP's classification (404/501/401) so CONNECT
+// and forwarded requests behave identically.
+func (p *Proxy) serveConnect(w http.ResponseWriter, r *http.Request) {
+	sid, port, ok := parseConnect(r)
+	if !ok {
+		p.mx.Inc(`data_requests_total{result="badrequest"}`)
+		http.Error(w, "bad connect target", http.StatusBadRequest)
+		return
+	}
+	route, err := p.router.Route(r.Context(), sid, port)
+	if err != nil {
+		p.mx.Inc(`data_requests_total{result="route_error"}`)
+		http.Error(w, "routing error", http.StatusBadGateway)
+		return
+	}
+	switch route.Kind {
+	case KindNotFound:
+		p.mx.Inc(`data_requests_total{result="notfound"}`)
+		http.Error(w, "sandbox not found", http.StatusNotFound)
+		return
+	case KindDeny:
+		p.mx.Inc(`data_requests_total{result="denied"}`)
+		http.Error(w, "data plane not available on this sandbox", http.StatusNotImplemented)
+		return
+	case KindUDS, KindTCP:
+	default:
+		p.mx.Inc(`data_requests_total{result="route_error"}`)
+		http.Error(w, "routing error", http.StatusBadGateway)
+		return
+	}
+	if !p.authorized(r, route) {
+		p.mx.Inc(`data_requests_total{result="unauthorized"}`)
+		http.Error(w, "invalid access token", http.StatusUnauthorized)
+		return
+	}
+	backend, err := dialRoute(r.Context(), route)
+	if err != nil {
+		p.mx.Inc(`data_requests_total{result="upstream_error"}`)
+		http.Error(w, "upstream error", http.StatusBadGateway)
+		return
+	}
+	p.mx.Inc(`data_requests_total{result="ok"}`)
+	Tunnel(w, r, backend)
+}
+
+// parseConnect resolves (sid, port) for a CONNECT: sid from E2b-Sandbox-Id (or the
+// authority's <port>-<sid> label as a fallback), port from the CONNECT target
+// authority — the target host itself is ignored (uniformly the sandbox's floating IP).
+func parseConnect(r *http.Request) (sid string, port int, ok bool) {
+	sid = r.Header.Get("E2b-Sandbox-Id")
+	if sid == "" {
+		if s, _, parsed := ParseSandbox(r); parsed {
+			sid = s
+		}
+	}
+	if sid == "" {
+		return "", 0, false
+	}
+	target := r.URL.Host
+	if target == "" {
+		target = r.Host
+	}
+	_, ps, err := net.SplitHostPort(target)
+	if err != nil {
+		return "", 0, false
+	}
+	port, err = strconv.Atoi(ps)
+	if err != nil || port <= 0 {
+		return "", 0, false
+	}
+	return sid, port, true
+}
+
+// Tunnel splices the client connection (the CONNECT request) to backend,
+// bidirectionally, for both HTTP/1.1 (Hijack + "200 Connection established") and
+// HTTP/2 (200 response + request/response stream copy). It closes backend on return.
+// Exported so the external-mode gateway can reuse it when relaying a CONNECT to a
+// proxy worker.
+func Tunnel(w http.ResponseWriter, r *http.Request, backend net.Conn) {
+	defer backend.Close()
+
+	if r.ProtoMajor == 2 {
+		w.WriteHeader(http.StatusOK)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		done := make(chan struct{}, 2)
+		go func() { _, _ = io.Copy(backend, r.Body); done <- struct{}{} }()       // client -> backend
+		go func() { _, _ = io.Copy(flushWriter{w}, backend); done <- struct{}{} }() // backend -> client
+		<-done
+		return
+	}
+
+	hj, ok := w.(http.Hijacker)
+	if !ok {
+		http.Error(w, "connect unsupported", http.StatusInternalServerError)
+		return
+	}
+	client, _, err := hj.Hijack()
+	if err != nil {
+		return
+	}
+	defer client.Close()
+	if _, err := io.WriteString(client, "HTTP/1.1 200 Connection established\r\n\r\n"); err != nil {
+		return
+	}
+	done := make(chan struct{}, 2)
+	go func() { _, _ = io.Copy(backend, client); done <- struct{}{} }()
+	go func() { _, _ = io.Copy(client, backend); done <- struct{}{} }()
+	<-done
+}
+
+// flushWriter flushes after each write so the HTTP/2 backend->client tunnel half
+// streams promptly instead of buffering.
+type flushWriter struct{ w io.Writer }
+
+func (fw flushWriter) Write(p []byte) (int, error) {
+	n, err := fw.w.Write(p)
+	if f, ok := fw.w.(http.Flusher); ok {
+		f.Flush()
+	}
+	return n, err
+}
