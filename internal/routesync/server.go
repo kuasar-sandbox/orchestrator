@@ -8,9 +8,15 @@ import (
 
 // Sink applies inbound route messages on the proxy side (the route table).
 type Sink interface {
-	ApplySnapshot(routes []RouteEntry)
+	// BeginSync marks the start of a fresh sync stream: entries from a prior stream
+	// are tentatively stale until re-applied via ApplyUpsert before the Bookmark.
+	BeginSync()
 	ApplyUpsert(r RouteEntry)
 	ApplyDelete(sid string)
+	// Bookmark marks the initial route stream complete: the table is synced, and
+	// entries not seen since the matching BeginSync are dropped (deleted while
+	// disconnected).
+	Bookmark()
 	SetPolicy(p Policy)
 }
 
@@ -44,6 +50,10 @@ func (s *Server) ServeSync(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
+
+	// Mark a new sync generation for this stream so the Bookmark can sweep entries
+	// removed while we were disconnected. Done before reading any frame.
+	s.sink.BeginSync()
 
 	// Reader: apply inbound route frames until EOF/error, then cancel so the
 	// writer loop exits and the handler returns (closing the response -> the
@@ -86,14 +96,14 @@ func (s *Server) apply(m *Msg) {
 		if m.Hello != nil {
 			s.sink.SetPolicy(m.Hello.Policy)
 		}
-	case TypeSnapshot:
-		s.sink.ApplySnapshot(m.Routes)
 	case TypeUpsert:
 		if m.Route != nil {
 			s.sink.ApplyUpsert(*m.Route)
 		}
 	case TypeDelete:
 		s.sink.ApplyDelete(m.SID)
+	case TypeBookmark:
+		s.sink.Bookmark()
 	default:
 		s.log.Warn("routesync: unknown message", "type", m.Type)
 	}

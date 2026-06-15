@@ -2,45 +2,66 @@ package orch
 
 import (
 	"context"
+	"encoding/hex"
+	"strings"
 	"time"
 
+	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/keys"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/types"
 )
 
-// This file makes the orchestrator the routesync.Source: it snapshots the route
-// set, publishes route changes to subscribed route-sync clients (one per external
+// This file makes the orchestrator the routesync.Source: it streams the route set,
+// publishes route changes to subscribed route-sync clients (one per external
 // proxy), and resumes a sandbox when a proxy wakes it. The orchestrator is the
 // single route authority — proxies are caches.
 
-// routeEntry projects a sandbox into the wire route entry pushed to proxies.
+// routeEntry projects a sandbox into the wire route entry pushed to proxies. The
+// MMDS secret is derived deterministically (so every proxy worker agrees) and is
+// carried on every entry — subscribers that don't serve MMDS simply ignore it.
 func routeEntry(sb *types.Sandbox) routesync.RouteEntry {
 	return routesync.RouteEntry{
-		SandboxID:   sb.ID,
-		Profile:     string(sb.Profile()),
-		TemplateID:  sb.TemplateID,
-		State:       string(sb.State),
-		EnvdUDS:     sb.EnvdUDS,
-		CiUDS:       sb.CiUDS,
-		FloatingIP:  sb.FloatingIP,
-		AccessToken: sb.EnvdAccessToken,
+		SandboxID:        sb.ID,
+		Profile:          string(sb.Profile()),
+		TemplateID:       sb.TemplateID,
+		State:            string(sb.State),
+		EnvdUDS:          sb.EnvdUDS,
+		CiUDS:            sb.CiUDS,
+		FloatingIP:       sb.FloatingIP,
+		AccessToken:      sb.EnvdAccessToken,
+		SnapshotLocation: snapshotLocation(sb.SnapshotRef),
+		MmdsSecret:       hex.EncodeToString(keys.MmdsSecret(sb.ManifestKey, sb.ID)),
+	}
+}
+
+// snapshotLocation classifies a sandbox's persisted state so a subscriber can
+// decide migration: "" when never paused (running/dead), "remote" for an uploaded
+// (portable) manifest:// ref, else "local" (a node-bound checkpoint bundle).
+func snapshotLocation(ref string) string {
+	switch {
+	case ref == "":
+		return ""
+	case strings.HasPrefix(ref, "manifest://"):
+		return "remote"
+	default:
+		return "local"
 	}
 }
 
 // --- routesync.Source ---
 
-// Snapshot returns the full current route set (running + paused).
-func (o *Orchestrator) Snapshot(ctx context.Context) ([]routesync.RouteEntry, error) {
-	var out []routesync.RouteEntry
+// Range streams the full current route set (running + paused) one entry at a time,
+// in id order within each state. Streaming (vs materializing a slice) keeps
+// send-side memory bounded at high sandbox density — see store.RangeByState.
+func (o *Orchestrator) Range(ctx context.Context, fn func(routesync.RouteEntry) error) error {
 	for _, st := range []types.State{types.StateRunning, types.StatePaused} {
 		if err := o.st.RangeByState(ctx, st, func(sb *types.Sandbox) error {
-			out = append(out, routeEntry(sb))
-			return nil
+			return fn(routeEntry(sb))
 		}); err != nil {
-			return nil, err
+			return err
 		}
 	}
-	return out, nil
+	return nil
 }
 
 // Subscribe registers a route-change listener. The orchestrator drops + closes the

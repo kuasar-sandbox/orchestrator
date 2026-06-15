@@ -18,25 +18,28 @@ import (
 
 // fakeSink records what the proxy side receives.
 type fakeSink struct {
-	snap chan []routesync.RouteEntry
-	up   chan routesync.RouteEntry
-	del  chan string
-	pol  chan routesync.Policy
+	begin chan struct{}
+	up    chan routesync.RouteEntry
+	del   chan string
+	book  chan struct{}
+	pol   chan routesync.Policy
 }
 
 func newFakeSink() *fakeSink {
 	return &fakeSink{
-		snap: make(chan []routesync.RouteEntry, 4),
-		up:   make(chan routesync.RouteEntry, 4),
-		del:  make(chan string, 4),
-		pol:  make(chan routesync.Policy, 4),
+		begin: make(chan struct{}, 4),
+		up:    make(chan routesync.RouteEntry, 4),
+		del:   make(chan string, 4),
+		book:  make(chan struct{}, 4),
+		pol:   make(chan routesync.Policy, 4),
 	}
 }
 
-func (f *fakeSink) ApplySnapshot(r []routesync.RouteEntry) { f.snap <- r }
-func (f *fakeSink) ApplyUpsert(r routesync.RouteEntry)     { f.up <- r }
-func (f *fakeSink) ApplyDelete(sid string)                 { f.del <- sid }
-func (f *fakeSink) SetPolicy(p routesync.Policy)           { f.pol <- p }
+func (f *fakeSink) BeginSync()                         { f.begin <- struct{}{} }
+func (f *fakeSink) ApplyUpsert(r routesync.RouteEntry) { f.up <- r }
+func (f *fakeSink) ApplyDelete(sid string)             { f.del <- sid }
+func (f *fakeSink) Bookmark()                          { f.book <- struct{}{} }
+func (f *fakeSink) SetPolicy(p routesync.Policy)       { f.pol <- p }
 
 type fakeWakes struct{ ch chan string }
 
@@ -56,23 +59,12 @@ type fakeSource struct {
 	pol  routesync.Policy
 }
 
-func (s *fakeSource) Snapshot(ctx context.Context) ([]routesync.RouteEntry, error) {
-	return []routesync.RouteEntry{{SandboxID: "s1", Profile: "e2b", State: routesync.StateRunning}}, nil
+func (s *fakeSource) Range(ctx context.Context, fn func(routesync.RouteEntry) error) error {
+	return fn(routesync.RouteEntry{SandboxID: "s1", Profile: "e2b", State: routesync.StateRunning})
 }
 func (s *fakeSource) Subscribe() (<-chan routesync.Event, func()) { return s.sub, func() {} }
 func (s *fakeSource) OnWake(ctx context.Context, sid string)      { s.woke <- sid }
 func (s *fakeSource) Policy() routesync.Policy                    { return s.pol }
-
-func recvEntries(t *testing.T, ch <-chan []routesync.RouteEntry) []routesync.RouteEntry {
-	t.Helper()
-	select {
-	case v := <-ch:
-		return v
-	case <-time.After(3 * time.Second):
-		t.Fatal("timeout waiting for snapshot")
-		return nil
-	}
-}
 
 func recv[T any](t *testing.T, ch <-chan T, what string) T {
 	t.Helper()
@@ -87,7 +79,7 @@ func recv[T any](t *testing.T, ch <-chan T, what string) T {
 }
 
 // TestRouteSyncRoundtrip drives the real bidi h2c protocol end to end: handshake +
-// policy + snapshot + a delta downstream, and a wake upstream.
+// policy + initial route stream + bookmark + a delta downstream, and a wake upstream.
 func TestRouteSyncRoundtrip(t *testing.T) {
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	sock := filepath.Join(t.TempDir(), "p.sock")
@@ -120,13 +112,15 @@ func TestRouteSyncRoundtrip(t *testing.T) {
 	defer cancel()
 	go cl.Run(ctx)
 
-	// Handshake policy + snapshot land on the sink.
+	// Handshake policy, then the initial route set streams as upsert(s1) + bookmark.
 	if p := recv(t, sink.pol, "policy"); p.AuthMode != "enforce" || p.ParkTimeoutMS != 1234 {
 		t.Fatalf("policy = %+v", p)
 	}
-	if snap := recvEntries(t, sink.snap); len(snap) != 1 || snap[0].SandboxID != "s1" {
-		t.Fatalf("snapshot = %+v", snap)
+	recv(t, sink.begin, "begin-sync")
+	if r := recv(t, sink.up, "initial upsert"); r.SandboxID != "s1" {
+		t.Fatalf("initial upsert = %+v", r)
 	}
+	recv(t, sink.book, "bookmark")
 
 	// A delta published by the source is delivered as an upsert.
 	src.sub <- routesync.Event{Kind: routesync.TypeUpsert, Route: routesync.RouteEntry{SandboxID: "s2", State: routesync.StateRunning}}

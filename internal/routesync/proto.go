@@ -2,9 +2,15 @@
 // in proxy_mode=external. The orchestrator (the route authority) dials each proxy
 // worker's UDS and runs a single long-lived, bidirectional stream over h2c:
 //
-//	orchestrator -> proxy :  Hello(policy) -> Snapshot(all routes) -> Upsert/Delete (deltas)
-//	proxy -> orchestrator :  HelloAck       -> Wake(sid)            (data-plane traffic for a
-//	                                                                 missing/paused sandbox)
+//	orchestrator -> proxy :  Hello(policy) -> Upsert* -> Bookmark -> Upsert/Delete (live deltas)
+//	proxy -> orchestrator :  HelloAck       -> Wake(sid)          (data-plane traffic for a
+//	                                                               missing/paused sandbox)
+//
+// The initial route set is streamed one Upsert per sandbox, then a Bookmark marks
+// "initial sync complete" — no materialized all-routes frame (bounded send-side
+// memory at high sandbox density). The proxy applies the stream against a sync
+// generation and, on the Bookmark, drops entries it did not see this stream (which
+// recovers deletions that happened while it was disconnected — see internal/routetable).
 //
 // On a Wake the orchestrator resumes the sandbox (single-flight) and the resulting
 // Upsert flows back down, unparking the proxy's held request. The wire is
@@ -42,9 +48,9 @@ const (
 const (
 	TypeHello    = "hello"     // orchestrator -> proxy (carries Policy)
 	TypeHelloAck = "hello_ack" // proxy -> orchestrator
-	TypeSnapshot = "snapshot"  // orchestrator -> proxy (full route set; replace-all)
 	TypeUpsert   = "upsert"    // orchestrator -> proxy (one route added/changed)
 	TypeDelete   = "delete"    // orchestrator -> proxy (one route removed)
+	TypeBookmark = "bookmark"  // orchestrator -> proxy (initial route stream complete; synced)
 	TypeWake     = "wake"      // proxy -> orchestrator (resume this sandbox)
 )
 
@@ -60,6 +66,14 @@ type RouteEntry struct {
 	CiUDS       string `json:"ci_uds,omitempty"`       // e2b code-interpreter port 49999
 	FloatingIP  string `json:"floatingip,omitempty"`   // host-reachable addr for user ports
 	AccessToken string `json:"access_token,omitempty"` // envdAccessToken; X-Access-Token must match
+	// SnapshotLocation is "" for running/dead, else "local" (node-bound checkpoint
+	// bundle — blocks a node drain unless migrated) or "remote" (uploaded, portable).
+	// A subscriber (e.g. the platform agent) reads it to decide migration; the actual
+	// MIGRATION_TOKEN is minted on demand by export-sandbox, never broadcast here.
+	SnapshotLocation string `json:"snap_loc,omitempty"`
+	// MmdsSecret is the per-sandbox MMDS signing key (hex), derived deterministically
+	// from the manifest key + id (keys.MmdsSecret) so every proxy worker agrees on it.
+	MmdsSecret string `json:"mmds_secret,omitempty"`
 }
 
 // Policy is the operational policy the orchestrator pushes to a proxy at handshake
@@ -73,11 +87,10 @@ type Policy struct {
 // Msg is one wire message — a tagged union; exactly one payload field is set for a
 // given Type.
 type Msg struct {
-	Type   string       `json:"type"`
-	Hello  *Hello       `json:"hello,omitempty"`
-	Routes []RouteEntry `json:"routes,omitempty"` // snapshot
-	Route  *RouteEntry  `json:"route,omitempty"`  // upsert
-	SID    string       `json:"sid,omitempty"`    // delete | wake
+	Type  string      `json:"type"`
+	Hello *Hello      `json:"hello,omitempty"`
+	Route *RouteEntry `json:"route,omitempty"` // upsert
+	SID   string      `json:"sid,omitempty"`   // delete | wake
 }
 
 // Hello is the first frame each side sends. The orchestrator's carries the Policy.
@@ -95,7 +108,7 @@ type Event struct {
 	SID   string     // Delete
 }
 
-const maxFrame = 16 << 20 // 16 MiB — a full snapshot of all sandboxes fits in one frame
+const maxFrame = 1 << 20 // 1 MiB — generous bound for a single route/wake frame (no all-routes frame)
 
 // writeMsg writes a length-prefixed JSON frame ([4B LE len][json]).
 func writeMsg(w io.Writer, m *Msg) error {

@@ -8,6 +8,7 @@ package routetable
 
 import (
 	"context"
+	"encoding/hex"
 	"sync"
 	"time"
 
@@ -19,10 +20,12 @@ import (
 type Table struct {
 	mu       sync.Mutex
 	routes   map[string]routesync.RouteEntry
+	gen      map[string]uint64 // sid -> sync generation last applied (for Bookmark sweep)
+	curGen   uint64            // current sync generation (bumped per BeginSync)
 	policy   routesync.Policy
 	waiters  map[string][]chan struct{} // per-sid parking notifications
 	synced   bool
-	syncedCh chan struct{} // closed once the first snapshot is applied
+	syncedCh chan struct{} // closed once the first sync completes (first Bookmark)
 
 	wakeCh  chan string
 	pending map[string]bool // sids with a wake already queued (dedupe)
@@ -38,6 +41,7 @@ func New(defaultPark time.Duration) *Table {
 	}
 	return &Table{
 		routes:      map[string]routesync.RouteEntry{},
+		gen:         map[string]uint64{},
 		waiters:     map[string][]chan struct{}{},
 		syncedCh:    make(chan struct{}),
 		wakeCh:      make(chan string, 1024),
@@ -48,23 +52,19 @@ func New(defaultPark time.Duration) *Table {
 
 // --- routesync.Sink ---
 
-func (t *Table) ApplySnapshot(routes []routesync.RouteEntry) {
+// BeginSync starts a new sync generation. Existing entries stay live (the data
+// plane keeps serving the prior set) until the matching Bookmark sweeps any not
+// re-applied this generation — so a reconnect never opens a routing gap.
+func (t *Table) BeginSync() {
 	t.mu.Lock()
-	t.routes = make(map[string]routesync.RouteEntry, len(routes))
-	for _, r := range routes {
-		t.routes[r.SandboxID] = r
-		t.notifyLocked(r.SandboxID)
-	}
-	if !t.synced {
-		t.synced = true
-		close(t.syncedCh)
-	}
+	t.curGen++
 	t.mu.Unlock()
 }
 
 func (t *Table) ApplyUpsert(r routesync.RouteEntry) {
 	t.mu.Lock()
 	t.routes[r.SandboxID] = r
+	t.gen[r.SandboxID] = t.curGen
 	t.notifyLocked(r.SandboxID) // wake parked requests (they re-check state)
 	t.mu.Unlock()
 }
@@ -72,7 +72,26 @@ func (t *Table) ApplyUpsert(r routesync.RouteEntry) {
 func (t *Table) ApplyDelete(sid string) {
 	t.mu.Lock()
 	delete(t.routes, sid)
+	delete(t.gen, sid)
 	t.notifyLocked(sid) // unblock parked requests -> they see "gone"
+	t.mu.Unlock()
+}
+
+// Bookmark marks the initial route stream complete: drop entries not re-applied
+// this sync generation (removed while we were disconnected), then flip synced.
+func (t *Table) Bookmark() {
+	t.mu.Lock()
+	for sid, g := range t.gen {
+		if g != t.curGen {
+			delete(t.routes, sid)
+			delete(t.gen, sid)
+			t.notifyLocked(sid) // unblock parked requests -> they see "gone"
+		}
+	}
+	if !t.synced {
+		t.synced = true
+		close(t.syncedCh)
+	}
 	t.mu.Unlock()
 }
 
@@ -131,6 +150,25 @@ func (t *Table) SandboxInfo(sid string) (templateID, accessToken string, ok bool
 		return r.TemplateID, r.AccessToken, true
 	}
 	return "", "", false
+}
+
+// MmdsSecret returns sid's per-sandbox MMDS signing key (mmds.Source). The
+// orchestrator derives it deterministically and ships it in the route entry; we
+// decode the hex. ok=false if the sandbox is unknown or carries no secret. Not
+// gated on running state: a GET verifies a token minted moments earlier, and the
+// key is state-independent.
+func (t *Table) MmdsSecret(sid string) (secret []byte, ok bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	r, ok := t.routes[sid]
+	if !ok || r.MmdsSecret == "" {
+		return nil, false
+	}
+	b, err := hex.DecodeString(r.MmdsSecret)
+	if err != nil {
+		return nil, false
+	}
+	return b, true
 }
 
 // Policy returns the last pushed policy.

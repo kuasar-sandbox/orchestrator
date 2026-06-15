@@ -12,11 +12,21 @@ func running(sid string) routesync.RouteEntry {
 	return routesync.RouteEntry{SandboxID: sid, Profile: "e2b", State: routesync.StateRunning, EnvdUDS: "/run/" + sid + ".sock"}
 }
 
+// syncRoutes drives one full sync stream (BeginSync -> upserts -> Bookmark) — the
+// replacement for the old replace-all ApplySnapshot.
+func syncRoutes(tbl *Table, routes ...routesync.RouteEntry) {
+	tbl.BeginSync()
+	for _, r := range routes {
+		tbl.ApplyUpsert(r)
+	}
+	tbl.Bookmark()
+}
+
 func TestApplyAndLookup(t *testing.T) {
 	tbl := New(time.Second)
-	tbl.ApplySnapshot([]routesync.RouteEntry{running("s1")})
+	syncRoutes(tbl, running("s1"))
 	if r, ok := tbl.Lookup("s1"); !ok || r.State != routesync.StateRunning {
-		t.Fatalf("snapshot lookup s1 = %+v ok=%v", r, ok)
+		t.Fatalf("synced lookup s1 = %+v ok=%v", r, ok)
 	}
 	tbl.ApplyUpsert(routesync.RouteEntry{SandboxID: "s1", State: routesync.StatePaused})
 	if r, _ := tbl.Lookup("s1"); r.State != routesync.StatePaused {
@@ -28,9 +38,32 @@ func TestApplyAndLookup(t *testing.T) {
 	}
 }
 
+// TestReconnectSweep covers the generation sweep: an entry present after one sync
+// stream but absent from the next (deleted while the proxy was disconnected) is
+// dropped at the second Bookmark — and the live table is never emptied mid-resync.
+func TestReconnectSweep(t *testing.T) {
+	tbl := New(time.Second)
+	syncRoutes(tbl, running("s1"), running("s2"))
+
+	// Second stream re-applies only s2 (s1 was deleted while disconnected).
+	tbl.BeginSync()
+	tbl.ApplyUpsert(running("s2"))
+	if _, ok := tbl.Lookup("s1"); !ok {
+		t.Fatal("s1 dropped before bookmark (resync gap)")
+	}
+	tbl.Bookmark()
+
+	if _, ok := tbl.Lookup("s1"); ok {
+		t.Fatal("s1 not swept after second bookmark")
+	}
+	if _, ok := tbl.Lookup("s2"); !ok {
+		t.Fatal("s2 wrongly swept")
+	}
+}
+
 func TestResolveImmediate(t *testing.T) {
 	tbl := New(time.Second)
-	tbl.ApplySnapshot([]routesync.RouteEntry{running("s1")})
+	syncRoutes(tbl, running("s1"))
 	r, ok := tbl.Resolve(context.Background(), "s1")
 	if !ok || r.EnvdUDS == "" {
 		t.Fatalf("resolve running = %+v ok=%v", r, ok)
@@ -39,7 +72,7 @@ func TestResolveImmediate(t *testing.T) {
 
 func TestResolveParksThenResumes(t *testing.T) {
 	tbl := New(2 * time.Second)
-	tbl.ApplySnapshot(nil) // synced, but s1 absent
+	syncRoutes(tbl) // synced, but s1 absent
 
 	got := make(chan bool, 1)
 	go func() {
@@ -67,7 +100,7 @@ func TestResolveParksThenResumes(t *testing.T) {
 
 func TestResolveTimeout(t *testing.T) {
 	tbl := New(150 * time.Millisecond)
-	tbl.ApplySnapshot(nil) // synced, s1 never appears
+	syncRoutes(tbl) // synced, s1 never appears
 	start := time.Now()
 	_, ok := tbl.Resolve(context.Background(), "s1")
 	if ok {

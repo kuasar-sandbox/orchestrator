@@ -24,7 +24,6 @@ package mmds
 import (
 	"context"
 	"crypto/hmac"
-	"crypto/rand"
 	"crypto/sha256"
 	"crypto/sha512"
 	"encoding/hex"
@@ -45,24 +44,25 @@ type Source interface {
 	ByFloatingIP(ip string) (sandboxID string, ok bool)
 	// SandboxInfo returns the running sandbox's current template id + access token.
 	SandboxInfo(sandboxID string) (templateID, accessToken string, ok bool)
+	// MmdsSecret returns sid's per-sandbox session-token signing key — deterministic
+	// from the manifest key + id, so a token minted by any proxy worker verifies in
+	// any other. ok=false for an unknown sandbox.
+	MmdsSecret(sandboxID string) (secret []byte, ok bool)
 }
 
 // Server is the MMDS handler. Serve it on a listener the host redirects
 // 169.254.169.254:80 to.
 type Server struct {
-	src    Source
-	park   time.Duration // max PUT wait for the route to sync (data-plane park budget)
-	secret []byte        // per-process HMAC key for session tokens
-	log    *slog.Logger
+	src  Source
+	park time.Duration // max PUT wait for the route to sync (data-plane park budget)
+	log  *slog.Logger
 }
 
 func New(src Source, park time.Duration, log *slog.Logger) *Server {
 	if park <= 0 {
 		park = 30 * time.Second
 	}
-	secret := make([]byte, 32)
-	_, _ = rand.Read(secret)
-	return &Server{src: src, park: park, secret: secret, log: log}
+	return &Server{src: src, park: park, log: log}
 }
 
 // opts is the metadata document envd's host.MMDSOpts unmarshals. address is left empty
@@ -103,8 +103,15 @@ func (s *Server) putToken(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "", http.StatusServiceUnavailable)
 		return
 	}
+	secret, ok := s.src.MmdsSecret(sid)
+	if !ok {
+		// A running sandbox without a derivable secret means a missing manifest key —
+		// shouldn't happen; fail closed so envd retries rather than gets a bad token.
+		http.Error(w, "", http.StatusServiceUnavailable)
+		return
+	}
 	w.Header().Set("Content-Type", "text/plain")
-	_, _ = w.Write([]byte(s.mintToken(sid)))
+	_, _ = w.Write([]byte(sid + "." + sign(sid, secret)))
 }
 
 func (s *Server) getMeta(w http.ResponseWriter, r *http.Request) {
@@ -144,32 +151,35 @@ func (s *Server) resolve(ctx context.Context, ip string) (string, bool) {
 	}
 }
 
-// mintToken returns "<sid>.<hex(HMAC-SHA256(sid))>" — opaque to envd, unforgeable by the
-// guest (it lacks the per-process secret). The sid is not secret (it's the sandbox id).
-func (s *Server) mintToken(sid string) string {
-	return sid + "." + s.sign(sid)
-}
-
+// A session token is "<sid>.<hex(HMAC-SHA256(secret, sid))>" — opaque to envd,
+// unforgeable by the guest (it lacks the secret). The sid is not secret (it's the
+// sandbox id). The secret is the per-sandbox key from the Source, so any worker mints
+// and verifies the same token.
 func (s *Server) verifyToken(tok string) (string, bool) {
 	sid, sig, found := strings.Cut(tok, ".")
 	if !found || sid == "" {
+		return "", false
+	}
+	secret, ok := s.src.MmdsSecret(sid)
+	if !ok {
 		return "", false
 	}
 	got, err := hex.DecodeString(sig)
 	if err != nil {
 		return "", false
 	}
-	want, _ := hex.DecodeString(s.sign(sid))
-	if !hmac.Equal(got, want) {
+	if !hmac.Equal(got, signBytes(sid, secret)) {
 		return "", false
 	}
 	return sid, true
 }
 
-func (s *Server) sign(sid string) string {
-	mac := hmac.New(sha256.New, s.secret)
+func sign(sid string, secret []byte) string { return hex.EncodeToString(signBytes(sid, secret)) }
+
+func signBytes(sid string, secret []byte) []byte {
+	mac := hmac.New(sha256.New, secret)
 	mac.Write([]byte(sid))
-	return hex.EncodeToString(mac.Sum(nil))
+	return mac.Sum(nil)
 }
 
 // HashToken renders exactly what envd's checkMMDSHash compares against —

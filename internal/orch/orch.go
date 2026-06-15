@@ -626,6 +626,22 @@ func (o *Orchestrator) SandboxInfo(sid string) (templateID, accessToken string, 
 	return "", "", false
 }
 
+// MmdsSecret derives sid's per-sandbox MMDS signing key for the in-process MMDS
+// service (proxy_mode=internal); implements mmds.Source. Deterministic from the
+// sandbox's manifest key + id (keys.MmdsSecret) — the same key any proxy worker
+// would derive. Not gated on running state (a GET verifies a token minted moments
+// earlier), but an unknown sandbox / missing manifest key yields ok=false.
+func (o *Orchestrator) MmdsSecret(sid string) (secret []byte, ok bool) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	sb, found := o.reg[sid]
+	if !found {
+		return nil, false
+	}
+	s := keys.MmdsSecret(sb.ManifestKey, sid)
+	return s, s != nil
+}
+
 func (o *Orchestrator) teardown(ctx context.Context, sb *types.Sandbox) {
 	// The sandbox runs in its systemd unit's own cgroup (sandbox-ctl --cgroup-adopt),
 	// and the unit is KillMode=control-group, so StopUnit SIGKILLs every straggler

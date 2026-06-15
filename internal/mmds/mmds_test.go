@@ -19,6 +19,16 @@ func (f fakeSource) SandboxInfo(sid string) (string, string, bool) {
 	return v[0], v[1], ok
 }
 
+// MmdsSecret returns a deterministic per-sandbox secret for known sandboxes (a
+// stand-in for keys.MmdsSecret), and ok=false for unknown ids so a forged token's
+// sid fails to verify.
+func (f fakeSource) MmdsSecret(sid string) ([]byte, bool) {
+	if _, ok := f.info[sid]; !ok {
+		return nil, false
+	}
+	return []byte("secret-for-" + sid), true
+}
+
 func TestPutGetFlow(t *testing.T) {
 	src := fakeSource{
 		fip:  map[string]string{"100.100.96.5": "sbx-1"},
@@ -53,7 +63,7 @@ func TestPutGetFlow(t *testing.T) {
 		}
 	}
 
-	// A forged/tampered token -> 401 (unforgeable without the per-process secret).
+	// A forged/tampered token -> 401 (unforgeable without the per-sandbox secret).
 	req = httptest.NewRequest("GET", "http://169.254.169.254/", nil)
 	req.Header.Set("X-metadata-token", "sbx-evil.deadbeef")
 	w = httptest.NewRecorder()

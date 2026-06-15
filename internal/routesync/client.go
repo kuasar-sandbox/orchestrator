@@ -17,10 +17,12 @@ import (
 // Source is the orchestrator-side route authority the client distributes. The
 // orchestrator (internal/orch) implements it.
 type Source interface {
-	// Snapshot returns the full current route set (running + paused sandboxes).
-	Snapshot(ctx context.Context) ([]RouteEntry, error)
+	// Range streams the full current route set (running + paused sandboxes) one
+	// entry at a time through fn, in id order. Streaming (vs returning a slice)
+	// keeps send-side memory bounded at high sandbox density. fn errors abort.
+	Range(ctx context.Context, fn func(RouteEntry) error) error
 	// Subscribe registers for route-change events. The returned channel is closed
-	// by the source if it falls behind (the caller then reconnects + re-snapshots);
+	// by the source if it falls behind (the caller then reconnects + re-syncs);
 	// cancel unregisters it.
 	Subscribe() (ch <-chan Event, cancel func())
 	// OnWake handles a proxy's request to resume a sandbox (single-flight; the
@@ -96,7 +98,7 @@ func (c *Client) session(ctx context.Context, tr *http2.Transport) error {
 	ch, cancelSub := c.src.Subscribe()
 	defer cancelSub()
 
-	// Writer goroutine: Hello -> Snapshot -> deltas. Closing pw ends the request.
+	// Writer goroutine: Hello -> Upserts -> Bookmark -> deltas. Closing pw ends the request.
 	go func() { pw.CloseWithError(c.writeStream(sctx, pw, ch)) }()
 
 	resp, err := tr.RoundTrip(req)
@@ -118,20 +120,22 @@ func (c *Client) session(ctx context.Context, tr *http2.Transport) error {
 	}
 }
 
-// writeStream sends the handshake + a full snapshot, then forwards route events
-// until ctx ends or the subscription is dropped (returns an error -> reconnect +
-// re-snapshot). Subscribing happens before the snapshot is taken (in session), so
-// events racing the snapshot are buffered and replayed as idempotent upserts.
+// writeStream sends the handshake, streams the current route set as individual
+// Upserts followed by a Bookmark (no materialized all-routes frame), then forwards
+// live route events until ctx ends or the subscription is dropped (returns an
+// error -> reconnect + re-sync). Subscribing happens before the range (in session),
+// so events racing the initial stream are buffered and replayed as idempotent upserts.
 func (c *Client) writeStream(ctx context.Context, w io.Writer, ch <-chan Event) error {
 	hello := &Msg{Type: TypeHello, Hello: &Hello{Version: Version, Role: "orchestrator", Policy: c.src.Policy()}}
 	if err := writeMsg(w, hello); err != nil {
 		return err
 	}
-	routes, err := c.src.Snapshot(ctx)
-	if err != nil {
+	if err := c.src.Range(ctx, func(r RouteEntry) error {
+		return writeMsg(w, &Msg{Type: TypeUpsert, Route: &r})
+	}); err != nil {
 		return err
 	}
-	if err := writeMsg(w, &Msg{Type: TypeSnapshot, Routes: routes}); err != nil {
+	if err := writeMsg(w, &Msg{Type: TypeBookmark}); err != nil {
 		return err
 	}
 	for {
