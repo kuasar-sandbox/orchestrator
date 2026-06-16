@@ -13,8 +13,40 @@ import (
 	"time"
 
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/apikey"
+	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/types"
 )
+
+// configHeaderNs maps each X-Kuasar-Sandbox-<Ns> request header to the namespaced
+// metadata key it normalizes into. Headers are an alternate config-injection surface
+// (create + template build); on conflict with an e2b metadata key of the same
+// namespace the header wins. The header value is the same JSON the metadata key holds.
+var configHeaderNs = []struct{ header, metaKey string }{
+	{"X-Kuasar-Sandbox-Resource", sandboxcfg.NsResource},
+	{"X-Kuasar-Sandbox-Network", sandboxcfg.NsNetwork},
+	{"X-Kuasar-Sandbox-Launch", sandboxcfg.NsLaunch},
+	{"X-Kuasar-Sandbox-Init", sandboxcfg.NsInit},
+	{"X-Kuasar-Sandbox-Mounts", sandboxcfg.NsMounts},
+	{"X-Kuasar-Sandbox-Files", sandboxcfg.NsFiles},
+	{"X-Kuasar-Sandbox-Metadata", sandboxcfg.NsMetadata},
+}
+
+// mergeConfigHeaders folds the X-Kuasar-Sandbox-<Ns> headers into meta, the header
+// overriding an e2b metadata key of the same namespace. Returns the merged map
+// (allocating one only if a header is present and meta was nil).
+func mergeConfigHeaders(meta map[string]string, h http.Header) map[string]string {
+	for _, m := range configHeaderNs {
+		v := h.Get(m.header)
+		if v == "" {
+			continue
+		}
+		if meta == nil {
+			meta = map[string]string{}
+		}
+		meta[m.metaKey] = v
+	}
+	return meta
+}
 
 // ErrAlreadyPaused is returned by Core.Pause when the sandbox is already paused.
 var ErrAlreadyPaused = errors.New("already paused")
@@ -198,6 +230,9 @@ func (a *API) create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	req.APIKey = apiKeyFrom(r.Context())
+	// Headers are an alternate config-injection surface; fold them into the e2b
+	// metadata (header wins) so the orchestrator sees one uniform carrier.
+	req.Metadata = mergeConfigHeaders(req.Metadata, r.Header)
 	sb, err := a.core.Create(r.Context(), req)
 	if err != nil {
 		a.fail(w, err)

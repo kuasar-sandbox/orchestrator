@@ -144,26 +144,26 @@ func (o *Orchestrator) launch(ctx context.Context, sb *types.Sandbox, tmpl types
 			return fmt.Errorf("orch: mkdir %s: %w", d, err)
 		}
 	}
-	ov, err := parseOverrides(sb.Metadata)
+	spec, err := sandboxcfg.ParseSpec(sb.Metadata)
 	if err != nil {
 		return err
 	}
-	plainIP, cidrIP, err := o.allocInnerIP(tmpl.Profile, ov.InnerIP)
+	plainIP, cidrIP, err := o.allocInnerIP(tmpl.Profile, spec.Network.InnerIP)
 	if err != nil {
 		return err
 	}
 	port, err := o.vs.Attach(ctx, vswitch.AttachReq{
 		InnerIP:          plainIP,
-		TransitGatewayIP: ov.TransitGatewayIP,
-		TransitGeneveVNI: ov.TransitGeneveVNI,
-		TransitMAC:       ov.TransitMAC,
+		TransitGatewayIP: spec.Network.TransitGatewayIP,
+		TransitGeneveVNI: spec.Network.TransitGeneveVNI,
+		TransitMAC:       spec.Network.TransitMAC,
 	})
 	if err != nil {
 		return err
 	}
 	sb.VswitchPort, sb.FloatingIP, sb.PortMAC, sb.InnerIP = port.Port, port.FloatingIP, port.MAC, cidrIP
 
-	p := o.sandboxParams(sb, tmpl, ov)
+	p := o.sandboxParams(sb, tmpl, spec)
 	// A restore must declare the exact capacity the snapshot froze —
 	// snapshot.cfg is authoritative and the runtime refuses a mismatch
 	// rather than resize a resumed VM. Template snapshots are self-
@@ -425,21 +425,37 @@ func (o *Orchestrator) sandboxConfigPath(sb *types.Sandbox) string {
 	return sb.RunDir + "/" + sb.ID + ".yaml"
 }
 
-func (o *Orchestrator) sandboxParams(sb *types.Sandbox, tmpl types.TemplateID, ov sandboxOverride) sandboxcfg.Params {
-	dns := o.cfg.Sandbox.Network.DNS
-	if len(ov.DNS) > 0 {
-		dns = ov.DNS
-	}
+func (o *Orchestrator) sandboxParams(sb *types.Sandbox, tmpl types.TemplateID, spec sandboxcfg.SandboxSpec) sandboxcfg.Params {
 	return sandboxcfg.Params{
 		Sandbox: sb, Template: tmpl,
 		RuntimeE2B: o.cfg.Sandbox.Boot.RuntimeE2B, RuntimeBase: o.cfg.Sandbox.Boot.RuntimeBase, Kernel: o.cfg.Sandbox.Boot.Kernel,
 		OverlayDiffTpl: o.cfg.Sandbox.Boot.OverlayDiffTemplate,
 		TapFDExec:      o.vs.TapFDExec(sb.VswitchPort), EnvVars: sb.Env,
 		VCPU: o.cfg.Sandbox.Resources.VCPU, Memory: o.cfg.Sandbox.Resources.Memory, ControllerSocket: o.cfg.Sandbox.Resources.ControlSocket,
-		Nexthop:     firstNonEmpty(ov.Nexthop, o.innerGateway(tmpl.Profile)),
-		Hostname:    firstNonEmpty(ov.Hostname, o.cfg.Sandbox.Network.Hostname),
-		DNS:         dns,
+		Network:     o.resolveNetwork(sb, tmpl, spec.Network),
 		MMDSEnabled: o.cfg.MMDS.Enabled,
+		Spec:        spec,
+	}
+}
+
+// resolveNetwork merges the tenant network override with profile/node defaults into
+// the resolved logical network used both for the guest config and for the
+// snapshot-borne metadata (kuasar-sandbox.network). inner_ip is the assigned CIDR
+// (set at attach). On restore the caller fills missing fields from the snapshot
+// before this (Stage 3); here a tenant value still wins over the node default.
+func (o *Orchestrator) resolveNetwork(sb *types.Sandbox, tmpl types.TemplateID, ov sandboxcfg.NetworkSpec) sandboxcfg.NetworkSpec {
+	dns := o.cfg.Sandbox.Network.DNS
+	if len(ov.DNS) > 0 {
+		dns = ov.DNS
+	}
+	return sandboxcfg.NetworkSpec{
+		Hostname:         firstNonEmpty(ov.Hostname, o.cfg.Sandbox.Network.Hostname),
+		DNS:              dns,
+		InnerIP:          sb.InnerIP, // assigned CIDR (vswitch attach)
+		Nexthop:          firstNonEmpty(ov.Nexthop, o.innerGateway(tmpl.Profile)),
+		TransitGatewayIP: ov.TransitGatewayIP,
+		TransitGeneveVNI: ov.TransitGeneveVNI,
+		TransitMAC:       ov.TransitMAC,
 	}
 }
 
@@ -472,11 +488,11 @@ func (o *Orchestrator) sandboxLaunchSpec(ctx context.Context, sid string) (*conf
 	if err != nil {
 		return nil, "", false, err
 	}
-	ov, err := parseOverrides(sb.Metadata)
+	cfgSpec, err := sandboxcfg.ParseSpec(sb.Metadata)
 	if err != nil {
 		return nil, "", false, err
 	}
-	p := o.sandboxParams(sb, tmpl, ov)
+	p := o.sandboxParams(sb, tmpl, cfgSpec)
 	// --run-root pins sandbox-ctl's socket/staging dir (ch.sock, ctl.sock, …) to the
 	// orchestrator's run root, so RunDir == cfg.Paths.RunRoot/<sid> and the snapshot client
 	// (also --run-root cfg.Paths.RunRoot) finds ctl.sock. Without it sandbox-ctl defaults to
@@ -775,6 +791,14 @@ func (o *Orchestrator) envdInit(ctx context.Context, sb *types.Sandbox) error {
 		return fmt.Errorf("orch: envd /init status %d", resp.StatusCode)
 	}
 	return nil
+}
+
+// firstNonEmpty returns a if non-empty, else b (override-over-default helper).
+func firstNonEmpty(a, b string) string {
+	if a != "" {
+		return a
+	}
+	return b
 }
 
 // profileNet returns the configured inner IP / gateway for a profile (e2b vs bare).
