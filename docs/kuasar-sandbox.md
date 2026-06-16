@@ -147,28 +147,23 @@ Warm Pool),共享同一套基础设施:内容定义分块、收敛加密、内�
 |---|---|---|---|---|
 | **kuasar-sandbox**(本仓) | 系统文档 + 发布聚合 + 跨仓 e2e/perf | `release.sh` 下载即用包 | — | 本文 + `deployment.md`/`perf.md` |
 | **sandbox-runtime** | microVM 生命周期引擎:一沙箱一进程的沙箱控制(块设备/快照代理、内存统一持有、balloon 环)+ Guest 一号进程 | `sandbox-ctl`、`sandbox-init`、`sandbox-runtime.erofs` | `pkg/resource`(资源控制协议+Client) | `sandbox-runtime/docs/sandbox.md`、`sandbox-runtime.md` |
-| **sandbox-accelerator** | 存储加速:分块/收敛加密/清单公共库 + 内容寻址存储 + 分层缓存 | `manifest-ctl`、`store-ctl`、`cache-ctl` | `pkg/manifest`、`pkg/{cache,store}/client` | `sandbox-accelerator/docs/{manifest,store,cache}.md` |
-| **sandbox-builder** | 镜像构建:OCI → EROFS 确定性展平,远程拉取 + Referrers 幂等 | `flatten-ctl` | `pkg/image`(读取展平镜像) | `sandbox-builder/docs/flatten.md` |
+| **sandbox-accelerator** | 存储加速 + 镜像构建:分块/收敛加密/清单库 + 内容寻址存储 + 分层缓存 + OCI → EROFS 确定性展平(远程拉取 + Referrers 幂等) | `manifest-ctl`、`store-ctl`、`cache-ctl`、`flatten-ctl` | `pkg/manifest`、`pkg/image`、`pkg/{cache,store}/client` | `sandbox-accelerator/docs/{manifest,store,cache,flatten}.md` |
 | **sandbox-vswitch** | eBPF/TC 虚拟交换机:单节点 4096 端口隔离网络 + tapfd 交接 | `vswitch-ctl`、`tapfd-get` | `pkg/tapfd`(fd 交接规约) | `sandbox-vswitch/docs/{vswitch,tapfd}.md` |
-| **sandbox-sentinel** | 节点级资源守护:准入/额度分配/主动回收(节点环) | `node-ctl` | — | `sandbox-sentinel/docs/node.md` |
-| **sandbox-orchestrator** | 单机沙箱编排 + e2b 兼容 ingress:控制面 REST、envd-in-guest 反代、模板构建(沙箱内三阶段)、密钥派生 | `orchestrator-ctl`、`e2b-key-ctl`、`sandbox-runtime-{e2b,builder}.erofs` | — | `sandbox-orchestrator/docs/orchestrator.md` |
+| **sandbox-orchestrator** | 单机沙箱编排 + e2b 兼容 ingress:控制面 REST、envd-in-guest 反代、模板构建(沙箱内三阶段)、密钥派生 + 节点级资源守护(准入/额度分配/主动回收) | `orchestrator-ctl`、`e2b-key-ctl`、`node-ctl`、`sandbox-runtime-{e2b,builder}.erofs` | — | `sandbox-orchestrator/docs/{orchestrator,node}.md` |
 | **sandbox-deps** | 原生依赖:定制 Guest 内核、VMM 补丁、erofs 工具 | `vmlinux`、`cloud-hypervisor`、`mkfs.erofs` | 构建脚本 + patches + configs | `sandbox-deps/docs/{cloud-hypervisor,sandbox-kernel,build}.md` |
 
 ### 2.3 依赖关系
 
 ```
  sandbox-accelerator   sandbox-vswitch   sandbox-deps        (T0: no internal deps)
-        ▲   ▲                ▲
-        │   │ pkg/manifest   │ pkg/tapfd
-        │   └────────────────┼──────────────┐
-        │ pkg/manifest       │              │
- sandbox-builder ────────────┤              │               (T1)
-        ▲                    │              │
-        │ pkg/image          │ pkg/tapfd    │ pkg/manifest
- sandbox-runtime ────────────┴──────────────┘               (T2)
-        ▲                    ▲
-        │ pkg/resource       │ CLI: run-sandbox→sandbox-ctl + vswitch-ctl;run-builder→沙箱内 flatten-ctl
- sandbox-sentinel    sandbox-orchestrator                   (T3)
+   (storage + flatten)       ▲
+        ▲                    │ pkg/tapfd
+        │ pkg/manifest+image │
+        └────────────────────┤
+ sandbox-runtime ────────────┘                              (T2)
+        ▲
+        │ pkg/resource  (orchestrator CLI: run-sandbox→sandbox-ctl + vswitch-ctl;run-builder→沙箱内 flatten-ctl)
+ sandbox-orchestrator   (e2b ingress + node-ctl)            (T3)
 ```
 
 实线是 Go 导入边。`sandbox-orchestrator` 不 import 任何兄弟仓(`CGO_ENABLED=0`
@@ -750,10 +745,10 @@ Cold boot (1 GiB image):                 Snapshot restore (512 MiB):
   配置 schema;`sandbox-runtime.md` — Guest 一号进程。
 - `sandbox-accelerator/docs/{manifest,store,cache}.md` — 清单格式与读写管线、
   内容寻址存储与代轮转、分层缓存三形态。
-- `sandbox-builder/docs/flatten.md` — 确定性展平、远程拉取与 Referrers 幂等。
+- `sandbox-accelerator/docs/flatten.md` — 确定性展平、远程拉取与 Referrers 幂等。
 - `sandbox-vswitch/docs/vswitch.md` — eBPF 虚拟交换机;`tapfd.md` — tap fd 交接
   协议。
-- `sandbox-sentinel/docs/node.md` — 节点资源仲裁协议与算法。
+- `sandbox-orchestrator/docs/node.md` — 节点资源仲裁协议与算法。
 - `sandbox-orchestrator/docs/orchestrator.md` — e2b 兼容控制面、模板构建、密钥
   与归属模型。
 - `sandbox-deps/docs/{cloud-hypervisor,sandbox-kernel,build}.md` — VMM 补丁集、

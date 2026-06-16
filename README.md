@@ -21,11 +21,9 @@
 |---|---|---|
 | **kuasar-sandbox**(本仓) | 系统文档 + 发布聚合 + 跨仓 e2e/perf | `scripts/release.sh`、`docs/`、`test/` |
 | **sandbox-runtime** | microVM 生命周期引擎(host `sandbox-ctl` + guest `sandbox-init`)+ vhost 块后端 | `pkg/resource`(资源控制协议+Client) |
-| **sandbox-orchestrator** | 单机 e2b 兼容沙箱编排/ingress(控制面 + envd-in-guest 反代 + 模板构建) | `orchestrator-ctl` + `e2b-key-ctl`、`sandbox-runtime-e2b.erofs` |
-| **sandbox-accelerator** | 存储加速:内容寻址存储 + 分层缓存 + 收敛加密 | `pkg/manifest`、`pkg/{cache,store}/client` |
-| **sandbox-builder** | 镜像构建:OCI → EROFS 确定性展平 | `pkg/image`(读取展平镜像)+ `flatten-ctl` |
+| **sandbox-orchestrator** | 单机 e2b 兼容沙箱编排/ingress(控制面 + envd-in-guest 反代 + 模板构建)+ 节点级资源守护(准入/分配/回收,3,000+ 密度) | `orchestrator-ctl` + `e2b-key-ctl` + `node-ctl`、`sandbox-runtime-{e2b,builder}.erofs` |
+| **sandbox-accelerator** | 存储加速 + 镜像构建:内容寻址存储 + 分层缓存 + 收敛加密 + OCI → EROFS 确定性展平 | `pkg/manifest`、`pkg/image`、`pkg/{cache,store}/client` + `flatten-ctl` |
 | **sandbox-vswitch** | eBPF/TC 虚拟交换机 + tapfd 交接 | `pkg/tapfd`(fd 交接规约)+ `vswitch-ctl`/`tapfd-get` |
-| **sandbox-sentinel** | 节点级资源守护(准入/分配/回收,3,000+ 密度) | `node-ctl` 守护进程 |
 | **sandbox-deps** | 原生依赖:vmlinux / cloud-hypervisor / mkfs.erofs | 构建脚本 + patches + configs |
 
 ## 构建

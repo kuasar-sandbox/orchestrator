@@ -140,15 +140,15 @@ for f in test/e2e/*.sh; do bash "$f" || break; done
 
 ## 6. 留在源仓的 e2e
 
-`sandbox-sentinel/test/e2e/e2e_node_ctl.sh` **未打包**。该脚本通过 heredoc 内
+`sandbox-orchestrator/test/e2e/e2e_node_ctl.sh` **未打包**。该脚本通过 heredoc 内
 联生成 Go driver 文件并 `go run` 执行(驱动 import
 `github.com/kuasar-sandbox/sandbox-runtime/pkg/resource`),运行时需要源码工
 作区。如需跑:
 
 ```bash
-git clone https://github.com/kuasar-sandbox/sandbox-sentinel
+git clone https://github.com/kuasar-sandbox/sandbox-orchestrator
 git clone https://github.com/kuasar-sandbox/sandbox-runtime  # 兄弟目录
-cd sandbox-sentinel && GOWORK=off make build
+cd sandbox-orchestrator && GOWORK=off make node-ctl
 bash test/e2e/e2e_node_ctl.sh
 ```
 

@@ -634,7 +634,7 @@ make perf-sandbox
 改 `pkg/nodectl/*` 或 `pkg/sandbox/*` 中的资源控制路径时:
 
 ```bash
-make -C sandbox-sentinel test-e2e-node-ctl   # node-ctl 资源协议 e2e,sentinel 仓专有(未入 umbrella)
+make -C sandbox-orchestrator test-e2e-node-ctl   # node-ctl 资源协议 e2e(orchestrator 仓;umbrella test-e2e 经其调用)
 make test-e2e-density
 make perf-density
 ```

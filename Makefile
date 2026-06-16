@@ -35,11 +35,11 @@ export TARGET_ARCH
 BINDIR         := bin/$(TARGET_ARCH)
 SBIN           := $(abspath $(BINDIR))
 ARTIFACTS_LIST := scripts/artifacts.list
-GO_REPOS       := sandbox-accelerator sandbox-builder sandbox-runtime sandbox-sentinel sandbox-vswitch sandbox-orchestrator
+GO_REPOS       := sandbox-accelerator sandbox-runtime sandbox-vswitch sandbox-orchestrator
 
 # Cross-repo e2e tests this repo carries (each needs binaries from multiple
 # sub-repos: vmlinux/CH/mkfs.erofs from sandbox-deps, manifest-ctl/store-ctl/
-# cache-ctl from sandbox-accelerator, flatten-ctl from sandbox-builder, etc.).
+# cache-ctl/flatten-ctl from sandbox-accelerator, node-ctl from sandbox-orchestrator, etc.).
 UMBRELLA_E2E := \
   test-e2e-manifest test-e2e-obs test-e2e-warmpool-dedup test-e2e-density \
   test-e2e-sandbox-cold test-e2e-sandbox-cold-manifest test-e2e-sandbox-cold-target \
@@ -67,9 +67,7 @@ all: build
 build:
 	$(MAKE) -C $(ORG)/sandbox-deps build
 	$(MAKE) -C $(ORG)/sandbox-accelerator build
-	$(MAKE) -C $(ORG)/sandbox-builder build
 	$(MAKE) -C $(ORG)/sandbox-runtime build
-	$(MAKE) -C $(ORG)/sandbox-sentinel build
 	$(MAKE) -C $(ORG)/sandbox-vswitch build
 	$(MAKE) -C $(ORG)/sandbox-orchestrator build
 	@$(MAKE) collect
@@ -115,7 +113,7 @@ $(UMBRELLA_E2E): test-e2e-%: build
 # Aggregate test-e2e: every umbrella sub-target + each sub-repo's test-e2e.
 test-e2e: build $(UMBRELLA_E2E)
 	$(MAKE) -C $(ORG)/sandbox-accelerator test-e2e
-	$(MAKE) -C $(ORG)/sandbox-sentinel test-e2e
+	$(MAKE) -C $(ORG)/sandbox-orchestrator test-e2e-node-ctl
 	$(MAKE) -C $(ORG)/sandbox-vswitch test-e2e
 
 # perf harnesses living in this repo (cross-repo binary use).

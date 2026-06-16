@@ -49,13 +49,13 @@ DOCS=(
   "sandbox-accelerator/docs/cache.md"
   "sandbox-accelerator/docs/manifest.md"
   "sandbox-accelerator/docs/store.md"
-  # image builder
-  "sandbox-builder/docs/flatten.md"
+  # image builder (folded into the accelerator)
+  "sandbox-accelerator/docs/flatten.md"
   # microVM runtime
   "sandbox-runtime/docs/sandbox.md"
   "sandbox-runtime/docs/sandbox-runtime.md"
-  # node controller
-  "sandbox-sentinel/docs/node.md"
+  # node controller (folded into the orchestrator)
+  "sandbox-orchestrator/docs/node.md"
   # node orchestrator (e2b-compatible ingress)
   "sandbox-orchestrator/docs/orchestrator.md"
   # virtual switch
@@ -68,9 +68,9 @@ DOCS=(
 
 # Cross-repo e2e — all scripts use `SCRIPT_DIR/../../bin` for BIN default, so
 # placing them at <release>/test/e2e/ makes BIN resolve to <release>/bin/ with
-# no script edits. Excluded: sandbox-sentinel/test/e2e/e2e_node_ctl.sh —
+# no script edits. Excluded: sandbox-orchestrator/test/e2e/e2e_node_ctl.sh —
 # generates Go drivers via heredoc and runs them with `go run`, requiring a
-# checkout of sandbox-{sentinel,runtime} sources. Keep it in the source repo.
+# checkout of sandbox-{orchestrator,runtime} sources. Keep it in the source repo.
 E2ES=(
   # umbrella (25)
   "kuasar-sandbox/test/e2e/e2e_density.sh"
