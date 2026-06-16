@@ -324,12 +324,17 @@ EOF
     wait "$SBPID" 2>/dev/null || true
 
     # Ingest blk1 diff (the overlay's actual disk content) into the store
-    # so we can manifest-diff it against other sandboxes' overlays.
+    # so we can manifest-diff it against other sandboxes' overlays. store
+    # consumes tarstream artifacts (ff88f5f), so wrap the raw diff first;
+    # the envelope is a deterministic constant prefix (entry "image", zero
+    # mtime/uid/gid, identical size across CoW copies) that dedups away, so
+    # the cross-sandbox content dedup measured below is unaffected.
     echo "    ingest blk1 overlay → store"
+    "$BIN/flatten-ctl" tar stream -f "$DIFF_FILE.tar" "image:$DIFF_FILE"
     BLK1_MKEY=$("$BIN/manifest-ctl" store \
         --manifest-config "$WORK/accelerator.yaml" \
         --no-progress \
-        "$DIFF_FILE")
+        "$DIFF_FILE.tar")
     [ ${#BLK1_MKEY} -eq 64 ] || { echo "FAIL: bad BLK1_MKEY for sandbox $i: '$BLK1_MKEY'"; exit 1; }
     BLK1_MKEYS[i]="$BLK1_MKEY"
     echo "    blk1 manifest:     $BLK1_MKEY"

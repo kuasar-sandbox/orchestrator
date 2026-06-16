@@ -134,15 +134,21 @@ fi
 dd if=/dev/urandom of="$WORK/payload.bin" bs=4096 count=64 status=none
 ORIG_HASH=$(sha256sum "$WORK/payload.bin" | awk '{print $1}')
 
+# store consumes tarstream artifacts (ff88f5f); wrap the raw payload first
+# (flatten-ctl tar stream, pure Go), then read the payload back out of the
+# loaded artifact with tar extract --dense before comparing hashes.
+"$BIN/flatten-ctl" tar stream -f "$WORK/payload.tar" "image:$WORK/payload.bin"
+
 echo "==> manifest-ctl store"
 MKEY=$("$BIN/manifest-ctl" store --manifest-config "$WORK/accelerator.yaml" \
-    --no-progress "$WORK/payload.bin")
+    --no-progress "$WORK/payload.tar")
 [ ${#MKEY} -eq 64 ] || { echo "FAIL: bad manifest key length ${#MKEY}"; exit 1; }
 echo "    manifest key: $MKEY"
 
 echo "==> manifest-ctl load (round-trip via OBS)"
 "$BIN/manifest-ctl" load --manifest-config "$WORK/accelerator.yaml" \
-    --output "$WORK/restored.bin" --no-progress "$MKEY"
+    --output "$WORK/restored.tar" --no-progress "$MKEY"
+"$BIN/flatten-ctl" tar extract -f "$WORK/restored.tar" --dense "image:$WORK/restored.bin"
 RESTORED_HASH=$(sha256sum "$WORK/restored.bin" | awk '{print $1}')
 
 if [ "$ORIG_HASH" != "$RESTORED_HASH" ]; then
@@ -156,7 +162,7 @@ echo "    PASS: round-trip hash matches"
 # ─── dedup verification ────────────────────────────────────────────────
 echo "==> dedup: store same payload again, expect 0 new chunks"
 OUT=$("$BIN/manifest-ctl" store --manifest-config "$WORK/accelerator.yaml" \
-    --no-progress "$WORK/payload.bin" 2>&1)
+    --no-progress "$WORK/payload.tar" 2>&1)
 STORED=$(echo "$OUT" | grep "chunks:" | grep -oP 'stored=\K[0-9]+' || echo "?")
 if [ "$STORED" = "0" ]; then
     echo "    PASS: dedup hit (0 new chunks on second store)"
