@@ -173,7 +173,10 @@ echo "  $IMAGE_A and $IMAGE_B available locally"
 # ============================================================
 echo ""
 echo "=== Test 1: Flatten $IMAGE_A ==="
-docker save "$IMAGE_A" | "$BIN/flatten-ctl" export --output "$TMPDIR/image-a.erofs" --no-progress 2>&1
+# flatten-ctl export preserves image file ownership, which needs root/CAP_CHOWN.
+# sudo just this call so the rest of the manifest e2e stays unprivileged and a
+# plain `make test-e2e` works without wrapping the whole run in sudo.
+docker save "$IMAGE_A" | sudo -nE "$BIN/flatten-ctl" export --output "$TMPDIR/image-a.erofs" --no-progress 2>&1
 SIZE=$(stat --printf="%s" "$TMPDIR/image-a.erofs" 2>/dev/null || stat -f "%z" "$TMPDIR/image-a.erofs")
 if [ "$SIZE" -gt 0 ]; then
     ok "flatten produced $SIZE bytes"
@@ -297,7 +300,7 @@ fi
 # ============================================================
 echo ""
 echo "=== Test 8: Cross-image diff ($IMAGE_A vs $IMAGE_B) ==="
-docker save "$IMAGE_B" | "$BIN/flatten-ctl" export --output "$TMPDIR/image-b.erofs" --no-progress 2>&1
+docker save "$IMAGE_B" | sudo -nE "$BIN/flatten-ctl" export --output "$TMPDIR/image-b.erofs" --no-progress 2>&1
 MKEY_B=$("$BIN/manifest-ctl" store $COMMON --no-progress "$TMPDIR/image-b.erofs")
 "$BIN/manifest-ctl" get-manifest $COMMON --output "$TMPDIR/image-b.manifest" "$MKEY_B"
 OUTPUT=$("$BIN/manifest-ctl" diff "$TMPDIR/image-a.manifest" "$TMPDIR/image-b.manifest" 2>&1)
