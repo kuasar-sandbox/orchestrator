@@ -31,6 +31,14 @@ var configHeaderNs = []struct{ header, metaKey string }{
 	{"X-Kuasar-Sandbox-Metadata", sandboxcfg.NsMetadata},
 }
 
+// pickInt returns a if non-zero, else b (camelCase vs snake_case e2b field aliases).
+func pickInt(a, b int) int {
+	if a != 0 {
+		return a
+	}
+	return b
+}
+
 // mergeConfigHeaders folds the X-Kuasar-Sandbox-<Ns> headers into meta, the header
 // overriding an e2b metadata key of the same namespace. Returns the merged map
 // (allocating one only if a header is present and meta was nil).
@@ -91,6 +99,9 @@ type TriggerSpec struct {
 	Steps        []types.TemplateStep
 	StartCmd     string
 	ReadyCmd     string
+	// Metadata is the trigger-time template config (kuasar-sandbox.<ns> keys from
+	// cpu/memory + X-Kuasar-Sandbox-* headers); it overrides the register-time config.
+	Metadata map[string]string
 }
 
 // BuildLogEntry is one build-progress line surfaced to the SDK (e2b BuildLogEntry:
@@ -128,7 +139,7 @@ type Core interface {
 	// (register name/cpu/memory) → POST /v2/templates/{tid}/builds/{bid} (start, carries
 	// fromImage + fromImageRegistry + steps) → GET …/status (poll). The node pulls +
 	// flattens the named image server-side — no client-side docker build/push.
-	RegisterBuild(ctx context.Context, apiKey, name string, tags []string) (*types.Build, error)
+	RegisterBuild(ctx context.Context, apiKey, name string, tags []string, metadata map[string]string) (*types.Build, error)
 	TriggerBuild(ctx context.Context, apiKey, templateID, buildID string, spec TriggerSpec, auth BuildAuth) error
 	BuildStatus(ctx context.Context, apiKey, templateID, buildID string) (*types.Build, error)
 	// BuildLogs returns the build's progress log entries from offset onward
@@ -335,11 +346,19 @@ func (a *API) timeout(w http.ResponseWriter, r *http.Request) {
 
 func (a *API) registerTemplate(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Name string   `json:"name"`
-		Tags []string `json:"tags"`
+		Name        string   `json:"name"`
+		Tags        []string `json:"tags"`
+		CPUCount    int      `json:"cpuCount"`
+		CPUCountSn  int      `json:"cpu_count"`
+		MemoryMB    int      `json:"memoryMB"`
+		MemoryMBSn  int      `json:"memory_mb"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&body)
-	b, err := a.core.RegisterBuild(r.Context(), apiKeyFrom(r.Context()), body.Name, body.Tags)
+	// Template config: X-Kuasar-Sandbox-* headers, with the e2b cpu/memory folded
+	// into the resource namespace (cpu/memory win over a resource header).
+	meta := mergeConfigHeaders(nil, r.Header)
+	meta = sandboxcfg.SetCapacity(meta, pickInt(body.CPUCount, body.CPUCountSn), pickInt(body.MemoryMB, body.MemoryMBSn))
+	b, err := a.core.RegisterBuild(r.Context(), apiKeyFrom(r.Context()), body.Name, body.Tags, meta)
 	if err != nil {
 		a.fail(w, err)
 		return
@@ -375,6 +394,10 @@ func (a *API) triggerBuild(w http.ResponseWriter, r *http.Request) {
 		ReadyCmdE2B  string               `json:"ready_cmd"`
 		Dockerfile   string               `json:"dockerfile"`
 		TemplateName string               `json:"template_name"`
+		CPUCount     int                  `json:"cpuCount"`
+		CPUCountSn   int                  `json:"cpu_count"`
+		MemoryMB     int                  `json:"memoryMB"`
+		MemoryMBSn   int                  `json:"memory_mb"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeErr(w, 400, "bad body")
@@ -396,6 +419,9 @@ func (a *API) triggerBuild(w http.ResponseWriter, r *http.Request) {
 		RegistryUsername: body.FromImageRegistry.Username,
 		RegistryPassword: body.FromImageRegistry.Password,
 	}
+	// Trigger-time template config overrides register: headers + e2b cpu/memory.
+	meta := mergeConfigHeaders(nil, r.Header)
+	meta = sandboxcfg.SetCapacity(meta, pickInt(body.CPUCount, body.CPUCountSn), pickInt(body.MemoryMB, body.MemoryMBSn))
 	err := a.core.TriggerBuild(r.Context(), apiKeyFrom(r.Context()),
 		r.PathValue("tid"), r.PathValue("bid"), TriggerSpec{
 			FromImage:    body.FromImage,
@@ -403,6 +429,7 @@ func (a *API) triggerBuild(w http.ResponseWriter, r *http.Request) {
 			Steps:        body.Steps,
 			StartCmd:     startCmd,
 			ReadyCmd:     readyCmd,
+			Metadata:     meta,
 		}, auth)
 	if err != nil {
 		switch {

@@ -119,6 +119,48 @@ func ParseSpec(meta map[string]string) (SandboxSpec, error) {
 	return s, nil
 }
 
+// capacityJSON is the canonical snake_case JSON shape for the resource capacity,
+// matching the config yaml tags (rtconfig.CapacityConfig has no json tags). Used to
+// emit a well-formed kuasar-sandbox.resource value from register/trigger cpu/memory.
+type capacityJSON struct {
+	CPU    int    `json:"cpu,omitempty"`
+	Memory string `json:"memory,omitempty"`
+}
+
+// SetCapacity folds an e2b register/trigger cpuCount/memoryMB into meta as the
+// resource namespace capacity (it wins over a resource header — the capacity-only
+// resource overwrites any prior resource value). Zero cpu and memory => no-op.
+// memoryMiB is treated as MiB (the config size unit). Returns the merged map.
+func SetCapacity(meta map[string]string, cpu, memoryMiB int) map[string]string {
+	if cpu <= 0 && memoryMiB <= 0 {
+		return meta
+	}
+	var cap capacityJSON
+	if cpu > 0 {
+		cap.CPU = cpu
+	}
+	if memoryMiB > 0 {
+		cap.Memory = fmt.Sprintf("%dMiB", memoryMiB)
+	}
+	b, err := json.Marshal(struct {
+		Capacity capacityJSON `json:"capacity"`
+	}{cap})
+	if err != nil {
+		return meta
+	}
+	if meta == nil {
+		meta = map[string]string{}
+	}
+	meta[NsResource] = string(b)
+	return meta
+}
+
+// MergeMetadata overlays over onto base per key (over wins) — used to layer a
+// create's config namespaces over a template's. Returns nil when both are empty.
+func MergeMetadata(base, over map[string]string) map[string]string {
+	return mergeStr(base, over)
+}
+
 // validate format-checks the tenant network fields (CIDR / IP / MAC).
 func (n NetworkSpec) validate() error {
 	if n.InnerIP != "" {

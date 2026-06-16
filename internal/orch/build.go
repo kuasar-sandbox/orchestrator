@@ -16,6 +16,7 @@ import (
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/keys"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/regcreds"
+	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/types"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/vswitch"
 )
@@ -26,7 +27,7 @@ var hexKeyRe = regexp.MustCompile(`^[0-9a-f]{64}$`)
 // allowlist, and records a registered build. fromImage is pre-derived from
 // builder_image_uri_mask — the convention the e2b CLI pushes its client-built
 // image under ({templateID}/{buildID}); the v3 trigger may still override it.
-func (o *Orchestrator) newRegisteredBuild(ctx context.Context, apiKey, name string, tags []string) (*types.Build, error) {
+func (o *Orchestrator) newRegisteredBuild(ctx context.Context, apiKey, name string, tags []string, metadata map[string]string) (*types.Build, error) {
 	manifestKey, err := o.resolveAllowed(ctx, apiKey)
 	if err != nil {
 		return nil, err
@@ -53,6 +54,7 @@ func (o *Orchestrator) newRegisteredBuild(ctx context.Context, apiKey, name stri
 		FromImage:   o.imageURIFromMask(templateID, bid.String()),
 		Names:       nonEmpty(name),
 		Aliases:     append([]string{}, tags...),
+		Metadata:    metadata,
 		CreatedUnix: time.Now().Unix(),
 	}
 	if err := o.st.PutBuild(ctx, b); err != nil {
@@ -63,8 +65,8 @@ func (o *Orchestrator) newRegisteredBuild(ctx context.Context, apiKey, name stri
 
 // RegisterBuild handles POST /v3/templates (e2b v2 build system): record a
 // registered build; the base image + start command arrive at trigger time.
-func (o *Orchestrator) RegisterBuild(ctx context.Context, apiKey, name string, tags []string) (*types.Build, error) {
-	return o.newRegisteredBuild(ctx, apiKey, name, tags)
+func (o *Orchestrator) RegisterBuild(ctx context.Context, apiKey, name string, tags []string, metadata map[string]string) (*types.Build, error) {
+	return o.newRegisteredBuild(ctx, apiKey, name, tags, metadata)
 }
 
 // TriggerBuild handles POST /v2/templates/{tid}/builds/{bid}: record the base
@@ -133,6 +135,7 @@ func (o *Orchestrator) TriggerBuild(ctx context.Context, apiKey, tid, bid string
 	b.Steps = spec.Steps
 	b.StartCmd = spec.StartCmd
 	b.ReadyCmd = spec.ReadyCmd
+	b.Metadata = sandboxcfg.MergeMetadata(b.Metadata, spec.Metadata) // trigger overrides register
 	b.Kind = types.KindImg
 	if spec.StartCmd != "" || b.FromTemplate != "" {
 		// snp is provisional: the pipeline reports what it actually
@@ -208,21 +211,31 @@ func (o *Orchestrator) ListTemplates(ctx context.Context, apiKey string) ([]*typ
 // id the SDK reports as BuildInfo.template_id, or a build name/alias — to its built
 // persist id. Returns "" if no ready build owned by this api key matches.
 func (o *Orchestrator) resolveTemplateAlias(ctx context.Context, apiKey, ref string) string {
+	if b := o.templateBuild(ctx, apiKey, ref); b != nil {
+		return b.PersistID
+	}
+	return ""
+}
+
+// templateBuild resolves a template ref (persist id, transient id, name, or alias)
+// to its build record within the tenant's templates, or nil if none matches. Used
+// to recover a template's declared config (builds.metadata_json) at create time.
+func (o *Orchestrator) templateBuild(ctx context.Context, apiKey, ref string) *types.Build {
 	builds, err := o.ListTemplates(ctx, apiKey)
 	if err != nil {
-		return ""
+		return nil
 	}
 	for _, b := range builds {
 		if ref == b.PersistID || ref == b.TemplateID {
-			return b.PersistID
+			return b
 		}
 		for _, n := range append(append([]string{}, b.Names...), b.Aliases...) {
 			if n == ref {
-				return b.PersistID
+				return b
 			}
 		}
 	}
-	return ""
+	return nil
 }
 
 // --- builder resource pool ---
@@ -460,6 +473,19 @@ func (o *Orchestrator) BuildSpecFor(ctx context.Context, configID string) (*conf
 		fromTemplate, fromTemplateKind = t.Key, string(t.Kind)
 	}
 
+	// Phase-C VM capacity: the template's declared resource.capacity (register
+	// cpuCount/memoryMB or a resource header) else the node builder default. This
+	// pins snapshot.cfg.resources.capacity, which a snp-template create inherits.
+	vcpu, mem := o.cfg.Builder.VCPU, o.cfg.Builder.Memory
+	if cfgSpec, perr := sandboxcfg.ParseSpec(b.Metadata); perr == nil && cfgSpec.Resource.Capacity != nil {
+		if cfgSpec.Resource.Capacity.CPU > 0 {
+			vcpu = cfgSpec.Resource.Capacity.CPU
+		}
+		if cfgSpec.Resource.Capacity.Memory != "" {
+			mem = cfgSpec.Resource.Capacity.Memory
+		}
+	}
+
 	spec := &configsock.BuildSpec{
 		BuildID:          b.BuildID,
 		Workdir:          pend.workdir,
@@ -489,8 +515,8 @@ func (o *Orchestrator) BuildSpecFor(ctx context.Context, configID string) (*conf
 			Hostname:  "build-" + shortID(b.BuildID),
 			DNS:       o.cfg.Sandbox.Network.DNS,
 		},
-		VCPU:        o.cfg.Builder.VCPU,
-		Memory:      o.cfg.Builder.Memory,
+		VCPU:        vcpu,
+		Memory:      mem,
 		MMDSEnabled: o.cfg.MMDS.Enabled,
 		EnvdToken:   pend.envdToken,
 		Insecure:    o.cfg.Builder.InsecureRegistry,

@@ -107,6 +107,14 @@ func (o *Orchestrator) Create(ctx context.Context, req api.CreateReq) (*types.Sa
 	envdTok, _ := keys.MintToken()
 	trafTok, _ := keys.MintToken()
 
+	// Layer the template's declared config (builds.metadata_json) under the create's
+	// own config — create wins per namespace. Best-effort: a self-describing or
+	// foreign template may have no local build record (then it's just the create's).
+	meta := req.Metadata
+	if tb := o.templateBuild(ctx, req.APIKey, req.TemplateID); tb != nil && len(tb.Metadata) > 0 {
+		meta = sandboxcfg.MergeMetadata(tb.Metadata, req.Metadata)
+	}
+
 	sb := &types.Sandbox{
 		ID:                 sid,
 		TemplateID:         tmpl.String(), // canonical persist id (resolved from a transient/alias ref)
@@ -116,7 +124,7 @@ func (o *Orchestrator) Create(ctx context.Context, req api.CreateReq) (*types.Sa
 		ManifestKey:        manifestKey,
 		EnvdAccessToken:    envdTok,
 		TrafficAccessToken: trafTok,
-		Metadata:           req.Metadata,
+		Metadata:           meta,
 		Env:                req.EnvVars,
 		CreatedUnix:        time.Now().Unix(),
 		DeadlineUnix:       time.Now().Add(time.Duration(req.TimeoutSec) * time.Second).Unix(),

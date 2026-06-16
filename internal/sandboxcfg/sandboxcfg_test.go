@@ -107,6 +107,30 @@ func TestBuildInjectsNetworkMetadata(t *testing.T) {
 	}
 }
 
+func TestSetCapacityRoundTrip(t *testing.T) {
+	// cpu/memory fold into a well-formed resource namespace ParseSpec reads back.
+	meta := SetCapacity(nil, 4, 8192)
+	s, err := ParseSpec(meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.Resource.Capacity == nil || s.Resource.Capacity.CPU != 4 || s.Resource.Capacity.Memory != "8192MiB" {
+		t.Fatalf("capacity round-trip: %+v", s.Resource.Capacity)
+	}
+	if SetCapacity(nil, 0, 0) != nil {
+		t.Fatal("zero cpu/memory must be a no-op")
+	}
+}
+
+func TestMergeMetadataOverWins(t *testing.T) {
+	base := map[string]string{NsNetwork: "from-template", NsLaunch: "tmpl-launch"}
+	over := map[string]string{NsNetwork: "from-create"}
+	m := MergeMetadata(base, over)
+	if m[NsNetwork] != "from-create" || m[NsLaunch] != "tmpl-launch" {
+		t.Fatalf("create should win per namespace, template fills the rest: %+v", m)
+	}
+}
+
 func TestBuildImgCapacityOverride(t *testing.T) {
 	p := baseParams(types.ProfileBare)
 	p.Spec.Resource.Capacity = &rtconfig.CapacityConfig{CPU: 8, Memory: "16GiB"}

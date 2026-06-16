@@ -69,5 +69,11 @@ type Build struct {
 	Reason      string   // error detail
 	Names       []string // user-supplied name(s) + persist id (when ready)
 	Aliases     []string // user-supplied alias(es) + persist id (when ready)
+	// Metadata is the template's default sandbox config — the same kuasar-sandbox.<ns>
+	// namespaced keys a create carries (register cpu/memory + X-Kuasar-Sandbox-*
+	// headers land here; trigger overrides). It drives the build's phase-C capacity
+	// and is layered under a create's own config (create wins) when launching from
+	// this template.
+	Metadata    map[string]string
 	CreatedUnix int64
 }
