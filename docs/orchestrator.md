@@ -377,8 +377,8 @@ envd,回占位 token,数据面控制端口 501。`trafficAccessToken` 为 SDK �
 
 | 操作 | 方法 + 路径 | 要点 |
 |---|---|---|
-| register | `POST /v3/templates` → 202 | body `{name, tags}`;回 `{templateID: transient-<uuidv7>, buildID, names, tags, aliases, public:false}` |
-| trigger | `POST /v2/templates/{tid}/builds/{bid}` → 202 | body 兼容 `{fromImage, fromTemplate, fromImageRegistry{username,password}, steps[], startCmd, readyCmd}` 与 CLI 形态 `{start_cmd, ready_cmd, …}`;`fromImage`/`fromTemplate` 互斥,皆缺时由 `builder.image_uri_mask` 推 fromImage;steps 支持 `RUN/ENV/ARG/WORKDIR/USER/COPY`(COPY 须先经 files 端点上传 context:未配 files_storage→**501**、未上传→**400**,§11);`startCmd` 非空或 fromTemplate ⇒ 暂记 snp(终态以流水线产物为准,§11),否则 img;fromTemplate 且无 steps 无 startCmd ⇒ 拒绝(无事可做) |
+| register | `POST /v3/templates` → 202 | body `{name, tags, cpuCount, memoryMB}` + `X-Kuasar-Sandbox-*` 头 → 模板默认配置(cpu/memory→`resource.capacity`,§4.6);回 `{templateID: transient-<uuidv7>, buildID, names, tags, aliases, public:false}` |
+| trigger | `POST /v2/templates/{tid}/builds/{bid}` → 202 | body 兼容 `{fromImage, fromTemplate, fromImageRegistry{username,password}, steps[], startCmd, readyCmd}` 与 CLI 形态 `{start_cmd, ready_cmd, …}`;`fromImage`/`fromTemplate` 互斥,皆缺时由 `builder.image_uri_mask` 推 fromImage;steps 支持 `RUN/ENV/ARG/WORKDIR/USER/COPY`(COPY 须先经 files 端点上传 context:未配 files_storage→**501**、未上传→**400**,§11);`startCmd` 非空或 fromTemplate ⇒ 暂记 snp(终态以流水线产物为准,§11),否则 img;fromTemplate 且无 steps 无 startCmd ⇒ 拒绝(无事可做);`cpu_count`/`memory_mb` + `X-Kuasar-Sandbox-*` 头 → 模板配置,**覆盖 register**(§4.6) |
 | status | `GET /templates/{tid}/builds/{bid}/status` | 回 `{templateID, buildID, status, logs:[], logEntries:[]}` + 失败时 `reason{message}`;`logs`/`logEntries` 取自 journald 构建流(tag build),按 `?logsOffset`(已读条数)分页,SDK `on_build_logs` 即据此流式输出(§11);**进行中恒报 `building`**(registered/waiting/building 均映射,CLI wait 循环仅在 `building` 续轮询),终态 `ready`/`error`;失败 `reason` 通用(详情在日志流);ready 后 `templateID` 即报持久 id,并附 `names`/`aliases` |
 | files | `GET /templates/{tid}/files/{hash}` → 201 | COPY context 上传协商:`tid→build→归属`校验后回 `{present, url}`——present 即对象已在桶(客户端跳过上传),url 为**直传桶的 presigned PUT**(字节不过控制面);未配 `files_storage`→**501**,未知/非属主 tid→**404**。详见 §11 |
 | list | `GET /templates` | 本租户 ready 模板;`templateID` 列为持久 id |
@@ -426,6 +426,39 @@ transient templateID = transient-<uuidv7>       构建注册期临时句柄,buil
 - routesync(external proxy / 路由观察者):版本 1,帧 `[4B LE len][JSON]`,消息
   `register|hello|upsert|delete|bookmark|wake`,路径
   `PUT /internal/plugin/{id}/register`(config-socket plugin 平面,§9.2)。
+
+### 4.6 沙箱配置传递链
+
+每实例沙箱配置经**命名空间化的 e2b metadata 保留键** `kuasar-sandbox.<ns>`(各值一个
+JSON 对象)注入,零 SDK/API 改动。命名空间是 sandbox-runtime `config.SandboxConfig`
+(orchestrator import,单一真源)的**租户可控子集**:
+
+| 命名空间 | 去向 |
+|---|---|
+| `resource` | `resources.{capacity,allocatable}`(不含 `control`,节点托管) |
+| `network` | 拆分:`hostname`/`nexthop`→guest;`inner_ip`/`transit_*`→`vswitch.Attach`;`dns`→`/etc/resolv.conf` |
+| `launch` | `launch.{exec,args,env,workdir,restart,user,stop_signal,plugin}`——**仅 bare**;e2b profile 拒(envd 占用 launch) |
+| `init` / `mounts` / `files` | 直透 `init[]` / `mounts[]` / `files[]` |
+| `metadata` | `SANDBOX_CONFIG.metadata` 透传(如 `e2b.start_cmd`) |
+
+- **渲染**:orchestrator 建 `config.SandboxConfig` 基座(boot/tapfd/control/capacity/已解析
+  网络)再叠租户命名空间,yaml 序列化经 config-socket 交 sandbox-ctl。深校验(ValidateCold)
+  在 sandbox-ctl——orchestrator 侧 yaml 是半成品(cgroup_path 经 `--cgroup-adopt`、base 经
+  快照填),这里只对租户网络做格式校验。
+- **两个注入面**:e2b metadata,与 `X-Kuasar-Sandbox-<Ns>` 请求头(API 边缘归一化进
+  metadata,**同名头胜过 metadata 键**)。create 与模板构建(register/trigger)都支持;
+  构建配置存 `builds.metadata_json`。
+- **优先级**:`节点默认 ⊕ 模板配置 ⊕ create 配置`(create 按命名空间胜)。模板配置:snp
+  经快照、img 经 `builds.metadata_json`。构建内 `register ⊕ trigger`(trigger 胜);
+  register/trigger 的 `cpuCount`/`memoryMB` → `resource.capacity`(胜过 resource 头),决定
+  phase-C 构建 VM 容量。
+- **capacity**:img create 自由(create/模板/默认);snp create / resume / 迁移导入**钉死
+  快照**(runtime 拒容量不等)。
+- **network 随快照**:渲染时把已解析逻辑网络注入
+  `SANDBOX_CONFIG.metadata["kuasar-sandbox.network"]`,随 snapshot.cfg 落盘并跨 restore 继承;
+  restore 时 orchestrator 读回,填 create 未指定的网络字段(**显式 create 胜**,§8)。迁移
+  token 同样携带 metadata。其余命名空间只在冷启生效或已冻入快照,故只 network 需随快照。
+- **持久化**:`sandboxes.metadata_json` / `builds.metadata_json`。
 
 ## 5. 进程管理(systemd 模板单元,启动时自动生成安装)
 
@@ -635,13 +668,10 @@ id 二次注册自动反注册(并断链)前者。鉴权:配 `paths.plugin_pidfi
     杜绝重复 IP 分配 / attach / StartUnit 竞态。internal 模式 proxy 在请求内同步触发;
     external 模式经 routesync `Wake` 上行,orchestrator 端同样单飞(§9.1)。
   - resume 同时是 `POST /sandboxes/{id}/connect` 的实现;带 `timeout` 则顺带续期。
-- **每实例配置覆盖**(create 经 metadata,零 SDK/API 改动):metadata 保留键
-  **`kuasar-sandbox/config`**(值为 JSON 串)覆盖该沙箱网络项:`hostname`/`dns`/
-  `inner_ip`(CIDR)/`nexthop`/`transit_gateway_ip`/`transit_geneve_vni`/`transit_mac`
-  (后三者经 `vswitch-ctl attach --transit-*` 进 GENEVE 隧道)。空字段回落
-  profile/config 默认;仅做格式校验、无白名单门(沙箱以完整能力经 sandbox API 发布,
-  平台自身亦经此 API 管理)。metadata 持久化 ⇒ resume 时重新解析,覆盖在沙箱全生命
-  周期一致。
+- **每实例配置**(create/构建经 metadata + `X-Kuasar-Sandbox-*` 头,命名空间化,详见
+  §4.6):配置随沙箱持久化(`metadata_json`),resume 时重新解析、全生命周期一致;无白名单
+  门(沙箱以完整能力经 sandbox API 发布,平台自身亦经此 API 管理)。**network 另随快照**——
+  restore 时 orchestrator 读回快照内的逻辑网络,填 create 未指定的字段(显式 create 胜)。
 
 ### 8.1 暂停态分层、转模板与跨机迁移
 
@@ -1103,7 +1133,8 @@ serve 重启后以 `ListUnitsByPatterns("sandbox-runner@*.service")` 为存活�
 
 单元测试:`make test`(handler 路由、apikey/secretbox/regcreds、routesync(注册/bookmark
 往返)/routetable(世代清扫)、plugin 注册表(同 id 顶替/分片)、proxy CONNECT 隧道 +
-网关链式 relay、mmds(确定性密钥)、单飞、override、migrate 等)。跨仓 e2e 集中在 umbrella
+网关链式 relay、mmds(确定性密钥)、单飞、沙箱配置注入(命名空间解析/容量折叠/网络合并)、
+migrate 等)。跨仓 e2e 集中在 umbrella
 `kuasar-sandbox/test/e2e/`(需多仓产物:vmlinux/cloud-hypervisor/mkfs.erofs/
 sandbox-runtime-e2b.erofs 等),均已注册为 umbrella make 目标,缺前置则自跳过
 (`REQUIRE_*=1` 改为硬失败):
