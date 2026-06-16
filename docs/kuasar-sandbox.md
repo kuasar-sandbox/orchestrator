@@ -160,10 +160,10 @@ Warm Pool),共享同一套基础设施:内容定义分块、收敛加密、内�
         ▲                    │ pkg/tapfd
         │ pkg/manifest+image │
         └────────────────────┤
- sandbox-runtime ────────────┘                              (T2)
+ sandbox-runtime ────────────┘                              (T1)
         ▲
         │ pkg/resource  (orchestrator CLI: run-sandbox→sandbox-ctl + vswitch-ctl;run-builder→沙箱内 flatten-ctl)
- sandbox-orchestrator   (e2b ingress + node-ctl)            (T3)
+ sandbox-orchestrator   (e2b ingress + node-ctl)            (T2)
 ```
 
 实线是 Go 导入边。`sandbox-orchestrator` 不 import 任何兄弟仓(`CGO_ENABLED=0`
