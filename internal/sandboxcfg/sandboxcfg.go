@@ -411,12 +411,13 @@ func guestFiles(hostname string, dns []string) []rtconfig.FileConfig {
 	return files
 }
 
-// RestoreRef is the snapshot ref sandbox-ctl should restore from, or "" for a cold
-// boot. A resumed sandbox (img OR snp) restores from its latest pause snapshot;
+// RestoreRefFor is the snapshot ref sandbox-ctl should restore from, or "" for a
+// cold boot. A resumed sandbox (img OR snp) restores from its latest pause snapshot;
 // otherwise a snp template cold-starts by restoring its build snapshot, and an img
-// template cold-boots.
-func (p Params) RestoreRef() string {
-	if ref := p.Sandbox.SnapshotRef; ref != "" {
+// template cold-boots. Exported so the orchestrator can resolve it before rendering
+// (to read the snapshot's inherited config).
+func RestoreRefFor(sb *types.Sandbox, tmpl types.TemplateID) string {
+	if ref := sb.SnapshotRef; ref != "" {
 		// SnapshotRef is a full ref: "manifest://<key>" or a local bundle path. A
 		// scheme-less, non-path value is an older bare manifest key (back-compat).
 		if strings.Contains(ref, "://") || strings.HasPrefix(ref, "/") {
@@ -424,10 +425,43 @@ func (p Params) RestoreRef() string {
 		}
 		return "manifest://" + ref
 	}
-	if p.Template.Kind == types.KindSnp {
-		return p.Template.ManifestRef()
+	if tmpl.Kind == types.KindSnp {
+		return tmpl.ManifestRef()
 	}
 	return ""
+}
+
+// RestoreRef is RestoreRefFor for this Params.
+func (p Params) RestoreRef() string { return RestoreRefFor(p.Sandbox, p.Template) }
+
+// MergeNetwork overlays over (the explicit / create network) onto base (the
+// snapshot-inherited network) field by field: explicit wins, the snapshot fills what
+// create left unset (node defaults fill the rest at resolve time). This is point 7's
+// precedence — explicit create config over inherited snapshot config.
+func MergeNetwork(base, over NetworkSpec) NetworkSpec {
+	out := base
+	if over.Hostname != "" {
+		out.Hostname = over.Hostname
+	}
+	if len(over.DNS) > 0 {
+		out.DNS = over.DNS
+	}
+	if over.InnerIP != "" {
+		out.InnerIP = over.InnerIP
+	}
+	if over.Nexthop != "" {
+		out.Nexthop = over.Nexthop
+	}
+	if over.TransitGatewayIP != "" {
+		out.TransitGatewayIP = over.TransitGatewayIP
+	}
+	if over.TransitGeneveVNI != 0 {
+		out.TransitGeneveVNI = over.TransitGeneveVNI
+	}
+	if over.TransitMAC != "" {
+		out.TransitMAC = over.TransitMAC
+	}
+	return out
 }
 
 // ConnectSpecs are the UDS<->guest forwards sandbox-ctl should open. e2b exposes

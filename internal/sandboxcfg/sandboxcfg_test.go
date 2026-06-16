@@ -122,6 +122,19 @@ func TestSetCapacityRoundTrip(t *testing.T) {
 	}
 }
 
+func TestMergeNetworkExplicitWins(t *testing.T) {
+	// snapshot-inherited network; create explicitly sets only hostname.
+	snap := NetworkSpec{Hostname: "snap-host", Nexthop: "10.0.0.4", TransitGeneveVNI: 100, DNS: []string{"9.9.9.9"}}
+	create := NetworkSpec{Hostname: "create-host"}
+	m := MergeNetwork(snap, create)
+	if m.Hostname != "create-host" {
+		t.Fatalf("explicit create hostname must win: %q", m.Hostname)
+	}
+	if m.Nexthop != "10.0.0.4" || m.TransitGeneveVNI != 100 || len(m.DNS) != 1 {
+		t.Fatalf("snapshot must fill fields create left unset: %+v", m)
+	}
+}
+
 func TestMergeMetadataOverWins(t *testing.T) {
 	base := map[string]string{NsNetwork: "from-template", NsLaunch: "tmpl-launch"}
 	over := map[string]string{NsNetwork: "from-create"}

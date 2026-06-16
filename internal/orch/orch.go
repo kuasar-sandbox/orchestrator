@@ -156,6 +156,16 @@ func (o *Orchestrator) launch(ctx context.Context, sb *types.Sandbox, tmpl types
 	if err != nil {
 		return err
 	}
+	// Restore (resume / snp-template create / migration import): inherit the
+	// snapshot's logical network for fields the create config left unset (point 7 —
+	// explicit create config wins, the snapshot fills the rest), and pin capacity to
+	// the snapshot (the runtime refuses a mismatch). Read before attach so an
+	// inherited inner_ip / transit_* reaches allocInnerIP + vswitch.Attach.
+	var snap snapInfo
+	if ref := sandboxcfg.RestoreRefFor(sb, tmpl); ref != "" {
+		snap = o.snapshotConfig(ctx, sb, ref)
+		spec.Network = sandboxcfg.MergeNetwork(snap.Network, spec.Network)
+	}
 	plainIP, cidrIP, err := o.allocInnerIP(tmpl.Profile, spec.Network.InnerIP)
 	if err != nil {
 		return err
@@ -172,15 +182,11 @@ func (o *Orchestrator) launch(ctx context.Context, sb *types.Sandbox, tmpl types
 	sb.VswitchPort, sb.FloatingIP, sb.PortMAC, sb.InnerIP = port.Port, port.FloatingIP, port.MAC, cidrIP
 
 	p := o.sandboxParams(sb, tmpl, spec)
-	// A restore must declare the exact capacity the snapshot froze —
-	// snapshot.cfg is authoritative and the runtime refuses a mismatch
-	// rather than resize a resumed VM. Template snapshots are self-
-	// describing and may have been taken at a different budget than this
-	// node's create defaults (e.g. the build pipeline's builder.vcpu/memory).
-	if ref := p.RestoreRef(); ref != "" {
-		if cpu, mem, ok := o.snapshotCapacity(ctx, sb, ref); ok {
-			p.VCPU, p.Memory = cpu, mem
-		}
+	// Pin capacity to the snapshot the runtime froze (read above). Template
+	// snapshots are self-describing and may have been taken at a different budget
+	// than this node's create defaults (e.g. the build pipeline's builder.vcpu/memory).
+	if snap.HasCapacity {
+		p.VCPU, p.Memory = snap.CapCPU, snap.CapMem
 	}
 	if err := p.WriteYAML(o.sandboxConfigPath(sb)); err != nil {
 		return err
@@ -394,11 +400,24 @@ func (o *Orchestrator) resumeIfPaused(ctx context.Context, sid string) error {
 	return o.resume(ctx, sb)
 }
 
-// snapshotCapacity reads resources.capacity from a snapshot ref's embedded
-// snapshot.cfg (`sandbox-ctl info --json`; reads only the trailing ZIP, a few
-// KB even via manifest://). Returns ok=false on any failure — the launch then
-// proceeds with the node defaults and the runtime stays the enforcer.
-func (o *Orchestrator) snapshotCapacity(ctx context.Context, sb *types.Sandbox, ref string) (int, string, bool) {
+// snapInfo is the config the orchestrator inherits from a restore snapshot: the
+// frozen capacity (the runtime pins it) and the logical network (the
+// kuasar-sandbox.network key the orchestrator injected into the snapshot's metadata),
+// used to fill create-config network fields left unset (point 7).
+type snapInfo struct {
+	Network     sandboxcfg.NetworkSpec
+	CapCPU      int
+	CapMem      string
+	HasCapacity bool
+}
+
+// snapshotConfig reads resources.capacity + the kuasar-sandbox.network metadata from a
+// snapshot ref's embedded snapshot.cfg (`sandbox-ctl info --json`; reads only the
+// trailing ZIP, a few KB even via manifest://). Best-effort: any probe/parse failure
+// yields a zero snapInfo and the launch proceeds with node defaults (the runtime
+// stays the capacity enforcer).
+func (o *Orchestrator) snapshotConfig(ctx context.Context, sb *types.Sandbox, ref string) snapInfo {
+	var info snapInfo
 	args := []string{"info", "--json"}
 	if strings.HasPrefix(ref, "manifest://") {
 		args = append(args, "--manifest-config", o.cfg.ManifestConfig)
@@ -407,9 +426,10 @@ func (o *Orchestrator) snapshotCapacity(ctx context.Context, sb *types.Sandbox, 
 	cmd.Env = append(os.Environ(), "MANIFEST_KEY="+sb.ManifestKey)
 	out, err := cmd.Output()
 	if err != nil {
-		o.log.Warn("snapshot capacity probe failed; using node defaults", "sid", sb.ID, "ref", ref, "err", err)
-		return 0, "", false
+		o.log.Warn("snapshot config probe failed; using node defaults", "sid", sb.ID, "ref", ref, "err", err)
+		return info
 	}
+	// info --json marshals restore.SnapshotCfg by Go field name (capitalized).
 	var cfg struct {
 		Resources struct {
 			Capacity struct {
@@ -417,13 +437,19 @@ func (o *Orchestrator) snapshotCapacity(ctx context.Context, sb *types.Sandbox, 
 				Memory string `json:"Memory"`
 			} `json:"Capacity"`
 		} `json:"Resources"`
+		Metadata map[string]string `json:"Metadata"`
 	}
-	if err := json.Unmarshal(out, &cfg); err != nil ||
-		cfg.Resources.Capacity.CPU <= 0 || cfg.Resources.Capacity.Memory == "" {
-		o.log.Warn("snapshot capacity parse failed; using node defaults", "sid", sb.ID, "ref", ref, "err", err)
-		return 0, "", false
+	if err := json.Unmarshal(out, &cfg); err != nil {
+		o.log.Warn("snapshot config parse failed; using node defaults", "sid", sb.ID, "ref", ref, "err", err)
+		return info
 	}
-	return cfg.Resources.Capacity.CPU, cfg.Resources.Capacity.Memory, true
+	if cfg.Resources.Capacity.CPU > 0 && cfg.Resources.Capacity.Memory != "" {
+		info.CapCPU, info.CapMem, info.HasCapacity = cfg.Resources.Capacity.CPU, cfg.Resources.Capacity.Memory, true
+	}
+	if nraw := strings.TrimSpace(cfg.Metadata[sandboxcfg.NsNetwork]); nraw != "" {
+		_ = json.Unmarshal([]byte(nraw), &info.Network) // best-effort; malformed -> zero network
+	}
+	return info
 }
 
 // --- configsock.Provider ---
