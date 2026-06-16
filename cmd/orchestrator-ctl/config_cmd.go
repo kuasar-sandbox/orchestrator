@@ -88,7 +88,7 @@ sandbox:                                          # sandbox-instance defaults
   resources:
     vcpu: 2
     memory: 2GiB
-    # control_socket: /run/sandbox-resource.sock  # sandbox-sentinel UDS (opt-in); omit = static cgroup
+    # control_socket: /run/sandbox-resource.sock  # node-ctl resource socket (opt-in); omit = static cgroup
   network:
     switch: sw0
     hostname: sandbox                             # guest hostname (sethostname + /etc/hosts)
