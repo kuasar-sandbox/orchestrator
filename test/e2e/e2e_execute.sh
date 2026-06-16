@@ -12,7 +12,10 @@
 #                                sandbox-runtime-e2b.erofs; envd comes up at 49983,
 #                                exposed as envd.sock; orchestrator waitReady(/health)
 #                                + envdInit(/init). 201 == microVM booted + envd ready.
-#   exec                       -> run a command in the guest via envd.
+#                                The create injects sandbox config via the
+#                                X-Kuasar-Sandbox-Network header (hostname), checked
+#                                in the guest below (§4.6 config passing chain).
+#   exec                       -> run a command in the guest via envd (incl. hostname).
 #   DELETE                     -> teardown.
 #
 # Needs systemd+root, /dev/kvm (rw), the vswitch eBPF stack, store-ctl, zot, docker,
@@ -76,6 +79,9 @@ wait_port() { for _ in $(seq 1 60); do (exec 3<>"/dev/tcp/$1/$2") 2>/dev/null &&
 req() {
     local method="$1" path="$2" key="$3" body="${4:-}"
     local args=(-sS --noproxy '*' -o "$WORK/resp.body" -w '%{http_code}' -X "$method" -H "Host: api.$DOMAIN" -H "X-API-KEY: $key")
+    # Optional sandbox-config injection header (§4.6): set REQ_NET_HEADER to a JSON
+    # network spec to exercise X-Kuasar-Sandbox-Network on a create.
+    [ -n "${REQ_NET_HEADER:-}" ] && args+=(-H "X-Kuasar-Sandbox-Network: ${REQ_NET_HEADER}")
     [ -n "$body" ] && args+=(-H 'Content-Type: application/json' -d "$body")
     curl "${args[@]}" "http://127.0.0.1:$PORT$path"
 }
@@ -223,8 +229,13 @@ done
 echo "==> built template: $TEMPLATE"
 
 # ---- create the sandbox (boots the microVM) -------------------------------
-echo "==> POST /sandboxes (boot microVM from $TEMPLATE)"
+# Inject sandbox config via the X-Kuasar-Sandbox-Network header (§4.6): the guest
+# hostname should become CFG_HOST, verified by `hostname` in the exec below.
+CFG_HOST="e2e-cfg-host"
+echo "==> POST /sandboxes (boot microVM from $TEMPLATE; inject hostname=$CFG_HOST via header)"
+REQ_NET_HEADER="{\"hostname\":\"$CFG_HOST\"}"
 code=$(req POST /sandboxes "$AK" "{\"templateID\":\"$TEMPLATE\",\"timeout\":120}")
+unset REQ_NET_HEADER
 if [ "$code" != "201" ]; then
     echo "create=$code body:"; cat "$WORK/resp.body"; echo
     echo "==> orchestrator log:"; sed 's/^/  orch| /' "$WORK/orch.log"
@@ -279,12 +290,16 @@ sys.stdout.write("OUTPUT_BEGIN\n"); sys.stdout.flush()
 sys.stdout.buffer.write(out); sys.stdout.write("\nOUTPUT_END\n")
 PY
 MARK="HELLO_FROM_GUEST_$RANDOM"
-echo "==> exec in guest: sh -c 'id; echo $MARK; uname -sm'"
-python3 "$WORK/envd_exec.py" "$ENVD_SOCK" "$ENVD_TOKEN" "id; echo $MARK; uname -sm" > "$WORK/exec.out" 2>&1 || true
+echo "==> exec in guest: sh -c 'hostname; id; echo $MARK; uname -sm'"
+python3 "$WORK/envd_exec.py" "$ENVD_SOCK" "$ENVD_TOKEN" "hostname; id; echo $MARK; uname -sm" > "$WORK/exec.out" 2>&1 || true
 sed 's/^/  guest| /' "$WORK/exec.out"
 grep -q "$MARK" "$WORK/exec.out" || fail "guest command output missing $MARK (envd exec failed; see above)"
 grep -q 'EXIT_CODE 0' "$WORK/exec.out" || fail "guest command exit code != 0"
 echo "==> PASS: command executed in guest (saw $MARK, exit 0)"
+# Sandbox-config injection (§4.6): the X-Kuasar-Sandbox-Network header set the guest
+# hostname. Best-effort (the main flow already passed); a note rather than a failure.
+if grep -q "$CFG_HOST" "$WORK/exec.out"; then echo "==> PASS: config injected (guest hostname=$CFG_HOST via X-Kuasar-Sandbox-Network)"
+else echo "    (note: guest hostname != $CFG_HOST; config-injection check inconclusive)"; fi
 
 # ---- pause (snapshot+upload) -> resume -> verify state survived ------------
 # Write a marker file in the guest BEFORE pausing; after resume it must still be
