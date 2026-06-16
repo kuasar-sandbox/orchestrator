@@ -208,16 +208,16 @@ else
     fail "info --json: Architecture is empty"
 fi
 
-# Truncating to erofs_size yields a pure EROFS file that still mounts
-# (we don't actually mount in CI — just verify the byte invariant
-# that EROFS magic remains at offset 1024).
-cp "$TMPDIR/image-a.erofs" "$TMPDIR/image-a.pure.erofs"
-truncate -s "$EROFS_SIZE" "$TMPDIR/image-a.pure.erofs"
+# flatten now emits a tarstream artifact (tar header + EROFS payload + trailing ZIP,
+# ff88f5f), so the EROFS no longer starts at offset 0 — a bare truncate won't expose
+# it. Extract the payload (entry "image") and verify the EROFS magic at offset 1024
+# of the pure erofs.
+"$BIN/flatten-ctl" tar extract -f "$TMPDIR/image-a.erofs" --dense "image:$TMPDIR/image-a.pure.erofs"
 MAGIC_HEX=$(dd if="$TMPDIR/image-a.pure.erofs" bs=1 count=4 skip=1024 2>/dev/null | od -An -tx1 | tr -d ' \n')
 if [ "$MAGIC_HEX" = "e2e1f5e0" ]; then
-    ok "post-truncate file retains EROFS magic at offset 1024"
+    ok "extracted EROFS payload retains magic at offset 1024"
 else
-    fail "EROFS magic missing after truncate (got: $MAGIC_HEX)"
+    fail "EROFS magic missing in extracted payload (got: $MAGIC_HEX)"
 fi
 
 # ============================================================
@@ -353,9 +353,13 @@ dd if=/dev/urandom of="$SPARSE" bs=1M count=1 status=none
 dd if=/dev/zero    of="$SPARSE" bs=1M count=7 seek=1 conv=notrunc status=none
 SPARSE_HASH=$(sha256sum "$SPARSE" | awk '{print $1}')
 
+# The store consumes platform tarstream artifacts, not bare files (ff88f5f), so
+# package the sparse file first (flatten-ctl tar stream, pure Go). The chunker still
+# detects the all-zero content chunks (IsZero) during ingest.
+"$BIN/flatten-ctl" tar stream -f "$SPARSE.tar" "image:$SPARSE"
 # Use fixed chunking so we can predict counts: 8 MiB / 64 KiB = 128 chunks total.
 MKEY_SPARSE=$("$BIN/manifest-ctl" store --manifest-config "$TMPDIR/accelerator-fixed-64k.yaml" --no-progress \
-    "$SPARSE" 2>"$TMPDIR/sparse-store.stderr")
+    "$SPARSE.tar" 2>"$TMPDIR/sparse-store.stderr")
 
 # Parse the "chunks: stored=S dedup=D zero=W" summary line.
 SUMMARY=$(grep -E '^chunks:' "$TMPDIR/sparse-store.stderr" | head -1)
@@ -374,10 +378,12 @@ fi
 INFO_ZERO=$(grep -E '^zero chunks:' "$TMPDIR/sparse-info.txt" | sed -E 's/zero chunks:\s+([0-9]+).*/\1/')
 assert_eq "$ZERO_W" "$INFO_ZERO" "info reports same zero count as store summary"
 
-# Round-trip: load by key and compare SHA256.
-"$BIN/manifest-ctl" load $COMMON --no-progress --output "$TMPDIR/sparse.rt" "$MKEY_SPARSE"
+# Round-trip: load the artifact, extract its payload (--dense materializes the
+# zero chunks), and compare SHA256 to the original.
+"$BIN/manifest-ctl" load $COMMON --no-progress --output "$TMPDIR/sparse.rt.tar" "$MKEY_SPARSE"
+"$BIN/flatten-ctl" tar extract -f "$TMPDIR/sparse.rt.tar" --dense "image:$TMPDIR/sparse.rt"
 RT_HASH=$(sha256sum "$TMPDIR/sparse.rt" | awk '{print $1}')
-assert_eq "$SPARSE_HASH" "$RT_HASH" "sparse file roundtrip matches"
+assert_eq "$SPARSE_HASH" "$RT_HASH" "sparse file payload roundtrip matches"
 
 # Manifest size sanity: with 128 chunks total but only ~16 non-zero
 # (1 MiB / 64 KiB), the sealed key table holds ~16*32 bytes of key
@@ -395,7 +401,7 @@ fi
 
 # ============================================================
 echo ""
-echo "=== Test 13: Sparse file with holes (--detect-holes + --hole=zero/punch) ==="
+echo "=== Test 13: Sparse file with holes (envelope-borne hole metadata) ==="
 # 8 MiB sparse file: 1 MiB random + 7 MiB hole. truncate creates a
 # real filesystem hole (not zero-fill); dd at offset 0 writes the
 # leading data without touching the trailing hole region.
@@ -410,52 +416,37 @@ HOLED_BSIZE=$(stat -c '%B' "$HOLED")
 HOLED_ALLOC=$((HOLED_BLOCKS * HOLED_BSIZE))
 echo "  source: apparent=8MiB allocated=$HOLED_ALLOC bytes"
 
-# Store with --detect-holes; fixed chunking so we can predict counts.
+# Package the sparse file: flatten-ctl tar stream captures the filesystem hole
+# (SEEK_HOLE) into the artifact envelope, so the store records it as authoritative
+# hole metadata from the envelope — no content scanning. Fixed chunking for
+# predictable counts.
+"$BIN/flatten-ctl" tar stream -f "$HOLED.tar" "image:$HOLED"
 MKEY_HOLED=$("$BIN/manifest-ctl" store --manifest-config "$TMPDIR/accelerator-fixed-64k.yaml" --no-progress \
-    --detect-holes "$HOLED" 2>"$TMPDIR/holed-store.stderr")
+    "$HOLED.tar" 2>"$TMPDIR/holed-store.stderr")
 
 # info is the source of truth for hole extents: the store summary
 # carries no holes line, so we materialize the manifest and read its
-# holes count back — which transitively proves --detect-holes recorded
-# them at ingest.
+# holes count back — proving the store recorded the envelope hole at
+# ingest (the tar stream carried it from SEEK_HOLE, no content scan).
 "$BIN/manifest-ctl" get-manifest $COMMON --output "$TMPDIR/holed.manifest" "$MKEY_HOLED"
 "$BIN/manifest-ctl" info "$TMPDIR/holed.manifest" > "$TMPDIR/holed-info.txt"
 INFO_HOLES=$(grep -E '^holes:' "$TMPDIR/holed-info.txt" | sed -E 's/holes:\s+([0-9]+).*/\1/')
 if [ "$INFO_HOLES" -lt 1 ]; then
-    fail "info shows holes=$INFO_HOLES, expected ≥1 (--detect-holes ineffective)"
+    fail "info shows holes=$INFO_HOLES, expected ≥1 (envelope hole not recorded)"
 else
-    ok "store --detect-holes recorded $INFO_HOLES hole extent(s) (via info)"
+    ok "store recorded $INFO_HOLES envelope hole extent(s) (via info)"
 fi
 
-# Default --hole=error rejects the manifest.
-if "$BIN/manifest-ctl" load $COMMON --no-progress \
-        --output "$TMPDIR/holed-error.out" "$MKEY_HOLED" 2>"$TMPDIR/holed-load-err.stderr"; then
-    fail "default --hole=error should have failed but did not"
-else
-    ok "default policy rejected manifest with hole"
-fi
-
-# --hole=zero: synthesize zeros for hole region, output bytes-equal to source.
-"$BIN/manifest-ctl" load $COMMON --no-progress --hole=zero \
-    --output "$TMPDIR/holed-zero.out" "$MKEY_HOLED" 2>&1 >/dev/null
-ZERO_HASH=$(sha256sum "$TMPDIR/holed-zero.out" | awk '{print $1}')
-assert_eq "$HOLED_HASH" "$ZERO_HASH" "--hole=zero output bytes-equal to sparse source"
-
-# --hole=punch: output should be a sparse file (allocation < apparent size).
-"$BIN/manifest-ctl" load $COMMON --no-progress --hole=punch \
-    --output "$TMPDIR/holed-punch.out" "$MKEY_HOLED" 2>&1 >/dev/null
-PUNCH_HASH=$(sha256sum "$TMPDIR/holed-punch.out" | awk '{print $1}')
-assert_eq "$HOLED_HASH" "$PUNCH_HASH" "--hole=punch output bytes-equal to sparse source"
-PUNCH_BLOCKS=$(stat -c '%b' "$TMPDIR/holed-punch.out")
-PUNCH_BSIZE=$(stat -c '%B' "$TMPDIR/holed-punch.out")
-PUNCH_ALLOC=$((PUNCH_BLOCKS * PUNCH_BSIZE))
-echo "  --hole=punch output: apparent=8MiB allocated=$PUNCH_ALLOC bytes"
-# Sparse if allocated < ~6 MiB (punching a 7 MiB hole leaves ≤ 1 MiB allocated).
-if [ "$PUNCH_ALLOC" -lt 6291456 ]; then
-    ok "--hole=punch produced sparse output (allocated $PUNCH_ALLOC < 6 MiB)"
-else
-    fail "--hole=punch did not punch (allocated $PUNCH_ALLOC ≥ 6 MiB)"
-fi
+# Round-trip: load the artifact and extract its payload. load emits a tarstream
+# artifact carrying the hole in its envelope, and the extractor chooses
+# materialization: --dense fills zeros (bytes-equal to the source, since a hole
+# reads as zeros), the default punches a sparse file. The sparse-output (punch)
+# behavior is covered by flatten-ctl's own extract tests; here we assert the
+# byte-exact payload roundtrip.
+"$BIN/manifest-ctl" load $COMMON --no-progress --output "$TMPDIR/holed.rt.tar" "$MKEY_HOLED"
+"$BIN/flatten-ctl" tar extract -f "$TMPDIR/holed.rt.tar" --dense "image:$TMPDIR/holed.rt"
+RT_HASH=$(sha256sum "$TMPDIR/holed.rt" | awk '{print $1}')
+assert_eq "$HOLED_HASH" "$RT_HASH" "sparse-hole payload roundtrip matches (holes materialized as zeros)"
 
 # ============================================================
 echo ""
