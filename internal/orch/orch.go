@@ -34,11 +34,20 @@ import (
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/vswitch"
 )
 
+// vsClient is the vswitch surface the orchestrator uses; the production impl is
+// *vswitch.CLI. Declared as an interface so the port attach/detach/tap-fd path
+// can be substituted in tests (and launch exercised without a real vswitch-ctl).
+type vsClient interface {
+	Attach(ctx context.Context, req vswitch.AttachReq) (*vswitch.Port, error)
+	Detach(ctx context.Context, port string) error
+	TapFDExec(port string) []string
+}
+
 type Orchestrator struct {
 	cfg *config.Config
 	st  *store.Store
 	lc  launcher.Launcher
-	vs  *vswitch.CLI
+	vs  vsClient
 	log *slog.Logger
 
 	mu  sync.Mutex
@@ -56,7 +65,7 @@ type Orchestrator struct {
 	files *filestore.Store // COPY build-context object store; nil = unconfigured (COPY → 501)
 }
 
-func New(cfg *config.Config, st *store.Store, lc launcher.Launcher, vs *vswitch.CLI, log *slog.Logger) *Orchestrator {
+func New(cfg *config.Config, st *store.Store, lc launcher.Launcher, vs vsClient, log *slog.Logger) *Orchestrator {
 	o := &Orchestrator{
 		cfg: cfg, st: st, lc: lc, vs: vs, log: log,
 		reg:  map[string]*types.Sandbox{},
@@ -314,13 +323,30 @@ func (o *Orchestrator) Connect(ctx context.Context, id, apiKey, migrationToken s
 		return nil, api.ErrNotFound
 	}
 	if sb.State == types.StatePaused {
-		if err := o.resume(ctx, sb); err != nil {
+		// Route the resume through the same per-sid single-flight the data plane
+		// uses, so a /connect racing data-plane traffic (or another /connect)
+		// collapses to one resume+launch instead of double-allocating the port or
+		// starting the unit twice. resumeIfPaused re-checks "still paused?" inside
+		// the flight, so the losers are no-ops.
+		if err := o.sf.Do(id, func() error { return o.resumeIfPaused(ctx, id) }); err != nil {
 			return nil, err
+		}
+		// Re-read the now-running snapshot the flight published; never mutate the
+		// cached pointer in place.
+		if r := o.lookup(id); r != nil {
+			sb = r
+		} else if sb, err = o.st.Get(ctx, id); err != nil || sb == nil {
+			return nil, api.ErrNotFound
 		}
 	}
 	if timeoutSec > 0 {
-		sb.DeadlineUnix = time.Now().Add(time.Duration(timeoutSec) * time.Second).Unix()
-		_ = o.st.SetDeadline(ctx, id, sb.DeadlineUnix)
+		dl := time.Now().Add(time.Duration(timeoutSec) * time.Second).Unix()
+		if s := o.mutateCached(id, func(nb *types.Sandbox) { nb.DeadlineUnix = dl }); s != nil {
+			sb = s // cached: published a fresh snapshot with the new deadline
+		} else {
+			sb.DeadlineUnix = dl // not cached (fresh, unpublished) — safe in place
+		}
+		_ = o.st.SetDeadline(ctx, id, dl)
 	}
 	return sb, nil
 }
@@ -344,14 +370,19 @@ func (o *Orchestrator) resume(ctx context.Context, sb *types.Sandbox) error {
 	if err != nil {
 		return err
 	}
-	sb.State = types.StateRunning
-	if err := o.launch(ctx, sb, tmpl); err != nil {
+	// Operate on a private copy. launch sets the network fields and publishes via
+	// o.cache, swapping the cached pointer in one locked step — a published cache
+	// entry is never mutated in place, so concurrent readers (Route, MMDS lookups)
+	// always observe a consistent snapshot and there is no field-level data race.
+	nb := *sb
+	nb.State = types.StateRunning
+	if err := o.launch(ctx, &nb, tmpl); err != nil {
 		return err
 	}
-	if err := o.st.SetState(ctx, sb.ID, types.StateRunning); err != nil {
+	if err := o.st.SetState(ctx, nb.ID, types.StateRunning); err != nil {
 		return err
 	}
-	o.publishUpsert(sb) // unparks any proxy holding a request for this sandbox
+	o.publishUpsert(&nb) // unparks any proxy holding a request for this sandbox
 	return nil
 }
 
@@ -649,6 +680,25 @@ func (o *Orchestrator) lookup(id string) *types.Sandbox {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	return o.reg[id]
+}
+
+// mutateCached atomically replaces the cached entry for id with a copy that fn
+// has mutated (under o.mu) and returns the new snapshot, or nil if id is not
+// cached. Published cache entries are immutable: every in-place field change to
+// a cached *types.Sandbox goes through here (or through cache() of a freshly
+// built, not-yet-published object), so a reader holding a cached pointer never
+// observes a torn write.
+func (o *Orchestrator) mutateCached(id string, fn func(*types.Sandbox)) *types.Sandbox {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	cur := o.reg[id]
+	if cur == nil {
+		return nil
+	}
+	nb := *cur
+	fn(&nb)
+	o.reg[id] = &nb
+	return &nb
 }
 
 // ByFloatingIP maps a guest's (SNAT'd) source floating IP to its running sandbox id,
