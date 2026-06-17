@@ -58,6 +58,7 @@ DOCS=(
   "sandbox-orchestrator/docs/node.md"
   # node orchestrator (e2b-compatible ingress)
   "sandbox-orchestrator/docs/orchestrator.md"
+  "sandbox-orchestrator/docs/proxy.md"
   # virtual switch
   "sandbox-vswitch/docs/vswitch.md"
   "sandbox-vswitch/docs/tapfd.md"
