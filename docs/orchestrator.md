@@ -110,7 +110,8 @@ envd `/health` 就绪(60s 上限)→ `POST /init` 置 env/默认用户 → 起 T
 数据面按 `Host`(`<port>-<sid>.<domain>`)或 `E2b-Sandbox-Id`/`E2b-Sandbox-Port` 头解析
 `(sid, port)`,校验 `X-Access-Token` 后转发:e2b profile 的 49983/49999 拨 sandbox-ctl
 `--connect` 暴露的 host UDS 直达 envd;其余任意端口拨 `floatingip:port`。对 paused
-沙箱的请求触发自动 resume(单飞合并,§8)。部署形态(internal/external/off)见 §9.1。
+沙箱的请求触发自动 resume(单飞合并,§8)。部署形态(internal/external/off)见 §9.1,
+转发层设计见 [proxy.md](proxy.md)。
 
 ## 2. 命令行接口
 
@@ -121,7 +122,7 @@ envd `/health` 就绪(60s 上限)→ `POST /init` 置 env/默认用户 → 起 T
 | 子命令 | 用途 |
 |---|---|
 | `serve` | 启动 daemon:控制面 + 数据面 + 本机控制 socket + reaper + 构建池 |
-| `proxy` | 外置数据面 worker(`proxy.mode=external`,§9.1) |
+| `proxy` | 外置数据面 worker(`proxy.mode=external`;见 §2.3 与 proxy.md) |
 | `run-sandbox` / `run-builder` | systemd 单元内启动器,非给人用(§2.4、§6) |
 | `config` | 配置规范化/校验,或输出带注释骨架 |
 | `manifest-key` | `add`/`remove`/`check`/`list`:create/build 白名单管理(§7) |
@@ -173,27 +174,9 @@ orchestrator-ctl serve [--config /etc/orchestrator-ctl/config.yaml]
 
 ### 2.3 `orchestrator-ctl proxy`
 
-外置数据面 worker(§9.1)。运维带外起(`deploy/orchestrator-proxy@.service`),
-与 orchestrator 同节点(本地拨 envd-UDS / floatingip)。
-
-```
-orchestrator-ctl proxy --config-socket=<uds> --id=<name> --socket=<uds>
-                       [--data-listen=:443] [--tls-cert <pem> --tls-key <pem>]
-                       [--auth off|log|enforce] [--park-timeout 30s]
-                       [--metrics-listen <addr>] [--mmds-listen <addr>]
-```
-
-| 参数 | 默认 | 说明 |
-|---|---|---|
-| `--config-socket` | (必填) | orchestrator 的 config-socket UDS:worker 在其 plugin 平面注册并同步路由(§6/§9.2) |
-| `--id` | (必填) | 本 worker 的 plugin id,每 worker 唯一(同 id 二次注册会顶掉前者) |
-| `--socket` | (必填) | 本 worker 服务兜底网关转发数据面请求的 UDS(注册时上报给 orchestrator) |
-| `--data-listen` | 空 | 数据面入口,**SO_REUSEPORT**(多 worker 共享同一端口);空 = 仅 UDS 服务 |
-| `--tls-cert/--tls-key` | 空 | 数据面 TLS(与 orchestrator 同一张通配证书);空 = h2c |
-| `--auth` | `enforce` | 数据面鉴权回退值,仅在 orchestrator 策略到达前生效(§9.3) |
-| `--park-timeout` | `30s` | 请求挂起预算回退值,同上 |
-| `--metrics-listen` | 空 | Prometheus 文本端点(`/metrics`) |
-| `--mmds-listen` | 空 | MMDS 元数据服务监听地址;serve 配 `mmds.enabled` 时设置(§9.4) |
+外置数据面 worker(`proxy.mode=external`);运维带外起、与 orchestrator 同节点。命令行、
+参数、部署模式与拓扑见 [proxy.md](proxy.md) §2、§5——转发层自成一文,本仓控制面只在
+§9 讲如何按 `proxy.mode` 装配它。
 
 ### 2.4 `orchestrator-ctl run-sandbox` / `run-builder`
 
@@ -296,10 +279,10 @@ orchestrator-ctl 同目录 → PATH"自动发现。
 | `api.domain` | (必填) | 服务域,如 `sandboxes.example.com`;控制面 = `api.<domain>` |
 | `api.listen` | `:443` | 北向监听;dev 用 `:3000` 走明文 h2c |
 | `api.tls.cert/key` | 空 | 通配证书(`*.<domain>` 与 `api.<domain>`,§12);空 = 明文 |
-| `proxy.mode` | `internal` | 数据面承载:`internal`/`external`/`off`(§9.1) |
+| `proxy.mode` | `internal` | 数据面承载:`internal`/`external`/`off`(装配见 §9.1,部署模式见 proxy.md §5) |
 | `proxy.data_listen` | 空 | 专用数据面监听;空 = 与 `api.listen` 共口。external 模式由 worker 持有数据口,orchestrator 不绑它 |
-| `proxy.park_timeout` | `30s` | 数据面请求挂起预算:等路由同步 / paused 沙箱 resume 的上限(§9.1) |
-| `proxy.auth` | `enforce` | 数据面鉴权:`off`/`log`/`enforce`,校验 `X-Access-Token`(§9.3) |
+| `proxy.park_timeout` | `30s` | 数据面请求挂起预算:等路由同步 / paused 沙箱 resume 的上限(proxy.md §5) |
+| `proxy.auth` | `enforce` | 数据面鉴权:`off`/`log`/`enforce`,校验 `X-Access-Token`(proxy.md §7) |
 | `proxy.metrics_listen` | 空(关) | Prometheus 文本端点(`data_requests_total{result=…}`、`gateway_forward_total` 等) |
 | `encryption_key` | (必填) | manifest_key 落盘加密的 AES-256 密钥:`:` 分隔多个 64-hex,首个为活动密钥,其余备用解旧记录(轮换);`ORCHESTRATOR_ENCRYPTION_KEY` env 优先 |
 | `manifest_config` | `/opt/sandbox/manifest.yaml` | 共享远程 manifest store 配置(`manifest.key` 留空,租户 key 经 env 按任务下发) |
@@ -334,13 +317,13 @@ orchestrator-ctl 同目录 → PATH"自动发现。
 | `builder.files_storage` | 空 | COPY 构建上下文的 S3/OBS 对象存储(子键 `endpoint`/`region`/`bucket`(必填)/`prefix`/`access_key`/`secret_key`/`force_path_style`/`presign_expiry`);空 = COPY 回 501。orchestrator 仅 presign + HEAD;`access_key` 空走 AWS 默认链;`force_path_style` 默认 false(versitygw/minio 置 true);`presign_expiry` 默认 1h(PUT;GET 用 total+5m)。本地/单机无云对象存储用 versitygw(§11) |
 | `checkpoint.mode` | `local` | 暂停态落地:`local` = 本机文件(节点绑定)/ `remote` = 远程 manifest(可移植 = 模板)(§8.1) |
 | `checkpoint.local_dir` | `/var/lib/sandbox-saved` | 本机快照目录(`mode=local`) |
-| `mmds.enabled` | `false` | envd 鉴权姿态开关(§9.4):false = `-isnotfc` + proxy 单闸门;true = FC 模式 + MMDS re-key |
+| `mmds.enabled` | `false` | envd 鉴权姿态开关(§9.2、proxy.md §8):false = `-isnotfc` + proxy 单闸门;true = FC 模式 + MMDS re-key |
 | `mmds.listen` | `127.0.0.1:19254` | MMDS 监听地址(vswitch `--mgmt-service` 的转换目标) |
 
 配置自洽校验:`mmds.enabled=false` 时 `proxy.auth` 必须为 `enforce`(envd 非 secure,
 proxy 是唯一数据面闸门);`mmds.enabled=true` 时 `proxy.mode` 不得为 `off`(MMDS 寄宿
 proxy 组件)。external 模式无须静态 worker 列表——worker 自行经 plugin 平面注册,网关
-按活跃注册集转发(§9.1)。
+按活跃注册集转发(§9.1、§9.3)。
 
 ## 4. e2b API 契约
 
@@ -368,7 +351,7 @@ create 的 `templateID` 接受三种引用:持久 id(`<profile>-<kind>-<key>`,§
 transient id、或已 ready 构建的 name/alias——后两者解析到持久 id 再走统一路径。
 `envdVersion` 回 `0.6.1`(e2b)或 stub `0.1.0`(bare,≥0.1.0 否则 SDK 自毁);bare 无
 envd,回占位 token,数据面控制端口 501。`trafficAccessToken` 为 SDK 兼容字段;数据面
-强制头是 `X-Access-Token`(= `envdAccessToken`,§9.3)。
+强制头是 `X-Access-Token`(= `envdAccessToken`,proxy.md §7)。
 
 ### 4.2 控制面:模板构建 API
 
@@ -425,7 +408,7 @@ transient templateID = transient-<uuidv7>       构建注册期临时句柄,buil
   默认开,SDK 每次数据面调用携带。
 - routesync(external proxy / 路由观察者):版本 1,帧 `[4B LE len][JSON]`,消息
   `register|hello|upsert|delete|bookmark|wake`,路径
-  `PUT /internal/plugin/{id}/register`(config-socket plugin 平面,§9.2)。
+  `PUT /internal/plugin/{id}/register`(config-socket plugin 平面,§6;线格式 proxy.md §6)。
 
 ### 4.6 沙箱配置传递链
 
@@ -594,7 +577,7 @@ serve 在 UDS `paths.config_socket`(默认 `/run/sandbox/orchestrator.socket`,**
 
 **③ plugin 平面** — `PUT /internal/plugin/{id}/register`:一个订阅者(external proxy
 worker,或路由观察者如平台 agent)注册其能力并**持挂该 h2c 连接**——连接本身即它的
-租约 + 路由流(routesync,§9.2)。请求体首帧是 `register{caps}`,之后(route_wake)是
+租约 + 路由流(routesync,线格式见 proxy.md §6)。请求体首帧是 `register{caps}`,之后(route_wake)是
 `wake` 上行;响应体下行 `hello(policy) → upsert* → bookmark → upsert/delete`。能力相互
 **独立、不强制组合**:`subscribe`(`route` | `route_wake`)、`proxy{socket{path}}`
 (声明 orchestrator 兜底网关转发数据面请求的目标 UDS)、`mmds`。**断连即反注册**;同
@@ -639,8 +622,10 @@ id 二次注册自动反注册(并断链)前者。鉴权:配 `paths.plugin_pidfi
 - **key 不落明文**:sqlite 内加密;运行期只在 orchestrator 内存、LaunchSpec env 帧、
   子进程 env(`MANIFEST_KEY`)中;`<sid>.yaml` 非密不含 key。auto-resume 从加密存储
   解出 key 解封快照(数据面唤醒无 api_key 可用)。
-- 数据面另有一对随机 token(`envdAccessToken`/`trafficAccessToken`,create 时铸造、
-  随行存库),语义见 §9.3。
+- 数据面另有 token 与会话密钥,皆系于此根:`envdAccessToken`/`trafficAccessToken`
+  (create 时铸造的随机 token、随行存库,数据面鉴权语义见 proxy.md §7);`MmdsSecret =
+  HMAC-SHA256(manifest_key, "kuasar-mmds-v1:"+sid)`(每沙箱确定性派生的 MMDS 会话签名
+  密钥,`mmds.enabled` 时随路由分发给 proxy 校验 envd 身份,见 proxy.md §8)。
 
 ## 8. 生命周期与状态机
 
@@ -666,7 +651,7 @@ id 二次注册自动反注册(并断链)前者。鉴权:配 `paths.plugin_pidfi
   + StartUnit),LaunchSpec 带 `--restore <snapshot_ref>` → sandbox-ctl 解封恢复。
   - **单飞**:同一 sid 的并发数据面请求经 per-sid single-flight 合并为一次 resume,
     杜绝重复 IP 分配 / attach / StartUnit 竞态。internal 模式 proxy 在请求内同步触发;
-    external 模式经 routesync `Wake` 上行,orchestrator 端同样单飞(§9.1)。
+    external 模式经 routesync `Wake` 上行,orchestrator 端同样单飞(§9.2)。
   - resume 同时是 `POST /sandboxes/{id}/connect` 的实现;带 `timeout` 则顺带续期。
 - **每实例配置**(create/构建经 metadata + `X-Kuasar-Sandbox-*` 头,命名空间化,详见
   §4.6):配置随沙箱持久化(`metadata_json`),resume 时重新解析、全生命周期一致;无白名单
@@ -708,188 +693,58 @@ e2b API/CLI 零改动。
   import(同上校验,且 token 内 id 须等于所连 sid,否则报错并回收误插行),迁移收敛
   为单次 SDK 调用;`import-sandbox` CLI 保留作显式预导入。
 - **状态感知驱动迁移**:暂停态的本地/远程经 `RouteEntry.snap_loc`(`local`|`remote`)随
-  路由流下发(§9.2);订阅 plugin 平面的平台 agent(`subscribe=route`)据此识别哪些 paused
+  路由流下发(proxy.md §6);订阅 plugin 平面的平台 agent(`subscribe=route`)据此识别哪些 paused
   沙箱节点绑定(腾空节点前须先迁移)、哪些已可移植,再按需调 export-sandbox 铸造
   MIGRATION_TOKEN 完成自动迁移。迁移 token 是凭据且会回收源行,故按需铸造、绝不随路由广播。
 - 限制:token 不含系统密钥,但携带沙箱自有 env 与数据面 token,按"沙箱级敏感"对待;
   快照绑定其 guest runtime(erofs 摘要校验),不同 runtime 的节点拒绝导入。
 
-## 9. 数据面 proxy
+## 9. 数据面装配(serve 侧)
 
-proxy 是 L7 反代:按 `Host`(`<port>-<sid>.<domain>`)或 `E2b-Sandbox-Id`/
-`E2b-Sandbox-Port` 头解析 `(sid, port)` → 路由判定 → 校验 `X-Access-Token`(§9.3)→
-转发。`httputil.ReverseProxy{FlushInterval: -1}` 即时刷流(`process.Start`/`WatchDir`/
-`/files` 都是流式),上游走 HTTP/1.1(envd 双栈,Connect 流在 h1 上承载),透传不
-缓冲。路由判定(两种部署形态共用同一函数):
+数据面**转发层**——L7 反代:按 `(sid, port)` 路由到 guest envd / floatingip,逐请求
+鉴权,CONNECT 隧道,MMDS,以及 routesync 线格式——自成一文,见 [proxy.md](proxy.md)。
+本节只讲 orchestrator 控制面对数据面的三项职责:按 `proxy.mode` 装配承载、作路由唯一
+权威向订阅者广播、以及兜底网关。
 
-```
-profile=e2b  且 port ∈ {49983, 49999}  → dial UDS (envd.sock / ci.sock)
-profile=bare 且 port ∈ {49983, 49999}  → 501 (no data plane)
-其余任意用户端口                        → dial floatingip:port
-未知 sid / 挂起超时仍未 running         → 404
-```
+### 9.1 按 proxy.mode 装配
 
-普通 HTTP 请求如上反代;`CONNECT` 请求另走原始 TCP 隧道(§9.5)。
+serve 启动末段按 `proxy.mode`(§3)装配数据面;控制面 `api.<domain>` 始终由
+`api.listen` 提供,按 Host 与数据面(`<port>-<sid>.<domain>`)分流:
 
-### 9.1 proxy 部署模式(internal / external / off)
-
-`proxy.mode` 选数据面如何承载(控制面 `api.<domain>` 始终由 serve 的 `api.listen`
-提供):
-
-| 模式 | 数据面承载 | 进程 | 适用 |
-|---|---|---|---|
-| **internal**(默认) | serve 进程内 proxy | 单二进制 | 简单部署,无额外组件 |
-| **external** | 独立 `orchestrator-ctl proxy` worker(≥1),**SO_REUSEPORT** 共享数据面端口 | serve + N×proxy | 数据面/控制面进程隔离、独立扩缩 |
-| **off** | 拒绝(501) | – | 该节点不提供数据面 |
-
-external 模式拓扑(数据面字节流不经 orchestrator;**worker 主动注册,orchestrator 不拨
-任何人**):
-
-```
- client ──► orchestrator-ctl proxy  :443 (SO_REUSEPORT, N workers share the port)
-                 │ local route table (synced) + per-sid request park
-                 │ running   → check X-Access-Token → dial envd-UDS / floatingip:port
-                 │ paused /  → Wake (upstream) + park → unpark on Upsert(running)
-                 │  missing     park timeout → 404
-                 └─ dials serve's config-socket: PUT /internal/plugin/{id}/register
-                       worker → serve : register(caps) → Wake{sid}
-                       serve → worker : Hello(policy) → Upsert* → Bookmark → Upsert/Delete
- client ──► orchestrator-ctl serve  :443 (fallback: data-plane request hits the
-                 │                        control listener)
-                 └─ forwards to one REGISTERED worker over its UDS (picked by sid hash;
-                    CONNECT → chained CONNECT relay, §9.5)
-```
-
-- **注册即订阅**:worker 经 `--config-socket`/`--id` 在 plugin 平面(§6)注册
-  `subscribe=route_wake` + `proxy{socket}`,持挂连接 = 租约 + 路由流。orchestrator 不再
-  拨 worker——拓扑反转后它只是连接的应答方与路由权威。断连即反注册;同 id 二次注册顶
-  掉(断链)前者。同一平面也接受**非 proxy 观察者**(如平台 agent,`subscribe=route`),
-  借此感知沙箱状态(含暂停态本地/远程,§8.1)而不参与数据面转发。
-- **路由权威在 orchestrator,worker 是缓存**:create/resume/pause/kill 实时广播
-  Upsert/Delete 给所有订阅者;worker 重启 → 自动重连重注册 + 重新同步;订阅滞后 →
-  orchestrator 断开该订阅,worker 重连重同步(有界内存、最终一致)。初始全量不再是单帧
-  快照,而是**逐条 Upsert + 末尾 Bookmark**(§9.2),高密度下发端内存有界。
-- **park**:对 missing/paused sid 的请求先上行 `Wake`(同 sid 去重),再挂起等
-  `Upsert(running)` 回灌解挂;`park_timeout`(策略下推,默认 30s)内未就绪回 404。
-  首个 Bookmark 到达前的请求同样先等同步完成。
-- **运营策略集中下推**:握手 Hello 携带 `Policy{domain, auth_mode, park_timeout_ms}`;
-  worker 的 `--auth`/`--park-timeout` 仅为策略到达前的回退。
-- **兜底转发**:数据面请求误达 serve 监听口时,serve 按 sid 的 FNV 哈希在**活跃注册的
-  worker 集**上挑一个,经其 UDS 反代过去(连接亲和),由 worker 照常处理(含鉴权);
-  `CONNECT` 经链式 CONNECT relay 转发(§9.5)。无 worker 注册时回 502。
-- **多 worker**:plugin 注册 + SO_REUSEPORT + 确定性 MMDS 密钥(§9.4)使 N 个对等
-  worker 进程各自独立注册、各持本地路由表、共享数据口即可工作,无需主从/共享内存。
-- worker 由运维带外管理(`deploy/orchestrator-proxy@.service`),serve 不自动安装;
-  须与 serve 同节点(本地拨 envd-UDS/floatingip)。
-- **可观测**:`proxy.metrics_listen`(serve)/`--metrics-listen`(worker)暴露
-  Prometheus 文本:`data_requests_total{result=ok|unauthorized|notfound|denied|…}`、
-  `gateway_forward_total{result=ok|error|no_worker}` 等。
-
-### 9.2 routesync 协议
-
-订阅者 ↔ orchestrator 的路由分发协议,**帧化 JSON over h2c**(零 gRPC/protobuf)。
-**订阅者是拨号方,orchestrator 是应答方 + 路由权威**:
-
-- 传输:订阅者拨 orchestrator 的 config-socket,发 `PUT /internal/plugin/{id}/register`
-  (plugin 平面,§6,`plugin_pidfile`/socket 0600 鉴权);单 HTTP/2 请求全双工——
-  请求体上行(首帧 `register`,之后 `wake`),响应体下行(`hello`/`upsert`/`bookmark`/
-  `delete`)。持挂该连接即注册租约,断连即反注册;同 id 二次注册顶掉前者。
-- 帧:`[4 字节 LE 长度][JSON]`,单帧上限 1 MiB(每帧仅一条路由 / 一个 wake,无全量帧)。
-- 消息(`type` 字段判别):
-
-  | 方向 | 消息 | 载荷 |
-  |---|---|---|
-  | 订阅者 → orch | `register` | `{subscribe{kind: route\|route_wake}, proxy{socket{path}}, mmds}`(能力,首帧) |
-  | orch → 订阅者 | `hello` | `{version:1, policy{domain, auth_mode, park_timeout_ms}}` |
-  | orch → 订阅者 | `upsert` / `delete` | `route: RouteEntry` / `sid` |
-  | orch → 订阅者 | `bookmark` | —(初始全量结束;订阅者据此判定已同步) |
-  | 订阅者 → orch | `wake` | `sid`(请求 resume;仅 `route_wake`) |
-
-- **初始同步用 bookmark 取代全量快照**:握手后 orchestrator 逐条流式 `upsert`(直接由
-  store 流式扫描喂出,不物化整表/巨帧),末尾发一个 `bookmark` 表示"初始集已发完"。
-  订阅者按一个**同步世代**应用本轮流,收到 bookmark 时清掉本轮未见过的条目——由此
-  无缝回收断连期间发生的删除,且重同步全程旧表仍在服务(无路由空窗)。
-- `RouteEntry = {sid, profile, template_id, state(running|paused|dead), envd_uds,
-  ci_uds, floatingip, access_token, snap_loc, mmds_secret}`——订阅者据此独立服务数据
-  面,无每请求回调。两个新字段对所有订阅者一致下发(不做按角色裁剪):
-  - `snap_loc`:running/dead 为空,否则 `local`(节点绑定的本机快照)或 `remote`
-    (已上传、可移植)。观察者据此判定迁移(§8.1);迁移 token 仍由 export-sandbox 按需
-    铸造,不随路由广播。
-  - `mmds_secret`:该沙箱的 MMDS 会话签名密钥(hex),由 `manifest_key + sid` 确定性派生
-    (§9.4),不服务 MMDS 的订阅者忽略即可。
-- 容错:连接断 → 订阅者指数退避重连重注册(0.2s 起、5s 封顶),重连即重新
-  `register` + 重新同步(逐条 upsert + bookmark);订阅积压 → orchestrator 掐掉该订阅、
-  订阅者重连重同步。Wake 的 resume 由 orchestrator 端单飞去重。
-
-### 9.3 数据面鉴权(X-Access-Token)
-
-- 数据面 token = `envdAccessToken`,头 **`X-Access-Token`**(与原版 e2b 一致;secure
-  沙箱自 SDK v2.0.0 默认开,SDK 每次数据面调用携带)。create 铸造 → 回 SDK → 随路由
-  分发;**proxy 逐请求校验**其与该沙箱 token 一致(常数时间比较)。
-- `proxy.auth ∈ {off | log | enforce}`,默认 **enforce**(不符回 401);`log` 告警但
-  放行;external 模式校验在 worker(策略下推,兜底转发路径上 serve 不校验、由 worker
-  校验)。
-- **例外放行**:`auth=off`;路由无 token(bare);envd 预签名文件 URL(带 `signature`
-  query,envd 自行验签、不带头)。
-- envd 是否**另行**自校验此 token 由 `mmds.enabled` 决定(§9.4)。无论哪种姿态,envd
-  仅经 proxy 的 host-UDS 可达(49983/49999 走 `--connect` UDS,非 floatingip),沙箱
-  间无通路。
-- create 响应同时返回 `trafficAccessToken`(SDK 兼容字段,非强制头)。
-
-### 9.4 envd 鉴权姿态与快照扇出(mmds.enabled)
-
-快照扇出的子沙箱(`export-sandbox --to-template` 或任何 snp 模板 create)由内存恢复,
-其 envd 持**源**沙箱的 token;envd 在 `-isnotfc` 下不允许把 token 改成新身份的值
-(`/init` 仅允许首设/重确认同 token/匹配 MMDS hash),会拒绝子沙箱数据面。单开关
-`mmds.enabled` 选两种姿态,二者都使扇出沙箱数据面可用:
-
-| | `enabled=false`(默认) | `enabled=true` |
+| 模式 | 数据面承载 | 进程 |
 |---|---|---|
-| envd 启动 | `-isnotfc` | FC 模式(去 `-isnotfc`) |
-| envd token | `/init` 省略 `accessToken` → envd 非 secure | 经 MMDS 授权后 `/init` 重置为每身份新 token |
-| 数据面闸门 | 仅 proxy(配置强制 `proxy.auth=enforce`) | proxy + envd(纵深防御) |
-| 扇出 fork | 可用(envd 无 token,故不错配) | 可用(envd 重置为新 token) |
+| **internal**(默认) | serve 进程内 proxy(与控制面同一 `http.Handler`,按 Host 分流) | 单二进制 |
+| **external** | 独立 `orchestrator-ctl proxy` worker(≥1)经 plugin 平面注册、SO_REUSEPORT 共享数据口 | serve + N×proxy |
+| **off** | 拒绝(501) | – |
 
-**MMDS 服务**(`enabled=true`):orchestrator 在 **proxy 组件**内起 Firecracker MMDS
-v2 兼容服务(internal:serve 绑 `mmds.listen`;external:worker `--mmds-listen`,
-数据源是同步来的路由表)。两段式:
+internal 直接在进程内挂转发层;external 下 serve 不绑数据口,改为在 plugin 平面(§6)
+接受 worker 注册并向其广播路由(§9.2),数据面字节流不经 serve。两模式共用同一转发判定
+函数;部署拓扑、SO_REUSEPORT 与确定性 MMDS 密钥(多 worker 对等)等细节见 proxy.md §5,
+转发判定与即时刷流见 proxy.md §4。
 
-1. **`PUT /latest/api/token`**:按请求源 IP(= 沙箱 floatingip,vswitch mgmt-extract
-   已 SNAT)查路由表解析沙箱 id——未注册则 **park 等待**(复用数据面挂起预算,故
-   external 模式无"先注册后轮询"的时序约束),超时回 503(envd 的轮询会重试);
-   命中则回 HMAC 签名、编码了沙箱 id 的 session token(`<sid>.<hmac>`)。
-2. **`GET /`**(头 `X-metadata-token`):校验并解码 session token 取沙箱 id(guest 内
-   代码不可信,不复读源 IP),回 `{instanceID, envID, accessTokenHash}`,
-   `accessTokenHash = hex(sha512(token))`(= envd `keys.HashAccessTokenBytes`)。
+### 9.2 路由权威与广播
 
-session token 的 HMAC 密钥是**每沙箱确定性派生**的 `MmdsSecret = HMAC-SHA256(manifest_key,
-"kuasar-mmds-v1:"+sid)`(`keys.MmdsSecret`),非进程随机:internal 模式 orchestrator 直接
-派生,external 模式经 `RouteEntry.mmds_secret` 同步给 worker(§9.2)。因此任一 worker 铸
-造的 token 在任一 worker 都能校验——多 worker(及节点内故障转移)下 PUT 与 GET 落到不同
-worker 也一致,这正是确定性密钥相对进程随机密钥的关键。
+orchestrator 是路由与生命周期的**唯一权威**:create/resume/pause/kill 实时更新路由,经
+**routesync** 广播 Upsert/Delete 给所有 plugin 平面订阅者(external proxy worker 与路由
+观察者如平台 agent)。订阅者持只读缓存独立服务数据面 / 感知状态,不回调控制面;广播逐条
+upsert + 末尾 bookmark(高密度下发端内存有界)。线格式(帧化 JSON over h2c)、容错重同步、
+`RouteEntry` 字段(含驱动迁移的 `snap_loc`、扇出用的 `mmds_secret`)见 proxy.md §6;
+plugin 平面的注册与鉴权见 §6。
 
-envd 硬编码访问 `169.254.169.254:80`;部署侧用 vswitch
-`--mgmt-service 169.254.169.254:80:<mmds.listen>` 在 eBPF 数据面把该 VIP 直译到
-`mmds.listen`(无 iptables,自动改写回程;loopback target 需 mgmt 设备
-`route_localnet=1`),故本进程不占特权端口、不需 root。配置校验强制
-`proxy.mode != off`(MMDS 寄宿 proxy)。
+- **auto-resume 单飞**:数据面打到 paused 沙箱触发 resume——internal 在请求内同步触发,
+  external 经 routesync `Wake` 上行;同一 sid 的并发请求经 per-sid single-flight 合并为
+  一次 resume(§8)。
+- **envd 鉴权姿态(`mmds.enabled`)**:该开关决定 create 是否给 envd 下发 token、proxy
+  是否寄宿 MMDS 服务——`false` = envd 非 secure、proxy 单闸门(配置强制
+  `proxy.auth=enforce`);`true` = proxy 组件内起 FC MMDS v2、经 `/init` re-key 每身份新
+  token,使快照扇出沙箱数据面可用。姿态对比与 MMDS 两段式协议见 proxy.md §8。
 
-### 9.5 CONNECT 隧道
+### 9.3 兜底网关
 
-数据面除反代普通 HTTP 外,还支持 `CONNECT` 开原始 TCP 隧道(端口转发、非 HTTP 协议)。
-按数据面模型,**CONNECT 目标主机被忽略**(统一是沙箱 floatingip),仅取其端口;沙箱 id
-仍来自 `E2b-Sandbox-Id` 头(或 authority 的 `<port>-<sid>` 标签)。路由解析与
-`X-Access-Token` 校验同普通请求,随后把客户端连接对接到后端(envd-control UDS 或
-floatingip:port)。
-
-一个共享隧道原语承载两种传输:HTTP/1.1 经 `Hijack` + `200 Connection established`,
-HTTP/2 经 `WriteHeader(200)` + 请求/响应流对拷。它覆盖每条数据面路径,即 proxy 直收的
-数据面与控制面转发的数据面都支持 CONNECT:
-
-- **proxy 直收**(及 internal 模式):直接隧道到沙箱;
-- **控制面兜底网关**(external):`httputil.ReverseProxy` 不能隧道 CONNECT,故网关向选中
-  的 worker 经其 UDS 发**链式 CONNECT**(带上 sandbox id + access token),收到 200 后
-  对接——client → 网关 → worker → 沙箱(无环,沿用 h2mux 式链式隧道)。
+数据面请求误达 serve 控制面监听口时(external 模式下客户端未分流到数据口),serve 按
+sid 的 FNV 哈希在**活跃注册的 worker 集**上挑一个,经其 `--socket` UDS 反代过去(连接
+亲和),由 worker 照常处理(含鉴权);`CONNECT` 经链式 CONNECT relay 转发,无 worker
+注册时回 502。链式隧道与转发细节见 proxy.md §9。
 
 ## 10. guest profile:envd 嵌入
 
@@ -902,7 +757,7 @@ HTTP/2 经 `WriteHeader(200)` + 请求/响应流对拷。它覆盖每条数据�
 - **零 sandbox-init 改动**:`/opt/sandbox-runtime` 被 sandbox-init 自动 bind-mount 进
   guest 同名路径,envd 直接作 `launch.exec`:
   `/opt/sandbox-runtime/bin/envd -isnotfc -port 49983`(`mmds.enabled` 时去
-  `-isnotfc`,§9.4),`restart=always`,**以 root(`user: "0:0"`)运行**——envd 需要
+  `-isnotfc`,proxy.md §8),`restart=always`,**以 root(`user: "0:0"`)运行**——envd 需要
   `CAP_SETUID/SETGID` 才能按镜像配置的用户跑工作负载命令(镜像设了 `Config.User` 时
   非 root 的 envd 会 exec EPERM);工作负载本身仍以目标用户执行。
 - envd 是 **sandbox-deps** 的原生构建产物(与 cloud-hypervisor/vmlinux/mkfs.erofs
@@ -923,7 +778,7 @@ HTTP/2 经 `WriteHeader(200)` + 请求/响应流对拷。它覆盖每条数据�
   (`sandbox.network.dns`),并经 `network.hostname` sethostname;launch 与 restore
   均生效。
 - host 在 envd 就绪后调 **`POST /init`**(经 UDS):置 `envVars`、默认用户
-  `user`/workdir `/home/user`、时间戳;仅 `mmds.enabled` 时携带 `accessToken`(§9.4)。
+  `user`/workdir `/home/user`、时间戳;仅 `mmds.enabled` 时携带 `accessToken`(proxy.md §8)。
 
 ## 11. 模板构建(三阶段流水线,构建在沙箱内进行)
 
@@ -962,7 +817,7 @@ microVM(`sandbox-ctl run` 直接子进程);A 阶段就绪探针 = guest 内
   挂载,被 `--skip-mounts` 排除,导出不自吞、工具链不进镜像。
 - **C template**(有 startCmd,显式或自 base 模板继承):**生产 e2b runtime** 冷启
   最终镜像(runtime_ref 冻入快照——模板的子沙箱不得继承构建工具链),envd 为 app
-  (MMDS 姿态随部署,§9.4),`/init` 预置(此后 RPC 携 `X-Access-Token`)。startCmd
+  (MMDS 姿态随部署,proxy.md §8),`/init` 预置(此后 RPC 携 `X-Access-Token`)。startCmd
   **经 envd 启动**(e2b 默认身份 `user`、`/home/user`),流挂至就绪后断开——envd
   不因断流杀进程(其源码明言进程上下文与请求解耦),进程以 **envd 管理进程**身份
   冻入快照,扇出沙箱里 SDK 可 list/connect;readyCmd 以 2s 间隔轮询至成功(预算
@@ -1082,7 +937,7 @@ external worker 的 `--data-listen`),证书同一张。dev:`E2B_API_URL`/
 | `fsck.erofs`/`mkfs.erofs`(deps) | CLI(`deps/build-runtime-e2b.sh`、`deps/build-runtime-builder.sh`) | 确定性重打 e2b / builder runtime(§10、§11) |
 | guest envd | UDS(sandbox-ctl `--connect` 映射);构建流水线另以最小 connect+JSON 客户端调 `process.Start`(steps/startCmd/readyCmd,§11) | 原版不改;协议 pin 见 §4.3/§4.5 |
 | systemd | D-Bus:StartUnit/StopUnit/ResetFailed/ListUnitsByPatterns/Reload | 进程管理 + 单元自装(§5) |
-| `orchestrator-ctl proxy`(external) | UDS routesync(双向 h2c 帧化 JSON)+ 兜底反代 | 同节点、运维带外起;数据口 SO_REUSEPORT 共享(§9.1) |
+| `orchestrator-ctl proxy`(external) | UDS routesync(双向 h2c 帧化 JSON)+ 兜底反代 | 同节点、运维带外起;数据口 SO_REUSEPORT 共享(proxy.md §5) |
 
 不新增导出包;`CGO_ENABLED=0`;依赖层级 = 叶子。
 
@@ -1126,7 +981,7 @@ serve 重启后以 `ListUnitsByPatterns("sandbox-runner@*.service")` 为存活�
 | serve 崩溃/重启 | 控制面与 internal 数据面中断;沙箱(microVM/单元)不受影响 | systemd 重启 → 重启对账收养;external worker 凭本地路由表继续转发 running 流量(Wake 无人应答,paused 唤醒挂起至超时) |
 | proxy worker 崩溃(external) | 该 worker 上的连接断;SO_REUSEPORT 下其余 worker 继续接新连接 | systemd 重启 → worker 重新注册重新同步,无状态恢复 |
 | runner 单元/CH 崩溃 | 该沙箱死(`Restart=no`,有状态不重试) | 对账标 dead;客户重新 create(或从 paused 快照 resume) |
-| routesync 断流 | worker 路由表停更 | 订阅者指数退避重连重注册,重连即重新同步(逐条 upsert + bookmark,§9.2) |
+| routesync 断流 | worker 路由表停更 | 订阅者指数退避重连重注册,重连即重新同步(逐条 upsert + bookmark,proxy.md §6) |
 | sqlite 损坏 | 控制面不可用 | 文件级备份/重建;沙箱单元仍可被 ListUnits 发现并由运维处置 |
 
 ## 15. 测试
@@ -1152,6 +1007,10 @@ sandbox-runtime-e2b.erofs 等),均已注册为 umbrella make 目标,缺前置则
 
 ## 16. See Also
 
+- [proxy.md](proxy.md) —— 数据面转发层:路由判定 / 部署模式(internal/external/off)/
+  routesync / 数据面鉴权 / MMDS / CONNECT 隧道(本文 §9 装配的转发层实现)
+- [node.md](node.md) —— 节点资源控制协议(`sandbox.resources.control_socket` 的对端)
+  与 node-ctl 参考实现
 - `sandbox-runtime/docs/sandbox.md` —— sandbox-ctl:SANDBOX_CONFIG 模式、
   run/snapshot/restore/connect 原语、cgroup 模型
 - `sandbox-vswitch/docs/vswitch.md` —— attach/detach/open-port、floatingip 与
@@ -1160,7 +1019,5 @@ sandbox-runtime-e2b.erofs 等),均已注册为 umbrella make 目标,缺前置则
   `FLATTEN_REGISTRY_*`
 - `sandbox-accelerator/docs/manifest.md` —— manifest 内容键、收敛加密与去重域
   (§7 的存储侧)
-- `sandbox-sentinel/docs/node.md` —— 资源控制协议
-  (`sandbox.resources.control_socket` 的对端)
 - `kuasar-sandbox/docs/deployment.md` —— 节点部署拓扑中本组件的位置与单元安装
 - `kuasar-sandbox/test/demo/DEMO.md` —— e2b CLI/SDK 全流程演示

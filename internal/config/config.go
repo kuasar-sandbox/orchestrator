@@ -19,7 +19,8 @@ import (
 )
 
 // Proxy modes select how the node serves sandbox data-plane traffic
-// (<port>-<sid>.<domain>). See docs/orchestrator.md §"proxy 部署模式".
+// (<port>-<sid>.<domain>). See docs/proxy.md §5 (deployment modes);
+// docs/orchestrator.md §9 covers how serve assembles the chosen mode.
 const (
 	ProxyInternal = "internal" // in-process proxy (default)
 	ProxyExternal = "external" // offloaded to orchestrator-ctl proxy worker processes

@@ -72,6 +72,8 @@ python -c 'from e2b import Sandbox; s = Sandbox.create("e2b-img-<key>"); print(s
 ## 文档
 
 - [docs/orchestrator.md](docs/orchestrator.md) — 编排设计与命令参考:架构 / e2b 契约 /
-  进程管理 / 密钥模型 / 数据面 proxy / 模板构建 / 可靠性 / 测试。
+  进程管理 / 密钥模型 / 数据面装配 / 模板构建 / 可靠性 / 测试。
+- [docs/proxy.md](docs/proxy.md) — 数据面转发层:路由判定 / 部署模式(internal/external/off)/
+  routesync / 数据面鉴权 / MMDS / CONNECT 隧道。
 - [docs/node.md](docs/node.md) — 节点资源控制协议(`sandbox-ctl` 拨号目标)与 node-ctl
   参考实现:准入 / 水位额度 / 主动回收 / 无强一致状态恢复。
