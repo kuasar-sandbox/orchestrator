@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# e2e_obs.sh — store-ctl(obs backend) ↔ real OBS round-trip.
+# e2e_obs.sh — store-ctl(obs backend) ↔ real S3-compatible OBS round-trip.
 #
 # Gated on OBS_E2E=1; credentials and endpoint default to ~/.obsconfig
 # auto-discovery (so dev workstations with obsutil already configured
