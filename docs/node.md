@@ -343,16 +343,6 @@ AdminReclaim     (sandbox_id, target_allocatable)               # 背后 node-ct
                  → Ack (new_allocatable)                        # shrink-only,clamp 到 floor
 ```
 
-通知(控制器推,sandbox-ctl 接;wire 类型与 Client 回调已定义,node-ctl 当前
-不推送——主动收缩与 admin 改值统一经 Heartbeat ack 的 `new_allocatable` 传播):
-
-```
-ReclaimRequest   (token, target_allocatable, deadline_ms)      # 定向收回,deadline 前须到达 target
-                 → ReclaimDone (token)                          # sandbox-ctl 完成回执
-
-UpdateConfig     (token, ...)                                   # 运维动态调
-```
-
 `token`:Admit 时由控制器生成的随机字符串,作为后续所有 RPC 的认证 + 索引。
 重连时 sandbox-ctl 重发 token,控制器验证后绑定到现有 reservation。
 
@@ -376,8 +366,8 @@ UpdateConfig     (token, ...)                                   # 运维动态�
 
 **长连维持**:
 
-- 沙箱进入 startup 后,连接保持活跃;sandbox-ctl 在此连接上发后续 RPC、
-  收 ReclaimRequest/UpdateConfig 推送
+- 沙箱进入 startup 后,连接保持活跃;sandbox-ctl 在此连接上发后续 RPC,并经
+  Heartbeat ack 的 `new_allocatable` 接收 reclaim/admin 的 allocatable 调整
 - 30s 周期 Heartbeat;控制器 90s(3 个周期)未收到 → 视为掉线,触发故障
   处理(详见 §故障域处理)
 
@@ -705,9 +695,7 @@ correlation = independent          # 沙箱独立 burst,可改 50% 同步
 | 单节点最大 N | 越大越好 | 调高 N 直到 OOM 频次 > 阈值 |
 | budget-grant 延迟 P99 | < 50 ms | 控制器内 RPC 计时 |
 | Admit 拒绝率 | < 5%(green/yellow 区) | 控制器计数 |
-| 节点预算利用率 | > 75%(memory) | (node_allocated_mem / allocatable_pool_mem) 时间均值 |
-| Reclaim push 准时率 | > 95% | reclaim deadline 内 sandbox-ctl 完成的比例 |
-| CPU 公平偏差 | < 10%(节点饱和时) | 单沙箱实测 cpu / (allocatable.cpu × physical_cpu / Σ allocatable.cpu) |
+| 节点预算利用率 | > 75%(memory) | (node_allocated_mem / allocatable_pool_mem) 时间均值 || CPU 公平偏差 | < 10%(节点饱和时) | 单沙箱实测 cpu / (allocatable.cpu × physical_cpu / Σ allocatable.cpu) |
 
 ## 10. 跟其他子系统的关系
 

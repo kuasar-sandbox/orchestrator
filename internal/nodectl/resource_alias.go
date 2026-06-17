@@ -35,9 +35,6 @@ const (
 	TypeHeartbeat      = resource.TypeHeartbeat
 	TypeRelease        = resource.TypeRelease
 	TypeAck            = resource.TypeAck
-	TypeReclaimRequest = resource.TypeReclaimRequest
-	TypeReclaimDone    = resource.TypeReclaimDone
-	TypeUpdateConfig   = resource.TypeUpdateConfig
 	TypeReattach       = resource.TypeReattach
 	TypeError          = resource.TypeError
 	TypeAdminDrain     = resource.TypeAdminDrain
