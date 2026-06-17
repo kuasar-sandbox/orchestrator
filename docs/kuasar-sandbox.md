@@ -416,8 +416,7 @@ same content → same key → same ciphertext → dedup on ciphertext
 - salt 控制去重域:同 salt 内去重,不同 salt 间隔离(§4.4)。
 
 代价:对已知明文攻击有理论弱点(可确认某内容是否存在)。对本场景可接受——
-存储的是系统级数据(OS、运行时),非用户敏感数据。chunk 加密另有 fake 模式
-(HMAC+明文,性能基线,生产拒绝),见 `manifest.md`。
+存储的是系统级数据(OS、运行时),非用户敏感数据。
 
 ### 4.4 Salt、Generation 与分代 GC
 

@@ -144,20 +144,6 @@ crypto:
   manifest: aes
 EOF
 
-cat > "$TMPDIR/accelerator-fake.yaml" <<EOF
-manifest:
-  key: "$KEY"
-store:
-  endpoint: 127.0.0.1:$STORE_PORT
-  pool: 2
-  timeout: 10s
-chunker:
-  mode: cdc
-crypto:
-  chunk: fake
-  manifest: fake
-EOF
-
 COMMON="--manifest-config $TMPDIR/accelerator.yaml"
 
 # Ensure both images are available locally before any test starts;
@@ -322,18 +308,7 @@ ok "CDC vs fixed diff completed"
 
 # ============================================================
 echo ""
-echo "=== Test 10: Fake crypto roundtrip ==="
-# crypto mode comes from the config (chunk: fake / manifest: fake);
-# there is no per-invocation --crypto-fake flag.
-MKEY_FAKE=$("$BIN/manifest-ctl" store --manifest-config "$TMPDIR/accelerator-fake.yaml" --no-progress "$TMPDIR/image-a.erofs")
-"$BIN/manifest-ctl" load --manifest-config "$TMPDIR/accelerator-fake.yaml" --output "$TMPDIR/image-a-fake-restored.erofs" --no-progress "$MKEY_FAKE"
-
-H4=$(sha256sum "$TMPDIR/image-a-fake-restored.erofs" | awk '{print $1}')
-assert_eq "$H1" "$H4" "fake crypto store → load roundtrip matches"
-
-# ============================================================
-echo ""
-echo "=== Test 11: stdin store + load roundtrip ==="
+echo "=== Test 10: stdin store + load roundtrip ==="
 # store reads the image from stdin (no positional input) and prints the
 # manifest key; load reconstructs by key. This is the one-step model —
 # no separate put-manifest stage.
@@ -346,7 +321,7 @@ assert_eq "$H1" "$H5" "stdin store + load roundtrip matches original"
 
 # ============================================================
 echo ""
-echo "=== Test 12: Sparse file roundtrip (zero-block optimization) ==="
+echo "=== Test 11: Sparse file roundtrip (zero-block optimization) ==="
 # 8 MiB sparse file: 1 MiB random data + 7 MiB zeros. Verify the
 # all-zero optimization path: most chunks are IsZero, manifest size is
 # small (compressed key table), and round-trip reconstructs identical
@@ -404,7 +379,7 @@ fi
 
 # ============================================================
 echo ""
-echo "=== Test 13: Sparse file with holes (envelope-borne hole metadata) ==="
+echo "=== Test 12: Sparse file with holes (envelope-borne hole metadata) ==="
 # 8 MiB sparse file: 1 MiB random + 7 MiB hole. truncate creates a
 # real filesystem hole (not zero-fill); dd at offset 0 writes the
 # leading data without touching the trailing hole region.
