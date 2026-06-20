@@ -31,22 +31,31 @@ type Node interface {
 	// terminal sandbox state is reported on the route stream; the ack only confirms
 	// receipt + that synchronous preconditions (key installed, template valid) held.
 	HandleCommand(ctx context.Context, cmd *routesync.Command) *routesync.CmdAck
+	// Heartbeat is the node's current water level (live sandbox count, drain),
+	// sent periodically so the registry tracks liveness (the dead-node sweep) and
+	// placement headroom (cluster.md §5.1 / §11).
+	Heartbeat() *routesync.Heartbeat
 }
 
 // Client is a node's node-link client: it dials the registry, registers the
 // node's identity, then streams its sandbox routes while executing registry
 // commands, reconnecting with capped backoff.
 type Client struct {
-	dial     func(ctx context.Context) (net.Conn, error)
-	identity routesync.NodeRegister
-	node     Node
-	log      *slog.Logger
+	dial      func(ctx context.Context) (net.Conn, error)
+	identity  routesync.NodeRegister
+	node      Node
+	heartbeat time.Duration
+	log       *slog.Logger
 }
 
 // New builds a Client. dial returns a fresh connection to the registry's
-// node-link listener (a TCP or mTLS dial).
-func New(dial func(ctx context.Context) (net.Conn, error), identity routesync.NodeRegister, node Node, log *slog.Logger) *Client {
-	return &Client{dial: dial, identity: identity, node: node, log: log}
+// node-link listener (a TCP or mTLS dial); heartbeat is the period between node
+// heartbeats (<=0 → 10s).
+func New(dial func(ctx context.Context) (net.Conn, error), identity routesync.NodeRegister, node Node, heartbeat time.Duration, log *slog.Logger) *Client {
+	if heartbeat <= 0 {
+		heartbeat = 10 * time.Second
+	}
+	return &Client{dial: dial, identity: identity, node: node, heartbeat: heartbeat, log: log}
 }
 
 // Run keeps a single node-link session alive, reconnecting with capped backoff
@@ -125,6 +134,28 @@ func (c *Client) session(ctx context.Context, tr *http2.Transport) error {
 			}
 		}
 	}
+	// Periodic heartbeat (node -> registry): liveness for the dead-node sweep +
+	// water level for placement (cluster.md §5.1 / §11), serialized via the outbox.
+	go func() {
+		t := time.NewTicker(c.heartbeat)
+		defer t.Stop()
+		for {
+			select {
+			case <-sctx.Done():
+				return
+			case <-t.C:
+				hb := c.node.Heartbeat()
+				if hb == nil {
+					continue
+				}
+				select {
+				case outbox <- &routesync.Msg{Type: routesync.TypeHeartbeat, Beat: hb}:
+				case <-sctx.Done():
+					return
+				}
+			}
+		}
+	}()
 	routesync.StreamAuthority(sctx, pw, func() {}, resp.Body, c.node, reg, onUp, outbox, c.log)
 	return sctx.Err()
 }

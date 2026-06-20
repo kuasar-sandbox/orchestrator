@@ -78,6 +78,16 @@ func (o *Orchestrator) HandleCommand(ctx context.Context, cmd *routesync.Command
 	}
 }
 
+// Heartbeat reports the node's water level for the registry (nodelink.Node): the
+// live sandbox count (the placer's headroom-fallback signal). Memory/build pools
+// ride the resource controller; the cluster placer uses Counts.
+func (o *Orchestrator) Heartbeat() *routesync.Heartbeat {
+	o.mu.Lock()
+	count := len(o.reg)
+	o.mu.Unlock()
+	return &routesync.Heartbeat{Counts: count}
+}
+
 func accept(cmd *routesync.Command) *routesync.CmdAck {
 	return &routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted}
 }

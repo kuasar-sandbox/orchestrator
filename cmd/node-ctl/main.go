@@ -154,12 +154,18 @@ func serve(args []string, log *slog.Logger) error {
 			dataEndpoint = cfg.API.Listen
 		}
 		regAddr := cfg.Cluster.Registry
+		hbInterval := 10 * time.Second
+		if cfg.Cluster.HeartbeatInterval != "" {
+			if d, err := time.ParseDuration(cfg.Cluster.HeartbeatInterval); err == nil {
+				hbInterval = d
+			}
+		}
 		nl := nodelink.New(
 			func(dctx context.Context) (net.Conn, error) {
 				return (&net.Dialer{}).DialContext(dctx, "tcp", regAddr)
 			},
 			routesync.NodeRegister{NodeID: nodeID, Labels: cfg.Cluster.Labels, DataEndpoint: dataEndpoint},
-			core, log,
+			core, hbInterval, log,
 		)
 		go nl.Run(ctx)
 		log.Info("node-ctl serve: node-link to cluster registry", "registry", regAddr, "node_id", nodeID)

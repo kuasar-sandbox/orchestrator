@@ -383,10 +383,11 @@ func (r *Registry) updateNodeRegister(ctx context.Context, nr *routesync.NodeReg
 	rec.BuildCapacity = nr.BuildCapacity
 	rec.DataEndpoint = nr.DataEndpoint
 	rec.RuntimeDigest = nr.RuntimeDigest
+	rec.LastHeartbeatUnix = time.Now().Unix()
 	return r.stores.PutNode(ctx, rec)
 }
 
-// updateHeartbeat folds a node's water level into its record.
+// updateHeartbeat folds a node's water level into its record + stamps liveness.
 func (r *Registry) updateHeartbeat(ctx context.Context, nodeID string, hb *routesync.Heartbeat) {
 	rec, found, err := r.stores.GetNode(ctx, nodeID)
 	if err != nil || !found {
@@ -394,7 +395,77 @@ func (r *Registry) updateHeartbeat(ctx context.Context, nodeID string, hb *route
 	}
 	rec.Zone, rec.Allocated, rec.Pool = hb.Zone, hb.Allocated, hb.Pool
 	rec.BuildAlloc, rec.Counts, rec.Draining = hb.BuildAlloc, hb.Counts, hb.Draining
+	rec.LastHeartbeatUnix = time.Now().Unix()
 	_ = r.stores.PutNode(ctx, rec)
+}
+
+// RunReaper periodically sweeps dead nodes until ctx is cancelled (cluster.md
+// §11); cluster-ctl registry runs it in the background.
+func (r *Registry) RunReaper(ctx context.Context, deadAfter time.Duration) {
+	if deadAfter <= 0 {
+		deadAfter = 30 * time.Second
+	}
+	tick := deadAfter / 3
+	if tick < time.Second {
+		tick = time.Second
+	}
+	t := time.NewTicker(tick)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			r.sweepDeadNodes(ctx, deadAfter)
+		}
+	}
+}
+
+// sweepDeadNodes resets the sandboxes of every disconnected node whose last
+// heartbeat predates node_dead_after, then removes the node record (cluster.md
+// §11): READY/RESERVED/PAUSED (node-local snapshot, lost with the node) → reset
+// so the next Reserve re-places; SAVED (remote, unbound) is left untouched.
+func (r *Registry) sweepDeadNodes(ctx context.Context, deadAfter time.Duration) {
+	cutoff := time.Now().Add(-deadAfter).Unix()
+	var dead []string
+	_ = r.stores.RangeNodes(ctx, func(n *NodeRecord) error {
+		if _, connected := r.node(n.NodeID); connected {
+			return nil // a live channel is not dead (a quiet water level is fine)
+		}
+		if n.LastHeartbeatUnix > 0 && n.LastHeartbeatUnix < cutoff {
+			dead = append(dead, n.NodeID)
+		}
+		return nil
+	})
+	if len(dead) == 0 {
+		return
+	}
+	deadSet := make(map[string]bool, len(dead))
+	for _, id := range dead {
+		deadSet[id] = true
+	}
+	// Collect first (the Range callback is read-only), then mutate.
+	var reset []*SandboxRecord
+	_ = r.stores.RangeAllSandboxes(ctx, func(s *SandboxRecord) error {
+		if deadSet[s.NodeID] && (s.State == StateReady || s.State == StateReserved || s.State == StatePaused) {
+			reset = append(reset, &SandboxRecord{Group: s.Group, RouteKey: s.RouteKey, SID: s.SID})
+		}
+		return nil
+	})
+	for _, s := range reset {
+		_ = r.stores.DeleteSandbox(ctx, s.Group, s.RouteKey)
+		r.dropSID(s.SID)
+	}
+	for _, id := range dead {
+		_ = r.stores.DeleteNode(ctx, id)
+	}
+	r.log.Warn("registry: swept dead nodes", "nodes", dead, "sandboxes_reset", len(reset))
+}
+
+func (r *Registry) dropSID(sid string) {
+	r.mu.Lock()
+	delete(r.sidKeys, sid)
+	r.mu.Unlock()
 }
 
 func cas(err error, ok bool) error {

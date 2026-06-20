@@ -67,6 +67,10 @@ func runRegistry(args []string, log *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	// Dead-node sweep (cluster.md §11): reset the sandboxes of nodes whose
+	// node-link dropped and whose last heartbeat predates node_dead_after.
+	go reg.RunReaper(ctx, cfg.Channel.NodeDeadDur())
+
 	mux := http.NewServeMux()
 	mux.HandleFunc(routesync.NodeLinkPath, reg.ServeNodeLink)
 

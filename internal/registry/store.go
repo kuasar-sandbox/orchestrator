@@ -55,6 +55,10 @@ type NodeRecord struct {
 	BuildAlloc    *routesync.BuildResources `json:"build_alloc,omitempty"`
 	Counts        int                       `json:"counts,omitempty"`
 	Draining      bool                      `json:"draining,omitempty"`
+	// LastHeartbeatUnix is the last sign of life (register or heartbeat); the
+	// dead-node sweep (§11) resets a disconnected node whose last beat predates
+	// node_dead_after.
+	LastHeartbeatUnix int64 `json:"last_heartbeat_unix,omitempty"`
 }
 
 // SandboxRecord is a group-sharded sandbox row, keyed (group, route_key).
@@ -98,7 +102,7 @@ func NewStores(kv clusterstore.Store, box *secretbox.Box) *Stores {
 	return &Stores{kv: kv, box: box}
 }
 
-func nodeKey(id string) string    { return nodePrefix + id }
+func nodeKey(id string) string     { return nodePrefix + id }
 func groupKey(group string) string { return groupPrefix + group }
 
 // sandboxKey is sandbox/<group>/<route_key>; group may contain '/', so the
@@ -188,6 +192,18 @@ func (s *Stores) DeleteSandbox(ctx context.Context, group, routeKey string) erro
 // RangeSandboxes streams a group's sandbox rows (cluster.md §8 list = this).
 func (s *Stores) RangeSandboxes(ctx context.Context, group string, fn func(*SandboxRecord) error) error {
 	return s.kv.Range(ctx, sandboxGroupPrefix(group), func(kv clusterstore.KV) error {
+		var r SandboxRecord
+		if err := json.Unmarshal(kv.Value, &r); err != nil {
+			return err
+		}
+		return fn(&r)
+	})
+}
+
+// RangeAllSandboxes streams every sandbox row across groups (the dead-node sweep
+// scans these to reset a failed node's sandboxes, §11).
+func (s *Stores) RangeAllSandboxes(ctx context.Context, fn func(*SandboxRecord) error) error {
+	return s.kv.Range(ctx, sandboxPrefix, func(kv clusterstore.KV) error {
 		var r SandboxRecord
 		if err := json.Unmarshal(kv.Value, &r); err != nil {
 			return err

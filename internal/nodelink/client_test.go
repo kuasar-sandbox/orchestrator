@@ -46,6 +46,7 @@ func (n *fakeNode) Range(ctx context.Context, fn func(routesync.RouteEntry) erro
 func (n *fakeNode) Subscribe() (<-chan routesync.Event, func()) { return n.events, func() {} }
 func (n *fakeNode) OnWake(ctx context.Context, sid string)      {}
 func (n *fakeNode) Policy() routesync.Policy                    { return routesync.Policy{} }
+func (n *fakeNode) Heartbeat() *routesync.Heartbeat             { return &routesync.Heartbeat{} }
 
 func (n *fakeNode) HandleCommand(ctx context.Context, cmd *routesync.Command) *routesync.CmdAck {
 	ack := &routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted}
@@ -85,7 +86,7 @@ func TestNodeLinkReserveRoundTrip(t *testing.T) {
 	client := New(
 		func(ctx context.Context) (net.Conn, error) { return net.Dial("tcp", addr) },
 		routesync.NodeRegister{NodeID: "n1", DataEndpoint: "10.0.0.1:8443"},
-		node, log,
+		node, 50*time.Millisecond, log,
 	)
 	go client.Run(ctx)
 

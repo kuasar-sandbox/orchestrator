@@ -160,3 +160,51 @@ func TestReservePausedResume(t *testing.T) {
 		t.Fatalf("resume result: %+v", res)
 	}
 }
+
+func TestSweepDeadNodes(t *testing.T) {
+	ctx := context.Background()
+	reg := testReg(t)
+	// Disconnected node with a stale heartbeat + a READY sandbox → both swept.
+	reg.stores.PutNode(ctx, &NodeRecord{NodeID: "dead", LastHeartbeatUnix: time.Now().Add(-time.Hour).Unix()})
+	reg.stores.PutSandbox(ctx, &SandboxRecord{Group: "/g", RouteKey: "rk", SID: "sb-1", State: StateReady, NodeID: "dead"})
+	reg.indexSID("sb-1", "/g", "rk")
+	// Connected node with a stale heartbeat → NOT swept (a live channel isn't dead).
+	reg.stores.PutNode(ctx, &NodeRecord{NodeID: "live", LastHeartbeatUnix: time.Now().Add(-time.Hour).Unix()})
+	reg.addNode(&fakeConn{nodeID: "live"})
+	reg.stores.PutSandbox(ctx, &SandboxRecord{Group: "/g2", RouteKey: "rk", SID: "sb-2", State: StateReady, NodeID: "live"})
+
+	reg.sweepDeadNodes(ctx, 30*time.Second)
+
+	if _, found, _ := reg.stores.GetNode(ctx, "dead"); found {
+		t.Fatal("dead node not swept")
+	}
+	if _, _, found, _ := reg.stores.GetSandbox(ctx, "/g", "rk"); found {
+		t.Fatal("dead node's sandbox not reset")
+	}
+	if _, found, _ := reg.stores.GetNode(ctx, "live"); !found {
+		t.Fatal("connected node wrongly swept")
+	}
+	if _, _, found, _ := reg.stores.GetSandbox(ctx, "/g2", "rk"); !found {
+		t.Fatal("connected node's sandbox wrongly reset")
+	}
+}
+
+func TestSweepKeepsFreshAndSaved(t *testing.T) {
+	ctx := context.Background()
+	reg := testReg(t)
+	// Fresh (recent) disconnected node → not stale → kept.
+	reg.stores.PutNode(ctx, &NodeRecord{NodeID: "fresh", LastHeartbeatUnix: time.Now().Unix()})
+	// Stale disconnected node carrying a SAVED (unbound) sandbox → node swept,
+	// SAVED left for re-placement elsewhere.
+	reg.stores.PutNode(ctx, &NodeRecord{NodeID: "dead", LastHeartbeatUnix: time.Now().Add(-time.Hour).Unix()})
+	reg.stores.PutSandbox(ctx, &SandboxRecord{Group: "/g", RouteKey: "rk", SID: "sb-s", State: StateSaved, NodeID: "dead"})
+
+	reg.sweepDeadNodes(ctx, 30*time.Second)
+
+	if _, found, _ := reg.stores.GetNode(ctx, "fresh"); !found {
+		t.Fatal("fresh disconnected node wrongly swept")
+	}
+	if _, _, found, _ := reg.stores.GetSandbox(ctx, "/g", "rk"); !found {
+		t.Fatal("SAVED sandbox wrongly reset (it is unbound)")
+	}
+}

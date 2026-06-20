@@ -87,10 +87,11 @@ type ResourceListenConfig struct {
 // ClusterConfig connects this node to a cluster-ctl registry over node-link
 // (node.md §10). Empty Registry = standalone single-node (no cluster).
 type ClusterConfig struct {
-	Registry     string            `yaml:"registry"`      // registry node-link addr host:port; "" = standalone
-	NodeID       string            `yaml:"node_id"`       // this node's id; "" = hostname
-	Labels       map[string]string `yaml:"labels"`        // zone / pool / slot / node (nodeSelectors)
-	DataEndpoint string            `yaml:"data_endpoint"` // host:port the router forwards the data plane to
+	Registry          string            `yaml:"registry"`           // registry node-link addr host:port; "" = standalone
+	NodeID            string            `yaml:"node_id"`            // this node's id; "" = hostname
+	Labels            map[string]string `yaml:"labels"`             // zone / pool / slot / node (nodeSelectors)
+	DataEndpoint      string            `yaml:"data_endpoint"`      // host:port the router forwards the data plane to
+	HeartbeatInterval string            `yaml:"heartbeat_interval"` // node-link heartbeat period; "" = 10s
 }
 
 // APIConfig is the north control plane + TLS.
