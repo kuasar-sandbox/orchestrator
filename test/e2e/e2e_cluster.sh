@@ -141,7 +141,7 @@ cat > "$WORK/cluster.yaml" <<EOF
 domain: $DOMAIN
 store: { kind: sqlite, dsn: $WORK/cluster/registry.db }
 group_config: { encryption_key: "$ENC2" }
-channel: { listen: 127.0.0.1:$REG_PORT }
+channel: { listen: 127.0.0.1:$REG_PORT, heartbeat_interval: 2s, node_dead_after: 6s }
 op: { listen: $OP_SOCK }
 reserve: { park_timeout: 90s }
 router: { listen: 127.0.0.1:$ROUTER_PORT, data_plane_auth: off }
@@ -154,7 +154,7 @@ encryption_key: "$ENC"
 manifest_config: $WORK/manifest.yaml
 paths: { run_root: $WORK/run, base_root: $WORK/lib, config_socket: $WORK/node-ctl.socket }
 units: { dir: $UNIT_DIR }
-cluster: { registry: "127.0.0.1:$REG_PORT", node_id: n1, data_endpoint: "127.0.0.1:$PORT" }
+cluster: { registry: "127.0.0.1:$REG_PORT", node_id: n1, data_endpoint: "127.0.0.1:$PORT", heartbeat_interval: 2s }
 sandbox:
   timeout_sec: 120
   network: { switch: $SWITCH }
@@ -168,7 +168,7 @@ builder:
 checkpoint: { mode: remote }
 EOF
 "$BIN/node-ctl" serve --config "$WORK/config.yaml" >"$WORK/orch.log" 2>&1 &
-PIDS+=($!)
+NODE_PID=$!; PIDS+=($NODE_PID)
 for _ in $(seq 1 30); do
     curl -sS --noproxy '*' -o /dev/null "http://127.0.0.1:$PORT/health" -H "Host: api.$DOMAIN" 2>/dev/null && break
     kill -0 "${PIDS[-1]}" 2>/dev/null || { sed 's/^/  /' "$WORK/orch.log"; skip "node-ctl exited"; }
@@ -254,5 +254,16 @@ case "$DATA_CODE" in
     *) echo "== router log =="; sed 's/^/  router| /' "$WORK/router.log" | tail -20; fail "data-plane forward to envd failed (http $DATA_CODE)";;
 esac
 
+# ---- dead-node sweep: kill node-ctl; the registry reaps its sandbox (§11) ----
+echo "==> killing node-ctl (pid $NODE_PID); expecting the registry to sweep $SID after node_dead_after (6s)"
+kill -9 "$NODE_PID" 2>/dev/null
+swept=0
+for _ in $(seq 1 20); do
+    code=$(curl -sS --noproxy '*' --unix-socket "$OP_SOCK" -o /dev/null -w '%{http_code}' "http://op/op/route?sid=$SID" 2>/dev/null || echo 000)
+    [ "$code" = "404" ] && { swept=1; break; }
+    sleep 1
+done
+[ "$swept" = "1" ] && echo "==> PASS: registry swept the dead node's sandbox (op /route -> 404)" || { sed 's/^/  reg| /' "$WORK/registry.log" | tail -15; fail "dead-node sweep did not reset $SID"; }
+
 echo
-echo "==> e2e_cluster: OK   (group $GROUP, sandbox $SID on node n1 via the cluster control plane)"
+echo "==> e2e_cluster: OK   (group $GROUP, sandbox $SID on node n1 via the cluster control plane + dead-node sweep)"
