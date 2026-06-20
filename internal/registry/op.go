@@ -10,8 +10,10 @@ import (
 // Phase 3 ships reserve + route resolution for the router; the scaler's view
 // subscription + the resumable watch land with later phases.
 const (
-	OpReservePath = "/op/reserve" // POST ?group=&route_key= -> ReserveResult
-	OpRoutePath   = "/op/route"   // GET  ?sid=             -> RouteResolve
+	OpReservePath      = "/op/reserve"       // POST ?group=&route_key= -> ReserveResult
+	OpRoutePath        = "/op/route"         // GET  ?sid=              -> RouteResolve
+	OpReserveBuildPath = "/op/reserve-build" // POST ?group=            -> ReserveResult (build node)
+	OpGroupPath        = "/op/group"         // POST ?group=&template_ref= -> set template_ref
 )
 
 // RouteResolve is the data-plane forwarding target the router needs for a sid
@@ -31,6 +33,26 @@ type RouteResolve struct {
 func (r *Registry) ServeOp(mux *http.ServeMux) {
 	mux.HandleFunc(OpReservePath, r.serveReserve)
 	mux.HandleFunc(OpRoutePath, r.serveRoute)
+	mux.HandleFunc(OpReserveBuildPath, r.serveReserveBuild)
+	mux.HandleFunc(OpGroupPath, r.serveGroup)
+}
+
+func (r *Registry) serveReserveBuild(w http.ResponseWriter, req *http.Request) {
+	res, err := r.ReserveBuild(req.Context(), req.URL.Query().Get("group"))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+	writeJSON(w, res)
+}
+
+func (r *Registry) serveGroup(w http.ResponseWriter, req *http.Request) {
+	q := req.URL.Query()
+	if err := r.SetGroupTemplate(req.Context(), q.Get("group"), q.Get("template_ref")); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (r *Registry) serveReserve(w http.ResponseWriter, req *http.Request) {
