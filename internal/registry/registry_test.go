@@ -91,6 +91,49 @@ func TestReserveSandboxNoNode(t *testing.T) {
 	}
 }
 
+func TestSendAndWaitAck(t *testing.T) {
+	reg := testReg(t)
+	conn := &fakeConn{nodeID: "n1", onCmd: func(cmd *routesync.Command) {
+		go reg.ackCommand(&routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted})
+	}}
+	ack, err := reg.sendAndWait(context.Background(), conn, &routesync.Command{CmdID: "c1", Kind: routesync.CmdKeyPut}, 2*time.Second)
+	if err != nil {
+		t.Fatalf("sendAndWait: %v", err)
+	}
+	if ack.Status != routesync.AckAccepted {
+		t.Fatalf("ack: %+v", ack)
+	}
+}
+
+func TestSendAndWaitTimeout(t *testing.T) {
+	reg := testReg(t)
+	conn := &fakeConn{nodeID: "n1"} // never acks
+	if _, err := reg.sendAndWait(context.Background(), conn, &routesync.Command{CmdID: "c2", Kind: routesync.CmdKeyPut}, 100*time.Millisecond); err == nil {
+		t.Fatal("expected timeout waiting for an ack")
+	}
+}
+
+func TestCreateRejectFastFails(t *testing.T) {
+	ctx := context.Background()
+	reg := testReg(t)
+	reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"})
+	conn := &fakeConn{nodeID: "n1", onCmd: func(cmd *routesync.Command) {
+		if cmd.Kind == routesync.CmdCreate {
+			go reg.ackCommand(&routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckRejected, Reason: "bad template"})
+		}
+	}}
+	reg.addNode(conn)
+
+	start := time.Now()
+	_, err := reg.ReserveSandbox(ctx, "/g", "rk", nil)
+	if err == nil {
+		t.Fatal("expected reserve to fail on a rejected create")
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("reserve took %v; expected fast-fail on reject (park_timeout is 5s)", elapsed)
+	}
+}
+
 func TestReservePausedResume(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)

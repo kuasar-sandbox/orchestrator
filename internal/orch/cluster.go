@@ -19,27 +19,43 @@ import (
 // terminal state on the route stream (routes.go already carries the cluster
 // (group, route_key) identity, so a registry Reserve converges on it).
 
-// HandleCommand executes a registry node-link command. The terminal sandbox
-// state is reported back via the route stream, which a registry Reserve waits on
-// (not on an ack), so this need only kick off the action.
-func (o *Orchestrator) HandleCommand(ctx context.Context, cmd *routesync.Command) {
+// HandleCommand executes a registry node-link command and returns a receipt ack
+// (cluster.md §5.1): accepted once the synchronous preconditions hold (key
+// installed, template valid), rejected otherwise. Slow work (a boot/resume/
+// teardown) runs asynchronously so the ack is prompt and the node-link reader
+// isn't blocked; the terminal sandbox state is reported on the route stream,
+// which a Reserve waits on.
+func (o *Orchestrator) HandleCommand(ctx context.Context, cmd *routesync.Command) *routesync.CmdAck {
 	switch cmd.Kind {
 	case routesync.CmdCreate:
-		if _, err := o.CreateCluster(ctx, cmd); err != nil {
-			o.log.Error("cluster create", "sid", cmd.SID, "group", cmd.Group, "err", err)
+		manifestKey, tmpl, err := o.precheckCluster(ctx, cmd)
+		if err != nil {
+			return reject(cmd, err)
 		}
+		go func() {
+			if _, err := o.bootCluster(context.Background(), cmd, manifestKey, tmpl); err != nil {
+				o.log.Error("cluster create", "sid", cmd.SID, "group", cmd.Group, "err", err)
+			}
+		}()
+		return accept(cmd)
 	case routesync.CmdConnect:
-		if err := o.connectCluster(ctx, cmd.SID); err != nil {
-			o.log.Error("cluster connect", "sid", cmd.SID, "err", err)
-		}
+		go func() {
+			if err := o.connectCluster(context.Background(), cmd.SID); err != nil {
+				o.log.Error("cluster connect", "sid", cmd.SID, "err", err)
+			}
+		}()
+		return accept(cmd)
 	case routesync.CmdDelete:
-		if err := o.deleteCluster(ctx, cmd.SID); err != nil {
-			o.log.Error("cluster delete", "sid", cmd.SID, "err", err)
-		}
+		go func() {
+			if err := o.deleteCluster(context.Background(), cmd.SID); err != nil {
+				o.log.Error("cluster delete", "sid", cmd.SID, "err", err)
+			}
+		}()
+		return accept(cmd)
 	case routesync.CmdKeyPut, routesync.CmdKeyRenew:
-		// Key distribution (cluster.md §7.6): the registry pushes the group's
-		// manifest key into the node's allowlist (a TTL lease) so create can
-		// resolve it by fingerprint.
+		// Key distribution (cluster.md §7.6): install the group's manifest key into
+		// the node's allowlist (a TTL lease) so create can resolve it by fingerprint.
+		// The ack confirms installation — a build forward (Reserve) gates on it.
 		if cmd.ManifestKey != "" {
 			var ttl int64
 			if cmd.ExpiresUnix > 0 {
@@ -48,31 +64,59 @@ func (o *Orchestrator) HandleCommand(ctx context.Context, cmd *routesync.Command
 				}
 			}
 			if _, err := o.st.AddManifestKey(ctx, cmd.ManifestKey, "cluster", ttl, ""); err != nil {
-				o.log.Error("cluster key_put", "fp", cmd.KeyFingerprint, "err", err)
+				return reject(cmd, err)
 			}
 		}
+		return accept(cmd)
 	case routesync.CmdKeyDrop:
-		// the node's lazy lease expiry reclaims the key; explicit drop-by-fingerprint is Phase 7.
-		o.log.Debug("cluster key_drop", "fp", cmd.KeyFingerprint)
+		if err := o.dropClusterKey(ctx, cmd.KeyFingerprint); err != nil {
+			return reject(cmd, err)
+		}
+		return accept(cmd)
 	default:
-		o.log.Warn("cluster: unhandled command", "kind", cmd.Kind, "sid", cmd.SID)
+		return reject(cmd, fmt.Errorf("unhandled command kind %q", cmd.Kind))
 	}
 }
 
-// CreateCluster boots a sandbox the registry placed here (node-link create): the
-// registry-minted sid, the group's snapshot template, the manifest key the node
-// holds (matched by fingerprint), and the cluster (group, route_key) metadata. It
-// mirrors Create but with an external sid + a fingerprint-resolved key (no api
-// key — the registry already authorized; the key arrives via predistribution).
+func accept(cmd *routesync.Command) *routesync.CmdAck {
+	return &routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted}
+}
+
+func reject(cmd *routesync.Command, err error) *routesync.CmdAck {
+	return &routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckRejected, Reason: err.Error()}
+}
+
+// CreateCluster is the synchronous precheck + boot of a node-link create. The
+// async path (HandleCommand) splits it so the ack is prompt; callers/tests that
+// want the result synchronously use this.
 func (o *Orchestrator) CreateCluster(ctx context.Context, cmd *routesync.Command) (*types.Sandbox, error) {
-	manifestKey, err := o.resolveByFingerprint(ctx, cmd.KeyFingerprint)
+	manifestKey, tmpl, err := o.precheckCluster(ctx, cmd)
 	if err != nil {
 		return nil, err
 	}
+	return o.bootCluster(ctx, cmd, manifestKey, tmpl)
+}
+
+// precheckCluster resolves the manifest key (by the fingerprint the registry
+// predistributed) and the snapshot template — the fast, synchronous preconditions
+// whose failure is a rejected ack (rather than a slow create that fails only by
+// Reserve timeout).
+func (o *Orchestrator) precheckCluster(ctx context.Context, cmd *routesync.Command) (string, types.TemplateID, error) {
+	manifestKey, err := o.resolveByFingerprint(ctx, cmd.KeyFingerprint)
+	if err != nil {
+		return "", types.TemplateID{}, err
+	}
 	tmpl, err := types.ParseTemplateID(cmd.TemplateRef)
 	if err != nil {
-		return nil, fmt.Errorf("cluster create: template %q: %w", cmd.TemplateRef, err)
+		return "", types.TemplateID{}, fmt.Errorf("cluster create: template %q: %w", cmd.TemplateRef, err)
 	}
+	return manifestKey, tmpl, nil
+}
+
+// bootCluster builds + launches the sandbox (registry-minted sid, resolved key,
+// cluster (group, route_key) metadata) and publishes its route — which satisfies
+// the registry's Reserve.
+func (o *Orchestrator) bootCluster(ctx context.Context, cmd *routesync.Command, manifestKey string, tmpl types.TemplateID) (*types.Sandbox, error) {
 	envdTok, _ := keys.MintToken()
 	trafTok, _ := keys.MintToken()
 
@@ -161,4 +205,12 @@ func (o *Orchestrator) deriveSandboxAPIKey(ctx context.Context, sid string) (str
 		return "", err
 	}
 	return apikey.Mint(raw)
+}
+
+// dropClusterKey removes a predistributed manifest key from the node's allowlist
+// by fingerprint (cluster.md §7.6 lease withdrawal). 7a relies on the node's lazy
+// TTL-lease expiry to reclaim it; 7c wires explicit removal-by-fingerprint.
+func (o *Orchestrator) dropClusterKey(ctx context.Context, fingerprint string) error {
+	o.log.Debug("cluster key_drop (lazy lease expiry reclaims; explicit drop is 7c)", "fp", fingerprint)
+	return nil
 }

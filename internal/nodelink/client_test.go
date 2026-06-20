@@ -47,9 +47,10 @@ func (n *fakeNode) Subscribe() (<-chan routesync.Event, func()) { return n.event
 func (n *fakeNode) OnWake(ctx context.Context, sid string)      {}
 func (n *fakeNode) Policy() routesync.Policy                    { return routesync.Policy{} }
 
-func (n *fakeNode) HandleCommand(ctx context.Context, cmd *routesync.Command) {
+func (n *fakeNode) HandleCommand(ctx context.Context, cmd *routesync.Command) *routesync.CmdAck {
+	ack := &routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted}
 	if cmd.Kind != routesync.CmdCreate {
-		return
+		return ack
 	}
 	e := routesync.RouteEntry{
 		SandboxID: cmd.SID, Group: cmd.Group, RouteKey: cmd.RouteKey,
@@ -59,6 +60,7 @@ func (n *fakeNode) HandleCommand(ctx context.Context, cmd *routesync.Command) {
 	n.routes[cmd.SID] = e
 	n.mu.Unlock()
 	n.events <- routesync.Event{Kind: routesync.TypeUpsert, Route: e}
+	return ack
 }
 
 func TestNodeLinkReserveRoundTrip(t *testing.T) {

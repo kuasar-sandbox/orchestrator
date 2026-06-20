@@ -2,6 +2,7 @@ package registry
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/routesync"
@@ -27,11 +28,18 @@ func (r *Registry) ReserveBuild(ctx context.Context, group string) (*ReserveResu
 	}
 	if g, gok, _ := r.stores.GetGroupByID(ctx, group); gok && g.ManifestKey != "" {
 		fp := keyFingerprint(g.ManifestKey)
-		if err := conn.send(&routesync.Command{
+		// Gate on the key being installed: the build register arrives over the data
+		// plane (HTTP) and races this channel command, so wait for the node's ack
+		// before handing the node back to the router (cluster.md §5.1, §7.6).
+		ack, err := r.sendAndWait(ctx, conn, &routesync.Command{
 			CmdID: newID(), Kind: routesync.CmdKeyPut, KeyFingerprint: fp,
 			ManifestKey: g.ManifestKey, ExpiresUnix: time.Now().Add(3 * time.Hour).Unix(),
-		}); err != nil {
-			return nil, err
+		}, 10*time.Second)
+		if err != nil {
+			return nil, fmt.Errorf("registry: build key predistribution: %w", err)
+		}
+		if ack.Status != routesync.AckAccepted {
+			return nil, fmt.Errorf("registry: build node rejected key: %s", ack.Reason)
 		}
 	}
 	return &ReserveResult{NodeID: nodeID, DataEndpoint: r.nodeDataEndpoint(ctx, nodeID)}, nil

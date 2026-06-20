@@ -85,9 +85,12 @@ func (r *Registry) ServeNodeLink(w http.ResponseWriter, req *http.Request) {
 			if m.Beat != nil {
 				r.updateHeartbeat(ctx, nr.NodeID, m.Beat)
 			}
-		case routesync.TypeBookmark, routesync.TypeCmdAck:
-			// initial-sync marker / command ack: a Reserve waits on the running
-			// route event, not the ack, so these need no action in the skeleton.
+		case routesync.TypeCmdAck:
+			// Command receipt: wakes a sendAndWait (key gating) or fast-fails a
+			// rejected lifecycle command's Reserve (cluster.md §5.1).
+			r.ackCommand(m.Ack)
+		case routesync.TypeBookmark:
+			// initial-sync marker; the route stream itself converges state.
 		}
 	}
 }

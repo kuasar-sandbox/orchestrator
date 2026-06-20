@@ -26,9 +26,11 @@ import (
 type Node interface {
 	routesync.Source
 	// HandleCommand executes a registry lifecycle / key command (create / connect
-	// / delete / key_*). The terminal sandbox state is reported back on the route
-	// stream (Source), which a registry Reserve waits on — not on an ack.
-	HandleCommand(ctx context.Context, cmd *routesync.Command)
+	// / delete / key_*) and returns a receipt ack (accepted, or rejected on a
+	// precondition failure). Slow work (a boot/resume) runs asynchronously and the
+	// terminal sandbox state is reported on the route stream; the ack only confirms
+	// receipt + that synchronous preconditions (key installed, template valid) held.
+	HandleCommand(ctx context.Context, cmd *routesync.Command) *routesync.CmdAck
 }
 
 // Client is a node's node-link client: it dials the registry, registers the
@@ -112,11 +114,17 @@ func (c *Client) session(ctx context.Context, tr *http2.Transport) error {
 	// reusing the shared authority loop. Subscribe(kind=registry) makes the loop
 	// stream routes; onUp dispatches commands.
 	reg := routesync.Register{Subscribe: &routesync.Subscribe{Kind: routesync.KindRegistry}}
+	outbox := make(chan *routesync.Msg, 32)
 	onUp := func(uctx context.Context, m *routesync.Msg) {
 		if m.Type == routesync.TypeCommand && m.Cmd != nil {
-			c.node.HandleCommand(uctx, m.Cmd)
+			if ack := c.node.HandleCommand(uctx, m.Cmd); ack != nil {
+				select {
+				case outbox <- &routesync.Msg{Type: routesync.TypeCmdAck, Ack: ack}:
+				case <-uctx.Done():
+				}
+			}
 		}
 	}
-	routesync.StreamAuthority(sctx, pw, func() {}, resp.Body, c.node, reg, onUp, c.log)
+	routesync.StreamAuthority(sctx, pw, func() {}, resp.Body, c.node, reg, onUp, outbox, c.log)
 	return sctx.Err()
 }

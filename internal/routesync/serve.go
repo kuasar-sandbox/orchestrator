@@ -79,7 +79,7 @@ func ServeAuthority(ctx context.Context, w io.Writer, flush func(), body io.Read
 		return
 	}
 	flush()
-	StreamAuthority(ctx, w, flush, body, src, reg, onUp, log)
+	StreamAuthority(ctx, w, flush, body, src, reg, onUp, nil, log)
 }
 
 // StreamAuthority runs the route-stream half of an authority connection WITHOUT
@@ -90,7 +90,11 @@ func ServeAuthority(ctx context.Context, w io.Writer, flush func(), body io.Read
 // The proxy plane reaches it via ServeAuthority (after a Hello); the cluster
 // node-link reaches it directly after writing its NodeRegister, so the node — the
 // route authority that DIALS the registry — reuses the same streaming loop.
-func StreamAuthority(ctx context.Context, w io.Writer, flush func(), body io.Reader, src Source, reg Register, onUp func(context.Context, *Msg), log *slog.Logger) {
+//
+// outbox (nil for the proxy plane) carries up-frames the up-handler produces —
+// the node-link's command acks — so they serialize through this single writer
+// alongside the route deltas rather than racing it.
+func StreamAuthority(ctx context.Context, w io.Writer, flush func(), body io.Reader, src Source, reg Register, onUp func(context.Context, *Msg), outbox <-chan *Msg, log *slog.Logger) {
 	sctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -137,6 +141,11 @@ func StreamAuthority(ctx context.Context, w io.Writer, flush func(), body io.Rea
 		select {
 		case <-sctx.Done():
 			return
+		case m := <-outbox:
+			if err := WriteMsg(w, m); err != nil {
+				return
+			}
+			flush()
 		case ev, ok := <-ch:
 			if !ok {
 				return // lagged + dropped by the source; the subscriber reconnects + re-syncs

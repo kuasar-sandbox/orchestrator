@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"log/slog"
 	"sync"
 	"time"
@@ -40,10 +41,12 @@ type Registry struct {
 	parkTimeout time.Duration
 	log         *slog.Logger
 
-	mu       sync.Mutex
-	nodes    map[string]nodeConn     // node_id -> channel
-	inflight map[string]*reserveCall // single-flight ReserveSandbox per (group,route_key)
-	sidKeys  map[string][2]string    // sid -> {group, route_key} (delete-by-sid from the route stream)
+	mu        sync.Mutex
+	nodes     map[string]nodeConn               // node_id -> channel
+	inflight  map[string]*reserveCall           // single-flight ReserveSandbox per (group,route_key)
+	sidKeys   map[string][2]string              // sid -> {group, route_key} (delete-by-sid from the route stream)
+	acks      map[string]chan *routesync.CmdAck // cmd_id -> ack waiter (synchronous key commands)
+	cmdFlight map[string]string                 // create/connect cmd_id -> flightKey (ack-reject fast-fails Reserve)
 }
 
 // reserveCall is one in-flight ReserveSandbox; joiners wait on done, the channel
@@ -79,6 +82,8 @@ func New(stores *Stores, placer Placer, parkTimeout time.Duration, log *slog.Log
 		nodes:       make(map[string]nodeConn),
 		inflight:    make(map[string]*reserveCall),
 		sidKeys:     make(map[string][2]string),
+		acks:        make(map[string]chan *routesync.CmdAck),
+		cmdFlight:   make(map[string]string),
 	}
 }
 
@@ -141,7 +146,9 @@ func (r *Registry) startReserve(ctx context.Context, group, routeKey string, rec
 		if _, ok, err := r.stores.CASSandbox(ctx, &reserved, rev); err != nil || !ok {
 			return cas(err, ok)
 		}
-		return conn.send(&routesync.Command{CmdID: newID(), Kind: routesync.CmdConnect, SID: rec.SID})
+		ccmd := &routesync.Command{CmdID: newID(), Kind: routesync.CmdConnect, SID: rec.SID}
+		r.trackCmd(ccmd.CmdID, flightKey(group, routeKey))
+		return conn.send(ccmd)
 	}
 
 	// NONE / SAVED: place + create.
@@ -181,7 +188,67 @@ func (r *Registry) startReserve(ctx context.Context, group, routeKey string, rec
 			}
 		}
 	}
+	r.trackCmd(cmd.CmdID, flightKey(group, routeKey))
 	return conn.send(cmd)
+}
+
+// sendAndWait sends a command and blocks until the node acks it (or timeout) — for
+// synchronous commands (key_put/renew/drop), so a build forward gates on the key
+// being installed (cluster.md §5.1) instead of racing it over the data plane.
+func (r *Registry) sendAndWait(ctx context.Context, conn nodeConn, cmd *routesync.Command, timeout time.Duration) (*routesync.CmdAck, error) {
+	ch := make(chan *routesync.CmdAck, 1)
+	r.mu.Lock()
+	r.acks[cmd.CmdID] = ch
+	r.mu.Unlock()
+	defer func() {
+		r.mu.Lock()
+		delete(r.acks, cmd.CmdID)
+		r.mu.Unlock()
+	}()
+	if err := conn.send(cmd); err != nil {
+		return nil, err
+	}
+	wctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	select {
+	case ack := <-ch:
+		return ack, nil
+	case <-wctx.Done():
+		return nil, wctx.Err()
+	}
+}
+
+// trackCmd registers a lifecycle command's cmd_id against its single-flight key so
+// a rejected ack fast-fails the Reserve (instead of waiting out park_timeout).
+func (r *Registry) trackCmd(cmdID, key string) {
+	r.mu.Lock()
+	r.cmdFlight[cmdID] = key
+	r.mu.Unlock()
+}
+
+// ackCommand handles a node's CmdAck: wake a sendAndWait waiter, or fast-fail the
+// Reserve a rejected lifecycle command belongs to.
+func (r *Registry) ackCommand(ack *routesync.CmdAck) {
+	if ack == nil {
+		return
+	}
+	r.mu.Lock()
+	ch, isWait := r.acks[ack.CmdID]
+	fk, isFlight := r.cmdFlight[ack.CmdID]
+	if isFlight {
+		delete(r.cmdFlight, ack.CmdID)
+	}
+	r.mu.Unlock()
+	if isWait {
+		select {
+		case ch <- ack:
+		default:
+		}
+		return
+	}
+	if isFlight && ack.Status == routesync.AckRejected {
+		r.finish(fk, nil, fmt.Errorf("registry: node rejected command: %s", ack.Reason))
+	}
 }
 
 // applyRoute is called by the channel reader for each sandbox route the node
