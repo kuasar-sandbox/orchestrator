@@ -12,7 +12,7 @@
 
 SHELL := /bin/bash
 
-.PHONY: all build node-ctl e2b-key-ctl sandbox-runtime-e2b sandbox-runtime-builder \
+.PHONY: all build node-ctl cluster-ctl e2b-key-ctl sandbox-runtime-e2b sandbox-runtime-builder \
         test vet bench test-e2e test-e2e-orchestrator test-e2e-proxy test-e2e-node-ctl clean help
 
 # ---------------------------------------------------------------------------
@@ -63,7 +63,7 @@ all: build
 
 # `build` ships the daemon + the e2b key tool. sandbox-runtime-e2b is opt-in
 # (needs envd + a base runtime), invoked explicitly or by the umbrella's deps stage.
-build: node-ctl e2b-key-ctl
+build: node-ctl cluster-ctl e2b-key-ctl
 
 # e2b-key-ctl: pure-derivation tool to mint e2b API keys from a manifest key.
 e2b-key-ctl:
@@ -78,6 +78,12 @@ node-ctl:
 	@mkdir -p $(BINDIR)
 	GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=0 $(GO) build $(GO_BUILD_FLAGS) -o $(BINDIR)/node-ctl ./cmd/node-ctl
 	$(call link_bin,node-ctl)
+
+# cluster-ctl: the cluster control plane (registry / router / scaler, cluster.md).
+cluster-ctl:
+	@mkdir -p $(BINDIR)
+	GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=0 $(GO) build $(GO_BUILD_FLAGS) -o $(BINDIR)/cluster-ctl ./cmd/cluster-ctl
+	$(call link_bin,cluster-ctl)
 
 # Inject envd into a bare sandbox-runtime.erofs -> sandbox-runtime-e2b.erofs
 # (pure shell over fsck.erofs/mkfs.erofs — no node-ctl binary needed).
