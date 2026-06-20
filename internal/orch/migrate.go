@@ -134,7 +134,7 @@ func (o *Orchestrator) ImportSandbox(ctx context.Context, apiKey, token string) 
 		return "", err
 	}
 	if mk == "" {
-		return "", fmt.Errorf("import-sandbox: tenant key not on this node — add it first: orchestrator-ctl manifest-key add <key>")
+		return "", fmt.Errorf("import-sandbox: tenant key not on this node — add it first: node-ctl manifest-key add <key>")
 	}
 	rawMK, _ := hex.DecodeString(mk)
 	if hex.EncodeToString(apikey.Fingerprint(rawMK)) != tok.MKFingerprint {

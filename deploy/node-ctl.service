@@ -1,0 +1,17 @@
+# node-ctl daemon unit — the e2b-compatible node host + in-process node resource
+# controller. It launches each sandbox as a sandbox-runner@<sid>.service instance
+# over systemd D-Bus, so it needs the system bus and cgroup write access. Start
+# after the data-plane daemons.
+[Unit]
+Description=kuasar node-ctl (e2b host + node resource control)
+After=network-online.target cache-ctl.service store-ctl.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/node-ctl serve --config /etc/node-ctl/config.yaml
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

@@ -2,7 +2,7 @@
 // UDS that multiplexes several planes over HTTP (h2c, with HTTP/1.1 fallback), each
 // with its own authentication:
 //
-//   - task   (POST /internal/task/launchspec): orchestrator-ctl run-sandbox / run-builder
+//   - task   (POST /internal/task/launchspec): node-ctl run-sandbox / run-builder
 //     fetch their generic LaunchSpec by config-id, then exec-replace into the target. Authed by
 //     SO_PEERCRED peer pid == the id's pidfile (/run/sandbox/<id>/<id>.pid).
 //   - admin  (/internal/admin/manifest-keys): manifest-key allowlist management.
@@ -67,7 +67,7 @@ const (
 	ConsoleTag   = "console"
 )
 
-// Request is what a task client (orchestrator-ctl run-sandbox / run-builder) sends.
+// Request is what a task client (node-ctl run-sandbox / run-builder) sends.
 type Request struct {
 	ConfigID string `json:"config_id"`
 	Version  int    `json:"version"`
@@ -95,7 +95,7 @@ type Provider interface {
 	BuildSpecFor(ctx context.Context, configID string) (resp *BuildSpec, pidFile string, ok bool, err error)
 }
 
-// BuildSpec is the work order orchestrator-ctl run-builder fetches for
+// BuildSpec is the work order node-ctl run-builder fetches for
 // "build:<bid>": everything the three-phase pipeline (import → steps →
 // template snapshot) needs. Secrets (manifest key, tenant registry
 // creds) ride here over the socket, never on disk.

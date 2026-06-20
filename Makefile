@@ -1,7 +1,8 @@
 # sandbox-orchestrator — node orchestration + e2b-compatible control plane +
-# node-level resource control (node-ctl, folded in from sandbox-sentinel).
+# node-level resource control, all in one node-ctl daemon (the e2b host + the
+# resource controller, folded in from the former e2b host daemon + sandbox-sentinel).
 #
-# orchestrator-ctl and node-ctl are pure-Go daemons (CGO_ENABLED=0). It also assembles the
+# node-ctl and e2b-key-ctl are pure-Go daemons (CGO_ENABLED=0). It also assembles the
 # e2b guest runtime:
 #   - sandbox-runtime-e2b   a base sandbox-runtime.erofs with envd injected at
 #                           /opt/sandbox-runtime/bin/envd (auto-bind-mounted into
@@ -11,7 +12,7 @@
 
 SHELL := /bin/bash
 
-.PHONY: all build orchestrator-ctl e2b-key-ctl node-ctl sandbox-runtime-e2b sandbox-runtime-builder \
+.PHONY: all build node-ctl e2b-key-ctl sandbox-runtime-e2b sandbox-runtime-builder \
         test vet bench test-e2e test-e2e-orchestrator test-e2e-proxy test-e2e-node-ctl clean help
 
 # ---------------------------------------------------------------------------
@@ -62,12 +63,7 @@ all: build
 
 # `build` ships the daemon + the e2b key tool. sandbox-runtime-e2b is opt-in
 # (needs envd + a base runtime), invoked explicitly or by the umbrella's deps stage.
-build: orchestrator-ctl e2b-key-ctl node-ctl
-
-orchestrator-ctl:
-	@mkdir -p $(BINDIR)
-	GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=0 $(GO) build $(GO_BUILD_FLAGS) -o $(BINDIR)/orchestrator-ctl ./cmd/orchestrator-ctl
-	$(call link_bin,orchestrator-ctl)
+build: node-ctl e2b-key-ctl
 
 # e2b-key-ctl: pure-derivation tool to mint e2b API keys from a manifest key.
 e2b-key-ctl:
@@ -75,16 +71,16 @@ e2b-key-ctl:
 	GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=0 $(GO) build $(GO_BUILD_FLAGS) -o $(BINDIR)/e2b-key-ctl ./cmd/e2b-key-ctl
 	$(call link_bin,e2b-key-ctl)
 
-# node-ctl: node-level resource controller (admission / budget / reclaim),
-# speaking the protocol in sandbox-runtime/pkg/resource. Folded in from
-# sandbox-sentinel.
+# node-ctl: the node daemon — e2b-compatible host (serve / proxy / run-sandbox /
+# run-builder / manifest-key / export-sandbox) + the in-process node resource
+# controller (serve resource_listen; node-ctl resource verbs, ex sandbox-sentinel).
 node-ctl:
 	@mkdir -p $(BINDIR)
 	GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=0 $(GO) build $(GO_BUILD_FLAGS) -o $(BINDIR)/node-ctl ./cmd/node-ctl
 	$(call link_bin,node-ctl)
 
 # Inject envd into a bare sandbox-runtime.erofs -> sandbox-runtime-e2b.erofs
-# (pure shell over fsck.erofs/mkfs.erofs — no orchestrator-ctl binary needed).
+# (pure shell over fsck.erofs/mkfs.erofs — no node-ctl binary needed).
 sandbox-runtime-e2b:
 	@[ -f "$(BASE_RUNTIME)" ] || { echo "missing base runtime: $(BASE_RUNTIME) (build sandbox-runtime first or set BASE_RUNTIME=...)" >&2; exit 1; }
 	@[ -f "$(ENVD)" ] || { echo "missing envd: $(ENVD) (run 'make -C sandbox-deps envd' or set ENVD=...)" >&2; exit 1; }
@@ -137,7 +133,7 @@ test-e2e-node-ctl:
 
 help:
 	@echo "sandbox-orchestrator. Targets:"
-	@echo "  build / orchestrator-ctl   build the e2b-compatible ingress daemon"
+	@echo "  build / node-ctl           build the node daemon (e2b host + resource control)"
 	@echo "  sandbox-runtime-e2b        inject envd (from sandbox-deps) into a base sandbox-runtime.erofs"
 	@echo "  sandbox-runtime-builder    e2b flavor + flatten-ctl + mkfs.erofs (build-sandbox guest runtime)"
 	@echo "  node-ctl                   node resource controller (folded in from sandbox-sentinel)"

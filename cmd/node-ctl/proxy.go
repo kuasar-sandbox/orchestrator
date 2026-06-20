@@ -33,7 +33,7 @@ import (
 //     workers share one port), forwarding to envd UDS / floatingip from its synced
 //     route table, parking a request until the route is ready (Wake -> resume).
 //
-//     orchestrator-ctl proxy --config-socket=<uds> --id=<name> --socket=<uds>
+//     node-ctl proxy --config-socket=<uds> --id=<name> --socket=<uds>
 //     --data-listen=<addr> [--tls-cert --tls-key] [--auth=off|log|enforce]
 //     [--park-timeout=30s] [--metrics-listen=<addr>] [--mmds-listen=<addr>]
 func runProxy(args []string, log *slog.Logger) error {
@@ -129,7 +129,7 @@ func runProxy(args []string, log *slog.Logger) error {
 	if err != nil {
 		return fmt.Errorf("proxy: listen %s: %w", *dataListen, err)
 	}
-	log.Info("orchestrator-ctl proxy serving", "data_listen", *dataListen, "socket", *socket, "id", *id,
+	log.Info("node-ctl proxy serving", "data_listen", *dataListen, "socket", *socket, "id", *id,
 		"config_socket", *configSocket, "tls", *tlsCert != "", "auth_fallback", authFallback)
 	return serveListener(ctx, dataLn, px, *tlsCert, *tlsKey, log)
 }

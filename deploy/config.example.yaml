@@ -1,9 +1,9 @@
-# orchestrator-ctl configuration. See sandbox-orchestrator/docs/orchestrator.md.
+# node-ctl configuration. See sandbox-orchestrator/docs/node.md.
 # The unmodified e2b SDK reaches this node via: E2B_DOMAIN=<domain> E2B_API_KEY=<key>
 # (dev: E2B_API_URL=http://host:3000 E2B_SANDBOX_URL=http://<port>-<sid>.host:3000).
 #
 # Config is grouped by concern. External binaries (sandbox-ctl, vswitch-ctl,
-# flatten-ctl, …) are auto-discovered next to the orchestrator-ctl binary, then on
+# flatten-ctl, …) are auto-discovered next to the node-ctl binary, then on
 # PATH — they are not configured here.
 
 # North control plane + TLS.
@@ -11,13 +11,13 @@ api:
   domain: sandboxes.example.com
   listen: ":443"                                 # dev: ":3000" (plain http)
   tls:
-    cert: /etc/orchestrator-ctl/tls/fullchain.pem   # wildcard *.<domain> AND api.<domain>
-    key: /etc/orchestrator-ctl/tls/privkey.pem
+    cert: /etc/node-ctl/tls/fullchain.pem   # wildcard *.<domain> AND api.<domain>
+    key: /etc/node-ctl/tls/privkey.pem
 
 # Data-plane proxy. mode selects how sandbox traffic (<port>-<sid>.<domain>) is served:
 #   internal (default) — in-process proxy (single binary, no extra moving parts).
-#   external           — offload to orchestrator-ctl proxy workers (deploy/
-#                        orchestrator-proxy@.service): each worker registers on the
+#   external           — offload to node-ctl proxy workers (deploy/
+#                        node-proxy@.service): each worker registers on the
 #                        config-socket plugin plane + syncs the route table from it,
 #                        and they own the data-plane port (SO_REUSEPORT). No static
 #                        socket list — the orchestrator forwards by sandbox-id hash
@@ -35,9 +35,9 @@ proxy:
 
 # Secrets-at-rest. Per-tenant manifest keys are stored AES-256-GCM-encrypted under
 # encryption_key: ":"-separated 64-hex keys, first = active (new writes), rest =
-# standby (decrypt during rotation). Prefer the ORCHESTRATOR_ENCRYPTION_KEY env
+# standby (decrypt during rotation). Prefer the NODE_CTL_ENCRYPTION_KEY env
 # (overrides this). Generate one: `openssl rand -hex 32`. Which manifest keys may
-# create/build/import is the manifest_keys table (orchestrator-ctl manifest-key …);
+# create/build/import is the manifest_keys table (node-ctl manifest-key …);
 # e2b API keys are derived from a manifest key with `e2b-key-ctl gen-apikey`.
 encryption_key: "0000000000000000000000000000000000000000000000000000000000000000"
 
@@ -54,15 +54,15 @@ paths:
   # and the e2b api plane (a plain-h2c twin of api.listen, incl. export/import). The
   # manifest-key / export-sandbox / import-sandbox CLIs and external proxy workers are
   # clients of this socket — they do not open the DB or read this config.
-  config_socket: /run/sandbox/orchestrator.socket
-  # db_path: /var/lib/sandbox/orchestrator.db     # default = <base_root>/orchestrator.db
+  config_socket: /run/sandbox/node-ctl.socket
+  # db_path: /var/lib/sandbox/node-ctl.db     # default = <base_root>/node-ctl.db
   # admin_pidfile gates the admin plane: when set, a manifest-key caller's peer pid must
   # be listed (one per line; '#' comments ok). Unset (default) relies on the socket's
   # 0600 perms (same uid / root). Set it to restrict admin to specific automation pids.
-  # admin_pidfile: /run/sandbox/orchestrator-admin.pids
+  # admin_pidfile: /run/sandbox/node-ctl-admin.pids
   # plugin_pidfile gates the plugin plane (proxy/agent registration), same format as
   # admin_pidfile. Unset relies on the socket's 0600 perms.
-  # plugin_pidfile: /run/sandbox/orchestrator-plugin.pids
+  # plugin_pidfile: /run/sandbox/node-ctl-plugin.pids
 
 # Systemd template units (generated + installed at startup, then daemon-reloaded).
 # units:
@@ -96,7 +96,7 @@ sandbox:
 # Build-instance settings. Builds run INSIDE build sandboxes (tenant network +
 # isolation): image pull and step execution happen in microVMs booted from
 # runtime_builder; only artifact relay and the final uploads run on the host.
-# Concurrency is admitted in orchestrator-ctl; the CPU/memory ceiling is applied
+# Concurrency is admitted in node-ctl; the CPU/memory ceiling is applied
 # to sandbox-builder.slice (the whole pipeline runs in the unit's cgroup).
 builder:
   max_concurrent: 2
@@ -143,7 +143,7 @@ builder:
 # files (mode=local, default; restorable only on this node — matches the sandbox-bound
 # lifecycle) or straight to the remote manifest store (mode=remote; portable = a
 # template). A local checkpoint is promoted to remote on demand via
-# `orchestrator-ctl export-sandbox` (--to-template for a reusable template, or a
+# `node-ctl export-sandbox` (--to-template for a reusable template, or a
 # migration token to move the sandbox to another node).
 checkpoint:
   mode: local

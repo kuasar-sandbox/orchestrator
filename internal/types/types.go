@@ -1,4 +1,4 @@
-// Package types holds the core domain types shared across orchestrator-ctl.
+// Package types holds the core domain types shared across node-ctl.
 package types
 
 import (

@@ -28,7 +28,7 @@ func HTTPClient(socket string) *http.Client {
 }
 
 // FetchLaunchSpec dials the config-socket and pulls the LaunchSpec for configID.
-// The caller (orchestrator-ctl run-sandbox / run-builder) must have written its pidfile first so the
+// The caller (node-ctl run-sandbox / run-builder) must have written its pidfile first so the
 // server's SO_PEERCRED check matches the connecting pid.
 func FetchLaunchSpec(socket, configID string) (*LaunchSpec, error) {
 	body, _ := json.Marshal(Request{ConfigID: configID})

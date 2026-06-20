@@ -151,7 +151,7 @@ func (o *Orchestrator) Create(ctx context.Context, req api.CreateReq) (*types.Sa
 }
 
 // launch prepares dirs + network, writes the sandbox config file, starts the unit
-// (orchestrator-ctl run-sandbox -> sandbox-ctl), waits for readiness and provisions
+// (node-ctl run-sandbox -> sandbox-ctl), waits for readiness and provisions
 // envd. The non-secret config lands at <run-dir>/<sid>.yaml; the secret manifest
 // key rides in the run-sandbox LaunchSpec env (LaunchSpecFor). The cgroup is the
 // unit's own (--cgroup-adopt). Used by Create and Connect(resume).

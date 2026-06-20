@@ -9,13 +9,13 @@ import (
 )
 
 // InstallUnits generates and installs the systemd template units (+ slices)
-// orchestrator-ctl drives, then daemon-reloads if anything changed. It is a
+// node-ctl drives, then daemon-reloads if anything changed. It is a
 // no-op when install_units=false (operator manages units out of band).
 //
 //   - <runner>  (sandbox-runner@.service): one microVM sandbox; also runs snapshot
-//     builds. ExecStart=orchestrator-ctl run-sandbox (exec-replaces into sandbox-ctl
+//     builds. ExecStart=node-ctl run-sandbox (exec-replaces into sandbox-ctl
 //     run), config pulled over the config-socket.
-//   - <builder> (sandbox-builder@.service): one template build. ExecStart=orchestrator-ctl
+//   - <builder> (sandbox-builder@.service): one template build. ExecStart=node-ctl
 //     run-builder, which pulls the BuildSpec (MANIFEST_KEY + tenant registry creds in
 //     env) over the config-socket and drives the three-phase pipeline itself
 //     (import/steps/template sandboxes as direct children; result JSON on stdout).
@@ -53,7 +53,7 @@ func (o *Orchestrator) InstallUnits(ctx context.Context) error {
 func (o *Orchestrator) runnerUnitFile() string {
 	return fmt.Sprintf(`[Unit]
 Description=kuasar sandbox %%i
-# orchestrator-ctl prepares %s/%%i and %s/%%i + writes %s/%%i/%%i.yaml before start.
+# node-ctl prepares %s/%%i and %s/%%i + writes %s/%%i/%%i.yaml before start.
 
 [Service]
 Type=exec

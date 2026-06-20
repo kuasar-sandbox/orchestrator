@@ -1,4 +1,4 @@
-// Package config loads orchestrator-ctl's node-local configuration.
+// Package config loads node-ctl's node-local configuration.
 //
 // The YAML is grouped by concern: api / proxy / paths / units / sandbox (the
 // sandbox-instance defaults, sub-grouped resources/network/boot) / builder /
@@ -23,7 +23,7 @@ import (
 // docs/orchestrator.md §9 covers how serve assembles the chosen mode.
 const (
 	ProxyInternal = "internal" // in-process proxy (default)
-	ProxyExternal = "external" // offloaded to orchestrator-ctl proxy worker processes
+	ProxyExternal = "external" // offloaded to node-ctl proxy worker processes
 	ProxyOff      = "off"      // data plane disabled on this node
 )
 
@@ -43,10 +43,10 @@ const (
 // Auto-discovered external binary names (resolved via Config.Bin against the
 // orchestrator binary's dir, then PATH). They are intentionally not config keys.
 const (
-	BinSandboxCtl      = "sandbox-ctl"
-	BinVswitchCtl      = "vswitch-ctl"
-	BinFlattenCtl      = "flatten-ctl"
-	BinOrchestratorCtl = "orchestrator-ctl"
+	BinSandboxCtl = "sandbox-ctl"
+	BinVswitchCtl = "vswitch-ctl"
+	BinFlattenCtl = "flatten-ctl"
+	BinNodeCtl    = "node-ctl"
 )
 
 // Config is the grouped node-local configuration.
@@ -57,16 +57,28 @@ type Config struct {
 	Units   UnitsConfig   `yaml:"units"`   // systemd unit management
 	Sandbox SandboxConfig `yaml:"sandbox"` // sandbox-instance defaults
 	Builder BuilderConfig `yaml:"builder"` // build-instance settings
+	// ResourceListen optionally hosts the node resource controller in-process
+	// (resource_listen, node-resource.md); disabled => sandboxes use static cgroup.
+	ResourceListen ResourceListenConfig `yaml:"resource_listen"`
 	// Checkpoint is the paused-state tiering policy (parallel to sandbox).
 	Checkpoint CheckpointConfig `yaml:"checkpoint"`
 	// MMDS is the optional envd metadata service (re-keys envd to fresh per-identity
 	// tokens). Disabled => envd runs non-secure and the proxy is the sole data-plane gate.
 	MMDS MMDSConfig `yaml:"mmds"`
 	// Singular top-level references.
-	EncryptionKey  string `yaml:"encryption_key"`  // manifest_key at-rest AES-256 (":"-sep, first active); or ORCHESTRATOR_ENCRYPTION_KEY env
+	EncryptionKey  string `yaml:"encryption_key"`  // manifest_key at-rest AES-256 (":"-sep, first active); or NODE_CTL_ENCRYPTION_KEY env
 	ManifestConfig string `yaml:"manifest_config"` // remote manifest store config (path ref; shared by sandbox + builder)
 
 	execDir string // auto: dir of os.Executable(); used by Bin (not a YAML field)
+}
+
+// ResourceListenConfig optionally hosts the node resource controller in-process
+// inside serve (the resource_listen sub-server, node-resource.md). Disabled by
+// default; sandboxes then use static cgroup.
+type ResourceListenConfig struct {
+	Enabled bool   `yaml:"enabled"`
+	Socket  string `yaml:"socket"` // controller UDS; "" = nodectl default
+	Config  string `yaml:"config"` // resource controller yaml; "" = built-in defaults
 }
 
 // APIConfig is the north control plane + TLS.
@@ -111,8 +123,8 @@ type MMDSConfig struct {
 type PathsConfig struct {
 	RunRoot      string `yaml:"run_root"`      // default /run/sandbox (tmpfs)
 	BaseRoot     string `yaml:"base_root"`     // default /var/lib/sandbox (persistent)
-	DBPath       string `yaml:"db_path"`       // default <base_root>/orchestrator.db
-	ConfigSocket  string `yaml:"config_socket"`  // default /run/sandbox/orchestrator.socket
+	DBPath       string `yaml:"db_path"`       // default <base_root>/node-ctl.db
+	ConfigSocket  string `yaml:"config_socket"`  // default /run/sandbox/node-ctl.socket
 	AdminPidfile  string `yaml:"admin_pidfile"`  // optional PID allowlist (multi-line) gating the socket admin plane; "" => socket perms (same-uid/root) only
 	PluginPidfile string `yaml:"plugin_pidfile"` // optional PID allowlist (multi-line) gating the socket plugin plane (proxy/agent registration); "" => socket perms only
 }
@@ -200,7 +212,7 @@ type BootConfig struct {
 }
 
 // BuilderConfig is the build-instance settings. Concurrency is admitted in
-// orchestrator-ctl; the CPU/memory ceiling is applied to sandbox-builder.slice.
+// node-ctl; the CPU/memory ceiling is applied to sandbox-builder.slice.
 // Builds run INSIDE build sandboxes (tenant network + isolation): import and
 // step execution happen in microVMs booted from runtime_builder; only artifact
 // streaming and the final uploads run on the host (run-builder).
@@ -273,7 +285,7 @@ func (f *FilesStorageConfig) PresignExpiryDur() time.Duration {
 // snapshot either to node-local files (mode=local, default; restorable only on
 // this node — matches the sandbox-bound lifecycle) or straight to the remote
 // manifest store (mode=remote; portable = a template). A local checkpoint is
-// promoted to remote on demand via `orchestrator-ctl export-sandbox`.
+// promoted to remote on demand via `node-ctl export-sandbox`.
 type CheckpointConfig struct {
 	Mode     string `yaml:"mode"`      // local (default) | remote
 	LocalDir string `yaml:"local_dir"` // local checkpoint files dir (mode=local); default /var/lib/sandbox-saved
@@ -306,9 +318,9 @@ func (c *Config) applyDefaults() {
 	def(&c.ManifestConfig, "/opt/sandbox/manifest.yaml")
 	def(&c.Paths.RunRoot, "/run/sandbox")
 	def(&c.Paths.BaseRoot, "/var/lib/sandbox")
-	def(&c.Paths.ConfigSocket, "/run/sandbox/orchestrator.socket")
+	def(&c.Paths.ConfigSocket, "/run/sandbox/node-ctl.socket")
 	if c.Paths.DBPath == "" {
-		c.Paths.DBPath = filepath.Join(c.Paths.BaseRoot, "orchestrator.db")
+		c.Paths.DBPath = filepath.Join(c.Paths.BaseRoot, "node-ctl.db")
 	}
 	def(&c.Units.Dir, "/etc/systemd/system")
 	def(&c.Units.Runner, "sandbox-runner@.service")
@@ -364,10 +376,10 @@ func (c *Config) applyDefaults() {
 }
 
 // EncryptionKeySpec returns the effective encryption-key set: the
-// ORCHESTRATOR_ENCRYPTION_KEY env when set, else the config's encryption_key
+// NODE_CTL_ENCRYPTION_KEY env when set, else the config's encryption_key
 // (":"-separated 64-hex keys, first = active).
 func (c *Config) EncryptionKeySpec() string {
-	if v := os.Getenv("ORCHESTRATOR_ENCRYPTION_KEY"); v != "" {
+	if v := os.Getenv("NODE_CTL_ENCRYPTION_KEY"); v != "" {
 		return v
 	}
 	return c.EncryptionKey
@@ -391,7 +403,7 @@ func (c *Config) SandboxCtl() string      { return c.Bin(BinSandboxCtl) }
 func (c *Config) ManifestCtl() string     { return c.Bin("manifest-ctl") }
 func (c *Config) VswitchCtl() string      { return c.Bin(BinVswitchCtl) }
 func (c *Config) FlattenCtl() string      { return c.Bin(BinFlattenCtl) }
-func (c *Config) OrchestratorCtl() string { return c.Bin(BinOrchestratorCtl) }
+func (c *Config) OrchestratorCtl() string { return c.Bin(BinNodeCtl) }
 
 // ParkTimeoutDur parses proxy.park_timeout (default 30s on any parse error).
 func (c *Config) ParkTimeoutDur() time.Duration {
@@ -407,7 +419,7 @@ func (c *Config) validate() error {
 		return fmt.Errorf("config: api.domain is required")
 	}
 	if c.EncryptionKeySpec() == "" {
-		return fmt.Errorf("config: encryption_key (or ORCHESTRATOR_ENCRYPTION_KEY env) is required")
+		return fmt.Errorf("config: encryption_key (or NODE_CTL_ENCRYPTION_KEY env) is required")
 	}
 	switch c.Checkpoint.Mode {
 	case CheckpointLocal, CheckpointRemote:

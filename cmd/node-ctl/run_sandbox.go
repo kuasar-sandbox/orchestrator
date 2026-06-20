@@ -11,7 +11,7 @@ import (
 // and exec-replaces into sandbox-ctl. Flags fall back to the TASK_* env (systemd %i
 // wiring); TASK_* are stripped from the child environment.
 //
-//	orchestrator-ctl run-sandbox --pidfile=<f> --config-socket=<uds> --sandbox-id=<sid>
+//	node-ctl run-sandbox --pidfile=<f> --config-socket=<uds> --sandbox-id=<sid>
 func runSandbox(args []string, _ *slog.Logger) error {
 	fs := flag.NewFlagSet("run-sandbox", flag.ExitOnError)
 	pidfile := fs.String("pidfile", "", "pidfile to lock+write (TASK_PIDFILE)")

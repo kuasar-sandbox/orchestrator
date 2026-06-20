@@ -9,7 +9,7 @@ import (
 	"os"
 )
 
-// exportSandboxCmd implements `orchestrator-ctl export-sandbox <sid>` as a client of
+// exportSandboxCmd implements `node-ctl export-sandbox <sid>` as a client of
 // the running serve daemon's api plane (POST /sandboxes/{id}/export over the local
 // control socket). With --to-template it promotes the paused sandbox's snapshot to a
 // remote manifest and prints the persist template id (fork; usable via `e2b sandbox
@@ -18,7 +18,7 @@ import (
 func exportSandboxCmd(args []string, _ *slog.Logger) error {
 	sid, rest := leadingPositional(args)
 	fs := flag.NewFlagSet("export-sandbox", flag.ContinueOnError)
-	socket := fs.String("socket", "", "orchestrator control socket (or ORCHESTRATOR_SOCKET env)")
+	socket := fs.String("socket", "", "orchestrator control socket (or NODE_CTL_SOCKET env)")
 	toTemplate := fs.Bool("to-template", false, "promote + print the persist template id (fork) instead of a migration token")
 	keepSource := fs.Bool("keep-source", false, "keep the source sandbox (copy) instead of relinquishing it (move)")
 	if err := fs.Parse(rest); err != nil {
@@ -28,7 +28,7 @@ func exportSandboxCmd(args []string, _ *slog.Logger) error {
 		sid = fs.Arg(0)
 	}
 	if sid == "" {
-		return fmt.Errorf("usage: orchestrator-ctl export-sandbox <sid> [--to-template] [--keep-source] [--socket S]")
+		return fmt.Errorf("usage: node-ctl export-sandbox <sid> [--to-template] [--keep-source] [--socket S]")
 	}
 	apiKey := os.Getenv("E2B_API_KEY")
 	if apiKey == "" {
@@ -51,14 +51,14 @@ func exportSandboxCmd(args []string, _ *slog.Logger) error {
 	return nil
 }
 
-// importSandboxCmd implements `orchestrator-ctl import-sandbox <token>` as a client of
+// importSandboxCmd implements `node-ctl import-sandbox <token>` as a client of
 // the daemon's api plane (POST /sandboxes/import): recreate a paused sandbox from a
 // migration token on this node (which must share the remote store and have the tenant
 // manifest-key added). Auth: E2B_API_KEY env.
 func importSandboxCmd(args []string, _ *slog.Logger) error {
 	tok, rest := leadingPositional(args)
 	fs := flag.NewFlagSet("import-sandbox", flag.ContinueOnError)
-	socket := fs.String("socket", "", "orchestrator control socket (or ORCHESTRATOR_SOCKET env)")
+	socket := fs.String("socket", "", "orchestrator control socket (or NODE_CTL_SOCKET env)")
 	if err := fs.Parse(rest); err != nil {
 		return err
 	}
@@ -66,7 +66,7 @@ func importSandboxCmd(args []string, _ *slog.Logger) error {
 		tok = fs.Arg(0)
 	}
 	if tok == "" {
-		return fmt.Errorf("usage: orchestrator-ctl import-sandbox <token> [--socket S]")
+		return fmt.Errorf("usage: node-ctl import-sandbox <token> [--socket S]")
 	}
 	apiKey := os.Getenv("E2B_API_KEY")
 	if apiKey == "" {

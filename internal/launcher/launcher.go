@@ -28,7 +28,7 @@ type Launcher interface {
 	ResetFailed(ctx context.Context, unit string) error
 	// List returns units matching the glob pattern (the liveness authority).
 	List(ctx context.Context, pattern string) ([]Unit, error)
-	// Reload re-reads unit files after orchestrator-ctl installs/updates them.
+	// Reload re-reads unit files after node-ctl installs/updates them.
 	Reload(ctx context.Context) error
 	Close() error
 }

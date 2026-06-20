@@ -33,7 +33,7 @@ func buildRegistryAuth(file, user, pass, token string) (string, error) {
 	return "", nil
 }
 
-// manifestKeyCmd implements `orchestrator-ctl manifest-key {add|remove|check|list}`
+// manifestKeyCmd implements `node-ctl manifest-key {add|remove|check|list}`
 // — the create/build allowlist (the manifest_keys table). It is a thin client of the
 // running serve daemon's admin plane (the local control socket): the daemon is the
 // sole owner of the table. Keys are read from positional args or the MANIFEST_KEY
@@ -41,17 +41,17 @@ func buildRegistryAuth(file, user, pass, token string) (string, error) {
 // Admin authorization is by SO_PEERCRED (admin_pidfile allowlist, or the socket's
 // 0600 perms — same uid / root — when admin_pidfile is unset).
 //
-//	orchestrator-ctl manifest-key add    [--label L] [--socket S] <MANIFEST_KEY>...
-//	orchestrator-ctl manifest-key remove            [--socket S] <MANIFEST_KEY>...
-//	orchestrator-ctl manifest-key check             [--socket S] <MANIFEST_KEY>...
-//	orchestrator-ctl manifest-key list              [--socket S]
+//	node-ctl manifest-key add    [--label L] [--socket S] <MANIFEST_KEY>...
+//	node-ctl manifest-key remove            [--socket S] <MANIFEST_KEY>...
+//	node-ctl manifest-key check             [--socket S] <MANIFEST_KEY>...
+//	node-ctl manifest-key list              [--socket S]
 func manifestKeyCmd(args []string, _ *slog.Logger) error {
 	if len(args) == 0 {
 		return fmt.Errorf("manifest-key: subcommand required: add|remove|check|list")
 	}
 	sub, rest := args[0], args[1:]
 	fs := flag.NewFlagSet("manifest-key "+sub, flag.ExitOnError)
-	socket := fs.String("socket", "", "orchestrator control socket (or ORCHESTRATOR_SOCKET env)")
+	socket := fs.String("socket", "", "orchestrator control socket (or NODE_CTL_SOCKET env)")
 	label := fs.String("label", "", "optional label (add)")
 	ttl := fs.Duration("ttl", 0, "add: expire the key after this duration (e.g. 24h); 0 = never. Re-adding refreshes it.")
 	regAuthFile := fs.String("registry-auth", "", "add: tenant-default registry creds as a docker config.json file")

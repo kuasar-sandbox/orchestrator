@@ -299,7 +299,7 @@ type pendingBuild struct {
 }
 
 // executeBuild runs the three-phase pipeline in a sandbox-builder@<bid>
-// unit: orchestrator-ctl run-builder fetches the BuildSpec over the
+// unit: node-ctl run-builder fetches the BuildSpec over the
 // config-socket and drives import/steps/template sandboxes itself (as
 // direct children, in the unit's cgroup). This side owns what spans the
 // unit: the workdir, ONE vswitch slot the phases reuse sequentially,

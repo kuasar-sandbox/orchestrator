@@ -17,6 +17,30 @@ func adminClient(socketPath string) (*nodectl.Client, error) {
 	return c, nil
 }
 
+// resourceCmd dispatches `node-ctl resource <verb>`. The controller itself runs
+// inside serve (resource_listen); these are admin / inspection clients to it.
+func resourceCmd(args []string) int {
+	if len(args) < 1 {
+		fmt.Fprintln(os.Stderr, "usage: node-ctl resource {status|list|drain|grant|reclaim} ...")
+		return 2
+	}
+	switch args[0] {
+	case "status":
+		return statusCmd(args[1:])
+	case "list":
+		return listCmd(args[1:])
+	case "drain":
+		return drainCmd(args[1:])
+	case "grant":
+		return grantCmd(args[1:])
+	case "reclaim":
+		return reclaimCmd(args[1:])
+	default:
+		fmt.Fprintf(os.Stderr, "unknown resource verb %q\n", args[0])
+		return 2
+	}
+}
+
 func drainCmd(args []string) int {
 	fs := flag.NewFlagSet("drain", flag.ContinueOnError)
 	socket := fs.String("socket", nodectl.DefaultSocket, "controller UDS path")

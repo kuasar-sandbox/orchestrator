@@ -2,7 +2,7 @@
 // API keys from a tenant manifest key (the 64-hex root secret), generates new
 // manifest keys, and prints fingerprints — no DB, config, or orchestrator state.
 // The minted api key is what the e2b SDK uses (E2B_API_KEY); the manifest key
-// stays with the operator and is registered via `orchestrator-ctl manifest-key add`.
+// stays with the operator and is registered via `node-ctl manifest-key add`.
 //
 //	e2b-key-ctl gen-apikey  [<MANIFEST_KEY>]   # derive an e2b API key (or MANIFEST_KEY env)
 //	e2b-key-ctl gen-key                         # random 32-byte manifest key (64-hex)

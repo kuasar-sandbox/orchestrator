@@ -1,6 +1,6 @@
 package main
 
-// Shared client plumbing for the CLIs that talk to a running `orchestrator-ctl
+// Shared client plumbing for the CLIs that talk to a running `node-ctl
 // serve` daemon over its local control socket (manifest-key, export-sandbox,
 // import-sandbox). These commands never read the orchestrator config file — the
 // daemon owns the store + keys; they only need the socket path.
@@ -17,15 +17,15 @@ import (
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/configsock"
 )
 
-const defaultSocket = "/run/sandbox/orchestrator.socket"
+const defaultSocket = "/run/sandbox/node-ctl.socket"
 
-// resolveSocket picks the control-socket path: --socket flag, else ORCHESTRATOR_SOCKET
+// resolveSocket picks the control-socket path: --socket flag, else NODE_CTL_SOCKET
 // env, else the default (matches config_socket's default).
 func resolveSocket(flagVal string) string {
 	if flagVal != "" {
 		return flagVal
 	}
-	if v := os.Getenv("ORCHESTRATOR_SOCKET"); v != "" {
+	if v := os.Getenv("NODE_CTL_SOCKET"); v != "" {
 		return v
 	}
 	return defaultSocket
@@ -54,7 +54,7 @@ func udsDo(socket, method, path string, hdr map[string]string, reqBody any) (int
 	}
 	resp, err := configsock.HTTPClient(socket).Do(req)
 	if err != nil {
-		return 0, nil, fmt.Errorf("reach orchestrator at %s: %w (is `orchestrator-ctl serve` running?)", socket, err)
+		return 0, nil, fmt.Errorf("reach orchestrator at %s: %w (is `node-ctl serve` running?)", socket, err)
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)

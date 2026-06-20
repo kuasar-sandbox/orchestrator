@@ -10,12 +10,12 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// configCmd implements `orchestrator-ctl config` — emit a normalized config from
+// configCmd implements `node-ctl config` — emit a normalized config from
 // --config (loading applies defaults + validates), or a commented skeleton via
 // --template. Mirrors `sandbox-ctl config` / `flatten-ctl config`.
 //
-//	orchestrator-ctl config --config <file>   # normalize + validate, re-emit
-//	orchestrator-ctl config --template        # emit a commented skeleton
+//	node-ctl config --config <file>   # normalize + validate, re-emit
+//	node-ctl config --template        # emit a commented skeleton
 //	  [-o <file>]                             # write to file (default stdout)
 func configCmd(args []string, _ *slog.Logger) error {
 	fs := flag.NewFlagSet("config", flag.ExitOnError)
@@ -49,15 +49,15 @@ func configCmd(args []string, _ *slog.Logger) error {
 }
 
 // orchConfigSkeleton is the commented authoring template (see deploy/config.example.yaml).
-const orchConfigSkeleton = `# orchestrator-ctl config — orchestrator-ctl serve --config <this>.
+const orchConfigSkeleton = `# node-ctl config — node-ctl serve --config <this>.
 # The unmodified e2b SDK reaches this node via E2B_DOMAIN/E2B_API_KEY (dev:
 # E2B_API_URL/E2B_SANDBOX_URL http). Required: api.domain + encryption_key.
 # Config is grouped by concern; external binaries (sandbox-ctl, vswitch-ctl,
-# flatten-ctl, …) are auto-discovered next to orchestrator-ctl then on PATH.
+# flatten-ctl, …) are auto-discovered next to node-ctl then on PATH.
 api:
   domain: sandboxes.example.com
   listen: ":443"                                 # dev: ":3000" (plain http/h2c)
-  tls: { cert: /etc/orchestrator-ctl/tls/fullchain.pem, key: /etc/orchestrator-ctl/tls/privkey.pem }
+  tls: { cert: /etc/node-ctl/tls/fullchain.pem, key: /etc/node-ctl/tls/privkey.pem }
 proxy:
   mode: internal                                 # internal | external | off
   auth: enforce                                  # off | log | enforce: validate X-Access-Token
@@ -66,17 +66,17 @@ proxy:
   # park_timeout: 30s
   # metrics_listen: ":9900"                       # optional Prometheus text endpoint
 # AES-256 keys for manifest keys at rest (":"-separated, first active). Prefer the
-# ORCHESTRATOR_ENCRYPTION_KEY env (overrides). Generate: e2b-key-ctl gen-key.
+# NODE_CTL_ENCRYPTION_KEY env (overrides). Generate: e2b-key-ctl gen-key.
 encryption_key: "0000000000000000000000000000000000000000000000000000000000000000"
 # Shared remote manifest store (manifest.key empty; the tenant key arrives via env).
 manifest_config: /opt/sandbox/manifest.yaml
-# Allowlist (who may create/build/import) is the manifest_keys table: orchestrator-ctl
+# Allowlist (who may create/build/import) is the manifest_keys table: node-ctl
 # manifest-key add|remove|check|list. e2b API keys: e2b-key-ctl gen-apikey.
 paths:
   run_root: /run/sandbox
   base_root: /var/lib/sandbox
-  config_socket: /run/sandbox/orchestrator.socket  # local control socket: task + manifest-key admin + api plane (h2c)
-  # db_path: /var/lib/sandbox/orchestrator.db    # default = <base_root>/orchestrator.db
+  config_socket: /run/sandbox/node-ctl.socket  # local control socket: task + manifest-key admin + api plane (h2c)
+  # db_path: /var/lib/sandbox/node-ctl.db    # default = <base_root>/node-ctl.db
   # admin_pidfile: /run/sandbox/orchestrator-admin.pids  # PID allowlist for the admin plane; unset = socket 0600 perms (same uid/root)
 # units:                                          # systemd template units (defaults shown)
 #   dir: /etc/systemd/system

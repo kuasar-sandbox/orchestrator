@@ -33,7 +33,7 @@ type Box struct{ keys []aeadKey }
 
 // NewFromColonHex builds a Box from a ":"-separated list of 64-hex AES-256 keys
 // (the first is active). Used for the orchestrator's encryption_key config / the
-// ORCHESTRATOR_ENCRYPTION_KEY env. Empty/blank entries are ignored.
+// NODE_CTL_ENCRYPTION_KEY env. Empty/blank entries are ignored.
 func NewFromColonHex(spec string) (*Box, error) {
 	var b Box
 	seen := map[[tagLen]byte]bool{}
