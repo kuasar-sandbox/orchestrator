@@ -34,8 +34,10 @@ import (
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/launcher"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/metrics"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/mmds"
+	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/nodelink"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/orch"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/proxy"
+	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/secretbox"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/store"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/vswitch"
@@ -138,6 +140,29 @@ func serve(args []string, log *slog.Logger) error {
 		if err := startResourceController(ctx, cfg.ResourceListen.Config, cfg.ResourceListen.Socket, log); err != nil {
 			return fmt.Errorf("resource_listen: %w", err)
 		}
+	}
+
+	// Connect to the cluster registry over node-link (node.md §10) if configured:
+	// the node streams its sandbox routes up + executes the registry's commands.
+	if cfg.Cluster.Registry != "" {
+		nodeID := cfg.Cluster.NodeID
+		if nodeID == "" {
+			nodeID, _ = os.Hostname()
+		}
+		dataEndpoint := cfg.Cluster.DataEndpoint
+		if dataEndpoint == "" {
+			dataEndpoint = cfg.API.Listen
+		}
+		regAddr := cfg.Cluster.Registry
+		nl := nodelink.New(
+			func(dctx context.Context) (net.Conn, error) {
+				return (&net.Dialer{}).DialContext(dctx, "tcp", regAddr)
+			},
+			routesync.NodeRegister{NodeID: nodeID, Labels: cfg.Cluster.Labels, DataEndpoint: dataEndpoint},
+			core, log,
+		)
+		go nl.Run(ctx)
+		log.Info("node-ctl serve: node-link to cluster registry", "registry", regAddr, "node_id", nodeID)
 	}
 
 	// North api handler (e2b control plane + export/import). Built once and shared by

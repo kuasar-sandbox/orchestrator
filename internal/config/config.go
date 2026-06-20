@@ -65,6 +65,9 @@ type Config struct {
 	// MMDS is the optional envd metadata service (re-keys envd to fresh per-identity
 	// tokens). Disabled => envd runs non-secure and the proxy is the sole data-plane gate.
 	MMDS MMDSConfig `yaml:"mmds"`
+	// Cluster connects this node to a cluster-ctl registry over node-link
+	// (node.md §10); empty = standalone single-node.
+	Cluster ClusterConfig `yaml:"cluster"`
 	// Singular top-level references.
 	EncryptionKey  string `yaml:"encryption_key"`  // manifest_key at-rest AES-256 (":"-sep, first active); or NODE_CTL_ENCRYPTION_KEY env
 	ManifestConfig string `yaml:"manifest_config"` // remote manifest store config (path ref; shared by sandbox + builder)
@@ -79,6 +82,15 @@ type ResourceListenConfig struct {
 	Enabled bool   `yaml:"enabled"`
 	Socket  string `yaml:"socket"` // controller UDS; "" = nodectl default
 	Config  string `yaml:"config"` // resource controller yaml; "" = built-in defaults
+}
+
+// ClusterConfig connects this node to a cluster-ctl registry over node-link
+// (node.md §10). Empty Registry = standalone single-node (no cluster).
+type ClusterConfig struct {
+	Registry     string            `yaml:"registry"`      // registry node-link addr host:port; "" = standalone
+	NodeID       string            `yaml:"node_id"`       // this node's id; "" = hostname
+	Labels       map[string]string `yaml:"labels"`        // zone / pool / slot / node (nodeSelectors)
+	DataEndpoint string            `yaml:"data_endpoint"` // host:port the router forwards the data plane to
 }
 
 // APIConfig is the north control plane + TLS.

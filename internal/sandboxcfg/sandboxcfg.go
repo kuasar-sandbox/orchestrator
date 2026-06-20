@@ -34,6 +34,7 @@ const (
 	NsMounts   = "kuasar-sandbox.mounts"
 	NsFiles    = "kuasar-sandbox.files"
 	NsMetadata = "kuasar-sandbox.metadata"
+	NsCluster  = "kuasar-sandbox.cluster" // {group, route_key}: cluster routing / shard identity (node.md §4.6)
 )
 
 // NetworkSpec is the orchestrator's LOGICAL network model — broader than the guest
