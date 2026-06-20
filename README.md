@@ -21,7 +21,7 @@
 |---|---|---|
 | **kuasar-sandbox**(本仓) | 系统文档 + 发布聚合 + 跨仓 e2e/perf | `scripts/release.sh`、`docs/`、`test/` |
 | **sandbox-runtime** | microVM 生命周期引擎(host `sandbox-ctl` + guest `sandbox-init`)+ vhost 块后端 | `pkg/resource`(资源控制协议+Client) |
-| **sandbox-orchestrator** | 单机 e2b 兼容沙箱编排/ingress(控制面 + envd-in-guest 反代 + 模板构建)+ 节点级资源守护(准入/分配/回收,3,000+ 密度) | `orchestrator-ctl` + `e2b-key-ctl` + `node-ctl`、`sandbox-runtime-{e2b,builder}.erofs` |
+| **sandbox-orchestrator** | 单机 e2b 兼容沙箱编排/ingress(控制面 + envd-in-guest 反代 + 模板构建)+ 节点级资源守护(准入/分配/回收,3,000+ 密度) | `node-ctl` + `cluster-ctl` + `e2b-key-ctl`、`sandbox-runtime-{e2b,builder}.erofs` |
 | **sandbox-accelerator** | 存储加速 + 镜像构建:内容寻址存储 + 分层缓存 + 收敛加密 + OCI → EROFS 确定性展平 | `pkg/manifest`、`pkg/image`、`pkg/{cache,store}/client` + `flatten-ctl` |
 | **sandbox-vswitch** | eBPF/TC 虚拟交换机 + tapfd 交接 | `pkg/tapfd`(fd 交接规约)+ `vswitch-ctl`/`tapfd-get` |
 | **sandbox-deps** | 原生依赖:vmlinux / cloud-hypervisor / mkfs.erofs | 构建脚本 + patches + configs |
@@ -72,4 +72,4 @@ make -C kuasar-sandbox perf              # 性能 harness 全套
   端口、启停依赖、故障域。
 - [docs/perf.md](docs/perf.md) — 实测性能基线、回归 checklist 与调优杠杆。
 - 模块设计文档随各自仓(如 `sandbox-runtime/docs/sandbox.md`、
-  `sandbox-accelerator/docs/manifest.md`、`sandbox-orchestrator/docs/orchestrator.md`)。
+  `sandbox-accelerator/docs/manifest.md`、`sandbox-orchestrator/docs/node.md`)。

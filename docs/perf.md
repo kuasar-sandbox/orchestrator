@@ -645,5 +645,5 @@ make perf-density
 
 - [`cache.md`](cache.md) —— cache-ctl 架构,本文 §1 关注其运行特征
 - [`sandbox.md`](sandbox.md) —— sandbox-ctl 架构,本文 §2 关注其运行特征
-- [`node.md`](node.md) —— 节点资源控制器架构与协议规范
+- [`node-resource.md`](node-resource.md) —— 节点资源控制器架构与协议规范
 - [`kuasar-sandbox.md`](kuasar-sandbox.md) §1.3 / §7 —— 系统级 SLO 与规模推算的来源

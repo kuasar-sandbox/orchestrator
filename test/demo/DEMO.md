@@ -13,7 +13,7 @@ SDK 零修改,仅靠环境变量 + 本机 `/etc/hosts` + 自签 TLS(`SSL_CERT_FI
 
 ## 演示了什么
 
-| 步骤 | 命令(真实 e2b Python SDK / orchestrator-ctl) | 证明 |
+| 步骤 | 命令(真实 e2b Python SDK / node-ctl) | 证明 |
 |---|---|---|
 | 1 | (编排起栈) | orchestrator(TLS) + eBPF vswitch + host NAT;store/cache 经 UDS 复用 |
 | 2 | `e2b-key-ctl` + `manifest-key add` | 密钥模型:manifest_key 根密钥 → 派生 api_key → 白名单 + 租户镜像拉取凭据 |
@@ -28,7 +28,7 @@ SDK 零修改,仅靠环境变量 + 本机 `/etc/hosts` + 自签 TLS(`SSL_CERT_FI
 
 ## 前置条件
 
-- 二进制(`make -C kuasar-sandbox build`):`orchestrator-ctl`、`store-ctl`、**`cache-ctl`**(CGO/rocksdb)、
+- 二进制(`make -C kuasar-sandbox build`):`node-ctl`、`store-ctl`、**`cache-ctl`**(CGO/rocksdb)、
   `flatten-ctl`、`e2b-key-ctl`、`vswitch-ctl`、`cloud-hypervisor`、`vmlinux`、`sandbox-runtime-e2b.erofs`、
   `sandbox-runtime-builder.erofs`(`make sandbox-runtime-builder`;构建沙箱的 guest 运行时)。
 - 主机:**systemd 为 PID1 + root**(编排经 D-Bus 驱动单元;TLS :443;KVM);可读写 `/dev/kvm`。
@@ -78,7 +78,7 @@ e2b profile 的 guest 网卡是一个 link-local **inner IP** `169.254.0.21/30`�
    **DNAT** 成沙箱 inner IP、重定向到对应 tap,回包再 **SNAT** 回 floatingip;`mgmt_cidrs` 含 `0.0.0.0/0` ⇒ 出网入口。
 2. **host NAT**(脚本幂等加、退出删):`iptables -A FORWARD -{i,o} sw0m0 …` + `-t nat -A POSTROUTING -s 100.100.96.0/20 -j MASQUERADE`。
 3. **guest inner IP + 默认路由 + `/etc/hosts`/`/etc/resolv.conf`** 由 orchestrator 经 SANDBOX_CONFIG `files:` 自动下发
-   (hostname 治 getfqdn 卡顿、见 orchestrator.md §10;guest DNS `169.254.169.253` 经 demo 的 iptables DNAT 路由到本机首个 nameserver)。
+   (hostname 治 getfqdn 卡顿、见 node.md §11;guest DNS `169.254.169.253` 经 demo 的 iptables DNAT 路由到本机首个 nameserver)。
 
 两条访问沙箱端口的路径(步骤 6 均验证):**直连** host 经 `sw0m0` 直达 `http://<floatingip>:<port>`;**e2b 暴露端口**
 `https://<port>-<sid>.<domain>`,proxy 校验 `X-Access-Token` 后转发到 `floatingip:port`。
@@ -96,7 +96,7 @@ e2b profile 的 guest 网卡是一个 link-local **inner IP** `169.254.0.21/30`�
 e2b SDK 用 `E2B_DOMAIN` 推出控制面 `https://api.<domain>` 与数据面 `https://<port>-<sid>.<domain>`:
 
 - `E2B_DOMAIN`/`E2B_API_KEY` 指向本节点;**构建直接 `from_image(<registry>/<image>)`**——构建沙箱内拉取并展平
-  (凭据来自租户默认或任务级 token,见 orchestrator.md §11),**不再有客户端 docker build/push 或 `E2B_IMAGE_URI_MASK`**。
+  (凭据来自租户默认或任务级 token,见 node.md §12),**不再有客户端 docker build/push 或 `E2B_IMAGE_URI_MASK`**。
   镜像 ref 须**从构建沙箱可达**:本地 zot 经 vswitch mgmt VIP(`169.254.169.254:<port>`)寻址(脚本自动改写),
   第三方仓库经 NAT 出网直达。
 - 自签 `*.<domain>` 证书 + **`SSL_CERT_FILE=<cert>`**(httpx 信任)让 SDK 接受 TLS。
@@ -111,7 +111,7 @@ e2b SDK 用 `E2B_DOMAIN` 推出控制面 `https://api.<domain>` 与数据面 `ht
   `launch.user=0:0`,不沿用镜像 `Config.User`)。
 - **持久存储复用**:`demo_prep.sh` 的 store/cache/仓库常驻、数据落 `DEMO_DATA_DIR`(默认 `~/.cache/kuasar-demo`),
   跨多次演示去重缓存 → 复跑快;`demo_prep.sh reset` 清空重来。
-- **自签 TLS** 仅为本机演示;生产用通配 `*.<domain>` 正式证书(见 `sandbox-orchestrator/docs/orchestrator.md` §12)。
+- **自签 TLS** 仅为本机演示;生产用通配 `*.<domain>` 正式证书(见 `sandbox-orchestrator/docs/node.md` §13)。
 
 自动化回归(断言版、非讲解版)见 `kuasar-sandbox/test/e2e/`:`e2e_run_builder.sh`(三阶段构建流水线:
 guest 内拉取展平 → steps → 模板快照 → 从产物模板 create)与 `e2e_execute.sh`(启动+执行+暂停/恢复状态存活)。

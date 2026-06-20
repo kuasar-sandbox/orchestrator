@@ -112,7 +112,7 @@ Warm Pool),共享同一套基础设施:内容定义分块、收敛加密、内�
                                                 ▼
   ┌── Compute node  (×N per AZ) ───────────────────────────────────────────────────────┐
   │                                                                                    │
-  │  orchestrator-ctl  (e2b-compatible ingress)                                        │
+  │  node-ctl          (e2b-compatible ingress)                                        │
   │    lands per-sandbox config & keys / invokes run / drives in-sandbox build         │
   │        │ run                                  │ build  (sandbox-builder@<bid>)     │
   │        ▼                                      ▼                                    │
@@ -149,7 +149,7 @@ Warm Pool),共享同一套基础设施:内容定义分块、收敛加密、内�
 | **sandbox-runtime** | microVM 生命周期引擎:一沙箱一进程的沙箱控制(块设备/快照代理、内存统一持有、balloon 环)+ Guest 一号进程 | `sandbox-ctl`、`sandbox-init`、`sandbox-runtime.erofs` | `pkg/resource`(资源控制协议+Client) | `sandbox-runtime/docs/sandbox.md`、`sandbox-runtime.md` |
 | **sandbox-accelerator** | 存储加速 + 镜像构建:分块/收敛加密/清单库 + 内容寻址存储 + 分层缓存 + OCI → EROFS 确定性展平(远程拉取 + Referrers 幂等) | `manifest-ctl`、`store-ctl`、`cache-ctl`、`flatten-ctl` | `pkg/manifest`、`pkg/image`、`pkg/{cache,store}/client` | `sandbox-accelerator/docs/{manifest,store,cache,flatten}.md` |
 | **sandbox-vswitch** | eBPF/TC 虚拟交换机:单节点 4096 端口隔离网络 + tapfd 交接 | `vswitch-ctl`、`tapfd-get` | `pkg/tapfd`(fd 交接规约) | `sandbox-vswitch/docs/{vswitch,tapfd}.md` |
-| **sandbox-orchestrator** | 单机沙箱编排 + e2b 兼容 ingress:控制面 REST、envd-in-guest 反代、模板构建(沙箱内三阶段)、密钥派生 + 节点级资源守护(准入/额度分配/主动回收) | `orchestrator-ctl`、`e2b-key-ctl`、`node-ctl`、`sandbox-runtime-{e2b,builder}.erofs` | — | `sandbox-orchestrator/docs/{orchestrator,node}.md` |
+| **sandbox-orchestrator** | 单机沙箱编排 + e2b 兼容 ingress:控制面 REST、envd-in-guest 反代、模板构建(沙箱内三阶段)、密钥派生 + 节点级资源守护(准入/额度分配/主动回收) | `node-ctl`、`cluster-ctl`、`e2b-key-ctl`、`sandbox-runtime-{e2b,builder}.erofs` | — | `sandbox-orchestrator/docs/{node,node-proxy,node-resource,cluster}.md` |
 | **sandbox-deps** | 原生依赖:定制 Guest 内核、VMM 补丁、erofs 工具 | `vmlinux`、`cloud-hypervisor`、`mkfs.erofs` | 构建脚本 + patches + configs | `sandbox-deps/docs/{cloud-hypervisor,sandbox-kernel,build}.md` |
 
 ### 2.3 依赖关系
@@ -169,7 +169,7 @@ Warm Pool),共享同一套基础设施:内容定义分块、收敛加密、内�
 实线是 Go 导入边。`sandbox-orchestrator` 不 import 任何兄弟仓(`CGO_ENABLED=0`
 叶子),在计算节点上经 `run-sandbox`/`run-builder` 驱动 `sandbox-ctl`(拉起/快照沙箱)、
 `vswitch-ctl`(编排网络);模板构建在构建沙箱内跑三阶段(`flatten-ctl` 经 builder runtime
-flavor 投影进 guest 执行,详见 `sandbox-orchestrator/docs/orchestrator.md` §11)。各 Go 导出面均为纯 Go、
+flavor 投影进 guest 执行,详见 `sandbox-orchestrator/docs/node.md` §12)。各 Go 导出面均为纯 Go、
 无 CGO;重后端(rocksdb/对象存储 SDK/eBPF)隔离在各仓 `server`/`rocks`/
 `internal` 内,不进入下游导入闭包。唯一 CGO 二进制是 accelerator 的
 `cache-ctl`(静态链 librocksdb)。
@@ -566,7 +566,7 @@ KASLR/ASLR 降低安全性,对短生命周期、网络隔离的 VM 可接受;Sna
 - 快照恢复路径下内存按需加载,初始工作集约 25%,天然减少物理占用;单沙箱底噪
   (VMM 进程 + 已驻留 Guest 页)<60 MiB,其中 VMM 进程开销 ~10 MiB 量级。
 
-密度实测与调优杠杆见 [`perf.md`](perf.md) §3,协议与算法见 `node.md`。
+密度实测与调优杠杆见 [`perf.md`](perf.md) §3,协议与算法见 `sandbox-orchestrator/docs/node-resource.md`。
 
 ## 5. 设计取舍
 
@@ -724,7 +724,7 @@ Cold boot (1 GiB image):                 Snapshot restore (512 MiB):
 按节点角色部署(进程清单、端口、配置入口、启停依赖与故障域见
 [`deployment.md`](deployment.md)):
 
-- **计算节点**(~5,000/AZ):`orchestrator-ctl` + `node-ctl` + `cache-ctl tiered`
+- **计算节点**(~5,000/AZ):`node-ctl` + `cache-ctl tiered`
   + `store-ctl`(sidecar)+ `sandbox-ctl × ~3K`(每沙箱一进程,派生
   `cloud-hypervisor`);e2b 模板构建在本节点的构建沙箱内进行(`sandbox-builder@<bid>`
   → 三阶段,见 `deployment.md` §5),无独立展平池。
@@ -747,8 +747,10 @@ Cold boot (1 GiB image):                 Snapshot restore (512 MiB):
 - `sandbox-accelerator/docs/flatten.md` — 确定性展平、远程拉取与 Referrers 幂等。
 - `sandbox-vswitch/docs/vswitch.md` — eBPF 虚拟交换机;`tapfd.md` — tap fd 交接
   协议。
-- `sandbox-orchestrator/docs/node.md` — 节点资源仲裁协议与算法。
-- `sandbox-orchestrator/docs/orchestrator.md` — e2b 兼容控制面、模板构建、密钥
-  与归属模型。
+- `sandbox-orchestrator/docs/node-resource.md` — 节点资源仲裁协议与算法。
+- `sandbox-orchestrator/docs/node.md` — e2b 兼容控制面、模板构建、密钥与归属模型、
+  集群接入(node-link)。
+- `sandbox-orchestrator/docs/cluster.md` — 集群级注册表 / Reserve 状态机 / 放置与
+  密钥分发(router·scaler)。
 - `sandbox-deps/docs/{cloud-hypervisor,sandbox-kernel,build}.md` — VMM 补丁集、
   Guest 内核契约、原生依赖构建。
