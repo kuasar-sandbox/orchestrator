@@ -171,7 +171,14 @@ func (r *Registry) startReserve(ctx context.Context, group, routeKey string, rec
 	if g, gok, _ := r.stores.GetGroupByID(ctx, group); gok {
 		cmd.TemplateRef = g.TemplateRef
 		if g.ManifestKey != "" {
-			cmd.KeyFingerprint = keyFingerprint(g.ManifestKey)
+			fp := keyFingerprint(g.ManifestKey)
+			cmd.KeyFingerprint = fp
+			// Predistribute the group's manifest key over the same ordered channel
+			// before create (cluster.md §7.6). Skeleton: distribute-on-reserve; the
+			// lease-based ahead-of-placement predistribution is Phase 7.
+			if err := conn.send(&routesync.Command{CmdID: newID(), Kind: routesync.CmdKeyPut, KeyFingerprint: fp, ManifestKey: g.ManifestKey, ExpiresUnix: time.Now().Add(3 * time.Hour).Unix()}); err != nil {
+				return err
+			}
 		}
 	}
 	return conn.send(cmd)

@@ -36,8 +36,25 @@ func (o *Orchestrator) HandleCommand(ctx context.Context, cmd *routesync.Command
 		if err := o.deleteCluster(ctx, cmd.SID); err != nil {
 			o.log.Error("cluster delete", "sid", cmd.SID, "err", err)
 		}
+	case routesync.CmdKeyPut, routesync.CmdKeyRenew:
+		// Key distribution (cluster.md §7.6): the registry pushes the group's
+		// manifest key into the node's allowlist (a TTL lease) so create can
+		// resolve it by fingerprint.
+		if cmd.ManifestKey != "" {
+			var ttl int64
+			if cmd.ExpiresUnix > 0 {
+				if ttl = cmd.ExpiresUnix - time.Now().Unix(); ttl <= 0 {
+					ttl = 1
+				}
+			}
+			if _, err := o.st.AddManifestKey(ctx, cmd.ManifestKey, "cluster", ttl, ""); err != nil {
+				o.log.Error("cluster key_put", "fp", cmd.KeyFingerprint, "err", err)
+			}
+		}
+	case routesync.CmdKeyDrop:
+		// the node's lazy lease expiry reclaims the key; explicit drop-by-fingerprint is Phase 7.
+		o.log.Debug("cluster key_drop", "fp", cmd.KeyFingerprint)
 	default:
-		// key_put/renew/drop land with Phase 6 (predistribution writes the allowlist).
 		o.log.Warn("cluster: unhandled command", "kind", cmd.Kind, "sid", cmd.SID)
 	}
 }
