@@ -240,6 +240,10 @@ SID=$(grep -o '"sandboxID":"[^"]*"' "$WORK/create.body" | head -1 | cut -d'"' -f
 [ -n "$SID" ] || fail "no sandboxID in create response"
 echo "==> PASS: cluster create booted sandbox $SID (router -> registry reserve -> node-link -> microVM)"
 
+# ---- router auth: a bad api key is rejected at the router before reserve (§8) -
+bad=$(curl -sS --noproxy '*' -o /dev/null -w '%{http_code}' -X POST -H "Host: api.$DOMAIN" -H "X-API-KEY: e2b_deadbeefdeadbeef" -H "X-Kuasar-Sandbox-Group: $GROUP" -H "X-Kuasar-Route-Key: bad:key" "http://127.0.0.1:$ROUTER_PORT/sandboxes")
+[ "$bad" = "403" ] && echo "==> PASS: router rejected a bad api key (403, §8 auth cache)" || fail "router auth: bad key got $bad (want 403)"
+
 # ---- the registry knows the route is ready ---------------------------------
 curl -sS --noproxy '*' --unix-socket "$OP_SOCK" -o "$WORK/route.body" "http://op/op/route?sid=$SID" || fail "op route query"
 grep -q '"state":"ready"' "$WORK/route.body" || { cat "$WORK/route.body"; fail "registry route not ready for $SID"; }
