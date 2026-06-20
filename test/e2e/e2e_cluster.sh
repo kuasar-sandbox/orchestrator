@@ -177,24 +177,13 @@ done
 "$BIN/node-ctl" manifest-key add --socket "$WORK/node-ctl.socket" "$MK" >/dev/null || fail "manifest-key add"
 echo "==> node-ctl up (:$PORT); its node-link client retries until the registry starts"
 
-# ---- build a template via the node's e2b API -------------------------------
-code=$(req POST /v3/templates "$AK" '{"name":"cluster-tmpl"}'); [ "$code" = "202" ] || { cat "$WORK/resp.body"; fail "register=$code"; }
-TID=$(grep -o '"templateID":"[^"]*"' "$WORK/resp.body" | head -1 | cut -d'"' -f4)
-BID=$(grep -o '"buildID":"[^"]*"' "$WORK/resp.body" | head -1 | cut -d'"' -f4)
-code=$(req POST "/v2/templates/$TID/builds/$BID" "$AK" "{\"fromImage\":\"$GUEST_REF\"}"); [ "$code" = "202" ] || { cat "$WORK/resp.body"; fail "trigger=$code"; }
-TEMPLATE=""
-for _ in $(seq 1 120); do
-    req GET "/templates/$TID/builds/$BID/status" "$AK" >/dev/null
-    st=$(grep -o '"status":"[^"]*"' "$WORK/resp.body" | head -1 | cut -d'"' -f4)
-    case "$st" in ready) TEMPLATE=$(grep -oE 'e2b-img-[0-9a-f]{64}' "$WORK/resp.body" | head -1); break;; error) cat "$WORK/resp.body"; fail "build error";; esac; sleep 1
-done
-[ -n "$TEMPLATE" ] || fail "build did not become ready"
-echo "==> built template: $TEMPLATE"
-
-# ---- seed group config (registry not yet running), then start registry -----
+# ---- seed group (no template yet), start registry + router -----------------
+# The group carries the manifest key + placement; its template_ref is filled in
+# after the cluster build below. Seed before the registry starts so the registry
+# is the sole sqlite writer (no cross-process revision clash).
 GROUP="/cell/proj/app/g1"
-"$BIN/cluster-ctl" group upsert --config "$WORK/cluster.yaml" --group "$GROUP" --template-ref "$TEMPLATE" --manifest-key "$MK" >/dev/null || fail "group upsert"
-echo "==> seeded group $GROUP -> $TEMPLATE"
+"$BIN/cluster-ctl" group upsert --config "$WORK/cluster.yaml" --group "$GROUP" --manifest-key "$MK" >/dev/null || fail "group upsert"
+echo "==> seeded group $GROUP (manifest key; template set after the cluster build)"
 "$BIN/cluster-ctl" registry --config "$WORK/cluster.yaml" >"$WORK/registry.log" 2>&1 &
 PIDS+=($!); wait_port 127.0.0.1 "$REG_PORT" registry
 echo "==> cluster-ctl registry up (node-link :$REG_PORT, op $OP_SOCK)"
@@ -204,6 +193,34 @@ echo "==> PASS: node joined the cluster (registry saw the node-link connection)"
 "$BIN/cluster-ctl" router --config "$WORK/cluster.yaml" >"$WORK/router.log" 2>&1 &
 PIDS+=($!); wait_port 127.0.0.1 "$ROUTER_PORT" router
 echo "==> cluster-ctl router up (:$ROUTER_PORT)"
+
+# ---- build a template THROUGH the cluster (router -> reserve-build -> node) -
+# rreq drives the e2b build via the router control plane: the register reserves a
+# build node (predistributing the key) and the router records build_id -> node,
+# routing the trigger/status there.
+rreq() {
+    local method="$1" path="$2" body="${3:-}"
+    local args=(-sS --noproxy '*' -o "$WORK/resp.body" -w '%{http_code}' -X "$method" -H "Host: api.$DOMAIN" -H "X-API-KEY: $AK" -H "X-Kuasar-Sandbox-Group: $GROUP")
+    [ -n "$body" ] && args+=(-H 'Content-Type: application/json' -d "$body")
+    curl "${args[@]}" "http://127.0.0.1:$ROUTER_PORT$path"
+}
+code=$(rreq POST /v3/templates '{"name":"cluster-tmpl"}'); [ "$code" = "202" ] || { cat "$WORK/resp.body"; fail "cluster build register=$code"; }
+TID=$(grep -o '"templateID":"[^"]*"' "$WORK/resp.body" | head -1 | cut -d'"' -f4)
+BID=$(grep -o '"buildID":"[^"]*"' "$WORK/resp.body" | head -1 | cut -d'"' -f4)
+code=$(rreq POST "/v2/templates/$TID/builds/$BID" "{\"fromImage\":\"$GUEST_REF\"}"); [ "$code" = "202" ] || { cat "$WORK/resp.body"; fail "cluster build trigger=$code"; }
+TEMPLATE=""
+for _ in $(seq 1 120); do
+    rreq GET "/templates/$TID/builds/$BID/status" >/dev/null
+    st=$(grep -o '"status":"[^"]*"' "$WORK/resp.body" | head -1 | cut -d'"' -f4)
+    case "$st" in ready) TEMPLATE=$(grep -oE 'e2b-img-[0-9a-f]{64}' "$WORK/resp.body" | head -1); break;; error) cat "$WORK/resp.body"; fail "cluster build error";; esac; sleep 1
+done
+[ -n "$TEMPLATE" ] || { sed 's/^/  router| /' "$WORK/router.log" | tail -20; fail "cluster build did not become ready"; }
+echo "==> PASS: cluster build produced $TEMPLATE (router -> reserve-build -> node build sandbox)"
+
+# ---- point the group at the freshly built template (registry in-process) ----
+code=$(curl -sS --noproxy '*' --unix-socket "$OP_SOCK" -o /dev/null -w '%{http_code}' -X POST "http://op/op/group?group=$GROUP&template_ref=$TEMPLATE")
+[ "$code" = "204" ] || fail "op /op/group set template_ref (http $code)"
+echo "==> group $GROUP -> $TEMPLATE (via registry op)"
 
 # ---- create a sandbox THROUGH the cluster (router -> reserve -> node boot) --
 RK="user1:sess1"
