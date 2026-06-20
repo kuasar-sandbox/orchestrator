@@ -54,11 +54,13 @@ type reserveCall struct {
 	err    error
 }
 
-// ReserveResult is what a satisfied ReserveSandbox returns (cluster.md §7.2).
+// ReserveResult is what a satisfied ReserveSandbox returns (cluster.md §7.2). The
+// router injects AccessToken and forwards to the node's DataEndpoint.
 type ReserveResult struct {
-	NodeID      string
-	SID         string
-	AccessToken string
+	NodeID       string `json:"node_id"`
+	SID          string `json:"sid"`
+	AccessToken  string `json:"access_token"`
+	DataEndpoint string `json:"data_endpoint"`
 }
 
 // New builds a Registry. If placer is nil a built-in least-loaded placer is used.
@@ -95,7 +97,7 @@ func (r *Registry) ReserveSandbox(ctx context.Context, group, routeKey string, c
 	}
 	if found && rec.State == StateReady {
 		if _, live := r.node(rec.NodeID); live {
-			return &ReserveResult{NodeID: rec.NodeID, SID: rec.SID, AccessToken: rec.AccessToken}, nil
+			return &ReserveResult{NodeID: rec.NodeID, SID: rec.SID, AccessToken: rec.AccessToken, DataEndpoint: r.nodeDataEndpoint(ctx, rec.NodeID)}, nil
 		}
 		// node gone: fall through to re-place (dead-node sweep also resets it).
 	}
@@ -203,7 +205,7 @@ func (r *Registry) applyRoute(ctx context.Context, nodeID string, e *routesync.R
 	}
 	r.indexSID(e.SandboxID, e.Group, e.RouteKey)
 	if rec.State == StateReady {
-		r.finish(flightKey(e.Group, e.RouteKey), &ReserveResult{NodeID: nodeID, SID: e.SandboxID, AccessToken: e.AccessToken}, nil)
+		r.finish(flightKey(e.Group, e.RouteKey), &ReserveResult{NodeID: nodeID, SID: e.SandboxID, AccessToken: e.AccessToken, DataEndpoint: r.nodeDataEndpoint(ctx, nodeID)}, nil)
 	}
 }
 
@@ -265,6 +267,15 @@ func (r *Registry) node(id string) (nodeConn, bool) {
 	defer r.mu.Unlock()
 	c, ok := r.nodes[id]
 	return c, ok
+}
+
+// nodeDataEndpoint returns a node's data-plane endpoint (the router forwards to
+// it), or "" if the node is unknown.
+func (r *Registry) nodeDataEndpoint(ctx context.Context, nodeID string) string {
+	if n, found, _ := r.stores.GetNode(ctx, nodeID); found && n != nil {
+		return n.DataEndpoint
+	}
+	return ""
 }
 
 func (r *Registry) addNode(c nodeConn) {

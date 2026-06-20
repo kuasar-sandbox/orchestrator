@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"golang.org/x/net/http2"
@@ -78,9 +79,47 @@ func runRegistry(args []string, log *slog.Logger) error {
 		<-ctx.Done()
 		srv.Close()
 	}()
-	log.Info("cluster-ctl registry serving node-link", "channel_listen", cfg.Channel.Listen, "store", cfg.Store.DSN)
+
+	// Op interface (router / scaler dial, cluster.md §5.2; the cluster e2e drives
+	// reserve through it). Phase 7 adds mTLS + the resumable watch.
+	opMux := http.NewServeMux()
+	reg.ServeOp(opMux)
+	opLn, err := listenOp(cfg.Op.Listen)
+	if err != nil {
+		return fmt.Errorf("registry: op listen %s: %w", cfg.Op.Listen, err)
+	}
+	opSrv := &http.Server{Handler: opMux}
+	go func() {
+		<-ctx.Done()
+		opSrv.Close()
+	}()
+	go func() {
+		if err := opSrv.Serve(opLn); err != nil && err != http.ErrServerClosed {
+			log.Error("registry op", "err", err)
+		}
+	}()
+
+	log.Info("cluster-ctl registry", "channel_listen", cfg.Channel.Listen, "op_listen", cfg.Op.Listen, "store", cfg.Store.DSN)
 	if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
 		return err
 	}
 	return nil
+}
+
+// listenOp binds the op interface: a unix socket (path starts with "/") at 0600,
+// or a TCP address.
+func listenOp(addr string) (net.Listener, error) {
+	if strings.HasPrefix(addr, "/") {
+		_ = os.Remove(addr)
+		if dir := addr[:strings.LastIndexByte(addr, '/')]; dir != "" {
+			_ = os.MkdirAll(dir, 0o755)
+		}
+		ln, err := net.Listen("unix", addr)
+		if err != nil {
+			return nil, err
+		}
+		_ = os.Chmod(addr, 0o600)
+		return ln, nil
+	}
+	return net.Listen("tcp", addr)
 }
