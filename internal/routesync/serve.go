@@ -31,7 +31,7 @@ type Source interface {
 // config-socket plugin handler calls this before ServeAuthority so it can register
 // the subscriber (and its proxy target) before streaming.
 func ReadRegister(r io.Reader) (Register, error) {
-	m, err := readMsg(r)
+	m, err := ReadMsg(r)
 	if err != nil {
 		return Register{}, err
 	}
@@ -80,7 +80,7 @@ func ServeAuthority(ctx context.Context, w io.Writer, flush func(), body io.Read
 	go func() {
 		defer cancel()
 		for {
-			m, err := readMsg(body)
+			m, err := ReadMsg(body)
 			if err != nil {
 				if sctx.Err() == nil {
 					log.Debug("routesync: authority read end", "err", err)
@@ -94,7 +94,7 @@ func ServeAuthority(ctx context.Context, w io.Writer, flush func(), body io.Read
 	}()
 
 	// Writer: handshake policy first (flush so the peer's RoundTrip returns).
-	if err := writeMsg(w, &Msg{Type: TypeHello, Hello: &Hello{Version: Version, Policy: src.Policy()}}); err != nil {
+	if err := WriteMsg(w, &Msg{Type: TypeHello, Hello: &Hello{Version: Version, Policy: src.Policy()}}); err != nil {
 		return
 	}
 	flush()
@@ -111,11 +111,11 @@ func ServeAuthority(ctx context.Context, w io.Writer, flush func(), body io.Read
 	defer cancelSub()
 
 	if err := src.Range(sctx, func(r RouteEntry) error {
-		return writeMsg(w, &Msg{Type: TypeUpsert, Route: &r})
+		return WriteMsg(w, &Msg{Type: TypeUpsert, Route: &r})
 	}); err != nil {
 		return
 	}
-	if err := writeMsg(w, &Msg{Type: TypeBookmark}); err != nil {
+	if err := WriteMsg(w, &Msg{Type: TypeBookmark}); err != nil {
 		return
 	}
 	flush()
@@ -138,7 +138,7 @@ func ServeAuthority(ctx context.Context, w io.Writer, flush func(), body io.Read
 			default:
 				continue
 			}
-			if err := writeMsg(w, m); err != nil {
+			if err := WriteMsg(w, m); err != nil {
 				return
 			}
 			flush()

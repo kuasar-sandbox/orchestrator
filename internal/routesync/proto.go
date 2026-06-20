@@ -182,8 +182,8 @@ type Event struct {
 
 const maxFrame = 1 << 20 // 1 MiB — generous bound for a single route/wake frame (no all-routes frame)
 
-// writeMsg writes a length-prefixed JSON frame ([4B LE len][json]).
-func writeMsg(w io.Writer, m *Msg) error {
+// WriteMsg writes a length-prefixed JSON frame ([4B LE len][json]).
+func WriteMsg(w io.Writer, m *Msg) error {
 	b, err := json.Marshal(m)
 	if err != nil {
 		return err
@@ -200,8 +200,8 @@ func writeMsg(w io.Writer, m *Msg) error {
 	return err
 }
 
-// readMsg reads one length-prefixed JSON frame.
-func readMsg(r io.Reader) (*Msg, error) {
+// ReadMsg reads one length-prefixed JSON frame.
+func ReadMsg(r io.Reader) (*Msg, error) {
 	var hdr [4]byte
 	if _, err := io.ReadFull(r, hdr[:]); err != nil {
 		return nil, err

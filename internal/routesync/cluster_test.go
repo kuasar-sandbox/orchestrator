@@ -8,12 +8,12 @@ import (
 func roundTrip(t *testing.T, m *Msg) *Msg {
 	t.Helper()
 	var buf bytes.Buffer
-	if err := writeMsg(&buf, m); err != nil {
-		t.Fatalf("writeMsg: %v", err)
+	if err := WriteMsg(&buf, m); err != nil {
+		t.Fatalf("WriteMsg: %v", err)
 	}
-	got, err := readMsg(&buf)
+	got, err := ReadMsg(&buf)
 	if err != nil {
-		t.Fatalf("readMsg: %v", err)
+		t.Fatalf("ReadMsg: %v", err)
 	}
 	return got
 }

@@ -1,0 +1,119 @@
+package registry
+
+import (
+	"context"
+	"io"
+	"log/slog"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/clusterstore"
+	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/routesync"
+)
+
+func testReg(t *testing.T) *Registry {
+	t.Helper()
+	kv, err := clusterstore.Open(filepath.Join(t.TempDir(), "reg.db"), 0)
+	if err != nil {
+		t.Fatalf("open kv: %v", err)
+	}
+	t.Cleanup(func() { kv.Close() })
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	return New(NewStores(kv, nil), nil, 5*time.Second, log)
+}
+
+// fakeConn implements nodeConn; its onCmd hook lets a test simulate the node
+// reacting to a command (e.g. reporting the sandbox running).
+type fakeConn struct {
+	nodeID string
+	onCmd  func(*routesync.Command)
+}
+
+func (c *fakeConn) id() string { return c.nodeID }
+func (c *fakeConn) send(cmd *routesync.Command) error {
+	if c.onCmd != nil {
+		c.onCmd(cmd)
+	}
+	return nil
+}
+
+func TestReserveSandboxCreateFlow(t *testing.T) {
+	ctx := context.Background()
+	reg := testReg(t)
+	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// The fake node, on create, reports the sandbox running (the node is the
+	// route authority; the registry's Reserve waits on this).
+	conn := &fakeConn{nodeID: "n1"}
+	conn.onCmd = func(cmd *routesync.Command) {
+		if cmd.Kind != routesync.CmdCreate {
+			return
+		}
+		go reg.applyRoute(context.Background(), "n1", &routesync.RouteEntry{
+			SandboxID: cmd.SID, Group: cmd.Group, RouteKey: cmd.RouteKey,
+			State: routesync.StateRunning, AccessToken: "tok-" + cmd.SID,
+		})
+	}
+	reg.addNode(conn)
+
+	res, err := reg.ReserveSandbox(ctx, "/c/p/a/g1", "u1:s1", nil)
+	if err != nil {
+		t.Fatalf("reserve: %v", err)
+	}
+	if res.NodeID != "n1" || res.SID == "" || res.AccessToken != "tok-"+res.SID {
+		t.Fatalf("reserve result: %+v", res)
+	}
+
+	// The sandbox is now READY; a second reserve for the same key returns it
+	// directly (session affinity) without re-placing.
+	res2, err := reg.ReserveSandbox(ctx, "/c/p/a/g1", "u1:s1", nil)
+	if err != nil {
+		t.Fatalf("re-reserve: %v", err)
+	}
+	if res2.SID != res.SID || res2.NodeID != "n1" {
+		t.Fatalf("re-reserve mismatch: %+v vs %+v", res2, res)
+	}
+
+	// SandboxStore reflects READY keyed by (group, route_key).
+	rec, _, found, err := reg.stores.GetSandbox(ctx, "/c/p/a/g1", "u1:s1")
+	if err != nil || !found || rec.State != StateReady {
+		t.Fatalf("stored record: %+v found=%v err=%v", rec, found, err)
+	}
+}
+
+func TestReserveSandboxNoNode(t *testing.T) {
+	reg := testReg(t)
+	if _, err := reg.ReserveSandbox(context.Background(), "/c/p/a/g1", "u1:s1", nil); err == nil {
+		t.Fatal("expected error with no nodes")
+	}
+}
+
+func TestReservePausedResume(t *testing.T) {
+	ctx := context.Background()
+	reg := testReg(t)
+	reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"})
+	// Seed a PAUSED sandbox on n1.
+	reg.stores.PutSandbox(ctx, &SandboxRecord{Group: "/g", RouteKey: "rk", SID: "sb-x", State: StatePaused, NodeID: "n1"})
+
+	conn := &fakeConn{nodeID: "n1"}
+	conn.onCmd = func(cmd *routesync.Command) {
+		if cmd.Kind != routesync.CmdConnect {
+			return
+		}
+		go reg.applyRoute(context.Background(), "n1", &routesync.RouteEntry{
+			SandboxID: "sb-x", Group: "/g", RouteKey: "rk", State: routesync.StateRunning, AccessToken: "tok",
+		})
+	}
+	reg.addNode(conn)
+
+	res, err := reg.ReserveSandbox(ctx, "/g", "rk", nil)
+	if err != nil {
+		t.Fatalf("resume reserve: %v", err)
+	}
+	if res.SID != "sb-x" || res.AccessToken != "tok" {
+		t.Fatalf("resume result: %+v", res)
+	}
+}

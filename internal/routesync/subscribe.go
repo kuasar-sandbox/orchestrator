@@ -104,7 +104,7 @@ func (s *Subscriber) session(ctx context.Context, tr *http2.Transport) error {
 	// Reader: a fresh sync generation, then apply down frames until EOF/error.
 	s.sink.BeginSync()
 	for {
-		m, err := readMsg(resp.Body)
+		m, err := ReadMsg(resp.Body)
 		if err != nil {
 			return err
 		}
@@ -116,7 +116,7 @@ func (s *Subscriber) session(ctx context.Context, tr *http2.Transport) error {
 // With no WakeSource it holds the request body open (the down stream is what matters).
 func (s *Subscriber) writeUp(ctx context.Context, w io.Writer) error {
 	r := s.reg
-	if err := writeMsg(w, &Msg{Type: TypeRegister, Register: &r}); err != nil {
+	if err := WriteMsg(w, &Msg{Type: TypeRegister, Register: &r}); err != nil {
 		return err
 	}
 	if s.wakes == nil {
@@ -128,7 +128,7 @@ func (s *Subscriber) writeUp(ctx context.Context, w io.Writer) error {
 		if !ok {
 			return ctx.Err()
 		}
-		if err := writeMsg(w, &Msg{Type: TypeWake, SID: sid}); err != nil {
+		if err := WriteMsg(w, &Msg{Type: TypeWake, SID: sid}); err != nil {
 			return err
 		}
 	}
