@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
@@ -70,6 +71,8 @@ func runRegistry(args []string, log *slog.Logger) error {
 	// Dead-node sweep (cluster.md §11): reset the sandboxes of nodes whose
 	// node-link dropped and whose last heartbeat predates node_dead_after.
 	go reg.RunReaper(ctx, cfg.Channel.NodeDeadDur())
+	// Key predistribution + lease renewal to each group's allocation set (§7.6).
+	go reg.RunKeyDistributor(ctx, time.Hour)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc(routesync.NodeLinkPath, reg.ServeNodeLink)

@@ -47,6 +47,9 @@ type Registry struct {
 	sidKeys   map[string][2]string              // sid -> {group, route_key} (delete-by-sid from the route stream)
 	acks      map[string]chan *routesync.CmdAck // cmd_id -> ack waiter (synchronous key commands)
 	cmdFlight map[string]string                 // create/connect cmd_id -> flightKey (ack-reject fast-fails Reserve)
+
+	keyMu     sync.Mutex
+	keyLeased map[string]map[string]bool // group -> node_ids currently holding the predistributed key
 }
 
 // reserveCall is one in-flight ReserveSandbox; joiners wait on done, the channel
@@ -84,6 +87,7 @@ func New(stores *Stores, placer Placer, parkTimeout time.Duration, log *slog.Log
 		sidKeys:     make(map[string][2]string),
 		acks:        make(map[string]chan *routesync.CmdAck),
 		cmdFlight:   make(map[string]string),
+		keyLeased:   make(map[string]map[string]bool),
 	}
 }
 
@@ -178,14 +182,10 @@ func (r *Registry) startReserve(ctx context.Context, group, routeKey string, rec
 	if g, gok, _ := r.stores.GetGroupByID(ctx, group); gok {
 		cmd.TemplateRef = g.TemplateRef
 		if g.ManifestKey != "" {
-			fp := keyFingerprint(g.ManifestKey)
-			cmd.KeyFingerprint = fp
-			// Predistribute the group's manifest key over the same ordered channel
-			// before create (cluster.md §7.6). Skeleton: distribute-on-reserve; the
-			// lease-based ahead-of-placement predistribution is Phase 7.
-			if err := conn.send(&routesync.Command{CmdID: newID(), Kind: routesync.CmdKeyPut, KeyFingerprint: fp, ManifestKey: g.ManifestKey, ExpiresUnix: time.Now().Add(3 * time.Hour).Unix()}); err != nil {
-				return err
-			}
+			// The key is predistributed to the group's allocation set ahead of
+			// placement (cluster.md §7.6; reconcileKeys); create only references it
+			// by fingerprint. A node missing it fails precheck -> rejected ack.
+			cmd.KeyFingerprint = keyFingerprint(g.ManifestKey)
 		}
 	}
 	r.trackCmd(cmd.CmdID, flightKey(group, routeKey))

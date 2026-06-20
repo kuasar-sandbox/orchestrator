@@ -58,6 +58,7 @@ func (r *Registry) ServeNodeLink(w http.ResponseWriter, req *http.Request) {
 	conn := &nodeChannel{nodeID: nr.NodeID, w: w, flush: flusher.Flush}
 	r.addNode(conn)
 	defer r.removeNode(conn)
+	r.onNodeConnected() // predistribute this node's groups' manifest keys (§7.6)
 
 	// Ack with a Hello so the node's RoundTrip returns and it starts streaming.
 	if err := routesync.WriteMsg(w, &routesync.Msg{Type: routesync.TypeHello, Hello: &routesync.Hello{Version: routesync.Version}}); err != nil {

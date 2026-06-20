@@ -221,6 +221,15 @@ func (o *Orchestrator) deriveSandboxAPIKey(ctx context.Context, sid string) (str
 // by fingerprint (cluster.md §7.6 lease withdrawal). 7a relies on the node's lazy
 // TTL-lease expiry to reclaim it; 7c wires explicit removal-by-fingerprint.
 func (o *Orchestrator) dropClusterKey(ctx context.Context, fingerprint string) error {
-	o.log.Debug("cluster key_drop (lazy lease expiry reclaims; explicit drop is 7c)", "fp", fingerprint)
+	keys, err := o.st.AllowedManifestKeysByHash(ctx, fingerprint)
+	if err != nil {
+		return err
+	}
+	for _, k := range keys {
+		if _, err := o.st.RemoveManifestKey(ctx, k); err != nil {
+			return err
+		}
+	}
+	o.log.Debug("cluster key_drop", "fp", fingerprint, "removed", len(keys))
 	return nil
 }

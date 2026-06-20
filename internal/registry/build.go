@@ -2,10 +2,6 @@ package registry
 
 import (
 	"context"
-	"fmt"
-	"time"
-
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/routesync"
 )
 
 // ReserveBuild places a template build on a node (cluster.md §11): it picks a
@@ -22,26 +18,12 @@ func (r *Registry) ReserveBuild(ctx context.Context, group string) (*ReserveResu
 	if err != nil {
 		return nil, err
 	}
-	conn, ok := r.node(nodeID)
-	if !ok {
+	if _, ok := r.node(nodeID); !ok {
 		return nil, ErrNoNode
 	}
-	if g, gok, _ := r.stores.GetGroupByID(ctx, group); gok && g.ManifestKey != "" {
-		fp := keyFingerprint(g.ManifestKey)
-		// Gate on the key being installed: the build register arrives over the data
-		// plane (HTTP) and races this channel command, so wait for the node's ack
-		// before handing the node back to the router (cluster.md §5.1, §7.6).
-		ack, err := r.sendAndWait(ctx, conn, &routesync.Command{
-			CmdID: newID(), Kind: routesync.CmdKeyPut, KeyFingerprint: fp,
-			ManifestKey: g.ManifestKey, ExpiresUnix: time.Now().Add(3 * time.Hour).Unix(),
-		}, 10*time.Second)
-		if err != nil {
-			return nil, fmt.Errorf("registry: build key predistribution: %w", err)
-		}
-		if ack.Status != routesync.AckAccepted {
-			return nil, fmt.Errorf("registry: build node rejected key: %s", ack.Reason)
-		}
-	}
+	// The group's manifest key is predistributed to the allocation set ahead of
+	// placement (cluster.md §7.6; reconcileKeys), so the build node already holds
+	// it — the build register (over the data plane) authorizes against it.
 	return &ReserveResult{NodeID: nodeID, DataEndpoint: r.nodeDataEndpoint(ctx, nodeID)}, nil
 }
 

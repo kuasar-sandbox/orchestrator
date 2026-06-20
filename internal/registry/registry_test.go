@@ -10,7 +10,57 @@ import (
 
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/clusterstore"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/routesync"
+	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/secretbox"
 )
+
+func testRegWithBox(t *testing.T) *Registry {
+	t.Helper()
+	kv, err := clusterstore.Open(filepath.Join(t.TempDir(), "reg.db"), 0)
+	if err != nil {
+		t.Fatalf("open kv: %v", err)
+	}
+	t.Cleanup(func() { kv.Close() })
+	box, err := secretbox.NewFromColonHex("0000000000000000000000000000000000000000000000000000000000000001")
+	if err != nil {
+		t.Fatalf("box: %v", err)
+	}
+	return New(NewStores(kv, box), nil, 5*time.Second, slog.New(slog.NewTextHandler(io.Discard, nil)))
+}
+
+const testMK = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+
+func TestKeyPredistribution(t *testing.T) {
+	ctx := context.Background()
+	reg := testRegWithBox(t)
+	reg.stores.PutGroup(ctx, &GroupConfig{Group: "/g", ManifestKey: testMK})
+	reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1", Labels: map[string]string{"zone": "east"}})
+	var cmds []*routesync.Command
+	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(c *routesync.Command) { cmds = append(cmds, c) }})
+
+	reg.reconcileKeys(ctx)
+
+	if len(cmds) != 1 || cmds[0].Kind != routesync.CmdKeyPut || cmds[0].ManifestKey != testMK {
+		t.Fatalf("expected one key_put with the group key, got %+v", cmds)
+	}
+}
+
+func TestKeyDropOnLeave(t *testing.T) {
+	ctx := context.Background()
+	reg := testRegWithBox(t)
+	reg.stores.PutGroup(ctx, &GroupConfig{Group: "/g", ManifestKey: testMK, NodeSelectors: []map[string]string{{"zone": "east"}}})
+	reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1", Labels: map[string]string{"zone": "east"}})
+	var cmds []*routesync.Command
+	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(c *routesync.Command) { cmds = append(cmds, c) }})
+
+	reg.reconcileKeys(ctx) // n1 matches the selector → key_put
+	reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1", Labels: map[string]string{"zone": "west"}})
+	cmds = nil
+	reg.reconcileKeys(ctx) // n1 left the set → key_drop
+
+	if len(cmds) != 1 || cmds[0].Kind != routesync.CmdKeyDrop {
+		t.Fatalf("expected one key_drop after the node left the allocation set, got %+v", cmds)
+	}
+}
 
 func testReg(t *testing.T) *Registry {
 	t.Helper()

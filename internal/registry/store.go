@@ -234,6 +234,25 @@ func (s *Stores) PutGroup(ctx context.Context, g *GroupConfig) error {
 	return err
 }
 
+// RangeGroups streams every group config (manifest_key decrypted) — the key
+// distributor reconciles predistribution leases over these (§7.6).
+func (s *Stores) RangeGroups(ctx context.Context, fn func(*GroupConfig) error) error {
+	return s.kv.Range(ctx, groupPrefix, func(kv clusterstore.KV) error {
+		var g GroupConfig
+		if err := json.Unmarshal(kv.Value, &g); err != nil {
+			return err
+		}
+		if g.ManifestKey != "" && s.box != nil {
+			dec, err := s.box.DecryptString(g.ManifestKey)
+			if err != nil {
+				return err
+			}
+			g.ManifestKey = dec
+		}
+		return fn(&g)
+	})
+}
+
 // GetGroupByID returns the group config for an exact group id (manifest_key
 // decrypted), or (nil,false) if absent.
 func (s *Stores) GetGroupByID(ctx context.Context, group string) (*GroupConfig, bool, error) {

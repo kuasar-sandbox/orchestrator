@@ -59,9 +59,9 @@ func (o *Orchestrator) readBuildJournal(ctx context.Context, bid string) []api.B
 	sc.Buffer(make([]byte, 1<<16), 8<<20) // some lines (RUN output) are large
 	for sc.Scan() {
 		var rec struct {
-			Message  json.RawMessage `json:"MESSAGE"`
-			Priority string          `json:"PRIORITY"`
-			RealtimeTS string        `json:"__REALTIME_TIMESTAMP"`
+			Message    json.RawMessage `json:"MESSAGE"`
+			Priority   string          `json:"PRIORITY"`
+			RealtimeTS string          `json:"__REALTIME_TIMESTAMP"`
 		}
 		if json.Unmarshal(sc.Bytes(), &rec) != nil {
 			continue
