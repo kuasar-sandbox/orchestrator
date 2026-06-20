@@ -28,7 +28,7 @@ func main() {
 	case "registry":
 		err = runRegistry(os.Args[2:], log)
 	case "router":
-		err = fmt.Errorf("router is not implemented yet (Phase 3)")
+		err = runRouter(os.Args[2:], log)
 	case "scaler":
 		err = fmt.Errorf("scaler is not implemented yet (Phase 4)")
 	case "group":
