@@ -253,6 +253,10 @@ case "$DATA_CODE" in
     *) echo "== router log =="; sed 's/^/  router| /' "$WORK/router.log" | tail -20; fail "data-plane forward to envd failed (http $DATA_CODE)";;
 esac
 
+# ---- control verb: GET the sandbox via the router (forward to the node) ------
+gcode=$(curl -sS --noproxy '*' -o /dev/null -w '%{http_code}' -H "Host: api.$DOMAIN" -H "X-API-KEY: $AK" -H "X-Kuasar-Sandbox-Group: $GROUP" "http://127.0.0.1:$ROUTER_PORT/sandboxes/$SID")
+[ "$gcode" = "200" ] && echo "==> PASS: control verb GET /sandboxes/$SID forwarded to the node (http 200)" || { sed 's/^/  router| /' "$WORK/router.log" | tail -10; fail "control-verb forward GET=$gcode (want 200)"; }
+
 # ---- dead-node sweep: kill node-ctl; the registry reaps its sandbox (§11) ----
 echo "==> killing node-ctl (pid $NODE_PID); expecting the registry to sweep $SID after node_dead_after (6s)"
 kill -9 "$NODE_PID" 2>/dev/null
