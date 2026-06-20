@@ -8,6 +8,7 @@
 //	node-ctl config       [--template]                          # render skeleton / dump resolved config
 //	node-ctl manifest-key <add|list|remove> ...                 # tenant root-key whitelist (admin socket)
 //	node-ctl export-sandbox|import-sandbox ...                  # paused-snapshot egress / ingress
+//	node-ctl resource <status|list|drain|grant|reclaim>        # node resource controller (hosted in serve via resource_listen)
 //	node-ctl version
 //
 // Templates are built through the e2b API (POST /v3/templates ...), not a CLI.
@@ -79,7 +80,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: node-ctl {serve|proxy|run-sandbox|run-builder|config|manifest-key|export-sandbox|import-sandbox|version} [flags]")
+	fmt.Fprintln(os.Stderr, "usage: node-ctl {serve|proxy|run-sandbox|run-builder|config|manifest-key|export-sandbox|import-sandbox|resource|version} [flags]")
 	os.Exit(2)
 }
 

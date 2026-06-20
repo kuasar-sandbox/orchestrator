@@ -77,7 +77,7 @@ paths:
   base_root: /var/lib/sandbox
   config_socket: /run/sandbox/node-ctl.socket  # local control socket: task + manifest-key admin + api plane (h2c)
   # db_path: /var/lib/sandbox/node-ctl.db    # default = <base_root>/node-ctl.db
-  # admin_pidfile: /run/sandbox/orchestrator-admin.pids  # PID allowlist for the admin plane; unset = socket 0600 perms (same uid/root)
+  # admin_pidfile: /run/sandbox/node-ctl-admin.pids  # PID allowlist for the admin plane; unset = socket 0600 perms (same uid/root)
 # units:                                          # systemd template units (defaults shown)
 #   dir: /etc/systemd/system
 #   runner: sandbox-runner@.service
@@ -128,6 +128,13 @@ builder:                                           # builds run INSIDE build san
   #   force_path_style: false                               # versitygw/minio need true
   #   access_key: ""                                        # empty → AWS default chain
   #   secret_key: ""
+# resource_listen: optional in-process node resource controller (admission /
+# budget / density; sandbox-ctl dials its socket). Disabled = static cgroup.
+# Inspect / operate with: node-ctl resource {status|list|drain|grant|reclaim}.
+# resource_listen:
+#   enabled: true
+#   socket: /run/sandbox-resource.sock           # "" = built-in default
+#   config: /etc/node-ctl/resource.yaml          # "" = built-in defaults
 checkpoint:                                        # paused-state tiering
   mode: local                                     # local (node-bound files) | remote (portable manifest)
   local_dir: /var/lib/sandbox-saved
