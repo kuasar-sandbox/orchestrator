@@ -12,6 +12,7 @@ package router
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -52,30 +53,43 @@ type routeResolve struct {
 // Router is the e2b unified ingress. It dials the registry op interface (UDS or
 // TCP) for reserve + route resolution.
 type Router struct {
-	domain   string
-	opBase   string // http base for the op interface
-	opClient *http.Client
-	log      *slog.Logger
+	domain      string
+	opBase      string // http base for the op interface
+	opClient    *http.Client // 60s timeout (reserve / route calls)
+	watchClient *http.Client // no timeout (the long-lived route watch stream)
+	log         *slog.Logger
 
 	buildsMu sync.Mutex
 	builds   map[string]string // build_id -> node data endpoint (a build is node-bound)
+
+	cacheMu  sync.RWMutex
+	cache    map[string]*routeResolve // sid -> resolved data-plane target (local route cache, §5)
+	keyToSID map[string]string        // sandbox store key -> sid (for delete eviction)
 }
 
 // New builds a Router. opAddr is the registry op endpoint: a path ("/run/...")
 // for a unix socket, or host:port for TCP.
 func New(opAddr, domain string, log *slog.Logger) *Router {
-	rt := &Router{domain: domain, log: log, builds: map[string]string{}}
+	rt := &Router{
+		domain: domain, log: log,
+		builds:   map[string]string{},
+		cache:    map[string]*routeResolve{},
+		keyToSID: map[string]string{},
+	}
+	var transport http.RoundTripper
 	if strings.HasPrefix(opAddr, "/") {
 		rt.opBase = "http://op"
-		rt.opClient = &http.Client{Timeout: 60 * time.Second, Transport: &http.Transport{
+		transport = &http.Transport{
 			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 				return (&net.Dialer{}).DialContext(ctx, "unix", opAddr)
 			},
-		}}
+		}
 	} else {
 		rt.opBase = "http://" + opAddr
-		rt.opClient = &http.Client{Timeout: 60 * time.Second}
+		transport = &http.Transport{}
 	}
+	rt.opClient = &http.Client{Timeout: 60 * time.Second, Transport: transport}
+	rt.watchClient = &http.Client{Transport: transport} // no timeout: the watch is long-lived
 	return rt
 }
 
@@ -235,10 +249,15 @@ func (rt *Router) serveData(w http.ResponseWriter, r *http.Request, host string)
 		return
 	}
 	sid := sub[i+1:]
-	rr, err := rt.opRoute(r.Context(), sid)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadGateway)
-		return
+	// Hot path: serve from the local route cache (zero op round-trip, §5). On a
+	// miss (cache lagging / cold), fall back to the registry op.
+	rr := rt.cachedRoute(sid)
+	if rr == nil {
+		var err error
+		if rr, err = rt.opRoute(r.Context(), sid); err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
 	}
 	if rr.State != "ready" || rr.DataEndpoint == "" {
 		http.Error(w, "sandbox not ready", http.StatusServiceUnavailable)
@@ -306,4 +325,116 @@ func (rt *Router) opCall(ctx context.Context, method, u string, out any) error {
 		return fmt.Errorf("op %s: %s: %s", u, resp.Status, strings.TrimSpace(string(b)))
 	}
 	return json.NewDecoder(resp.Body).Decode(out)
+}
+
+// --- local route cache (op watch) ---
+
+// watchEvent mirrors registry.WatchEvent (decoupled from the registry package).
+type watchEvent struct {
+	Type  string        `json:"type"` // "put" | "delete" | "bookmark"
+	Key   string        `json:"key,omitempty"`
+	Route *routeResolve `json:"route,omitempty"`
+	Rev   int64         `json:"rev,omitempty"`
+}
+
+func (rt *Router) cachedRoute(sid string) *routeResolve {
+	rt.cacheMu.RLock()
+	defer rt.cacheMu.RUnlock()
+	return rt.cache[sid]
+}
+
+// RunWatch keeps the local route cache synced from the registry's op watch
+// (cluster.md §5): a snapshot then live deltas, reconnecting with capped backoff.
+// The data plane serves from the cache (zero op round-trip); a miss falls back to
+// the op interface. cluster-ctl router runs this in the background.
+func (rt *Router) RunWatch(ctx context.Context) {
+	backoff := 200 * time.Millisecond
+	for ctx.Err() == nil {
+		err := rt.watchOnce(ctx)
+		if ctx.Err() != nil {
+			return
+		}
+		rt.log.Warn("router: route watch ended; reconnecting", "err", err)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(backoff):
+		}
+		backoff = min(backoff*2, 5*time.Second)
+	}
+}
+
+func (rt *Router) watchOnce(ctx context.Context) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rt.opBase+"/op/watch", nil)
+	if err != nil {
+		return err
+	}
+	resp, err := rt.watchClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("op watch: %s", resp.Status)
+	}
+	// Accumulate the snapshot, swap it in atomically at the bookmark, then apply
+	// live deltas to the live cache (so the data plane never sees a half-built set).
+	snap := map[string]*routeResolve{}
+	snapKey := map[string]string{}
+	syncing := true
+	for {
+		ev, err := readWatchFrame(resp.Body)
+		if err != nil {
+			return err
+		}
+		switch ev.Type {
+		case "put":
+			if ev.Route == nil {
+				continue
+			}
+			if syncing {
+				snap[ev.Route.SID] = ev.Route
+				snapKey[ev.Key] = ev.Route.SID
+			} else {
+				rt.cacheMu.Lock()
+				rt.cache[ev.Route.SID] = ev.Route
+				rt.keyToSID[ev.Key] = ev.Route.SID
+				rt.cacheMu.Unlock()
+			}
+		case "delete":
+			if !syncing {
+				rt.cacheMu.Lock()
+				if sid := rt.keyToSID[ev.Key]; sid != "" {
+					delete(rt.cache, sid)
+				}
+				delete(rt.keyToSID, ev.Key)
+				rt.cacheMu.Unlock()
+			}
+		case "bookmark":
+			rt.cacheMu.Lock()
+			rt.cache, rt.keyToSID = snap, snapKey
+			rt.cacheMu.Unlock()
+			syncing = false
+		}
+	}
+}
+
+func readWatchFrame(r io.Reader) (*watchEvent, error) {
+	var hdr [4]byte
+	if _, err := io.ReadFull(r, hdr[:]); err != nil {
+		return nil, err
+	}
+	n := binary.LittleEndian.Uint32(hdr[:])
+	if n == 0 || n > 1<<20 {
+		return nil, fmt.Errorf("router: bad watch frame length %d", n)
+	}
+	buf := make([]byte, n)
+	if _, err := io.ReadFull(r, buf); err != nil {
+		return nil, err
+	}
+	var ev watchEvent
+	if err := json.Unmarshal(buf, &ev); err != nil {
+		return nil, err
+	}
+	return &ev, nil
 }
