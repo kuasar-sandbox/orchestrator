@@ -1,738 +1,1122 @@
-# node — 节点资源控制器
+# node — 节点 e2b 兼容沙箱主机与集群接入
 
-`node-ctl` 是节点级资源控制器,作为 systemd-managed daemon 运行,跟节点上
-所有动态控制模式 sandbox-ctl 通过沙箱资源控制协议对话,完成跨沙箱仲裁、
-burst 申请、settled 收回、admission 控制。
+`node-ctl` 是计算节点上的单实例常驻 daemon,对外提供一套 **e2b 兼容 API**,把节点上的
+microVM 沙箱以 e2b 协议暴露给客户端——未改造的 e2b SDK(python / js `e2b`、
+`@e2b/code-interpreter`)与 e2b CLI 可直接指向本机运行。`node-ctl serve` 一身兼数职:
+**api**(控制面 REST:沙箱生命周期、模板构建、鉴权)、**主机**(经 systemd 模板单元
+拉起/停止 `sandbox-ctl` 与 `flatten-ctl`,调 `vswitch-ctl` 编排网络)、**proxy**(把
+客户端到沙箱的数据面流量反代到 guest)、可选的**资源控制器**(节点级资源仲裁,经
+`resource_listen` 内置,node-resource.md)、以及 **node-link 客户端**(接入集群,把本节点
+交由 cluster-ctl 编排,§10)。
 
-控制器是协议的**对端角色**,不是某个具体进程:任何遵循 §5 定义的实现都可
-作为 sandbox-ctl 的对端,`node-ctl` 是参考实现。本文档同时定义协议规范与
-node-ctl 的内部组织。
+node-ctl 既可**独立运行**(直供 e2b SDK / CLI,单机即可用),也可经 node-link **接入集群**
+由 registry / router / scaler 编排(cluster.md);两态共用同一套 e2b 控制面与生命周期原语——
+**控制面 create / pause / kill / 模板构建始终在本节点**,集群只下发高层命令复用这些原语(§10)。
+
+沙箱本体由 `sandbox-ctl` 运行(microVM,cloud-hypervisor);e2b profile 的 guest 内
+跑原版 envd(经注入 envd 的 `sandbox-runtime-e2b.erofs`,§11),serve 经 UDS
+反代其单端口协议(49983/Connect-RPC)。密钥模型以租户 **manifest_key** 为根:api_key
+由它派生(MAC 令牌),库内只存 AES-GCM 密文,密钥永不落明文盘(§7)。
+
+产物两个二进制:**`node-ctl`**(daemon + 启动器 + 资源控制器 + 管理 CLI,§2)与
+**`e2b-key-ctl`**(纯派生凭据工具,无 DB/config/编排状态,§2.8)。
 
 ## 1. 概述
 
 ### 1.1 业务问题
 
-平台目标是单节点高密度承载 microVM 沙箱。Agent 应用的运行剖面有显著间歇性:
+平台的沙箱栈(runtime/accelerator/builder/vswitch)各自提供 CLI 原语:起一台 microVM、
+展平一个镜像、attach 一个端口。缺一个北向面把它们组合成"客户可用的服务":客户拿着
+现成的 e2b SDK/CLI 与一个 api key,要能 create/exec/pause/resume/kill 沙箱、构建自定义
+模板,而不感知 microVM、manifest、eBPF 交换机的存在。
 
-- **稳态**:绝大多数时间占用极少资源(典型 0.1 核 / 128 MiB),用于心跳、
-  长连接保活、轻量后台任务
-- **突发**:处理用户请求时短时拉到声明上限(2 核 / 8 GiB),持续秒到分钟级
-- **回归**:请求处理完后回到稳态
-
-矛盾的根源是:**capacity 之和远大于物理内存(超分),但 burst 窗口期需要
-兑现 capacity 承诺**。静态分配解决不了这个问题——必须有动态调度,根据节点
-资源预算把资源按需分给突发中的沙箱、从空闲沙箱回收。
-
-控制器解决三个矛盾:
-1. **超分必要性**:让 allocatable 贴近真实工作集,密度从 `physical_mem /
-   capacity` 提升到 `physical_mem / typical_floor`(典型提升 60×)
-2. **突发不能丢状态**:burst 中沙箱被 OOM kill = 业务感知失败。控制器仲裁
-   保证有预算的沙箱可以拉到 capacity
-3. **节点不能炸**:多沙箱同时 burst 时 host 级 OOM 是灾难。控制器水位机制
-   保证 `node_allocated ≤ allocatable_pool`
+node-ctl 补这一层,并刻意选择 **e2b 协议兼容**而非自定义 API:e2b 的 SDK 生态
+(代码解释器、agent 框架集成)直接可用,客户端零改造;协议契约清晰(端点、token、
+状态机皆有参照实现),兼容性可用真实 SDK/CLI 端到端验收。大规模部署时,多个 node-ctl
+节点经 node-link 聚合到 cluster-ctl 控制面,做机群级会话亲和路由与按需调度(§10、cluster.md);
+单节点亦可独立承载。
 
 ### 1.2 设计原则
 
-1. **优先确定性闭环**:首选内核态自动机制(cgroup memory.high PSI、cpu.max
-   throttling、cpu.weight 比例公平、deflate_on_oom),用户态控制环路只补内核
-   机制不到位的部分
-2. **CPU 静态、内存动态**:CPU 通过 `cpu.max + cpu.weight` 静态实现,不引入
-   CPU 维度的动态控制环;只有内存有 burst/recover 状态机
-3. **per-sandbox-ctl 进程模型不破**:sandbox-ctl 仍是 runc-style 一次启动
-   一个沙箱;控制器是它的协调对端,不是监督者
-4. **状态全部在 /run**:控制器状态进 tmpfs,host 下电即清空——下电后所有
-   沙箱都不存在,无任何有效信息需要跨重启留存
-5. **故障域边界清晰**:控制器状态意外丢失后能从 cgroup 与 sandbox-ctl 重建;
-   sandbox-ctl 崩溃自动通知控制器释放预留;两者无需强一致
-6. **事件驱动而非定时**:settled 等关键状态转换以 launch protocol 消息为
-   触发,不依赖定时器估计
+1. **依赖面薄,经 CLI 组合**:驱动 `sandbox-ctl`(run/snapshot)、`vswitch-ctl`
+   (attach/detach)、`flatten-ctl`(export)全部经子进程 CLI,不 import 兄弟仓内部包;
+   经 systemd D-Bus 管单元;经 UDS 反代 envd。叶子组件,纯 Go,`CGO_ENABLED=0`。
+2. **资源仲裁可内置可外置**:沙箱准入/配额由 `sandbox-ctl`(`pkg/resource` 的 client)
+   与节点级**资源控制器**对话完成;控制器既可独立进程,也可由 `node-ctl serve` 经
+   `resource_listen` 内置(node-resource.md)。控制器是可分离的子系统,与 serve 的
+   api / 主机 / proxy 逻辑解耦。构建任务的资源池由 serve 自管(§12)。
+3. **进程管理交给 systemd**:一沙箱一单元(`sandbox-runner@<sid>`),单元 cgroup 即
+   沙箱资源 cgroup(`--cgroup-adopt`,§5.1),`StopUnit` 即完整回收;serve 不
+   自己当进程监督者。
+4. **密钥不落明文盘**:租户 manifest_key 库内 AES-256-GCM 加密,运行期只经内存与
+   启动器 LaunchSpec 的 env 帧传递(§6、§7);集群下经 node-link 下行的 manifest_key
+   同样仅加密落盘(§10)。
+5. **本节点路由权威,数据面可外置,集群可接入**:serve 是**本节点**路由与生命周期的
+   权威;数据面 proxy 可内置(单二进制)或外置为独立 worker(§9)。接入集群时,机群级
+   路由权威是 registry——serve 经 node-link 上报沙箱事件、受理集群命令(§10),不与
+   集群争路由权威。
+6. **重启可对账**:状态在 sqlite + systemd 单元集,serve 重启后以单元集为
+   存活权威对账收养/清理(§15);集群下另经 node-link 重连重报本节点沙箱集让 registry 收敛。
 
-### 1.3 故障域
+### 1.3 两类沙箱(profile)
 
-| 故障 | 直接影响 | 规避 / 自愈 |
-|------|---------|-------------|
-| controller 崩溃 | sandbox-ctl 长连断开;新沙箱 admit 失败 | systemd 重启;sandbox-ctl 退化无控制器继续跑 |
-| controller 状态文件损坏 | 重启时无法恢复 reservation 记账 | 从空状态起,预算按 yaml 重算,等 sandbox-ctl 重连(§8.2) |
-| sandbox-ctl 崩溃 | 沙箱按既有规则销毁 | controller 检测连接断 → 保留 reservation 等 Reattach,心跳静默 90 s 后释放 |
-| controller ↔ sandbox-ctl 网络抖动 | RPC 超时 | 退避重连;期间 sandbox-ctl 用最近一次 grant 继续跑 |
-| 单沙箱 OOM | guest 内进程被 kill;deflate_on_oom 释放 balloon | 非平台级故障;controller 计 OOM 事件 |
-| host 物理 OOM | 内核 OOM killer 选目标 | 水位机制保证 node_allocated 始终 ≤ 物理可用,正常情况不应触发 |
+| profile | 是什么 | 数据面 | 对外服务 |
+|---|---|---|---|
+| **e2b** | guest 内跑原版 envd,agent 经其 exec / 读写文件 / 跑代码 | 支持(fs/process/pty/runCode,经 envd 代理) | envd + floatingip 用户端口 |
+| **bare** | 把客户镜像当网络化 microVM 跑起来,无 envd | 不支持(控制端口回 501) | 仅 floatingip 网络 |
+
+`bare` 直接复用基础沙箱运行时(`sandbox-runtime.erofs`),把基础沙箱接上北向 API;
+经 e2b API 构建的模板恒为 **e2b** profile。profile 编码在 templateID 前缀里(§4.4),
+运行期据此选 runtime erofs 与数据通路。
+
+### 1.4 边界与依赖
+
+- 北向客户:e2b SDK / CLI 直连;集群下经 cluster-ctl router 转发(数据面)+ node-link
+  下发命令(控制),平台管理面亦可经 e2b API 对接。
+- 既可**独立运行**也可**接入集群**:控制面(create/pause/kill/模板构建)始终在本节点;
+  接入集群仅多一条 node-link(§10),不改 e2b 契约。
+- 不实现 envd 协议:数据面只透传到 guest 内原版 envd(§4.3)。
+- 不提供 sandbox metrics 端点(e2b API 的 `/sandboxes/{id}/metrics` 面)。
+- 构建不支持 server 端执行 Dockerfile steps:服务端只对一个已存在的镜像引用做拉取 +
+  展平(§12)。
+- 节点本地:路由、存储、单元管理都是节点本地的;跨机协作经远程 manifest store 携带
+  快照/模板(§8.1)与 cluster-ctl 的 node-link 编排(§10)。
+- 依赖:stdlib + `modernc.org/sqlite`(纯 Go)+ `golang.org/x/net/http2`(h2c,
+  config-socket 与 node-link 共用)+ `golang.org/x/sys`(pidfile 锁 / SO_REUSEPORT /
+  SO_PEERCRED)+ `coreos/go-systemd`(D-Bus)+ `google/uuid`(v7)+ `gopkg.in/yaml.v3`。
+  无 gRPC/protobuf。
+
+### 1.5 架构与数据通路
+
+```
+          e2b SDK / CLI                                    cluster-ctl (cluster.md)
+               │ https://api.<domain>          │           registry · router · scaler
+               ▼                                ▼                    ▲
+      ┌─ node-ctl serve ──────────────────────┐   ┌─ data plane ──┐ │ node-link (§10):
+      │ api: e2b control plane (REST)         │   │ proxy         │ │  up: register/HB/
+      │   sandboxes create/connect/pause/...  │   │ (internal /   │ │      sandbox events
+      │   templates register/trigger/status   │   │  external     │ │  down: create/connect/
+      │ host:                                 │   │  workers,     │ │       delete/build_register/key
+      │   vswitch-ctl attach → floatingip     │   │  route-synced)│ │
+      │   StartUnit(sandbox-runner@<sid>)     │   │ 49983/49999   │ └─ node-link client ───┐
+      │   envd /init → sqlite + TTL           │   │  → UDS (envd) │                        │
+      │ build: builds table → pool →          │   │ other ports → │◄── cluster-ctl router  │
+      │   StartUnit(sandbox-builder@<bid>)    │   │  floatingip   │    forwards data plane  │
+      │ [resource_listen]: resource ctrl      │   └──────┬────────┘                        │
+      └──────┬───────────────┬────────────────┘         │                                 │
+             │ D-Bus         │ UDS config-socket         │                                 │
+             ▼               ▼ (LaunchSpec / BuildSpec,  │                                 │
+      systemd units            secrets in env)           │                                 │
+      + slices         run-sandbox → execve sandbox-ctl  │                                 │
+                       run-builder → 3-phase build (§12) │                                 │
+                             │                            ▼                                 │
+                       cloud-hypervisor microVM ◄── tap ── vswitch (eBPF) ◄─────────────────┘
+                         guest: sandbox-init + envd
+```
+
+create 流程:建 `<run_root>/<sid>/`(tmpfs)+ `<base_root>/<sid>/`(disk)→
+`vswitch-ctl attach` 拿 `{port, floatingip, mac}` → 写非密配置 `<sid>.yaml` → 登记
+sqlite → `StartUnit(sandbox-runner@<sid>)` → 单元内 `run-sandbox` 经 config-socket 取
+LaunchSpec(密钥经 env)后 `execve` 成 `sandbox-ctl run` → 起 microVM → (e2b)等
+envd `/health` 就绪(60s 上限)→ `POST /init` 置 env/默认用户 → 起 TTL。集群下,该
+create 由 node-link 的 `create` 命令触发,group / route-key 经 metadata 注入并随事件回报
+registry(§10、§4.6)。
+
+数据面按 `Host`(`<port>-<sid>.<domain>`)或 `E2b-Sandbox-Id`/`E2b-Sandbox-Port` 头解析
+`(sid, port)`,校验 `X-Access-Token` 后转发:e2b profile 的 49983/49999 拨 sandbox-ctl
+`--connect` 暴露的 host UDS 直达 envd;其余任意端口拨 `floatingip:port`。对 paused
+沙箱的请求触发自动 resume(单飞合并,§8)。部署形态(internal/external/off)见 §9.1,
+转发层设计见 [node-proxy.md](node-proxy.md)。集群下,数据面由 cluster-ctl router 经
+注入 `E2b-Sandbox-Id` + `X-Access-Token` 转发进本节点 proxy,节点侧零改动(cluster-router.md)。
 
 ## 2. 命令行接口
 
 ### 2.1 子命令总览
 
+**`node-ctl`**:
+
 | 子命令 | 用途 |
 |---|---|
-| `daemon` | 启动 RPC server + admission + allocator + reclaimer + persister |
-| `status` | 节点预算快照(只读) |
-| `list` | 列举当前 reservation(只读) |
-| `drain` | 进入排空状态(运维) |
-| `grant` | 强制下发 budget(调试) |
-| `reclaim` | 强制收回(运维) |
+| `serve` | 启动 daemon:控制面 + 数据面 + 本机控制 socket + reaper + 构建池;配 `cluster` 则起 node-link 客户端(§10),配 `resource_listen` 则内置资源控制器(node-resource.md) |
+| `proxy` | 外置数据面 worker(`proxy.mode=external`;见 §2.3 与 node-proxy.md) |
+| `run-sandbox` / `run-builder` | systemd 单元内启动器,非给人用(§2.4、§6) |
+| `resource` | `status`/`list`/`drain`/`grant`/`reclaim`:资源控制器只读巡检与运维(node-resource.md §2) |
+| `config` | 配置规范化/校验,或输出带注释骨架 |
+| `manifest-key` | `add`/`remove`/`check`/`list`:create/build 白名单管理(§7;集群下另由 registry 租约写入,§10) |
+| `export-sandbox` / `import-sandbox` | 暂停沙箱转模板 / 跨机迁移(§8.1) |
+| `version` | 版本 |
 
-### 2.2 `node-ctl daemon`
+**`e2b-key-ctl`**(纯派生,不触 DB/config/daemon):
 
-```
-node-ctl daemon [--config /etc/node-ctl/node-ctl.yaml] [--listen /run/sandbox-resource.sock]
-```
+| 子命令 | 用途 |
+|---|---|
+| `gen-key` | 生成随机 32B manifest key(64-hex) |
+| `gen-apikey [<MANIFEST_KEY>]` | 从 manifest key 派生 e2b api key(`e2b_` + hex,§7) |
+| `fingerprint [<MANIFEST_KEY>]` | 打印 24-hex 指纹(与白名单/库内索引一致) |
+| `seal-pull-token [<MANIFEST_KEY>] …` | 封装不透明镜像拉取令牌(`kpt_`,§12) |
+| `version` | 版本 |
 
-启动 RPC server、admission worker、memory allocator、active reclaimer、idle
-sweeper 与 state persister(§7)。systemd 单元入口。`--config` 省略时使用 §3.1
-的内建默认值;`--listen` 覆盖 yaml 的 `listen` 路径(为空则用 yaml 值)。
+接住一个新节点(独立模式)的典型顺序:
 
-### 2.3 `node-ctl status`
+```bash
+# 1) 生成租户根密钥,登记白名单,派生 SDK 用的 api key
+MK=$(e2b-key-ctl gen-key)
+node-ctl manifest-key add "$MK" --label tenant-a
+export E2B_API_KEY=$(e2b-key-ctl gen-apikey "$MK")
 
-```
-node-ctl status [--state /run/node-ctl/state.json]
-```
-
-读 state 文件,打印水位区、节点预算、host 预留、运维容差、已分配量、利用率与
-reservation 数。只读,可与运行中的 daemon 共存。
-
-### 2.4 `node-ctl list`
-
-```
-node-ctl list [--state /run/node-ctl/state.json]
-```
-
-把 reservation 表导出为 JSON。只读。
-
-### 2.5 `node-ctl drain`
-
-```
-node-ctl drain [--socket /run/sandbox-resource.sock] [--disable]
+# 2) e2b SDK/CLI 直接指向本机
+export E2B_DOMAIN=sandboxes.example.com        # 生产(TLS, §13)
+# dev: E2B_API_URL=http://host:3000  E2B_SANDBOX_URL=http://host:3000
 ```
 
-通知 daemon 不再接受新沙箱准入;`--disable` 取消排空。运维命令——典型用于
-节点维护前清空沙箱。
+集群模式下密钥由 registry 经 node-link 租约下发(§10、cluster.md §7.6),无须手动
+`manifest-key add`。
 
-### 2.6 `node-ctl grant`
-
-```
-node-ctl grant <sid> --memory <size> [--socket /run/sandbox-resource.sock]
-```
-
-绕过水位与限速,直接给某沙箱发放内存 budget(上限 clamp 到 capacity),用于排查
-或紧急调度;sandbox-ctl 经下次 Heartbeat 取得新值落地。
-
-### 2.7 `node-ctl reclaim`
+### 2.2 `node-ctl serve`
 
 ```
-node-ctl reclaim <sid> --memory <target> [--socket /run/sandbox-resource.sock]
+node-ctl serve [--config /etc/node-ctl/config.yaml] [--proxy internal|external|off]
 ```
 
-直接将某沙箱 allocatable 收缩到目标值(shrink-only,clamp 到 floor;目标高于
-当前值时报错),用于人工干预异常场景;同样经 Heartbeat 传播。
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `--config` | `/etc/node-ctl/config.yaml` | 配置文件(§3) |
+| `--proxy` | – | 覆盖配置的 `proxy.mode` |
+
+启动序列:打开 sqlite(文件 chmod 0600)→ 生成并安装 systemd 模板单元(§5)→
+重启对账(§15)→ 起 reaper(TTL,5s 周期)与构建池(§12)→ 起本机控制 socket(§6)
+→(配 `resource_listen` 则起内置资源控制器,node-resource.md)→ 按 `proxy.mode` 装配
+数据面(§9)→(配 `cluster.registry` 则拨 registry 起 node-link 客户端,§10)→
+监听 `api.listen`。`api.<domain>`(及任何 `api.` 前缀 Host)路由到控制面,其余 Host
+进数据面。TLS 证书缺省时以明文 h2c 服务(dev:SDK 走 `E2B_API_URL`/`E2B_SANDBOX_URL`)。
+
+随仓 systemd 单元模板:`deploy/node-ctl.service`。
+
+### 2.3 `node-ctl proxy`
+
+外置数据面 worker(`proxy.mode=external`);运维带外起、与 serve 同节点。命令行、
+参数、部署模式与拓扑见 [node-proxy.md](node-proxy.md) §2、§5——转发层自成一文,本仓控制面只在
+§9 讲如何按 `proxy.mode` 装配它。
+
+### 2.4 `node-ctl run-sandbox` / `run-builder`
+
+systemd 单元的 ExecStart,非给人用。共用的进入骨架:`--pidfile` 以
+`fcntl(F_SETLK)` 排他锁防重入、写本 PID → 拨 `--config-socket` 取规约(§6)。
+之后两者分道:
+
+- **run-sandbox**:取 LaunchSpec → `chdir(workdir)`、剥除 `TASK_*` 引导变量、合入
+  `spec.env`(密钥)→ `execve` 替换为 `sandbox-ctl run`,目标继承本 PID 与单元
+  cgroup(锁 fd 已清 `FD_CLOEXEC`,随 execve 存活)。
+- **run-builder**:取 BuildSpec → **驻留**驱动三阶段构建流水线(§12):各阶段沙箱
+  (`sandbox-ctl run`)是它的直接子进程,整个构建计入本单元 cgroup;结束把结果 JSON
+  (`{image_key|snapshot_key, start_cmd, ready_cmd, error}`)打到 stdout,由单元
+  `StandardOutput=file:` 捕获为 `<bid>.result`。
+
+```
+node-ctl run-sandbox --pidfile=<f> --config-socket=<uds> --sandbox-id=<sid>
+node-ctl run-builder --pidfile=<f> --config-socket=<uds> --build-id=<bid>
+```
+
+flags 缺省回落 `TASK_PIDFILE` / `TASK_CONFIG_SOCKET` / `TASK_SANDBOX_ID` /
+`TASK_BUILD_ID` env(systemd `%i` 接线用)。
+
+### 2.5 `node-ctl config`
+
+```
+node-ctl config --config <file>   # 加载(补默认 + 校验)后重排输出
+node-ctl config --template        # 输出带注释骨架
+                -o <file>         # 写文件(默认 stdout)
+```
+
+与 `sandbox-ctl config` / `flatten-ctl config` 同形态。骨架与
+`deploy/config.example.yaml` 对应。
+
+### 2.6 `node-ctl manifest-key`
+
+create/build 白名单(`manifest_keys` 表)管理,是 serve daemon **admin 平面**的瘦
+客户端(经本机控制 socket,§6)——daemon 是该表唯一写者,CLI 不开 DB、不读 config,
+只需 `--socket`(或 `NODE_CTL_SOCKET` env,默认 `/run/sandbox/node-ctl.socket`)。
+key 取自位置参数或 `MANIFEST_KEY` env;输出只含指纹,绝不回显 key。集群下该表另由
+registry 经 node-link 以租约项写入(§10、cluster.md §7.6),与手动项共存。
+
+```
+node-ctl manifest-key add    [--label L] [--ttl 24h]
+                             [--registry-auth <docker.json> |
+                              --registry-username U --registry-password P |
+                              --registry-token T]      [--socket S] <KEY>…
+node-ctl manifest-key remove [--socket S] <KEY>…
+node-ctl manifest-key check  [--socket S] <KEY>…
+node-ctl manifest-key list   [--socket S]
+```
+
+- `--ttl`:失效时长(`0`/缺省 = 永不);**重复 add 刷新失效时间**。过期 key 视同不在
+  白名单,由 reaper 惰性清理;`list` 显示 `expires`。
+- `--registry-auth`/`--registry-*`:租户默认镜像拉取凭据,加密存白名单行
+  (`registry_auth_enc`),构建拉取时按 fromImage 的 host 匹配取用(§12)。
+- 鉴权:`SO_PEERCRED`——配置了 `paths.admin_pidfile` 则 peer pid 须在其中;未配则仅靠
+  socket 0600 权限(同 uid / root)。
+
+### 2.7 `node-ctl export-sandbox` / `import-sandbox`
+
+serve daemon **api 平面**的客户端(经本机控制 socket 调 `POST /sandboxes/{id}/export`
+与 `POST /sandboxes/import`),鉴权 `E2B_API_KEY` env(须属主)。语义见 §8.1。
+
+```
+node-ctl export-sandbox <sid> [--to-template] [--keep-source] [--socket S]
+node-ctl import-sandbox <token> [--socket S]
+```
+
+- `export-sandbox <sid>`:打印单行 base64 迁移 token(默认 move,回收源行;
+  `--keep-source` = copy)。
+- `export-sandbox <sid> --to-template`:晋升为远程快照并打印持久 templateID(扇出用)。
+- `import-sandbox <token>`:在本机插入 paused 行并打印 sid,随后 `e2b sandbox resume`
+  即可在本机恢复。
+
+### 2.8 `e2b-key-ctl`
+
+总览见 §2.1。`seal-pull-token` 完整形式:
+
+```
+e2b-key-ctl seal-pull-token [<MANIFEST_KEY>] {--registry-username U --registry-password P |
+                                              --registry-token T}
+```
+
+输出 `kpt_` 前缀的不透明令牌:以租户 manifest_key 派生密钥 AES-GCM 封装的镜像拉取
+凭据,经 SDK `api_headers`(头 `X-Kuasar-Pull-Token`)随构建请求传入,serve 用
+该租户的存量 key 解封(§12)。manifest key 取自首个位置参数或 `MANIFEST_KEY` env。
 
 ## 3. 配置
 
-### 3.1 node-ctl.yaml
-
-`/etc/node-ctl/node-ctl.yaml`:
-
-```yaml
-listen: /run/sandbox-resource.sock
-state_path: /run/node-ctl/state.json   # tmpfs
-cgroup_scan_paths:                      # (预留)重启对账扫描根
-  - /sys/fs/cgroup/sandboxes
-
-resources:
-  physical_memory: auto                # auto = 读 /proc/meminfo MemTotal
-  physical_cpu: auto                   # auto = 读 nproc
-  host_reserved:
-    memory: 16GiB
-    cpu: 1.5
-
-watermarks:
-  operational_margin_factor: 0.10
-  high_factor: 0.85
-  low_factor: 0.70
-  emergency_factor: 0.05
-  startup_factor: 0.50                 # startup_pool = allocatable_pool × 此值
-
-rate_limits:
-  memory_grant_per_sec_factor: 0.05    # × allocatable_pool_mem
-
-admission:
-  rate: 4                              # /s — admission token bucket 填充
-  burst: 16                            # admission token bucket 容量
-  startup_ttl: 30s                     # admit → settled 上限
-  queue_ttl: 30s                       # 短期阻塞排队上限
-  queue_max_depth: 256                 # 队列容量,超即立 reject queue_full
-
-dampening:                              # 振荡阻尼,不进 sandbox.yaml
-  recover_duration: 60s                # burst → settled 观察期
-  cooldown_periods: 10                 # × 100ms,burst → recover 判定门槛
-
-logging:
-  level: info
-  audit_path: /run/node-ctl/audit.log  # tmpfs;高频审计不写磁盘
-```
-
-### 3.2 字段语义
+完整带注释样例见 `deploy/config.example.yaml`(`node-ctl config --template`
+输出同形骨架),权威结构是 `internal/config/config.go`。配置按关注点分组:`api`、
+`proxy`、`paths`、`units`、`sandbox`(实例级默认,子组 `resources`/`network`/`boot`)、
+`builder`、`checkpoint`、`mmds`、`cluster`(node-link,§10)、`resource_listen`(内置
+资源控制器,node-resource.md),外加顶层单值 `encryption_key`、`manifest_config`。
+**必填仅 `api.domain` 与 `encryption_key`**(后者可用 `NODE_CTL_ENCRYPTION_KEY`
+env 覆盖)。外部二进制(sandbox-ctl/vswitch-ctl/flatten-ctl)**不配置**:按"与
+node-ctl 同目录 → PATH"自动发现。
 
 | 字段 | 默认 | 说明 |
 |---|---|---|
-| `listen` | `/run/sandbox-resource.sock` | UDS,sandbox-ctl 拨号目标 |
-| `state_path` | `/run/node-ctl/state.json` | tmpfs,daemon 重启快速恢复用 |
-| `cgroup_scan_paths` | `[/sys/fs/cgroup/sandboxes]` | (预留)重启对账扫描根 |
-| `resources.physical_memory` | `auto` | 节点物理内存(`/proc/meminfo`)|
-| `resources.physical_cpu` | `auto` | 节点物理核数(`nproc`) |
-| `resources.host_reserved.memory` | `16GiB` | host 自身预留(kernel + cache-ctl + store-ctl + monitoring),按节点实测覆盖(§10.2) |
-| `resources.host_reserved.cpu` | `1.5` | 同上,CPU 维度 |
-| `watermarks.operational_margin_factor` | 0.10 | 节点预算的 10%,容差,不参与分配 |
-| `watermarks.high_factor` | 0.85 | red 区起点 |
-| `watermarks.low_factor` | 0.70 | yellow 区起点 |
-| `watermarks.emergency_factor` | 0.05 | 紧急池,仅 urgency=high 申请可触 |
-| `watermarks.startup_factor` | 0.50 | startup_pool = allocatable_pool × 此值;admission 阶段累计 effective_startup_budget 的上界,为 steady-state grant 留余量(约束:emergency_factor < startup_factor ≤ 1.0) |
-| `rate_limits.memory_grant_per_sec_factor` | 0.05 | 内存仲裁限速:每秒总扩展量 ≤ allocatable_pool × 此值 |
-| `admission.rate` | 4 | Admit 速率,token bucket 装填速率(/s) |
-| `admission.burst` | 16 | Admit token bucket 容量 |
-| `admission.startup_ttl` | 30s | sandbox-ctl 必须在此时间内进入 settled,否则 IdleSweeper 释放 reservation |
-| `admission.queue_ttl` | 30s | 短期阻塞排队最长等待,超时 → reject `queue_canceled` |
-| `admission.queue_max_depth` | 256 | 队列容量,超即立 reject `queue_full` |
-| `dampening.recover_duration` | 60s | burst → settled 观察期 |
-| `dampening.cooldown_periods` | 10 | × 100ms,burst → recover 判定门槛 |
-
-## 4. 资源预算与水位
-
-### 4.1 预算结构
-
-```
-physical_total            = 节点物理内存(或 CPU 总核数)
-host_reserved             = kernel + controller + cache-ctl + store-ctl + monitoring
-                            内存典型 5-10%,CPU 典型 5%
-node_budget               = physical_total − host_reserved
-operational_margin        = node_budget × 10%       # 容差,不参与分配
-allocatable_pool          = node_budget − operational_margin
-```
-
-`operational_margin = 10%` 是固定容差,留给:
-
-- 控制器重启时的状态重建延迟(短暂超额)
-- cgroup 计数误差 + kernel 内部分配波动
-- host 进程偶发内存峰值
-
-operational_margin 即使在 critical 区也不被触动——节点的"绝对底线"。
-
-### 4.2 水位线
-
-```
-high_watermark   = allocatable_pool × 85%
-low_watermark    = allocatable_pool × 70%
-emergency_pool   = allocatable_pool × 5%
-startup_pool     = allocatable_pool × 50%   # admission 阶段累计上界
-```
-
-`emergency_pool` 仅响应 urgency=high(oom 类紧急申请),正常仲裁动用前 95%
-预算。
-
-`startup_pool` 是 admission 单独跟踪的 sub-budget:所有 pre-settled 阶段
-reservation 的 `effective_startup_budget` 累计不能超过 startup_pool。创建并发
-以"内存硬限"而非"个数硬限"表达——同样的 startup_pool 容下若干个小 sandbox 或
-单个大 sandbox,自然 throttle。
-
-水位区间行为:
-
-| 区间 | node_allocated 位置 | Admit | settled 收缩 margin | burst 申请 |
-|------|---------------------|-------|---------------------|-----------|
-| **green** | < low_watermark | 接受 | ×1.25 | 限速批 |
-| **yellow** | [low, high) | 接受 | ×1.10 | 限速批 |
-| **red** | [high, pool − emergency_pool) | **拒绝**(`zone_critical`) | ×1.05 | 仅 urgency=high |
-| **critical** | ≥ pool − emergency_pool | 拒绝 | ×1.00 | 仅 urgency=high |
-
-settled 收缩由 Active Reclaimer 执行:每 10 s 扫一遍 settled reservation,把
-allocatable_now 收向 `max(floor, last_reported_rss × margin)`,margin 随水位区
-收紧;新值经 Heartbeat ack 的 `new_allocatable` 传到 sandbox-ctl 落地(§5.2)。
-
-注: zone red/critical 是系统保护性 reject——即使其他短期资源可缓解
-(token bucket / startup_pool),进入 red/critical 仍然立即拒绝,给系统
-recovery 留空间。
-
-CPU 不参与水位决策:admission 与运行期仲裁均仅内存维度;控制器对 CPU 只做
-记账(reservation 按 floor.cpu 累计,`status` 可见)——CPU 不动态分配。
-
-### 4.3 仲裁策略
-
-`RequestBudget` 同步处理(仅内存维度),没有服务端 grant 队列——未获批的请求
-拿到 `cooldown_ms` 退避重试,期间沙箱在 cgroup memory.high PSI 反压下等待:
-
-- **urgency**:high(oom)绕过 token bucket 限速,且可动用 emergency_pool;
-  normal/low 在 red/critical 区直接得 0 + cooldown
-- **限速**:token bucket,每秒总扩展量 ≤ allocatable_pool ×
-  `memory_grant_per_sec_factor`;token 不足时按补给 ETA 回 cooldown_ms
-  (下限 50 ms)
-- **步长**:单次 grant clamp 到 [4 MiB, 512 MiB],且 ≤ capacity 余量与
-  zone headroom
-- CPU:无运行时仲裁
-
-限速是防惊群核心:即使 100 个沙箱同时 burst,每秒放出的总量有界,未获批的
-沙箱继续在 PSI 反压下退避重试,而不是同时全 grant 撞墙。
-
-## 5. 沙箱资源控制协议
-
-### 5.1 协议形态
-
-UDS,长度前缀(4 字节 LE uint32)+ JSON 消息——简单、调试友好、无外部依赖。
-
-每个 sandbox-ctl 启动时 `Admit` 后建立长连,直到沙箱退出。连接生命周期与
-沙箱生命周期对齐。wire 格式与 `Client` 的唯一定义点是
-`sandbox-runtime/pkg/resource`,client/server 共用。
-
-### 5.2 消息类型
-
-请求/响应对(sandbox-ctl 发,控制器答):
-
-```
-Admit            (sandbox_id, capacity, floor, startup_budget_memory,
-                  allocatable_at_snapshot?, cgroup_path)
-                 → AdmitResponse (status, token, granted_initial_alloc,
-                                  reason?, queued_for_ms, queue_pos_at_in)
-                   status ∈ {admitted, rejected}
-                   (queued 保留不用:短期阻塞时 server 持连不回应,§5.3)
-                   granted_initial_alloc = max(startup_budget_memory, floor,
-                                               allocatable_at_snapshot)
-                   reason:rejected 时分类(§6.4)
-                   queued_for_ms / queue_pos_at_in:命中队列时回填的诊断元数据
-                 # sandbox_id 用作 admin 动词(grant/reclaim)的索引键;
-                 # cgroup_path 存入 reservation 并随 state.json 持久化
-
-Settled          (token, current_rss, current_cpu_usec)        # 进入 settled 通知
-                 → Ack
-                 # 触发时机:冷启动收到 launch hello 之后;
-                 #            恢复收到 guest 的 restore_ack 之后
-
-RequestBudget    (token, current_alloc, requested_delta, urgency, reason)
-                 → BudgetResponse (granted_delta, new_allocatable, cooldown_ms)
-
-OOMReport        (token, oom_count, killed_pid, killed_rss)    # 紧急上报
-                 → Ack
-
-Heartbeat        (token, current_rss, current_cpu_usec, recent_high_count,
-                  cpu_throttled_periods)                       # 30s 周期
-                 → Ack (new_allocatable)
-                   # Ack 回带权威 new_allocatable:active reclaimer 或 admin
-                   # 动词改过 allocatable_now 时,sandbox-ctl 在此取新值并落地
-                   # (cgroup memory.high + balloon resize)——reclaim/admin 的
-                   # 传播通道
-
-Release          (token, reason)                                # reason ∈ {normal, error, ...}
-                 → Ack
-
-Reattach         (token)                                        # 断线重连后重新绑定(§5.3)
-                 → Ack (new_allocatable)                        # 成功:回带当前 allocatable_now
-                 → Error "unknown token"                        # token 不存在
-```
-
-admin 动词(运维 CLI 发,控制器答;以 sandbox_id 而非 token 定位目标):
-
-```
-AdminStatus      ()                                             # node-ctl 经 RPC 查实时态
-                 → Ack (zone, node_allocated, allocatable_pool,
-                        reservation_count, drained)
-                   # state.json 不可直接访问时(如跨主机巡检)用
-
-AdminDrain       (drain)                                        # 背后 node-ctl drain
-                 → Ack (drained)
-
-AdminGrant       (sandbox_id, requested_delta)                  # 背后 node-ctl grant
-                 → Ack (granted_delta, new_allocatable)         # 绕过水位/限速
-
-AdminReclaim     (sandbox_id, target_allocatable)               # 背后 node-ctl reclaim
-                 → Ack (new_allocatable)                        # shrink-only,clamp 到 floor
-```
-
-`token`:Admit 时由控制器生成的随机字符串,作为后续所有 RPC 的认证 + 索引。
-重连时 sandbox-ctl 重发 token,控制器验证后绑定到现有 reservation。
-
-`reason` 字段是字符串枚举,用于审计与调试。
-
-**注意 RequestBudget 没有 dim 字段**——CPU 不参与运行时仲裁。
-
-### 5.3 连接生命周期
-
-**首次建连**:
-
-1. sandbox-ctl 拨 UDS,发 `Admit`
-2. 控制器评估请求:
-   - 通过 → 立即回 `status=admitted`
-   - 长期失败(drain / zone red/critical / 超 pool / 超 startup_pool)→ `status=rejected`
-   - 短期阻塞(token / main_headroom / startup_headroom)→ **不回应**,
-     conn 入服务端 FIFO queue;worker 在条件满足时回 `admitted`,
-     queue_ttl 超时回 `rejected`
-3. status=admitted:sandbox-ctl 持有 token,继续启动流程
-4. status=rejected:sandbox-ctl 退出非零(orchestrator 决定 retry / 换 host)
-
-**长连维持**:
-
-- 沙箱进入 startup 后,连接保持活跃;sandbox-ctl 在此连接上发后续 RPC,并经
-  Heartbeat ack 的 `new_allocatable` 接收 reclaim/admin 的 allocatable 调整
-- 30s 周期 Heartbeat;控制器 90s(3 个周期)未收到 → 视为掉线,触发故障
-  处理(详见 §故障域处理)
-
-**重连**:
-
-- 连接断开,sandbox-ctl 退避重试(1s, 2s, 5s, 10s, 10s, ...)
-- 重连成功后发 `Reattach(token)`,控制器验证 token 找到 reservation 后回
-  `Ack(new_allocatable)`,重新绑定连接;token 不存在则回 `Error "unknown token"`
-- 重连期间 sandbox-ctl 用最近一次 grant 状态继续运行(cgroup 不变、balloon
-  不变),不主动调整资源
-
-**断连降级**:
-
-- 持续 60s 重连失败,sandbox-ctl 切到无控制器模式继续——保持当前
-  allocatable 不变,接管 cgroup memory.high 设置,不再申请 burst
-- 此时即使有新压力,只能靠 cgroup PSI 反压 + deflate_on_oom 兜底
-- 重连成功后自动恢复联动
-
-**沙箱退出**:
-
-- sandbox-ctl 退出前发 `Release`;控制器收到后释放 reservation
-- sandbox-ctl 异常退出(无 Release):控制器检测连接 EOF/RST → 视沙箱可能
-  死亡;通过 cgroup 路径检查交叉验证
-
-## 6. 创建期管控
-
-### 6.1 admission 流程
-
-`sandbox-ctl run` 启动后第一动作不是 cgroup join,而是判断是否需要连控制器:
-
-```
-T0  sandbox-ctl run --config xx.yaml
-T1  parse config, compute (capacity, floor, startup.memory)
-    若 control.controller 为空 → 跳过 admit,跳到 T5
-T2  dial controller, send Admit
-T3  block read AdmitResponse(可能立即,也可能在 queue 中等待)
-T4  if rejected: exit 2(orchestrator 决定 retry / 换 host)
-T4' if admitted: continue(可能伴随 queued_for_ms > 0,仅作 log 用)
-T5  cgroup join(静态 cgroup / 动态控制模式写限制;无 cgroup 模式跳过)
-T6  ... 启动序列继续(详见 sandbox.md §冷启动数据流)
-```
-
-sandbox.yaml `resources.startup.memory` 是 sandbox 期望的 startup 阶段
-budget;默认 = allocatable.memory。admission 实际给出 `granted_initial_alloc
-= max(startup.memory, allocatable.memory, allocatable_at_snapshot)`,即
-三者最大,无降级。
-
-### 6.2 决策矩阵
-
-每个 Admit 在 server 内部归一化:
-
-```
-effective_startup_budget = max(
-    startup_budget_memory,      # 来自 sandbox.yaml resources.startup.memory
-    floor_memory_bytes,         # 来自 sandbox.yaml resources.allocatable.memory
-    allocatable_at_snapshot     # 仅 restore 路径,cold = 0
-)
-```
-
-冷启动与恢复**走完全相同的决策路径**,差异由公式吸收。
-
-预检(立即 reject,不入队):
-
-| 条件 | reject 原因 |
-|---|---|
-| `effective_startup_budget == 0` | `invalid_burst` |
-| `effective_startup_budget > allocatable_pool` | `exceeds_node_capacity`(永不可能) |
-| `effective_startup_budget > startup_pool` | `exceeds_startup_pool`(永不进 startup_pool) |
-
-主决策:
-
-| 失败原因 | 决策 | 类别 | 唤醒源 |
-|---|---|---|---|
-| drained | reject | long | — |
-| zone Red/Critical | reject | sys-protect | — |
-| `> main_headroom`(可装 pool 但暂缺) | **queue** | short | Settled / Release / Reclaim |
-| `> startup_headroom`(可装 startup_pool 但暂缺) | **queue** | short | Settled / pre-settled Release |
-| token bucket 空 | **queue** | short | one-shot token-refill timer |
-| `queue.depth ≥ queue_max_depth` | reject `queue_full` | overload | — |
-| 等待时间 > `queue_ttl` | reject `queue_ttl` | timeout | per-entry TTL timer |
-| 默认(全部通过) | admitted | — | — |
-
-并发不再由 hardcoded `max_concurrent_creating` 限,而是由 `startup_pool`
-budget 自然 throttle:每个 sandbox admission 占 `effective_startup_budget`
-在 startup_pool 内,Settled 时立即归还。
-
-### 6.3 队列协调机制
-
-服务端 FIFO 队列 + 持有连接 + 事件驱动 worker(单 goroutine)。
-
-**worker 主循环**只 select `wakeCh + shutdownCh`,无周期 timer:
-
-| Wake 来源 | 触发时机 |
-|---|---|
-| 入队 | server.handleAdmit 决策为 short-term block 时 |
-| Settled | sandbox-ctl 发 Settled message(main pool 收 burst→max(rss,floor);startup pool 收 effective_startup_budget→0)|
-| Release | sandbox-ctl 发 Release(pre-settled 时 startup pool 同步释放)|
-| Reclaim | 强制收回完成 |
-| **per-entry TTL** | 入队时 `time.AfterFunc(queue_ttl, pushWake)` |
-| **per-entry conn EOF** | 入队时启 reader goroutine,client 断连时 `pushWake` |
-| **one-shot token refill** | head 阻于 token bucket 时,worker 末尾 `AfterFunc(eta, pushWake)` |
-
-worker 处理:严格 FIFO。head 不通过即停,直到 wake 重试。worker 入口先取
-`queueMu`,再取 `State.Lock`(锁顺序固定避免死锁)。
-
-### 6.4 reject reason 分类
-
-| reason | 含义 | sandbox-ctl 行为 |
+| `api.domain` | (必填) | 服务域,如 `sandboxes.example.com`;控制面 = `api.<domain>` |
+| `api.listen` | `:443` | 北向监听;dev 用 `:3000` 走明文 h2c |
+| `api.tls.cert/key` | 空 | 通配证书(`*.<domain>` 与 `api.<domain>`,§13);空 = 明文 |
+| `proxy.mode` | `internal` | 数据面承载:`internal`/`external`/`off`(装配见 §9.1,部署模式见 node-proxy.md §5) |
+| `proxy.data_listen` | 空 | 专用数据面监听;空 = 与 `api.listen` 共口。external 模式由 worker 持有数据口,serve 不绑它 |
+| `proxy.park_timeout` | `30s` | 数据面请求挂起预算:等路由同步 / paused 沙箱 resume 的上限(node-proxy.md §5) |
+| `proxy.auth` | `enforce` | 数据面鉴权:`off`/`log`/`enforce`,校验 `X-Access-Token`(node-proxy.md §7) |
+| `proxy.metrics_listen` | 空(关) | Prometheus 文本端点(`data_requests_total{result=…}`、`gateway_forward_total` 等) |
+| `encryption_key` | (必填) | manifest_key 落盘加密的 AES-256 密钥:`:` 分隔多个 64-hex,首个为活动密钥,其余备用解旧记录(轮换);`NODE_CTL_ENCRYPTION_KEY` env 优先 |
+| `manifest_config` | `/opt/sandbox/manifest.yaml` | 共享远程 manifest store 配置(`manifest.key` 留空,租户 key 经 env 按任务下发) |
+| `paths.run_root` | `/run/sandbox` | tmpfs 运行态:`<sid>/` 运行目录、UDS、pidfile |
+| `paths.base_root` | `/var/lib/sandbox` | 持久态根 |
+| `paths.db_path` | `<base_root>/node-ctl.db` | sqlite 路径(§15) |
+| `paths.config_socket` | `/run/sandbox/node-ctl.socket` | 本机控制 socket(四平面 h2c,§6);manifest-key/export/import CLI 与 external proxy / 平台 agent 的连接点 |
+| `paths.admin_pidfile` | 空 | admin 平面的多行 PID 白名单(`#` 注释);未配则仅靠 socket 0600 |
+| `paths.plugin_pidfile` | 空 | plugin 平面(proxy/agent 注册)的多行 PID 白名单;未配则仅靠 socket 0600 |
+| `units.dir` | `/etc/systemd/system` | 模板单元安装目录 |
+| `units.runner` / `units.builder` | `sandbox-runner@.service` / `sandbox-builder@.service` | 模板单元名 |
+| `units.install` | `true` | `false` = 单元由运维带外管理,serve 不生成安装 |
+| `sandbox.timeout_sec` | `300` | 沙箱默认 TTL(秒) |
+| `sandbox.resources.vcpu` / `.memory` | `2` / `2GiB` | 每沙箱容量;同时回显在 e2b list/get 的 `cpuCount`/`memoryMB`。**restore 类启动(snp 模板 create / resume / 迁移导入)按快照内 snapshot.cfg 的 capacity 覆盖**——快照自描述,可与本机默认不同(如构建预算下产出的模板) |
+| `sandbox.resources.control_socket` | 空 | 资源控制器 UDS,**opt-in**;空 = 静态 cgroup(单元自身,§5.1);非空指向内置(`resource_listen`)或独立控制器(node-resource.md) |
+| `sandbox.network.switch` | `sw0` | vswitch 交换机名 |
+| `sandbox.network.hostname` | `sandbox` | guest 主机名:sethostname + `/etc/hosts` 条目(§11) |
+| `sandbox.network.dns` | `[169.254.169.253]` | 注入 guest `/etc/resolv.conf` 的 nameserver;该地址需部署侧路由到真实 DNS |
+| `sandbox.network.e2b` / `.bare` | `169.254.0.21/30`+`169.254.0.22` / `169.254.1.1/31`+`169.254.1.0` | 按 profile 的 guest 内 `{inner_ip, nexthop}`:每 profile 复用同一对,沙箱唯一身份是 floatingip;e2b 的 /30 + 网关让 envd 端口转发可用 |
+| `sandbox.boot.kernel` | – | vmlinux 路径 |
+| `sandbox.boot.runtime_e2b` / `.runtime_base` | – | 两 profile 的 guest runtime erofs(§11) |
+| `sandbox.boot.overlay_diff_template` | – | 预格式化空 ext4,img 冷启时稀疏复制为可写 upper(裸空 diff 非合法 fs 会被拒);部署方 `mkfs.ext4` 于稀疏文件提供;restore 不需要(overlay 链来自快照) |
+| `builder.max_concurrent` | `2` | 构建池并发(serve 内计数信号量,§12) |
+| `builder.cpu_quota` / `.memory_max` | 空 | 施加到 `sandbox-builder.slice` 的 `CPUQuota`/`MemoryMax` |
+| `builder.insecure_registry` | `false` | 经明文 HTTP 拉取 base 镜像(dev/本机 registry) |
+| `builder.platform` | 空 | 拉取平台,如 `linux/amd64` |
+| `builder.image_uri_mask` | 空 | 客户端推送镜像的命名约定(含 `{templateID}`/`{buildID}` 占位,须与 e2b CLI 的 `E2B_IMAGE_URI_MASK` 一致);trigger 缺 `fromImage` 时据此推导;**须从构建沙箱内可达**——拉取在 guest 内进行(§12) |
+| `builder.runtime_builder` | – | 构建沙箱的 guest runtime erofs(e2b flavor + flatten-ctl + mkfs.erofs;umbrella `make sandbox-runtime-builder` 产出) |
+| `builder.diff_template` | – | 构建沙箱可写盘的预格式化 ext4(拉取缓存 + steps 增量 + 导出 scratch;稀疏文件,建议 ≥ 最大预期镜像的 3 倍) |
+| `builder.vcpu` / `.memory` | `2` / `4GiB` | 每台构建沙箱(阶段 microVM)的容量 |
+| `builder.{pull,step,ready,total}_timeout_sec` | `600`/`600`/`120`/`1800` | 阶段超时:guest 内拉取+展平、单条 RUN step(经 `Connect-Timeout-Ms` 同步到 guest 侧)、readyCmd 轮询预算(2s 间隔;缺省 readyCmd = `sleep 20`)、整个构建(单元 `TimeoutStartSec` = total+60) |
+| `builder.files_storage` | 空 | COPY 构建上下文的 S3/OBS 对象存储(子键 `endpoint`/`region`/`bucket`(必填)/`prefix`/`access_key`/`secret_key`/`force_path_style`/`presign_expiry`);空 = COPY 回 501。serve 仅 presign + HEAD;`access_key` 空走 AWS 默认链;`force_path_style` 默认 false(versitygw/minio 置 true);`presign_expiry` 默认 1h(PUT;GET 用 total+5m)。本地/单机无云对象存储用 versitygw(§12) |
+| `checkpoint.mode` | `local` | 暂停态落地:`local` = 本机文件(节点绑定)/ `remote` = 远程 manifest(可移植 = 模板)(§8.1) |
+| `checkpoint.local_dir` | `/var/lib/sandbox-saved` | 本机快照目录(`mode=local`) |
+| `mmds.enabled` | `false` | envd 鉴权姿态开关(§9.2、node-proxy.md §8):false = `-isnotfc` + proxy 单闸门;true = FC 模式 + MMDS re-key |
+| `mmds.listen` | `127.0.0.1:19254` | MMDS 监听地址(vswitch `--mgmt-service` 的转换目标) |
+| `cluster.registry` | 空 | registry 的 node-link 地址(§10);空 = 独立模式,不接入集群 |
+| `cluster.node_id` | (接入集群必填) | 本节点唯一标识(node-link 注册,cluster.md §5) |
+| `cluster.labels` | 空 | 节点标签 `{zone,pool,slot,node}`(scaler nodeSelectors 匹配,cluster-scaler.md §4.3) |
+| `cluster.data_endpoint` | 空 | 本节点数据面端点(供 router 转发);缺省由 `api.domain` + `proxy`/`api` 监听推导 |
+| `cluster.tls` | 空 | node-link mTLS 证书 / key / CA(生产必配,§10 / cluster.md §5.4) |
+| `resource_listen` | 空 | 内置资源控制器:非空即在该 UDS 起控制器(node-resource.md),其余字段(`resources`/`watermarks`/`admission`/…)同 node-resource.md §3;空 = 不内置(沙箱用静态 cgroup 或拨独立控制器) |
+
+配置自洽校验:`mmds.enabled=false` 时 `proxy.auth` 必须为 `enforce`(envd 非 secure,
+proxy 是唯一数据面闸门);`mmds.enabled=true` 时 `proxy.mode` 不得为 `off`(MMDS 寄宿
+proxy 组件)。external 模式无须静态 worker 列表——worker 自行经 plugin 平面注册,网关
+按活跃注册集转发(§9.1、§9.3)。配 `cluster.registry` 时 `cluster.node_id` 必填;配
+`resource_listen` 时 `sandbox.resources.control_socket` 通常指向它(否则控制器空跑)。
+
+## 4. e2b API 契约
+
+基址 `https://api.<domain>`;鉴权 **`X-API-KEY`**(SDK)或 **`Authorization: Bearer`**
+(e2b CLI 构建面,两者同样解析)。api_key 由 manifest_key 派生(`e2b-key-ctl
+gen-apikey`),serve 经 MAC 校验解析出租户——无静态 api_keys 表(§7)。
+
+**归属校验**:按 id 的控制操作用 api_key 的 MAC 对该资源行的(解密)manifest_key
+校验,不符回 **404**(不泄露他租户存在性);create / build / import 另需 manifest_key
+在白名单,否则 **403**。
+
+### 4.1 控制面:沙箱生命周期
+
+| 操作 | 方法 + 路径 | 要点 |
 |---|---|---|
-| `drained` | 控制器进入 drain 模式 | exit 非零;orchestrator 知节点不再接客 |
-| `zone_critical` | main pool 在 red/critical 区 | exit;orchestrator 换 host 或等其他 sandbox release |
-| `invalid_burst` | 请求 effective_burst 计算为 0 | 配置错(yaml 全空)|
-| `exceeds_node_capacity` | effective_startup_budget > allocatable_pool | 配置错(永远塞不进这个节点)|
-| `exceeds_startup_pool` | effective_burst > startup_pool 上限 | startup_factor 配过小 / sandbox burst 配过大 |
-| `queue_full` | queue.depth ≥ queue_max_depth | 节点 admission 压力极大,orchestrator 换 host |
-| `queue_ttl` | 等待时间 > queue_ttl | 短期资源紧但 30s 内未缓解,orchestrator 决定 |
-| `queue_canceled` | 客户端断连或自身 TTL 触发 | 通常 client-side 已退出 |
-| `daemon_shutting_down` | daemon 停机时排空在队 admit | orchestrator 换 host |
+| create | `POST /sandboxes` → 201 | body `{templateID, timeout, metadata, envVars}`(timeout 缺省取 `sandbox.timeout_sec`,默认 300s);回 `{sandboxID, templateID, clientID, domain, envdVersion, envdAccessToken, trafficAccessToken, alias}` |
+| get | `GET /sandboxes/{id}` | 附 `state`/`startedAt`/`endAt`/`metadata` |
+| list | `GET /v2/sandboxes` | 仅本租户;query `state`/`limit`/`nextToken`,分页头 `x-next-token`;每项含 `cpuCount`/`memoryMB`/`diskSizeMB`(节点统一配置值 + overlay 模板尺寸)与 ISO-8601 `startedAt`/`endAt` |
+| kill | `DELETE /sandboxes/{id}` → 204 | 非本租户 ⇒ 404 |
+| resume | `POST /sandboxes/{id}/connect` | e2b 语义:resume 走 `/connect`;body `{timeout:秒}` 顺带续期;可携迁移 token 自动 import(§8.1) |
+| pause | `POST /sandboxes/{id}/pause` → 204 | 已暂停回 **409** |
+| timeout | `POST /sandboxes/{id}/timeout` | body `{timeout:秒}`,重置 TTL |
 
-### 6.5 reservation 生命周期与 token TTL
+create 的 `templateID` 接受三种引用:持久 id(`<profile>-<kind>-<key>`,§4.4)、注册期
+transient id、或已 ready 构建的 name/alias——后两者解析到持久 id 再走统一路径。
+`envdVersion` 回 `0.6.1`(e2b)或 stub `0.1.0`(bare,≥0.1.0 否则 SDK 自毁);bare 无
+envd,回占位 token,数据面控制端口 501。`trafficAccessToken` 为 SDK 兼容字段;数据面
+强制头是 `X-Access-Token`(= `envdAccessToken`,node-proxy.md §7)。
 
-```
-Admit (admitted)
- │  reservation 占用 effective_startup_budget,token 生成
- │
- ▼
-sandbox-ctl 启动 CH(cgroup join → memfd → ...)
- │  若 sandbox-ctl 在 startup_ttl(默认 30s)内不发 Settled
- │   → 控制器视为创建失败,自动 release reservation
- ▼
-launch hello(冷启动)/ restore_ack(恢复)
- │
- ▼
-sandbox-ctl 发 Settled(token, current_rss, current_cpu_usec)
- │  reservation 进入 settled;allocatable_now 从 effective_startup_budget
- │  收缩到 max(current_rss, floor),startup_pool 同步归还该 budget
- │
- ▼
-... 后续 RequestBudget / Heartbeat / OOMReport ...
- │
- ▼
-sandbox-ctl 发 Release 或连接断开
- │  控制器释放 reservation
- ▼
-end
-```
+### 4.2 控制面:模板构建 API
 
-**TTL 设计依据**:
+实现 e2b **v2 build system** 的端点族(SDK `Template.build` / CLI 走它);构建语义与
+资源池见 §12。
 
-- `startup_ttl = 30s`:覆盖典型冷启动(大镜像 + 慢网络下 manifest 恢复)。
-  超时即视为创建失败,释放 reservation
-- `queue_ttl = 30s`:Admit 排队太久无意义,上层调度器宁可换节点
+| 操作 | 方法 + 路径 | 要点 |
+|---|---|---|
+| register | `POST /v3/templates` → 202 | body `{name, tags, cpuCount, memoryMB}` + `X-Kuasar-Sandbox-*` 头 → 模板默认配置(cpu/memory→`resource.capacity`,§4.6);回 `{templateID: transient-<uuidv7>, buildID, names, tags, aliases, public:false}` |
+| trigger | `POST /v2/templates/{tid}/builds/{bid}` → 202 | body 兼容 `{fromImage, fromTemplate, fromImageRegistry{username,password}, steps[], startCmd, readyCmd}` 与 CLI 形态 `{start_cmd, ready_cmd, …}`;`fromImage`/`fromTemplate` 互斥,皆缺时由 `builder.image_uri_mask` 推 fromImage;steps 支持 `RUN/ENV/ARG/WORKDIR/USER/COPY`(COPY 须先经 files 端点上传 context:未配 files_storage→**501**、未上传→**400**,§12);`startCmd` 非空或 fromTemplate ⇒ 暂记 snp(终态以流水线产物为准,§12),否则 img;fromTemplate 且无 steps 无 startCmd ⇒ 拒绝(无事可做);`cpu_count`/`memory_mb` + `X-Kuasar-Sandbox-*` 头 → 模板配置,**覆盖 register**(§4.6) |
+| status | `GET /templates/{tid}/builds/{bid}/status` | 回 `{templateID, buildID, status, logs:[], logEntries:[]}` + 失败时 `reason{message}`;`logs`/`logEntries` 取自 journald 构建流(tag build),按 `?logsOffset`(已读条数)分页,SDK `on_build_logs` 即据此流式输出(§12);**进行中恒报 `building`**(registered/waiting/building 均映射,CLI wait 循环仅在 `building` 续轮询),终态 `ready`/`error`;失败 `reason` 通用(详情在日志流);ready 后 `templateID` 即报持久 id,并附 `names`/`aliases` |
+| files | `GET /templates/{tid}/files/{hash}` → 201 | COPY context 上传协商:`tid→build→归属`校验后回 `{present, url}`——present 即对象已在桶(客户端跳过上传),url 为**直传桶的 presigned PUT**(字节不过控制面);未配 `files_storage`→**501**,未知/非属主 tid→**404**。详见 §12 |
+| list | `GET /templates` | 本租户 ready 模板;`templateID` 列为持久 id |
 
-## 7. node-ctl 内部组织
+### 4.3 数据面协议(envd,数据面仅透传)
 
-`node-ctl` 是协议的参考实现,作为 per-node daemon 由 systemd 管理。它内部
-组织成四个角色,共享 in-memory state 与 /run 持久化:
+envd 单端口 **49983**,HTTP/1.1 与 h2c 双栈,Connect-RPC(proto 包无版本):
+`process.Process`、`filesystem.Filesystem`(仅元数据);文件内容走 HTTP
+`GET/POST /files`(+ 签名 query);另有 `/health`、`/init`、`/metrics`。每操作用户
+经 `Authorization: Basic base64("user:")`。**code-interpreter** =
+`POST https://49999-<sid>.<domain>/execute`(NDJSON)→ guest FastAPI(:49999) →
+Jupyter(:8888)。exec = `POST /process.Process/Start`(头 `X-Access-Token`)。
+租户数据面本组件只透传不实现;**构建流水线自带一个最小 `process.Start` 客户端**
+(connect+JSON 信封手写,无 protobuf/gRPC 依赖)驱动 steps/startCmd/readyCmd(§12)。
+
+guest 内 envd 的两个控制端口经 sandbox-ctl `--connect` 映射为 host UDS
+(`<rundir>/envd.sock`、`ci.sock`),仅 proxy 可达——不走 floatingip,沙箱间无通路。
+
+### 4.4 templateID 与模板形态(transient / persist,无 templates 表)
 
 ```
-node-ctl daemon
-├── RPC server               处理协议消息
-├── Admission Controller     §6 准入与速率限制
-├── Memory Allocator         §4.3 仲裁与 grant
-├── Reclaim Scheduler        §4.2 settled 期主动收回
-└── State Persister          §8 /run/node-ctl/state.json 写
+persist  templateID = <profile>-<kind>-<key>    profile∈{e2b,bare}; kind∈{img,snp};
+                                                key = manifest content key (64-hex)
+transient templateID = transient-<uuidv7>       构建注册期临时句柄,build 完即弃
 ```
 
-这些角色在协议规范中是隐式的——其他实现可以选择不同的内部组织。本文档其余
-部分(§可靠性、§admission)以 node-ctl 行为为准描述。
+- **持久 id 自描述**:即 manifest 键,是 create 的正式 templateID;运行期从前缀解析
+  profile(选 runtime erofs)与 kind(img = 冷启,snp = restore)。格式/枚举不合法
+  当场 4xx。
+- **临时 id** 由注册生成;构建完成后持久 id 写入该构建的 names + aliases 一并返回,
+  之后只用持久 id。
+- **无独立 templates 表**:`builds` 表兼任模板登记(§15);持久 id 由构建产物推导。
+  快照晋升的模板(§8.1)甚至不写 builds 表——id 本身即完整引用。
 
-## 8. 可靠性
+### 4.5 SDK / CLI 对接与协议 pin
 
-### 8.1 状态全部在 /run
+- 重定向:`E2B_DOMAIN=<domain>` + `E2B_API_KEY`(生产,TLS);dev 走
+  `E2B_API_URL`/`E2B_SANDBOX_URL`(http/h2c)。控制面要求 Host 命中 `api.*`。
+- api_key 形态:`e2b_` + 72 hex(共 76 字符);e2b SDK 以 `/^e2b_[0-9a-f]+$/` 校验
+  格式,服务端另验 MAC(§7)。
+- envd 版本 pin:按 e2b-dev/infra 发布 tag 定版(sandbox-deps `ENVD_TARBALL`,默认
+  `2026.22`,对应 envd 0.6.x);SDK:`e2b` js 2.27.x / py 2.25.x 实测兼容。
+- 数据面鉴权头 `X-Access-Token`(= `envdAccessToken`):secure 沙箱自 SDK v2.0.0
+  默认开,SDK 每次数据面调用携带。
+- routesync(external proxy / 路由观察者):版本 1,帧 `[4B LE len][JSON]`,消息
+  `register|hello|upsert|delete|bookmark|wake`,路径
+  `PUT /internal/plugin/{id}/register`(config-socket plugin 平面,§6;线格式 node-proxy.md §6)。
 
-控制器状态分两类,**全部 tmpfs,无任何磁盘持久化**:
+### 4.6 沙箱配置传递链
 
-**进程内**:
+每实例沙箱配置经**命名空间化的 e2b metadata 保留键** `kuasar-sandbox.<ns>`(各值一个
+JSON 对象)注入,零 SDK/API 改动。命名空间是 sandbox-runtime `config.SandboxConfig`
+(serve import,单一真源)的**租户可控子集**:
 
-- 当前 RPC 连接表
-- 速率限制 token bucket 状态
-- 短期统计(1 分钟窗口的 grant 次数等)
+| 命名空间 | 去向 |
+|---|---|
+| `resource` | `resources.{capacity,allocatable}`(不含 `control`,节点托管) |
+| `network` | 拆分:`hostname`/`nexthop`→guest;`inner_ip`/`transit_*`→`vswitch.Attach`;`dns`→`/etc/resolv.conf` |
+| `launch` | `launch.{exec,args,env,workdir,restart,user,stop_signal,plugin}`——**仅 bare**;e2b profile 拒(envd 占用 launch) |
+| `init` / `mounts` / `files` | 直透 `init[]` / `mounts[]` / `files[]` |
+| `metadata` | `SANDBOX_CONFIG.metadata` 透传(如 `e2b.start_cmd`) |
+| `cluster` | `{group, route_key}`——集群调度 / 路由身份,经 node-link 上报 registry(§10、cluster.md §5.1);独立模式无 node-link 时仅作记录 |
 
-**`/run/node-ctl/state.json`**:
+- **渲染**:serve 建 `config.SandboxConfig` 基座(boot/tapfd/control/capacity/已解析
+  网络)再叠租户命名空间,yaml 序列化经 config-socket 交 sandbox-ctl。深校验(ValidateCold)
+  在 sandbox-ctl——serve 侧 yaml 是半成品(cgroup_path 经 `--cgroup-adopt`、base 经
+  快照填),这里只对租户网络做格式校验。
+- **两个注入面**:e2b metadata,与 `X-Kuasar-Sandbox-<Ns>` 请求头(API 边缘归一化进
+  metadata,**同名头胜过 metadata 键**)。create 与模板构建(register/trigger)都支持;
+  构建配置存 `builds.metadata_json`。集群下 `create` 命令亦经 metadata 注入 `cluster`
+  命名空间(§10)。
+- **优先级**:`节点默认 ⊕ 模板配置 ⊕ create 配置`(create 按命名空间胜)。模板配置:snp
+  经快照、img 经 `builds.metadata_json`。构建内 `register ⊕ trigger`(trigger 胜);
+  register/trigger 的 `cpuCount`/`memoryMB` → `resource.capacity`(胜过 resource 头),决定
+  phase-C 构建 VM 容量。
+- **capacity**:img create 自由(create/模板/默认);snp create / resume / 迁移导入**钉死
+  快照**(runtime 拒容量不等)。
+- **network 随快照**:渲染时把已解析逻辑网络注入
+  `SANDBOX_CONFIG.metadata["kuasar-sandbox.network"]`,随 snapshot.cfg 落盘并跨 restore 继承;
+  restore 时 serve 读回,填 create 未指定的网络字段(**显式 create 胜**,§8)。迁移
+  token 同样携带 metadata。其余命名空间只在冷启生效或已冻入快照,故只 network 需随快照。
+- **持久化**:`sandboxes.metadata_json` / `builds.metadata_json`。
 
-```
-{
-  "version": 1,
-  "node_budget":         { "memory_bytes": ..., "cpu_milli": ... },
-  "host_reserved":       { "memory_bytes": ..., "cpu_milli": ... },
-  "operational_margin":  { "memory_bytes": ..., "cpu_milli": ... },
-  "watermarks":          { "high_factor": 0.85, "low_factor": 0.70, "emergency_factor": 0.05 },
-  "reservations": [
-    {
-      "token":              "...",
-      "sandbox_id":         "...",
-      "sandbox_ctl_pid":    12345,
-      "cgroup_path":        "/sys/fs/cgroup/sandboxes/sb-001",
-      "capacity":           { "memory_bytes": ..., "cpu_milli": ... },
-      "floor":              { "memory_bytes": ..., "cpu_milli": ... },
-      "allocatable_now_mem":  ...,    # 仅内存有运行时值
-      "stage":              "settled",
-      "stage_entered_at":   "2026-..-..T..",
-      "last_heartbeat_at":  "2026-..-..T..",
-      "oom_count":          0
-    },
-    ...
-  ]
-}
-```
+## 5. 进程管理(systemd 模板单元,启动时自动生成安装)
 
-写入策略:
+serve 启动时生成并安装两个模板单元 + 两个 slice(`sandbox-runner.slice`、
+`sandbox-builder.slice`)到 `units.dir`,内容变更才 `daemon-reload`(D-Bus `Reload`);
+`units.install: false` 则交由运维带外管理。ExecStart 里的 `node-ctl` 路径
+取自 serve 自身所在目录(自动发现,§3)。
 
-- **关键事件即时写**:Admit grant、Release、Reclaim 完成等改变 reservations
-  数组的事件
-- **状态变化批量写**:Heartbeat 更新 last_heartbeat_at 等高频但非关键的更新
-  按 5 秒批量 flush
-- **原子写**:`write to state.json.tmp + fsync + rename` 防截断
+**runner 单元**(`%i` = sid):
 
-`/run` 是 tmpfs,host 重启即丢——这正是想要的:host 重启时所有沙箱的 CH
-进程都已死,没有任何活沙箱需要恢复 reservation。
-
-### 8.2 控制器进程重启恢复
-
-控制器进程重启(systemd 自动 restart 或运维主动)但 host 未重启时:
-
-1. **读 /run/node-ctl/state.json**:成功则得到上次写入时的 reservations 快照;
-   失败或不存在则 reservations = []
-2. **扫描已知父 cgroup**:控制器 yaml 配置一个或多个 `cgroup_scan_paths`
-   (典型 `/sys/fs/cgroup/sandboxes/`),遍历得到当前 host 上活的沙箱 cgroup
-   列表
-3. **交叉对账**:对每个 cgroup:
-   - 在 state.json 找到对应 reservation:状态有效,标记待重连
-   - 不在 state.json:**孤儿 cgroup**——通过 cgroup.procs 找 sandbox-ctl pid,
-     通过 `/proc/<pid>/cmdline` 验证是 sandbox-ctl,通过启动参数读到
-     sandbox.yaml 路径取得 sandbox sid + capacity,**临时收纳**为新
-     reservation,等其重连
-   - state.json 有但 cgroup 不存在:沙箱已死,丢弃 reservation
-4. **等待重连**:已知的活 reservation 暂无连接(`Conn=nil`),收到
-   sandbox-ctl 的 `Reattach(token)` 后回 `Ack(new_allocatable)` 重新绑定;
-   超过心跳过期阈值仍无重连的由 IdleSweeper 视为死亡丢弃
-5. **服务恢复**:期间控制器接受新 Admit 申请,但水位计算包含已知活沙箱的
-   reservation(可能短暂超估,优先保守)
-
-**关键不变量**:**cgroup 是真相之源,state.json 是性能优化**。state.json
-损坏不导致功能失败,只是恢复期 + 30 s 等所有沙箱重连。
-
-### 8.3 故障域处理
-
-**sandbox-ctl 崩溃**:
-
-- 控制器通过 RPC 连接 EOF 检测
-- 立即将 reservation 标记 `pending_release`,5 s 内交叉检查 cgroup:
-  - cgroup 还在 → 沙箱可能仍在跑(sandbox-ctl 异常但 CH 还活):pending,
-    最长等 60 s,期间不接受该 sid 重连(必须新 Admit)
-  - cgroup 已消失 → 真死,释放 reservation
-
-**sandbox-ctl 网络断 + 自身仍活**:
-
-- 同上,但 60 s 后 cgroup 仍在
-- 此时 sandbox-ctl 已经走降级流程,继续无控制器运行
-- 控制器把 reservation 转 `presumed_no_controller`:仍计入 node_allocated,
-  但不再接受其 RPC(token 失效,需要 sandbox-ctl 主动重 Admit)
-
-**控制器自身崩溃**:
-
-- systemd 重启
-- 重启过程中所有 sandbox-ctl 退化无控制器
-- 控制器起来后走重建流程,sandbox-ctl 重连后恢复联动
-
-**全节点 OOM(host 级)**:
-
-- 不应发生(水位机制保证)。若发生,kernel OOM killer 选目标。controller 与
-  cache-ctl 等 host 进程优先级低于 sandbox(由 systemd OOM score 设置),
-  先被杀
-- 控制器重启后走重建流程,期间沙箱继续运行(降级)
-
-**host 重启**:
-
-- 所有沙箱与控制器同时消失
-- /run/ 清空,无任何状态留存
-- 重新启动后从空状态开始,等上层调度器重新发沙箱
-
-## 9. 工作负载模型与基线
-
-### 9.1 agent-intermittent 模型
-
-agent 应用的运行剖面输入规范(实测在 [`perf.md`](perf.md)):
-
-```
-节点参数:
-  N_sandboxes               沙箱总数(扫描变量,32 / 64 / 128 / 256 / 512)
-  capacity_each             (memory=8 GiB, cpu=2)
-  floor_each                (memory=128 MiB, cpu=0.1)
-  startup_budget_memory     1 GiB
-
-每沙箱状态机:
-  state ∈ {idle, active}
-  转换:
-    idle → active:    指数到达,平均间隔 1/λ_a 秒
-    active → idle:    持续时间 D ~ Pareto(α=1.5, x_min=5)秒
-
-每沙箱内存行为:
-  idle:    RSS_target = 128 MiB,cpu 使用 ≈ 0.05 核
-  active:  RSS 在 G ~ Uniform[1, 5]秒内线性升至 R_max ~ Uniform[1, 6]GiB
-           cpu 使用 ≈ Uniform[0.5, 2]核
-           保持到 active 期结束
-           active 结束后 5 秒内 RSS 通过 madvise 回到 128 MiB
+```ini
+# sandbox-runner@.service (生成内容,路径按配置渲染)
+[Service]
+Type=exec
+WorkingDirectory=/run/sandbox/%i
+ExecStart=<node-ctl> run-sandbox --pidfile=/run/sandbox/%i/%i.pid \
+          --config-socket=/run/sandbox/node-ctl.socket --sandbox-id=%i
+Restart=no                  # 一进程一沙箱、有状态:崩 = 该沙箱已死,不重试
+KillMode=control-group      # StopUnit 连 cloud-hypervisor 一并 SIGKILL(§5.1)
+TimeoutStopSec=20
+Slice=sandbox-runner.slice
+Delegate=yes                # 委派控制器,--cgroup-adopt 才能写 cpu.max/memory.max(§5.1)
 ```
 
-baseline 参数集:
+**builder 单元**(`%i` = build id,§12):
+
+```ini
+# sandbox-builder@.service (生成内容)
+[Service]
+Type=oneshot
+WorkingDirectory=/run/sandbox/%i
+StandardOutput=file:/run/sandbox/%i/%i.result   # 捕获 run-builder stdout 的构建结果 JSON
+StandardError=journal                           # 流水线进度/报错进 journal,不污染 .result
+LogRateLimitIntervalSec=0                        # 构建少且要全量细节(每阶段控制台 + flatten/RUN 进度):关本单元限流不丢行(runner 单元保留默认限流,§5.2)
+ExecStart=<node-ctl> run-builder --pidfile=/run/sandbox/%i/%i.pid \
+          --config-socket=/run/sandbox/node-ctl.socket --build-id=%i
+TimeoutStartSec=1860              # builder.total_timeout_sec + 60
+KillMode=control-group
+Slice=sandbox-builder.slice   # 构建池 cgroup 上限(builder.cpu_quota/memory_max)
+```
+
+两单元的 ExecStart 都是启动器(§2.4),锁 pidfile 后经 config-socket 取规约,然后
+分道:runner `execve` 替换为 `sandbox-ctl run`(继承单元主 PID 与 cgroup,
+`Type=exec` 故无需 sd_notify);builder **驻留**驱动三阶段流水线(§12),阶段沙箱
+(`sandbox-ctl run` + cloud-hypervisor)是其直接子进程、整个构建计入本单元 cgroup,
+`Type=oneshot` 使 `StartUnit` 阻塞至流水线退出,`KillMode=control-group` 保证
+StopUnit/超时连阶段 VM 一并回收。
+
+- **kill**:`StopUnit`(连 CH 一并 SIGKILL)→ `ResetFailedUnit` → `vswitch-ctl detach`
+  → 删运行目录 → 删库行。`kill` 在进程层生效,不受 guest 内 restart 策略阻挡。
+- **就绪**:`Type=exec` 下 exec 成功即视为单元已启动;e2b profile 再轮询 envd
+  `/health`(UDS,60s 上限)判数据面就绪。
+- **存活权威**:`ListUnitsByPatterns("sandbox-runner@*.service")` 一次拿权威存活集
+  (§15)。
+- 宿主 `Restart=no` 与 guest 内 envd `restart=always`(sandbox-init 管)是两层,
+  互不相干。
+
+### 5.1 cgroup(cgroup-adopt:单元自身 cgroup 即沙箱资源 cgroup)
+
+serve 不预建 cgroup、不做进程搬迁。LaunchSpec 给 sandbox-ctl 带
+**`--cgroup-adopt`**:它接管自己所在 systemd 单元的 cgroup 作为沙箱资源 cgroup——读
+`/proc/self/cgroup` 求出路径,cloud-hypervisor 与自身都留在其中。于是:
+
+- 一个单元 = 一个沙箱 cgroup;资源控制器(配置了 `control_socket` 时)在该路径上原地
+  仲裁;`KillMode=control-group` 使 `StopUnit` 连 CH 一起 SIGKILL,无需 serve
+  排空/rmdir 安全网。
+- 单元必须 `Delegate=yes`:否则单元 cgroup 的控制器接口文件(`cpu.max`/`memory.max`)
+  非本进程可写,`--cgroup-adopt` 写资源上限会 `permission denied`。
+- 代价:sandbox-ctl 与 CH 同处受限 cgroup,`memory.high` 节流存在死锁风险(见
+  sandbox-runtime `pkg/sandbox/cgroup.go` 头注)。采纳此模型并照常设 `memory.high`。
+
+### 5.2 日志:journald 单汇 + 标签词表
+
+沙箱栈的 app stdio 与 guest 内核 dmesg 全部直写 journald(无临时日志文件),由
+`SYSLOG_IDENTIFIER` 标签区分;journald 按写入进程的 cgroup 自动盖 `_SYSTEMD_UNIT`,
+故"标签 + 单元"二元组即选定一路流。写者是 **sandbox-ctl** 的 stdio bridge
+(`--stdout-to/--stderr-to/--console journald=<tag>`,语义见 sandbox-runtime
+sandbox.md §2.2)与 run-builder(自身里程碑 + envd RUN 输出回放,`go-systemd/journal`
+纯 Go 直发):
+
+| 标签 | 写者 / 单元 | 内容 | 去向 |
+|---|---|---|---|
+| `sandbox` | runner 沙箱 / `sandbox-runner@<sid>` | 沙箱 app stdio | 仅宿主排障 |
+| `build` | builder 阶段沙箱 + run-builder / `sandbox-builder@<bid>` | 阶段 app stdio + 里程碑 + RUN 回放 + flatten 进度 | **SDK 构建日志**(§12);宿主亦可见 |
+| `console` | runner / builder 两类沙箱 | guest 内核 dmesg | **仅宿主**(故意不入 SDK 构建日志) |
+
+- **runner**:LaunchSpec(§6)给 sandbox-ctl 带 `--stdout-to journald=sandbox
+  --stderr-to journald=sandbox --console journald=console`;exec 替换后在 runner 单元
+  cgroup 内直写,标签自动归 `sandbox-runner@<sid>`。`journalctl -u
+  sandbox-runner@<sid>.service [SYSLOG_IDENTIFIER=sandbox|console]` 按沙箱取流。
+- **builder**:run-builder 给每台阶段沙箱带 `journald=build`(app)/`journald=console`
+  (内核);单元 `LogRateLimitIntervalSec=0` 保证不丢行(§5)。
+- **限流策略**:builder 单元关限流(构建少、要全量细节);runner 单元保留默认限流
+  (数千沙箱不得刷爆 journal)。
+- sandbox-ctl 自身进程日志(其 stderr)随单元落 journal 但**不带标签**——属宿主排障,
+  不进任何标签过滤流(也不入 .result:那是 run-builder stdout 专用)。
+
+## 6. 本机控制 socket(task / admin / plugin / api 平面)
+
+serve 在 UDS `paths.config_socket`(默认 `/run/sandbox/node-ctl.socket`,**0600**)
+跑一个 h2c HTTP 服务(兼容 HTTP/1.1):单 socket 复用四个平面、各自鉴权。连接建立时
+经 **`SO_PEERCRED`** 取 peer pid 注入请求上下文;socket 0600 ⇒ 仅同 uid / root 可连,
+各平面在此之上再细分。`/internal/*` 前缀 e2b SDK 永不使用,与 api 路径不冲突。
+
+**① task 平面** — 启动器取工作规约,两条路径、同一鉴权:
+
+- `POST /internal/task/launchspec`(run-sandbox;req `{config_id: "sandbox:<sid>"}`)
+  → **LaunchSpec** `{exec, args, workdir, env}`:`exec=sandbox-ctl`,
+  `args=[run --sandbox-id <sid> --config <rundir>/<sid>.yaml --manifest-config
+  <shared> --run-root <run_root> --cgroup-adopt (--restore <ref>)
+  (--connect <uds:ip:port>)…]`,`env={MANIFEST_KEY}`。`--run-root` 把 sandbox-ctl
+  的 socket/staging 目录(`ch.sock`/`ctl.sock`/…)钉到 serve 的 run_root,
+  pause/snapshot 客户端(同 `--run-root`)才能拨到 `ctl.sock`。
+- `POST /internal/task/buildspec`(run-builder;req `{config_id: "build:<bid>"}`)
+  → **BuildSpec(构建工作单)**:`{build_id, workdir, from_image | from_template
+  (+kind), steps[], start_cmd, ready_cmd, env, paths, net, vcpu, memory,
+  mmds_enabled, envd_token, insecure, platform, timeouts}`——`env` 含
+  `MANIFEST_KEY` + 租户 `FLATTEN_*` 拉取凭据;`paths` 是宿主侧工件与工具
+  (kernel / runtime_e2b / runtime_builder / 两个 diff template / sandbox-ctl /
+  flatten-ctl / manifest-ctl / manifest_config);`net` 是 serve 预先 attach 的
+  网络槽(tapfd exec、mac、inner_ip、nexthop、hostname、dns),全构建复用。
+  run-builder 据此自建阶段沙箱(§12);仅在该构建单元运行期间可取(serve 持挂
+  pending 状态,单元退出即失效)。
+- **鉴权**:peer pid ⟷ `<rundir>/<id>/<id>.pid`(启动器拨号前已锁写本 PID),相等即
+  认证。
+- 设计意图:**非密配置走文件**(`<sid>.yaml`;构建的阶段 yaml 由 run-builder 写进
+  workdir)、**密钥走 spec env**——秘密只在内存与 env 中,不落盘。
+
+**② admin 平面** — `/internal/admin/manifest-keys`(`GET` = list,`POST
+{op: add|remove|check, key, label, ttl_seconds, registry_auth}`):manifest-key 白名单
+管理(§7)。鉴权:配 `paths.admin_pidfile` 则 peer pid 须在其中;未配则仅靠 socket
+0600。`node-ctl manifest-key` 即此平面客户端;集群下 node-link 收到的 `key_put`/`key_renew`/
+`key_drop` 命令亦写此表(租约项,§10)。
+
+**③ plugin 平面** — `PUT /internal/plugin/{id}/register`:一个订阅者(external proxy
+worker,或路由观察者如平台 agent)注册其能力并**持挂该 h2c 连接**——连接本身即它的
+租约 + 路由流(routesync,线格式见 node-proxy.md §6)。请求体首帧是 `register{caps}`,之后(route_wake)是
+`wake` 上行;响应体下行 `hello(policy) → upsert* → bookmark → upsert/delete`。能力相互
+**独立、不强制组合**:`subscribe`(`route` | `route_wake`)、`proxy{socket{path}}`
+(声明 serve 兜底网关转发数据面请求的目标 UDS)、`mmds`。**断连即反注册**;同
+id 二次注册自动反注册(并断链)前者。鉴权:配 `paths.plugin_pidfile` 则 peer pid 须在
+其中,未配则仅靠 socket 0600(同 admin)。external proxy worker、平台 agent 均经此订阅。
+此平面是**节点本地** UDS,与接入集群的 node-link(§10,跨网 mTLS)正交。
+
+**④ api 平面** — 其余路径回落到 e2b 控制面 handler(与 TLS `api.listen` **同一个**
+`http.Handler`,含 export/import 扩展),明文 h2c、`X-API-KEY` 鉴权。
+`export-sandbox`/`import-sandbox` CLI 即此平面客户端(§8.1)。
+
+**信任模型**:host root / daemon uid 可信;租户代码在 guest 内,够不到 host UDS。
+
+## 7. 密钥与归属模型(manifest_key 根密钥,加密存 sqlite)
+
+- **manifest_key 是每租户根密钥**(32B / 64-hex),同时就是 manifest 内容键
+  (`MANIFEST_KEY` env / `manifest.key`)。**api_key 由它派生**(`e2b-key-ctl
+  gen-apikey`):
+
+  ```
+  api_key = "e2b_" + hex( fp(12) ‖ ts(4) ‖ nonce(4) ‖ mac(16) )      # 76 字符
+  fp  = SHA256(manifest_key)[:12]                                    # O(1) 库内匹配
+  mac = HMAC-SHA256(manifest_key, fp‖ts‖nonce)[:16]                  # 无 key 不可伪造
+  ```
+
+  e2b SDK 以 `/^e2b_[0-9a-f]+$/` 校验 api_key 格式(故用 hex 编码);serve 另
+  自校验 MAC(`internal/apikey`)。manifest_key 本身永不发给 SDK。
+- **加密落盘**:`manifest_keys` / `sandboxes` / `builds` 三表的 manifest_key 字段
+  AES-256-GCM 加密(`internal/secretbox`:记录 = `keytag(4)‖nonce(12)‖ct+tag`,
+  keytag 选解密钥),另存 `manifest_key_hash = hex(fp)` 非唯一索引(快速匹配/排除)。
+  加密密钥经 `encryption_key` / `NODE_CTL_ENCRYPTION_KEY`(`:` 分隔多键,[0]
+  活动、其余备用解旧记录,支持轮换)。
+- **鉴权解析**(短 hash 匹配 + 完整 MAC 校验):api_key → 按 `fp` 命中行/白名单 →
+  解密 manifest_key → 重算 HMAC 比对:
+  - **create / build / import**:manifest_key 须在 `manifest_keys` 白名单
+    (`node-ctl manifest-key`,§2.6;daemon 是该表唯一写者;集群下 registry 经
+    node-link 租约写入,§10),否则 **403**。
+  - **其他按 id / list 操作**:只对资源行自身的 manifest_key 校验,不查白名单——即
+    清空白名单,存量 sandbox/build 仍可正常操作直至生命周期结束。
+  - list 的 hash 预筛非唯一,逐行再验 MAC,杜绝 hash 碰撞串租户。
+- **与收敛加密的关系**:manifest_key 只封 manifest 的密钥表;chunk 加密密钥派生自
+  `SHA256(salt‖明文)`、与租户 key 无关 ⇒ chunk 去重仍跨租户;租户之间不共享 key 与
+  模板。
+- **key 不落明文**:sqlite 内加密;运行期只在 serve 内存、LaunchSpec env 帧、
+  子进程 env(`MANIFEST_KEY`)中;`<sid>.yaml` 非密不含 key。auto-resume 从加密存储
+  解出 key 解封快照(数据面唤醒无 api_key 可用)。集群下经 node-link 下行的 manifest_key
+  同样仅入加密存储 + 运行期内存(§10)。
+- 数据面另有 token 与会话密钥,皆系于此根:`envdAccessToken`/`trafficAccessToken`
+  (create 时铸造的随机 token、随行存库,数据面鉴权语义见 node-proxy.md §7);`MmdsSecret =
+  HMAC-SHA256(manifest_key, "kuasar-mmds-v1:"+sid)`(每沙箱确定性派生的 MMDS 会话签名
+  密钥,`mmds.enabled` 时随路由分发给 proxy 校验 envd 身份,见 node-proxy.md §8)。
+
+## 8. 生命周期与状态机
 
 ```
-λ_a = 0.01 events/s/sandbox       # 平均每沙箱 100s burst 一次
-α = 1.5, x_min = 5                # Pareto 形状
-correlation = independent          # 沙箱独立 burst,可改 50% 同步
+            create(img: cold boot / snp: restore)
+                 │
+                 ▼            pause / TTL(auto-suspend)
+   ┌────────► running ───────────────────────────────► paused
+   │             │                                       │
+   │             │ kill                                  │
+   │             ▼                                       │
+   │           (row deleted)                             │
+   └──────◄── connect(resume) / data-plane wake ──◄──────┘
 ```
 
-### 9.2 衡量指标
+- 操作映射:create(img = 冷启 / snp = restore)、connect = resume、pause = snapshot、
+  timeout = 续期、TTL 到期 = auto-suspend(pause)、kill = 销毁(删行)。重启对账可把
+  失联的 running 标为 `dead`(§15);paused/dead 行中,paused 可再拉起,kill 删行。
+  集群下,这些操作另由 node-link 命令触发(create/connect/delete,§10),并把
+  状态变化作为事件上报 registry。
+- **auto-suspend**:reaper(5s 周期)发现 `deadline` 已过 → 对运行中 sandbox-ctl 封
+  快照(按 `checkpoint.mode`,§8.1)→ 记 `snapshot_ref`、标 paused → `StopUnit` →
+  detach。路由表保留 paused 路由,后续数据面流量可唤醒。
+- **auto-resume**:数据面流量打到 paused 沙箱 → 读库 → 重走 launch(建目录 + attach
+  + StartUnit),LaunchSpec 带 `--restore <snapshot_ref>` → sandbox-ctl 解封恢复。
+  - **单飞**:同一 sid 的并发数据面请求经 per-sid single-flight 合并为一次 resume,
+    杜绝重复 IP 分配 / attach / StartUnit 竞态。internal 模式 proxy 在请求内同步触发;
+    external 模式经 routesync `Wake` 上行,serve 端同样单飞(§9.2)。集群级会话亲和的
+    单飞在 registry 端按 (group, route-key) 进行(cluster.md §7)。
+  - resume 同时是 `POST /sandboxes/{id}/connect` 的实现;带 `timeout` 则顺带续期。
+- **每实例配置**(create/构建经 metadata + `X-Kuasar-Sandbox-*` 头,命名空间化,详见
+  §4.6):配置随沙箱持久化(`metadata_json`),resume 时重新解析、全生命周期一致;无白名单
+  门(沙箱以完整能力经 sandbox API 发布,平台自身亦经此 API 管理)。**network 另随快照**——
+  restore 时 serve 读回快照内的逻辑网络,填 create 未指定的字段(显式 create 胜)。
 
-| 指标 | 目标 | 测量方式 |
-|------|------|---------|
-| guest OOM 频次 | 0 / 节点 / 小时 | cgroup memory.events.oom 累计 |
-| host OOM 频次 | 0 / 节点 / 小时 | dmesg + /proc/pressure 异常 |
-| burst P99 应用延迟 | < 100 ms 或基线值的 1.2 倍 | 应用内打点,vsock 协议回传 |
-| 单节点最大 N | 越大越好 | 调高 N 直到 OOM 频次 > 阈值 |
-| budget-grant 延迟 P99 | < 50 ms | 控制器内 RPC 计时 |
-| Admit 拒绝率 | < 5%(green/yellow 区) | 控制器计数 |
-| 节点预算利用率 | > 75%(memory) | (node_allocated_mem / allocatable_pool_mem) 时间均值 || CPU 公平偏差 | < 10%(节点饱和时) | 单沙箱实测 cpu / (allocatable.cpu × physical_cpu / Σ allocatable.cpu) |
+### 8.1 暂停态分层、转模板与跨机迁移
 
-## 10. 跟其他子系统的关系
+沙箱快照有两态,`checkpoint.mode` 选 pause 的默认落地:
 
-### 10.1 与 sandbox-ctl
+| | **本机快照**(`local`,默认) | **远程快照**(`remote`) |
+|---|---|---|
+| 实现 | `sandbox-ctl snapshot --output` → `checkpoint.local_dir/<sid>/<sid>.snapshot` | `sandbox-ctl snapshot --upload` → manifest store |
+| `snapshot_ref` | 本机 bundle 路径 | `manifest://<key>` |
+| 可恢复范围 | 仅本机(恰合"沙箱附着宿主") | 任意共享同一 store 的节点 |
+| 本质 | 暂停态 | **可移植,即模板** |
 
-- **协议对端**:sandbox-ctl 是协议本侧执行器(沙箱级),node-ctl 是对端
-  控制器(节点级)
-- **通过 sandbox.yaml 关联**:sandbox.yaml `control.controller` 字段是 UDS
-  路径,sandbox-ctl 启动时拨号
-- **解耦**:控制器不直接管 CH 进程,不直接读 guest 状态;只跟 sandbox-ctl
-  对话,sandbox-ctl 负责把决策落到 CH/cgroup
+本机快照可按需晋升:`export-sandbox` 内部走 `sandbox-ctl upload-snapshot <bundle>`
+上传为远程 manifest 并重指 `snapshot_ref`(本机 bundle 随之删除)。全部基于现有
+sandbox-ctl 原语(`snapshot --output|--upload`、`upload-snapshot`、`run --restore`),
+e2b API/CLI 零改动。集群下的 PAUSED→SAVED 下沉(节点本机 → 远程、不绑节点)即复用此晋升
++ 铸迁移 token,经 node-link 两阶段上报(§10、cluster.md §7.4)。
 
-详见 [`sandbox.md`](sandbox.md) §与 node-ctl 的资源协议。
+`export-sandbox` / `import-sandbox`(CLI 形式见 §2.7)是 api 平面端点
+`POST /sandboxes/{id}/export`、`POST /sandboxes/import` 的客户端;两端点在 TLS
+`api.listen` 上同样可达(api-key 已按租户隔离),晋升/导出/插行全由 daemon 进程内
+完成,无第二写者。
 
-### 10.2 与 cache-ctl / store-ctl
+- **晋升 / 转模板**(`--to-template`,须 paused):确保远程后,组装并打印自描述持久
+  id `<profile>-snp-<key>`(不写 builds 表)。之后 `e2b sandbox create <id>` 即从该
+  快照扇出新沙箱(新 sid);create 解密用的租户 key 仍由 api_key→白名单解析。
+- **迁移(同 sid 跨机)**:`export-sandbox <sid>` 确保远程后导出**单行 base64 token**
+  = 沙箱行(env/metadata/deadline/数据面 token + runtime erofs 摘要;manifest_key
+  仅指纹、不含密钥);默认回收源行(move,`--keep-source` = copy)。目标机
+  `import-sandbox <token>`:api_key → 白名单解析租户 key(须先 `manifest-key add`,
+  与 create 同前置)、校验 token 指纹与本机 runtime 摘要一致,插入 paused 行;随后
+  `connect` 在新机恢复。目标机须共享同一 `manifest_config`(远程 store)。
+- **一步迁移**:`Sandbox.connect(<sid>, api_headers={"X-Kuasar-Migration-Token":
+  <token>})`——目标机本地无此 sid 且带迁移 token 时,connect 在 resume 前自动
+  import(同上校验,且 token 内 id 须等于所连 sid,否则报错并回收误插行),迁移收敛
+  为单次 SDK 调用;`import-sandbox` CLI 保留作显式预导入。集群下,registry 的
+  `create{migration_token}` 命令即以此一步迁移在新节点拉起 SAVED 沙箱(§10、cluster.md §7)。
+- **状态感知驱动迁移**:暂停态的本地/远程经 `RouteEntry.snap_loc`(`local`|`remote`)随
+  路由流下发(node-proxy.md §6);订阅 plugin 平面的平台 agent(`subscribe=route`)据此识别哪些 paused
+  沙箱节点绑定(腾空节点前须先迁移)、哪些已可移植,再按需调 export-sandbox 铸造
+  MIGRATION_TOKEN 完成自动迁移。集群下该感知与迁移由 registry 经 node-link 驱动(scaler 不碰生命周期)
+  (§10、cluster.md §7)。迁移 token 是凭据且会回收源行,故按需铸造、绝不随路由广播。
+- 限制:token 不含系统密钥,但携带沙箱自有 env 与数据面 token,按"沙箱级敏感"对待;
+  快照绑定其 guest runtime(erofs 摘要校验),不同 runtime 的节点拒绝导入。
 
-cache-ctl / store-ctl 的资源占用是 host 预留的一部分,计入
-`resources.host_reserved.memory`。典型:
-- store-ctl(fs backend):~50-100 MiB(含 page cache 缓冲)
-- cache-ctl(rocksdb L1):由 yaml `wal_size_limit_mb` + `block_cache_size`
-  决定,典型 2-8 GiB
-- 监控 / 日志:~500 MiB
+## 9. 数据面装配(serve 侧)
 
-实际 host_reserved 应在节点上跑空载基线后实测,加 ~20% 余量。
+数据面**转发层**——L7 反代:按 `(sid, port)` 路由到 guest envd / floatingip,逐请求
+鉴权,CONNECT 隧道,MMDS,以及 routesync 线格式——自成一文,见 [node-proxy.md](node-proxy.md)。
+本节只讲 serve 控制面对数据面的三项职责:按 `proxy.mode` 装配承载、作本节点路由
+权威向订阅者广播、以及兜底网关。
 
-### 10.3 不感知 VMM
+### 9.1 按 proxy.mode 装配
 
-控制器只跟 sandbox-ctl 对话,不依赖 cloud-hypervisor 任何接口。这层间接是为了
-让控制器跟 CH 解耦,未来 VMM 替换或控制器实现替换都不影响另一侧。
+serve 启动末段按 `proxy.mode`(§3)装配数据面;控制面 `api.<domain>` 始终由
+`api.listen` 提供,按 Host 与数据面(`<port>-<sid>.<domain>`)分流:
 
-## 11. See Also
+| 模式 | 数据面承载 | 进程 |
+|---|---|---|
+| **internal**(默认) | serve 进程内 proxy(与控制面同一 `http.Handler`,按 Host 分流) | 单二进制 |
+| **external** | 独立 `node-ctl proxy` worker(≥1)经 plugin 平面注册、SO_REUSEPORT 共享数据口 | serve + N×proxy |
+| **off** | 拒绝(501) | – |
 
-- [`sandbox.md`](sandbox.md) §资源模型 / §与 node-ctl 的资源协议 —— sandbox-ctl
-  侧的执行器行为(本协议本侧)
-- [`sandbox.md`](sandbox.md) §恢复时的资源衔接 —— 恢复路径下的 Admit 字段
-  `allocatable_at_snapshot` 派生
-- [`cache.md`](cache.md) / [`store.md`](store.md) —— 资源预留计入 host_reserved
-  的两个组件
-- [`perf.md`](perf.md) —— agent-intermittent 工作负载模型实测、密度调优
-- `kuasar-sandbox/docs/kuasar-sandbox.md` §1.1 / §4.7 —— 高密度承载与超分场景的业务定位
+internal 直接在进程内挂转发层;external 下 serve 不绑数据口,改为在 plugin 平面(§6)
+接受 worker 注册并向其广播路由(§9.2),数据面字节流不经 serve。两模式共用同一转发判定
+函数;部署拓扑、SO_REUSEPORT 与确定性 MMDS 密钥(多 worker 对等)等细节见 node-proxy.md §5,
+转发判定与即时刷流见 node-proxy.md §4。集群下,cluster-ctl router 把数据面转发进本节点的
+数据端点(internal 的 `api.listen`/`data_listen` 或 external worker 的数据口),节点侧
+按 `E2b-Sandbox-Id` 寻址照常处理(cluster-router.md §5),无须区分来源。
+
+### 9.2 路由权威与广播
+
+serve 是**本节点**路由与生命周期的权威:create/resume/pause/kill 实时更新路由,经
+**routesync** 广播 Upsert/Delete 给所有 plugin 平面订阅者(external proxy worker 与路由
+观察者如平台 agent)。订阅者持只读缓存独立服务数据面 / 感知状态,不回调控制面;广播逐条
+upsert + 末尾 bookmark(高密度下发端内存有界)。线格式(帧化 JSON over h2c)、容错重同步、
+`RouteEntry` 字段(含驱动迁移的 `snap_loc`、扇出用的 `mmds_secret`)见 node-proxy.md §6;
+plugin 平面的注册与鉴权见 §6。机群级路由权威是 registry(cluster.md);serve 经 node-link
+把本节点沙箱事件上报 registry(§10),与本节点 plugin 平面的路由广播是两条正交通道。
+
+- **auto-resume 单飞**:数据面打到 paused 沙箱触发 resume——internal 在请求内同步触发,
+  external 经 routesync `Wake` 上行;同一 sid 的并发请求经 per-sid single-flight 合并为
+  一次 resume(§8)。
+- **envd 鉴权姿态(`mmds.enabled`)**:该开关决定 create 是否给 envd 下发 token、proxy
+  是否寄宿 MMDS 服务——`false` = envd 非 secure、proxy 单闸门(配置强制
+  `proxy.auth=enforce`);`true` = proxy 组件内起 FC MMDS v2、经 `/init` re-key 每身份新
+  token,使快照扇出沙箱数据面可用。姿态对比与 MMDS 两段式协议见 node-proxy.md §8。
+
+### 9.3 兜底网关
+
+数据面请求误达 serve 控制面监听口时(external 模式下客户端未分流到数据口),serve 按
+sid 的 FNV 哈希在**活跃注册的 worker 集**上挑一个,经其 `--socket` UDS 反代过去(连接
+亲和),由 worker 照常处理(含鉴权);`CONNECT` 经链式 CONNECT relay 转发,无 worker
+注册时回 502。链式隧道与转发细节见 node-proxy.md §9。
+
+## 10. 集群接入(node-link:复用 routesync)
+
+配 `cluster.registry`(§3)时,`node-ctl serve` 拨 registry 把本节点接入集群,交由 cluster-ctl
+(registry / router / scaler)编排。**节点接入复用其既有 routesync 引擎**(node-proxy.md §6):节点
+拨 registry、注册身份、**反向监听**,registry 在该连接上以 `register{subscribe:{kind:registry}}` 作
+**路由订阅者**,此后节点作**路由 / 构建权威**下行流式上报、registry 上行下发命令。线格式与枢纽
+语义由 **cluster.md §5** 权威定义;本节只讲节点侧角色。空 `cluster.registry` = 独立模式,本节不生效。
+
+集群下两条到节点的路径:**node-link**(本节,承载注册 / 心跳 / 路由+构建事件 / 命令 / 密钥),与
+cluster router **转发到本节点 e2b 控制面 / 数据面**的请求——pause/kill/timeout、build trigger/status/
+files 转发本机 e2b 控制面(§4),数据面业务流量经 router 注入 `E2b-Sandbox-Id` + `X-Access-Token` 转发
+本机 proxy(node-proxy.md)。后者复用节点既有 e2b API,**节点侧零改动**。
+
+- **接入即注册**:拨 registry 的 `channel.listen`(全双工 h2c,生产 mTLS),首帧发
+  `register{node_id, labels, capacity, build_capacity, data_endpoint, runtime_digest}`(取自 `cluster.*`
+  配置与本机能力;`build_capacity{cpu,mem,storage}` 源自 builder slice + scratch 预算,§12)。registry
+  回 ack 后节点反向监听(cluster.md §5.1)。
+- **心跳上报**:周期发 `heartbeat{zone, allocated, pool, build_alloc, counts, draining}`——沙箱水位取自
+  资源控制器(node-resource.md),`build_alloc` 为本机在跑 / 预留构建占用,`draining` 由节点侧 drain
+  (§2.5 即 node-resource.md `resource drain`)置位;喂集群 P2C / 放置排除(cluster-scaler.md §4)。
+- **路由 / 构建事件上报**(节点为权威,下行):沙箱状态变化发 `sandbox{sid, group, route_key, state,
+  snap_loc, access_token, migration_token?, template_id}`;构建状态变化发 `build{build_id, group, state, template_id?,
+  reason?}`;消失发 `delete{sid|build_id}`;首 / 重连末尾 `bookmark`。**group / route_key 从沙箱 metadata
+  的 `kuasar-sandbox.cluster` 命名空间解析**(§4.6)。
+- **命令受理**(registry 上行下发):serve 以**既有 e2b 生命周期原语**(§8 / §8.1)执行,以 sid /
+  build_id 幂等,受理即回 `cmd_ack`,终态经上述事件上报(cluster.md §5.2):
+
+  | 命令 | 节点动作 |
+  |---|---|
+  | `create{cmd_id, sid, group, route_key, template_ref, key_fp, config, migration_token?}` | 冷启 `template_ref` + 合并 `config`(§8;snp 模板 = 快照恢复快启)或带 token 一步迁移导入 + restore(§8.1);`key_fp` 选本机租约 manifest_key;group/route_key 注入沙箱 metadata |
+  | `connect{cmd_id, sid}` | 恢复本机 PAUSED 沙箱(§8 auto-resume) |
+  | `delete{cmd_id, sid|build_id}` | 销毁沙箱 / 构建(§5 kill);SAVED 两阶段回收步 |
+  | `build_register{cmd_id, build_id, group, spec, key_fp}` | 在本机登记一个构建(§12);此后 trigger/status/files 经 router 转发本机 e2b 构建 API |
+  | `key_put` / `key_renew` / `key_drop{fingerprint, manifest_key?, expires_unix}` | 写 / 续 / 撤 `manifest_keys` 租约项(§7);**registry 的密钥分发**(cluster.md §7.6) |
+
+  无 `drain` 命令——节点排空 / 维护由**节点侧**发起(node-resource.md §2.5 资源 drain,或本机深空闲
+  自提升),集群侧仅停止向其分配(cluster-scaler.md §4),不由 registry 命令(cluster.md §7.3)。
+- **PAUSED→SAVED(节点驱动 / 显式)**:节点本地深空闲策略(或控制面显式 pause)把本机快照上送远程
+  (§8.1)、铸 migration_token,发 `saved(token)` 但**保留本机**;registry 持久化 token、清 node_id 后
+  下发 `delete{sid}`,节点收到才回收本机——两阶段不丢态(cluster.md §7.4)。
+- **断线增量重连**:断连指数退避重连重注册,带 `resume_from=<rev>` 请增量重放(registry 留存窗口内
+  只补增量,否则逐条全量 + `bookmark`,cluster.md §5.3)。registry 重启亦然。
+- **安全**:node-link 生产走 mTLS(`cluster.tls`);下行 `manifest_key` 仅入加密存储(§7),上行
+  `access_token` / `migration_token` 属沙箱级敏感,皆在 mTLS 内(cluster.md §5.4)。
+- **与本机 plugin 平面统一**:接入集群即"节点作路由权威、registry 作订阅者"——与本机 config-socket
+  plugin 平面(proxy worker / 观察者订阅本节点路由,§6 / node-proxy.md §6)**同一 routesync 引擎、
+  同一线格式**,仅订阅者 `kind` 不同(`route` / `route_wake` / `registry`)。router **不**订阅节点
+  plugin 平面,机群路由经 registry 聚合。
+
+## 11. guest profile:envd 嵌入
+
+- 独立 **`sandbox-runtime-e2b.erofs`**(主 runtime 保持精简):`deps/build-runtime-e2b.sh`
+  (`make sandbox-runtime-e2b` 调用,纯 shell,shell out `fsck.erofs`/`mkfs.erofs`)把
+  固定版本 envd 注入运行时层的 `/opt/sandbox-runtime/bin/envd`,确定性重打(与
+  flatten 同款 mkfs 参数),并把成品**补齐到 2 MiB 对齐**(virtio-pmem 后端要求,
+  否则 cloud-hypervisor 报 `PmemSizeNotAligned`;EROFS superblock 自描述范围,尾部
+  稀疏 padding 对 guest mount 不可见)。
+- **零 sandbox-init 改动**:`/opt/sandbox-runtime` 被 sandbox-init 自动 bind-mount 进
+  guest 同名路径,envd 直接作 `launch.exec`:
+  `/opt/sandbox-runtime/bin/envd -isnotfc -port 49983`(`mmds.enabled` 时去
+  `-isnotfc`,node-proxy.md §8),`restart=always`,**以 root(`user: "0:0"`)运行**——envd 需要
+  `CAP_SETUID/SETGID` 才能按镜像配置的用户跑工作负载命令(镜像设了 `Config.User` 时
+  非 root 的 envd 会 exec EPERM);工作负载本身仍以目标用户执行。
+- envd 是 **sandbox-deps** 的原生构建产物(与 cloud-hypervisor/vmlinux/mkfs.erofs
+  并列):`make -C sandbox-deps envd` 拉取 e2b-dev/infra 发布 tarball(默认 tag
+  `2026.22`,`ENVD_TARBALL` 可覆盖)→ `go build packages/envd`。本仓
+  `make sandbox-runtime-e2b` 再把它注入裸 runtime(输入路径 `BASE_RUNTIME`/`ENVD`/
+  `FSCK`/`MKFS` 可覆盖,默认取 umbrella 聚合 `bin/`)。
+- **userland 门槛**(对 base/客户镜像的约束):须有 `bash`、`coreutils`/`util-linux`、
+  预建默认用户(默认 `user`,含 `/home/user`)、cgroup v2、可写 `/run`。envd 跑每条
+  guest 命令以默认用户、并包一层 `ionice -c 2 -n 4 nice -n N "$@"`——缺用户或缺
+  util-linux/coreutils 会报 `invalid default user` / `ionice: not found`(裸 alpine
+  两者皆缺)。
+- **guest 须有 `/etc/hosts`**:展平的 docker 镜像不带它(docker 仅在容器运行时注入),
+  而 guest 内 `socket.getfqdn(hostname)` 类调用(许多服务器在 bind 后、listen 前调它,
+  如 Python `http.server.server_bind`)查无本地条目即落到 DNS,解析主机名阻塞约 20s,
+  表象是"host→floatingip 应用端口转发失败"。serve 经 SANDBOX_CONFIG 既有
+  `files:` 机制注入 `/etc/hosts`(`127.0.1.1 <hostname>` 条目)与 `/etc/resolv.conf`
+  (`sandbox.network.dns`),并经 `network.hostname` sethostname;launch 与 restore
+  均生效。
+- host 在 envd 就绪后调 **`POST /init`**(经 UDS):置 `envVars`、默认用户
+  `user`/workdir `/home/user`、时间戳;仅 `mmds.enabled` 时携带 `accessToken`(node-proxy.md §8)。
+
+## 12. 模板构建(三阶段流水线,构建在沙箱内进行)
+
+构建经 e2b API 提交(端点见 §4.2;无独立构建 CLI),落 `builds` 表,由资源池调度,
+每个构建一个 `sandbox-builder@<bid>` 单元。**镜像拉取与 step 执行都发生在构建沙箱
+(microVM)内**——租户的网络流量与镜像内容不触宿主用户态,宿主侧只做工件接力与
+收尾上传。
+
+**serve 侧(每构建一次)**:建 workdir → `vswitch-ctl attach` 一个网络槽(整个构建
+复用,各阶段顺序交接 tapfd)→ 铸 envd token →(`mmds.enabled` 时)挂一行合成路由,
+让模板阶段 FC 模式的 envd 能按 floatingip 自解析 → `StartUnit`(oneshot,阻塞至
+流水线退出)→ 读 `<bid>.result` JSON → 终态落库:产物为快照 ⇒ `kind=snp`、为镜像 ⇒
+`img`,持久 id `e2b-<kind>-<key>` 写入 names/aliases。
+
+**单元内(run-builder,§2.4)** 依 BuildSpec(§6)最多跑三个阶段,每阶段一台
+microVM(`sandbox-ctl run` 直接子进程);A 阶段就绪探针 = guest 内
+`flatten-ctl mountpoint /.probe`,B/C 阶段以 envd `/health` 为就绪:
+
+- **A import**(有 fromImage):**空**单盘沙箱——root 即 `builder.diff_template`
+  复制出的可写 ext4(无 base 镜像),`launch.placeholder` 锚定;guest runtime 用
+  **builder flavor**(`builder.runtime_builder`:e2b flavor + flatten-ctl +
+  mkfs.erofs,经 `/opt/sandbox-runtime` 投影进任意 rootfs)。guest 内
+  `flatten-ctl export --output - <fromImage>` 以租户凭据(`FLATTEN_*` 仅经 exec env
+  入 guest)拉取 + 展平,tarstream 镜像工件经 exec stdio 流回宿主 `workdir/image.img`。
+- **B steps**(有 steps):以 base 镜像为 root(本地工件或 `manifest://`)+ builder
+  runtime + 大可写 upper(同一 diff_template),**envd 为 app**(构建工具姿态:恒
+  `-isnotfc`、不 `/init`、无 token;唯一盘足迹 `/run/e2b` 落在 tmpfs 挂载上,导出
+  排除)。`RUN` **经 envd `process.Start`** 逐条执行——与 e2b 自家构建同形:
+  `/bin/bash -l -c <cmd>`、按操作用户经 `Authorization: Basic`、`Connect-Timeout-Ms`
+  带 step 预算(guest 侧也会到点杀)——上下文为宿主累积的 ENV/WORKDIR/USER,**初值
+  灌自 base 镜像 config**(RUN 所见与 docker build 一致;`ARG` 仅做 `${k}` 替换,
+  不入镜像;**bash 因此是带 steps/startCmd 构建的镜像契约**,e2b 同款)。步完后宿主
+  把累积上下文叠回 base config 写回 guest,`flatten-ctl mountpoint /.kuasar-build`
+  (自绑挂载点)+ `export --skip-mounts --runtime-config … --tmpdir /.kuasar-build
+  --output - /` 导出新镜像工件流回——挂载点自身与 `/opt/sandbox-runtime` 投影都是
+  挂载,被 `--skip-mounts` 排除,导出不自吞、工具链不进镜像。
+- **C template**(有 startCmd,显式或自 base 模板继承):**生产 e2b runtime** 冷启
+  最终镜像(runtime_ref 冻入快照——模板的子沙箱不得继承构建工具链),envd 为 app
+  (MMDS 姿态随部署,node-proxy.md §8),`/init` 预置(此后 RPC 携 `X-Access-Token`)。startCmd
+  **经 envd 启动**(e2b 默认身份 `user`、`/home/user`),流挂至就绪后断开——envd
+  不因断流杀进程(其源码明言进程上下文与请求解耦),进程以 **envd 管理进程**身份
+  冻入快照,扇出沙箱里 SDK 可 list/connect;readyCmd 以 2s 间隔轮询至成功(预算
+  `ready_timeout_sec`;缺省时同 e2b:`sleep 20`),就绪后先断 startCmd 流(已败则
+  构建失败)再 `sandbox-ctl snapshot --output` 出本地快照 bundle。
+
+**两类 guest 信道,刻意分离**:e2b 语义命令(steps/startCmd/readyCmd)走 envd,
+与 e2b 自家模板构建逐项同形;平台机制(flatten-ctl 拉取/导出、运行时配置注入、
+工件流回、就绪探针)走 `sandbox-ctl exec`——任意 rootfs 可用、裸 stdio 接力,
+不依赖镜像 userland。
+
+**fromTemplate**:base 来自既有模板——img 模板直接用其镜像 key;snp 模板经
+`sandbox-ctl info --json manifest://<key>` 读 snapshot.cfg 取 `base_ref`,并继承
+metadata 里的 `e2b.start_cmd`/`e2b.ready_cmd`(请求显式给出者优先)。fromTemplate
+与 fromImage 互斥;fromTemplate 且无 steps 无 startCmd 拒绝(无事可做)。
+
+**COPY/ADD step(构建上下文经对象存储直传)**:COPY 的本质是"把一份 tar 摊进
+rootfs"——文件系统操作,不是 e2b 进程语义,故走 sandbox-ctl exec + flatten-ctl(不经
+envd),且**镜像无需自带 tar/gzip**(flatten-ctl 纯 Go 解包,scratch/distroless 亦可
+COPY)。三段:
+
+1. **上传协商(files 端点,§4.2)**:客户端先 `GET /templates/{tid}/files/{hash}`,
+   服务端校验归属后回 `{present, url}`;`present=false` 时客户端把 **gzip(tar)** 上下文
+   经 presigned PUT **直传桶**(字节不过控制面,e2b SDK 同款裸 PUT)。对象 key =
+   `{prefix}/files/{aaaa}/{bb}/{uuid}/{hash}`(uuid=tid 的 uuidv7 部分;aaaa=uuid[0:4]
+   ~50 天、bb=uuid[4:6] ~5 小时,时间分桶散列前缀 + 便于按日期 GC)。隔离靠端点归属
+   校验:只为属主签当前 tid 路径的 URL,桶私有、客户端无凭据。
+2. **触发校验**:trigger 时每个 COPY 的 (tid,hash) 经 HeadObject 确认已上传——未配
+   `files_storage`→501,未上传→400,失败快。
+3. **构建期解包**:`BuildSpecFor` 为每个 COPY 预签 GET URL(TTL=total+5m,绑构建全程)。
+   run-builder:`http.Get`(平台取数,宿主侧)→ 宿主 gunzip → `sandbox-ctl exec
+   --stdin-from <tar> -- flatten-ctl tar extract --dense [--chown O][--chmod M]
+   <rule>`。rule 由 (src,dst)+context 条目派生(整根 `:dst/`、目录前缀 `src/:dst/`、
+   单文件 `src:out`;dst 相对则按累积 WORKDIR 解析,默认 `/`);owner 缺省 `0:0`
+   (Docker 语义,`--chown` 覆盖,名字在解包根的 /etc/passwd 解析);`--dense` 守稀疏
+   铁律(源码无权威洞元数据,零即数据)。单源 COPY(e2b executor 同限)。
+
+**对象存储(`builder.files_storage`,§3)**:S3/OBS;serve 只 presign + HEAD,
+唯一 aws-sdk 落点;本地/单机无云对象存储时指向 versitygw(`sandbox-deps make
+versitygw`)。force_path_style 默认 false(虚拟主机式;versitygw/minio 置 true)。
+
+**收尾上传(平台凭据唯一出现点)**:img-only ⇒ `manifest-ctl store image.img`
+(stdout = 64-hex manifest key);产出快照 ⇒ **一条** `sandbox-ctl upload-snapshot
+<bundle>`——自动上传 snapshot.cfg 引用的全部本地工件(base 镜像、overlay)并把引用
+改写为 `manifest://`(runtime_ref 不动,宿主提供)。结果 JSON
+`{image_key|snapshot_key, start_cmd, ready_cmd, error}` 打 stdout → `<bid>.result`;
+快照模板的 start/ready 同时记进 snapshot.cfg metadata,模板自描述(fromTemplate
+继承与 create 都读它)。
+
+**构建日志流(journald 单汇 → status API → SDK on_build_logs)**:构建进度对 SDK
+实时可见,零临时文件——全部写 journald 标签 `build`(机制 + 标签词表见 §5.2),
+serve 按需查询单元日志回给 SDK。**写入**(tag build,单元
+`sandbox-builder@<bid>`):run-builder 里程碑(`import: pulling…`、`step N: RUN…`、
+`template: ready`、`uploading…`)经 `go-systemd/journal` 直发;RUN/startCmd 输出由
+持流的 run-builder 从 envd 流回放进同一汇(envd 自身无 journal);阶段 app stdio 由
+sandbox-ctl `--stdout-to/--stderr-to journald=build` 直写;flatten 拉取/导出进度经
+`sandbox-ctl exec --stderr-to journald=build`(去掉 `--no-progress`,故 SDK 见
+`pull: N/M layers`、`flatten: …` 滚动);失败时 run-builder 补写一行
+`build failed: <err>`。guest 内核 dmesg(tag console)与 sandbox-ctl 自身日志不在此
+过滤,SDK 见干净构建日志。**读取**:status(§4.2)按 `?logsOffset`(已读条数)分页;
+serve `journalctl _SYSTEMD_UNIT=sandbox-builder@<bid>.service
+SYSLOG_IDENTIFIER=build --output=json` 取 MESSAGE/PRIORITY/时间戳,PRIORITY→e2b level
+(≤3 error、4 warn、≥7 debug、余 info),切片 `[offset:]` 回
+`{logs[], logEntries[{timestamp, level, message}]}`;尽力而为(非 systemd / 无日志 →
+空,不阻断 status)。CGO-free:sdjournal 读需 CGO,故 journalctl 子进程读、
+`go-systemd/journal` 纯 Go 写。**失败语义**:流水线失败 ⇒ `reason.message` 保持通用
+(`build failed; see build logs`),详情已在日志流里(零额外机制);基础设施失败
+(流水线未起、无 .result)无构建日志,`reason` 直陈宿主侧错误。
+
+**fromImage 的来源**:trigger body 显式给出;或(e2b CLI 在客户端 `docker build` +
+`docker push` 到约定名、trigger 不带镜像引用的工作流)由 `builder.image_uri_mask`
+推出 `<mask>/{templateID}:{buildID}`——掩码须与 CLI 侧 `E2B_IMAGE_URI_MASK` 一致,
+且**须从构建沙箱内可达**(拉取在 guest 内:本机 registry 须绑非环回地址、按
+vswitch mgmt VIP 寻址;第三方 registry 经 NAT 出网)。两者皆缺则 trigger 报错。
+配本机/私网 registry 时设 `builder.insecure_registry`、`builder.platform`。
+
+**资源池**:`builder.max_concurrent`(默认 2)= serve 内计数信号量准入;
+`waiting → building` 用 builds 表 CAS 抢占(重启/多实例安全);CPU/内存上限经
+`sandbox-builder.slice` 的 `CPUQuota`/`MemoryMax` 施加(整条流水线都在单元 cgroup
+内,上限对阶段 VM 生效)。
+
+**镜像拉取凭据**(按优先级解析,无凭据则匿名):
+
+1. **任务级 pull token**:SDK `api_headers` 头 `X-Kuasar-Pull-Token`,值为
+   `e2b-key-ctl seal-pull-token` 用租户 manifest_key 派生密钥封装的 `kpt_` 令牌,
+   serve 以该租户存量 key 解封;
+2. **SDK 明文**:trigger body `fromImageRegistry{username, password}`;
+3. **租户默认**:`manifest_keys.registry_auth_enc`(docker config.json;
+   `manifest-key add --registry-auth` 或 `--registry-username/--password/--token`
+   自动组装 catch-all `*` 条目;按 fromImage host → `*` 匹配取条)。
+
+解析结果加密存 `builds.registry_auth_enc`,构建时解出注入
+`FLATTEN_REGISTRY_{USERNAME,PASSWORD|TOKEN}`(flatten-ctl `pkg/remote` 读取,token
+优先),**经 exec env 进入 import 阶段的 guest——入 guest 的只有 `FLATTEN_*`,
+`MANIFEST_KEY` 永不入 guest**。凭据仅加密存库 + 运行期 env;workdir 里的阶段 yaml
+无秘密。
+
+**不支持**:多源 COPY(e2b executor 亦只取 src+dst)、step 级缓存(`force` 字段
+接受但忽略,总是全量执行)、服务端 Dockerfile 解析(CLI 已在客户端展开为 steps)。
+
+## 13. DNS / TLS
+
+生产:`*.<domain>` + `api.<domain>` 通配 DNS + TLS(operator 提供,on-prem/离线
+友好)。控制面与数据面可同口(`api.listen`)或分口(`proxy.data_listen` /
+external worker 的 `--data-listen`),证书同一张。dev:`E2B_API_URL`/
+`E2B_SANDBOX_URL` 指向明文 http(h2c),无需证书与通配 DNS。集群下 cluster-ctl router
+持对外通配证书,node-link 用独立的 `cluster.tls` mTLS(§10)。
+
+## 14. 契约边界
+
+| 对象 | 方式 | 说明 |
+|---|---|---|
+| `sandbox-ctl`(runtime) | 经 run-sandbox(单元)`execve`:`run --config <sid>.yaml --manifest-config … --run-root … --cgroup-adopt [--restore] [--connect]`;run-builder 以直接子进程 `run` 阶段沙箱,经 `exec --env/--stdin-from/--stdout-to` 做平台接力(flatten-ctl 调用、配置注入、工件流、探针),收尾 `snapshot --output` / `upload-snapshot` / `info --json`;serve 调 `snapshot --upload`(pause) | 非密配置文件 + 密钥 env;资源准入在其内部;e2b 语义命令不走它(走 envd,§12) |
+| 资源控制器(node-resource.md) | serve 内置(`resource_listen`)或独立进程;沙箱经 `sandbox.resources.control_socket` 拨号(`pkg/resource` 协议) | 单元 cgroup 即沙箱 cgroup,控制器原地仲裁;不配 control_socket = 静态 cgroup(`--cgroup-adopt`),配了才进 SANDBOX_CONFIG `resources.control.controller` |
+| registry(cluster-ctl) | node-link:serve 拨 registry、反向注册为路由权威,上报 register/heartbeat/sandbox/build 事件、受理 create/connect/delete/build_register/key 命令(§10、cluster.md §5) | mTLS;命令复用 §8 / §8.1 生命周期原语;空 `cluster.registry` = 独立模式不接入 |
+| `vswitch-ctl`(vswitch) | CLI:`attach <switch> --inner-ip [--transit-*]` / `detach --port`;`open-port` 作 SANDBOX_CONFIG `network.tapfd.exec`(sandbox-ctl 执行,经 `TAPFD_SOCKET` 收 tap fd) | 交换机预先起好(`vswitch-ctl start`,内核态数据面);port 对外、slot 内部;一个构建复用一个槽 |
+| `flatten-ctl`(builder) | **guest 内**(builder runtime 自带,经 sandbox-ctl exec 驱动):`export --output -`(import 拉取 / steps 导出)、`mountpoint`;宿主侧:`info --json`(读镜像运行时配置,本地工件或 manifest://) | 租户 `FLATTEN_*` 仅经 exec env 入 guest;tarstream 镜像工件经 exec stdio 接力 |
+| `manifest-ctl`(accelerator) | `store <image.img>`(img-only 构建的收尾上传) | manifest key 经 stdout 回收;`MANIFEST_KEY` 经 env |
+| `fsck.erofs`/`mkfs.erofs`(deps) | CLI(`deps/build-runtime-e2b.sh`、`deps/build-runtime-builder.sh`) | 确定性重打 e2b / builder runtime(§11、§12) |
+| guest envd | UDS(sandbox-ctl `--connect` 映射);构建流水线另以最小 connect+JSON 客户端调 `process.Start`(steps/startCmd/readyCmd,§12) | 原版不改;协议 pin 见 §4.3/§4.5 |
+| systemd | D-Bus:StartUnit/StopUnit/ResetFailed/ListUnitsByPatterns/Reload | 进程管理 + 单元自装(§5) |
+| `node-ctl proxy`(external) | UDS routesync(双向 h2c 帧化 JSON)+ 兜底反代 | 同节点、运维带外起;数据口 SO_REUSEPORT 共享(node-proxy.md §5) |
+
+不新增导出包;`CGO_ENABLED=0`;依赖层级 = 叶子。
+
+## 15. 可靠性
+
+### 15.1 状态存储(sqlite)
+
+单文件 sqlite(`paths.db_path`,WAL,文件 0600),纯 Go 驱动。三张表:
+
+```
+sandboxes      id(uuidv7) PK, template_id, state(running|paused|dead), deadline_unix,
+               run_dir, base_dir, envd_uds, ci_uds, floatingip, vswitch_port,
+               inner_ip, port_mac, manifest_key_hash, manifest_key_enc, snapshot_ref,
+               envd_access_token, traffic_access_token, metadata_json, env_json,
+               created_unix
+builds         build_id PK, template_id(transient-…), persist_id(<profile>-<kind>-<key>),
+               manifest_key_hash, manifest_key_enc, profile, kind, from_image,
+               start_cmd, status(registered|waiting|building|ready|error), reason,
+               names_json, aliases_json, registry_auth_enc, created_unix
+manifest_keys  key_hash(索引), key_enc, label, created_unix, expires_unix,
+               registry_auth_enc
+```
+
+`builds` 兼任模板登记(§4.4);`*_key_enc` 均 AES-256-GCM、`*_hash` 为
+`SHA256(mk)[:12]` 非唯一索引(§7)。
+
+### 15.2 重启对账
+
+serve 重启后以 `ListUnitsByPatterns("sandbox-runner@*.service")` 为存活权威:
+
+- 单元 active/activating 且库内 running ⇒ **收养**(重挂内存路由、TTL 继续生效,
+  external 模式随快照重新推给 worker;集群下经 node-link 重报);
+- 库内 running 但无对应活单元 ⇒ 清理(StopUnit/detach/删运行目录)并标 `dead`;
+- `run_root` 为 tmpfs ⇒ 整机重启后 running 全部判 dead;`paused` 行与 snp 模板保留,
+  可被 connect/auto-resume 重新拉起(本机快照存于磁盘 `checkpoint.local_dir`)。
+
+### 15.3 故障域
+
+| 故障 | 影响 | 自愈 |
+|---|---|---|
+| serve 崩溃/重启 | 控制面与 internal 数据面中断;沙箱(microVM/单元)不受影响 | systemd 重启 → 重启对账收养;external worker 凭本地路由表继续转发 running 流量(Wake 无人应答,paused 唤醒挂起至超时);集群下 node-link 重连重报 |
+| proxy worker 崩溃(external) | 该 worker 上的连接断;SO_REUSEPORT 下其余 worker 继续接新连接 | systemd 重启 → worker 重新注册重新同步,无状态恢复 |
+| runner 单元/CH 崩溃 | 该沙箱死(`Restart=no`,有状态不重试) | 对账标 dead;客户重新 create(或从 paused 快照 resume) |
+| routesync 断流 | worker 路由表停更 | 订阅者指数退避重连重注册,重连即重新同步(逐条 upsert + bookmark,node-proxy.md §6) |
+| node-link 断流(集群) | registry 暂失本节点视图 | 节点指数退避重连重注册重报沙箱集(§10、cluster.md §5.3);本节点沙箱不受影响 |
+| sqlite 损坏 | 控制面不可用 | 文件级备份/重建;沙箱单元仍可被 ListUnits 发现并由运维处置 |
+
+## 16. 测试
+
+单元测试:`make test`(handler 路由、apikey/secretbox/regcreds、routesync(注册/bookmark
+往返)/routetable(世代清扫)、plugin 注册表(同 id 顶替/分片)、proxy CONNECT 隧道 +
+网关链式 relay、mmds(确定性密钥)、单飞、沙箱配置注入(命名空间解析/容量折叠/网络合并)、
+migrate、node-link(注册/事件/命令往返)等)。跨仓 e2e 集中在 umbrella
+`kuasar-sandbox/test/e2e/`(需多仓产物:vmlinux/cloud-hypervisor/mkfs.erofs/
+sandbox-runtime-e2b.erofs 等),均已注册为 umbrella make 目标,缺前置则自跳过
+(`REQUIRE_*=1` 改为硬失败):
+
+| 脚本 | 覆盖 | make 目标 |
+|---|---|---|
+| `e2e_node.sh` | 单元自动安装 + 控制面(`/health`、401 路径)+ 构建 API 生命周期(register/trigger/status、跨 key 归属 404)+(有 KVM 时)bare create/list/kill | `test-e2e-node` |
+| `e2e_runtask.sh` | run-sandbox/run-builder 启动器(纯用户态,无 root/systemd/KVM):pidfile 锁/双起拒绝、HTTP 取 LaunchSpec、execve、`TASK_*` 剥除;`config` CLI 往返 | `test-e2e-runtask` |
+| `e2e_run_builder.sh` | 三阶段构建流水线(KVM + vswitch + store-ctl + zot,guest 经 mgmt VIP 拉取):fromImage → e2b-img;fromTemplate(img)+steps+startCmd → e2b-snp(manifest:// base、配置合并、snapshot.cfg metadata 断言);fromTemplate(snp)+steps → e2b-snp(start/ready 继承);再从产物模板 create/list/kill;COPY 与 files 端点 501 | `test-e2e-run-builder` |
+| `e2e_execute.sh` | 从已建模板冷启真实 microVM、guest 内 exec、pause(snapshot)→ resume 全链路;create 经 `X-Kuasar-Sandbox-Network` 注入 hostname 并在 guest 校验(§4.6) | `test-e2e-execute` |
+| `e2e_node_proxy.sh` | `proxy.mode=external` 全链路:serve + 独立 worker(plugin 平面注册 + SO_REUSEPORT)+ 真实 microVM/envd,数据面经 proxy 走(401/转发/wake/resume/CONNECT 隧道/兜底网关 relay/metrics) | `test-e2e-node-proxy` |
+
+本仓 `make test-e2e` 聚合 `test-e2e-node` + `test-e2e-node-proxy`(指向 umbrella
+同名脚本)。
+
+## 17. See Also
+
+- [node-proxy.md](node-proxy.md) —— 数据面转发层:路由判定 / 部署模式(internal/external/off)/
+  routesync / 数据面鉴权 / MMDS / CONNECT 隧道(本文 §9 装配的转发层实现,集群下 router 转发进入)
+- [node-resource.md](node-resource.md) —— 节点资源控制协议(`sandbox.resources.control_socket`
+  的对端)与控制器内部组织(`resource_listen` 内置或独立)
+- [cluster.md](cluster.md) —— 集群控制面:node-link 线格式(§5,本文 §10 的对端)、注册表、
+  Reserve 状态机;[cluster-router.md](cluster-router.md) 数据面入口、[cluster-scaler.md](cluster-scaler.md)
+  放置与密钥分发
+- `sandbox-runtime/docs/sandbox.md` —— sandbox-ctl:SANDBOX_CONFIG 模式、
+  run/snapshot/restore/connect 原语、cgroup 模型
+- `sandbox-vswitch/docs/vswitch.md` —— attach/detach/open-port、floatingip 与
+  mgmt-service(MMDS VIP 转换)语义
+- `sandbox-accelerator/docs/flatten.md` —— flatten-ctl export 与 OCI Referrers 幂等流、
+  `FLATTEN_REGISTRY_*`
+- `sandbox-accelerator/docs/manifest.md` —— manifest 内容键、收敛加密与去重域
+  (§7 的存储侧)
+- `kuasar-sandbox/docs/deployment.md` —— 节点部署拓扑中本组件的位置与单元安装
+- `kuasar-sandbox/test/demo/DEMO.md` —— e2b CLI/SDK 全流程演示
