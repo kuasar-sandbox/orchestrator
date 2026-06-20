@@ -174,8 +174,7 @@ for _ in $(seq 1 30); do
     kill -0 "${PIDS[-1]}" 2>/dev/null || { sed 's/^/  /' "$WORK/orch.log"; skip "node-ctl exited"; }
     sleep 0.5
 done
-"$BIN/node-ctl" manifest-key add --socket "$WORK/node-ctl.socket" "$MK" >/dev/null || fail "manifest-key add"
-echo "==> node-ctl up (:$PORT); its node-link client retries until the registry starts"
+echo "==> node-ctl up (:$PORT); node-link retries until the registry starts (the registry PREDISTRIBUTES the manifest key — no manual manifest-key add)"
 
 # ---- seed group (no template yet), start registry + router -----------------
 # The group carries the manifest key + placement; its template_ref is filled in
