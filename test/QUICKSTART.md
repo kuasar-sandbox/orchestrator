@@ -12,12 +12,12 @@
 │                              mkfs.erofs / fsck.erofs / envd / manifest-ctl /
 │                              store-ctl / cache-ctl / flatten-ctl / sandbox-ctl /
 │                              sandbox-init / node-ctl / vswitch-ctl / tapfd-get /
-│                              orchestrator-ctl / e2b-key-ctl /
+│                              e2b-key-ctl /
 │                              sandbox-runtime.erofs / sandbox-runtime-e2b.erofs)
 ├── README.md                  项目入口
 ├── docs/                      系统设计 + 模块设计 + 部署 + 性能基线
 ├── deploy/                    运维配置样例 + systemd 单元(config.example.yaml /
-│                              orchestrator-ctl.service / orchestrator-proxy@.service)
+│                              node-ctl.service / node-proxy@.service)
 └── test/
     ├── QUICKSTART.md          本文件
     ├── e2e/                   跨仓 e2e 脚本(一键跑,零环境变量)
@@ -110,7 +110,7 @@ for f in test/e2e/*.sh; do bash "$f" || break; done
 
 | 脚本 | 验证内容 |
 |---|---|
-| `e2e_orchestrator.sh` | orchestrator-ctl 单元自动安装 + e2b 控制面(`/health`、`X-API-KEY` 401)+ 构建 API |
+| `e2e_orchestrator.sh` | node-ctl 单元自动安装 + e2b 控制面(`/health`、`X-API-KEY` 401)+ 构建 API |
 | `e2e_runtask.sh` | run-sandbox/run-builder 启动器 + `config`/`info` CLI(纯用户态,无 root/systemd/KVM)|
 | `e2e_run_builder.sh` | 三阶段构建流水线(KVM):guest 内拉取展平 → steps → 模板快照;fromImage/fromTemplate 三链 + 从产物模板 create |
 | `e2e_execute.sh` | 启真实 microVM(KVM)→ envd 内执行 → 暂停/恢复状态存活 → kill |

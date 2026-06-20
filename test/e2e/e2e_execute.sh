@@ -36,7 +36,7 @@ SW_NETNS="${SW_NETNS:-e2e_sw}"
 skip() { echo; echo "==> e2e_execute: skipping ($*)"; [ "${REQUIRE_EXEC:-0}" = "1" ] && { echo "REQUIRE_EXEC=1; failing" >&2; exit 1; }; exit 0; }
 fail() { echo "==> FAIL: $*" >&2; exit 1; }
 
-for b in orchestrator-ctl sandbox-ctl flatten-ctl store-ctl e2b-key-ctl vswitch-ctl cloud-hypervisor; do [ -x "$BIN/$b" ] || skip "missing $BIN/$b"; done
+for b in node-ctl sandbox-ctl flatten-ctl store-ctl e2b-key-ctl vswitch-ctl cloud-hypervisor; do [ -x "$BIN/$b" ] || skip "missing $BIN/$b"; done
 [ -f "$BIN/vmlinux" ] || skip "missing $BIN/vmlinux"
 [ -f "$BIN/sandbox-runtime-e2b.erofs" ] || skip "missing $BIN/sandbox-runtime-e2b.erofs"
 [ -f "$BIN/sandbox-runtime-builder.erofs" ] || skip "missing $BIN/sandbox-runtime-builder.erofs (make sandbox-runtime-builder)"
@@ -185,7 +185,7 @@ cat > "$WORK/config.yaml" <<EOF
 api: { domain: $DOMAIN, listen: ":$PORT" }
 encryption_key: "$ENC"
 manifest_config: $WORK/manifest.yaml
-paths: { run_root: $WORK/run, base_root: $WORK/lib, config_socket: $WORK/orchestrator.socket }
+paths: { run_root: $WORK/run, base_root: $WORK/lib, config_socket: $WORK/node-ctl.socket }
 units: { dir: $UNIT_DIR }
 sandbox:
   timeout_sec: 120
@@ -199,15 +199,15 @@ builder:
   memory: 1GiB
 checkpoint: { mode: remote }
 EOF
-"$BIN/orchestrator-ctl" serve --config "$WORK/config.yaml" >"$WORK/orch.log" 2>&1 &
+"$BIN/node-ctl" serve --config "$WORK/config.yaml" >"$WORK/orch.log" 2>&1 &
 PIDS+=($!)
 for _ in $(seq 1 30); do
     curl -sS --noproxy '*' -o /dev/null "http://127.0.0.1:$PORT/health" -H "Host: api.$DOMAIN" 2>/dev/null && break
     kill -0 "${PIDS[-1]}" 2>/dev/null || { sed 's/^/  /' "$WORK/orch.log"; skip "orchestrator exited"; }
     sleep 0.5
 done
-echo "==> orchestrator-ctl up (:$PORT)"
-"$BIN/orchestrator-ctl" manifest-key add --socket "$WORK/orchestrator.socket" "$MK" >/dev/null || fail "manifest-key add"
+echo "==> node-ctl up (:$PORT)"
+"$BIN/node-ctl" manifest-key add --socket "$WORK/node-ctl.socket" "$MK" >/dev/null || fail "manifest-key add"
 
 # ---- build a ready template (native v3, proven) ---------------------------
 code=$(req POST /v3/templates "$AK" '{"name":"exec-tmpl"}')

@@ -3,7 +3,7 @@
 # e2e_runtask.sh — verify the in-unit task launchers run-sandbox / run-builder and the
 # new config/info CLI surfaces, WITHOUT needing root / systemd / KVM (pure userspace).
 #
-#   1. CLI smokes      orchestrator-ctl/flatten-ctl/sandbox-ctl `config` round-trip
+#   1. CLI smokes      node-ctl/flatten-ctl/sandbox-ctl `config` round-trip
 #                      (--template emits, --config re-loads + validates); arg-validation
 #                      for run-sandbox / run-builder and sandbox-ctl info.
 #   2. run-sandbox     against a fake config-socket (python): verifies it locks+writes
@@ -18,7 +18,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 BIN="${BIN:-$REPO_ROOT/bin}"
-ORCH="$BIN/orchestrator-ctl"
+ORCH="$BIN/node-ctl"
 SANDBOX="$BIN/sandbox-ctl"
 FLATTEN="$BIN/flatten-ctl"
 
@@ -38,8 +38,8 @@ trap '[ -n "${E2E_KEEP:-}" ] && echo "kept $WORK" || rm -rf "$WORK"; [ -n "${SRV
 # ---- 1. CLI smokes --------------------------------------------------------
 echo "==> CLI: config --template + round-trip (validate)"
 "$ORCH" config --template > "$WORK/orch.yaml"
-grep -q "domain:" "$WORK/orch.yaml" || fail "orchestrator-ctl config --template missing domain"
-"$ORCH" config --config "$WORK/orch.yaml" >/dev/null || fail "orchestrator-ctl config --config did not validate the template"
+grep -q "domain:" "$WORK/orch.yaml" || fail "node-ctl config --template missing domain"
+"$ORCH" config --config "$WORK/orch.yaml" >/dev/null || fail "node-ctl config --config did not validate the template"
 
 "$FLATTEN" config --template > "$WORK/flatten.yaml"
 grep -q "referer:" "$WORK/flatten.yaml" || fail "flatten-ctl config --template missing referer"
@@ -48,7 +48,7 @@ grep -q "enabled:" "$WORK/flatten.yaml" || fail "flatten-ctl config --template m
 
 "$SANDBOX" config --template > "$WORK/sb.yaml" 2>/dev/null || true
 grep -q "resources:" "$WORK/sb.yaml" || fail "sandbox-ctl config --template missing resources"
-echo "==> PASS: config --template + round-trip for orchestrator-ctl/flatten-ctl/sandbox-ctl"
+echo "==> PASS: config --template + round-trip for node-ctl/flatten-ctl/sandbox-ctl"
 
 echo "==> CLI: arg-validation (must reject)"
 "$ORCH" run-sandbox >/dev/null 2>&1 && fail "run-sandbox with no args should fail" || true
@@ -58,7 +58,7 @@ echo "==> CLI: arg-validation (must reject)"
 echo "==> PASS: run-sandbox/run-builder + sandbox-ctl info reject bad invocation"
 
 # ---- 2. run-sandbox against a fake config-socket --------------------------
-SOCK="$WORK/orchestrator.socket"
+SOCK="$WORK/node-ctl.socket"
 PIDFILE="$WORK/task.pid"
 OUTFILE="$WORK/marker.out"
 mkdir -p "$WORK/wd"

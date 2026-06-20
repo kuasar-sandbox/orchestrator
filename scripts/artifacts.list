@@ -13,7 +13,6 @@ sandbox-runtime     sandbox-runtime.erofs
 sandbox-orchestrator node-ctl
 sandbox-vswitch     vswitch-ctl
 sandbox-vswitch     tapfd-get
-sandbox-orchestrator orchestrator-ctl
 sandbox-orchestrator e2b-key-ctl
 sandbox-orchestrator sandbox-runtime-e2b.erofs
 sandbox-orchestrator sandbox-runtime-builder.erofs

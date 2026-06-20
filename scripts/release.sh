@@ -118,12 +118,12 @@ PERFS=(
 )
 
 # Deploy assets — operator-facing config + unit examples staged under
-# <release>/deploy/. orchestrator-ctl additionally self-installs its sandbox
-# template units at startup (see orchestrator.md §5).
+# <release>/deploy/. node-ctl additionally self-installs its sandbox
+# template units at startup (see node.md §5).
 DEPLOYS=(
   "sandbox-orchestrator/deploy/config.example.yaml"
-  "sandbox-orchestrator/deploy/orchestrator-ctl.service"
-  "sandbox-orchestrator/deploy/orchestrator-proxy@.service"
+  "sandbox-orchestrator/deploy/node-ctl.service"
+  "sandbox-orchestrator/deploy/node-proxy@.service"
 )
 
 # The e2b end-to-end demo (script + guide) — the headline "try it" walkthrough.

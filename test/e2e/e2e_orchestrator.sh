@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# e2e_orchestrator.sh — bring up orchestrator-ctl (the e2b-compatible single-node
+# e2e_orchestrator.sh — bring up node-ctl (the e2b-compatible single-node
 # ingress) and exercise it end to end with plain curl (the same surface the e2b
 # SDK/CLI use):
 #
@@ -13,7 +13,7 @@
 #   4. data plane (gated)   if /dev/kvm + a prebuilt TEMPLATE_ID are present:
 #                          POST /sandboxes (bare) → GET /v2/sandboxes → DELETE.
 #
-# orchestrator-ctl needs systemd (it drives units over D-Bus), so this test
+# node-ctl needs systemd (it drives units over D-Bus), so this test
 # requires systemd as PID1 and root. Missing prerequisites → exit 0 ("skipped on
 # this host") unless REQUIRE_ORCH=1. The control-plane tests need only systemd +
 # root; the data-plane create step additionally needs vswitch + /dev/kvm (gated).
@@ -35,11 +35,11 @@ skip() {
 }
 
 # ---- prerequisite checks --------------------------------------------------
-for b in orchestrator-ctl sandbox-ctl e2b-key-ctl; do
+for b in node-ctl sandbox-ctl e2b-key-ctl; do
     [ -x "$BIN/$b" ] || skip "missing $BIN/$b — run 'make build'"
 done
 command -v curl >/dev/null 2>&1 || skip "curl not on PATH"
-[ -d /run/systemd/system ] || skip "systemd is not PID1 (orchestrator-ctl drives units over D-Bus)"
+[ -d /run/systemd/system ] || skip "systemd is not PID1 (node-ctl drives units over D-Bus)"
 
 if [ "$(id -u)" -ne 0 ]; then
     exec sudo -nE "$0" "$@"
@@ -79,7 +79,7 @@ req() {
 }
 
 # The control-plane / unit-install / build-API / ownership tests below do NOT need
-# a running vswitch — orchestrator-ctl only dials vswitch-ctl on sandbox *create*
+# a running vswitch — node-ctl only dials vswitch-ctl on sandbox *create*
 # (the gated data-plane step at the end). So no `vswitch-ctl serve` here.
 
 # ---- orchestrator config (dev http; transient paths) ----------------------
@@ -87,7 +87,7 @@ cat > "$WORK/config.yaml" <<EOF
 api: { domain: $DOMAIN, listen: ":$PORT" }
 encryption_key: "$ENC"
 manifest_config: $WORK/manifest.yaml
-paths: { run_root: $WORK/run, base_root: $WORK/lib, config_socket: $WORK/orchestrator.socket }
+paths: { run_root: $WORK/run, base_root: $WORK/lib, config_socket: $WORK/node-ctl.socket }
 units: { dir: $UNIT_DIR }
 sandbox:
   network: { switch: $SWITCH }
@@ -101,19 +101,19 @@ manifest:
   key: ""
 EOF
 
-# ---- 2. start orchestrator-ctl serve --------------------------------------
-echo "==> orchestrator-ctl serve (dev http :$PORT, unit_dir=$UNIT_DIR)"
-"$BIN/orchestrator-ctl" serve --config "$WORK/config.yaml" >"$WORK/orch.log" 2>&1 &
+# ---- 2. start node-ctl serve --------------------------------------
+echo "==> node-ctl serve (dev http :$PORT, unit_dir=$UNIT_DIR)"
+"$BIN/node-ctl" serve --config "$WORK/config.yaml" >"$WORK/orch.log" 2>&1 &
 PIDS+=($!)
 for i in $(seq 1 30); do
     curl -sS --noproxy '*' -o /dev/null "http://127.0.0.1:$PORT/health" -H "Host: api.$DOMAIN" 2>/dev/null && break
-    kill -0 "${PIDS[-1]}" 2>/dev/null || { sed 's/^/    /' "$WORK/orch.log"; skip "orchestrator-ctl serve exited (see log)"; }
+    kill -0 "${PIDS[-1]}" 2>/dev/null || { sed 's/^/    /' "$WORK/orch.log"; skip "node-ctl serve exited (see log)"; }
     sleep 0.5
 done
 
 # Allowlist MK so it may create/build — now via serve's admin plane on the control
 # socket (the daemon owns the manifest_keys table), so it runs AFTER serve is up.
-"$BIN/orchestrator-ctl" manifest-key add --socket "$WORK/orchestrator.socket" "$MK" >/dev/null || fail "manifest-key add failed"
+"$BIN/node-ctl" manifest-key add --socket "$WORK/node-ctl.socket" "$MK" >/dev/null || fail "manifest-key add failed"
 
 # ---- 1. assert unit auto-install ------------------------------------------
 for u in sandbox-runner@.service sandbox-builder@.service sandbox-runner.slice sandbox-builder.slice; do

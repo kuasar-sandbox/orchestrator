@@ -53,7 +53,7 @@ pause(){ [ -n "${DEMO_PAUSE:-}" ] && { printf "${c_dim}  ⏎ to continue…${c_o
 die()  { echo $'\e[1;31m'"  ✗ $*"$'\e[0m' >&2; exit 1; }
 
 # ---- prerequisites --------------------------------------------------------
-for b in orchestrator-ctl e2b-key-ctl vswitch-ctl cloud-hypervisor; do [ -x "$BIN/$b" ] || die "missing $BIN/$b — run 'make build'"; done
+for b in node-ctl e2b-key-ctl vswitch-ctl cloud-hypervisor; do [ -x "$BIN/$b" ] || die "missing $BIN/$b — run 'make build'"; done
 [ -f "$BIN/vmlinux" ] && [ -f "$BIN/sandbox-runtime-e2b.erofs" ] || die "missing kernel/runtime erofs in $BIN"
 [ -f "$BIN/sandbox-runtime-builder.erofs" ] || die "missing $BIN/sandbox-runtime-builder.erofs — run 'make sandbox-runtime-builder' (builds run in-guest)"
 [ -S "${STORE_SOCK:-}" ] || die "store socket $STORE_SOCK absent — run demo_prep.sh"
@@ -154,7 +154,7 @@ proxy: { auth: enforce }
 $MMDS_CFG
 encryption_key: "$ENC"
 manifest_config: $WORK/manifest.yaml
-paths: { run_root: $WORK/run, base_root: $WORK/lib, config_socket: $WORK/orchestrator.socket }
+paths: { run_root: $WORK/run, base_root: $WORK/lib, config_socket: $WORK/node-ctl.socket }
 units: { dir: $UNIT_DIR }
 sandbox:
   network: { switch: $SWITCH }            # e2b defaults: ip 169.254.0.21/30 nexthop .22; hostname/dns injected via files:
@@ -205,8 +205,8 @@ if [ -n "${DEMO_MMDS:-}" ]; then
 fi
 
 hosts_add "api.$DOMAIN"
-say "orchestrator-ctl serve — e2b control plane + data-plane proxy (TLS :$TLS_PORT)"
-"$BIN/orchestrator-ctl" serve --config "$WORK/config.yaml" >"$WORK/orch.log" 2>&1 & PIDS+=($!)
+say "node-ctl serve — e2b control plane + data-plane proxy (TLS :$TLS_PORT)"
+"$BIN/node-ctl" serve --config "$WORK/config.yaml" >"$WORK/orch.log" 2>&1 & PIDS+=($!)
 for _ in $(seq 1 40); do (exec 3<>"/dev/tcp/127.0.0.1/$TLS_PORT") 2>/dev/null && { exec 3>&- 3<&-; break; }; kill -0 "${PIDS[-1]}" 2>/dev/null || { sed 's/^/    /' "$WORK/orch.log"; die "orchestrator exited"; }; sleep 0.5; done
 ok "orchestrator serving https://api.$DOMAIN"
 pause
@@ -216,8 +216,8 @@ banner "Onboard a tenant (manifest key → allowlist + registry creds → e2b AP
 # ---------------------------------------------------------------------------
 REG_FLAGS=(); [ -n "${REGISTRY_USER:-}" ] && REG_FLAGS=(--registry-username "$REGISTRY_USER" --registry-password "${REGISTRY_PASS:-}")
 say "allowlist the tenant manifest key + its default registry pull creds (so the node can pull $REGISTRY):"
-echo "${c_cmd}  \$ orchestrator-ctl manifest-key add ${REG_FLAGS:+--registry-username … } \$MANIFEST_KEY${c_off}"
-"$BIN/orchestrator-ctl" manifest-key add --socket "$WORK/orchestrator.socket" "${REG_FLAGS[@]}" "$MK" >/dev/null || die "manifest-key add"
+echo "${c_cmd}  \$ node-ctl manifest-key add ${REG_FLAGS:+--registry-username … } \$MANIFEST_KEY${c_off}"
+"$BIN/node-ctl" manifest-key add --socket "$WORK/node-ctl.socket" "${REG_FLAGS[@]}" "$MK" >/dev/null || die "manifest-key add"
 AK="$("$BIN/e2b-key-ctl" gen-apikey "$MK")"
 ok "tenant ready — e2b API key ${AK:0:16}…  (format e2b_<hex>)"
 # world-readable env for another terminal to drive the Python SDK against this node
@@ -389,8 +389,8 @@ py <<PY || die "pause-before-export failed"
 from e2b import Sandbox
 Sandbox.connect("$SID").pause()
 PY
-echo "${c_cmd}  \$ orchestrator-ctl export-sandbox $SID --to-template --keep-source${c_off}"
-FORK_TMPL="$(E2B_API_KEY="$AK" "$BIN/orchestrator-ctl" export-sandbox "$SID" --to-template --keep-source --socket "$WORK/orchestrator.socket")" \
+echo "${c_cmd}  \$ node-ctl export-sandbox $SID --to-template --keep-source${c_off}"
+FORK_TMPL="$(E2B_API_KEY="$AK" "$BIN/node-ctl" export-sandbox "$SID" --to-template --keep-source --socket "$WORK/node-ctl.socket")" \
   || die "export-sandbox --to-template failed"
 ok "paused state → template $FORK_TMPL"
 say "create a NEW sandbox from that template — it carries the forked state:"
@@ -416,8 +416,8 @@ pause
 banner "一步迁移 (export move → connect with X-Kuasar-Migration-Token = import+resume)"
 # ---------------------------------------------------------------------------
 say "export (move) mints a one-line token and relinquishes the source row; connect with the token re-imports + resumes in ONE SDK call."
-echo "${c_cmd}  \$ TOKEN=\$(orchestrator-ctl export-sandbox $SID)${c_off}"
-MIG_TOKEN="$(E2B_API_KEY="$AK" "$BIN/orchestrator-ctl" export-sandbox "$SID" --socket "$WORK/orchestrator.socket")" || die "export-sandbox (move) failed"
+echo "${c_cmd}  \$ TOKEN=\$(node-ctl export-sandbox $SID)${c_off}"
+MIG_TOKEN="$(E2B_API_KEY="$AK" "$BIN/node-ctl" export-sandbox "$SID" --socket "$WORK/node-ctl.socket")" || die "export-sandbox (move) failed"
 say "source row now gone; resume on (logically) another node with the token in api_headers:"
 py <<PY || die "connect-with-migration-token failed"
 from e2b import Sandbox

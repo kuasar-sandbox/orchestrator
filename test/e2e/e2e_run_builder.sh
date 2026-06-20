@@ -28,7 +28,7 @@
 # merged ENV/WORKDIR; B3's RUN step only succeeds if B2's RUN persisted.
 #
 # Requires systemd as PID1 + root (units over D-Bus), /dev/kvm, docker (seeds
-# the base image), zot, mkfs.ext4, and bin/: orchestrator-ctl sandbox-ctl
+# the base image), zot, mkfs.ext4, and bin/: node-ctl sandbox-ctl
 # e2b-key-ctl vswitch-ctl cloud-hypervisor flatten-ctl manifest-ctl store-ctl
 # + vmlinux + sandbox-runtime{,-e2b,-builder}.erofs. Missing prerequisites →
 # exit 0 ("skipped") unless REQUIRE_BUILDER=1.
@@ -62,7 +62,7 @@ skip() {
 fail() { echo "==> FAIL: $*" >&2; exit 1; }
 
 # ---- prerequisite checks --------------------------------------------------
-for b in orchestrator-ctl sandbox-ctl e2b-key-ctl vswitch-ctl cloud-hypervisor flatten-ctl manifest-ctl store-ctl; do
+for b in node-ctl sandbox-ctl e2b-key-ctl vswitch-ctl cloud-hypervisor flatten-ctl manifest-ctl store-ctl; do
     [ -x "$BIN/$b" ] || skip "missing $BIN/$b — run 'make build'"
 done
 for f in vmlinux sandbox-runtime.erofs sandbox-runtime-e2b.erofs sandbox-runtime-builder.erofs; do
@@ -226,7 +226,7 @@ cat > "$WORK/config.yaml" <<EOF
 api: { domain: $DOMAIN, listen: ":$PORT" }
 encryption_key: "$ENC"
 manifest_config: $WORK/manifest.yaml
-paths: { run_root: $WORK/run, base_root: $WORK/lib, config_socket: $WORK/orchestrator.socket }
+paths: { run_root: $WORK/run, base_root: $WORK/lib, config_socket: $WORK/node-ctl.socket }
 units: { dir: $UNIT_DIR }
 sandbox:
   network: { switch: $SWITCH }
@@ -249,14 +249,14 @@ $FILES_STORAGE_YAML
 checkpoint: { mode: local, local_dir: $WORK/saved }
 EOF
 
-"$BIN/orchestrator-ctl" serve --config "$WORK/config.yaml" >"$WORK/orch.log" 2>&1 &
+"$BIN/node-ctl" serve --config "$WORK/config.yaml" >"$WORK/orch.log" 2>&1 &
 PIDS+=($!)
 for _ in $(seq 1 30); do
     curl -sS --noproxy '*' -o /dev/null "http://127.0.0.1:$PORT/health" -H "Host: api.$DOMAIN" 2>/dev/null && break
     kill -0 "${PIDS[-1]}" 2>/dev/null || { sed 's/^/    /' "$WORK/orch.log"; fail "orchestrator serve exited"; }
     sleep 0.5
 done
-"$BIN/orchestrator-ctl" manifest-key add --socket "$WORK/orchestrator.socket" "$MK" >/dev/null || fail "manifest-key add"
+"$BIN/node-ctl" manifest-key add --socket "$WORK/node-ctl.socket" "$MK" >/dev/null || fail "manifest-key add"
 echo "==> orchestrator up (dev http :$PORT); tenant allowlisted"
 
 req() { # method path key [body]

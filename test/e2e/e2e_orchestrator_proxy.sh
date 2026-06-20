@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # e2e_orchestrator_proxy.sh — exercise proxy_mode=external end to end with REAL
-# components: orchestrator-ctl serve (control plane), a separate orchestrator-ctl
+# components: node-ctl serve (control plane), a separate node-ctl
 # proxy worker (data plane, SO_REUSEPORT) that REGISTERS on the config-socket plugin
 # plane and syncs its route table from it, a REAL microVM sandbox with REAL envd, and
 # data-plane traffic driven THROUGH the proxy (not the orchestrator):
@@ -37,7 +37,7 @@ SW_NETNS="${SW_NETNS:-e2e_sw}"
 skip() { echo; echo "==> e2e_orchestrator_proxy: skipping ($*)"; [ "${REQUIRE_PROXY:-0}" = "1" ] && { echo "REQUIRE_PROXY=1; failing" >&2; exit 1; }; exit 0; }
 fail() { echo "==> FAIL: $*" >&2; exit 1; }
 
-for b in orchestrator-ctl sandbox-ctl flatten-ctl store-ctl e2b-key-ctl vswitch-ctl cloud-hypervisor; do [ -x "$BIN/$b" ] || skip "missing $BIN/$b"; done
+for b in node-ctl sandbox-ctl flatten-ctl store-ctl e2b-key-ctl vswitch-ctl cloud-hypervisor; do [ -x "$BIN/$b" ] || skip "missing $BIN/$b"; done
 [ -f "$BIN/vmlinux" ] || skip "missing $BIN/vmlinux"
 [ -f "$BIN/sandbox-runtime-e2b.erofs" ] || skip "missing $BIN/sandbox-runtime-e2b.erofs"
 [ -f "$BIN/sandbox-runtime-builder.erofs" ] || skip "missing $BIN/sandbox-runtime-builder.erofs (make sandbox-runtime-builder)"
@@ -187,7 +187,7 @@ api: { domain: $DOMAIN, listen: ":$PORT" }
 proxy: { mode: external, auth: enforce, park_timeout: 90s }
 encryption_key: "$ENC"
 manifest_config: $WORK/manifest.yaml
-paths: { run_root: $WORK/run, base_root: $WORK/lib, config_socket: $WORK/orchestrator.socket }
+paths: { run_root: $WORK/run, base_root: $WORK/lib, config_socket: $WORK/node-ctl.socket }
 units: { dir: $UNIT_DIR }
 sandbox:
   timeout_sec: 120
@@ -204,18 +204,18 @@ EOF
 
 # ---- start serve (control plane), then the proxy worker -------------------
 # The proxy now DIALS serve's config-socket to register, so serve comes up first.
-echo "==> orchestrator-ctl serve (control :$PORT, proxy_mode=external)"
-"$BIN/orchestrator-ctl" serve --config "$WORK/config.yaml" >"$WORK/orch.log" 2>&1 &
+echo "==> node-ctl serve (control :$PORT, proxy_mode=external)"
+"$BIN/node-ctl" serve --config "$WORK/config.yaml" >"$WORK/orch.log" 2>&1 &
 PIDS+=($!)
 for _ in $(seq 1 30); do
     curl -sS --noproxy '*' -o /dev/null "http://127.0.0.1:$PORT/health" -H "Host: api.$DOMAIN" 2>/dev/null && break
     kill -0 "${PIDS[-1]}" 2>/dev/null || { dump_logs; skip "orchestrator exited"; }
     sleep 0.5
 done
-"$BIN/orchestrator-ctl" manifest-key add --socket "$WORK/orchestrator.socket" "$MK" >/dev/null || fail "manifest-key add"
+"$BIN/node-ctl" manifest-key add --socket "$WORK/node-ctl.socket" "$MK" >/dev/null || fail "manifest-key add"
 
-echo "==> orchestrator-ctl proxy (registers on config-socket, data-plane :$PROXY_PORT)"
-"$BIN/orchestrator-ctl" proxy --config-socket="$WORK/orchestrator.socket" --id=proxy-1 \
+echo "==> node-ctl proxy (registers on config-socket, data-plane :$PROXY_PORT)"
+"$BIN/node-ctl" proxy --config-socket="$WORK/node-ctl.socket" --id=proxy-1 \
     --socket="$PROXY_SOCK" --data-listen="127.0.0.1:$PROXY_PORT" \
     --auth=enforce --park-timeout=90s --metrics-listen="127.0.0.1:$METRICS_PORT" >"$WORK/proxy.log" 2>&1 &
 PIDS+=($!)
