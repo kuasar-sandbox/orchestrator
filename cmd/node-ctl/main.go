@@ -17,6 +17,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -29,6 +30,7 @@ import (
 	"time"
 
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/api"
+	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/clustercfg"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/config"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/launcher"
@@ -160,12 +162,20 @@ func serve(args []string, log *slog.Logger) error {
 				hbInterval = d
 			}
 		}
+		var clientTLS *tls.Config
+		if cfg.Cluster.TLSCert != "" {
+			ct, terr := clustercfg.TLS{Cert: cfg.Cluster.TLSCert, Key: cfg.Cluster.TLSKey, CA: cfg.Cluster.TLSCA}.ClientConfig("")
+			if terr != nil {
+				return fmt.Errorf("cluster node-link tls: %w", terr)
+			}
+			clientTLS = ct
+		}
 		nl := nodelink.New(
 			func(dctx context.Context) (net.Conn, error) {
 				return (&net.Dialer{}).DialContext(dctx, "tcp", regAddr)
 			},
 			routesync.NodeRegister{NodeID: nodeID, Labels: cfg.Cluster.Labels, DataEndpoint: dataEndpoint},
-			core, hbInterval, log,
+			core, hbInterval, clientTLS, log,
 		)
 		go nl.Run(ctx)
 		log.Info("node-ctl serve: node-link to cluster registry", "registry", regAddr, "node_id", nodeID)

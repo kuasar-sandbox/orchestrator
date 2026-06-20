@@ -55,14 +55,29 @@ func runRouter(args []string, log *slog.Logger) error {
 	if err != nil {
 		return fmt.Errorf("router: listen %s: %w", cfg.Router.Listen, err)
 	}
-	srv := &http.Server{Handler: h2c.NewHandler(rt.Handler(), &http2.Server{})}
+	var srv *http.Server
+	if cfg.Router.TLS.Enabled() {
+		stls, terr := cfg.Router.TLS.ServerConfig()
+		if terr != nil {
+			return fmt.Errorf("router: tls: %w", terr)
+		}
+		srv = &http.Server{Handler: rt.Handler(), TLSConfig: stls}
+	} else {
+		srv = &http.Server{Handler: h2c.NewHandler(rt.Handler(), &http2.Server{})}
+	}
 	go func() {
 		<-ctx.Done()
 		srv.Close()
 	}()
-	log.Info("cluster-ctl router", "listen", cfg.Router.Listen, "domain", cfg.Domain, "op", opAddr)
-	if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
-		return err
+	log.Info("cluster-ctl router", "listen", cfg.Router.Listen, "domain", cfg.Domain, "op", opAddr, "tls", cfg.Router.TLS.Enabled())
+	var serveErr error
+	if cfg.Router.TLS.Enabled() {
+		serveErr = srv.ServeTLS(ln, "", "")
+	} else {
+		serveErr = srv.Serve(ln)
+	}
+	if serveErr != nil && serveErr != http.ErrServerClosed {
+		return serveErr
 	}
 	return nil
 }

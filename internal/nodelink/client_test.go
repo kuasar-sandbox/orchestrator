@@ -86,7 +86,7 @@ func TestNodeLinkReserveRoundTrip(t *testing.T) {
 	client := New(
 		func(ctx context.Context) (net.Conn, error) { return net.Dial("tcp", addr) },
 		routesync.NodeRegister{NodeID: "n1", DataEndpoint: "10.0.0.1:8443"},
-		node, 50*time.Millisecond, log,
+		node, 50*time.Millisecond, nil, log,
 	)
 	go client.Run(ctx)
 

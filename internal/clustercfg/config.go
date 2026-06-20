@@ -6,6 +6,8 @@
 package clustercfg
 
 import (
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"os"
 	"strings"
@@ -116,6 +118,61 @@ type TLS struct {
 	Cert string `yaml:"cert"`
 	Key  string `yaml:"key"`
 	CA   string `yaml:"ca"`
+}
+
+// Enabled reports whether a TLS server/client should be configured (cert + key).
+func (t TLS) Enabled() bool { return t.Cert != "" && t.Key != "" }
+
+// ServerConfig builds a server tls.Config; a CA enables mTLS (require + verify
+// client certs). h2 is advertised so node-link / op / ingress negotiate HTTP/2.
+func (t TLS) ServerConfig() (*tls.Config, error) {
+	cert, err := tls.LoadX509KeyPair(t.Cert, t.Key)
+	if err != nil {
+		return nil, err
+	}
+	cfg := &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12, NextProtos: []string{"h2", "http/1.1"}}
+	if t.CA != "" {
+		pool, err := caPool(t.CA)
+		if err != nil {
+			return nil, err
+		}
+		cfg.ClientCAs = pool
+		cfg.ClientAuth = tls.RequireAndVerifyClientCert
+	}
+	return cfg, nil
+}
+
+// ClientConfig builds a client tls.Config (client cert for mTLS + CA to verify
+// the server); serverName sets the verification/SNI name when non-empty.
+func (t TLS) ClientConfig(serverName string) (*tls.Config, error) {
+	cfg := &tls.Config{MinVersion: tls.VersionTLS12, NextProtos: []string{"h2"}, ServerName: serverName}
+	if t.Cert != "" && t.Key != "" {
+		cert, err := tls.LoadX509KeyPair(t.Cert, t.Key)
+		if err != nil {
+			return nil, err
+		}
+		cfg.Certificates = []tls.Certificate{cert}
+	}
+	if t.CA != "" {
+		pool, err := caPool(t.CA)
+		if err != nil {
+			return nil, err
+		}
+		cfg.RootCAs = pool
+	}
+	return cfg, nil
+}
+
+func caPool(path string) (*x509.CertPool, error) {
+	pem, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(pem) {
+		return nil, fmt.Errorf("clustercfg: no certificates in %s", path)
+	}
+	return pool, nil
 }
 
 // Default returns the configuration with all non-required fields populated.

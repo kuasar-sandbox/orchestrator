@@ -92,6 +92,9 @@ type ClusterConfig struct {
 	Labels            map[string]string `yaml:"labels"`             // zone / pool / slot / node (nodeSelectors)
 	DataEndpoint      string            `yaml:"data_endpoint"`      // host:port the router forwards the data plane to
 	HeartbeatInterval string            `yaml:"heartbeat_interval"` // node-link heartbeat period; "" = 10s
+	TLSCert           string            `yaml:"tls_cert"`           // node-link client cert (mTLS); "" = plain h2c
+	TLSKey            string            `yaml:"tls_key"`
+	TLSCA             string            `yaml:"tls_ca"` // CA that verifies the registry's server cert
 }
 
 // APIConfig is the north control plane + TLS.

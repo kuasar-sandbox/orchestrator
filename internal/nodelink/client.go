@@ -45,27 +45,44 @@ type Client struct {
 	identity  routesync.NodeRegister
 	node      Node
 	heartbeat time.Duration
+	tlsConfig *tls.Config // non-nil = dial the registry over (m)TLS instead of h2c
 	log       *slog.Logger
 }
 
 // New builds a Client. dial returns a fresh connection to the registry's
 // node-link listener (a TCP or mTLS dial); heartbeat is the period between node
 // heartbeats (<=0 → 10s).
-func New(dial func(ctx context.Context) (net.Conn, error), identity routesync.NodeRegister, node Node, heartbeat time.Duration, log *slog.Logger) *Client {
+func New(dial func(ctx context.Context) (net.Conn, error), identity routesync.NodeRegister, node Node, heartbeat time.Duration, tlsConfig *tls.Config, log *slog.Logger) *Client {
 	if heartbeat <= 0 {
 		heartbeat = 10 * time.Second
 	}
-	return &Client{dial: dial, identity: identity, node: node, heartbeat: heartbeat, log: log}
+	return &Client{dial: dial, identity: identity, node: node, heartbeat: heartbeat, tlsConfig: tlsConfig, log: log}
 }
 
 // Run keeps a single node-link session alive, reconnecting with capped backoff
 // until ctx is cancelled.
 func (c *Client) Run(ctx context.Context) {
-	tr := &http2.Transport{
-		AllowHTTP: true,
-		DialTLSContext: func(ctx context.Context, _, _ string, _ *tls.Config) (net.Conn, error) {
+	tr := &http2.Transport{}
+	if c.tlsConfig != nil {
+		// mTLS: dial plain, then complete a TLS handshake with the node's client
+		// cert (the registry verifies it; SAN/fingerprint backs node_id, §5.4).
+		tr.DialTLSContext = func(ctx context.Context, _, _ string, _ *tls.Config) (net.Conn, error) {
+			conn, err := c.dial(ctx)
+			if err != nil {
+				return nil, err
+			}
+			tc := tls.Client(conn, c.tlsConfig)
+			if err := tc.HandshakeContext(ctx); err != nil {
+				conn.Close()
+				return nil, err
+			}
+			return tc, nil
+		}
+	} else {
+		tr.AllowHTTP = true
+		tr.DialTLSContext = func(ctx context.Context, _, _ string, _ *tls.Config) (net.Conn, error) {
 			return c.dial(ctx)
-		},
+		}
 	}
 	defer tr.CloseIdleConnections()
 	backoff := 200 * time.Millisecond
@@ -94,7 +111,11 @@ func (c *Client) session(ctx context.Context, tr *http2.Transport) error {
 	pr, pw := io.Pipe()
 	defer pw.Close()
 
-	req, err := http.NewRequestWithContext(sctx, http.MethodPut, "http://registry"+routesync.NodeLinkPath, pr)
+	scheme := "http"
+	if c.tlsConfig != nil {
+		scheme = "https"
+	}
+	req, err := http.NewRequestWithContext(sctx, http.MethodPut, scheme+"://registry"+routesync.NodeLinkPath, pr)
 	if err != nil {
 		return err
 	}

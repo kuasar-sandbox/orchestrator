@@ -83,7 +83,16 @@ func runRegistry(args []string, log *slog.Logger) error {
 	if err != nil {
 		return fmt.Errorf("registry: channel listen %s: %w", cfg.Channel.Listen, err)
 	}
-	srv := &http.Server{Handler: h2c.NewHandler(mux, &http2.Server{})}
+	var srv *http.Server
+	if cfg.Channel.TLS.Enabled() {
+		stls, terr := cfg.Channel.TLS.ServerConfig()
+		if terr != nil {
+			return fmt.Errorf("registry: channel tls: %w", terr)
+		}
+		srv = &http.Server{Handler: mux, TLSConfig: stls} // h2 over (m)TLS (§5.4)
+	} else {
+		srv = &http.Server{Handler: h2c.NewHandler(mux, &http2.Server{})}
+	}
 	go func() {
 		<-ctx.Done()
 		srv.Close()
@@ -108,9 +117,15 @@ func runRegistry(args []string, log *slog.Logger) error {
 		}
 	}()
 
-	log.Info("cluster-ctl registry", "channel_listen", cfg.Channel.Listen, "op_listen", cfg.Op.Listen, "store", cfg.Store.DSN)
-	if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
-		return err
+	log.Info("cluster-ctl registry", "channel_listen", cfg.Channel.Listen, "channel_tls", cfg.Channel.TLS.Enabled(), "op_listen", cfg.Op.Listen, "store", cfg.Store.DSN)
+	var serveErr error
+	if cfg.Channel.TLS.Enabled() {
+		serveErr = srv.ServeTLS(ln, "", "")
+	} else {
+		serveErr = srv.Serve(ln)
+	}
+	if serveErr != nil && serveErr != http.ErrServerClosed {
+		return serveErr
 	}
 	return nil
 }
