@@ -65,16 +65,25 @@ type Router struct {
 	cacheMu  sync.RWMutex
 	cache    map[string]*routeResolve // sid -> resolved data-plane target (local route cache, §5)
 	keyToSID map[string]string        // sandbox store key -> sid (for delete eviction)
+
+	authTTL time.Duration
+	authMu  sync.Mutex
+	authOK  map[string]time.Time // group\x00api_key -> cached-valid-until (§8)
 }
 
 // New builds a Router. opAddr is the registry op endpoint: a path ("/run/...")
-// for a unix socket, or host:port for TCP.
-func New(opAddr, domain string, log *slog.Logger) *Router {
+// for a unix socket, or host:port for TCP. authTTL caches api-key verification
+// (<=0 → 60s).
+func New(opAddr, domain string, authTTL time.Duration, log *slog.Logger) *Router {
+	if authTTL <= 0 {
+		authTTL = 60 * time.Second
+	}
 	rt := &Router{
-		domain: domain, log: log,
+		domain: domain, log: log, authTTL: authTTL,
 		builds:   map[string]string{},
 		cache:    map[string]*routeResolve{},
 		keyToSID: map[string]string{},
+		authOK:   map[string]time.Time{},
 	}
 	var transport http.RoundTripper
 	if strings.HasPrefix(opAddr, "/") {
@@ -140,6 +149,10 @@ func (rt *Router) handleCreate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, HeaderGroup+" required", http.StatusBadRequest)
 		return
 	}
+	if !rt.verifyAuth(r.Context(), group, r.Header.Get(HeaderAPIKey)) {
+		http.Error(w, "invalid api key for group", http.StatusForbidden)
+		return
+	}
 	routeKey := r.Header.Get(HeaderRouteKey)
 	res, err := rt.opReserve(r.Context(), group, routeKey)
 	if err != nil {
@@ -167,6 +180,10 @@ func (rt *Router) handleBuildRegister(w http.ResponseWriter, r *http.Request) {
 	group := r.Header.Get(HeaderGroup)
 	if group == "" {
 		http.Error(w, HeaderGroup+" required", http.StatusBadRequest)
+		return
+	}
+	if !rt.verifyAuth(r.Context(), group, r.Header.Get(HeaderAPIKey)) {
+		http.Error(w, "invalid api key for group", http.StatusForbidden)
 		return
 	}
 	res, err := rt.opReserveBuild(r.Context(), group)
@@ -265,6 +282,10 @@ func (rt *Router) handleList(w http.ResponseWriter, r *http.Request) {
 	group := r.Header.Get(HeaderGroup)
 	if group == "" {
 		http.Error(w, HeaderGroup+" required", http.StatusBadRequest)
+		return
+	}
+	if !rt.verifyAuth(r.Context(), group, r.Header.Get(HeaderAPIKey)) {
+		http.Error(w, "invalid api key for group", http.StatusForbidden)
 		return
 	}
 	u := fmt.Sprintf("%s/op/list?group=%s", rt.opBase, url.QueryEscape(group))
@@ -510,6 +531,40 @@ func (rt *Router) watchOnce(ctx context.Context) error {
 			syncing = false
 		}
 	}
+}
+
+// verifyAuth checks an api key against a group via the op interface, caching a
+// valid result for authTTL (cluster-router.md §8) so the data/control path does
+// not re-verify per request. An empty key or group is rejected.
+func (rt *Router) verifyAuth(ctx context.Context, group, apiKey string) bool {
+	if group == "" || apiKey == "" {
+		return false
+	}
+	k := group + "\x00" + apiKey
+	rt.authMu.Lock()
+	if exp, ok := rt.authOK[k]; ok && time.Now().Before(exp) {
+		rt.authMu.Unlock()
+		return true
+	}
+	rt.authMu.Unlock()
+
+	u := fmt.Sprintf("%s/op/verify-key?group=%s&api_key=%s", rt.opBase, url.QueryEscape(group), url.QueryEscape(apiKey))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return false
+	}
+	resp, err := rt.opClient.Do(req)
+	if err != nil {
+		return false
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return false
+	}
+	rt.authMu.Lock()
+	rt.authOK[k] = time.Now().Add(rt.authTTL)
+	rt.authMu.Unlock()
+	return true
 }
 
 func readWatchFrame(r io.Reader) (*watchEvent, error) {

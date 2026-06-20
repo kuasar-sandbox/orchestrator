@@ -42,7 +42,7 @@ func runRouter(args []string, log *slog.Logger) error {
 		cfg.Router.Listen = *listen
 	}
 
-	rt := router.New(opAddr, cfg.Domain, log)
+	rt := router.New(opAddr, cfg.Domain, cfg.Router.AuthCacheDur(), log)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()

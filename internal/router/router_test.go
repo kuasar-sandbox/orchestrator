@@ -44,15 +44,18 @@ func TestBuildRoutingThroughRouter(t *testing.T) {
 	nodeHost := strings.TrimPrefix(node.URL, "http://")
 
 	op := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/op/reserve-build" {
+		switch r.URL.Path {
+		case "/op/reserve-build":
 			_ = json.NewEncoder(w).Encode(reserveResult{NodeID: "n1", DataEndpoint: nodeHost})
-			return
+		case "/op/verify-key":
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusNotFound)
 		}
-		w.WriteHeader(http.StatusNotFound)
 	}))
 	defer op.Close()
 
-	rt := New(strings.TrimPrefix(op.URL, "http://"), "test.local", slog.Default())
+	rt := New(strings.TrimPrefix(op.URL, "http://"), "test.local", 0, slog.Default())
 	srv := httptest.NewServer(rt.Handler())
 	defer srv.Close()
 
@@ -60,6 +63,7 @@ func TestBuildRoutingThroughRouter(t *testing.T) {
 	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/v3/templates", nil)
 	req.Host = "api.test.local"
 	req.Header.Set(HeaderGroup, "/g")
+	req.Header.Set(HeaderAPIKey, "e2b_test")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)

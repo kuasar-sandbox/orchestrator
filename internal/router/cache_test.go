@@ -13,6 +13,35 @@ import (
 	"time"
 )
 
+// TestAuthRejectsBadKey checks the Phase 7g router auth: a create whose api key
+// the registry rejects is 403'd at the router, before any reserve.
+func TestAuthRejectsBadKey(t *testing.T) {
+	op := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/op/verify-key" {
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer op.Close()
+	rt := New(strings.TrimPrefix(op.URL, "http://"), "test.local", 0, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	srv := httptest.NewServer(rt.Handler())
+	defer srv.Close()
+
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/sandboxes", nil)
+	req.Host = "api.test.local"
+	req.Header.Set(HeaderGroup, "/g")
+	req.Header.Set(HeaderAPIKey, "e2b_bad")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("create with a rejected key status=%d, want 403", resp.StatusCode)
+	}
+}
+
 // TestSandboxVerbForward checks the Phase 7f control plane: a sid-scoped verb is
 // forwarded to the node that holds the sandbox (resolved via the op interface).
 func TestSandboxVerbForward(t *testing.T) {
@@ -33,7 +62,7 @@ func TestSandboxVerbForward(t *testing.T) {
 	}))
 	defer op.Close()
 
-	rt := New(strings.TrimPrefix(op.URL, "http://"), "test.local", slog.New(slog.NewTextHandler(io.Discard, nil)))
+	rt := New(strings.TrimPrefix(op.URL, "http://"), "test.local", 0, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	srv := httptest.NewServer(rt.Handler())
 	defer srv.Close()
 
@@ -93,7 +122,7 @@ func TestRouteCacheFromWatch(t *testing.T) {
 	}))
 	defer op.Close()
 
-	rt := New(strings.TrimPrefix(op.URL, "http://"), "test.local", slog.New(slog.NewTextHandler(io.Discard, nil)))
+	rt := New(strings.TrimPrefix(op.URL, "http://"), "test.local", 0, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	go rt.RunWatch(ctx)
 
 	// Wait for the cache to populate from the watch snapshot.

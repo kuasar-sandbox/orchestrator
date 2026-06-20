@@ -2,8 +2,11 @@ package registry
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"net/http"
+
+	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/apikey"
 )
 
 // Op interface paths the router (and later the scaler) dial (cluster.md §5.2).
@@ -15,6 +18,7 @@ const (
 	OpReserveBuildPath = "/op/reserve-build" // POST ?group=            -> ReserveResult (build node)
 	OpGroupPath        = "/op/group"         // POST ?group=&template_ref= -> set template_ref
 	OpListPath         = "/op/list"          // GET  ?group=            -> the group's sandbox shard
+	OpVerifyKeyPath    = "/op/verify-key"    // GET  ?group=&api_key=   -> 200 valid / 403 invalid
 )
 
 // RouteResolve is the data-plane forwarding target the router needs for a sid
@@ -37,7 +41,35 @@ func (r *Registry) ServeOp(mux *http.ServeMux) {
 	mux.HandleFunc(OpReserveBuildPath, r.serveReserveBuild)
 	mux.HandleFunc(OpGroupPath, r.serveGroup)
 	mux.HandleFunc(OpListPath, r.serveList)
+	mux.HandleFunc(OpVerifyKeyPath, r.serveVerifyKey)
 	mux.HandleFunc(OpWatchPath, r.serveWatch)
+}
+
+// serveVerifyKey verifies an api key against a group's manifest key (the router's
+// auth check, cached for router.auth_cache_ttl — cluster-router.md §8). A 403
+// hides both a bad key and an unknown group.
+func (r *Registry) serveVerifyKey(w http.ResponseWriter, req *http.Request) {
+	q := req.URL.Query()
+	g, found, err := r.stores.GetGroupByID(req.Context(), q.Get("group"))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if !found || g.ManifestKey == "" {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	p, err := apikey.Parse(q.Get("api_key"))
+	if err != nil {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	raw, err := hex.DecodeString(g.ManifestKey)
+	if err != nil || !apikey.Verify(p, raw) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
 }
 
 // ListItem is one row of a group's sandbox listing (cluster-router.md §6: list is
