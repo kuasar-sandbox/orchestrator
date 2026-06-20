@@ -50,6 +50,7 @@ func PluginRegisterPath(id string) string { return pluginPathPrefix + id + "/reg
 const (
 	KindRoute     = "route"      // route stream only (observer)
 	KindRouteWake = "route_wake" // route stream + this subscriber issues Wakes (a proxy)
+	KindRegistry  = "registry"   // cluster registry subscribing to a node's routes (node.md §10)
 )
 
 // RouteEntry.State values (mirror internal/types.State string values).
@@ -89,6 +90,12 @@ type RouteEntry struct {
 	// MmdsSecret is the per-sandbox MMDS signing key (hex), derived deterministically
 	// from the manifest key + id (keys.MmdsSecret) so every proxy worker agrees on it.
 	MmdsSecret string `json:"mmds_secret,omitempty"`
+	// Cluster node-link fields (node.md §10 / cluster.md §5.1): set when the route
+	// authority is a node reporting sandboxes to the registry; empty on the local
+	// proxy plane. The registry keys SandboxStore by (Group, RouteKey).
+	Group          string `json:"group,omitempty"`           // sandbox-group (shard key)
+	RouteKey       string `json:"route_key,omitempty"`       // {user,session} routing key (session affinity)
+	MigrationToken string `json:"migration_token,omitempty"` // SAVED → portable; minted by export-sandbox
 }
 
 // Policy is the operational policy the orchestrator pushes to a proxy at handshake
@@ -106,7 +113,14 @@ type Msg struct {
 	Hello    *Hello      `json:"hello,omitempty"`    // hello (orchestrator -> subscriber)
 	Register *Register   `json:"register,omitempty"` // register (subscriber -> orchestrator, first up-frame)
 	Route    *RouteEntry `json:"route,omitempty"`    // upsert
-	SID      string      `json:"sid,omitempty"`      // delete | wake
+	SID      string      `json:"sid,omitempty"`      // delete | wake | command target
+	// Cluster node-link variants (node.md §10): node_register / heartbeat / cmd_ack
+	// flow node -> registry; command flows registry -> node; rev stamps down events.
+	NodeReg *NodeRegister `json:"node_register,omitempty"`
+	Beat    *Heartbeat    `json:"heartbeat,omitempty"`
+	Cmd     *Command      `json:"command,omitempty"`
+	Ack     *CmdAck       `json:"cmd_ack,omitempty"`
+	Rev     int64         `json:"rev,omitempty"` // per-shard monotonic revision for resume_from (§5.3)
 }
 
 // Hello is the orchestrator's first down-frame; it carries the operational Policy.
@@ -123,6 +137,9 @@ type Register struct {
 	Subscribe *Subscribe `json:"subscribe,omitempty"` // route stream; nil = lease only (no routes)
 	Proxy     *Proxy     `json:"proxy,omitempty"`     // accepts gateway-forwarded data-plane requests
 	Mmds      bool       `json:"mmds,omitempty"`      // serves MMDS (the per-sandbox secret ships on every entry)
+	// ResumeFrom (opt-in) asks the authority to replay the route changelog strictly
+	// after this rev instead of a full re-sync (§5.3); 0 = full sync + bookmark.
+	ResumeFrom int64 `json:"resume_from,omitempty"`
 }
 
 // Subscribe selects the route-stream flavor.
