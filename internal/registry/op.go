@@ -35,6 +35,7 @@ func (r *Registry) ServeOp(mux *http.ServeMux) {
 	mux.HandleFunc(OpRoutePath, r.serveRoute)
 	mux.HandleFunc(OpReserveBuildPath, r.serveReserveBuild)
 	mux.HandleFunc(OpGroupPath, r.serveGroup)
+	mux.HandleFunc(OpWatchPath, r.serveWatch)
 }
 
 func (r *Registry) serveReserveBuild(w http.ResponseWriter, req *http.Request) {

@@ -2,8 +2,12 @@ package registry
 
 import (
 	"context"
+	"encoding/binary"
+	"encoding/json"
 	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"testing"
 	"time"
@@ -209,6 +213,54 @@ func TestReservePausedResume(t *testing.T) {
 	if res.SID != "sb-x" || res.AccessToken != "tok" {
 		t.Fatalf("resume result: %+v", res)
 	}
+}
+
+func TestOpWatch(t *testing.T) {
+	ctx := context.Background()
+	reg := testReg(t)
+	reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1", DataEndpoint: "10.0.0.1:8443"})
+	reg.stores.PutSandbox(ctx, &SandboxRecord{Group: "/g", RouteKey: "rk", SID: "sb-1", State: StateReady, NodeID: "n1", AccessToken: "tok"})
+
+	mux := http.NewServeMux()
+	reg.ServeOp(mux)
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/op/watch")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	// Snapshot: one put (sb-1, resolved to its node's data endpoint) + a bookmark.
+	if put := readWatchFrame(t, resp.Body); put.Type != "put" || put.Route == nil || put.Route.SID != "sb-1" || put.Route.DataEndpoint != "10.0.0.1:8443" {
+		t.Fatalf("snapshot put: %+v", put)
+	}
+	if bm := readWatchFrame(t, resp.Body); bm.Type != "bookmark" {
+		t.Fatalf("expected bookmark, got %+v", bm)
+	}
+	// Live delta: a new sandbox shows up as a put.
+	reg.stores.PutSandbox(ctx, &SandboxRecord{Group: "/g", RouteKey: "rk2", SID: "sb-2", State: StateReady, NodeID: "n1", AccessToken: "t2"})
+	if d := readWatchFrame(t, resp.Body); d.Type != "put" || d.Route == nil || d.Route.SID != "sb-2" {
+		t.Fatalf("delta put: %+v", d)
+	}
+}
+
+func readWatchFrame(t *testing.T, r io.Reader) *WatchEvent {
+	t.Helper()
+	var hdr [4]byte
+	if _, err := io.ReadFull(r, hdr[:]); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, binary.LittleEndian.Uint32(hdr[:]))
+	if _, err := io.ReadFull(r, buf); err != nil {
+		t.Fatal(err)
+	}
+	var ev WatchEvent
+	if err := json.Unmarshal(buf, &ev); err != nil {
+		t.Fatal(err)
+	}
+	return &ev
 }
 
 func TestSweepDeadNodes(t *testing.T) {
