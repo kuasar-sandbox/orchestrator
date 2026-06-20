@@ -72,6 +72,25 @@ func ServeStream(ctx context.Context, w http.ResponseWriter, body io.Reader, src
 // onUp = a registry-command dispatcher). The frame codec and this loop are the
 // single shared engine; only the transport adapter and onUp differ.
 func ServeAuthority(ctx context.Context, w io.Writer, flush func(), body io.Reader, src Source, reg Register, onUp func(context.Context, *Msg), log *slog.Logger) {
+	// Handshake: policy first (flush so the peer's RoundTrip returns), then the
+	// shared route-stream loop. The cluster node-link sends a NodeRegister frame
+	// instead of Hello and calls StreamAuthority directly.
+	if err := WriteMsg(w, &Msg{Type: TypeHello, Hello: &Hello{Version: Version, Policy: src.Policy()}}); err != nil {
+		return
+	}
+	flush()
+	StreamAuthority(ctx, w, flush, body, src, reg, onUp, log)
+}
+
+// StreamAuthority runs the route-stream half of an authority connection WITHOUT
+// the handshake frame: it reads up-frames from body (each handed to onUp) and —
+// when reg subscribes — streams the initial route set as Upserts, a Bookmark,
+// then live deltas to w. It returns when body hits EOF/error or ctx is cancelled.
+//
+// The proxy plane reaches it via ServeAuthority (after a Hello); the cluster
+// node-link reaches it directly after writing its NodeRegister, so the node — the
+// route authority that DIALS the registry — reuses the same streaming loop.
+func StreamAuthority(ctx context.Context, w io.Writer, flush func(), body io.Reader, src Source, reg Register, onUp func(context.Context, *Msg), log *slog.Logger) {
 	sctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -92,12 +111,6 @@ func ServeAuthority(ctx context.Context, w io.Writer, flush func(), body io.Read
 			}
 		}
 	}()
-
-	// Writer: handshake policy first (flush so the peer's RoundTrip returns).
-	if err := WriteMsg(w, &Msg{Type: TypeHello, Hello: &Hello{Version: Version, Policy: src.Policy()}}); err != nil {
-		return
-	}
-	flush()
 
 	if !reg.subscribes() {
 		// Lease only (no route stream): hold the connection open until disconnect.

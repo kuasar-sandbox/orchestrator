@@ -1,0 +1,122 @@
+// Package nodelink is the node side of the cluster node-link channel (node.md
+// §10): a node-ctl serve dials the registry, registers its identity, then — as
+// the route authority — streams its sandbox routes up while executing the
+// registry's lifecycle/key commands. It reuses the routesync engine (the frame
+// codec + StreamAuthority): the only node-link-specific bits are sending a
+// NodeRegister frame instead of Hello and dispatching commands instead of wakes.
+package nodelink
+
+import (
+	"context"
+	"crypto/tls"
+	"io"
+	"log/slog"
+	"net"
+	"net/http"
+	"time"
+
+	"golang.org/x/net/http2"
+
+	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/routesync"
+)
+
+// Node is what the node-link client needs from the node's orchestrator: a route
+// Source for the node's sandboxes (RouteEntry with Group/RouteKey set) and
+// execution of registry commands. internal/orch implements it.
+type Node interface {
+	routesync.Source
+	// HandleCommand executes a registry lifecycle / key command (create / connect
+	// / delete / key_*). The terminal sandbox state is reported back on the route
+	// stream (Source), which a registry Reserve waits on — not on an ack.
+	HandleCommand(ctx context.Context, cmd *routesync.Command)
+}
+
+// Client is a node's node-link client: it dials the registry, registers the
+// node's identity, then streams its sandbox routes while executing registry
+// commands, reconnecting with capped backoff.
+type Client struct {
+	dial     func(ctx context.Context) (net.Conn, error)
+	identity routesync.NodeRegister
+	node     Node
+	log      *slog.Logger
+}
+
+// New builds a Client. dial returns a fresh connection to the registry's
+// node-link listener (a TCP or mTLS dial).
+func New(dial func(ctx context.Context) (net.Conn, error), identity routesync.NodeRegister, node Node, log *slog.Logger) *Client {
+	return &Client{dial: dial, identity: identity, node: node, log: log}
+}
+
+// Run keeps a single node-link session alive, reconnecting with capped backoff
+// until ctx is cancelled.
+func (c *Client) Run(ctx context.Context) {
+	tr := &http2.Transport{
+		AllowHTTP: true,
+		DialTLSContext: func(ctx context.Context, _, _ string, _ *tls.Config) (net.Conn, error) {
+			return c.dial(ctx)
+		},
+	}
+	defer tr.CloseIdleConnections()
+	backoff := 200 * time.Millisecond
+	for ctx.Err() == nil {
+		err := c.session(ctx, tr)
+		if ctx.Err() != nil {
+			return
+		}
+		c.log.Warn("node-link: session ended; reconnecting", "node", c.identity.NodeID, "err", err)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(backoff):
+		}
+		backoff = min(backoff*2, 5*time.Second)
+	}
+}
+
+// session runs one node-link registration: it PUTs the node-link stream (request
+// body = NodeRegister then the route stream) and reads the down stream (response
+// body = Hello then commands), full-duplex over h2c. The node is the authority,
+// so it WRITES routes and READS commands (the inverse of a proxy subscriber).
+func (c *Client) session(ctx context.Context, tr *http2.Transport) error {
+	sctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	pr, pw := io.Pipe()
+	defer pw.Close()
+
+	req, err := http.NewRequestWithContext(sctx, http.MethodPut, "http://registry"+routesync.NodeLinkPath, pr)
+	if err != nil {
+		return err
+	}
+
+	// Write NodeRegister concurrently so RoundTrip can start consuming the
+	// request body; it returns once the registry has read it and replied.
+	regErr := make(chan error, 1)
+	go func() {
+		regErr <- routesync.WriteMsg(pw, &routesync.Msg{Type: routesync.TypeNodeRegister, NodeReg: &c.identity})
+	}()
+
+	resp, err := tr.RoundTrip(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if err := <-regErr; err != nil {
+		return err
+	}
+	// Registry's Hello ack (the node ignores its policy).
+	if _, err := routesync.ReadMsg(resp.Body); err != nil {
+		return err
+	}
+
+	// Stream the node's routes (to pw) while executing commands (from resp.Body),
+	// reusing the shared authority loop. Subscribe(kind=registry) makes the loop
+	// stream routes; onUp dispatches commands.
+	reg := routesync.Register{Subscribe: &routesync.Subscribe{Kind: routesync.KindRegistry}}
+	onUp := func(uctx context.Context, m *routesync.Msg) {
+		if m.Type == routesync.TypeCommand && m.Cmd != nil {
+			c.node.HandleCommand(uctx, m.Cmd)
+		}
+	}
+	routesync.StreamAuthority(sctx, pw, func() {}, resp.Body, c.node, reg, onUp, c.log)
+	return sctx.Err()
+}

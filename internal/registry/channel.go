@@ -8,10 +8,6 @@ import (
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/routesync"
 )
 
-// NodeLinkPath is the path a node-ctl serve dials to open its node-link channel
-// to the registry (node.md §10). h2c full-duplex (golang.org/x/net/http2).
-const NodeLinkPath = "/internal/node-link"
-
 // nodeChannel is the registry's per-node channel handle: it writes commands to
 // the node on the h2c response body (serialized). It implements nodeConn.
 type nodeChannel struct {

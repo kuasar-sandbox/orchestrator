@@ -15,6 +15,10 @@ const (
 	TypeCmdAck       = "cmd_ack"       // node -> registry (command accepted / rejected)
 )
 
+// NodeLinkPath is the HTTP path a node-ctl serve dials to open its node-link
+// channel to the registry (node.md §10); h2c full-duplex.
+const NodeLinkPath = "/internal/node-link"
+
 // Command kinds (Command.Kind) — the lifecycle + key primitives the registry
 // drives the node with. The node executes via its existing e2b lifecycle (the
 // command just carries the intent) and reports the terminal state on the route

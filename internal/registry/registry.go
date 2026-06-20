@@ -80,6 +80,9 @@ func New(stores *Stores, placer Placer, parkTimeout time.Duration, log *slog.Log
 	}
 }
 
+// Stores exposes the typed store layer (cluster-ctl seeds group config; tests).
+func (r *Registry) Stores() *Stores { return r.stores }
+
 func flightKey(group, routeKey string) string { return group + "\x00" + routeKey }
 
 // ReserveSandbox resolves (group, route_key) to a running sandbox, placing +
