@@ -10,6 +10,7 @@ require (
 	github.com/aws/smithy-go v1.25.1
 	github.com/coreos/go-systemd/v22 v22.5.0
 	github.com/google/uuid v1.6.0
+	github.com/kuasar-sandbox/sandbox-accelerator v0.0.0
 	github.com/kuasar-sandbox/sandbox-runtime v0.0.0
 	golang.org/x/net v0.49.0
 	golang.org/x/sys v0.40.0
@@ -43,7 +44,6 @@ require (
 	github.com/godbus/dbus/v5 v5.0.4 // indirect
 	github.com/golang/protobuf v1.5.4 // indirect
 	github.com/hashicorp/golang-lru/v2 v2.0.7 // indirect
-	github.com/kuasar-sandbox/sandbox-accelerator v0.0.0 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/ncruces/go-strftime v0.1.9 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect

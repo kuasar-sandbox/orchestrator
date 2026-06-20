@@ -30,7 +30,7 @@ func main() {
 	case "router":
 		err = runRouter(os.Args[2:], log)
 	case "scaler":
-		err = fmt.Errorf("scaler is not implemented yet (Phase 4)")
+		err = runScaler(os.Args[2:], log)
 	case "group":
 		err = groupCmd(os.Args[2:])
 	case "config":

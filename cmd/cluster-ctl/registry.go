@@ -19,6 +19,7 @@ import (
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/clusterstore"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/registry"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/routesync"
+	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/scaler"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/secretbox"
 )
 
@@ -60,7 +61,8 @@ func runRegistry(args []string, log *slog.Logger) error {
 			return err
 		}
 	}
-	reg := registry.New(registry.NewStores(kv, box), nil, cfg.Reserve.ParkDur(), log)
+	stores := registry.NewStores(kv, box)
+	reg := registry.New(stores, scaler.New(stores, cfg.Scaler), cfg.Reserve.ParkDur(), log)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
