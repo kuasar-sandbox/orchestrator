@@ -203,7 +203,15 @@ rreq() {
     [ -n "$body" ] && args+=(-H 'Content-Type: application/json' -d "$body")
     curl "${args[@]}" "http://127.0.0.1:$ROUTER_PORT$path"
 }
-code=$(rreq POST /v3/templates '{"name":"cluster-tmpl"}'); [ "$code" = "202" ] || { cat "$WORK/resp.body"; fail "cluster build register=$code"; }
+# Retry the register while the just-joined node settles into placement (a fresh
+# node can be transiently unplaceable for an instant after node-link connect).
+for _ in $(seq 1 8); do
+    code=$(rreq POST /v3/templates '{"name":"cluster-tmpl"}')
+    [ "$code" = "202" ] && break
+    grep -q "no eligible node" "$WORK/resp.body" 2>/dev/null && { sleep 1; continue; }
+    break
+done
+[ "$code" = "202" ] || { cat "$WORK/resp.body"; fail "cluster build register=$code"; }
 TID=$(grep -o '"templateID":"[^"]*"' "$WORK/resp.body" | head -1 | cut -d'"' -f4)
 BID=$(grep -o '"buildID":"[^"]*"' "$WORK/resp.body" | head -1 | cut -d'"' -f4)
 code=$(rreq POST "/v2/templates/$TID/builds/$BID" "{\"fromImage\":\"$GUEST_REF\"}"); [ "$code" = "202" ] || { cat "$WORK/resp.body"; fail "cluster build trigger=$code"; }
