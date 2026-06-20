@@ -123,8 +123,14 @@ func (rt *Router) serveControl(w http.ResponseWriter, r *http.Request) {
 	case strings.Contains(path, "/builds/"):
 		// build trigger / status / files: route by build_id to the recorded node.
 		rt.handleBuildForward(w, r)
+	case r.Method == http.MethodGet && strings.HasSuffix(path, "/sandboxes"):
+		// list: the group's sandbox shard (no cross-group).
+		rt.handleList(w, r)
+	case strings.Contains(path, "/sandboxes/"):
+		// get / kill / pause / timeout / connect / export: forward to the node by sid.
+		rt.handleSandboxVerb(w, r)
 	default:
-		http.Error(w, "cluster router: control verb not implemented (Phase 7 adds pause/kill/list/get)", http.StatusNotImplemented)
+		http.Error(w, "cluster router: control verb not supported", http.StatusNotImplemented)
 	}
 }
 
@@ -228,6 +234,93 @@ func extractBuildID(path string) string {
 		return ""
 	}
 	rest := path[i+len("/builds/"):]
+	if j := strings.IndexByte(rest, '/'); j >= 0 {
+		return rest[:j]
+	}
+	return rest
+}
+
+// --- sandbox control verbs (forward by sid / group shard) ---
+
+// handleSandboxVerb forwards a sid-scoped control verb (get/kill/pause/timeout/
+// connect/export) to the node holding the sandbox (cluster-router.md §6); kill's
+// teardown propagates back as a route delete, converging the registry.
+func (rt *Router) handleSandboxVerb(w http.ResponseWriter, r *http.Request) {
+	sid := extractSandboxID(r.URL.Path)
+	if sid == "" || sid == "import" {
+		http.Error(w, "cluster router: unsupported sandbox path", http.StatusNotImplemented)
+		return
+	}
+	endpoint := rt.resolveNode(r.Context(), sid)
+	if endpoint == "" {
+		http.Error(w, "sandbox not found", http.StatusNotFound)
+		return
+	}
+	rt.forwardToNode(w, r, endpoint)
+}
+
+// handleList returns the group's sandbox shard (cluster-router.md §6: list is
+// group-local — the registry holds every node's sandboxes for the group).
+func (rt *Router) handleList(w http.ResponseWriter, r *http.Request) {
+	group := r.Header.Get(HeaderGroup)
+	if group == "" {
+		http.Error(w, HeaderGroup+" required", http.StatusBadRequest)
+		return
+	}
+	u := fmt.Sprintf("%s/op/list?group=%s", rt.opBase, url.QueryEscape(group))
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, u, nil)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	resp, err := rt.opClient.Do(req)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = io.Copy(w, resp.Body)
+}
+
+// resolveNode finds a sandbox's node data endpoint via the route cache, falling
+// back to the op interface.
+func (rt *Router) resolveNode(ctx context.Context, sid string) string {
+	if rr := rt.cachedRoute(sid); rr != nil && rr.DataEndpoint != "" {
+		return rr.DataEndpoint
+	}
+	if rr, err := rt.opRoute(ctx, sid); err == nil {
+		return rr.DataEndpoint
+	}
+	return ""
+}
+
+// forwardToNode proxies a control request to a node's e2b control plane (Host
+// api.<domain>; the client's X-API-KEY passes through for the node's auth).
+func (rt *Router) forwardToNode(w http.ResponseWriter, r *http.Request, dataEndpoint string) {
+	target := &url.URL{Scheme: "http", Host: dataEndpoint}
+	proxy := httputil.NewSingleHostReverseProxy(target)
+	apiHost := "api." + rt.domain
+	proxy.Director = func(req *http.Request) {
+		req.URL.Scheme = "http"
+		req.URL.Host = dataEndpoint
+		req.Host = apiHost
+	}
+	proxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, e error) {
+		rt.log.Warn("router: control forward", "node", dataEndpoint, "err", e)
+		http.Error(w, "bad gateway", http.StatusBadGateway)
+	}
+	proxy.ServeHTTP(w, r)
+}
+
+// extractSandboxID pulls the sid from an e2b sandbox path: the segment after
+// "/sandboxes/" (e.g. /sandboxes/<sid>[/pause]).
+func extractSandboxID(path string) string {
+	i := strings.Index(path, "/sandboxes/")
+	if i < 0 {
+		return ""
+	}
+	rest := path[i+len("/sandboxes/"):]
 	if j := strings.IndexByte(rest, '/'); j >= 0 {
 		return rest[:j]
 	}

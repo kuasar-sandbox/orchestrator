@@ -14,6 +14,7 @@ const (
 	OpRoutePath        = "/op/route"         // GET  ?sid=              -> RouteResolve
 	OpReserveBuildPath = "/op/reserve-build" // POST ?group=            -> ReserveResult (build node)
 	OpGroupPath        = "/op/group"         // POST ?group=&template_ref= -> set template_ref
+	OpListPath         = "/op/list"          // GET  ?group=            -> the group's sandbox shard
 )
 
 // RouteResolve is the data-plane forwarding target the router needs for a sid
@@ -35,7 +36,29 @@ func (r *Registry) ServeOp(mux *http.ServeMux) {
 	mux.HandleFunc(OpRoutePath, r.serveRoute)
 	mux.HandleFunc(OpReserveBuildPath, r.serveReserveBuild)
 	mux.HandleFunc(OpGroupPath, r.serveGroup)
+	mux.HandleFunc(OpListPath, r.serveList)
 	mux.HandleFunc(OpWatchPath, r.serveWatch)
+}
+
+// ListItem is one row of a group's sandbox listing (cluster-router.md §6: list is
+// served from the group's SandboxStore shard, no cross-group).
+type ListItem struct {
+	SandboxID  string `json:"sandboxID"`
+	State      string `json:"state"`
+	TemplateID string `json:"templateID,omitempty"`
+	ClientID   string `json:"clientID,omitempty"`
+}
+
+func (r *Registry) serveList(w http.ResponseWriter, req *http.Request) {
+	group := req.URL.Query().Get("group")
+	out := []ListItem{}
+	_ = r.stores.RangeSandboxes(req.Context(), group, func(s *SandboxRecord) error {
+		if s.State == StateReady || s.State == StatePaused {
+			out = append(out, ListItem{SandboxID: s.SID, State: string(s.State), TemplateID: s.TemplateID, ClientID: s.NodeID})
+		}
+		return nil
+	})
+	writeJSON(w, out)
 }
 
 func (r *Registry) serveReserveBuild(w http.ResponseWriter, req *http.Request) {
