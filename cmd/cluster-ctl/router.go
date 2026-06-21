@@ -43,6 +43,7 @@ func runRouter(args []string, log *slog.Logger) error {
 	}
 
 	rt := router.New(opAddr, cfg.Domain, cfg.Router.AuthCacheDur(), log)
+	rt.SetDataPlaneAuth(cfg.Router.DataPlaneAuth)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()

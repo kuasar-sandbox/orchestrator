@@ -52,7 +52,7 @@ func (o *Orchestrator) HandleCommand(ctx context.Context, cmd *routesync.Command
 			}
 		}()
 		return accept(cmd)
-	case routesync.CmdKeyPut, routesync.CmdKeyRenew:
+	case routesync.CmdKeyPut:
 		// Key distribution (cluster.md §7.6): install the group's manifest key into
 		// the node's allowlist (a TTL lease) so create can resolve it by fingerprint.
 		// The ack confirms installation — a build forward (Reserve) gates on it.

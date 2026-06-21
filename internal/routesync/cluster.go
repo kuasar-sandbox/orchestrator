@@ -24,12 +24,11 @@ const NodeLinkPath = "/internal/node-link"
 // command just carries the intent) and reports the terminal state on the route
 // stream; a Reserve waits on that route event, not the ack.
 const (
-	CmdCreate   = "create"    // boot a sandbox (cold template restore, or migration import+restore)
-	CmdConnect  = "connect"   // resume a node-local PAUSED sandbox
-	CmdDelete   = "delete"    // destroy a sandbox (kill, or the SAVED two-phase reclaim step)
-	CmdKeyPut   = "key_put"   // install a manifest-key lease (cluster.md §7.6)
-	CmdKeyRenew = "key_renew" // renew a key lease
-	CmdKeyDrop  = "key_drop"  // drop a key lease
+	CmdCreate  = "create"   // boot a sandbox (cold template restore, or migration import+restore)
+	CmdConnect = "connect"  // resume a node-local PAUSED sandbox
+	CmdDelete  = "delete"   // destroy a sandbox (kill, or the SAVED two-phase reclaim step)
+	CmdKeyPut  = "key_put"  // install / renew a manifest-key lease (reconcile re-sends; cluster.md §7.6)
+	CmdKeyDrop = "key_drop" // drop a key lease
 )
 
 // CmdAck statuses.
@@ -84,9 +83,9 @@ type Command struct {
 	KeyFingerprint string            `json:"key_fp,omitempty"`          // manifest-key fingerprint the node must already hold
 	Config         map[string]string `json:"config,omitempty"`          // merged sandbox config (node default ⊕ group ⊕ create)
 	MigrationToken string            `json:"migration_token,omitempty"` // SAVED one-step import + restore
-	// key_put / key_renew / key_drop
+	// key_put / key_drop
 	ManifestKey string `json:"manifest_key,omitempty"` // hex; only on key_put
-	ExpiresUnix int64  `json:"expires_unix,omitempty"` // lease expiry (key_put / key_renew)
+	ExpiresUnix int64  `json:"expires_unix,omitempty"` // lease expiry (key_put)
 }
 
 // CmdAck acknowledges a Command's receipt; the terminal outcome arrives via the

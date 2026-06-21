@@ -67,8 +67,9 @@ const buildTTL = time.Hour
 // Router is the e2b unified ingress. It dials the registry op interface (UDS or
 // TCP) for reserve + route resolution.
 type Router struct {
-	domain      string
-	opBase      string // http base for the op interface
+	domain        string
+	dataPlaneAuth string // off | log | enforce — data-plane access-token check (§8)
+	opBase        string // http base for the op interface
 	opClient    *http.Client // 60s timeout (reserve / route calls)
 	watchClient *http.Client // no timeout (the long-lived route watch stream)
 	log         *slog.Logger
@@ -85,9 +86,6 @@ type Router struct {
 	authOK  map[string]time.Time // group\x00api_key -> cached-valid-until (§8)
 
 	fwdTransport *http.Transport // pooled transport for node (data/control/build) forwards
-
-	watchMu  sync.Mutex
-	watchRev int64 // last applied watch revision (for from_rev resume)
 }
 
 // New builds a Router. opAddr is the registry op endpoint: a path ("/run/...")
@@ -123,6 +121,10 @@ func New(opAddr, domain string, authTTL time.Duration, log *slog.Logger) *Router
 	rt.fwdTransport = &http.Transport{MaxIdleConns: 512, MaxIdleConnsPerHost: 64, IdleConnTimeout: 90 * time.Second}
 	return rt
 }
+
+// SetDataPlaneAuth sets the data-plane access-token enforcement mode (off | log |
+// enforce); cluster-ctl router sets it from config before serving.
+func (rt *Router) SetDataPlaneAuth(mode string) { rt.dataPlaneAuth = mode }
 
 // Handler routes by Host: api.<domain> (and any api.* host) -> control plane;
 // everything else -> data plane (<port>-<sid>.<domain>).
@@ -412,6 +414,18 @@ func (rt *Router) serveData(w http.ResponseWriter, r *http.Request, host string)
 	if rr.State != "ready" || rr.DataEndpoint == "" {
 		http.Error(w, "sandbox not ready", http.StatusServiceUnavailable)
 		return
+	}
+	// Data-plane token enforcement (cluster-router.md §8): enforce requires the
+	// caller to present the sandbox's access token; log warns on mismatch; off (and
+	// unset) skips. The token is (re)injected for the node below regardless.
+	if rt.dataPlaneAuth == "enforce" || rt.dataPlaneAuth == "log" {
+		if r.Header.Get(HeaderAccessTok) != rr.AccessToken {
+			if rt.dataPlaneAuth == "enforce" {
+				http.Error(w, "invalid access token", http.StatusUnauthorized)
+				return
+			}
+			rt.log.Warn("router: data-plane token mismatch (log mode)", "sid", sid)
+		}
 	}
 	// CONNECT (raw TCP port-forward tunnel) cannot go through ReverseProxy; tunnel
 	// it explicitly to the node, carrying the authority + access token.
