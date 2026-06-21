@@ -50,6 +50,7 @@ func runRouter(args []string, log *slog.Logger) error {
 	// Sync the local route cache from the registry op watch (hot-path data plane,
 	// cluster.md §5; a cache miss falls back to op /route).
 	go rt.RunWatch(ctx)
+	go rt.RunCleanup(ctx) // evict expired auth-cache / stale build-map entries
 
 	ln, err := net.Listen("tcp", cfg.Router.Listen)
 	if err != nil {

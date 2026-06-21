@@ -10,6 +10,7 @@
 package router
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/binary"
@@ -24,6 +25,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	proxypkg "github.com/kuasar-sandbox/sandbox-orchestrator/internal/proxy"
 )
 
 // Headers the cluster ingress reads (cluster.md §1.4).
@@ -44,11 +47,22 @@ type reserveResult struct {
 }
 type routeResolve struct {
 	SID          string `json:"sid"`
+	Group        string `json:"group"`
+	RouteKey     string `json:"route_key"`
 	NodeID       string `json:"node_id"`
 	DataEndpoint string `json:"data_endpoint"`
 	AccessToken  string `json:"access_token"`
 	State        string `json:"state"`
 }
+
+// buildEntry maps a build to its node; RunCleanup evicts entries older than
+// buildTTL so the build map doesn't grow unboundedly over the ingress's life.
+type buildEntry struct {
+	node string
+	at   time.Time
+}
+
+const buildTTL = time.Hour
 
 // Router is the e2b unified ingress. It dials the registry op interface (UDS or
 // TCP) for reserve + route resolution.
@@ -60,7 +74,7 @@ type Router struct {
 	log         *slog.Logger
 
 	buildsMu sync.Mutex
-	builds   map[string]string // build_id -> node data endpoint (a build is node-bound)
+	builds   map[string]buildEntry // build_id -> node (a build is node-bound); TTL-evicted
 
 	cacheMu  sync.RWMutex
 	cache    map[string]*routeResolve // sid -> resolved data-plane target (local route cache, §5)
@@ -69,6 +83,11 @@ type Router struct {
 	authTTL time.Duration
 	authMu  sync.Mutex
 	authOK  map[string]time.Time // group\x00api_key -> cached-valid-until (§8)
+
+	fwdTransport *http.Transport // pooled transport for node (data/control/build) forwards
+
+	watchMu  sync.Mutex
+	watchRev int64 // last applied watch revision (for from_rev resume)
 }
 
 // New builds a Router. opAddr is the registry op endpoint: a path ("/run/...")
@@ -80,7 +99,7 @@ func New(opAddr, domain string, authTTL time.Duration, log *slog.Logger) *Router
 	}
 	rt := &Router{
 		domain: domain, log: log, authTTL: authTTL,
-		builds:   map[string]string{},
+		builds:   map[string]buildEntry{},
 		cache:    map[string]*routeResolve{},
 		keyToSID: map[string]string{},
 		authOK:   map[string]time.Time{},
@@ -99,6 +118,9 @@ func New(opAddr, domain string, authTTL time.Duration, log *slog.Logger) *Router
 	}
 	rt.opClient = &http.Client{Timeout: 60 * time.Second, Transport: transport}
 	rt.watchClient = &http.Client{Transport: transport} // no timeout: the watch is long-lived
+	// Pooled transport for node forwards: a higher per-host idle cap than the
+	// stdlib default of 2 avoids TCP/TLS churn to a busy node at high density.
+	rt.fwdTransport = &http.Transport{MaxIdleConns: 512, MaxIdleConnsPerHost: 64, IdleConnTimeout: 90 * time.Second}
 	return rt
 }
 
@@ -110,7 +132,7 @@ func (rt *Router) Handler() http.Handler {
 		if i := strings.IndexByte(host, ':'); i >= 0 {
 			host = host[:i]
 		}
-		if host == "api."+rt.domain || strings.HasPrefix(host, "api.") {
+		if host == "api."+rt.domain {
 			rt.serveControl(w, r)
 			return
 		}
@@ -149,8 +171,7 @@ func (rt *Router) handleCreate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, HeaderGroup+" required", http.StatusBadRequest)
 		return
 	}
-	if !rt.verifyAuth(r.Context(), group, r.Header.Get(HeaderAPIKey)) {
-		http.Error(w, "invalid api key for group", http.StatusForbidden)
+	if !rt.authorize(w, r.Context(), group, r.Header.Get(HeaderAPIKey)) {
 		return
 	}
 	routeKey := r.Header.Get(HeaderRouteKey)
@@ -182,8 +203,7 @@ func (rt *Router) handleBuildRegister(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, HeaderGroup+" required", http.StatusBadRequest)
 		return
 	}
-	if !rt.verifyAuth(r.Context(), group, r.Header.Get(HeaderAPIKey)) {
-		http.Error(w, "invalid api key for group", http.StatusForbidden)
+	if !rt.authorize(w, r.Context(), group, r.Header.Get(HeaderAPIKey)) {
 		return
 	}
 	res, err := rt.opReserveBuild(r.Context(), group)
@@ -200,13 +220,13 @@ func (rt *Router) handleBuildRegister(w http.ResponseWriter, r *http.Request) {
 func (rt *Router) handleBuildForward(w http.ResponseWriter, r *http.Request) {
 	bid := extractBuildID(r.URL.Path)
 	rt.buildsMu.Lock()
-	node := rt.builds[bid]
+	e, ok := rt.builds[bid]
 	rt.buildsMu.Unlock()
-	if node == "" {
+	if !ok {
 		http.Error(w, "unknown build "+bid, http.StatusNotFound)
 		return
 	}
-	rt.forwardBuild(w, r, node, false)
+	rt.forwardBuild(w, r, e.node, false)
 }
 
 // forwardBuild proxies a build control call to a node's e2b control plane (Host
@@ -215,11 +235,13 @@ func (rt *Router) handleBuildForward(w http.ResponseWriter, r *http.Request) {
 func (rt *Router) forwardBuild(w http.ResponseWriter, r *http.Request, dataEndpoint string, capture bool) {
 	target := &url.URL{Scheme: "http", Host: dataEndpoint}
 	proxy := httputil.NewSingleHostReverseProxy(target)
+	proxy.Transport = rt.fwdTransport
 	apiHost := "api." + rt.domain
 	proxy.Director = func(req *http.Request) {
 		req.URL.Scheme = "http"
 		req.URL.Host = dataEndpoint
 		req.Host = apiHost
+		req.Header.Del(HeaderAccessTok) // builds authorize via X-API-KEY, not a client token
 	}
 	if capture {
 		proxy.ModifyResponse = func(resp *http.Response) error {
@@ -230,7 +252,7 @@ func (rt *Router) forwardBuild(w http.ResponseWriter, r *http.Request, dataEndpo
 			}
 			if json.Unmarshal(body, &reg) == nil && reg.BuildID != "" {
 				rt.buildsMu.Lock()
-				rt.builds[reg.BuildID] = dataEndpoint
+				rt.builds[reg.BuildID] = buildEntry{node: dataEndpoint, at: time.Now()}
 				rt.buildsMu.Unlock()
 			}
 			return nil
@@ -268,12 +290,18 @@ func (rt *Router) handleSandboxVerb(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "cluster router: unsupported sandbox path", http.StatusNotImplemented)
 		return
 	}
-	endpoint := rt.resolveNode(r.Context(), sid)
-	if endpoint == "" {
+	rr := rt.resolveRoute(r.Context(), sid)
+	if rr == nil || rr.DataEndpoint == "" {
 		http.Error(w, "sandbox not found", http.StatusNotFound)
 		return
 	}
-	rt.forwardToNode(w, r, endpoint)
+	// Authenticate the caller against the sandbox's group before forwarding (the
+	// node re-authenticates too, but the ingress must not be an open relay / sid
+	// oracle — cluster-router.md §6/§8).
+	if !rt.authorize(w, r.Context(), rr.Group, r.Header.Get(HeaderAPIKey)) {
+		return
+	}
+	rt.forwardToNode(w, r, rr.DataEndpoint)
 }
 
 // handleList returns the group's sandbox shard (cluster-router.md §6: list is
@@ -284,8 +312,7 @@ func (rt *Router) handleList(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, HeaderGroup+" required", http.StatusBadRequest)
 		return
 	}
-	if !rt.verifyAuth(r.Context(), group, r.Header.Get(HeaderAPIKey)) {
-		http.Error(w, "invalid api key for group", http.StatusForbidden)
+	if !rt.authorize(w, r.Context(), group, r.Header.Get(HeaderAPIKey)) {
 		return
 	}
 	u := fmt.Sprintf("%s/op/list?group=%s", rt.opBase, url.QueryEscape(group))
@@ -304,16 +331,16 @@ func (rt *Router) handleList(w http.ResponseWriter, r *http.Request) {
 	_, _ = io.Copy(w, resp.Body)
 }
 
-// resolveNode finds a sandbox's node data endpoint via the route cache, falling
-// back to the op interface.
-func (rt *Router) resolveNode(ctx context.Context, sid string) string {
-	if rr := rt.cachedRoute(sid); rr != nil && rr.DataEndpoint != "" {
-		return rr.DataEndpoint
+// resolveRoute returns a sandbox's resolved route via the local cache, falling
+// back to the op interface; nil if unknown.
+func (rt *Router) resolveRoute(ctx context.Context, sid string) *routeResolve {
+	if rr := rt.cachedRoute(sid); rr != nil {
+		return rr
 	}
 	if rr, err := rt.opRoute(ctx, sid); err == nil {
-		return rr.DataEndpoint
+		return rr
 	}
-	return ""
+	return nil
 }
 
 // forwardToNode proxies a control request to a node's e2b control plane (Host
@@ -321,11 +348,13 @@ func (rt *Router) resolveNode(ctx context.Context, sid string) string {
 func (rt *Router) forwardToNode(w http.ResponseWriter, r *http.Request, dataEndpoint string) {
 	target := &url.URL{Scheme: "http", Host: dataEndpoint}
 	proxy := httputil.NewSingleHostReverseProxy(target)
+	proxy.Transport = rt.fwdTransport
 	apiHost := "api." + rt.domain
 	proxy.Director = func(req *http.Request) {
 		req.URL.Scheme = "http"
 		req.URL.Host = dataEndpoint
 		req.Host = apiHost
+		req.Header.Del(HeaderAccessTok) // control verbs authorize via X-API-KEY, not a client token
 	}
 	proxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, e error) {
 		rt.log.Warn("router: control forward", "node", dataEndpoint, "err", e)
@@ -373,26 +402,89 @@ func (rt *Router) serveData(w http.ResponseWriter, r *http.Request, host string)
 			return
 		}
 	}
+	// Not ready (paused / lagging): data-plane traffic wakes it via Reserve (§1.4),
+	// then forwards to the resumed node.
+	if (rr.State != "ready" || rr.DataEndpoint == "") && rr.Group != "" {
+		if res, err := rt.opReserve(r.Context(), rr.Group, rr.RouteKey); err == nil && res.DataEndpoint != "" {
+			rr = &routeResolve{SID: res.SID, Group: rr.Group, RouteKey: rr.RouteKey, NodeID: res.NodeID, DataEndpoint: res.DataEndpoint, AccessToken: res.AccessToken, State: "ready"}
+		}
+	}
 	if rr.State != "ready" || rr.DataEndpoint == "" {
 		http.Error(w, "sandbox not ready", http.StatusServiceUnavailable)
+		return
+	}
+	// CONNECT (raw TCP port-forward tunnel) cannot go through ReverseProxy; tunnel
+	// it explicitly to the node, carrying the authority + access token.
+	if r.Method == http.MethodConnect {
+		rt.tunnelData(w, r, rr)
 		return
 	}
 	// Two-hop forward: preserve the <port>-<sid>.<domain> Host (the node proxy
 	// resolves the sandbox from it) and inject the access token.
 	target := &url.URL{Scheme: "http", Host: rr.DataEndpoint}
 	proxy := httputil.NewSingleHostReverseProxy(target)
-	origHost := r.Host
+	proxy.Transport = rt.fwdTransport
+	origHost, tok := r.Host, rr.AccessToken
 	proxy.Director = func(req *http.Request) {
 		req.URL.Scheme = target.Scheme
 		req.URL.Host = target.Host
 		req.Host = origHost
-		req.Header.Set(HeaderAccessTok, rr.AccessToken)
+		req.Header.Set(HeaderAccessTok, tok)
 	}
 	proxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, e error) {
+		// A cached route that fails is likely stale (sandbox moved/gone): evict it so
+		// the next request re-resolves via the watch / op (§5 stale → fallback).
+		rt.evictRoute(sid)
 		rt.log.Warn("router: data forward", "sid", sid, "node", rr.NodeID, "err", e)
 		http.Error(w, "bad gateway", http.StatusBadGateway)
 	}
 	proxy.ServeHTTP(w, r)
+}
+
+// tunnelData chains a CONNECT to the node's data endpoint (the node tunnels onward
+// to the sandbox), carrying the <port>-<sid>.<domain> authority + access token,
+// then splices client <-> node (httputil.ReverseProxy can't tunnel CONNECT).
+func (rt *Router) tunnelData(w http.ResponseWriter, r *http.Request, rr *routeResolve) {
+	backend, err := (&net.Dialer{}).DialContext(r.Context(), "tcp", rr.DataEndpoint)
+	if err != nil {
+		http.Error(w, "node unreachable", http.StatusBadGateway)
+		return
+	}
+	hdr := "CONNECT " + r.Host + " HTTP/1.1\r\nHost: " + r.Host + "\r\n" + HeaderAccessTok + ": " + rr.AccessToken + "\r\n\r\n"
+	if _, err := io.WriteString(backend, hdr); err != nil {
+		backend.Close()
+		http.Error(w, "node unreachable", http.StatusBadGateway)
+		return
+	}
+	br := bufio.NewReader(backend)
+	resp, err := http.ReadResponse(br, &http.Request{Method: http.MethodConnect})
+	if err != nil || resp.StatusCode != http.StatusOK {
+		backend.Close()
+		code := http.StatusBadGateway
+		if err == nil {
+			code = resp.StatusCode
+		}
+		rt.evictRoute(rr.SID)
+		http.Error(w, "connect refused by node", code)
+		return
+	}
+	// br may hold tunnel bytes prefetched past the CONNECT response; read through it.
+	proxypkg.Tunnel(w, r, &bufConn{Conn: backend, r: br})
+}
+
+// bufConn reads from a bufio.Reader (which may hold bytes prefetched past the
+// CONNECT response) before the underlying conn.
+type bufConn struct {
+	net.Conn
+	r *bufio.Reader
+}
+
+func (c *bufConn) Read(p []byte) (int, error) { return c.r.Read(p) }
+
+func (rt *Router) evictRoute(sid string) {
+	rt.cacheMu.Lock()
+	delete(rt.cache, sid)
+	rt.cacheMu.Unlock()
 }
 
 // --- op client ---
@@ -534,38 +626,87 @@ func (rt *Router) watchOnce(ctx context.Context) error {
 }
 
 // verifyAuth checks an api key against a group via the op interface, caching a
-// valid result for authTTL (cluster-router.md §8) so the data/control path does
-// not re-verify per request. An empty key or group is rejected.
-func (rt *Router) verifyAuth(ctx context.Context, group, apiKey string) bool {
+// valid result for authTTL (cluster-router.md §8). It returns (ok, err): a
+// non-nil err means the op interface was unreachable (caller → 503); ok==false
+// with nil err means the key was rejected (caller → 403).
+func (rt *Router) verifyAuth(ctx context.Context, group, apiKey string) (bool, error) {
 	if group == "" || apiKey == "" {
-		return false
+		return false, nil
 	}
 	k := group + "\x00" + apiKey
 	rt.authMu.Lock()
 	if exp, ok := rt.authOK[k]; ok && time.Now().Before(exp) {
 		rt.authMu.Unlock()
-		return true
+		return true, nil
 	}
 	rt.authMu.Unlock()
 
 	u := fmt.Sprintf("%s/op/verify-key?group=%s", rt.opBase, url.QueryEscape(group))
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
-		return false
+		return false, err
 	}
 	req.Header.Set(HeaderAPIKey, apiKey) // api key in a header, never the query string (logged)
 	resp, err := rt.opClient.Do(req)
 	if err != nil {
-		return false
+		return false, err // op unreachable
 	}
 	resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
+	switch resp.StatusCode {
+	case http.StatusOK:
+		rt.authMu.Lock()
+		rt.authOK[k] = time.Now().Add(rt.authTTL)
+		rt.authMu.Unlock()
+		return true, nil
+	case http.StatusForbidden:
+		return false, nil // the registry rejected the key
+	default:
+		return false, fmt.Errorf("op verify-key: %s", resp.Status)
+	}
+}
+
+// authorize verifies (group, api_key) and writes the right error on failure: 503
+// when the op interface is unreachable (don't 403-storm on a transient blip), 403
+// when the key is rejected. Returns false on failure.
+func (rt *Router) authorize(w http.ResponseWriter, ctx context.Context, group, apiKey string) bool {
+	ok, err := rt.verifyAuth(ctx, group, apiKey)
+	if err != nil {
+		http.Error(w, "auth temporarily unavailable", http.StatusServiceUnavailable)
 		return false
 	}
-	rt.authMu.Lock()
-	rt.authOK[k] = time.Now().Add(rt.authTTL)
-	rt.authMu.Unlock()
+	if !ok {
+		http.Error(w, "invalid api key for group", http.StatusForbidden)
+		return false
+	}
 	return true
+}
+
+// RunCleanup periodically evicts expired auth-cache and stale build-map entries so
+// neither grows unboundedly over the ingress's lifetime; cluster-ctl router runs it.
+func (rt *Router) RunCleanup(ctx context.Context) {
+	t := time.NewTicker(time.Minute)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-t.C:
+			rt.authMu.Lock()
+			for k, exp := range rt.authOK {
+				if now.After(exp) {
+					delete(rt.authOK, k)
+				}
+			}
+			rt.authMu.Unlock()
+			rt.buildsMu.Lock()
+			for k, e := range rt.builds {
+				if now.Sub(e.at) > buildTTL {
+					delete(rt.builds, k)
+				}
+			}
+			rt.buildsMu.Unlock()
+		}
+	}
 }
 
 func readWatchFrame(r io.Reader) (*watchEvent, error) {

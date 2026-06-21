@@ -54,11 +54,14 @@ func TestSandboxVerbForward(t *testing.T) {
 	nodeHost := strings.TrimPrefix(node.URL, "http://")
 
 	op := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/op/route" {
-			_ = json.NewEncoder(w).Encode(routeResolve{SID: "sb-1", DataEndpoint: nodeHost, State: "ready"})
-			return
+		switch r.URL.Path {
+		case "/op/route":
+			_ = json.NewEncoder(w).Encode(routeResolve{SID: "sb-1", Group: "/g", DataEndpoint: nodeHost, State: "ready"})
+		case "/op/verify-key":
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusNotFound)
 		}
-		w.WriteHeader(http.StatusNotFound)
 	}))
 	defer op.Close()
 
@@ -68,6 +71,7 @@ func TestSandboxVerbForward(t *testing.T) {
 
 	req, _ := http.NewRequest(http.MethodDelete, srv.URL+"/sandboxes/sb-1", nil)
 	req.Host = "api.test.local"
+	req.Header.Set(HeaderAPIKey, "e2b_test")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
