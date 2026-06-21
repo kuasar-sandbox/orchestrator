@@ -33,21 +33,21 @@ func (o *Orchestrator) HandleCommand(ctx context.Context, cmd *routesync.Command
 			return reject(cmd, err)
 		}
 		go func() {
-			if _, err := o.bootCluster(context.Background(), cmd, manifestKey, tmpl); err != nil {
+			if _, err := o.bootCluster(o.asyncCtx(), cmd, manifestKey, tmpl); err != nil {
 				o.log.Error("cluster create", "sid", cmd.SID, "group", cmd.Group, "err", err)
 			}
 		}()
 		return accept(cmd)
 	case routesync.CmdConnect:
 		go func() {
-			if err := o.connectCluster(context.Background(), cmd.SID); err != nil {
+			if err := o.connectCluster(o.asyncCtx(), cmd.SID); err != nil {
 				o.log.Error("cluster connect", "sid", cmd.SID, "err", err)
 			}
 		}()
 		return accept(cmd)
 	case routesync.CmdDelete:
 		go func() {
-			if err := o.deleteCluster(context.Background(), cmd.SID); err != nil {
+			if err := o.deleteCluster(o.asyncCtx(), cmd.SID); err != nil {
 				o.log.Error("cluster delete", "sid", cmd.SID, "err", err)
 			}
 		}()
@@ -86,6 +86,18 @@ func (o *Orchestrator) Heartbeat() *routesync.Heartbeat {
 	count := len(o.reg)
 	o.mu.Unlock()
 	return &routesync.Heartbeat{Counts: count}
+}
+
+// SetClusterContext sets the lifetime for node-link async work (boots / resumes /
+// teardowns): serve passes its shutdown context so in-flight work is cancelled on
+// drain instead of leaking past it. Call before starting the node-link client.
+func (o *Orchestrator) SetClusterContext(ctx context.Context) { o.clusterCtx = ctx }
+
+func (o *Orchestrator) asyncCtx() context.Context {
+	if o.clusterCtx != nil {
+		return o.clusterCtx
+	}
+	return context.Background()
 }
 
 func accept(cmd *routesync.Command) *routesync.CmdAck {

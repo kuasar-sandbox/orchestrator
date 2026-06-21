@@ -170,6 +170,7 @@ func serve(args []string, log *slog.Logger) error {
 			}
 			clientTLS = ct
 		}
+		core.SetClusterContext(ctx) // node-link async work (boots) cancels on serve shutdown
 		nl := nodelink.New(
 			func(dctx context.Context) (net.Conn, error) {
 				return (&net.Dialer{}).DialContext(dctx, "tcp", regAddr)

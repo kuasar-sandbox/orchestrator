@@ -63,6 +63,8 @@ type Orchestrator struct {
 	pend   map[string]*pendingBuild // builds whose unit is running (BuildSpecFor source)
 
 	files *filestore.Store // COPY build-context object store; nil = unconfigured (COPY → 501)
+
+	clusterCtx context.Context // node-link async work lifetime (set by serve); nil = background
 }
 
 func New(cfg *config.Config, st *store.Store, lc launcher.Launcher, vs vsClient, log *slog.Logger) *Orchestrator {
