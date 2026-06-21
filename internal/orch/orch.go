@@ -389,11 +389,21 @@ func (o *Orchestrator) resume(ctx context.Context, sb *types.Sandbox) error {
 	// always observe a consistent snapshot and there is no field-level data race.
 	nb := *sb
 	nb.State = types.StateRunning
+	// Re-arm the running TTL: a resumed sandbox runs for timeout_sec more. Its stored
+	// deadline is from before the pause (already passed), so without this the reaper
+	// would immediately re-suspend it — also the case for a SAVED migrate's restore,
+	// whose token carries the original stale deadline.
+	if o.cfg.Sandbox.TimeoutSec > 0 {
+		nb.DeadlineUnix = time.Now().Add(time.Duration(o.cfg.Sandbox.TimeoutSec) * time.Second).Unix()
+	}
 	if err := o.launch(ctx, &nb, tmpl); err != nil {
 		return err
 	}
 	if err := o.st.SetState(ctx, nb.ID, types.StateRunning); err != nil {
 		return err
+	}
+	if o.cfg.Sandbox.TimeoutSec > 0 {
+		_ = o.st.SetDeadline(ctx, nb.ID, nb.DeadlineUnix)
 	}
 	o.publishUpsert(&nb) // unparks any proxy holding a request for this sandbox
 	return nil

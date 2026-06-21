@@ -31,6 +31,7 @@ func (o *Orchestrator) HandleCommand(ctx context.Context, cmd *routesync.Command
 	case routesync.CmdCreate:
 		manifestKey, tmpl, err := o.precheckCluster(ctx, cmd)
 		if err != nil {
+			o.log.Warn("cluster create rejected", "sid", cmd.SID, "migrate", cmd.MigrationToken != "", "err", err)
 			return reject(cmd, err)
 		}
 		go func() {
@@ -194,6 +195,7 @@ func (o *Orchestrator) bootCluster(ctx context.Context, cmd *routesync.Command, 
 // original sid + cluster metadata; the published running route satisfies the
 // Reserve (cluster.md §7.4 phase 2).
 func (o *Orchestrator) migrateCluster(ctx context.Context, cmd *routesync.Command, manifestKey string) (*types.Sandbox, error) {
+	o.log.Info("cluster migrate: import + restore", "sid", cmd.SID)
 	if _, err := o.importSandboxWithKey(ctx, manifestKey, cmd.MigrationToken); err != nil {
 		return nil, fmt.Errorf("cluster migrate: import: %w", err)
 	}
@@ -201,10 +203,12 @@ func (o *Orchestrator) migrateCluster(ctx context.Context, cmd *routesync.Comman
 	if err != nil || sb == nil {
 		return nil, fmt.Errorf("cluster migrate: imported sandbox %s missing", cmd.SID)
 	}
+	// resume publishes the running route (from its own updated copy); a second
+	// publishUpsert(sb) here would re-publish the stale paused sb and overwrite it.
 	if err := o.resume(ctx, sb); err != nil {
 		return nil, err
 	}
-	o.publishUpsert(sb)
+	o.log.Info("cluster migrate: restored to running", "sid", cmd.SID)
 	return sb, nil
 }
 
@@ -234,12 +238,14 @@ func (o *Orchestrator) connectCluster(ctx context.Context, sid string) error {
 }
 
 func (o *Orchestrator) deleteCluster(ctx context.Context, sid string) error {
+	saved := o.isSavedPending(sid)
 	defer o.clearSavedPending(sid) // a SAVED reclaim (or a kill) clears any saved-pending mark
 	apiKey, err := o.deriveSandboxAPIKey(ctx, sid)
 	if err != nil {
 		return err
 	}
-	_, err = o.Kill(ctx, sid, apiKey)
+	ok, err := o.Kill(ctx, sid, apiKey)
+	o.log.Info("cluster delete", "sid", sid, "reclaim", saved, "killed", ok, "err", err)
 	return err
 }
 
