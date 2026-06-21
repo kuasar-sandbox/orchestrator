@@ -59,6 +59,10 @@ listen——scaler 是纯调度器(订阅 + 被调建议方)。
 
 | 字段 | 默认 | 说明 |
 |---|---|---|
+| `scaler.mode` | `inprocess` | 放置部署形态:`inprocess`(registry 进程内)/ `remote`(独立 scaler 进程经 op,§5)|
+| `scaler.endpoint` | 空 | `mode=remote`:registry 调用 scaler `/scaler/place` 的地址 |
+| `scaler.listen` | 空 | `mode=remote`:scaler `/scaler/place` 的监听地址 |
+| `scaler.tls` | 空 | `mode=remote`:registry ↔ scaler 放置跳的 mTLS |
 | `scaler.place_candidates` | `2` | P2C 抽样候选数(§4.2) |
 | `scaler.zone_admit_max` | `yellow` | 放置水位区上限(red 排除);**当前放置尚未消费**(§4.2 负载信号) |
 | `scaler.shuffle_sharding` | 空 | shuffle-sharding 规则列表(§4.4);空 = 仅用静态 nodeSelectors |

@@ -110,12 +110,13 @@ router 为运行守护进程,router 经 UDS / mTLS 连 registry;大规模可把�
 cluster-ctl registry [--config …] [--store sqlite:/var/lib/cluster/registry.db]
                      [--channel-listen :7700] [--op-listen /run/cluster/registry.sock]
 cluster-ctl router   [--config …] [--registry <addr>] [--listen :443] [--tls-cert/--tls-key]
-cluster-ctl scaler   [--config …] [--registry <addr>]
+cluster-ctl scaler   [--config …] [--registry <addr>] [--listen <addr>]   # scaler.mode=remote
 ```
 
 registry(持久)与 router 为运行守护进程,router 经 `--registry`(UDS 本机 / mTLS 远端)连 registry
-的 op-listen(§4.2)。**放置(scaler 角色)当前在 registry 进程内**——registry 直接持有放置器并调用
-(§7.5);`cluster-ctl scaler` 仅打印其放置配置,独立 scaler 进程是大规模拆分形态(§4.2 右列)。
+的 op-listen(§4.2)。放置默认在 registry 进程内(`scaler.mode=inprocess`,registry 直接持有放置器,
+§7.5);`scaler.mode=remote` 时 `cluster-ctl scaler` 为独立进程,订阅 op 的节点 / group 视图并服务
+`/scaler/place`,registry 经 remotePlacer 调用(§4.2 右列)。
 
 ## 3. 配置
 
@@ -129,12 +130,14 @@ registry(持久)与 router 为运行守护进程,router 经 `--registry`(UDS 本
 | `store.dsn` | `/var/lib/cluster/registry.db` | sqlite 路径 / etcd 端点 / raft 配置 |
 | `group_config.providers` | `store` | 细粒度 provider 选择(§6.2):每个接口(key / sandbox-config / placement)可 `store` 或 `external:<addr>` |
 | `group_config.encryption_key` | 空 | `store` 自存 manifest_key 时的 AES-256 落盘密钥(同 node.md §3,可 env 覆盖);全 `external` 时不需 |
+| `group_config.tls` | 空 | `external:<addr>` provider 的 mTLS(§6.2)|
 | `channel.listen` | `:7700` | 节点拨入的统一通道监听(§5);registry 持有 |
 | `channel.tls` | 空 | 通道 mTLS 证书 / CA(生产必配,§5.4) |
 | `channel.heartbeat_interval` | `10s` | 下发心跳周期 |
 | `channel.node_dead_after` | `30s` | 连续未收心跳判失联(§11) |
 | `channel.revision_retention` | `10000` | 每分片保留的变更日志条数,供断线增量重放(§5.3);超出则客户端全量重同步 |
-| `op.listen` | `/run/cluster/registry.sock` | 异步 op / watch 监听(UDS 本机;跨机拆分的 op-mTLS 见 §10)|
+| `op.listen` | `/run/cluster/registry.sock` | 异步 op / watch 监听(UDS 本机 / 跨机 TCP)|
+| `op.tls` | 空 | op 接口 mTLS(`op.listen` 为 TCP 跨机时;UDS 本机免,§5.4)|
 | `reserve.park_timeout` | `30s` | `Reserve` 等待 READY 的预算上限(§7);超时回错由 router 转 503 |
 
 ## 4. 架构与角色
