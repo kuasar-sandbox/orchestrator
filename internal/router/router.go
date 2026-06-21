@@ -86,6 +86,8 @@ type Router struct {
 	authOK  map[string]time.Time // group\x00api_key -> cached-valid-until (§8)
 
 	fwdTransport *http.Transport // pooled transport for node (data/control/build) forwards
+
+	watchRev int64 // last applied watch revision (resume point); only the watch loop touches it
 }
 
 // New builds a Router. opAddr is the registry op endpoint: a path ("/run/...")
@@ -585,7 +587,8 @@ func (rt *Router) RunWatch(ctx context.Context) {
 }
 
 func (rt *Router) watchOnce(ctx context.Context) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rt.opBase+"/op/watch", nil)
+	u := fmt.Sprintf("%s/op/watch?from_rev=%d", rt.opBase, rt.watchRev)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return err
 	}
@@ -597,29 +600,35 @@ func (rt *Router) watchOnce(ctx context.Context) error {
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("op watch: %s", resp.Status)
 	}
-	// Accumulate the snapshot, swap it in atomically at the bookmark, then apply
-	// live deltas to the live cache (so the data plane never sees a half-built set).
-	snap := map[string]*routeResolve{}
-	snapKey := map[string]string{}
-	syncing := true
+	// A "reset" frame starts a full snapshot (first connect, or a compacted resume):
+	// accumulate into a shadow map and swap it in atomically at the bookmark, so the
+	// data plane never sees a half-built set. A resume (no reset) applies deltas to
+	// the live cache, keeping it. watchRev only advances once live (post-bookmark),
+	// so a snapshot interrupted before its bookmark re-snapshots on reconnect.
+	var snap map[string]*routeResolve
+	var snapKey map[string]string
+	syncing := false
 	for {
 		ev, err := readWatchFrame(resp.Body)
 		if err != nil {
 			return err
 		}
 		switch ev.Type {
+		case "reset":
+			snap = map[string]*routeResolve{}
+			snapKey = map[string]string{}
+			syncing = true
 		case "put":
-			if ev.Route == nil {
-				continue
-			}
-			if syncing {
-				snap[ev.Route.SID] = ev.Route
-				snapKey[ev.Key] = ev.Route.SID
-			} else {
-				rt.cacheMu.Lock()
-				rt.cache[ev.Route.SID] = ev.Route
-				rt.keyToSID[ev.Key] = ev.Route.SID
-				rt.cacheMu.Unlock()
+			if ev.Route != nil {
+				if syncing {
+					snap[ev.Route.SID] = ev.Route
+					snapKey[ev.Key] = ev.Route.SID
+				} else {
+					rt.cacheMu.Lock()
+					rt.cache[ev.Route.SID] = ev.Route
+					rt.keyToSID[ev.Key] = ev.Route.SID
+					rt.cacheMu.Unlock()
+				}
 			}
 		case "delete":
 			if !syncing {
@@ -631,10 +640,17 @@ func (rt *Router) watchOnce(ctx context.Context) error {
 				rt.cacheMu.Unlock()
 			}
 		case "bookmark":
-			rt.cacheMu.Lock()
-			rt.cache, rt.keyToSID = snap, snapKey
-			rt.cacheMu.Unlock()
-			syncing = false
+			if syncing {
+				rt.cacheMu.Lock()
+				rt.cache, rt.keyToSID = snap, snapKey
+				rt.cacheMu.Unlock()
+				syncing = false
+			}
+		}
+		// Advance the resume point only for frames applied to the live cache (the
+		// bookmark above flips syncing off first, so its rev is recorded too).
+		if !syncing && ev.Rev > rt.watchRev {
+			rt.watchRev = ev.Rev
 		}
 	}
 }

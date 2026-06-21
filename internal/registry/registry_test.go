@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -232,17 +233,31 @@ func TestOpWatch(t *testing.T) {
 	}
 	defer resp.Body.Close()
 
-	// Snapshot: one put (sb-1, resolved to its node's data endpoint) + a bookmark.
+	// Snapshot: a reset, one put (sb-1, resolved to its node's data endpoint), a bookmark.
+	if rs := readWatchFrame(t, resp.Body); rs.Type != "reset" {
+		t.Fatalf("expected reset, got %+v", rs)
+	}
 	if put := readWatchFrame(t, resp.Body); put.Type != "put" || put.Route == nil || put.Route.SID != "sb-1" || put.Route.DataEndpoint != "10.0.0.1:8443" {
 		t.Fatalf("snapshot put: %+v", put)
 	}
-	if bm := readWatchFrame(t, resp.Body); bm.Type != "bookmark" {
+	bm := readWatchFrame(t, resp.Body)
+	if bm.Type != "bookmark" {
 		t.Fatalf("expected bookmark, got %+v", bm)
 	}
 	// Live delta: a new sandbox shows up as a put.
 	reg.stores.PutSandbox(ctx, &SandboxRecord{Group: "/g", RouteKey: "rk2", SID: "sb-2", State: StateReady, NodeID: "n1", AccessToken: "t2"})
 	if d := readWatchFrame(t, resp.Body); d.Type != "put" || d.Route == nil || d.Route.SID != "sb-2" {
 		t.Fatalf("delta put: %+v", d)
+	}
+
+	// Resume from the bookmark rev: deltas only, NO reset/snapshot (incremental sync).
+	resp2, err := http.Get(fmt.Sprintf("%s/op/watch?from_rev=%d", srv.URL, bm.Rev))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp2.Body.Close()
+	if d := readWatchFrame(t, resp2.Body); d.Type == "reset" || d.Type == "bookmark" {
+		t.Fatalf("resume should replay deltas, not re-snapshot; got %+v", d)
 	}
 }
 

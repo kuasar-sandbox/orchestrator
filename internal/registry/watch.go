@@ -12,15 +12,16 @@ import (
 )
 
 // OpWatchPath streams resolved sandbox route changes to the router's local cache
-// (cluster.md §5.2/§5.3): GET ?from_rev=N. from_rev<=0 → a snapshot (every current
-// route as a put) + a bookmark + live deltas; from_rev>0 → replay the change-log
-// strictly after N (or, if compacted, fall back to a snapshot), then live deltas.
+// (cluster.md §5.2/§5.3): GET ?from_rev=N. from_rev<=0 (or a compacted from_rev>0)
+// → a reset + a snapshot (every current route as a put) + a bookmark + live deltas;
+// a live from_rev>0 → replay the change-log strictly after N (no reset/snapshot),
+// then live deltas. The reset tells the subscriber to rebuild vs keep its cache.
 // Frames are length-prefixed JSON ([4B LE len][WatchEvent]).
 const OpWatchPath = "/op/watch"
 
 // WatchEvent is one frame on the watch stream.
 type WatchEvent struct {
-	Type  string        `json:"type"` // "put" | "delete" | "bookmark"
+	Type  string        `json:"type"` // "reset" | "put" | "delete" | "bookmark"
 	Key   string        `json:"key,omitempty"`
 	Route *RouteResolve `json:"route,omitempty"` // put: the resolved data-plane target (incl sid)
 	Rev   int64         `json:"rev,omitempty"`
@@ -61,6 +62,12 @@ func (r *Registry) serveWatch(w http.ResponseWriter, req *http.Request) {
 	ch, err := r.stores.kv.Watch(ctx, sandboxPrefix, rev0)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	// A snapshot follows: tell the subscriber to discard its cache and rebuild from
+	// the puts up to the bookmark. A resume (the from_rev>0 path above) sends no
+	// reset, so the subscriber keeps its cache and applies the deltas live.
+	if err := writeWatchFrame(w, &WatchEvent{Type: "reset", Rev: rev0}); err != nil {
 		return
 	}
 	// Preload node endpoints once: a GetNode per snapshot row would be O(N) sqlite
