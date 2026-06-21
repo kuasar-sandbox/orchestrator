@@ -38,7 +38,9 @@ type Placement struct {
 // "no such group"; err!=nil is "provider unavailable" (callers map it to 503, not
 // a 403/404, so a provider blip doesn't masquerade as a missing group).
 type (
-	KeyProvider           interface{ Key(ctx context.Context, group string) (Key, bool, error) }
+	KeyProvider interface {
+		Key(ctx context.Context, group string) (Key, bool, error)
+	}
 	SandboxConfigProvider interface {
 		SandboxConfig(ctx context.Context, group string) (SandboxConfig, bool, error)
 	}
