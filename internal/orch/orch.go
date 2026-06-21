@@ -64,15 +64,19 @@ type Orchestrator struct {
 
 	files *filestore.Store // COPY build-context object store; nil = unconfigured (COPY → 501)
 
+	savedMu      sync.Mutex
+	savedPending map[string]string // sid -> migration token (PAUSED->SAVED promote in flight, §7.4)
+
 	clusterCtx context.Context // node-link async work lifetime (set by serve); nil = background
 }
 
 func New(cfg *config.Config, st *store.Store, lc launcher.Launcher, vs vsClient, log *slog.Logger) *Orchestrator {
 	o := &Orchestrator{
 		cfg: cfg, st: st, lc: lc, vs: vs, log: log,
-		reg:  map[string]*types.Sandbox{},
-		subs: map[int]chan routesync.Event{},
-		pend: map[string]*pendingBuild{},
+		reg:          map[string]*types.Sandbox{},
+		subs:         map[int]chan routesync.Event{},
+		pend:         map[string]*pendingBuild{},
+		savedPending: map[string]string{},
 	}
 	if fc := cfg.Builder.FilesStorage; fc != nil {
 		fs, err := filestore.New(fc)
@@ -291,6 +295,13 @@ func (o *Orchestrator) pauseSandbox(ctx context.Context, sb *types.Sandbox) erro
 	sb.State = types.StatePaused
 	_ = o.st.SetSnapshotRef(ctx, sb.ID, ref)
 	_ = o.st.SetState(ctx, sb.ID, types.StatePaused)
+	// Cluster deep-idle clock (§7.4): re-arm DeadlineUnix as the post-pause idle
+	// deadline so the reaper promotes this to SAVED after deep_idle_sec (opt-in).
+	if o.cfg.Cluster.Registry != "" && o.cfg.Checkpoint.DeepIdleSec > 0 {
+		d := time.Now().Unix() + int64(o.cfg.Checkpoint.DeepIdleSec)
+		sb.DeadlineUnix = d
+		_ = o.st.SetDeadline(ctx, sb.ID, d)
+	}
 	o.cache(sb)
 	_ = o.lc.Stop(ctx, o.runnerUnit(sb.ID))
 	_ = o.lc.ResetFailed(ctx, o.runnerUnit(sb.ID))
@@ -622,6 +633,7 @@ func (o *Orchestrator) Reaper(ctx context.Context, interval time.Duration) {
 					o.log.Warn("reaper pause", "sid", sb.ID, "err", err)
 				}
 			}
+			o.reapDeepIdle(ctx, now) // PAUSED deep-idle -> SAVED (cluster, opt-in; §7.4)
 			if n, err := o.st.PruneExpiredManifestKeys(ctx); err != nil {
 				o.log.Warn("reaper prune manifest keys", "err", err)
 			} else if n > 0 {

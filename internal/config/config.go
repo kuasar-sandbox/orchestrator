@@ -303,8 +303,9 @@ func (f *FilesStorageConfig) PresignExpiryDur() time.Duration {
 // manifest store (mode=remote; portable = a template). A local checkpoint is
 // promoted to remote on demand via `node-ctl export-sandbox`.
 type CheckpointConfig struct {
-	Mode     string `yaml:"mode"`      // local (default) | remote
-	LocalDir string `yaml:"local_dir"` // local checkpoint files dir (mode=local); default /var/lib/sandbox-saved
+	Mode        string `yaml:"mode"`          // local (default) | remote
+	LocalDir    string `yaml:"local_dir"`     // local checkpoint files dir (mode=local); default /var/lib/sandbox-saved
+	DeepIdleSec int    `yaml:"deep_idle_sec"` // PAUSED -> SAVED promote after this idle (cluster; cluster.md §7.4); 0 = off
 }
 
 // Load reads the config file and applies defaults.

@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/apikey"
@@ -233,6 +234,7 @@ func (o *Orchestrator) connectCluster(ctx context.Context, sid string) error {
 }
 
 func (o *Orchestrator) deleteCluster(ctx context.Context, sid string) error {
+	defer o.clearSavedPending(sid) // a SAVED reclaim (or a kill) clears any saved-pending mark
 	apiKey, err := o.deriveSandboxAPIKey(ctx, sid)
 	if err != nil {
 		return err
@@ -274,4 +276,68 @@ func (o *Orchestrator) dropClusterKey(ctx context.Context, fingerprint string) e
 	}
 	o.log.Debug("cluster key_drop", "fp", fingerprint, "removed", len(keys))
 	return nil
+}
+
+// reapDeepIdle promotes deep-idle PAUSED sandboxes to SAVED (cluster.md §7.4),
+// cluster-only and opt-in (checkpoint.deep_idle_sec > 0). DeadlineUnix doubles as
+// the post-pause idle clock (pauseSandbox sets it on pause). Called by the Reaper.
+func (o *Orchestrator) reapDeepIdle(ctx context.Context, now int64) {
+	if o.cfg.Cluster.Registry == "" || o.cfg.Checkpoint.DeepIdleSec <= 0 {
+		return
+	}
+	var idle []*types.Sandbox
+	_ = o.st.RangeByState(ctx, types.StatePaused, func(sb *types.Sandbox) error {
+		if sb.DeadlineUnix > 0 && now >= sb.DeadlineUnix && !o.isSavedPending(sb.ID) {
+			idle = append(idle, sb)
+		}
+		return nil
+	})
+	for _, sb := range idle {
+		if err := o.promoteToSaved(ctx, sb); err != nil {
+			o.log.Warn("reaper promote-saved", "sid", sb.ID, "err", err)
+		}
+	}
+}
+
+// promoteToSaved promotes a deep-idle PAUSED sandbox to SAVED (cluster.md §7.4):
+// ensure its snapshot is remote (portable), mint a migration token, and mark it
+// saved-pending so its route reports `saved` — the registry then stores the token,
+// unbinds the node, and tells this node to reclaim the local copy.
+func (o *Orchestrator) promoteToSaved(ctx context.Context, sb *types.Sandbox) error {
+	if sb.SnapshotRef == "" {
+		return fmt.Errorf("promote-saved: %s has no snapshot", sb.ID)
+	}
+	ref := sb.SnapshotRef
+	if !strings.HasPrefix(ref, "manifest://") {
+		mref, err := o.promote(ctx, sb, ref) // upload the local bundle -> remote manifest
+		if err != nil {
+			return err
+		}
+		_ = o.st.SetSnapshotRef(ctx, sb.ID, mref)
+		sb.SnapshotRef, ref = mref, mref
+	}
+	tok, err := o.mintSandboxToken(sb, ref)
+	if err != nil {
+		return err
+	}
+	o.savedMu.Lock()
+	o.savedPending[sb.ID] = tok
+	o.savedMu.Unlock()
+	o.publishUpsert(sb) // routeEntry now reports `saved` + the token (re-emitted on reconnect)
+	o.log.Info("promoted sandbox to SAVED", "sid", sb.ID)
+	return nil
+}
+
+func (o *Orchestrator) isSavedPending(sid string) bool { return o.savedToken(sid) != "" }
+
+func (o *Orchestrator) savedToken(sid string) string {
+	o.savedMu.Lock()
+	defer o.savedMu.Unlock()
+	return o.savedPending[sid]
+}
+
+func (o *Orchestrator) clearSavedPending(sid string) {
+	o.savedMu.Lock()
+	delete(o.savedPending, sid)
+	o.savedMu.Unlock()
 }

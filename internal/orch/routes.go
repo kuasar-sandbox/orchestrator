@@ -21,7 +21,7 @@ import (
 // routeEntry projects a sandbox into the wire route entry pushed to proxies. The
 // MMDS secret is derived deterministically (so every proxy worker agrees) and is
 // carried on every entry — subscribers that don't serve MMDS simply ignore it.
-func routeEntry(sb *types.Sandbox) routesync.RouteEntry {
+func (o *Orchestrator) routeEntry(sb *types.Sandbox) routesync.RouteEntry {
 	e := routesync.RouteEntry{
 		SandboxID:        sb.ID,
 		Profile:          string(sb.Profile()),
@@ -44,6 +44,13 @@ func routeEntry(sb *types.Sandbox) routesync.RouteEntry {
 		if json.Unmarshal([]byte(cm), &c) == nil {
 			e.Group, e.RouteKey = c.Group, c.RouteKey
 		}
+	}
+	// Deep-idle promote in flight (§7.4): report `saved` + the migration token
+	// instead of `paused`, so the registry stores the token, unbinds the node, and
+	// tells this node to reclaim the local copy (re-emitted on a node-link reconnect).
+	if tok := o.savedToken(sb.ID); tok != "" {
+		e.State = routesync.StateSaved
+		e.MigrationToken = tok
 	}
 	return e
 }
@@ -70,7 +77,7 @@ func snapshotLocation(ref string) string {
 func (o *Orchestrator) Range(ctx context.Context, fn func(routesync.RouteEntry) error) error {
 	for _, st := range []types.State{types.StateRunning, types.StatePaused} {
 		if err := o.st.RangeByState(ctx, st, func(sb *types.Sandbox) error {
-			return fn(routeEntry(sb))
+			return fn(o.routeEntry(sb))
 		}); err != nil {
 			return err
 		}
@@ -137,7 +144,7 @@ func (o *Orchestrator) Policy() routesync.Policy {
 // --- publish ---
 
 func (o *Orchestrator) publishUpsert(sb *types.Sandbox) {
-	o.publish(routesync.Event{Kind: routesync.TypeUpsert, Route: routeEntry(sb)})
+	o.publish(routesync.Event{Kind: routesync.TypeUpsert, Route: o.routeEntry(sb)})
 }
 
 func (o *Orchestrator) publishDelete(sid string) {
