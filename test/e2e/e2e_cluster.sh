@@ -11,7 +11,10 @@
 #
 # It reuses e2e_execute's store/zot/vswitch/build setup to produce a real template,
 # then drives a sandbox THROUGH the cluster (router -> registry -> node-link ->
-# CreateCluster -> cloud-hypervisor) and checks the two-hop data path to envd.
+# CreateCluster -> cloud-hypervisor) and checks the two-hop data path to envd. The
+# op interface runs over mTLS, placement via a standalone scaler (scaler.mode=
+# remote), and it exercises the SAVED two-phase migration (deep-idle promote ->
+# Reserve(token) -> import+restore).
 #
 # Needs systemd+root, /dev/kvm, the vswitch stack, store-ctl, zot, docker,
 # mkfs.erofs, the kernel + runtimes in bin (same as e2e_execute). Missing -> exit 0.
@@ -66,7 +69,20 @@ wait_port() { for _ in $(seq 1 60); do (exec 3<>"/dev/tcp/$1/$2") 2>/dev/null &&
 PORT="$(free_port)"           # node-ctl serve (e2b API + data plane)
 REG_PORT="$(free_port)"       # cluster-ctl registry node-link
 ROUTER_PORT="$(free_port)"    # cluster-ctl router ingress
-OP_SOCK="$WORK/cluster/registry.sock"
+OP_PORT="$(free_port)"        # cluster-ctl registry op interface (TCP, mTLS)
+OP_LISTEN="127.0.0.1:$OP_PORT"
+SCALER_SOCK="$WORK/cluster/scaler.sock" # standalone scaler /scaler/place (scaler.mode=remote)
+command -v openssl >/dev/null 2>&1 || skip "openssl not on PATH (op-mTLS)"
+# One self-signed cert (its own CA; SAN 127.0.0.1; server+client EKU) for op mTLS:
+# the registry presents it (server side), the router/scaler/curl present it (client
+# side), and everyone trusts it as the CA — so a single cert exercises mutual auth.
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
+    -keyout "$WORK/cluster/op.key" -out "$WORK/cluster/op.pem" -days 1 \
+    -subj "/CN=127.0.0.1" -addext "subjectAltName=IP:127.0.0.1" \
+    -addext "extendedKeyUsage=serverAuth,clientAuth" >"$WORK/openssl.log" 2>&1 || { cat "$WORK/openssl.log"; fail "openssl gen op cert"; }
+OP_CERT="$WORK/cluster/op.pem"; OP_KEY="$WORK/cluster/op.key"
+# op query helper (mTLS over TCP, HTTP/1.1).
+opcurl() { curl -sS --noproxy '*' --cacert "$OP_CERT" --cert "$OP_CERT" --key "$OP_KEY" "$@"; }
 
 # node-ctl e2b request helper (build a template via the node's own API).
 req() {
@@ -142,7 +158,10 @@ domain: $DOMAIN
 store: { kind: sqlite, dsn: $WORK/cluster/registry.db }
 group_config: { encryption_key: "$ENC2" }
 channel: { listen: 127.0.0.1:$REG_PORT, heartbeat_interval: 2s, node_dead_after: 6s }
-op: { listen: $OP_SOCK }
+op:
+  listen: $OP_LISTEN
+  tls: { cert: $OP_CERT, key: $OP_KEY, ca: $OP_CERT }
+scaler: { mode: remote, endpoint: $SCALER_SOCK, listen: $SCALER_SOCK, registry: $OP_LISTEN }
 reserve: { park_timeout: 90s }
 router: { listen: 127.0.0.1:$ROUTER_PORT, data_plane_auth: off }
 EOF
@@ -165,7 +184,7 @@ builder:
   diff_template: $BLD
   vcpu: 1
   memory: 1GiB
-checkpoint: { mode: remote }
+checkpoint: { mode: remote, deep_idle_sec: 3 }
 EOF
 "$BIN/node-ctl" serve --config "$WORK/config.yaml" >"$WORK/orch.log" 2>&1 &
 NODE_PID=$!; PIDS+=($NODE_PID)
@@ -185,10 +204,21 @@ GROUP="/cell/proj/app/g1"
 echo "==> seeded group $GROUP (manifest key; template set after the cluster build)"
 "$BIN/cluster-ctl" registry --config "$WORK/cluster.yaml" >"$WORK/registry.log" 2>&1 &
 PIDS+=($!); wait_port 127.0.0.1 "$REG_PORT" registry
-echo "==> cluster-ctl registry up (node-link :$REG_PORT, op $OP_SOCK)"
+echo "==> cluster-ctl registry up (node-link :$REG_PORT, op $OP_LISTEN mTLS)"
 for _ in $(seq 1 30); do grep -q "node connected" "$WORK/registry.log" && break; sleep 0.5; done
 grep -q "node connected" "$WORK/registry.log" || { sed 's/^/  reg| /' "$WORK/registry.log"; fail "node never joined the cluster over node-link"; }
 echo "==> PASS: node joined the cluster (registry saw the node-link connection)"
+"$BIN/cluster-ctl" scaler --config "$WORK/cluster.yaml" >"$WORK/scaler.log" 2>&1 &
+PIDS+=($!)
+# Standalone scaler (scaler.mode=remote): it subscribes the registry's op node/group
+# view (over mTLS) and answers placement on its UDS — wait until its view syncs.
+for _ in $(seq 1 60); do
+    sc=$(curl -sS --noproxy '*' --unix-socket "$SCALER_SOCK" -o /dev/null -w '%{http_code}' -X POST "http://scaler/scaler/place?group=$GROUP&route_key=probe" 2>/dev/null || echo 000)
+    [ "$sc" = "200" ] && break
+    sleep 0.5
+done
+[ "$sc" = "200" ] || { sed 's/^/  scaler| /' "$WORK/scaler.log" | tail -15; fail "standalone scaler view not ready (place probe=$sc)"; }
+echo "==> PASS: standalone scaler (mode=remote) ready — placement served over the op view (mTLS)"
 "$BIN/cluster-ctl" router --config "$WORK/cluster.yaml" >"$WORK/router.log" 2>&1 &
 PIDS+=($!); wait_port 127.0.0.1 "$ROUTER_PORT" router
 echo "==> cluster-ctl router up (:$ROUTER_PORT)"
@@ -221,7 +251,7 @@ done
 echo "==> PASS: cluster build produced $TEMPLATE (router -> reserve-build -> node build sandbox)"
 
 # ---- point the group at the freshly built template (registry in-process) ----
-code=$(curl -sS --noproxy '*' --unix-socket "$OP_SOCK" -o /dev/null -w '%{http_code}' -X POST "http://op/op/group?group=$GROUP&template_ref=$TEMPLATE")
+code=$(opcurl -o /dev/null -w '%{http_code}' -X POST "https://$OP_LISTEN/op/group?group=$GROUP&template_ref=$TEMPLATE")
 [ "$code" = "204" ] || fail "op /op/group set template_ref (http $code)"
 echo "==> group $GROUP -> $TEMPLATE (via registry op)"
 
@@ -249,7 +279,7 @@ bad=$(curl -sS --noproxy '*' -o /dev/null -w '%{http_code}' -X POST -H "Host: ap
 [ "$bad" = "403" ] && echo "==> PASS: router rejected a bad api key (403, §8 auth cache)" || fail "router auth: bad key got $bad (want 403)"
 
 # ---- the registry knows the route is ready ---------------------------------
-curl -sS --noproxy '*' --unix-socket "$OP_SOCK" -o "$WORK/route.body" "http://op/op/route?sid=$SID" || fail "op route query"
+opcurl -o "$WORK/route.body" "https://$OP_LISTEN/op/route?sid=$SID" || fail "op route query"
 grep -q '"state":"ready"' "$WORK/route.body" || { cat "$WORK/route.body"; fail "registry route not ready for $SID"; }
 echo "==> PASS: registry resolves $SID -> node ready (op /route)"
 
@@ -265,16 +295,42 @@ esac
 gcode=$(curl -sS --noproxy '*' -o /dev/null -w '%{http_code}' -H "Host: api.$DOMAIN" -H "X-API-KEY: $AK" -H "X-Kuasar-Sandbox-Group: $GROUP" "http://127.0.0.1:$ROUTER_PORT/sandboxes/$SID")
 [ "$gcode" = "200" ] && echo "==> PASS: control verb GET /sandboxes/$SID forwarded to the node (http 200)" || { sed 's/^/  router| /' "$WORK/router.log" | tail -10; fail "control-verb forward GET=$gcode (want 200)"; }
 
+# ---- SAVED two-phase migration (§7.4): pause -> deep-idle promote -> migrate ----
+pcode=$(rreq POST "/sandboxes/$SID/pause")
+case "$pcode" in 200|204) ;; *) sed 's/^/  router| /' "$WORK/router.log" | tail -8; fail "pause $SID = $pcode";; esac
+# checkpoint.deep_idle_sec=3 + the node reaper promote the paused sandbox to SAVED:
+# the node uploads a remote snapshot, mints a migration token, reports `saved`; the
+# registry stores it node-unbound and tells the node to reclaim its local copy.
+saved=0
+for _ in $(seq 1 30); do
+    opcurl -o "$WORK/saved.body" "https://$OP_LISTEN/op/route?sid=$SID" 2>/dev/null
+    grep -q '"state":"saved"' "$WORK/saved.body" 2>/dev/null && { saved=1; break; }
+    sleep 1
+done
+[ "$saved" = "1" ] || { cat "$WORK/saved.body" 2>/dev/null; sed 's/^/  orch| /' "$WORK/orch.log" | tail -15; fail "sandbox $SID never promoted to SAVED"; }
+echo "==> PASS: deep-idle PAUSED sandbox promoted to SAVED (node-unbound + migration token)"
+# Migrate: a data-plane request to the SAVED sid triggers Reserve(SAVED) -> create
+# {migration_token} -> import + restore on a node, preserving the sid.
+curl -sS --noproxy '*' -o /dev/null --max-time 90 -H "Host: 49983-$SID.$DOMAIN" "http://127.0.0.1:$ROUTER_PORT/health" 2>/dev/null || true
+ready=0
+for _ in $(seq 1 30); do
+    opcurl -o "$WORK/mig.body" "https://$OP_LISTEN/op/route?sid=$SID" 2>/dev/null
+    grep -q '"state":"ready"' "$WORK/mig.body" 2>/dev/null && { ready=1; break; }
+    sleep 1
+done
+[ "$ready" = "1" ] || { cat "$WORK/mig.body" 2>/dev/null; sed 's/^/  orch| /' "$WORK/orch.log" | tail -20; fail "SAVED sandbox $SID did not migrate back to ready"; }
+echo "==> PASS: SAVED sandbox migrated back via Reserve(token) -> import+restore (op/route ready)"
+
 # ---- dead-node sweep: kill node-ctl; the registry reaps its sandbox (§11) ----
 echo "==> killing node-ctl (pid $NODE_PID); expecting the registry to sweep $SID after node_dead_after (6s)"
 kill -9 "$NODE_PID" 2>/dev/null
 swept=0
 for _ in $(seq 1 20); do
-    code=$(curl -sS --noproxy '*' --unix-socket "$OP_SOCK" -o /dev/null -w '%{http_code}' "http://op/op/route?sid=$SID" 2>/dev/null || echo 000)
+    code=$(opcurl -o /dev/null -w '%{http_code}' "https://$OP_LISTEN/op/route?sid=$SID" 2>/dev/null || echo 000)
     [ "$code" = "404" ] && { swept=1; break; }
     sleep 1
 done
 [ "$swept" = "1" ] && echo "==> PASS: registry swept the dead node's sandbox (op /route -> 404)" || { sed 's/^/  reg| /' "$WORK/registry.log" | tail -15; fail "dead-node sweep did not reset $SID"; }
 
 echo
-echo "==> e2e_cluster: OK   (group $GROUP, sandbox $SID on node n1 via the cluster control plane + dead-node sweep)"
+echo "==> e2e_cluster: OK   (op-mTLS + standalone scaler[mode=remote] + cluster build/create + SAVED migration + dead-node sweep; group $GROUP)"
