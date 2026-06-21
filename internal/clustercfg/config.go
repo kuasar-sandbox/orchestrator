@@ -292,7 +292,13 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("clustercfg: store.dsn is required")
 	}
 	for iface, p := range c.GroupConfig.Providers {
-		if p != ProviderStore && !strings.HasPrefix(p, ProviderExternalPfx) {
+		switch {
+		case p == ProviderStore:
+		case strings.HasPrefix(p, ProviderExternalPfx):
+			if strings.TrimPrefix(p, ProviderExternalPfx) == "" {
+				return fmt.Errorf("clustercfg: group_config.providers[%s]=%q has an empty external address", iface, p)
+			}
+		default:
 			return fmt.Errorf("clustercfg: group_config.providers[%s]=%q invalid (store|external:<addr>)", iface, p)
 		}
 	}
@@ -310,6 +316,14 @@ func (c *Config) Validate() error {
 	case "off", "log", "enforce":
 	default:
 		return fmt.Errorf("clustercfg: router.data_plane_auth %q invalid (off|log|enforce)", c.Router.DataPlaneAuth)
+	}
+	switch c.Scaler.ZoneAdmitMax {
+	case "", "green", "yellow", "red":
+	default:
+		return fmt.Errorf("clustercfg: scaler.zone_admit_max %q invalid (green|yellow|red)", c.Scaler.ZoneAdmitMax)
+	}
+	if c.Scaler.PlaceCandidates < 0 {
+		return fmt.Errorf("clustercfg: scaler.place_candidates %d invalid (must be >= 0)", c.Scaler.PlaceCandidates)
 	}
 	return nil
 }
