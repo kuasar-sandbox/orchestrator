@@ -13,6 +13,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -93,7 +94,9 @@ type Router struct {
 // New builds a Router. opAddr is the registry op endpoint: a path ("/run/...")
 // for a unix socket, or host:port for TCP. authTTL caches api-key verification
 // (<=0 → 60s).
-func New(opAddr, domain string, authTTL time.Duration, log *slog.Logger) *Router {
+// opTLS (non-nil) makes a TCP op endpoint dial over (m)TLS h2; nil = plain. A UDS
+// opAddr ("/...") is always plain (local).
+func New(opAddr, domain string, authTTL time.Duration, opTLS *tls.Config, log *slog.Logger) *Router {
 	if authTTL <= 0 {
 		authTTL = 60 * time.Second
 	}
@@ -105,14 +108,18 @@ func New(opAddr, domain string, authTTL time.Duration, log *slog.Logger) *Router
 		authOK:   map[string]time.Time{},
 	}
 	var transport http.RoundTripper
-	if strings.HasPrefix(opAddr, "/") {
+	switch {
+	case strings.HasPrefix(opAddr, "/"):
 		rt.opBase = "http://op"
 		transport = &http.Transport{
 			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 				return (&net.Dialer{}).DialContext(ctx, "unix", opAddr)
 			},
 		}
-	} else {
+	case opTLS != nil:
+		rt.opBase = "https://" + opAddr
+		transport = &http.Transport{TLSClientConfig: opTLS, ForceAttemptHTTP2: true}
+	default:
 		rt.opBase = "http://" + opAddr
 		transport = &http.Transport{}
 	}

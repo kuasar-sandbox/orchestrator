@@ -77,8 +77,7 @@ func runRegistry(args []string, log *slog.Logger) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc(routesync.NodeLinkPath, reg.ServeNodeLink)
 
-	// TODO(Phase 7): channel.tls mTLS; Phase 3/4 add the op-listen interface for
-	// router/scaler. Phase 2 serves node-link over plain h2c.
+	// node-link over channel.tls mTLS when configured (§5.4), else plain h2c.
 	ln, err := net.Listen("tcp", cfg.Channel.Listen)
 	if err != nil {
 		return fmt.Errorf("registry: channel listen %s: %w", cfg.Channel.Listen, err)
@@ -99,7 +98,7 @@ func runRegistry(args []string, log *slog.Logger) error {
 	}()
 
 	// Op interface (router / scaler dial, cluster.md §5.2; the cluster e2e drives
-	// reserve through it). Phase 7 adds mTLS + the resumable watch.
+	// reserve through it).
 	opMux := http.NewServeMux()
 	reg.ServeOp(opMux)
 	opLn, err := listenOp(cfg.Op.Listen)
@@ -107,17 +106,32 @@ func runRegistry(args []string, log *slog.Logger) error {
 		return fmt.Errorf("registry: op listen %s: %w", cfg.Op.Listen, err)
 	}
 	opSrv := &http.Server{Handler: opMux}
+	// op-mTLS for the cross-host split (cluster.md §5.4); a UDS (local) stays plain.
+	opTLS := cfg.Op.TLS.Enabled() && !strings.HasPrefix(cfg.Op.Listen, "/")
+	if opTLS {
+		stls, terr := cfg.Op.TLS.ServerConfig()
+		if terr != nil {
+			return fmt.Errorf("registry: op tls: %w", terr)
+		}
+		opSrv.TLSConfig = stls
+	}
 	go func() {
 		<-ctx.Done()
 		opSrv.Close()
 	}()
 	go func() {
-		if err := opSrv.Serve(opLn); err != nil && err != http.ErrServerClosed {
-			log.Error("registry op", "err", err)
+		var e error
+		if opTLS {
+			e = opSrv.ServeTLS(opLn, "", "")
+		} else {
+			e = opSrv.Serve(opLn)
+		}
+		if e != nil && e != http.ErrServerClosed {
+			log.Error("registry op", "err", e)
 		}
 	}()
 
-	log.Info("cluster-ctl registry", "channel_listen", cfg.Channel.Listen, "channel_tls", cfg.Channel.TLS.Enabled(), "op_listen", cfg.Op.Listen, "store", cfg.Store.DSN)
+	log.Info("cluster-ctl registry", "channel_listen", cfg.Channel.Listen, "channel_tls", cfg.Channel.TLS.Enabled(), "op_listen", cfg.Op.Listen, "op_tls", opTLS, "store", cfg.Store.DSN)
 	var serveErr error
 	if cfg.Channel.TLS.Enabled() {
 		serveErr = srv.ServeTLS(ln, "", "")

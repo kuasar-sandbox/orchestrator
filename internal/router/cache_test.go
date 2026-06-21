@@ -24,7 +24,7 @@ func TestAuthRejectsBadKey(t *testing.T) {
 		w.WriteHeader(http.StatusNotFound)
 	}))
 	defer op.Close()
-	rt := New(strings.TrimPrefix(op.URL, "http://"), "test.local", 0, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	rt := New(strings.TrimPrefix(op.URL, "http://"), "test.local", 0, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	srv := httptest.NewServer(rt.Handler())
 	defer srv.Close()
 
@@ -65,7 +65,7 @@ func TestSandboxVerbForward(t *testing.T) {
 	}))
 	defer op.Close()
 
-	rt := New(strings.TrimPrefix(op.URL, "http://"), "test.local", 0, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	rt := New(strings.TrimPrefix(op.URL, "http://"), "test.local", 0, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	srv := httptest.NewServer(rt.Handler())
 	defer srv.Close()
 
@@ -126,7 +126,7 @@ func TestRouteCacheFromWatch(t *testing.T) {
 	}))
 	defer op.Close()
 
-	rt := New(strings.TrimPrefix(op.URL, "http://"), "test.local", 0, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	rt := New(strings.TrimPrefix(op.URL, "http://"), "test.local", 0, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	go rt.RunWatch(ctx)
 
 	// Wait for the cache to populate from the watch snapshot.

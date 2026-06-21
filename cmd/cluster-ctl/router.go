@@ -2,12 +2,14 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"flag"
 	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"golang.org/x/net/http2"
@@ -42,7 +44,19 @@ func runRouter(args []string, log *slog.Logger) error {
 		cfg.Router.Listen = *listen
 	}
 
-	rt := router.New(opAddr, cfg.Domain, cfg.Router.AuthCacheDur(), log)
+	// op-mTLS when the op endpoint is a remote TCP addr and op.tls is configured
+	// (cluster.md §5.4); a co-located UDS op stays plain.
+	var opTLS *tls.Config
+	if !strings.HasPrefix(opAddr, "/") && cfg.Op.TLS.Enabled() {
+		host := opAddr
+		if i := strings.LastIndexByte(host, ':'); i >= 0 {
+			host = host[:i]
+		}
+		if opTLS, err = cfg.Op.TLS.ClientConfig(host); err != nil {
+			return fmt.Errorf("router: op tls: %w", err)
+		}
+	}
+	rt := router.New(opAddr, cfg.Domain, cfg.Router.AuthCacheDur(), opTLS, log)
 	rt.SetDataPlaneAuth(cfg.Router.DataPlaneAuth)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)

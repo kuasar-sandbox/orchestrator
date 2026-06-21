@@ -55,7 +55,7 @@ func TestBuildRoutingThroughRouter(t *testing.T) {
 	}))
 	defer op.Close()
 
-	rt := New(strings.TrimPrefix(op.URL, "http://"), "test.local", 0, slog.Default())
+	rt := New(strings.TrimPrefix(op.URL, "http://"), "test.local", 0, nil, slog.Default())
 	srv := httptest.NewServer(rt.Handler())
 	defer srv.Close()
 
