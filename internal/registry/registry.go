@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/apikey"
+	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/groupcfg"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/routesync"
 )
 
@@ -52,6 +53,8 @@ type Registry struct {
 	keyLeased map[string]map[string]bool // group -> node_ids currently holding the predistributed key
 
 	reconcileTrigger chan struct{} // coalesced key-reconcile wakeups (a node connecting)
+
+	resolver groupcfg.Resolver // group-config providers (store by default; §6.2)
 }
 
 // reserveCall is one in-flight ReserveSandbox; joiners wait on done, the channel
@@ -91,8 +94,13 @@ func New(stores *Stores, placer Placer, parkTimeout time.Duration, log *slog.Log
 		cmdFlight:        make(map[string]string),
 		keyLeased:        make(map[string]map[string]bool),
 		reconcileTrigger: make(chan struct{}, 1),
+		resolver:         storeResolver(stores),
 	}
 }
+
+// SetGroupResolver overrides the group-config providers (e.g. an external cloud
+// provider per interface, §6.2); cluster-ctl sets it from config before serving.
+func (r *Registry) SetGroupResolver(res groupcfg.Resolver) { r.resolver = res }
 
 // Stores exposes the typed store layer (cluster-ctl seeds group config; tests).
 func (r *Registry) Stores() *Stores { return r.stores }
@@ -196,14 +204,19 @@ func (r *Registry) startReserve(ctx context.Context, group, routeKey string, rec
 	}
 
 	cmd := &routesync.Command{CmdID: newID(), Kind: routesync.CmdCreate, SID: sid, Group: group, RouteKey: routeKey, Config: createConfig, MigrationToken: migrationToken}
-	if g, gok, _ := r.stores.GetGroupByID(ctx, group); gok {
-		cmd.TemplateRef = g.TemplateRef
-		if g.ManifestKey != "" {
-			// The key is predistributed to the group's allocation set ahead of
-			// placement (cluster.md §7.6; reconcileKeys); create only references it
-			// by fingerprint. A node missing it fails precheck -> rejected ack.
-			cmd.KeyFingerprint = keyFingerprint(g.ManifestKey)
-		}
+	// Group config via the resolver (store or external, §6.2): template ref + the
+	// group's sandbox_config defaults folded under the create config (§7.2: node
+	// default ⊕ group ⊕ create; create wins).
+	if sc, ok, _ := r.resolver.Sandbox.SandboxConfig(ctx, group); ok {
+		cmd.TemplateRef = sc.TemplateRef
+		cmd.Config = mergeConfig(sc.Config, createConfig)
+	}
+	if k, ok, _ := r.resolver.Key.Key(ctx, group); ok && k.ManifestKey != "" {
+		// The key is predistributed to the group's allocation set ahead of placement
+		// (cluster.md §7.6; reconcileKeys for store keys, the external provider's own
+		// distribution otherwise); create only references it by fingerprint. A node
+		// missing it fails precheck -> rejected ack.
+		cmd.KeyFingerprint = keyFingerprint(k.ManifestKey)
 	}
 	r.trackCmd(cmd.CmdID, flightKey(group, routeKey))
 	if err := conn.send(cmd); err != nil {
@@ -524,6 +537,22 @@ func (r *Registry) hasInflight(key string) bool {
 	_, ok := r.inflight[key]
 	r.mu.Unlock()
 	return ok
+}
+
+// mergeConfig folds a group's sandbox_config defaults under the create config
+// (create overrides group); returns create unchanged when there are no defaults.
+func mergeConfig(group, create map[string]string) map[string]string {
+	if len(group) == 0 {
+		return create
+	}
+	merged := make(map[string]string, len(group)+len(create))
+	for k, v := range group {
+		merged[k] = v
+	}
+	for k, v := range create {
+		merged[k] = v
+	}
+	return merged
 }
 
 func cas(err error, ok bool) error {

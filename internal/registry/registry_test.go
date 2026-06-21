@@ -299,6 +299,32 @@ func TestSandboxKeyNoCollision(t *testing.T) {
 	}
 }
 
+func TestGroupResolverStoreAndMerge(t *testing.T) {
+	ctx := context.Background()
+	reg := testReg(t)
+	// No manifest_key here: sealing it needs an encryption box (PutGroup errors
+	// otherwise); the key projection (g.ManifestKey → Key.ManifestKey) is trivial.
+	if err := reg.stores.PutGroup(ctx, &GroupConfig{Group: "/g", ProjectID: "p", TemplateRef: "tmpl",
+		SandboxConfig: map[string]string{"a": "1", "b": "2"}, NodeSelectors: []map[string]string{{"z": "e"}}}); err != nil {
+		t.Fatal(err)
+	}
+	// The default store-backed resolver projects each fine-grained interface.
+	if k, ok, _ := reg.resolver.Key.Key(ctx, "/g"); !ok || k.ProjectID != "p" {
+		t.Fatalf("store key: %+v ok=%v", k, ok)
+	}
+	if sc, ok, _ := reg.resolver.Sandbox.SandboxConfig(ctx, "/g"); !ok || sc.TemplateRef != "tmpl" || sc.Config["a"] != "1" {
+		t.Fatalf("store sandbox: %+v ok=%v", sc, ok)
+	}
+	if pl, ok, _ := reg.resolver.Placement.Placement(ctx, "/g"); !ok || len(pl.NodeSelectors) != 1 {
+		t.Fatalf("store placement: %+v ok=%v", pl, ok)
+	}
+	// §7.2 merge: the group's sandbox_config defaults fold under create (create wins).
+	merged := mergeConfig(map[string]string{"a": "1", "b": "2"}, map[string]string{"b": "X", "c": "3"})
+	if merged["a"] != "1" || merged["b"] != "X" || merged["c"] != "3" {
+		t.Fatalf("mergeConfig: %v", merged)
+	}
+}
+
 func TestSweepKeepsInflightReserved(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)

@@ -58,6 +58,7 @@ type GroupConfigConfig struct {
 	// "store" or "external:<addr>". Empty entries default to store.
 	Providers     map[string]string `yaml:"providers"`
 	EncryptionKey string            `yaml:"encryption_key"` // AES-256 at-rest for self-stored manifest_key; or CLUSTER_GROUP_ENCRYPTION_KEY env
+	TLS           TLS               `yaml:"tls"`            // mTLS for external:<addr> providers (§6.2)
 }
 
 // Provider interface names (keys of GroupConfigConfig.Providers).

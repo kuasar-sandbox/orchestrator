@@ -52,12 +52,12 @@ func (r *Registry) ServeOp(mux *http.ServeMux) {
 // hides both a bad key and an unknown group.
 func (r *Registry) serveVerifyKey(w http.ResponseWriter, req *http.Request) {
 	q := req.URL.Query()
-	g, found, err := r.stores.GetGroupByID(req.Context(), q.Get("group"))
+	k, found, err := r.resolver.Key.Key(req.Context(), q.Get("group"))
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		http.Error(w, err.Error(), http.StatusServiceUnavailable) // key provider unavailable → 503
 		return
 	}
-	if !found || g.ManifestKey == "" {
+	if !found || k.ManifestKey == "" {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
@@ -66,7 +66,7 @@ func (r *Registry) serveVerifyKey(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
-	raw, err := hex.DecodeString(g.ManifestKey)
+	raw, err := hex.DecodeString(k.ManifestKey)
 	if err != nil || !apikey.Verify(p, raw) {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return

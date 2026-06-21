@@ -65,6 +65,16 @@ func runRegistry(args []string, log *slog.Logger) error {
 	}
 	stores := registry.NewStores(kv, box)
 
+	// Group-config providers: store by default, external:<addr> per interface (§6.2).
+	// Built first so the in-process scaler can honor an external placement provider.
+	var extTLS *tls.Config
+	if cfg.GroupConfig.TLS.Enabled() {
+		if extTLS, err = cfg.GroupConfig.TLS.ClientConfig(""); err != nil {
+			return fmt.Errorf("registry: group_config tls: %w", err)
+		}
+	}
+	resolver := registry.NewGroupResolver(cfg.GroupConfig, stores, time.Minute, extTLS)
+
 	// Placement: in-process by default; a standalone scaler (mode=remote) serves it
 	// over the op channel via a remotePlacer (cluster.md §4.3).
 	var placer registry.Placer
@@ -82,9 +92,10 @@ func runRegistry(args []string, log *slog.Logger) error {
 		placer = registry.NewRemotePlacer(cfg.Scaler.Endpoint, stls, cfg.Reserve.ParkDur())
 		log.Info("cluster-ctl registry: remote scaler", "endpoint", cfg.Scaler.Endpoint)
 	} else {
-		placer = scaler.New(stores, cfg.Scaler)
+		placer = scaler.New(stores, resolver.Placement, cfg.Scaler)
 	}
 	reg := registry.New(stores, placer, cfg.Reserve.ParkDur(), log)
+	reg.SetGroupResolver(resolver)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()

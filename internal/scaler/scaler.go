@@ -16,21 +16,28 @@ import (
 
 	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/maglev"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/clustercfg"
+	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/groupcfg"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/registry"
 )
 
 // Placer schedules sandboxes onto nodes.
 type Placer struct {
-	stores *registry.Stores
-	cfg    clustercfg.ScalerConfig
+	stores    *registry.Stores
+	placement groupcfg.PlacementProvider // group selectors (store by default; external §6.2)
+	cfg       clustercfg.ScalerConfig
 }
 
-// New builds a Placer over the registry's stores with the scaler config.
-func New(stores *registry.Stores, cfg clustercfg.ScalerConfig) *Placer {
+// New builds a Placer over the registry's stores. placement supplies a group's
+// nodeSelectors (nil → the store-backed provider); pass the resolver's placement
+// provider to honor an external placement interface.
+func New(stores *registry.Stores, placement groupcfg.PlacementProvider, cfg clustercfg.ScalerConfig) *Placer {
 	if cfg.PlaceCandidates <= 0 {
 		cfg.PlaceCandidates = 2
 	}
-	return &Placer{stores: stores, cfg: cfg}
+	if placement == nil {
+		placement = registry.StorePlacement(stores)
+	}
+	return &Placer{stores: stores, placement: placement, cfg: cfg}
 }
 
 // PlaceSandbox suggests the least-loaded eligible node (cluster-scaler.md §4.2):
@@ -38,8 +45,8 @@ func New(stores *registry.Stores, cfg clustercfg.ScalerConfig) *Placer {
 // shuffle-sharding slots, then P2C by sandbox count.
 func (p *Placer) PlaceSandbox(ctx context.Context, group, routeKey string) (string, error) {
 	var selectors []map[string]string
-	if g, found, _ := p.stores.GetGroupByID(ctx, group); found && g != nil {
-		selectors = g.NodeSelectors
+	if pl, found, _ := p.placement.Placement(ctx, group); found {
+		selectors = pl.NodeSelectors
 	}
 	// Scan the node table once (RangeNodes deserializes every row — one pass), then
 	// run the shared placement algorithm over the slice.

@@ -27,7 +27,7 @@ func TestPlaceRespectsSelectors(t *testing.T) {
 	s.PutNode(ctx, &registry.NodeRecord{NodeID: "b", Labels: map[string]string{"zone": "east"}, Counts: 1})
 	s.PutNode(ctx, &registry.NodeRecord{NodeID: "c", Labels: map[string]string{"zone": "west"}})
 	s.PutGroup(ctx, &registry.GroupConfig{Group: "/g", NodeSelectors: []map[string]string{{"zone": "east"}}})
-	p := New(s, clustercfg.ScalerConfig{PlaceCandidates: 2})
+	p := New(s, nil, clustercfg.ScalerConfig{PlaceCandidates: 2})
 	for i := 0; i < 30; i++ {
 		node, err := p.PlaceSandbox(ctx, "/g", "rk")
 		if err != nil {
@@ -44,7 +44,7 @@ func TestPlaceNoEligible(t *testing.T) {
 	s := testStores(t)
 	s.PutNode(ctx, &registry.NodeRecord{NodeID: "a", Labels: map[string]string{"zone": "west"}})
 	s.PutGroup(ctx, &registry.GroupConfig{Group: "/g", NodeSelectors: []map[string]string{{"zone": "east"}}})
-	p := New(s, clustercfg.ScalerConfig{})
+	p := New(s, nil, clustercfg.ScalerConfig{})
 	if _, err := p.PlaceSandbox(ctx, "/g", "rk"); err == nil {
 		t.Fatal("expected ErrNoNode for no matching node")
 	}
@@ -55,7 +55,7 @@ func TestPlaceDraining(t *testing.T) {
 	s := testStores(t)
 	s.PutNode(ctx, &registry.NodeRecord{NodeID: "a", Draining: true})
 	s.PutGroup(ctx, &registry.GroupConfig{Group: "/g"})
-	p := New(s, clustercfg.ScalerConfig{})
+	p := New(s, nil, clustercfg.ScalerConfig{})
 	if _, err := p.PlaceSandbox(ctx, "/g", "rk"); err == nil {
 		t.Fatal("expected ErrNoNode: the only node is draining")
 	}
@@ -67,7 +67,7 @@ func TestP2CNoReplacementAvoidsHot(t *testing.T) {
 	s.PutNode(ctx, &registry.NodeRecord{NodeID: "hot", Counts: 100})
 	s.PutNode(ctx, &registry.NodeRecord{NodeID: "cold", Counts: 0})
 	s.PutGroup(ctx, &registry.GroupConfig{Group: "/g"})
-	p := New(s, clustercfg.ScalerConfig{PlaceCandidates: 2})
+	p := New(s, nil, clustercfg.ScalerConfig{PlaceCandidates: 2})
 	// k=2 over exactly 2 eligible nodes, sampled WITHOUT replacement, must always
 	// pick the colder node (with replacement it picks the hot one ~25% of the time).
 	for i := 0; i < 2000; i++ {
@@ -88,7 +88,7 @@ func TestShuffleSharding(t *testing.T) {
 		s.PutNode(ctx, &registry.NodeRecord{NodeID: "n-" + slot, Labels: map[string]string{"pool": "p1", "slot": slot}})
 	}
 	s.PutGroup(ctx, &registry.GroupConfig{Group: "/cell/proj/app/g1"})
-	p := New(s, clustercfg.ScalerConfig{PlaceCandidates: 2, ShuffleSharding: []clustercfg.ShuffleRule{
+	p := New(s, nil, clustercfg.ScalerConfig{PlaceCandidates: 2, ShuffleSharding: []clustercfg.ShuffleRule{
 		{Selector: map[string]string{"pool": "p1"}, ShardBy: "slot", N: 2},
 	}})
 	got := map[string]bool{}
