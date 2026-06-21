@@ -41,8 +41,8 @@ func (p *Placer) PlaceSandbox(ctx context.Context, group, routeKey string) (stri
 	if g, found, _ := p.stores.GetGroupByID(ctx, group); found && g != nil {
 		selectors = g.NodeSelectors
 	}
-	// Scan the node table once, then compute shuffle slots + eligibility over the
-	// in-memory slice (RangeNodes deserializes every row — one pass, not 2-3).
+	// Scan the node table once (RangeNodes deserializes every row — one pass), then
+	// run the shared placement algorithm over the slice.
 	var nodes []*registry.NodeRecord
 	if err := p.stores.RangeNodes(ctx, func(n *registry.NodeRecord) error {
 		nodes = append(nodes, n)
@@ -50,8 +50,15 @@ func (p *Placer) PlaceSandbox(ctx context.Context, group, routeKey string) (stri
 	}); err != nil {
 		return "", err
 	}
-	slotSet, shardBy := shuffleSlots(group, nodes, p.cfg.ShuffleSharding)
+	return placeOver(group, nodes, selectors, p.cfg.ShuffleSharding, p.cfg.PlaceCandidates)
+}
 
+// placeOver runs the placement algorithm over a node set + a group's selectors
+// (cluster-scaler.md §4.2): matchSelectors ∧ ¬draining ∧ shuffle slot, then P2C by
+// sandbox count. Shared by the in-process Placer and the standalone scaler's
+// view-backed handler.
+func placeOver(group string, nodes []*registry.NodeRecord, selectors []map[string]string, rules []clustercfg.ShuffleRule, candidates int) (string, error) {
+	slotSet, shardBy := shuffleSlots(group, nodes, rules)
 	var eligible []*registry.NodeRecord
 	for _, n := range nodes {
 		if n.Draining || !matchSelectors(n.Labels, selectors) {
@@ -65,7 +72,7 @@ func (p *Placer) PlaceSandbox(ctx context.Context, group, routeKey string) (stri
 	if len(eligible) == 0 {
 		return "", registry.ErrNoNode
 	}
-	return p2c(eligible, p.cfg.PlaceCandidates).NodeID, nil
+	return p2c(eligible, candidates).NodeID, nil
 }
 
 // shuffleSlots returns the deterministic set of shard_by label values this group

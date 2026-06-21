@@ -128,8 +128,11 @@ func resolveRecordEP(rec *SandboxRecord, dataEndpoint string) *RouteResolve {
 	}
 }
 
-func writeWatchFrame(w io.Writer, ev *WatchEvent) error {
-	b, err := json.Marshal(ev)
+func writeWatchFrame(w io.Writer, ev *WatchEvent) error { return writeFrame(w, ev) }
+
+// writeFrame writes a length-prefixed JSON frame ([4B LE len][JSON]).
+func writeFrame(w io.Writer, v any) error {
+	b, err := json.Marshal(v)
 	if err != nil {
 		return err
 	}

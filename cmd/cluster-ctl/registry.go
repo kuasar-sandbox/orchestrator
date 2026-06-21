@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -63,7 +64,27 @@ func runRegistry(args []string, log *slog.Logger) error {
 		}
 	}
 	stores := registry.NewStores(kv, box)
-	reg := registry.New(stores, scaler.New(stores, cfg.Scaler), cfg.Reserve.ParkDur(), log)
+
+	// Placement: in-process by default; a standalone scaler (mode=remote) serves it
+	// over the op channel via a remotePlacer (cluster.md §4.3).
+	var placer registry.Placer
+	if cfg.Scaler.Mode == clustercfg.ScalerRemote {
+		var stls *tls.Config
+		if !strings.HasPrefix(cfg.Scaler.Endpoint, "/") && cfg.Scaler.TLS.Enabled() {
+			host := cfg.Scaler.Endpoint
+			if i := strings.LastIndexByte(host, ':'); i >= 0 {
+				host = host[:i]
+			}
+			if stls, err = cfg.Scaler.TLS.ClientConfig(host); err != nil {
+				return fmt.Errorf("registry: scaler tls: %w", err)
+			}
+		}
+		placer = registry.NewRemotePlacer(cfg.Scaler.Endpoint, stls, cfg.Reserve.ParkDur())
+		log.Info("cluster-ctl registry: remote scaler", "endpoint", cfg.Scaler.Endpoint)
+	} else {
+		placer = scaler.New(stores, cfg.Scaler)
+	}
+	reg := registry.New(stores, placer, cfg.Reserve.ParkDur(), log)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()

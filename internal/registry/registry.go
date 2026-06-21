@@ -162,14 +162,24 @@ func (r *Registry) startReserve(ctx context.Context, group, routeKey string, rec
 		return nil
 	}
 
-	// NONE / SAVED: place + create.
-	nodeID, err := r.placer.PlaceSandbox(ctx, group, routeKey)
-	if err != nil {
-		return err
-	}
-	conn, live := r.node(nodeID)
-	if !live {
-		return ErrNodeGone
+	// NONE / SAVED: place + create. Re-ask the placer once if it suggests a node
+	// that's no longer connected — a lagging (remote-scaler) view or a node that
+	// just dropped (cluster-scaler.md §5); P2C will likely pick a live one.
+	var nodeID string
+	var conn nodeConn
+	for attempt := 0; ; attempt++ {
+		var perr error
+		nodeID, perr = r.placer.PlaceSandbox(ctx, group, routeKey)
+		if perr != nil {
+			return perr
+		}
+		var live bool
+		if conn, live = r.node(nodeID); live {
+			break
+		}
+		if attempt >= 1 {
+			return ErrNodeGone
+		}
 	}
 	sid := "sb-" + newID()
 	migrationToken := ""

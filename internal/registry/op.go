@@ -43,6 +43,8 @@ func (r *Registry) ServeOp(mux *http.ServeMux) {
 	mux.HandleFunc(OpListPath, r.serveList)
 	mux.HandleFunc(OpVerifyKeyPath, r.serveVerifyKey)
 	mux.HandleFunc(OpWatchPath, r.serveWatch)
+	mux.HandleFunc(OpNodeWatchPath, r.serveNodeWatch)   // standalone scaler view (§5.2)
+	mux.HandleFunc(OpGroupWatchPath, r.serveGroupWatch) // standalone scaler view (§5.2)
 }
 
 // serveVerifyKey verifies an api key against a group's manifest key (the router's

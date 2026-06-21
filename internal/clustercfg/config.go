@@ -99,11 +99,21 @@ type RouterConfig struct {
 
 // ScalerConfig is the placement scheduler role.
 type ScalerConfig struct {
-	Registry        string        `yaml:"registry"`         // registry op endpoint
+	Registry        string        `yaml:"registry"`         // registry op endpoint (the scaler dials this)
+	Mode            string        `yaml:"mode"`             // inprocess (default) | remote
+	Endpoint        string        `yaml:"endpoint"`         // registry -> scaler placement addr (mode=remote)
+	Listen          string        `yaml:"listen"`           // scaler /scaler/place listener (mode=remote)
+	TLS             TLS           `yaml:"tls"`              // mTLS for the registry <-> scaler placement hop
 	PlaceCandidates int           `yaml:"place_candidates"` // P2C sample size; default 2
 	ZoneAdmitMax    string        `yaml:"zone_admit_max"`   // exclude nodes hotter than this; default yellow
 	ShuffleSharding []ShuffleRule `yaml:"shuffle_sharding"` // empty = static nodeSelectors only
 }
+
+// Scaler deployment modes (scaler.mode).
+const (
+	ScalerInprocess = "inprocess" // placement runs inside the registry process (default)
+	ScalerRemote    = "remote"    // a standalone scaler process serves placement over op
+)
 
 // ShuffleRule pins each matching group to n deterministic shards of the node
 // set bucketed by a label (cluster-scaler.md §4.4).
@@ -197,7 +207,7 @@ func Default() Config {
 			AuthCacheTTL:  "60s",
 			DataPlaneAuth: "enforce",
 		},
-		Scaler: ScalerConfig{PlaceCandidates: 2, ZoneAdmitMax: "yellow"},
+		Scaler: ScalerConfig{Mode: ScalerInprocess, PlaceCandidates: 2, ZoneAdmitMax: "yellow"},
 	}
 }
 
@@ -273,6 +283,9 @@ func (c *Config) applyDefaults() {
 	if c.Scaler.PlaceCandidates == 0 {
 		c.Scaler.PlaceCandidates = d.Scaler.PlaceCandidates
 	}
+	if c.Scaler.Mode == "" {
+		c.Scaler.Mode = d.Scaler.Mode
+	}
 	if c.Scaler.ZoneAdmitMax == "" {
 		c.Scaler.ZoneAdmitMax = d.Scaler.ZoneAdmitMax
 	}
@@ -324,6 +337,14 @@ func (c *Config) Validate() error {
 	}
 	if c.Scaler.PlaceCandidates < 0 {
 		return fmt.Errorf("clustercfg: scaler.place_candidates %d invalid (must be >= 0)", c.Scaler.PlaceCandidates)
+	}
+	switch c.Scaler.Mode {
+	case "", ScalerInprocess, ScalerRemote:
+	default:
+		return fmt.Errorf("clustercfg: scaler.mode %q invalid (inprocess|remote)", c.Scaler.Mode)
+	}
+	if c.Scaler.Mode == ScalerRemote && c.Scaler.Endpoint == "" {
+		return fmt.Errorf("clustercfg: scaler.endpoint required when scaler.mode=remote")
 	}
 	return nil
 }
