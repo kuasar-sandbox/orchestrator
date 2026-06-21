@@ -548,11 +548,12 @@ func (rt *Router) verifyAuth(ctx context.Context, group, apiKey string) bool {
 	}
 	rt.authMu.Unlock()
 
-	u := fmt.Sprintf("%s/op/verify-key?group=%s&api_key=%s", rt.opBase, url.QueryEscape(group), url.QueryEscape(apiKey))
+	u := fmt.Sprintf("%s/op/verify-key?group=%s", rt.opBase, url.QueryEscape(group))
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return false
 	}
+	req.Header.Set(HeaderAPIKey, apiKey) // api key in a header, never the query string (logged)
 	resp, err := rt.opClient.Do(req)
 	if err != nil {
 		return false

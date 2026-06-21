@@ -59,7 +59,7 @@ func (r *Registry) serveVerifyKey(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
-	p, err := apikey.Parse(q.Get("api_key"))
+	p, err := apikey.Parse(req.Header.Get("X-API-KEY")) // in a header, never the query (logged)
 	if err != nil {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return

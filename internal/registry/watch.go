@@ -63,8 +63,12 @@ func (r *Registry) serveWatch(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	// Preload node endpoints once: a GetNode per snapshot row would be O(N) sqlite
+	// reads at high density. Live deltas below resolve per-event (infrequent).
+	nodeEP := map[string]string{}
+	_ = r.stores.RangeNodes(ctx, func(n *NodeRecord) error { nodeEP[n.NodeID] = n.DataEndpoint; return nil })
 	if err := r.stores.RangeAllSandboxes(ctx, func(rec *SandboxRecord) error {
-		return writeWatchFrame(w, &WatchEvent{Type: "put", Key: sandboxKey(rec.Group, rec.RouteKey), Route: r.resolveRecord(ctx, rec), Rev: rev0})
+		return writeWatchFrame(w, &WatchEvent{Type: "put", Key: sandboxKey(rec.Group, rec.RouteKey), Route: resolveRecordEP(rec, nodeEP[rec.NodeID]), Rev: rev0})
 	}); err != nil {
 		return
 	}
@@ -106,9 +110,13 @@ func (r *Registry) streamWatch(ctx context.Context, w io.Writer, flusher http.Fl
 }
 
 func (r *Registry) resolveRecord(ctx context.Context, rec *SandboxRecord) *RouteResolve {
+	return resolveRecordEP(rec, r.nodeDataEndpoint(ctx, rec.NodeID))
+}
+
+func resolveRecordEP(rec *SandboxRecord, dataEndpoint string) *RouteResolve {
 	return &RouteResolve{
 		SID: rec.SID, Group: rec.Group, RouteKey: rec.RouteKey, NodeID: rec.NodeID,
-		DataEndpoint: r.nodeDataEndpoint(ctx, rec.NodeID), AccessToken: rec.AccessToken,
+		DataEndpoint: dataEndpoint, AccessToken: rec.AccessToken,
 		State: string(rec.State),
 	}
 }
