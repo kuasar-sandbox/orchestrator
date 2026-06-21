@@ -263,6 +263,49 @@ func readWatchFrame(t *testing.T, r io.Reader) *WatchEvent {
 	return &ev
 }
 
+func TestSandboxKeyNoCollision(t *testing.T) {
+	ctx := context.Background()
+	reg := testReg(t)
+	// Nested groups: a per-group range over /a must NOT bleed into /a/b.
+	reg.stores.PutSandbox(ctx, &SandboxRecord{Group: "/a", RouteKey: "x", SID: "sb-a", State: StateReady})
+	reg.stores.PutSandbox(ctx, &SandboxRecord{Group: "/a/b", RouteKey: "y", SID: "sb-ab", State: StateReady})
+	var got []string
+	reg.stores.RangeSandboxes(ctx, "/a", func(s *SandboxRecord) error { got = append(got, s.SID); return nil })
+	if len(got) != 1 || got[0] != "sb-a" {
+		t.Fatalf("RangeSandboxes(/a) leaked across groups: %v (want [sb-a])", got)
+	}
+	// Aliasing across the group/route_key boundary must not overwrite:
+	// (/a, "b/y") and (/a/b, "y") must be distinct records.
+	reg.stores.PutSandbox(ctx, &SandboxRecord{Group: "/a", RouteKey: "b/y", SID: "sb-1", State: StateReady})
+	r1, _, _, _ := reg.stores.GetSandbox(ctx, "/a", "b/y")
+	rab, _, _, _ := reg.stores.GetSandbox(ctx, "/a/b", "y")
+	if r1 == nil || r1.SID != "sb-1" || rab == nil || rab.SID != "sb-ab" {
+		t.Fatalf("key aliasing overwrote a different tenant: (/a,b/y)=%v (/a/b,y)=%v", r1, rab)
+	}
+}
+
+func TestSweepKeepsInflightReserved(t *testing.T) {
+	ctx := context.Background()
+	reg := testReg(t)
+	reg.stores.PutNode(ctx, &NodeRecord{NodeID: "dead", LastHeartbeatUnix: time.Now().Add(-time.Hour).Unix()})
+	// A RESERVED row whose single-flight is still in flight must survive the sweep.
+	reg.stores.PutSandbox(ctx, &SandboxRecord{Group: "/g", RouteKey: "live", SID: "sb-r", State: StateReserved, NodeID: "dead"})
+	reg.mu.Lock()
+	reg.inflight[flightKey("/g", "live")] = &reserveCall{done: make(chan struct{})}
+	reg.mu.Unlock()
+	// A RESERVED row with no in-flight reserve is stale → swept.
+	reg.stores.PutSandbox(ctx, &SandboxRecord{Group: "/g", RouteKey: "stale", SID: "sb-s", State: StateReserved, NodeID: "dead"})
+
+	reg.sweepDeadNodes(ctx, 30*time.Second)
+
+	if _, _, found, _ := reg.stores.GetSandbox(ctx, "/g", "live"); !found {
+		t.Fatal("swept a RESERVED row owned by an in-flight reserve")
+	}
+	if _, _, found, _ := reg.stores.GetSandbox(ctx, "/g", "stale"); found {
+		t.Fatal("did not sweep a stale RESERVED row on a dead node")
+	}
+}
+
 func TestSweepDeadNodes(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)

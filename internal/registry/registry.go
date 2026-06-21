@@ -152,7 +152,11 @@ func (r *Registry) startReserve(ctx context.Context, group, routeKey string, rec
 		}
 		ccmd := &routesync.Command{CmdID: newID(), Kind: routesync.CmdConnect, SID: rec.SID}
 		r.trackCmd(ccmd.CmdID, flightKey(group, routeKey))
-		return conn.send(ccmd)
+		if err := conn.send(ccmd); err != nil {
+			_, _ = r.stores.PutSandbox(ctx, rec) // roll back RESERVED -> PAUSED (connect never reached the node)
+			return err
+		}
+		return nil
 	}
 
 	// NONE / SAVED: place + create.
@@ -189,7 +193,13 @@ func (r *Registry) startReserve(ctx context.Context, group, routeKey string, rec
 		}
 	}
 	r.trackCmd(cmd.CmdID, flightKey(group, routeKey))
-	return conn.send(cmd)
+	if err := conn.send(cmd); err != nil {
+		// Roll back the reservation that never reached the node, so it doesn't
+		// strand a RESERVED tombstone on a live node (the sweep won't clear it).
+		_ = r.stores.DeleteSandbox(ctx, group, routeKey)
+		return err
+	}
+	return nil
 }
 
 // sendAndWait sends a command and blocks until the node acks it (or timeout) — for
@@ -273,6 +283,15 @@ func (r *Registry) applyRoute(ctx context.Context, nodeID string, e *routesync.R
 	default:
 		rec.State = StateReady
 	}
+	// Fence a stale upsert from a node that no longer owns this (group,route_key):
+	// a re-placement CASes the record onto the new node, so the new owner's routes
+	// apply (its record is RESERVED, not yet READY), while a former owner's late
+	// re-stream (after a reconnect / false-positive sweep) can't resurrect a route
+	// the registry already moved.
+	if cur, _, found, _ := r.stores.GetSandbox(ctx, e.Group, e.RouteKey); found &&
+		cur.NodeID != "" && cur.NodeID != nodeID && cur.State == StateReady {
+		return
+	}
 	if _, err := r.stores.PutSandbox(ctx, rec); err != nil {
 		r.log.Warn("registry: put sandbox route", "group", e.Group, "err", err)
 		return
@@ -309,10 +328,17 @@ func (r *Registry) applyDeleteBySID(ctx context.Context, sid string) {
 	}
 }
 
-// finish satisfies the single-flight call for key (idempotent — first wins).
+// finish satisfies the single-flight call for key (idempotent — first wins). It
+// also drops any in-flight command tracked for this key, so cmdFlight doesn't
+// leak when the route event finishes the Reserve before/without the cmd_ack.
 func (r *Registry) finish(key string, res *ReserveResult, err error) {
 	r.mu.Lock()
 	call := r.inflight[key]
+	for id, fk := range r.cmdFlight {
+		if fk == key {
+			delete(r.cmdFlight, id)
+		}
+	}
 	r.mu.Unlock()
 	if call == nil {
 		return
@@ -423,8 +449,10 @@ func (r *Registry) RunReaper(ctx context.Context, deadAfter time.Duration) {
 
 // sweepDeadNodes resets the sandboxes of every disconnected node whose last
 // heartbeat predates node_dead_after, then removes the node record (cluster.md
-// §11): READY/RESERVED/PAUSED (node-local snapshot, lost with the node) → reset
-// so the next Reserve re-places; SAVED (remote, unbound) is left untouched.
+// §11): READY/PAUSED (node-local snapshot, lost with the node) → reset so the
+// next Reserve re-places; a RESERVED row is reset only when no in-flight Reserve
+// owns it (so the sweep can't delete a reservation under a concurrent reserve on
+// a reconnect blip); SAVED (remote, unbound) is left untouched.
 func (r *Registry) sweepDeadNodes(ctx context.Context, deadAfter time.Duration) {
 	cutoff := time.Now().Add(-deadAfter).Unix()
 	var dead []string
@@ -447,8 +475,18 @@ func (r *Registry) sweepDeadNodes(ctx context.Context, deadAfter time.Duration) 
 	// Collect first (the Range callback is read-only), then mutate.
 	var reset []*SandboxRecord
 	_ = r.stores.RangeAllSandboxes(ctx, func(s *SandboxRecord) error {
-		if deadSet[s.NodeID] && (s.State == StateReady || s.State == StateReserved || s.State == StatePaused) {
+		if !deadSet[s.NodeID] {
+			return nil
+		}
+		switch s.State {
+		case StateReady, StatePaused:
 			reset = append(reset, &SandboxRecord{Group: s.Group, RouteKey: s.RouteKey, SID: s.SID})
+		case StateReserved:
+			// Owned by an in-flight single-flight; only sweep a stale reservation
+			// (no live reserve), never one a concurrent Reserve still holds.
+			if !r.hasInflight(flightKey(s.Group, s.RouteKey)) {
+				reset = append(reset, &SandboxRecord{Group: s.Group, RouteKey: s.RouteKey, SID: s.SID})
+			}
 		}
 		return nil
 	})
@@ -466,6 +504,13 @@ func (r *Registry) dropSID(sid string) {
 	r.mu.Lock()
 	delete(r.sidKeys, sid)
 	r.mu.Unlock()
+}
+
+func (r *Registry) hasInflight(key string) bool {
+	r.mu.Lock()
+	_, ok := r.inflight[key]
+	r.mu.Unlock()
+	return ok
 }
 
 func cas(err error, ok bool) error {

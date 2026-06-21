@@ -56,15 +56,19 @@ func (r *Registry) ServeNodeLink(w http.ResponseWriter, req *http.Request) {
 	}
 
 	conn := &nodeChannel{nodeID: nr.NodeID, w: w, flush: flusher.Flush}
-	r.addNode(conn)
-	defer r.removeNode(conn)
-	r.onNodeConnected() // predistribute this node's groups' manifest keys (§7.6)
 
-	// Ack with a Hello so the node's RoundTrip returns and it starts streaming.
+	// Write Hello BEFORE exposing the channel. Once addNode/onNodeConnected run, a
+	// concurrent reconcileKeys can conn.send() on this same h2 stream (under
+	// nodeChannel.mu); a bare Hello write after that would race it and interleave
+	// frames. Hello goes out first, while this is still the only writer.
 	if err := routesync.WriteMsg(w, &routesync.Msg{Type: routesync.TypeHello, Hello: &routesync.Hello{Version: routesync.Version}}); err != nil {
 		return
 	}
 	flusher.Flush()
+
+	r.addNode(conn)
+	defer r.removeNode(conn)
+	r.onNodeConnected() // predistribute this node's groups' manifest keys (§7.6)
 	r.log.Info("node-link: node connected", "node", nr.NodeID, "labels", nr.Labels)
 
 	for {

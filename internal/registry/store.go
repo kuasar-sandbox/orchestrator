@@ -15,6 +15,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/url"
 
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/clusterstore"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/routesync"
@@ -105,12 +106,15 @@ func NewStores(kv clusterstore.Store, box *secretbox.Box) *Stores {
 func nodeKey(id string) string     { return nodePrefix + id }
 func groupKey(group string) string { return groupPrefix + group }
 
-// sandboxKey is sandbox/<group>/<route_key>; group may contain '/', so the
-// per-group range prefix is sandboxGroupPrefix(group).
+// sandboxKey is sandbox/<esc(group)>/<esc(route_key)>. group AND route_key can
+// contain '/', so each segment is URL-path-escaped: that makes the key injective
+// (no aliasing of (group,route_key) pairs) and the per-group range prefix
+// unambiguous (no bleed from a nested group like "/a" into "/a/b"). The value
+// carries the unescaped group/route_key, so the key is never decoded.
 func sandboxKey(group, routeKey string) string {
-	return sandboxPrefix + group + "/" + routeKey
+	return sandboxPrefix + url.PathEscape(group) + "/" + url.PathEscape(routeKey)
 }
-func sandboxGroupPrefix(group string) string { return sandboxPrefix + group + "/" }
+func sandboxGroupPrefix(group string) string { return sandboxPrefix + url.PathEscape(group) + "/" }
 
 // --- node table (global) ---
 
