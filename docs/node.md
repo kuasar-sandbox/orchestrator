@@ -96,7 +96,7 @@ node-ctl 补这一层,并刻意选择 **e2b 协议兼容**而非自定义 API:e2
       │ api: e2b control plane (REST)         │   │ proxy         │ │  up: register/HB/
       │   sandboxes create/connect/pause/...  │   │ (internal /   │ │      sandbox events
       │   templates register/trigger/status   │   │  external     │ │  down: create/connect/
-      │ host:                                 │   │  workers,     │ │       delete/build_register/key
+      │ host:                                 │   │  workers,     │ │       delete/key_put/key_drop
       │   vswitch-ctl attach → floatingip     │   │  route-synced)│ │
       │   StartUnit(sandbox-runner@<sid>)     │   │ 49983/49999   │ └─ node-link client ───┐
       │   envd /init → sqlite + TTL           │   │  → UDS (envd) │                        │
@@ -604,7 +604,7 @@ serve 在 UDS `paths.config_socket`(默认 `/run/sandbox/node-ctl.socket`,**0600
 **② admin 平面** — `/internal/admin/manifest-keys`(`GET` = list,`POST
 {op: add|remove|check, key, label, ttl_seconds, registry_auth}`):manifest-key 白名单
 管理(§7)。鉴权:配 `paths.admin_pidfile` 则 peer pid 须在其中;未配则仅靠 socket
-0600。`node-ctl manifest-key` 即此平面客户端;集群下 node-link 收到的 `key_put`/`key_renew`/
+0600。`node-ctl manifest-key` 即此平面客户端;集群下 node-link 收到的 `key_put`(写 / 重发续租)/
 `key_drop` 命令亦写此表(租约项,§10)。
 
 **③ plugin 平面** — `PUT /internal/plugin/{id}/register`:一个订阅者(external proxy
@@ -822,8 +822,7 @@ files 转发本机 e2b 控制面(§4),数据面业务流量经 router 注入 `E2
   | `create{cmd_id, sid, group, route_key, template_ref, key_fp, config, migration_token?}` | 冷启 `template_ref` + 合并 `config`(§8;snp 模板 = 快照恢复快启)或带 token 一步迁移导入 + restore(§8.1);`key_fp` 选本机租约 manifest_key;group/route_key 注入沙箱 metadata |
   | `connect{cmd_id, sid}` | 恢复本机 PAUSED 沙箱(§8 auto-resume) |
   | `delete{cmd_id, sid|build_id}` | 销毁沙箱 / 构建(§5 kill);SAVED 两阶段回收步 |
-  | `build_register{cmd_id, build_id, group, spec, key_fp}` | 在本机登记一个构建(§12);此后 trigger/status/files 经 router 转发本机 e2b 构建 API |
-  | `key_put` / `key_renew` / `key_drop{fingerprint, manifest_key?, expires_unix}` | 写 / 续 / 撤 `manifest_keys` 租约项(§7);**registry 的密钥分发**(cluster.md §7.6) |
+  | `key_put` / `key_drop{fingerprint, manifest_key?, expires_unix}` | 写 / 重发续租 / 撤 `manifest_keys` 租约项(§7);**registry 的密钥分发**(cluster.md §7.6) |
 
   无 `drain` 命令——节点排空 / 维护由**节点侧**发起(node-resource.md §2.5 资源 drain,或本机深空闲
   自提升),集群侧仅停止向其分配(cluster-scaler.md §4),不由 registry 命令(cluster.md §7.3)。
@@ -1025,7 +1024,7 @@ external worker 的 `--data-listen`),证书同一张。dev:`E2B_API_URL`/
 |---|---|---|
 | `sandbox-ctl`(runtime) | 经 run-sandbox(单元)`execve`:`run --config <sid>.yaml --manifest-config … --run-root … --cgroup-adopt [--restore] [--connect]`;run-builder 以直接子进程 `run` 阶段沙箱,经 `exec --env/--stdin-from/--stdout-to` 做平台接力(flatten-ctl 调用、配置注入、工件流、探针),收尾 `snapshot --output` / `upload-snapshot` / `info --json`;serve 调 `snapshot --upload`(pause) | 非密配置文件 + 密钥 env;资源准入在其内部;e2b 语义命令不走它(走 envd,§12) |
 | 资源控制器(node-resource.md) | serve 内置(`resource_listen`)或独立进程;沙箱经 `sandbox.resources.control_socket` 拨号(`pkg/resource` 协议) | 单元 cgroup 即沙箱 cgroup,控制器原地仲裁;不配 control_socket = 静态 cgroup(`--cgroup-adopt`),配了才进 SANDBOX_CONFIG `resources.control.controller` |
-| registry(cluster-ctl) | node-link:serve 拨 registry、反向注册为路由权威,上报 register/heartbeat/sandbox/build 事件、受理 create/connect/delete/build_register/key 命令(§10、cluster.md §5) | mTLS;命令复用 §8 / §8.1 生命周期原语;空 `cluster.registry` = 独立模式不接入 |
+| registry(cluster-ctl) | node-link:serve 拨 registry、反向注册为路由权威,上报 register/heartbeat/sandbox/build 事件、受理 create/connect/delete/key_put/key_drop 命令(§10、cluster.md §5) | mTLS;命令复用 §8 / §8.1 生命周期原语;空 `cluster.registry` = 独立模式不接入 |
 | `vswitch-ctl`(vswitch) | CLI:`attach <switch> --inner-ip [--transit-*]` / `detach --port`;`open-port` 作 SANDBOX_CONFIG `network.tapfd.exec`(sandbox-ctl 执行,经 `TAPFD_SOCKET` 收 tap fd) | 交换机预先起好(`vswitch-ctl start`,内核态数据面);port 对外、slot 内部;一个构建复用一个槽 |
 | `flatten-ctl`(builder) | **guest 内**(builder runtime 自带,经 sandbox-ctl exec 驱动):`export --output -`(import 拉取 / steps 导出)、`mountpoint`;宿主侧:`info --json`(读镜像运行时配置,本地工件或 manifest://) | 租户 `FLATTEN_*` 仅经 exec env 入 guest;tarstream 镜像工件经 exec stdio 接力 |
 | `manifest-ctl`(accelerator) | `store <image.img>`(img-only 构建的收尾上传) | manifest key 经 stdout 回收;`MANIFEST_KEY` 经 env |

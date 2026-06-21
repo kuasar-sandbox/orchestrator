@@ -30,7 +30,8 @@ scaler 解决:nodeSelectors + shuffle-sharding 选址(§4.2 / §4.4),P2C 均衡(
    持节点连接、不推密钥、不动沙箱。
 2. **本地视图 + 本地计算**:订阅 registry 的节点 / group 状态维护本地视图;建议时本地算,不每次
    全表扫 / 不远程 fan-out——故建议快(cluster.md §9 冷路径)。
-3. **P2C 而非全局最优**:抽两个候选取较空者——O(1)、去相关、抗惊群。
+3. **P2C 而非全局最优**:无放回抽两个不同候选取较空者——O(1)、去相关、抗惊群(无放回避免 2 节点集时
+   ~25% 抽中同一更热节点)。
 4. **关联变化不迁移在跑沙箱**:nodeSelectors / shuffle 分片的变化**只影响新建沙箱落点,已启动的
    沙箱不动**(§4.3 / §4.4)。
 
@@ -59,7 +60,7 @@ listen——scaler 是纯调度器(订阅 + 被调建议方)。
 | 字段 | 默认 | 说明 |
 |---|---|---|
 | `scaler.place_candidates` | `2` | P2C 抽样候选数(§4.2) |
-| `scaler.zone_admit_max` | `yellow` | 放置只选水位区 ≤ 此的节点(red / critical 排除,§4.2) |
+| `scaler.zone_admit_max` | `yellow` | 放置水位区上限(red 排除);**当前放置尚未消费**(§4.2 负载信号) |
 | `scaler.shuffle_sharding` | 空 | shuffle-sharding 规则列表(§4.4);空 = 仅用静态 nodeSelectors |
 
 `shuffle_sharding` 规则形态:
@@ -92,16 +93,14 @@ scaler 订阅 registry 节点注册表(labels、watermark、build_capacity / bui
 ```
 eligible = { node :
     matchSelectors(node.labels, group.有效 nodeSelectors)   // 静态 ∪ shuffle 分片(§4.4)
-  ∧ node alive ∧ ¬ node.draining
-  ∧ node.zone ≤ scaler.zone_admit_max
-  ∧ runtimeCompatible(node.runtime_digest, target)        // 冷启=模板 runtime; 迁移=快照 runtime
+  ∧ ¬ node.draining
 }
-node_id = argmin( sample(eligible, place_candidates), load )
+node_id = argmin( sample(eligible, place_candidates), node.counts )   // P2C:无放回抽 place_candidates 个,取活沙箱计数较小者
 ```
 
-- **负载信号**:首选 `allocated / pool` 水位(node-resource.md,经心跳);**无 `resource_listen` 的
-  节点**(静态 cgroup,node.md §3)回退为 `沙箱计数 / capacity` headroom(`heartbeat.counts` +
-  `register.capacity`)。
+- **负载信号**:当前用 `heartbeat.counts`(活沙箱计数)。`allocated / pool` 水位(node-resource.md)、
+  `zone ≤ zone_admit_max` 区间过滤、`runtime_digest` 兼容性为设计信号,当前放置尚未纳入(仅
+  selector + shuffle 分片 + `¬draining` + 计数 P2C)。
 - `eligible` 为空 → 建议失败 → `Reserve` 失败 → router 转 503(cluster.md §7.4)。
 - scaler 只**建议**;registry 提交时 CAS(并发 / 视图滞后冲突则重问一次,cluster.md §4.3)。
 
@@ -141,6 +140,9 @@ scaler 把 {shard_by ∈ shards} 选择器 patch 回 group 的有效 nodeSelecto
 
 ### 4.5 PlaceBuild(资源感知)
 
+当前 build 放置复用 §4.2 `PlaceSandbox(group, "build")`(selector + shuffle + 计数 P2C)。下述按 build
+资源余量的放置为设计中能力——节点已上报 `build_capacity` / `build_alloc`,放置尚未消费:
+
 `PlaceBuild(group, resources{cpu,mem,storage}) → node_id 建议`:在 build 资源余量满足的节点间 P2C。
 
 ```
@@ -157,7 +159,7 @@ node_id = argmin( sample(eligible, place_candidates), build_alloc/build_capacity
 - **build 声明所需 `resources`**(不指定取 builder 默认配置);registry 提交 BuildStore 时 **RESERVED
   即占用**该节点 `build_alloc`,ready/error/gone 释放(cluster.md §7.5)。scaler 订阅 `build_alloc`
   维护视图。
-- 节点最终 admission 仍权威(build_register `rejected` → registry re-Place)。
+- 节点最终 admission 仍权威(build 沙箱启动被拒 → registry re-Place)。
 
 ## 5. 可靠性
 

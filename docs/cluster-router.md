@@ -40,18 +40,16 @@ router 与节点 proxy(node-proxy.md)构成**两级转发**:router 选**哪个�
 ## 2. 命令行接口
 
 ```
-cluster-ctl router [--config /etc/cluster-ctl/config.yaml] [--registry <addr>]
-                   [--listen :443] [--tls-cert <pem> --tls-key <pem>]
-                   [--auth enforce|log|off] [--metrics-listen <addr>]
+cluster-ctl router [--config /etc/cluster-ctl/config.yaml] [--registry <addr>] [--listen :443]
 ```
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
-| `--registry` | (必填) | registry 的 op 接口(UDS 本机 / mTLS 远端,cluster.md §4.2) |
-| `--listen` | `:443` | 统一入口(控制面 `api.<domain>` + 数据面,按 Host 分流);多副本同机可 **SO_REUSEPORT** |
-| `--tls-cert/--tls-key` | 空 | 通配证书(`*.<domain>` + `api.<domain>`);空 = h2c(dev) |
-| `--auth` | `enforce` | 调用方鉴权(§7):`enforce` / `log` / `off` |
-| `--metrics-listen` | 空 | Prometheus 端点(`router_requests_total{plane,result}`、`reserve_latency`、`cache_hit` 等) |
+| `--config` | `/etc/cluster-ctl/config.yaml` | 配置文件 |
+| `--registry` | 空 | 覆盖 registry op 接口(UDS 本机 / mTLS 远端,cluster.md §4.2);省略则用 `router.registry`,再省则同机 `op.listen` |
+| `--listen` | 空 | 覆盖 `router.listen` |
+
+TLS(`router.tls`)、数据面鉴权(`router.data_plane_auth`)等经配置文件(§3),无对应命令行旗标。
 
 ## 3. 配置
 
@@ -59,13 +57,13 @@ cluster-ctl router [--config /etc/cluster-ctl/config.yaml] [--registry <addr>]
 
 | 字段 | 默认 | 说明 |
 |---|---|---|
-| `router.listen` | `:443` | 同 `--listen` |
-| `router.tls` | 空 | 通配证书 |
-| `router.auth` | `enforce` | 调用方鉴权模式(§7) |
-| `router.group_header` | `X-Kuasar-Sandbox-Group` | 携带 sandbox-group 的头(每请求必带,§4) |
-| `router.route_key_header` | `X-Kuasar-Route-Key` | 数据面直寻址时携带 route-key 的头(§4) |
-| `router.auth_cache_ttl` | `60s` | 调用方鉴权结果缓存时长(§7) |
-| `router.metrics_listen` | 空 | Prometheus 端点 |
+| `router.registry` | 空 | registry op 接口;空 = 同机 `op.listen`(cluster.md §4.2) |
+| `router.listen` | `:443` | 统一入口(控制面 `api.<domain>` + 数据面,按 Host 分流);多副本同机 SO_REUSEPORT |
+| `router.tls` | 空 | 通配证书(`*.<domain>` + `api.<domain>`);空 = h2c(dev) |
+| `router.data_plane_auth` | `enforce` | 数据面 access-token 校验(§7):`enforce` 要求调用方携带沙箱 token(否则 401)/ `log` 仅告警 / `off` 跳过 |
+| `router.auth_cache_ttl` | `60s` | 调用方 api_key↔group 鉴权结果缓存时长(§8) |
+
+sandbox-group / route-key 头为固定常量(`X-Kuasar-Sandbox-Group` / `X-Kuasar-Route-Key`,§4),非配置项。
 
 `Reserve` 等待预算用 registry 的 `reserve.park_timeout`(cluster.md §3)。
 
@@ -128,9 +126,10 @@ create/connect 是 `Reserve` 的发起方,**等节点上报 running 才回**;其
         X-Access-Token: <access_token>       // 服务端注入(bare 路由无 token, 不注入)
 ```
 
-- **普通 HTTP**:`httputil.ReverseProxy{FlushInterval:-1}` 即时刷流反代到节点数据端点(TLS / h2c);
-  按节点数据端点池化连接。节点 proxy 按 `(sid, port)` 路由 guest envd / floatingip 并校验 token
-  (node-proxy.md §4 / §7)。
+- **普通 HTTP**:`httputil.ReverseProxy` 反代到节点数据端点(流式响应自动刷新;TLS / h2c);
+  **按节点数据端点池化连接**(per-host idle 上限高于 stdlib 默认,避免高密度连接抖动)。节点 proxy
+  按 `(sid, port)` 路由 guest envd / floatingip 并校验 token(node-proxy.md §4 / §7)。命中缓存的路由
+  转发失败(502)即**淘汰该缓存项**,下次经 watch / op 重解析。
 - **CONNECT 隧道**(端口转发 / 原始 TCP):router 向节点发**链式 CONNECT**(带 `E2b-Sandbox-Id` +
   端口 + `X-Access-Token`),节点照其链式 CONNECT 路径对接 guest(node-proxy.md §9)——
   client → router → node → guest,无环。
@@ -138,6 +137,9 @@ create/connect 是 `Reserve` 的发起方,**等节点上报 running 才回**;其
   头,节点 proxy 对无 token 路由放行(node-proxy.md §7);e2b 控制端口(49983/49999)回 501(同节点)。
 - **by-sid 的 paused/saved**:数据面打到已暂停 / 已上送的 sid,经其记录的 (group, route-key) 触发
   `Reserve` 恢复 / 迁移(单飞在 registry),再转发。
+- **数据面鉴权**(`router.data_plane_auth`,§3):`enforce`(默认)转发前校验调用方所带 `X-Access-Token`
+  与该 sandbox token 一致(否则 `401`),`log` 仅告警,`off` 跳过;各模式转发给节点时均注入正确 token
+  (节点 proxy 再校验,node-proxy.md §7)。
 
 ## 8. 调用方鉴权
 
@@ -150,7 +152,8 @@ sandbox-group 的授权**——控制面同理:
 - **鉴权缓存**:校验结果按 `router.auth_cache_ttl`(默认 60s)缓存,避免每请求回 `GroupKeyProvider`
   (尤其 external provider)——降延迟(cluster.md §9)。
 - 把鉴权折进 registry 调用使**租户密钥只在 registry / provider**(router 不持密钥)。
-- `router.auth`:`enforce`(默认)/ `log` / `off`(dev)。可前置 mTLS / JWT 网关替换鉴权钩子,接口不变。
+- 调用方鉴权(api_key)**恒开**,无 off/log 档;op 不可达回 `503`、密钥不符回 `403`。数据面 per-sandbox
+  token 的 `enforce`/`log`/`off` 档见 `router.data_plane_auth`(§7)。可前置 mTLS / JWT 网关替换鉴权钩子,接口不变。
 
 服务端内部 per-sandbox token 校验仍在节点 proxy(node-proxy.md §7),与此处调用方授权是**两道独立
 闸门**。
