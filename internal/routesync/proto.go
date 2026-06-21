@@ -58,6 +58,7 @@ const (
 	StateRunning = "running"
 	StatePaused  = "paused"
 	StateDead    = "dead"
+	StateSaved   = "saved" // node uploaded a remote snapshot + minted a migration token (cluster.md §7.4)
 )
 
 // Message types.

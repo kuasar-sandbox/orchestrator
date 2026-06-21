@@ -90,9 +90,27 @@ func (o *Orchestrator) ExportSandbox(ctx context.Context, apiKey, sid string, to
 		return types.TemplateID{Profile: tmpl.Profile, Kind: types.KindSnp, Key: key}.String(), nil
 	}
 
+	tok, err := o.mintSandboxToken(sb, ref)
+	if err != nil {
+		return "", err
+	}
+	if !keepSource {
+		_ = o.st.Delete(ctx, sid) // move: relinquish the source (the remote snapshot persists)
+	}
+	return tok, nil
+}
+
+// mintSandboxToken marshals a sandbox + its remote snapshot ref into a base64
+// migration token — the handle export-sandbox and the cluster SAVED promote both
+// hand a target node. No api-key gating; callers authorize upstream.
+func (o *Orchestrator) mintSandboxToken(sb *types.Sandbox, ref string) (string, error) {
+	tmpl, err := types.ParseTemplateID(sb.TemplateID)
+	if err != nil {
+		return "", err
+	}
 	dig, err := sha256File(o.runtimeFileFor(tmpl.Profile))
 	if err != nil {
-		return "", fmt.Errorf("export-sandbox: hash runtime: %w", err)
+		return "", fmt.Errorf("mint token: hash runtime: %w", err)
 	}
 	rawMK, _ := hex.DecodeString(sb.ManifestKey)
 	b, err := json.Marshal(SandboxToken{
@@ -105,9 +123,6 @@ func (o *Orchestrator) ExportSandbox(ctx context.Context, apiKey, sid string, to
 	if err != nil {
 		return "", err
 	}
-	if !keepSource {
-		_ = o.st.Delete(ctx, sid) // move: relinquish the source (the remote snapshot persists)
-	}
 	return base64.StdEncoding.EncodeToString(b), nil
 }
 
@@ -119,6 +134,23 @@ func (o *Orchestrator) ImportSandbox(ctx context.Context, apiKey, token string) 
 	if apiKey == "" {
 		return "", fmt.Errorf("import-sandbox: E2B_API_KEY is required")
 	}
+	// The tenant key must be on this node (manifest-key add) — same precondition as
+	// create — and the api key must resolve to it.
+	mk, err := o.resolveAllowed(ctx, apiKey)
+	if err != nil {
+		return "", err
+	}
+	if mk == "" {
+		return "", fmt.Errorf("import-sandbox: tenant key not on this node — add it first: node-ctl manifest-key add <key>")
+	}
+	return o.importSandboxWithKey(ctx, mk, token)
+}
+
+// importSandboxWithKey decodes a migration token, checks its fingerprint against
+// the resolved tenant key mk + that this node's guest runtime matches the
+// snapshot's, then inserts the paused row (the caller resumes). The cluster create
+// path supplies mk from the predistributed key; the SDK path from the api key.
+func (o *Orchestrator) importSandboxWithKey(ctx context.Context, mk, token string) (string, error) {
 	raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(token))
 	if err != nil {
 		return "", fmt.Errorf("import-sandbox: bad token: %w", err)
@@ -126,15 +158,6 @@ func (o *Orchestrator) ImportSandbox(ctx context.Context, apiKey, token string) 
 	var tok SandboxToken
 	if err := json.Unmarshal(raw, &tok); err != nil || tok.ID == "" || tok.SnapshotRef == "" {
 		return "", fmt.Errorf("import-sandbox: bad token (id/snapshot_ref missing)")
-	}
-	// The tenant key must be on this node (manifest-key add) — same precondition as
-	// create. The api key must resolve to it and match the token's fingerprint.
-	mk, err := o.resolveAllowed(ctx, apiKey)
-	if err != nil {
-		return "", err
-	}
-	if mk == "" {
-		return "", fmt.Errorf("import-sandbox: tenant key not on this node — add it first: node-ctl manifest-key add <key>")
 	}
 	rawMK, _ := hex.DecodeString(mk)
 	if hex.EncodeToString(apikey.Fingerprint(rawMK)) != tok.MKFingerprint {

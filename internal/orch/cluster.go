@@ -128,6 +128,11 @@ func (o *Orchestrator) precheckCluster(ctx context.Context, cmd *routesync.Comma
 	if err != nil {
 		return "", types.TemplateID{}, err
 	}
+	// A migration restores from the token's snapshot, not a template — the group's
+	// template_ref may be empty, so don't require it to parse.
+	if cmd.MigrationToken != "" {
+		return manifestKey, types.TemplateID{}, nil
+	}
 	tmpl, err := types.ParseTemplateID(cmd.TemplateRef)
 	if err != nil {
 		return "", types.TemplateID{}, fmt.Errorf("cluster create: template %q: %w", cmd.TemplateRef, err)
@@ -139,6 +144,12 @@ func (o *Orchestrator) precheckCluster(ctx context.Context, cmd *routesync.Comma
 // cluster (group, route_key) metadata) and publishes its route — which satisfies
 // the registry's Reserve.
 func (o *Orchestrator) bootCluster(ctx context.Context, cmd *routesync.Command, manifestKey string, tmpl types.TemplateID) (*types.Sandbox, error) {
+	// Migration (a SAVED reserve carries a token): import the remote snapshot by
+	// token + restore in one step, preserving the original sid (cluster.md §7.4),
+	// instead of a cold template boot.
+	if cmd.MigrationToken != "" {
+		return o.migrateCluster(ctx, cmd, manifestKey)
+	}
 	envdTok, _ := keys.MintToken()
 	trafTok, _ := keys.MintToken()
 
@@ -171,6 +182,25 @@ func (o *Orchestrator) bootCluster(ctx context.Context, cmd *routesync.Command, 
 	}
 	if err := o.launch(ctx, sb, tmpl); err != nil {
 		o.teardown(context.Background(), sb)
+		return nil, err
+	}
+	o.publishUpsert(sb)
+	return sb, nil
+}
+
+// migrateCluster imports a SAVED sandbox's migration token (the tenant key resolved
+// in precheck) and restores it from the remote snapshot on this node, keeping the
+// original sid + cluster metadata; the published running route satisfies the
+// Reserve (cluster.md §7.4 phase 2).
+func (o *Orchestrator) migrateCluster(ctx context.Context, cmd *routesync.Command, manifestKey string) (*types.Sandbox, error) {
+	if _, err := o.importSandboxWithKey(ctx, manifestKey, cmd.MigrationToken); err != nil {
+		return nil, fmt.Errorf("cluster migrate: import: %w", err)
+	}
+	sb, err := o.st.Get(ctx, cmd.SID)
+	if err != nil || sb == nil {
+		return nil, fmt.Errorf("cluster migrate: imported sandbox %s missing", cmd.SID)
+	}
+	if err := o.resume(ctx, sb); err != nil {
 		return nil, err
 	}
 	o.publishUpsert(sb)

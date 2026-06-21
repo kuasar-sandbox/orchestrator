@@ -192,6 +192,7 @@ func (r *Registry) startReserve(ctx context.Context, group, routeKey string, rec
 	sid := "sb-" + newID()
 	migrationToken := ""
 	if found && rec.State == StateSaved {
+		sid = rec.SID // reuse the original sid so the migration token's id matches on import
 		migrationToken = rec.MigrationToken
 	}
 	reserved := &SandboxRecord{Group: group, RouteKey: routeKey, SID: sid, State: StateReserved, NodeID: nodeID}
@@ -220,9 +221,14 @@ func (r *Registry) startReserve(ctx context.Context, group, routeKey string, rec
 	}
 	r.trackCmd(cmd.CmdID, flightKey(group, routeKey))
 	if err := conn.send(cmd); err != nil {
-		// Roll back the reservation that never reached the node, so it doesn't
-		// strand a RESERVED tombstone on a live node (the sweep won't clear it).
-		_ = r.stores.DeleteSandbox(ctx, group, routeKey)
+		// Roll back the reservation that never reached the node. A SAVED origin must
+		// RESTORE its record (it carries the migration token); a fresh one is deleted
+		// (a RESERVED tombstone on a live node wouldn't be swept).
+		if found && rec.State == StateSaved {
+			_, _ = r.stores.PutSandbox(ctx, rec)
+		} else {
+			_ = r.stores.DeleteSandbox(ctx, group, routeKey)
+		}
 		return err
 	}
 	return nil
@@ -294,6 +300,10 @@ func (r *Registry) applyRoute(ctx context.Context, nodeID string, e *routesync.R
 	if e.Group == "" || e.RouteKey == "" {
 		return // not a cluster-scoped sandbox route
 	}
+	if e.State == routesync.StateSaved {
+		r.applySaved(ctx, nodeID, e) // PAUSED -> SAVED promote (cluster.md §7.4)
+		return
+	}
 	rec := &SandboxRecord{
 		Group: e.Group, RouteKey: e.RouteKey, SID: e.SandboxID, NodeID: nodeID,
 		AccessToken: e.AccessToken, MigrationToken: e.MigrationToken, SnapLoc: e.SnapshotLocation,
@@ -328,6 +338,28 @@ func (r *Registry) applyRoute(ctx context.Context, nodeID string, e *routesync.R
 	}
 }
 
+// applySaved persists a PAUSED -> SAVED promotion (cluster.md §7.4): the node
+// uploaded a remote snapshot + minted a migration token but still holds the local
+// copy. The registry stores a node-unbound SAVED record (the token lets any node
+// later import+restore) and tells the reporting node to reclaim its local copy.
+func (r *Registry) applySaved(ctx context.Context, nodeID string, e *routesync.RouteEntry) {
+	rec := &SandboxRecord{
+		Group: e.Group, RouteKey: e.RouteKey, SID: e.SandboxID, NodeID: "", // unbind
+		State: StateSaved, AccessToken: e.AccessToken, MigrationToken: e.MigrationToken,
+		SnapLoc: e.SnapshotLocation, TemplateID: e.TemplateID, LastActive: time.Now().Unix(),
+	}
+	if _, err := r.stores.PutSandbox(ctx, rec); err != nil {
+		r.log.Warn("registry: put saved", "group", e.Group, "err", err)
+		return
+	}
+	r.indexSID(e.SandboxID, e.Group, e.RouteKey) // keep the sid index for a later by-sid wake
+	// Reclaim the node's local copy. This delete does NOT remove the registry record
+	// — applyDeleteBySID skips a SAVED record (the two-phase reclaim, §7.4).
+	if conn, live := r.node(nodeID); live {
+		_ = conn.send(&routesync.Command{CmdID: newID(), Kind: routesync.CmdDelete, SID: e.SandboxID})
+	}
+}
+
 // applyDelete converges a removed route (the node reports the sandbox gone).
 func (r *Registry) applyDelete(ctx context.Context, group, routeKey string) {
 	if group == "" || routeKey == "" {
@@ -347,11 +379,19 @@ func (r *Registry) indexSID(sid, group, routeKey string) {
 func (r *Registry) applyDeleteBySID(ctx context.Context, sid string) {
 	r.mu.Lock()
 	kp, ok := r.sidKeys[sid]
+	r.mu.Unlock()
+	if !ok {
+		return
+	}
+	// A SAVED sandbox's local copy is reclaimed by the node (the §7.4 delete), but
+	// its registry record + sid index persist for a later migrate — keep both.
+	if cur, _, found, _ := r.stores.GetSandbox(ctx, kp[0], kp[1]); found && cur.State == StateSaved {
+		return
+	}
+	r.mu.Lock()
 	delete(r.sidKeys, sid)
 	r.mu.Unlock()
-	if ok {
-		r.applyDelete(ctx, kp[0], kp[1])
-	}
+	r.applyDelete(ctx, kp[0], kp[1])
 }
 
 // finish satisfies the single-flight call for key (idempotent — first wins). It
