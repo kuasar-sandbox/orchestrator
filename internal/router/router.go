@@ -68,11 +68,11 @@ const buildTTL = time.Hour
 // TCP) for reserve + route resolution.
 type Router struct {
 	domain        string
-	dataPlaneAuth string // off | log | enforce — data-plane access-token check (§8)
-	opBase        string // http base for the op interface
-	opClient    *http.Client // 60s timeout (reserve / route calls)
-	watchClient *http.Client // no timeout (the long-lived route watch stream)
-	log         *slog.Logger
+	dataPlaneAuth string       // off | log | enforce — data-plane access-token check (§8)
+	opBase        string       // http base for the op interface
+	opClient      *http.Client // 60s timeout (reserve / route calls)
+	watchClient   *http.Client // no timeout (the long-lived route watch stream)
+	log           *slog.Logger
 
 	buildsMu sync.Mutex
 	builds   map[string]buildEntry // build_id -> node (a build is node-bound); TTL-evicted

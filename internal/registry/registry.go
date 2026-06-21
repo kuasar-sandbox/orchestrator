@@ -80,13 +80,13 @@ func New(stores *Stores, placer Placer, parkTimeout time.Duration, log *slog.Log
 		parkTimeout = 30 * time.Second
 	}
 	return &Registry{
-		stores:      stores,
-		placer:      placer,
-		parkTimeout: parkTimeout,
-		log:         log,
-		nodes:       make(map[string]nodeConn),
-		inflight:    make(map[string]*reserveCall),
-		sidKeys:     make(map[string][2]string),
+		stores:           stores,
+		placer:           placer,
+		parkTimeout:      parkTimeout,
+		log:              log,
+		nodes:            make(map[string]nodeConn),
+		inflight:         make(map[string]*reserveCall),
+		sidKeys:          make(map[string][2]string),
 		acks:             make(map[string]chan *routesync.CmdAck),
 		cmdFlight:        make(map[string]string),
 		keyLeased:        make(map[string]map[string]bool),
