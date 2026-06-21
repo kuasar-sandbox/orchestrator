@@ -34,20 +34,35 @@ func (r *Registry) RunKeyDistributor(ctx context.Context, renew time.Duration) {
 			return
 		case <-t.C:
 			r.reconcileKeys(ctx)
+		case <-r.reconcileTrigger:
+			r.reconcileKeys(ctx)
 		}
 	}
 }
 
-// onNodeConnected predistributes keys promptly to a freshly connected node (so it
-// holds its groups' keys before the first placement), off the channel read path.
+// onNodeConnected coalesces a key-reconcile request when a node connects: a
+// reconnect storm collapses into one reconcile instead of one goroutine per
+// node. The distributor loop drains the trigger; if it isn't running, the
+// non-blocking send is simply dropped (tests reconcile directly).
 func (r *Registry) onNodeConnected() {
-	go r.reconcileKeys(context.Background())
+	select {
+	case r.reconcileTrigger <- struct{}{}:
+	default:
+	}
 }
 
 // reconcileKeys pushes each keyed group's manifest key to its connected
 // allocation set (install / renew) and drops it from nodes that left the set.
+// The key-lease map is updated under keyMu, but the channel sends happen AFTER
+// the lock is released — so one wedged node can't stall key distribution for
+// every other group/node behind a blocked send.
 func (r *Registry) reconcileKeys(ctx context.Context) {
 	expires := time.Now().Add(keyLeaseTTL).Unix()
+	type keyOp struct {
+		nodeID, fp, manifestKey string
+		drop                    bool
+	}
+	var ops []keyOp
 	_ = r.stores.RangeGroups(ctx, func(g *GroupConfig) error {
 		if g.ManifestKey == "" {
 			return nil
@@ -57,21 +72,28 @@ func (r *Registry) reconcileKeys(ctx context.Context) {
 		r.keyMu.Lock()
 		have := r.keyLeased[g.Group]
 		for nodeID := range want {
-			if conn, live := r.node(nodeID); live {
-				_ = conn.send(&routesync.Command{CmdID: newID(), Kind: routesync.CmdKeyPut, KeyFingerprint: fp, ManifestKey: g.ManifestKey, ExpiresUnix: expires})
-			}
+			ops = append(ops, keyOp{nodeID: nodeID, fp: fp, manifestKey: g.ManifestKey})
 		}
 		for nodeID := range have {
 			if !want[nodeID] {
-				if conn, live := r.node(nodeID); live {
-					_ = conn.send(&routesync.Command{CmdID: newID(), Kind: routesync.CmdKeyDrop, KeyFingerprint: fp})
-				}
+				ops = append(ops, keyOp{nodeID: nodeID, fp: fp, drop: true})
 			}
 		}
 		r.keyLeased[g.Group] = want
 		r.keyMu.Unlock()
 		return nil
 	})
+	for _, o := range ops {
+		conn, live := r.node(o.nodeID)
+		if !live {
+			continue
+		}
+		if o.drop {
+			_ = conn.send(&routesync.Command{CmdID: newID(), Kind: routesync.CmdKeyDrop, KeyFingerprint: o.fp})
+		} else {
+			_ = conn.send(&routesync.Command{CmdID: newID(), Kind: routesync.CmdKeyPut, KeyFingerprint: o.fp, ManifestKey: o.manifestKey, ExpiresUnix: expires})
+		}
+	}
 }
 
 // allocationSet is the connected nodes matching a group's nodeSelectors (the key

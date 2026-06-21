@@ -50,6 +50,8 @@ type Registry struct {
 
 	keyMu     sync.Mutex
 	keyLeased map[string]map[string]bool // group -> node_ids currently holding the predistributed key
+
+	reconcileTrigger chan struct{} // coalesced key-reconcile wakeups (a node connecting)
 }
 
 // reserveCall is one in-flight ReserveSandbox; joiners wait on done, the channel
@@ -85,9 +87,10 @@ func New(stores *Stores, placer Placer, parkTimeout time.Duration, log *slog.Log
 		nodes:       make(map[string]nodeConn),
 		inflight:    make(map[string]*reserveCall),
 		sidKeys:     make(map[string][2]string),
-		acks:        make(map[string]chan *routesync.CmdAck),
-		cmdFlight:   make(map[string]string),
-		keyLeased:   make(map[string]map[string]bool),
+		acks:             make(map[string]chan *routesync.CmdAck),
+		cmdFlight:        make(map[string]string),
+		keyLeased:        make(map[string]map[string]bool),
+		reconcileTrigger: make(chan struct{}, 1),
 	}
 }
 
