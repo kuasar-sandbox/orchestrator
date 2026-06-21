@@ -61,6 +61,26 @@ func TestPlaceDraining(t *testing.T) {
 	}
 }
 
+func TestP2CNoReplacementAvoidsHot(t *testing.T) {
+	ctx := context.Background()
+	s := testStores(t)
+	s.PutNode(ctx, &registry.NodeRecord{NodeID: "hot", Counts: 100})
+	s.PutNode(ctx, &registry.NodeRecord{NodeID: "cold", Counts: 0})
+	s.PutGroup(ctx, &registry.GroupConfig{Group: "/g"})
+	p := New(s, clustercfg.ScalerConfig{PlaceCandidates: 2})
+	// k=2 over exactly 2 eligible nodes, sampled WITHOUT replacement, must always
+	// pick the colder node (with replacement it picks the hot one ~25% of the time).
+	for i := 0; i < 2000; i++ {
+		node, err := p.PlaceSandbox(ctx, "/g", "rk")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if node == "hot" {
+			t.Fatal("P2C(k=2) picked the hot node; sampling-with-replacement regression")
+		}
+	}
+}
+
 func TestShuffleSharding(t *testing.T) {
 	ctx := context.Background()
 	s := testStores(t)

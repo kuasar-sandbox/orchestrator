@@ -41,20 +41,26 @@ func (p *Placer) PlaceSandbox(ctx context.Context, group, routeKey string) (stri
 	if g, found, _ := p.stores.GetGroupByID(ctx, group); found && g != nil {
 		selectors = g.NodeSelectors
 	}
-	slotSet, shardBy := p.shuffleSlots(ctx, group)
-
-	var eligible []*registry.NodeRecord
+	// Scan the node table once, then compute shuffle slots + eligibility over the
+	// in-memory slice (RangeNodes deserializes every row — one pass, not 2-3).
+	var nodes []*registry.NodeRecord
 	if err := p.stores.RangeNodes(ctx, func(n *registry.NodeRecord) error {
-		if n.Draining || !matchSelectors(n.Labels, selectors) {
-			return nil
-		}
-		if slotSet != nil && !slotSet[n.Labels[shardBy]] {
-			return nil // shuffle-sharding: the group isn't pinned to this node's slot
-		}
-		eligible = append(eligible, n)
+		nodes = append(nodes, n)
 		return nil
 	}); err != nil {
 		return "", err
+	}
+	slotSet, shardBy := shuffleSlots(group, nodes, p.cfg.ShuffleSharding)
+
+	var eligible []*registry.NodeRecord
+	for _, n := range nodes {
+		if n.Draining || !matchSelectors(n.Labels, selectors) {
+			continue
+		}
+		if slotSet != nil && !slotSet[n.Labels[shardBy]] {
+			continue // shuffle-sharding: the group isn't pinned to this node's slot
+		}
+		eligible = append(eligible, n)
 	}
 	if len(eligible) == 0 {
 		return "", registry.ErrNoNode
@@ -64,26 +70,25 @@ func (p *Placer) PlaceSandbox(ctx context.Context, group, routeKey string) (stri
 
 // shuffleSlots returns the deterministic set of shard_by label values this group
 // is pinned to (cluster-scaler.md §4.4), or (nil,"") when no shuffle rule
-// applies. It buckets the live nodes by each rule's shard_by label and uses
+// applies. It buckets the given nodes by each rule's shard_by label and uses
 // maglev.LocateN to pick the group's n slots from that set.
-func (p *Placer) shuffleSlots(ctx context.Context, group string) (map[string]bool, string) {
-	for _, rule := range p.cfg.ShuffleSharding {
+func shuffleSlots(group string, nodes []*registry.NodeRecord, rules []clustercfg.ShuffleRule) (map[string]bool, string) {
+	for _, rule := range rules {
 		if rule.ShardBy == "" || rule.N <= 0 {
 			continue
 		}
 		// distinct shard_by values among nodes carrying the rule's selector.
 		seen := map[string]bool{}
 		var values []string
-		_ = p.stores.RangeNodes(ctx, func(n *registry.NodeRecord) error {
+		for _, n := range nodes {
 			if !labelsContain(n.Labels, rule.Selector) {
-				return nil
+				continue
 			}
 			if v := n.Labels[rule.ShardBy]; v != "" && !seen[v] {
 				seen[v] = true
 				values = append(values, v)
 			}
-			return nil
-		})
+		}
 		if len(values) == 0 {
 			continue
 		}
@@ -128,17 +133,28 @@ func labelsContain(labels, want map[string]string) bool {
 	return true
 }
 
-// p2c picks the least-loaded of k random candidates (power-of-two-choices when
-// k=2): O(1), decorrelated, herd-resistant (cluster-scaler.md §4.2). load =
-// sandbox count (the headroom fallback when no resource_listen heartbeat).
+// p2c picks the least-loaded of k DISTINCT random candidates (power-of-two-
+// choices when k=2): decorrelated, herd-resistant (cluster-scaler.md §4.2).
+// Sampling is WITHOUT replacement — with replacement, k=2 over a 2-node set
+// returns the more-loaded node ~25% of the time, which is exactly the eligible-
+// set size shuffle-sharding produces. Fisher-Yates also randomizes tie order.
+// load = sandbox count (the headroom fallback when no resource heartbeat).
 func p2c(nodes []*registry.NodeRecord, k int) *registry.NodeRecord {
+	if k > len(nodes) {
+		k = len(nodes)
+	}
 	if k < 1 {
 		k = 1
 	}
-	best := nodes[rand.Intn(len(nodes))]
-	for i := 1; i < k; i++ {
-		c := nodes[rand.Intn(len(nodes))]
-		if c.Counts < best.Counts {
+	idx := make([]int, len(nodes))
+	for i := range idx {
+		idx[i] = i
+	}
+	best := nodes[0]
+	for i := 0; i < k; i++ {
+		j := i + rand.Intn(len(idx)-i)
+		idx[i], idx[j] = idx[j], idx[i]
+		if c := nodes[idx[i]]; i == 0 || c.Counts < best.Counts {
 			best = c
 		}
 	}
