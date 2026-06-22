@@ -150,19 +150,32 @@ MKFS_EXT4="$(command -v mkfs.ext4 || echo /sbin/mkfs.ext4)"
 OVL="$WORK/overlay-1G.ext4"; truncate -s 1G "$OVL"; "$MKFS_EXT4" -F -q -b 4096 "$OVL" >"$WORK/mkfs.log" 2>&1 || fail "mkfs overlay"
 BLD="$WORK/builder-2G.ext4"; truncate -s 2G "$BLD"; "$MKFS_EXT4" -F -q -b 4096 "$BLD" >"$WORK/mkfs-bld.log" 2>&1 || fail "mkfs builder"
 
-# ---- cluster config (registry is started after the group is seeded, so the
-#      registry is the sole writer of its sqlite — no cross-process rev clash) --
-cat > "$WORK/cluster.yaml" <<EOF
-domain: $DOMAIN
-store: { kind: sqlite, dsn: $WORK/cluster/registry.db }
-group_config: { encryption_key: "$ENC2" }
-channel: { listen: 127.0.0.1:$REG_PORT, heartbeat_interval: 2s, node_dead_after: 6s }
-op:
+# ---- per-role cluster configs (one file per role, cluster.md §3). The registry
+#      binds control_api (server mTLS); router/scaler DIAL it via registry.{endpoint,tls}
+#      (client mTLS). Registry is started after the group is seeded so it is the sole
+#      writer of its sqlite (no cross-process rev clash). --------------------------
+cat > "$WORK/registry.yaml" <<EOF
+state: { backend: sqlite, dsn: $WORK/cluster/registry.db }
+sandbox_group: { encryption_key: "$ENC2" }
+node_link: { listen: 127.0.0.1:$REG_PORT, heartbeat_interval: 2s, node_dead_after: 6s }
+control_api:
   listen: $OP_LISTEN
   tls: { cert: $OP_CERT, key: $OP_KEY, ca: $OP_CERT }
-scaler: { registry: $OP_LISTEN }
 reserve: { park_timeout: 90s }
-router: { listen: 127.0.0.1:$ROUTER_PORT, data_plane_auth: off }
+EOF
+cat > "$WORK/router.yaml" <<EOF
+domain: $DOMAIN
+registry:
+  endpoint: $OP_LISTEN
+  tls: { cert: $OP_CERT, key: $OP_KEY, ca: $OP_CERT }
+ingress: { listen: 127.0.0.1:$ROUTER_PORT }
+auth: { data_plane: off }
+EOF
+cat > "$WORK/scaler.yaml" <<EOF
+registry:
+  endpoint: $OP_LISTEN
+  tls: { cert: $OP_CERT, key: $OP_KEY, ca: $OP_CERT }
+placement: { node_dead_after: 6s }
 EOF
 
 # ---- node-ctl serve, joined to the cluster over node-link ------------------
@@ -172,7 +185,7 @@ encryption_key: "$ENC"
 manifest_config: $WORK/manifest.yaml
 paths: { run_root: $WORK/run, base_root: $WORK/lib, config_socket: $WORK/node-ctl.socket }
 units: { dir: $UNIT_DIR }
-cluster: { registry: "127.0.0.1:$REG_PORT", node_id: n1, data_endpoint: "127.0.0.1:$PORT", heartbeat_interval: 2s }
+cluster: { registry: { endpoint: "127.0.0.1:$REG_PORT" }, node_id: n1, data_endpoint: "127.0.0.1:$PORT", heartbeat_interval: 2s }
 sandbox:
   timeout_sec: 120
   network: { switch: $SWITCH }
@@ -199,15 +212,15 @@ echo "==> node-ctl up (:$PORT); node-link retries until the registry starts (the
 # after the cluster build below. Seed before the registry starts so the registry
 # is the sole sqlite writer (no cross-process revision clash).
 GROUP="/cell/proj/app/g1"
-"$BIN/cluster-ctl" group upsert --config "$WORK/cluster.yaml" --group "$GROUP" --manifest-key "$MK" >/dev/null || fail "group upsert"
+"$BIN/cluster-ctl" sandbox-group upsert --config "$WORK/registry.yaml" --group "$GROUP" --manifest-key "$MK" >/dev/null || fail "sandbox-group upsert"
 echo "==> seeded group $GROUP (manifest key; template set after the cluster build)"
-"$BIN/cluster-ctl" registry --config "$WORK/cluster.yaml" >"$WORK/registry.log" 2>&1 &
+"$BIN/cluster-ctl" registry --config "$WORK/registry.yaml" >"$WORK/registry.log" 2>&1 &
 PIDS+=($!); wait_port 127.0.0.1 "$REG_PORT" registry
 echo "==> cluster-ctl registry up (node-link :$REG_PORT, op $OP_LISTEN mTLS)"
 for _ in $(seq 1 30); do grep -q "node connected" "$WORK/registry.log" && break; sleep 0.5; done
 grep -q "node connected" "$WORK/registry.log" || { sed 's/^/  reg| /' "$WORK/registry.log"; fail "node never joined the cluster over node-link"; }
 echo "==> PASS: node joined the cluster (registry saw the node-link connection)"
-"$BIN/cluster-ctl" scaler --config "$WORK/cluster.yaml" >"$WORK/scaler.log" 2>&1 &
+"$BIN/cluster-ctl" scaler --config "$WORK/scaler.yaml" >"$WORK/scaler.log" 2>&1 &
 PIDS+=($!)
 # Standalone scaler (no in-process mode): it DIALS the registry op endpoint (mTLS),
 # subscribes the node/group view, and answers the registry's reverse placement
@@ -215,7 +228,7 @@ PIDS+=($!)
 for _ in $(seq 1 60); do grep -q "scaler-link: scaler connected" "$WORK/registry.log" && break; sleep 0.5; done
 grep -q "scaler-link: scaler connected" "$WORK/registry.log" || { sed 's/^/  scaler| /' "$WORK/scaler.log" | tail -15; fail "standalone scaler never connected the scaler-link"; }
 echo "==> PASS: standalone scaler dialed the registry; placement answered over the reverse-call scaler-link (mTLS)"
-"$BIN/cluster-ctl" router --config "$WORK/cluster.yaml" >"$WORK/router.log" 2>&1 &
+"$BIN/cluster-ctl" router --config "$WORK/router.yaml" >"$WORK/router.log" 2>&1 &
 PIDS+=($!); wait_port 127.0.0.1 "$ROUTER_PORT" router
 echo "==> cluster-ctl router up (:$ROUTER_PORT)"
 
@@ -247,8 +260,8 @@ done
 echo "==> PASS: cluster build produced $TEMPLATE (router -> reserve-build -> node build sandbox)"
 
 # ---- point the group at the freshly built template (registry in-process) ----
-code=$(opcurl -o /dev/null -w '%{http_code}' -X POST "https://$OP_LISTEN/op/group?group=$GROUP&template_ref=$TEMPLATE")
-[ "$code" = "204" ] || fail "op /op/group set template_ref (http $code)"
+code=$(opcurl -o /dev/null -w '%{http_code}' -X POST "https://$OP_LISTEN/control/group?group=$GROUP&template_ref=$TEMPLATE")
+[ "$code" = "204" ] || fail "control_api /control/group set template_ref (http $code)"
 echo "==> group $GROUP -> $TEMPLATE (via registry op)"
 
 # ---- create a sandbox THROUGH the cluster (router -> reserve -> node boot) --
@@ -275,7 +288,7 @@ bad=$(curl -sS --noproxy '*' -o /dev/null -w '%{http_code}' -X POST -H "Host: ap
 [ "$bad" = "403" ] && echo "==> PASS: router rejected a bad api key (403, §8 auth cache)" || fail "router auth: bad key got $bad (want 403)"
 
 # ---- the registry knows the route is ready ---------------------------------
-opcurl -o "$WORK/route.body" "https://$OP_LISTEN/op/route?sid=$SID" || fail "op route query"
+opcurl -o "$WORK/route.body" "https://$OP_LISTEN/control/route?sid=$SID" || fail "control_api route query"
 grep -q '"state":"ready"' "$WORK/route.body" || { cat "$WORK/route.body"; fail "registry route not ready for $SID"; }
 echo "==> PASS: registry resolves $SID -> node ready (op /route)"
 
@@ -308,7 +321,7 @@ case "$pcode" in 200|204) ;; *) sed 's/^/  router| /' "$WORK/router.log" | tail 
 # registry stores it node-unbound and tells the node to reclaim its local copy.
 saved=0
 for _ in $(seq 1 30); do
-    opcurl -o "$WORK/saved.body" "https://$OP_LISTEN/op/route?sid=$SID" 2>/dev/null
+    opcurl -o "$WORK/saved.body" "https://$OP_LISTEN/control/route?sid=$SID" 2>/dev/null
     grep -q '"state":"saved"' "$WORK/saved.body" 2>/dev/null && { saved=1; break; }
     sleep 1
 done
@@ -319,7 +332,7 @@ echo "==> PASS: deep-idle PAUSED sandbox promoted to SAVED (node-unbound + migra
 curl -sS --noproxy '*' -o /dev/null --max-time 90 -H "Host: 49983-$SID.$DOMAIN" "http://127.0.0.1:$ROUTER_PORT/health" 2>/dev/null || true
 ready=0
 for _ in $(seq 1 30); do
-    opcurl -o "$WORK/mig.body" "https://$OP_LISTEN/op/route?sid=$SID" 2>/dev/null
+    opcurl -o "$WORK/mig.body" "https://$OP_LISTEN/control/route?sid=$SID" 2>/dev/null
     grep -q '"state":"ready"' "$WORK/mig.body" 2>/dev/null && { ready=1; break; }
     sleep 1
 done
@@ -331,7 +344,7 @@ echo "==> killing node-ctl (pid $NODE_PID); expecting the registry to sweep $SID
 kill -9 "$NODE_PID" 2>/dev/null
 swept=0
 for _ in $(seq 1 20); do
-    code=$(opcurl -o /dev/null -w '%{http_code}' "https://$OP_LISTEN/op/route?sid=$SID" 2>/dev/null || echo 000)
+    code=$(opcurl -o /dev/null -w '%{http_code}' "https://$OP_LISTEN/control/route?sid=$SID" 2>/dev/null || echo 000)
     [ "$code" = "404" ] && { swept=1; break; }
     sleep 1
 done

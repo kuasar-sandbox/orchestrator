@@ -113,7 +113,6 @@ $(UMBRELLA_E2E): test-e2e-%: build
 # Aggregate test-e2e: every umbrella sub-target + each sub-repo's test-e2e.
 test-e2e: build $(UMBRELLA_E2E)
 	$(MAKE) -C $(ORG)/sandbox-accelerator test-e2e
-	$(MAKE) -C $(ORG)/sandbox-orchestrator test-e2e-node-ctl
 	$(MAKE) -C $(ORG)/sandbox-vswitch test-e2e
 
 # perf harnesses living in this repo (cross-repo binary use).

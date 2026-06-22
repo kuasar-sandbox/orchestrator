@@ -7,7 +7,7 @@
 # data-plane traffic driven THROUGH the proxy (not the orchestrator):
 #
 #   serve(proxy_mode=external)                          # control plane on :PORT
-#   proxy --config-socket=<uds> --id=.. --socket=<uds> --data-listen=:PROXY_PORT
+#   proxy --config <proxy.yaml> --id=.. --socket=<uds>  # data-plane on :PROXY_PORT
 #         # registers on the config-socket plugin plane + syncs the route table
 #   POST /sandboxes  -> real VM + envd ; serve streams the route to the proxy
 #   GET <proxy>/health (Host 49983-<sid>): no token -> 401 (enforce);
@@ -215,9 +215,17 @@ done
 "$BIN/node-ctl" manifest-key add --socket "$WORK/node-ctl.socket" "$MK" >/dev/null || fail "manifest-key add"
 
 echo "==> node-ctl proxy (registers on config-socket, data-plane :$PROXY_PORT)"
-"$BIN/node-ctl" proxy --config-socket="$WORK/node-ctl.socket" --id=proxy-1 \
-    --socket="$PROXY_SOCK" --data-listen="127.0.0.1:$PROXY_PORT" \
-    --auth=enforce --park-timeout=90s --metrics-listen="127.0.0.1:$METRICS_PORT" >"$WORK/proxy.log" 2>&1 &
+# The worker reads its policy/endpoints from proxy.yaml; only per-instance identity
+# (--id/--socket) + the per-instance metrics port stay on the command line. h2c here
+# (no tls), matching serve's plain-http listener.
+cat > "$WORK/proxy.yaml" <<EOF
+config_socket: $WORK/node-ctl.socket
+data_listen: 127.0.0.1:$PROXY_PORT
+auth: enforce
+park_timeout: 90s
+EOF
+"$BIN/node-ctl" proxy --config "$WORK/proxy.yaml" --id=proxy-1 \
+    --socket="$PROXY_SOCK" --metrics-listen="127.0.0.1:$METRICS_PORT" >"$WORK/proxy.log" 2>&1 &
 PIDS+=($!)
 wait_port 127.0.0.1 "$PROXY_PORT" proxy
 echo "==> control plane up; proxy registered on the config-socket plugin plane"

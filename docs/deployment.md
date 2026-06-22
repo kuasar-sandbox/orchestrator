@@ -246,7 +246,7 @@ node-ctl 解析,见 node.md §12。构建池上限由 `sandbox-builder.slice` �
 ## 6. Cluster Control Plane (cluster-ctl)
 
 大规模(多 compute 节点)部署时,机群之上由 **cluster-ctl** 三角色控制面聚合:**registry**
-(持久状态权威 + 节点通道枢纽 + 异步 op/watch)、**router**(e2b 兼容统一入口:控制面 + 数据面,
+(持久状态权威 + 节点通道枢纽 + 异步 control_api/watch)、**router**(e2b 兼容统一入口:控制面 + 数据面,
 按 sandbox-group + route-key 会话亲和路由)、**scaler**(放置调度器)。详见
 `sandbox-orchestrator/docs/cluster.md`。单 compute 节点独立部署(直供 e2b SDK)时**不需要** cluster 层。
 
@@ -254,11 +254,11 @@ node-ctl 解析,见 node.md §12。构建池上限由 `sandbox-builder.slice` �
 
 | 进程 | 角色 | 数量 | 启停 | 归属 |
 |---|---|---|---|---|
-| `cluster-ctl registry` | 持久状态权威(node / sandbox-group / sandbox / build 注册表)+ 每节点 node-link 长连枢纽 + 异步 op/watch;**持久后端 sqlite/etcd/raft(无内存模式)** | 单 / 多副本(按 sandbox-group 分片)| systemd | 平台内,`cluster.md` §4 / §10 |
+| `cluster-ctl registry` | 持久状态权威(node / sandbox-group / sandbox / build 注册表)+ 每节点 node-link 长连枢纽 + 异步 control_api/watch;**持久后端 sqlite/etcd/raft(无内存模式)** | 单 / 多副本(按 sandbox-group 分片)| systemd | 平台内,`cluster.md` §4 / §10 |
 | `cluster-ctl router` | e2b 兼容统一入口(`api.<domain>` 控制面 + 数据面),持本地路由缓存,经 Reserve 路由 / 拉起沙箱 | N 副本(LB 后,无状态)| systemd | 平台内,`cluster-router.md` |
 | `cluster-ctl scaler` | 放置调度器:给 registry 出 PlaceSandbox / PlaceBuild 建议 + 维护 shuffle-sharding 选择器 | 单 / 多副本(按 group 分片)| systemd | 平台内,`cluster-scaler.md` |
 
-小规模可三角色同机共置(op 接口走 UDS,低延迟);大规模各自横向扩展(`cluster.md` §4.2)。
+小规模可三角色同机共置(control_api 接口走 UDS,低延迟);大规模各自横向扩展(`cluster.md` §4.2)。
 
 ### 6.2 端口
 
@@ -266,7 +266,7 @@ node-ctl 解析,见 node.md §12。构建池上限由 `sandbox-builder.slice` �
 |---|---|---|---|
 | `cluster-ctl router` | `:443` | HTTPS/h2 | **对外** e2b 控制面 + 数据面入口(机群唯一北向面)|
 | `cluster-ctl registry` | `:7700`(node-link)| 帧化 JSON/h2c,mTLS | compute 节点 `node-ctl serve` 拨入注册 / 心跳 / 事件 / 命令(每节点一条长连)|
-| `cluster-ctl registry` | `/run/cluster/registry.sock`(op)| 帧化 JSON | 本机 router/scaler 的异步 op/watch(远端经 mTLS)|
+| `cluster-ctl registry` | `/run/cluster/registry.sock`(control_api)| 帧化 JSON | 本机 router/scaler 的异步 reserve/watch/placement(远端经 mTLS)|
 
 ### 6.3 与节点 / 平台管理面的关系
 
@@ -274,7 +274,7 @@ node-ctl 解析,见 node.md §12。构建池上限由 `sandbox-builder.slice` �
   (复用其 routesync 引擎,反向注册为路由权威);registry 经该通道下发 create/connect/delete/
   build_register/密钥租约,节点上报沙箱 / 构建事件与水位(`node.md` §10)。
 - **平台管理面(平台外)**:经 `GroupConfigProvider` 接口给 cluster 提供 sandbox-group 配置(租户
-  manifest_key、沙箱初始化配置、镜像仓库、模板、nodeSelectors)——registry 自存(`group_config.providers=store`)
+  manifest_key、沙箱初始化配置、镜像仓库、模板、nodeSelectors)——registry 自存(`sandbox_group.providers=store`)
   或向平台管理面服务取(`external:`,扩展点,`cluster.md` §6.2)。租户密钥分发由 registry 主管
   (预分发到分配节点集,`cluster.md` §7.6)。
 
@@ -450,9 +450,9 @@ Cluster Control Plane:  registry(持久 sqlite/etcd)+ router(N 副本 LB 后)+ s
 | `store-ctl` | `--config <path>` | `listen: 127.0.0.1:7100`(节点本机)| [`docs/store.md`](store.md) §3 |
 | `cache-ctl tiered` | `--config <path>` | `listen: 127.0.0.1:7070`(节点本机);`tiers[].cluster.peers` 写本 AZ L2 全集群 | [`docs/cache.md`](cache.md) §3.4 |
 | `cache-ctl shard` | `--config <path>` | `listen: 0.0.0.0:7070`(对外服务)| [`docs/cache.md`](cache.md) §3.3 |
-| `node-ctl serve(resource_listen)` | `/etc/node-ctl/config.yaml` 的 `resource_listen` 块 | `listen: /run/sandbox-resource.sock` | [`docs/node-resource.md`](node-resource.md) §3 |
-| `cluster-ctl registry` | `--config /etc/cluster-ctl/config.yaml` | `store: sqlite/etcd/raft`,`channel.listen: :7700`,`op.listen` UDS | `sandbox-orchestrator/docs/cluster.md` §3 |
-| `cluster-ctl router` / `scaler` | `--config … --registry <addr>` | router `:443`(LB 后 N 副本) | `cluster-router.md` / `cluster-scaler.md` §3 |
+| `node-ctl serve(resource_listen)` | `/etc/node-ctl/serve.yaml` 的内联 `resource_listen` 块 | `socket: /run/sandbox-resource.sock` | [`docs/node-resource.md`](node-resource.md) §3 |
+| `cluster-ctl registry` | `--config /etc/cluster-ctl/registry.yaml` | `state.backend: sqlite/etcd/raft`,`node_link.listen: :7700`,`control_api.listen` UDS | `sandbox-orchestrator/docs/cluster.md` §3 |
+| `cluster-ctl router` / `scaler` | `--config /etc/cluster-ctl/{router,scaler}.yaml`(各自文件;`registry: { endpoint, tls }` 指向 registry control_api)| router `:443`(LB 后 N 副本) | `cluster-router.md` / `cluster-scaler.md` §3 |
 | `sandbox-ctl run` | `--config <path>`(`SANDBOX_CONFIG`)+ `--manifest-config <path>`(`MANIFEST_CONFIG`)| **per-sandbox**,由 `node-ctl` 生成,落在 `/run/sandbox/<sid>/` | [`docs/sandbox.md`](sandbox.md) §3 |
 | `manifest-ctl` | `--manifest-config <path>`(`MANIFEST_CONFIG`)| 与 `sandbox-ctl` 共享格式;只连本机 store-ctl + cache-ctl | [`docs/manifest.md`](manifest.md) §3 |
 | `flatten-ctl` | CLI flag + `--manifest-config`(`MANIFEST_CONFIG`,`--upload` 时)+ `--config`(`FLATTEN_CONFIG`,registry 源时);凭据走 `FLATTEN_REGISTRY_*` env | 经 builder runtime flavor 在构建沙箱 guest 内运行(`run-builder` 驱动,§5)| [`docs/flatten.md`](flatten.md) §2 |
