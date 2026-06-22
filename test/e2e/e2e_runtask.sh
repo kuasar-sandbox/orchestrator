@@ -37,9 +37,9 @@ trap '[ -n "${E2E_KEEP:-}" ] && echo "kept $WORK" || rm -rf "$WORK"; [ -n "${SRV
 
 # ---- 1. CLI smokes --------------------------------------------------------
 echo "==> CLI: config --template + round-trip (validate)"
-"$ORCH" config --template > "$WORK/orch.yaml"
-grep -q "domain:" "$WORK/orch.yaml" || fail "node-ctl config --template missing domain"
-"$ORCH" config --config "$WORK/orch.yaml" >/dev/null || fail "node-ctl config --config did not validate the template"
+"$ORCH" config serve --template > "$WORK/orch.yaml"
+grep -q "domain:" "$WORK/orch.yaml" || fail "node-ctl config serve --template missing domain"
+"$ORCH" config serve --config "$WORK/orch.yaml" >/dev/null || fail "node-ctl config serve --config did not validate the template"
 
 "$FLATTEN" config --template > "$WORK/flatten.yaml"
 grep -q "referer:" "$WORK/flatten.yaml" || fail "flatten-ctl config --template missing referer"
