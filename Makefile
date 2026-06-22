@@ -12,7 +12,7 @@
 
 SHELL    := /bin/bash
 ORG      := $(abspath $(CURDIR)/..)
-VERSION  ?= v0.1.0
+VERSION  ?= v0.1.1
 
 # ---------------------------------------------------------------------------
 # Architecture selection (identical normalization across kuasar-sandbox repos)

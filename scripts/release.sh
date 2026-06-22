@@ -22,7 +22,7 @@
 
 set -euo pipefail
 
-VERSION="${1:-v0.1.0}"
+VERSION="${1:-v0.1.1}"
 ARCH="${TARGET_ARCH:-$(uname -m)}"
 case "$ARCH" in amd64) ARCH=x86_64 ;; arm64) ARCH=aarch64 ;; esac
 
@@ -54,11 +54,14 @@ DOCS=(
   # microVM runtime
   "sandbox-runtime/docs/sandbox.md"
   "sandbox-runtime/docs/sandbox-runtime.md"
-  # node controller (folded into the orchestrator)
+  # node orchestrator — single-node control plane + data-plane proxy + resource daemon
   "sandbox-orchestrator/docs/node.md"
-  # node orchestrator (e2b-compatible ingress)
-  "sandbox-orchestrator/docs/orchestrator.md"
-  "sandbox-orchestrator/docs/proxy.md"
+  "sandbox-orchestrator/docs/node-proxy.md"
+  "sandbox-orchestrator/docs/node-resource.md"
+  # cluster tier — registry + router + scaler
+  "sandbox-orchestrator/docs/cluster.md"
+  "sandbox-orchestrator/docs/cluster-router.md"
+  "sandbox-orchestrator/docs/cluster-scaler.md"
   # virtual switch
   "sandbox-vswitch/docs/vswitch.md"
   "sandbox-vswitch/docs/tapfd.md"
@@ -99,6 +102,8 @@ E2ES=(
   "kuasar-sandbox/test/e2e/e2e_run_builder.sh"
   "kuasar-sandbox/test/e2e/e2e_execute.sh"
   "kuasar-sandbox/test/e2e/e2e_orchestrator_proxy.sh"
+  # cluster tier (real microVM: router -> registry -> node-link)
+  "kuasar-sandbox/test/e2e/e2e_cluster.sh"
   # accelerator (2)
   "sandbox-accelerator/test/e2e/e2e_cache.sh"
   "sandbox-accelerator/test/e2e/e2e_cluster_rolling.sh"
