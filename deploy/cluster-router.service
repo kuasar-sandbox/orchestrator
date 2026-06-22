@@ -1,0 +1,16 @@
+# cluster-router.service — cluster unified e2b ingress (cluster-router.md). Dials the
+# registry op endpoint (router.yaml: registry). Stateless; run one or more replicas
+# (they share :443 via SO_REUSEPORT). Operator-managed.
+[Unit]
+Description=kuasar cluster-ctl router (unified e2b ingress)
+After=network-online.target cluster-registry.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/cluster-ctl router --config /etc/cluster-ctl/router.yaml
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

@@ -11,7 +11,7 @@ import (
 )
 
 // Scaler-link (cluster.md §4.3/§5.2): the standalone scaler DIALS the registry
-// (no scaler listen) and subscribes the node/group view (the op watches); on this
+// (no scaler listen) and subscribes the node/group view (the control watches); on this
 // link the registry REVERSE-REQUESTS placement — it writes place_req down and the
 // scaler answers place_result up. channelPlacer is the registry's Placer over it;
 // with no scaler attached, placement returns ErrNoNode (cold placement stalls

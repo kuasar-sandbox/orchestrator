@@ -2,8 +2,8 @@
 
 节点级**资源控制器**跟节点上所有动态控制模式 sandbox-ctl 通过沙箱资源控制
 协议对话,完成跨沙箱仲裁、burst 申请、settled 收回、admission 控制。它由
-`node-ctl serve` 经 `resource_listen` 内置(node.md §3 / §10),也可作为独立
-daemon 运行;本文档把内置实例与独立 daemon 统称"控制器"。
+`node-ctl serve` 经 `resource_listen` 内置(node.md §3 / §10),配置内联在
+serve.yaml 里,无独立 daemon 入口、无单独配置文件;本文档统称其为"控制器"。
 
 控制器是协议的**对端角色**,不是某个具体进程:任何遵循 §5 定义的实现都可
 作为 sandbox-ctl 的对端,`node-ctl` 的内置控制器是参考实现。本文档同时定义
@@ -61,8 +61,8 @@ daemon 运行;本文档把内置实例与独立 daemon 统称"控制器"。
 
 ## 2. 命令行接口
 
-控制器既可由 `node-ctl serve` 内置(配 `resource_listen`,node.md §3 / §10),也可作为
-独立进程运行;只读巡检与运维动词在 `node-ctl resource` 子命令组下。
+控制器由 `node-ctl serve` 内置(配 `resource_listen`,node.md §3 / §10);只读巡检
+与运维动词在 `node-ctl resource` 子命令组下。
 
 ### 2.1 子命令总览
 
@@ -75,12 +75,12 @@ daemon 运行;本文档把内置实例与独立 daemon 统称"控制器"。
 | `resource grant` | 强制下发 budget(调试) |
 | `resource reclaim` | 强制收回(运维) |
 
-### 2.2 控制器启动(`node-ctl serve` 内置 / 独立)
+### 2.2 控制器启动(`node-ctl serve` 内置)
 
 控制器随 `node-ctl serve` 起:配 `resource_listen`(§3)即在该 UDS 起 RPC server、
 admission worker、memory allocator、active reclaimer、idle sweeper 与 state
-persister(§7)。`resource_listen` 的子字段(`listen` / `state_path` /
-`cgroup_scan_paths` / `resources` / `watermarks` / …)即原 daemon 的配置(§3)。
+persister(§7)。`resource_listen` 的子字段(`socket` / `state_path` /
+`cgroup_scan_paths` / `resources` / `watermarks` / …)是内联在 serve.yaml 里的控制器调参(§3)。
 集群下,控制器上报的节点水位(zone / allocated / pool)经 serve 的 node-link 心跳喂
 集群 P2C 放置(node.md §10、cluster.md §5 / cluster-scaler.md §4)。
 
@@ -133,12 +133,15 @@ node-ctl resource reclaim <sid> --memory <target> [--socket /run/sandbox-resourc
 
 ### 3.1 resource_listen 配置块
 
-控制器配置是 `node-ctl serve` 配置(node.md §3)的 `resource_listen` 块(独立 daemon
-同形态单独成文);`resource_listen` 非空即在其 `listen` 起控制器。字段(yaml 形态):
+控制器配置是 `node-ctl serve` 配置(node.md §3)的 `resource_listen` 块,内联在
+serve.yaml 里(无独立配置文件);`enabled: true` 即在其 `socket` 起控制器。字段
+(yaml 形态,均挂在 `resource_listen:` 下):
 
 ```yaml
-listen: /run/sandbox-resource.sock
+enabled: true
+socket: /run/sandbox-resource.sock     # "" = pkg/resource 默认(与 sandbox-ctl 一致)
 state_path: /run/node-ctl/state.json   # tmpfs
+audit_path: /run/node-ctl/audit.log    # tmpfs;高频审计不写磁盘
 cgroup_scan_paths:                      # (预留)重启对账扫描根
   - /sys/fs/cgroup/sandboxes
 
@@ -169,18 +172,16 @@ admission:
 dampening:                              # 振荡阻尼,不进 sandbox.yaml
   recover_duration: 60s                # burst → settled 观察期
   cooldown_periods: 10                 # × 100ms,burst → recover 判定门槛
-
-logging:
-  level: info
-  audit_path: /run/node-ctl/audit.log  # tmpfs;高频审计不写磁盘
 ```
 
 ### 3.2 字段语义
 
 | 字段 | 默认 | 说明 |
 |---|---|---|
-| `listen` | `/run/sandbox-resource.sock` | UDS,sandbox-ctl 拨号目标 |
+| `enabled` | `false` | 置 `true` 才在 serve 内起控制器;否则沙箱用静态 cgroup |
+| `socket` | `pkg/resource` 默认 | UDS,sandbox-ctl 拨号目标;`""` = 协议默认(与 sandbox-ctl 一致) |
 | `state_path` | `/run/node-ctl/state.json` | tmpfs,控制器重启快速恢复用 |
+| `audit_path` | `/run/node-ctl/audit.log` | tmpfs;高频审计不写磁盘 |
 | `cgroup_scan_paths` | `[/sys/fs/cgroup/sandboxes]` | (预留)重启对账扫描根 |
 | `resources.physical_memory` | `auto` | 节点物理内存(`/proc/meminfo`)|
 | `resources.physical_cpu` | `auto` | 节点物理核数(`nproc`) |
@@ -528,11 +529,11 @@ end
 
 ## 7. node-ctl 内部组织
 
-`node-ctl` 的内置控制器是协议的参考实现,随 `node-ctl serve` 起(或独立 daemon)。
+`node-ctl` 的内置控制器是协议的参考实现,随 `node-ctl serve` 起(配 `resource_listen`)。
 它内部组织成四个角色,共享 in-memory state 与 /run 持久化:
 
 ```
-controller (node-ctl serve resource_listen / 独立 daemon)
+controller (node-ctl serve resource_listen)
 ├── RPC server               处理协议消息
 ├── Admission Controller     §6 准入与速率限制
 ├── Memory Allocator         §4.3 仲裁与 grant

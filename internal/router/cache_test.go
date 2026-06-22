@@ -16,15 +16,15 @@ import (
 // TestAuthRejectsBadKey checks the Phase 7g router auth: a create whose api key
 // the registry rejects is 403'd at the router, before any reserve.
 func TestAuthRejectsBadKey(t *testing.T) {
-	op := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/op/verify-key" {
+	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/control/verify-key" {
 			w.WriteHeader(http.StatusForbidden)
 			return
 		}
 		w.WriteHeader(http.StatusNotFound)
 	}))
-	defer op.Close()
-	rt := New(strings.TrimPrefix(op.URL, "http://"), "test.local", 0, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	defer control.Close()
+	rt := New(strings.TrimPrefix(control.URL, "http://"), "test.local", 0, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	srv := httptest.NewServer(rt.Handler())
 	defer srv.Close()
 
@@ -43,7 +43,7 @@ func TestAuthRejectsBadKey(t *testing.T) {
 }
 
 // TestSandboxVerbForward checks the Phase 7f control plane: a sid-scoped verb is
-// forwarded to the node that holds the sandbox (resolved via the op interface).
+// forwarded to the node that holds the sandbox (resolved via the control API).
 func TestSandboxVerbForward(t *testing.T) {
 	var gotPath, gotMethod string
 	node := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -53,19 +53,19 @@ func TestSandboxVerbForward(t *testing.T) {
 	defer node.Close()
 	nodeHost := strings.TrimPrefix(node.URL, "http://")
 
-	op := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/op/route":
+		case "/control/route":
 			_ = json.NewEncoder(w).Encode(routeResolve{SID: "sb-1", Group: "/g", DataEndpoint: nodeHost, State: "ready"})
-		case "/op/verify-key":
+		case "/control/verify-key":
 			w.WriteHeader(http.StatusOK)
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}
 	}))
-	defer op.Close()
+	defer control.Close()
 
-	rt := New(strings.TrimPrefix(op.URL, "http://"), "test.local", 0, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	rt := New(strings.TrimPrefix(control.URL, "http://"), "test.local", 0, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	srv := httptest.NewServer(rt.Handler())
 	defer srv.Close()
 
@@ -95,7 +95,7 @@ func writeTestFrame(t *testing.T, w io.Writer, ev *watchEvent) {
 }
 
 // TestRouteCacheFromWatch checks the Phase 7e hot path: the router syncs its
-// route cache from /op/watch and serves the data plane from it (no /op/route).
+// route cache from /control/watch and serves the data plane from it (no /control/route).
 func TestRouteCacheFromWatch(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -109,9 +109,9 @@ func TestRouteCacheFromWatch(t *testing.T) {
 	nodeHost := strings.TrimPrefix(node.URL, "http://")
 
 	var routeHits int
-	op := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/op/watch":
+		case "/control/watch":
 			fl := w.(http.Flusher)
 			writeTestFrame(t, w, &watchEvent{Type: "put", Key: "sandbox//g/rk", Route: &routeResolve{SID: "sb-1", DataEndpoint: nodeHost, AccessToken: "tok", State: "ready"}})
 			writeTestFrame(t, w, &watchEvent{Type: "bookmark", Rev: 1})
@@ -119,14 +119,14 @@ func TestRouteCacheFromWatch(t *testing.T) {
 			// Return after the snapshot; RunWatch reconnects + re-snapshots, which
 			// keeps the cache warm without the handler holding the stream (and
 			// avoids a Close()-vs-context-cancel deadlock in the test teardown).
-		case "/op/route":
+		case "/control/route":
 			routeHits++
 			w.WriteHeader(http.StatusNotFound)
 		}
 	}))
-	defer op.Close()
+	defer control.Close()
 
-	rt := New(strings.TrimPrefix(op.URL, "http://"), "test.local", 0, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	rt := New(strings.TrimPrefix(control.URL, "http://"), "test.local", 0, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	go rt.RunWatch(ctx)
 
 	// Wait for the cache to populate from the watch snapshot.
@@ -154,6 +154,6 @@ func TestRouteCacheFromWatch(t *testing.T) {
 		t.Fatal("request did not reach the node via the cached route")
 	}
 	if routeHits != 0 {
-		t.Fatalf("op /route was hit %d times; the cache should serve the hot path", routeHits)
+		t.Fatalf("control /route was hit %d times; the cache should serve the hot path", routeHits)
 	}
 }

@@ -33,37 +33,37 @@ router 与节点 proxy(node-proxy.md)构成**两级转发**:router 选**哪个�
 ### 1.2 边界与依赖
 
 - 上游:e2b SDK / CLI(控制面)与业务客户端(数据面),均带 `X-API-KEY` + `X-Kuasar-Sandbox-Group`。
-- 下游:registry 的异步 op / watch 接口(`ReserveSandbox`/`ReserveBuild`/控制 + 路由订阅,cluster.md
+- 下游:registry 的异步 control_api / watch 接口(`ReserveSandbox`/`ReserveBuild`/控制 + 路由订阅,cluster.md
   §4.3 / §5.2);节点的 **e2b 控制面**(转发 pause/kill/build)与**数据端点**(node-proxy.md 数据面)。
 - 数据面字节经 router → node → guest 两跳,不经 registry。
 
 ## 2. 命令行接口
 
 ```
-cluster-ctl router [--config /etc/cluster-ctl/config.yaml] [--registry <addr>] [--listen :443]
+cluster-ctl router --config /etc/cluster-ctl/router.yaml
 ```
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
-| `--config` | `/etc/cluster-ctl/config.yaml` | 配置文件 |
-| `--registry` | 空 | 覆盖 registry op 接口(UDS 本机 / mTLS 远端,cluster.md §4.2);省略则用 `router.registry`,再省则同机 `op.listen` |
-| `--listen` | 空 | 覆盖 `router.listen` |
+| `--config` | `/etc/cluster-ctl/router.yaml` | 配置文件(§3)|
 
-TLS(`router.tls`)、数据面鉴权(`router.data_plane_auth`)等经配置文件(§3),无对应命令行旗标。
+入口、registry 拨号地址、TLS、鉴权等全部经配置文件(§3),无对应命令行旗标。
 
 ## 3. 配置
 
-`router` 配置组(完整表见 cluster.md §3):
+`router.yaml` 独立 schema(cluster.md §3 列三角色概览)。**必填 `domain`**:
 
 | 字段 | 默认 | 说明 |
 |---|---|---|
-| `router.registry` | 空 | registry op 接口;空 = 同机 `op.listen`(cluster.md §4.2) |
-| `router.listen` | `:443` | 统一入口(控制面 `api.<domain>` + 数据面,按 Host 分流);多副本同机 SO_REUSEPORT |
-| `router.tls` | 空 | 通配证书(`*.<domain>` + `api.<domain>`);空 = h2c(dev) |
-| `router.auth` | `enforce` | 调用方 api_key 鉴权(§8):`enforce` / `log`(告警放行）/ `off`(前置外部 mTLS/JWT 网关)|
-| `router.data_plane_auth` | `enforce` | 数据面 access-token 校验(§7):`enforce` 要求调用方携带沙箱 token(否则 401)/ `log` 仅告警 / `off` 跳过 |
-| `router.auth_cache_ttl` | `60s` | 调用方 api_key↔group 鉴权结果缓存时长(§8) |
-| `router.metrics_listen` | 空 | Prometheus 端点(`router_requests_total{plane,result}`)|
+| `domain` | (必填) | 服务域;router 据此按 Host 分流控制面 / 数据面 |
+| `registry.endpoint` | `/run/cluster/registry.sock` | registry control_api 拨号地址(UDS 本机 / `host:port` 远端,cluster.md §4.2)|
+| `registry.tls` | 空 | 拨远端 registry 的客户端 mTLS(`cert`/`key` + `ca`,cluster.md §5.4);UDS 本机免 |
+| `ingress.listen` | `:443` | 统一入口(控制面 `api.<domain>` + 数据面,按 Host 分流);多副本同机 SO_REUSEPORT |
+| `ingress.tls` | 空 | 通配证书(`*.<domain>` + `api.<domain>`);空 = h2c(dev) |
+| `auth.api_key` | `enforce` | 调用方 api_key 鉴权(§8):`enforce` / `log`(告警放行)/ `off`(前置外部 mTLS/JWT 网关)|
+| `auth.data_plane` | `enforce` | 数据面 access-token 校验(§7):`enforce` 要求调用方携带沙箱 token(否则 401)/ `log` 仅告警 / `off` 跳过 |
+| `auth.cache_ttl` | `60s` | 调用方 api_key↔group 鉴权结果缓存时长(§8) |
+| `metrics_listen` | 空 | Prometheus 端点(`router_requests_total{plane,result}`)|
 
 sandbox-group / route-key 头为固定常量(`X-Kuasar-Sandbox-Group` / `X-Kuasar-Route-Key`,§4),非配置项。
 
@@ -131,7 +131,7 @@ create/connect 是 `Reserve` 的发起方,**等节点上报 running 才回**;其
 - **普通 HTTP**:`httputil.ReverseProxy` 反代到节点数据端点(流式响应自动刷新;TLS / h2c);
   **按节点数据端点池化连接**(per-host idle 上限高于 stdlib 默认,避免高密度连接抖动)。节点 proxy
   按 `(sid, port)` 路由 guest envd / floatingip 并校验 token(node-proxy.md §4 / §7)。命中缓存的路由
-  转发失败(502)即**淘汰该缓存项**,下次经 watch / op 重解析。
+  转发失败(502)即**淘汰该缓存项**,下次经 watch / control_api 重解析。
 - **CONNECT 隧道**(端口转发 / 原始 TCP):router 向节点发**链式 CONNECT**(带 `E2b-Sandbox-Id` +
   端口 + `X-Access-Token`),节点照其链式 CONNECT 路径对接 guest(node-proxy.md §9)——
   client → router → node → guest,无环。
@@ -141,7 +141,7 @@ create/connect 是 `Reserve` 的发起方,**等节点上报 running 才回**;其
   (node-proxy.md §4/§7)。
 - **by-sid 的 paused/saved**:数据面打到已暂停 / 已上送的 sid,经其记录的 (group, route-key) 触发
   `Reserve` 恢复 / 迁移(单飞在 registry),再转发。
-- **数据面鉴权**(`router.data_plane_auth`,§3):`enforce`(默认)转发前校验调用方所带 `X-Access-Token`
+- **数据面鉴权**(`auth.data_plane`,§3):`enforce`(默认)转发前校验调用方所带 `X-Access-Token`
   与该 sandbox token 一致(否则 `401`),`log` 仅告警,`off` 跳过;各模式转发给节点时均注入正确 token
   (节点 proxy 再校验,node-proxy.md §7)。
 
@@ -153,11 +153,11 @@ sandbox-group 的授权**——控制面同理:
 - 客户端带 `X-API-KEY`;router 经 registry 以该 **group 租户 manifest_key** 校验(指纹匹配 + HMAC,
   复用 `apikey.Verify`,node.md §7)——api_key 解析出的租户须等于 group 的 `project_id` / manifest_key,
   否则拒(`403`;不泄露 group 存在性回 `404`)。
-- **鉴权缓存**:校验结果按 `router.auth_cache_ttl`(默认 60s)缓存,避免每请求回 `GroupKeyProvider`
+- **鉴权缓存**:校验结果按 `auth.cache_ttl`(默认 60s)缓存,避免每请求回 `GroupKeyProvider`
   (尤其 external provider)——降延迟(cluster.md §9)。
 - 把鉴权折进 registry 调用使**租户密钥只在 registry / provider**(router 不持密钥)。
-- 调用方鉴权 `router.auth`:`enforce`(默认,op 不可达回 `503`、密钥不符回 `403`)/ `log`(告警放行)/
-  `off`(跳过——前置外部 mTLS / JWT 网关替换鉴权钩子)。与数据面 per-sandbox token 的 `router.data_plane_auth`
+- 调用方鉴权 `auth.api_key`:`enforce`(默认,control_api 不可达回 `503`、密钥不符回 `403`)/ `log`(告警放行)/
+  `off`(跳过——前置外部 mTLS / JWT 网关替换鉴权钩子)。与数据面 per-sandbox token 的 `auth.data_plane`
   (§7)分开命名、各自三档。
 
 服务端内部 per-sandbox token 校验仍在节点 proxy(node-proxy.md §7),与此处调用方授权是**两道独立

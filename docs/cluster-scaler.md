@@ -47,27 +47,29 @@ scaler 解决:nodeSelectors + shuffle-sharding 选址(§4.2 / §4.4),P2C 均衡(
 ## 2. 命令行接口
 
 ```
-cluster-ctl scaler [--config /etc/cluster-ctl/config.yaml] [--registry <addr>]
+cluster-ctl scaler --config /etc/cluster-ctl/scaler.yaml
 ```
 
-经 `--registry` 连 registry 的 op 接口(UDS 本机 / mTLS 远端,cluster.md §4.2 / §5.2)。无独立
-listen——scaler 是纯调度器(订阅 + 被调建议方)。
+经配置的 `registry.endpoint`(+ 客户端 `registry.tls`)连 registry 的 control_api(UDS 本机 / mTLS 远端,cluster.md §4.2 /
+§5.2)。无独立 listen——scaler 是纯调度器(订阅 + 被调建议方)。
 
 ## 3. 配置
 
-`scaler` 配置组(完整表见 cluster.md §3):
+`scaler.yaml` 独立 schema(cluster.md §3 列三角色概览):
 
 | 字段 | 默认 | 说明 |
 |---|---|---|
-| `scaler.registry` | 空 | registry op 端点(scaler 拨入);空 = 同机 `op.listen` |
-| `scaler.place_candidates` | `2` | P2C 抽样候选数(§4.2) |
-| `scaler.zone_admit_max` | `yellow` | 放置只选水位区 ≤ 此的节点(red / critical 排除,§4.2) |
-| `scaler.shuffle_sharding` | 空 | shuffle-sharding 规则列表(§4.4);空 = 仅用静态 nodeSelectors |
+| `registry.endpoint` | `/run/cluster/registry.sock` | registry control_api 拨号地址(UDS 本机 / `host:port` 远端,cluster.md §4.2)|
+| `registry.tls` | 空 | 拨远端 registry 的客户端 mTLS(`cert`/`key` + `ca`);UDS 本机免 |
+| `placement.candidates` | `2` | P2C 抽样候选数(§4.2) |
+| `placement.zone_admit_max` | `yellow` | 放置只选水位区 ≤ 此的节点(red / critical 排除,§4.2) |
+| `placement.node_dead_after` | `30s` | 超此静默即将该节点排除出放置(§4.2)|
+| `placement.shuffle_sharding` | 空 | shuffle-sharding 规则列表(§4.4);空 = 仅用静态 nodeSelectors |
 
-`shuffle_sharding` 规则形态:
+`placement.shuffle_sharding` 规则形态:
 
 ```yaml
-scaler:
+placement:
   shuffle_sharding:
     - selector: {random-two-slots}   # 命中: nodeSelectors 含此标签的 group + labels 含此标签的 node
       shard_by: slot                  # 以 node 的 slot 标签值分桶, 每个 slot 值 = 一个分片
@@ -95,10 +97,10 @@ scaler 订阅 registry 节点注册表(labels、watermark、build_capacity / bui
 eligible = { node :
     matchSelectors(node.labels, group.有效 nodeSelectors)   // 静态 ∪ shuffle 分片(§4.4)
   ∧ node alive(LastHeartbeatUnix 未超 node_dead_after) ∧ ¬ node.draining
-  ∧ node.zone ≤ scaler.zone_admit_max                     // red / critical 排除
+  ∧ node.zone ≤ zone_admit_max                     // red / critical 排除
   ∧ runtimeCompatible(node.runtime_digest, target)        // target 非空时(如迁移快照 runtime)
 }
-node_id = argmin( sample(eligible, place_candidates), load )   // P2C 无放回抽 place_candidates 个,取 load 较小者
+node_id = argmin( sample(eligible, candidates), load )   // P2C 无放回抽 candidates 个,取 load 较小者
 ```
 
 - **负载信号**:首选 `allocated / pool` 水位(经心跳),回退 `counts / capacity` headroom,再回退裸 counts。
@@ -121,7 +123,7 @@ nodeSelectors: [{zone: east1a, pool: c01}]          → zone=east1a 且 pool=c01
 
 ### 4.4 shuffle-sharding(选择器 patch,maglev)
 
-静态 nodeSelectors 给粗粒度可落集;`scaler.shuffle_sharding` 规则在其内把每个 group 钉到**确定性
+静态 nodeSelectors 给粗粒度可落集;`shuffle_sharding` 规则在其内把每个 group 钉到**确定性
 随机的 n 个分片**——**仅按标签分组均匀分布,不按负载**。对每条规则:取 labels 含 `selector` 的节点,
 按 `shard_by` 标签值分桶得分片集 `S`;对 nodeSelectors 含 `selector` 的每个 group:
 
@@ -151,7 +153,7 @@ eligible = { node :
     matchSelectors(node.labels, group.有效 nodeSelectors) ∧ node alive ∧ ¬ draining
   ∧ node.build_capacity − node.build_alloc ≥ resources    // build 资源 headroom
 }
-node_id = argmin( sample(eligible, place_candidates), build_alloc/build_capacity )
+node_id = argmin( sample(eligible, candidates), build_alloc/build_capacity )
 ```
 
 - **每节点 build 资源容量 `{cpu, mem, storage}`**:源自 builder slice 配置(`builder.cpu_quota` /

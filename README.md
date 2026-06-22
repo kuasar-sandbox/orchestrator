@@ -24,7 +24,7 @@ e2b 兼容沙箱平台的**节点主机**与**集群控制面**,两个二进制�
 | 路径 | 角色 |
 | --- | --- |
 | `cmd/node-ctl` | 节点主二进制:`serve`(daemon:控制面 + 数据面 + 可选 `resource_listen` 资源控制器 + node-link 客户端)/ `proxy`(外置数据面 worker)/ `run-sandbox`·`run-builder`(单元内启动器)/ `resource {status,list,drain,grant,reclaim}` / `config` / `manifest-key` / `export-sandbox`·`import-sandbox` / `version` |
-| `cmd/cluster-ctl` | 集群主二进制(三角色均独立进程):`registry`(持久状态权威 + 节点通道 + 密钥分发)/ `router`(e2b 入口)/ `scaler`(反向调用放置)/ `group`(sandbox-group 配置)/ `config` / `version` |
+| `cmd/cluster-ctl` | 集群主二进制(三角色均独立进程):`registry`(持久状态权威 + 节点通道 + 密钥分发)/ `router`(e2b 入口)/ `scaler`(反向调用放置)/ `sandbox-group`(sandbox-group 配置)/ `config` / `version` |
 | `cmd/e2b-key-ctl` | 纯派生凭据工具(无 DB/config):`gen-key` / `gen-apikey` / `fingerprint` / `seal-pull-token` |
 | `internal/orch` | 节点编排核心:生命周期、构建池、本节点路由权威、单元生成、重启对账 |
 | `internal/nodectl` | 资源控制器:两环仲裁、四级水位 + 应急池、cgroup 真相源对账恢复、审计 |
@@ -37,7 +37,7 @@ e2b 兼容沙箱平台的**节点主机**与**集群控制面**,两个二进制�
 | `internal/{config,clustercfg,sandboxcfg,store}` | 节点 / 集群配置加载、SANDBOX_CONFIG 渲染、sqlite 状态(sandboxes/builds/manifest_keys) |
 | `internal/{mmds,metrics,launcher,vswitch,util}` | MMDS 元数据(envd re-key)、Prometheus 文本、systemd D-Bus、vswitch-ctl 封装、内联工具 |
 | `deps/build-runtime-{e2b,builder}.sh` | 把 envd(+构建工具链 flatten-ctl/mkfs.erofs)注入基础 runtime → `sandbox-runtime-{e2b,builder}.erofs`(确定性重打 + 2MiB 对齐) |
-| `deploy/` | 配置样例与 systemd 单元(`node-ctl.service`、`node-proxy@.service`、`cluster-ctl.service`) |
+| `deploy/` | 每角色配置样例(`{serve,proxy}.example.yaml`、`{registry,router,scaler}.example.yaml`)与 systemd 单元(`node-ctl.service`、`node-proxy@.service`、`cluster-{registry,router,scaler}.service`) |
 
 ## 构建
 
@@ -59,14 +59,14 @@ MK=$(e2b-key-ctl gen-key)
 node-ctl manifest-key add "$MK" --label tenant-a
 export E2B_API_KEY=$(e2b-key-ctl gen-apikey "$MK")
 
-# 启动节点 daemon(必填仅 api.domain + encryption_key;骨架: node-ctl config --template)
-# 配 resource_listen 即内置资源控制器;配 cluster.registry 即接入集群
-node-ctl serve --config /etc/node-ctl/config.yaml
+# 启动节点 daemon(必填仅 api.domain + encryption_key;骨架: node-ctl config serve --template)
+# serve.yaml 内联 resource_listen 即内置资源控制器;配 cluster.registry 即接入集群
+node-ctl serve --config /etc/node-ctl/serve.yaml
 
-# 可选:集群控制面——三角色各为独立进程(registry 持久 sqlite;router/scaler 拨 registry op)
-cluster-ctl registry --config /etc/cluster-ctl/config.yaml
-cluster-ctl router   --config /etc/cluster-ctl/config.yaml
-cluster-ctl scaler   --config /etc/cluster-ctl/config.yaml
+# 可选:集群控制面——三角色各为独立进程、各自配置文件(registry 持久 sqlite;router/scaler 拨 registry control_api)
+cluster-ctl registry --config /etc/cluster-ctl/registry.yaml
+cluster-ctl router   --config /etc/cluster-ctl/router.yaml
+cluster-ctl scaler   --config /etc/cluster-ctl/scaler.yaml
 
 # e2b SDK/CLI 直连本机(独立模式)
 export E2B_DOMAIN=sandboxes.example.com     # dev: E2B_API_URL/E2B_SANDBOX_URL http
@@ -83,7 +83,7 @@ python -c 'from e2b import Sandbox; s = Sandbox.create("e2b-img-<key>"); print(s
 - [docs/node-proxy.md](docs/node-proxy.md) — 数据面转发层:路由判定 / 部署模式(internal/external/off)/
   routesync / 数据面鉴权 / MMDS / CONNECT 隧道。
 - [docs/node-resource.md](docs/node-resource.md) — 节点资源控制协议(`sandbox-ctl` 拨号目标)与
-  控制器(`resource_listen` 内置 / 独立):准入 / 水位额度 / 主动回收 / 无强一致状态恢复。
+  控制器(`serve` 经内联 `resource_listen` 内置):准入 / 水位额度 / 主动回收 / 无强一致状态恢复。
 - [docs/cluster.md](docs/cluster.md) — 集群控制面:node-link 线格式、节点 / sandbox-group / 沙箱
   注册表、Reserve 状态机、Store 接口与可扩展性。
 - [docs/cluster-router.md](docs/cluster-router.md) — 集群级数据面入口:e2b 头解析、调用方鉴权、

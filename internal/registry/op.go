@@ -9,17 +9,17 @@ import (
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/apikey"
 )
 
-// Op interface paths the router (and later the scaler) dial (cluster.md §5.2).
+// Control API paths the router (and later the scaler) dial (cluster.md §5.2).
 // Phase 3 ships reserve + route resolution for the router; the scaler's view
 // subscription + the resumable watch land with later phases.
 const (
-	OpReservePath      = "/op/reserve"       // POST ?group=&route_key= -> ReserveResult
-	OpRoutePath        = "/op/route"         // GET  ?sid=              -> RouteResolve
-	OpReserveBuildPath = "/op/reserve-build" // POST {group,resources,metadata} -> BuildReserveResult
-	OpBuildPath        = "/op/build"         // GET  ?build_id=         -> BuildReserveResult (resolve)
-	OpGroupPath        = "/op/group"         // POST ?group=&template_ref= -> set template_ref
-	OpListPath         = "/op/list"          // GET  ?group=            -> the group's sandbox shard
-	OpVerifyKeyPath    = "/op/verify-key"    // GET  ?group=&api_key=   -> 200 valid / 403 invalid
+	ControlReservePath      = "/control/reserve"       // POST ?group=&route_key= -> ReserveResult
+	ControlRoutePath        = "/control/route"         // GET  ?sid=              -> RouteResolve
+	ControlReserveBuildPath = "/control/reserve-build" // POST {group,resources,metadata} -> BuildReserveResult
+	ControlBuildPath        = "/control/build"         // GET  ?build_id=         -> BuildReserveResult (resolve)
+	ControlGroupPath        = "/control/group"         // POST ?group=&template_ref= -> set template_ref
+	ControlListPath         = "/control/list"          // GET  ?group=            -> the group's sandbox shard
+	ControlVerifyKeyPath    = "/control/verify-key"    // GET  ?group=&api_key=   -> 200 valid / 403 invalid
 )
 
 // RouteResolve is the data-plane forwarding target the router needs for a sid
@@ -34,19 +34,19 @@ type RouteResolve struct {
 	State        string `json:"state"`
 }
 
-// ServeOp mounts the op interface (reserve + route resolution) on a mux. The
-// registry serves it on op.listen for router/scaler.
-func (r *Registry) ServeOp(mux *http.ServeMux) {
-	mux.HandleFunc(OpReservePath, r.serveReserve)
-	mux.HandleFunc(OpRoutePath, r.serveRoute)
-	mux.HandleFunc(OpReserveBuildPath, r.serveReserveBuild)
-	mux.HandleFunc(OpBuildPath, r.serveBuild) // resolve build_id -> node (router restart)
-	mux.HandleFunc(OpGroupPath, r.serveGroup)
-	mux.HandleFunc(OpListPath, r.serveList)
-	mux.HandleFunc(OpVerifyKeyPath, r.serveVerifyKey)
-	mux.HandleFunc(OpWatchPath, r.serveWatch)
-	mux.HandleFunc(OpNodeWatchPath, r.serveNodeWatch)   // standalone scaler view (§5.2)
-	mux.HandleFunc(OpGroupWatchPath, r.serveGroupWatch) // standalone scaler view (§5.2)
+// ServeControl mounts the control API (reserve + route resolution) on a mux. The
+// registry serves it on control_api.listen for router/scaler.
+func (r *Registry) ServeControl(mux *http.ServeMux) {
+	mux.HandleFunc(ControlReservePath, r.serveReserve)
+	mux.HandleFunc(ControlRoutePath, r.serveRoute)
+	mux.HandleFunc(ControlReserveBuildPath, r.serveReserveBuild)
+	mux.HandleFunc(ControlBuildPath, r.serveBuild) // resolve build_id -> node (router restart)
+	mux.HandleFunc(ControlGroupPath, r.serveGroup)
+	mux.HandleFunc(ControlListPath, r.serveList)
+	mux.HandleFunc(ControlVerifyKeyPath, r.serveVerifyKey)
+	mux.HandleFunc(ControlWatchPath, r.serveWatch)
+	mux.HandleFunc(ControlNodeWatchPath, r.serveNodeWatch)   // standalone scaler view (§5.2)
+	mux.HandleFunc(ControlGroupWatchPath, r.serveGroupWatch) // standalone scaler view (§5.2)
 }
 
 // serveVerifyKey verifies an api key against a group's manifest key (the router's

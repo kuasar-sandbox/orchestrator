@@ -13,12 +13,12 @@ import (
 
 // Node/group view watch (cluster.md §5.2): a standalone scaler subscribes these to
 // mirror the node table + group placement config locally, exactly as the router
-// subscribes /op/watch for routes. Same reset+snapshot+bookmark+deltas protocol
+// subscribes /control/watch for routes. Same reset+snapshot+bookmark+deltas protocol
 // (viewStream), resumable by from_rev. Group values are projected to strip the
 // sealed manifest_key — the scaler has no business with keys.
 const (
-	OpNodeWatchPath  = "/op/watch-nodes"
-	OpGroupWatchPath = "/op/watch-groups"
+	ControlNodeWatchPath  = "/control/watch-nodes"
+	ControlGroupWatchPath = "/control/watch-groups"
 )
 
 // ViewEvent is one frame on a view watch ([4B LE len][ViewEvent]); Value is the

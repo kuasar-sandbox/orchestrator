@@ -26,39 +26,31 @@ import (
 
 // runRegistry starts the registry role: the durable state authority + node-link
 // hub (cluster.md §4.1). Phase 2 serves the node-link channel (nodes dial it to
-// register, stream routes, receive commands); the router/scaler op interface
+// register, stream routes, receive commands); the router/scaler control API
 // lands with those roles.
 func runRegistry(args []string, log *slog.Logger) error {
 	fs := flag.NewFlagSet("registry", flag.ExitOnError)
-	cfgPath := fs.String("config", "/etc/cluster-ctl/config.yaml", "config file")
-	storeDSN := fs.String("store", "", "override store.dsn")
-	channelListen := fs.String("channel-listen", "", "override channel.listen")
+	cfgPath := fs.String("config", "/etc/cluster-ctl/registry.yaml", "config file")
 	_ = fs.Parse(args)
 
-	cfg, err := clustercfg.Load(*cfgPath)
+	cfg, err := clustercfg.LoadRegistry(*cfgPath)
 	if err != nil {
 		return err
 	}
-	if *storeDSN != "" {
-		cfg.Store.DSN = *storeDSN
-	}
-	if *channelListen != "" {
-		cfg.Channel.Listen = *channelListen
-	}
-	if cfg.Store.Kind != clustercfg.StoreSQLite {
-		return fmt.Errorf("registry: store.kind %q not implemented yet (Phase 7); use sqlite", cfg.Store.Kind)
+	if cfg.State.Backend != clustercfg.BackendSQLite {
+		return fmt.Errorf("registry: state.backend %q not implemented yet (Phase 7); use sqlite", cfg.State.Backend)
 	}
 
-	kv, err := clusterstore.Open(cfg.Store.DSN, cfg.Channel.RevisionRetention)
+	kv, err := clusterstore.Open(cfg.State.DSN, cfg.NodeLink.RevisionRetention)
 	if err != nil {
 		return err
 	}
 	defer kv.Close()
-	_ = os.Chmod(cfg.Store.DSN, 0o600)
+	_ = os.Chmod(cfg.State.DSN, 0o600)
 
 	var box *secretbox.Box
-	if cfg.GroupConfig.EncryptionKey != "" {
-		if box, err = secretbox.NewFromColonHex(cfg.GroupConfig.EncryptionKey); err != nil {
+	if cfg.SandboxGroup.EncryptionKey != "" {
+		if box, err = secretbox.NewFromColonHex(cfg.SandboxGroup.EncryptionKey); err != nil {
 			return err
 		}
 	}
@@ -66,12 +58,12 @@ func runRegistry(args []string, log *slog.Logger) error {
 
 	// Group-config providers: store by default, external:<addr> per interface (§6.2).
 	var extTLS *tls.Config
-	if cfg.GroupConfig.TLS.Enabled() {
-		if extTLS, err = cfg.GroupConfig.TLS.ClientConfig(""); err != nil {
-			return fmt.Errorf("registry: group_config tls: %w", err)
+	if cfg.SandboxGroup.TLS.Enabled() {
+		if extTLS, err = cfg.SandboxGroup.TLS.ClientConfig(""); err != nil {
+			return fmt.Errorf("registry: sandbox_group tls: %w", err)
 		}
 	}
-	resolver := registry.NewGroupResolver(cfg.GroupConfig, stores, time.Minute, extTLS)
+	resolver := registry.NewGroupResolver(cfg.SandboxGroup, stores, time.Minute, extTLS)
 
 	// Placement is the standalone scaler (cluster.md §4.1/§5.2 — no in-process
 	// mode): the registry reverse-requests Place over the scaler-link. With no
@@ -85,7 +77,7 @@ func runRegistry(args []string, log *slog.Logger) error {
 
 	// Dead-node sweep (cluster.md §11): reset the sandboxes of nodes whose
 	// node-link dropped and whose last heartbeat predates node_dead_after.
-	go reg.RunReaper(ctx, cfg.Channel.NodeDeadDur())
+	go reg.RunReaper(ctx, cfg.NodeLink.NodeDeadDur())
 	// Key predistribution + lease renewal to each group's allocation set (§7.6).
 	go reg.RunKeyDistributor(ctx, time.Hour)
 	// Idle SAVED record GC (route-key cardinality cap, §10/§12); off when unset.
@@ -94,16 +86,16 @@ func runRegistry(args []string, log *slog.Logger) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc(routesync.NodeLinkPath, reg.ServeNodeLink)
 
-	// node-link over channel.tls mTLS when configured (§5.4), else plain h2c.
-	ln, err := net.Listen("tcp", cfg.Channel.Listen)
+	// node-link over node_link.tls mTLS when configured (§5.4), else plain h2c.
+	ln, err := net.Listen("tcp", cfg.NodeLink.Listen)
 	if err != nil {
-		return fmt.Errorf("registry: channel listen %s: %w", cfg.Channel.Listen, err)
+		return fmt.Errorf("registry: node_link listen %s: %w", cfg.NodeLink.Listen, err)
 	}
 	var srv *http.Server
-	if cfg.Channel.TLS.Enabled() {
-		stls, terr := cfg.Channel.TLS.ServerConfig()
+	if cfg.NodeLink.TLS.Enabled() {
+		stls, terr := cfg.NodeLink.TLS.ServerConfig()
 		if terr != nil {
-			return fmt.Errorf("registry: channel tls: %w", terr)
+			return fmt.Errorf("registry: node_link tls: %w", terr)
 		}
 		srv = &http.Server{Handler: mux, TLSConfig: stls} // h2 over (m)TLS (§5.4)
 	} else {
@@ -114,48 +106,48 @@ func runRegistry(args []string, log *slog.Logger) error {
 		srv.Close()
 	}()
 
-	// Op interface (router / scaler dial, cluster.md §5.2; the cluster e2e drives
+	// Control API (router / scaler dial, cluster.md §5.2; the cluster e2e drives
 	// reserve through it).
-	opMux := http.NewServeMux()
-	reg.ServeOp(opMux)
-	opMux.HandleFunc(routesync.ScalerLinkPath, reg.ServeScalerLink) // scaler reverse-call (§5.2)
-	opLn, err := listenOp(cfg.Op.Listen)
+	controlMux := http.NewServeMux()
+	reg.ServeControl(controlMux)
+	controlMux.HandleFunc(routesync.ScalerLinkPath, reg.ServeScalerLink) // scaler reverse-call (§5.2)
+	controlLn, err := listenControl(cfg.ControlAPI.Listen)
 	if err != nil {
-		return fmt.Errorf("registry: op listen %s: %w", cfg.Op.Listen, err)
+		return fmt.Errorf("registry: control_api listen %s: %w", cfg.ControlAPI.Listen, err)
 	}
-	opSrv := &http.Server{Handler: opMux}
-	// op-mTLS for the cross-host split (cluster.md §5.4); a UDS (local) stays plain.
-	opTLS := cfg.Op.TLS.Enabled() && !strings.HasPrefix(cfg.Op.Listen, "/")
-	if opTLS {
-		stls, terr := cfg.Op.TLS.ServerConfig()
+	controlSrv := &http.Server{Handler: controlMux}
+	// control mTLS for the cross-host split (cluster.md §5.4); a UDS (local) stays plain.
+	controlTLS := cfg.ControlAPI.TLS.Enabled() && !strings.HasPrefix(cfg.ControlAPI.Listen, "/")
+	if controlTLS {
+		stls, terr := cfg.ControlAPI.TLS.ServerConfig()
 		if terr != nil {
-			return fmt.Errorf("registry: op tls: %w", terr)
+			return fmt.Errorf("registry: control_api tls: %w", terr)
 		}
-		opSrv.TLSConfig = stls
+		controlSrv.TLSConfig = stls
 	} else {
 		// Plain (UDS/TCP): serve h2c so the scaler-link's full-duplex h2 stream works
 		// (h2c.NewHandler still falls through to HTTP/1.1 for the watch GETs).
-		opSrv.Handler = h2c.NewHandler(opMux, &http2.Server{})
+		controlSrv.Handler = h2c.NewHandler(controlMux, &http2.Server{})
 	}
 	go func() {
 		<-ctx.Done()
-		opSrv.Close()
+		controlSrv.Close()
 	}()
 	go func() {
 		var e error
-		if opTLS {
-			e = opSrv.ServeTLS(opLn, "", "")
+		if controlTLS {
+			e = controlSrv.ServeTLS(controlLn, "", "")
 		} else {
-			e = opSrv.Serve(opLn)
+			e = controlSrv.Serve(controlLn)
 		}
 		if e != nil && e != http.ErrServerClosed {
-			log.Error("registry op", "err", e)
+			log.Error("registry control", "err", e)
 		}
 	}()
 
-	log.Info("cluster-ctl registry", "channel_listen", cfg.Channel.Listen, "channel_tls", cfg.Channel.TLS.Enabled(), "op_listen", cfg.Op.Listen, "op_tls", opTLS, "store", cfg.Store.DSN)
+	log.Info("cluster-ctl registry", "node_link", cfg.NodeLink.Listen, "node_link_tls", cfg.NodeLink.TLS.Enabled(), "control_api", cfg.ControlAPI.Listen, "control_api_tls", controlTLS, "state", cfg.State.DSN)
 	var serveErr error
-	if cfg.Channel.TLS.Enabled() {
+	if cfg.NodeLink.TLS.Enabled() {
 		serveErr = srv.ServeTLS(ln, "", "")
 	} else {
 		serveErr = srv.Serve(ln)
@@ -166,9 +158,9 @@ func runRegistry(args []string, log *slog.Logger) error {
 	return nil
 }
 
-// listenOp binds the op interface: a unix socket (path starts with "/") at 0600,
+// listenControl binds the control API: a unix socket (path starts with "/") at 0600,
 // or a TCP address.
-func listenOp(addr string) (net.Listener, error) {
+func listenControl(addr string) (net.Listener, error) {
 	if strings.HasPrefix(addr, "/") {
 		_ = os.Remove(addr)
 		if dir := addr[:strings.LastIndexByte(addr, '/')]; dir != "" {

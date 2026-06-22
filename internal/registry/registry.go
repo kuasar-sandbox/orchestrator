@@ -30,7 +30,7 @@ type nodeConn interface {
 
 // Placer suggests a node for a new sandbox (cluster.md §4.3: the scaler suggests,
 // the registry commits by CAS). Phase 2 ships a built-in single-node placer; the
-// cluster-ctl scaler replaces it over the op channel in Phase 4.
+// cluster-ctl scaler replaces it over the control channel in Phase 4.
 // PlaceRequest is a placement ask. Build marks a build placement (resource-aware,
 // cluster-scaler.md §4.5); TargetRuntimeDigest (when known, e.g. a migration's
 // snapshot runtime) lets the scaler prefer runtime-compatible nodes (§4.2).

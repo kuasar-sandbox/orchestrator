@@ -286,18 +286,18 @@ func TestReservePausedResume(t *testing.T) {
 	}
 }
 
-func TestOpWatch(t *testing.T) {
+func TestControlWatch(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
 	reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1", DataEndpoint: "10.0.0.1:8443"})
 	reg.stores.PutSandbox(ctx, &SandboxRecord{Group: "/g", RouteKey: "rk", SID: "sb-1", State: StateReady, NodeID: "n1", AccessToken: "tok"})
 
 	mux := http.NewServeMux()
-	reg.ServeOp(mux)
+	reg.ServeControl(mux)
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
-	resp, err := http.Get(srv.URL + "/op/watch")
+	resp, err := http.Get(srv.URL + "/control/watch")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -321,7 +321,7 @@ func TestOpWatch(t *testing.T) {
 	}
 
 	// Resume from the bookmark rev: deltas only, NO reset/snapshot (incremental sync).
-	resp2, err := http.Get(fmt.Sprintf("%s/op/watch?from_rev=%d", srv.URL, bm.Rev))
+	resp2, err := http.Get(fmt.Sprintf("%s/control/watch?from_rev=%d", srv.URL, bm.Rev))
 	if err != nil {
 		t.Fatal(err)
 	}

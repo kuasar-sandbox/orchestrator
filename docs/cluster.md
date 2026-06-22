@@ -16,7 +16,7 @@ cluster **以 sandbox-group 为唯一分区单位**组织一切(沙箱 / 构建 
 原语运行,node.md §4 / §8),cluster 不新增沙箱机制、只做编排与路由。
 
 产物一个二进制 **`cluster-ctl`**,三角色 registry / router / scaler 均为**独立进程**(无同进程内存
-模式):registry 持久化;router / scaler 经 op(UDS 本机 / mTLS 远端)连 registry。小规模同机共置(UDS
+模式):registry 持久化;router / scaler 经 control_api(UDS 本机 / mTLS 远端)连 registry。小规模同机共置(UDS
 低延迟)、大规模各自横向扩展(§4 / §12)。
 
 ## 1. 概述
@@ -74,7 +74,7 @@ cluster **以 sandbox-group 为唯一分区单位**组织一切(沙箱 / 构建 
    │          pause/kill/timeout=转发节点 · list/get=group 分片 · build=…     │
    │  数据面: 缓存命中→直转;未命中→registry.ReserveSandbox → 注入 token 转发  │
    └──────────────┬───────────────────────────────────────┬─────────────────┘
-        异步 op / watch (UDS 本机 | mTLS)                   │ data-plane forward
+        异步 control_api / watch (UDS 本机 | mTLS)          │ data-plane forward
                   ▼                                         │ (router→node→guest)
    ┌──────── cluster-ctl registry (持久状态权威 + 通道枢纽) ──┐  │
    │  NodeStore(全局)· GroupConfigProvider(细粒度可外置)   │  │
@@ -99,45 +99,74 @@ cluster **以 sandbox-group 为唯一分区单位**组织一切(沙箱 / 构建 
 
 | 子命令 | 用途 |
 |---|---|
-| `registry` | 持久状态权威 + 通道枢纽 + 异步 op / watch 接口(§4 / §5) |
+| `registry` | 持久状态权威 + 通道枢纽 + 异步 control_api / watch 接口(§4 / §5) |
 | `router` | e2b 兼容统一入口:控制面 + 数据面(cluster-router.md) |
 | `scaler` | 放置调度器:给出 PlaceSandbox 建议(沙箱与 build 均经此;cluster-scaler.md) |
-| `group` | sandbox-group 配置管理(`upsert`/`get`/`list`/`remove`,§6.2);registry admin 瘦客户端 |
-| `config` | 配置规范化 / 校验,或输出带注释骨架 |
+| `sandbox-group` | sandbox-group 配置管理(`upsert`/`get`,§6.2);registry admin 瘦客户端 |
+| `config` | 配置诊断 / 生成,按角色:`config <registry\|router\|scaler> [--template\|--config <f>\|--resolve]` |
 | `version` | 版本 |
 
 ```
-cluster-ctl registry [--config …] [--store sqlite:/var/lib/cluster/registry.db]
-                     [--channel-listen :7700] [--op-listen /run/cluster/registry.sock]
-cluster-ctl router   [--config …] [--registry <addr>] [--listen :443]
-cluster-ctl scaler   [--config …] [--registry <addr>]
+cluster-ctl registry --config /etc/cluster-ctl/registry.yaml
+cluster-ctl router   --config /etc/cluster-ctl/router.yaml
+cluster-ctl scaler   --config /etc/cluster-ctl/scaler.yaml
 ```
 
-三角色均为独立进程,router / scaler 经 `--registry`(UDS 本机 / mTLS 远端)连 registry 的 op-listen
-(§4.2)。**scaler 无 listen**:它拨 registry、订阅节点 / group 视图,registry 经 scaler-link **反向下发**
-`place_req`、scaler 回 `place_result`(§5.2)。
+三角色均为独立进程、**各持一份配置文件**(§3):router / scaler 经各自配置的 `registry.endpoint`(拨号
+地址,UDS 本机 / mTLS 远端)+ 客户端 `registry.tls` 连 registry 的 control_api(§4.2)。**scaler 无 listen**:它拨 registry、
+订阅节点 / group 视图,registry 经 scaler-link **反向下发** `place_req`、scaler 回 `place_result`(§5.2)。
 
 ## 3. 配置
 
-权威结构 `internal/clustercfg/config.go`。按角色分组:`store`、`group_config`、`channel`、`reserve`、
-`router`(cluster-router.md §3)、`scaler`(cluster-scaler.md §3)。**必填仅 `domain` 与 `store`**。
+权威结构 `internal/clustercfg/config.go`。**一角色一文件**:`registry.yaml` / `router.yaml` /
+`scaler.yaml` 各自独立 schema,只装该角色真正消费的字段——文件即进程所读。共享子类型(`tls` 等)
+复用,但 control_api 端点在 registry 是**绑定地址**(`control_api.listen`)、在 router / scaler 是
+**拨号地址**(`registry.endpoint` + 客户端 `registry.tls`)。骨架与校验按角色:
+`cluster-ctl config <registry|router|scaler> [--template | --config <f> [--resolve]]`。
+
+### registry.yaml(持久状态权威 + 通道枢纽。必填 `state`)
+
+| 字段 | 默认 | 说明 |
+|---|---|---|
+| `state.backend` | `sqlite` | 注册表后端:**当前实现 `sqlite`**(单机持久,最简);`etcd` / `raft` 为接口预留(§10);**无 `memory`**。命名 `state`(非 `store`)以与 sandbox-accelerator 的内容 store 区分 |
+| `state.dsn` | `/var/lib/cluster/registry.db` | sqlite 路径 / etcd 端点 / raft 配置 |
+| `sandbox_group.providers` | `store` | 细粒度 provider 选择(§6.2):每个接口(`key` / `sandbox_config` / `placement` / `image_pull`)可 `store` 或 `external:<addr>` |
+| `sandbox_group.encryption_key` | 空 | `store` 自存 manifest_key 时的 AES-256 落盘密钥,或 `SANDBOX_GROUP_ENCRYPTION_KEY` env 覆盖;全 `external` 时不需 |
+| `sandbox_group.tls` | 空 | `external:<addr>` provider 的**客户端** mTLS(§6.2)|
+| `node_link.listen` | `:7700` | 节点拨入的 node-link 监听(§5);registry 持有 |
+| `node_link.tls` | 空 | node-link **服务端** mTLS 证书 / CA(生产必配,§5.4) |
+| `node_link.heartbeat_interval` | `10s` | 下发心跳周期 |
+| `node_link.node_dead_after` | `30s` | 连续未收心跳判失联(§11) |
+| `node_link.revision_retention` | `10000` | 每分片保留的变更日志条数,供断线增量重放(§5.3);超出则客户端全量重同步 |
+| `control_api.listen` | `/run/cluster/registry.sock` | router / scaler 拨入的 control_api / watch 接口**绑定**地址(UDS 本机 / 跨机 TCP)|
+| `control_api.tls` | 空 | control_api **服务端** mTLS(`control_api.listen` 为 TCP 跨机时;UDS 本机免,§5.4)|
+| `reserve.park_timeout` | `30s` | `Reserve` 等待 READY 的预算上限(§7);超时回错由 router 转 503 |
+| `reserve.record_ttl` | 空 | 空闲 SAVED 记录 GC 上限(§10 / §12);空 = 关 |
+
+### router.yaml(e2b 兼容统一入口。必填 `domain`。详 cluster-router.md §3)
 
 | 字段 | 默认 | 说明 |
 |---|---|---|
 | `domain` | (必填) | 服务域;router 据此分流控制面 / 数据面 |
-| `store.kind` | `sqlite` | 注册表后端:**当前实现 `sqlite`**(单机持久,最简);`etcd` / `raft` 为接口预留(§10);**无 `memory`** |
-| `store.dsn` | `/var/lib/cluster/registry.db` | sqlite 路径 / etcd 端点 / raft 配置 |
-| `group_config.providers` | `store` | 细粒度 provider 选择(§6.2):每个接口(key / sandbox-config / placement)可 `store` 或 `external:<addr>` |
-| `group_config.encryption_key` | 空 | `store` 自存 manifest_key 时的 AES-256 落盘密钥(同 node.md §3,可 env 覆盖);全 `external` 时不需 |
-| `group_config.tls` | 空 | `external:<addr>` provider 的 mTLS(§6.2)|
-| `channel.listen` | `:7700` | 节点拨入的统一通道监听(§5);registry 持有 |
-| `channel.tls` | 空 | 通道 mTLS 证书 / CA(生产必配,§5.4) |
-| `channel.heartbeat_interval` | `10s` | 下发心跳周期 |
-| `channel.node_dead_after` | `30s` | 连续未收心跳判失联(§11) |
-| `channel.revision_retention` | `10000` | 每分片保留的变更日志条数,供断线增量重放(§5.3);超出则客户端全量重同步 |
-| `op.listen` | `/run/cluster/registry.sock` | 异步 op / watch 监听(UDS 本机 / 跨机 TCP)|
-| `op.tls` | 空 | op 接口 mTLS(`op.listen` 为 TCP 跨机时;UDS 本机免,§5.4)|
-| `reserve.park_timeout` | `30s` | `Reserve` 等待 READY 的预算上限(§7);超时回错由 router 转 503 |
+| `registry.endpoint` | `/run/cluster/registry.sock` | registry control_api **拨号**地址(UDS 本机 / `host:port` 远端)|
+| `registry.tls` | 空 | 拨远端 registry 的**客户端** mTLS(`cert`/`key` + `ca`;§5.4)|
+| `ingress.listen` | `:443` | e2b 控制 + 数据入口(多副本 SO_REUSEPORT 共享)|
+| `ingress.tls` | 空 | 通配入口证书 `*.<domain>` + `api.<domain>` |
+| `auth.api_key` | `enforce` | 调用方 api_key 鉴权:`off` / `log` / `enforce`(§8)|
+| `auth.data_plane` | `enforce` | 数据面 access-token 校验:`off` / `log` / `enforce` |
+| `auth.cache_ttl` | `60s` | api_key↔group 校验缓存 |
+| `metrics_listen` | 空 | 可选 Prometheus 文本端点 |
+
+### scaler.yaml(放置调度器。详 cluster-scaler.md §3)
+
+| 字段 | 默认 | 说明 |
+|---|---|---|
+| `registry.endpoint` | `/run/cluster/registry.sock` | registry control_api **拨号**地址(UDS 本机 / `host:port` 远端)|
+| `registry.tls` | 空 | 拨远端 registry 的**客户端** mTLS |
+| `placement.candidates` | `2` | P2C 采样数 |
+| `placement.zone_admit_max` | `yellow` | 排除热于此区的节点(`green` / `yellow` / `red`)|
+| `placement.node_dead_after` | `30s` | 超此静默即将该节点排除出放置 |
+| `placement.shuffle_sharding` | 空 | 空 = 仅静态 nodeSelectors(cluster-scaler.md §4.4)|
 
 ## 4. 架构与角色
 
@@ -160,13 +189,13 @@ cluster-ctl scaler   [--config …] [--registry <addr>]
 
 | | 小规模(同机共置) | 大规模(拆分) |
 |---|---|---|
-| 进程 | registry(sqlite)+ router + scaler,同机,**op 接口走 UDS** | registry 多副本(按 group 分片,etcd/raft)+ router N 副本(LB)+ scaler 多副本(按 group 分片) |
+| 进程 | registry(sqlite)+ router + scaler,同机,**control_api 走 UDS** | registry 多副本(按 group 分片,etcd/raft)+ router N 副本(LB)+ scaler 多副本(按 group 分片) |
 | 启动延迟 | 冷路径控制往返 = UDS(亚毫秒) | 冷路径控制往返 = 同 AZ mTLS;热路径仍 router 本地缓存(§9) |
 | 可靠性 | sqlite 持久,registry 重启对账(§11) | KV / raft 复制 |
 
 ### 4.3 异步操作 + watch 接口
 
-registry 对 router / scaler 提供**异步风格**接口(`op.listen`,帧化 JSON,与 §5 通道同族):
+registry 对 router / scaler 提供**异步风格**接口(`control_api.listen`,帧化 JSON,与 §5 通道同族):
 
 - **watch 订阅**:router 订阅路由流(喂本地缓存),scaler 订阅节点 / group 状态;增量 + 可断线
   恢复(§5.3)。
@@ -185,7 +214,7 @@ registry 对 router / scaler 提供**异步风格**接口(`op.listen`,帧化 JSO
 |---|---|---|---|
 | proxy worker ↔ node | worker | node | worker(`route`/`route_wake`)——既有 |
 | **node ↔ registry**(§5.1) | **node** | **node**(其 routes + `build` 事件) | **registry**(`kind=registry`):上行下发 `create`/`connect`/`delete`/`key_put`/`key_drop` |
-| router ↔ registry | router | registry(集群路由 + op 结果) | router:上行发 `ReserveSandbox` 等 op(§4.3) |
+| router ↔ registry | router | registry(集群路由 + control_api 结果) | router:上行发 `ReserveSandbox` 等 control_api 调用(§4.3) |
 | scaler ↔ registry | scaler | registry(节点 / group 状态) | scaler:registry 反向请求 `Place*`(§7.5) |
 | 外部观察者 ↔ registry | watcher | registry | watcher(`kind=watch`) |
 
@@ -196,7 +225,7 @@ registry 对 router / scaler 提供**异步风格**接口(`op.listen`,帧化 JSO
 
 节点接入复用其既有 routesync **权威**侧(node-proxy.md §6),只是连接由节点拨出:
 
-1. node 拨 registry 的 `channel.listen`,首帧发 `register{node_id, labels, capacity, build_capacity,
+1. node 拨 registry 的 `node_link.listen`,首帧发 `register{node_id, labels, capacity, build_capacity,
    data_endpoint, runtime_digest}`,registry 回 ack。
 2. node **反向监听**;registry 在该连接发 `register{subscribe:{kind:registry}}`——即 registry 作为
    node 的一个路由订阅者。
@@ -228,7 +257,7 @@ node-resource.md §2.5,放置据此排除该节点)。
 
 ### 5.2 router / scaler ↔ registry
 
-同族帧协议(`op.listen`):router / scaler 拨 registry,订阅事件流(下行)+ 发操作(上行);registry
+同族帧协议(`control_api.listen`):router / scaler 拨 registry,订阅事件流(下行)+ 发操作(上行);registry
 对 scaler 反向发 `Place*` 请求(§7.5)。UDS 本机 / mTLS 远端(§4.2)。
 
 ### 5.3 断线快速重连(分片版本号增量重放)
@@ -236,7 +265,7 @@ node-resource.md §2.5,放置据此排除该节点)。
 每分片维护**单调递增 `rev`**;每条下行事件带其 `rev`。订阅者记最后应用的 `rev`,**重连时带入**
 `resume_from`:
 
-- registry 若仍有自该 `rev` 起的变更日志(`channel.revision_retention` 窗口内)→ 只重放增量 +
+- registry 若仍有自该 `rev` 起的变更日志(`node_link.revision_retention` 窗口内)→ 只重放增量 +
   新 `bookmark`;
 - 否则(`rev` 过旧 / 已压实)→ 退回逐条全量 + `bookmark` 世代清扫(node-proxy.md §6)。
 
@@ -280,7 +309,7 @@ GroupSandboxConfigProvider: Get(group) → {sandbox_config, image_repo, template
 GroupPlacementProvider:     Get(group) → {nodeSelectors, shuffle_labels}   // 静态部分; shuffle 由 scaler 维护
 ```
 
-- 每接口经 `group_config.providers`(§3)独立选 `store`(registry 自存,`cluster-ctl group upsert` 写,
+- 每接口经 `sandbox_group.providers`(§3)独立选 `store`(registry 自存,`cluster-ctl sandbox-group upsert` 写,
   manifest_key secretbox 加密)或 `external:<addr>`(向 cloud provider 取,不落 registry——manifest_key
   仅在 api_key 校验 / 密钥分发时过路)。这是云厂商接管 group 目录 / 多租户的扩展点;沙箱数据流只
   依赖接口可达。

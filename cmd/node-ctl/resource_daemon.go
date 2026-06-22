@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/config"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/nodectl"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/orch"
 )
@@ -26,20 +27,13 @@ var _ orch.ResourceProbe = resourceProbe{}
 
 // startResourceController starts the in-process node resource controller — the
 // serve `resource_listen` sub-server (node-resource.md) — and runs it until ctx
-// is cancelled. configPath is the resource controller yaml ("" = built-in
-// defaults); listenOverride overrides its UDS. It returns once the listener is
-// bound (the controller serves in a background goroutine), or an error if setup
-// fails. When resource_listen is disabled serve never calls this and sandboxes
-// fall back to static cgroup.
-func startResourceController(ctx context.Context, configPath, listenOverride string, slogger *slog.Logger) (orch.ResourceProbe, error) {
-	cfg, err := nodectl.LoadDaemonConfig(configPath)
-	if err != nil {
-		return nil, err
-	}
-	if listenOverride != "" {
-		cfg.Listen = listenOverride
-	}
-	resolved, err := cfg.Resolve()
+// is cancelled. rcfg is the inlined controller config from serve's config
+// (config.Config.ResourceListen); its tuning is resolved here (auto-detect +
+// defaults). It returns once the listener is bound (the controller serves in a
+// background goroutine), or an error if setup fails. When resource_listen is
+// absent/disabled serve never calls this and sandboxes fall back to static cgroup.
+func startResourceController(ctx context.Context, rcfg *config.ResourceListenConfig, slogger *slog.Logger) (orch.ResourceProbe, error) {
+	resolved, err := nodectl.Resolve(rcfg)
 	if err != nil {
 		return nil, err
 	}

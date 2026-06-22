@@ -1,7 +1,7 @@
 // Package groupcfg is the fine-grained group-config provider split (cluster.md
 // §6.2): each interface — key, sandbox-config, placement — resolves independently
 // to the registry store or an external cloud-provider service
-// (clustercfg group_config.providers). The value types are self-contained (no
+// (clustercfg sandbox_group.providers). The value types are self-contained (no
 // registry import → no import cycle); the registry supplies the store-backed
 // implementations and builds the Resolver, while this package supplies the
 // external HTTP implementations and a TTL cache for the hot path.

@@ -313,7 +313,7 @@ func (o *Orchestrator) pauseSandbox(ctx context.Context, sb *types.Sandbox) erro
 	_ = o.st.SetState(ctx, sb.ID, types.StatePaused)
 	// Cluster deep-idle clock (§7.4): re-arm DeadlineUnix as the post-pause idle
 	// deadline so the reaper promotes this to SAVED after deep_idle_sec (opt-in).
-	if o.cfg.Cluster.Registry != "" && o.cfg.Checkpoint.DeepIdleSec > 0 {
+	if o.cfg.Cluster.Registry.Endpoint != "" && o.cfg.Checkpoint.DeepIdleSec > 0 {
 		d := time.Now().Unix() + int64(o.cfg.Checkpoint.DeepIdleSec)
 		sb.DeadlineUnix = d
 		_ = o.st.SetDeadline(ctx, sb.ID, d)

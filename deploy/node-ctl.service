@@ -9,7 +9,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/node-ctl serve --config /etc/node-ctl/config.yaml
+ExecStart=/usr/bin/node-ctl serve --config /etc/node-ctl/serve.yaml
 Restart=on-failure
 RestartSec=2
 

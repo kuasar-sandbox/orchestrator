@@ -13,15 +13,15 @@ import (
 // TestAuthModeOff: with router.auth=off, caller auth is skipped (front with an
 // external gateway) — a bad key is NOT rejected.
 func TestAuthModeOff(t *testing.T) {
-	op := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/op/reserve" {
+	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/control/reserve" {
 			_ = json.NewEncoder(w).Encode(reserveResult{NodeID: "n1", SID: "sb-1", AccessToken: "t", DataEndpoint: "10.0.0.1:1"})
 			return
 		}
 		w.WriteHeader(http.StatusForbidden) // verify-key would reject
 	}))
-	defer op.Close()
-	rt := New(strings.TrimPrefix(op.URL, "http://"), "test.local", 0, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	defer control.Close()
+	rt := New(strings.TrimPrefix(control.URL, "http://"), "test.local", 0, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	rt.SetAuthMode("off")
 	srv := httptest.NewServer(rt.Handler())
 	defer srv.Close()
@@ -50,18 +50,18 @@ func TestServeDataByKey(t *testing.T) {
 	}))
 	defer node.Close()
 	nodeHost := strings.TrimPrefix(node.URL, "http://")
-	op := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/op/reserve":
+		case "/control/reserve":
 			_ = json.NewEncoder(w).Encode(reserveResult{NodeID: "n1", SID: "sb-9", AccessToken: "tok", DataEndpoint: nodeHost})
-		case "/op/verify-key":
+		case "/control/verify-key":
 			w.WriteHeader(http.StatusOK)
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}
 	}))
-	defer op.Close()
-	rt := New(strings.TrimPrefix(op.URL, "http://"), "test.local", 0, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	defer control.Close()
+	rt := New(strings.TrimPrefix(control.URL, "http://"), "test.local", 0, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	rt.SetDataPlaneAuth("off")
 	srv := httptest.NewServer(rt.Handler())
 	defer srv.Close()

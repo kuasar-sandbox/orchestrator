@@ -1,11 +1,11 @@
 // Command node-ctl is the single-node, e2b-compatible sandbox orchestrator.
 //
-//	node-ctl serve     --config <yaml>                          # run the daemon
-//	node-ctl proxy     --socket <uds> --data-listen <addr> ...  # external data-plane worker
+//	node-ctl serve     --config <serve.yaml>                    # run the daemon
+//	node-ctl proxy     --config <proxy.yaml> --id <name>        # external data-plane worker
 //	node-ctl run-sandbox --pidfile=<f> --config-socket=<uds> --sandbox-id=<sid>
 //	node-ctl run-builder --pidfile=<f> --config-socket=<uds> --build-id=<bid>
 //	                                                                    # in-unit launchers (not for humans)
-//	node-ctl config       [--template]                          # render skeleton / dump resolved config
+//	node-ctl config <serve|proxy> [--template|--config <f>|--resolve]  # config diagnose / generate
 //	node-ctl manifest-key <add|list|remove> ...                 # tenant root-key whitelist (admin socket)
 //	node-ctl export-sandbox|import-sandbox ...                  # paused-snapshot egress / ingress
 //	node-ctl resource <status|list|drain|grant|reclaim>        # node resource controller (hosted in serve via resource_listen)
@@ -90,18 +90,11 @@ func usage() {
 
 func serve(args []string, log *slog.Logger) error {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
-	cfgPath := fs.String("config", "/etc/node-ctl/config.yaml", "config file")
-	proxyMode := fs.String("proxy", "", "override proxy_mode: internal|external|off")
+	cfgPath := fs.String("config", "/etc/node-ctl/serve.yaml", "config file")
 	_ = fs.Parse(args)
 
 	cfg, err := config.Load(*cfgPath)
 	if err != nil {
-		return err
-	}
-	if *proxyMode != "" {
-		cfg.Proxy.Mode = *proxyMode
-	}
-	if err := cfg.ValidateProxy(); err != nil { // re-check after flag overrides
 		return err
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -138,8 +131,8 @@ func serve(args []string, log *slog.Logger) error {
 
 	// Optionally host the node resource controller in-process (resource_listen,
 	// node-resource.md). Disabled => sandboxes use static cgroup.
-	if cfg.ResourceListen.Enabled {
-		probe, err := startResourceController(ctx, cfg.ResourceListen.Config, cfg.ResourceListen.Socket, log)
+	if cfg.ResourceListen != nil && cfg.ResourceListen.Enabled {
+		probe, err := startResourceController(ctx, cfg.ResourceListen, log)
 		if err != nil {
 			return fmt.Errorf("resource_listen: %w", err)
 		}
@@ -148,7 +141,7 @@ func serve(args []string, log *slog.Logger) error {
 
 	// Connect to the cluster registry over node-link (node.md §10) if configured:
 	// the node streams its sandbox routes up + executes the registry's commands.
-	if cfg.Cluster.Registry != "" {
+	if cfg.Cluster.Registry.Endpoint != "" {
 		nodeID := cfg.Cluster.NodeID
 		if nodeID == "" {
 			nodeID, _ = os.Hostname()
@@ -157,7 +150,7 @@ func serve(args []string, log *slog.Logger) error {
 		if dataEndpoint == "" {
 			dataEndpoint = cfg.API.Listen
 		}
-		regAddr := cfg.Cluster.Registry
+		regAddr := cfg.Cluster.Registry.Endpoint
 		hbInterval := 10 * time.Second
 		if cfg.Cluster.HeartbeatInterval != "" {
 			if d, err := time.ParseDuration(cfg.Cluster.HeartbeatInterval); err == nil {
@@ -165,8 +158,8 @@ func serve(args []string, log *slog.Logger) error {
 			}
 		}
 		var clientTLS *tls.Config
-		if cfg.Cluster.TLSCert != "" {
-			ct, terr := clustercfg.TLS{Cert: cfg.Cluster.TLSCert, Key: cfg.Cluster.TLSKey, CA: cfg.Cluster.TLSCA}.ClientConfig("")
+		if cfg.Cluster.Registry.TLS.Cert != "" {
+			ct, terr := clustercfg.TLS{Cert: cfg.Cluster.Registry.TLS.Cert, Key: cfg.Cluster.Registry.TLS.Key, CA: cfg.Cluster.Registry.TLS.CA}.ClientConfig("")
 			if terr != nil {
 				return fmt.Errorf("cluster node-link tls: %w", terr)
 			}
@@ -262,7 +255,8 @@ func serve(args []string, log *slog.Logger) error {
 	// MMDS metadata service (mmds.enabled): re-keys envd (launched in FC mode) to fresh
 	// per-identity tokens at /init. Internal mode serves it here from the orchestrator's
 	// live sandbox set; external mode's proxy worker serves it from its synced route
-	// table (--mmds-listen). The host must redirect 169.254.169.254:80 -> mmds.listen.
+	// table (a worker started with --mmds, on proxy.yaml mmds_listen). The host must
+	// redirect 169.254.169.254:80 -> mmds.listen.
 	if cfg.MMDS.Enabled && cfg.Proxy.Mode == config.ProxyInternal {
 		mln, err := net.Listen("tcp", cfg.MMDS.Listen)
 		if err != nil {

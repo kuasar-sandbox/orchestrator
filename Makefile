@@ -13,7 +13,7 @@
 SHELL := /bin/bash
 
 .PHONY: all build node-ctl cluster-ctl e2b-key-ctl sandbox-runtime-e2b sandbox-runtime-builder \
-        test vet bench test-e2e test-e2e-orchestrator test-e2e-proxy test-e2e-node-ctl clean help
+        test vet bench test-e2e test-e2e-orchestrator test-e2e-proxy clean help
 
 # ---------------------------------------------------------------------------
 # Architecture selection (identical block across all kuasar-sandbox repos)
@@ -122,7 +122,7 @@ clean:
 # this target points BIN at the umbrella's assembled bin/.
 SBIN := $(abspath ../kuasar-sandbox/bin/$(TARGET_ARCH))
 
-test-e2e: test-e2e-orchestrator test-e2e-proxy test-e2e-node-ctl
+test-e2e: test-e2e-orchestrator test-e2e-proxy
 
 test-e2e-orchestrator:
 	BIN=$(SBIN) bash ../kuasar-sandbox/test/e2e/e2e_orchestrator.sh
@@ -132,11 +132,6 @@ test-e2e-orchestrator:
 test-e2e-proxy:
 	BIN=$(SBIN) bash ../kuasar-sandbox/test/e2e/e2e_orchestrator_proxy.sh
 
-# node-ctl resource-protocol e2e (folded in from sandbox-sentinel). Runs in this
-# repo's module context so its inline Go driver resolves sandbox-runtime/pkg/resource.
-test-e2e-node-ctl:
-	BIN=$(SBIN) bash test/e2e/e2e_node_ctl.sh
-
 help:
 	@echo "sandbox-orchestrator. Targets:"
 	@echo "  build / node-ctl           build the node daemon (e2b host + resource control)"
@@ -144,5 +139,5 @@ help:
 	@echo "  sandbox-runtime-builder    e2b flavor + flatten-ctl + mkfs.erofs (build-sandbox guest runtime)"
 	@echo "  node-ctl                   node resource controller (folded in from sandbox-sentinel)"
 	@echo "  test / vet / bench / clean"
-	@echo "  test-e2e[-orchestrator|-proxy|-node-ctl]  run the umbrella e2e against assembled bin/"
+	@echo "  test-e2e[-orchestrator|-proxy]  run the umbrella e2e against assembled bin/"
 	@echo "  TARGET_ARCH                x86_64 (default) | aarch64"

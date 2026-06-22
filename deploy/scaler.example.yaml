@@ -1,0 +1,20 @@
+# cluster-ctl scaler config — cluster-ctl scaler --config /etc/cluster-ctl/scaler.yaml.
+# Standalone placement scheduler (cluster-scaler.md §3): it dials the registry
+# control_api and answers placement over the scaler-link (no listener of its own).
+# Validate with `cluster-ctl config scaler --config scaler.yaml`.
+
+# Upstream: how to reach the registry's control_api (same target as router.registry).
+registry:
+  endpoint: /run/cluster/registry.sock
+  # tls: { cert: ..., key: ..., ca: ... }   # client mTLS to dial a remote registry (§5.4)
+
+placement:
+  candidates: 2                       # P2C sample size
+  zone_admit_max: yellow              # exclude nodes hotter than this (green|yellow|red)
+  node_dead_after: 30s                # exclude nodes silent longer than this
+  # shuffle_sharding: pin matching groups to n deterministic shards of the node set,
+  # bucketed by a node label (cluster-scaler.md §4.4). Empty = static nodeSelectors only.
+  # shuffle_sharding:
+  #   - selector: { pool: gpu }
+  #     shard_by: zone
+  #     n: 2

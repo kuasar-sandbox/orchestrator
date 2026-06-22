@@ -40,23 +40,33 @@
 与 serve 同节点。
 
 ```
-node-ctl proxy --config-socket=<uds> --id=<name> --socket=<uds>
-               [--data-listen=:443] [--tls-cert <pem> --tls-key <pem>]
-               [--auth off|log|enforce] [--park-timeout 30s]
-               [--metrics-listen <addr>] [--mmds-listen <addr>]
+node-ctl proxy --config /etc/node-ctl/proxy.yaml --id <name>
+               [--socket <uds>] [--metrics-listen <addr>] [--mmds]
 ```
+
+worker 读 `proxy.yaml` 取共享策略与端点,命令行只给每实例身份。多个实例
+(`node-proxy@1`、`@2`…)共用同一份 `proxy.yaml`,仅 `--id` 不同。
+
+每实例命令行参数:
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
-| `--config-socket` | (必填) | serve 的 config-socket UDS:worker 在其 plugin 平面注册并同步路由(node.md §6、本文 §6) |
+| `--config` | `/etc/node-ctl/proxy.yaml` | worker 配置文件 |
 | `--id` | (必填) | 本 worker 的 plugin id,每 worker 唯一(同 id 二次注册顶掉前者) |
-| `--socket` | (必填) | 本 worker 服务兜底网关转发的 UDS(注册时上报给 serve) |
-| `--data-listen` | 空 | 数据面入口,**SO_REUSEPORT**(多 worker 共享同一端口);空 = 仅 UDS 服务 |
-| `--tls-cert/--tls-key` | 空 | 数据面 TLS(与 serve 同一张通配证书);空 = h2c |
-| `--auth` | `enforce` | 数据面鉴权回退值,仅在 serve 策略到达前生效(§7) |
-| `--park-timeout` | `30s` | 请求挂起预算回退值,同上 |
-| `--metrics-listen` | 空 | Prometheus 文本端点(`/metrics`) |
-| `--mmds-listen` | 空 | MMDS 元数据服务监听地址;serve 配 `mmds.enabled` 时设置(§8) |
+| `--socket` | `<dir(config_socket)>/<id>.sock` | 本 worker 服务兜底网关转发的 UDS(注册时上报给 serve) |
+| `--metrics-listen` | 空 | Prometheus 文本端点(`/metrics`),每实例独立(同机多 worker 端口须异) |
+| `--mmds` | 关 | 在本实例起 FC MMDS 元数据服务(地址取 `mmds_listen`);serve 配 `mmds.enabled` 时挑一个 worker 开(§8) |
+
+`proxy.yaml` 字段:
+
+| 字段 | 默认 | 说明 |
+|---|---|---|
+| `config_socket` | `/run/sandbox/node-ctl.socket` | serve 的 config-socket UDS:worker 在其 plugin 平面注册并同步路由(node.md §6、本文 §6) |
+| `data_listen` | `:443` | 数据面入口,**SO_REUSEPORT**(多 worker 共享同一端口);空 = 仅 UDS 兜底服务 |
+| `tls` | 空 | 数据面 TLS `{cert,key}`(与 serve 同一张通配证书);空 = h2c |
+| `auth` | `enforce` | 数据面鉴权回退值,仅在 serve 策略到达前生效(§7) |
+| `park_timeout` | `30s` | 请求挂起预算回退值,同上 |
+| `mmds_listen` | `127.0.0.1:19254` | `--mmds` 实例绑定的 MMDS 地址(§8) |
 
 ## 3. 配置
 
@@ -71,7 +81,7 @@ node-ctl proxy --config-socket=<uds> --id=<name> --socket=<uds>
 | `mmds.enabled` | `false` | envd 鉴权姿态(§8):false = proxy 单闸门;true = FC MMDS v2 + envd re-key |
 
 external 模式下 `proxy.auth` / `park_timeout` 经握手 `Policy` 下推到 worker;worker 的
-`--auth` / `--park-timeout` 仅为策略到达前回退。
+`auth` / `park_timeout`(proxy.yaml)仅为策略到达前回退。
 
 ## 4. 转发数据通路
 
@@ -121,7 +131,7 @@ external 模式拓扑(数据面字节流不经 serve;**worker 主动注册,serve
                     CONNECT → chained CONNECT relay, §9)
 ```
 
-- **注册即订阅**:worker 经 `--config-socket` / `--id` 在 plugin 平面(node.md §6)
+- **注册即订阅**:worker 经 `config_socket`(proxy.yaml)/ `--id` 在 plugin 平面(node.md §6)
   注册 `subscribe=route_wake` + `proxy{socket}`,持挂连接 = 租约 + 路由流。serve
   不再拨 worker——拓扑反转后它只是连接的应答方与路由权威。断连即反注册;同 id 二次注册
   顶掉(断链)前者。同一平面也接受**非 proxy 观察者**(如平台 agent,`subscribe=route`),
@@ -134,7 +144,7 @@ external 模式拓扑(数据面字节流不经 serve;**worker 主动注册,serve
   `Upsert(running)` 回灌解挂;`park_timeout`(策略下推,默认 30s)内未就绪回 404。
   首个 Bookmark 到达前的请求同样先等同步完成。
 - **运营策略集中下推**:握手 Hello 携带 `Policy{domain, auth_mode, park_timeout_ms}`;
-  worker 的 `--auth` / `--park-timeout` 仅为策略到达前的回退。
+  worker 的 `auth` / `park_timeout`(proxy.yaml)仅为策略到达前的回退。
 - **兜底网关**:数据面请求误达 serve 监听口时,serve 按 sid 的 FNV 哈希在**活跃注册的
   worker 集**上挑一个,经其 `--socket` UDS 反代过去(连接亲和),由 worker 照常处理(含
   鉴权);`CONNECT` 经链式 CONNECT relay 转发(§9)。无 worker 注册时回 502。
@@ -223,7 +233,7 @@ external 模式拓扑(数据面字节流不经 serve;**worker 主动注册,serve
 | 扇出 fork | 可用(envd 无 token,故不错配) | 可用(envd 重置为新 token) |
 
 **MMDS 服务**(`enabled=true`):serve 在 **proxy 组件**内起 Firecracker MMDS
-v2 兼容服务(internal:serve 绑 `mmds.listen`;external:worker `--mmds-listen`,数据源
+v2 兼容服务(internal:serve 绑 `mmds.listen`;external:worker `--mmds`(地址取 `mmds_listen`),数据源
 是同步来的路由表)。两段式:
 
 1. **`PUT /latest/api/token`**:按请求源 IP(= 沙箱 floatingip,vswitch mgmt-extract

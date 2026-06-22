@@ -1,0 +1,16 @@
+# cluster-scaler.service — cluster placement scheduler (cluster-scaler.md). Dials the
+# registry op endpoint (scaler.yaml: registry) and answers placement over the
+# scaler-link; no listener of its own. Operator-managed.
+[Unit]
+Description=kuasar cluster-ctl scaler (placement scheduler)
+After=network-online.target cluster-registry.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/cluster-ctl scaler --config /etc/cluster-ctl/scaler.yaml
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

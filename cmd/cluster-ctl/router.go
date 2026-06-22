@@ -21,59 +21,48 @@ import (
 )
 
 // runRouter starts the router role: the e2b-compatible unified ingress
-// (cluster-router.md). It dials the registry's op interface for reserve + route
+// (cluster-router.md). It dials the registry's control API for reserve + route
 // resolution. Phase 3 serves plain h2c (dev); router.tls + auth cache are Phase 7.
 func runRouter(args []string, log *slog.Logger) error {
 	fs := flag.NewFlagSet("router", flag.ExitOnError)
-	cfgPath := fs.String("config", "/etc/cluster-ctl/config.yaml", "config file")
-	registryAddr := fs.String("registry", "", "override registry op endpoint (UDS path or host:port)")
-	listen := fs.String("listen", "", "override router.listen")
+	cfgPath := fs.String("config", "/etc/cluster-ctl/router.yaml", "config file")
 	_ = fs.Parse(args)
 
-	cfg, err := clustercfg.Load(*cfgPath)
+	cfg, err := clustercfg.LoadRouter(*cfgPath)
 	if err != nil {
 		return err
 	}
-	opAddr := cfg.Router.Registry
-	if *registryAddr != "" {
-		opAddr = *registryAddr
-	}
-	if opAddr == "" {
-		opAddr = cfg.Op.Listen // co-located: dial the registry's op UDS
-	}
-	if *listen != "" {
-		cfg.Router.Listen = *listen
-	}
+	controlAddr := cfg.Registry.Endpoint // registry control_api to dial (default: co-located socket)
 
-	// op-mTLS when the op endpoint is a remote TCP addr and op.tls is configured
-	// (cluster.md §5.4); a co-located UDS op stays plain.
-	var opTLS *tls.Config
-	if !strings.HasPrefix(opAddr, "/") && cfg.Op.TLS.Enabled() {
-		host := opAddr
+	// registry mTLS when the endpoint is a remote TCP addr and registry.tls is set
+	// (cluster.md §5.4); a co-located UDS endpoint stays plain.
+	var controlTLS *tls.Config
+	if !strings.HasPrefix(controlAddr, "/") && cfg.Registry.TLS.Enabled() {
+		host := controlAddr
 		if i := strings.LastIndexByte(host, ':'); i >= 0 {
 			host = host[:i]
 		}
-		if opTLS, err = cfg.Op.TLS.ClientConfig(host); err != nil {
-			return fmt.Errorf("router: op tls: %w", err)
+		if controlTLS, err = cfg.Registry.TLS.ClientConfig(host); err != nil {
+			return fmt.Errorf("router: registry tls: %w", err)
 		}
 	}
-	rt := router.New(opAddr, cfg.Domain, cfg.Router.AuthCacheDur(), opTLS, log)
-	rt.SetDataPlaneAuth(cfg.Router.DataPlaneAuth)
-	rt.SetAuthMode(cfg.Router.Auth)
+	rt := router.New(controlAddr, cfg.Domain, cfg.AuthCacheDur(), controlTLS, log)
+	rt.SetDataPlaneAuth(cfg.Auth.DataPlane)
+	rt.SetAuthMode(cfg.Auth.APIKey)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	// Sync the local route cache from the registry op watch (hot-path data plane,
-	// cluster.md §5; a cache miss falls back to op /route).
+	// Sync the local route cache from the registry control watch (hot-path data plane,
+	// cluster.md §5; a cache miss falls back to control /route).
 	go rt.RunWatch(ctx)
 	go rt.RunCleanup(ctx) // evict expired auth-cache / stale build-map entries
 
 	// Optional Prometheus metrics endpoint (router_requests_total{plane,result}, §10).
-	if cfg.Router.MetricsListen != "" {
-		mln, merr := net.Listen("tcp", cfg.Router.MetricsListen)
+	if cfg.MetricsListen != "" {
+		mln, merr := net.Listen("tcp", cfg.MetricsListen)
 		if merr != nil {
-			return fmt.Errorf("router: metrics listen %s: %w", cfg.Router.MetricsListen, merr)
+			return fmt.Errorf("router: metrics listen %s: %w", cfg.MetricsListen, merr)
 		}
 		mmux := http.NewServeMux()
 		mmux.HandleFunc("/metrics", rt.Metrics().Handler())
@@ -96,13 +85,13 @@ func runRouter(args []string, log *slog.Logger) error {
 		}
 		return serr
 	}}
-	ln, err := lc.Listen(ctx, "tcp", cfg.Router.Listen)
+	ln, err := lc.Listen(ctx, "tcp", cfg.Ingress.Listen)
 	if err != nil {
-		return fmt.Errorf("router: listen %s: %w", cfg.Router.Listen, err)
+		return fmt.Errorf("router: listen %s: %w", cfg.Ingress.Listen, err)
 	}
 	var srv *http.Server
-	if cfg.Router.TLS.Enabled() {
-		stls, terr := cfg.Router.TLS.ServerConfig()
+	if cfg.Ingress.TLS.Enabled() {
+		stls, terr := cfg.Ingress.TLS.ServerConfig()
 		if terr != nil {
 			return fmt.Errorf("router: tls: %w", terr)
 		}
@@ -114,9 +103,9 @@ func runRouter(args []string, log *slog.Logger) error {
 		<-ctx.Done()
 		srv.Close()
 	}()
-	log.Info("cluster-ctl router", "listen", cfg.Router.Listen, "domain", cfg.Domain, "op", opAddr, "tls", cfg.Router.TLS.Enabled())
+	log.Info("cluster-ctl router", "listen", cfg.Ingress.Listen, "domain", cfg.Domain, "registry", controlAddr, "tls", cfg.Ingress.TLS.Enabled())
 	var serveErr error
-	if cfg.Router.TLS.Enabled() {
+	if cfg.Ingress.TLS.Enabled() {
 		serveErr = srv.ServeTLS(ln, "", "")
 	} else {
 		serveErr = srv.Serve(ln)

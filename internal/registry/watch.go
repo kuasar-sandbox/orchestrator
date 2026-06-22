@@ -11,13 +11,13 @@ import (
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/clusterstore"
 )
 
-// OpWatchPath streams resolved sandbox route changes to the router's local cache
+// ControlWatchPath streams resolved sandbox route changes to the router's local cache
 // (cluster.md §5.2/§5.3): GET ?from_rev=N. from_rev<=0 (or a compacted from_rev>0)
 // → a reset + a snapshot (every current route as a put) + a bookmark + live deltas;
 // a live from_rev>0 → replay the change-log strictly after N (no reset/snapshot),
 // then live deltas. The reset tells the subscriber to rebuild vs keep its cache.
 // Frames are length-prefixed JSON ([4B LE len][WatchEvent]).
-const OpWatchPath = "/op/watch"
+const ControlWatchPath = "/control/watch"
 
 // WatchEvent is one frame on the watch stream.
 type WatchEvent struct {

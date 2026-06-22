@@ -2,23 +2,51 @@ package clustercfg
 
 import "testing"
 
+// TestValidateRejectsBadValues exercises each role's Validate over the bad values it
+// owns (providers → registry, zones/candidates → scaler, auth → router).
 func TestValidateRejectsBadValues(t *testing.T) {
-	base := func() Config { c := Default(); c.Domain = "d"; return c }
-	cases := map[string]func(*Config){
-		"empty external addr":  func(c *Config) { c.GroupConfig.Providers[ProviderKey] = "external:" },
-		"bad zone_admit_max":   func(c *Config) { c.Scaler.ZoneAdmitMax = "purple" },
-		"negative place_cands": func(c *Config) { c.Scaler.PlaceCandidates = -1 },
-		"bad data_plane_auth":  func(c *Config) { c.Router.DataPlaneAuth = "maybe" },
-	}
-	for name, mut := range cases {
-		c := base()
-		mut(&c)
+	t.Run("registry empty external addr", func(t *testing.T) {
+		c := DefaultRegistry()
+		c.SandboxGroup.Providers[ProviderKey] = "external:"
 		if err := c.Validate(); err == nil {
-			t.Errorf("%s: Validate accepted an invalid config", name)
+			t.Error("Validate accepted an empty external addr")
 		}
-	}
-	ok := base()
-	if err := ok.Validate(); err != nil {
-		t.Fatalf("a valid default config failed Validate: %v", err)
-	}
+	})
+	t.Run("scaler bad zone_admit_max", func(t *testing.T) {
+		c := DefaultScaler()
+		c.Placement.ZoneAdmitMax = "purple"
+		if err := c.Validate(); err == nil {
+			t.Error("Validate accepted a bad zone_admit_max")
+		}
+	})
+	t.Run("scaler negative candidates", func(t *testing.T) {
+		c := DefaultScaler()
+		c.Placement.Candidates = -1
+		if err := c.Validate(); err == nil {
+			t.Error("Validate accepted a negative placement.candidates")
+		}
+	})
+	t.Run("router bad data_plane", func(t *testing.T) {
+		c := DefaultRouter()
+		c.Domain = "d"
+		c.Auth.DataPlane = "maybe"
+		if err := c.Validate(); err == nil {
+			t.Error("Validate accepted a bad auth.data_plane")
+		}
+	})
+	t.Run("valid defaults pass", func(t *testing.T) {
+		r := DefaultRegistry()
+		if err := r.Validate(); err != nil {
+			t.Fatalf("a valid default registry failed Validate: %v", err)
+		}
+		rt := DefaultRouter()
+		rt.Domain = "d"
+		if err := rt.Validate(); err != nil {
+			t.Fatalf("a valid default router failed Validate: %v", err)
+		}
+		s := DefaultScaler()
+		if err := s.Validate(); err != nil {
+			t.Fatalf("a valid default scaler failed Validate: %v", err)
+		}
+	})
 }

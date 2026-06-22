@@ -41,10 +41,10 @@ node-ctl 补这一层,并刻意选择 **e2b 协议兼容**而非自定义 API:e2
 1. **依赖面薄,经 CLI 组合**:驱动 `sandbox-ctl`(run/snapshot)、`vswitch-ctl`
    (attach/detach)、`flatten-ctl`(export)全部经子进程 CLI,不 import 兄弟仓内部包;
    经 systemd D-Bus 管单元;经 UDS 反代 envd。叶子组件,纯 Go,`CGO_ENABLED=0`。
-2. **资源仲裁可内置可外置**:沙箱准入/配额由 `sandbox-ctl`(`pkg/resource` 的 client)
-   与节点级**资源控制器**对话完成;控制器既可独立进程,也可由 `node-ctl serve` 经
-   `resource_listen` 内置(node-resource.md)。控制器是可分离的子系统,与 serve 的
-   api / 主机 / proxy 逻辑解耦。构建任务的资源池由 serve 自管(§12)。
+2. **资源仲裁内置且可分离**:沙箱准入/配额由 `sandbox-ctl`(`pkg/resource` 的 client)
+   与节点级**资源控制器**对话完成;控制器由 `node-ctl serve` 经 `resource_listen` 内置
+   (node-resource.md),调参随 serve 配置内联。它仍是与 serve 的 api / 主机 / proxy
+   逻辑解耦的可分离子系统。构建任务的资源池由 serve 自管(§12)。
 3. **进程管理交给 systemd**:一沙箱一单元(`sandbox-runner@<sid>`),单元 cgroup 即
    沙箱资源 cgroup(`--cgroup-adopt`,§5.1),`StopUnit` 即完整回收;serve 不
    自己当进程监督者。
@@ -175,18 +175,17 @@ export E2B_DOMAIN=sandboxes.example.com        # 生产(TLS, §13)
 ### 2.2 `node-ctl serve`
 
 ```
-node-ctl serve [--config /etc/node-ctl/config.yaml] [--proxy internal|external|off]
+node-ctl serve [--config /etc/node-ctl/serve.yaml]
 ```
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
-| `--config` | `/etc/node-ctl/config.yaml` | 配置文件(§3) |
-| `--proxy` | – | 覆盖配置的 `proxy.mode` |
+| `--config` | `/etc/node-ctl/serve.yaml` | 配置文件(§3);`proxy.mode` 等一律以文件为准 |
 
 启动序列:打开 sqlite(文件 chmod 0600)→ 生成并安装 systemd 模板单元(§5)→
 重启对账(§15)→ 起 reaper(TTL,5s 周期)与构建池(§12)→ 起本机控制 socket(§6)
 →(配 `resource_listen` 则起内置资源控制器,node-resource.md)→ 按 `proxy.mode` 装配
-数据面(§9)→(配 `cluster.registry` 则拨 registry 起 node-link 客户端,§10)→
+数据面(§9)→(配 `cluster.registry.endpoint` 则拨 registry 起 node-link 客户端,§10)→
 监听 `api.listen`。`api.<domain>`(及任何 `api.` 前缀 Host)路由到控制面,其余 Host
 进数据面。TLS 证书缺省时以明文 h2c 服务(dev:SDK 走 `E2B_API_URL`/`E2B_SANDBOX_URL`)。
 
@@ -194,9 +193,18 @@ node-ctl serve [--config /etc/node-ctl/config.yaml] [--proxy internal|external|o
 
 ### 2.3 `node-ctl proxy`
 
-外置数据面 worker(`proxy.mode=external`);运维带外起、与 serve 同节点。命令行、
-参数、部署模式与拓扑见 [node-proxy.md](node-proxy.md) §2、§5——转发层自成一文,本仓控制面只在
-§9 讲如何按 `proxy.mode` 装配它。
+外置数据面 worker(`proxy.mode=external`);运维带外起、与 serve 同节点。配置文件驱动
+(`proxy.yaml`,自带 schema,见 [node-proxy.md](node-proxy.md) §2),命令行只剩每实例身份:
+
+```
+node-ctl proxy --config /etc/node-ctl/proxy.yaml --id <name>
+               [--socket <uds>] [--metrics-listen <addr>] [--mmds]
+```
+
+策略与端点(`config_socket`/`data_listen`/`tls`/`auth`/`park_timeout`/`mmds_listen`)在
+`proxy.yaml`;`--id` 必填,`--socket` 缺省 `<dir(config_socket)>/<id>.sock`,`--metrics-listen`
+每实例(端口须异),`--mmds` 让本实例起 MMDS(地址取 `mmds_listen`)。部署模式与拓扑见
+node-proxy.md §2、§5——转发层自成一文,本仓控制面只在 §9 讲如何按 `proxy.mode` 装配它。
 
 ### 2.4 `node-ctl run-sandbox` / `run-builder`
 
@@ -222,14 +230,18 @@ flags 缺省回落 `TASK_PIDFILE` / `TASK_CONFIG_SOCKET` / `TASK_SANDBOX_ID` /
 
 ### 2.5 `node-ctl config`
 
+配置诊断 + 生成工具,**按角色**(`serve` / `proxy`,各自独立文件与 schema):
+
 ```
-node-ctl config --config <file>   # 加载(补默认 + 校验)后重排输出
-node-ctl config --template        # 输出带注释骨架
-                -o <file>         # 写文件(默认 stdout)
+node-ctl config <serve|proxy> --template            # 输出该角色带注释骨架
+node-ctl config <serve|proxy> --config <file>       # 加载(补默认 + 校验)后重排输出
+node-ctl config <serve|proxy> --config <file> --resolve   # 再展开 auto/派生(实际生效形态)
+                              -o <file>             # 写文件(默认 stdout)
 ```
 
-与 `sandbox-ctl config` / `flatten-ctl config` 同形态。骨架与
-`deploy/config.example.yaml` 对应。
+角色作首参以消歧 schema:`serve` 对应 `serve.yaml`(§3),`proxy` 对应 `proxy.yaml`
+(node-proxy.md §2)。`--resolve` 对 `serve` 额外展开 `resource_listen` 的 `auto` 内存/CPU
+(并深校验水位),其余角色与 `--config` 等价。骨架与 `deploy/{serve,proxy}.example.yaml` 对应。
 
 ### 2.6 `node-ctl manifest-key`
 
@@ -287,13 +299,13 @@ e2b-key-ctl seal-pull-token [<MANIFEST_KEY>] {--registry-username U --registry-p
 
 ## 3. 配置
 
-完整带注释样例见 `deploy/config.example.yaml`(`node-ctl config --template`
-输出同形骨架),权威结构是 `internal/config/config.go`。配置按关注点分组:`api`、
-`proxy`、`paths`、`units`、`sandbox`(实例级默认,子组 `resources`/`network`/`boot`)、
-`builder`、`checkpoint`、`mmds`、`cluster`(node-link,§10)、`resource_listen`(内置
-资源控制器,node-resource.md),外加顶层单值 `encryption_key`、`manifest_config`。
-**必填仅 `api.domain` 与 `encryption_key`**(后者可用 `NODE_CTL_ENCRYPTION_KEY`
-env 覆盖)。外部二进制(sandbox-ctl/vswitch-ctl/flatten-ctl)**不配置**:按"与
+serve daemon 的配置文件是 `serve.yaml`。完整带注释样例见 `deploy/serve.example.yaml`
+(`node-ctl config serve --template` 输出同形骨架),权威结构是 `internal/config/config.go`。
+配置按关注点分组:`api`、`proxy`、`paths`、`units`、`sandbox`(实例级默认,子组
+`resources`/`network`/`boot`)、`builder`、`checkpoint`、`mmds`、`cluster`(node-link,§10)、
+`resource_listen`(内置资源控制器,调参全部内联,node-resource.md),外加顶层单值
+`encryption_key`、`manifest_config`。**必填仅 `api.domain` 与 `encryption_key`**(后者可用
+`NODE_CONFIG_ENCRYPTION_KEY` env 覆盖)。外部二进制(sandbox-ctl/vswitch-ctl/flatten-ctl)**不配置**:按"与
 node-ctl 同目录 → PATH"自动发现。
 
 | 字段 | 默认 | 说明 |
@@ -302,11 +314,11 @@ node-ctl 同目录 → PATH"自动发现。
 | `api.listen` | `:443` | 北向监听;dev 用 `:3000` 走明文 h2c |
 | `api.tls.cert/key` | 空 | 通配证书(`*.<domain>` 与 `api.<domain>`,§13);空 = 明文 |
 | `proxy.mode` | `internal` | 数据面承载:`internal`/`external`/`off`(装配见 §9.1,部署模式见 node-proxy.md §5) |
-| `proxy.data_listen` | 空 | 专用数据面监听;空 = 与 `api.listen` 共口。external 模式由 worker 持有数据口,serve 不绑它 |
+| `proxy.data_listen` | 空 | internal 模式专用数据面监听;空 = 与 `api.listen` 共口。external 模式数据口在 worker 的 `proxy.yaml`(serve 不绑) |
 | `proxy.park_timeout` | `30s` | 数据面请求挂起预算:等路由同步 / paused 沙箱 resume 的上限(node-proxy.md §5) |
 | `proxy.auth` | `enforce` | 数据面鉴权:`off`/`log`/`enforce`,校验 `X-Access-Token`(node-proxy.md §7) |
 | `proxy.metrics_listen` | 空(关) | Prometheus 文本端点(`data_requests_total{result=…}`、`gateway_forward_total` 等) |
-| `encryption_key` | (必填) | manifest_key 落盘加密的 AES-256 密钥:`:` 分隔多个 64-hex,首个为活动密钥,其余备用解旧记录(轮换);`NODE_CTL_ENCRYPTION_KEY` env 优先 |
+| `encryption_key` | (必填) | manifest_key 落盘加密的 AES-256 密钥:`:` 分隔多个 64-hex,首个为活动密钥,其余备用解旧记录(轮换);`NODE_CONFIG_ENCRYPTION_KEY` env 优先 |
 | `manifest_config` | `/opt/sandbox/manifest.yaml` | 共享远程 manifest store 配置(`manifest.key` 留空,租户 key 经 env 按任务下发) |
 | `paths.run_root` | `/run/sandbox` | tmpfs 运行态:`<sid>/` 运行目录、UDS、pidfile |
 | `paths.base_root` | `/var/lib/sandbox` | 持久态根 |
@@ -319,7 +331,7 @@ node-ctl 同目录 → PATH"自动发现。
 | `units.install` | `true` | `false` = 单元由运维带外管理,serve 不生成安装 |
 | `sandbox.timeout_sec` | `300` | 沙箱默认 TTL(秒) |
 | `sandbox.resources.vcpu` / `.memory` | `2` / `2GiB` | 每沙箱容量;同时回显在 e2b list/get 的 `cpuCount`/`memoryMB`。**restore 类启动(snp 模板 create / resume / 迁移导入)按快照内 snapshot.cfg 的 capacity 覆盖**——快照自描述,可与本机默认不同(如构建预算下产出的模板) |
-| `sandbox.resources.control_socket` | 空 | 资源控制器 UDS,**opt-in**;空 = 静态 cgroup(单元自身,§5.1);非空指向内置(`resource_listen`)或独立控制器(node-resource.md) |
+| `sandbox.resources.control_socket` | 空 | 资源控制器 UDS,**opt-in**;空 = 静态 cgroup(单元自身,§5.1);非空指向内置控制器(`resource_listen`,通常即其 `socket`,node-resource.md) |
 | `sandbox.network.switch` | `sw0` | vswitch 交换机名 |
 | `sandbox.network.hostname` | `sandbox` | guest 主机名:sethostname + `/etc/hosts` 条目(§11) |
 | `sandbox.network.dns` | `[169.254.169.253]` | 注入 guest `/etc/resolv.conf` 的 nameserver;该地址需部署侧路由到真实 DNS |
@@ -342,17 +354,17 @@ node-ctl 同目录 → PATH"自动发现。
 | `checkpoint.deep_idle_sec` | `0` | 集群:PAUSED 深空闲 → SAVED 自提升阈值(cluster.md §7.4);0 = 关 |
 | `mmds.enabled` | `false` | envd 鉴权姿态开关(§9.2、node-proxy.md §8):false = `-isnotfc` + proxy 单闸门;true = FC 模式 + MMDS re-key |
 | `mmds.listen` | `127.0.0.1:19254` | MMDS 监听地址(vswitch `--mgmt-service` 的转换目标) |
-| `cluster.registry` | 空 | registry 的 node-link 地址(§10);空 = 独立模式,不接入集群 |
+| `cluster.registry.endpoint` | 空 | registry 的 node-link 地址(§10);空 = 独立模式,不接入集群 |
+| `cluster.registry.tls` | 空 | node-link mTLS 证书 / key / CA(`{cert,key,ca}`;生产必配,§10 / cluster.md §5.4) |
 | `cluster.node_id` | (接入集群必填) | 本节点唯一标识(node-link 注册,cluster.md §5) |
 | `cluster.labels` | 空 | 节点标签 `{zone,pool,slot,node}`(scaler nodeSelectors 匹配,cluster-scaler.md §4.3) |
 | `cluster.data_endpoint` | 空 | 本节点数据面端点(供 router 转发);缺省由 `api.domain` + `proxy`/`api` 监听推导 |
-| `cluster.tls` | 空 | node-link mTLS 证书 / key / CA(生产必配,§10 / cluster.md §5.4) |
-| `resource_listen` | 空 | 内置资源控制器:非空即在该 UDS 起控制器(node-resource.md),其余字段(`resources`/`watermarks`/`admission`/…)同 node-resource.md §3;空 = 不内置(沙箱用静态 cgroup 或拨独立控制器) |
+| `resource_listen` | 缺省(不内置) | 内置资源控制器整块(调参内联,无独立文件):`enabled` 开关、`socket`(控制器 UDS,**唯一权威**;空 = `pkg/resource` 默认,与 sandbox-ctl 一致),其余 `state_path`/`audit_path`/`cgroup_scan_paths`/`resources`/`watermarks`/`rate_limits`/`admission`/`dampening` 均有默认(语义见 node-resource.md §3.2);整块省略或 `enabled: false` = 不内置(沙箱用静态 cgroup) |
 
 配置自洽校验:`mmds.enabled=false` 时 `proxy.auth` 必须为 `enforce`(envd 非 secure,
 proxy 是唯一数据面闸门);`mmds.enabled=true` 时 `proxy.mode` 不得为 `off`(MMDS 寄宿
 proxy 组件)。external 模式无须静态 worker 列表——worker 自行经 plugin 平面注册,网关
-按活跃注册集转发(§9.1、§9.3)。配 `cluster.registry` 时 `cluster.node_id` 必填;配
+按活跃注册集转发(§9.1、§9.3)。配 `cluster.registry.endpoint` 时 `cluster.node_id` 必填;配
 `resource_listen` 时 `sandbox.resources.control_socket` 通常指向它(否则控制器空跑)。
 
 ## 4. e2b API 契约
@@ -641,7 +653,7 @@ id 二次注册自动反注册(并断链)前者。鉴权:配 `paths.plugin_pidfi
 - **加密落盘**:`manifest_keys` / `sandboxes` / `builds` 三表的 manifest_key 字段
   AES-256-GCM 加密(`internal/secretbox`:记录 = `keytag(4)‖nonce(12)‖ct+tag`,
   keytag 选解密钥),另存 `manifest_key_hash = hex(fp)` 非唯一索引(快速匹配/排除)。
-  加密密钥经 `encryption_key` / `NODE_CTL_ENCRYPTION_KEY`(`:` 分隔多键,[0]
+  加密密钥经 `encryption_key` / `NODE_CONFIG_ENCRYPTION_KEY`(`:` 分隔多键,[0]
   活动、其余备用解旧记录,支持轮换)。
 - **鉴权解析**(短 hash 匹配 + 完整 MAC 校验):api_key → 按 `fp` 命中行/白名单 →
   解密 manifest_key → 重算 HMAC 比对:
@@ -793,18 +805,18 @@ sid 的 FNV 哈希在**活跃注册的 worker 集**上挑一个,经其 `--socket
 
 ## 10. 集群接入(node-link:复用 routesync)
 
-配 `cluster.registry`(§3)时,`node-ctl serve` 拨 registry 把本节点接入集群,交由 cluster-ctl
+配 `cluster.registry.endpoint`(§3)时,`node-ctl serve` 拨 registry 把本节点接入集群,交由 cluster-ctl
 (registry / router / scaler)编排。**节点接入复用其既有 routesync 引擎**(node-proxy.md §6):节点
 拨 registry、注册身份、**反向监听**,registry 在该连接上以 `register{subscribe:{kind:registry}}` 作
 **路由订阅者**,此后节点作**路由 / 构建权威**下行流式上报、registry 上行下发命令。线格式与枢纽
-语义由 **cluster.md §5** 权威定义;本节只讲节点侧角色。空 `cluster.registry` = 独立模式,本节不生效。
+语义由 **cluster.md §5** 权威定义;本节只讲节点侧角色。空 `cluster.registry.endpoint` = 独立模式,本节不生效。
 
 集群下两条到节点的路径:**node-link**(本节,承载注册 / 心跳 / 路由+构建事件 / 命令 / 密钥),与
 cluster router **转发到本节点 e2b 控制面 / 数据面**的请求——pause/kill/timeout、build trigger/status/
 files 转发本机 e2b 控制面(§4),数据面业务流量经 router 注入 `E2b-Sandbox-Id` + `X-Access-Token` 转发
 本机 proxy(node-proxy.md)。后者复用节点既有 e2b API,**节点侧零改动**。
 
-- **接入即注册**:拨 registry 的 `channel.listen`(全双工 h2c,生产 mTLS),首帧发
+- **接入即注册**:拨 registry 的 `node_link.listen`(全双工 h2c,生产 mTLS),首帧发
   `register{node_id, labels, capacity, build_capacity, data_endpoint, runtime_digest}`(取自 `cluster.*`
   配置与本机能力;`build_capacity{cpu,mem,storage}` 源自 builder slice + scratch 预算,§12)。registry
   回 ack 后节点反向监听(cluster.md §5.1)。
@@ -1016,7 +1028,7 @@ vswitch mgmt VIP 寻址;第三方 registry 经 NAT 出网)。两者皆缺则 tri
 
 生产:`*.<domain>` + `api.<domain>` 通配 DNS + TLS(operator 提供,on-prem/离线
 友好)。控制面与数据面可同口(`api.listen`)或分口(`proxy.data_listen` /
-external worker 的 `--data-listen`),证书同一张。dev:`E2B_API_URL`/
+external worker 的 `data_listen`,proxy.yaml),证书同一张。dev:`E2B_API_URL`/
 `E2B_SANDBOX_URL` 指向明文 http(h2c),无需证书与通配 DNS。集群下 cluster-ctl router
 持对外通配证书,node-link 用独立的 `cluster.tls` mTLS(§10)。
 
@@ -1025,8 +1037,8 @@ external worker 的 `--data-listen`),证书同一张。dev:`E2B_API_URL`/
 | 对象 | 方式 | 说明 |
 |---|---|---|
 | `sandbox-ctl`(runtime) | 经 run-sandbox(单元)`execve`:`run --config <sid>.yaml --manifest-config … --run-root … --cgroup-adopt [--restore] [--connect]`;run-builder 以直接子进程 `run` 阶段沙箱,经 `exec --env/--stdin-from/--stdout-to` 做平台接力(flatten-ctl 调用、配置注入、工件流、探针),收尾 `snapshot --output` / `upload-snapshot` / `info --json`;serve 调 `snapshot --upload`(pause) | 非密配置文件 + 密钥 env;资源准入在其内部;e2b 语义命令不走它(走 envd,§12) |
-| 资源控制器(node-resource.md) | serve 内置(`resource_listen`)或独立进程;沙箱经 `sandbox.resources.control_socket` 拨号(`pkg/resource` 协议) | 单元 cgroup 即沙箱 cgroup,控制器原地仲裁;不配 control_socket = 静态 cgroup(`--cgroup-adopt`),配了才进 SANDBOX_CONFIG `resources.control.controller` |
-| registry(cluster-ctl) | node-link:serve 拨 registry、反向注册为路由权威,上报 register/heartbeat/sandbox/build_event 事件、受理 create/connect/delete/key_put/key_drop/build_register 命令(§10、cluster.md §5) | mTLS;命令复用 §8 / §8.1 生命周期原语;空 `cluster.registry` = 独立模式不接入 |
+| 资源控制器(node-resource.md) | serve 内置(`resource_listen`,调参内联);沙箱经 `sandbox.resources.control_socket` 拨号(`pkg/resource` 协议) | 单元 cgroup 即沙箱 cgroup,控制器原地仲裁;不配 control_socket = 静态 cgroup(`--cgroup-adopt`),配了才进 SANDBOX_CONFIG `resources.control.controller` |
+| registry(cluster-ctl) | node-link:serve 拨 registry、反向注册为路由权威,上报 register/heartbeat/sandbox/build_event 事件、受理 create/connect/delete/key_put/key_drop/build_register 命令(§10、cluster.md §5) | mTLS;命令复用 §8 / §8.1 生命周期原语;空 `cluster.registry.endpoint` = 独立模式不接入 |
 | `vswitch-ctl`(vswitch) | CLI:`attach <switch> --inner-ip [--transit-*]` / `detach --port`;`open-port` 作 SANDBOX_CONFIG `network.tapfd.exec`(sandbox-ctl 执行,经 `TAPFD_SOCKET` 收 tap fd) | 交换机预先起好(`vswitch-ctl start`,内核态数据面);port 对外、slot 内部;一个构建复用一个槽 |
 | `flatten-ctl`(builder) | **guest 内**(builder runtime 自带,经 sandbox-ctl exec 驱动):`export --output -`(import 拉取 / steps 导出)、`mountpoint`;宿主侧:`info --json`(读镜像运行时配置,本地工件或 manifest://) | 租户 `FLATTEN_*` 仅经 exec env 入 guest;tarstream 镜像工件经 exec stdio 接力 |
 | `manifest-ctl`(accelerator) | `store <image.img>`(img-only 构建的收尾上传) | manifest key 经 stdout 回收;`MANIFEST_KEY` 经 env |
@@ -1107,7 +1119,7 @@ sandbox-runtime-e2b.erofs 等),均已注册为 umbrella make 目标,缺前置则
 - [node-proxy.md](node-proxy.md) —— 数据面转发层:路由判定 / 部署模式(internal/external/off)/
   routesync / 数据面鉴权 / MMDS / CONNECT 隧道(本文 §9 装配的转发层实现,集群下 router 转发进入)
 - [node-resource.md](node-resource.md) —— 节点资源控制协议(`sandbox.resources.control_socket`
-  的对端)与控制器内部组织(`resource_listen` 内置或独立)
+  的对端)与控制器内部组织(serve 经 `resource_listen` 内置,调参内联)
 - [cluster.md](cluster.md) —— 集群控制面:node-link 线格式(§5,本文 §10 的对端)、注册表、
   Reserve 状态机;[cluster-router.md](cluster-router.md) 数据面入口、[cluster-scaler.md](cluster-scaler.md)
   放置与密钥分发

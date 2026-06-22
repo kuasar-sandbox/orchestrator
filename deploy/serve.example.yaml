@@ -1,4 +1,7 @@
-# node-ctl configuration. See sandbox-orchestrator/docs/node.md.
+# node-ctl serve config — node-ctl serve --config /etc/node-ctl/serve.yaml.
+# See sandbox-orchestrator/docs/node.md §3. Generate a fresh skeleton with
+# `node-ctl config serve --template`; validate yours with
+# `node-ctl config serve --config serve.yaml [--resolve]`.
 # The unmodified e2b SDK reaches this node via: E2B_DOMAIN=<domain> E2B_API_KEY=<key>
 # (dev: E2B_API_URL=http://host:3000 E2B_SANDBOX_URL=http://<port>-<sid>.host:3000).
 #
@@ -14,14 +17,13 @@ api:
     cert: /etc/node-ctl/tls/fullchain.pem   # wildcard *.<domain> AND api.<domain>
     key: /etc/node-ctl/tls/privkey.pem
 
-# Data-plane proxy. mode selects how sandbox traffic (<port>-<sid>.<domain>) is served:
+# Data-plane policy. mode selects how sandbox traffic (<port>-<sid>.<domain>) is served:
 #   internal (default) — in-process proxy (single binary, no extra moving parts).
-#   external           — offload to node-ctl proxy workers (deploy/
-#                        node-proxy@.service): each worker registers on the
-#                        config-socket plugin plane + syncs the route table from it,
-#                        and they own the data-plane port (SO_REUSEPORT). No static
-#                        socket list — the orchestrator forwards by sandbox-id hash
-#                        over the live registered set.
+#   external           — offload to node-ctl proxy workers (deploy/proxy.example.yaml
+#                        + node-proxy@.service): the workers own the data-plane port
+#                        (SO_REUSEPORT) and read proxy.yaml; serve forwards by sandbox-id
+#                        hash over the live registered set. The data port lives in
+#                        proxy.yaml, NOT here.
 #   off                — reject data-plane traffic on this node.
 # auth: the proxy validates X-Access-Token (= envdAccessToken) — enforce (default)
 # rejects mismatches (401); log warns but forwards; off disables. park_timeout bounds
@@ -29,13 +31,13 @@ api:
 proxy:
   mode: internal
   auth: enforce
-  # data_listen: ""                              # dedicated data-plane addr; "" = share api.listen
+  # data_listen: ""                              # internal-mode dedicated addr; "" = share api.listen
   # park_timeout: 30s
-  # metrics_listen: 127.0.0.1:9095               # "" = metrics off
+  # metrics_listen: 127.0.0.1:9095               # serve's own metrics; "" = off
 
 # Secrets-at-rest. Per-tenant manifest keys are stored AES-256-GCM-encrypted under
 # encryption_key: ":"-separated 64-hex keys, first = active (new writes), rest =
-# standby (decrypt during rotation). Prefer the NODE_CTL_ENCRYPTION_KEY env
+# standby (decrypt during rotation). Prefer the NODE_CONFIG_ENCRYPTION_KEY env
 # (overrides this). Generate one: `openssl rand -hex 32`. Which manifest keys may
 # create/build/import is the manifest_keys table (node-ctl manifest-key …);
 # e2b API keys are derived from a manifest key with `e2b-key-ctl gen-apikey`.
@@ -56,13 +58,8 @@ paths:
   # clients of this socket — they do not open the DB or read this config.
   config_socket: /run/sandbox/node-ctl.socket
   # db_path: /var/lib/sandbox/node-ctl.db     # default = <base_root>/node-ctl.db
-  # admin_pidfile gates the admin plane: when set, a manifest-key caller's peer pid must
-  # be listed (one per line; '#' comments ok). Unset (default) relies on the socket's
-  # 0600 perms (same uid / root). Set it to restrict admin to specific automation pids.
-  # admin_pidfile: /run/sandbox/node-ctl-admin.pids
-  # plugin_pidfile gates the plugin plane (proxy/agent registration), same format as
-  # admin_pidfile. Unset relies on the socket's 0600 perms.
-  # plugin_pidfile: /run/sandbox/node-ctl-plugin.pids
+  # admin_pidfile: /run/sandbox/node-ctl-admin.pids   # PID allowlist gating the admin plane
+  # plugin_pidfile: /run/sandbox/node-ctl-plugin.pids # PID allowlist gating the plugin plane
 
 # Systemd template units (generated + installed at startup, then daemon-reloaded).
 # units:
@@ -77,7 +74,8 @@ sandbox:
   resources:
     vcpu: 2
     memory: 2GiB
-    # control_socket: /run/sandbox-resource.sock  # sandbox-sentinel UDS (opt-in); omit = static cgroup
+    # control_socket: /run/sandbox-resource.sock  # resource-controller UDS (opt-in); omit = static cgroup.
+    #                                              # Set to resource_listen.socket below when hosting the controller.
   network:
     switch: sw0
     hostname: sandbox                             # guest hostname (sethostname + /etc/hosts entry)
@@ -96,69 +94,70 @@ sandbox:
 # Build-instance settings. Builds run INSIDE build sandboxes (tenant network +
 # isolation): image pull and step execution happen in microVMs booted from
 # runtime_builder; only artifact relay and the final uploads run on the host.
-# Concurrency is admitted in node-ctl; the CPU/memory ceiling is applied
-# to sandbox-builder.slice (the whole pipeline runs in the unit's cgroup).
 builder:
   max_concurrent: 2
-  # Build-sandbox guest runtime (e2b flavor + flatten-ctl + mkfs.erofs; built by
-  # the umbrella `make sandbox-runtime-builder`).
   runtime_builder: /opt/sandbox/runtime/v1/sandbox-runtime-builder.erofs
-  # Pre-formatted ext4 seeding the build sandbox's writable disk (pull cache +
-  # steps delta + export scratch). Sparse; size it ~3x the largest expected image.
   diff_template: /opt/sandbox/overlay-templates/builder-8G.ext4
-  # vcpu: 2                                       # per build-sandbox capacity
+  # vcpu: 2
   # memory: 4GiB
   # cpu_quota: "200%"                             # -> sandbox-builder.slice CPUQuota
   # memory_max: "8G"                              # -> sandbox-builder.slice MemoryMax
   # insecure_registry: false                      # pull base over plain HTTP (dev/local registry)
   # platform: linux/amd64
-  # Phase timeouts (seconds): in-guest pull+flatten, one RUN step, the readyCmd
-  # poll budget, the whole build (unit TimeoutStartSec = total + 60).
   # pull_timeout_sec: 600
   # step_timeout_sec: 600
   # ready_timeout_sec: 120
   # total_timeout_sec: 1800
-  # Where the e2b CLI pushes its client-built image (must match the CLI's
-  # E2B_IMAGE_URI_MASK; {templateID}/{buildID} tokens). When a build omits fromImage
-  # it is derived from this. Must be reachable from INSIDE a build sandbox (the
-  # pull runs in the guest): a host-local registry must bind a non-loopback
-  # address and be named via the vswitch mgmt VIP.
   # image_uri_mask: "docker.sandboxes.example.com/e2b/custom-envs/{templateID}:{buildID}"
-  # COPY build contexts: the client uploads the (gzipped tar) context straight to
-  # this S3/OBS bucket via a presigned PUT, the build sandbox fetches it via a
-  # presigned GET — bytes never transit the orchestrator. Unset → COPY steps are
-  # rejected (501). For local/single-node without a cloud object store, point it
-  # at a versitygw gateway (sandbox-deps: make versitygw).
-  # files_storage:
+  # files_storage:                                # COPY build contexts (presigned PUT/GET); unset → COPY rejected (501)
   #   endpoint: https://obs.cn-north-4.example.com  # versitygw: http://127.0.0.1:7070
   #   region: cn-north-4
   #   bucket: kuasar-build-files
-  #   prefix: ""                       # optional key prefix
-  #   access_key: ""                   # empty → AWS default chain (env / instance role)
+  #   force_path_style: false                       # versitygw / minio need true
+  #   access_key: ""                                # empty → AWS default chain
   #   secret_key: ""
-  #   force_path_style: false          # versitygw / minio need true (AWS S3 / OBS: false)
-  #   presign_expiry: 1h               # upload-URL lifetime (GET uses total_timeout + 5m)
+
+# Optional in-process node resource controller (admission / budget / density;
+# sandbox-ctl dials its socket). Absent/disabled = static cgroup. The tuning is
+# inlined here — there is no separate file. Inspect / operate with:
+# node-ctl resource {status|list|drain|grant|reclaim}.
+# resource_listen:
+#   enabled: true
+#   socket: /run/sandbox-resource.sock           # "" = pkg/resource default (sandbox-ctl's default)
+#   # Advanced tuning — all defaulted (node-resource.md §3.2); usually left untouched:
+#   # state_path: /run/node-ctl/state.json
+#   # audit_path: /run/node-ctl/audit.log
+#   # resources: { physical_memory: auto, physical_cpu: auto, host_reserved: { memory: 16GiB, cpu: 1.5 } }
+#   # watermarks: { operational_margin_factor: 0.10, high_factor: 0.85, low_factor: 0.70, emergency_factor: 0.05, startup_factor: 0.50 }
+#   # rate_limits: { memory_grant_per_sec_factor: 0.05 }
+#   # admission: { rate: 4, burst: 16, startup_ttl: 30s, queue_ttl: 30s, queue_max_depth: 256 }
+#   # dampening: { recover_duration: 60s, cooldown_periods: 10 }
 
 # Paused-state tiering. On pause a sandbox's snapshot is written either to node-local
-# files (mode=local, default; restorable only on this node — matches the sandbox-bound
-# lifecycle) or straight to the remote manifest store (mode=remote; portable = a
-# template). A local checkpoint is promoted to remote on demand via
-# `node-ctl export-sandbox` (--to-template for a reusable template, or a
-# migration token to move the sandbox to another node).
+# files (mode=local, default) or straight to the remote manifest store (mode=remote;
+# portable = a template). A local checkpoint is promoted via `node-ctl export-sandbox`.
 checkpoint:
   mode: local
   local_dir: /var/lib/sandbox-saved
 
 # mmds: optional envd metadata service for FC-mode token re-keying.
-#   disabled (default) — envd runs -isnotfc (non-secure); the proxy enforces
-#     X-Access-Token as the sole data-plane gate (so proxy.auth must be enforce).
-#     Snapshot forks still work (no envd token to mismatch).
-#   enabled — envd runs in FC mode and is re-keyed to a fresh per-identity token at
-#     /init via a Firecracker MMDS v2 service hosted in the proxy component (envd-side
-#     enforcement / defense-in-depth). The vswitch translates the metadata VIP to the
-#     listener: `vswitch-ctl start ... --mgmt-service 169.254.169.254:80:<listen>` (no
-#     iptables; a loopback listen needs route_localnet=1 on the mgmt dev). Requires
-#     proxy.mode != off; in external mode the worker serves it via --mmds-listen.
+#   disabled (default) — envd runs non-secure; the proxy enforces X-Access-Token as the
+#     sole data-plane gate (so proxy.auth must be enforce). Snapshot forks still work.
+#   enabled — envd runs in FC mode and is re-keyed to a fresh per-identity token at /init
+#     via a Firecracker MMDS v2 service hosted in the proxy component. The vswitch
+#     translates the metadata VIP to the listener (vswitch-ctl --mgmt-service ...).
+#     Requires proxy.mode != off; external mode serves it on a worker started with --mmds.
 # mmds:
 #   enabled: false
 #   listen: 127.0.0.1:19254
+
+# cluster: connect this node to a cluster-ctl registry over node-link (node.md §10).
+# Omitted = standalone single-node.
+# cluster:
+#   registry:                                     # how to reach the registry node-link
+#     endpoint: registry.cluster.example.com:7700 # "" = standalone single-node
+#     tls: { cert: "", key: "", ca: "" }          # node-link client mTLS; empty = plain h2c
+#   node_id: ""                                   # "" = hostname
+#   labels: { zone: z1, pool: default }
+#   data_endpoint: ""                             # host:port the router forwards data to; "" = api.listen
+#   heartbeat_interval: 10s

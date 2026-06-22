@@ -10,24 +10,55 @@ import (
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/clustercfg"
 )
 
-// configCmd implements `cluster-ctl config` — emit a commented skeleton
-// (--template) or normalize + validate a config (--config), mirroring
-// `node-ctl config`.
+// configCmd implements `cluster-ctl config <role>` — a per-role config diagnose +
+// generate tool (role ∈ {registry, router, scaler}), mirroring `node-ctl config`.
+// Each role has its own file + schema, so the skeleton and validation are
+// role-specific (registry/router/scaler.yaml are independent — no shared file).
+//
+//	cluster-ctl config registry --template            # commented skeleton for registry.yaml
+//	cluster-ctl config router   --config router.yaml  # normalize + validate, re-emit
+//	cluster-ctl config scaler   --config scaler.yaml --resolve   # + defaulted effective form
+//	  [-o <file>]                                                # write to file (default stdout)
 func configCmd(args []string) error {
-	fs := flag.NewFlagSet("config", flag.ExitOnError)
+	if len(args) < 1 {
+		return fmt.Errorf("usage: cluster-ctl config <registry|router|scaler> [--template | --config <f> [--resolve]] [-o <f>]")
+	}
+	role := args[0]
+	fs := flag.NewFlagSet("config "+role, flag.ExitOnError)
 	cfgPath := fs.String("config", "", "input config YAML to normalize + validate")
-	template := fs.Bool("template", false, "emit a commented skeleton instead of reading --config")
+	template := fs.Bool("template", false, "emit a commented skeleton for the role")
+	// Cluster role configs have no auto-detected values, so --resolve == --config
+	// (defaults already are the effective form). Accepted for CLI symmetry.
+	_ = fs.Bool("resolve", false, "expand defaults to the effective form")
 	out := fs.String("o", "", "write output to this file instead of stdout")
-	_ = fs.Parse(args)
+	_ = fs.Parse(args[1:])
+
+	var (
+		skeleton string
+		load     func(string) (any, error)
+	)
+	switch role {
+	case "registry":
+		skeleton = registryConfigSkeleton
+		load = func(p string) (any, error) { return clustercfg.LoadRegistry(p) }
+	case "router":
+		skeleton = routerConfigSkeleton
+		load = func(p string) (any, error) { return clustercfg.LoadRouter(p) }
+	case "scaler":
+		skeleton = scalerConfigSkeleton
+		load = func(p string) (any, error) { return clustercfg.LoadScaler(p) }
+	default:
+		return fmt.Errorf("config: unknown role %q (registry|router|scaler)", role)
+	}
 
 	var output []byte
 	if *template {
-		output = []byte(clusterConfigSkeleton)
+		output = []byte(skeleton)
 	} else {
 		if *cfgPath == "" {
-			return fmt.Errorf("config: --config <file> or --template required")
+			return fmt.Errorf("config %s: --config <file> or --template required", role)
 		}
-		cfg, err := clustercfg.Load(*cfgPath)
+		cfg, err := load(*cfgPath)
 		if err != nil {
 			return err
 		}
@@ -44,29 +75,57 @@ func configCmd(args []string) error {
 	return err
 }
 
-const clusterConfigSkeleton = `# cluster-ctl config (cluster.md §3). Required: domain + store.
-domain: sandboxes.example.com
-store:
-  kind: sqlite                       # sqlite | etcd | raft (etcd/raft = Phase 7)
+const registryConfigSkeleton = `# cluster-ctl registry config — cluster-ctl registry --config <this> (cluster.md §3/§4.1).
+# Durable state authority + node-link hub. Required: state.
+state:                               # durable cluster-state backend
+  backend: sqlite                    # sqlite | etcd | raft (etcd/raft = Phase 7)
   dsn: /var/lib/cluster/registry.db
-group_config:
-  providers: { key: store, sandbox_config: store, placement: store }
-  # encryption_key: ""               # AES-256 sealing self-stored manifest_key (or CLUSTER_GROUP_ENCRYPTION_KEY env)
-channel:
-  listen: ":7700"                    # nodes dial this (node-link)
-  # tls: { cert: ..., key: ..., ca: ... }   # mTLS (Phase 7)
+sandbox_group:                       # how per-group config is sourced (§6.2)
+  providers: { key: store, sandbox_config: store, placement: store, image_pull: store }
+  # encryption_key: ""               # AES-256 sealing self-stored manifest_key (or SANDBOX_GROUP_ENCRYPTION_KEY env)
+  # tls: { cert: ..., key: ..., ca: ... }   # client mTLS for external:<addr> providers
+node_link:                           # nodes dial this (node-link)
+  listen: ":7700"
+  # tls: { cert: ..., key: ..., ca: ... }   # server mTLS (Phase 7)
   heartbeat_interval: 10s
   node_dead_after: 30s
   revision_retention: 10000
-op:
-  listen: /run/cluster/registry.sock # router / scaler dial (Phase 3/4)
+control_api:                         # router / scaler dial this
+  listen: /run/cluster/registry.sock # UDS local; host:port remote
+  # tls: { cert: ..., key: ..., ca: ... }   # server mTLS when split across hosts (§5.4)
 reserve:
   park_timeout: 30s
-router:                              # cluster-router.md §3 (Phase 3)
+  # record_ttl: ""                   # GC idle SAVED records after this; "" = off
+`
+
+const routerConfigSkeleton = `# cluster-ctl router config — cluster-ctl router --config <this> (cluster-router.md §3).
+# e2b-compatible unified ingress. Required: domain.
+domain: sandboxes.example.com
+registry:                            # upstream: the registry control_api to dial
+  endpoint: /run/cluster/registry.sock   # UDS local; host:port remote
+  # tls: { cert: ..., key: ..., ca: ... }   # client mTLS to dial a remote registry (§5.4)
+ingress:                             # downstream: e2b client ingress
   listen: ":443"
-  auth_cache_ttl: 60s
-  data_plane_auth: enforce
-scaler:                              # cluster-scaler.md §3 (Phase 4)
-  place_candidates: 2
-  zone_admit_max: yellow
+  # tls: { cert: ..., key: ... }     # wildcard *.<domain> + api.<domain>
+auth:
+  api_key: enforce                   # caller api_key auth: off | log | enforce
+  data_plane: enforce                # data-plane access-token check: off | log | enforce
+  cache_ttl: 60s                     # api_key↔group verification cache
+# metrics_listen: ":9910"            # optional Prometheus text endpoint
+`
+
+const scalerConfigSkeleton = `# cluster-ctl scaler config — cluster-ctl scaler --config <this> (cluster-scaler.md §3).
+# Standalone placement scheduler; dials the registry control_api, answers placement
+# over the scaler-link (no listener of its own).
+registry:                            # upstream: the registry control_api to dial
+  endpoint: /run/cluster/registry.sock   # UDS local; host:port remote
+  # tls: { cert: ..., key: ..., ca: ... }   # client mTLS to dial a remote registry (§5.4)
+placement:
+  candidates: 2                      # P2C sample size
+  zone_admit_max: yellow             # exclude nodes hotter than this (green|yellow|red)
+  node_dead_after: 30s               # exclude nodes silent longer than this
+  # shuffle_sharding:                # empty = static nodeSelectors only (cluster-scaler.md §4.4)
+  #   - selector: { pool: gpu }
+  #     shard_by: zone
+  #     n: 2
 `

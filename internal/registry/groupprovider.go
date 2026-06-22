@@ -63,9 +63,9 @@ func storeResolver(s *Stores) groupcfg.Resolver {
 }
 
 // NewGroupResolver builds a resolver, picking store vs external per fine-grained
-// interface from group_config.providers (cluster.md §6.2). extTLS dials an
+// interface from sandbox_group.providers (cluster.md §6.2). extTLS dials an
 // external:<addr> over mTLS; ttl caches external reads (hot path).
-func NewGroupResolver(cfg clustercfg.GroupConfigConfig, s *Stores, ttl time.Duration, extTLS *tls.Config) groupcfg.Resolver {
+func NewGroupResolver(cfg clustercfg.SandboxGroupConfig, s *Stores, ttl time.Duration, extTLS *tls.Config) groupcfg.Resolver {
 	r := storeResolver(s)
 	if _, ext, addr := cfg.ProviderFor(clustercfg.ProviderKey); ext {
 		r.Key = groupcfg.NewExternalKey(addr, extTLS, ttl)

@@ -20,7 +20,7 @@ import (
 )
 
 // TestScalerLinkReverseCall drives the full P2 reverse-call in-process: a registry
-// (op + scaler-link over h2c) + a standalone scaler dialing it; the registry's
+// (control + scaler-link over h2c) + a standalone scaler dialing it; the registry's
 // channelPlacer reverse-requests placement and the scaler answers over its view.
 func TestScalerLinkReverseCall(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -41,13 +41,13 @@ func TestScalerLinkReverseCall(t *testing.T) {
 	reg.SetPlacer(placer)
 
 	mux := http.NewServeMux()
-	reg.ServeOp(mux)
+	reg.ServeControl(mux)
 	mux.HandleFunc("/internal/scaler-link", reg.ServeScalerLink)
-	opSrv := httptest.NewServer(h2c.NewHandler(mux, &http2.Server{}))
-	defer opSrv.Close()
+	controlSrv := httptest.NewServer(h2c.NewHandler(mux, &http2.Server{}))
+	defer controlSrv.Close()
 	defer cancel() // LIFO: cancel before closing the server so the scaler tears down its streams first
 
-	svc := NewRemote(strings.TrimPrefix(opSrv.URL, "http://"), nil, clustercfg.ScalerConfig{PlaceCandidates: 2}, 30, discard)
+	svc := NewRemote(strings.TrimPrefix(controlSrv.URL, "http://"), nil, clustercfg.PlacementConfig{Candidates: 2}, 30, discard)
 	svc.Start(ctx)
 
 	// Poll until the scaler-link + views are up and placement resolves to the colder

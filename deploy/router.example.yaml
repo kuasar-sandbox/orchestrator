@@ -1,0 +1,23 @@
+# cluster-ctl router config — cluster-ctl router --config /etc/cluster-ctl/router.yaml.
+# e2b-compatible unified ingress (cluster-router.md §3). Required: domain.
+# Validate with `cluster-ctl config router --config router.yaml`.
+
+domain: sandboxes.example.com
+
+# Upstream: how to reach the registry's control_api (cluster.md §4.2). A co-located
+# UDS, or a remote host:port (then set registry.tls for client mTLS).
+registry:
+  endpoint: /run/cluster/registry.sock
+  # tls: { cert: ..., key: ..., ca: ... }   # client mTLS to dial a remote registry (§5.4)
+
+# Downstream: the client-facing e2b ingress (SO_REUSEPORT across replicas).
+ingress:
+  listen: ":443"
+  # tls: { cert: /etc/cluster-ctl/tls/fullchain.pem, key: /etc/cluster-ctl/tls/privkey.pem }  # wildcard *.<domain> + api.<domain>
+
+auth:
+  api_key: enforce                    # caller api_key auth: off | log | enforce
+  data_plane: enforce                 # data-plane access-token check: off | log | enforce
+  cache_ttl: 60s                      # api_key↔group verification cache
+
+# metrics_listen: ":9910"             # optional Prometheus text endpoint

@@ -1,12 +1,14 @@
-# node-proxy@.service — external data-plane proxy worker (proxy.mode=external).
+# node-proxy@.service — external data-plane proxy worker (serve.yaml proxy.mode=external).
 #
-# Run one or more instances (node-proxy@1, @2, ...). All instances bind the
-# same data-plane port with SO_REUSEPORT (the kernel load-balances connections), and
-# each registers itself on node-ctl's config-socket plugin plane
-# (--config-socket) under a unique --id, holding that connection open as its route
-# stream + lease. node-ctl needs NO static socket list — it learns workers
-# from their registrations and forwards by sandbox-id hash over the live set:
+# Run one or more instances (node-proxy@1, @2, ...). All instances read one shared
+# /etc/node-ctl/proxy.yaml (config_socket / data_listen / tls / auth / park_timeout)
+# and differ only by --id %i: each binds the same data_listen with SO_REUSEPORT (the
+# kernel load-balances connections) and registers on node-ctl's config-socket plugin
+# plane under that unique id, holding the connection open as its route stream + lease.
+# node-ctl needs NO static socket list — it learns workers from their registrations
+# and forwards by sandbox-id hash over the live set:
 #
+#   # serve.yaml
 #   proxy:
 #     mode: external
 #
@@ -14,7 +16,7 @@
 # stateless: it serves only what it syncs over the registration stream, so a
 # crash/restart re-registers and re-syncs from scratch. It must run on the same node
 # as node-ctl (it dials the config-socket + per-sandbox envd UDS / floatingip
-# locally). Optionally gate registration with paths.plugin_pidfile.
+# locally). Optionally gate registration with serve.yaml paths.plugin_pidfile.
 [Unit]
 Description=kuasar node-ctl data-plane proxy %i
 After=network-online.target node-ctl.service
@@ -22,22 +24,14 @@ Wants=network-online.target
 
 [Service]
 Type=exec
-# --config-socket is node-ctl's control socket (paths.config_socket); --id is
-# this worker's unique plugin id; --socket is the per-worker UDS node-ctl's
-# gateway forwards to (advertised at registration). --data-listen is shared across
-# workers (SO_REUSEPORT). TLS is the same wildcard cert node-ctl serves
-# (*.<domain>). The auth fallback applies only until node-ctl pushes its
-# policy (proxy.auth) over the registration handshake.
+# --config points at the shared worker config; --id is this worker's unique plugin
+# id (the gateway-forward --socket defaults to <dir(config_socket)>/<id>.sock).
+# --metrics-listen is per-instance (ports must differ across workers). Add --mmds on
+# exactly one instance when serve runs envd in FC mode (serve.yaml mmds.enabled).
 ExecStart=/usr/bin/node-ctl proxy \
-  --config-socket=/run/sandbox/node-ctl.socket \
+  --config=/etc/node-ctl/proxy.yaml \
   --id=proxy-%i \
-  --socket=/run/sandbox/proxy-%i.sock \
-  --data-listen=:443 \
-  --tls-cert=/etc/node-ctl/tls/fullchain.pem \
-  --tls-key=/etc/node-ctl/tls/privkey.pem \
-  --auth=enforce \
-  --park-timeout=90s \
-  --metrics-listen=127.0.0.1:9090
+  --metrics-listen=127.0.0.1:909%i
 Restart=always
 RestartSec=1
 

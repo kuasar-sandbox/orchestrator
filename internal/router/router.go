@@ -1,12 +1,12 @@
 // Package router is the cluster's e2b-compatible unified ingress
 // (cluster-router.md): it serves the e2b control plane (api.<domain>) and the
 // data plane (<port>-<sid>.<domain>) by Host, reserving sandboxes through the
-// registry's op interface and forwarding the data plane to the placed node (the
+// registry's control API and forwarding the data plane to the placed node (the
 // two-hop path: client -> router -> node data endpoint -> guest).
 //
 // Phase 3 ships create (-> reserve) + data-plane forward by sid; the remaining
 // control verbs (pause/kill/list/get forwarded to the node) and the local route
-// cache (hot-path, zero-op-roundtrip) build on this.
+// cache (hot-path, zero-control-roundtrip) build on this.
 package router
 
 import (
@@ -39,7 +39,7 @@ const (
 	HeaderAccessTok = "X-Access-Token"
 )
 
-// reserveResult / routeResolve mirror the registry op JSON (decoupled from the
+// reserveResult / routeResolve mirror the registry control JSON (decoupled from the
 // registry package).
 type reserveResult struct {
 	NodeID       string `json:"node_id"`
@@ -66,14 +66,14 @@ type buildEntry struct {
 
 const buildTTL = time.Hour
 
-// Router is the e2b unified ingress. It dials the registry op interface (UDS or
+// Router is the e2b unified ingress. It dials the registry control API (UDS or
 // TCP) for reserve + route resolution.
 type Router struct {
 	domain        string
 	authMode      string // off | log | enforce — caller api_key auth (§8); default enforce
 	dataPlaneAuth string // off | log | enforce — data-plane access-token check (§7)
 	mx            *metrics.M
-	opBase        string       // http base for the op interface
+	controlBase   string       // http base for the control API
 	opClient      *http.Client // 60s timeout (reserve / route calls)
 	watchClient   *http.Client // no timeout (the long-lived route watch stream)
 	log           *slog.Logger
@@ -94,12 +94,12 @@ type Router struct {
 	watchRev int64 // last applied watch revision (resume point); only the watch loop touches it
 }
 
-// New builds a Router. opAddr is the registry op endpoint: a path ("/run/...")
+// New builds a Router. controlAddr is the registry control endpoint: a path ("/run/...")
 // for a unix socket, or host:port for TCP. authTTL caches api-key verification
 // (<=0 → 60s).
-// opTLS (non-nil) makes a TCP op endpoint dial over (m)TLS h2; nil = plain. A UDS
-// opAddr ("/...") is always plain (local).
-func New(opAddr, domain string, authTTL time.Duration, opTLS *tls.Config, log *slog.Logger) *Router {
+// controlTLS (non-nil) makes a TCP control endpoint dial over (m)TLS h2; nil = plain. A UDS
+// controlAddr ("/...") is always plain (local).
+func New(controlAddr, domain string, authTTL time.Duration, controlTLS *tls.Config, log *slog.Logger) *Router {
 	if authTTL <= 0 {
 		authTTL = 60 * time.Second
 	}
@@ -112,18 +112,18 @@ func New(opAddr, domain string, authTTL time.Duration, opTLS *tls.Config, log *s
 	}
 	var transport http.RoundTripper
 	switch {
-	case strings.HasPrefix(opAddr, "/"):
-		rt.opBase = "http://op"
+	case strings.HasPrefix(controlAddr, "/"):
+		rt.controlBase = "http://control"
 		transport = &http.Transport{
 			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-				return (&net.Dialer{}).DialContext(ctx, "unix", opAddr)
+				return (&net.Dialer{}).DialContext(ctx, "unix", controlAddr)
 			},
 		}
-	case opTLS != nil:
-		rt.opBase = "https://" + opAddr
-		transport = &http.Transport{TLSClientConfig: opTLS, ForceAttemptHTTP2: true}
+	case controlTLS != nil:
+		rt.controlBase = "https://" + controlAddr
+		transport = &http.Transport{TLSClientConfig: controlTLS, ForceAttemptHTTP2: true}
 	default:
-		rt.opBase = "http://" + opAddr
+		rt.controlBase = "http://" + controlAddr
 		transport = &http.Transport{}
 	}
 	rt.opClient = &http.Client{Timeout: 60 * time.Second, Transport: transport}
@@ -273,7 +273,7 @@ func (rt *Router) handleBuildRegister(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// buildResources mirrors routesync.BuildResources for the op request body.
+// buildResources mirrors routesync.BuildResources for the control request body.
 type buildResources struct {
 	CPU     int   `json:"cpu,omitempty"`
 	Mem     int64 `json:"mem,omitempty"`
@@ -288,7 +288,7 @@ func nonEmptySlice(s string) []string {
 }
 
 // handleBuildForward routes a build trigger/status/files call to the node that
-// holds the build (by build_id), resolving via the registry op on a local miss
+// holds the build (by build_id), resolving via the registry control on a local miss
 // (router restart: the in-memory build map is lost but the BuildStore persists).
 func (rt *Router) handleBuildForward(w http.ResponseWriter, r *http.Request) {
 	bid := extractBuildID(r.URL.Path)
@@ -381,7 +381,7 @@ func (rt *Router) handleList(w http.ResponseWriter, r *http.Request) {
 	if !rt.authorize(w, r.Context(), group, r.Header.Get(HeaderAPIKey)) {
 		return
 	}
-	u := fmt.Sprintf("%s/op/list?group=%s", rt.opBase, url.QueryEscape(group))
+	u := fmt.Sprintf("%s/control/list?group=%s", rt.controlBase, url.QueryEscape(group))
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, u, nil)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
@@ -398,7 +398,7 @@ func (rt *Router) handleList(w http.ResponseWriter, r *http.Request) {
 }
 
 // resolveRoute returns a sandbox's resolved route via the local cache, falling
-// back to the op interface; nil if unknown.
+// back to the control API; nil if unknown.
 func (rt *Router) resolveRoute(ctx context.Context, sid string) *routeResolve {
 	if rr := rt.cachedRoute(sid); rr != nil {
 		return rr
@@ -464,8 +464,8 @@ func (rt *Router) serveData(w http.ResponseWriter, r *http.Request, host string)
 		return
 	}
 	sid := sub[i+1:]
-	// Hot path: serve from the local route cache (zero op round-trip, §5). On a
-	// miss (cache lagging / cold), fall back to the registry op.
+	// Hot path: serve from the local route cache (zero control round-trip, §5). On a
+	// miss (cache lagging / cold), fall back to the registry control.
 	rr := rt.cachedRoute(sid)
 	if rr == nil {
 		var err error
@@ -523,7 +523,7 @@ func (rt *Router) forwardSandboxData(w http.ResponseWriter, r *http.Request, rr 
 	}
 	proxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, e error) {
 		// A cached route that fails is likely stale (sandbox moved/gone): evict it so
-		// the next request re-resolves via the watch / op (§5 stale → fallback).
+		// the next request re-resolves via the watch / control (§5 stale → fallback).
 		rt.evictRoute(sid)
 		rt.mx.Inc(`router_requests_total{plane="data",result="bad_gateway"}`)
 		rt.log.Warn("router: data forward", "sid", sid, "node", rr.NodeID, "err", e)
@@ -599,10 +599,10 @@ func (rt *Router) evictRoute(sid string) {
 	rt.cacheMu.Unlock()
 }
 
-// --- op client ---
+// --- control client ---
 
 func (rt *Router) opReserve(ctx context.Context, group, routeKey string) (*reserveResult, error) {
-	u := fmt.Sprintf("%s/op/reserve?group=%s&route_key=%s", rt.opBase, url.QueryEscape(group), url.QueryEscape(routeKey))
+	u := fmt.Sprintf("%s/control/reserve?group=%s&route_key=%s", rt.controlBase, url.QueryEscape(group), url.QueryEscape(routeKey))
 	var res reserveResult
 	if err := rt.opCall(ctx, http.MethodPost, u, &res); err != nil {
 		return nil, err
@@ -612,7 +612,7 @@ func (rt *Router) opReserve(ctx context.Context, group, routeKey string) (*reser
 
 func (rt *Router) opReserveBuild(ctx context.Context, group string, resources *buildResources) (*buildReserveResult, error) {
 	reqBody, _ := json.Marshal(map[string]any{"group": group, "resources": resources})
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, rt.opBase+OpReserveBuildPath, bytes.NewReader(reqBody))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, rt.controlBase+ControlReserveBuildPath, bytes.NewReader(reqBody))
 	if err != nil {
 		return nil, err
 	}
@@ -624,7 +624,7 @@ func (rt *Router) opReserveBuild(ctx context.Context, group string, resources *b
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return nil, fmt.Errorf("op reserve-build: %s: %s", resp.Status, strings.TrimSpace(string(b)))
+		return nil, fmt.Errorf("control reserve-build: %s: %s", resp.Status, strings.TrimSpace(string(b)))
 	}
 	var res buildReserveResult
 	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
@@ -634,7 +634,7 @@ func (rt *Router) opReserveBuild(ctx context.Context, group string, resources *b
 }
 
 func (rt *Router) opResolveBuild(ctx context.Context, buildID string) (*buildReserveResult, error) {
-	u := fmt.Sprintf("%s/op/build?build_id=%s", rt.opBase, url.QueryEscape(buildID))
+	u := fmt.Sprintf("%s/control/build?build_id=%s", rt.controlBase, url.QueryEscape(buildID))
 	var res buildReserveResult
 	if err := rt.opCall(ctx, http.MethodGet, u, &res); err != nil {
 		return nil, err
@@ -642,11 +642,11 @@ func (rt *Router) opResolveBuild(ctx context.Context, buildID string) (*buildRes
 	return &res, nil
 }
 
-// OpReserveBuildPath mirrors the registry op path (avoids importing the registry).
-const OpReserveBuildPath = "/op/reserve-build"
+// ControlReserveBuildPath mirrors the registry control path (avoids importing the registry).
+const ControlReserveBuildPath = "/control/reserve-build"
 
 func (rt *Router) opRoute(ctx context.Context, sid string) (*routeResolve, error) {
-	u := fmt.Sprintf("%s/op/route?sid=%s", rt.opBase, url.QueryEscape(sid))
+	u := fmt.Sprintf("%s/control/route?sid=%s", rt.controlBase, url.QueryEscape(sid))
 	var rr routeResolve
 	if err := rt.opCall(ctx, http.MethodGet, u, &rr); err != nil {
 		return nil, err
@@ -666,12 +666,12 @@ func (rt *Router) opCall(ctx context.Context, method, u string, out any) error {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return fmt.Errorf("op %s: %s: %s", u, resp.Status, strings.TrimSpace(string(b)))
+		return fmt.Errorf("control %s: %s: %s", u, resp.Status, strings.TrimSpace(string(b)))
 	}
 	return json.NewDecoder(resp.Body).Decode(out)
 }
 
-// --- local route cache (op watch) ---
+// --- local route cache (control watch) ---
 
 // watchEvent mirrors registry.WatchEvent (decoupled from the registry package).
 type watchEvent struct {
@@ -687,10 +687,10 @@ func (rt *Router) cachedRoute(sid string) *routeResolve {
 	return rt.cache[sid]
 }
 
-// RunWatch keeps the local route cache synced from the registry's op watch
+// RunWatch keeps the local route cache synced from the registry's control watch
 // (cluster.md §5): a snapshot then live deltas, reconnecting with capped backoff.
-// The data plane serves from the cache (zero op round-trip); a miss falls back to
-// the op interface. cluster-ctl router runs this in the background.
+// The data plane serves from the cache (zero control round-trip); a miss falls back to
+// the control API. cluster-ctl router runs this in the background.
 func (rt *Router) RunWatch(ctx context.Context) {
 	backoff := 200 * time.Millisecond
 	for ctx.Err() == nil {
@@ -709,7 +709,7 @@ func (rt *Router) RunWatch(ctx context.Context) {
 }
 
 func (rt *Router) watchOnce(ctx context.Context) error {
-	u := fmt.Sprintf("%s/op/watch?from_rev=%d", rt.opBase, rt.watchRev)
+	u := fmt.Sprintf("%s/control/watch?from_rev=%d", rt.controlBase, rt.watchRev)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return err
@@ -720,7 +720,7 @@ func (rt *Router) watchOnce(ctx context.Context) error {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("op watch: %s", resp.Status)
+		return fmt.Errorf("control watch: %s", resp.Status)
 	}
 	// A "reset" frame starts a full snapshot (first connect, or a compacted resume):
 	// accumulate into a shadow map and swap it in atomically at the bookmark, so the
@@ -777,9 +777,9 @@ func (rt *Router) watchOnce(ctx context.Context) error {
 	}
 }
 
-// verifyAuth checks an api key against a group via the op interface, caching a
+// verifyAuth checks an api key against a group via the control API, caching a
 // valid result for authTTL (cluster-router.md §8). It returns (ok, err): a
-// non-nil err means the op interface was unreachable (caller → 503); ok==false
+// non-nil err means the control API was unreachable (caller → 503); ok==false
 // with nil err means the key was rejected (caller → 403).
 func (rt *Router) verifyAuth(ctx context.Context, group, apiKey string) (bool, error) {
 	if group == "" || apiKey == "" {
@@ -793,7 +793,7 @@ func (rt *Router) verifyAuth(ctx context.Context, group, apiKey string) (bool, e
 	}
 	rt.authMu.Unlock()
 
-	u := fmt.Sprintf("%s/op/verify-key?group=%s", rt.opBase, url.QueryEscape(group))
+	u := fmt.Sprintf("%s/control/verify-key?group=%s", rt.controlBase, url.QueryEscape(group))
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return false, err
@@ -801,7 +801,7 @@ func (rt *Router) verifyAuth(ctx context.Context, group, apiKey string) (bool, e
 	req.Header.Set(HeaderAPIKey, apiKey) // api key in a header, never the query string (logged)
 	resp, err := rt.opClient.Do(req)
 	if err != nil {
-		return false, err // op unreachable
+		return false, err // control unreachable
 	}
 	resp.Body.Close()
 	switch resp.StatusCode {
@@ -813,12 +813,12 @@ func (rt *Router) verifyAuth(ctx context.Context, group, apiKey string) (bool, e
 	case http.StatusForbidden:
 		return false, nil // the registry rejected the key
 	default:
-		return false, fmt.Errorf("op verify-key: %s", resp.Status)
+		return false, fmt.Errorf("control verify-key: %s", resp.Status)
 	}
 }
 
 // authorize verifies (group, api_key) and writes the right error on failure: 503
-// when the op interface is unreachable (don't 403-storm on a transient blip), 403
+// when the control API is unreachable (don't 403-storm on a transient blip), 403
 // when the key is rejected. Returns false on failure.
 func (rt *Router) authorize(w http.ResponseWriter, ctx context.Context, group, apiKey string) bool {
 	if rt.authMode == "off" {
@@ -827,7 +827,7 @@ func (rt *Router) authorize(w http.ResponseWriter, ctx context.Context, group, a
 	ok, err := rt.verifyAuth(ctx, group, apiKey)
 	if err != nil {
 		if rt.authMode == "log" {
-			rt.log.Warn("router: caller-auth op unreachable (log mode, allowing)", "group", group)
+			rt.log.Warn("router: caller-auth control unreachable (log mode, allowing)", "group", group)
 			return true
 		}
 		http.Error(w, "auth temporarily unavailable", http.StatusServiceUnavailable)

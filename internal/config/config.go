@@ -58,8 +58,9 @@ type Config struct {
 	Sandbox SandboxConfig `yaml:"sandbox"` // sandbox-instance defaults
 	Builder BuilderConfig `yaml:"builder"` // build-instance settings
 	// ResourceListen optionally hosts the node resource controller in-process
-	// (resource_listen, node-resource.md); disabled => sandboxes use static cgroup.
-	ResourceListen ResourceListenConfig `yaml:"resource_listen"`
+	// (resource_listen, node-resource.md); absent/disabled => sandboxes use static
+	// cgroup. The controller's tuning is inlined here — there is no second file.
+	ResourceListen *ResourceListenConfig `yaml:"resource_listen,omitempty"`
 	// Checkpoint is the paused-state tiering policy (parallel to sandbox).
 	Checkpoint CheckpointConfig `yaml:"checkpoint"`
 	// MMDS is the optional envd metadata service (re-keys envd to fresh per-identity
@@ -69,32 +70,165 @@ type Config struct {
 	// (node.md §10); empty = standalone single-node.
 	Cluster ClusterConfig `yaml:"cluster"`
 	// Singular top-level references.
-	EncryptionKey  string `yaml:"encryption_key"`  // manifest_key at-rest AES-256 (":"-sep, first active); or NODE_CTL_ENCRYPTION_KEY env
+	EncryptionKey  string `yaml:"encryption_key"`  // manifest_key at-rest AES-256 (":"-sep, first active); or NODE_CONFIG_ENCRYPTION_KEY env
 	ManifestConfig string `yaml:"manifest_config"` // remote manifest store config (path ref; shared by sandbox + builder)
 
 	execDir string // auto: dir of os.Executable(); used by Bin (not a YAML field)
 }
 
-// ResourceListenConfig optionally hosts the node resource controller in-process
-// inside serve (the resource_listen sub-server, node-resource.md). Disabled by
-// default; sandboxes then use static cgroup.
+// ResourceListenConfig hosts the in-process node resource controller inside serve
+// (the resource_listen sub-server, node-resource.md). Absent / Enabled=false =>
+// sandboxes use static cgroup. The controller's tuning is inlined here — there is
+// no second config file; nodectl.Resolve consumes this struct directly.
 type ResourceListenConfig struct {
-	Enabled bool   `yaml:"enabled"`
-	Socket  string `yaml:"socket"` // controller UDS; "" = nodectl default
-	Config  string `yaml:"config"` // resource controller yaml; "" = built-in defaults
+	Enabled         bool                     `yaml:"enabled"`
+	Socket          string                   `yaml:"socket"`            // controller UDS; "" = pkg/resource.DefaultSocket (sandbox-ctl's default)
+	StatePath       string                   `yaml:"state_path"`        // restart fast-recovery state (tmpfs); default /run/node-ctl/state.json
+	AuditPath       string                   `yaml:"audit_path"`        // audit log (tmpfs); default /run/node-ctl/audit.log
+	CgroupScanPaths []string                 `yaml:"cgroup_scan_paths"` // (reserved) restart reconcile roots
+	Resources       ResourceHostConfig       `yaml:"resources"`         // node physical capacity + host reservation
+	Watermarks      ResourceWatermarksConfig `yaml:"watermarks"`        // zone thresholds (fractions of allocatable pool)
+	RateLimits      ResourceRateLimitsConfig `yaml:"rate_limits"`       // memory grant rate limit
+	Admission       ResourceAdmissionConfig  `yaml:"admission"`         // admit token bucket + queue
+	Dampening       ResourceDampeningConfig  `yaml:"dampening"`         // oscillation damping
+	LogLevel        string                   `yaml:"log_level"`         // info (default)
+}
+
+// ResourceHostConfig is the node's physical capacity and the host's own reservation.
+type ResourceHostConfig struct {
+	PhysicalMemory string               `yaml:"physical_memory"` // "auto" (/proc/meminfo) or a size string
+	PhysicalCPU    string               `yaml:"physical_cpu"`    // "auto" (nproc) or an integer core count
+	HostReserved   ResourceHostReserved `yaml:"host_reserved"`   // kernel + node daemons reservation
+}
+
+// ResourceHostReserved is the memory/CPU carved out for the host itself.
+type ResourceHostReserved struct {
+	Memory string  `yaml:"memory"` // default 16GiB
+	CPU    float64 `yaml:"cpu"`    // cores; default 1.5
+}
+
+// ResourceWatermarksConfig sets the zone thresholds as fractions of the allocatable
+// pool (node-resource.md §3.2 / §4).
+type ResourceWatermarksConfig struct {
+	OperationalMarginFactor float64 `yaml:"operational_margin_factor"` // default 0.10
+	HighFactor              float64 `yaml:"high_factor"`               // red zone start; default 0.85
+	LowFactor               float64 `yaml:"low_factor"`                // yellow zone start; default 0.70
+	EmergencyFactor         float64 `yaml:"emergency_factor"`          // emergency pool; default 0.05
+	StartupFactor           float64 `yaml:"startup_factor"`            // startup_pool = pool × this; default 0.50 (emergency < startup ≤ 1.0)
+}
+
+// ResourceRateLimitsConfig bounds the memory grant rate.
+type ResourceRateLimitsConfig struct {
+	MemoryGrantPerSecFactor float64 `yaml:"memory_grant_per_sec_factor"` // × allocatable pool; default 0.05
+}
+
+// ResourceAdmissionConfig is the admit token bucket + short-block queue.
+type ResourceAdmissionConfig struct {
+	Rate          int    `yaml:"rate"`            // tokens/s; default 4
+	Burst         int    `yaml:"burst"`           // bucket capacity; default 16
+	StartupTTL    string `yaml:"startup_ttl"`     // admit→settled deadline; default 30s
+	QueueTTL      string `yaml:"queue_ttl"`       // max short-block wait; default 30s
+	QueueMaxDepth int    `yaml:"queue_max_depth"` // queue capacity; default 256
+}
+
+// ResourceDampeningConfig damps zone oscillation (does not enter sandbox.yaml).
+type ResourceDampeningConfig struct {
+	RecoverDuration string `yaml:"recover_duration"` // burst→settled observation; default 60s
+	CooldownPeriods int    `yaml:"cooldown_periods"` // × 100ms; default 10
+}
+
+// ApplyDefaults fills the controller tuning defaults (node-resource.md §3.2). The
+// socket default (pkg/resource.DefaultSocket) is applied by nodectl.Resolve, which
+// owns that protocol constant. Exported so nodectl.Resolve can default a config
+// block built outside config.Load (e.g. in tests).
+func (r *ResourceListenConfig) ApplyDefaults() {
+	if r.StatePath == "" {
+		r.StatePath = "/run/node-ctl/state.json"
+	}
+	if r.AuditPath == "" {
+		r.AuditPath = "/run/node-ctl/audit.log"
+	}
+	if len(r.CgroupScanPaths) == 0 {
+		r.CgroupScanPaths = []string{"/sys/fs/cgroup/sandboxes"}
+	}
+	if r.Resources.PhysicalMemory == "" {
+		r.Resources.PhysicalMemory = "auto"
+	}
+	if r.Resources.PhysicalCPU == "" {
+		r.Resources.PhysicalCPU = "auto"
+	}
+	if r.Resources.HostReserved.Memory == "" {
+		r.Resources.HostReserved.Memory = "16GiB"
+	}
+	if r.Resources.HostReserved.CPU == 0 {
+		r.Resources.HostReserved.CPU = 1.5
+	}
+	if r.Watermarks.OperationalMarginFactor == 0 {
+		r.Watermarks.OperationalMarginFactor = 0.10
+	}
+	if r.Watermarks.HighFactor == 0 {
+		r.Watermarks.HighFactor = 0.85
+	}
+	if r.Watermarks.LowFactor == 0 {
+		r.Watermarks.LowFactor = 0.70
+	}
+	if r.Watermarks.EmergencyFactor == 0 {
+		r.Watermarks.EmergencyFactor = 0.05
+	}
+	if r.Watermarks.StartupFactor == 0 {
+		r.Watermarks.StartupFactor = 0.50
+	}
+	if r.RateLimits.MemoryGrantPerSecFactor == 0 {
+		r.RateLimits.MemoryGrantPerSecFactor = 0.05
+	}
+	if r.Admission.Rate == 0 {
+		r.Admission.Rate = 4
+	}
+	if r.Admission.Burst == 0 {
+		r.Admission.Burst = 16
+	}
+	if r.Admission.StartupTTL == "" {
+		r.Admission.StartupTTL = "30s"
+	}
+	if r.Admission.QueueTTL == "" {
+		r.Admission.QueueTTL = "30s"
+	}
+	if r.Admission.QueueMaxDepth == 0 {
+		r.Admission.QueueMaxDepth = 256
+	}
+	if r.Dampening.RecoverDuration == "" {
+		r.Dampening.RecoverDuration = "60s"
+	}
+	if r.Dampening.CooldownPeriods == 0 {
+		r.Dampening.CooldownPeriods = 10
+	}
+	if r.LogLevel == "" {
+		r.LogLevel = "info"
+	}
 }
 
 // ClusterConfig connects this node to a cluster-ctl registry over node-link
-// (node.md §10). Empty Registry = standalone single-node (no cluster).
+// (node.md §10). Empty Registry.Endpoint = standalone single-node (no cluster).
 type ClusterConfig struct {
-	Registry          string            `yaml:"registry"`           // registry node-link addr host:port; "" = standalone
+	Registry          ClusterRegistry   `yaml:"registry"`           // how to reach the registry node-link
 	NodeID            string            `yaml:"node_id"`            // this node's id; "" = hostname
 	Labels            map[string]string `yaml:"labels"`             // zone / pool / slot / node (nodeSelectors)
 	DataEndpoint      string            `yaml:"data_endpoint"`      // host:port the router forwards the data plane to
 	HeartbeatInterval string            `yaml:"heartbeat_interval"` // node-link heartbeat period; "" = 10s
-	TLSCert           string            `yaml:"tls_cert"`           // node-link client cert (mTLS); "" = plain h2c
-	TLSKey            string            `yaml:"tls_key"`
-	TLSCA             string            `yaml:"tls_ca"` // CA that verifies the registry's server cert
+}
+
+// ClusterRegistry is how the node dials the registry's node-link listener; the
+// { endpoint, tls } shape mirrors cluster-ctl's router/scaler `registry:` group.
+type ClusterRegistry struct {
+	Endpoint string      `yaml:"endpoint"` // registry node-link addr host:port; "" = standalone
+	TLS      TLSMaterial `yaml:"tls"`      // node-link client mTLS; empty = plain h2c
+}
+
+// TLSMaterial is cert/key + CA (mirrors clustercfg.TLS) for the node-link client.
+type TLSMaterial struct {
+	Cert string `yaml:"cert"`
+	Key  string `yaml:"key"`
+	CA   string `yaml:"ca"` // CA that verifies the registry's server cert
 }
 
 // APIConfig is the north control plane + TLS.
@@ -126,7 +260,7 @@ type ProxyConfig struct {
 // to a fresh per-identity value at /init — required for snapshot-fork data-plane auth.
 // enabled=false keeps envd in -isnotfc (non-secure); the proxy then enforces
 // X-Access-Token as the sole gate. The MMDS is hosted by the proxy component
-// (internal: serve binds Listen; external: the proxy worker via --mmds-listen). envd
+// (internal: serve binds Listen; external: a proxy worker started with --mmds). envd
 // hard-codes 169.254.169.254:80, so the vswitch's --mgmt-service translates that VIP to
 // Listen in its datapath (no iptables); a loopback Listen needs route_localnet=1 on the
 // mgmt dev.
@@ -137,9 +271,9 @@ type MMDSConfig struct {
 
 // PathsConfig holds node-local directories and sockets.
 type PathsConfig struct {
-	RunRoot      string `yaml:"run_root"`      // default /run/sandbox (tmpfs)
-	BaseRoot     string `yaml:"base_root"`     // default /var/lib/sandbox (persistent)
-	DBPath       string `yaml:"db_path"`       // default <base_root>/node-ctl.db
+	RunRoot       string `yaml:"run_root"`       // default /run/sandbox (tmpfs)
+	BaseRoot      string `yaml:"base_root"`      // default /var/lib/sandbox (persistent)
+	DBPath        string `yaml:"db_path"`        // default <base_root>/node-ctl.db
 	ConfigSocket  string `yaml:"config_socket"`  // default /run/sandbox/node-ctl.socket
 	AdminPidfile  string `yaml:"admin_pidfile"`  // optional PID allowlist (multi-line) gating the socket admin plane; "" => socket perms (same-uid/root) only
 	PluginPidfile string `yaml:"plugin_pidfile"` // optional PID allowlist (multi-line) gating the socket plugin plane (proxy/agent registration); "" => socket perms only
@@ -279,10 +413,10 @@ type BuilderConfig struct {
 type FilesStorageConfig struct {
 	Endpoint  string `yaml:"endpoint"`   // S3 endpoint; empty = AWS default
 	Region    string `yaml:"region"`     // e.g. "cn-north-4" / "us-east-1"
-	Bucket    string `yaml:"bucket"`      // required
-	Prefix    string `yaml:"prefix"`      // optional key prefix
-	AccessKey string `yaml:"access_key"`  // empty → AWS default chain (env / instance role)
-	SecretKey string `yaml:"secret_key"`  // paired with access_key
+	Bucket    string `yaml:"bucket"`     // required
+	Prefix    string `yaml:"prefix"`     // optional key prefix
+	AccessKey string `yaml:"access_key"` // empty → AWS default chain (env / instance role)
+	SecretKey string `yaml:"secret_key"` // paired with access_key
 	// ForcePathStyle selects path-style addressing (host/bucket/key). Default
 	// false (virtual-host, what AWS S3 / OBS use); versitygw / minio need true.
 	ForcePathStyle bool `yaml:"force_path_style"`
@@ -391,16 +525,19 @@ func (c *Config) applyDefaults() {
 	def(&c.Checkpoint.Mode, CheckpointLocal)
 	def(&c.Checkpoint.LocalDir, "/var/lib/sandbox-saved")
 	def(&c.MMDS.Listen, "127.0.0.1:19254")
+	if c.ResourceListen != nil {
+		c.ResourceListen.ApplyDefaults()
+	}
 	if exe, err := os.Executable(); err == nil {
 		c.execDir = filepath.Dir(exe)
 	}
 }
 
 // EncryptionKeySpec returns the effective encryption-key set: the
-// NODE_CTL_ENCRYPTION_KEY env when set, else the config's encryption_key
+// NODE_CONFIG_ENCRYPTION_KEY env when set, else the config's encryption_key
 // (":"-separated 64-hex keys, first = active).
 func (c *Config) EncryptionKeySpec() string {
-	if v := os.Getenv("NODE_CTL_ENCRYPTION_KEY"); v != "" {
+	if v := os.Getenv("NODE_CONFIG_ENCRYPTION_KEY"); v != "" {
 		return v
 	}
 	return c.EncryptionKey
@@ -440,19 +577,18 @@ func (c *Config) validate() error {
 		return fmt.Errorf("config: api.domain is required")
 	}
 	if c.EncryptionKeySpec() == "" {
-		return fmt.Errorf("config: encryption_key (or NODE_CTL_ENCRYPTION_KEY env) is required")
+		return fmt.Errorf("config: encryption_key (or NODE_CONFIG_ENCRYPTION_KEY env) is required")
 	}
 	switch c.Checkpoint.Mode {
 	case CheckpointLocal, CheckpointRemote:
 	default:
 		return fmt.Errorf("config: checkpoint.mode %q (want local|remote)", c.Checkpoint.Mode)
 	}
-	return c.ValidateProxy()
+	return c.validateProxy()
 }
 
-// ValidateProxy checks the proxy-mode fields. Exported so serve can re-check after
-// applying --proxy / --proxy-socket flag overrides.
-func (c *Config) ValidateProxy() error {
+// validateProxy checks the proxy-mode + mmds invariants.
+func (c *Config) validateProxy() error {
 	switch c.Proxy.Mode {
 	case ProxyInternal, ProxyExternal, ProxyOff:
 	default:
@@ -478,4 +614,68 @@ func (c *Config) ValidateProxy() error {
 		return fmt.Errorf("config: builder.files_storage.bucket is required when files_storage is set")
 	}
 	return nil
+}
+
+// ProxyFileConfig is the external data-plane proxy worker's config
+// (node-ctl proxy --config <this>). The worker shares serve's wildcard cert + data
+// port, but keeps its OWN bootstrap auth/park fallback — serve pushes the
+// authoritative policy over the registration stream once connected. Per-instance
+// identity (--id / --socket) and the per-instance --metrics-listen stay flags.
+type ProxyFileConfig struct {
+	ConfigSocket string    `yaml:"config_socket"` // serve control socket to register + sync on (= serve paths.config_socket)
+	DataListen   string    `yaml:"data_listen"`   // SO_REUSEPORT data-plane ingress (workers share it); "" = UDS-only gateway-forward
+	TLS          TLSConfig `yaml:"tls"`           // data-plane listener cert (= serve's wildcard); "" = h2c
+	Auth         string    `yaml:"auth"`          // bootstrap fallback until serve pushes policy: off|log|enforce (default enforce)
+	ParkTimeout  string    `yaml:"park_timeout"`  // bootstrap fallback; default 30s
+	MMDSListen   string    `yaml:"mmds_listen"`   // FC MMDS service addr this worker binds when started with --mmds; default 127.0.0.1:19254
+}
+
+// LoadProxy reads the proxy worker config, applies defaults, and validates.
+func LoadProxy(path string) (*ProxyFileConfig, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("proxy config: read %s: %w", path, err)
+	}
+	var p ProxyFileConfig
+	if err := yaml.Unmarshal(b, &p); err != nil {
+		return nil, fmt.Errorf("proxy config: parse %s: %w", path, err)
+	}
+	p.applyDefaults()
+	return &p, p.validate()
+}
+
+func (p *ProxyFileConfig) applyDefaults() {
+	if p.ConfigSocket == "" {
+		p.ConfigSocket = "/run/sandbox/node-ctl.socket"
+	}
+	if p.Auth == "" {
+		p.Auth = AuthEnforce
+	}
+	if p.ParkTimeout == "" {
+		p.ParkTimeout = "30s"
+	}
+	if p.MMDSListen == "" {
+		p.MMDSListen = "127.0.0.1:19254"
+	}
+}
+
+func (p *ProxyFileConfig) validate() error {
+	switch p.Auth {
+	case AuthOff, AuthLog, AuthEnforce:
+	default:
+		return fmt.Errorf("proxy config: auth %q (want off|log|enforce)", p.Auth)
+	}
+	if _, err := time.ParseDuration(p.ParkTimeout); err != nil {
+		return fmt.Errorf("proxy config: park_timeout %q: %w", p.ParkTimeout, err)
+	}
+	return nil
+}
+
+// ParkTimeoutDur parses the worker's park_timeout fallback (default 30s).
+func (p *ProxyFileConfig) ParkTimeoutDur() time.Duration {
+	d, err := time.ParseDuration(p.ParkTimeout)
+	if err != nil || d <= 0 {
+		return 30 * time.Second
+	}
+	return d
 }

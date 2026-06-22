@@ -22,15 +22,15 @@ import (
 )
 
 // Service is the standalone scaler (cluster-scaler.md §4.2/§5): it DIALS the
-// registry, subscribes the node/group view (the op watches), and answers the
+// registry, subscribes the node/group view (the control watches), and answers the
 // registry's reverse placement requests on the scaler-link (no scaler listen).
 // Placement runs over its local view; the registry commits by CAS.
 type Service struct {
-	opBase      string
+	controlBase string
 	scheme      string
 	watchClient *http.Client     // no timeout: long-lived view watches
 	placeTr     *http2.Transport // full-duplex scaler-link (place_req down / place_result up)
-	cfg         clustercfg.ScalerConfig
+	cfg         clustercfg.PlacementConfig
 	deadAfter   int64 // node_dead_after seconds (node-alive eligibility, §4.2)
 	log         *slog.Logger
 
@@ -38,11 +38,11 @@ type Service struct {
 	groups *viewMap[*registry.GroupView]
 }
 
-// NewRemote builds a standalone scaler dialing the registry op endpoint (a UDS
-// path, or host:port; opTLS non-nil = mTLS h2). deadAfter is node_dead_after.
-func NewRemote(opAddr string, opTLS *tls.Config, cfg clustercfg.ScalerConfig, deadAfter int64, log *slog.Logger) *Service {
-	if cfg.PlaceCandidates <= 0 {
-		cfg.PlaceCandidates = 2
+// NewRemote builds a standalone scaler dialing the registry control endpoint (a UDS
+// path, or host:port; controlTLS non-nil = mTLS h2). deadAfter is node_dead_after.
+func NewRemote(controlAddr string, controlTLS *tls.Config, cfg clustercfg.PlacementConfig, deadAfter int64, log *slog.Logger) *Service {
+	if cfg.Candidates <= 0 {
+		cfg.Candidates = 2
 	}
 	s := &Service{
 		cfg: cfg, deadAfter: deadAfter, log: log,
@@ -53,24 +53,24 @@ func NewRemote(opAddr string, opTLS *tls.Config, cfg clustercfg.ScalerConfig, de
 	// (full-duplex: registry writes place_req down, scaler writes place_result up).
 	pt := &http2.Transport{}
 	switch {
-	case strings.HasPrefix(opAddr, "/"):
-		s.opBase, s.scheme = "http://op", "http"
+	case strings.HasPrefix(controlAddr, "/"):
+		s.controlBase, s.scheme = "http://control", "http"
 		dial := func(ctx context.Context, _, _ string) (net.Conn, error) {
-			return (&net.Dialer{}).DialContext(ctx, "unix", opAddr)
+			return (&net.Dialer{}).DialContext(ctx, "unix", controlAddr)
 		}
 		s.watchClient = &http.Client{Transport: &http.Transport{DialContext: dial}}
 		pt.AllowHTTP = true
 		pt.DialTLSContext = func(ctx context.Context, _, _ string, _ *tls.Config) (net.Conn, error) { return dial(ctx, "", "") }
-	case opTLS != nil:
-		s.opBase, s.scheme = "https://"+opAddr, "https"
-		s.watchClient = &http.Client{Transport: &http.Transport{TLSClientConfig: opTLS, ForceAttemptHTTP2: true}}
+	case controlTLS != nil:
+		s.controlBase, s.scheme = "https://"+controlAddr, "https"
+		s.watchClient = &http.Client{Transport: &http.Transport{TLSClientConfig: controlTLS, ForceAttemptHTTP2: true}}
 		pt.DialTLSContext = func(ctx context.Context, _, addr string, _ *tls.Config) (net.Conn, error) {
 			d := &net.Dialer{}
-			raw, err := d.DialContext(ctx, "tcp", opAddr)
+			raw, err := d.DialContext(ctx, "tcp", controlAddr)
 			if err != nil {
 				return nil, err
 			}
-			tc := tls.Client(raw, opTLS)
+			tc := tls.Client(raw, controlTLS)
 			if err := tc.HandshakeContext(ctx); err != nil {
 				raw.Close()
 				return nil, err
@@ -78,11 +78,11 @@ func NewRemote(opAddr string, opTLS *tls.Config, cfg clustercfg.ScalerConfig, de
 			return tc, nil
 		}
 	default:
-		s.opBase, s.scheme = "http://"+opAddr, "http"
+		s.controlBase, s.scheme = "http://"+controlAddr, "http"
 		s.watchClient = &http.Client{Transport: &http.Transport{}}
 		pt.AllowHTTP = true
 		pt.DialTLSContext = func(ctx context.Context, _, _ string, _ *tls.Config) (net.Conn, error) {
-			return (&net.Dialer{}).DialContext(ctx, "tcp", opAddr)
+			return (&net.Dialer{}).DialContext(ctx, "tcp", controlAddr)
 		}
 	}
 	s.placeTr = pt
@@ -91,8 +91,8 @@ func NewRemote(opAddr string, opTLS *tls.Config, cfg clustercfg.ScalerConfig, de
 
 // Start launches the node + group view-watch loops + the scaler-link (background).
 func (s *Service) Start(ctx context.Context) {
-	go s.subscribe(ctx, registry.OpNodeWatchPath, s.nodes)
-	go s.subscribe(ctx, registry.OpGroupWatchPath, s.groups)
+	go s.subscribe(ctx, registry.ControlNodeWatchPath, s.nodes)
+	go s.subscribe(ctx, registry.ControlGroupWatchPath, s.groups)
 	go s.runPlaceLink(ctx)
 }
 
@@ -111,7 +111,7 @@ func (s *Service) answer(req *routesync.PlaceReq) *routesync.PlaceResult {
 	}
 	p := placeParams{
 		group: req.Group, nodes: s.nodes.values(), selectors: selectors,
-		rules: s.cfg.ShuffleSharding, candidates: s.cfg.PlaceCandidates,
+		rules: s.cfg.ShuffleSharding, candidates: s.cfg.Candidates,
 		zoneAdmitMax: s.cfg.ZoneAdmitMax, deadAfter: s.deadAfter, now: time.Now().Unix(),
 		targetRuntimeDigest: req.TargetRuntimeDigest,
 	}
@@ -157,7 +157,7 @@ func (s *Service) placeSession(ctx context.Context) error {
 	defer cancel()
 	pr, pw := io.Pipe()
 	defer pw.Close()
-	req, err := http.NewRequestWithContext(sctx, http.MethodPut, s.opBase+routesync.ScalerLinkPath, pr)
+	req, err := http.NewRequestWithContext(sctx, http.MethodPut, s.controlBase+routesync.ScalerLinkPath, pr)
 	if err != nil {
 		return err
 	}
@@ -230,7 +230,7 @@ func (s *Service) reconcileSelectors(ctx context.Context, send func(*routesync.M
 	}
 }
 
-// subscribe keeps a view synced from the registry op watch, reconnecting with
+// subscribe keeps a view synced from the registry control watch, reconnecting with
 // capped backoff and resuming from the last applied rev (mirrors the router).
 func (s *Service) subscribe(ctx context.Context, path string, sink viewSink) {
 	backoff := 200 * time.Millisecond
@@ -252,7 +252,7 @@ func (s *Service) subscribe(ctx context.Context, path string, sink viewSink) {
 }
 
 func (s *Service) subscribeOnce(ctx context.Context, path string, fromRev int64, sink viewSink) (int64, error) {
-	u := fmt.Sprintf("%s%s?from_rev=%d", s.opBase, path, fromRev)
+	u := fmt.Sprintf("%s%s?from_rev=%d", s.controlBase, path, fromRev)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return fromRev, err

@@ -439,7 +439,7 @@ func (o *Orchestrator) dropClusterKey(ctx context.Context, fingerprint string) e
 // cluster-only and opt-in (checkpoint.deep_idle_sec > 0). DeadlineUnix doubles as
 // the post-pause idle clock (pauseSandbox sets it on pause). Called by the Reaper.
 func (o *Orchestrator) reapDeepIdle(ctx context.Context, now int64) {
-	if o.cfg.Cluster.Registry == "" || o.cfg.Checkpoint.DeepIdleSec <= 0 {
+	if o.cfg.Cluster.Registry.Endpoint == "" || o.cfg.Checkpoint.DeepIdleSec <= 0 {
 		return
 	}
 	var idle []*types.Sandbox

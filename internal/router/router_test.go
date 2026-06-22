@@ -43,21 +43,21 @@ func TestBuildRoutingThroughRouter(t *testing.T) {
 	defer node.Close()
 	nodeHost := strings.TrimPrefix(node.URL, "http://")
 
-	op := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/op/reserve-build":
+		case "/control/reserve-build":
 			// The registry assigns the build/template ids + places it (§7.5); the
 			// router synthesizes the e2b register response and routes follow-ups.
 			_ = json.NewEncoder(w).Encode(buildReserveResult{BuildID: "b1", TemplateID: "t1", NodeID: "n1", DataEndpoint: nodeHost})
-		case "/op/verify-key":
+		case "/control/verify-key":
 			w.WriteHeader(http.StatusOK)
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}
 	}))
-	defer op.Close()
+	defer control.Close()
 
-	rt := New(strings.TrimPrefix(op.URL, "http://"), "test.local", 0, nil, slog.Default())
+	rt := New(strings.TrimPrefix(control.URL, "http://"), "test.local", 0, nil, slog.Default())
 	srv := httptest.NewServer(rt.Handler())
 	defer srv.Close()
 
