@@ -169,6 +169,15 @@ func (s *Service) placeSession(ctx context.Context) error {
 	if _, err := routesync.ReadMsg(resp.Body); err != nil { // registry Hello
 		return err
 	}
+	// Two writers on pw (place_result from the read loop, selector_patch from the
+	// reconcile goroutine) → serialize.
+	var wmu sync.Mutex
+	send := func(m *routesync.Msg) error {
+		wmu.Lock()
+		defer wmu.Unlock()
+		return routesync.WriteMsg(pw, m)
+	}
+	go s.reconcileSelectors(sctx, send) // push shuffle-effective nodeSelectors (§4.4/§7.6)
 	for {
 		m, err := routesync.ReadMsg(resp.Body)
 		if err != nil {
@@ -176,8 +185,46 @@ func (s *Service) placeSession(ctx context.Context) error {
 		}
 		if m.Type == routesync.TypePlaceReq && m.PlaceReq != nil {
 			res := s.answer(m.PlaceReq) // placement is in-memory + fast; answer inline
-			if err := routesync.WriteMsg(pw, &routesync.Msg{Type: routesync.TypePlaceResult, PlaceResult: res}); err != nil {
+			if err := send(&routesync.Msg{Type: routesync.TypePlaceResult, PlaceResult: res}); err != nil {
 				return err
+			}
+		}
+	}
+}
+
+// reconcileSelectors periodically computes each shuffle-group's effective
+// nodeSelectors over the view and pushes a selector_patch on change (the registry
+// uses it as the key-distribution allocation set, §7.6). Per-session change
+// tracking; a reconnect re-pushes all (the registry's overlay is derived state).
+func (s *Service) reconcileSelectors(ctx context.Context, send func(*routesync.Msg) error) {
+	if len(s.cfg.ShuffleSharding) == 0 {
+		return // no shuffle rules → no overlay (key dist uses static selectors)
+	}
+	last := map[string]string{}
+	t := time.NewTicker(3 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			if !s.nodes.ready() || !s.groups.ready() {
+				continue
+			}
+			nodes := s.nodes.values()
+			for _, g := range s.groups.values() {
+				eff, ok := effectiveSelectors(g.Group, nodes, g.NodeSelectors, s.cfg.ShuffleSharding)
+				if !ok {
+					continue
+				}
+				key := fmt.Sprint(eff)
+				if last[g.Group] == key {
+					continue // unchanged since last push
+				}
+				if err := send(&routesync.Msg{Type: routesync.TypeSelectorPatch, Patch: &routesync.SelectorPatch{Group: g.Group, Selectors: eff}}); err != nil {
+					return
+				}
+				last[g.Group] = key
 			}
 		}
 	}

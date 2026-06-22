@@ -96,12 +96,19 @@ func (r *Registry) reconcileKeys(ctx context.Context) {
 	}
 }
 
-// allocationSet is the connected nodes matching a group's nodeSelectors (the key
-// recipients); empty selectors match every node.
+// allocationSet is the connected nodes matching a group's effective nodeSelectors
+// (the key recipients); empty selectors match every node. When the scaler has
+// pushed a shuffle-effective overlay for the group (§4.4), it is used instead of
+// the static selectors, so keys predistribute only to the group's shuffle-pinned
+// nodes (§7.6) rather than the whole static selector set.
 func (r *Registry) allocationSet(ctx context.Context, g *GroupConfig) map[string]bool {
+	selectors := g.NodeSelectors
+	if eff, ok := r.effectiveSelectors(g.Group); ok {
+		selectors = eff
+	}
 	set := map[string]bool{}
 	_ = r.stores.RangeNodes(ctx, func(n *NodeRecord) error {
-		if _, live := r.node(n.NodeID); live && matchAnySelector(n.Labels, g.NodeSelectors) {
+		if _, live := r.node(n.NodeID); live && matchAnySelector(n.Labels, selectors) {
 			set[n.NodeID] = true
 		}
 		return nil

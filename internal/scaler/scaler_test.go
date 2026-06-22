@@ -104,6 +104,28 @@ func TestShuffleSharding(t *testing.T) {
 	}
 }
 
+func TestEffectiveSelectors(t *testing.T) {
+	var ns []*registry.NodeRecord
+	for _, slot := range []string{"s1", "s2", "s3", "s4"} {
+		ns = append(ns, &registry.NodeRecord{NodeID: "n-" + slot, Labels: map[string]string{"pool": "p1", "slot": slot}})
+	}
+	rules := []clustercfg.ShuffleRule{{Selector: map[string]string{"pool": "p1"}, ShardBy: "slot", N: 2}}
+	eff, ok := effectiveSelectors("/cell/g1", ns, []map[string]string{{"pool": "p1"}}, rules)
+	if !ok || len(eff) != 2 {
+		t.Fatalf("effective selectors: ok=%v %v (want 2 = N pinned slots)", ok, eff)
+	}
+	// Each effective selector carries the static label + a pinned slot.
+	for _, sel := range eff {
+		if sel["pool"] != "p1" || sel["slot"] == "" {
+			t.Fatalf("effective selector %v missing pool/slot narrowing", sel)
+		}
+	}
+	// No shuffle rule → no overlay (key dist falls back to static).
+	if _, ok := effectiveSelectors("/g", ns, nil, nil); ok {
+		t.Fatal("no shuffle rule should yield no overlay")
+	}
+}
+
 func TestPlaceBuildHeadroom(t *testing.T) {
 	// A node with no build headroom (alloc==capacity CPU) is excluded.
 	ns := nodes(
