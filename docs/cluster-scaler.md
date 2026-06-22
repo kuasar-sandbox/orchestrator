@@ -59,12 +59,9 @@ listen——scaler 是纯调度器(订阅 + 被调建议方)。
 
 | 字段 | 默认 | 说明 |
 |---|---|---|
-| `scaler.mode` | `inprocess` | 放置部署形态:`inprocess`(registry 进程内)/ `remote`(独立 scaler 进程经 op,§5)|
-| `scaler.endpoint` | 空 | `mode=remote`:registry 调用 scaler `/scaler/place` 的地址 |
-| `scaler.listen` | 空 | `mode=remote`:scaler `/scaler/place` 的监听地址 |
-| `scaler.tls` | 空 | `mode=remote`:registry ↔ scaler 放置跳的 mTLS |
+| `scaler.registry` | 空 | registry op 端点(scaler 拨入);空 = 同机 `op.listen` |
 | `scaler.place_candidates` | `2` | P2C 抽样候选数(§4.2) |
-| `scaler.zone_admit_max` | `yellow` | 放置水位区上限(red 排除);**当前放置尚未消费**(§4.2 负载信号) |
+| `scaler.zone_admit_max` | `yellow` | 放置只选水位区 ≤ 此的节点(red / critical 排除,§4.2) |
 | `scaler.shuffle_sharding` | 空 | shuffle-sharding 规则列表(§4.4);空 = 仅用静态 nodeSelectors |
 
 `shuffle_sharding` 规则形态:
@@ -97,16 +94,17 @@ scaler 订阅 registry 节点注册表(labels、watermark、build_capacity / bui
 ```
 eligible = { node :
     matchSelectors(node.labels, group.有效 nodeSelectors)   // 静态 ∪ shuffle 分片(§4.4)
-  ∧ ¬ node.draining
+  ∧ node alive(LastHeartbeatUnix 未超 node_dead_after) ∧ ¬ node.draining
+  ∧ node.zone ≤ scaler.zone_admit_max                     // red / critical 排除
+  ∧ runtimeCompatible(node.runtime_digest, target)        // target 非空时(如迁移快照 runtime)
 }
-node_id = argmin( sample(eligible, place_candidates), node.counts )   // P2C:无放回抽 place_candidates 个,取活沙箱计数较小者
+node_id = argmin( sample(eligible, place_candidates), load )   // P2C 无放回抽 place_candidates 个,取 load 较小者
 ```
 
-- **负载信号**:当前用 `heartbeat.counts`(活沙箱计数)。`allocated / pool` 水位(node-resource.md)、
-  `zone ≤ zone_admit_max` 区间过滤、`runtime_digest` 兼容性为设计信号,当前放置尚未纳入(仅
-  selector + shuffle 分片 + `¬draining` + 计数 P2C)。
+- **负载信号**:首选 `allocated / pool` 水位(经心跳),回退 `counts / capacity` headroom,再回退裸 counts。
+- **node alive**:scaler 视图里 `LastHeartbeatUnix` 超 `node_dead_after` 的节点排除(失联未扫前)。
 - `eligible` 为空 → 建议失败 → `Reserve` 失败 → router 转 503(cluster.md §7.4)。
-- scaler 只**建议**;registry 提交时 CAS(并发 / 视图滞后冲突则重问一次,cluster.md §4.3)。
+- scaler 只**建议**;registry 提交时 CAS(并发 / 视图滞后 / CAS 冲突则重问一次,cluster.md §4.3)。
 
 ### 4.3 nodeSelectors 与爆炸半径
 
@@ -144,10 +142,9 @@ scaler 把 {shard_by ∈ shards} 选择器 patch 回 group 的有效 nodeSelecto
 
 ### 4.5 PlaceBuild(资源感知)
 
-当前 build 放置复用 §4.2 `PlaceSandbox(group, "build")`(selector + shuffle + 计数 P2C)。下述按 build
-资源余量的放置为设计中能力——节点已上报 `build_capacity` / `build_alloc`,放置尚未消费:
-
 `PlaceBuild(group, resources{cpu,mem,storage}) → node_id 建议`:在 build 资源余量满足的节点间 P2C。
+scaler 据视图过滤 build 余量、按利用率 P2C 建议;registry 提交时按 BuildStore 已 RESERVED 之和**权威
+校验**该节点余量(超订 re-Place,cluster.md §7.5)。
 
 ```
 eligible = { node :
