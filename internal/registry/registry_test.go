@@ -189,6 +189,54 @@ func TestCreateRejectFastFails(t *testing.T) {
 	}
 }
 
+func TestParkTimeoutRollback(t *testing.T) {
+	ctx := context.Background()
+	kv, _ := clusterstore.Open(filepath.Join(t.TempDir(), "r.db"), 0)
+	defer kv.Close()
+	reg := New(NewStores(kv, nil), nil, 200*time.Millisecond, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"})
+	reg.addNode(&fakeConn{nodeID: "n1"}) // accepts create but never reports running
+
+	_, err := reg.ReserveSandbox(ctx, "/g", "rk", nil)
+	if err == nil {
+		t.Fatal("expected park timeout error")
+	}
+	// The RESERVED record (never reached READY) must be rolled back, not stranded.
+	if _, _, found, _ := reg.stores.GetSandbox(ctx, "/g", "rk"); found {
+		t.Fatal("RESERVED record stranded after park timeout (not rolled back)")
+	}
+}
+
+func TestReplaceOnRejectSucceeds(t *testing.T) {
+	ctx := context.Background()
+	reg := testReg(t)
+	reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"})
+	creates := 0
+	conn := &fakeConn{nodeID: "n1"}
+	conn.onCmd = func(cmd *routesync.Command) {
+		if cmd.Kind != routesync.CmdCreate {
+			return
+		}
+		creates++
+		if creates == 1 {
+			go reg.ackCommand(&routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckRejected, Reason: "transient"})
+			return
+		}
+		go reg.applyRoute(context.Background(), "n1", &routesync.RouteEntry{
+			SandboxID: cmd.SID, Group: cmd.Group, RouteKey: cmd.RouteKey, State: routesync.StateRunning, AccessToken: "tok",
+		})
+	}
+	reg.addNode(conn)
+
+	res, err := reg.ReserveSandbox(ctx, "/g", "rk", nil)
+	if err != nil {
+		t.Fatalf("reserve should succeed after one re-place: %v", err)
+	}
+	if res.NodeID != "n1" || creates != 2 {
+		t.Fatalf("expected 2 creates (reject then re-place success); got %d creates, res=%+v", creates, res)
+	}
+}
+
 func TestReservePausedResume(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)

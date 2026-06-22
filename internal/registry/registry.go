@@ -81,6 +81,14 @@ type reserveCall struct {
 	done   chan struct{}
 	result *ReserveResult
 	err    error
+	// re-Place context (§7.4): a rejected create re-places once on another node
+	// before failing the Reserve. orig is the pre-reserve record (SAVED carries the
+	// migration token / sid to preserve on re-Place).
+	group, routeKey string
+	orig            *SandboxRecord
+	found           bool
+	createConfig    map[string]string
+	retried         bool
 }
 
 // ReserveResult is what a satisfied ReserveSandbox returns (cluster.md §7.2). The
@@ -176,7 +184,7 @@ func (r *Registry) ReserveSandbox(ctx context.Context, group, routeKey string, c
 		r.mu.Unlock()
 		return waitCall(ctx, call)
 	}
-	call := &reserveCall{done: make(chan struct{})}
+	call := &reserveCall{done: make(chan struct{}), group: group, routeKey: routeKey, orig: rec, found: found, createConfig: createConfig}
 	r.inflight[key] = call
 	r.mu.Unlock()
 	defer func() {
@@ -187,11 +195,36 @@ func (r *Registry) ReserveSandbox(ctx context.Context, group, routeKey string, c
 
 	if err := r.startReserve(ctx, group, routeKey, rec, rev, found, createConfig); err != nil {
 		r.finish(key, nil, err)
+		r.rollbackReserve(group, routeKey, rec, found)
 		return waitCall(ctx, call)
 	}
 	wctx, cancel := context.WithTimeout(ctx, r.parkTimeout)
 	defer cancel()
-	return waitCall(wctx, call)
+	res, rerr := waitCall(wctx, call)
+	if rerr != nil {
+		// Park timeout / caller cancel: undo a RESERVED that never reached READY, so
+		// it doesn't strand on a live node (the sweep only clears dead-node rows).
+		r.rollbackReserve(group, routeKey, rec, found)
+	}
+	return res, rerr
+}
+
+// rollbackReserve restores a (group, route_key) to its pre-reserve state when a
+// Reserve fails without reaching READY (cluster.md §7.4): a SAVED/PAUSED/NONE
+// record is put back (SAVED keeps its migration token), a fresh one is deleted —
+// but only while the row is still RESERVED (a late running route may have won).
+func (r *Registry) rollbackReserve(group, routeKey string, orig *SandboxRecord, found bool) {
+	ctx := context.Background() // must complete even if the caller's ctx is done
+	cur, _, curFound, err := r.stores.GetSandbox(ctx, group, routeKey)
+	if err != nil || !curFound || cur.State != StateReserved {
+		return // already resolved (READY) / gone — nothing to roll back
+	}
+	if found {
+		_, _ = r.stores.PutSandbox(ctx, orig)
+	} else {
+		_ = r.stores.DeleteSandbox(ctx, group, routeKey)
+		r.dropSID(cur.SID)
+	}
 }
 
 // startReserve drives the placement + command for the leader of a single-flight.
@@ -218,68 +251,80 @@ func (r *Registry) startReserve(ctx context.Context, group, routeKey string, rec
 		return nil
 	}
 
-	// NONE / SAVED: place + create. Re-ask the placer once if it suggests a node
-	// that's no longer connected — a lagging (remote-scaler) view or a node that
-	// just dropped (cluster-scaler.md §5); P2C will likely pick a live one.
-	var nodeID string
-	var conn nodeConn
-	for attempt := 0; ; attempt++ {
-		var perr error
-		nodeID, perr = r.placer.Place(ctx, PlaceRequest{Group: group, RouteKey: routeKey})
+	// NONE / SAVED: place + create.
+	return r.placeAndCreate(ctx, group, routeKey, rec, found, createConfig)
+}
+
+// placeAndCreate places a node and sends the create command, CASing the RESERVED
+// record. It re-reads + re-asks the placer once on a dead-node suggestion OR a CAS
+// conflict (a lagging view / concurrent mutation, cluster.md §4.3/§5). orig is the
+// pre-reserve record; a SAVED origin reuses its sid + migration token so the
+// target imports the same sandbox. It is re-drivable: a rejected create re-invokes
+// it (re-Place once, §7.4), which re-reads the current rev and places afresh.
+func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, orig *SandboxRecord, found bool, createConfig map[string]string) error {
+	for attempt := 0; attempt < 2; attempt++ {
+		cur, curRev, curFound, err := r.stores.GetSandbox(ctx, group, routeKey)
+		if err != nil {
+			return err
+		}
+		if curFound && cur.State == StateReady {
+			return nil // a concurrent attempt already won; the running route finishes the Reserve
+		}
+		nodeID, perr := r.placer.Place(ctx, PlaceRequest{Group: group, RouteKey: routeKey})
 		if perr != nil {
 			return perr
 		}
-		var live bool
-		if conn, live = r.node(nodeID); live {
-			break
-		}
-		if attempt >= 1 {
+		conn, live := r.node(nodeID)
+		if !live {
+			if attempt == 0 {
+				continue // re-ask once (the suggested node just dropped / stale view)
+			}
 			return ErrNodeGone
 		}
-	}
-	sid := "sb-" + newID()
-	migrationToken := ""
-	if found && rec.State == StateSaved {
-		sid = rec.SID // reuse the original sid so the migration token's id matches on import
-		migrationToken = rec.MigrationToken
-	}
-	reserved := &SandboxRecord{Group: group, RouteKey: routeKey, SID: sid, State: StateReserved, NodeID: nodeID}
-	expect := int64(0)
-	if found {
-		expect = rev
-	}
-	if _, ok, err := r.stores.CASSandbox(ctx, reserved, expect); err != nil || !ok {
-		return cas(err, ok)
-	}
-
-	cmd := &routesync.Command{CmdID: newID(), Kind: routesync.CmdCreate, SID: sid, Group: group, RouteKey: routeKey, Config: createConfig, MigrationToken: migrationToken}
-	// Group config via the resolver (store or external, §6.2): template ref + the
-	// group's sandbox_config defaults folded under the create config (§7.2: node
-	// default ⊕ group ⊕ create; create wins).
-	if sc, ok, _ := r.resolver.Sandbox.SandboxConfig(ctx, group); ok {
-		cmd.TemplateRef = sc.TemplateRef
-		cmd.Config = mergeConfig(sc.Config, createConfig)
-	}
-	if k, ok, _ := r.resolver.Key.Key(ctx, group); ok && k.ManifestKey != "" {
-		// The key is predistributed to the group's allocation set ahead of placement
-		// (cluster.md §7.6; reconcileKeys for store keys, the external provider's own
-		// distribution otherwise); create only references it by fingerprint. A node
-		// missing it fails precheck -> rejected ack.
-		cmd.KeyFingerprint = keyFingerprint(k.ManifestKey)
-	}
-	r.trackCmd(cmd.CmdID, flightKey(group, routeKey))
-	if err := conn.send(cmd); err != nil {
-		// Roll back the reservation that never reached the node. A SAVED origin must
-		// RESTORE its record (it carries the migration token); a fresh one is deleted
-		// (a RESERVED tombstone on a live node wouldn't be swept).
-		if found && rec.State == StateSaved {
-			_, _ = r.stores.PutSandbox(ctx, rec)
-		} else {
-			_ = r.stores.DeleteSandbox(ctx, group, routeKey)
+		sid := "sb-" + newID()
+		migrationToken := ""
+		if found && orig.State == StateSaved {
+			sid = orig.SID // reuse the original sid so the migration token's id matches on import
+			migrationToken = orig.MigrationToken
 		}
-		return err
+		expect := int64(0)
+		if curFound {
+			expect = curRev
+		}
+		reserved := &SandboxRecord{Group: group, RouteKey: routeKey, SID: sid, State: StateReserved, NodeID: nodeID}
+		if _, ok, cerr := r.stores.CASSandbox(ctx, reserved, expect); cerr != nil {
+			return cerr
+		} else if !ok {
+			if attempt == 0 {
+				continue // CAS conflict: re-read + re-ask once (§4.3)
+			}
+			return ErrNoNode
+		}
+
+		cmd := &routesync.Command{CmdID: newID(), Kind: routesync.CmdCreate, SID: sid, Group: group, RouteKey: routeKey, Config: createConfig, MigrationToken: migrationToken}
+		// Group config via the resolver (store or external, §6.2): template ref + the
+		// group's sandbox_config defaults folded under the create config (§7.2).
+		if sc, ok, _ := r.resolver.Sandbox.SandboxConfig(ctx, group); ok {
+			cmd.TemplateRef = sc.TemplateRef
+			cmd.Config = mergeConfig(sc.Config, createConfig)
+		}
+		if k, ok, _ := r.resolver.Key.Key(ctx, group); ok && k.ManifestKey != "" {
+			// The key is predistributed ahead of placement (§7.6); create references it
+			// by fingerprint. A node missing it fails precheck -> rejected ack -> re-Place.
+			cmd.KeyFingerprint = keyFingerprint(k.ManifestKey)
+		}
+		r.trackCmd(cmd.CmdID, flightKey(group, routeKey))
+		if err := conn.send(cmd); err != nil {
+			if found && orig.State == StateSaved {
+				_, _ = r.stores.PutSandbox(ctx, orig) // SAVED: restore (keeps the migration token)
+			} else {
+				_ = r.stores.DeleteSandbox(ctx, group, routeKey)
+			}
+			return err
+		}
+		return nil
 	}
-	return nil
+	return ErrNoNode
 }
 
 // sendAndWait sends a command and blocks until the node acks it (or timeout) — for
@@ -337,8 +382,37 @@ func (r *Registry) ackCommand(ack *routesync.CmdAck) {
 		return
 	}
 	if isFlight && ack.Status == routesync.AckRejected {
+		// A rejected create re-places once on another node before failing the Reserve
+		// (cluster.md §7.4): a node-specific reject (e.g. a missing key lease) often
+		// succeeds elsewhere; a second reject (or non-create reject) fails it.
+		if r.replaceOnReject(fk) {
+			return
+		}
 		r.finish(fk, nil, fmt.Errorf("registry: node rejected command: %s", ack.Reason))
 	}
+}
+
+// replaceOnReject re-drives placement once for a rejected flight (returns true if
+// it re-placed, so the Reserve keeps waiting). The single-flight call carries the
+// pre-reserve record so a SAVED origin re-places with its migration token.
+func (r *Registry) replaceOnReject(key string) bool {
+	r.mu.Lock()
+	call := r.inflight[key]
+	if call == nil || call.retried {
+		r.mu.Unlock()
+		return false
+	}
+	call.retried = true
+	g, rk, orig, found, cfg := call.group, call.routeKey, call.orig, call.found, call.createConfig
+	r.mu.Unlock()
+	go func() {
+		// Background ctx: the re-Place must outlive the channel-reader callback; the
+		// placer applies its own timeout. A failure fails the Reserve.
+		if err := r.placeAndCreate(context.Background(), g, rk, orig, found, cfg); err != nil {
+			r.finish(key, nil, fmt.Errorf("registry: re-place after reject failed: %w", err))
+		}
+	}()
+	return true
 }
 
 // applyRoute is called by the channel reader for each sandbox route the node
