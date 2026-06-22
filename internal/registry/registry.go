@@ -682,10 +682,25 @@ func (r *Registry) sweepDeadNodes(ctx context.Context, deadAfter time.Duration) 
 		_ = r.stores.DeleteSandbox(ctx, s.Group, s.RouteKey)
 		r.dropSID(s.SID)
 	}
+	// A dead node's in-flight builds go to error (§11) — their reservation releases
+	// (the headroom sum counts only registered/building), and the e2b client sees
+	// the failure via the router's build status.
+	var deadBuilds []*BuildRecord
+	_ = r.stores.RangeBuilds(ctx, func(b *BuildRecord) error {
+		if deadSet[b.NodeID] && b.occupies() {
+			cp := *b
+			deadBuilds = append(deadBuilds, &cp)
+		}
+		return nil
+	})
+	for _, b := range deadBuilds {
+		b.State, b.Reason = BuildError, "node disconnected"
+		_ = r.stores.PutBuild(ctx, b)
+	}
 	for _, id := range dead {
 		_ = r.stores.DeleteNode(ctx, id)
 	}
-	r.log.Warn("registry: swept dead nodes", "nodes", dead, "sandboxes_reset", len(reset))
+	r.log.Warn("registry: swept dead nodes", "nodes", dead, "sandboxes_reset", len(reset), "builds_errored", len(deadBuilds))
 }
 
 func (r *Registry) dropSID(sid string) {

@@ -156,6 +156,7 @@ func (o *Orchestrator) TriggerBuild(ctx context.Context, apiKey, tid, bid string
 // pull token (api_headers, opaque, manifest-key-sealed) > the SDK's fromImageRegistry
 // (cleartext username/password) > the tenant default (manifest_keys) > anonymous.
 func (o *Orchestrator) resolveBuildCreds(ctx context.Context, b *types.Build, pullToken, regUser, regPass string) (string, error) {
+	clusterAuth, isCluster := o.clusterBuildCreds(b.BuildID)
 	var creds regcreds.Creds
 	switch {
 	case pullToken != "":
@@ -166,6 +167,10 @@ func (o *Orchestrator) resolveBuildCreds(ctx context.Context, b *types.Build, pu
 		creds = c
 	case regUser != "":
 		creds = regcreds.Creds{Username: regUser, Password: regPass}
+	case isCluster:
+		// Cluster build: use the registry-delivered transient creds (cluster.md §7.5),
+		// not the node's stored registry_auth_enc.
+		creds = regcreds.CredsForImage(clusterAuth, b.FromImage)
 	default:
 		authJSON, err := o.st.RegistryAuthForKey(ctx, b.ManifestKey)
 		if err != nil {
@@ -265,6 +270,7 @@ func (o *Orchestrator) BuildPool(ctx context.Context, interval time.Duration) {
 					<-sem
 					continue
 				}
+				o.publishBuildState(b.BuildID, "building", "", "")
 				go func(b *types.Build) {
 					defer func() { <-sem }()
 					o.executeBuild(ctx, b)
@@ -315,6 +321,7 @@ func (o *Orchestrator) executeBuild(ctx context.Context, b *types.Build) {
 		// and the detail lives in the log, not a duplicated BuildException tail.
 		b.Status, b.Reason = types.BuildError, "build failed; see build logs"
 		_ = o.st.PutBuild(ctx, b)
+		o.publishBuildState(b.BuildID, "error", "", b.Reason)
 		o.log.Warn("build failed", "bid", b.BuildID, "err", res.Error)
 		return
 	case err != nil:
@@ -323,6 +330,7 @@ func (o *Orchestrator) executeBuild(ctx context.Context, b *types.Build) {
 		// side error directly, it is the only signal.
 		b.Status, b.Reason = types.BuildError, err.Error()
 		_ = o.st.PutBuild(ctx, b)
+		o.publishBuildState(b.BuildID, "error", "", b.Reason)
 		o.log.Warn("build failed", "bid", b.BuildID, "err", err)
 		return
 	}
@@ -336,6 +344,7 @@ func (o *Orchestrator) executeBuild(ctx context.Context, b *types.Build) {
 	default:
 		b.Status, b.Reason = types.BuildError, "build produced no artifact"
 		_ = o.st.PutBuild(ctx, b)
+		o.publishBuildState(b.BuildID, "error", "", b.Reason)
 		return
 	}
 	b.StartCmd, b.ReadyCmd = res.StartCmd, res.ReadyCmd
@@ -343,6 +352,7 @@ func (o *Orchestrator) executeBuild(ctx context.Context, b *types.Build) {
 	b.Names = appendUnique(b.Names, b.PersistID)
 	b.Aliases = appendUnique(b.Aliases, b.PersistID)
 	_ = o.st.PutBuild(ctx, b)
+	o.publishBuildState(b.BuildID, "ready", b.PersistID, "")
 	o.log.Info("build ready", "bid", b.BuildID, "template", b.PersistID)
 }
 

@@ -58,12 +58,28 @@ type SelectorPatch struct {
 // command just carries the intent) and reports the terminal state on the route
 // stream; a Reserve waits on that route event, not the ack.
 const (
-	CmdCreate  = "create"   // boot a sandbox (cold template restore, or migration import+restore)
-	CmdConnect = "connect"  // resume a node-local PAUSED sandbox
-	CmdDelete  = "delete"   // destroy a sandbox (kill, or the SAVED two-phase reclaim step)
-	CmdKeyPut  = "key_put"  // install / renew a manifest-key lease (reconcile re-sends; cluster.md §7.6)
-	CmdKeyDrop = "key_drop" // drop a key lease
+	CmdCreate        = "create"         // boot a sandbox (cold template restore, or migration import+restore)
+	CmdConnect       = "connect"        // resume a node-local PAUSED sandbox
+	CmdDelete        = "delete"         // destroy a sandbox (kill, or the SAVED two-phase reclaim step)
+	CmdKeyPut        = "key_put"        // install / renew a manifest-key lease (reconcile re-sends; cluster.md §7.6)
+	CmdKeyDrop       = "key_drop"       // drop a key lease
+	CmdBuildRegister = "build_register" // pre-provision a build on the node (registry-assigned ids, §7.5)
 )
+
+// TypeBuildEvent: node -> registry, a build's state transition (cluster.md §5.1);
+// the registry converges the BuildStore (§6.1) + releases the build's reserved
+// resources on a terminal state.
+const TypeBuildEvent = "build_event"
+
+// BuildEvent reports a build's state up the node-link (§5.1). State is one of
+// registered/building/ready/error; TemplateID carries the persist id on ready.
+type BuildEvent struct {
+	BuildID    string `json:"build_id"`
+	Group      string `json:"group"`
+	State      string `json:"state"`
+	TemplateID string `json:"template_id,omitempty"`
+	Reason     string `json:"reason,omitempty"`
+}
 
 // CmdAck statuses.
 const (
@@ -120,6 +136,13 @@ type Command struct {
 	// key_put / key_drop
 	ManifestKey string `json:"manifest_key,omitempty"` // hex; only on key_put
 	ExpiresUnix int64  `json:"expires_unix,omitempty"` // lease expiry (key_put)
+	// build_register (§7.5): pre-provision a build with registry-assigned ids +
+	// reserved resources. ImageRepo/RegistryAuth are the group's image-pull creds,
+	// delivered WITH the build task and used transiently (never persisted on the node).
+	BuildID        string          `json:"build_id,omitempty"`
+	BuildResources *BuildResources `json:"build_resources,omitempty"`
+	ImageRepo      string          `json:"image_repo,omitempty"`
+	RegistryAuth   string          `json:"registry_auth,omitempty"` // docker config.json; transient
 }
 
 // CmdAck acknowledges a Command's receipt; the terminal outcome arrives via the

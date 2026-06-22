@@ -69,15 +69,30 @@ type Orchestrator struct {
 
 	clusterCtx context.Context // node-link async work lifetime (set by serve); nil = background
 	probe      ResourceProbe   // node water level for cluster heartbeat (set by serve when resource_listen on); nil = none
+
+	clusterBuildMu sync.Mutex
+	clusterBuilds  map[string]*clusterBuild     // build_id -> cluster build (group + transient image-pull creds, §7.5)
+	buildEvents    chan *routesync.BuildEvent   // node -> registry build state, drained by the node-link client
+}
+
+// clusterBuild is a registry-driven build's node-side context: its group (for
+// build events) + the transient image-pull creds (used for this build only, never
+// persisted — cluster.md §7.5).
+type clusterBuild struct {
+	group        string
+	imageRepo    string
+	registryAuth string
 }
 
 func New(cfg *config.Config, st *store.Store, lc launcher.Launcher, vs vsClient, log *slog.Logger) *Orchestrator {
 	o := &Orchestrator{
 		cfg: cfg, st: st, lc: lc, vs: vs, log: log,
-		reg:          map[string]*types.Sandbox{},
-		subs:         map[int]chan routesync.Event{},
-		pend:         map[string]*pendingBuild{},
-		savedPending: map[string]string{},
+		reg:           map[string]*types.Sandbox{},
+		subs:          map[int]chan routesync.Event{},
+		pend:          map[string]*pendingBuild{},
+		savedPending:  map[string]string{},
+		clusterBuilds: map[string]*clusterBuild{},
+		buildEvents:   make(chan *routesync.BuildEvent, 64),
 	}
 	if fc := cfg.Builder.FilesStorage; fc != nil {
 		fs, err := filestore.New(fc)

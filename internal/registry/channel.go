@@ -94,6 +94,12 @@ func (r *Registry) ServeNodeLink(w http.ResponseWriter, req *http.Request) {
 			// Command receipt: wakes a sendAndWait (key gating) or fast-fails a
 			// rejected lifecycle command's Reserve (cluster.md §5.1).
 			r.ackCommand(m.Ack)
+		case routesync.TypeBuildEvent:
+			// Build state transition: converge the BuildStore (§7.5); a terminal
+			// state releases the build's reserved node resources.
+			if m.Build != nil {
+				r.applyBuildEvent(ctx, m.Build)
+			}
 		case routesync.TypeBookmark:
 			// initial-sync marker; the route stream itself converges state.
 		}

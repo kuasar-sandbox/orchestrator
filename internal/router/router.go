@@ -206,8 +206,20 @@ func (rt *Router) handleCreate(w http.ResponseWriter, r *http.Request) {
 
 // --- build control plane ---
 
-// handleBuildRegister reserves a build node for the group, forwards the register
-// to it, and records build_id -> node so the follow-up build calls route there.
+// buildReserveResult mirrors registry.BuildReserveResult (the registry assigns the
+// build/template ids + places the build, §7.5).
+type buildReserveResult struct {
+	BuildID      string `json:"build_id"`
+	TemplateID   string `json:"template_id"`
+	NodeID       string `json:"node_id"`
+	DataEndpoint string `json:"data_endpoint"`
+}
+
+// handleBuildRegister reserves + pre-provisions a build via the registry (which
+// assigns the ids, resource-aware-places it, RESERVES the node's build pool, and
+// sends build_register with the image-pull creds, §7.5), then synthesizes the e2b
+// register response from the registry's ids — it does NOT forward the register to
+// the node (the node already holds the build).
 func (rt *Router) handleBuildRegister(w http.ResponseWriter, r *http.Request) {
 	group := r.Header.Get(HeaderGroup)
 	if group == "" {
@@ -217,33 +229,75 @@ func (rt *Router) handleBuildRegister(w http.ResponseWriter, r *http.Request) {
 	if !rt.authorize(w, r.Context(), group, r.Header.Get(HeaderAPIKey)) {
 		return
 	}
-	res, err := rt.opReserveBuild(r.Context(), group)
+	var body struct {
+		Name     string   `json:"name"`
+		Tags     []string `json:"tags"`
+		CPUCount int      `json:"cpuCount"`
+		MemoryMB int      `json:"memoryMB"`
+	}
+	_ = json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body)
+	var resources *buildResources
+	if body.CPUCount > 0 || body.MemoryMB > 0 {
+		resources = &buildResources{CPU: body.CPUCount * 1000, Mem: int64(body.MemoryMB) << 20}
+	}
+	res, err := rt.opReserveBuild(r.Context(), group, resources)
 	if err != nil {
 		rt.log.Warn("router: reserve-build", "group", group, "err", err)
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
 	}
-	rt.forwardBuild(w, r, res.DataEndpoint, true)
+	rt.buildsMu.Lock()
+	rt.builds[res.BuildID] = buildEntry{node: res.DataEndpoint, at: time.Now()}
+	rt.buildsMu.Unlock()
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusAccepted)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"templateID": res.TemplateID, "buildID": res.BuildID,
+		"public": false, "names": nonEmptySlice(body.Name), "tags": body.Tags, "aliases": body.Tags,
+	})
+}
+
+// buildResources mirrors routesync.BuildResources for the op request body.
+type buildResources struct {
+	CPU     int   `json:"cpu,omitempty"`
+	Mem     int64 `json:"mem,omitempty"`
+	Storage int64 `json:"storage,omitempty"`
+}
+
+func nonEmptySlice(s string) []string {
+	if s == "" {
+		return []string{}
+	}
+	return []string{s}
 }
 
 // handleBuildForward routes a build trigger/status/files call to the node that
-// holds the build (by build_id from the path).
+// holds the build (by build_id), resolving via the registry op on a local miss
+// (router restart: the in-memory build map is lost but the BuildStore persists).
 func (rt *Router) handleBuildForward(w http.ResponseWriter, r *http.Request) {
 	bid := extractBuildID(r.URL.Path)
 	rt.buildsMu.Lock()
 	e, ok := rt.builds[bid]
 	rt.buildsMu.Unlock()
+	node := e.node
 	if !ok {
-		http.Error(w, "unknown build "+bid, http.StatusNotFound)
-		return
+		res, rerr := rt.opResolveBuild(r.Context(), bid)
+		if rerr != nil || res.DataEndpoint == "" {
+			http.Error(w, "unknown build "+bid, http.StatusNotFound)
+			return
+		}
+		node = res.DataEndpoint
+		rt.buildsMu.Lock()
+		rt.builds[bid] = buildEntry{node: node, at: time.Now()}
+		rt.buildsMu.Unlock()
 	}
-	rt.forwardBuild(w, r, e.node, false)
+	rt.forwardBuild(w, r, node)
 }
 
-// forwardBuild proxies a build control call to a node's e2b control plane (Host
-// api.<domain>; the client's X-API-KEY passes through for the node's build auth).
-// When capture is set it records build_id -> node from the register reply.
-func (rt *Router) forwardBuild(w http.ResponseWriter, r *http.Request, dataEndpoint string, capture bool) {
+// forwardBuild proxies a build control call (trigger / status / files) to the node
+// holding the build (Host api.<domain>; the client's X-API-KEY passes through for
+// the node's build auth).
+func (rt *Router) forwardBuild(w http.ResponseWriter, r *http.Request, dataEndpoint string) {
 	target := &url.URL{Scheme: "http", Host: dataEndpoint}
 	proxy := httputil.NewSingleHostReverseProxy(target)
 	proxy.Transport = rt.fwdTransport
@@ -253,21 +307,6 @@ func (rt *Router) forwardBuild(w http.ResponseWriter, r *http.Request, dataEndpo
 		req.URL.Host = dataEndpoint
 		req.Host = apiHost
 		req.Header.Del(HeaderAccessTok) // builds authorize via X-API-KEY, not a client token
-	}
-	if capture {
-		proxy.ModifyResponse = func(resp *http.Response) error {
-			body, _ := io.ReadAll(resp.Body)
-			resp.Body = io.NopCloser(bytes.NewReader(body))
-			var reg struct {
-				BuildID string `json:"buildID"`
-			}
-			if json.Unmarshal(body, &reg) == nil && reg.BuildID != "" {
-				rt.buildsMu.Lock()
-				rt.builds[reg.BuildID] = buildEntry{node: dataEndpoint, at: time.Now()}
-				rt.buildsMu.Unlock()
-			}
-			return nil
-		}
 	}
 	proxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, e error) {
 		rt.log.Warn("router: build forward", "node", dataEndpoint, "err", e)
@@ -521,14 +560,40 @@ func (rt *Router) opReserve(ctx context.Context, group, routeKey string) (*reser
 	return &res, nil
 }
 
-func (rt *Router) opReserveBuild(ctx context.Context, group string) (*reserveResult, error) {
-	u := fmt.Sprintf("%s/op/reserve-build?group=%s", rt.opBase, url.QueryEscape(group))
-	var res reserveResult
-	if err := rt.opCall(ctx, http.MethodPost, u, &res); err != nil {
+func (rt *Router) opReserveBuild(ctx context.Context, group string, resources *buildResources) (*buildReserveResult, error) {
+	reqBody, _ := json.Marshal(map[string]any{"group": group, "resources": resources})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, rt.opBase+OpReserveBuildPath, bytes.NewReader(reqBody))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := rt.opClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return nil, fmt.Errorf("op reserve-build: %s: %s", resp.Status, strings.TrimSpace(string(b)))
+	}
+	var res buildReserveResult
+	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
 		return nil, err
 	}
 	return &res, nil
 }
+
+func (rt *Router) opResolveBuild(ctx context.Context, buildID string) (*buildReserveResult, error) {
+	u := fmt.Sprintf("%s/op/build?build_id=%s", rt.opBase, url.QueryEscape(buildID))
+	var res buildReserveResult
+	if err := rt.opCall(ctx, http.MethodGet, u, &res); err != nil {
+		return nil, err
+	}
+	return &res, nil
+}
+
+// OpReserveBuildPath mirrors the registry op path (avoids importing the registry).
+const OpReserveBuildPath = "/op/reserve-build"
 
 func (rt *Router) opRoute(ctx context.Context, sid string) (*routeResolve, error) {
 	u := fmt.Sprintf("%s/op/route?sid=%s", rt.opBase, url.QueryEscape(sid))

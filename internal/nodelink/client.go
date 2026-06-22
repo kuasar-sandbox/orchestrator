@@ -35,6 +35,9 @@ type Node interface {
 	// sent periodically so the registry tracks liveness (the dead-node sweep) and
 	// placement headroom (cluster.md §5.1 / §11).
 	Heartbeat() *routesync.Heartbeat
+	// BuildEvents streams the node's build state transitions (registered/building/
+	// ready/error) up to the registry, which converges the BuildStore (§5.1/§7.5).
+	BuildEvents() <-chan *routesync.BuildEvent
 }
 
 // Client is a node's node-link client: it dials the registry, registers the
@@ -171,6 +174,29 @@ func (c *Client) session(ctx context.Context, tr *http2.Transport) error {
 				}
 				select {
 				case outbox <- &routesync.Msg{Type: routesync.TypeHeartbeat, Beat: hb}:
+				case <-sctx.Done():
+					return
+				}
+			}
+		}
+	}()
+	// Build events (node -> registry): the BuildStore converges from these + releases
+	// reserved resources on a terminal state (cluster.md §5.1 / §7.5).
+	go func() {
+		evs := c.node.BuildEvents()
+		if evs == nil {
+			return
+		}
+		for {
+			select {
+			case <-sctx.Done():
+				return
+			case ev := <-evs:
+				if ev == nil {
+					continue
+				}
+				select {
+				case outbox <- &routesync.Msg{Type: routesync.TypeBuildEvent, Build: ev}:
 				case <-sctx.Done():
 					return
 				}

@@ -15,7 +15,8 @@ import (
 const (
 	OpReservePath      = "/op/reserve"       // POST ?group=&route_key= -> ReserveResult
 	OpRoutePath        = "/op/route"         // GET  ?sid=              -> RouteResolve
-	OpReserveBuildPath = "/op/reserve-build" // POST ?group=            -> ReserveResult (build node)
+	OpReserveBuildPath = "/op/reserve-build" // POST {group,resources,metadata} -> BuildReserveResult
+	OpBuildPath        = "/op/build"         // GET  ?build_id=         -> BuildReserveResult (resolve)
 	OpGroupPath        = "/op/group"         // POST ?group=&template_ref= -> set template_ref
 	OpListPath         = "/op/list"          // GET  ?group=            -> the group's sandbox shard
 	OpVerifyKeyPath    = "/op/verify-key"    // GET  ?group=&api_key=   -> 200 valid / 403 invalid
@@ -39,6 +40,7 @@ func (r *Registry) ServeOp(mux *http.ServeMux) {
 	mux.HandleFunc(OpReservePath, r.serveReserve)
 	mux.HandleFunc(OpRoutePath, r.serveRoute)
 	mux.HandleFunc(OpReserveBuildPath, r.serveReserveBuild)
+	mux.HandleFunc(OpBuildPath, r.serveBuild) // resolve build_id -> node (router restart)
 	mux.HandleFunc(OpGroupPath, r.serveGroup)
 	mux.HandleFunc(OpListPath, r.serveList)
 	mux.HandleFunc(OpVerifyKeyPath, r.serveVerifyKey)
@@ -96,9 +98,27 @@ func (r *Registry) serveList(w http.ResponseWriter, req *http.Request) {
 }
 
 func (r *Registry) serveReserveBuild(w http.ResponseWriter, req *http.Request) {
-	res, err := r.ReserveBuild(req.Context(), req.URL.Query().Get("group"))
+	var br BuildReserveReq
+	if err := json.NewDecoder(req.Body).Decode(&br); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if br.Group == "" {
+		br.Group = req.URL.Query().Get("group")
+	}
+	res, err := r.ReserveBuild(req.Context(), br)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+	writeJSON(w, res)
+}
+
+// serveBuild resolves a build_id to its node (router restart recovery, §7.5).
+func (r *Registry) serveBuild(w http.ResponseWriter, req *http.Request) {
+	res, found := r.ResolveBuild(req.Context(), req.URL.Query().Get("build_id"))
+	if !found {
+		http.Error(w, "build not found", http.StatusNotFound)
 		return
 	}
 	writeJSON(w, res)

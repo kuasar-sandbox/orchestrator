@@ -126,6 +126,7 @@ type Msg struct {
 	PlaceReq    *PlaceReq      `json:"place_req,omitempty"`
 	PlaceResult *PlaceResult   `json:"place_result,omitempty"`
 	Patch       *SelectorPatch `json:"selector_patch,omitempty"`
+	Build       *BuildEvent    `json:"build_event,omitempty"` // node -> registry build state (§5.1/§7.5)
 }
 
 // Hello is the orchestrator's first down-frame; it carries the operational Policy.

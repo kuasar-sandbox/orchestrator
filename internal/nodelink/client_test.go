@@ -47,6 +47,7 @@ func (n *fakeNode) Subscribe() (<-chan routesync.Event, func()) { return n.event
 func (n *fakeNode) OnWake(ctx context.Context, sid string)      {}
 func (n *fakeNode) Policy() routesync.Policy                    { return routesync.Policy{} }
 func (n *fakeNode) Heartbeat() *routesync.Heartbeat             { return &routesync.Heartbeat{} }
+func (n *fakeNode) BuildEvents() <-chan *routesync.BuildEvent   { return nil }
 
 func (n *fakeNode) HandleCommand(ctx context.Context, cmd *routesync.Command) *routesync.CmdAck {
 	ack := &routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted}

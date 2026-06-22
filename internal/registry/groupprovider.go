@@ -47,9 +47,19 @@ func (p storePlacement) Placement(ctx context.Context, group string) (groupcfg.P
 // default; exported so the scaler / tests can use it without the full resolver).
 func StorePlacement(s *Stores) groupcfg.PlacementProvider { return storePlacement{s} }
 
+type storeImagePull struct{ s *Stores }
+
+func (p storeImagePull) ImagePull(ctx context.Context, group string) (groupcfg.ImagePull, bool, error) {
+	g, found, err := p.s.GetGroupByID(ctx, group)
+	if err != nil || !found {
+		return groupcfg.ImagePull{}, found, err
+	}
+	return groupcfg.ImagePull{ImageRepo: g.ImageRepo, RegistryAuth: g.RegistryAuth}, true, nil
+}
+
 // storeResolver is the all-store resolver (the registry default).
 func storeResolver(s *Stores) groupcfg.Resolver {
-	return groupcfg.Resolver{Key: storeKey{s}, Sandbox: storeSandbox{s}, Placement: storePlacement{s}}
+	return groupcfg.Resolver{Key: storeKey{s}, Sandbox: storeSandbox{s}, Placement: storePlacement{s}, ImagePull: storeImagePull{s}}
 }
 
 // NewGroupResolver builds a resolver, picking store vs external per fine-grained
@@ -65,6 +75,9 @@ func NewGroupResolver(cfg clustercfg.GroupConfigConfig, s *Stores, ttl time.Dura
 	}
 	if _, ext, addr := cfg.ProviderFor(clustercfg.ProviderPlacement); ext {
 		r.Placement = groupcfg.NewExternalPlacement(addr, extTLS, ttl)
+	}
+	if _, ext, addr := cfg.ProviderFor(clustercfg.ProviderImagePull); ext {
+		r.ImagePull = groupcfg.NewExternalImagePull(addr, extTLS, ttl)
 	}
 	return r
 }

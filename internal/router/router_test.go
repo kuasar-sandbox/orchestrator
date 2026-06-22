@@ -46,7 +46,9 @@ func TestBuildRoutingThroughRouter(t *testing.T) {
 	op := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/op/reserve-build":
-			_ = json.NewEncoder(w).Encode(reserveResult{NodeID: "n1", DataEndpoint: nodeHost})
+			// The registry assigns the build/template ids + places it (§7.5); the
+			// router synthesizes the e2b register response and routes follow-ups.
+			_ = json.NewEncoder(w).Encode(buildReserveResult{BuildID: "b1", TemplateID: "t1", NodeID: "n1", DataEndpoint: nodeHost})
 		case "/op/verify-key":
 			w.WriteHeader(http.StatusOK)
 		default:

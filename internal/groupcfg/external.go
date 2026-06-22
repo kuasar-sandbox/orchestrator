@@ -21,6 +21,7 @@ const (
 	pathKey       = "/groupcfg/key"
 	pathSandbox   = "/groupcfg/sandbox-config"
 	pathPlacement = "/groupcfg/placement"
+	pathImagePull = "/groupcfg/image-pull"
 )
 
 // func adapters so a closure satisfies a provider interface.
@@ -37,6 +38,12 @@ func (f sandboxFunc) SandboxConfig(ctx context.Context, g string) (SandboxConfig
 type placementFunc func(context.Context, string) (Placement, bool, error)
 
 func (f placementFunc) Placement(ctx context.Context, g string) (Placement, bool, error) {
+	return f(ctx, g)
+}
+
+type imagePullFunc func(context.Context, string) (ImagePull, bool, error)
+
+func (f imagePullFunc) ImagePull(ctx context.Context, g string) (ImagePull, bool, error) {
 	return f(ctx, g)
 }
 
@@ -70,6 +77,16 @@ func NewExternalPlacement(addr string, tlsCfg *tls.Config, ttl time.Duration) Pl
 		return p, ok, err
 	})
 	return placementFunc(c.lookup)
+}
+
+func NewExternalImagePull(addr string, tlsCfg *tls.Config, ttl time.Duration) ImagePullProvider {
+	base, client := httpClient(addr, tlsCfg)
+	c := newCache(ttl, func(ctx context.Context, g string) (ImagePull, bool, error) {
+		var ip ImagePull
+		ok, err := getJSON(ctx, client, base, pathImagePull, g, &ip)
+		return ip, ok, err
+	})
+	return imagePullFunc(c.lookup)
 }
 
 func httpClient(addr string, tlsCfg *tls.Config) (string, *http.Client) {

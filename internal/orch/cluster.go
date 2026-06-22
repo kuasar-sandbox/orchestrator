@@ -76,6 +76,15 @@ func (o *Orchestrator) HandleCommand(ctx context.Context, cmd *routesync.Command
 			return reject(cmd, err)
 		}
 		return accept(cmd)
+	case routesync.CmdBuildRegister:
+		// Pre-provision a registry-assigned build (cluster.md §7.5): create the build
+		// record with the registry's ids + resolved key, stash the image-pull creds
+		// for this build, and report `registered` up. The e2b trigger (router-
+		// forwarded) then runs it; state flows back as build events.
+		if err := o.registerClusterBuild(ctx, cmd); err != nil {
+			return reject(cmd, err)
+		}
+		return accept(cmd)
 	default:
 		return reject(cmd, fmt.Errorf("unhandled command kind %q", cmd.Kind))
 	}
@@ -94,6 +103,78 @@ type ResourceProbe interface {
 
 // SetResourceProbe wires the node water-level source for the cluster heartbeat.
 func (o *Orchestrator) SetResourceProbe(p ResourceProbe) { o.probe = p }
+
+// registerClusterBuild pre-provisions a build the registry assigned + placed here
+// (cluster.md §7.5): resolve the tenant key by the predistributed fingerprint,
+// create the build record under the registry's ids, stash the transient image-pull
+// creds, and report `registered` up the node-link.
+func (o *Orchestrator) registerClusterBuild(ctx context.Context, cmd *routesync.Command) error {
+	if cmd.BuildID == "" || cmd.TemplateRef == "" {
+		return fmt.Errorf("build_register: missing build_id / template_id")
+	}
+	manifestKey, err := o.resolveByFingerprint(ctx, cmd.KeyFingerprint)
+	if err != nil {
+		return err
+	}
+	b := &types.Build{
+		BuildID:     cmd.BuildID,
+		TemplateID:  cmd.TemplateRef,
+		ManifestKey: manifestKey,
+		Profile:     types.ProfileE2B,
+		Kind:        types.KindImg,
+		Status:      types.BuildRegistered,
+		FromImage:   o.imageURIFromMask(cmd.TemplateRef, cmd.BuildID),
+		Metadata:    cmd.Config,
+		CreatedUnix: time.Now().Unix(),
+	}
+	if err := o.st.PutBuild(ctx, b); err != nil {
+		return err
+	}
+	o.clusterBuildMu.Lock()
+	o.clusterBuilds[cmd.BuildID] = &clusterBuild{group: cmd.Group, imageRepo: cmd.ImageRepo, registryAuth: cmd.RegistryAuth}
+	o.clusterBuildMu.Unlock()
+	o.publishBuildState(cmd.BuildID, "registered", "", "")
+	return nil
+}
+
+// BuildEvents is the node-link client's source of build state transitions
+// (nodelink.Node); the client streams them to the registry (§5.1).
+func (o *Orchestrator) BuildEvents() <-chan *routesync.BuildEvent { return o.buildEvents }
+
+// publishBuildState emits a build event for a cluster build (no-op for a non-
+// cluster, e.g. single-node, build). Non-blocking: a full buffer drops the event
+// (the registry reconverges from the next transition / the router's status).
+func (o *Orchestrator) publishBuildState(buildID, state, templateID, reason string) {
+	o.clusterBuildMu.Lock()
+	cb := o.clusterBuilds[buildID]
+	o.clusterBuildMu.Unlock()
+	if cb == nil {
+		return // not a cluster-driven build
+	}
+	ev := &routesync.BuildEvent{BuildID: buildID, Group: cb.group, State: state, TemplateID: templateID, Reason: reason}
+	select {
+	case o.buildEvents <- ev:
+	default:
+	}
+	if state == "ready" || state == "error" {
+		o.clusterBuildMu.Lock()
+		delete(o.clusterBuilds, buildID) // terminal: drop the transient creds
+		o.clusterBuildMu.Unlock()
+	}
+}
+
+// clusterBuildCreds returns a cluster build's transient image-pull creds (registry
+// auth) if it is registry-driven, so resolveBuildCreds uses them instead of the
+// node's stored registry_auth_enc (cluster.md §7.5: creds are not persisted here).
+func (o *Orchestrator) clusterBuildCreds(buildID string) (string, bool) {
+	o.clusterBuildMu.Lock()
+	defer o.clusterBuildMu.Unlock()
+	cb := o.clusterBuilds[buildID]
+	if cb == nil {
+		return "", false
+	}
+	return cb.registryAuth, true
+}
 
 // Heartbeat reports the node's water level for the registry (nodelink.Node):
 // sandbox count + (when resource_listen is on) zone/allocated/pool/draining, and

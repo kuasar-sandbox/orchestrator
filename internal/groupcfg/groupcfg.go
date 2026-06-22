@@ -34,6 +34,16 @@ type Placement struct {
 	ShuffleLabels map[string]string   `json:"shuffle_labels,omitempty"`
 }
 
+// ImagePull is a group's build image-pull config: the default registry + its pull
+// credentials (a docker config.json). RegistryAuth is sensitive — like ManifestKey
+// it is sealed at rest by the store provider / passed through by an external
+// provider, and the registry delivers it WITH the build task (never persisted on
+// the node — cluster.md §7.5).
+type ImagePull struct {
+	ImageRepo    string `json:"image_repo,omitempty"`
+	RegistryAuth string `json:"registry_auth,omitempty"`
+}
+
 // The three provider interfaces. Each returns (value, found, err): found==false is
 // "no such group"; err!=nil is "provider unavailable" (callers map it to 503, not
 // a 403/404, so a provider blip doesn't masquerade as a missing group).
@@ -47,6 +57,9 @@ type (
 	PlacementProvider interface {
 		Placement(ctx context.Context, group string) (Placement, bool, error)
 	}
+	ImagePullProvider interface {
+		ImagePull(ctx context.Context, group string) (ImagePull, bool, error)
+	}
 )
 
 // Resolver bundles the three resolved providers (built by the registry from
@@ -55,6 +68,7 @@ type Resolver struct {
 	Key       KeyProvider
 	Sandbox   SandboxConfigProvider
 	Placement PlacementProvider
+	ImagePull ImagePullProvider
 }
 
 // cache is a generic single-flight-free TTL cache over a fetch func, shared by the

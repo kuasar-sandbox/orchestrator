@@ -66,6 +66,7 @@ const (
 	ProviderKey           = "key"            // GroupKeyProvider (project_id + manifest_key)
 	ProviderSandboxConfig = "sandbox_config" // GroupSandboxConfigProvider
 	ProviderPlacement     = "placement"      // GroupPlacementProvider (nodeSelectors + shuffle labels)
+	ProviderImagePull     = "image_pull"     // GroupImagePullProvider (image_repo + registry_auth, §7.5)
 )
 
 // ChannelConfig is the per-node node-link hub the registry holds.
@@ -187,6 +188,7 @@ func Default() Config {
 			ProviderKey:           ProviderStore,
 			ProviderSandboxConfig: ProviderStore,
 			ProviderPlacement:     ProviderStore,
+			ProviderImagePull:     ProviderStore,
 		}},
 		Channel: ChannelConfig{
 			Listen:            ":7700",
@@ -241,7 +243,7 @@ func (c *Config) applyDefaults() {
 	if c.GroupConfig.Providers == nil {
 		c.GroupConfig.Providers = d.GroupConfig.Providers
 	} else {
-		for _, k := range []string{ProviderKey, ProviderSandboxConfig, ProviderPlacement} {
+		for _, k := range []string{ProviderKey, ProviderSandboxConfig, ProviderPlacement, ProviderImagePull} {
 			if c.GroupConfig.Providers[k] == "" {
 				c.GroupConfig.Providers[k] = ProviderStore
 			}

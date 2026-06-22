@@ -27,7 +27,7 @@ const (
 	nodePrefix    = "node/"    // node/<node_id>              (global)
 	groupPrefix   = "group/"   // group/<group>               (config; manifest_key sealed)
 	sandboxPrefix = "sandbox/" // sandbox/<group>/<route_key> (group-sharded)
-	buildPrefix   = "build/"   // build/<group>/<build_id>    (Phase 5)
+	buildPrefix   = "build/"   // build/<esc(group)>/<build_id> (group-sharded, §6.1)
 )
 
 // SandboxState mirrors cluster.md §7.1 (no WARM; warm = remote snapshot + restore).
@@ -83,6 +83,7 @@ type GroupConfig struct {
 	Group         string              `json:"group"` // group path (the store key)
 	ProjectID     string              `json:"project_id,omitempty"`
 	ManifestKey   string              `json:"manifest_key,omitempty"` // hex; sealed on store, plain in memory
+	RegistryAuth  string              `json:"registry_auth,omitempty"` // build image-pull creds (docker config.json); sealed on store
 	SandboxConfig map[string]string   `json:"sandbox_config,omitempty"`
 	ImageRepo     string              `json:"image_repo,omitempty"`
 	TemplateRef   string              `json:"template_ref,omitempty"`
@@ -220,15 +221,24 @@ func (s *Stores) RangeAllSandboxes(ctx context.Context, fn func(*SandboxRecord) 
 
 func (s *Stores) PutGroup(ctx context.Context, g *GroupConfig) error {
 	stored := *g
-	if g.ManifestKey != "" {
+	if g.ManifestKey != "" || g.RegistryAuth != "" {
 		if s.box == nil {
-			return fmt.Errorf("registry: group %q has a manifest_key but no encryption box configured", g.Group)
+			return fmt.Errorf("registry: group %q has sealed secrets (manifest_key / registry_auth) but no encryption box configured", g.Group)
 		}
-		enc, err := s.box.EncryptString(g.ManifestKey)
-		if err != nil {
-			return err
+		if g.ManifestKey != "" {
+			enc, err := s.box.EncryptString(g.ManifestKey)
+			if err != nil {
+				return err
+			}
+			stored.ManifestKey = enc
 		}
-		stored.ManifestKey = enc
+		if g.RegistryAuth != "" {
+			enc, err := s.box.EncryptString(g.RegistryAuth)
+			if err != nil {
+				return err
+			}
+			stored.RegistryAuth = enc
+		}
 	}
 	b, err := json.Marshal(&stored)
 	if err != nil {
@@ -238,7 +248,30 @@ func (s *Stores) PutGroup(ctx context.Context, g *GroupConfig) error {
 	return err
 }
 
-// RangeGroups streams every group config (manifest_key decrypted) — the key
+// unsealGroup decrypts a group's sealed secrets (manifest_key + registry_auth) in
+// place. Both are sealed at rest by PutGroup; both are plain in memory.
+func (s *Stores) unsealGroup(g *GroupConfig) error {
+	if s.box == nil {
+		return nil
+	}
+	if g.ManifestKey != "" {
+		dec, err := s.box.DecryptString(g.ManifestKey)
+		if err != nil {
+			return fmt.Errorf("registry: decrypt group manifest_key: %w", err)
+		}
+		g.ManifestKey = dec
+	}
+	if g.RegistryAuth != "" {
+		dec, err := s.box.DecryptString(g.RegistryAuth)
+		if err != nil {
+			return fmt.Errorf("registry: decrypt group registry_auth: %w", err)
+		}
+		g.RegistryAuth = dec
+	}
+	return nil
+}
+
+// RangeGroups streams every group config (secrets decrypted) — the key
 // distributor reconciles predistribution leases over these (§7.6).
 func (s *Stores) RangeGroups(ctx context.Context, fn func(*GroupConfig) error) error {
 	return s.kv.Range(ctx, groupPrefix, func(kv clusterstore.KV) error {
@@ -246,19 +279,15 @@ func (s *Stores) RangeGroups(ctx context.Context, fn func(*GroupConfig) error) e
 		if err := json.Unmarshal(kv.Value, &g); err != nil {
 			return err
 		}
-		if g.ManifestKey != "" && s.box != nil {
-			dec, err := s.box.DecryptString(g.ManifestKey)
-			if err != nil {
-				return err
-			}
-			g.ManifestKey = dec
+		if err := s.unsealGroup(&g); err != nil {
+			return err
 		}
 		return fn(&g)
 	})
 }
 
-// GetGroupByID returns the group config for an exact group id (manifest_key
-// decrypted), or (nil,false) if absent.
+// GetGroupByID returns the group config for an exact group id (secrets decrypted),
+// or (nil,false) if absent.
 func (s *Stores) GetGroupByID(ctx context.Context, group string) (*GroupConfig, bool, error) {
 	kv, found, err := s.kv.Get(ctx, groupKey(group))
 	if err != nil || !found {
@@ -268,12 +297,8 @@ func (s *Stores) GetGroupByID(ctx context.Context, group string) (*GroupConfig, 
 	if err := json.Unmarshal(kv.Value, &g); err != nil {
 		return nil, false, err
 	}
-	if g.ManifestKey != "" && s.box != nil {
-		dec, err := s.box.DecryptString(g.ManifestKey)
-		if err != nil {
-			return nil, false, fmt.Errorf("registry: decrypt group manifest_key: %w", err)
-		}
-		g.ManifestKey = dec
+	if err := s.unsealGroup(&g); err != nil {
+		return nil, false, err
 	}
 	return &g, true, nil
 }
