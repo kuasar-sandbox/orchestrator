@@ -7,7 +7,7 @@ vhost-user-blk、内存快照 userfaultfd)与三种启动模式(镜像冷启动�
 Warm Pool),共享同一套基础设施:内容定义分块、收敛加密、内容寻址存储、分层缓存
 与二进制清单(Manifest)。
 
-实现按职责拆分为七个独立演进的子仓(§2.2),边界只暴露薄的、命名具体的纯 Go
+实现按职责拆分为六个独立演进的子仓(§2.2),边界只暴露薄的、命名具体的纯 Go
 导入面;本仓(kuasar-sandbox)是主项目,承载系统级文档、跨仓 e2e/perf 套件与
 发布聚合。本文是系统设计总览:平台解决什么问题、子系统如何分工协作、数据如何
 端到端流动、关键机制与取舍。模块级设计在各子仓 `docs/`,部署拓扑见
@@ -149,7 +149,7 @@ Warm Pool),共享同一套基础设施:内容定义分块、收敛加密、内�
 | **sandbox-runtime** | microVM 生命周期引擎:一沙箱一进程的沙箱控制(块设备/快照代理、内存统一持有、balloon 环)+ Guest 一号进程 | `sandbox-ctl`、`sandbox-init`、`sandbox-runtime.erofs` | `pkg/resource`(资源控制协议+Client) | `sandbox-runtime/docs/sandbox.md`、`sandbox-runtime.md` |
 | **sandbox-accelerator** | 存储加速 + 镜像构建:分块/收敛加密/清单库 + 内容寻址存储 + 分层缓存 + OCI → EROFS 确定性展平(远程拉取 + Referrers 幂等) | `manifest-ctl`、`store-ctl`、`cache-ctl`、`flatten-ctl` | `pkg/manifest`、`pkg/image`、`pkg/{cache,store}/client` | `sandbox-accelerator/docs/{manifest,store,cache,flatten}.md` |
 | **sandbox-vswitch** | eBPF/TC 虚拟交换机:单节点 4096 端口隔离网络 + tapfd 交接 | `vswitch-ctl`、`tapfd-get` | `pkg/tapfd`(fd 交接规约) | `sandbox-vswitch/docs/{vswitch,tapfd}.md` |
-| **sandbox-orchestrator** | 单机沙箱编排 + e2b 兼容 ingress:控制面 REST、envd-in-guest 反代、模板构建(沙箱内三阶段)、密钥派生 + 节点级资源守护(准入/额度分配/主动回收) | `node-ctl`、`cluster-ctl`、`e2b-key-ctl`、`sandbox-runtime-{e2b,builder}.erofs` | — | `sandbox-orchestrator/docs/{node,node-proxy,node-resource,cluster}.md` |
+| **sandbox-orchestrator** | 单机沙箱编排 + e2b 兼容 ingress:控制面 REST、envd-in-guest 反代、模板构建(沙箱内三阶段)、密钥派生 + 节点级资源守护(准入/额度分配/主动回收)+ 集群控制面(registry/router/scaler) | `node-ctl`、`cluster-ctl`、`e2b-key-ctl`、`sandbox-runtime-{e2b,builder}.erofs` | — | `sandbox-orchestrator/docs/{node,node-proxy,node-resource,cluster}.md` |
 | **sandbox-deps** | 原生依赖:定制 Guest 内核、VMM 补丁、erofs 工具 | `vmlinux`、`cloud-hypervisor`、`mkfs.erofs` | 构建脚本 + patches + configs | `sandbox-deps/docs/{cloud-hypervisor,sandbox-kernel,build}.md` |
 
 ### 2.3 依赖关系
@@ -472,8 +472,9 @@ salt 源于 Generation ID,一个机制同时回答三个问题:
 
 到达远端的请求 ≈ L1 miss 35% × L2 miss 0.1% ≈ 0.035%。
 
-- **L1 抗扫描**:LRU-k(k=2)——顺序扫描的 chunk 留在冷链表快速驱逐,频繁访问
-  的提升到热链表,避免大批量启动冲刷常驻热数据。
+- **L1 抗扫描**:强制准入(Put 不做 admission 拒绝)+ Count-Min Sketch 频率统计,
+  冷数据经存储引擎 CompactionFilter 后台物理删;无应用层 LRU/SLRU 队列,RocksDB
+  BlockCache 护住热数据,避免大批量启动冲刷常驻热数据。
 - **L2 纠删码降尾延迟**:数百 chunk 的启动场景下至少一次命中 L2 尾延迟的概率
   显著(§7.1)。每 chunk 编码为 5 分片(RS 4-of-5)分布到 5 节点,读取并行请求
   5 取最快 4 重建——最慢节点被自然丢弃,全延迟分布改善 ~20%,存储开销 25%

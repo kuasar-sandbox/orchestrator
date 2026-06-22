@@ -260,7 +260,7 @@ I/O,~10 s 量级。本设计的 sandbox-ctl 持有 memfd + SEEK_DATA/HOLE 扫驻
 | /vm.resume + vCPU 跑到第一个 TICK | ~250 ms |
 | 端到端(snapshot 时 TICK=10 → 接续到 TICK 13) | ~750 ms 实测窗口 |
 
-uffd 统计(restore 模式 = SparseSnapshotSource):
+uffd 统计(restore 模式 = StreamSnapshotSource):
 
 ```
 faults_absent        92
@@ -279,8 +279,8 @@ restore 比 cold-start 平均批小一半(96 vs 196):snapshot 文件 SEEK_HOLE �
 
 ### 2.6 优化机会(按收益预估)
 
-**SparseSnapshotSource 提供 RunLength 接口**(中,~30%):现 `extendBatch`
-对每个候选页调一次 `IsZero(off)`,256 次 bit lookup。SparseSnapshotSource
+**StreamSnapshotSource 提供 RunLength 接口**(中,~30%):现 `extendBatch`
+对每个候选页调一次 `IsZero(off)`,256 次 bit lookup。StreamSnapshotSource
 持有 `holeMap []uint64`,可以一次性算出"从 off 起同类连续多少页"
 (查 word 内 `bits.TrailingZeros64` / `LeadingZeros64`)。预计 restore 路径下
 batch_avg 从 96 提到 ~150-200。
