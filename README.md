@@ -8,10 +8,11 @@ e2b 兼容沙箱平台的**节点主机**与**集群控制面**,两个二进制�
   (沙箱准入、内存预算分配、主动回收,把固定虚拟规格下的物理密度推到单节点 3,000+ 沙箱),
   以及 **node-link 客户端**(接入集群)。既可独立运行,也可经 node-link 交由 cluster-ctl 编排。
 - **`cluster-ctl`**(集群)——面向大规模部署的控制面,把机群里数千个 `node-ctl` 聚合成一个
-  逻辑沙箱池:**registry**(状态权威 + 节点通道枢纽)、**router**(集群级数据面入口,按
-  sandbox-group + route-key 会话亲和转发)、**scaler**(P2C 放置 + 租户密钥分发)。沙箱按需
-  创建 / 恢复 / 迁移,空闲下沉到节点本机快照乃至远程快照(可移植、不绑节点)。registry 后端
-  可插拔(单进程内存 → etcd → multi-raft KV),sandbox-group 为天然分区键。
+  逻辑沙箱池,**三角色均为独立进程**(无同进程内存模式):**registry**(持久状态权威 + 节点通道
+  枢纽 + 租户密钥分发)、**router**(集群级数据面入口,按 sandbox-group + route-key 会话亲和
+  转发)、**scaler**(独立进程,拨 registry、订阅视图,经 scaler-link 反向应答 P2C 放置建议)。
+  沙箱按需创建 / 恢复 / 迁移,空闲下沉到节点本机快照乃至远程快照(可移植、不绑节点)。registry
+  后端可插拔(**sqlite → etcd → raft**,持久无内存模式),sandbox-group 为天然分区键。
 
 是 [kuasar-sandbox](https://github.com/kuasar-sandbox/kuasar-sandbox) 平台的北向入口、节点
 资源仲裁与集群编排器,独立演进。两类沙箱 profile:**e2b**(guest 内 envd,完整数据面)与
@@ -23,12 +24,12 @@ e2b 兼容沙箱平台的**节点主机**与**集群控制面**,两个二进制�
 | 路径 | 角色 |
 | --- | --- |
 | `cmd/node-ctl` | 节点主二进制:`serve`(daemon:控制面 + 数据面 + 可选 `resource_listen` 资源控制器 + node-link 客户端)/ `proxy`(外置数据面 worker)/ `run-sandbox`·`run-builder`(单元内启动器)/ `resource {status,list,drain,grant,reclaim}` / `config` / `manifest-key` / `export-sandbox`·`import-sandbox` / `version` |
-| `cmd/cluster-ctl` | 集群主二进制:`serve`(三角色共驻,内存 Store)/ `registry` / `router` / `scaler`(拆分部署)/ `group`(sandbox-group 配置)/ `config` / `version` |
+| `cmd/cluster-ctl` | 集群主二进制(三角色均独立进程):`registry`(持久状态权威 + 节点通道 + 密钥分发)/ `router`(e2b 入口)/ `scaler`(反向调用放置)/ `group`(sandbox-group 配置)/ `config` / `version` |
 | `cmd/e2b-key-ctl` | 纯派生凭据工具(无 DB/config):`gen-key` / `gen-apikey` / `fingerprint` / `seal-pull-token` |
 | `internal/orch` | 节点编排核心:生命周期、构建池、本节点路由权威、单元生成、重启对账 |
 | `internal/nodectl` | 资源控制器:两环仲裁、四级水位 + 应急池、cgroup 真相源对账恢复、审计 |
 | `internal/nodelink` | node-link 通道(serve ↔ registry):注册 / 心跳 / 沙箱事件 / 命令,帧化 JSON over h2c |
-| `internal/{registry,router,scaler}` | 集群三角色:注册表 + Reserve 状态机 / 数据面入口 / P2C 放置 + 密钥租约 |
+| `internal/{registry,router,scaler}` | 集群三角色:注册表 + Reserve 状态机 + 密钥租约分发 + BuildStore / e2b 数据面入口 / 独立进程反向调用 P2C 放置 |
 | `internal/api` | e2b 控制面 REST(X-API-KEY 鉴权、export/import 扩展) |
 | `internal/proxy` `internal/routetable` `internal/routesync` | 数据面 L7 反代(含 CONNECT 隧道)、订阅者本地路由表(park/wake、世代清扫)、路由同步协议(注册 + bookmark) |
 | `internal/configsock` | 本机控制 socket:task(LaunchSpec/BuildSpec)/ admin(manifest-key)/ plugin(proxy 注册 + 路由流)/ api 四平面,SO_PEERCRED 鉴权 |
@@ -53,7 +54,7 @@ make test                       # 单元测试;e2e 见 docs/node.md §16
 ## 快速开始
 
 ```bash
-# 租户凭据:根密钥入白名单,api key 给 SDK(独立模式;集群下密钥由 scaler 租约下发)
+# 租户凭据:根密钥入白名单,api key 给 SDK(独立模式;集群下密钥由 registry 租约预分发)
 MK=$(e2b-key-ctl gen-key)
 node-ctl manifest-key add "$MK" --label tenant-a
 export E2B_API_KEY=$(e2b-key-ctl gen-apikey "$MK")
@@ -62,8 +63,10 @@ export E2B_API_KEY=$(e2b-key-ctl gen-apikey "$MK")
 # 配 resource_listen 即内置资源控制器;配 cluster.registry 即接入集群
 node-ctl serve --config /etc/node-ctl/config.yaml
 
-# 可选:轻量集群控制面(单进程三角色,内存 Store)
-cluster-ctl serve --config /etc/cluster-ctl/config.yaml
+# 可选:集群控制面——三角色各为独立进程(registry 持久 sqlite;router/scaler 拨 registry op)
+cluster-ctl registry --config /etc/cluster-ctl/config.yaml
+cluster-ctl router   --config /etc/cluster-ctl/config.yaml
+cluster-ctl scaler   --config /etc/cluster-ctl/config.yaml
 
 # e2b SDK/CLI 直连本机(独立模式)
 export E2B_DOMAIN=sandboxes.example.com     # dev: E2B_API_URL/E2B_SANDBOX_URL http
@@ -85,5 +88,5 @@ python -c 'from e2b import Sandbox; s = Sandbox.create("e2b-img-<key>"); print(s
   注册表、Reserve 状态机、Store 接口与可扩展性。
 - [docs/cluster-router.md](docs/cluster-router.md) — 集群级数据面入口:e2b 头解析、调用方鉴权、
   Reserve 消费、两跳转发与 CONNECT、token 注入。
-- [docs/cluster-scaler.md](docs/cluster-scaler.md) — 放置(P2C / nodeSelectors)、manifest_key 租约
-  分发、drain 与迁移腾移。
+- [docs/cluster-scaler.md](docs/cluster-scaler.md) — 放置调度器(独立进程、反向调用):nodeSelectors +
+  shuffle-sharding(maglev)+ zone / 水位 / runtime 信号 + P2C、shuffle 选择器 patch-back、资源感知 PlaceBuild。

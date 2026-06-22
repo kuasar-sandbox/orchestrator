@@ -125,7 +125,7 @@ cluster-ctl scaler   [--config …] [--registry <addr>]
 | 字段 | 默认 | 说明 |
 |---|---|---|
 | `domain` | (必填) | 服务域;router 据此分流控制面 / 数据面 |
-| `store.kind` | `sqlite` | 注册表后端:`sqlite`(单机持久,最简)/ `etcd` / `raft`(§10);**无 `memory`** |
+| `store.kind` | `sqlite` | 注册表后端:**当前实现 `sqlite`**(单机持久,最简);`etcd` / `raft` 为接口预留(§10);**无 `memory`** |
 | `store.dsn` | `/var/lib/cluster/registry.db` | sqlite 路径 / etcd 端点 / raft 配置 |
 | `group_config.providers` | `store` | 细粒度 provider 选择(§6.2):每个接口(key / sandbox-config / placement)可 `store` 或 `external:<addr>` |
 | `group_config.encryption_key` | 空 | `store` 自存 manifest_key 时的 AES-256 落盘密钥(同 node.md §3,可 env 覆盖);全 `external` 时不需 |
