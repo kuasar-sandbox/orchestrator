@@ -12,8 +12,8 @@
 # It reuses e2e_execute's store/zot/vswitch/build setup to produce a real template,
 # then drives a sandbox THROUGH the cluster (router -> registry -> node-link ->
 # CreateCluster -> cloud-hypervisor) and checks the two-hop data path to envd. The
-# op interface runs over mTLS, placement via a standalone scaler (scaler.mode=
-# remote), and it exercises the SAVED two-phase migration (deep-idle promote ->
+# op interface runs over mTLS, placement via a standalone scaler (reverse-call
+# scaler-link, no in-process mode), and it exercises the SAVED two-phase migration (deep-idle promote ->
 # Reserve(token) -> import+restore).
 #
 # Needs systemd+root, /dev/kvm, the vswitch stack, store-ctl, zot, docker,
@@ -71,7 +71,6 @@ REG_PORT="$(free_port)"       # cluster-ctl registry node-link
 ROUTER_PORT="$(free_port)"    # cluster-ctl router ingress
 OP_PORT="$(free_port)"        # cluster-ctl registry op interface (TCP, mTLS)
 OP_LISTEN="127.0.0.1:$OP_PORT"
-SCALER_SOCK="$WORK/cluster/scaler.sock" # standalone scaler /scaler/place (scaler.mode=remote)
 command -v openssl >/dev/null 2>&1 || skip "openssl not on PATH (op-mTLS)"
 # One self-signed cert (its own CA; SAN 127.0.0.1; server+client EKU) for op mTLS:
 # the registry presents it (server side), the router/scaler/curl present it (client
@@ -161,7 +160,7 @@ channel: { listen: 127.0.0.1:$REG_PORT, heartbeat_interval: 2s, node_dead_after:
 op:
   listen: $OP_LISTEN
   tls: { cert: $OP_CERT, key: $OP_KEY, ca: $OP_CERT }
-scaler: { mode: remote, endpoint: $SCALER_SOCK, listen: $SCALER_SOCK, registry: $OP_LISTEN }
+scaler: { registry: $OP_LISTEN }
 reserve: { park_timeout: 90s }
 router: { listen: 127.0.0.1:$ROUTER_PORT, data_plane_auth: off }
 EOF
@@ -210,15 +209,12 @@ grep -q "node connected" "$WORK/registry.log" || { sed 's/^/  reg| /' "$WORK/reg
 echo "==> PASS: node joined the cluster (registry saw the node-link connection)"
 "$BIN/cluster-ctl" scaler --config "$WORK/cluster.yaml" >"$WORK/scaler.log" 2>&1 &
 PIDS+=($!)
-# Standalone scaler (scaler.mode=remote): it subscribes the registry's op node/group
-# view (over mTLS) and answers placement on its UDS — wait until its view syncs.
-for _ in $(seq 1 60); do
-    sc=$(curl -sS --noproxy '*' --unix-socket "$SCALER_SOCK" -o /dev/null -w '%{http_code}' -X POST "http://scaler/scaler/place?group=$GROUP&route_key=probe" 2>/dev/null || echo 000)
-    [ "$sc" = "200" ] && break
-    sleep 0.5
-done
-[ "$sc" = "200" ] || { sed 's/^/  scaler| /' "$WORK/scaler.log" | tail -15; fail "standalone scaler view not ready (place probe=$sc)"; }
-echo "==> PASS: standalone scaler (mode=remote) ready — placement served over the op view (mTLS)"
+# Standalone scaler (no in-process mode): it DIALS the registry op endpoint (mTLS),
+# subscribes the node/group view, and answers the registry's reverse placement
+# requests over the scaler-link — wait until the registry sees the scaler connect.
+for _ in $(seq 1 60); do grep -q "scaler-link: scaler connected" "$WORK/registry.log" && break; sleep 0.5; done
+grep -q "scaler-link: scaler connected" "$WORK/registry.log" || { sed 's/^/  scaler| /' "$WORK/scaler.log" | tail -15; fail "standalone scaler never connected the scaler-link"; }
+echo "==> PASS: standalone scaler dialed the registry; placement answered over the reverse-call scaler-link (mTLS)"
 "$BIN/cluster-ctl" router --config "$WORK/cluster.yaml" >"$WORK/router.log" 2>&1 &
 PIDS+=($!); wait_port 127.0.0.1 "$ROUTER_PORT" router
 echo "==> cluster-ctl router up (:$ROUTER_PORT)"
@@ -333,4 +329,4 @@ done
 [ "$swept" = "1" ] && echo "==> PASS: registry swept the dead node's sandbox (op /route -> 404)" || { sed 's/^/  reg| /' "$WORK/registry.log" | tail -15; fail "dead-node sweep did not reset $SID"; }
 
 echo
-echo "==> e2e_cluster: OK   (op-mTLS + standalone scaler[mode=remote] + cluster build/create + SAVED migration + dead-node sweep; group $GROUP)"
+echo "==> e2e_cluster: OK   (op-mTLS + standalone scaler[reverse-call] + cluster build/create + SAVED migration + dead-node sweep; group $GROUP)"
