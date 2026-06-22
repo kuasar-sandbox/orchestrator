@@ -7,7 +7,22 @@ import (
 	"time"
 
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/nodectl"
+	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/orch"
 )
+
+// resourceProbe adapts the resource controller's State + AdmissionController to
+// orch.ResourceProbe, so the cluster heartbeat reports this node's water level.
+type resourceProbe struct {
+	state     *nodectl.State
+	admission *nodectl.AdmissionController
+}
+
+func (p resourceProbe) Zone() string          { return string(p.state.MemoryZone()) }
+func (p resourceProbe) AllocatedBytes() int64 { return int64(p.state.NodeAllocated().MemoryBytes) }
+func (p resourceProbe) PoolBytes() int64      { return int64(p.state.AllocatablePool.MemoryBytes) }
+func (p resourceProbe) Draining() bool        { return p.admission.IsDrained() }
+
+var _ orch.ResourceProbe = resourceProbe{}
 
 // startResourceController starts the in-process node resource controller — the
 // serve `resource_listen` sub-server (node-resource.md) — and runs it until ctx
@@ -16,17 +31,17 @@ import (
 // bound (the controller serves in a background goroutine), or an error if setup
 // fails. When resource_listen is disabled serve never calls this and sandboxes
 // fall back to static cgroup.
-func startResourceController(ctx context.Context, configPath, listenOverride string, slogger *slog.Logger) error {
+func startResourceController(ctx context.Context, configPath, listenOverride string, slogger *slog.Logger) (orch.ResourceProbe, error) {
 	cfg, err := nodectl.LoadDaemonConfig(configPath)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if listenOverride != "" {
 		cfg.Listen = listenOverride
 	}
 	resolved, err := cfg.Resolve()
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	state := nodectl.NewState(
@@ -63,7 +78,7 @@ func startResourceController(ctx context.Context, configPath, listenOverride str
 	}
 	if err := srv.Listen(); err != nil {
 		auditor.Close()
-		return err
+		return nil, err
 	}
 
 	// Wire the admission worker: it builds the reservation + AdmitResponse for a
@@ -99,5 +114,5 @@ func startResourceController(ctx context.Context, configPath, listenOverride str
 		admission.Stop()
 		auditor.Close()
 	}()
-	return nil
+	return resourceProbe{state: state, admission: admission}, nil
 }

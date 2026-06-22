@@ -68,6 +68,7 @@ type Orchestrator struct {
 	savedPending map[string]string // sid -> migration token (PAUSED->SAVED promote in flight, §7.4)
 
 	clusterCtx context.Context // node-link async work lifetime (set by serve); nil = background
+	probe      ResourceProbe   // node water level for cluster heartbeat (set by serve when resource_listen on); nil = none
 }
 
 func New(cfg *config.Config, st *store.Store, lc launcher.Launcher, vs vsClient, log *slog.Logger) *Orchestrator {

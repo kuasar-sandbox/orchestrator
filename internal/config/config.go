@@ -156,6 +156,7 @@ type UnitsConfig struct {
 // SandboxConfig is the sandbox-instance defaults, sub-grouped for clarity.
 type SandboxConfig struct {
 	TimeoutSec int             `yaml:"timeout_sec"` // default TTL; default 300
+	Capacity   int             `yaml:"capacity"`    // max sandboxes this node admits (cluster headroom denominator, §4.2); 0 = unbounded
 	Resources  ResourcesConfig `yaml:"resources"`   // capacity + resource control
 	Network    NetworkConfig   `yaml:"network"`     // vswitch + inner IP
 	Boot       BootConfig      `yaml:"boot"`        // boot artifacts (kernel / guest runtime / overlay)
@@ -172,6 +173,9 @@ type ResourcesConfig struct {
 // into whole MiB, for surfacing the VM's memory in e2b list/get responses. Returns
 // 0 if unset or unparseable (the value is informational, not an allocation knob).
 func (r ResourcesConfig) MemoryMiB() int { return parseMiB(r.Memory) }
+
+// MemoryMiB parses the build sandbox's memory into whole MiB (cluster build pool).
+func (b BuilderConfig) MemoryMiB() int { return parseMiB(b.Memory) }
 
 func parseMiB(s string) int {
 	s = strings.TrimSpace(s)

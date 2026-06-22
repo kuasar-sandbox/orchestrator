@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -80,14 +81,83 @@ func (o *Orchestrator) HandleCommand(ctx context.Context, cmd *routesync.Command
 	}
 }
 
-// Heartbeat reports the node's water level for the registry (nodelink.Node): the
-// live sandbox count (the placer's headroom-fallback signal). Memory/build pools
-// ride the resource controller; the cluster placer uses Counts.
+// ResourceProbe surfaces the node's water level for the cluster heartbeat. serve
+// sets it (an adapter over the resource controller) when resource_listen is on;
+// nil = no controller (static cgroup), then zone/water are reported as their
+// zero-load defaults and only the sandbox count + build alloc carry signal.
+type ResourceProbe interface {
+	Zone() string         // green | yellow | red | critical
+	AllocatedBytes() int64 // memory currently reserved
+	PoolBytes() int64      // allocatable memory pool
+	Draining() bool        // node-side drain set (node-resource.md §2.5)
+}
+
+// SetResourceProbe wires the node water-level source for the cluster heartbeat.
+func (o *Orchestrator) SetResourceProbe(p ResourceProbe) { o.probe = p }
+
+// Heartbeat reports the node's water level for the registry (nodelink.Node):
+// sandbox count + (when resource_listen is on) zone/allocated/pool/draining, and
+// the in-flight build resource alloc. The cluster placer (cluster-scaler.md §4.2)
+// excludes draining nodes, filters by zone, and ranks by the water level / count.
 func (o *Orchestrator) Heartbeat() *routesync.Heartbeat {
 	o.mu.Lock()
 	count := len(o.reg)
 	o.mu.Unlock()
-	return &routesync.Heartbeat{Counts: count}
+	hb := &routesync.Heartbeat{Counts: count, Zone: string(nodectlZoneGreen), BuildAlloc: o.buildAlloc()}
+	if p := o.probe; p != nil {
+		hb.Zone = p.Zone()
+		hb.Allocated = p.AllocatedBytes()
+		hb.Pool = p.PoolBytes()
+		hb.Draining = p.Draining()
+	}
+	return hb
+}
+
+// nodectlZoneGreen is the default zone reported when no resource controller is
+// present (a static-cgroup node is never "hot" from the cluster's view).
+const nodectlZoneGreen = "green"
+
+// buildAlloc is the in-flight build resource usage: live builds × the per-build
+// pool (builder vcpu/memory + diff_template scratch). Feeds resource-aware build
+// placement (cluster-scaler.md §4.5); nil when no builds are running.
+func (o *Orchestrator) buildAlloc() *routesync.BuildResources {
+	o.pendMu.Lock()
+	n := int64(len(o.pend))
+	o.pendMu.Unlock()
+	if n == 0 {
+		return nil
+	}
+	per := o.perBuildResources()
+	return &routesync.BuildResources{CPU: per.CPU * int(n), Mem: per.Mem * n, Storage: per.Storage * n}
+}
+
+// perBuildResources is one build sandbox's resource footprint from builder config.
+func (o *Orchestrator) perBuildResources() routesync.BuildResources {
+	storage := int64(0)
+	if fi, err := os.Stat(o.cfg.Builder.DiffTemplate); err == nil {
+		storage = fi.Size()
+	}
+	return routesync.BuildResources{
+		CPU:     o.cfg.Builder.VCPU * 1000, // milli-cores
+		Mem:     int64(o.cfg.Builder.MemoryMiB()) << 20,
+		Storage: storage,
+	}
+}
+
+// ClusterNodeInfo builds the static node-register fields for node-link (cluster.md
+// §5.1): max sandbox capacity (0 = unbounded), the build resource pool, and this
+// node's guest runtime digest (placement runtime-compat, §4.2).
+func (o *Orchestrator) ClusterNodeInfo() (capacity int, buildCap *routesync.BuildResources, runtimeDigest string) {
+	per := o.perBuildResources()
+	mc := o.cfg.Builder.MaxConcurrent
+	if mc <= 0 {
+		mc = 1
+	}
+	buildCap = &routesync.BuildResources{CPU: per.CPU * mc, Mem: per.Mem * int64(mc), Storage: per.Storage * int64(mc)}
+	if dig, err := sha256File(o.runtimeFileFor(types.ProfileE2B)); err == nil {
+		runtimeDigest = dig
+	}
+	return o.cfg.Sandbox.Capacity, buildCap, runtimeDigest
 }
 
 // SetClusterContext sets the lifetime for node-link async work (boots / resumes /

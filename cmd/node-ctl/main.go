@@ -139,9 +139,11 @@ func serve(args []string, log *slog.Logger) error {
 	// Optionally host the node resource controller in-process (resource_listen,
 	// node-resource.md). Disabled => sandboxes use static cgroup.
 	if cfg.ResourceListen.Enabled {
-		if err := startResourceController(ctx, cfg.ResourceListen.Config, cfg.ResourceListen.Socket, log); err != nil {
+		probe, err := startResourceController(ctx, cfg.ResourceListen.Config, cfg.ResourceListen.Socket, log)
+		if err != nil {
 			return fmt.Errorf("resource_listen: %w", err)
 		}
+		core.SetResourceProbe(probe) // cluster heartbeat reports this node's water level + drain
 	}
 
 	// Connect to the cluster registry over node-link (node.md §10) if configured:
@@ -171,11 +173,15 @@ func serve(args []string, log *slog.Logger) error {
 			clientTLS = ct
 		}
 		core.SetClusterContext(ctx) // node-link async work (boots) cancels on serve shutdown
+		capacity, buildCap, runtimeDigest := core.ClusterNodeInfo()
 		nl := nodelink.New(
 			func(dctx context.Context) (net.Conn, error) {
 				return (&net.Dialer{}).DialContext(dctx, "tcp", regAddr)
 			},
-			routesync.NodeRegister{NodeID: nodeID, Labels: cfg.Cluster.Labels, DataEndpoint: dataEndpoint},
+			routesync.NodeRegister{
+				NodeID: nodeID, Labels: cfg.Cluster.Labels, DataEndpoint: dataEndpoint,
+				Capacity: capacity, BuildCapacity: buildCap, RuntimeDigest: runtimeDigest,
+			},
 			core, hbInterval, clientTLS, log,
 		)
 		go nl.Run(ctx)
