@@ -104,9 +104,10 @@ E2ES=(
   "kuasar-sandbox/test/e2e/e2e_orchestrator_proxy.sh"
   # cluster tier (real microVM: router -> registry -> node-link)
   "kuasar-sandbox/test/e2e/e2e_cluster.sh"
-  # accelerator (2)
+  # accelerator (3)
   "sandbox-accelerator/test/e2e/e2e_cache.sh"
   "sandbox-accelerator/test/e2e/e2e_cluster_rolling.sh"
+  "sandbox-accelerator/test/e2e/e2e_store_cache_listen.sh"
 )
 
 # Perf + dedup-analysis helpers (same `../../bin` path convention).
@@ -116,10 +117,12 @@ PERFS=(
   "kuasar-sandbox/test/perf/sandbox-perf-manifest.sh"
   "kuasar-sandbox/test/perf/density-perf.sh"
   "kuasar-sandbox/test/perf/workload.py"
-  # accelerator bench/dedup helpers (3)
+  # accelerator bench/dedup helpers (5)
   "sandbox-accelerator/test/scripts/bench_cache.sh"
   "sandbox-accelerator/test/scripts/bench_cache_remote.sh"
   "sandbox-accelerator/test/scripts/dedup_report.sh"
+  "sandbox-accelerator/test/scripts/procmon.sh"
+  "sandbox-accelerator/test/scripts/proc_analyze.py"
 )
 
 # Deploy assets — operator-facing config + unit examples staged under
@@ -131,10 +134,13 @@ DEPLOYS=(
   "sandbox-orchestrator/deploy/node-proxy@.service"
 )
 
-# The e2b end-to-end demo (script + guide) — the headline "try it" walkthrough.
-# Relocate-safe (demo_e2b.sh uses ../../bin). Heavier host prereqs than the e2e
-# (e2b CLI + zot + docker + /dev/kvm + openssl + mkfs.ext4); it checks + skips.
+# The e2b end-to-end demo (prep + run scripts + guide) — the headline "try it"
+# walkthrough. demo_e2b.sh requires demo_prep.sh to have run first (it sources
+# the prep.env handoff demo_prep writes). Relocate-safe (both use ../../bin).
+# Heavier host prereqs than the e2e (e2b CLI + zot + docker + /dev/kvm + openssl
+# + mkfs.ext4); checks + skips.
 DEMOS=(
+  "kuasar-sandbox/test/demo/demo_prep.sh"
   "kuasar-sandbox/test/demo/demo_e2b.sh"
   "kuasar-sandbox/test/demo/DEMO.md"
 )
@@ -160,6 +166,25 @@ for f in "$UMBRELLA_DIR"/test/e2e/*.sh; do
   printf '%s\n' "${E2ES[@]}" | grep -q "/$b\$" && continue
   printf '%s\n' "${E2E_EXCLUDE[@]:-}" | grep -qx "$b" && continue
   missing+=("test/e2e/$b — not in E2ES or E2E_EXCLUDE (release manifest drift)")
+done
+# Same drift guard for the accelerator sub-repo scripts the release bundles —
+# its e2e (E2ES) and its bench/dedup helpers (PERFS). runtime/vswitch ship no
+# test scripts; orchestrator's sole e2e needs a source checkout (kept out).
+ACC_E2E_EXCLUDE=( "run.sh" )   # flatten-registry e2e: finds binaries via PATH/env, not the ../../bin convention; stays in the source repo
+for f in "$ORG"/sandbox-accelerator/test/e2e/*.sh; do
+  [ -e "$f" ] || continue
+  b="$(basename "$f")"
+  printf '%s\n' "${E2ES[@]}" | grep -q "/$b\$" && continue
+  printf '%s\n' "${ACC_E2E_EXCLUDE[@]:-}" | grep -qx "$b" && continue
+  missing+=("sandbox-accelerator/test/e2e/$b — not in E2ES or ACC_E2E_EXCLUDE (release manifest drift)")
+done
+ACC_SCRIPTS_EXCLUDE=()   # add basenames intentionally kept out of the release, with a reason
+for f in "$ORG"/sandbox-accelerator/test/scripts/*; do
+  [ -e "$f" ] || continue
+  b="$(basename "$f")"
+  printf '%s\n' "${PERFS[@]}" | grep -q "/$b\$" && continue
+  printf '%s\n' "${ACC_SCRIPTS_EXCLUDE[@]:-}" | grep -qx "$b" && continue
+  missing+=("sandbox-accelerator/test/scripts/$b — not in PERFS or ACC_SCRIPTS_EXCLUDE (release manifest drift)")
 done
 if [ "${#missing[@]}" -gt 0 ]; then
   echo "release.sh: missing inputs:" >&2
