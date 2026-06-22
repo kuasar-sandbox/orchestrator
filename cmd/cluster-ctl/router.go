@@ -14,6 +14,7 @@ import (
 
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
+	"golang.org/x/sys/unix"
 
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/clustercfg"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/router"
@@ -58,6 +59,7 @@ func runRouter(args []string, log *slog.Logger) error {
 	}
 	rt := router.New(opAddr, cfg.Domain, cfg.Router.AuthCacheDur(), opTLS, log)
 	rt.SetDataPlaneAuth(cfg.Router.DataPlaneAuth)
+	rt.SetAuthMode(cfg.Router.Auth)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -67,7 +69,34 @@ func runRouter(args []string, log *slog.Logger) error {
 	go rt.RunWatch(ctx)
 	go rt.RunCleanup(ctx) // evict expired auth-cache / stale build-map entries
 
-	ln, err := net.Listen("tcp", cfg.Router.Listen)
+	// Optional Prometheus metrics endpoint (router_requests_total{plane,result}, §10).
+	if cfg.Router.MetricsListen != "" {
+		mln, merr := net.Listen("tcp", cfg.Router.MetricsListen)
+		if merr != nil {
+			return fmt.Errorf("router: metrics listen %s: %w", cfg.Router.MetricsListen, merr)
+		}
+		mmux := http.NewServeMux()
+		mmux.HandleFunc("/metrics", rt.Metrics().Handler())
+		msrv := &http.Server{Handler: mmux}
+		go func() { <-ctx.Done(); msrv.Close() }()
+		go func() {
+			if e := msrv.Serve(mln); e != nil && e != http.ErrServerClosed {
+				log.Error("router metrics", "err", e)
+			}
+		}()
+	}
+
+	// SO_REUSEPORT so multiple same-host router replicas can share :443 (router §10).
+	lc := net.ListenConfig{Control: func(_, _ string, c syscall.RawConn) error {
+		var serr error
+		if err := c.Control(func(fd uintptr) {
+			serr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEPORT, 1)
+		}); err != nil {
+			return err
+		}
+		return serr
+	}}
+	ln, err := lc.Listen(ctx, "tcp", cfg.Router.Listen)
 	if err != nil {
 		return fmt.Errorf("router: listen %s: %w", cfg.Router.Listen, err)
 	}

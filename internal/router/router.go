@@ -27,6 +27,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/metrics"
 	proxypkg "github.com/kuasar-sandbox/sandbox-orchestrator/internal/proxy"
 )
 
@@ -69,7 +70,9 @@ const buildTTL = time.Hour
 // TCP) for reserve + route resolution.
 type Router struct {
 	domain        string
-	dataPlaneAuth string       // off | log | enforce — data-plane access-token check (§8)
+	authMode      string       // off | log | enforce — caller api_key auth (§8); default enforce
+	dataPlaneAuth string       // off | log | enforce — data-plane access-token check (§7)
+	mx            *metrics.M
 	opBase        string       // http base for the op interface
 	opClient      *http.Client // 60s timeout (reserve / route calls)
 	watchClient   *http.Client // no timeout (the long-lived route watch stream)
@@ -101,7 +104,7 @@ func New(opAddr, domain string, authTTL time.Duration, opTLS *tls.Config, log *s
 		authTTL = 60 * time.Second
 	}
 	rt := &Router{
-		domain: domain, log: log, authTTL: authTTL,
+		domain: domain, log: log, authTTL: authTTL, authMode: "enforce", mx: metrics.New(),
 		builds:   map[string]buildEntry{},
 		cache:    map[string]*routeResolve{},
 		keyToSID: map[string]string{},
@@ -135,6 +138,18 @@ func New(opAddr, domain string, authTTL time.Duration, opTLS *tls.Config, log *s
 // enforce); cluster-ctl router sets it from config before serving.
 func (rt *Router) SetDataPlaneAuth(mode string) { rt.dataPlaneAuth = mode }
 
+// SetAuthMode sets the caller api_key auth mode (off | log | enforce, §8): off
+// skips it (front with an external mTLS/JWT gateway), log warns but allows.
+func (rt *Router) SetAuthMode(mode string) {
+	if mode != "" {
+		rt.authMode = mode
+	}
+}
+
+// Metrics returns the router's metric registry (Prometheus text); cluster-ctl
+// serves it on router.metrics_listen.
+func (rt *Router) Metrics() *metrics.M { return rt.mx }
+
 // Handler routes by Host: api.<domain> (and any api.* host) -> control plane;
 // everything else -> data plane (<port>-<sid>.<domain>).
 func (rt *Router) Handler() http.Handler {
@@ -154,6 +169,7 @@ func (rt *Router) Handler() http.Handler {
 // --- control plane ---
 
 func (rt *Router) serveControl(w http.ResponseWriter, r *http.Request) {
+	rt.mx.Inc(`router_requests_total{plane="control"}`)
 	path := r.URL.Path
 	switch {
 	case r.Method == http.MethodPost && strings.HasSuffix(path, "/sandboxes"):
@@ -430,6 +446,12 @@ func extractSandboxID(path string) string {
 // --- data plane ---
 
 func (rt *Router) serveData(w http.ResponseWriter, r *http.Request, host string) {
+	// by-(group,route-key): business traffic with no prior create directly triggers
+	// a Reserve (router §4), addressed by headers rather than a <port>-<sid> host.
+	if g, rk := r.Header.Get(HeaderGroup), r.Header.Get(HeaderRouteKey); g != "" && rk != "" {
+		rt.serveDataByKey(w, r, g, rk)
+		return
+	}
 	sub := strings.TrimSuffix(host, "."+rt.domain)
 	if sub == host { // not under our domain
 		http.Error(w, "unknown host", http.StatusNotFound)
@@ -475,32 +497,60 @@ func (rt *Router) serveData(w http.ResponseWriter, r *http.Request, host string)
 			rt.log.Warn("router: data-plane token mismatch (log mode)", "sid", sid)
 		}
 	}
-	// CONNECT (raw TCP port-forward tunnel) cannot go through ReverseProxy; tunnel
-	// it explicitly to the node, carrying the authority + access token.
+	rt.forwardSandboxData(w, r, rr, r.Host, sid)
+}
+
+// forwardSandboxData two-hop forwards a data-plane request to the sandbox's node:
+// sandboxHost is the <port>-<sid>.<domain> authority the node proxy resolves from
+// (preserved for by-sid; synthesized for by-(group,route-key)). The access token
+// is injected; CONNECT is tunneled (ReverseProxy can't).
+func (rt *Router) forwardSandboxData(w http.ResponseWriter, r *http.Request, rr *routeResolve, sandboxHost, sid string) {
+	r.Host = sandboxHost
+	rt.mx.Inc(`router_requests_total{plane="data"}`)
 	if r.Method == http.MethodConnect {
 		rt.tunnelData(w, r, rr)
 		return
 	}
-	// Two-hop forward: preserve the <port>-<sid>.<domain> Host (the node proxy
-	// resolves the sandbox from it) and inject the access token.
 	target := &url.URL{Scheme: "http", Host: rr.DataEndpoint}
 	proxy := httputil.NewSingleHostReverseProxy(target)
 	proxy.Transport = rt.fwdTransport
-	origHost, tok := r.Host, rr.AccessToken
+	tok := rr.AccessToken
 	proxy.Director = func(req *http.Request) {
 		req.URL.Scheme = target.Scheme
 		req.URL.Host = target.Host
-		req.Host = origHost
+		req.Host = sandboxHost
 		req.Header.Set(HeaderAccessTok, tok)
 	}
 	proxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, e error) {
 		// A cached route that fails is likely stale (sandbox moved/gone): evict it so
 		// the next request re-resolves via the watch / op (§5 stale → fallback).
 		rt.evictRoute(sid)
+		rt.mx.Inc(`router_requests_total{plane="data",result="bad_gateway"}`)
 		rt.log.Warn("router: data forward", "sid", sid, "node", rr.NodeID, "err", e)
 		http.Error(w, "bad gateway", http.StatusBadGateway)
 	}
 	proxy.ServeHTTP(w, r)
+}
+
+// serveDataByKey handles by-(group,route-key) data-plane addressing (router §4):
+// business traffic with no prior create. The caller authenticates by api_key (the
+// per-sandbox token is router-injected, not caller-held); the router Reserves the
+// (group, route_key) sandbox and forwards to it on port E2b-Sandbox-Port.
+func (rt *Router) serveDataByKey(w http.ResponseWriter, r *http.Request, group, routeKey string) {
+	if !rt.authorize(w, r.Context(), group, r.Header.Get(HeaderAPIKey)) {
+		return
+	}
+	res, err := rt.opReserve(r.Context(), group, routeKey)
+	if err != nil || res.DataEndpoint == "" {
+		http.Error(w, "reserve failed", http.StatusServiceUnavailable)
+		return
+	}
+	port := r.Header.Get("E2b-Sandbox-Port")
+	if port == "" {
+		port = "49983"
+	}
+	rr := &routeResolve{SID: res.SID, Group: group, RouteKey: routeKey, NodeID: res.NodeID, DataEndpoint: res.DataEndpoint, AccessToken: res.AccessToken, State: "ready"}
+	rt.forwardSandboxData(w, r, rr, port+"-"+res.SID+"."+rt.domain, res.SID)
 }
 
 // tunnelData chains a CONNECT to the node's data endpoint (the node tunnels onward
@@ -771,12 +821,24 @@ func (rt *Router) verifyAuth(ctx context.Context, group, apiKey string) (bool, e
 // when the op interface is unreachable (don't 403-storm on a transient blip), 403
 // when the key is rejected. Returns false on failure.
 func (rt *Router) authorize(w http.ResponseWriter, ctx context.Context, group, apiKey string) bool {
+	if rt.authMode == "off" {
+		return true // caller auth delegated to a front gateway (§8)
+	}
 	ok, err := rt.verifyAuth(ctx, group, apiKey)
 	if err != nil {
+		if rt.authMode == "log" {
+			rt.log.Warn("router: caller-auth op unreachable (log mode, allowing)", "group", group)
+			return true
+		}
 		http.Error(w, "auth temporarily unavailable", http.StatusServiceUnavailable)
 		return false
 	}
 	if !ok {
+		if rt.authMode == "log" {
+			rt.log.Warn("router: caller-auth reject (log mode, allowing)", "group", group)
+			return true
+		}
+		rt.mx.Inc(`router_requests_total{result="auth_reject"}`)
 		http.Error(w, "invalid api key for group", http.StatusForbidden)
 		return false
 	}

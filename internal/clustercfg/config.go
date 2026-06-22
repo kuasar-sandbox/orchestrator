@@ -95,7 +95,8 @@ type RouterConfig struct {
 	Listen        string `yaml:"listen"`          // e2b control+data ingress; default :443
 	TLS           TLS    `yaml:"tls"`             // wildcard *.<domain> + api.<domain>
 	AuthCacheTTL  string `yaml:"auth_cache_ttl"`  // api_key↔group verification cache; default 60s
-	DataPlaneAuth string `yaml:"data_plane_auth"` // off | log | enforce (default)
+	Auth          string `yaml:"auth"`            // caller api_key auth: off | log | enforce (default); §8
+	DataPlaneAuth string `yaml:"data_plane_auth"` // data-plane access-token check: off | log | enforce (default)
 	MetricsListen string `yaml:"metrics_listen"`  // optional Prometheus text endpoint
 }
 
@@ -201,6 +202,7 @@ func Default() Config {
 		Router: RouterConfig{
 			Listen:        ":443",
 			AuthCacheTTL:  "60s",
+			Auth:          "enforce",
 			DataPlaneAuth: "enforce",
 		},
 		Scaler: ScalerConfig{PlaceCandidates: 2, ZoneAdmitMax: "yellow"},
@@ -276,6 +278,9 @@ func (c *Config) applyDefaults() {
 	if c.Router.DataPlaneAuth == "" {
 		c.Router.DataPlaneAuth = d.Router.DataPlaneAuth
 	}
+	if c.Router.Auth == "" {
+		c.Router.Auth = d.Router.Auth
+	}
 	if c.Scaler.PlaceCandidates == 0 {
 		c.Scaler.PlaceCandidates = d.Scaler.PlaceCandidates
 	}
@@ -317,6 +322,11 @@ func (c *Config) Validate() error {
 		if _, err := time.ParseDuration(d); err != nil {
 			return fmt.Errorf("clustercfg: %s %q: %w", name, d, err)
 		}
+	}
+	switch c.Router.Auth {
+	case "", "off", "log", "enforce":
+	default:
+		return fmt.Errorf("clustercfg: router.auth %q invalid (off|log|enforce)", c.Router.Auth)
 	}
 	switch c.Router.DataPlaneAuth {
 	case "off", "log", "enforce":
