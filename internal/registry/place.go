@@ -2,14 +2,13 @@ package registry
 
 import "context"
 
-// builtinPlacer is the registry's default placer for a single-node-cluster: it
-// picks the live, non-draining node with the lowest sandbox count (a crude
-// least-load). cluster-ctl scaler replaces it with shuffle-sharding +
-// nodeSelectors over the op channel in Phase 4; group affinity / selectors are
-// ignored here.
+// builtinPlacer is a fallback placer (tests / a registry with no scaler attached):
+// it picks the live, non-draining node with the lowest sandbox count (a crude
+// least-load), ignoring selectors / shuffle / zone. Production placement is the
+// standalone scaler over the scaler-link (channelPlacer); cluster.md §4.1/§5.2.
 type builtinPlacer struct{ stores *Stores }
 
-func (p *builtinPlacer) PlaceSandbox(ctx context.Context, group, routeKey string) (string, error) {
+func (p *builtinPlacer) Place(ctx context.Context, req PlaceRequest) (string, error) {
 	var best *NodeRecord
 	if err := p.stores.RangeNodes(ctx, func(n *NodeRecord) error {
 		if n.Draining {

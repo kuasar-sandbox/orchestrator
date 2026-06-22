@@ -21,7 +21,6 @@ import (
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/clusterstore"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/registry"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/routesync"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/scaler"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/secretbox"
 )
 
@@ -66,7 +65,6 @@ func runRegistry(args []string, log *slog.Logger) error {
 	stores := registry.NewStores(kv, box)
 
 	// Group-config providers: store by default, external:<addr> per interface (§6.2).
-	// Built first so the in-process scaler can honor an external placement provider.
 	var extTLS *tls.Config
 	if cfg.GroupConfig.TLS.Enabled() {
 		if extTLS, err = cfg.GroupConfig.TLS.ClientConfig(""); err != nil {
@@ -75,26 +73,11 @@ func runRegistry(args []string, log *slog.Logger) error {
 	}
 	resolver := registry.NewGroupResolver(cfg.GroupConfig, stores, time.Minute, extTLS)
 
-	// Placement: in-process by default; a standalone scaler (mode=remote) serves it
-	// over the op channel via a remotePlacer (cluster.md §4.3).
-	var placer registry.Placer
-	if cfg.Scaler.Mode == clustercfg.ScalerRemote {
-		var stls *tls.Config
-		if !strings.HasPrefix(cfg.Scaler.Endpoint, "/") && cfg.Scaler.TLS.Enabled() {
-			host := cfg.Scaler.Endpoint
-			if i := strings.LastIndexByte(host, ':'); i >= 0 {
-				host = host[:i]
-			}
-			if stls, err = cfg.Scaler.TLS.ClientConfig(host); err != nil {
-				return fmt.Errorf("registry: scaler tls: %w", err)
-			}
-		}
-		placer = registry.NewRemotePlacer(cfg.Scaler.Endpoint, stls, cfg.Reserve.ParkDur())
-		log.Info("cluster-ctl registry: remote scaler", "endpoint", cfg.Scaler.Endpoint)
-	} else {
-		placer = scaler.New(stores, resolver.Placement, cfg.Scaler)
-	}
-	reg := registry.New(stores, placer, cfg.Reserve.ParkDur(), log)
+	// Placement is the standalone scaler (cluster.md §4.1/§5.2 — no in-process
+	// mode): the registry reverse-requests Place over the scaler-link. With no
+	// scaler attached, cold placement stalls (§11); the data plane is unaffected.
+	reg := registry.New(stores, nil, cfg.Reserve.ParkDur(), log)
+	reg.SetPlacer(registry.NewChannelPlacer(reg, cfg.Reserve.ParkDur()))
 	reg.SetGroupResolver(resolver)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -133,6 +116,7 @@ func runRegistry(args []string, log *slog.Logger) error {
 	// reserve through it).
 	opMux := http.NewServeMux()
 	reg.ServeOp(opMux)
+	opMux.HandleFunc(routesync.ScalerLinkPath, reg.ServeScalerLink) // scaler reverse-call (§5.2)
 	opLn, err := listenOp(cfg.Op.Listen)
 	if err != nil {
 		return fmt.Errorf("registry: op listen %s: %w", cfg.Op.Listen, err)
@@ -146,6 +130,10 @@ func runRegistry(args []string, log *slog.Logger) error {
 			return fmt.Errorf("registry: op tls: %w", terr)
 		}
 		opSrv.TLSConfig = stls
+	} else {
+		// Plain (UDS/TCP): serve h2c so the scaler-link's full-duplex h2 stream works
+		// (h2c.NewHandler still falls through to HTTP/1.1 for the watch GETs).
+		opSrv.Handler = h2c.NewHandler(opMux, &http2.Server{})
 	}
 	go func() {
 		<-ctx.Done()

@@ -31,8 +31,21 @@ type nodeConn interface {
 // Placer suggests a node for a new sandbox (cluster.md §4.3: the scaler suggests,
 // the registry commits by CAS). Phase 2 ships a built-in single-node placer; the
 // cluster-ctl scaler replaces it over the op channel in Phase 4.
+// PlaceRequest is a placement ask. Build marks a build placement (resource-aware,
+// cluster-scaler.md §4.5); TargetRuntimeDigest (when known, e.g. a migration's
+// snapshot runtime) lets the scaler prefer runtime-compatible nodes (§4.2).
+type PlaceRequest struct {
+	Group               string
+	RouteKey            string
+	Build               bool
+	TargetRuntimeDigest string
+}
+
+// Placer suggests a node for a sandbox/build. In production it is the channelPlacer
+// (the standalone scaler answers over the scaler-link, cluster.md §4.3/§5.2); the
+// builtin placer is a test/no-scaler fallback.
 type Placer interface {
-	PlaceSandbox(ctx context.Context, group, routeKey string) (nodeID string, err error)
+	Place(ctx context.Context, req PlaceRequest) (nodeID string, err error)
 }
 
 // Registry is the cluster control plane's state authority + node-link hub.
@@ -55,6 +68,11 @@ type Registry struct {
 	reconcileTrigger chan struct{} // coalesced key-reconcile wakeups (a node connecting)
 
 	resolver groupcfg.Resolver // group-config providers (store by default; §6.2)
+
+	scalerMu     sync.Mutex
+	curScaler    *scalerConn                            // the connected standalone scaler (reverse-call placement, §5.2)
+	placeWaiters map[string]chan *routesync.PlaceResult // in-flight place_req -> result waiter
+	overlay      map[string][]map[string]string         // group -> shuffle-effective nodeSelectors (scaler patch, §7.6)
 }
 
 // reserveCall is one in-flight ReserveSandbox; joiners wait on done, the channel
@@ -95,12 +113,42 @@ func New(stores *Stores, placer Placer, parkTimeout time.Duration, log *slog.Log
 		keyLeased:        make(map[string]map[string]bool),
 		reconcileTrigger: make(chan struct{}, 1),
 		resolver:         storeResolver(stores),
+		placeWaiters:     make(map[string]chan *routesync.PlaceResult),
+		overlay:          make(map[string][]map[string]string),
 	}
+}
+
+// applySelectorPatch records the scaler's shuffle-effective nodeSelectors for a
+// group (cluster.md §4.4); keydist's allocation set reads it (§7.6) so manifest
+// keys predistribute only to the group's shuffle-pinned nodes. Derived state,
+// rebuilt when the scaler reconnects + re-pushes; empty selectors clears it.
+func (r *Registry) applySelectorPatch(p *routesync.SelectorPatch) {
+	r.scalerMu.Lock()
+	if len(p.Selectors) == 0 {
+		delete(r.overlay, p.Group)
+	} else {
+		r.overlay[p.Group] = p.Selectors
+	}
+	r.scalerMu.Unlock()
+}
+
+// effectiveSelectors returns the scaler's shuffle-effective nodeSelectors for a
+// group if it has pushed an overlay, else nil (caller falls back to the group's
+// static selectors).
+func (r *Registry) effectiveSelectors(group string) ([]map[string]string, bool) {
+	r.scalerMu.Lock()
+	defer r.scalerMu.Unlock()
+	sel, ok := r.overlay[group]
+	return sel, ok
 }
 
 // SetGroupResolver overrides the group-config providers (e.g. an external cloud
 // provider per interface, §6.2); cluster-ctl sets it from config before serving.
 func (r *Registry) SetGroupResolver(res groupcfg.Resolver) { r.resolver = res }
+
+// SetPlacer wires the placer (the channelPlacer over the scaler-link); cluster-ctl
+// sets it after New (the channelPlacer needs the registry it places through).
+func (r *Registry) SetPlacer(p Placer) { r.placer = p }
 
 // Stores exposes the typed store layer (cluster-ctl seeds group config; tests).
 func (r *Registry) Stores() *Stores { return r.stores }
@@ -177,7 +225,7 @@ func (r *Registry) startReserve(ctx context.Context, group, routeKey string, rec
 	var conn nodeConn
 	for attempt := 0; ; attempt++ {
 		var perr error
-		nodeID, perr = r.placer.PlaceSandbox(ctx, group, routeKey)
+		nodeID, perr = r.placer.Place(ctx, PlaceRequest{Group: group, RouteKey: routeKey})
 		if perr != nil {
 			return perr
 		}

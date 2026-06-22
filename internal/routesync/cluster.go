@@ -13,11 +13,45 @@ const (
 	TypeHeartbeat    = "heartbeat"     // node -> registry (water level)
 	TypeCommand      = "command"       // registry -> node (lifecycle / key primitive)
 	TypeCmdAck       = "cmd_ack"       // node -> registry (command accepted / rejected)
+	// Scaler-link (cluster.md §5.2): the scaler DIALS the registry (no scaler
+	// listen); the registry reverse-requests placement down, the scaler answers up.
+	TypePlaceReq      = "place_req"      // registry -> scaler (place this sandbox)
+	TypePlaceResult   = "place_result"   // scaler -> registry (suggested node, or no_node)
+	TypeSelectorPatch = "selector_patch" // scaler -> registry (shuffle-effective nodeSelectors overlay, §4.4/§7.6)
 )
 
-// NodeLinkPath is the HTTP path a node-ctl serve dials to open its node-link
-// channel to the registry (node.md §10); h2c full-duplex.
-const NodeLinkPath = "/internal/node-link"
+// NodeLinkPath / ScalerLinkPath are the HTTP paths node-ctl serve / cluster-ctl
+// scaler dial to open their full-duplex channels to the registry (h2c/h2).
+const (
+	NodeLinkPath   = "/internal/node-link"
+	ScalerLinkPath = "/internal/scaler-link"
+)
+
+// PlaceReq is a registry placement request to the scaler (cluster.md §5.2/§7.5).
+// TargetRuntimeDigest (when known, e.g. a migration's snapshot runtime) lets the
+// scaler prefer runtime-compatible nodes (§4.2); empty = no runtime constraint.
+type PlaceReq struct {
+	ReqID               string `json:"req_id"`
+	Group               string `json:"group"`
+	RouteKey            string `json:"route_key"`
+	Build               bool   `json:"build,omitempty"`         // a build placement (resource-aware, §4.5)
+	TargetRuntimeDigest string `json:"target_runtime,omitempty"`
+}
+
+// PlaceResult is the scaler's answer (NodeID set, or NoNode when nothing eligible).
+type PlaceResult struct {
+	ReqID  string `json:"req_id"`
+	NodeID string `json:"node_id,omitempty"`
+	NoNode bool   `json:"no_node,omitempty"`
+}
+
+// SelectorPatch is the scaler's shuffle-effective nodeSelectors for a group: the
+// static selectors narrowed to the group's pinned shuffle slots (§4.4). The
+// registry uses it as the key-distribution allocation set (§7.6).
+type SelectorPatch struct {
+	Group     string              `json:"group"`
+	Selectors []map[string]string `json:"selectors"`
+}
 
 // Command kinds (Command.Kind) — the lifecycle + key primitives the registry
 // drives the node with. The node executes via its existing e2b lifecycle (the

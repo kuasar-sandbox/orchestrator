@@ -122,6 +122,10 @@ type Msg struct {
 	Cmd     *Command      `json:"command,omitempty"`
 	Ack     *CmdAck       `json:"cmd_ack,omitempty"`
 	Rev     int64         `json:"rev,omitempty"` // per-shard monotonic revision for resume_from (§5.3)
+	// Scaler-link variants (cluster.md §5.2): place_req down, place_result + selector_patch up.
+	PlaceReq    *PlaceReq      `json:"place_req,omitempty"`
+	PlaceResult *PlaceResult   `json:"place_result,omitempty"`
+	Patch       *SelectorPatch `json:"selector_patch,omitempty"`
 }
 
 // Hello is the orchestrator's first down-frame; it carries the operational Policy.

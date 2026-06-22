@@ -14,96 +14,173 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/net/http2"
+
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/clustercfg"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/registry"
+	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/routesync"
 )
 
-// Service is the standalone scaler (cluster-scaler.md §5): it mirrors the
-// registry's node table + group placement config over the op view-watch (a local
-// view) and answers placement over POST /scaler/place, which the registry's
-// remotePlacer calls. The in-process Placer (New) stays the default deployment.
+// Service is the standalone scaler (cluster-scaler.md §4.2/§5): it DIALS the
+// registry, subscribes the node/group view (the op watches), and answers the
+// registry's reverse placement requests on the scaler-link (no scaler listen).
+// Placement runs over its local view; the registry commits by CAS.
 type Service struct {
 	opBase      string
-	watchClient *http.Client // no timeout: long-lived view watches
+	scheme      string
+	watchClient *http.Client     // no timeout: long-lived view watches
+	placeTr     *http2.Transport // full-duplex scaler-link (place_req down / place_result up)
 	cfg         clustercfg.ScalerConfig
+	deadAfter   int64 // node_dead_after seconds (node-alive eligibility, §4.2)
 	log         *slog.Logger
 
 	nodes  *viewMap[*registry.NodeRecord]
 	groups *viewMap[*registry.GroupView]
 }
 
-var errViewNotReady = fmt.Errorf("scaler: view not synced")
-
 // NewRemote builds a standalone scaler dialing the registry op endpoint (a UDS
-// path, or host:port; opTLS non-nil = mTLS h2).
-func NewRemote(opAddr string, opTLS *tls.Config, cfg clustercfg.ScalerConfig, log *slog.Logger) *Service {
+// path, or host:port; opTLS non-nil = mTLS h2). deadAfter is node_dead_after.
+func NewRemote(opAddr string, opTLS *tls.Config, cfg clustercfg.ScalerConfig, deadAfter int64, log *slog.Logger) *Service {
 	if cfg.PlaceCandidates <= 0 {
 		cfg.PlaceCandidates = 2
 	}
 	s := &Service{
-		cfg: cfg, log: log,
+		cfg: cfg, deadAfter: deadAfter, log: log,
 		nodes:  newViewMap(decodeNode),
 		groups: newViewMap(decodeGroup),
 	}
-	var transport http.RoundTripper
+	// View watches over a normal client; the scaler-link over an h2 transport
+	// (full-duplex: registry writes place_req down, scaler writes place_result up).
+	pt := &http2.Transport{}
 	switch {
 	case strings.HasPrefix(opAddr, "/"):
-		s.opBase = "http://op"
-		transport = &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+		s.opBase, s.scheme = "http://op", "http"
+		dial := func(ctx context.Context, _, _ string) (net.Conn, error) {
 			return (&net.Dialer{}).DialContext(ctx, "unix", opAddr)
-		}}
+		}
+		s.watchClient = &http.Client{Transport: &http.Transport{DialContext: dial}}
+		pt.AllowHTTP = true
+		pt.DialTLSContext = func(ctx context.Context, _, _ string, _ *tls.Config) (net.Conn, error) { return dial(ctx, "", "") }
 	case opTLS != nil:
-		s.opBase = "https://" + opAddr
-		transport = &http.Transport{TLSClientConfig: opTLS, ForceAttemptHTTP2: true}
+		s.opBase, s.scheme = "https://"+opAddr, "https"
+		s.watchClient = &http.Client{Transport: &http.Transport{TLSClientConfig: opTLS, ForceAttemptHTTP2: true}}
+		pt.DialTLSContext = func(ctx context.Context, _, addr string, _ *tls.Config) (net.Conn, error) {
+			d := &net.Dialer{}
+			raw, err := d.DialContext(ctx, "tcp", opAddr)
+			if err != nil {
+				return nil, err
+			}
+			tc := tls.Client(raw, opTLS)
+			if err := tc.HandshakeContext(ctx); err != nil {
+				raw.Close()
+				return nil, err
+			}
+			return tc, nil
+		}
 	default:
-		s.opBase = "http://" + opAddr
-		transport = &http.Transport{}
+		s.opBase, s.scheme = "http://"+opAddr, "http"
+		s.watchClient = &http.Client{Transport: &http.Transport{}}
+		pt.AllowHTTP = true
+		pt.DialTLSContext = func(ctx context.Context, _, _ string, _ *tls.Config) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "tcp", opAddr)
+		}
 	}
-	s.watchClient = &http.Client{Transport: transport}
+	s.placeTr = pt
 	return s
 }
 
-// Start launches the node + group view-watch loops (background).
+// Start launches the node + group view-watch loops + the scaler-link (background).
 func (s *Service) Start(ctx context.Context) {
 	go s.subscribe(ctx, registry.OpNodeWatchPath, s.nodes)
 	go s.subscribe(ctx, registry.OpGroupWatchPath, s.groups)
+	go s.runPlaceLink(ctx)
 }
 
-// Handler serves the placement op the registry's remotePlacer calls.
-func (s *Service) Handler() http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/scaler/place", s.servePlace)
-	return mux
-}
-
-func (s *Service) servePlace(w http.ResponseWriter, r *http.Request) {
-	q := r.URL.Query()
-	nodeID, err := s.Place(q.Get("group"), q.Get("route_key"))
-	switch {
-	case err == registry.ErrNoNode:
-		http.Error(w, "no eligible node", http.StatusConflict)
-	case err == errViewNotReady:
-		http.Error(w, "scaler view not synced", http.StatusServiceUnavailable)
-	case err != nil:
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-	default:
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]string{"node_id": nodeID})
-	}
-}
-
-// Place runs the placement algorithm over the local view. It refuses until both
-// views have completed their first snapshot (so it never places over a partial
-// node set or missing selectors → blast-radius violation).
-func (s *Service) Place(group, routeKey string) (string, error) {
+// answer computes a placement for a reverse request over the local view. It
+// returns NoNode until both views have synced (never places over a partial node
+// set / missing selectors → blast-radius violation) or when nothing is eligible.
+func (s *Service) answer(req *routesync.PlaceReq) *routesync.PlaceResult {
+	res := &routesync.PlaceResult{ReqID: req.ReqID}
 	if !s.nodes.ready() || !s.groups.ready() {
-		return "", errViewNotReady
+		res.NoNode = true
+		return res
 	}
 	var selectors []map[string]string
-	if g, ok := s.groups.get(group); ok {
+	if g, ok := s.groups.get(req.Group); ok {
 		selectors = g.NodeSelectors
 	}
-	return placeOver(group, s.nodes.values(), selectors, s.cfg.ShuffleSharding, s.cfg.PlaceCandidates)
+	p := placeParams{
+		group: req.Group, nodes: s.nodes.values(), selectors: selectors,
+		rules: s.cfg.ShuffleSharding, candidates: s.cfg.PlaceCandidates,
+		zoneAdmitMax: s.cfg.ZoneAdmitMax, deadAfter: s.deadAfter, now: time.Now().Unix(),
+		targetRuntimeDigest: req.TargetRuntimeDigest,
+	}
+	var node string
+	var err error
+	if req.Build {
+		node, err = placeBuild(p)
+	} else {
+		node, err = placeSandbox(p)
+	}
+	if err != nil || node == "" {
+		res.NoNode = true
+	} else {
+		res.NodeID = node
+	}
+	return res
+}
+
+// runPlaceLink keeps the scaler-link alive (the registry's reverse-call channel),
+// reconnecting with capped backoff until ctx is cancelled.
+func (s *Service) runPlaceLink(ctx context.Context) {
+	backoff := 200 * time.Millisecond
+	for ctx.Err() == nil {
+		err := s.placeSession(ctx)
+		if ctx.Err() != nil {
+			return
+		}
+		s.log.Warn("scaler: place-link ended; reconnecting", "err", err)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(backoff):
+		}
+		backoff = min(backoff*2, 5*time.Second)
+	}
+}
+
+// placeSession runs one scaler-link: PUT the link (request body = place_result
+// stream up), read place_req down (response body), and answer each over the local
+// view. Full-duplex h2 (mirrors node-link, inverse roles: the registry commands).
+func (s *Service) placeSession(ctx context.Context) error {
+	sctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	pr, pw := io.Pipe()
+	defer pw.Close()
+	req, err := http.NewRequestWithContext(sctx, http.MethodPut, s.opBase+routesync.ScalerLinkPath, pr)
+	if err != nil {
+		return err
+	}
+	resp, err := s.placeTr.RoundTrip(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if _, err := routesync.ReadMsg(resp.Body); err != nil { // registry Hello
+		return err
+	}
+	for {
+		m, err := routesync.ReadMsg(resp.Body)
+		if err != nil {
+			return err
+		}
+		if m.Type == routesync.TypePlaceReq && m.PlaceReq != nil {
+			res := s.answer(m.PlaceReq) // placement is in-memory + fast; answer inline
+			if err := routesync.WriteMsg(pw, &routesync.Msg{Type: routesync.TypePlaceResult, PlaceResult: res}); err != nil {
+				return err
+			}
+		}
+	}
 }
 
 // subscribe keeps a view synced from the registry op watch, reconnecting with

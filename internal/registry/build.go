@@ -14,7 +14,7 @@ import (
 // and the router tracks build_id -> node; durable build tracking in a BuildStore
 // is a later refinement.
 func (r *Registry) ReserveBuild(ctx context.Context, group string) (*ReserveResult, error) {
-	nodeID, err := r.placer.PlaceSandbox(ctx, group, "build")
+	nodeID, err := r.placer.Place(ctx, PlaceRequest{Group: group, RouteKey: "build", Build: true})
 	if err != nil {
 		return nil, err
 	}
