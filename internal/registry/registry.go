@@ -635,6 +635,49 @@ func (r *Registry) RunReaper(ctx context.Context, deadAfter time.Duration) {
 	}
 }
 
+// RunRecordGC reclaims idle SAVED (group,route_key) records older than ttl
+// (cluster.md §10/§12: a route-key cardinality cap). SAVED is node-unbound (its
+// snapshot lives in the remote content store, reclaimed by that store's own GC
+// once unreferenced), so deleting the record just frees the route-key. ttl<=0
+// disables it (SAVED holds resumable state — operators opt in).
+func (r *Registry) RunRecordGC(ctx context.Context, ttl time.Duration) {
+	if ttl <= 0 {
+		return
+	}
+	tick := ttl / 4
+	if tick < time.Minute {
+		tick = time.Minute
+	}
+	t := time.NewTicker(tick)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			r.gcIdleRecords(ctx, ttl)
+		}
+	}
+}
+
+func (r *Registry) gcIdleRecords(ctx context.Context, ttl time.Duration) {
+	cutoff := time.Now().Add(-ttl).Unix()
+	var stale []*SandboxRecord
+	_ = r.stores.RangeAllSandboxes(ctx, func(s *SandboxRecord) error {
+		if s.State == StateSaved && s.LastActive > 0 && s.LastActive < cutoff {
+			stale = append(stale, &SandboxRecord{Group: s.Group, RouteKey: s.RouteKey, SID: s.SID})
+		}
+		return nil
+	})
+	for _, s := range stale {
+		_ = r.stores.DeleteSandbox(ctx, s.Group, s.RouteKey)
+		r.dropSID(s.SID)
+	}
+	if len(stale) > 0 {
+		r.log.Info("registry: gc'd idle SAVED records", "count", len(stale))
+	}
+}
+
 // sweepDeadNodes resets the sandboxes of every disconnected node whose last
 // heartbeat predates node_dead_after, then removes the node record (cluster.md
 // §11): READY/PAUSED (node-local snapshot, lost with the node) → reset so the

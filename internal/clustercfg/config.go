@@ -87,6 +87,7 @@ type OpConfig struct {
 // ReserveConfig bounds how long Reserve waits for a node's running event.
 type ReserveConfig struct {
 	ParkTimeout string `yaml:"park_timeout"` // default 30s; on timeout router → 503
+	RecordTTL   string `yaml:"record_ttl"`   // GC idle SAVED records after this (route-key cardinality cap, §10/§12); "" = off
 }
 
 // RouterConfig is the unified e2b ingress role.
@@ -323,6 +324,11 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("clustercfg: %s %q: %w", name, d, err)
 		}
 	}
+	if c.Reserve.RecordTTL != "" {
+		if _, err := time.ParseDuration(c.Reserve.RecordTTL); err != nil {
+			return fmt.Errorf("clustercfg: reserve.record_ttl %q: %w", c.Reserve.RecordTTL, err)
+		}
+	}
 	switch c.Router.Auth {
 	case "", "off", "log", "enforce":
 	default:
@@ -348,7 +354,10 @@ func (c *Config) Validate() error {
 
 func (c *ChannelConfig) HeartbeatDur() time.Duration { d, _ := time.ParseDuration(c.HeartbeatInterval); return d }
 func (c *ChannelConfig) NodeDeadDur() time.Duration  { d, _ := time.ParseDuration(c.NodeDeadAfter); return d }
-func (c *ReserveConfig) ParkDur() time.Duration      { d, _ := time.ParseDuration(c.ParkTimeout); return d }
+func (c *ReserveConfig) ParkDur() time.Duration { d, _ := time.ParseDuration(c.ParkTimeout); return d }
+
+// RecordTTLDur is the idle-SAVED-record GC age (0 = disabled).
+func (c *ReserveConfig) RecordTTLDur() time.Duration { d, _ := time.ParseDuration(c.RecordTTL); return d }
 func (c *RouterConfig) AuthCacheDur() time.Duration  { d, _ := time.ParseDuration(c.AuthCacheTTL); return d }
 
 // ProviderFor returns the configured provider spec for a fine-grained interface

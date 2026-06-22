@@ -189,6 +189,28 @@ func TestCreateRejectFastFails(t *testing.T) {
 	}
 }
 
+func TestRecordGCIdleSaved(t *testing.T) {
+	ctx := context.Background()
+	reg := testReg(t)
+	now := time.Now().Unix()
+	// An old SAVED record (idle past TTL) is reclaimed; a fresh SAVED + a READY are kept.
+	reg.stores.PutSandbox(ctx, &SandboxRecord{Group: "/g", RouteKey: "old", SID: "sb-old", State: StateSaved, LastActive: now - 7200})
+	reg.stores.PutSandbox(ctx, &SandboxRecord{Group: "/g", RouteKey: "fresh", SID: "sb-fresh", State: StateSaved, LastActive: now})
+	reg.stores.PutSandbox(ctx, &SandboxRecord{Group: "/g", RouteKey: "ready", SID: "sb-r", State: StateReady, LastActive: now - 7200})
+
+	reg.gcIdleRecords(ctx, time.Hour)
+
+	if _, _, found, _ := reg.stores.GetSandbox(ctx, "/g", "old"); found {
+		t.Fatal("idle SAVED record should be GC'd")
+	}
+	if _, _, found, _ := reg.stores.GetSandbox(ctx, "/g", "fresh"); !found {
+		t.Fatal("a fresh SAVED record must be kept")
+	}
+	if _, _, found, _ := reg.stores.GetSandbox(ctx, "/g", "ready"); !found {
+		t.Fatal("a READY record must never be GC'd (only idle SAVED)")
+	}
+}
+
 func TestParkTimeoutRollback(t *testing.T) {
 	ctx := context.Background()
 	kv, _ := clusterstore.Open(filepath.Join(t.TempDir(), "r.db"), 0)

@@ -88,6 +88,8 @@ func runRegistry(args []string, log *slog.Logger) error {
 	go reg.RunReaper(ctx, cfg.Channel.NodeDeadDur())
 	// Key predistribution + lease renewal to each group's allocation set (§7.6).
 	go reg.RunKeyDistributor(ctx, time.Hour)
+	// Idle SAVED record GC (route-key cardinality cap, §10/§12); off when unset.
+	go reg.RunRecordGC(ctx, cfg.Reserve.RecordTTLDur())
 
 	mux := http.NewServeMux()
 	mux.HandleFunc(routesync.NodeLinkPath, reg.ServeNodeLink)
