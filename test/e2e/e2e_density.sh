@@ -62,6 +62,7 @@ VMLINUX="${VMLINUX:-$BIN/vmlinux}"
 [ -f "$VMLINUX" ] || skip "no vmlinux at $VMLINUX (run make vmlinux)"
 
 WORK="$(mktemp -d /tmp/e2e-density-XXXXXX)"
+mkdir -p "$WORK/run" "$WORK/lib"   # serve's run/base roots (sandboxes still use /run/sandbox directly)
 DAEMON_PID=""
 declare -a SANDBOX_PIDS=()
 declare -a SANDBOX_SIDS=()
@@ -205,15 +206,21 @@ EOF
     } > "$WORK/$sid.yaml"
 }
 
+# The resource controller is hosted in `node-ctl serve` (resource_listen); there is
+# no standalone daemon. We run a minimal serve (install_units=false, api on a
+# throwaway port, temp paths) whose only live subsystem is the controller on
+# resource_listen.socket — sandboxes are still launched directly by sandbox-ctl
+# against that socket.
 start_daemon() {
     local cfg="$1"
-    "$BIN/node-ctl" daemon --config "$cfg" >"$WORK/daemon.log" 2>&1 &
+    "$BIN/node-ctl" serve --config "$cfg" >"$WORK/daemon.log" 2>&1 &
     DAEMON_PID=$!
-    for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+    for _ in $(seq 1 60); do
         [ -S "$WORK/sandbox-resource.sock" ] && return 0
-        sleep 0.2
+        kill -0 "$DAEMON_PID" 2>/dev/null || { cat "$WORK/daemon.log"; fail "node-ctl serve exited before binding the resource socket"; }
+        sleep 0.25
     done
-    fail "daemon socket not created in time"
+    fail "resource socket not created in time"
 }
 
 stop_daemon() {
@@ -232,71 +239,104 @@ cleanup_sb() {
     ip link delete "${sid}-tap" 2>/dev/null || true
 }
 
+# Minimal `node-ctl serve` config: only the in-process resource controller
+# (resource_listen) is exercised. The serve scaffold (api/encryption_key/paths/
+# units) is inert here — install_units=false, api on a throwaway port — so serve
+# touches neither host systemd nor real ports.
 write_default_config() {
     cat > "$WORK/node-ctl.yaml" <<EOF
-listen: $WORK/sandbox-resource.sock
-state_path: $WORK/state.json
-cgroup_scan_paths:
-  - /sys/fs/cgroup/sandboxes
-resources:
-  physical_memory: 4GiB
-  physical_cpu: 4
-  host_reserved:
-    memory: 512MiB
-    cpu: 1
-watermarks:
-  operational_margin_factor: 0.10
-  high_factor: 0.85
-  low_factor: 0.70
-  emergency_factor: 0.05
-rate_limits:
-  memory_grant_per_sec_factor: 0.20
-admission:
-  rate: 50
-  burst: 50
-  max_concurrent_creating: 50
-  startup_ttl: 120s
-  queue_ttl: 30s
-dampening:
-  recover_duration: 30s
-  cooldown_periods: 5
-logging:
-  level: info
+api: { domain: density.local, listen: "127.0.0.1:0" }
+encryption_key: "0000000000000000000000000000000000000000000000000000000000000000"
+proxy: { mode: internal, auth: enforce }
+paths:
+  run_root: $WORK/run
+  base_root: $WORK/lib
+  config_socket: $WORK/node-ctl.socket
+  db_path: $WORK/node-ctl.db
+units: { dir: $WORK/units, install: false }
+resource_listen:
+  enabled: true
+  socket: $WORK/sandbox-resource.sock
+  state_path: $WORK/state.json
   audit_path: $WORK/audit.log
+  cgroup_scan_paths:
+    - /sys/fs/cgroup/sandboxes
+  resources:
+    physical_memory: 4GiB
+    physical_cpu: 4
+    host_reserved:
+      memory: 512MiB
+      cpu: 1
+  watermarks:
+    operational_margin_factor: 0.10
+    high_factor: 0.85
+    low_factor: 0.70
+    emergency_factor: 0.05
+    startup_factor: 0.50
+  rate_limits:
+    memory_grant_per_sec_factor: 0.20
+  admission:
+    rate: 50
+    burst: 50
+    startup_ttl: 120s
+    queue_ttl: 30s
+    queue_max_depth: 256
+  dampening:
+    recover_duration: 30s
+    cooldown_periods: 5
+  log_level: info
 EOF
 }
 
 write_compact_config() {
     cat > "$WORK/node-ctl-compact.yaml" <<EOF
-listen: $WORK/sandbox-resource.sock
-state_path: $WORK/state.json
-cgroup_scan_paths:
-  - /sys/fs/cgroup/sandboxes
-resources:
-  physical_memory: 400MiB
-  physical_cpu: 4
-  host_reserved:
-    memory: 80MiB
-    cpu: 0.5
-watermarks:
-  operational_margin_factor: 0.10
-  high_factor: 0.85
-  low_factor: 0.70
-  emergency_factor: 0.05
-rate_limits:
-  memory_grant_per_sec_factor: 0.20
-admission:
-  rate: 50
-  burst: 50
-  max_concurrent_creating: 50
-  startup_ttl: 60s
-  queue_ttl: 10s
-dampening:
-  recover_duration: 30s
-  cooldown_periods: 5
-logging:
-  level: info
+api: { domain: density.local, listen: "127.0.0.1:0" }
+encryption_key: "0000000000000000000000000000000000000000000000000000000000000000"
+proxy: { mode: internal, auth: enforce }
+paths:
+  run_root: $WORK/run
+  base_root: $WORK/lib
+  config_socket: $WORK/node-ctl.socket
+  db_path: $WORK/node-ctl.db
+units: { dir: $WORK/units, install: false }
+resource_listen:
+  enabled: true
+  socket: $WORK/sandbox-resource.sock
+  state_path: $WORK/state.json
   audit_path: $WORK/audit.log
+  cgroup_scan_paths:
+    - /sys/fs/cgroup/sandboxes
+  # Sized for DETERMINISTIC creation-rate backpressure (Phase C), independent of
+  # startup/settle timing: allocatable_pool = (240-80)MiB * (1-0.10) = 144MiB. Each
+  # sandbox commits its 32MiB floor to NodeAllocated at admit, so the 4th leaves the
+  # node at 128MiB >= the red water mark (0.85*144 = 122.4MiB) — and the 5th admit is
+  # HARD-rejected with "node in zone red" (the zone gate is checked before pool
+  # headroom, which would otherwise only queue). startup_factor=1.0 makes the startup
+  # pool (= allocatable_pool) >= 4 floors so the first four are not startup-blocked.
+  resources:
+    physical_memory: 240MiB
+    physical_cpu: 4
+    host_reserved:
+      memory: 80MiB
+      cpu: 0.5
+  watermarks:
+    operational_margin_factor: 0.10
+    high_factor: 0.85
+    low_factor: 0.70
+    emergency_factor: 0.05
+    startup_factor: 1.00
+  rate_limits:
+    memory_grant_per_sec_factor: 0.20
+  admission:
+    rate: 50
+    burst: 50
+    startup_ttl: 60s
+    queue_ttl: 10s
+    queue_max_depth: 256
+  dampening:
+    recover_duration: 30s
+    cooldown_periods: 5
+  log_level: info
 EOF
 }
 
@@ -315,10 +355,14 @@ EOF
 # starve sandbox-ctl's Go scheduler — observed 5s chShutdownGrace
 # expanding to ~11s wallclock. 60s = generous slack.
 shutdown_sandbox() {
-    local pid="$1" sid="${2:-?}" waited=0 timeout=60
-    kill -TERM "$pid" 2>/dev/null || { wait "$pid" 2>/dev/null; return 0; }
+    local pid="$1" sid="${2:-?}" waited=0 timeout=120
+    # Teardown success = the process is GONE, not its exit code. A B1 sandbox is
+    # meant to OOM, so its sandbox-ctl may exit non-zero — tolerate wait's code
+    # (|| true) so that doesn't abort teardown under set -e. Only a process still
+    # alive past the timeout (a real residual) is a failure (return 1 below).
+    kill -TERM "$pid" 2>/dev/null || { wait "$pid" 2>/dev/null || true; return 0; }
     while [ "$waited" -lt "$timeout" ]; do
-        kill -0 "$pid" 2>/dev/null || { wait "$pid" 2>/dev/null; return 0; }
+        kill -0 "$pid" 2>/dev/null || { wait "$pid" 2>/dev/null || true; return 0; }
         sleep 1
         waited=$((waited+1))
     done
@@ -328,6 +372,9 @@ shutdown_sandbox() {
     echo "WARN:   sudo kill -KILL $pid" >&2
     echo "WARN:   sudo pkill -KILL -f 'cloud-hypervisor.*--net tap=${sid}-tap'" >&2
     echo "WARN:   sudo ip link delete ${sid}-tap; sudo rmdir /sys/fs/cgroup/sandboxes/${sid}" >&2
+    # A sandbox-ctl still ignoring SIGTERM after the (generous) timeout is a real
+    # bug, and a leaked process is worse than a failed run — fail loudly (do NOT
+    # return 0 and march on leaving it behind).
     return 1
 }
 
@@ -502,9 +549,11 @@ phase_c() {
         SANDBOX_PIDS+=("$p")
     done
 
-    # Race: try the 5th admit BEFORE the 10s active reclaimer first sweep,
-    # otherwise the reclaimer would free enough to admit the 5th. Cold-start
-    # takes ~1s so 5s gives all four time to settle.
+    # Let the four admits land + reserve (each commits its 32MiB floor to
+    # NodeAllocated). The 5th rejection is deterministic — it rides on those four
+    # committed floors crossing the red water mark (see write_compact_config), which
+    # the reclaimer cannot free below floor and which settling does not release — so
+    # this wait is just to ensure the four reservations exist, not a timing bet.
     sleep 5
 
     local nres

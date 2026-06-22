@@ -146,7 +146,7 @@ STAGGER_S="${STAGGER_S:-0}"
 TICK_S=5
 
 WORK="${WORK:-$(mktemp -d /tmp/density-perf-XXXXXX)}"
-mkdir -p "$WORK"
+mkdir -p "$WORK" "$WORK/run" "$WORK/lib"
 OUT="${PERF_OUT:-$REPO_ROOT/test/results/density-perf-N${N}.txt}"
 mkdir -p "$(dirname "$OUT")"
 
@@ -168,7 +168,7 @@ declare -a SB_SIDS=()
 # Go scheduler delays sandbox-ctl's shutdown goroutine — observed 5s
 # chShutdownGrace expanding to ~11s wallclock. 60s = generous slack.
 stop_sandbox_ctl() {
-    local pid="$1" sid="${2:-?}" waited=0 timeout=60
+    local pid="$1" sid="${2:-?}" waited=0 timeout=120
     # Reap already-exited children first. A sandbox-ctl that exited
     # naturally (e.g. its admit was queue-canceled and Run() returned
     # an error long ago) is gone from /proc OR sits as a zombie in
@@ -176,15 +176,15 @@ stop_sandbox_ctl() {
     # "alive" — read /proc/$pid/stat directly.
     if [ ! -d "/proc/$pid" ] || \
        [ "$(awk '{print $3}' /proc/$pid/stat 2>/dev/null)" = "Z" ]; then
-        wait "$pid" 2>/dev/null
+        wait "$pid" 2>/dev/null || true   # process is gone; its exit code is not a teardown failure
         return 0
     fi
-    kill -TERM "$pid" 2>/dev/null || { wait "$pid" 2>/dev/null; return 0; }
+    kill -TERM "$pid" 2>/dev/null || { wait "$pid" 2>/dev/null || true; return 0; }
     while [ "$waited" -lt "$timeout" ]; do
         # Same as the entry check — kill -0 alone misses zombies.
         if [ ! -d "/proc/$pid" ] || \
            [ "$(awk '{print $3}' /proc/$pid/stat 2>/dev/null)" = "Z" ]; then
-            wait "$pid" 2>/dev/null
+            wait "$pid" 2>/dev/null || true   # process is gone; its exit code is not a teardown failure
             return 0
         fi
         sleep 1
@@ -311,38 +311,51 @@ EOF
     } > "$WORK/$sid.yaml"
 }
 
-# ---- daemon config ----
+# ---- node-ctl serve config (only the resource_listen controller is live) ----
+# install_units=false + api on a throwaway port keep serve from touching host
+# systemd / real ports; sandboxes are still launched directly by sandbox-ctl
+# against resource_listen.socket.
 cat > "$WORK/node-ctl.yaml" <<EOF
-listen: $WORK/sandbox-resource.sock
-state_path: $WORK/state.json
-cgroup_scan_paths:
-  - /sys/fs/cgroup/sandboxes
-resources:
-  physical_memory: $PHYS_MEM
-  physical_cpu: $PHYS_CPU
-  host_reserved:
-    memory: $HOST_RES_MEM
-    cpu: $HOST_RES_CPU
-watermarks:
-  operational_margin_factor: 0.10
-  high_factor: $HIGH_FACTOR
-  low_factor: $LOW_FACTOR
-  emergency_factor: $EMERG_FACTOR
-  startup_factor: $STARTUP_FACTOR
-rate_limits:
-  memory_grant_per_sec_factor: $GRANT_PER_SEC_FACTOR
-admission:
-  rate: $ADM_RATE
-  burst: $ADM_BURST
-  startup_ttl: 30s
-  queue_ttl: ${ADMIT_DEADLINE}s
-  queue_max_depth: 256
-dampening:
-  recover_duration: $RECOVER_DUR
-  cooldown_periods: 5
-logging:
-  level: info
+api: { domain: density.local, listen: "127.0.0.1:0" }
+encryption_key: "0000000000000000000000000000000000000000000000000000000000000000"
+proxy: { mode: internal, auth: enforce }
+paths:
+  run_root: $WORK/run
+  base_root: $WORK/lib
+  config_socket: $WORK/node-ctl.socket
+  db_path: $WORK/node-ctl.db
+units: { dir: $WORK/units, install: false }
+resource_listen:
+  enabled: true
+  socket: $WORK/sandbox-resource.sock
+  state_path: $WORK/state.json
   audit_path: $WORK/audit.log
+  cgroup_scan_paths:
+    - /sys/fs/cgroup/sandboxes
+  resources:
+    physical_memory: $PHYS_MEM
+    physical_cpu: $PHYS_CPU
+    host_reserved:
+      memory: $HOST_RES_MEM
+      cpu: $HOST_RES_CPU
+  watermarks:
+    operational_margin_factor: 0.10
+    high_factor: $HIGH_FACTOR
+    low_factor: $LOW_FACTOR
+    emergency_factor: $EMERG_FACTOR
+    startup_factor: $STARTUP_FACTOR
+  rate_limits:
+    memory_grant_per_sec_factor: $GRANT_PER_SEC_FACTOR
+  admission:
+    rate: $ADM_RATE
+    burst: $ADM_BURST
+    startup_ttl: 30s
+    queue_ttl: ${ADMIT_DEADLINE}s
+    queue_max_depth: 256
+  dampening:
+    recover_duration: $RECOVER_DUR
+    cooldown_periods: 5
+  log_level: info
 EOF
 
 # ---- helpers: snapshot host avail / controller counters / cgroup events ----
@@ -420,14 +433,15 @@ say "   workload:     $WORKLOAD_DESC"
 say "   timing:       workload=${WL_DURATION}s  admit_deadline=${ADMIT_DEADLINE}s  observe=${OBSERVE_DURATION}s  (queue_ttl=${ADMIT_DEADLINE}s)"
 say ""
 
-# ---- spin up node-ctl daemon ----
-"$BIN/node-ctl" daemon --config "$WORK/node-ctl.yaml" >"$WORK/daemon.log" 2>&1 &
+# ---- spin up the resource controller (node-ctl serve, resource_listen) ----
+"$BIN/node-ctl" serve --config "$WORK/node-ctl.yaml" >"$WORK/daemon.log" 2>&1 &
 DAEMON_PID=$!
-for _ in 1 2 3 4 5 6 7 8 9 10; do
+for _ in $(seq 1 60); do
     [ -S "$WORK/sandbox-resource.sock" ] && break
-    sleep 0.2
+    kill -0 "$DAEMON_PID" 2>/dev/null || break
+    sleep 0.25
 done
-[ -S "$WORK/sandbox-resource.sock" ] || { say " FATAL: node-ctl daemon did not bind socket"; exit 1; }
+[ -S "$WORK/sandbox-resource.sock" ] || { say " FATAL: node-ctl serve did not bind the resource socket"; cat "$WORK/daemon.log" >&2; exit 1; }
 
 # ---- baseline host memory (taken AFTER daemon up, BEFORE first sandbox) ----
 host_baseline_avail=$(read_avail)
