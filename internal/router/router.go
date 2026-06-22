@@ -70,8 +70,8 @@ const buildTTL = time.Hour
 // TCP) for reserve + route resolution.
 type Router struct {
 	domain        string
-	authMode      string       // off | log | enforce — caller api_key auth (§8); default enforce
-	dataPlaneAuth string       // off | log | enforce — data-plane access-token check (§7)
+	authMode      string // off | log | enforce — caller api_key auth (§8); default enforce
+	dataPlaneAuth string // off | log | enforce — data-plane access-token check (§7)
 	mx            *metrics.M
 	opBase        string       // http base for the op interface
 	opClient      *http.Client // 60s timeout (reserve / route calls)

@@ -82,7 +82,7 @@ type SandboxRecord struct {
 type GroupConfig struct {
 	Group         string              `json:"group"` // group path (the store key)
 	ProjectID     string              `json:"project_id,omitempty"`
-	ManifestKey   string              `json:"manifest_key,omitempty"` // hex; sealed on store, plain in memory
+	ManifestKey   string              `json:"manifest_key,omitempty"`  // hex; sealed on store, plain in memory
 	RegistryAuth  string              `json:"registry_auth,omitempty"` // build image-pull creds (docker config.json); sealed on store
 	SandboxConfig map[string]string   `json:"sandbox_config,omitempty"`
 	ImageRepo     string              `json:"image_repo,omitempty"`

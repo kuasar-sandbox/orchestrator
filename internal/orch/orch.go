@@ -71,8 +71,8 @@ type Orchestrator struct {
 	probe      ResourceProbe   // node water level for cluster heartbeat (set by serve when resource_listen on); nil = none
 
 	clusterBuildMu sync.Mutex
-	clusterBuilds  map[string]*clusterBuild     // build_id -> cluster build (group + transient image-pull creds, §7.5)
-	buildEvents    chan *routesync.BuildEvent   // node -> registry build state, drained by the node-link client
+	clusterBuilds  map[string]*clusterBuild   // build_id -> cluster build (group + transient image-pull creds, §7.5)
+	buildEvents    chan *routesync.BuildEvent // node -> registry build state, drained by the node-link client
 }
 
 // clusterBuild is a registry-driven build's node-side context: its group (for

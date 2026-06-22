@@ -7,9 +7,9 @@ import (
 )
 
 type stubProbe struct {
-	zone               string
-	alloc, pool        int64
-	draining           bool
+	zone        string
+	alloc, pool int64
+	draining    bool
 }
 
 func (p stubProbe) Zone() string          { return p.zone }

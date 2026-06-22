@@ -95,7 +95,7 @@ func (o *Orchestrator) HandleCommand(ctx context.Context, cmd *routesync.Command
 // nil = no controller (static cgroup), then zone/water are reported as their
 // zero-load defaults and only the sandbox count + build alloc carry signal.
 type ResourceProbe interface {
-	Zone() string         // green | yellow | red | critical
+	Zone() string          // green | yellow | red | critical
 	AllocatedBytes() int64 // memory currently reserved
 	PoolBytes() int64      // allocatable memory pool
 	Draining() bool        // node-side drain set (node-resource.md §2.5)

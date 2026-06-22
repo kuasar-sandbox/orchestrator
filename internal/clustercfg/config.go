@@ -28,8 +28,8 @@ const (
 // is independently "store" (registry self-stores) or "external:<addr>" (a
 // cloud-provider service; manifest_key only passes through, never persisted).
 const (
-	ProviderStore        = "store"
-	ProviderExternalPfx  = "external:" // external:<addr>
+	ProviderStore         = "store"
+	ProviderExternalPfx   = "external:" // external:<addr>
 	envGroupEncryptionKey = "CLUSTER_GROUP_ENCRYPTION_KEY"
 )
 
@@ -352,13 +352,25 @@ func (c *Config) Validate() error {
 
 // Duration accessors (validated by Validate, so the parse can't fail here).
 
-func (c *ChannelConfig) HeartbeatDur() time.Duration { d, _ := time.ParseDuration(c.HeartbeatInterval); return d }
-func (c *ChannelConfig) NodeDeadDur() time.Duration  { d, _ := time.ParseDuration(c.NodeDeadAfter); return d }
+func (c *ChannelConfig) HeartbeatDur() time.Duration {
+	d, _ := time.ParseDuration(c.HeartbeatInterval)
+	return d
+}
+func (c *ChannelConfig) NodeDeadDur() time.Duration {
+	d, _ := time.ParseDuration(c.NodeDeadAfter)
+	return d
+}
 func (c *ReserveConfig) ParkDur() time.Duration { d, _ := time.ParseDuration(c.ParkTimeout); return d }
 
 // RecordTTLDur is the idle-SAVED-record GC age (0 = disabled).
-func (c *ReserveConfig) RecordTTLDur() time.Duration { d, _ := time.ParseDuration(c.RecordTTL); return d }
-func (c *RouterConfig) AuthCacheDur() time.Duration  { d, _ := time.ParseDuration(c.AuthCacheTTL); return d }
+func (c *ReserveConfig) RecordTTLDur() time.Duration {
+	d, _ := time.ParseDuration(c.RecordTTL)
+	return d
+}
+func (c *RouterConfig) AuthCacheDur() time.Duration {
+	d, _ := time.ParseDuration(c.AuthCacheTTL)
+	return d
+}
 
 // ProviderFor returns the configured provider spec for a fine-grained interface
 // (defaulting to store), and whether it is external (with the address).

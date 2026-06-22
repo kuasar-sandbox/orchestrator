@@ -34,7 +34,7 @@ type PlaceReq struct {
 	ReqID               string `json:"req_id"`
 	Group               string `json:"group"`
 	RouteKey            string `json:"route_key"`
-	Build               bool   `json:"build,omitempty"`         // a build placement (resource-aware, §4.5)
+	Build               bool   `json:"build,omitempty"` // a build placement (resource-aware, §4.5)
 	TargetRuntimeDigest string `json:"target_runtime,omitempty"`
 }
 
@@ -111,10 +111,10 @@ type BuildResources struct {
 // is set by node-side drain (node-resource.md §2.5) so placement excludes the node.
 type Heartbeat struct {
 	Zone       string          `json:"zone,omitempty"`
-	Allocated  int64           `json:"allocated,omitempty"`  // memory allocated (bytes)
-	Pool       int64           `json:"pool,omitempty"`       // allocatable pool (bytes)
+	Allocated  int64           `json:"allocated,omitempty"`   // memory allocated (bytes)
+	Pool       int64           `json:"pool,omitempty"`        // allocatable pool (bytes)
 	BuildAlloc *BuildResources `json:"build_alloc,omitempty"` // in-flight + reserved build usage
-	Counts     int             `json:"counts,omitempty"`     // live sandbox count (headroom fallback)
+	Counts     int             `json:"counts,omitempty"`      // live sandbox count (headroom fallback)
 	Draining   bool            `json:"draining,omitempty"`
 }
 
