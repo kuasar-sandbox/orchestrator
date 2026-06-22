@@ -287,6 +287,15 @@ case "$DATA_CODE" in
     *) echo "== router log =="; sed 's/^/  router| /' "$WORK/router.log" | tail -20; fail "data-plane forward to envd failed (http $DATA_CODE)";;
 esac
 
+# ---- by-(group,route-key) data addressing: no <port>-<sid> host, just headers --
+BYKEY=$(curl -sS --noproxy '*' -o /dev/null -w '%{http_code}' --max-time 15 \
+    -H "Host: data.$DOMAIN" -H "X-API-KEY: $AK" -H "X-Kuasar-Sandbox-Group: $GROUP" -H "X-Kuasar-Route-Key: $RK" -H "E2b-Sandbox-Port: 49983" \
+    "http://127.0.0.1:$ROUTER_PORT/health" 2>/dev/null || echo 000)
+case "$BYKEY" in
+    2*|404) echo "==> PASS: by-(group,route-key) data addressing reached the sandbox (Reserve + forward; http $BYKEY)";;
+    *) echo "== router log =="; sed 's/^/  router| /' "$WORK/router.log" | tail -15; fail "by-key data addressing failed (http $BYKEY)";;
+esac
+
 # ---- control verb: GET the sandbox via the router (forward to the node) ------
 gcode=$(curl -sS --noproxy '*' -o /dev/null -w '%{http_code}' -H "Host: api.$DOMAIN" -H "X-API-KEY: $AK" -H "X-Kuasar-Sandbox-Group: $GROUP" "http://127.0.0.1:$ROUTER_PORT/sandboxes/$SID")
 [ "$gcode" = "200" ] && echo "==> PASS: control verb GET /sandboxes/$SID forwarded to the node (http 200)" || { sed 's/^/  router| /' "$WORK/router.log" | tail -10; fail "control-verb forward GET=$gcode (want 200)"; }
