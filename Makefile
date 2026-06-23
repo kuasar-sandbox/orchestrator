@@ -40,15 +40,14 @@ GO_REPOS       := sandbox-accelerator sandbox-runtime sandbox-vswitch sandbox-or
 # Cross-repo e2e tests this repo carries (each needs binaries from multiple
 # sub-repos: vmlinux/CH/mkfs.erofs from sandbox-deps, manifest-ctl/store-ctl/
 # cache-ctl/flatten-ctl from sandbox-accelerator, node-ctl from sandbox-orchestrator, etc.).
-UMBRELLA_E2E := \
-  test-e2e-manifest test-e2e-obs test-e2e-warmpool-dedup test-e2e-density \
-  test-e2e-sandbox-cold test-e2e-sandbox-cold-manifest test-e2e-sandbox-cold-target \
-  test-e2e-sandbox-diff-template test-e2e-sandbox-launchspec test-e2e-sandbox-local-merge \
-  test-e2e-sandbox-proto \
-  test-e2e-sandbox-restore test-e2e-sandbox-restore-files test-e2e-sandbox-snapshot \
-  test-e2e-sandbox-stdio test-e2e-sandbox-tapfd test-e2e-sandbox-upload-restore \
-  test-e2e-orchestrator test-e2e-runtask \
-  test-e2e-run-builder test-e2e-execute test-e2e-orchestrator-proxy
+#
+# Auto-derived from the filesystem so `make test-e2e` always runs EVERY e2e script
+# (drop an e2e_*.sh into test/e2e/ and it is included — no list to forget). The
+# target name maps to the file with '_' → '-': e2e_sandbox_cold.sh → test-e2e-sandbox-cold
+# (the pattern rule below reverses it). Each script self-skips (exit 0) when its
+# prerequisites are absent, so coverage is never silently dropped.
+E2E_SCRIPTS  := $(sort $(wildcard test/e2e/e2e_*.sh))
+UMBRELLA_E2E := $(foreach s,$(E2E_SCRIPTS),test-e2e-$(subst _,-,$(patsubst e2e_%.sh,%,$(notdir $(s)))))
 
 PERF_TARGETS := perf-sandbox perf-sandbox-manifest perf-density
 
@@ -161,7 +160,7 @@ help:
 	@echo "  build         build every sub-repo + assemble bin/\$$(TARGET_ARCH)/ (multi-min cold)"
 	@echo "  collect       re-assemble bin/\$$(TARGET_ARCH)/ from existing sub-repo outputs"
 	@echo "  release       build + package dist/kuasar-sandbox-\$$(VERSION)-linux-\$$(TARGET_ARCH).tar.gz"
-	@echo "  test-e2e      aggregate: drive each sub-repo's test-e2e + run this repo's cross-repo e2e (22)"
+	@echo "  test-e2e      aggregate: drive each sub-repo's test-e2e + run this repo's cross-repo e2e ($(words $(UMBRELLA_E2E)))"
 	@echo "  test-e2e-<X>  one e2e sub-target (X in {manifest,obs,density,sandbox-{cold,..},orchestrator,run-builder,execute,..})"
 	@echo "  demo          run the e2b end-to-end demo (test/demo/demo_e2b.sh; DEMO_PAUSE=1 to step through)"
 	@echo "  perf          aggregate: accelerator perf-cache + this repo's perf-sandbox/-manifest/-density"
