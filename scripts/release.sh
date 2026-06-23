@@ -125,13 +125,23 @@ PERFS=(
   "sandbox-accelerator/test/scripts/proc_analyze.py"
 )
 
-# Deploy assets — operator-facing config + unit examples staged under
-# <release>/deploy/. node-ctl additionally self-installs its sandbox
-# template units at startup (see node.md §5).
+# Deploy assets — operator-facing example configs + systemd units staged under
+# <release>/deploy/: one example config per daemon role (node serve/proxy +
+# cluster registry/router/scaler) and the matching units. node-ctl additionally
+# self-installs its sandbox template units at startup (see node.md §5).
 DEPLOYS=(
-  "sandbox-orchestrator/deploy/config.example.yaml"
+  # node roles
+  "sandbox-orchestrator/deploy/serve.example.yaml"
+  "sandbox-orchestrator/deploy/proxy.example.yaml"
   "sandbox-orchestrator/deploy/node-ctl.service"
   "sandbox-orchestrator/deploy/node-proxy@.service"
+  # cluster roles
+  "sandbox-orchestrator/deploy/registry.example.yaml"
+  "sandbox-orchestrator/deploy/router.example.yaml"
+  "sandbox-orchestrator/deploy/scaler.example.yaml"
+  "sandbox-orchestrator/deploy/cluster-registry.service"
+  "sandbox-orchestrator/deploy/cluster-router.service"
+  "sandbox-orchestrator/deploy/cluster-scaler.service"
 )
 
 # The e2b end-to-end demo (prep + run scripts + guide) — the headline "try it"
@@ -170,7 +180,7 @@ done
 # Same drift guard for the accelerator sub-repo scripts the release bundles —
 # its e2e (E2ES) and its bench/dedup helpers (PERFS). runtime/vswitch ship no
 # test scripts; orchestrator's sole e2e needs a source checkout (kept out).
-ACC_E2E_EXCLUDE=( "run.sh" )   # flatten-registry e2e: finds binaries via PATH/env, not the ../../bin convention; stays in the source repo
+ACC_E2E_EXCLUDE=( "e2e_flatten.sh" )   # flatten-registry e2e: finds binaries via PATH/env, not the ../../bin convention; stays in the source repo
 for f in "$ORG"/sandbox-accelerator/test/e2e/*.sh; do
   [ -e "$f" ] || continue
   b="$(basename "$f")"
@@ -185,6 +195,16 @@ for f in "$ORG"/sandbox-accelerator/test/scripts/*; do
   printf '%s\n' "${PERFS[@]}" | grep -q "/$b\$" && continue
   printf '%s\n' "${ACC_SCRIPTS_EXCLUDE[@]:-}" | grep -qx "$b" && continue
   missing+=("sandbox-accelerator/test/scripts/$b — not in PERFS or ACC_SCRIPTS_EXCLUDE (release manifest drift)")
+done
+# Same drift guard for the operator deploy assets (DEPLOYS): a newly-added role
+# config or unit must be bundled or excluded, else it silently misses the tarball.
+DEPLOY_EXCLUDE=()   # add basenames intentionally kept out of the release, with a reason
+for f in "$ORG"/sandbox-orchestrator/deploy/*; do
+  [ -e "$f" ] || continue
+  b="$(basename "$f")"
+  printf '%s\n' "${DEPLOYS[@]}" | grep -q "/$b\$" && continue
+  printf '%s\n' "${DEPLOY_EXCLUDE[@]:-}" | grep -qx "$b" && continue
+  missing+=("sandbox-orchestrator/deploy/$b — not in DEPLOYS or DEPLOY_EXCLUDE (release manifest drift)")
 done
 if [ "${#missing[@]}" -gt 0 ]; then
   echo "release.sh: missing inputs:" >&2
