@@ -245,3 +245,20 @@ SandboxGroupImporter:
 | registry 双成员故障 | 对应 shard 少于 W 时停写 |
 | membership 变更 | learner 预同步 + per-shard 短栅栏 + old grace |
 | 整集群下电 | 不要求自动恢复沙箱 |
+
+## 13. 集群 stub e2e
+
+`node-stub-ctl` 是集群功能的本仓 e2e 节点桩。它使用真实 `node_link` 协议接入 registry,一个进程可
+模拟多个节点,但不启动 microVM。除 microVM/应用进程外,它完整模拟节点控制面行为:
+
+- 注册 node、心跳、drain、水位和 build 预算。
+- 接收 `key_put/key_drop/create/connect/delete/build_register` 命令并返回 ack。
+- 按 sandbox 行为配置延迟发布 READY/dead route event。
+- 发布 build event。
+- 提供 admin API / 子命令查询节点、沙箱、build、key、command 和 data hit。
+- 支持 `restart-link`、`reboot-empty`、`crash/start` 等节点动作。
+
+本仓 `make test-e2e` 先 `make build`,再用产物真实启动 `cluster-ctl registry/router/scaler` 与
+`node-stub-ctl`,覆盖 group 导入、key 分发、Reserve、数据面转发、活动路由缓存、BuildRegister、
+孤儿 route 清理和节点清空收敛。该 e2e 不依赖 KVM/root/systemd;真实 microVM 端到端测试由 umbrella
+仓和 `kuasar-sandbox` 集成套件执行。

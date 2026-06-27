@@ -1,6 +1,6 @@
 # sandbox-orchestrator
 
-e2b 兼容沙箱平台的**节点主机**与**集群控制面**,两个二进制、两层:
+e2b 兼容沙箱平台的**节点主机**与**集群控制面**,两个生产二进制、一个 e2e 辅助二进制、两层:
 
 - **`node-ctl`**(节点)——计算节点上的单实例常驻 daemon。对外是 **e2b 兼容北向入口**
   (未改造的 e2b SDK/CLI 直接指向即可 create/exec/pause/resume/kill microVM 沙箱、构建
@@ -26,6 +26,7 @@ e2b 兼容沙箱平台的**节点主机**与**集群控制面**,两个二进制�
 | --- | --- |
 | `cmd/node-ctl` | 节点主二进制:`serve`(daemon:控制面 + 数据面 + 可选 `resource_listen` 资源控制器 + node-link 客户端)/ `proxy`(外置数据面 worker)/ `run-sandbox`·`run-builder`(单元内启动器)/ `resource {status,list,drain,grant,reclaim}` / `config` / `manifest-key` / `export-sandbox`·`import-sandbox` / `version` |
 | `cmd/cluster-ctl` | 集群主二进制(三角色均独立进程):`registry`(持久状态权威 + 节点通道 + 密钥分发)/ `router`(e2b 入口)/ `scaler`(反向调用放置)/ `sandbox-group`(sandbox-group 配置)/ `config` / `version` |
+| `cmd/node-stub-ctl` | 集群 e2e 辅助二进制:一个进程模拟多个 node-link 节点,提供 admin/data API 控制重启、清空、沙箱/build 状态和故障注入,不启动 microVM |
 | `cmd/e2b-key-ctl` | 纯派生凭据工具(无 DB/config):`gen-key` / `gen-apikey` / `fingerprint` / `seal-pull-token` |
 | `internal/orch` | 节点编排核心:生命周期、构建池、本节点路由权威、单元生成、重启对账 |
 | `internal/nodectl` | 资源控制器:两环仲裁、四级水位 + 应急池、cgroup 真相源对账恢复、审计 |
@@ -43,11 +44,12 @@ e2b 兼容沙箱平台的**节点主机**与**集群控制面**,两个二进制�
 ## 构建
 
 ```bash
-make build                      # bin/<arch>/{node-ctl,cluster-ctl,e2b-key-ctl};纯 Go,CGO_ENABLED=0
+make build                      # bin/<arch>/{node-ctl,cluster-ctl,node-stub-ctl,e2b-key-ctl};纯 Go,CGO_ENABLED=0
 make build TARGET_ARCH=aarch64  # 交叉编译(别名 amd64 / arm64)
 make sandbox-runtime-e2b        # 注入 envd 的 guest runtime(需 sandbox-deps 的 envd/fsck.erofs/mkfs.erofs)
 make sandbox-runtime-builder    # 构建沙箱 guest runtime(e2b flavor + flatten-ctl + mkfs.erofs)
-make test                       # 单元测试;e2e 见 docs/node.md §16
+make test                       # 单元测试
+make test-e2e                   # 启动真实 registry/router/scaler + node-stub-ctl 做集群 stub e2e
 ```
 
 运行需要 systemd(D-Bus 管单元)与 root;沙箱本体另需 KVM 与 vswitch(见各自仓)。

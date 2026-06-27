@@ -21,8 +21,8 @@ import (
 )
 
 // runRouter starts the router role: the e2b-compatible unified ingress
-// (cluster-router.md). It dials the registry's control API for reserve + route
-// resolution. Phase 3 serves plain h2c (dev); router.tls + auth cache are Phase 7.
+// (cluster-router.md). It dials the registry route_link for reserve, route
+// resolution, build placement, and API-key verification.
 func runRouter(args []string, log *slog.Logger) error {
 	fs := flag.NewFlagSet("router", flag.ExitOnError)
 	cfgPath := fs.String("config", "/etc/cluster-ctl/router.yaml", "config file")

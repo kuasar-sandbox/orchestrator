@@ -12,7 +12,7 @@
 
 SHELL := /bin/bash
 
-.PHONY: all build node-ctl cluster-ctl e2b-key-ctl sandbox-runtime-e2b sandbox-runtime-builder \
+.PHONY: all build node-ctl cluster-ctl node-stub-ctl e2b-key-ctl sandbox-runtime-e2b sandbox-runtime-builder \
         test vet bench test-e2e test-e2e-cluster-stub clean help
 
 # ---------------------------------------------------------------------------
@@ -63,7 +63,7 @@ all: build
 
 # `build` ships the daemon + the e2b key tool. sandbox-runtime-e2b is opt-in
 # (needs envd + a base runtime), invoked explicitly or by the umbrella's deps stage.
-build: node-ctl cluster-ctl e2b-key-ctl
+build: node-ctl cluster-ctl node-stub-ctl e2b-key-ctl
 
 # e2b-key-ctl: pure-derivation tool to mint e2b API keys from a manifest key.
 e2b-key-ctl:
@@ -84,6 +84,13 @@ cluster-ctl:
 	@mkdir -p $(BINDIR)
 	GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=0 $(GO) build $(GO_BUILD_FLAGS) -o $(BINDIR)/cluster-ctl ./cmd/cluster-ctl
 	$(call link_bin,cluster-ctl)
+
+# node-stub-ctl: controllable node-link stubs for cluster e2e. It simulates node
+# control-plane behavior without launching microVMs.
+node-stub-ctl:
+	@mkdir -p $(BINDIR)
+	GOOS=linux GOARCH=$(GO_ARCH) CGO_ENABLED=0 $(GO) build $(GO_BUILD_FLAGS) -o $(BINDIR)/node-stub-ctl ./cmd/node-stub-ctl
+	$(call link_bin,node-stub-ctl)
 
 # Inject envd into a bare sandbox-runtime.erofs -> sandbox-runtime-e2b.erofs
 # (pure shell over fsck.erofs/mkfs.erofs — no node-ctl binary needed).
@@ -120,10 +127,10 @@ clean:
 
 # Self-contained cluster e2e: real registry/router/scaler code with a node-link
 # stub. No KVM, systemd, root, or microVM artifacts required.
-test-e2e: test-e2e-cluster-stub
+test-e2e: build test-e2e-cluster-stub
 
 test-e2e-cluster-stub:
-	CGO_ENABLED=0 $(GO) test ./test/e2e/cluster_stub
+	BIN="$(CURDIR)/$(BINDIR)" bash test/e2e/e2e_cluster_stub.sh
 
 help:
 	@echo "sandbox-orchestrator. Targets:"
@@ -131,6 +138,7 @@ help:
 	@echo "  sandbox-runtime-e2b        inject envd (from sandbox-deps) into a base sandbox-runtime.erofs"
 	@echo "  sandbox-runtime-builder    e2b flavor + flatten-ctl + mkfs.erofs (build-sandbox guest runtime)"
 	@echo "  node-ctl                   node resource controller (folded in from sandbox-sentinel)"
+	@echo "  node-stub-ctl              build controllable cluster e2e node-link stubs"
 	@echo "  test / vet / bench / clean"
-	@echo "  test-e2e                  run the self-contained cluster stub e2e"
+	@echo "  test-e2e                   run real-process cluster e2e with node-stub-ctl"
 	@echo "  TARGET_ARCH                x86_64 (default) | aarch64"
