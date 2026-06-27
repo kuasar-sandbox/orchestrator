@@ -7,7 +7,6 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -15,10 +14,31 @@ import (
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
 
+	clusterstate "github.com/kuasar-sandbox/sandbox-orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/clusterstore"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/registry"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/routesync"
 )
+
+const testAuthKey = "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100"
+
+type authProvider struct{}
+
+func (authProvider) Get(context.Context, string) (clusterstate.SandboxGroup, bool, error) {
+	return clusterstate.SandboxGroup{}, true, nil
+}
+
+func (authProvider) GetPlacementHint(context.Context, string) (clusterstate.PlacementHint, bool, error) {
+	return clusterstate.PlacementHint{}, true, nil
+}
+
+func (authProvider) GetKey(context.Context, string) (clusterstate.Secret, bool, error) {
+	return clusterstate.Secret{}, false, nil
+}
+
+func (authProvider) GetAuthKey(context.Context, string) (clusterstate.Secret, bool, error) {
+	return clusterstate.Secret{Type: clusterstate.SecretInline, Value: testAuthKey}, true, nil
+}
 
 // fakeNode implements Node: it streams its routes and, on a create command,
 // "boots" the sandbox by adding a running route + emitting an upsert event — the
@@ -70,12 +90,10 @@ func TestNodeLinkReserveRoundTrip(t *testing.T) {
 	defer cancel()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 
-	kv, err := clusterstore.Open(filepath.Join(t.TempDir(), "r.db"), 0)
-	if err != nil {
-		t.Fatal(err)
-	}
+	kv := clusterstore.OpenMemory(0)
 	defer kv.Close()
 	reg := registry.New(registry.NewStores(kv, nil), nil, 5*time.Second, log)
+	reg.SetSandboxGroupProvider(authProvider{})
 
 	mux := http.NewServeMux()
 	mux.HandleFunc(routesync.NodeLinkPath, reg.ServeNodeLink)
@@ -107,7 +125,11 @@ func TestNodeLinkReserveRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reserve over node-link: %v", err)
 	}
-	if res.NodeID != "n1" || res.SID == "" || res.AccessToken != "tok-"+res.SID {
+	want, err := clusterstate.DeriveAccessToken(testAuthKey, res.SID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.NodeID != "n1" || res.SID == "" || res.AccessToken != want {
 		t.Fatalf("reserve result: %+v", res)
 	}
 }

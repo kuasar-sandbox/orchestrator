@@ -77,12 +77,11 @@ func configCmd(args []string) error {
 
 const registryConfigSkeleton = `# cluster-ctl registry config — cluster-ctl registry --config <this> (cluster.md §3/§4.1).
 # Durable state authority + node-link hub. Required: state.
-state:                               # durable cluster-state backend
-  backend: sqlite                    # sqlite | etcd | raft (etcd/raft = Phase 7)
-  dsn: /var/lib/cluster/registry.db
+state:                               # registry-owned state backend
+  backend: memory
 sandbox_group:                       # how per-group config is sourced (§6.2)
   providers: { key: store, sandbox_config: store, placement: store, image_pull: store }
-  # encryption_key: ""               # AES-256 sealing self-stored manifest_key (or SANDBOX_GROUP_ENCRYPTION_KEY env)
+  # encryption_key: ""               # AES-256 sealing self-stored group secrets (or SANDBOX_GROUP_ENCRYPTION_KEY env)
   # tls: { cert: ..., key: ..., ca: ... }   # client mTLS for external:<addr> providers
 node_link:                           # nodes dial this (node-link)
   listen: ":7700"
@@ -95,7 +94,6 @@ control_api:                         # router / scaler dial this
   # tls: { cert: ..., key: ..., ca: ... }   # server mTLS when split across hosts (§5.4)
 reserve:
   park_timeout: 30s
-  # record_ttl: ""                   # GC idle SAVED records after this; "" = off
 `
 
 const routerConfigSkeleton = `# cluster-ctl router config — cluster-ctl router --config <this> (cluster-router.md §3).

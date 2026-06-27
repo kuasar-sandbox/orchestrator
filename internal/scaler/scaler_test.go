@@ -126,6 +126,32 @@ func TestEffectiveSelectors(t *testing.T) {
 	}
 }
 
+func TestKeyAllocation(t *testing.T) {
+	ns := nodes(
+		&registry.NodeRecord{NodeID: "n-s1", Labels: map[string]string{"pool": "p1", "slot": "s1"}},
+		&registry.NodeRecord{NodeID: "n-s2", Labels: map[string]string{"pool": "p1", "slot": "s2"}},
+		&registry.NodeRecord{NodeID: "n-s3", Labels: map[string]string{"pool": "p1", "slot": "s3"}, Draining: true},
+		&registry.NodeRecord{NodeID: "other", Labels: map[string]string{"pool": "p2", "slot": "s4"}},
+	)
+	rules := []clustercfg.ShuffleRule{{Selector: map[string]string{"pool": "p1"}, ShardBy: "slot", N: 2}}
+	selectors, ids := keyAllocation("/cell/g1", ns, []map[string]string{{"pool": "p1"}}, rules)
+	if len(selectors) != 2 {
+		t.Fatalf("selectors=%v, want two shuffle-effective selectors", selectors)
+	}
+	for _, id := range ids {
+		if id == "n-s3" || id == "other" {
+			t.Fatalf("allocation included ineligible node %q: %v", id, ids)
+		}
+	}
+	if len(ids) == 0 {
+		t.Fatal("allocation unexpectedly empty")
+	}
+	_, ids = keyAllocation("/g", ns, []map[string]string{{"pool": "p2"}}, nil)
+	if len(ids) != 1 || ids[0] != "other" {
+		t.Fatalf("static allocation ids=%v, want [other]", ids)
+	}
+}
+
 func TestPlaceBuildHeadroom(t *testing.T) {
 	// A node with no build headroom (alloc==capacity CPU) is excluded.
 	ns := nodes(

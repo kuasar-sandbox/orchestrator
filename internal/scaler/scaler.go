@@ -24,11 +24,11 @@ type placeParams struct {
 	zoneAdmitMax        string // exclude nodes hotter than this (green<yellow<red<critical); "" = no zone filter
 	deadAfter           int64  // exclude nodes whose last heartbeat predates now-deadAfter (0 = skip)
 	now                 int64
-	targetRuntimeDigest string // when set, require node.RuntimeDigest == it (runtime-compat, §4.2)
+	targetRuntimeDigest string // when set, require node.RuntimeDigest == it (runtime match, §4.2)
 }
 
 // placeSandbox runs the sandbox placement algorithm (cluster-scaler.md §4.2):
-// matchSelectors ∧ ¬draining ∧ alive ∧ zone≤max ∧ runtime-compatible ∧ shuffle
+// matchSelectors ∧ ¬draining ∧ alive ∧ zone≤max ∧ runtime-match ∧ shuffle
 // slot, then P2C by water level. (Build placement is resource-aware — placeBuild.)
 func placeSandbox(p placeParams) (string, error) {
 	slotSet, shardBy := shuffleSlots(p.group, p.nodes, p.rules)

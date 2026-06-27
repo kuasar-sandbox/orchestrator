@@ -15,9 +15,9 @@ import (
 )
 
 // runScaler starts the standalone scaler (cluster.md §1.2/§4.2 — always a separate
-// process, no in-process mode): it DIALS the registry control endpoint, subscribes the
-// node/group view, and answers the registry's reverse placement requests over the
-// scaler-link. No listener (the registry reverse-calls it).
+// process, no in-process mode): it DIALS the registry control endpoint, subscribes
+// node_list/group views, and answers the registry's reverse placement requests over
+// the scaler-link. No listener (the registry reverse-calls it).
 func runScaler(args []string, log *slog.Logger) error {
 	fs := flag.NewFlagSet("scaler", flag.ExitOnError)
 	cfgPath := fs.String("config", "/etc/cluster-ctl/scaler.yaml", "config file")
@@ -45,7 +45,7 @@ func runScaler(args []string, log *slog.Logger) error {
 	svc := scaler.NewRemote(controlAddr, controlTLS, cfg.Placement, deadAfter, log)
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	svc.Start(ctx) // node + group view watches + the scaler-link (reverse placement)
+	svc.Start(ctx) // node_list + group watches + the scaler-link (reverse placement)
 	log.Info("cluster-ctl scaler", "registry", controlAddr, "registry_tls", controlTLS != nil,
 		"candidates", cfg.Placement.Candidates, "zone_admit_max", cfg.Placement.ZoneAdmitMax,
 		"shuffle_rules", len(cfg.Placement.ShuffleSharding))

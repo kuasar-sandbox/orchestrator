@@ -11,9 +11,8 @@ import (
 	"time"
 )
 
-// GroupHeader carries the group id on external provider requests (in a header,
-// never the query string — the manifest_key is in the response body only, and
-// group ids stay out of access logs).
+// GroupHeader carries the group id on external provider requests. It is a header
+// so group ids and returned key material stay out of query logs.
 const GroupHeader = "X-Kuasar-Sandbox-Group"
 
 // External provider wire paths (cluster.md §6.2).

@@ -351,7 +351,6 @@ node-ctl 同目录 → PATH"自动发现。
 | `builder.files_storage` | 空 | COPY 构建上下文的 S3/OBS 对象存储(子键 `endpoint`/`region`/`bucket`(必填)/`prefix`/`access_key`/`secret_key`/`force_path_style`/`presign_expiry`);空 = COPY 回 501。serve 仅 presign + HEAD;`access_key` 空走 AWS 默认链;`force_path_style` 默认 false(versitygw/minio 置 true);`presign_expiry` 默认 1h(PUT;GET 用 total+5m)。本地/单机无云对象存储用 versitygw(§12) |
 | `checkpoint.mode` | `local` | 暂停态落地:`local` = 本机文件(节点绑定)/ `remote` = 远程 manifest(可移植 = 模板)(§8.1) |
 | `checkpoint.local_dir` | `/var/lib/sandbox-saved` | 本机快照目录(`mode=local`) |
-| `checkpoint.deep_idle_sec` | `0` | 集群:PAUSED 深空闲 → SAVED 自提升阈值(cluster.md §7.4);0 = 关 |
 | `mmds.enabled` | `false` | envd 鉴权姿态开关(§9.2、node-proxy.md §8):false = `-isnotfc` + proxy 单闸门;true = FC 模式 + MMDS re-key |
 | `mmds.listen` | `127.0.0.1:19254` | MMDS 监听地址(vswitch `--mgmt-service` 的转换目标) |
 | `cluster.registry.endpoint` | 空 | registry 的 node-link 地址(§10);空 = 独立模式,不接入集群 |
@@ -723,8 +722,7 @@ id 二次注册自动反注册(并断链)前者。鉴权:配 `paths.plugin_pidfi
 本机快照可按需晋升:`export-sandbox` 内部走 `sandbox-ctl upload-snapshot <bundle>`
 上传为远程 manifest 并重指 `snapshot_ref`(本机 bundle 随之删除)。全部基于现有
 sandbox-ctl 原语(`snapshot --output|--upload`、`upload-snapshot`、`run --restore`),
-e2b API/CLI 零改动。集群下的 PAUSED→SAVED 下沉(节点本机 → 远程、不绑节点)即复用此晋升
-+ 铸迁移 token,经 node-link 两阶段上报(§10、cluster.md §7.4)。
+e2b API/CLI 零改动。
 
 `export-sandbox` / `import-sandbox`(CLI 形式见 §2.7)是 api 平面端点
 `POST /sandboxes/{id}/export`、`POST /sandboxes/import` 的客户端;两端点在 TLS
@@ -743,13 +741,11 @@ e2b API/CLI 零改动。集群下的 PAUSED→SAVED 下沉(节点本机 → 远�
 - **一步迁移**:`Sandbox.connect(<sid>, api_headers={"X-Kuasar-Migration-Token":
   <token>})`——目标机本地无此 sid 且带迁移 token 时,connect 在 resume 前自动
   import(同上校验,且 token 内 id 须等于所连 sid,否则报错并回收误插行),迁移收敛
-  为单次 SDK 调用;`import-sandbox` CLI 保留作显式预导入。集群下,registry 的
-  `create{migration_token}` 命令即以此一步迁移在新节点拉起 SAVED 沙箱(§10、cluster.md §7)。
+  为单次 SDK 调用;`import-sandbox` CLI 保留作显式预导入。
 - **状态感知驱动迁移**:暂停态的本地/远程经 `RouteEntry.snap_loc`(`local`|`remote`)随
   路由流下发(node-proxy.md §6);订阅 plugin 平面的平台 agent(`subscribe=route`)据此识别哪些 paused
   沙箱节点绑定(腾空节点前须先迁移)、哪些已可移植,再按需调 export-sandbox 铸造
-  MIGRATION_TOKEN 完成自动迁移。集群下该感知与迁移由 registry 经 node-link 驱动(scaler 不碰生命周期)
-  (§10、cluster.md §7)。迁移 token 是凭据且会回收源行,故按需铸造、绝不随路由广播。
+  MIGRATION_TOKEN 完成自动迁移。迁移 token 是凭据且会回收源行,故按需铸造、绝不随路由广播。
 - 限制:token 不含系统密钥,但携带沙箱自有 env 与数据面 token,按"沙箱级敏感"对待;
   快照绑定其 guest runtime(erofs 摘要校验),不同 runtime 的节点拒绝导入。
 
@@ -832,21 +828,18 @@ files 转发本机 e2b 控制面(§4),数据面业务流量经 router 注入 `E2
 
   | 命令 | 节点动作 |
   |---|---|
-  | `create{cmd_id, sid, group, route_key, template_ref, key_fp, config, migration_token?}` | 冷启 `template_ref` + 合并 `config`(§8;snp 模板 = 快照恢复快启)或带 token 一步迁移导入 + restore(§8.1);`key_fp` 选本机租约 manifest_key;group/route_key 注入沙箱 metadata |
+  | `create{cmd_id, sid, group, route_key, template_ref, key_fp, config}` | 冷启 `template_ref` + 合并 `config`(§8;snp 模板 = 快照恢复快启);`key_fp` 选本机租约 manifest_key;group/route_key 注入沙箱 metadata |
   | `connect{cmd_id, sid}` | 恢复本机 PAUSED 沙箱(§8 auto-resume) |
-  | `delete{cmd_id, sid|build_id}` | 销毁沙箱 / 构建(§5 kill);SAVED 两阶段回收步 |
+  | `delete{cmd_id, sid|build_id}` | 销毁沙箱 / 构建(§5 kill) |
   | `key_put` / `key_drop{fingerprint, manifest_key?, expires_unix}` | 写 / 重发续租 / 撤 `manifest_keys` 租约项(§7);**registry 的密钥分发**(cluster.md §7.6) |
   | `build_register{build_id, template_id, group, resources, image_repo, registry_auth, key_fp, config}` | 预配 registry 分配的构建(§12;按指纹解析 key、建 build 记录、瞬态用镜像凭据);构建态经 `build_event` 上报 |
 
-  无 `drain` 命令——节点排空 / 维护由**节点侧**发起(node-resource.md §2.5 资源 drain,或本机深空闲
-  自提升),集群侧仅停止向其分配(cluster-scaler.md §4),不由 registry 命令(cluster.md §7.3)。
-- **PAUSED→SAVED(节点驱动 / 显式)**:节点本地深空闲策略(或控制面显式 pause)把本机快照上送远程
-  (§8.1)、铸 migration_token,发 `saved(token)` 但**保留本机**;registry 持久化 token、清 node_id 后
-  下发 `delete{sid}`,节点收到才回收本机——两阶段不丢态(cluster.md §7.4)。
+  无 `drain` 命令——节点排空 / 维护由**节点侧**发起(node-resource.md §2.5 资源 drain 或本机维护策略),
+  集群侧仅停止向其分配(cluster-scaler.md §4),不由 registry 命令(cluster.md §7.3)。
 - **断线增量重连**:断连指数退避重连重注册,带 `resume_from=<rev>` 请增量重放(registry 留存窗口内
   只补增量,否则逐条全量 + `bookmark`,cluster.md §5.3)。registry 重启亦然。
 - **安全**:node-link 生产走 mTLS(`cluster.tls`);下行 `manifest_key` 仅入加密存储(§7),上行
-  `access_token` / `migration_token` 属沙箱级敏感,皆在 mTLS 内(cluster.md §5.4)。
+  `access_token` 属沙箱级敏感,在 mTLS 内传输(cluster.md §5.4)。
 - **与本机 plugin 平面统一**:接入集群即"节点作路由权威、registry 作订阅者"——与本机 config-socket
   plugin 平面(proxy worker / 观察者订阅本节点路由,§6 / node-proxy.md §6)**同一 routesync 引擎、
   同一线格式**,仅订阅者 `kind` 不同(`route` / `route_wake` / `registry`)。router **不**订阅节点

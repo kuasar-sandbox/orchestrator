@@ -27,6 +27,26 @@ type Source interface {
 	Policy() Policy
 }
 
+// ErrResumeUnavailable tells StreamAuthority to fall back to a full snapshot for
+// this subscription. Other replay errors are treated as stream failures.
+var ErrResumeUnavailable = errors.New("routesync: resume unavailable")
+
+// ResumableSource is an optional Source extension. If ResumeFrom carries a token
+// whose fingerprint matches SourceFingerprint, StreamAuthority replays changes
+// strictly after the decoded sequence instead of sending a full Range snapshot.
+// A fingerprint mismatch forces a full resync, which is the safety property node
+// owner subscriptions need across source restarts.
+type ResumableSource interface {
+	SourceFingerprint() string
+	Replay(ctx context.Context, afterSeq int64, fn func(Event) error) error
+}
+
+// RevisionSource is an optional Source extension used to stamp bookmarks with
+// the latest opaque resume token for the next incremental subscription.
+type RevisionSource interface {
+	CurrentRevToken() string
+}
+
 // ReadRegister reads the subscriber's first up-frame (its Register caps). The
 // config-socket plugin handler calls this before ServeAuthority so it can register
 // the subscriber (and its proxy target) before streaming.
@@ -127,12 +147,36 @@ func StreamAuthority(ctx context.Context, w io.Writer, flush func(), body io.Rea
 	ch, cancelSub := src.Subscribe()
 	defer cancelSub()
 
-	if err := src.Range(sctx, func(r RouteEntry) error {
-		return WriteMsg(w, &Msg{Type: TypeUpsert, Route: &r})
-	}); err != nil {
-		return
+	resumed := false
+	if reg.ResumeFrom != "" {
+		if rs, ok := src.(ResumableSource); ok {
+			if after, ok := CheckRevToken(reg.ResumeFrom, rs.SourceFingerprint()); ok {
+				err := rs.Replay(sctx, after, func(ev Event) error {
+					return writeEvent(w, ev)
+				})
+				switch {
+				case err == nil:
+					resumed = true
+				case errors.Is(err, ErrResumeUnavailable):
+					resumed = false
+				default:
+					return
+				}
+			}
+		}
 	}
-	if err := WriteMsg(w, &Msg{Type: TypeBookmark}); err != nil {
+	if !resumed {
+		if err := src.Range(sctx, func(r RouteEntry) error {
+			return WriteMsg(w, &Msg{Type: TypeUpsert, Route: &r})
+		}); err != nil {
+			return
+		}
+	}
+	bookmark := &Msg{Type: TypeBookmark}
+	if rev, ok := src.(RevisionSource); ok {
+		bookmark.RevToken = rev.CurrentRevToken()
+	}
+	if err := WriteMsg(w, bookmark); err != nil {
 		return
 	}
 	flush()
@@ -141,7 +185,10 @@ func StreamAuthority(ctx context.Context, w io.Writer, flush func(), body io.Rea
 		select {
 		case <-sctx.Done():
 			return
-		case m := <-outbox:
+		case m, ok := <-outbox:
+			if !ok || m == nil {
+				return
+			}
 			if err := WriteMsg(w, m); err != nil {
 				return
 			}
@@ -150,20 +197,24 @@ func StreamAuthority(ctx context.Context, w io.Writer, flush func(), body io.Rea
 			if !ok {
 				return // lagged + dropped by the source; the subscriber reconnects + re-syncs
 			}
-			m := &Msg{Type: ev.Kind}
-			switch ev.Kind {
-			case TypeUpsert:
-				r := ev.Route
-				m.Route = &r
-			case TypeDelete:
-				m.SID = ev.SID
-			default:
-				continue
-			}
-			if err := WriteMsg(w, m); err != nil {
+			if err := writeEvent(w, ev); err != nil {
 				return
 			}
 			flush()
 		}
 	}
+}
+
+func writeEvent(w io.Writer, ev Event) error {
+	m := &Msg{Type: ev.Kind}
+	switch ev.Kind {
+	case TypeUpsert:
+		r := ev.Route
+		m.Route = &r
+	case TypeDelete:
+		m.SID = ev.SID
+	default:
+		return nil
+	}
+	return WriteMsg(w, m)
 }

@@ -35,6 +35,12 @@ func TestNodeLinkCodecRoundTrip(t *testing.T) {
 	if c.Cmd == nil || c.Cmd.Kind != CmdCreate || c.Cmd.Group != "/c/p/a/g1" || c.Rev != 42 {
 		t.Fatalf("command round-trip: %+v rev=%d", c.Cmd, c.Rev)
 	}
+	k := roundTrip(t, &Msg{Type: TypeCommand, Cmd: &Command{
+		CmdID: "k1", Kind: CmdKeyPut, ManifestKeyType: "ref", ManifestKeyRef: "vault://tenant/key", ExpiresUnix: 123,
+	}})
+	if k.Cmd == nil || k.Cmd.ManifestKeyType != "ref" || k.Cmd.ManifestKeyRef != "vault://tenant/key" {
+		t.Fatalf("key_put ref round-trip: %+v", k.Cmd)
+	}
 
 	// a sandbox route reuses RouteEntry with the cluster fields set
 	r := roundTrip(t, &Msg{Type: TypeUpsert, Route: &RouteEntry{
@@ -56,9 +62,9 @@ func TestNodeLinkCodecRoundTrip(t *testing.T) {
 	}
 
 	reg := roundTrip(t, &Msg{Type: TypeRegister, Register: &Register{
-		Subscribe: &Subscribe{Kind: KindRegistry}, ResumeFrom: 100,
+		Subscribe: &Subscribe{Kind: KindRegistry}, ResumeFrom: MakeRevToken("node-fp", 100),
 	}})
-	if reg.Register == nil || reg.Register.Subscribe.Kind != KindRegistry || reg.Register.ResumeFrom != 100 {
+	if reg.Register == nil || reg.Register.Subscribe.Kind != KindRegistry || reg.Register.ResumeFrom != "node-fp:100" {
 		t.Fatalf("registry register round-trip: %+v", reg.Register)
 	}
 }

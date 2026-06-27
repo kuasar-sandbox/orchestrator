@@ -1,36 +1,30 @@
-// Package registry is the cluster control plane's durable state authority + node
-// channel hub (cluster.md §4/§6/§7). It layers four logical tables on the shared
-// clusterstore KV — node (global), sandbox-group config, sandbox + build
-// (group-sharded) — and drives sandboxes onto nodes via node-link (node.md §10):
-// ReserveSandbox places (a Placer suggests, the registry commits by CAS), sends
-// a create/connect command down a node's channel, and waits for the node to
-// report the sandbox running on its route stream.
-//
-// Phase 2 ships the sandbox path (node + group + sandbox tables, ReserveSandbox,
-// the node-link server) with a built-in single-node Placer; build registry,
-// scaler, router, and key distribution land in later phases.
+// Package registry is the cluster control plane's route/node owner and node-link
+// hub. route_link and node_link state go through the registry-owned quorum
+// kernel; group/build configuration remains in local typed tables until those
+// namespaces move behind the same member RPC boundary.
 package registry
 
 import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"net/url"
+	"sync"
+	"time"
 
+	clusterstate "github.com/kuasar-sandbox/sandbox-orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/clusterstore"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/secretbox"
 )
 
-// Key prefixes for the registry's logical tables on the shared clusterstore.
+// Key prefixes for registry-local typed tables.
 const (
-	nodePrefix    = "node/"    // node/<node_id>              (global)
-	groupPrefix   = "group/"   // group/<group>               (config; manifest_key sealed)
-	sandboxPrefix = "sandbox/" // sandbox/<group>/<route_key> (group-sharded)
-	buildPrefix   = "build/"   // build/<esc(group)>/<build_id> (group-sharded, §6.1)
+	groupPrefix = "group/" // group/<group>               (config; keys sealed)
+	buildPrefix = "build/" // build/<esc(group)>/<build_id> (group-sharded, §6.1)
 )
 
-// SandboxState mirrors cluster.md §7.1 (no WARM; warm = remote snapshot + restore).
+// SandboxState mirrors cluster.md route state. A missing/dead sandbox is
+// represented by no route row.
 type SandboxState string
 
 const (
@@ -38,11 +32,9 @@ const (
 	StateReserved SandboxState = "reserved"
 	StateReady    SandboxState = "ready"
 	StatePaused   SandboxState = "paused"
-	StateSaved    SandboxState = "saved"
 )
 
-// NodeRecord is the global node table row (cluster.md §6.1): identity + capacity
-// from register, water level from heartbeat.
+// NodeRecord is the registry-facing node_link view.
 type NodeRecord struct {
 	NodeID        string                    `json:"node_id"`
 	Labels        map[string]string         `json:"labels,omitempty"`
@@ -59,30 +51,30 @@ type NodeRecord struct {
 	// LastHeartbeatUnix is the last sign of life (register or heartbeat); the
 	// dead-node sweep (§11) resets a disconnected node whose last beat predates
 	// node_dead_after.
-	LastHeartbeatUnix int64 `json:"last_heartbeat_unix,omitempty"`
+	LastHeartbeatUnix int64  `json:"last_heartbeat_unix,omitempty"`
+	ResumeToken       string `json:"resume_token,omitempty"`
 }
 
-// SandboxRecord is a group-sharded sandbox row, keyed (group, route_key).
+// SandboxRecord is the registry-facing route_link view, keyed by
+// (group, route_key).
 type SandboxRecord struct {
-	Group          string       `json:"group"`
-	RouteKey       string       `json:"route_key"`
-	SID            string       `json:"sid,omitempty"`
-	State          SandboxState `json:"state"`
-	NodeID         string       `json:"node_id,omitempty"`
-	AccessToken    string       `json:"access_token,omitempty"`
-	MigrationToken string       `json:"migration_token,omitempty"`
-	SnapLoc        string       `json:"snap_loc,omitempty"`
-	TemplateID     string       `json:"template_id,omitempty"`
-	LastActive     int64        `json:"last_active,omitempty"`
+	Group      string       `json:"group"`
+	RouteKey   string       `json:"route_key"`
+	SID        string       `json:"sid,omitempty"`
+	State      SandboxState `json:"state"`
+	NodeID     string       `json:"node_id,omitempty"`
+	SnapLoc    string       `json:"snap_loc,omitempty"`
+	TemplateID string       `json:"template_id,omitempty"`
+	LastActive int64        `json:"last_active,omitempty"`
 }
 
-// GroupConfig is the sandbox-group config (cluster.md §6.2). The skeleton stores
-// it whole via the store provider; the fine-grained provider split is Phase 7.
-// ManifestKey (hex) is sealed at rest by the registry's box.
+// GroupConfig is the sandbox-group config. Secret fields are sealed at rest by
+// the registry's box.
 type GroupConfig struct {
 	Group         string              `json:"group"` // group path (the store key)
 	ProjectID     string              `json:"project_id,omitempty"`
 	ManifestKey   string              `json:"manifest_key,omitempty"`  // hex; sealed on store, plain in memory
+	AuthKey       string              `json:"auth_key,omitempty"`      // hex; sealed on store, plain in memory
 	RegistryAuth  string              `json:"registry_auth,omitempty"` // build image-pull creds (docker config.json); sealed on store
 	SandboxConfig map[string]string   `json:"sandbox_config,omitempty"`
 	ImageRepo     string              `json:"image_repo,omitempty"`
@@ -91,139 +83,464 @@ type GroupConfig struct {
 	ShuffleLabels map[string]string   `json:"shuffle_labels,omitempty"`
 }
 
-// Stores wraps the shared KV with typed, per-table accessors. The box seals the
-// group manifest_key at rest (cluster.md §6.2 store provider).
+// Stores wraps the shared KV with typed, per-table accessors. The box seals group
+// secrets at rest.
 type Stores struct {
-	kv  clusterstore.Store
-	box *secretbox.Box
+	kv     clusterstore.Store
+	box    *secretbox.Box
+	routes *clusterstate.RouteQuorum
+	nodes  *clusterstate.NodeQuorum
+
+	nodeListMu   sync.Mutex
+	nodeListRev  int64
+	nodeListLog  []clusterstore.Event
+	nodeListSubs map[int]chan clusterstore.Event
+	nodeListSeq  int
+
+	handoffMu        sync.RWMutex
+	membershipVer    int64
+	routeHandoffGate map[string]clusterstate.HandoffGate
+	nodeHandoffGate  map[string]clusterstate.HandoffGate
 }
+
+const nodeListHeartbeatBucketSec = 60
 
 // NewStores builds the typed store layer over a clusterstore (box may be nil
-// only if no group manifest_key is ever stored).
+// only if no group secret is ever stored).
 func NewStores(kv clusterstore.Store, box *secretbox.Box) *Stores {
-	return &Stores{kv: kv, box: box}
+	return &Stores{
+		kv:               kv,
+		box:              box,
+		routes:           clusterstate.NewRouteQuorum("registry", clusterstate.NewMemoryRouteReplica()),
+		nodes:            clusterstate.NewNodeQuorum("registry", clusterstate.NewMemoryNodeReplica()),
+		nodeListSubs:     map[int]chan clusterstore.Event{},
+		membershipVer:    1,
+		routeHandoffGate: map[string]clusterstate.HandoffGate{},
+		nodeHandoffGate:  map[string]clusterstate.HandoffGate{},
+	}
 }
 
-func nodeKey(id string) string     { return nodePrefix + id }
 func groupKey(group string) string { return groupPrefix + group }
 
-// sandboxKey is sandbox/<esc(group)>/<esc(route_key)>. group AND route_key can
-// contain '/', so each segment is URL-path-escaped: that makes the key injective
-// (no aliasing of (group,route_key) pairs) and the per-group range prefix
-// unambiguous (no bleed from a nested group like "/a" into "/a/b"). The value
-// carries the unescaped group/route_key, so the key is never decoded.
-func sandboxKey(group, routeKey string) string {
-	return sandboxPrefix + url.PathEscape(group) + "/" + url.PathEscape(routeKey)
+func (s *Stores) SetMembershipVersion(version int64) {
+	s.handoffMu.Lock()
+	s.membershipVer = version
+	s.handoffMu.Unlock()
 }
-func sandboxGroupPrefix(group string) string { return sandboxPrefix + url.PathEscape(group) + "/" }
 
-// --- node table (global) ---
+func (s *Stores) SetRouteHandoffGate(group, routeKey string, gate clusterstate.HandoffGate) {
+	s.handoffMu.Lock()
+	s.routeHandoffGate[clusterstate.RouteKey(group, routeKey)] = gate
+	s.handoffMu.Unlock()
+}
+
+func (s *Stores) SetNodeHandoffGate(nodeID string, gate clusterstate.HandoffGate) {
+	s.handoffMu.Lock()
+	s.nodeHandoffGate[nodeID] = gate
+	s.handoffMu.Unlock()
+}
+
+func (s *Stores) checkRouteHandoff(group, routeKey string) error {
+	s.handoffMu.RLock()
+	version := s.membershipVer
+	gate, ok := s.routeHandoffGate[clusterstate.RouteKey(group, routeKey)]
+	s.handoffMu.RUnlock()
+	if !ok {
+		return nil
+	}
+	return clusterstate.DecisionError(gate.DecideWrite(version, time.Now()))
+}
+
+func (s *Stores) checkNodeHandoff(nodeID string) error {
+	s.handoffMu.RLock()
+	version := s.membershipVer
+	gate, ok := s.nodeHandoffGate[nodeID]
+	s.handoffMu.RUnlock()
+	if !ok {
+		return nil
+	}
+	return clusterstate.DecisionError(gate.DecideWrite(version, time.Now()))
+}
+
+// --- node_link ---
 
 func (s *Stores) PutNode(ctx context.Context, n *NodeRecord) error {
-	b, err := json.Marshal(n)
-	if err != nil {
+	if _, err := s.putNodeLink(ctx, n); err != nil {
 		return err
 	}
-	_, err = s.kv.Put(ctx, nodeKey(n.NodeID), b)
+	return s.PutNodeList(ctx, n)
+}
+
+// PutNodeRuntime updates node_link high-frequency state only. Heartbeats must not
+// write node_list, otherwise every water-level tick fans out to scaler WATCH_LIST.
+func (s *Stores) PutNodeRuntime(ctx context.Context, n *NodeRecord) error {
+	_, err := s.putNodeLink(ctx, n)
 	return err
 }
 
 func (s *Stores) GetNode(ctx context.Context, id string) (*NodeRecord, bool, error) {
-	kv, found, err := s.kv.Get(ctx, nodeKey(id))
+	rec, found, err := s.nodes.Get(ctx, id)
 	if err != nil || !found {
 		return nil, found, err
 	}
-	var n NodeRecord
-	if err := json.Unmarshal(kv.Value, &n); err != nil {
-		return nil, false, err
-	}
+	n := fromClusterNode(rec)
 	return &n, true, nil
 }
 
 func (s *Stores) DeleteNode(ctx context.Context, id string) error {
-	_, err := s.kv.Delete(ctx, nodeKey(id))
-	return err
+	if err := s.checkNodeHandoff(id); err != nil {
+		return err
+	}
+	rec, found, err := s.nodes.Get(ctx, id)
+	if err != nil {
+		return err
+	}
+	if found {
+		_, err = s.nodes.CAS(ctx, id, rec.Meta.Rev, func(clusterstate.NodeRecord, bool) (clusterstate.NodeRecord, bool, error) {
+			return clusterstate.NodeRecord{}, false, nil
+		})
+		if err != nil {
+			return err
+		}
+	}
+	return s.publishNodeListDelete(ctx, id)
 }
 
 // RangeNodes streams every node record (read-only callback).
 func (s *Stores) RangeNodes(ctx context.Context, fn func(*NodeRecord) error) error {
-	return s.kv.Range(ctx, nodePrefix, func(kv clusterstore.KV) error {
-		var n NodeRecord
-		if err := json.Unmarshal(kv.Value, &n); err != nil {
-			return err
-		}
+	return s.nodes.List(ctx, func(rec clusterstate.NodeRecord) error {
+		n := fromClusterNode(rec)
 		return fn(&n)
 	})
 }
 
-// --- sandbox table (group-sharded) ---
-
-// GetSandbox returns the (group, route_key) record + its store revision (for CAS).
-func (s *Stores) GetSandbox(ctx context.Context, group, routeKey string) (rec *SandboxRecord, rev int64, found bool, err error) {
-	kv, found, err := s.kv.Get(ctx, sandboxKey(group, routeKey))
-	if err != nil || !found {
-		return nil, 0, found, err
-	}
-	var r SandboxRecord
-	if err := json.Unmarshal(kv.Value, &r); err != nil {
-		return nil, 0, false, err
-	}
-	return &r, kv.ModRev, true, nil
+func (s *Stores) PutNodeList(ctx context.Context, n *NodeRecord) error {
+	entry := projectNodeListRecord(n)
+	return s.publishNodeListPut(ctx, entry)
 }
 
-func (s *Stores) PutSandbox(ctx context.Context, r *SandboxRecord) (int64, error) {
-	b, err := json.Marshal(r)
+func coarseNodeListHeartbeat(ts int64) int64 {
+	if ts <= 0 {
+		return 0
+	}
+	return ts - ts%nodeListHeartbeatBucketSec
+}
+
+func (s *Stores) putNodeLink(ctx context.Context, n *NodeRecord) (uint64, error) {
+	if err := s.checkNodeHandoff(n.NodeID); err != nil {
+		return 0, err
+	}
+	cur, found, err := s.nodes.Get(ctx, n.NodeID)
 	if err != nil {
 		return 0, err
 	}
-	return s.kv.Put(ctx, sandboxKey(r.Group, r.RouteKey), b)
+	expect := uint64(0)
+	if found {
+		expect = cur.Meta.Rev
+	}
+	rec, err := s.nodes.CAS(ctx, n.NodeID, expect, func(clusterstate.NodeRecord, bool) (clusterstate.NodeRecord, bool, error) {
+		return toClusterNode(n), true, nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	return rec.Meta.Rev, nil
+}
+
+func projectNodeListRecord(n *NodeRecord) clusterstate.NodeListEntry {
+	cn := toClusterNode(n)
+	cn.LastHeartbeatUnix = coarseNodeListHeartbeat(cn.LastHeartbeatUnix)
+	return clusterstate.ProjectNodeList(cn)
+}
+
+func (s *Stores) NodeListRev(ctx context.Context) (int64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	s.nodeListMu.Lock()
+	defer s.nodeListMu.Unlock()
+	return s.nodeListRev, nil
+}
+
+func (s *Stores) RangeNodeList(ctx context.Context, fn func(clusterstate.NodeListEntry) error) error {
+	return s.nodes.List(ctx, func(n clusterstate.NodeRecord) error {
+		n.LastHeartbeatUnix = coarseNodeListHeartbeat(n.LastHeartbeatUnix)
+		return fn(clusterstate.ProjectNodeList(n))
+	})
+}
+
+func (s *Stores) WatchNodeList(ctx context.Context, fromRev int64) (<-chan clusterstore.Event, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	s.nodeListMu.Lock()
+	defer s.nodeListMu.Unlock()
+	if fromRev > 0 && len(s.nodeListLog) > 0 && fromRev < s.nodeListLog[0].Rev-1 {
+		return nil, clusterstore.ErrCompacted
+	}
+	replay := make([]clusterstore.Event, 0)
+	for _, ev := range s.nodeListLog {
+		if ev.Rev > fromRev {
+			replay = append(replay, ev)
+		}
+	}
+	ch := make(chan clusterstore.Event, len(replay)+1024)
+	for _, ev := range replay {
+		ch <- ev
+	}
+	id := s.nodeListSeq
+	s.nodeListSeq++
+	s.nodeListSubs[id] = ch
+	go func() {
+		<-ctx.Done()
+		s.nodeListMu.Lock()
+		if cur, ok := s.nodeListSubs[id]; ok {
+			delete(s.nodeListSubs, id)
+			close(cur)
+		}
+		s.nodeListMu.Unlock()
+	}()
+	return ch, nil
+}
+
+func (s *Stores) publishNodeListPut(ctx context.Context, entry clusterstate.NodeListEntry) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	b, err := json.Marshal(entry)
+	if err != nil {
+		return err
+	}
+	s.publishNodeListEvent(clusterstore.Event{Type: clusterstore.EventPut, Key: entry.NodeID, Value: b})
+	return nil
+}
+
+func (s *Stores) publishNodeListDelete(ctx context.Context, nodeID string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.publishNodeListEvent(clusterstore.Event{Type: clusterstore.EventDelete, Key: nodeID})
+	return nil
+}
+
+func (s *Stores) publishNodeListEvent(ev clusterstore.Event) {
+	s.nodeListMu.Lock()
+	defer s.nodeListMu.Unlock()
+	s.nodeListRev++
+	ev.Rev = s.nodeListRev
+	s.nodeListLog = append(s.nodeListLog, ev)
+	if len(s.nodeListLog) > 10000 {
+		copy(s.nodeListLog, s.nodeListLog[len(s.nodeListLog)-10000:])
+		s.nodeListLog = s.nodeListLog[:10000]
+	}
+	for id, ch := range s.nodeListSubs {
+		select {
+		case ch <- ev:
+		default:
+			delete(s.nodeListSubs, id)
+			close(ch)
+		}
+	}
+}
+
+// --- route_link ---
+
+// GetSandbox returns the route_link record + its revision (for CAS).
+func (s *Stores) GetSandbox(ctx context.Context, group, routeKey string) (rec *SandboxRecord, rev int64, found bool, err error) {
+	rr, found, err := s.routes.Get(ctx, group, routeKey)
+	if err != nil || !found {
+		return nil, 0, found, err
+	}
+	r := fromClusterRoute(rr)
+	return &r, int64(rr.Meta.Rev), true, nil
+}
+
+func (s *Stores) PutSandbox(ctx context.Context, r *SandboxRecord) (int64, error) {
+	_, rev, found, err := s.GetSandbox(ctx, r.Group, r.RouteKey)
+	if err != nil {
+		return 0, err
+	}
+	expect := int64(0)
+	if found {
+		expect = rev
+	}
+	rev, ok, err := s.CASSandbox(ctx, r, expect)
+	if err != nil {
+		return 0, err
+	}
+	if !ok {
+		return 0, clusterstate.ErrConflict
+	}
+	return rev, nil
 }
 
 // CASSandbox commits r only if the record's current revision is expectRev
 // (expectRev 0 = create-only). Returns (newRev, committed).
 func (s *Stores) CASSandbox(ctx context.Context, r *SandboxRecord, expectRev int64) (int64, bool, error) {
-	b, err := json.Marshal(r)
+	if expectRev < 0 {
+		return 0, false, fmt.Errorf("registry: negative route_link revision %d", expectRev)
+	}
+	if err := s.checkRouteHandoff(r.Group, r.RouteKey); err != nil {
+		return 0, false, err
+	}
+	rec, err := s.routes.CAS(ctx, r.Group, r.RouteKey, uint64(expectRev), func(clusterstate.RouteRecord, bool) (clusterstate.RouteRecord, bool, error) {
+		return toClusterRoute(r), true, nil
+	})
+	if err == clusterstate.ErrConflict {
+		return 0, false, nil
+	}
 	if err != nil {
 		return 0, false, err
 	}
-	return s.kv.CAS(ctx, sandboxKey(r.Group, r.RouteKey), expectRev, b)
+	return int64(rec.Meta.Rev), true, nil
 }
 
 func (s *Stores) DeleteSandbox(ctx context.Context, group, routeKey string) error {
-	_, err := s.kv.Delete(ctx, sandboxKey(group, routeKey))
+	if err := s.checkRouteHandoff(group, routeKey); err != nil {
+		return err
+	}
+	rec, found, err := s.routes.Get(ctx, group, routeKey)
+	if err != nil || !found {
+		return err
+	}
+	_, err = s.routes.CAS(ctx, group, routeKey, rec.Meta.Rev, func(clusterstate.RouteRecord, bool) (clusterstate.RouteRecord, bool, error) {
+		return clusterstate.RouteRecord{}, false, nil
+	})
 	return err
 }
 
-// RangeSandboxes streams a group's sandbox rows (cluster.md §8 list = this).
+// RangeSandboxes streams a group's route_link rows.
 func (s *Stores) RangeSandboxes(ctx context.Context, group string, fn func(*SandboxRecord) error) error {
-	return s.kv.Range(ctx, sandboxGroupPrefix(group), func(kv clusterstore.KV) error {
-		var r SandboxRecord
-		if err := json.Unmarshal(kv.Value, &r); err != nil {
-			return err
-		}
+	return s.routes.List(ctx, group, func(rec clusterstate.RouteRecord) error {
+		r := fromClusterRoute(rec)
 		return fn(&r)
 	})
 }
 
-// RangeAllSandboxes streams every sandbox row across groups (the dead-node sweep
-// scans these to reset a failed node's sandboxes, §11).
+// RangeAllSandboxes streams every route_link row across groups.
 func (s *Stores) RangeAllSandboxes(ctx context.Context, fn func(*SandboxRecord) error) error {
-	return s.kv.Range(ctx, sandboxPrefix, func(kv clusterstore.KV) error {
-		var r SandboxRecord
-		if err := json.Unmarshal(kv.Value, &r); err != nil {
-			return err
-		}
+	return s.routes.List(ctx, "", func(rec clusterstate.RouteRecord) error {
+		r := fromClusterRoute(rec)
 		return fn(&r)
 	})
 }
 
-// --- group config (manifest_key sealed at rest) ---
+func toClusterRoute(r *SandboxRecord) clusterstate.RouteRecord {
+	if r == nil {
+		return clusterstate.RouteRecord{}
+	}
+	return clusterstate.RouteRecord{
+		Group:      r.Group,
+		RouteKey:   r.RouteKey,
+		SandboxID:  r.SID,
+		State:      toClusterRouteState(r.State),
+		NodeID:     r.NodeID,
+		TemplateID: r.TemplateID,
+	}
+}
+
+func fromClusterRoute(r clusterstate.RouteRecord) SandboxRecord {
+	return SandboxRecord{
+		Group:      r.Group,
+		RouteKey:   r.RouteKey,
+		SID:        r.SandboxID,
+		State:      fromClusterRouteState(r.State),
+		NodeID:     r.NodeID,
+		TemplateID: r.TemplateID,
+		LastActive: r.Meta.UpdatedAt.Unix(),
+	}
+}
+
+func toClusterRouteState(st SandboxState) clusterstate.RouteState {
+	switch st {
+	case StateReserved:
+		return clusterstate.RouteReserved
+	case StateReady:
+		return clusterstate.RouteReady
+	case StatePaused:
+		return clusterstate.RoutePaused
+	default:
+		return clusterstate.RouteNone
+	}
+}
+
+func fromClusterRouteState(st clusterstate.RouteState) SandboxState {
+	switch st {
+	case clusterstate.RouteReserved:
+		return StateReserved
+	case clusterstate.RouteReady:
+		return StateReady
+	case clusterstate.RoutePaused:
+		return StatePaused
+	default:
+		return StateNone
+	}
+}
+
+func toClusterNode(n *NodeRecord) clusterstate.NodeRecord {
+	if n == nil {
+		return clusterstate.NodeRecord{}
+	}
+	st := clusterstate.NodeLive
+	if n.Draining {
+		st = clusterstate.NodeDrained
+	}
+	return clusterstate.NodeRecord{
+		NodeID:            n.NodeID,
+		State:             st,
+		Labels:            cloneStringMap(n.Labels),
+		Capacity:          n.Capacity,
+		BuildCapacity:     cloneBuildResources(n.BuildCapacity),
+		DataEndpoint:      n.DataEndpoint,
+		RuntimeDigest:     n.RuntimeDigest,
+		Zone:              n.Zone,
+		Allocated:         n.Allocated,
+		Pool:              n.Pool,
+		BuildAlloc:        cloneBuildResources(n.BuildAlloc),
+		Counts:            n.Counts,
+		Draining:          n.Draining,
+		LastHeartbeatUnix: n.LastHeartbeatUnix,
+		ResumeToken:       n.ResumeToken,
+	}
+}
+
+func fromClusterNode(n clusterstate.NodeRecord) NodeRecord {
+	return NodeRecord{
+		NodeID:            n.NodeID,
+		Labels:            cloneStringMap(n.Labels),
+		Capacity:          n.Capacity,
+		BuildCapacity:     cloneBuildResources(n.BuildCapacity),
+		DataEndpoint:      n.DataEndpoint,
+		RuntimeDigest:     n.RuntimeDigest,
+		Zone:              n.Zone,
+		Allocated:         n.Allocated,
+		Pool:              n.Pool,
+		BuildAlloc:        cloneBuildResources(n.BuildAlloc),
+		Counts:            n.Counts,
+		Draining:          n.Draining || n.State == clusterstate.NodeDrained,
+		LastHeartbeatUnix: n.LastHeartbeatUnix,
+		ResumeToken:       n.ResumeToken,
+	}
+}
+
+func cloneStringMap(in map[string]string) map[string]string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
+
+// --- group config (secret fields sealed at rest) ---
 
 func (s *Stores) PutGroup(ctx context.Context, g *GroupConfig) error {
 	stored := *g
-	if g.ManifestKey != "" || g.RegistryAuth != "" {
+	if g.ManifestKey != "" || g.AuthKey != "" || g.RegistryAuth != "" {
 		if s.box == nil {
-			return fmt.Errorf("registry: group %q has sealed secrets (manifest_key / registry_auth) but no encryption box configured", g.Group)
+			return fmt.Errorf("registry: group %q has sealed secrets but no encryption box configured", g.Group)
 		}
 		if g.ManifestKey != "" {
 			enc, err := s.box.EncryptString(g.ManifestKey)
@@ -231,6 +548,13 @@ func (s *Stores) PutGroup(ctx context.Context, g *GroupConfig) error {
 				return err
 			}
 			stored.ManifestKey = enc
+		}
+		if g.AuthKey != "" {
+			enc, err := s.box.EncryptString(g.AuthKey)
+			if err != nil {
+				return err
+			}
+			stored.AuthKey = enc
 		}
 		if g.RegistryAuth != "" {
 			enc, err := s.box.EncryptString(g.RegistryAuth)
@@ -248,8 +572,7 @@ func (s *Stores) PutGroup(ctx context.Context, g *GroupConfig) error {
 	return err
 }
 
-// unsealGroup decrypts a group's sealed secrets (manifest_key + registry_auth) in
-// place. Both are sealed at rest by PutGroup; both are plain in memory.
+// unsealGroup decrypts a group's sealed secrets in place.
 func (s *Stores) unsealGroup(g *GroupConfig) error {
 	if s.box == nil {
 		return nil
@@ -260,6 +583,13 @@ func (s *Stores) unsealGroup(g *GroupConfig) error {
 			return fmt.Errorf("registry: decrypt group manifest_key: %w", err)
 		}
 		g.ManifestKey = dec
+	}
+	if g.AuthKey != "" {
+		dec, err := s.box.DecryptString(g.AuthKey)
+		if err != nil {
+			return fmt.Errorf("registry: decrypt group auth_key: %w", err)
+		}
+		g.AuthKey = dec
 	}
 	if g.RegistryAuth != "" {
 		dec, err := s.box.DecryptString(g.RegistryAuth)

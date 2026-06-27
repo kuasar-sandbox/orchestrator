@@ -1,516 +1,247 @@
-# cluster — 集群级注册表、控制面与沙箱编排
+# cluster — registry 自聚簇、会话路由与沙箱编排
 
-`cluster-ctl` 是面向大规模部署的集群控制面,把一个机群里数千个 `node-ctl serve` 节点(node.md)
-聚合成一个逻辑沙箱池:对外提供 **e2b 兼容控制面 + 数据面**(均限定在 **sandbox-group** 范围内),
-按业务身份(sandbox-group + **route-key**)在机群范围把请求路由 / 拉起到正确的沙箱。一身兼三角色:
-**registry**(持久化状态权威 + 通道枢纽 + 异步操作 / watch 接口,本文)、**router**(e2b 兼容**统一
-入口**:控制面 + 数据面,cluster-router.md)、**scaler**(放置**调度器**:给出放置建议,
-cluster-scaler.md)。
+`cluster-ctl` 是面向大规模部署的集群控制面,把数千个 `node-ctl serve` 节点聚合成一个
+按 **sandbox-group** 分片的逻辑沙箱池。它对外提供 e2b 兼容控制面与数据面入口,对内维护
+会话路由、放置、构建、密钥分发和节点故障收敛。
 
-**最小化启动延迟是第一约束**(平台以亚秒级冷启动 / 快照恢复为目标):热路径(已建立会话)
-经 router 本地路由缓存直转,**零控制面往返**;冷 / 恢复路径以**远程快照 + 快速恢复**(平台原生
-能力)拉起,经 shuffle-sharding 的缓存局部性加速——cluster 自身只贡献可忽略的编排开销(§9)。
-
-cluster **以 sandbox-group 为唯一分区单位**组织一切(沙箱 / 构建 / 配置),操作严格限定单个 group、
-**无跨 group 操作**,由此支持规模化分片。控制面**校验后转发节点**执行(节点以既有 e2b 生命周期
-原语运行,node.md §4 / §8),cluster 不新增沙箱机制、只做编排与路由。
-
-产物一个二进制 **`cluster-ctl`**,三角色 registry / router / scaler 均为**独立进程**(无同进程内存
-模式):registry 持久化;router / scaler 经 control_api(UDS 本机 / mTLS 远端)连 registry。小规模同机共置(UDS
-低延迟)、大规模各自横向扩展(§4 / §12)。
+cluster 的核心目标是:稳态数据面请求不经过 registry,冷路径通过 registry 自聚簇完成放置 /
+恢复 / 构建预留;Registry 成员故障只影响其参与的小逻辑集群,不触发全局重分片;成员变更由
+运维版本化触发,以 learner 预同步和 per-shard 短栅栏完成业务无损切换。
 
 ## 1. 概述
 
-### 1.1 业务问题
+### 1.1 设计原则
 
-平台目标是把大量 Agent / Serverless 工作负载承载在机群上。单机 node(node.md)解决不了:
+1. **sandbox-group 是唯一业务分片键**:路由、构建、placement、group 配置均按 group 定位。
+   每个北向请求必须携带 `X-Kuasar-Sandbox-Group`;当前不支持无 group 的 cluster 数据面入口。
+2. **registry 自身是可靠状态集群**:状态由 registry 成员直接复制,不依赖外部存储后端。
+   Registry 容忍单成员故障。整套 registry 完全下电后不要求自动恢复沙箱。
+3. **节点是存活态真相之源**:sandbox/build 是否还在运行以 node 上报为准;registry 是路由权威和
+   可重建聚合。node 整机重启直接清空,不重拉旧 sandbox。
+4. **热路径旁路控制面**:router 对活动连接和近期路由做本地缓存;命中时直接转发到 node,不调用
+   `Reserve`。miss / fail-fast 后才走 registry。
+5. **SWIM 不参与分片计算**:Registry 成员故障只影响 owner set 内的可达性判断;`LocateN` 的输入
+   仅为版本化成员表。成员变更只由运维更新 `membership_version` 触发。
+6. **放置与执行分层**:scaler 负责 group 导入、WATCH_LIST、shuffle-sharding 与 Place;node owner
+   负责节点连接、命令投递、运行态与资源 admission。
 
-- **会话亲和**:同一用户 / 会话的连续请求应落到**同一个**热沙箱,而它可能在机群任意节点——需要
-  机群范围的 (业务身份 → 沙箱 → 节点) 映射,且查得快(热路径零控制面往返,§9)。
-- **缩到零 + 快启**:**沙箱 / sandbox-group 数量远超节点数**,不可能在节点上常驻预热实例;空闲沙箱
-  下沉为节点本机快照(PAUSED)乃至远程快照(SAVED,可移植、释放节点),按需以**快照恢复**拉起
-  (亚秒级,§9)。"预热池"是**虚拟的**:即去重的远程快照存储 + 缓存,按需恢复。
-- **放置、爆炸半径与密度**:新沙箱落在哪个节点取决于标签(zone/pool/slot)、实时水位与**爆炸半径**
-  (一个 group 只落在受限的节点子集);租户密钥须先到达目标节点。
-- **统一北向面**:e2b SDK / CLI 与业务流量指向集群一个入口,而非逐节点寻址。
+### 1.2 角色
 
-### 1.2 设计原则
-
-1. **启动延迟第一**:热路径 router 本地缓存直转;冷 / 恢复路径靠远程快照 + 快速恢复 + 缓存局部性;
-   控制面编排开销可忽略(持久长连、UDS 共置、密钥预置,§9)。
-2. **sandbox-group 是唯一分区键、操作不跨 group**:沙箱 / 构建 / 配置按 group 组织;每个操作点名
-   一个 group(`X-Kuasar-Sandbox-Group`)。节点注册表是**唯一的全局(不分片)表**(§6)。
-3. **控制面 + 数据面,均经节点执行**:cluster 提供完整 e2b 控制面(§8)与数据面转发,但校验后
-   **转发节点**——节点以既有 e2b 原语执行(node.md §8 / §8.1)。
-4. **持久可靠、无纯内存模式**:registry 任何后端都持久(sqlite / etcd / raft,§10),进程重启可从
-   存储 + 节点重连恢复业务态。
-5. **节点事件为真相之源、最终一致、Reserve 总等 READY**:沙箱 / 构建状态由节点经统一通道上报,
-   registry 据此收敛;`Reserve` 永远等待节点**自动上报的 running 事件**才返回(§7)。
-6. **调度与状态分层(利于规模化)**:scaler 是**调度器**,给出放置**建议**;registry **提交**预留
-   (原子 CAS)。scaler 不联系节点、不持密钥、不碰生命周期(§4 / cluster-scaler.md)。
-
-### 1.3 边界与依赖
-
-- **下游是 node-ctl serve**:经统一通道(§5)注册 / 心跳 / 事件 / 命令 / 密钥;控制面操作经 router
-  转发到节点 e2b 控制面(node.md §4),create/connect 经 Reserve(走节点命令)。不直连 guest。
-- **数据面字节不经 registry**:router → node 数据端点 → guest,两跳;通道只承载控制,无业务字节。
-- **数据面两种寻址并存**:create 后**按 sid**(e2b 原生 SDK 流)、或业务流量**按 (group, route-key) 头**
-  (无 create 直触发 Reserve)(cluster-router.md §4)。
-- **实现于 sandbox-orchestrator `internal/*`**(与 node-ctl 共仓,无新导出包);纯 Go、`CGO_ENABLED=0`;
-  无 gRPC / protobuf——统一通道是帧化 JSON over h2c,沿用 routesync 线格式(node-proxy.md §6)。
-  shuffle-sharding 复用 sandbox-accelerator 导出的 `pkg/maglev`;快照恢复 / 去重靠 accelerator 远程
-  store + 缓存(cluster-scaler.md §4 / §9)。
-
-### 1.4 架构与数据通路
-
-```
-   e2b SDK / CLI (api.<domain> 控制面)            业务流量 (数据面)
-   X-API-KEY + X-Kuasar-Sandbox-Group            X-Kuasar-Sandbox-Group + X-Kuasar-Route-Key
-            │                                     (或 create 后 by sid)
-            ▼                                          ▼
-   ┌──────── cluster-ctl router (N replicas, 无状态, 统一 e2b 入口) ──────────┐
-   │  本地路由缓存(热路径直转, 零控制往返, §9)                              │
-   │  控制面: 校验(api_key↔group) → create/connect=ReserveSandbox ·          │
-   │          pause/kill/timeout=转发节点 · list/get=group 分片 · build=…     │
-   │  数据面: 缓存命中→直转;未命中→registry.ReserveSandbox → 注入 token 转发  │
-   └──────────────┬───────────────────────────────────────┬─────────────────┘
-        异步 control_api / watch (UDS 本机 | mTLS)          │ data-plane forward
-                  ▼                                         │ (router→node→guest)
-   ┌──────── cluster-ctl registry (持久状态权威 + 通道枢纽) ──┐  │
-   │  NodeStore(全局)· GroupConfigProvider(细粒度可外置)   │  │
-   │  SandboxStore / BuildStore(按 group 分片)             │  │
-   │  Reserve 提交(CAS)· 控制面 · 密钥分发 · §5 通道枢纽    │  │
-   └────────┬──────────────────────────────┬───────────────┘  │
-   PlaceSandbox/PlaceBuild 建议(同步)       │ 统一通道(per node, mTLS):
-   ┌── scaler(调度器: 选节点建议)──┐         │  ▲ 节点上报: routes(sandbox)·build·heartbeat
-   │  订阅 node/group 态;maglev      │         │  ▼ registry 下发: create·connect·delete·key_put·key_drop
-   │  shuffle 选择器 patch          │         │
-   └────────────────────────────────┘         ▼
-   ┌──────── node-ctl serve (per node, node.md) ─────────────────────────┐
-   │  e2b 控制面(转发目标)· data-plane proxy → guest envd / floatingip    │◄── router forward
-   │  e2b lifecycle: create/restore/snapshot/migrate(快照恢复, §9)        │
-   │  通道客户端(node.md §10): dials registry, 反向注册为路由权威          │
-   └──────────────┬──────────────────────────────────────────────────────┘
-                  ▼  sandbox-ctl run / --restore / snapshot
-            cloud-hypervisor microVM (guest: sandbox-init + envd)
-```
-
-## 2. 命令行接口
-
-| 子命令 | 用途 |
+| 角色 | 职责 |
 |---|---|
-| `registry` | 持久状态权威 + 通道枢纽 + 异步 control_api / watch 接口(§4 / §5) |
-| `router` | e2b 兼容统一入口:控制面 + 数据面(cluster-router.md) |
-| `scaler` | 放置调度器:给出 PlaceSandbox 建议(沙箱与 build 均经此;cluster-scaler.md) |
-| `sandbox-group` | sandbox-group 配置管理(`upsert`/`get`,§6.2);registry admin 瘦客户端 |
-| `config` | 配置诊断 / 生成,按角色:`config <registry\|router\|scaler> [--template\|--config <f>\|--resolve]` |
-| `version` | 版本 |
+| registry member | 组成 registry 小集群,承载 `route_link` / `node_link` / `node_list` / `scale_link` 命名空间 |
+| router | e2b 统一入口;按 group 定位 route owner;活动连接缓存;miss 时调用 Reserve |
+| scaler | 消费 node_list WATCH_LIST;导入 group;维护 placement / key allocation;响应 PlaceSandbox / PlaceBuild |
+| node | 运行 sandbox/build;经 node_link 上报全量清单与事件;接收 create/connect/delete/key/build 命令 |
 
-```
-cluster-ctl registry --config /etc/cluster-ctl/registry.yaml
-cluster-ctl router   --config /etc/cluster-ctl/router.yaml
-cluster-ctl scaler   --config /etc/cluster-ctl/scaler.yaml
-```
+## 2. Registry 命名空间
 
-三角色均为独立进程、**各持一份配置文件**(§3):router / scaler 经各自配置的 `registry.endpoint`(拨号
-地址,UDS 本机 / mTLS 远端)+ 客户端 `registry.tls` 连 registry 的 control_api(§4.2)。**scaler 无 listen**:它拨 registry、
-订阅节点 / group 视图,registry 经 scaler-link **反向下发** `place_req`、scaler 回 `place_result`(§5.2)。
+Registry 成员集由运维配置和 `membership_version` 定义。每个命名空间用 `pkg/maglev.LocateN`
+从版本化成员表定位 owner set。
 
-## 3. 配置
-
-权威结构 `internal/clustercfg/config.go`。**一角色一文件**:`registry.yaml` / `router.yaml` /
-`scaler.yaml` 各自独立 schema,只装该角色真正消费的字段——文件即进程所读。共享子类型(`tls` 等)
-复用,但 control_api 端点在 registry 是**绑定地址**(`control_api.listen`)、在 router / scaler 是
-**拨号地址**(`registry.endpoint` + 客户端 `registry.tls`)。骨架与校验按角色:
-`cluster-ctl config <registry|router|scaler> [--template | --config <f> [--resolve]]`。
-
-### registry.yaml(持久状态权威 + 通道枢纽。必填 `state`)
-
-| 字段 | 默认 | 说明 |
-|---|---|---|
-| `state.backend` | `sqlite` | 注册表后端:**当前实现 `sqlite`**(单机持久,最简);`etcd` / `raft` 为接口预留(§10);**无 `memory`**。命名 `state`(非 `store`)以与 sandbox-accelerator 的内容 store 区分 |
-| `state.dsn` | `/var/lib/cluster/registry.db` | sqlite 路径 / etcd 端点 / raft 配置 |
-| `sandbox_group.providers` | `store` | 细粒度 provider 选择(§6.2):每个接口(`key` / `sandbox_config` / `placement` / `image_pull`)可 `store` 或 `external:<addr>` |
-| `sandbox_group.encryption_key` | 空 | `store` 自存 manifest_key 时的 AES-256 落盘密钥,或 `SANDBOX_GROUP_ENCRYPTION_KEY` env 覆盖;全 `external` 时不需 |
-| `sandbox_group.tls` | 空 | `external:<addr>` provider 的**客户端** mTLS(§6.2)|
-| `node_link.listen` | `:7700` | 节点拨入的 node-link 监听(§5);registry 持有 |
-| `node_link.tls` | 空 | node-link **服务端** mTLS 证书 / CA(生产必配,§5.4) |
-| `node_link.heartbeat_interval` | `10s` | 下发心跳周期 |
-| `node_link.node_dead_after` | `30s` | 连续未收心跳判失联(§11) |
-| `node_link.revision_retention` | `10000` | 每分片保留的变更日志条数,供断线增量重放(§5.3);超出则客户端全量重同步 |
-| `control_api.listen` | `/run/cluster/registry.sock` | router / scaler 拨入的 control_api / watch 接口**绑定**地址(UDS 本机 / 跨机 TCP)|
-| `control_api.tls` | 空 | control_api **服务端** mTLS(`control_api.listen` 为 TCP 跨机时;UDS 本机免,§5.4)|
-| `reserve.park_timeout` | `30s` | `Reserve` 等待 READY 的预算上限(§7);超时回错由 router 转 503 |
-| `reserve.record_ttl` | 空 | 空闲 SAVED 记录 GC 上限(§10 / §12);空 = 关 |
-
-### router.yaml(e2b 兼容统一入口。必填 `domain`。详 cluster-router.md §3)
-
-| 字段 | 默认 | 说明 |
-|---|---|---|
-| `domain` | (必填) | 服务域;router 据此分流控制面 / 数据面 |
-| `registry.endpoint` | `/run/cluster/registry.sock` | registry control_api **拨号**地址(UDS 本机 / `host:port` 远端)|
-| `registry.tls` | 空 | 拨远端 registry 的**客户端** mTLS(`cert`/`key` + `ca`;§5.4)|
-| `ingress.listen` | `:443` | e2b 控制 + 数据入口(多副本 SO_REUSEPORT 共享)|
-| `ingress.tls` | 空 | 通配入口证书 `*.<domain>` + `api.<domain>` |
-| `auth.api_key` | `enforce` | 调用方 api_key 鉴权:`off` / `log` / `enforce`(§8)|
-| `auth.data_plane` | `enforce` | 数据面 access-token 校验:`off` / `log` / `enforce` |
-| `auth.cache_ttl` | `60s` | api_key↔group 校验缓存 |
-| `metrics_listen` | 空 | 可选 Prometheus 文本端点 |
-
-### scaler.yaml(放置调度器。详 cluster-scaler.md §3)
-
-| 字段 | 默认 | 说明 |
-|---|---|---|
-| `registry.endpoint` | `/run/cluster/registry.sock` | registry control_api **拨号**地址(UDS 本机 / `host:port` 远端)|
-| `registry.tls` | 空 | 拨远端 registry 的**客户端** mTLS |
-| `placement.candidates` | `2` | P2C 采样数 |
-| `placement.zone_admit_max` | `yellow` | 排除热于此区的节点(`green` / `yellow` / `red`)|
-| `placement.node_dead_after` | `30s` | 超此静默即将该节点排除出放置 |
-| `placement.shuffle_sharding` | 空 | 空 = 仅静态 nodeSelectors(cluster-scaler.md §4.4)|
-
-## 4. 架构与角色
-
-### 4.1 三角色职责
-
-- **registry**——**持久**状态权威 + 通道枢纽。持有每节点一条统一通道长连(§5),维护四张注册表
-  (§6),提供 `Reserve`(§7)与控制面后端逻辑(§8),**提交**放置预留(CAS),**主管密钥分发**
-  (§7.6),对 router / scaler 提供**异步操作 + watch** 接口(§4.3)。registry **内部**,不对客户端
-  直接开 e2b 口。
-- **router**——无状态 **e2b 兼容统一入口**(控制面 + 数据面)。持**本地路由缓存**(订阅 registry
-  路由流):热路径命中直转(零控制往返,§9);未命中 / 控制操作 → registry。N 副本置 LB 后。
-- **scaler**——放置**调度器**,独立进程。拨 registry、订阅其节点 / group 视图(本地视图),registry 经
-  scaler-link 反向请求 `PlaceSandbox` / `PlaceBuild` 时**本地算出节点建议**(§5.2 / §7.5)。**不联系节点、
-  不持密钥、不碰沙箱生命周期、无 drain**;把 shuffle-sharding 命中 slot 作为有效 nodeSelectors overlay
-  patch 回 registry(供密钥分发,cluster-scaler.md §4)。
-
-### 4.2 部署形态
-
-三角色均为独立进程(无同进程内存模式)。
-
-| | 小规模(同机共置) | 大规模(拆分) |
-|---|---|---|
-| 进程 | registry(sqlite)+ router + scaler,同机,**control_api 走 UDS** | registry 多副本(按 group 分片,etcd/raft)+ router N 副本(LB)+ scaler 多副本(按 group 分片) |
-| 启动延迟 | 冷路径控制往返 = UDS(亚毫秒) | 冷路径控制往返 = 同 AZ mTLS;热路径仍 router 本地缓存(§9) |
-| 可靠性 | sqlite 持久,registry 重启对账(§11) | KV / raft 复制 |
-
-### 4.3 异步操作 + watch 接口
-
-registry 对 router / scaler 提供**异步风格**接口(`control_api.listen`,帧化 JSON,与 §5 通道同族):
-
-- **watch 订阅**:router 订阅路由流(喂本地缓存),scaler 订阅节点 / group 状态;增量 + 可断线
-  恢复(§5.3)。
-- **操作**:router 发 `ReserveSandbox` / `ReserveBuild` / 控制转发,经结果事件得到结果(§7);
-  registry 经 scaler-link 反向请求 `PlaceSandbox` / `PlaceBuild`,scaler 在本地视图上算后回结果(§5.2 / §7.5)。
-- **调度器 / 提交分层**:scaler **建议**节点(P2C over 本地视图),registry **原子提交**预留
-  (CAS;并发冲突 / 视图滞后则重问一次)——Kubernetes scheduler / apiserver 式分层,利于
-  placement 层独立扩展(§1.2 原则 6)。
-
-## 5. 统一通道协议
-
-**一套帧化 JSON over h2c 的 pub/sub + 上行命令协议**承载所有控制连接,角色化复用 routesync 线格式
-(node-proxy.md §6)——零 gRPC / protobuf。统一对象:
-
-| 连接 | 拨号方 | 权威(下行流) | 订阅 + 上行 |
+| 命名空间 | key | owner set | 内容 |
 |---|---|---|---|
-| proxy worker ↔ node | worker | node | worker(`route`/`route_wake`)——既有 |
-| **node ↔ registry**(§5.1) | **node** | **node**(其 routes + `build` 事件) | **registry**(`kind=registry`):上行下发 `create`/`connect`/`delete`/`key_put`/`key_drop` |
-| router ↔ registry | router | registry(集群路由 + control_api 结果) | router:上行发 `ReserveSandbox` 等 control_api 调用(§4.3) |
-| scaler ↔ registry | scaler | registry(节点 / group 状态) | scaler:registry 反向请求 `Place*`(§7.5) |
-| 外部观察者 ↔ registry | watcher | registry | watcher(`kind=watch`) |
+| `route_link` | group | `LocateN(group,K)` | route 记录、build 记录、placement 记录;每个 owner 持完整 group 视图 |
+| `node_link` | node_id | `LocateN(node_id,N)` | node 连接、sandbox/build 清单、labels、水位、build 预算;每个 owner 持完整 node 视图 |
+| `node_list` | `__NODE_LIST__#shard` | `LocateN(key,M)` | 低频节点目录与 labels,向 scaler 提供 WATCH_LIST |
+| `scale_link` | scaler_id | 全复制 | scaler 实例目录和能力 |
 
-- **帧**:`[4 字节 LE 长度][JSON]`,单帧 ≤ 1 MiB,每帧一条;每条带**分片单调版本号 `rev`**(§5.3)。
-- **传输**:生产 mTLS;持挂连接即在线租约,断连即失联。
+`node_link` 中只有当前连接 owner 持有实际 node TCP/h2c 连接;其余 owner 通过复制持有完整视图。
+`route_link` 的所有 owner 均可响应查询和订阅。写入达到 W quorum 后提交,随后继续复制到全
+owner set,用于完整视图和本地 waiter 唤醒。
 
-### 5.1 node ↔ registry(反向注册)
+## 3. 成员与分片变更
 
-节点接入复用其既有 routesync **权威**侧(node-proxy.md §6),只是连接由节点拨出:
+### 3.1 成员故障
 
-1. node 拨 registry 的 `node_link.listen`,首帧发 `register{node_id, labels, capacity, build_capacity,
-   data_endpoint, runtime_digest}`,registry 回 ack。
-2. node **反向监听**;registry 在该连接发 `register{subscribe:{kind:registry}}`——即 registry 作为
-   node 的一个路由订阅者。
-3. 此后 node 作**路由 / 构建权威**下行流式 `upsert/delete`(`sandbox`/`build` 路由)+ `bookmark`;
-   registry 作**订阅者 + 命令方**上行发命令。
+成员故障由 SWIM 探测,但不改变 `LocateN` 结果。某成员不可达时:
 
-故节点侧**无独立 node-link 实现**——一套 routesync 引擎同时服务本机 proxy worker 与远端 registry
-(node.md §10)。
+- 它参与的 owner set 降一格,只要可达 owner 数 ≥ W 即继续服务。
+- 若可达 owner 数 < W,该 shard 停写(CP),不降级乱写。
+- 故障不触发 reshard;恢复成员须 catch-up 后才能重新参与 quorum。
 
-**节点上报**(下行,node→registry):`sandbox{sid, group, route_key, state(running|paused|dead),
-snap_loc, access_token, migration_token?, template_id}`、`build{build_id, group, state, template_id?,
-reason?}`、`delete{sid|build_id}`、`bookmark`;`heartbeat{zone, allocated, pool, build_alloc, counts, draining}`(`draining` 由节点侧 drain 置位,
-node-resource.md §2.5,放置据此排除该节点)。
+### 3.2 成员变更
 
-**registry 下发**(上行命令,registry→node):
+成员变更采用 **版本化成员表 + learner 预同步 + per-shard 短栅栏 + moved/grace 转发**:
 
-| 命令 | 用途 |
+```text
+stable(v)
+  -> prepare(v+1)
+  -> catchup(v+1)
+  -> switching(v+1, barrier_seq)
+  -> stable(v+1)
+  -> old_grace(v, expires)
+```
+
+1. 运维提交新成员表,生成 `membership_version=v+1`。
+2. Registry 计算受影响的 route/node/node_list shard。
+3. 新 owner 先作为 learner,从旧 owner 拉 snapshot,再接收 delta。
+4. learner 追到 barrier 后,仅对该 shard 进入短 `switching` 栅栏:新写短排队,超时返回
+   `Retry-After`。
+5. 新 owner set 确认应用到 `barrier_seq` 后 flip 到 `v+1`。
+6. 旧 owner 进入 `old_grace`,只返回 `moved(v+1,new_owners)` 或代转发,不接受本地写。
+
+新增成员先 learner 后 flip;删除成员先 leaving,由 replacement learner 追平后再退出。node_link
+owner 变化不能误判 node dead:旧 owner 在 grace 期继续转发 node 事件/命令,并在 ack 中提示 node
+后续重连到新 owner。
+
+## 4. 状态复制与恢复
+
+`route_link` 和后续 `node_link` 采用无主 quorum CAS。协议以唯一 ballot 定序写入:
+`(round, writer_id)` 按字典序比较,同一 key 的两个并发写不会撞同一个 version。写入分
+prepare/accept 两阶段;读 quorum 时必须把读到的最高 ballot/version 回写到落后 owner,完成
+read-repair。这样不需要 per-group primary,也不把 SWIM 活性判断引入数据路径。
+
+复制协议必须满足:
+
+- 写入必须经 owner set 的 W quorum 提交。
+- 提交后继续 best-effort 复制到全 K/N/M owner。
+- 每条记录有单调 rev 和唯一 ballot;写条件必须校验 expected rev。
+- 旧成员表写入必须被 `membership_version` 拒绝。
+- 成员冷重启后进入 joining,catch-up 完成前不参与写 quorum。
+
+size-1 模式中 `LocateN` 只返回本成员,quorum 退化为本地内存写;同样使用 expected rev + ballot
+接口,因此扩展到多成员时不改变上层状态机。size-1 用于开发和小规模部署,不提供 registry 成员
+故障 HA。
+
+## 5. Route 模型
+
+### 5.1 身份
+
+- 稳定会话身份:`(group, route_key)`。
+- 当前运行实例:`sandbox_id`。它是不透明字符串,内部可包含保存/恢复代际,外部不解析。
+- `sid` 如继续使用,应与 `sandbox_id` 等价或作为其别名。
+- cluster 内部总是同时维护 `group`、`route_key`、`sandbox_id`。
+
+### 5.2 Route 记录
+
+| 字段 | 说明 |
 |---|---|
-| `create{cmd_id, sid, group, route_key, template_ref, key_fp, config, migration_token?}` | 拉起沙箱:冷启 `template_ref`(快照模板=快速恢复,§9)或迁移(migration_token 一步导入 + restore)|
-| `connect{cmd_id, sid}` | 恢复本机 PAUSED 沙箱(node.md §8) |
-| `delete{cmd_id, sid|build_id}` | 销毁(kill,或 SAVED 两阶段回收步,§7.4) |
-| `key_put`/`key_drop{fingerprint, manifest_key?, expires_unix}` | 密钥租约分发 / 续租(续租=重发 `key_put`)/ 撤销(registry owns,§7.6) |
-| `build_register{cmd_id, build_id, template_id, group, resources, image_repo, registry_auth, key_fp, config}` | 预配 registry 分配的 build(§7.5);节点建 build 记录 + 瞬态用凭据 |
+| `group` | 分片键 |
+| `route_key` | 会话键 |
+| `state` | `reserved` / `placed` / `ready` / `paused` / `dead` |
+| `node_id` | 当前承载节点 |
+| `sandbox_id` | 当前实例 id |
+| `version` | CAS 版本 |
+| `updated_at` | reconcile / timeout 使用 |
 
-节点上报另含 `build_event{build_id, group, state, template_id?, reason?}`(node→registry,§7.5)。
+### 5.3 状态机
 
-命令携 `cmd_id`,node 立即回 `cmd_ack{cmd_id, status, reason?}`(accepted/rejected);**终态经上述
-事件上报**,`Reserve` 等该事件(§7)。命令以 sid / build_id 幂等。
-
-### 5.2 router / scaler ↔ registry
-
-同族帧协议(`control_api.listen`):router / scaler 拨 registry,订阅事件流(下行)+ 发操作(上行);registry
-对 scaler 反向发 `Place*` 请求(§7.5)。UDS 本机 / mTLS 远端(§4.2)。
-
-### 5.3 断线快速重连(分片版本号增量重放)
-
-每分片维护**单调递增 `rev`**;每条下行事件带其 `rev`。订阅者记最后应用的 `rev`,**重连时带入**
-`resume_from`:
-
-- registry 若仍有自该 `rev` 起的变更日志(`node_link.revision_retention` 窗口内)→ 只重放增量 +
-  新 `bookmark`;
-- 否则(`rev` 过旧 / 已压实)→ 退回逐条全量 + `bookmark` 世代清扫(node-proxy.md §6)。
-
-**opt-in**:不支持 `resume_from` 的订阅者照常全量重同步。此机制对三类订阅(节点 / 本机 plugin /
-外部 watch)一致,避免高密度下重连风暴(§11 / §12)。
-
-### 5.4 安全
-
-mTLS;节点证书 SAN / 指纹背书 node_id。`access_token` / `migration_token` 上行、`manifest_key`
-下行皆在 mTLS 内;registry 若自存(provider=store)按 secretbox 加密(node.md §7),external provider
-则 manifest_key 仅过路。同 node_id 重连顶替旧连。
-
-## 6. 注册表模型
-
-四张表,**sandbox-group 是唯一分区键**;NodeStore 全局,Sandbox/Build 按 group 分片;group 配置经
-细粒度 provider。
-
-### 6.1 四张表
-
-| 表 | 分区 | 内容 | 来源 |
-|---|---|---|---|
-| **node** | **全局(不分片)** | labels、liveness、watermark(zone/allocated/pool)、**build_capacity{cpu,mem,storage}** + build_alloc、capacity、data_endpoint、runtime_digest、`draining` 标记 | 通道 `register`/`heartbeat`(§5);失联判定 §11 |
-| **sandbox-group config** | (经 provider,§6.2) | tenant(project_id + manifest_key + registry_auth)、沙箱初始化配置、镜像仓库、模板 ref、nodeSelectors / shuffle 标签 | 细粒度 `GroupConfigProvider`(key / sandbox_config / placement / image_pull):store 自存或外部 cloud provider |
-| **sandbox** | **按 group 分片** | 每 `(group, route_key)`:state、sid、node_id、access_token、migration_token、last_active、snap_loc、template_id | 通道 `sandbox`/`delete` 收敛(§5);Reserve 提交 RESERVED(§7) |
-| **build** | **按 group 分片** | 每 `(group, build_id)`:state(registered/building/ready/error)、node_id、resources、template_id | ReserveBuild 提交 RESERVED(即占该节点 build 余量,§7.5);通道 `build_event` 收敛、终态释放 |
-
-- **group 唯一分片键**:节点表全局且小;沙箱 / 构建表按 group 分片。每操作点名 group → 唯一分片 →
-  **无跨分片 / 跨 group 操作**。`list` = Range 该 group 的 sandbox 分片。
-- **sid 索引 group 局部**:每请求带 `X-Kuasar-Sandbox-Group`,`(group, sid)` 在该分片内反查——无全局
-  sid 索引。
-- 一个 (group, route_key) 至多一条 sandbox 记录(会话亲和)。
-
-### 6.2 GroupConfigProvider(细粒度、可外置)
-
-group 关联配置按功能拆成**细粒度接口**,provider 可按接口选择子集实现(例如密钥走外部 cloud
-provider、沙箱配置走 store):
-
-```
-GroupKeyProvider:           Get(group) → {project_id, manifest_key}        // 鉴权 + 密钥分发, 敏感
-GroupSandboxConfigProvider: Get(group) → {sandbox_config, image_repo, template_ref}
-GroupPlacementProvider:     Get(group) → {nodeSelectors, shuffle_labels}   // 静态部分; shuffle 由 scaler 维护
+```text
+none -> reserved -> placed -> ready
+ready -> paused -> reserved -> ready
+ready/paused/placed -> dead/tombstone
 ```
 
-- 每接口经 `sandbox_group.providers`(§3)独立选 `store`(registry 自存,`cluster-ctl sandbox-group upsert` 写,
-  manifest_key secretbox 加密)或 `external:<addr>`(向 cloud provider 取,不落 registry——manifest_key
-  仅在 api_key 校验 / 密钥分发时过路)。这是云厂商接管 group 目录 / 多租户的扩展点;沙箱数据流只
-  依赖接口可达。
-- `template_ref` 须**远程可移植快照模板**(`manifest://` 持久 snp id,§9 快启);`sandbox_config` 缺失
-  则数据面直触发的 Reserve 失败(§8)。
+整机清空、单沙箱 killed、node 重启后的缺失沙箱都收敛为 dead route 清理;下次 Reserve
+重新放置。
 
-## 7. Reserve 与放置
+`ReserveSandbox` 返回时必须已经 READY 或失败。若已有 `reserved/placed`,新请求 join 等待同一状态机。
+客户端超时不等价于取消已提交的 placed;node 后续上报 running 时记录仍可进入 READY。
 
-`Reserve` 是核心:**ReserveSandbox**(按 route_key,有亲和 / 暂停态)与 **ReserveBuild**(按 build_id,
-资源感知,§7.5)**显式分开**。scaler **建议**放置,registry **提交**(§4.3)。
+孤儿清理由 route owner 判定:node 上报的 `(group, route_key, sandbox_id)` 在 route_link 中不存在
+或已被替换,则下发 delete/kill 到该 node。整机清空、单 sandbox killed、node dead 最终都走 dead
+sandbox 清理 route 的统一路径。
 
-### 7.1 沙箱状态
+## 6. Node-link
 
-| state | 含义 | node_id | migration_token |
-|---|---|---|---|
-| `NONE` | 无记录 | — | — |
-| `RESERVED` | 处理中(放置 / 创建 / 恢复在途;单飞) | 提交后置 | — |
-| `READY` | 在 node_id 上运行、可服务 | 有 | — |
-| `PAUSED` | 节点本机快照(快恢复、绑节点) | 有 | — |
-| `SAVED` | 远程快照(可移植、不绑节点) | **空** | 有 |
+Node 不进 SWIM。Node 连接 registry 后按 `LocateN(node_id,N)` 归属 node owner set。node 上报:
 
-无 `WARM` 态——预热靠远程快照 + 快速恢复,非节点常驻实例(§9)。
+- 全量 sandbox 清单和增量事件。
+- build 状态事件。
+- labels、runtime_digest、build_capacity、draining、粗粒度 liveness。
+- 高频水位保留在 node_link owner 本地;node_list 是独立低频投影,普通 heartbeat 不触发
+  WATCH_LIST 扇出。draining 变化和粗粒度 liveness 刷新才更新 node_list。
 
-### 7.2 ReserveSandbox 流程
+增量订阅的 rev 是字符串,格式由 node owner/node 私有约定,推荐编码为 `source_fingerprint:seq`。
+node owner 在订阅时把上次 token 传给 node;node 校验 fingerprint,匹配时 replay `seq` 之后的
+事件,不匹配或 changelog 不可用时强制全量 resync。node owner 还应以 1h-6h 随机打散周期做全量
+resync,防止长期增量漂移。
 
-```
-ReserveSandbox(group, route_key, create_config?) → (node_id, sid, reserve_token{access_token,sid,node_id,exp}, err)
+## 7. Router
 
-cfg = merge(节点默认, GroupSandboxConfigProvider.Get(group).sandbox_config, create_config)
-      // 数据面直触发(无 create_config)只用 节点默认 ⊕ group 配置;group 无沙箱配置 → 失败(§8)
-lookup (group, route_key):
-  READY     → 直接返回
-  RESERVED  → 加入该键单飞,等 READY 或 park_timeout
-  PAUSED    → 单飞{ 提交 RESERVED; connect(sid)[同节点恢复, 免放置]; 等 running → READY }
-  SAVED|NONE→ 单飞{ node = scaler.PlaceSandbox(group, route_key) 建议; registry 原子提交(CAS);
-                    create(sid, …, cfg, migration_token?)   // SAVED 带 token=一步迁移; NONE 冷启 template_ref(快照恢复)
-                    等 running → READY }
-```
+Router 是无状态北向入口,但持本地缓存:
 
-- **单飞按 (group, route_key)**;**总等 running 事件**才返回(§5.1)。
-- **快启**:`template_ref` 为 snp 快照模板时,"冷启"实为**快照恢复**(亚秒级,§9);PAUSED 同节点
-  恢复免放置;SAVED 远程快照恢复。
-- **reserve_token** = `{access_token, sid, node_id, exp}`——router 注入 `X-Access-Token` 转发
-  `node_id.data_endpoint`(cluster-router.md §7)。
+- **route resolution cache**:key 为 `(group, route_key, sandbox_id, port, protocol)`。
+- **active connection cache**:已有活动 HTTP/CONNECT 路由时,同一路由新请求不调用 Reserve。
+- **singleflight reserve**:同 route 并发 miss 只发起一次 Reserve。
 
-### 7.3 状态转移与驱动方
+所有请求必须带 `X-Kuasar-Sandbox-Group`。当前不设计 sid 编 group 的无头入口。router 不订阅全量
+route watch;转发失败时 fail-fast 淘汰缓存,下次重新 Reserve。
 
-| 转移 | 驱动 | 机制 |
+## 8. Scaler 与 node_list
+
+Scaler 消费 `node_list` 的 WATCH_LIST。WATCH_LIST 只包含低频字段:
+
+- node_id
+- labels
+- runtime_digest
+- build_capacity / capacity class
+- draining
+- coarse liveness
+
+`allocated`、`build_alloc`、counts、zone 等高频水位字段不进 WATCH_LIST;Place 时向 node owner
+按需 GET 或使用短 TTL 缓存。
+
+Scaler 通过 `SandboxGroupImporter.Range` 导入 group,通过 `SandboxGroupProvider` 取得 placement hint、
+auth-key、manifest-key、registry_auth 等配置。shuffle-sharding 使用 `pkg/maglev.LocateN`,结果编码进
+最终 placement selectors。
+
+## 9. 密钥与鉴权
+
+group 有两个密钥域:
+
+| 名称 | 持有者 | 用途 |
 |---|---|---|
-| NONE / SAVED → RESERVED → READY | ReserveSandbox | PlaceSandbox 建议 + 提交 → `create` → 等 running |
-| PAUSED → RESERVED → READY | ReserveSandbox | `connect{sid}`(同节点,免放置)→ 等 running |
-| READY → PAUSED | **节点**(TTL auto-suspend,node.md §8)| 节点 pause + `sandbox`(snap_loc=local) |
-| PAUSED → SAVED | **节点**(深空闲自提升)/ 显式控制面 | 节点上送远程 + 铸 token + `sandbox`(saved,§7.4) |
-| READY/PAUSED → NONE | **节点失联**(§11)/ kill | 死节点清扫;kill = `delete` + 事件 |
+| `auth_key` | router / node / provider | 验 API key,派生 access token |
+| `manifest_key` | node / provider | 解密镜像/快照内容;router 不接触 |
 
-沙箱 **pause / 提升只由节点侧策略(TTL / 深空闲)或控制面显式调用发起**;scaler 不碰生命周期。
+`access_token = MAC(auth_key, sandbox_id)`。access token 不需要存储在 route 记录中。
 
-### 7.4 失败、回滚与 SAVED 两阶段
+`manifest_key` 和 `registry_auth` 都是 typed secret,支持 inline 或 ref 带外交付。密钥分发遵循
+scaler/Tier-1 的 allocation 结果:scaler 决定哪些 node 应有 key,node owner 负责实际 `key_put/key_drop`
+和 lease/ack 重试。密钥分发是 create/build 前置条件,不影响已运行 sandbox。
 
-- **park 超时**:`park_timeout` 内未等到 running → 回错(router 转 503/504);RESERVED **回滚**到先前态
-  (SAVED / NONE / PAUSED),可重入。
-- **部分失败**:`create` 被 `rejected` / 超时 → 回滚;`rejected` 时 registry 改投(re-Place + 重新提交)
-  重试一次再回滚。
-- **SAVED 两阶段(不丢态)**:节点上送远程 + 铸 `migration_token`、报 `saved(token)` 但**保留本机
-  快照**;registry 持久化 token、清 `node_id`,再下发 `delete{sid}`;节点收到才回收本机。registry 在
-  token 持久化前崩溃则本机仍在、重连重报自愈。SAVED 的 migration_token 指向**内容寻址远程快照**,
-  re-Place 可重复消费。
+## 10. Build
 
-### 7.5 ReserveBuild / PlaceBuild(资源感知)
+Build 记录按 group 存在 route_link;执行态和实时预算归 node owner。
 
-`POST /v3/templates`(register)经 router 触发 **ReserveBuild**(registry 分配 build_id / template_id):
+流程:
 
-```
-ReserveBuild(group, resources?) → (build_id, template_id, node_id)
-  res  = resources ?? 默认 build 资源
-  node = PlaceBuild(group, res)                 // scaler 在 build_capacity−build_alloc≥res 的节点间利用率 P2C(§4.5)
-  registry 提交 BuildStore{(group,build_id)→node, res, state=registered}   // **RESERVED 即占用**该节点 build 余量
-  下发 build_register{build_id, template_id, res, image_repo, registry_auth, key_fp} 到 node(node-link 命令)
-```
+1. route owner 收到 `ReserveBuild(group, resources)`。
+2. 调 scaler `PlaceBuild`。
+3. 向 node owner 请求 `AdmitBuild(build_id, resources, ttl)`。
+4. admission 成功后写 group build record。
+5. 下发 `build_register`。
+6. 失败路径 release admission;终态 build_event 释放预算。
 
-提交时 registry **权威校验**该节点 build 余量(BuildStore 中 registered/building 之和),超订则 re-Place;
-RESERVED 立即占用,避免心跳追上前并发超订。此后 build 的 trigger/status/files 由 router 按 build_id 转发该
-node 的 e2b 构建 API(§8;build→node 由 BuildStore 解析,router 重启可恢复);节点跑三阶段构建
-(node.md §12)并经通道 `build_event`(registered/building/ready/error)上报,registry 收敛 BuildStore、**终态
-释放**占用;死节点其 build → error。**镜像拉取凭据**(image_repo + registry_auth)经独立 image_pull
-provider 解析(store 密封 / external 透传)、随 build_register 下发,节点**瞬态**使用、不落盘(§6.2)。产物
-持久模板经远程 store 可达,任意节点快照恢复(§6 `template_ref`)。
+`build_id` 查询必须带 group。若 node owner 发现预算不足,直接拒绝,route owner 重调度。
 
-### 7.6 密钥分发(registry 主管)
+## 11. Provider
 
-**registry**(非 scaler)负责把 group 的 manifest_key 以 TTL 租约**预分发**到其分配节点集并续租
-(`key_put` 写 / 重发续租 / `key_drop` 撤,§5.1;reconcile 周期重发 `key_put` 即续租)。**预分发是基本能力**(非 opt-in):放置前密钥已在节点;
-`Place` 不做即时 key_put,**所选节点缺密钥则 `create` 直接失败**(→ re-Place / 错)。`KeyDistributor`
-两实现:**registry 经通道推送**(默认),或 **registry 委托 provider**(云厂商密钥服务带外推到节点,
-registry 只交付"分配集")。manifest_key 由 `GroupKeyProvider` 取。lease 默认 **3h、每 1h 续租**(留 ≥2 次续租裕度抗抖动);
-分配节点集 = scaler 维护的 group 有效 nodeSelectors 命中集(cluster-scaler.md §4.4),选择器变更 →
-registry 撤旧节点租约 / 铺新节点;隔离节点续租断流即 ≤ 3h 后过期失效(失败闭合)。
+新 provider 模型:
 
-## 8. 控制面 API(e2b 兼容,sandbox-group 范围)
+```text
+SandboxGroupProvider:
+  Get(group)              -> sandbox config, image repo, registry_auth, metadata
+  GetPlacementHint(group) -> raw selectors / shuffle labels
+  GetKey(group)           -> typed manifest_key
+  GetAuthKey(group)       -> auth_key or verification material
 
-router 在 `api.<domain>` 暴露 e2b 兼容控制面(实现见 cluster-router.md;本节定义契约)。**每请求必带
-`X-Kuasar-Sandbox-Group`**,操作严格限定该 group——**无跨 group 操作**。鉴权:`X-API-KEY` 经 MAC 校验
-该 group 的租户 manifest_key(`GroupKeyProvider` 取,复用 node.md §7),不符回 403(不泄露存在性回 404)。
-
-| 操作 | 方法 + 路径 | 集群语义 |
-|---|---|---|
-| create | `POST /sandboxes` | 取 route_key + create 配置 → 合并 `节点默认 ⊕ group 配置 ⊕ create`(create 胜)→ ReserveSandbox → 回 `{sandboxID, tokens}`(node.md §4.1) |
-| connect(resume) | `POST /sandboxes/{id}/connect` | 本 group 取记录(含 route_key)→ ReserveSandbox 恢复 / 迁移(可携 `X-Kuasar-Migration-Token` + route_key 一步迁移)|
-| pause / kill / timeout | `POST .../pause` 等 | 取记录 node_id → **转发该节点 e2b 控制面**执行;kill 另删记录 + `delete` |
-| get | `GET /sandboxes/{id}` | 本 group 分片读 +(可选)转发节点取活信息 |
-| list | `GET /v2/sandboxes` | **仅本 group**:Range 该 group sandbox 分片;不跨 group |
-| build | `POST /v3/templates`、`/v2/templates/{tid}/builds/{bid}`、`/status`、`/files` | register 走 ReserveBuild(§7.5)→ 其余转发被 pin 节点(node.md §12)|
-
-- **校验后转发**:create/connect 经 Reserve(走节点命令);pause/kill/timeout/build-trigger 转发节点
-  执行;list/get 从 group 分片 store 服务。
-- **配置合并**:create 初始化配置与 group 关联配置合并;**数据面直触发的 Reserve(无 create)只用
-  `节点默认 ⊕ group 配置`**,group 未关联沙箱配置则 Reserve 失败、拒绝请求。
-- **api_key 与单机一致**:manifest_key 派生 api_key(node.md §7);cluster 按 group 的 manifest_key 校验。
-
-## 9. 启动延迟与数据通路
-
-最小化启动延迟是第一约束。延迟拆成两类路径(PAUSED 唤醒是介于二者的快档,见下):
-
-```
-热(已建立会话, READY):  client ─TLS─► router ─(本地路由缓存)─► node ─UDS─► guest
-                          = 2 网络跳, 零控制面往返。
-
-冷/恢复(首触 / 唤醒):    client ─► router ─► registry.ReserveSandbox ─►[PlaceSandbox 建议+提交]─►
-                          node.create/connect(快照恢复) ─► running 事件 ─► 结果 ─► router ─► node
-                          = 控制往返(共置时 UDS, 亚毫秒)+ 快照恢复(亚秒, 平台原生)主导。
+SandboxGroupImporter:
+  Range(cursor, limit)    -> groups with ttl/generation
 ```
 
-- **热路径零控制往返**:router 订阅 registry 路由流、持本地缓存(`(group,route-key)/sid → node,token`),
-  命中直转(cluster-router.md §5)。已建立会话不碰控制面。
-- **快照恢复即"预热"**:沙箱 / group 数量远超节点,不在节点常驻实例;group 模板取 **snp 快照** →
-  首启即快速恢复;空闲 PAUSED(本机)/ SAVED(远程),唤醒即恢复。"预热池"=去重远程快照存储 + 缓存,
-  按需恢复(亚秒)。
-- **shuffle-sharding 顺带缓存局部性**:group 钉死 n 个 slot(cluster-scaler.md §4),其快照 chunk 与
-  本机 bundle 在那几个节点上缓存常热——恢复免远程拉取。一举三得:爆炸半径、均衡分布、**恢复局部性**。
-- **同节点 PAUSED 优于 SAVED 迁移**:PAUSED 本机恢复免放置、免远程拉取,远快于 SAVED 迁移;调高
-  节点 idle→SAVED 阈值让会话久留 PAUSED,SAVED 留给真正回收 / 跨机。
-- **编排开销可忽略**:控制连接持久(无握手)、密钥预置(无 key 推送,§7.6)、共置 UDS、调用方鉴权
-  缓存(cluster-router.md §8);唯一不可省的网络跳是 `registry↔node`。
+实现阶段可用现有 `groupcfg` 做 adapter,但新 cluster 内核只依赖该统一接口。
 
-## 10. Store 接口与可扩展性
+## 12. 可靠性
 
-四张表统一在一组 Store 接口之后,**持久后端从 sqlite 起、接口为 etcd / raft 预留,扩容不改接口**;
-**sandbox-group 是唯一分片键**。
-
-```
-NodeStore(全局)               Get/Put/Delete/Range/Watch/Lease
-GroupConfigProvider(细粒度)    见 §6.2,可外置
-SandboxStore / BuildStore      Get/Put/Delete/Range(group,…)/Watch(group)/Lease/CAS(group,…)
-  (按 group 分片)
-```
-
-- **后端**:`sqlite`(单机持久,最简,复用 node 的纯 Go sqlite);`etcd`(单 / 多节点,Watch/Lease/txn,
-  分片版本号即 etcd revision);`raft`(按 group 分片,每片一组 multi-raft)。**无 memory**——任何模式
-  进程重启可恢复(§11)。
-- **调度器 / 提交**:放置经 `CAS(group, …)` 原子提交(§4.3),scaler 建议、registry 提交。
-- **分片版本号**:每分片单调 `rev` + 有界变更日志,支撑断线增量重放(§5.3)与 watch。
-- **流式 `Range`**:list / 计数 / 重同步 / GC 一律回调式迭代,不物化整表。
-- **Lease**:节点 liveness、manifest_key 节点租约(§7.6)、空闲 (group,route_key) 记录 GC(SAVED / 长
-  不活跃 TTL 回收,控制 route-key 基数)。
-
-## 11. 可靠性
-
-| 故障 | 影响 | 自愈 |
-|---|---|---|
-| registry 崩溃 / 重启 | 通道全断;Reserve 暂不可用 | **从持久 Store 恢复**(group 配置 / 记录)+ 节点重连重报沙箱 / 构建集(§5.3 增量)→ 机群态重建。**无纯内存**故重启不丢业务态(§1.2) |
-| **节点失联(> `node_dead_after`)** | 该节点单元不可达 | 排除放置;**死节点清扫**:其 `READY`/`PAUSED`(本机快照随节点已失)、及**无在途 Reserve 持有**的 `RESERVED` 记录 → 删除(下次 Reserve 快照恢复 / re-Place);有在途 Reserve 的 `RESERVED` 不动(由单飞自管),`SAVED`(不绑节点)不动。避免 READY 记录长指死节点反复 502(cluster-router.md §9) |
-| 节点抖动后重连 | 短暂 stale | 增量重连重报(§5.3);期间该节点请求 502 / park 超时 |
-| router / scaler 崩溃 | 无状态 | 重启重连 registry,增量重同步缓存 / 视图 |
-| Reserve 在途失败 / 超时 | 该请求 | 回滚 RESERVED,可重入(§7.4) |
-| scaler 不可用 | 冷放置停滞 | 热路径不受影响(router 缓存);park 超时;scaler 重连即恢复 |
-| 节点密钥租约过期(被隔离) | 不能解密 | 失败闭合:create 失败 → re-Place(§7.6) |
-
-**关键不变量**:**节点是沙箱 / 构建存活态的真相之源,registry 是持久聚合 + 路由权威**。
-
-## 12. 性能
-
-- **热路径**:router 本地缓存命中 = 一次查表 + 即时刷流反代,零控制往返(§9)。
-- **冷路径**:控制往返(共置 UDS)+ 快照恢复;PlaceSandbox 建议 = scaler 本地计算(订阅视图);
-  单飞抑制同 (group,route_key) 冷启惊群。
-- **横向扩**:router 无状态(N 副本 LB);registry 按 group 分片(Sandbox/Build),NodeStore + 通道枢纽
-  为全局节点层;scaler 按 group 分片(调度 / 提交分层利于此,§4.3)。
-- **断线快恢复**:分片版本号增量重放(§5.3),高密度下重连不发全量,内存 / 带宽有界。
-- **route-key 基数**:一 (group,route_key) 一记录,会话维度大——Lease 对 SAVED / 长不活跃记录 TTL
-  回收(§10),全量扫描流式。
-
-## 13. See Also
-
-- [cluster-router.md](cluster-router.md) —— e2b 兼容统一入口:控制面 + 数据面、本地路由缓存、头解析、
-  调用方鉴权、Reserve 消费、两跳转发与 CONNECT、token 注入。
-- [cluster-scaler.md](cluster-scaler.md) —— 放置调度器(建议)、shuffle-sharding 选择器 patch / maglev、
-  PlaceBuild 资源感知、爆炸半径不变量;不联系节点、不碰生命周期。
-- [node.md](node.md) §10 —— 节点侧统一通道(反向注册为路由权威);§4 —— cluster 控制面转发到的节点
-  e2b 契约;§8 / §8.1 —— 沙箱生命周期与快照 / 迁移原语(§9 快启);§7 —— 密钥模型;§12 —— 三阶段构建。
-- [node-proxy.md](node-proxy.md) §6 —— routesync 线格式(本统一通道的基座,含 `kind=registry` + 命令
-  上行 + 版本号重放)。
-- [node-resource.md](node-resource.md) —— 节点水位来源(P2C 信号)。
-- `sandbox-accelerator/docs/cache.md` / `manifest.md` —— `pkg/maglev`(shuffle-sharding 复用)、远程
-  快照 store 与缓存(§9 快启 / 去重)。
-- `kuasar-sandbox/docs/kuasar-sandbox.md` / `deployment.md` —— 平台总体定位与集群部署拓扑。
+| 事件 | 行为 |
+|---|---|
+| router 崩溃 | 丢缓存;重启后 miss Reserve |
+| scaler 崩溃 | 冷放置受影响;热连接不受影响 |
+| node 崩溃/清空 | node owner / route owner 清理 route;下次 Reserve 重新放置 |
+| registry 单成员故障 | owner set quorum 足够时继续服务;故障成员恢复后 catch-up |
+| registry 双成员故障 | 对应 shard 少于 W 时停写 |
+| membership 变更 | learner 预同步 + per-shard 短栅栏 + old grace |
+| 整集群下电 | 不要求自动恢复沙箱 |

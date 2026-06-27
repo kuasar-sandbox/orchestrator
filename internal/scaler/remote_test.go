@@ -6,7 +6,6 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -26,10 +25,7 @@ func TestScalerLinkReverseCall(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	discard := slog.New(slog.NewTextHandler(io.Discard, nil))
 
-	kv, err := clusterstore.Open(filepath.Join(t.TempDir(), "reg.db"), 1000)
-	if err != nil {
-		t.Fatal(err)
-	}
+	kv := clusterstore.OpenMemory(1000)
 	defer kv.Close()
 	stores := registry.NewStores(kv, nil)
 	stores.PutNode(ctx, &registry.NodeRecord{NodeID: "n1", Labels: map[string]string{"pool": "p"}, Counts: 5})
@@ -50,17 +46,20 @@ func TestScalerLinkReverseCall(t *testing.T) {
 	svc := NewRemote(strings.TrimPrefix(controlSrv.URL, "http://"), nil, clustercfg.PlacementConfig{Candidates: 2}, 30, discard)
 	svc.Start(ctx)
 
-	// Poll until the scaler-link + views are up and placement resolves to the colder
-	// node (n2, Counts=0) via the reverse-call.
+	// Poll until the scaler-link + node_list/group views are up and placement
+	// resolves to a selector-matching node via the reverse-call. node_list no
+	// longer carries high-frequency load, so this does not assert colder-node
+	// selection.
 	var node string
+	var err error
 	for i := 0; i < 300; i++ {
 		if node, err = placer.Place(ctx, registry.PlaceRequest{Group: "/g", RouteKey: "rk"}); err == nil {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	if err != nil || node != "n2" {
-		t.Fatalf("reverse-call Place = %q err=%v (want colder n2)", node, err)
+	if err != nil || (node != "n1" && node != "n2") {
+		t.Fatalf("reverse-call Place = %q err=%v (want n1 or n2)", node, err)
 	}
 
 	// An unplaceable group (no matching nodes) → ErrNoNode through the reverse-call.
@@ -78,10 +77,7 @@ func TestScalerLinkReverseCall(t *testing.T) {
 // TestChannelPlacerNoScaler: with no scaler attached, placement stalls (ErrNoNode),
 // not a hang — the data plane (router cache) is unaffected (cluster.md §11).
 func TestChannelPlacerNoScaler(t *testing.T) {
-	kv, err := clusterstore.Open(filepath.Join(t.TempDir(), "r.db"), 0)
-	if err != nil {
-		t.Fatal(err)
-	}
+	kv := clusterstore.OpenMemory(0)
 	defer kv.Close()
 	reg := registry.New(registry.NewStores(kv, nil), nil, 0, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	placer := registry.NewChannelPlacer(reg, 200*time.Millisecond)

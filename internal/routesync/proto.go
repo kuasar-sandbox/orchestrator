@@ -58,7 +58,6 @@ const (
 	StateRunning = "running"
 	StatePaused  = "paused"
 	StateDead    = "dead"
-	StateSaved   = "saved" // node uploaded a remote snapshot + minted a migration token (cluster.md §7.4)
 )
 
 // Message types.
@@ -94,9 +93,8 @@ type RouteEntry struct {
 	// Cluster node-link fields (node.md §10 / cluster.md §5.1): set when the route
 	// authority is a node reporting sandboxes to the registry; empty on the local
 	// proxy plane. The registry keys SandboxStore by (Group, RouteKey).
-	Group          string `json:"group,omitempty"`           // sandbox-group (shard key)
-	RouteKey       string `json:"route_key,omitempty"`       // {user,session} routing key (session affinity)
-	MigrationToken string `json:"migration_token,omitempty"` // SAVED → portable; minted by export-sandbox
+	Group    string `json:"group,omitempty"`     // sandbox-group (shard key)
+	RouteKey string `json:"route_key,omitempty"` // {user,session} routing key (session affinity)
 }
 
 // Policy is the operational policy the orchestrator pushes to a proxy at handshake
@@ -117,11 +115,12 @@ type Msg struct {
 	SID      string      `json:"sid,omitempty"`      // delete | wake | command target
 	// Cluster node-link variants (node.md §10): node_register / heartbeat / cmd_ack
 	// flow node -> registry; command flows registry -> node; rev stamps down events.
-	NodeReg *NodeRegister `json:"node_register,omitempty"`
-	Beat    *Heartbeat    `json:"heartbeat,omitempty"`
-	Cmd     *Command      `json:"command,omitempty"`
-	Ack     *CmdAck       `json:"cmd_ack,omitempty"`
-	Rev     int64         `json:"rev,omitempty"` // per-shard monotonic revision for resume_from (§5.3)
+	NodeReg  *NodeRegister `json:"node_register,omitempty"`
+	Beat     *Heartbeat    `json:"heartbeat,omitempty"`
+	Cmd      *Command      `json:"command,omitempty"`
+	Ack      *CmdAck       `json:"cmd_ack,omitempty"`
+	Rev      int64         `json:"rev,omitempty"` // per-shard monotonic revision for resume_from (§5.3)
+	RevToken string        `json:"rev_token,omitempty"`
 	// Scaler-link variants (cluster.md §5.2): place_req down, place_result + selector_patch up.
 	PlaceReq    *PlaceReq      `json:"place_req,omitempty"`
 	PlaceResult *PlaceResult   `json:"place_result,omitempty"`
@@ -131,8 +130,9 @@ type Msg struct {
 
 // Hello is the orchestrator's first down-frame; it carries the operational Policy.
 type Hello struct {
-	Version int    `json:"version"`
-	Policy  Policy `json:"policy,omitempty"`
+	Version    int    `json:"version"`
+	Policy     Policy `json:"policy,omitempty"`
+	ResumeFrom string `json:"resume_from,omitempty"` // node-link subscriber request; empty means full sync
 }
 
 // Register is the subscriber's first up-frame: the capabilities it wants wired. The
@@ -144,8 +144,10 @@ type Register struct {
 	Proxy     *Proxy     `json:"proxy,omitempty"`     // accepts gateway-forwarded data-plane requests
 	Mmds      bool       `json:"mmds,omitempty"`      // serves MMDS (the per-sandbox secret ships on every entry)
 	// ResumeFrom (opt-in) asks the authority to replay the route changelog strictly
-	// after this rev instead of a full re-sync (§5.3); 0 = full sync + bookmark.
-	ResumeFrom int64 `json:"resume_from,omitempty"`
+	// after this token instead of a full re-sync. The token is intentionally a
+	// string so a node owner can embed a source fingerprint and reject incremental
+	// resume across node restart / instance boundaries.
+	ResumeFrom string `json:"resume_from,omitempty"`
 }
 
 // Subscribe selects the route-stream flavor.

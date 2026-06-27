@@ -138,8 +138,11 @@ func (c *Client) session(ctx context.Context, tr *http2.Transport) error {
 	if err := <-regErr; err != nil {
 		return err
 	}
-	// Registry's Hello ack (the node ignores its policy).
-	if _, err := routesync.ReadMsg(resp.Body); err != nil {
+	// Registry's Hello ack may carry the node owner's resume token. Empty means
+	// full resync; a fingerprint mismatch inside StreamAuthority also falls back
+	// to full resync.
+	hello, err := routesync.ReadMsg(resp.Body)
+	if err != nil {
 		return err
 	}
 
@@ -147,6 +150,9 @@ func (c *Client) session(ctx context.Context, tr *http2.Transport) error {
 	// reusing the shared authority loop. Subscribe(kind=registry) makes the loop
 	// stream routes; onUp dispatches commands.
 	reg := routesync.Register{Subscribe: &routesync.Subscribe{Kind: routesync.KindRegistry}}
+	if hello.Type == routesync.TypeHello && hello.Hello != nil {
+		reg.ResumeFrom = hello.Hello.ResumeFrom
+	}
 	outbox := make(chan *routesync.Msg, 32)
 	onUp := func(uctx context.Context, m *routesync.Msg) {
 		if m.Type == routesync.TypeCommand && m.Cmd != nil {

@@ -59,13 +59,15 @@ type Orchestrator struct {
 	subs   map[int]chan routesync.Event // route-change subscribers (routesync clients)
 	subSeq int
 
+	routeLogMu sync.Mutex
+	routeFP    string
+	routeSeq   int64
+	routeLog   []routeLogEntry
+
 	pendMu sync.Mutex
 	pend   map[string]*pendingBuild // builds whose unit is running (BuildSpecFor source)
 
 	files *filestore.Store // COPY build-context object store; nil = unconfigured (COPY → 501)
-
-	savedMu      sync.Mutex
-	savedPending map[string]string // sid -> migration token (PAUSED->SAVED promote in flight, §7.4)
 
 	clusterCtx context.Context // node-link async work lifetime (set by serve); nil = background
 	probe      ResourceProbe   // node water level for cluster heartbeat (set by serve when resource_listen on); nil = none
@@ -89,8 +91,8 @@ func New(cfg *config.Config, st *store.Store, lc launcher.Launcher, vs vsClient,
 		cfg: cfg, st: st, lc: lc, vs: vs, log: log,
 		reg:           map[string]*types.Sandbox{},
 		subs:          map[int]chan routesync.Event{},
+		routeFP:       uuid.NewString(),
 		pend:          map[string]*pendingBuild{},
-		savedPending:  map[string]string{},
 		clusterBuilds: map[string]*clusterBuild{},
 		buildEvents:   make(chan *routesync.BuildEvent, 64),
 	}
@@ -311,13 +313,6 @@ func (o *Orchestrator) pauseSandbox(ctx context.Context, sb *types.Sandbox) erro
 	sb.State = types.StatePaused
 	_ = o.st.SetSnapshotRef(ctx, sb.ID, ref)
 	_ = o.st.SetState(ctx, sb.ID, types.StatePaused)
-	// Cluster deep-idle clock (§7.4): re-arm DeadlineUnix as the post-pause idle
-	// deadline so the reaper promotes this to SAVED after deep_idle_sec (opt-in).
-	if o.cfg.Cluster.Registry.Endpoint != "" && o.cfg.Checkpoint.DeepIdleSec > 0 {
-		d := time.Now().Unix() + int64(o.cfg.Checkpoint.DeepIdleSec)
-		sb.DeadlineUnix = d
-		_ = o.st.SetDeadline(ctx, sb.ID, d)
-	}
 	o.cache(sb)
 	_ = o.lc.Stop(ctx, o.runnerUnit(sb.ID))
 	_ = o.lc.ResetFailed(ctx, o.runnerUnit(sb.ID))
@@ -407,8 +402,7 @@ func (o *Orchestrator) resume(ctx context.Context, sb *types.Sandbox) error {
 	nb.State = types.StateRunning
 	// Re-arm the running TTL: a resumed sandbox runs for timeout_sec more. Its stored
 	// deadline is from before the pause (already passed), so without this the reaper
-	// would immediately re-suspend it — also the case for a SAVED migrate's restore,
-	// whose token carries the original stale deadline.
+	// would immediately re-suspend it.
 	if o.cfg.Sandbox.TimeoutSec > 0 {
 		nb.DeadlineUnix = time.Now().Add(time.Duration(o.cfg.Sandbox.TimeoutSec) * time.Second).Unix()
 	}
@@ -659,7 +653,6 @@ func (o *Orchestrator) Reaper(ctx context.Context, interval time.Duration) {
 					o.log.Warn("reaper pause", "sid", sb.ID, "err", err)
 				}
 			}
-			o.reapDeepIdle(ctx, now) // PAUSED deep-idle -> SAVED (cluster, opt-in; §7.4)
 			if n, err := o.st.PruneExpiredManifestKeys(ctx); err != nil {
 				o.log.Warn("reaper prune manifest keys", "err", err)
 			} else if n > 0 {

@@ -13,6 +13,13 @@ import (
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/types"
 )
 
+const routeLogLimit = 4096
+
+type routeLogEntry struct {
+	seq int64
+	ev  routesync.Event
+}
+
 // This file makes the orchestrator the routesync.Source: it streams the route set,
 // publishes route changes to subscribed route-sync clients (one per external
 // proxy), and resumes a sandbox when a proxy wakes it. The orchestrator is the
@@ -44,13 +51,6 @@ func (o *Orchestrator) routeEntry(sb *types.Sandbox) routesync.RouteEntry {
 		if json.Unmarshal([]byte(cm), &c) == nil {
 			e.Group, e.RouteKey = c.Group, c.RouteKey
 		}
-	}
-	// Deep-idle promote in flight (§7.4): report `saved` + the migration token
-	// instead of `paused`, so the registry stores the token, unbinds the node, and
-	// tells this node to reclaim the local copy (re-emitted on a node-link reconnect).
-	if tok := o.savedToken(sb.ID); tok != "" {
-		e.State = routesync.StateSaved
-		e.MigrationToken = tok
 	}
 	return e
 }
@@ -141,6 +141,51 @@ func (o *Orchestrator) Policy() routesync.Policy {
 	}
 }
 
+func (o *Orchestrator) SourceFingerprint() string {
+	o.routeLogMu.Lock()
+	defer o.routeLogMu.Unlock()
+	return o.routeFP
+}
+
+func (o *Orchestrator) CurrentRevToken() string {
+	o.routeLogMu.Lock()
+	defer o.routeLogMu.Unlock()
+	return routesync.MakeRevToken(o.routeFP, o.routeSeq)
+}
+
+func (o *Orchestrator) Replay(ctx context.Context, afterSeq int64, fn func(routesync.Event) error) error {
+	o.routeLogMu.Lock()
+	if len(o.routeLog) == 0 {
+		if afterSeq == o.routeSeq {
+			o.routeLogMu.Unlock()
+			return nil
+		}
+		o.routeLogMu.Unlock()
+		return routesync.ErrResumeUnavailable
+	}
+	first := o.routeLog[0].seq
+	if afterSeq < first-1 || afterSeq > o.routeSeq {
+		o.routeLogMu.Unlock()
+		return routesync.ErrResumeUnavailable
+	}
+	events := make([]routesync.Event, 0, len(o.routeLog))
+	for _, item := range o.routeLog {
+		if item.seq > afterSeq {
+			events = append(events, item.ev)
+		}
+	}
+	o.routeLogMu.Unlock()
+	for _, ev := range events {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := fn(ev); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // --- publish ---
 
 func (o *Orchestrator) publishUpsert(sb *types.Sandbox) {
@@ -154,6 +199,7 @@ func (o *Orchestrator) publishDelete(sid string) {
 // publish fans an event out to every subscriber. A full subscriber is dropped +
 // closed (it reconnects and re-snapshots) rather than blocking the caller.
 func (o *Orchestrator) publish(ev routesync.Event) {
+	o.appendRouteLog(ev)
 	o.subsMu.Lock()
 	defer o.subsMu.Unlock()
 	for id, ch := range o.subs {
@@ -164,5 +210,16 @@ func (o *Orchestrator) publish(ev routesync.Event) {
 			close(ch)
 			o.log.Warn("routesync subscriber lagged; dropped (will reconnect)", "sub", id)
 		}
+	}
+}
+
+func (o *Orchestrator) appendRouteLog(ev routesync.Event) {
+	o.routeLogMu.Lock()
+	defer o.routeLogMu.Unlock()
+	o.routeSeq++
+	o.routeLog = append(o.routeLog, routeLogEntry{seq: o.routeSeq, ev: ev})
+	if len(o.routeLog) > routeLogLimit {
+		copy(o.routeLog, o.routeLog[len(o.routeLog)-routeLogLimit:])
+		o.routeLog = o.routeLog[:routeLogLimit]
 	}
 }

@@ -44,23 +44,27 @@ func (r *Registry) ServeControl(mux *http.ServeMux) {
 	mux.HandleFunc(ControlGroupPath, r.serveGroup)
 	mux.HandleFunc(ControlListPath, r.serveList)
 	mux.HandleFunc(ControlVerifyKeyPath, r.serveVerifyKey)
-	mux.HandleFunc(ControlWatchPath, r.serveWatch)
-	mux.HandleFunc(ControlNodeWatchPath, r.serveNodeWatch)   // standalone scaler view (§5.2)
-	mux.HandleFunc(ControlGroupWatchPath, r.serveGroupWatch) // standalone scaler view (§5.2)
+	mux.HandleFunc(ControlNodeListWatchPath, r.serveNodeListWatch) // scaler node_list WATCH_LIST
+	mux.HandleFunc(ControlGroupWatchPath, r.serveGroupWatch)       // scaler group view
 }
 
-// serveVerifyKey verifies an api key against a group's manifest key (the router's
-// auth check, cached for router.auth_cache_ttl — cluster-router.md §8). A 403
-// hides both a bad key and an unknown group.
+// serveVerifyKey verifies an api key against a group's auth_key (the router's
+// auth check, cached for router.auth_cache_ttl). A 403 hides both a bad key and
+// an unknown group. manifest_key is node/provider-facing and is not read here.
 func (r *Registry) serveVerifyKey(w http.ResponseWriter, req *http.Request) {
 	q := req.URL.Query()
-	k, found, err := r.resolver.Key.Key(req.Context(), q.Get("group"))
+	k, found, err := r.groupProvider.GetAuthKey(req.Context(), q.Get("group"))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusServiceUnavailable) // key provider unavailable → 503
 		return
 	}
-	if !found || k.ManifestKey == "" {
+	if !found || k.Value == "" {
 		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	authKey, err := r.resolveSecret(req.Context(), "auth_key", k)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
 	}
 	p, err := apikey.Parse(req.Header.Get("X-API-KEY")) // in a header, never the query (logged)
@@ -68,7 +72,7 @@ func (r *Registry) serveVerifyKey(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
-	raw, err := hex.DecodeString(k.ManifestKey)
+	raw, err := hex.DecodeString(authKey)
 	if err != nil || !apikey.Verify(p, raw) {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
@@ -169,9 +173,13 @@ func (r *Registry) ResolveSID(ctx context.Context, sid string) (*RouteResolve, b
 	if err != nil || !found {
 		return nil, found, err
 	}
+	tok, err := r.deriveAccessToken(ctx, rec.Group, rec.SID)
+	if err != nil {
+		return nil, false, err
+	}
 	return &RouteResolve{
 		SID: rec.SID, Group: rec.Group, RouteKey: rec.RouteKey, NodeID: rec.NodeID,
-		DataEndpoint: r.nodeDataEndpoint(ctx, rec.NodeID), AccessToken: rec.AccessToken,
+		DataEndpoint: r.nodeDataEndpoint(ctx, rec.NodeID), AccessToken: tok,
 		State: string(rec.State),
 	}, true, nil
 }

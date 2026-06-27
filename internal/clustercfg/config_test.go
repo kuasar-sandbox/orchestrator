@@ -19,7 +19,7 @@ func TestRouterNeedsDomain(t *testing.T) {
 
 func TestLoadRegistryPartialAppliesDefaults(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "registry.yaml")
-	os.WriteFile(path, []byte("state:\n  backend: sqlite\n  dsn: /tmp/r.db\nnode_link:\n  listen: \":8800\"\n"), 0o600)
+	os.WriteFile(path, []byte("state:\n  backend: memory\nnode_link:\n  listen: \":8800\"\n"), 0o600)
 	c, err := LoadRegistry(path)
 	if err != nil {
 		t.Fatalf("load: %v", err)
@@ -66,9 +66,9 @@ func TestProviderForExternal(t *testing.T) {
 
 func TestRegistryValidateRejects(t *testing.T) {
 	c := DefaultRegistry()
-	c.State.Backend = "memory" // no memory mode
+	c.State.Backend = "unknown"
 	if err := c.Validate(); err == nil {
-		t.Fatal("memory backend should be rejected")
+		t.Fatal("unknown backend should be rejected")
 	}
 	c = DefaultRegistry()
 	c.Reserve.ParkTimeout = "notaduration"

@@ -2,6 +2,8 @@ package registry
 
 import (
 	"context"
+	"fmt"
+	"time"
 
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/routesync"
 )
@@ -26,6 +28,8 @@ type BuildReserveReq struct {
 // defaultBuildResources is one build's resource footprint when the request omits
 // it (cluster.md §7.5 "不指定则使用默认"); a coarse single-build slot.
 var defaultBuildResources = &routesync.BuildResources{CPU: 1000, Mem: 1 << 30}
+
+const buildRegisterAckTimeout = 5 * time.Second
 
 // ReserveBuild places a build on a resource-eligible node and pre-provisions it
 // (cluster.md §7.5): the registry assigns the build/template ids, resource-aware
@@ -53,15 +57,16 @@ func (r *Registry) ReserveBuild(ctx context.Context, req BuildReserveReq) (*Buil
 		if !live {
 			continue
 		}
-		if !r.buildHeadroom(ctx, id, resources) {
+		if !r.admitBuild(ctx, id, buildID, resources) {
 			if attempt == 0 {
-				continue // oversubscribed (commit-time check); re-ask the placer
+				continue // node owner budget rejected; re-ask the placer
 			}
 			return nil, ErrNoNode
 		}
-		// Commit the reservation BEFORE sending the command — RESERVED occupies now.
+		// Commit the group build record after node-owner admission succeeds.
 		rec := &BuildRecord{Group: req.Group, BuildID: buildID, NodeID: id, Resources: resources, State: BuildRegistered}
 		if err := r.stores.PutBuild(ctx, rec); err != nil {
+			r.releaseBuildAdmission(buildID)
 			return nil, err
 		}
 		nodeID = id
@@ -69,15 +74,40 @@ func (r *Registry) ReserveBuild(ctx context.Context, req BuildReserveReq) (*Buil
 			CmdID: newID(), Kind: routesync.CmdBuildRegister, Group: req.Group,
 			BuildID: buildID, TemplateRef: templateID, BuildResources: resources, Config: req.Metadata,
 		}
-		if k, ok, _ := r.resolver.Key.Key(ctx, req.Group); ok && k.ManifestKey != "" {
-			cmd.KeyFingerprint = keyFingerprint(k.ManifestKey)
-		}
-		if ip, ok, _ := r.resolver.ImagePull.ImagePull(ctx, req.Group); ok {
-			cmd.ImageRepo, cmd.RegistryAuth = ip.ImageRepo, ip.RegistryAuth // delivered with the build task; node uses transiently
-		}
-		if err := conn.send(cmd); err != nil {
-			_ = r.stores.DeleteBuild(ctx, req.Group, buildID) // roll back the reservation
+		if manifestKey, ok, err := r.manifestKey(ctx, req.Group); err != nil {
+			_ = r.stores.DeleteBuild(ctx, req.Group, buildID)
+			r.releaseBuildAdmission(buildID)
 			return nil, err
+		} else if ok && manifestKey != "" {
+			cmd.KeyFingerprint = keyFingerprint(manifestKey)
+		}
+		if sg, ok, err := r.groupProvider.Get(ctx, req.Group); err != nil {
+			_ = r.stores.DeleteBuild(ctx, req.Group, buildID)
+			r.releaseBuildAdmission(buildID)
+			return nil, err
+		} else if ok {
+			cmd.ImageRepo = sg.ImageRepo
+			if sg.RegistryAuth.Value != "" {
+				auth, err := r.resolveSecret(ctx, "registry_auth", sg.RegistryAuth)
+				if err != nil {
+					_ = r.stores.DeleteBuild(ctx, req.Group, buildID)
+					r.releaseBuildAdmission(buildID)
+					return nil, err
+				}
+				cmd.RegistryAuth = auth // delivered with the build task; node uses transiently
+			}
+		}
+		ack, err := r.sendAndWait(ctx, conn, cmd, buildRegisterAckTimeout)
+		if err != nil || ack.Status != routesync.AckAccepted {
+			_ = r.stores.DeleteBuild(ctx, req.Group, buildID) // roll back the reservation
+			r.releaseBuildAdmission(buildID)
+			if attempt == 0 {
+				continue
+			}
+			if err != nil {
+				return nil, err
+			}
+			return nil, fmt.Errorf("registry: build_register rejected: %s", ack.Reason)
 		}
 		break
 	}
@@ -85,6 +115,19 @@ func (r *Registry) ReserveBuild(ctx context.Context, req BuildReserveReq) (*Buil
 		return nil, ErrNoNode
 	}
 	return &BuildReserveResult{BuildID: buildID, TemplateID: templateID, NodeID: nodeID, DataEndpoint: r.nodeDataEndpoint(ctx, nodeID)}, nil
+}
+
+func (r *Registry) admitBuild(ctx context.Context, nodeID, buildID string, want *routesync.BuildResources) bool {
+	if r.nodeOwner == nil {
+		return false
+	}
+	return r.nodeOwner.AdmitBuild(ctx, nodeID, buildID, want)
+}
+
+func (r *Registry) releaseBuildAdmission(buildID string) {
+	if r.nodeOwner != nil {
+		r.nodeOwner.ReleaseBuild(context.Background(), buildID)
+	}
 }
 
 // buildHeadroom reports whether nodeID can fit want given its declared build pool
@@ -126,11 +169,13 @@ func (r *Registry) applyBuildEvent(ctx context.Context, e *routesync.BuildEvent)
 	}
 	rec.Reason = e.Reason
 	_ = r.stores.PutBuild(ctx, rec)
+	if !rec.occupies() {
+		r.releaseBuildAdmission(rec.BuildID)
+	}
 }
 
-// SetGroupTemplate updates a group's template_ref in-process (the registry is the
-// sole sqlite writer, so a build that just produced a template can point its
-// group at it without a second writer racing the revision counter).
+// SetGroupTemplate updates a group's template_ref in the registry-local group
+// store so a build that just produced a template can point its group at it.
 func (r *Registry) SetGroupTemplate(ctx context.Context, group, templateRef string) error {
 	g, found, err := r.stores.GetGroupByID(ctx, group)
 	if err != nil || !found || g == nil {

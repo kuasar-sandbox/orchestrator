@@ -17,7 +17,7 @@ func TestExternalKeyProviderAndCache(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == pathKey && r.Header.Get(GroupHeader) == "/g" {
 			atomic.AddInt64(&hits, 1)
-			_ = json.NewEncoder(w).Encode(Key{ProjectID: "p1", ManifestKey: "abcd"})
+			_ = json.NewEncoder(w).Encode(Key{ProjectID: "p1", ManifestKey: "abcd", AuthKey: "dcba"})
 			return
 		}
 		w.WriteHeader(http.StatusNotFound) // unknown group
@@ -27,7 +27,7 @@ func TestExternalKeyProviderAndCache(t *testing.T) {
 	kp := NewExternalKey(strings.TrimPrefix(srv.URL, "http://"), nil, time.Minute)
 
 	k, found, err := kp.Key(ctx, "/g")
-	if err != nil || !found || k.ManifestKey != "abcd" || k.ProjectID != "p1" {
+	if err != nil || !found || k.ManifestKey != "abcd" || k.AuthKey != "dcba" || k.ProjectID != "p1" {
 		t.Fatalf("external key: %+v found=%v err=%v", k, found, err)
 	}
 	// Second lookup is served from the TTL cache (no extra HTTP hit).

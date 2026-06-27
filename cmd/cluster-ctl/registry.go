@@ -37,16 +37,8 @@ func runRegistry(args []string, log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	if cfg.State.Backend != clustercfg.BackendSQLite {
-		return fmt.Errorf("registry: state.backend %q not implemented yet (Phase 7); use sqlite", cfg.State.Backend)
-	}
-
-	kv, err := clusterstore.Open(cfg.State.DSN, cfg.NodeLink.RevisionRetention)
-	if err != nil {
-		return err
-	}
+	kv := clusterstore.OpenMemory(cfg.NodeLink.RevisionRetention)
 	defer kv.Close()
-	_ = os.Chmod(cfg.State.DSN, 0o600)
 
 	var box *secretbox.Box
 	if cfg.SandboxGroup.EncryptionKey != "" {
@@ -80,8 +72,6 @@ func runRegistry(args []string, log *slog.Logger) error {
 	go reg.RunReaper(ctx, cfg.NodeLink.NodeDeadDur())
 	// Key predistribution + lease renewal to each group's allocation set (§7.6).
 	go reg.RunKeyDistributor(ctx, time.Hour)
-	// Idle SAVED record GC (route-key cardinality cap, §10/§12); off when unset.
-	go reg.RunRecordGC(ctx, cfg.Reserve.RecordTTLDur())
 
 	mux := http.NewServeMux()
 	mux.HandleFunc(routesync.NodeLinkPath, reg.ServeNodeLink)
@@ -145,7 +135,7 @@ func runRegistry(args []string, log *slog.Logger) error {
 		}
 	}()
 
-	log.Info("cluster-ctl registry", "node_link", cfg.NodeLink.Listen, "node_link_tls", cfg.NodeLink.TLS.Enabled(), "control_api", cfg.ControlAPI.Listen, "control_api_tls", controlTLS, "state", cfg.State.DSN)
+	log.Info("cluster-ctl registry", "node_link", cfg.NodeLink.Listen, "node_link_tls", cfg.NodeLink.TLS.Enabled(), "control_api", cfg.ControlAPI.Listen, "control_api_tls", controlTLS, "state_backend", cfg.State.Backend)
 	var serveErr error
 	if cfg.NodeLink.TLS.Enabled() {
 		serveErr = srv.ServeTLS(ln, "", "")

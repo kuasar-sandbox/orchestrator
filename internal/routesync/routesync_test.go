@@ -54,9 +54,11 @@ func (f *fakeWakes) NextWake(ctx context.Context) (string, bool) {
 
 // fakeSource is the orchestrator side.
 type fakeSource struct {
-	sub  chan routesync.Event
-	woke chan string
-	pol  routesync.Policy
+	sub    chan routesync.Event
+	woke   chan string
+	pol    routesync.Policy
+	fp     string
+	replay []routesync.Event
 }
 
 func (s *fakeSource) Range(ctx context.Context, fn func(routesync.RouteEntry) error) error {
@@ -65,6 +67,24 @@ func (s *fakeSource) Range(ctx context.Context, fn func(routesync.RouteEntry) er
 func (s *fakeSource) Subscribe() (<-chan routesync.Event, func()) { return s.sub, func() {} }
 func (s *fakeSource) OnWake(ctx context.Context, sid string)      { s.woke <- sid }
 func (s *fakeSource) Policy() routesync.Policy                    { return s.pol }
+func (s *fakeSource) SourceFingerprint() string                   { return s.fp }
+func (s *fakeSource) Replay(ctx context.Context, afterSeq int64, fn func(routesync.Event) error) error {
+	if s.fp == "" {
+		return routesync.ErrResumeUnavailable
+	}
+	for _, ev := range s.replay {
+		if err := fn(ev); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+func (s *fakeSource) CurrentRevToken() string {
+	if s.fp == "" {
+		return ""
+	}
+	return routesync.MakeRevToken(s.fp, 100)
+}
 
 func recv[T any](t *testing.T, ch <-chan T, what string) T {
 	t.Helper()
@@ -148,4 +168,100 @@ func TestRouteSyncRoundtrip(t *testing.T) {
 	if got := recv(t, src.woke, "wake"); got != "s9" {
 		t.Fatalf("wake = %q", got)
 	}
+}
+
+func TestRouteSyncResumeReplay(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	sock := filepath.Join(t.TempDir(), "cfg.sock")
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	src := &fakeSource{
+		sub:  make(chan routesync.Event, 4),
+		woke: make(chan string, 4),
+		fp:   "source-a",
+		replay: []routesync.Event{{
+			Kind:  routesync.TypeUpsert,
+			Route: routesync.RouteEntry{SandboxID: "replayed", State: routesync.StateRunning},
+		}},
+	}
+	httpSrv := &http.Server{Handler: h2c.NewHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reg, err := routesync.ReadRegister(r.Body)
+		if err != nil {
+			http.Error(w, "bad register", http.StatusBadRequest)
+			return
+		}
+		routesync.ServeStream(r.Context(), w, r.Body, src, reg, log)
+	}), &http2.Server{})}
+	go httpSrv.Serve(ln)
+	defer httpSrv.Close()
+
+	sink := newFakeSink()
+	dial := func(ctx context.Context) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, "unix", sock)
+	}
+	reg := routesync.Register{
+		Subscribe:  &routesync.Subscribe{Kind: routesync.KindRoute},
+		ResumeFrom: routesync.MakeRevToken("source-a", 7),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go routesync.NewSubscriber(dial, "px-resume", reg, sink, nil, log).Run(ctx)
+
+	recv(t, sink.begin, "begin-sync")
+	if up := recv(t, sink.up, "replayed upsert"); up.SandboxID != "replayed" {
+		t.Fatalf("resume upsert = %+v, want replayed delta", up)
+	}
+	recv(t, sink.book, "bookmark")
+}
+
+func TestRouteSyncResumeFingerprintMismatchFallsBack(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	sock := filepath.Join(t.TempDir(), "cfg.sock")
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	src := &fakeSource{
+		sub:  make(chan routesync.Event, 4),
+		woke: make(chan string, 4),
+		fp:   "source-a",
+		replay: []routesync.Event{{
+			Kind:  routesync.TypeUpsert,
+			Route: routesync.RouteEntry{SandboxID: "must-not-replay", State: routesync.StateRunning},
+		}},
+	}
+	httpSrv := &http.Server{Handler: h2c.NewHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reg, err := routesync.ReadRegister(r.Body)
+		if err != nil {
+			http.Error(w, "bad register", http.StatusBadRequest)
+			return
+		}
+		routesync.ServeStream(r.Context(), w, r.Body, src, reg, log)
+	}), &http2.Server{})}
+	go httpSrv.Serve(ln)
+	defer httpSrv.Close()
+
+	sink := newFakeSink()
+	dial := func(ctx context.Context) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, "unix", sock)
+	}
+	reg := routesync.Register{
+		Subscribe:  &routesync.Subscribe{Kind: routesync.KindRoute},
+		ResumeFrom: routesync.MakeRevToken("other-source", 7),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go routesync.NewSubscriber(dial, "px-mismatch", reg, sink, nil, log).Run(ctx)
+
+	recv(t, sink.begin, "begin-sync")
+	if up := recv(t, sink.up, "snapshot upsert"); up.SandboxID != "s1" {
+		t.Fatalf("fallback upsert = %+v, want full snapshot", up)
+	}
+	recv(t, sink.book, "bookmark")
 }

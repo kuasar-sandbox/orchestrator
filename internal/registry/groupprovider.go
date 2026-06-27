@@ -3,8 +3,10 @@ package registry
 import (
 	"context"
 	"crypto/tls"
+	"sort"
 	"time"
 
+	clusterstate "github.com/kuasar-sandbox/sandbox-orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/clustercfg"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/groupcfg"
 )
@@ -20,7 +22,7 @@ func (p storeKey) Key(ctx context.Context, group string) (groupcfg.Key, bool, er
 	if err != nil || !found {
 		return groupcfg.Key{}, found, err
 	}
-	return groupcfg.Key{ProjectID: g.ProjectID, ManifestKey: g.ManifestKey}, true, nil
+	return groupcfg.Key{ProjectID: g.ProjectID, ManifestKey: g.ManifestKey, AuthKey: g.AuthKey}, true, nil
 }
 
 type storeSandbox struct{ s *Stores }
@@ -60,6 +62,40 @@ func (p storeImagePull) ImagePull(ctx context.Context, group string) (groupcfg.I
 // storeResolver is the all-store resolver (the registry default).
 func storeResolver(s *Stores) groupcfg.Resolver {
 	return groupcfg.Resolver{Key: storeKey{s}, Sandbox: storeSandbox{s}, Placement: storePlacement{s}, ImagePull: storeImagePull{s}}
+}
+
+type storeGroupImporter struct{ s *Stores }
+
+func (p storeGroupImporter) Range(ctx context.Context, cursor string, limit int) (clusterstate.GroupPage, error) {
+	if limit <= 0 {
+		limit = 1024
+	}
+	groups := make([]string, 0)
+	if err := p.s.RangeGroups(ctx, func(g *GroupConfig) error {
+		if g.Group != "" {
+			groups = append(groups, g.Group)
+		}
+		return nil
+	}); err != nil {
+		return clusterstate.GroupPage{}, err
+	}
+	sort.Strings(groups)
+	start := 0
+	if cursor != "" {
+		start = sort.SearchStrings(groups, cursor)
+		for start < len(groups) && groups[start] <= cursor {
+			start++
+		}
+	}
+	end := start + limit
+	if end > len(groups) {
+		end = len(groups)
+	}
+	page := clusterstate.GroupPage{Groups: append([]string(nil), groups[start:end]...)}
+	if end < len(groups) {
+		page.NextCursor = groups[end-1]
+	}
+	return page, nil
 }
 
 // NewGroupResolver builds a resolver, picking store vs external per fine-grained

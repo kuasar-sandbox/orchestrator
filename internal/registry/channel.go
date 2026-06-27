@@ -61,7 +61,11 @@ func (r *Registry) ServeNodeLink(w http.ResponseWriter, req *http.Request) {
 	// concurrent reconcileKeys can conn.send() on this same h2 stream (under
 	// nodeChannel.mu); a bare Hello write after that would race it and interleave
 	// frames. Hello goes out first, while this is still the only writer.
-	if err := routesync.WriteMsg(w, &routesync.Msg{Type: routesync.TypeHello, Hello: &routesync.Hello{Version: routesync.Version}}); err != nil {
+	resumeFrom := ""
+	if rec, found, err := r.stores.GetNode(ctx, nr.NodeID); err == nil && found {
+		resumeFrom = rec.ResumeToken
+	}
+	if err := routesync.WriteMsg(w, &routesync.Msg{Type: routesync.TypeHello, Hello: &routesync.Hello{Version: routesync.Version, ResumeFrom: resumeFrom}}); err != nil {
 		return
 	}
 	flusher.Flush()
@@ -101,7 +105,9 @@ func (r *Registry) ServeNodeLink(w http.ResponseWriter, req *http.Request) {
 				r.applyBuildEvent(ctx, m.Build)
 			}
 		case routesync.TypeBookmark:
-			// initial-sync marker; the route stream itself converges state.
+			if m.RevToken != "" {
+				r.updateNodeResume(ctx, nr.NodeID, m.RevToken)
+			}
 		}
 	}
 }

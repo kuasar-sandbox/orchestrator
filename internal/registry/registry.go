@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/apikey"
+	clusterstate "github.com/kuasar-sandbox/sandbox-orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/groupcfg"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/routesync"
 )
@@ -28,12 +29,11 @@ type nodeConn interface {
 	send(*routesync.Command) error
 }
 
-// Placer suggests a node for a new sandbox (cluster.md §4.3: the scaler suggests,
-// the registry commits by CAS). Phase 2 ships a built-in single-node placer; the
-// cluster-ctl scaler replaces it over the control channel in Phase 4.
+// Placer suggests a node for a new sandbox: the scaler suggests, the registry
+// commits by CAS.
 // PlaceRequest is a placement ask. Build marks a build placement (resource-aware,
-// cluster-scaler.md §4.5); TargetRuntimeDigest (when known, e.g. a migration's
-// snapshot runtime) lets the scaler prefer runtime-compatible nodes (§4.2).
+// cluster-scaler.md §4.5); TargetRuntimeDigest lets the scaler prefer compatible
+// node runtimes when the caller knows the required runtime identity.
 type PlaceRequest struct {
 	Group               string
 	RouteKey            string
@@ -41,11 +41,23 @@ type PlaceRequest struct {
 	TargetRuntimeDigest string
 }
 
-// Placer suggests a node for a sandbox/build. In production it is the channelPlacer
-// (the standalone scaler answers over the scaler-link, cluster.md §4.3/§5.2); the
-// builtin placer is a test/no-scaler fallback.
+// Placer suggests a node for a sandbox/build. In production it is the
+// channelPlacer; the builtin placer is the single-member/test default.
 type Placer interface {
 	Place(ctx context.Context, req PlaceRequest) (nodeID string, err error)
+}
+
+type SecretResolver interface {
+	ResolveSecret(ctx context.Context, kind string, secret clusterstate.Secret) (string, error)
+}
+
+type inlineSecretResolver struct{}
+
+func (inlineSecretResolver) ResolveSecret(ctx context.Context, kind string, secret clusterstate.Secret) (string, error) {
+	if secret.Type == "" || secret.Type == clusterstate.SecretInline {
+		return secret.Value, nil
+	}
+	return "", fmt.Errorf("registry: %s ref resolver is not configured", kind)
 }
 
 // Registry is the cluster control plane's state authority + node-link hub.
@@ -63,16 +75,22 @@ type Registry struct {
 	cmdFlight map[string]string                 // create/connect cmd_id -> flightKey (ack-reject fast-fails Reserve)
 
 	keyMu     sync.Mutex
-	keyLeased map[string]map[string]bool // group -> node_ids currently holding the predistributed key
+	keyLeased map[string]keyLeaseState // group -> nodes currently holding the predistributed key
 
 	reconcileTrigger chan struct{} // coalesced key-reconcile wakeups (a node connecting)
 
-	resolver groupcfg.Resolver // group-config providers (store by default; §6.2)
+	nodeOwner NodeOwner
+
+	resolver       groupcfg.Resolver                 // store/external provider bundle used by local adapters
+	groupProvider  clusterstate.SandboxGroupProvider // unified group provider used by the new cluster kernel
+	groupImporter  clusterstate.SandboxGroupImporter // unified group iterator used by scaler/key distribution
+	secretResolver SecretResolver
 
 	scalerMu     sync.Mutex
 	curScaler    *scalerConn                            // the connected standalone scaler (reverse-call placement, §5.2)
 	placeWaiters map[string]chan *routesync.PlaceResult // in-flight place_req -> result waiter
-	overlay      map[string][]map[string]string         // group -> shuffle-effective nodeSelectors (scaler patch, §7.6)
+	overlay      map[string][]map[string]string         // group -> shuffle-effective nodeSelectors projection
+	keyAlloc     map[string]map[string]bool             // group -> scaler-owned manifest-key allocation set
 }
 
 // reserveCall is one in-flight ReserveSandbox; joiners wait on done, the channel
@@ -82,8 +100,8 @@ type reserveCall struct {
 	result *ReserveResult
 	err    error
 	// re-Place context (§7.4): a rejected create re-places once on another node
-	// before failing the Reserve. orig is the pre-reserve record (SAVED carries the
-	// migration token / sid to preserve on re-Place).
+	// before failing the Reserve. orig is the pre-reserve record to restore on
+	// timeout/reject while the row is still RESERVED.
 	group, routeKey string
 	orig            *SandboxRecord
 	found           bool
@@ -108,7 +126,7 @@ func New(stores *Stores, placer Placer, parkTimeout time.Duration, log *slog.Log
 	if parkTimeout <= 0 {
 		parkTimeout = 30 * time.Second
 	}
-	return &Registry{
+	r := &Registry{
 		stores:           stores,
 		placer:           placer,
 		parkTimeout:      parkTimeout,
@@ -118,24 +136,38 @@ func New(stores *Stores, placer Placer, parkTimeout time.Duration, log *slog.Log
 		sidKeys:          make(map[string][2]string),
 		acks:             make(map[string]chan *routesync.CmdAck),
 		cmdFlight:        make(map[string]string),
-		keyLeased:        make(map[string]map[string]bool),
+		keyLeased:        make(map[string]keyLeaseState),
 		reconcileTrigger: make(chan struct{}, 1),
 		resolver:         storeResolver(stores),
+		groupImporter:    storeGroupImporter{stores},
+		secretResolver:   inlineSecretResolver{},
 		placeWaiters:     make(map[string]chan *routesync.PlaceResult),
 		overlay:          make(map[string][]map[string]string),
+		keyAlloc:         make(map[string]map[string]bool),
 	}
+	r.nodeOwner = newLocalNodeOwner(r)
+	r.groupProvider = clusterstate.ResolverAdapter{Resolver: r.resolver}
+	return r
 }
 
-// applySelectorPatch records the scaler's shuffle-effective nodeSelectors for a
-// group (cluster.md §4.4); keydist's allocation set reads it (§7.6) so manifest
-// keys predistribute only to the group's shuffle-pinned nodes. Derived state,
-// rebuilt when the scaler reconnects + re-pushes; empty selectors clears it.
+// applySelectorPatch records the scaler-owned key allocation for a group. The
+// registry/node owner executes key_put/key_drop to this explicit node set; local
+// selector matching is only a bootstrap path before the scaler has pushed allocation.
 func (r *Registry) applySelectorPatch(p *routesync.SelectorPatch) {
 	r.scalerMu.Lock()
 	if len(p.Selectors) == 0 {
 		delete(r.overlay, p.Group)
 	} else {
 		r.overlay[p.Group] = p.Selectors
+	}
+	if p.NodeAllocation {
+		set := make(map[string]bool, len(p.NodeIDs))
+		for _, id := range p.NodeIDs {
+			if id != "" {
+				set[id] = true
+			}
+		}
+		r.keyAlloc[p.Group] = set
 	}
 	r.scalerMu.Unlock()
 }
@@ -150,16 +182,87 @@ func (r *Registry) effectiveSelectors(group string) ([]map[string]string, bool) 
 	return sel, ok
 }
 
-// SetGroupResolver overrides the group-config providers (e.g. an external cloud
-// provider per interface, §6.2); cluster-ctl sets it from config before serving.
-func (r *Registry) SetGroupResolver(res groupcfg.Resolver) { r.resolver = res }
+func (r *Registry) keyAllocation(group string) (map[string]bool, bool) {
+	r.scalerMu.Lock()
+	defer r.scalerMu.Unlock()
+	src, ok := r.keyAlloc[group]
+	if !ok {
+		return nil, false
+	}
+	out := make(map[string]bool, len(src))
+	for id := range src {
+		out[id] = true
+	}
+	return out, true
+}
+
+// SetGroupResolver overrides the group-config providers and refreshes the unified
+// SandboxGroupProvider adapter.
+func (r *Registry) SetGroupResolver(res groupcfg.Resolver) {
+	r.resolver = res
+	r.groupProvider = clusterstate.ResolverAdapter{Resolver: res}
+}
+
+// SetSandboxGroupProvider installs the unified provider used by registry cluster
+// paths.
+func (r *Registry) SetSandboxGroupProvider(p clusterstate.SandboxGroupProvider) {
+	r.groupProvider = p
+}
+
+// SetSandboxGroupImporter installs the group lister used by background cluster
+// reconcilers such as key distribution. The provider owns per-group data; the
+// importer owns the group namespace.
+func (r *Registry) SetSandboxGroupImporter(p clusterstate.SandboxGroupImporter) {
+	r.groupImporter = p
+}
+
+func (r *Registry) SetSecretResolver(res SecretResolver) {
+	r.secretResolver = res
+}
 
 // SetPlacer wires the placer (the channelPlacer over the scaler-link); cluster-ctl
 // sets it after New (the channelPlacer needs the registry it places through).
 func (r *Registry) SetPlacer(p Placer) { r.placer = p }
 
+// SetNodeOwner replaces the local node-owner adapter. Reserve/build/key/orphan
+// flows stay the same; execution-state authority moves behind this interface.
+func (r *Registry) SetNodeOwner(owner NodeOwner) {
+	r.nodeOwner = owner
+}
+
 // Stores exposes the typed store layer (cluster-ctl seeds group config; tests).
 func (r *Registry) Stores() *Stores { return r.stores }
+
+func (r *Registry) deriveAccessToken(ctx context.Context, group, sandboxID string) (string, error) {
+	k, found, err := r.groupProvider.GetAuthKey(ctx, group)
+	if err != nil {
+		return "", err
+	}
+	if !found || k.Value == "" {
+		return "", fmt.Errorf("registry: auth_key missing for group %q", group)
+	}
+	authKey, err := r.resolveSecret(ctx, "auth_key", k)
+	if err != nil {
+		return "", err
+	}
+	return clusterstate.DeriveAccessToken(authKey, sandboxID)
+}
+
+func (r *Registry) manifestKey(ctx context.Context, group string) (string, bool, error) {
+	k, found, err := r.groupProvider.GetKey(ctx, group)
+	if err != nil || !found || k.Value == "" {
+		return "", found, err
+	}
+	v, err := r.resolveSecret(ctx, "manifest_key", k)
+	return v, true, err
+}
+
+func (r *Registry) resolveSecret(ctx context.Context, kind string, s clusterstate.Secret) (string, error) {
+	if r.secretResolver == nil {
+		r.secretResolver = inlineSecretResolver{}
+	}
+	return r.secretResolver.ResolveSecret(ctx, kind, s)
+}
 
 func flightKey(group, routeKey string) string { return group + "\x00" + routeKey }
 
@@ -173,7 +276,11 @@ func (r *Registry) ReserveSandbox(ctx context.Context, group, routeKey string, c
 	}
 	if found && rec.State == StateReady {
 		if _, live := r.node(rec.NodeID); live {
-			return &ReserveResult{NodeID: rec.NodeID, SID: rec.SID, AccessToken: rec.AccessToken, DataEndpoint: r.nodeDataEndpoint(ctx, rec.NodeID)}, nil
+			tok, err := r.deriveAccessToken(ctx, rec.Group, rec.SID)
+			if err != nil {
+				return nil, err
+			}
+			return &ReserveResult{NodeID: rec.NodeID, SID: rec.SID, AccessToken: tok, DataEndpoint: r.nodeDataEndpoint(ctx, rec.NodeID)}, nil
 		}
 		// node gone: fall through to re-place (dead-node sweep also resets it).
 	}
@@ -210,9 +317,9 @@ func (r *Registry) ReserveSandbox(ctx context.Context, group, routeKey string, c
 }
 
 // rollbackReserve restores a (group, route_key) to its pre-reserve state when a
-// Reserve fails without reaching READY (cluster.md §7.4): a SAVED/PAUSED/NONE
-// record is put back (SAVED keeps its migration token), a fresh one is deleted —
-// but only while the row is still RESERVED (a late running route may have won).
+// Reserve fails without reaching READY (cluster.md §7.4): a pre-existing PAUSED
+// row is put back and a fresh one is deleted, but only while the row is still
+// RESERVED (a late running route may have won).
 func (r *Registry) rollbackReserve(group, routeKey string, orig *SandboxRecord, found bool) {
 	ctx := context.Background() // must complete even if the caller's ctx is done
 	cur, _, curFound, err := r.stores.GetSandbox(ctx, group, routeKey)
@@ -251,16 +358,15 @@ func (r *Registry) startReserve(ctx context.Context, group, routeKey string, rec
 		return nil
 	}
 
-	// NONE / SAVED: place + create.
+	// NONE: place + create.
 	return r.placeAndCreate(ctx, group, routeKey, rec, found, createConfig)
 }
 
 // placeAndCreate places a node and sends the create command, CASing the RESERVED
 // record. It re-reads + re-asks the placer once on a dead-node suggestion OR a CAS
-// conflict (a lagging view / concurrent mutation, cluster.md §4.3/§5). orig is the
-// pre-reserve record; a SAVED origin reuses its sid + migration token so the
-// target imports the same sandbox. It is re-drivable: a rejected create re-invokes
-// it (re-Place once, §7.4), which re-reads the current rev and places afresh.
+// conflict (a lagging view / concurrent mutation, cluster.md §4.3/§5). It is
+// re-drivable: a rejected create re-invokes it (re-Place once, §7.4), which
+// re-reads the current rev and places afresh.
 func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, orig *SandboxRecord, found bool, createConfig map[string]string) error {
 	for attempt := 0; attempt < 2; attempt++ {
 		cur, curRev, curFound, err := r.stores.GetSandbox(ctx, group, routeKey)
@@ -282,11 +388,6 @@ func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, o
 			return ErrNodeGone
 		}
 		sid := "sb-" + newID()
-		migrationToken := ""
-		if found && orig.State == StateSaved {
-			sid = orig.SID // reuse the original sid so the migration token's id matches on import
-			migrationToken = orig.MigrationToken
-		}
 		expect := int64(0)
 		if curFound {
 			expect = curRev
@@ -301,25 +402,30 @@ func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, o
 			return ErrNoNode
 		}
 
-		cmd := &routesync.Command{CmdID: newID(), Kind: routesync.CmdCreate, SID: sid, Group: group, RouteKey: routeKey, Config: createConfig, MigrationToken: migrationToken}
-		// Group config via the resolver (store or external, §6.2): template ref + the
-		// group's sandbox_config defaults folded under the create config (§7.2).
-		if sc, ok, _ := r.resolver.Sandbox.SandboxConfig(ctx, group); ok {
-			cmd.TemplateRef = sc.TemplateRef
-			cmd.Config = mergeConfig(sc.Config, createConfig)
+		cmd := &routesync.Command{CmdID: newID(), Kind: routesync.CmdCreate, SID: sid, Group: group, RouteKey: routeKey, Config: createConfig}
+		// Group config via the unified provider: template ref + group defaults folded
+		// under the create config (§7.2).
+		if sg, ok, err := r.groupProvider.Get(ctx, group); err != nil {
+			return err
+		} else if ok {
+			cmd.TemplateRef = sg.TemplateRef
+			cmd.Config = mergeConfig(sg.Config, createConfig)
 		}
-		if k, ok, _ := r.resolver.Key.Key(ctx, group); ok && k.ManifestKey != "" {
+		if manifestKey, ok, err := r.manifestKey(ctx, group); err != nil {
+			return err
+		} else if ok && manifestKey != "" {
 			// The key is predistributed ahead of placement (§7.6); create references it
 			// by fingerprint. A node missing it fails precheck -> rejected ack -> re-Place.
-			cmd.KeyFingerprint = keyFingerprint(k.ManifestKey)
+			cmd.KeyFingerprint = keyFingerprint(manifestKey)
+		}
+		if tok, err := r.deriveAccessToken(ctx, group, sid); err != nil {
+			return err
+		} else if tok != "" {
+			cmd.AccessToken = tok
 		}
 		r.trackCmd(cmd.CmdID, flightKey(group, routeKey))
 		if err := conn.send(cmd); err != nil {
-			if found && orig.State == StateSaved {
-				_, _ = r.stores.PutSandbox(ctx, orig) // SAVED: restore (keeps the migration token)
-			} else {
-				_ = r.stores.DeleteSandbox(ctx, group, routeKey)
-			}
+			_ = r.stores.DeleteSandbox(ctx, group, routeKey)
 			return err
 		}
 		return nil
@@ -393,8 +499,7 @@ func (r *Registry) ackCommand(ack *routesync.CmdAck) {
 }
 
 // replaceOnReject re-drives placement once for a rejected flight (returns true if
-// it re-placed, so the Reserve keeps waiting). The single-flight call carries the
-// pre-reserve record so a SAVED origin re-places with its migration token.
+// it re-placed, so the Reserve keeps waiting).
 func (r *Registry) replaceOnReject(key string) bool {
 	r.mu.Lock()
 	call := r.inflight[key]
@@ -422,32 +527,35 @@ func (r *Registry) applyRoute(ctx context.Context, nodeID string, e *routesync.R
 	if e.Group == "" || e.RouteKey == "" {
 		return // not a cluster-scoped sandbox route
 	}
-	if e.State == routesync.StateSaved {
-		r.applySaved(ctx, nodeID, e) // PAUSED -> SAVED promote (cluster.md §7.4)
+	if e.State == routesync.StateDead {
+		r.applyDelete(ctx, e.Group, e.RouteKey)
+		r.dropSID(e.SandboxID)
 		return
 	}
 	rec := &SandboxRecord{
 		Group: e.Group, RouteKey: e.RouteKey, SID: e.SandboxID, NodeID: nodeID,
-		AccessToken: e.AccessToken, MigrationToken: e.MigrationToken, SnapLoc: e.SnapshotLocation,
-		TemplateID: e.TemplateID, LastActive: time.Now().Unix(),
+		SnapLoc: e.SnapshotLocation, TemplateID: e.TemplateID, LastActive: time.Now().Unix(),
 	}
 	switch e.State {
 	case routesync.StateRunning:
 		rec.State = StateReady
 	case routesync.StatePaused:
 		rec.State = StatePaused
-	case routesync.StateDead:
-		rec.State = StateNone
 	default:
-		rec.State = StateReady
+		r.log.Warn("registry: ignored unknown route state", "group", e.Group, "route_key", e.RouteKey, "state", e.State)
+		return
 	}
-	// Fence a stale upsert from a node that no longer owns this (group,route_key):
-	// a re-placement CASes the record onto the new node, so the new owner's routes
-	// apply (its record is RESERVED, not yet READY), while a former owner's late
-	// re-stream (after a reconnect / false-positive sweep) can't resurrect a route
-	// the registry already moved.
-	if cur, _, found, _ := r.stores.GetSandbox(ctx, e.Group, e.RouteKey); found &&
-		cur.NodeID != "" && cur.NodeID != nodeID && cur.State == StateReady {
+	// Route owner fences orphan reports. A node reporting a sandbox whose
+	// (group, route_key, sandbox_id) is absent or has been replaced means the
+	// sandbox has already been deleted/replaced in control state; tell that node
+	// to kill its local copy instead of resurrecting the route.
+	cur, _, found, err := r.stores.GetSandbox(ctx, e.Group, e.RouteKey)
+	if err != nil {
+		r.log.Warn("registry: read sandbox route", "group", e.Group, "err", err)
+		return
+	}
+	if !found || (cur.SID != "" && cur.SID != e.SandboxID) || (cur.NodeID != "" && cur.NodeID != nodeID) {
+		r.deleteOrphanSandbox(ctx, nodeID, e.SandboxID, e.Group, e.RouteKey)
 		return
 	}
 	if _, err := r.stores.PutSandbox(ctx, rec); err != nil {
@@ -456,29 +564,21 @@ func (r *Registry) applyRoute(ctx context.Context, nodeID string, e *routesync.R
 	}
 	r.indexSID(e.SandboxID, e.Group, e.RouteKey)
 	if rec.State == StateReady {
-		r.finish(flightKey(e.Group, e.RouteKey), &ReserveResult{NodeID: nodeID, SID: e.SandboxID, AccessToken: e.AccessToken, DataEndpoint: r.nodeDataEndpoint(ctx, nodeID)}, nil)
+		tok, err := r.deriveAccessToken(ctx, e.Group, e.SandboxID)
+		if err != nil {
+			r.finish(flightKey(e.Group, e.RouteKey), nil, err)
+			return
+		}
+		r.finish(flightKey(e.Group, e.RouteKey), &ReserveResult{NodeID: nodeID, SID: e.SandboxID, AccessToken: tok, DataEndpoint: r.nodeDataEndpoint(ctx, nodeID)}, nil)
 	}
 }
 
-// applySaved persists a PAUSED -> SAVED promotion (cluster.md §7.4): the node
-// uploaded a remote snapshot + minted a migration token but still holds the local
-// copy. The registry stores a node-unbound SAVED record (the token lets any node
-// later import+restore) and tells the reporting node to reclaim its local copy.
-func (r *Registry) applySaved(ctx context.Context, nodeID string, e *routesync.RouteEntry) {
-	rec := &SandboxRecord{
-		Group: e.Group, RouteKey: e.RouteKey, SID: e.SandboxID, NodeID: "", // unbind
-		State: StateSaved, AccessToken: e.AccessToken, MigrationToken: e.MigrationToken,
-		SnapLoc: e.SnapshotLocation, TemplateID: e.TemplateID, LastActive: time.Now().Unix(),
-	}
-	if _, err := r.stores.PutSandbox(ctx, rec); err != nil {
-		r.log.Warn("registry: put saved", "group", e.Group, "err", err)
+func (r *Registry) deleteOrphanSandbox(ctx context.Context, nodeID, sid, group, routeKey string) {
+	if r.nodeOwner == nil || sid == "" {
 		return
 	}
-	r.indexSID(e.SandboxID, e.Group, e.RouteKey) // keep the sid index for a later by-sid wake
-	// Reclaim the node's local copy. This delete does NOT remove the registry record
-	// — applyDeleteBySID skips a SAVED record (the two-phase reclaim, §7.4).
-	if conn, live := r.node(nodeID); live {
-		_ = conn.send(&routesync.Command{CmdID: newID(), Kind: routesync.CmdDelete, SID: e.SandboxID})
+	if err := r.nodeOwner.DeleteSandbox(ctx, nodeID, sid); err != nil && !errors.Is(err, ErrNodeGone) {
+		r.log.Warn("registry: delete orphan sandbox", "node", nodeID, "sid", sid, "group", group, "route_key", routeKey, "err", err)
 	}
 }
 
@@ -503,11 +603,6 @@ func (r *Registry) applyDeleteBySID(ctx context.Context, sid string) {
 	kp, ok := r.sidKeys[sid]
 	r.mu.Unlock()
 	if !ok {
-		return
-	}
-	// A SAVED sandbox's local copy is reclaimed by the node (the §7.4 delete), but
-	// its registry record + sid index persist for a later migrate — keep both.
-	if cur, _, found, _ := r.stores.GetSandbox(ctx, kp[0], kp[1]); found && cur.State == StateSaved {
 		return
 	}
 	r.mu.Lock()
@@ -560,7 +655,10 @@ func (r *Registry) node(id string) (nodeConn, bool) {
 // nodeDataEndpoint returns a node's data-plane endpoint (the router forwards to
 // it), or "" if the node is unknown.
 func (r *Registry) nodeDataEndpoint(ctx context.Context, nodeID string) string {
-	if n, found, _ := r.stores.GetNode(ctx, nodeID); found && n != nil {
+	if r.nodeOwner == nil {
+		return ""
+	}
+	if n, found, _ := r.nodeOwner.Runtime(ctx, nodeID); found && n != nil {
 		return n.DataEndpoint
 	}
 	return ""
@@ -607,10 +705,24 @@ func (r *Registry) updateHeartbeat(ctx context.Context, nodeID string, hb *route
 	if err != nil || !found {
 		return
 	}
+	oldDraining := rec.Draining
+	oldHeartbeat := rec.LastHeartbeatUnix
 	rec.Zone, rec.Allocated, rec.Pool = hb.Zone, hb.Allocated, hb.Pool
 	rec.BuildAlloc, rec.Counts, rec.Draining = hb.BuildAlloc, hb.Counts, hb.Draining
 	rec.LastHeartbeatUnix = time.Now().Unix()
-	_ = r.stores.PutNode(ctx, rec)
+	_ = r.stores.PutNodeRuntime(ctx, rec)
+	if rec.Draining != oldDraining || oldHeartbeat <= 0 || rec.LastHeartbeatUnix-oldHeartbeat >= nodeListHeartbeatBucketSec {
+		_ = r.stores.PutNodeList(ctx, rec)
+	}
+}
+
+func (r *Registry) updateNodeResume(ctx context.Context, nodeID, token string) {
+	rec, found, err := r.stores.GetNode(ctx, nodeID)
+	if err != nil || !found {
+		return
+	}
+	rec.ResumeToken = token
+	_ = r.stores.PutNodeRuntime(ctx, rec)
 }
 
 // RunReaper periodically sweeps dead nodes until ctx is cancelled (cluster.md
@@ -635,55 +747,12 @@ func (r *Registry) RunReaper(ctx context.Context, deadAfter time.Duration) {
 	}
 }
 
-// RunRecordGC reclaims idle SAVED (group,route_key) records older than ttl
-// (cluster.md §10/§12: a route-key cardinality cap). SAVED is node-unbound (its
-// snapshot lives in the remote content store, reclaimed by that store's own GC
-// once unreferenced), so deleting the record just frees the route-key. ttl<=0
-// disables it (SAVED holds resumable state — operators opt in).
-func (r *Registry) RunRecordGC(ctx context.Context, ttl time.Duration) {
-	if ttl <= 0 {
-		return
-	}
-	tick := ttl / 4
-	if tick < time.Minute {
-		tick = time.Minute
-	}
-	t := time.NewTicker(tick)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-			r.gcIdleRecords(ctx, ttl)
-		}
-	}
-}
-
-func (r *Registry) gcIdleRecords(ctx context.Context, ttl time.Duration) {
-	cutoff := time.Now().Add(-ttl).Unix()
-	var stale []*SandboxRecord
-	_ = r.stores.RangeAllSandboxes(ctx, func(s *SandboxRecord) error {
-		if s.State == StateSaved && s.LastActive > 0 && s.LastActive < cutoff {
-			stale = append(stale, &SandboxRecord{Group: s.Group, RouteKey: s.RouteKey, SID: s.SID})
-		}
-		return nil
-	})
-	for _, s := range stale {
-		_ = r.stores.DeleteSandbox(ctx, s.Group, s.RouteKey)
-		r.dropSID(s.SID)
-	}
-	if len(stale) > 0 {
-		r.log.Info("registry: gc'd idle SAVED records", "count", len(stale))
-	}
-}
-
 // sweepDeadNodes resets the sandboxes of every disconnected node whose last
 // heartbeat predates node_dead_after, then removes the node record (cluster.md
 // §11): READY/PAUSED (node-local snapshot, lost with the node) → reset so the
 // next Reserve re-places; a RESERVED row is reset only when no in-flight Reserve
-// owns it (so the sweep can't delete a reservation under a concurrent reserve on
-// a reconnect blip); SAVED (remote, unbound) is left untouched.
+// owns it, so the sweep can't delete a reservation under a concurrent reserve on
+// a reconnect blip.
 func (r *Registry) sweepDeadNodes(ctx context.Context, deadAfter time.Duration) {
 	cutoff := time.Now().Add(-deadAfter).Unix()
 	var dead []string
@@ -739,6 +808,7 @@ func (r *Registry) sweepDeadNodes(ctx context.Context, deadAfter time.Duration) 
 	for _, b := range deadBuilds {
 		b.State, b.Reason = BuildError, "node disconnected"
 		_ = r.stores.PutBuild(ctx, b)
+		r.releaseBuildAdmission(b.BuildID)
 	}
 	for _, id := range dead {
 		_ = r.stores.DeleteNode(ctx, id)

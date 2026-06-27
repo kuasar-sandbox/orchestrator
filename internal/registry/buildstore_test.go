@@ -2,10 +2,72 @@ package registry
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/routesync"
 )
+
+type recordingNodeOwner struct {
+	allow    bool
+	admitted []string
+	released []string
+}
+
+func (a *recordingNodeOwner) PutManifestKey(ctx context.Context, nodeID, fingerprint, manifestKey string, expiresUnix int64) error {
+	return nil
+}
+
+func (a *recordingNodeOwner) DropManifestKey(ctx context.Context, nodeID, fingerprint string) error {
+	return nil
+}
+
+func (a *recordingNodeOwner) AdmitBuild(ctx context.Context, nodeID, buildID string, want *routesync.BuildResources) bool {
+	a.admitted = append(a.admitted, nodeID+"/"+buildID)
+	return a.allow
+}
+
+func (a *recordingNodeOwner) ReleaseBuild(ctx context.Context, buildID string) {
+	a.released = append(a.released, buildID)
+}
+
+func (a *recordingNodeOwner) Runtime(ctx context.Context, nodeID string) (*NodeRecord, bool, error) {
+	return nil, false, nil
+}
+
+func (a *recordingNodeOwner) DeleteSandbox(ctx context.Context, nodeID, sid string) error {
+	return nil
+}
+
+func buildAckConn(reg *Registry, nodeID string) *fakeConn {
+	return &fakeConn{nodeID: nodeID, onCmd: func(cmd *routesync.Command) {
+		if cmd.Kind == routesync.CmdBuildRegister {
+			go reg.ackCommand(&routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted})
+		}
+	}}
+}
+
+func TestReserveBuildUsesNodeOwnerBoundary(t *testing.T) {
+	ctx := context.Background()
+	reg := testReg(t)
+	reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"})
+	reg.addNode(buildAckConn(reg, "n1"))
+	admitter := &recordingNodeOwner{allow: true}
+	reg.SetNodeOwner(admitter)
+
+	res, err := reg.ReserveBuild(ctx, BuildReserveReq{Group: "/g", Resources: &routesync.BuildResources{CPU: 2000}})
+	if err != nil {
+		t.Fatalf("reserve build: %v", err)
+	}
+	if len(admitter.admitted) != 1 || admitter.admitted[0] != "n1/"+res.BuildID {
+		t.Fatalf("admitted=%v, want n1/%s", admitter.admitted, res.BuildID)
+	}
+	reg.applyBuildEvent(ctx, &routesync.BuildEvent{Group: "/g", BuildID: res.BuildID, State: string(BuildReady)})
+	if len(admitter.released) != 1 || admitter.released[0] != res.BuildID {
+		t.Fatalf("released=%v, want %s", admitter.released, res.BuildID)
+	}
+}
 
 // TestReserveBuildResourceAware drives the §7.5 core: a build reserves its node's
 // build pool IMMEDIATELY (RESERVED occupies), a second build that would
@@ -15,7 +77,7 @@ func TestReserveBuildResourceAware(t *testing.T) {
 	reg := testReg(t)
 	// n1 has a 2-core build pool.
 	reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1", BuildCapacity: &routesync.BuildResources{CPU: 2000, Mem: 8 << 30, Storage: 100 << 30}})
-	reg.addNode(&fakeConn{nodeID: "n1"})
+	reg.addNode(buildAckConn(reg, "n1"))
 
 	// First build (1.5 cores) fits + is committed RESERVED on n1.
 	r1, err := reg.ReserveBuild(ctx, BuildReserveReq{Group: "/g", Resources: &routesync.BuildResources{CPU: 1500}})
@@ -48,7 +110,7 @@ func TestReserveBuildDefaultResources(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
 	reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"}) // no declared build pool → unconstrained
-	reg.addNode(&fakeConn{nodeID: "n1"})
+	reg.addNode(buildAckConn(reg, "n1"))
 	r1, err := reg.ReserveBuild(ctx, BuildReserveReq{Group: "/g"})
 	if err != nil || r1.BuildID == "" || r1.TemplateID == "" {
 		t.Fatalf("default-resources build: %+v err=%v", r1, err)
@@ -56,5 +118,50 @@ func TestReserveBuildDefaultResources(t *testing.T) {
 	rec, found, _ := reg.stores.GetBuildInGroup(ctx, "/g", r1.BuildID)
 	if !found || rec.Resources == nil || rec.Resources.CPU != defaultBuildResources.CPU {
 		t.Fatalf("default resources not applied: %+v", rec)
+	}
+}
+
+func TestReserveBuildReleasesAdmissionOnSendFailure(t *testing.T) {
+	ctx := context.Background()
+	reg := testReg(t)
+	reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1", BuildCapacity: &routesync.BuildResources{CPU: 2000}})
+	reg.addNode(&fakeConn{nodeID: "n1", err: errors.New("send failed")})
+
+	if _, err := reg.ReserveBuild(ctx, BuildReserveReq{Group: "/g", Resources: &routesync.BuildResources{CPU: 2000}}); err == nil {
+		t.Fatal("first build should fail when build_register send fails")
+	}
+
+	reg.addNode(buildAckConn(reg, "n1"))
+	res, err := reg.ReserveBuild(ctx, BuildReserveReq{Group: "/g", Resources: &routesync.BuildResources{CPU: 2000}})
+	if err != nil || res.NodeID != "n1" {
+		t.Fatalf("admission lease was not released after send failure: res=%+v err=%v", res, err)
+	}
+}
+
+func TestReserveBuildReleasesAdmissionOnRejectedAck(t *testing.T) {
+	ctx := context.Background()
+	reg := testReg(t)
+	reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1", BuildCapacity: &routesync.BuildResources{CPU: 2000}})
+	reject := true
+	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(cmd *routesync.Command) {
+		if cmd.Kind != routesync.CmdBuildRegister {
+			return
+		}
+		status, reason := routesync.AckAccepted, ""
+		if reject {
+			status, reason = routesync.AckRejected, "no budget"
+		}
+		go reg.ackCommand(&routesync.CmdAck{CmdID: cmd.CmdID, Status: status, Reason: reason})
+	}})
+
+	if _, err := reg.ReserveBuild(ctx, BuildReserveReq{Group: "/g", Resources: &routesync.BuildResources{CPU: 2000}}); err == nil {
+		t.Fatal("rejected build_register should fail")
+	} else if fmt.Sprint(err) == "" {
+		t.Fatal("expected non-empty rejection error")
+	}
+	reject = false
+	res, err := reg.ReserveBuild(ctx, BuildReserveReq{Group: "/g", Resources: &routesync.BuildResources{CPU: 2000}})
+	if err != nil || res.NodeID != "n1" {
+		t.Fatalf("admission lease was not released after rejected ack: res=%+v err=%v", res, err)
 	}
 }

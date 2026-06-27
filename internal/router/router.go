@@ -14,7 +14,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
-	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -57,6 +56,11 @@ type routeResolve struct {
 	State        string `json:"state"`
 }
 
+type activeRoute struct {
+	rr   *routeResolve
+	refs int
+}
+
 // buildEntry maps a build to its node; RunCleanup evicts entries older than
 // buildTTL so the build map doesn't grow unboundedly over the ingress's life.
 type buildEntry struct {
@@ -75,15 +79,18 @@ type Router struct {
 	mx            *metrics.M
 	controlBase   string       // http base for the control API
 	opClient      *http.Client // 60s timeout (reserve / route calls)
-	watchClient   *http.Client // no timeout (the long-lived route watch stream)
 	log           *slog.Logger
 
 	buildsMu sync.Mutex
 	builds   map[string]buildEntry // build_id -> node (a build is node-bound); TTL-evicted
 
-	cacheMu  sync.RWMutex
-	cache    map[string]*routeResolve // sid -> resolved data-plane target (local route cache, §5)
-	keyToSID map[string]string        // sandbox store key -> sid (for delete eviction)
+	cacheMu sync.RWMutex
+	cache   map[string]*routeResolve // sid -> resolved data-plane target (local route cache, §5)
+	byKey   map[string]string        // group\x00route_key -> sid (active route cache, no registry watch)
+	active  map[string]*activeRoute  // active group/route or sid forwards; survives normal route-cache churn
+
+	reserveMu       sync.Mutex
+	reserveInFlight map[string]*reserveFlight // single-flight Reserve per (group,route_key)
 
 	authTTL time.Duration
 	authMu  sync.Mutex
@@ -91,7 +98,12 @@ type Router struct {
 
 	fwdTransport *http.Transport // pooled transport for node (data/control/build) forwards
 
-	watchRev int64 // last applied watch revision (resume point); only the watch loop touches it
+}
+
+type reserveFlight struct {
+	done chan struct{}
+	res  *reserveResult
+	err  error
 }
 
 // New builds a Router. controlAddr is the registry control endpoint: a path ("/run/...")
@@ -105,10 +117,12 @@ func New(controlAddr, domain string, authTTL time.Duration, controlTLS *tls.Conf
 	}
 	rt := &Router{
 		domain: domain, log: log, authTTL: authTTL, authMode: "enforce", mx: metrics.New(),
-		builds:   map[string]buildEntry{},
-		cache:    map[string]*routeResolve{},
-		keyToSID: map[string]string{},
-		authOK:   map[string]time.Time{},
+		builds:          map[string]buildEntry{},
+		cache:           map[string]*routeResolve{},
+		byKey:           map[string]string{},
+		active:          map[string]*activeRoute{},
+		reserveInFlight: map[string]*reserveFlight{},
+		authOK:          map[string]time.Time{},
 	}
 	var transport http.RoundTripper
 	switch {
@@ -127,7 +141,6 @@ func New(controlAddr, domain string, authTTL time.Duration, controlTLS *tls.Conf
 		transport = &http.Transport{}
 	}
 	rt.opClient = &http.Client{Timeout: 60 * time.Second, Transport: transport}
-	rt.watchClient = &http.Client{Transport: transport} // no timeout: the watch is long-lived
 	// Pooled transport for node forwards: a higher per-host idle cap than the
 	// stdlib default of 2 avoids TCP/TLS churn to a busy node at high density.
 	rt.fwdTransport = &http.Transport{MaxIdleConns: 512, MaxIdleConnsPerHost: 64, IdleConnTimeout: 90 * time.Second}
@@ -202,7 +215,7 @@ func (rt *Router) handleCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	routeKey := r.Header.Get(HeaderRouteKey)
-	res, err := rt.opReserve(r.Context(), group, routeKey)
+	res, err := rt.reserveByKey(r.Context(), group, routeKey)
 	if err != nil {
 		rt.log.Warn("router: reserve", "group", group, "err", err)
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
@@ -473,11 +486,12 @@ func (rt *Router) serveData(w http.ResponseWriter, r *http.Request, host string)
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return
 		}
+		rt.rememberRoute(rr)
 	}
 	// Not ready (paused / lagging): data-plane traffic wakes it via Reserve (§1.4),
 	// then forwards to the resumed node.
 	if (rr.State != "ready" || rr.DataEndpoint == "") && rr.Group != "" {
-		if res, err := rt.opReserve(r.Context(), rr.Group, rr.RouteKey); err == nil && res.DataEndpoint != "" {
+		if res, err := rt.reserveByKey(r.Context(), rr.Group, rr.RouteKey); err == nil && res.DataEndpoint != "" {
 			rr = &routeResolve{SID: res.SID, Group: rr.Group, RouteKey: rr.RouteKey, NodeID: res.NodeID, DataEndpoint: res.DataEndpoint, AccessToken: res.AccessToken, State: "ready"}
 		}
 	}
@@ -506,6 +520,8 @@ func (rt *Router) serveData(w http.ResponseWriter, r *http.Request, host string)
 // is injected; CONNECT is tunneled (ReverseProxy can't).
 func (rt *Router) forwardSandboxData(w http.ResponseWriter, r *http.Request, rr *routeResolve, sandboxHost, sid string) {
 	r.Host = sandboxHost
+	doneActive := rt.beginActiveRoute(rr)
+	defer doneActive()
 	rt.mx.Inc(`router_requests_total{plane="data"}`)
 	if r.Method == http.MethodConnect {
 		rt.tunnelData(w, r, rr)
@@ -540,17 +556,21 @@ func (rt *Router) serveDataByKey(w http.ResponseWriter, r *http.Request, group, 
 	if !rt.authorize(w, r.Context(), group, r.Header.Get(HeaderAPIKey)) {
 		return
 	}
-	res, err := rt.opReserve(r.Context(), group, routeKey)
-	if err != nil || res.DataEndpoint == "" {
-		http.Error(w, "reserve failed", http.StatusServiceUnavailable)
-		return
+	rr := rt.cachedRouteByKey(group, routeKey)
+	if rr == nil || rr.State != "ready" || rr.DataEndpoint == "" {
+		res, err := rt.reserveByKey(r.Context(), group, routeKey)
+		if err != nil || res.DataEndpoint == "" {
+			http.Error(w, "reserve failed", http.StatusServiceUnavailable)
+			return
+		}
+		rr = &routeResolve{SID: res.SID, Group: group, RouteKey: routeKey, NodeID: res.NodeID, DataEndpoint: res.DataEndpoint, AccessToken: res.AccessToken, State: "ready"}
+		rt.rememberRoute(rr)
 	}
 	port := r.Header.Get("E2b-Sandbox-Port")
 	if port == "" {
 		port = "49983"
 	}
-	rr := &routeResolve{SID: res.SID, Group: group, RouteKey: routeKey, NodeID: res.NodeID, DataEndpoint: res.DataEndpoint, AccessToken: res.AccessToken, State: "ready"}
-	rt.forwardSandboxData(w, r, rr, port+"-"+res.SID+"."+rt.domain, res.SID)
+	rt.forwardSandboxData(w, r, rr, port+"-"+rr.SID+"."+rt.domain, rr.SID)
 }
 
 // tunnelData chains a CONNECT to the node's data endpoint (the node tunnels onward
@@ -595,8 +615,89 @@ func (c *bufConn) Read(p []byte) (int, error) { return c.r.Read(p) }
 
 func (rt *Router) evictRoute(sid string) {
 	rt.cacheMu.Lock()
+	if rr := rt.cache[sid]; rr != nil {
+		delete(rt.byKey, routeCacheKey(rr.Group, rr.RouteKey))
+		for _, key := range activeRouteKeys(rr) {
+			delete(rt.active, key)
+		}
+	}
+	delete(rt.active, activeSIDKey(sid))
 	delete(rt.cache, sid)
 	rt.cacheMu.Unlock()
+}
+
+func routeCacheKey(group, routeKey string) string { return group + "\x00" + routeKey }
+func activeSIDKey(sid string) string              { return "sid\x00" + sid }
+
+func activeRouteKeys(rr *routeResolve) []string {
+	if rr == nil {
+		return nil
+	}
+	keys := make([]string, 0, 2)
+	if rr.Group != "" && rr.RouteKey != "" {
+		keys = append(keys, routeCacheKey(rr.Group, rr.RouteKey))
+	}
+	if rr.SID != "" {
+		keys = append(keys, activeSIDKey(rr.SID))
+	}
+	return keys
+}
+
+func (rt *Router) beginActiveRoute(rr *routeResolve) func() {
+	keys := activeRouteKeys(rr)
+	if len(keys) == 0 {
+		return func() {}
+	}
+	cp := *rr
+	rt.cacheMu.Lock()
+	for _, key := range keys {
+		if cur := rt.active[key]; cur != nil {
+			cur.refs++
+		} else {
+			rt.active[key] = &activeRoute{rr: &cp, refs: 1}
+		}
+	}
+	rt.cacheMu.Unlock()
+	return func() {
+		rt.cacheMu.Lock()
+		defer rt.cacheMu.Unlock()
+		for _, key := range keys {
+			cur := rt.active[key]
+			if cur == nil {
+				continue
+			}
+			cur.refs--
+			if cur.refs <= 0 {
+				delete(rt.active, key)
+			}
+		}
+	}
+}
+
+func (rt *Router) rememberRoute(rr *routeResolve) {
+	if rr == nil || rr.SID == "" {
+		return
+	}
+	rt.cacheMu.Lock()
+	rt.cache[rr.SID] = rr
+	if rr.Group != "" && rr.RouteKey != "" {
+		rt.byKey[routeCacheKey(rr.Group, rr.RouteKey)] = rr.SID
+	}
+	rt.cacheMu.Unlock()
+}
+
+func (rt *Router) cachedRouteByKey(group, routeKey string) *routeResolve {
+	rt.cacheMu.RLock()
+	defer rt.cacheMu.RUnlock()
+	key := routeCacheKey(group, routeKey)
+	if ar := rt.active[key]; ar != nil && ar.rr != nil {
+		cp := *ar.rr
+		return &cp
+	}
+	if sid := rt.byKey[key]; sid != "" {
+		return rt.cache[sid]
+	}
+	return nil
 }
 
 // --- control client ---
@@ -608,6 +709,37 @@ func (rt *Router) opReserve(ctx context.Context, group, routeKey string) (*reser
 		return nil, err
 	}
 	return &res, nil
+}
+
+func (rt *Router) reserveByKey(ctx context.Context, group, routeKey string) (*reserveResult, error) {
+	key := routeCacheKey(group, routeKey)
+	rt.reserveMu.Lock()
+	if f := rt.reserveInFlight[key]; f != nil {
+		rt.reserveMu.Unlock()
+		select {
+		case <-f.done:
+			return f.res, f.err
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	f := &reserveFlight{done: make(chan struct{})}
+	rt.reserveInFlight[key] = f
+	rt.reserveMu.Unlock()
+
+	f.res, f.err = rt.opReserve(ctx, group, routeKey)
+	if f.err == nil && f.res != nil {
+		rt.rememberRoute(&routeResolve{
+			SID: f.res.SID, Group: group, RouteKey: routeKey, NodeID: f.res.NodeID,
+			DataEndpoint: f.res.DataEndpoint, AccessToken: f.res.AccessToken, State: "ready",
+		})
+	}
+	close(f.done)
+
+	rt.reserveMu.Lock()
+	delete(rt.reserveInFlight, key)
+	rt.reserveMu.Unlock()
+	return f.res, f.err
 }
 
 func (rt *Router) opReserveBuild(ctx context.Context, group string, resources *buildResources) (*buildReserveResult, error) {
@@ -671,110 +803,16 @@ func (rt *Router) opCall(ctx context.Context, method, u string, out any) error {
 	return json.NewDecoder(resp.Body).Decode(out)
 }
 
-// --- local route cache (control watch) ---
-
-// watchEvent mirrors registry.WatchEvent (decoupled from the registry package).
-type watchEvent struct {
-	Type  string        `json:"type"` // "put" | "delete" | "bookmark"
-	Key   string        `json:"key,omitempty"`
-	Route *routeResolve `json:"route,omitempty"`
-	Rev   int64         `json:"rev,omitempty"`
-}
+// --- local route cache ---
 
 func (rt *Router) cachedRoute(sid string) *routeResolve {
 	rt.cacheMu.RLock()
 	defer rt.cacheMu.RUnlock()
+	if ar := rt.active[activeSIDKey(sid)]; ar != nil && ar.rr != nil {
+		cp := *ar.rr
+		return &cp
+	}
 	return rt.cache[sid]
-}
-
-// RunWatch keeps the local route cache synced from the registry's control watch
-// (cluster.md §5): a snapshot then live deltas, reconnecting with capped backoff.
-// The data plane serves from the cache (zero control round-trip); a miss falls back to
-// the control API. cluster-ctl router runs this in the background.
-func (rt *Router) RunWatch(ctx context.Context) {
-	backoff := 200 * time.Millisecond
-	for ctx.Err() == nil {
-		err := rt.watchOnce(ctx)
-		if ctx.Err() != nil {
-			return
-		}
-		rt.log.Warn("router: route watch ended; reconnecting", "err", err)
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(backoff):
-		}
-		backoff = min(backoff*2, 5*time.Second)
-	}
-}
-
-func (rt *Router) watchOnce(ctx context.Context) error {
-	u := fmt.Sprintf("%s/control/watch?from_rev=%d", rt.controlBase, rt.watchRev)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
-	if err != nil {
-		return err
-	}
-	resp, err := rt.watchClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("control watch: %s", resp.Status)
-	}
-	// A "reset" frame starts a full snapshot (first connect, or a compacted resume):
-	// accumulate into a shadow map and swap it in atomically at the bookmark, so the
-	// data plane never sees a half-built set. A resume (no reset) applies deltas to
-	// the live cache, keeping it. watchRev only advances once live (post-bookmark),
-	// so a snapshot interrupted before its bookmark re-snapshots on reconnect.
-	var snap map[string]*routeResolve
-	var snapKey map[string]string
-	syncing := false
-	for {
-		ev, err := readWatchFrame(resp.Body)
-		if err != nil {
-			return err
-		}
-		switch ev.Type {
-		case "reset":
-			snap = map[string]*routeResolve{}
-			snapKey = map[string]string{}
-			syncing = true
-		case "put":
-			if ev.Route != nil {
-				if syncing {
-					snap[ev.Route.SID] = ev.Route
-					snapKey[ev.Key] = ev.Route.SID
-				} else {
-					rt.cacheMu.Lock()
-					rt.cache[ev.Route.SID] = ev.Route
-					rt.keyToSID[ev.Key] = ev.Route.SID
-					rt.cacheMu.Unlock()
-				}
-			}
-		case "delete":
-			if !syncing {
-				rt.cacheMu.Lock()
-				if sid := rt.keyToSID[ev.Key]; sid != "" {
-					delete(rt.cache, sid)
-				}
-				delete(rt.keyToSID, ev.Key)
-				rt.cacheMu.Unlock()
-			}
-		case "bookmark":
-			if syncing {
-				rt.cacheMu.Lock()
-				rt.cache, rt.keyToSID = snap, snapKey
-				rt.cacheMu.Unlock()
-				syncing = false
-			}
-		}
-		// Advance the resume point only for frames applied to the live cache (the
-		// bookmark above flips syncing off first, so its rev is recorded too).
-		if !syncing && ev.Rev > rt.watchRev {
-			rt.watchRev = ev.Rev
-		}
-	}
 }
 
 // verifyAuth checks an api key against a group via the control API, caching a
@@ -871,24 +909,4 @@ func (rt *Router) RunCleanup(ctx context.Context) {
 			rt.buildsMu.Unlock()
 		}
 	}
-}
-
-func readWatchFrame(r io.Reader) (*watchEvent, error) {
-	var hdr [4]byte
-	if _, err := io.ReadFull(r, hdr[:]); err != nil {
-		return nil, err
-	}
-	n := binary.LittleEndian.Uint32(hdr[:])
-	if n == 0 || n > 1<<20 {
-		return nil, fmt.Errorf("router: bad watch frame length %d", n)
-	}
-	buf := make([]byte, n)
-	if _, err := io.ReadFull(r, buf); err != nil {
-		return nil, err
-	}
-	var ev watchEvent
-	if err := json.Unmarshal(buf, &ev); err != nil {
-		return nil, err
-	}
-	return &ev, nil
 }

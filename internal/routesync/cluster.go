@@ -3,7 +3,7 @@ package routesync
 // Cluster node-link message types (node.md §10 / cluster.md §5). They extend the
 // Msg union for the node <-> registry channel: the node DIALS the registry and is
 // the route authority (its sandbox routes flow as Upsert/Delete + Bookmark, with
-// Group/RouteKey/MigrationToken set on each RouteEntry), while the registry
+// Group/RouteKey set on each RouteEntry), while the registry
 // subscribes (KindRegistry) and sends Commands the other way. The frame codec and
 // the ServeAuthority loop are the same routesync engine the proxy plane uses;
 // only the handshake (NodeRegister vs Hello) and the uplink (Command vs Wake)
@@ -17,7 +17,7 @@ const (
 	// listen); the registry reverse-requests placement down, the scaler answers up.
 	TypePlaceReq      = "place_req"      // registry -> scaler (place this sandbox)
 	TypePlaceResult   = "place_result"   // scaler -> registry (suggested node, or no_node)
-	TypeSelectorPatch = "selector_patch" // scaler -> registry (shuffle-effective nodeSelectors overlay, §4.4/§7.6)
+	TypeSelectorPatch = "selector_patch" // scaler -> registry (key allocation / shuffle-effective selectors, §7.6)
 )
 
 // NodeLinkPath / ScalerLinkPath are the HTTP paths node-ctl serve / cluster-ctl
@@ -28,8 +28,8 @@ const (
 )
 
 // PlaceReq is a registry placement request to the scaler (cluster.md §5.2/§7.5).
-// TargetRuntimeDigest (when known, e.g. a migration's snapshot runtime) lets the
-// scaler prefer runtime-compatible nodes (§4.2); empty = no runtime constraint.
+// TargetRuntimeDigest lets the scaler require a matching guest runtime; empty
+// means no runtime constraint.
 type PlaceReq struct {
 	ReqID               string `json:"req_id"`
 	Group               string `json:"group"`
@@ -45,12 +45,14 @@ type PlaceResult struct {
 	NoNode bool   `json:"no_node,omitempty"`
 }
 
-// SelectorPatch is the scaler's shuffle-effective nodeSelectors for a group: the
-// static selectors narrowed to the group's pinned shuffle slots (§4.4). The
-// registry uses it as the key-distribution allocation set (§7.6).
+// SelectorPatch is the scaler's key allocation for a group. NodeIDs is the
+// explicit node set that should hold the group's manifest key; Selectors carries
+// the shuffle-effective selector projection.
 type SelectorPatch struct {
-	Group     string              `json:"group"`
-	Selectors []map[string]string `json:"selectors"`
+	Group          string              `json:"group"`
+	Selectors      []map[string]string `json:"selectors"`
+	NodeIDs        []string            `json:"node_ids,omitempty"`
+	NodeAllocation bool                `json:"node_allocation,omitempty"`
 }
 
 // Command kinds (Command.Kind) — the lifecycle + key primitives the registry
@@ -58,9 +60,9 @@ type SelectorPatch struct {
 // command just carries the intent) and reports the terminal state on the route
 // stream; a Reserve waits on that route event, not the ack.
 const (
-	CmdCreate        = "create"         // boot a sandbox (cold template restore, or migration import+restore)
+	CmdCreate        = "create"         // boot a sandbox from a template
 	CmdConnect       = "connect"        // resume a node-local PAUSED sandbox
-	CmdDelete        = "delete"         // destroy a sandbox (kill, or the SAVED two-phase reclaim step)
+	CmdDelete        = "delete"         // destroy a sandbox
 	CmdKeyPut        = "key_put"        // install / renew a manifest-key lease (reconcile re-sends; cluster.md §7.6)
 	CmdKeyDrop       = "key_drop"       // drop a key lease
 	CmdBuildRegister = "build_register" // pre-provision a build on the node (registry-assigned ids, §7.5)
@@ -93,10 +95,10 @@ const (
 type NodeRegister struct {
 	NodeID        string            `json:"node_id"`
 	Labels        map[string]string `json:"labels,omitempty"`         // zone / pool / slot / node (nodeSelectors)
-	Capacity      int               `json:"capacity,omitempty"`       // max sandboxes (headroom fallback signal)
+	Capacity      int               `json:"capacity,omitempty"`       // max sandboxes (headroom signal)
 	BuildCapacity *BuildResources   `json:"build_capacity,omitempty"` // CPU/mem/storage build pool (§7.5)
 	DataEndpoint  string            `json:"data_endpoint,omitempty"`  // host:port the router forwards data-plane to
-	RuntimeDigest string            `json:"runtime_digest,omitempty"` // guest runtime identity (placement compat)
+	RuntimeDigest string            `json:"runtime_digest,omitempty"` // guest runtime identity
 }
 
 // BuildResources is a node's build resource pool (or a build's request), kept
@@ -114,7 +116,7 @@ type Heartbeat struct {
 	Allocated  int64           `json:"allocated,omitempty"`   // memory allocated (bytes)
 	Pool       int64           `json:"pool,omitempty"`        // allocatable pool (bytes)
 	BuildAlloc *BuildResources `json:"build_alloc,omitempty"` // in-flight + reserved build usage
-	Counts     int             `json:"counts,omitempty"`      // live sandbox count (headroom fallback)
+	Counts     int             `json:"counts,omitempty"`      // live sandbox count (headroom signal)
 	Draining   bool            `json:"draining,omitempty"`
 }
 
@@ -129,13 +131,15 @@ type Command struct {
 	Group    string `json:"group,omitempty"`
 	RouteKey string `json:"route_key,omitempty"`
 	// create
-	TemplateRef    string            `json:"template_ref,omitempty"`    // snapshot template ref (cold start = fast restore)
-	KeyFingerprint string            `json:"key_fp,omitempty"`          // manifest-key fingerprint the node must already hold
-	Config         map[string]string `json:"config,omitempty"`          // merged sandbox config (node default ⊕ group ⊕ create)
-	MigrationToken string            `json:"migration_token,omitempty"` // SAVED one-step import + restore
+	TemplateRef    string            `json:"template_ref,omitempty"` // snapshot template ref (cold start = fast restore)
+	KeyFingerprint string            `json:"key_fp,omitempty"`       // manifest-key fingerprint the node must already hold
+	Config         map[string]string `json:"config,omitempty"`       // merged sandbox config (node default ⊕ group ⊕ create)
+	AccessToken    string            `json:"access_token,omitempty"` // MAC(auth_key,sid), supplied by registry
 	// key_put / key_drop
-	ManifestKey string `json:"manifest_key,omitempty"` // hex; only on key_put
-	ExpiresUnix int64  `json:"expires_unix,omitempty"` // lease expiry (key_put)
+	ManifestKeyType string `json:"manifest_key_type,omitempty"` // inline | ref
+	ManifestKey     string `json:"manifest_key,omitempty"`      // hex; only on inline key_put
+	ManifestKeyRef  string `json:"manifest_key_ref,omitempty"`  // provider ref; resolved out-of-band by node owner
+	ExpiresUnix     int64  `json:"expires_unix,omitempty"`      // lease expiry (key_put)
 	// build_register (§7.5): pre-provision a build with registry-assigned ids +
 	// reserved resources. ImageRepo/RegistryAuth are the group's image-pull creds,
 	// delivered WITH the build task and used transiently (never persisted on the node).

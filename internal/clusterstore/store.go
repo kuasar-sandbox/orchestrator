@@ -1,16 +1,14 @@
-// Package clusterstore is the cluster registry's durable key-value store: a
-// small etcd-shaped KV (Get/Put/Delete/Range/Watch/Lease/CAS over an opaque
-// []byte value, a global monotonic revision, and a bounded change-log for
-// catch-up Watch). The registry layers its four tables on top by key prefix
+// Package clusterstore is the size-1 registry KV layer: a small
+// in-process KV (Get/Put/Delete/Range/Watch/Lease/CAS over an opaque []byte
+// value, a global monotonic revision, and a bounded change-log for catch-up
+// Watch). The registry layers its four tables on top by key prefix
 // (node/<id>, group/<group>, sandbox/<group>/<route_key>, build/<group>/<id>);
 // sensitive fields (manifest_key) are encrypted by the registry before Put, so
 // the store itself stays opaque.
 //
-// Phase 0b ships the sqlite backend (pure-Go modernc.org/sqlite, single-host,
-// in-process Watch/Lease). The interface is etcd-shaped on purpose: the etcd /
-// raft backends (Phase 7, multi-replica, group-sharded) implement the same
-// contract — Watch fromRev maps to an etcd watch revision, CAS to a txn, Lease
-// to an etcd lease — with no change to the registry above it.
+// Target cluster operation moves route_link/node_link state to the
+// registry-owned replicated kernel. This package remains for local typed tables
+// that have not yet moved into that kernel.
 package clusterstore
 
 import (

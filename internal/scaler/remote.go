@@ -10,12 +10,14 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"golang.org/x/net/http2"
 
+	clusterstate "github.com/kuasar-sandbox/sandbox-orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/clustercfg"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/registry"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/routesync"
@@ -46,7 +48,7 @@ func NewRemote(controlAddr string, controlTLS *tls.Config, cfg clustercfg.Placem
 	}
 	s := &Service{
 		cfg: cfg, deadAfter: deadAfter, log: log,
-		nodes:  newViewMap(decodeNode),
+		nodes:  newViewMap(decodeNodeList),
 		groups: newViewMap(decodeGroup),
 	}
 	// View watches over a normal client; the scaler-link over an h2 transport
@@ -89,9 +91,11 @@ func NewRemote(controlAddr string, controlTLS *tls.Config, cfg clustercfg.Placem
 	return s
 }
 
-// Start launches the node + group view-watch loops + the scaler-link (background).
+// Start launches the node_list + group view-watch loops + the scaler-link
+// (background). node_list is low-frequency catalog data; hot load/budget is
+// validated by registry/node owner on the cold placement path.
 func (s *Service) Start(ctx context.Context) {
-	go s.subscribe(ctx, registry.ControlNodeWatchPath, s.nodes)
+	go s.subscribe(ctx, registry.ControlNodeListWatchPath, s.nodes)
 	go s.subscribe(ctx, registry.ControlGroupWatchPath, s.groups)
 	go s.runPlaceLink(ctx)
 }
@@ -169,15 +173,15 @@ func (s *Service) placeSession(ctx context.Context) error {
 	if _, err := routesync.ReadMsg(resp.Body); err != nil { // registry Hello
 		return err
 	}
-	// Two writers on pw (place_result from the read loop, selector_patch from the
-	// reconcile goroutine) → serialize.
+	// Two writers on pw (place_result from the read loop, allocation patch from
+	// the reconcile goroutine) → serialize.
 	var wmu sync.Mutex
 	send := func(m *routesync.Msg) error {
 		wmu.Lock()
 		defer wmu.Unlock()
 		return routesync.WriteMsg(pw, m)
 	}
-	go s.reconcileSelectors(sctx, send) // push shuffle-effective nodeSelectors (§4.4/§7.6)
+	go s.reconcileKeyAllocations(sctx, send)
 	for {
 		m, err := routesync.ReadMsg(resp.Body)
 		if err != nil {
@@ -192,14 +196,10 @@ func (s *Service) placeSession(ctx context.Context) error {
 	}
 }
 
-// reconcileSelectors periodically computes each shuffle-group's effective
-// nodeSelectors over the view and pushes a selector_patch on change (the registry
-// uses it as the key-distribution allocation set, §7.6). Per-session change
-// tracking; a reconnect re-pushes all (the registry's overlay is derived state).
-func (s *Service) reconcileSelectors(ctx context.Context, send func(*routesync.Msg) error) {
-	if len(s.cfg.ShuffleSharding) == 0 {
-		return // no shuffle rules → no overlay (key dist uses static selectors)
-	}
+// reconcileKeyAllocations periodically computes each group's explicit node set for
+// manifest-key distribution and pushes it to registry/node owner. Per-session
+// change tracking; a reconnect re-pushes all derived state.
+func (s *Service) reconcileKeyAllocations(ctx context.Context, send func(*routesync.Msg) error) {
 	last := map[string]string{}
 	t := time.NewTicker(3 * time.Second)
 	defer t.Stop()
@@ -213,21 +213,37 @@ func (s *Service) reconcileSelectors(ctx context.Context, send func(*routesync.M
 			}
 			nodes := s.nodes.values()
 			for _, g := range s.groups.values() {
-				eff, ok := effectiveSelectors(g.Group, nodes, g.NodeSelectors, s.cfg.ShuffleSharding)
-				if !ok {
-					continue
-				}
-				key := fmt.Sprint(eff)
+				selectors, nodeIDs := keyAllocation(g.Group, nodes, g.NodeSelectors, s.cfg.ShuffleSharding)
+				key := fmt.Sprint(selectors) + "|" + strings.Join(nodeIDs, ",")
 				if last[g.Group] == key {
 					continue // unchanged since last push
 				}
-				if err := send(&routesync.Msg{Type: routesync.TypeSelectorPatch, Patch: &routesync.SelectorPatch{Group: g.Group, Selectors: eff}}); err != nil {
+				patch := &routesync.SelectorPatch{
+					Group: g.Group, Selectors: selectors, NodeIDs: nodeIDs, NodeAllocation: true,
+				}
+				if err := send(&routesync.Msg{Type: routesync.TypeSelectorPatch, Patch: patch}); err != nil {
 					return
 				}
 				last[g.Group] = key
 			}
 		}
 	}
+}
+
+func keyAllocation(group string, nodes []*registry.NodeRecord, selectors []map[string]string, rules []clustercfg.ShuffleRule) ([]map[string]string, []string) {
+	effective := selectors
+	if eff, ok := effectiveSelectors(group, nodes, selectors, rules); ok {
+		effective = eff
+	}
+	var nodeIDs []string
+	for _, n := range nodes {
+		if n.Draining || !matchSelectors(n.Labels, effective) {
+			continue
+		}
+		nodeIDs = append(nodeIDs, n.NodeID)
+	}
+	sort.Strings(nodeIDs)
+	return effective, nodeIDs
 }
 
 // subscribe keeps a view synced from the registry control watch, reconnecting with
@@ -313,6 +329,18 @@ func decodeNode(raw json.RawMessage) (*registry.NodeRecord, bool) {
 		return nil, false
 	}
 	return &n, true
+}
+
+func decodeNodeList(raw json.RawMessage) (*registry.NodeRecord, bool) {
+	var n clusterstate.NodeListEntry
+	if json.Unmarshal(raw, &n) != nil {
+		return nil, false
+	}
+	return &registry.NodeRecord{
+		NodeID: n.NodeID, Labels: n.Labels, Capacity: n.Capacity, BuildCapacity: n.BuildCapacity,
+		DataEndpoint: n.DataEndpoint, RuntimeDigest: n.RuntimeDigest, Draining: n.Draining,
+		LastHeartbeatUnix: n.LastHeartbeatUnix,
+	}, true
 }
 
 func decodeGroup(raw json.RawMessage) (*registry.GroupView, bool) {

@@ -13,11 +13,13 @@ import (
 	"time"
 )
 
-// Key is the tenant key pair. ManifestKey from an external provider is
-// pass-through only — it is never persisted by the registry (cluster.md §5.4).
+// Key is the tenant key material. ManifestKey is node-facing content crypto
+// material; AuthKey is router/node-facing API/auth-token material. External
+// provider values are pass-through only.
 type Key struct {
 	ProjectID   string `json:"project_id,omitempty"`
 	ManifestKey string `json:"manifest_key,omitempty"` // hex
+	AuthKey     string `json:"auth_key,omitempty"`     // hex
 }
 
 // SandboxConfig is a group's sandbox defaults (folded into create config, §7.2)

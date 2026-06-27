@@ -53,9 +53,8 @@ func runRouter(args []string, log *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	// Sync the local route cache from the registry control watch (hot-path data plane,
-	// cluster.md §5; a cache miss falls back to control /route).
-	go rt.RunWatch(ctx)
+	// The cluster router's hot path is driven by active route/connection cache:
+	// misses Reserve through the registry and stale entries fail fast.
 	go rt.RunCleanup(ctx) // evict expired auth-cache / stale build-map entries
 
 	// Optional Prometheus metrics endpoint (router_requests_total{plane,result}, §10).

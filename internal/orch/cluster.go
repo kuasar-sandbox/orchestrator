@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"strings"
 	"time"
 
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/apikey"
@@ -32,7 +31,7 @@ func (o *Orchestrator) HandleCommand(ctx context.Context, cmd *routesync.Command
 	case routesync.CmdCreate:
 		manifestKey, tmpl, err := o.precheckCluster(ctx, cmd)
 		if err != nil {
-			o.log.Warn("cluster create rejected", "sid", cmd.SID, "migrate", cmd.MigrationToken != "", "err", err)
+			o.log.Warn("cluster create rejected", "sid", cmd.SID, "err", err)
 			return reject(cmd, err)
 		}
 		go func() {
@@ -59,6 +58,9 @@ func (o *Orchestrator) HandleCommand(ctx context.Context, cmd *routesync.Command
 		// Key distribution (cluster.md §7.6): install the group's manifest key into
 		// the node's allowlist (a TTL lease) so create can resolve it by fingerprint.
 		// The ack confirms installation — a build forward (Reserve) gates on it.
+		if cmd.ManifestKeyType == "ref" || cmd.ManifestKeyRef != "" {
+			return reject(cmd, fmt.Errorf("manifest_key ref delivery is not configured"))
+		}
 		if cmd.ManifestKey != "" {
 			var ttl int64
 			if cmd.ExpiresUnix > 0 {
@@ -227,7 +229,7 @@ func (o *Orchestrator) perBuildResources() routesync.BuildResources {
 
 // ClusterNodeInfo builds the static node-register fields for node-link (cluster.md
 // §5.1): max sandbox capacity (0 = unbounded), the build resource pool, and this
-// node's guest runtime digest (placement runtime-compat, §4.2).
+// node's guest runtime digest for placement runtime matching.
 func (o *Orchestrator) ClusterNodeInfo() (capacity int, buildCap *routesync.BuildResources, runtimeDigest string) {
 	per := o.perBuildResources()
 	mc := o.cfg.Builder.MaxConcurrent
@@ -281,11 +283,6 @@ func (o *Orchestrator) precheckCluster(ctx context.Context, cmd *routesync.Comma
 	if err != nil {
 		return "", types.TemplateID{}, err
 	}
-	// A migration restores from the token's snapshot, not a template — the group's
-	// template_ref may be empty, so don't require it to parse.
-	if cmd.MigrationToken != "" {
-		return manifestKey, types.TemplateID{}, nil
-	}
 	tmpl, err := types.ParseTemplateID(cmd.TemplateRef)
 	if err != nil {
 		return "", types.TemplateID{}, fmt.Errorf("cluster create: template %q: %w", cmd.TemplateRef, err)
@@ -297,13 +294,10 @@ func (o *Orchestrator) precheckCluster(ctx context.Context, cmd *routesync.Comma
 // cluster (group, route_key) metadata) and publishes its route — which satisfies
 // the registry's Reserve.
 func (o *Orchestrator) bootCluster(ctx context.Context, cmd *routesync.Command, manifestKey string, tmpl types.TemplateID) (*types.Sandbox, error) {
-	// Migration (a SAVED reserve carries a token): import the remote snapshot by
-	// token + restore in one step, preserving the original sid (cluster.md §7.4),
-	// instead of a cold template boot.
-	if cmd.MigrationToken != "" {
-		return o.migrateCluster(ctx, cmd, manifestKey)
+	envdTok := cmd.AccessToken
+	if envdTok == "" {
+		return nil, fmt.Errorf("cluster create: access_token required")
 	}
-	envdTok, _ := keys.MintToken()
 	trafTok, _ := keys.MintToken()
 
 	meta := map[string]string{}
@@ -341,28 +335,6 @@ func (o *Orchestrator) bootCluster(ctx context.Context, cmd *routesync.Command, 
 	return sb, nil
 }
 
-// migrateCluster imports a SAVED sandbox's migration token (the tenant key resolved
-// in precheck) and restores it from the remote snapshot on this node, keeping the
-// original sid + cluster metadata; the published running route satisfies the
-// Reserve (cluster.md §7.4 phase 2).
-func (o *Orchestrator) migrateCluster(ctx context.Context, cmd *routesync.Command, manifestKey string) (*types.Sandbox, error) {
-	o.log.Info("cluster migrate: import + restore", "sid", cmd.SID)
-	if _, err := o.importSandboxWithKey(ctx, manifestKey, cmd.MigrationToken); err != nil {
-		return nil, fmt.Errorf("cluster migrate: import: %w", err)
-	}
-	sb, err := o.st.Get(ctx, cmd.SID)
-	if err != nil || sb == nil {
-		return nil, fmt.Errorf("cluster migrate: imported sandbox %s missing", cmd.SID)
-	}
-	// resume publishes the running route (from its own updated copy); a second
-	// publishUpsert(sb) here would re-publish the stale paused sb and overwrite it.
-	if err := o.resume(ctx, sb); err != nil {
-		return nil, err
-	}
-	o.log.Info("cluster migrate: restored to running", "sid", cmd.SID)
-	return sb, nil
-}
-
 func (o *Orchestrator) resolveByFingerprint(ctx context.Context, fp string) (string, error) {
 	if fp == "" {
 		return "", fmt.Errorf("cluster create: empty key fingerprint")
@@ -389,14 +361,12 @@ func (o *Orchestrator) connectCluster(ctx context.Context, sid string) error {
 }
 
 func (o *Orchestrator) deleteCluster(ctx context.Context, sid string) error {
-	saved := o.isSavedPending(sid)
-	defer o.clearSavedPending(sid) // a SAVED reclaim (or a kill) clears any saved-pending mark
 	apiKey, err := o.deriveSandboxAPIKey(ctx, sid)
 	if err != nil {
 		return err
 	}
 	ok, err := o.Kill(ctx, sid, apiKey)
-	o.log.Info("cluster delete", "sid", sid, "reclaim", saved, "killed", ok, "err", err)
+	o.log.Info("cluster delete", "sid", sid, "killed", ok, "err", err)
 	return err
 }
 
@@ -433,68 +403,4 @@ func (o *Orchestrator) dropClusterKey(ctx context.Context, fingerprint string) e
 	}
 	o.log.Debug("cluster key_drop", "fp", fingerprint, "removed", len(keys))
 	return nil
-}
-
-// reapDeepIdle promotes deep-idle PAUSED sandboxes to SAVED (cluster.md §7.4),
-// cluster-only and opt-in (checkpoint.deep_idle_sec > 0). DeadlineUnix doubles as
-// the post-pause idle clock (pauseSandbox sets it on pause). Called by the Reaper.
-func (o *Orchestrator) reapDeepIdle(ctx context.Context, now int64) {
-	if o.cfg.Cluster.Registry.Endpoint == "" || o.cfg.Checkpoint.DeepIdleSec <= 0 {
-		return
-	}
-	var idle []*types.Sandbox
-	_ = o.st.RangeByState(ctx, types.StatePaused, func(sb *types.Sandbox) error {
-		if sb.DeadlineUnix > 0 && now >= sb.DeadlineUnix && !o.isSavedPending(sb.ID) {
-			idle = append(idle, sb)
-		}
-		return nil
-	})
-	for _, sb := range idle {
-		if err := o.promoteToSaved(ctx, sb); err != nil {
-			o.log.Warn("reaper promote-saved", "sid", sb.ID, "err", err)
-		}
-	}
-}
-
-// promoteToSaved promotes a deep-idle PAUSED sandbox to SAVED (cluster.md §7.4):
-// ensure its snapshot is remote (portable), mint a migration token, and mark it
-// saved-pending so its route reports `saved` — the registry then stores the token,
-// unbinds the node, and tells this node to reclaim the local copy.
-func (o *Orchestrator) promoteToSaved(ctx context.Context, sb *types.Sandbox) error {
-	if sb.SnapshotRef == "" {
-		return fmt.Errorf("promote-saved: %s has no snapshot", sb.ID)
-	}
-	ref := sb.SnapshotRef
-	if !strings.HasPrefix(ref, "manifest://") {
-		mref, err := o.promote(ctx, sb, ref) // upload the local bundle -> remote manifest
-		if err != nil {
-			return err
-		}
-		_ = o.st.SetSnapshotRef(ctx, sb.ID, mref)
-		sb.SnapshotRef, ref = mref, mref
-	}
-	tok, err := o.mintSandboxToken(sb, ref)
-	if err != nil {
-		return err
-	}
-	o.savedMu.Lock()
-	o.savedPending[sb.ID] = tok
-	o.savedMu.Unlock()
-	o.publishUpsert(sb) // routeEntry now reports `saved` + the token (re-emitted on reconnect)
-	o.log.Info("promoted sandbox to SAVED", "sid", sb.ID)
-	return nil
-}
-
-func (o *Orchestrator) isSavedPending(sid string) bool { return o.savedToken(sid) != "" }
-
-func (o *Orchestrator) savedToken(sid string) string {
-	o.savedMu.Lock()
-	defer o.savedMu.Unlock()
-	return o.savedPending[sid]
-}
-
-func (o *Orchestrator) clearSavedPending(sid string) {
-	o.savedMu.Lock()
-	delete(o.savedPending, sid)
-	o.savedMu.Unlock()
 }

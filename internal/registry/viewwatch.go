@@ -8,17 +8,16 @@ import (
 	"strconv"
 	"strings"
 
+	clusterstate "github.com/kuasar-sandbox/sandbox-orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/clusterstore"
 )
 
-// Node/group view watch (cluster.md §5.2): a standalone scaler subscribes these to
-// mirror the node table + group placement config locally, exactly as the router
-// subscribes /control/watch for routes. Same reset+snapshot+bookmark+deltas protocol
-// (viewStream), resumable by from_rev. Group values are projected to strip the
-// sealed manifest_key — the scaler has no business with keys.
+// Node/group view watches are low-frequency control-plane streams for scaler
+// views. Router does not subscribe to route watches. node_list is projected from
+// node_link quorum state; group values are projected to strip sealed secrets.
 const (
-	ControlNodeWatchPath  = "/control/watch-nodes"
-	ControlGroupWatchPath = "/control/watch-groups"
+	ControlNodeListWatchPath = "/control/watch-node-list" // scaler WATCH_LIST
+	ControlGroupWatchPath    = "/control/watch-groups"
 )
 
 // ViewEvent is one frame on a view watch ([4B LE len][ViewEvent]); Value is the
@@ -30,24 +29,69 @@ type ViewEvent struct {
 	Rev   int64           `json:"rev,omitempty"`
 }
 
-// GroupView is the placement-only projection of a group sent to subscribers (no
-// manifest_key / project_id — those never leave the registry/key-provider).
+// GroupView is the placement-only projection of a group sent to subscribers.
 type GroupView struct {
 	Group         string              `json:"group"`
 	NodeSelectors []map[string]string `json:"node_selectors,omitempty"`
 	ShuffleLabels map[string]string   `json:"shuffle_labels,omitempty"`
 }
 
-func (r *Registry) serveNodeWatch(w http.ResponseWriter, req *http.Request) {
-	r.viewStream(w, req, nodePrefix, func(_ string, raw []byte) ([]byte, bool) { return raw, true })
+func (r *Registry) serveNodeListWatch(w http.ResponseWriter, req *http.Request) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "watch needs a flushable (h2c) writer", http.StatusInternalServerError)
+		return
+	}
+	ctx := req.Context()
+	var fromRev int64
+	if v := req.URL.Query().Get("from_rev"); v != "" {
+		fromRev, _ = strconv.ParseInt(v, 10, 64)
+	}
+	if fromRev > 0 {
+		ch, err := r.stores.WatchNodeList(ctx, fromRev)
+		if err == nil {
+			r.streamNodeListView(ctx, w, flusher, ch)
+			return
+		}
+		if err != clusterstore.ErrCompacted {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+	}
+	rev0, err := r.stores.NodeListRev(ctx)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	ch, err := r.stores.WatchNodeList(ctx, rev0)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if err := writeFrame(w, &ViewEvent{Type: "reset", Rev: rev0}); err != nil {
+		return
+	}
+	if err := r.stores.RangeNodeList(ctx, func(entry clusterstate.NodeListEntry) error {
+		val, err := json.Marshal(entry)
+		if err != nil {
+			return err
+		}
+		return writeFrame(w, &ViewEvent{Type: "put", Key: entry.NodeID, Value: val, Rev: rev0})
+	}); err != nil {
+		return
+	}
+	if err := writeFrame(w, &ViewEvent{Type: "bookmark", Rev: rev0}); err != nil {
+		return
+	}
+	flusher.Flush()
+	r.streamNodeListView(ctx, w, flusher, ch)
 }
 
 func (r *Registry) serveGroupWatch(w http.ResponseWriter, req *http.Request) {
 	r.viewStream(w, req, groupPrefix, projectGroupView)
 }
 
-// projectGroupView strips the sealed manifest_key + project_id before a group goes
-// to a subscriber (the scaler needs only placement labels/selectors).
+// projectGroupView strips sealed secrets before a group goes to a subscriber.
 func projectGroupView(_ string, raw []byte) ([]byte, bool) {
 	var g GroupConfig
 	if json.Unmarshal(raw, &g) != nil {
@@ -60,9 +104,35 @@ func projectGroupView(_ string, raw []byte) ([]byte, bool) {
 	return out, true
 }
 
-// viewStream serves the reset+snapshot+bookmark+deltas watch protocol over a store
-// prefix (the same shape as serveWatch, generalized for raw records). project maps
-// a stored value to the wire value (ok=false skips it).
+func (r *Registry) streamNodeListView(ctx context.Context, w io.Writer, flusher http.Flusher, ch <-chan clusterstore.Event) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case ev, ok := <-ch:
+			if !ok {
+				return
+			}
+			var ve *ViewEvent
+			switch ev.Type {
+			case clusterstore.EventPut:
+				ve = &ViewEvent{Type: "put", Key: ev.Key, Value: ev.Value, Rev: ev.Rev}
+			case clusterstore.EventDelete:
+				ve = &ViewEvent{Type: "delete", Key: ev.Key, Rev: ev.Rev}
+			default:
+				continue
+			}
+			if err := writeFrame(w, ve); err != nil {
+				return
+			}
+			flusher.Flush()
+		}
+	}
+}
+
+// viewStream serves the reset+snapshot+bookmark+deltas watch protocol over a
+// low-frequency store prefix. project maps a stored value to the wire value
+// (ok=false skips it).
 func (r *Registry) viewStream(w http.ResponseWriter, req *http.Request, prefix string, project func(key string, raw []byte) ([]byte, bool)) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {

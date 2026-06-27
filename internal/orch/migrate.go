@@ -101,8 +101,7 @@ func (o *Orchestrator) ExportSandbox(ctx context.Context, apiKey, sid string, to
 }
 
 // mintSandboxToken marshals a sandbox + its remote snapshot ref into a base64
-// migration token — the handle export-sandbox and the cluster SAVED promote both
-// hand a target node. No api-key gating; callers authorize upstream.
+// migration token. No api-key gating; callers authorize upstream.
 func (o *Orchestrator) mintSandboxToken(sb *types.Sandbox, ref string) (string, error) {
 	tmpl, err := types.ParseTemplateID(sb.TemplateID)
 	if err != nil {

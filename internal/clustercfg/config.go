@@ -17,18 +17,14 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// State backends. No memory mode: every backend is durable so a registry restart
-// recovers from storage + node reconnect (cluster.md §1.2). Named "backend" (not
-// "store") to avoid colliding with sandbox-accelerator's content store (store-ctl).
+// State backends. Target cluster operation uses registry-owned memory plus the
+// registry replication layer; full cluster power-off does not auto-restore routes.
 const (
-	BackendSQLite = "sqlite" // single-host durable (Phase 0b; pure-Go)
-	BackendEtcd   = "etcd"   // multi-replica (Phase 7)
-	BackendRaft   = "raft"   // group-sharded multi-raft (Phase 7)
+	BackendMemory = "memory" // size-1 registry-owned state; no auto-restore after full stop
 )
 
-// SandboxGroup provider selection (cluster.md §6.2). Each fine-grained interface is
-// independently "store" (registry self-stores) or "external:<addr>" (a
-// cloud-provider service; manifest_key only passes through, never persisted).
+// SandboxGroup provider selection. Each fine-grained interface is independently
+// "store" (registry self-stores) or "external:<addr>".
 const (
 	ProviderStore         = "store"
 	ProviderExternalPfx   = "external:" // external:<addr>
@@ -37,7 +33,7 @@ const (
 
 // Provider interface names (keys of SandboxGroupConfig.Providers).
 const (
-	ProviderKey           = "key"            // GroupKeyProvider (project_id + manifest_key)
+	ProviderKey           = "key"            // GroupKeyProvider (project_id + manifest_key + auth_key)
 	ProviderSandboxConfig = "sandbox_config" // GroupSandboxConfigProvider
 	ProviderPlacement     = "placement"      // GroupPlacementProvider (nodeSelectors + shuffle labels)
 	ProviderImagePull     = "image_pull"     // GroupImagePullProvider (image_repo + registry_auth, §7.5)
@@ -54,17 +50,16 @@ const defaultRegistryEndpoint = "/run/cluster/registry.sock"
 // StateConfig selects the durable backend the registry stores cluster state in
 // (sandboxes / sandbox-groups / routes / revisions).
 type StateConfig struct {
-	Backend string `yaml:"backend"` // sqlite (default) | etcd | raft
-	DSN     string `yaml:"dsn"`     // sqlite path / etcd endpoints / raft config
+	Backend string `yaml:"backend"` // memory
 }
 
-// SandboxGroupConfig selects, per fine-grained provider, store vs external, and the
-// at-rest key for self-stored sandbox-group manifest_keys.
+// SandboxGroupConfig selects, per fine-grained provider, store vs external, and
+// the at-rest key for self-stored sandbox-group secrets.
 type SandboxGroupConfig struct {
 	// Providers maps each interface (key / sandbox_config / placement / image_pull)
 	// to "store" or "external:<addr>". Empty entries default to store.
 	Providers     map[string]string `yaml:"providers"`
-	EncryptionKey string            `yaml:"encryption_key"` // AES-256 at-rest for self-stored manifest_key; or SANDBOX_GROUP_ENCRYPTION_KEY env
+	EncryptionKey string            `yaml:"encryption_key"` // AES-256 at-rest for self-stored group secrets; or SANDBOX_GROUP_ENCRYPTION_KEY env
 	TLS           TLS               `yaml:"tls"`            // client mTLS for external:<addr> providers (§6.2)
 }
 
@@ -89,7 +84,6 @@ type ControlAPIConfig struct {
 // ReserveConfig bounds how long Reserve waits for a node's running event.
 type ReserveConfig struct {
 	ParkTimeout string `yaml:"park_timeout"` // default 30s; on timeout router → 503
-	RecordTTL   string `yaml:"record_ttl"`   // GC idle SAVED records after this (§10/§12); "" = off
 }
 
 // RegistryDial is how a role (node / router / scaler) reaches the registry: the
@@ -201,12 +195,6 @@ func (c *NodeLinkConfig) NodeDeadDur() time.Duration {
 }
 func (c *ReserveConfig) ParkDur() time.Duration { d, _ := time.ParseDuration(c.ParkTimeout); return d }
 
-// RecordTTLDur is the idle-SAVED-record GC age (0 = disabled).
-func (c *ReserveConfig) RecordTTLDur() time.Duration {
-	d, _ := time.ParseDuration(c.RecordTTL)
-	return d
-}
-
 // ProviderFor returns the configured provider spec for a fine-grained interface
 // (defaulting to store), and whether it is external (with the address).
 func (g *SandboxGroupConfig) ProviderFor(iface string) (spec string, external bool, addr string) {
@@ -267,7 +255,7 @@ type RegistryConfig struct {
 // DefaultRegistry returns the registry config with all non-required fields set.
 func DefaultRegistry() RegistryConfig {
 	return RegistryConfig{
-		State: StateConfig{Backend: BackendSQLite, DSN: "/var/lib/cluster/registry.db"},
+		State: StateConfig{Backend: BackendMemory},
 		SandboxGroup: SandboxGroupConfig{Providers: map[string]string{
 			ProviderKey:           ProviderStore,
 			ProviderSandboxConfig: ProviderStore,
@@ -310,9 +298,6 @@ func (c *RegistryConfig) applyDefaults() {
 	if c.State.Backend == "" {
 		c.State.Backend = d.State.Backend
 	}
-	if c.State.DSN == "" {
-		c.State.DSN = d.State.DSN
-	}
 	if c.SandboxGroup.Providers == nil {
 		c.SandboxGroup.Providers = d.SandboxGroup.Providers
 	} else {
@@ -345,12 +330,9 @@ func (c *RegistryConfig) applyDefaults() {
 // Validate checks required fields and that durations / enums parse.
 func (c *RegistryConfig) Validate() error {
 	switch c.State.Backend {
-	case BackendSQLite, BackendEtcd, BackendRaft:
+	case BackendMemory:
 	default:
-		return fmt.Errorf("clustercfg: state.backend %q invalid (sqlite|etcd|raft)", c.State.Backend)
-	}
-	if c.State.DSN == "" {
-		return fmt.Errorf("clustercfg: state.dsn is required")
+		return fmt.Errorf("clustercfg: state.backend %q invalid (memory)", c.State.Backend)
 	}
 	if err := validateProviders(c.SandboxGroup.Providers); err != nil {
 		return err
@@ -359,7 +341,6 @@ func (c *RegistryConfig) Validate() error {
 		"node_link.heartbeat_interval": c.NodeLink.HeartbeatInterval,
 		"node_link.node_dead_after":    c.NodeLink.NodeDeadAfter,
 		"reserve.park_timeout":         c.Reserve.ParkTimeout,
-		"reserve.record_ttl":           c.Reserve.RecordTTL,
 	})
 }
 
