@@ -10,6 +10,10 @@ DOMAIN="${DOMAIN:-cluster.stub.local}"
 GROUP="${GROUP:-/e2e/stub/group}"
 NODES="${NODES:-4}"
 
+step() {
+    echo "==> $*" >&2
+}
+
 skip() {
     echo "==> SKIP: $*" >&2
     if [ "${REQUIRE_CLUSTER_STUB:-0}" = "1" ]; then
@@ -35,6 +39,7 @@ command -v curl >/dev/null 2>&1 || skip "curl not on PATH"
 [ -x "$CLUSTER_CTL" ] || skip "missing cluster-ctl at $CLUSTER_CTL (run make build)"
 [ -x "$NODE_STUB_CTL" ] || skip "missing node-stub-ctl at $NODE_STUB_CTL (run make build)"
 [ -x "$E2B_KEY_CTL" ] || skip "missing e2b-key-ctl at $E2B_KEY_CTL (run make build)"
+step "cluster stub e2e: using BIN=$BIN"
 
 free_port() {
     python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()'
@@ -156,16 +161,20 @@ EOF
 
 "$CLUSTER_CTL" registry --config "$WORK/registry.yaml" >"$WORK/registry.log" 2>&1 &
 PIDS+=("$!")
+step "starting registry"
 wait_tcp "$NODE_PORT" "registry node_link"
 wait_tcp "$ROUTE_PORT" "registry route_link"
 wait_tcp "$SCALE_PORT" "registry scale_link"
 
+step "importing sandbox group"
 "$CLUSTER_CTL" registry import --config "$WORK/registry.yaml" --endpoint "127.0.0.1:$ROUTE_PORT" -i "$WORK/groups.jsonl" >"$WORK/import.log" 2>&1 ||
     fail "registry import failed"
 
+step "starting scaler"
 "$CLUSTER_CTL" scaler --config "$WORK/scaler.yaml" >"$WORK/scaler.log" 2>&1 &
 PIDS+=("$!")
 
+step "starting node-stub-ctl with $NODES nodes"
 "$NODE_STUB_CTL" serve \
     --node-link "127.0.0.1:$NODE_PORT" \
     --nodes "$NODES" \
@@ -178,10 +187,12 @@ PIDS+=("$!")
 ADMIN="http://127.0.0.1:$ADMIN_PORT"
 wait_http "$ADMIN/healthz" "node-stub admin"
 
+step "starting router"
 "$CLUSTER_CTL" router --config "$WORK/router.yaml" >"$WORK/router.log" 2>&1 &
 PIDS+=("$!")
 wait_tcp "$ROUTER_PORT" "router"
 
+step "waiting for key distribution"
 python3 - "$ADMIN" "$NODES" <<'PY' || fail "manifest keys were not distributed to all stub nodes"
 import json, sys, time, urllib.request
 admin, want = sys.argv[1], int(sys.argv[2])
@@ -196,6 +207,7 @@ for _ in range(120):
 sys.exit(1)
 PY
 
+step "checking Reserve -> READY -> data forward"
 code="$(retry_code 204 "$WORK/data1.body" \
     -H "Host: data.$DOMAIN" \
     -H "X-Kuasar-Sandbox-Group: $GROUP" \
@@ -223,6 +235,7 @@ PY
 )"
 [ "$create_count_before" = "1" ] || fail "expected one create after first reserve, got $create_count_before"
 
+step "checking active route cache"
 code="$(retry_code 204 "$WORK/data2.body" \
     -H "Host: data.$DOMAIN" \
     -H "X-Kuasar-Sandbox-Group: $GROUP" \
@@ -240,6 +253,7 @@ PY
 )"
 [ "$create_count_after" = "$create_count_before" ] || fail "active route cache caused another create ($create_count_before -> $create_count_after)"
 
+step "checking build_register"
 code="$(http_code "$WORK/build.body" -X POST \
     -H "Host: api.$DOMAIN" \
     -H "X-Kuasar-Sandbox-Group: $GROUP" \
@@ -255,6 +269,7 @@ cmds = json.load(urllib.request.urlopen(sys.argv[1] + "/v1/commands", timeout=2)
 assert any(c.get("kind") == "build_register" for c in cmds), cmds
 PY
 
+step "checking orphan route cleanup"
 "$NODE_STUB_CTL" sandbox orphan --admin "$ADMIN" --node stub-1 --group "$GROUP" --route-key orphan --sid sb-orphan >"$WORK/orphan.out"
 python3 - "$ADMIN" <<'PY' || fail "orphan route did not trigger delete command"
 import json, sys, time, urllib.request
@@ -267,6 +282,7 @@ for _ in range(100):
 sys.exit(1)
 PY
 
+step "checking reboot-empty cleanup"
 python3 - "$ADMIN" "$WORK/first_sandbox.env" <<'PY'
 import json, shlex, sys, urllib.request
 nodes = json.load(urllib.request.urlopen(sys.argv[1] + "/v1/nodes", timeout=2))
