@@ -10,14 +10,14 @@ import (
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/routesync"
 )
 
-// Scaler-link (cluster.md §4.3/§5.2): the standalone scaler DIALS the registry
-// (no scaler listen) and subscribes the node/group view (the control watches); on this
-// link the registry REVERSE-REQUESTS placement — it writes place_req down and the
-// scaler answers place_result up. channelPlacer is the registry's Placer over it;
-// with no scaler attached, placement returns ErrNoNode (cold placement stalls
-// until a scaler connects, §11) — the data plane (router cache) is unaffected.
+// scale_link session (cluster.md §4.3/§5.2): the standalone scaler DIALS the
+// registry (no scaler listen), subscribes node_list/group views over scale_link,
+// and receives reverse placement requests on this full-duplex session. The
+// registry writes place_req down and the scaler answers place_result up. With no
+// scaler attached, placement returns ErrNoNode (cold placement stalls until a
+// scaler connects, §11); the data plane (router cache) is unaffected.
 
-// scalerConn writes place_req frames down the scaler-link response body (serialized).
+// scalerConn writes place_req frames down the scale_link response body (serialized).
 type scalerConn struct {
 	mu    sync.Mutex
 	w     io.Writer
@@ -41,8 +41,8 @@ type channelPlacer struct {
 }
 
 // NewChannelPlacer builds the production Placer: it forwards each placement to the
-// scaler over the scaler-link. timeout bounds a placement (<=0 → 5s) so a slow/
-// absent scaler can't consume the whole park budget.
+// scaler over scale_link. timeout bounds a placement (<=0 → 5s) so a slow/absent
+// scaler can't consume the whole park budget.
 func NewChannelPlacer(r *Registry, timeout time.Duration) Placer {
 	if timeout <= 0 {
 		timeout = 5 * time.Second
@@ -82,11 +82,11 @@ func (p *channelPlacer) Place(ctx context.Context, req PlaceRequest) (string, er
 func (r *Registry) ServeScalerLink(w http.ResponseWriter, req *http.Request) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		http.Error(w, "scaler-link needs a flushable writer", http.StatusInternalServerError)
+		http.Error(w, "scale_link needs a flushable writer", http.StatusInternalServerError)
 		return
 	}
 	conn := &scalerConn{w: w, flush: flusher.Flush}
-	// Hello first (so the scaler knows the link is up before it streams), while this
+	// Hello first (so the scaler knows scale_link is up before it streams), while this
 	// is still the only writer — mirrors node-link.
 	if err := routesync.WriteMsg(w, &routesync.Msg{Type: routesync.TypeHello, Hello: &routesync.Hello{Version: routesync.Version}}); err != nil {
 		return
@@ -94,7 +94,7 @@ func (r *Registry) ServeScalerLink(w http.ResponseWriter, req *http.Request) {
 	flusher.Flush()
 	r.setScaler(conn)
 	defer r.clearScaler(conn)
-	r.log.Info("scaler-link: scaler connected")
+	r.log.Info("scale_link: scaler connected")
 
 	body := req.Body
 	for {

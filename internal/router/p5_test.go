@@ -17,7 +17,7 @@ import (
 // external gateway) — a bad key is NOT rejected.
 func TestAuthModeOff(t *testing.T) {
 	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/control/reserve" {
+		if r.URL.Path == "/route-link/reserve" {
 			_ = json.NewEncoder(w).Encode(reserveResult{NodeID: "n1", SID: "sb-1", AccessToken: "t", DataEndpoint: "10.0.0.1:1"})
 			return
 		}
@@ -56,10 +56,10 @@ func TestServeDataByKey(t *testing.T) {
 	nodeHost := strings.TrimPrefix(node.URL, "http://")
 	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/control/reserve":
+		case "/route-link/reserve":
 			reserveHits++
 			_ = json.NewEncoder(w).Encode(reserveResult{NodeID: "n1", SID: "sb-9", AccessToken: "tok", DataEndpoint: nodeHost})
-		case "/control/verify-key":
+		case "/route-link/verify-key":
 			w.WriteHeader(http.StatusOK)
 		default:
 			w.WriteHeader(http.StatusNotFound)
@@ -123,7 +123,7 @@ func TestServeDataByKeyUsesActiveRouteWhenRouteCacheEvicted(t *testing.T) {
 	defer node.Close()
 	nodeHost := strings.TrimPrefix(node.URL, "http://")
 	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/control/reserve" {
+		if r.URL.Path != "/route-link/reserve" {
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}

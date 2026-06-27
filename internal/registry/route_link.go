@@ -9,17 +9,16 @@ import (
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/apikey"
 )
 
-// Control API paths the router (and later the scaler) dial (cluster.md §5.2).
-// Phase 3 ships reserve + route resolution for the router; the scaler's view
-// subscription + the resumable watch land with later phases.
+// route_link paths. Routers and operator tools dial this link for group-scoped
+// route/build operations, API-key verification, and import/export.
 const (
-	ControlReservePath      = "/control/reserve"       // POST ?group=&route_key= -> ReserveResult
-	ControlRoutePath        = "/control/route"         // GET  ?sid=              -> RouteResolve
-	ControlReserveBuildPath = "/control/reserve-build" // POST {group,resources,metadata} -> BuildReserveResult
-	ControlBuildPath        = "/control/build"         // GET  ?build_id=         -> BuildReserveResult (resolve)
-	ControlGroupPath        = "/control/group"         // POST ?group=&template_ref= -> set template_ref
-	ControlListPath         = "/control/list"          // GET  ?group=            -> the group's sandbox shard
-	ControlVerifyKeyPath    = "/control/verify-key"    // GET  ?group=&api_key=   -> 200 valid / 403 invalid
+	RouteLinkReservePath      = "/route-link/reserve"       // POST ?group=&route_key= -> ReserveResult
+	RouteLinkRoutePath        = "/route-link/route"         // GET  ?sid=              -> RouteResolve
+	RouteLinkReserveBuildPath = "/route-link/reserve-build" // POST {group,resources,metadata} -> BuildReserveResult
+	RouteLinkBuildPath        = "/route-link/build"         // GET  ?build_id=         -> BuildReserveResult (resolve)
+	RouteLinkGroupPath        = "/route-link/group"         // POST ?group=&template_ref= -> set template_ref
+	RouteLinkListPath         = "/route-link/list"          // GET  ?group=            -> the group's sandbox shard
+	RouteLinkVerifyKeyPath    = "/route-link/verify-key"    // GET  ?group=&api_key=   -> 200 valid / 403 invalid
 )
 
 // RouteResolve is the data-plane forwarding target the router needs for a sid
@@ -34,18 +33,17 @@ type RouteResolve struct {
 	State        string `json:"state"`
 }
 
-// ServeControl mounts the control API (reserve + route resolution) on a mux. The
-// registry serves it on control_api.listen for router/scaler.
-func (r *Registry) ServeControl(mux *http.ServeMux) {
-	mux.HandleFunc(ControlReservePath, r.serveReserve)
-	mux.HandleFunc(ControlRoutePath, r.serveRoute)
-	mux.HandleFunc(ControlReserveBuildPath, r.serveReserveBuild)
-	mux.HandleFunc(ControlBuildPath, r.serveBuild) // resolve build_id -> node (router restart)
-	mux.HandleFunc(ControlGroupPath, r.serveGroup)
-	mux.HandleFunc(ControlListPath, r.serveList)
-	mux.HandleFunc(ControlVerifyKeyPath, r.serveVerifyKey)
-	mux.HandleFunc(ControlNodeListWatchPath, r.serveNodeListWatch) // scaler node_list WATCH_LIST
-	mux.HandleFunc(ControlGroupWatchPath, r.serveGroupWatch)       // scaler group view
+// ServeRouteLink mounts the router/admin-facing route_link API.
+func (r *Registry) ServeRouteLink(mux *http.ServeMux) {
+	mux.HandleFunc(RouteLinkReservePath, r.serveReserve)
+	mux.HandleFunc(RouteLinkRoutePath, r.serveRoute)
+	mux.HandleFunc(RouteLinkReserveBuildPath, r.serveReserveBuild)
+	mux.HandleFunc(RouteLinkBuildPath, r.serveBuild) // resolve build_id -> node (router restart)
+	mux.HandleFunc(RouteLinkGroupPath, r.serveGroup)
+	mux.HandleFunc(RouteLinkListPath, r.serveList)
+	mux.HandleFunc(RouteLinkVerifyKeyPath, r.serveVerifyKey)
+	mux.HandleFunc(RouteLinkExportPath, r.serveExport) // operator JSONL export
+	mux.HandleFunc(RouteLinkImportPath, r.serveImport) // operator JSONL import
 }
 
 // serveVerifyKey verifies an api key against a group's auth_key (the router's

@@ -14,7 +14,7 @@ import (
 // the registry rejects is 403'd at the router, before any reserve.
 func TestAuthRejectsBadKey(t *testing.T) {
 	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/control/verify-key" {
+		if r.URL.Path == "/route-link/verify-key" {
 			w.WriteHeader(http.StatusForbidden)
 			return
 		}
@@ -52,9 +52,9 @@ func TestSandboxVerbForward(t *testing.T) {
 
 	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/control/route":
+		case "/route-link/route":
 			_ = json.NewEncoder(w).Encode(routeResolve{SID: "sb-1", Group: "/g", DataEndpoint: nodeHost, State: "ready"})
-		case "/control/verify-key":
+		case "/route-link/verify-key":
 			w.WriteHeader(http.StatusOK)
 		default:
 			w.WriteHeader(http.StatusNotFound)

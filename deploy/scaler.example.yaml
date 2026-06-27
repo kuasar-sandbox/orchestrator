@@ -1,12 +1,12 @@
 # cluster-ctl scaler config — cluster-ctl scaler --config /etc/cluster-ctl/scaler.yaml.
-# Standalone placement scheduler (cluster-scaler.md §3): it dials the registry
-# control_api and answers placement over the scaler-link (no listener of its own).
+# Standalone placement scheduler (cluster-scaler.md §3): it dials registry
+# scale_link for node_list/group views and reverse placement (no listener).
 # Validate with `cluster-ctl config scaler --config scaler.yaml`.
 
-# Upstream: how to reach the registry's control_api (same target as router.registry).
-registry:
-  endpoint: /run/cluster/registry.sock
-  # tls: { cert: ..., key: ..., ca: ... }   # client mTLS to dial a remote registry (§5.4)
+# Upstream: how to reach the registry scale_link.
+scale_link:
+  endpoint: /run/cluster/scale-link.sock
+  # tls: { cert: ..., key: ..., ca: ... }   # client mTLS to dial a remote scale_link
 
 placement:
   candidates: 2                       # P2C sample size

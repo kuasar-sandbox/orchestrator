@@ -1,7 +1,7 @@
 // Package scaler is the cluster's placement scheduler (cluster-scaler.md): a
 // standalone process (cluster.md §1.2/§4.2 — no in-process mode) that DIALS the
-// registry, subscribes the node/group view, and answers the registry's reverse
-// placement requests over the scaler-link. Placement = nodeSelectors (blast
+// registry scale_link, subscribes node_list/group views, and answers the registry's
+// reverse placement requests over scale_link. Placement = nodeSelectors (blast
 // radius) + shuffle-sharding (maglev) + zone/water-level + P2C least-load, over
 // its local view; the registry commits the suggestion by CAS (cluster.md §4.3).
 package scaler

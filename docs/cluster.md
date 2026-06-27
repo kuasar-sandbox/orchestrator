@@ -167,7 +167,7 @@ Router 是无状态北向入口,但持本地缓存:
 - **singleflight reserve**:同 route 并发 miss 只发起一次 Reserve。
 
 所有请求必须带 `X-Kuasar-Sandbox-Group`。当前不设计 sid 编 group 的无头入口。router 不订阅全量
-route watch;转发失败时 fail-fast 淘汰缓存,下次重新 Reserve。
+全量 route 订阅;转发失败时 fail-fast 淘汰缓存,下次重新 Reserve。
 
 ## 8. Scaler 与 node_list
 
@@ -178,7 +178,7 @@ Scaler 消费 `node_list` 的 WATCH_LIST。WATCH_LIST 只包含低频字段:
 - runtime_digest
 - build_capacity / capacity class
 - draining
-- coarse liveness
+- liveness timestamp
 
 `allocated`、`build_alloc`、counts、zone 等高频水位字段不进 WATCH_LIST;Place 时向 node owner
 按需 GET 或使用短 TTL 缓存。

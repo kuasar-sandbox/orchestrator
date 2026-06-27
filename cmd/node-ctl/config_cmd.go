@@ -199,10 +199,10 @@ checkpoint:                                        # paused-state tiering
 # mmds:                                            # optional envd FC-mode token re-keying
 #   enabled: false                                # false => envd non-secure; proxy.auth must be enforce
 #   listen: 127.0.0.1:19254                        # MMDS listener (vswitch --mgmt-service target)
-# cluster:                                         # connect this node to a cluster-ctl registry (node-link, node.md §10)
-#   registry:                                     # how to reach the registry node-link
+# cluster:                                         # connect this node to registry node_link (node.md §10)
+#   node_link:                                    # how to reach registry node_link
 #     endpoint: registry.cluster.example.com:7700 # "" = standalone single-node
-#     tls: { cert: "", key: "", ca: "" }          # node-link client mTLS; empty = plain h2c
+#     tls: { cert: "", key: "", ca: "" }          # node_link client mTLS; empty = plain h2c
 #   node_id: ""                                   # "" = hostname
 #   labels: { zone: z1, pool: default }
 #   data_endpoint: ""                             # host:port the router forwards data to; "" = api.listen

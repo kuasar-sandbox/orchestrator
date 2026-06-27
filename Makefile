@@ -13,7 +13,7 @@
 SHELL := /bin/bash
 
 .PHONY: all build node-ctl cluster-ctl e2b-key-ctl sandbox-runtime-e2b sandbox-runtime-builder \
-        test vet bench test-e2e test-e2e-orchestrator test-e2e-proxy clean help
+        test vet bench test-e2e test-e2e-cluster-stub clean help
 
 # ---------------------------------------------------------------------------
 # Architecture selection (identical block across all kuasar-sandbox repos)
@@ -118,19 +118,12 @@ bench:
 clean:
 	rm -rf bin build
 
-# Cross-repo e2e lives in the umbrella (kuasar-sandbox/test/e2e/e2e_orchestrator.sh);
-# this target points BIN at the umbrella's assembled bin/.
-SBIN := $(abspath ../kuasar-sandbox/bin/$(TARGET_ARCH))
+# Self-contained cluster e2e: real registry/router/scaler code with a node-link
+# stub. No KVM, systemd, root, or microVM artifacts required.
+test-e2e: test-e2e-cluster-stub
 
-test-e2e: test-e2e-orchestrator test-e2e-proxy
-
-test-e2e-orchestrator:
-	BIN=$(SBIN) bash ../kuasar-sandbox/test/e2e/e2e_orchestrator.sh
-
-# External data-plane proxy (proxy_mode=external): serve + a separate proxy worker
-# + routesync + a real microVM, with data-plane traffic driven through the proxy.
-test-e2e-proxy:
-	BIN=$(SBIN) bash ../kuasar-sandbox/test/e2e/e2e_orchestrator_proxy.sh
+test-e2e-cluster-stub:
+	CGO_ENABLED=0 $(GO) test ./test/e2e/cluster_stub
 
 help:
 	@echo "sandbox-orchestrator. Targets:"
@@ -139,5 +132,5 @@ help:
 	@echo "  sandbox-runtime-builder    e2b flavor + flatten-ctl + mkfs.erofs (build-sandbox guest runtime)"
 	@echo "  node-ctl                   node resource controller (folded in from sandbox-sentinel)"
 	@echo "  test / vet / bench / clean"
-	@echo "  test-e2e[-orchestrator|-proxy]  run the umbrella e2e against assembled bin/"
+	@echo "  test-e2e                  run the self-contained cluster stub e2e"
 	@echo "  TARGET_ARCH                x86_64 (default) | aarch64"

@@ -28,6 +28,7 @@ import (
 
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/metrics"
 	proxypkg "github.com/kuasar-sandbox/sandbox-orchestrator/internal/proxy"
+	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/registry"
 )
 
 // Headers the cluster ingress reads (cluster.md §1.4).
@@ -38,8 +39,7 @@ const (
 	HeaderAccessTok = "X-Access-Token"
 )
 
-// reserveResult / routeResolve mirror the registry control JSON (decoupled from the
-// registry package).
+// reserveResult / routeResolve mirror registry route_link JSON.
 type reserveResult struct {
 	NodeID       string `json:"node_id"`
 	SID          string `json:"sid"`
@@ -70,15 +70,15 @@ type buildEntry struct {
 
 const buildTTL = time.Hour
 
-// Router is the e2b unified ingress. It dials the registry control API (UDS or
-// TCP) for reserve + route resolution.
+// Router is the e2b unified ingress. It dials registry route_link (UDS or TCP)
+// for reserve + route resolution.
 type Router struct {
 	domain        string
 	authMode      string // off | log | enforce — caller api_key auth (§8); default enforce
 	dataPlaneAuth string // off | log | enforce — data-plane access-token check (§7)
 	mx            *metrics.M
-	controlBase   string       // http base for the control API
-	opClient      *http.Client // 60s timeout (reserve / route calls)
+	routeLinkBase string       // http base for registry route_link
+	routeClient   *http.Client // 60s timeout (reserve / route calls)
 	log           *slog.Logger
 
 	buildsMu sync.Mutex
@@ -106,12 +106,12 @@ type reserveFlight struct {
 	err  error
 }
 
-// New builds a Router. controlAddr is the registry control endpoint: a path ("/run/...")
+// New builds a Router. routeAddr is the registry route_link endpoint: a path ("/run/...")
 // for a unix socket, or host:port for TCP. authTTL caches api-key verification
 // (<=0 → 60s).
-// controlTLS (non-nil) makes a TCP control endpoint dial over (m)TLS h2; nil = plain. A UDS
-// controlAddr ("/...") is always plain (local).
-func New(controlAddr, domain string, authTTL time.Duration, controlTLS *tls.Config, log *slog.Logger) *Router {
+// routeTLS (non-nil) makes a TCP route_link endpoint dial over (m)TLS h2; nil =
+// plain. A UDS routeAddr ("/...") is always plain (local).
+func New(routeAddr, domain string, authTTL time.Duration, routeTLS *tls.Config, log *slog.Logger) *Router {
 	if authTTL <= 0 {
 		authTTL = 60 * time.Second
 	}
@@ -126,21 +126,21 @@ func New(controlAddr, domain string, authTTL time.Duration, controlTLS *tls.Conf
 	}
 	var transport http.RoundTripper
 	switch {
-	case strings.HasPrefix(controlAddr, "/"):
-		rt.controlBase = "http://control"
+	case strings.HasPrefix(routeAddr, "/"):
+		rt.routeLinkBase = "http://route-link"
 		transport = &http.Transport{
 			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-				return (&net.Dialer{}).DialContext(ctx, "unix", controlAddr)
+				return (&net.Dialer{}).DialContext(ctx, "unix", routeAddr)
 			},
 		}
-	case controlTLS != nil:
-		rt.controlBase = "https://" + controlAddr
-		transport = &http.Transport{TLSClientConfig: controlTLS, ForceAttemptHTTP2: true}
+	case routeTLS != nil:
+		rt.routeLinkBase = "https://" + routeAddr
+		transport = &http.Transport{TLSClientConfig: routeTLS, ForceAttemptHTTP2: true}
 	default:
-		rt.controlBase = "http://" + controlAddr
+		rt.routeLinkBase = "http://" + routeAddr
 		transport = &http.Transport{}
 	}
-	rt.opClient = &http.Client{Timeout: 60 * time.Second, Transport: transport}
+	rt.routeClient = &http.Client{Timeout: 60 * time.Second, Transport: transport}
 	// Pooled transport for node forwards: a higher per-host idle cap than the
 	// stdlib default of 2 avoids TCP/TLS churn to a busy node at high density.
 	rt.fwdTransport = &http.Transport{MaxIdleConns: 512, MaxIdleConnsPerHost: 64, IdleConnTimeout: 90 * time.Second}
@@ -269,7 +269,7 @@ func (rt *Router) handleBuildRegister(w http.ResponseWriter, r *http.Request) {
 	if body.CPUCount > 0 || body.MemoryMB > 0 {
 		resources = &buildResources{CPU: body.CPUCount * 1000, Mem: int64(body.MemoryMB) << 20}
 	}
-	res, err := rt.opReserveBuild(r.Context(), group, resources)
+	res, err := rt.routeLinkReserveBuild(r.Context(), group, resources)
 	if err != nil {
 		rt.log.Warn("router: reserve-build", "group", group, "err", err)
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
@@ -301,7 +301,7 @@ func nonEmptySlice(s string) []string {
 }
 
 // handleBuildForward routes a build trigger/status/files call to the node that
-// holds the build (by build_id), resolving via the registry control on a local miss
+// holds the build (by build_id), resolving via route_link on a local miss
 // (router restart: the in-memory build map is lost but the BuildStore persists).
 func (rt *Router) handleBuildForward(w http.ResponseWriter, r *http.Request) {
 	bid := extractBuildID(r.URL.Path)
@@ -310,7 +310,7 @@ func (rt *Router) handleBuildForward(w http.ResponseWriter, r *http.Request) {
 	rt.buildsMu.Unlock()
 	node := e.node
 	if !ok {
-		res, rerr := rt.opResolveBuild(r.Context(), bid)
+		res, rerr := rt.routeLinkResolveBuild(r.Context(), bid)
 		if rerr != nil || res.DataEndpoint == "" {
 			http.Error(w, "unknown build "+bid, http.StatusNotFound)
 			return
@@ -394,13 +394,13 @@ func (rt *Router) handleList(w http.ResponseWriter, r *http.Request) {
 	if !rt.authorize(w, r.Context(), group, r.Header.Get(HeaderAPIKey)) {
 		return
 	}
-	u := fmt.Sprintf("%s/control/list?group=%s", rt.controlBase, url.QueryEscape(group))
+	u := fmt.Sprintf("%s%s?group=%s", rt.routeLinkBase, registry.RouteLinkListPath, url.QueryEscape(group))
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, u, nil)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
-	resp, err := rt.opClient.Do(req)
+	resp, err := rt.routeClient.Do(req)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
@@ -416,7 +416,7 @@ func (rt *Router) resolveRoute(ctx context.Context, sid string) *routeResolve {
 	if rr := rt.cachedRoute(sid); rr != nil {
 		return rr
 	}
-	if rr, err := rt.opRoute(ctx, sid); err == nil {
+	if rr, err := rt.routeLinkRoute(ctx, sid); err == nil {
 		return rr
 	}
 	return nil
@@ -478,11 +478,11 @@ func (rt *Router) serveData(w http.ResponseWriter, r *http.Request, host string)
 	}
 	sid := sub[i+1:]
 	// Hot path: serve from the local route cache (zero control round-trip, §5). On a
-	// miss (cache lagging / cold), fall back to the registry control.
+	// miss (cache lagging / cold), fall back to route_link.
 	rr := rt.cachedRoute(sid)
 	if rr == nil {
 		var err error
-		if rr, err = rt.opRoute(r.Context(), sid); err != nil {
+		if rr, err = rt.routeLinkRoute(r.Context(), sid); err != nil {
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return
 		}
@@ -702,10 +702,10 @@ func (rt *Router) cachedRouteByKey(group, routeKey string) *routeResolve {
 
 // --- control client ---
 
-func (rt *Router) opReserve(ctx context.Context, group, routeKey string) (*reserveResult, error) {
-	u := fmt.Sprintf("%s/control/reserve?group=%s&route_key=%s", rt.controlBase, url.QueryEscape(group), url.QueryEscape(routeKey))
+func (rt *Router) routeLinkReserve(ctx context.Context, group, routeKey string) (*reserveResult, error) {
+	u := fmt.Sprintf("%s%s?group=%s&route_key=%s", rt.routeLinkBase, registry.RouteLinkReservePath, url.QueryEscape(group), url.QueryEscape(routeKey))
 	var res reserveResult
-	if err := rt.opCall(ctx, http.MethodPost, u, &res); err != nil {
+	if err := rt.routeLinkCall(ctx, http.MethodPost, u, &res); err != nil {
 		return nil, err
 	}
 	return &res, nil
@@ -727,7 +727,7 @@ func (rt *Router) reserveByKey(ctx context.Context, group, routeKey string) (*re
 	rt.reserveInFlight[key] = f
 	rt.reserveMu.Unlock()
 
-	f.res, f.err = rt.opReserve(ctx, group, routeKey)
+	f.res, f.err = rt.routeLinkReserve(ctx, group, routeKey)
 	if f.err == nil && f.res != nil {
 		rt.rememberRoute(&routeResolve{
 			SID: f.res.SID, Group: group, RouteKey: routeKey, NodeID: f.res.NodeID,
@@ -742,21 +742,21 @@ func (rt *Router) reserveByKey(ctx context.Context, group, routeKey string) (*re
 	return f.res, f.err
 }
 
-func (rt *Router) opReserveBuild(ctx context.Context, group string, resources *buildResources) (*buildReserveResult, error) {
+func (rt *Router) routeLinkReserveBuild(ctx context.Context, group string, resources *buildResources) (*buildReserveResult, error) {
 	reqBody, _ := json.Marshal(map[string]any{"group": group, "resources": resources})
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, rt.controlBase+ControlReserveBuildPath, bytes.NewReader(reqBody))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, rt.routeLinkBase+registry.RouteLinkReserveBuildPath, bytes.NewReader(reqBody))
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := rt.opClient.Do(req)
+	resp, err := rt.routeClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return nil, fmt.Errorf("control reserve-build: %s: %s", resp.Status, strings.TrimSpace(string(b)))
+		return nil, fmt.Errorf("route_link reserve-build: %s: %s", resp.Status, strings.TrimSpace(string(b)))
 	}
 	var res buildReserveResult
 	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
@@ -765,40 +765,37 @@ func (rt *Router) opReserveBuild(ctx context.Context, group string, resources *b
 	return &res, nil
 }
 
-func (rt *Router) opResolveBuild(ctx context.Context, buildID string) (*buildReserveResult, error) {
-	u := fmt.Sprintf("%s/control/build?build_id=%s", rt.controlBase, url.QueryEscape(buildID))
+func (rt *Router) routeLinkResolveBuild(ctx context.Context, buildID string) (*buildReserveResult, error) {
+	u := fmt.Sprintf("%s%s?build_id=%s", rt.routeLinkBase, registry.RouteLinkBuildPath, url.QueryEscape(buildID))
 	var res buildReserveResult
-	if err := rt.opCall(ctx, http.MethodGet, u, &res); err != nil {
+	if err := rt.routeLinkCall(ctx, http.MethodGet, u, &res); err != nil {
 		return nil, err
 	}
 	return &res, nil
 }
 
-// ControlReserveBuildPath mirrors the registry control path (avoids importing the registry).
-const ControlReserveBuildPath = "/control/reserve-build"
-
-func (rt *Router) opRoute(ctx context.Context, sid string) (*routeResolve, error) {
-	u := fmt.Sprintf("%s/control/route?sid=%s", rt.controlBase, url.QueryEscape(sid))
+func (rt *Router) routeLinkRoute(ctx context.Context, sid string) (*routeResolve, error) {
+	u := fmt.Sprintf("%s%s?sid=%s", rt.routeLinkBase, registry.RouteLinkRoutePath, url.QueryEscape(sid))
 	var rr routeResolve
-	if err := rt.opCall(ctx, http.MethodGet, u, &rr); err != nil {
+	if err := rt.routeLinkCall(ctx, http.MethodGet, u, &rr); err != nil {
 		return nil, err
 	}
 	return &rr, nil
 }
 
-func (rt *Router) opCall(ctx context.Context, method, u string, out any) error {
+func (rt *Router) routeLinkCall(ctx context.Context, method, u string, out any) error {
 	req, err := http.NewRequestWithContext(ctx, method, u, nil)
 	if err != nil {
 		return err
 	}
-	resp, err := rt.opClient.Do(req)
+	resp, err := rt.routeClient.Do(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return fmt.Errorf("control %s: %s: %s", u, resp.Status, strings.TrimSpace(string(b)))
+		return fmt.Errorf("route_link %s: %s: %s", u, resp.Status, strings.TrimSpace(string(b)))
 	}
 	return json.NewDecoder(resp.Body).Decode(out)
 }
@@ -831,15 +828,15 @@ func (rt *Router) verifyAuth(ctx context.Context, group, apiKey string) (bool, e
 	}
 	rt.authMu.Unlock()
 
-	u := fmt.Sprintf("%s/control/verify-key?group=%s", rt.controlBase, url.QueryEscape(group))
+	u := fmt.Sprintf("%s%s?group=%s", rt.routeLinkBase, registry.RouteLinkVerifyKeyPath, url.QueryEscape(group))
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return false, err
 	}
 	req.Header.Set(HeaderAPIKey, apiKey) // api key in a header, never the query string (logged)
-	resp, err := rt.opClient.Do(req)
+	resp, err := rt.routeClient.Do(req)
 	if err != nil {
-		return false, err // control unreachable
+		return false, err // route_link unreachable
 	}
 	resp.Body.Close()
 	switch resp.StatusCode {
@@ -851,7 +848,7 @@ func (rt *Router) verifyAuth(ctx context.Context, group, apiKey string) (bool, e
 	case http.StatusForbidden:
 		return false, nil // the registry rejected the key
 	default:
-		return false, fmt.Errorf("control verify-key: %s", resp.Status)
+		return false, fmt.Errorf("route_link verify-key: %s", resp.Status)
 	}
 }
 
@@ -865,7 +862,7 @@ func (rt *Router) authorize(w http.ResponseWriter, ctx context.Context, group, a
 	ok, err := rt.verifyAuth(ctx, group, apiKey)
 	if err != nil {
 		if rt.authMode == "log" {
-			rt.log.Warn("router: caller-auth control unreachable (log mode, allowing)", "group", group)
+			rt.log.Warn("router: caller-auth route_link unreachable (log mode, allowing)", "group", group)
 			return true
 		}
 		http.Error(w, "auth temporarily unavailable", http.StatusServiceUnavailable)

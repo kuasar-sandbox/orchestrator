@@ -207,20 +207,19 @@ func (r *ResourceListenConfig) ApplyDefaults() {
 	}
 }
 
-// ClusterConfig connects this node to a cluster-ctl registry over node-link
-// (node.md §10). Empty Registry.Endpoint = standalone single-node (no cluster).
+// ClusterConfig connects this node to a cluster-ctl registry over node_link
+// (node.md §10). Empty NodeLink.Endpoint = standalone single-node (no cluster).
 type ClusterConfig struct {
-	Registry          ClusterRegistry   `yaml:"registry"`           // how to reach the registry node-link
+	NodeLink          ClusterNodeLink   `yaml:"node_link"`          // how to reach registry node_link
 	NodeID            string            `yaml:"node_id"`            // this node's id; "" = hostname
 	Labels            map[string]string `yaml:"labels"`             // zone / pool / slot / node (nodeSelectors)
 	DataEndpoint      string            `yaml:"data_endpoint"`      // host:port the router forwards the data plane to
 	HeartbeatInterval string            `yaml:"heartbeat_interval"` // node-link heartbeat period; "" = 10s
 }
 
-// ClusterRegistry is how the node dials the registry's node-link listener; the
-// { endpoint, tls } shape mirrors cluster-ctl's router/scaler `registry:` group.
-type ClusterRegistry struct {
-	Endpoint string      `yaml:"endpoint"` // registry node-link addr host:port; "" = standalone
+// ClusterNodeLink is how the node dials the registry's node_link listener.
+type ClusterNodeLink struct {
+	Endpoint string      `yaml:"endpoint"` // registry node_link addr host:port; "" = standalone
 	TLS      TLSMaterial `yaml:"tls"`      // node-link client mTLS; empty = plain h2c
 }
 

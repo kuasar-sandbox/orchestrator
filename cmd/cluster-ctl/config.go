@@ -76,21 +76,22 @@ func configCmd(args []string) error {
 }
 
 const registryConfigSkeleton = `# cluster-ctl registry config — cluster-ctl registry --config <this> (cluster.md §3/§4.1).
-# Durable state authority + node-link hub. Required: state.
-state:                               # registry-owned state backend
-  backend: memory
+# Registry-owned state authority + node_link / route_link / scale_link hub.
 sandbox_group:                       # how per-group config is sourced (§6.2)
   providers: { key: store, sandbox_config: store, placement: store, image_pull: store }
   # encryption_key: ""               # AES-256 sealing self-stored group secrets (or SANDBOX_GROUP_ENCRYPTION_KEY env)
   # tls: { cert: ..., key: ..., ca: ... }   # client mTLS for external:<addr> providers
-node_link:                           # nodes dial this (node-link)
+node_link:                           # nodes dial this
   listen: ":7700"
-  # tls: { cert: ..., key: ..., ca: ... }   # server mTLS (Phase 7)
+  # tls: { cert: ..., key: ..., ca: ... }   # server mTLS
   heartbeat_interval: 10s
   node_dead_after: 30s
   revision_retention: 10000
-control_api:                         # router / scaler dial this
-  listen: /run/cluster/registry.sock # UDS local; host:port remote
+route_link:                          # routers/admin tools dial this
+  listen: /run/cluster/route-link.sock
+  # tls: { cert: ..., key: ..., ca: ... }   # server mTLS when split across hosts (§5.4)
+scale_link:                          # scalers dial this
+  listen: /run/cluster/scale-link.sock
   # tls: { cert: ..., key: ..., ca: ... }   # server mTLS when split across hosts (§5.4)
 reserve:
   park_timeout: 30s
@@ -99,9 +100,9 @@ reserve:
 const routerConfigSkeleton = `# cluster-ctl router config — cluster-ctl router --config <this> (cluster-router.md §3).
 # e2b-compatible unified ingress. Required: domain.
 domain: sandboxes.example.com
-registry:                            # upstream: the registry control_api to dial
-  endpoint: /run/cluster/registry.sock   # UDS local; host:port remote
-  # tls: { cert: ..., key: ..., ca: ... }   # client mTLS to dial a remote registry (§5.4)
+route_link:                          # upstream: registry route_link
+  endpoint: /run/cluster/route-link.sock  # UDS local; host:port remote
+  # tls: { cert: ..., key: ..., ca: ... }   # client mTLS to dial a remote route_link (§5.4)
 ingress:                             # downstream: e2b client ingress
   listen: ":443"
   # tls: { cert: ..., key: ... }     # wildcard *.<domain> + api.<domain>
@@ -113,11 +114,10 @@ auth:
 `
 
 const scalerConfigSkeleton = `# cluster-ctl scaler config — cluster-ctl scaler --config <this> (cluster-scaler.md §3).
-# Standalone placement scheduler; dials the registry control_api, answers placement
-# over the scaler-link (no listener of its own).
-registry:                            # upstream: the registry control_api to dial
-  endpoint: /run/cluster/registry.sock   # UDS local; host:port remote
-  # tls: { cert: ..., key: ..., ca: ... }   # client mTLS to dial a remote registry (§5.4)
+# Standalone placement scheduler; dials registry scale_link (no listener of its own).
+scale_link:                          # upstream: registry scale_link
+  endpoint: /run/cluster/scale-link.sock  # UDS local; host:port remote
+  # tls: { cert: ..., key: ..., ca: ... }   # client mTLS to dial a remote scale_link (§5.4)
 placement:
   candidates: 2                      # P2C sample size
   zone_admit_max: yellow             # exclude nodes hotter than this (green|yellow|red)

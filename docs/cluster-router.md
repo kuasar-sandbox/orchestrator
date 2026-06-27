@@ -29,8 +29,8 @@ cluster-ctl router --config /etc/cluster-ctl/router.yaml
 | `domain` | cluster 服务域 |
 | `ingress.listen` | 控制面和数据面入口 |
 | `ingress.tls` | 通配证书 |
-| `registry.members` | registry 成员表 bootstrap |
-| `registry.tls` | 到 registry 的 mTLS |
+| `route_link.endpoint` | registry route_link 地址 |
+| `route_link.tls` | 到 registry route_link 的 mTLS |
 | `auth.api_key` | `enforce` / `log` / `off` |
 | `auth.cache_ttl` | API key 校验缓存 |
 | `cache.route_ttl` | 路由解析缓存 TTL |
@@ -75,7 +75,7 @@ access_token = MAC(auth_key, sandbox_id)
 ### 5.2 active connection cache
 
 HTTP 请求复用到 node 的 pooled transport。CONNECT/WebSocket 不能复用同一 TCP tunnel,但会维持
-route active 标记和 resolution cache。active cache 是热路径主优化;它比维护全量 route watch 更符合
+route active 标记和 resolution cache。active cache 是热路径主优化;它比维护全量 route 流更符合
 会话流量模型。
 
 ### 5.3 singleflight
@@ -92,7 +92,7 @@ route active 标记和 resolution cache。active cache 是热路径主优化;它
 - route TTL/idle timeout 到期。
 
 淘汰后下一次请求重新 Reserve。迁移/恢复时允许首个请求付出一次 fail-fast 代价,不为此维护
-router route watch。
+router route 订阅。
 
 ## 6. 控制面
 

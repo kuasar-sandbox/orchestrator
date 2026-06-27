@@ -141,7 +141,7 @@ func serve(args []string, log *slog.Logger) error {
 
 	// Connect to the cluster registry over node-link (node.md §10) if configured:
 	// the node streams its sandbox routes up + executes the registry's commands.
-	if cfg.Cluster.Registry.Endpoint != "" {
+	if cfg.Cluster.NodeLink.Endpoint != "" {
 		nodeID := cfg.Cluster.NodeID
 		if nodeID == "" {
 			nodeID, _ = os.Hostname()
@@ -150,7 +150,7 @@ func serve(args []string, log *slog.Logger) error {
 		if dataEndpoint == "" {
 			dataEndpoint = cfg.API.Listen
 		}
-		regAddr := cfg.Cluster.Registry.Endpoint
+		regAddr := cfg.Cluster.NodeLink.Endpoint
 		hbInterval := 10 * time.Second
 		if cfg.Cluster.HeartbeatInterval != "" {
 			if d, err := time.ParseDuration(cfg.Cluster.HeartbeatInterval); err == nil {
@@ -158,8 +158,8 @@ func serve(args []string, log *slog.Logger) error {
 			}
 		}
 		var clientTLS *tls.Config
-		if cfg.Cluster.Registry.TLS.Cert != "" {
-			ct, terr := clustercfg.TLS{Cert: cfg.Cluster.Registry.TLS.Cert, Key: cfg.Cluster.Registry.TLS.Key, CA: cfg.Cluster.Registry.TLS.CA}.ClientConfig("")
+		if cfg.Cluster.NodeLink.TLS.Cert != "" {
+			ct, terr := clustercfg.TLS{Cert: cfg.Cluster.NodeLink.TLS.Cert, Key: cfg.Cluster.NodeLink.TLS.Key, CA: cfg.Cluster.NodeLink.TLS.CA}.ClientConfig("")
 			if terr != nil {
 				return fmt.Errorf("cluster node-link tls: %w", terr)
 			}

@@ -4,11 +4,11 @@
 
 domain: sandboxes.example.com
 
-# Upstream: how to reach the registry's control_api (cluster.md §4.2). A co-located
-# UDS, or a remote host:port (then set registry.tls for client mTLS).
-registry:
-  endpoint: /run/cluster/registry.sock
-  # tls: { cert: ..., key: ..., ca: ... }   # client mTLS to dial a remote registry (§5.4)
+# Upstream: how to reach the registry route_link. A co-located UDS, or a remote
+# host:port (then set route_link.tls for client mTLS).
+route_link:
+  endpoint: /run/cluster/route-link.sock
+  # tls: { cert: ..., key: ..., ca: ... }   # client mTLS to dial a remote route_link
 
 # Downstream: the client-facing e2b ingress (SO_REUSEPORT across replicas).
 ingress:

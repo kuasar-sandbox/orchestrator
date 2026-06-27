@@ -1,4 +1,4 @@
-// Package registry is the cluster control plane's route/node owner and node-link
+// Package registry is the cluster control plane's route/node owner and node_link
 // hub. route_link and node_link state go through the registry-owned quorum
 // kernel; group/build configuration remains in local typed tables until those
 // namespaces move behind the same member RPC boundary.
@@ -103,7 +103,7 @@ type Stores struct {
 	nodeHandoffGate  map[string]clusterstate.HandoffGate
 }
 
-const nodeListHeartbeatBucketSec = 60
+const nodeListHeartbeatRefreshSec = 60
 
 // NewStores builds the typed store layer over a clusterstore (box may be nil
 // only if no group secret is ever stored).
@@ -219,13 +219,6 @@ func (s *Stores) PutNodeList(ctx context.Context, n *NodeRecord) error {
 	return s.publishNodeListPut(ctx, entry)
 }
 
-func coarseNodeListHeartbeat(ts int64) int64 {
-	if ts <= 0 {
-		return 0
-	}
-	return ts - ts%nodeListHeartbeatBucketSec
-}
-
 func (s *Stores) putNodeLink(ctx context.Context, n *NodeRecord) (uint64, error) {
 	if err := s.checkNodeHandoff(n.NodeID); err != nil {
 		return 0, err
@@ -248,9 +241,7 @@ func (s *Stores) putNodeLink(ctx context.Context, n *NodeRecord) (uint64, error)
 }
 
 func projectNodeListRecord(n *NodeRecord) clusterstate.NodeListEntry {
-	cn := toClusterNode(n)
-	cn.LastHeartbeatUnix = coarseNodeListHeartbeat(cn.LastHeartbeatUnix)
-	return clusterstate.ProjectNodeList(cn)
+	return clusterstate.ProjectNodeList(toClusterNode(n))
 }
 
 func (s *Stores) NodeListRev(ctx context.Context) (int64, error) {
@@ -264,7 +255,6 @@ func (s *Stores) NodeListRev(ctx context.Context) (int64, error) {
 
 func (s *Stores) RangeNodeList(ctx context.Context, fn func(clusterstate.NodeListEntry) error) error {
 	return s.nodes.List(ctx, func(n clusterstate.NodeRecord) error {
-		n.LastHeartbeatUnix = coarseNodeListHeartbeat(n.LastHeartbeatUnix)
 		return fn(clusterstate.ProjectNodeList(n))
 	})
 }

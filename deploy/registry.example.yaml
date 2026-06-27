@@ -1,11 +1,6 @@
 # cluster-ctl registry config — cluster-ctl registry --config /etc/cluster-ctl/registry.yaml.
-# Durable state authority + node-link hub (cluster.md §3/§4.1). Required: state.
+# Registry-owned state authority + node_link / route_link / scale_link hub.
 # Validate with `cluster-ctl config registry --config registry.yaml`.
-
-# Durable backend the registry stores cluster state in (sandboxes/groups/routes/revisions).
-state:
-  backend: sqlite                     # sqlite | etcd | raft (etcd/raft = Phase 7)
-  dsn: /var/lib/cluster/registry.db
 
 # How per-group config is sourced (cluster.md §6.2): each interface is "store" (the
 # registry self-stores) or "external:<addr>" (a cloud-provider service).
@@ -14,19 +9,23 @@ sandbox_group:
   # encryption_key: ""                # AES-256 sealing self-stored manifest_key (or SANDBOX_GROUP_ENCRYPTION_KEY env)
   # tls: { cert: ..., key: ..., ca: ... }   # client mTLS for external:<addr> providers
 
-# Listener nodes dial to register, stream routes, and receive commands (node-link).
+# Listener nodes dial to register, stream routes, and receive commands (node_link).
 node_link:
   listen: ":7700"
-  # tls: { cert: ..., key: ..., ca: ... }   # server mTLS (Phase 7)
+  # tls: { cert: ..., key: ..., ca: ... }   # server mTLS
   heartbeat_interval: 10s
   node_dead_after: 30s
   revision_retention: 10000
 
-# Listener the router + scaler dial (they set their own registry.endpoint to this).
-control_api:
-  listen: /run/cluster/registry.sock  # UDS local; host:port for a remote split
-  # tls: { cert: ..., key: ..., ca: ... }   # server mTLS when split across hosts (§5.4)
+# Listener routers and admin tools dial for Reserve/resolve/group import-export.
+route_link:
+  listen: /run/cluster/route-link.sock
+  # tls: { cert: ..., key: ..., ca: ... }   # server mTLS when split across hosts
+
+# Listener scalers dial for node_list/group WATCH_LIST and reverse placement.
+scale_link:
+  listen: /run/cluster/scale-link.sock
+  # tls: { cert: ..., key: ..., ca: ... }   # server mTLS when split across hosts
 
 reserve:
   park_timeout: 30s
-  # record_ttl: ""                    # GC idle SAVED records after this; "" = off

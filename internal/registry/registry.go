@@ -60,7 +60,7 @@ func (inlineSecretResolver) ResolveSecret(ctx context.Context, kind string, secr
 	return "", fmt.Errorf("registry: %s ref resolver is not configured", kind)
 }
 
-// Registry is the cluster control plane's state authority + node-link hub.
+// Registry is the cluster control plane's state authority + node_link hub.
 type Registry struct {
 	stores      *Stores
 	placer      Placer
@@ -220,7 +220,7 @@ func (r *Registry) SetSecretResolver(res SecretResolver) {
 	r.secretResolver = res
 }
 
-// SetPlacer wires the placer (the channelPlacer over the scaler-link); cluster-ctl
+// SetPlacer wires the placer (the channelPlacer over scale_link); cluster-ctl
 // sets it after New (the channelPlacer needs the registry it places through).
 func (r *Registry) SetPlacer(p Placer) { r.placer = p }
 
@@ -711,7 +711,7 @@ func (r *Registry) updateHeartbeat(ctx context.Context, nodeID string, hb *route
 	rec.BuildAlloc, rec.Counts, rec.Draining = hb.BuildAlloc, hb.Counts, hb.Draining
 	rec.LastHeartbeatUnix = time.Now().Unix()
 	_ = r.stores.PutNodeRuntime(ctx, rec)
-	if rec.Draining != oldDraining || oldHeartbeat <= 0 || rec.LastHeartbeatUnix-oldHeartbeat >= nodeListHeartbeatBucketSec {
+	if rec.Draining != oldDraining || oldHeartbeat <= 0 || rec.LastHeartbeatUnix-oldHeartbeat >= nodeListHeartbeatRefreshSec {
 		_ = r.stores.PutNodeList(ctx, rec)
 	}
 }

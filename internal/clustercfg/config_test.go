@@ -19,7 +19,7 @@ func TestRouterNeedsDomain(t *testing.T) {
 
 func TestLoadRegistryPartialAppliesDefaults(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "registry.yaml")
-	os.WriteFile(path, []byte("state:\n  backend: memory\nnode_link:\n  listen: \":8800\"\n"), 0o600)
+	os.WriteFile(path, []byte("node_link:\n  listen: \":8800\"\n"), 0o600)
 	c, err := LoadRegistry(path)
 	if err != nil {
 		t.Fatalf("load: %v", err)
@@ -28,8 +28,8 @@ func TestLoadRegistryPartialAppliesDefaults(t *testing.T) {
 	if c.NodeLink.Listen != ":8800" || c.NodeLink.RevisionRetention != 10000 || c.NodeLink.HeartbeatInterval != "10s" {
 		t.Fatalf("node_link defaults not filled: %+v", c.NodeLink)
 	}
-	if c.ControlAPI.Listen == "" || c.Reserve.ParkTimeout != "30s" {
-		t.Fatalf("control_api/reserve defaults not filled: %+v %+v", c.ControlAPI, c.Reserve)
+	if c.RouteLink.Listen == "" || c.ScaleLink.Listen == "" || c.Reserve.ParkTimeout != "30s" {
+		t.Fatalf("link/reserve defaults not filled: route=%+v scale=%+v reserve=%+v", c.RouteLink, c.ScaleLink, c.Reserve)
 	}
 	// providers default to store.
 	if p, ext, _ := c.SandboxGroup.ProviderFor(ProviderKey); p != ProviderStore || ext {
@@ -47,8 +47,8 @@ func TestLoadScalerPartialAppliesDefaults(t *testing.T) {
 	if c.Placement.Candidates != 3 || c.Placement.ZoneAdmitMax != "yellow" || c.Placement.NodeDeadAfter != "30s" {
 		t.Fatalf("placement merge wrong: %+v", c.Placement)
 	}
-	if c.Registry.Endpoint == "" {
-		t.Fatal("scaler registry.endpoint default not filled")
+	if c.ScaleLink.Endpoint == "" {
+		t.Fatal("scaler scale_link.endpoint default not filled")
 	}
 }
 
@@ -66,11 +66,6 @@ func TestProviderForExternal(t *testing.T) {
 
 func TestRegistryValidateRejects(t *testing.T) {
 	c := DefaultRegistry()
-	c.State.Backend = "unknown"
-	if err := c.Validate(); err == nil {
-		t.Fatal("unknown backend should be rejected")
-	}
-	c = DefaultRegistry()
 	c.Reserve.ParkTimeout = "notaduration"
 	if err := c.Validate(); err == nil {
 		t.Fatal("bad duration should be rejected")

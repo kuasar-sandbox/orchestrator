@@ -631,11 +631,11 @@ func TestNodeListWatchProjectsLowFrequencyFields(t *testing.T) {
 	})
 
 	mux := http.NewServeMux()
-	reg.ServeControl(mux)
+	reg.ServeScaleLink(mux)
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
-	resp, err := http.Get(srv.URL + ControlNodeListWatchPath)
+	resp, err := http.Get(srv.URL + ScaleLinkNodeListWatchPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -802,11 +802,11 @@ func TestVerifyKeyUsesAuthKeyProvider(t *testing.T) {
 	reg := testReg(t)
 	reg.SetSandboxGroupProvider(authOnlyProvider{})
 	mux := http.NewServeMux()
-	reg.ServeControl(mux)
+	reg.ServeRouteLink(mux)
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
-	req, _ := http.NewRequest(http.MethodGet, srv.URL+ControlVerifyKeyPath+"?group=/g", nil)
+	req, _ := http.NewRequest(http.MethodGet, srv.URL+RouteLinkVerifyKeyPath+"?group=/g", nil)
 	req.Header.Set("X-API-KEY", authAPIKey)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -817,7 +817,7 @@ func TestVerifyKeyUsesAuthKeyProvider(t *testing.T) {
 		t.Fatalf("auth-key api key status=%d, want 200", resp.StatusCode)
 	}
 
-	req, _ = http.NewRequest(http.MethodGet, srv.URL+ControlVerifyKeyPath+"?group=/g", nil)
+	req, _ = http.NewRequest(http.MethodGet, srv.URL+RouteLinkVerifyKeyPath+"?group=/g", nil)
 	req.Header.Set("X-API-KEY", manifestAPIKey)
 	resp, err = http.DefaultClient.Do(req)
 	if err != nil {
@@ -842,11 +842,11 @@ func TestVerifyKeyResolvesAuthKeyRef(t *testing.T) {
 	reg.SetSandboxGroupProvider(refKeyProvider{})
 	reg.SetSecretResolver(mapSecretResolver{"auth-ref": testAuthKey, "manifest-ref": testMK})
 	mux := http.NewServeMux()
-	reg.ServeControl(mux)
+	reg.ServeRouteLink(mux)
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
-	req, _ := http.NewRequest(http.MethodGet, srv.URL+ControlVerifyKeyPath+"?group=/g", nil)
+	req, _ := http.NewRequest(http.MethodGet, srv.URL+RouteLinkVerifyKeyPath+"?group=/g", nil)
 	req.Header.Set("X-API-KEY", authAPIKey)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {

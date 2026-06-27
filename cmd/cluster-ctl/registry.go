@@ -24,11 +24,16 @@ import (
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/secretbox"
 )
 
-// runRegistry starts the registry role: the durable state authority + node-link
-// hub (cluster.md §4.1). Phase 2 serves the node-link channel (nodes dial it to
-// register, stream routes, receive commands); the router/scaler control API
-// lands with those roles.
+// runRegistry starts the registry role: the state authority + node_link /
+// route_link / scale_link hub (cluster.md §4.1). node_link serves nodes; route_link
+// serves routers/admin tools; scale_link serves scalers.
 func runRegistry(args []string, log *slog.Logger) error {
+	if len(args) > 0 {
+		switch args[0] {
+		case "export", "import":
+			return registryAdminCmd(args)
+		}
+	}
 	fs := flag.NewFlagSet("registry", flag.ExitOnError)
 	cfgPath := fs.String("config", "/etc/cluster-ctl/registry.yaml", "config file")
 	_ = fs.Parse(args)
@@ -58,7 +63,7 @@ func runRegistry(args []string, log *slog.Logger) error {
 	resolver := registry.NewGroupResolver(cfg.SandboxGroup, stores, time.Minute, extTLS)
 
 	// Placement is the standalone scaler (cluster.md §4.1/§5.2 — no in-process
-	// mode): the registry reverse-requests Place over the scaler-link. With no
+	// mode): the registry reverse-requests Place over scale_link. With no
 	// scaler attached, cold placement stalls (§11); the data plane is unaffected.
 	reg := registry.New(stores, nil, cfg.Reserve.ParkDur(), log)
 	reg.SetPlacer(registry.NewChannelPlacer(reg, cfg.Reserve.ParkDur()))
@@ -96,46 +101,78 @@ func runRegistry(args []string, log *slog.Logger) error {
 		srv.Close()
 	}()
 
-	// Control API (router / scaler dial, cluster.md §5.2; the cluster e2e drives
-	// reserve through it).
-	controlMux := http.NewServeMux()
-	reg.ServeControl(controlMux)
-	controlMux.HandleFunc(routesync.ScalerLinkPath, reg.ServeScalerLink) // scaler reverse-call (§5.2)
-	controlLn, err := listenControl(cfg.ControlAPI.Listen)
+	// route_link is the router/admin-facing link: reserve, resolve, list, verify,
+	// and operator import/export.
+	routeMux := http.NewServeMux()
+	reg.ServeRouteLink(routeMux)
+	routeLn, err := listenLink(cfg.RouteLink.Listen)
 	if err != nil {
-		return fmt.Errorf("registry: control_api listen %s: %w", cfg.ControlAPI.Listen, err)
+		return fmt.Errorf("registry: route_link listen %s: %w", cfg.RouteLink.Listen, err)
 	}
-	controlSrv := &http.Server{Handler: controlMux}
-	// control mTLS for the cross-host split (cluster.md §5.4); a UDS (local) stays plain.
-	controlTLS := cfg.ControlAPI.TLS.Enabled() && !strings.HasPrefix(cfg.ControlAPI.Listen, "/")
-	if controlTLS {
-		stls, terr := cfg.ControlAPI.TLS.ServerConfig()
+	routeSrv := &http.Server{Handler: routeMux}
+	routeTLS := cfg.RouteLink.TLS.Enabled() && !strings.HasPrefix(cfg.RouteLink.Listen, "/")
+	if routeTLS {
+		stls, terr := cfg.RouteLink.TLS.ServerConfig()
 		if terr != nil {
-			return fmt.Errorf("registry: control_api tls: %w", terr)
+			return fmt.Errorf("registry: route_link tls: %w", terr)
 		}
-		controlSrv.TLSConfig = stls
+		routeSrv.TLSConfig = stls
 	} else {
-		// Plain (UDS/TCP): serve h2c so the scaler-link's full-duplex h2 stream works
-		// (h2c.NewHandler still falls through to HTTP/1.1 for the watch GETs).
-		controlSrv.Handler = h2c.NewHandler(controlMux, &http2.Server{})
+		routeSrv.Handler = h2c.NewHandler(routeMux, &http2.Server{})
 	}
 	go func() {
 		<-ctx.Done()
-		controlSrv.Close()
+		routeSrv.Close()
 	}()
 	go func() {
 		var e error
-		if controlTLS {
-			e = controlSrv.ServeTLS(controlLn, "", "")
+		if routeTLS {
+			e = routeSrv.ServeTLS(routeLn, "", "")
 		} else {
-			e = controlSrv.Serve(controlLn)
+			e = routeSrv.Serve(routeLn)
 		}
 		if e != nil && e != http.ErrServerClosed {
-			log.Error("registry control", "err", e)
+			log.Error("registry route_link", "err", e)
 		}
 	}()
 
-	log.Info("cluster-ctl registry", "node_link", cfg.NodeLink.Listen, "node_link_tls", cfg.NodeLink.TLS.Enabled(), "control_api", cfg.ControlAPI.Listen, "control_api_tls", controlTLS, "state_backend", cfg.State.Backend)
+	// scale_link is the scaler-facing link: node_list/group views and reverse
+	// placement over the scale_link session.
+	scaleMux := http.NewServeMux()
+	reg.ServeScaleLink(scaleMux)
+	scaleMux.HandleFunc(routesync.ScaleLinkPath, reg.ServeScalerLink)
+	scaleLn, err := listenLink(cfg.ScaleLink.Listen)
+	if err != nil {
+		return fmt.Errorf("registry: scale_link listen %s: %w", cfg.ScaleLink.Listen, err)
+	}
+	scaleSrv := &http.Server{Handler: scaleMux}
+	scaleTLS := cfg.ScaleLink.TLS.Enabled() && !strings.HasPrefix(cfg.ScaleLink.Listen, "/")
+	if scaleTLS {
+		stls, terr := cfg.ScaleLink.TLS.ServerConfig()
+		if terr != nil {
+			return fmt.Errorf("registry: scale_link tls: %w", terr)
+		}
+		scaleSrv.TLSConfig = stls
+	} else {
+		scaleSrv.Handler = h2c.NewHandler(scaleMux, &http2.Server{})
+	}
+	go func() {
+		<-ctx.Done()
+		scaleSrv.Close()
+	}()
+	go func() {
+		var e error
+		if scaleTLS {
+			e = scaleSrv.ServeTLS(scaleLn, "", "")
+		} else {
+			e = scaleSrv.Serve(scaleLn)
+		}
+		if e != nil && e != http.ErrServerClosed {
+			log.Error("registry scale_link", "err", e)
+		}
+	}()
+
+	log.Info("cluster-ctl registry", "node_link", cfg.NodeLink.Listen, "node_link_tls", cfg.NodeLink.TLS.Enabled(), "route_link", cfg.RouteLink.Listen, "route_link_tls", routeTLS, "scale_link", cfg.ScaleLink.Listen, "scale_link_tls", scaleTLS)
 	var serveErr error
 	if cfg.NodeLink.TLS.Enabled() {
 		serveErr = srv.ServeTLS(ln, "", "")
@@ -148,9 +185,9 @@ func runRegistry(args []string, log *slog.Logger) error {
 	return nil
 }
 
-// listenControl binds the control API: a unix socket (path starts with "/") at 0600,
+// listenLink binds a registry link: a unix socket (path starts with "/") at 0600,
 // or a TCP address.
-func listenControl(addr string) (net.Listener, error) {
+func listenLink(addr string) (net.Listener, error) {
 	if strings.HasPrefix(addr, "/") {
 		_ = os.Remove(addr)
 		if dir := addr[:strings.LastIndexByte(addr, '/')]; dir != "" {

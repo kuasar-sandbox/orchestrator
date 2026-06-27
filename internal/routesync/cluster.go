@@ -20,11 +20,11 @@ const (
 	TypeSelectorPatch = "selector_patch" // scaler -> registry (key allocation / shuffle-effective selectors, §7.6)
 )
 
-// NodeLinkPath / ScalerLinkPath are the HTTP paths node-ctl serve / cluster-ctl
+// NodeLinkPath / ScaleLinkPath are the HTTP paths node-ctl serve / cluster-ctl
 // scaler dial to open their full-duplex channels to the registry (h2c/h2).
 const (
-	NodeLinkPath   = "/internal/node-link"
-	ScalerLinkPath = "/internal/scaler-link"
+	NodeLinkPath  = "/node-link/session"
+	ScaleLinkPath = "/scale-link/session"
 )
 
 // PlaceReq is a registry placement request to the scaler (cluster.md §5.2/§7.5).

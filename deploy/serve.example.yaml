@@ -151,12 +151,12 @@ checkpoint:
 #   enabled: false
 #   listen: 127.0.0.1:19254
 
-# cluster: connect this node to a cluster-ctl registry over node-link (node.md §10).
+# cluster: connect this node to a cluster-ctl registry over node_link (node.md §10).
 # Omitted = standalone single-node.
 # cluster:
-#   registry:                                     # how to reach the registry node-link
+#   node_link:                                    # how to reach registry node_link
 #     endpoint: registry.cluster.example.com:7700 # "" = standalone single-node
-#     tls: { cert: "", key: "", ca: "" }          # node-link client mTLS; empty = plain h2c
+#     tls: { cert: "", key: "", ca: "" }          # node_link client mTLS; empty = plain h2c
 #   node_id: ""                                   # "" = hostname
 #   labels: { zone: z1, pool: default }
 #   data_endpoint: ""                             # host:port the router forwards data to; "" = api.listen

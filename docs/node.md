@@ -185,7 +185,7 @@ node-ctl serve [--config /etc/node-ctl/serve.yaml]
 启动序列:打开 sqlite(文件 chmod 0600)→ 生成并安装 systemd 模板单元(§5)→
 重启对账(§15)→ 起 reaper(TTL,5s 周期)与构建池(§12)→ 起本机控制 socket(§6)
 →(配 `resource_listen` 则起内置资源控制器,node-resource.md)→ 按 `proxy.mode` 装配
-数据面(§9)→(配 `cluster.registry.endpoint` 则拨 registry 起 node-link 客户端,§10)→
+数据面(§9)→(配 `cluster.node_link.endpoint` 则拨 registry 起 node-link 客户端,§10)→
 监听 `api.listen`。`api.<domain>`(及任何 `api.` 前缀 Host)路由到控制面,其余 Host
 进数据面。TLS 证书缺省时以明文 h2c 服务(dev:SDK 走 `E2B_API_URL`/`E2B_SANDBOX_URL`)。
 
@@ -353,8 +353,8 @@ node-ctl 同目录 → PATH"自动发现。
 | `checkpoint.local_dir` | `/var/lib/sandbox-saved` | 本机快照目录(`mode=local`) |
 | `mmds.enabled` | `false` | envd 鉴权姿态开关(§9.2、node-proxy.md §8):false = `-isnotfc` + proxy 单闸门;true = FC 模式 + MMDS re-key |
 | `mmds.listen` | `127.0.0.1:19254` | MMDS 监听地址(vswitch `--mgmt-service` 的转换目标) |
-| `cluster.registry.endpoint` | 空 | registry 的 node-link 地址(§10);空 = 独立模式,不接入集群 |
-| `cluster.registry.tls` | 空 | node-link mTLS 证书 / key / CA(`{cert,key,ca}`;生产必配,§10 / cluster.md §5.4) |
+| `cluster.node_link.endpoint` | 空 | registry 的 node_link 地址(§10);空 = 独立模式,不接入集群 |
+| `cluster.node_link.tls` | 空 | node_link mTLS 证书 / key / CA(`{cert,key,ca}`;生产必配,§10 / cluster.md §5.4) |
 | `cluster.node_id` | (接入集群必填) | 本节点唯一标识(node-link 注册,cluster.md §5) |
 | `cluster.labels` | 空 | 节点标签 `{zone,pool,slot,node}`(scaler nodeSelectors 匹配,cluster-scaler.md §4.3) |
 | `cluster.data_endpoint` | 空 | 本节点数据面端点(供 router 转发);缺省由 `api.domain` + `proxy`/`api` 监听推导 |
@@ -363,7 +363,7 @@ node-ctl 同目录 → PATH"自动发现。
 配置自洽校验:`mmds.enabled=false` 时 `proxy.auth` 必须为 `enforce`(envd 非 secure,
 proxy 是唯一数据面闸门);`mmds.enabled=true` 时 `proxy.mode` 不得为 `off`(MMDS 寄宿
 proxy 组件)。external 模式无须静态 worker 列表——worker 自行经 plugin 平面注册,网关
-按活跃注册集转发(§9.1、§9.3)。配 `cluster.registry.endpoint` 时 `cluster.node_id` 必填;配
+按活跃注册集转发(§9.1、§9.3)。配 `cluster.node_link.endpoint` 时 `cluster.node_id` 必填;配
 `resource_listen` 时 `sandbox.resources.control_socket` 通常指向它(否则控制器空跑)。
 
 ## 4. e2b API 契约
@@ -801,11 +801,11 @@ sid 的 FNV 哈希在**活跃注册的 worker 集**上挑一个,经其 `--socket
 
 ## 10. 集群接入(node-link:复用 routesync)
 
-配 `cluster.registry.endpoint`(§3)时,`node-ctl serve` 拨 registry 把本节点接入集群,交由 cluster-ctl
+配 `cluster.node_link.endpoint`(§3)时,`node-ctl serve` 拨 registry 把本节点接入集群,交由 cluster-ctl
 (registry / router / scaler)编排。**节点接入复用其既有 routesync 引擎**(node-proxy.md §6):节点
 拨 registry、注册身份、**反向监听**,registry 在该连接上以 `register{subscribe:{kind:registry}}` 作
 **路由订阅者**,此后节点作**路由 / 构建权威**下行流式上报、registry 上行下发命令。线格式与枢纽
-语义由 **cluster.md §5** 权威定义;本节只讲节点侧角色。空 `cluster.registry.endpoint` = 独立模式,本节不生效。
+语义由 **cluster.md §5** 权威定义;本节只讲节点侧角色。空 `cluster.node_link.endpoint` = 独立模式,本节不生效。
 
 集群下两条到节点的路径:**node-link**(本节,承载注册 / 心跳 / 路由+构建事件 / 命令 / 密钥),与
 cluster router **转发到本节点 e2b 控制面 / 数据面**的请求——pause/kill/timeout、build trigger/status/
@@ -838,7 +838,7 @@ files 转发本机 e2b 控制面(§4),数据面业务流量经 router 注入 `E2
   集群侧仅停止向其分配(cluster-scaler.md §4),不由 registry 命令(cluster.md §7.3)。
 - **断线增量重连**:断连指数退避重连重注册,带 `resume_from=<rev>` 请增量重放(registry 留存窗口内
   只补增量,否则逐条全量 + `bookmark`,cluster.md §5.3)。registry 重启亦然。
-- **安全**:node-link 生产走 mTLS(`cluster.tls`);下行 `manifest_key` 仅入加密存储(§7),上行
+- **安全**:node-link 生产走 mTLS(`cluster.node_link.tls`);下行 `manifest_key` 仅入加密存储(§7),上行
   `access_token` 属沙箱级敏感,在 mTLS 内传输(cluster.md §5.4)。
 - **与本机 plugin 平面统一**:接入集群即"节点作路由权威、registry 作订阅者"——与本机 config-socket
   plugin 平面(proxy worker / 观察者订阅本节点路由,§6 / node-proxy.md §6)**同一 routesync 引擎、
@@ -1023,7 +1023,7 @@ vswitch mgmt VIP 寻址;第三方 registry 经 NAT 出网)。两者皆缺则 tri
 友好)。控制面与数据面可同口(`api.listen`)或分口(`proxy.data_listen` /
 external worker 的 `data_listen`,proxy.yaml),证书同一张。dev:`E2B_API_URL`/
 `E2B_SANDBOX_URL` 指向明文 http(h2c),无需证书与通配 DNS。集群下 cluster-ctl router
-持对外通配证书,node-link 用独立的 `cluster.tls` mTLS(§10)。
+持对外通配证书,node-link 用独立的 `cluster.node_link.tls` mTLS(§10)。
 
 ## 14. 契约边界
 
@@ -1031,7 +1031,7 @@ external worker 的 `data_listen`,proxy.yaml),证书同一张。dev:`E2B_API_URL
 |---|---|---|
 | `sandbox-ctl`(runtime) | 经 run-sandbox(单元)`execve`:`run --config <sid>.yaml --manifest-config … --run-root … --cgroup-adopt [--restore] [--connect]`;run-builder 以直接子进程 `run` 阶段沙箱,经 `exec --env/--stdin-from/--stdout-to` 做平台接力(flatten-ctl 调用、配置注入、工件流、探针),收尾 `snapshot --output` / `upload-snapshot` / `info --json`;serve 调 `snapshot --upload`(pause) | 非密配置文件 + 密钥 env;资源准入在其内部;e2b 语义命令不走它(走 envd,§12) |
 | 资源控制器(node-resource.md) | serve 内置(`resource_listen`,调参内联);沙箱经 `sandbox.resources.control_socket` 拨号(`pkg/resource` 协议) | 单元 cgroup 即沙箱 cgroup,控制器原地仲裁;不配 control_socket = 静态 cgroup(`--cgroup-adopt`),配了才进 SANDBOX_CONFIG `resources.control.controller` |
-| registry(cluster-ctl) | node-link:serve 拨 registry、反向注册为路由权威,上报 register/heartbeat/sandbox/build_event 事件、受理 create/connect/delete/key_put/key_drop/build_register 命令(§10、cluster.md §5) | mTLS;命令复用 §8 / §8.1 生命周期原语;空 `cluster.registry.endpoint` = 独立模式不接入 |
+| registry(cluster-ctl) | node-link:serve 拨 registry、反向注册为路由权威,上报 register/heartbeat/sandbox/build_event 事件、受理 create/connect/delete/key_put/key_drop/build_register 命令(§10、cluster.md §5) | mTLS;命令复用 §8 / §8.1 生命周期原语;空 `cluster.node_link.endpoint` = 独立模式不接入 |
 | `vswitch-ctl`(vswitch) | CLI:`attach <switch> --inner-ip [--transit-*]` / `detach --port`;`open-port` 作 SANDBOX_CONFIG `network.tapfd.exec`(sandbox-ctl 执行,经 `TAPFD_SOCKET` 收 tap fd) | 交换机预先起好(`vswitch-ctl start`,内核态数据面);port 对外、slot 内部;一个构建复用一个槽 |
 | `flatten-ctl`(builder) | **guest 内**(builder runtime 自带,经 sandbox-ctl exec 驱动):`export --output -`(import 拉取 / steps 导出)、`mountpoint`;宿主侧:`info --json`(读镜像运行时配置,本地工件或 manifest://) | 租户 `FLATTEN_*` 仅经 exec env 入 guest;tarstream 镜像工件经 exec stdio 接力 |
 | `manifest-ctl`(accelerator) | `store <image.img>`(img-only 构建的收尾上传) | manifest key 经 stdout 回收;`MANIFEST_KEY` 经 env |

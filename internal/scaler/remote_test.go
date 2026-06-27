@@ -16,10 +16,11 @@ import (
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/clustercfg"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/clusterstore"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/registry"
+	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/routesync"
 )
 
 // TestScalerLinkReverseCall drives the full P2 reverse-call in-process: a registry
-// (control + scaler-link over h2c) + a standalone scaler dialing it; the registry's
+// (scale_link over h2c) + a standalone scaler dialing it; the registry's
 // channelPlacer reverse-requests placement and the scaler answers over its view.
 func TestScalerLinkReverseCall(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -37,8 +38,8 @@ func TestScalerLinkReverseCall(t *testing.T) {
 	reg.SetPlacer(placer)
 
 	mux := http.NewServeMux()
-	reg.ServeControl(mux)
-	mux.HandleFunc("/internal/scaler-link", reg.ServeScalerLink)
+	reg.ServeScaleLink(mux)
+	mux.HandleFunc(routesync.ScaleLinkPath, reg.ServeScalerLink)
 	controlSrv := httptest.NewServer(h2c.NewHandler(mux, &http2.Server{}))
 	defer controlSrv.Close()
 	defer cancel() // LIFO: cancel before closing the server so the scaler tears down its streams first
@@ -46,7 +47,7 @@ func TestScalerLinkReverseCall(t *testing.T) {
 	svc := NewRemote(strings.TrimPrefix(controlSrv.URL, "http://"), nil, clustercfg.PlacementConfig{Candidates: 2}, 30, discard)
 	svc.Start(ctx)
 
-	// Poll until the scaler-link + node_list/group views are up and placement
+	// Poll until scale_link + node_list/group views are up and placement
 	// resolves to a selector-matching node via the reverse-call. node_list no
 	// longer carries high-frequency load, so this does not assert colder-node
 	// selection.

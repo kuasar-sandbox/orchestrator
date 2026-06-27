@@ -32,21 +32,21 @@ func runRouter(args []string, log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	controlAddr := cfg.Registry.Endpoint // registry control_api to dial (default: co-located socket)
+	routeAddr := cfg.RouteLink.Endpoint
 
-	// registry mTLS when the endpoint is a remote TCP addr and registry.tls is set
+	// route_link mTLS when the endpoint is a remote TCP addr and tls is set
 	// (cluster.md §5.4); a co-located UDS endpoint stays plain.
-	var controlTLS *tls.Config
-	if !strings.HasPrefix(controlAddr, "/") && cfg.Registry.TLS.Enabled() {
-		host := controlAddr
+	var routeTLS *tls.Config
+	if !strings.HasPrefix(routeAddr, "/") && cfg.RouteLink.TLS.Enabled() {
+		host := routeAddr
 		if i := strings.LastIndexByte(host, ':'); i >= 0 {
 			host = host[:i]
 		}
-		if controlTLS, err = cfg.Registry.TLS.ClientConfig(host); err != nil {
-			return fmt.Errorf("router: registry tls: %w", err)
+		if routeTLS, err = cfg.RouteLink.TLS.ClientConfig(host); err != nil {
+			return fmt.Errorf("router: route_link tls: %w", err)
 		}
 	}
-	rt := router.New(controlAddr, cfg.Domain, cfg.AuthCacheDur(), controlTLS, log)
+	rt := router.New(routeAddr, cfg.Domain, cfg.AuthCacheDur(), routeTLS, log)
 	rt.SetDataPlaneAuth(cfg.Auth.DataPlane)
 	rt.SetAuthMode(cfg.Auth.APIKey)
 
@@ -102,7 +102,7 @@ func runRouter(args []string, log *slog.Logger) error {
 		<-ctx.Done()
 		srv.Close()
 	}()
-	log.Info("cluster-ctl router", "listen", cfg.Ingress.Listen, "domain", cfg.Domain, "registry", controlAddr, "tls", cfg.Ingress.TLS.Enabled())
+	log.Info("cluster-ctl router", "listen", cfg.Ingress.Listen, "domain", cfg.Domain, "route_link", routeAddr, "tls", cfg.Ingress.TLS.Enabled())
 	var serveErr error
 	if cfg.Ingress.TLS.Enabled() {
 		serveErr = srv.ServeTLS(ln, "", "")

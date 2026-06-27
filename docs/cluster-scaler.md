@@ -24,8 +24,8 @@ cluster-ctl scaler --config /etc/cluster-ctl/scaler.yaml
 
 | 字段 | 说明 |
 |---|---|
-| `registry.members` | registry 成员 bootstrap |
-| `registry.tls` | 到 registry 的 mTLS |
+| `scale_link.endpoint` | registry scale_link 地址 |
+| `scale_link.tls` | 到 registry scale_link 的 mTLS |
 | `placement.candidates` | P2C 候选数量 |
 | `placement.zone_admit_max` | 可放置最高水位 |
 | `placement.shuffle_sharding` | shuffle 规则 |
@@ -59,7 +59,7 @@ node_list 由 registry 的 node owner 汇总低频节点字段:
 - runtime_digest
 - build_capacity / capacity class
 - draining
-- coarse liveness
+- liveness timestamp
 
 WATCH_LIST 语义:
 

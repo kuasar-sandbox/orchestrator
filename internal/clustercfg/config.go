@@ -1,9 +1,8 @@
 // Package clustercfg loads cluster-ctl's configuration. Each role runs as its own
 // process with its OWN config file and schema (cluster.md §3) — there is no shared
 // file: registry.yaml / router.yaml / scaler.yaml each carry only what that role
-// needs, grouped by concern. Config groups are named for who connects / what they
-// are: the registry binds `node_link` (nodes) and `control_api` (router/scaler);
-// router/scaler express where to reach the registry as `registry: { endpoint, tls }`.
+// needs, grouped by the cluster link they operate: node_link, route_link,
+// scale_link, and node_list.
 package clustercfg
 
 import (
@@ -15,12 +14,6 @@ import (
 	"time"
 
 	"gopkg.in/yaml.v3"
-)
-
-// State backends. Target cluster operation uses registry-owned memory plus the
-// registry replication layer; full cluster power-off does not auto-restore routes.
-const (
-	BackendMemory = "memory" // size-1 registry-owned state; no auto-restore after full stop
 )
 
 // SandboxGroup provider selection. Each fine-grained interface is independently
@@ -39,19 +32,14 @@ const (
 	ProviderImagePull     = "image_pull"     // GroupImagePullProvider (image_repo + registry_auth, §7.5)
 )
 
-// defaultRegistryEndpoint is the registry control_api endpoint co-located
-// router/scaler dial by default (matches ControlAPIConfig.Listen's default).
-const defaultRegistryEndpoint = "/run/cluster/registry.sock"
+const (
+	defaultRouteLinkEndpoint = "/run/cluster/route-link.sock"
+	defaultScaleLinkEndpoint = "/run/cluster/scale-link.sock"
+)
 
 // ===========================================================================
 // Shared sub-types (reused across the three role schemas).
 // ===========================================================================
-
-// StateConfig selects the durable backend the registry stores cluster state in
-// (sandboxes / sandbox-groups / routes / revisions).
-type StateConfig struct {
-	Backend string `yaml:"backend"` // memory
-}
 
 // SandboxGroupConfig selects, per fine-grained provider, store vs external, and
 // the at-rest key for self-stored sandbox-group secrets.
@@ -73,11 +61,11 @@ type NodeLinkConfig struct {
 	RevisionRetention int    `yaml:"revision_retention"` // change-log depth for resume_from; default 10000
 }
 
-// ControlAPIConfig is the listener the cluster control plane (router + scaler) dials
-// for reserve / route-watch / placement. Bound by the registry; dialed via the
-// router/scaler `registry: { endpoint, tls }`.
-type ControlAPIConfig struct {
-	Listen string `yaml:"listen"` // default /run/cluster/registry.sock (UDS); remote via TLS
+// LinkListenConfig is a registry-owned link listener. route_link is dialed by
+// routers/admin tools; scale_link is dialed by scalers for node_list/group views
+// and reverse placement.
+type LinkListenConfig struct {
+	Listen string `yaml:"listen"` // UDS path / host:port
 	TLS    TLS    `yaml:"tls"`    // server mTLS when split across hosts
 }
 
@@ -86,9 +74,9 @@ type ReserveConfig struct {
 	ParkTimeout string `yaml:"park_timeout"` // default 30s; on timeout router → 503
 }
 
-// RegistryDial is how a role (node / router / scaler) reaches the registry: the
+// LinkDialConfig is how a role (node / router / scaler) reaches the registry: the
 // endpoint it dials plus the client mTLS to present (when the endpoint is remote).
-type RegistryDial struct {
+type LinkDialConfig struct {
 	Endpoint string `yaml:"endpoint"` // registry listener to dial (UDS path / host:port)
 	TLS      TLS    `yaml:"tls"`      // client mTLS for a remote endpoint (cluster.md §5.4)
 }
@@ -133,7 +121,7 @@ type TLS struct {
 func (t TLS) Enabled() bool { return t.Cert != "" && t.Key != "" }
 
 // ServerConfig builds a server tls.Config; a CA enables mTLS (require + verify
-// client certs). h2 is advertised so node-link / control_api / ingress negotiate HTTP/2.
+// client certs). h2 is advertised so registry links and ingress negotiate HTTP/2.
 func (t TLS) ServerConfig() (*tls.Config, error) {
 	cert, err := tls.LoadX509KeyPair(t.Cert, t.Key)
 	if err != nil {
@@ -238,33 +226,34 @@ func validateProviders(p map[string]string) error {
 }
 
 // ===========================================================================
-// registry.yaml — durable state authority + node-link hub (cluster.md §4.1).
+// registry.yaml — registry-owned state authority + node_link / route_link /
+// scale_link hub (cluster.md §4.1).
 // ===========================================================================
 
-// RegistryConfig is the registry role's config: the durable state backend,
-// sandbox-group config providers, the node-link listener it holds, the control_api
-// listener it binds (router/scaler dial it), and the Reserve park budget.
+// RegistryConfig is the registry role's config: sandbox-group config providers,
+// the node_link listener it holds, the route_link and scale_link listeners it
+// binds, and the Reserve park budget.
 type RegistryConfig struct {
-	State        StateConfig        `yaml:"state"`         // durable backend (required)
 	SandboxGroup SandboxGroupConfig `yaml:"sandbox_group"` // sandbox-group config providers
 	NodeLink     NodeLinkConfig     `yaml:"node_link"`     // nodes dial this (registry holds it)
-	ControlAPI   ControlAPIConfig   `yaml:"control_api"`   // router/scaler dial this
+	RouteLink    LinkListenConfig   `yaml:"route_link"`    // routers/admin tools dial this
+	ScaleLink    LinkListenConfig   `yaml:"scale_link"`    // scalers dial this
 	Reserve      ReserveConfig      `yaml:"reserve"`       // Reserve park budget
 }
 
 // DefaultRegistry returns the registry config with all non-required fields set.
 func DefaultRegistry() RegistryConfig {
 	return RegistryConfig{
-		State: StateConfig{Backend: BackendMemory},
 		SandboxGroup: SandboxGroupConfig{Providers: map[string]string{
 			ProviderKey:           ProviderStore,
 			ProviderSandboxConfig: ProviderStore,
 			ProviderPlacement:     ProviderStore,
 			ProviderImagePull:     ProviderStore,
 		}},
-		NodeLink:   NodeLinkConfig{Listen: ":7700", HeartbeatInterval: "10s", NodeDeadAfter: "30s", RevisionRetention: 10000},
-		ControlAPI: ControlAPIConfig{Listen: defaultRegistryEndpoint},
-		Reserve:    ReserveConfig{ParkTimeout: "30s"},
+		NodeLink:  NodeLinkConfig{Listen: ":7700", HeartbeatInterval: "10s", NodeDeadAfter: "30s", RevisionRetention: 10000},
+		RouteLink: LinkListenConfig{Listen: defaultRouteLinkEndpoint},
+		ScaleLink: LinkListenConfig{Listen: defaultScaleLinkEndpoint},
+		Reserve:   ReserveConfig{ParkTimeout: "30s"},
 	}
 }
 
@@ -295,9 +284,6 @@ func LoadRegistry(path string) (*RegistryConfig, error) {
 // defaulted struct overwrites whole sub-structs that appear, zeroing siblings).
 func (c *RegistryConfig) applyDefaults() {
 	d := DefaultRegistry()
-	if c.State.Backend == "" {
-		c.State.Backend = d.State.Backend
-	}
 	if c.SandboxGroup.Providers == nil {
 		c.SandboxGroup.Providers = d.SandboxGroup.Providers
 	} else {
@@ -319,8 +305,11 @@ func (c *RegistryConfig) applyDefaults() {
 	if c.NodeLink.RevisionRetention == 0 {
 		c.NodeLink.RevisionRetention = d.NodeLink.RevisionRetention
 	}
-	if c.ControlAPI.Listen == "" {
-		c.ControlAPI.Listen = d.ControlAPI.Listen
+	if c.RouteLink.Listen == "" {
+		c.RouteLink.Listen = d.RouteLink.Listen
+	}
+	if c.ScaleLink.Listen == "" {
+		c.ScaleLink.Listen = d.ScaleLink.Listen
 	}
 	if c.Reserve.ParkTimeout == "" {
 		c.Reserve.ParkTimeout = d.Reserve.ParkTimeout
@@ -329,11 +318,6 @@ func (c *RegistryConfig) applyDefaults() {
 
 // Validate checks required fields and that durations / enums parse.
 func (c *RegistryConfig) Validate() error {
-	switch c.State.Backend {
-	case BackendMemory:
-	default:
-		return fmt.Errorf("clustercfg: state.backend %q invalid (memory)", c.State.Backend)
-	}
 	if err := validateProviders(c.SandboxGroup.Providers); err != nil {
 		return err
 	}
@@ -351,19 +335,19 @@ func (c *RegistryConfig) Validate() error {
 // RouterConfig is the router role's config, grouped as upstream (registry) /
 // downstream (ingress) / policy (auth) plus the service domain.
 type RouterConfig struct {
-	Domain        string        `yaml:"domain"`         // service domain; splits control/data (required)
-	Registry      RegistryDial  `yaml:"registry"`       // upstream: the registry control_api to dial
-	Ingress       IngressConfig `yaml:"ingress"`        // downstream: e2b client ingress
-	Auth          RouterAuth    `yaml:"auth"`           // auth policy
-	MetricsListen string        `yaml:"metrics_listen"` // optional Prometheus text endpoint
+	Domain        string         `yaml:"domain"`         // service domain; splits control/data (required)
+	RouteLink     LinkDialConfig `yaml:"route_link"`     // upstream: registry route_link to dial
+	Ingress       IngressConfig  `yaml:"ingress"`        // downstream: e2b client ingress
+	Auth          RouterAuth     `yaml:"auth"`           // auth policy
+	MetricsListen string         `yaml:"metrics_listen"` // optional Prometheus text endpoint
 }
 
 // DefaultRouter returns the router config with all non-required fields set.
 func DefaultRouter() RouterConfig {
 	return RouterConfig{
-		Registry: RegistryDial{Endpoint: defaultRegistryEndpoint},
-		Ingress:  IngressConfig{Listen: ":443"},
-		Auth:     RouterAuth{APIKey: "enforce", DataPlane: "enforce", CacheTTL: "60s"},
+		RouteLink: LinkDialConfig{Endpoint: defaultRouteLinkEndpoint},
+		Ingress:   IngressConfig{Listen: ":443"},
+		Auth:      RouterAuth{APIKey: "enforce", DataPlane: "enforce", CacheTTL: "60s"},
 	}
 }
 
@@ -388,8 +372,8 @@ func LoadRouter(path string) (*RouterConfig, error) {
 
 func (c *RouterConfig) applyDefaults() {
 	d := DefaultRouter()
-	if c.Registry.Endpoint == "" {
-		c.Registry.Endpoint = d.Registry.Endpoint
+	if c.RouteLink.Endpoint == "" {
+		c.RouteLink.Endpoint = d.RouteLink.Endpoint
 	}
 	if c.Ingress.Listen == "" {
 		c.Ingress.Listen = d.Ingress.Listen
@@ -432,17 +416,17 @@ func (c *RouterConfig) AuthCacheDur() time.Duration {
 // ===========================================================================
 
 // ScalerConfig is the standalone scaler's config (cluster.md §1.2/§4.2 — always a
-// separate process that dials the registry control_api and answers placement over
-// the scaler-link): the upstream registry plus the placement policy.
+// separate process that dials registry scale_link and answers placement over that
+// link): the upstream scale_link plus the placement policy.
 type ScalerConfig struct {
-	Registry  RegistryDial    `yaml:"registry"`  // upstream: the registry control_api to dial
-	Placement PlacementConfig `yaml:"placement"` // placement policy
+	ScaleLink LinkDialConfig  `yaml:"scale_link"` // upstream: registry scale_link to dial
+	Placement PlacementConfig `yaml:"placement"`  // placement policy
 }
 
 // DefaultScaler returns the scaler config with all non-required fields set.
 func DefaultScaler() ScalerConfig {
 	return ScalerConfig{
-		Registry:  RegistryDial{Endpoint: defaultRegistryEndpoint},
+		ScaleLink: LinkDialConfig{Endpoint: defaultScaleLinkEndpoint},
 		Placement: PlacementConfig{Candidates: 2, ZoneAdmitMax: "yellow", NodeDeadAfter: "30s"},
 	}
 }
@@ -468,8 +452,8 @@ func LoadScaler(path string) (*ScalerConfig, error) {
 
 func (c *ScalerConfig) applyDefaults() {
 	d := DefaultScaler()
-	if c.Registry.Endpoint == "" {
-		c.Registry.Endpoint = d.Registry.Endpoint
+	if c.ScaleLink.Endpoint == "" {
+		c.ScaleLink.Endpoint = d.ScaleLink.Endpoint
 	}
 	if c.Placement.Candidates == 0 {
 		c.Placement.Candidates = d.Placement.Candidates

@@ -24,14 +24,14 @@ import (
 )
 
 // Service is the standalone scaler (cluster-scaler.md §4.2/§5): it DIALS the
-// registry, subscribes the node/group view (the control watches), and answers the
-// registry's reverse placement requests on the scaler-link (no scaler listen).
+// registry scale_link, subscribes node_list/group views, and answers the
+// registry's reverse placement requests over scale_link (no scaler listen).
 // Placement runs over its local view; the registry commits by CAS.
 type Service struct {
-	controlBase string
+	scaleBase   string
 	scheme      string
 	watchClient *http.Client     // no timeout: long-lived view watches
-	placeTr     *http2.Transport // full-duplex scaler-link (place_req down / place_result up)
+	placeTr     *http2.Transport // full-duplex scale_link session (place_req down / place_result up)
 	cfg         clustercfg.PlacementConfig
 	deadAfter   int64 // node_dead_after seconds (node-alive eligibility, §4.2)
 	log         *slog.Logger
@@ -40,9 +40,9 @@ type Service struct {
 	groups *viewMap[*registry.GroupView]
 }
 
-// NewRemote builds a standalone scaler dialing the registry control endpoint (a UDS
-// path, or host:port; controlTLS non-nil = mTLS h2). deadAfter is node_dead_after.
-func NewRemote(controlAddr string, controlTLS *tls.Config, cfg clustercfg.PlacementConfig, deadAfter int64, log *slog.Logger) *Service {
+// NewRemote builds a standalone scaler dialing registry scale_link (a UDS path,
+// or host:port; scaleTLS non-nil = mTLS h2). deadAfter is node_dead_after.
+func NewRemote(scaleAddr string, scaleTLS *tls.Config, cfg clustercfg.PlacementConfig, deadAfter int64, log *slog.Logger) *Service {
 	if cfg.Candidates <= 0 {
 		cfg.Candidates = 2
 	}
@@ -51,28 +51,28 @@ func NewRemote(controlAddr string, controlTLS *tls.Config, cfg clustercfg.Placem
 		nodes:  newViewMap(decodeNodeList),
 		groups: newViewMap(decodeGroup),
 	}
-	// View watches over a normal client; the scaler-link over an h2 transport
+	// View watches over a normal client; the scale_link session over an h2 transport
 	// (full-duplex: registry writes place_req down, scaler writes place_result up).
 	pt := &http2.Transport{}
 	switch {
-	case strings.HasPrefix(controlAddr, "/"):
-		s.controlBase, s.scheme = "http://control", "http"
+	case strings.HasPrefix(scaleAddr, "/"):
+		s.scaleBase, s.scheme = "http://scale-link", "http"
 		dial := func(ctx context.Context, _, _ string) (net.Conn, error) {
-			return (&net.Dialer{}).DialContext(ctx, "unix", controlAddr)
+			return (&net.Dialer{}).DialContext(ctx, "unix", scaleAddr)
 		}
 		s.watchClient = &http.Client{Transport: &http.Transport{DialContext: dial}}
 		pt.AllowHTTP = true
 		pt.DialTLSContext = func(ctx context.Context, _, _ string, _ *tls.Config) (net.Conn, error) { return dial(ctx, "", "") }
-	case controlTLS != nil:
-		s.controlBase, s.scheme = "https://"+controlAddr, "https"
-		s.watchClient = &http.Client{Transport: &http.Transport{TLSClientConfig: controlTLS, ForceAttemptHTTP2: true}}
+	case scaleTLS != nil:
+		s.scaleBase, s.scheme = "https://"+scaleAddr, "https"
+		s.watchClient = &http.Client{Transport: &http.Transport{TLSClientConfig: scaleTLS, ForceAttemptHTTP2: true}}
 		pt.DialTLSContext = func(ctx context.Context, _, addr string, _ *tls.Config) (net.Conn, error) {
 			d := &net.Dialer{}
-			raw, err := d.DialContext(ctx, "tcp", controlAddr)
+			raw, err := d.DialContext(ctx, "tcp", scaleAddr)
 			if err != nil {
 				return nil, err
 			}
-			tc := tls.Client(raw, controlTLS)
+			tc := tls.Client(raw, scaleTLS)
 			if err := tc.HandshakeContext(ctx); err != nil {
 				raw.Close()
 				return nil, err
@@ -80,23 +80,23 @@ func NewRemote(controlAddr string, controlTLS *tls.Config, cfg clustercfg.Placem
 			return tc, nil
 		}
 	default:
-		s.controlBase, s.scheme = "http://"+controlAddr, "http"
+		s.scaleBase, s.scheme = "http://"+scaleAddr, "http"
 		s.watchClient = &http.Client{Transport: &http.Transport{}}
 		pt.AllowHTTP = true
 		pt.DialTLSContext = func(ctx context.Context, _, _ string, _ *tls.Config) (net.Conn, error) {
-			return (&net.Dialer{}).DialContext(ctx, "tcp", controlAddr)
+			return (&net.Dialer{}).DialContext(ctx, "tcp", scaleAddr)
 		}
 	}
 	s.placeTr = pt
 	return s
 }
 
-// Start launches the node_list + group view-watch loops + the scaler-link
+// Start launches the node_list + group view-watch loops + the scale_link session
 // (background). node_list is low-frequency catalog data; hot load/budget is
 // validated by registry/node owner on the cold placement path.
 func (s *Service) Start(ctx context.Context) {
-	go s.subscribe(ctx, registry.ControlNodeListWatchPath, s.nodes)
-	go s.subscribe(ctx, registry.ControlGroupWatchPath, s.groups)
+	go s.subscribe(ctx, registry.ScaleLinkNodeListWatchPath, s.nodes)
+	go s.subscribe(ctx, registry.ScaleLinkGroupWatchPath, s.groups)
 	go s.runPlaceLink(ctx)
 }
 
@@ -134,7 +134,7 @@ func (s *Service) answer(req *routesync.PlaceReq) *routesync.PlaceResult {
 	return res
 }
 
-// runPlaceLink keeps the scaler-link alive (the registry's reverse-call channel),
+// runPlaceLink keeps the scale_link session alive (the registry's reverse-call channel),
 // reconnecting with capped backoff until ctx is cancelled.
 func (s *Service) runPlaceLink(ctx context.Context) {
 	backoff := 200 * time.Millisecond
@@ -153,7 +153,7 @@ func (s *Service) runPlaceLink(ctx context.Context) {
 	}
 }
 
-// placeSession runs one scaler-link: PUT the link (request body = place_result
+// placeSession runs one scale_link session: PUT the link (request body = place_result
 // stream up), read place_req down (response body), and answer each over the local
 // view. Full-duplex h2 (mirrors node-link, inverse roles: the registry commands).
 func (s *Service) placeSession(ctx context.Context) error {
@@ -161,7 +161,7 @@ func (s *Service) placeSession(ctx context.Context) error {
 	defer cancel()
 	pr, pw := io.Pipe()
 	defer pw.Close()
-	req, err := http.NewRequestWithContext(sctx, http.MethodPut, s.controlBase+routesync.ScalerLinkPath, pr)
+	req, err := http.NewRequestWithContext(sctx, http.MethodPut, s.scaleBase+routesync.ScaleLinkPath, pr)
 	if err != nil {
 		return err
 	}
@@ -246,7 +246,7 @@ func keyAllocation(group string, nodes []*registry.NodeRecord, selectors []map[s
 	return effective, nodeIDs
 }
 
-// subscribe keeps a view synced from the registry control watch, reconnecting with
+// subscribe keeps a view synced from registry scale_link, reconnecting with
 // capped backoff and resuming from the last applied rev (mirrors the router).
 func (s *Service) subscribe(ctx context.Context, path string, sink viewSink) {
 	backoff := 200 * time.Millisecond
@@ -268,7 +268,7 @@ func (s *Service) subscribe(ctx context.Context, path string, sink viewSink) {
 }
 
 func (s *Service) subscribeOnce(ctx context.Context, path string, fromRev int64, sink viewSink) (int64, error) {
-	u := fmt.Sprintf("%s%s?from_rev=%d", s.controlBase, path, fromRev)
+	u := fmt.Sprintf("%s%s?from_rev=%d", s.scaleBase, path, fromRev)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return fromRev, err

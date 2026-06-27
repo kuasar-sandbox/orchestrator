@@ -13,11 +13,11 @@ import (
 )
 
 // Node/group view watches are low-frequency control-plane streams for scaler
-// views. Router does not subscribe to route watches. node_list is projected from
+// views. Router does not subscribe to a global route stream. node_list is projected from
 // node_link quorum state; group values are projected to strip sealed secrets.
 const (
-	ControlNodeListWatchPath = "/control/watch-node-list" // scaler WATCH_LIST
-	ControlGroupWatchPath    = "/control/watch-groups"
+	ScaleLinkNodeListWatchPath = "/scale-link/watch-node-list" // scaler node_list WATCH_LIST
+	ScaleLinkGroupWatchPath    = "/scale-link/watch-groups"
 )
 
 // ViewEvent is one frame on a view watch ([4B LE len][ViewEvent]); Value is the
@@ -89,6 +89,14 @@ func (r *Registry) serveNodeListWatch(w http.ResponseWriter, req *http.Request) 
 
 func (r *Registry) serveGroupWatch(w http.ResponseWriter, req *http.Request) {
 	r.viewStream(w, req, groupPrefix, projectGroupView)
+}
+
+// ServeScaleLink mounts the scaler-facing scale_link API: node_list WATCH_LIST,
+// group placement view, and the full-duplex scale_link session (registered by the
+// cluster-ctl registry command).
+func (r *Registry) ServeScaleLink(mux *http.ServeMux) {
+	mux.HandleFunc(ScaleLinkNodeListWatchPath, r.serveNodeListWatch)
+	mux.HandleFunc(ScaleLinkGroupWatchPath, r.serveGroupWatch)
 }
 
 // projectGroupView strips sealed secrets before a group goes to a subscriber.

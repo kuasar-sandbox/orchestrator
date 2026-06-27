@@ -8,7 +8,7 @@ import (
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/routesync"
 )
 
-// nodeChannel is the registry's per-node channel handle: it writes commands to
+// nodeChannel is the registry's per-node node_link handle: it writes commands to
 // the node on the h2c response body (serialized). It implements nodeConn.
 type nodeChannel struct {
 	nodeID string
@@ -57,7 +57,7 @@ func (r *Registry) ServeNodeLink(w http.ResponseWriter, req *http.Request) {
 
 	conn := &nodeChannel{nodeID: nr.NodeID, w: w, flush: flusher.Flush}
 
-	// Write Hello BEFORE exposing the channel. Once addNode/onNodeConnected run, a
+	// Write Hello BEFORE exposing the node_link. Once addNode/onNodeConnected run, a
 	// concurrent reconcileKeys can conn.send() on this same h2 stream (under
 	// nodeChannel.mu); a bare Hello write after that would race it and interleave
 	// frames. Hello goes out first, while this is still the only writer.

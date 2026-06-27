@@ -8,11 +8,12 @@ e2b 兼容沙箱平台的**节点主机**与**集群控制面**,两个二进制�
   (沙箱准入、内存预算分配、主动回收,把固定虚拟规格下的物理密度推到单节点 3,000+ 沙箱),
   以及 **node-link 客户端**(接入集群)。既可独立运行,也可经 node-link 交由 cluster-ctl 编排。
 - **`cluster-ctl`**(集群)——面向大规模部署的控制面,把机群里数千个 `node-ctl` 聚合成一个
-  逻辑沙箱池,**三角色均为独立进程**(无同进程内存模式):**registry**(持久状态权威 + 节点通道
+  逻辑沙箱池,**三角色均为独立进程**(无同进程内存模式):**registry**(状态权威 + 节点通道
   枢纽 + 租户密钥分发)、**router**(集群级数据面入口,按 sandbox-group + route-key 会话亲和
-  转发)、**scaler**(独立进程,拨 registry、订阅视图,经 scaler-link 反向应答 P2C 放置建议)。
+  转发)、**scaler**(独立进程,拨 registry `scale_link`、订阅视图,反向应答 P2C 放置建议)。
   沙箱按需创建 / 恢复 / 迁移,空闲下沉到节点本机快照乃至远程快照(可移植、不绑节点)。registry
-  后端可插拔(**sqlite → etcd → raft**,持久无内存模式),sandbox-group 为天然分区键。
+  自身按 sandbox-group 分片复制状态;整套 registry 完全下电后不自动恢复运行中沙箱,可通过
+  group/route 导入导出支持外部持久化和灾难恢复。
 
 是 [kuasar-sandbox](https://github.com/kuasar-sandbox/kuasar-sandbox) 平台的北向入口、节点
 资源仲裁与集群编排器,独立演进。两类沙箱 profile:**e2b**(guest 内 envd,完整数据面)与
@@ -60,10 +61,10 @@ node-ctl manifest-key add "$MK" --label tenant-a
 export E2B_API_KEY=$(e2b-key-ctl gen-apikey "$MK")
 
 # 启动节点 daemon(必填仅 api.domain + encryption_key;骨架: node-ctl config serve --template)
-# serve.yaml 内联 resource_listen 即内置资源控制器;配 cluster.registry 即接入集群
+# serve.yaml 内联 resource_listen 即内置资源控制器;配 cluster.node_link 即接入集群
 node-ctl serve --config /etc/node-ctl/serve.yaml
 
-# 可选:集群控制面——三角色各为独立进程、各自配置文件(registry 持久 sqlite;router/scaler 拨 registry control_api)
+# 可选:集群控制面——三角色各为独立进程、各自配置文件
 cluster-ctl registry --config /etc/cluster-ctl/registry.yaml
 cluster-ctl router   --config /etc/cluster-ctl/router.yaml
 cluster-ctl scaler   --config /etc/cluster-ctl/scaler.yaml
