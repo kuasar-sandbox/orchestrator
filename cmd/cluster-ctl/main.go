@@ -3,7 +3,7 @@
 //	cluster-ctl registry  --config <registry.yaml>   # state authority + node_link hub
 //	cluster-ctl router    --config <router.yaml>     # e2b-compatible unified ingress
 //	cluster-ctl scaler    --config <scaler.yaml>     # placement scheduler
-//	cluster-ctl sandbox-group <upsert|get> ...           # sandbox-group config admin
+//	cluster-ctl scaler import --config <scaler.yaml> -i groups.jsonl
 //	cluster-ctl config <registry|router|scaler> [--template|--config <f>|--resolve]  # config diagnose / generate
 //	cluster-ctl version
 //
@@ -31,8 +31,6 @@ func main() {
 		err = runRouter(os.Args[2:], log)
 	case "scaler":
 		err = runScaler(os.Args[2:], log)
-	case "sandbox-group":
-		err = sandboxGroupCmd(os.Args[2:])
 	case "config":
 		err = configCmd(os.Args[2:])
 	case "version", "-v", "--version":
@@ -47,6 +45,6 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: cluster-ctl {registry|router|scaler|sandbox-group|config|version} [flags]")
+	fmt.Fprintln(os.Stderr, "usage: cluster-ctl {registry|router|scaler|config|version} [flags]")
 	os.Exit(2)
 }

@@ -18,12 +18,18 @@ type NodeReplica interface {
 	Keys(ctx context.Context) []string
 }
 
+type NodeReplicaSlot struct {
+	ID      string
+	Replica NodeReplica
+}
+
 // NodeQuorum is the leaderless node_link write protocol over a node owner set.
 // It mirrors RouteQuorum: unique ballots, prepare/accept, read-repair, and
 // tombstones for deletes so a lagging owner cannot resurrect a removed node.
 type NodeQuorum struct {
 	writer   string
-	replicas []NodeReplica
+	replicas []nodeReplicaSlot
+	sets     []quorumSet
 	mu       sync.Mutex
 	rounds   map[string]uint64
 }
@@ -32,40 +38,53 @@ func NewNodeQuorum(writer string, replicas ...NodeReplica) *NodeQuorum {
 	if writer == "" {
 		writer = "local"
 	}
-	return &NodeQuorum{writer: writer, replicas: replicas, rounds: map[string]uint64{}}
+	slots := make([]NodeReplicaSlot, 0, len(replicas))
+	owners := make([]string, 0, len(replicas))
+	for i, rep := range replicas {
+		id := replicaIndexID(i)
+		slots = append(slots, NodeReplicaSlot{ID: id, Replica: rep})
+		owners = append(owners, id)
+	}
+	return NewNodeJointQuorum(writer, slots, [][]string{owners})
 }
 
-func (q *NodeQuorum) quorum() int { return len(q.replicas)/2 + 1 }
+func NewNodeJointQuorum(writer string, slots []NodeReplicaSlot, ownerSets [][]string) *NodeQuorum {
+	if writer == "" {
+		writer = "local"
+	}
+	reps, sets := buildNodeQuorumSets(slots, ownerSets)
+	return &NodeQuorum{writer: writer, replicas: reps, sets: sets, rounds: map[string]uint64{}}
+}
 
 func (q *NodeQuorum) Get(ctx context.Context, nodeID string) (NodeRecord, bool, error) {
 	ballot := q.nextBallot(ctx, nodeID)
 	reads := make([]nodeRead, 0, len(q.replicas))
-	prepared := make([]NodeReplica, 0, len(q.replicas))
-	for _, r := range q.replicas {
-		rec, found, ok, err := r.Prepare(ctx, nodeID, ballot)
+	prepared := map[int]bool{}
+	for i, r := range q.replicas {
+		rec, found, ok, err := r.replica.Prepare(ctx, nodeID, ballot)
 		if err != nil || !ok {
 			continue
 		}
-		prepared = append(prepared, r)
+		prepared[i] = true
 		reads = append(reads, nodeRead{rec: rec, found: found})
 	}
-	if len(prepared) < q.quorum() {
+	if !satisfiesQuorumSets(prepared, q.sets) {
 		return NodeRecord{}, false, ErrQuorum
 	}
 	best, found := highestNode(reads)
 	if found {
 		best.Meta.Ballot = ballot
-		accepted := 0
-		for _, r := range prepared {
-			if ok, _ := r.Accept(ctx, nodeID, best, ballot); ok {
-				accepted++
+		accepted := map[int]bool{}
+		for i := range prepared {
+			if ok, _ := q.replicas[i].replica.Accept(ctx, nodeID, best, ballot); ok {
+				accepted[i] = true
 			}
 		}
-		if accepted < q.quorum() {
+		if !satisfiesQuorumSets(accepted, q.sets) {
 			return NodeRecord{}, false, ErrQuorum
 		}
 		for _, r := range q.replicas {
-			_ = r.Repair(ctx, nodeID, best)
+			_ = r.replica.Repair(ctx, nodeID, best)
 		}
 	}
 	if found && best.State == NodeDead {
@@ -77,7 +96,7 @@ func (q *NodeQuorum) Get(ctx context.Context, nodeID string) (NodeRecord, bool, 
 func (q *NodeQuorum) List(ctx context.Context, fn func(NodeRecord) error) error {
 	keys := map[string]bool{}
 	for _, r := range q.replicas {
-		for _, key := range r.Keys(ctx) {
+		for _, key := range r.replica.Keys(ctx) {
 			keys[key] = true
 		}
 	}
@@ -104,16 +123,16 @@ func (q *NodeQuorum) List(ctx context.Context, fn func(NodeRecord) error) error 
 func (q *NodeQuorum) CAS(ctx context.Context, nodeID string, expectRev uint64, propose NodeProposal) (NodeRecord, error) {
 	ballot := q.nextBallot(ctx, nodeID)
 	reads := make([]nodeRead, 0, len(q.replicas))
-	prepared := make([]NodeReplica, 0, len(q.replicas))
-	for _, r := range q.replicas {
-		rec, found, ok, err := r.Prepare(ctx, nodeID, ballot)
+	prepared := map[int]bool{}
+	for i, r := range q.replicas {
+		rec, found, ok, err := r.replica.Prepare(ctx, nodeID, ballot)
 		if err != nil || !ok {
 			continue
 		}
-		prepared = append(prepared, r)
+		prepared[i] = true
 		reads = append(reads, nodeRead{rec: rec, found: found})
 	}
-	if len(prepared) < q.quorum() {
+	if !satisfiesQuorumSets(prepared, q.sets) {
 		return NodeRecord{}, ErrQuorum
 	}
 	cur, physicalFound := highestNode(reads)
@@ -138,32 +157,32 @@ func (q *NodeQuorum) CAS(ctx context.Context, nodeID string, expectRev uint64, p
 			NodeID: nodeID,
 			State:  NodeDead,
 		}
-		accepted := 0
-		for _, r := range prepared {
-			if ok, _ := r.Accept(ctx, nodeID, tombstone, ballot); ok {
-				accepted++
+		accepted := map[int]bool{}
+		for i := range prepared {
+			if ok, _ := q.replicas[i].replica.Accept(ctx, nodeID, tombstone, ballot); ok {
+				accepted[i] = true
 			}
 		}
-		if accepted < q.quorum() {
+		if !satisfiesQuorumSets(accepted, q.sets) {
 			return NodeRecord{}, ErrQuorum
 		}
 		for _, r := range q.replicas {
-			_ = r.Repair(ctx, nodeID, tombstone)
+			_ = r.replica.Repair(ctx, nodeID, tombstone)
 		}
 		return NodeRecord{}, nil
 	}
 	next.Meta = RecordMeta{Ballot: ballot, Rev: cur.Meta.Rev + 1, UpdatedAt: time.Now()}
-	accepted := 0
-	for _, r := range prepared {
-		if ok, _ := r.Accept(ctx, nodeID, next, ballot); ok {
-			accepted++
+	accepted := map[int]bool{}
+	for i := range prepared {
+		if ok, _ := q.replicas[i].replica.Accept(ctx, nodeID, next, ballot); ok {
+			accepted[i] = true
 		}
 	}
-	if accepted < q.quorum() {
+	if !satisfiesQuorumSets(accepted, q.sets) {
 		return NodeRecord{}, ErrQuorum
 	}
 	for _, r := range q.replicas {
-		_ = r.Repair(ctx, nodeID, next)
+		_ = r.replica.Repair(ctx, nodeID, next)
 	}
 	return next, nil
 }
@@ -171,7 +190,7 @@ func (q *NodeQuorum) CAS(ctx context.Context, nodeID string, expectRev uint64, p
 func (q *NodeQuorum) nextBallot(ctx context.Context, nodeID string) Ballot {
 	var max Ballot
 	for _, r := range q.replicas {
-		if b, err := r.MaxBallot(ctx, nodeID); err == nil && max.Less(b) {
+		if b, err := r.replica.MaxBallot(ctx, nodeID); err == nil && max.Less(b) {
 			max = b
 		}
 	}
@@ -183,6 +202,55 @@ func (q *NodeQuorum) nextBallot(ctx context.Context, nodeID string) Ballot {
 	next := max.Round + 1
 	q.rounds[nodeID] = next
 	return Ballot{Round: next, Writer: q.writer}
+}
+
+type nodeReplicaSlot struct {
+	id      string
+	replica NodeReplica
+}
+
+func buildNodeQuorumSets(slots []NodeReplicaSlot, ownerSets [][]string) ([]nodeReplicaSlot, []quorumSet) {
+	reps := make([]nodeReplicaSlot, 0, len(slots))
+	byID := map[string]int{}
+	for i, slot := range slots {
+		if slot.Replica == nil {
+			continue
+		}
+		id := slot.ID
+		if id == "" {
+			id = replicaIndexID(i)
+		}
+		if _, ok := byID[id]; ok {
+			continue
+		}
+		byID[id] = len(reps)
+		reps = append(reps, nodeReplicaSlot{id: id, replica: slot.Replica})
+	}
+	sets := make([]quorumSet, 0, len(ownerSets))
+	for _, owners := range ownerSets {
+		seen := map[int]bool{}
+		var indices []int
+		for _, id := range owners {
+			idx, ok := byID[id]
+			if !ok || seen[idx] {
+				continue
+			}
+			seen[idx] = true
+			indices = append(indices, idx)
+		}
+		if len(indices) == 0 {
+			continue
+		}
+		sets = append(sets, quorumSet{indices: indices, quorum: len(indices)/2 + 1})
+	}
+	if len(sets) == 0 && len(reps) != 0 {
+		indices := make([]int, len(reps))
+		for i := range reps {
+			indices[i] = i
+		}
+		sets = append(sets, quorumSet{indices: indices, quorum: len(indices)/2 + 1})
+	}
+	return reps, sets
 }
 
 type nodeRead struct {

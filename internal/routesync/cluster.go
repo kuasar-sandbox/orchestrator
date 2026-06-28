@@ -13,46 +13,51 @@ const (
 	TypeHeartbeat    = "heartbeat"     // node -> registry (water level)
 	TypeCommand      = "command"       // registry -> node (lifecycle / key primitive)
 	TypeCmdAck       = "cmd_ack"       // node -> registry (command accepted / rejected)
-	// Scaler-link (cluster.md §5.2): the scaler DIALS the registry (no scaler
-	// listen); the registry reverse-requests placement down, the scaler answers up.
-	TypePlaceReq      = "place_req"      // registry -> scaler (place this sandbox)
-	TypePlaceResult   = "place_result"   // scaler -> registry (suggested node, or no_node)
-	TypeSelectorPatch = "selector_patch" // scaler -> registry (key allocation / shuffle-effective selectors, §7.6)
 )
 
-// NodeLinkPath / ScaleLinkPath are the HTTP paths node-ctl serve / cluster-ctl
-// scaler dial to open their full-duplex channels to the registry (h2c/h2).
-const (
-	NodeLinkPath  = "/node-link/session"
-	ScaleLinkPath = "/scale-link/session"
-)
+// NodeLinkPath is the HTTP path node-ctl serve dials to open its node_link
+// channel to the registry.
+const NodeLinkPath = "/node-link/session"
 
-// PlaceReq is a registry placement request to the scaler (cluster.md §5.2/§7.5).
+// PlaceReq is a registry placement request to the scaler.
 // TargetRuntimeDigest lets the scaler require a matching guest runtime; empty
 // means no runtime constraint.
 type PlaceReq struct {
-	ReqID               string `json:"req_id"`
-	Group               string `json:"group"`
-	RouteKey            string `json:"route_key"`
-	Build               bool   `json:"build,omitempty"` // a build placement (resource-aware, §4.5)
-	TargetRuntimeDigest string `json:"target_runtime,omitempty"`
+	ReqID               string            `json:"req_id"`
+	Group               string            `json:"group"`
+	RouteKey            string            `json:"route_key"`
+	SandboxID           string            `json:"sandbox_id,omitempty"`
+	Config              map[string]string `json:"config,omitempty"`
+	Build               bool              `json:"build,omitempty"` // a build placement (resource-aware, §4.5)
+	TargetRuntimeDigest string            `json:"target_runtime,omitempty"`
 }
 
 // PlaceResult is the scaler's answer (NodeID set, or NoNode when nothing eligible).
 type PlaceResult struct {
-	ReqID  string `json:"req_id"`
-	NodeID string `json:"node_id,omitempty"`
-	NoNode bool   `json:"no_node,omitempty"`
+	ReqID          string            `json:"req_id"`
+	NodeID         string            `json:"node_id,omitempty"`
+	NoNode         bool              `json:"no_node,omitempty"`
+	Error          string            `json:"error,omitempty"`
+	TemplateRef    string            `json:"template_ref,omitempty"`
+	Config         map[string]string `json:"config,omitempty"`
+	KeyFingerprint string            `json:"key_fp,omitempty"`
+	AccessToken    string            `json:"access_token,omitempty"`
+	ImageRepo      string            `json:"image_repo,omitempty"`
+	RegistryAuth   string            `json:"registry_auth,omitempty"`
 }
 
 // SelectorPatch is the scaler's key allocation for a group. NodeIDs is the
 // explicit node set that should hold the group's manifest key; Selectors carries
 // the shuffle-effective selector projection.
 type SelectorPatch struct {
-	Group          string              `json:"group"`
-	Selectors      []map[string]string `json:"selectors"`
-	NodeIDs        []string            `json:"node_ids,omitempty"`
-	NodeAllocation bool                `json:"node_allocation,omitempty"`
+	Group           string              `json:"group"`
+	Selectors       []map[string]string `json:"selectors"`
+	NodeIDs         []string            `json:"node_ids,omitempty"`
+	NodeAllocation  bool                `json:"node_allocation,omitempty"`
+	KeyFingerprint  string              `json:"key_fp,omitempty"`
+	ManifestKeyType string              `json:"manifest_key_type,omitempty"`
+	ManifestKey     string              `json:"manifest_key,omitempty"`
+	ManifestKeyRef  string              `json:"manifest_key_ref,omitempty"`
 }
 
 // Command kinds (Command.Kind) — the lifecycle + key primitives the registry

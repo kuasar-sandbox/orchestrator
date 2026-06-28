@@ -2,10 +2,7 @@ package registry
 
 import (
 	"context"
-	"fmt"
 	"time"
-
-	clusterstate "github.com/kuasar-sandbox/sandbox-orchestrator/internal/cluster"
 )
 
 // Key distribution (cluster.md §7.6): the registry predistributes each group's
@@ -26,8 +23,15 @@ type keyLeaseState struct {
 }
 
 type keyOp struct {
-	nodeID, fp, manifestKey string
-	drop                    bool
+	nodeID, fp, keyType, keyValue string
+	drop                          bool
+}
+
+type keyAllocationState struct {
+	fp       string
+	keyType  string
+	keyValue string
+	nodes    map[string]bool
 }
 
 // RunKeyDistributor reconciles key leases on start, then every renew interval,
@@ -70,53 +74,29 @@ func (r *Registry) onNodeConnected() {
 func (r *Registry) reconcileKeys(ctx context.Context) {
 	expires := time.Now().Add(keyLeaseTTL).Unix()
 	var ops []keyOp
-	seen := map[string]bool{}
-	importErr := r.rangeImportedGroups(ctx, func(group string) error {
-		seen[group] = true
-		manifestKey, found, err := r.inlineManifestKey(ctx, group)
-		if err != nil {
-			r.log.Warn("registry: manifest key unavailable for distribution", "group", group, "err", err)
+	allocs := r.keyAllocations()
+	for group, alloc := range allocs {
+		if alloc.fp == "" || alloc.keyValue == "" {
 			r.dropGroupKeyLeases(group, &ops)
-			return nil
+			continue
 		}
-		if !found || manifestKey == "" {
-			r.dropGroupKeyLeases(group, &ops)
-			return nil
-		}
-		fp := keyFingerprint(manifestKey)
-		want := r.allocationSet(ctx, group)
+		want := r.liveAllocationSet(alloc.nodes)
 		r.keyMu.Lock()
 		have := r.keyLeased[group]
-		if have.fp != "" && have.fp != fp {
+		if have.fp != "" && have.fp != alloc.fp {
 			for nodeID := range have.nodes {
 				ops = append(ops, keyOp{nodeID: nodeID, fp: have.fp, drop: true})
 			}
 		}
 		for nodeID := range want {
-			ops = append(ops, keyOp{nodeID: nodeID, fp: fp, manifestKey: manifestKey})
+			ops = append(ops, keyOp{nodeID: nodeID, fp: alloc.fp, keyType: alloc.keyType, keyValue: alloc.keyValue})
 		}
 		for nodeID := range have.nodes {
-			if have.fp == fp && !want[nodeID] {
+			if have.fp == alloc.fp && !want[nodeID] {
 				ops = append(ops, keyOp{nodeID: nodeID, fp: have.fp, drop: true})
 			}
 		}
-		r.keyLeased[group] = keyLeaseState{fp: fp, nodes: want}
-		r.keyMu.Unlock()
-		return nil
-	})
-	if importErr != nil {
-		r.log.Warn("registry: group import failed during key reconcile", "err", importErr)
-	} else {
-		r.keyMu.Lock()
-		for group, have := range r.keyLeased {
-			if seen[group] {
-				continue
-			}
-			for nodeID := range have.nodes {
-				ops = append(ops, keyOp{nodeID: nodeID, fp: have.fp, drop: true})
-			}
-			delete(r.keyLeased, group)
-		}
+		r.keyLeased[group] = keyLeaseState{fp: alloc.fp, nodes: want}
 		r.keyMu.Unlock()
 	}
 	for _, o := range ops {
@@ -126,48 +106,9 @@ func (r *Registry) reconcileKeys(ctx context.Context) {
 		if o.drop {
 			_ = r.nodeOwner.DropManifestKey(ctx, o.nodeID, o.fp)
 		} else {
-			_ = r.nodeOwner.PutManifestKey(ctx, o.nodeID, o.fp, o.manifestKey, expires)
+			_ = r.nodeOwner.PutManifestKey(ctx, o.nodeID, o.fp, o.keyType, o.keyValue, expires)
 		}
 	}
-}
-
-func (r *Registry) rangeImportedGroups(ctx context.Context, fn func(string) error) error {
-	if r.groupImporter == nil {
-		return fmt.Errorf("registry: sandbox group importer is not configured")
-	}
-	cursor := ""
-	for {
-		page, err := r.groupImporter.Range(ctx, cursor, 1024)
-		if err != nil {
-			return err
-		}
-		for _, group := range page.Groups {
-			if group == "" {
-				continue
-			}
-			if err := fn(group); err != nil {
-				return err
-			}
-		}
-		if page.NextCursor == "" {
-			return nil
-		}
-		if page.NextCursor == cursor {
-			return fmt.Errorf("registry: sandbox group importer did not advance cursor %q", cursor)
-		}
-		cursor = page.NextCursor
-	}
-}
-
-func (r *Registry) inlineManifestKey(ctx context.Context, group string) (string, bool, error) {
-	k, found, err := r.groupProvider.GetKey(ctx, group)
-	if err != nil || !found || k.Value == "" {
-		return "", found, err
-	}
-	if k.Type != "" && k.Type != clusterstate.SecretInline {
-		return "", true, fmt.Errorf("typed manifest_key %q requires out-of-band node delivery", k.Type)
-	}
-	return k.Value, true, nil
 }
 
 func (r *Registry) dropGroupKeyLeases(group string, ops *[]keyOp) {
@@ -181,35 +122,13 @@ func (r *Registry) dropGroupKeyLeases(group string, ops *[]keyOp) {
 	}
 }
 
-// allocationSet returns the manifest-key recipients. The scaler-owned explicit
-// allocation is authoritative once present; local selector matching is used only
-// for size-1/bootstrap operation before the scaler pushes allocation.
-func (r *Registry) allocationSet(ctx context.Context, group string) map[string]bool {
-	if alloc, ok := r.keyAllocation(group); ok {
-		set := map[string]bool{}
-		for nodeID := range alloc {
-			if _, live := r.node(nodeID); live {
-				set[nodeID] = true
-			}
-		}
-		return set
-	}
-	var selectors []map[string]string
-	if hint, ok, err := r.groupProvider.GetPlacementHint(ctx, group); err != nil {
-		r.log.Warn("registry: placement hint unavailable during key reconcile", "group", group, "err", err)
-	} else if ok {
-		selectors = hint.NodeSelectors
-	}
-	if eff, ok := r.effectiveSelectors(group); ok {
-		selectors = eff
-	}
+func (r *Registry) liveAllocationSet(nodes map[string]bool) map[string]bool {
 	set := map[string]bool{}
-	_ = r.stores.RangeNodes(ctx, func(n *NodeRecord) error {
-		if _, live := r.node(n.NodeID); live && matchAnySelector(n.Labels, selectors) {
-			set[n.NodeID] = true
+	for nodeID := range nodes {
+		if _, live := r.node(nodeID); live {
+			set[nodeID] = true
 		}
-		return nil
-	})
+	}
 	return set
 }
 

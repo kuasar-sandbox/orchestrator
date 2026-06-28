@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/binary"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -18,116 +17,52 @@ import (
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
 
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/apikey"
 	clusterstate "github.com/kuasar-sandbox/sandbox-orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/clusterstore"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/routesync"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/secretbox"
 )
 
 func testRegWithBox(t *testing.T) *Registry {
 	t.Helper()
 	kv := clusterstore.OpenMemory(0)
 	t.Cleanup(func() { kv.Close() })
-	box, err := secretbox.NewFromColonHex("0000000000000000000000000000000000000000000000000000000000000001")
-	if err != nil {
-		t.Fatalf("box: %v", err)
-	}
-	return New(NewStores(kv, box), nil, 5*time.Second, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	return New(NewStores(kv), nil, 5*time.Second, slog.New(slog.NewTextHandler(io.Discard, nil)))
 }
 
 const testMK = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
 const testAuthKey = "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100"
 
-type authOnlyProvider struct{}
+type placementFunc func(context.Context, PlaceRequest) (*Placement, error)
 
-func (authOnlyProvider) Get(context.Context, string) (clusterstate.SandboxGroup, bool, error) {
-	return clusterstate.SandboxGroup{}, true, nil
+func (f placementFunc) Place(ctx context.Context, req PlaceRequest) (*Placement, error) {
+	return f(ctx, req)
 }
 
-func (authOnlyProvider) GetPlacementHint(context.Context, string) (clusterstate.PlacementHint, bool, error) {
-	return clusterstate.PlacementHint{}, true, nil
-}
-
-func (authOnlyProvider) GetKey(context.Context, string) (clusterstate.Secret, bool, error) {
-	return clusterstate.Secret{Type: clusterstate.SecretInline, Value: testMK}, true, nil
-}
-
-func (authOnlyProvider) GetAuthKey(context.Context, string) (clusterstate.Secret, bool, error) {
-	return clusterstate.Secret{Type: clusterstate.SecretInline, Value: testAuthKey}, true, nil
-}
-
-type failingAuthProvider struct{ authOnlyProvider }
-
-func (failingAuthProvider) GetAuthKey(context.Context, string) (clusterstate.Secret, bool, error) {
-	return clusterstate.Secret{}, false, context.Canceled
-}
-
-type refKeyProvider struct{ authOnlyProvider }
-
-func (refKeyProvider) GetKey(context.Context, string) (clusterstate.Secret, bool, error) {
-	return clusterstate.Secret{Type: clusterstate.SecretRef, Value: "manifest-ref"}, true, nil
-}
-
-func (refKeyProvider) GetAuthKey(context.Context, string) (clusterstate.Secret, bool, error) {
-	return clusterstate.Secret{Type: clusterstate.SecretRef, Value: "auth-ref"}, true, nil
-}
-
-type mapSecretResolver map[string]string
-
-func (m mapSecretResolver) ResolveSecret(ctx context.Context, kind string, s clusterstate.Secret) (string, error) {
-	if s.Type == "" || s.Type == clusterstate.SecretInline {
-		return s.Value, nil
-	}
-	return m[s.Value], nil
-}
-
-type fullGroupProvider struct{ authOnlyProvider }
-
-func (fullGroupProvider) Get(context.Context, string) (clusterstate.SandboxGroup, bool, error) {
-	return clusterstate.SandboxGroup{
-		Group: "/g", Config: map[string]string{"a": "1"}, TemplateRef: "e2b-snp-tmpl",
-		ImageRepo: "repo", RegistryAuth: clusterstate.Secret{Type: clusterstate.SecretInline, Value: "auth-json"},
-	}, true, nil
-}
-
-type providerBackedGroups struct {
-	groups    []string
-	key       string
-	selectors []map[string]string
-}
-
-func (p *providerBackedGroups) Range(context.Context, string, int) (clusterstate.GroupPage, error) {
-	return clusterstate.GroupPage{Groups: append([]string(nil), p.groups...)}, nil
-}
-
-func (p *providerBackedGroups) Get(context.Context, string) (clusterstate.SandboxGroup, bool, error) {
-	return clusterstate.SandboxGroup{Group: "/g"}, true, nil
-}
-
-func (p *providerBackedGroups) GetPlacementHint(context.Context, string) (clusterstate.PlacementHint, bool, error) {
-	return clusterstate.PlacementHint{NodeSelectors: p.selectors}, true, nil
-}
-
-func (p *providerBackedGroups) GetKey(context.Context, string) (clusterstate.Secret, bool, error) {
-	if p.key == "" {
-		return clusterstate.Secret{}, false, nil
-	}
-	return clusterstate.Secret{Type: clusterstate.SecretInline, Value: p.key}, true, nil
-}
-
-func (p *providerBackedGroups) GetAuthKey(context.Context, string) (clusterstate.Secret, bool, error) {
-	return clusterstate.Secret{Type: clusterstate.SecretInline, Value: testAuthKey}, true, nil
+func placementWithToken(nodeID string) Placer {
+	return placementFunc(func(ctx context.Context, req PlaceRequest) (*Placement, error) {
+		tok := ""
+		if req.SandboxID != "" {
+			var err error
+			tok, err = clusterstate.DeriveAccessToken(testAuthKey, req.SandboxID)
+			if err != nil {
+				return nil, err
+			}
+		}
+		return &Placement{
+			NodeID: nodeID, TemplateRef: "e2b-snp-tmpl", Config: mergeConfig(map[string]string{"a": "1"}, req.Config),
+			KeyFingerprint: keyFingerprint(testMK), AccessToken: tok, ImageRepo: "repo", RegistryAuth: "auth-json",
+		}, nil
+	})
 }
 
 func TestKeyPredistribution(t *testing.T) {
 	ctx := context.Background()
 	reg := testRegWithBox(t)
-	reg.stores.PutGroup(ctx, &GroupConfig{Group: "/g", ManifestKey: testMK})
 	reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1", Labels: map[string]string{"zone": "east"}})
 	var cmds []*routesync.Command
 	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(c *routesync.Command) { cmds = append(cmds, c) }})
 
+	pushKeyAllocation(reg, "/g", []string{"n1"}, testMK)
 	reg.reconcileKeys(ctx)
 
 	if len(cmds) != 1 || cmds[0].Kind != routesync.CmdKeyPut || cmds[0].ManifestKey != testMK {
@@ -138,32 +73,31 @@ func TestKeyPredistribution(t *testing.T) {
 func TestKeyDropOnLeave(t *testing.T) {
 	ctx := context.Background()
 	reg := testRegWithBox(t)
-	reg.stores.PutGroup(ctx, &GroupConfig{Group: "/g", ManifestKey: testMK, NodeSelectors: []map[string]string{{"zone": "east"}}})
 	reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1", Labels: map[string]string{"zone": "east"}})
 	var cmds []*routesync.Command
 	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(c *routesync.Command) { cmds = append(cmds, c) }})
 
-	reg.reconcileKeys(ctx) // n1 matches the selector → key_put
-	reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1", Labels: map[string]string{"zone": "west"}})
+	pushKeyAllocation(reg, "/g", []string{"n1"}, testMK)
+	reg.reconcileKeys(ctx)
+	pushKeyAllocation(reg, "/g", nil, "")
 	cmds = nil
-	reg.reconcileKeys(ctx) // n1 left the set → key_drop
+	reg.reconcileKeys(ctx)
 
 	if len(cmds) != 1 || cmds[0].Kind != routesync.CmdKeyDrop {
-		t.Fatalf("expected one key_drop after the node left the allocation set, got %+v", cmds)
+		t.Fatalf("expected one key_drop after the scaler removed allocation, got %+v", cmds)
 	}
 }
 
 func TestKeyDistributionUsesScalerAllocation(t *testing.T) {
 	ctx := context.Background()
 	reg := testRegWithBox(t)
-	reg.stores.PutGroup(ctx, &GroupConfig{Group: "/g", ManifestKey: testMK, NodeSelectors: []map[string]string{{"zone": "east"}}})
 	reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1", Labels: map[string]string{"zone": "east"}})
 	reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n2", Labels: map[string]string{"zone": "west"}})
 	cmds := map[string][]*routesync.Command{}
 	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(c *routesync.Command) { cmds["n1"] = append(cmds["n1"], c) }})
 	reg.addNode(&fakeConn{nodeID: "n2", onCmd: func(c *routesync.Command) { cmds["n2"] = append(cmds["n2"], c) }})
 
-	reg.applySelectorPatch(&routesync.SelectorPatch{Group: "/g", NodeIDs: []string{"n2"}, NodeAllocation: true})
+	pushKeyAllocation(reg, "/g", []string{"n2"}, testMK)
 	reg.reconcileKeys(ctx)
 
 	if len(cmds["n1"]) != 0 {
@@ -174,76 +108,35 @@ func TestKeyDistributionUsesScalerAllocation(t *testing.T) {
 	}
 
 	cmds = map[string][]*routesync.Command{}
-	reg.applySelectorPatch(&routesync.SelectorPatch{Group: "/g", NodeAllocation: true})
+	pushKeyAllocation(reg, "/g", nil, "")
 	reg.reconcileKeys(ctx)
 	if len(cmds["n2"]) != 1 || cmds["n2"][0].Kind != routesync.CmdKeyDrop {
 		t.Fatalf("empty scaler allocation should drop n2 key, commands=%+v", cmds["n2"])
 	}
 }
 
-func TestKeyDistributionUsesSandboxGroupProviderImporter(t *testing.T) {
-	ctx := context.Background()
-	reg := testReg(t)
-	src := &providerBackedGroups{
-		groups:    []string{"/g"},
-		key:       testMK,
-		selectors: []map[string]string{{"zone": "east"}},
-	}
-	reg.SetSandboxGroupProvider(src)
-	reg.SetSandboxGroupImporter(src)
-	reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1", Labels: map[string]string{"zone": "east"}})
-	reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n2", Labels: map[string]string{"zone": "west"}})
-	cmds := map[string][]*routesync.Command{}
-	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(c *routesync.Command) { cmds["n1"] = append(cmds["n1"], c) }})
-	reg.addNode(&fakeConn{nodeID: "n2", onCmd: func(c *routesync.Command) { cmds["n2"] = append(cmds["n2"], c) }})
-
-	reg.reconcileKeys(ctx)
-	if len(cmds["n1"]) != 1 || cmds["n1"][0].Kind != routesync.CmdKeyPut || cmds["n1"][0].ManifestKey != testMK {
-		t.Fatalf("n1 provider key commands=%+v, want key_put", cmds["n1"])
-	}
-	if len(cmds["n2"]) != 0 {
-		t.Fatalf("n2 should not receive provider key commands: %+v", cmds["n2"])
-	}
-
-	cmds = map[string][]*routesync.Command{}
-	src.key = testAuthKey
-	reg.reconcileKeys(ctx)
-	if len(cmds["n1"]) != 2 || cmds["n1"][0].Kind != routesync.CmdKeyDrop || cmds["n1"][1].Kind != routesync.CmdKeyPut {
-		t.Fatalf("rotated provider key commands=%+v, want key_drop + key_put", cmds["n1"])
-	}
-
-	cmds = map[string][]*routesync.Command{}
-	src.groups = nil
-	reg.reconcileKeys(ctx)
-	if len(cmds["n1"]) != 1 || cmds["n1"][0].Kind != routesync.CmdKeyDrop {
-		t.Fatalf("deleted provider group commands=%+v, want key_drop", cmds["n1"])
-	}
-}
-
 func TestKeyDistributionDropsDeletedGroupAndRotatedKey(t *testing.T) {
 	ctx := context.Background()
 	reg := testRegWithBox(t)
-	reg.stores.PutGroup(ctx, &GroupConfig{Group: "/g", ManifestKey: testMK})
 	reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"})
 	var cmds []*routesync.Command
 	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(c *routesync.Command) { cmds = append(cmds, c) }})
 
+	pushKeyAllocation(reg, "/g", []string{"n1"}, testMK)
 	reg.reconcileKeys(ctx)
 	if len(cmds) != 1 || cmds[0].Kind != routesync.CmdKeyPut {
 		t.Fatalf("initial commands=%+v, want key_put", cmds)
 	}
 
 	cmds = nil
-	reg.stores.PutGroup(ctx, &GroupConfig{Group: "/g", ManifestKey: testAuthKey})
+	pushKeyAllocation(reg, "/g", []string{"n1"}, testAuthKey)
 	reg.reconcileKeys(ctx)
 	if len(cmds) != 2 || cmds[0].Kind != routesync.CmdKeyDrop || cmds[1].Kind != routesync.CmdKeyPut {
 		t.Fatalf("rotated key commands=%+v, want key_drop old + key_put new", cmds)
 	}
 
 	cmds = nil
-	if _, err := reg.stores.kv.Delete(ctx, groupKey("/g")); err != nil {
-		t.Fatal(err)
-	}
+	pushKeyAllocation(reg, "/g", nil, "")
 	reg.reconcileKeys(ctx)
 	if len(cmds) != 1 || cmds[0].Kind != routesync.CmdKeyDrop {
 		t.Fatalf("deleted group commands=%+v, want key_drop", cmds)
@@ -255,9 +148,17 @@ func testReg(t *testing.T) *Registry {
 	kv := clusterstore.OpenMemory(0)
 	t.Cleanup(func() { kv.Close() })
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	reg := New(NewStores(kv, nil), nil, 5*time.Second, log)
-	reg.SetSandboxGroupProvider(authOnlyProvider{})
-	return reg
+	return New(NewStores(kv), nil, 5*time.Second, log)
+}
+
+func pushKeyAllocation(reg *Registry, group string, nodes []string, manifestKey string) {
+	patch := &routesync.SelectorPatch{Group: group, NodeIDs: nodes, NodeAllocation: true}
+	if manifestKey != "" {
+		patch.KeyFingerprint = keyFingerprint(manifestKey)
+		patch.ManifestKeyType = clusterstate.SecretInline
+		patch.ManifestKey = manifestKey
+	}
+	reg.applySelectorPatch(patch)
 }
 
 // fakeConn implements nodeConn; its onCmd hook lets a test simulate the node
@@ -282,6 +183,7 @@ func (c *fakeConn) send(cmd *routesync.Command) error {
 func TestReserveSandboxCreateFlow(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
+	reg.SetPlacer(placementWithToken("n1"))
 	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"}); err != nil {
 		t.Fatal(err)
 	}
@@ -332,7 +234,7 @@ func TestReserveSandboxCreateFlow(t *testing.T) {
 func TestReserveSandboxCreateUsesDerivedAccessToken(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
-	reg.SetSandboxGroupProvider(authOnlyProvider{})
+	reg.SetPlacer(placementWithToken("n1"))
 	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"}); err != nil {
 		t.Fatal(err)
 	}
@@ -367,16 +269,15 @@ func TestReserveSandboxCreateUsesDerivedAccessToken(t *testing.T) {
 func TestReadyRouteUsesDerivedAccessToken(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
-	reg.SetSandboxGroupProvider(authOnlyProvider{})
 	reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"})
 	reg.addNode(&fakeConn{nodeID: "n1"})
-	reg.stores.PutSandbox(ctx, &SandboxRecord{Group: "/g", RouteKey: "rk", SID: "sb-ready", State: StateReady, NodeID: "n1"})
-	reg.indexSID("sb-ready", "/g", "rk")
-
 	want, err := clusterstate.DeriveAccessToken(testAuthKey, "sb-ready")
 	if err != nil {
 		t.Fatal(err)
 	}
+	reg.stores.PutSandbox(ctx, &SandboxRecord{Group: "/g", RouteKey: "rk", SID: "sb-ready", State: StateReady, NodeID: "n1", AccessToken: want})
+	reg.indexSID("sb-ready", "/g", "rk")
+
 	res, err := reg.ReserveSandbox(ctx, "/g", "rk", nil)
 	if err != nil {
 		t.Fatal(err)
@@ -393,30 +294,10 @@ func TestReadyRouteUsesDerivedAccessToken(t *testing.T) {
 	}
 }
 
-func TestReadyRouteAuthProviderErrorFails(t *testing.T) {
+func TestReserveSandboxCreateUsesPlacementMaterial(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
-	reg.SetSandboxGroupProvider(failingAuthProvider{})
-	reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"})
-	reg.addNode(&fakeConn{nodeID: "n1"})
-	reg.stores.PutSandbox(ctx, &SandboxRecord{
-		Group: "/g", RouteKey: "rk", SID: "sb-ready", State: StateReady,
-		NodeID: "n1",
-	})
-	reg.indexSID("sb-ready", "/g", "rk")
-
-	if _, err := reg.ReserveSandbox(ctx, "/g", "rk", nil); err == nil {
-		t.Fatal("ready reserve should fail when auth_key provider fails")
-	}
-	if _, _, err := reg.ResolveSID(ctx, "sb-ready"); err == nil {
-		t.Fatal("sid resolve should fail when auth_key provider fails")
-	}
-}
-
-func TestReserveSandboxCreateUsesSandboxGroupProvider(t *testing.T) {
-	ctx := context.Background()
-	reg := testReg(t)
-	reg.SetSandboxGroupProvider(fullGroupProvider{})
+	reg.SetPlacer(placementWithToken("n1"))
 	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"}); err != nil {
 		t.Fatal(err)
 	}
@@ -442,7 +323,7 @@ func TestReserveSandboxCreateUsesSandboxGroupProvider(t *testing.T) {
 		t.Fatal("create command not sent")
 	}
 	if got.TemplateRef != "e2b-snp-tmpl" || got.Config["a"] != "1" || got.Config["b"] != "2" {
-		t.Fatalf("create command did not use SandboxGroupProvider config: %+v", got)
+		t.Fatalf("create command did not use placement config: %+v", got)
 	}
 	if got.KeyFingerprint != keyFingerprint(testMK) {
 		t.Fatalf("key fingerprint=%q, want provider key fp", got.KeyFingerprint)
@@ -544,7 +425,7 @@ func TestParkTimeoutRollback(t *testing.T) {
 	ctx := context.Background()
 	kv := clusterstore.OpenMemory(0)
 	defer kv.Close()
-	reg := New(NewStores(kv, nil), nil, 200*time.Millisecond, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	reg := New(NewStores(kv), nil, 200*time.Millisecond, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"})
 	reg.addNode(&fakeConn{nodeID: "n1"}) // accepts create but never reports running
 
@@ -592,8 +473,12 @@ func TestReservePausedResume(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
 	reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"})
+	want, err := clusterstate.DeriveAccessToken(testAuthKey, "sb-x")
+	if err != nil {
+		t.Fatal(err)
+	}
 	// Seed a PAUSED sandbox on n1.
-	reg.stores.PutSandbox(ctx, &SandboxRecord{Group: "/g", RouteKey: "rk", SID: "sb-x", State: StatePaused, NodeID: "n1"})
+	reg.stores.PutSandbox(ctx, &SandboxRecord{Group: "/g", RouteKey: "rk", SID: "sb-x", State: StatePaused, NodeID: "n1", AccessToken: want})
 
 	conn := &fakeConn{nodeID: "n1"}
 	conn.onCmd = func(cmd *routesync.Command) {
@@ -609,10 +494,6 @@ func TestReservePausedResume(t *testing.T) {
 	res, err := reg.ReserveSandbox(ctx, "/g", "rk", nil)
 	if err != nil {
 		t.Fatalf("resume reserve: %v", err)
-	}
-	want, err := clusterstate.DeriveAccessToken(testAuthKey, "sb-x")
-	if err != nil {
-		t.Fatal(err)
 	}
 	if res.SID != "sb-x" || res.AccessToken != want {
 		t.Fatalf("resume result: %+v", res)
@@ -781,116 +662,6 @@ func TestNodeLinkResumeTokenReturnedOnReconnect(t *testing.T) {
 	}
 }
 
-func TestVerifyKeyUsesAuthKeyProvider(t *testing.T) {
-	authRaw, err := hex.DecodeString(testAuthKey)
-	if err != nil {
-		t.Fatal(err)
-	}
-	manifestRaw, err := hex.DecodeString(testMK)
-	if err != nil {
-		t.Fatal(err)
-	}
-	authAPIKey, err := apikey.Mint(authRaw)
-	if err != nil {
-		t.Fatal(err)
-	}
-	manifestAPIKey, err := apikey.Mint(manifestRaw)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	reg := testReg(t)
-	reg.SetSandboxGroupProvider(authOnlyProvider{})
-	mux := http.NewServeMux()
-	reg.ServeRouteLink(mux)
-	srv := httptest.NewServer(mux)
-	defer srv.Close()
-
-	req, _ := http.NewRequest(http.MethodGet, srv.URL+RouteLinkVerifyKeyPath+"?group=/g", nil)
-	req.Header.Set("X-API-KEY", authAPIKey)
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("auth-key api key status=%d, want 200", resp.StatusCode)
-	}
-
-	req, _ = http.NewRequest(http.MethodGet, srv.URL+RouteLinkVerifyKeyPath+"?group=/g", nil)
-	req.Header.Set("X-API-KEY", manifestAPIKey)
-	resp, err = http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusForbidden {
-		t.Fatalf("manifest-key api key status=%d, want 403", resp.StatusCode)
-	}
-}
-
-func TestVerifyKeyResolvesAuthKeyRef(t *testing.T) {
-	authRaw, err := hex.DecodeString(testAuthKey)
-	if err != nil {
-		t.Fatal(err)
-	}
-	authAPIKey, err := apikey.Mint(authRaw)
-	if err != nil {
-		t.Fatal(err)
-	}
-	reg := testReg(t)
-	reg.SetSandboxGroupProvider(refKeyProvider{})
-	reg.SetSecretResolver(mapSecretResolver{"auth-ref": testAuthKey, "manifest-ref": testMK})
-	mux := http.NewServeMux()
-	reg.ServeRouteLink(mux)
-	srv := httptest.NewServer(mux)
-	defer srv.Close()
-
-	req, _ := http.NewRequest(http.MethodGet, srv.URL+RouteLinkVerifyKeyPath+"?group=/g", nil)
-	req.Header.Set("X-API-KEY", authAPIKey)
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("auth-key ref api key status=%d, want 200", resp.StatusCode)
-	}
-}
-
-func TestReserveSandboxCreateResolvesSecretRefs(t *testing.T) {
-	ctx := context.Background()
-	reg := testReg(t)
-	reg.SetSandboxGroupProvider(refKeyProvider{})
-	reg.SetSecretResolver(mapSecretResolver{"auth-ref": testAuthKey, "manifest-ref": testMK})
-	reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"})
-	var got *routesync.Command
-	conn := &fakeConn{nodeID: "n1"}
-	conn.onCmd = func(cmd *routesync.Command) {
-		if cmd.Kind != routesync.CmdCreate {
-			return
-		}
-		cp := *cmd
-		got = &cp
-		go reg.applyRoute(context.Background(), "n1", &routesync.RouteEntry{
-			SandboxID: cmd.SID, Group: cmd.Group, RouteKey: cmd.RouteKey, State: routesync.StateRunning,
-		})
-	}
-	reg.addNode(conn)
-
-	res, err := reg.ReserveSandbox(ctx, "/g", "rk", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	wantToken, err := clusterstate.DeriveAccessToken(testAuthKey, res.SID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got == nil || got.KeyFingerprint != keyFingerprint(testMK) || got.AccessToken != wantToken || res.AccessToken != wantToken {
-		t.Fatalf("create command/result got=%+v res=%+v", got, res)
-	}
-}
-
 func readViewFrame(t *testing.T, r io.Reader) *ViewEvent {
 	t.Helper()
 	var hdr [4]byte
@@ -931,9 +702,13 @@ func TestSandboxKeyNoCollision(t *testing.T) {
 
 func TestStoresRouteLinkUsesQuorumRepair(t *testing.T) {
 	ctx := context.Background()
-	reg := testReg(t)
-	r1, r2, r3 := clusterstate.NewMemoryRouteReplica(), clusterstate.NewMemoryRouteReplica(), clusterstate.NewMemoryRouteReplica()
-	reg.stores.routes = clusterstate.NewRouteQuorum("registry-test", r1, r2, r3)
+	kv := clusterstore.OpenMemory(0)
+	defer kv.Close()
+	r2, r3 := clusterstate.NewMemoryRouteReplica(), clusterstate.NewMemoryRouteReplica()
+	view := clusterstate.MemberView{Version: 1, Members: []string{"r1", "r2", "r3"}}
+	stores := NewClusterStores(kv, "r1", view, 3, 1,
+		map[string]clusterstate.RouteReplica{"r2": r2, "r3": r3}, nil)
+	reg := New(stores, nil, 5*time.Second, slog.New(slog.NewTextHandler(io.Discard, nil)))
 
 	seed := clusterstate.RouteRecord{
 		Meta:      clusterstate.RecordMeta{Ballot: clusterstate.Ballot{Round: 7, Writer: "seed"}, Rev: 3, UpdatedAt: time.Now()},
@@ -943,7 +718,7 @@ func TestStoresRouteLinkUsesQuorumRepair(t *testing.T) {
 		State:     clusterstate.RouteReady,
 		NodeID:    "n1",
 	}
-	if ok, err := r1.Accept(ctx, clusterstate.RouteKey("/g", "rk"), seed, seed.Meta.Ballot); err != nil || !ok {
+	if ok, err := stores.LocalRouteReplica().Accept(ctx, clusterstate.RouteKey("/g", "rk"), seed, seed.Meta.Ballot); err != nil || !ok {
 		t.Fatalf("seed route accept ok=%v err=%v", ok, err)
 	}
 
@@ -961,9 +736,13 @@ func TestStoresRouteLinkUsesQuorumRepair(t *testing.T) {
 
 func TestStoresNodeLinkUsesQuorumRepair(t *testing.T) {
 	ctx := context.Background()
-	reg := testReg(t)
-	n1, n2, n3 := clusterstate.NewMemoryNodeReplica(), clusterstate.NewMemoryNodeReplica(), clusterstate.NewMemoryNodeReplica()
-	reg.stores.nodes = clusterstate.NewNodeQuorum("registry-test", n1, n2, n3)
+	kv := clusterstore.OpenMemory(0)
+	defer kv.Close()
+	n2, n3 := clusterstate.NewMemoryNodeReplica(), clusterstate.NewMemoryNodeReplica()
+	view := clusterstate.MemberView{Version: 1, Members: []string{"n1", "n2", "n3"}}
+	stores := NewClusterStores(kv, "n1", view, 1, 3,
+		nil, map[string]clusterstate.NodeReplica{"n2": n2, "n3": n3})
+	reg := New(stores, nil, 5*time.Second, slog.New(slog.NewTextHandler(io.Discard, nil)))
 
 	seed := clusterstate.NodeRecord{
 		Meta:         clusterstate.RecordMeta{Ballot: clusterstate.Ballot{Round: 9, Writer: "seed"}, Rev: 4, UpdatedAt: time.Now()},
@@ -972,7 +751,7 @@ func TestStoresNodeLinkUsesQuorumRepair(t *testing.T) {
 		Labels:       map[string]string{"pool": "p"},
 		DataEndpoint: "10.0.0.1:8443",
 	}
-	if ok, err := n1.Accept(ctx, "node-q", seed, seed.Meta.Ballot); err != nil || !ok {
+	if ok, err := stores.LocalNodeReplica().Accept(ctx, "node-q", seed, seed.Meta.Ballot); err != nil || !ok {
 		t.Fatalf("seed node accept ok=%v err=%v", ok, err)
 	}
 
@@ -1020,26 +799,7 @@ func TestNodeLinkHandoffGateReturnsMoved(t *testing.T) {
 	}
 }
 
-func TestGroupResolverStoreAndMerge(t *testing.T) {
-	ctx := context.Background()
-	reg := testReg(t)
-	// No secrets here: sealing them needs an encryption box (PutGroup errors
-	// otherwise).
-	if err := reg.stores.PutGroup(ctx, &GroupConfig{Group: "/g", ProjectID: "p", TemplateRef: "tmpl",
-		SandboxConfig: map[string]string{"a": "1", "b": "2"}, NodeSelectors: []map[string]string{{"z": "e"}}}); err != nil {
-		t.Fatal(err)
-	}
-	// The default store-backed resolver projects each fine-grained interface.
-	if k, ok, _ := reg.resolver.Key.Key(ctx, "/g"); !ok || k.ProjectID != "p" {
-		t.Fatalf("store key: %+v ok=%v", k, ok)
-	}
-	if sc, ok, _ := reg.resolver.Sandbox.SandboxConfig(ctx, "/g"); !ok || sc.TemplateRef != "tmpl" || sc.Config["a"] != "1" {
-		t.Fatalf("store sandbox: %+v ok=%v", sc, ok)
-	}
-	if pl, ok, _ := reg.resolver.Placement.Placement(ctx, "/g"); !ok || len(pl.NodeSelectors) != 1 {
-		t.Fatalf("store placement: %+v ok=%v", pl, ok)
-	}
-	// §7.2 merge: the group's sandbox_config defaults fold under create (create wins).
+func TestMergeConfig(t *testing.T) {
 	merged := mergeConfig(map[string]string{"a": "1", "b": "2"}, map[string]string{"b": "X", "c": "3"})
 	if merged["a"] != "1" || merged["b"] != "X" || merged["c"] != "3" {
 		t.Fatalf("mergeConfig: %v", merged)

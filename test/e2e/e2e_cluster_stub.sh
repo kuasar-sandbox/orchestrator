@@ -34,15 +34,45 @@ fail() {
     exit 1
 }
 
+if [ -z "${CLUSTER_STUB_CASE:-}" ]; then
+    for spec in registry-n1:1 registry-n3:3 registry-joint:4; do
+        CLUSTER_STUB_CASE="${spec%%:*}"
+        REGISTRIES="${spec##*:}"
+        step "running case $CLUSTER_STUB_CASE (registries=$REGISTRIES)"
+        CLUSTER_STUB_CASE="$CLUSTER_STUB_CASE" REGISTRIES="$REGISTRIES" "$0"
+    done
+    exit 0
+fi
+
 command -v python3 >/dev/null 2>&1 || skip "python3 not on PATH"
 command -v curl >/dev/null 2>&1 || skip "curl not on PATH"
 [ -x "$CLUSTER_CTL" ] || skip "missing cluster-ctl at $CLUSTER_CTL (run make build)"
 [ -x "$NODE_STUB_CTL" ] || skip "missing node-stub-ctl at $NODE_STUB_CTL (run make build)"
 [ -x "$E2B_KEY_CTL" ] || skip "missing e2b-key-ctl at $E2B_KEY_CTL (run make build)"
-step "cluster stub e2e: using BIN=$BIN"
+REGISTRIES="${REGISTRIES:-1}"
+step "cluster stub e2e: case=$CLUSTER_STUB_CASE registries=$REGISTRIES using BIN=$BIN"
 
 free_port() {
-    python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()'
+    python3 <<'PY'
+import socket, sys
+try:
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    print(s.getsockname()[1])
+    s.close()
+except PermissionError:
+    sys.exit(2)
+PY
+}
+
+alloc_port() {
+    local var="$1"
+    local name="$2"
+    local port
+    if ! port="$(free_port)"; then
+        skip "cannot allocate local TCP port for $name (socket permission denied in this environment)"
+    fi
+    printf -v "$var" '%s' "$port"
 }
 
 wait_tcp() {
@@ -107,37 +137,85 @@ cleanup() {
 }
 trap cleanup EXIT
 
-NODE_PORT="$(free_port)"
-ROUTE_PORT="$(free_port)"
-SCALE_PORT="$(free_port)"
-ROUTER_PORT="$(free_port)"
-ADMIN_PORT="$(free_port)"
-DATA_PORT="$(free_port)"
+CONTROL_PORTS=()
+for i in $(seq 1 "$REGISTRIES"); do
+    alloc_port REGISTRY_PORT "registry-$i"
+    CONTROL_PORTS+=("$REGISTRY_PORT")
+done
+CONTROL_PORT="${CONTROL_PORTS[0]}"
+alloc_port SCALER_PORT scaler
+alloc_port ROUTER_PORT router
+alloc_port ADMIN_PORT node-stub-admin
+alloc_port DATA_PORT node-stub-data
 
 AUTH_KEY="$("$E2B_KEY_CTL" gen-key)"
 MANIFEST_KEY="$("$E2B_KEY_CTL" gen-key)"
 API_KEY="$("$E2B_KEY_CTL" gen-apikey "$AUTH_KEY")"
-ENC_KEY="0000000000000000000000000000000000000000000000000000000000000001"
 
-cat >"$WORK/registry.yaml" <<EOF
-sandbox_group:
-  encryption_key: "$ENC_KEY"
+OWNER_COUNT="$REGISTRIES"
+ACTIVE_IDS=()
+NEXT_IDS=()
+if [ "$CLUSTER_STUB_CASE" = "registry-joint" ]; then
+    OWNER_COUNT=3
+    ACTIVE_IDS=(1 2 3)
+    NEXT_IDS=(2 3 4)
+else
+    for i in $(seq 1 "$REGISTRIES"); do
+        ACTIVE_IDS+=("$i")
+    done
+fi
+
+ACTIVE_MEMBERS_YAML=""
+for i in "${ACTIVE_IDS[@]}"; do
+    port="${CONTROL_PORTS[$((i-1))]}"
+    ACTIVE_MEMBERS_YAML="$ACTIVE_MEMBERS_YAML        - { id: registry-$i, advertise: \"http://127.0.0.1:$port\" }
+"
+done
+NEXT_LINE=""
+NEXT_MEMBERS_BLOCK=""
+if [ "${#NEXT_IDS[@]}" -gt 0 ]; then
+    NEXT_LINE="  next: 2
+"
+    NEXT_MEMBERS_YAML=""
+    for i in "${NEXT_IDS[@]}"; do
+        port="${CONTROL_PORTS[$((i-1))]}"
+        NEXT_MEMBERS_YAML="$NEXT_MEMBERS_YAML        - { id: registry-$i, advertise: \"http://127.0.0.1:$port\" }
+"
+    done
+    NEXT_MEMBERS_BLOCK="    - version: 2
+      members:
+$NEXT_MEMBERS_YAML"
+fi
+
+for i in $(seq 1 "$REGISTRIES"); do
+    port="${CONTROL_PORTS[$((i-1))]}"
+    cat >"$WORK/registry-$i.yaml" <<EOF
+member:
+  id: registry-$i
+  listen: "127.0.0.1:$port"
+  advertise: "http://127.0.0.1:$port"
+membership:
+  active: 1
+${NEXT_LINE}  versions:
+    - version: 1
+      members:
+$ACTIVE_MEMBERS_YAML$NEXT_MEMBERS_BLOCK
+  owners:
+    route_link: $OWNER_COUNT
+    node_link: $OWNER_COUNT
+    node_list: $OWNER_COUNT
 node_link:
-  listen: "127.0.0.1:$NODE_PORT"
   heartbeat_interval: "500ms"
   node_dead_after: "3s"
 route_link:
-  listen: "127.0.0.1:$ROUTE_PORT"
-scale_link:
-  listen: "127.0.0.1:$SCALE_PORT"
-reserve:
   park_timeout: "5s"
 EOF
+done
 
 cat >"$WORK/router.yaml" <<EOF
 domain: "$DOMAIN"
-route_link:
-  endpoint: "127.0.0.1:$ROUTE_PORT"
+registry:
+  bootstrap: "127.0.0.1:$CONTROL_PORT"
 ingress:
   listen: "127.0.0.1:$ROUTER_PORT"
 auth:
@@ -147,8 +225,12 @@ auth:
 EOF
 
 cat >"$WORK/scaler.yaml" <<EOF
-scale_link:
-  endpoint: "127.0.0.1:$SCALE_PORT"
+member:
+  id: scaler-1
+  listen: "127.0.0.1:$SCALER_PORT"
+  advertise: "http://127.0.0.1:$SCALER_PORT"
+registry:
+  bootstrap: "127.0.0.1:$CONTROL_PORT"
 placement:
   candidates: 2
   zone_admit_max: "yellow"
@@ -159,24 +241,48 @@ cat >"$WORK/groups.jsonl" <<EOF
 {"type":"group","group":{"group":"$GROUP","manifest_key":"$MANIFEST_KEY","auth_key":"$AUTH_KEY","template_ref":"tmpl-stub","node_selectors":[{"pool":"stub"}],"sandbox_config":{"stub.create_delay_ms":"15","stub.http_status":"204"}}}
 EOF
 
-"$CLUSTER_CTL" registry --config "$WORK/registry.yaml" >"$WORK/registry.log" 2>&1 &
-PIDS+=("$!")
-step "starting registry"
-wait_tcp "$NODE_PORT" "registry node_link"
-wait_tcp "$ROUTE_PORT" "registry route_link"
-wait_tcp "$SCALE_PORT" "registry scale_link"
+for i in $(seq 1 "$REGISTRIES"); do
+    port="${CONTROL_PORTS[$((i-1))]}"
+    "$CLUSTER_CTL" registry --config "$WORK/registry-$i.yaml" >"$WORK/registry-$i.log" 2>&1 &
+    PIDS+=("$!")
+    step "starting registry-$i"
+    wait_tcp "$port" "registry-$i control"
+done
 
-step "importing sandbox group"
-"$CLUSTER_CTL" registry import --config "$WORK/registry.yaml" --endpoint "127.0.0.1:$ROUTE_PORT" -i "$WORK/groups.jsonl" >"$WORK/import.log" 2>&1 ||
-    fail "registry import failed"
+step "checking member transport labels"
+python3 - "http://127.0.0.1:$CONTROL_PORT" <<'PY' >"$WORK/member-labels.txt" || fail "membership labels not available"
+import json, sys, urllib.request
+base = sys.argv[1]
+m = json.load(urllib.request.urlopen(base + "/cluster/membership", timeout=2))
+active = m.get("active", m.get("Active"))
+next_version = m.get("next", m.get("Next"))
+labels = []
+for v in m.get("versions", m.get("Versions", [])):
+    version = v.get("version", v.get("Version"))
+    if version in (active, next_version):
+        labels.append(v.get("label", v.get("Label")))
+assert labels and all(labels), m
+print("\n".join(labels))
+PY
+while IFS= read -r label; do
+    [ -n "$label" ] || continue
+    curl -fsS --noproxy '*' -X POST --data-binary 'ping' \
+        "http://127.0.0.1:$CONTROL_PORT/internal/memberlist/packet/$label" >/dev/null ||
+        fail "member transport packet failed for label $label"
+done <"$WORK/member-labels.txt"
 
 step "starting scaler"
 "$CLUSTER_CTL" scaler --config "$WORK/scaler.yaml" >"$WORK/scaler.log" 2>&1 &
 PIDS+=("$!")
+wait_tcp "$SCALER_PORT" "scaler"
+
+step "importing sandbox group into scaler"
+"$CLUSTER_CTL" scaler import --config "$WORK/scaler.yaml" --endpoint "127.0.0.1:$SCALER_PORT" -i "$WORK/groups.jsonl" >"$WORK/import.log" 2>&1 ||
+    fail "scaler import failed"
 
 step "starting node-stub-ctl with $NODES nodes"
 "$NODE_STUB_CTL" serve \
-    --node-link "127.0.0.1:$NODE_PORT" \
+    --node-link "127.0.0.1:$CONTROL_PORT" \
     --nodes "$NODES" \
     --node-prefix stub \
     --admin-listen "127.0.0.1:$ADMIN_PORT" \
@@ -226,6 +332,17 @@ assert last["group"] == sys.argv[2], last
 assert last["route_key"] == "user1/session1", last
 assert last.get("access_token", "").startswith("sat_"), last
 PY
+
+if [ "$CLUSTER_STUB_CASE" = "registry-joint" ]; then
+    step "checking joint route visibility from next-only registry"
+    curl -sS --noproxy '*' --get --data-urlencode "group=$GROUP" \
+        "http://127.0.0.1:${CONTROL_PORTS[3]}/route-link/list" >"$WORK/joint-routes.json"
+    python3 - "$WORK/joint-routes.json" <<'PY' || fail "next-only registry did not expose the reserved route"
+import json, sys
+routes = json.load(open(sys.argv[1]))
+assert any(r.get("sandboxID") and r.get("state") == "ready" for r in routes), routes
+PY
+fi
 
 create_count_before="$(python3 - "$ADMIN" <<'PY'
 import json, sys, urllib.request
@@ -309,7 +426,7 @@ sys.exit(1)
 PY
 
 curl -sS --noproxy '*' --get --data-urlencode "group=$GROUP" \
-    "http://127.0.0.1:$ROUTE_PORT/route-link/list" >"$WORK/routes.json"
+    "http://127.0.0.1:$CONTROL_PORT/route-link/list" >"$WORK/routes.json"
 python3 - "$WORK/routes.json" "$SID" <<'PY' || fail "route_link still contains rebooted sandbox"
 import json, sys
 routes = json.load(open(sys.argv[1]))

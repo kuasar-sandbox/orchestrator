@@ -1,6 +1,7 @@
 package scaler
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/binary"
@@ -10,12 +11,11 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"sort"
 	"strings"
 	"sync"
 	"time"
-
-	"golang.org/x/net/http2"
 
 	clusterstate "github.com/kuasar-sandbox/sandbox-orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/clustercfg"
@@ -23,81 +23,215 @@ import (
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/routesync"
 )
 
-// Service is the standalone scaler (cluster-scaler.md §4.2/§5): it DIALS the
-// registry scale_link, subscribes node_list/group views, and answers the
-// registry's reverse placement requests over scale_link (no scaler listen).
-// Placement runs over its local view; the registry commits by CAS.
+// Service is the standalone scaler placement engine. It keeps node_list/group
+// views synced, computes placement over the local view, and returns suggestions
+// that the registry commits through route/node owner state.
 type Service struct {
-	scaleBase   string
-	scheme      string
-	watchClient *http.Client     // no timeout: long-lived view watches
-	placeTr     *http2.Transport // full-duplex scale_link session (place_req down / place_result up)
-	cfg         clustercfg.PlacementConfig
-	deadAfter   int64 // node_dead_after seconds (node-alive eligibility, §4.2)
-	log         *slog.Logger
+	links     []RegistryLink
+	cfg       clustercfg.PlacementConfig
+	deadAfter int64 // node_dead_after seconds (node-alive eligibility, §4.2)
+	log       *slog.Logger
 
-	nodes  *viewMap[*registry.NodeRecord]
-	groups *viewMap[*registry.GroupView]
+	nodes  *nodeView
+	groups *groupStore
 }
 
-// NewRemote builds a standalone scaler dialing registry scale_link (a UDS path,
-// or host:port; scaleTLS non-nil = mTLS h2). deadAfter is node_dead_after.
+type RegistryLink struct {
+	Name    string
+	BaseURL string
+	Client  *http.Client
+}
+
+// NewRemote builds a standalone scaler connected to registry control paths. The
+// address may be a UDS path, host:port, or http(s) URL.
 func NewRemote(scaleAddr string, scaleTLS *tls.Config, cfg clustercfg.PlacementConfig, deadAfter int64, log *slog.Logger) *Service {
+	return NewRemoteLinks([]RegistryLink{registryLinkFromAddress("registry", scaleAddr, scaleTLS)}, cfg, deadAfter, log)
+}
+
+func NewRemoteLinks(links []RegistryLink, cfg clustercfg.PlacementConfig, deadAfter int64, log *slog.Logger) *Service {
 	if cfg.Candidates <= 0 {
 		cfg.Candidates = 2
 	}
-	s := &Service{
-		cfg: cfg, deadAfter: deadAfter, log: log,
-		nodes:  newViewMap(decodeNodeList),
-		groups: newViewMap(decodeGroup),
+	links = normalizeRegistryLinks(links)
+	return &Service{
+		links: links, cfg: cfg, deadAfter: deadAfter, log: log,
+		nodes:  newNodeView(minReadyLinks(len(links))),
+		groups: newGroupStore(),
 	}
-	// View watches over a normal client; the scale_link session over an h2 transport
-	// (full-duplex: registry writes place_req down, scaler writes place_result up).
-	pt := &http2.Transport{}
+}
+
+func registryLinkFromAddress(name, scaleAddr string, scaleTLS *tls.Config) RegistryLink {
+	link := RegistryLink{Name: name}
 	switch {
+	case strings.HasPrefix(scaleAddr, "http://") || strings.HasPrefix(scaleAddr, "https://"):
+		u, err := url.Parse(scaleAddr)
+		if err == nil && u.Host != "" {
+			link.BaseURL = strings.TrimRight(scaleAddr, "/")
+			if u.Scheme == "https" {
+				link.Client = &http.Client{Transport: &http.Transport{TLSClientConfig: scaleTLS, ForceAttemptHTTP2: true}}
+			} else {
+				link.Client = &http.Client{Transport: &http.Transport{}}
+			}
+			return link
+		}
 	case strings.HasPrefix(scaleAddr, "/"):
-		s.scaleBase, s.scheme = "http://scale-link", "http"
+		link.BaseURL = "http://scale-link"
 		dial := func(ctx context.Context, _, _ string) (net.Conn, error) {
 			return (&net.Dialer{}).DialContext(ctx, "unix", scaleAddr)
 		}
-		s.watchClient = &http.Client{Transport: &http.Transport{DialContext: dial}}
-		pt.AllowHTTP = true
-		pt.DialTLSContext = func(ctx context.Context, _, _ string, _ *tls.Config) (net.Conn, error) { return dial(ctx, "", "") }
+		link.Client = &http.Client{Transport: &http.Transport{DialContext: dial}}
+		return link
 	case scaleTLS != nil:
-		s.scaleBase, s.scheme = "https://"+scaleAddr, "https"
-		s.watchClient = &http.Client{Transport: &http.Transport{TLSClientConfig: scaleTLS, ForceAttemptHTTP2: true}}
-		pt.DialTLSContext = func(ctx context.Context, _, addr string, _ *tls.Config) (net.Conn, error) {
-			d := &net.Dialer{}
-			raw, err := d.DialContext(ctx, "tcp", scaleAddr)
-			if err != nil {
-				return nil, err
-			}
-			tc := tls.Client(raw, scaleTLS)
-			if err := tc.HandshakeContext(ctx); err != nil {
-				raw.Close()
-				return nil, err
-			}
-			return tc, nil
-		}
+		link.BaseURL = "https://" + scaleAddr
+		link.Client = &http.Client{Transport: &http.Transport{TLSClientConfig: scaleTLS, ForceAttemptHTTP2: true}}
+		return link
 	default:
-		s.scaleBase, s.scheme = "http://"+scaleAddr, "http"
-		s.watchClient = &http.Client{Transport: &http.Transport{}}
-		pt.AllowHTTP = true
-		pt.DialTLSContext = func(ctx context.Context, _, _ string, _ *tls.Config) (net.Conn, error) {
-			return (&net.Dialer{}).DialContext(ctx, "tcp", scaleAddr)
-		}
+		link.BaseURL = "http://" + scaleAddr
+		link.Client = &http.Client{Transport: &http.Transport{}}
+		return link
 	}
-	s.placeTr = pt
-	return s
+	link.BaseURL = strings.TrimRight(scaleAddr, "/")
+	link.Client = &http.Client{Transport: &http.Transport{}}
+	return link
 }
 
-// Start launches the node_list + group view-watch loops + the scale_link session
-// (background). node_list is low-frequency catalog data; hot load/budget is
-// validated by registry/node owner on the cold placement path.
+func normalizeRegistryLinks(links []RegistryLink) []RegistryLink {
+	out := make([]RegistryLink, 0, len(links))
+	seen := map[string]int{}
+	for _, link := range links {
+		link.BaseURL = strings.TrimRight(link.BaseURL, "/")
+		if link.BaseURL == "" {
+			continue
+		}
+		if link.Name == "" {
+			link.Name = link.BaseURL
+		}
+		baseName := link.Name
+		if n := seen[baseName]; n > 0 {
+			link.Name = fmt.Sprintf("%s#%d", baseName, n+1)
+		}
+		seen[baseName]++
+		if link.Client == nil {
+			link.Client = &http.Client{Transport: &http.Transport{}}
+		}
+		out = append(out, link)
+	}
+	return out
+}
+
+func minReadyLinks(n int) int {
+	switch {
+	case n <= 1:
+		return 1
+	default:
+		return n - 1
+	}
+}
+
+// Start launches the node_list watch loop and key allocation reconcile.
+// sandbox-group data is imported into the scaler/provider side, not watched from
+// registry. node_list is low-frequency catalog data; hot load/budget is validated
+// by registry/node owner on the cold placement path.
 func (s *Service) Start(ctx context.Context) {
-	go s.subscribe(ctx, registry.ScaleLinkNodeListWatchPath, s.nodes)
-	go s.subscribe(ctx, registry.ScaleLinkGroupWatchPath, s.groups)
-	go s.runPlaceLink(ctx)
+	for _, link := range s.links {
+		link := link
+		go s.subscribe(ctx, link, registry.ScaleLinkNodeListWatchPath, s.nodes.source(link.Name))
+	}
+	go s.reconcileKeyAllocations(ctx)
+}
+
+func (s *Service) ServeScaleLink(mux *http.ServeMux) {
+	mux.HandleFunc(registry.ScaleLinkPlacePath, s.servePlace)
+	mux.HandleFunc(registry.ScaleLinkVerifyKeyPath, s.serveVerifyKey)
+	mux.HandleFunc(GroupImportPath, s.serveGroupImport)
+}
+
+func (s *Service) ImportGroups(groups []clusterstate.SandboxGroupRecord) {
+	s.groups.replace(groups)
+}
+
+func (s *Service) servePlace(w http.ResponseWriter, req *http.Request) {
+	if req.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var in routesync.PlaceReq
+	if err := json.NewDecoder(io.LimitReader(req.Body, 1<<20)).Decode(&in); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(s.answer(&in))
+}
+
+func (s *Service) serveGroupImport(w http.ResponseWriter, req *http.Request) {
+	if req.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	groups, sum, err := importGroups(io.LimitReader(req.Body, 64<<20))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	s.groups.replace(groups)
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(sum)
+}
+
+func (s *Service) serveVerifyKey(w http.ResponseWriter, req *http.Request) {
+	if req.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	g, ok := s.groups.get(req.URL.Query().Get("group"))
+	if !ok {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	authKey, err := inlineSecret("auth_key", g.AuthKey)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+	if authKey == "" || !verifyAPIKey(authKey, req.Header.Get("X-API-KEY")) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
+func (s *Service) RegisterLoop(ctx context.Context, id, advertise, readyLabel string) {
+	s.RegisterLoopDynamic(ctx, id, advertise, func(context.Context) (string, error) { return readyLabel, nil })
+}
+
+func (s *Service) RegisterLoopDynamic(ctx context.Context, id, advertise string, readyLabel func(context.Context) (string, error)) {
+	if id == "" || advertise == "" {
+		s.log.Warn("scaler: registration disabled; member id/advertise missing")
+		return
+	}
+	t := time.NewTicker(5 * time.Second)
+	defer t.Stop()
+	for {
+		label := ""
+		if readyLabel != nil {
+			var err error
+			label, err = readyLabel(ctx)
+			if err != nil {
+				s.log.Warn("scaler: ready label", "err", err)
+			}
+		}
+		for _, link := range s.links {
+			if err := s.postJSON(ctx, link, registry.ScaleLinkRegisterPath, registry.ScalerRegister{ID: id, Advertise: advertise, ReadyLabel: label}); err != nil {
+				s.log.Warn("scaler: register", "registry", link.Name, "err", err)
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+	}
 }
 
 // answer computes a placement for a reverse request over the local view. It
@@ -109,98 +243,74 @@ func (s *Service) answer(req *routesync.PlaceReq) *routesync.PlaceResult {
 		res.NoNode = true
 		return res
 	}
-	var selectors []map[string]string
-	if g, ok := s.groups.get(req.Group); ok {
-		selectors = g.NodeSelectors
+	g, ok := s.groups.get(req.Group)
+	if !ok {
+		res.NoNode = true
+		return res
+	}
+	fp, _, _, _, err := manifestKeyPatch(g)
+	if err != nil {
+		res.Error = err.Error()
+		return res
+	}
+	if !req.Build {
+		authKey, err := inlineSecret("auth_key", g.AuthKey)
+		if err != nil {
+			res.Error = err.Error()
+			return res
+		}
+		if authKey != "" && req.SandboxID != "" {
+			tok, err := clusterstate.DeriveAccessToken(authKey, req.SandboxID)
+			if err != nil {
+				res.Error = err.Error()
+				return res
+			}
+			res.AccessToken = tok
+		}
 	}
 	p := placeParams{
-		group: req.Group, nodes: s.nodes.values(), selectors: selectors,
+		group: req.Group, nodes: s.nodes.values(), selectors: g.NodeSelectors,
 		rules: s.cfg.ShuffleSharding, candidates: s.cfg.Candidates,
 		zoneAdmitMax: s.cfg.ZoneAdmitMax, deadAfter: s.deadAfter, now: time.Now().Unix(),
 		targetRuntimeDigest: req.TargetRuntimeDigest,
 	}
 	var node string
-	var err error
+	var placeErr error
 	if req.Build {
-		node, err = placeBuild(p)
+		node, placeErr = placeBuild(p)
 	} else {
-		node, err = placeSandbox(p)
+		node, placeErr = placeSandbox(p)
 	}
-	if err != nil || node == "" {
+	if placeErr != nil || node == "" {
 		res.NoNode = true
 	} else {
 		res.NodeID = node
+		res.KeyFingerprint = fp
+		if req.Build {
+			res.ImageRepo = g.ImageRepo
+			if g.RegistryAuth.Value != "" {
+				registryAuth, err := inlineSecret("registry_auth", g.RegistryAuth)
+				if err != nil {
+					res.Error = err.Error()
+					res.NodeID = ""
+					return res
+				}
+				res.RegistryAuth = registryAuth
+			}
+		} else {
+			res.TemplateRef = g.TemplateRef
+			res.Config = mergeConfig(g.Config, req.Config)
+		}
 	}
 	return res
 }
 
-// runPlaceLink keeps the scale_link session alive (the registry's reverse-call channel),
-// reconnecting with capped backoff until ctx is cancelled.
-func (s *Service) runPlaceLink(ctx context.Context) {
-	backoff := 200 * time.Millisecond
-	for ctx.Err() == nil {
-		err := s.placeSession(ctx)
-		if ctx.Err() != nil {
-			return
-		}
-		s.log.Warn("scaler: place-link ended; reconnecting", "err", err)
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(backoff):
-		}
-		backoff = min(backoff*2, 5*time.Second)
-	}
-}
-
-// placeSession runs one scale_link session: PUT the link (request body = place_result
-// stream up), read place_req down (response body), and answer each over the local
-// view. Full-duplex h2 (mirrors node-link, inverse roles: the registry commands).
-func (s *Service) placeSession(ctx context.Context) error {
-	sctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	pr, pw := io.Pipe()
-	defer pw.Close()
-	req, err := http.NewRequestWithContext(sctx, http.MethodPut, s.scaleBase+routesync.ScaleLinkPath, pr)
-	if err != nil {
-		return err
-	}
-	resp, err := s.placeTr.RoundTrip(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if _, err := routesync.ReadMsg(resp.Body); err != nil { // registry Hello
-		return err
-	}
-	// Two writers on pw (place_result from the read loop, allocation patch from
-	// the reconcile goroutine) → serialize.
-	var wmu sync.Mutex
-	send := func(m *routesync.Msg) error {
-		wmu.Lock()
-		defer wmu.Unlock()
-		return routesync.WriteMsg(pw, m)
-	}
-	go s.reconcileKeyAllocations(sctx, send)
-	for {
-		m, err := routesync.ReadMsg(resp.Body)
-		if err != nil {
-			return err
-		}
-		if m.Type == routesync.TypePlaceReq && m.PlaceReq != nil {
-			res := s.answer(m.PlaceReq) // placement is in-memory + fast; answer inline
-			if err := send(&routesync.Msg{Type: routesync.TypePlaceResult, PlaceResult: res}); err != nil {
-				return err
-			}
-		}
-	}
-}
-
 // reconcileKeyAllocations periodically computes each group's explicit node set for
-// manifest-key distribution and pushes it to registry/node owner. Per-session
-// change tracking; a reconnect re-pushes all derived state.
-func (s *Service) reconcileKeyAllocations(ctx context.Context, send func(*routesync.Msg) error) {
-	last := map[string]string{}
+// manifest-key distribution and pushes it to every registry member. Change
+// tracking is per registry link so a down member retries without forcing the
+// already updated members to receive every unchanged group again.
+func (s *Service) reconcileKeyAllocations(ctx context.Context) {
+	last := map[string]map[string]string{} // registry link -> group -> derived key
 	t := time.NewTicker(3 * time.Second)
 	defer t.Stop()
 	for {
@@ -212,22 +322,87 @@ func (s *Service) reconcileKeyAllocations(ctx context.Context, send func(*routes
 				continue
 			}
 			nodes := s.nodes.values()
+			current := map[string]bool{}
 			for _, g := range s.groups.values() {
+				current[g.Group] = true
 				selectors, nodeIDs := keyAllocation(g.Group, nodes, g.NodeSelectors, s.cfg.ShuffleSharding)
-				key := fmt.Sprint(selectors) + "|" + strings.Join(nodeIDs, ",")
-				if last[g.Group] == key {
-					continue // unchanged since last push
+				fp, keyType, keyValue, keyRef, err := manifestKeyPatch(g)
+				if err != nil {
+					s.log.Warn("scaler: manifest key", "group", g.Group, "err", err)
+					nodeIDs = nil
+					fp, keyType, keyValue, keyRef = "", "", "", ""
 				}
+				key := fmt.Sprint(selectors) + "|" + strings.Join(nodeIDs, ",") + "|" + fp + "|" + keyType + "|" + keyValue + "|" + keyRef
 				patch := &routesync.SelectorPatch{
 					Group: g.Group, Selectors: selectors, NodeIDs: nodeIDs, NodeAllocation: true,
+					KeyFingerprint: fp, ManifestKeyType: keyType, ManifestKey: keyValue, ManifestKeyRef: keyRef,
 				}
-				if err := send(&routesync.Msg{Type: routesync.TypeSelectorPatch, Patch: patch}); err != nil {
-					return
+				for _, link := range s.links {
+					if last[link.Name] == nil {
+						last[link.Name] = map[string]string{}
+					}
+					if last[link.Name][g.Group] == key {
+						continue // unchanged since last successful push to this member
+					}
+					if err := s.postJSON(ctx, link, registry.ScaleLinkSelectorPatchPath, patch); err != nil {
+						s.log.Warn("scaler: selector patch", "registry", link.Name, "group", g.Group, "err", err)
+						continue
+					}
+					last[link.Name][g.Group] = key
 				}
-				last[g.Group] = key
+			}
+			byName := s.linksByName()
+			for name, groups := range last {
+				link, ok := byName[name]
+				if !ok {
+					delete(last, name)
+					continue
+				}
+				for group := range groups {
+					if current[group] {
+						continue
+					}
+					if err := s.postJSON(ctx, link, registry.ScaleLinkSelectorPatchPath, &routesync.SelectorPatch{Group: group, NodeAllocation: true}); err != nil {
+						s.log.Warn("scaler: selector patch delete", "registry", name, "group", group, "err", err)
+						continue
+					}
+					delete(groups, group)
+				}
 			}
 		}
 	}
+}
+
+func (s *Service) linksByName() map[string]RegistryLink {
+	out := make(map[string]RegistryLink, len(s.links))
+	for _, link := range s.links {
+		out[link.Name] = link
+	}
+	return out
+}
+
+func (s *Service) postJSON(ctx context.Context, link RegistryLink, path string, v any) error {
+	var body bytes.Buffer
+	if err := json.NewEncoder(&body).Encode(v); err != nil {
+		return err
+	}
+	reqCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, link.BaseURL+path, &body)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := link.Client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return fmt.Errorf("%s: %s", resp.Status, strings.TrimSpace(string(b)))
+	}
+	return nil
 }
 
 func keyAllocation(group string, nodes []*registry.NodeRecord, selectors []map[string]string, rules []clustercfg.ShuffleRule) ([]map[string]string, []string) {
@@ -248,16 +423,16 @@ func keyAllocation(group string, nodes []*registry.NodeRecord, selectors []map[s
 
 // subscribe keeps a view synced from registry scale_link, reconnecting with
 // capped backoff and resuming from the last applied rev (mirrors the router).
-func (s *Service) subscribe(ctx context.Context, path string, sink viewSink) {
+func (s *Service) subscribe(ctx context.Context, link RegistryLink, path string, sink viewSink) {
 	backoff := 200 * time.Millisecond
 	var rev int64
 	for ctx.Err() == nil {
-		newRev, err := s.subscribeOnce(ctx, path, rev, sink)
+		newRev, err := s.subscribeOnce(ctx, link, path, rev, sink)
 		rev = newRev
 		if ctx.Err() != nil {
 			return
 		}
-		s.log.Warn("scaler: view watch ended; reconnecting", "path", path, "err", err)
+		s.log.Warn("scaler: view watch ended; reconnecting", "registry", link.Name, "path", path, "err", err)
 		select {
 		case <-ctx.Done():
 			return
@@ -267,13 +442,13 @@ func (s *Service) subscribe(ctx context.Context, path string, sink viewSink) {
 	}
 }
 
-func (s *Service) subscribeOnce(ctx context.Context, path string, fromRev int64, sink viewSink) (int64, error) {
-	u := fmt.Sprintf("%s%s?from_rev=%d", s.scaleBase, path, fromRev)
+func (s *Service) subscribeOnce(ctx context.Context, link RegistryLink, path string, fromRev int64, sink viewSink) (int64, error) {
+	u := fmt.Sprintf("%s%s?from_rev=%d", link.BaseURL, path, fromRev)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return fromRev, err
 	}
-	resp, err := s.watchClient.Do(req)
+	resp, err := link.Client.Do(req)
 	if err != nil {
 		return fromRev, err
 	}
@@ -343,16 +518,7 @@ func decodeNodeList(raw json.RawMessage) (*registry.NodeRecord, bool) {
 	}, true
 }
 
-func decodeGroup(raw json.RawMessage) (*registry.GroupView, bool) {
-	var g registry.GroupView
-	if json.Unmarshal(raw, &g) != nil {
-		return nil, false
-	}
-	return &g, true
-}
-
-// viewSink is the subset of viewMap the watch loop drives (type-erased over the
-// element type, since put takes the raw JSON the map decodes itself).
+// viewSink is the subset of a watch-backed view the watch loop drives.
 type viewSink interface {
 	reset()
 	put(key string, raw json.RawMessage)
@@ -360,80 +526,154 @@ type viewSink interface {
 	bookmark()
 }
 
-// viewMap is a watch-synced map: a shadow accumulates during a snapshot and is
-// swapped in atomically at the bookmark; live deltas apply directly. Reads never
-// see a half-built set.
-type viewMap[T any] struct {
-	mu      sync.RWMutex
-	live    map[string]T
-	shadow  map[string]T
+// nodeView merges node_list WATCH_LIST streams from multiple registry members.
+// Each source applies snapshot reset/bookmark atomically; the scaler reads a
+// node_id-keyed union over synced sources, preferring the freshest heartbeat when
+// the same node appears from more than one registry member.
+type nodeView struct {
+	mu       sync.RWMutex
+	sources  map[string]*nodeSource
+	minReady int
+}
+
+type nodeSource struct {
+	live    map[string]*registry.NodeRecord
+	shadow  map[string]*registry.NodeRecord
 	syncing bool
 	synced  bool
-	decode  func(json.RawMessage) (T, bool)
 }
 
-func newViewMap[T any](decode func(json.RawMessage) (T, bool)) *viewMap[T] {
-	return &viewMap[T]{live: map[string]T{}, decode: decode}
+type nodeViewSink struct {
+	view   *nodeView
+	source string
 }
 
-func (m *viewMap[T]) reset() {
-	m.mu.Lock()
-	m.shadow = map[string]T{}
-	m.syncing = true
-	m.mu.Unlock()
+func newNodeView(minReady int) *nodeView {
+	if minReady < 1 {
+		minReady = 1
+	}
+	return &nodeView{sources: map[string]*nodeSource{}, minReady: minReady}
 }
 
-func (m *viewMap[T]) put(key string, raw json.RawMessage) {
-	v, ok := m.decode(raw)
-	if !ok {
+func (v *nodeView) source(name string) viewSink {
+	if name == "" {
+		name = "registry"
+	}
+	v.mu.Lock()
+	v.ensureLocked(name)
+	v.mu.Unlock()
+	return nodeViewSink{view: v, source: name}
+}
+
+func (v *nodeView) ensureLocked(name string) *nodeSource {
+	src := v.sources[name]
+	if src == nil {
+		src = &nodeSource{live: map[string]*registry.NodeRecord{}}
+		v.sources[name] = src
+	}
+	return src
+}
+
+func (s nodeViewSink) reset() {
+	s.view.mu.Lock()
+	src := s.view.ensureLocked(s.source)
+	src.shadow = map[string]*registry.NodeRecord{}
+	src.syncing = true
+	s.view.mu.Unlock()
+}
+
+func (s nodeViewSink) put(key string, raw json.RawMessage) {
+	v, ok := decodeNodeList(raw)
+	if !ok || key == "" {
 		return
 	}
-	m.mu.Lock()
-	if m.syncing {
-		m.shadow[key] = v
+	s.view.mu.Lock()
+	src := s.view.ensureLocked(s.source)
+	if src.syncing {
+		src.shadow[key] = v
 	} else {
-		m.live[key] = v
+		src.live[key] = v
 	}
-	m.mu.Unlock()
+	s.view.mu.Unlock()
 }
 
-func (m *viewMap[T]) del(key string) {
-	m.mu.Lock()
-	if !m.syncing {
-		delete(m.live, key)
+func (s nodeViewSink) del(key string) {
+	s.view.mu.Lock()
+	src := s.view.ensureLocked(s.source)
+	if src.syncing {
+		delete(src.shadow, key)
+	} else {
+		delete(src.live, key)
 	}
-	m.mu.Unlock()
+	s.view.mu.Unlock()
 }
 
-func (m *viewMap[T]) bookmark() {
-	m.mu.Lock()
-	if m.syncing {
-		m.live, m.shadow = m.shadow, nil
-		m.syncing = false
-		m.synced = true
+func (s nodeViewSink) bookmark() {
+	s.view.mu.Lock()
+	src := s.view.ensureLocked(s.source)
+	if src.syncing {
+		src.live, src.shadow = src.shadow, nil
+		src.syncing = false
 	}
-	m.mu.Unlock()
+	src.synced = true
+	s.view.mu.Unlock()
 }
 
-func (m *viewMap[T]) ready() bool {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.synced
+func (v *nodeView) ready() bool {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	ready := 0
+	for _, src := range v.sources {
+		if src.synced {
+			ready++
+		}
+	}
+	return ready >= v.minReady
 }
 
-func (m *viewMap[T]) values() []T {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	out := make([]T, 0, len(m.live))
-	for _, v := range m.live {
-		out = append(out, v)
+func (v *nodeView) values() []*registry.NodeRecord {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	merged := map[string]*registry.NodeRecord{}
+	for _, src := range v.sources {
+		if !src.synced {
+			continue
+		}
+		for id, rec := range src.live {
+			cur := merged[id]
+			if cur == nil || fresherNode(rec, cur) {
+				merged[id] = cloneNodeRecord(rec)
+			}
+		}
 	}
+	out := make([]*registry.NodeRecord, 0, len(merged))
+	for _, rec := range merged {
+		out = append(out, rec)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].NodeID < out[j].NodeID })
 	return out
 }
 
-func (m *viewMap[T]) get(key string) (T, bool) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	v, ok := m.live[key]
-	return v, ok
+func fresherNode(a, b *registry.NodeRecord) bool {
+	if a.LastHeartbeatUnix != b.LastHeartbeatUnix {
+		return a.LastHeartbeatUnix > b.LastHeartbeatUnix
+	}
+	return a.NodeID < b.NodeID
+}
+
+func cloneNodeRecord(in *registry.NodeRecord) *registry.NodeRecord {
+	if in == nil {
+		return nil
+	}
+	out := *in
+	out.Labels = cloneStringMap(in.Labels)
+	if in.BuildCapacity != nil {
+		bc := *in.BuildCapacity
+		out.BuildCapacity = &bc
+	}
+	if in.BuildAlloc != nil {
+		ba := *in.BuildAlloc
+		out.BuildAlloc = &ba
+	}
+	return &out
 }

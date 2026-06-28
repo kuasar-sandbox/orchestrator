@@ -6,22 +6,26 @@ import (
 	"io"
 	"net/http"
 	"strconv"
-	"strings"
+	"time"
 
 	clusterstate "github.com/kuasar-sandbox/sandbox-orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/clusterstore"
+	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/routesync"
 )
 
-// Node/group view watches are low-frequency control-plane streams for scaler
-// views. Router does not subscribe to a global route stream. node_list is projected from
-// node_link quorum state; group values are projected to strip sealed secrets.
+// Node view watches are low-frequency control-plane streams for scaler views.
+// Router does not subscribe to a global route stream. node_list is projected from
+// node_link quorum state; sandbox-group data is imported on scaler/provider side.
 const (
 	ScaleLinkNodeListWatchPath = "/scale-link/watch-node-list" // scaler node_list WATCH_LIST
-	ScaleLinkGroupWatchPath    = "/scale-link/watch-groups"
+	ScaleLinkRegisterPath      = "/scale-link/register"
+	ScaleLinkSelectorPatchPath = "/scale-link/selector-patch"
+	ScaleLinkPlacePath         = "/scale-link/place"
+	ScaleLinkVerifyKeyPath     = "/scale-link/verify-key"
 )
 
 // ViewEvent is one frame on a view watch ([4B LE len][ViewEvent]); Value is the
-// raw record JSON (a NodeRecord, or a key-stripped group projection).
+// raw node_list record JSON.
 type ViewEvent struct {
 	Type  string          `json:"type"` // "reset" | "put" | "delete" | "bookmark"
 	Key   string          `json:"key,omitempty"`
@@ -29,11 +33,10 @@ type ViewEvent struct {
 	Rev   int64           `json:"rev,omitempty"`
 }
 
-// GroupView is the placement-only projection of a group sent to subscribers.
-type GroupView struct {
-	Group         string              `json:"group"`
-	NodeSelectors []map[string]string `json:"node_selectors,omitempty"`
-	ShuffleLabels map[string]string   `json:"shuffle_labels,omitempty"`
+type ScalerRegister struct {
+	ID         string `json:"id"`
+	Advertise  string `json:"advertise"`
+	ReadyLabel string `json:"ready_label"`
 }
 
 func (r *Registry) serveNodeListWatch(w http.ResponseWriter, req *http.Request) {
@@ -87,29 +90,52 @@ func (r *Registry) serveNodeListWatch(w http.ResponseWriter, req *http.Request) 
 	r.streamNodeListView(ctx, w, flusher, ch)
 }
 
-func (r *Registry) serveGroupWatch(w http.ResponseWriter, req *http.Request) {
-	r.viewStream(w, req, groupPrefix, projectGroupView)
-}
-
 // ServeScaleLink mounts the scaler-facing scale_link API: node_list WATCH_LIST,
-// group placement view, and the full-duplex scale_link session (registered by the
-// cluster-ctl registry command).
+// scaler registration, and selector/key-allocation patches.
 func (r *Registry) ServeScaleLink(mux *http.ServeMux) {
 	mux.HandleFunc(ScaleLinkNodeListWatchPath, r.serveNodeListWatch)
-	mux.HandleFunc(ScaleLinkGroupWatchPath, r.serveGroupWatch)
+	mux.HandleFunc(ScaleLinkRegisterPath, r.serveScalerRegister)
+	mux.HandleFunc(ScaleLinkSelectorPatchPath, r.serveSelectorPatch)
 }
 
-// projectGroupView strips sealed secrets before a group goes to a subscriber.
-func projectGroupView(_ string, raw []byte) ([]byte, bool) {
-	var g GroupConfig
-	if json.Unmarshal(raw, &g) != nil {
-		return nil, false
+func (r *Registry) serveScalerRegister(w http.ResponseWriter, req *http.Request) {
+	if req.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
 	}
-	out, err := json.Marshal(GroupView{Group: g.Group, NodeSelectors: g.NodeSelectors, ShuffleLabels: g.ShuffleLabels})
-	if err != nil {
-		return nil, false
+	var in ScalerRegister
+	if err := json.NewDecoder(io.LimitReader(req.Body, 1<<20)).Decode(&in); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
 	}
-	return out, true
+	if in.ID == "" || in.Advertise == "" {
+		http.Error(w, "id and advertise are required", http.StatusBadRequest)
+		return
+	}
+	if r.scaleReadyLabel != "" && in.ReadyLabel != r.scaleReadyLabel {
+		http.Error(w, "ready_label does not match active registry membership", http.StatusConflict)
+		return
+	}
+	r.setScalerPeer(scalerPeer{ID: in.ID, Advertise: in.Advertise, ReadyLabel: in.ReadyLabel, LastSeen: time.Now()})
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (r *Registry) serveSelectorPatch(w http.ResponseWriter, req *http.Request) {
+	if req.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var patch routesync.SelectorPatch
+	if err := json.NewDecoder(io.LimitReader(req.Body, 4<<20)).Decode(&patch); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if patch.Group == "" {
+		http.Error(w, "group is required", http.StatusBadRequest)
+		return
+	}
+	r.applySelectorPatch(&patch)
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (r *Registry) streamNodeListView(ctx context.Context, w io.Writer, flusher http.Flusher, ch <-chan clusterstore.Event) {
@@ -127,94 +153,6 @@ func (r *Registry) streamNodeListView(ctx context.Context, w io.Writer, flusher 
 				ve = &ViewEvent{Type: "put", Key: ev.Key, Value: ev.Value, Rev: ev.Rev}
 			case clusterstore.EventDelete:
 				ve = &ViewEvent{Type: "delete", Key: ev.Key, Rev: ev.Rev}
-			default:
-				continue
-			}
-			if err := writeFrame(w, ve); err != nil {
-				return
-			}
-			flusher.Flush()
-		}
-	}
-}
-
-// viewStream serves the reset+snapshot+bookmark+deltas watch protocol over a
-// low-frequency store prefix. project maps a stored value to the wire value
-// (ok=false skips it).
-func (r *Registry) viewStream(w http.ResponseWriter, req *http.Request, prefix string, project func(key string, raw []byte) ([]byte, bool)) {
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		http.Error(w, "watch needs a flushable (h2c) writer", http.StatusInternalServerError)
-		return
-	}
-	ctx := req.Context()
-	var fromRev int64
-	if v := req.URL.Query().Get("from_rev"); v != "" {
-		fromRev, _ = strconv.ParseInt(v, 10, 64)
-	}
-	// Resumable replay after a known rev; on compaction fall back to a snapshot.
-	if fromRev > 0 {
-		ch, err := r.stores.kv.Watch(ctx, prefix, fromRev)
-		if err == nil {
-			r.streamView(ctx, w, flusher, ch, prefix, project)
-			return
-		}
-		if err != clusterstore.ErrCompacted {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-	}
-	rev0, err := r.stores.kv.Rev(ctx)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	ch, err := r.stores.kv.Watch(ctx, prefix, rev0)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	if err := writeFrame(w, &ViewEvent{Type: "reset", Rev: rev0}); err != nil {
-		return
-	}
-	if err := r.stores.kv.Range(ctx, prefix, func(kv clusterstore.KV) error {
-		val, ok := project(kv.Key, kv.Value)
-		if !ok {
-			return nil
-		}
-		// Emit the logical id (prefix stripped) so the subscriber keys by node_id /
-		// group, decoupled from the store-key scheme.
-		return writeFrame(w, &ViewEvent{Type: "put", Key: strings.TrimPrefix(kv.Key, prefix), Value: val, Rev: rev0})
-	}); err != nil {
-		return
-	}
-	if err := writeFrame(w, &ViewEvent{Type: "bookmark", Rev: rev0}); err != nil {
-		return
-	}
-	flusher.Flush()
-	r.streamView(ctx, w, flusher, ch, prefix, project)
-}
-
-func (r *Registry) streamView(ctx context.Context, w io.Writer, flusher http.Flusher, ch <-chan clusterstore.Event, prefix string, project func(string, []byte) ([]byte, bool)) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case ev, ok := <-ch:
-			if !ok {
-				return
-			}
-			key := strings.TrimPrefix(ev.Key, prefix)
-			var ve *ViewEvent
-			switch ev.Type {
-			case clusterstore.EventPut:
-				val, pok := project(ev.Key, ev.Value)
-				if !pok {
-					continue
-				}
-				ve = &ViewEvent{Type: "put", Key: key, Value: val, Rev: ev.Rev}
-			case clusterstore.EventDelete:
-				ve = &ViewEvent{Type: "delete", Key: key, Rev: ev.Rev}
 			default:
 				continue
 			}

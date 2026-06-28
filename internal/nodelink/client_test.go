@@ -22,22 +22,14 @@ import (
 
 const testAuthKey = "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100"
 
-type authProvider struct{}
+type testPlacer struct{}
 
-func (authProvider) Get(context.Context, string) (clusterstate.SandboxGroup, bool, error) {
-	return clusterstate.SandboxGroup{}, true, nil
-}
-
-func (authProvider) GetPlacementHint(context.Context, string) (clusterstate.PlacementHint, bool, error) {
-	return clusterstate.PlacementHint{}, true, nil
-}
-
-func (authProvider) GetKey(context.Context, string) (clusterstate.Secret, bool, error) {
-	return clusterstate.Secret{}, false, nil
-}
-
-func (authProvider) GetAuthKey(context.Context, string) (clusterstate.Secret, bool, error) {
-	return clusterstate.Secret{Type: clusterstate.SecretInline, Value: testAuthKey}, true, nil
+func (testPlacer) Place(ctx context.Context, req registry.PlaceRequest) (*registry.Placement, error) {
+	tok, err := clusterstate.DeriveAccessToken(testAuthKey, req.SandboxID)
+	if err != nil {
+		return nil, err
+	}
+	return &registry.Placement{NodeID: "n1", AccessToken: tok}, nil
 }
 
 // fakeNode implements Node: it streams its routes and, on a create command,
@@ -76,7 +68,7 @@ func (n *fakeNode) HandleCommand(ctx context.Context, cmd *routesync.Command) *r
 	}
 	e := routesync.RouteEntry{
 		SandboxID: cmd.SID, Group: cmd.Group, RouteKey: cmd.RouteKey,
-		State: routesync.StateRunning, AccessToken: "tok-" + cmd.SID,
+		State: routesync.StateRunning, AccessToken: cmd.AccessToken,
 	}
 	n.mu.Lock()
 	n.routes[cmd.SID] = e
@@ -92,8 +84,7 @@ func TestNodeLinkReserveRoundTrip(t *testing.T) {
 
 	kv := clusterstore.OpenMemory(0)
 	defer kv.Close()
-	reg := registry.New(registry.NewStores(kv, nil), nil, 5*time.Second, log)
-	reg.SetSandboxGroupProvider(authProvider{})
+	reg := registry.New(registry.NewStores(kv), testPlacer{}, 5*time.Second, log)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc(routesync.NodeLinkPath, reg.ServeNodeLink)

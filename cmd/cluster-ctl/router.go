@@ -9,14 +9,15 @@ import (
 	"net"
 	"net/http"
 	"os/signal"
-	"strings"
 	"syscall"
+	"time"
 
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
 	"golang.org/x/sys/unix"
 
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/clustercfg"
+	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/clusterclient"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/router"
 )
 
@@ -32,21 +33,21 @@ func runRouter(args []string, log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	routeAddr := cfg.RouteLink.Endpoint
+	registryAddr := cfg.Registry.Bootstrap
 
-	// route_link mTLS when the endpoint is a remote TCP addr and tls is set
-	// (cluster.md §5.4); a co-located UDS endpoint stays plain.
-	var routeTLS *tls.Config
-	if !strings.HasPrefix(routeAddr, "/") && cfg.RouteLink.TLS.Enabled() {
-		host := routeAddr
-		if i := strings.LastIndexByte(host, ':'); i >= 0 {
-			host = host[:i]
-		}
-		if routeTLS, err = cfg.RouteLink.TLS.ClientConfig(host); err != nil {
-			return fmt.Errorf("router: route_link tls: %w", err)
+	// registry mTLS when the endpoint is remote and tls is set; a co-located UDS
+	// endpoint stays plain.
+	var registryTLS *tls.Config
+	if endpointServerName(registryAddr) != "" && cfg.Registry.TLS.Enabled() {
+		if registryTLS, err = cfg.Registry.TLS.ClientConfig(endpointServerName(registryAddr)); err != nil {
+			return fmt.Errorf("router: registry tls: %w", err)
 		}
 	}
-	rt := router.New(routeAddr, cfg.Domain, cfg.AuthCacheDur(), routeTLS, log)
+	regClient, err := clusterclient.NewRegistry(registryAddr, registryTLS)
+	if err != nil {
+		return err
+	}
+	rt := router.NewWithRegistry(regClient, cfg.Domain, cfg.AuthCacheDur(), log)
 	rt.SetDataPlaneAuth(cfg.Auth.DataPlane)
 	rt.SetAuthMode(cfg.Auth.APIKey)
 
@@ -56,6 +57,20 @@ func runRouter(args []string, log *slog.Logger) error {
 	// The cluster router's hot path is driven by active route/connection cache:
 	// misses Reserve through the registry and stale entries fail fast.
 	go rt.RunCleanup(ctx) // evict expired auth-cache / stale build-map entries
+	go func() {
+		t := time.NewTicker(5 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				if err := regClient.Refresh(ctx); err != nil {
+					log.Warn("router: membership refresh", "err", err)
+				}
+			}
+		}
+	}()
 
 	// Optional Prometheus metrics endpoint (router_requests_total{plane,result}, §10).
 	if cfg.MetricsListen != "" {
@@ -102,7 +117,7 @@ func runRouter(args []string, log *slog.Logger) error {
 		<-ctx.Done()
 		srv.Close()
 	}()
-	log.Info("cluster-ctl router", "listen", cfg.Ingress.Listen, "domain", cfg.Domain, "route_link", routeAddr, "tls", cfg.Ingress.TLS.Enabled())
+	log.Info("cluster-ctl router", "listen", cfg.Ingress.Listen, "domain", cfg.Domain, "registry", registryAddr, "tls", cfg.Ingress.TLS.Enabled())
 	var serveErr error
 	if cfg.Ingress.TLS.Enabled() {
 		serveErr = srv.ServeTLS(ln, "", "")

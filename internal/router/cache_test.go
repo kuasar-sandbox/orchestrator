@@ -68,6 +68,7 @@ func TestSandboxVerbForward(t *testing.T) {
 
 	req, _ := http.NewRequest(http.MethodDelete, srv.URL+"/sandboxes/sb-1", nil)
 	req.Host = "api.test.local"
+	req.Header.Set(HeaderGroup, "/g")
 	req.Header.Set(HeaderAPIKey, "e2b_test")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {

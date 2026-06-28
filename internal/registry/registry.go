@@ -12,7 +12,6 @@ import (
 
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/apikey"
 	clusterstate "github.com/kuasar-sandbox/sandbox-orchestrator/internal/cluster"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/groupcfg"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/routesync"
 )
 
@@ -37,27 +36,30 @@ type nodeConn interface {
 type PlaceRequest struct {
 	Group               string
 	RouteKey            string
+	SandboxID           string
+	Config              map[string]string
 	Build               bool
 	TargetRuntimeDigest string
 }
 
-// Placer suggests a node for a sandbox/build. In production it is the
-// channelPlacer; the builtin placer is the single-member/test default.
+// Placement is a scaler answer plus the group-derived material the registry must
+// place on node commands. Registry route owners persist AccessToken in route_link
+// and never call a sandbox-group provider on the hot/read path.
+type Placement struct {
+	NodeID         string
+	TemplateRef    string
+	Config         map[string]string
+	KeyFingerprint string
+	AccessToken    string
+	ImageRepo      string
+	RegistryAuth   string
+}
+
+// Placer suggests a node and group-derived create/build material. Production
+// placement calls scaler over scale_link; the builtin placer is the size-1/test
+// fallback and only fills NodeID.
 type Placer interface {
-	Place(ctx context.Context, req PlaceRequest) (nodeID string, err error)
-}
-
-type SecretResolver interface {
-	ResolveSecret(ctx context.Context, kind string, secret clusterstate.Secret) (string, error)
-}
-
-type inlineSecretResolver struct{}
-
-func (inlineSecretResolver) ResolveSecret(ctx context.Context, kind string, secret clusterstate.Secret) (string, error) {
-	if secret.Type == "" || secret.Type == clusterstate.SecretInline {
-		return secret.Value, nil
-	}
-	return "", fmt.Errorf("registry: %s ref resolver is not configured", kind)
+	Place(ctx context.Context, req PlaceRequest) (*Placement, error)
 }
 
 // Registry is the cluster control plane's state authority + node_link hub.
@@ -79,18 +81,20 @@ type Registry struct {
 
 	reconcileTrigger chan struct{} // coalesced key-reconcile wakeups (a node connecting)
 
-	nodeOwner NodeOwner
+	localNodeOwner NodeOwner
+	nodeOwner      NodeOwner
 
-	resolver       groupcfg.Resolver                 // store/external provider bundle used by local adapters
-	groupProvider  clusterstate.SandboxGroupProvider // unified group provider used by the new cluster kernel
-	groupImporter  clusterstate.SandboxGroupImporter // unified group iterator used by scaler/key distribution
-	secretResolver SecretResolver
+	scalerMu        sync.Mutex
+	scaleReadyLabel string
+	scalerPeers     map[string]scalerPeer
+	keyAlloc        map[string]keyAllocationState // group -> scaler-owned manifest-key allocation set
+}
 
-	scalerMu     sync.Mutex
-	curScaler    *scalerConn                            // the connected standalone scaler (reverse-call placement, §5.2)
-	placeWaiters map[string]chan *routesync.PlaceResult // in-flight place_req -> result waiter
-	overlay      map[string][]map[string]string         // group -> shuffle-effective nodeSelectors projection
-	keyAlloc     map[string]map[string]bool             // group -> scaler-owned manifest-key allocation set
+type scalerPeer struct {
+	ID         string
+	Advertise  string
+	ReadyLabel string
+	LastSeen   time.Time
 }
 
 // reserveCall is one in-flight ReserveSandbox; joiners wait on done, the channel
@@ -138,15 +142,12 @@ func New(stores *Stores, placer Placer, parkTimeout time.Duration, log *slog.Log
 		cmdFlight:        make(map[string]string),
 		keyLeased:        make(map[string]keyLeaseState),
 		reconcileTrigger: make(chan struct{}, 1),
-		resolver:         storeResolver(stores),
-		groupImporter:    storeGroupImporter{stores},
-		secretResolver:   inlineSecretResolver{},
-		placeWaiters:     make(map[string]chan *routesync.PlaceResult),
-		overlay:          make(map[string][]map[string]string),
-		keyAlloc:         make(map[string]map[string]bool),
+		scalerPeers:      make(map[string]scalerPeer),
+		keyAlloc:         make(map[string]keyAllocationState),
 	}
-	r.nodeOwner = newLocalNodeOwner(r)
-	r.groupProvider = clusterstate.ResolverAdapter{Resolver: r.resolver}
+	localOwner := newLocalNodeOwner(r)
+	r.localNodeOwner = localOwner
+	r.nodeOwner = localOwner
 	return r
 }
 
@@ -155,11 +156,6 @@ func New(stores *Stores, placer Placer, parkTimeout time.Duration, log *slog.Log
 // selector matching is only a bootstrap path before the scaler has pushed allocation.
 func (r *Registry) applySelectorPatch(p *routesync.SelectorPatch) {
 	r.scalerMu.Lock()
-	if len(p.Selectors) == 0 {
-		delete(r.overlay, p.Group)
-	} else {
-		r.overlay[p.Group] = p.Selectors
-	}
 	if p.NodeAllocation {
 		set := make(map[string]bool, len(p.NodeIDs))
 		for _, id := range p.NodeIDs {
@@ -167,61 +163,66 @@ func (r *Registry) applySelectorPatch(p *routesync.SelectorPatch) {
 				set[id] = true
 			}
 		}
-		r.keyAlloc[p.Group] = set
+		keyType, keyValue := p.ManifestKeyType, p.ManifestKey
+		if keyType == "ref" {
+			keyValue = p.ManifestKeyRef
+		}
+		if keyType == "" && keyValue != "" {
+			keyType = clusterstate.SecretInline
+		}
+		r.keyAlloc[p.Group] = keyAllocationState{fp: p.KeyFingerprint, keyType: keyType, keyValue: keyValue, nodes: set}
 	}
+	r.scalerMu.Unlock()
+	r.onNodeConnected()
+}
+
+func (r *Registry) keyAllocations() map[string]keyAllocationState {
+	r.scalerMu.Lock()
+	defer r.scalerMu.Unlock()
+	out := make(map[string]keyAllocationState, len(r.keyAlloc))
+	for group, src := range r.keyAlloc {
+		nodes := make(map[string]bool, len(src.nodes))
+		for id := range src.nodes {
+			nodes[id] = true
+		}
+		out[group] = keyAllocationState{fp: src.fp, keyType: src.keyType, keyValue: src.keyValue, nodes: nodes}
+	}
+	return out
+}
+
+// SetScaleReadyLabel sets the registry membership label a scaler must advertise
+// before it is used for Place requests.
+func (r *Registry) SetScaleReadyLabel(label string) {
+	r.scalerMu.Lock()
+	r.scaleReadyLabel = label
 	r.scalerMu.Unlock()
 }
 
-// effectiveSelectors returns the scaler's shuffle-effective nodeSelectors for a
-// group if it has pushed an overlay, else nil (caller falls back to the group's
-// static selectors).
-func (r *Registry) effectiveSelectors(group string) ([]map[string]string, bool) {
+func (r *Registry) setScalerPeer(peer scalerPeer) {
+	r.scalerMu.Lock()
+	r.scalerPeers[peer.ID] = peer
+	r.scalerMu.Unlock()
+}
+
+func (r *Registry) readyScalerPeers(maxAge time.Duration) []scalerPeer {
+	now := time.Now()
 	r.scalerMu.Lock()
 	defer r.scalerMu.Unlock()
-	sel, ok := r.overlay[group]
-	return sel, ok
-}
-
-func (r *Registry) keyAllocation(group string) (map[string]bool, bool) {
-	r.scalerMu.Lock()
-	defer r.scalerMu.Unlock()
-	src, ok := r.keyAlloc[group]
-	if !ok {
-		return nil, false
+	out := make([]scalerPeer, 0, len(r.scalerPeers))
+	for id, peer := range r.scalerPeers {
+		if maxAge > 0 && now.Sub(peer.LastSeen) > maxAge {
+			delete(r.scalerPeers, id)
+			continue
+		}
+		if r.scaleReadyLabel != "" && peer.ReadyLabel != r.scaleReadyLabel {
+			continue
+		}
+		out = append(out, peer)
 	}
-	out := make(map[string]bool, len(src))
-	for id := range src {
-		out[id] = true
-	}
-	return out, true
+	return out
 }
 
-// SetGroupResolver overrides the group-config providers and refreshes the unified
-// SandboxGroupProvider adapter.
-func (r *Registry) SetGroupResolver(res groupcfg.Resolver) {
-	r.resolver = res
-	r.groupProvider = clusterstate.ResolverAdapter{Resolver: res}
-}
-
-// SetSandboxGroupProvider installs the unified provider used by registry cluster
-// paths.
-func (r *Registry) SetSandboxGroupProvider(p clusterstate.SandboxGroupProvider) {
-	r.groupProvider = p
-}
-
-// SetSandboxGroupImporter installs the group lister used by background cluster
-// reconcilers such as key distribution. The provider owns per-group data; the
-// importer owns the group namespace.
-func (r *Registry) SetSandboxGroupImporter(p clusterstate.SandboxGroupImporter) {
-	r.groupImporter = p
-}
-
-func (r *Registry) SetSecretResolver(res SecretResolver) {
-	r.secretResolver = res
-}
-
-// SetPlacer wires the placer (the channelPlacer over scale_link); cluster-ctl
-// sets it after New (the channelPlacer needs the registry it places through).
+// SetPlacer wires the placer implementation.
 func (r *Registry) SetPlacer(p Placer) { r.placer = p }
 
 // SetNodeOwner replaces the local node-owner adapter. Reserve/build/key/orphan
@@ -230,39 +231,14 @@ func (r *Registry) SetNodeOwner(owner NodeOwner) {
 	r.nodeOwner = owner
 }
 
-// Stores exposes the typed store layer (cluster-ctl seeds group config; tests).
+func (r *Registry) SetRemoteNodeOwners(remotes map[string]NodeOwner) {
+	r.nodeOwner = newRoutingNodeOwner(r, r.localNodeOwner, remotes)
+}
+
+func (r *Registry) LocalNodeOwner() NodeOwner { return r.localNodeOwner }
+
+// Stores exposes the typed store layer used by registry route/node/build state.
 func (r *Registry) Stores() *Stores { return r.stores }
-
-func (r *Registry) deriveAccessToken(ctx context.Context, group, sandboxID string) (string, error) {
-	k, found, err := r.groupProvider.GetAuthKey(ctx, group)
-	if err != nil {
-		return "", err
-	}
-	if !found || k.Value == "" {
-		return "", fmt.Errorf("registry: auth_key missing for group %q", group)
-	}
-	authKey, err := r.resolveSecret(ctx, "auth_key", k)
-	if err != nil {
-		return "", err
-	}
-	return clusterstate.DeriveAccessToken(authKey, sandboxID)
-}
-
-func (r *Registry) manifestKey(ctx context.Context, group string) (string, bool, error) {
-	k, found, err := r.groupProvider.GetKey(ctx, group)
-	if err != nil || !found || k.Value == "" {
-		return "", found, err
-	}
-	v, err := r.resolveSecret(ctx, "manifest_key", k)
-	return v, true, err
-}
-
-func (r *Registry) resolveSecret(ctx context.Context, kind string, s clusterstate.Secret) (string, error) {
-	if r.secretResolver == nil {
-		r.secretResolver = inlineSecretResolver{}
-	}
-	return r.secretResolver.ResolveSecret(ctx, kind, s)
-}
 
 func flightKey(group, routeKey string) string { return group + "\x00" + routeKey }
 
@@ -276,11 +252,7 @@ func (r *Registry) ReserveSandbox(ctx context.Context, group, routeKey string, c
 	}
 	if found && rec.State == StateReady {
 		if _, live := r.node(rec.NodeID); live {
-			tok, err := r.deriveAccessToken(ctx, rec.Group, rec.SID)
-			if err != nil {
-				return nil, err
-			}
-			return &ReserveResult{NodeID: rec.NodeID, SID: rec.SID, AccessToken: tok, DataEndpoint: r.nodeDataEndpoint(ctx, rec.NodeID)}, nil
+			return &ReserveResult{NodeID: rec.NodeID, SID: rec.SID, AccessToken: rec.AccessToken, DataEndpoint: r.nodeDataEndpoint(ctx, rec.NodeID)}, nil
 		}
 		// node gone: fall through to re-place (dead-node sweep also resets it).
 	}
@@ -376,10 +348,15 @@ func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, o
 		if curFound && cur.State == StateReady {
 			return nil // a concurrent attempt already won; the running route finishes the Reserve
 		}
-		nodeID, perr := r.placer.Place(ctx, PlaceRequest{Group: group, RouteKey: routeKey})
+		sid := "sb-" + newID()
+		placement, perr := r.placer.Place(ctx, PlaceRequest{Group: group, RouteKey: routeKey, SandboxID: sid, Config: createConfig})
 		if perr != nil {
 			return perr
 		}
+		if placement == nil || placement.NodeID == "" {
+			return ErrNoNode
+		}
+		nodeID := placement.NodeID
 		conn, live := r.node(nodeID)
 		if !live {
 			if attempt == 0 {
@@ -387,12 +364,14 @@ func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, o
 			}
 			return ErrNodeGone
 		}
-		sid := "sb-" + newID()
 		expect := int64(0)
 		if curFound {
 			expect = curRev
 		}
-		reserved := &SandboxRecord{Group: group, RouteKey: routeKey, SID: sid, State: StateReserved, NodeID: nodeID}
+		reserved := &SandboxRecord{
+			Group: group, RouteKey: routeKey, SID: sid, State: StateReserved, NodeID: nodeID,
+			TemplateID: placement.TemplateRef, AccessToken: placement.AccessToken,
+		}
 		if _, ok, cerr := r.stores.CASSandbox(ctx, reserved, expect); cerr != nil {
 			return cerr
 		} else if !ok {
@@ -402,26 +381,10 @@ func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, o
 			return ErrNoNode
 		}
 
-		cmd := &routesync.Command{CmdID: newID(), Kind: routesync.CmdCreate, SID: sid, Group: group, RouteKey: routeKey, Config: createConfig}
-		// Group config via the unified provider: template ref + group defaults folded
-		// under the create config (§7.2).
-		if sg, ok, err := r.groupProvider.Get(ctx, group); err != nil {
-			return err
-		} else if ok {
-			cmd.TemplateRef = sg.TemplateRef
-			cmd.Config = mergeConfig(sg.Config, createConfig)
-		}
-		if manifestKey, ok, err := r.manifestKey(ctx, group); err != nil {
-			return err
-		} else if ok && manifestKey != "" {
-			// The key is predistributed ahead of placement (§7.6); create references it
-			// by fingerprint. A node missing it fails precheck -> rejected ack -> re-Place.
-			cmd.KeyFingerprint = keyFingerprint(manifestKey)
-		}
-		if tok, err := r.deriveAccessToken(ctx, group, sid); err != nil {
-			return err
-		} else if tok != "" {
-			cmd.AccessToken = tok
+		cmd := &routesync.Command{
+			CmdID: newID(), Kind: routesync.CmdCreate, SID: sid, Group: group, RouteKey: routeKey,
+			TemplateRef: placement.TemplateRef, Config: placement.Config,
+			KeyFingerprint: placement.KeyFingerprint, AccessToken: placement.AccessToken,
 		}
 		r.trackCmd(cmd.CmdID, flightKey(group, routeKey))
 		if err := conn.send(cmd); err != nil {
@@ -534,7 +497,8 @@ func (r *Registry) applyRoute(ctx context.Context, nodeID string, e *routesync.R
 	}
 	rec := &SandboxRecord{
 		Group: e.Group, RouteKey: e.RouteKey, SID: e.SandboxID, NodeID: nodeID,
-		SnapLoc: e.SnapshotLocation, TemplateID: e.TemplateID, LastActive: time.Now().Unix(),
+		SnapLoc: e.SnapshotLocation, TemplateID: e.TemplateID, AccessToken: e.AccessToken,
+		LastActive: time.Now().Unix(),
 	}
 	switch e.State {
 	case routesync.StateRunning:
@@ -558,18 +522,19 @@ func (r *Registry) applyRoute(ctx context.Context, nodeID string, e *routesync.R
 		r.deleteOrphanSandbox(ctx, nodeID, e.SandboxID, e.Group, e.RouteKey)
 		return
 	}
+	if rec.TemplateID == "" {
+		rec.TemplateID = cur.TemplateID
+	}
+	if rec.AccessToken == "" {
+		rec.AccessToken = cur.AccessToken
+	}
 	if _, err := r.stores.PutSandbox(ctx, rec); err != nil {
 		r.log.Warn("registry: put sandbox route", "group", e.Group, "err", err)
 		return
 	}
 	r.indexSID(e.SandboxID, e.Group, e.RouteKey)
 	if rec.State == StateReady {
-		tok, err := r.deriveAccessToken(ctx, e.Group, e.SandboxID)
-		if err != nil {
-			r.finish(flightKey(e.Group, e.RouteKey), nil, err)
-			return
-		}
-		r.finish(flightKey(e.Group, e.RouteKey), &ReserveResult{NodeID: nodeID, SID: e.SandboxID, AccessToken: tok, DataEndpoint: r.nodeDataEndpoint(ctx, nodeID)}, nil)
+		r.finish(flightKey(e.Group, e.RouteKey), &ReserveResult{NodeID: nodeID, SID: e.SandboxID, AccessToken: rec.AccessToken, DataEndpoint: r.nodeDataEndpoint(ctx, nodeID)}, nil)
 	}
 }
 
@@ -696,6 +661,7 @@ func (r *Registry) updateNodeRegister(ctx context.Context, nr *routesync.NodeReg
 	rec.DataEndpoint = nr.DataEndpoint
 	rec.RuntimeDigest = nr.RuntimeDigest
 	rec.LastHeartbeatUnix = time.Now().Unix()
+	rec.LinkOwner = r.stores.WriterID()
 	return r.stores.PutNode(ctx, rec)
 }
 
@@ -711,7 +677,7 @@ func (r *Registry) updateHeartbeat(ctx context.Context, nodeID string, hb *route
 	rec.BuildAlloc, rec.Counts, rec.Draining = hb.BuildAlloc, hb.Counts, hb.Draining
 	rec.LastHeartbeatUnix = time.Now().Unix()
 	_ = r.stores.PutNodeRuntime(ctx, rec)
-	if rec.Draining != oldDraining || oldHeartbeat <= 0 || rec.LastHeartbeatUnix-oldHeartbeat >= nodeListHeartbeatRefreshSec {
+	if rec.Draining != oldDraining || oldHeartbeat <= 0 || rec.LastHeartbeatUnix-oldHeartbeat >= r.stores.NodeListHeartbeatRefreshSec() {
 		_ = r.stores.PutNodeList(ctx, rec)
 	}
 }

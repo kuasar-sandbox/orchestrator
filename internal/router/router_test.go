@@ -1,12 +1,16 @@
 package router
 
 import (
+	"context"
 	"encoding/json"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/clusterclient"
 )
 
 func TestExtractBuildID(t *testing.T) {
@@ -21,6 +25,53 @@ func TestExtractBuildID(t *testing.T) {
 		if got := extractBuildID(path); got != want {
 			t.Errorf("extractBuildID(%q)=%q want %q", path, got, want)
 		}
+	}
+}
+
+func TestRouteLinkHTTPFailsOverOnServerError(t *testing.T) {
+	var calls []string
+	first := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls = append(calls, "first")
+		return textResponse(http.StatusServiceUnavailable, "down"), nil
+	})}
+	second := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls = append(calls, "second")
+		return textResponse(http.StatusOK, `{"ok":true}`), nil
+	})}
+	rt := &Router{routeRegistry: routeRegistryFunc(func(context.Context, string) ([]clusterclient.Endpoint, error) {
+		return []clusterclient.Endpoint{
+			{MemberID: "r1", BaseURL: "http://r1", Client: first},
+			{MemberID: "r2", BaseURL: "http://r2", Client: second},
+		}, nil
+	})}
+	resp, err := rt.routeLinkHTTP(context.Background(), "/g", http.MethodGet, "/route-link/test", nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || strings.Join(calls, ",") != "first,second" {
+		t.Fatalf("status=%d calls=%v", resp.StatusCode, calls)
+	}
+}
+
+type routeRegistryFunc func(context.Context, string) ([]clusterclient.Endpoint, error)
+
+func (f routeRegistryFunc) RouteCandidates(ctx context.Context, group string) ([]clusterclient.Endpoint, error) {
+	return f(ctx, group)
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+func textResponse(code int, body string) *http.Response {
+	return &http.Response{
+		StatusCode: code,
+		Status:     http.StatusText(code),
+		Body:       io.NopCloser(strings.NewReader(body)),
+		Header:     http.Header{"Content-Type": []string{"text/plain"}},
 	}
 }
 
@@ -82,6 +133,8 @@ func TestBuildRoutingThroughRouter(t *testing.T) {
 	// a trigger for b1 (no group header) must route to the recorded node.
 	req2, _ := http.NewRequest(http.MethodPost, srv.URL+"/v2/templates/t1/builds/b1", nil)
 	req2.Host = "api.test.local"
+	req2.Header.Set(HeaderGroup, "/g")
+	req2.Header.Set(HeaderAPIKey, "e2b_test")
 	resp2, err := http.DefaultClient.Do(req2)
 	if err != nil {
 		t.Fatal(err)

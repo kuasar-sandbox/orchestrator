@@ -49,10 +49,14 @@ func (r *Registry) ReserveBuild(ctx context.Context, req BuildReserveReq) (*Buil
 	// build given the already-RESERVED builds (the registry is authoritative, §7.5).
 	var nodeID string
 	for attempt := 0; attempt < 2; attempt++ {
-		id, err := r.placer.Place(ctx, PlaceRequest{Group: req.Group, RouteKey: "build", Build: true})
+		placement, err := r.placer.Place(ctx, PlaceRequest{Group: req.Group, RouteKey: "build", Build: true, Config: req.Metadata})
 		if err != nil {
 			return nil, err
 		}
+		if placement == nil || placement.NodeID == "" {
+			return nil, ErrNoNode
+		}
+		id := placement.NodeID
 		conn, live := r.node(id)
 		if !live {
 			continue
@@ -73,29 +77,7 @@ func (r *Registry) ReserveBuild(ctx context.Context, req BuildReserveReq) (*Buil
 		cmd := &routesync.Command{
 			CmdID: newID(), Kind: routesync.CmdBuildRegister, Group: req.Group,
 			BuildID: buildID, TemplateRef: templateID, BuildResources: resources, Config: req.Metadata,
-		}
-		if manifestKey, ok, err := r.manifestKey(ctx, req.Group); err != nil {
-			_ = r.stores.DeleteBuild(ctx, req.Group, buildID)
-			r.releaseBuildAdmission(buildID)
-			return nil, err
-		} else if ok && manifestKey != "" {
-			cmd.KeyFingerprint = keyFingerprint(manifestKey)
-		}
-		if sg, ok, err := r.groupProvider.Get(ctx, req.Group); err != nil {
-			_ = r.stores.DeleteBuild(ctx, req.Group, buildID)
-			r.releaseBuildAdmission(buildID)
-			return nil, err
-		} else if ok {
-			cmd.ImageRepo = sg.ImageRepo
-			if sg.RegistryAuth.Value != "" {
-				auth, err := r.resolveSecret(ctx, "registry_auth", sg.RegistryAuth)
-				if err != nil {
-					_ = r.stores.DeleteBuild(ctx, req.Group, buildID)
-					r.releaseBuildAdmission(buildID)
-					return nil, err
-				}
-				cmd.RegistryAuth = auth // delivered with the build task; node uses transiently
-			}
+			KeyFingerprint: placement.KeyFingerprint, ImageRepo: placement.ImageRepo, RegistryAuth: placement.RegistryAuth,
 		}
 		ack, err := r.sendAndWait(ctx, conn, cmd, buildRegisterAckTimeout)
 		if err != nil || ack.Status != routesync.AckAccepted {
@@ -172,17 +154,6 @@ func (r *Registry) applyBuildEvent(ctx context.Context, e *routesync.BuildEvent)
 	if !rec.occupies() {
 		r.releaseBuildAdmission(rec.BuildID)
 	}
-}
-
-// SetGroupTemplate updates a group's template_ref in the registry-local group
-// store so a build that just produced a template can point its group at it.
-func (r *Registry) SetGroupTemplate(ctx context.Context, group, templateRef string) error {
-	g, found, err := r.stores.GetGroupByID(ctx, group)
-	if err != nil || !found || g == nil {
-		return err
-	}
-	g.TemplateRef = templateRef
-	return r.stores.PutGroup(ctx, g)
 }
 
 // ResolveBuild maps a build_id to its node (router restart recovery: the router's

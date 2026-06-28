@@ -4,11 +4,11 @@
 
 domain: sandboxes.example.com
 
-# Upstream: how to reach the registry route_link. A co-located UDS, or a remote
-# host:port (then set route_link.tls for client mTLS).
-route_link:
-  endpoint: /run/cluster/route-link.sock
-  # tls: { cert: ..., key: ..., ca: ... }   # client mTLS to dial a remote route_link
+# Upstream: registry bootstrap endpoint. Router fetches membership, then routes
+# each group operation to the route_link owner set.
+registry:
+  bootstrap: registry-1.example:7700
+  # tls: { cert: ..., key: ..., ca: ... }   # client mTLS to registry control plane
 
 # Downstream: the client-facing e2b ingress (SO_REUSEPORT across replicas).
 ingress:

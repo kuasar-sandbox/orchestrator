@@ -2,11 +2,9 @@ package registry
 
 import (
 	"context"
-	"encoding/hex"
 	"encoding/json"
 	"net/http"
-
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/apikey"
+	"time"
 )
 
 // route_link paths. Routers and operator tools dial this link for group-scoped
@@ -16,7 +14,6 @@ const (
 	RouteLinkRoutePath        = "/route-link/route"         // GET  ?sid=              -> RouteResolve
 	RouteLinkReserveBuildPath = "/route-link/reserve-build" // POST {group,resources,metadata} -> BuildReserveResult
 	RouteLinkBuildPath        = "/route-link/build"         // GET  ?build_id=         -> BuildReserveResult (resolve)
-	RouteLinkGroupPath        = "/route-link/group"         // POST ?group=&template_ref= -> set template_ref
 	RouteLinkListPath         = "/route-link/list"          // GET  ?group=            -> the group's sandbox shard
 	RouteLinkVerifyKeyPath    = "/route-link/verify-key"    // GET  ?group=&api_key=   -> 200 valid / 403 invalid
 )
@@ -39,39 +36,23 @@ func (r *Registry) ServeRouteLink(mux *http.ServeMux) {
 	mux.HandleFunc(RouteLinkRoutePath, r.serveRoute)
 	mux.HandleFunc(RouteLinkReserveBuildPath, r.serveReserveBuild)
 	mux.HandleFunc(RouteLinkBuildPath, r.serveBuild) // resolve build_id -> node (router restart)
-	mux.HandleFunc(RouteLinkGroupPath, r.serveGroup)
 	mux.HandleFunc(RouteLinkListPath, r.serveList)
 	mux.HandleFunc(RouteLinkVerifyKeyPath, r.serveVerifyKey)
 	mux.HandleFunc(RouteLinkExportPath, r.serveExport) // operator JSONL export
 	mux.HandleFunc(RouteLinkImportPath, r.serveImport) // operator JSONL import
 }
 
-// serveVerifyKey verifies an api key against a group's auth_key (the router's
-// auth check, cached for router.auth_cache_ttl). A 403 hides both a bad key and
-// an unknown group. manifest_key is node/provider-facing and is not read here.
+// serveVerifyKey verifies an api key through the scaler-owned group provider
+// view. Registry route owners do not read auth_key; they only fail over across
+// ready scalers. A 403 hides both a bad key and an unknown group.
 func (r *Registry) serveVerifyKey(w http.ResponseWriter, req *http.Request) {
 	q := req.URL.Query()
-	k, found, err := r.groupProvider.GetAuthKey(req.Context(), q.Get("group"))
+	ok, err := r.VerifyAPIKey(req.Context(), q.Get("group"), req.Header.Get("X-API-KEY"), 3, 2*time.Second)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusServiceUnavailable) // key provider unavailable → 503
 		return
 	}
-	if !found || k.Value == "" {
-		http.Error(w, "forbidden", http.StatusForbidden)
-		return
-	}
-	authKey, err := r.resolveSecret(req.Context(), "auth_key", k)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusServiceUnavailable)
-		return
-	}
-	p, err := apikey.Parse(req.Header.Get("X-API-KEY")) // in a header, never the query (logged)
-	if err != nil {
-		http.Error(w, "forbidden", http.StatusForbidden)
-		return
-	}
-	raw, err := hex.DecodeString(authKey)
-	if err != nil || !apikey.Verify(p, raw) {
+	if !ok {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
@@ -126,15 +107,6 @@ func (r *Registry) serveBuild(w http.ResponseWriter, req *http.Request) {
 	writeJSON(w, res)
 }
 
-func (r *Registry) serveGroup(w http.ResponseWriter, req *http.Request) {
-	q := req.URL.Query()
-	if err := r.SetGroupTemplate(req.Context(), q.Get("group"), q.Get("template_ref")); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	w.WriteHeader(http.StatusNoContent)
-}
-
 func (r *Registry) serveReserve(w http.ResponseWriter, req *http.Request) {
 	q := req.URL.Query()
 	res, err := r.ReserveSandbox(req.Context(), q.Get("group"), q.Get("route_key"), nil)
@@ -171,13 +143,9 @@ func (r *Registry) ResolveSID(ctx context.Context, sid string) (*RouteResolve, b
 	if err != nil || !found {
 		return nil, found, err
 	}
-	tok, err := r.deriveAccessToken(ctx, rec.Group, rec.SID)
-	if err != nil {
-		return nil, false, err
-	}
 	return &RouteResolve{
 		SID: rec.SID, Group: rec.Group, RouteKey: rec.RouteKey, NodeID: rec.NodeID,
-		DataEndpoint: r.nodeDataEndpoint(ctx, rec.NodeID), AccessToken: tok,
+		DataEndpoint: r.nodeDataEndpoint(ctx, rec.NodeID), AccessToken: rec.AccessToken,
 		State: string(rec.State),
 	}, true, nil
 }

@@ -31,10 +31,9 @@ func registryAdminCmd(args []string) error {
 func registryExportCmd(args []string) error {
 	fs := flag.NewFlagSet("registry export", flag.ExitOnError)
 	cfgPath := fs.String("config", "/etc/cluster-ctl/registry.yaml", "registry config file")
-	endpoint := fs.String("endpoint", "", "registry route_link endpoint override")
-	kind := fs.String("kind", "all", "records to export: all|groups|routes")
+	endpoint := fs.String("endpoint", "", "registry control endpoint override")
+	kind := fs.String("kind", "all", "records to export: all|routes")
 	group := fs.String("group", "", "exact sandbox-group filter")
-	includeSecrets := fs.String("include-secrets", registry.SnapshotIncludeSecretsRedacted, "secret export mode: redacted|inline")
 	outPath := fs.String("o", "", "output JSONL file (default stdout)")
 	_ = fs.Parse(args)
 
@@ -47,7 +46,6 @@ func registryExportCmd(args []string) error {
 	if *group != "" {
 		q.Set("group", *group)
 	}
-	q.Set("include_secrets", *includeSecrets)
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, base+registry.RouteLinkExportPath+"?"+q.Encode(), nil)
 	if err != nil {
 		return err
@@ -78,7 +76,7 @@ func registryExportCmd(args []string) error {
 func registryImportCmd(args []string) error {
 	fs := flag.NewFlagSet("registry import", flag.ExitOnError)
 	cfgPath := fs.String("config", "/etc/cluster-ctl/registry.yaml", "registry config file")
-	endpoint := fs.String("endpoint", "", "registry route_link endpoint override")
+	endpoint := fs.String("endpoint", "", "registry control endpoint override")
 	inPath := fs.String("i", "", "input JSONL file (default stdin)")
 	_ = fs.Parse(args)
 
@@ -119,22 +117,18 @@ func registryRouteLinkClient(cfgPath, override string) (string, *http.Client, er
 	if err != nil {
 		return "", nil, err
 	}
-	addr := cfg.RouteLink.Listen
+	addr := cfg.ControlListen()
 	if override != "" {
 		addr = override
 	}
 	if addr == "" {
-		return "", nil, fmt.Errorf("registry route_link endpoint is empty")
+		return "", nil, fmt.Errorf("registry control endpoint is empty")
 	}
 	var tlsCfg *tls.Config
-	if !strings.HasPrefix(addr, "/") && cfg.RouteLink.TLS.Enabled() {
-		host := addr
-		if i := strings.LastIndexByte(host, ':'); i >= 0 {
-			host = host[:i]
-		}
-		tlsCfg, err = cfg.RouteLink.TLS.ClientConfig(host)
+	if endpointServerName(addr) != "" && cfg.Member.TLS.Enabled() {
+		tlsCfg, err = cfg.Member.TLS.ClientConfig(endpointServerName(addr))
 		if err != nil {
-			return "", nil, fmt.Errorf("registry route_link tls: %w", err)
+			return "", nil, fmt.Errorf("registry control tls: %w", err)
 		}
 	}
 	base, client := controlHTTPClient(addr, tlsCfg)
@@ -150,6 +144,11 @@ func controlHTTPClient(addr string, tlsCfg *tls.Config) (string, *http.Client) {
 		tr = &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 			return (&net.Dialer{}).DialContext(ctx, "unix", addr)
 		}}
+	case strings.HasPrefix(addr, "http://") || strings.HasPrefix(addr, "https://"):
+		base = strings.TrimRight(addr, "/")
+		if strings.HasPrefix(addr, "https://") {
+			tr = &http.Transport{TLSClientConfig: tlsCfg, ForceAttemptHTTP2: true}
+		}
 	case tlsCfg != nil:
 		base = "https://" + addr
 		tr = &http.Transport{TLSClientConfig: tlsCfg, ForceAttemptHTTP2: true}

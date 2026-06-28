@@ -8,7 +8,7 @@ import (
 )
 
 type NodeOwner interface {
-	PutManifestKey(ctx context.Context, nodeID, fingerprint, manifestKey string, expiresUnix int64) error
+	PutManifestKey(ctx context.Context, nodeID, fingerprint, keyType, keyValue string, expiresUnix int64) error
 	DropManifestKey(ctx context.Context, nodeID, fingerprint string) error
 	AdmitBuild(ctx context.Context, nodeID, buildID string, want *routesync.BuildResources) bool
 	ReleaseBuild(ctx context.Context, buildID string)
@@ -25,12 +25,21 @@ func newLocalNodeOwner(reg *Registry) *localNodeOwner {
 	return &localNodeOwner{reg: reg, leases: newBuildAdmissionManager()}
 }
 
-func (o *localNodeOwner) PutManifestKey(ctx context.Context, nodeID, fingerprint, manifestKey string, expiresUnix int64) error {
+func (o *localNodeOwner) PutManifestKey(ctx context.Context, nodeID, fingerprint, keyType, keyValue string, expiresUnix int64) error {
 	conn, live := o.reg.node(nodeID)
 	if !live {
 		return ErrNodeGone
 	}
-	return conn.send(&routesync.Command{CmdID: newID(), Kind: routesync.CmdKeyPut, KeyFingerprint: fingerprint, ManifestKey: manifestKey, ExpiresUnix: expiresUnix})
+	if keyType == "" {
+		keyType = "inline"
+	}
+	cmd := &routesync.Command{CmdID: newID(), Kind: routesync.CmdKeyPut, KeyFingerprint: fingerprint, ManifestKeyType: keyType, ExpiresUnix: expiresUnix}
+	if keyType == "ref" {
+		cmd.ManifestKeyRef = keyValue
+	} else {
+		cmd.ManifestKey = keyValue
+	}
+	return conn.send(cmd)
 }
 
 func (o *localNodeOwner) DropManifestKey(ctx context.Context, nodeID, fingerprint string) error {
@@ -64,6 +73,82 @@ func (o *localNodeOwner) DeleteSandbox(ctx context.Context, nodeID, sid string) 
 	}
 	return conn.send(&routesync.Command{CmdID: newID(), Kind: routesync.CmdDelete, SID: sid})
 }
+
+type routingNodeOwner struct {
+	reg     *Registry
+	local   NodeOwner
+	remotes map[string]NodeOwner
+}
+
+func newRoutingNodeOwner(reg *Registry, local NodeOwner, remotes map[string]NodeOwner) *routingNodeOwner {
+	cp := make(map[string]NodeOwner, len(remotes))
+	for id, owner := range remotes {
+		if id != "" && owner != nil {
+			cp[id] = owner
+		}
+	}
+	return &routingNodeOwner{reg: reg, local: local, remotes: cp}
+}
+
+func (o *routingNodeOwner) ownerFor(ctx context.Context, nodeID string) NodeOwner {
+	node, found, err := o.reg.stores.GetNode(ctx, nodeID)
+	if err != nil || !found || node.LinkOwner == "" || node.LinkOwner == o.reg.stores.WriterID() {
+		return o.local
+	}
+	if remote := o.remotes[node.LinkOwner]; remote != nil {
+		return remote
+	}
+	return missingNodeOwner{memberID: node.LinkOwner}
+}
+
+func (o *routingNodeOwner) PutManifestKey(ctx context.Context, nodeID, fingerprint, keyType, keyValue string, expiresUnix int64) error {
+	return o.ownerFor(ctx, nodeID).PutManifestKey(ctx, nodeID, fingerprint, keyType, keyValue, expiresUnix)
+}
+
+func (o *routingNodeOwner) DropManifestKey(ctx context.Context, nodeID, fingerprint string) error {
+	return o.ownerFor(ctx, nodeID).DropManifestKey(ctx, nodeID, fingerprint)
+}
+
+func (o *routingNodeOwner) AdmitBuild(ctx context.Context, nodeID, buildID string, want *routesync.BuildResources) bool {
+	return o.ownerFor(ctx, nodeID).AdmitBuild(ctx, nodeID, buildID, want)
+}
+
+func (o *routingNodeOwner) ReleaseBuild(ctx context.Context, buildID string) {
+	o.local.ReleaseBuild(ctx, buildID)
+	for _, remote := range o.remotes {
+		remote.ReleaseBuild(ctx, buildID)
+	}
+}
+
+func (o *routingNodeOwner) Runtime(ctx context.Context, nodeID string) (*NodeRecord, bool, error) {
+	return o.ownerFor(ctx, nodeID).Runtime(ctx, nodeID)
+}
+
+func (o *routingNodeOwner) DeleteSandbox(ctx context.Context, nodeID, sid string) error {
+	return o.ownerFor(ctx, nodeID).DeleteSandbox(ctx, nodeID, sid)
+}
+
+type missingNodeOwner struct{ memberID string }
+
+func (o missingNodeOwner) err() error { return ErrNodeGone }
+
+func (o missingNodeOwner) PutManifestKey(context.Context, string, string, string, string, int64) error {
+	return o.err()
+}
+
+func (o missingNodeOwner) DropManifestKey(context.Context, string, string) error { return o.err() }
+
+func (o missingNodeOwner) AdmitBuild(context.Context, string, string, *routesync.BuildResources) bool {
+	return false
+}
+
+func (o missingNodeOwner) ReleaseBuild(context.Context, string) {}
+
+func (o missingNodeOwner) Runtime(context.Context, string) (*NodeRecord, bool, error) {
+	return nil, false, o.err()
+}
+
+func (o missingNodeOwner) DeleteSandbox(context.Context, string, string) error { return o.err() }
 
 // buildAdmissionManager is the local node owner build-budget state.
 // It is intentionally volatile: a node/registry restart clears execution leases,

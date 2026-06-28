@@ -6,79 +6,98 @@
 package clustercfg
 
 import (
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/hex"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
 )
 
-// SandboxGroup provider selection. Each fine-grained interface is independently
-// "store" (registry self-stores) or "external:<addr>".
 const (
-	ProviderStore         = "store"
-	ProviderExternalPfx   = "external:" // external:<addr>
-	envGroupEncryptionKey = "SANDBOX_GROUP_ENCRYPTION_KEY"
-)
-
-// Provider interface names (keys of SandboxGroupConfig.Providers).
-const (
-	ProviderKey           = "key"            // GroupKeyProvider (project_id + manifest_key + auth_key)
-	ProviderSandboxConfig = "sandbox_config" // GroupSandboxConfigProvider
-	ProviderPlacement     = "placement"      // GroupPlacementProvider (nodeSelectors + shuffle labels)
-	ProviderImagePull     = "image_pull"     // GroupImagePullProvider (image_repo + registry_auth, §7.5)
-)
-
-const (
-	defaultRouteLinkEndpoint = "/run/cluster/route-link.sock"
-	defaultScaleLinkEndpoint = "/run/cluster/scale-link.sock"
+	defaultRegistryBootstrap = "127.0.0.1:7700"
 )
 
 // ===========================================================================
 // Shared sub-types (reused across the three role schemas).
 // ===========================================================================
 
-// SandboxGroupConfig selects, per fine-grained provider, store vs external, and
-// the at-rest key for self-stored sandbox-group secrets.
-type SandboxGroupConfig struct {
-	// Providers maps each interface (key / sandbox_config / placement / image_pull)
-	// to "store" or "external:<addr>". Empty entries default to store.
-	Providers     map[string]string `yaml:"providers"`
-	EncryptionKey string            `yaml:"encryption_key"` // AES-256 at-rest for self-stored group secrets; or SANDBOX_GROUP_ENCRYPTION_KEY env
-	TLS           TLS               `yaml:"tls"`            // client mTLS for external:<addr> providers (§6.2)
+// MemberConfig is a registry member's unified control-plane endpoint. node_link,
+// route_link, scale_link, member RPC, and memberlist HTTP transport are path
+// namespaces on this listener unless node_link.listen is explicitly split out.
+type MemberConfig struct {
+	ID        string `yaml:"id"`
+	Listen    string `yaml:"listen"`    // unified control-plane listener
+	Advertise string `yaml:"advertise"` // address peers/clients use to reach this member
+	TLS       TLS    `yaml:"tls"`       // server mTLS for the unified listener
 }
 
-// NodeLinkConfig is the listener nodes dial to register, stream routes, and receive
-// commands (the node-link protocol).
+// MembershipConfig is the versioned registry member view. The active version is
+// the client routing input. When next is set, registry writes use joint owner
+// sets: active quorum and next quorum must both commit before the write returns.
+type MembershipConfig struct {
+	Active   int64                 `yaml:"active" json:"active"`
+	Next     int64                 `yaml:"next,omitempty" json:"next,omitempty"`
+	Versions []MembershipVersion   `yaml:"versions" json:"versions"`
+	Owners   MembershipOwnerConfig `yaml:"owners" json:"owners"`
+}
+
+type MembershipVersion struct {
+	Version int64              `yaml:"version" json:"version"`
+	Label   string             `yaml:"label,omitempty" json:"label,omitempty"`
+	Members []MembershipMember `yaml:"members" json:"members"`
+}
+
+type MembershipMember struct {
+	ID        string `yaml:"id" json:"id"`
+	Advertise string `yaml:"advertise" json:"advertise"`
+}
+
+type MembershipOwnerConfig struct {
+	RouteLink int `yaml:"route_link" json:"route_link"`
+	NodeLink  int `yaml:"node_link" json:"node_link"`
+	NodeList  int `yaml:"node_list" json:"node_list"`
+}
+
+// NodeLinkConfig configures node_link behavior. listen/advertise are optional
+// production split points for node long-lived streams; empty means reuse member.
 type NodeLinkConfig struct {
-	Listen            string `yaml:"listen"`             // node dial target; default :7700
-	TLS               TLS    `yaml:"tls"`                // server mTLS (production)
+	Listen            string `yaml:"listen"`
+	Advertise         string `yaml:"advertise"`
+	TLS               TLS    `yaml:"tls"`
 	HeartbeatInterval string `yaml:"heartbeat_interval"` // default 10s
-	NodeDeadAfter     string `yaml:"node_dead_after"`    // default 30s (§11 failure)
+	NodeDeadAfter     string `yaml:"node_dead_after"`    // default 30s
 	RevisionRetention int    `yaml:"revision_retention"` // change-log depth for resume_from; default 10000
 }
 
-// LinkListenConfig is a registry-owned link listener. route_link is dialed by
-// routers/admin tools; scale_link is dialed by scalers for node_list/group views
-// and reverse placement.
-type LinkListenConfig struct {
-	Listen string `yaml:"listen"` // UDS path / host:port
-	TLS    TLS    `yaml:"tls"`    // server mTLS when split across hosts
+// RouteLinkConfig configures route_link behavior. The HTTP listener is member.listen.
+type RouteLinkConfig struct {
+	ParkTimeout string `yaml:"park_timeout"` // default 30s; on timeout router -> 503
 }
 
-// ReserveConfig bounds how long Reserve waits for a node's running event.
-type ReserveConfig struct {
-	ParkTimeout string `yaml:"park_timeout"` // default 30s; on timeout router → 503
+type NodeListConfig struct {
+	ShardCount     int `yaml:"shard_count"`
+	WatchRetention int `yaml:"watch_retention"`
 }
 
-// LinkDialConfig is how a role (node / router / scaler) reaches the registry: the
-// endpoint it dials plus the client mTLS to present (when the endpoint is remote).
-type LinkDialConfig struct {
-	Endpoint string `yaml:"endpoint"` // registry listener to dial (UDS path / host:port)
-	TLS      TLS    `yaml:"tls"`      // client mTLS for a remote endpoint (cluster.md §5.4)
+// ScaleLinkConfig configures scaler discovery/placement over the unified member listener.
+type ScaleLinkConfig struct {
+	ScalerReplicaCount int    `yaml:"scaler_replica_count"`
+	MinReadyScalers    int    `yaml:"min_ready_scalers"`
+	PlaceTimeout       string `yaml:"place_timeout"`
+}
+
+// RegistryDialConfig is how a consumer reaches the registry bootstrap endpoint.
+// Consumers fetch /cluster/membership first, then route group/node operations to
+// the owner set from that versioned membership.
+type RegistryDialConfig struct {
+	Bootstrap string `yaml:"bootstrap"`
+	TLS       TLS    `yaml:"tls"`
 }
 
 // IngressConfig is the router's client-facing e2b ingress listener.
@@ -181,19 +200,100 @@ func (c *NodeLinkConfig) NodeDeadDur() time.Duration {
 	d, _ := time.ParseDuration(c.NodeDeadAfter)
 	return d
 }
-func (c *ReserveConfig) ParkDur() time.Duration { d, _ := time.ParseDuration(c.ParkTimeout); return d }
+func (c *RouteLinkConfig) ParkDur() time.Duration {
+	d, _ := time.ParseDuration(c.ParkTimeout)
+	return d
+}
+func (c *ScaleLinkConfig) PlaceDur() time.Duration {
+	d, _ := time.ParseDuration(c.PlaceTimeout)
+	return d
+}
 
-// ProviderFor returns the configured provider spec for a fine-grained interface
-// (defaulting to store), and whether it is external (with the address).
-func (g *SandboxGroupConfig) ProviderFor(iface string) (spec string, external bool, addr string) {
-	spec = g.Providers[iface]
-	if spec == "" {
-		spec = ProviderStore
+// ActiveVersion returns the configured active membership version.
+func (m MembershipConfig) ActiveVersion() (MembershipVersion, bool) {
+	for _, v := range m.Versions {
+		if v.Version == m.Active {
+			return v.WithComputedLabel(), true
+		}
 	}
-	if strings.HasPrefix(spec, ProviderExternalPfx) {
-		return spec, true, strings.TrimPrefix(spec, ProviderExternalPfx)
+	return MembershipVersion{}, false
+}
+
+func (m MembershipConfig) NextVersion() (MembershipVersion, bool) {
+	if m.Next == 0 || m.Next == m.Active {
+		return MembershipVersion{}, false
 	}
-	return spec, false, ""
+	for _, v := range m.Versions {
+		if v.Version == m.Next {
+			return v.WithComputedLabel(), true
+		}
+	}
+	return MembershipVersion{}, false
+}
+
+func (m MembershipConfig) OwnerVersions() []MembershipVersion {
+	out := make([]MembershipVersion, 0, 2)
+	if active, ok := m.ActiveVersion(); ok {
+		out = append(out, active)
+	}
+	if next, ok := m.NextVersion(); ok {
+		out = append(out, next)
+	}
+	return out
+}
+
+func (m MembershipConfig) MemberVersions() []MembershipVersion {
+	seen := map[int64]bool{}
+	out := make([]MembershipVersion, 0, len(m.Versions))
+	for _, v := range m.OwnerVersions() {
+		if seen[v.Version] {
+			continue
+		}
+		seen[v.Version] = true
+		out = append(out, v)
+	}
+	return out
+}
+
+// WithComputedLabels returns a copy whose version labels are stable and explicit.
+func (m MembershipConfig) WithComputedLabels() MembershipConfig {
+	out := m
+	out.Versions = append([]MembershipVersion(nil), m.Versions...)
+	for i := range out.Versions {
+		out.Versions[i] = out.Versions[i].WithComputedLabel()
+	}
+	return out
+}
+
+// WithComputedLabel returns a copy with label set to
+// registry.<version>.<sha256(sort(member ids))>. The label is used to isolate
+// memberlist runtimes and watch tokens from different membership versions.
+func (v MembershipVersion) WithComputedLabel() MembershipVersion {
+	if v.Label != "" {
+		return v
+	}
+	ids := make([]string, 0, len(v.Members))
+	for _, m := range v.Members {
+		if m.ID != "" {
+			ids = append(ids, m.ID)
+		}
+	}
+	sort.Strings(ids)
+	sum := sha256.Sum256([]byte(strings.Join(ids, "\n")))
+	v.Label = fmt.Sprintf("registry.%d.%s", v.Version, hex.EncodeToString(sum[:])[:16])
+	return v
+}
+
+// MemberIDs returns the sorted member ids in this membership version.
+func (v MembershipVersion) MemberIDs() []string {
+	out := make([]string, 0, len(v.Members))
+	for _, m := range v.Members {
+		if m.ID != "" {
+			out = append(out, m.ID)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 // validateDurations checks a name→value map parses as Go durations ("" skipped).
@@ -209,56 +309,43 @@ func validateDurations(m map[string]string) error {
 	return nil
 }
 
-// validateProviders checks each sandbox_group provider is store|external:<addr>.
-func validateProviders(p map[string]string) error {
-	for iface, spec := range p {
-		switch {
-		case spec == ProviderStore:
-		case strings.HasPrefix(spec, ProviderExternalPfx):
-			if strings.TrimPrefix(spec, ProviderExternalPfx) == "" {
-				return fmt.Errorf("clustercfg: sandbox_group.providers[%s]=%q has an empty external address", iface, spec)
-			}
-		default:
-			return fmt.Errorf("clustercfg: sandbox_group.providers[%s]=%q invalid (store|external:<addr>)", iface, spec)
-		}
-	}
-	return nil
-}
-
 // ===========================================================================
-// registry.yaml — registry-owned state authority + node_link / route_link /
-// scale_link hub (cluster.md §4.1).
+// registry.yaml — registry member unified control plane (cluster.md §2).
 // ===========================================================================
 
-// RegistryConfig is the registry role's config: sandbox-group config providers,
-// the node_link listener it holds, the route_link and scale_link listeners it
-// binds, and the Reserve park budget.
+// RegistryConfig is the registry role's config. member.listen is the default
+// listener for node_link, route_link, scale_link, member RPC, and memberlist HTTP
+// transport. node_link.listen may split long-lived node streams onto another
+// listener.
 type RegistryConfig struct {
-	SandboxGroup SandboxGroupConfig `yaml:"sandbox_group"` // sandbox-group config providers
-	NodeLink     NodeLinkConfig     `yaml:"node_link"`     // nodes dial this (registry holds it)
-	RouteLink    LinkListenConfig   `yaml:"route_link"`    // routers/admin tools dial this
-	ScaleLink    LinkListenConfig   `yaml:"scale_link"`    // scalers dial this
-	Reserve      ReserveConfig      `yaml:"reserve"`       // Reserve park budget
+	Member     MemberConfig     `yaml:"member"`
+	Membership MembershipConfig `yaml:"membership"`
+	NodeLink   NodeLinkConfig   `yaml:"node_link"`
+	RouteLink  RouteLinkConfig  `yaml:"route_link"`
+	NodeList   NodeListConfig   `yaml:"node_list"`
+	ScaleLink  ScaleLinkConfig  `yaml:"scale_link"`
 }
 
 // DefaultRegistry returns the registry config with all non-required fields set.
 func DefaultRegistry() RegistryConfig {
 	return RegistryConfig{
-		SandboxGroup: SandboxGroupConfig{Providers: map[string]string{
-			ProviderKey:           ProviderStore,
-			ProviderSandboxConfig: ProviderStore,
-			ProviderPlacement:     ProviderStore,
-			ProviderImagePull:     ProviderStore,
-		}},
-		NodeLink:  NodeLinkConfig{Listen: ":7700", HeartbeatInterval: "10s", NodeDeadAfter: "30s", RevisionRetention: 10000},
-		RouteLink: LinkListenConfig{Listen: defaultRouteLinkEndpoint},
-		ScaleLink: LinkListenConfig{Listen: defaultScaleLinkEndpoint},
-		Reserve:   ReserveConfig{ParkTimeout: "30s"},
+		Member: MemberConfig{ID: "registry", Listen: ":7700"},
+		Membership: MembershipConfig{
+			Active: 1,
+			Versions: []MembershipVersion{{
+				Version: 1,
+				Members: []MembershipMember{{ID: "registry"}},
+			}},
+			Owners: MembershipOwnerConfig{RouteLink: 1, NodeLink: 1, NodeList: 1},
+		},
+		NodeLink:  NodeLinkConfig{HeartbeatInterval: "10s", NodeDeadAfter: "30s", RevisionRetention: 10000},
+		RouteLink: RouteLinkConfig{ParkTimeout: "30s"},
+		NodeList:  NodeListConfig{ShardCount: 1024, WatchRetention: 10000},
+		ScaleLink: ScaleLinkConfig{ScalerReplicaCount: 3, MinReadyScalers: 1, PlaceTimeout: "2s"},
 	}
 }
 
-// LoadRegistry reads, defaults, and validates registry.yaml. The sandbox-group
-// encryption_key falls back to the SANDBOX_GROUP_ENCRYPTION_KEY env when unset.
+// LoadRegistry reads, defaults, and validates registry.yaml.
 func LoadRegistry(path string) (*RegistryConfig, error) {
 	c := DefaultRegistry()
 	if path != "" {
@@ -271,9 +358,6 @@ func LoadRegistry(path string) (*RegistryConfig, error) {
 		}
 		c.applyDefaults()
 	}
-	if c.SandboxGroup.EncryptionKey == "" {
-		c.SandboxGroup.EncryptionKey = os.Getenv(envGroupEncryptionKey)
-	}
 	if err := c.Validate(); err != nil {
 		return nil, err
 	}
@@ -284,17 +368,38 @@ func LoadRegistry(path string) (*RegistryConfig, error) {
 // defaulted struct overwrites whole sub-structs that appear, zeroing siblings).
 func (c *RegistryConfig) applyDefaults() {
 	d := DefaultRegistry()
-	if c.SandboxGroup.Providers == nil {
-		c.SandboxGroup.Providers = d.SandboxGroup.Providers
-	} else {
-		for _, k := range []string{ProviderKey, ProviderSandboxConfig, ProviderPlacement, ProviderImagePull} {
-			if c.SandboxGroup.Providers[k] == "" {
-				c.SandboxGroup.Providers[k] = ProviderStore
+	if c.Member.ID == "" {
+		c.Member.ID = d.Member.ID
+	}
+	if c.Member.Listen == "" {
+		c.Member.Listen = d.Member.Listen
+	}
+	if c.Member.Advertise == "" {
+		c.Member.Advertise = c.Member.Listen
+	}
+	if c.Membership.Active == 0 {
+		c.Membership.Active = d.Membership.Active
+	}
+	if len(c.Membership.Versions) == 0 {
+		c.Membership.Versions = d.Membership.Versions
+	}
+	for vi := range c.Membership.Versions {
+		for mi := range c.Membership.Versions[vi].Members {
+			if c.Membership.Versions[vi].Members[mi].ID == c.Member.ID &&
+				c.Membership.Versions[vi].Members[mi].Advertise == "" {
+				c.Membership.Versions[vi].Members[mi].Advertise = c.ControlAdvertise()
 			}
 		}
+		c.Membership.Versions[vi] = c.Membership.Versions[vi].WithComputedLabel()
 	}
-	if c.NodeLink.Listen == "" {
-		c.NodeLink.Listen = d.NodeLink.Listen
+	if c.Membership.Owners.RouteLink == 0 {
+		c.Membership.Owners.RouteLink = d.Membership.Owners.RouteLink
+	}
+	if c.Membership.Owners.NodeLink == 0 {
+		c.Membership.Owners.NodeLink = d.Membership.Owners.NodeLink
+	}
+	if c.Membership.Owners.NodeList == 0 {
+		c.Membership.Owners.NodeList = d.Membership.Owners.NodeList
 	}
 	if c.NodeLink.HeartbeatInterval == "" {
 		c.NodeLink.HeartbeatInterval = d.NodeLink.HeartbeatInterval
@@ -305,27 +410,107 @@ func (c *RegistryConfig) applyDefaults() {
 	if c.NodeLink.RevisionRetention == 0 {
 		c.NodeLink.RevisionRetention = d.NodeLink.RevisionRetention
 	}
-	if c.RouteLink.Listen == "" {
-		c.RouteLink.Listen = d.RouteLink.Listen
+	if c.RouteLink.ParkTimeout == "" {
+		c.RouteLink.ParkTimeout = d.RouteLink.ParkTimeout
 	}
-	if c.ScaleLink.Listen == "" {
-		c.ScaleLink.Listen = d.ScaleLink.Listen
+	if c.NodeList.ShardCount == 0 {
+		c.NodeList.ShardCount = d.NodeList.ShardCount
 	}
-	if c.Reserve.ParkTimeout == "" {
-		c.Reserve.ParkTimeout = d.Reserve.ParkTimeout
+	if c.NodeList.WatchRetention == 0 {
+		c.NodeList.WatchRetention = d.NodeList.WatchRetention
+	}
+	if c.ScaleLink.ScalerReplicaCount == 0 {
+		c.ScaleLink.ScalerReplicaCount = d.ScaleLink.ScalerReplicaCount
+	}
+	if c.ScaleLink.MinReadyScalers == 0 {
+		c.ScaleLink.MinReadyScalers = d.ScaleLink.MinReadyScalers
+	}
+	if c.ScaleLink.PlaceTimeout == "" {
+		c.ScaleLink.PlaceTimeout = d.ScaleLink.PlaceTimeout
 	}
 }
 
 // Validate checks required fields and that durations / enums parse.
 func (c *RegistryConfig) Validate() error {
-	if err := validateProviders(c.SandboxGroup.Providers); err != nil {
-		return err
+	if c.Member.ID == "" {
+		return fmt.Errorf("clustercfg: member.id is required")
+	}
+	if c.Member.Listen == "" {
+		return fmt.Errorf("clustercfg: member.listen is required")
+	}
+	if c.Membership.Active <= 0 {
+		return fmt.Errorf("clustercfg: membership.active must be positive")
+	}
+	if c.Membership.Next < 0 {
+		return fmt.Errorf("clustercfg: membership.next must not be negative")
+	}
+	if len(c.Membership.Versions) == 0 {
+		return fmt.Errorf("clustercfg: membership.versions must not be empty")
+	}
+	activeFound := false
+	nextFound := c.Membership.Next == 0 || c.Membership.Next == c.Membership.Active
+	selfInOwnerVersion := false
+	for _, v := range c.Membership.Versions {
+		if v.Version == c.Membership.Active {
+			activeFound = true
+		}
+		if v.Version == c.Membership.Next {
+			nextFound = true
+		}
+		if v.Version <= 0 {
+			return fmt.Errorf("clustercfg: membership version must be positive")
+		}
+		if len(v.Members) == 0 {
+			return fmt.Errorf("clustercfg: membership version %d has no members", v.Version)
+		}
+		if v.Version == c.Membership.Active || (c.Membership.Next != 0 && v.Version == c.Membership.Next) {
+			for _, member := range v.Members {
+				if member.ID == c.Member.ID {
+					selfInOwnerVersion = true
+				}
+			}
+		}
+	}
+	if !activeFound {
+		return fmt.Errorf("clustercfg: membership.active %d is not in membership.versions", c.Membership.Active)
+	}
+	if !nextFound {
+		return fmt.Errorf("clustercfg: membership.next %d is not in membership.versions", c.Membership.Next)
+	}
+	if !selfInOwnerVersion {
+		return fmt.Errorf("clustercfg: member.id %q is not in active or next membership", c.Member.ID)
 	}
 	return validateDurations(map[string]string{
 		"node_link.heartbeat_interval": c.NodeLink.HeartbeatInterval,
 		"node_link.node_dead_after":    c.NodeLink.NodeDeadAfter,
-		"reserve.park_timeout":         c.Reserve.ParkTimeout,
+		"route_link.park_timeout":      c.RouteLink.ParkTimeout,
+		"scale_link.place_timeout":     c.ScaleLink.PlaceTimeout,
 	})
+}
+
+// ControlListen is the unified registry listener.
+func (c *RegistryConfig) ControlListen() string { return c.Member.Listen }
+
+// ControlAdvertise is the address other components should use for this member.
+func (c *RegistryConfig) ControlAdvertise() string {
+	if c.Member.Advertise != "" {
+		return c.Member.Advertise
+	}
+	return c.Member.Listen
+}
+
+// NodeListen is the node_link listener; empty node_link.listen means reuse the
+// unified control listener.
+func (c *RegistryConfig) NodeListen() string {
+	if c.NodeLink.Listen != "" {
+		return c.NodeLink.Listen
+	}
+	return c.Member.Listen
+}
+
+// NodeLinkSplit reports whether node_link should bind a separate listener.
+func (c *RegistryConfig) NodeLinkSplit() bool {
+	return c.NodeLink.Listen != "" && c.NodeLink.Listen != c.Member.Listen
 }
 
 // ===========================================================================
@@ -335,19 +520,19 @@ func (c *RegistryConfig) Validate() error {
 // RouterConfig is the router role's config, grouped as upstream (registry) /
 // downstream (ingress) / policy (auth) plus the service domain.
 type RouterConfig struct {
-	Domain        string         `yaml:"domain"`         // service domain; splits control/data (required)
-	RouteLink     LinkDialConfig `yaml:"route_link"`     // upstream: registry route_link to dial
-	Ingress       IngressConfig  `yaml:"ingress"`        // downstream: e2b client ingress
-	Auth          RouterAuth     `yaml:"auth"`           // auth policy
-	MetricsListen string         `yaml:"metrics_listen"` // optional Prometheus text endpoint
+	Domain        string             `yaml:"domain"`         // service domain; splits control/data (required)
+	Registry      RegistryDialConfig `yaml:"registry"`       // upstream: registry bootstrap/membership
+	Ingress       IngressConfig      `yaml:"ingress"`        // downstream: e2b client ingress
+	Auth          RouterAuth         `yaml:"auth"`           // auth policy
+	MetricsListen string             `yaml:"metrics_listen"` // optional Prometheus text endpoint
 }
 
 // DefaultRouter returns the router config with all non-required fields set.
 func DefaultRouter() RouterConfig {
 	return RouterConfig{
-		RouteLink: LinkDialConfig{Endpoint: defaultRouteLinkEndpoint},
-		Ingress:   IngressConfig{Listen: ":443"},
-		Auth:      RouterAuth{APIKey: "enforce", DataPlane: "enforce", CacheTTL: "60s"},
+		Registry: RegistryDialConfig{Bootstrap: defaultRegistryBootstrap},
+		Ingress:  IngressConfig{Listen: ":443"},
+		Auth:     RouterAuth{APIKey: "enforce", DataPlane: "enforce", CacheTTL: "60s"},
 	}
 }
 
@@ -372,8 +557,8 @@ func LoadRouter(path string) (*RouterConfig, error) {
 
 func (c *RouterConfig) applyDefaults() {
 	d := DefaultRouter()
-	if c.RouteLink.Endpoint == "" {
-		c.RouteLink.Endpoint = d.RouteLink.Endpoint
+	if c.Registry.Bootstrap == "" {
+		c.Registry.Bootstrap = d.Registry.Bootstrap
 	}
 	if c.Ingress.Listen == "" {
 		c.Ingress.Listen = d.Ingress.Listen
@@ -392,6 +577,9 @@ func (c *RouterConfig) applyDefaults() {
 func (c *RouterConfig) Validate() error {
 	if c.Domain == "" {
 		return fmt.Errorf("clustercfg: domain is required")
+	}
+	if c.Registry.Bootstrap == "" {
+		return fmt.Errorf("clustercfg: registry.bootstrap is required")
 	}
 	switch c.Auth.APIKey {
 	case "", "off", "log", "enforce":
@@ -419,14 +607,16 @@ func (c *RouterConfig) AuthCacheDur() time.Duration {
 // separate process that dials registry scale_link and answers placement over that
 // link): the upstream scale_link plus the placement policy.
 type ScalerConfig struct {
-	ScaleLink LinkDialConfig  `yaml:"scale_link"` // upstream: registry scale_link to dial
-	Placement PlacementConfig `yaml:"placement"`  // placement policy
+	Member    MemberConfig       `yaml:"member"`
+	Registry  RegistryDialConfig `yaml:"registry"`  // upstream: registry bootstrap/membership
+	Placement PlacementConfig    `yaml:"placement"` // placement policy
 }
 
 // DefaultScaler returns the scaler config with all non-required fields set.
 func DefaultScaler() ScalerConfig {
 	return ScalerConfig{
-		ScaleLink: LinkDialConfig{Endpoint: defaultScaleLinkEndpoint},
+		Member:    MemberConfig{ID: "scaler", Listen: ":7800"},
+		Registry:  RegistryDialConfig{Bootstrap: defaultRegistryBootstrap},
 		Placement: PlacementConfig{Candidates: 2, ZoneAdmitMax: "yellow", NodeDeadAfter: "30s"},
 	}
 }
@@ -452,8 +642,17 @@ func LoadScaler(path string) (*ScalerConfig, error) {
 
 func (c *ScalerConfig) applyDefaults() {
 	d := DefaultScaler()
-	if c.ScaleLink.Endpoint == "" {
-		c.ScaleLink.Endpoint = d.ScaleLink.Endpoint
+	if c.Member.ID == "" {
+		c.Member.ID = d.Member.ID
+	}
+	if c.Member.Listen == "" {
+		c.Member.Listen = d.Member.Listen
+	}
+	if c.Member.Advertise == "" {
+		c.Member.Advertise = c.Member.Listen
+	}
+	if c.Registry.Bootstrap == "" {
+		c.Registry.Bootstrap = d.Registry.Bootstrap
 	}
 	if c.Placement.Candidates == 0 {
 		c.Placement.Candidates = d.Placement.Candidates
@@ -467,6 +666,15 @@ func (c *ScalerConfig) applyDefaults() {
 }
 
 func (c *ScalerConfig) Validate() error {
+	if c.Member.ID == "" {
+		return fmt.Errorf("clustercfg: member.id is required")
+	}
+	if c.Member.Listen == "" {
+		return fmt.Errorf("clustercfg: member.listen is required")
+	}
+	if c.Registry.Bootstrap == "" {
+		return fmt.Errorf("clustercfg: registry.bootstrap is required")
+	}
 	switch c.Placement.ZoneAdmitMax {
 	case "", "green", "yellow", "red":
 	default:

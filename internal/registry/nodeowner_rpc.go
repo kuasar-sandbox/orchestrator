@@ -14,14 +14,16 @@ import (
 const NodeOwnerRPCPath = "/internal/node-owner"
 
 type nodeOwnerRequest struct {
-	Op          string                    `json:"op"`
-	NodeID      string                    `json:"node_id,omitempty"`
-	Fingerprint string                    `json:"fingerprint,omitempty"`
-	ManifestKey string                    `json:"manifest_key,omitempty"`
-	ExpiresUnix int64                     `json:"expires_unix,omitempty"`
-	BuildID     string                    `json:"build_id,omitempty"`
-	Resources   *routesync.BuildResources `json:"resources,omitempty"`
-	SID         string                    `json:"sid,omitempty"`
+	Op              string                    `json:"op"`
+	NodeID          string                    `json:"node_id,omitempty"`
+	Fingerprint     string                    `json:"fingerprint,omitempty"`
+	ManifestKeyType string                    `json:"manifest_key_type,omitempty"`
+	ManifestKey     string                    `json:"manifest_key,omitempty"`
+	ManifestKeyRef  string                    `json:"manifest_key_ref,omitempty"`
+	ExpiresUnix     int64                     `json:"expires_unix,omitempty"`
+	BuildID         string                    `json:"build_id,omitempty"`
+	Resources       *routesync.BuildResources `json:"resources,omitempty"`
+	SID             string                    `json:"sid,omitempty"`
 }
 
 type nodeOwnerResponse struct {
@@ -45,7 +47,11 @@ func ServeNodeOwner(w http.ResponseWriter, req *http.Request, owner NodeOwner) {
 	var err error
 	switch in.Op {
 	case "put_manifest_key":
-		err = owner.PutManifestKey(req.Context(), in.NodeID, in.Fingerprint, in.ManifestKey, in.ExpiresUnix)
+		keyType, keyValue := in.ManifestKeyType, in.ManifestKey
+		if keyType == "ref" {
+			keyValue = in.ManifestKeyRef
+		}
+		err = owner.PutManifestKey(req.Context(), in.NodeID, in.Fingerprint, keyType, keyValue, in.ExpiresUnix)
 		out.OK = err == nil
 	case "drop_manifest_key":
 		err = owner.DropManifestKey(req.Context(), in.NodeID, in.Fingerprint)
@@ -88,8 +94,14 @@ func NewHTTPNodeOwner(endpoint string, client *http.Client) *HTTPNodeOwner {
 	return &HTTPNodeOwner{endpoint: strings.TrimRight(endpoint, "/"), client: client}
 }
 
-func (o *HTTPNodeOwner) PutManifestKey(ctx context.Context, nodeID, fingerprint, manifestKey string, expiresUnix int64) error {
-	_, err := o.call(ctx, nodeOwnerRequest{Op: "put_manifest_key", NodeID: nodeID, Fingerprint: fingerprint, ManifestKey: manifestKey, ExpiresUnix: expiresUnix})
+func (o *HTTPNodeOwner) PutManifestKey(ctx context.Context, nodeID, fingerprint, keyType, keyValue string, expiresUnix int64) error {
+	req := nodeOwnerRequest{Op: "put_manifest_key", NodeID: nodeID, Fingerprint: fingerprint, ManifestKeyType: keyType, ExpiresUnix: expiresUnix}
+	if keyType == "ref" {
+		req.ManifestKeyRef = keyValue
+	} else {
+		req.ManifestKey = keyValue
+	}
+	_, err := o.call(ctx, req)
 	return err
 }
 

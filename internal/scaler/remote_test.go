@@ -13,58 +13,54 @@ import (
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
 
+	clusterstate "github.com/kuasar-sandbox/sandbox-orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/clustercfg"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/clusterstore"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/registry"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/routesync"
 )
 
-// TestScalerLinkReverseCall drives the full P2 reverse-call in-process: a registry
-// (scale_link over h2c) + a standalone scaler dialing it; the registry's
-// channelPlacer reverse-requests placement and the scaler answers over its view.
-func TestScalerLinkReverseCall(t *testing.T) {
+func TestScalerDirectPlace(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	discard := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	kv := clusterstore.OpenMemory(1000)
 	defer kv.Close()
-	stores := registry.NewStores(kv, nil)
+	stores := registry.NewStores(kv)
 	stores.PutNode(ctx, &registry.NodeRecord{NodeID: "n1", Labels: map[string]string{"pool": "p"}, Counts: 5})
 	stores.PutNode(ctx, &registry.NodeRecord{NodeID: "n2", Labels: map[string]string{"pool": "p"}, Counts: 0})
-	stores.PutGroup(ctx, &registry.GroupConfig{Group: "/g", NodeSelectors: []map[string]string{{"pool": "p"}}})
 
 	reg := registry.New(stores, nil, 0, discard)
-	placer := registry.NewChannelPlacer(reg, 2*time.Second)
+	placer := registry.NewHTTPScalePlacer(reg, 2, 2*time.Second)
 	reg.SetPlacer(placer)
 
 	mux := http.NewServeMux()
 	reg.ServeScaleLink(mux)
-	mux.HandleFunc(routesync.ScaleLinkPath, reg.ServeScalerLink)
 	controlSrv := httptest.NewServer(h2c.NewHandler(mux, &http2.Server{}))
 	defer controlSrv.Close()
-	defer cancel() // LIFO: cancel before closing the server so the scaler tears down its streams first
+	defer cancel()
 
 	svc := NewRemote(strings.TrimPrefix(controlSrv.URL, "http://"), nil, clustercfg.PlacementConfig{Candidates: 2}, 30, discard)
+	scalerMux := http.NewServeMux()
+	svc.ServeScaleLink(scalerMux)
+	scalerSrv := httptest.NewServer(scalerMux)
+	defer scalerSrv.Close()
+	svc.groups.replace([]clusterstate.SandboxGroupRecord{{Group: "/g", NodeSelectors: []map[string]string{{"pool": "p"}}}})
 	svc.Start(ctx)
+	go svc.RegisterLoop(ctx, "s1", scalerSrv.URL, "")
 
-	// Poll until scale_link + node_list/group views are up and placement
-	// resolves to a selector-matching node via the reverse-call. node_list no
-	// longer carries high-frequency load, so this does not assert colder-node
-	// selection.
-	var node string
+	var placement *registry.Placement
 	var err error
 	for i := 0; i < 300; i++ {
-		if node, err = placer.Place(ctx, registry.PlaceRequest{Group: "/g", RouteKey: "rk"}); err == nil {
+		if placement, err = placer.Place(ctx, registry.PlaceRequest{Group: "/g", RouteKey: "rk"}); err == nil {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	if err != nil || (node != "n1" && node != "n2") {
-		t.Fatalf("reverse-call Place = %q err=%v (want n1 or n2)", node, err)
+	if err != nil || (placement.NodeID != "n1" && placement.NodeID != "n2") {
+		t.Fatalf("direct Place = %+v err=%v (want n1 or n2)", placement, err)
 	}
 
-	// An unplaceable group (no matching nodes) → ErrNoNode through the reverse-call.
-	stores.PutGroup(ctx, &registry.GroupConfig{Group: "/x", NodeSelectors: []map[string]string{{"pool": "absent"}}})
+	svc.groups.replace([]clusterstate.SandboxGroupRecord{{Group: "/x", NodeSelectors: []map[string]string{{"pool": "absent"}}}})
 	for i := 0; i < 300; i++ {
 		_, perr := placer.Place(ctx, registry.PlaceRequest{Group: "/x", RouteKey: "rk"})
 		if perr == registry.ErrNoNode {
@@ -75,13 +71,76 @@ func TestScalerLinkReverseCall(t *testing.T) {
 	t.Fatal("unplaceable group never returned ErrNoNode")
 }
 
-// TestChannelPlacerNoScaler: with no scaler attached, placement stalls (ErrNoNode),
-// not a hang — the data plane (router cache) is unaffected (cluster.md §11).
-func TestChannelPlacerNoScaler(t *testing.T) {
+func TestScalerConnectsAllRegistryMembers(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	discard := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	reg1, srv1 := testScaleRegistry(t, ctx, "n1")
+	defer srv1.Close()
+	reg2, srv2 := testScaleRegistry(t, ctx, "n2")
+	defer srv2.Close()
+
+	svc := NewRemoteLinks([]RegistryLink{
+		{Name: "r1", BaseURL: srv1.URL, Client: srv1.Client()},
+		{Name: "r2", BaseURL: srv2.URL, Client: srv2.Client()},
+	}, clustercfg.PlacementConfig{Candidates: 1}, 30, discard)
+	scalerMux := http.NewServeMux()
+	svc.ServeScaleLink(scalerMux)
+	scalerSrv := httptest.NewServer(scalerMux)
+	defer scalerSrv.Close()
+	defer cancel()
+	svc.ImportGroups([]clusterstate.SandboxGroupRecord{{Group: "/g", NodeSelectors: []map[string]string{{"pool": "p"}}}})
+	svc.Start(ctx)
+	go svc.RegisterLoop(ctx, "s1", scalerSrv.URL, "")
+
+	for i := 0; i < 300; i++ {
+		if len(svc.nodes.values()) == 2 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := len(svc.nodes.values()); got != 2 {
+		t.Fatalf("merged node_list size=%d, want 2", got)
+	}
+
+	for name, placer := range map[string]registry.Placer{
+		"reg1": registry.NewHTTPScalePlacer(reg1, 1, 2*time.Second),
+		"reg2": registry.NewHTTPScalePlacer(reg2, 1, 2*time.Second),
+	} {
+		var placement *registry.Placement
+		var err error
+		for i := 0; i < 300; i++ {
+			placement, err = placer.Place(ctx, registry.PlaceRequest{Group: "/g", RouteKey: "rk"})
+			if err == nil && placement != nil && placement.NodeID != "" {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		if err != nil || placement == nil || placement.NodeID == "" {
+			t.Fatalf("%s Place = %+v err=%v", name, placement, err)
+		}
+	}
+}
+
+func testScaleRegistry(t *testing.T, ctx context.Context, nodeID string) (*registry.Registry, *httptest.Server) {
+	t.Helper()
+	kv := clusterstore.OpenMemory(1000)
+	t.Cleanup(func() { kv.Close() })
+	stores := registry.NewStores(kv)
+	if err := stores.PutNode(ctx, &registry.NodeRecord{NodeID: nodeID, Labels: map[string]string{"pool": "p"}, LastHeartbeatUnix: time.Now().Unix()}); err != nil {
+		t.Fatal(err)
+	}
+	reg := registry.New(stores, nil, 0, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	mux := http.NewServeMux()
+	reg.ServeScaleLink(mux)
+	return reg, httptest.NewServer(h2c.NewHandler(mux, &http2.Server{}))
+}
+
+func TestHTTPScalePlacerNoScaler(t *testing.T) {
 	kv := clusterstore.OpenMemory(0)
 	defer kv.Close()
-	reg := registry.New(registry.NewStores(kv, nil), nil, 0, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	placer := registry.NewChannelPlacer(reg, 200*time.Millisecond)
+	reg := registry.New(registry.NewStores(kv), nil, 0, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	placer := registry.NewHTTPScalePlacer(reg, 1, 200*time.Millisecond)
 	if _, err := placer.Place(context.Background(), registry.PlaceRequest{Group: "/g"}); err != registry.ErrNoNode {
 		t.Fatalf("no scaler → want ErrNoNode, got %v", err)
 	}

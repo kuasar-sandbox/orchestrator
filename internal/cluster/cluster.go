@@ -1,15 +1,16 @@
-// Package cluster contains the shared contracts for the cluster control plane's
-// stateful registry design: versioned member placement and sandbox-group providers.
+// Package cluster contains shared contracts for the cluster control plane:
+// versioned member placement, route/node records, and scaler-side sandbox-group
+// provider/importer interfaces.
 package cluster
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
 
 	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/maglev"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/groupcfg"
 )
 
 // MemberView is the versioned registry member set. LocateN must use this stable
@@ -43,8 +44,38 @@ func (v MemberView) Owners(key string, n int) ([]string, error) {
 // Secret is a typed secret value. Inline values are carried by registry/scaler;
 // ref values are resolved out-of-band by the node or provider.
 type Secret struct {
-	Type  string `json:"type"`            // inline | ref
-	Value string `json:"value,omitempty"` // inline secret or provider reference
+	Type        string `json:"type"`                  // inline | ref
+	Value       string `json:"value,omitempty"`       // inline secret or provider reference
+	Fingerprint string `json:"fingerprint,omitempty"` // required for ref manifest_key key_put/precheck
+}
+
+func (s *Secret) UnmarshalJSON(raw []byte) error {
+	if string(raw) == "null" {
+		*s = Secret{}
+		return nil
+	}
+	var shorthand string
+	if len(raw) > 0 && raw[0] == '"' {
+		if err := json.Unmarshal(raw, &shorthand); err != nil {
+			return err
+		}
+		if shorthand == "" {
+			*s = Secret{}
+		} else {
+			*s = Secret{Type: SecretInline, Value: shorthand}
+		}
+		return nil
+	}
+	type alias Secret
+	var out alias
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return err
+	}
+	if out.Type == "" && out.Value != "" {
+		out.Type = SecretInline
+	}
+	*s = Secret(out)
+	return nil
 }
 
 const (
@@ -60,6 +91,23 @@ type SandboxGroup struct {
 	RegistryAuth Secret            `json:"registry_auth,omitempty"`
 	TemplateRef  string            `json:"template_ref,omitempty"`
 	Metadata     map[string]string `json:"metadata,omitempty"`
+}
+
+// SandboxGroupRecord is the importer record owned by scaler/provider side. It is
+// intentionally richer than SandboxGroup: scaler needs placement selectors and
+// secret material to answer Place and push node-owner key allocation.
+type SandboxGroupRecord struct {
+	Group         string              `json:"group"`
+	ProjectID     string              `json:"project_id,omitempty"`
+	ManifestKey   Secret              `json:"manifest_key,omitempty"`
+	AuthKey       Secret              `json:"auth_key,omitempty"`
+	RegistryAuth  Secret              `json:"registry_auth,omitempty"`
+	Config        map[string]string   `json:"sandbox_config,omitempty"`
+	ImageRepo     string              `json:"image_repo,omitempty"`
+	TemplateRef   string              `json:"template_ref,omitempty"`
+	Metadata      map[string]string   `json:"metadata,omitempty"`
+	NodeSelectors []map[string]string `json:"node_selectors,omitempty"`
+	ShuffleLabels map[string]string   `json:"shuffle_labels,omitempty"`
 }
 
 // PlacementHint is the raw placement input. Scaler folds shuffle-sharding into
@@ -85,55 +133,4 @@ type SandboxGroupProvider interface {
 
 type SandboxGroupImporter interface {
 	Range(ctx context.Context, cursor string, limit int) (GroupPage, error)
-}
-
-// ResolverAdapter projects the existing groupcfg resolver into the unified
-// provider interface.
-type ResolverAdapter struct {
-	Resolver groupcfg.Resolver
-}
-
-func (a ResolverAdapter) Get(ctx context.Context, group string) (SandboxGroup, bool, error) {
-	sc, found, err := a.Resolver.Sandbox.SandboxConfig(ctx, group)
-	if err != nil || !found {
-		return SandboxGroup{}, found, err
-	}
-	out := SandboxGroup{Group: group, Config: sc.Config, ImageRepo: sc.ImageRepo, TemplateRef: sc.TemplateRef}
-	if a.Resolver.ImagePull != nil {
-		if ip, ok, err := a.Resolver.ImagePull.ImagePull(ctx, group); err != nil {
-			return SandboxGroup{}, false, err
-		} else if ok {
-			if ip.ImageRepo != "" {
-				out.ImageRepo = ip.ImageRepo
-			}
-			if ip.RegistryAuth != "" {
-				out.RegistryAuth = Secret{Type: SecretInline, Value: ip.RegistryAuth}
-			}
-		}
-	}
-	return out, true, nil
-}
-
-func (a ResolverAdapter) GetPlacementHint(ctx context.Context, group string) (PlacementHint, bool, error) {
-	p, found, err := a.Resolver.Placement.Placement(ctx, group)
-	if err != nil || !found {
-		return PlacementHint{}, found, err
-	}
-	return PlacementHint{NodeSelectors: p.NodeSelectors, ShuffleLabels: p.ShuffleLabels}, true, nil
-}
-
-func (a ResolverAdapter) GetKey(ctx context.Context, group string) (Secret, bool, error) {
-	k, found, err := a.Resolver.Key.Key(ctx, group)
-	if err != nil || !found || k.ManifestKey == "" {
-		return Secret{}, found, err
-	}
-	return Secret{Type: SecretInline, Value: k.ManifestKey}, true, nil
-}
-
-func (a ResolverAdapter) GetAuthKey(ctx context.Context, group string) (Secret, bool, error) {
-	k, found, err := a.Resolver.Key.Key(ctx, group)
-	if err != nil || !found || k.AuthKey == "" {
-		return Secret{}, found, err
-	}
-	return Secret{Type: SecretInline, Value: k.AuthKey}, true, nil
 }

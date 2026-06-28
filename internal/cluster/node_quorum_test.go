@@ -131,6 +131,30 @@ func TestNodeQuorumReadRepair(t *testing.T) {
 	}
 }
 
+func TestNodeJointQuorumRequiresEveryOwnerSet(t *testing.T) {
+	ctx := context.Background()
+	a := &flakyNodeReplica{NodeReplica: NewMemoryNodeReplica()}
+	b := &flakyNodeReplica{NodeReplica: NewMemoryNodeReplica()}
+	c := &flakyNodeReplica{NodeReplica: NewMemoryNodeReplica()}
+	d := &flakyNodeReplica{NodeReplica: NewMemoryNodeReplica()}
+	e := &flakyNodeReplica{NodeReplica: NewMemoryNodeReplica()}
+	q := NewNodeJointQuorum("writer", []NodeReplicaSlot{
+		{ID: "a", Replica: a},
+		{ID: "b", Replica: b},
+		{ID: "c", Replica: c},
+		{ID: "d", Replica: d},
+		{ID: "e", Replica: e},
+	}, [][]string{{"a", "b", "c"}, {"b", "d", "e"}})
+
+	a.down, b.down = true, true
+	_, err := q.CAS(ctx, "n1", 0, func(NodeRecord, bool) (NodeRecord, bool, error) {
+		return NodeRecord{NodeID: "n1", State: NodeLive}, true, nil
+	})
+	if !errors.Is(err, ErrQuorum) {
+		t.Fatalf("joint write err=%v, want ErrQuorum when active set lacks quorum", err)
+	}
+}
+
 func TestNodeQuorumDeleteTombstonePreventsResurrection(t *testing.T) {
 	ctx := context.Background()
 	rs := []*MemoryNodeReplica{NewMemoryNodeReplica(), NewMemoryNodeReplica(), NewMemoryNodeReplica()}

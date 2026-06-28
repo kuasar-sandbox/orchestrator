@@ -1,31 +1,38 @@
 # cluster-ctl registry config — cluster-ctl registry --config /etc/cluster-ctl/registry.yaml.
-# Registry-owned state authority + node_link / route_link / scale_link hub.
 # Validate with `cluster-ctl config registry --config registry.yaml`.
 
-# How per-group config is sourced (cluster.md §6.2): each interface is "store" (the
-# registry self-stores) or "external:<addr>" (a cloud-provider service).
-sandbox_group:
-  providers: { key: store, sandbox_config: store, placement: store, image_pull: store }
-  # encryption_key: ""                # AES-256 sealing self-stored manifest_key (or SANDBOX_GROUP_ENCRYPTION_KEY env)
-  # tls: { cert: ..., key: ..., ca: ... }   # client mTLS for external:<addr> providers
-
-# Listener nodes dial to register, stream routes, and receive commands (node_link).
-node_link:
+member:
+  id: registry-1
   listen: ":7700"
+  advertise: "https://registry-1.example:7700"
   # tls: { cert: ..., key: ..., ca: ... }   # server mTLS
+
+membership:
+  active: 1
+  versions:
+    - version: 1
+      members:
+        - { id: registry-1, advertise: "https://registry-1.example:7700" }
+  owners:
+    route_link: 1
+    node_link: 1
+    node_list: 1
+
+node_link:
+  # listen: ""                         # optional split listener for node streams; empty = member.listen
+  # advertise: ""
   heartbeat_interval: 10s
   node_dead_after: 30s
   revision_retention: 10000
 
-# Listener routers and admin tools dial for Reserve/resolve/group import-export.
 route_link:
-  listen: /run/cluster/route-link.sock
-  # tls: { cert: ..., key: ..., ca: ... }   # server mTLS when split across hosts
-
-# Listener scalers dial for node_list/group WATCH_LIST and reverse placement.
-scale_link:
-  listen: /run/cluster/scale-link.sock
-  # tls: { cert: ..., key: ..., ca: ... }   # server mTLS when split across hosts
-
-reserve:
   park_timeout: 30s
+
+node_list:
+  shard_count: 1024
+  watch_retention: 10000
+
+scale_link:
+  scaler_replica_count: 3
+  min_ready_scalers: 1
+  place_timeout: 2s

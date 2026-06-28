@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -21,12 +22,18 @@ type RouteReplica interface {
 	Keys(ctx context.Context) []string
 }
 
+type RouteReplicaSlot struct {
+	ID      string
+	Replica RouteReplica
+}
+
 // RouteQuorum is the leaderless route_link write protocol over an owner set. It
 // uses unique ballots plus prepare/accept; reads repair the highest accepted value
 // back to lagging owners.
 type RouteQuorum struct {
 	writer   string
-	replicas []RouteReplica
+	replicas []routeReplicaSlot
+	sets     []quorumSet
 	mu       sync.Mutex
 	rounds   map[string]uint64
 }
@@ -35,41 +42,54 @@ func NewRouteQuorum(writer string, replicas ...RouteReplica) *RouteQuorum {
 	if writer == "" {
 		writer = "local"
 	}
-	return &RouteQuorum{writer: writer, replicas: replicas, rounds: map[string]uint64{}}
+	slots := make([]RouteReplicaSlot, 0, len(replicas))
+	owners := make([]string, 0, len(replicas))
+	for i, rep := range replicas {
+		id := replicaIndexID(i)
+		slots = append(slots, RouteReplicaSlot{ID: id, Replica: rep})
+		owners = append(owners, id)
+	}
+	return NewRouteJointQuorum(writer, slots, [][]string{owners})
 }
 
-func (q *RouteQuorum) quorum() int { return len(q.replicas)/2 + 1 }
+func NewRouteJointQuorum(writer string, slots []RouteReplicaSlot, ownerSets [][]string) *RouteQuorum {
+	if writer == "" {
+		writer = "local"
+	}
+	reps, sets := buildRouteQuorumSets(slots, ownerSets)
+	return &RouteQuorum{writer: writer, replicas: reps, sets: sets, rounds: map[string]uint64{}}
+}
 
 func (q *RouteQuorum) Get(ctx context.Context, group, routeKey string) (RouteRecord, bool, error) {
 	key := RouteKey(group, routeKey)
 	ballot := q.nextBallot(ctx, key)
 	reads := make([]routeRead, 0, len(q.replicas))
-	prepared := make([]RouteReplica, 0, len(q.replicas))
-	for _, r := range q.replicas {
-		rec, found, ok, err := r.Prepare(ctx, key, ballot)
+	prepared := map[int]bool{}
+	for i, r := range q.replicas {
+		rec, found, ok, err := r.replica.Prepare(ctx, key, ballot)
 		if err != nil || !ok {
 			continue
 		}
-		prepared = append(prepared, r)
+		prepared[i] = true
 		reads = append(reads, routeRead{rec: rec, found: found})
 	}
-	if len(prepared) < q.quorum() {
+	if !satisfiesQuorumSets(prepared, q.sets) {
 		return RouteRecord{}, false, ErrQuorum
 	}
 	best, found := highestRoute(reads)
 	if found {
 		best.Meta.Ballot = ballot
-		accepted := 0
-		for _, r := range prepared {
-			if ok, _ := r.Accept(ctx, key, best, ballot); ok {
-				accepted++
+		accepted := map[int]bool{}
+		for i := range prepared {
+			if ok, _ := q.replicas[i].replica.Accept(ctx, key, best, ballot); ok {
+				accepted[i] = true
 			}
 		}
-		if accepted < q.quorum() {
+		if !satisfiesQuorumSets(accepted, q.sets) {
 			return RouteRecord{}, false, ErrQuorum
 		}
 		for _, r := range q.replicas {
-			_ = r.Repair(ctx, key, best)
+			_ = r.replica.Repair(ctx, key, best)
 		}
 	}
 	if found && best.State == RouteDead {
@@ -81,7 +101,7 @@ func (q *RouteQuorum) Get(ctx context.Context, group, routeKey string) (RouteRec
 func (q *RouteQuorum) List(ctx context.Context, group string, fn func(RouteRecord) error) error {
 	keys := map[string]bool{}
 	for _, r := range q.replicas {
-		for _, key := range r.Keys(ctx) {
+		for _, key := range r.replica.Keys(ctx) {
 			g, _ := splitRouteKey(key)
 			if group == "" || g == group {
 				keys[key] = true
@@ -113,16 +133,16 @@ func (q *RouteQuorum) CAS(ctx context.Context, group, routeKey string, expectRev
 	key := RouteKey(group, routeKey)
 	ballot := q.nextBallot(ctx, key)
 	reads := make([]routeRead, 0, len(q.replicas))
-	prepared := make([]RouteReplica, 0, len(q.replicas))
-	for _, r := range q.replicas {
-		rec, found, ok, err := r.Prepare(ctx, key, ballot)
+	prepared := map[int]bool{}
+	for i, r := range q.replicas {
+		rec, found, ok, err := r.replica.Prepare(ctx, key, ballot)
 		if err != nil || !ok {
 			continue
 		}
-		prepared = append(prepared, r)
+		prepared[i] = true
 		reads = append(reads, routeRead{rec: rec, found: found})
 	}
-	if len(prepared) < q.quorum() {
+	if !satisfiesQuorumSets(prepared, q.sets) {
 		return RouteRecord{}, ErrQuorum
 	}
 	cur, physicalFound := highestRoute(reads)
@@ -152,32 +172,32 @@ func (q *RouteQuorum) CAS(ctx context.Context, group, routeKey string, expectRev
 			RouteKey: rk,
 			State:    RouteDead,
 		}
-		accepted := 0
-		for _, r := range prepared {
-			if ok, _ := r.Accept(ctx, key, tombstone, ballot); ok {
-				accepted++
+		accepted := map[int]bool{}
+		for i := range prepared {
+			if ok, _ := q.replicas[i].replica.Accept(ctx, key, tombstone, ballot); ok {
+				accepted[i] = true
 			}
 		}
-		if accepted < q.quorum() {
+		if !satisfiesQuorumSets(accepted, q.sets) {
 			return RouteRecord{}, ErrQuorum
 		}
 		for _, r := range q.replicas {
-			_ = r.Repair(ctx, key, tombstone)
+			_ = r.replica.Repair(ctx, key, tombstone)
 		}
 		return RouteRecord{}, nil
 	}
 	next.Meta = RecordMeta{Ballot: ballot, Rev: cur.Meta.Rev + 1, UpdatedAt: time.Now()}
-	accepted := 0
-	for _, r := range prepared {
-		if ok, _ := r.Accept(ctx, key, next, ballot); ok {
-			accepted++
+	accepted := map[int]bool{}
+	for i := range prepared {
+		if ok, _ := q.replicas[i].replica.Accept(ctx, key, next, ballot); ok {
+			accepted[i] = true
 		}
 	}
-	if accepted < q.quorum() {
+	if !satisfiesQuorumSets(accepted, q.sets) {
 		return RouteRecord{}, ErrQuorum
 	}
 	for _, r := range q.replicas {
-		_ = r.Repair(ctx, key, next)
+		_ = r.replica.Repair(ctx, key, next)
 	}
 	return next, nil
 }
@@ -185,7 +205,7 @@ func (q *RouteQuorum) CAS(ctx context.Context, group, routeKey string, expectRev
 func (q *RouteQuorum) nextBallot(ctx context.Context, key string) Ballot {
 	var max Ballot
 	for _, r := range q.replicas {
-		if b, err := r.MaxBallot(ctx, key); err == nil && max.Less(b) {
+		if b, err := r.replica.MaxBallot(ctx, key); err == nil && max.Less(b) {
 			max = b
 		}
 	}
@@ -197,6 +217,82 @@ func (q *RouteQuorum) nextBallot(ctx context.Context, key string) Ballot {
 	next := max.Round + 1
 	q.rounds[key] = next
 	return Ballot{Round: next, Writer: q.writer}
+}
+
+type routeReplicaSlot struct {
+	id      string
+	replica RouteReplica
+}
+
+type quorumSet struct {
+	indices []int
+	quorum  int
+}
+
+func buildRouteQuorumSets(slots []RouteReplicaSlot, ownerSets [][]string) ([]routeReplicaSlot, []quorumSet) {
+	reps := make([]routeReplicaSlot, 0, len(slots))
+	byID := map[string]int{}
+	for i, slot := range slots {
+		if slot.Replica == nil {
+			continue
+		}
+		id := slot.ID
+		if id == "" {
+			id = replicaIndexID(i)
+		}
+		if _, ok := byID[id]; ok {
+			continue
+		}
+		byID[id] = len(reps)
+		reps = append(reps, routeReplicaSlot{id: id, replica: slot.Replica})
+	}
+	sets := make([]quorumSet, 0, len(ownerSets))
+	for _, owners := range ownerSets {
+		seen := map[int]bool{}
+		var indices []int
+		for _, id := range owners {
+			idx, ok := byID[id]
+			if !ok || seen[idx] {
+				continue
+			}
+			seen[idx] = true
+			indices = append(indices, idx)
+		}
+		if len(indices) == 0 {
+			continue
+		}
+		sets = append(sets, quorumSet{indices: indices, quorum: len(indices)/2 + 1})
+	}
+	if len(sets) == 0 && len(reps) != 0 {
+		indices := make([]int, len(reps))
+		for i := range reps {
+			indices[i] = i
+		}
+		sets = append(sets, quorumSet{indices: indices, quorum: len(indices)/2 + 1})
+	}
+	return reps, sets
+}
+
+func satisfiesQuorumSets(votes map[int]bool, sets []quorumSet) bool {
+	if len(sets) == 0 {
+		return false
+	}
+	for _, set := range sets {
+		n := 0
+		for _, idx := range set.indices {
+			if votes[idx] {
+				n++
+			}
+		}
+		if n < set.quorum {
+			return false
+		}
+	}
+	return true
+}
+
+func replicaIndexID(i int) string {
+	return "#" + strconv.Itoa(i)
 }
 
 type routeRead struct {

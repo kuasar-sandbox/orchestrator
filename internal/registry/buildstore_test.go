@@ -15,7 +15,7 @@ type recordingNodeOwner struct {
 	released []string
 }
 
-func (a *recordingNodeOwner) PutManifestKey(ctx context.Context, nodeID, fingerprint, manifestKey string, expiresUnix int64) error {
+func (a *recordingNodeOwner) PutManifestKey(ctx context.Context, nodeID, fingerprint, keyType, keyValue string, expiresUnix int64) error {
 	return nil
 }
 

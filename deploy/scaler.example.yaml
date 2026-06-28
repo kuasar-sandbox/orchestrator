@@ -1,12 +1,21 @@
 # cluster-ctl scaler config — cluster-ctl scaler --config /etc/cluster-ctl/scaler.yaml.
-# Standalone placement scheduler (cluster-scaler.md §3): it dials registry
-# scale_link for node_list/group views and reverse placement (no listener).
+# Standalone placement scheduler (cluster-scaler.md §3): it starts from registry
+# membership, connects every active registry member, and provides placement for
+# registry callers.
 # Validate with `cluster-ctl config scaler --config scaler.yaml`.
 
-# Upstream: how to reach the registry scale_link.
-scale_link:
-  endpoint: /run/cluster/scale-link.sock
-  # tls: { cert: ..., key: ..., ca: ... }   # client mTLS to dial a remote scale_link
+member:
+  id: scaler-1
+  listen: ":7800"
+  advertise: "https://scaler-1.example:7800"
+  # tls: { cert: ..., key: ..., ca: ... }   # server mTLS for scaler Place API
+
+registry:
+  bootstrap: registry-1.example:7700
+  # tls: { cert: ..., key: ..., ca: ... }   # client mTLS to registry control plane
+
+# Sandbox-group records are imported into scaler/provider side, for example:
+#   cluster-ctl scaler import --config scaler.yaml -i groups.jsonl
 
 placement:
   candidates: 2                       # P2C sample size

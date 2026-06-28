@@ -75,34 +75,45 @@ func configCmd(args []string) error {
 	return err
 }
 
-const registryConfigSkeleton = `# cluster-ctl registry config — cluster-ctl registry --config <this> (cluster.md §3/§4.1).
-# Registry-owned state authority + node_link / route_link / scale_link hub.
-sandbox_group:                       # how per-group config is sourced (§6.2)
-  providers: { key: store, sandbox_config: store, placement: store, image_pull: store }
-  # encryption_key: ""               # AES-256 sealing self-stored group secrets (or SANDBOX_GROUP_ENCRYPTION_KEY env)
-  # tls: { cert: ..., key: ..., ca: ... }   # client mTLS for external:<addr> providers
-node_link:                           # nodes dial this
+const registryConfigSkeleton = `# cluster-ctl registry config — cluster-ctl registry --config <this> (cluster.md §2).
+member:                              # unified HTTP control plane
+  id: registry-1
   listen: ":7700"
+  advertise: "https://registry-1.example:7700"
   # tls: { cert: ..., key: ..., ca: ... }   # server mTLS
+membership:
+  active: 1
+  versions:
+    - version: 1
+      members:
+        - { id: registry-1, advertise: "https://registry-1.example:7700" }
+  owners:
+    route_link: 1
+    node_link: 1
+    node_list: 1
+node_link:
+  # listen: ""                       # optional split listener for node streams; empty = member.listen
+  # advertise: ""
   heartbeat_interval: 10s
   node_dead_after: 30s
   revision_retention: 10000
-route_link:                          # routers/admin tools dial this
-  listen: /run/cluster/route-link.sock
-  # tls: { cert: ..., key: ..., ca: ... }   # server mTLS when split across hosts (§5.4)
-scale_link:                          # scalers dial this
-  listen: /run/cluster/scale-link.sock
-  # tls: { cert: ..., key: ..., ca: ... }   # server mTLS when split across hosts (§5.4)
-reserve:
+route_link:
   park_timeout: 30s
+node_list:
+  shard_count: 1024
+  watch_retention: 10000
+scale_link:
+  scaler_replica_count: 3
+  min_ready_scalers: 1
+  place_timeout: 2s
 `
 
 const routerConfigSkeleton = `# cluster-ctl router config — cluster-ctl router --config <this> (cluster-router.md §3).
 # e2b-compatible unified ingress. Required: domain.
 domain: sandboxes.example.com
-route_link:                          # upstream: registry route_link
-  endpoint: /run/cluster/route-link.sock  # UDS local; host:port remote
-  # tls: { cert: ..., key: ..., ca: ... }   # client mTLS to dial a remote route_link (§5.4)
+registry:                            # bootstrap endpoint for registry membership
+  bootstrap: registry-1.example:7700
+  # tls: { cert: ..., key: ..., ca: ... }   # client mTLS to registry control plane
 ingress:                             # downstream: e2b client ingress
   listen: ":443"
   # tls: { cert: ..., key: ... }     # wildcard *.<domain> + api.<domain>
@@ -114,10 +125,18 @@ auth:
 `
 
 const scalerConfigSkeleton = `# cluster-ctl scaler config — cluster-ctl scaler --config <this> (cluster-scaler.md §3).
-# Standalone placement scheduler; dials registry scale_link (no listener of its own).
-scale_link:                          # upstream: registry scale_link
-  endpoint: /run/cluster/scale-link.sock  # UDS local; host:port remote
-  # tls: { cert: ..., key: ..., ca: ... }   # client mTLS to dial a remote scale_link (§5.4)
+# Standalone placement scheduler; starts from registry membership and connects
+# every active registry member.
+member:
+  id: scaler-1
+  listen: ":7800"
+  advertise: "https://scaler-1.example:7800"
+  # tls: { cert: ..., key: ..., ca: ... }   # server mTLS for scaler Place API
+registry:
+  bootstrap: registry-1.example:7700
+  # tls: { cert: ..., key: ..., ca: ... }   # client mTLS to registry control plane
+# sandbox-group records are imported into scaler/provider side:
+#   cluster-ctl scaler import --config scaler.yaml -i groups.jsonl
 placement:
   candidates: 2                      # P2C sample size
   zone_admit_max: yellow             # exclude nodes hotter than this (green|yellow|red)

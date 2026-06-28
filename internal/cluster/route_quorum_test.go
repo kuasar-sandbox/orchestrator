@@ -160,6 +160,67 @@ func TestRouteQuorumReadRepair(t *testing.T) {
 	}
 }
 
+func TestRouteJointQuorumRequiresEveryOwnerSet(t *testing.T) {
+	ctx := context.Background()
+	a := &flakyRouteReplica{RouteReplica: NewMemoryRouteReplica()}
+	b := &flakyRouteReplica{RouteReplica: NewMemoryRouteReplica()}
+	c := &flakyRouteReplica{RouteReplica: NewMemoryRouteReplica()}
+	d := &flakyRouteReplica{RouteReplica: NewMemoryRouteReplica()}
+	e := &flakyRouteReplica{RouteReplica: NewMemoryRouteReplica()}
+	q := NewRouteJointQuorum("writer", []RouteReplicaSlot{
+		{ID: "a", Replica: a},
+		{ID: "b", Replica: b},
+		{ID: "c", Replica: c},
+		{ID: "d", Replica: d},
+		{ID: "e", Replica: e},
+	}, [][]string{{"a", "b", "c"}, {"b", "d", "e"}})
+
+	a.down, b.down = true, true
+	_, err := q.CAS(ctx, "/g", "rk", 0, func(RouteRecord, bool) (RouteRecord, bool, error) {
+		return RouteRecord{Group: "/g", RouteKey: "rk", SandboxID: "sb", State: RouteReady}, true, nil
+	})
+	if !errors.Is(err, ErrQuorum) {
+		t.Fatalf("joint write err=%v, want ErrQuorum when active set lacks quorum", err)
+	}
+}
+
+func TestRouteJointQuorumReadRepairsNextOwnerSet(t *testing.T) {
+	ctx := context.Background()
+	a := NewMemoryRouteReplica()
+	b := NewMemoryRouteReplica()
+	c := NewMemoryRouteReplica()
+	d := NewMemoryRouteReplica()
+	e := NewMemoryRouteReplica()
+	key := RouteKey("/g", "rk")
+	old := RouteRecord{
+		Meta:  RecordMeta{Ballot: Ballot{Round: 4, Writer: "old"}, Rev: 2},
+		Group: "/g", RouteKey: "rk", SandboxID: "sb", State: RouteReady,
+	}
+	for _, r := range []*MemoryRouteReplica{a, b, c} {
+		if ok, err := r.Accept(ctx, key, old, old.Meta.Ballot); err != nil || !ok {
+			t.Fatalf("seed accept ok=%v err=%v", ok, err)
+		}
+	}
+
+	q := NewRouteJointQuorum("reader", []RouteReplicaSlot{
+		{ID: "a", Replica: a},
+		{ID: "b", Replica: b},
+		{ID: "c", Replica: c},
+		{ID: "d", Replica: d},
+		{ID: "e", Replica: e},
+	}, [][]string{{"a", "b", "c"}, {"b", "d", "e"}})
+	got, found, err := q.Get(ctx, "/g", "rk")
+	if err != nil || !found || got.SandboxID != "sb" {
+		t.Fatalf("joint get found=%v err=%v got=%+v", found, err, got)
+	}
+	for _, r := range []*MemoryRouteReplica{d, e} {
+		rr, found, err := r.Read(ctx, key)
+		if err != nil || !found || rr.SandboxID != "sb" || rr.Meta.Ballot.Writer != "reader" {
+			t.Fatalf("next owner after repair found=%v err=%v rec=%+v", found, err, rr)
+		}
+	}
+}
+
 func TestRouteQuorumDeleteTombstonePreventsResurrection(t *testing.T) {
 	ctx := context.Background()
 	rs := []*MemoryRouteReplica{NewMemoryRouteReplica(), NewMemoryRouteReplica(), NewMemoryRouteReplica()}

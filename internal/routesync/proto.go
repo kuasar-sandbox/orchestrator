@@ -121,11 +121,7 @@ type Msg struct {
 	Ack      *CmdAck       `json:"cmd_ack,omitempty"`
 	Rev      int64         `json:"rev,omitempty"` // per-shard monotonic revision for resume_from (§5.3)
 	RevToken string        `json:"rev_token,omitempty"`
-	// Scaler-link variants (cluster.md §5.2): place_req down, place_result + selector_patch up.
-	PlaceReq    *PlaceReq      `json:"place_req,omitempty"`
-	PlaceResult *PlaceResult   `json:"place_result,omitempty"`
-	Patch       *SelectorPatch `json:"selector_patch,omitempty"`
-	Build       *BuildEvent    `json:"build_event,omitempty"` // node -> registry build state (§5.1/§7.5)
+	Build    *BuildEvent   `json:"build_event,omitempty"` // node -> registry build state (§5.1/§7.5)
 }
 
 // Hello is the orchestrator's first down-frame; it carries the operational Policy.

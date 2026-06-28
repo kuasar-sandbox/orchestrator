@@ -26,6 +26,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/clusterclient"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/metrics"
 	proxypkg "github.com/kuasar-sandbox/sandbox-orchestrator/internal/proxy"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/registry"
@@ -70,15 +71,16 @@ type buildEntry struct {
 
 const buildTTL = time.Hour
 
-// Router is the e2b unified ingress. It dials registry route_link (UDS or TCP)
-// for reserve + route resolution.
+// Router is the e2b unified ingress. It uses registry membership to route each
+// group-scoped control request to a route owner, then forwards data to nodes.
 type Router struct {
 	domain        string
 	authMode      string // off | log | enforce — caller api_key auth (§8); default enforce
 	dataPlaneAuth string // off | log | enforce — data-plane access-token check (§7)
 	mx            *metrics.M
-	routeLinkBase string       // http base for registry route_link
-	routeClient   *http.Client // 60s timeout (reserve / route calls)
+	routeLinkBase string       // static base used by New in tests / size-1 local mode
+	routeClient   *http.Client // static client used by New in tests / size-1 local mode
+	routeRegistry routeRegistry
 	log           *slog.Logger
 
 	buildsMu sync.Mutex
@@ -106,11 +108,23 @@ type reserveFlight struct {
 	err  error
 }
 
-// New builds a Router. routeAddr is the registry route_link endpoint: a path ("/run/...")
-// for a unix socket, or host:port for TCP. authTTL caches api-key verification
-// (<=0 → 60s).
-// routeTLS (non-nil) makes a TCP route_link endpoint dial over (m)TLS h2; nil =
-// plain. A UDS routeAddr ("/...") is always plain (local).
+type routeRegistry interface {
+	RouteCandidates(ctx context.Context, group string) ([]clusterclient.Endpoint, error)
+}
+
+type staticRouteRegistry struct {
+	ep clusterclient.Endpoint
+}
+
+func (s staticRouteRegistry) RouteCandidates(context.Context, string) ([]clusterclient.Endpoint, error) {
+	if s.ep.Client == nil || s.ep.BaseURL == "" {
+		return nil, fmt.Errorf("router: route registry endpoint is not configured")
+	}
+	return []clusterclient.Endpoint{s.ep}, nil
+}
+
+// New builds a Router with one static registry endpoint. Production wiring uses
+// NewWithRegistry so group operations go through membership owner selection.
 func New(routeAddr, domain string, authTTL time.Duration, routeTLS *tls.Config, log *slog.Logger) *Router {
 	if authTTL <= 0 {
 		authTTL = 60 * time.Second
@@ -124,26 +138,25 @@ func New(routeAddr, domain string, authTTL time.Duration, routeTLS *tls.Config, 
 		reserveInFlight: map[string]*reserveFlight{},
 		authOK:          map[string]time.Time{},
 	}
-	var transport http.RoundTripper
-	switch {
-	case strings.HasPrefix(routeAddr, "/"):
-		rt.routeLinkBase = "http://route-link"
-		transport = &http.Transport{
-			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-				return (&net.Dialer{}).DialContext(ctx, "unix", routeAddr)
-			},
-		}
-	case routeTLS != nil:
-		rt.routeLinkBase = "https://" + routeAddr
-		transport = &http.Transport{TLSClientConfig: routeTLS, ForceAttemptHTTP2: true}
-	default:
-		rt.routeLinkBase = "http://" + routeAddr
-		transport = &http.Transport{}
+	base, client, err := clusterclient.HTTPBase(routeAddr, routeTLS)
+	if err != nil {
+		base, client = "http://"+routeAddr, &http.Client{Transport: &http.Transport{}}
 	}
-	rt.routeClient = &http.Client{Timeout: 60 * time.Second, Transport: transport}
+	client.Timeout = 60 * time.Second
+	rt.routeLinkBase = base
+	rt.routeClient = client
+	rt.routeRegistry = staticRouteRegistry{ep: clusterclient.Endpoint{MemberID: "static", BaseURL: base, Client: client}}
 	// Pooled transport for node forwards: a higher per-host idle cap than the
 	// stdlib default of 2 avoids TCP/TLS churn to a busy node at high density.
 	rt.fwdTransport = &http.Transport{MaxIdleConns: 512, MaxIdleConnsPerHost: 64, IdleConnTimeout: 90 * time.Second}
+	return rt
+}
+
+func NewWithRegistry(reg *clusterclient.Registry, domain string, authTTL time.Duration, log *slog.Logger) *Router {
+	rt := New("127.0.0.1:7700", domain, authTTL, nil, log)
+	rt.routeLinkBase = ""
+	rt.routeClient = nil
+	rt.routeRegistry = reg
 	return rt
 }
 
@@ -304,13 +317,21 @@ func nonEmptySlice(s string) []string {
 // holds the build (by build_id), resolving via route_link on a local miss
 // (router restart: the in-memory build map is lost but the BuildStore persists).
 func (rt *Router) handleBuildForward(w http.ResponseWriter, r *http.Request) {
+	group := r.Header.Get(HeaderGroup)
+	if group == "" {
+		http.Error(w, HeaderGroup+" required", http.StatusBadRequest)
+		return
+	}
+	if !rt.authorize(w, r.Context(), group, r.Header.Get(HeaderAPIKey)) {
+		return
+	}
 	bid := extractBuildID(r.URL.Path)
 	rt.buildsMu.Lock()
 	e, ok := rt.builds[bid]
 	rt.buildsMu.Unlock()
 	node := e.node
 	if !ok {
-		res, rerr := rt.routeLinkResolveBuild(r.Context(), bid)
+		res, rerr := rt.routeLinkResolveBuild(r.Context(), group, bid)
 		if rerr != nil || res.DataEndpoint == "" {
 			http.Error(w, "unknown build "+bid, http.StatusNotFound)
 			return
@@ -364,12 +385,17 @@ func extractBuildID(path string) string {
 // connect/export) to the node holding the sandbox (cluster-router.md §6); kill's
 // teardown propagates back as a route delete, converging the registry.
 func (rt *Router) handleSandboxVerb(w http.ResponseWriter, r *http.Request) {
+	group := r.Header.Get(HeaderGroup)
+	if group == "" {
+		http.Error(w, HeaderGroup+" required", http.StatusBadRequest)
+		return
+	}
 	sid := extractSandboxID(r.URL.Path)
 	if sid == "" || sid == "import" {
 		http.Error(w, "cluster router: unsupported sandbox path", http.StatusNotImplemented)
 		return
 	}
-	rr := rt.resolveRoute(r.Context(), sid)
+	rr := rt.resolveRoute(r.Context(), group, sid)
 	if rr == nil || rr.DataEndpoint == "" {
 		http.Error(w, "sandbox not found", http.StatusNotFound)
 		return
@@ -377,7 +403,7 @@ func (rt *Router) handleSandboxVerb(w http.ResponseWriter, r *http.Request) {
 	// Authenticate the caller against the sandbox's group before forwarding (the
 	// node re-authenticates too, but the ingress must not be an open relay / sid
 	// oracle — cluster-router.md §6/§8).
-	if !rt.authorize(w, r.Context(), rr.Group, r.Header.Get(HeaderAPIKey)) {
+	if !rt.authorize(w, r.Context(), group, r.Header.Get(HeaderAPIKey)) {
 		return
 	}
 	rt.forwardToNode(w, r, rr.DataEndpoint)
@@ -394,13 +420,8 @@ func (rt *Router) handleList(w http.ResponseWriter, r *http.Request) {
 	if !rt.authorize(w, r.Context(), group, r.Header.Get(HeaderAPIKey)) {
 		return
 	}
-	u := fmt.Sprintf("%s%s?group=%s", rt.routeLinkBase, registry.RouteLinkListPath, url.QueryEscape(group))
-	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, u, nil)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadGateway)
-		return
-	}
-	resp, err := rt.routeClient.Do(req)
+	path := fmt.Sprintf("%s?group=%s", registry.RouteLinkListPath, url.QueryEscape(group))
+	resp, err := rt.routeLinkHTTP(r.Context(), group, http.MethodGet, path, nil, nil)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
@@ -412,11 +433,11 @@ func (rt *Router) handleList(w http.ResponseWriter, r *http.Request) {
 
 // resolveRoute returns a sandbox's resolved route via the local cache, falling
 // back to the control API; nil if unknown.
-func (rt *Router) resolveRoute(ctx context.Context, sid string) *routeResolve {
-	if rr := rt.cachedRoute(sid); rr != nil {
+func (rt *Router) resolveRoute(ctx context.Context, group, sid string) *routeResolve {
+	if rr := rt.cachedRoute(sid); rr != nil && (group == "" || rr.Group == "" || rr.Group == group) {
 		return rr
 	}
-	if rr, err := rt.routeLinkRoute(ctx, sid); err == nil {
+	if rr, err := rt.routeLinkRoute(ctx, group, sid); err == nil {
 		return rr
 	}
 	return nil
@@ -477,12 +498,20 @@ func (rt *Router) serveData(w http.ResponseWriter, r *http.Request, host string)
 		return
 	}
 	sid := sub[i+1:]
+	group := r.Header.Get(HeaderGroup)
+	if group == "" {
+		http.Error(w, HeaderGroup+" required", http.StatusBadRequest)
+		return
+	}
 	// Hot path: serve from the local route cache (zero control round-trip, §5). On a
 	// miss (cache lagging / cold), fall back to route_link.
 	rr := rt.cachedRoute(sid)
+	if rr != nil && rr.Group != "" && rr.Group != group {
+		rr = nil
+	}
 	if rr == nil {
 		var err error
-		if rr, err = rt.routeLinkRoute(r.Context(), sid); err != nil {
+		if rr, err = rt.routeLinkRoute(r.Context(), group, sid); err != nil {
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return
 		}
@@ -703,9 +732,9 @@ func (rt *Router) cachedRouteByKey(group, routeKey string) *routeResolve {
 // --- control client ---
 
 func (rt *Router) routeLinkReserve(ctx context.Context, group, routeKey string) (*reserveResult, error) {
-	u := fmt.Sprintf("%s%s?group=%s&route_key=%s", rt.routeLinkBase, registry.RouteLinkReservePath, url.QueryEscape(group), url.QueryEscape(routeKey))
+	path := fmt.Sprintf("%s?group=%s&route_key=%s", registry.RouteLinkReservePath, url.QueryEscape(group), url.QueryEscape(routeKey))
 	var res reserveResult
-	if err := rt.routeLinkCall(ctx, http.MethodPost, u, &res); err != nil {
+	if err := rt.routeLinkCall(ctx, group, http.MethodPost, path, nil, nil, &res); err != nil {
 		return nil, err
 	}
 	return &res, nil
@@ -744,12 +773,7 @@ func (rt *Router) reserveByKey(ctx context.Context, group, routeKey string) (*re
 
 func (rt *Router) routeLinkReserveBuild(ctx context.Context, group string, resources *buildResources) (*buildReserveResult, error) {
 	reqBody, _ := json.Marshal(map[string]any{"group": group, "resources": resources})
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, rt.routeLinkBase+registry.RouteLinkReserveBuildPath, bytes.NewReader(reqBody))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := rt.routeClient.Do(req)
+	resp, err := rt.routeLinkHTTP(ctx, group, http.MethodPost, registry.RouteLinkReserveBuildPath, reqBody, map[string]string{"Content-Type": "application/json"})
 	if err != nil {
 		return nil, err
 	}
@@ -765,39 +789,68 @@ func (rt *Router) routeLinkReserveBuild(ctx context.Context, group string, resou
 	return &res, nil
 }
 
-func (rt *Router) routeLinkResolveBuild(ctx context.Context, buildID string) (*buildReserveResult, error) {
-	u := fmt.Sprintf("%s%s?build_id=%s", rt.routeLinkBase, registry.RouteLinkBuildPath, url.QueryEscape(buildID))
+func (rt *Router) routeLinkResolveBuild(ctx context.Context, group, buildID string) (*buildReserveResult, error) {
+	path := fmt.Sprintf("%s?group=%s&build_id=%s", registry.RouteLinkBuildPath, url.QueryEscape(group), url.QueryEscape(buildID))
 	var res buildReserveResult
-	if err := rt.routeLinkCall(ctx, http.MethodGet, u, &res); err != nil {
+	if err := rt.routeLinkCall(ctx, group, http.MethodGet, path, nil, nil, &res); err != nil {
 		return nil, err
 	}
 	return &res, nil
 }
 
-func (rt *Router) routeLinkRoute(ctx context.Context, sid string) (*routeResolve, error) {
-	u := fmt.Sprintf("%s%s?sid=%s", rt.routeLinkBase, registry.RouteLinkRoutePath, url.QueryEscape(sid))
+func (rt *Router) routeLinkRoute(ctx context.Context, group, sid string) (*routeResolve, error) {
+	path := fmt.Sprintf("%s?group=%s&sid=%s", registry.RouteLinkRoutePath, url.QueryEscape(group), url.QueryEscape(sid))
 	var rr routeResolve
-	if err := rt.routeLinkCall(ctx, http.MethodGet, u, &rr); err != nil {
+	if err := rt.routeLinkCall(ctx, group, http.MethodGet, path, nil, nil, &rr); err != nil {
 		return nil, err
 	}
 	return &rr, nil
 }
 
-func (rt *Router) routeLinkCall(ctx context.Context, method, u string, out any) error {
-	req, err := http.NewRequestWithContext(ctx, method, u, nil)
-	if err != nil {
-		return err
-	}
-	resp, err := rt.routeClient.Do(req)
+func (rt *Router) routeLinkCall(ctx context.Context, group, method, path string, body []byte, headers map[string]string, out any) error {
+	resp, err := rt.routeLinkHTTP(ctx, group, method, path, body, headers)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return fmt.Errorf("route_link %s: %s: %s", u, resp.Status, strings.TrimSpace(string(b)))
+		return fmt.Errorf("route_link %s: %s: %s", path, resp.Status, strings.TrimSpace(string(b)))
 	}
 	return json.NewDecoder(resp.Body).Decode(out)
+}
+
+func (rt *Router) routeLinkHTTP(ctx context.Context, group, method, path string, body []byte, headers map[string]string) (*http.Response, error) {
+	eps, err := rt.routeRegistry.RouteCandidates(ctx, group)
+	if err != nil {
+		return nil, err
+	}
+	var last error
+	for i, ep := range eps {
+		req, err := http.NewRequestWithContext(ctx, method, ep.BaseURL+path, bytes.NewReader(body))
+		if err != nil {
+			return nil, err
+		}
+		for k, v := range headers {
+			req.Header.Set(k, v)
+		}
+		resp, err := ep.Client.Do(req)
+		if err != nil {
+			last = err
+			continue
+		}
+		if resp.StatusCode >= 500 && i+1 < len(eps) {
+			b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+			resp.Body.Close()
+			last = fmt.Errorf("route_link %s: %s: %s", ep.MemberID, resp.Status, strings.TrimSpace(string(b)))
+			continue
+		}
+		return resp, nil
+	}
+	if last != nil {
+		return nil, last
+	}
+	return nil, fmt.Errorf("router: no registry candidates for group %q", group)
 }
 
 // --- local route cache ---
@@ -828,13 +881,8 @@ func (rt *Router) verifyAuth(ctx context.Context, group, apiKey string) (bool, e
 	}
 	rt.authMu.Unlock()
 
-	u := fmt.Sprintf("%s%s?group=%s", rt.routeLinkBase, registry.RouteLinkVerifyKeyPath, url.QueryEscape(group))
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
-	if err != nil {
-		return false, err
-	}
-	req.Header.Set(HeaderAPIKey, apiKey) // api key in a header, never the query string (logged)
-	resp, err := rt.routeClient.Do(req)
+	path := fmt.Sprintf("%s?group=%s", registry.RouteLinkVerifyKeyPath, url.QueryEscape(group))
+	resp, err := rt.routeLinkHTTP(ctx, group, http.MethodGet, path, nil, map[string]string{HeaderAPIKey: apiKey})
 	if err != nil {
 		return false, err // route_link unreachable
 	}

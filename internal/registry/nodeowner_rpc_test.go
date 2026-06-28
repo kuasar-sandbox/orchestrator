@@ -15,8 +15,8 @@ type rpcNodeOwner struct {
 	released []string
 }
 
-func (o *rpcNodeOwner) PutManifestKey(ctx context.Context, nodeID, fingerprint, manifestKey string, expiresUnix int64) error {
-	o.ops = append(o.ops, "put:"+nodeID+":"+fingerprint+":"+manifestKey)
+func (o *rpcNodeOwner) PutManifestKey(ctx context.Context, nodeID, fingerprint, keyType, keyValue string, expiresUnix int64) error {
+	o.ops = append(o.ops, "put:"+nodeID+":"+fingerprint+":"+keyType+":"+keyValue)
 	return nil
 }
 
@@ -52,7 +52,7 @@ func TestHTTPNodeOwner(t *testing.T) {
 	defer srv.Close()
 
 	client := NewHTTPNodeOwner(srv.URL, srv.Client())
-	if err := client.PutManifestKey(ctx, "n1", "fp", "mk", 123); err != nil {
+	if err := client.PutManifestKey(ctx, "n1", "fp", "inline", "mk", 123); err != nil {
 		t.Fatal(err)
 	}
 	if err := client.DropManifestKey(ctx, "n1", "fp"); err != nil {
@@ -69,7 +69,7 @@ func TestHTTPNodeOwner(t *testing.T) {
 	if err := client.DeleteSandbox(ctx, "n1", "sb1"); err != nil {
 		t.Fatal(err)
 	}
-	wantOps := []string{"put:n1:fp:mk", "drop:n1:fp", "admit:n1:b1", "delete:n1:sb1"}
+	wantOps := []string{"put:n1:fp:inline:mk", "drop:n1:fp", "admit:n1:b1", "delete:n1:sb1"}
 	if len(owner.ops) != len(wantOps) {
 		t.Fatalf("ops=%v want %v", owner.ops, wantOps)
 	}

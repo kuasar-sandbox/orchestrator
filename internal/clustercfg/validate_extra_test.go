@@ -3,13 +3,20 @@ package clustercfg
 import "testing"
 
 // TestValidateRejectsBadValues exercises each role's Validate over the bad values it
-// owns (providers → registry, zones/candidates → scaler, auth → router).
+// owns (durations/membership → registry, zones/candidates → scaler, auth → router).
 func TestValidateRejectsBadValues(t *testing.T) {
-	t.Run("registry empty external addr", func(t *testing.T) {
+	t.Run("registry bad duration", func(t *testing.T) {
 		c := DefaultRegistry()
-		c.SandboxGroup.Providers[ProviderKey] = "external:"
+		c.RouteLink.ParkTimeout = "bad"
 		if err := c.Validate(); err == nil {
-			t.Error("Validate accepted an empty external addr")
+			t.Error("Validate accepted a bad route_link.park_timeout")
+		}
+	})
+	t.Run("registry member id outside active membership", func(t *testing.T) {
+		c := DefaultRegistry()
+		c.Member.ID = "missing"
+		if err := c.Validate(); err == nil {
+			t.Error("Validate accepted a member.id outside active membership")
 		}
 	})
 	t.Run("scaler bad zone_admit_max", func(t *testing.T) {

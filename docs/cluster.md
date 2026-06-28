@@ -2,118 +2,259 @@
 
 `cluster-ctl` 是面向大规模部署的集群控制面,把数千个 `node-ctl serve` 节点聚合成一个
 按 **sandbox-group** 分片的逻辑沙箱池。它对外提供 e2b 兼容控制面与数据面入口,对内维护
-会话路由、放置、构建、密钥分发和节点故障收敛。
+会话路由、放置、构建、密钥分发、节点故障收敛和 registry 成员变更。
 
-cluster 的核心目标是:稳态数据面请求不经过 registry,冷路径通过 registry 自聚簇完成放置 /
-恢复 / 构建预留;Registry 成员故障只影响其参与的小逻辑集群,不触发全局重分片;成员变更由
-运维版本化触发,以 learner 预同步和 per-shard 短栅栏完成业务无损切换。
+cluster 的核心目标是:稳态数据面请求不经过 registry;冷路径通过 registry 自聚簇完成放置 / 恢复 /
+构建预留;Registry 成员故障只影响其参与的小逻辑分片;成员变更由运维版本化触发,通过
+joint owner set 与 namespace 自身收敛驱动完成业务无损切换。
 
 ## 1. 概述
 
 ### 1.1 设计原则
 
-1. **sandbox-group 是唯一业务分片键**:路由、构建、placement、group 配置均按 group 定位。
-   每个北向请求必须携带 `X-Kuasar-Sandbox-Group`;当前不支持无 group 的 cluster 数据面入口。
-2. **registry 自身是可靠状态集群**:状态由 registry 成员直接复制,不依赖外部存储后端。
-   Registry 容忍单成员故障。整套 registry 完全下电后不要求自动恢复沙箱。
-3. **节点是存活态真相之源**:sandbox/build 是否还在运行以 node 上报为准;registry 是路由权威和
+1. **sandbox-group 是唯一业务分片键**:路由、构建和 placement 均按 group 定位。每个北向请求必须
+   携带 `X-Kuasar-Sandbox-Group`;当前不支持无 group 的 cluster 数据面入口。
+2. **registry 自身是可靠状态集群**:执行态由 registry 成员直接复制,不依赖外部存储后端。Registry
+   逻辑分片容忍单成员故障。整套 registry 完全下电后不要求自动恢复运行中 sandbox。
+3. **registry 不实现 sandbox-group provider**:`SandboxGroupProvider` 和 `SandboxGroupImporter` 只属于
+   scaler 或外部 provider。registry 不保存 group 配置、placement hint、auth_key 或 manifest_key 的
+   provider store。
+4. **节点是存活态真相之源**:sandbox/build 是否还在运行以 node 上报为准;registry 是路由权威和
    可重建聚合。node 整机重启直接清空,不重拉旧 sandbox。
-4. **热路径旁路控制面**:router 对活动连接和近期路由做本地缓存;命中时直接转发到 node,不调用
+5. **热路径旁路控制面**:router 对活动连接和近期路由做本地缓存;命中时直接转发到 node,不调用
    `Reserve`。miss / fail-fast 后才走 registry。
-5. **SWIM 不参与分片计算**:Registry 成员故障只影响 owner set 内的可达性判断;`LocateN` 的输入
-   仅为版本化成员表。成员变更只由运维更新 `membership_version` 触发。
-6. **放置与执行分层**:scaler 负责 group 导入、WATCH_LIST、shuffle-sharding 与 Place;node owner
-   负责节点连接、命令投递、运行态与资源 admission。
+6. **memberlist 不参与分片计算**:Registry 成员表由配置版本定义;`LocateN` 的输入仅为版本化成员表。
+   memberlist 只做 failure detection 和 ready 传播。
+7. **放置与执行分层**:scaler 负责 group 导入、WATCH_LIST、shuffle-sharding、key allocation 与
+   `Place`;node owner 负责节点连接、命令投递、运行态与资源 admission。
 
 ### 1.2 角色
 
 | 角色 | 职责 |
 |---|---|
-| registry member | 组成 registry 小集群,承载 `route_link` / `node_link` / `node_list` / `scale_link` 命名空间 |
+| registry member | 组成 registry 自聚簇,承载 `route_link` / `node_link` / `node_list` 执行态和 membership |
 | router | e2b 统一入口;按 group 定位 route owner;活动连接缓存;miss 时调用 Reserve |
-| scaler | 消费 node_list WATCH_LIST;导入 group;维护 placement / key allocation;响应 PlaceSandbox / PlaceBuild |
+| scaler | 消费 node_list WATCH_LIST;通过 provider/importer 导入 group;维护 placement / key allocation;提供 Place API |
 | node | 运行 sandbox/build;经 node_link 上报全量清单与事件;接收 create/connect/delete/key/build 命令 |
 
-## 2. Registry 命名空间
+## 2. 配置与监听
 
-Registry 成员集由运维配置和 `membership_version` 定义。每个命名空间用 `pkg/maglev.LocateN`
-从版本化成员表定位 owner set。
+registry 默认只有一个控制面监听,所有协议按 path 区分:
 
-| 命名空间 | key | owner set | 内容 |
-|---|---|---|---|
-| `route_link` | group | `LocateN(group,K)` | route 记录、build 记录、placement 记录;每个 owner 持完整 group 视图 |
-| `node_link` | node_id | `LocateN(node_id,N)` | node 连接、sandbox/build 清单、labels、水位、build 预算;每个 owner 持完整 node 视图 |
-| `node_list` | `__NODE_LIST__#shard` | `LocateN(key,M)` | 低频节点目录与 labels,向 scaler 提供 WATCH_LIST |
-| `scale_link` | scaler_id | 全复制 | scaler 实例目录和能力 |
+```yaml
+member:
+  id: A
+  listen: "0.0.0.0:7700"
+  advertise: "https://A:7700"
 
-`node_link` 中只有当前连接 owner 持有实际 node TCP/h2c 连接;其余 owner 通过复制持有完整视图。
-`route_link` 的所有 owner 均可响应查询和订阅。写入达到 W quorum 后提交,随后继续复制到全
-owner set,用于完整视图和本地 waiter 唤醒。
+membership:
+  active: 1
+  versions:
+    - version: 1
+      members:
+        - { id: A, advertise: "https://A:7700" }
+        - { id: B, advertise: "https://B:7700" }
+        - { id: C, advertise: "https://C:7700" }
+  owners:
+    route_link: 3
+    node_link: 3
+    node_list: 3
 
-## 3. 成员与分片变更
+node_link:
+  heartbeat_interval: 10s
+  node_dead_after: 30s
+  revision_retention: 10000
+  # listen: ""      # 空 = 复用 member.listen;非空 = 独立 node 长连接监听
+  # advertise: ""
 
-### 3.1 成员故障
+route_link:
+  park_timeout: 30s
 
-成员故障由 SWIM 探测,但不改变 `LocateN` 结果。某成员不可达时:
+node_list:
+  shard_count: 1024
+  watch_retention: 10000
 
-- 它参与的 owner set 降一格,只要可达 owner 数 ≥ W 即继续服务。
-- 若可达 owner 数 < W,该 shard 停写(CP),不降级乱写。
-- 故障不触发 reshard;恢复成员须 catch-up 后才能重新参与 quorum。
-
-### 3.2 成员变更
-
-成员变更采用 **版本化成员表 + learner 预同步 + per-shard 短栅栏 + moved/grace 转发**:
-
-```text
-stable(v)
-  -> prepare(v+1)
-  -> catchup(v+1)
-  -> switching(v+1, barrier_seq)
-  -> stable(v+1)
-  -> old_grace(v, expires)
+scale_link:
+  scaler_replica_count: 3
+  min_ready_scalers: 1
+  place_timeout: 2s
 ```
 
-1. 运维提交新成员表,生成 `membership_version=v+1`。
-2. Registry 计算受影响的 route/node/node_list shard。
-3. 新 owner 先作为 learner,从旧 owner 拉 snapshot,再接收 delta。
-4. learner 追到 barrier 后,仅对该 shard 进入短 `switching` 栅栏:新写短排队,超时返回
-   `Retry-After`。
-5. 新 owner set 确认应用到 `barrier_seq` 后 flip 到 `v+1`。
-6. 旧 owner 进入 `old_grace`,只返回 `moved(v+1,new_owners)` 或代转发,不接受本地写。
+默认 path:
 
-新增成员先 learner 后 flip;删除成员先 leaving,由 replacement learner 追平后再退出。node_link
-owner 变化不能误判 node dead:旧 owner 在 grace 期继续转发 node 事件/命令,并在 ack 中提示 node
-后续重连到新 owner。
+```text
+/node-link/*
+/route-link/*
+/scale-link/watch-node-list
+/cluster/membership
+/internal/registry-member/*
+/internal/memberlist/*
+```
 
-## 4. 状态复制与恢复
+`member_link` 不作为单独配置项存在,它就是统一监听上的 `/internal/registry-member/*`。`node_link.listen`
+只用于生产上隔离 node 长连接流量,不改变 owner 规则和协议语义。
 
-`route_link` 和后续 `node_link` 采用无主 quorum CAS。协议以唯一 ballot 定序写入:
+## 3. Registry 命名空间
+
+Registry 成员集由运维配置和 membership version 定义。每个命名空间用 `pkg/maglev.LocateN` 从版本化
+成员表定位 owner set。
+
+| 命名空间 | shard key | owner set | 内容 |
+|---|---|---|---|
+| `route_link` | group | `LocateN(group,K)` | route 记录、build 执行态;每个 owner 持完整 group 执行态视图 |
+| `node_link` | node_id | `LocateN(node_id,N)` | node 连接、sandbox/build 清单、labels、水位、build 预算;每个 owner 持完整 node 视图 |
+| `node_list` | `__NODE_LIST__#shard` | `LocateN(key,M)` | 低频节点目录与 labels,向 scaler 提供 WATCH_LIST |
+| `scale_link` | group | `LocateN(group,ready_scalers,R)` | scaler 动态成员域和 Place 故障转移候选 |
+
+`node_link` 中只有当前连接 owner 持有实际 node h2 stream;其余 owner 通过复制持有完整视图。
+node 记录携带 `link_owner`,route owner 需要下发 `create/key/build/delete` 时,通过 node-owner RPC 转发到
+持有该 h2 stream 的 registry 成员。`route_link` 的所有 owner 均可响应查询。写入达到要求 quorum 后提交,
+随后继续复制到全 owner set,用于完整视图和本地 waiter 唤醒。
+
+## 4. Membership 与 memberlist
+
+### 4.1 成员表
+
+registry 成员表只来自运维分发的配置文件。reload 通过信号或 API 触发。每个版本有稳定 label:
+
+```text
+registry.<version>.<sha256(sort(member_ids))>
+```
+
+registry 可以同时持有 active / next 两个版本。旧版本直到 `old_grace` 结束才 retire。router、node、scaler
+不加入 registry memberlist,它们通过 `GET /cluster/membership` 获取 active / next 成员表。
+
+### 4.2 memberlist
+
+memberlist 只作为 failure detector / ready 传播机制,不进入分片计算。memberlist transport 复用 HTTP
+控制面;failure detector 必须遵守以下边界:
+
+- 不维护 registry 成员清单。
+- 不改变 `LocateN` 输入。
+- 不作为数据复制通道。
+- 不把 suspect/dead 事件转化为 reshard。
+
+memberlist transport 使用 HTTP,复用 registry/scaler 的控制面,不引入 UDP 组网要求:
+
+```text
+POST /internal/memberlist/packet/{label}
+POST /internal/memberlist/stream/{label}
+```
+
+registry 每个 membership version 使用独立 memberlist label。scaler ready 通过 register loop 表达。
+scaler 向每个 active / next registry 成员推送:
+
+```json
+{"role":"scaler","id":"s1","advertise":"https://s1:7800","ready_label":"registry.2.hash"}
+```
+
+### 4.3 成员故障
+
+成员故障由 memberlist 探测,但不改变 owner set。某成员不可达时:
+
+- 它参与的 owner set 降一格,只要可达 owner 数满足 quorum 即继续服务。
+- 若 quorum 不足,该 shard 停写(CP),不降级乱写。
+- 恢复成员须 catch-up/read-repair 后才能重新参与有效写 quorum。
+
+## 5. Joint Owner Set
+
+跨版本时,受影响 shard 的逻辑 owner set 是 old/new 并集:
+
+```text
+oldOwners   = LocateN(shard_key,V1)
+newOwners   = LocateN(shard_key,V2)
+unionOwners = oldOwners ∪ newOwners
+```
+
+提交条件不是 union majority,而是 joint quorum:
+
+```text
+prepare/read:  quorum(oldOwners) + quorum(newOwners)
+accept/write:  quorum(oldOwners) + quorum(newOwners)
+repair:        best-effort 写满 unionOwners
+```
+
+重叠成员可同时计入 old quorum 和 new quorum。普通 union majority 不安全,因为它可能读不到旧版本已提交
+但只落在旧 quorum 上的值。
+
+状态机:
+
+```text
+stable(v1)
+  -> load_config(v2)
+  -> joint_node_link(v1,v2)
+  -> rebuild_node_list(v2)
+  -> wait_scaler_ready(v2)
+  -> joint_route_link(v1,v2)
+  -> cutover_barrier
+  -> stable(v2)
+  -> old_grace(v1)
+  -> retire(v1)
+```
+
+## 6. 状态复制
+
+`route_link`、`node_link` 和 `node_list` 使用无主 quorum CAS。协议以唯一 ballot 定序写入:
 `(round, writer_id)` 按字典序比较,同一 key 的两个并发写不会撞同一个 version。写入分
 prepare/accept 两阶段;读 quorum 时必须把读到的最高 ballot/version 回写到落后 owner,完成
-read-repair。这样不需要 per-group primary,也不把 SWIM 活性判断引入数据路径。
+read-repair。
 
 复制协议必须满足:
 
-- 写入必须经 owner set 的 W quorum 提交。
-- 提交后继续 best-effort 复制到全 K/N/M owner。
+- stable 模式写入经当前 owner set quorum 提交。
+- joint 模式写入经 old quorum + new quorum 提交。
+- 提交后继续 best-effort 复制到 union / 全 owner set。
 - 每条记录有单调 rev 和唯一 ballot;写条件必须校验 expected rev。
-- 旧成员表写入必须被 `membership_version` 拒绝。
+- 旧 membership 写入必须被 moved/retry,不能在旧 owner 本地提交。
 - 成员冷重启后进入 joining,catch-up 完成前不参与写 quorum。
 
 size-1 模式中 `LocateN` 只返回本成员,quorum 退化为本地内存写;同样使用 expected rev + ballot
-接口,因此扩展到多成员时不改变上层状态机。size-1 用于开发和小规模部署,不提供 registry 成员
-故障 HA。
+接口。size-1 用于开发和小规模部署,不提供 registry 成员故障 HA。
 
-## 5. Route 模型
+## 7. Namespace 收敛
 
-### 5.1 身份
+不设计独立 cold-key promoter。收敛由 namespace 自己的事实源驱动。
+
+### 7.1 node_link
+
+活动 node 连接持有者在进入 joint 后:
+
+1. 向 union owners 发送一次完整 node snapshot。
+2. 后续 heartbeat、sandbox/build event、清单变化实时 fanout。
+3. 用 transfer lease 和 `reconnect_to` 把 node 连接迁到新 owner。
+4. 新 owner 要求 full resync 后释放 transfer lease。
+
+已断开 node 不阻塞切换。它重连时按当前 membership 做全量 resync;不重连则按 dead/reconcile 收敛。
+
+### 7.2 route_link / group
+
+scaler 的全量 group import 是 group 收敛驱动。scaler 不复制 route 数据,只保证 group 全集被触达。
+
+```text
+scaler import generation G
+  -> for each group:
+       group owner 对该 group 下 route/build execution records 做 joint read/repair
+  -> 写 promotion marker
+```
+
+provider 删除 group 时不能直接从 import 中消失;必须以 tombstone/draining group 形式继续出现,直到 registry
+确认该 group 没有活动 route/build 执行态。
+
+### 7.3 node_list
+
+node_list 不作为真相源迁移。它从 node_link 投影重建。watch token 编入 membership label;label 变化时
+scaler reset + full snapshot。
+
+## 8. Route 模型
+
+### 8.1 身份
 
 - 稳定会话身份:`(group, route_key)`。
 - 当前运行实例:`sandbox_id`。它是不透明字符串,内部可包含保存/恢复代际,外部不解析。
 - `sid` 如继续使用,应与 `sandbox_id` 等价或作为其别名。
 - cluster 内部总是同时维护 `group`、`route_key`、`sandbox_id`。
 
-### 5.2 Route 记录
+### 8.2 Route 记录
 
 | 字段 | 说明 |
 |---|---|
@@ -122,10 +263,11 @@ size-1 模式中 `LocateN` 只返回本成员,quorum 退化为本地内存写;�
 | `state` | `reserved` / `placed` / `ready` / `paused` / `dead` |
 | `node_id` | 当前承载节点 |
 | `sandbox_id` | 当前实例 id |
+| `access_token` | 当前实例的数据面 token,由 scaler 按 `MAC(auth_key,sandbox_id)` 生成 |
 | `version` | CAS 版本 |
 | `updated_at` | reconcile / timeout 使用 |
 
-### 5.3 状态机
+### 8.3 状态机
 
 ```text
 none -> reserved -> placed -> ready
@@ -133,32 +275,28 @@ ready -> paused -> reserved -> ready
 ready/paused/placed -> dead/tombstone
 ```
 
-整机清空、单沙箱 killed、node 重启后的缺失沙箱都收敛为 dead route 清理;下次 Reserve
-重新放置。
+整机清空、单沙箱 killed、node 重启后的缺失沙箱都收敛为 dead route 清理;下次 Reserve 重新放置。
 
 `ReserveSandbox` 返回时必须已经 READY 或失败。若已有 `reserved/placed`,新请求 join 等待同一状态机。
 客户端超时不等价于取消已提交的 placed;node 后续上报 running 时记录仍可进入 READY。
 
-孤儿清理由 route owner 判定:node 上报的 `(group, route_key, sandbox_id)` 在 route_link 中不存在
-或已被替换,则下发 delete/kill 到该 node。整机清空、单 sandbox killed、node dead 最终都走 dead
-sandbox 清理 route 的统一路径。
+孤儿清理由 route owner 判定:node 上报的 `(group, route_key, sandbox_id)` 在 route_link 中不存在或已被替换,
+则下发 delete/kill 到该 node。这个过程不经过数据面,也不依赖 access token。
 
-## 6. Node-link
+## 9. Node-link
 
-Node 不进 SWIM。Node 连接 registry 后按 `LocateN(node_id,N)` 归属 node owner set。node 上报:
+Node 不进 memberlist。Node 连接 registry 后按 `LocateN(node_id,N)` 归属 node owner set。node 上报:
 
 - 全量 sandbox 清单和增量事件。
 - build 状态事件。
 - labels、runtime_digest、build_capacity、draining、粗粒度 liveness。
-- 高频水位保留在 node_link owner 本地;node_list 是独立低频投影,普通 heartbeat 不触发
-  WATCH_LIST 扇出。draining 变化和粗粒度 liveness 刷新才更新 node_list。
+- 高频水位保留在 node_link owner 本地;node_list 是独立低频投影,普通 heartbeat 不触发 WATCH_LIST 扇出。
 
 增量订阅的 rev 是字符串,格式由 node owner/node 私有约定,推荐编码为 `source_fingerprint:seq`。
-node owner 在订阅时把上次 token 传给 node;node 校验 fingerprint,匹配时 replay `seq` 之后的
-事件,不匹配或 changelog 不可用时强制全量 resync。node owner 还应以 1h-6h 随机打散周期做全量
-resync,防止长期增量漂移。
+node owner 在订阅时把上次 token 传给 node;node 校验 fingerprint,匹配时 replay `seq` 之后的事件,不匹配
+或 changelog 不可用时强制全量 resync。node owner 还应以 1h-6h 随机打散周期做全量 resync。
 
-## 7. Router
+## 10. Router
 
 Router 是无状态北向入口,但持本地缓存:
 
@@ -166,28 +304,50 @@ Router 是无状态北向入口,但持本地缓存:
 - **active connection cache**:已有活动 HTTP/CONNECT 路由时,同一路由新请求不调用 Reserve。
 - **singleflight reserve**:同 route 并发 miss 只发起一次 Reserve。
 
-所有请求必须带 `X-Kuasar-Sandbox-Group`。当前不设计 sid 编 group 的无头入口。router 不订阅全量
-全量 route 订阅;转发失败时 fail-fast 淘汰缓存,下次重新 Reserve。
+所有请求必须带 `X-Kuasar-Sandbox-Group`。router 通过 bootstrap 获取 registry membership,按 group 定位
+route owner。router 不订阅全量 route 或 node_list;转发失败时 fail-fast 淘汰缓存,下次重新 Reserve。
 
-## 8. Scaler 与 node_list
+router 调 route owner 的 `verify-key`;registry 只按 group failover 到 ready scaler 校验,不读取 auth_key。
+router 与 registry 都不接触 manifest_key。
 
-Scaler 消费 `node_list` 的 WATCH_LIST。WATCH_LIST 只包含低频字段:
+## 11. Scaler 与 Place
 
-- node_id
-- labels
-- runtime_digest
-- build_capacity / capacity class
-- draining
-- liveness timestamp
+scaler 是 placement 和 group provider/importer 的消费者。registry 不实现 provider。
 
-`allocated`、`build_alloc`、counts、zone 等高频水位字段不进 WATCH_LIST;Place 时向 node owner
-按需 GET 或使用短 TTL 缓存。
+scaler 负责:
 
-Scaler 通过 `SandboxGroupImporter.Range` 导入 group,通过 `SandboxGroupProvider` 取得 placement hint、
-auth-key、manifest-key、registry_auth 等配置。shuffle-sharding 使用 `pkg/maglev.LocateN`,结果编码进
-最终 placement selectors。
+- `SandboxGroupImporter.Range` 全量/增量导入 group。
+- `SandboxGroupProvider.GetPlacementHint` 构建 group placement cache。
+- `SandboxGroupProvider.GetKey` / `GetAuthKey` 生成 key allocation / auth material intent。
+- 按 active membership 订阅每个 registry 成员的 node_list WATCH_LIST,并在本地合并。
+- 周期性向每个 active registry 成员 `POST /scale-link/register` 发布 ready 状态。
+- 向每个 active registry 成员推送 selector/key allocation patch。
+- 对 registry 暴露 `POST /scale-link/place`。
 
-## 9. 密钥与鉴权
+registry 对 group 做 scaler 选择:
+
+```text
+readyScalers = alive scalers where ready_label == active_registry_label
+candidates   = LocateN(group, readyScalers, scaler_replica_count)
+try candidates in order until success
+```
+
+registry 只做故障转移,不做 P2C。P2C/负载选择属于 scaler 内部对 node 的 placement 策略。最终 node owner
+admission 仍是资源确认点。
+
+`PlaceSandbox` 返回:
+
+```text
+node_id
+create_spec / sandbox_config
+key intent / secret refs
+access_token = MAC(auth_key, sandbox_id)
+runtime/template hints
+```
+
+registry 根据返回值做 node owner admission、key_put/key_drop、create/connect。registry 不解析 provider。
+
+## 12. 密钥与鉴权
 
 group 有两个密钥域:
 
@@ -196,13 +356,15 @@ group 有两个密钥域:
 | `auth_key` | router / node / provider | 验 API key,派生 access token |
 | `manifest_key` | node / provider | 解密镜像/快照内容;router 不接触 |
 
-`access_token = MAC(auth_key, sandbox_id)`。access token 不需要存储在 route 记录中。
+`access_token = MAC(auth_key, sandbox_id)`。scaler 在 Place 时生成当前 sandbox_id 对应 token,registry 将其
+随 route 记录保存,READY/ResolveSID 只读 route_link,不回查 provider。
 
-`manifest_key` 和 `registry_auth` 都是 typed secret,支持 inline 或 ref 带外交付。密钥分发遵循
-scaler/Tier-1 的 allocation 结果:scaler 决定哪些 node 应有 key,node owner 负责实际 `key_put/key_drop`
-和 lease/ack 重试。密钥分发是 create/build 前置条件,不影响已运行 sandbox。
+`manifest_key` 和 `registry_auth` 都是 typed secret,支持 inline 或 ref 带外交付。`manifest_key` 使用 ref
+时必须同时给出 fingerprint,供 create/build precheck 使用。密钥分发遵循 scaler 的 allocation 结果:
+scaler 决定哪些 node 应有 key,node owner 负责实际 `key_put/key_drop` 和 lease/ack 重试。
+密钥分发是 create/build 前置条件,不影响已运行 sandbox。
 
-## 10. Build
+## 13. Build
 
 Build 记录按 group 存在 route_link;执行态和实时预算归 node owner。
 
@@ -217,36 +379,28 @@ Build 记录按 group 存在 route_link;执行态和实时预算归 node owner�
 
 `build_id` 查询必须带 group。若 node owner 发现预算不足,直接拒绝,route owner 重调度。
 
-## 11. Provider
+## 14. 导入导出
 
-新 provider 模型:
+registry export/import 只覆盖 registry 执行态灾备数据:
 
-```text
-SandboxGroupProvider:
-  Get(group)              -> sandbox config, image repo, registry_auth, metadata
-  GetPlacementHint(group) -> raw selectors / shuffle labels
-  GetKey(group)           -> typed manifest_key
-  GetAuthKey(group)       -> auth_key or verification material
+- route records
 
-SandboxGroupImporter:
-  Range(cursor, limit)    -> groups with ttl/generation
-```
+registry export/import 不覆盖 sandbox-group provider 数据。group 配置、placement hint、auth_key、manifest_key
+由 scaler/provider 侧导入导出。
 
-实现阶段可用现有 `groupcfg` 做 adapter,但新 cluster 内核只依赖该统一接口。
-
-## 12. 可靠性
+## 15. 可靠性
 
 | 事件 | 行为 |
 |---|---|
 | router 崩溃 | 丢缓存;重启后 miss Reserve |
-| scaler 崩溃 | 冷放置受影响;热连接不受影响 |
+| scaler 崩溃 | 冷放置受影响;热连接不受影响;registry failover 到同 group 的下一个 ready scaler |
 | node 崩溃/清空 | node owner / route owner 清理 route;下次 Reserve 重新放置 |
-| registry 单成员故障 | owner set quorum 足够时继续服务;故障成员恢复后 catch-up |
-| registry 双成员故障 | 对应 shard 少于 W 时停写 |
-| membership 变更 | learner 预同步 + per-shard 短栅栏 + old grace |
-| 整集群下电 | 不要求自动恢复沙箱 |
+| registry 单成员故障 | owner set quorum 足够时继续服务;故障成员恢复后 catch-up/read-repair |
+| registry 双成员故障 | 对应 shard 少于 quorum 时停写 |
+| membership 变更 | joint owner set + namespace 收敛 + old grace |
+| 整集群下电 | 不要求自动恢复运行中 sandbox |
 
-## 13. 集群 stub e2e
+## 16. 集群 stub e2e
 
 `node-stub-ctl` 是集群功能的本仓 e2e 节点桩。它使用真实 `node_link` 协议接入 registry,一个进程可
 模拟多个节点,但不启动 microVM。除 microVM/应用进程外,它完整模拟节点控制面行为:
@@ -260,5 +414,5 @@ SandboxGroupImporter:
 
 本仓 `make test-e2e` 先 `make build`,再用产物真实启动 `cluster-ctl registry/router/scaler` 与
 `node-stub-ctl`,覆盖 group 导入、key 分发、Reserve、数据面转发、活动路由缓存、BuildRegister、
-孤儿 route 清理和节点清空收敛。该 e2e 不依赖 KVM/root/systemd;真实 microVM 端到端测试由 umbrella
-仓和 `kuasar-sandbox` 集成套件执行。
+孤儿 route 清理和节点清空收敛。`test/e2e/e2e_cluster_stub.sh` 默认跑 `registry-n1` 和 `registry-n3`
+两个 case,验证 size-1 与多 registry 成员下的真实进程链路。

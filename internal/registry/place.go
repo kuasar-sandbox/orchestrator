@@ -8,7 +8,7 @@ import "context"
 // standalone scaler over scale_link (channelPlacer); cluster.md §4.1/§5.2.
 type builtinPlacer struct{ stores *Stores }
 
-func (p *builtinPlacer) Place(ctx context.Context, req PlaceRequest) (string, error) {
+func (p *builtinPlacer) Place(ctx context.Context, req PlaceRequest) (*Placement, error) {
 	var best *NodeRecord
 	if err := p.stores.RangeNodes(ctx, func(n *NodeRecord) error {
 		if n.Draining {
@@ -19,10 +19,10 @@ func (p *builtinPlacer) Place(ctx context.Context, req PlaceRequest) (string, er
 		}
 		return nil
 	}); err != nil {
-		return "", err
+		return nil, err
 	}
 	if best == nil {
-		return "", ErrNoNode
+		return nil, ErrNoNode
 	}
-	return best.NodeID, nil
+	return &Placement{NodeID: best.NodeID, Config: cloneStringMap(req.Config)}, nil
 }

@@ -21,13 +21,13 @@ import (
 	"golang.org/x/net/http2/h2c"
 
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/apikey"
+	clusterstate "github.com/kuasar-sandbox/sandbox-orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/clustercfg"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/clusterstore"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/registry"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/router"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/scaler"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/secretbox"
 )
 
 const (
@@ -57,24 +57,10 @@ func newHarness(t *testing.T) *harness {
 
 	kv := clusterstore.OpenMemory(1000)
 	t.Cleanup(func() { kv.Close() })
-	box, err := secretbox.NewFromColonHex("0000000000000000000000000000000000000000000000000000000000000001")
-	if err != nil {
-		t.Fatal(err)
-	}
-	stores := registry.NewStores(kv, box)
-	if err := stores.PutGroup(ctx, &registry.GroupConfig{
-		Group:         testGroup,
-		ManifestKey:   testMK,
-		AuthKey:       testAuthKey,
-		TemplateRef:   "tmpl-1",
-		NodeSelectors: []map[string]string{{"pool": "stub"}},
-		SandboxConfig: map[string]string{"from_group": "yes"},
-	}); err != nil {
-		t.Fatal(err)
-	}
+	stores := registry.NewStores(kv)
 
 	reg := registry.New(stores, nil, 5*time.Second, log)
-	placer := registry.NewChannelPlacer(reg, 2*time.Second)
+	placer := registry.NewHTTPScalePlacer(reg, 1, 2*time.Second)
 	reg.SetPlacer(placer)
 	go reg.RunKeyDistributor(ctx, time.Hour)
 
@@ -82,12 +68,21 @@ func newHarness(t *testing.T) *harness {
 	reg.ServeRouteLink(mux)
 	reg.ServeScaleLink(mux)
 	mux.HandleFunc(routesync.NodeLinkPath, reg.ServeNodeLink)
-	mux.HandleFunc(routesync.ScaleLinkPath, reg.ServeScalerLink)
 	links := httptest.NewServer(h2c.NewHandler(mux, &http2.Server{}))
 	linkAddr := strings.TrimPrefix(links.URL, "http://")
 
 	svc := scaler.NewRemote(linkAddr, nil, clustercfg.PlacementConfig{Candidates: 1, ZoneAdmitMax: "yellow"}, 30, log)
+	scalerMux := http.NewServeMux()
+	svc.ServeScaleLink(scalerMux)
+	scalerSrv := httptest.NewServer(scalerMux)
+	svc.ImportGroups([]clusterstate.SandboxGroupRecord{{
+		Group: testGroup, ManifestKey: clusterstate.Secret{Type: clusterstate.SecretInline, Value: testMK},
+		AuthKey:     clusterstate.Secret{Type: clusterstate.SecretInline, Value: testAuthKey},
+		TemplateRef: "tmpl-1", NodeSelectors: []map[string]string{{"pool": "stub"}},
+		Config: map[string]string{"from_group": "yes"},
+	}})
 	svc.Start(ctx)
+	go svc.RegisterLoop(ctx, "s1", scalerSrv.URL, "")
 
 	dataHits := make(chan *http.Request, 16)
 	dataToken := make(chan string, 16)
@@ -120,6 +115,7 @@ func newHarness(t *testing.T) *harness {
 	t.Cleanup(func() {
 		cancel()
 		node.close()
+		scalerSrv.Close()
 		routerSrv.Close()
 		links.Close()
 	})
@@ -130,16 +126,15 @@ func waitForPlacement(t *testing.T, ctx context.Context, placer registry.Placer,
 	t.Helper()
 	var last error
 	for i := 0; i < 300; i++ {
-		if node, err := placer.Place(ctx, registry.PlaceRequest{Group: testGroup, RouteKey: "probe"}); err == nil && node == "n1" {
+		if placement, err := placer.Place(ctx, registry.PlaceRequest{Group: testGroup, RouteKey: "probe"}); err == nil && placement.NodeID == "n1" {
 			return
 		} else {
 			last = err
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatalf("scaler placement did not become ready: %v; node_list=%s groups=%s", last,
-		readScaleSnapshot(t, linksURL+registry.ScaleLinkNodeListWatchPath),
-		readScaleSnapshot(t, linksURL+registry.ScaleLinkGroupWatchPath))
+	t.Fatalf("scaler placement did not become ready: %v; node_list=%s", last,
+		readScaleSnapshot(t, linksURL+registry.ScaleLinkNodeListWatchPath))
 }
 
 func readScaleSnapshot(t *testing.T, u string) string {
@@ -296,6 +291,7 @@ func (h *harness) doDataByKey(t *testing.T, routeKey string) *http.Response {
 
 type nodeStub struct {
 	t      *testing.T
+	ctx    context.Context
 	cancel context.CancelFunc
 	pw     *io.PipeWriter
 	resp   *http.Response
@@ -330,7 +326,7 @@ func startNodeStub(t *testing.T, ctx context.Context, controlURL, dataEndpoint s
 		}
 		respCh <- resp
 	}()
-	stub := &nodeStub{t: t, cancel: cancel, pw: pw, cmdCh: make(chan *routesync.Command, 64)}
+	stub := &nodeStub{t: t, ctx: nctx, cancel: cancel, pw: pw, cmdCh: make(chan *routesync.Command, 64)}
 	stub.write(t, &routesync.Msg{Type: routesync.TypeNodeRegister, NodeReg: &routesync.NodeRegister{
 		NodeID: "n1", Labels: map[string]string{"pool": "stub"}, Capacity: 10,
 		BuildCapacity: &routesync.BuildResources{CPU: 4000, Mem: 4 << 30},
@@ -446,6 +442,11 @@ func (n *nodeStub) write(t *testing.T, msg *routesync.Msg) {
 	n.writeMu.Lock()
 	defer n.writeMu.Unlock()
 	if err := routesync.WriteMsg(n.pw, msg); err != nil {
+		select {
+		case <-n.ctx.Done():
+			return
+		default:
+		}
 		t.Fatalf("node write %s: %v", msg.Type, err)
 	}
 }

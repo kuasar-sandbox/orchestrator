@@ -46,17 +46,19 @@ const (
 	RouteDead     RouteState = "dead"
 )
 
-// RouteRecord is the group-sharded route_link value. It does not store access
-// tokens; routers derive those from auth_key and sandbox_id.
+// RouteRecord is the group-sharded route_link value. AccessToken is the
+// scaler-derived data-plane token for the current SandboxID generation; registry
+// route owners return it without consulting sandbox-group providers.
 type RouteRecord struct {
-	Meta       RecordMeta        `json:"meta"`
-	Group      string            `json:"group"`
-	RouteKey   string            `json:"route_key"`
-	SandboxID  string            `json:"sandbox_id,omitempty"`
-	State      RouteState        `json:"state"`
-	NodeID     string            `json:"node_id,omitempty"`
-	TemplateID string            `json:"template_id,omitempty"`
-	Config     map[string]string `json:"config,omitempty"`
+	Meta        RecordMeta        `json:"meta"`
+	Group       string            `json:"group"`
+	RouteKey    string            `json:"route_key"`
+	SandboxID   string            `json:"sandbox_id,omitempty"`
+	State       RouteState        `json:"state"`
+	NodeID      string            `json:"node_id,omitempty"`
+	TemplateID  string            `json:"template_id,omitempty"`
+	Config      map[string]string `json:"config,omitempty"`
+	AccessToken string            `json:"access_token,omitempty"`
 }
 
 func RouteKey(group, routeKey string) string { return group + "\x00" + routeKey }
@@ -87,6 +89,7 @@ type NodeRecord struct {
 	Draining          bool                      `json:"draining,omitempty"`
 	LastHeartbeatUnix int64                     `json:"last_heartbeat_unix,omitempty"`
 	ResumeToken       string                    `json:"resume_token,omitempty"`
+	LinkOwner         string                    `json:"link_owner,omitempty"`
 }
 
 // NodeListEntry is the low-frequency WATCH_LIST projection consumed by scaler.

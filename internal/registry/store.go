@@ -1,25 +1,23 @@
 // Package registry is the cluster control plane's route/node owner and node_link
 // hub. route_link and node_link state go through the registry-owned quorum
-// kernel; group/build configuration remains in local typed tables until those
-// namespaces move behind the same member RPC boundary.
+// kernel; sandbox-group provider state lives on scaler/provider side.
 package registry
 
 import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
 	clusterstate "github.com/kuasar-sandbox/sandbox-orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/clusterstore"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/routesync"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/secretbox"
 )
 
 // Key prefixes for registry-local typed tables.
 const (
-	groupPrefix = "group/" // group/<group>               (config; keys sealed)
 	buildPrefix = "build/" // build/<esc(group)>/<build_id> (group-sharded, §6.1)
 )
 
@@ -53,49 +51,45 @@ type NodeRecord struct {
 	// node_dead_after.
 	LastHeartbeatUnix int64  `json:"last_heartbeat_unix,omitempty"`
 	ResumeToken       string `json:"resume_token,omitempty"`
+	LinkOwner         string `json:"link_owner,omitempty"`
 }
 
 // SandboxRecord is the registry-facing route_link view, keyed by
 // (group, route_key).
 type SandboxRecord struct {
-	Group      string       `json:"group"`
-	RouteKey   string       `json:"route_key"`
-	SID        string       `json:"sid,omitempty"`
-	State      SandboxState `json:"state"`
-	NodeID     string       `json:"node_id,omitempty"`
-	SnapLoc    string       `json:"snap_loc,omitempty"`
-	TemplateID string       `json:"template_id,omitempty"`
-	LastActive int64        `json:"last_active,omitempty"`
+	Group       string       `json:"group"`
+	RouteKey    string       `json:"route_key"`
+	SID         string       `json:"sid,omitempty"`
+	State       SandboxState `json:"state"`
+	NodeID      string       `json:"node_id,omitempty"`
+	SnapLoc     string       `json:"snap_loc,omitempty"`
+	TemplateID  string       `json:"template_id,omitempty"`
+	AccessToken string       `json:"access_token,omitempty"`
+	LastActive  int64        `json:"last_active,omitempty"`
 }
 
-// GroupConfig is the sandbox-group config. Secret fields are sealed at rest by
-// the registry's box.
-type GroupConfig struct {
-	Group         string              `json:"group"` // group path (the store key)
-	ProjectID     string              `json:"project_id,omitempty"`
-	ManifestKey   string              `json:"manifest_key,omitempty"`  // hex; sealed on store, plain in memory
-	AuthKey       string              `json:"auth_key,omitempty"`      // hex; sealed on store, plain in memory
-	RegistryAuth  string              `json:"registry_auth,omitempty"` // build image-pull creds (docker config.json); sealed on store
-	SandboxConfig map[string]string   `json:"sandbox_config,omitempty"`
-	ImageRepo     string              `json:"image_repo,omitempty"`
-	TemplateRef   string              `json:"template_ref,omitempty"`
-	NodeSelectors []map[string]string `json:"node_selectors,omitempty"`
-	ShuffleLabels map[string]string   `json:"shuffle_labels,omitempty"`
-}
-
-// Stores wraps the shared KV with typed, per-table accessors. The box seals group
-// secrets at rest.
+// Stores wraps the shared KV with typed, per-table accessors.
 type Stores struct {
 	kv     clusterstore.Store
-	box    *secretbox.Box
 	routes *clusterstate.RouteQuorum
 	nodes  *clusterstate.NodeQuorum
 
-	nodeListMu   sync.Mutex
-	nodeListRev  int64
-	nodeListLog  []clusterstore.Event
-	nodeListSubs map[int]chan clusterstore.Event
-	nodeListSeq  int
+	writerID        string
+	memberViews     []clusterstate.MemberView
+	routeOwnerCount int
+	nodeOwnerCount  int
+	localRoute      *clusterstate.MemoryRouteReplica
+	localNode       *clusterstate.MemoryNodeReplica
+	routeReplicas   map[string]clusterstate.RouteReplica
+	nodeReplicas    map[string]clusterstate.NodeReplica
+	replicaMu       sync.RWMutex
+
+	nodeListMu                  sync.Mutex
+	nodeListRev                 int64
+	nodeListLog                 []clusterstore.Event
+	nodeListSubs                map[int]chan clusterstore.Event
+	nodeListSeq                 int
+	nodeListHeartbeatRefreshSec int64
 
 	handoffMu        sync.RWMutex
 	membershipVer    int64
@@ -103,29 +97,288 @@ type Stores struct {
 	nodeHandoffGate  map[string]clusterstate.HandoffGate
 }
 
-const nodeListHeartbeatRefreshSec = 60
+const defaultNodeListHeartbeatRefreshSec = 60
 
-// NewStores builds the typed store layer over a clusterstore (box may be nil
-// only if no group secret is ever stored).
-func NewStores(kv clusterstore.Store, box *secretbox.Box) *Stores {
+// NewStores builds the typed store layer over a clusterstore.
+func NewStores(kv clusterstore.Store) *Stores {
+	return NewClusterStores(kv, "registry", clusterstate.MemberView{Version: 1, Members: []string{"registry"}}, 1, 1, nil, nil)
+}
+
+func NewClusterStores(
+	kv clusterstore.Store,
+	writerID string,
+	view clusterstate.MemberView,
+	routeOwnerCount, nodeOwnerCount int,
+	routeReplicas map[string]clusterstate.RouteReplica,
+	nodeReplicas map[string]clusterstate.NodeReplica,
+) *Stores {
+	if writerID == "" {
+		writerID = "registry"
+	}
+	if len(view.Members) == 0 {
+		view = clusterstate.MemberView{Version: 1, Members: []string{writerID}}
+	}
+	if routeOwnerCount <= 0 {
+		routeOwnerCount = 1
+	}
+	if nodeOwnerCount <= 0 {
+		nodeOwnerCount = 1
+	}
+	localRoute := clusterstate.NewMemoryRouteReplica()
+	localNode := clusterstate.NewMemoryNodeReplica()
+	rreps := make(map[string]clusterstate.RouteReplica, len(routeReplicas)+1)
+	nreps := make(map[string]clusterstate.NodeReplica, len(nodeReplicas)+1)
+	for id, rep := range routeReplicas {
+		if id != "" && rep != nil && id != writerID {
+			rreps[id] = rep
+		}
+	}
+	for id, rep := range nodeReplicas {
+		if id != "" && rep != nil && id != writerID {
+			nreps[id] = rep
+		}
+	}
+	rreps[writerID] = localRoute
+	nreps[writerID] = localNode
 	return &Stores{
-		kv:               kv,
-		box:              box,
-		routes:           clusterstate.NewRouteQuorum("registry", clusterstate.NewMemoryRouteReplica()),
-		nodes:            clusterstate.NewNodeQuorum("registry", clusterstate.NewMemoryNodeReplica()),
-		nodeListSubs:     map[int]chan clusterstore.Event{},
-		membershipVer:    1,
-		routeHandoffGate: map[string]clusterstate.HandoffGate{},
-		nodeHandoffGate:  map[string]clusterstate.HandoffGate{},
+		kv:                          kv,
+		routes:                      clusterstate.NewRouteQuorum(writerID, localRoute),
+		nodes:                       clusterstate.NewNodeQuorum(writerID, localNode),
+		writerID:                    writerID,
+		memberViews:                 []clusterstate.MemberView{view},
+		routeOwnerCount:             routeOwnerCount,
+		nodeOwnerCount:              nodeOwnerCount,
+		localRoute:                  localRoute,
+		localNode:                   localNode,
+		routeReplicas:               rreps,
+		nodeReplicas:                nreps,
+		nodeListSubs:                map[int]chan clusterstore.Event{},
+		nodeListHeartbeatRefreshSec: defaultNodeListHeartbeatRefreshSec,
+		membershipVer:               view.Version,
+		routeHandoffGate:            map[string]clusterstate.HandoffGate{},
+		nodeHandoffGate:             map[string]clusterstate.HandoffGate{},
 	}
 }
 
-func groupKey(group string) string { return groupPrefix + group }
+func NewClusterStoresWithViews(
+	kv clusterstore.Store,
+	writerID string,
+	views []clusterstate.MemberView,
+	routeOwnerCount, nodeOwnerCount int,
+	routeReplicas map[string]clusterstate.RouteReplica,
+	nodeReplicas map[string]clusterstate.NodeReplica,
+) *Stores {
+	if len(views) == 0 {
+		views = []clusterstate.MemberView{{Version: 1, Members: []string{writerID}}}
+	}
+	stores := NewClusterStores(kv, writerID, views[0], routeOwnerCount, nodeOwnerCount, routeReplicas, nodeReplicas)
+	stores.SetMemberViews(views)
+	return stores
+}
+
+func (s *Stores) LocalRouteReplica() clusterstate.RouteReplica { return s.localRoute }
+
+func (s *Stores) LocalNodeReplica() clusterstate.NodeReplica { return s.localNode }
+
+func (s *Stores) WriterID() string { return s.writerID }
+
+func (s *Stores) SetNodeListHeartbeatRefresh(d time.Duration) {
+	sec := int64(d.Seconds())
+	if sec < 1 {
+		sec = 1
+	}
+	s.nodeListMu.Lock()
+	s.nodeListHeartbeatRefreshSec = sec
+	s.nodeListMu.Unlock()
+}
+
+func (s *Stores) NodeListHeartbeatRefreshSec() int64 {
+	s.nodeListMu.Lock()
+	defer s.nodeListMu.Unlock()
+	if s.nodeListHeartbeatRefreshSec <= 0 {
+		return defaultNodeListHeartbeatRefreshSec
+	}
+	return s.nodeListHeartbeatRefreshSec
+}
 
 func (s *Stores) SetMembershipVersion(version int64) {
 	s.handoffMu.Lock()
 	s.membershipVer = version
 	s.handoffMu.Unlock()
+}
+
+func (s *Stores) SetMemberViews(views []clusterstate.MemberView) {
+	if len(views) == 0 {
+		return
+	}
+	clean := make([]clusterstate.MemberView, 0, len(views))
+	seen := map[int64]bool{}
+	for _, view := range views {
+		if len(view.Members) == 0 || seen[view.Version] {
+			continue
+		}
+		seen[view.Version] = true
+		clean = append(clean, view)
+	}
+	if len(clean) == 0 {
+		return
+	}
+	s.replicaMu.Lock()
+	s.memberViews = clean
+	s.replicaMu.Unlock()
+}
+
+func (s *Stores) SetClusterTopology(
+	views []clusterstate.MemberView,
+	routeOwnerCount, nodeOwnerCount int,
+	routeReplicas map[string]clusterstate.RouteReplica,
+	nodeReplicas map[string]clusterstate.NodeReplica,
+) {
+	if len(views) == 0 {
+		return
+	}
+	cleanViews := make([]clusterstate.MemberView, 0, len(views))
+	seenViews := map[int64]bool{}
+	for _, view := range views {
+		if len(view.Members) == 0 || seenViews[view.Version] {
+			continue
+		}
+		seenViews[view.Version] = true
+		cleanViews = append(cleanViews, view)
+	}
+	if len(cleanViews) == 0 {
+		return
+	}
+	if routeOwnerCount <= 0 {
+		routeOwnerCount = 1
+	}
+	if nodeOwnerCount <= 0 {
+		nodeOwnerCount = 1
+	}
+	rreps := make(map[string]clusterstate.RouteReplica, len(routeReplicas)+1)
+	nreps := make(map[string]clusterstate.NodeReplica, len(nodeReplicas)+1)
+	for id, rep := range routeReplicas {
+		if id != "" && id != s.writerID && rep != nil {
+			rreps[id] = rep
+		}
+	}
+	for id, rep := range nodeReplicas {
+		if id != "" && id != s.writerID && rep != nil {
+			nreps[id] = rep
+		}
+	}
+	rreps[s.writerID] = s.localRoute
+	nreps[s.writerID] = s.localNode
+	s.replicaMu.Lock()
+	s.memberViews = cleanViews
+	s.routeOwnerCount = routeOwnerCount
+	s.nodeOwnerCount = nodeOwnerCount
+	s.routeReplicas = rreps
+	s.nodeReplicas = nreps
+	s.replicaMu.Unlock()
+}
+
+func (s *Stores) routeQuorum(group string) (*clusterstate.RouteQuorum, error) {
+	s.replicaMu.RLock()
+	defer s.replicaMu.RUnlock()
+	ownerSets, ownerUnion, err := locatedOwnerSets(s.memberViews, group, s.routeOwnerCount)
+	if err != nil {
+		return nil, err
+	}
+	reps := make([]clusterstate.RouteReplicaSlot, 0, len(ownerUnion))
+	for _, id := range ownerUnion {
+		rep := s.routeReplicas[id]
+		if rep == nil {
+			rep = unavailableRouteReplica{id: id}
+		}
+		reps = append(reps, clusterstate.RouteReplicaSlot{ID: id, Replica: rep})
+	}
+	return clusterstate.NewRouteJointQuorum(s.writerID, reps, ownerSets), nil
+}
+
+func (s *Stores) nodeQuorum(nodeID string) (*clusterstate.NodeQuorum, error) {
+	s.replicaMu.RLock()
+	defer s.replicaMu.RUnlock()
+	ownerSets, ownerUnion, err := locatedOwnerSets(s.memberViews, nodeID, s.nodeOwnerCount)
+	if err != nil {
+		return nil, err
+	}
+	reps := make([]clusterstate.NodeReplicaSlot, 0, len(ownerUnion))
+	for _, id := range ownerUnion {
+		rep := s.nodeReplicas[id]
+		if rep == nil {
+			rep = unavailableNodeReplica{id: id}
+		}
+		reps = append(reps, clusterstate.NodeReplicaSlot{ID: id, Replica: rep})
+	}
+	return clusterstate.NewNodeJointQuorum(s.writerID, reps, ownerSets), nil
+}
+
+func locatedOwnerSets(views []clusterstate.MemberView, key string, ownerCount int) ([][]string, []string, error) {
+	sets := make([][]string, 0, len(views))
+	seen := map[string]bool{}
+	var union []string
+	for _, view := range views {
+		owners, err := view.Owners(key, ownerCount)
+		if err != nil {
+			return nil, nil, err
+		}
+		if len(owners) == 0 {
+			continue
+		}
+		sets = append(sets, owners)
+		for _, id := range owners {
+			if seen[id] {
+				continue
+			}
+			seen[id] = true
+			union = append(union, id)
+		}
+	}
+	sort.Strings(union)
+	return sets, union, nil
+}
+
+func (s *Stores) routeKeys(ctx context.Context) []string {
+	s.replicaMu.RLock()
+	reps := make([]clusterstate.RouteReplica, 0, len(s.routeReplicas))
+	for _, rep := range s.routeReplicas {
+		reps = append(reps, rep)
+	}
+	s.replicaMu.RUnlock()
+	seen := map[string]bool{}
+	for _, rep := range reps {
+		for _, key := range rep.Keys(ctx) {
+			seen[key] = true
+		}
+	}
+	keys := make([]string, 0, len(seen))
+	for key := range seen {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func (s *Stores) nodeKeys(ctx context.Context) []string {
+	s.replicaMu.RLock()
+	reps := make([]clusterstate.NodeReplica, 0, len(s.nodeReplicas))
+	for _, rep := range s.nodeReplicas {
+		reps = append(reps, rep)
+	}
+	s.replicaMu.RUnlock()
+	seen := map[string]bool{}
+	for _, rep := range reps {
+		for _, key := range rep.Keys(ctx) {
+			seen[key] = true
+		}
+	}
+	keys := make([]string, 0, len(seen))
+	for key := range seen {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 func (s *Stores) SetRouteHandoffGate(group, routeKey string, gate clusterstate.HandoffGate) {
@@ -179,7 +432,11 @@ func (s *Stores) PutNodeRuntime(ctx context.Context, n *NodeRecord) error {
 }
 
 func (s *Stores) GetNode(ctx context.Context, id string) (*NodeRecord, bool, error) {
-	rec, found, err := s.nodes.Get(ctx, id)
+	q, err := s.nodeQuorum(id)
+	if err != nil {
+		return nil, false, err
+	}
+	rec, found, err := q.Get(ctx, id)
 	if err != nil || !found {
 		return nil, found, err
 	}
@@ -191,12 +448,16 @@ func (s *Stores) DeleteNode(ctx context.Context, id string) error {
 	if err := s.checkNodeHandoff(id); err != nil {
 		return err
 	}
-	rec, found, err := s.nodes.Get(ctx, id)
+	q, err := s.nodeQuorum(id)
+	if err != nil {
+		return err
+	}
+	rec, found, err := q.Get(ctx, id)
 	if err != nil {
 		return err
 	}
 	if found {
-		_, err = s.nodes.CAS(ctx, id, rec.Meta.Rev, func(clusterstate.NodeRecord, bool) (clusterstate.NodeRecord, bool, error) {
+		_, err = q.CAS(ctx, id, rec.Meta.Rev, func(clusterstate.NodeRecord, bool) (clusterstate.NodeRecord, bool, error) {
 			return clusterstate.NodeRecord{}, false, nil
 		})
 		if err != nil {
@@ -208,10 +469,19 @@ func (s *Stores) DeleteNode(ctx context.Context, id string) error {
 
 // RangeNodes streams every node record (read-only callback).
 func (s *Stores) RangeNodes(ctx context.Context, fn func(*NodeRecord) error) error {
-	return s.nodes.List(ctx, func(rec clusterstate.NodeRecord) error {
-		n := fromClusterNode(rec)
-		return fn(&n)
-	})
+	for _, key := range s.nodeKeys(ctx) {
+		rec, found, err := s.GetNode(ctx, key)
+		if err != nil {
+			return err
+		}
+		if !found {
+			continue
+		}
+		if err := fn(rec); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *Stores) PutNodeList(ctx context.Context, n *NodeRecord) error {
@@ -223,7 +493,11 @@ func (s *Stores) putNodeLink(ctx context.Context, n *NodeRecord) (uint64, error)
 	if err := s.checkNodeHandoff(n.NodeID); err != nil {
 		return 0, err
 	}
-	cur, found, err := s.nodes.Get(ctx, n.NodeID)
+	q, err := s.nodeQuorum(n.NodeID)
+	if err != nil {
+		return 0, err
+	}
+	cur, found, err := q.Get(ctx, n.NodeID)
 	if err != nil {
 		return 0, err
 	}
@@ -231,7 +505,7 @@ func (s *Stores) putNodeLink(ctx context.Context, n *NodeRecord) (uint64, error)
 	if found {
 		expect = cur.Meta.Rev
 	}
-	rec, err := s.nodes.CAS(ctx, n.NodeID, expect, func(clusterstate.NodeRecord, bool) (clusterstate.NodeRecord, bool, error) {
+	rec, err := q.CAS(ctx, n.NodeID, expect, func(clusterstate.NodeRecord, bool) (clusterstate.NodeRecord, bool, error) {
 		return toClusterNode(n), true, nil
 	})
 	if err != nil {
@@ -254,8 +528,8 @@ func (s *Stores) NodeListRev(ctx context.Context) (int64, error) {
 }
 
 func (s *Stores) RangeNodeList(ctx context.Context, fn func(clusterstate.NodeListEntry) error) error {
-	return s.nodes.List(ctx, func(n clusterstate.NodeRecord) error {
-		return fn(clusterstate.ProjectNodeList(n))
+	return s.RangeNodes(ctx, func(n *NodeRecord) error {
+		return fn(projectNodeListRecord(n))
 	})
 }
 
@@ -337,7 +611,11 @@ func (s *Stores) publishNodeListEvent(ev clusterstore.Event) {
 
 // GetSandbox returns the route_link record + its revision (for CAS).
 func (s *Stores) GetSandbox(ctx context.Context, group, routeKey string) (rec *SandboxRecord, rev int64, found bool, err error) {
-	rr, found, err := s.routes.Get(ctx, group, routeKey)
+	q, err := s.routeQuorum(group)
+	if err != nil {
+		return nil, 0, false, err
+	}
+	rr, found, err := q.Get(ctx, group, routeKey)
 	if err != nil || !found {
 		return nil, 0, found, err
 	}
@@ -373,7 +651,11 @@ func (s *Stores) CASSandbox(ctx context.Context, r *SandboxRecord, expectRev int
 	if err := s.checkRouteHandoff(r.Group, r.RouteKey); err != nil {
 		return 0, false, err
 	}
-	rec, err := s.routes.CAS(ctx, r.Group, r.RouteKey, uint64(expectRev), func(clusterstate.RouteRecord, bool) (clusterstate.RouteRecord, bool, error) {
+	q, err := s.routeQuorum(r.Group)
+	if err != nil {
+		return 0, false, err
+	}
+	rec, err := q.CAS(ctx, r.Group, r.RouteKey, uint64(expectRev), func(clusterstate.RouteRecord, bool) (clusterstate.RouteRecord, bool, error) {
 		return toClusterRoute(r), true, nil
 	})
 	if err == clusterstate.ErrConflict {
@@ -389,11 +671,15 @@ func (s *Stores) DeleteSandbox(ctx context.Context, group, routeKey string) erro
 	if err := s.checkRouteHandoff(group, routeKey); err != nil {
 		return err
 	}
-	rec, found, err := s.routes.Get(ctx, group, routeKey)
+	q, err := s.routeQuorum(group)
+	if err != nil {
+		return err
+	}
+	rec, found, err := q.Get(ctx, group, routeKey)
 	if err != nil || !found {
 		return err
 	}
-	_, err = s.routes.CAS(ctx, group, routeKey, rec.Meta.Rev, func(clusterstate.RouteRecord, bool) (clusterstate.RouteRecord, bool, error) {
+	_, err = q.CAS(ctx, group, routeKey, rec.Meta.Rev, func(clusterstate.RouteRecord, bool) (clusterstate.RouteRecord, bool, error) {
 		return clusterstate.RouteRecord{}, false, nil
 	})
 	return err
@@ -401,18 +687,41 @@ func (s *Stores) DeleteSandbox(ctx context.Context, group, routeKey string) erro
 
 // RangeSandboxes streams a group's route_link rows.
 func (s *Stores) RangeSandboxes(ctx context.Context, group string, fn func(*SandboxRecord) error) error {
-	return s.routes.List(ctx, group, func(rec clusterstate.RouteRecord) error {
-		r := fromClusterRoute(rec)
-		return fn(&r)
-	})
+	return s.rangeSandboxes(ctx, group, fn)
 }
 
 // RangeAllSandboxes streams every route_link row across groups.
 func (s *Stores) RangeAllSandboxes(ctx context.Context, fn func(*SandboxRecord) error) error {
-	return s.routes.List(ctx, "", func(rec clusterstate.RouteRecord) error {
-		r := fromClusterRoute(rec)
-		return fn(&r)
-	})
+	return s.rangeSandboxes(ctx, "", fn)
+}
+
+func (s *Stores) rangeSandboxes(ctx context.Context, group string, fn func(*SandboxRecord) error) error {
+	for _, key := range s.routeKeys(ctx) {
+		g, rk := splitRouteStorageKey(key)
+		if group != "" && g != group {
+			continue
+		}
+		rec, _, found, err := s.GetSandbox(ctx, g, rk)
+		if err != nil {
+			return err
+		}
+		if !found {
+			continue
+		}
+		if err := fn(rec); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func splitRouteStorageKey(key string) (string, string) {
+	for i := 0; i < len(key); i++ {
+		if key[i] == 0 {
+			return key[:i], key[i+1:]
+		}
+	}
+	return "", key
 }
 
 func toClusterRoute(r *SandboxRecord) clusterstate.RouteRecord {
@@ -420,24 +729,26 @@ func toClusterRoute(r *SandboxRecord) clusterstate.RouteRecord {
 		return clusterstate.RouteRecord{}
 	}
 	return clusterstate.RouteRecord{
-		Group:      r.Group,
-		RouteKey:   r.RouteKey,
-		SandboxID:  r.SID,
-		State:      toClusterRouteState(r.State),
-		NodeID:     r.NodeID,
-		TemplateID: r.TemplateID,
+		Group:       r.Group,
+		RouteKey:    r.RouteKey,
+		SandboxID:   r.SID,
+		State:       toClusterRouteState(r.State),
+		NodeID:      r.NodeID,
+		TemplateID:  r.TemplateID,
+		AccessToken: r.AccessToken,
 	}
 }
 
 func fromClusterRoute(r clusterstate.RouteRecord) SandboxRecord {
 	return SandboxRecord{
-		Group:      r.Group,
-		RouteKey:   r.RouteKey,
-		SID:        r.SandboxID,
-		State:      fromClusterRouteState(r.State),
-		NodeID:     r.NodeID,
-		TemplateID: r.TemplateID,
-		LastActive: r.Meta.UpdatedAt.Unix(),
+		Group:       r.Group,
+		RouteKey:    r.RouteKey,
+		SID:         r.SandboxID,
+		State:       fromClusterRouteState(r.State),
+		NodeID:      r.NodeID,
+		TemplateID:  r.TemplateID,
+		AccessToken: r.AccessToken,
+		LastActive:  r.Meta.UpdatedAt.Unix(),
 	}
 }
 
@@ -491,6 +802,7 @@ func toClusterNode(n *NodeRecord) clusterstate.NodeRecord {
 		Draining:          n.Draining,
 		LastHeartbeatUnix: n.LastHeartbeatUnix,
 		ResumeToken:       n.ResumeToken,
+		LinkOwner:         n.LinkOwner,
 	}
 }
 
@@ -510,6 +822,7 @@ func fromClusterNode(n clusterstate.NodeRecord) NodeRecord {
 		Draining:          n.Draining || n.State == clusterstate.NodeDrained,
 		LastHeartbeatUnix: n.LastHeartbeatUnix,
 		ResumeToken:       n.ResumeToken,
+		LinkOwner:         n.LinkOwner,
 	}
 }
 
@@ -524,101 +837,58 @@ func cloneStringMap(in map[string]string) map[string]string {
 	return out
 }
 
-// --- group config (secret fields sealed at rest) ---
+type unavailableRouteReplica struct{ id string }
 
-func (s *Stores) PutGroup(ctx context.Context, g *GroupConfig) error {
-	stored := *g
-	if g.ManifestKey != "" || g.AuthKey != "" || g.RegistryAuth != "" {
-		if s.box == nil {
-			return fmt.Errorf("registry: group %q has sealed secrets but no encryption box configured", g.Group)
-		}
-		if g.ManifestKey != "" {
-			enc, err := s.box.EncryptString(g.ManifestKey)
-			if err != nil {
-				return err
-			}
-			stored.ManifestKey = enc
-		}
-		if g.AuthKey != "" {
-			enc, err := s.box.EncryptString(g.AuthKey)
-			if err != nil {
-				return err
-			}
-			stored.AuthKey = enc
-		}
-		if g.RegistryAuth != "" {
-			enc, err := s.box.EncryptString(g.RegistryAuth)
-			if err != nil {
-				return err
-			}
-			stored.RegistryAuth = enc
-		}
-	}
-	b, err := json.Marshal(&stored)
-	if err != nil {
-		return err
-	}
-	_, err = s.kv.Put(ctx, groupKey(g.Group), b)
-	return err
+func (r unavailableRouteReplica) err() error {
+	return fmt.Errorf("registry: route replica %q unavailable", r.id)
 }
 
-// unsealGroup decrypts a group's sealed secrets in place.
-func (s *Stores) unsealGroup(g *GroupConfig) error {
-	if s.box == nil {
-		return nil
-	}
-	if g.ManifestKey != "" {
-		dec, err := s.box.DecryptString(g.ManifestKey)
-		if err != nil {
-			return fmt.Errorf("registry: decrypt group manifest_key: %w", err)
-		}
-		g.ManifestKey = dec
-	}
-	if g.AuthKey != "" {
-		dec, err := s.box.DecryptString(g.AuthKey)
-		if err != nil {
-			return fmt.Errorf("registry: decrypt group auth_key: %w", err)
-		}
-		g.AuthKey = dec
-	}
-	if g.RegistryAuth != "" {
-		dec, err := s.box.DecryptString(g.RegistryAuth)
-		if err != nil {
-			return fmt.Errorf("registry: decrypt group registry_auth: %w", err)
-		}
-		g.RegistryAuth = dec
-	}
-	return nil
+func (r unavailableRouteReplica) Read(context.Context, string) (clusterstate.RouteRecord, bool, error) {
+	return clusterstate.RouteRecord{}, false, r.err()
 }
 
-// RangeGroups streams every group config (secrets decrypted) — the key
-// distributor reconciles predistribution leases over these (§7.6).
-func (s *Stores) RangeGroups(ctx context.Context, fn func(*GroupConfig) error) error {
-	return s.kv.Range(ctx, groupPrefix, func(kv clusterstore.KV) error {
-		var g GroupConfig
-		if err := json.Unmarshal(kv.Value, &g); err != nil {
-			return err
-		}
-		if err := s.unsealGroup(&g); err != nil {
-			return err
-		}
-		return fn(&g)
-	})
+func (r unavailableRouteReplica) Prepare(context.Context, string, clusterstate.Ballot) (clusterstate.RouteRecord, bool, bool, error) {
+	return clusterstate.RouteRecord{}, false, false, r.err()
 }
 
-// GetGroupByID returns the group config for an exact group id (secrets decrypted),
-// or (nil,false) if absent.
-func (s *Stores) GetGroupByID(ctx context.Context, group string) (*GroupConfig, bool, error) {
-	kv, found, err := s.kv.Get(ctx, groupKey(group))
-	if err != nil || !found {
-		return nil, found, err
-	}
-	var g GroupConfig
-	if err := json.Unmarshal(kv.Value, &g); err != nil {
-		return nil, false, err
-	}
-	if err := s.unsealGroup(&g); err != nil {
-		return nil, false, err
-	}
-	return &g, true, nil
+func (r unavailableRouteReplica) Accept(context.Context, string, clusterstate.RouteRecord, clusterstate.Ballot) (bool, error) {
+	return false, r.err()
 }
+
+func (r unavailableRouteReplica) Repair(context.Context, string, clusterstate.RouteRecord) error {
+	return r.err()
+}
+
+func (r unavailableRouteReplica) MaxBallot(context.Context, string) (clusterstate.Ballot, error) {
+	return clusterstate.Ballot{}, r.err()
+}
+
+func (r unavailableRouteReplica) Keys(context.Context) []string { return nil }
+
+type unavailableNodeReplica struct{ id string }
+
+func (r unavailableNodeReplica) err() error {
+	return fmt.Errorf("registry: node replica %q unavailable", r.id)
+}
+
+func (r unavailableNodeReplica) Read(context.Context, string) (clusterstate.NodeRecord, bool, error) {
+	return clusterstate.NodeRecord{}, false, r.err()
+}
+
+func (r unavailableNodeReplica) Prepare(context.Context, string, clusterstate.Ballot) (clusterstate.NodeRecord, bool, bool, error) {
+	return clusterstate.NodeRecord{}, false, false, r.err()
+}
+
+func (r unavailableNodeReplica) Accept(context.Context, string, clusterstate.NodeRecord, clusterstate.Ballot) (bool, error) {
+	return false, r.err()
+}
+
+func (r unavailableNodeReplica) Repair(context.Context, string, clusterstate.NodeRecord) error {
+	return r.err()
+}
+
+func (r unavailableNodeReplica) MaxBallot(context.Context, string) (clusterstate.Ballot, error) {
+	return clusterstate.Ballot{}, r.err()
+}
+
+func (r unavailableNodeReplica) Keys(context.Context) []string { return nil }
