@@ -751,7 +751,7 @@ Cold boot (1 GiB image):                 Snapshot restore (512 MiB):
 - `sandbox-orchestrator/docs/node-resource.md` — 节点资源仲裁协议与算法。
 - `sandbox-orchestrator/docs/node.md` — e2b 兼容控制面、模板构建、密钥与归属模型、
   集群接入(node-link)。
-- `sandbox-orchestrator/docs/cluster.md` — 集群级注册表 / Reserve 状态机 / 放置与
-  密钥分发(router·scaler)。
+- `sandbox-orchestrator/docs/cluster.md` — 集群级 registry 自聚簇 / Reserve 状态机 /
+  scaler 放置与密钥分发。
 - `sandbox-deps/docs/{cloud-hypervisor,sandbox-kernel,build}.md` — VMM 补丁集、
   Guest 内核契约、原生依赖构建。

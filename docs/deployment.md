@@ -17,14 +17,14 @@ vsock / UDS)协作。本文档定义这些进程在生产部署中的归属、�
 |---|---|---|---|
 | Compute Node | 每 AZ 一集群,~5,000 节点 | 承载客户沙箱(microVM),每节点 ~3K microVM;e2b 模板构建也在本节点的构建沙箱内进行(§5) | `node-ctl`(serve, 含 resource_listen)、`cache-ctl tiered`、`store-ctl`(sidecar)、`sandbox-ctl × N` |
 | L2 Cache Cluster | 每 AZ 一集群,100-200 节点 | 分布式 EC 缓存(RS 4+1,Maglev 一致性哈希),吸收 L1 miss 把 L3 请求压到 < 0.1% | `cache-ctl shard` |
-| Cluster Control Plane | 每 AZ 一组(小规模可单机)| e2b 兼容机群控制面:registry(注册表 + 节点通道枢纽)/ router(统一入口 + 会话亲和路由)/ scaler(放置调度);按 sandbox-group + route-key 把请求路由 / 按需拉起到正确节点的沙箱 | `cluster-ctl registry`、`cluster-ctl router`、`cluster-ctl scaler` |
+| Cluster Control Plane | 每 AZ 一组(小规模可单机)| e2b 兼容机群控制面:registry(自聚簇注册表 + 节点通道枢纽)/ router(统一入口 + 会话亲和路由)/ scaler(放置调度 + group provider);按 sandbox-group + route-key 把请求路由 / 按需拉起到正确节点的沙箱 | `cluster-ctl registry`、`cluster-ctl router`、`cluster-ctl scaler` |
 
 **Region 级共享资源**(由各自的平台管理面运营,平台外)
 
 | 资源 | 用途 |
 |---|---|
 | OBS 桶 | L3 chunk 与 Manifest 持久化(`store-ctl` 后端) |
-| 平台管理面 | 沙箱实例调度、配置、租户管控、模板构建凭据(registry 拉取令牌 / 客户密钥)↔ **cluster 控制面**(经 GroupConfigProvider 提供 sandbox-group 配置)与 compute 节点 `node-ctl` 对话 |
+| 平台管理面 | 沙箱实例调度、配置、租户管控、模板构建凭据(registry 拉取令牌 / 客户密钥)↔ **cluster 控制面**(向 scaler/provider 导入 sandbox-group 配置)与 compute 节点 `node-ctl` 对话 |
 | 容器镜像仓库 | 租户镜像来源;构建沙箱内 `flatten-ctl` 按需拉取(OCI v1.1,支持 Referrers) |
 
 ## 2. Compute Node
@@ -246,46 +246,54 @@ node-ctl 解析,见 node.md §12。构建池上限由 `sandbox-builder.slice` �
 ## 6. Cluster Control Plane (cluster-ctl)
 
 大规模(多 compute 节点)部署时,机群之上由 **cluster-ctl** 三角色控制面聚合:**registry**
-(持久状态权威 + 节点通道枢纽 + 异步 control_api/watch)、**router**(e2b 兼容统一入口:控制面 + 数据面,
-按 sandbox-group + route-key 会话亲和路由)、**scaler**(放置调度器)。详见
+(自聚簇执行态权威 + 节点通道枢纽)、**router**(e2b 兼容统一入口:控制面 + 数据面,
+按 sandbox-group + route-key 会话亲和路由)、**scaler**(group provider/importer + 放置调度器)。详见
 `sandbox-orchestrator/docs/cluster.md`。单 compute 节点独立部署(直供 e2b SDK)时**不需要** cluster 层。
 
 ### 6.1 进程
 
 | 进程 | 角色 | 数量 | 启停 | 归属 |
 |---|---|---|---|---|
-| `cluster-ctl registry` | 持久状态权威(node / sandbox-group / sandbox / build 注册表)+ 每节点 node-link 长连枢纽 + 异步 control_api/watch;**持久后端 sqlite/etcd/raft(无内存模式)** | 单 / 多副本(按 sandbox-group 分片)| systemd | 平台内,`cluster.md` §4 / §10 |
-| `cluster-ctl router` | e2b 兼容统一入口(`api.<domain>` 控制面 + 数据面),持本地路由缓存,经 Reserve 路由 / 拉起沙箱 | N 副本(LB 后,无状态)| systemd | 平台内,`cluster-router.md` |
-| `cluster-ctl scaler` | 放置调度器:给 registry 出 PlaceSandbox / PlaceBuild 建议 + 维护 shuffle-sharding 选择器 | 单 / 多副本(按 group 分片)| systemd | 平台内,`cluster-scaler.md` |
+| `cluster-ctl registry` | registry 自聚簇成员;复制 `route_link` / `node_link` / `node_list` 执行态,承载 node 长连接和 route/node owner RPC | 1 或 N 副本;每个 group/node 由 LocateN 选 owner set | systemd | 平台内,`cluster.md` |
+| `cluster-ctl router` | e2b 兼容统一入口(`api.<domain>` 控制面 + 数据面),持活动连接 cache 和近期路由 cache,miss 时经 Reserve 路由 / 拉起沙箱 | N 副本(LB 后,无状态)| systemd | 平台内,`cluster-router.md` |
+| `cluster-ctl scaler` | group provider/importer、WATCH_LIST 消费方与放置调度器;向 registry 提供 PlaceSandbox / PlaceBuild / verify-key | N 副本;按 group 确定性 failover | systemd | 平台内,`cluster-scaler.md` |
 
-小规模可三角色同机共置(control_api 接口走 UDS,低延迟);大规模各自横向扩展(`cluster.md` §4.2)。
+小规模可三角色同机共置;大规模按 registry 成员表、router 入口副本和 scaler 副本分别扩展。
 
 ### 6.2 端口
 
 | 进程 | 监听 | 协议 | 用途 |
 |---|---|---|---|
 | `cluster-ctl router` | `:443` | HTTPS/h2 | **对外** e2b 控制面 + 数据面入口(机群唯一北向面)|
-| `cluster-ctl registry` | `:7700`(node-link)| 帧化 JSON/h2c,mTLS | compute 节点 `node-ctl serve` 拨入注册 / 心跳 / 事件 / 命令(每节点一条长连)|
-| `cluster-ctl registry` | `/run/cluster/registry.sock`(control_api)| 帧化 JSON | 本机 router/scaler 的异步 reserve/watch/placement(远端经 mTLS)|
+| `cluster-ctl registry` | `member.listen`,如 `:7700` | JSONRPC over HTTP/h2c 或 HTTPS | 统一控制面;按 path 承载 `/node-link/*`、`/route-link/*`、`/scale-link/*`、`/cluster/membership`、`/internal/registry-member/*`、`/internal/memberlist/*` |
+| `cluster-ctl registry` | `node_link.listen`(可选) | JSONRPC over HTTP/h2c 或 HTTPS | 可选独立 node 长连接监听;为空时复用 `member.listen` |
+| `cluster-ctl scaler` | `member.listen`,如 `:7800` | JSONRPC over HTTP/h2c 或 HTTPS | scaler Place / verify-key / import API;registry 对 scaler 只做 failover 调用 |
 
 ### 6.3 与节点 / 平台管理面的关系
 
-- **节点接入**:每 compute 节点 `node-ctl serve` 配 `cluster.registry`,拨 registry 起 node-link
-  (复用其 routesync 引擎,反向注册为路由权威);registry 经该通道下发 create/connect/delete/
-  build_register/密钥租约,节点上报沙箱 / 构建事件与水位(`node.md` §10)。
-- **平台管理面(平台外)**:经 `GroupConfigProvider` 接口给 cluster 提供 sandbox-group 配置(租户
-  manifest_key、沙箱初始化配置、镜像仓库、模板、nodeSelectors)——registry 自存(`sandbox_group.providers=store`)
-  或向平台管理面服务取(`external:`,扩展点,`cluster.md` §6.2)。租户密钥分发由 registry 主管
-  (预分发到分配节点集,`cluster.md` §7.6)。
+- **节点接入**:每 compute 节点 `node-ctl serve` 配 registry bootstrap,拨入 node-link。`node_link`
+  owner 持有实际 h2 stream,同 owner set 内复制完整节点视图;`route_link` owner 要下发
+  create/connect/delete/build/key 命令时,通过 node-owner RPC 转给当前 `link_owner`。
+- **平台管理面(平台外)**:向 scaler/provider 侧导入 sandbox-group 配置(租户 `manifest_key`、
+  `auth_key`、沙箱初始化配置、镜像仓库、模板、nodeSelectors)。registry 不实现 group provider,
+  只在 Reserve/Place 冷路径把请求转给 ready scaler。密钥分发是 create/build 前置条件,drop 或租约过期
+  不影响已经运行的 sandbox。
+- **成员关系**:registry 成员表由版本化配置分发,通过信号或 API reload。`memberlist` 复用 HTTP
+  控制面只做 failure detection 和 ready 传播,不维护成员清单,不参与 `LocateN` 分片计算。
+- **成员变更**:registry 可同时持有 active / next membership。受影响的 group/node 逻辑 owner set 为
+  old/new 并集,提交要求 old quorum + new quorum;scaler 的周期/触发 group import 与 node/node_list 上报
+  驱动冷 key 和执行态自然复制到新 owner set。router/node/scaler 通过 `/cluster/membership` 刷新 active/next
+  视图。
 
 ### 6.4 故障域
 
 | 故障 | 影响 | 自愈 |
 |---|---|---|
-| `registry` 崩溃 | node-link 全断,Reserve 暂不可用 | 持久后端恢复 + 节点重连重报(增量),机群态重建;router 本地缓存使**已建立会话热路径不受影响** |
+| 单个 `registry` 成员崩溃 | 其参与的逻辑分片降一格;quorum 仍满足时继续服务,不足时该分片停写 | 成员恢复后通过 quorum read / read-repair catch-up;router 本地 cache 使**已建立会话热路径不受影响** |
+| registry 整集群完全下电 | Reserve/Place 暂不可用;运行中 sandbox 不要求自动恢复到 registry | 节点和 registry 重新启动后按新执行态重新接入;灾难恢复可通过 route/node/group 记录导入导出手动恢复 |
 | `router` 崩溃 | 该副本连接断 | 无状态,LB 改路由其余副本 |
-| `scaler` 崩溃 | 冷放置停滞 | 热路径不受影响;park 超时;重连即恢复 |
-| 单 compute 节点 node-link 失联 | registry 暂失该节点视图 | 节点重连重报;死节点清扫使其记录失效(`cluster.md` §11)|
+| `scaler` 崩溃 | 该 scaler 不再作为 ready 候选;冷放置 failover 到同 group 的其他 scaler | 热路径不受影响;Place 超时后 registry 换下一个候选 |
+| 单 compute 节点 node-link 失联 | registry 暂失该节点视图 | 节点重连重报;node_dead_after 后 node_list 失效,scaler 不再放置到该节点;孤儿 sandbox 按 group+sandbox_id 清理 |
 
 ## 7. 全景拓扑
 
@@ -433,7 +441,7 @@ Region 级:         OBS 桶 + 平台管理面
 
 每 compute 节点跑:`store-ctl` + `cache-ctl tiered` + `node-ctl`(serve,含
 `resource_listen`)+ `sandbox-ctl × ~3K`。
-Cluster Control Plane:  registry(持久 sqlite/etcd)+ router(N 副本 LB 后)+ scaler。
+Cluster Control Plane:  registry 自聚簇(N 副本,按 group/node 逻辑分片)+ router(N 副本 LB 后)+ scaler(N 副本)。
 
 ### 10.3 多 AZ
 
@@ -451,8 +459,9 @@ Cluster Control Plane:  registry(持久 sqlite/etcd)+ router(N 副本 LB 后)+ s
 | `cache-ctl tiered` | `--config <path>` | `listen: 127.0.0.1:7070`(节点本机);`tiers[].cluster.peers` 写本 AZ L2 全集群 | [`docs/cache.md`](cache.md) §3.4 |
 | `cache-ctl shard` | `--config <path>` | `listen: 0.0.0.0:7070`(对外服务)| [`docs/cache.md`](cache.md) §3.3 |
 | `node-ctl serve(resource_listen)` | `/etc/node-ctl/serve.yaml` 的内联 `resource_listen` 块 | `socket: /run/sandbox-resource.sock` | [`docs/node-resource.md`](node-resource.md) §3 |
-| `cluster-ctl registry` | `--config /etc/cluster-ctl/registry.yaml` | `state.backend: sqlite/etcd/raft`,`node_link.listen: :7700`,`control_api.listen` UDS | `sandbox-orchestrator/docs/cluster.md` §3 |
-| `cluster-ctl router` / `scaler` | `--config /etc/cluster-ctl/{router,scaler}.yaml`(各自文件;`registry: { endpoint, tls }` 指向 registry control_api)| router `:443`(LB 后 N 副本) | `cluster-router.md` / `cluster-scaler.md` §3 |
+| `cluster-ctl registry` | `--config /etc/cluster-ctl/registry.yaml` | `member.id/listen/advertise`;`membership.active/versions/owners`;`node_link`、`route_link`、`node_list`、`scale_link` | `sandbox-orchestrator/docs/cluster.md` §2 |
+| `cluster-ctl router` | `--config /etc/cluster-ctl/router.yaml` | `registry.bootstrap` 指向 registry 控制面;router `:443`(LB 后 N 副本);请求必须带 `X-Kuasar-Sandbox-Group` | `sandbox-orchestrator/docs/cluster-router.md` §3 |
+| `cluster-ctl scaler` | `--config /etc/cluster-ctl/scaler.yaml` | `member.id/listen/advertise`;`registry.bootstrap`;group 配置经 `cluster-ctl scaler import` 或外部 provider 导入 | `sandbox-orchestrator/docs/cluster-scaler.md` §3 |
 | `sandbox-ctl run` | `--config <path>`(`SANDBOX_CONFIG`)+ `--manifest-config <path>`(`MANIFEST_CONFIG`)| **per-sandbox**,由 `node-ctl` 生成,落在 `/run/sandbox/<sid>/` | [`docs/sandbox.md`](sandbox.md) §3 |
 | `manifest-ctl` | `--manifest-config <path>`(`MANIFEST_CONFIG`)| 与 `sandbox-ctl` 共享格式;只连本机 store-ctl + cache-ctl | [`docs/manifest.md`](manifest.md) §3 |
 | `flatten-ctl` | CLI flag + `--manifest-config`(`MANIFEST_CONFIG`,`--upload` 时)+ `--config`(`FLATTEN_CONFIG`,registry 源时);凭据走 `FLATTEN_REGISTRY_*` env | 经 builder runtime flavor 在构建沙箱 guest 内运行(`run-builder` 驱动,§5)| [`docs/flatten.md`](flatten.md) §2 |

@@ -12,6 +12,7 @@ sandbox-runtime     sandbox-init
 sandbox-runtime     sandbox-runtime.erofs
 sandbox-orchestrator node-ctl
 sandbox-orchestrator cluster-ctl
+sandbox-orchestrator node-stub-ctl
 sandbox-vswitch     vswitch-ctl
 sandbox-vswitch     tapfd-get
 sandbox-orchestrator e2b-key-ctl

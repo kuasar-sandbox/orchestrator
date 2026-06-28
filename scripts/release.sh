@@ -102,7 +102,7 @@ E2ES=(
   "kuasar-sandbox/test/e2e/e2e_run_builder.sh"
   "kuasar-sandbox/test/e2e/e2e_execute.sh"
   "kuasar-sandbox/test/e2e/e2e_orchestrator_proxy.sh"
-  # cluster tier (real microVM: router -> registry -> node-link)
+  # cluster tier (real cluster processes + node-stub-ctl control-plane/data-forwarding stub)
   "kuasar-sandbox/test/e2e/e2e_cluster.sh"
   # accelerator (3)
   "sandbox-accelerator/test/e2e/e2e_cache.sh"
