@@ -1,6 +1,6 @@
-# cluster-scaler.service — cluster placement scheduler (cluster-scaler.md). Dials the
-# registry op endpoint (scaler.yaml: registry) and answers placement over the
-# scaler-link; no listener of its own. Operator-managed.
+# cluster-scaler.service — cluster placement scheduler (cluster-scaler.md).
+# Starts the scaler member API, follows registry membership, consumes node_list
+# WATCH_LIST and serves Place/verify-key for registry callers. Operator-managed.
 [Unit]
 Description=kuasar cluster-ctl scaler (placement scheduler)
 After=network-online.target cluster-registry.service
