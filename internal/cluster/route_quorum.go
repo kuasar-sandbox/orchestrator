@@ -63,34 +63,18 @@ func NewRouteJointQuorum(writer string, slots []RouteReplicaSlot, ownerSets [][]
 func (q *RouteQuorum) Get(ctx context.Context, group, routeKey string) (RouteRecord, bool, error) {
 	key := RouteKey(group, routeKey)
 	ballot := q.nextBallot(ctx, key)
-	reads := make([]routeRead, 0, len(q.replicas))
-	prepared := map[int]bool{}
-	for i, r := range q.replicas {
-		rec, found, ok, err := r.replica.Prepare(ctx, key, ballot)
-		if err != nil || !ok {
-			continue
-		}
-		prepared[i] = true
-		reads = append(reads, routeRead{rec: rec, found: found})
-	}
+	reads, prepared := q.prepare(ctx, key, ballot)
 	if !satisfiesQuorumSets(prepared, q.sets) {
 		return RouteRecord{}, false, ErrQuorum
 	}
 	best, found := highestRoute(reads)
 	if found {
 		best.Meta.Ballot = ballot
-		accepted := map[int]bool{}
-		for i := range prepared {
-			if ok, _ := q.replicas[i].replica.Accept(ctx, key, best, ballot); ok {
-				accepted[i] = true
-			}
-		}
+		accepted := q.accept(ctx, key, best, ballot, prepared)
 		if !satisfiesQuorumSets(accepted, q.sets) {
 			return RouteRecord{}, false, ErrQuorum
 		}
-		for _, r := range q.replicas {
-			_ = r.replica.Repair(ctx, key, best)
-		}
+		q.repairBestEffort(ctx, key, best)
 	}
 	if found && best.State == RouteDead {
 		return RouteRecord{}, false, nil
@@ -132,16 +116,7 @@ func (q *RouteQuorum) List(ctx context.Context, group string, fn func(RouteRecor
 func (q *RouteQuorum) CAS(ctx context.Context, group, routeKey string, expectRev uint64, propose RouteProposal) (RouteRecord, error) {
 	key := RouteKey(group, routeKey)
 	ballot := q.nextBallot(ctx, key)
-	reads := make([]routeRead, 0, len(q.replicas))
-	prepared := map[int]bool{}
-	for i, r := range q.replicas {
-		rec, found, ok, err := r.replica.Prepare(ctx, key, ballot)
-		if err != nil || !ok {
-			continue
-		}
-		prepared[i] = true
-		reads = append(reads, routeRead{rec: rec, found: found})
-	}
+	reads, prepared := q.prepare(ctx, key, ballot)
 	if !satisfiesQuorumSets(prepared, q.sets) {
 		return RouteRecord{}, ErrQuorum
 	}
@@ -172,43 +147,24 @@ func (q *RouteQuorum) CAS(ctx context.Context, group, routeKey string, expectRev
 			RouteKey: rk,
 			State:    RouteDead,
 		}
-		accepted := map[int]bool{}
-		for i := range prepared {
-			if ok, _ := q.replicas[i].replica.Accept(ctx, key, tombstone, ballot); ok {
-				accepted[i] = true
-			}
-		}
+		accepted := q.accept(ctx, key, tombstone, ballot, prepared)
 		if !satisfiesQuorumSets(accepted, q.sets) {
 			return RouteRecord{}, ErrQuorum
 		}
-		for _, r := range q.replicas {
-			_ = r.replica.Repair(ctx, key, tombstone)
-		}
+		q.repairBestEffort(ctx, key, tombstone)
 		return RouteRecord{}, nil
 	}
 	next.Meta = RecordMeta{Ballot: ballot, Rev: cur.Meta.Rev + 1, UpdatedAt: time.Now()}
-	accepted := map[int]bool{}
-	for i := range prepared {
-		if ok, _ := q.replicas[i].replica.Accept(ctx, key, next, ballot); ok {
-			accepted[i] = true
-		}
-	}
+	accepted := q.accept(ctx, key, next, ballot, prepared)
 	if !satisfiesQuorumSets(accepted, q.sets) {
 		return RouteRecord{}, ErrQuorum
 	}
-	for _, r := range q.replicas {
-		_ = r.replica.Repair(ctx, key, next)
-	}
+	q.repairBestEffort(ctx, key, next)
 	return next, nil
 }
 
 func (q *RouteQuorum) nextBallot(ctx context.Context, key string) Ballot {
-	var max Ballot
-	for _, r := range q.replicas {
-		if b, err := r.replica.MaxBallot(ctx, key); err == nil && max.Less(b) {
-			max = b
-		}
-	}
+	max := q.maxBallot(ctx, key)
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	if local := q.rounds[key]; max.Round < local {
@@ -217,6 +173,100 @@ func (q *RouteQuorum) nextBallot(ctx context.Context, key string) Ballot {
 	next := max.Round + 1
 	q.rounds[key] = next
 	return Ballot{Round: next, Writer: q.writer}
+}
+
+func (q *RouteQuorum) maxBallot(ctx context.Context, key string) Ballot {
+	type result struct {
+		ballot Ballot
+		err    error
+	}
+	ch := make(chan result, len(q.replicas))
+	for _, r := range q.replicas {
+		rep := r.replica
+		go func() {
+			b, err := rep.MaxBallot(ctx, key)
+			ch <- result{ballot: b, err: err}
+		}()
+	}
+	var max Ballot
+	for range q.replicas {
+		res := <-ch
+		if res.err == nil && max.Less(res.ballot) {
+			max = res.ballot
+		}
+	}
+	return max
+}
+
+func (q *RouteQuorum) prepare(ctx context.Context, key string, ballot Ballot) ([]routeRead, map[int]bool) {
+	type result struct {
+		idx   int
+		rec   RouteRecord
+		found bool
+		ok    bool
+		err   error
+	}
+	ch := make(chan result, len(q.replicas))
+	for i, r := range q.replicas {
+		idx, rep := i, r.replica
+		go func() {
+			rec, found, ok, err := rep.Prepare(ctx, key, ballot)
+			ch <- result{idx: idx, rec: rec, found: found, ok: ok, err: err}
+		}()
+	}
+	reads := make([]routeRead, 0, len(q.replicas))
+	prepared := map[int]bool{}
+	for range q.replicas {
+		res := <-ch
+		if res.err != nil || !res.ok {
+			continue
+		}
+		prepared[res.idx] = true
+		reads = append(reads, routeRead{rec: res.rec, found: res.found})
+	}
+	return reads, prepared
+}
+
+func (q *RouteQuorum) accept(ctx context.Context, key string, rec RouteRecord, ballot Ballot, prepared map[int]bool) map[int]bool {
+	type result struct {
+		idx int
+		ok  bool
+	}
+	ch := make(chan result, len(prepared))
+	for i := range prepared {
+		idx, rep := i, q.replicas[i].replica
+		go func() {
+			ok, _ := rep.Accept(ctx, key, rec, ballot)
+			ch <- result{idx: idx, ok: ok}
+		}()
+	}
+	accepted := map[int]bool{}
+	for range prepared {
+		res := <-ch
+		if res.ok {
+			accepted[res.idx] = true
+		}
+	}
+	return accepted
+}
+
+func (q *RouteQuorum) repairBestEffort(ctx context.Context, key string, rec RouteRecord) {
+	repairCtx := context.WithoutCancel(ctx)
+	if _, ok := repairCtx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		repairCtx, cancel = context.WithTimeout(repairCtx, 250*time.Millisecond)
+		defer cancel()
+	}
+	var wg sync.WaitGroup
+	for _, r := range q.replicas {
+		rep := r.replica
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = rep.Repair(repairCtx, key, rec)
+		}()
+	}
+	wg.Wait()
 }
 
 type routeReplicaSlot struct {

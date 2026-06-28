@@ -22,7 +22,6 @@ import (
 	clusterstate "github.com/kuasar-sandbox/sandbox-orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/clustercfg"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/clusterstore"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/membertransport"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/registry"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/routesync"
 )
@@ -64,21 +63,17 @@ func runRegistry(args []string, log *slog.Logger) error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	memberMux, err := newMemberTransportMux(cfg, cfg.Member.TLS)
-	if err != nil {
-		return err
-	}
-	go runRegistryReload(ctx, *cfgPath, cfgState, reg, memberMux, log)
+	go runRegistryReload(ctx, *cfgPath, cfgState, reg, log)
 
 	// Dead-node sweep (cluster.md §11): reset the sandboxes of nodes whose
 	// node-link dropped and whose last heartbeat predates node_dead_after.
 	go reg.RunReaper(ctx, cfg.NodeLink.NodeDeadDur())
+	go runRegistryCatchUp(ctx, stores, 5*time.Second, log)
 	// Key predistribution + lease renewal to each group's allocation set (§7.6).
 	go reg.RunKeyDistributor(ctx, time.Hour)
 
 	controlMux := http.NewServeMux()
-	controlMux.Handle(membertransport.PathPrefix+"/", memberMux)
-	mountRegistryControl(controlMux, reg, cfgState, *cfgPath, memberMux)
+	mountRegistryControl(controlMux, reg, cfgState, *cfgPath)
 	if !cfg.NodeLinkSplit() {
 		controlMux.HandleFunc(routesync.NodeLinkPath, reg.ServeNodeLink)
 	} else {
@@ -101,37 +96,26 @@ func runRegistry(args []string, log *slog.Logger) error {
 	return serveClusterHTTP(ctx, "member", cfg.ControlListen(), cfg.Member.TLS, controlMux, log)
 }
 
-func newMemberTransportMux(cfg *clustercfg.RegistryConfig, tlsMaterial clustercfg.TLS) (*membertransport.Mux, error) {
-	mux := membertransport.NewMux()
-	if err := syncMemberTransportMux(mux, cfg, tlsMaterial); err != nil {
-		return nil, err
+func runRegistryCatchUp(ctx context.Context, stores *registry.Stores, interval time.Duration, log *slog.Logger) {
+	if interval <= 0 {
+		interval = 5 * time.Second
 	}
-	return mux, nil
-}
-
-func syncMemberTransportMux(mux *membertransport.Mux, cfg *clustercfg.RegistryConfig, tlsMaterial clustercfg.TLS) error {
-	resolver := memberResolver(cfg)
-	_, client, err := registryMemberClient(cfg.ControlAdvertise(), tlsMaterial)
-	if err != nil {
-		return err
-	}
-	for _, version := range cfg.Membership.OwnerVersions() {
-		if err := mux.Register(membertransport.New(version.Label, cfg.Member.ID, resolver, client)); err != nil {
-			return err
+	timer := time.NewTimer(0)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+			catchCtx, cancel := context.WithTimeout(ctx, interval)
+			err := stores.CatchUp(catchCtx)
+			cancel()
+			if err != nil && ctx.Err() == nil {
+				log.Warn("registry catch-up", "err", err)
+			}
+			timer.Reset(interval)
 		}
 	}
-	return nil
-}
-
-func memberResolver(cfg *clustercfg.RegistryConfig) membertransport.StaticResolver {
-	resolver := membertransport.StaticResolver{}
-	for _, member := range unionMembershipMembers(cfg.Membership.OwnerVersions()) {
-		if member.ID == "" || member.Advertise == "" {
-			continue
-		}
-		resolver[member.ID] = member.Advertise
-	}
-	return resolver
 }
 
 type registryRuntimeConfig struct {
@@ -156,7 +140,7 @@ func (s *registryRuntimeConfig) set(cfg *clustercfg.RegistryConfig) {
 	s.mu.Unlock()
 }
 
-func mountRegistryControl(mux *http.ServeMux, reg *registry.Registry, cfgState *registryRuntimeConfig, cfgPath string, memberMux *membertransport.Mux) {
+func mountRegistryControl(mux *http.ServeMux, reg *registry.Registry, cfgState *registryRuntimeConfig, cfgPath string) {
 	reg.ServeRouteLink(mux)
 	reg.ServeScaleLink(mux)
 	mux.HandleFunc(clusterstate.RouteReplicaRPCPath, func(w http.ResponseWriter, req *http.Request) {
@@ -182,7 +166,7 @@ func mountRegistryControl(mux *http.ServeMux, reg *registry.Registry, cfgState *
 			return
 		}
 		cfg := cfgState.get()
-		if err := reloadRegistryConfig(req.Context(), cfgPath, cfg, cfgState, reg, memberMux); err != nil {
+		if err := reloadRegistryConfig(req.Context(), cfgPath, cfg, cfgState, reg); err != nil {
 			http.Error(w, err.Error(), http.StatusConflict)
 			return
 		}
@@ -190,7 +174,7 @@ func mountRegistryControl(mux *http.ServeMux, reg *registry.Registry, cfgState *
 	})
 }
 
-func runRegistryReload(ctx context.Context, cfgPath string, cfgState *registryRuntimeConfig, reg *registry.Registry, memberMux *membertransport.Mux, log *slog.Logger) {
+func runRegistryReload(ctx context.Context, cfgPath string, cfgState *registryRuntimeConfig, reg *registry.Registry, log *slog.Logger) {
 	hup := make(chan os.Signal, 1)
 	signal.Notify(hup, syscall.SIGHUP)
 	defer signal.Stop(hup)
@@ -200,7 +184,7 @@ func runRegistryReload(ctx context.Context, cfgPath string, cfgState *registryRu
 			return
 		case <-hup:
 			old := cfgState.get()
-			if err := reloadRegistryConfig(ctx, cfgPath, old, cfgState, reg, memberMux); err != nil {
+			if err := reloadRegistryConfig(ctx, cfgPath, old, cfgState, reg); err != nil {
 				log.Error("registry reload failed", "err", err)
 			} else {
 				next := cfgState.get()
@@ -210,7 +194,7 @@ func runRegistryReload(ctx context.Context, cfgPath string, cfgState *registryRu
 	}
 }
 
-func reloadRegistryConfig(ctx context.Context, cfgPath string, old *clustercfg.RegistryConfig, cfgState *registryRuntimeConfig, reg *registry.Registry, memberMux *membertransport.Mux) error {
+func reloadRegistryConfig(ctx context.Context, cfgPath string, old *clustercfg.RegistryConfig, cfgState *registryRuntimeConfig, reg *registry.Registry) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -240,11 +224,6 @@ func reloadRegistryConfig(ctx context.Context, cfgPath string, old *clustercfg.R
 	views, routeReplicas, nodeReplicas, nodeOwners, err := buildRegistryTopology(next)
 	if err != nil {
 		return err
-	}
-	if memberMux != nil {
-		if err := syncMemberTransportMux(memberMux, next, next.Member.TLS); err != nil {
-			return err
-		}
 	}
 	reg.Stores().SetClusterTopology(views,
 		next.Membership.Owners.RouteLink, next.Membership.Owners.NodeLink,
@@ -305,8 +284,9 @@ func buildRegistryTopology(cfg *clustercfg.RegistryConfig) ([]clusterstate.Membe
 		if err != nil {
 			return nil, nil, nil, nil, fmt.Errorf("registry: member %q: %w", member.ID, err)
 		}
-		routeReplicas[member.ID] = clusterstate.NewHTTPRouteReplica(base, client)
-		nodeReplicas[member.ID] = clusterstate.NewHTTPNodeReplica(base, client)
+		health := clusterstate.NewReplicaHealth(2 * time.Second)
+		routeReplicas[member.ID] = clusterstate.NewHTTPRouteReplicaWithHealth(base, client, health)
+		nodeReplicas[member.ID] = clusterstate.NewHTTPNodeReplicaWithHealth(base, client, health)
 		nodeOwners[member.ID] = registry.NewHTTPNodeOwner(base, client)
 	}
 	return views, routeReplicas, nodeReplicas, nodeOwners, nil

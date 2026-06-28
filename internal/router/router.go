@@ -3,17 +3,15 @@
 // data plane (<port>-<sid>.<domain>) by Host, reserving sandboxes through the
 // registry's control API and forwarding the data plane to the placed node (the
 // two-hop path: client -> router -> node data endpoint -> guest).
-//
-// Phase 3 ships create (-> reserve) + data-plane forward by sid; the remaining
-// control verbs (pause/kill/list/get forwarded to the node) and the local route
-// cache (hot-path, zero-control-roundtrip) build on this.
 package router
 
 import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/tls"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -228,6 +226,9 @@ func (rt *Router) handleCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	routeKey := r.Header.Get(HeaderRouteKey)
+	if routeKey == "" {
+		routeKey = newRouteKey()
+	}
 	res, err := rt.reserveByKey(r.Context(), group, routeKey)
 	if err != nil {
 		rt.log.Warn("router: reserve", "group", group, "err", err)
@@ -315,7 +316,8 @@ func nonEmptySlice(s string) []string {
 
 // handleBuildForward routes a build trigger/status/files call to the node that
 // holds the build (by build_id), resolving via route_link on a local miss
-// (router restart: the in-memory build map is lost but the BuildStore persists).
+// (router restart: the in-memory build map is lost but route_link build state is
+// replicated).
 func (rt *Router) handleBuildForward(w http.ResponseWriter, r *http.Request) {
 	group := r.Header.Get(HeaderGroup)
 	if group == "" {
@@ -395,15 +397,20 @@ func (rt *Router) handleSandboxVerb(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "cluster router: unsupported sandbox path", http.StatusNotImplemented)
 		return
 	}
-	rr := rt.resolveRoute(r.Context(), group, sid)
-	if rr == nil || rr.DataEndpoint == "" {
-		http.Error(w, "sandbox not found", http.StatusNotFound)
+	routeKey := r.Header.Get(HeaderRouteKey)
+	if routeKey == "" {
+		http.Error(w, HeaderRouteKey+" required", http.StatusBadRequest)
 		return
 	}
 	// Authenticate the caller against the sandbox's group before forwarding (the
 	// node re-authenticates too, but the ingress must not be an open relay / sid
 	// oracle — cluster-router.md §6/§8).
 	if !rt.authorize(w, r.Context(), group, r.Header.Get(HeaderAPIKey)) {
+		return
+	}
+	rr := rt.resolveRoute(r.Context(), group, routeKey, sid)
+	if rr == nil || rr.DataEndpoint == "" {
+		http.Error(w, "sandbox not found", http.StatusNotFound)
 		return
 	}
 	rt.forwardToNode(w, r, rr.DataEndpoint)
@@ -433,11 +440,15 @@ func (rt *Router) handleList(w http.ResponseWriter, r *http.Request) {
 
 // resolveRoute returns a sandbox's resolved route via the local cache, falling
 // back to the control API; nil if unknown.
-func (rt *Router) resolveRoute(ctx context.Context, group, sid string) *routeResolve {
-	if rr := rt.cachedRoute(sid); rr != nil && (group == "" || rr.Group == "" || rr.Group == group) {
+func (rt *Router) resolveRoute(ctx context.Context, group, routeKey, sid string) *routeResolve {
+	if rr := rt.cachedRoute(sid); rr != nil && routeMatchesIdentity(rr, group, routeKey) {
 		return rr
 	}
-	if rr, err := rt.routeLinkRoute(ctx, group, sid); err == nil {
+	if rr, err := rt.routeLinkRoute(ctx, group, routeKey, sid); err == nil {
+		if !routeMatchesIdentity(rr, group, routeKey) {
+			rt.evictRoute(sid)
+			return nil
+		}
 		return rr
 	}
 	return nil
@@ -503,16 +514,26 @@ func (rt *Router) serveData(w http.ResponseWriter, r *http.Request, host string)
 		http.Error(w, HeaderGroup+" required", http.StatusBadRequest)
 		return
 	}
+	routeKey := r.Header.Get(HeaderRouteKey)
+	if routeKey == "" {
+		http.Error(w, HeaderRouteKey+" required", http.StatusBadRequest)
+		return
+	}
 	// Hot path: serve from the local route cache (zero control round-trip, §5). On a
 	// miss (cache lagging / cold), fall back to route_link.
 	rr := rt.cachedRoute(sid)
-	if rr != nil && rr.Group != "" && rr.Group != group {
+	if rr != nil && !routeMatchesIdentity(rr, group, routeKey) {
 		rr = nil
 	}
 	if rr == nil {
 		var err error
-		if rr, err = rt.routeLinkRoute(r.Context(), group, sid); err != nil {
+		if rr, err = rt.routeLinkRoute(r.Context(), group, routeKey, sid); err != nil {
 			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		if !routeMatchesIdentity(rr, group, routeKey) {
+			rt.evictRoute(sid)
+			http.Error(w, "sandbox not found", http.StatusNotFound)
 			return
 		}
 		rt.rememberRoute(rr)
@@ -715,6 +736,22 @@ func (rt *Router) rememberRoute(rr *routeResolve) {
 	rt.cacheMu.Unlock()
 }
 
+func routeBelongsToGroup(rr *routeResolve, group string) bool {
+	return rr != nil && group != "" && rr.Group == group
+}
+
+func routeMatchesIdentity(rr *routeResolve, group, routeKey string) bool {
+	return routeBelongsToGroup(rr, group) && routeKey != "" && rr.RouteKey == routeKey
+}
+
+func newRouteKey() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return fmt.Sprintf("rk-%d", time.Now().UnixNano())
+	}
+	return "rk-" + hex.EncodeToString(b[:])
+}
+
 func (rt *Router) cachedRouteByKey(group, routeKey string) *routeResolve {
 	rt.cacheMu.RLock()
 	defer rt.cacheMu.RUnlock()
@@ -798,8 +835,8 @@ func (rt *Router) routeLinkResolveBuild(ctx context.Context, group, buildID stri
 	return &res, nil
 }
 
-func (rt *Router) routeLinkRoute(ctx context.Context, group, sid string) (*routeResolve, error) {
-	path := fmt.Sprintf("%s?group=%s&sid=%s", registry.RouteLinkRoutePath, url.QueryEscape(group), url.QueryEscape(sid))
+func (rt *Router) routeLinkRoute(ctx context.Context, group, routeKey, sid string) (*routeResolve, error) {
+	path := fmt.Sprintf("%s?group=%s&route_key=%s&sid=%s", registry.RouteLinkRoutePath, url.QueryEscape(group), url.QueryEscape(routeKey), url.QueryEscape(sid))
 	var rr routeResolve
 	if err := rt.routeLinkCall(ctx, group, http.MethodGet, path, nil, nil, &rr); err != nil {
 		return nil, err

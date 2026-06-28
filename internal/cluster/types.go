@@ -50,15 +50,20 @@ const (
 // scaler-derived data-plane token for the current SandboxID generation; registry
 // route owners return it without consulting sandbox-group providers.
 type RouteRecord struct {
-	Meta        RecordMeta        `json:"meta"`
-	Group       string            `json:"group"`
-	RouteKey    string            `json:"route_key"`
-	SandboxID   string            `json:"sandbox_id,omitempty"`
-	State       RouteState        `json:"state"`
-	NodeID      string            `json:"node_id,omitempty"`
-	TemplateID  string            `json:"template_id,omitempty"`
-	Config      map[string]string `json:"config,omitempty"`
-	AccessToken string            `json:"access_token,omitempty"`
+	Meta           RecordMeta                `json:"meta"`
+	Group          string                    `json:"group"`
+	RouteKey       string                    `json:"route_key"`
+	SandboxID      string                    `json:"sandbox_id,omitempty"`
+	State          RouteState                `json:"state"`
+	NodeID         string                    `json:"node_id,omitempty"`
+	TemplateID     string                    `json:"template_id,omitempty"`
+	Config         map[string]string         `json:"config,omitempty"`
+	AccessToken    string                    `json:"access_token,omitempty"`
+	BuildID        string                    `json:"build_id,omitempty"`
+	BuildState     string                    `json:"build_state,omitempty"`
+	BuildResources *routesync.BuildResources `json:"build_resources,omitempty"`
+	BuildReason    string                    `json:"build_reason,omitempty"`
+	CreatedUnix    int64                     `json:"created_unix,omitempty"`
 }
 
 func RouteKey(group, routeKey string) string { return group + "\x00" + routeKey }

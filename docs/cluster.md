@@ -23,8 +23,8 @@ joint owner set 与 namespace 自身收敛驱动完成业务无损切换。
    可重建聚合。node 整机重启直接清空,不重拉旧 sandbox。
 5. **热路径旁路控制面**:router 对活动连接和近期路由做本地缓存;命中时直接转发到 node,不调用
    `Reserve`。miss / fail-fast 后才走 registry。
-6. **memberlist 不参与分片计算**:Registry 成员表由配置版本定义;`LocateN` 的输入仅为版本化成员表。
-   memberlist 只做 failure detection 和 ready 传播。
+6. **成员健康不参与分片计算**:Registry 成员表由配置版本定义;`LocateN` 的输入仅为版本化成员表。
+   HTTP replica health 只影响 retry/cooldown,不改变 owner set。
 7. **放置与执行分层**:scaler 负责 group 导入、WATCH_LIST、shuffle-sharding、key allocation 与
    `Place`;node owner 负责节点连接、命令投递、运行态与资源 admission。
 
@@ -88,7 +88,6 @@ scale_link:
 /scale-link/watch-node-list
 /cluster/membership
 /internal/registry-member/*
-/internal/memberlist/*
 ```
 
 `member_link` 不作为单独配置项存在,它就是统一监听上的 `/internal/registry-member/*`。`node_link.listen`
@@ -111,7 +110,7 @@ node 记录携带 `link_owner`,route owner 需要下发 `create/key/build/delete
 持有该 h2 stream 的 registry 成员。`route_link` 的所有 owner 均可响应查询。写入达到要求 quorum 后提交,
 随后继续复制到全 owner set,用于完整视图和本地 waiter 唤醒。
 
-## 4. Membership 与 memberlist
+## 4. Membership 与成员健康
 
 ### 4.1 成员表
 
@@ -122,27 +121,19 @@ registry.<version>.<sha256(sort(member_ids))>
 ```
 
 registry 可以同时持有 active / next 两个版本。旧版本直到 `old_grace` 结束才 retire。router、node、scaler
-不加入 registry memberlist,它们通过 `GET /cluster/membership` 获取 active / next 成员表。
+通过 `GET /cluster/membership` 获取 active / next 成员表。
 
-### 4.2 memberlist
+### 4.2 成员健康
 
-memberlist 只作为 failure detector / ready 传播机制,不进入分片计算。memberlist transport 复用 HTTP
-控制面;failure detector 必须遵守以下边界:
+registry 成员之间的 route/node replica RPC 使用 HTTP 控制面。客户端维护每个 peer 的短周期 health/cooldown:
+RPC 失败后该 peer 暂时 fail-fast,冷路径 fanout 仍按完整 owner set 并发尝试。成员健康必须遵守以下边界:
 
 - 不维护 registry 成员清单。
 - 不改变 `LocateN` 输入。
 - 不作为数据复制通道。
 - 不把 suspect/dead 事件转化为 reshard。
 
-memberlist transport 使用 HTTP,复用 registry/scaler 的控制面,不引入 UDP 组网要求:
-
-```text
-POST /internal/memberlist/packet/{label}
-POST /internal/memberlist/stream/{label}
-```
-
-registry 每个 membership version 使用独立 memberlist label。scaler ready 通过 register loop 表达。
-scaler 向每个 active / next registry 成员推送:
+scaler ready 通过 register loop 表达。scaler 向每个 active / next registry 成员推送:
 
 ```json
 {"role":"scaler","id":"s1","advertise":"https://s1:7800","ready_label":"registry.2.hash"}
@@ -150,11 +141,11 @@ scaler 向每个 active / next registry 成员推送:
 
 ### 4.3 成员故障
 
-成员故障由 memberlist 探测,但不改变 owner set。某成员不可达时:
+成员故障由 replica RPC 失败和 health/cooldown 体现,但不改变 owner set。某成员不可达时:
 
 - 它参与的 owner set 降一格,只要可达 owner 数满足 quorum 即继续服务。
 - 若 quorum 不足,该 shard 停写(CP),不降级乱写。
-- 恢复成员须 catch-up/read-repair 后才能重新参与有效写 quorum。
+- 恢复成员通过后台 catch-up/read-repair 重新补齐本地副本;写 quorum 始终以 owner set quorum 判定。
 
 ## 5. Joint Owner Set
 
@@ -206,14 +197,16 @@ read-repair。
 - 提交后继续 best-effort 复制到 union / 全 owner set。
 - 每条记录有单调 rev 和唯一 ballot;写条件必须校验 expected rev。
 - 旧 membership 写入必须被 moved/retry,不能在旧 owner 本地提交。
-- 成员冷重启后进入 joining,catch-up 完成前不参与写 quorum。
+- 成员冷重启后本地副本为空;后台 catch-up 扫描可见 key 并触发 quorum read-repair。运行期只在 owner
+  quorum 足够时继续服务。
 
 size-1 模式中 `LocateN` 只返回本成员,quorum 退化为本地内存写;同样使用 expected rev + ballot
 接口。size-1 用于开发和小规模部署,不提供 registry 成员故障 HA。
 
 ## 7. Namespace 收敛
 
-不设计独立 cold-key promoter。收敛由 namespace 自己的事实源驱动。
+不设计独立跨 namespace cold-key promoter。收敛由 namespace 自己的事实源驱动;registry 成员重启后的
+本地副本补齐由后台 catch-up 扫描可见 route/node key 并触发 read-repair。
 
 ### 7.1 node_link
 
@@ -285,7 +278,7 @@ ready/paused/placed -> dead/tombstone
 
 ## 9. Node-link
 
-Node 不进 memberlist。Node 连接 registry 后按 `LocateN(node_id,N)` 归属 node owner set。node 上报:
+Node 连接 registry 后按 `LocateN(node_id,N)` 归属 node owner set。node 上报:
 
 - 全量 sandbox 清单和增量事件。
 - build 状态事件。
@@ -384,6 +377,7 @@ Build 记录按 group 存在 route_link;执行态和实时预算归 node owner�
 registry export/import 只覆盖 registry 执行态灾备数据:
 
 - route records
+- build execution records
 
 registry export/import 不覆盖 sandbox-group provider 数据。group 配置、placement hint、auth_key、manifest_key
 由 scaler/provider 侧导入导出。

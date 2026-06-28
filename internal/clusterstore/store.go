@@ -1,14 +1,7 @@
-// Package clusterstore is the size-1 registry KV layer: a small
-// in-process KV (Get/Put/Delete/Range/Watch/Lease/CAS over an opaque []byte
-// value, a global monotonic revision, and a bounded change-log for catch-up
-// Watch). The registry layers its four tables on top by key prefix
-// (node/<id>, group/<group>, sandbox/<group>/<route_key>, build/<group>/<id>);
-// sensitive fields (manifest_key) are encrypted by the registry before Put, so
-// the store itself stays opaque.
-//
-// Target cluster operation moves route_link/node_link state to the
-// registry-owned replicated kernel. This package remains for local typed tables
-// that have not yet moved into that kernel.
+// Package clusterstore is a small in-process KV/change-log used for local
+// registry projections such as WATCH_LIST logs. route_link, node_link, and build
+// execution state live in the registry-owned replicated kernel; this store stays
+// opaque and process-local.
 package clusterstore
 
 import (

@@ -4,9 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
+	"time"
 )
 
 const (
@@ -110,13 +113,21 @@ func writeReplicaResponse(w http.ResponseWriter, out replicaResponse, err error)
 type HTTPRouteReplica struct {
 	endpoint string
 	client   *http.Client
+	health   *ReplicaHealth
 }
 
 func NewHTTPRouteReplica(endpoint string, client *http.Client) *HTTPRouteReplica {
+	return NewHTTPRouteReplicaWithHealth(endpoint, client, nil)
+}
+
+func NewHTTPRouteReplicaWithHealth(endpoint string, client *http.Client, health *ReplicaHealth) *HTTPRouteReplica {
 	if client == nil {
 		client = http.DefaultClient
 	}
-	return &HTTPRouteReplica{endpoint: strings.TrimRight(endpoint, "/"), client: client}
+	if health == nil {
+		health = NewReplicaHealth(2 * time.Second)
+	}
+	return &HTTPRouteReplica{endpoint: strings.TrimRight(endpoint, "/"), client: client, health: health}
 }
 
 func (r *HTTPRouteReplica) Read(ctx context.Context, key string) (RouteRecord, bool, error) {
@@ -153,19 +164,27 @@ func (r *HTTPRouteReplica) Keys(ctx context.Context) []string {
 }
 
 func (r *HTTPRouteReplica) call(ctx context.Context, in replicaRequest) (replicaResponse, error) {
-	return postReplica(ctx, r.client, r.endpoint+RouteReplicaRPCPath, in)
+	return postReplica(ctx, r.client, r.endpoint+RouteReplicaRPCPath, in, r.health)
 }
 
 type HTTPNodeReplica struct {
 	endpoint string
 	client   *http.Client
+	health   *ReplicaHealth
 }
 
 func NewHTTPNodeReplica(endpoint string, client *http.Client) *HTTPNodeReplica {
+	return NewHTTPNodeReplicaWithHealth(endpoint, client, nil)
+}
+
+func NewHTTPNodeReplicaWithHealth(endpoint string, client *http.Client, health *ReplicaHealth) *HTTPNodeReplica {
 	if client == nil {
 		client = http.DefaultClient
 	}
-	return &HTTPNodeReplica{endpoint: strings.TrimRight(endpoint, "/"), client: client}
+	if health == nil {
+		health = NewReplicaHealth(2 * time.Second)
+	}
+	return &HTTPNodeReplica{endpoint: strings.TrimRight(endpoint, "/"), client: client, health: health}
 }
 
 func (r *HTTPNodeReplica) Read(ctx context.Context, key string) (NodeRecord, bool, error) {
@@ -202,10 +221,55 @@ func (r *HTTPNodeReplica) Keys(ctx context.Context) []string {
 }
 
 func (r *HTTPNodeReplica) call(ctx context.Context, in replicaRequest) (replicaResponse, error) {
-	return postReplica(ctx, r.client, r.endpoint+NodeReplicaRPCPath, in)
+	return postReplica(ctx, r.client, r.endpoint+NodeReplicaRPCPath, in, r.health)
 }
 
-func postReplica(ctx context.Context, client *http.Client, url string, in replicaRequest) (replicaResponse, error) {
+var ErrReplicaUnavailable = errors.New("cluster: replica unavailable")
+
+type ReplicaHealth struct {
+	mu             sync.Mutex
+	cooldown       time.Duration
+	unhealthyUntil time.Time
+}
+
+func NewReplicaHealth(cooldown time.Duration) *ReplicaHealth {
+	if cooldown <= 0 {
+		cooldown = 2 * time.Second
+	}
+	return &ReplicaHealth{cooldown: cooldown}
+}
+
+func (h *ReplicaHealth) Available() bool {
+	if h == nil {
+		return true
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return time.Now().After(h.unhealthyUntil)
+}
+
+func (h *ReplicaHealth) MarkSuccess() {
+	if h == nil {
+		return
+	}
+	h.mu.Lock()
+	h.unhealthyUntil = time.Time{}
+	h.mu.Unlock()
+}
+
+func (h *ReplicaHealth) MarkFailure() {
+	if h == nil {
+		return
+	}
+	h.mu.Lock()
+	h.unhealthyUntil = time.Now().Add(h.cooldown)
+	h.mu.Unlock()
+}
+
+func postReplica(ctx context.Context, client *http.Client, url string, in replicaRequest, health *ReplicaHealth) (replicaResponse, error) {
+	if health != nil && !health.Available() {
+		return replicaResponse{}, ErrReplicaUnavailable
+	}
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(&in); err != nil {
 		return replicaResponse{}, err
@@ -217,18 +281,33 @@ func postReplica(ctx context.Context, client *http.Client, url string, in replic
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := client.Do(req)
 	if err != nil {
+		if health != nil {
+			health.MarkFailure()
+		}
 		return replicaResponse{}, err
 	}
 	defer resp.Body.Close()
 	var out replicaResponse
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		if health != nil {
+			health.MarkFailure()
+		}
 		return replicaResponse{}, err
 	}
 	if out.Error != "" {
+		if health != nil {
+			health.MarkFailure()
+		}
 		return out, fmt.Errorf("%s", out.Error)
 	}
 	if resp.StatusCode >= 300 {
+		if health != nil {
+			health.MarkFailure()
+		}
 		return out, fmt.Errorf("cluster: replica rpc status %s", resp.Status)
+	}
+	if health != nil {
+		health.MarkSuccess()
 	}
 	return out, nil
 }

@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"testing"
 
+	clusterstate "github.com/kuasar-sandbox/sandbox-orchestrator/internal/cluster"
+	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/clusterstore"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/routesync"
 )
 
@@ -118,6 +120,46 @@ func TestReserveBuildDefaultResources(t *testing.T) {
 	rec, found, _ := reg.stores.GetBuildInGroup(ctx, "/g", r1.BuildID)
 	if !found || rec.Resources == nil || rec.Resources.CPU != defaultBuildResources.CPU {
 		t.Fatalf("default resources not applied: %+v", rec)
+	}
+}
+
+func TestBuildStoreUsesRouteQuorumAndDoesNotLeakToSandboxList(t *testing.T) {
+	ctx := context.Background()
+	kv := clusterstore.OpenMemory(0)
+	defer kv.Close()
+	r2, r3 := clusterstate.NewMemoryRouteReplica(), clusterstate.NewMemoryRouteReplica()
+	view := clusterstate.MemberView{Version: 1, Members: []string{"r1", "r2", "r3"}}
+	stores := NewClusterStores(kv, "r1", view, 3, 1,
+		map[string]clusterstate.RouteReplica{"r2": r2, "r3": r3}, nil)
+
+	if err := stores.PutBuild(ctx, &BuildRecord{
+		Group: "/g", BuildID: "bld-1", NodeID: "n1", State: BuildRegistered,
+		Resources: &routesync.BuildResources{CPU: 1000}, CreatedU: 123,
+	}); err != nil {
+		t.Fatalf("PutBuild: %v", err)
+	}
+	key := clusterstate.RouteKey("/g", buildRouteKey("bld-1"))
+	for id, rep := range map[string]clusterstate.RouteReplica{"r1": stores.LocalRouteReplica(), "r2": r2, "r3": r3} {
+		got, found, err := rep.Read(ctx, key)
+		if err != nil || !found || got.BuildID != "bld-1" || got.NodeID != "n1" {
+			t.Fatalf("replica %s build route=%+v found=%v err=%v", id, got, found, err)
+		}
+	}
+
+	var sandboxes []string
+	if err := stores.RangeSandboxes(ctx, "/g", func(s *SandboxRecord) error {
+		sandboxes = append(sandboxes, s.RouteKey)
+		return nil
+	}); err != nil {
+		t.Fatalf("RangeSandboxes: %v", err)
+	}
+	if len(sandboxes) != 0 {
+		t.Fatalf("build route leaked into sandbox list: %v", sandboxes)
+	}
+
+	got, found, err := stores.GetBuildInGroup(ctx, "/g", "bld-1")
+	if err != nil || !found || got.Resources == nil || got.Resources.CPU != 1000 || got.CreatedU != 123 {
+		t.Fatalf("GetBuildInGroup=%+v found=%v err=%v", got, found, err)
 	}
 }
 

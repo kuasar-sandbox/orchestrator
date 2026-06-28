@@ -51,7 +51,7 @@ GET /cluster/membership
 `LocateN(group,active.members,route_link.owner_count)` 定位 route owner。请求失败、收到 moved/retry 或
 membership label 不匹配时刷新 membership 并重试。
 
-router 不加入 registry memberlist,也不订阅 route 或 node_list。
+router 不参与 registry 成员健康检测,也不订阅 route 或 node_list。
 
 ## 5. 寻址
 

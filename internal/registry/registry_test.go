@@ -285,12 +285,18 @@ func TestReadyRouteUsesDerivedAccessToken(t *testing.T) {
 	if res.AccessToken != want {
 		t.Fatalf("ready reserve token=%q, want derived %q", res.AccessToken, want)
 	}
-	rr, found, err := reg.ResolveSID(ctx, "sb-ready")
+	rr, found, err := reg.ResolveSID(ctx, "/g", "rk", "sb-ready")
 	if err != nil || !found {
 		t.Fatalf("resolve found=%v err=%v", found, err)
 	}
 	if rr.AccessToken != want {
 		t.Fatalf("resolve token=%q, want derived %q", rr.AccessToken, want)
+	}
+	if _, found, err := reg.ResolveSID(ctx, "/other", "rk", "sb-ready"); err != nil || found {
+		t.Fatalf("wrong-group resolve found=%v err=%v", found, err)
+	}
+	if _, found, err := reg.ResolveSID(ctx, "/g", "other-rk", "sb-ready"); err != nil || found {
+		t.Fatalf("wrong-route-key resolve found=%v err=%v", found, err)
 	}
 }
 

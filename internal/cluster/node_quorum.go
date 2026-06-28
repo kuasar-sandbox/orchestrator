@@ -58,34 +58,18 @@ func NewNodeJointQuorum(writer string, slots []NodeReplicaSlot, ownerSets [][]st
 
 func (q *NodeQuorum) Get(ctx context.Context, nodeID string) (NodeRecord, bool, error) {
 	ballot := q.nextBallot(ctx, nodeID)
-	reads := make([]nodeRead, 0, len(q.replicas))
-	prepared := map[int]bool{}
-	for i, r := range q.replicas {
-		rec, found, ok, err := r.replica.Prepare(ctx, nodeID, ballot)
-		if err != nil || !ok {
-			continue
-		}
-		prepared[i] = true
-		reads = append(reads, nodeRead{rec: rec, found: found})
-	}
+	reads, prepared := q.prepare(ctx, nodeID, ballot)
 	if !satisfiesQuorumSets(prepared, q.sets) {
 		return NodeRecord{}, false, ErrQuorum
 	}
 	best, found := highestNode(reads)
 	if found {
 		best.Meta.Ballot = ballot
-		accepted := map[int]bool{}
-		for i := range prepared {
-			if ok, _ := q.replicas[i].replica.Accept(ctx, nodeID, best, ballot); ok {
-				accepted[i] = true
-			}
-		}
+		accepted := q.accept(ctx, nodeID, best, ballot, prepared)
 		if !satisfiesQuorumSets(accepted, q.sets) {
 			return NodeRecord{}, false, ErrQuorum
 		}
-		for _, r := range q.replicas {
-			_ = r.replica.Repair(ctx, nodeID, best)
-		}
+		q.repairBestEffort(ctx, nodeID, best)
 	}
 	if found && best.State == NodeDead {
 		return NodeRecord{}, false, nil
@@ -122,16 +106,7 @@ func (q *NodeQuorum) List(ctx context.Context, fn func(NodeRecord) error) error 
 
 func (q *NodeQuorum) CAS(ctx context.Context, nodeID string, expectRev uint64, propose NodeProposal) (NodeRecord, error) {
 	ballot := q.nextBallot(ctx, nodeID)
-	reads := make([]nodeRead, 0, len(q.replicas))
-	prepared := map[int]bool{}
-	for i, r := range q.replicas {
-		rec, found, ok, err := r.replica.Prepare(ctx, nodeID, ballot)
-		if err != nil || !ok {
-			continue
-		}
-		prepared[i] = true
-		reads = append(reads, nodeRead{rec: rec, found: found})
-	}
+	reads, prepared := q.prepare(ctx, nodeID, ballot)
 	if !satisfiesQuorumSets(prepared, q.sets) {
 		return NodeRecord{}, ErrQuorum
 	}
@@ -157,43 +132,24 @@ func (q *NodeQuorum) CAS(ctx context.Context, nodeID string, expectRev uint64, p
 			NodeID: nodeID,
 			State:  NodeDead,
 		}
-		accepted := map[int]bool{}
-		for i := range prepared {
-			if ok, _ := q.replicas[i].replica.Accept(ctx, nodeID, tombstone, ballot); ok {
-				accepted[i] = true
-			}
-		}
+		accepted := q.accept(ctx, nodeID, tombstone, ballot, prepared)
 		if !satisfiesQuorumSets(accepted, q.sets) {
 			return NodeRecord{}, ErrQuorum
 		}
-		for _, r := range q.replicas {
-			_ = r.replica.Repair(ctx, nodeID, tombstone)
-		}
+		q.repairBestEffort(ctx, nodeID, tombstone)
 		return NodeRecord{}, nil
 	}
 	next.Meta = RecordMeta{Ballot: ballot, Rev: cur.Meta.Rev + 1, UpdatedAt: time.Now()}
-	accepted := map[int]bool{}
-	for i := range prepared {
-		if ok, _ := q.replicas[i].replica.Accept(ctx, nodeID, next, ballot); ok {
-			accepted[i] = true
-		}
-	}
+	accepted := q.accept(ctx, nodeID, next, ballot, prepared)
 	if !satisfiesQuorumSets(accepted, q.sets) {
 		return NodeRecord{}, ErrQuorum
 	}
-	for _, r := range q.replicas {
-		_ = r.replica.Repair(ctx, nodeID, next)
-	}
+	q.repairBestEffort(ctx, nodeID, next)
 	return next, nil
 }
 
 func (q *NodeQuorum) nextBallot(ctx context.Context, nodeID string) Ballot {
-	var max Ballot
-	for _, r := range q.replicas {
-		if b, err := r.replica.MaxBallot(ctx, nodeID); err == nil && max.Less(b) {
-			max = b
-		}
-	}
+	max := q.maxBallot(ctx, nodeID)
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	if local := q.rounds[nodeID]; max.Round < local {
@@ -202,6 +158,100 @@ func (q *NodeQuorum) nextBallot(ctx context.Context, nodeID string) Ballot {
 	next := max.Round + 1
 	q.rounds[nodeID] = next
 	return Ballot{Round: next, Writer: q.writer}
+}
+
+func (q *NodeQuorum) maxBallot(ctx context.Context, nodeID string) Ballot {
+	type result struct {
+		ballot Ballot
+		err    error
+	}
+	ch := make(chan result, len(q.replicas))
+	for _, r := range q.replicas {
+		rep := r.replica
+		go func() {
+			b, err := rep.MaxBallot(ctx, nodeID)
+			ch <- result{ballot: b, err: err}
+		}()
+	}
+	var max Ballot
+	for range q.replicas {
+		res := <-ch
+		if res.err == nil && max.Less(res.ballot) {
+			max = res.ballot
+		}
+	}
+	return max
+}
+
+func (q *NodeQuorum) prepare(ctx context.Context, nodeID string, ballot Ballot) ([]nodeRead, map[int]bool) {
+	type result struct {
+		idx   int
+		rec   NodeRecord
+		found bool
+		ok    bool
+		err   error
+	}
+	ch := make(chan result, len(q.replicas))
+	for i, r := range q.replicas {
+		idx, rep := i, r.replica
+		go func() {
+			rec, found, ok, err := rep.Prepare(ctx, nodeID, ballot)
+			ch <- result{idx: idx, rec: rec, found: found, ok: ok, err: err}
+		}()
+	}
+	reads := make([]nodeRead, 0, len(q.replicas))
+	prepared := map[int]bool{}
+	for range q.replicas {
+		res := <-ch
+		if res.err != nil || !res.ok {
+			continue
+		}
+		prepared[res.idx] = true
+		reads = append(reads, nodeRead{rec: res.rec, found: res.found})
+	}
+	return reads, prepared
+}
+
+func (q *NodeQuorum) accept(ctx context.Context, nodeID string, rec NodeRecord, ballot Ballot, prepared map[int]bool) map[int]bool {
+	type result struct {
+		idx int
+		ok  bool
+	}
+	ch := make(chan result, len(prepared))
+	for i := range prepared {
+		idx, rep := i, q.replicas[i].replica
+		go func() {
+			ok, _ := rep.Accept(ctx, nodeID, rec, ballot)
+			ch <- result{idx: idx, ok: ok}
+		}()
+	}
+	accepted := map[int]bool{}
+	for range prepared {
+		res := <-ch
+		if res.ok {
+			accepted[res.idx] = true
+		}
+	}
+	return accepted
+}
+
+func (q *NodeQuorum) repairBestEffort(ctx context.Context, nodeID string, rec NodeRecord) {
+	repairCtx := context.WithoutCancel(ctx)
+	if _, ok := repairCtx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		repairCtx, cancel = context.WithTimeout(repairCtx, 250*time.Millisecond)
+		defer cancel()
+	}
+	var wg sync.WaitGroup
+	for _, r := range q.replicas {
+		rep := r.replica
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = rep.Repair(repairCtx, nodeID, rec)
+		}()
+	}
+	wg.Wait()
 }
 
 type nodeReplicaSlot struct {

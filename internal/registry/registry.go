@@ -246,6 +246,9 @@ func flightKey(group, routeKey string) string { return group + "\x00" + routeKey
 // creating (or resuming a PAUSED sandbox) on a node and waiting for the node to
 // report it running, single-flight per key (cluster.md §7.2).
 func (r *Registry) ReserveSandbox(ctx context.Context, group, routeKey string, createConfig map[string]string) (*ReserveResult, error) {
+	if isBuildRouteKey(routeKey) {
+		return nil, fmt.Errorf("registry: route_key prefix %q is reserved", buildRouteKeyPrefix)
+	}
 	rec, rev, found, err := r.stores.GetSandbox(ctx, group, routeKey)
 	if err != nil {
 		return nil, err

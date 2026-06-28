@@ -28,8 +28,8 @@ const (
 // ===========================================================================
 
 // MemberConfig is a registry member's unified control-plane endpoint. node_link,
-// route_link, scale_link, member RPC, and memberlist HTTP transport are path
-// namespaces on this listener unless node_link.listen is explicitly split out.
+// route_link, scale_link, and member RPC are path namespaces on this listener
+// unless node_link.listen is explicitly split out.
 type MemberConfig struct {
 	ID        string `yaml:"id"`
 	Listen    string `yaml:"listen"`    // unified control-plane listener
@@ -267,7 +267,7 @@ func (m MembershipConfig) WithComputedLabels() MembershipConfig {
 
 // WithComputedLabel returns a copy with label set to
 // registry.<version>.<sha256(sort(member ids))>. The label is used to isolate
-// memberlist runtimes and watch tokens from different membership versions.
+// scaler ready state and watch tokens from different membership versions.
 func (v MembershipVersion) WithComputedLabel() MembershipVersion {
 	if v.Label != "" {
 		return v
@@ -296,14 +296,19 @@ func (v MembershipVersion) MemberIDs() []string {
 	return out
 }
 
-// validateDurations checks a name→value map parses as Go durations ("" skipped).
+// validateDurations checks a name→value map parses as positive Go durations
+// ("" skipped).
 func validateDurations(m map[string]string) error {
 	for name, d := range m {
 		if d == "" {
 			continue
 		}
-		if _, err := time.ParseDuration(d); err != nil {
+		parsed, err := time.ParseDuration(d)
+		if err != nil {
 			return fmt.Errorf("clustercfg: %s %q: %w", name, d, err)
+		}
+		if parsed <= 0 {
+			return fmt.Errorf("clustercfg: %s must be positive", name)
 		}
 	}
 	return nil
@@ -314,9 +319,8 @@ func validateDurations(m map[string]string) error {
 // ===========================================================================
 
 // RegistryConfig is the registry role's config. member.listen is the default
-// listener for node_link, route_link, scale_link, member RPC, and memberlist HTTP
-// transport. node_link.listen may split long-lived node streams onto another
-// listener.
+// listener for node_link, route_link, scale_link, and member RPC. node_link.listen
+// may split long-lived node streams onto another listener.
 type RegistryConfig struct {
 	Member     MemberConfig     `yaml:"member"`
 	Membership MembershipConfig `yaml:"membership"`
@@ -480,6 +484,33 @@ func (c *RegistryConfig) Validate() error {
 	if !selfInOwnerVersion {
 		return fmt.Errorf("clustercfg: member.id %q is not in active or next membership", c.Member.ID)
 	}
+	if c.Membership.Owners.RouteLink <= 0 {
+		return fmt.Errorf("clustercfg: membership.owners.route_link must be positive")
+	}
+	if c.Membership.Owners.NodeLink <= 0 {
+		return fmt.Errorf("clustercfg: membership.owners.node_link must be positive")
+	}
+	if c.Membership.Owners.NodeList <= 0 {
+		return fmt.Errorf("clustercfg: membership.owners.node_list must be positive")
+	}
+	if c.NodeLink.RevisionRetention <= 0 {
+		return fmt.Errorf("clustercfg: node_link.revision_retention must be positive")
+	}
+	if c.NodeList.ShardCount <= 0 {
+		return fmt.Errorf("clustercfg: node_list.shard_count must be positive")
+	}
+	if c.NodeList.WatchRetention <= 0 {
+		return fmt.Errorf("clustercfg: node_list.watch_retention must be positive")
+	}
+	if c.ScaleLink.ScalerReplicaCount <= 0 {
+		return fmt.Errorf("clustercfg: scale_link.scaler_replica_count must be positive")
+	}
+	if c.ScaleLink.MinReadyScalers <= 0 {
+		return fmt.Errorf("clustercfg: scale_link.min_ready_scalers must be positive")
+	}
+	if c.ScaleLink.MinReadyScalers > c.ScaleLink.ScalerReplicaCount {
+		return fmt.Errorf("clustercfg: scale_link.min_ready_scalers must not exceed scaler_replica_count")
+	}
 	return validateDurations(map[string]string{
 		"node_link.heartbeat_interval": c.NodeLink.HeartbeatInterval,
 		"node_link.node_dead_after":    c.NodeLink.NodeDeadAfter,
@@ -603,9 +634,9 @@ func (c *RouterConfig) AuthCacheDur() time.Duration {
 // scaler.yaml — placement scheduler (cluster-scaler.md).
 // ===========================================================================
 
-// ScalerConfig is the standalone scaler's config (cluster.md §1.2/§4.2 — always a
-// separate process that dials registry scale_link and answers placement over that
-// link): the upstream scale_link plus the placement policy.
+// ScalerConfig is the standalone scaler's config. It discovers registry
+// membership through the bootstrap endpoint, pushes itself to scale_link, and
+// answers placement calls from registry route owners.
 type ScalerConfig struct {
 	Member    MemberConfig       `yaml:"member"`
 	Registry  RegistryDialConfig `yaml:"registry"`  // upstream: registry bootstrap/membership

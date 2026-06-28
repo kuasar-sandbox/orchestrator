@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -16,10 +17,7 @@ import (
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/routesync"
 )
 
-// Key prefixes for registry-local typed tables.
-const (
-	buildPrefix = "build/" // build/<esc(group)>/<build_id> (group-sharded, §6.1)
-)
+const buildRouteKeyPrefix = "__kuasar_build__/"
 
 // SandboxState mirrors cluster.md route state. A missing/dead sandbox is
 // represented by no route row.
@@ -57,15 +55,20 @@ type NodeRecord struct {
 // SandboxRecord is the registry-facing route_link view, keyed by
 // (group, route_key).
 type SandboxRecord struct {
-	Group       string       `json:"group"`
-	RouteKey    string       `json:"route_key"`
-	SID         string       `json:"sid,omitempty"`
-	State       SandboxState `json:"state"`
-	NodeID      string       `json:"node_id,omitempty"`
-	SnapLoc     string       `json:"snap_loc,omitempty"`
-	TemplateID  string       `json:"template_id,omitempty"`
-	AccessToken string       `json:"access_token,omitempty"`
-	LastActive  int64        `json:"last_active,omitempty"`
+	Group          string                    `json:"group"`
+	RouteKey       string                    `json:"route_key"`
+	SID            string                    `json:"sid,omitempty"`
+	State          SandboxState              `json:"state"`
+	NodeID         string                    `json:"node_id,omitempty"`
+	SnapLoc        string                    `json:"snap_loc,omitempty"`
+	TemplateID     string                    `json:"template_id,omitempty"`
+	AccessToken    string                    `json:"access_token,omitempty"`
+	LastActive     int64                     `json:"last_active,omitempty"`
+	BuildID        string                    `json:"build_id,omitempty"`
+	BuildState     BuildState                `json:"build_state,omitempty"`
+	BuildResources *routesync.BuildResources `json:"build_resources,omitempty"`
+	BuildReason    string                    `json:"build_reason,omitempty"`
+	CreatedU       int64                     `json:"created_unix,omitempty"`
 }
 
 // Stores wraps the shared KV with typed, per-table accessors.
@@ -379,6 +382,25 @@ func (s *Stores) nodeKeys(ctx context.Context) []string {
 	}
 	sort.Strings(keys)
 	return keys
+}
+
+// CatchUp promotes records visible in any configured owner replica back through
+// quorum reads. A restarted registry member starts with empty in-memory local
+// replicas; this scan lets the quorum protocol read-repair route_link/node_link
+// records into the local replica without a separate migration step.
+func (s *Stores) CatchUp(ctx context.Context) error {
+	for _, key := range s.routeKeys(ctx) {
+		group, routeKey := splitRouteStorageKey(key)
+		if _, _, _, err := s.GetSandbox(ctx, group, routeKey); err != nil {
+			return err
+		}
+	}
+	for _, key := range s.nodeKeys(ctx) {
+		if _, _, err := s.GetNode(ctx, key); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *Stores) SetRouteHandoffGate(group, routeKey string, gate clusterstate.HandoffGate) {
@@ -701,6 +723,9 @@ func (s *Stores) rangeSandboxes(ctx context.Context, group string, fn func(*Sand
 		if group != "" && g != group {
 			continue
 		}
+		if isBuildRouteKey(rk) {
+			continue
+		}
 		rec, _, found, err := s.GetSandbox(ctx, g, rk)
 		if err != nil {
 			return err
@@ -713,6 +738,16 @@ func (s *Stores) rangeSandboxes(ctx context.Context, group string, fn func(*Sand
 		}
 	}
 	return nil
+}
+
+func buildRouteKey(buildID string) string { return buildRouteKeyPrefix + buildID }
+
+func buildIDFromRouteKey(routeKey string) string {
+	return strings.TrimPrefix(routeKey, buildRouteKeyPrefix)
+}
+
+func isBuildRouteKey(routeKey string) bool {
+	return strings.HasPrefix(routeKey, buildRouteKeyPrefix)
 }
 
 func splitRouteStorageKey(key string) (string, string) {
@@ -729,26 +764,36 @@ func toClusterRoute(r *SandboxRecord) clusterstate.RouteRecord {
 		return clusterstate.RouteRecord{}
 	}
 	return clusterstate.RouteRecord{
-		Group:       r.Group,
-		RouteKey:    r.RouteKey,
-		SandboxID:   r.SID,
-		State:       toClusterRouteState(r.State),
-		NodeID:      r.NodeID,
-		TemplateID:  r.TemplateID,
-		AccessToken: r.AccessToken,
+		Group:          r.Group,
+		RouteKey:       r.RouteKey,
+		SandboxID:      r.SID,
+		State:          toClusterRouteState(r.State),
+		NodeID:         r.NodeID,
+		TemplateID:     r.TemplateID,
+		AccessToken:    r.AccessToken,
+		BuildID:        r.BuildID,
+		BuildState:     string(r.BuildState),
+		BuildResources: cloneBuildResources(r.BuildResources),
+		BuildReason:    r.BuildReason,
+		CreatedUnix:    r.CreatedU,
 	}
 }
 
 func fromClusterRoute(r clusterstate.RouteRecord) SandboxRecord {
 	return SandboxRecord{
-		Group:       r.Group,
-		RouteKey:    r.RouteKey,
-		SID:         r.SandboxID,
-		State:       fromClusterRouteState(r.State),
-		NodeID:      r.NodeID,
-		TemplateID:  r.TemplateID,
-		AccessToken: r.AccessToken,
-		LastActive:  r.Meta.UpdatedAt.Unix(),
+		Group:          r.Group,
+		RouteKey:       r.RouteKey,
+		SID:            r.SandboxID,
+		State:          fromClusterRouteState(r.State),
+		NodeID:         r.NodeID,
+		TemplateID:     r.TemplateID,
+		AccessToken:    r.AccessToken,
+		LastActive:     r.Meta.UpdatedAt.Unix(),
+		BuildID:        r.BuildID,
+		BuildState:     BuildState(r.BuildState),
+		BuildResources: cloneBuildResources(r.BuildResources),
+		BuildReason:    r.BuildReason,
+		CreatedU:       r.CreatedUnix,
 	}
 }
 

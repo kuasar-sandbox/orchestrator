@@ -19,7 +19,7 @@ import (
 func TestRouteLinkClientTLS(t *testing.T) {
 	routeLink := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/route-link/route" {
-			_ = json.NewEncoder(w).Encode(routeResolve{SID: "sb-1", DataEndpoint: "10.0.0.1:1", State: "ready"})
+			_ = json.NewEncoder(w).Encode(routeResolve{SID: "sb-1", Group: "/g", RouteKey: "rk", DataEndpoint: "10.0.0.1:1", State: "ready"})
 			return
 		}
 		w.WriteHeader(http.StatusNotFound)
@@ -37,7 +37,7 @@ func TestRouteLinkClientTLS(t *testing.T) {
 	if !strings.HasPrefix(rt.routeLinkBase, "https://") {
 		t.Fatalf("routeLinkBase should be https for a TLS route_link endpoint, got %q", rt.routeLinkBase)
 	}
-	rr := rt.resolveRoute(context.Background(), "/g", "sb-1")
+	rr := rt.resolveRoute(context.Background(), "/g", "rk", "sb-1")
 	if rr == nil || rr.SID != "sb-1" || rr.DataEndpoint != "10.0.0.1:1" {
 		t.Fatalf("resolveRoute over TLS: %+v", rr)
 	}

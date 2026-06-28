@@ -43,6 +43,43 @@ func TestAuthModeOff(t *testing.T) {
 	}
 }
 
+func TestCreateGeneratesRouteKeyWhenHeaderMissing(t *testing.T) {
+	var routeKeys []string
+	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/route-link/reserve" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		rk := r.URL.Query().Get("route_key")
+		routeKeys = append(routeKeys, rk)
+		_ = json.NewEncoder(w).Encode(reserveResult{
+			NodeID: "n1", SID: fmt.Sprintf("sb-%d", len(routeKeys)), AccessToken: "tok", DataEndpoint: "10.0.0.1:1",
+		})
+	}))
+	defer control.Close()
+	rt := New(strings.TrimPrefix(control.URL, "http://"), "test.local", 0, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	rt.SetAuthMode("off")
+	srv := httptest.NewServer(rt.Handler())
+	defer srv.Close()
+
+	for i := 0; i < 2; i++ {
+		req, _ := http.NewRequest(http.MethodPost, srv.URL+"/sandboxes", nil)
+		req.Host = "api.test.local"
+		req.Header.Set(HeaderGroup, "/g")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusCreated {
+			t.Fatalf("create %d status=%d, want 201", i, resp.StatusCode)
+		}
+	}
+	if len(routeKeys) != 2 || routeKeys[0] == "" || routeKeys[1] == "" || routeKeys[0] == routeKeys[1] {
+		t.Fatalf("generated route keys=%v, want two non-empty unique values", routeKeys)
+	}
+}
+
 // TestServeDataByKey: a data-plane request carrying group + route-key headers (no
 // prior create) Reserves and forwards to the node (router §4).
 func TestServeDataByKey(t *testing.T) {
@@ -105,6 +142,46 @@ func TestServeDataByKey(t *testing.T) {
 	}
 	if reserveHits != 1 {
 		t.Fatalf("reserve hits=%d, want 1 (second request should use route cache)", reserveHits)
+	}
+}
+
+func TestSandboxVerbRejectsRouteFromDifferentGroup(t *testing.T) {
+	var nodeHits int32
+	node := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&nodeHits, 1)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer node.Close()
+	nodeHost := strings.TrimPrefix(node.URL, "http://")
+	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/route-link/route" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(routeResolve{
+			SID: "sb-1", Group: "/other", RouteKey: "rk", NodeID: "n1", DataEndpoint: nodeHost, AccessToken: "tok", State: "ready",
+		})
+	}))
+	defer control.Close()
+	rt := New(strings.TrimPrefix(control.URL, "http://"), "test.local", 0, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	rt.SetAuthMode("off")
+	srv := httptest.NewServer(rt.Handler())
+	defer srv.Close()
+
+	req, _ := http.NewRequest(http.MethodDelete, srv.URL+"/sandboxes/sb-1", nil)
+	req.Host = "api.test.local"
+	req.Header.Set(HeaderGroup, "/g")
+	req.Header.Set(HeaderRouteKey, "rk")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("status=%d, want 404", resp.StatusCode)
+	}
+	if got := atomic.LoadInt32(&nodeHits); got != 0 {
+		t.Fatalf("node hits=%d, want 0", got)
 	}
 }
 

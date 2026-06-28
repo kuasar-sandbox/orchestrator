@@ -156,15 +156,13 @@ func (r *Registry) applyBuildEvent(ctx context.Context, e *routesync.BuildEvent)
 	}
 }
 
-// ResolveBuild maps a build_id to its node (router restart recovery: the router's
-// in-memory build map is lost, but the BuildStore persists). Scans builds (small).
-func (r *Registry) ResolveBuild(ctx context.Context, buildID string) (*BuildReserveResult, bool) {
-	var res *BuildReserveResult
-	_ = r.stores.RangeBuilds(ctx, func(b *BuildRecord) error {
-		if b.BuildID == buildID {
-			res = &BuildReserveResult{BuildID: b.BuildID, TemplateID: b.TemplateID, NodeID: b.NodeID, DataEndpoint: r.nodeDataEndpoint(ctx, b.NodeID)}
-		}
-		return nil
-	})
-	return res, res != nil
+// ResolveBuild maps a group's build_id to its node (router restart recovery: the
+// router's in-memory build map is lost, but route_link replicated build state is
+// still group-sharded).
+func (r *Registry) ResolveBuild(ctx context.Context, group, buildID string) (*BuildReserveResult, bool) {
+	b, found, err := r.stores.GetBuildInGroup(ctx, group, buildID)
+	if err != nil || !found {
+		return nil, false
+	}
+	return &BuildReserveResult{BuildID: b.BuildID, TemplateID: b.TemplateID, NodeID: b.NodeID, DataEndpoint: r.nodeDataEndpoint(ctx, b.NodeID)}, true
 }

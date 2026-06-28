@@ -11,9 +11,9 @@ import (
 // route/build operations, API-key verification, and import/export.
 const (
 	RouteLinkReservePath      = "/route-link/reserve"       // POST ?group=&route_key= -> ReserveResult
-	RouteLinkRoutePath        = "/route-link/route"         // GET  ?sid=              -> RouteResolve
+	RouteLinkRoutePath        = "/route-link/route"         // GET  ?group=&route_key=&sid= -> RouteResolve
 	RouteLinkReserveBuildPath = "/route-link/reserve-build" // POST {group,resources,metadata} -> BuildReserveResult
-	RouteLinkBuildPath        = "/route-link/build"         // GET  ?build_id=         -> BuildReserveResult (resolve)
+	RouteLinkBuildPath        = "/route-link/build"         // GET  ?group=&build_id=  -> BuildReserveResult (resolve)
 	RouteLinkListPath         = "/route-link/list"          // GET  ?group=            -> the group's sandbox shard
 	RouteLinkVerifyKeyPath    = "/route-link/verify-key"    // GET  ?group=&api_key=   -> 200 valid / 403 invalid
 )
@@ -99,7 +99,8 @@ func (r *Registry) serveReserveBuild(w http.ResponseWriter, req *http.Request) {
 
 // serveBuild resolves a build_id to its node (router restart recovery, §7.5).
 func (r *Registry) serveBuild(w http.ResponseWriter, req *http.Request) {
-	res, found := r.ResolveBuild(req.Context(), req.URL.Query().Get("build_id"))
+	q := req.URL.Query()
+	res, found := r.ResolveBuild(req.Context(), q.Get("group"), q.Get("build_id"))
 	if !found {
 		http.Error(w, "build not found", http.StatusNotFound)
 		return
@@ -118,7 +119,8 @@ func (r *Registry) serveReserve(w http.ResponseWriter, req *http.Request) {
 }
 
 func (r *Registry) serveRoute(w http.ResponseWriter, req *http.Request) {
-	rr, found, err := r.ResolveSID(req.Context(), req.URL.Query().Get("sid"))
+	q := req.URL.Query()
+	rr, found, err := r.ResolveSID(req.Context(), q.Get("group"), q.Get("route_key"), q.Get("sid"))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -130,18 +132,19 @@ func (r *Registry) serveRoute(w http.ResponseWriter, req *http.Request) {
 	writeJSON(w, rr)
 }
 
-// ResolveSID maps a sid to its data-plane forwarding target (router hot path),
-// via the sid index built from the route stream.
-func (r *Registry) ResolveSID(ctx context.Context, sid string) (*RouteResolve, bool, error) {
-	r.mu.Lock()
-	kp, ok := r.sidKeys[sid]
-	r.mu.Unlock()
-	if !ok {
+// ResolveSID maps a group-scoped (route_key, sid) pair to its data-plane
+// forwarding target. The lookup is exact and quorum-backed; it does not trust
+// this process's local sid index or scan the whole group.
+func (r *Registry) ResolveSID(ctx context.Context, group, routeKey, sid string) (*RouteResolve, bool, error) {
+	if group == "" || routeKey == "" || sid == "" {
 		return nil, false, nil
 	}
-	rec, _, found, err := r.stores.GetSandbox(ctx, kp[0], kp[1])
+	rec, _, found, err := r.stores.GetSandbox(ctx, group, routeKey)
 	if err != nil || !found {
 		return nil, found, err
+	}
+	if rec.SID != sid {
+		return nil, false, nil
 	}
 	return &RouteResolve{
 		SID: rec.SID, Group: rec.Group, RouteKey: rec.RouteKey, NodeID: rec.NodeID,

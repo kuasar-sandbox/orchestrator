@@ -70,6 +70,19 @@ func (r *Registry) ExportSnapshot(ctx context.Context, w io.Writer, opts Snapsho
 		}); err != nil {
 			return SnapshotSummary{}, err
 		}
+		if err := r.stores.RangeBuilds(ctx, func(b *BuildRecord) error {
+			if opts.Group != "" && b.Group != opts.Group {
+				return nil
+			}
+			out := sandboxRecordFromBuild(b)
+			if err := enc.Encode(SnapshotRecord{Type: SnapshotKindRoute, Route: out}); err != nil {
+				return err
+			}
+			sum.Routes++
+			return nil
+		}); err != nil {
+			return SnapshotSummary{}, err
+		}
 	}
 	return sum, nil
 }

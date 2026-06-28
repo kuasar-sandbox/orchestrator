@@ -8,6 +8,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/routesync"
 )
 
 func TestSnapshotRouteRoundTrip(t *testing.T) {
@@ -43,8 +45,37 @@ func TestSnapshotRouteRoundTrip(t *testing.T) {
 	if route.SID != "sb-1" || route.State != StateReady || route.NodeID != "n1" || route.AccessToken != "tok" {
 		t.Fatalf("imported route=%+v", route)
 	}
-	if rr, found, err := dst.ResolveSID(ctx, "sb-1"); err != nil || !found || rr.RouteKey != "rk" || rr.AccessToken != "tok" {
-		t.Fatalf("sid index resolve=%+v found=%v err=%v", rr, found, err)
+	if rr, found, err := dst.ResolveSID(ctx, "/g", "rk", "sb-1"); err != nil || !found || rr.RouteKey != "rk" || rr.AccessToken != "tok" {
+		t.Fatalf("sid resolve=%+v found=%v err=%v", rr, found, err)
+	}
+}
+
+func TestSnapshotIncludesBuildRouteRecords(t *testing.T) {
+	ctx := context.Background()
+	src := testReg(t)
+	if err := src.stores.PutBuild(ctx, &BuildRecord{
+		Group: "/g", BuildID: "bld-1", NodeID: "n1", Resources: &routesync.BuildResources{CPU: 1000},
+		State: BuildBuilding, TemplateID: "tmpl-1", Reason: "running", CreatedU: 99,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var raw bytes.Buffer
+	sum, err := src.ExportSnapshot(ctx, &raw, SnapshotOptions{Kind: "all"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum.Routes != 1 {
+		t.Fatalf("summary=%+v, want 1 route record", sum)
+	}
+
+	dst := testReg(t)
+	if _, err := dst.ImportSnapshot(ctx, strings.NewReader(raw.String())); err != nil {
+		t.Fatal(err)
+	}
+	got, found, err := dst.stores.GetBuildInGroup(ctx, "/g", "bld-1")
+	if err != nil || !found || got.State != BuildBuilding || got.Resources == nil || got.Resources.CPU != 1000 || got.CreatedU != 99 {
+		t.Fatalf("imported build=%+v found=%v err=%v", got, found, err)
 	}
 }
 

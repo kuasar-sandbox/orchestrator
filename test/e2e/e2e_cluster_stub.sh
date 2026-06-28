@@ -249,27 +249,31 @@ for i in $(seq 1 "$REGISTRIES"); do
     wait_tcp "$port" "registry-$i control"
 done
 
-step "checking member transport labels"
-python3 - "http://127.0.0.1:$CONTROL_PORT" <<'PY' >"$WORK/member-labels.txt" || fail "membership labels not available"
+step "checking registry membership endpoints"
+for port in "${CONTROL_PORTS[@]}"; do
+    python3 - "http://127.0.0.1:$port" "$REGISTRIES" <<'PY' || fail "membership endpoint failed on $port"
 import json, sys, urllib.request
 base = sys.argv[1]
+want = int(sys.argv[2])
 m = json.load(urllib.request.urlopen(base + "/cluster/membership", timeout=2))
 active = m.get("active", m.get("Active"))
+versions = m.get("versions", m.get("Versions", []))
+assert active, m
+active_versions = [v for v in versions if v.get("version", v.get("Version")) == active]
+assert len(active_versions) == 1, m
+assert active_versions[0].get("label", active_versions[0].get("Label")), m
 next_version = m.get("next", m.get("Next"))
-labels = []
-for v in m.get("versions", m.get("Versions", [])):
+ids = set()
+for v in versions:
     version = v.get("version", v.get("Version"))
-    if version in (active, next_version):
-        labels.append(v.get("label", v.get("Label")))
-assert labels and all(labels), m
-print("\n".join(labels))
+    if version not in (active, next_version):
+        continue
+    assert v.get("label", v.get("Label")), m
+    for member in v.get("members", v.get("Members", [])):
+        ids.add(member.get("id", member.get("ID")))
+assert len(ids) == want, m
 PY
-while IFS= read -r label; do
-    [ -n "$label" ] || continue
-    curl -fsS --noproxy '*' -X POST --data-binary 'ping' \
-        "http://127.0.0.1:$CONTROL_PORT/internal/memberlist/packet/$label" >/dev/null ||
-        fail "member transport packet failed for label $label"
-done <"$WORK/member-labels.txt"
+done
 
 step "starting scaler"
 "$CLUSTER_CTL" scaler --config "$WORK/scaler.yaml" >"$WORK/scaler.log" 2>&1 &

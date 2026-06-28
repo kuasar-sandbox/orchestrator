@@ -47,6 +47,54 @@ func TestClusterStoresRouteAndNodeUseLocatedOwners(t *testing.T) {
 	})
 }
 
+func TestClusterStoresCatchUpRepairsEmptyLocalReplica(t *testing.T) {
+	ctx := context.Background()
+	view := clusterstate.MemberView{Version: 1, Members: []string{"a", "b", "c"}}
+	rb, rc := clusterstate.NewMemoryRouteReplica(), clusterstate.NewMemoryRouteReplica()
+	nb, nc := clusterstate.NewMemoryNodeReplica(), clusterstate.NewMemoryNodeReplica()
+	kv := clusterstore.OpenMemory(100)
+	defer kv.Close()
+
+	stores := NewClusterStores(kv, "a", view, 3, 3,
+		map[string]clusterstate.RouteReplica{"b": rb, "c": rc},
+		map[string]clusterstate.NodeReplica{"b": nb, "c": nc})
+
+	route := clusterstate.RouteRecord{
+		Meta:      clusterstate.RecordMeta{Ballot: clusterstate.Ballot{Round: 3, Writer: "seed"}, Rev: 2, UpdatedAt: time.Now()},
+		Group:     "/g",
+		RouteKey:  "rk",
+		SandboxID: "sb-1",
+		State:     clusterstate.RouteReady,
+		NodeID:    "n1",
+	}
+	for _, rep := range []*clusterstate.MemoryRouteReplica{rb, rc} {
+		if ok, err := rep.Accept(ctx, clusterstate.RouteKey("/g", "rk"), route, route.Meta.Ballot); err != nil || !ok {
+			t.Fatalf("seed route accept ok=%v err=%v", ok, err)
+		}
+	}
+	node := clusterstate.NodeRecord{
+		Meta:         clusterstate.RecordMeta{Ballot: clusterstate.Ballot{Round: 4, Writer: "seed"}, Rev: 2, UpdatedAt: time.Now()},
+		NodeID:       "n1",
+		State:        clusterstate.NodeLive,
+		DataEndpoint: "10.0.0.1:8080",
+	}
+	for _, rep := range []*clusterstate.MemoryNodeReplica{nb, nc} {
+		if ok, err := rep.Accept(ctx, "n1", node, node.Meta.Ballot); err != nil || !ok {
+			t.Fatalf("seed node accept ok=%v err=%v", ok, err)
+		}
+	}
+
+	if err := stores.CatchUp(ctx); err != nil {
+		t.Fatalf("CatchUp: %v", err)
+	}
+	if got, found, err := stores.LocalRouteReplica().Read(ctx, clusterstate.RouteKey("/g", "rk")); err != nil || !found || got.SandboxID != "sb-1" {
+		t.Fatalf("local route after catch-up=%+v found=%v err=%v", got, found, err)
+	}
+	if got, found, err := stores.LocalNodeReplica().Read(ctx, "n1"); err != nil || !found || got.DataEndpoint != "10.0.0.1:8080" {
+		t.Fatalf("local node after catch-up=%+v found=%v err=%v", got, found, err)
+	}
+}
+
 func TestClusterStoresJointMembershipWritesBothOwnerSets(t *testing.T) {
 	ctx := context.Background()
 	active := clusterstate.MemberView{Version: 1, Members: []string{"a", "b", "c"}}
