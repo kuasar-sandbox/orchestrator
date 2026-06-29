@@ -93,6 +93,7 @@ type ScaleLinkConfig struct {
 	MinReadyScalers    int    `yaml:"min_ready_scalers"`
 	ScalerLabel        string `yaml:"scaler_label"`
 	PlaceTimeout       string `yaml:"place_timeout"`
+	AllocationTTL      string `yaml:"allocation_ttl"`
 }
 
 type ScalerMemberlistConfig struct {
@@ -132,6 +133,12 @@ type PlacementConfig struct {
 	ZoneAdmitMax    string        `yaml:"zone_admit_max"`   // exclude nodes hotter than this; default yellow
 	NodeDeadAfter   string        `yaml:"node_dead_after"`  // exclude nodes silent longer than this; default 30s
 	ShuffleSharding []ShuffleRule `yaml:"shuffle_sharding"` // empty = static nodeSelectors only
+}
+
+type GroupSourceConfig struct {
+	SourceID   string `yaml:"source_id"`
+	SourceType string `yaml:"source_type"`
+	Path       string `yaml:"path,omitempty"`
 }
 
 // ShuffleRule pins each matching group to n deterministic shards of the node set
@@ -219,6 +226,10 @@ func (c *RouteLinkConfig) ParkDur() time.Duration {
 }
 func (c *ScaleLinkConfig) PlaceDur() time.Duration {
 	d, _ := time.ParseDuration(c.PlaceTimeout)
+	return d
+}
+func (c *ScaleLinkConfig) AllocationTTLDur() time.Duration {
+	d, _ := time.ParseDuration(c.AllocationTTL)
 	return d
 }
 
@@ -373,7 +384,7 @@ func DefaultRegistry() RegistryConfig {
 		NodeLink:  NodeLinkConfig{HeartbeatInterval: "10s", NodeDeadAfter: "30s", RevisionRetention: 10000},
 		RouteLink: RouteLinkConfig{ParkTimeout: "30s"},
 		NodeList:  NodeListConfig{WatchRetention: 10000},
-		ScaleLink: ScaleLinkConfig{ScalerReplicaCount: 3, MinReadyScalers: 1, ScalerLabel: "scaler.default", PlaceTimeout: "2s"},
+		ScaleLink: ScaleLinkConfig{ScalerReplicaCount: 3, MinReadyScalers: 1, ScalerLabel: "scaler.default", PlaceTimeout: "2s", AllocationTTL: "10m"},
 	}
 }
 
@@ -459,6 +470,9 @@ func (c *RegistryConfig) applyDefaults() {
 	}
 	if c.ScaleLink.PlaceTimeout == "" {
 		c.ScaleLink.PlaceTimeout = d.ScaleLink.PlaceTimeout
+	}
+	if c.ScaleLink.AllocationTTL == "" {
+		c.ScaleLink.AllocationTTL = d.ScaleLink.AllocationTTL
 	}
 }
 
@@ -556,6 +570,7 @@ func (c *RegistryConfig) Validate() error {
 		"node_link.node_dead_after":    c.NodeLink.NodeDeadAfter,
 		"route_link.park_timeout":      c.RouteLink.ParkTimeout,
 		"scale_link.place_timeout":     c.ScaleLink.PlaceTimeout,
+		"scale_link.allocation_ttl":    c.ScaleLink.AllocationTTL,
 	})
 }
 
@@ -700,19 +715,21 @@ func (c *RouterConfig) RouteIdleDur() time.Duration {
 // membership through the bootstrap endpoint, pushes itself to scale_link, and
 // answers placement calls from registry route owners.
 type ScalerConfig struct {
-	Member     MemberConfig           `yaml:"member"`
-	Memberlist ScalerMemberlistConfig `yaml:"memberlist"`
-	Registry   RegistryDialConfig     `yaml:"registry"`  // upstream: registry bootstrap/membership
-	Placement  PlacementConfig        `yaml:"placement"` // placement policy
+	Member       MemberConfig           `yaml:"member"`
+	Memberlist   ScalerMemberlistConfig `yaml:"memberlist"`
+	Registry     RegistryDialConfig     `yaml:"registry"` // upstream: registry bootstrap/membership
+	ImportGroups []GroupSourceConfig    `yaml:"import_groups,omitempty"`
+	Placement    PlacementConfig        `yaml:"placement"` // placement policy
 }
 
 // DefaultScaler returns the scaler config with all non-required fields set.
 func DefaultScaler() ScalerConfig {
 	return ScalerConfig{
-		Member:     MemberConfig{ID: "scaler", Listen: ":7800"},
-		Memberlist: ScalerMemberlistConfig{Label: "scaler.default"},
-		Registry:   RegistryDialConfig{Bootstrap: defaultRegistryBootstrap},
-		Placement:  PlacementConfig{Candidates: 2, ZoneAdmitMax: "yellow", NodeDeadAfter: "30s"},
+		Member:       MemberConfig{ID: "scaler", Listen: ":7800"},
+		Memberlist:   ScalerMemberlistConfig{Label: "scaler.default"},
+		Registry:     RegistryDialConfig{Bootstrap: defaultRegistryBootstrap},
+		ImportGroups: nil,
+		Placement:    PlacementConfig{Candidates: 2, ZoneAdmitMax: "yellow", NodeDeadAfter: "30s"},
 	}
 }
 
@@ -783,6 +800,24 @@ func (c *ScalerConfig) Validate() error {
 	}
 	if c.Placement.Candidates < 0 {
 		return fmt.Errorf("clustercfg: placement.candidates %d invalid (must be >= 0)", c.Placement.Candidates)
+	}
+	seenSources := map[string]bool{}
+	for _, source := range c.ImportGroups {
+		if source.SourceID == "" {
+			return fmt.Errorf("clustercfg: import_groups.source_id is required")
+		}
+		if seenSources[source.SourceID] {
+			return fmt.Errorf("clustercfg: duplicate import_groups.source_id %q", source.SourceID)
+		}
+		seenSources[source.SourceID] = true
+		switch source.SourceType {
+		case "file":
+			if source.Path == "" {
+				return fmt.Errorf("clustercfg: import_groups[%s].path is required for file source", source.SourceID)
+			}
+		default:
+			return fmt.Errorf("clustercfg: import_groups[%s].source_type %q invalid (file)", source.SourceID, source.SourceType)
+		}
 	}
 	return validateDurations(map[string]string{"placement.node_dead_after": c.Placement.NodeDeadAfter})
 }

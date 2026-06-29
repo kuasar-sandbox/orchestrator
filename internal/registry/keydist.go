@@ -25,10 +25,11 @@ type keyOp struct {
 }
 
 type keyAllocationState struct {
-	fp       string
-	keyType  string
-	keyValue string
-	nodes    map[string]bool
+	fp        string
+	keyType   string
+	keyValue  string
+	nodes     map[string]bool
+	expiresAt time.Time
 }
 
 // RunKeyDistributor reconciles key leases on start, then every renew interval,
@@ -38,18 +39,38 @@ func (r *Registry) RunKeyDistributor(ctx context.Context, renew time.Duration) {
 		renew = keyRenewEvery
 	}
 	r.reconcileKeys(ctx)
-	t := time.NewTicker(renew)
-	defer t.Stop()
 	for {
+		t := time.NewTimer(r.keyDistributionInterval(renew))
 		select {
 		case <-ctx.Done():
+			t.Stop()
 			return
 		case <-t.C:
 			r.reconcileKeys(ctx)
 		case <-r.reconcileTrigger:
+			if !t.Stop() {
+				select {
+				case <-t.C:
+				default:
+				}
+			}
 			r.reconcileKeys(ctx)
 		}
 	}
+}
+
+func (r *Registry) keyDistributionInterval(renew time.Duration) time.Duration {
+	r.scalerMu.Lock()
+	allocationTTL := r.keyAllocationTTL
+	r.scalerMu.Unlock()
+	interval := renew
+	if allocationTTL > 0 && allocationTTL/2 > 0 && allocationTTL/2 < interval {
+		interval = allocationTTL / 2
+	}
+	if interval <= 0 {
+		return time.Second
+	}
+	return interval
 }
 
 // onNodeConnected coalesces a key-reconcile request when a node connects: a

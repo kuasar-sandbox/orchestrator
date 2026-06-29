@@ -37,8 +37,9 @@ type Service struct {
 	deadAfter int64 // node_dead_after seconds (node-alive eligibility, §4.2)
 	log       *slog.Logger
 
-	nodes  *nodeView
-	groups *groupStore
+	nodes    *nodeView
+	provider clusterstate.SandboxGroupProvider
+	importer clusterstate.SandboxGroupImporter
 }
 
 type RegistryLink struct {
@@ -54,15 +55,26 @@ func NewRemote(scaleAddr string, scaleTLS *tls.Config, cfg clustercfg.PlacementC
 }
 
 func NewRemoteLinks(links []RegistryLink, cfg clustercfg.PlacementConfig, deadAfter int64, log *slog.Logger) *Service {
+	return NewRemoteLinksWithGroups(links, emptyGroupSource{}, emptyGroupSource{}, cfg, deadAfter, log)
+}
+
+func NewRemoteLinksWithGroups(links []RegistryLink, provider clusterstate.SandboxGroupProvider, importer clusterstate.SandboxGroupImporter, cfg clustercfg.PlacementConfig, deadAfter int64, log *slog.Logger) *Service {
 	if cfg.Candidates <= 0 {
 		cfg.Candidates = 2
 	}
 	links = normalizeRegistryLinks(links)
+	if provider == nil {
+		provider = emptyGroupSource{}
+	}
+	if importer == nil {
+		importer = emptyGroupSource{}
+	}
 	return &Service{
 		links: links, watchLinks: links,
 		cfg: cfg, deadAfter: deadAfter, log: log,
-		nodes:  newNodeView(1),
-		groups: newGroupStore(),
+		nodes:    newNodeView(1),
+		provider: provider,
+		importer: importer,
 	}
 }
 
@@ -204,11 +216,6 @@ func (s *Service) startWatchLinkLocked(ctx context.Context) {
 func (s *Service) ServeScaleLink(mux *http.ServeMux) {
 	mux.HandleFunc(registry.ScaleLinkPlacePath, s.servePlace)
 	mux.HandleFunc(registry.ScaleLinkVerifyKeyPath, s.serveVerifyKey)
-	mux.HandleFunc(GroupImportPath, s.serveGroupImport)
-}
-
-func (s *Service) ImportGroups(groups []clusterstate.SandboxGroupRecord) {
-	s.groups.upsert(groups)
 }
 
 func (s *Service) servePlace(w http.ResponseWriter, req *http.Request) {
@@ -222,22 +229,7 @@ func (s *Service) servePlace(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(s.answer(&in))
-}
-
-func (s *Service) serveGroupImport(w http.ResponseWriter, req *http.Request) {
-	if req.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	groups, sum, err := importGroups(io.LimitReader(req.Body, 64<<20))
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	s.groups.upsert(groups)
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(sum)
+	_ = json.NewEncoder(w).Encode(s.answer(req.Context(), &in))
 }
 
 func (s *Service) serveVerifyKey(w http.ResponseWriter, req *http.Request) {
@@ -245,12 +237,16 @@ func (s *Service) serveVerifyKey(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	g, ok := s.groups.get(req.URL.Query().Get("group"))
+	authSecret, ok, err := s.provider.GetAuthKey(req.Context(), req.URL.Query().Get("group"))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		return
+	}
 	if !ok {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
-	authKey, err := inlineSecret("auth_key", g.AuthKey)
+	authKey, err := inlineSecret("auth_key", authSecret)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
@@ -297,24 +293,28 @@ func (s *Service) RegisterLoopDynamic(ctx context.Context, id, advertise, member
 // answer computes a placement for a reverse request over the local view. It
 // requires a complete node_list snapshot, then resolves only the requested group;
 // there is no global "all groups imported" readiness gate.
-func (s *Service) answer(req *routesync.PlaceReq) *routesync.PlaceResult {
+func (s *Service) answer(ctx context.Context, req *routesync.PlaceReq) *routesync.PlaceResult {
 	res := &routesync.PlaceResult{ReqID: req.ReqID}
 	if !s.nodes.ready() {
 		res.NoNode = true
 		return res
 	}
-	g, ok := s.groups.get(req.Group)
+	g, ok, err := s.groupForPlace(ctx, req.Group)
+	if err != nil {
+		res.Error = err.Error()
+		return res
+	}
 	if !ok {
 		res.NoNode = true
 		return res
 	}
-	fp, _, _, _, err := manifestKeyPatch(g)
+	fp, _, _, _, err := manifestKeyPatch(req.Group, g.manifestKey)
 	if err != nil {
 		res.Error = err.Error()
 		return res
 	}
 	if !req.Build {
-		authKey, err := inlineSecret("auth_key", g.AuthKey)
+		authKey, err := inlineSecret("auth_key", g.authKey)
 		if err != nil {
 			res.Error = err.Error()
 			return res
@@ -329,7 +329,7 @@ func (s *Service) answer(req *routesync.PlaceReq) *routesync.PlaceResult {
 		}
 	}
 	p := placeParams{
-		group: req.Group, nodes: s.nodes.values(), selectors: g.NodeSelectors,
+		group: req.Group, nodes: s.nodes.values(), selectors: g.hint.NodeSelectors,
 		rules: s.cfg.ShuffleSharding, candidates: s.cfg.Candidates,
 		zoneAdmitMax: s.cfg.ZoneAdmitMax, deadAfter: s.deadAfter, now: time.Now().Unix(),
 		targetRuntimeDigest: req.TargetRuntimeDigest,
@@ -347,9 +347,9 @@ func (s *Service) answer(req *routesync.PlaceReq) *routesync.PlaceResult {
 		res.NodeID = node
 		res.KeyFingerprint = fp
 		if req.Build {
-			res.ImageRepo = g.ImageRepo
-			if g.RegistryAuth.Value != "" {
-				registryAuth, err := inlineSecret("registry_auth", g.RegistryAuth)
+			res.ImageRepo = g.group.ImageRepo
+			if g.group.RegistryAuth.Value != "" {
+				registryAuth, err := inlineSecret("registry_auth", g.group.RegistryAuth)
 				if err != nil {
 					res.Error = err.Error()
 					res.NodeID = ""
@@ -358,11 +358,73 @@ func (s *Service) answer(req *routesync.PlaceReq) *routesync.PlaceResult {
 				res.RegistryAuth = registryAuth
 			}
 		} else {
-			res.TemplateRef = g.TemplateRef
-			res.Config = mergeConfig(g.Config, req.Config)
+			res.TemplateRef = g.group.TemplateRef
+			res.Config = mergeConfig(g.group.Config, req.Config)
 		}
 	}
 	return res
+}
+
+type groupView struct {
+	group       clusterstate.SandboxGroup
+	hint        clusterstate.PlacementHint
+	manifestKey clusterstate.Secret
+	authKey     clusterstate.Secret
+}
+
+func (s *Service) groupForPlace(ctx context.Context, group string) (groupView, bool, error) {
+	g, found, err := s.provider.Get(ctx, group)
+	if err != nil || !found {
+		return groupView{}, false, err
+	}
+	hint, _, err := s.provider.GetPlacementHint(ctx, group)
+	if err != nil {
+		return groupView{}, false, err
+	}
+	manifestKey, _, err := s.provider.GetKey(ctx, group)
+	if err != nil {
+		return groupView{}, false, err
+	}
+	authKey, _, err := s.provider.GetAuthKey(ctx, group)
+	if err != nil {
+		return groupView{}, false, err
+	}
+	return groupView{group: g, hint: hint, manifestKey: manifestKey, authKey: authKey}, true, nil
+}
+
+type groupAllocation struct {
+	group       string
+	hint        clusterstate.PlacementHint
+	manifestKey clusterstate.Secret
+}
+
+func (s *Service) groupAllocations(ctx context.Context) ([]groupAllocation, error) {
+	var out []groupAllocation
+	cursor := ""
+	for {
+		page, err := s.importer.Range(ctx, cursor, defaultGroupPageLimit)
+		if err != nil {
+			return nil, err
+		}
+		for _, group := range page.Groups {
+			hint, found, err := s.provider.GetPlacementHint(ctx, group)
+			if err != nil {
+				return nil, err
+			}
+			if !found {
+				continue
+			}
+			key, _, err := s.provider.GetKey(ctx, group)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, groupAllocation{group: group, hint: hint, manifestKey: key})
+		}
+		if page.NextCursor == "" {
+			return out, nil
+		}
+		cursor = page.NextCursor
+	}
 }
 
 // reconcileKeyAllocations periodically computes each group's explicit node set for
@@ -382,33 +444,38 @@ func (s *Service) reconcileKeyAllocations(ctx context.Context) {
 				continue
 			}
 			nodes := s.nodes.values()
+			allocations, err := s.groupAllocations(ctx)
+			if err != nil {
+				s.log.Warn("scaler: group import", "err", err)
+				continue
+			}
 			current := map[string]bool{}
-			for _, g := range s.groups.values() {
-				current[g.Group] = true
-				selectors, nodeIDs := keyAllocation(g.Group, nodes, g.NodeSelectors, s.cfg.ShuffleSharding)
-				fp, keyType, keyValue, keyRef, err := manifestKeyPatch(g)
+			for _, g := range allocations {
+				current[g.group] = true
+				selectors, nodeIDs := keyAllocation(g.group, nodes, g.hint.NodeSelectors, s.cfg.ShuffleSharding)
+				fp, keyType, keyValue, keyRef, err := manifestKeyPatch(g.group, g.manifestKey)
 				if err != nil {
-					s.log.Warn("scaler: manifest key", "group", g.Group, "err", err)
+					s.log.Warn("scaler: manifest key", "group", g.group, "err", err)
 					nodeIDs = nil
 					fp, keyType, keyValue, keyRef = "", "", "", ""
 				}
 				key := fmt.Sprint(selectors) + "|" + strings.Join(nodeIDs, ",") + "|" + fp + "|" + keyType + "|" + keyValue + "|" + keyRef
 				patch := &routesync.SelectorPatch{
-					Group: g.Group, Selectors: selectors, NodeIDs: nodeIDs, NodeAllocation: true,
+					Group: g.group, Selectors: selectors, NodeIDs: nodeIDs, NodeAllocation: true,
 					KeyFingerprint: fp, ManifestKeyType: keyType, ManifestKey: keyValue, ManifestKeyRef: keyRef,
 				}
 				for _, link := range s.RegistryLinks() {
 					if last[link.Name] == nil {
 						last[link.Name] = map[string]string{}
 					}
-					if last[link.Name][g.Group] == key {
+					if last[link.Name][g.group] == key {
 						continue // unchanged since last successful push to this member
 					}
 					if err := s.postJSON(ctx, link, registry.ScaleLinkSelectorPatchPath, patch); err != nil {
-						s.log.Warn("scaler: selector patch", "registry", link.Name, "group", g.Group, "err", err)
+						s.log.Warn("scaler: selector patch", "registry", link.Name, "group", g.group, "err", err)
 						continue
 					}
-					last[link.Name][g.Group] = key
+					last[link.Name][g.group] = key
 				}
 			}
 			byName := s.linksByName()

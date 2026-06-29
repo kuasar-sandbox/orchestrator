@@ -20,7 +20,6 @@ sandbox-group 配置,维护 placement 与密钥分配集合,消费 `node_list` �
 
 ```text
 cluster-ctl scaler --config /etc/cluster-ctl/scaler.yaml
-cluster-ctl scaler import --config /etc/cluster-ctl/scaler.yaml -i groups.jsonl
 ```
 
 ## 3. 配置
@@ -32,22 +31,23 @@ cluster-ctl scaler import --config /etc/cluster-ctl/scaler.yaml -i groups.jsonl
 | `member.listen` | scaler HTTP API 监听 |
 | `member.advertise` | registry 调用 scaler 的地址 |
 | `memberlist.label` | scaler memberlist label,默认 `scaler.default` |
+| `import_groups[]` | 可选辅助 group source;首版内置 `source_type=file` |
 | `placement.candidates` | scaler 内部 node P2C 候选数量 |
 | `placement.zone_admit_max` | 可放置最高水位 |
 | `placement.shuffle_sharding` | shuffle 规则 |
 
 registry 侧的 `scale_link.scaler_label` 指定 scaler memberlist 域,默认 `scaler.default`;
-`scale_link.scaler_replica_count` 控制每个 group 的 scaler failover 候选数量。`scale_link` 不再是
-registry reverse session,也不保存 scaler 目录。scaler 通过 registry membership 得到 active / next
-registry owner 成员、node_list owner 候选与当前 registry label,向这些 owner 成员注册 memberlist seed,
-并始终只从一个 node_list owner 订阅 WATCH_LIST;断线或 membership 变化后切换到下一候选。membership
-refresh 会尝试 bootstrap 与已知成员并选择 active version 最新的结果。registry 收到 scaler register 后以
-`role=observer` 加入 scaler memberlist;ready scaler 视图来自 memberlist meta。scaler 在本地 API 提供:
+`scale_link.scaler_replica_count` 控制每个 group 的 scaler failover 候选数量,`scale_link.allocation_ttl`
+控制 registry 侧 scaler key allocation intent 的自动过期时间。`scale_link` 不再是 registry reverse
+session,也不保存 scaler 目录。scaler 通过 registry membership 得到 active / next registry owner 成员、
+node_list owner 候选与当前 registry label,向这些 owner 成员注册 memberlist seed,并始终只从一个
+node_list owner 订阅 WATCH_LIST;断线或 membership 变化后切换到下一候选。membership refresh 会尝试
+bootstrap 与已知成员并选择 active version 最新的结果。registry 收到 scaler register 后以 `role=observer`
+加入 scaler memberlist;ready scaler 视图来自 memberlist meta。scaler 在本地 API 提供:
 
 ```text
 POST /scale-link/place
 GET  /scale-link/verify-key
-POST /scale-link/import-groups
 ```
 
 ## 4. Provider / Importer
@@ -65,11 +65,22 @@ SandboxGroupImporter:
   Range(cursor, limit)
 ```
 
-Importer 提供 group 列表、TTL、tombstone/draining 标记和 generation。当前实现用
-`cluster-ctl scaler import` 导入 JSONL,语义是 upsert:缺失 group 不删除既有 cache,只有 `deleted` 或
-`expires_unix` 到期才停止参与 Place 和 key allocation。provider 删除 group 时,必须先以 tombstone/draining
-group 形式继续出现,直到 registry 确认该 group 没有活动 route/build 执行态;随后停止续租,让 group/key
-cache 按 TTL 淘汰。
+Importer 只提供当前可见的 group 列表。Provider 对 group 的点查 miss 后,新的 Place/verify-key 返回
+不可用。registry 已经收到的 key allocation intent 由
+`scale_link.allocation_ttl` 自动过期,并在下一轮 key distributor reconcile 中清理 node_link key cache。
+
+内置 `file` source 只是辅助实现,用于本地开发和 e2e:
+
+```yaml
+import_groups:
+  - source_id: example-file-source
+    source_type: file
+    path: /path/to/dir
+```
+
+该 source 枚举目录下的 `*.json` 文件。每个文件是一个 `SandboxGroupRecord` JSON。文件数量预期较小,
+`Get/GetPlacementHint/GetKey/GetAuthKey` 可直接扫描目录解析;生产环境应通过实现
+`SandboxGroupProvider` / `SandboxGroupImporter` 接口接入实际 group 源。
 
 ## 5. node_list WATCH_LIST
 
@@ -93,7 +104,7 @@ WATCH_LIST 语义:
 
 node_list owner 分片内全复制,所以 scaler 不需要也不能把多个 owner 的结果做片间合并。scaler ready 只要求
 一个 active node_list WATCH_LIST 完成 reset/bookmark;当前 owner 断线时,scaler 清空该源视图并 failover
-到另一个候选 owner 重新 snapshot。group cache 按单个 group 命中和 TTL 判断,不参与全局 ready。
+到另一个候选 owner 重新 snapshot。group 由 Provider 按请求点查,不参与全局 ready。
 
 ## 6. Scale-link 成员域
 
@@ -108,10 +119,9 @@ scaler ready 的条件:
 
 - 已拉取当前 registry membership。
 - 一个 active node_list WATCH_LIST 已完成 reset/bookmark。
-- provider 可用。
 
-group import 不构成全局 ready 门槛。每个 Place 只解析请求中的 group;该 group 未命中、已过期或 tombstone
-时返回 NoNode/不可用,不会阻塞其他 group。
+group import 不构成全局 ready 门槛。每个 Place 只解析请求中的 group;该 group 未命中时返回
+NoNode/不可用,不会阻塞其他 group。
 
 registry 只把 scaler memberlist 中 `role=scaler`、alive、`ready=true` 且
 `ready_label == active_registry_label` 的成员作为 Place 候选。ready 信息不来自 `scale_link/register`,
@@ -127,7 +137,7 @@ registry 只把 scaler memberlist 中 `role=scaler`、alive、`ready=true` 且
 
 周期任务:
 
-1. `Importer.Range` 得 group 页、TTL/tombstone 和 generation。
+1. `Importer.Range` 得 group 页。
 2. `GetPlacementHint` 得静态 selectors/shuffle labels。
 3. 用 `pkg/maglev.LocateN` 计算 shuffle 结果。
 4. 将 shuffle 约束合并进最终 selectors。
@@ -153,7 +163,7 @@ registry 不对 scaler 做 P2C。P2C 只用于 scaler 内部从 node 候选中�
 
 流程:
 
-1. 读取 group placement cache。
+1. 读取 group Provider 和 placement hint。
 2. 在 WATCH_LIST 本地索引中过滤 labels/runtime/draining。
 3. 从候选集中抽 P2C。
 4. 返回 `node_id + create_spec + key intent + runtime/template hints`。
@@ -189,7 +199,7 @@ scaler 主管 key allocation 决策:
 |---|---|
 | scaler 崩溃 | registry 对该 group failover 到下一个 ready scaler;热路径不受影响 |
 | WATCH_LIST 断线 | scaler 清空 node_list 视图并 failover 到另一个 owner 全量重订;完成 bookmark 前 not-ready |
-| provider 不可用 | 对受影响 group 的 Place 返回不可用;其他已缓存 group 可继续服务 |
+| provider 不可用 | 对受影响 group 的 Place/verify-key 返回不可用 |
 | node labels 旧 | node owner admission/create 兜底拒绝 |
 | key 续租投递失败 | create/build 在 node 侧 reject,route owner 重调度或返回失败;下一次 heartbeat refresh 重试 |
 | build 预算泄漏 | admission lease 超时释放 |

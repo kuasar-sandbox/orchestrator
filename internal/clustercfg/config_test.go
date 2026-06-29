@@ -33,7 +33,8 @@ func TestLoadRegistryPartialAppliesDefaults(t *testing.T) {
 	if c.NodeLink.RevisionRetention != 10000 || c.NodeLink.HeartbeatInterval != "10s" {
 		t.Fatalf("node_link defaults not filled: %+v", c.NodeLink)
 	}
-	if c.RouteLink.ParkTimeout != "30s" || c.NodeList.WatchRetention != 10000 || c.ScaleLink.PlaceTimeout != "2s" {
+	if c.RouteLink.ParkTimeout != "30s" || c.NodeList.WatchRetention != 10000 ||
+		c.ScaleLink.PlaceTimeout != "2s" || c.ScaleLink.AllocationTTL != "10m" {
 		t.Fatalf("link defaults not filled: route=%+v node_list=%+v scale=%+v", c.RouteLink, c.NodeList, c.ScaleLink)
 	}
 }
@@ -50,6 +51,26 @@ func TestLoadScalerPartialAppliesDefaults(t *testing.T) {
 	}
 	if c.Registry.Bootstrap == "" {
 		t.Fatal("scaler registry.bootstrap default not filled")
+	}
+}
+
+func TestScalerImportGroupsValidatesFileSource(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(t.TempDir(), "scaler.yaml")
+	raw := []byte("import_groups:\n  - source_id: file-a\n    source_type: file\n    path: " + dir + "\n")
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := LoadScaler(path)
+	if err != nil {
+		t.Fatalf("load scaler file source: %v", err)
+	}
+	if len(c.ImportGroups) != 1 || c.ImportGroups[0].Path != dir {
+		t.Fatalf("import_groups not loaded: %+v", c.ImportGroups)
+	}
+	c.ImportGroups[0].SourceType = "unknown"
+	if err := c.Validate(); err == nil {
+		t.Fatal("unknown source type should be rejected")
 	}
 }
 

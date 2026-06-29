@@ -5,12 +5,9 @@ import (
 	"crypto/tls"
 	"flag"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
-	"os"
 	"os/signal"
-	"strings"
 	"syscall"
 	"time"
 
@@ -24,9 +21,6 @@ import (
 // bootstrap source, keeps node/group placement views synced, and answers registry
 // placement requests.
 func runScaler(args []string, log *slog.Logger) error {
-	if len(args) > 0 && args[0] == "import" {
-		return scalerImportCmd(args[1:])
-	}
 	fs := flag.NewFlagSet("scaler", flag.ExitOnError)
 	cfgPath := fs.String("config", "/etc/cluster-ctl/scaler.yaml", "config file")
 	_ = fs.Parse(args)
@@ -64,7 +58,11 @@ func runScaler(args []string, log *slog.Logger) error {
 		return err
 	}
 	links := registryLinks(eps)
-	svc := scaler.NewRemoteLinks(links, cfg.Placement, deadAfter, log)
+	groupSource, err := scaler.NewConfiguredGroupSource(cfg.ImportGroups)
+	if err != nil {
+		return err
+	}
+	svc := scaler.NewRemoteLinksWithGroups(links, groupSource, groupSource, cfg.Placement, deadAfter, log)
 	svc.SetNodeListLinks(ctx, registryLinks(nodeListEps))
 	memberHub := membergroup.NewHub()
 	memberlistTLS, err := membergroupTLSConfig(cfg.Member.TLS)
@@ -95,7 +93,7 @@ func runScaler(args []string, log *slog.Logger) error {
 	go runScalerMemberMeta(ctx, scalerGroup, svc, regClient, cfg.Member.Advertise, log)
 	go svc.RegisterLoopDynamic(ctx, cfg.Member.ID, cfg.Member.Advertise, cfg.Memberlist.Label, cfg.Member.Advertise)
 	log.Info("cluster-ctl scaler", "registry", registryAddr, "registry_members", len(links), "registry_tls", registryTLS != nil,
-		"candidates", cfg.Placement.Candidates, "zone_admit_max", cfg.Placement.ZoneAdmitMax,
+		"group_sources", len(cfg.ImportGroups), "candidates", cfg.Placement.Candidates, "zone_admit_max", cfg.Placement.ZoneAdmitMax,
 		"shuffle_rules", len(cfg.Placement.ShuffleSharding))
 	select {
 	case <-ctx.Done():
@@ -179,58 +177,4 @@ func registryLinks(eps []clusterclient.Endpoint) []scaler.RegistryLink {
 		links = append(links, scaler.RegistryLink{Name: ep.MemberID, BaseURL: ep.BaseURL, Client: ep.Client})
 	}
 	return links
-}
-
-func scalerImportCmd(args []string) error {
-	fs := flag.NewFlagSet("scaler import", flag.ExitOnError)
-	cfgPath := fs.String("config", "/etc/cluster-ctl/scaler.yaml", "scaler config file")
-	endpoint := fs.String("endpoint", "", "scaler endpoint override")
-	inPath := fs.String("i", "", "input JSONL file (default stdin)")
-	_ = fs.Parse(args)
-
-	cfg, err := clustercfg.LoadScaler(*cfgPath)
-	if err != nil {
-		return err
-	}
-	addr := cfg.Member.Listen
-	if *endpoint != "" {
-		addr = *endpoint
-	}
-	if addr == "" {
-		return fmt.Errorf("scaler endpoint is empty")
-	}
-	var tlsCfg *tls.Config
-	if endpointServerName(addr) != "" && cfg.Member.TLS.Enabled() {
-		tlsCfg, err = cfg.Member.TLS.ClientConfig(endpointServerName(addr))
-		if err != nil {
-			return fmt.Errorf("scaler tls: %w", err)
-		}
-	}
-	base, client := controlHTTPClient(addr, tlsCfg)
-	r := io.Reader(os.Stdin)
-	var f *os.File
-	if *inPath != "" {
-		f, err = os.Open(*inPath)
-		if err != nil {
-			return err
-		}
-		defer f.Close()
-		r = f
-	}
-	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, base+scaler.GroupImportPath, r)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/x-ndjson")
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("scaler import: %s: %s", resp.Status, strings.TrimSpace(string(body)))
-	}
-	_, err = os.Stdout.Write(body)
-	return err
 }

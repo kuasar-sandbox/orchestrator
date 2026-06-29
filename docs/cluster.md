@@ -248,13 +248,11 @@ allocation;node_link 由 node 连接、心跳和事件触达;node_list 由 node-
 
 ### 7.2 route_link / group
 
-scaler 的 group provider/importer 是 group/key allocation 的事实源。导入是 upsert + TTL/tombstone 语义,
-缺失 group 不构成删除;过期或 tombstone 才会停止参与 Place 和 key allocation。scaler 不复制 route 数据。
-route/build 执行态不做跨 group promoter;后续同 group 请求、node 上报和 group-scoped list/export 会通过
-quorum read-repair 补齐该 group 的 owner 副本。
-
-provider 删除 group 时不能直接从 import 中消失;必须以 tombstone/draining group 形式继续出现,直到 registry
-确认该 group 没有活动 route/build 执行态。
+scaler 的 group provider/importer 是 group/key allocation 的事实源。registry 不保存 group 配置,也不实现
+provider。group 从 provider 消失后,新的 Place/verify-key 直接按该 group 不存在处理;registry 中已经收到
+的 key allocation intent 由 `scale_link.allocation_ttl` 自动过期,再通过 key distributor 清理 node_link
+key cache。scaler 不复制 route 数据。route/build 执行态不做跨 group promoter;后续同 group 请求、node
+上报和 group-scoped list/export 会通过 quorum read-repair 补齐该 group 的 owner 副本。
 
 route owner 内部维护按 group 分开的本地 watch log。这个 watch 只服务 registry 内部:
 
@@ -353,7 +351,7 @@ scaler 是 placement 和 group provider/importer 的消费者。registry 不实�
 scaler 负责:
 
 - `SandboxGroupImporter.Range` 全量/增量导入 group。
-- `SandboxGroupProvider.GetPlacementHint` 构建 group placement cache。
+- `SandboxGroupProvider.GetPlacementHint` 提供 group placement hint。
 - `SandboxGroupProvider.GetKey` / `GetAuthKey` 生成 key allocation / auth material intent。
 - 按 active / next membership 得到 node_list owner 候选,一次只订阅一个 owner;断线后 reset 并切换下一个。
 - 周期性向 active / next registry owner 成员 `POST /scale-link/register` 发布 memberlist seed。
@@ -400,9 +398,10 @@ group 有两个密钥域:
 `manifest_key` 和 `registry_auth` 都是 typed secret,支持 inline 或 ref 带外交付。`manifest_key` 使用 ref
 时必须同时给出 fingerprint,供 create/build precheck 使用。密钥分发遵循 scaler 的 allocation 结果:
 scaler 决定哪些 node 应有 key,registry/node owner 将 desired key list 写入对应 node_link 记录并在 owner
-set 内 CAS 复制。node_link key cache 同时记录已成功下发的 lease 到期时间;实际 `key_put` 由 node-link
-心跳维系,TTL 未到期的条目不重复下发。`key_drop` 不作为正确性依赖,节点侧租约按 TTL 淘汰未续租 key。
-密钥分发是 create/build 前置条件,不影响已运行 sandbox。
+set 内 CAS 复制。registry 保存的 scaler allocation intent 有 `scale_link.allocation_ttl`;scaler 停止续推
+后 intent 自动过期,node_link key cache 随下一轮 reconcile 清理。node_link key cache 同时记录已成功下发
+的 lease 到期时间;实际 `key_put` 由 node-link 心跳维系,TTL 未到期的条目不重复下发。`key_drop` 不作为
+正确性依赖,节点侧租约按 TTL 淘汰未续租 key。密钥分发是 create/build 前置条件,不影响已运行 sandbox。
 
 ## 13. Build
 

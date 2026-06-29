@@ -93,6 +93,7 @@ type Registry struct {
 	scalePeerSource  ScalerPeerSource
 	scalerSeedJoiner ScalerSeedJoiner
 	keyAlloc         map[string]keyAllocationState // group -> scaler-owned manifest-key allocation set
+	keyAllocationTTL time.Duration
 	scaleReplicas    int
 	minReadyScalers  int
 	scaleTimeout     time.Duration
@@ -152,6 +153,7 @@ func New(stores *Stores, placer Placer, parkTimeout time.Duration, log *slog.Log
 		keyLeased:        make(map[string]keyLeaseState),
 		reconcileTrigger: make(chan struct{}, 1),
 		keyAlloc:         make(map[string]keyAllocationState),
+		keyAllocationTTL: 10 * time.Minute,
 		scaleReplicas:    1,
 		minReadyScalers:  1,
 		scaleTimeout:     2 * time.Second,
@@ -181,7 +183,12 @@ func (r *Registry) applySelectorPatch(p *routesync.SelectorPatch) {
 		if keyType == "" && keyValue != "" {
 			keyType = clusterstate.SecretInline
 		}
-		r.keyAlloc[p.Group] = keyAllocationState{fp: p.KeyFingerprint, keyType: keyType, keyValue: keyValue, nodes: set}
+		if len(set) == 0 || p.KeyFingerprint == "" || keyValue == "" {
+			delete(r.keyAlloc, p.Group)
+		} else {
+			expiresAt := time.Now().Add(r.keyAllocationTTL)
+			r.keyAlloc[p.Group] = keyAllocationState{fp: p.KeyFingerprint, keyType: keyType, keyValue: keyValue, nodes: set, expiresAt: expiresAt}
+		}
 	}
 	r.scalerMu.Unlock()
 	r.onNodeConnected()
@@ -190,13 +197,19 @@ func (r *Registry) applySelectorPatch(p *routesync.SelectorPatch) {
 func (r *Registry) keyAllocations() map[string]keyAllocationState {
 	r.scalerMu.Lock()
 	defer r.scalerMu.Unlock()
+	now := time.Now()
+	for group, src := range r.keyAlloc {
+		if !src.expiresAt.IsZero() && !src.expiresAt.After(now) {
+			delete(r.keyAlloc, group)
+		}
+	}
 	out := make(map[string]keyAllocationState, len(r.keyAlloc))
 	for group, src := range r.keyAlloc {
 		nodes := make(map[string]bool, len(src.nodes))
 		for id := range src.nodes {
 			nodes[id] = true
 		}
-		out[group] = keyAllocationState{fp: src.fp, keyType: src.keyType, keyValue: src.keyValue, nodes: nodes}
+		out[group] = keyAllocationState{fp: src.fp, keyType: src.keyType, keyValue: src.keyValue, nodes: nodes, expiresAt: src.expiresAt}
 	}
 	return out
 }
@@ -206,6 +219,15 @@ func (r *Registry) keyAllocations() map[string]keyAllocationState {
 func (r *Registry) SetScaleReadyLabel(label string) {
 	r.scalerMu.Lock()
 	r.scaleReadyLabel = label
+	r.scalerMu.Unlock()
+}
+
+func (r *Registry) SetKeyAllocationTTL(ttl time.Duration) {
+	if ttl <= 0 {
+		ttl = 10 * time.Minute
+	}
+	r.scalerMu.Lock()
+	r.keyAllocationTTL = ttl
 	r.scalerMu.Unlock()
 }
 

@@ -108,6 +108,7 @@ scale_link:
   scaler_replica_count: 3
   min_ready_scalers: 1
   place_timeout: 2s
+  allocation_ttl: 10m                   # registry-side scaler allocation intent TTL
 `
 
 const routerConfigSkeleton = `# cluster-ctl router config — cluster-ctl router --config <this> (cluster-router.md §3).
@@ -142,8 +143,10 @@ memberlist:
 registry:
   bootstrap: registry-1.example:7700
   # tls: { cert: ..., key: ..., ca: ... }   # client mTLS to registry control plane
-# sandbox-group records are imported into scaler/provider side:
-#   cluster-ctl scaler import --config scaler.yaml -i groups.jsonl
+import_groups:                         # optional helper source; production injects Provider/Importer
+  - source_id: example-file-source
+    source_type: file
+    path: /var/lib/kuasar/groups
 placement:
   candidates: 2                      # P2C sample size
   zone_admit_max: yellow             # exclude nodes hotter than this (green|yellow|red)

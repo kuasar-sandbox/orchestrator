@@ -150,7 +150,7 @@ func TestKeyDistributionUsesScalerAllocation(t *testing.T) {
 	}
 }
 
-func TestKeyDistributionDropsDeletedGroupAndRotatedKey(t *testing.T) {
+func TestKeyDistributionDropsRemovedAllocationAndRotatedKey(t *testing.T) {
 	ctx := context.Background()
 	reg := testRegWithBox(t)
 	reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"})
@@ -178,11 +178,11 @@ func TestKeyDistributionDropsDeletedGroupAndRotatedKey(t *testing.T) {
 	pushKeyAllocation(reg, "/g", nil, "")
 	reg.reconcileKeys(ctx)
 	if len(cmds) != 0 {
-		t.Fatalf("deleted group commands=%+v, want none", cmds)
+		t.Fatalf("removed allocation commands=%+v, want none", cmds)
 	}
 	node, _, _ = reg.stores.GetNode(ctx, "n1")
 	if len(node.ManifestKeys) != 0 {
-		t.Fatalf("deleted group cache=%+v, want empty", node.ManifestKeys)
+		t.Fatalf("removed allocation cache=%+v, want empty", node.ManifestKeys)
 	}
 }
 
@@ -215,6 +215,33 @@ func TestKeyDistributionCachesKeysInNodeLink(t *testing.T) {
 	}
 	if len(node.ManifestKeys) != 1 || node.ManifestKeys[0].Fingerprint != keyFingerprint(testMK) {
 		t.Fatalf("register cleared node_link manifest key cache: %+v", node.ManifestKeys)
+	}
+}
+
+func TestKeyAllocationTTLExpiresNodeLinkCache(t *testing.T) {
+	ctx := context.Background()
+	reg := testRegWithBox(t)
+	reg.SetKeyAllocationTTL(20 * time.Millisecond)
+	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"}); err != nil {
+		t.Fatal(err)
+	}
+	reg.addNode(&fakeConn{nodeID: "n1"})
+
+	pushKeyAllocation(reg, "/g", []string{"n1"}, testMK)
+	reg.reconcileKeys(ctx)
+	node, found, err := reg.stores.GetNode(ctx, "n1")
+	if err != nil || !found || len(node.ManifestKeys) != 1 {
+		t.Fatalf("initial key cache=%+v found=%v err=%v", node, found, err)
+	}
+
+	time.Sleep(25 * time.Millisecond)
+	reg.reconcileKeys(ctx)
+	node, found, err = reg.stores.GetNode(ctx, "n1")
+	if err != nil || !found {
+		t.Fatalf("node found=%v err=%v", found, err)
+	}
+	if len(node.ManifestKeys) != 0 {
+		t.Fatalf("expired allocation kept node_link key cache: %+v", node.ManifestKeys)
 	}
 }
 

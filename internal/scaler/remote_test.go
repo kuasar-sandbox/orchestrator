@@ -43,7 +43,11 @@ func TestScalerDirectPlace(t *testing.T) {
 	defer controlSrv.Close()
 	defer cancel()
 
-	svc := NewRemote(strings.TrimPrefix(controlSrv.URL, "http://"), nil, clustercfg.PlacementConfig{Candidates: 2}, 30, discard)
+	src := testGroupSource(t,
+		clusterstate.SandboxGroupRecord{Group: "/g", NodeSelectors: []map[string]string{{"pool": "p"}}},
+		clusterstate.SandboxGroupRecord{Group: "/x", NodeSelectors: []map[string]string{{"pool": "absent"}}},
+	)
+	svc := NewRemoteLinksWithGroups([]RegistryLink{registryLinkFromAddress("registry", strings.TrimPrefix(controlSrv.URL, "http://"), nil)}, src, src, clustercfg.PlacementConfig{Candidates: 2}, 30, discard)
 	scalerMux := http.NewServeMux()
 	svc.ServeScaleLink(scalerMux)
 	scalerSrv := httptest.NewServer(scalerMux)
@@ -51,7 +55,6 @@ func TestScalerDirectPlace(t *testing.T) {
 	reg.SetScalerPeerSource(func(string) []registry.ScalerPeer {
 		return []registry.ScalerPeer{{ID: "s1", Advertise: scalerSrv.URL}}
 	})
-	svc.groups.replace([]clusterstate.SandboxGroupRecord{{Group: "/g", NodeSelectors: []map[string]string{{"pool": "p"}}}})
 	svc.Start(ctx)
 
 	var placement *registry.Placement
@@ -66,7 +69,6 @@ func TestScalerDirectPlace(t *testing.T) {
 		t.Fatalf("direct Place = %+v err=%v (want n1 or n2)", placement, err)
 	}
 
-	svc.groups.replace([]clusterstate.SandboxGroupRecord{{Group: "/x", NodeSelectors: []map[string]string{{"pool": "absent"}}}})
 	for i := 0; i < 300; i++ {
 		_, perr := placer.Place(ctx, registry.PlaceRequest{Group: "/x", RouteKey: "rk"})
 		if perr == registry.ErrNoNode {
@@ -86,10 +88,11 @@ func TestScalerUsesSingleNodeListSourceAndRegistersAllRegistryMembers(t *testing
 	reg2, srv2 := testScaleRegistry(t, ctx, "n2")
 	defer srv2.Close()
 
-	svc := NewRemoteLinks([]RegistryLink{
+	src := testGroupSource(t, clusterstate.SandboxGroupRecord{Group: "/g", NodeSelectors: []map[string]string{{"pool": "p"}}})
+	svc := NewRemoteLinksWithGroups([]RegistryLink{
 		{Name: "r1", BaseURL: srv1.URL, Client: srv1.Client()},
 		{Name: "r2", BaseURL: srv2.URL, Client: srv2.Client()},
-	}, clustercfg.PlacementConfig{Candidates: 1}, 30, discard)
+	}, src, src, clustercfg.PlacementConfig{Candidates: 1}, 30, discard)
 	scalerMux := http.NewServeMux()
 	svc.ServeScaleLink(scalerMux)
 	scalerSrv := httptest.NewServer(scalerMux)
@@ -101,7 +104,6 @@ func TestScalerUsesSingleNodeListSourceAndRegistersAllRegistryMembers(t *testing
 		return []registry.ScalerPeer{{ID: "s1", Advertise: scalerSrv.URL}}
 	})
 	defer cancel()
-	svc.ImportGroups([]clusterstate.SandboxGroupRecord{{Group: "/g", NodeSelectors: []map[string]string{{"pool": "p"}}}})
 	svc.Start(ctx)
 
 	for i := 0; i < 300; i++ {

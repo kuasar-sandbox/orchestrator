@@ -12,6 +12,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -99,7 +101,17 @@ func newHarness(t *testing.T) *harness {
 		return out
 	})
 
-	svc := scaler.NewRemote(linkAddr, nil, clustercfg.PlacementConfig{Candidates: 1, ZoneAdmitMax: "yellow"}, 30, log)
+	groupDir := t.TempDir()
+	writeStubGroup(t, groupDir)
+	groupSource, err := scaler.NewFileGroupSource("stub", groupDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc := scaler.NewRemoteLinksWithGroups(
+		[]scaler.RegistryLink{{Name: "registry", BaseURL: "http://" + linkAddr, Client: http.DefaultClient}},
+		groupSource, groupSource,
+		clustercfg.PlacementConfig{Candidates: 1, ZoneAdmitMax: "yellow"}, 30, log,
+	)
 	scalerHub := membergroup.NewHub()
 	scalerMux := http.NewServeMux()
 	scalerHub.Mount(scalerMux)
@@ -116,12 +128,6 @@ func newHarness(t *testing.T) *harness {
 	if err != nil {
 		t.Fatal(err)
 	}
-	svc.ImportGroups([]clusterstate.SandboxGroupRecord{{
-		Group: testGroup, ManifestKey: clusterstate.Secret{Type: clusterstate.SecretInline, Value: testMK},
-		AuthKey:     clusterstate.Secret{Type: clusterstate.SecretInline, Value: testAuthKey},
-		TemplateRef: "tmpl-1", NodeSelectors: []map[string]string{{"pool": "stub"}},
-		Config: map[string]string{"from_group": "yes"},
-	}})
 	svc.Start(ctx)
 	go svc.RegisterLoop(ctx, "s1", scalerSrv.URL, "scaler.default")
 
@@ -163,6 +169,23 @@ func newHarness(t *testing.T) *harness {
 		links.Close()
 	})
 	return h
+}
+
+func writeStubGroup(t *testing.T, dir string) {
+	t.Helper()
+	raw, err := json.Marshal(clusterstate.SandboxGroupRecord{
+		Group: testGroup, ManifestKey: clusterstate.Secret{Type: clusterstate.SecretInline, Value: testMK},
+		AuthKey:       clusterstate.Secret{Type: clusterstate.SecretInline, Value: testAuthKey},
+		TemplateRef:   "tmpl-1",
+		NodeSelectors: []map[string]string{{"pool": "stub"}},
+		Config:        map[string]string{"from_group": "yes"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "group.json"), raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func waitForPlacement(t *testing.T, ctx context.Context, placer registry.Placer, linksURL string) {

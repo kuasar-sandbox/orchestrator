@@ -1,141 +1,326 @@
 package scaler
 
 import (
-	"bufio"
+	"context"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io"
+	"os"
+	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
-	"sync"
-	"time"
 
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/apikey"
 	clusterstate "github.com/kuasar-sandbox/sandbox-orchestrator/internal/cluster"
+	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/clustercfg"
 )
 
-const GroupImportPath = "/scale-link/import-groups"
+const defaultGroupPageLimit = 1024
 
-const SnapshotKindGroup = "group"
-
-type GroupImportRecord struct {
-	Type  string                           `json:"type"`
-	Group *clusterstate.SandboxGroupRecord `json:"group,omitempty"`
+type GroupSource interface {
+	clusterstate.SandboxGroupProvider
+	clusterstate.SandboxGroupImporter
 }
 
-type GroupImportSummary struct {
-	Groups int `json:"groups"`
-}
-
-type groupStore struct {
-	mu     sync.RWMutex
-	groups map[string]clusterstate.SandboxGroupRecord
-}
-
-func newGroupStore() *groupStore {
-	return &groupStore{groups: map[string]clusterstate.SandboxGroupRecord{}}
-}
-
-func (s *groupStore) get(group string) (clusterstate.SandboxGroupRecord, bool) {
-	s.pruneExpired(time.Now().Unix())
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	g, ok := s.groups[group]
-	if !ok || g.Deleted {
-		return clusterstate.SandboxGroupRecord{}, false
+func NewConfiguredGroupSource(sources []clustercfg.GroupSourceConfig) (GroupSource, error) {
+	if len(sources) == 0 {
+		return emptyGroupSource{}, nil
 	}
-	return cloneGroupRecord(g), true
+	out := make([]GroupSource, 0, len(sources))
+	for _, cfg := range sources {
+		switch cfg.SourceType {
+		case "file":
+			src, err := NewFileGroupSource(cfg.SourceID, cfg.Path)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, src)
+		default:
+			return nil, fmt.Errorf("scaler: unsupported group source type %q", cfg.SourceType)
+		}
+	}
+	return multiGroupSource{sources: out}, nil
 }
 
-func (s *groupStore) values() []clusterstate.SandboxGroupRecord {
-	s.pruneExpired(time.Now().Unix())
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	out := make([]clusterstate.SandboxGroupRecord, 0, len(s.groups))
-	for _, g := range s.groups {
-		if g.Deleted {
+func NewFileGroupSource(sourceID, dir string) (GroupSource, error) {
+	if sourceID == "" {
+		return nil, fmt.Errorf("scaler: file group source id is required")
+	}
+	if dir == "" {
+		return nil, fmt.Errorf("scaler: file group source %q path is required", sourceID)
+	}
+	info, err := os.Stat(dir)
+	if err != nil {
+		return nil, fmt.Errorf("scaler: file group source %q stat %s: %w", sourceID, dir, err)
+	}
+	if !info.IsDir() {
+		return nil, fmt.Errorf("scaler: file group source %q path %s is not a directory", sourceID, dir)
+	}
+	return &fileGroupSource{sourceID: sourceID, dir: dir}, nil
+}
+
+type emptyGroupSource struct{}
+
+func (emptyGroupSource) Get(context.Context, string) (clusterstate.SandboxGroup, bool, error) {
+	return clusterstate.SandboxGroup{}, false, nil
+}
+
+func (emptyGroupSource) GetPlacementHint(context.Context, string) (clusterstate.PlacementHint, bool, error) {
+	return clusterstate.PlacementHint{}, false, nil
+}
+
+func (emptyGroupSource) GetKey(context.Context, string) (clusterstate.Secret, bool, error) {
+	return clusterstate.Secret{}, false, nil
+}
+
+func (emptyGroupSource) GetAuthKey(context.Context, string) (clusterstate.Secret, bool, error) {
+	return clusterstate.Secret{}, false, nil
+}
+
+func (emptyGroupSource) Range(context.Context, string, int) (clusterstate.GroupPage, error) {
+	return clusterstate.GroupPage{}, nil
+}
+
+type multiGroupSource struct {
+	sources []GroupSource
+}
+
+func (m multiGroupSource) Get(ctx context.Context, group string) (clusterstate.SandboxGroup, bool, error) {
+	for _, source := range m.sources {
+		g, found, err := source.Get(ctx, group)
+		if err != nil || found {
+			return g, found, err
+		}
+	}
+	return clusterstate.SandboxGroup{}, false, nil
+}
+
+func (m multiGroupSource) GetPlacementHint(ctx context.Context, group string) (clusterstate.PlacementHint, bool, error) {
+	for _, source := range m.sources {
+		hint, found, err := source.GetPlacementHint(ctx, group)
+		if err != nil || found {
+			return hint, found, err
+		}
+	}
+	return clusterstate.PlacementHint{}, false, nil
+}
+
+func (m multiGroupSource) GetKey(ctx context.Context, group string) (clusterstate.Secret, bool, error) {
+	for _, source := range m.sources {
+		key, found, err := source.GetKey(ctx, group)
+		if err != nil || found {
+			return key, found, err
+		}
+	}
+	return clusterstate.Secret{}, false, nil
+}
+
+func (m multiGroupSource) GetAuthKey(ctx context.Context, group string) (clusterstate.Secret, bool, error) {
+	for _, source := range m.sources {
+		key, found, err := source.GetAuthKey(ctx, group)
+		if err != nil || found {
+			return key, found, err
+		}
+	}
+	return clusterstate.Secret{}, false, nil
+}
+
+func (m multiGroupSource) Range(ctx context.Context, cursor string, limit int) (clusterstate.GroupPage, error) {
+	if limit <= 0 {
+		limit = defaultGroupPageLimit
+	}
+	seen := map[string]bool{}
+	for _, source := range m.sources {
+		next := ""
+		for {
+			page, err := source.Range(ctx, next, defaultGroupPageLimit)
+			if err != nil {
+				return clusterstate.GroupPage{}, err
+			}
+			for _, group := range page.Groups {
+				seen[group] = true
+			}
+			if page.NextCursor == "" {
+				break
+			}
+			next = page.NextCursor
+		}
+	}
+	groups := make([]string, 0, len(seen))
+	for group := range seen {
+		groups = append(groups, group)
+	}
+	sort.Strings(groups)
+	start, err := parseGroupCursor(cursor)
+	if err != nil {
+		return clusterstate.GroupPage{}, err
+	}
+	if start >= len(groups) {
+		return clusterstate.GroupPage{}, nil
+	}
+	end := start + limit
+	if end > len(groups) {
+		end = len(groups)
+	}
+	next := ""
+	if end < len(groups) {
+		next = strconv.Itoa(end)
+	}
+	return clusterstate.GroupPage{Groups: groups[start:end], NextCursor: next}, nil
+}
+
+type fileGroupSource struct {
+	sourceID string
+	dir      string
+}
+
+func (s *fileGroupSource) Get(ctx context.Context, group string) (clusterstate.SandboxGroup, bool, error) {
+	rec, found, err := s.find(ctx, group)
+	if err != nil || !found {
+		return clusterstate.SandboxGroup{}, false, err
+	}
+	return groupRecordToGroup(rec), true, nil
+}
+
+func (s *fileGroupSource) GetPlacementHint(ctx context.Context, group string) (clusterstate.PlacementHint, bool, error) {
+	rec, found, err := s.find(ctx, group)
+	if err != nil || !found {
+		return clusterstate.PlacementHint{}, false, err
+	}
+	return clusterstate.PlacementHint{NodeSelectors: cloneSelectors(rec.NodeSelectors), ShuffleLabels: cloneStringMap(rec.ShuffleLabels)}, true, nil
+}
+
+func (s *fileGroupSource) GetKey(ctx context.Context, group string) (clusterstate.Secret, bool, error) {
+	rec, found, err := s.find(ctx, group)
+	if err != nil || !found {
+		return clusterstate.Secret{}, false, err
+	}
+	return rec.ManifestKey, true, nil
+}
+
+func (s *fileGroupSource) GetAuthKey(ctx context.Context, group string) (clusterstate.Secret, bool, error) {
+	rec, found, err := s.find(ctx, group)
+	if err != nil || !found {
+		return clusterstate.Secret{}, false, err
+	}
+	return rec.AuthKey, true, nil
+}
+
+func (s *fileGroupSource) Range(ctx context.Context, cursor string, limit int) (clusterstate.GroupPage, error) {
+	if limit <= 0 {
+		limit = defaultGroupPageLimit
+	}
+	records, err := s.records(ctx)
+	if err != nil {
+		return clusterstate.GroupPage{}, err
+	}
+	groups := make([]string, 0, len(records))
+	for _, rec := range records {
+		groups = append(groups, rec.Group)
+	}
+	sort.Strings(groups)
+	start, err := parseGroupCursor(cursor)
+	if err != nil {
+		return clusterstate.GroupPage{}, err
+	}
+	if start >= len(groups) {
+		return clusterstate.GroupPage{}, nil
+	}
+	end := start + limit
+	if end > len(groups) {
+		end = len(groups)
+	}
+	next := ""
+	if end < len(groups) {
+		next = strconv.Itoa(end)
+	}
+	return clusterstate.GroupPage{Groups: groups[start:end], NextCursor: next}, nil
+}
+
+func (s *fileGroupSource) find(ctx context.Context, group string) (clusterstate.SandboxGroupRecord, bool, error) {
+	if group == "" {
+		return clusterstate.SandboxGroupRecord{}, false, nil
+	}
+	records, err := s.records(ctx)
+	if err != nil {
+		return clusterstate.SandboxGroupRecord{}, false, err
+	}
+	for _, rec := range records {
+		if rec.Group == group {
+			return rec, true, nil
+		}
+	}
+	return clusterstate.SandboxGroupRecord{}, false, nil
+}
+
+func (s *fileGroupSource) records(ctx context.Context) ([]clusterstate.SandboxGroupRecord, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	entries, err := os.ReadDir(s.dir)
+	if err != nil {
+		return nil, fmt.Errorf("scaler: file group source %q read %s: %w", s.sourceID, s.dir, err)
+	}
+	records := make([]clusterstate.SandboxGroupRecord, 0, len(entries))
+	for _, entry := range entries {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
 			continue
 		}
-		out = append(out, cloneGroupRecord(g))
+		rec, err := readGroupRecord(filepath.Join(s.dir, entry.Name()))
+		if err != nil {
+			return nil, fmt.Errorf("scaler: file group source %q: %w", s.sourceID, err)
+		}
+		if !groupRecordActive(rec) {
+			continue
+		}
+		records = append(records, cloneGroupRecord(rec))
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Group < out[j].Group })
-	return out
+	return records, nil
 }
 
-func (s *groupStore) upsert(groups []clusterstate.SandboxGroupRecord) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for _, g := range groups {
-		if g.Group == "" {
-			continue
-		}
-		if g.Deleted {
-			delete(s.groups, g.Group)
-			continue
-		}
-		if g.ExpiresUnix > 0 && g.ExpiresUnix <= time.Now().Unix() {
-			delete(s.groups, g.Group)
-			continue
-		}
-		s.groups[g.Group] = cloneGroupRecord(g)
+func readGroupRecord(path string) (clusterstate.SandboxGroupRecord, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return clusterstate.SandboxGroupRecord{}, err
 	}
+	var rec clusterstate.SandboxGroupRecord
+	if err := json.Unmarshal(raw, &rec); err != nil {
+		return clusterstate.SandboxGroupRecord{}, fmt.Errorf("parse %s: %w", path, err)
+	}
+	if rec.Group == "" {
+		return clusterstate.SandboxGroupRecord{}, fmt.Errorf("parse %s: group is required", path)
+	}
+	return rec, nil
 }
 
-func (s *groupStore) replace(groups []clusterstate.SandboxGroupRecord) {
-	next := make(map[string]clusterstate.SandboxGroupRecord, len(groups))
-	now := time.Now().Unix()
-	for _, g := range groups {
-		if g.Group == "" || g.Deleted || (g.ExpiresUnix > 0 && g.ExpiresUnix <= now) {
-			continue
-		}
-		next[g.Group] = cloneGroupRecord(g)
-	}
-	s.mu.Lock()
-	s.groups = next
-	s.mu.Unlock()
+func groupRecordActive(rec clusterstate.SandboxGroupRecord) bool {
+	return rec.Group != ""
 }
 
-func (s *groupStore) pruneExpired(now int64) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for group, g := range s.groups {
-		if g.ExpiresUnix > 0 && g.ExpiresUnix <= now {
-			delete(s.groups, group)
-		}
+func parseGroupCursor(cursor string) (int, error) {
+	if cursor == "" {
+		return 0, nil
 	}
+	start, err := strconv.Atoi(cursor)
+	if err != nil || start < 0 {
+		return 0, fmt.Errorf("scaler: invalid group cursor %q", cursor)
+	}
+	return start, nil
 }
 
-func importGroups(rd io.Reader) ([]clusterstate.SandboxGroupRecord, GroupImportSummary, error) {
-	sc := bufio.NewScanner(rd)
-	sc.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
-	var groups []clusterstate.SandboxGroupRecord
-	line := 0
-	for sc.Scan() {
-		line++
-		raw := strings.TrimSpace(sc.Text())
-		if raw == "" {
-			continue
-		}
-		var rec GroupImportRecord
-		if err := json.Unmarshal([]byte(raw), &rec); err != nil {
-			return nil, GroupImportSummary{}, fmt.Errorf("scaler group import line %d: %w", line, err)
-		}
-		if rec.Type == "" {
-			rec.Type = SnapshotKindGroup
-		}
-		if rec.Type != SnapshotKindGroup {
-			return nil, GroupImportSummary{}, fmt.Errorf("scaler group import line %d: unknown type %q", line, rec.Type)
-		}
-		if rec.Group == nil || rec.Group.Group == "" {
-			return nil, GroupImportSummary{}, fmt.Errorf("scaler group import line %d: group record missing group", line)
-		}
-		groups = append(groups, cloneGroupRecord(*rec.Group))
+func groupRecordToGroup(rec clusterstate.SandboxGroupRecord) clusterstate.SandboxGroup {
+	return clusterstate.SandboxGroup{
+		Group:        rec.Group,
+		Config:       cloneStringMap(rec.Config),
+		ImageRepo:    rec.ImageRepo,
+		RegistryAuth: rec.RegistryAuth,
+		TemplateRef:  rec.TemplateRef,
+		Metadata:     cloneStringMap(rec.Metadata),
 	}
-	if err := sc.Err(); err != nil {
-		return nil, GroupImportSummary{}, err
-	}
-	return groups, GroupImportSummary{Groups: len(groups)}, nil
 }
 
 func inlineSecret(kind string, s clusterstate.Secret) (string, error) {
@@ -148,26 +333,26 @@ func inlineSecret(kind string, s clusterstate.Secret) (string, error) {
 	return s.Value, nil
 }
 
-func manifestKeyPatch(g clusterstate.SandboxGroupRecord) (fp, keyType, keyValue, keyRef string, err error) {
-	if g.ManifestKey.Value == "" {
+func manifestKeyPatch(group string, key clusterstate.Secret) (fp, keyType, keyValue, keyRef string, err error) {
+	if key.Value == "" {
 		return "", "", "", "", nil
 	}
-	keyType = g.ManifestKey.Type
+	keyType = key.Type
 	if keyType == "" {
 		keyType = clusterstate.SecretInline
 	}
 	switch keyType {
 	case clusterstate.SecretInline:
-		fp = manifestKeyFingerprint(g.ManifestKey.Value)
+		fp = manifestKeyFingerprint(key.Value)
 		if fp == "" {
-			return "", "", "", "", fmt.Errorf("scaler: invalid manifest_key for group %q", g.Group)
+			return "", "", "", "", fmt.Errorf("scaler: invalid manifest_key for group %q", group)
 		}
-		return fp, keyType, g.ManifestKey.Value, "", nil
+		return fp, keyType, key.Value, "", nil
 	case clusterstate.SecretRef:
-		if g.ManifestKey.Fingerprint == "" {
-			return "", "", "", "", fmt.Errorf("scaler: manifest_key ref for group %q missing fingerprint", g.Group)
+		if key.Fingerprint == "" {
+			return "", "", "", "", fmt.Errorf("scaler: manifest_key ref for group %q missing fingerprint", group)
 		}
-		return g.ManifestKey.Fingerprint, keyType, "", g.ManifestKey.Value, nil
+		return key.Fingerprint, keyType, "", key.Value, nil
 	default:
 		return "", "", "", "", fmt.Errorf("scaler: unknown manifest_key type %q", keyType)
 	}

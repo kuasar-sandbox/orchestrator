@@ -78,6 +78,7 @@ func runRegistry(args []string, log *slog.Logger) error {
 		reg.SetScaleReadyLabel(active.Label)
 	}
 	reg.SetScalePolicy(cfg.ScaleLink.ScalerReplicaCount, cfg.ScaleLink.MinReadyScalers, cfg.ScaleLink.PlaceDur())
+	reg.SetKeyAllocationTTL(cfg.ScaleLink.AllocationTTLDur())
 	reg.SetPlacer(registry.NewHTTPScalePlacerWithMinReady(reg, cfg.ScaleLink.ScalerReplicaCount, cfg.ScaleLink.MinReadyScalers, cfg.ScaleLink.PlaceDur()))
 	cfgState := newRegistryRuntimeConfig(cfg)
 
@@ -244,6 +245,7 @@ func reloadRegistryConfig(ctx context.Context, cfgPath string, old *clustercfg.R
 	reg.SetScaleReadyLabel(active.Label)
 	reg.SetScalerMemberlistLabel(next.ScaleLink.ScalerLabel)
 	reg.SetScalePolicy(next.ScaleLink.ScalerReplicaCount, next.ScaleLink.MinReadyScalers, next.ScaleLink.PlaceDur())
+	reg.SetKeyAllocationTTL(next.ScaleLink.AllocationTTLDur())
 	reg.SetPlacer(registry.NewHTTPScalePlacerWithMinReady(reg, next.ScaleLink.ScalerReplicaCount, next.ScaleLink.MinReadyScalers, next.ScaleLink.PlaceDur()))
 	cfgState.set(next)
 	return nil

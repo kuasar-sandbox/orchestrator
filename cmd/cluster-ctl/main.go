@@ -3,7 +3,6 @@
 //	cluster-ctl registry  --config <registry.yaml>   # state authority + node_link hub
 //	cluster-ctl router    --config <router.yaml>     # e2b-compatible unified ingress
 //	cluster-ctl scaler    --config <scaler.yaml>     # placement scheduler
-//	cluster-ctl scaler import --config <scaler.yaml> -i groups.jsonl
 //	cluster-ctl config <registry|router|scaler> [--template|--config <f>|--resolve]  # config diagnose / generate
 //	cluster-ctl version
 //

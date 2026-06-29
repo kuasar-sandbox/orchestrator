@@ -231,14 +231,19 @@ member:
   advertise: "http://127.0.0.1:$SCALER_PORT"
 registry:
   bootstrap: "127.0.0.1:$CONTROL_PORT"
+import_groups:
+  - source_id: stub-file-source
+    source_type: file
+    path: "$WORK/groups"
 placement:
   candidates: 2
   zone_admit_max: "yellow"
   node_dead_after: "3s"
 EOF
 
-cat >"$WORK/groups.jsonl" <<EOF
-{"type":"group","group":{"group":"$GROUP","manifest_key":"$MANIFEST_KEY","auth_key":"$AUTH_KEY","template_ref":"tmpl-stub","node_selectors":[{"pool":"stub"}],"sandbox_config":{"stub.create_delay_ms":"15","stub.http_status":"204"}}}
+mkdir -p "$WORK/groups"
+cat >"$WORK/groups/group.json" <<EOF
+{"group":"$GROUP","manifest_key":"$MANIFEST_KEY","auth_key":"$AUTH_KEY","template_ref":"tmpl-stub","node_selectors":[{"pool":"stub"}],"sandbox_config":{"stub.create_delay_ms":"15","stub.http_status":"204"}}
 EOF
 
 for i in $(seq 1 "$REGISTRIES"); do
@@ -279,10 +284,6 @@ step "starting scaler"
 "$CLUSTER_CTL" scaler --config "$WORK/scaler.yaml" > >(tee "$WORK/scaler.log" >&2) 2>&1 &
 PIDS+=("$!")
 wait_tcp "$SCALER_PORT" "scaler"
-
-step "importing sandbox group into scaler"
-"$CLUSTER_CTL" scaler import --config "$WORK/scaler.yaml" --endpoint "127.0.0.1:$SCALER_PORT" -i "$WORK/groups.jsonl" > >(tee "$WORK/import.log" >&2) 2>&1 ||
-    fail "scaler import failed"
 
 step "starting node-stub-ctl with $NODES nodes"
 "$NODE_STUB_CTL" serve \
