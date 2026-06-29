@@ -12,6 +12,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/clustercfg"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/clusterclient"
@@ -57,11 +58,13 @@ func runScaler(args []string, log *slog.Logger) error {
 	if len(eps) == 0 {
 		return fmt.Errorf("scaler: registry membership has no members")
 	}
-	links := make([]scaler.RegistryLink, 0, len(eps))
-	for _, ep := range eps {
-		links = append(links, scaler.RegistryLink{Name: ep.MemberID, BaseURL: ep.BaseURL, Client: ep.Client})
+	nodeListEps, err := regClient.NodeListEndpoints(ctx)
+	if err != nil {
+		return err
 	}
+	links := registryLinks(eps)
 	svc := scaler.NewRemoteLinks(links, cfg.Placement, deadAfter, log)
+	svc.SetNodeListLinks(ctx, registryLinks(nodeListEps))
 	mux := http.NewServeMux()
 	svc.ServeScaleLink(mux)
 	errCh := make(chan error, 1)
@@ -69,6 +72,7 @@ func runScaler(args []string, log *slog.Logger) error {
 		errCh <- serveClusterHTTP(ctx, "scaler", cfg.Member.Listen, cfg.Member.TLS, mux, log)
 	}()
 	svc.Start(ctx)
+	go runScalerRegistryLinks(ctx, regClient, svc, log)
 	go svc.RegisterLoopDynamic(ctx, cfg.Member.ID, cfg.Member.Advertise, func(ctx context.Context) (string, error) {
 		if err := regClient.Refresh(ctx); err != nil {
 			return "", err
@@ -84,6 +88,46 @@ func runScaler(args []string, log *slog.Logger) error {
 	case err := <-errCh:
 		return err
 	}
+}
+
+func runScalerRegistryLinks(ctx context.Context, regClient *clusterclient.Registry, svc *scaler.Service, log *slog.Logger) {
+	t := time.NewTicker(5 * time.Second)
+	defer t.Stop()
+	refresh := func() {
+		if err := regClient.Refresh(ctx); err != nil {
+			log.Warn("scaler: membership refresh", "err", err)
+			return
+		}
+		eps, err := regClient.OwnerEndpoints(ctx)
+		if err != nil {
+			log.Warn("scaler: owner endpoints", "err", err)
+			return
+		}
+		nodeListEps, err := regClient.NodeListEndpoints(ctx)
+		if err != nil {
+			log.Warn("scaler: node_list endpoints", "err", err)
+			return
+		}
+		svc.SetRegistryLinks(ctx, registryLinks(eps))
+		svc.SetNodeListLinks(ctx, registryLinks(nodeListEps))
+	}
+	refresh()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			refresh()
+		}
+	}
+}
+
+func registryLinks(eps []clusterclient.Endpoint) []scaler.RegistryLink {
+	links := make([]scaler.RegistryLink, 0, len(eps))
+	for _, ep := range eps {
+		links = append(links, scaler.RegistryLink{Name: ep.MemberID, BaseURL: ep.BaseURL, Client: ep.Client})
+	}
+	return links
 }
 
 func scalerImportCmd(args []string) error {

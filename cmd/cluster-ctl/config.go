@@ -100,7 +100,6 @@ node_link:
 route_link:
   park_timeout: 30s
 node_list:
-  shard_count: 1024
   watch_retention: 10000
 scale_link:
   scaler_replica_count: 3
@@ -121,6 +120,9 @@ auth:
   api_key: enforce                   # caller api_key auth: off | log | enforce
   data_plane: enforce                # data-plane access-token check: off | log | enforce
   cache_ttl: 60s                     # api_key↔group verification cache
+cache:
+  route_ttl: 5m
+  idle_timeout: 2m
 # metrics_listen: ":9910"            # optional Prometheus text endpoint
 `
 

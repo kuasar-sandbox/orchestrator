@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
-	"time"
 )
 
 // route_link paths. Routers and operator tools dial this link for group-scoped
@@ -47,7 +46,8 @@ func (r *Registry) ServeRouteLink(mux *http.ServeMux) {
 // ready scalers. A 403 hides both a bad key and an unknown group.
 func (r *Registry) serveVerifyKey(w http.ResponseWriter, req *http.Request) {
 	q := req.URL.Query()
-	ok, err := r.VerifyAPIKey(req.Context(), q.Get("group"), req.Header.Get("X-API-KEY"), 3, 2*time.Second)
+	replicas, minReady, timeout := r.scalePolicy()
+	ok, err := r.VerifyAPIKeyWithMinReady(req.Context(), q.Get("group"), req.Header.Get("X-API-KEY"), replicas, minReady, timeout)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusServiceUnavailable) // key provider unavailable → 503
 		return

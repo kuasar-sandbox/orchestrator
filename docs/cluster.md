@@ -71,7 +71,6 @@ route_link:
   park_timeout: 30s
 
 node_list:
-  shard_count: 1024
   watch_retention: 10000
 
 scale_link:
@@ -102,7 +101,7 @@ Registry 成员集由运维配置和 membership version 定义。每个命名空
 |---|---|---|---|
 | `route_link` | group | `LocateN(group,K)` | route 记录、build 执行态;每个 owner 持完整 group 执行态视图 |
 | `node_link` | node_id | `LocateN(node_id,N)` | node 连接、sandbox/build 清单、labels、水位、build 预算;每个 owner 持完整 node 视图 |
-| `node_list` | `__NODE_LIST__#shard` | `LocateN(key,M)` | 低频节点目录与 labels,向 scaler 提供 WATCH_LIST |
+| `node_list` | `node_list` | `LocateN("node_list",M)` | 低频节点目录与 labels;每个 node_list owner 持完整目录和 WATCH_LIST log |
 | `scale_link` | group | `LocateN(group,ready_scalers,R)` | scaler 动态成员域和 Place 故障转移候选 |
 
 `node_link` 中只有当前连接 owner 持有实际 node h2 stream;其余 owner 通过复制持有完整视图。
@@ -235,8 +234,10 @@ provider 删除 group 时不能直接从 import 中消失;必须以 tombstone/dr
 
 ### 7.3 node_list
 
-node_list 不作为真相源迁移。它从 node_link 投影重建。watch token 编入 membership label;label 变化时
-scaler reset + full snapshot。
+node_list 不作为真相源迁移。node-link 连接持有者在 register、draining 变化和低频 liveness refresh 时,
+把 node_link 的低频投影写入当前 node_list owner set。node_list owner 之间持完整目录副本和 watch log;不设计
+后台从 node_link 扫描重建 node_list 的第二条事实传播路径。watch token 编入 membership label;label 变化时
+scaler 重新订阅 node_list owner set 并 reset + full snapshot。新 owner 通过 node-link 持有者的持续低频刷新补齐目录。
 
 ## 8. Route 模型
 
@@ -312,9 +313,9 @@ scaler 负责:
 - `SandboxGroupImporter.Range` 全量/增量导入 group。
 - `SandboxGroupProvider.GetPlacementHint` 构建 group placement cache。
 - `SandboxGroupProvider.GetKey` / `GetAuthKey` 生成 key allocation / auth material intent。
-- 按 active membership 订阅每个 registry 成员的 node_list WATCH_LIST,并在本地合并。
-- 周期性向每个 active registry 成员 `POST /scale-link/register` 发布 ready 状态。
-- 向每个 active registry 成员推送 selector/key allocation patch。
+- 按 active / next membership 订阅 node_list owner 的 WATCH_LIST,并在本地合并。
+- 周期性向每个 active / next registry 成员 `POST /scale-link/register` 发布 ready 状态。
+- 向每个 active / next registry 成员推送 selector/key allocation patch。
 - 对 registry 暴露 `POST /scale-link/place`。
 
 registry 对 group 做 scaler 选择:

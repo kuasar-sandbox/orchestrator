@@ -36,8 +36,9 @@ cluster-ctl scaler import --config /etc/cluster-ctl/scaler.yaml -i groups.jsonl
 | `placement.shuffle_sharding` | shuffle 规则 |
 
 registry 侧的 `scale_link.scaler_replica_count` 控制每个 group 的 scaler failover 候选数量。
-`scale_link` 不再是 registry reverse session。scaler 通过 registry membership 得到 active
-registry 成员与当前 registry label,连接每个 active registry 成员,并在本地 API 提供:
+`scale_link` 不再是 registry reverse session。scaler 通过 registry membership 得到 active / next
+registry 成员、node_list owner set 与当前 registry label,向每个 registry 成员注册 ready 状态,订阅
+node_list owners 的 WATCH_LIST,并在本地 API 提供:
 
 ```text
 POST /scale-link/place
@@ -78,15 +79,15 @@ node_list 由 registry 的 node owner 汇总低频节点字段:
 
 WATCH_LIST 语义:
 
-1. scaler 按 active registry membership 订阅每个 registry 成员的 node_list WATCH_LIST。
+1. scaler 按 active / next registry membership 订阅 node_list owner 的 WATCH_LIST。
 2. 首帧为 snapshot/reset,随后 delta,最后以 bookmark 标记初始视图完整。
 3. watch token 编入 membership label;label 变化或 token fingerprint 不匹配时全量重订。
 4. 高频负载不在该流中传播;普通 heartbeat 只更新 node_link,不会触发 node_list 事件。
 5. draining 变化和粗粒度 liveness 刷新更新 node_list。
 
-scaler 本地按 `node_id` 合并多个 registry 成员的 WATCH_LIST 源。同一 node 出现在多个源时,取
-`last_heartbeat_unix` 最新的记录。首版 ready 门槛是 active registry 成员数的 `N-1` 个源完成
-reset/bookmark,N=1 时要求 1 个源;这与 registry 逻辑分片运行期只容忍单成员故障的目标一致。
+scaler 本地按 `node_id` 合并多个 node_list owner 的 WATCH_LIST 源。同一 node 出现在多个源时,取
+`last_heartbeat_unix` 最新的记录。首版 ready 门槛是 node_list owner 源数量的 `N-1` 个完成
+reset/bookmark,N=1 时要求 1 个源;这与 node_list owner set 运行期只容忍单成员故障的目标一致。
 
 ## 6. Scale-link 成员域
 
@@ -99,7 +100,7 @@ scaler 启动后拉取 registry membership,获得 active label,然后周期性�
 scaler ready 的条件:
 
 - 已拉取当前 registry membership。
-- 必需数量的 registry node_list 源已完成 reset/bookmark。
+- 必需数量的 node_list owner 源已完成 reset/bookmark。
 - group import generation 达到当前要求。
 - provider 可用。
 

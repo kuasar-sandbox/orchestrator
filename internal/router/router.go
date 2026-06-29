@@ -53,6 +53,8 @@ type routeResolve struct {
 	DataEndpoint string `json:"data_endpoint"`
 	AccessToken  string `json:"access_token"`
 	State        string `json:"state"`
+	cachedAt     time.Time
+	lastUsed     time.Time
 }
 
 type activeRoute struct {
@@ -85,8 +87,8 @@ type Router struct {
 	builds   map[string]buildEntry // build_id -> node (a build is node-bound); TTL-evicted
 
 	cacheMu sync.RWMutex
-	cache   map[string]*routeResolve // sid -> resolved data-plane target (local route cache, §5)
-	byKey   map[string]string        // group\x00route_key -> sid (active route cache, no registry watch)
+	cache   map[string]*routeResolve // group\x00route_key\x00sid -> resolved data-plane target
+	byKey   map[string]string        // group\x00route_key -> full route cache key (no registry watch)
 	active  map[string]*activeRoute  // active group/route or sid forwards; survives normal route-cache churn
 
 	reserveMu       sync.Mutex
@@ -95,6 +97,9 @@ type Router struct {
 	authTTL time.Duration
 	authMu  sync.Mutex
 	authOK  map[string]time.Time // group\x00api_key -> cached-valid-until (§8)
+
+	routeTTL         time.Duration
+	routeIdleTimeout time.Duration
 
 	fwdTransport *http.Transport // pooled transport for node (data/control/build) forwards
 
@@ -129,12 +134,14 @@ func New(routeAddr, domain string, authTTL time.Duration, routeTLS *tls.Config, 
 	}
 	rt := &Router{
 		domain: domain, log: log, authTTL: authTTL, authMode: "enforce", mx: metrics.New(),
-		builds:          map[string]buildEntry{},
-		cache:           map[string]*routeResolve{},
-		byKey:           map[string]string{},
-		active:          map[string]*activeRoute{},
-		reserveInFlight: map[string]*reserveFlight{},
-		authOK:          map[string]time.Time{},
+		builds:           map[string]buildEntry{},
+		cache:            map[string]*routeResolve{},
+		byKey:            map[string]string{},
+		active:           map[string]*activeRoute{},
+		reserveInFlight:  map[string]*reserveFlight{},
+		authOK:           map[string]time.Time{},
+		routeTTL:         5 * time.Minute,
+		routeIdleTimeout: 2 * time.Minute,
 	}
 	base, client, err := clusterclient.HTTPBase(routeAddr, routeTLS)
 	if err != nil {
@@ -161,6 +168,16 @@ func NewWithRegistry(reg *clusterclient.Registry, domain string, authTTL time.Du
 // SetDataPlaneAuth sets the data-plane access-token enforcement mode (off | log |
 // enforce); cluster-ctl router sets it from config before serving.
 func (rt *Router) SetDataPlaneAuth(mode string) { rt.dataPlaneAuth = mode }
+
+// SetRouteCache configures local route resolution cache retention. Non-positive
+// values disable that particular age check; active requests remain protected by
+// the active-route map while they are in flight.
+func (rt *Router) SetRouteCache(routeTTL, idleTimeout time.Duration) {
+	rt.cacheMu.Lock()
+	defer rt.cacheMu.Unlock()
+	rt.routeTTL = routeTTL
+	rt.routeIdleTimeout = idleTimeout
+}
 
 // SetAuthMode sets the caller api_key auth mode (off | log | enforce, §8): off
 // skips it (front with an external mTLS/JWT gateway), log warns but allows.
@@ -241,6 +258,7 @@ func (rt *Router) handleCreate(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusCreated)
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"sandboxID":   res.SID,
+		"routeKey":    routeKey,
 		"clientID":    res.NodeID,
 		"accessToken": res.AccessToken,
 		"domain":      rt.domain,
@@ -441,14 +459,15 @@ func (rt *Router) handleList(w http.ResponseWriter, r *http.Request) {
 // resolveRoute returns a sandbox's resolved route via the local cache, falling
 // back to the control API; nil if unknown.
 func (rt *Router) resolveRoute(ctx context.Context, group, routeKey, sid string) *routeResolve {
-	if rr := rt.cachedRoute(sid); rr != nil && routeMatchesIdentity(rr, group, routeKey) {
+	if rr := rt.cachedRoute(group, routeKey, sid); rr != nil && routeMatchesIdentity(rr, group, routeKey) {
 		return rr
 	}
 	if rr, err := rt.routeLinkRoute(ctx, group, routeKey, sid); err == nil {
 		if !routeMatchesIdentity(rr, group, routeKey) {
-			rt.evictRoute(sid)
+			rt.evictRoute(group, routeKey, sid)
 			return nil
 		}
+		rt.rememberRoute(rr)
 		return rr
 	}
 	return nil
@@ -491,20 +510,24 @@ func extractSandboxID(path string) string {
 // --- data plane ---
 
 func (rt *Router) serveData(w http.ResponseWriter, r *http.Request, host string) {
-	// by-(group,route-key): business traffic with no prior create directly triggers
-	// a Reserve (router §4), addressed by headers rather than a <port>-<sid> host.
-	if g, rk := r.Header.Get(HeaderGroup), r.Header.Get(HeaderRouteKey); g != "" && rk != "" {
-		rt.serveDataByKey(w, r, g, rk)
-		return
-	}
 	sub := strings.TrimSuffix(host, "."+rt.domain)
 	if sub == host { // not under our domain
+		// by-(group,route-key): business traffic with no prior create directly
+		// triggers Reserve, addressed by headers rather than a <port>-<sid> host.
+		if g, rk := r.Header.Get(HeaderGroup), r.Header.Get(HeaderRouteKey); g != "" && rk != "" {
+			rt.serveDataByKey(w, r, g, rk)
+			return
+		}
 		http.Error(w, "unknown host", http.StatusNotFound)
 		return
 	}
 	// sub = <port>-<sid>
 	i := strings.IndexByte(sub, '-')
 	if i < 0 {
+		if g, rk := r.Header.Get(HeaderGroup), r.Header.Get(HeaderRouteKey); g != "" && rk != "" {
+			rt.serveDataByKey(w, r, g, rk)
+			return
+		}
 		http.Error(w, "bad data host (want <port>-<sid>.<domain>)", http.StatusBadRequest)
 		return
 	}
@@ -521,7 +544,7 @@ func (rt *Router) serveData(w http.ResponseWriter, r *http.Request, host string)
 	}
 	// Hot path: serve from the local route cache (zero control round-trip, §5). On a
 	// miss (cache lagging / cold), fall back to route_link.
-	rr := rt.cachedRoute(sid)
+	rr := rt.cachedRoute(group, routeKey, sid)
 	if rr != nil && !routeMatchesIdentity(rr, group, routeKey) {
 		rr = nil
 	}
@@ -532,7 +555,7 @@ func (rt *Router) serveData(w http.ResponseWriter, r *http.Request, host string)
 			return
 		}
 		if !routeMatchesIdentity(rr, group, routeKey) {
-			rt.evictRoute(sid)
+			rt.evictRoute(group, routeKey, sid)
 			http.Error(w, "sandbox not found", http.StatusNotFound)
 			return
 		}
@@ -590,7 +613,7 @@ func (rt *Router) forwardSandboxData(w http.ResponseWriter, r *http.Request, rr 
 	proxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, e error) {
 		// A cached route that fails is likely stale (sandbox moved/gone): evict it so
 		// the next request re-resolves via the watch / control (§5 stale → fallback).
-		rt.evictRoute(sid)
+		rt.evictRoute(rr.Group, rr.RouteKey, sid)
 		rt.mx.Inc(`router_requests_total{plane="data",result="bad_gateway"}`)
 		rt.log.Warn("router: data forward", "sid", sid, "node", rr.NodeID, "err", e)
 		http.Error(w, "bad gateway", http.StatusBadGateway)
@@ -646,7 +669,7 @@ func (rt *Router) tunnelData(w http.ResponseWriter, r *http.Request, rr *routeRe
 		if err == nil {
 			code = resp.StatusCode
 		}
-		rt.evictRoute(rr.SID)
+		rt.evictRoute(rr.Group, rr.RouteKey, rr.SID)
 		http.Error(w, "connect refused by node", code)
 		return
 	}
@@ -663,21 +686,29 @@ type bufConn struct {
 
 func (c *bufConn) Read(p []byte) (int, error) { return c.r.Read(p) }
 
-func (rt *Router) evictRoute(sid string) {
+func (rt *Router) evictRoute(group, routeKey, sid string) {
 	rt.cacheMu.Lock()
-	if rr := rt.cache[sid]; rr != nil {
-		delete(rt.byKey, routeCacheKey(rr.Group, rr.RouteKey))
+	key := routeCacheID(group, routeKey, sid)
+	if rr := rt.cache[key]; rr != nil {
+		if routeCacheID(rr.Group, rr.RouteKey, rr.SID) == key {
+			delete(rt.byKey, routeCacheKey(rr.Group, rr.RouteKey))
+		}
 		for _, key := range activeRouteKeys(rr) {
 			delete(rt.active, key)
 		}
 	}
-	delete(rt.active, activeSIDKey(sid))
-	delete(rt.cache, sid)
+	delete(rt.active, activeSIDKey(group, routeKey, sid))
+	delete(rt.cache, key)
 	rt.cacheMu.Unlock()
 }
 
 func routeCacheKey(group, routeKey string) string { return group + "\x00" + routeKey }
-func activeSIDKey(sid string) string              { return "sid\x00" + sid }
+func routeCacheID(group, routeKey, sid string) string {
+	return group + "\x00" + routeKey + "\x00" + sid
+}
+func activeSIDKey(group, routeKey, sid string) string {
+	return "sid\x00" + routeCacheID(group, routeKey, sid)
+}
 
 func activeRouteKeys(rr *routeResolve) []string {
 	if rr == nil {
@@ -687,8 +718,8 @@ func activeRouteKeys(rr *routeResolve) []string {
 	if rr.Group != "" && rr.RouteKey != "" {
 		keys = append(keys, routeCacheKey(rr.Group, rr.RouteKey))
 	}
-	if rr.SID != "" {
-		keys = append(keys, activeSIDKey(rr.SID))
+	if rr.Group != "" && rr.RouteKey != "" && rr.SID != "" {
+		keys = append(keys, activeSIDKey(rr.Group, rr.RouteKey, rr.SID))
 	}
 	return keys
 }
@@ -725,14 +756,17 @@ func (rt *Router) beginActiveRoute(rr *routeResolve) func() {
 }
 
 func (rt *Router) rememberRoute(rr *routeResolve) {
-	if rr == nil || rr.SID == "" {
+	if rr == nil || rr.Group == "" || rr.RouteKey == "" || rr.SID == "" {
 		return
 	}
+	cp := *rr
+	now := time.Now()
+	cp.cachedAt = now
+	cp.lastUsed = now
+	key := routeCacheID(cp.Group, cp.RouteKey, cp.SID)
 	rt.cacheMu.Lock()
-	rt.cache[rr.SID] = rr
-	if rr.Group != "" && rr.RouteKey != "" {
-		rt.byKey[routeCacheKey(rr.Group, rr.RouteKey)] = rr.SID
-	}
+	rt.cache[key] = &cp
+	rt.byKey[routeCacheKey(cp.Group, cp.RouteKey)] = key
 	rt.cacheMu.Unlock()
 }
 
@@ -753,15 +787,15 @@ func newRouteKey() string {
 }
 
 func (rt *Router) cachedRouteByKey(group, routeKey string) *routeResolve {
-	rt.cacheMu.RLock()
-	defer rt.cacheMu.RUnlock()
 	key := routeCacheKey(group, routeKey)
+	rt.cacheMu.Lock()
+	defer rt.cacheMu.Unlock()
 	if ar := rt.active[key]; ar != nil && ar.rr != nil {
 		cp := *ar.rr
 		return &cp
 	}
-	if sid := rt.byKey[key]; sid != "" {
-		return rt.cache[sid]
+	if cacheKey := rt.byKey[key]; cacheKey != "" {
+		return rt.cacheRouteLocked(cacheKey, time.Now())
 	}
 	return nil
 }
@@ -892,14 +926,39 @@ func (rt *Router) routeLinkHTTP(ctx context.Context, group, method, path string,
 
 // --- local route cache ---
 
-func (rt *Router) cachedRoute(sid string) *routeResolve {
-	rt.cacheMu.RLock()
-	defer rt.cacheMu.RUnlock()
-	if ar := rt.active[activeSIDKey(sid)]; ar != nil && ar.rr != nil {
+func (rt *Router) cachedRoute(group, routeKey, sid string) *routeResolve {
+	cacheKey := routeCacheID(group, routeKey, sid)
+	rt.cacheMu.Lock()
+	defer rt.cacheMu.Unlock()
+	if ar := rt.active[activeSIDKey(group, routeKey, sid)]; ar != nil && ar.rr != nil {
 		cp := *ar.rr
 		return &cp
 	}
-	return rt.cache[sid]
+	return rt.cacheRouteLocked(cacheKey, time.Now())
+}
+
+func (rt *Router) cacheRouteLocked(cacheKey string, now time.Time) *routeResolve {
+	rr := rt.cache[cacheKey]
+	if rr == nil {
+		return nil
+	}
+	if rt.routeTTL > 0 && !rr.cachedAt.IsZero() && now.Sub(rr.cachedAt) > rt.routeTTL {
+		delete(rt.cache, cacheKey)
+		if rt.byKey[routeCacheKey(rr.Group, rr.RouteKey)] == cacheKey {
+			delete(rt.byKey, routeCacheKey(rr.Group, rr.RouteKey))
+		}
+		return nil
+	}
+	if rt.routeIdleTimeout > 0 && !rr.lastUsed.IsZero() && now.Sub(rr.lastUsed) > rt.routeIdleTimeout {
+		delete(rt.cache, cacheKey)
+		if rt.byKey[routeCacheKey(rr.Group, rr.RouteKey)] == cacheKey {
+			delete(rt.byKey, routeCacheKey(rr.Group, rr.RouteKey))
+		}
+		return nil
+	}
+	rr.lastUsed = now
+	cp := *rr
+	return &cp
 }
 
 // verifyAuth checks an api key against a group via the control API, caching a
@@ -965,8 +1024,8 @@ func (rt *Router) authorize(w http.ResponseWriter, ctx context.Context, group, a
 	return true
 }
 
-// RunCleanup periodically evicts expired auth-cache and stale build-map entries so
-// neither grows unboundedly over the ingress's lifetime; cluster-ctl router runs it.
+// RunCleanup periodically evicts expired auth-cache and stale route/build entries
+// so local ingress state stays bounded over the process lifetime.
 func (rt *Router) RunCleanup(ctx context.Context) {
 	t := time.NewTicker(time.Minute)
 	defer t.Stop()
@@ -982,6 +1041,22 @@ func (rt *Router) RunCleanup(ctx context.Context) {
 				}
 			}
 			rt.authMu.Unlock()
+			rt.cacheMu.Lock()
+			for key, rr := range rt.cache {
+				if rr == nil {
+					delete(rt.cache, key)
+					continue
+				}
+				expired := rt.routeTTL > 0 && !rr.cachedAt.IsZero() && now.Sub(rr.cachedAt) > rt.routeTTL
+				idle := rt.routeIdleTimeout > 0 && !rr.lastUsed.IsZero() && now.Sub(rr.lastUsed) > rt.routeIdleTimeout
+				if expired || idle {
+					delete(rt.cache, key)
+					if rt.byKey[routeCacheKey(rr.Group, rr.RouteKey)] == key {
+						delete(rt.byKey, routeCacheKey(rr.Group, rr.RouteKey))
+					}
+				}
+			}
+			rt.cacheMu.Unlock()
 			rt.buildsMu.Lock()
 			for k, e := range rt.builds {
 				if now.Sub(e.at) > buildTTL {

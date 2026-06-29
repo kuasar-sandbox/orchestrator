@@ -861,3 +861,16 @@ func TestSweepDeadNodes(t *testing.T) {
 		t.Fatal("connected node's sandbox wrongly reset")
 	}
 }
+
+func TestHTTPScalePlacerHonorsMinReadyScalers(t *testing.T) {
+	ctx := context.Background()
+	reg := testReg(t)
+	reg.setScalerPeer(scalerPeer{ID: "s1", Advertise: "http://127.0.0.1:1", LastSeen: time.Now()})
+	placer := NewHTTPScalePlacerWithMinReady(reg, 1, 2, 100*time.Millisecond)
+	if _, err := placer.Place(ctx, PlaceRequest{Group: "/g", RouteKey: "rk"}); err != ErrNoNode {
+		t.Fatalf("Place with one ready scaler and min_ready=2 err=%v, want ErrNoNode", err)
+	}
+	if _, err := reg.VerifyAPIKeyWithMinReady(ctx, "/g", "key", 1, 2, 100*time.Millisecond); err != ErrNoNode {
+		t.Fatalf("VerifyAPIKey with one ready scaler and min_ready=2 err=%v, want ErrNoNode", err)
+	}
+}

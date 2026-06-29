@@ -52,13 +52,15 @@ func runRegistry(args []string, log *slog.Logger) error {
 		return err
 	}
 	stores.SetNodeListHeartbeatRefresh(nodeListHeartbeatRefresh(cfg.NodeLink.NodeDeadDur()))
+	stores.SetNodeListWatchRetention(cfg.NodeList.WatchRetention)
 
 	reg := registry.New(stores, nil, cfg.RouteLink.ParkDur(), log)
 	reg.SetRemoteNodeOwners(remoteNodeOwners)
 	if active, ok := cfg.Membership.ActiveVersion(); ok {
 		reg.SetScaleReadyLabel(active.Label)
 	}
-	reg.SetPlacer(registry.NewHTTPScalePlacer(reg, cfg.ScaleLink.ScalerReplicaCount, cfg.ScaleLink.PlaceDur()))
+	reg.SetScalePolicy(cfg.ScaleLink.ScalerReplicaCount, cfg.ScaleLink.MinReadyScalers, cfg.ScaleLink.PlaceDur())
+	reg.SetPlacer(registry.NewHTTPScalePlacerWithMinReady(reg, cfg.ScaleLink.ScalerReplicaCount, cfg.ScaleLink.MinReadyScalers, cfg.ScaleLink.PlaceDur()))
 	cfgState := newRegistryRuntimeConfig(cfg)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -149,6 +151,9 @@ func mountRegistryControl(mux *http.ServeMux, reg *registry.Registry, cfgState *
 	mux.HandleFunc(clusterstate.NodeReplicaRPCPath, func(w http.ResponseWriter, req *http.Request) {
 		clusterstate.ServeNodeReplica(w, req, reg.Stores().LocalNodeReplica())
 	})
+	mux.HandleFunc(registry.NodeListReplicaRPCPath, func(w http.ResponseWriter, req *http.Request) {
+		registry.ServeNodeListReplica(w, req, reg.Stores())
+	})
 	mux.HandleFunc(registry.NodeOwnerRPCPath, func(w http.ResponseWriter, req *http.Request) {
 		registry.ServeNodeOwner(w, req, reg.LocalNodeOwner())
 	})
@@ -221,18 +226,21 @@ func reloadRegistryConfig(ctx context.Context, cfgPath string, old *clustercfg.R
 	if !ok {
 		return fmt.Errorf("registry reload: active membership %d not found", next.Membership.Active)
 	}
-	views, routeReplicas, nodeReplicas, nodeOwners, err := buildRegistryTopology(next)
+	views, routeReplicas, nodeReplicas, nodeListReplicas, nodeOwners, err := buildRegistryTopology(next)
 	if err != nil {
 		return err
 	}
 	reg.Stores().SetClusterTopology(views,
 		next.Membership.Owners.RouteLink, next.Membership.Owners.NodeLink,
 		routeReplicas, nodeReplicas)
+	reg.Stores().SetNodeListTopology(views, next.Membership.Owners.NodeList, nodeListReplicas)
 	reg.Stores().SetMembershipVersion(active.Version)
 	reg.Stores().SetNodeListHeartbeatRefresh(nodeListHeartbeatRefresh(next.NodeLink.NodeDeadDur()))
+	reg.Stores().SetNodeListWatchRetention(next.NodeList.WatchRetention)
 	reg.SetRemoteNodeOwners(nodeOwners)
 	reg.SetScaleReadyLabel(active.Label)
-	reg.SetPlacer(registry.NewHTTPScalePlacer(reg, next.ScaleLink.ScalerReplicaCount, next.ScaleLink.PlaceDur()))
+	reg.SetScalePolicy(next.ScaleLink.ScalerReplicaCount, next.ScaleLink.MinReadyScalers, next.ScaleLink.PlaceDur())
+	reg.SetPlacer(registry.NewHTTPScalePlacerWithMinReady(reg, next.ScaleLink.ScalerReplicaCount, next.ScaleLink.MinReadyScalers, next.ScaleLink.PlaceDur()))
 	cfgState.set(next)
 	return nil
 }
@@ -256,18 +264,19 @@ func newRegistryStores(kv clusterstore.Store, cfg *clustercfg.RegistryConfig) (*
 	if !ok {
 		return nil, nil, fmt.Errorf("registry: active membership %d not found", cfg.Membership.Active)
 	}
-	views, routeReplicas, nodeReplicas, nodeOwners, err := buildRegistryTopology(cfg)
+	views, routeReplicas, nodeReplicas, nodeListReplicas, nodeOwners, err := buildRegistryTopology(cfg)
 	if err != nil {
 		return nil, nil, err
 	}
 	stores := registry.NewClusterStoresWithViews(kv, cfg.Member.ID, views,
 		cfg.Membership.Owners.RouteLink, cfg.Membership.Owners.NodeLink,
 		routeReplicas, nodeReplicas)
+	stores.SetNodeListTopology(views, cfg.Membership.Owners.NodeList, nodeListReplicas)
 	stores.SetMembershipVersion(active.Version)
 	return stores, nodeOwners, nil
 }
 
-func buildRegistryTopology(cfg *clustercfg.RegistryConfig) ([]clusterstate.MemberView, map[string]clusterstate.RouteReplica, map[string]clusterstate.NodeReplica, map[string]registry.NodeOwner, error) {
+func buildRegistryTopology(cfg *clustercfg.RegistryConfig) ([]clusterstate.MemberView, map[string]clusterstate.RouteReplica, map[string]clusterstate.NodeReplica, map[string]registry.NodeListReplica, map[string]registry.NodeOwner, error) {
 	versions := cfg.Membership.OwnerVersions()
 	views := make([]clusterstate.MemberView, 0, len(versions))
 	for _, version := range versions {
@@ -275,6 +284,7 @@ func buildRegistryTopology(cfg *clustercfg.RegistryConfig) ([]clusterstate.Membe
 	}
 	routeReplicas := map[string]clusterstate.RouteReplica{}
 	nodeReplicas := map[string]clusterstate.NodeReplica{}
+	nodeListReplicas := map[string]registry.NodeListReplica{}
 	nodeOwners := map[string]registry.NodeOwner{}
 	for _, member := range unionMembershipMembers(versions) {
 		if member.ID == "" || member.ID == cfg.Member.ID {
@@ -282,14 +292,15 @@ func buildRegistryTopology(cfg *clustercfg.RegistryConfig) ([]clusterstate.Membe
 		}
 		base, client, err := registryMemberClient(member.Advertise, cfg.Member.TLS)
 		if err != nil {
-			return nil, nil, nil, nil, fmt.Errorf("registry: member %q: %w", member.ID, err)
+			return nil, nil, nil, nil, nil, fmt.Errorf("registry: member %q: %w", member.ID, err)
 		}
 		health := clusterstate.NewReplicaHealth(2 * time.Second)
 		routeReplicas[member.ID] = clusterstate.NewHTTPRouteReplicaWithHealth(base, client, health)
 		nodeReplicas[member.ID] = clusterstate.NewHTTPNodeReplicaWithHealth(base, client, health)
+		nodeListReplicas[member.ID] = registry.NewHTTPNodeListReplica(base, client)
 		nodeOwners[member.ID] = registry.NewHTTPNodeOwner(base, client)
 	}
-	return views, routeReplicas, nodeReplicas, nodeOwners, nil
+	return views, routeReplicas, nodeReplicas, nodeListReplicas, nodeOwners, nil
 }
 
 func unionMembershipMembers(versions []clustercfg.MembershipVersion) []clustercfg.MembershipMember {

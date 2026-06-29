@@ -29,7 +29,6 @@ route_link:
   park_timeout: 30s
 
 node_list:
-  shard_count: 1024
   watch_retention: 10000
 
 scale_link:

@@ -81,7 +81,6 @@ type RouteLinkConfig struct {
 }
 
 type NodeListConfig struct {
-	ShardCount     int `yaml:"shard_count"`
 	WatchRetention int `yaml:"watch_retention"`
 }
 
@@ -111,6 +110,12 @@ type RouterAuth struct {
 	APIKey    string `yaml:"api_key"`    // caller api_key auth: off | log | enforce (default); §8
 	DataPlane string `yaml:"data_plane"` // data-plane access-token check: off | log | enforce (default)
 	CacheTTL  string `yaml:"cache_ttl"`  // api_key↔group verification cache; default 60s
+}
+
+// RouterCache configures local route resolution and active-route cache retention.
+type RouterCache struct {
+	RouteTTL    string `yaml:"route_ttl"`    // route resolution max age; default 5m
+	IdleTimeout string `yaml:"idle_timeout"` // route resolution idle age; default 2m
 }
 
 // PlacementConfig groups the scaler's placement policy.
@@ -344,7 +349,7 @@ func DefaultRegistry() RegistryConfig {
 		},
 		NodeLink:  NodeLinkConfig{HeartbeatInterval: "10s", NodeDeadAfter: "30s", RevisionRetention: 10000},
 		RouteLink: RouteLinkConfig{ParkTimeout: "30s"},
-		NodeList:  NodeListConfig{ShardCount: 1024, WatchRetention: 10000},
+		NodeList:  NodeListConfig{WatchRetention: 10000},
 		ScaleLink: ScaleLinkConfig{ScalerReplicaCount: 3, MinReadyScalers: 1, PlaceTimeout: "2s"},
 	}
 }
@@ -416,9 +421,6 @@ func (c *RegistryConfig) applyDefaults() {
 	}
 	if c.RouteLink.ParkTimeout == "" {
 		c.RouteLink.ParkTimeout = d.RouteLink.ParkTimeout
-	}
-	if c.NodeList.ShardCount == 0 {
-		c.NodeList.ShardCount = d.NodeList.ShardCount
 	}
 	if c.NodeList.WatchRetention == 0 {
 		c.NodeList.WatchRetention = d.NodeList.WatchRetention
@@ -496,9 +498,6 @@ func (c *RegistryConfig) Validate() error {
 	if c.NodeLink.RevisionRetention <= 0 {
 		return fmt.Errorf("clustercfg: node_link.revision_retention must be positive")
 	}
-	if c.NodeList.ShardCount <= 0 {
-		return fmt.Errorf("clustercfg: node_list.shard_count must be positive")
-	}
 	if c.NodeList.WatchRetention <= 0 {
 		return fmt.Errorf("clustercfg: node_list.watch_retention must be positive")
 	}
@@ -555,6 +554,7 @@ type RouterConfig struct {
 	Registry      RegistryDialConfig `yaml:"registry"`       // upstream: registry bootstrap/membership
 	Ingress       IngressConfig      `yaml:"ingress"`        // downstream: e2b client ingress
 	Auth          RouterAuth         `yaml:"auth"`           // auth policy
+	Cache         RouterCache        `yaml:"cache"`          // local route cache policy
 	MetricsListen string             `yaml:"metrics_listen"` // optional Prometheus text endpoint
 }
 
@@ -564,6 +564,7 @@ func DefaultRouter() RouterConfig {
 		Registry: RegistryDialConfig{Bootstrap: defaultRegistryBootstrap},
 		Ingress:  IngressConfig{Listen: ":443"},
 		Auth:     RouterAuth{APIKey: "enforce", DataPlane: "enforce", CacheTTL: "60s"},
+		Cache:    RouterCache{RouteTTL: "5m", IdleTimeout: "2m"},
 	}
 }
 
@@ -603,6 +604,12 @@ func (c *RouterConfig) applyDefaults() {
 	if c.Auth.CacheTTL == "" {
 		c.Auth.CacheTTL = d.Auth.CacheTTL
 	}
+	if c.Cache.RouteTTL == "" {
+		c.Cache.RouteTTL = d.Cache.RouteTTL
+	}
+	if c.Cache.IdleTimeout == "" {
+		c.Cache.IdleTimeout = d.Cache.IdleTimeout
+	}
 }
 
 func (c *RouterConfig) Validate() error {
@@ -622,11 +629,25 @@ func (c *RouterConfig) Validate() error {
 	default:
 		return fmt.Errorf("clustercfg: auth.data_plane %q invalid (off|log|enforce)", c.Auth.DataPlane)
 	}
-	return validateDurations(map[string]string{"auth.cache_ttl": c.Auth.CacheTTL})
+	return validateDurations(map[string]string{
+		"auth.cache_ttl":     c.Auth.CacheTTL,
+		"cache.route_ttl":    c.Cache.RouteTTL,
+		"cache.idle_timeout": c.Cache.IdleTimeout,
+	})
 }
 
 func (c *RouterConfig) AuthCacheDur() time.Duration {
 	d, _ := time.ParseDuration(c.Auth.CacheTTL)
+	return d
+}
+
+func (c *RouterConfig) RouteCacheDur() time.Duration {
+	d, _ := time.ParseDuration(c.Cache.RouteTTL)
+	return d
+}
+
+func (c *RouterConfig) RouteIdleDur() time.Duration {
+	d, _ := time.ParseDuration(c.Cache.IdleTimeout)
 	return d
 }
 

@@ -70,13 +70,69 @@ func TestCreateGeneratesRouteKeyWhenHeaderMissing(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		var out struct {
+			RouteKey string `json:"routeKey"`
+		}
+		_ = json.NewDecoder(resp.Body).Decode(&out)
 		resp.Body.Close()
 		if resp.StatusCode != http.StatusCreated {
 			t.Fatalf("create %d status=%d, want 201", i, resp.StatusCode)
 		}
+		if out.RouteKey == "" {
+			t.Fatalf("create %d omitted generated routeKey in response", i)
+		}
 	}
 	if len(routeKeys) != 2 || routeKeys[0] == "" || routeKeys[1] == "" || routeKeys[0] == routeKeys[1] {
 		t.Fatalf("generated route keys=%v, want two non-empty unique values", routeKeys)
+	}
+}
+
+func TestServeDataSidHostDoesNotUseByKeyReserve(t *testing.T) {
+	var reserveHits int
+	var routeHits int
+	var gotHost string
+	node := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHost = r.Host
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer node.Close()
+	nodeHost := strings.TrimPrefix(node.URL, "http://")
+	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/route-link/reserve":
+			reserveHits++
+			_ = json.NewEncoder(w).Encode(reserveResult{NodeID: "n1", SID: "wrong", AccessToken: "tok", DataEndpoint: nodeHost})
+		case "/route-link/route":
+			routeHits++
+			_ = json.NewEncoder(w).Encode(routeResolve{SID: "sb-1", Group: "/g", RouteKey: "rk", NodeID: "n1", DataEndpoint: nodeHost, AccessToken: "tok", State: "ready"})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer control.Close()
+	rt := New(strings.TrimPrefix(control.URL, "http://"), "test.local", 0, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	rt.SetAuthMode("off")
+	rt.SetDataPlaneAuth("off")
+	srv := httptest.NewServer(rt.Handler())
+	defer srv.Close()
+
+	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/health", nil)
+	req.Host = "49983-sb-1.test.local"
+	req.Header.Set(HeaderGroup, "/g")
+	req.Header.Set(HeaderRouteKey, "rk")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("sid-host data status=%d, want 204", resp.StatusCode)
+	}
+	if routeHits != 1 || reserveHits != 0 {
+		t.Fatalf("routeHits=%d reserveHits=%d, want route only", routeHits, reserveHits)
+	}
+	if gotHost != "49983-sb-1.test.local" {
+		t.Fatalf("node saw Host=%q, want original sid host", gotHost)
 	}
 }
 

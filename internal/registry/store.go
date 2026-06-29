@@ -88,11 +88,16 @@ type Stores struct {
 	replicaMu       sync.RWMutex
 
 	nodeListMu                  sync.Mutex
+	nodeList                    map[string]clusterstate.NodeListEntry
 	nodeListRev                 int64
 	nodeListLog                 []clusterstore.Event
 	nodeListSubs                map[int]chan clusterstore.Event
 	nodeListSeq                 int
+	nodeListRetention           int
 	nodeListHeartbeatRefreshSec int64
+	nodeListOwnerCount          int
+	nodeListReplicas            map[string]NodeListReplica
+	nodeListTopologySet         bool
 
 	handoffMu        sync.RWMutex
 	membershipVer    int64
@@ -155,8 +160,12 @@ func NewClusterStores(
 		localNode:                   localNode,
 		routeReplicas:               rreps,
 		nodeReplicas:                nreps,
+		nodeList:                    map[string]clusterstate.NodeListEntry{},
 		nodeListSubs:                map[int]chan clusterstore.Event{},
+		nodeListRetention:           10000,
 		nodeListHeartbeatRefreshSec: defaultNodeListHeartbeatRefreshSec,
+		nodeListOwnerCount:          1,
+		nodeListReplicas:            map[string]NodeListReplica{writerID: nil},
 		membershipVer:               view.Version,
 		routeHandoffGate:            map[string]clusterstate.HandoffGate{},
 		nodeHandoffGate:             map[string]clusterstate.HandoffGate{},
@@ -192,6 +201,19 @@ func (s *Stores) SetNodeListHeartbeatRefresh(d time.Duration) {
 	}
 	s.nodeListMu.Lock()
 	s.nodeListHeartbeatRefreshSec = sec
+	s.nodeListMu.Unlock()
+}
+
+func (s *Stores) SetNodeListWatchRetention(n int) {
+	if n <= 0 {
+		n = 10000
+	}
+	s.nodeListMu.Lock()
+	s.nodeListRetention = n
+	if len(s.nodeListLog) > n {
+		copy(s.nodeListLog, s.nodeListLog[len(s.nodeListLog)-n:])
+		s.nodeListLog = s.nodeListLog[:n]
+	}
 	s.nodeListMu.Unlock()
 }
 
@@ -281,6 +303,37 @@ func (s *Stores) SetClusterTopology(
 	s.replicaMu.Unlock()
 }
 
+func (s *Stores) SetNodeListTopology(views []clusterstate.MemberView, ownerCount int, replicas map[string]NodeListReplica) {
+	cleanViews := make([]clusterstate.MemberView, 0, len(views))
+	seenVersion := map[int64]bool{}
+	for _, view := range views {
+		if len(view.Members) == 0 || seenVersion[view.Version] {
+			continue
+		}
+		seenVersion[view.Version] = true
+		cleanViews = append(cleanViews, view)
+	}
+	if len(cleanViews) == 0 {
+		return
+	}
+	if ownerCount <= 0 {
+		ownerCount = 1
+	}
+	reps := make(map[string]NodeListReplica, len(replicas)+1)
+	for id, rep := range replicas {
+		if id != "" && id != s.writerID && rep != nil {
+			reps[id] = rep
+		}
+	}
+	reps[s.writerID] = s
+	s.replicaMu.Lock()
+	s.memberViews = cleanViews
+	s.nodeListOwnerCount = ownerCount
+	s.nodeListReplicas = reps
+	s.nodeListTopologySet = true
+	s.replicaMu.Unlock()
+}
+
 func (s *Stores) routeQuorum(group string) (*clusterstate.RouteQuorum, error) {
 	s.replicaMu.RLock()
 	defer s.replicaMu.RUnlock()
@@ -315,6 +368,27 @@ func (s *Stores) nodeQuorum(nodeID string) (*clusterstate.NodeQuorum, error) {
 		reps = append(reps, clusterstate.NodeReplicaSlot{ID: id, Replica: rep})
 	}
 	return clusterstate.NewNodeJointQuorum(s.writerID, reps, ownerSets), nil
+}
+
+func (s *Stores) nodeListOwners() ([][]string, []string, error) {
+	s.replicaMu.RLock()
+	if !s.nodeListTopologySet {
+		writer := s.writerID
+		s.replicaMu.RUnlock()
+		return [][]string{{writer}}, []string{writer}, nil
+	}
+	defer s.replicaMu.RUnlock()
+	return locatedOwnerSets(s.memberViews, clusterstate.NamespaceNodeList, s.nodeListOwnerCount)
+}
+
+func (s *Stores) nodeListReplica(id string) NodeListReplica {
+	if id == s.writerID {
+		return s
+	}
+	s.replicaMu.RLock()
+	rep := s.nodeListReplicas[id]
+	s.replicaMu.RUnlock()
+	return rep
 }
 
 func locatedOwnerSets(views []clusterstate.MemberView, key string, ownerCount int) ([][]string, []string, error) {
@@ -486,7 +560,7 @@ func (s *Stores) DeleteNode(ctx context.Context, id string) error {
 			return err
 		}
 	}
-	return s.publishNodeListDelete(ctx, id)
+	return s.DeleteNodeList(ctx, id)
 }
 
 // RangeNodes streams every node record (read-only callback).
@@ -508,7 +582,7 @@ func (s *Stores) RangeNodes(ctx context.Context, fn func(*NodeRecord) error) err
 
 func (s *Stores) PutNodeList(ctx context.Context, n *NodeRecord) error {
 	entry := projectNodeListRecord(n)
-	return s.publishNodeListPut(ctx, entry)
+	return s.PutNodeListEntry(ctx, entry)
 }
 
 func (s *Stores) putNodeLink(ctx context.Context, n *NodeRecord) (uint64, error) {
@@ -540,6 +614,10 @@ func projectNodeListRecord(n *NodeRecord) clusterstate.NodeListEntry {
 	return clusterstate.ProjectNodeList(toClusterNode(n))
 }
 
+func nodeListEntryNewer(next, cur clusterstate.NodeListEntry) bool {
+	return next.LastHeartbeatUnix >= cur.LastHeartbeatUnix
+}
+
 func (s *Stores) NodeListRev(ctx context.Context) (int64, error) {
 	if err := ctx.Err(); err != nil {
 		return 0, err
@@ -550,9 +628,22 @@ func (s *Stores) NodeListRev(ctx context.Context) (int64, error) {
 }
 
 func (s *Stores) RangeNodeList(ctx context.Context, fn func(clusterstate.NodeListEntry) error) error {
-	return s.RangeNodes(ctx, func(n *NodeRecord) error {
-		return fn(projectNodeListRecord(n))
-	})
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.nodeListMu.Lock()
+	out := make([]clusterstate.NodeListEntry, 0, len(s.nodeList))
+	for _, entry := range s.nodeList {
+		out = append(out, entry)
+	}
+	s.nodeListMu.Unlock()
+	sort.Slice(out, func(i, j int) bool { return out[i].NodeID < out[j].NodeID })
+	for _, entry := range out {
+		if err := fn(entry); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *Stores) WatchNodeList(ctx context.Context, fromRev int64) (<-chan clusterstore.Event, error) {
@@ -589,35 +680,123 @@ func (s *Stores) WatchNodeList(ctx context.Context, fromRev int64) (<-chan clust
 	return ch, nil
 }
 
-func (s *Stores) publishNodeListPut(ctx context.Context, entry clusterstate.NodeListEntry) error {
+func (s *Stores) PutNodeListEntry(ctx context.Context, entry clusterstate.NodeListEntry) error {
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	if entry.NodeID == "" {
+		return fmt.Errorf("registry: node_list node_id is required")
+	}
+	return s.replicateNodeList(ctx, func(rep NodeListReplica) error {
+		return rep.ApplyNodeListPut(ctx, entry)
+	})
+}
+
+func (s *Stores) DeleteNodeList(ctx context.Context, nodeID string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if nodeID == "" {
+		return nil
+	}
+	return s.replicateNodeList(ctx, func(rep NodeListReplica) error {
+		return rep.ApplyNodeListDelete(ctx, nodeID)
+	})
+}
+
+func (s *Stores) replicateNodeList(ctx context.Context, apply func(NodeListReplica) error) error {
+	ownerSets, ownerUnion, err := s.nodeListOwners()
+	if err != nil {
+		return err
+	}
+	accepted := map[string]bool{}
+	var last error
+	for _, id := range ownerUnion {
+		rep := s.nodeListReplica(id)
+		if rep == nil {
+			last = fmt.Errorf("registry: node_list replica %q unavailable", id)
+			continue
+		}
+		if err := apply(rep); err != nil {
+			last = err
+			continue
+		}
+		accepted[id] = true
+	}
+	if !satisfiesOwnerQuorums(accepted, ownerSets) {
+		if last != nil {
+			return last
+		}
+		return clusterstate.ErrQuorum
+	}
+	return nil
+}
+
+func satisfiesOwnerQuorums(accepted map[string]bool, ownerSets [][]string) bool {
+	for _, owners := range ownerSets {
+		need := len(owners)/2 + 1
+		got := 0
+		for _, id := range owners {
+			if accepted[id] {
+				got++
+			}
+		}
+		if got < need {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *Stores) ApplyNodeListPut(ctx context.Context, entry clusterstate.NodeListEntry) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if entry.NodeID == "" {
+		return fmt.Errorf("registry: node_list node_id is required")
 	}
 	b, err := json.Marshal(entry)
 	if err != nil {
 		return err
 	}
-	s.publishNodeListEvent(clusterstore.Event{Type: clusterstore.EventPut, Key: entry.NodeID, Value: b})
-	return nil
+	return s.publishNodeListEvent(clusterstore.Event{Type: clusterstore.EventPut, Key: entry.NodeID, Value: b}, &entry)
 }
 
-func (s *Stores) publishNodeListDelete(ctx context.Context, nodeID string) error {
+func (s *Stores) ApplyNodeListDelete(ctx context.Context, nodeID string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	s.publishNodeListEvent(clusterstore.Event{Type: clusterstore.EventDelete, Key: nodeID})
-	return nil
+	if nodeID == "" {
+		return nil
+	}
+	return s.publishNodeListEvent(clusterstore.Event{Type: clusterstore.EventDelete, Key: nodeID}, nil)
 }
 
-func (s *Stores) publishNodeListEvent(ev clusterstore.Event) {
+func (s *Stores) publishNodeListEvent(ev clusterstore.Event, entry *clusterstate.NodeListEntry) error {
 	s.nodeListMu.Lock()
 	defer s.nodeListMu.Unlock()
+	switch ev.Type {
+	case clusterstore.EventPut:
+		if entry == nil {
+			return fmt.Errorf("registry: node_list put missing entry")
+		}
+		if cur, ok := s.nodeList[entry.NodeID]; ok && !nodeListEntryNewer(*entry, cur) {
+			return nil
+		}
+		s.nodeList[entry.NodeID] = *entry
+	case clusterstore.EventDelete:
+		delete(s.nodeList, ev.Key)
+	}
 	s.nodeListRev++
 	ev.Rev = s.nodeListRev
 	s.nodeListLog = append(s.nodeListLog, ev)
-	if len(s.nodeListLog) > 10000 {
-		copy(s.nodeListLog, s.nodeListLog[len(s.nodeListLog)-10000:])
-		s.nodeListLog = s.nodeListLog[:10000]
+	retention := s.nodeListRetention
+	if retention <= 0 {
+		retention = 10000
+	}
+	if len(s.nodeListLog) > retention {
+		copy(s.nodeListLog, s.nodeListLog[len(s.nodeListLog)-retention:])
+		s.nodeListLog = s.nodeListLog[:retention]
 	}
 	for id, ch := range s.nodeListSubs {
 		select {
@@ -627,6 +806,7 @@ func (s *Stores) publishNodeListEvent(ev clusterstore.Event) {
 			close(ch)
 		}
 	}
+	return nil
 }
 
 // --- route_link ---

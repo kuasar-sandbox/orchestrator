@@ -27,7 +27,12 @@ import (
 // views synced, computes placement over the local view, and returns suggestions
 // that the registry commits through route/node owner state.
 type Service struct {
-	links     []RegistryLink
+	linksMu     sync.RWMutex
+	links       []RegistryLink
+	watchLinks  []RegistryLink
+	watchCancel map[string]context.CancelFunc
+	startedCtx  context.Context
+
 	cfg       clustercfg.PlacementConfig
 	deadAfter int64 // node_dead_after seconds (node-alive eligibility, §4.2)
 	log       *slog.Logger
@@ -54,7 +59,8 @@ func NewRemoteLinks(links []RegistryLink, cfg clustercfg.PlacementConfig, deadAf
 	}
 	links = normalizeRegistryLinks(links)
 	return &Service{
-		links: links, cfg: cfg, deadAfter: deadAfter, log: log,
+		links: links, watchLinks: links, watchCancel: map[string]context.CancelFunc{},
+		cfg: cfg, deadAfter: deadAfter, log: log,
 		nodes:  newNodeView(minReadyLinks(len(links))),
 		groups: newGroupStore(),
 	}
@@ -133,11 +139,74 @@ func minReadyLinks(n int) int {
 // registry. node_list is low-frequency catalog data; hot load/budget is validated
 // by registry/node owner on the cold placement path.
 func (s *Service) Start(ctx context.Context) {
-	for _, link := range s.links {
-		link := link
-		go s.subscribe(ctx, link, registry.ScaleLinkNodeListWatchPath, s.nodes.source(link.Name))
+	s.linksMu.Lock()
+	if s.startedCtx == nil {
+		s.startedCtx = ctx
+		for _, link := range s.watchLinks {
+			s.startWatchLinkLocked(ctx, link)
+		}
 	}
+	s.linksMu.Unlock()
 	go s.reconcileKeyAllocations(ctx)
+}
+
+func (s *Service) SetRegistryLinks(ctx context.Context, links []RegistryLink) {
+	links = normalizeRegistryLinks(links)
+	s.linksMu.Lock()
+	defer s.linksMu.Unlock()
+	s.links = links
+}
+
+func (s *Service) SetNodeListLinks(ctx context.Context, links []RegistryLink) {
+	links = normalizeRegistryLinks(links)
+	s.linksMu.Lock()
+	defer s.linksMu.Unlock()
+	old := make(map[string]RegistryLink, len(s.watchLinks))
+	for _, link := range s.watchLinks {
+		old[link.Name] = link
+	}
+	next := make(map[string]RegistryLink, len(links))
+	for _, link := range links {
+		next[link.Name] = link
+		if cur, ok := old[link.Name]; ok && cur.BaseURL == link.BaseURL {
+			continue
+		}
+		if cancel := s.watchCancel[link.Name]; cancel != nil {
+			cancel()
+			delete(s.watchCancel, link.Name)
+			s.nodes.removeSource(link.Name)
+		}
+		if s.startedCtx != nil {
+			s.startWatchLinkLocked(ctx, link)
+		}
+	}
+	for name := range old {
+		if _, ok := next[name]; ok {
+			continue
+		}
+		if cancel := s.watchCancel[name]; cancel != nil {
+			cancel()
+			delete(s.watchCancel, name)
+		}
+		s.nodes.removeSource(name)
+	}
+	s.watchLinks = links
+	s.nodes.setMinReady(minReadyLinks(len(links)))
+}
+
+func (s *Service) RegistryLinks() []RegistryLink {
+	s.linksMu.RLock()
+	defer s.linksMu.RUnlock()
+	return append([]RegistryLink(nil), s.links...)
+}
+
+func (s *Service) startWatchLinkLocked(ctx context.Context, link RegistryLink) {
+	if _, exists := s.watchCancel[link.Name]; exists {
+		return
+	}
+	wctx, cancel := context.WithCancel(ctx)
+	s.watchCancel[link.Name] = cancel
+	go s.subscribe(wctx, link, registry.ScaleLinkNodeListWatchPath, s.nodes.source(link.Name))
 }
 
 func (s *Service) ServeScaleLink(mux *http.ServeMux) {
@@ -221,7 +290,7 @@ func (s *Service) RegisterLoopDynamic(ctx context.Context, id, advertise string,
 				s.log.Warn("scaler: ready label", "err", err)
 			}
 		}
-		for _, link := range s.links {
+		for _, link := range s.RegistryLinks() {
 			if err := s.postJSON(ctx, link, registry.ScaleLinkRegisterPath, registry.ScalerRegister{ID: id, Advertise: advertise, ReadyLabel: label}); err != nil {
 				s.log.Warn("scaler: register", "registry", link.Name, "err", err)
 			}
@@ -337,7 +406,7 @@ func (s *Service) reconcileKeyAllocations(ctx context.Context) {
 					Group: g.Group, Selectors: selectors, NodeIDs: nodeIDs, NodeAllocation: true,
 					KeyFingerprint: fp, ManifestKeyType: keyType, ManifestKey: keyValue, ManifestKeyRef: keyRef,
 				}
-				for _, link := range s.links {
+				for _, link := range s.RegistryLinks() {
 					if last[link.Name] == nil {
 						last[link.Name] = map[string]string{}
 					}
@@ -374,8 +443,9 @@ func (s *Service) reconcileKeyAllocations(ctx context.Context) {
 }
 
 func (s *Service) linksByName() map[string]RegistryLink {
-	out := make(map[string]RegistryLink, len(s.links))
-	for _, link := range s.links {
+	links := s.RegistryLinks()
+	out := make(map[string]RegistryLink, len(links))
+	for _, link := range links {
 		out[link.Name] = link
 	}
 	return out
@@ -563,6 +633,21 @@ func (v *nodeView) source(name string) viewSink {
 	v.ensureLocked(name)
 	v.mu.Unlock()
 	return nodeViewSink{view: v, source: name}
+}
+
+func (v *nodeView) setMinReady(n int) {
+	if n < 1 {
+		n = 1
+	}
+	v.mu.Lock()
+	v.minReady = n
+	v.mu.Unlock()
+}
+
+func (v *nodeView) removeSource(name string) {
+	v.mu.Lock()
+	delete(v.sources, name)
+	v.mu.Unlock()
 }
 
 func (v *nodeView) ensureLocked(name string) *nodeSource {

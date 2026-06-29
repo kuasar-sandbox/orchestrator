@@ -33,7 +33,7 @@ func TestLoadRegistryPartialAppliesDefaults(t *testing.T) {
 	if c.NodeLink.RevisionRetention != 10000 || c.NodeLink.HeartbeatInterval != "10s" {
 		t.Fatalf("node_link defaults not filled: %+v", c.NodeLink)
 	}
-	if c.RouteLink.ParkTimeout != "30s" || c.NodeList.ShardCount != 1024 || c.ScaleLink.PlaceTimeout != "2s" {
+	if c.RouteLink.ParkTimeout != "30s" || c.NodeList.WatchRetention != 10000 || c.ScaleLink.PlaceTimeout != "2s" {
 		t.Fatalf("link defaults not filled: route=%+v node_list=%+v scale=%+v", c.RouteLink, c.NodeList, c.ScaleLink)
 	}
 }

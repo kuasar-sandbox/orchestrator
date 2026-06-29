@@ -261,6 +261,65 @@ func TestNodeListHeartbeatRefreshIsConfigurable(t *testing.T) {
 	}
 }
 
+func TestNodeListReplicatesToLocatedOwnerSet(t *testing.T) {
+	ctx := context.Background()
+	view := clusterstate.MemberView{Version: 1, Members: []string{"a", "b", "c"}}
+	rb, rc := &nodeListReplicaRecorder{entries: map[string]clusterstate.NodeListEntry{}}, &nodeListReplicaRecorder{entries: map[string]clusterstate.NodeListEntry{}}
+	kv := clusterstore.OpenMemory(100)
+	defer kv.Close()
+	stores := NewClusterStores(kv, "a", view, 1, 1, nil, nil)
+	stores.SetNodeListTopology([]clusterstate.MemberView{view}, 2, map[string]NodeListReplica{"b": rb, "c": rc})
+
+	entry := clusterstate.NodeListEntry{NodeID: "n1", Labels: map[string]string{"pool": "p"}, LastHeartbeatUnix: time.Now().Unix()}
+	if err := stores.PutNodeListEntry(ctx, entry); err != nil {
+		t.Fatalf("PutNodeListEntry: %v", err)
+	}
+	owners, err := view.Owners(clusterstate.NamespaceNodeList, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reps := map[string]func() bool{
+		"a": func() bool {
+			found := false
+			_ = stores.RangeNodeList(ctx, func(got clusterstate.NodeListEntry) error {
+				found = found || got.NodeID == "n1"
+				return nil
+			})
+			return found
+		},
+		"b": func() bool { _, ok := rb.entries["n1"]; return ok },
+		"c": func() bool { _, ok := rc.entries["n1"]; return ok },
+	}
+	ownerSet := map[string]bool{}
+	for _, owner := range owners {
+		ownerSet[owner] = true
+	}
+	for id, has := range reps {
+		if ownerSet[id] && !has() {
+			t.Fatalf("node_list owner %s missing replicated entry; owners=%v", id, owners)
+		}
+		if !ownerSet[id] && has() {
+			t.Fatalf("node_list non-owner %s unexpectedly has replicated entry; owners=%v", id, owners)
+		}
+	}
+}
+
+type nodeListReplicaRecorder struct {
+	entries map[string]clusterstate.NodeListEntry
+	deletes []string
+}
+
+func (r *nodeListReplicaRecorder) ApplyNodeListPut(ctx context.Context, entry clusterstate.NodeListEntry) error {
+	r.entries[entry.NodeID] = entry
+	return nil
+}
+
+func (r *nodeListReplicaRecorder) ApplyNodeListDelete(ctx context.Context, nodeID string) error {
+	delete(r.entries, nodeID)
+	r.deletes = append(r.deletes, nodeID)
+	return nil
+}
+
 type routingNodeOwnerRecorder struct {
 	allow    bool
 	keys     []string

@@ -21,13 +21,21 @@ const scalerPeerMaxAge = 30 * time.Second
 type HTTPScalePlacer struct {
 	r            *Registry
 	replicaCount int
+	minReady     int
 	timeout      time.Duration
 	client       *http.Client
 }
 
 func NewHTTPScalePlacer(r *Registry, replicaCount int, timeout time.Duration) Placer {
+	return NewHTTPScalePlacerWithMinReady(r, replicaCount, 1, timeout)
+}
+
+func NewHTTPScalePlacerWithMinReady(r *Registry, replicaCount, minReady int, timeout time.Duration) Placer {
 	if replicaCount <= 0 {
 		replicaCount = 1
+	}
+	if minReady <= 0 {
+		minReady = 1
 	}
 	if timeout <= 0 {
 		timeout = 2 * time.Second
@@ -35,6 +43,7 @@ func NewHTTPScalePlacer(r *Registry, replicaCount int, timeout time.Duration) Pl
 	return &HTTPScalePlacer{
 		r:            r,
 		replicaCount: replicaCount,
+		minReady:     minReady,
 		timeout:      timeout,
 		client:       &http.Client{Timeout: timeout},
 	}
@@ -42,7 +51,7 @@ func NewHTTPScalePlacer(r *Registry, replicaCount int, timeout time.Duration) Pl
 
 func (p *HTTPScalePlacer) Place(ctx context.Context, req PlaceRequest) (*Placement, error) {
 	peers := p.r.readyScalerPeers(scalerPeerMaxAge)
-	if len(peers) == 0 {
+	if len(peers) < p.minReady {
 		return nil, ErrNoNode
 	}
 	byID := make(map[string]scalerPeer, len(peers))
@@ -127,14 +136,21 @@ func (p *HTTPScalePlacer) placeOne(ctx context.Context, peer scalerPeer, req Pla
 }
 
 func (r *Registry) VerifyAPIKey(ctx context.Context, group, apiKey string, replicaCount int, timeout time.Duration) (bool, error) {
+	return r.VerifyAPIKeyWithMinReady(ctx, group, apiKey, replicaCount, 1, timeout)
+}
+
+func (r *Registry) VerifyAPIKeyWithMinReady(ctx context.Context, group, apiKey string, replicaCount, minReady int, timeout time.Duration) (bool, error) {
 	if replicaCount <= 0 {
 		replicaCount = 1
+	}
+	if minReady <= 0 {
+		minReady = 1
 	}
 	if timeout <= 0 {
 		timeout = 2 * time.Second
 	}
 	peers := r.readyScalerPeers(scalerPeerMaxAge)
-	if len(peers) == 0 {
+	if len(peers) < minReady {
 		return false, ErrNoNode
 	}
 	byID := make(map[string]scalerPeer, len(peers))

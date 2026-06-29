@@ -88,6 +88,9 @@ type Registry struct {
 	scaleReadyLabel string
 	scalerPeers     map[string]scalerPeer
 	keyAlloc        map[string]keyAllocationState // group -> scaler-owned manifest-key allocation set
+	scaleReplicas   int
+	minReadyScalers int
+	scaleTimeout    time.Duration
 }
 
 type scalerPeer struct {
@@ -144,6 +147,9 @@ func New(stores *Stores, placer Placer, parkTimeout time.Duration, log *slog.Log
 		reconcileTrigger: make(chan struct{}, 1),
 		scalerPeers:      make(map[string]scalerPeer),
 		keyAlloc:         make(map[string]keyAllocationState),
+		scaleReplicas:    1,
+		minReadyScalers:  1,
+		scaleTimeout:     2 * time.Second,
 	}
 	localOwner := newLocalNodeOwner(r)
 	r.localNodeOwner = localOwner
@@ -196,6 +202,29 @@ func (r *Registry) SetScaleReadyLabel(label string) {
 	r.scalerMu.Lock()
 	r.scaleReadyLabel = label
 	r.scalerMu.Unlock()
+}
+
+func (r *Registry) SetScalePolicy(replicaCount, minReady int, timeout time.Duration) {
+	if replicaCount <= 0 {
+		replicaCount = 1
+	}
+	if minReady <= 0 {
+		minReady = 1
+	}
+	if timeout <= 0 {
+		timeout = 2 * time.Second
+	}
+	r.scalerMu.Lock()
+	r.scaleReplicas = replicaCount
+	r.minReadyScalers = minReady
+	r.scaleTimeout = timeout
+	r.scalerMu.Unlock()
+}
+
+func (r *Registry) scalePolicy() (replicaCount, minReady int, timeout time.Duration) {
+	r.scalerMu.Lock()
+	defer r.scalerMu.Unlock()
+	return r.scaleReplicas, r.minReadyScalers, r.scaleTimeout
 }
 
 func (r *Registry) setScalerPeer(peer scalerPeer) {

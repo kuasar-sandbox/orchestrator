@@ -137,6 +137,14 @@ func (r *Registry) NodeCandidates(ctx context.Context, nodeID string) ([]Endpoin
 	return r.candidates(ctx, m, nodeID, m.Owners.NodeLink)
 }
 
+func (r *Registry) NodeListEndpoints(ctx context.Context) ([]Endpoint, error) {
+	m, err := r.Membership(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return r.ownerUnionEndpoints(ctx, m, clusterstate.NamespaceNodeList, m.Owners.NodeList)
+}
+
 func (r *Registry) ActiveEndpoints(ctx context.Context) ([]Endpoint, error) {
 	m, err := r.Membership(ctx)
 	if err != nil {
@@ -151,6 +159,53 @@ func (r *Registry) ActiveEndpoints(ctx context.Context) ([]Endpoint, error) {
 	out := make([]Endpoint, 0, len(members))
 	for _, member := range members {
 		ep, err := r.endpointForMember(v, member)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, ep)
+	}
+	return out, nil
+}
+
+func (r *Registry) ownerUnionEndpoints(ctx context.Context, m clustercfg.MembershipConfig, key string, ownerCount int) ([]Endpoint, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if ownerCount <= 0 {
+		return nil, fmt.Errorf("clusterclient: owner count must be positive")
+	}
+	byID := map[string]clustercfg.MembershipMember{}
+	versionByID := map[string]clustercfg.MembershipVersion{}
+	for _, v := range m.OwnerVersions() {
+		view := clusterstate.MemberView{Version: v.Version, Members: v.MemberIDs()}
+		owners, err := view.Owners(key, ownerCount)
+		if err != nil {
+			return nil, err
+		}
+		members := map[string]clustercfg.MembershipMember{}
+		for _, member := range v.Members {
+			members[member.ID] = member
+		}
+		for _, id := range owners {
+			member := members[id]
+			if member.ID == "" {
+				continue
+			}
+			if _, ok := byID[id]; ok {
+				continue
+			}
+			byID[id] = member
+			versionByID[id] = v
+		}
+	}
+	ids := make([]string, 0, len(byID))
+	for id := range byID {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	out := make([]Endpoint, 0, len(ids))
+	for _, id := range ids {
+		ep, err := r.endpointForMember(versionByID[id], byID[id])
 		if err != nil {
 			return nil, err
 		}

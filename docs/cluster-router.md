@@ -73,14 +73,17 @@ router 不参与 registry 成员健康检测,也不订阅 route 或 node_list。
 key:
 
 ```text
-(group, route_key, sandbox_id, port, protocol)
+(group, route_key, sandbox_id)
 ```
 
 value:
 
 ```text
-{node_id, data_endpoint, sandbox_id, route_version, expires}
+{node_id, data_endpoint, sandbox_id, route_version, expires, last_used}
 ```
+
+端口和协议不参与 route owner 解析;它们保留在 `<port>-<sandbox_id>.<domain>` Host 和请求方法中,由
+node proxy 执行最后一跳。
 
 `access_token` 存储在 registry route 记录中,由 scaler 在 Place 时使用 `auth_key` 生成:
 
