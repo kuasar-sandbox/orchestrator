@@ -124,7 +124,7 @@ func (r *Registry) serveExport(w http.ResponseWriter, req *http.Request) {
 		Kind:  q.Get("kind"),
 		Group: q.Get("group"),
 	}); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		http.Error(w, err.Error(), routeLinkStatus(err))
 		return
 	}
 }

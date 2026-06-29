@@ -36,6 +36,13 @@ func TestRouteQuorumOverHTTPReplicas(t *testing.T) {
 	if err != nil || !found || got.SandboxID != "sb-http" {
 		t.Fatalf("get route = %+v found=%v err=%v", got, found, err)
 	}
+	list, err := NewHTTPRouteReplica(srvA.URL, srvA.Client()).ListGroup(ctx, "/g")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 1 || list[0].SandboxID != "sb-http" {
+		t.Fatalf("list_group=%+v, want sb-http", list)
+	}
 }
 
 func TestNodeQuorumOverHTTPReplicas(t *testing.T) {

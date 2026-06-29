@@ -20,18 +20,20 @@ const (
 type replicaRequest struct {
 	Op     string      `json:"op"`
 	Key    string      `json:"key,omitempty"`
+	Group  string      `json:"group,omitempty"`
 	Ballot Ballot      `json:"ballot,omitempty"`
 	Route  RouteRecord `json:"route,omitempty"`
 	Node   NodeRecord  `json:"node,omitempty"`
 }
 
 type replicaResponse struct {
-	Route  RouteRecord `json:"route,omitempty"`
-	Node   NodeRecord  `json:"node,omitempty"`
-	Found  bool        `json:"found,omitempty"`
-	OK     bool        `json:"ok,omitempty"`
-	Ballot Ballot      `json:"ballot,omitempty"`
-	Error  string      `json:"error,omitempty"`
+	Route  RouteRecord   `json:"route,omitempty"`
+	Routes []RouteRecord `json:"routes,omitempty"`
+	Node   NodeRecord    `json:"node,omitempty"`
+	Found  bool          `json:"found,omitempty"`
+	OK     bool          `json:"ok,omitempty"`
+	Ballot Ballot        `json:"ballot,omitempty"`
+	Error  string        `json:"error,omitempty"`
 }
 
 func ServeRouteReplica(w http.ResponseWriter, req *http.Request, replica RouteReplica) {
@@ -58,6 +60,9 @@ func ServeRouteReplica(w http.ResponseWriter, req *http.Request, replica RouteRe
 		out.OK = err == nil
 	case "max_ballot":
 		out.Ballot, err = replica.MaxBallot(req.Context(), in.Key)
+	case "list_group":
+		out.Routes, err = replica.ListGroup(req.Context(), in.Group)
+		out.OK = err == nil
 	default:
 		err = fmt.Errorf("cluster: unknown route replica op %q", in.Op)
 	}
@@ -146,6 +151,11 @@ func (r *HTTPRouteReplica) Repair(ctx context.Context, key string, rec RouteReco
 func (r *HTTPRouteReplica) MaxBallot(ctx context.Context, key string) (Ballot, error) {
 	out, err := r.call(ctx, replicaRequest{Op: "max_ballot", Key: key})
 	return out.Ballot, err
+}
+
+func (r *HTTPRouteReplica) ListGroup(ctx context.Context, group string) ([]RouteRecord, error) {
+	out, err := r.call(ctx, replicaRequest{Op: "list_group", Group: group})
+	return out.Routes, err
 }
 
 func (r *HTTPRouteReplica) call(ctx context.Context, in replicaRequest) (replicaResponse, error) {

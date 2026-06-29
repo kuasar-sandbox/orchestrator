@@ -2,7 +2,9 @@ package registry
 
 import (
 	"context"
+	"errors"
 	"sync"
+	"time"
 
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/routesync"
 )
@@ -14,6 +16,8 @@ type NodeOwner interface {
 	ReleaseBuild(ctx context.Context, buildID string)
 	Runtime(ctx context.Context, nodeID string) (*NodeRecord, bool, error)
 	DeleteSandbox(ctx context.Context, nodeID, sid string) error
+	SendCommand(ctx context.Context, nodeID string, cmd *routesync.Command) error
+	SendCommandAndWait(ctx context.Context, nodeID string, cmd *routesync.Command, timeout time.Duration) (*routesync.CmdAck, error)
 }
 
 type localNodeOwner struct {
@@ -26,10 +30,6 @@ func newLocalNodeOwner(reg *Registry) *localNodeOwner {
 }
 
 func (o *localNodeOwner) PutManifestKey(ctx context.Context, nodeID, fingerprint, keyType, keyValue string, expiresUnix int64) error {
-	conn, live := o.reg.node(nodeID)
-	if !live {
-		return ErrNodeGone
-	}
 	if keyType == "" {
 		keyType = "inline"
 	}
@@ -39,15 +39,11 @@ func (o *localNodeOwner) PutManifestKey(ctx context.Context, nodeID, fingerprint
 	} else {
 		cmd.ManifestKey = keyValue
 	}
-	return conn.send(cmd)
+	return o.SendCommand(ctx, nodeID, cmd)
 }
 
 func (o *localNodeOwner) DropManifestKey(ctx context.Context, nodeID, fingerprint string) error {
-	conn, live := o.reg.node(nodeID)
-	if !live {
-		return ErrNodeGone
-	}
-	return conn.send(&routesync.Command{CmdID: newID(), Kind: routesync.CmdKeyDrop, KeyFingerprint: fingerprint})
+	return o.SendCommand(ctx, nodeID, &routesync.Command{CmdID: newID(), Kind: routesync.CmdKeyDrop, KeyFingerprint: fingerprint})
 }
 
 func (o *localNodeOwner) AdmitBuild(ctx context.Context, nodeID, buildID string, want *routesync.BuildResources) bool {
@@ -67,11 +63,41 @@ func (o *localNodeOwner) Runtime(ctx context.Context, nodeID string) (*NodeRecor
 }
 
 func (o *localNodeOwner) DeleteSandbox(ctx context.Context, nodeID, sid string) error {
+	return o.SendCommand(ctx, nodeID, &routesync.Command{CmdID: newID(), Kind: routesync.CmdDelete, SID: sid})
+}
+
+func (o *localNodeOwner) SendCommand(ctx context.Context, nodeID string, cmd *routesync.Command) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	conn, live := o.reg.node(nodeID)
 	if !live {
 		return ErrNodeGone
 	}
-	return conn.send(&routesync.Command{CmdID: newID(), Kind: routesync.CmdDelete, SID: sid})
+	if cmd == nil {
+		return errors.New("registry: node command is required")
+	}
+	if cmd.CmdID == "" {
+		cmd.CmdID = newID()
+	}
+	return conn.send(cmd)
+}
+
+func (o *localNodeOwner) SendCommandAndWait(ctx context.Context, nodeID string, cmd *routesync.Command, timeout time.Duration) (*routesync.CmdAck, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	conn, live := o.reg.node(nodeID)
+	if !live {
+		return nil, ErrNodeGone
+	}
+	if cmd == nil {
+		return nil, errors.New("registry: node command is required")
+	}
+	if cmd.CmdID == "" {
+		cmd.CmdID = newID()
+	}
+	return o.reg.sendAndWait(ctx, conn, cmd, timeout)
 }
 
 type routingNodeOwner struct {
@@ -128,6 +154,14 @@ func (o *routingNodeOwner) DeleteSandbox(ctx context.Context, nodeID, sid string
 	return o.ownerFor(ctx, nodeID).DeleteSandbox(ctx, nodeID, sid)
 }
 
+func (o *routingNodeOwner) SendCommand(ctx context.Context, nodeID string, cmd *routesync.Command) error {
+	return o.ownerFor(ctx, nodeID).SendCommand(ctx, nodeID, cmd)
+}
+
+func (o *routingNodeOwner) SendCommandAndWait(ctx context.Context, nodeID string, cmd *routesync.Command, timeout time.Duration) (*routesync.CmdAck, error) {
+	return o.ownerFor(ctx, nodeID).SendCommandAndWait(ctx, nodeID, cmd, timeout)
+}
+
 type missingNodeOwner struct{ memberID string }
 
 func (o missingNodeOwner) err() error { return ErrNodeGone }
@@ -149,6 +183,14 @@ func (o missingNodeOwner) Runtime(context.Context, string) (*NodeRecord, bool, e
 }
 
 func (o missingNodeOwner) DeleteSandbox(context.Context, string, string) error { return o.err() }
+
+func (o missingNodeOwner) SendCommand(context.Context, string, *routesync.Command) error {
+	return o.err()
+}
+
+func (o missingNodeOwner) SendCommandAndWait(context.Context, string, *routesync.Command, time.Duration) (*routesync.CmdAck, error) {
+	return nil, o.err()
+}
 
 // buildAdmissionManager is the local node owner build-budget state.
 // It is intentionally volatile: a node/registry restart clears execution leases,

@@ -363,3 +363,41 @@ func TestRouteQuorumConcurrentSameWriterNextBallotsAreUnique(t *testing.T) {
 		t.Fatalf("committed ballots=%d, want %d", len(seen), workers)
 	}
 }
+
+func TestMemoryRouteReplicaListGroupUsesGroupIndexAndKeepsTombstones(t *testing.T) {
+	ctx := context.Background()
+	rep := NewMemoryRouteReplica()
+	q := NewRouteQuorum("writer", rep)
+	if _, err := q.CAS(ctx, "/g", "live", 0, func(RouteRecord, bool) (RouteRecord, bool, error) {
+		return RouteRecord{Group: "/g", RouteKey: "live", SandboxID: "sb-live", State: RouteReady}, true, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := q.CAS(ctx, "/other", "rk", 0, func(RouteRecord, bool) (RouteRecord, bool, error) {
+		return RouteRecord{Group: "/other", RouteKey: "rk", SandboxID: "sb-other", State: RouteReady}, true, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := q.CAS(ctx, "/g", "gone", 0, func(RouteRecord, bool) (RouteRecord, bool, error) {
+		return RouteRecord{Group: "/g", RouteKey: "gone", SandboxID: "sb-gone", State: RouteReady}, true, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := q.CAS(ctx, "/g", "gone", 1, func(RouteRecord, bool) (RouteRecord, bool, error) {
+		return RouteRecord{}, false, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	list, err := rep.ListGroup(ctx, "/g")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]RouteState{}
+	for _, rec := range list {
+		got[rec.RouteKey] = rec.State
+	}
+	if len(got) != 2 || got["live"] != RouteReady || got["gone"] != RouteDead {
+		t.Fatalf("ListGroup(/g)=%+v, want live ready + gone tombstone", list)
+	}
+}

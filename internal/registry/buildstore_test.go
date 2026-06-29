@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"testing"
+	"time"
 
 	clusterstate "github.com/kuasar-sandbox/sandbox-orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/clusterstore"
@@ -40,6 +41,14 @@ func (a *recordingNodeOwner) Runtime(ctx context.Context, nodeID string) (*NodeR
 
 func (a *recordingNodeOwner) DeleteSandbox(ctx context.Context, nodeID, sid string) error {
 	return nil
+}
+
+func (a *recordingNodeOwner) SendCommand(ctx context.Context, nodeID string, cmd *routesync.Command) error {
+	return nil
+}
+
+func (a *recordingNodeOwner) SendCommandAndWait(ctx context.Context, nodeID string, cmd *routesync.Command, timeout time.Duration) (*routesync.CmdAck, error) {
+	return &routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted}, nil
 }
 
 func buildAckConn(reg *Registry, nodeID string) *fakeConn {

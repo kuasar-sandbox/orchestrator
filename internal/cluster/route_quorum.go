@@ -3,6 +3,7 @@ package cluster
 import (
 	"context"
 	"errors"
+	"reflect"
 	"strconv"
 	"sync"
 	"time"
@@ -18,6 +19,7 @@ type RouteReplica interface {
 	Accept(ctx context.Context, key string, rec RouteRecord, ballot Ballot) (bool, error)
 	Repair(ctx context.Context, key string, rec RouteRecord) error
 	MaxBallot(ctx context.Context, key string) (Ballot, error)
+	ListGroup(ctx context.Context, group string) ([]RouteRecord, error)
 }
 
 type RouteReplicaSlot struct {
@@ -336,10 +338,19 @@ type MemoryRouteReplica struct {
 	mu       sync.Mutex
 	promised map[string]Ballot
 	accepted map[string]RouteRecord
+	byGroup  map[string]map[string]struct{}
+	keyGroup map[string]string
+	onChange func(key string, rec RouteRecord)
 }
 
 func NewMemoryRouteReplica() *MemoryRouteReplica {
-	return &MemoryRouteReplica{promised: map[string]Ballot{}, accepted: map[string]RouteRecord{}}
+	return &MemoryRouteReplica{promised: map[string]Ballot{}, accepted: map[string]RouteRecord{}, byGroup: map[string]map[string]struct{}{}, keyGroup: map[string]string{}}
+}
+
+func (r *MemoryRouteReplica) SetOnChange(fn func(key string, rec RouteRecord)) {
+	r.mu.Lock()
+	r.onChange = fn
+	r.mu.Unlock()
 }
 
 func (r *MemoryRouteReplica) Read(ctx context.Context, key string) (RouteRecord, bool, error) {
@@ -371,12 +382,21 @@ func (r *MemoryRouteReplica) Accept(ctx context.Context, key string, rec RouteRe
 		return false, err
 	}
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	if ballot.Less(r.promised[key]) {
+		r.mu.Unlock()
 		return false, nil
 	}
+	cur, found := r.accepted[key]
+	changed := !found || routeLogicalChanged(cur, rec)
 	r.promised[key] = ballot
 	r.accepted[key] = cloneRoute(rec)
+	r.indexAcceptedLocked(key, rec)
+	onChange := r.onChange
+	out := cloneRoute(rec)
+	r.mu.Unlock()
+	if changed && onChange != nil {
+		onChange(key, out)
+	}
 	return true, nil
 }
 
@@ -385,8 +405,8 @@ func (r *MemoryRouteReplica) AcceptDelete(ctx context.Context, key string, ballo
 		return false, err
 	}
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	if ballot.Less(r.promised[key]) {
+		r.mu.Unlock()
 		return false, nil
 	}
 	r.promised[key] = ballot
@@ -401,7 +421,15 @@ func (r *MemoryRouteReplica) AcceptDelete(ctx context.Context, key string, ballo
 	if !found {
 		tombstone.Meta.Rev = 1
 	}
+	changed := !found || routeLogicalChanged(cur, tombstone)
 	r.accepted[key] = tombstone
+	r.indexAcceptedLocked(key, tombstone)
+	onChange := r.onChange
+	out := cloneRoute(tombstone)
+	r.mu.Unlock()
+	if changed && onChange != nil {
+		onChange(key, out)
+	}
 	return true, nil
 }
 
@@ -410,12 +438,21 @@ func (r *MemoryRouteReplica) Repair(ctx context.Context, key string, rec RouteRe
 		return err
 	}
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	cur, found := r.accepted[key]
 	if !found || cur.Meta.Ballot.Less(rec.Meta.Ballot) ||
 		(cur.Meta.Ballot == rec.Meta.Ballot && cur.Meta.Rev < rec.Meta.Rev) {
+		changed := !found || routeLogicalChanged(cur, rec)
 		r.accepted[key] = cloneRoute(rec)
+		r.indexAcceptedLocked(key, rec)
+		onChange := r.onChange
+		out := cloneRoute(rec)
+		r.mu.Unlock()
+		if changed && onChange != nil {
+			onChange(key, out)
+		}
+		return nil
 	}
+	r.mu.Unlock()
 	return nil
 }
 
@@ -448,11 +485,40 @@ func (r *MemoryRouteReplica) ListGroup(ctx context.Context, group string) ([]Rou
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	out := make([]RouteRecord, 0)
-	for key, rec := range r.accepted {
-		g, _ := splitRouteKey(key)
-		if g == group && rec.State != RouteDead {
+	for key := range r.byGroup[group] {
+		if rec, found := r.accepted[key]; found {
 			out = append(out, cloneRoute(rec))
 		}
 	}
 	return out, nil
+}
+
+func (r *MemoryRouteReplica) indexAcceptedLocked(key string, rec RouteRecord) {
+	if oldGroup := r.keyGroup[key]; oldGroup != "" {
+		if keys := r.byGroup[oldGroup]; keys != nil {
+			delete(keys, key)
+			if len(keys) == 0 {
+				delete(r.byGroup, oldGroup)
+			}
+		}
+		delete(r.keyGroup, key)
+	}
+	group := rec.Group
+	if group == "" {
+		group, _ = splitRouteKey(key)
+	}
+	if group == "" {
+		return
+	}
+	if r.byGroup[group] == nil {
+		r.byGroup[group] = map[string]struct{}{}
+	}
+	r.byGroup[group][key] = struct{}{}
+	r.keyGroup[key] = group
+}
+
+func routeLogicalChanged(a, b RouteRecord) bool {
+	a.Meta = RecordMeta{}
+	b.Meta = RecordMeta{}
+	return !reflect.DeepEqual(a, b)
 }

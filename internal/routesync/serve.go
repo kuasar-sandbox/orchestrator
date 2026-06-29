@@ -172,7 +172,7 @@ func StreamAuthority(ctx context.Context, w io.Writer, flush func(), body io.Rea
 			return
 		}
 	}
-	bookmark := &Msg{Type: TypeBookmark}
+	bookmark := &Msg{Type: TypeBookmark, FullSync: !resumed}
 	if rev, ok := src.(RevisionSource); ok {
 		bookmark.RevToken = rev.CurrentRevToken()
 	}

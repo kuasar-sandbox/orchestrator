@@ -63,7 +63,8 @@ type SelectorPatch struct {
 // Command kinds (Command.Kind) — the lifecycle + key primitives the registry
 // drives the node with. The node executes via its existing e2b lifecycle (the
 // command just carries the intent) and reports the terminal state on the route
-// stream; a Reserve waits on that route event, not the ack.
+// stream. Command callers wait for ack acceptance; Reserve completion waits on
+// the route event.
 const (
 	CmdCreate        = "create"         // boot a sandbox from a template
 	CmdConnect       = "connect"        // resume a node-local PAUSED sandbox

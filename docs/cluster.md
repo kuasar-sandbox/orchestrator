@@ -108,6 +108,8 @@ Registry 成员集由运维配置和 membership version 定义。每个命名空
 node 记录携带 `link_owner`,route owner 需要下发 `create/key/build/delete` 时,通过 node-owner RPC 转发到
 持有该 h2 stream 的 registry 成员。`route_link` 的所有 owner 均可响应查询。写入达到要求 quorum 后提交,
 随后继续复制到全 owner set,用于完整视图和本地 waiter 唤醒。
+若某个 route owner 本地 group 视图尚未 ready,它只能按该 group 的 owner set 做 group-scoped catch-up,
+从分片内副本拉取同 group 记录并 read-repair 到本地;不能跨 group 扫描或把多个无关分片结果合并。
 
 ## 4. Membership 与成员健康
 
@@ -234,6 +236,14 @@ scaler import generation G
 provider 删除 group 时不能直接从 import 中消失;必须以 tombstone/draining group 形式继续出现,直到 registry
 确认该 group 没有活动 route/build 执行态。
 
+route owner 内部维护按 group 分开的本地 watch log。这个 watch 只服务 registry 内部:
+
+- node owner 写入 READY/PAUSED/DEAD 后,group owner 的本地副本 accept/repair 触发 group event。
+- `ReserveSandbox` park 期间同时等待本进程 singleflight、该 group event,并用短周期 quorum read 兜底。
+- router 不订阅 route watch;router 只依赖 Reserve 返回 READY 或失败。
+- group list/export 在返回前必须确认本地 group 视图 ready;未 ready 时先执行 group-scoped catch-up,
+  quorum 不足则返回 503。
+
 ### 7.3 node_list
 
 node_list 不作为真相源迁移。node-link 连接持有者在 register、draining 变化和低频 liveness refresh 时,
@@ -256,7 +266,7 @@ scaler 重新订阅 node_list owner set 并 reset + full snapshot。新 owner �
 |---|---|
 | `group` | 分片键 |
 | `route_key` | 会话键 |
-| `state` | `reserved` / `placed` / `ready` / `paused` / `dead` |
+| `state` | `reserved` / `ready` / `paused` / `dead` |
 | `node_id` | 当前承载节点 |
 | `sandbox_id` | 当前实例 id |
 | `access_token` | 当前实例的数据面 token,由 scaler 按 `MAC(auth_key,sandbox_id)` 生成 |
@@ -266,15 +276,16 @@ scaler 重新订阅 node_list owner set 并 reset + full snapshot。新 owner �
 ### 8.3 状态机
 
 ```text
-none -> reserved -> placed -> ready
+none -> reserved -> ready
 ready -> paused -> reserved -> ready
-ready/paused/placed -> dead/tombstone
+ready/paused/reserved -> dead/tombstone
 ```
 
 整机清空、单沙箱 killed、node 重启后的缺失沙箱都收敛为 dead route 清理;下次 Reserve 重新放置。
 
-`ReserveSandbox` 返回时必须已经 READY 或失败。若已有 `reserved/placed`,新请求 join 等待同一状态机。
-客户端超时不等价于取消已提交的 placed;node 后续上报 running 时记录仍可进入 READY。
+`ReserveSandbox` 返回时必须已经 READY 或失败。若已有 `reserved`,新请求 join 等待同一状态机。
+create/connect 命令被 node owner ack 接受后,route owner 等待 node 上报 READY;等待超时会把仍停在
+`reserved` 的记录回滚或恢复为原 PAUSED 记录。若 node 的 READY 上报先到达,READY 写入胜出。
 
 孤儿清理由 route owner 判定:node 上报的 `(group, route_key, sandbox_id)` 在 route_link 中不存在或已被替换,
 则下发 delete/kill 到该 node。这个过程不经过数据面,也不依赖 access token。
@@ -291,6 +302,10 @@ Node 连接 registry 后按 `LocateN(node_id,N)` 归属 node owner set。node �
 增量订阅的 rev 是字符串,格式由 node owner/node 私有约定,推荐编码为 `source_fingerprint:seq`。
 node owner 在订阅时把上次 token 传给 node;node 校验 fingerprint,匹配时 replay `seq` 之后的事件,不匹配
 或 changelog 不可用时强制全量 resync。node owner 还应以 1h-6h 随机打散周期做全量 resync。
+
+node-link bookmark 标记本轮同步结束。若 bookmark 来自全量 Range,registry 会把本 node 记录中本轮未出现
+的 sandbox refs 按精确 `(group,route_key,sandbox_id)` 校验后删除对应 route;若 bookmark 来自增量 replay,
+只更新 resume token,不做缺失清理。build 终态仍由 build_event 收敛,不从 sandbox 全量清单推断。
 
 ## 10. Router
 

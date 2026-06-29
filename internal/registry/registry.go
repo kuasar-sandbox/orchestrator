@@ -18,8 +18,10 @@ import (
 // ErrNoNode is returned when no eligible node can host a sandbox.
 var ErrNoNode = errors.New("registry: no eligible node")
 
-// ErrNodeGone is returned when the placed node's channel disappeared mid-reserve.
-var ErrNodeGone = errors.New("registry: placed node not connected")
+// ErrNodeGone is returned when the node owner cannot reach the target node.
+var ErrNodeGone = errors.New("registry: node owner cannot reach node")
+
+const lifecycleAckTimeout = 5 * time.Second
 
 // nodeConn is the registry's handle to one connected node's channel — it sends
 // commands toward the node. channel.go implements it over the wire; tests fake it.
@@ -69,12 +71,11 @@ type Registry struct {
 	parkTimeout time.Duration
 	log         *slog.Logger
 
-	mu        sync.Mutex
-	nodes     map[string]nodeConn               // node_id -> channel
-	inflight  map[string]*reserveCall           // single-flight ReserveSandbox per (group,route_key)
-	sidKeys   map[string][2]string              // sid -> {group, route_key} (delete-by-sid from the route stream)
-	acks      map[string]chan *routesync.CmdAck // cmd_id -> ack waiter (synchronous key commands)
-	cmdFlight map[string]string                 // create/connect cmd_id -> flightKey (ack-reject fast-fails Reserve)
+	mu       sync.Mutex
+	nodes    map[string]nodeConn               // node_id -> channel
+	inflight map[string]*reserveCall           // single-flight ReserveSandbox per (group,route_key)
+	sidKeys  map[string][2]string              // sid -> {group, route_key} (delete-by-sid from the route stream)
+	acks     map[string]chan *routesync.CmdAck // cmd_id -> ack waiter (synchronous key commands)
 
 	keyMu     sync.Mutex
 	keyLeased map[string]keyLeaseState // group -> nodes currently holding the predistributed key
@@ -115,7 +116,6 @@ type reserveCall struct {
 	orig            *SandboxRecord
 	found           bool
 	createConfig    map[string]string
-	retried         bool
 }
 
 // ReserveResult is what a satisfied ReserveSandbox returns (cluster.md §7.2). The
@@ -144,7 +144,6 @@ func New(stores *Stores, placer Placer, parkTimeout time.Duration, log *slog.Log
 		inflight:         make(map[string]*reserveCall),
 		sidKeys:          make(map[string][2]string),
 		acks:             make(map[string]chan *routesync.CmdAck),
-		cmdFlight:        make(map[string]string),
 		keyLeased:        make(map[string]keyLeaseState),
 		reconcileTrigger: make(chan struct{}, 1),
 		scalerPeers:      make(map[string]scalerPeer),
@@ -277,6 +276,9 @@ func flightKey(group, routeKey string) string { return group + "\x00" + routeKey
 // creating (or resuming a PAUSED sandbox) on a node and waiting for the node to
 // report it running, single-flight per key (cluster.md §7.2).
 func (r *Registry) ReserveSandbox(ctx context.Context, group, routeKey string, createConfig map[string]string) (*ReserveResult, error) {
+	if group == "" || routeKey == "" {
+		return nil, fmt.Errorf("registry: group and route_key are required")
+	}
 	if isBuildRouteKey(routeKey) {
 		return nil, fmt.Errorf("registry: route_key prefix %q is reserved", buildRouteKeyPrefix)
 	}
@@ -285,10 +287,10 @@ func (r *Registry) ReserveSandbox(ctx context.Context, group, routeKey string, c
 		return nil, err
 	}
 	if found && rec.State == StateReady {
-		if _, live := r.node(rec.NodeID); live {
-			return &ReserveResult{NodeID: rec.NodeID, SID: rec.SID, AccessToken: rec.AccessToken, DataEndpoint: r.nodeDataEndpoint(ctx, rec.NodeID)}, nil
+		if res, live := r.readyResultFromRecord(ctx, rec); live {
+			return res, nil
 		}
-		// node gone: fall through to re-place (dead-node sweep also resets it).
+		// Missing node runtime: fall through to re-place (dead-node sweep also resets it).
 	}
 
 	key := flightKey(group, routeKey)
@@ -313,7 +315,7 @@ func (r *Registry) ReserveSandbox(ctx context.Context, group, routeKey string, c
 	}
 	wctx, cancel := context.WithTimeout(ctx, r.parkTimeout)
 	defer cancel()
-	res, rerr := waitCall(wctx, call)
+	res, rerr := r.waitReserveCall(wctx, call)
 	if rerr != nil {
 		// Park timeout / caller cancel: undo a RESERVED that never reached READY, so
 		// it doesn't strand on a live node (the sweep only clears dead-node rows).
@@ -349,8 +351,7 @@ func (r *Registry) rollbackReserve(group, routeKey string, orig *SandboxRecord, 
 func (r *Registry) startReserve(ctx context.Context, group, routeKey string, rec *SandboxRecord, rev int64, found bool, createConfig map[string]string) error {
 	// PAUSED: resume on the same node (no placement).
 	if found && rec.State == StatePaused && rec.NodeID != "" {
-		conn, live := r.node(rec.NodeID)
-		if !live {
+		if r.nodeOwner == nil {
 			return ErrNodeGone
 		}
 		reserved := *rec
@@ -360,10 +361,18 @@ func (r *Registry) startReserve(ctx context.Context, group, routeKey string, rec
 		}
 		_ = r.stores.AddNodeSandboxRef(ctx, rec.NodeID, clusterstate.NodeSandboxRef{Group: group, RouteKey: routeKey, SandboxID: rec.SID})
 		ccmd := &routesync.Command{CmdID: newID(), Kind: routesync.CmdConnect, SID: rec.SID}
-		r.trackCmd(ccmd.CmdID, flightKey(group, routeKey))
-		if err := conn.send(ccmd); err != nil {
+		ack, err := r.nodeOwner.SendCommandAndWait(ctx, rec.NodeID, ccmd, lifecycleAckTimeout)
+		if err != nil {
 			_, _ = r.stores.PutSandbox(ctx, rec) // roll back RESERVED -> PAUSED (connect never reached the node)
 			return err
+		}
+		if ack == nil || ack.Status != routesync.AckAccepted {
+			_, _ = r.stores.PutSandbox(ctx, rec)
+			reason := ""
+			if ack != nil {
+				reason = ack.Reason
+			}
+			return fmt.Errorf("registry: connect rejected: %s", reason)
 		}
 		return nil
 	}
@@ -395,13 +404,6 @@ func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, o
 			return ErrNoNode
 		}
 		nodeID := placement.NodeID
-		conn, live := r.node(nodeID)
-		if !live {
-			if attempt == 0 {
-				continue // re-ask once (the suggested node just dropped / stale view)
-			}
-			return ErrNodeGone
-		}
 		expect := int64(0)
 		if curFound {
 			expect = curRev
@@ -425,11 +427,31 @@ func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, o
 			TemplateRef: placement.TemplateRef, Config: placement.Config,
 			KeyFingerprint: placement.KeyFingerprint, AccessToken: placement.AccessToken,
 		}
-		r.trackCmd(cmd.CmdID, flightKey(group, routeKey))
-		if err := conn.send(cmd); err != nil {
+		if r.nodeOwner == nil {
 			_ = r.stores.DeleteSandbox(ctx, group, routeKey)
 			_ = r.stores.RemoveNodeSandboxRef(ctx, nodeID, group, routeKey, sid)
+			return ErrNodeGone
+		}
+		ack, err := r.nodeOwner.SendCommandAndWait(ctx, nodeID, cmd, lifecycleAckTimeout)
+		if err != nil {
+			_ = r.stores.DeleteSandbox(ctx, group, routeKey)
+			_ = r.stores.RemoveNodeSandboxRef(ctx, nodeID, group, routeKey, sid)
+			if attempt == 0 && errors.Is(err, ErrNodeGone) {
+				continue
+			}
 			return err
+		}
+		if ack == nil || ack.Status != routesync.AckAccepted {
+			_ = r.stores.DeleteSandbox(ctx, group, routeKey)
+			_ = r.stores.RemoveNodeSandboxRef(ctx, nodeID, group, routeKey, sid)
+			if attempt == 0 {
+				continue
+			}
+			reason := ""
+			if ack != nil {
+				reason = ack.Reason
+			}
+			return fmt.Errorf("registry: create rejected: %s", reason)
 		}
 		return nil
 	}
@@ -462,65 +484,22 @@ func (r *Registry) sendAndWait(ctx context.Context, conn nodeConn, cmd *routesyn
 	}
 }
 
-// trackCmd registers a lifecycle command's cmd_id against its single-flight key so
-// a rejected ack fast-fails the Reserve (instead of waiting out park_timeout).
-func (r *Registry) trackCmd(cmdID, key string) {
-	r.mu.Lock()
-	r.cmdFlight[cmdID] = key
-	r.mu.Unlock()
-}
-
-// ackCommand handles a node's CmdAck: wake a sendAndWait waiter, or fast-fail the
-// Reserve a rejected lifecycle command belongs to.
+// ackCommand handles a node's CmdAck and wakes the matching SendCommandAndWait
+// waiter. Lifecycle rejection/retry is handled synchronously by the node owner
+// command caller.
 func (r *Registry) ackCommand(ack *routesync.CmdAck) {
 	if ack == nil {
 		return
 	}
 	r.mu.Lock()
 	ch, isWait := r.acks[ack.CmdID]
-	fk, isFlight := r.cmdFlight[ack.CmdID]
-	if isFlight {
-		delete(r.cmdFlight, ack.CmdID)
-	}
 	r.mu.Unlock()
 	if isWait {
 		select {
 		case ch <- ack:
 		default:
 		}
-		return
 	}
-	if isFlight && ack.Status == routesync.AckRejected {
-		// A rejected create re-places once on another node before failing the Reserve
-		// (cluster.md §7.4): a node-specific reject (e.g. a missing key lease) often
-		// succeeds elsewhere; a second reject (or non-create reject) fails it.
-		if r.replaceOnReject(fk) {
-			return
-		}
-		r.finish(fk, nil, fmt.Errorf("registry: node rejected command: %s", ack.Reason))
-	}
-}
-
-// replaceOnReject re-drives placement once for a rejected flight (returns true if
-// it re-placed, so the Reserve keeps waiting).
-func (r *Registry) replaceOnReject(key string) bool {
-	r.mu.Lock()
-	call := r.inflight[key]
-	if call == nil || call.retried {
-		r.mu.Unlock()
-		return false
-	}
-	call.retried = true
-	g, rk, orig, found, cfg := call.group, call.routeKey, call.orig, call.found, call.createConfig
-	r.mu.Unlock()
-	go func() {
-		// Background ctx: the re-Place must outlive the channel-reader callback; the
-		// placer applies its own timeout. A failure fails the Reserve.
-		if err := r.placeAndCreate(context.Background(), g, rk, orig, found, cfg); err != nil {
-			r.finish(key, nil, fmt.Errorf("registry: re-place after reject failed: %w", err))
-		}
-	}()
-	return true
 }
 
 // applyRoute is called by the channel reader for each sandbox route the node
@@ -550,19 +529,43 @@ func (r *Registry) applyRoute(ctx context.Context, nodeID string, e *routesync.R
 		r.log.Warn("registry: ignored unknown route state", "group", e.Group, "route_key", e.RouteKey, "state", e.State)
 		return
 	}
+	r.applyLiveRoute(ctx, nodeID, e, rec)
+}
+
+func (r *Registry) applyLiveRoute(ctx context.Context, nodeID string, e *routesync.RouteEntry, rec *SandboxRecord) {
+	const attempts = 5
+	for attempt := 0; attempt < attempts; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(time.Duration(attempt) * 10 * time.Millisecond):
+			}
+		}
+		if r.tryApplyLiveRoute(ctx, nodeID, e, rec) {
+			return
+		}
+	}
+	r.log.Warn("registry: route report did not converge", "group", e.Group, "route_key", e.RouteKey, "sid", e.SandboxID)
+}
+
+func (r *Registry) tryApplyLiveRoute(ctx context.Context, nodeID string, e *routesync.RouteEntry, rec *SandboxRecord) bool {
 	// Route owner fences orphan reports. A node reporting a sandbox whose
 	// (group, route_key, sandbox_id) is absent or has been replaced means the
 	// sandbox has already been deleted/replaced in control state; tell that node
 	// to kill its local copy instead of resurrecting the route.
 	cur, _, found, err := r.stores.GetSandbox(ctx, e.Group, e.RouteKey)
 	if err != nil {
+		if transientRouteRead(err) {
+			return false
+		}
 		r.log.Warn("registry: read sandbox route", "group", e.Group, "err", err)
-		return
+		return true
 	}
 	if !found || (cur.SID != "" && cur.SID != e.SandboxID) || (cur.NodeID != "" && cur.NodeID != nodeID) {
 		r.deleteOrphanSandbox(ctx, nodeID, e.SandboxID, e.Group, e.RouteKey)
 		_ = r.stores.RemoveNodeSandboxRef(ctx, nodeID, e.Group, e.RouteKey, e.SandboxID)
-		return
+		return true
 	}
 	if rec.TemplateID == "" {
 		rec.TemplateID = cur.TemplateID
@@ -571,14 +574,18 @@ func (r *Registry) applyRoute(ctx context.Context, nodeID string, e *routesync.R
 		rec.AccessToken = cur.AccessToken
 	}
 	if _, err := r.stores.PutSandbox(ctx, rec); err != nil {
+		if transientRouteRead(err) {
+			return false
+		}
 		r.log.Warn("registry: put sandbox route", "group", e.Group, "err", err)
-		return
+		return true
 	}
 	_ = r.stores.AddNodeSandboxRef(ctx, nodeID, clusterstate.NodeSandboxRef{Group: e.Group, RouteKey: e.RouteKey, SandboxID: e.SandboxID})
 	r.indexSID(e.SandboxID, e.Group, e.RouteKey)
 	if rec.State == StateReady {
 		r.finish(flightKey(e.Group, e.RouteKey), &ReserveResult{NodeID: nodeID, SID: e.SandboxID, AccessToken: rec.AccessToken, DataEndpoint: r.nodeDataEndpoint(ctx, nodeID)}, nil)
 	}
+	return true
 }
 
 func (r *Registry) deleteOrphanSandbox(ctx context.Context, nodeID, sid, group, routeKey string) {
@@ -595,10 +602,67 @@ func (r *Registry) applyDelete(ctx context.Context, group, routeKey string) {
 	if group == "" || routeKey == "" {
 		return
 	}
-	rec, _, found, _ := r.stores.GetSandbox(ctx, group, routeKey)
-	_ = r.stores.DeleteSandbox(ctx, group, routeKey)
-	if found {
-		_ = r.stores.RemoveNodeSandboxRef(ctx, rec.NodeID, group, routeKey, rec.SID)
+	const attempts = 5
+	for attempt := 0; attempt < attempts; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(time.Duration(attempt) * 10 * time.Millisecond):
+			}
+		}
+		if r.tryApplyDelete(ctx, group, routeKey) {
+			return
+		}
+	}
+	r.log.Warn("registry: delete route report did not converge", "group", group, "route_key", routeKey)
+}
+
+func (r *Registry) tryApplyDelete(ctx context.Context, group, routeKey string) bool {
+	rec, _, found, err := r.stores.GetSandbox(ctx, group, routeKey)
+	if err != nil {
+		if transientRouteRead(err) {
+			return false
+		}
+		return true
+	}
+	if !found {
+		return true
+	}
+	if err := r.stores.DeleteSandbox(ctx, group, routeKey); err != nil {
+		if transientRouteRead(err) {
+			return false
+		}
+		return true
+	}
+	_ = r.stores.RemoveNodeSandboxRef(ctx, rec.NodeID, group, routeKey, rec.SID)
+	return true
+}
+
+func (r *Registry) applyNodeFullSnapshot(ctx context.Context, nodeID string, seen map[string]string) {
+	if nodeID == "" {
+		return
+	}
+	rec, found, err := r.stores.GetNode(ctx, nodeID)
+	if err != nil || !found {
+		return
+	}
+	for _, ref := range append([]clusterstate.NodeSandboxRef(nil), rec.Sandboxes...) {
+		if ref.Group == "" || ref.RouteKey == "" {
+			continue
+		}
+		if sid, ok := seen[clusterstate.RouteKey(ref.Group, ref.RouteKey)]; ok && (sid == "" || ref.SandboxID == "" || sid == ref.SandboxID) {
+			continue
+		}
+		cur, _, routeFound, err := r.stores.GetSandbox(ctx, ref.Group, ref.RouteKey)
+		if err != nil {
+			continue
+		}
+		if routeFound && cur.NodeID == nodeID && (ref.SandboxID == "" || cur.SID == ref.SandboxID) {
+			_ = r.stores.DeleteSandbox(ctx, ref.Group, ref.RouteKey)
+			r.dropSID(cur.SID)
+		}
+		_ = r.stores.RemoveNodeSandboxRef(ctx, nodeID, ref.Group, ref.RouteKey, ref.SandboxID)
 	}
 }
 
@@ -632,16 +696,9 @@ func (r *Registry) applyDeleteBySID(ctx context.Context, nodeID, sid string) {
 }
 
 // finish satisfies the single-flight call for key (idempotent — first wins). It
-// also drops any in-flight command tracked for this key, so cmdFlight doesn't
-// leak when the route event finishes the Reserve before/without the cmd_ack.
 func (r *Registry) finish(key string, res *ReserveResult, err error) {
 	r.mu.Lock()
 	call := r.inflight[key]
-	for id, fk := range r.cmdFlight {
-		if fk == key {
-			delete(r.cmdFlight, id)
-		}
-	}
 	r.mu.Unlock()
 	if call == nil {
 		return
@@ -661,6 +718,65 @@ func waitCall(ctx context.Context, call *reserveCall) (*ReserveResult, error) {
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
+}
+
+func (r *Registry) waitReserveCall(ctx context.Context, call *reserveCall) (*ReserveResult, error) {
+	rev, _ := r.stores.RouteGroupRev(ctx, call.group)
+	watchCtx, cancelWatch := context.WithCancel(ctx)
+	defer cancelWatch()
+	ch, _ := r.stores.WatchRouteGroup(watchCtx, call.group, rev)
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-call.done:
+			return call.result, call.err
+		default:
+		}
+		if res, ready, err := r.reserveReadyResult(ctx, call.group, call.routeKey); transientRouteRead(err) {
+			// A route owner may be accepting the node's READY update concurrently;
+			// keep the parked reserve until the event/read settles or times out.
+		} else if err != nil {
+			return nil, err
+		} else if ready {
+			return res, nil
+		}
+		select {
+		case <-call.done:
+			return call.result, call.err
+		case <-ch:
+		case <-ticker.C:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+}
+
+func transientRouteRead(err error) bool {
+	return errors.Is(err, clusterstate.ErrQuorum) || errors.Is(err, clusterstate.ErrConflict)
+}
+
+func (r *Registry) reserveReadyResult(ctx context.Context, group, routeKey string) (*ReserveResult, bool, error) {
+	rec, _, found, err := r.stores.GetSandbox(ctx, group, routeKey)
+	if err != nil || !found || rec.State != StateReady {
+		return nil, false, err
+	}
+	res, live := r.readyResultFromRecord(ctx, rec)
+	return res, live, nil
+}
+
+func (r *Registry) readyResultFromRecord(ctx context.Context, rec *SandboxRecord) (*ReserveResult, bool) {
+	if rec == nil || rec.NodeID == "" || r.nodeOwner == nil {
+		return nil, false
+	}
+	node, found, err := r.nodeOwner.Runtime(ctx, rec.NodeID)
+	if err != nil || !found || node == nil {
+		return nil, false
+	}
+	return &ReserveResult{
+		NodeID: rec.NodeID, SID: rec.SID, AccessToken: rec.AccessToken,
+		DataEndpoint: node.DataEndpoint,
+	}, true
 }
 
 // --- node channel registry ---

@@ -6,6 +6,7 @@ package registry
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -18,6 +19,8 @@ import (
 )
 
 const buildRouteKeyPrefix = "__kuasar_build__/"
+
+var ErrShardNotReady = errors.New("registry: shard view not ready")
 
 // SandboxState mirrors cluster.md route state. A missing/dead sandbox is
 // represented by no route row.
@@ -89,6 +92,14 @@ type Stores struct {
 	nodeReplicas    map[string]clusterstate.NodeReplica
 	replicaMu       sync.RWMutex
 
+	routeMu        sync.Mutex
+	routeRev       int64
+	routeLog       map[string][]clusterstore.Event
+	routeSubs      map[string]map[int]chan clusterstore.Event
+	routeSeq       int
+	routeRetention int
+	routeReady     map[string]bool
+
 	nodeListMu                  sync.Mutex
 	nodeList                    map[string]clusterstate.NodeListEntry
 	nodeListRev                 int64
@@ -150,7 +161,7 @@ func NewClusterStores(
 	}
 	rreps[writerID] = localRoute
 	nreps[writerID] = localNode
-	return &Stores{
+	stores := &Stores{
 		kv:                          kv,
 		routes:                      clusterstate.NewRouteQuorum(writerID, localRoute),
 		nodes:                       clusterstate.NewNodeQuorum(writerID, localNode),
@@ -162,6 +173,10 @@ func NewClusterStores(
 		localNode:                   localNode,
 		routeReplicas:               rreps,
 		nodeReplicas:                nreps,
+		routeLog:                    map[string][]clusterstore.Event{},
+		routeSubs:                   map[string]map[int]chan clusterstore.Event{},
+		routeRetention:              10000,
+		routeReady:                  map[string]bool{},
 		nodeList:                    map[string]clusterstate.NodeListEntry{},
 		nodeListSubs:                map[int]chan clusterstore.Event{},
 		nodeListRetention:           10000,
@@ -172,6 +187,8 @@ func NewClusterStores(
 		routeHandoffGate:            map[string]clusterstate.HandoffGate{},
 		nodeHandoffGate:             map[string]clusterstate.HandoffGate{},
 	}
+	localRoute.SetOnChange(stores.publishRouteReplicaEvent)
+	return stores
 }
 
 func NewClusterStoresWithViews(
@@ -253,6 +270,7 @@ func (s *Stores) SetMemberViews(views []clusterstate.MemberView) {
 	s.replicaMu.Lock()
 	s.memberViews = clean
 	s.replicaMu.Unlock()
+	s.clearRouteReadiness()
 }
 
 func (s *Stores) SetClusterTopology(
@@ -303,6 +321,7 @@ func (s *Stores) SetClusterTopology(
 	s.routeReplicas = rreps
 	s.nodeReplicas = nreps
 	s.replicaMu.Unlock()
+	s.clearRouteReadiness()
 }
 
 func (s *Stores) SetNodeListTopology(views []clusterstate.MemberView, ownerCount int, replicas map[string]NodeListReplica) {
@@ -334,6 +353,7 @@ func (s *Stores) SetNodeListTopology(views []clusterstate.MemberView, ownerCount
 	s.nodeListReplicas = reps
 	s.nodeListTopologySet = true
 	s.replicaMu.Unlock()
+	s.clearRouteReadiness()
 }
 
 func (s *Stores) routeQuorum(group string) (*clusterstate.RouteQuorum, error) {
@@ -352,6 +372,28 @@ func (s *Stores) routeQuorum(group string) (*clusterstate.RouteQuorum, error) {
 		reps = append(reps, clusterstate.RouteReplicaSlot{ID: id, Replica: rep})
 	}
 	return clusterstate.NewRouteJointQuorum(s.writerID, reps, ownerSets), nil
+}
+
+func (s *Stores) routeOwners(group string) ([][]string, []string, error) {
+	s.replicaMu.RLock()
+	defer s.replicaMu.RUnlock()
+	return locatedOwnerSets(s.memberViews, group, s.routeOwnerCount)
+}
+
+func (s *Stores) routeReplica(id string) clusterstate.RouteReplica {
+	if id == s.writerID {
+		return s.localRoute
+	}
+	s.replicaMu.RLock()
+	rep := s.routeReplicas[id]
+	s.replicaMu.RUnlock()
+	return rep
+}
+
+func (s *Stores) clearRouteReadiness() {
+	s.routeMu.Lock()
+	s.routeReady = map[string]bool{}
+	s.routeMu.Unlock()
 }
 
 func (s *Stores) nodeQuorum(nodeID string) (*clusterstate.NodeQuorum, error) {
@@ -815,6 +857,187 @@ func (s *Stores) publishNodeListEvent(ev clusterstore.Event, entry *clusterstate
 
 // --- route_link ---
 
+func (s *Stores) RouteGroupRev(ctx context.Context, group string) (int64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	s.routeMu.Lock()
+	defer s.routeMu.Unlock()
+	return s.routeRev, nil
+}
+
+func (s *Stores) WatchRouteGroup(ctx context.Context, group string, fromRev int64) (<-chan clusterstore.Event, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if group == "" {
+		return nil, fmt.Errorf("registry: group is required for route watch")
+	}
+	s.routeMu.Lock()
+	defer s.routeMu.Unlock()
+	log := s.routeLog[group]
+	if fromRev > 0 && len(log) > 0 && fromRev < log[0].Rev-1 {
+		return nil, clusterstore.ErrCompacted
+	}
+	replay := make([]clusterstore.Event, 0)
+	for _, ev := range log {
+		if ev.Rev > fromRev {
+			replay = append(replay, ev)
+		}
+	}
+	ch := make(chan clusterstore.Event, len(replay)+1024)
+	for _, ev := range replay {
+		ch <- ev
+	}
+	id := s.routeSeq
+	s.routeSeq++
+	if s.routeSubs[group] == nil {
+		s.routeSubs[group] = map[int]chan clusterstore.Event{}
+	}
+	s.routeSubs[group][id] = ch
+	go func() {
+		<-ctx.Done()
+		s.routeMu.Lock()
+		if subs := s.routeSubs[group]; subs != nil {
+			if cur, ok := subs[id]; ok {
+				delete(subs, id)
+				close(cur)
+			}
+			if len(subs) == 0 {
+				delete(s.routeSubs, group)
+			}
+		}
+		s.routeMu.Unlock()
+	}()
+	return ch, nil
+}
+
+func (s *Stores) publishRouteReplicaEvent(key string, rr clusterstate.RouteRecord) {
+	group, routeKey := rr.Group, rr.RouteKey
+	if group == "" || routeKey == "" {
+		group, routeKey = splitRouteStorageKey(key)
+	}
+	if group == "" || routeKey == "" {
+		return
+	}
+	ev := clusterstore.Event{Key: routeKey}
+	if rr.State == clusterstate.RouteDead {
+		ev.Type = clusterstore.EventDelete
+	} else {
+		ev.Type = clusterstore.EventPut
+		b, err := json.Marshal(fromClusterRoute(rr))
+		if err != nil {
+			return
+		}
+		ev.Value = b
+	}
+	s.routeMu.Lock()
+	defer s.routeMu.Unlock()
+	s.routeRev++
+	ev.Rev = s.routeRev
+	s.routeLog[group] = append(s.routeLog[group], ev)
+	retention := s.routeRetention
+	if retention <= 0 {
+		retention = 10000
+	}
+	if len(s.routeLog[group]) > retention {
+		log := s.routeLog[group]
+		copy(log, log[len(log)-retention:])
+		s.routeLog[group] = log[:retention]
+	}
+	for id, ch := range s.routeSubs[group] {
+		select {
+		case ch <- ev:
+		default:
+			delete(s.routeSubs[group], id)
+			close(ch)
+		}
+	}
+	if len(s.routeSubs[group]) == 0 {
+		delete(s.routeSubs, group)
+	}
+}
+
+func (s *Stores) ensureRouteGroupReady(ctx context.Context, group string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if group == "" {
+		return fmt.Errorf("registry: group is required for route_link list")
+	}
+	s.routeMu.Lock()
+	if s.routeReady[group] {
+		s.routeMu.Unlock()
+		return nil
+	}
+	s.routeMu.Unlock()
+	ownerSets, jointOwners, err := s.routeOwners(group)
+	if err != nil {
+		return err
+	}
+	isOwner := false
+	for _, id := range jointOwners {
+		if id == s.writerID {
+			isOwner = true
+			break
+		}
+	}
+	if !isOwner {
+		return ErrShardNotReady
+	}
+	accepted := map[string]bool{}
+	byKey := map[string]clusterstate.RouteRecord{}
+	var last error
+	for _, id := range jointOwners {
+		rep := s.routeReplica(id)
+		if rep == nil {
+			last = fmt.Errorf("registry: route replica %q unavailable", id)
+			continue
+		}
+		routes, err := rep.ListGroup(ctx, group)
+		if err != nil {
+			last = err
+			continue
+		}
+		accepted[id] = true
+		for _, rr := range routes {
+			g, rk := rr.Group, rr.RouteKey
+			if g == "" || rk == "" {
+				continue
+			}
+			if g != group {
+				continue
+			}
+			key := clusterstate.RouteKey(g, rk)
+			if cur, ok := byKey[key]; !ok || routeRecordNewer(rr, cur) {
+				byKey[key] = rr
+			}
+		}
+	}
+	if !satisfiesOwnerQuorums(accepted, ownerSets) {
+		if last != nil {
+			return last
+		}
+		return clusterstate.ErrQuorum
+	}
+	for key, rr := range byKey {
+		if err := s.localRoute.Repair(ctx, key, rr); err != nil {
+			return err
+		}
+	}
+	s.routeMu.Lock()
+	s.routeReady[group] = true
+	s.routeMu.Unlock()
+	return nil
+}
+
+func routeRecordNewer(next, cur clusterstate.RouteRecord) bool {
+	if cur.Meta.Ballot.Less(next.Meta.Ballot) {
+		return true
+	}
+	return cur.Meta.Ballot == next.Meta.Ballot && cur.Meta.Rev < next.Meta.Rev
+}
+
 // GetSandbox returns the route_link record + its revision (for CAS).
 func (s *Stores) GetSandbox(ctx context.Context, group, routeKey string) (rec *SandboxRecord, rev int64, found bool, err error) {
 	q, err := s.routeQuorum(group)
@@ -915,6 +1138,9 @@ func (s *Stores) rangeGroupRoutes(ctx context.Context, group string, includeBuil
 	}
 	if group == "" {
 		return fmt.Errorf("registry: group is required for route_link list")
+	}
+	if err := s.ensureRouteGroupReady(ctx, group); err != nil {
+		return err
 	}
 	routes, err := s.localRoute.ListGroup(ctx, group)
 	if err != nil {
@@ -1124,6 +1350,10 @@ func (r unavailableRouteReplica) Repair(context.Context, string, clusterstate.Ro
 
 func (r unavailableRouteReplica) MaxBallot(context.Context, string) (clusterstate.Ballot, error) {
 	return clusterstate.Ballot{}, r.err()
+}
+
+func (r unavailableRouteReplica) ListGroup(context.Context, string) ([]clusterstate.RouteRecord, error) {
+	return nil, r.err()
 }
 
 type unavailableNodeReplica struct{ id string }

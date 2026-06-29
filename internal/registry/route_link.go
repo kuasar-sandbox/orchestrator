@@ -3,7 +3,10 @@ package registry
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
+
+	clusterstate "github.com/kuasar-sandbox/sandbox-orchestrator/internal/cluster"
 )
 
 // route_link paths. Routers and operator tools dial this link for group-scoped
@@ -81,7 +84,7 @@ func (r *Registry) serveList(w http.ResponseWriter, req *http.Request) {
 		}
 		return nil
 	}); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		http.Error(w, err.Error(), routeLinkStatus(err))
 		return
 	}
 	writeJSON(w, out)
@@ -95,6 +98,10 @@ func (r *Registry) serveReserveBuild(w http.ResponseWriter, req *http.Request) {
 	}
 	if br.Group == "" {
 		br.Group = req.URL.Query().Get("group")
+	}
+	if br.Group == "" {
+		http.Error(w, "group is required", http.StatusBadRequest)
+		return
 	}
 	res, err := r.ReserveBuild(req.Context(), br)
 	if err != nil {
@@ -117,7 +124,12 @@ func (r *Registry) serveBuild(w http.ResponseWriter, req *http.Request) {
 
 func (r *Registry) serveReserve(w http.ResponseWriter, req *http.Request) {
 	q := req.URL.Query()
-	res, err := r.ReserveSandbox(req.Context(), q.Get("group"), q.Get("route_key"), nil)
+	group, routeKey := q.Get("group"), q.Get("route_key")
+	if group == "" || routeKey == "" {
+		http.Error(w, "group and route_key are required", http.StatusBadRequest)
+		return
+	}
+	res, err := r.ReserveSandbox(req.Context(), group, routeKey, nil)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
@@ -163,4 +175,13 @@ func (r *Registry) ResolveSID(ctx context.Context, group, routeKey, sid string) 
 func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+func routeLinkStatus(err error) int {
+	switch {
+	case errors.Is(err, ErrShardNotReady), errors.Is(err, clusterstate.ErrQuorum):
+		return http.StatusServiceUnavailable
+	default:
+		return http.StatusBadRequest
+	}
 }

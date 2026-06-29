@@ -1,7 +1,7 @@
 // Package router is the cluster's e2b-compatible unified ingress
 // (cluster-router.md): it serves the e2b control plane (api.<domain>) and the
 // data plane (<port>-<sid>.<domain>) by Host, reserving sandboxes through the
-// registry's control API and forwarding the data plane to the placed node (the
+// registry's control API and forwarding the data plane to the target node (the
 // two-hop path: client -> router -> node data endpoint -> guest).
 package router
 
@@ -452,7 +452,15 @@ func (rt *Router) handleList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer resp.Body.Close()
-	w.Header().Set("Content-Type", "application/json")
+	for k, vals := range resp.Header {
+		for _, v := range vals {
+			w.Header().Add(k, v)
+		}
+	}
+	if w.Header().Get("Content-Type") == "" {
+		w.Header().Set("Content-Type", "application/json")
+	}
+	w.WriteHeader(resp.StatusCode)
 	_, _ = io.Copy(w, resp.Body)
 }
 
@@ -612,7 +620,7 @@ func (rt *Router) forwardSandboxData(w http.ResponseWriter, r *http.Request, rr 
 	}
 	proxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, e error) {
 		// A cached route that fails is likely stale (sandbox moved/gone): evict it so
-		// the next request re-resolves via the watch / control (§5 stale → fallback).
+		// the next request re-resolves via route_link control (§5 stale → fallback).
 		rt.evictRoute(rr.Group, rr.RouteKey, sid)
 		rt.mx.Inc(`router_requests_total{plane="data",result="bad_gateway"}`)
 		rt.log.Warn("router: data forward", "sid", sid, "node", rr.NodeID, "err", e)

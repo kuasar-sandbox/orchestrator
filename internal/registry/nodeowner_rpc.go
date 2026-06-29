@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/routesync"
 )
@@ -24,13 +25,16 @@ type nodeOwnerRequest struct {
 	BuildID         string                    `json:"build_id,omitempty"`
 	Resources       *routesync.BuildResources `json:"resources,omitempty"`
 	SID             string                    `json:"sid,omitempty"`
+	Command         *routesync.Command        `json:"command,omitempty"`
+	TimeoutMS       int64                     `json:"timeout_ms,omitempty"`
 }
 
 type nodeOwnerResponse struct {
-	OK    bool        `json:"ok,omitempty"`
-	Node  *NodeRecord `json:"node,omitempty"`
-	Found bool        `json:"found,omitempty"`
-	Error string      `json:"error,omitempty"`
+	OK    bool              `json:"ok,omitempty"`
+	Node  *NodeRecord       `json:"node,omitempty"`
+	Found bool              `json:"found,omitempty"`
+	Ack   *routesync.CmdAck `json:"ack,omitempty"`
+	Error string            `json:"error,omitempty"`
 }
 
 func ServeNodeOwner(w http.ResponseWriter, req *http.Request, owner NodeOwner) {
@@ -66,6 +70,13 @@ func ServeNodeOwner(w http.ResponseWriter, req *http.Request, owner NodeOwner) {
 		out.OK = err == nil
 	case "delete_sandbox":
 		err = owner.DeleteSandbox(req.Context(), in.NodeID, in.SID)
+		out.OK = err == nil
+	case "send_command":
+		err = owner.SendCommand(req.Context(), in.NodeID, in.Command)
+		out.OK = err == nil
+	case "send_command_wait":
+		timeout := time.Duration(in.TimeoutMS) * time.Millisecond
+		out.Ack, err = owner.SendCommandAndWait(req.Context(), in.NodeID, in.Command, timeout)
 		out.OK = err == nil
 	default:
 		err = fmt.Errorf("registry: unknown node-owner op %q", in.Op)
@@ -127,6 +138,16 @@ func (o *HTTPNodeOwner) Runtime(ctx context.Context, nodeID string) (*NodeRecord
 func (o *HTTPNodeOwner) DeleteSandbox(ctx context.Context, nodeID, sid string) error {
 	_, err := o.call(ctx, nodeOwnerRequest{Op: "delete_sandbox", NodeID: nodeID, SID: sid})
 	return err
+}
+
+func (o *HTTPNodeOwner) SendCommand(ctx context.Context, nodeID string, cmd *routesync.Command) error {
+	_, err := o.call(ctx, nodeOwnerRequest{Op: "send_command", NodeID: nodeID, Command: cmd})
+	return err
+}
+
+func (o *HTTPNodeOwner) SendCommandAndWait(ctx context.Context, nodeID string, cmd *routesync.Command, timeout time.Duration) (*routesync.CmdAck, error) {
+	out, err := o.call(ctx, nodeOwnerRequest{Op: "send_command_wait", NodeID: nodeID, Command: cmd, TimeoutMS: timeout.Milliseconds()})
+	return out.Ack, err
 }
 
 func (o *HTTPNodeOwner) call(ctx context.Context, in nodeOwnerRequest) (nodeOwnerResponse, error) {

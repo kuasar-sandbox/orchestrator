@@ -180,6 +180,48 @@ func (c *fakeConn) send(cmd *routesync.Command) error {
 	return nil
 }
 
+type remoteLifecycleOwner struct {
+	reg      *Registry
+	commands int
+}
+
+func (o *remoteLifecycleOwner) PutManifestKey(ctx context.Context, nodeID, fingerprint, keyType, keyValue string, expiresUnix int64) error {
+	return nil
+}
+
+func (o *remoteLifecycleOwner) DropManifestKey(ctx context.Context, nodeID, fingerprint string) error {
+	return nil
+}
+
+func (o *remoteLifecycleOwner) AdmitBuild(ctx context.Context, nodeID, buildID string, want *routesync.BuildResources) bool {
+	return true
+}
+
+func (o *remoteLifecycleOwner) ReleaseBuild(ctx context.Context, buildID string) {}
+
+func (o *remoteLifecycleOwner) Runtime(ctx context.Context, nodeID string) (*NodeRecord, bool, error) {
+	return o.reg.stores.GetNode(ctx, nodeID)
+}
+
+func (o *remoteLifecycleOwner) DeleteSandbox(ctx context.Context, nodeID, sid string) error {
+	return nil
+}
+
+func (o *remoteLifecycleOwner) SendCommand(ctx context.Context, nodeID string, cmd *routesync.Command) error {
+	o.commands++
+	return nil
+}
+
+func (o *remoteLifecycleOwner) SendCommandAndWait(ctx context.Context, nodeID string, cmd *routesync.Command, timeout time.Duration) (*routesync.CmdAck, error) {
+	o.commands++
+	if cmd.Kind == routesync.CmdCreate {
+		_, _ = o.reg.stores.PutSandbox(ctx, &SandboxRecord{
+			Group: cmd.Group, RouteKey: cmd.RouteKey, SID: cmd.SID, State: StateReady, NodeID: nodeID, AccessToken: cmd.AccessToken,
+		})
+	}
+	return &routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted}, nil
+}
+
 func TestReserveSandboxCreateFlow(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
@@ -195,6 +237,7 @@ func TestReserveSandboxCreateFlow(t *testing.T) {
 		if cmd.Kind != routesync.CmdCreate {
 			return
 		}
+		go reg.ackCommand(&routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted})
 		go reg.applyRoute(context.Background(), "n1", &routesync.RouteEntry{
 			SandboxID: cmd.SID, Group: cmd.Group, RouteKey: cmd.RouteKey,
 			State: routesync.StateRunning,
@@ -246,6 +289,7 @@ func TestReserveSandboxCreateUsesDerivedAccessToken(t *testing.T) {
 			return
 		}
 		commandToken = cmd.AccessToken
+		go reg.ackCommand(&routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted})
 		go reg.applyRoute(context.Background(), "n1", &routesync.RouteEntry{
 			SandboxID: cmd.SID, Group: cmd.Group, RouteKey: cmd.RouteKey,
 			State: routesync.StateRunning, AccessToken: cmd.AccessToken,
@@ -315,6 +359,7 @@ func TestReserveSandboxCreateUsesPlacementMaterial(t *testing.T) {
 		}
 		cp := *cmd
 		got = &cp
+		go reg.ackCommand(&routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted})
 		go reg.applyRoute(context.Background(), "n1", &routesync.RouteEntry{
 			SandboxID: cmd.SID, Group: cmd.Group, RouteKey: cmd.RouteKey,
 			State: routesync.StateRunning, AccessToken: cmd.AccessToken,
@@ -333,6 +378,52 @@ func TestReserveSandboxCreateUsesPlacementMaterial(t *testing.T) {
 	}
 	if got.KeyFingerprint != keyFingerprint(testMK) {
 		t.Fatalf("key fingerprint=%q, want provider key fp", got.KeyFingerprint)
+	}
+}
+
+func TestReserveSandboxCreateUsesRemoteNodeOwner(t *testing.T) {
+	ctx := context.Background()
+	kv := clusterstore.OpenMemory(0)
+	defer kv.Close()
+	reg := New(NewStores(kv), placementWithToken("n-remote"), time.Second, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n-remote", LinkOwner: "remote", DataEndpoint: "10.0.0.2:8443"}); err != nil {
+		t.Fatal(err)
+	}
+	owner := &remoteLifecycleOwner{reg: reg}
+	reg.SetRemoteNodeOwners(map[string]NodeOwner{"remote": owner})
+
+	res, err := reg.ReserveSandbox(ctx, "/g", "rk", nil)
+	if err != nil {
+		t.Fatalf("reserve via remote owner: %v", err)
+	}
+	if res.NodeID != "n-remote" || res.DataEndpoint != "10.0.0.2:8443" || owner.commands != 1 {
+		t.Fatalf("res=%+v commands=%d", res, owner.commands)
+	}
+}
+
+func TestReserveSandboxReadyRouteUsesRemoteNodeOwnerRuntime(t *testing.T) {
+	ctx := context.Background()
+	kv := clusterstore.OpenMemory(0)
+	defer kv.Close()
+	reg := New(NewStores(kv), placementFunc(func(context.Context, PlaceRequest) (*Placement, error) {
+		t.Fatal("ready route should not call placer")
+		return nil, nil
+	}), time.Second, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n-remote", LinkOwner: "remote", DataEndpoint: "10.0.0.2:8443"}); err != nil {
+		t.Fatal(err)
+	}
+	owner := &remoteLifecycleOwner{reg: reg}
+	reg.SetRemoteNodeOwners(map[string]NodeOwner{"remote": owner})
+	_, _ = reg.stores.PutSandbox(ctx, &SandboxRecord{
+		Group: "/g", RouteKey: "rk", SID: "sb-ready", State: StateReady, NodeID: "n-remote", AccessToken: "tok",
+	})
+
+	res, err := reg.ReserveSandbox(ctx, "/g", "rk", nil)
+	if err != nil {
+		t.Fatalf("reserve ready via remote owner: %v", err)
+	}
+	if res.NodeID != "n-remote" || res.DataEndpoint != "10.0.0.2:8443" || owner.commands != 0 {
+		t.Fatalf("res=%+v commands=%d", res, owner.commands)
 	}
 }
 
@@ -434,7 +525,11 @@ func TestParkTimeoutRollback(t *testing.T) {
 	reg := New(NewStores(kv), nil, 200*time.Millisecond, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	reg.SetPlacer(placementWithToken("n1"))
 	reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"})
-	reg.addNode(&fakeConn{nodeID: "n1"}) // accepts create but never reports running
+	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(cmd *routesync.Command) {
+		if cmd.Kind == routesync.CmdCreate {
+			go reg.ackCommand(&routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted})
+		}
+	}}) // accepts create but never reports running
 
 	_, err := reg.ReserveSandbox(ctx, "/g", "rk", nil)
 	if err == nil {
@@ -462,6 +557,7 @@ func TestReplaceOnRejectSucceeds(t *testing.T) {
 			go reg.ackCommand(&routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckRejected, Reason: "transient"})
 			return
 		}
+		go reg.ackCommand(&routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted})
 		go reg.applyRoute(context.Background(), "n1", &routesync.RouteEntry{
 			SandboxID: cmd.SID, Group: cmd.Group, RouteKey: cmd.RouteKey, State: routesync.StateRunning, AccessToken: "tok",
 		})
@@ -493,6 +589,7 @@ func TestReservePausedResume(t *testing.T) {
 		if cmd.Kind != routesync.CmdConnect {
 			return
 		}
+		go reg.ackCommand(&routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted})
 		go reg.applyRoute(context.Background(), "n1", &routesync.RouteEntry{
 			SandboxID: "sb-x", Group: "/g", RouteKey: "rk", State: routesync.StateRunning,
 		})
@@ -705,6 +802,85 @@ func TestSandboxKeyNoCollision(t *testing.T) {
 	rab, _, _, _ := reg.stores.GetSandbox(ctx, "/a/b", "y")
 	if r1 == nil || r1.SID != "sb-1" || rab == nil || rab.SID != "sb-ab" {
 		t.Fatalf("key aliasing overwrote a different tenant: (/a,b/y)=%v (/a/b,y)=%v", r1, rab)
+	}
+}
+
+func TestRangeSandboxesWarmsGroupViewAndPublishesRouteWatch(t *testing.T) {
+	ctx := context.Background()
+	kv := clusterstore.OpenMemory(0)
+	defer kv.Close()
+	remote := clusterstate.NewMemoryRouteReplica()
+	view := clusterstate.MemberView{Version: 1, Members: []string{"r1", "r2"}}
+	stores := NewClusterStores(kv, "r1", view, 2, 1, map[string]clusterstate.RouteReplica{"r2": remote}, nil)
+
+	rev, err := stores.RouteGroupRev(ctx, "/g")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch, err := stores.WatchRouteGroup(ctx, "/g", rev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seed := clusterstate.RouteRecord{
+		Meta:      clusterstate.RecordMeta{Ballot: clusterstate.Ballot{Round: 7, Writer: "remote"}, Rev: 1, UpdatedAt: time.Now()},
+		Group:     "/g",
+		RouteKey:  "rk",
+		SandboxID: "sb-warm",
+		State:     clusterstate.RouteReady,
+		NodeID:    "n1",
+	}
+	if ok, err := remote.Accept(ctx, clusterstate.RouteKey("/g", "rk"), seed, seed.Meta.Ballot); err != nil || !ok {
+		t.Fatalf("seed remote route ok=%v err=%v", ok, err)
+	}
+
+	var got []string
+	if err := stores.RangeSandboxes(ctx, "/g", func(s *SandboxRecord) error {
+		got = append(got, s.SID)
+		return nil
+	}); err != nil {
+		t.Fatalf("range warm: %v", err)
+	}
+	if len(got) != 1 || got[0] != "sb-warm" {
+		t.Fatalf("range got %v, want [sb-warm]", got)
+	}
+	select {
+	case ev := <-ch:
+		if ev.Type != clusterstore.EventPut || ev.Key != "rk" {
+			t.Fatalf("route watch event=%+v", ev)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("route watch did not receive warmup repair")
+	}
+}
+
+func TestNodeFullSnapshotDeletesMissingSandboxRefs(t *testing.T) {
+	ctx := context.Background()
+	reg := testReg(t)
+	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1", Sandboxes: []clusterstate.NodeSandboxRef{
+		{Group: "/g", RouteKey: "keep", SandboxID: "sb-keep"},
+		{Group: "/g", RouteKey: "gone", SandboxID: "sb-gone"},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = reg.stores.PutSandbox(ctx, &SandboxRecord{Group: "/g", RouteKey: "keep", SID: "sb-keep", State: StateReady, NodeID: "n1"})
+	_, _ = reg.stores.PutSandbox(ctx, &SandboxRecord{Group: "/g", RouteKey: "gone", SID: "sb-gone", State: StateReady, NodeID: "n1"})
+	reg.indexSID("sb-keep", "/g", "keep")
+	reg.indexSID("sb-gone", "/g", "gone")
+
+	reg.applyNodeFullSnapshot(ctx, "n1", map[string]string{clusterstate.RouteKey("/g", "keep"): "sb-keep"})
+
+	if _, _, found, _ := reg.stores.GetSandbox(ctx, "/g", "gone"); found {
+		t.Fatal("full snapshot should delete route missing from node range")
+	}
+	if _, _, found, _ := reg.stores.GetSandbox(ctx, "/g", "keep"); !found {
+		t.Fatal("full snapshot deleted present route")
+	}
+	node, found, err := reg.stores.GetNode(ctx, "n1")
+	if err != nil || !found {
+		t.Fatalf("node found=%v err=%v", found, err)
+	}
+	if len(node.Sandboxes) != 1 || node.Sandboxes[0].RouteKey != "keep" {
+		t.Fatalf("node refs after full snapshot=%+v", node.Sandboxes)
 	}
 }
 

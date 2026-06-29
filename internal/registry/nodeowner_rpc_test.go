@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/routesync"
 )
@@ -43,6 +44,16 @@ func (o *rpcNodeOwner) DeleteSandbox(ctx context.Context, nodeID, sid string) er
 	return nil
 }
 
+func (o *rpcNodeOwner) SendCommand(ctx context.Context, nodeID string, cmd *routesync.Command) error {
+	o.ops = append(o.ops, "send:"+nodeID+":"+cmd.Kind)
+	return nil
+}
+
+func (o *rpcNodeOwner) SendCommandAndWait(ctx context.Context, nodeID string, cmd *routesync.Command, timeout time.Duration) (*routesync.CmdAck, error) {
+	o.ops = append(o.ops, "wait:"+nodeID+":"+cmd.Kind)
+	return &routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted}, nil
+}
+
 func TestHTTPNodeOwner(t *testing.T) {
 	ctx := context.Background()
 	owner := &rpcNodeOwner{admit: true}
@@ -69,7 +80,14 @@ func TestHTTPNodeOwner(t *testing.T) {
 	if err := client.DeleteSandbox(ctx, "n1", "sb1"); err != nil {
 		t.Fatal(err)
 	}
-	wantOps := []string{"put:n1:fp:inline:mk", "drop:n1:fp", "admit:n1:b1", "delete:n1:sb1"}
+	if err := client.SendCommand(ctx, "n1", &routesync.Command{CmdID: "c1", Kind: routesync.CmdDelete, SID: "sb2"}); err != nil {
+		t.Fatal(err)
+	}
+	ack, err := client.SendCommandAndWait(ctx, "n1", &routesync.Command{CmdID: "c2", Kind: routesync.CmdCreate}, time.Second)
+	if err != nil || ack == nil || ack.Status != routesync.AckAccepted {
+		t.Fatalf("send wait ack=%+v err=%v", ack, err)
+	}
+	wantOps := []string{"put:n1:fp:inline:mk", "drop:n1:fp", "admit:n1:b1", "delete:n1:sb1", "send:n1:delete", "wait:n1:create"}
 	if len(owner.ops) != len(wantOps) {
 		t.Fatalf("ops=%v want %v", owner.ops, wantOps)
 	}

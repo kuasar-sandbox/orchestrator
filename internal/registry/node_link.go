@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"sync"
 
+	clusterstate "github.com/kuasar-sandbox/sandbox-orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/routesync"
 )
 
@@ -75,6 +76,8 @@ func (r *Registry) ServeNodeLink(w http.ResponseWriter, req *http.Request) {
 	r.onNodeConnected() // predistribute this node's groups' manifest keys (§7.6)
 	r.log.Info("node-link: node connected", "node", nr.NodeID, "labels", nr.Labels)
 
+	collectingFull := true
+	fullSeen := map[string]string{}
 	for {
 		m, err := routesync.ReadMsg(body)
 		if err != nil {
@@ -86,6 +89,9 @@ func (r *Registry) ServeNodeLink(w http.ResponseWriter, req *http.Request) {
 		switch m.Type {
 		case routesync.TypeUpsert:
 			if m.Route != nil {
+				if collectingFull && m.Route.Group != "" && m.Route.RouteKey != "" {
+					fullSeen[clusterstate.RouteKey(m.Route.Group, m.Route.RouteKey)] = m.Route.SandboxID
+				}
 				r.applyRoute(ctx, nr.NodeID, m.Route)
 			}
 		case routesync.TypeDelete:
@@ -95,8 +101,7 @@ func (r *Registry) ServeNodeLink(w http.ResponseWriter, req *http.Request) {
 				r.updateHeartbeat(ctx, nr.NodeID, m.Beat)
 			}
 		case routesync.TypeCmdAck:
-			// Command receipt: wakes a sendAndWait (key gating) or fast-fails a
-			// rejected lifecycle command's Reserve (cluster.md §5.1).
+			// Command receipt wakes the matching node-owner SendCommandAndWait.
 			r.ackCommand(m.Ack)
 		case routesync.TypeBuildEvent:
 			// Build state transition: converge the BuildStore (§7.5); a terminal
@@ -105,6 +110,11 @@ func (r *Registry) ServeNodeLink(w http.ResponseWriter, req *http.Request) {
 				r.applyBuildEvent(ctx, nr.NodeID, m.Build)
 			}
 		case routesync.TypeBookmark:
+			if collectingFull && m.FullSync {
+				r.applyNodeFullSnapshot(ctx, nr.NodeID, fullSeen)
+			}
+			collectingFull = false
+			fullSeen = nil
 			if m.RevToken != "" {
 				r.updateNodeResume(ctx, nr.NodeID, m.RevToken)
 			}

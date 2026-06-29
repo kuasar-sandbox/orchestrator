@@ -121,6 +121,7 @@ type Msg struct {
 	Ack      *CmdAck       `json:"cmd_ack,omitempty"`
 	Rev      int64         `json:"rev,omitempty"` // per-shard monotonic revision for resume_from (§5.3)
 	RevToken string        `json:"rev_token,omitempty"`
+	FullSync bool          `json:"full_sync,omitempty"`   // bookmark follows a full snapshot, not an incremental replay
 	Build    *BuildEvent   `json:"build_event,omitempty"` // node -> registry build state (§5.1/§7.5)
 }
 

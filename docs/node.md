@@ -821,8 +821,9 @@ files 转发本机 e2b 控制面(§4),数据面业务流量经 router 注入 `E2
   (§2.5 即 node-resource.md `resource drain`)置位;喂集群 P2C / 放置排除(cluster-scaler.md §4)。
 - **路由 / 构建事件上报**(节点为权威,下行):沙箱状态变化发 `sandbox{sid, group, route_key, state,
   snap_loc, access_token, migration_token?, template_id}`;构建状态变化发 `build{build_id, group, state, template_id?,
-  reason?}`;消失发 `delete{sid|build_id}`;首 / 重连末尾 `bookmark`。**group / route_key 从沙箱 metadata
-  的 `kuasar-sandbox.cluster` 命名空间解析**(§4.6)。
+  reason?}`;消失发 `delete{sid|build_id}`;首 / 重连末尾 `bookmark`。全量 Range 结束的 bookmark 带
+  `full_sync=true`,registry 据此清理本 node 记录中本轮未出现的 sandbox refs;增量 replay 的 bookmark
+  不触发缺失清理。**group / route_key 从沙箱 metadata 的 `kuasar-sandbox.cluster` 命名空间解析**(§4.6)。
 - **命令受理**(registry 上行下发):serve 以**既有 e2b 生命周期原语**(§8 / §8.1)执行,以 sid /
   build_id 幂等,受理即回 `cmd_ack`,终态经上述事件上报(cluster.md §5.2):
 

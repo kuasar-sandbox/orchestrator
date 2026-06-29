@@ -39,6 +39,9 @@ const buildRegisterAckTimeout = 5 * time.Second
 // up), and a build_register command hands the node the ids + image-pull creds.
 // Build state flows back as build events (releasing the reservation on terminal).
 func (r *Registry) ReserveBuild(ctx context.Context, req BuildReserveReq) (*BuildReserveResult, error) {
+	if req.Group == "" {
+		return nil, fmt.Errorf("registry: group is required")
+	}
 	resources := req.Resources
 	if resources == nil {
 		resources = defaultBuildResources
@@ -58,10 +61,6 @@ func (r *Registry) ReserveBuild(ctx context.Context, req BuildReserveReq) (*Buil
 			return nil, ErrNoNode
 		}
 		id := placement.NodeID
-		conn, live := r.node(id)
-		if !live {
-			continue
-		}
 		if !r.admitBuild(ctx, id, buildID, resources) {
 			if attempt == 0 {
 				continue // node owner budget rejected; re-ask the placer
@@ -81,8 +80,14 @@ func (r *Registry) ReserveBuild(ctx context.Context, req BuildReserveReq) (*Buil
 			BuildID: buildID, TemplateRef: templateID, BuildResources: resources, Config: req.Metadata,
 			KeyFingerprint: placement.KeyFingerprint, ImageRepo: placement.ImageRepo, RegistryAuth: placement.RegistryAuth,
 		}
-		ack, err := r.sendAndWait(ctx, conn, cmd, buildRegisterAckTimeout)
-		if err != nil || ack.Status != routesync.AckAccepted {
+		if r.nodeOwner == nil {
+			_ = r.stores.DeleteBuild(ctx, req.Group, buildID)
+			_ = r.stores.RemoveNodeBuildRef(ctx, id, req.Group, buildID)
+			r.releaseBuildAdmission(buildID)
+			return nil, ErrNodeGone
+		}
+		ack, err := r.nodeOwner.SendCommandAndWait(ctx, id, cmd, buildRegisterAckTimeout)
+		if err != nil || ack == nil || ack.Status != routesync.AckAccepted {
 			_ = r.stores.DeleteBuild(ctx, req.Group, buildID) // roll back the reservation
 			_ = r.stores.RemoveNodeBuildRef(ctx, id, req.Group, buildID)
 			r.releaseBuildAdmission(buildID)
@@ -92,7 +97,11 @@ func (r *Registry) ReserveBuild(ctx context.Context, req BuildReserveReq) (*Buil
 			if err != nil {
 				return nil, err
 			}
-			return nil, fmt.Errorf("registry: build_register rejected: %s", ack.Reason)
+			reason := ""
+			if ack != nil {
+				reason = ack.Reason
+			}
+			return nil, fmt.Errorf("registry: build_register rejected: %s", reason)
 		}
 		break
 	}

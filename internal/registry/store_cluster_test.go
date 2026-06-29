@@ -309,3 +309,13 @@ func (r *routingNodeOwnerRecorder) DeleteSandbox(ctx context.Context, nodeID, si
 	r.deleted = append(r.deleted, nodeID+"/"+sid)
 	return nil
 }
+
+func (r *routingNodeOwnerRecorder) SendCommand(ctx context.Context, nodeID string, cmd *routesync.Command) error {
+	r.deleted = append(r.deleted, nodeID+"/"+cmd.Kind)
+	return nil
+}
+
+func (r *routingNodeOwnerRecorder) SendCommandAndWait(ctx context.Context, nodeID string, cmd *routesync.Command, timeout time.Duration) (*routesync.CmdAck, error) {
+	r.deleted = append(r.deleted, nodeID+"/"+cmd.Kind)
+	return &routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted}, nil
+}
