@@ -22,7 +22,7 @@ func TestRegistryReloadRejectsDirectActiveSwitchWithoutJointConfig(t *testing.T)
 	}))
 	cfgState, reg := newRegistryReloadTestRuntime(t, old)
 
-	err := reloadRegistryConfig(context.Background(), path, old, cfgState, reg)
+	err := reloadRegistryConfig(context.Background(), path, old, cfgState, reg, nil, nil)
 	if err == nil {
 		t.Fatal("direct active membership switch without prior joint config should be rejected")
 	}
@@ -41,7 +41,7 @@ func TestRegistryReloadAllowsCutoverFromConfiguredNextMembership(t *testing.T) {
 	}))
 	cfgState, reg := newRegistryReloadTestRuntime(t, old)
 
-	if err := reloadRegistryConfig(context.Background(), path, old, cfgState, reg); err != nil {
+	if err := reloadRegistryConfig(context.Background(), path, old, cfgState, reg, nil, nil); err != nil {
 		t.Fatalf("cutover from old next membership should reload: %v", err)
 	}
 	if got := cfgState.get().Membership.Active; got != 2 {
@@ -72,7 +72,7 @@ membership:
     node_link: 2
     node_list: 2
 `)
-	views, _, _, _, nodeOwners, err := buildRegistryTopology(cfg)
+	views, _, _, _, nodeOwners, err := buildRegistryTopology(cfg, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -84,11 +84,26 @@ membership:
 	}
 }
 
+func TestNewRegistryStoresSetsNodeListHeartbeatRefresh(t *testing.T) {
+	cfg := loadRegistryReloadTestConfig(t, registryReloadTestConfig(1, 0, "registry-b", map[int][]string{
+		1: {"registry-a", "registry-b", "registry-c"},
+	}))
+	kv := clusterstore.OpenMemory(cfg.NodeLink.RevisionRetention)
+	defer kv.Close()
+	stores, _, err := newRegistryStores(kv, cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := stores.NodeListHeartbeatRefreshSec(); got != 1 {
+		t.Fatalf("node_list heartbeat refresh sec = %d, want 1 for node_dead_after=3s", got)
+	}
+}
+
 func newRegistryReloadTestRuntime(t *testing.T, cfg *clustercfg.RegistryConfig) (*registryRuntimeConfig, *registry.Registry) {
 	t.Helper()
 	kv := clusterstore.OpenMemory(cfg.NodeLink.RevisionRetention)
 	t.Cleanup(func() { kv.Close() })
-	stores, remoteNodeOwners, err := newRegistryStores(kv, cfg)
+	stores, remoteNodeOwners, err := newRegistryStores(kv, cfg, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

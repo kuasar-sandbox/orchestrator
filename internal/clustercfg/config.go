@@ -91,7 +91,12 @@ type NodeListConfig struct {
 type ScaleLinkConfig struct {
 	ScalerReplicaCount int    `yaml:"scaler_replica_count"`
 	MinReadyScalers    int    `yaml:"min_ready_scalers"`
+	ScalerLabel        string `yaml:"scaler_label"`
 	PlaceTimeout       string `yaml:"place_timeout"`
+}
+
+type ScalerMemberlistConfig struct {
+	Label string `yaml:"label"`
 }
 
 // RegistryDialConfig is how a consumer reaches the registry bootstrap endpoint.
@@ -368,7 +373,7 @@ func DefaultRegistry() RegistryConfig {
 		NodeLink:  NodeLinkConfig{HeartbeatInterval: "10s", NodeDeadAfter: "30s", RevisionRetention: 10000},
 		RouteLink: RouteLinkConfig{ParkTimeout: "30s"},
 		NodeList:  NodeListConfig{WatchRetention: 10000},
-		ScaleLink: ScaleLinkConfig{ScalerReplicaCount: 3, MinReadyScalers: 1, PlaceTimeout: "2s"},
+		ScaleLink: ScaleLinkConfig{ScalerReplicaCount: 3, MinReadyScalers: 1, ScalerLabel: "scaler.default", PlaceTimeout: "2s"},
 	}
 }
 
@@ -448,6 +453,9 @@ func (c *RegistryConfig) applyDefaults() {
 	}
 	if c.ScaleLink.MinReadyScalers == 0 {
 		c.ScaleLink.MinReadyScalers = d.ScaleLink.MinReadyScalers
+	}
+	if c.ScaleLink.ScalerLabel == "" {
+		c.ScaleLink.ScalerLabel = d.ScaleLink.ScalerLabel
 	}
 	if c.ScaleLink.PlaceTimeout == "" {
 		c.ScaleLink.PlaceTimeout = d.ScaleLink.PlaceTimeout
@@ -539,6 +547,9 @@ func (c *RegistryConfig) Validate() error {
 	}
 	if c.ScaleLink.MinReadyScalers > c.ScaleLink.ScalerReplicaCount {
 		return fmt.Errorf("clustercfg: scale_link.min_ready_scalers must not exceed scaler_replica_count")
+	}
+	if c.ScaleLink.ScalerLabel == "" {
+		return fmt.Errorf("clustercfg: scale_link.scaler_label is required")
 	}
 	return validateDurations(map[string]string{
 		"node_link.heartbeat_interval": c.NodeLink.HeartbeatInterval,
@@ -689,17 +700,19 @@ func (c *RouterConfig) RouteIdleDur() time.Duration {
 // membership through the bootstrap endpoint, pushes itself to scale_link, and
 // answers placement calls from registry route owners.
 type ScalerConfig struct {
-	Member    MemberConfig       `yaml:"member"`
-	Registry  RegistryDialConfig `yaml:"registry"`  // upstream: registry bootstrap/membership
-	Placement PlacementConfig    `yaml:"placement"` // placement policy
+	Member     MemberConfig           `yaml:"member"`
+	Memberlist ScalerMemberlistConfig `yaml:"memberlist"`
+	Registry   RegistryDialConfig     `yaml:"registry"`  // upstream: registry bootstrap/membership
+	Placement  PlacementConfig        `yaml:"placement"` // placement policy
 }
 
 // DefaultScaler returns the scaler config with all non-required fields set.
 func DefaultScaler() ScalerConfig {
 	return ScalerConfig{
-		Member:    MemberConfig{ID: "scaler", Listen: ":7800"},
-		Registry:  RegistryDialConfig{Bootstrap: defaultRegistryBootstrap},
-		Placement: PlacementConfig{Candidates: 2, ZoneAdmitMax: "yellow", NodeDeadAfter: "30s"},
+		Member:     MemberConfig{ID: "scaler", Listen: ":7800"},
+		Memberlist: ScalerMemberlistConfig{Label: "scaler.default"},
+		Registry:   RegistryDialConfig{Bootstrap: defaultRegistryBootstrap},
+		Placement:  PlacementConfig{Candidates: 2, ZoneAdmitMax: "yellow", NodeDeadAfter: "30s"},
 	}
 }
 
@@ -733,6 +746,9 @@ func (c *ScalerConfig) applyDefaults() {
 	if c.Member.Advertise == "" {
 		c.Member.Advertise = c.Member.Listen
 	}
+	if c.Memberlist.Label == "" {
+		c.Memberlist.Label = d.Memberlist.Label
+	}
 	if c.Registry.Bootstrap == "" {
 		c.Registry.Bootstrap = d.Registry.Bootstrap
 	}
@@ -756,6 +772,9 @@ func (c *ScalerConfig) Validate() error {
 	}
 	if c.Registry.Bootstrap == "" {
 		return fmt.Errorf("clustercfg: registry.bootstrap is required")
+	}
+	if c.Memberlist.Label == "" {
+		return fmt.Errorf("clustercfg: memberlist.label is required")
 	}
 	switch c.Placement.ZoneAdmitMax {
 	case "", "green", "yellow", "red":

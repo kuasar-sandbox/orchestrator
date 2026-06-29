@@ -48,9 +48,11 @@ func TestScalerDirectPlace(t *testing.T) {
 	svc.ServeScaleLink(scalerMux)
 	scalerSrv := httptest.NewServer(scalerMux)
 	defer scalerSrv.Close()
+	reg.SetScalerPeerSource(func(string) []registry.ScalerPeer {
+		return []registry.ScalerPeer{{ID: "s1", Advertise: scalerSrv.URL}}
+	})
 	svc.groups.replace([]clusterstate.SandboxGroupRecord{{Group: "/g", NodeSelectors: []map[string]string{{"pool": "p"}}}})
 	svc.Start(ctx)
-	go svc.RegisterLoop(ctx, "s1", scalerSrv.URL, "")
 
 	var placement *registry.Placement
 	var err error
@@ -92,10 +94,15 @@ func TestScalerUsesSingleNodeListSourceAndRegistersAllRegistryMembers(t *testing
 	svc.ServeScaleLink(scalerMux)
 	scalerSrv := httptest.NewServer(scalerMux)
 	defer scalerSrv.Close()
+	reg1.SetScalerPeerSource(func(string) []registry.ScalerPeer {
+		return []registry.ScalerPeer{{ID: "s1", Advertise: scalerSrv.URL}}
+	})
+	reg2.SetScalerPeerSource(func(string) []registry.ScalerPeer {
+		return []registry.ScalerPeer{{ID: "s1", Advertise: scalerSrv.URL}}
+	})
 	defer cancel()
 	svc.ImportGroups([]clusterstate.SandboxGroupRecord{{Group: "/g", NodeSelectors: []map[string]string{{"pool": "p"}}}})
 	svc.Start(ctx)
-	go svc.RegisterLoop(ctx, "s1", scalerSrv.URL, "")
 
 	for i := 0; i < 300; i++ {
 		if len(svc.nodes.values()) == 1 {
@@ -180,6 +187,42 @@ func TestSubscribeOnceUsesOpaqueWatchToken(t *testing.T) {
 	}
 	if values.Get("from") != "registry.1.test:7" {
 		t.Fatalf("query %q did not carry opaque from token", rawQuery)
+	}
+}
+
+func TestRegisterLoopReportsMemberlistSeed(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	got := make(chan registry.ScalerRegister, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path != registry.ScaleLinkRegisterPath {
+			http.NotFound(w, req)
+			return
+		}
+		var in registry.ScalerRegister
+		if err := json.NewDecoder(req.Body).Decode(&in); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		select {
+		case got <- in:
+		default:
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	svc := NewRemoteLinks([]RegistryLink{{Name: "r1", BaseURL: srv.URL, Client: srv.Client()}},
+		clustercfg.PlacementConfig{Candidates: 1}, 30, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	go svc.RegisterLoopDynamic(ctx, "s1", srv.URL, "scaler.default", srv.URL)
+
+	select {
+	case reg := <-got:
+		if reg.MemberlistLabel != "scaler.default" || reg.MemberlistAdvertise != srv.URL {
+			t.Fatalf("scaler registered wrong memberlist seed: %+v", reg)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("scaler did not register")
 	}
 }
 

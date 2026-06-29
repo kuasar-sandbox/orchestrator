@@ -262,28 +262,27 @@ func (s *Service) serveVerifyKey(w http.ResponseWriter, req *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
-func (s *Service) RegisterLoop(ctx context.Context, id, advertise, readyLabel string) {
-	s.RegisterLoopDynamic(ctx, id, advertise, func(context.Context) (string, error) { return readyLabel, nil })
+func (s *Service) RegisterLoop(ctx context.Context, id, advertise, memberlistLabel string) {
+	s.RegisterLoopDynamic(ctx, id, advertise, memberlistLabel, advertise)
 }
 
-func (s *Service) RegisterLoopDynamic(ctx context.Context, id, advertise string, readyLabel func(context.Context) (string, error)) {
+func (s *Service) Ready() bool {
+	return s.nodes.ready()
+}
+
+func (s *Service) RegisterLoopDynamic(ctx context.Context, id, advertise, memberlistLabel, memberlistAdvertise string) {
 	if id == "" || advertise == "" {
 		s.log.Warn("scaler: registration disabled; member id/advertise missing")
 		return
 	}
-	t := time.NewTicker(5 * time.Second)
+	t := time.NewTicker(time.Second)
 	defer t.Stop()
 	for {
-		label := ""
-		if readyLabel != nil {
-			var err error
-			label, err = readyLabel(ctx)
-			if err != nil {
-				s.log.Warn("scaler: ready label", "err", err)
-			}
-		}
 		for _, link := range s.RegistryLinks() {
-			if err := s.postJSON(ctx, link, registry.ScaleLinkRegisterPath, registry.ScalerRegister{ID: id, Advertise: advertise, ReadyLabel: label}); err != nil {
+			if err := s.postJSON(ctx, link, registry.ScaleLinkRegisterPath, registry.ScalerRegister{
+				ID: id, Advertise: advertise,
+				MemberlistLabel: memberlistLabel, MemberlistAdvertise: memberlistAdvertise,
+			}); err != nil {
 				s.log.Warn("scaler: register", "registry", link.Name, "err", err)
 			}
 		}

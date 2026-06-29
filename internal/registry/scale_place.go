@@ -54,7 +54,7 @@ func (p *HTTPScalePlacer) Place(ctx context.Context, req PlaceRequest) (*Placeme
 	if len(peers) < p.minReady {
 		return nil, ErrNoNode
 	}
-	byID := make(map[string]scalerPeer, len(peers))
+	byID := make(map[string]ScalerPeer, len(peers))
 	ids := make([]string, 0, len(peers))
 	for _, peer := range peers {
 		byID[peer.ID] = peer
@@ -85,7 +85,7 @@ func (p *HTTPScalePlacer) Place(ctx context.Context, req PlaceRequest) (*Placeme
 	return nil, ErrNoNode
 }
 
-func (p *HTTPScalePlacer) placeOne(ctx context.Context, peer scalerPeer, req PlaceRequest) (*Placement, error) {
+func (p *HTTPScalePlacer) placeOne(ctx context.Context, peer ScalerPeer, req PlaceRequest) (*Placement, error) {
 	if peer.Advertise == "" {
 		return nil, ErrNoNode
 	}
@@ -153,7 +153,7 @@ func (r *Registry) VerifyAPIKeyWithMinReady(ctx context.Context, group, apiKey s
 	if len(peers) < minReady {
 		return false, ErrNoNode
 	}
-	byID := make(map[string]scalerPeer, len(peers))
+	byID := make(map[string]ScalerPeer, len(peers))
 	ids := make([]string, 0, len(peers))
 	for _, peer := range peers {
 		byID[peer.ID] = peer
@@ -183,7 +183,7 @@ func (r *Registry) VerifyAPIKeyWithMinReady(ctx context.Context, group, apiKey s
 	return false, ErrNoNode
 }
 
-func verifyAPIKeyOne(ctx context.Context, client *http.Client, timeout time.Duration, peer scalerPeer, group, apiKey string) (bool, error) {
+func verifyAPIKeyOne(ctx context.Context, client *http.Client, timeout time.Duration, peer ScalerPeer, group, apiKey string) (bool, error) {
 	if peer.Advertise == "" {
 		return false, ErrNoNode
 	}

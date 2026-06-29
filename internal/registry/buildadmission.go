@@ -22,14 +22,12 @@ type NodeOwner interface {
 }
 
 type localNodeOwner struct {
-	reg     *Registry
-	leases  *buildAdmissionManager
-	keyMu   sync.Mutex
-	keySent map[string]map[string]int64
+	reg    *Registry
+	leases *buildAdmissionManager
 }
 
 func newLocalNodeOwner(reg *Registry) *localNodeOwner {
-	return &localNodeOwner{reg: reg, leases: newBuildAdmissionManager(), keySent: map[string]map[string]int64{}}
+	return &localNodeOwner{reg: reg, leases: newBuildAdmissionManager()}
 }
 
 func (o *localNodeOwner) PutManifestKey(ctx context.Context, nodeID, fingerprint, keyType, keyValue string, expiresUnix int64) error {
@@ -46,18 +44,7 @@ func (o *localNodeOwner) PutManifestKey(ctx context.Context, nodeID, fingerprint
 }
 
 func (o *localNodeOwner) DropManifestKey(ctx context.Context, nodeID, fingerprint string) error {
-	if err := o.reg.stores.DropNodeManifestKey(ctx, nodeID, fingerprint); err != nil {
-		return err
-	}
-	o.keyMu.Lock()
-	if sent := o.keySent[nodeID]; sent != nil {
-		delete(sent, fingerprint)
-		if len(sent) == 0 {
-			delete(o.keySent, nodeID)
-		}
-	}
-	o.keyMu.Unlock()
-	return nil
+	return o.reg.stores.DropNodeManifestKey(ctx, nodeID, fingerprint)
 }
 
 func (o *localNodeOwner) RefreshManifestKeys(ctx context.Context, nodeID string, keys []clusterstate.NodeManifestKey) {
@@ -66,7 +53,7 @@ func (o *localNodeOwner) RefreshManifestKeys(ctx context.Context, nodeID string,
 		if key.Fingerprint == "" || (key.ExpiresUnix > 0 && key.ExpiresUnix <= now) {
 			continue
 		}
-		if !o.shouldSendManifestKey(nodeID, key.Fingerprint, now) {
+		if key.SentExpiresUnix > now {
 			continue
 		}
 		cmd := &routesync.Command{
@@ -82,25 +69,9 @@ func (o *localNodeOwner) RefreshManifestKeys(ctx context.Context, nodeID string,
 			cmd.ManifestKeyType = clusterstate.SecretInline
 		}
 		if err := o.SendCommand(ctx, nodeID, cmd); err == nil {
-			o.recordManifestKeySent(nodeID, key.Fingerprint, now)
+			_ = o.reg.stores.MarkNodeManifestKeySent(ctx, nodeID, key.Fingerprint, key.ExpiresUnix)
 		}
 	}
-}
-
-func (o *localNodeOwner) shouldSendManifestKey(nodeID, fingerprint string, now int64) bool {
-	o.keyMu.Lock()
-	defer o.keyMu.Unlock()
-	last := o.keySent[nodeID][fingerprint]
-	return last == 0 || now-last >= int64(keyRenewEvery.Seconds())
-}
-
-func (o *localNodeOwner) recordManifestKeySent(nodeID, fingerprint string, now int64) {
-	o.keyMu.Lock()
-	if o.keySent[nodeID] == nil {
-		o.keySent[nodeID] = map[string]int64{}
-	}
-	o.keySent[nodeID][fingerprint] = now
-	o.keyMu.Unlock()
 }
 
 func (o *localNodeOwner) AdmitBuild(ctx context.Context, nodeID, buildID string, want *routesync.BuildResources) bool {

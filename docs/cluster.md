@@ -76,6 +76,7 @@ node_list:
   watch_retention: 10000
 
 scale_link:
+  scaler_label: scaler.default
   scaler_replica_count: 3
   min_ready_scalers: 1
   place_timeout: 2s
@@ -138,18 +139,24 @@ version 最新的 membership,避免单个 bootstrap 滞后影响切换。
 
 ### 4.2 成员健康
 
-registry 成员之间的 route/node replica RPC 使用 HTTP 控制面。客户端维护每个 peer 的短周期 health/cooldown:
-RPC 失败后该 peer 暂时 fail-fast,冷路径 fanout 仍按完整 owner set 并发尝试。成员健康必须遵守以下边界:
+registry 成员之间按 membership label 启动独立 memberlist 故障检测域。成员清单仍只来自配置;memberlist
+只报告配置成员的运行期可达性。route/node replica RPC 使用 HTTP 控制面;memberlist dead/suspect 和
+RPC 短周期 cooldown 只用于 fail-fast,冷路径 fanout 仍按完整 owner set 并发尝试。成员健康必须遵守以下边界:
 
-- 不维护 registry 成员清单。
+- 不维护 registry 成员清单,只观察配置成员。
 - 不改变 `LocateN` 输入。
 - 不作为数据复制通道。
 - 不把 suspect/dead 事件转化为 reshard。
 
-scaler ready 通过 register loop 表达。scaler 向每个 active / next registry 成员推送:
+memberlist transport 复用 registry/scaler 控制面监听,使用 `/internal/memberlist/*` 路径区分 packet 和
+stream;启用控制面 TLS/mTLS 时,memberlist client 也使用同一套成员 TLS material。
+
+scaler 成员列表来自独立 scaler memberlist 域,默认 label 为 `scaler.default`。registry 不配置 scaler
+列表,而是作为 `role=observer` 加入该域。`scale_link/register` 只提供 scaler seed,用于 registry 初始
+join scaler memberlist;ready 状态由 scaler memberlist meta 表达:
 
 ```json
-{"role":"scaler","id":"s1","advertise":"https://s1:7800","ready_label":"registry.2.hash"}
+{"role":"scaler","id":"s1","api_advertise":"https://s1:7800","memberlist_advertise":"https://s1:7800","ready":true,"ready_label":"registry.2.hash"}
 ```
 
 ### 4.3 成员故障
@@ -314,6 +321,7 @@ Node 连接 registry 后按 `LocateN(node_id,N)` 归属 node owner set。node �
 - labels、runtime_digest、build_capacity、draining、粗粒度 liveness。
 - `manifest_keys` desired cache,由 key allocation 写入 node_link owner set;实际下发由 node-link 心跳维系刷新。
 - 高频水位保留在 node_link owner 本地;node_list 是独立低频投影,普通 heartbeat 不触发 WATCH_LIST 扇出。
+- node_list 低频 heartbeat refresh 由 `node_dead_after` 派生,必须短于 scaler 判活窗口。
 
 增量订阅的 rev 是字符串,格式由 node owner/node 私有约定,推荐编码为 `source_fingerprint:seq`。
 node owner 在订阅时把上次 token 传给 node;node 校验 fingerprint,匹配时 replay `seq` 之后的事件,不匹配
@@ -348,14 +356,16 @@ scaler 负责:
 - `SandboxGroupProvider.GetPlacementHint` 构建 group placement cache。
 - `SandboxGroupProvider.GetKey` / `GetAuthKey` 生成 key allocation / auth material intent。
 - 按 active / next membership 得到 node_list owner 候选,一次只订阅一个 owner;断线后 reset 并切换下一个。
-- 周期性向每个 active / next registry owner 成员 `POST /scale-link/register` 发布 ready 状态。
+- 周期性向 active / next registry owner 成员 `POST /scale-link/register` 发布 memberlist seed。
+- 在 scaler memberlist meta 中发布 `ready`、`ready_label` 和 `api_advertise`;Place 使用 registry observer
+  看到的 ready scaler 视图。
 - 向每个 active / next registry owner 成员推送 selector/key allocation patch。
 - 对 registry 暴露 `POST /scale-link/place`。
 
 registry 对 group 做 scaler 选择:
 
 ```text
-readyScalers = alive scalers where ready_label == active_registry_label
+readyScalers = scaler memberlist nodes where role=scaler and alive and ready=true and ready_label == active_registry_label
 candidates   = LocateN(group, readyScalers, scaler_replica_count)
 try candidates in order until success
 ```
@@ -390,8 +400,9 @@ group 有两个密钥域:
 `manifest_key` 和 `registry_auth` 都是 typed secret,支持 inline 或 ref 带外交付。`manifest_key` 使用 ref
 时必须同时给出 fingerprint,供 create/build precheck 使用。密钥分发遵循 scaler 的 allocation 结果:
 scaler 决定哪些 node 应有 key,registry/node owner 将 desired key list 写入对应 node_link 记录并在 owner
-set 内 CAS 复制。实际 `key_put` 是 node-link 心跳维系的定期刷新;`key_drop` 不作为正确性依赖,节点侧租约
-按 TTL 淘汰未续租 key。密钥分发是 create/build 前置条件,不影响已运行 sandbox。
+set 内 CAS 复制。node_link key cache 同时记录已成功下发的 lease 到期时间;实际 `key_put` 由 node-link
+心跳维系,TTL 未到期的条目不重复下发。`key_drop` 不作为正确性依赖,节点侧租约按 TTL 淘汰未续租 key。
+密钥分发是 create/build 前置条件,不影响已运行 sandbox。
 
 ## 13. Build
 

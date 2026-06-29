@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
-	"time"
 
 	clusterstate "github.com/kuasar-sandbox/sandbox-orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/clusterstore"
@@ -36,9 +35,10 @@ type ViewEvent struct {
 }
 
 type ScalerRegister struct {
-	ID         string `json:"id"`
-	Advertise  string `json:"advertise"`
-	ReadyLabel string `json:"ready_label"`
+	ID                  string `json:"id"`
+	Advertise           string `json:"advertise"`
+	MemberlistLabel     string `json:"memberlist_label"`
+	MemberlistAdvertise string `json:"memberlist_advertise"`
 }
 
 func (r *Registry) serveNodeListWatch(w http.ResponseWriter, req *http.Request) {
@@ -115,11 +115,22 @@ func (r *Registry) serveScalerRegister(w http.ResponseWriter, req *http.Request)
 		http.Error(w, "id and advertise are required", http.StatusBadRequest)
 		return
 	}
-	if label := r.nodeListWatchLabel(); label != "" && in.ReadyLabel != label {
-		http.Error(w, "ready_label does not match active registry membership", http.StatusConflict)
+	label := in.MemberlistLabel
+	if label == "" {
+		label = r.scalerMemberlistLabel()
+	}
+	if want := r.scalerMemberlistLabel(); want != "" && label != want {
+		http.Error(w, "memberlist_label does not match registry scale_link.scaler_label", http.StatusConflict)
 		return
 	}
-	r.setScalerPeer(scalerPeer{ID: in.ID, Advertise: in.Advertise, ReadyLabel: in.ReadyLabel, LastSeen: time.Now()})
+	memberlistAdvertise := in.MemberlistAdvertise
+	if memberlistAdvertise == "" {
+		memberlistAdvertise = in.Advertise
+	}
+	if err := r.joinScalerSeed(req.Context(), in.ID, label, memberlistAdvertise); err != nil {
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		return
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 

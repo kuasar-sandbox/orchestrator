@@ -681,6 +681,9 @@ func (s *Stores) UpsertNodeManifestKey(ctx context.Context, nodeID string, key c
 	return s.updateNodeRuntime(ctx, nodeID, func(n *NodeRecord) {
 		for i := range n.ManifestKeys {
 			if n.ManifestKeys[i].Fingerprint == key.Fingerprint {
+				if sameNodeManifestKeyMaterial(n.ManifestKeys[i], key) && key.SentExpiresUnix == 0 {
+					key.SentExpiresUnix = n.ManifestKeys[i].SentExpiresUnix
+				}
 				n.ManifestKeys[i] = key
 				sortNodeManifestKeys(n.ManifestKeys)
 				return
@@ -688,6 +691,20 @@ func (s *Stores) UpsertNodeManifestKey(ctx context.Context, nodeID string, key c
 		}
 		n.ManifestKeys = append(n.ManifestKeys, key)
 		sortNodeManifestKeys(n.ManifestKeys)
+	})
+}
+
+func (s *Stores) MarkNodeManifestKeySent(ctx context.Context, nodeID, fingerprint string, sentExpiresUnix int64) error {
+	if nodeID == "" || fingerprint == "" || sentExpiresUnix <= 0 {
+		return nil
+	}
+	return s.updateNodeRuntime(ctx, nodeID, func(n *NodeRecord) {
+		for i := range n.ManifestKeys {
+			if n.ManifestKeys[i].Fingerprint == fingerprint {
+				n.ManifestKeys[i].SentExpiresUnix = sentExpiresUnix
+				return
+			}
+		}
 	})
 }
 
@@ -725,6 +742,10 @@ func (s *Stores) PruneExpiredNodeManifestKeys(ctx context.Context, nodeID string
 
 func sortNodeManifestKeys(keys []clusterstate.NodeManifestKey) {
 	sort.Slice(keys, func(i, j int) bool { return keys[i].Fingerprint < keys[j].Fingerprint })
+}
+
+func sameNodeManifestKeyMaterial(a, b clusterstate.NodeManifestKey) bool {
+	return a.Type == b.Type && a.Value == b.Value && a.Ref == b.Ref
 }
 
 func (s *Stores) putNodeLink(ctx context.Context, n *NodeRecord) (uint64, error) {
@@ -903,6 +924,9 @@ func (s *Stores) PutNodeListEntry(ctx context.Context, entry clusterstate.NodeLi
 		if err != nil {
 			return err
 		}
+		if found && !nodeListProjectionNewer(entry, cur) {
+			return nil
+		}
 		expect := uint64(0)
 		if found {
 			expect = cur.Meta.Rev
@@ -949,6 +973,9 @@ func (s *Stores) DeleteNodeListWithSource(ctx context.Context, nodeID string, so
 		if found && recordMetaZero(source) {
 			tombstone.SourceMeta = cur.SourceMeta
 			tombstone.LastHeartbeatUnix = cur.LastHeartbeatUnix
+		}
+		if found && !nodeListProjectionNewer(tombstone, cur) {
+			return nil
 		}
 		_, err = q.CAS(ctx, nodeID, expect, func(cur clusterstate.NodeListEntry, found bool) (clusterstate.NodeListEntry, bool, error) {
 			if !found || nodeListProjectionNewer(tombstone, cur) {

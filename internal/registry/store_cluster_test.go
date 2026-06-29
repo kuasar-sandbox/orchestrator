@@ -286,6 +286,32 @@ func TestNodeListTombstoneRejectsStaleProjection(t *testing.T) {
 	}
 }
 
+func TestNodeListDuplicateProjectionDoesNotAdvanceRev(t *testing.T) {
+	ctx := context.Background()
+	kv := clusterstore.OpenMemory(100)
+	defer kv.Close()
+	stores := NewClusterStores(kv, "a", clusterstate.MemberView{Version: 1, Members: []string{"a"}}, 1, 1, nil, nil)
+	entry := clusterstate.NodeListEntry{NodeID: "n1", LastHeartbeatUnix: 100, Labels: map[string]string{"pool": "p"}}
+
+	if err := stores.PutNodeListEntry(ctx, entry); err != nil {
+		t.Fatalf("PutNodeListEntry first: %v", err)
+	}
+	first, found, err := stores.LocalNodeListReplica().Read(ctx, "n1")
+	if err != nil || !found {
+		t.Fatalf("first read found=%v err=%v", found, err)
+	}
+	if err := stores.PutNodeListEntry(ctx, entry); err != nil {
+		t.Fatalf("PutNodeListEntry duplicate: %v", err)
+	}
+	second, found, err := stores.LocalNodeListReplica().Read(ctx, "n1")
+	if err != nil || !found {
+		t.Fatalf("second read found=%v err=%v", found, err)
+	}
+	if second.Meta.Rev != first.Meta.Rev {
+		t.Fatalf("duplicate projection advanced node_list rev: %d -> %d", first.Meta.Rev, second.Meta.Rev)
+	}
+}
+
 func TestNodeListRangeRepairsLocalFromOwnerSet(t *testing.T) {
 	ctx := context.Background()
 	view := clusterstate.MemberView{Version: 1, Members: []string{"a", "b"}}

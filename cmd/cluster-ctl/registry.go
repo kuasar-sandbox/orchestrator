@@ -22,6 +22,7 @@ import (
 	clusterstate "github.com/kuasar-sandbox/sandbox-orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/clustercfg"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/clusterstore"
+	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/membergroup"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/registry"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/routesync"
 )
@@ -44,10 +45,24 @@ func runRegistry(args []string, log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	memberHub := membergroup.NewHub()
+	registryMembers, err := newRegistryMemberRuntime(ctx, cfg, memberHub, log)
+	if err != nil {
+		return err
+	}
+	scalerObserver, err := newScalerObserverRuntime(cfg, memberHub, log)
+	if err != nil {
+		return err
+	}
 	kv := clusterstore.OpenMemory(cfg.NodeLink.RevisionRetention)
 	defer kv.Close()
 
-	stores, remoteNodeOwners, err := newRegistryStores(kv, cfg)
+	healthProvider := func(id string) clusterstate.ReplicaAvailability {
+		return clusterstate.NewFuncReplicaAvailability(func() bool { return registryMembers.AliveAny(id) }, 2*time.Second)
+	}
+	stores, remoteNodeOwners, err := newRegistryStores(kv, cfg, healthProvider)
 	if err != nil {
 		return err
 	}
@@ -56,6 +71,9 @@ func runRegistry(args []string, log *slog.Logger) error {
 
 	reg := registry.New(stores, nil, cfg.RouteLink.ParkDur(), log)
 	reg.SetRemoteNodeOwners(remoteNodeOwners)
+	reg.SetScalerMemberlistLabel(cfg.ScaleLink.ScalerLabel)
+	reg.SetScalerSeedJoiner(scalerObserver.JoinSeed)
+	reg.SetScalerPeerSource(scalerObserver.ReadyScalers)
 	if active, ok := cfg.Membership.ActiveVersion(); ok {
 		reg.SetScaleReadyLabel(active.Label)
 	}
@@ -63,9 +81,7 @@ func runRegistry(args []string, log *slog.Logger) error {
 	reg.SetPlacer(registry.NewHTTPScalePlacerWithMinReady(reg, cfg.ScaleLink.ScalerReplicaCount, cfg.ScaleLink.MinReadyScalers, cfg.ScaleLink.PlaceDur()))
 	cfgState := newRegistryRuntimeConfig(cfg)
 
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
-	go runRegistryReload(ctx, *cfgPath, cfgState, reg, log)
+	go runRegistryReload(ctx, *cfgPath, cfgState, reg, registryMembers, healthProvider, log)
 
 	// Dead-node sweep (cluster.md §11): reset the sandboxes of nodes whose
 	// node-link dropped and whose last heartbeat predates node_dead_after.
@@ -74,7 +90,8 @@ func runRegistry(args []string, log *slog.Logger) error {
 	go reg.RunKeyDistributor(ctx, time.Hour)
 
 	controlMux := http.NewServeMux()
-	mountRegistryControl(controlMux, reg, cfgState, *cfgPath)
+	memberHub.Mount(controlMux)
+	mountRegistryControl(controlMux, reg, cfgState, *cfgPath, registryMembers, healthProvider)
 	if !cfg.NodeLinkSplit() {
 		controlMux.HandleFunc(routesync.NodeLinkPath, reg.ServeNodeLink)
 	} else {
@@ -119,7 +136,7 @@ func (s *registryRuntimeConfig) set(cfg *clustercfg.RegistryConfig) {
 	s.mu.Unlock()
 }
 
-func mountRegistryControl(mux *http.ServeMux, reg *registry.Registry, cfgState *registryRuntimeConfig, cfgPath string) {
+func mountRegistryControl(mux *http.ServeMux, reg *registry.Registry, cfgState *registryRuntimeConfig, cfgPath string, members *registryMemberRuntime, healthProvider func(string) clusterstate.ReplicaAvailability) {
 	reg.ServeRouteLink(mux)
 	reg.ServeScaleLink(mux)
 	mux.HandleFunc(clusterstate.RouteReplicaRPCPath, func(w http.ResponseWriter, req *http.Request) {
@@ -148,7 +165,7 @@ func mountRegistryControl(mux *http.ServeMux, reg *registry.Registry, cfgState *
 			return
 		}
 		cfg := cfgState.get()
-		if err := reloadRegistryConfig(req.Context(), cfgPath, cfg, cfgState, reg); err != nil {
+		if err := reloadRegistryConfig(req.Context(), cfgPath, cfg, cfgState, reg, members, healthProvider); err != nil {
 			http.Error(w, err.Error(), http.StatusConflict)
 			return
 		}
@@ -156,7 +173,7 @@ func mountRegistryControl(mux *http.ServeMux, reg *registry.Registry, cfgState *
 	})
 }
 
-func runRegistryReload(ctx context.Context, cfgPath string, cfgState *registryRuntimeConfig, reg *registry.Registry, log *slog.Logger) {
+func runRegistryReload(ctx context.Context, cfgPath string, cfgState *registryRuntimeConfig, reg *registry.Registry, members *registryMemberRuntime, healthProvider func(string) clusterstate.ReplicaAvailability, log *slog.Logger) {
 	hup := make(chan os.Signal, 1)
 	signal.Notify(hup, syscall.SIGHUP)
 	defer signal.Stop(hup)
@@ -166,7 +183,7 @@ func runRegistryReload(ctx context.Context, cfgPath string, cfgState *registryRu
 			return
 		case <-hup:
 			old := cfgState.get()
-			if err := reloadRegistryConfig(ctx, cfgPath, old, cfgState, reg); err != nil {
+			if err := reloadRegistryConfig(ctx, cfgPath, old, cfgState, reg, members, healthProvider); err != nil {
 				log.Error("registry reload failed", "err", err)
 			} else {
 				next := cfgState.get()
@@ -176,7 +193,7 @@ func runRegistryReload(ctx context.Context, cfgPath string, cfgState *registryRu
 	}
 }
 
-func reloadRegistryConfig(ctx context.Context, cfgPath string, old *clustercfg.RegistryConfig, cfgState *registryRuntimeConfig, reg *registry.Registry) error {
+func reloadRegistryConfig(ctx context.Context, cfgPath string, old *clustercfg.RegistryConfig, cfgState *registryRuntimeConfig, reg *registry.Registry, members *registryMemberRuntime, healthProvider func(string) clusterstate.ReplicaAvailability) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -196,7 +213,8 @@ func reloadRegistryConfig(ctx context.Context, cfgPath string, old *clustercfg.R
 	if old.RouteLink.ParkTimeout != next.RouteLink.ParkTimeout ||
 		old.NodeLink.NodeDeadAfter != next.NodeLink.NodeDeadAfter ||
 		old.NodeLink.HeartbeatInterval != next.NodeLink.HeartbeatInterval ||
-		old.NodeLink.RevisionRetention != next.NodeLink.RevisionRetention {
+		old.NodeLink.RevisionRetention != next.NodeLink.RevisionRetention ||
+		old.ScaleLink.ScalerLabel != next.ScaleLink.ScalerLabel {
 		return fmt.Errorf("registry reload: non-membership runtime changes require restart")
 	}
 	if err := validateRegistryMembershipReload(old.Membership, next.Membership); err != nil {
@@ -206,7 +224,12 @@ func reloadRegistryConfig(ctx context.Context, cfgPath string, old *clustercfg.R
 	if !ok {
 		return fmt.Errorf("registry reload: active membership %d not found", next.Membership.Active)
 	}
-	views, routeReplicas, nodeReplicas, nodeListReplicas, nodeOwners, err := buildRegistryTopology(next)
+	if members != nil {
+		if err := members.Sync(ctx, next); err != nil {
+			return err
+		}
+	}
+	views, routeReplicas, nodeReplicas, nodeListReplicas, nodeOwners, err := buildRegistryTopology(next, healthProvider)
 	if err != nil {
 		return err
 	}
@@ -219,6 +242,7 @@ func reloadRegistryConfig(ctx context.Context, cfgPath string, old *clustercfg.R
 	reg.Stores().SetNodeListWatchRetention(next.NodeList.WatchRetention)
 	reg.SetRemoteNodeOwners(nodeOwners)
 	reg.SetScaleReadyLabel(active.Label)
+	reg.SetScalerMemberlistLabel(next.ScaleLink.ScalerLabel)
 	reg.SetScalePolicy(next.ScaleLink.ScalerReplicaCount, next.ScaleLink.MinReadyScalers, next.ScaleLink.PlaceDur())
 	reg.SetPlacer(registry.NewHTTPScalePlacerWithMinReady(reg, next.ScaleLink.ScalerReplicaCount, next.ScaleLink.MinReadyScalers, next.ScaleLink.PlaceDur()))
 	cfgState.set(next)
@@ -263,12 +287,12 @@ func nodeListHeartbeatRefresh(deadAfter time.Duration) time.Duration {
 	return d
 }
 
-func newRegistryStores(kv clusterstore.Store, cfg *clustercfg.RegistryConfig) (*registry.Stores, map[string]registry.NodeOwner, error) {
+func newRegistryStores(kv clusterstore.Store, cfg *clustercfg.RegistryConfig, healthProvider func(string) clusterstate.ReplicaAvailability) (*registry.Stores, map[string]registry.NodeOwner, error) {
 	active, ok := cfg.Membership.ActiveVersion()
 	if !ok {
 		return nil, nil, fmt.Errorf("registry: active membership %d not found", cfg.Membership.Active)
 	}
-	views, routeReplicas, nodeReplicas, nodeListReplicas, nodeOwners, err := buildRegistryTopology(cfg)
+	views, routeReplicas, nodeReplicas, nodeListReplicas, nodeOwners, err := buildRegistryTopology(cfg, healthProvider)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -277,10 +301,12 @@ func newRegistryStores(kv clusterstore.Store, cfg *clustercfg.RegistryConfig) (*
 		routeReplicas, nodeReplicas)
 	stores.SetNodeListTopology(views, cfg.Membership.Owners.NodeList, nodeListReplicas)
 	stores.SetMembershipVersion(active.Version)
+	stores.SetNodeListHeartbeatRefresh(nodeListHeartbeatRefresh(cfg.NodeLink.NodeDeadDur()))
+	stores.SetNodeListWatchRetention(cfg.NodeList.WatchRetention)
 	return stores, nodeOwners, nil
 }
 
-func buildRegistryTopology(cfg *clustercfg.RegistryConfig) ([]clusterstate.MemberView, map[string]clusterstate.RouteReplica, map[string]clusterstate.NodeReplica, map[string]clusterstate.NodeListReplica, map[string]registry.NodeOwner, error) {
+func buildRegistryTopology(cfg *clustercfg.RegistryConfig, healthProvider func(string) clusterstate.ReplicaAvailability) ([]clusterstate.MemberView, map[string]clusterstate.RouteReplica, map[string]clusterstate.NodeReplica, map[string]clusterstate.NodeListReplica, map[string]registry.NodeOwner, error) {
 	ownerVersions := cfg.Membership.OwnerVersions()
 	views := make([]clusterstate.MemberView, 0, len(ownerVersions))
 	for _, version := range ownerVersions {
@@ -298,7 +324,13 @@ func buildRegistryTopology(cfg *clustercfg.RegistryConfig) ([]clusterstate.Membe
 		if err != nil {
 			return nil, nil, nil, nil, nil, fmt.Errorf("registry: member %q: %w", member.ID, err)
 		}
-		health := clusterstate.NewReplicaHealth(2 * time.Second)
+		var health clusterstate.ReplicaAvailability
+		if healthProvider != nil {
+			health = healthProvider(member.ID)
+		}
+		if health == nil {
+			health = clusterstate.NewReplicaHealth(2 * time.Second)
+		}
 		routeReplicas[member.ID] = clusterstate.NewHTTPRouteReplicaWithHealth(base, client, health)
 		nodeReplicas[member.ID] = clusterstate.NewHTTPNodeReplicaWithHealth(base, client, health)
 		nodeListReplicas[member.ID] = registry.NewHTTPNodeListReplica(base, client)

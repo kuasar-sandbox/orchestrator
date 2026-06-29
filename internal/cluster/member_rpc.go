@@ -111,14 +111,14 @@ func writeReplicaResponse(w http.ResponseWriter, out replicaResponse, err error)
 type HTTPRouteReplica struct {
 	endpoint string
 	client   *http.Client
-	health   *ReplicaHealth
+	health   ReplicaAvailability
 }
 
 func NewHTTPRouteReplica(endpoint string, client *http.Client) *HTTPRouteReplica {
 	return NewHTTPRouteReplicaWithHealth(endpoint, client, nil)
 }
 
-func NewHTTPRouteReplicaWithHealth(endpoint string, client *http.Client, health *ReplicaHealth) *HTTPRouteReplica {
+func NewHTTPRouteReplicaWithHealth(endpoint string, client *http.Client, health ReplicaAvailability) *HTTPRouteReplica {
 	if client == nil {
 		client = http.DefaultClient
 	}
@@ -165,14 +165,14 @@ func (r *HTTPRouteReplica) call(ctx context.Context, in replicaRequest) (replica
 type HTTPNodeReplica struct {
 	endpoint string
 	client   *http.Client
-	health   *ReplicaHealth
+	health   ReplicaAvailability
 }
 
 func NewHTTPNodeReplica(endpoint string, client *http.Client) *HTTPNodeReplica {
 	return NewHTTPNodeReplicaWithHealth(endpoint, client, nil)
 }
 
-func NewHTTPNodeReplicaWithHealth(endpoint string, client *http.Client, health *ReplicaHealth) *HTTPNodeReplica {
+func NewHTTPNodeReplicaWithHealth(endpoint string, client *http.Client, health ReplicaAvailability) *HTTPNodeReplica {
 	if client == nil {
 		client = http.DefaultClient
 	}
@@ -219,6 +219,43 @@ type ReplicaHealth struct {
 	unhealthyUntil time.Time
 }
 
+type ReplicaAvailability interface {
+	Available() bool
+	MarkSuccess()
+	MarkFailure()
+}
+
+type FuncReplicaAvailability struct {
+	available func() bool
+	cooldown  *ReplicaHealth
+}
+
+func NewFuncReplicaAvailability(available func() bool, cooldown time.Duration) *FuncReplicaAvailability {
+	return &FuncReplicaAvailability{available: available, cooldown: NewReplicaHealth(cooldown)}
+}
+
+func (h *FuncReplicaAvailability) Available() bool {
+	if h == nil {
+		return true
+	}
+	if h.available != nil && !h.available() {
+		return false
+	}
+	return h.cooldown == nil || h.cooldown.Available()
+}
+
+func (h *FuncReplicaAvailability) MarkSuccess() {
+	if h != nil && h.cooldown != nil {
+		h.cooldown.MarkSuccess()
+	}
+}
+
+func (h *FuncReplicaAvailability) MarkFailure() {
+	if h != nil && h.cooldown != nil {
+		h.cooldown.MarkFailure()
+	}
+}
+
 func NewReplicaHealth(cooldown time.Duration) *ReplicaHealth {
 	if cooldown <= 0 {
 		cooldown = 2 * time.Second
@@ -253,7 +290,7 @@ func (h *ReplicaHealth) MarkFailure() {
 	h.mu.Unlock()
 }
 
-func postReplica(ctx context.Context, client *http.Client, url string, in replicaRequest, health *ReplicaHealth) (replicaResponse, error) {
+func postReplica(ctx context.Context, client *http.Client, url string, in replicaRequest, health ReplicaAvailability) (replicaResponse, error) {
 	if health != nil && !health.Available() {
 		return replicaResponse{}, ErrReplicaUnavailable
 	}

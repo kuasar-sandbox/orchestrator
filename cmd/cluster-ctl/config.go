@@ -104,6 +104,7 @@ route_link:
 node_list:
   watch_retention: 10000
 scale_link:
+  scaler_label: scaler.default          # scaler memberlist label; not a configured scaler list
   scaler_replica_count: 3
   min_ready_scalers: 1
   place_timeout: 2s
@@ -136,6 +137,8 @@ member:
   listen: ":7800"
   advertise: "https://scaler-1.example:7800"
   # tls: { cert: ..., key: ..., ca: ... }   # server mTLS for scaler Place API
+memberlist:
+  label: scaler.default
 registry:
   bootstrap: registry-1.example:7700
   # tls: { cert: ..., key: ..., ca: ... }   # client mTLS to registry control plane

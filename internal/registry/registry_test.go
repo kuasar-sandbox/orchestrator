@@ -74,6 +74,19 @@ func TestKeyPredistribution(t *testing.T) {
 	if len(cmds) != 1 || cmds[0].Kind != routesync.CmdKeyPut || cmds[0].ManifestKey != testMK {
 		t.Fatalf("expected heartbeat key_put with the group key, got %+v", cmds)
 	}
+	node, found, err := reg.stores.GetNode(ctx, "n1")
+	if err != nil || !found || len(node.ManifestKeys) != 1 {
+		t.Fatalf("node key state found=%v err=%v node=%+v", found, err, node)
+	}
+	if node.ManifestKeys[0].SentExpiresUnix != cmds[0].ExpiresUnix || node.ManifestKeys[0].SentExpiresUnix <= time.Now().Unix() {
+		t.Fatalf("sent key lease not persisted in node_link: key=%+v cmd=%+v", node.ManifestKeys[0], cmds[0])
+	}
+
+	cmds = nil
+	reg.updateHeartbeat(ctx, "n1", &routesync.Heartbeat{})
+	if len(cmds) != 0 {
+		t.Fatalf("heartbeat resent manifest key before stored TTL expired: %+v", cmds)
+	}
 }
 
 func TestKeyDropOnLeave(t *testing.T) {
@@ -1234,12 +1247,29 @@ func TestSweepDeadNodes(t *testing.T) {
 func TestHTTPScalePlacerHonorsMinReadyScalers(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
-	reg.setScalerPeer(scalerPeer{ID: "s1", Advertise: "http://127.0.0.1:1", LastSeen: time.Now()})
+	reg.SetScalerPeerSource(func(string) []ScalerPeer {
+		return []ScalerPeer{{ID: "s1", Advertise: "http://127.0.0.1:1"}}
+	})
 	placer := NewHTTPScalePlacerWithMinReady(reg, 1, 2, 100*time.Millisecond)
 	if _, err := placer.Place(ctx, PlaceRequest{Group: "/g", RouteKey: "rk"}); err != ErrNoNode {
 		t.Fatalf("Place with one ready scaler and min_ready=2 err=%v, want ErrNoNode", err)
 	}
 	if _, err := reg.VerifyAPIKeyWithMinReady(ctx, "/g", "key", 1, 2, 100*time.Millisecond); err != ErrNoNode {
 		t.Fatalf("VerifyAPIKey with one ready scaler and min_ready=2 err=%v, want ErrNoNode", err)
+	}
+}
+
+func TestReadyScalerPeersUseMemberlistSource(t *testing.T) {
+	reg := testReg(t)
+	reg.SetScaleReadyLabel("registry.1.test")
+	reg.SetScalerPeerSource(func(label string) []ScalerPeer {
+		if label != "registry.1.test" {
+			t.Fatalf("ready label passed to source = %q", label)
+		}
+		return []ScalerPeer{{ID: "s1", Advertise: "http://scaler-1", ReadyLabel: label}}
+	})
+	peers := reg.readyScalerPeers(time.Minute)
+	if len(peers) != 1 || peers[0].ID != "s1" || peers[0].Advertise != "http://scaler-1" {
+		t.Fatalf("ready scaler peers=%+v", peers)
 	}
 }

@@ -87,21 +87,26 @@ type Registry struct {
 	deadAfter      time.Duration
 	reaperCtx      context.Context
 
-	scalerMu        sync.Mutex
-	scaleReadyLabel string
-	scalerPeers     map[string]scalerPeer
-	keyAlloc        map[string]keyAllocationState // group -> scaler-owned manifest-key allocation set
-	scaleReplicas   int
-	minReadyScalers int
-	scaleTimeout    time.Duration
+	scalerMu         sync.Mutex
+	scaleReadyLabel  string
+	scalerLabel      string
+	scalePeerSource  ScalerPeerSource
+	scalerSeedJoiner ScalerSeedJoiner
+	keyAlloc         map[string]keyAllocationState // group -> scaler-owned manifest-key allocation set
+	scaleReplicas    int
+	minReadyScalers  int
+	scaleTimeout     time.Duration
 }
 
-type scalerPeer struct {
+type ScalerPeer struct {
 	ID         string
 	Advertise  string
 	ReadyLabel string
-	LastSeen   time.Time
 }
+
+type ScalerPeerSource func(readyLabel string) []ScalerPeer
+
+type ScalerSeedJoiner func(ctx context.Context, id, label, advertise string) error
 
 // reserveCall is one in-flight ReserveSandbox; joiners wait on done, the channel
 // reader fills result + closes done when the sandbox goes running.
@@ -146,7 +151,6 @@ func New(stores *Stores, placer Placer, parkTimeout time.Duration, log *slog.Log
 		acks:             make(map[string]chan *routesync.CmdAck),
 		keyLeased:        make(map[string]keyLeaseState),
 		reconcileTrigger: make(chan struct{}, 1),
-		scalerPeers:      make(map[string]scalerPeer),
 		keyAlloc:         make(map[string]keyAllocationState),
 		scaleReplicas:    1,
 		minReadyScalers:  1,
@@ -205,6 +209,40 @@ func (r *Registry) SetScaleReadyLabel(label string) {
 	r.scalerMu.Unlock()
 }
 
+func (r *Registry) SetScalerMemberlistLabel(label string) {
+	r.scalerMu.Lock()
+	r.scalerLabel = label
+	r.scalerMu.Unlock()
+}
+
+func (r *Registry) scalerMemberlistLabel() string {
+	r.scalerMu.Lock()
+	defer r.scalerMu.Unlock()
+	return r.scalerLabel
+}
+
+func (r *Registry) SetScalerPeerSource(source ScalerPeerSource) {
+	r.scalerMu.Lock()
+	r.scalePeerSource = source
+	r.scalerMu.Unlock()
+}
+
+func (r *Registry) SetScalerSeedJoiner(joiner ScalerSeedJoiner) {
+	r.scalerMu.Lock()
+	r.scalerSeedJoiner = joiner
+	r.scalerMu.Unlock()
+}
+
+func (r *Registry) joinScalerSeed(ctx context.Context, id, label, advertise string) error {
+	r.scalerMu.Lock()
+	joiner := r.scalerSeedJoiner
+	r.scalerMu.Unlock()
+	if joiner == nil {
+		return nil
+	}
+	return joiner(ctx, id, label, advertise)
+}
+
 func (r *Registry) SetScalePolicy(replicaCount, minReady int, timeout time.Duration) {
 	if replicaCount <= 0 {
 		replicaCount = 1
@@ -228,23 +266,21 @@ func (r *Registry) scalePolicy() (replicaCount, minReady int, timeout time.Durat
 	return r.scaleReplicas, r.minReadyScalers, r.scaleTimeout
 }
 
-func (r *Registry) setScalerPeer(peer scalerPeer) {
+func (r *Registry) readyScalerPeers(time.Duration) []ScalerPeer {
 	r.scalerMu.Lock()
-	r.scalerPeers[peer.ID] = peer
+	source := r.scalePeerSource
+	readyLabel := r.scaleReadyLabel
 	r.scalerMu.Unlock()
-}
-
-func (r *Registry) readyScalerPeers(maxAge time.Duration) []scalerPeer {
-	now := time.Now()
-	r.scalerMu.Lock()
-	defer r.scalerMu.Unlock()
-	out := make([]scalerPeer, 0, len(r.scalerPeers))
-	for id, peer := range r.scalerPeers {
-		if maxAge > 0 && now.Sub(peer.LastSeen) > maxAge {
-			delete(r.scalerPeers, id)
+	if source == nil {
+		return nil
+	}
+	src := source(readyLabel)
+	out := make([]ScalerPeer, 0, len(src))
+	for _, peer := range src {
+		if peer.ID == "" || peer.Advertise == "" {
 			continue
 		}
-		if r.scaleReadyLabel != "" && peer.ReadyLabel != r.scaleReadyLabel {
+		if readyLabel != "" && peer.ReadyLabel != "" && peer.ReadyLabel != readyLabel {
 			continue
 		}
 		out = append(out, peer)

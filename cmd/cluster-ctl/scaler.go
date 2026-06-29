@@ -16,6 +16,7 @@ import (
 
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/clustercfg"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/clusterclient"
+	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/membergroup"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/scaler"
 )
 
@@ -65,7 +66,25 @@ func runScaler(args []string, log *slog.Logger) error {
 	links := registryLinks(eps)
 	svc := scaler.NewRemoteLinks(links, cfg.Placement, deadAfter, log)
 	svc.SetNodeListLinks(ctx, registryLinks(nodeListEps))
+	memberHub := membergroup.NewHub()
+	memberlistTLS, err := membergroupTLSConfig(cfg.Member.TLS)
+	if err != nil {
+		return fmt.Errorf("scaler memberlist tls: %w", err)
+	}
+	scalerGroup, err := membergroup.New(membergroup.Options{
+		Label: cfg.Memberlist.Label, Name: cfg.Member.ID, Hub: memberHub, Log: log,
+		TLSConfig: memberlistTLS,
+		Meta: membergroup.Meta{
+			Role: membergroup.RoleScaler, ID: cfg.Member.ID,
+			APIAdvertise: cfg.Member.Advertise, MemberlistAdvertise: cfg.Member.Advertise,
+		},
+	})
+	if err != nil {
+		return err
+	}
+	defer scalerGroup.Shutdown()
 	mux := http.NewServeMux()
+	memberHub.Mount(mux)
 	svc.ServeScaleLink(mux)
 	errCh := make(chan error, 1)
 	go func() {
@@ -73,12 +92,8 @@ func runScaler(args []string, log *slog.Logger) error {
 	}()
 	svc.Start(ctx)
 	go runScalerRegistryLinks(ctx, regClient, svc, log)
-	go svc.RegisterLoopDynamic(ctx, cfg.Member.ID, cfg.Member.Advertise, func(ctx context.Context) (string, error) {
-		if err := regClient.Refresh(ctx); err != nil {
-			return "", err
-		}
-		return regClient.ActiveLabel(ctx)
-	})
+	go runScalerMemberMeta(ctx, scalerGroup, svc, regClient, cfg.Member.Advertise, log)
+	go svc.RegisterLoopDynamic(ctx, cfg.Member.ID, cfg.Member.Advertise, cfg.Memberlist.Label, cfg.Member.Advertise)
 	log.Info("cluster-ctl scaler", "registry", registryAddr, "registry_members", len(links), "registry_tls", registryTLS != nil,
 		"candidates", cfg.Placement.Candidates, "zone_admit_max", cfg.Placement.ZoneAdmitMax,
 		"shuffle_rules", len(cfg.Placement.ShuffleSharding))
@@ -87,6 +102,42 @@ func runScaler(args []string, log *slog.Logger) error {
 		return nil
 	case err := <-errCh:
 		return err
+	}
+}
+
+func runScalerMemberMeta(ctx context.Context, group *membergroup.Group, svc *scaler.Service, regClient *clusterclient.Registry, advertise string, log *slog.Logger) {
+	t := time.NewTicker(time.Second)
+	defer t.Stop()
+	update := func() {
+		ready := svc.Ready()
+		label := ""
+		if ready {
+			if err := regClient.Refresh(ctx); err != nil {
+				log.Warn("scaler: memberlist ready label", "err", err)
+				ready = false
+			} else if got, err := regClient.ActiveLabel(ctx); err != nil {
+				log.Warn("scaler: memberlist active label", "err", err)
+				ready = false
+			} else {
+				label = got
+			}
+		}
+		if err := group.UpdateMeta(membergroup.Meta{
+			Role: membergroup.RoleScaler, ID: group.Name(),
+			APIAdvertise: advertise, MemberlistAdvertise: advertise,
+			Ready: ready, ReadyLabel: label,
+		}); err != nil {
+			log.Debug("scaler: memberlist meta update", "err", err)
+		}
+	}
+	update()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			update()
+		}
 	}
 }
 

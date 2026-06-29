@@ -24,6 +24,7 @@ import (
 	clusterstate "github.com/kuasar-sandbox/sandbox-orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/clustercfg"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/clusterstore"
+	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/membergroup"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/registry"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/router"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/routesync"
@@ -62,19 +63,59 @@ func newHarness(t *testing.T) *harness {
 	reg := registry.New(stores, nil, 5*time.Second, log)
 	placer := registry.NewHTTPScalePlacer(reg, 1, 2*time.Second)
 	reg.SetPlacer(placer)
+	reg.SetScalerMemberlistLabel("scaler.default")
+	reg.SetScaleReadyLabel("registry.1.test")
 	go reg.RunKeyDistributor(ctx, time.Hour)
 
+	regHub := membergroup.NewHub()
 	mux := http.NewServeMux()
+	regHub.Mount(mux)
 	reg.ServeRouteLink(mux)
 	reg.ServeScaleLink(mux)
 	mux.HandleFunc(routesync.NodeLinkPath, reg.ServeNodeLink)
 	links := httptest.NewServer(h2c.NewHandler(mux, &http2.Server{}))
 	linkAddr := strings.TrimPrefix(links.URL, "http://")
+	observer, err := membergroup.New(membergroup.Options{
+		Label: "scaler.default", Name: "observer.registry", Hub: regHub, FastTimers: true,
+		Meta: membergroup.Meta{
+			Role: membergroup.RoleObserver, ID: "observer.registry",
+			APIAdvertise: links.URL, MemberlistAdvertise: links.URL,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reg.SetScalerSeedJoiner(func(ctx context.Context, id, label, advertise string) error {
+		observer.AddSeed(id, advertise)
+		_, err := observer.Join(id)
+		return err
+	})
+	reg.SetScalerPeerSource(func(label string) []registry.ScalerPeer {
+		metas := observer.ReadyScalers(label)
+		out := make([]registry.ScalerPeer, 0, len(metas))
+		for _, meta := range metas {
+			out = append(out, registry.ScalerPeer{ID: meta.ID, Advertise: meta.APIAdvertise, ReadyLabel: meta.ReadyLabel})
+		}
+		return out
+	})
 
 	svc := scaler.NewRemote(linkAddr, nil, clustercfg.PlacementConfig{Candidates: 1, ZoneAdmitMax: "yellow"}, 30, log)
+	scalerHub := membergroup.NewHub()
 	scalerMux := http.NewServeMux()
+	scalerHub.Mount(scalerMux)
 	svc.ServeScaleLink(scalerMux)
 	scalerSrv := httptest.NewServer(scalerMux)
+	scalerGroup, err := membergroup.New(membergroup.Options{
+		Label: "scaler.default", Name: "s1", Hub: scalerHub, FastTimers: true,
+		Meta: membergroup.Meta{
+			Role: membergroup.RoleScaler, ID: "s1",
+			APIAdvertise: scalerSrv.URL, MemberlistAdvertise: scalerSrv.URL,
+			Ready: true, ReadyLabel: "registry.1.test",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	svc.ImportGroups([]clusterstate.SandboxGroupRecord{{
 		Group: testGroup, ManifestKey: clusterstate.Secret{Type: clusterstate.SecretInline, Value: testMK},
 		AuthKey:     clusterstate.Secret{Type: clusterstate.SecretInline, Value: testAuthKey},
@@ -82,7 +123,7 @@ func newHarness(t *testing.T) *harness {
 		Config: map[string]string{"from_group": "yes"},
 	}})
 	svc.Start(ctx)
-	go svc.RegisterLoop(ctx, "s1", scalerSrv.URL, "")
+	go svc.RegisterLoop(ctx, "s1", scalerSrv.URL, "scaler.default")
 
 	dataHits := make(chan *http.Request, 16)
 	dataToken := make(chan string, 16)
@@ -114,6 +155,8 @@ func newHarness(t *testing.T) *harness {
 	}
 	t.Cleanup(func() {
 		cancel()
+		_ = observer.Shutdown()
+		_ = scalerGroup.Shutdown()
 		node.close()
 		scalerSrv.Close()
 		routerSrv.Close()

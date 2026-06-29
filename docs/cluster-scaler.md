@@ -31,15 +31,18 @@ cluster-ctl scaler import --config /etc/cluster-ctl/scaler.yaml -i groups.jsonl
 | `member.id` | scaler 实例 id |
 | `member.listen` | scaler HTTP API 监听 |
 | `member.advertise` | registry 调用 scaler 的地址 |
+| `memberlist.label` | scaler memberlist label,默认 `scaler.default` |
 | `placement.candidates` | scaler 内部 node P2C 候选数量 |
 | `placement.zone_admit_max` | 可放置最高水位 |
 | `placement.shuffle_sharding` | shuffle 规则 |
 
-registry 侧的 `scale_link.scaler_replica_count` 控制每个 group 的 scaler failover 候选数量。
-`scale_link` 不再是 registry reverse session。scaler 通过 registry membership 得到 active / next
-registry owner 成员、node_list owner 候选与当前 registry label,向这些 owner 成员注册 ready 状态,并始终只
-从一个 node_list owner 订阅 WATCH_LIST;断线或 membership 变化后切换到下一候选。membership refresh 会尝试
-bootstrap 与已知成员并选择 active version 最新的结果。scaler 在本地 API 提供:
+registry 侧的 `scale_link.scaler_label` 指定 scaler memberlist 域,默认 `scaler.default`;
+`scale_link.scaler_replica_count` 控制每个 group 的 scaler failover 候选数量。`scale_link` 不再是
+registry reverse session,也不保存 scaler 目录。scaler 通过 registry membership 得到 active / next
+registry owner 成员、node_list owner 候选与当前 registry label,向这些 owner 成员注册 memberlist seed,
+并始终只从一个 node_list owner 订阅 WATCH_LIST;断线或 membership 变化后切换到下一候选。membership
+refresh 会尝试 bootstrap 与已知成员并选择 active version 最新的结果。registry 收到 scaler register 后以
+`role=observer` 加入 scaler memberlist;ready scaler 视图来自 memberlist meta。scaler 在本地 API 提供:
 
 ```text
 POST /scale-link/place
@@ -94,11 +97,11 @@ node_list owner 分片内全复制,所以 scaler 不需要也不能把多个 own
 
 ## 6. Scale-link 成员域
 
-scaler 启动后拉取 registry membership,获得 active label,然后周期性向每个 active / next registry owner
-成员注册:
+scaler 启动后加入 `memberlist.label` 指定的 scaler memberlist,并周期性向每个 active / next registry
+owner 成员注册 seed:
 
 ```json
-{"role":"scaler","id":"s1","advertise":"https://s1:7800","ready_label":"registry.2.hash"}
+{"id":"s1","advertise":"https://s1:7800","memberlist_label":"scaler.default","memberlist_advertise":"https://s1:7800"}
 ```
 
 scaler ready 的条件:
@@ -110,7 +113,13 @@ scaler ready 的条件:
 group import 不构成全局 ready 门槛。每个 Place 只解析请求中的 group;该 group 未命中、已过期或 tombstone
 时返回 NoNode/不可用,不会阻塞其他 group。
 
-registry 只把 `ready_label == active_registry_label` 且最近注册未过期的 scaler 作为 Place 候选。
+registry 只把 scaler memberlist 中 `role=scaler`、alive、`ready=true` 且
+`ready_label == active_registry_label` 的成员作为 Place 候选。ready 信息不来自 `scale_link/register`,
+而来自 scaler memberlist meta:
+
+```json
+{"role":"scaler","id":"s1","api_advertise":"https://s1:7800","memberlist_advertise":"https://s1:7800","ready":true,"ready_label":"registry.2.hash"}
+```
 
 ## 7. Placement 计算
 
@@ -131,7 +140,7 @@ registry 只把 `ready_label == active_registry_label` 且最近注册未过期�
 registry 对 group 只做确定性 failover:
 
 ```text
-readyScalers = alive scalers where ready_label == active_registry_label
+readyScalers = scaler memberlist nodes where role=scaler and alive and ready=true and ready_label == active_registry_label
 candidates   = LocateN(group, readyScalers, scale_link.replica_count)
 try candidates in order until success
 ```
@@ -169,8 +178,8 @@ scaler 主管 key allocation 决策:
 2. 根据 placement selectors 得到 allocation set。
 3. 将目标 node set 与 key material/ref 作为 allocation patch 推给 registry。
 4. registry/node owner 把每个 node 的 desired key list 写入 node_link 记录并在 owner set 内 CAS 复制。
-5. node-link 心跳维系按间隔对当前连接节点执行 `key_put` 续租;未续租 key 由节点 TTL 淘汰,`key_drop`
-   不作为正确性依赖。
+5. node_link key cache 记录已成功下发的 lease 到期时间;node-link 心跳维系只对未下发或 TTL 已到期的
+   条目执行 `key_put` 续租。未续租 key 由节点 TTL 淘汰,`key_drop` 不作为正确性依赖。
 
 密钥是 create/build 前置条件;key cache 删除、key_drop 或租约过期不影响已经运行的 sandbox。
 
