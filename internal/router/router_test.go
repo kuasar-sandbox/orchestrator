@@ -54,6 +54,29 @@ func TestRouteLinkHTTPFailsOverOnServerError(t *testing.T) {
 	}
 }
 
+func TestRouteLinkHTTPRefreshesMembershipAndRetries(t *testing.T) {
+	var calls []string
+	oldClient := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls = append(calls, "old")
+		return textResponse(http.StatusServiceUnavailable, "old owner"), nil
+	})}
+	newClient := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls = append(calls, "new")
+		return textResponse(http.StatusOK, `{"ok":true}`), nil
+	})}
+	reg := &refreshingRouteRegistry{old: oldClient, new: newClient}
+	rt := &Router{routeRegistry: reg}
+
+	resp, err := rt.routeLinkHTTP(context.Background(), "/g", http.MethodGet, "/route-link/test", nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || reg.refreshes != 1 || strings.Join(calls, ",") != "old,new" {
+		t.Fatalf("status=%d refreshes=%d calls=%v", resp.StatusCode, reg.refreshes, calls)
+	}
+}
+
 func TestHandleListPropagatesRouteLinkStatus(t *testing.T) {
 	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -88,6 +111,29 @@ type routeRegistryFunc func(context.Context, string) ([]clusterclient.Endpoint, 
 
 func (f routeRegistryFunc) RouteCandidates(ctx context.Context, group string) ([]clusterclient.Endpoint, error) {
 	return f(ctx, group)
+}
+
+func (f routeRegistryFunc) Refresh(context.Context) error { return nil }
+
+type refreshingRouteRegistry struct {
+	old       *http.Client
+	new       *http.Client
+	refreshes int
+}
+
+func (r *refreshingRouteRegistry) RouteCandidates(context.Context, string) ([]clusterclient.Endpoint, error) {
+	client := r.old
+	id := "old"
+	if r.refreshes > 0 {
+		client = r.new
+		id = "new"
+	}
+	return []clusterclient.Endpoint{{MemberID: id, BaseURL: "http://" + id, Client: client}}, nil
+}
+
+func (r *refreshingRouteRegistry) Refresh(context.Context) error {
+	r.refreshes++
+	return nil
 }
 
 type roundTripFunc func(*http.Request) (*http.Response, error)

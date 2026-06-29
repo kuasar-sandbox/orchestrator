@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strconv"
 	"testing"
 
@@ -170,6 +171,70 @@ func TestSingleMemberWithoutAdvertiseUsesBootstrap(t *testing.T) {
 	}
 	if len(eps) != 1 || eps[0].BaseURL != "http://bootstrap:7700" || eps[0].Client != client {
 		t.Fatalf("endpoint = %+v", eps)
+	}
+}
+
+func TestFetchMembershipRefreshesFromKnownMembersAndChoosesNewestActive(t *testing.T) {
+	var oldSrv, newSrv *httptest.Server
+	oldMembership := clustercfg.MembershipConfig{}
+	newMembership := clustercfg.MembershipConfig{}
+	oldSrv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != MembershipPath {
+			t.Fatalf("unexpected old membership path %s", r.URL.Path)
+		}
+		_ = json.NewEncoder(w).Encode(oldMembership)
+	}))
+	t.Cleanup(oldSrv.Close)
+	newSrv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != MembershipPath {
+			t.Fatalf("unexpected new membership path %s", r.URL.Path)
+		}
+		_ = json.NewEncoder(w).Encode(newMembership)
+	}))
+	t.Cleanup(newSrv.Close)
+	oldMembership = clustercfg.MembershipConfig{
+		Active: 1,
+		Next:   2,
+		Versions: []clustercfg.MembershipVersion{
+			{Version: 1, Members: []clustercfg.MembershipMember{
+				{ID: "a", Advertise: oldSrv.URL},
+				{ID: "b", Advertise: newSrv.URL},
+				{ID: "c", Advertise: newSrv.URL},
+			}},
+			{Version: 2, Members: []clustercfg.MembershipMember{
+				{ID: "b", Advertise: newSrv.URL},
+				{ID: "c", Advertise: newSrv.URL},
+				{ID: "d", Advertise: newSrv.URL},
+			}},
+		},
+		Owners: clustercfg.MembershipOwnerConfig{RouteLink: 3, NodeLink: 3, NodeList: 3},
+	}
+	newMembership = clustercfg.MembershipConfig{
+		Active: 2,
+		Versions: []clustercfg.MembershipVersion{{
+			Version: 2,
+			Members: []clustercfg.MembershipMember{
+				{ID: "b", Advertise: newSrv.URL},
+				{ID: "c", Advertise: newSrv.URL},
+				{ID: "d", Advertise: newSrv.URL},
+			},
+		}},
+		Owners: clustercfg.MembershipOwnerConfig{RouteLink: 3, NodeLink: 3, NodeList: 3},
+	}
+	reg := NewRegistryWithClient(oldSrv.URL, oldSrv.Client())
+	first, err := reg.FetchMembership(t.Context())
+	if err != nil {
+		t.Fatalf("initial fetch: %v", err)
+	}
+	if first.Active != 1 {
+		t.Fatalf("initial active = %d, want 1", first.Active)
+	}
+	refreshed, err := reg.FetchMembership(t.Context())
+	if err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+	if refreshed.Active != 2 {
+		t.Fatalf("refreshed active = %d, want newest active 2", refreshed.Active)
 	}
 }
 

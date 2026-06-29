@@ -320,8 +320,11 @@ func (r *Registry) ReserveSandbox(ctx context.Context, group, routeKey string, c
 		// Park timeout / caller cancel: undo a RESERVED that never reached READY, so
 		// it doesn't strand on a live node (the sweep only clears dead-node rows).
 		r.rollbackReserve(group, routeKey, rec, found)
+		r.finish(key, nil, rerr)
+		return nil, rerr
 	}
-	return res, rerr
+	r.finish(key, res, nil)
+	return res, nil
 }
 
 // rollbackReserve restores a (group, route_key) to its pre-reserve state when a

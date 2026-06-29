@@ -113,6 +113,7 @@ type reserveFlight struct {
 
 type routeRegistry interface {
 	RouteCandidates(ctx context.Context, group string) ([]clusterclient.Endpoint, error)
+	Refresh(ctx context.Context) error
 }
 
 type staticRouteRegistry struct {
@@ -125,6 +126,8 @@ func (s staticRouteRegistry) RouteCandidates(context.Context, string) ([]cluster
 	}
 	return []clusterclient.Endpoint{s.ep}, nil
 }
+
+func (s staticRouteRegistry) Refresh(context.Context) error { return nil }
 
 // New builds a Router with one static registry endpoint. Production wiring uses
 // NewWithRegistry so group operations go through membership owner selection.
@@ -900,15 +903,36 @@ func (rt *Router) routeLinkCall(ctx context.Context, group, method, path string,
 }
 
 func (rt *Router) routeLinkHTTP(ctx context.Context, group, method, path string, body []byte, headers map[string]string) (*http.Response, error) {
+	refreshed := false
+	for {
+		resp, err, retry := rt.routeLinkHTTPOnce(ctx, group, method, path, body, headers)
+		if !retry || refreshed {
+			return resp, err
+		}
+		if refreshErr := rt.routeRegistry.Refresh(ctx); refreshErr != nil {
+			if resp != nil || err != nil {
+				return resp, err
+			}
+			return nil, refreshErr
+		}
+		if resp != nil {
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 512))
+			resp.Body.Close()
+		}
+		refreshed = true
+	}
+}
+
+func (rt *Router) routeLinkHTTPOnce(ctx context.Context, group, method, path string, body []byte, headers map[string]string) (*http.Response, error, bool) {
 	eps, err := rt.routeRegistry.RouteCandidates(ctx, group)
 	if err != nil {
-		return nil, err
+		return nil, err, false
 	}
 	var last error
 	for i, ep := range eps {
 		req, err := http.NewRequestWithContext(ctx, method, ep.BaseURL+path, bytes.NewReader(body))
 		if err != nil {
-			return nil, err
+			return nil, err, false
 		}
 		for k, v := range headers {
 			req.Header.Set(k, v)
@@ -918,18 +942,25 @@ func (rt *Router) routeLinkHTTP(ctx context.Context, group, method, path string,
 			last = err
 			continue
 		}
-		if resp.StatusCode >= 500 && i+1 < len(eps) {
+		if routeLinkRetryableStatus(resp.StatusCode) {
+			if i+1 >= len(eps) {
+				return resp, nil, true
+			}
 			b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
 			resp.Body.Close()
 			last = fmt.Errorf("route_link %s: %s: %s", ep.MemberID, resp.Status, strings.TrimSpace(string(b)))
 			continue
 		}
-		return resp, nil
+		return resp, nil, false
 	}
 	if last != nil {
-		return nil, last
+		return nil, last, true
 	}
-	return nil, fmt.Errorf("router: no registry candidates for group %q", group)
+	return nil, fmt.Errorf("router: no registry candidates for group %q", group), false
+}
+
+func routeLinkRetryableStatus(status int) bool {
+	return status == http.StatusConflict || status >= 500
 }
 
 // --- local route cache ---

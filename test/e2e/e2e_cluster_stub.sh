@@ -243,7 +243,7 @@ EOF
 
 for i in $(seq 1 "$REGISTRIES"); do
     port="${CONTROL_PORTS[$((i-1))]}"
-    "$CLUSTER_CTL" registry --config "$WORK/registry-$i.yaml" >"$WORK/registry-$i.log" 2>&1 &
+    "$CLUSTER_CTL" registry --config "$WORK/registry-$i.yaml" > >(tee "$WORK/registry-$i.log" >&2) 2>&1 &
     PIDS+=("$!")
     step "starting registry-$i"
     wait_tcp "$port" "registry-$i control"
@@ -276,12 +276,12 @@ PY
 done
 
 step "starting scaler"
-"$CLUSTER_CTL" scaler --config "$WORK/scaler.yaml" >"$WORK/scaler.log" 2>&1 &
+"$CLUSTER_CTL" scaler --config "$WORK/scaler.yaml" > >(tee "$WORK/scaler.log" >&2) 2>&1 &
 PIDS+=("$!")
 wait_tcp "$SCALER_PORT" "scaler"
 
 step "importing sandbox group into scaler"
-"$CLUSTER_CTL" scaler import --config "$WORK/scaler.yaml" --endpoint "127.0.0.1:$SCALER_PORT" -i "$WORK/groups.jsonl" >"$WORK/import.log" 2>&1 ||
+"$CLUSTER_CTL" scaler import --config "$WORK/scaler.yaml" --endpoint "127.0.0.1:$SCALER_PORT" -i "$WORK/groups.jsonl" > >(tee "$WORK/import.log" >&2) 2>&1 ||
     fail "scaler import failed"
 
 step "starting node-stub-ctl with $NODES nodes"
@@ -292,13 +292,13 @@ step "starting node-stub-ctl with $NODES nodes"
     --admin-listen "127.0.0.1:$ADMIN_PORT" \
     --data-listen "127.0.0.1:$DATA_PORT" \
     --label pool=stub \
-    --heartbeat 500ms >"$WORK/node-stub.log" 2>&1 &
+    --heartbeat 500ms > >(tee "$WORK/node-stub.log" >&2) 2>&1 &
 PIDS+=("$!")
 ADMIN="http://127.0.0.1:$ADMIN_PORT"
 wait_http "$ADMIN/healthz" "node-stub admin"
 
 step "starting router"
-"$CLUSTER_CTL" router --config "$WORK/router.yaml" >"$WORK/router.log" 2>&1 &
+"$CLUSTER_CTL" router --config "$WORK/router.yaml" > >(tee "$WORK/router.log" >&2) 2>&1 &
 PIDS+=("$!")
 wait_tcp "$ROUTER_PORT" "router"
 
@@ -346,6 +346,68 @@ import json, sys
 routes = json.load(open(sys.argv[1]))
 assert any(r.get("sandboxID") and r.get("state") == "ready" for r in routes), routes
 PY
+
+    step "cutting registry membership over to version 2 with old_grace version 1"
+    for i in 1 2 3 4; do
+        port="${CONTROL_PORTS[$((i-1))]}"
+        cat >"$WORK/registry-$i.yaml" <<EOF
+member:
+  id: registry-$i
+  listen: "127.0.0.1:$port"
+  advertise: "http://127.0.0.1:$port"
+membership:
+  active: 2
+  old_grace: 1
+  versions:
+    - version: 1
+      members:
+$ACTIVE_MEMBERS_YAML
+    - version: 2
+      members:
+$NEXT_MEMBERS_YAML  owners:
+    route_link: $OWNER_COUNT
+    node_link: $OWNER_COUNT
+    node_list: $OWNER_COUNT
+node_link:
+  heartbeat_interval: "500ms"
+  node_dead_after: "3s"
+route_link:
+  park_timeout: "5s"
+EOF
+        code="$(http_code "$WORK/reload-$i.body" -X POST "http://127.0.0.1:$port/cluster/reload" || true)"
+        [ "$code" = "204" ] || fail "registry-$i cutover reload returned $code: $(cat "$WORK/reload-$i.body")"
+    done
+
+    step "checking registries report active membership version 2 with old_grace version 1"
+    for i in 1 2 3 4; do
+        port="${CONTROL_PORTS[$((i-1))]}"
+        python3 - "http://127.0.0.1:$port" <<'PY' || fail "registry cutover membership check failed on $port"
+import json, sys, urllib.request
+m = json.load(urllib.request.urlopen(sys.argv[1] + "/cluster/membership", timeout=2))
+assert m.get("active", m.get("Active")) == 2, m
+assert not m.get("next", m.get("Next", 0)), m
+assert m.get("old_grace", m.get("OldGrace")) == 1, m
+PY
+    done
+
+    step "checking router/scaler refresh through known members after cutover"
+    code="$(retry_code 204 "$WORK/data-cutover.body" \
+        -H "Host: data.$DOMAIN" \
+        -H "X-Kuasar-Sandbox-Group: $GROUP" \
+        -H "X-Kuasar-Route-Key: user1/session-cutover" \
+        -H "X-API-KEY: $API_KEY" \
+        -H "E2b-Sandbox-Port: 49983" \
+        "http://127.0.0.1:$ROUTER_PORT/health" || true)"
+    [ "$code" = "204" ] || fail "data after registry cutover returned $code"
+
+    python3 - "$ADMIN" "$GROUP" <<'PY' || fail "cutover data hit was not recorded with the expected route key"
+import json, sys, urllib.request
+hits = json.load(urllib.request.urlopen(sys.argv[1] + "/v1/data-hits", timeout=2))
+assert hits, "no data hits"
+last = hits[-1]
+assert last["group"] == sys.argv[2], last
+assert last["route_key"] == "user1/session-cutover", last
+PY
 fi
 
 create_count_before="$(python3 - "$ADMIN" <<'PY'
@@ -354,7 +416,11 @@ cmds = json.load(urllib.request.urlopen(sys.argv[1] + "/v1/commands", timeout=2)
 print(sum(1 for c in cmds if c.get("kind") == "create"))
 PY
 )"
-[ "$create_count_before" = "1" ] || fail "expected one create after first reserve, got $create_count_before"
+expected_create_count=1
+if [ "$CLUSTER_STUB_CASE" = "registry-joint" ]; then
+    expected_create_count=2
+fi
+[ "$create_count_before" = "$expected_create_count" ] || fail "expected $expected_create_count create commands before active-cache check, got $create_count_before"
 
 step "checking active route cache"
 code="$(retry_code 204 "$WORK/data2.body" \
@@ -429,8 +495,12 @@ for _ in range(100):
 sys.exit(1)
 PY
 
+ROUTE_LIST_PORT="$CONTROL_PORT"
+if [ "$CLUSTER_STUB_CASE" = "registry-joint" ]; then
+    ROUTE_LIST_PORT="${CONTROL_PORTS[3]}"
+fi
 curl -sS --noproxy '*' --get --data-urlencode "group=$GROUP" \
-    "http://127.0.0.1:$CONTROL_PORT/route-link/list" >"$WORK/routes.json"
+    "http://127.0.0.1:$ROUTE_LIST_PORT/route-link/list" >"$WORK/routes.json"
 python3 - "$WORK/routes.json" "$SID" <<'PY' || fail "route_link still contains rebooted sandbox"
 import json, sys
 routes = json.load(open(sys.argv[1]))

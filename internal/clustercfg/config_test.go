@@ -78,3 +78,44 @@ func TestRegistryMembershipNextAllowsNextOnlyMember(t *testing.T) {
 		t.Fatal("member outside active+next should be rejected")
 	}
 }
+
+func TestRegistryMembershipOldGraceAllowsGraceOnlyMember(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "registry.yaml")
+	raw := `member:
+  id: registry-a
+  listen: "127.0.0.1:0"
+membership:
+  active: 2
+  old_grace: 1
+  versions:
+    - version: 1
+      members:
+        - { id: registry-a, advertise: "http://registry-a.example.test" }
+        - { id: registry-b, advertise: "http://registry-b.example.test" }
+        - { id: registry-c, advertise: "http://registry-c.example.test" }
+    - version: 2
+      members:
+        - { id: registry-b, advertise: "http://registry-b.example.test" }
+        - { id: registry-c, advertise: "http://registry-c.example.test" }
+        - { id: registry-d, advertise: "http://registry-d.example.test" }
+  owners:
+    route_link: 2
+    node_link: 2
+    node_list: 2
+`
+	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := LoadRegistry(path)
+	if err != nil {
+		t.Fatalf("old_grace-only registry member should validate: %v", err)
+	}
+	owners := c.Membership.OwnerVersions()
+	if len(owners) != 1 || owners[0].Version != 2 {
+		t.Fatalf("old_grace version must not be part of owner views: %+v", owners)
+	}
+	members := c.Membership.MemberVersions()
+	if len(members) != 2 || members[0].Version != 2 || members[1].Version != 1 {
+		t.Fatalf("member versions should include active then old_grace: %+v", members)
+	}
+}

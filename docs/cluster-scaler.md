@@ -12,8 +12,8 @@ sandbox-group 配置,维护 placement 与密钥分配集合,消费 `node_list` �
    算出哪些 node 应接收 key,再把 intent 交给 registry/node owner 执行。
 3. **registry 不实现 group provider**:内置 store provider 若存在,也属于 scaler/provider 侧,不是 registry。
 4. **WATCH_LIST 仅给 scaler**:router 不消费 node_list。
-5. **高频负载按需获取**:WATCH_LIST 不承载 allocated/build_alloc/counts 等高频字段;Place 时向 node
-   owner GET 实时水位或使用短 TTL cache。
+5. **高频负载不走 WATCH_LIST**:WATCH_LIST 不承载 allocated/build_alloc/counts 等高频字段;scaler 用
+   低频目录做候选过滤,最终资源确认由 registry/node owner admission 完成。
 6. **shuffle 影响新建,不迁移在跑 sandbox**。
 
 ## 2. 命令行
@@ -37,8 +37,9 @@ cluster-ctl scaler import --config /etc/cluster-ctl/scaler.yaml -i groups.jsonl
 
 registry 侧的 `scale_link.scaler_replica_count` 控制每个 group 的 scaler failover 候选数量。
 `scale_link` 不再是 registry reverse session。scaler 通过 registry membership 得到 active / next
-registry 成员、node_list owner 候选与当前 registry label,向每个 registry 成员注册 ready 状态,并始终只
-从一个 node_list owner 订阅 WATCH_LIST;断线或 membership 变化后切换到下一候选。scaler 在本地 API 提供:
+registry owner 成员、node_list owner 候选与当前 registry label,向这些 owner 成员注册 ready 状态,并始终只
+从一个 node_list owner 订阅 WATCH_LIST;断线或 membership 变化后切换到下一候选。membership refresh 会尝试
+bootstrap 与已知成员并选择 active version 最新的结果。scaler 在本地 API 提供:
 
 ```text
 POST /scale-link/place
@@ -92,7 +93,8 @@ node_list owner 分片内全复制,所以 scaler 不需要也不能把多个 own
 
 ## 6. Scale-link 成员域
 
-scaler 启动后拉取 registry membership,获得 active label,然后周期性向每个 active registry 成员注册:
+scaler 启动后拉取 registry membership,获得 active label,然后周期性向每个 active / next registry owner
+成员注册:
 
 ```json
 {"role":"scaler","id":"s1","advertise":"https://s1:7800","ready_label":"registry.2.hash"}
@@ -118,7 +120,8 @@ registry 只把 `ready_label == active_registry_label` 且最近注册未过期�
 3. 用 `pkg/maglev.LocateN` 计算 shuffle 结果。
 4. 将 shuffle 约束合并进最终 selectors。
 5. 计算 key allocation set,生成 key intent。
-6. membership joint 阶段把导入 group 全集作为触达集合,驱动 route/build 执行态跨版本收敛。
+6. membership 切换期间保持 group/key allocation 视图在新 owner 可用;route/build 执行态仍由同 group
+   请求或 node 事件触发 read-repair。
 
 ### 7.2 Registry 选择 scaler
 
@@ -141,8 +144,7 @@ registry 不对 scaler 做 P2C。P2C 只用于 scaler 内部从 node 候选中�
 1. 读取 group placement cache。
 2. 在 WATCH_LIST 本地索引中过滤 labels/runtime/draining。
 3. 从候选集中抽 P2C。
-4. 对候选 node owner GET 实时负载或使用短 TTL cache。
-5. 返回 `node_id + create_spec + key intent + runtime/template hints`。
+4. 返回 `node_id + create_spec + key intent + runtime/template hints`。
 
 若 node owner admission 或 create 后续拒绝,route owner 可换下一个 scaler 或重新 Place。
 

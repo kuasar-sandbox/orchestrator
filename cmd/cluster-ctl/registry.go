@@ -170,7 +170,7 @@ func runRegistryReload(ctx context.Context, cfgPath string, cfgState *registryRu
 				log.Error("registry reload failed", "err", err)
 			} else {
 				next := cfgState.get()
-				log.Info("registry reloaded", "membership_active", next.Membership.Active, "membership_next", next.Membership.Next)
+				log.Info("registry reloaded", "membership_active", next.Membership.Active, "membership_next", next.Membership.Next, "membership_old_grace", next.Membership.OldGrace)
 			}
 		}
 	}
@@ -199,6 +199,9 @@ func reloadRegistryConfig(ctx context.Context, cfgPath string, old *clustercfg.R
 		old.NodeLink.RevisionRetention != next.NodeLink.RevisionRetention {
 		return fmt.Errorf("registry reload: non-membership runtime changes require restart")
 	}
+	if err := validateRegistryMembershipReload(old.Membership, next.Membership); err != nil {
+		return err
+	}
 	active, ok := next.Membership.ActiveVersion()
 	if !ok {
 		return fmt.Errorf("registry reload: active membership %d not found", next.Membership.Active)
@@ -219,6 +222,30 @@ func reloadRegistryConfig(ctx context.Context, cfgPath string, old *clustercfg.R
 	reg.SetScalePolicy(next.ScaleLink.ScalerReplicaCount, next.ScaleLink.MinReadyScalers, next.ScaleLink.PlaceDur())
 	reg.SetPlacer(registry.NewHTTPScalePlacerWithMinReady(reg, next.ScaleLink.ScalerReplicaCount, next.ScaleLink.MinReadyScalers, next.ScaleLink.PlaceDur()))
 	cfgState.set(next)
+	return nil
+}
+
+func validateRegistryMembershipReload(old, next clustercfg.MembershipConfig) error {
+	oldNext := old.Next
+	if oldNext == old.Active {
+		oldNext = 0
+	}
+	nextNext := next.Next
+	if nextNext == next.Active {
+		nextNext = 0
+	}
+	if next.Active == old.Active {
+		if oldNext != 0 && nextNext != 0 && nextNext != oldNext {
+			return fmt.Errorf("registry reload: membership transition cannot replace next %d with %d before cutover or cancel", oldNext, nextNext)
+		}
+		return nil
+	}
+	if oldNext == 0 || next.Active != oldNext {
+		return fmt.Errorf("registry reload: membership transition from active %d to active %d requires prior next %d", old.Active, next.Active, next.Active)
+	}
+	if nextNext != 0 {
+		return fmt.Errorf("registry reload: membership transition to active %d must finish before configuring next %d", next.Active, nextNext)
+	}
 	return nil
 }
 
@@ -254,16 +281,16 @@ func newRegistryStores(kv clusterstore.Store, cfg *clustercfg.RegistryConfig) (*
 }
 
 func buildRegistryTopology(cfg *clustercfg.RegistryConfig) ([]clusterstate.MemberView, map[string]clusterstate.RouteReplica, map[string]clusterstate.NodeReplica, map[string]registry.NodeListReplica, map[string]registry.NodeOwner, error) {
-	versions := cfg.Membership.OwnerVersions()
-	views := make([]clusterstate.MemberView, 0, len(versions))
-	for _, version := range versions {
+	ownerVersions := cfg.Membership.OwnerVersions()
+	views := make([]clusterstate.MemberView, 0, len(ownerVersions))
+	for _, version := range ownerVersions {
 		views = append(views, clusterstate.MemberView{Version: version.Version, Members: version.MemberIDs()})
 	}
 	routeReplicas := map[string]clusterstate.RouteReplica{}
 	nodeReplicas := map[string]clusterstate.NodeReplica{}
 	nodeListReplicas := map[string]registry.NodeListReplica{}
 	nodeOwners := map[string]registry.NodeOwner{}
-	for _, member := range jointMembershipMembers(versions) {
+	for _, member := range jointMembershipMembers(cfg.Membership.MemberVersions()) {
 		if member.ID == "" || member.ID == cfg.Member.ID {
 			continue
 		}

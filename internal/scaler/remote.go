@@ -159,6 +159,10 @@ func (s *Service) SetNodeListLinks(ctx context.Context, links []RegistryLink) {
 	links = normalizeRegistryLinks(links)
 	s.linksMu.Lock()
 	defer s.linksMu.Unlock()
+	if sameRegistryLinkTargets(s.watchLinks, links) {
+		s.watchLinks = links
+		return
+	}
 	s.watchLinks = links
 	s.nodes.removeSource("node_list")
 	if s.watchCancel != nil {
@@ -168,6 +172,18 @@ func (s *Service) SetNodeListLinks(ctx context.Context, links []RegistryLink) {
 	if s.startedCtx != nil {
 		s.startWatchLinkLocked(ctx)
 	}
+}
+
+func sameRegistryLinkTargets(a, b []RegistryLink) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].Name != b[i].Name || a[i].BaseURL != b[i].BaseURL {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *Service) RegistryLinks() []RegistryLink {
@@ -469,6 +485,8 @@ func keyAllocation(group string, nodes []*registry.NodeRecord, selectors []map[s
 
 func (s *Service) watchNodeList(ctx context.Context) {
 	index := 0
+	current := ""
+	token := ""
 	for ctx.Err() == nil {
 		s.linksMu.RLock()
 		links := append([]RegistryLink(nil), s.watchLinks...)
@@ -487,9 +505,14 @@ func (s *Service) watchNodeList(ctx context.Context) {
 		}
 		link := links[index]
 		index++
-		s.nodes.removeSource("node_list")
+		if current != link.Name {
+			current = link.Name
+			token = ""
+			s.nodes.removeSource("node_list")
+		}
 		sink := s.nodes.source("node_list")
-		_, err := s.subscribeOnce(ctx, link, registry.ScaleLinkNodeListWatchPath, 0, sink)
+		nextToken, err := s.subscribeOnce(ctx, link, registry.ScaleLinkNodeListWatchPath, token, sink)
+		token = nextToken
 		if ctx.Err() != nil {
 			return
 		}
@@ -506,10 +529,10 @@ func (s *Service) watchNodeList(ctx context.Context) {
 // capped backoff and resuming from the last applied rev (mirrors the router).
 func (s *Service) subscribe(ctx context.Context, link RegistryLink, path string, sink viewSink) {
 	backoff := 200 * time.Millisecond
-	var rev int64
+	var token string
 	for ctx.Err() == nil {
-		newRev, err := s.subscribeOnce(ctx, link, path, rev, sink)
-		rev = newRev
+		newToken, err := s.subscribeOnce(ctx, link, path, token, sink)
+		token = newToken
 		if ctx.Err() != nil {
 			return
 		}
@@ -523,25 +546,28 @@ func (s *Service) subscribe(ctx context.Context, link RegistryLink, path string,
 	}
 }
 
-func (s *Service) subscribeOnce(ctx context.Context, link RegistryLink, path string, fromRev int64, sink viewSink) (int64, error) {
-	u := fmt.Sprintf("%s%s?from_rev=%d", link.BaseURL, path, fromRev)
+func (s *Service) subscribeOnce(ctx context.Context, link RegistryLink, path, fromToken string, sink viewSink) (string, error) {
+	u := fmt.Sprintf("%s%s", link.BaseURL, path)
+	if fromToken != "" {
+		u += "?from=" + url.QueryEscape(fromToken)
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
-		return fromRev, err
+		return fromToken, err
 	}
 	resp, err := link.Client.Do(req)
 	if err != nil {
-		return fromRev, err
+		return fromToken, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return fromRev, fmt.Errorf("view watch %s: %s", path, resp.Status)
+		return fromToken, fmt.Errorf("view watch %s: %s", path, resp.Status)
 	}
-	rev, syncing := fromRev, false
+	token, syncing := fromToken, false
 	for {
 		ev, err := readViewFrame(resp.Body)
 		if err != nil {
-			return rev, err
+			return token, err
 		}
 		switch ev.Type {
 		case "reset":
@@ -557,8 +583,8 @@ func (s *Service) subscribeOnce(ctx context.Context, link RegistryLink, path str
 		}
 		// Advance the resume point only once live (a snapshot interrupted before its
 		// bookmark re-snapshots on reconnect — same discipline as the router).
-		if !syncing && ev.Rev > rev {
-			rev = ev.Rev
+		if !syncing && ev.Token != "" {
+			token = ev.Token
 		}
 	}
 }

@@ -1,0 +1,52 @@
+package main
+
+import (
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"testing"
+
+	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/clusterstore"
+	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/registry"
+)
+
+func TestRegistryExportDefaultKindUsesRoutes(t *testing.T) {
+	kv := clusterstore.OpenMemory(0)
+	t.Cleanup(func() { kv.Close() })
+	reg := registry.New(registry.NewStores(kv), nil, 0, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	mux := http.NewServeMux()
+	reg.ServeRouteLink(mux)
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	cfgPath := writeRegistryAdminTestConfig(t, srv.URL)
+	outPath := t.TempDir() + "/routes.jsonl"
+	if err := registryExportCmd([]string{"--config", cfgPath, "--group", "/g", "-o", outPath}); err != nil {
+		t.Fatalf("registry export default kind failed: %v", err)
+	}
+}
+
+func writeRegistryAdminTestConfig(t *testing.T, endpoint string) string {
+	t.Helper()
+	path := t.TempDir() + "/registry.yaml"
+	cfg := `member:
+  id: registry
+  listen: "` + endpoint + `"
+membership:
+  active: 1
+  versions:
+    - version: 1
+      members:
+        - { id: registry }
+  owners:
+    route_link: 1
+    node_link: 1
+    node_list: 1
+`
+	if err := os.WriteFile(path, []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}

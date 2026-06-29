@@ -47,9 +47,9 @@ router 启动后通过 bootstrap 拉取 registry membership:
 GET /cluster/membership
 ```
 
-返回 active / next registry members、membership label 和 owner count。router 对每个 group 用
-`LocateN(group,active.members,route_link.owner_count)` 定位 route owner。请求失败、收到 moved/retry 或
-membership label 不匹配时刷新 membership 并重试。
+返回 active / next / old_grace registry members、membership label 和 owner count。router 对每个 group 用
+`LocateN(group,active.members,route_link.owner_count)` 定位 route owner。刷新 membership 时,router 会尝试
+bootstrap 和已知成员,选择 active version 最新的结果;route_link 请求遇到 5xx/409 时会刷新并重试一次。
 
 router 不参与 registry 成员健康检测,也不订阅 route 或 node_list。
 

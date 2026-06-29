@@ -83,6 +83,8 @@ member:                              # unified HTTP control plane
   # tls: { cert: ..., key: ..., ca: ... }   # server mTLS
 membership:
   active: 1
+  # next: 2                         # joint owner set target during membership change
+  # old_grace: 1                    # previous version kept as peer/node_link ingress after cutover
   versions:
     - version: 1
       members:

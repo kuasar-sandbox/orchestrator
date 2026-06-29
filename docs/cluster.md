@@ -49,6 +49,8 @@ member:
 
 membership:
   active: 1
+  # next: 2       # joint 阶段: active + next owner set 同时提交
+  # old_grace: 1  # cutover 后:旧成员只作为 peer/node_link 接入保留,不进入 owner set
   versions:
     - version: 1
       members:
@@ -86,10 +88,13 @@ scale_link:
 /route-link/*
 /scale-link/watch-node-list
 /cluster/membership
-/internal/registry-member/*
+/internal/registry-member/route-replica
+/internal/registry-member/node-replica
+/internal/registry-member/node-list-replica
+/internal/node-owner
 ```
 
-`member_link` 不作为单独配置项存在,它就是统一监听上的 `/internal/registry-member/*`。`node_link.listen`
+`member_link` 不作为单独配置项存在,它就是统一监听上的 `/internal/*` registry 成员 RPC。`node_link.listen`
 只用于生产上隔离 node 长连接流量,不改变 owner 规则和协议语义。
 
 ## 3. Registry 命名空间
@@ -121,8 +126,15 @@ registry 成员表只来自运维分发的配置文件。reload 通过信号或 
 registry.<version>.<sha256(sort(member_ids))>
 ```
 
-registry 可以同时持有 active / next 两个版本。旧版本直到 `old_grace` 结束才 retire。router、node、scaler
-通过 `GET /cluster/membership` 获取 active / next 成员表。
+registry 可以同时持有 `active`、`next` 和 `old_grace`:
+
+- `active`:客户端定位 route/node/node_list owner 的版本。
+- `next`:joint 阶段的目标版本;写入必须同时满足 active quorum 与 next quorum。
+- `old_grace`:cutover 后保留的旧版本;只用于 registry 成员互访、node-owner RPC 和仍接在旧成员上的
+  node_link,不参与 owner set,也不接受旧 owner 本地提交。
+
+router、scaler 通过 `GET /cluster/membership` 获取成员表。刷新时会从 bootstrap 和已知成员中选择 active
+version 最新的 membership,避免单个 bootstrap 滞后影响切换。
 
 ### 4.2 成员健康
 
@@ -146,7 +158,7 @@ scaler ready 通过 register loop 表达。scaler 向每个 active / next regist
 
 - 它参与的 owner set 降一格,只要可达 owner 数满足 quorum 即继续服务。
 - 若 quorum 不足,该 shard 停写(CP),不降级乱写。
-- 恢复成员不扫描全局 key 空间;后续同 shard key 的读写、node-link 上报或 group import 触达该 key 时,
+- 恢复成员不扫描全局 key 空间;后续同 shard key 的读写、node-link 上报或 group-scoped 操作触达该 key 时,
   quorum read-repair 补齐本地副本。
 
 ## 5. Joint Owner Set
@@ -180,10 +192,13 @@ stable(v1)
   -> wait_scaler_ready(v2)
   -> joint_route_link(v1,v2)
   -> cutover_barrier
-  -> stable(v2)
-  -> old_grace(v1)
+  -> stable(v2, old_grace=v1)
   -> retire(v1)
 ```
+
+reload 只允许两类 membership active 变化:同 active 下加载/取消同一个 `next`,或从已配置的 `next`
+切到新的 `active`。不能从 stable(v1) 直接跳到 stable(v2)。cutover 配置可以带 `old_grace=v1`,让旧成员
+继续作为 node_link 接入和 node-owner RPC 目标,但 owner views 只包含 v2。
 
 ## 6. 状态复制
 
@@ -198,9 +213,10 @@ read-repair。
 - joint 模式写入经 old quorum + new quorum 提交。
 - 提交后继续 best-effort 复制到同 shard key 的 joint owner set。
 - 每条记录有单调 rev 和唯一 ballot;写条件必须校验 expected rev。
-- 旧 membership 写入必须被 moved/retry,不能在旧 owner 本地提交。
+- cutover 后旧成员若仍在 `old_grace`,必须暴露新 active membership;旧版本不进入 owner view,旧 membership
+  写入不能在旧 owner 本地提交。
 - 成员冷重启后本地副本为空;不通过跨片扫描发现 key。只有带 shard key 的访问、node-link 上报或
-  group import 触达该 key 时才执行 quorum read-repair。
+  group-scoped 操作触达该 key 时才执行 quorum read-repair。
 
 size-1 模式中 `LocateN` 只返回本成员,quorum 退化为本地内存写;同样使用 expected rev + ballot
 接口。size-1 用于开发和小规模部署,不提供 registry 成员故障 HA。
@@ -208,30 +224,26 @@ size-1 模式中 `LocateN` 只返回本成员,quorum 退化为本地内存写;�
 ## 7. Namespace 收敛
 
 registry 不支持跨 group/node shard 扫描,也不通过枚举 key 做后台 promoter。收敛由 namespace 自己的事实源
-驱动:route/build 由 group import 或请求触达;node_link 由 node 连接、心跳和事件触达;node_list 由 node-link
-持有者的低频投影触达。
+驱动:route/build 由同 group 请求、node 上报或 group-scoped list/export 触达;group import 驱动 group/key
+allocation;node_link 由 node 连接、心跳和事件触达;node_list 由 node-link 持有者的低频投影触达。
 
 ### 7.1 node_link
 
-活动 node 连接持有者在进入 joint 后:
+活动 node 连接持有者在进入 joint/cutover 后:
 
-1. 向 joint owners 发送一次完整 node snapshot。
-2. 后续 heartbeat、sandbox/build event、清单变化实时 fanout。
-3. 用 transfer lease 和 `reconnect_to` 把 node 连接迁到新 owner。
-4. 新 owner 要求 full resync 后释放 transfer lease。
+1. register 和后续低频 liveness refresh 把 node_list 投影写入当前 owner set。
+2. heartbeat、sandbox/build event、清单变化继续写入当前 node_link owner set。
+3. 记录中的 `link_owner` 保留实际 h2 stream 持有者;新 route/node owner 通过 node-owner RPC 向该成员
+   下发 create/connect/delete/key/build 命令。
+4. 旧接入成员在 `old_grace` 期间不进入 owner set,但仍可作为 `link_owner` 接收转发命令。
 
 已断开 node 不阻塞切换。它重连时按当前 membership 做全量 resync;不重连则按 dead/reconcile 收敛。
 
 ### 7.2 route_link / group
 
-scaler 的全量 group import 是 group 收敛驱动。scaler 不复制 route 数据,只保证 group 全集被触达。
-
-```text
-scaler import generation G
-  -> for each group:
-       group owner 对该 group 的已知 route/build execution records 做 joint read/repair
-       不跨 group 枚举 registry route key
-```
+scaler 的全量 group import 是 group/key allocation 的事实源。scaler 不复制 route 数据。route/build 执行态
+不做跨 group promoter;后续同 group 请求、node 上报和 group-scoped list/export 会通过 quorum read-repair
+补齐该 group 的 owner 副本。
 
 provider 删除 group 时不能直接从 import 中消失;必须以 tombstone/draining group 形式继续出现,直到 registry
 确认该 group 没有活动 route/build 执行态。
@@ -315,7 +327,8 @@ Router 是无状态北向入口,但持本地缓存:
 - **active connection cache**:已有活动 HTTP/CONNECT 路由时,同一路由新请求不调用 Reserve。
 - **singleflight reserve**:同 route 并发 miss 只发起一次 Reserve。
 
-所有请求必须带 `X-Kuasar-Sandbox-Group`。router 通过 bootstrap 获取 registry membership,按 group 定位
+所有请求必须带 `X-Kuasar-Sandbox-Group`。router 通过 bootstrap 获取 registry membership,并在刷新时尝试
+bootstrap 与已知 active/next/old_grace 成员,选择 active version 最新的结果;按 active group owner 定位
 route owner。router 不订阅全量 route 或 node_list;转发失败时 fail-fast 淘汰缓存,下次重新 Reserve。
 
 router 调 route owner 的 `verify-key`;registry 只按 group failover 到 ready scaler 校验,不读取 auth_key。
@@ -331,8 +344,8 @@ scaler 负责:
 - `SandboxGroupProvider.GetPlacementHint` 构建 group placement cache。
 - `SandboxGroupProvider.GetKey` / `GetAuthKey` 生成 key allocation / auth material intent。
 - 按 active / next membership 得到 node_list owner 候选,一次只订阅一个 owner;断线后 reset 并切换下一个。
-- 周期性向每个 active / next registry 成员 `POST /scale-link/register` 发布 ready 状态。
-- 向每个 active / next registry 成员推送 selector/key allocation patch。
+- 周期性向每个 active / next registry owner 成员 `POST /scale-link/register` 发布 ready 状态。
+- 向每个 active / next registry owner 成员推送 selector/key allocation patch。
 - 对 registry 暴露 `POST /scale-link/place`。
 
 registry 对 group 做 scaler 选择:
@@ -426,5 +439,6 @@ registry export/import 不覆盖 sandbox-group provider 数据。group 配置、
 
 本仓 `make test-e2e` 先 `make build`,再用产物真实启动 `cluster-ctl registry/router/scaler` 与
 `node-stub-ctl`,覆盖 group 导入、key 分发、Reserve、数据面转发、活动路由缓存、BuildRegister、
-孤儿 route 清理和节点清空收敛。`test/e2e/e2e_cluster_stub.sh` 默认跑 `registry-n1` 和 `registry-n3`
-两个 case,验证 size-1 与多 registry 成员下的真实进程链路。
+孤儿 route 清理和节点清空收敛。`test/e2e/e2e_cluster_stub.sh` 默认跑 `registry-n1`、`registry-n3`
+和 `registry-joint` 三个 case;joint case 验证 next-only 成员复制可见、active v2 + old_grace v1 cutover、
+consumer membership refresh、cutover 后新 Reserve/BuildRegister 以及旧 node_link owner 转发。

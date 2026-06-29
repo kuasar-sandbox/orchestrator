@@ -11,6 +11,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"sync"
 	"testing"
 	"time"
 
@@ -271,6 +273,77 @@ func TestReserveSandboxCreateFlow(t *testing.T) {
 	rec, _, found, err := reg.stores.GetSandbox(ctx, "/c/p/a/g1", "u1:s1")
 	if err != nil || !found || rec.State != StateReady {
 		t.Fatalf("stored record: %+v found=%v err=%v", rec, found, err)
+	}
+}
+
+func TestReserveSandboxJoinerWakesWhenReadyObservedByQuorumRead(t *testing.T) {
+	ctx := context.Background()
+	reg := testReg(t)
+	reg.SetPlacer(placementWithToken("n1"))
+	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"}); err != nil {
+		t.Fatal(err)
+	}
+
+	commandSeen := make(chan *routesync.Command, 1)
+	releaseReady := make(chan struct{})
+	var once sync.Once
+	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(cmd *routesync.Command) {
+		if cmd.Kind != routesync.CmdCreate {
+			return
+		}
+		once.Do(func() { commandSeen <- cmd })
+		go reg.ackCommand(&routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted})
+		go func() {
+			<-releaseReady
+			_, _ = reg.stores.PutSandbox(context.Background(), &SandboxRecord{
+				Group: cmd.Group, RouteKey: cmd.RouteKey, SID: cmd.SID,
+				State: StateReady, NodeID: "n1", AccessToken: cmd.AccessToken,
+			})
+		}()
+	}})
+
+	type reserveOut struct {
+		res *ReserveResult
+		err error
+	}
+	leader := make(chan reserveOut, 1)
+	go func() {
+		res, err := reg.ReserveSandbox(ctx, "/g", "rk", nil)
+		leader <- reserveOut{res: res, err: err}
+	}()
+
+	select {
+	case <-commandSeen:
+	case <-time.After(time.Second):
+		t.Fatal("reserve did not send create command")
+	}
+
+	joinCtx, cancel := context.WithTimeout(ctx, 250*time.Millisecond)
+	defer cancel()
+	joiner := make(chan reserveOut, 1)
+	go func() {
+		res, err := reg.ReserveSandbox(joinCtx, "/g", "rk", nil)
+		joiner <- reserveOut{res: res, err: err}
+	}()
+	time.Sleep(25 * time.Millisecond)
+	close(releaseReady)
+
+	var lout reserveOut
+	select {
+	case lout = <-leader:
+	case <-time.After(time.Second):
+		t.Fatal("leader reserve did not complete")
+	}
+	if lout.err != nil || lout.res == nil || lout.res.SID == "" {
+		t.Fatalf("leader reserve = %+v err=%v", lout.res, lout.err)
+	}
+	select {
+	case jout := <-joiner:
+		if jout.err != nil || jout.res == nil || jout.res.SID != lout.res.SID {
+			t.Fatalf("joiner reserve = %+v err=%v, leader=%+v", jout.res, jout.err, lout.res)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("joiner reserve was not woken by ready quorum read")
 	}
 }
 
@@ -650,6 +723,56 @@ func TestNodeListWatchProjectsLowFrequencyFields(t *testing.T) {
 	}
 	if bm := readViewFrame(t, resp.Body); bm.Type != "bookmark" {
 		t.Fatalf("expected bookmark, got %+v", bm)
+	}
+}
+
+func TestNodeListWatchTokenResumesOnlyMatchingMembershipLabel(t *testing.T) {
+	ctx := context.Background()
+	reg := testReg(t)
+	reg.SetScaleReadyLabel("registry.1.test")
+	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1", LastHeartbeatUnix: time.Now().Unix()}); err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	reg.ServeScaleLink(mux)
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + ScaleLinkNodeListWatchPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reset := readViewFrame(t, resp.Body)
+	if reset.Type != "reset" {
+		t.Fatalf("initial first frame = %+v, want reset", reset)
+	}
+	_ = readViewFrame(t, resp.Body) // n1 snapshot
+	bookmark := readViewFrame(t, resp.Body)
+	resp.Body.Close()
+	if bookmark.Type != "bookmark" || bookmark.Token == "" {
+		t.Fatalf("initial bookmark missing watch token: %+v", bookmark)
+	}
+
+	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n2", LastHeartbeatUnix: time.Now().Unix()}); err != nil {
+		t.Fatal(err)
+	}
+	resp, err = http.Get(srv.URL + ScaleLinkNodeListWatchPath + "?from=" + url.QueryEscape(bookmark.Token))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	delta := readViewFrame(t, resp.Body)
+	if delta.Type != "put" || delta.Key != "n2" {
+		t.Fatalf("matching token should replay delta without reset, got %+v", delta)
+	}
+
+	resp2, err := http.Get(srv.URL + ScaleLinkNodeListWatchPath + "?from=" + url.QueryEscape("registry.2.test:1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp2.Body.Close()
+	if got := readViewFrame(t, resp2.Body); got.Type != "reset" {
+		t.Fatalf("mismatched token should force full snapshot reset, got %+v", got)
 	}
 }
 

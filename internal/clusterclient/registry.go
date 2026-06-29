@@ -83,27 +83,87 @@ func clientForScheme(scheme string, tlsConfig *tls.Config) *http.Client {
 }
 
 func (r *Registry) FetchMembership(ctx context.Context) (clustercfg.MembershipConfig, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, r.baseURL+MembershipPath, nil)
+	targets := r.membershipFetchTargets()
+	var out clustercfg.MembershipConfig
+	var got bool
+	var errs []string
+	for _, target := range targets {
+		next, err := fetchMembershipFrom(ctx, target)
+		if err != nil {
+			errs = append(errs, fmt.Sprintf("%s: %v", target.MemberID, err))
+			continue
+		}
+		next = next.WithComputedLabels()
+		if !got || membershipNewer(next, out) {
+			out = next
+			got = true
+		}
+	}
+	if !got {
+		if len(errs) == 0 {
+			return clustercfg.MembershipConfig{}, fmt.Errorf("clusterclient: no membership endpoints")
+		}
+		return clustercfg.MembershipConfig{}, fmt.Errorf("clusterclient: membership refresh failed: %s", strings.Join(errs, "; "))
+	}
+	r.mu.Lock()
+	r.membership = out
+	r.mu.Unlock()
+	return out, nil
+}
+
+func fetchMembershipFrom(ctx context.Context, ep Endpoint) (clustercfg.MembershipConfig, error) {
+	if ep.Client == nil {
+		return clustercfg.MembershipConfig{}, fmt.Errorf("client is nil")
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ep.BaseURL+MembershipPath, nil)
 	if err != nil {
 		return clustercfg.MembershipConfig{}, err
 	}
-	resp, err := r.client.Do(req)
+	resp, err := ep.Client.Do(req)
 	if err != nil {
 		return clustercfg.MembershipConfig{}, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return clustercfg.MembershipConfig{}, fmt.Errorf("clusterclient: membership %s", resp.Status)
+		return clustercfg.MembershipConfig{}, fmt.Errorf("membership %s", resp.Status)
 	}
 	var out clustercfg.MembershipConfig
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return clustercfg.MembershipConfig{}, err
 	}
-	out = out.WithComputedLabels()
-	r.mu.Lock()
-	r.membership = out
-	r.mu.Unlock()
 	return out, nil
+}
+
+func membershipNewer(a, b clustercfg.MembershipConfig) bool {
+	if a.Active != b.Active {
+		return a.Active > b.Active
+	}
+	return a.Next > b.Next
+}
+
+func (r *Registry) membershipFetchTargets() []Endpoint {
+	out := []Endpoint{{MemberID: "bootstrap", BaseURL: r.baseURL, Client: r.client}}
+	r.mu.RLock()
+	m := r.membership
+	r.mu.RUnlock()
+	if len(m.Versions) == 0 {
+		return out
+	}
+	seen := map[string]bool{r.baseURL: true}
+	for _, v := range m.MemberVersions() {
+		for _, member := range v.Members {
+			if member.ID == "" {
+				continue
+			}
+			ep, err := r.endpointForMember(v, member)
+			if err != nil || ep.BaseURL == "" || seen[ep.BaseURL] {
+				continue
+			}
+			seen[ep.BaseURL] = true
+			out = append(out, ep)
+		}
+	}
+	return out
 }
 
 func (r *Registry) Membership(ctx context.Context) (clustercfg.MembershipConfig, error) {

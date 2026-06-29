@@ -2,10 +2,14 @@ package scaler
 
 import (
 	"context"
+	"encoding/binary"
+	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -120,6 +124,93 @@ func TestScalerUsesSingleNodeListSourceAndRegistersAllRegistryMembers(t *testing
 			t.Fatalf("%s Place = %+v err=%v", name, placement, err)
 		}
 	}
+}
+
+func TestSetNodeListLinksSameLinksPreservesReadyView(t *testing.T) {
+	svc := NewRemoteLinks([]RegistryLink{{Name: "r1", BaseURL: "http://r1", Client: http.DefaultClient}},
+		clustercfg.PlacementConfig{Candidates: 1}, 30, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	seedNodeListView(t, svc, "n1")
+	if !svc.nodes.ready() || len(svc.nodes.values()) != 1 {
+		t.Fatal("seeded node_list view is not ready")
+	}
+
+	svc.SetNodeListLinks(context.Background(), []RegistryLink{{Name: "r1", BaseURL: "http://r1", Client: http.DefaultClient}})
+
+	if !svc.nodes.ready() || len(svc.nodes.values()) != 1 {
+		t.Fatalf("unchanged node_list links reset a ready view: ready=%v values=%v", svc.nodes.ready(), svc.nodes.values())
+	}
+}
+
+func TestSetNodeListLinksChangedLinksResetsReadyView(t *testing.T) {
+	svc := NewRemoteLinks([]RegistryLink{{Name: "r1", BaseURL: "http://r1", Client: http.DefaultClient}},
+		clustercfg.PlacementConfig{Candidates: 1}, 30, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	seedNodeListView(t, svc, "n1")
+
+	svc.SetNodeListLinks(context.Background(), []RegistryLink{{Name: "r2", BaseURL: "http://r2", Client: http.DefaultClient}})
+
+	if svc.nodes.ready() || len(svc.nodes.values()) != 0 {
+		t.Fatalf("changed node_list links kept stale view: ready=%v values=%v", svc.nodes.ready(), svc.nodes.values())
+	}
+}
+
+func TestSubscribeOnceUsesOpaqueWatchToken(t *testing.T) {
+	var rawQuery string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		rawQuery = req.URL.RawQuery
+		writeViewFrameForTest(t, w, &registry.ViewEvent{Type: "bookmark", Token: "registry.1.test:8"})
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+	}))
+	defer srv.Close()
+
+	svc := NewRemoteLinks(nil, clustercfg.PlacementConfig{Candidates: 1}, 30, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	token, err := svc.subscribeOnce(context.Background(),
+		RegistryLink{Name: "r1", BaseURL: srv.URL, Client: srv.Client()},
+		"/watch", "registry.1.test:7", svc.nodes.source("node_list"))
+	if !errors.Is(err, io.EOF) {
+		t.Fatalf("subscribeOnce err=%v, want EOF after test stream closes", err)
+	}
+	if token != "registry.1.test:8" {
+		t.Fatalf("token=%q, want updated event token", token)
+	}
+	values, err := url.ParseQuery(rawQuery)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if values.Get("from") != "registry.1.test:7" {
+		t.Fatalf("query %q did not carry opaque from token", rawQuery)
+	}
+}
+
+func writeViewFrameForTest(t *testing.T, w io.Writer, ev *registry.ViewEvent) {
+	t.Helper()
+	b, err := json.Marshal(ev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var hdr [4]byte
+	binary.LittleEndian.PutUint32(hdr[:], uint32(len(b)))
+	if _, err := w.Write(hdr[:]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write(b); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func seedNodeListView(t *testing.T, svc *Service, nodeID string) {
+	t.Helper()
+	sink := svc.nodes.source("node_list")
+	sink.reset()
+	raw, err := json.Marshal(clusterstate.NodeListEntry{
+		NodeID: nodeID, Labels: map[string]string{"pool": "p"}, LastHeartbeatUnix: time.Now().Unix(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sink.put(nodeID, raw)
+	sink.bookmark()
 }
 
 func testScaleRegistry(t *testing.T, ctx context.Context, nodeID string) (*registry.Registry, *httptest.Server) {

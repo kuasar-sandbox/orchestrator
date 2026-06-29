@@ -40,9 +40,12 @@ type MemberConfig struct {
 // MembershipConfig is the versioned registry member view. The active version is
 // the client routing input. When next is set, registry writes use joint owner
 // sets: active quorum and next quorum must both commit before the write returns.
+// old_grace keeps a previous version reachable for peer/node-owner RPC without
+// adding it to owner quorums.
 type MembershipConfig struct {
 	Active   int64                 `yaml:"active" json:"active"`
 	Next     int64                 `yaml:"next,omitempty" json:"next,omitempty"`
+	OldGrace int64                 `yaml:"old_grace,omitempty" json:"old_grace,omitempty"`
 	Versions []MembershipVersion   `yaml:"versions" json:"versions"`
 	Owners   MembershipOwnerConfig `yaml:"owners" json:"owners"`
 }
@@ -236,6 +239,18 @@ func (m MembershipConfig) NextVersion() (MembershipVersion, bool) {
 	return MembershipVersion{}, false
 }
 
+func (m MembershipConfig) OldGraceVersion() (MembershipVersion, bool) {
+	if m.OldGrace == 0 || m.OldGrace == m.Active || m.OldGrace == m.Next {
+		return MembershipVersion{}, false
+	}
+	for _, v := range m.Versions {
+		if v.Version == m.OldGrace {
+			return v.WithComputedLabel(), true
+		}
+	}
+	return MembershipVersion{}, false
+}
+
 func (m MembershipConfig) OwnerVersions() []MembershipVersion {
 	out := make([]MembershipVersion, 0, 2)
 	if active, ok := m.ActiveVersion(); ok {
@@ -256,6 +271,9 @@ func (m MembershipConfig) MemberVersions() []MembershipVersion {
 		}
 		seen[v.Version] = true
 		out = append(out, v)
+	}
+	if oldGrace, ok := m.OldGraceVersion(); ok && !seen[oldGrace.Version] {
+		out = append(out, oldGrace)
 	}
 	return out
 }
@@ -450,12 +468,16 @@ func (c *RegistryConfig) Validate() error {
 	if c.Membership.Next < 0 {
 		return fmt.Errorf("clustercfg: membership.next must not be negative")
 	}
+	if c.Membership.OldGrace < 0 {
+		return fmt.Errorf("clustercfg: membership.old_grace must not be negative")
+	}
 	if len(c.Membership.Versions) == 0 {
 		return fmt.Errorf("clustercfg: membership.versions must not be empty")
 	}
 	activeFound := false
 	nextFound := c.Membership.Next == 0 || c.Membership.Next == c.Membership.Active
-	selfInOwnerVersion := false
+	oldGraceFound := c.Membership.OldGrace == 0 || c.Membership.OldGrace == c.Membership.Active || c.Membership.OldGrace == c.Membership.Next
+	selfInServingVersion := false
 	for _, v := range c.Membership.Versions {
 		if v.Version == c.Membership.Active {
 			activeFound = true
@@ -463,16 +485,21 @@ func (c *RegistryConfig) Validate() error {
 		if v.Version == c.Membership.Next {
 			nextFound = true
 		}
+		if v.Version == c.Membership.OldGrace {
+			oldGraceFound = true
+		}
 		if v.Version <= 0 {
 			return fmt.Errorf("clustercfg: membership version must be positive")
 		}
 		if len(v.Members) == 0 {
 			return fmt.Errorf("clustercfg: membership version %d has no members", v.Version)
 		}
-		if v.Version == c.Membership.Active || (c.Membership.Next != 0 && v.Version == c.Membership.Next) {
+		if v.Version == c.Membership.Active ||
+			(c.Membership.Next != 0 && v.Version == c.Membership.Next) ||
+			(c.Membership.OldGrace != 0 && v.Version == c.Membership.OldGrace) {
 			for _, member := range v.Members {
 				if member.ID == c.Member.ID {
-					selfInOwnerVersion = true
+					selfInServingVersion = true
 				}
 			}
 		}
@@ -483,8 +510,11 @@ func (c *RegistryConfig) Validate() error {
 	if !nextFound {
 		return fmt.Errorf("clustercfg: membership.next %d is not in membership.versions", c.Membership.Next)
 	}
-	if !selfInOwnerVersion {
-		return fmt.Errorf("clustercfg: member.id %q is not in active or next membership", c.Member.ID)
+	if !oldGraceFound {
+		return fmt.Errorf("clustercfg: membership.old_grace %d is not in membership.versions", c.Membership.OldGrace)
+	}
+	if !selfInServingVersion {
+		return fmt.Errorf("clustercfg: member.id %q is not in active, next, or old_grace membership", c.Member.ID)
 	}
 	if c.Membership.Owners.RouteLink <= 0 {
 		return fmt.Errorf("clustercfg: membership.owners.route_link must be positive")
