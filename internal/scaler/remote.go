@@ -3,8 +3,10 @@ package scaler
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/tls"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -17,6 +19,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/maglev"
 	clusterstate "github.com/kuasar-sandbox/sandbox-orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/clustercfg"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/registry"
@@ -40,6 +43,15 @@ type Service struct {
 	nodes    *nodeView
 	provider clusterstate.SandboxGroupProvider
 	importer clusterstate.SandboxGroupImporter
+
+	taskMu            sync.RWMutex
+	runID             string
+	importTasks       []ImportTask
+	taskOwnerID       string
+	taskPeerSource    func() []string
+	taskLeaseTTL      time.Duration
+	allocationEvery   time.Duration
+	scaleLinkResolver func(context.Context, string) ([]RegistryLink, error)
 }
 
 type RegistryLink struct {
@@ -62,6 +74,17 @@ func NewRemoteLinksWithGroups(links []RegistryLink, provider clusterstate.Sandbo
 	if cfg.Candidates <= 0 {
 		cfg.Candidates = 2
 	}
+	if cfg.ImportOwnerCount <= 0 {
+		cfg.ImportOwnerCount = 3
+	}
+	taskLeaseTTL := cfg.ImportTaskLeaseTTLDur()
+	if taskLeaseTTL <= 0 {
+		taskLeaseTTL = 15 * time.Second
+	}
+	allocationEvery := cfg.AllocationRefreshDur()
+	if allocationEvery <= 0 {
+		allocationEvery = time.Minute
+	}
 	links = normalizeRegistryLinks(links)
 	if provider == nil {
 		provider = emptyGroupSource{}
@@ -69,13 +92,37 @@ func NewRemoteLinksWithGroups(links []RegistryLink, provider clusterstate.Sandbo
 	if importer == nil {
 		importer = emptyGroupSource{}
 	}
+	runID := newRunID()
 	return &Service{
 		links: links, watchLinks: links,
 		cfg: cfg, deadAfter: deadAfter, log: log,
-		nodes:    newNodeView(1),
-		provider: provider,
-		importer: importer,
+		nodes:           newNodeView(1),
+		provider:        provider,
+		importer:        importer,
+		runID:           runID,
+		importTasks:     importTasksFor(importer),
+		taskOwnerID:     "local",
+		taskLeaseTTL:    taskLeaseTTL,
+		allocationEvery: allocationEvery,
 	}
+}
+
+func newRunID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return fmt.Sprintf("%d", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b[:])
+}
+
+func importTasksFor(importer clusterstate.SandboxGroupImporter) []ImportTask {
+	if importer == nil {
+		return nil
+	}
+	if src, ok := importer.(ImportTaskSource); ok {
+		return src.ImportTasks()
+	}
+	return []ImportTask{{ID: "default", Importer: importer}}
 }
 
 func registryLinkFromAddress(name, scaleAddr string, scaleTLS *tls.Config) RegistryLink {
@@ -184,6 +231,22 @@ func (s *Service) SetNodeListLinks(ctx context.Context, links []RegistryLink) {
 	if s.startedCtx != nil {
 		s.startWatchLinkLocked(ctx)
 	}
+}
+
+func (s *Service) SetImportTaskOwnerSource(ownerID string, peerSource func() []string) {
+	if ownerID == "" {
+		ownerID = "local"
+	}
+	s.taskMu.Lock()
+	s.taskOwnerID = ownerID
+	s.taskPeerSource = peerSource
+	s.taskMu.Unlock()
+}
+
+func (s *Service) SetScaleLinkResolver(resolver func(context.Context, string) ([]RegistryLink, error)) {
+	s.linksMu.Lock()
+	s.scaleLinkResolver = resolver
+	s.linksMu.Unlock()
 }
 
 func sameRegistryLinkTargets(a, b []RegistryLink) bool {
@@ -398,11 +461,14 @@ type groupAllocation struct {
 	manifestKey clusterstate.Secret
 }
 
-func (s *Service) groupAllocations(ctx context.Context) ([]groupAllocation, error) {
+func (s *Service) groupAllocations(ctx context.Context, task ImportTask) ([]groupAllocation, error) {
+	if task.Importer == nil {
+		return nil, nil
+	}
 	var out []groupAllocation
 	cursor := ""
 	for {
-		page, err := s.importer.Range(ctx, cursor, defaultGroupPageLimit)
+		page, err := task.Importer.Range(ctx, cursor, defaultGroupPageLimit)
 		if err != nil {
 			return nil, err
 		}
@@ -427,13 +493,23 @@ func (s *Service) groupAllocations(ctx context.Context) ([]groupAllocation, erro
 	}
 }
 
+type selectorPatchState struct {
+	key    string
+	sentAt time.Time
+}
+
+type importLeaseToken struct {
+	taskID string
+	lease  registry.ImportTaskLease
+}
+
 // reconcileKeyAllocations periodically computes each group's explicit node set for
-// manifest-key distribution and pushes it to every registry member. Change
-// tracking is per registry link so a down member retries without forcing the
-// already updated members to receive every unchanged group again.
+// manifest-key distribution and pushes it to every registry member. Only the
+// import-task lease winner runs Range for a source task; unchanged patches are
+// still refreshed before the registry-side allocation TTL can expire.
 func (s *Service) reconcileKeyAllocations(ctx context.Context) {
-	last := map[string]map[string]string{} // registry link -> group -> derived key
-	t := time.NewTicker(3 * time.Second)
+	last := map[string]selectorPatchState{} // group -> derived key + owner-set signature + last successful push
+	t := time.NewTicker(s.reconcileInterval())
 	defer t.Stop()
 	for {
 		select {
@@ -443,70 +519,213 @@ func (s *Service) reconcileKeyAllocations(ctx context.Context) {
 			if !s.nodes.ready() {
 				continue
 			}
-			nodes := s.nodes.values()
-			allocations, err := s.groupAllocations(ctx)
-			if err != nil {
-				s.log.Warn("scaler: group import", "err", err)
-				continue
-			}
-			current := map[string]bool{}
-			for _, g := range allocations {
-				current[g.group] = true
-				selectors, nodeIDs := keyAllocation(g.group, nodes, g.hint.NodeSelectors, s.cfg.ShuffleSharding)
-				fp, keyType, keyValue, keyRef, err := manifestKeyPatch(g.group, g.manifestKey)
-				if err != nil {
-					s.log.Warn("scaler: manifest key", "group", g.group, "err", err)
-					nodeIDs = nil
-					fp, keyType, keyValue, keyRef = "", "", "", ""
-				}
-				key := fmt.Sprint(selectors) + "|" + strings.Join(nodeIDs, ",") + "|" + fp + "|" + keyType + "|" + keyValue + "|" + keyRef
-				patch := &routesync.SelectorPatch{
-					Group: g.group, Selectors: selectors, NodeIDs: nodeIDs, NodeAllocation: true,
-					KeyFingerprint: fp, ManifestKeyType: keyType, ManifestKey: keyValue, ManifestKeyRef: keyRef,
-				}
-				for _, link := range s.RegistryLinks() {
-					if last[link.Name] == nil {
-						last[link.Name] = map[string]string{}
-					}
-					if last[link.Name][g.group] == key {
-						continue // unchanged since last successful push to this member
-					}
-					if err := s.postJSON(ctx, link, registry.ScaleLinkSelectorPatchPath, patch); err != nil {
-						s.log.Warn("scaler: selector patch", "registry", link.Name, "group", g.group, "err", err)
-						continue
-					}
-					last[link.Name][g.group] = key
-				}
-			}
-			byName := s.linksByName()
-			for name, groups := range last {
-				link, ok := byName[name]
-				if !ok {
-					delete(last, name)
-					continue
-				}
-				for group := range groups {
-					if current[group] {
-						continue
-					}
-					if err := s.postJSON(ctx, link, registry.ScaleLinkSelectorPatchPath, &routesync.SelectorPatch{Group: group, NodeAllocation: true}); err != nil {
-						s.log.Warn("scaler: selector patch delete", "registry", name, "group", group, "err", err)
-						continue
-					}
-					delete(groups, group)
-				}
-			}
+			s.reconcileImportTasks(ctx, s.nodes.values(), last)
 		}
 	}
 }
 
-func (s *Service) linksByName() map[string]RegistryLink {
-	links := s.RegistryLinks()
-	out := make(map[string]RegistryLink, len(links))
-	for _, link := range links {
-		out[link.Name] = link
+func (s *Service) reconcileInterval() time.Duration {
+	interval := 3 * time.Second
+	if s.allocationEvery > 0 && s.allocationEvery/2 > 0 && s.allocationEvery/2 < interval {
+		interval = s.allocationEvery / 2
 	}
-	return out
+	if interval <= 0 {
+		return time.Second
+	}
+	return interval
+}
+
+func (s *Service) reconcileImportTasks(ctx context.Context, nodes []*registry.NodeRecord, last map[string]selectorPatchState) {
+	for _, task := range s.importTasks {
+		if task.ID == "" {
+			task.ID = "default"
+		}
+		if !s.isImportTaskCandidate(task.ID) {
+			continue
+		}
+		lease, ok := s.acquireImportTaskLeaseToken(ctx, task.ID)
+		if !ok {
+			continue
+		}
+		allocations, err := s.groupAllocations(ctx, task)
+		if err != nil {
+			s.log.Warn("scaler: group import", "task", task.ID, "err", err)
+			continue
+		}
+		lease, ok = s.acquireImportTaskLeaseToken(ctx, task.ID)
+		if !ok {
+			continue
+		}
+		s.pushAllocations(ctx, task.ID, nodes, allocations, lease, last)
+	}
+}
+
+func (s *Service) isImportTaskCandidate(taskID string) bool {
+	self, peers := s.taskOwnerSnapshot()
+	if self == "" {
+		return true
+	}
+	if len(peers) == 0 {
+		peers = []string{self}
+	}
+	seen := map[string]bool{}
+	ids := make([]string, 0, len(peers)+1)
+	for _, id := range peers {
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		ids = append(ids, id)
+	}
+	if !seen[self] {
+		ids = append(ids, self)
+	}
+	sort.Strings(ids)
+	n := s.cfg.ImportOwnerCount
+	if n <= 0 {
+		n = 3
+	}
+	if n > len(ids) {
+		n = len(ids)
+	}
+	owners, err := maglev.LocateN([]byte(taskID), ids, n)
+	if err != nil {
+		return false
+	}
+	for _, id := range owners {
+		if id == self {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Service) taskOwnerSnapshot() (string, []string) {
+	s.taskMu.RLock()
+	self := s.taskOwnerID
+	source := s.taskPeerSource
+	s.taskMu.RUnlock()
+	if self == "" {
+		self = "local"
+	}
+	if source == nil {
+		return self, []string{self}
+	}
+	return self, source()
+}
+
+func (s *Service) acquireImportTaskLeaseToken(ctx context.Context, taskID string) (importLeaseToken, bool) {
+	self, _ := s.taskOwnerSnapshot()
+	if self == "" {
+		self = "local"
+	}
+	links := s.scaleLinkLinks(ctx, clusterstate.ScaleLinkTaskKey(taskID))
+	for _, link := range links {
+		resp, err := s.acquireImportTaskLease(ctx, link, taskID, self)
+		if err != nil {
+			s.log.Warn("scaler: import task lease", "registry", link.Name, "task", taskID, "err", err)
+			continue
+		}
+		if !resp.Acquired {
+			return importLeaseToken{taskID: taskID, lease: resp.Lease}, false
+		}
+		return importLeaseToken{taskID: taskID, lease: resp.Lease}, true
+	}
+	return importLeaseToken{}, false
+}
+
+func (s *Service) acquireImportTaskLease(ctx context.Context, link RegistryLink, taskID, ownerID string) (registry.ImportTaskLeaseResponse, error) {
+	reqBody := registry.ImportTaskLeaseRequest{
+		TaskID: taskID, OwnerID: ownerID, RunID: s.runID,
+		TTLMillis: s.taskLeaseTTL.Milliseconds(),
+	}
+	var body bytes.Buffer
+	if err := json.NewEncoder(&body).Encode(&reqBody); err != nil {
+		return registry.ImportTaskLeaseResponse{}, err
+	}
+	reqCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, link.BaseURL+registry.ScaleLinkImportTaskPath, &body)
+	if err != nil {
+		return registry.ImportTaskLeaseResponse{}, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := link.Client.Do(req)
+	if err != nil {
+		return registry.ImportTaskLeaseResponse{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return registry.ImportTaskLeaseResponse{}, fmt.Errorf("%s: %s", resp.Status, strings.TrimSpace(string(b)))
+	}
+	var out registry.ImportTaskLeaseResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return registry.ImportTaskLeaseResponse{}, err
+	}
+	return out, nil
+}
+
+func (s *Service) pushAllocations(ctx context.Context, taskID string, nodes []*registry.NodeRecord, allocations []groupAllocation, lease importLeaseToken, last map[string]selectorPatchState) {
+	now := time.Now()
+	for _, g := range allocations {
+		selectors, nodeIDs := keyAllocation(g.group, nodes, g.hint.NodeSelectors, s.cfg.ShuffleSharding)
+		fp, keyType, keyValue, keyRef, err := manifestKeyPatch(g.group, g.manifestKey)
+		if err != nil {
+			s.log.Warn("scaler: manifest key", "group", g.group, "err", err)
+			nodeIDs = nil
+			fp, keyType, keyValue, keyRef = "", "", "", ""
+		}
+		links := s.scaleLinkLinks(ctx, clusterstate.ScaleLinkAllocationKey(g.group))
+		linkSig := registryLinkSignature(links)
+		key := fmt.Sprint(selectors) + "|" + strings.Join(nodeIDs, ",") + "|" + fp + "|" + keyType + "|" + keyValue + "|" + keyRef + "|" + linkSig
+		state := last[g.group]
+		if state.key == key && now.Sub(state.sentAt) < s.allocationEvery {
+			continue
+		}
+		patch := &routesync.SelectorPatch{
+			Group: g.group, Selectors: selectors, NodeIDs: nodeIDs, NodeAllocation: true,
+			KeyFingerprint: fp, ManifestKeyType: keyType, ManifestKey: keyValue, ManifestKeyRef: keyRef,
+			ImportTaskID: lease.taskID, ImportOwnerID: lease.lease.OwnerID, ImportRunID: lease.lease.RunID, ImportTerm: lease.lease.Term,
+		}
+		for _, link := range links {
+			if err := s.postJSON(ctx, link, registry.ScaleLinkSelectorPatchPath, patch); err != nil {
+				s.log.Warn("scaler: selector patch", "registry", link.Name, "task", taskID, "group", g.group, "err", err)
+				continue
+			}
+			last[g.group] = selectorPatchState{key: key, sentAt: now}
+			break
+		}
+	}
+}
+
+func (s *Service) scaleLinkLinks(ctx context.Context, recordKey string) []RegistryLink {
+	s.linksMu.RLock()
+	resolver := s.scaleLinkResolver
+	fallback := append([]RegistryLink(nil), s.links...)
+	s.linksMu.RUnlock()
+	if resolver == nil {
+		return fallback
+	}
+	links, err := resolver(ctx, recordKey)
+	if err != nil {
+		s.log.Warn("scaler: scale_link owner links", "key", recordKey, "err", err)
+		return fallback
+	}
+	links = normalizeRegistryLinks(links)
+	if len(links) == 0 {
+		return fallback
+	}
+	return links
+}
+
+func registryLinkSignature(links []RegistryLink) string {
+	ids := make([]string, 0, len(links))
+	for _, link := range links {
+		ids = append(ids, link.Name+"@"+link.BaseURL)
+	}
+	sort.Strings(ids)
+	return strings.Join(ids, ",")
 }
 
 func (s *Service) postJSON(ctx context.Context, link RegistryLink, path string, v any) error {

@@ -64,6 +64,7 @@ type MembershipMember struct {
 type MembershipOwnerConfig struct {
 	RouteLink int `yaml:"route_link" json:"route_link"`
 	NodeLink  int `yaml:"node_link" json:"node_link"`
+	ScaleLink int `yaml:"scale_link" json:"scale_link"`
 	NodeList  int `yaml:"node_list" json:"node_list"`
 }
 
@@ -129,10 +130,13 @@ type RouterCache struct {
 
 // PlacementConfig groups the scaler's placement policy.
 type PlacementConfig struct {
-	Candidates      int           `yaml:"candidates"`       // P2C sample size; default 2
-	ZoneAdmitMax    string        `yaml:"zone_admit_max"`   // exclude nodes hotter than this; default yellow
-	NodeDeadAfter   string        `yaml:"node_dead_after"`  // exclude nodes silent longer than this; default 30s
-	ShuffleSharding []ShuffleRule `yaml:"shuffle_sharding"` // empty = static nodeSelectors only
+	Candidates                int           `yaml:"candidates"`                  // P2C sample size; default 2
+	ZoneAdmitMax              string        `yaml:"zone_admit_max"`              // exclude nodes hotter than this; default yellow
+	NodeDeadAfter             string        `yaml:"node_dead_after"`             // exclude nodes silent longer than this; default 30s
+	ImportOwnerCount          int           `yaml:"import_owner_count"`          // scaler candidates that may race for one import task lease
+	ImportTaskLeaseTTL        string        `yaml:"import_task_lease_ttl"`       // registry-side import task lease TTL
+	AllocationRefreshInterval string        `yaml:"allocation_refresh_interval"` // unchanged key allocation refresh cadence
+	ShuffleSharding           []ShuffleRule `yaml:"shuffle_sharding"`            // empty = static nodeSelectors only
 }
 
 type GroupSourceConfig struct {
@@ -230,6 +234,14 @@ func (c *ScaleLinkConfig) PlaceDur() time.Duration {
 }
 func (c *ScaleLinkConfig) AllocationTTLDur() time.Duration {
 	d, _ := time.ParseDuration(c.AllocationTTL)
+	return d
+}
+func (c *PlacementConfig) ImportTaskLeaseTTLDur() time.Duration {
+	d, _ := time.ParseDuration(c.ImportTaskLeaseTTL)
+	return d
+}
+func (c *PlacementConfig) AllocationRefreshDur() time.Duration {
+	d, _ := time.ParseDuration(c.AllocationRefreshInterval)
 	return d
 }
 
@@ -379,7 +391,7 @@ func DefaultRegistry() RegistryConfig {
 				Version: 1,
 				Members: []MembershipMember{{ID: "registry"}},
 			}},
-			Owners: MembershipOwnerConfig{RouteLink: 1, NodeLink: 1, NodeList: 1},
+			Owners: MembershipOwnerConfig{RouteLink: 1, NodeLink: 1, ScaleLink: 1, NodeList: 1},
 		},
 		NodeLink:  NodeLinkConfig{HeartbeatInterval: "10s", NodeDeadAfter: "30s", RevisionRetention: 10000},
 		RouteLink: RouteLinkConfig{ParkTimeout: "30s"},
@@ -440,6 +452,9 @@ func (c *RegistryConfig) applyDefaults() {
 	}
 	if c.Membership.Owners.NodeLink == 0 {
 		c.Membership.Owners.NodeLink = d.Membership.Owners.NodeLink
+	}
+	if c.Membership.Owners.ScaleLink == 0 {
+		c.Membership.Owners.ScaleLink = d.Membership.Owners.ScaleLink
 	}
 	if c.Membership.Owners.NodeList == 0 {
 		c.Membership.Owners.NodeList = d.Membership.Owners.NodeList
@@ -543,6 +558,9 @@ func (c *RegistryConfig) Validate() error {
 	}
 	if c.Membership.Owners.NodeLink <= 0 {
 		return fmt.Errorf("clustercfg: membership.owners.node_link must be positive")
+	}
+	if c.Membership.Owners.ScaleLink <= 0 {
+		return fmt.Errorf("clustercfg: membership.owners.scale_link must be positive")
 	}
 	if c.Membership.Owners.NodeList <= 0 {
 		return fmt.Errorf("clustercfg: membership.owners.node_list must be positive")
@@ -729,7 +747,10 @@ func DefaultScaler() ScalerConfig {
 		Memberlist:   ScalerMemberlistConfig{Label: "scaler.default"},
 		Registry:     RegistryDialConfig{Bootstrap: defaultRegistryBootstrap},
 		ImportGroups: nil,
-		Placement:    PlacementConfig{Candidates: 2, ZoneAdmitMax: "yellow", NodeDeadAfter: "30s"},
+		Placement: PlacementConfig{
+			Candidates: 2, ZoneAdmitMax: "yellow", NodeDeadAfter: "30s",
+			ImportOwnerCount: 3, ImportTaskLeaseTTL: "15s", AllocationRefreshInterval: "1m",
+		},
 	}
 }
 
@@ -778,6 +799,15 @@ func (c *ScalerConfig) applyDefaults() {
 	if c.Placement.NodeDeadAfter == "" {
 		c.Placement.NodeDeadAfter = d.Placement.NodeDeadAfter
 	}
+	if c.Placement.ImportOwnerCount == 0 {
+		c.Placement.ImportOwnerCount = d.Placement.ImportOwnerCount
+	}
+	if c.Placement.ImportTaskLeaseTTL == "" {
+		c.Placement.ImportTaskLeaseTTL = d.Placement.ImportTaskLeaseTTL
+	}
+	if c.Placement.AllocationRefreshInterval == "" {
+		c.Placement.AllocationRefreshInterval = d.Placement.AllocationRefreshInterval
+	}
 }
 
 func (c *ScalerConfig) Validate() error {
@@ -801,6 +831,9 @@ func (c *ScalerConfig) Validate() error {
 	if c.Placement.Candidates < 0 {
 		return fmt.Errorf("clustercfg: placement.candidates %d invalid (must be >= 0)", c.Placement.Candidates)
 	}
+	if c.Placement.ImportOwnerCount <= 0 {
+		return fmt.Errorf("clustercfg: placement.import_owner_count must be positive")
+	}
 	seenSources := map[string]bool{}
 	for _, source := range c.ImportGroups {
 		if source.SourceID == "" {
@@ -819,7 +852,11 @@ func (c *ScalerConfig) Validate() error {
 			return fmt.Errorf("clustercfg: import_groups[%s].source_type %q invalid (file)", source.SourceID, source.SourceType)
 		}
 	}
-	return validateDurations(map[string]string{"placement.node_dead_after": c.Placement.NodeDeadAfter})
+	return validateDurations(map[string]string{
+		"placement.node_dead_after":             c.Placement.NodeDeadAfter,
+		"placement.import_task_lease_ttl":       c.Placement.ImportTaskLeaseTTL,
+		"placement.allocation_refresh_interval": c.Placement.AllocationRefreshInterval,
+	})
 }
 
 // NodeDeadDur is how long a node may be silent before the scaler excludes it.

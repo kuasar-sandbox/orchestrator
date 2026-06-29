@@ -60,6 +60,7 @@ membership:
   owners:
     route_link: 3
     node_link: 3
+    scale_link: 3
     node_list: 3
 
 node_link:
@@ -80,6 +81,7 @@ scale_link:
   scaler_replica_count: 3
   min_ready_scalers: 1
   place_timeout: 2s
+  allocation_ttl: 10m
 ```
 
 默认 path:
@@ -87,10 +89,11 @@ scale_link:
 ```text
 /node-link/*
 /route-link/*
-/scale-link/watch-node-list
+/scale-link/*
 /cluster/membership
 /internal/registry-member/route-replica
 /internal/registry-member/node-replica
+/internal/registry-member/scale-link-replica
 /internal/registry-member/node-list-replica
 /internal/node-owner
 ```
@@ -108,7 +111,11 @@ Registry 成员集由运维配置和 membership version 定义。每个命名空
 | `route_link` | group | `LocateN(group,K)` | route 记录、build 执行态;每个 owner 持完整 group 执行态视图 |
 | `node_link` | node_id | `LocateN(node_id,N)` | node 连接、sandbox/build 清单、labels、水位、build 预算;每个 owner 持完整 node 视图 |
 | `node_list` | `node_list` | `LocateN("node_list",M)` | 低频节点目录与 labels;每个 node_list owner 持完整目录和 WATCH_LIST log |
-| `scale_link` | group | `LocateN(group,ready_scalers,R)` | scaler 动态成员域和 Place 故障转移候选 |
+| `scale_link` | scale_link key | `LocateN(key,S)` | import task lease 和 key allocation intent;registry owner set 内全复制 |
+
+`scale_link.scaler_replica_count` 只控制 registry 调用 ready scaler 的 failover 候选数,不是 registry 内部
+`scale_link` 记录的 owner count。后者由 `membership.owners.scale_link` 控制。
+`membership.owners.route_link/node_link/scale_link/node_list` 分别控制对应 registry 命名空间的 owner 数量。
 
 `node_link` 中只有当前连接 owner 持有实际 node h2 stream;其余 owner 通过复制持有完整视图。
 node 记录携带 `link_owner`,route owner 需要下发 `create/key/build/delete` 时,通过 node-owner RPC 转发到
@@ -209,7 +216,7 @@ reload 只允许两类 membership active 变化:同 active 下加载/取消同�
 
 ## 6. 状态复制
 
-`route_link`、`node_link` 和 `node_list` 使用无主 quorum CAS。协议以唯一 ballot 定序写入:
+`route_link`、`node_link`、`node_list` 和 registry 内部 `scale_link` 记录使用无主 quorum CAS。协议以唯一 ballot 定序写入:
 `(round, writer_id)` 按字典序比较,同一 key 的两个并发写不会撞同一个 version。写入分
 prepare/accept 两阶段;读 quorum 时必须把读到的最高 ballot/version 回写到落后 owner,完成
 read-repair。
@@ -353,11 +360,16 @@ scaler 负责:
 - `SandboxGroupImporter.Range` 全量/增量导入 group。
 - `SandboxGroupProvider.GetPlacementHint` 提供 group placement hint。
 - `SandboxGroupProvider.GetKey` / `GetAuthKey` 生成 key allocation / auth material intent。
+- 按 source/task 做 import owner 选择:ready scaler 经 `LocateN(task_id,ready_scalers,import_owner_count)`
+  得到候选,候选通过 `POST /scale-link/import-task-lease` 抢 registry task lease;只有 lease 胜者执行
+  `Range`。task lease 是 `scale_link` 命名空间记录,record key 为 `task\0<task_id>`,按
+  `NamespaceScaleLink + record_key` 定位 registry owner set,并在分片内用无主 CAS 全复制维护。
 - 按 active / next membership 得到 node_list owner 候选,一次只订阅一个 owner;断线后 reset 并切换下一个。
 - 周期性向 active / next registry owner 成员 `POST /scale-link/register` 发布 memberlist seed。
 - 在 scaler memberlist meta 中发布 `ready`、`ready_label` 和 `api_advertise`;Place 使用 registry observer
   看到的 ready scaler 视图。
-- 向每个 active / next registry owner 成员推送 selector/key allocation patch。
+- 向每个 active / next registry owner 成员推送 selector/key allocation patch;patch 携带 task lease
+  fencing 信息,registry 只接受当前 lease owner。
 - 对 registry 暴露 `POST /scale-link/place`。
 
 registry 对 group 做 scaler 选择:
@@ -398,10 +410,12 @@ group 有两个密钥域:
 `manifest_key` 和 `registry_auth` 都是 typed secret,支持 inline 或 ref 带外交付。`manifest_key` 使用 ref
 时必须同时给出 fingerprint,供 create/build precheck 使用。密钥分发遵循 scaler 的 allocation 结果:
 scaler 决定哪些 node 应有 key,registry/node owner 将 desired key list 写入对应 node_link 记录并在 owner
-set 内 CAS 复制。registry 保存的 scaler allocation intent 有 `scale_link.allocation_ttl`;scaler 停止续推
-后 intent 自动过期,node_link key cache 随下一轮 reconcile 清理。node_link key cache 同时记录已成功下发
-的 lease 到期时间;实际 `key_put` 由 node-link 心跳维系,TTL 未到期的条目不重复下发。`key_drop` 不作为
-正确性依赖,节点侧租约按 TTL 淘汰未续租 key。密钥分发是 create/build 前置条件,不影响已运行 sandbox。
+set 内 CAS 复制。registry 保存的 scaler allocation intent 是 `scale_link` 命名空间记录,record key 为
+`allocation\0<group>`,并带有 `scale_link.allocation_ttl`;scaler 按 `placement.allocation_refresh_interval`
+续推 unchanged allocation,停止续推后 intent 自动过期,node_link key cache 随下一轮 reconcile 清理。
+node_link key cache 同时记录已成功下发的 lease 到期时间;实际
+`key_put` 由 node-link 心跳维系,TTL 未到期的条目不重复下发。`key_drop` 不作为正确性依赖,节点侧租约
+按 TTL 淘汰未续租 key。密钥分发是 create/build 前置条件,不影响已运行 sandbox。
 
 ## 13. Build
 

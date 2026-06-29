@@ -203,6 +203,7 @@ $ACTIVE_MEMBERS_YAML$NEXT_MEMBERS_BLOCK
   owners:
     route_link: $OWNER_COUNT
     node_link: $OWNER_COUNT
+    scale_link: $OWNER_COUNT
     node_list: $OWNER_COUNT
 node_link:
   heartbeat_interval: "500ms"
@@ -368,6 +369,7 @@ $ACTIVE_MEMBERS_YAML
 $NEXT_MEMBERS_YAML  owners:
     route_link: $OWNER_COUNT
     node_link: $OWNER_COUNT
+    scale_link: $OWNER_COUNT
     node_list: $OWNER_COUNT
 node_link:
   heartbeat_interval: "500ms"

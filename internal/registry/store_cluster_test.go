@@ -47,6 +47,81 @@ func TestClusterStoresRouteAndNodeUseLocatedOwners(t *testing.T) {
 	})
 }
 
+func TestClusterStoresScaleLinkLeaseUsesLocatedOwners(t *testing.T) {
+	ctx := context.Background()
+	view := clusterstate.MemberView{Version: 1, Members: []string{"a", "b", "c"}}
+	sb, sc := clusterstate.NewMemoryScaleLinkReplica(), clusterstate.NewMemoryScaleLinkReplica()
+	kv := clusterstore.OpenMemory(100)
+	defer kv.Close()
+
+	stores := NewClusterStores(kv, "a", view, 2, 2, nil, nil)
+	stores.SetScaleLinkTopology([]clusterstate.MemberView{view}, 2, map[string]clusterstate.ScaleLinkReplica{
+		"b": sb, "c": sc,
+	})
+
+	taskID := "source-a"
+	rec, acquired, err := stores.AcquireScaleLinkLease(ctx, taskID, "s1", "run-1", "registry.1.test", time.Second)
+	if err != nil {
+		t.Fatalf("AcquireScaleLinkLease: %v", err)
+	}
+	if !acquired || rec.OwnerID != "s1" || rec.RunID != "run-1" || rec.Term == 0 {
+		t.Fatalf("unexpected lease acquired=%v rec=%+v", acquired, rec)
+	}
+
+	recordKey := scaleLinkTaskKey(taskID)
+	key := clusterstate.ScaleLinkShardKey(recordKey)
+	owners, err := view.Owners(key, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertScaleLinkOwnerKeys(t, ctx, owners, recordKey, "s1", map[string]clusterstate.ScaleLinkReplica{
+		"a": stores.LocalScaleLinkReplica(), "b": sb, "c": sc,
+	})
+
+	held, acquired, err := stores.AcquireScaleLinkLease(ctx, taskID, "s2", "run-2", "registry.1.test", time.Second)
+	if err != nil {
+		t.Fatalf("second AcquireScaleLinkLease: %v", err)
+	}
+	if acquired || held.OwnerID != "s1" || held.RunID != "run-1" {
+		t.Fatalf("live lease was not fenced: acquired=%v held=%+v", acquired, held)
+	}
+}
+
+func TestClusterStoresScaleLinkAllocationUsesLocatedOwners(t *testing.T) {
+	ctx := context.Background()
+	view := clusterstate.MemberView{Version: 1, Members: []string{"a", "b", "c"}}
+	sb, sc := clusterstate.NewMemoryScaleLinkReplica(), clusterstate.NewMemoryScaleLinkReplica()
+	kv := clusterstore.OpenMemory(100)
+	defer kv.Close()
+
+	stores := NewClusterStores(kv, "a", view, 2, 2, nil, nil)
+	stores.SetScaleLinkTopology([]clusterstate.MemberView{view}, 2, map[string]clusterstate.ScaleLinkReplica{
+		"b": sb, "c": sc,
+	})
+
+	group := "/scale-link/allocation"
+	rec, err := stores.PutScaleLinkAllocation(ctx, &routesync.SelectorPatch{
+		Group: group, NodeIDs: []string{"n1", "n2"}, NodeAllocation: true,
+		KeyFingerprint: "fp", ManifestKeyType: clusterstate.SecretInline, ManifestKey: "mk",
+	}, time.Second)
+	if err != nil {
+		t.Fatalf("PutScaleLinkAllocation: %v", err)
+	}
+	if rec.Kind != clusterstate.ScaleLinkKindAllocation || rec.Group != group || rec.KeyFingerprint != "fp" {
+		t.Fatalf("unexpected allocation record: %+v", rec)
+	}
+
+	recordKey := scaleLinkAllocationKey(group)
+	key := clusterstate.ScaleLinkShardKey(recordKey)
+	owners, err := view.Owners(key, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertScaleLinkAllocationOwnerKeys(t, ctx, owners, recordKey, group, map[string]clusterstate.ScaleLinkReplica{
+		"a": stores.LocalScaleLinkReplica(), "b": sb, "c": sc,
+	})
+}
+
 func TestClusterStoresJointMembershipWritesBothOwnerSets(t *testing.T) {
 	ctx := context.Background()
 	active := clusterstate.MemberView{Version: 1, Members: []string{"a", "b", "c"}}
@@ -149,6 +224,46 @@ func assertNodeOwnersHaveKey(t *testing.T, ctx context.Context, owners []string,
 		}
 		if _, found, err := rep.Read(ctx, key); err != nil || !found {
 			t.Fatalf("node owner %s missing key %q; owners=%v", owner, key, owners)
+		}
+	}
+}
+
+func assertScaleLinkOwnerKeys(t *testing.T, ctx context.Context, owners []string, key, ownerID string, reps map[string]clusterstate.ScaleLinkReplica) {
+	t.Helper()
+	ownerSet := map[string]bool{}
+	for _, owner := range owners {
+		ownerSet[owner] = true
+	}
+	for id, rep := range reps {
+		rec, has, err := rep.Read(ctx, key)
+		if err != nil {
+			t.Fatalf("scale_link owner %s read key %q: %v", id, key, err)
+		}
+		if ownerSet[id] && (!has || rec.OwnerID != ownerID) {
+			t.Fatalf("scale_link owner %s missing key %q owner %q; owners=%v rec=%+v", id, key, ownerID, owners, rec)
+		}
+		if !ownerSet[id] && has {
+			t.Fatalf("scale_link non-owner %s unexpectedly has key %q; owners=%v rec=%+v", id, key, owners, rec)
+		}
+	}
+}
+
+func assertScaleLinkAllocationOwnerKeys(t *testing.T, ctx context.Context, owners []string, key, group string, reps map[string]clusterstate.ScaleLinkReplica) {
+	t.Helper()
+	ownerSet := map[string]bool{}
+	for _, owner := range owners {
+		ownerSet[owner] = true
+	}
+	for id, rep := range reps {
+		rec, has, err := rep.Read(ctx, key)
+		if err != nil {
+			t.Fatalf("scale_link owner %s read key %q: %v", id, key, err)
+		}
+		if ownerSet[id] && (!has || rec.Kind != clusterstate.ScaleLinkKindAllocation || rec.Group != group) {
+			t.Fatalf("scale_link owner %s missing allocation key %q group %q; owners=%v rec=%+v", id, key, group, owners, rec)
+		}
+		if !ownerSet[id] && has {
+			t.Fatalf("scale_link non-owner %s unexpectedly has allocation key %q; owners=%v rec=%+v", id, key, owners, rec)
 		}
 	}
 }

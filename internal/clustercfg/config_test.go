@@ -27,7 +27,7 @@ func TestLoadRegistryPartialAppliesDefaults(t *testing.T) {
 	if c.Member.Listen != ":8800" || c.NodeListen() != ":8800" {
 		t.Fatalf("member/node listen defaults not filled: member=%+v node=%+v", c.Member, c.NodeLink)
 	}
-	if c.Membership.Active != 1 || len(c.Membership.Versions) != 1 || c.Membership.Owners.RouteLink != 1 {
+	if c.Membership.Active != 1 || len(c.Membership.Versions) != 1 || c.Membership.Owners.RouteLink != 1 || c.Membership.Owners.ScaleLink != 1 {
 		t.Fatalf("membership defaults not filled: %+v", c.Membership)
 	}
 	if c.NodeLink.RevisionRetention != 10000 || c.NodeLink.HeartbeatInterval != "10s" {
@@ -46,7 +46,8 @@ func TestLoadScalerPartialAppliesDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	if c.Placement.Candidates != 3 || c.Placement.ZoneAdmitMax != "yellow" || c.Placement.NodeDeadAfter != "30s" {
+	if c.Placement.Candidates != 3 || c.Placement.ZoneAdmitMax != "yellow" || c.Placement.NodeDeadAfter != "30s" ||
+		c.Placement.ImportOwnerCount != 3 || c.Placement.ImportTaskLeaseTTL != "15s" || c.Placement.AllocationRefreshInterval != "1m" {
 		t.Fatalf("placement merge wrong: %+v", c.Placement)
 	}
 	if c.Registry.Bootstrap == "" {
@@ -122,6 +123,7 @@ membership:
   owners:
     route_link: 2
     node_link: 2
+    scale_link: 2
     node_list: 2
 `
 	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {

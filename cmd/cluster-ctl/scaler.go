@@ -53,6 +53,9 @@ func runScaler(args []string, log *slog.Logger) error {
 	if len(eps) == 0 {
 		return fmt.Errorf("scaler: registry membership has no members")
 	}
+	if len(cfg.ImportGroups) == 0 {
+		return fmt.Errorf("scaler: standalone mode requires at least one import_groups source")
+	}
 	nodeListEps, err := regClient.NodeListEndpoints(ctx)
 	if err != nil {
 		return err
@@ -64,6 +67,16 @@ func runScaler(args []string, log *slog.Logger) error {
 	}
 	svc := scaler.NewRemoteLinksWithGroups(links, groupSource, groupSource, cfg.Placement, deadAfter, log)
 	svc.SetNodeListLinks(ctx, registryLinks(nodeListEps))
+	svc.SetScaleLinkResolver(func(ctx context.Context, recordKey string) ([]scaler.RegistryLink, error) {
+		if err := regClient.Refresh(ctx); err != nil {
+			return nil, err
+		}
+		eps, err := regClient.ScaleLinkEndpoints(ctx, recordKey)
+		if err != nil {
+			return nil, err
+		}
+		return registryLinks(eps), nil
+	})
 	memberHub := membergroup.NewHub()
 	memberlistTLS, err := membergroupTLSConfig(cfg.Member.TLS)
 	if err != nil {
@@ -81,6 +94,26 @@ func runScaler(args []string, log *slog.Logger) error {
 		return err
 	}
 	defer scalerGroup.Shutdown()
+	svc.SetImportTaskOwnerSource(cfg.Member.ID, func() []string {
+		if err := regClient.Refresh(ctx); err != nil {
+			return []string{cfg.Member.ID}
+		}
+		label, err := regClient.ActiveLabel(ctx)
+		if err != nil {
+			return []string{cfg.Member.ID}
+		}
+		metas := scalerGroup.ReadyScalers(label)
+		ids := make([]string, 0, len(metas))
+		for _, meta := range metas {
+			if meta.ID != "" {
+				ids = append(ids, meta.ID)
+			}
+		}
+		if len(ids) == 0 {
+			ids = append(ids, cfg.Member.ID)
+		}
+		return ids
+	})
 	mux := http.NewServeMux()
 	memberHub.Mount(mux)
 	svc.ServeScaleLink(mux)

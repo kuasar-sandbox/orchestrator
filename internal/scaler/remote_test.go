@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -228,6 +229,65 @@ func TestRegisterLoopReportsMemberlistSeed(t *testing.T) {
 	}
 }
 
+func TestImportTaskLeaseAllowsOnlyOneScalerToRange(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	discard := slog.New(slog.NewTextHandler(io.Discard, nil))
+	reg, srv := testScaleRegistry(t, ctx, "n1")
+	defer srv.Close()
+	defer cancel()
+	go reg.RunKeyDistributor(ctx, time.Hour)
+
+	src1 := newCountingGroupSource("/g")
+	src2 := newCountingGroupSource("/g")
+	cfg := clustercfg.PlacementConfig{
+		Candidates: 1, ImportOwnerCount: 2, ImportTaskLeaseTTL: "500ms", AllocationRefreshInterval: "50ms",
+	}
+	link := RegistryLink{Name: "registry", BaseURL: srv.URL, Client: srv.Client()}
+	svc1 := NewRemoteLinksWithGroups([]RegistryLink{link}, src1, src1, cfg, 30, discard)
+	svc2 := NewRemoteLinksWithGroups([]RegistryLink{link}, src2, src2, cfg, 30, discard)
+	peers := func() []string { return []string{"s1", "s2"} }
+	svc1.SetImportTaskOwnerSource("s1", peers)
+	svc2.SetImportTaskOwnerSource("s2", peers)
+	seedNodeListView(t, svc1, "n1")
+	seedNodeListView(t, svc2, "n1")
+	svc1.Start(ctx)
+	svc2.Start(ctx)
+
+	time.Sleep(180 * time.Millisecond)
+	c1, c2 := src1.rangeCalls.Load(), src2.rangeCalls.Load()
+	if (c1 > 0 && c2 > 0) || (c1 == 0 && c2 == 0) {
+		t.Fatalf("Range calls svc1=%d svc2=%d, want exactly one task owner", c1, c2)
+	}
+}
+
+func TestScalerRefreshesUnchangedAllocationBeforeRegistryTTL(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	discard := slog.New(slog.NewTextHandler(io.Discard, nil))
+	reg, srv := testScaleRegistry(t, ctx, "n1")
+	defer srv.Close()
+	defer cancel()
+	reg.SetKeyAllocationTTL(90 * time.Millisecond)
+	go reg.RunKeyDistributor(ctx, time.Hour)
+
+	src := newCountingGroupSource("/g")
+	cfg := clustercfg.PlacementConfig{
+		Candidates: 1, ImportOwnerCount: 1, ImportTaskLeaseTTL: "500ms", AllocationRefreshInterval: "25ms",
+	}
+	svc := NewRemoteLinksWithGroups(
+		[]RegistryLink{{Name: "registry", BaseURL: srv.URL, Client: srv.Client()}},
+		src, src, cfg, 30, discard,
+	)
+	seedNodeListView(t, svc, "n1")
+	svc.Start(ctx)
+
+	waitForNodeKey(t, ctx, reg, "n1", true)
+	time.Sleep(180 * time.Millisecond)
+	waitForNodeKey(t, ctx, reg, "n1", true)
+	if calls := src.rangeCalls.Load(); calls < 2 {
+		t.Fatalf("Range calls=%d, want repeated refresh cycles", calls)
+	}
+}
+
 func writeViewFrameForTest(t *testing.T, w io.Writer, ev *registry.ViewEvent) {
 	t.Helper()
 	b, err := json.Marshal(ev)
@@ -256,6 +316,53 @@ func seedNodeListView(t *testing.T, svc *Service, nodeID string) {
 	}
 	sink.put(nodeID, raw)
 	sink.bookmark()
+}
+
+func waitForNodeKey(t *testing.T, ctx context.Context, reg *registry.Registry, nodeID string, want bool) {
+	t.Helper()
+	for i := 0; i < 200; i++ {
+		node, found, err := reg.Stores().GetNode(ctx, nodeID)
+		if err == nil && found && (len(node.ManifestKeys) > 0) == want {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	node, found, err := reg.Stores().GetNode(ctx, nodeID)
+	t.Fatalf("node key presence=%v found=%v err=%v keys=%+v, want %v", len(node.ManifestKeys) > 0, found, err, node.ManifestKeys, want)
+}
+
+type countingGroupSource struct {
+	group      string
+	rangeCalls atomic.Int32
+}
+
+func newCountingGroupSource(group string) *countingGroupSource {
+	return &countingGroupSource{group: group}
+}
+
+func (s *countingGroupSource) ImportTasks() []ImportTask {
+	return []ImportTask{{ID: "counting-source", Importer: s}}
+}
+
+func (s *countingGroupSource) Get(context.Context, string) (clusterstate.SandboxGroup, bool, error) {
+	return clusterstate.SandboxGroup{Group: s.group}, true, nil
+}
+
+func (s *countingGroupSource) GetPlacementHint(context.Context, string) (clusterstate.PlacementHint, bool, error) {
+	return clusterstate.PlacementHint{NodeSelectors: []map[string]string{{"pool": "p"}}}, true, nil
+}
+
+func (s *countingGroupSource) GetKey(context.Context, string) (clusterstate.Secret, bool, error) {
+	return clusterstate.Secret{Type: clusterstate.SecretInline, Value: testManifestKey}, true, nil
+}
+
+func (s *countingGroupSource) GetAuthKey(context.Context, string) (clusterstate.Secret, bool, error) {
+	return clusterstate.Secret{Type: clusterstate.SecretInline, Value: testAuthKey}, true, nil
+}
+
+func (s *countingGroupSource) Range(context.Context, string, int) (clusterstate.GroupPage, error) {
+	s.rangeCalls.Add(1)
+	return clusterstate.GroupPage{Groups: []string{s.group}}, nil
 }
 
 func testScaleRegistry(t *testing.T, ctx context.Context, nodeID string) (*registry.Registry, *httptest.Server) {

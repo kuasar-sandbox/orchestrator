@@ -3,10 +3,12 @@ package registry
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	clusterstate "github.com/kuasar-sandbox/sandbox-orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/clusterstore"
@@ -20,6 +22,7 @@ const (
 	ScaleLinkNodeListWatchPath = "/scale-link/watch-node-list" // scaler node_list WATCH_LIST
 	ScaleLinkRegisterPath      = "/scale-link/register"
 	ScaleLinkSelectorPatchPath = "/scale-link/selector-patch"
+	ScaleLinkImportTaskPath    = "/scale-link/import-task-lease"
 	ScaleLinkPlacePath         = "/scale-link/place"
 	ScaleLinkVerifyKeyPath     = "/scale-link/verify-key"
 )
@@ -39,6 +42,19 @@ type ScalerRegister struct {
 	Advertise           string `json:"advertise"`
 	MemberlistLabel     string `json:"memberlist_label"`
 	MemberlistAdvertise string `json:"memberlist_advertise"`
+}
+
+type ImportTaskLeaseRequest struct {
+	TaskID     string `json:"task_id"`
+	OwnerID    string `json:"owner_id"`
+	RunID      string `json:"run_id"`
+	ReadyLabel string `json:"ready_label,omitempty"`
+	TTLMillis  int64  `json:"ttl_ms"`
+}
+
+type ImportTaskLeaseResponse struct {
+	Acquired bool            `json:"acquired"`
+	Lease    ImportTaskLease `json:"lease"`
 }
 
 func (r *Registry) serveNodeListWatch(w http.ResponseWriter, req *http.Request) {
@@ -99,6 +115,7 @@ func (r *Registry) ServeScaleLink(mux *http.ServeMux) {
 	mux.HandleFunc(ScaleLinkNodeListWatchPath, r.serveNodeListWatch)
 	mux.HandleFunc(ScaleLinkRegisterPath, r.serveScalerRegister)
 	mux.HandleFunc(ScaleLinkSelectorPatchPath, r.serveSelectorPatch)
+	mux.HandleFunc(ScaleLinkImportTaskPath, r.serveImportTaskLease)
 }
 
 func (r *Registry) serveScalerRegister(w http.ResponseWriter, req *http.Request) {
@@ -148,8 +165,57 @@ func (r *Registry) serveSelectorPatch(w http.ResponseWriter, req *http.Request) 
 		http.Error(w, "group is required", http.StatusBadRequest)
 		return
 	}
-	r.applySelectorPatch(&patch)
+	if err := r.applySelectorPatch(req.Context(), &patch); err != nil {
+		if errors.Is(err, errStaleImportTaskLease) {
+			http.Error(w, "stale import task lease", http.StatusConflict)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		return
+	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (r *Registry) serveImportTaskLease(w http.ResponseWriter, req *http.Request) {
+	if req.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var in ImportTaskLeaseRequest
+	if err := json.NewDecoder(io.LimitReader(req.Body, 1<<20)).Decode(&in); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if in.TaskID == "" || in.OwnerID == "" || in.RunID == "" {
+		http.Error(w, "task_id, owner_id and run_id are required", http.StatusBadRequest)
+		return
+	}
+	resp, err := r.acquireImportTaskLease(req.Context(), in)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
+func (r *Registry) acquireImportTaskLease(ctx context.Context, in ImportTaskLeaseRequest) (ImportTaskLeaseResponse, error) {
+	ttl := time.Duration(in.TTLMillis) * time.Millisecond
+	if ttl <= 0 {
+		ttl = 15 * time.Second
+	}
+	rec, acquired, err := r.stores.AcquireScaleLinkLease(ctx, in.TaskID, in.OwnerID, in.RunID, in.ReadyLabel, ttl)
+	if err != nil {
+		return ImportTaskLeaseResponse{}, err
+	}
+	return ImportTaskLeaseResponse{Acquired: acquired, Lease: importTaskLeaseFromScaleLink(rec)}, nil
+}
+
+func importTaskLeaseFromScaleLink(rec clusterstate.ScaleLinkRecord) ImportTaskLease {
+	return ImportTaskLease{
+		TaskID: rec.TaskID, OwnerID: rec.OwnerID, RunID: rec.RunID, Term: rec.Term,
+		ReadyLabel: rec.ReadyLabel, ExpiresUnixMs: rec.ExpiresUnixMs,
+	}
 }
 
 func (r *Registry) streamNodeListView(ctx context.Context, w io.Writer, flusher http.Flusher, ch <-chan clusterstore.Event, label string) {

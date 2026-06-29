@@ -92,6 +92,7 @@ membership:
   owners:
     route_link: 1
     node_link: 1
+    scale_link: 1
     node_list: 1
 node_link:
   # listen: ""                       # optional split listener for node streams; empty = member.listen
@@ -143,7 +144,7 @@ memberlist:
 registry:
   bootstrap: registry-1.example:7700
   # tls: { cert: ..., key: ..., ca: ... }   # client mTLS to registry control plane
-import_groups:                         # optional helper source; production injects Provider/Importer
+import_groups:                         # standalone scaler requires at least one source
   - source_id: example-file-source
     source_type: file
     path: /var/lib/kuasar/groups
@@ -151,6 +152,9 @@ placement:
   candidates: 2                      # P2C sample size
   zone_admit_max: yellow             # exclude nodes hotter than this (green|yellow|red)
   node_dead_after: 30s               # exclude nodes silent longer than this
+  import_owner_count: 3              # candidates that may race for each source/task lease
+  import_task_lease_ttl: 15s         # registry-side import task lease TTL
+  allocation_refresh_interval: 1m    # refresh unchanged key allocation before registry TTL
   # shuffle_sharding:                # empty = static nodeSelectors only (cluster-scaler.md §4.4)
   #   - selector: { pool: gpu }
   #     shard_by: zone

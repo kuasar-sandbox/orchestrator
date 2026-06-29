@@ -245,6 +245,44 @@ func TestKeyAllocationTTLExpiresNodeLinkCache(t *testing.T) {
 	}
 }
 
+func TestSelectorPatchRequiresCurrentImportTaskLease(t *testing.T) {
+	reg := testReg(t)
+	ctx := context.Background()
+	resp, err := reg.acquireImportTaskLease(ctx, ImportTaskLeaseRequest{
+		TaskID: "source-a", OwnerID: "s1", RunID: "run-1", TTLMillis: 1000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease := resp.Lease
+	if lease.Term == 0 {
+		t.Fatalf("lease term was not assigned: %+v", lease)
+	}
+	stale := &routesync.SelectorPatch{
+		Group: "/g", NodeIDs: []string{"n1"}, NodeAllocation: true,
+		KeyFingerprint: "stale", ManifestKeyType: clusterstate.SecretInline, ManifestKey: "mk-stale",
+		ImportTaskID: "source-a", ImportOwnerID: "s2", ImportRunID: "run-2", ImportTerm: lease.Term,
+	}
+	if err := reg.applySelectorPatch(ctx, stale); !errors.Is(err, errStaleImportTaskLease) {
+		t.Fatalf("stale task owner patch err=%v, want errStaleImportTaskLease", err)
+	}
+	if got := reg.keyAllocations(); len(got) != 0 {
+		t.Fatalf("stale patch changed allocations: %+v", got)
+	}
+	good := &routesync.SelectorPatch{
+		Group: "/g", NodeIDs: []string{"n1"}, NodeAllocation: true,
+		KeyFingerprint: "fresh", ManifestKeyType: clusterstate.SecretInline, ManifestKey: "mk-fresh",
+		ImportTaskID: "source-a", ImportOwnerID: lease.OwnerID, ImportRunID: lease.RunID, ImportTerm: lease.Term,
+	}
+	if err := reg.applySelectorPatch(ctx, good); err != nil {
+		t.Fatalf("current task owner patch was rejected: %v", err)
+	}
+	got := reg.keyAllocations()
+	if got["/g"].fp != "fresh" || got["/g"].keyValue != "mk-fresh" {
+		t.Fatalf("current patch not applied: %+v", got)
+	}
+}
+
 func testReg(t *testing.T) *Registry {
 	t.Helper()
 	kv := clusterstore.OpenMemory(0)
@@ -260,7 +298,9 @@ func pushKeyAllocation(reg *Registry, group string, nodes []string, manifestKey 
 		patch.ManifestKeyType = clusterstate.SecretInline
 		patch.ManifestKey = manifestKey
 	}
-	reg.applySelectorPatch(patch)
+	if err := reg.applySelectorPatch(context.Background(), patch); err != nil {
+		panic(err)
+	}
 }
 
 // fakeConn implements nodeConn; its onCmd hook lets a test simulate the node

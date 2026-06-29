@@ -70,9 +70,10 @@ membership:
   owners:
     route_link: 2
     node_link: 2
+    scale_link: 2
     node_list: 2
 `)
-	views, _, _, _, nodeOwners, err := buildRegistryTopology(cfg, nil)
+	views, _, _, _, _, nodeOwners, err := buildRegistryTopology(cfg, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -159,7 +160,7 @@ func registryReloadTestConfig(active, next int, self string, versions map[int][]
 		}
 	}
 	b.WriteString("  owners:\n")
-	for _, ns := range []string{"route_link", "node_link", "node_list"} {
+	for _, ns := range []string{"route_link", "node_link", "scale_link", "node_list"} {
 		b.WriteString("    ")
 		b.WriteString(ns)
 		b.WriteString(": 2\n")

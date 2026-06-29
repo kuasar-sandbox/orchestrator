@@ -43,6 +43,7 @@ membership:
   owners:
     route_link: 1
     node_link: 1
+    scale_link: 1
     node_list: 1
 `
 	if err := os.WriteFile(path, []byte(cfg), 0o600); err != nil {

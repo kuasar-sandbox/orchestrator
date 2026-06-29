@@ -1,6 +1,7 @@
 // Package registry is the cluster control plane's route/node owner and node_link
-// hub. route_link and node_link state go through the registry-owned quorum
-// kernel; sandbox-group provider state lives on scaler/provider side.
+// hub. route_link, node_link, node_list, and scale_link records go through the
+// registry-owned quorum kernel; sandbox-group provider state lives on
+// scaler/provider side.
 package registry
 
 import (
@@ -84,16 +85,19 @@ type Stores struct {
 	routes *clusterstate.RouteQuorum
 	nodes  *clusterstate.NodeQuorum
 
-	writerID        string
-	memberViews     []clusterstate.MemberView
-	routeOwnerCount int
-	nodeOwnerCount  int
-	localRoute      *clusterstate.MemoryRouteReplica
-	localNode       *clusterstate.MemoryNodeReplica
-	localNodeList   *clusterstate.MemoryNodeListReplica
-	routeReplicas   map[string]clusterstate.RouteReplica
-	nodeReplicas    map[string]clusterstate.NodeReplica
-	replicaMu       sync.RWMutex
+	writerID            string
+	memberViews         []clusterstate.MemberView
+	routeOwnerCount     int
+	nodeOwnerCount      int
+	scaleLinkOwnerCount int
+	localRoute          *clusterstate.MemoryRouteReplica
+	localNode           *clusterstate.MemoryNodeReplica
+	localScaleLink      *clusterstate.MemoryScaleLinkReplica
+	localNodeList       *clusterstate.MemoryNodeListReplica
+	routeReplicas       map[string]clusterstate.RouteReplica
+	nodeReplicas        map[string]clusterstate.NodeReplica
+	scaleLinkReplicas   map[string]clusterstate.ScaleLinkReplica
+	replicaMu           sync.RWMutex
 
 	routeMu        sync.Mutex
 	routeRev       int64
@@ -150,6 +154,7 @@ func NewClusterStores(
 	}
 	localRoute := clusterstate.NewMemoryRouteReplica()
 	localNode := clusterstate.NewMemoryNodeReplica()
+	localScaleLink := clusterstate.NewMemoryScaleLinkReplica()
 	localNodeList := clusterstate.NewMemoryNodeListReplica()
 	rreps := make(map[string]clusterstate.RouteReplica, len(routeReplicas)+1)
 	nreps := make(map[string]clusterstate.NodeReplica, len(nodeReplicas)+1)
@@ -165,6 +170,7 @@ func NewClusterStores(
 	}
 	rreps[writerID] = localRoute
 	nreps[writerID] = localNode
+	streps := map[string]clusterstate.ScaleLinkReplica{writerID: localScaleLink}
 	stores := &Stores{
 		kv:                          kv,
 		routes:                      clusterstate.NewRouteQuorum(writerID, localRoute),
@@ -173,11 +179,14 @@ func NewClusterStores(
 		memberViews:                 []clusterstate.MemberView{view},
 		routeOwnerCount:             routeOwnerCount,
 		nodeOwnerCount:              nodeOwnerCount,
+		scaleLinkOwnerCount:         routeOwnerCount,
 		localRoute:                  localRoute,
 		localNode:                   localNode,
+		localScaleLink:              localScaleLink,
 		localNodeList:               localNodeList,
 		routeReplicas:               rreps,
 		nodeReplicas:                nreps,
+		scaleLinkReplicas:           streps,
 		routeLog:                    map[string][]clusterstore.Event{},
 		routeSubs:                   map[string]map[int]chan clusterstore.Event{},
 		routeRetention:              10000,
@@ -215,6 +224,8 @@ func NewClusterStoresWithViews(
 func (s *Stores) LocalRouteReplica() clusterstate.RouteReplica { return s.localRoute }
 
 func (s *Stores) LocalNodeReplica() clusterstate.NodeReplica { return s.localNode }
+
+func (s *Stores) LocalScaleLinkReplica() clusterstate.ScaleLinkReplica { return s.localScaleLink }
 
 func (s *Stores) LocalNodeListReplica() clusterstate.NodeListReplica { return s.localNodeList }
 
@@ -366,6 +377,36 @@ func (s *Stores) SetNodeListTopology(views []clusterstate.MemberView, ownerCount
 	s.clearNodeListReadiness()
 }
 
+func (s *Stores) SetScaleLinkTopology(views []clusterstate.MemberView, ownerCount int, replicas map[string]clusterstate.ScaleLinkReplica) {
+	cleanViews := make([]clusterstate.MemberView, 0, len(views))
+	seenVersion := map[int64]bool{}
+	for _, view := range views {
+		if len(view.Members) == 0 || seenVersion[view.Version] {
+			continue
+		}
+		seenVersion[view.Version] = true
+		cleanViews = append(cleanViews, view)
+	}
+	if len(cleanViews) == 0 {
+		return
+	}
+	if ownerCount <= 0 {
+		ownerCount = s.routeOwnerCount
+	}
+	reps := make(map[string]clusterstate.ScaleLinkReplica, len(replicas)+1)
+	for id, rep := range replicas {
+		if id != "" && id != s.writerID && rep != nil {
+			reps[id] = rep
+		}
+	}
+	reps[s.writerID] = s.localScaleLink
+	s.replicaMu.Lock()
+	s.memberViews = cleanViews
+	s.scaleLinkOwnerCount = ownerCount
+	s.scaleLinkReplicas = reps
+	s.replicaMu.Unlock()
+}
+
 func (s *Stores) routeQuorum(group string) (*clusterstate.RouteQuorum, error) {
 	s.replicaMu.RLock()
 	defer s.replicaMu.RUnlock()
@@ -382,6 +423,25 @@ func (s *Stores) routeQuorum(group string) (*clusterstate.RouteQuorum, error) {
 		reps = append(reps, clusterstate.RouteReplicaSlot{ID: id, Replica: rep})
 	}
 	return clusterstate.NewRouteJointQuorum(s.writerID, reps, ownerSets), nil
+}
+
+func (s *Stores) scaleLinkQuorum(shardKey string) (*clusterstate.ScaleLinkQuorum, error) {
+	s.replicaMu.RLock()
+	defer s.replicaMu.RUnlock()
+	key := clusterstate.ScaleLinkShardKey(shardKey)
+	ownerSets, jointOwners, err := locatedOwnerSets(s.memberViews, key, s.scaleLinkOwnerCount)
+	if err != nil {
+		return nil, err
+	}
+	reps := make([]clusterstate.ScaleLinkReplicaSlot, 0, len(jointOwners))
+	for _, id := range jointOwners {
+		rep := s.scaleLinkReplicas[id]
+		if rep == nil {
+			rep = unavailableScaleLinkReplica{id: id}
+		}
+		reps = append(reps, clusterstate.ScaleLinkReplicaSlot{ID: id, Replica: rep})
+	}
+	return clusterstate.NewScaleLinkJointQuorum(s.writerID, reps, ownerSets), nil
 }
 
 func (s *Stores) routeOwners(group string) ([][]string, []string, error) {
@@ -532,6 +592,140 @@ func (s *Stores) checkNodeHandoff(nodeID string) error {
 	}
 	return clusterstate.DecisionError(gate.DecideWrite(version, time.Now()))
 }
+
+var errScaleLinkLeaseHeld = errors.New("registry: scale_link task lease held")
+
+func (s *Stores) AcquireScaleLinkLease(ctx context.Context, taskID, ownerID, runID, readyLabel string, ttl time.Duration) (clusterstate.ScaleLinkRecord, bool, error) {
+	if taskID == "" || ownerID == "" || runID == "" {
+		return clusterstate.ScaleLinkRecord{}, false, fmt.Errorf("registry: task_id, owner_id and run_id are required")
+	}
+	if ttl <= 0 {
+		ttl = 15 * time.Second
+	}
+	recordKey := scaleLinkTaskKey(taskID)
+	for attempt := 0; attempt < 5; attempt++ {
+		q, err := s.scaleLinkQuorum(recordKey)
+		if err != nil {
+			return clusterstate.ScaleLinkRecord{}, false, err
+		}
+		cur, found, err := q.Get(ctx, recordKey)
+		if err != nil {
+			return clusterstate.ScaleLinkRecord{}, false, err
+		}
+		now := time.Now()
+		if found && scaleLinkLeaseLiveForOther(cur, ownerID, runID, now) {
+			return cur, false, nil
+		}
+		expect := uint64(0)
+		if found {
+			expect = cur.Meta.Rev
+		}
+		next, err := q.CAS(ctx, recordKey, expect, func(current clusterstate.ScaleLinkRecord, currentFound bool) (clusterstate.ScaleLinkRecord, bool, error) {
+			now := time.Now()
+			if currentFound && scaleLinkLeaseLiveForOther(current, ownerID, runID, now) {
+				return current, true, errScaleLinkLeaseHeld
+			}
+			term := current.Term
+			if !currentFound || current.OwnerID != ownerID || current.RunID != runID {
+				term++
+				if term == 0 {
+					term = 1
+				}
+			}
+			return clusterstate.ScaleLinkRecord{
+				Key: recordKey, Kind: clusterstate.ScaleLinkKindTaskLease,
+				TaskID: taskID, OwnerID: ownerID, RunID: runID, ReadyLabel: readyLabel,
+				Term: term, ExpiresUnixMs: now.Add(ttl).UnixMilli(),
+			}, true, nil
+		})
+		switch {
+		case err == nil:
+			return next, true, nil
+		case errors.Is(err, errScaleLinkLeaseHeld):
+			held, _, gerr := q.Get(ctx, recordKey)
+			return held, false, gerr
+		case errors.Is(err, clusterstate.ErrConflict):
+			continue
+		default:
+			return clusterstate.ScaleLinkRecord{}, false, err
+		}
+	}
+	return clusterstate.ScaleLinkRecord{}, false, clusterstate.ErrConflict
+}
+
+func (s *Stores) CheckScaleLinkLease(ctx context.Context, taskID, ownerID, runID string, term uint64) bool {
+	if taskID == "" {
+		return true
+	}
+	recordKey := scaleLinkTaskKey(taskID)
+	q, err := s.scaleLinkQuorum(recordKey)
+	if err != nil {
+		return false
+	}
+	rec, found, err := q.Get(ctx, recordKey)
+	if err != nil || !found {
+		return false
+	}
+	return rec.OwnerID == ownerID && rec.RunID == runID && rec.Term == term &&
+		(rec.ExpiresUnixMs <= 0 || rec.ExpiresUnixMs > time.Now().UnixMilli())
+}
+
+func scaleLinkLeaseLiveForOther(cur clusterstate.ScaleLinkRecord, ownerID, runID string, now time.Time) bool {
+	if cur.ExpiresUnixMs > 0 && cur.ExpiresUnixMs <= now.UnixMilli() {
+		return false
+	}
+	return cur.OwnerID != "" && (cur.OwnerID != ownerID || cur.RunID != runID)
+}
+
+func (s *Stores) PutScaleLinkAllocation(ctx context.Context, p *routesync.SelectorPatch, ttl time.Duration) (clusterstate.ScaleLinkRecord, error) {
+	if p == nil || p.Group == "" {
+		return clusterstate.ScaleLinkRecord{}, fmt.Errorf("registry: group is required for scale_link allocation")
+	}
+	if ttl <= 0 {
+		ttl = 10 * time.Minute
+	}
+	recordKey := scaleLinkAllocationKey(p.Group)
+	for attempt := 0; attempt < 5; attempt++ {
+		q, err := s.scaleLinkQuorum(recordKey)
+		if err != nil {
+			return clusterstate.ScaleLinkRecord{}, err
+		}
+		cur, found, err := q.Get(ctx, recordKey)
+		if err != nil {
+			return clusterstate.ScaleLinkRecord{}, err
+		}
+		expect := uint64(0)
+		if found {
+			expect = cur.Meta.Rev
+		}
+		next, err := q.CAS(ctx, recordKey, expect, func(clusterstate.ScaleLinkRecord, bool) (clusterstate.ScaleLinkRecord, bool, error) {
+			expires := time.Now().Add(ttl).UnixMilli()
+			if len(p.NodeIDs) == 0 || p.KeyFingerprint == "" || (p.ManifestKey == "" && p.ManifestKeyRef == "") {
+				expires = time.Now().UnixMilli()
+			}
+			return clusterstate.ScaleLinkRecord{
+				Key: recordKey, Kind: clusterstate.ScaleLinkKindAllocation,
+				Group: p.Group, NodeIDs: append([]string(nil), p.NodeIDs...),
+				KeyFingerprint: p.KeyFingerprint, ManifestKeyType: p.ManifestKeyType,
+				ManifestKey: p.ManifestKey, ManifestKeyRef: p.ManifestKeyRef,
+				ExpiresUnixMs: expires,
+			}, true, nil
+		})
+		switch {
+		case err == nil:
+			return next, nil
+		case errors.Is(err, clusterstate.ErrConflict):
+			continue
+		default:
+			return clusterstate.ScaleLinkRecord{}, err
+		}
+	}
+	return clusterstate.ScaleLinkRecord{}, clusterstate.ErrConflict
+}
+
+func scaleLinkTaskKey(taskID string) string { return clusterstate.ScaleLinkTaskKey(taskID) }
+
+func scaleLinkAllocationKey(group string) string { return clusterstate.ScaleLinkAllocationKey(group) }
 
 // --- node_link ---
 
@@ -1650,6 +1844,32 @@ func (r unavailableNodeReplica) Repair(context.Context, string, clusterstate.Nod
 }
 
 func (r unavailableNodeReplica) MaxBallot(context.Context, string) (clusterstate.Ballot, error) {
+	return clusterstate.Ballot{}, r.err()
+}
+
+type unavailableScaleLinkReplica struct{ id string }
+
+func (r unavailableScaleLinkReplica) err() error {
+	return fmt.Errorf("registry: scale_link replica %q unavailable", r.id)
+}
+
+func (r unavailableScaleLinkReplica) Read(context.Context, string) (clusterstate.ScaleLinkRecord, bool, error) {
+	return clusterstate.ScaleLinkRecord{}, false, r.err()
+}
+
+func (r unavailableScaleLinkReplica) Prepare(context.Context, string, clusterstate.Ballot) (clusterstate.ScaleLinkRecord, bool, bool, error) {
+	return clusterstate.ScaleLinkRecord{}, false, false, r.err()
+}
+
+func (r unavailableScaleLinkReplica) Accept(context.Context, string, clusterstate.ScaleLinkRecord, clusterstate.Ballot) (bool, error) {
+	return false, r.err()
+}
+
+func (r unavailableScaleLinkReplica) Repair(context.Context, string, clusterstate.ScaleLinkRecord) error {
+	return r.err()
+}
+
+func (r unavailableScaleLinkReplica) MaxBallot(context.Context, string) (clusterstate.Ballot, error) {
 	return clusterstate.Ballot{}, r.err()
 }
 

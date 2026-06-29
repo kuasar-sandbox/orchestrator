@@ -23,6 +23,15 @@ type GroupSource interface {
 	clusterstate.SandboxGroupImporter
 }
 
+type ImportTask struct {
+	ID       string
+	Importer clusterstate.SandboxGroupImporter
+}
+
+type ImportTaskSource interface {
+	ImportTasks() []ImportTask
+}
+
 func NewConfiguredGroupSource(sources []clustercfg.GroupSourceConfig) (GroupSource, error) {
 	if len(sources) == 0 {
 		return emptyGroupSource{}, nil
@@ -81,6 +90,8 @@ func (emptyGroupSource) GetAuthKey(context.Context, string) (clusterstate.Secret
 func (emptyGroupSource) Range(context.Context, string, int) (clusterstate.GroupPage, error) {
 	return clusterstate.GroupPage{}, nil
 }
+
+func (emptyGroupSource) ImportTasks() []ImportTask { return nil }
 
 type multiGroupSource struct {
 	sources []GroupSource
@@ -170,9 +181,25 @@ func (m multiGroupSource) Range(ctx context.Context, cursor string, limit int) (
 	return clusterstate.GroupPage{Groups: groups[start:end], NextCursor: next}, nil
 }
 
+func (m multiGroupSource) ImportTasks() []ImportTask {
+	var out []ImportTask
+	for _, source := range m.sources {
+		if tasks, ok := source.(ImportTaskSource); ok {
+			out = append(out, tasks.ImportTasks()...)
+			continue
+		}
+		out = append(out, ImportTask{ID: "default", Importer: source})
+	}
+	return out
+}
+
 type fileGroupSource struct {
 	sourceID string
 	dir      string
+}
+
+func (s *fileGroupSource) ImportTasks() []ImportTask {
+	return []ImportTask{{ID: s.sourceID, Importer: s}}
 }
 
 func (s *fileGroupSource) Get(ctx context.Context, group string) (clusterstate.SandboxGroup, bool, error) {

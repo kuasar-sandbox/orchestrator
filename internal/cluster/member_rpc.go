@@ -13,27 +13,30 @@ import (
 )
 
 const (
-	RouteReplicaRPCPath = "/internal/registry-member/route-replica"
-	NodeReplicaRPCPath  = "/internal/registry-member/node-replica"
+	RouteReplicaRPCPath     = "/internal/registry-member/route-replica"
+	NodeReplicaRPCPath      = "/internal/registry-member/node-replica"
+	ScaleLinkReplicaRPCPath = "/internal/registry-member/scale-link-replica"
 )
 
 type replicaRequest struct {
-	Op     string      `json:"op"`
-	Key    string      `json:"key,omitempty"`
-	Group  string      `json:"group,omitempty"`
-	Ballot Ballot      `json:"ballot,omitempty"`
-	Route  RouteRecord `json:"route,omitempty"`
-	Node   NodeRecord  `json:"node,omitempty"`
+	Op     string          `json:"op"`
+	Key    string          `json:"key,omitempty"`
+	Group  string          `json:"group,omitempty"`
+	Ballot Ballot          `json:"ballot,omitempty"`
+	Route  RouteRecord     `json:"route,omitempty"`
+	Node   NodeRecord      `json:"node,omitempty"`
+	Scale  ScaleLinkRecord `json:"scale,omitempty"`
 }
 
 type replicaResponse struct {
-	Route  RouteRecord   `json:"route,omitempty"`
-	Routes []RouteRecord `json:"routes,omitempty"`
-	Node   NodeRecord    `json:"node,omitempty"`
-	Found  bool          `json:"found,omitempty"`
-	OK     bool          `json:"ok,omitempty"`
-	Ballot Ballot        `json:"ballot,omitempty"`
-	Error  string        `json:"error,omitempty"`
+	Route  RouteRecord     `json:"route,omitempty"`
+	Routes []RouteRecord   `json:"routes,omitempty"`
+	Node   NodeRecord      `json:"node,omitempty"`
+	Scale  ScaleLinkRecord `json:"scale,omitempty"`
+	Found  bool            `json:"found,omitempty"`
+	OK     bool            `json:"ok,omitempty"`
+	Ballot Ballot          `json:"ballot,omitempty"`
+	Error  string          `json:"error,omitempty"`
 }
 
 func ServeRouteReplica(w http.ResponseWriter, req *http.Request, replica RouteReplica) {
@@ -95,6 +98,36 @@ func ServeNodeReplica(w http.ResponseWriter, req *http.Request, replica NodeRepl
 		out.Ballot, err = replica.MaxBallot(req.Context(), in.Key)
 	default:
 		err = fmt.Errorf("cluster: unknown node replica op %q", in.Op)
+	}
+	writeReplicaResponse(w, out, err)
+}
+
+func ServeScaleLinkReplica(w http.ResponseWriter, req *http.Request, replica ScaleLinkReplica) {
+	if req.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var in replicaRequest
+	if err := json.NewDecoder(req.Body).Decode(&in); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	var out replicaResponse
+	var err error
+	switch in.Op {
+	case "read":
+		out.Scale, out.Found, err = replica.Read(req.Context(), in.Key)
+	case "prepare":
+		out.Scale, out.Found, out.OK, err = replica.Prepare(req.Context(), in.Key, in.Ballot)
+	case "accept":
+		out.OK, err = replica.Accept(req.Context(), in.Key, in.Scale, in.Ballot)
+	case "repair":
+		err = replica.Repair(req.Context(), in.Key, in.Scale)
+		out.OK = err == nil
+	case "max_ballot":
+		out.Ballot, err = replica.MaxBallot(req.Context(), in.Key)
+	default:
+		err = fmt.Errorf("cluster: unknown scale task replica op %q", in.Op)
 	}
 	writeReplicaResponse(w, out, err)
 }
@@ -209,6 +242,51 @@ func (r *HTTPNodeReplica) MaxBallot(ctx context.Context, key string) (Ballot, er
 
 func (r *HTTPNodeReplica) call(ctx context.Context, in replicaRequest) (replicaResponse, error) {
 	return postReplica(ctx, r.client, r.endpoint+NodeReplicaRPCPath, in, r.health)
+}
+
+type HTTPScaleLinkReplica struct {
+	endpoint string
+	client   *http.Client
+	health   ReplicaAvailability
+}
+
+func NewHTTPScaleLinkReplicaWithHealth(endpoint string, client *http.Client, health ReplicaAvailability) *HTTPScaleLinkReplica {
+	if client == nil {
+		client = http.DefaultClient
+	}
+	if health == nil {
+		health = NewReplicaHealth(2 * time.Second)
+	}
+	return &HTTPScaleLinkReplica{endpoint: strings.TrimRight(endpoint, "/"), client: client, health: health}
+}
+
+func (r *HTTPScaleLinkReplica) Read(ctx context.Context, key string) (ScaleLinkRecord, bool, error) {
+	out, err := r.call(ctx, replicaRequest{Op: "read", Key: key})
+	return out.Scale, out.Found, err
+}
+
+func (r *HTTPScaleLinkReplica) Prepare(ctx context.Context, key string, ballot Ballot) (ScaleLinkRecord, bool, bool, error) {
+	out, err := r.call(ctx, replicaRequest{Op: "prepare", Key: key, Ballot: ballot})
+	return out.Scale, out.Found, out.OK, err
+}
+
+func (r *HTTPScaleLinkReplica) Accept(ctx context.Context, key string, rec ScaleLinkRecord, ballot Ballot) (bool, error) {
+	out, err := r.call(ctx, replicaRequest{Op: "accept", Key: key, Scale: rec, Ballot: ballot})
+	return out.OK, err
+}
+
+func (r *HTTPScaleLinkReplica) Repair(ctx context.Context, key string, rec ScaleLinkRecord) error {
+	_, err := r.call(ctx, replicaRequest{Op: "repair", Key: key, Scale: rec})
+	return err
+}
+
+func (r *HTTPScaleLinkReplica) MaxBallot(ctx context.Context, key string) (Ballot, error) {
+	out, err := r.call(ctx, replicaRequest{Op: "max_ballot", Key: key})
+	return out.Ballot, err
+}
+
+func (r *HTTPScaleLinkReplica) call(ctx context.Context, in replicaRequest) (replicaResponse, error) {
+	return postReplica(ctx, r.client, r.endpoint+ScaleLinkReplicaRPCPath, in, r.health)
 }
 
 var ErrReplicaUnavailable = errors.New("cluster: replica unavailable")

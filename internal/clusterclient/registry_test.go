@@ -121,7 +121,7 @@ func TestNodeListEndpointsUseLocatedJointOwners(t *testing.T) {
 			active,
 			next,
 		},
-		Owners: clustercfg.MembershipOwnerConfig{RouteLink: 1, NodeLink: 1, NodeList: 2},
+		Owners: clustercfg.MembershipOwnerConfig{RouteLink: 1, NodeLink: 1, ScaleLink: 2, NodeList: 2},
 	}
 	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		return jsonResponse(200, membership), nil
@@ -148,6 +148,62 @@ func TestNodeListEndpointsUseLocatedJointOwners(t *testing.T) {
 	for _, ep := range eps {
 		if !wantSet[ep.MemberID] {
 			t.Fatalf("unexpected node_list endpoint %+v want owners=%v", ep, wantSet)
+		}
+	}
+}
+
+func TestScaleLinkEndpointsUseLocatedJointOwners(t *testing.T) {
+	active := clustercfg.MembershipVersion{
+		Version: 1,
+		Members: []clustercfg.MembershipMember{
+			{ID: "a", Advertise: "http://a:7700"},
+			{ID: "b", Advertise: "http://b:7700"},
+			{ID: "c", Advertise: "http://c:7700"},
+		},
+	}
+	next := clustercfg.MembershipVersion{
+		Version: 2,
+		Members: []clustercfg.MembershipMember{
+			{ID: "b", Advertise: "http://b:7700"},
+			{ID: "c", Advertise: "http://c:7700"},
+			{ID: "d", Advertise: "http://d:7700"},
+		},
+	}
+	membership := clustercfg.MembershipConfig{
+		Active: 1,
+		Next:   2,
+		Versions: []clustercfg.MembershipVersion{
+			active,
+			next,
+		},
+		Owners: clustercfg.MembershipOwnerConfig{RouteLink: 1, NodeLink: 1, ScaleLink: 2, NodeList: 1},
+	}
+	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return jsonResponse(200, membership), nil
+	})}
+	reg := NewRegistryWithClient("http://bootstrap:7700", client)
+	recordKey := clusterstate.ScaleLinkAllocationKey("/g")
+	eps, err := reg.ScaleLinkEndpoints(t.Context(), recordKey)
+	if err != nil {
+		t.Fatalf("scale_link endpoints: %v", err)
+	}
+	wantSet := map[string]bool{}
+	for _, version := range []clustercfg.MembershipVersion{active, next} {
+		view := clusterstate.MemberView{Version: version.Version, Members: version.MemberIDs()}
+		owners, err := view.Owners(clusterstate.ScaleLinkShardKey(recordKey), 2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, owner := range owners {
+			wantSet[owner] = true
+		}
+	}
+	if len(eps) != len(wantSet) {
+		t.Fatalf("scale_link endpoints=%+v want owners=%v", eps, wantSet)
+	}
+	for _, ep := range eps {
+		if !wantSet[ep.MemberID] {
+			t.Fatalf("unexpected scale_link endpoint %+v want owners=%v", ep, wantSet)
 		}
 	}
 }

@@ -36,6 +36,35 @@ type RecordMeta struct {
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
+const (
+	ScaleLinkKindTaskLease  = "task_lease"
+	ScaleLinkKindAllocation = "allocation"
+)
+
+func ScaleLinkTaskKey(taskID string) string { return "task\x00" + taskID }
+
+func ScaleLinkAllocationKey(group string) string { return ScaleLinkKindAllocation + "\x00" + group }
+
+func ScaleLinkShardKey(recordKey string) string { return NamespaceScaleLink + "\x00" + recordKey }
+
+type ScaleLinkRecord struct {
+	Meta            RecordMeta `json:"meta"`
+	Key             string     `json:"key"`
+	Kind            string     `json:"kind"`
+	TaskID          string     `json:"task_id"`
+	OwnerID         string     `json:"owner_id,omitempty"`
+	RunID           string     `json:"run_id,omitempty"`
+	Term            uint64     `json:"term,omitempty"`
+	ReadyLabel      string     `json:"ready_label,omitempty"`
+	Group           string     `json:"group,omitempty"`
+	NodeIDs         []string   `json:"node_ids,omitempty"`
+	KeyFingerprint  string     `json:"key_fingerprint,omitempty"`
+	ManifestKeyType string     `json:"manifest_key_type,omitempty"`
+	ManifestKey     string     `json:"manifest_key,omitempty"`
+	ManifestKeyRef  string     `json:"manifest_key_ref,omitempty"`
+	ExpiresUnixMs   int64      `json:"expires_unix_ms,omitempty"`
+}
+
 type RouteState string
 
 const (

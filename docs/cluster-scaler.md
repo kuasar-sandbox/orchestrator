@@ -10,7 +10,7 @@ sandbox-group 配置,维护 placement 与密钥分配集合,消费 `node_list` �
    经 node_link 下发。
 2. **scaler 主管 placement 与 key allocation 决策**:它通过 Provider/Importer 取得 group 配置与 key,
    算出哪些 node 应接收 key,再把 intent 交给 registry/node owner 执行。
-3. **registry 不实现 group provider**:内置 store provider 若存在,也属于 scaler/provider 侧,不是 registry。
+3. **registry 不实现 group provider**:内置 file source 只服务开发和 e2e;生产通过接口注入 provider/importer。
 4. **WATCH_LIST 仅给 scaler**:router 不消费 node_list。
 5. **高频负载不走 WATCH_LIST**:WATCH_LIST 不承载 allocated/build_alloc/counts 等高频字段;scaler 用
    低频目录做候选过滤,最终资源确认由 registry/node owner admission 完成。
@@ -31,9 +31,12 @@ cluster-ctl scaler --config /etc/cluster-ctl/scaler.yaml
 | `member.listen` | scaler HTTP API 监听 |
 | `member.advertise` | registry 调用 scaler 的地址 |
 | `memberlist.label` | scaler memberlist label,默认 `scaler.default` |
-| `import_groups[]` | 可选辅助 group source;首版内置 `source_type=file` |
+| `import_groups[]` | standalone scaler 的 group source;首版内置 `source_type=file` |
 | `placement.candidates` | scaler 内部 node P2C 候选数量 |
 | `placement.zone_admit_max` | 可放置最高水位 |
+| `placement.import_owner_count` | 每个 import task 可参与 lease 竞争的 scaler 候选数,默认 3 |
+| `placement.import_task_lease_ttl` | registry 侧 import task owner lease TTL,默认 15s |
+| `placement.allocation_refresh_interval` | unchanged key allocation patch 刷新周期,默认 1m |
 | `placement.shuffle_sharding` | shuffle 规则 |
 
 registry 侧的 `scale_link.scaler_label` 指定 scaler memberlist 域,默认 `scaler.default`;
@@ -48,6 +51,7 @@ bootstrap 与已知成员并选择 active version 最新的结果。registry 收
 ```text
 POST /scale-link/place
 GET  /scale-link/verify-key
+POST /scale-link/import-task-lease
 ```
 
 ## 4. Provider / Importer
@@ -69,7 +73,9 @@ Importer 只提供当前可见的 group 列表。Provider 对 group 的点查 mi
 不可用。registry 已经收到的 key allocation intent 由
 `scale_link.allocation_ttl` 自动过期,并在下一轮 key distributor reconcile 中清理 node_link key cache。
 
-内置 `file` source 只是辅助实现,用于本地开发和 e2e:
+内置 `file` source 只是辅助实现,用于本地开发和 e2e。`cluster-ctl scaler` 独立运行时必须至少配置一个
+`import_groups` source;生产环境也可以在嵌入式模式直接注入自定义 `SandboxGroupProvider` /
+`SandboxGroupImporter`:
 
 ```yaml
 import_groups:
@@ -135,15 +141,30 @@ registry 只把 scaler memberlist 中 `role=scaler`、alive、`ready=true` 且
 
 ### 7.1 group placement reconcile
 
-周期任务:
+每个 source 暴露一个或多个 import task。内置 file source 的 task id 等于 `source_id`;自定义 importer
+未显式暴露 task 时作为 `default` task 处理。
 
-1. `Importer.Range` 得 group 页。
-2. `GetPlacementHint` 得静态 selectors/shuffle labels。
-3. 用 `pkg/maglev.LocateN` 计算 shuffle 结果。
-4. 将 shuffle 约束合并进最终 selectors。
-5. 计算 key allocation set,生成 key intent。
-6. membership 切换期间保持 group/key allocation 视图在新 owner 可用;route/build 执行态仍由同 group
+每轮 reconcile 对每个 task 执行:
+
+1. 从 scaler memberlist 取 `role=scaler && ready=true && ready_label==active_registry_label` 的成员 id。
+2. 用 `pkg/maglev.LocateN(task_id,ready_scalers,placement.import_owner_count)` 得到 task owner 候选。
+3. 候选按 `task\0<task_id>` 定位 scale_link owner set,向 owner endpoint
+   `POST /scale-link/import-task-lease` 抢 task lease。请求携带
+   `task_id`、`owner_id`、进程 `run_id` 和 `ttl_ms`。
+   task lease 是 `scale_link` 命名空间记录,record key 为 `task\0<task_id>`,按
+   `NamespaceScaleLink + record_key` 定位 registry owner set,并在分片内用无主 CAS 全复制维护。
+4. 只有 lease 胜者执行该 task 的 `Importer.Range`。
+5. 胜者用 `GetPlacementHint` 得静态 selectors/shuffle labels,用 `pkg/maglev.LocateN` 计算 shuffle 结果,
+   将 shuffle 约束合并进最终 selectors。
+6. 胜者计算 key allocation set,按 `allocation\0<group>` 定位 scale_link owner set,生成 selector/key
+   allocation patch。patch 携带 `import_task_id/import_owner_id/import_run_id/import_term`;registry 只接受与
+   当前 task lease 匹配的 patch,并把 allocation intent 写入 scale_link CAS 记录。
+7. membership 切换期间保持 group/key allocation 视图在新 owner 可用;route/build 执行态仍由同 group
    请求或 node 事件触发 read-repair。
+
+scaler 会按 `placement.allocation_refresh_interval` 续推 unchanged allocation patch,该值必须短于 registry
+侧 `scale_link.allocation_ttl`。group 从 provider 消失时不主动删除 allocation intent;registry TTL 到期后
+自动清理。
 
 ### 7.2 Registry 选择 scaler
 
@@ -201,6 +222,7 @@ scaler 主管 key allocation 决策:
 | WATCH_LIST 断线 | scaler 清空 node_list 视图并 failover 到另一个 owner 全量重订;完成 bookmark 前 not-ready |
 | provider 不可用 | 对受影响 group 的 Place/verify-key 返回不可用 |
 | node labels 旧 | node owner admission/create 兜底拒绝 |
+| task owner 崩溃 | import task lease 到期后其他候选接管;旧 owner 后续 patch 被 term/run_id fencing 拒绝 |
 | key 续租投递失败 | create/build 在 node 侧 reject,route owner 重调度或返回失败;下一次 heartbeat refresh 重试 |
 | build 预算泄漏 | admission lease 超时释放 |
 

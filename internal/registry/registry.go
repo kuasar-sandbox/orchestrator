@@ -21,6 +21,8 @@ var ErrNoNode = errors.New("registry: no eligible node")
 // ErrNodeGone is returned when the node owner cannot reach the target node.
 var ErrNodeGone = errors.New("registry: node owner cannot reach node")
 
+var errStaleImportTaskLease = errors.New("registry: stale import task lease")
+
 const lifecycleAckTimeout = 5 * time.Second
 
 // nodeConn is the registry's handle to one connected node's channel — it sends
@@ -109,6 +111,15 @@ type ScalerPeerSource func(readyLabel string) []ScalerPeer
 
 type ScalerSeedJoiner func(ctx context.Context, id, label, advertise string) error
 
+type ImportTaskLease struct {
+	TaskID        string `json:"task_id"`
+	OwnerID       string `json:"owner_id"`
+	RunID         string `json:"run_id"`
+	Term          uint64 `json:"term"`
+	ReadyLabel    string `json:"ready_label,omitempty"`
+	ExpiresUnixMs int64  `json:"expires_unix_ms"`
+}
+
 // reserveCall is one in-flight ReserveSandbox; joiners wait on done, the channel
 // reader fills result + closes done when the sandbox goes running.
 type reserveCall struct {
@@ -161,37 +172,71 @@ func New(stores *Stores, placer Placer, parkTimeout time.Duration, log *slog.Log
 	localOwner := newLocalNodeOwner(r)
 	r.localNodeOwner = localOwner
 	r.nodeOwner = localOwner
+	if rep, ok := stores.LocalScaleLinkReplica().(interface {
+		SetApplyHook(func(clusterstate.ScaleLinkRecord))
+	}); ok {
+		rep.SetApplyHook(r.projectScaleLinkRecord)
+	}
 	return r
 }
 
 // applySelectorPatch records the scaler-owned key allocation for a group. The
 // registry/node owner writes this explicit node set into node_link key caches;
 // local selector matching is only a bootstrap path before the scaler has pushed allocation.
-func (r *Registry) applySelectorPatch(p *routesync.SelectorPatch) {
+func (r *Registry) applySelectorPatch(ctx context.Context, p *routesync.SelectorPatch) error {
+	if !r.selectorPatchLeaseOK(ctx, p) {
+		return errStaleImportTaskLease
+	}
+	if !p.NodeAllocation {
+		return nil
+	}
+	if _, err := r.stores.PutScaleLinkAllocation(ctx, p, r.keyAllocationTTL); err != nil {
+		return err
+	}
+	r.onNodeConnected()
+	return nil
+}
+
+func (r *Registry) projectScaleLinkRecord(rec clusterstate.ScaleLinkRecord) {
+	if rec.Kind != clusterstate.ScaleLinkKindAllocation || rec.Group == "" {
+		return
+	}
+	changed := false
 	r.scalerMu.Lock()
-	if p.NodeAllocation {
-		set := make(map[string]bool, len(p.NodeIDs))
-		for _, id := range p.NodeIDs {
-			if id != "" {
-				set[id] = true
-			}
-		}
-		keyType, keyValue := p.ManifestKeyType, p.ManifestKey
-		if keyType == "ref" {
-			keyValue = p.ManifestKeyRef
-		}
-		if keyType == "" && keyValue != "" {
-			keyType = clusterstate.SecretInline
-		}
-		if len(set) == 0 || p.KeyFingerprint == "" || keyValue == "" {
-			delete(r.keyAlloc, p.Group)
-		} else {
-			expiresAt := time.Now().Add(r.keyAllocationTTL)
-			r.keyAlloc[p.Group] = keyAllocationState{fp: p.KeyFingerprint, keyType: keyType, keyValue: keyValue, nodes: set, expiresAt: expiresAt}
+	if rec.ExpiresUnixMs > 0 && rec.ExpiresUnixMs <= time.Now().UnixMilli() {
+		delete(r.keyAlloc, rec.Group)
+		changed = true
+		r.scalerMu.Unlock()
+		r.onNodeConnected()
+		return
+	}
+	set := make(map[string]bool, len(rec.NodeIDs))
+	for _, id := range rec.NodeIDs {
+		if id != "" {
+			set[id] = true
 		}
 	}
+	keyType, keyValue := rec.ManifestKeyType, rec.ManifestKey
+	if keyType == "ref" {
+		keyValue = rec.ManifestKeyRef
+	}
+	if keyType == "" && keyValue != "" {
+		keyType = clusterstate.SecretInline
+	}
+	if len(set) == 0 || rec.KeyFingerprint == "" || keyValue == "" {
+		delete(r.keyAlloc, rec.Group)
+		changed = true
+		r.scalerMu.Unlock()
+		r.onNodeConnected()
+		return
+	}
+	expiresAt := time.UnixMilli(rec.ExpiresUnixMs)
+	r.keyAlloc[rec.Group] = keyAllocationState{fp: rec.KeyFingerprint, keyType: keyType, keyValue: keyValue, nodes: set, expiresAt: expiresAt}
+	changed = true
 	r.scalerMu.Unlock()
-	r.onNodeConnected()
+	if changed {
+		r.onNodeConnected()
+	}
 }
 
 func (r *Registry) keyAllocations() map[string]keyAllocationState {
@@ -212,6 +257,13 @@ func (r *Registry) keyAllocations() map[string]keyAllocationState {
 		out[group] = keyAllocationState{fp: src.fp, keyType: src.keyType, keyValue: src.keyValue, nodes: nodes, expiresAt: src.expiresAt}
 	}
 	return out
+}
+
+func (r *Registry) selectorPatchLeaseOK(ctx context.Context, p *routesync.SelectorPatch) bool {
+	if p == nil || p.ImportTaskID == "" {
+		return true
+	}
+	return r.stores.CheckScaleLinkLease(ctx, p.ImportTaskID, p.ImportOwnerID, p.ImportRunID, p.ImportTerm)
 }
 
 // SetScaleReadyLabel sets the registry membership label a scaler must advertise
