@@ -36,12 +36,15 @@ type SnapshotSummary struct {
 
 func (o SnapshotOptions) normalized() (SnapshotOptions, error) {
 	if o.Kind == "" {
-		o.Kind = "all"
+		o.Kind = "routes"
 	}
 	switch o.Kind {
-	case "all", "routes":
+	case "routes":
 	default:
 		return SnapshotOptions{}, fmt.Errorf("registry snapshot: invalid kind %q", o.Kind)
+	}
+	if o.Group == "" {
+		return SnapshotOptions{}, fmt.Errorf("registry snapshot: group is required")
 	}
 	return o, nil
 }
@@ -53,36 +56,25 @@ func (r *Registry) ExportSnapshot(ctx context.Context, w io.Writer, opts Snapsho
 	}
 	enc := json.NewEncoder(w)
 	var sum SnapshotSummary
-	if opts.Kind == "all" || opts.Kind == "routes" {
-		rangeFn := r.stores.RangeAllSandboxes
-		if opts.Group != "" {
-			rangeFn = func(ctx context.Context, fn func(*SandboxRecord) error) error {
-				return r.stores.RangeSandboxes(ctx, opts.Group, fn)
-			}
+	if err := r.stores.RangeSandboxes(ctx, opts.Group, func(s *SandboxRecord) error {
+		out := *s
+		if err := enc.Encode(SnapshotRecord{Type: SnapshotKindRoute, Route: &out}); err != nil {
+			return err
 		}
-		if err := rangeFn(ctx, func(s *SandboxRecord) error {
-			out := *s
-			if err := enc.Encode(SnapshotRecord{Type: SnapshotKindRoute, Route: &out}); err != nil {
-				return err
-			}
-			sum.Routes++
-			return nil
-		}); err != nil {
-			return SnapshotSummary{}, err
+		sum.Routes++
+		return nil
+	}); err != nil {
+		return SnapshotSummary{}, err
+	}
+	if err := r.stores.RangeBuildsInGroup(ctx, opts.Group, func(b *BuildRecord) error {
+		out := sandboxRecordFromBuild(b)
+		if err := enc.Encode(SnapshotRecord{Type: SnapshotKindRoute, Route: out}); err != nil {
+			return err
 		}
-		if err := r.stores.RangeBuilds(ctx, func(b *BuildRecord) error {
-			if opts.Group != "" && b.Group != opts.Group {
-				return nil
-			}
-			out := sandboxRecordFromBuild(b)
-			if err := enc.Encode(SnapshotRecord{Type: SnapshotKindRoute, Route: out}); err != nil {
-				return err
-			}
-			sum.Routes++
-			return nil
-		}); err != nil {
-			return SnapshotSummary{}, err
-		}
+		sum.Routes++
+		return nil
+	}); err != nil {
+		return SnapshotSummary{}, err
 	}
 	return sum, nil
 }

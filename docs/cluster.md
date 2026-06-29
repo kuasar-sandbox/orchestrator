@@ -144,27 +144,28 @@ scaler ready 通过 register loop 表达。scaler 向每个 active / next regist
 
 - 它参与的 owner set 降一格,只要可达 owner 数满足 quorum 即继续服务。
 - 若 quorum 不足,该 shard 停写(CP),不降级乱写。
-- 恢复成员通过后台 catch-up/read-repair 重新补齐本地副本;写 quorum 始终以 owner set quorum 判定。
+- 恢复成员不扫描全局 key 空间;后续同 shard key 的读写、node-link 上报或 group import 触达该 key 时,
+  quorum read-repair 补齐本地副本。
 
 ## 5. Joint Owner Set
 
-跨版本时,受影响 shard 的逻辑 owner set 是 old/new 并集:
+跨版本时,对同一个 shard key,逻辑 owner set 是 old/new 并集:
 
 ```text
 oldOwners   = LocateN(shard_key,V1)
 newOwners   = LocateN(shard_key,V2)
-unionOwners = oldOwners ∪ newOwners
+jointOwners = oldOwners ∪ newOwners
 ```
 
-提交条件不是 union majority,而是 joint quorum:
+提交条件不是并集 majority,而是 joint quorum:
 
 ```text
 prepare/read:  quorum(oldOwners) + quorum(newOwners)
 accept/write:  quorum(oldOwners) + quorum(newOwners)
-repair:        best-effort 写满 unionOwners
+repair:        best-effort 写满 jointOwners
 ```
 
-重叠成员可同时计入 old quorum 和 new quorum。普通 union majority 不安全,因为它可能读不到旧版本已提交
+重叠成员可同时计入 old quorum 和 new quorum。普通并集 majority 不安全,因为它可能读不到旧版本已提交
 但只落在旧 quorum 上的值。
 
 状态机:
@@ -173,7 +174,7 @@ repair:        best-effort 写满 unionOwners
 stable(v1)
   -> load_config(v2)
   -> joint_node_link(v1,v2)
-  -> rebuild_node_list(v2)
+  -> node_list_refresh(v2)
   -> wait_scaler_ready(v2)
   -> joint_route_link(v1,v2)
   -> cutover_barrier
@@ -193,25 +194,26 @@ read-repair。
 
 - stable 模式写入经当前 owner set quorum 提交。
 - joint 模式写入经 old quorum + new quorum 提交。
-- 提交后继续 best-effort 复制到 union / 全 owner set。
+- 提交后继续 best-effort 复制到同 shard key 的 joint owner set。
 - 每条记录有单调 rev 和唯一 ballot;写条件必须校验 expected rev。
 - 旧 membership 写入必须被 moved/retry,不能在旧 owner 本地提交。
-- 成员冷重启后本地副本为空;后台 catch-up 扫描可见 key 并触发 quorum read-repair。运行期只在 owner
-  quorum 足够时继续服务。
+- 成员冷重启后本地副本为空;不通过跨片扫描发现 key。只有带 shard key 的访问、node-link 上报或
+  group import 触达该 key 时才执行 quorum read-repair。
 
 size-1 模式中 `LocateN` 只返回本成员,quorum 退化为本地内存写;同样使用 expected rev + ballot
 接口。size-1 用于开发和小规模部署,不提供 registry 成员故障 HA。
 
 ## 7. Namespace 收敛
 
-不设计独立跨 namespace cold-key promoter。收敛由 namespace 自己的事实源驱动;registry 成员重启后的
-本地副本补齐由后台 catch-up 扫描可见 route/node key 并触发 read-repair。
+registry 不支持跨 group/node shard 扫描,也不通过枚举 key 做后台 promoter。收敛由 namespace 自己的事实源
+驱动:route/build 由 group import 或请求触达;node_link 由 node 连接、心跳和事件触达;node_list 由 node-link
+持有者的低频投影触达。
 
 ### 7.1 node_link
 
 活动 node 连接持有者在进入 joint 后:
 
-1. 向 union owners 发送一次完整 node snapshot。
+1. 向 joint owners 发送一次完整 node snapshot。
 2. 后续 heartbeat、sandbox/build event、清单变化实时 fanout。
 3. 用 transfer lease 和 `reconnect_to` 把 node 连接迁到新 owner。
 4. 新 owner 要求 full resync 后释放 transfer lease。
@@ -225,8 +227,8 @@ scaler 的全量 group import 是 group 收敛驱动。scaler 不复制 route �
 ```text
 scaler import generation G
   -> for each group:
-       group owner 对该 group 下 route/build execution records 做 joint read/repair
-  -> 写 promotion marker
+       group owner 对该 group 的已知 route/build execution records 做 joint read/repair
+       不跨 group 枚举 registry route key
 ```
 
 provider 删除 group 时不能直接从 import 中消失;必须以 tombstone/draining group 形式继续出现,直到 registry
@@ -313,7 +315,7 @@ scaler 负责:
 - `SandboxGroupImporter.Range` 全量/增量导入 group。
 - `SandboxGroupProvider.GetPlacementHint` 构建 group placement cache。
 - `SandboxGroupProvider.GetKey` / `GetAuthKey` 生成 key allocation / auth material intent。
-- 按 active / next membership 订阅 node_list owner 的 WATCH_LIST,并在本地合并。
+- 按 active / next membership 得到 node_list owner 候选,一次只订阅一个 owner;断线后 reset 并切换下一个。
 - 周期性向每个 active / next registry 成员 `POST /scale-link/register` 发布 ready 状态。
 - 向每个 active / next registry 成员推送 selector/key allocation patch。
 - 对 registry 暴露 `POST /scale-link/place`。
@@ -390,7 +392,7 @@ registry export/import 不覆盖 sandbox-group provider 数据。group 配置、
 | router 崩溃 | 丢缓存;重启后 miss Reserve |
 | scaler 崩溃 | 冷放置受影响;热连接不受影响;registry failover 到同 group 的下一个 ready scaler |
 | node 崩溃/清空 | node owner / route owner 清理 route;下次 Reserve 重新放置 |
-| registry 单成员故障 | owner set quorum 足够时继续服务;故障成员恢复后 catch-up/read-repair |
+| registry 单成员故障 | owner set quorum 足够时继续服务;故障成员由后续同 key 访问或事实源上报触发 read-repair |
 | registry 双成员故障 | 对应 shard 少于 quorum 时停写 |
 | membership 变更 | joint owner set + namespace 收敛 + old grace |
 | 整集群下电 | 不要求自动恢复运行中 sandbox |

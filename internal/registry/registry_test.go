@@ -432,6 +432,7 @@ func TestParkTimeoutRollback(t *testing.T) {
 	kv := clusterstore.OpenMemory(0)
 	defer kv.Close()
 	reg := New(NewStores(kv), nil, 200*time.Millisecond, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	reg.SetPlacer(placementWithToken("n1"))
 	reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"})
 	reg.addNode(&fakeConn{nodeID: "n1"}) // accepts create but never reports running
 
@@ -448,6 +449,7 @@ func TestParkTimeoutRollback(t *testing.T) {
 func TestReplaceOnRejectSucceeds(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
+	reg.SetPlacer(placementWithToken("n1"))
 	reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"})
 	creates := 0
 	conn := &fakeConn{nodeID: "n1"}
@@ -815,7 +817,10 @@ func TestMergeConfig(t *testing.T) {
 func TestSweepKeepsInflightReserved(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
-	reg.stores.PutNode(ctx, &NodeRecord{NodeID: "dead", LastHeartbeatUnix: time.Now().Add(-time.Hour).Unix()})
+	reg.stores.PutNode(ctx, &NodeRecord{NodeID: "dead", LastHeartbeatUnix: time.Now().Add(-time.Hour).Unix(), Sandboxes: []clusterstate.NodeSandboxRef{
+		{Group: "/g", RouteKey: "live", SandboxID: "sb-r"},
+		{Group: "/g", RouteKey: "stale", SandboxID: "sb-s"},
+	}})
 	// A RESERVED row whose single-flight is still in flight must survive the sweep.
 	reg.stores.PutSandbox(ctx, &SandboxRecord{Group: "/g", RouteKey: "live", SID: "sb-r", State: StateReserved, NodeID: "dead"})
 	reg.mu.Lock()
@@ -824,7 +829,7 @@ func TestSweepKeepsInflightReserved(t *testing.T) {
 	// A RESERVED row with no in-flight reserve is stale → swept.
 	reg.stores.PutSandbox(ctx, &SandboxRecord{Group: "/g", RouteKey: "stale", SID: "sb-s", State: StateReserved, NodeID: "dead"})
 
-	reg.sweepDeadNodes(ctx, 30*time.Second)
+	reg.sweepNode(ctx, "dead", 30*time.Second)
 
 	if _, _, found, _ := reg.stores.GetSandbox(ctx, "/g", "live"); !found {
 		t.Fatal("swept a RESERVED row owned by an in-flight reserve")
@@ -838,15 +843,20 @@ func TestSweepDeadNodes(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
 	// Disconnected node with a stale heartbeat + a READY sandbox → both swept.
-	reg.stores.PutNode(ctx, &NodeRecord{NodeID: "dead", LastHeartbeatUnix: time.Now().Add(-time.Hour).Unix()})
+	reg.stores.PutNode(ctx, &NodeRecord{NodeID: "dead", LastHeartbeatUnix: time.Now().Add(-time.Hour).Unix(), Sandboxes: []clusterstate.NodeSandboxRef{
+		{Group: "/g", RouteKey: "rk", SandboxID: "sb-1"},
+	}})
 	reg.stores.PutSandbox(ctx, &SandboxRecord{Group: "/g", RouteKey: "rk", SID: "sb-1", State: StateReady, NodeID: "dead"})
 	reg.indexSID("sb-1", "/g", "rk")
 	// Connected node with a stale heartbeat → NOT swept (a live channel isn't dead).
-	reg.stores.PutNode(ctx, &NodeRecord{NodeID: "live", LastHeartbeatUnix: time.Now().Add(-time.Hour).Unix()})
+	reg.stores.PutNode(ctx, &NodeRecord{NodeID: "live", LastHeartbeatUnix: time.Now().Add(-time.Hour).Unix(), Sandboxes: []clusterstate.NodeSandboxRef{
+		{Group: "/g2", RouteKey: "rk", SandboxID: "sb-2"},
+	}})
 	reg.addNode(&fakeConn{nodeID: "live"})
 	reg.stores.PutSandbox(ctx, &SandboxRecord{Group: "/g2", RouteKey: "rk", SID: "sb-2", State: StateReady, NodeID: "live"})
 
-	reg.sweepDeadNodes(ctx, 30*time.Second)
+	reg.sweepNode(ctx, "dead", 30*time.Second)
+	reg.sweepNode(ctx, "live", 30*time.Second)
 
 	if _, found, _ := reg.stores.GetNode(ctx, "dead"); found {
 		t.Fatal("dead node not swept")

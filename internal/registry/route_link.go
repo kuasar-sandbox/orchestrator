@@ -70,13 +70,20 @@ type ListItem struct {
 
 func (r *Registry) serveList(w http.ResponseWriter, req *http.Request) {
 	group := req.URL.Query().Get("group")
+	if group == "" {
+		http.Error(w, "group is required", http.StatusBadRequest)
+		return
+	}
 	out := []ListItem{}
-	_ = r.stores.RangeSandboxes(req.Context(), group, func(s *SandboxRecord) error {
+	if err := r.stores.RangeSandboxes(req.Context(), group, func(s *SandboxRecord) error {
 		if s.State == StateReady || s.State == StatePaused {
 			out = append(out, ListItem{SandboxID: s.SID, State: string(s.State), TemplateID: s.TemplateID, ClientID: s.NodeID})
 		}
 		return nil
-	})
+	}); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 	writeJSON(w, out)
 }
 

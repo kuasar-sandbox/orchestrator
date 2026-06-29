@@ -76,13 +76,6 @@ func (r *flakyNodeReplica) MaxBallot(ctx context.Context, key string) (Ballot, e
 	return r.NodeReplica.MaxBallot(ctx, key)
 }
 
-func (r *flakyNodeReplica) Keys(ctx context.Context) []string {
-	if r.down {
-		return nil
-	}
-	return r.NodeReplica.Keys(ctx)
-}
-
 func TestNodeQuorumMemberFailurePolicy(t *testing.T) {
 	ctx := context.Background()
 	a := &flakyNodeReplica{NodeReplica: NewMemoryNodeReplica()}

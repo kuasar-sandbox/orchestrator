@@ -30,7 +30,7 @@ type Service struct {
 	linksMu     sync.RWMutex
 	links       []RegistryLink
 	watchLinks  []RegistryLink
-	watchCancel map[string]context.CancelFunc
+	watchCancel context.CancelFunc
 	startedCtx  context.Context
 
 	cfg       clustercfg.PlacementConfig
@@ -59,9 +59,9 @@ func NewRemoteLinks(links []RegistryLink, cfg clustercfg.PlacementConfig, deadAf
 	}
 	links = normalizeRegistryLinks(links)
 	return &Service{
-		links: links, watchLinks: links, watchCancel: map[string]context.CancelFunc{},
+		links: links, watchLinks: links,
 		cfg: cfg, deadAfter: deadAfter, log: log,
-		nodes:  newNodeView(minReadyLinks(len(links))),
+		nodes:  newNodeView(1),
 		groups: newGroupStore(),
 	}
 }
@@ -142,9 +142,7 @@ func (s *Service) Start(ctx context.Context) {
 	s.linksMu.Lock()
 	if s.startedCtx == nil {
 		s.startedCtx = ctx
-		for _, link := range s.watchLinks {
-			s.startWatchLinkLocked(ctx, link)
-		}
+		s.startWatchLinkLocked(ctx)
 	}
 	s.linksMu.Unlock()
 	go s.reconcileKeyAllocations(ctx)
@@ -161,37 +159,15 @@ func (s *Service) SetNodeListLinks(ctx context.Context, links []RegistryLink) {
 	links = normalizeRegistryLinks(links)
 	s.linksMu.Lock()
 	defer s.linksMu.Unlock()
-	old := make(map[string]RegistryLink, len(s.watchLinks))
-	for _, link := range s.watchLinks {
-		old[link.Name] = link
-	}
-	next := make(map[string]RegistryLink, len(links))
-	for _, link := range links {
-		next[link.Name] = link
-		if cur, ok := old[link.Name]; ok && cur.BaseURL == link.BaseURL {
-			continue
-		}
-		if cancel := s.watchCancel[link.Name]; cancel != nil {
-			cancel()
-			delete(s.watchCancel, link.Name)
-			s.nodes.removeSource(link.Name)
-		}
-		if s.startedCtx != nil {
-			s.startWatchLinkLocked(ctx, link)
-		}
-	}
-	for name := range old {
-		if _, ok := next[name]; ok {
-			continue
-		}
-		if cancel := s.watchCancel[name]; cancel != nil {
-			cancel()
-			delete(s.watchCancel, name)
-		}
-		s.nodes.removeSource(name)
-	}
 	s.watchLinks = links
-	s.nodes.setMinReady(minReadyLinks(len(links)))
+	s.nodes.removeSource("node_list")
+	if s.watchCancel != nil {
+		s.watchCancel()
+		s.watchCancel = nil
+	}
+	if s.startedCtx != nil {
+		s.startWatchLinkLocked(ctx)
+	}
 }
 
 func (s *Service) RegistryLinks() []RegistryLink {
@@ -200,13 +176,13 @@ func (s *Service) RegistryLinks() []RegistryLink {
 	return append([]RegistryLink(nil), s.links...)
 }
 
-func (s *Service) startWatchLinkLocked(ctx context.Context, link RegistryLink) {
-	if _, exists := s.watchCancel[link.Name]; exists {
+func (s *Service) startWatchLinkLocked(ctx context.Context) {
+	if s.watchCancel != nil {
 		return
 	}
 	wctx, cancel := context.WithCancel(ctx)
-	s.watchCancel[link.Name] = cancel
-	go s.subscribe(wctx, link, registry.ScaleLinkNodeListWatchPath, s.nodes.source(link.Name))
+	s.watchCancel = cancel
+	go s.watchNodeList(wctx)
 }
 
 func (s *Service) ServeScaleLink(mux *http.ServeMux) {
@@ -491,6 +467,41 @@ func keyAllocation(group string, nodes []*registry.NodeRecord, selectors []map[s
 	return effective, nodeIDs
 }
 
+func (s *Service) watchNodeList(ctx context.Context) {
+	index := 0
+	for ctx.Err() == nil {
+		s.linksMu.RLock()
+		links := append([]RegistryLink(nil), s.watchLinks...)
+		s.linksMu.RUnlock()
+		if len(links) == 0 {
+			s.nodes.removeSource("node_list")
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(time.Second):
+				continue
+			}
+		}
+		if index >= len(links) {
+			index = 0
+		}
+		link := links[index]
+		index++
+		s.nodes.removeSource("node_list")
+		sink := s.nodes.source("node_list")
+		_, err := s.subscribeOnce(ctx, link, registry.ScaleLinkNodeListWatchPath, 0, sink)
+		if ctx.Err() != nil {
+			return
+		}
+		s.log.Warn("scaler: node_list watch ended; failing over", "registry", link.Name, "err", err)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+}
+
 // subscribe keeps a view synced from registry scale_link, reconnecting with
 // capped backoff and resuming from the last applied rev (mirrors the router).
 func (s *Service) subscribe(ctx context.Context, link RegistryLink, path string, sink viewSink) {
@@ -596,10 +607,9 @@ type viewSink interface {
 	bookmark()
 }
 
-// nodeView merges node_list WATCH_LIST streams from multiple registry members.
-// Each source applies snapshot reset/bookmark atomically; the scaler reads a
-// node_id-keyed union over synced sources, preferring the freshest heartbeat when
-// the same node appears from more than one registry member.
+// nodeView holds the single active node_list WATCH_LIST source. A source applies
+// snapshot reset/bookmark atomically; failover clears the old source before the
+// next owner publishes a full snapshot.
 type nodeView struct {
 	mu       sync.RWMutex
 	sources  map[string]*nodeSource

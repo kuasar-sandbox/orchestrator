@@ -31,7 +31,6 @@ type replicaResponse struct {
 	Found  bool        `json:"found,omitempty"`
 	OK     bool        `json:"ok,omitempty"`
 	Ballot Ballot      `json:"ballot,omitempty"`
-	Keys   []string    `json:"keys,omitempty"`
 	Error  string      `json:"error,omitempty"`
 }
 
@@ -59,9 +58,6 @@ func ServeRouteReplica(w http.ResponseWriter, req *http.Request, replica RouteRe
 		out.OK = err == nil
 	case "max_ballot":
 		out.Ballot, err = replica.MaxBallot(req.Context(), in.Key)
-	case "keys":
-		out.Keys = replica.Keys(req.Context())
-		out.OK = true
 	default:
 		err = fmt.Errorf("cluster: unknown route replica op %q", in.Op)
 	}
@@ -92,9 +88,6 @@ func ServeNodeReplica(w http.ResponseWriter, req *http.Request, replica NodeRepl
 		out.OK = err == nil
 	case "max_ballot":
 		out.Ballot, err = replica.MaxBallot(req.Context(), in.Key)
-	case "keys":
-		out.Keys = replica.Keys(req.Context())
-		out.OK = true
 	default:
 		err = fmt.Errorf("cluster: unknown node replica op %q", in.Op)
 	}
@@ -155,14 +148,6 @@ func (r *HTTPRouteReplica) MaxBallot(ctx context.Context, key string) (Ballot, e
 	return out.Ballot, err
 }
 
-func (r *HTTPRouteReplica) Keys(ctx context.Context) []string {
-	out, err := r.call(ctx, replicaRequest{Op: "keys"})
-	if err != nil {
-		return nil
-	}
-	return out.Keys
-}
-
 func (r *HTTPRouteReplica) call(ctx context.Context, in replicaRequest) (replicaResponse, error) {
 	return postReplica(ctx, r.client, r.endpoint+RouteReplicaRPCPath, in, r.health)
 }
@@ -210,14 +195,6 @@ func (r *HTTPNodeReplica) Repair(ctx context.Context, key string, rec NodeRecord
 func (r *HTTPNodeReplica) MaxBallot(ctx context.Context, key string) (Ballot, error) {
 	out, err := r.call(ctx, replicaRequest{Op: "max_ballot", Key: key})
 	return out.Ballot, err
-}
-
-func (r *HTTPNodeReplica) Keys(ctx context.Context) []string {
-	out, err := r.call(ctx, replicaRequest{Op: "keys"})
-	if err != nil {
-		return nil
-	}
-	return out.Keys
 }
 
 func (r *HTTPNodeReplica) call(ctx context.Context, in replicaRequest) (replicaResponse, error) {

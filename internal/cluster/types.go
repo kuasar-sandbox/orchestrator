@@ -95,6 +95,19 @@ type NodeRecord struct {
 	LastHeartbeatUnix int64                     `json:"last_heartbeat_unix,omitempty"`
 	ResumeToken       string                    `json:"resume_token,omitempty"`
 	LinkOwner         string                    `json:"link_owner,omitempty"`
+	Sandboxes         []NodeSandboxRef          `json:"sandboxes,omitempty"`
+	Builds            []NodeBuildRef            `json:"builds,omitempty"`
+}
+
+type NodeSandboxRef struct {
+	Group     string `json:"group"`
+	RouteKey  string `json:"route_key"`
+	SandboxID string `json:"sandbox_id,omitempty"`
+}
+
+type NodeBuildRef struct {
+	Group   string `json:"group"`
+	BuildID string `json:"build_id"`
 }
 
 // NodeListEntry is the low-frequency WATCH_LIST projection consumed by scaler.

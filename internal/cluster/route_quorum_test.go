@@ -105,13 +105,6 @@ func (r *flakyRouteReplica) MaxBallot(ctx context.Context, key string) (Ballot, 
 	return r.RouteReplica.MaxBallot(ctx, key)
 }
 
-func (r *flakyRouteReplica) Keys(ctx context.Context) []string {
-	if r.down {
-		return nil
-	}
-	return r.RouteReplica.Keys(ctx)
-}
-
 func TestRouteQuorumMemberFailurePolicy(t *testing.T) {
 	ctx := context.Background()
 	a := &flakyRouteReplica{RouteReplica: NewMemoryRouteReplica()}

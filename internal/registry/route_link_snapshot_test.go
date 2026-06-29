@@ -22,7 +22,7 @@ func TestSnapshotRouteRoundTrip(t *testing.T) {
 	}
 
 	var raw bytes.Buffer
-	sum, err := src.ExportSnapshot(ctx, &raw, SnapshotOptions{Kind: "all"})
+	sum, err := src.ExportSnapshot(ctx, &raw, SnapshotOptions{Kind: "routes", Group: "/g"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -61,7 +61,7 @@ func TestSnapshotIncludesBuildRouteRecords(t *testing.T) {
 	}
 
 	var raw bytes.Buffer
-	sum, err := src.ExportSnapshot(ctx, &raw, SnapshotOptions{Kind: "all"})
+	sum, err := src.ExportSnapshot(ctx, &raw, SnapshotOptions{Kind: "routes", Group: "/g"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -103,5 +103,14 @@ func TestSnapshotRouteLinkAPI(t *testing.T) {
 	}
 	if route, _, found, err := reg.stores.GetSandbox(ctx, "/g", "rk"); err != nil || !found || route.SID != "sb-1" || route.AccessToken != "tok" {
 		t.Fatalf("imported route=%+v found=%v err=%v", route, found, err)
+	}
+}
+
+func TestSnapshotExportRequiresGroup(t *testing.T) {
+	ctx := context.Background()
+	reg := testReg(t)
+	var raw bytes.Buffer
+	if _, err := reg.ExportSnapshot(ctx, &raw, SnapshotOptions{Kind: "routes"}); err == nil {
+		t.Fatal("expected group-scoped export to require group")
 	}
 }

@@ -89,7 +89,7 @@ func (r *Registry) ServeNodeLink(w http.ResponseWriter, req *http.Request) {
 				r.applyRoute(ctx, nr.NodeID, m.Route)
 			}
 		case routesync.TypeDelete:
-			r.applyDeleteBySID(ctx, m.SID)
+			r.applyDeleteBySID(ctx, nr.NodeID, m.SID)
 		case routesync.TypeHeartbeat:
 			if m.Beat != nil {
 				r.updateHeartbeat(ctx, nr.NodeID, m.Beat)
@@ -102,7 +102,7 @@ func (r *Registry) ServeNodeLink(w http.ResponseWriter, req *http.Request) {
 			// Build state transition: converge the BuildStore (§7.5); a terminal
 			// state releases the build's reserved node resources.
 			if m.Build != nil {
-				r.applyBuildEvent(ctx, m.Build)
+				r.applyBuildEvent(ctx, nr.NodeID, m.Build)
 			}
 		case routesync.TypeBookmark:
 			if m.RevToken != "" {

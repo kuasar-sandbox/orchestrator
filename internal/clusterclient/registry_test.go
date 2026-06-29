@@ -96,7 +96,7 @@ func TestOwnerEndpointsIncludeNextMembership(t *testing.T) {
 	}
 }
 
-func TestNodeListEndpointsUseLocatedOwnerUnion(t *testing.T) {
+func TestNodeListEndpointsUseLocatedJointOwners(t *testing.T) {
 	active := clustercfg.MembershipVersion{
 		Version: 1,
 		Members: []clustercfg.MembershipMember{

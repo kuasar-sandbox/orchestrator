@@ -53,6 +53,7 @@ func buildAckConn(reg *Registry, nodeID string) *fakeConn {
 func TestReserveBuildUsesNodeOwnerBoundary(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
+	reg.SetPlacer(placementWithToken("n1"))
 	reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"})
 	reg.addNode(buildAckConn(reg, "n1"))
 	admitter := &recordingNodeOwner{allow: true}
@@ -65,7 +66,7 @@ func TestReserveBuildUsesNodeOwnerBoundary(t *testing.T) {
 	if len(admitter.admitted) != 1 || admitter.admitted[0] != "n1/"+res.BuildID {
 		t.Fatalf("admitted=%v, want n1/%s", admitter.admitted, res.BuildID)
 	}
-	reg.applyBuildEvent(ctx, &routesync.BuildEvent{Group: "/g", BuildID: res.BuildID, State: string(BuildReady)})
+	reg.applyBuildEvent(ctx, "n1", &routesync.BuildEvent{Group: "/g", BuildID: res.BuildID, State: string(BuildReady)})
 	if len(admitter.released) != 1 || admitter.released[0] != res.BuildID {
 		t.Fatalf("released=%v, want %s", admitter.released, res.BuildID)
 	}
@@ -77,6 +78,7 @@ func TestReserveBuildUsesNodeOwnerBoundary(t *testing.T) {
 func TestReserveBuildResourceAware(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
+	reg.SetPlacer(placementWithToken("n1"))
 	// n1 has a 2-core build pool.
 	reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1", BuildCapacity: &routesync.BuildResources{CPU: 2000, Mem: 8 << 30, Storage: 100 << 30}})
 	reg.addNode(buildAckConn(reg, "n1"))
@@ -97,7 +99,7 @@ func TestReserveBuildResourceAware(t *testing.T) {
 	}
 
 	// The first build finishes → releases the pool → a second build now fits.
-	reg.applyBuildEvent(ctx, &routesync.BuildEvent{BuildID: r1.BuildID, Group: "/g", State: "ready", TemplateID: "e2b-img-x"})
+	reg.applyBuildEvent(ctx, "n1", &routesync.BuildEvent{BuildID: r1.BuildID, Group: "/g", State: "ready", TemplateID: "e2b-img-x"})
 	if rec, _, _ := reg.stores.GetBuildInGroup(ctx, "/g", r1.BuildID); rec.occupies() {
 		t.Fatal("a ready build should not occupy the pool")
 	}
@@ -111,6 +113,7 @@ func TestReserveBuildResourceAware(t *testing.T) {
 func TestReserveBuildDefaultResources(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
+	reg.SetPlacer(placementWithToken("n1"))
 	reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"}) // no declared build pool → unconstrained
 	reg.addNode(buildAckConn(reg, "n1"))
 	r1, err := reg.ReserveBuild(ctx, BuildReserveReq{Group: "/g"})
@@ -166,6 +169,7 @@ func TestBuildStoreUsesRouteQuorumAndDoesNotLeakToSandboxList(t *testing.T) {
 func TestReserveBuildReleasesAdmissionOnSendFailure(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
+	reg.SetPlacer(placementWithToken("n1"))
 	reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1", BuildCapacity: &routesync.BuildResources{CPU: 2000}})
 	reg.addNode(&fakeConn{nodeID: "n1", err: errors.New("send failed")})
 
@@ -183,6 +187,7 @@ func TestReserveBuildReleasesAdmissionOnSendFailure(t *testing.T) {
 func TestReserveBuildReleasesAdmissionOnRejectedAck(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
+	reg.SetPlacer(placementWithToken("n1"))
 	reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1", BuildCapacity: &routesync.BuildResources{CPU: 2000}})
 	reject := true
 	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(cmd *routesync.Command) {

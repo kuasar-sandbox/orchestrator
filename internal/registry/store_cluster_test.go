@@ -47,54 +47,6 @@ func TestClusterStoresRouteAndNodeUseLocatedOwners(t *testing.T) {
 	})
 }
 
-func TestClusterStoresCatchUpRepairsEmptyLocalReplica(t *testing.T) {
-	ctx := context.Background()
-	view := clusterstate.MemberView{Version: 1, Members: []string{"a", "b", "c"}}
-	rb, rc := clusterstate.NewMemoryRouteReplica(), clusterstate.NewMemoryRouteReplica()
-	nb, nc := clusterstate.NewMemoryNodeReplica(), clusterstate.NewMemoryNodeReplica()
-	kv := clusterstore.OpenMemory(100)
-	defer kv.Close()
-
-	stores := NewClusterStores(kv, "a", view, 3, 3,
-		map[string]clusterstate.RouteReplica{"b": rb, "c": rc},
-		map[string]clusterstate.NodeReplica{"b": nb, "c": nc})
-
-	route := clusterstate.RouteRecord{
-		Meta:      clusterstate.RecordMeta{Ballot: clusterstate.Ballot{Round: 3, Writer: "seed"}, Rev: 2, UpdatedAt: time.Now()},
-		Group:     "/g",
-		RouteKey:  "rk",
-		SandboxID: "sb-1",
-		State:     clusterstate.RouteReady,
-		NodeID:    "n1",
-	}
-	for _, rep := range []*clusterstate.MemoryRouteReplica{rb, rc} {
-		if ok, err := rep.Accept(ctx, clusterstate.RouteKey("/g", "rk"), route, route.Meta.Ballot); err != nil || !ok {
-			t.Fatalf("seed route accept ok=%v err=%v", ok, err)
-		}
-	}
-	node := clusterstate.NodeRecord{
-		Meta:         clusterstate.RecordMeta{Ballot: clusterstate.Ballot{Round: 4, Writer: "seed"}, Rev: 2, UpdatedAt: time.Now()},
-		NodeID:       "n1",
-		State:        clusterstate.NodeLive,
-		DataEndpoint: "10.0.0.1:8080",
-	}
-	for _, rep := range []*clusterstate.MemoryNodeReplica{nb, nc} {
-		if ok, err := rep.Accept(ctx, "n1", node, node.Meta.Ballot); err != nil || !ok {
-			t.Fatalf("seed node accept ok=%v err=%v", ok, err)
-		}
-	}
-
-	if err := stores.CatchUp(ctx); err != nil {
-		t.Fatalf("CatchUp: %v", err)
-	}
-	if got, found, err := stores.LocalRouteReplica().Read(ctx, clusterstate.RouteKey("/g", "rk")); err != nil || !found || got.SandboxID != "sb-1" {
-		t.Fatalf("local route after catch-up=%+v found=%v err=%v", got, found, err)
-	}
-	if got, found, err := stores.LocalNodeReplica().Read(ctx, "n1"); err != nil || !found || got.DataEndpoint != "10.0.0.1:8080" {
-		t.Fatalf("local node after catch-up=%+v found=%v err=%v", got, found, err)
-	}
-}
-
 func TestClusterStoresJointMembershipWritesBothOwnerSets(t *testing.T) {
 	ctx := context.Background()
 	active := clusterstate.MemberView{Version: 1, Members: []string{"a", "b", "c"}}
@@ -142,7 +94,10 @@ func assertRouteOwnerKeys(t *testing.T, ctx context.Context, owners []string, ke
 		ownerSet[owner] = true
 	}
 	for id, rep := range reps {
-		has := contains(rep.Keys(ctx), key)
+		_, has, err := rep.Read(ctx, key)
+		if err != nil {
+			t.Fatalf("route owner %s read key %q: %v", id, key, err)
+		}
 		if ownerSet[id] && !has {
 			t.Fatalf("route owner %s missing key %q; owners=%v", id, key, owners)
 		}
@@ -156,7 +111,10 @@ func assertRouteOwnersHaveKey(t *testing.T, ctx context.Context, owners []string
 	t.Helper()
 	for _, owner := range owners {
 		rep := reps[owner]
-		if rep == nil || !contains(rep.Keys(ctx), key) {
+		if rep == nil {
+			t.Fatalf("route owner %s missing replica", owner)
+		}
+		if _, found, err := rep.Read(ctx, key); err != nil || !found {
 			t.Fatalf("route owner %s missing key %q; owners=%v", owner, key, owners)
 		}
 	}
@@ -169,7 +127,10 @@ func assertNodeOwnerKeys(t *testing.T, ctx context.Context, owners []string, key
 		ownerSet[owner] = true
 	}
 	for id, rep := range reps {
-		has := contains(rep.Keys(ctx), key)
+		_, has, err := rep.Read(ctx, key)
+		if err != nil {
+			t.Fatalf("node owner %s read key %q: %v", id, key, err)
+		}
 		if ownerSet[id] && !has {
 			t.Fatalf("node owner %s missing key %q; owners=%v", id, key, owners)
 		}
@@ -183,19 +144,13 @@ func assertNodeOwnersHaveKey(t *testing.T, ctx context.Context, owners []string,
 	t.Helper()
 	for _, owner := range owners {
 		rep := reps[owner]
-		if rep == nil || !contains(rep.Keys(ctx), key) {
+		if rep == nil {
+			t.Fatalf("node owner %s missing replica", owner)
+		}
+		if _, found, err := rep.Read(ctx, key); err != nil || !found {
 			t.Fatalf("node owner %s missing key %q; owners=%v", owner, key, owners)
 		}
 	}
-}
-
-func contains(xs []string, want string) bool {
-	for _, x := range xs {
-		if x == want {
-			return true
-		}
-	}
-	return false
 }
 
 func TestRoutingNodeOwnerUsesLinkOwner(t *testing.T) {

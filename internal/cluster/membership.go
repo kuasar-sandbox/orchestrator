@@ -2,10 +2,6 @@ package cluster
 
 import "context"
 
-type NamespaceScanner interface {
-	ListKeys(ctx context.Context, namespace string, fn func(string) error) error
-}
-
 type KeyMove struct {
 	Key      string   `json:"key"`
 	From     []string `json:"from"`
@@ -45,17 +41,6 @@ func PlanHandoff(ctx context.Context, from, to MemberView, ownerCount int, keys 
 		}
 	}
 	return plan, nil
-}
-
-func PlanNamespaceHandoff(ctx context.Context, from, to MemberView, ownerCount int, namespace string, scanner NamespaceScanner) (HandoffPlan, error) {
-	keys := make([]string, 0)
-	if err := scanner.ListKeys(ctx, namespace, func(key string) error {
-		keys = append(keys, key)
-		return nil
-	}); err != nil {
-		return HandoffPlan{FromVersion: from.Version, ToVersion: to.Version, OwnerCount: ownerCount}, err
-	}
-	return PlanHandoff(ctx, from, to, ownerCount, keys)
 }
 
 func diffOwners(oldOwners, newOwners []string) (stable, added, removed []string) {

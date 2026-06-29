@@ -142,7 +142,7 @@ func (r *Registry) NodeListEndpoints(ctx context.Context) ([]Endpoint, error) {
 	if err != nil {
 		return nil, err
 	}
-	return r.ownerUnionEndpoints(ctx, m, clusterstate.NamespaceNodeList, m.Owners.NodeList)
+	return r.jointOwnerEndpoints(ctx, m, clusterstate.NamespaceNodeList, m.Owners.NodeList)
 }
 
 func (r *Registry) ActiveEndpoints(ctx context.Context) ([]Endpoint, error) {
@@ -167,7 +167,7 @@ func (r *Registry) ActiveEndpoints(ctx context.Context) ([]Endpoint, error) {
 	return out, nil
 }
 
-func (r *Registry) ownerUnionEndpoints(ctx context.Context, m clustercfg.MembershipConfig, key string, ownerCount int) ([]Endpoint, error) {
+func (r *Registry) jointOwnerEndpoints(ctx context.Context, m clustercfg.MembershipConfig, key string, ownerCount int) ([]Endpoint, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}

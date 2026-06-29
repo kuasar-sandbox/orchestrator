@@ -3,7 +3,6 @@ package cluster
 import (
 	"context"
 	"errors"
-	"fmt"
 	"sort"
 	"strings"
 	"sync"
@@ -26,7 +25,6 @@ type NodeLink interface {
 	GetNode(ctx context.Context, nodeID string) (NodeRecord, bool, error)
 	PutNode(ctx context.Context, rec NodeRecord, expectRev uint64, ballot Ballot) (NodeRecord, error)
 	DeleteNode(ctx context.Context, nodeID string, expectRev uint64, ballot Ballot) error
-	ListNodes(ctx context.Context, fn func(NodeRecord) error) error
 }
 
 type NodeList interface {
@@ -185,25 +183,6 @@ func (m *MemoryKernel) DeleteNode(ctx context.Context, nodeID string, expectRev 
 	return nil
 }
 
-func (m *MemoryKernel) ListNodes(ctx context.Context, fn func(NodeRecord) error) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	m.mu.RLock()
-	out := make([]NodeRecord, 0, len(m.nodes))
-	for _, rec := range m.nodes {
-		out = append(out, cloneNode(rec))
-	}
-	m.mu.RUnlock()
-	sort.Slice(out, func(i, j int) bool { return out[i].NodeID < out[j].NodeID })
-	for _, rec := range out {
-		if err := fn(rec); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 func (m *MemoryKernel) GetNodeList(ctx context.Context, nodeID string) (NodeListEntry, bool, error) {
 	if err := ctx.Err(); err != nil {
 		return NodeListEntry{}, false, err
@@ -227,42 +206,6 @@ func (m *MemoryKernel) ListNodeList(ctx context.Context, fn func(NodeListEntry) 
 	sort.Slice(out, func(i, j int) bool { return out[i].NodeID < out[j].NodeID })
 	for _, rec := range out {
 		if err := fn(rec); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func (m *MemoryKernel) ListKeys(ctx context.Context, namespace string, fn func(string) error) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	m.mu.RLock()
-	var keys []string
-	switch namespace {
-	case NamespaceRouteLink:
-		keys = make([]string, 0, len(m.routes))
-		for key := range m.routes {
-			keys = append(keys, key)
-		}
-	case NamespaceNodeLink:
-		keys = make([]string, 0, len(m.nodes))
-		for key := range m.nodes {
-			keys = append(keys, key)
-		}
-	case NamespaceNodeList:
-		keys = make([]string, 0, len(m.nodeList))
-		for key := range m.nodeList {
-			keys = append(keys, key)
-		}
-	default:
-		m.mu.RUnlock()
-		return fmt.Errorf("cluster: unknown namespace %q", namespace)
-	}
-	m.mu.RUnlock()
-	sort.Strings(keys)
-	for _, key := range keys {
-		if err := fn(key); err != nil {
 			return err
 		}
 	}
@@ -295,6 +238,8 @@ func cloneNode(in NodeRecord) NodeRecord {
 	in.Labels = cloneStringMap(in.Labels)
 	in.BuildCapacity = cloneBuildResources(in.BuildCapacity)
 	in.BuildAlloc = cloneBuildResources(in.BuildAlloc)
+	in.Sandboxes = cloneNodeSandboxRefs(in.Sandboxes)
+	in.Builds = cloneNodeBuildRefs(in.Builds)
 	return in
 }
 
@@ -302,4 +247,22 @@ func cloneNodeList(in NodeListEntry) NodeListEntry {
 	in.Labels = cloneStringMap(in.Labels)
 	in.BuildCapacity = cloneBuildResources(in.BuildCapacity)
 	return in
+}
+
+func cloneNodeSandboxRefs(in []NodeSandboxRef) []NodeSandboxRef {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]NodeSandboxRef, len(in))
+	copy(out, in)
+	return out
+}
+
+func cloneNodeBuildRefs(in []NodeBuildRef) []NodeBuildRef {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]NodeBuildRef, len(in))
+	copy(out, in)
+	return out
 }

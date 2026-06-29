@@ -3,7 +3,6 @@ package cluster
 import (
 	"context"
 	"errors"
-	"sort"
 	"strconv"
 	"sync"
 	"time"
@@ -19,7 +18,6 @@ type RouteReplica interface {
 	Accept(ctx context.Context, key string, rec RouteRecord, ballot Ballot) (bool, error)
 	Repair(ctx context.Context, key string, rec RouteRecord) error
 	MaxBallot(ctx context.Context, key string) (Ballot, error)
-	Keys(ctx context.Context) []string
 }
 
 type RouteReplicaSlot struct {
@@ -80,37 +78,6 @@ func (q *RouteQuorum) Get(ctx context.Context, group, routeKey string) (RouteRec
 		return RouteRecord{}, false, nil
 	}
 	return best, found, nil
-}
-
-func (q *RouteQuorum) List(ctx context.Context, group string, fn func(RouteRecord) error) error {
-	keys := map[string]bool{}
-	for _, r := range q.replicas {
-		for _, key := range r.replica.Keys(ctx) {
-			g, _ := splitRouteKey(key)
-			if group == "" || g == group {
-				keys[key] = true
-			}
-		}
-	}
-	ordered := make([]string, 0, len(keys))
-	for key := range keys {
-		ordered = append(ordered, key)
-	}
-	sort.Strings(ordered)
-	for _, key := range ordered {
-		g, rk := splitRouteKey(key)
-		rec, found, err := q.Get(ctx, g, rk)
-		if err != nil {
-			return err
-		}
-		if !found {
-			continue
-		}
-		if err := fn(rec); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 func (q *RouteQuorum) CAS(ctx context.Context, group, routeKey string, expectRev uint64, propose RouteProposal) (RouteRecord, error) {
@@ -474,17 +441,18 @@ func (r *MemoryRouteReplica) MaxBallot(ctx context.Context, key string) (Ballot,
 	return max, nil
 }
 
-func (r *MemoryRouteReplica) Keys(ctx context.Context) []string {
+func (r *MemoryRouteReplica) ListGroup(ctx context.Context, group string) ([]RouteRecord, error) {
 	if err := ctx.Err(); err != nil {
-		return nil
+		return nil, err
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	keys := make([]string, 0, len(r.accepted))
+	out := make([]RouteRecord, 0)
 	for key, rec := range r.accepted {
-		if rec.State != RouteDead {
-			keys = append(keys, key)
+		g, _ := splitRouteKey(key)
+		if g == group && rec.State != RouteDead {
+			out = append(out, cloneRoute(rec))
 		}
 	}
-	return keys
+	return out, nil
 }

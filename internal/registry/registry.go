@@ -83,6 +83,8 @@ type Registry struct {
 
 	localNodeOwner NodeOwner
 	nodeOwner      NodeOwner
+	deadAfter      time.Duration
+	reaperCtx      context.Context
 
 	scalerMu        sync.Mutex
 	scaleReadyLabel string
@@ -125,10 +127,10 @@ type ReserveResult struct {
 	DataEndpoint string `json:"data_endpoint"`
 }
 
-// New builds a Registry. If placer is nil a built-in least-loaded placer is used.
+// New builds a Registry. Production callers set a scale_link placer explicitly.
 func New(stores *Stores, placer Placer, parkTimeout time.Duration, log *slog.Logger) *Registry {
 	if placer == nil {
-		placer = &builtinPlacer{stores: stores}
+		placer = noPlacer{}
 	}
 	if parkTimeout <= 0 {
 		parkTimeout = 30 * time.Second
@@ -334,6 +336,9 @@ func (r *Registry) rollbackReserve(group, routeKey string, orig *SandboxRecord, 
 		_, _ = r.stores.PutSandbox(ctx, orig)
 	} else {
 		_ = r.stores.DeleteSandbox(ctx, group, routeKey)
+		if cur.NodeID != "" {
+			_ = r.stores.RemoveNodeSandboxRef(ctx, cur.NodeID, group, routeKey, cur.SID)
+		}
 		r.dropSID(cur.SID)
 	}
 }
@@ -353,6 +358,7 @@ func (r *Registry) startReserve(ctx context.Context, group, routeKey string, rec
 		if _, ok, err := r.stores.CASSandbox(ctx, &reserved, rev); err != nil || !ok {
 			return cas(err, ok)
 		}
+		_ = r.stores.AddNodeSandboxRef(ctx, rec.NodeID, clusterstate.NodeSandboxRef{Group: group, RouteKey: routeKey, SandboxID: rec.SID})
 		ccmd := &routesync.Command{CmdID: newID(), Kind: routesync.CmdConnect, SID: rec.SID}
 		r.trackCmd(ccmd.CmdID, flightKey(group, routeKey))
 		if err := conn.send(ccmd); err != nil {
@@ -412,6 +418,7 @@ func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, o
 			}
 			return ErrNoNode
 		}
+		_ = r.stores.AddNodeSandboxRef(ctx, nodeID, clusterstate.NodeSandboxRef{Group: group, RouteKey: routeKey, SandboxID: sid})
 
 		cmd := &routesync.Command{
 			CmdID: newID(), Kind: routesync.CmdCreate, SID: sid, Group: group, RouteKey: routeKey,
@@ -421,6 +428,7 @@ func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, o
 		r.trackCmd(cmd.CmdID, flightKey(group, routeKey))
 		if err := conn.send(cmd); err != nil {
 			_ = r.stores.DeleteSandbox(ctx, group, routeKey)
+			_ = r.stores.RemoveNodeSandboxRef(ctx, nodeID, group, routeKey, sid)
 			return err
 		}
 		return nil
@@ -524,6 +532,7 @@ func (r *Registry) applyRoute(ctx context.Context, nodeID string, e *routesync.R
 	}
 	if e.State == routesync.StateDead {
 		r.applyDelete(ctx, e.Group, e.RouteKey)
+		_ = r.stores.RemoveNodeSandboxRef(ctx, nodeID, e.Group, e.RouteKey, e.SandboxID)
 		r.dropSID(e.SandboxID)
 		return
 	}
@@ -552,6 +561,7 @@ func (r *Registry) applyRoute(ctx context.Context, nodeID string, e *routesync.R
 	}
 	if !found || (cur.SID != "" && cur.SID != e.SandboxID) || (cur.NodeID != "" && cur.NodeID != nodeID) {
 		r.deleteOrphanSandbox(ctx, nodeID, e.SandboxID, e.Group, e.RouteKey)
+		_ = r.stores.RemoveNodeSandboxRef(ctx, nodeID, e.Group, e.RouteKey, e.SandboxID)
 		return
 	}
 	if rec.TemplateID == "" {
@@ -564,6 +574,7 @@ func (r *Registry) applyRoute(ctx context.Context, nodeID string, e *routesync.R
 		r.log.Warn("registry: put sandbox route", "group", e.Group, "err", err)
 		return
 	}
+	_ = r.stores.AddNodeSandboxRef(ctx, nodeID, clusterstate.NodeSandboxRef{Group: e.Group, RouteKey: e.RouteKey, SandboxID: e.SandboxID})
 	r.indexSID(e.SandboxID, e.Group, e.RouteKey)
 	if rec.State == StateReady {
 		r.finish(flightKey(e.Group, e.RouteKey), &ReserveResult{NodeID: nodeID, SID: e.SandboxID, AccessToken: rec.AccessToken, DataEndpoint: r.nodeDataEndpoint(ctx, nodeID)}, nil)
@@ -584,7 +595,11 @@ func (r *Registry) applyDelete(ctx context.Context, group, routeKey string) {
 	if group == "" || routeKey == "" {
 		return
 	}
+	rec, _, found, _ := r.stores.GetSandbox(ctx, group, routeKey)
 	_ = r.stores.DeleteSandbox(ctx, group, routeKey)
+	if found {
+		_ = r.stores.RemoveNodeSandboxRef(ctx, rec.NodeID, group, routeKey, rec.SID)
+	}
 }
 
 func (r *Registry) indexSID(sid, group, routeKey string) {
@@ -595,17 +610,25 @@ func (r *Registry) indexSID(sid, group, routeKey string) {
 
 // applyDeleteBySID converges a route delete (the route stream deletes by sid; the
 // registry keys sandboxes by (group, route_key), so it resolves via the index).
-func (r *Registry) applyDeleteBySID(ctx context.Context, sid string) {
+func (r *Registry) applyDeleteBySID(ctx context.Context, nodeID, sid string) {
 	r.mu.Lock()
 	kp, ok := r.sidKeys[sid]
 	r.mu.Unlock()
-	if !ok {
+	if ok {
+		r.mu.Lock()
+		delete(r.sidKeys, sid)
+		r.mu.Unlock()
+		r.applyDelete(ctx, kp[0], kp[1])
 		return
 	}
-	r.mu.Lock()
-	delete(r.sidKeys, sid)
-	r.mu.Unlock()
-	r.applyDelete(ctx, kp[0], kp[1])
+	if rec, found, err := r.stores.GetNode(ctx, nodeID); err == nil && found {
+		for _, ref := range rec.Sandboxes {
+			if ref.SandboxID == sid {
+				r.applyDelete(ctx, ref.Group, ref.RouteKey)
+				return
+			}
+		}
+	}
 }
 
 // finish satisfies the single-flight call for key (idempotent — first wins). It
@@ -670,11 +693,16 @@ func (r *Registry) addNode(c nodeConn) {
 }
 
 func (r *Registry) removeNode(c nodeConn) {
+	removed := false
 	r.mu.Lock()
 	if r.nodes[c.id()] == c {
 		delete(r.nodes, c.id())
+		removed = true
 	}
 	r.mu.Unlock()
+	if removed {
+		r.scheduleNodeReap(c.id())
+	}
 }
 
 // updateNodeRegister upserts the node table row from a node's register frame.
@@ -723,95 +751,90 @@ func (r *Registry) updateNodeResume(ctx context.Context, nodeID, token string) {
 	_ = r.stores.PutNodeRuntime(ctx, rec)
 }
 
-// RunReaper periodically sweeps dead nodes until ctx is cancelled (cluster.md
-// §11); cluster-ctl registry runs it in the background.
+// RunReaper configures event-driven dead-node cleanup. A node-link disconnect
+// schedules cleanup for that node only; registry never scans node shards globally.
 func (r *Registry) RunReaper(ctx context.Context, deadAfter time.Duration) {
 	if deadAfter <= 0 {
 		deadAfter = 30 * time.Second
 	}
-	tick := deadAfter / 3
-	if tick < time.Second {
-		tick = time.Second
+	r.mu.Lock()
+	r.reaperCtx = ctx
+	r.deadAfter = deadAfter
+	r.mu.Unlock()
+	<-ctx.Done()
+}
+
+func (r *Registry) scheduleNodeReap(nodeID string) {
+	r.mu.Lock()
+	ctx := r.reaperCtx
+	deadAfter := r.deadAfter
+	r.mu.Unlock()
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	t := time.NewTicker(tick)
-	defer t.Stop()
-	for {
+	if deadAfter <= 0 {
+		deadAfter = 30 * time.Second
+	}
+	go func() {
+		timer := time.NewTimer(deadAfter)
+		defer timer.Stop()
 		select {
 		case <-ctx.Done():
 			return
-		case <-t.C:
-			r.sweepDeadNodes(ctx, deadAfter)
+		case <-timer.C:
+			r.sweepNode(ctx, nodeID, deadAfter)
 		}
-	}
+	}()
 }
 
-// sweepDeadNodes resets the sandboxes of every disconnected node whose last
-// heartbeat predates node_dead_after, then removes the node record (cluster.md
-// §11): READY/PAUSED (node-local snapshot, lost with the node) → reset so the
-// next Reserve re-places; a RESERVED row is reset only when no in-flight Reserve
-// owns it, so the sweep can't delete a reservation under a concurrent reserve on
-// a reconnect blip.
-func (r *Registry) sweepDeadNodes(ctx context.Context, deadAfter time.Duration) {
-	cutoff := time.Now().Add(-deadAfter).Unix()
-	var dead []string
-	_ = r.stores.RangeNodes(ctx, func(n *NodeRecord) error {
-		if _, connected := r.node(n.NodeID); connected {
-			return nil // a live channel is not dead (a quiet water level is fine)
-		}
-		if n.LastHeartbeatUnix > 0 && n.LastHeartbeatUnix < cutoff {
-			dead = append(dead, n.NodeID)
-		}
-		return nil
-	})
-	if len(dead) == 0 {
+// sweepNode resets one disconnected node's route/build refs from that node shard.
+func (r *Registry) sweepNode(ctx context.Context, nodeID string, deadAfter time.Duration) {
+	if nodeID == "" {
 		return
 	}
-	deadSet := make(map[string]bool, len(dead))
-	for _, id := range dead {
-		deadSet[id] = true
+	if _, connected := r.node(nodeID); connected {
+		return
 	}
-	// Collect first (the Range callback is read-only), then mutate.
-	var reset []*SandboxRecord
-	_ = r.stores.RangeAllSandboxes(ctx, func(s *SandboxRecord) error {
-		if !deadSet[s.NodeID] {
-			return nil
+	rec, found, err := r.stores.GetNode(ctx, nodeID)
+	if err != nil || !found {
+		return
+	}
+	cutoff := time.Now().Add(-deadAfter).Unix()
+	if rec.LastHeartbeatUnix <= 0 || rec.LastHeartbeatUnix >= cutoff {
+		return
+	}
+	reset := 0
+	for _, ref := range append([]clusterstate.NodeSandboxRef(nil), rec.Sandboxes...) {
+		s, _, found, err := r.stores.GetSandbox(ctx, ref.Group, ref.RouteKey)
+		if err != nil || !found || s.NodeID != nodeID {
+			continue
 		}
-		switch s.State {
-		case StateReady, StatePaused:
-			reset = append(reset, &SandboxRecord{Group: s.Group, RouteKey: s.RouteKey, SID: s.SID})
-		case StateReserved:
-			// Owned by an in-flight single-flight; only sweep a stale reservation
-			// (no live reserve), never one a concurrent Reserve still holds.
-			if !r.hasInflight(flightKey(s.Group, s.RouteKey)) {
-				reset = append(reset, &SandboxRecord{Group: s.Group, RouteKey: s.RouteKey, SID: s.SID})
-			}
+		shouldReset := s.State == StateReady || s.State == StatePaused
+		if s.State == StateReserved && !r.hasInflight(flightKey(s.Group, s.RouteKey)) {
+			shouldReset = true
 		}
-		return nil
-	})
-	for _, s := range reset {
+		if !shouldReset {
+			continue
+		}
 		_ = r.stores.DeleteSandbox(ctx, s.Group, s.RouteKey)
+		_ = r.stores.RemoveNodeSandboxRef(ctx, nodeID, s.Group, s.RouteKey, s.SID)
 		r.dropSID(s.SID)
+		reset++
 	}
-	// A dead node's in-flight builds go to error (§11) — their reservation releases
-	// (the headroom sum counts only registered/building), and the e2b client sees
-	// the failure via the router's build status.
-	var deadBuilds []*BuildRecord
-	_ = r.stores.RangeBuilds(ctx, func(b *BuildRecord) error {
-		if deadSet[b.NodeID] && b.occupies() {
-			cp := *b
-			deadBuilds = append(deadBuilds, &cp)
+	deadBuilds := 0
+	for _, ref := range append([]clusterstate.NodeBuildRef(nil), rec.Builds...) {
+		b, found, err := r.stores.GetBuildInGroup(ctx, ref.Group, ref.BuildID)
+		if err != nil || !found || b.NodeID != nodeID || !b.occupies() {
+			continue
 		}
-		return nil
-	})
-	for _, b := range deadBuilds {
 		b.State, b.Reason = BuildError, "node disconnected"
 		_ = r.stores.PutBuild(ctx, b)
+		_ = r.stores.RemoveNodeBuildRef(ctx, nodeID, b.Group, b.BuildID)
 		r.releaseBuildAdmission(b.BuildID)
+		deadBuilds++
 	}
-	for _, id := range dead {
-		_ = r.stores.DeleteNode(ctx, id)
-	}
-	r.log.Warn("registry: swept dead nodes", "nodes", dead, "sandboxes_reset", len(reset), "builds_errored", len(deadBuilds))
+	_ = r.stores.DeleteNode(ctx, nodeID)
+	r.log.Warn("registry: swept dead node", "node", nodeID, "sandboxes_reset", reset, "builds_errored", deadBuilds)
 }
 
 func (r *Registry) dropSID(sid string) {

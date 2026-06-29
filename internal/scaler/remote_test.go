@@ -71,7 +71,7 @@ func TestScalerDirectPlace(t *testing.T) {
 	t.Fatal("unplaceable group never returned ErrNoNode")
 }
 
-func TestScalerConnectsAllRegistryMembers(t *testing.T) {
+func TestScalerUsesSingleNodeListSourceAndRegistersAllRegistryMembers(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	discard := slog.New(slog.NewTextHandler(io.Discard, nil))
 
@@ -94,13 +94,13 @@ func TestScalerConnectsAllRegistryMembers(t *testing.T) {
 	go svc.RegisterLoop(ctx, "s1", scalerSrv.URL, "")
 
 	for i := 0; i < 300; i++ {
-		if len(svc.nodes.values()) == 2 {
+		if len(svc.nodes.values()) == 1 {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	if got := len(svc.nodes.values()); got != 2 {
-		t.Fatalf("merged node_list size=%d, want 2", got)
+	if got := len(svc.nodes.values()); got != 1 {
+		t.Fatalf("single-source node_list size=%d, want 1", got)
 	}
 
 	for name, placer := range map[string]registry.Placer{

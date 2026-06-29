@@ -70,7 +70,6 @@ func runRegistry(args []string, log *slog.Logger) error {
 	// Dead-node sweep (cluster.md §11): reset the sandboxes of nodes whose
 	// node-link dropped and whose last heartbeat predates node_dead_after.
 	go reg.RunReaper(ctx, cfg.NodeLink.NodeDeadDur())
-	go runRegistryCatchUp(ctx, stores, 5*time.Second, log)
 	// Key predistribution + lease renewal to each group's allocation set (§7.6).
 	go reg.RunKeyDistributor(ctx, time.Hour)
 
@@ -96,28 +95,6 @@ func runRegistry(args []string, log *slog.Logger) error {
 		"node_link_split", cfg.NodeLinkSplit(),
 		"membership_active", cfg.Membership.Active)
 	return serveClusterHTTP(ctx, "member", cfg.ControlListen(), cfg.Member.TLS, controlMux, log)
-}
-
-func runRegistryCatchUp(ctx context.Context, stores *registry.Stores, interval time.Duration, log *slog.Logger) {
-	if interval <= 0 {
-		interval = 5 * time.Second
-	}
-	timer := time.NewTimer(0)
-	defer timer.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-timer.C:
-			catchCtx, cancel := context.WithTimeout(ctx, interval)
-			err := stores.CatchUp(catchCtx)
-			cancel()
-			if err != nil && ctx.Err() == nil {
-				log.Warn("registry catch-up", "err", err)
-			}
-			timer.Reset(interval)
-		}
-	}
 }
 
 type registryRuntimeConfig struct {
@@ -286,7 +263,7 @@ func buildRegistryTopology(cfg *clustercfg.RegistryConfig) ([]clusterstate.Membe
 	nodeReplicas := map[string]clusterstate.NodeReplica{}
 	nodeListReplicas := map[string]registry.NodeListReplica{}
 	nodeOwners := map[string]registry.NodeOwner{}
-	for _, member := range unionMembershipMembers(versions) {
+	for _, member := range jointMembershipMembers(versions) {
 		if member.ID == "" || member.ID == cfg.Member.ID {
 			continue
 		}
@@ -303,7 +280,7 @@ func buildRegistryTopology(cfg *clustercfg.RegistryConfig) ([]clusterstate.Membe
 	return views, routeReplicas, nodeReplicas, nodeListReplicas, nodeOwners, nil
 }
 
-func unionMembershipMembers(versions []clustercfg.MembershipVersion) []clustercfg.MembershipMember {
+func jointMembershipMembers(versions []clustercfg.MembershipVersion) []clustercfg.MembershipMember {
 	seen := map[string]bool{}
 	var out []clustercfg.MembershipMember
 	for _, version := range versions {

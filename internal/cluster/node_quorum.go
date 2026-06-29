@@ -2,7 +2,6 @@ package cluster
 
 import (
 	"context"
-	"sort"
 	"sync"
 	"time"
 )
@@ -15,7 +14,6 @@ type NodeReplica interface {
 	Accept(ctx context.Context, nodeID string, rec NodeRecord, ballot Ballot) (bool, error)
 	Repair(ctx context.Context, nodeID string, rec NodeRecord) error
 	MaxBallot(ctx context.Context, nodeID string) (Ballot, error)
-	Keys(ctx context.Context) []string
 }
 
 type NodeReplicaSlot struct {
@@ -75,33 +73,6 @@ func (q *NodeQuorum) Get(ctx context.Context, nodeID string) (NodeRecord, bool, 
 		return NodeRecord{}, false, nil
 	}
 	return best, found, nil
-}
-
-func (q *NodeQuorum) List(ctx context.Context, fn func(NodeRecord) error) error {
-	keys := map[string]bool{}
-	for _, r := range q.replicas {
-		for _, key := range r.replica.Keys(ctx) {
-			keys[key] = true
-		}
-	}
-	ordered := make([]string, 0, len(keys))
-	for key := range keys {
-		ordered = append(ordered, key)
-	}
-	sort.Strings(ordered)
-	for _, key := range ordered {
-		rec, found, err := q.Get(ctx, key)
-		if err != nil {
-			return err
-		}
-		if !found {
-			continue
-		}
-		if err := fn(rec); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 func (q *NodeQuorum) CAS(ctx context.Context, nodeID string, expectRev uint64, propose NodeProposal) (NodeRecord, error) {
@@ -419,19 +390,4 @@ func (r *MemoryNodeReplica) MaxBallot(ctx context.Context, nodeID string) (Ballo
 		max = rec.Meta.Ballot
 	}
 	return max, nil
-}
-
-func (r *MemoryNodeReplica) Keys(ctx context.Context) []string {
-	if err := ctx.Err(); err != nil {
-		return nil
-	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	keys := make([]string, 0, len(r.accepted))
-	for key, rec := range r.accepted {
-		if rec.State != NodeDead {
-			keys = append(keys, key)
-		}
-	}
-	return keys
 }

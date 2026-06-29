@@ -125,7 +125,10 @@ func (r *Registry) dropGroupKeyLeases(group string, ops *[]keyOp) {
 func (r *Registry) liveAllocationSet(nodes map[string]bool) map[string]bool {
 	set := map[string]bool{}
 	for nodeID := range nodes {
-		if _, live := r.node(nodeID); live {
+		if r.nodeOwner == nil {
+			continue
+		}
+		if _, found, err := r.nodeOwner.Runtime(context.Background(), nodeID); err == nil && found {
 			set[nodeID] = true
 		}
 	}

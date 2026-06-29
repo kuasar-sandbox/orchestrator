@@ -4,8 +4,9 @@ import "context"
 
 type RouteReplicaMap map[string]RouteReplica
 
-// SyncRouteHandoff pre-syncs moved route_link keys to their added owners. It is
-// the in-memory equivalent of learner catch-up before a membership flip.
+// SyncRouteHandoff pre-syncs explicitly supplied route_link keys to their added
+// owners before a membership flip. The caller owns key discovery; registry
+// shards never enumerate unrelated keys.
 func SyncRouteHandoff(ctx context.Context, plan HandoffPlan, replicas RouteReplicaMap) error {
 	for _, move := range plan.Moves {
 		if err := ctx.Err(); err != nil {

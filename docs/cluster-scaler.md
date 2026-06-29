@@ -37,8 +37,8 @@ cluster-ctl scaler import --config /etc/cluster-ctl/scaler.yaml -i groups.jsonl
 
 registry 侧的 `scale_link.scaler_replica_count` 控制每个 group 的 scaler failover 候选数量。
 `scale_link` 不再是 registry reverse session。scaler 通过 registry membership 得到 active / next
-registry 成员、node_list owner set 与当前 registry label,向每个 registry 成员注册 ready 状态,订阅
-node_list owners 的 WATCH_LIST,并在本地 API 提供:
+registry 成员、node_list owner 候选与当前 registry label,向每个 registry 成员注册 ready 状态,并始终只
+从一个 node_list owner 订阅 WATCH_LIST;断线或 membership 变化后切换到下一候选。scaler 在本地 API 提供:
 
 ```text
 POST /scale-link/place
@@ -79,15 +79,16 @@ node_list 由 registry 的 node owner 汇总低频节点字段:
 
 WATCH_LIST 语义:
 
-1. scaler 按 active / next registry membership 订阅 node_list owner 的 WATCH_LIST。
+1. scaler 按 active / next registry membership 得到 node_list owner 候选,但任一时刻只消费其中一个 owner
+   的完整 WATCH_LIST。
 2. 首帧为 snapshot/reset,随后 delta,最后以 bookmark 标记初始视图完整。
 3. watch token 编入 membership label;label 变化或 token fingerprint 不匹配时全量重订。
 4. 高频负载不在该流中传播;普通 heartbeat 只更新 node_link,不会触发 node_list 事件。
 5. draining 变化和粗粒度 liveness 刷新更新 node_list。
 
-scaler 本地按 `node_id` 合并多个 node_list owner 的 WATCH_LIST 源。同一 node 出现在多个源时,取
-`last_heartbeat_unix` 最新的记录。首版 ready 门槛是 node_list owner 源数量的 `N-1` 个完成
-reset/bookmark,N=1 时要求 1 个源;这与 node_list owner set 运行期只容忍单成员故障的目标一致。
+node_list owner 分片内全复制,所以 scaler 不需要也不能把多个 owner 的结果做片间合并。首版 ready 门槛
+是一个 active node_list WATCH_LIST 完成 reset/bookmark;当前 owner 断线时,scaler 清空该源视图并 failover
+到另一个候选 owner 重新 snapshot。
 
 ## 6. Scale-link 成员域
 
@@ -100,7 +101,7 @@ scaler 启动后拉取 registry membership,获得 active label,然后周期性�
 scaler ready 的条件:
 
 - 已拉取当前 registry membership。
-- 必需数量的 node_list owner 源已完成 reset/bookmark。
+- 一个 active node_list WATCH_LIST 已完成 reset/bookmark。
 - group import generation 达到当前要求。
 - provider 可用。
 
@@ -171,7 +172,7 @@ scaler 主管 key allocation 决策:
 | 事件 | 行为 |
 |---|---|
 | scaler 崩溃 | registry 对该 group failover 到下一个 ready scaler;热路径不受影响 |
-| WATCH_LIST 断线 | 低于必需 ready 源时 scaler not-ready;否则继续服务并对断线源全量重订 |
+| WATCH_LIST 断线 | scaler 清空 node_list 视图并 failover 到另一个 owner 全量重订;完成 bookmark 前 not-ready |
 | provider 不可用 | scaler 标记 not-ready 或 Place 返回不可用 |
 | node labels 旧 | node owner admission/create 兜底拒绝 |
 | key 投递失败 | create/build 在 node 侧 reject,route owner 重调度或返回失败 |

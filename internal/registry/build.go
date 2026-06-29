@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	clusterstate "github.com/kuasar-sandbox/sandbox-orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/routesync"
 )
 
@@ -73,6 +74,7 @@ func (r *Registry) ReserveBuild(ctx context.Context, req BuildReserveReq) (*Buil
 			r.releaseBuildAdmission(buildID)
 			return nil, err
 		}
+		_ = r.stores.AddNodeBuildRef(ctx, id, clusterstate.NodeBuildRef{Group: req.Group, BuildID: buildID})
 		nodeID = id
 		cmd := &routesync.Command{
 			CmdID: newID(), Kind: routesync.CmdBuildRegister, Group: req.Group,
@@ -82,6 +84,7 @@ func (r *Registry) ReserveBuild(ctx context.Context, req BuildReserveReq) (*Buil
 		ack, err := r.sendAndWait(ctx, conn, cmd, buildRegisterAckTimeout)
 		if err != nil || ack.Status != routesync.AckAccepted {
 			_ = r.stores.DeleteBuild(ctx, req.Group, buildID) // roll back the reservation
+			_ = r.stores.RemoveNodeBuildRef(ctx, id, req.Group, buildID)
 			r.releaseBuildAdmission(buildID)
 			if attempt == 0 {
 				continue
@@ -112,37 +115,18 @@ func (r *Registry) releaseBuildAdmission(buildID string) {
 	}
 }
 
-// buildHeadroom reports whether nodeID can fit want given its declared build pool
-// (NodeRecord.BuildCapacity) minus the sum of RESERVED/building builds on it (the
-// registry-authoritative occupancy, §7.5). A node with no declared pool fits.
-func (r *Registry) buildHeadroom(ctx context.Context, nodeID string, want *routesync.BuildResources) bool {
-	node, found, err := r.stores.GetNode(ctx, nodeID)
-	if err != nil || !found || node.BuildCapacity == nil {
-		return found && err == nil // no declared pool → unconstrained
-	}
-	var usedCPU int
-	var usedMem, usedStor int64
-	_ = r.stores.RangeBuilds(ctx, func(b *BuildRecord) error {
-		if b.NodeID == nodeID && b.occupies() && b.Resources != nil {
-			usedCPU += b.Resources.CPU
-			usedMem += b.Resources.Mem
-			usedStor += b.Resources.Storage
-		}
-		return nil
-	})
-	cap := node.BuildCapacity
-	return usedCPU+want.CPU <= cap.CPU && usedMem+want.Mem <= cap.Mem && usedStor+want.Storage <= cap.Storage
-}
-
 // applyBuildEvent converges a build's state from a node's build event (§5.1): it
 // updates the BuildStore (releasing the reservation on a terminal state, since the
 // headroom sum counts only registered/building builds).
-func (r *Registry) applyBuildEvent(ctx context.Context, e *routesync.BuildEvent) {
+func (r *Registry) applyBuildEvent(ctx context.Context, nodeID string, e *routesync.BuildEvent) {
 	if e.Group == "" || e.BuildID == "" {
 		return
 	}
 	rec, found, err := r.stores.GetBuildInGroup(ctx, e.Group, e.BuildID)
 	if err != nil || !found {
+		return
+	}
+	if rec.NodeID != "" && nodeID != "" && rec.NodeID != nodeID {
 		return
 	}
 	rec.State = BuildState(e.State)
@@ -153,6 +137,7 @@ func (r *Registry) applyBuildEvent(ctx context.Context, e *routesync.BuildEvent)
 	_ = r.stores.PutBuild(ctx, rec)
 	if !rec.occupies() {
 		r.releaseBuildAdmission(rec.BuildID)
+		_ = r.stores.RemoveNodeBuildRef(ctx, rec.NodeID, rec.Group, rec.BuildID)
 	}
 }
 

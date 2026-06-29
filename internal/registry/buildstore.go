@@ -60,32 +60,6 @@ func (s *Stores) DeleteBuild(ctx context.Context, group, buildID string) error {
 	return s.DeleteSandbox(ctx, group, buildRouteKey(buildID))
 }
 
-// RangeBuilds streams every build row across groups (placement headroom accounting
-// + the dead-node build→error sweep).
-func (s *Stores) RangeBuilds(ctx context.Context, fn func(*BuildRecord) error) error {
-	for _, key := range s.routeKeys(ctx) {
-		group, routeKey := splitRouteStorageKey(key)
-		if !isBuildRouteKey(routeKey) {
-			continue
-		}
-		rec, _, found, err := s.GetSandbox(ctx, group, routeKey)
-		if err != nil {
-			return err
-		}
-		if !found {
-			continue
-		}
-		b := buildRecordFromSandbox(rec)
-		if b.BuildID == "" {
-			b.BuildID = buildIDFromRouteKey(routeKey)
-		}
-		if err := fn(b); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 func buildRecordFromSandbox(rec *SandboxRecord) *BuildRecord {
 	if rec == nil {
 		return nil
