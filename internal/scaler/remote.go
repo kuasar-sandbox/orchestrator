@@ -208,7 +208,7 @@ func (s *Service) ServeScaleLink(mux *http.ServeMux) {
 }
 
 func (s *Service) ImportGroups(groups []clusterstate.SandboxGroupRecord) {
-	s.groups.replace(groups)
+	s.groups.upsert(groups)
 }
 
 func (s *Service) servePlace(w http.ResponseWriter, req *http.Request) {
@@ -235,7 +235,7 @@ func (s *Service) serveGroupImport(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	s.groups.replace(groups)
+	s.groups.upsert(groups)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(sum)
 }
@@ -296,11 +296,11 @@ func (s *Service) RegisterLoopDynamic(ctx context.Context, id, advertise string,
 }
 
 // answer computes a placement for a reverse request over the local view. It
-// returns NoNode until both views have synced (never places over a partial node
-// set / missing selectors → blast-radius violation) or when nothing is eligible.
+// requires a complete node_list snapshot, then resolves only the requested group;
+// there is no global "all groups imported" readiness gate.
 func (s *Service) answer(req *routesync.PlaceReq) *routesync.PlaceResult {
 	res := &routesync.PlaceResult{ReqID: req.ReqID}
-	if !s.nodes.ready() || !s.groups.ready() {
+	if !s.nodes.ready() {
 		res.NoNode = true
 		return res
 	}
@@ -379,7 +379,7 @@ func (s *Service) reconcileKeyAllocations(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			if !s.nodes.ready() || !s.groups.ready() {
+			if !s.nodes.ready() {
 				continue
 			}
 			nodes := s.nodes.values()

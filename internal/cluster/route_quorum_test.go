@@ -153,6 +153,30 @@ func TestRouteQuorumReadRepair(t *testing.T) {
 	}
 }
 
+func TestRouteRepairRaisesPromiseAndRejectsLowerAccept(t *testing.T) {
+	ctx := context.Background()
+	rep := NewMemoryRouteReplica()
+	key := RouteKey("/g", "rk")
+	high := RouteRecord{
+		Meta:  RecordMeta{Ballot: Ballot{Round: 9, Writer: "repair"}, Rev: 3},
+		Group: "/g", RouteKey: "rk", SandboxID: "high", State: RouteReady,
+	}
+	if err := rep.Repair(ctx, key, high); err != nil {
+		t.Fatal(err)
+	}
+	low := RouteRecord{
+		Meta:  RecordMeta{Ballot: Ballot{Round: 4, Writer: "late"}, Rev: 2},
+		Group: "/g", RouteKey: "rk", SandboxID: "low", State: RouteReserved,
+	}
+	if ok, err := rep.Accept(ctx, key, low, low.Meta.Ballot); err != nil || ok {
+		t.Fatalf("lower accept after repair ok=%v err=%v, want rejected", ok, err)
+	}
+	got, found, err := rep.Read(ctx, key)
+	if err != nil || !found || got.SandboxID != "high" || got.Meta.Ballot != high.Meta.Ballot {
+		t.Fatalf("repair value was overwritten: found=%v err=%v got=%+v", found, err, got)
+	}
+}
+
 func TestRouteJointQuorumRequiresEveryOwnerSet(t *testing.T) {
 	ctx := context.Background()
 	a := &flakyRouteReplica{RouteReplica: NewMemoryRouteReplica()}

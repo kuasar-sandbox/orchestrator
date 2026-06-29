@@ -241,9 +241,10 @@ allocation;node_link 由 node 连接、心跳和事件触达;node_list 由 node-
 
 ### 7.2 route_link / group
 
-scaler 的全量 group import 是 group/key allocation 的事实源。scaler 不复制 route 数据。route/build 执行态
-不做跨 group promoter;后续同 group 请求、node 上报和 group-scoped list/export 会通过 quorum read-repair
-补齐该 group 的 owner 副本。
+scaler 的 group provider/importer 是 group/key allocation 的事实源。导入是 upsert + TTL/tombstone 语义,
+缺失 group 不构成删除;过期或 tombstone 才会停止参与 Place 和 key allocation。scaler 不复制 route 数据。
+route/build 执行态不做跨 group promoter;后续同 group 请求、node 上报和 group-scoped list/export 会通过
+quorum read-repair 补齐该 group 的 owner 副本。
 
 provider 删除 group 时不能直接从 import 中消失;必须以 tombstone/draining group 形式继续出现,直到 registry
 确认该 group 没有活动 route/build 执行态。
@@ -258,10 +259,12 @@ route owner 内部维护按 group 分开的本地 watch log。这个 watch 只�
 
 ### 7.3 node_list
 
-node_list 不作为真相源迁移。node-link 连接持有者在 register、draining 变化和低频 liveness refresh 时,
-把 node_link 的低频投影写入当前 node_list owner set。node_list owner 之间持完整目录副本和 watch log;不设计
-后台从 node_link 扫描重建 node_list 的第二条事实传播路径。watch token 编入 membership label;label 变化时
-scaler 重新订阅 node_list owner set 并 reset + full snapshot。新 owner 通过 node-link 持有者的持续低频刷新补齐目录。
+node_list 是固定 namespace 的逻辑分片:`LocateN("node_list",M)` 得到 owner set,分片内每个 owner 持完整目录。
+node-link 连接持有者在 register、draining 变化和低频 liveness refresh 时,把 node_link 的低频投影以
+无主 CAS 写入当前 node_list owner set。owner 本地副本 accept/repair 会触发 WATCH_LIST 事件;本地视图未
+ready 时,只能从同一 node_list owner set 做 list + repair,不能跨 node shard 扫描,也不从 node_link
+重建第二条事实传播路径。watch token 编入 membership label;label 变化时 scaler 重新订阅 node_list owner
+set 并 reset + full snapshot。
 
 ## 8. Route 模型
 
@@ -309,6 +312,7 @@ Node 连接 registry 后按 `LocateN(node_id,N)` 归属 node owner set。node �
 - 全量 sandbox 清单和增量事件。
 - build 状态事件。
 - labels、runtime_digest、build_capacity、draining、粗粒度 liveness。
+- `manifest_keys` desired cache,由 key allocation 写入 node_link owner set;实际下发由 node-link 心跳维系刷新。
 - 高频水位保留在 node_link owner 本地;node_list 是独立低频投影,普通 heartbeat 不触发 WATCH_LIST 扇出。
 
 增量订阅的 rev 是字符串,格式由 node owner/node 私有约定,推荐编码为 `source_fingerprint:seq`。
@@ -369,7 +373,7 @@ access_token = MAC(auth_key, sandbox_id)
 runtime/template hints
 ```
 
-registry 根据返回值做 node owner admission、key_put/key_drop、create/connect。registry 不解析 provider。
+registry 根据返回值做 node owner admission、node_link key cache 更新、create/connect。registry 不解析 provider。
 
 ## 12. 密钥与鉴权
 
@@ -385,8 +389,9 @@ group 有两个密钥域:
 
 `manifest_key` 和 `registry_auth` 都是 typed secret,支持 inline 或 ref 带外交付。`manifest_key` 使用 ref
 时必须同时给出 fingerprint,供 create/build precheck 使用。密钥分发遵循 scaler 的 allocation 结果:
-scaler 决定哪些 node 应有 key,node owner 负责实际 `key_put/key_drop` 和 lease/ack 重试。
-密钥分发是 create/build 前置条件,不影响已运行 sandbox。
+scaler 决定哪些 node 应有 key,registry/node owner 将 desired key list 写入对应 node_link 记录并在 owner
+set 内 CAS 复制。实际 `key_put` 是 node-link 心跳维系的定期刷新;`key_drop` 不作为正确性依赖,节点侧租约
+按 TTL 淘汰未续租 key。密钥分发是 create/build 前置条件,不影响已运行 sandbox。
 
 ## 13. Build
 

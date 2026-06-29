@@ -95,8 +95,17 @@ type NodeRecord struct {
 	LastHeartbeatUnix int64                     `json:"last_heartbeat_unix,omitempty"`
 	ResumeToken       string                    `json:"resume_token,omitempty"`
 	LinkOwner         string                    `json:"link_owner,omitempty"`
+	ManifestKeys      []NodeManifestKey         `json:"manifest_keys,omitempty"`
 	Sandboxes         []NodeSandboxRef          `json:"sandboxes,omitempty"`
 	Builds            []NodeBuildRef            `json:"builds,omitempty"`
+}
+
+type NodeManifestKey struct {
+	Fingerprint string `json:"fingerprint"`
+	Type        string `json:"type,omitempty"`
+	Value       string `json:"value,omitempty"`
+	Ref         string `json:"ref,omitempty"`
+	ExpiresUnix int64  `json:"expires_unix,omitempty"`
 }
 
 type NodeSandboxRef struct {
@@ -114,6 +123,7 @@ type NodeBuildRef struct {
 // High-frequency load stays in node_link and is fetched at placement time.
 type NodeListEntry struct {
 	Meta              RecordMeta                `json:"meta"`
+	SourceMeta        RecordMeta                `json:"source_meta,omitempty"`
 	NodeID            string                    `json:"node_id"`
 	Labels            map[string]string         `json:"labels,omitempty"`
 	Capacity          int                       `json:"capacity,omitempty"`
@@ -122,11 +132,12 @@ type NodeListEntry struct {
 	RuntimeDigest     string                    `json:"runtime_digest,omitempty"`
 	Draining          bool                      `json:"draining,omitempty"`
 	LastHeartbeatUnix int64                     `json:"last_heartbeat_unix,omitempty"`
+	Deleted           bool                      `json:"deleted,omitempty"`
 }
 
 func ProjectNodeList(n NodeRecord) NodeListEntry {
 	return NodeListEntry{
-		Meta: n.Meta, NodeID: n.NodeID, Labels: cloneStringMap(n.Labels), Capacity: n.Capacity,
+		SourceMeta: n.Meta, NodeID: n.NodeID, Labels: cloneStringMap(n.Labels), Capacity: n.Capacity,
 		BuildCapacity: cloneBuildResources(n.BuildCapacity), DataEndpoint: n.DataEndpoint,
 		RuntimeDigest: n.RuntimeDigest, Draining: n.Draining, LastHeartbeatUnix: n.LastHeartbeatUnix,
 	}

@@ -337,6 +337,9 @@ func (r *MemoryNodeReplica) Accept(ctx context.Context, nodeID string, rec NodeR
 	if ballot.Less(r.promised[nodeID]) {
 		return false, nil
 	}
+	if cur, found := r.accepted[nodeID]; found && ballot.Less(cur.Meta.Ballot) {
+		return false, nil
+	}
 	r.promised[nodeID] = ballot
 	r.accepted[nodeID] = cloneNode(rec)
 	return true, nil
@@ -351,8 +354,11 @@ func (r *MemoryNodeReplica) AcceptDelete(ctx context.Context, nodeID string, bal
 	if ballot.Less(r.promised[nodeID]) {
 		return false, nil
 	}
-	r.promised[nodeID] = ballot
 	cur, found := r.accepted[nodeID]
+	if found && ballot.Less(cur.Meta.Ballot) {
+		return false, nil
+	}
+	r.promised[nodeID] = ballot
 	tombstone := NodeRecord{
 		Meta:   RecordMeta{Ballot: ballot, Rev: cur.Meta.Rev + 1, UpdatedAt: time.Now()},
 		NodeID: nodeID,
@@ -374,7 +380,12 @@ func (r *MemoryNodeReplica) Repair(ctx context.Context, nodeID string, rec NodeR
 	cur, found := r.accepted[nodeID]
 	if !found || cur.Meta.Ballot.Less(rec.Meta.Ballot) ||
 		(cur.Meta.Ballot == rec.Meta.Ballot && cur.Meta.Rev < rec.Meta.Rev) {
+		if r.promised[nodeID].Less(rec.Meta.Ballot) {
+			r.promised[nodeID] = rec.Meta.Ballot
+		}
 		r.accepted[nodeID] = cloneNode(rec)
+	} else if r.promised[nodeID].Less(cur.Meta.Ballot) {
+		r.promised[nodeID] = cur.Meta.Ballot
 	}
 	return nil
 }

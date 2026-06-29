@@ -67,8 +67,12 @@ func TestKeyPredistribution(t *testing.T) {
 	pushKeyAllocation(reg, "/g", []string{"n1"}, testMK)
 	reg.reconcileKeys(ctx)
 
+	if len(cmds) != 0 {
+		t.Fatalf("reconcileKeys should only update node_link cache, got commands %+v", cmds)
+	}
+	reg.updateHeartbeat(ctx, "n1", &routesync.Heartbeat{})
 	if len(cmds) != 1 || cmds[0].Kind != routesync.CmdKeyPut || cmds[0].ManifestKey != testMK {
-		t.Fatalf("expected one key_put with the group key, got %+v", cmds)
+		t.Fatalf("expected heartbeat key_put with the group key, got %+v", cmds)
 	}
 }
 
@@ -81,12 +85,20 @@ func TestKeyDropOnLeave(t *testing.T) {
 
 	pushKeyAllocation(reg, "/g", []string{"n1"}, testMK)
 	reg.reconcileKeys(ctx)
+	reg.updateHeartbeat(ctx, "n1", &routesync.Heartbeat{})
 	pushKeyAllocation(reg, "/g", nil, "")
 	cmds = nil
 	reg.reconcileKeys(ctx)
 
-	if len(cmds) != 1 || cmds[0].Kind != routesync.CmdKeyDrop {
-		t.Fatalf("expected one key_drop after the scaler removed allocation, got %+v", cmds)
+	if len(cmds) != 0 {
+		t.Fatalf("drop should only update node_link cache; node TTL handles expiry, got %+v", cmds)
+	}
+	node, found, err := reg.stores.GetNode(ctx, "n1")
+	if err != nil || !found {
+		t.Fatalf("node found=%v err=%v", found, err)
+	}
+	if len(node.ManifestKeys) != 0 {
+		t.Fatalf("node_link key cache not cleared after allocation removal: %+v", node.ManifestKeys)
 	}
 }
 
@@ -105,15 +117,23 @@ func TestKeyDistributionUsesScalerAllocation(t *testing.T) {
 	if len(cmds["n1"]) != 0 {
 		t.Fatalf("selector-matching n1 got commands despite scaler allocation to n2: %+v", cmds["n1"])
 	}
-	if len(cmds["n2"]) != 1 || cmds["n2"][0].Kind != routesync.CmdKeyPut {
-		t.Fatalf("n2 commands=%+v, want one key_put", cmds["n2"])
+	if len(cmds["n2"]) != 0 {
+		t.Fatalf("reconcileKeys should not push n2 commands immediately: %+v", cmds["n2"])
+	}
+	n2, found, err := reg.stores.GetNode(ctx, "n2")
+	if err != nil || !found || len(n2.ManifestKeys) != 1 {
+		t.Fatalf("n2 node_link cache=%+v found=%v err=%v", n2, found, err)
 	}
 
 	cmds = map[string][]*routesync.Command{}
 	pushKeyAllocation(reg, "/g", nil, "")
 	reg.reconcileKeys(ctx)
-	if len(cmds["n2"]) != 1 || cmds["n2"][0].Kind != routesync.CmdKeyDrop {
-		t.Fatalf("empty scaler allocation should drop n2 key, commands=%+v", cmds["n2"])
+	if len(cmds["n2"]) != 0 {
+		t.Fatalf("empty scaler allocation should not push key_drop, commands=%+v", cmds["n2"])
+	}
+	n2, _, _ = reg.stores.GetNode(ctx, "n2")
+	if len(n2.ManifestKeys) != 0 {
+		t.Fatalf("empty scaler allocation should clear n2 cache: %+v", n2.ManifestKeys)
 	}
 }
 
@@ -126,22 +146,62 @@ func TestKeyDistributionDropsDeletedGroupAndRotatedKey(t *testing.T) {
 
 	pushKeyAllocation(reg, "/g", []string{"n1"}, testMK)
 	reg.reconcileKeys(ctx)
-	if len(cmds) != 1 || cmds[0].Kind != routesync.CmdKeyPut {
-		t.Fatalf("initial commands=%+v, want key_put", cmds)
+	if len(cmds) != 0 {
+		t.Fatalf("initial reconcile commands=%+v, want none", cmds)
 	}
 
 	cmds = nil
 	pushKeyAllocation(reg, "/g", []string{"n1"}, testAuthKey)
 	reg.reconcileKeys(ctx)
-	if len(cmds) != 2 || cmds[0].Kind != routesync.CmdKeyDrop || cmds[1].Kind != routesync.CmdKeyPut {
-		t.Fatalf("rotated key commands=%+v, want key_drop old + key_put new", cmds)
+	if len(cmds) != 0 {
+		t.Fatalf("rotated key reconcile commands=%+v, want none", cmds)
+	}
+	node, _, _ := reg.stores.GetNode(ctx, "n1")
+	if len(node.ManifestKeys) != 1 || node.ManifestKeys[0].Fingerprint != keyFingerprint(testAuthKey) {
+		t.Fatalf("rotated key cache=%+v, want new key only", node.ManifestKeys)
 	}
 
 	cmds = nil
 	pushKeyAllocation(reg, "/g", nil, "")
 	reg.reconcileKeys(ctx)
-	if len(cmds) != 1 || cmds[0].Kind != routesync.CmdKeyDrop {
-		t.Fatalf("deleted group commands=%+v, want key_drop", cmds)
+	if len(cmds) != 0 {
+		t.Fatalf("deleted group commands=%+v, want none", cmds)
+	}
+	node, _, _ = reg.stores.GetNode(ctx, "n1")
+	if len(node.ManifestKeys) != 0 {
+		t.Fatalf("deleted group cache=%+v, want empty", node.ManifestKeys)
+	}
+}
+
+func TestKeyDistributionCachesKeysInNodeLink(t *testing.T) {
+	ctx := context.Background()
+	reg := testRegWithBox(t)
+	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"}); err != nil {
+		t.Fatal(err)
+	}
+	reg.addNode(&fakeConn{nodeID: "n1"})
+
+	pushKeyAllocation(reg, "/g", []string{"n1"}, testMK)
+	reg.reconcileKeys(ctx)
+
+	node, found, err := reg.stores.GetNode(ctx, "n1")
+	if err != nil || !found {
+		t.Fatalf("node found=%v err=%v", found, err)
+	}
+	if len(node.ManifestKeys) != 1 || node.ManifestKeys[0].Fingerprint != keyFingerprint(testMK) || node.ManifestKeys[0].Value != testMK {
+		t.Fatalf("node_link manifest key cache=%+v", node.ManifestKeys)
+	}
+
+	registered := &routesync.NodeRegister{NodeID: "n1", Capacity: 10, DataEndpoint: "10.0.0.1:8443"}
+	if err := reg.updateNodeRegister(ctx, registered); err != nil {
+		t.Fatalf("updateNodeRegister: %v", err)
+	}
+	node, found, err = reg.stores.GetNode(ctx, "n1")
+	if err != nil || !found {
+		t.Fatalf("node after register found=%v err=%v", found, err)
+	}
+	if len(node.ManifestKeys) != 1 || node.ManifestKeys[0].Fingerprint != keyFingerprint(testMK) {
+		t.Fatalf("register cleared node_link manifest key cache: %+v", node.ManifestKeys)
 	}
 }
 

@@ -35,6 +35,7 @@ const (
 
 // NodeRecord is the registry-facing node_link view.
 type NodeRecord struct {
+	Meta          clusterstate.RecordMeta   `json:"meta,omitempty"`
 	NodeID        string                    `json:"node_id"`
 	Labels        map[string]string         `json:"labels,omitempty"`
 	Capacity      int                       `json:"capacity,omitempty"`
@@ -50,11 +51,12 @@ type NodeRecord struct {
 	// LastHeartbeatUnix is the last sign of life (register or heartbeat); the
 	// dead-node sweep (§11) resets a disconnected node whose last beat predates
 	// node_dead_after.
-	LastHeartbeatUnix int64                         `json:"last_heartbeat_unix,omitempty"`
-	ResumeToken       string                        `json:"resume_token,omitempty"`
-	LinkOwner         string                        `json:"link_owner,omitempty"`
-	Sandboxes         []clusterstate.NodeSandboxRef `json:"sandboxes,omitempty"`
-	Builds            []clusterstate.NodeBuildRef   `json:"builds,omitempty"`
+	LastHeartbeatUnix int64                          `json:"last_heartbeat_unix,omitempty"`
+	ResumeToken       string                         `json:"resume_token,omitempty"`
+	LinkOwner         string                         `json:"link_owner,omitempty"`
+	ManifestKeys      []clusterstate.NodeManifestKey `json:"manifest_keys,omitempty"`
+	Sandboxes         []clusterstate.NodeSandboxRef  `json:"sandboxes,omitempty"`
+	Builds            []clusterstate.NodeBuildRef    `json:"builds,omitempty"`
 }
 
 // SandboxRecord is the registry-facing route_link view, keyed by
@@ -88,6 +90,7 @@ type Stores struct {
 	nodeOwnerCount  int
 	localRoute      *clusterstate.MemoryRouteReplica
 	localNode       *clusterstate.MemoryNodeReplica
+	localNodeList   *clusterstate.MemoryNodeListReplica
 	routeReplicas   map[string]clusterstate.RouteReplica
 	nodeReplicas    map[string]clusterstate.NodeReplica
 	replicaMu       sync.RWMutex
@@ -101,7 +104,6 @@ type Stores struct {
 	routeReady     map[string]bool
 
 	nodeListMu                  sync.Mutex
-	nodeList                    map[string]clusterstate.NodeListEntry
 	nodeListRev                 int64
 	nodeListLog                 []clusterstore.Event
 	nodeListSubs                map[int]chan clusterstore.Event
@@ -109,8 +111,9 @@ type Stores struct {
 	nodeListRetention           int
 	nodeListHeartbeatRefreshSec int64
 	nodeListOwnerCount          int
-	nodeListReplicas            map[string]NodeListReplica
+	nodeListReplicas            map[string]clusterstate.NodeListReplica
 	nodeListTopologySet         bool
+	nodeListReady               bool
 
 	handoffMu        sync.RWMutex
 	membershipVer    int64
@@ -147,6 +150,7 @@ func NewClusterStores(
 	}
 	localRoute := clusterstate.NewMemoryRouteReplica()
 	localNode := clusterstate.NewMemoryNodeReplica()
+	localNodeList := clusterstate.NewMemoryNodeListReplica()
 	rreps := make(map[string]clusterstate.RouteReplica, len(routeReplicas)+1)
 	nreps := make(map[string]clusterstate.NodeReplica, len(nodeReplicas)+1)
 	for id, rep := range routeReplicas {
@@ -171,23 +175,24 @@ func NewClusterStores(
 		nodeOwnerCount:              nodeOwnerCount,
 		localRoute:                  localRoute,
 		localNode:                   localNode,
+		localNodeList:               localNodeList,
 		routeReplicas:               rreps,
 		nodeReplicas:                nreps,
 		routeLog:                    map[string][]clusterstore.Event{},
 		routeSubs:                   map[string]map[int]chan clusterstore.Event{},
 		routeRetention:              10000,
 		routeReady:                  map[string]bool{},
-		nodeList:                    map[string]clusterstate.NodeListEntry{},
 		nodeListSubs:                map[int]chan clusterstore.Event{},
 		nodeListRetention:           10000,
 		nodeListHeartbeatRefreshSec: defaultNodeListHeartbeatRefreshSec,
 		nodeListOwnerCount:          1,
-		nodeListReplicas:            map[string]NodeListReplica{writerID: nil},
+		nodeListReplicas:            map[string]clusterstate.NodeListReplica{writerID: localNodeList},
 		membershipVer:               view.Version,
 		routeHandoffGate:            map[string]clusterstate.HandoffGate{},
 		nodeHandoffGate:             map[string]clusterstate.HandoffGate{},
 	}
 	localRoute.SetOnChange(stores.publishRouteReplicaEvent)
+	localNodeList.SetOnChange(stores.publishNodeListReplicaEvent)
 	return stores
 }
 
@@ -210,6 +215,8 @@ func NewClusterStoresWithViews(
 func (s *Stores) LocalRouteReplica() clusterstate.RouteReplica { return s.localRoute }
 
 func (s *Stores) LocalNodeReplica() clusterstate.NodeReplica { return s.localNode }
+
+func (s *Stores) LocalNodeListReplica() clusterstate.NodeListReplica { return s.localNodeList }
 
 func (s *Stores) WriterID() string { return s.writerID }
 
@@ -271,6 +278,7 @@ func (s *Stores) SetMemberViews(views []clusterstate.MemberView) {
 	s.memberViews = clean
 	s.replicaMu.Unlock()
 	s.clearRouteReadiness()
+	s.clearNodeListReadiness()
 }
 
 func (s *Stores) SetClusterTopology(
@@ -322,9 +330,10 @@ func (s *Stores) SetClusterTopology(
 	s.nodeReplicas = nreps
 	s.replicaMu.Unlock()
 	s.clearRouteReadiness()
+	s.clearNodeListReadiness()
 }
 
-func (s *Stores) SetNodeListTopology(views []clusterstate.MemberView, ownerCount int, replicas map[string]NodeListReplica) {
+func (s *Stores) SetNodeListTopology(views []clusterstate.MemberView, ownerCount int, replicas map[string]clusterstate.NodeListReplica) {
 	cleanViews := make([]clusterstate.MemberView, 0, len(views))
 	seenVersion := map[int64]bool{}
 	for _, view := range views {
@@ -340,13 +349,13 @@ func (s *Stores) SetNodeListTopology(views []clusterstate.MemberView, ownerCount
 	if ownerCount <= 0 {
 		ownerCount = 1
 	}
-	reps := make(map[string]NodeListReplica, len(replicas)+1)
+	reps := make(map[string]clusterstate.NodeListReplica, len(replicas)+1)
 	for id, rep := range replicas {
 		if id != "" && id != s.writerID && rep != nil {
 			reps[id] = rep
 		}
 	}
-	reps[s.writerID] = s
+	reps[s.writerID] = s.localNodeList
 	s.replicaMu.Lock()
 	s.memberViews = cleanViews
 	s.nodeListOwnerCount = ownerCount
@@ -354,6 +363,7 @@ func (s *Stores) SetNodeListTopology(views []clusterstate.MemberView, ownerCount
 	s.nodeListTopologySet = true
 	s.replicaMu.Unlock()
 	s.clearRouteReadiness()
+	s.clearNodeListReadiness()
 }
 
 func (s *Stores) routeQuorum(group string) (*clusterstate.RouteQuorum, error) {
@@ -396,6 +406,12 @@ func (s *Stores) clearRouteReadiness() {
 	s.routeMu.Unlock()
 }
 
+func (s *Stores) clearNodeListReadiness() {
+	s.nodeListMu.Lock()
+	s.nodeListReady = false
+	s.nodeListMu.Unlock()
+}
+
 func (s *Stores) nodeQuorum(nodeID string) (*clusterstate.NodeQuorum, error) {
 	s.replicaMu.RLock()
 	defer s.replicaMu.RUnlock()
@@ -425,14 +441,37 @@ func (s *Stores) nodeListOwners() ([][]string, []string, error) {
 	return locatedOwnerSets(s.memberViews, clusterstate.NamespaceNodeList, s.nodeListOwnerCount)
 }
 
-func (s *Stores) nodeListReplica(id string) NodeListReplica {
+func (s *Stores) nodeListReplica(id string) clusterstate.NodeListReplica {
 	if id == s.writerID {
-		return s
+		return s.localNodeList
 	}
 	s.replicaMu.RLock()
 	rep := s.nodeListReplicas[id]
 	s.replicaMu.RUnlock()
 	return rep
+}
+
+func (s *Stores) nodeListQuorum() (*clusterstate.NodeListQuorum, error) {
+	s.replicaMu.RLock()
+	defer s.replicaMu.RUnlock()
+	ownerSets := [][]string{{s.writerID}}
+	jointOwners := []string{s.writerID}
+	if s.nodeListTopologySet {
+		var err error
+		ownerSets, jointOwners, err = locatedOwnerSets(s.memberViews, clusterstate.NamespaceNodeList, s.nodeListOwnerCount)
+		if err != nil {
+			return nil, err
+		}
+	}
+	reps := make([]clusterstate.NodeListReplicaSlot, 0, len(jointOwners))
+	for _, id := range jointOwners {
+		rep := s.nodeListReplicas[id]
+		if rep == nil {
+			rep = unavailableNodeListReplica{id: id}
+		}
+		reps = append(reps, clusterstate.NodeListReplicaSlot{ID: id, Replica: rep})
+	}
+	return clusterstate.NewNodeListJointQuorum(s.writerID, reps, ownerSets), nil
 }
 
 func locatedOwnerSets(views []clusterstate.MemberView, key string, ownerCount int) ([][]string, []string, error) {
@@ -542,6 +581,7 @@ func (s *Stores) DeleteNode(ctx context.Context, id string) error {
 		if err != nil {
 			return err
 		}
+		return s.DeleteNodeListWithSource(ctx, id, rec.Meta)
 	}
 	return s.DeleteNodeList(ctx, id)
 }
@@ -631,6 +671,62 @@ func (s *Stores) updateNodeRuntime(ctx context.Context, nodeID string, mutate fu
 	return clusterstate.ErrConflict
 }
 
+func (s *Stores) UpsertNodeManifestKey(ctx context.Context, nodeID string, key clusterstate.NodeManifestKey) error {
+	if nodeID == "" || key.Fingerprint == "" {
+		return nil
+	}
+	if key.Type == "" {
+		key.Type = clusterstate.SecretInline
+	}
+	return s.updateNodeRuntime(ctx, nodeID, func(n *NodeRecord) {
+		for i := range n.ManifestKeys {
+			if n.ManifestKeys[i].Fingerprint == key.Fingerprint {
+				n.ManifestKeys[i] = key
+				sortNodeManifestKeys(n.ManifestKeys)
+				return
+			}
+		}
+		n.ManifestKeys = append(n.ManifestKeys, key)
+		sortNodeManifestKeys(n.ManifestKeys)
+	})
+}
+
+func (s *Stores) DropNodeManifestKey(ctx context.Context, nodeID, fingerprint string) error {
+	if nodeID == "" || fingerprint == "" {
+		return nil
+	}
+	return s.updateNodeRuntime(ctx, nodeID, func(n *NodeRecord) {
+		out := n.ManifestKeys[:0]
+		for _, key := range n.ManifestKeys {
+			if key.Fingerprint == fingerprint {
+				continue
+			}
+			out = append(out, key)
+		}
+		n.ManifestKeys = out
+	})
+}
+
+func (s *Stores) PruneExpiredNodeManifestKeys(ctx context.Context, nodeID string, nowUnix int64) error {
+	if nodeID == "" || nowUnix <= 0 {
+		return nil
+	}
+	return s.updateNodeRuntime(ctx, nodeID, func(n *NodeRecord) {
+		out := n.ManifestKeys[:0]
+		for _, key := range n.ManifestKeys {
+			if key.ExpiresUnix > 0 && key.ExpiresUnix <= nowUnix {
+				continue
+			}
+			out = append(out, key)
+		}
+		n.ManifestKeys = out
+	})
+}
+
+func sortNodeManifestKeys(keys []clusterstate.NodeManifestKey) {
+	sort.Slice(keys, func(i, j int) bool { return keys[i].Fingerprint < keys[j].Fingerprint })
+}
+
 func (s *Stores) putNodeLink(ctx context.Context, n *NodeRecord) (uint64, error) {
 	if err := s.checkNodeHandoff(n.NodeID); err != nil {
 		return 0, err
@@ -653,6 +749,7 @@ func (s *Stores) putNodeLink(ctx context.Context, n *NodeRecord) (uint64, error)
 	if err != nil {
 		return 0, err
 	}
+	n.Meta = rec.Meta
 	return rec.Meta.Rev, nil
 }
 
@@ -660,12 +757,68 @@ func projectNodeListRecord(n *NodeRecord) clusterstate.NodeListEntry {
 	return clusterstate.ProjectNodeList(toClusterNode(n))
 }
 
-func nodeListEntryNewer(next, cur clusterstate.NodeListEntry) bool {
-	return next.LastHeartbeatUnix >= cur.LastHeartbeatUnix
+func nodeListRecordNewer(next, cur clusterstate.NodeListEntry) bool {
+	if cur.Meta.Ballot.Less(next.Meta.Ballot) {
+		return true
+	}
+	return cur.Meta.Ballot == next.Meta.Ballot && cur.Meta.Rev < next.Meta.Rev
+}
+
+func nodeListProjectionNewer(next, cur clusterstate.NodeListEntry) bool {
+	if cmp := compareProjectionSource(next, cur); cmp != 0 {
+		return cmp > 0
+	}
+	if next.Deleted != cur.Deleted {
+		return next.Deleted
+	}
+	return false
+}
+
+func compareProjectionSource(next, cur clusterstate.NodeListEntry) int {
+	nextHasSource := !recordMetaZero(next.SourceMeta)
+	curHasSource := !recordMetaZero(cur.SourceMeta)
+	switch {
+	case nextHasSource && curHasSource:
+		return compareRecordMeta(next.SourceMeta, cur.SourceMeta)
+	case nextHasSource:
+		return 1
+	case curHasSource:
+		return -1
+	}
+	switch {
+	case next.LastHeartbeatUnix > cur.LastHeartbeatUnix:
+		return 1
+	case next.LastHeartbeatUnix < cur.LastHeartbeatUnix:
+		return -1
+	default:
+		return 0
+	}
+}
+
+func compareRecordMeta(a, b clusterstate.RecordMeta) int {
+	switch {
+	case a.Ballot.Less(b.Ballot):
+		return -1
+	case b.Ballot.Less(a.Ballot):
+		return 1
+	case a.Rev < b.Rev:
+		return -1
+	case a.Rev > b.Rev:
+		return 1
+	default:
+		return 0
+	}
+}
+
+func recordMetaZero(m clusterstate.RecordMeta) bool {
+	return m.Ballot.IsZero() && m.Rev == 0 && m.UpdatedAt.IsZero()
 }
 
 func (s *Stores) NodeListRev(ctx context.Context) (int64, error) {
 	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	if err := s.ensureNodeListReady(ctx); err != nil {
 		return 0, err
 	}
 	s.nodeListMu.Lock()
@@ -677,14 +830,18 @@ func (s *Stores) RangeNodeList(ctx context.Context, fn func(clusterstate.NodeLis
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	s.nodeListMu.Lock()
-	out := make([]clusterstate.NodeListEntry, 0, len(s.nodeList))
-	for _, entry := range s.nodeList {
-		out = append(out, entry)
+	if err := s.ensureNodeListReady(ctx); err != nil {
+		return err
 	}
-	s.nodeListMu.Unlock()
+	out, err := s.localNodeList.List(ctx)
+	if err != nil {
+		return err
+	}
 	sort.Slice(out, func(i, j int) bool { return out[i].NodeID < out[j].NodeID })
 	for _, entry := range out {
+		if entry.Deleted {
+			continue
+		}
 		if err := fn(entry); err != nil {
 			return err
 		}
@@ -694,6 +851,9 @@ func (s *Stores) RangeNodeList(ctx context.Context, fn func(clusterstate.NodeLis
 
 func (s *Stores) WatchNodeList(ctx context.Context, fromRev int64) (<-chan clusterstore.Event, error) {
 	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := s.ensureNodeListReady(ctx); err != nil {
 		return nil, err
 	}
 	s.nodeListMu.Lock()
@@ -733,106 +893,97 @@ func (s *Stores) PutNodeListEntry(ctx context.Context, entry clusterstate.NodeLi
 	if entry.NodeID == "" {
 		return fmt.Errorf("registry: node_list node_id is required")
 	}
-	return s.replicateNodeList(ctx, func(rep NodeListReplica) error {
-		return rep.ApplyNodeListPut(ctx, entry)
-	})
+	entry.Deleted = false
+	for attempt := 0; attempt < 5; attempt++ {
+		q, err := s.nodeListQuorum()
+		if err != nil {
+			return err
+		}
+		cur, found, err := q.Read(ctx, entry.NodeID)
+		if err != nil {
+			return err
+		}
+		expect := uint64(0)
+		if found {
+			expect = cur.Meta.Rev
+		}
+		_, err = q.CAS(ctx, entry.NodeID, expect, func(cur clusterstate.NodeListEntry, found bool) (clusterstate.NodeListEntry, bool, error) {
+			if !found || nodeListProjectionNewer(entry, cur) {
+				return entry, true, nil
+			}
+			return cur, true, nil
+		})
+		if err == clusterstate.ErrConflict {
+			continue
+		}
+		return err
+	}
+	return clusterstate.ErrConflict
 }
 
 func (s *Stores) DeleteNodeList(ctx context.Context, nodeID string) error {
+	return s.DeleteNodeListWithSource(ctx, nodeID, clusterstate.RecordMeta{})
+}
+
+func (s *Stores) DeleteNodeListWithSource(ctx context.Context, nodeID string, source clusterstate.RecordMeta) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	if nodeID == "" {
 		return nil
 	}
-	return s.replicateNodeList(ctx, func(rep NodeListReplica) error {
-		return rep.ApplyNodeListDelete(ctx, nodeID)
-	})
-}
-
-func (s *Stores) replicateNodeList(ctx context.Context, apply func(NodeListReplica) error) error {
-	ownerSets, jointOwners, err := s.nodeListOwners()
-	if err != nil {
-		return err
-	}
-	accepted := map[string]bool{}
-	var last error
-	for _, id := range jointOwners {
-		rep := s.nodeListReplica(id)
-		if rep == nil {
-			last = fmt.Errorf("registry: node_list replica %q unavailable", id)
-			continue
+	for attempt := 0; attempt < 5; attempt++ {
+		q, err := s.nodeListQuorum()
+		if err != nil {
+			return err
 		}
-		if err := apply(rep); err != nil {
-			last = err
-			continue
+		cur, found, err := q.Read(ctx, nodeID)
+		if err != nil {
+			return err
 		}
-		accepted[id] = true
-	}
-	if !satisfiesOwnerQuorums(accepted, ownerSets) {
-		if last != nil {
-			return last
+		expect := uint64(0)
+		if found {
+			expect = cur.Meta.Rev
 		}
-		return clusterstate.ErrQuorum
-	}
-	return nil
-}
-
-func satisfiesOwnerQuorums(accepted map[string]bool, ownerSets [][]string) bool {
-	for _, owners := range ownerSets {
-		need := len(owners)/2 + 1
-		got := 0
-		for _, id := range owners {
-			if accepted[id] {
-				got++
+		tombstone := clusterstate.NodeListEntry{NodeID: nodeID, SourceMeta: source, Deleted: true}
+		if found && recordMetaZero(source) {
+			tombstone.SourceMeta = cur.SourceMeta
+			tombstone.LastHeartbeatUnix = cur.LastHeartbeatUnix
+		}
+		_, err = q.CAS(ctx, nodeID, expect, func(cur clusterstate.NodeListEntry, found bool) (clusterstate.NodeListEntry, bool, error) {
+			if !found || nodeListProjectionNewer(tombstone, cur) {
+				return tombstone, true, nil
 			}
+			return cur, true, nil
+		})
+		if err == clusterstate.ErrConflict {
+			continue
 		}
-		if got < need {
-			return false
-		}
+		return err
 	}
-	return true
+	return clusterstate.ErrConflict
 }
 
-func (s *Stores) ApplyNodeListPut(ctx context.Context, entry clusterstate.NodeListEntry) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	if entry.NodeID == "" {
-		return fmt.Errorf("registry: node_list node_id is required")
-	}
-	b, err := json.Marshal(entry)
-	if err != nil {
-		return err
-	}
-	return s.publishNodeListEvent(clusterstore.Event{Type: clusterstore.EventPut, Key: entry.NodeID, Value: b}, &entry)
-}
-
-func (s *Stores) ApplyNodeListDelete(ctx context.Context, nodeID string) error {
-	if err := ctx.Err(); err != nil {
-		return err
+func (s *Stores) publishNodeListReplicaEvent(nodeID string, entry clusterstate.NodeListEntry) {
+	if nodeID == "" {
+		nodeID = entry.NodeID
 	}
 	if nodeID == "" {
-		return nil
+		return
 	}
-	return s.publishNodeListEvent(clusterstore.Event{Type: clusterstore.EventDelete, Key: nodeID}, nil)
-}
-
-func (s *Stores) publishNodeListEvent(ev clusterstore.Event, entry *clusterstate.NodeListEntry) error {
+	ev := clusterstore.Event{Key: nodeID}
+	if entry.Deleted {
+		ev.Type = clusterstore.EventDelete
+	} else {
+		ev.Type = clusterstore.EventPut
+		b, err := json.Marshal(entry)
+		if err != nil {
+			return
+		}
+		ev.Value = b
+	}
 	s.nodeListMu.Lock()
 	defer s.nodeListMu.Unlock()
-	switch ev.Type {
-	case clusterstore.EventPut:
-		if entry == nil {
-			return fmt.Errorf("registry: node_list put missing entry")
-		}
-		if cur, ok := s.nodeList[entry.NodeID]; ok && !nodeListEntryNewer(*entry, cur) {
-			return nil
-		}
-		s.nodeList[entry.NodeID] = *entry
-	case clusterstore.EventDelete:
-		delete(s.nodeList, ev.Key)
-	}
 	s.nodeListRev++
 	ev.Rev = s.nodeListRev
 	s.nodeListLog = append(s.nodeListLog, ev)
@@ -852,7 +1003,6 @@ func (s *Stores) publishNodeListEvent(ev clusterstore.Event, entry *clusterstate
 			close(ch)
 		}
 	}
-	return nil
 }
 
 // --- route_link ---
@@ -1029,6 +1179,87 @@ func (s *Stores) ensureRouteGroupReady(ctx context.Context, group string) error 
 	s.routeReady[group] = true
 	s.routeMu.Unlock()
 	return nil
+}
+
+func (s *Stores) ensureNodeListReady(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.nodeListMu.Lock()
+	if s.nodeListReady {
+		s.nodeListMu.Unlock()
+		return nil
+	}
+	s.nodeListMu.Unlock()
+	ownerSets, jointOwners, err := s.nodeListOwners()
+	if err != nil {
+		return err
+	}
+	isOwner := false
+	for _, id := range jointOwners {
+		if id == s.writerID {
+			isOwner = true
+			break
+		}
+	}
+	if !isOwner {
+		return ErrShardNotReady
+	}
+	accepted := map[string]bool{}
+	byNode := map[string]clusterstate.NodeListEntry{}
+	var last error
+	for _, id := range jointOwners {
+		rep := s.nodeListReplica(id)
+		if rep == nil {
+			last = fmt.Errorf("registry: node_list replica %q unavailable", id)
+			continue
+		}
+		entries, err := rep.List(ctx)
+		if err != nil {
+			last = err
+			continue
+		}
+		accepted[id] = true
+		for _, entry := range entries {
+			if entry.NodeID == "" {
+				continue
+			}
+			if cur, ok := byNode[entry.NodeID]; !ok || nodeListRecordNewer(entry, cur) {
+				byNode[entry.NodeID] = entry
+			}
+		}
+	}
+	if !satisfiesOwnerQuorums(accepted, ownerSets) {
+		if last != nil {
+			return last
+		}
+		return clusterstate.ErrQuorum
+	}
+	for nodeID, entry := range byNode {
+		if err := s.localNodeList.Repair(ctx, nodeID, entry); err != nil {
+			return err
+		}
+	}
+	s.nodeListMu.Lock()
+	s.nodeListReady = true
+	s.nodeListMu.Unlock()
+	return nil
+}
+
+func satisfiesOwnerQuorums(accepted map[string]bool, ownerSets [][]string) bool {
+	for _, owners := range ownerSets {
+		need := len(owners)/2 + 1
+		got := 0
+		for _, id := range owners {
+			if accepted[id] {
+				got++
+			}
+		}
+		if got < need {
+			return false
+		}
+	}
+	return true
 }
 
 func routeRecordNewer(next, cur clusterstate.RouteRecord) bool {
@@ -1254,6 +1485,7 @@ func toClusterNode(n *NodeRecord) clusterstate.NodeRecord {
 		st = clusterstate.NodeDrained
 	}
 	return clusterstate.NodeRecord{
+		Meta:              n.Meta,
 		NodeID:            n.NodeID,
 		State:             st,
 		Labels:            cloneStringMap(n.Labels),
@@ -1270,6 +1502,7 @@ func toClusterNode(n *NodeRecord) clusterstate.NodeRecord {
 		LastHeartbeatUnix: n.LastHeartbeatUnix,
 		ResumeToken:       n.ResumeToken,
 		LinkOwner:         n.LinkOwner,
+		ManifestKeys:      cloneNodeManifestKeys(n.ManifestKeys),
 		Sandboxes:         cloneNodeSandboxRefs(n.Sandboxes),
 		Builds:            cloneNodeBuildRefs(n.Builds),
 	}
@@ -1277,6 +1510,7 @@ func toClusterNode(n *NodeRecord) clusterstate.NodeRecord {
 
 func fromClusterNode(n clusterstate.NodeRecord) NodeRecord {
 	return NodeRecord{
+		Meta:              n.Meta,
 		NodeID:            n.NodeID,
 		Labels:            cloneStringMap(n.Labels),
 		Capacity:          n.Capacity,
@@ -1292,6 +1526,7 @@ func fromClusterNode(n clusterstate.NodeRecord) NodeRecord {
 		LastHeartbeatUnix: n.LastHeartbeatUnix,
 		ResumeToken:       n.ResumeToken,
 		LinkOwner:         n.LinkOwner,
+		ManifestKeys:      cloneNodeManifestKeys(n.ManifestKeys),
 		Sandboxes:         cloneNodeSandboxRefs(n.Sandboxes),
 		Builds:            cloneNodeBuildRefs(n.Builds),
 	}
@@ -1305,6 +1540,15 @@ func cloneStringMap(in map[string]string) map[string]string {
 	for k, v := range in {
 		out[k] = v
 	}
+	return out
+}
+
+func cloneNodeManifestKeys(in []clusterstate.NodeManifestKey) []clusterstate.NodeManifestKey {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]clusterstate.NodeManifestKey, len(in))
+	copy(out, in)
 	return out
 }
 
@@ -1380,4 +1624,34 @@ func (r unavailableNodeReplica) Repair(context.Context, string, clusterstate.Nod
 
 func (r unavailableNodeReplica) MaxBallot(context.Context, string) (clusterstate.Ballot, error) {
 	return clusterstate.Ballot{}, r.err()
+}
+
+type unavailableNodeListReplica struct{ id string }
+
+func (r unavailableNodeListReplica) err() error {
+	return fmt.Errorf("registry: node_list replica %q unavailable", r.id)
+}
+
+func (r unavailableNodeListReplica) Read(context.Context, string) (clusterstate.NodeListEntry, bool, error) {
+	return clusterstate.NodeListEntry{}, false, r.err()
+}
+
+func (r unavailableNodeListReplica) Prepare(context.Context, string, clusterstate.Ballot) (clusterstate.NodeListEntry, bool, bool, error) {
+	return clusterstate.NodeListEntry{}, false, false, r.err()
+}
+
+func (r unavailableNodeListReplica) Accept(context.Context, string, clusterstate.NodeListEntry, clusterstate.Ballot) (bool, error) {
+	return false, r.err()
+}
+
+func (r unavailableNodeListReplica) Repair(context.Context, string, clusterstate.NodeListEntry) error {
+	return r.err()
+}
+
+func (r unavailableNodeListReplica) MaxBallot(context.Context, string) (clusterstate.Ballot, error) {
+	return clusterstate.Ballot{}, r.err()
+}
+
+func (r unavailableNodeListReplica) List(context.Context) ([]clusterstate.NodeListEntry, error) {
+	return nil, r.err()
 }

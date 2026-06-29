@@ -387,6 +387,10 @@ func (r *MemoryRouteReplica) Accept(ctx context.Context, key string, rec RouteRe
 		return false, nil
 	}
 	cur, found := r.accepted[key]
+	if found && ballot.Less(cur.Meta.Ballot) {
+		r.mu.Unlock()
+		return false, nil
+	}
 	changed := !found || routeLogicalChanged(cur, rec)
 	r.promised[key] = ballot
 	r.accepted[key] = cloneRoute(rec)
@@ -409,8 +413,12 @@ func (r *MemoryRouteReplica) AcceptDelete(ctx context.Context, key string, ballo
 		r.mu.Unlock()
 		return false, nil
 	}
-	r.promised[key] = ballot
 	cur, found := r.accepted[key]
+	if found && ballot.Less(cur.Meta.Ballot) {
+		r.mu.Unlock()
+		return false, nil
+	}
+	r.promised[key] = ballot
 	group, routeKey := splitRouteKey(key)
 	tombstone := RouteRecord{
 		Meta:     RecordMeta{Ballot: ballot, Rev: cur.Meta.Rev + 1, UpdatedAt: time.Now()},
@@ -442,6 +450,9 @@ func (r *MemoryRouteReplica) Repair(ctx context.Context, key string, rec RouteRe
 	if !found || cur.Meta.Ballot.Less(rec.Meta.Ballot) ||
 		(cur.Meta.Ballot == rec.Meta.Ballot && cur.Meta.Rev < rec.Meta.Rev) {
 		changed := !found || routeLogicalChanged(cur, rec)
+		if r.promised[key].Less(rec.Meta.Ballot) {
+			r.promised[key] = rec.Meta.Ballot
+		}
 		r.accepted[key] = cloneRoute(rec)
 		r.indexAcceptedLocked(key, rec)
 		onChange := r.onChange
@@ -451,6 +462,9 @@ func (r *MemoryRouteReplica) Repair(ctx context.Context, key string, rec RouteRe
 			onChange(key, out)
 		}
 		return nil
+	}
+	if r.promised[key].Less(cur.Meta.Ballot) {
+		r.promised[key] = cur.Meta.Ballot
 	}
 	r.mu.Unlock()
 	return nil

@@ -124,6 +124,29 @@ func TestNodeQuorumReadRepair(t *testing.T) {
 	}
 }
 
+func TestNodeRepairRaisesPromiseAndRejectsLowerAccept(t *testing.T) {
+	ctx := context.Background()
+	rep := NewMemoryNodeReplica()
+	high := NodeRecord{
+		Meta:   RecordMeta{Ballot: Ballot{Round: 9, Writer: "repair"}, Rev: 3},
+		NodeID: "n1", State: NodeLive, RuntimeDigest: "high",
+	}
+	if err := rep.Repair(ctx, "n1", high); err != nil {
+		t.Fatal(err)
+	}
+	low := NodeRecord{
+		Meta:   RecordMeta{Ballot: Ballot{Round: 4, Writer: "late"}, Rev: 2},
+		NodeID: "n1", State: NodeDrained, RuntimeDigest: "low",
+	}
+	if ok, err := rep.Accept(ctx, "n1", low, low.Meta.Ballot); err != nil || ok {
+		t.Fatalf("lower accept after repair ok=%v err=%v, want rejected", ok, err)
+	}
+	got, found, err := rep.Read(ctx, "n1")
+	if err != nil || !found || got.RuntimeDigest != "high" || got.Meta.Ballot != high.Meta.Ballot {
+		t.Fatalf("repair value was overwritten: found=%v err=%v got=%+v", found, err, got)
+	}
+}
+
 func TestNodeJointQuorumRequiresEveryOwnerSet(t *testing.T) {
 	ctx := context.Background()
 	a := &flakyNodeReplica{NodeReplica: NewMemoryNodeReplica()}

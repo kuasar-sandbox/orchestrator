@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/apikey"
 	clusterstate "github.com/kuasar-sandbox/sandbox-orchestrator/internal/cluster"
@@ -30,52 +31,79 @@ type GroupImportSummary struct {
 type groupStore struct {
 	mu     sync.RWMutex
 	groups map[string]clusterstate.SandboxGroupRecord
-	synced bool
 }
 
 func newGroupStore() *groupStore {
 	return &groupStore{groups: map[string]clusterstate.SandboxGroupRecord{}}
 }
 
-func (s *groupStore) ready() bool {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.synced
-}
-
 func (s *groupStore) get(group string) (clusterstate.SandboxGroupRecord, bool) {
+	s.pruneExpired(time.Now().Unix())
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	g, ok := s.groups[group]
-	if !ok {
+	if !ok || g.Deleted {
 		return clusterstate.SandboxGroupRecord{}, false
 	}
 	return cloneGroupRecord(g), true
 }
 
 func (s *groupStore) values() []clusterstate.SandboxGroupRecord {
+	s.pruneExpired(time.Now().Unix())
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	out := make([]clusterstate.SandboxGroupRecord, 0, len(s.groups))
 	for _, g := range s.groups {
+		if g.Deleted {
+			continue
+		}
 		out = append(out, cloneGroupRecord(g))
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Group < out[j].Group })
 	return out
 }
 
-func (s *groupStore) replace(groups []clusterstate.SandboxGroupRecord) {
-	next := make(map[string]clusterstate.SandboxGroupRecord, len(groups))
+func (s *groupStore) upsert(groups []clusterstate.SandboxGroupRecord) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	for _, g := range groups {
 		if g.Group == "" {
+			continue
+		}
+		if g.Deleted {
+			delete(s.groups, g.Group)
+			continue
+		}
+		if g.ExpiresUnix > 0 && g.ExpiresUnix <= time.Now().Unix() {
+			delete(s.groups, g.Group)
+			continue
+		}
+		s.groups[g.Group] = cloneGroupRecord(g)
+	}
+}
+
+func (s *groupStore) replace(groups []clusterstate.SandboxGroupRecord) {
+	next := make(map[string]clusterstate.SandboxGroupRecord, len(groups))
+	now := time.Now().Unix()
+	for _, g := range groups {
+		if g.Group == "" || g.Deleted || (g.ExpiresUnix > 0 && g.ExpiresUnix <= now) {
 			continue
 		}
 		next[g.Group] = cloneGroupRecord(g)
 	}
 	s.mu.Lock()
 	s.groups = next
-	s.synced = true
 	s.mu.Unlock()
+}
+
+func (s *groupStore) pruneExpired(now int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for group, g := range s.groups {
+		if g.ExpiresUnix > 0 && g.ExpiresUnix <= now {
+			delete(s.groups, group)
+		}
+	}
 }
 
 func importGroups(rd io.Reader) ([]clusterstate.SandboxGroupRecord, GroupImportSummary, error) {

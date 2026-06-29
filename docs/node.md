@@ -169,7 +169,7 @@ export E2B_DOMAIN=sandboxes.example.com        # 生产(TLS, §13)
 # dev: E2B_API_URL=http://host:3000  E2B_SANDBOX_URL=http://host:3000
 ```
 
-集群模式下密钥由 registry 经 node-link 租约下发(§10、cluster.md §7.6),无须手动
+集群模式下密钥由 registry 经 node-link 租约下发(§10、cluster.md §12),无须手动
 `manifest-key add`。
 
 ### 2.2 `node-ctl serve`
@@ -249,7 +249,7 @@ create/build 白名单(`manifest_keys` 表)管理,是 serve daemon **admin 平�
 客户端(经本机控制 socket,§6)——daemon 是该表唯一写者,CLI 不开 DB、不读 config,
 只需 `--socket`(或 `NODE_CTL_SOCKET` env,默认 `/run/sandbox/node-ctl.socket`)。
 key 取自位置参数或 `MANIFEST_KEY` env;输出只含指纹,绝不回显 key。集群下该表另由
-registry 经 node-link 以租约项写入(§10、cluster.md §7.6),与手动项共存。
+registry 经 node-link 以租约项写入(§10、cluster.md §12),与手动项共存。
 
 ```
 node-ctl manifest-key add    [--label L] [--ttl 24h]
@@ -616,8 +616,8 @@ serve 在 UDS `paths.config_socket`(默认 `/run/sandbox/node-ctl.socket`,**0600
 **② admin 平面** — `/internal/admin/manifest-keys`(`GET` = list,`POST
 {op: add|remove|check, key, label, ttl_seconds, registry_auth}`):manifest-key 白名单
 管理(§7)。鉴权:配 `paths.admin_pidfile` 则 peer pid 须在其中;未配则仅靠 socket
-0600。`node-ctl manifest-key` 即此平面客户端;集群下 node-link 收到的 `key_put`(写 / 重发续租)/
-`key_drop` 命令亦写此表(租约项,§10)。
+0600。`node-ctl manifest-key` 即此平面客户端;集群下 node-link 心跳维系收到的 `key_put` 写 / 重发续租
+租约项;未续租 key 按 TTL 淘汰,`key_drop` 只作为 best-effort 清理命令(§10)。
 
 **③ plugin 平面** — `PUT /internal/plugin/{id}/register`:一个订阅者(external proxy
 worker,或路由观察者如平台 agent)注册其能力并**持挂该 h2c 连接**——连接本身即它的
@@ -832,7 +832,7 @@ files 转发本机 e2b 控制面(§4),数据面业务流量经 router 注入 `E2
   | `create{cmd_id, sid, group, route_key, template_ref, key_fp, config}` | 冷启 `template_ref` + 合并 `config`(§8;snp 模板 = 快照恢复快启);`key_fp` 选本机租约 manifest_key;group/route_key 注入沙箱 metadata |
   | `connect{cmd_id, sid}` | 恢复本机 PAUSED 沙箱(§8 auto-resume) |
   | `delete{cmd_id, sid|build_id}` | 销毁沙箱 / 构建(§5 kill) |
-  | `key_put` / `key_drop{fingerprint, manifest_key?, expires_unix}` | 写 / 重发续租 / 撤 `manifest_keys` 租约项(§7);**registry 的密钥分发**(cluster.md §7.6) |
+  | `key_put` / `key_drop{fingerprint, manifest_key?, expires_unix}` | `key_put` 写 / 重发续租 `manifest_keys` 租约项;`key_drop` best-effort 清理,正确性依赖 TTL 淘汰(§7);**registry 的密钥分发**(cluster.md §12) |
   | `build_register{build_id, template_id, group, resources, image_repo, registry_auth, key_fp, config}` | 预配 registry 分配的构建(§12;按指纹解析 key、建 build 记录、瞬态用镜像凭据);构建态经 `build_event` 上报 |
 
   无 `drain` 命令——节点排空 / 维护由**节点侧**发起(node-resource.md §2.5 资源 drain 或本机维护策略),

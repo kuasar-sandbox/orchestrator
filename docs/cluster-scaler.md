@@ -63,9 +63,10 @@ SandboxGroupImporter:
 ```
 
 Importer 提供 group 列表、TTL、tombstone/draining 标记和 generation。当前实现用
-`cluster-ctl scaler import` 导入 JSONL,语义是全量替换;缺失 group 会触发空 key allocation patch,
-registry/node owner 据此 drop key。provider 删除 group 时,必须先以 tombstone/draining group 形式继续出现在
-import 中,直到 registry 确认该 group 没有活动 route/build 执行态。
+`cluster-ctl scaler import` 导入 JSONL,语义是 upsert:缺失 group 不删除既有 cache,只有 `deleted` 或
+`expires_unix` 到期才停止参与 Place 和 key allocation。provider 删除 group 时,必须先以 tombstone/draining
+group 形式继续出现,直到 registry 确认该 group 没有活动 route/build 执行态;随后停止续租,让 group/key
+cache 按 TTL 淘汰。
 
 ## 5. node_list WATCH_LIST
 
@@ -87,9 +88,9 @@ WATCH_LIST 语义:
 4. 高频负载不在该流中传播;普通 heartbeat 只更新 node_link,不会触发 node_list 事件。
 5. draining 变化和粗粒度 liveness 刷新更新 node_list。
 
-node_list owner 分片内全复制,所以 scaler 不需要也不能把多个 owner 的结果做片间合并。首版 ready 门槛
-是一个 active node_list WATCH_LIST 完成 reset/bookmark;当前 owner 断线时,scaler 清空该源视图并 failover
-到另一个候选 owner 重新 snapshot。
+node_list owner 分片内全复制,所以 scaler 不需要也不能把多个 owner 的结果做片间合并。scaler ready 只要求
+一个 active node_list WATCH_LIST 完成 reset/bookmark;当前 owner 断线时,scaler 清空该源视图并 failover
+到另一个候选 owner 重新 snapshot。group cache 按单个 group 命中和 TTL 判断,不参与全局 ready。
 
 ## 6. Scale-link 成员域
 
@@ -104,8 +105,10 @@ scaler ready 的条件:
 
 - 已拉取当前 registry membership。
 - 一个 active node_list WATCH_LIST 已完成 reset/bookmark。
-- group import generation 达到当前要求。
 - provider 可用。
+
+group import 不构成全局 ready 门槛。每个 Place 只解析请求中的 group;该 group 未命中、已过期或 tombstone
+时返回 NoNode/不可用,不会阻塞其他 group。
 
 registry 只把 `ready_label == active_registry_label` 且最近注册未过期的 scaler 作为 Place 候选。
 
@@ -115,7 +118,7 @@ registry 只把 `ready_label == active_registry_label` 且最近注册未过期�
 
 周期任务:
 
-1. `Importer.Range` 得 group 集和 generation。
+1. `Importer.Range` 得 group 页、TTL/tombstone 和 generation。
 2. `GetPlacementHint` 得静态 selectors/shuffle labels。
 3. 用 `pkg/maglev.LocateN` 计算 shuffle 结果。
 4. 将 shuffle 约束合并进最终 selectors。
@@ -164,10 +167,12 @@ scaler 主管 key allocation 决策:
 
 1. 获取 group 的 typed `manifest_key` 和 `auth_key`。
 2. 根据 placement selectors 得到 allocation set。
-3. 将目标 node set 与 key material/ref 作为 intent 返回给 registry/node owner。
-4. node owner 执行 `key_put/key_drop`、ack、lease、重试。
+3. 将目标 node set 与 key material/ref 作为 allocation patch 推给 registry。
+4. registry/node owner 把每个 node 的 desired key list 写入 node_link 记录并在 owner set 内 CAS 复制。
+5. node-link 心跳维系按间隔对当前连接节点执行 `key_put` 续租;未续租 key 由节点 TTL 淘汰,`key_drop`
+   不作为正确性依赖。
 
-密钥是 create/build 前置条件;key_drop 或租约过期不影响已经运行的 sandbox。
+密钥是 create/build 前置条件;key cache 删除、key_drop 或租约过期不影响已经运行的 sandbox。
 
 ## 9. 可靠性
 
@@ -175,9 +180,9 @@ scaler 主管 key allocation 决策:
 |---|---|
 | scaler 崩溃 | registry 对该 group failover 到下一个 ready scaler;热路径不受影响 |
 | WATCH_LIST 断线 | scaler 清空 node_list 视图并 failover 到另一个 owner 全量重订;完成 bookmark 前 not-ready |
-| provider 不可用 | scaler 标记 not-ready 或 Place 返回不可用 |
+| provider 不可用 | 对受影响 group 的 Place 返回不可用;其他已缓存 group 可继续服务 |
 | node labels 旧 | node owner admission/create 兜底拒绝 |
-| key 投递失败 | create/build 在 node 侧 reject,route owner 重调度或返回失败 |
+| key 续租投递失败 | create/build 在 node 侧 reject,route owner 重调度或返回失败;下一次 heartbeat refresh 重试 |
 | build 预算泄漏 | admission lease 超时释放 |
 
 ## 10. 性能

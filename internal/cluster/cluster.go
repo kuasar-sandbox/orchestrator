@@ -99,6 +99,8 @@ type SandboxGroup struct {
 type SandboxGroupRecord struct {
 	Group         string              `json:"group"`
 	ProjectID     string              `json:"project_id,omitempty"`
+	ExpiresUnix   int64               `json:"expires_unix,omitempty"`
+	Deleted       bool                `json:"deleted,omitempty"`
 	ManifestKey   Secret              `json:"manifest_key,omitempty"`
 	AuthKey       Secret              `json:"auth_key,omitempty"`
 	RegistryAuth  Secret              `json:"registry_auth,omitempty"`

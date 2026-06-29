@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	clusterstate "github.com/kuasar-sandbox/sandbox-orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/routesync"
 )
 
@@ -21,29 +22,85 @@ type NodeOwner interface {
 }
 
 type localNodeOwner struct {
-	reg    *Registry
-	leases *buildAdmissionManager
+	reg     *Registry
+	leases  *buildAdmissionManager
+	keyMu   sync.Mutex
+	keySent map[string]map[string]int64
 }
 
 func newLocalNodeOwner(reg *Registry) *localNodeOwner {
-	return &localNodeOwner{reg: reg, leases: newBuildAdmissionManager()}
+	return &localNodeOwner{reg: reg, leases: newBuildAdmissionManager(), keySent: map[string]map[string]int64{}}
 }
 
 func (o *localNodeOwner) PutManifestKey(ctx context.Context, nodeID, fingerprint, keyType, keyValue string, expiresUnix int64) error {
 	if keyType == "" {
-		keyType = "inline"
+		keyType = clusterstate.SecretInline
 	}
-	cmd := &routesync.Command{CmdID: newID(), Kind: routesync.CmdKeyPut, KeyFingerprint: fingerprint, ManifestKeyType: keyType, ExpiresUnix: expiresUnix}
+	key := clusterstate.NodeManifestKey{Fingerprint: fingerprint, Type: keyType, ExpiresUnix: expiresUnix}
 	if keyType == "ref" {
-		cmd.ManifestKeyRef = keyValue
+		key.Ref = keyValue
 	} else {
-		cmd.ManifestKey = keyValue
+		key.Value = keyValue
 	}
-	return o.SendCommand(ctx, nodeID, cmd)
+	return o.reg.stores.UpsertNodeManifestKey(ctx, nodeID, key)
 }
 
 func (o *localNodeOwner) DropManifestKey(ctx context.Context, nodeID, fingerprint string) error {
-	return o.SendCommand(ctx, nodeID, &routesync.Command{CmdID: newID(), Kind: routesync.CmdKeyDrop, KeyFingerprint: fingerprint})
+	if err := o.reg.stores.DropNodeManifestKey(ctx, nodeID, fingerprint); err != nil {
+		return err
+	}
+	o.keyMu.Lock()
+	if sent := o.keySent[nodeID]; sent != nil {
+		delete(sent, fingerprint)
+		if len(sent) == 0 {
+			delete(o.keySent, nodeID)
+		}
+	}
+	o.keyMu.Unlock()
+	return nil
+}
+
+func (o *localNodeOwner) RefreshManifestKeys(ctx context.Context, nodeID string, keys []clusterstate.NodeManifestKey) {
+	now := time.Now().Unix()
+	for _, key := range keys {
+		if key.Fingerprint == "" || (key.ExpiresUnix > 0 && key.ExpiresUnix <= now) {
+			continue
+		}
+		if !o.shouldSendManifestKey(nodeID, key.Fingerprint, now) {
+			continue
+		}
+		cmd := &routesync.Command{
+			CmdID:           newID(),
+			Kind:            routesync.CmdKeyPut,
+			KeyFingerprint:  key.Fingerprint,
+			ManifestKeyType: key.Type,
+			ManifestKey:     key.Value,
+			ManifestKeyRef:  key.Ref,
+			ExpiresUnix:     key.ExpiresUnix,
+		}
+		if cmd.ManifestKeyType == "" {
+			cmd.ManifestKeyType = clusterstate.SecretInline
+		}
+		if err := o.SendCommand(ctx, nodeID, cmd); err == nil {
+			o.recordManifestKeySent(nodeID, key.Fingerprint, now)
+		}
+	}
+}
+
+func (o *localNodeOwner) shouldSendManifestKey(nodeID, fingerprint string, now int64) bool {
+	o.keyMu.Lock()
+	defer o.keyMu.Unlock()
+	last := o.keySent[nodeID][fingerprint]
+	return last == 0 || now-last >= int64(keyRenewEvery.Seconds())
+}
+
+func (o *localNodeOwner) recordManifestKeySent(nodeID, fingerprint string, now int64) {
+	o.keyMu.Lock()
+	if o.keySent[nodeID] == nil {
+		o.keySent[nodeID] = map[string]int64{}
+	}
+	o.keySent[nodeID][fingerprint] = now
+	o.keyMu.Unlock()
 }
 
 func (o *localNodeOwner) AdmitBuild(ctx context.Context, nodeID, buildID string, want *routesync.BuildResources) bool {

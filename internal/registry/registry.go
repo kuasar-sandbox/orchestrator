@@ -159,8 +159,8 @@ func New(stores *Stores, placer Placer, parkTimeout time.Duration, log *slog.Log
 }
 
 // applySelectorPatch records the scaler-owned key allocation for a group. The
-// registry/node owner executes key_put/key_drop to this explicit node set; local
-// selector matching is only a bootstrap path before the scaler has pushed allocation.
+// registry/node owner writes this explicit node set into node_link key caches;
+// local selector matching is only a bootstrap path before the scaler has pushed allocation.
 func (r *Registry) applySelectorPatch(p *routesync.SelectorPatch) {
 	r.scalerMu.Lock()
 	if p.NodeAllocation {
@@ -461,9 +461,9 @@ func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, o
 	return ErrNoNode
 }
 
-// sendAndWait sends a command and blocks until the node acks it (or timeout) — for
-// synchronous commands (key_put/renew/drop), so a build forward gates on the key
-// being installed (cluster.md §5.1) instead of racing it over the data plane.
+// sendAndWait sends a lifecycle/build command and blocks until the node acks it
+// (or timeout). key_put refreshes are best-effort heartbeat maintenance and do
+// not use this path.
 func (r *Registry) sendAndWait(ctx context.Context, conn nodeConn, cmd *routesync.Command, timeout time.Duration) (*routesync.CmdAck, error) {
 	ch := make(chan *routesync.CmdAck, 1)
 	r.mu.Lock()
@@ -856,9 +856,20 @@ func (r *Registry) updateHeartbeat(ctx context.Context, nodeID string, hb *route
 	rec.BuildAlloc, rec.Counts, rec.Draining = hb.BuildAlloc, hb.Counts, hb.Draining
 	rec.LastHeartbeatUnix = time.Now().Unix()
 	_ = r.stores.PutNodeRuntime(ctx, rec)
+	r.refreshNodeManifestKeys(ctx, rec)
 	if rec.Draining != oldDraining || oldHeartbeat <= 0 || rec.LastHeartbeatUnix-oldHeartbeat >= r.stores.NodeListHeartbeatRefreshSec() {
 		_ = r.stores.PutNodeList(ctx, rec)
 	}
+}
+
+func (r *Registry) refreshNodeManifestKeys(ctx context.Context, rec *NodeRecord) {
+	if rec == nil || rec.NodeID == "" || len(rec.ManifestKeys) == 0 {
+		return
+	}
+	if owner, ok := r.localNodeOwner.(*localNodeOwner); ok {
+		owner.RefreshManifestKeys(ctx, rec.NodeID, rec.ManifestKeys)
+	}
+	_ = r.stores.PruneExpiredNodeManifestKeys(ctx, rec.NodeID, time.Now().Unix())
 }
 
 func (r *Registry) updateNodeResume(ctx context.Context, nodeID, token string) {

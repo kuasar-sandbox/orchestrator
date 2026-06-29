@@ -185,6 +185,10 @@ func readViewFrame(r io.Reader) (*registry.ViewEvent, error) {
 func TestClusterStubReserveAndDataPlane(t *testing.T) {
 	h := newHarness(t)
 
+	h.waitForNodeKeyCache(t, "n1")
+	h.node.sendHeartbeat(t)
+	h.node.waitCommand(t, routesync.CmdKeyPut)
+
 	resp := h.doDataByKey(t, "u1:s1")
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusNoContent {
@@ -197,7 +201,6 @@ func TestClusterStubReserveAndDataPlane(t *testing.T) {
 	if create.KeyFingerprint == "" || create.AccessToken == "" {
 		t.Fatalf("create missing key fingerprint or access token: %+v", create)
 	}
-	h.node.waitCommand(t, routesync.CmdKeyPut)
 
 	select {
 	case req := <-h.dataHits:
@@ -224,6 +227,18 @@ func TestClusterStubReserveAndDataPlane(t *testing.T) {
 	if got := h.node.countKind(routesync.CmdCreate); got != 1 {
 		t.Fatalf("create commands=%d, want 1 (route cache should avoid Reserve)", got)
 	}
+}
+
+func (h *harness) waitForNodeKeyCache(t *testing.T, nodeID string) {
+	t.Helper()
+	for i := 0; i < 300; i++ {
+		node, found, err := h.reg.Stores().GetNode(h.ctx, nodeID)
+		if err == nil && found && len(node.ManifestKeys) > 0 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("node %s did not receive manifest key cache", nodeID)
 }
 
 func TestClusterStubBuildRegister(t *testing.T) {
@@ -435,6 +450,11 @@ func (n *nodeStub) commandKinds() []string {
 func (n *nodeStub) sendRoute(t *testing.T, entry routesync.RouteEntry) {
 	t.Helper()
 	n.write(t, &routesync.Msg{Type: routesync.TypeUpsert, Route: &entry})
+}
+
+func (n *nodeStub) sendHeartbeat(t *testing.T) {
+	t.Helper()
+	n.write(t, &routesync.Msg{Type: routesync.TypeHeartbeat, Beat: &routesync.Heartbeat{Counts: 0}})
 }
 
 func (n *nodeStub) write(t *testing.T, msg *routesync.Msg) {

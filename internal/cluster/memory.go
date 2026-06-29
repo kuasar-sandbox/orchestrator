@@ -238,6 +238,7 @@ func cloneNode(in NodeRecord) NodeRecord {
 	in.Labels = cloneStringMap(in.Labels)
 	in.BuildCapacity = cloneBuildResources(in.BuildCapacity)
 	in.BuildAlloc = cloneBuildResources(in.BuildAlloc)
+	in.ManifestKeys = cloneNodeManifestKeys(in.ManifestKeys)
 	in.Sandboxes = cloneNodeSandboxRefs(in.Sandboxes)
 	in.Builds = cloneNodeBuildRefs(in.Builds)
 	return in
@@ -247,6 +248,15 @@ func cloneNodeList(in NodeListEntry) NodeListEntry {
 	in.Labels = cloneStringMap(in.Labels)
 	in.BuildCapacity = cloneBuildResources(in.BuildCapacity)
 	return in
+}
+
+func cloneNodeManifestKeys(in []NodeManifestKey) []NodeManifestKey {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]NodeManifestKey, len(in))
+	copy(out, in)
+	return out
 }
 
 func cloneNodeSandboxRefs(in []NodeSandboxRef) []NodeSandboxRef {

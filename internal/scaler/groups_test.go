@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"strings"
 	"testing"
+	"time"
 
 	clusterstate "github.com/kuasar-sandbox/sandbox-orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/clustercfg"
@@ -51,6 +52,45 @@ func TestAnswerIncludesGroupMaterial(t *testing.T) {
 	}
 	if res.AccessToken != want || res.KeyFingerprint == "" {
 		t.Fatalf("token/key mismatch: %+v want token %q", res, want)
+	}
+}
+
+func TestAnswerUsesRequestedGroupWithoutGlobalImportReady(t *testing.T) {
+	svc := NewRemote("127.0.0.1:1", nil, clustercfg.PlacementConfig{Candidates: 1}, 30, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	putNodeList(t, svc, clusterstate.NodeListEntry{NodeID: "n1", Labels: map[string]string{"pool": "p"}})
+	svc.groups.mu.Lock()
+	svc.groups.groups["/g"] = clusterstate.SandboxGroupRecord{
+		Group: "/g", ManifestKey: clusterstate.Secret{Type: clusterstate.SecretInline, Value: testManifestKey},
+		AuthKey:       clusterstate.Secret{Type: clusterstate.SecretInline, Value: testAuthKey},
+		TemplateRef:   "tmpl",
+		NodeSelectors: []map[string]string{{"pool": "p"}},
+	}
+	svc.groups.mu.Unlock()
+
+	res := svc.answer(&routesync.PlaceReq{Group: "/g", RouteKey: "rk", SandboxID: "sb-1"})
+	if res.NoNode || res.Error != "" || res.NodeID != "n1" {
+		t.Fatalf("answer should not require global group import readiness: %+v", res)
+	}
+}
+
+func TestImportGroupsUpsertsAndTTLEvicts(t *testing.T) {
+	svc := NewRemote("127.0.0.1:1", nil, clustercfg.PlacementConfig{Candidates: 1}, 30, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	svc.ImportGroups([]clusterstate.SandboxGroupRecord{{Group: "/g", TemplateRef: "g"}})
+	svc.ImportGroups([]clusterstate.SandboxGroupRecord{{Group: "/x", TemplateRef: "x"}})
+	if _, ok := svc.groups.get("/g"); !ok {
+		t.Fatal("upsert import deleted missing /g")
+	}
+	if _, ok := svc.groups.get("/x"); !ok {
+		t.Fatal("upsert import did not add /x")
+	}
+
+	svc.ImportGroups([]clusterstate.SandboxGroupRecord{{Group: "/g", ExpiresUnix: time.Now().Add(-time.Second).Unix()}})
+	if _, ok := svc.groups.get("/g"); ok {
+		t.Fatal("expired group was not evicted")
+	}
+	svc.ImportGroups([]clusterstate.SandboxGroupRecord{{Group: "/x", Deleted: true}})
+	if _, ok := svc.groups.get("/x"); ok {
+		t.Fatal("deleted group tombstone was not evicted")
 	}
 }
 

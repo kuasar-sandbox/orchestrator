@@ -55,9 +55,9 @@ func (o *Orchestrator) HandleCommand(ctx context.Context, cmd *routesync.Command
 		}()
 		return accept(cmd)
 	case routesync.CmdKeyPut:
-		// Key distribution (cluster.md §7.6): install the group's manifest key into
-		// the node's allowlist (a TTL lease) so create can resolve it by fingerprint.
-		// The ack confirms installation — a build forward (Reserve) gates on it.
+		// Key distribution (cluster.md §12): refresh the manifest-key allowlist
+		// lease so create/build can resolve it by fingerprint. The registry sends
+		// this from node_link heartbeat maintenance, not on the Place path.
 		if cmd.ManifestKeyType == "ref" || cmd.ManifestKeyRef != "" {
 			return reject(cmd, fmt.Errorf("manifest_key ref delivery is not configured"))
 		}
@@ -388,9 +388,9 @@ func (o *Orchestrator) deriveSandboxAPIKey(ctx context.Context, sid string) (str
 	return apikey.Mint(raw)
 }
 
-// dropClusterKey removes a predistributed manifest key from the node's allowlist
-// by fingerprint (cluster.md §7.6 lease withdrawal). 7a relies on the node's lazy
-// TTL-lease expiry to reclaim it; 7c wires explicit removal-by-fingerprint.
+// dropClusterKey removes a manifest key from the node's allowlist by fingerprint.
+// It is best-effort; normal withdrawal relies on TTL expiry when heartbeat
+// refresh stops (cluster.md §12).
 func (o *Orchestrator) dropClusterKey(ctx context.Context, fingerprint string) error {
 	keys, err := o.st.AllowedManifestKeysByHash(ctx, fingerprint)
 	if err != nil {

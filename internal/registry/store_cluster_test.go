@@ -219,11 +219,11 @@ func TestNodeListHeartbeatRefreshIsConfigurable(t *testing.T) {
 func TestNodeListReplicatesToLocatedOwnerSet(t *testing.T) {
 	ctx := context.Background()
 	view := clusterstate.MemberView{Version: 1, Members: []string{"a", "b", "c"}}
-	rb, rc := &nodeListReplicaRecorder{entries: map[string]clusterstate.NodeListEntry{}}, &nodeListReplicaRecorder{entries: map[string]clusterstate.NodeListEntry{}}
+	rb, rc := clusterstate.NewMemoryNodeListReplica(), clusterstate.NewMemoryNodeListReplica()
 	kv := clusterstore.OpenMemory(100)
 	defer kv.Close()
 	stores := NewClusterStores(kv, "a", view, 1, 1, nil, nil)
-	stores.SetNodeListTopology([]clusterstate.MemberView{view}, 2, map[string]NodeListReplica{"b": rb, "c": rc})
+	stores.SetNodeListTopology([]clusterstate.MemberView{view}, 2, map[string]clusterstate.NodeListReplica{"b": rb, "c": rc})
 
 	entry := clusterstate.NodeListEntry{NodeID: "n1", Labels: map[string]string{"pool": "p"}, LastHeartbeatUnix: time.Now().Unix()}
 	if err := stores.PutNodeListEntry(ctx, entry); err != nil {
@@ -235,15 +235,11 @@ func TestNodeListReplicatesToLocatedOwnerSet(t *testing.T) {
 	}
 	reps := map[string]func() bool{
 		"a": func() bool {
-			found := false
-			_ = stores.RangeNodeList(ctx, func(got clusterstate.NodeListEntry) error {
-				found = found || got.NodeID == "n1"
-				return nil
-			})
+			_, found, _ := stores.LocalNodeListReplica().Read(ctx, "n1")
 			return found
 		},
-		"b": func() bool { _, ok := rb.entries["n1"]; return ok },
-		"c": func() bool { _, ok := rc.entries["n1"]; return ok },
+		"b": func() bool { _, found, _ := rb.Read(ctx, "n1"); return found },
+		"c": func() bool { _, found, _ := rc.Read(ctx, "n1"); return found },
 	}
 	ownerSet := map[string]bool{}
 	for _, owner := range owners {
@@ -259,20 +255,66 @@ func TestNodeListReplicatesToLocatedOwnerSet(t *testing.T) {
 	}
 }
 
-type nodeListReplicaRecorder struct {
-	entries map[string]clusterstate.NodeListEntry
-	deletes []string
+func TestNodeListTombstoneRejectsStaleProjection(t *testing.T) {
+	ctx := context.Background()
+	kv := clusterstore.OpenMemory(100)
+	defer kv.Close()
+	stores := NewClusterStores(kv, "a", clusterstate.MemberView{Version: 1, Members: []string{"a"}}, 1, 1, nil, nil)
+
+	if err := stores.PutNodeListEntry(ctx, clusterstate.NodeListEntry{
+		NodeID: "n1", LastHeartbeatUnix: 100, Labels: map[string]string{"gen": "new"},
+	}); err != nil {
+		t.Fatalf("PutNodeListEntry new: %v", err)
+	}
+	if err := stores.DeleteNodeList(ctx, "n1"); err != nil {
+		t.Fatalf("DeleteNodeList: %v", err)
+	}
+	if err := stores.PutNodeListEntry(ctx, clusterstate.NodeListEntry{
+		NodeID: "n1", LastHeartbeatUnix: 99, Labels: map[string]string{"gen": "stale"},
+	}); err != nil {
+		t.Fatalf("PutNodeListEntry stale: %v", err)
+	}
+	found := false
+	if err := stores.RangeNodeList(ctx, func(got clusterstate.NodeListEntry) error {
+		found = found || got.NodeID == "n1"
+		return nil
+	}); err != nil {
+		t.Fatalf("RangeNodeList: %v", err)
+	}
+	if found {
+		t.Fatal("stale node_list projection resurrected after delete")
+	}
 }
 
-func (r *nodeListReplicaRecorder) ApplyNodeListPut(ctx context.Context, entry clusterstate.NodeListEntry) error {
-	r.entries[entry.NodeID] = entry
-	return nil
-}
+func TestNodeListRangeRepairsLocalFromOwnerSet(t *testing.T) {
+	ctx := context.Background()
+	view := clusterstate.MemberView{Version: 1, Members: []string{"a", "b"}}
+	rb := clusterstate.NewMemoryNodeListReplica()
+	seed := clusterstate.NodeListEntry{
+		Meta:   clusterstate.RecordMeta{Ballot: clusterstate.Ballot{Round: 5, Writer: "b"}, Rev: 3, UpdatedAt: time.Now()},
+		NodeID: "n-remote", Labels: map[string]string{"pool": "p"}, LastHeartbeatUnix: time.Now().Unix(),
+	}
+	if ok, err := rb.Accept(ctx, seed.NodeID, seed, seed.Meta.Ballot); err != nil || !ok {
+		t.Fatalf("seed remote node_list ok=%v err=%v", ok, err)
+	}
+	kv := clusterstore.OpenMemory(100)
+	defer kv.Close()
+	stores := NewClusterStores(kv, "a", view, 1, 1, nil, nil)
+	stores.SetNodeListTopology([]clusterstate.MemberView{view}, 2, map[string]clusterstate.NodeListReplica{"b": rb})
 
-func (r *nodeListReplicaRecorder) ApplyNodeListDelete(ctx context.Context, nodeID string) error {
-	delete(r.entries, nodeID)
-	r.deletes = append(r.deletes, nodeID)
-	return nil
+	var got []clusterstate.NodeListEntry
+	if err := stores.RangeNodeList(ctx, func(entry clusterstate.NodeListEntry) error {
+		got = append(got, entry)
+		return nil
+	}); err != nil {
+		t.Fatalf("RangeNodeList: %v", err)
+	}
+	if len(got) != 1 || got[0].NodeID != seed.NodeID {
+		t.Fatalf("unexpected range result: %+v", got)
+	}
+	if _, found, err := stores.LocalNodeListReplica().Read(ctx, seed.NodeID); err != nil || !found {
+		t.Fatalf("local repair found=%v err=%v", found, err)
+	}
 }
 
 type routingNodeOwnerRecorder struct {

@@ -69,7 +69,7 @@ const (
 	CmdCreate        = "create"         // boot a sandbox from a template
 	CmdConnect       = "connect"        // resume a node-local PAUSED sandbox
 	CmdDelete        = "delete"         // destroy a sandbox
-	CmdKeyPut        = "key_put"        // install / renew a manifest-key lease (reconcile re-sends; cluster.md §7.6)
+	CmdKeyPut        = "key_put"        // install / renew a manifest-key lease (heartbeat refresh; cluster.md §12)
 	CmdKeyDrop       = "key_drop"       // drop a key lease
 	CmdBuildRegister = "build_register" // pre-provision a build on the node (registry-assigned ids, §7.5)
 )

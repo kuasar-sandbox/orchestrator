@@ -5,12 +5,9 @@ import (
 	"time"
 )
 
-// Key distribution (cluster.md §7.6): the registry predistributes each group's
-// manifest key to its allocation set (the nodes matching the group's
-// nodeSelectors) on a TTL lease, ahead of placement, renews held leases, and
-// drops the key from nodes that leave the set. Placement itself does no key_put —
-// a node missing the key fails create/build (a rejected ack / 4xx), which is the
-// intended signal that predistribution must precede placement.
+// Key distribution (cluster.md §12): the registry projects each group's manifest
+// key allocation into per-node node_link key caches. Heartbeat maintenance sends
+// periodic key_put renewals from that cache; placement itself does no key_put.
 
 const (
 	keyLeaseTTL   = 3 * time.Hour // lease lifetime pushed to nodes
@@ -24,7 +21,7 @@ type keyLeaseState struct {
 
 type keyOp struct {
 	nodeID, fp, keyType, keyValue string
-	drop                          bool
+	expiresUnix                   int64
 }
 
 type keyAllocationState struct {
@@ -66,60 +63,85 @@ func (r *Registry) onNodeConnected() {
 	}
 }
 
-// reconcileKeys pushes each keyed group's manifest key to its connected
-// allocation set (install / renew) and drops it from nodes that left the set.
-// The key-lease map is updated under keyMu, but the channel sends happen AFTER
-// the lock is released — so one wedged node can't stall key distribution for
-// every other group/node behind a blocked send.
+// reconcileKeys projects scaler-owned group allocations into each node's
+// node_link manifest-key cache. Actual key_put refreshes are driven by node
+// heartbeat maintenance; this path must not synchronously push node commands.
 func (r *Registry) reconcileKeys(ctx context.Context) {
 	expires := time.Now().Add(keyLeaseTTL).Unix()
-	var ops []keyOp
 	allocs := r.keyAllocations()
+	prev := r.keyLeaseSnapshot()
+	next := make(map[string]keyLeaseState, len(allocs))
+	desired := map[string]map[string]keyOp{}
 	for group, alloc := range allocs {
 		if alloc.fp == "" || alloc.keyValue == "" {
-			r.dropGroupKeyLeases(group, &ops)
 			continue
 		}
 		want := r.liveAllocationSet(alloc.nodes)
-		r.keyMu.Lock()
-		have := r.keyLeased[group]
-		if have.fp != "" && have.fp != alloc.fp {
-			for nodeID := range have.nodes {
-				ops = append(ops, keyOp{nodeID: nodeID, fp: have.fp, drop: true})
-			}
-		}
 		for nodeID := range want {
-			ops = append(ops, keyOp{nodeID: nodeID, fp: alloc.fp, keyType: alloc.keyType, keyValue: alloc.keyValue})
-		}
-		for nodeID := range have.nodes {
-			if have.fp == alloc.fp && !want[nodeID] {
-				ops = append(ops, keyOp{nodeID: nodeID, fp: have.fp, drop: true})
+			if desired[nodeID] == nil {
+				desired[nodeID] = map[string]keyOp{}
 			}
+			desired[nodeID][alloc.fp] = keyOp{nodeID: nodeID, fp: alloc.fp, keyType: alloc.keyType, keyValue: alloc.keyValue, expiresUnix: expires}
 		}
-		r.keyLeased[group] = keyLeaseState{fp: alloc.fp, nodes: want}
-		r.keyMu.Unlock()
+		next[group] = keyLeaseState{fp: alloc.fp, nodes: want}
 	}
-	for _, o := range ops {
+	for _, keys := range desired {
+		for _, o := range keys {
+			if r.nodeOwner == nil {
+				continue
+			}
+			_ = r.nodeOwner.PutManifestKey(ctx, o.nodeID, o.fp, o.keyType, o.keyValue, o.expiresUnix)
+		}
+	}
+	for _, have := range previousNodeKeySet(prev) {
 		if r.nodeOwner == nil {
 			continue
 		}
-		if o.drop {
-			_ = r.nodeOwner.DropManifestKey(ctx, o.nodeID, o.fp)
-		} else {
-			_ = r.nodeOwner.PutManifestKey(ctx, o.nodeID, o.fp, o.keyType, o.keyValue, expires)
+		if desired[have.nodeID] != nil && desired[have.nodeID][have.fp].fp != "" {
+			continue
 		}
+		_ = r.nodeOwner.DropManifestKey(ctx, have.nodeID, have.fp)
 	}
+	r.replaceKeyLeases(next)
 }
 
-func (r *Registry) dropGroupKeyLeases(group string, ops *[]keyOp) {
+func (r *Registry) keyLeaseSnapshot() map[string]keyLeaseState {
 	r.keyMu.Lock()
 	defer r.keyMu.Unlock()
-	if have, ok := r.keyLeased[group]; ok {
-		for nodeID := range have.nodes {
-			*ops = append(*ops, keyOp{nodeID: nodeID, fp: have.fp, drop: true})
+	out := make(map[string]keyLeaseState, len(r.keyLeased))
+	for group, lease := range r.keyLeased {
+		nodes := make(map[string]bool, len(lease.nodes))
+		for nodeID := range lease.nodes {
+			nodes[nodeID] = true
 		}
-		delete(r.keyLeased, group)
+		out[group] = keyLeaseState{fp: lease.fp, nodes: nodes}
 	}
+	return out
+}
+
+func (r *Registry) replaceKeyLeases(next map[string]keyLeaseState) {
+	r.keyMu.Lock()
+	r.keyLeased = next
+	r.keyMu.Unlock()
+}
+
+func previousNodeKeySet(prev map[string]keyLeaseState) []keyOp {
+	seen := map[string]bool{}
+	var out []keyOp
+	for _, lease := range prev {
+		if lease.fp == "" {
+			continue
+		}
+		for nodeID := range lease.nodes {
+			key := nodeID + "\x00" + lease.fp
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			out = append(out, keyOp{nodeID: nodeID, fp: lease.fp})
+		}
+	}
+	return out
 }
 
 func (r *Registry) liveAllocationSet(nodes map[string]bool) map[string]bool {

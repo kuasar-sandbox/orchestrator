@@ -129,7 +129,7 @@ func mountRegistryControl(mux *http.ServeMux, reg *registry.Registry, cfgState *
 		clusterstate.ServeNodeReplica(w, req, reg.Stores().LocalNodeReplica())
 	})
 	mux.HandleFunc(registry.NodeListReplicaRPCPath, func(w http.ResponseWriter, req *http.Request) {
-		registry.ServeNodeListReplica(w, req, reg.Stores())
+		registry.ServeNodeListReplica(w, req, reg.Stores().LocalNodeListReplica())
 	})
 	mux.HandleFunc(registry.NodeOwnerRPCPath, func(w http.ResponseWriter, req *http.Request) {
 		registry.ServeNodeOwner(w, req, reg.LocalNodeOwner())
@@ -280,7 +280,7 @@ func newRegistryStores(kv clusterstore.Store, cfg *clustercfg.RegistryConfig) (*
 	return stores, nodeOwners, nil
 }
 
-func buildRegistryTopology(cfg *clustercfg.RegistryConfig) ([]clusterstate.MemberView, map[string]clusterstate.RouteReplica, map[string]clusterstate.NodeReplica, map[string]registry.NodeListReplica, map[string]registry.NodeOwner, error) {
+func buildRegistryTopology(cfg *clustercfg.RegistryConfig) ([]clusterstate.MemberView, map[string]clusterstate.RouteReplica, map[string]clusterstate.NodeReplica, map[string]clusterstate.NodeListReplica, map[string]registry.NodeOwner, error) {
 	ownerVersions := cfg.Membership.OwnerVersions()
 	views := make([]clusterstate.MemberView, 0, len(ownerVersions))
 	for _, version := range ownerVersions {
@@ -288,7 +288,7 @@ func buildRegistryTopology(cfg *clustercfg.RegistryConfig) ([]clusterstate.Membe
 	}
 	routeReplicas := map[string]clusterstate.RouteReplica{}
 	nodeReplicas := map[string]clusterstate.NodeReplica{}
-	nodeListReplicas := map[string]registry.NodeListReplica{}
+	nodeListReplicas := map[string]clusterstate.NodeListReplica{}
 	nodeOwners := map[string]registry.NodeOwner{}
 	for _, member := range jointMembershipMembers(cfg.Membership.MemberVersions()) {
 		if member.ID == "" || member.ID == cfg.Member.ID {
