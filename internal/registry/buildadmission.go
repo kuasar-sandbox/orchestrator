@@ -53,7 +53,7 @@ func (o *localNodeOwner) RefreshManifestKeys(ctx context.Context, nodeID string,
 		if key.Fingerprint == "" || (key.ExpiresUnix > 0 && key.ExpiresUnix <= now) {
 			continue
 		}
-		if key.SentExpiresUnix > now {
+		if key.SentExpiresUnix-now > int64(keyRenewBefore.Seconds()) {
 			continue
 		}
 		cmd := &routesync.Command{

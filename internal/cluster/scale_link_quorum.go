@@ -9,11 +9,11 @@ import (
 type ScaleLinkProposal func(current ScaleLinkRecord, found bool) (ScaleLinkRecord, bool, error)
 
 type ScaleLinkReplica interface {
-	Read(ctx context.Context, taskID string) (ScaleLinkRecord, bool, error)
-	Prepare(ctx context.Context, taskID string, ballot Ballot) (ScaleLinkRecord, bool, bool, error)
-	Accept(ctx context.Context, taskID string, rec ScaleLinkRecord, ballot Ballot) (bool, error)
-	Repair(ctx context.Context, taskID string, rec ScaleLinkRecord) error
-	MaxBallot(ctx context.Context, taskID string) (Ballot, error)
+	Read(ctx context.Context, key string) (ScaleLinkRecord, bool, error)
+	Prepare(ctx context.Context, key string, ballot Ballot) (ScaleLinkRecord, bool, bool, error)
+	Accept(ctx context.Context, key string, rec ScaleLinkRecord, ballot Ballot) (bool, error)
+	Repair(ctx context.Context, key string, rec ScaleLinkRecord) error
+	MaxBallot(ctx context.Context, key string) (Ballot, error)
 }
 
 type ScaleLinkReplicaSlot struct {
@@ -37,35 +37,35 @@ func NewScaleLinkJointQuorum(writer string, slots []ScaleLinkReplicaSlot, ownerS
 	return &ScaleLinkQuorum{writer: writer, replicas: reps, sets: sets, rounds: map[string]uint64{}}
 }
 
-func (q *ScaleLinkQuorum) Get(ctx context.Context, taskID string) (ScaleLinkRecord, bool, error) {
-	rec, found, err := q.Read(ctx, taskID)
+func (q *ScaleLinkQuorum) Get(ctx context.Context, key string) (ScaleLinkRecord, bool, error) {
+	rec, found, err := q.Read(ctx, key)
 	if err != nil || !found {
 		return ScaleLinkRecord{}, false, err
 	}
 	return rec, true, nil
 }
 
-func (q *ScaleLinkQuorum) Read(ctx context.Context, taskID string) (ScaleLinkRecord, bool, error) {
-	ballot := q.nextBallot(ctx, taskID)
-	reads, prepared := q.prepare(ctx, taskID, ballot)
+func (q *ScaleLinkQuorum) Read(ctx context.Context, key string) (ScaleLinkRecord, bool, error) {
+	ballot := q.nextBallot(ctx, key)
+	reads, prepared := q.prepare(ctx, key, ballot)
 	if !satisfiesQuorumSets(prepared, q.sets) {
 		return ScaleLinkRecord{}, false, ErrQuorum
 	}
 	best, found := highestScaleLink(reads)
 	if found {
 		best.Meta.Ballot = ballot
-		accepted := q.accept(ctx, taskID, best, ballot, prepared)
+		accepted := q.accept(ctx, key, best, ballot, prepared)
 		if !satisfiesQuorumSets(accepted, q.sets) {
 			return ScaleLinkRecord{}, false, ErrQuorum
 		}
-		q.repairBestEffort(ctx, taskID, best)
+		q.repairBestEffort(ctx, key, best)
 	}
 	return best, found, nil
 }
 
-func (q *ScaleLinkQuorum) CAS(ctx context.Context, taskID string, expectRev uint64, propose ScaleLinkProposal) (ScaleLinkRecord, error) {
-	ballot := q.nextBallot(ctx, taskID)
-	reads, prepared := q.prepare(ctx, taskID, ballot)
+func (q *ScaleLinkQuorum) CAS(ctx context.Context, key string, expectRev uint64, propose ScaleLinkProposal) (ScaleLinkRecord, error) {
+	ballot := q.nextBallot(ctx, key)
+	reads, prepared := q.prepare(ctx, key, ballot)
 	if !satisfiesQuorumSets(prepared, q.sets) {
 		return ScaleLinkRecord{}, ErrQuorum
 	}
@@ -81,30 +81,30 @@ func (q *ScaleLinkQuorum) CAS(ctx context.Context, taskID string, expectRev uint
 		return ScaleLinkRecord{}, nil
 	}
 	if next.Key == "" {
-		next.Key = taskID
+		next.Key = key
 	}
 	next.Meta = RecordMeta{Ballot: ballot, Rev: cur.Meta.Rev + 1, UpdatedAt: time.Now()}
-	accepted := q.accept(ctx, taskID, next, ballot, prepared)
+	accepted := q.accept(ctx, key, next, ballot, prepared)
 	if !satisfiesQuorumSets(accepted, q.sets) {
 		return ScaleLinkRecord{}, ErrQuorum
 	}
-	q.repairBestEffort(ctx, taskID, next)
+	q.repairBestEffort(ctx, key, next)
 	return next, nil
 }
 
-func (q *ScaleLinkQuorum) nextBallot(ctx context.Context, taskID string) Ballot {
-	max := q.maxBallot(ctx, taskID)
+func (q *ScaleLinkQuorum) nextBallot(ctx context.Context, key string) Ballot {
+	max := q.maxBallot(ctx, key)
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	if local := q.rounds[taskID]; max.Round < local {
+	if local := q.rounds[key]; max.Round < local {
 		max.Round = local
 	}
 	next := max.Round + 1
-	q.rounds[taskID] = next
+	q.rounds[key] = next
 	return Ballot{Round: next, Writer: q.writer}
 }
 
-func (q *ScaleLinkQuorum) maxBallot(ctx context.Context, taskID string) Ballot {
+func (q *ScaleLinkQuorum) maxBallot(ctx context.Context, key string) Ballot {
 	type result struct {
 		ballot Ballot
 		err    error
@@ -113,7 +113,7 @@ func (q *ScaleLinkQuorum) maxBallot(ctx context.Context, taskID string) Ballot {
 	for _, r := range q.replicas {
 		rep := r.replica
 		go func() {
-			b, err := rep.MaxBallot(ctx, taskID)
+			b, err := rep.MaxBallot(ctx, key)
 			ch <- result{ballot: b, err: err}
 		}()
 	}
@@ -132,7 +132,7 @@ type scaleLinkRead struct {
 	found bool
 }
 
-func (q *ScaleLinkQuorum) prepare(ctx context.Context, taskID string, ballot Ballot) ([]scaleLinkRead, map[int]bool) {
+func (q *ScaleLinkQuorum) prepare(ctx context.Context, key string, ballot Ballot) ([]scaleLinkRead, map[int]bool) {
 	type result struct {
 		idx   int
 		rec   ScaleLinkRecord
@@ -144,7 +144,7 @@ func (q *ScaleLinkQuorum) prepare(ctx context.Context, taskID string, ballot Bal
 	for i, r := range q.replicas {
 		idx, rep := i, r.replica
 		go func() {
-			rec, found, ok, err := rep.Prepare(ctx, taskID, ballot)
+			rec, found, ok, err := rep.Prepare(ctx, key, ballot)
 			ch <- result{idx: idx, rec: rec, found: found, ok: ok, err: err}
 		}()
 	}
@@ -161,7 +161,7 @@ func (q *ScaleLinkQuorum) prepare(ctx context.Context, taskID string, ballot Bal
 	return reads, prepared
 }
 
-func (q *ScaleLinkQuorum) accept(ctx context.Context, taskID string, rec ScaleLinkRecord, ballot Ballot, prepared map[int]bool) map[int]bool {
+func (q *ScaleLinkQuorum) accept(ctx context.Context, key string, rec ScaleLinkRecord, ballot Ballot, prepared map[int]bool) map[int]bool {
 	type result struct {
 		idx int
 		ok  bool
@@ -170,7 +170,7 @@ func (q *ScaleLinkQuorum) accept(ctx context.Context, taskID string, rec ScaleLi
 	for i := range prepared {
 		idx, rep := i, q.replicas[i].replica
 		go func() {
-			ok, _ := rep.Accept(ctx, taskID, rec, ballot)
+			ok, _ := rep.Accept(ctx, key, rec, ballot)
 			ch <- result{idx: idx, ok: ok}
 		}()
 	}
@@ -184,7 +184,7 @@ func (q *ScaleLinkQuorum) accept(ctx context.Context, taskID string, rec ScaleLi
 	return accepted
 }
 
-func (q *ScaleLinkQuorum) repairBestEffort(ctx context.Context, taskID string, rec ScaleLinkRecord) {
+func (q *ScaleLinkQuorum) repairBestEffort(ctx context.Context, key string, rec ScaleLinkRecord) {
 	repairCtx := context.WithoutCancel(ctx)
 	if _, ok := repairCtx.Deadline(); !ok {
 		var cancel context.CancelFunc
@@ -197,7 +197,7 @@ func (q *ScaleLinkQuorum) repairBestEffort(ctx context.Context, taskID string, r
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_ = rep.Repair(repairCtx, taskID, rec)
+			_ = rep.Repair(repairCtx, key, rec)
 		}()
 	}
 	wg.Wait()
@@ -284,48 +284,48 @@ func (r *MemoryScaleLinkReplica) SetApplyHook(fn func(ScaleLinkRecord)) {
 	r.mu.Unlock()
 }
 
-func (r *MemoryScaleLinkReplica) Read(ctx context.Context, taskID string) (ScaleLinkRecord, bool, error) {
+func (r *MemoryScaleLinkReplica) Read(ctx context.Context, key string) (ScaleLinkRecord, bool, error) {
 	if err := ctx.Err(); err != nil {
 		return ScaleLinkRecord{}, false, err
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	rec, found := r.accepted[taskID]
+	rec, found := r.accepted[key]
 	return cloneScaleLink(rec), found, nil
 }
 
-func (r *MemoryScaleLinkReplica) Prepare(ctx context.Context, taskID string, ballot Ballot) (ScaleLinkRecord, bool, bool, error) {
+func (r *MemoryScaleLinkReplica) Prepare(ctx context.Context, key string, ballot Ballot) (ScaleLinkRecord, bool, bool, error) {
 	if err := ctx.Err(); err != nil {
 		return ScaleLinkRecord{}, false, false, err
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if ballot.Less(r.promised[taskID]) {
+	if ballot.Less(r.promised[key]) {
 		return ScaleLinkRecord{}, false, false, nil
 	}
-	r.promised[taskID] = ballot
-	rec, found := r.accepted[taskID]
+	r.promised[key] = ballot
+	rec, found := r.accepted[key]
 	return cloneScaleLink(rec), found, true, nil
 }
 
-func (r *MemoryScaleLinkReplica) Accept(ctx context.Context, taskID string, rec ScaleLinkRecord, ballot Ballot) (bool, error) {
+func (r *MemoryScaleLinkReplica) Accept(ctx context.Context, key string, rec ScaleLinkRecord, ballot Ballot) (bool, error) {
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
 	r.mu.Lock()
-	if ballot.Less(r.promised[taskID]) {
+	if ballot.Less(r.promised[key]) {
 		r.mu.Unlock()
 		return false, nil
 	}
-	if cur, found := r.accepted[taskID]; found && ballot.Less(cur.Meta.Ballot) {
+	if cur, found := r.accepted[key]; found && ballot.Less(cur.Meta.Ballot) {
 		r.mu.Unlock()
 		return false, nil
 	}
 	if rec.Key == "" {
-		rec.Key = taskID
+		rec.Key = key
 	}
-	r.promised[taskID] = ballot
-	r.accepted[taskID] = cloneScaleLink(rec)
+	r.promised[key] = ballot
+	r.accepted[key] = cloneScaleLink(rec)
 	hook := r.onApply
 	applied := cloneScaleLink(rec)
 	r.mu.Unlock()
@@ -335,21 +335,25 @@ func (r *MemoryScaleLinkReplica) Accept(ctx context.Context, taskID string, rec 
 	return true, nil
 }
 
-func (r *MemoryScaleLinkReplica) Repair(ctx context.Context, taskID string, rec ScaleLinkRecord) error {
+func (r *MemoryScaleLinkReplica) Repair(ctx context.Context, key string, rec ScaleLinkRecord) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	r.mu.Lock()
-	cur, found := r.accepted[taskID]
+	if rec.Meta.Ballot.Less(r.promised[key]) {
+		r.mu.Unlock()
+		return nil
+	}
+	cur, found := r.accepted[key]
 	if !found || cur.Meta.Ballot.Less(rec.Meta.Ballot) ||
 		(cur.Meta.Ballot == rec.Meta.Ballot && cur.Meta.Rev < rec.Meta.Rev) {
 		if rec.Key == "" {
-			rec.Key = taskID
+			rec.Key = key
 		}
-		if r.promised[taskID].Less(rec.Meta.Ballot) {
-			r.promised[taskID] = rec.Meta.Ballot
+		if r.promised[key].Less(rec.Meta.Ballot) {
+			r.promised[key] = rec.Meta.Ballot
 		}
-		r.accepted[taskID] = cloneScaleLink(rec)
+		r.accepted[key] = cloneScaleLink(rec)
 		hook := r.onApply
 		applied := cloneScaleLink(rec)
 		r.mu.Unlock()
@@ -357,21 +361,49 @@ func (r *MemoryScaleLinkReplica) Repair(ctx context.Context, taskID string, rec 
 			hook(applied)
 		}
 		return nil
-	} else if r.promised[taskID].Less(cur.Meta.Ballot) {
-		r.promised[taskID] = cur.Meta.Ballot
+	} else if r.promised[key].Less(cur.Meta.Ballot) {
+		r.promised[key] = cur.Meta.Ballot
 	}
 	r.mu.Unlock()
 	return nil
 }
 
-func (r *MemoryScaleLinkReplica) MaxBallot(ctx context.Context, taskID string) (Ballot, error) {
+func (r *MemoryScaleLinkReplica) CompactExpiredAllocations(nowUnixMs int64) int {
+	if nowUnixMs <= 0 {
+		nowUnixMs = time.Now().UnixMilli()
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	n := 0
+	for key, rec := range r.accepted {
+		if rec.Kind != ScaleLinkKindAllocation || rec.ExpiresUnixMs <= 0 || rec.ExpiresUnixMs > nowUnixMs {
+			continue
+		}
+		barrier := compactedScaleLinkBarrier(rec.Meta.Ballot)
+		if r.promised[key].Less(barrier) {
+			r.promised[key] = barrier
+		}
+		delete(r.accepted, key)
+		n++
+	}
+	return n
+}
+
+func compactedScaleLinkBarrier(ballot Ballot) Ballot {
+	if ballot.Round == ^uint64(0) {
+		return Ballot{Round: ballot.Round, Writer: "\xff"}
+	}
+	return Ballot{Round: ballot.Round + 1}
+}
+
+func (r *MemoryScaleLinkReplica) MaxBallot(ctx context.Context, key string) (Ballot, error) {
 	if err := ctx.Err(); err != nil {
 		return Ballot{}, err
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	max := r.promised[taskID]
-	if rec, found := r.accepted[taskID]; found && max.Less(rec.Meta.Ballot) {
+	max := r.promised[key]
+	if rec, found := r.accepted[key]; found && max.Less(rec.Meta.Ballot) {
 		max = rec.Meta.Ballot
 	}
 	return max, nil

@@ -10,18 +10,20 @@ import (
 // periodic key_put renewals from that cache; placement itself does no key_put.
 
 const (
-	keyLeaseTTL   = 3 * time.Hour // lease lifetime pushed to nodes
-	keyRenewEvery = time.Hour     // reconcile / renew cadence (>=2 renews of margin)
+	keyLeaseTTL    = 3 * time.Hour // lease lifetime pushed to nodes
+	keyRenewEvery  = time.Hour     // reconcile / renew cadence (>=2 renews of margin)
+	keyRenewBefore = time.Hour     // refresh node leases before they reach expiry
 )
 
 type keyLeaseState struct {
-	fp    string
-	nodes map[string]bool
+	fp          string
+	nodes       map[string]bool
+	expiresUnix int64
 }
 
 type keyOp struct {
-	nodeID, fp, keyType, keyValue string
-	expiresUnix                   int64
+	group, nodeID, fp, keyType, keyValue string
+	expiresUnix                          int64
 }
 
 type keyAllocationState struct {
@@ -98,20 +100,27 @@ func (r *Registry) reconcileKeys(ctx context.Context) {
 			continue
 		}
 		want := r.liveAllocationSet(alloc.nodes)
+		next[group] = keyLeaseState{fp: alloc.fp, nodes: map[string]bool{}, expiresUnix: expires}
 		for nodeID := range want {
 			if desired[nodeID] == nil {
 				desired[nodeID] = map[string]keyOp{}
 			}
-			desired[nodeID][alloc.fp] = keyOp{nodeID: nodeID, fp: alloc.fp, keyType: alloc.keyType, keyValue: alloc.keyValue, expiresUnix: expires}
+			desired[nodeID][alloc.fp] = keyOp{group: group, nodeID: nodeID, fp: alloc.fp, keyType: alloc.keyType, keyValue: alloc.keyValue, expiresUnix: expires}
 		}
-		next[group] = keyLeaseState{fp: alloc.fp, nodes: want}
 	}
+	now := time.Now().Unix()
 	for _, keys := range desired {
 		for _, o := range keys {
 			if r.nodeOwner == nil {
 				continue
 			}
-			_ = r.nodeOwner.PutManifestKey(ctx, o.nodeID, o.fp, o.keyType, o.keyValue, o.expiresUnix)
+			if prevNodeKeyFresh(prev, o.nodeID, o.fp, now) {
+				markNodeKeyLease(next, o.group, o.nodeID)
+				continue
+			}
+			if err := r.nodeOwner.PutManifestKey(ctx, o.nodeID, o.fp, o.keyType, o.keyValue, o.expiresUnix); err == nil {
+				markNodeKeyLease(next, o.group, o.nodeID)
+			}
 		}
 	}
 	for _, have := range previousNodeKeySet(prev) {
@@ -126,6 +135,18 @@ func (r *Registry) reconcileKeys(ctx context.Context) {
 	r.replaceKeyLeases(next)
 }
 
+func markNodeKeyLease(next map[string]keyLeaseState, group, nodeID string) {
+	if group == "" || nodeID == "" {
+		return
+	}
+	lease := next[group]
+	if lease.nodes == nil {
+		lease.nodes = map[string]bool{}
+	}
+	lease.nodes[nodeID] = true
+	next[group] = lease
+}
+
 func (r *Registry) keyLeaseSnapshot() map[string]keyLeaseState {
 	r.keyMu.Lock()
 	defer r.keyMu.Unlock()
@@ -135,7 +156,7 @@ func (r *Registry) keyLeaseSnapshot() map[string]keyLeaseState {
 		for nodeID := range lease.nodes {
 			nodes[nodeID] = true
 		}
-		out[group] = keyLeaseState{fp: lease.fp, nodes: nodes}
+		out[group] = keyLeaseState{fp: lease.fp, nodes: nodes, expiresUnix: lease.expiresUnix}
 	}
 	return out
 }
@@ -163,6 +184,19 @@ func previousNodeKeySet(prev map[string]keyLeaseState) []keyOp {
 		}
 	}
 	return out
+}
+
+func prevNodeKeyFresh(prev map[string]keyLeaseState, nodeID, fp string, nowUnix int64) bool {
+	if nodeID == "" || fp == "" {
+		return false
+	}
+	for _, lease := range prev {
+		if lease.fp != fp || !lease.nodes[nodeID] {
+			continue
+		}
+		return lease.expiresUnix-nowUnix > int64(keyRenewBefore.Seconds())
+	}
+	return false
 }
 
 func (r *Registry) liveAllocationSet(nodes map[string]bool) map[string]bool {

@@ -13,7 +13,7 @@ const (
 	NamespaceScaleLink = "scale_link"
 )
 
-// Ballot is the unique write id used by route_link/node_link writes. Multi-member
+// Ballot is the unique write id used by registry replicated namespaces. Multi-member
 // owners compare ballots lexicographically by (round, writer); size-1 uses the
 // same shape so the storage contract does not change during clustering.
 type Ballot struct {
@@ -37,11 +37,11 @@ type RecordMeta struct {
 }
 
 const (
-	ScaleLinkKindTaskLease  = "task_lease"
-	ScaleLinkKindAllocation = "allocation"
+	ScaleLinkKindSourceLease = "source_lease"
+	ScaleLinkKindAllocation  = "allocation"
 )
 
-func ScaleLinkTaskKey(taskID string) string { return "task\x00" + taskID }
+func ScaleLinkSourceKey(sourceID string) string { return "source\x00" + sourceID }
 
 func ScaleLinkAllocationKey(group string) string { return ScaleLinkKindAllocation + "\x00" + group }
 
@@ -51,11 +51,15 @@ type ScaleLinkRecord struct {
 	Meta            RecordMeta `json:"meta"`
 	Key             string     `json:"key"`
 	Kind            string     `json:"kind"`
-	TaskID          string     `json:"task_id"`
+	SourceID        string     `json:"source_id,omitempty"`
 	OwnerID         string     `json:"owner_id,omitempty"`
 	RunID           string     `json:"run_id,omitempty"`
 	Term            uint64     `json:"term,omitempty"`
+	Cursor          string     `json:"cursor,omitempty"`
+	Round           uint64     `json:"round,omitempty"`
 	ReadyLabel      string     `json:"ready_label,omitempty"`
+	NextRunUnixMs   int64      `json:"next_run_unix_ms,omitempty"`
+	LastError       string     `json:"last_error,omitempty"`
 	Group           string     `json:"group,omitempty"`
 	NodeIDs         []string   `json:"node_ids,omitempty"`
 	KeyFingerprint  string     `json:"key_fingerprint,omitempty"`

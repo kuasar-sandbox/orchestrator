@@ -32,7 +32,7 @@ joint owner set 与 namespace 自身收敛驱动完成业务无损切换。
 
 | 角色 | 职责 |
 |---|---|
-| registry member | 组成 registry 自聚簇,承载 `route_link` / `node_link` / `node_list` 执行态和 membership |
+| registry member | 组成 registry 自聚簇,承载 `route_link` / `node_link` / `node_list` / `scale_link` 执行态和 membership |
 | router | e2b 统一入口;按 group 定位 route owner;活动连接缓存;miss 时调用 Reserve |
 | scaler | 消费 node_list WATCH_LIST;通过 provider/importer 导入 group;维护 placement / key allocation;提供 Place API |
 | node | 运行 sandbox/build;经 node_link 上报全量清单与事件;接收 create/connect/delete/key/build 命令 |
@@ -111,7 +111,7 @@ Registry 成员集由运维配置和 membership version 定义。每个命名空
 | `route_link` | group | `LocateN(group,K)` | route 记录、build 执行态;每个 owner 持完整 group 执行态视图 |
 | `node_link` | node_id | `LocateN(node_id,N)` | node 连接、sandbox/build 清单、labels、水位、build 预算;每个 owner 持完整 node 视图 |
 | `node_list` | `node_list` | `LocateN("node_list",M)` | 低频节点目录与 labels;每个 node_list owner 持完整目录和 WATCH_LIST log |
-| `scale_link` | scale_link key | `LocateN(key,S)` | import task lease 和 key allocation intent;registry owner set 内全复制 |
+| `scale_link` | scale_link key | `LocateN(key,S)` | source lease/cursor 和 key allocation intent;registry owner set 内全复制 |
 
 `scale_link.scaler_replica_count` 只控制 registry 调用 ready scaler 的 failover 候选数,不是 registry 内部
 `scale_link` 记录的 owner count。后者由 `membership.owners.scale_link` 控制。
@@ -360,16 +360,18 @@ scaler 负责:
 - `SandboxGroupImporter.Range` 全量/增量导入 group。
 - `SandboxGroupProvider.GetPlacementHint` 提供 group placement hint。
 - `SandboxGroupProvider.GetKey` / `GetAuthKey` 生成 key allocation / auth material intent。
-- 按 source/task 做 import owner 选择:ready scaler 经 `LocateN(task_id,ready_scalers,import_owner_count)`
-  得到候选,候选通过 `POST /scale-link/import-task-lease` 抢 registry task lease;只有 lease 胜者执行
-  `Range`。task lease 是 `scale_link` 命名空间记录,record key 为 `task\0<task_id>`,按
-  `NamespaceScaleLink + record_key` 定位 registry owner set,并在分片内用无主 CAS 全复制维护。
+- 按 `source_id` 做 import owner 选择:ready scaler 经
+  `LocateN(source_id,ready_scalers,import_source_owner_count)` 得到候选,候选通过
+  `POST /scale-link/import-source-lease` 抢 registry source lease;只有 lease 胜者从 source execution record
+  的 cursor 执行 `Range`。source lease 是 `scale_link` 命名空间记录,record key 为
+  `source\0<source_id>`,按 `NamespaceScaleLink + record_key` 定位 registry owner set,并在分片内用无主
+  CAS 全复制维护。每页 patch 全部成功后通过 `POST /scale-link/import-source-cursor` 推进 cursor。
 - 按 active / next membership 得到 node_list owner 候选,一次只订阅一个 owner;断线后 reset 并切换下一个。
 - 周期性向 active / next registry owner 成员 `POST /scale-link/register` 发布 memberlist seed。
 - 在 scaler memberlist meta 中发布 `ready`、`ready_label` 和 `api_advertise`;Place 使用 registry observer
   看到的 ready scaler 视图。
-- 向每个 active / next registry owner 成员推送 selector/key allocation patch;patch 携带 task lease
-  fencing 信息,registry 只接受当前 lease owner。
+- 按 `allocation\0<group>` 定位 `scale_link` owner set,向该 owner set 推送 selector/key allocation patch;
+  patch 携带 source lease fencing 信息,registry 只接受当前 source lease owner。
 - 对 registry 暴露 `POST /scale-link/place`。
 
 registry 对 group 做 scaler 选择:
@@ -414,8 +416,9 @@ set 内 CAS 复制。registry 保存的 scaler allocation intent 是 `scale_link
 `allocation\0<group>`,并带有 `scale_link.allocation_ttl`;scaler 按 `placement.allocation_refresh_interval`
 续推 unchanged allocation,停止续推后 intent 自动过期,node_link key cache 随下一轮 reconcile 清理。
 node_link key cache 同时记录已成功下发的 lease 到期时间;实际
-`key_put` 由 node-link 心跳维系,TTL 未到期的条目不重复下发。`key_drop` 不作为正确性依赖,节点侧租约
-按 TTL 淘汰未续租 key。密钥分发是 create/build 前置条件,不影响已运行 sandbox。
+`key_put` 由 node-link 心跳维系,未进入续租窗口的条目不重复下发,进入续租窗口后随心跳刷新 lease。
+`key_drop` 不作为正确性依赖,节点侧租约按 TTL 淘汰未续租 key。密钥分发是 create/build 前置条件,
+不影响已运行 sandbox。
 
 ## 13. Build
 

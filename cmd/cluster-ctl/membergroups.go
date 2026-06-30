@@ -197,13 +197,9 @@ func (s *scalerObserverRuntime) JoinSeed(_ context.Context, id, label, advertise
 	}
 	s.mu.Lock()
 	s.group.AddSeed(id, advertise)
+	_, err := s.group.Join(id)
 	s.mu.Unlock()
-	go func() {
-		s.mu.Lock()
-		defer s.mu.Unlock()
-		_, _ = s.group.Join(id)
-	}()
-	return nil
+	return err
 }
 
 func (s *scalerObserverRuntime) ReadyScalers(readyLabel string) []registry.ScalerPeer {

@@ -22,7 +22,8 @@ const (
 	ScaleLinkNodeListWatchPath = "/scale-link/watch-node-list" // scaler node_list WATCH_LIST
 	ScaleLinkRegisterPath      = "/scale-link/register"
 	ScaleLinkSelectorPatchPath = "/scale-link/selector-patch"
-	ScaleLinkImportTaskPath    = "/scale-link/import-task-lease"
+	ScaleLinkImportSourcePath  = "/scale-link/import-source-lease"
+	ScaleLinkSourceCursorPath  = "/scale-link/import-source-cursor"
 	ScaleLinkPlacePath         = "/scale-link/place"
 	ScaleLinkVerifyKeyPath     = "/scale-link/verify-key"
 )
@@ -44,17 +45,27 @@ type ScalerRegister struct {
 	MemberlistAdvertise string `json:"memberlist_advertise"`
 }
 
-type ImportTaskLeaseRequest struct {
-	TaskID     string `json:"task_id"`
+type ImportSourceLeaseRequest struct {
+	SourceID   string `json:"source_id"`
 	OwnerID    string `json:"owner_id"`
 	RunID      string `json:"run_id"`
 	ReadyLabel string `json:"ready_label,omitempty"`
 	TTLMillis  int64  `json:"ttl_ms"`
 }
 
-type ImportTaskLeaseResponse struct {
-	Acquired bool            `json:"acquired"`
-	Lease    ImportTaskLease `json:"lease"`
+type ImportSourceLeaseResponse struct {
+	Acquired bool              `json:"acquired"`
+	Lease    ImportSourceLease `json:"lease"`
+}
+
+type ImportSourceCursorRequest struct {
+	SourceID string `json:"source_id"`
+	OwnerID  string `json:"owner_id"`
+	RunID    string `json:"run_id"`
+	Term     uint64 `json:"term"`
+	Cursor   string `json:"cursor,omitempty"`
+	Complete bool   `json:"complete,omitempty"`
+	Error    string `json:"error,omitempty"`
 }
 
 func (r *Registry) serveNodeListWatch(w http.ResponseWriter, req *http.Request) {
@@ -115,7 +126,8 @@ func (r *Registry) ServeScaleLink(mux *http.ServeMux) {
 	mux.HandleFunc(ScaleLinkNodeListWatchPath, r.serveNodeListWatch)
 	mux.HandleFunc(ScaleLinkRegisterPath, r.serveScalerRegister)
 	mux.HandleFunc(ScaleLinkSelectorPatchPath, r.serveSelectorPatch)
-	mux.HandleFunc(ScaleLinkImportTaskPath, r.serveImportTaskLease)
+	mux.HandleFunc(ScaleLinkImportSourcePath, r.serveImportSourceLease)
+	mux.HandleFunc(ScaleLinkSourceCursorPath, r.serveImportSourceCursor)
 }
 
 func (r *Registry) serveScalerRegister(w http.ResponseWriter, req *http.Request) {
@@ -166,8 +178,8 @@ func (r *Registry) serveSelectorPatch(w http.ResponseWriter, req *http.Request) 
 		return
 	}
 	if err := r.applySelectorPatch(req.Context(), &patch); err != nil {
-		if errors.Is(err, errStaleImportTaskLease) {
-			http.Error(w, "stale import task lease", http.StatusConflict)
+		if errors.Is(err, errStaleImportSourceLease) {
+			http.Error(w, "stale import source lease", http.StatusConflict)
 			return
 		}
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
@@ -176,21 +188,21 @@ func (r *Registry) serveSelectorPatch(w http.ResponseWriter, req *http.Request) 
 	w.WriteHeader(http.StatusNoContent)
 }
 
-func (r *Registry) serveImportTaskLease(w http.ResponseWriter, req *http.Request) {
+func (r *Registry) serveImportSourceLease(w http.ResponseWriter, req *http.Request) {
 	if req.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	var in ImportTaskLeaseRequest
+	var in ImportSourceLeaseRequest
 	if err := json.NewDecoder(io.LimitReader(req.Body, 1<<20)).Decode(&in); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	if in.TaskID == "" || in.OwnerID == "" || in.RunID == "" {
-		http.Error(w, "task_id, owner_id and run_id are required", http.StatusBadRequest)
+	if in.SourceID == "" || in.OwnerID == "" || in.RunID == "" {
+		http.Error(w, "source_id, owner_id and run_id are required", http.StatusBadRequest)
 		return
 	}
-	resp, err := r.acquireImportTaskLease(req.Context(), in)
+	resp, err := r.acquireImportSourceLease(req.Context(), in)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
@@ -199,22 +211,50 @@ func (r *Registry) serveImportTaskLease(w http.ResponseWriter, req *http.Request
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
-func (r *Registry) acquireImportTaskLease(ctx context.Context, in ImportTaskLeaseRequest) (ImportTaskLeaseResponse, error) {
+func (r *Registry) serveImportSourceCursor(w http.ResponseWriter, req *http.Request) {
+	if req.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var in ImportSourceCursorRequest
+	if err := json.NewDecoder(io.LimitReader(req.Body, 1<<20)).Decode(&in); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if in.SourceID == "" || in.OwnerID == "" || in.RunID == "" || in.Term == 0 {
+		http.Error(w, "source_id, owner_id, run_id and term are required", http.StatusBadRequest)
+		return
+	}
+	rec, err := r.stores.CheckpointScaleLinkSource(req.Context(), in.SourceID, in.OwnerID, in.RunID, in.Term, in.Cursor, in.Complete, in.Error)
+	if err != nil {
+		if errors.Is(err, errScaleLinkStaleLease) {
+			http.Error(w, "stale import source lease", http.StatusConflict)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(importSourceLeaseFromScaleLink(rec))
+}
+
+func (r *Registry) acquireImportSourceLease(ctx context.Context, in ImportSourceLeaseRequest) (ImportSourceLeaseResponse, error) {
 	ttl := time.Duration(in.TTLMillis) * time.Millisecond
 	if ttl <= 0 {
 		ttl = 15 * time.Second
 	}
-	rec, acquired, err := r.stores.AcquireScaleLinkLease(ctx, in.TaskID, in.OwnerID, in.RunID, in.ReadyLabel, ttl)
+	rec, acquired, err := r.stores.AcquireScaleLinkSourceLease(ctx, in.SourceID, in.OwnerID, in.RunID, in.ReadyLabel, ttl)
 	if err != nil {
-		return ImportTaskLeaseResponse{}, err
+		return ImportSourceLeaseResponse{}, err
 	}
-	return ImportTaskLeaseResponse{Acquired: acquired, Lease: importTaskLeaseFromScaleLink(rec)}, nil
+	return ImportSourceLeaseResponse{Acquired: acquired, Lease: importSourceLeaseFromScaleLink(rec)}, nil
 }
 
-func importTaskLeaseFromScaleLink(rec clusterstate.ScaleLinkRecord) ImportTaskLease {
-	return ImportTaskLease{
-		TaskID: rec.TaskID, OwnerID: rec.OwnerID, RunID: rec.RunID, Term: rec.Term,
-		ReadyLabel: rec.ReadyLabel, ExpiresUnixMs: rec.ExpiresUnixMs,
+func importSourceLeaseFromScaleLink(rec clusterstate.ScaleLinkRecord) ImportSourceLease {
+	return ImportSourceLease{
+		SourceID: rec.SourceID, OwnerID: rec.OwnerID, RunID: rec.RunID, Term: rec.Term,
+		Cursor: rec.Cursor, Round: rec.Round, ReadyLabel: rec.ReadyLabel,
+		NextRunUnixMs: rec.NextRunUnixMs, LastError: rec.LastError, ExpiresUnixMs: rec.ExpiresUnixMs,
 	}
 }
 

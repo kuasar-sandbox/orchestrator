@@ -21,7 +21,7 @@ var ErrNoNode = errors.New("registry: no eligible node")
 // ErrNodeGone is returned when the node owner cannot reach the target node.
 var ErrNodeGone = errors.New("registry: node owner cannot reach node")
 
-var errStaleImportTaskLease = errors.New("registry: stale import task lease")
+var errStaleImportSourceLease = errors.New("registry: stale import source lease")
 
 const lifecycleAckTimeout = 5 * time.Second
 
@@ -111,12 +111,16 @@ type ScalerPeerSource func(readyLabel string) []ScalerPeer
 
 type ScalerSeedJoiner func(ctx context.Context, id, label, advertise string) error
 
-type ImportTaskLease struct {
-	TaskID        string `json:"task_id"`
+type ImportSourceLease struct {
+	SourceID      string `json:"source_id"`
 	OwnerID       string `json:"owner_id"`
 	RunID         string `json:"run_id"`
 	Term          uint64 `json:"term"`
+	Cursor        string `json:"cursor,omitempty"`
+	Round         uint64 `json:"round,omitempty"`
 	ReadyLabel    string `json:"ready_label,omitempty"`
+	NextRunUnixMs int64  `json:"next_run_unix_ms,omitempty"`
+	LastError     string `json:"last_error,omitempty"`
 	ExpiresUnixMs int64  `json:"expires_unix_ms"`
 }
 
@@ -185,7 +189,7 @@ func New(stores *Stores, placer Placer, parkTimeout time.Duration, log *slog.Log
 // local selector matching is only a bootstrap path before the scaler has pushed allocation.
 func (r *Registry) applySelectorPatch(ctx context.Context, p *routesync.SelectorPatch) error {
 	if !r.selectorPatchLeaseOK(ctx, p) {
-		return errStaleImportTaskLease
+		return errStaleImportSourceLease
 	}
 	if !p.NodeAllocation {
 		return nil
@@ -240,6 +244,9 @@ func (r *Registry) projectScaleLinkRecord(rec clusterstate.ScaleLinkRecord) {
 }
 
 func (r *Registry) keyAllocations() map[string]keyAllocationState {
+	if r.stores != nil {
+		r.stores.CompactScaleLinkAllocations(time.Now().UnixMilli())
+	}
 	r.scalerMu.Lock()
 	defer r.scalerMu.Unlock()
 	now := time.Now()
@@ -260,10 +267,10 @@ func (r *Registry) keyAllocations() map[string]keyAllocationState {
 }
 
 func (r *Registry) selectorPatchLeaseOK(ctx context.Context, p *routesync.SelectorPatch) bool {
-	if p == nil || p.ImportTaskID == "" {
+	if p == nil || p.ImportSourceID == "" {
 		return true
 	}
-	return r.stores.CheckScaleLinkLease(ctx, p.ImportTaskID, p.ImportOwnerID, p.ImportRunID, p.ImportTerm)
+	return r.stores.CheckScaleLinkSourceLease(ctx, p.ImportSourceID, p.ImportOwnerID, p.ImportRunID, p.ImportTerm)
 }
 
 // SetScaleReadyLabel sets the registry membership label a scaler must advertise
@@ -392,7 +399,7 @@ func (r *Registry) ReserveSandbox(ctx context.Context, group, routeKey string, c
 	if isBuildRouteKey(routeKey) {
 		return nil, fmt.Errorf("registry: route_key prefix %q is reserved", buildRouteKeyPrefix)
 	}
-	rec, rev, found, err := r.stores.GetSandbox(ctx, group, routeKey)
+	rec, rev, found, err := r.getSandboxForReserve(ctx, group, routeKey)
 	if err != nil {
 		return nil, err
 	}
@@ -435,6 +442,22 @@ func (r *Registry) ReserveSandbox(ctx context.Context, group, routeKey string, c
 	}
 	r.finish(key, res, nil)
 	return res, nil
+}
+
+func (r *Registry) getSandboxForReserve(ctx context.Context, group, routeKey string) (*SandboxRecord, int64, bool, error) {
+	for {
+		rec, rev, found, err := r.stores.GetSandbox(ctx, group, routeKey)
+		if !transientRouteRead(err) {
+			return rec, rev, found, err
+		}
+		timer := time.NewTimer(10 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, 0, false, ctx.Err()
+		case <-timer.C:
+		}
+	}
 }
 
 // rollbackReserve restores a (group, route_key) to its pre-reserve state when a

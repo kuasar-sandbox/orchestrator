@@ -61,22 +61,13 @@ func runScaler(args []string, log *slog.Logger) error {
 		return err
 	}
 	links := registryLinks(eps)
-	groupSource, err := scaler.NewConfiguredGroupSource(cfg.ImportGroups)
+	groupInputs, err := scaler.NewConfiguredGroupInputs(cfg.ImportGroups)
 	if err != nil {
 		return err
 	}
-	svc := scaler.NewRemoteLinksWithGroups(links, groupSource, groupSource, cfg.Placement, deadAfter, log)
+	svc := scaler.NewRemoteLinksWithGroups(links, groupInputs.Provider, groupInputs.Sources, cfg.Placement, deadAfter, log)
 	svc.SetNodeListLinks(ctx, registryLinks(nodeListEps))
-	svc.SetScaleLinkResolver(func(ctx context.Context, recordKey string) ([]scaler.RegistryLink, error) {
-		if err := regClient.Refresh(ctx); err != nil {
-			return nil, err
-		}
-		eps, err := regClient.ScaleLinkEndpoints(ctx, recordKey)
-		if err != nil {
-			return nil, err
-		}
-		return registryLinks(eps), nil
-	})
+	svc.SetScaleLinkResolver(newScaleLinkResolver(regClient))
 	memberHub := membergroup.NewHub()
 	memberlistTLS, err := membergroupTLSConfig(cfg.Member.TLS)
 	if err != nil {
@@ -94,7 +85,7 @@ func runScaler(args []string, log *slog.Logger) error {
 		return err
 	}
 	defer scalerGroup.Shutdown()
-	svc.SetImportTaskOwnerSource(cfg.Member.ID, func() []string {
+	svc.SetImportSourceOwnerSource(cfg.Member.ID, func() []string {
 		if err := regClient.Refresh(ctx); err != nil {
 			return []string{cfg.Member.ID}
 		}
@@ -201,6 +192,16 @@ func runScalerRegistryLinks(ctx context.Context, regClient *clusterclient.Regist
 		case <-t.C:
 			refresh()
 		}
+	}
+}
+
+func newScaleLinkResolver(regClient *clusterclient.Registry) func(context.Context, string) ([]scaler.RegistryLink, error) {
+	return func(ctx context.Context, recordKey string) ([]scaler.RegistryLink, error) {
+		eps, err := regClient.ScaleLinkEndpoints(ctx, recordKey)
+		if err != nil {
+			return nil, err
+		}
+		return registryLinks(eps), nil
 	}
 }
 

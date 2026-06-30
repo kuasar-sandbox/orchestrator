@@ -227,6 +227,13 @@ func (s *Stores) LocalNodeReplica() clusterstate.NodeReplica { return s.localNod
 
 func (s *Stores) LocalScaleLinkReplica() clusterstate.ScaleLinkReplica { return s.localScaleLink }
 
+func (s *Stores) CompactScaleLinkAllocations(nowUnixMs int64) int {
+	if s == nil || s.localScaleLink == nil {
+		return 0
+	}
+	return s.localScaleLink.CompactExpiredAllocations(nowUnixMs)
+}
+
 func (s *Stores) LocalNodeListReplica() clusterstate.NodeListReplica { return s.localNodeList }
 
 func (s *Stores) WriterID() string { return s.writerID }
@@ -593,16 +600,19 @@ func (s *Stores) checkNodeHandoff(nodeID string) error {
 	return clusterstate.DecisionError(gate.DecideWrite(version, time.Now()))
 }
 
-var errScaleLinkLeaseHeld = errors.New("registry: scale_link task lease held")
+var (
+	errScaleLinkLeaseHeld  = errors.New("registry: scale_link source lease held")
+	errScaleLinkStaleLease = errors.New("registry: stale scale_link source lease")
+)
 
-func (s *Stores) AcquireScaleLinkLease(ctx context.Context, taskID, ownerID, runID, readyLabel string, ttl time.Duration) (clusterstate.ScaleLinkRecord, bool, error) {
-	if taskID == "" || ownerID == "" || runID == "" {
-		return clusterstate.ScaleLinkRecord{}, false, fmt.Errorf("registry: task_id, owner_id and run_id are required")
+func (s *Stores) AcquireScaleLinkSourceLease(ctx context.Context, sourceID, ownerID, runID, readyLabel string, ttl time.Duration) (clusterstate.ScaleLinkRecord, bool, error) {
+	if sourceID == "" || ownerID == "" || runID == "" {
+		return clusterstate.ScaleLinkRecord{}, false, fmt.Errorf("registry: source_id, owner_id and run_id are required")
 	}
 	if ttl <= 0 {
 		ttl = 15 * time.Second
 	}
-	recordKey := scaleLinkTaskKey(taskID)
+	recordKey := scaleLinkSourceKey(sourceID)
 	for attempt := 0; attempt < 5; attempt++ {
 		q, err := s.scaleLinkQuorum(recordKey)
 		if err != nil {
@@ -632,11 +642,16 @@ func (s *Stores) AcquireScaleLinkLease(ctx context.Context, taskID, ownerID, run
 					term = 1
 				}
 			}
-			return clusterstate.ScaleLinkRecord{
-				Key: recordKey, Kind: clusterstate.ScaleLinkKindTaskLease,
-				TaskID: taskID, OwnerID: ownerID, RunID: runID, ReadyLabel: readyLabel,
-				Term: term, ExpiresUnixMs: now.Add(ttl).UnixMilli(),
-			}, true, nil
+			next := current
+			next.Key = recordKey
+			next.Kind = clusterstate.ScaleLinkKindSourceLease
+			next.SourceID = sourceID
+			next.OwnerID = ownerID
+			next.RunID = runID
+			next.ReadyLabel = readyLabel
+			next.Term = term
+			next.ExpiresUnixMs = now.Add(ttl).UnixMilli()
+			return next, true, nil
 		})
 		switch {
 		case err == nil:
@@ -653,11 +668,11 @@ func (s *Stores) AcquireScaleLinkLease(ctx context.Context, taskID, ownerID, run
 	return clusterstate.ScaleLinkRecord{}, false, clusterstate.ErrConflict
 }
 
-func (s *Stores) CheckScaleLinkLease(ctx context.Context, taskID, ownerID, runID string, term uint64) bool {
-	if taskID == "" {
+func (s *Stores) CheckScaleLinkSourceLease(ctx context.Context, sourceID, ownerID, runID string, term uint64) bool {
+	if sourceID == "" {
 		return true
 	}
-	recordKey := scaleLinkTaskKey(taskID)
+	recordKey := scaleLinkSourceKey(sourceID)
 	q, err := s.scaleLinkQuorum(recordKey)
 	if err != nil {
 		return false
@@ -668,6 +683,56 @@ func (s *Stores) CheckScaleLinkLease(ctx context.Context, taskID, ownerID, runID
 	}
 	return rec.OwnerID == ownerID && rec.RunID == runID && rec.Term == term &&
 		(rec.ExpiresUnixMs <= 0 || rec.ExpiresUnixMs > time.Now().UnixMilli())
+}
+
+func (s *Stores) CheckpointScaleLinkSource(ctx context.Context, sourceID, ownerID, runID string, term uint64, cursor string, complete bool, lastErr string) (clusterstate.ScaleLinkRecord, error) {
+	if sourceID == "" || ownerID == "" || runID == "" || term == 0 {
+		return clusterstate.ScaleLinkRecord{}, fmt.Errorf("registry: source_id, owner_id, run_id and term are required")
+	}
+	recordKey := scaleLinkSourceKey(sourceID)
+	for attempt := 0; attempt < 5; attempt++ {
+		q, err := s.scaleLinkQuorum(recordKey)
+		if err != nil {
+			return clusterstate.ScaleLinkRecord{}, err
+		}
+		cur, found, err := q.Get(ctx, recordKey)
+		if err != nil {
+			return clusterstate.ScaleLinkRecord{}, err
+		}
+		expect := uint64(0)
+		if found {
+			expect = cur.Meta.Rev
+		}
+		next, err := q.CAS(ctx, recordKey, expect, func(current clusterstate.ScaleLinkRecord, currentFound bool) (clusterstate.ScaleLinkRecord, bool, error) {
+			if !currentFound || current.OwnerID != ownerID || current.RunID != runID || current.Term != term ||
+				(current.ExpiresUnixMs > 0 && current.ExpiresUnixMs <= time.Now().UnixMilli()) {
+				return current, currentFound, errScaleLinkStaleLease
+			}
+			next := current
+			next.Key = recordKey
+			next.Kind = clusterstate.ScaleLinkKindSourceLease
+			next.SourceID = sourceID
+			next.LastError = lastErr
+			if complete {
+				next.Cursor = ""
+				next.Round++
+			} else {
+				next.Cursor = cursor
+			}
+			return next, true, nil
+		})
+		switch {
+		case err == nil:
+			return next, nil
+		case errors.Is(err, errScaleLinkStaleLease):
+			return clusterstate.ScaleLinkRecord{}, errScaleLinkStaleLease
+		case errors.Is(err, clusterstate.ErrConflict):
+			continue
+		default:
+			return clusterstate.ScaleLinkRecord{}, err
+		}
+	}
+	return clusterstate.ScaleLinkRecord{}, clusterstate.ErrConflict
 }
 
 func scaleLinkLeaseLiveForOther(cur clusterstate.ScaleLinkRecord, ownerID, runID string, now time.Time) bool {
@@ -723,7 +788,7 @@ func (s *Stores) PutScaleLinkAllocation(ctx context.Context, p *routesync.Select
 	return clusterstate.ScaleLinkRecord{}, clusterstate.ErrConflict
 }
 
-func scaleLinkTaskKey(taskID string) string { return clusterstate.ScaleLinkTaskKey(taskID) }
+func scaleLinkSourceKey(sourceID string) string { return clusterstate.ScaleLinkSourceKey(sourceID) }
 
 func scaleLinkAllocationKey(group string) string { return clusterstate.ScaleLinkAllocationKey(group) }
 

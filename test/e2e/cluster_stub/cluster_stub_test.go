@@ -109,7 +109,7 @@ func newHarness(t *testing.T) *harness {
 	}
 	svc := scaler.NewRemoteLinksWithGroups(
 		[]scaler.RegistryLink{{Name: "registry", BaseURL: "http://" + linkAddr, Client: http.DefaultClient}},
-		groupSource, groupSource,
+		groupSource, []scaler.ImportSource{{SourceID: "stub", Importer: groupSource}},
 		clustercfg.PlacementConfig{Candidates: 1, ZoneAdmitMax: "yellow"}, 30, log,
 	)
 	scalerHub := membergroup.NewHub()
@@ -297,7 +297,7 @@ func TestClusterStubReserveAndDataPlane(t *testing.T) {
 
 func (h *harness) waitForNodeKeyCache(t *testing.T, nodeID string) {
 	t.Helper()
-	for i := 0; i < 300; i++ {
+	for i := 0; i < 1000; i++ {
 		node, found, err := h.reg.Stores().GetNode(h.ctx, nodeID)
 		if err == nil && found && len(node.ManifestKeys) > 0 {
 			return

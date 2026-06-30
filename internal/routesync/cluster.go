@@ -58,7 +58,7 @@ type SelectorPatch struct {
 	ManifestKeyType string              `json:"manifest_key_type,omitempty"`
 	ManifestKey     string              `json:"manifest_key,omitempty"`
 	ManifestKeyRef  string              `json:"manifest_key_ref,omitempty"`
-	ImportTaskID    string              `json:"import_task_id,omitempty"`
+	ImportSourceID  string              `json:"import_source_id,omitempty"`
 	ImportOwnerID   string              `json:"import_owner_id,omitempty"`
 	ImportRunID     string              `json:"import_run_id,omitempty"`
 	ImportTerm      uint64              `json:"import_term,omitempty"`

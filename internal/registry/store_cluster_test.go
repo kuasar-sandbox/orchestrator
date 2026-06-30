@@ -2,6 +2,7 @@ package registry
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -47,7 +48,7 @@ func TestClusterStoresRouteAndNodeUseLocatedOwners(t *testing.T) {
 	})
 }
 
-func TestClusterStoresScaleLinkLeaseUsesLocatedOwners(t *testing.T) {
+func TestClusterStoresScaleLinkSourceLeaseUsesLocatedOwners(t *testing.T) {
 	ctx := context.Background()
 	view := clusterstate.MemberView{Version: 1, Members: []string{"a", "b", "c"}}
 	sb, sc := clusterstate.NewMemoryScaleLinkReplica(), clusterstate.NewMemoryScaleLinkReplica()
@@ -59,16 +60,16 @@ func TestClusterStoresScaleLinkLeaseUsesLocatedOwners(t *testing.T) {
 		"b": sb, "c": sc,
 	})
 
-	taskID := "source-a"
-	rec, acquired, err := stores.AcquireScaleLinkLease(ctx, taskID, "s1", "run-1", "registry.1.test", time.Second)
+	sourceID := "source-a"
+	rec, acquired, err := stores.AcquireScaleLinkSourceLease(ctx, sourceID, "s1", "run-1", "registry.1.test", time.Second)
 	if err != nil {
-		t.Fatalf("AcquireScaleLinkLease: %v", err)
+		t.Fatalf("AcquireScaleLinkSourceLease: %v", err)
 	}
-	if !acquired || rec.OwnerID != "s1" || rec.RunID != "run-1" || rec.Term == 0 {
+	if !acquired || rec.SourceID != sourceID || rec.OwnerID != "s1" || rec.RunID != "run-1" || rec.Term == 0 {
 		t.Fatalf("unexpected lease acquired=%v rec=%+v", acquired, rec)
 	}
 
-	recordKey := scaleLinkTaskKey(taskID)
+	recordKey := scaleLinkSourceKey(sourceID)
 	key := clusterstate.ScaleLinkShardKey(recordKey)
 	owners, err := view.Owners(key, 2)
 	if err != nil {
@@ -78,12 +79,41 @@ func TestClusterStoresScaleLinkLeaseUsesLocatedOwners(t *testing.T) {
 		"a": stores.LocalScaleLinkReplica(), "b": sb, "c": sc,
 	})
 
-	held, acquired, err := stores.AcquireScaleLinkLease(ctx, taskID, "s2", "run-2", "registry.1.test", time.Second)
+	held, acquired, err := stores.AcquireScaleLinkSourceLease(ctx, sourceID, "s2", "run-2", "registry.1.test", time.Second)
 	if err != nil {
-		t.Fatalf("second AcquireScaleLinkLease: %v", err)
+		t.Fatalf("second AcquireScaleLinkSourceLease: %v", err)
 	}
 	if acquired || held.OwnerID != "s1" || held.RunID != "run-1" {
 		t.Fatalf("live lease was not fenced: acquired=%v held=%+v", acquired, held)
+	}
+}
+
+func TestClusterStoresScaleLinkSourceCursorUsesLeaseFencing(t *testing.T) {
+	ctx := context.Background()
+	kv := clusterstore.OpenMemory(100)
+	defer kv.Close()
+	stores := NewStores(kv)
+
+	rec, acquired, err := stores.AcquireScaleLinkSourceLease(ctx, "source-a", "s1", "run-1", "registry.1.test", time.Second)
+	if err != nil || !acquired {
+		t.Fatalf("AcquireScaleLinkSourceLease acquired=%v err=%v", acquired, err)
+	}
+	if _, err := stores.CheckpointScaleLinkSource(ctx, "source-a", "s2", "run-2", rec.Term, "next", false, ""); !errors.Is(err, errScaleLinkStaleLease) {
+		t.Fatalf("stale checkpoint err=%v, want errScaleLinkStaleLease", err)
+	}
+	next, err := stores.CheckpointScaleLinkSource(ctx, "source-a", "s1", "run-1", rec.Term, "next", false, "")
+	if err != nil {
+		t.Fatalf("CheckpointScaleLinkSource: %v", err)
+	}
+	if next.Cursor != "next" || next.Round != 0 {
+		t.Fatalf("checkpoint did not preserve cursor/round: %+v", next)
+	}
+	done, err := stores.CheckpointScaleLinkSource(ctx, "source-a", "s1", "run-1", rec.Term, "", true, "")
+	if err != nil {
+		t.Fatalf("complete CheckpointScaleLinkSource: %v", err)
+	}
+	if done.Cursor != "" || done.Round != 1 {
+		t.Fatalf("complete checkpoint did not advance round: %+v", done)
 	}
 }
 

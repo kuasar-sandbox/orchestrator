@@ -127,7 +127,7 @@ func ServeScaleLinkReplica(w http.ResponseWriter, req *http.Request, replica Sca
 	case "max_ballot":
 		out.Ballot, err = replica.MaxBallot(req.Context(), in.Key)
 	default:
-		err = fmt.Errorf("cluster: unknown scale task replica op %q", in.Op)
+		err = fmt.Errorf("cluster: unknown scale_link replica op %q", in.Op)
 	}
 	writeReplicaResponse(w, out, err)
 }

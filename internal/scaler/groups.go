@@ -18,41 +18,39 @@ import (
 
 const defaultGroupPageLimit = 1024
 
-type GroupSource interface {
-	clusterstate.SandboxGroupProvider
-	clusterstate.SandboxGroupImporter
-}
-
-type ImportTask struct {
-	ID       string
+type ImportSource struct {
+	SourceID string
 	Importer clusterstate.SandboxGroupImporter
 }
 
-type ImportTaskSource interface {
-	ImportTasks() []ImportTask
+type ConfiguredGroupInputs struct {
+	Provider clusterstate.SandboxGroupProvider
+	Sources  []ImportSource
 }
 
-func NewConfiguredGroupSource(sources []clustercfg.GroupSourceConfig) (GroupSource, error) {
+func NewConfiguredGroupInputs(sources []clustercfg.GroupSourceConfig) (ConfiguredGroupInputs, error) {
 	if len(sources) == 0 {
-		return emptyGroupSource{}, nil
+		return ConfiguredGroupInputs{Provider: emptyGroupProvider{}}, nil
 	}
-	out := make([]GroupSource, 0, len(sources))
+	out := make([]*fileGroupSource, 0, len(sources))
+	imports := make([]ImportSource, 0, len(sources))
 	for _, cfg := range sources {
 		switch cfg.SourceType {
 		case "file":
 			src, err := NewFileGroupSource(cfg.SourceID, cfg.Path)
 			if err != nil {
-				return nil, err
+				return ConfiguredGroupInputs{}, err
 			}
 			out = append(out, src)
+			imports = append(imports, ImportSource{SourceID: cfg.SourceID, Importer: src})
 		default:
-			return nil, fmt.Errorf("scaler: unsupported group source type %q", cfg.SourceType)
+			return ConfiguredGroupInputs{}, fmt.Errorf("scaler: unsupported group source type %q", cfg.SourceType)
 		}
 	}
-	return multiGroupSource{sources: out}, nil
+	return ConfiguredGroupInputs{Provider: multiGroupProvider{sources: out}, Sources: imports}, nil
 }
 
-func NewFileGroupSource(sourceID, dir string) (GroupSource, error) {
+func NewFileGroupSource(sourceID, dir string) (*fileGroupSource, error) {
 	if sourceID == "" {
 		return nil, fmt.Errorf("scaler: file group source id is required")
 	}
@@ -69,137 +67,115 @@ func NewFileGroupSource(sourceID, dir string) (GroupSource, error) {
 	return &fileGroupSource{sourceID: sourceID, dir: dir}, nil
 }
 
-type emptyGroupSource struct{}
+type emptyGroupProvider struct{}
 
-func (emptyGroupSource) Get(context.Context, string) (clusterstate.SandboxGroup, bool, error) {
+func (emptyGroupProvider) Get(context.Context, string) (clusterstate.SandboxGroup, bool, error) {
 	return clusterstate.SandboxGroup{}, false, nil
 }
 
-func (emptyGroupSource) GetPlacementHint(context.Context, string) (clusterstate.PlacementHint, bool, error) {
+func (emptyGroupProvider) GetPlacementHint(context.Context, string) (clusterstate.PlacementHint, bool, error) {
 	return clusterstate.PlacementHint{}, false, nil
 }
 
-func (emptyGroupSource) GetKey(context.Context, string) (clusterstate.Secret, bool, error) {
+func (emptyGroupProvider) GetKey(context.Context, string) (clusterstate.Secret, bool, error) {
 	return clusterstate.Secret{}, false, nil
 }
 
-func (emptyGroupSource) GetAuthKey(context.Context, string) (clusterstate.Secret, bool, error) {
+func (emptyGroupProvider) GetAuthKey(context.Context, string) (clusterstate.Secret, bool, error) {
 	return clusterstate.Secret{}, false, nil
 }
 
-func (emptyGroupSource) Range(context.Context, string, int) (clusterstate.GroupPage, error) {
-	return clusterstate.GroupPage{}, nil
+type multiGroupProvider struct {
+	sources []*fileGroupSource
 }
 
-func (emptyGroupSource) ImportTasks() []ImportTask { return nil }
-
-type multiGroupSource struct {
-	sources []GroupSource
-}
-
-func (m multiGroupSource) Get(ctx context.Context, group string) (clusterstate.SandboxGroup, bool, error) {
+func (m multiGroupProvider) Get(ctx context.Context, group string) (clusterstate.SandboxGroup, bool, error) {
+	var out clusterstate.SandboxGroup
+	foundOne := ""
 	for _, source := range m.sources {
 		g, found, err := source.Get(ctx, group)
-		if err != nil || found {
-			return g, found, err
+		if err != nil {
+			return clusterstate.SandboxGroup{}, false, err
 		}
-	}
-	return clusterstate.SandboxGroup{}, false, nil
-}
-
-func (m multiGroupSource) GetPlacementHint(ctx context.Context, group string) (clusterstate.PlacementHint, bool, error) {
-	for _, source := range m.sources {
-		hint, found, err := source.GetPlacementHint(ctx, group)
-		if err != nil || found {
-			return hint, found, err
-		}
-	}
-	return clusterstate.PlacementHint{}, false, nil
-}
-
-func (m multiGroupSource) GetKey(ctx context.Context, group string) (clusterstate.Secret, bool, error) {
-	for _, source := range m.sources {
-		key, found, err := source.GetKey(ctx, group)
-		if err != nil || found {
-			return key, found, err
-		}
-	}
-	return clusterstate.Secret{}, false, nil
-}
-
-func (m multiGroupSource) GetAuthKey(ctx context.Context, group string) (clusterstate.Secret, bool, error) {
-	for _, source := range m.sources {
-		key, found, err := source.GetAuthKey(ctx, group)
-		if err != nil || found {
-			return key, found, err
-		}
-	}
-	return clusterstate.Secret{}, false, nil
-}
-
-func (m multiGroupSource) Range(ctx context.Context, cursor string, limit int) (clusterstate.GroupPage, error) {
-	if limit <= 0 {
-		limit = defaultGroupPageLimit
-	}
-	seen := map[string]bool{}
-	for _, source := range m.sources {
-		next := ""
-		for {
-			page, err := source.Range(ctx, next, defaultGroupPageLimit)
-			if err != nil {
-				return clusterstate.GroupPage{}, err
-			}
-			for _, group := range page.Groups {
-				seen[group] = true
-			}
-			if page.NextCursor == "" {
-				break
-			}
-			next = page.NextCursor
-		}
-	}
-	groups := make([]string, 0, len(seen))
-	for group := range seen {
-		groups = append(groups, group)
-	}
-	sort.Strings(groups)
-	start, err := parseGroupCursor(cursor)
-	if err != nil {
-		return clusterstate.GroupPage{}, err
-	}
-	if start >= len(groups) {
-		return clusterstate.GroupPage{}, nil
-	}
-	end := start + limit
-	if end > len(groups) {
-		end = len(groups)
-	}
-	next := ""
-	if end < len(groups) {
-		next = strconv.Itoa(end)
-	}
-	return clusterstate.GroupPage{Groups: groups[start:end], NextCursor: next}, nil
-}
-
-func (m multiGroupSource) ImportTasks() []ImportTask {
-	var out []ImportTask
-	for _, source := range m.sources {
-		if tasks, ok := source.(ImportTaskSource); ok {
-			out = append(out, tasks.ImportTasks()...)
+		if !found {
 			continue
 		}
-		out = append(out, ImportTask{ID: "default", Importer: source})
+		if foundOne != "" {
+			return clusterstate.SandboxGroup{}, false, duplicateGroupError(group, foundOne, source.sourceID)
+		}
+		foundOne = source.sourceID
+		out = g
 	}
-	return out
+	return out, foundOne != "", nil
+}
+
+func (m multiGroupProvider) GetPlacementHint(ctx context.Context, group string) (clusterstate.PlacementHint, bool, error) {
+	var out clusterstate.PlacementHint
+	foundOne := ""
+	for _, source := range m.sources {
+		hint, found, err := source.GetPlacementHint(ctx, group)
+		if err != nil {
+			return clusterstate.PlacementHint{}, false, err
+		}
+		if !found {
+			continue
+		}
+		if foundOne != "" {
+			return clusterstate.PlacementHint{}, false, duplicateGroupError(group, foundOne, source.sourceID)
+		}
+		foundOne = source.sourceID
+		out = hint
+	}
+	return out, foundOne != "", nil
+}
+
+func (m multiGroupProvider) GetKey(ctx context.Context, group string) (clusterstate.Secret, bool, error) {
+	var out clusterstate.Secret
+	foundOne := ""
+	for _, source := range m.sources {
+		key, found, err := source.GetKey(ctx, group)
+		if err != nil {
+			return clusterstate.Secret{}, false, err
+		}
+		if !found {
+			continue
+		}
+		if foundOne != "" {
+			return clusterstate.Secret{}, false, duplicateGroupError(group, foundOne, source.sourceID)
+		}
+		foundOne = source.sourceID
+		out = key
+	}
+	return out, foundOne != "", nil
+}
+
+func (m multiGroupProvider) GetAuthKey(ctx context.Context, group string) (clusterstate.Secret, bool, error) {
+	var out clusterstate.Secret
+	foundOne := ""
+	for _, source := range m.sources {
+		key, found, err := source.GetAuthKey(ctx, group)
+		if err != nil {
+			return clusterstate.Secret{}, false, err
+		}
+		if !found {
+			continue
+		}
+		if foundOne != "" {
+			return clusterstate.Secret{}, false, duplicateGroupError(group, foundOne, source.sourceID)
+		}
+		foundOne = source.sourceID
+		out = key
+	}
+	return out, foundOne != "", nil
+}
+
+func duplicateGroupError(group, firstSource, secondSource string) error {
+	return fmt.Errorf("scaler: group %q is defined by multiple sources (%s, %s)", group, firstSource, secondSource)
 }
 
 type fileGroupSource struct {
 	sourceID string
 	dir      string
-}
-
-func (s *fileGroupSource) ImportTasks() []ImportTask {
-	return []ImportTask{{ID: s.sourceID, Importer: s}}
 }
 
 func (s *fileGroupSource) Get(ctx context.Context, group string) (clusterstate.SandboxGroup, bool, error) {
@@ -290,6 +266,7 @@ func (s *fileGroupSource) records(ctx context.Context) ([]clusterstate.SandboxGr
 		return nil, fmt.Errorf("scaler: file group source %q read %s: %w", s.sourceID, s.dir, err)
 	}
 	records := make([]clusterstate.SandboxGroupRecord, 0, len(entries))
+	seen := map[string]string{}
 	for _, entry := range entries {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -304,6 +281,10 @@ func (s *fileGroupSource) records(ctx context.Context) ([]clusterstate.SandboxGr
 		if !groupRecordActive(rec) {
 			continue
 		}
+		if prev := seen[rec.Group]; prev != "" {
+			return nil, fmt.Errorf("duplicate group %q in %s and %s", rec.Group, prev, filepath.Join(s.dir, entry.Name()))
+		}
+		seen[rec.Group] = filepath.Join(s.dir, entry.Name())
 		records = append(records, cloneGroupRecord(rec))
 	}
 	return records, nil

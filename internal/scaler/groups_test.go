@@ -104,7 +104,7 @@ func TestFileRemovalStopsNewPlacement(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	svc := NewRemoteLinksWithGroups(nil, src, src, clustercfg.PlacementConfig{Candidates: 1}, 30, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	svc := NewRemoteLinksWithGroups(nil, src, testImportSources("test", src), clustercfg.PlacementConfig{Candidates: 1}, 30, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	putNodeList(t, svc, clusterstate.NodeListEntry{NodeID: "n1", Labels: map[string]string{"pool": "p"}})
 
 	if res := svc.answer(context.Background(), &routesync.PlaceReq{Group: "/g", RouteKey: "rk"}); res.NoNode || res.Error != "" {
@@ -121,10 +121,10 @@ func TestFileRemovalStopsNewPlacement(t *testing.T) {
 func testServiceWithGroups(t *testing.T, groups ...clusterstate.SandboxGroupRecord) *Service {
 	t.Helper()
 	src := testGroupSource(t, groups...)
-	return NewRemoteLinksWithGroups(nil, src, src, clustercfg.PlacementConfig{Candidates: 1}, 30, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	return NewRemoteLinksWithGroups(nil, src, testImportSources("test", src), clustercfg.PlacementConfig{Candidates: 1}, 30, slog.New(slog.NewTextHandler(io.Discard, nil)))
 }
 
-func testGroupSource(t *testing.T, groups ...clusterstate.SandboxGroupRecord) GroupSource {
+func testGroupSource(t *testing.T, groups ...clusterstate.SandboxGroupRecord) *fileGroupSource {
 	t.Helper()
 	dir := t.TempDir()
 	for i, group := range groups {
@@ -139,6 +139,58 @@ func testGroupSource(t *testing.T, groups ...clusterstate.SandboxGroupRecord) Gr
 		t.Fatal(err)
 	}
 	return src
+}
+
+func TestConfiguredGroupInputsKeepsSourcesIndependent(t *testing.T) {
+	dirA := t.TempDir()
+	dirB := t.TempDir()
+	writeGroupFile(t, dirA, "a.json", clusterstate.SandboxGroupRecord{Group: "/a"})
+	writeGroupFile(t, dirB, "b.json", clusterstate.SandboxGroupRecord{Group: "/b"})
+
+	inputs, err := NewConfiguredGroupInputs([]clustercfg.GroupSourceConfig{
+		{SourceID: "source-a", SourceType: "file", Path: dirA},
+		{SourceID: "source-b", SourceType: "file", Path: dirB},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(inputs.Sources) != 2 || inputs.Sources[0].SourceID != "source-a" || inputs.Sources[1].SourceID != "source-b" {
+		t.Fatalf("sources not preserved independently: %+v", inputs.Sources)
+	}
+	if _, ok := inputs.Provider.(clusterstate.SandboxGroupImporter); ok {
+		t.Fatal("configured provider unexpectedly exposes a merged Range importer")
+	}
+}
+
+func TestConfiguredGroupInputsRejectsDuplicateGroupAcrossSources(t *testing.T) {
+	dirA := t.TempDir()
+	dirB := t.TempDir()
+	writeGroupFile(t, dirA, "a.json", clusterstate.SandboxGroupRecord{Group: "/dup"})
+	writeGroupFile(t, dirB, "b.json", clusterstate.SandboxGroupRecord{Group: "/dup"})
+
+	inputs, err := NewConfiguredGroupInputs([]clustercfg.GroupSourceConfig{
+		{SourceID: "source-a", SourceType: "file", Path: dirA},
+		{SourceID: "source-b", SourceType: "file", Path: dirB},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := inputs.Provider.Get(context.Background(), "/dup"); err == nil {
+		t.Fatal("duplicate group across sources should fail provider lookup")
+	}
+}
+
+func TestFileGroupSourceRejectsDuplicateGroupInSource(t *testing.T) {
+	dir := t.TempDir()
+	writeGroupFile(t, dir, "a.json", clusterstate.SandboxGroupRecord{Group: "/dup"})
+	writeGroupFile(t, dir, "b.json", clusterstate.SandboxGroupRecord{Group: "/dup"})
+	src, err := NewFileGroupSource("source-a", dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := src.Range(context.Background(), "", 10); err == nil {
+		t.Fatal("duplicate group inside one source should fail Range")
+	}
 }
 
 func writeGroupFile(t *testing.T, dir, name string, group clusterstate.SandboxGroupRecord) {

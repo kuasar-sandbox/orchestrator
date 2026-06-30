@@ -25,6 +25,11 @@ skip() {
 fail() {
     echo "==> FAIL: $*" >&2
     if [ -n "${WORK:-}" ] && [ -d "$WORK" ]; then
+        for f in "$WORK"/*.body "$WORK"/*.json; do
+            [ -f "$f" ] || continue
+            echo "---- $f ----" >&2
+            sed -n '1,220p' "$f" >&2 || true
+        done
         for f in "$WORK"/*.log; do
             [ -f "$f" ] || continue
             echo "---- $f ----" >&2

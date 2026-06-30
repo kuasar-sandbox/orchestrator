@@ -89,6 +89,76 @@ func TestKeyPredistribution(t *testing.T) {
 	}
 }
 
+func TestHeartbeatRenewsManifestKeyBeforeLeaseExpiry(t *testing.T) {
+	ctx := context.Background()
+	reg := testRegWithBox(t)
+	now := time.Now().Unix()
+	key := clusterstate.NodeManifestKey{
+		Fingerprint:     "fp",
+		Type:            clusterstate.SecretInline,
+		Value:           "mk",
+		ExpiresUnix:     now + int64(keyLeaseTTL.Seconds()),
+		SentExpiresUnix: now + int64((keyRenewBefore / 2).Seconds()),
+	}
+	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1", ManifestKeys: []clusterstate.NodeManifestKey{key}}); err != nil {
+		t.Fatal(err)
+	}
+	var cmds []*routesync.Command
+	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(c *routesync.Command) { cmds = append(cmds, c) }})
+
+	reg.updateHeartbeat(ctx, "n1", &routesync.Heartbeat{})
+
+	if len(cmds) != 1 || cmds[0].Kind != routesync.CmdKeyPut || cmds[0].KeyFingerprint != "fp" {
+		t.Fatalf("heartbeat did not renew key approaching expiry: %+v", cmds)
+	}
+
+	cmds = nil
+	node, found, err := reg.stores.GetNode(ctx, "n1")
+	if err != nil || !found {
+		t.Fatalf("node found=%v err=%v", found, err)
+	}
+	node.ManifestKeys[0].SentExpiresUnix = now + int64((keyRenewBefore + time.Hour).Seconds())
+	if err := reg.stores.PutNode(ctx, node); err != nil {
+		t.Fatal(err)
+	}
+	reg.updateHeartbeat(ctx, "n1", &routesync.Heartbeat{})
+	if len(cmds) != 0 {
+		t.Fatalf("heartbeat renewed key before renew window: %+v", cmds)
+	}
+}
+
+func TestKeyDistributionRetriesFailedManifestKeyCacheWrite(t *testing.T) {
+	ctx := context.Background()
+	reg := testRegWithBox(t)
+	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1", Labels: map[string]string{"zone": "east"}}); err != nil {
+		t.Fatal(err)
+	}
+	owner := &flakyManifestKeyOwner{remoteLifecycleOwner: remoteLifecycleOwner{reg: reg}}
+	reg.SetNodeOwner(owner)
+	pushKeyAllocation(reg, "/g", []string{"n1"}, testMK)
+
+	reg.reconcileKeys(ctx)
+	if owner.putCalls != 1 {
+		t.Fatalf("first reconcile put calls=%d, want 1", owner.putCalls)
+	}
+	node, found, err := reg.stores.GetNode(ctx, "n1")
+	if err != nil || !found {
+		t.Fatalf("node found=%v err=%v", found, err)
+	}
+	if len(node.ManifestKeys) != 0 {
+		t.Fatalf("failed key cache write was persisted: %+v", node.ManifestKeys)
+	}
+
+	reg.reconcileKeys(ctx)
+	if owner.putCalls != 2 {
+		t.Fatalf("second reconcile put calls=%d, want retry after failed cache write", owner.putCalls)
+	}
+	node, found, err = reg.stores.GetNode(ctx, "n1")
+	if err != nil || !found || len(node.ManifestKeys) != 1 {
+		t.Fatalf("retry did not persist key cache found=%v err=%v node=%+v", found, err, node)
+	}
+}
+
 func TestKeyDropOnLeave(t *testing.T) {
 	ctx := context.Background()
 	reg := testRegWithBox(t)
@@ -245,11 +315,11 @@ func TestKeyAllocationTTLExpiresNodeLinkCache(t *testing.T) {
 	}
 }
 
-func TestSelectorPatchRequiresCurrentImportTaskLease(t *testing.T) {
+func TestSelectorPatchRequiresCurrentImportSourceLease(t *testing.T) {
 	reg := testReg(t)
 	ctx := context.Background()
-	resp, err := reg.acquireImportTaskLease(ctx, ImportTaskLeaseRequest{
-		TaskID: "source-a", OwnerID: "s1", RunID: "run-1", TTLMillis: 1000,
+	resp, err := reg.acquireImportSourceLease(ctx, ImportSourceLeaseRequest{
+		SourceID: "source-a", OwnerID: "s1", RunID: "run-1", TTLMillis: 1000,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -261,10 +331,10 @@ func TestSelectorPatchRequiresCurrentImportTaskLease(t *testing.T) {
 	stale := &routesync.SelectorPatch{
 		Group: "/g", NodeIDs: []string{"n1"}, NodeAllocation: true,
 		KeyFingerprint: "stale", ManifestKeyType: clusterstate.SecretInline, ManifestKey: "mk-stale",
-		ImportTaskID: "source-a", ImportOwnerID: "s2", ImportRunID: "run-2", ImportTerm: lease.Term,
+		ImportSourceID: "source-a", ImportOwnerID: "s2", ImportRunID: "run-2", ImportTerm: lease.Term,
 	}
-	if err := reg.applySelectorPatch(ctx, stale); !errors.Is(err, errStaleImportTaskLease) {
-		t.Fatalf("stale task owner patch err=%v, want errStaleImportTaskLease", err)
+	if err := reg.applySelectorPatch(ctx, stale); !errors.Is(err, errStaleImportSourceLease) {
+		t.Fatalf("stale source owner patch err=%v, want errStaleImportSourceLease", err)
 	}
 	if got := reg.keyAllocations(); len(got) != 0 {
 		t.Fatalf("stale patch changed allocations: %+v", got)
@@ -272,10 +342,10 @@ func TestSelectorPatchRequiresCurrentImportTaskLease(t *testing.T) {
 	good := &routesync.SelectorPatch{
 		Group: "/g", NodeIDs: []string{"n1"}, NodeAllocation: true,
 		KeyFingerprint: "fresh", ManifestKeyType: clusterstate.SecretInline, ManifestKey: "mk-fresh",
-		ImportTaskID: "source-a", ImportOwnerID: lease.OwnerID, ImportRunID: lease.RunID, ImportTerm: lease.Term,
+		ImportSourceID: "source-a", ImportOwnerID: lease.OwnerID, ImportRunID: lease.RunID, ImportTerm: lease.Term,
 	}
 	if err := reg.applySelectorPatch(ctx, good); err != nil {
-		t.Fatalf("current task owner patch was rejected: %v", err)
+		t.Fatalf("current source owner patch was rejected: %v", err)
 	}
 	got := reg.keyAllocations()
 	if got["/g"].fp != "fresh" || got["/g"].keyValue != "mk-fresh" {
@@ -325,6 +395,28 @@ func (c *fakeConn) send(cmd *routesync.Command) error {
 type remoteLifecycleOwner struct {
 	reg      *Registry
 	commands int
+}
+
+type flakyManifestKeyOwner struct {
+	remoteLifecycleOwner
+	putCalls int
+}
+
+func (o *flakyManifestKeyOwner) PutManifestKey(ctx context.Context, nodeID, fingerprint, keyType, keyValue string, expiresUnix int64) error {
+	o.putCalls++
+	if o.putCalls == 1 {
+		return errors.New("temporary key cache failure")
+	}
+	if keyType == "" {
+		keyType = clusterstate.SecretInline
+	}
+	key := clusterstate.NodeManifestKey{Fingerprint: fingerprint, Type: keyType, ExpiresUnix: expiresUnix}
+	if keyType == "ref" {
+		key.Ref = keyValue
+	} else {
+		key.Value = keyValue
+	}
+	return o.reg.stores.UpsertNodeManifestKey(ctx, nodeID, key)
 }
 
 func (o *remoteLifecycleOwner) PutManifestKey(ctx context.Context, nodeID, fingerprint, keyType, keyValue string, expiresUnix int64) error {
