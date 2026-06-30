@@ -6,22 +6,16 @@ package registry
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
-	"strings"
 	"sync"
 	"time"
 
 	clusterstate "github.com/kuasar-sandbox/sandbox-orchestrator/internal/cluster"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/clusterstore"
+	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/cluster/shardkv"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/routesync"
 )
-
-const buildRouteKeyPrefix = "__kuasar_build__/"
-
-var ErrShardNotReady = errors.New("registry: shard view not ready")
 
 // SandboxState mirrors cluster.md route state. A missing/dead sandbox is
 // represented by no route row.
@@ -79,66 +73,55 @@ type SandboxRecord struct {
 	CreatedU       int64                     `json:"created_unix,omitempty"`
 }
 
-// Stores wraps the shared KV with typed, per-table accessors.
-type Stores struct {
-	kv     clusterstore.Store
-	routes *clusterstate.RouteQuorum
-	nodes  *clusterstate.NodeQuorum
+type WatchEventType int
 
+const (
+	WatchEventPut WatchEventType = iota + 1
+	WatchEventDelete
+)
+
+// WatchEvent is the registry typed watch surface exposed by node_list and
+// route_link group watches. It is projected from shardkv watch events.
+type WatchEvent struct {
+	Type  WatchEventType
+	Key   string
+	Value []byte
+	Rev   int64
+}
+
+var ErrWatchCompacted = shardkv.ErrCompacted
+
+// Stores wraps shardkv with registry-specific record codecs.
+type Stores struct {
 	writerID            string
 	memberViews         []clusterstate.MemberView
 	routeOwnerCount     int
 	nodeOwnerCount      int
+	nodeListOwnerCount  int
 	scaleLinkOwnerCount int
-	localRoute          *clusterstate.MemoryRouteReplica
-	localNode           *clusterstate.MemoryNodeReplica
-	localScaleLink      *clusterstate.MemoryScaleLinkReplica
-	localNodeList       *clusterstate.MemoryNodeListReplica
-	routeReplicas       map[string]clusterstate.RouteReplica
-	nodeReplicas        map[string]clusterstate.NodeReplica
-	scaleLinkReplicas   map[string]clusterstate.ScaleLinkReplica
 	replicaMu           sync.RWMutex
 
-	routeMu        sync.Mutex
-	routeRev       int64
-	routeLog       map[string][]clusterstore.Event
-	routeSubs      map[string]map[int]chan clusterstore.Event
-	routeSeq       int
-	routeRetention int
-	routeReady     map[string]bool
-
 	nodeListMu                  sync.Mutex
-	nodeListRev                 int64
-	nodeListLog                 []clusterstore.Event
-	nodeListSubs                map[int]chan clusterstore.Event
-	nodeListSeq                 int
-	nodeListRetention           int
+	nodeListWatchRetention      int
 	nodeListHeartbeatRefreshSec int64
-	nodeListOwnerCount          int
-	nodeListReplicas            map[string]clusterstate.NodeListReplica
-	nodeListTopologySet         bool
-	nodeListReady               bool
 
-	handoffMu        sync.RWMutex
-	membershipVer    int64
-	routeHandoffGate map[string]clusterstate.HandoffGate
-	nodeHandoffGate  map[string]clusterstate.HandoffGate
+	shardMu        sync.RWMutex
+	shardStore     *shardkv.Store
+	shardTransport shardkv.Transport
+	shardReady     shardkv.MemberReadyProvider
 }
 
 const defaultNodeListHeartbeatRefreshSec = 60
 
-// NewStores builds the typed store layer over a clusterstore.
-func NewStores(kv clusterstore.Store) *Stores {
-	return NewClusterStores(kv, "registry", clusterstate.MemberView{Version: 1, Members: []string{"registry"}}, 1, 1, nil, nil)
+// NewStores builds a size-1 registry shardkv store.
+func NewStores() *Stores {
+	return NewClusterStores("registry", clusterstate.MemberView{Version: 1, Members: []string{"registry"}}, 1, 1, 1, 1)
 }
 
 func NewClusterStores(
-	kv clusterstore.Store,
 	writerID string,
 	view clusterstate.MemberView,
-	routeOwnerCount, nodeOwnerCount int,
-	routeReplicas map[string]clusterstate.RouteReplica,
-	nodeReplicas map[string]clusterstate.NodeReplica,
+	routeOwnerCount, nodeOwnerCount, nodeListOwnerCount, scaleLinkOwnerCount int,
 ) *Stores {
 	if writerID == "" {
 		writerID = "registry"
@@ -152,89 +135,38 @@ func NewClusterStores(
 	if nodeOwnerCount <= 0 {
 		nodeOwnerCount = 1
 	}
-	localRoute := clusterstate.NewMemoryRouteReplica()
-	localNode := clusterstate.NewMemoryNodeReplica()
-	localScaleLink := clusterstate.NewMemoryScaleLinkReplica()
-	localNodeList := clusterstate.NewMemoryNodeListReplica()
-	rreps := make(map[string]clusterstate.RouteReplica, len(routeReplicas)+1)
-	nreps := make(map[string]clusterstate.NodeReplica, len(nodeReplicas)+1)
-	for id, rep := range routeReplicas {
-		if id != "" && rep != nil && id != writerID {
-			rreps[id] = rep
-		}
+	if nodeListOwnerCount <= 0 {
+		nodeListOwnerCount = 1
 	}
-	for id, rep := range nodeReplicas {
-		if id != "" && rep != nil && id != writerID {
-			nreps[id] = rep
-		}
+	if scaleLinkOwnerCount <= 0 {
+		scaleLinkOwnerCount = routeOwnerCount
 	}
-	rreps[writerID] = localRoute
-	nreps[writerID] = localNode
-	streps := map[string]clusterstate.ScaleLinkReplica{writerID: localScaleLink}
 	stores := &Stores{
-		kv:                          kv,
-		routes:                      clusterstate.NewRouteQuorum(writerID, localRoute),
-		nodes:                       clusterstate.NewNodeQuorum(writerID, localNode),
 		writerID:                    writerID,
 		memberViews:                 []clusterstate.MemberView{view},
 		routeOwnerCount:             routeOwnerCount,
 		nodeOwnerCount:              nodeOwnerCount,
-		scaleLinkOwnerCount:         routeOwnerCount,
-		localRoute:                  localRoute,
-		localNode:                   localNode,
-		localScaleLink:              localScaleLink,
-		localNodeList:               localNodeList,
-		routeReplicas:               rreps,
-		nodeReplicas:                nreps,
-		scaleLinkReplicas:           streps,
-		routeLog:                    map[string][]clusterstore.Event{},
-		routeSubs:                   map[string]map[int]chan clusterstore.Event{},
-		routeRetention:              10000,
-		routeReady:                  map[string]bool{},
-		nodeListSubs:                map[int]chan clusterstore.Event{},
-		nodeListRetention:           10000,
+		nodeListOwnerCount:          nodeListOwnerCount,
+		scaleLinkOwnerCount:         scaleLinkOwnerCount,
+		nodeListWatchRetention:      10000,
 		nodeListHeartbeatRefreshSec: defaultNodeListHeartbeatRefreshSec,
-		nodeListOwnerCount:          1,
-		nodeListReplicas:            map[string]clusterstate.NodeListReplica{writerID: localNodeList},
-		membershipVer:               view.Version,
-		routeHandoffGate:            map[string]clusterstate.HandoffGate{},
-		nodeHandoffGate:             map[string]clusterstate.HandoffGate{},
 	}
-	localRoute.SetOnChange(stores.publishRouteReplicaEvent)
-	localNodeList.SetOnChange(stores.publishNodeListReplicaEvent)
+	stores.rebuildShardStore()
 	return stores
 }
 
 func NewClusterStoresWithViews(
-	kv clusterstore.Store,
 	writerID string,
 	views []clusterstate.MemberView,
-	routeOwnerCount, nodeOwnerCount int,
-	routeReplicas map[string]clusterstate.RouteReplica,
-	nodeReplicas map[string]clusterstate.NodeReplica,
+	routeOwnerCount, nodeOwnerCount, nodeListOwnerCount, scaleLinkOwnerCount int,
 ) *Stores {
 	if len(views) == 0 {
 		views = []clusterstate.MemberView{{Version: 1, Members: []string{writerID}}}
 	}
-	stores := NewClusterStores(kv, writerID, views[0], routeOwnerCount, nodeOwnerCount, routeReplicas, nodeReplicas)
+	stores := NewClusterStores(writerID, views[0], routeOwnerCount, nodeOwnerCount, nodeListOwnerCount, scaleLinkOwnerCount)
 	stores.SetMemberViews(views)
 	return stores
 }
-
-func (s *Stores) LocalRouteReplica() clusterstate.RouteReplica { return s.localRoute }
-
-func (s *Stores) LocalNodeReplica() clusterstate.NodeReplica { return s.localNode }
-
-func (s *Stores) LocalScaleLinkReplica() clusterstate.ScaleLinkReplica { return s.localScaleLink }
-
-func (s *Stores) CompactScaleLinkAllocations(nowUnixMs int64) int {
-	if s == nil || s.localScaleLink == nil {
-		return 0
-	}
-	return s.localScaleLink.CompactExpiredAllocations(nowUnixMs)
-}
-
-func (s *Stores) LocalNodeListReplica() clusterstate.NodeListReplica { return s.localNodeList }
 
 func (s *Stores) WriterID() string { return s.writerID }
 
@@ -253,12 +185,9 @@ func (s *Stores) SetNodeListWatchRetention(n int) {
 		n = 10000
 	}
 	s.nodeListMu.Lock()
-	s.nodeListRetention = n
-	if len(s.nodeListLog) > n {
-		copy(s.nodeListLog, s.nodeListLog[len(s.nodeListLog)-n:])
-		s.nodeListLog = s.nodeListLog[:n]
-	}
+	s.nodeListWatchRetention = n
 	s.nodeListMu.Unlock()
+	s.rebuildShardStore()
 }
 
 func (s *Stores) NodeListHeartbeatRefreshSec() int64 {
@@ -268,12 +197,6 @@ func (s *Stores) NodeListHeartbeatRefreshSec() int64 {
 		return defaultNodeListHeartbeatRefreshSec
 	}
 	return s.nodeListHeartbeatRefreshSec
-}
-
-func (s *Stores) SetMembershipVersion(version int64) {
-	s.handoffMu.Lock()
-	s.membershipVer = version
-	s.handoffMu.Unlock()
 }
 
 func (s *Stores) SetMemberViews(views []clusterstate.MemberView) {
@@ -295,15 +218,12 @@ func (s *Stores) SetMemberViews(views []clusterstate.MemberView) {
 	s.replicaMu.Lock()
 	s.memberViews = clean
 	s.replicaMu.Unlock()
-	s.clearRouteReadiness()
-	s.clearNodeListReadiness()
+	s.rebuildShardStore()
 }
 
 func (s *Stores) SetClusterTopology(
 	views []clusterstate.MemberView,
 	routeOwnerCount, nodeOwnerCount int,
-	routeReplicas map[string]clusterstate.RouteReplica,
-	nodeReplicas map[string]clusterstate.NodeReplica,
 ) {
 	if len(views) == 0 {
 		return
@@ -326,32 +246,15 @@ func (s *Stores) SetClusterTopology(
 	if nodeOwnerCount <= 0 {
 		nodeOwnerCount = 1
 	}
-	rreps := make(map[string]clusterstate.RouteReplica, len(routeReplicas)+1)
-	nreps := make(map[string]clusterstate.NodeReplica, len(nodeReplicas)+1)
-	for id, rep := range routeReplicas {
-		if id != "" && id != s.writerID && rep != nil {
-			rreps[id] = rep
-		}
-	}
-	for id, rep := range nodeReplicas {
-		if id != "" && id != s.writerID && rep != nil {
-			nreps[id] = rep
-		}
-	}
-	rreps[s.writerID] = s.localRoute
-	nreps[s.writerID] = s.localNode
 	s.replicaMu.Lock()
 	s.memberViews = cleanViews
 	s.routeOwnerCount = routeOwnerCount
 	s.nodeOwnerCount = nodeOwnerCount
-	s.routeReplicas = rreps
-	s.nodeReplicas = nreps
 	s.replicaMu.Unlock()
-	s.clearRouteReadiness()
-	s.clearNodeListReadiness()
+	s.rebuildShardStore()
 }
 
-func (s *Stores) SetNodeListTopology(views []clusterstate.MemberView, ownerCount int, replicas map[string]clusterstate.NodeListReplica) {
+func (s *Stores) SetNodeListTopology(views []clusterstate.MemberView, ownerCount int) {
 	cleanViews := make([]clusterstate.MemberView, 0, len(views))
 	seenVersion := map[int64]bool{}
 	for _, view := range views {
@@ -367,24 +270,14 @@ func (s *Stores) SetNodeListTopology(views []clusterstate.MemberView, ownerCount
 	if ownerCount <= 0 {
 		ownerCount = 1
 	}
-	reps := make(map[string]clusterstate.NodeListReplica, len(replicas)+1)
-	for id, rep := range replicas {
-		if id != "" && id != s.writerID && rep != nil {
-			reps[id] = rep
-		}
-	}
-	reps[s.writerID] = s.localNodeList
 	s.replicaMu.Lock()
 	s.memberViews = cleanViews
 	s.nodeListOwnerCount = ownerCount
-	s.nodeListReplicas = reps
-	s.nodeListTopologySet = true
 	s.replicaMu.Unlock()
-	s.clearRouteReadiness()
-	s.clearNodeListReadiness()
+	s.rebuildShardStore()
 }
 
-func (s *Stores) SetScaleLinkTopology(views []clusterstate.MemberView, ownerCount int, replicas map[string]clusterstate.ScaleLinkReplica) {
+func (s *Stores) SetScaleLinkTopology(views []clusterstate.MemberView, ownerCount int) {
 	cleanViews := make([]clusterstate.MemberView, 0, len(views))
 	seenVersion := map[int64]bool{}
 	for _, view := range views {
@@ -400,397 +293,123 @@ func (s *Stores) SetScaleLinkTopology(views []clusterstate.MemberView, ownerCoun
 	if ownerCount <= 0 {
 		ownerCount = s.routeOwnerCount
 	}
-	reps := make(map[string]clusterstate.ScaleLinkReplica, len(replicas)+1)
-	for id, rep := range replicas {
-		if id != "" && id != s.writerID && rep != nil {
-			reps[id] = rep
-		}
-	}
-	reps[s.writerID] = s.localScaleLink
 	s.replicaMu.Lock()
 	s.memberViews = cleanViews
 	s.scaleLinkOwnerCount = ownerCount
-	s.scaleLinkReplicas = reps
 	s.replicaMu.Unlock()
+	s.rebuildShardStore()
 }
 
-func (s *Stores) routeQuorum(group string) (*clusterstate.RouteQuorum, error) {
-	s.replicaMu.RLock()
-	defer s.replicaMu.RUnlock()
-	ownerSets, jointOwners, err := locatedOwnerSets(s.memberViews, group, s.routeOwnerCount)
-	if err != nil {
-		return nil, err
-	}
-	reps := make([]clusterstate.RouteReplicaSlot, 0, len(jointOwners))
-	for _, id := range jointOwners {
-		rep := s.routeReplicas[id]
-		if rep == nil {
-			rep = unavailableRouteReplica{id: id}
-		}
-		reps = append(reps, clusterstate.RouteReplicaSlot{ID: id, Replica: rep})
-	}
-	return clusterstate.NewRouteJointQuorum(s.writerID, reps, ownerSets), nil
+func (s *Stores) ShardStore() *shardkv.Store {
+	s.shardMu.RLock()
+	defer s.shardMu.RUnlock()
+	return s.shardStore
 }
 
-func (s *Stores) scaleLinkQuorum(shardKey string) (*clusterstate.ScaleLinkQuorum, error) {
-	s.replicaMu.RLock()
-	defer s.replicaMu.RUnlock()
-	key := clusterstate.ScaleLinkShardKey(shardKey)
-	ownerSets, jointOwners, err := locatedOwnerSets(s.memberViews, key, s.scaleLinkOwnerCount)
-	if err != nil {
-		return nil, err
-	}
-	reps := make([]clusterstate.ScaleLinkReplicaSlot, 0, len(jointOwners))
-	for _, id := range jointOwners {
-		rep := s.scaleLinkReplicas[id]
-		if rep == nil {
-			rep = unavailableScaleLinkReplica{id: id}
-		}
-		reps = append(reps, clusterstate.ScaleLinkReplicaSlot{ID: id, Replica: rep})
-	}
-	return clusterstate.NewScaleLinkJointQuorum(s.writerID, reps, ownerSets), nil
+func (s *Stores) SetShardTransport(transport shardkv.Transport, ready shardkv.MemberReadyProvider) {
+	s.shardMu.Lock()
+	s.shardTransport = transport
+	s.shardReady = ready
+	s.shardMu.Unlock()
+	s.rebuildShardStore()
 }
 
-func (s *Stores) routeOwners(group string) ([][]string, []string, error) {
-	s.replicaMu.RLock()
-	defer s.replicaMu.RUnlock()
-	return locatedOwnerSets(s.memberViews, group, s.routeOwnerCount)
-}
-
-func (s *Stores) routeReplica(id string) clusterstate.RouteReplica {
-	if id == s.writerID {
-		return s.localRoute
+func (s *Stores) rebuildShardStore() {
+	if s == nil {
+		return
 	}
 	s.replicaMu.RLock()
-	rep := s.routeReplicas[id]
+	views := append([]clusterstate.MemberView(nil), s.memberViews...)
+	routeOwners, nodeOwners := s.routeOwnerCount, s.nodeOwnerCount
+	nodeListOwners, scaleOwners := s.nodeListOwnerCount, s.scaleLinkOwnerCount
+	writerID := s.writerID
 	s.replicaMu.RUnlock()
-	return rep
-}
-
-func (s *Stores) clearRouteReadiness() {
-	s.routeMu.Lock()
-	s.routeReady = map[string]bool{}
-	s.routeMu.Unlock()
-}
-
-func (s *Stores) clearNodeListReadiness() {
 	s.nodeListMu.Lock()
-	s.nodeListReady = false
+	nodeListWatchRetention := s.nodeListWatchRetention
 	s.nodeListMu.Unlock()
-}
-
-func (s *Stores) nodeQuorum(nodeID string) (*clusterstate.NodeQuorum, error) {
-	s.replicaMu.RLock()
-	defer s.replicaMu.RUnlock()
-	ownerSets, jointOwners, err := locatedOwnerSets(s.memberViews, nodeID, s.nodeOwnerCount)
-	if err != nil {
-		return nil, err
+	if routeOwners <= 0 {
+		routeOwners = 1
 	}
-	reps := make([]clusterstate.NodeReplicaSlot, 0, len(jointOwners))
-	for _, id := range jointOwners {
-		rep := s.nodeReplicas[id]
-		if rep == nil {
-			rep = unavailableNodeReplica{id: id}
-		}
-		reps = append(reps, clusterstate.NodeReplicaSlot{ID: id, Replica: rep})
+	if nodeOwners <= 0 {
+		nodeOwners = 1
 	}
-	return clusterstate.NewNodeJointQuorum(s.writerID, reps, ownerSets), nil
-}
-
-func (s *Stores) nodeListOwners() ([][]string, []string, error) {
-	s.replicaMu.RLock()
-	if !s.nodeListTopologySet {
-		writer := s.writerID
-		s.replicaMu.RUnlock()
-		return [][]string{{writer}}, []string{writer}, nil
+	if nodeListOwners <= 0 {
+		nodeListOwners = 1
 	}
-	defer s.replicaMu.RUnlock()
-	return locatedOwnerSets(s.memberViews, clusterstate.NamespaceNodeList, s.nodeListOwnerCount)
-}
-
-func (s *Stores) nodeListReplica(id string) clusterstate.NodeListReplica {
-	if id == s.writerID {
-		return s.localNodeList
+	if scaleOwners <= 0 {
+		scaleOwners = routeOwners
 	}
-	s.replicaMu.RLock()
-	rep := s.nodeListReplicas[id]
-	s.replicaMu.RUnlock()
-	return rep
-}
-
-func (s *Stores) nodeListQuorum() (*clusterstate.NodeListQuorum, error) {
-	s.replicaMu.RLock()
-	defer s.replicaMu.RUnlock()
-	ownerSets := [][]string{{s.writerID}}
-	jointOwners := []string{s.writerID}
-	if s.nodeListTopologySet {
-		var err error
-		ownerSets, jointOwners, err = locatedOwnerSets(s.memberViews, clusterstate.NamespaceNodeList, s.nodeListOwnerCount)
-		if err != nil {
-			return nil, err
-		}
+	if nodeListWatchRetention <= 0 {
+		nodeListWatchRetention = 10000
 	}
-	reps := make([]clusterstate.NodeListReplicaSlot, 0, len(jointOwners))
-	for _, id := range jointOwners {
-		rep := s.nodeListReplicas[id]
-		if rep == nil {
-			rep = unavailableNodeListReplica{id: id}
-		}
-		reps = append(reps, clusterstate.NodeListReplicaSlot{ID: id, Replica: rep})
-	}
-	return clusterstate.NewNodeListJointQuorum(s.writerID, reps, ownerSets), nil
-}
-
-func locatedOwnerSets(views []clusterstate.MemberView, key string, ownerCount int) ([][]string, []string, error) {
-	sets := make([][]string, 0, len(views))
-	seen := map[string]bool{}
-	var jointOwners []string
+	clusterViews := make([]shardkv.ClusterView, 0, len(views))
 	for _, view := range views {
-		owners, err := view.Owners(key, ownerCount)
-		if err != nil {
-			return nil, nil, err
-		}
-		if len(owners) == 0 {
+		if len(view.Members) == 0 {
 			continue
 		}
-		sets = append(sets, owners)
-		for _, id := range owners {
-			if seen[id] {
-				continue
+		members := make([]shardkv.MemberID, 0, len(view.Members))
+		for _, member := range view.Members {
+			if member != "" {
+				members = append(members, shardkv.MemberID(member))
 			}
-			seen[id] = true
-			jointOwners = append(jointOwners, id)
 		}
+		clusterViews = append(clusterViews, shardkv.ClusterView{
+			Version: view.Version,
+			Label:   fmt.Sprintf("membership.%d", view.Version),
+			Members: members,
+		})
 	}
-	sort.Strings(jointOwners)
-	return sets, jointOwners, nil
-}
-
-func (s *Stores) SetRouteHandoffGate(group, routeKey string, gate clusterstate.HandoffGate) {
-	s.handoffMu.Lock()
-	s.routeHandoffGate[clusterstate.RouteKey(group, routeKey)] = gate
-	s.handoffMu.Unlock()
-}
-
-func (s *Stores) SetNodeHandoffGate(nodeID string, gate clusterstate.HandoffGate) {
-	s.handoffMu.Lock()
-	s.nodeHandoffGate[nodeID] = gate
-	s.handoffMu.Unlock()
-}
-
-func (s *Stores) checkRouteHandoff(group, routeKey string) error {
-	s.handoffMu.RLock()
-	version := s.membershipVer
-	gate, ok := s.routeHandoffGate[clusterstate.RouteKey(group, routeKey)]
-	s.handoffMu.RUnlock()
-	if !ok {
-		return nil
+	if len(clusterViews) == 0 {
+		clusterViews = []shardkv.ClusterView{{Version: 1, Label: "membership.1", Members: []shardkv.MemberID{shardkv.MemberID(writerID)}}}
 	}
-	return clusterstate.DecisionError(gate.DecideWrite(version, time.Now()))
-}
-
-func (s *Stores) checkNodeHandoff(nodeID string) error {
-	s.handoffMu.RLock()
-	version := s.membershipVer
-	gate, ok := s.nodeHandoffGate[nodeID]
-	s.handoffMu.RUnlock()
-	if !ok {
-		return nil
+	resolver, err := shardkv.NewMaglevResolver(shardkv.MaglevResolverConfig{
+		Local: shardkv.MemberID(writerID),
+		Views: clusterViews,
+		Layout: shardkv.Layout{Namespaces: map[shardkv.Namespace]shardkv.NamespaceSpec{
+			shardkv.Namespace(clusterstate.NamespaceRouteLink): {ShardMemberCount: routeOwners, TombstoneRetention: time.Hour, WatchRetention: 10000, IdleShardTTL: time.Hour},
+			shardkv.Namespace(clusterstate.NamespaceNodeLink):  {ShardMemberCount: nodeOwners, TombstoneRetention: time.Hour, WatchRetention: 10000, IdleShardTTL: time.Hour},
+			shardkv.Namespace(clusterstate.NamespaceNodeList):  {ShardMemberCount: nodeListOwners, TombstoneRetention: time.Hour, WatchRetention: nodeListWatchRetention, Pinned: true},
+			shardkv.Namespace(clusterstate.NamespaceScaleLink): {ShardMemberCount: scaleOwners, TombstoneRetention: time.Hour, WatchRetention: 10000, IdleShardTTL: time.Hour},
+		}},
+	})
+	if err != nil {
+		return
 	}
-	return clusterstate.DecisionError(gate.DecideWrite(version, time.Now()))
+	s.shardMu.RLock()
+	transport, ready := s.shardTransport, s.shardReady
+	old := s.shardStore
+	s.shardMu.RUnlock()
+	if old != nil {
+		_ = old.Configure(resolver, transport, ready, 10000)
+		return
+	}
+	store, err := shardkv.NewStore(shardkv.StoreOptions{
+		Local: shardkv.MemberID(writerID), Resolver: resolver, Transport: transport, Ready: ready,
+		DefaultWatchRetention: 10000,
+	})
+	if err != nil {
+		return
+	}
+	s.shardMu.Lock()
+	s.shardStore = store
+	s.shardMu.Unlock()
 }
 
 var (
-	errScaleLinkLeaseHeld  = errors.New("registry: scale_link source lease held")
 	errScaleLinkStaleLease = errors.New("registry: stale scale_link source lease")
 )
 
-func (s *Stores) AcquireScaleLinkSourceLease(ctx context.Context, sourceID, ownerID, runID, readyLabel string, ttl time.Duration) (clusterstate.ScaleLinkRecord, bool, error) {
-	if sourceID == "" || ownerID == "" || runID == "" {
-		return clusterstate.ScaleLinkRecord{}, false, fmt.Errorf("registry: source_id, owner_id and run_id are required")
-	}
-	if ttl <= 0 {
-		ttl = 15 * time.Second
-	}
-	recordKey := scaleLinkSourceKey(sourceID)
-	for attempt := 0; attempt < 5; attempt++ {
-		q, err := s.scaleLinkQuorum(recordKey)
-		if err != nil {
-			return clusterstate.ScaleLinkRecord{}, false, err
-		}
-		cur, found, err := q.Get(ctx, recordKey)
-		if err != nil {
-			return clusterstate.ScaleLinkRecord{}, false, err
-		}
-		now := time.Now()
-		if found && scaleLinkLeaseLiveForOther(cur, ownerID, runID, now) {
-			return cur, false, nil
-		}
-		expect := uint64(0)
-		if found {
-			expect = cur.Meta.Rev
-		}
-		next, err := q.CAS(ctx, recordKey, expect, func(current clusterstate.ScaleLinkRecord, currentFound bool) (clusterstate.ScaleLinkRecord, bool, error) {
-			now := time.Now()
-			if currentFound && scaleLinkLeaseLiveForOther(current, ownerID, runID, now) {
-				return current, true, errScaleLinkLeaseHeld
-			}
-			term := current.Term
-			if !currentFound || current.OwnerID != ownerID || current.RunID != runID {
-				term++
-				if term == 0 {
-					term = 1
-				}
-			}
-			next := current
-			next.Key = recordKey
-			next.Kind = clusterstate.ScaleLinkKindSourceLease
-			next.SourceID = sourceID
-			next.OwnerID = ownerID
-			next.RunID = runID
-			next.ReadyLabel = readyLabel
-			next.Term = term
-			next.ExpiresUnixMs = now.Add(ttl).UnixMilli()
-			return next, true, nil
-		})
-		switch {
-		case err == nil:
-			return next, true, nil
-		case errors.Is(err, errScaleLinkLeaseHeld):
-			held, _, gerr := q.Get(ctx, recordKey)
-			return held, false, gerr
-		case errors.Is(err, clusterstate.ErrConflict):
-			continue
-		default:
-			return clusterstate.ScaleLinkRecord{}, false, err
-		}
-	}
-	return clusterstate.ScaleLinkRecord{}, false, clusterstate.ErrConflict
+func (s *Stores) AcquireScaleLinkSourceLease(ctx context.Context, sourceID, ownerID, runID, readyLabel string, ttl time.Duration) (clusterstate.ScaleImportSourceState, bool, error) {
+	return s.acquireScaleImportSourceShard(ctx, sourceID, ownerID, runID, readyLabel, ttl)
 }
 
 func (s *Stores) CheckScaleLinkSourceLease(ctx context.Context, sourceID, ownerID, runID string, term uint64) bool {
-	if sourceID == "" {
-		return true
-	}
-	recordKey := scaleLinkSourceKey(sourceID)
-	q, err := s.scaleLinkQuorum(recordKey)
-	if err != nil {
-		return false
-	}
-	rec, found, err := q.Get(ctx, recordKey)
-	if err != nil || !found {
-		return false
-	}
-	return rec.OwnerID == ownerID && rec.RunID == runID && rec.Term == term &&
-		(rec.ExpiresUnixMs <= 0 || rec.ExpiresUnixMs > time.Now().UnixMilli())
+	return s.checkScaleImportSourceShard(ctx, sourceID, ownerID, runID, term)
 }
 
-func (s *Stores) CheckpointScaleLinkSource(ctx context.Context, sourceID, ownerID, runID string, term uint64, cursor string, complete bool, lastErr string) (clusterstate.ScaleLinkRecord, error) {
-	if sourceID == "" || ownerID == "" || runID == "" || term == 0 {
-		return clusterstate.ScaleLinkRecord{}, fmt.Errorf("registry: source_id, owner_id, run_id and term are required")
-	}
-	recordKey := scaleLinkSourceKey(sourceID)
-	for attempt := 0; attempt < 5; attempt++ {
-		q, err := s.scaleLinkQuorum(recordKey)
-		if err != nil {
-			return clusterstate.ScaleLinkRecord{}, err
-		}
-		cur, found, err := q.Get(ctx, recordKey)
-		if err != nil {
-			return clusterstate.ScaleLinkRecord{}, err
-		}
-		expect := uint64(0)
-		if found {
-			expect = cur.Meta.Rev
-		}
-		next, err := q.CAS(ctx, recordKey, expect, func(current clusterstate.ScaleLinkRecord, currentFound bool) (clusterstate.ScaleLinkRecord, bool, error) {
-			if !currentFound || current.OwnerID != ownerID || current.RunID != runID || current.Term != term ||
-				(current.ExpiresUnixMs > 0 && current.ExpiresUnixMs <= time.Now().UnixMilli()) {
-				return current, currentFound, errScaleLinkStaleLease
-			}
-			next := current
-			next.Key = recordKey
-			next.Kind = clusterstate.ScaleLinkKindSourceLease
-			next.SourceID = sourceID
-			next.LastError = lastErr
-			if complete {
-				next.Cursor = ""
-				next.Round++
-			} else {
-				next.Cursor = cursor
-			}
-			return next, true, nil
-		})
-		switch {
-		case err == nil:
-			return next, nil
-		case errors.Is(err, errScaleLinkStaleLease):
-			return clusterstate.ScaleLinkRecord{}, errScaleLinkStaleLease
-		case errors.Is(err, clusterstate.ErrConflict):
-			continue
-		default:
-			return clusterstate.ScaleLinkRecord{}, err
-		}
-	}
-	return clusterstate.ScaleLinkRecord{}, clusterstate.ErrConflict
+func (s *Stores) CheckpointScaleLinkSource(ctx context.Context, sourceID, ownerID, runID string, term uint64, cursor string, complete bool, lastErr string) (clusterstate.ScaleImportSourceState, error) {
+	return s.checkpointScaleImportSourceShard(ctx, sourceID, ownerID, runID, term, cursor, complete, lastErr)
 }
-
-func scaleLinkLeaseLiveForOther(cur clusterstate.ScaleLinkRecord, ownerID, runID string, now time.Time) bool {
-	if cur.ExpiresUnixMs > 0 && cur.ExpiresUnixMs <= now.UnixMilli() {
-		return false
-	}
-	return cur.OwnerID != "" && (cur.OwnerID != ownerID || cur.RunID != runID)
-}
-
-func (s *Stores) PutScaleLinkAllocation(ctx context.Context, p *routesync.SelectorPatch, ttl time.Duration) (clusterstate.ScaleLinkRecord, error) {
-	if p == nil || p.Group == "" {
-		return clusterstate.ScaleLinkRecord{}, fmt.Errorf("registry: group is required for scale_link allocation")
-	}
-	if ttl <= 0 {
-		ttl = 10 * time.Minute
-	}
-	recordKey := scaleLinkAllocationKey(p.Group)
-	for attempt := 0; attempt < 5; attempt++ {
-		q, err := s.scaleLinkQuorum(recordKey)
-		if err != nil {
-			return clusterstate.ScaleLinkRecord{}, err
-		}
-		cur, found, err := q.Get(ctx, recordKey)
-		if err != nil {
-			return clusterstate.ScaleLinkRecord{}, err
-		}
-		expect := uint64(0)
-		if found {
-			expect = cur.Meta.Rev
-		}
-		next, err := q.CAS(ctx, recordKey, expect, func(clusterstate.ScaleLinkRecord, bool) (clusterstate.ScaleLinkRecord, bool, error) {
-			expires := time.Now().Add(ttl).UnixMilli()
-			if len(p.NodeIDs) == 0 || p.KeyFingerprint == "" || (p.ManifestKey == "" && p.ManifestKeyRef == "") {
-				expires = time.Now().UnixMilli()
-			}
-			return clusterstate.ScaleLinkRecord{
-				Key: recordKey, Kind: clusterstate.ScaleLinkKindAllocation,
-				Group: p.Group, NodeIDs: append([]string(nil), p.NodeIDs...),
-				KeyFingerprint: p.KeyFingerprint, ManifestKeyType: p.ManifestKeyType,
-				ManifestKey: p.ManifestKey, ManifestKeyRef: p.ManifestKeyRef,
-				ExpiresUnixMs: expires,
-			}, true, nil
-		})
-		switch {
-		case err == nil:
-			return next, nil
-		case errors.Is(err, clusterstate.ErrConflict):
-			continue
-		default:
-			return clusterstate.ScaleLinkRecord{}, err
-		}
-	}
-	return clusterstate.ScaleLinkRecord{}, clusterstate.ErrConflict
-}
-
-func scaleLinkSourceKey(sourceID string) string { return clusterstate.ScaleLinkSourceKey(sourceID) }
-
-func scaleLinkAllocationKey(group string) string { return clusterstate.ScaleLinkAllocationKey(group) }
 
 // --- node_link ---
 
@@ -809,37 +428,18 @@ func (s *Stores) PutNodeRuntime(ctx context.Context, n *NodeRecord) error {
 }
 
 func (s *Stores) GetNode(ctx context.Context, id string) (*NodeRecord, bool, error) {
-	q, err := s.nodeQuorum(id)
-	if err != nil {
-		return nil, false, err
-	}
-	rec, found, err := q.Get(ctx, id)
-	if err != nil || !found {
-		return nil, found, err
-	}
-	n := fromClusterNode(rec)
-	return &n, true, nil
+	return s.getNodeShard(ctx, id)
 }
 
 func (s *Stores) DeleteNode(ctx context.Context, id string) error {
-	if err := s.checkNodeHandoff(id); err != nil {
-		return err
-	}
-	q, err := s.nodeQuorum(id)
+	rec, found, err := s.getNodeShard(ctx, id)
 	if err != nil {
 		return err
 	}
-	rec, found, err := q.Get(ctx, id)
-	if err != nil {
+	if err := s.deleteNodeShard(ctx, id); err != nil {
 		return err
 	}
 	if found {
-		_, err = q.CAS(ctx, id, rec.Meta.Rev, func(clusterstate.NodeRecord, bool) (clusterstate.NodeRecord, bool, error) {
-			return clusterstate.NodeRecord{}, false, nil
-		})
-		if err != nil {
-			return err
-		}
 		return s.DeleteNodeListWithSource(ctx, id, rec.Meta)
 	}
 	return s.DeleteNodeList(ctx, id)
@@ -854,64 +454,45 @@ func (s *Stores) AddNodeSandboxRef(ctx context.Context, nodeID string, ref clust
 	if nodeID == "" || ref.Group == "" || ref.RouteKey == "" {
 		return nil
 	}
-	return s.updateNodeRuntime(ctx, nodeID, func(n *NodeRecord) {
-		for i := range n.Sandboxes {
-			if n.Sandboxes[i].Group == ref.Group && n.Sandboxes[i].RouteKey == ref.RouteKey {
-				n.Sandboxes[i] = ref
-				return
-			}
-		}
-		n.Sandboxes = append(n.Sandboxes, ref)
-	})
+	return s.addNodeSandboxRefShard(ctx, nodeID, ref)
 }
 
 func (s *Stores) RemoveNodeSandboxRef(ctx context.Context, nodeID, group, routeKey, sid string) error {
 	if nodeID == "" {
 		return nil
 	}
-	return s.updateNodeRuntime(ctx, nodeID, func(n *NodeRecord) {
-		out := n.Sandboxes[:0]
-		for _, ref := range n.Sandboxes {
-			matchKey := group != "" && routeKey != "" && ref.Group == group && ref.RouteKey == routeKey
-			matchSID := sid != "" && ref.SandboxID == sid
-			if matchKey || matchSID {
-				continue
+	if group != "" && routeKey != "" {
+		return s.removeNodeSandboxRefShard(ctx, nodeID, group, routeKey)
+	}
+	if sid == "" {
+		return nil
+	}
+	rec, found, err := s.getNodeShard(ctx, nodeID)
+	if err != nil || !found {
+		return err
+	}
+	for _, ref := range rec.Sandboxes {
+		if ref.SandboxID == sid {
+			if err := s.removeNodeSandboxRefShard(ctx, nodeID, ref.Group, ref.RouteKey); err != nil {
+				return err
 			}
-			out = append(out, ref)
 		}
-		n.Sandboxes = out
-	})
+	}
+	return nil
 }
 
 func (s *Stores) AddNodeBuildRef(ctx context.Context, nodeID string, ref clusterstate.NodeBuildRef) error {
 	if nodeID == "" || ref.Group == "" || ref.BuildID == "" {
 		return nil
 	}
-	return s.updateNodeRuntime(ctx, nodeID, func(n *NodeRecord) {
-		for i := range n.Builds {
-			if n.Builds[i].Group == ref.Group && n.Builds[i].BuildID == ref.BuildID {
-				n.Builds[i] = ref
-				return
-			}
-		}
-		n.Builds = append(n.Builds, ref)
-	})
+	return s.addNodeBuildRefShard(ctx, nodeID, ref)
 }
 
 func (s *Stores) RemoveNodeBuildRef(ctx context.Context, nodeID, group, buildID string) error {
 	if nodeID == "" || group == "" || buildID == "" {
 		return nil
 	}
-	return s.updateNodeRuntime(ctx, nodeID, func(n *NodeRecord) {
-		out := n.Builds[:0]
-		for _, ref := range n.Builds {
-			if ref.Group == group && ref.BuildID == buildID {
-				continue
-			}
-			out = append(out, ref)
-		}
-		n.Builds = out
-	})
+	return s.removeNodeBuildRefShard(ctx, nodeID, group, buildID)
 }
 
 func (s *Stores) updateNodeRuntime(ctx context.Context, nodeID string, mutate func(*NodeRecord)) error {
@@ -937,66 +518,51 @@ func (s *Stores) UpsertNodeManifestKey(ctx context.Context, nodeID string, key c
 	if key.Type == "" {
 		key.Type = clusterstate.SecretInline
 	}
-	return s.updateNodeRuntime(ctx, nodeID, func(n *NodeRecord) {
-		for i := range n.ManifestKeys {
-			if n.ManifestKeys[i].Fingerprint == key.Fingerprint {
-				if sameNodeManifestKeyMaterial(n.ManifestKeys[i], key) && key.SentExpiresUnix == 0 {
-					key.SentExpiresUnix = n.ManifestKeys[i].SentExpiresUnix
-				}
-				n.ManifestKeys[i] = key
-				sortNodeManifestKeys(n.ManifestKeys)
-				return
-			}
-		}
-		n.ManifestKeys = append(n.ManifestKeys, key)
-		sortNodeManifestKeys(n.ManifestKeys)
-	})
+	cur, _, found, err := s.getNodeManifestKeyShard(ctx, nodeID, key.Fingerprint)
+	if err != nil {
+		return err
+	}
+	if found && sameNodeManifestKeyMaterial(cur, key) && key.SentExpiresUnix == 0 {
+		key.SentExpiresUnix = cur.SentExpiresUnix
+	}
+	return s.upsertNodeManifestKeyShard(ctx, nodeID, key)
 }
 
 func (s *Stores) MarkNodeManifestKeySent(ctx context.Context, nodeID, fingerprint string, sentExpiresUnix int64) error {
 	if nodeID == "" || fingerprint == "" || sentExpiresUnix <= 0 {
 		return nil
 	}
-	return s.updateNodeRuntime(ctx, nodeID, func(n *NodeRecord) {
-		for i := range n.ManifestKeys {
-			if n.ManifestKeys[i].Fingerprint == fingerprint {
-				n.ManifestKeys[i].SentExpiresUnix = sentExpiresUnix
-				return
-			}
-		}
-	})
+	key, _, found, err := s.getNodeManifestKeyShard(ctx, nodeID, fingerprint)
+	if err != nil || !found {
+		return err
+	}
+	key.SentExpiresUnix = sentExpiresUnix
+	return s.upsertNodeManifestKeyShard(ctx, nodeID, key)
 }
 
 func (s *Stores) DropNodeManifestKey(ctx context.Context, nodeID, fingerprint string) error {
 	if nodeID == "" || fingerprint == "" {
 		return nil
 	}
-	return s.updateNodeRuntime(ctx, nodeID, func(n *NodeRecord) {
-		out := n.ManifestKeys[:0]
-		for _, key := range n.ManifestKeys {
-			if key.Fingerprint == fingerprint {
-				continue
-			}
-			out = append(out, key)
-		}
-		n.ManifestKeys = out
-	})
+	return s.dropNodeManifestKeyShard(ctx, nodeID, fingerprint)
 }
 
 func (s *Stores) PruneExpiredNodeManifestKeys(ctx context.Context, nodeID string, nowUnix int64) error {
 	if nodeID == "" || nowUnix <= 0 {
 		return nil
 	}
-	return s.updateNodeRuntime(ctx, nodeID, func(n *NodeRecord) {
-		out := n.ManifestKeys[:0]
-		for _, key := range n.ManifestKeys {
-			if key.ExpiresUnix > 0 && key.ExpiresUnix <= nowUnix {
-				continue
+	rec, found, err := s.getNodeShard(ctx, nodeID)
+	if err != nil || !found {
+		return err
+	}
+	for _, key := range rec.ManifestKeys {
+		if key.ExpiresUnix > 0 && key.ExpiresUnix <= nowUnix {
+			if err := s.dropNodeManifestKeyShard(ctx, nodeID, key.Fingerprint); err != nil {
+				return err
 			}
-			out = append(out, key)
 		}
-		n.ManifestKeys = out
-	})
+	}
+	return nil
 }
 
 func sortNodeManifestKeys(keys []clusterstate.NodeManifestKey) {
@@ -1008,40 +574,11 @@ func sameNodeManifestKeyMaterial(a, b clusterstate.NodeManifestKey) bool {
 }
 
 func (s *Stores) putNodeLink(ctx context.Context, n *NodeRecord) (uint64, error) {
-	if err := s.checkNodeHandoff(n.NodeID); err != nil {
-		return 0, err
-	}
-	q, err := s.nodeQuorum(n.NodeID)
-	if err != nil {
-		return 0, err
-	}
-	cur, found, err := q.Get(ctx, n.NodeID)
-	if err != nil {
-		return 0, err
-	}
-	expect := uint64(0)
-	if found {
-		expect = cur.Meta.Rev
-	}
-	rec, err := q.CAS(ctx, n.NodeID, expect, func(clusterstate.NodeRecord, bool) (clusterstate.NodeRecord, bool, error) {
-		return toClusterNode(n), true, nil
-	})
-	if err != nil {
-		return 0, err
-	}
-	n.Meta = rec.Meta
-	return rec.Meta.Rev, nil
+	return s.putNodeShard(ctx, n)
 }
 
 func projectNodeListRecord(n *NodeRecord) clusterstate.NodeListEntry {
 	return clusterstate.ProjectNodeList(toClusterNode(n))
-}
-
-func nodeListRecordNewer(next, cur clusterstate.NodeListEntry) bool {
-	if cur.Meta.Ballot.Less(next.Meta.Ballot) {
-		return true
-	}
-	return cur.Meta.Ballot == next.Meta.Ballot && cur.Meta.Rev < next.Meta.Rev
 }
 
 func nodeListProjectionNewer(next, cur clusterstate.NodeListEntry) bool {
@@ -1098,70 +635,56 @@ func (s *Stores) NodeListRev(ctx context.Context) (int64, error) {
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
-	if err := s.ensureNodeListReady(ctx); err != nil {
+	sh, err := s.nodeListShard()
+	if err != nil {
 		return 0, err
 	}
-	s.nodeListMu.Lock()
-	defer s.nodeListMu.Unlock()
-	return s.nodeListRev, nil
+	snap, err := sh.Snapshot(ctx)
+	if err != nil {
+		return 0, err
+	}
+	return int64(snap.Rev), nil
 }
 
 func (s *Stores) RangeNodeList(ctx context.Context, fn func(clusterstate.NodeListEntry) error) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if err := s.ensureNodeListReady(ctx); err != nil {
-		return err
-	}
-	out, err := s.localNodeList.List(ctx)
-	if err != nil {
-		return err
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].NodeID < out[j].NodeID })
-	for _, entry := range out {
-		if entry.Deleted {
-			continue
-		}
-		if err := fn(entry); err != nil {
-			return err
-		}
-	}
-	return nil
+	return s.rangeNodeListShard(ctx, fn)
 }
 
-func (s *Stores) WatchNodeList(ctx context.Context, fromRev int64) (<-chan clusterstore.Event, error) {
+func (s *Stores) WatchNodeList(ctx context.Context, fromRev int64) (<-chan WatchEvent, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if err := s.ensureNodeListReady(ctx); err != nil {
+	if fromRev < 0 {
+		fromRev = 0
+	}
+	sh, err := s.nodeListShard()
+	if err != nil {
 		return nil, err
 	}
-	s.nodeListMu.Lock()
-	defer s.nodeListMu.Unlock()
-	if fromRev > 0 && len(s.nodeListLog) > 0 && fromRev < s.nodeListLog[0].Rev-1 {
-		return nil, clusterstore.ErrCompacted
+	watch, err := sh.WatchSince(ctx, uint64(fromRev))
+	if errors.Is(err, shardkv.ErrCompacted) {
+		return nil, ErrWatchCompacted
 	}
-	replay := make([]clusterstore.Event, 0)
-	for _, ev := range s.nodeListLog {
-		if ev.Rev > fromRev {
-			replay = append(replay, ev)
-		}
+	if err != nil {
+		return nil, err
 	}
-	ch := make(chan clusterstore.Event, len(replay)+1024)
-	for _, ev := range replay {
-		ch <- ev
-	}
-	id := s.nodeListSeq
-	s.nodeListSeq++
-	s.nodeListSubs[id] = ch
+	ch := make(chan WatchEvent, 1024)
 	go func() {
-		<-ctx.Done()
-		s.nodeListMu.Lock()
-		if cur, ok := s.nodeListSubs[id]; ok {
-			delete(s.nodeListSubs, id)
-			close(cur)
+		defer close(ch)
+		for ev := range watch.Events {
+			out, ok, err := nodeListWatchEvent(ev)
+			if err != nil || !ok {
+				continue
+			}
+			select {
+			case ch <- out:
+			case <-ctx.Done():
+				return
+			}
 		}
-		s.nodeListMu.Unlock()
 	}()
 	return ch, nil
 }
@@ -1174,34 +697,44 @@ func (s *Stores) PutNodeListEntry(ctx context.Context, entry clusterstate.NodeLi
 		return fmt.Errorf("registry: node_list node_id is required")
 	}
 	entry.Deleted = false
+	sh, err := s.nodeListShard()
+	if err != nil {
+		return err
+	}
+	key := clusterstate.NodeListRecordKey(entry.NodeID)
 	for attempt := 0; attempt < 5; attempt++ {
-		q, err := s.nodeListQuorum()
+		curRec, found, err := sh.GetRecord(ctx, key)
 		if err != nil {
 			return err
 		}
-		cur, found, err := q.Read(ctx, entry.NodeID)
-		if err != nil {
-			return err
+		var cur clusterstate.NodeListEntry
+		if found {
+			cur, err = clusterstate.DecodeShardValue[clusterstate.NodeListEntry](curRec.Value)
+			if err != nil {
+				return err
+			}
 		}
 		if found && !nodeListProjectionNewer(entry, cur) {
 			return nil
 		}
 		expect := uint64(0)
 		if found {
-			expect = cur.Meta.Rev
+			expect = curRec.Meta.Rev
 		}
-		_, err = q.CAS(ctx, entry.NodeID, expect, func(cur clusterstate.NodeListEntry, found bool) (clusterstate.NodeListEntry, bool, error) {
-			if !found || nodeListProjectionNewer(entry, cur) {
-				return entry, true, nil
-			}
-			return cur, true, nil
-		})
-		if err == clusterstate.ErrConflict {
+		value, err := clusterstate.EncodeShardValue(entry)
+		if err != nil {
+			return err
+		}
+		_, ok, err := sh.CAS(ctx, key, expect, value)
+		if err != nil {
+			return err
+		}
+		if !ok {
 			continue
 		}
-		return err
+		return nil
 	}
-	return clusterstate.ErrConflict
+	return shardkv.ErrConflict
 }
 
 func (s *Stores) DeleteNodeList(ctx context.Context, nodeID string) error {
@@ -1215,80 +748,45 @@ func (s *Stores) DeleteNodeListWithSource(ctx context.Context, nodeID string, so
 	if nodeID == "" {
 		return nil
 	}
+	sh, err := s.nodeListShard()
+	if err != nil {
+		return err
+	}
+	key := clusterstate.NodeListRecordKey(nodeID)
 	for attempt := 0; attempt < 5; attempt++ {
-		q, err := s.nodeListQuorum()
+		curRec, found, err := sh.GetRecord(ctx, key)
 		if err != nil {
 			return err
 		}
-		cur, found, err := q.Read(ctx, nodeID)
+		if !found {
+			return nil
+		}
+		cur, err := clusterstate.DecodeShardValue[clusterstate.NodeListEntry](curRec.Value)
 		if err != nil {
 			return err
-		}
-		expect := uint64(0)
-		if found {
-			expect = cur.Meta.Rev
 		}
 		tombstone := clusterstate.NodeListEntry{NodeID: nodeID, SourceMeta: source, Deleted: true}
-		if found && recordMetaZero(source) {
+		if recordMetaZero(source) {
 			tombstone.SourceMeta = cur.SourceMeta
 			tombstone.LastHeartbeatUnix = cur.LastHeartbeatUnix
 		}
-		if found && !nodeListProjectionNewer(tombstone, cur) {
+		if !nodeListProjectionNewer(tombstone, cur) {
 			return nil
 		}
-		_, err = q.CAS(ctx, nodeID, expect, func(cur clusterstate.NodeListEntry, found bool) (clusterstate.NodeListEntry, bool, error) {
-			if !found || nodeListProjectionNewer(tombstone, cur) {
-				return tombstone, true, nil
-			}
-			return cur, true, nil
-		})
-		if err == clusterstate.ErrConflict {
+		value, err := clusterstate.EncodeShardValue(tombstone)
+		if err != nil {
+			return err
+		}
+		_, ok, err := sh.DeleteValue(ctx, key, curRec.Meta.Rev, value)
+		if err != nil {
+			return err
+		}
+		if !ok {
 			continue
 		}
-		return err
+		return nil
 	}
-	return clusterstate.ErrConflict
-}
-
-func (s *Stores) publishNodeListReplicaEvent(nodeID string, entry clusterstate.NodeListEntry) {
-	if nodeID == "" {
-		nodeID = entry.NodeID
-	}
-	if nodeID == "" {
-		return
-	}
-	ev := clusterstore.Event{Key: nodeID}
-	if entry.Deleted {
-		ev.Type = clusterstore.EventDelete
-	} else {
-		ev.Type = clusterstore.EventPut
-		b, err := json.Marshal(entry)
-		if err != nil {
-			return
-		}
-		ev.Value = b
-	}
-	s.nodeListMu.Lock()
-	defer s.nodeListMu.Unlock()
-	s.nodeListRev++
-	ev.Rev = s.nodeListRev
-	s.nodeListLog = append(s.nodeListLog, ev)
-	retention := s.nodeListRetention
-	if retention <= 0 {
-		retention = 10000
-	}
-	if len(s.nodeListLog) > retention {
-		copy(s.nodeListLog, s.nodeListLog[len(s.nodeListLog)-retention:])
-		s.nodeListLog = s.nodeListLog[:retention]
-	}
-	for id, ch := range s.nodeListSubs {
-		select {
-		case ch <- ev:
-		default:
-			delete(s.nodeListSubs, id)
-			close(ch)
-		}
-	}
+	return shardkv.ErrConflict
 }
 
 // --- route_link ---
@@ -1297,276 +795,60 @@ func (s *Stores) RouteGroupRev(ctx context.Context, group string) (int64, error)
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
-	s.routeMu.Lock()
-	defer s.routeMu.Unlock()
-	return s.routeRev, nil
+	sh, err := s.routeLinkShard(group)
+	if err != nil {
+		return 0, err
+	}
+	snap, err := sh.Snapshot(ctx)
+	if err != nil {
+		return 0, err
+	}
+	return int64(snap.Rev), nil
 }
 
-func (s *Stores) WatchRouteGroup(ctx context.Context, group string, fromRev int64) (<-chan clusterstore.Event, error) {
+func (s *Stores) WatchRouteGroup(ctx context.Context, group string, fromRev int64) (<-chan WatchEvent, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	if group == "" {
 		return nil, fmt.Errorf("registry: group is required for route watch")
 	}
-	s.routeMu.Lock()
-	defer s.routeMu.Unlock()
-	log := s.routeLog[group]
-	if fromRev > 0 && len(log) > 0 && fromRev < log[0].Rev-1 {
-		return nil, clusterstore.ErrCompacted
+	if fromRev < 0 {
+		fromRev = 0
 	}
-	replay := make([]clusterstore.Event, 0)
-	for _, ev := range log {
-		if ev.Rev > fromRev {
-			replay = append(replay, ev)
-		}
+	sh, err := s.routeLinkShard(group)
+	if err != nil {
+		return nil, err
 	}
-	ch := make(chan clusterstore.Event, len(replay)+1024)
-	for _, ev := range replay {
-		ch <- ev
+	watch, err := sh.WatchSince(ctx, uint64(fromRev))
+	if errors.Is(err, shardkv.ErrCompacted) {
+		return nil, ErrWatchCompacted
 	}
-	id := s.routeSeq
-	s.routeSeq++
-	if s.routeSubs[group] == nil {
-		s.routeSubs[group] = map[int]chan clusterstore.Event{}
+	if err != nil {
+		return nil, err
 	}
-	s.routeSubs[group][id] = ch
+	ch := make(chan WatchEvent, 1024)
 	go func() {
-		<-ctx.Done()
-		s.routeMu.Lock()
-		if subs := s.routeSubs[group]; subs != nil {
-			if cur, ok := subs[id]; ok {
-				delete(subs, id)
-				close(cur)
+		defer close(ch)
+		for ev := range watch.Events {
+			out, ok, err := routeWatchEvent(ev)
+			if err != nil || !ok {
+				continue
 			}
-			if len(subs) == 0 {
-				delete(s.routeSubs, group)
+			select {
+			case ch <- out:
+			case <-ctx.Done():
+				return
 			}
 		}
-		s.routeMu.Unlock()
 	}()
 	return ch, nil
 }
 
-func (s *Stores) publishRouteReplicaEvent(key string, rr clusterstate.RouteRecord) {
-	group, routeKey := rr.Group, rr.RouteKey
-	if group == "" || routeKey == "" {
-		group, routeKey = splitRouteStorageKey(key)
-	}
-	if group == "" || routeKey == "" {
-		return
-	}
-	ev := clusterstore.Event{Key: routeKey}
-	if rr.State == clusterstate.RouteDead {
-		ev.Type = clusterstore.EventDelete
-	} else {
-		ev.Type = clusterstore.EventPut
-		b, err := json.Marshal(fromClusterRoute(rr))
-		if err != nil {
-			return
-		}
-		ev.Value = b
-	}
-	s.routeMu.Lock()
-	defer s.routeMu.Unlock()
-	s.routeRev++
-	ev.Rev = s.routeRev
-	s.routeLog[group] = append(s.routeLog[group], ev)
-	retention := s.routeRetention
-	if retention <= 0 {
-		retention = 10000
-	}
-	if len(s.routeLog[group]) > retention {
-		log := s.routeLog[group]
-		copy(log, log[len(log)-retention:])
-		s.routeLog[group] = log[:retention]
-	}
-	for id, ch := range s.routeSubs[group] {
-		select {
-		case ch <- ev:
-		default:
-			delete(s.routeSubs[group], id)
-			close(ch)
-		}
-	}
-	if len(s.routeSubs[group]) == 0 {
-		delete(s.routeSubs, group)
-	}
-}
-
-func (s *Stores) ensureRouteGroupReady(ctx context.Context, group string) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	if group == "" {
-		return fmt.Errorf("registry: group is required for route_link list")
-	}
-	s.routeMu.Lock()
-	if s.routeReady[group] {
-		s.routeMu.Unlock()
-		return nil
-	}
-	s.routeMu.Unlock()
-	ownerSets, jointOwners, err := s.routeOwners(group)
-	if err != nil {
-		return err
-	}
-	isOwner := false
-	for _, id := range jointOwners {
-		if id == s.writerID {
-			isOwner = true
-			break
-		}
-	}
-	if !isOwner {
-		return ErrShardNotReady
-	}
-	accepted := map[string]bool{}
-	byKey := map[string]clusterstate.RouteRecord{}
-	var last error
-	for _, id := range jointOwners {
-		rep := s.routeReplica(id)
-		if rep == nil {
-			last = fmt.Errorf("registry: route replica %q unavailable", id)
-			continue
-		}
-		routes, err := rep.ListGroup(ctx, group)
-		if err != nil {
-			last = err
-			continue
-		}
-		accepted[id] = true
-		for _, rr := range routes {
-			g, rk := rr.Group, rr.RouteKey
-			if g == "" || rk == "" {
-				continue
-			}
-			if g != group {
-				continue
-			}
-			key := clusterstate.RouteKey(g, rk)
-			if cur, ok := byKey[key]; !ok || routeRecordNewer(rr, cur) {
-				byKey[key] = rr
-			}
-		}
-	}
-	if !satisfiesOwnerQuorums(accepted, ownerSets) {
-		if last != nil {
-			return last
-		}
-		return clusterstate.ErrQuorum
-	}
-	for key, rr := range byKey {
-		if err := s.localRoute.Repair(ctx, key, rr); err != nil {
-			return err
-		}
-	}
-	s.routeMu.Lock()
-	s.routeReady[group] = true
-	s.routeMu.Unlock()
-	return nil
-}
-
-func (s *Stores) ensureNodeListReady(ctx context.Context) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	s.nodeListMu.Lock()
-	if s.nodeListReady {
-		s.nodeListMu.Unlock()
-		return nil
-	}
-	s.nodeListMu.Unlock()
-	ownerSets, jointOwners, err := s.nodeListOwners()
-	if err != nil {
-		return err
-	}
-	isOwner := false
-	for _, id := range jointOwners {
-		if id == s.writerID {
-			isOwner = true
-			break
-		}
-	}
-	if !isOwner {
-		return ErrShardNotReady
-	}
-	accepted := map[string]bool{}
-	byNode := map[string]clusterstate.NodeListEntry{}
-	var last error
-	for _, id := range jointOwners {
-		rep := s.nodeListReplica(id)
-		if rep == nil {
-			last = fmt.Errorf("registry: node_list replica %q unavailable", id)
-			continue
-		}
-		entries, err := rep.List(ctx)
-		if err != nil {
-			last = err
-			continue
-		}
-		accepted[id] = true
-		for _, entry := range entries {
-			if entry.NodeID == "" {
-				continue
-			}
-			if cur, ok := byNode[entry.NodeID]; !ok || nodeListRecordNewer(entry, cur) {
-				byNode[entry.NodeID] = entry
-			}
-		}
-	}
-	if !satisfiesOwnerQuorums(accepted, ownerSets) {
-		if last != nil {
-			return last
-		}
-		return clusterstate.ErrQuorum
-	}
-	for nodeID, entry := range byNode {
-		if err := s.localNodeList.Repair(ctx, nodeID, entry); err != nil {
-			return err
-		}
-	}
-	s.nodeListMu.Lock()
-	s.nodeListReady = true
-	s.nodeListMu.Unlock()
-	return nil
-}
-
-func satisfiesOwnerQuorums(accepted map[string]bool, ownerSets [][]string) bool {
-	for _, owners := range ownerSets {
-		need := len(owners)/2 + 1
-		got := 0
-		for _, id := range owners {
-			if accepted[id] {
-				got++
-			}
-		}
-		if got < need {
-			return false
-		}
-	}
-	return true
-}
-
-func routeRecordNewer(next, cur clusterstate.RouteRecord) bool {
-	if cur.Meta.Ballot.Less(next.Meta.Ballot) {
-		return true
-	}
-	return cur.Meta.Ballot == next.Meta.Ballot && cur.Meta.Rev < next.Meta.Rev
-}
-
 // GetSandbox returns the route_link record + its revision (for CAS).
 func (s *Stores) GetSandbox(ctx context.Context, group, routeKey string) (rec *SandboxRecord, rev int64, found bool, err error) {
-	q, err := s.routeQuorum(group)
-	if err != nil {
-		return nil, 0, false, err
-	}
-	rr, found, err := q.Get(ctx, group, routeKey)
-	if err != nil || !found {
-		return nil, 0, found, err
-	}
-	r := fromClusterRoute(rr)
-	return &r, int64(rr.Meta.Rev), true, nil
+	rec, urev, found, err := s.getRouteSandboxShard(ctx, group, routeKey)
+	return rec, int64(urev), found, err
 }
 
 func (s *Stores) PutSandbox(ctx context.Context, r *SandboxRecord) (int64, error) {
@@ -1594,172 +876,36 @@ func (s *Stores) CASSandbox(ctx context.Context, r *SandboxRecord, expectRev int
 	if expectRev < 0 {
 		return 0, false, fmt.Errorf("registry: negative route_link revision %d", expectRev)
 	}
-	if err := s.checkRouteHandoff(r.Group, r.RouteKey); err != nil {
-		return 0, false, err
-	}
-	q, err := s.routeQuorum(r.Group)
+	rev, ok, err := s.casRouteSandboxShard(ctx, r, uint64(expectRev))
 	if err != nil {
 		return 0, false, err
 	}
-	rec, err := q.CAS(ctx, r.Group, r.RouteKey, uint64(expectRev), func(clusterstate.RouteRecord, bool) (clusterstate.RouteRecord, bool, error) {
-		return toClusterRoute(r), true, nil
-	})
-	if err == clusterstate.ErrConflict {
-		return 0, false, nil
-	}
-	if err != nil {
-		return 0, false, err
-	}
-	return int64(rec.Meta.Rev), true, nil
+	return int64(rev), ok, nil
 }
 
 func (s *Stores) DeleteSandbox(ctx context.Context, group, routeKey string) error {
-	if err := s.checkRouteHandoff(group, routeKey); err != nil {
-		return err
-	}
-	q, err := s.routeQuorum(group)
-	if err != nil {
-		return err
-	}
-	rec, found, err := q.Get(ctx, group, routeKey)
-	if err != nil || !found {
-		return err
-	}
-	_, err = q.CAS(ctx, group, routeKey, rec.Meta.Rev, func(clusterstate.RouteRecord, bool) (clusterstate.RouteRecord, bool, error) {
-		return clusterstate.RouteRecord{}, false, nil
-	})
-	return err
+	return s.deleteRouteSandboxShard(ctx, group, routeKey)
 }
 
 // RangeSandboxes streams a group's route_link rows.
 func (s *Stores) RangeSandboxes(ctx context.Context, group string, fn func(*SandboxRecord) error) error {
-	return s.rangeGroupRoutes(ctx, group, false, fn)
-}
-
-func (s *Stores) RangeBuildsInGroup(ctx context.Context, group string, fn func(*BuildRecord) error) error {
-	return s.rangeGroupRoutes(ctx, group, true, func(s *SandboxRecord) error {
-		if !isBuildRouteKey(s.RouteKey) {
-			return nil
-		}
-		b := buildRecordFromSandbox(s)
-		if b.BuildID == "" {
-			b.BuildID = buildIDFromRouteKey(s.RouteKey)
-		}
-		return fn(b)
-	})
-}
-
-func (s *Stores) rangeGroupRoutes(ctx context.Context, group string, includeBuilds bool, fn func(*SandboxRecord) error) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	if group == "" {
 		return fmt.Errorf("registry: group is required for route_link list")
 	}
-	if err := s.ensureRouteGroupReady(ctx, group); err != nil {
+	return s.rangeRouteSandboxesShard(ctx, group, fn)
+}
+
+func (s *Stores) RangeBuildsInGroup(ctx context.Context, group string, fn func(*BuildRecord) error) error {
+	if err := ctx.Err(); err != nil {
 		return err
 	}
-	routes, err := s.localRoute.ListGroup(ctx, group)
-	if err != nil {
-		return err
+	if group == "" {
+		return fmt.Errorf("registry: group is required for route_link list")
 	}
-	sort.Slice(routes, func(i, j int) bool { return routes[i].RouteKey < routes[j].RouteKey })
-	for _, rr := range routes {
-		if rr.State == clusterstate.RouteDead {
-			continue
-		}
-		if !includeBuilds && isBuildRouteKey(rr.RouteKey) {
-			continue
-		}
-		rec := fromClusterRoute(rr)
-		if err := fn(&rec); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func buildRouteKey(buildID string) string { return buildRouteKeyPrefix + buildID }
-
-func buildIDFromRouteKey(routeKey string) string {
-	return strings.TrimPrefix(routeKey, buildRouteKeyPrefix)
-}
-
-func isBuildRouteKey(routeKey string) bool {
-	return strings.HasPrefix(routeKey, buildRouteKeyPrefix)
-}
-
-func splitRouteStorageKey(key string) (string, string) {
-	for i := 0; i < len(key); i++ {
-		if key[i] == 0 {
-			return key[:i], key[i+1:]
-		}
-	}
-	return "", key
-}
-
-func toClusterRoute(r *SandboxRecord) clusterstate.RouteRecord {
-	if r == nil {
-		return clusterstate.RouteRecord{}
-	}
-	return clusterstate.RouteRecord{
-		Group:          r.Group,
-		RouteKey:       r.RouteKey,
-		SandboxID:      r.SID,
-		State:          toClusterRouteState(r.State),
-		NodeID:         r.NodeID,
-		TemplateID:     r.TemplateID,
-		AccessToken:    r.AccessToken,
-		BuildID:        r.BuildID,
-		BuildState:     string(r.BuildState),
-		BuildResources: cloneBuildResources(r.BuildResources),
-		BuildReason:    r.BuildReason,
-		CreatedUnix:    r.CreatedU,
-	}
-}
-
-func fromClusterRoute(r clusterstate.RouteRecord) SandboxRecord {
-	return SandboxRecord{
-		Group:          r.Group,
-		RouteKey:       r.RouteKey,
-		SID:            r.SandboxID,
-		State:          fromClusterRouteState(r.State),
-		NodeID:         r.NodeID,
-		TemplateID:     r.TemplateID,
-		AccessToken:    r.AccessToken,
-		LastActive:     r.Meta.UpdatedAt.Unix(),
-		BuildID:        r.BuildID,
-		BuildState:     BuildState(r.BuildState),
-		BuildResources: cloneBuildResources(r.BuildResources),
-		BuildReason:    r.BuildReason,
-		CreatedU:       r.CreatedUnix,
-	}
-}
-
-func toClusterRouteState(st SandboxState) clusterstate.RouteState {
-	switch st {
-	case StateReserved:
-		return clusterstate.RouteReserved
-	case StateReady:
-		return clusterstate.RouteReady
-	case StatePaused:
-		return clusterstate.RoutePaused
-	default:
-		return clusterstate.RouteNone
-	}
-}
-
-func fromClusterRouteState(st clusterstate.RouteState) SandboxState {
-	switch st {
-	case clusterstate.RouteReserved:
-		return StateReserved
-	case clusterstate.RouteReady:
-		return StateReady
-	case clusterstate.RoutePaused:
-		return StatePaused
-	default:
-		return StateNone
-	}
+	return s.rangeRouteBuildsShard(ctx, group, fn)
 }
 
 func toClusterNode(n *NodeRecord) clusterstate.NodeRecord {
@@ -1785,30 +931,6 @@ func toClusterNode(n *NodeRecord) clusterstate.NodeRecord {
 		BuildAlloc:        cloneBuildResources(n.BuildAlloc),
 		Counts:            n.Counts,
 		Draining:          n.Draining,
-		LastHeartbeatUnix: n.LastHeartbeatUnix,
-		ResumeToken:       n.ResumeToken,
-		LinkOwner:         n.LinkOwner,
-		ManifestKeys:      cloneNodeManifestKeys(n.ManifestKeys),
-		Sandboxes:         cloneNodeSandboxRefs(n.Sandboxes),
-		Builds:            cloneNodeBuildRefs(n.Builds),
-	}
-}
-
-func fromClusterNode(n clusterstate.NodeRecord) NodeRecord {
-	return NodeRecord{
-		Meta:              n.Meta,
-		NodeID:            n.NodeID,
-		Labels:            cloneStringMap(n.Labels),
-		Capacity:          n.Capacity,
-		BuildCapacity:     cloneBuildResources(n.BuildCapacity),
-		DataEndpoint:      n.DataEndpoint,
-		RuntimeDigest:     n.RuntimeDigest,
-		Zone:              n.Zone,
-		Allocated:         n.Allocated,
-		Pool:              n.Pool,
-		BuildAlloc:        cloneBuildResources(n.BuildAlloc),
-		Counts:            n.Counts,
-		Draining:          n.Draining || n.State == clusterstate.NodeDrained,
 		LastHeartbeatUnix: n.LastHeartbeatUnix,
 		ResumeToken:       n.ResumeToken,
 		LinkOwner:         n.LinkOwner,
@@ -1854,116 +976,4 @@ func cloneNodeBuildRefs(in []clusterstate.NodeBuildRef) []clusterstate.NodeBuild
 	out := make([]clusterstate.NodeBuildRef, len(in))
 	copy(out, in)
 	return out
-}
-
-type unavailableRouteReplica struct{ id string }
-
-func (r unavailableRouteReplica) err() error {
-	return fmt.Errorf("registry: route replica %q unavailable", r.id)
-}
-
-func (r unavailableRouteReplica) Read(context.Context, string) (clusterstate.RouteRecord, bool, error) {
-	return clusterstate.RouteRecord{}, false, r.err()
-}
-
-func (r unavailableRouteReplica) Prepare(context.Context, string, clusterstate.Ballot) (clusterstate.RouteRecord, bool, bool, error) {
-	return clusterstate.RouteRecord{}, false, false, r.err()
-}
-
-func (r unavailableRouteReplica) Accept(context.Context, string, clusterstate.RouteRecord, clusterstate.Ballot) (bool, error) {
-	return false, r.err()
-}
-
-func (r unavailableRouteReplica) Repair(context.Context, string, clusterstate.RouteRecord) error {
-	return r.err()
-}
-
-func (r unavailableRouteReplica) MaxBallot(context.Context, string) (clusterstate.Ballot, error) {
-	return clusterstate.Ballot{}, r.err()
-}
-
-func (r unavailableRouteReplica) ListGroup(context.Context, string) ([]clusterstate.RouteRecord, error) {
-	return nil, r.err()
-}
-
-type unavailableNodeReplica struct{ id string }
-
-func (r unavailableNodeReplica) err() error {
-	return fmt.Errorf("registry: node replica %q unavailable", r.id)
-}
-
-func (r unavailableNodeReplica) Read(context.Context, string) (clusterstate.NodeRecord, bool, error) {
-	return clusterstate.NodeRecord{}, false, r.err()
-}
-
-func (r unavailableNodeReplica) Prepare(context.Context, string, clusterstate.Ballot) (clusterstate.NodeRecord, bool, bool, error) {
-	return clusterstate.NodeRecord{}, false, false, r.err()
-}
-
-func (r unavailableNodeReplica) Accept(context.Context, string, clusterstate.NodeRecord, clusterstate.Ballot) (bool, error) {
-	return false, r.err()
-}
-
-func (r unavailableNodeReplica) Repair(context.Context, string, clusterstate.NodeRecord) error {
-	return r.err()
-}
-
-func (r unavailableNodeReplica) MaxBallot(context.Context, string) (clusterstate.Ballot, error) {
-	return clusterstate.Ballot{}, r.err()
-}
-
-type unavailableScaleLinkReplica struct{ id string }
-
-func (r unavailableScaleLinkReplica) err() error {
-	return fmt.Errorf("registry: scale_link replica %q unavailable", r.id)
-}
-
-func (r unavailableScaleLinkReplica) Read(context.Context, string) (clusterstate.ScaleLinkRecord, bool, error) {
-	return clusterstate.ScaleLinkRecord{}, false, r.err()
-}
-
-func (r unavailableScaleLinkReplica) Prepare(context.Context, string, clusterstate.Ballot) (clusterstate.ScaleLinkRecord, bool, bool, error) {
-	return clusterstate.ScaleLinkRecord{}, false, false, r.err()
-}
-
-func (r unavailableScaleLinkReplica) Accept(context.Context, string, clusterstate.ScaleLinkRecord, clusterstate.Ballot) (bool, error) {
-	return false, r.err()
-}
-
-func (r unavailableScaleLinkReplica) Repair(context.Context, string, clusterstate.ScaleLinkRecord) error {
-	return r.err()
-}
-
-func (r unavailableScaleLinkReplica) MaxBallot(context.Context, string) (clusterstate.Ballot, error) {
-	return clusterstate.Ballot{}, r.err()
-}
-
-type unavailableNodeListReplica struct{ id string }
-
-func (r unavailableNodeListReplica) err() error {
-	return fmt.Errorf("registry: node_list replica %q unavailable", r.id)
-}
-
-func (r unavailableNodeListReplica) Read(context.Context, string) (clusterstate.NodeListEntry, bool, error) {
-	return clusterstate.NodeListEntry{}, false, r.err()
-}
-
-func (r unavailableNodeListReplica) Prepare(context.Context, string, clusterstate.Ballot) (clusterstate.NodeListEntry, bool, bool, error) {
-	return clusterstate.NodeListEntry{}, false, false, r.err()
-}
-
-func (r unavailableNodeListReplica) Accept(context.Context, string, clusterstate.NodeListEntry, clusterstate.Ballot) (bool, error) {
-	return false, r.err()
-}
-
-func (r unavailableNodeListReplica) Repair(context.Context, string, clusterstate.NodeListEntry) error {
-	return r.err()
-}
-
-func (r unavailableNodeListReplica) MaxBallot(context.Context, string) (clusterstate.Ballot, error) {
-	return clusterstate.Ballot{}, r.err()
-}
-
-func (r unavailableNodeListReplica) List(context.Context) ([]clusterstate.NodeListEntry, error) {
-	return nil, r.err()
 }

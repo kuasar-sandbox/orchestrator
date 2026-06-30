@@ -58,10 +58,9 @@ func (r *Registry) ServeNodeLink(w http.ResponseWriter, req *http.Request) {
 
 	conn := &nodeChannel{nodeID: nr.NodeID, w: w, flush: flusher.Flush}
 
-	// Write Hello BEFORE exposing the node_link. Once addNode/onNodeConnected run, a
-	// concurrent reconcileKeys can conn.send() on this same h2 stream (under
-	// nodeChannel.mu); a bare Hello write after that would race it and interleave
-	// frames. Hello goes out first, while this is still the only writer.
+	// Write Hello BEFORE exposing the node_link. After addNode, heartbeat
+	// maintenance may send key refresh commands on this same h2 stream under
+	// nodeChannel.mu; Hello goes out first while this is still the only writer.
 	resumeFrom := ""
 	if rec, found, err := r.stores.GetNode(ctx, nr.NodeID); err == nil && found {
 		resumeFrom = rec.ResumeToken
@@ -73,7 +72,6 @@ func (r *Registry) ServeNodeLink(w http.ResponseWriter, req *http.Request) {
 
 	r.addNode(conn)
 	defer r.removeNode(conn)
-	r.onNodeConnected() // predistribute this node's groups' manifest keys (§7.6)
 	r.log.Info("node-link: node connected", "node", nr.NodeID, "labels", nr.Labels)
 
 	collectingFull := true

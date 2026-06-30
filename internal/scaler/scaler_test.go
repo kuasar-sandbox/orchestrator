@@ -120,13 +120,13 @@ func TestEffectiveSelectors(t *testing.T) {
 			t.Fatalf("effective selector %v missing pool/slot narrowing", sel)
 		}
 	}
-	// No shuffle rule → no overlay (key dist falls back to static).
+	// No shuffle rule -> no overlay; selector patch uses the static selectors.
 	if _, ok := effectiveSelectors("/g", ns, nil, nil); ok {
 		t.Fatal("no shuffle rule should yield no overlay")
 	}
 }
 
-func TestKeyAllocation(t *testing.T) {
+func TestSelectorPatchTargets(t *testing.T) {
 	ns := nodes(
 		&registry.NodeRecord{NodeID: "n-s1", Labels: map[string]string{"pool": "p1", "slot": "s1"}},
 		&registry.NodeRecord{NodeID: "n-s2", Labels: map[string]string{"pool": "p1", "slot": "s2"}},
@@ -134,21 +134,21 @@ func TestKeyAllocation(t *testing.T) {
 		&registry.NodeRecord{NodeID: "other", Labels: map[string]string{"pool": "p2", "slot": "s4"}},
 	)
 	rules := []clustercfg.ShuffleRule{{Selector: map[string]string{"pool": "p1"}, ShardBy: "slot", N: 2}}
-	selectors, ids := keyAllocation("/cell/g1", ns, []map[string]string{{"pool": "p1"}}, rules)
+	selectors, ids := selectorPatchTargets("/cell/g1", ns, []map[string]string{{"pool": "p1"}}, rules)
 	if len(selectors) != 2 {
 		t.Fatalf("selectors=%v, want two shuffle-effective selectors", selectors)
 	}
 	for _, id := range ids {
 		if id == "n-s3" || id == "other" {
-			t.Fatalf("allocation included ineligible node %q: %v", id, ids)
+			t.Fatalf("selector patch included ineligible node %q: %v", id, ids)
 		}
 	}
 	if len(ids) == 0 {
-		t.Fatal("allocation unexpectedly empty")
+		t.Fatal("selector patch target set unexpectedly empty")
 	}
-	_, ids = keyAllocation("/g", ns, []map[string]string{{"pool": "p2"}}, nil)
+	_, ids = selectorPatchTargets("/g", ns, []map[string]string{{"pool": "p2"}}, nil)
 	if len(ids) != 1 || ids[0] != "other" {
-		t.Fatalf("static allocation ids=%v, want [other]", ids)
+		t.Fatalf("static selector patch ids=%v, want [other]", ids)
 	}
 }
 

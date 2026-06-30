@@ -309,7 +309,7 @@ step "starting router"
 PIDS+=("$!")
 wait_tcp "$ROUTER_PORT" "router"
 
-step "waiting for key distribution"
+step "waiting for node_link manifest-key cache"
 python3 - "$ADMIN" "$NODES" <<'PY' || fail "manifest keys were not distributed to all stub nodes"
 import json, sys, time, urllib.request
 admin, want = sys.argv[1], int(sys.argv[2])
@@ -348,7 +348,7 @@ if [ "$CLUSTER_STUB_CASE" = "registry-joint" ]; then
     step "checking joint route visibility from next-only registry"
     curl -sS --noproxy '*' --get --data-urlencode "group=$GROUP" \
         "http://127.0.0.1:${CONTROL_PORTS[3]}/route-link/list" >"$WORK/joint-routes.json"
-    python3 - "$WORK/joint-routes.json" <<'PY' || fail "next-only registry did not expose the reserved route"
+    python3 - "$WORK/joint-routes.json" <<'PY' || fail "next-only registry did not expose the ready route"
 import json, sys
 routes = json.load(open(sys.argv[1]))
 assert any(r.get("sandboxID") and r.get("state") == "ready" for r in routes), routes

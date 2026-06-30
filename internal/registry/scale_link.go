@@ -11,7 +11,6 @@ import (
 	"time"
 
 	clusterstate "github.com/kuasar-sandbox/sandbox-orchestrator/internal/cluster"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/clusterstore"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/routesync"
 )
 
@@ -84,7 +83,7 @@ func (r *Registry) serveNodeListWatch(w http.ResponseWriter, req *http.Request) 
 				r.streamNodeListView(ctx, w, flusher, ch, label)
 				return
 			}
-			if err != clusterstore.ErrCompacted {
+			if err != ErrWatchCompacted {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
 			}
@@ -121,7 +120,7 @@ func (r *Registry) serveNodeListWatch(w http.ResponseWriter, req *http.Request) 
 }
 
 // ServeScaleLink mounts the scaler-facing scale_link API: node_list WATCH_LIST,
-// scaler registration, and selector/key-allocation patches.
+// scaler registration, import source leases, and selector patches.
 func (r *Registry) ServeScaleLink(mux *http.ServeMux) {
 	mux.HandleFunc(ScaleLinkNodeListWatchPath, r.serveNodeListWatch)
 	mux.HandleFunc(ScaleLinkRegisterPath, r.serveScalerRegister)
@@ -235,7 +234,7 @@ func (r *Registry) serveImportSourceCursor(w http.ResponseWriter, req *http.Requ
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(importSourceLeaseFromScaleLink(rec))
+	_ = json.NewEncoder(w).Encode(importSourceLeaseFromState(rec))
 }
 
 func (r *Registry) acquireImportSourceLease(ctx context.Context, in ImportSourceLeaseRequest) (ImportSourceLeaseResponse, error) {
@@ -247,10 +246,10 @@ func (r *Registry) acquireImportSourceLease(ctx context.Context, in ImportSource
 	if err != nil {
 		return ImportSourceLeaseResponse{}, err
 	}
-	return ImportSourceLeaseResponse{Acquired: acquired, Lease: importSourceLeaseFromScaleLink(rec)}, nil
+	return ImportSourceLeaseResponse{Acquired: acquired, Lease: importSourceLeaseFromState(rec)}, nil
 }
 
-func importSourceLeaseFromScaleLink(rec clusterstate.ScaleLinkRecord) ImportSourceLease {
+func importSourceLeaseFromState(rec clusterstate.ScaleImportSourceState) ImportSourceLease {
 	return ImportSourceLease{
 		SourceID: rec.SourceID, OwnerID: rec.OwnerID, RunID: rec.RunID, Term: rec.Term,
 		Cursor: rec.Cursor, Round: rec.Round, ReadyLabel: rec.ReadyLabel,
@@ -258,7 +257,7 @@ func importSourceLeaseFromScaleLink(rec clusterstate.ScaleLinkRecord) ImportSour
 	}
 }
 
-func (r *Registry) streamNodeListView(ctx context.Context, w io.Writer, flusher http.Flusher, ch <-chan clusterstore.Event, label string) {
+func (r *Registry) streamNodeListView(ctx context.Context, w io.Writer, flusher http.Flusher, ch <-chan WatchEvent, label string) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -269,9 +268,9 @@ func (r *Registry) streamNodeListView(ctx context.Context, w io.Writer, flusher 
 			}
 			var ve *ViewEvent
 			switch ev.Type {
-			case clusterstore.EventPut:
+			case WatchEventPut:
 				ve = &ViewEvent{Type: "put", Key: ev.Key, Value: ev.Value, Rev: ev.Rev, Token: makeNodeListWatchToken(label, ev.Rev)}
-			case clusterstore.EventDelete:
+			case WatchEventDelete:
 				ve = &ViewEvent{Type: "delete", Key: ev.Key, Rev: ev.Rev, Token: makeNodeListWatchToken(label, ev.Rev)}
 			default:
 				continue

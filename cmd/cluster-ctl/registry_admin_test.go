@@ -1,21 +1,17 @@
 package main
 
 import (
+	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/registry"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"testing"
-
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/clusterstore"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/registry"
 )
 
 func TestRegistryExportDefaultKindUsesRoutes(t *testing.T) {
-	kv := clusterstore.OpenMemory(0)
-	t.Cleanup(func() { kv.Close() })
-	reg := registry.New(registry.NewStores(kv), nil, 0, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	reg := registry.New(registry.NewStores(), nil, 0, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	mux := http.NewServeMux()
 	reg.ServeRouteLink(mux)
 	srv := httptest.NewServer(mux)

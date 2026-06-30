@@ -51,14 +51,14 @@ type Service struct {
 	nodes    *nodeView
 	provider clusterstate.SandboxGroupProvider
 
-	sourceMu          sync.RWMutex
-	runID             string
-	importSources     []ImportSource
-	sourceOwnerID     string
-	sourcePeerSource  func() []string
-	sourceLeaseTTL    time.Duration
-	allocationEvery   time.Duration
-	scaleLinkResolver func(context.Context, string) ([]RegistryLink, error)
+	sourceMu           sync.RWMutex
+	runID              string
+	importSources      []ImportSource
+	sourceOwnerID      string
+	sourcePeerSource   func() []string
+	sourceLeaseTTL     time.Duration
+	selectorPatchEvery time.Duration
+	scaleLinkResolver  func(context.Context, string) ([]RegistryLink, error)
 }
 
 type RegistryLink struct {
@@ -88,9 +88,9 @@ func NewRemoteLinksWithGroups(links []RegistryLink, provider clusterstate.Sandbo
 	if sourceLeaseTTL <= 0 {
 		sourceLeaseTTL = 15 * time.Second
 	}
-	allocationEvery := cfg.AllocationRefreshDur()
-	if allocationEvery <= 0 {
-		allocationEvery = time.Minute
+	selectorPatchEvery := cfg.SelectorPatchRefreshDur()
+	if selectorPatchEvery <= 0 {
+		selectorPatchEvery = time.Minute
 	}
 	links = normalizeRegistryLinks(links)
 	if provider == nil {
@@ -100,13 +100,13 @@ func NewRemoteLinksWithGroups(links []RegistryLink, provider clusterstate.Sandbo
 	return &Service{
 		links: links, watchLinks: links,
 		cfg: cfg, deadAfter: deadAfter, log: log,
-		nodes:           newNodeView(1),
-		provider:        provider,
-		runID:           runID,
-		importSources:   normalizeImportSources(sources),
-		sourceOwnerID:   "local",
-		sourceLeaseTTL:  sourceLeaseTTL,
-		allocationEvery: allocationEvery,
+		nodes:              newNodeView(1),
+		provider:           provider,
+		runID:              runID,
+		importSources:      normalizeImportSources(sources),
+		sourceOwnerID:      "local",
+		sourceLeaseTTL:     sourceLeaseTTL,
+		selectorPatchEvery: selectorPatchEvery,
 	}
 }
 
@@ -199,7 +199,7 @@ func minReadyLinks(n int) int {
 	}
 }
 
-// Start launches the node_list watch loop and key allocation reconcile.
+// Start launches the node_list watch loop and selector patch reconcile.
 // sandbox-group data is imported into the scaler/provider side, not watched from
 // registry. node_list is low-frequency catalog data; hot load/budget is validated
 // by registry/node owner on the cold placement path.
@@ -210,7 +210,7 @@ func (s *Service) Start(ctx context.Context) {
 		s.startWatchLinkLocked(ctx)
 	}
 	s.linksMu.Unlock()
-	go s.reconcileKeyAllocations(ctx)
+	go s.reconcileSelectorPatches(ctx)
 }
 
 func (s *Service) SetRegistryLinks(ctx context.Context, links []RegistryLink) {
@@ -465,7 +465,7 @@ func (s *Service) groupForPlace(ctx context.Context, group string) (groupView, b
 	return groupView{group: g, hint: hint, manifestKey: manifestKey, authKey: authKey}, true, nil
 }
 
-type groupAllocation struct {
+type selectorPatchGroup struct {
 	group       string
 	hint        clusterstate.PlacementHint
 	manifestKey clusterstate.Secret
@@ -481,11 +481,11 @@ type importLeaseToken struct {
 	lease    registry.ImportSourceLease
 }
 
-// reconcileKeyAllocations computes each group's explicit node set for
-// manifest-key distribution and pushes it to the scale_link owner set. Only the
-// source lease winner runs Range for a source_id; unchanged patches are still
-// refreshed before the registry-side allocation TTL can expire.
-func (s *Service) reconcileKeyAllocations(ctx context.Context) {
+// reconcileSelectorPatches computes each imported group's shuffle-effective
+// selectors and manifest-key node set, then pushes them through scale_link. Only
+// the source lease winner runs Range for a source_id; unchanged patches are
+// refreshed so node_link manifest-key TTLs stay live.
+func (s *Service) reconcileSelectorPatches(ctx context.Context) {
 	last := map[string]selectorPatchState{} // group -> derived key + owner-set signature + last successful push
 	t := time.NewTicker(s.reconcileInterval())
 	defer t.Stop()
@@ -518,7 +518,7 @@ func (s *Service) reconcileKeyAllocations(ctx context.Context) {
 }
 
 func (s *Service) reconcileInterval() time.Duration {
-	interval := s.allocationEvery
+	interval := s.selectorPatchEvery
 	if interval <= 0 {
 		interval = time.Minute
 	}
@@ -551,12 +551,12 @@ func (s *Service) reconcileImportSource(ctx context.Context, source ImportSource
 			s.log.Warn("scaler: group import", "source", source.SourceID, "cursor", lease.lease.Cursor, "err", err)
 			return
 		}
-		allocations, err := s.groupAllocationsForGroups(ctx, page.Groups)
+		groups, err := s.selectorPatchGroupsForImportPage(ctx, page.Groups)
 		if err != nil {
 			s.log.Warn("scaler: group import", "source", source.SourceID, "err", err)
 			return
 		}
-		if err := s.pushAllocations(ctx, source.SourceID, nodes, allocations, lease, last); err != nil {
+		if err := s.pushSelectorPatches(ctx, source.SourceID, nodes, groups, lease, last); err != nil {
 			s.log.Warn("scaler: selector patch", "source", source.SourceID, "err", err)
 			return
 		}
@@ -571,8 +571,8 @@ func (s *Service) reconcileImportSource(ctx context.Context, source ImportSource
 	}
 }
 
-func (s *Service) groupAllocationsForGroups(ctx context.Context, groups []string) ([]groupAllocation, error) {
-	out := make([]groupAllocation, 0, len(groups))
+func (s *Service) selectorPatchGroupsForImportPage(ctx context.Context, groups []string) ([]selectorPatchGroup, error) {
+	out := make([]selectorPatchGroup, 0, len(groups))
 	for _, group := range groups {
 		hint, found, err := s.provider.GetPlacementHint(ctx, group)
 		if err != nil {
@@ -585,7 +585,7 @@ func (s *Service) groupAllocationsForGroups(ctx context.Context, groups []string
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, groupAllocation{group: group, hint: hint, manifestKey: key})
+		out = append(out, selectorPatchGroup{group: group, hint: hint, manifestKey: key})
 	}
 	return out, nil
 }
@@ -717,25 +717,25 @@ func (s *Service) checkpointImportSource(ctx context.Context, sourceID string, l
 	return fmt.Errorf("scaler: no registry link for source %s cursor checkpoint", sourceID)
 }
 
-func (s *Service) pushAllocations(ctx context.Context, sourceID string, nodes []*registry.NodeRecord, allocations []groupAllocation, lease importLeaseToken, last map[string]selectorPatchState) error {
+func (s *Service) pushSelectorPatches(ctx context.Context, sourceID string, nodes []*registry.NodeRecord, groups []selectorPatchGroup, lease importLeaseToken, last map[string]selectorPatchState) error {
 	now := time.Now()
-	for _, g := range allocations {
-		selectors, nodeIDs := keyAllocation(g.group, nodes, g.hint.NodeSelectors, s.cfg.ShuffleSharding)
+	for _, g := range groups {
+		selectors, nodeIDs := selectorPatchTargets(g.group, nodes, g.hint.NodeSelectors, s.cfg.ShuffleSharding)
 		fp, keyType, keyValue, keyRef, err := manifestKeyPatch(g.group, g.manifestKey)
 		if err != nil {
 			s.log.Warn("scaler: manifest key", "group", g.group, "err", err)
 			nodeIDs = nil
 			fp, keyType, keyValue, keyRef = "", "", "", ""
 		}
-		links := s.scaleLinkLinks(ctx, clusterstate.ScaleLinkAllocationKey(g.group))
+		links := s.scaleLinkLinks(ctx, clusterstate.ScaleLinkSourceKey(sourceID))
 		linkSig := registryLinkSignature(links)
-		key := allocationPatchSignature(selectors, nodeIDs, fp, keyType, keyValue, keyRef, linkSig)
+		key := selectorPatchSignature(selectors, nodeIDs, fp, keyType, keyValue, keyRef, linkSig)
 		state := last[g.group]
-		if state.key == key && now.Sub(state.sentAt) < s.allocationEvery {
+		if state.key == key && now.Sub(state.sentAt) < s.selectorPatchEvery {
 			continue
 		}
 		patch := &routesync.SelectorPatch{
-			Group: g.group, Selectors: selectors, NodeIDs: nodeIDs, NodeAllocation: true,
+			Group: g.group, Selectors: selectors, NodeIDs: nodeIDs,
 			KeyFingerprint: fp, ManifestKeyType: keyType, ManifestKey: keyValue, ManifestKeyRef: keyRef,
 			ImportSourceID: lease.sourceID, ImportOwnerID: lease.lease.OwnerID, ImportRunID: lease.lease.RunID, ImportTerm: lease.lease.Term,
 		}
@@ -785,7 +785,7 @@ func registryLinkSignature(links []RegistryLink) string {
 	return strings.Join(ids, ",")
 }
 
-func allocationPatchSignature(selectors []map[string]string, nodeIDs []string, fp, keyType, keyValue, keyRef, linkSig string) string {
+func selectorPatchSignature(selectors []map[string]string, nodeIDs []string, fp, keyType, keyValue, keyRef, linkSig string) string {
 	nodes := append([]string(nil), nodeIDs...)
 	sort.Strings(nodes)
 	return strings.Join([]string{
@@ -841,7 +841,7 @@ func (s *Service) postJSON(ctx context.Context, link RegistryLink, path string, 
 	return nil
 }
 
-func keyAllocation(group string, nodes []*registry.NodeRecord, selectors []map[string]string, rules []clustercfg.ShuffleRule) ([]map[string]string, []string) {
+func selectorPatchTargets(group string, nodes []*registry.NodeRecord, selectors []map[string]string, rules []clustercfg.ShuffleRule) ([]map[string]string, []string) {
 	effective := selectors
 	if eff, ok := effectiveSelectors(group, nodes, selectors, rules); ok {
 		effective = eff

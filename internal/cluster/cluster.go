@@ -95,7 +95,7 @@ type SandboxGroup struct {
 
 // SandboxGroupRecord is the importer record owned by scaler/provider side. It is
 // intentionally richer than SandboxGroup: scaler needs placement selectors and
-// secret material to answer Place and push node-owner key allocation.
+// secret material to answer Place and refresh node_link manifest-key cache.
 type SandboxGroupRecord struct {
 	Group         string              `json:"group"`
 	ProjectID     string              `json:"project_id,omitempty"`

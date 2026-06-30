@@ -94,7 +94,6 @@ type ScaleLinkConfig struct {
 	MinReadyScalers    int    `yaml:"min_ready_scalers"`
 	ScalerLabel        string `yaml:"scaler_label"`
 	PlaceTimeout       string `yaml:"place_timeout"`
-	AllocationTTL      string `yaml:"allocation_ttl"`
 }
 
 type ScalerMemberlistConfig struct {
@@ -130,13 +129,13 @@ type RouterCache struct {
 
 // PlacementConfig groups the scaler's placement policy.
 type PlacementConfig struct {
-	Candidates                int           `yaml:"candidates"`                  // P2C sample size; default 2
-	ZoneAdmitMax              string        `yaml:"zone_admit_max"`              // exclude nodes hotter than this; default yellow
-	NodeDeadAfter             string        `yaml:"node_dead_after"`             // exclude nodes silent longer than this; default 30s
-	ImportSourceOwnerCount    int           `yaml:"import_source_owner_count"`   // scaler candidates that may race for one source lease
-	ImportSourceLeaseTTL      string        `yaml:"import_source_lease_ttl"`     // registry-side source lease TTL
-	AllocationRefreshInterval string        `yaml:"allocation_refresh_interval"` // unchanged key allocation refresh cadence
-	ShuffleSharding           []ShuffleRule `yaml:"shuffle_sharding"`            // empty = static nodeSelectors only
+	Candidates             int           `yaml:"candidates"`                // P2C sample size; default 2
+	ZoneAdmitMax           string        `yaml:"zone_admit_max"`            // exclude nodes hotter than this; default yellow
+	NodeDeadAfter          string        `yaml:"node_dead_after"`           // exclude nodes silent longer than this; default 30s
+	ImportSourceOwnerCount int           `yaml:"import_source_owner_count"` // scaler candidates that may race for one source lease
+	ImportSourceLeaseTTL   string        `yaml:"import_source_lease_ttl"`   // registry-side source lease TTL
+	SelectorPatchRefresh   string        `yaml:"selector_patch_refresh_interval"`
+	ShuffleSharding        []ShuffleRule `yaml:"shuffle_sharding"` // empty = static nodeSelectors only
 }
 
 type GroupSourceConfig struct {
@@ -232,16 +231,12 @@ func (c *ScaleLinkConfig) PlaceDur() time.Duration {
 	d, _ := time.ParseDuration(c.PlaceTimeout)
 	return d
 }
-func (c *ScaleLinkConfig) AllocationTTLDur() time.Duration {
-	d, _ := time.ParseDuration(c.AllocationTTL)
-	return d
-}
 func (c *PlacementConfig) ImportSourceLeaseTTLDur() time.Duration {
 	d, _ := time.ParseDuration(c.ImportSourceLeaseTTL)
 	return d
 }
-func (c *PlacementConfig) AllocationRefreshDur() time.Duration {
-	d, _ := time.ParseDuration(c.AllocationRefreshInterval)
+func (c *PlacementConfig) SelectorPatchRefreshDur() time.Duration {
+	d, _ := time.ParseDuration(c.SelectorPatchRefresh)
 	return d
 }
 
@@ -396,7 +391,7 @@ func DefaultRegistry() RegistryConfig {
 		NodeLink:  NodeLinkConfig{HeartbeatInterval: "10s", NodeDeadAfter: "30s", RevisionRetention: 10000},
 		RouteLink: RouteLinkConfig{ParkTimeout: "30s"},
 		NodeList:  NodeListConfig{WatchRetention: 10000},
-		ScaleLink: ScaleLinkConfig{ScalerReplicaCount: 3, MinReadyScalers: 1, ScalerLabel: "scaler.default", PlaceTimeout: "2s", AllocationTTL: "10m"},
+		ScaleLink: ScaleLinkConfig{ScalerReplicaCount: 3, MinReadyScalers: 1, ScalerLabel: "scaler.default", PlaceTimeout: "2s"},
 	}
 }
 
@@ -485,9 +480,6 @@ func (c *RegistryConfig) applyDefaults() {
 	}
 	if c.ScaleLink.PlaceTimeout == "" {
 		c.ScaleLink.PlaceTimeout = d.ScaleLink.PlaceTimeout
-	}
-	if c.ScaleLink.AllocationTTL == "" {
-		c.ScaleLink.AllocationTTL = d.ScaleLink.AllocationTTL
 	}
 }
 
@@ -588,7 +580,6 @@ func (c *RegistryConfig) Validate() error {
 		"node_link.node_dead_after":    c.NodeLink.NodeDeadAfter,
 		"route_link.park_timeout":      c.RouteLink.ParkTimeout,
 		"scale_link.place_timeout":     c.ScaleLink.PlaceTimeout,
-		"scale_link.allocation_ttl":    c.ScaleLink.AllocationTTL,
 	})
 }
 
@@ -749,7 +740,7 @@ func DefaultScaler() ScalerConfig {
 		ImportGroups: nil,
 		Placement: PlacementConfig{
 			Candidates: 2, ZoneAdmitMax: "yellow", NodeDeadAfter: "30s",
-			ImportSourceOwnerCount: 3, ImportSourceLeaseTTL: "15s", AllocationRefreshInterval: "1m",
+			ImportSourceOwnerCount: 3, ImportSourceLeaseTTL: "15s", SelectorPatchRefresh: "1m",
 		},
 	}
 }
@@ -805,8 +796,8 @@ func (c *ScalerConfig) applyDefaults() {
 	if c.Placement.ImportSourceLeaseTTL == "" {
 		c.Placement.ImportSourceLeaseTTL = d.Placement.ImportSourceLeaseTTL
 	}
-	if c.Placement.AllocationRefreshInterval == "" {
-		c.Placement.AllocationRefreshInterval = d.Placement.AllocationRefreshInterval
+	if c.Placement.SelectorPatchRefresh == "" {
+		c.Placement.SelectorPatchRefresh = d.Placement.SelectorPatchRefresh
 	}
 }
 
@@ -853,9 +844,9 @@ func (c *ScalerConfig) Validate() error {
 		}
 	}
 	return validateDurations(map[string]string{
-		"placement.node_dead_after":             c.Placement.NodeDeadAfter,
-		"placement.import_source_lease_ttl":     c.Placement.ImportSourceLeaseTTL,
-		"placement.allocation_refresh_interval": c.Placement.AllocationRefreshInterval,
+		"placement.node_dead_after":                 c.Placement.NodeDeadAfter,
+		"placement.import_source_lease_ttl":         c.Placement.ImportSourceLeaseTTL,
+		"placement.selector_patch_refresh_interval": c.Placement.SelectorPatchRefresh,
 	})
 }
 

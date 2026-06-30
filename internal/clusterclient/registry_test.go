@@ -182,15 +182,15 @@ func TestScaleLinkEndpointsUseLocatedJointOwners(t *testing.T) {
 		return jsonResponse(200, membership), nil
 	})}
 	reg := NewRegistryWithClient("http://bootstrap:7700", client)
-	recordKey := clusterstate.ScaleLinkAllocationKey("/g")
-	eps, err := reg.ScaleLinkEndpoints(t.Context(), recordKey)
+	shardKey := clusterstate.ScaleLinkSourceKey("source-a")
+	eps, err := reg.ScaleLinkEndpoints(t.Context(), shardKey)
 	if err != nil {
 		t.Fatalf("scale_link endpoints: %v", err)
 	}
 	wantSet := map[string]bool{}
 	for _, version := range []clustercfg.MembershipVersion{active, next} {
 		view := clusterstate.MemberView{Version: version.Version, Members: version.MemberIDs()}
-		owners, err := view.Owners(clusterstate.ScaleLinkShardKey(recordKey), 2)
+		owners, err := view.Owners(shardKey, 2)
 		if err != nil {
 			t.Fatal(err)
 		}

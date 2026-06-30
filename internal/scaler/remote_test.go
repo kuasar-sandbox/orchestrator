@@ -20,17 +20,13 @@ import (
 
 	clusterstate "github.com/kuasar-sandbox/sandbox-orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/clustercfg"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/clusterstore"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/registry"
 )
 
 func TestScalerDirectPlace(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	discard := slog.New(slog.NewTextHandler(io.Discard, nil))
-
-	kv := clusterstore.OpenMemory(1000)
-	defer kv.Close()
-	stores := registry.NewStores(kv)
+	stores := registry.NewStores()
 	stores.PutNode(ctx, &registry.NodeRecord{NodeID: "n1", Labels: map[string]string{"pool": "p"}, Counts: 5})
 	stores.PutNode(ctx, &registry.NodeRecord{NodeID: "n2", Labels: map[string]string{"pool": "p"}, Counts: 0})
 
@@ -270,15 +266,14 @@ func TestRegisterLoopDynamicRetriesFailedRegisterQuickly(t *testing.T) {
 func TestImportSourceLeaseAllowsOnlyOneScalerToRange(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	discard := slog.New(slog.NewTextHandler(io.Discard, nil))
-	reg, srv := testScaleRegistry(t, ctx, "n1")
+	_, srv := testScaleRegistry(t, ctx, "n1")
 	defer srv.Close()
 	defer cancel()
-	go reg.RunKeyDistributor(ctx, time.Hour)
 
 	src1 := newCountingGroupSource("/g")
 	src2 := newCountingGroupSource("/g")
 	cfg := clustercfg.PlacementConfig{
-		Candidates: 1, ImportSourceOwnerCount: 2, ImportSourceLeaseTTL: "500ms", AllocationRefreshInterval: "50ms",
+		Candidates: 1, ImportSourceOwnerCount: 2, ImportSourceLeaseTTL: "500ms", SelectorPatchRefresh: "50ms",
 	}
 	link := RegistryLink{Name: "registry", BaseURL: srv.URL, Client: srv.Client()}
 	svc1 := NewRemoteLinksWithGroups([]RegistryLink{link}, src1, testImportSources("counting-source", src1), cfg, 30, discard)
@@ -298,18 +293,16 @@ func TestImportSourceLeaseAllowsOnlyOneScalerToRange(t *testing.T) {
 	}
 }
 
-func TestScalerRefreshesUnchangedAllocationBeforeRegistryTTL(t *testing.T) {
+func TestScalerRefreshesUnchangedNodeLinkKeyCache(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	discard := slog.New(slog.NewTextHandler(io.Discard, nil))
 	reg, srv := testScaleRegistry(t, ctx, "n1")
 	defer srv.Close()
 	defer cancel()
-	reg.SetKeyAllocationTTL(90 * time.Millisecond)
-	go reg.RunKeyDistributor(ctx, time.Hour)
 
 	src := newCountingGroupSource("/g")
 	cfg := clustercfg.PlacementConfig{
-		Candidates: 1, ImportSourceOwnerCount: 1, ImportSourceLeaseTTL: "500ms", AllocationRefreshInterval: "25ms",
+		Candidates: 1, ImportSourceOwnerCount: 1, ImportSourceLeaseTTL: "500ms", SelectorPatchRefresh: "25ms",
 	}
 	svc := NewRemoteLinksWithGroups(
 		[]RegistryLink{{Name: "registry", BaseURL: srv.URL, Client: srv.Client()}},
@@ -341,11 +334,11 @@ func TestReconcileKeyAllocationsRunsWhenNodeListBecomesReady(t *testing.T) {
 	svc := NewRemoteLinksWithGroups(
 		[]RegistryLink{{Name: "registry", BaseURL: srv.URL, Client: srv.Client()}},
 		src, testImportSources("counting-source", src),
-		clustercfg.PlacementConfig{Candidates: 1, ImportSourceOwnerCount: 1, ImportSourceLeaseTTL: "500ms", AllocationRefreshInterval: "1h"},
+		clustercfg.PlacementConfig{Candidates: 1, ImportSourceOwnerCount: 1, ImportSourceLeaseTTL: "500ms", SelectorPatchRefresh: "1h"},
 		30,
 		discard,
 	)
-	go svc.reconcileKeyAllocations(ctx)
+	go svc.reconcileSelectorPatches(ctx)
 
 	time.Sleep(30 * time.Millisecond)
 	if calls := src.rangeCalls.Load(); calls != 0 {
@@ -361,17 +354,17 @@ func TestReconcileKeyAllocationsRunsWhenNodeListBecomesReady(t *testing.T) {
 	t.Fatal("reconcile did not run after node_list became ready")
 }
 
-func TestReconcileIntervalUsesAllocationRefreshCadence(t *testing.T) {
-	svc := NewRemoteLinks(nil, clustercfg.PlacementConfig{AllocationRefreshInterval: "1m"}, 30, slog.New(slog.NewTextHandler(io.Discard, nil)))
+func TestReconcileIntervalUsesSelectorPatchRefreshCadence(t *testing.T) {
+	svc := NewRemoteLinks(nil, clustercfg.PlacementConfig{SelectorPatchRefresh: "1m"}, 30, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if got := svc.reconcileInterval(); got != time.Minute {
-		t.Fatalf("reconcile interval=%v, want allocation_refresh_interval", got)
+		t.Fatalf("reconcile interval=%v, want selector_patch_refresh_interval", got)
 	}
 }
 
-func TestAllocationPatchSignatureCanonicalizesSelectors(t *testing.T) {
+func TestSelectorPatchSignatureCanonicalizesSelectors(t *testing.T) {
 	links := []RegistryLink{{Name: "r2", BaseURL: "http://r2"}, {Name: "r1", BaseURL: "http://r1"}}
-	a := allocationPatchSignature([]map[string]string{{"b": "2", "a": "1"}, {"zone": "east"}}, []string{"n2", "n1"}, "fp", "inline", "mk", "", registryLinkSignature(links))
-	b := allocationPatchSignature([]map[string]string{{"a": "1", "b": "2"}, {"zone": "east"}}, []string{"n1", "n2"}, "fp", "inline", "mk", "", registryLinkSignature(links))
+	a := selectorPatchSignature([]map[string]string{{"b": "2", "a": "1"}, {"zone": "east"}}, []string{"n2", "n1"}, "fp", "inline", "mk", "", registryLinkSignature(links))
+	b := selectorPatchSignature([]map[string]string{{"a": "1", "b": "2"}, {"zone": "east"}}, []string{"n1", "n2"}, "fp", "inline", "mk", "", registryLinkSignature(links))
 	if a != b {
 		t.Fatalf("canonical signatures differ:\n%s\n%s", a, b)
 	}
@@ -424,7 +417,7 @@ func TestReconcileImportSourcePushesCompletedPagesBeforeLaterPageError(t *testin
 	svc := NewRemoteLinksWithGroups(
 		[]RegistryLink{{Name: "registry", BaseURL: srv.URL, Client: srv.Client()}},
 		src, testImportSources("paged-source", src),
-		clustercfg.PlacementConfig{Candidates: 1, ImportSourceOwnerCount: 1, ImportSourceLeaseTTL: "1s", AllocationRefreshInterval: "1m"},
+		clustercfg.PlacementConfig{Candidates: 1, ImportSourceOwnerCount: 1, ImportSourceLeaseTTL: "1s", SelectorPatchRefresh: "1m"},
 		30,
 		slog.New(slog.NewTextHandler(io.Discard, nil)),
 	)
@@ -473,7 +466,7 @@ func TestReconcileImportSourceDoesNotAdvanceCursorWhenPatchFails(t *testing.T) {
 	svc := NewRemoteLinksWithGroups(
 		[]RegistryLink{{Name: "registry", BaseURL: srv.URL, Client: srv.Client()}},
 		src, testImportSources("paged-source", src),
-		clustercfg.PlacementConfig{Candidates: 1, ImportSourceOwnerCount: 1, ImportSourceLeaseTTL: "1s", AllocationRefreshInterval: "1m"},
+		clustercfg.PlacementConfig{Candidates: 1, ImportSourceOwnerCount: 1, ImportSourceLeaseTTL: "1s", SelectorPatchRefresh: "1m"},
 		30,
 		slog.New(slog.NewTextHandler(io.Discard, nil)),
 	)
@@ -596,9 +589,7 @@ func (s *countingGroupSource) Range(context.Context, string, int) (clusterstate.
 
 func testScaleRegistry(t *testing.T, ctx context.Context, nodeID string) (*registry.Registry, *httptest.Server) {
 	t.Helper()
-	kv := clusterstore.OpenMemory(1000)
-	t.Cleanup(func() { kv.Close() })
-	stores := registry.NewStores(kv)
+	stores := registry.NewStores()
 	if err := stores.PutNode(ctx, &registry.NodeRecord{NodeID: nodeID, Labels: map[string]string{"pool": "p"}, LastHeartbeatUnix: time.Now().Unix()}); err != nil {
 		t.Fatal(err)
 	}
@@ -609,9 +600,7 @@ func testScaleRegistry(t *testing.T, ctx context.Context, nodeID string) (*regis
 }
 
 func TestHTTPScalePlacerNoScaler(t *testing.T) {
-	kv := clusterstore.OpenMemory(0)
-	defer kv.Close()
-	reg := registry.New(registry.NewStores(kv), nil, 0, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	reg := registry.New(registry.NewStores(), nil, 0, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	placer := registry.NewHTTPScalePlacer(reg, 1, 200*time.Millisecond)
 	if _, err := placer.Place(context.Background(), registry.PlaceRequest{Group: "/g"}); err != registry.ErrNoNode {
 		t.Fatalf("no scaler → want ErrNoNode, got %v", err)

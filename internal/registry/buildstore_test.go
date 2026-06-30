@@ -8,7 +8,7 @@ import (
 	"time"
 
 	clusterstate "github.com/kuasar-sandbox/sandbox-orchestrator/internal/cluster"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/clusterstore"
+	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/cluster/shardkv"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/routesync"
 )
 
@@ -135,14 +135,11 @@ func TestReserveBuildDefaultResources(t *testing.T) {
 	}
 }
 
-func TestBuildStoreUsesRouteQuorumAndDoesNotLeakToSandboxList(t *testing.T) {
+func TestBuildStoreUsesRouteLinkBuildShardAndDoesNotLeakToSandboxList(t *testing.T) {
 	ctx := context.Background()
-	kv := clusterstore.OpenMemory(0)
-	defer kv.Close()
-	r2, r3 := clusterstate.NewMemoryRouteReplica(), clusterstate.NewMemoryRouteReplica()
 	view := clusterstate.MemberView{Version: 1, Members: []string{"r1", "r2", "r3"}}
-	stores := NewClusterStores(kv, "r1", view, 3, 1,
-		map[string]clusterstate.RouteReplica{"r2": r2, "r3": r3}, nil)
+	cluster := newShardStoreCluster(t, []string{"r1", "r2", "r3"}, 3, 1, 1, 1)
+	stores := cluster["r1"]
 
 	if err := stores.PutBuild(ctx, &BuildRecord{
 		Group: "/g", BuildID: "bld-1", NodeID: "n1", State: BuildRegistered,
@@ -150,13 +147,11 @@ func TestBuildStoreUsesRouteQuorumAndDoesNotLeakToSandboxList(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("PutBuild: %v", err)
 	}
-	key := clusterstate.RouteKey("/g", buildRouteKey("bld-1"))
-	for id, rep := range map[string]clusterstate.RouteReplica{"r1": stores.LocalRouteReplica(), "r2": r2, "r3": r3} {
-		got, found, err := rep.Read(ctx, key)
-		if err != nil || !found || got.BuildID != "bld-1" || got.NodeID != "n1" {
-			t.Fatalf("replica %s build route=%+v found=%v err=%v", id, got, found, err)
-		}
+	owners, err := view.Owners("/g", 3)
+	if err != nil {
+		t.Fatal(err)
 	}
+	assertShardRecordOwners(t, ctx, cluster, shardkv.Namespace(clusterstate.NamespaceRouteLink), clusterstate.RouteLinkShard("/g"), clusterstate.RouteBuildRecordKey("bld-1"), owners)
 
 	var sandboxes []string
 	if err := stores.RangeSandboxes(ctx, "/g", func(s *SandboxRecord) error {
@@ -166,7 +161,7 @@ func TestBuildStoreUsesRouteQuorumAndDoesNotLeakToSandboxList(t *testing.T) {
 		t.Fatalf("RangeSandboxes: %v", err)
 	}
 	if len(sandboxes) != 0 {
-		t.Fatalf("build route leaked into sandbox list: %v", sandboxes)
+		t.Fatalf("build record leaked into sandbox list: %v", sandboxes)
 	}
 
 	got, found, err := stores.GetBuildInGroup(ctx, "/g", "bld-1")

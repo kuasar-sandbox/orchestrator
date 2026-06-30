@@ -20,8 +20,8 @@ import (
 	"golang.org/x/net/http2/h2c"
 
 	clusterstate "github.com/kuasar-sandbox/sandbox-orchestrator/internal/cluster"
+	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/cluster/shardkv"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/clustercfg"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/clusterstore"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/membergroup"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/registry"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/routesync"
@@ -56,13 +56,10 @@ func runRegistry(args []string, log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	kv := clusterstore.OpenMemory(cfg.NodeLink.RevisionRetention)
-	defer kv.Close()
-
 	healthProvider := func(id string) clusterstate.ReplicaAvailability {
 		return clusterstate.NewFuncReplicaAvailability(func() bool { return registryMembers.AliveAny(id) }, 2*time.Second)
 	}
-	stores, remoteNodeOwners, err := newRegistryStores(kv, cfg, healthProvider)
+	stores, remoteNodeOwners, err := newRegistryStores(cfg, healthProvider)
 	if err != nil {
 		return err
 	}
@@ -78,7 +75,6 @@ func runRegistry(args []string, log *slog.Logger) error {
 		reg.SetScaleReadyLabel(active.Label)
 	}
 	reg.SetScalePolicy(cfg.ScaleLink.ScalerReplicaCount, cfg.ScaleLink.MinReadyScalers, cfg.ScaleLink.PlaceDur())
-	reg.SetKeyAllocationTTL(cfg.ScaleLink.AllocationTTLDur())
 	reg.SetPlacer(registry.NewHTTPScalePlacerWithMinReady(reg, cfg.ScaleLink.ScalerReplicaCount, cfg.ScaleLink.MinReadyScalers, cfg.ScaleLink.PlaceDur()))
 	cfgState := newRegistryRuntimeConfig(cfg)
 
@@ -87,8 +83,6 @@ func runRegistry(args []string, log *slog.Logger) error {
 	// Dead-node sweep (cluster.md §11): reset the sandboxes of nodes whose
 	// node-link dropped and whose last heartbeat predates node_dead_after.
 	go reg.RunReaper(ctx, cfg.NodeLink.NodeDeadDur())
-	// Key predistribution + lease renewal to each group's allocation set (§7.6).
-	go reg.RunKeyDistributor(ctx, time.Hour)
 
 	controlMux := http.NewServeMux()
 	memberHub.Mount(controlMux)
@@ -140,17 +134,13 @@ func (s *registryRuntimeConfig) set(cfg *clustercfg.RegistryConfig) {
 func mountRegistryControl(mux *http.ServeMux, reg *registry.Registry, cfgState *registryRuntimeConfig, cfgPath string, members *registryMemberRuntime, healthProvider func(string) clusterstate.ReplicaAvailability) {
 	reg.ServeRouteLink(mux)
 	reg.ServeScaleLink(mux)
-	mux.HandleFunc(clusterstate.RouteReplicaRPCPath, func(w http.ResponseWriter, req *http.Request) {
-		clusterstate.ServeRouteReplica(w, req, reg.Stores().LocalRouteReplica())
-	})
-	mux.HandleFunc(clusterstate.NodeReplicaRPCPath, func(w http.ResponseWriter, req *http.Request) {
-		clusterstate.ServeNodeReplica(w, req, reg.Stores().LocalNodeReplica())
-	})
-	mux.HandleFunc(clusterstate.ScaleLinkReplicaRPCPath, func(w http.ResponseWriter, req *http.Request) {
-		clusterstate.ServeScaleLinkReplica(w, req, reg.Stores().LocalScaleLinkReplica())
-	})
-	mux.HandleFunc(registry.NodeListReplicaRPCPath, func(w http.ResponseWriter, req *http.Request) {
-		registry.ServeNodeListReplica(w, req, reg.Stores().LocalNodeListReplica())
+	mux.HandleFunc(shardkv.HTTPPath, func(w http.ResponseWriter, req *http.Request) {
+		store := reg.Stores().ShardStore()
+		if store == nil {
+			http.Error(w, "shard store is not initialized", http.StatusServiceUnavailable)
+			return
+		}
+		shardkv.ServeHTTP(store)(w, req)
 	})
 	mux.HandleFunc(registry.NodeOwnerRPCPath, func(w http.ResponseWriter, req *http.Request) {
 		registry.ServeNodeOwner(w, req, reg.LocalNodeOwner())
@@ -233,23 +223,22 @@ func reloadRegistryConfig(ctx context.Context, cfgPath string, old *clustercfg.R
 			return err
 		}
 	}
-	views, routeReplicas, nodeReplicas, scaleLinkReplicas, nodeListReplicas, nodeOwners, err := buildRegistryTopology(next, healthProvider)
+	views, nodeOwners, err := buildRegistryTopology(next)
 	if err != nil {
 		return err
 	}
-	reg.Stores().SetClusterTopology(views,
-		next.Membership.Owners.RouteLink, next.Membership.Owners.NodeLink,
-		routeReplicas, nodeReplicas)
-	reg.Stores().SetScaleLinkTopology(views, next.Membership.Owners.ScaleLink, scaleLinkReplicas)
-	reg.Stores().SetNodeListTopology(views, next.Membership.Owners.NodeList, nodeListReplicas)
-	reg.Stores().SetMembershipVersion(active.Version)
+	reg.Stores().SetClusterTopology(views, next.Membership.Owners.RouteLink, next.Membership.Owners.NodeLink)
+	reg.Stores().SetScaleLinkTopology(views, next.Membership.Owners.ScaleLink)
+	reg.Stores().SetNodeListTopology(views, next.Membership.Owners.NodeList)
+	if err := configureRegistryShardTransport(reg.Stores(), next, healthProvider); err != nil {
+		return err
+	}
 	reg.Stores().SetNodeListHeartbeatRefresh(nodeListHeartbeatRefresh(next.NodeLink.NodeDeadDur()))
 	reg.Stores().SetNodeListWatchRetention(next.NodeList.WatchRetention)
 	reg.SetRemoteNodeOwners(nodeOwners)
 	reg.SetScaleReadyLabel(active.Label)
 	reg.SetScalerMemberlistLabel(next.ScaleLink.ScalerLabel)
 	reg.SetScalePolicy(next.ScaleLink.ScalerReplicaCount, next.ScaleLink.MinReadyScalers, next.ScaleLink.PlaceDur())
-	reg.SetKeyAllocationTTL(next.ScaleLink.AllocationTTLDur())
 	reg.SetPlacer(registry.NewHTTPScalePlacerWithMinReady(reg, next.ScaleLink.ScalerReplicaCount, next.ScaleLink.MinReadyScalers, next.ScaleLink.PlaceDur()))
 	cfgState.set(next)
 	return nil
@@ -293,36 +282,65 @@ func nodeListHeartbeatRefresh(deadAfter time.Duration) time.Duration {
 	return d
 }
 
-func newRegistryStores(kv clusterstore.Store, cfg *clustercfg.RegistryConfig, healthProvider func(string) clusterstate.ReplicaAvailability) (*registry.Stores, map[string]registry.NodeOwner, error) {
-	active, ok := cfg.Membership.ActiveVersion()
-	if !ok {
+func newRegistryStores(cfg *clustercfg.RegistryConfig, healthProvider func(string) clusterstate.ReplicaAvailability) (*registry.Stores, map[string]registry.NodeOwner, error) {
+	if _, ok := cfg.Membership.ActiveVersion(); !ok {
 		return nil, nil, fmt.Errorf("registry: active membership %d not found", cfg.Membership.Active)
 	}
-	views, routeReplicas, nodeReplicas, scaleLinkReplicas, nodeListReplicas, nodeOwners, err := buildRegistryTopology(cfg, healthProvider)
+	views, nodeOwners, err := buildRegistryTopology(cfg)
 	if err != nil {
 		return nil, nil, err
 	}
-	stores := registry.NewClusterStoresWithViews(kv, cfg.Member.ID, views,
+	stores := registry.NewClusterStoresWithViews(cfg.Member.ID, views,
 		cfg.Membership.Owners.RouteLink, cfg.Membership.Owners.NodeLink,
-		routeReplicas, nodeReplicas)
-	stores.SetScaleLinkTopology(views, cfg.Membership.Owners.ScaleLink, scaleLinkReplicas)
-	stores.SetNodeListTopology(views, cfg.Membership.Owners.NodeList, nodeListReplicas)
-	stores.SetMembershipVersion(active.Version)
+		cfg.Membership.Owners.NodeList, cfg.Membership.Owners.ScaleLink)
+	stores.SetScaleLinkTopology(views, cfg.Membership.Owners.ScaleLink)
+	stores.SetNodeListTopology(views, cfg.Membership.Owners.NodeList)
+	if err := configureRegistryShardTransport(stores, cfg, healthProvider); err != nil {
+		return nil, nil, err
+	}
 	stores.SetNodeListHeartbeatRefresh(nodeListHeartbeatRefresh(cfg.NodeLink.NodeDeadDur()))
 	stores.SetNodeListWatchRetention(cfg.NodeList.WatchRetention)
 	return stores, nodeOwners, nil
 }
 
-func buildRegistryTopology(cfg *clustercfg.RegistryConfig, healthProvider func(string) clusterstate.ReplicaAvailability) ([]clusterstate.MemberView, map[string]clusterstate.RouteReplica, map[string]clusterstate.NodeReplica, map[string]clusterstate.ScaleLinkReplica, map[string]clusterstate.NodeListReplica, map[string]registry.NodeOwner, error) {
+func configureRegistryShardTransport(stores *registry.Stores, cfg *clustercfg.RegistryConfig, healthProvider func(string) clusterstate.ReplicaAvailability) error {
+	peers := map[shardkv.MemberID]shardkv.HTTPPeer{}
+	for _, member := range jointMembershipMembers(cfg.Membership.MemberVersions()) {
+		if member.ID == "" || member.ID == cfg.Member.ID {
+			continue
+		}
+		base, client, err := registryMemberClient(member.Advertise, cfg.Member.TLS)
+		if err != nil {
+			return fmt.Errorf("registry shardkv member %q: %w", member.ID, err)
+		}
+		peers[shardkv.MemberID(member.ID)] = shardkv.HTTPPeer{Endpoint: base, Client: client}
+	}
+	transport := shardkv.NewHTTPPeerTransport(shardkv.HTTPPeerResolverFunc(func(member shardkv.MemberID) (shardkv.HTTPPeer, bool) {
+		peer, ok := peers[member]
+		return peer, ok
+	}))
+	stores.SetShardTransport(transport, registryShardReady{healthProvider: healthProvider})
+	return nil
+}
+
+type registryShardReady struct {
+	healthProvider func(string) clusterstate.ReplicaAvailability
+}
+
+func (r registryShardReady) Ready(_ string, member shardkv.MemberID) bool {
+	if r.healthProvider == nil {
+		return true
+	}
+	health := r.healthProvider(string(member))
+	return health == nil || health.Available()
+}
+
+func buildRegistryTopology(cfg *clustercfg.RegistryConfig) ([]clusterstate.MemberView, map[string]registry.NodeOwner, error) {
 	ownerVersions := cfg.Membership.OwnerVersions()
 	views := make([]clusterstate.MemberView, 0, len(ownerVersions))
 	for _, version := range ownerVersions {
 		views = append(views, clusterstate.MemberView{Version: version.Version, Members: version.MemberIDs()})
 	}
-	routeReplicas := map[string]clusterstate.RouteReplica{}
-	nodeReplicas := map[string]clusterstate.NodeReplica{}
-	scaleLinkReplicas := map[string]clusterstate.ScaleLinkReplica{}
-	nodeListReplicas := map[string]clusterstate.NodeListReplica{}
 	nodeOwners := map[string]registry.NodeOwner{}
 	for _, member := range jointMembershipMembers(cfg.Membership.MemberVersions()) {
 		if member.ID == "" || member.ID == cfg.Member.ID {
@@ -330,22 +348,11 @@ func buildRegistryTopology(cfg *clustercfg.RegistryConfig, healthProvider func(s
 		}
 		base, client, err := registryMemberClient(member.Advertise, cfg.Member.TLS)
 		if err != nil {
-			return nil, nil, nil, nil, nil, nil, fmt.Errorf("registry: member %q: %w", member.ID, err)
+			return nil, nil, fmt.Errorf("registry: member %q: %w", member.ID, err)
 		}
-		var health clusterstate.ReplicaAvailability
-		if healthProvider != nil {
-			health = healthProvider(member.ID)
-		}
-		if health == nil {
-			health = clusterstate.NewReplicaHealth(2 * time.Second)
-		}
-		routeReplicas[member.ID] = clusterstate.NewHTTPRouteReplicaWithHealth(base, client, health)
-		nodeReplicas[member.ID] = clusterstate.NewHTTPNodeReplicaWithHealth(base, client, health)
-		scaleLinkReplicas[member.ID] = clusterstate.NewHTTPScaleLinkReplicaWithHealth(base, client, health)
-		nodeListReplicas[member.ID] = registry.NewHTTPNodeListReplica(base, client)
 		nodeOwners[member.ID] = registry.NewHTTPNodeOwner(base, client)
 	}
-	return views, routeReplicas, nodeReplicas, scaleLinkReplicas, nodeListReplicas, nodeOwners, nil
+	return views, nodeOwners, nil
 }
 
 func jointMembershipMembers(versions []clustercfg.MembershipVersion) []clustercfg.MembershipMember {

@@ -109,7 +109,6 @@ scale_link:
   scaler_replica_count: 3
   min_ready_scalers: 1
   place_timeout: 2s
-  allocation_ttl: 10m                   # registry-side scaler allocation intent TTL
 `
 
 const routerConfigSkeleton = `# cluster-ctl router config — cluster-ctl router --config <this> (cluster-router.md §3).
@@ -154,7 +153,7 @@ placement:
   node_dead_after: 30s               # exclude nodes silent longer than this
   import_source_owner_count: 3       # candidates that may race for each source lease
   import_source_lease_ttl: 15s       # registry-side source lease TTL
-  allocation_refresh_interval: 1m    # refresh unchanged key allocation before registry TTL
+  selector_patch_refresh_interval: 1m # refresh unchanged selector patches before node key TTL
   # shuffle_sharding:                # empty = static nodeSelectors only (cluster-scaler.md §4.4)
   #   - selector: { pool: gpu }
   #     shard_by: zone

@@ -179,7 +179,7 @@ func writeJSON(w http.ResponseWriter, v any) {
 
 func routeLinkStatus(err error) int {
 	switch {
-	case errors.Is(err, ErrShardNotReady), errors.Is(err, clusterstate.ErrQuorum):
+	case errors.Is(err, clusterstate.ErrQuorum):
 		return http.StatusServiceUnavailable
 	default:
 		return http.StatusBadRequest

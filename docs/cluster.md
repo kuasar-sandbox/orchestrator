@@ -24,8 +24,8 @@ joint owner set 与 namespace 自身收敛驱动完成业务无损切换。
 5. **热路径旁路控制面**:router 对活动连接和近期路由做本地缓存;命中时直接转发到 node,不调用
    `Reserve`。miss / fail-fast 后才走 registry。
 6. **成员健康不参与分片计算**:Registry 成员表由配置版本定义;`LocateN` 的输入仅为版本化成员表。
-   HTTP replica health 只影响 retry/cooldown,不改变 owner set。
-7. **放置与执行分层**:scaler 负责 group 导入、WATCH_LIST、shuffle-sharding、key allocation 与
+   成员健康只影响 retry/cooldown,不改变 owner set。
+7. **放置与执行分层**:scaler 负责 group 导入、WATCH_LIST、shuffle-sharding、selector patch 与
    `Place`;node owner 负责节点连接、命令投递、运行态与资源 admission。
 
 ### 1.2 角色
@@ -34,7 +34,7 @@ joint owner set 与 namespace 自身收敛驱动完成业务无损切换。
 |---|---|
 | registry member | 组成 registry 自聚簇,承载 `route_link` / `node_link` / `node_list` / `scale_link` 执行态和 membership |
 | router | e2b 统一入口;按 group 定位 route owner;活动连接缓存;miss 时调用 Reserve |
-| scaler | 消费 node_list WATCH_LIST;通过 provider/importer 导入 group;维护 placement / key allocation;提供 Place API |
+| scaler | 消费 node_list WATCH_LIST;通过 provider/importer 导入 group;维护 placement / selector patch;提供 Place API |
 | node | 运行 sandbox/build;经 node_link 上报全量清单与事件;接收 create/connect/delete/key/build 命令 |
 
 ## 2. 配置与监听
@@ -81,7 +81,6 @@ scale_link:
   scaler_replica_count: 3
   min_ready_scalers: 1
   place_timeout: 2s
-  allocation_ttl: 10m
 ```
 
 默认 path:
@@ -91,10 +90,7 @@ scale_link:
 /route-link/*
 /scale-link/*
 /cluster/membership
-/internal/registry-member/route-replica
-/internal/registry-member/node-replica
-/internal/registry-member/scale-link-replica
-/internal/registry-member/node-list-replica
+/internal/registry-member/shardkv
 /internal/node-owner
 ```
 
@@ -111,7 +107,7 @@ Registry 成员集由运维配置和 membership version 定义。每个命名空
 | `route_link` | group | `LocateN(group,K)` | route 记录、build 执行态;每个 owner 持完整 group 执行态视图 |
 | `node_link` | node_id | `LocateN(node_id,N)` | node 连接、sandbox/build 清单、labels、水位、build 预算;每个 owner 持完整 node 视图 |
 | `node_list` | `node_list` | `LocateN("node_list",M)` | 低频节点目录与 labels;每个 node_list owner 持完整目录和 WATCH_LIST log |
-| `scale_link` | scale_link key | `LocateN(key,S)` | source lease/cursor 和 key allocation intent;registry owner set 内全复制 |
+| `scale_link` | `import/source/<source_id>` | `LocateN(shard,S)` | import source lease/cursor;registry owner set 内全复制 |
 
 `scale_link.scaler_replica_count` 只控制 registry 调用 ready scaler 的 failover 候选数,不是 registry 内部
 `scale_link` 记录的 owner count。后者由 `membership.owners.scale_link` 控制。
@@ -147,7 +143,7 @@ version 最新的 membership,避免单个 bootstrap 滞后影响切换。
 ### 4.2 成员健康
 
 registry 成员之间按 membership label 启动独立 memberlist 故障检测域。成员清单仍只来自配置;memberlist
-只报告配置成员的运行期可达性。route/node replica RPC 使用 HTTP 控制面;memberlist dead/suspect 和
+只报告配置成员的运行期可达性。shardkv member RPC 使用 HTTP 控制面;memberlist dead/suspect 和
 RPC 短周期 cooldown 只用于 fail-fast,冷路径 fanout 仍按完整 owner set 并发尝试。成员健康必须遵守以下边界:
 
 - 不维护 registry 成员清单,只观察配置成员。
@@ -168,7 +164,7 @@ join scaler memberlist;ready 状态由 scaler memberlist meta 表达:
 
 ### 4.3 成员故障
 
-成员故障由 replica RPC 失败和 health/cooldown 体现,但不改变 owner set。某成员不可达时:
+成员故障由 shardkv member RPC 失败和 health/cooldown 体现,但不改变 owner set。某成员不可达时:
 
 - 它参与的 owner set 降一格,只要可达 owner 数满足 quorum 即继续服务。
 - 若 quorum 不足,该 shard 停写(CP),不降级乱写。
@@ -238,8 +234,9 @@ size-1 模式中 `LocateN` 只返回本成员,quorum 退化为本地内存写;�
 ## 7. Namespace 收敛
 
 registry 不支持跨 group/node shard 扫描,也不通过枚举 key 做后台 promoter。收敛由 namespace 自己的事实源
-驱动:route/build 由同 group 请求、node 上报或 group-scoped list/export 触达;group import 驱动 group/key
-allocation;node_link 由 node 连接、心跳和事件触达;node_list 由 node-link 持有者的低频投影触达。
+驱动:route/build 由同 group 请求、node 上报或 group-scoped list/export 触达;group import 驱动 selector
+patch 与 manifest-key cache refresh;node_link 由 node 连接、心跳和事件触达;node_list 由 node-link 持有者的
+低频投影触达。
 
 ### 7.1 node_link
 
@@ -255,10 +252,10 @@ allocation;node_link 由 node 连接、心跳和事件触达;node_list 由 node-
 
 ### 7.2 route_link / group
 
-scaler 的 group provider/importer 是 group/key allocation 的事实源。registry 不保存 group 配置,也不实现
-provider。group 从 provider 消失后,新的 Place/verify-key 直接按该 group 不存在处理;registry 中已经收到
-的 key allocation intent 由 `scale_link.allocation_ttl` 自动过期,再通过 key distributor 清理 node_link
-key cache。scaler 不复制 route 数据。route/build 执行态不做跨 group promoter;后续同 group 请求、node
+scaler 的 group provider/importer 是 group placement 与密钥材料的事实源。registry 不保存 group 配置,
+也不实现 provider。group 从 provider 消失后,新的 Place/verify-key 直接按该 group 不存在处理;已写入
+node_link 的 manifest-key cache 不主动删除,由 node_link 与节点侧 TTL 淘汰。scaler 不复制 route 数据。
+route/build 执行态不做跨 group promoter;后续同 group 请求、node
 上报和 group-scoped list/export 会通过 quorum read-repair 补齐该 group 的 owner 副本。
 
 route owner 内部维护按 group 分开的本地 watch log。这个 watch 只服务 registry 内部:
@@ -324,7 +321,7 @@ Node 连接 registry 后按 `LocateN(node_id,N)` 归属 node owner set。node �
 - 全量 sandbox 清单和增量事件。
 - build 状态事件。
 - labels、runtime_digest、build_capacity、draining、粗粒度 liveness。
-- `manifest_keys` desired cache,由 key allocation 写入 node_link owner set;实际下发由 node-link 心跳维系刷新。
+- `manifest_keys` cache,由 selector patch 写入 node_link owner set;实际下发由 node-link 心跳维系刷新。
 - 高频水位保留在 node_link owner 本地;node_list 是独立低频投影,普通 heartbeat 不触发 WATCH_LIST 扇出。
 - node_list 低频 heartbeat refresh 由 `node_dead_after` 派生,必须短于 scaler 判活窗口。
 
@@ -359,19 +356,19 @@ scaler 负责:
 
 - `SandboxGroupImporter.Range` 全量/增量导入 group。
 - `SandboxGroupProvider.GetPlacementHint` 提供 group placement hint。
-- `SandboxGroupProvider.GetKey` / `GetAuthKey` 生成 key allocation / auth material intent。
+- `SandboxGroupProvider.GetKey` / `GetAuthKey` 返回 manifest_key / auth_key material。
 - 按 `source_id` 做 import owner 选择:ready scaler 经
   `LocateN(source_id,ready_scalers,import_source_owner_count)` 得到候选,候选通过
   `POST /scale-link/import-source-lease` 抢 registry source lease;只有 lease 胜者从 source execution record
-  的 cursor 执行 `Range`。source lease 是 `scale_link` 命名空间记录,record key 为
-  `source\0<source_id>`,按 `NamespaceScaleLink + record_key` 定位 registry owner set,并在分片内用无主
+  的 cursor 执行 `Range`。source lease 是 `scale_link` 命名空间记录,shard 为
+  `import/source/<source_id>`,record key 为 `state`,并在分片内用无主
   CAS 全复制维护。每页 patch 全部成功后通过 `POST /scale-link/import-source-cursor` 推进 cursor。
 - 按 active / next membership 得到 node_list owner 候选,一次只订阅一个 owner;断线后 reset 并切换下一个。
 - 周期性向 active / next registry owner 成员 `POST /scale-link/register` 发布 memberlist seed。
 - 在 scaler memberlist meta 中发布 `ready`、`ready_label` 和 `api_advertise`;Place 使用 registry observer
   看到的 ready scaler 视图。
-- 按 `allocation\0<group>` 定位 `scale_link` owner set,向该 owner set 推送 selector/key allocation patch;
-  patch 携带 source lease fencing 信息,registry 只接受当前 source lease owner。
+- source lease 胜者向 `scale_link` owner endpoint 推送 selector patch。patch 携带 source lease fencing
+  信息,registry 只接受当前 source lease owner,并直接更新目标 node 的 node_link manifest-key cache。
 - 对 registry 暴露 `POST /scale-link/place`。
 
 registry 对 group 做 scaler 选择:
@@ -410,12 +407,10 @@ group 有两个密钥域:
 随 route 记录保存,READY/ResolveSID 只读 route_link,不回查 provider。
 
 `manifest_key` 和 `registry_auth` 都是 typed secret,支持 inline 或 ref 带外交付。`manifest_key` 使用 ref
-时必须同时给出 fingerprint,供 create/build precheck 使用。密钥分发遵循 scaler 的 allocation 结果:
-scaler 决定哪些 node 应有 key,registry/node owner 将 desired key list 写入对应 node_link 记录并在 owner
-set 内 CAS 复制。registry 保存的 scaler allocation intent 是 `scale_link` 命名空间记录,record key 为
-`allocation\0<group>`,并带有 `scale_link.allocation_ttl`;scaler 按 `placement.allocation_refresh_interval`
-续推 unchanged allocation,停止续推后 intent 自动过期,node_link key cache 随下一轮 reconcile 清理。
-node_link key cache 同时记录已成功下发的 lease 到期时间;实际
+时必须同时给出 fingerprint,供 create/build precheck 使用。密钥分发只发生在 shuffle-sharding/import
+路径:scaler 通过 selector patch 指定目标 node set 和 manifest_key material/ref,registry/node owner 将 key
+cache 写入对应 node_link 记录并在 owner set 内 CAS 复制。selector patch 不落成独立 registry intent。
+node_link key cache 记录 key 自身 TTL 和已成功下发的 lease 到期时间;实际
 `key_put` 由 node-link 心跳维系,未进入续租窗口的条目不重复下发,进入续租窗口后随心跳刷新 lease。
 `key_drop` 不作为正确性依赖,节点侧租约按 TTL 淘汰未续租 key。密钥分发是 create/build 前置条件,
 不影响已运行 sandbox。
@@ -442,6 +437,7 @@ registry export/import 只覆盖 registry 执行态灾备数据:
 - route records
 - build execution records
 
+JSONL 行使用显式类型:`{"type":"route","route":...}` 与 `{"type":"build","build":...}`。
 registry export/import 不覆盖 sandbox-group provider 数据。group 配置、placement hint、auth_key、manifest_key
 由 scaler/provider 侧导入导出。
 

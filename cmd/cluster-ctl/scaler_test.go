@@ -44,13 +44,13 @@ func TestScaleLinkResolverUsesCachedMembership(t *testing.T) {
 	hits.Store(0)
 	resolver := newScaleLinkResolver(regClient)
 
-	for _, group := range []string{"/g1", "/g2", "/g3"} {
-		links, err := resolver(context.Background(), clusterstate.ScaleLinkAllocationKey(group))
+	for _, source := range []string{"source-a", "source-b", "source-c"} {
+		links, err := resolver(context.Background(), clusterstate.ScaleLinkSourceKey(source))
 		if err != nil {
-			t.Fatalf("resolve %s: %v", group, err)
+			t.Fatalf("resolve %s: %v", source, err)
 		}
 		if len(links) == 0 {
-			t.Fatalf("resolve %s returned no links", group)
+			t.Fatalf("resolve %s returned no links", source)
 		}
 	}
 	if got := hits.Load(); got != 0 {

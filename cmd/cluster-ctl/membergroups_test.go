@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/clustercfg"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/clusterstore"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/membergroup"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/registry"
 )
@@ -33,10 +32,7 @@ func TestScaleLinkRegisterSeedsScalerObserverMemberlist(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer observer.group.Shutdown()
-
-	kv := clusterstore.OpenMemory(100)
-	defer kv.Close()
-	reg := registry.New(registry.NewStores(kv), nil, time.Second, log)
+	reg := registry.New(registry.NewStores(), nil, time.Second, log)
 	reg.SetScalerMemberlistLabel("scaler.default")
 	reg.SetScalerSeedJoiner(observer.JoinSeed)
 	reg.SetScalerPeerSource(observer.ReadyScalers)

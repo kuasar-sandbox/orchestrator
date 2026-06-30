@@ -79,11 +79,6 @@ type Registry struct {
 	sidKeys  map[string][2]string              // sid -> {group, route_key} (delete-by-sid from the route stream)
 	acks     map[string]chan *routesync.CmdAck // cmd_id -> ack waiter (synchronous key commands)
 
-	keyMu     sync.Mutex
-	keyLeased map[string]keyLeaseState // group -> nodes currently holding the predistributed key
-
-	reconcileTrigger chan struct{} // coalesced key-reconcile wakeups (a node connecting)
-
 	localNodeOwner NodeOwner
 	nodeOwner      NodeOwner
 	deadAfter      time.Duration
@@ -94,8 +89,6 @@ type Registry struct {
 	scalerLabel      string
 	scalePeerSource  ScalerPeerSource
 	scalerSeedJoiner ScalerSeedJoiner
-	keyAlloc         map[string]keyAllocationState // group -> scaler-owned manifest-key allocation set
-	keyAllocationTTL time.Duration
 	scaleReplicas    int
 	minReadyScalers  int
 	scaleTimeout     time.Duration
@@ -157,113 +150,56 @@ func New(stores *Stores, placer Placer, parkTimeout time.Duration, log *slog.Log
 		parkTimeout = 30 * time.Second
 	}
 	r := &Registry{
-		stores:           stores,
-		placer:           placer,
-		parkTimeout:      parkTimeout,
-		log:              log,
-		nodes:            make(map[string]nodeConn),
-		inflight:         make(map[string]*reserveCall),
-		sidKeys:          make(map[string][2]string),
-		acks:             make(map[string]chan *routesync.CmdAck),
-		keyLeased:        make(map[string]keyLeaseState),
-		reconcileTrigger: make(chan struct{}, 1),
-		keyAlloc:         make(map[string]keyAllocationState),
-		keyAllocationTTL: 10 * time.Minute,
-		scaleReplicas:    1,
-		minReadyScalers:  1,
-		scaleTimeout:     2 * time.Second,
+		stores:          stores,
+		placer:          placer,
+		parkTimeout:     parkTimeout,
+		log:             log,
+		nodes:           make(map[string]nodeConn),
+		inflight:        make(map[string]*reserveCall),
+		sidKeys:         make(map[string][2]string),
+		acks:            make(map[string]chan *routesync.CmdAck),
+		scaleReplicas:   1,
+		minReadyScalers: 1,
+		scaleTimeout:    2 * time.Second,
 	}
 	localOwner := newLocalNodeOwner(r)
 	r.localNodeOwner = localOwner
 	r.nodeOwner = localOwner
-	if rep, ok := stores.LocalScaleLinkReplica().(interface {
-		SetApplyHook(func(clusterstate.ScaleLinkRecord))
-	}); ok {
-		rep.SetApplyHook(r.projectScaleLinkRecord)
-	}
 	return r
 }
 
-// applySelectorPatch records the scaler-owned key allocation for a group. The
-// registry/node owner writes this explicit node set into node_link key caches;
-// local selector matching is only a bootstrap path before the scaler has pushed allocation.
+// applySelectorPatch renews the scaler-selected node manifest-key cache. The
+// scaler owns selector/shuffle decisions; registry only writes the current key
+// lease into node_link for the explicit nodes in the patch. Old keys are not
+// actively deleted: node_link and node side TTLs expire entries that stop being
+// renewed.
 func (r *Registry) applySelectorPatch(ctx context.Context, p *routesync.SelectorPatch) error {
 	if !r.selectorPatchLeaseOK(ctx, p) {
 		return errStaleImportSourceLease
 	}
-	if !p.NodeAllocation {
+	if p.KeyFingerprint == "" || len(p.NodeIDs) == 0 {
 		return nil
 	}
-	if _, err := r.stores.PutScaleLinkAllocation(ctx, p, r.keyAllocationTTL); err != nil {
-		return err
-	}
-	r.onNodeConnected()
-	return nil
-}
-
-func (r *Registry) projectScaleLinkRecord(rec clusterstate.ScaleLinkRecord) {
-	if rec.Kind != clusterstate.ScaleLinkKindAllocation || rec.Group == "" {
-		return
-	}
-	changed := false
-	r.scalerMu.Lock()
-	if rec.ExpiresUnixMs > 0 && rec.ExpiresUnixMs <= time.Now().UnixMilli() {
-		delete(r.keyAlloc, rec.Group)
-		changed = true
-		r.scalerMu.Unlock()
-		r.onNodeConnected()
-		return
-	}
-	set := make(map[string]bool, len(rec.NodeIDs))
-	for _, id := range rec.NodeIDs {
-		if id != "" {
-			set[id] = true
-		}
-	}
-	keyType, keyValue := rec.ManifestKeyType, rec.ManifestKey
-	if keyType == "ref" {
-		keyValue = rec.ManifestKeyRef
+	keyType, keyValue := p.ManifestKeyType, p.ManifestKey
+	if keyType == clusterstate.SecretRef {
+		keyValue = p.ManifestKeyRef
 	}
 	if keyType == "" && keyValue != "" {
 		keyType = clusterstate.SecretInline
 	}
-	if len(set) == 0 || rec.KeyFingerprint == "" || keyValue == "" {
-		delete(r.keyAlloc, rec.Group)
-		changed = true
-		r.scalerMu.Unlock()
-		r.onNodeConnected()
-		return
+	if keyValue == "" {
+		return nil
 	}
-	expiresAt := time.UnixMilli(rec.ExpiresUnixMs)
-	r.keyAlloc[rec.Group] = keyAllocationState{fp: rec.KeyFingerprint, keyType: keyType, keyValue: keyValue, nodes: set, expiresAt: expiresAt}
-	changed = true
-	r.scalerMu.Unlock()
-	if changed {
-		r.onNodeConnected()
-	}
-}
-
-func (r *Registry) keyAllocations() map[string]keyAllocationState {
-	if r.stores != nil {
-		r.stores.CompactScaleLinkAllocations(time.Now().UnixMilli())
-	}
-	r.scalerMu.Lock()
-	defer r.scalerMu.Unlock()
-	now := time.Now()
-	for group, src := range r.keyAlloc {
-		if !src.expiresAt.IsZero() && !src.expiresAt.After(now) {
-			delete(r.keyAlloc, group)
+	expiresUnix := time.Now().Add(keyLeaseTTL).Unix()
+	for _, nodeID := range p.NodeIDs {
+		if nodeID == "" || r.nodeOwner == nil {
+			continue
+		}
+		if err := r.nodeOwner.PutManifestKey(ctx, nodeID, p.KeyFingerprint, keyType, keyValue, expiresUnix); err != nil && !errors.Is(err, ErrNodeGone) {
+			return err
 		}
 	}
-	out := make(map[string]keyAllocationState, len(r.keyAlloc))
-	for group, src := range r.keyAlloc {
-		nodes := make(map[string]bool, len(src.nodes))
-		for id := range src.nodes {
-			nodes[id] = true
-		}
-		out[group] = keyAllocationState{fp: src.fp, keyType: src.keyType, keyValue: src.keyValue, nodes: nodes, expiresAt: src.expiresAt}
-	}
-	return out
+	return nil
 }
 
 func (r *Registry) selectorPatchLeaseOK(ctx context.Context, p *routesync.SelectorPatch) bool {
@@ -278,15 +214,6 @@ func (r *Registry) selectorPatchLeaseOK(ctx context.Context, p *routesync.Select
 func (r *Registry) SetScaleReadyLabel(label string) {
 	r.scalerMu.Lock()
 	r.scaleReadyLabel = label
-	r.scalerMu.Unlock()
-}
-
-func (r *Registry) SetKeyAllocationTTL(ttl time.Duration) {
-	if ttl <= 0 {
-		ttl = 10 * time.Minute
-	}
-	r.scalerMu.Lock()
-	r.keyAllocationTTL = ttl
 	r.scalerMu.Unlock()
 }
 
@@ -395,9 +322,6 @@ func flightKey(group, routeKey string) string { return group + "\x00" + routeKey
 func (r *Registry) ReserveSandbox(ctx context.Context, group, routeKey string, createConfig map[string]string) (*ReserveResult, error) {
 	if group == "" || routeKey == "" {
 		return nil, fmt.Errorf("registry: group and route_key are required")
-	}
-	if isBuildRouteKey(routeKey) {
-		return nil, fmt.Errorf("registry: route_key prefix %q is reserved", buildRouteKeyPrefix)
 	}
 	rec, rev, found, err := r.getSandboxForReserve(ctx, group, routeKey)
 	if err != nil {

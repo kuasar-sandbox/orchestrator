@@ -25,7 +25,6 @@ import (
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/apikey"
 	clusterstate "github.com/kuasar-sandbox/sandbox-orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/clustercfg"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/clusterstore"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/membergroup"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/registry"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/router"
@@ -57,17 +56,13 @@ func newHarness(t *testing.T) *harness {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-
-	kv := clusterstore.OpenMemory(1000)
-	t.Cleanup(func() { kv.Close() })
-	stores := registry.NewStores(kv)
+	stores := registry.NewStores()
 
 	reg := registry.New(stores, nil, 5*time.Second, log)
 	placer := registry.NewHTTPScalePlacer(reg, 1, 2*time.Second)
 	reg.SetPlacer(placer)
 	reg.SetScalerMemberlistLabel("scaler.default")
 	reg.SetScaleReadyLabel("registry.1.test")
-	go reg.RunKeyDistributor(ctx, time.Hour)
 
 	regHub := membergroup.NewHub()
 	mux := http.NewServeMux()

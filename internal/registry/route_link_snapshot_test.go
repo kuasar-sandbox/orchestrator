@@ -50,7 +50,7 @@ func TestSnapshotRouteRoundTrip(t *testing.T) {
 	}
 }
 
-func TestSnapshotIncludesBuildRouteRecords(t *testing.T) {
+func TestSnapshotIncludesBuildRecords(t *testing.T) {
 	ctx := context.Background()
 	src := testReg(t)
 	if err := src.stores.PutBuild(ctx, &BuildRecord{
@@ -65,8 +65,11 @@ func TestSnapshotIncludesBuildRouteRecords(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if sum.Routes != 1 {
-		t.Fatalf("summary=%+v, want 1 route record", sum)
+	if sum.Builds != 1 {
+		t.Fatalf("summary=%+v, want 1 build record", sum)
+	}
+	if !strings.Contains(raw.String(), `"type":"build"`) {
+		t.Fatalf("snapshot did not export build record type: %s", raw.String())
 	}
 
 	dst := testReg(t)

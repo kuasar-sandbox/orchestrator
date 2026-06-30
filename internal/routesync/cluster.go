@@ -46,14 +46,13 @@ type PlaceResult struct {
 	RegistryAuth   string            `json:"registry_auth,omitempty"`
 }
 
-// SelectorPatch is the scaler's key allocation for a group. NodeIDs is the
+// SelectorPatch is the scaler's placement projection for a group. NodeIDs is the
 // explicit node set that should hold the group's manifest key; Selectors carries
 // the shuffle-effective selector projection.
 type SelectorPatch struct {
 	Group           string              `json:"group"`
 	Selectors       []map[string]string `json:"selectors"`
 	NodeIDs         []string            `json:"node_ids,omitempty"`
-	NodeAllocation  bool                `json:"node_allocation,omitempty"`
 	KeyFingerprint  string              `json:"key_fp,omitempty"`
 	ManifestKeyType string              `json:"manifest_key_type,omitempty"`
 	ManifestKey     string              `json:"manifest_key,omitempty"`

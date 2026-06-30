@@ -1,15 +1,15 @@
 # cluster-scaler — group 导入、WATCH_LIST 与放置
 
 scaler 是 cluster 的放置执行方。它通过 `SandboxGroupProvider` / `SandboxGroupImporter` 获取
-sandbox-group 配置,维护 placement 与密钥分配集合,消费 `node_list` 的 WATCH_LIST,并向 registry 提供
+sandbox-group 配置,维护 placement 与 selector patch,消费 `node_list` 的 WATCH_LIST,并向 registry 提供
 `PlaceSandbox` / `PlaceBuild`。
 
 ## 1. 原则
 
 1. **scaler 不持 node 连接**:实际 `key_put`、`build_register`、create/connect/delete 均由 node owner
    经 node_link 下发。
-2. **scaler 主管 placement 与 key allocation 决策**:它通过 Provider/Importer 取得 group 配置与 key,
-   算出哪些 node 应接收 key,再把 intent 交给 registry/node owner 执行。
+2. **scaler 主管 placement 与 selector patch**:它通过 Provider/Importer 取得 group 配置与 key,
+   算出 shuffle-effective selectors 和应接收 key 的 node set,再交给 registry/node owner 执行。
 3. **registry 不实现 group provider**:内置 file source 只服务开发和 e2e;生产通过接口注入 provider/importer。
 4. **WATCH_LIST 仅给 scaler**:router 不消费 node_list。
 5. **高频负载不走 WATCH_LIST**:WATCH_LIST 不承载 allocated/build_alloc/counts 等高频字段;scaler 用
@@ -36,13 +36,12 @@ cluster-ctl scaler --config /etc/cluster-ctl/scaler.yaml
 | `placement.zone_admit_max` | 可放置最高水位 |
 | `placement.import_source_owner_count` | 每个 source 可参与 lease 竞争的 scaler 候选数,默认 3 |
 | `placement.import_source_lease_ttl` | registry 侧 source owner lease TTL,默认 15s |
-| `placement.allocation_refresh_interval` | unchanged key allocation patch 刷新周期,默认 1m |
+| `placement.selector_patch_refresh_interval` | unchanged selector patch 刷新周期,默认 1m |
 | `placement.shuffle_sharding` | shuffle 规则 |
 
 registry 侧的 `scale_link.scaler_label` 指定 scaler memberlist 域,默认 `scaler.default`;
-`scale_link.scaler_replica_count` 控制每个 group 的 scaler failover 候选数量,`scale_link.allocation_ttl`
-控制 registry 侧 scaler key allocation intent 的自动过期时间。`scale_link` 不再是 registry reverse
-session,也不保存 scaler 目录。scaler 通过 registry membership 得到 active / next registry owner 成员、
+`scale_link.scaler_replica_count` 控制每个 group 的 scaler failover 候选数量。`scale_link` 不再是
+registry reverse session,也不保存 scaler 目录。scaler 通过 registry membership 得到 active / next registry owner 成员、
 node_list owner 候选与当前 registry label,向这些 owner 成员注册 memberlist seed,并始终只从一个
 node_list owner 订阅 WATCH_LIST;断线或 membership 变化后切换到下一候选。membership refresh 会尝试
 bootstrap 与已知成员并选择 active version 最新的结果。registry 收到 scaler register 后以 `role=observer`
@@ -71,8 +70,7 @@ SandboxGroupImporter:
 ```
 
 Importer 只提供当前可见的 group 列表。Provider 对 group 的点查 miss 后,新的 Place/verify-key 返回
-不可用。registry 已经收到的 key allocation intent 由
-`scale_link.allocation_ttl` 自动过期,并在下一轮 key distributor reconcile 中清理 node_link key cache。
+不可用。已经写入 node_link 的 manifest-key cache 不主动删除,由 registry/node 侧 TTL 淘汰。
 
 内置 `file` source 只是辅助实现,用于本地开发和 e2e。`cluster-ctl scaler` 独立运行时必须至少配置一个
 `import_groups` source;生产环境也可以在嵌入式模式直接注入自定义 `SandboxGroupProvider` /
@@ -149,26 +147,25 @@ registry 只把 scaler memberlist 中 `role=scaler`、alive、`ready=true` 且
 
 1. 从 scaler memberlist 取 `role=scaler && ready=true && ready_label==active_registry_label` 的成员 id。
 2. 用 `pkg/maglev.LocateN(source_id,ready_scalers,placement.import_source_owner_count)` 得到 source owner 候选。
-3. 候选按 `source\0<source_id>` 定位 scale_link owner set,向 owner endpoint
+3. 候选按 `import/source/<source_id>` 定位 scale_link owner set,向 owner endpoint
    `POST /scale-link/import-source-lease` 抢 source lease。请求携带
    `source_id`、`owner_id`、进程 `run_id` 和 `ttl_ms`。
-   source lease 是 `scale_link` 命名空间记录,record key 为 `source\0<source_id>`,按
-   `NamespaceScaleLink + record_key` 定位 registry owner set,并在分片内用无主 CAS 全复制维护。
+   source lease 是 `scale_link` 命名空间记录,shard 为 `import/source/<source_id>`,record key 为 `state`,
+   并在分片内用无主 CAS 全复制维护。
 4. 只有 lease 胜者从 source execution record 的 `cursor` 执行该 source 的 `Importer.Range`。
 5. 胜者用 `GetPlacementHint` 得静态 selectors/shuffle labels,用 `pkg/maglev.LocateN` 计算 shuffle 结果,
    将 shuffle 约束合并进最终 selectors。
-6. 胜者计算 key allocation set,按 `allocation\0<group>` 定位 scale_link owner set,生成 selector/key
-   allocation patch。patch 携带 `import_source_id/import_owner_id/import_run_id/import_term`;registry 只接受与
-   当前 source lease 匹配的 patch,并把 allocation intent 写入 scale_link CAS 记录。
+6. 胜者计算 selector patch 目标 node set,并向 source 对应的 scale_link owner endpoint 发送 patch。
+   patch 携带 `import_source_id/import_owner_id/import_run_id/import_term`;registry 只接受与当前 source
+   lease 匹配的 patch,并直接刷新目标 node 的 node_link manifest-key cache。
 7. 本页 patch 全部成功后,胜者向 `POST /scale-link/import-source-cursor` 提交 `cursor`。`NextCursor==""`
    时清空 cursor 并递增 `round`;失败或 owner 崩溃时 cursor 不推进,后续 lease owner 从上次成功 cursor
    继续或重放同一页。
-8. membership 切换期间保持 group/key allocation 视图在新 owner 可用;route/build 执行态仍由同 group
+8. membership 切换期间保持 source lease/cursor 和 selector patch 通路在新 owner 可用;route/build 执行态仍由同 group
    请求或 node 事件触发 read-repair。
 
-scaler 会按 `placement.allocation_refresh_interval` 续推 unchanged allocation patch,该值必须短于 registry
-侧 `scale_link.allocation_ttl`。group 从 provider 消失时不主动删除 allocation intent;registry TTL 到期后
-自动清理,本地 `scale_link` replica 会在后续读写时压缩过期记录。
+scaler 会按 `placement.selector_patch_refresh_interval` 续推 unchanged selector patch,用于维持 node_link
+manifest-key cache。group 从 provider 消失时不主动删除 node_link key cache;registry/node TTL 到期后自动淘汰。
 
 ### 7.2 Registry 选择 scaler
 
@@ -207,11 +204,11 @@ registry 不对 scaler 做 P2C。P2C 只用于 scaler 内部从 node 候选中�
 
 ## 8. 密钥分发
 
-scaler 主管 key allocation 决策:
+scaler 主管 selector patch 和 manifest-key cache refresh:
 
 1. 获取 group 的 typed `manifest_key` 和 `auth_key`。
-2. 根据 placement selectors 得到 allocation set。
-3. 将目标 node set 与 key material/ref 作为 allocation patch 推给 registry。
+2. 根据 placement selectors 得到目标 node set。
+3. 将目标 node set 与 key material/ref 作为 selector patch 推给 registry。
 4. registry/node owner 把每个 node 的 desired key list 写入 node_link 记录并在 owner set 内 CAS 复制。
 5. node_link key cache 记录已成功下发的 lease 到期时间;node-link 心跳维系只对未下发或进入续租窗口的
    条目执行 `key_put` 续租。未续租 key 由节点 TTL 淘汰,`key_drop` 不作为正确性依赖。

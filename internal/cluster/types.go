@@ -36,38 +36,7 @@ type RecordMeta struct {
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
-const (
-	ScaleLinkKindSourceLease = "source_lease"
-	ScaleLinkKindAllocation  = "allocation"
-)
-
-func ScaleLinkSourceKey(sourceID string) string { return "source\x00" + sourceID }
-
-func ScaleLinkAllocationKey(group string) string { return ScaleLinkKindAllocation + "\x00" + group }
-
-func ScaleLinkShardKey(recordKey string) string { return NamespaceScaleLink + "\x00" + recordKey }
-
-type ScaleLinkRecord struct {
-	Meta            RecordMeta `json:"meta"`
-	Key             string     `json:"key"`
-	Kind            string     `json:"kind"`
-	SourceID        string     `json:"source_id,omitempty"`
-	OwnerID         string     `json:"owner_id,omitempty"`
-	RunID           string     `json:"run_id,omitempty"`
-	Term            uint64     `json:"term,omitempty"`
-	Cursor          string     `json:"cursor,omitempty"`
-	Round           uint64     `json:"round,omitempty"`
-	ReadyLabel      string     `json:"ready_label,omitempty"`
-	NextRunUnixMs   int64      `json:"next_run_unix_ms,omitempty"`
-	LastError       string     `json:"last_error,omitempty"`
-	Group           string     `json:"group,omitempty"`
-	NodeIDs         []string   `json:"node_ids,omitempty"`
-	KeyFingerprint  string     `json:"key_fingerprint,omitempty"`
-	ManifestKeyType string     `json:"manifest_key_type,omitempty"`
-	ManifestKey     string     `json:"manifest_key,omitempty"`
-	ManifestKeyRef  string     `json:"manifest_key_ref,omitempty"`
-	ExpiresUnixMs   int64      `json:"expires_unix_ms,omitempty"`
-}
+func ScaleLinkSourceKey(sourceID string) string { return "import/source/" + sourceID }
 
 type RouteState string
 

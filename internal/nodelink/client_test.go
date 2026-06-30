@@ -15,7 +15,6 @@ import (
 	"golang.org/x/net/http2/h2c"
 
 	clusterstate "github.com/kuasar-sandbox/sandbox-orchestrator/internal/cluster"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/clusterstore"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/registry"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/routesync"
 )
@@ -81,10 +80,7 @@ func TestNodeLinkReserveRoundTrip(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-
-	kv := clusterstore.OpenMemory(0)
-	defer kv.Close()
-	reg := registry.New(registry.NewStores(kv), testPlacer{}, 5*time.Second, log)
+	reg := registry.New(registry.NewStores(), testPlacer{}, 5*time.Second, log)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc(routesync.NodeLinkPath, reg.ServeNodeLink)

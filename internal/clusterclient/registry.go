@@ -205,12 +205,12 @@ func (r *Registry) NodeListEndpoints(ctx context.Context) ([]Endpoint, error) {
 	return r.jointOwnerEndpoints(ctx, m, clusterstate.NamespaceNodeList, m.Owners.NodeList)
 }
 
-func (r *Registry) ScaleLinkEndpoints(ctx context.Context, recordKey string) ([]Endpoint, error) {
+func (r *Registry) ScaleLinkEndpoints(ctx context.Context, shardKey string) ([]Endpoint, error) {
 	m, err := r.Membership(ctx)
 	if err != nil {
 		return nil, err
 	}
-	return r.jointOwnerEndpoints(ctx, m, clusterstate.ScaleLinkShardKey(recordKey), m.Owners.ScaleLink)
+	return r.jointOwnerEndpoints(ctx, m, shardKey, m.Owners.ScaleLink)
 }
 
 func (r *Registry) ActiveEndpoints(ctx context.Context) ([]Endpoint, error) {

@@ -15,6 +15,7 @@ const (
 	RouteLinkImportPath = "/route-link/import"
 
 	SnapshotKindRoute = "route"
+	SnapshotKindBuild = "build"
 )
 
 // SnapshotRecord is one JSONL row for registry operator import/export. It is a
@@ -23,6 +24,7 @@ const (
 type SnapshotRecord struct {
 	Type  string         `json:"type"`
 	Route *SandboxRecord `json:"route,omitempty"`
+	Build *BuildRecord   `json:"build,omitempty"`
 }
 
 type SnapshotOptions struct {
@@ -32,6 +34,7 @@ type SnapshotOptions struct {
 
 type SnapshotSummary struct {
 	Routes int `json:"routes"`
+	Builds int `json:"builds"`
 }
 
 func (o SnapshotOptions) normalized() (SnapshotOptions, error) {
@@ -67,11 +70,11 @@ func (r *Registry) ExportSnapshot(ctx context.Context, w io.Writer, opts Snapsho
 		return SnapshotSummary{}, err
 	}
 	if err := r.stores.RangeBuildsInGroup(ctx, opts.Group, func(b *BuildRecord) error {
-		out := sandboxRecordFromBuild(b)
-		if err := enc.Encode(SnapshotRecord{Type: SnapshotKindRoute, Route: out}); err != nil {
+		out := *b
+		if err := enc.Encode(SnapshotRecord{Type: SnapshotKindBuild, Build: &out}); err != nil {
 			return err
 		}
-		sum.Routes++
+		sum.Builds++
 		return nil
 	}); err != nil {
 		return SnapshotSummary{}, err
@@ -107,6 +110,15 @@ func (r *Registry) ImportSnapshot(ctx context.Context, rd io.Reader) (SnapshotSu
 				r.indexSID(route.SID, route.Group, route.RouteKey)
 			}
 			sum.Routes++
+		case SnapshotKindBuild:
+			if rec.Build == nil || rec.Build.Group == "" || rec.Build.BuildID == "" {
+				return sum, fmt.Errorf("registry snapshot line %d: build record missing group or build_id", line)
+			}
+			build := *rec.Build
+			if err := r.stores.PutBuild(ctx, &build); err != nil {
+				return sum, fmt.Errorf("registry snapshot line %d: put build %q/%q: %w", line, build.Group, build.BuildID, err)
+			}
+			sum.Builds++
 		default:
 			return sum, fmt.Errorf("registry snapshot line %d: unknown type %q", line, rec.Type)
 		}

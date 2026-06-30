@@ -7,21 +7,15 @@ import (
 	"time"
 
 	clusterstate "github.com/kuasar-sandbox/sandbox-orchestrator/internal/cluster"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/clusterstore"
+	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/cluster/shardkv"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/routesync"
 )
 
 func TestClusterStoresRouteAndNodeUseLocatedOwners(t *testing.T) {
 	ctx := context.Background()
 	view := clusterstate.MemberView{Version: 1, Members: []string{"a", "b", "c"}}
-	rb, rc := clusterstate.NewMemoryRouteReplica(), clusterstate.NewMemoryRouteReplica()
-	nb, nc := clusterstate.NewMemoryNodeReplica(), clusterstate.NewMemoryNodeReplica()
-	kv := clusterstore.OpenMemory(100)
-	defer kv.Close()
-
-	stores := NewClusterStores(kv, "a", view, 2, 2,
-		map[string]clusterstate.RouteReplica{"b": rb, "c": rc},
-		map[string]clusterstate.NodeReplica{"b": nb, "c": nc})
+	cluster := newShardStoreCluster(t, []string{"a", "b", "c"}, 2, 2, 1, 1)
+	stores := cluster["a"]
 
 	group, routeKey := "/cluster/located/group", "rk"
 	if _, err := stores.PutSandbox(ctx, &SandboxRecord{Group: group, RouteKey: routeKey, SID: "sb", State: StateReady}); err != nil {
@@ -31,9 +25,7 @@ func TestClusterStoresRouteAndNodeUseLocatedOwners(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	assertRouteOwnerKeys(t, ctx, routeOwners, group+"\x00"+routeKey, map[string]clusterstate.RouteReplica{
-		"a": stores.LocalRouteReplica(), "b": rb, "c": rc,
-	})
+	assertShardRecordOwners(t, ctx, cluster, shardkv.Namespace(clusterstate.NamespaceRouteLink), clusterstate.RouteLinkShard(group), clusterstate.RouteSandboxRecordKey(routeKey), routeOwners)
 
 	nodeID := "node-located"
 	if err := stores.PutNode(ctx, &NodeRecord{NodeID: nodeID}); err != nil {
@@ -43,22 +35,184 @@ func TestClusterStoresRouteAndNodeUseLocatedOwners(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	assertNodeOwnerKeys(t, ctx, nodeOwners, nodeID, map[string]clusterstate.NodeReplica{
-		"a": stores.LocalNodeReplica(), "b": nb, "c": nc,
-	})
+	assertShardRecordOwners(t, ctx, cluster, shardkv.Namespace(clusterstate.NamespaceNodeLink), clusterstate.NodeLinkShard(nodeID), clusterstate.NodeLinkProfileRecord, nodeOwners)
+}
+
+func TestStoresBuildShardKVNamespaces(t *testing.T) {
+	view := clusterstate.MemberView{Version: 1, Members: []string{"r1", "r2", "r3"}}
+
+	stores := NewClusterStores("r1", view, 2, 3, 1, 2)
+	stores.SetNodeListTopology([]clusterstate.MemberView{view}, 1)
+	stores.SetScaleLinkTopology([]clusterstate.MemberView{view}, 2)
+
+	shards := stores.ShardStore()
+	if shards == nil {
+		t.Fatal("ShardStore is nil")
+	}
+	cases := []struct {
+		ns    shardkv.Namespace
+		shard shardkv.ShardKey
+		want  int
+	}{
+		{shardkv.Namespace(clusterstate.NamespaceRouteLink), clusterstate.RouteLinkShard("/g"), 2},
+		{shardkv.Namespace(clusterstate.NamespaceNodeLink), clusterstate.NodeLinkShard("n1"), 3},
+		{shardkv.Namespace(clusterstate.NamespaceNodeList), clusterstate.NodeListShard, 1},
+		{shardkv.Namespace(clusterstate.NamespaceScaleLink), clusterstate.ScaleImportSourceShard("source-a"), 2},
+	}
+	for _, tc := range cases {
+		sh, err := shards.Shard(tc.ns, tc.shard)
+		if err != nil {
+			t.Fatalf("Shard(%s,%s): %v", tc.ns, tc.shard, err)
+		}
+		got, err := sh.View(context.Background())
+		if err != nil {
+			t.Fatalf("View(%s,%s): %v", tc.ns, tc.shard, err)
+		}
+		if len(got.Sets) != 1 || len(got.Sets[0].Members) != tc.want {
+			t.Fatalf("View(%s,%s)=%+v, want %d members", tc.ns, tc.shard, got, tc.want)
+		}
+	}
+}
+
+func TestNodeLinkShardRecordsAssembleNodeView(t *testing.T) {
+	ctx := context.Background()
+	stores := NewStores()
+	node := &NodeRecord{
+		NodeID: "n1", Labels: map[string]string{"pool": "p"}, Capacity: 10,
+		DataEndpoint: "10.0.0.1:8443", LastHeartbeatUnix: time.Now().Unix(), LinkOwner: "r1",
+	}
+	if err := stores.putNodeProfileShard(ctx, node); err != nil {
+		t.Fatalf("putNodeProfileShard: %v", err)
+	}
+	if err := stores.addNodeSandboxRefShard(ctx, "n1", clusterstate.NodeSandboxRef{Group: "/g", RouteKey: "rk", SandboxID: "sb"}); err != nil {
+		t.Fatalf("addNodeSandboxRefShard: %v", err)
+	}
+	if err := stores.addNodeBuildRefShard(ctx, "n1", clusterstate.NodeBuildRef{Group: "/g", BuildID: "b1"}); err != nil {
+		t.Fatalf("addNodeBuildRefShard: %v", err)
+	}
+	if err := stores.upsertNodeManifestKeyShard(ctx, "n1", clusterstate.NodeManifestKey{Fingerprint: "fp", Type: clusterstate.SecretInline, Value: "mk", ExpiresUnix: 123}); err != nil {
+		t.Fatalf("upsertNodeManifestKeyShard: %v", err)
+	}
+	got, found, err := stores.getNodeShard(ctx, "n1")
+	if err != nil || !found {
+		t.Fatalf("getNodeShard found=%v err=%v", found, err)
+	}
+	if got.NodeID != "n1" || got.Labels["pool"] != "p" || len(got.Sandboxes) != 1 || len(got.Builds) != 1 || len(got.ManifestKeys) != 1 {
+		t.Fatalf("node view=%+v", got)
+	}
+	if err := stores.dropNodeManifestKeyShard(ctx, "n1", "fp"); err != nil {
+		t.Fatalf("dropNodeManifestKeyShard: %v", err)
+	}
+	got, found, err = stores.getNodeShard(ctx, "n1")
+	if err != nil || !found {
+		t.Fatalf("getNodeShard after drop found=%v err=%v", found, err)
+	}
+	if len(got.ManifestKeys) != 0 {
+		t.Fatalf("manifest keys after tombstone=%+v", got.ManifestKeys)
+	}
+}
+
+func TestRouteLinkShardSeparatesSandboxesAndBuilds(t *testing.T) {
+	ctx := context.Background()
+	stores := NewStores()
+	if _, err := stores.putRouteSandboxShard(ctx, &SandboxRecord{Group: "/g", RouteKey: "rk", SID: "sb", State: StateReady}); err != nil {
+		t.Fatalf("putRouteSandboxShard: %v", err)
+	}
+	if _, err := stores.putRouteBuildShard(ctx, &BuildRecord{Group: "/g", BuildID: "b1", NodeID: "n1", State: BuildRegistered}); err != nil {
+		t.Fatalf("putRouteBuildShard: %v", err)
+	}
+	route, _, found, err := stores.getRouteSandboxShard(ctx, "/g", "rk")
+	if err != nil || !found || route.SID != "sb" {
+		t.Fatalf("getRouteSandboxShard route=%+v found=%v err=%v", route, found, err)
+	}
+	build, _, found, err := stores.getRouteBuildShard(ctx, "/g", "b1")
+	if err != nil || !found || build.BuildID != "b1" {
+		t.Fatalf("getRouteBuildShard build=%+v found=%v err=%v", build, found, err)
+	}
+	var routes []string
+	if err := stores.rangeRouteSandboxesShard(ctx, "/g", func(r *SandboxRecord) error {
+		routes = append(routes, r.RouteKey)
+		return nil
+	}); err != nil {
+		t.Fatalf("rangeRouteSandboxesShard: %v", err)
+	}
+	if len(routes) != 1 || routes[0] != "rk" {
+		t.Fatalf("routes=%v, want [rk]", routes)
+	}
+	var builds []string
+	if err := stores.rangeRouteBuildsShard(ctx, "/g", func(b *BuildRecord) error {
+		builds = append(builds, b.BuildID)
+		return nil
+	}); err != nil {
+		t.Fatalf("rangeRouteBuildsShard: %v", err)
+	}
+	if len(builds) != 1 || builds[0] != "b1" {
+		t.Fatalf("builds=%v, want [b1]", builds)
+	}
+}
+
+func TestNodeListShardFixedShard(t *testing.T) {
+	ctx := context.Background()
+	stores := NewStores()
+	if err := stores.putNodeListEntryShard(ctx, clusterstate.NodeListEntry{NodeID: "n2", Labels: map[string]string{"pool": "p2"}}); err != nil {
+		t.Fatalf("putNodeListEntryShard n2: %v", err)
+	}
+	if err := stores.putNodeListEntryShard(ctx, clusterstate.NodeListEntry{NodeID: "n1", Labels: map[string]string{"pool": "p1"}}); err != nil {
+		t.Fatalf("putNodeListEntryShard n1: %v", err)
+	}
+	var ids []string
+	if err := stores.rangeNodeListShard(ctx, func(entry clusterstate.NodeListEntry) error {
+		ids = append(ids, entry.NodeID)
+		return nil
+	}); err != nil {
+		t.Fatalf("rangeNodeListShard: %v", err)
+	}
+	if len(ids) != 2 || ids[0] != "n1" || ids[1] != "n2" {
+		t.Fatalf("ids=%v, want sorted n1,n2", ids)
+	}
+	if err := stores.deleteNodeListEntryShard(ctx, "n1"); err != nil {
+		t.Fatalf("deleteNodeListEntryShard: %v", err)
+	}
+	ids = nil
+	if err := stores.rangeNodeListShard(ctx, func(entry clusterstate.NodeListEntry) error {
+		ids = append(ids, entry.NodeID)
+		return nil
+	}); err != nil {
+		t.Fatalf("rangeNodeListShard after delete: %v", err)
+	}
+	if len(ids) != 1 || ids[0] != "n2" {
+		t.Fatalf("ids after delete=%v, want n2", ids)
+	}
+}
+
+func TestScaleLinkImportSourceShard(t *testing.T) {
+	ctx := context.Background()
+	stores := NewStores()
+	state, acquired, err := stores.acquireScaleImportSourceShard(ctx, "source-a", "s1", "run-1", "registry.1", time.Minute)
+	if err != nil || !acquired {
+		t.Fatalf("acquire state=%+v acquired=%v err=%v", state, acquired, err)
+	}
+	if state.SourceID != "source-a" || state.OwnerID != "s1" || state.Term == 0 {
+		t.Fatalf("unexpected state=%+v", state)
+	}
+	if ok := stores.checkScaleImportSourceShard(ctx, "source-a", "s1", "run-1", state.Term); !ok {
+		t.Fatal("lease check failed")
+	}
+	held, acquired, err := stores.acquireScaleImportSourceShard(ctx, "source-a", "s2", "run-2", "registry.1", time.Minute)
+	if err != nil || acquired || held.OwnerID != "s1" {
+		t.Fatalf("second acquire held=%+v acquired=%v err=%v", held, acquired, err)
+	}
+	next, err := stores.checkpointScaleImportSourceShard(ctx, "source-a", "s1", "run-1", state.Term, "cursor-1", false, "")
+	if err != nil || next.Cursor != "cursor-1" {
+		t.Fatalf("checkpoint next=%+v err=%v", next, err)
+	}
 }
 
 func TestClusterStoresScaleLinkSourceLeaseUsesLocatedOwners(t *testing.T) {
 	ctx := context.Background()
 	view := clusterstate.MemberView{Version: 1, Members: []string{"a", "b", "c"}}
-	sb, sc := clusterstate.NewMemoryScaleLinkReplica(), clusterstate.NewMemoryScaleLinkReplica()
-	kv := clusterstore.OpenMemory(100)
-	defer kv.Close()
-
-	stores := NewClusterStores(kv, "a", view, 2, 2, nil, nil)
-	stores.SetScaleLinkTopology([]clusterstate.MemberView{view}, 2, map[string]clusterstate.ScaleLinkReplica{
-		"b": sb, "c": sc,
-	})
+	cluster := newShardStoreCluster(t, []string{"a", "b", "c"}, 2, 2, 2, 1)
+	stores := cluster["a"]
 
 	sourceID := "source-a"
 	rec, acquired, err := stores.AcquireScaleLinkSourceLease(ctx, sourceID, "s1", "run-1", "registry.1.test", time.Second)
@@ -69,15 +223,12 @@ func TestClusterStoresScaleLinkSourceLeaseUsesLocatedOwners(t *testing.T) {
 		t.Fatalf("unexpected lease acquired=%v rec=%+v", acquired, rec)
 	}
 
-	recordKey := scaleLinkSourceKey(sourceID)
-	key := clusterstate.ScaleLinkShardKey(recordKey)
-	owners, err := view.Owners(key, 2)
+	shard := clusterstate.ScaleImportSourceShard(sourceID)
+	owners, err := view.Owners(string(shard), 2)
 	if err != nil {
 		t.Fatal(err)
 	}
-	assertScaleLinkOwnerKeys(t, ctx, owners, recordKey, "s1", map[string]clusterstate.ScaleLinkReplica{
-		"a": stores.LocalScaleLinkReplica(), "b": sb, "c": sc,
-	})
+	assertScaleImportShardOwners(t, ctx, cluster, owners, sourceID, "s1")
 
 	held, acquired, err := stores.AcquireScaleLinkSourceLease(ctx, sourceID, "s2", "run-2", "registry.1.test", time.Second)
 	if err != nil {
@@ -90,9 +241,7 @@ func TestClusterStoresScaleLinkSourceLeaseUsesLocatedOwners(t *testing.T) {
 
 func TestClusterStoresScaleLinkSourceCursorUsesLeaseFencing(t *testing.T) {
 	ctx := context.Background()
-	kv := clusterstore.OpenMemory(100)
-	defer kv.Close()
-	stores := NewStores(kv)
+	stores := NewStores()
 
 	rec, acquired, err := stores.AcquireScaleLinkSourceLease(ctx, "source-a", "s1", "run-1", "registry.1.test", time.Second)
 	if err != nil || !acquired {
@@ -117,185 +266,81 @@ func TestClusterStoresScaleLinkSourceCursorUsesLeaseFencing(t *testing.T) {
 	}
 }
 
-func TestClusterStoresScaleLinkAllocationUsesLocatedOwners(t *testing.T) {
-	ctx := context.Background()
-	view := clusterstate.MemberView{Version: 1, Members: []string{"a", "b", "c"}}
-	sb, sc := clusterstate.NewMemoryScaleLinkReplica(), clusterstate.NewMemoryScaleLinkReplica()
-	kv := clusterstore.OpenMemory(100)
-	defer kv.Close()
-
-	stores := NewClusterStores(kv, "a", view, 2, 2, nil, nil)
-	stores.SetScaleLinkTopology([]clusterstate.MemberView{view}, 2, map[string]clusterstate.ScaleLinkReplica{
-		"b": sb, "c": sc,
-	})
-
-	group := "/scale-link/allocation"
-	rec, err := stores.PutScaleLinkAllocation(ctx, &routesync.SelectorPatch{
-		Group: group, NodeIDs: []string{"n1", "n2"}, NodeAllocation: true,
-		KeyFingerprint: "fp", ManifestKeyType: clusterstate.SecretInline, ManifestKey: "mk",
-	}, time.Second)
-	if err != nil {
-		t.Fatalf("PutScaleLinkAllocation: %v", err)
-	}
-	if rec.Kind != clusterstate.ScaleLinkKindAllocation || rec.Group != group || rec.KeyFingerprint != "fp" {
-		t.Fatalf("unexpected allocation record: %+v", rec)
-	}
-
-	recordKey := scaleLinkAllocationKey(group)
-	key := clusterstate.ScaleLinkShardKey(recordKey)
-	owners, err := view.Owners(key, 2)
-	if err != nil {
-		t.Fatal(err)
-	}
-	assertScaleLinkAllocationOwnerKeys(t, ctx, owners, recordKey, group, map[string]clusterstate.ScaleLinkReplica{
-		"a": stores.LocalScaleLinkReplica(), "b": sb, "c": sc,
-	})
-}
-
 func TestClusterStoresJointMembershipWritesBothOwnerSets(t *testing.T) {
 	ctx := context.Background()
 	active := clusterstate.MemberView{Version: 1, Members: []string{"a", "b", "c"}}
 	next := clusterstate.MemberView{Version: 2, Members: []string{"b", "c", "d"}}
-	rb, rc, rd := clusterstate.NewMemoryRouteReplica(), clusterstate.NewMemoryRouteReplica(), clusterstate.NewMemoryRouteReplica()
-	nb, nc, nd := clusterstate.NewMemoryNodeReplica(), clusterstate.NewMemoryNodeReplica(), clusterstate.NewMemoryNodeReplica()
-	kv := clusterstore.OpenMemory(100)
-	defer kv.Close()
-
-	stores := NewClusterStoresWithViews(kv, "a", []clusterstate.MemberView{active, next}, 2, 2,
-		map[string]clusterstate.RouteReplica{"b": rb, "c": rc, "d": rd},
-		map[string]clusterstate.NodeReplica{"b": nb, "c": nc, "d": nd})
+	cluster := newShardStoreClusterWithViews(t, []clusterstate.MemberView{active, next}, 2, 2, 1, 1)
+	stores := cluster["a"]
 
 	group, routeKey := "/cluster/joint/group", "rk"
 	if _, err := stores.PutSandbox(ctx, &SandboxRecord{Group: group, RouteKey: routeKey, SID: "sb", State: StateReady}); err != nil {
 		t.Fatalf("PutSandbox: %v", err)
 	}
-	routeReps := map[string]clusterstate.RouteReplica{"a": stores.LocalRouteReplica(), "b": rb, "c": rc, "d": rd}
 	for _, view := range []clusterstate.MemberView{active, next} {
 		owners, err := view.Owners(group, 2)
 		if err != nil {
 			t.Fatal(err)
 		}
-		assertRouteOwnersHaveKey(t, ctx, owners, group+"\x00"+routeKey, routeReps)
+		assertShardRecordPresent(t, ctx, cluster, shardkv.Namespace(clusterstate.NamespaceRouteLink), clusterstate.RouteLinkShard(group), clusterstate.RouteSandboxRecordKey(routeKey), owners)
 	}
 
 	nodeID := "node-joint"
 	if err := stores.PutNode(ctx, &NodeRecord{NodeID: nodeID}); err != nil {
 		t.Fatalf("PutNode: %v", err)
 	}
-	nodeReps := map[string]clusterstate.NodeReplica{"a": stores.LocalNodeReplica(), "b": nb, "c": nc, "d": nd}
 	for _, view := range []clusterstate.MemberView{active, next} {
 		owners, err := view.Owners(nodeID, 2)
 		if err != nil {
 			t.Fatal(err)
 		}
-		assertNodeOwnersHaveKey(t, ctx, owners, nodeID, nodeReps)
+		assertShardRecordPresent(t, ctx, cluster, shardkv.Namespace(clusterstate.NamespaceNodeLink), clusterstate.NodeLinkShard(nodeID), clusterstate.NodeLinkProfileRecord, owners)
 	}
 }
 
-func assertRouteOwnerKeys(t *testing.T, ctx context.Context, owners []string, key string, reps map[string]clusterstate.RouteReplica) {
+func assertShardRecordPresent(t *testing.T, ctx context.Context, stores map[string]*Stores, ns shardkv.Namespace, shard shardkv.ShardKey, key shardkv.RecordKey, owners []string) {
+	t.Helper()
+	for _, id := range owners {
+		store := stores[id]
+		if store == nil {
+			t.Fatalf("owner %s missing store", id)
+		}
+		has := localShardHasRecord(t, ctx, store, ns, shard, key)
+		if !has {
+			t.Fatalf("owner %s missing %s/%s key %q; owners=%v", id, ns, shard, key, owners)
+		}
+	}
+}
+
+func assertShardRecordOwners(t *testing.T, ctx context.Context, stores map[string]*Stores, ns shardkv.Namespace, shard shardkv.ShardKey, key shardkv.RecordKey, owners []string) {
 	t.Helper()
 	ownerSet := map[string]bool{}
 	for _, owner := range owners {
 		ownerSet[owner] = true
 	}
-	for id, rep := range reps {
-		_, has, err := rep.Read(ctx, key)
-		if err != nil {
-			t.Fatalf("route owner %s read key %q: %v", id, key, err)
-		}
+	for id, store := range stores {
+		has := localShardHasRecord(t, ctx, store, ns, shard, key)
 		if ownerSet[id] && !has {
-			t.Fatalf("route owner %s missing key %q; owners=%v", id, key, owners)
+			t.Fatalf("owner %s missing %s/%s key %q; owners=%v", id, ns, shard, key, owners)
 		}
 		if !ownerSet[id] && has {
-			t.Fatalf("route non-owner %s unexpectedly has key %q; owners=%v", id, key, owners)
+			t.Fatalf("non-owner %s unexpectedly has %s/%s key %q; owners=%v", id, ns, shard, key, owners)
 		}
 	}
 }
 
-func assertRouteOwnersHaveKey(t *testing.T, ctx context.Context, owners []string, key string, reps map[string]clusterstate.RouteReplica) {
+func localShardHasRecord(t *testing.T, ctx context.Context, store *Stores, ns shardkv.Namespace, shard shardkv.ShardKey, key shardkv.RecordKey) bool {
 	t.Helper()
-	for _, owner := range owners {
-		rep := reps[owner]
-		if rep == nil {
-			t.Fatalf("route owner %s missing replica", owner)
-		}
-		if _, found, err := rep.Read(ctx, key); err != nil || !found {
-			t.Fatalf("route owner %s missing key %q; owners=%v", owner, key, owners)
+	resp, err := store.ShardStore().Handle(ctx, shardkv.Request{Op: shardkv.OpSnapshot, Namespace: ns, Shard: shard})
+	if err != nil {
+		t.Fatalf("snapshot %s/%s: %v", ns, shard, err)
+	}
+	for _, rec := range resp.Records {
+		if rec.Key == key && !rec.Deleted {
+			return true
 		}
 	}
-}
-
-func assertNodeOwnerKeys(t *testing.T, ctx context.Context, owners []string, key string, reps map[string]clusterstate.NodeReplica) {
-	t.Helper()
-	ownerSet := map[string]bool{}
-	for _, owner := range owners {
-		ownerSet[owner] = true
-	}
-	for id, rep := range reps {
-		_, has, err := rep.Read(ctx, key)
-		if err != nil {
-			t.Fatalf("node owner %s read key %q: %v", id, key, err)
-		}
-		if ownerSet[id] && !has {
-			t.Fatalf("node owner %s missing key %q; owners=%v", id, key, owners)
-		}
-		if !ownerSet[id] && has {
-			t.Fatalf("node non-owner %s unexpectedly has key %q; owners=%v", id, key, owners)
-		}
-	}
-}
-
-func assertNodeOwnersHaveKey(t *testing.T, ctx context.Context, owners []string, key string, reps map[string]clusterstate.NodeReplica) {
-	t.Helper()
-	for _, owner := range owners {
-		rep := reps[owner]
-		if rep == nil {
-			t.Fatalf("node owner %s missing replica", owner)
-		}
-		if _, found, err := rep.Read(ctx, key); err != nil || !found {
-			t.Fatalf("node owner %s missing key %q; owners=%v", owner, key, owners)
-		}
-	}
-}
-
-func assertScaleLinkOwnerKeys(t *testing.T, ctx context.Context, owners []string, key, ownerID string, reps map[string]clusterstate.ScaleLinkReplica) {
-	t.Helper()
-	ownerSet := map[string]bool{}
-	for _, owner := range owners {
-		ownerSet[owner] = true
-	}
-	for id, rep := range reps {
-		rec, has, err := rep.Read(ctx, key)
-		if err != nil {
-			t.Fatalf("scale_link owner %s read key %q: %v", id, key, err)
-		}
-		if ownerSet[id] && (!has || rec.OwnerID != ownerID) {
-			t.Fatalf("scale_link owner %s missing key %q owner %q; owners=%v rec=%+v", id, key, ownerID, owners, rec)
-		}
-		if !ownerSet[id] && has {
-			t.Fatalf("scale_link non-owner %s unexpectedly has key %q; owners=%v rec=%+v", id, key, owners, rec)
-		}
-	}
-}
-
-func assertScaleLinkAllocationOwnerKeys(t *testing.T, ctx context.Context, owners []string, key, group string, reps map[string]clusterstate.ScaleLinkReplica) {
-	t.Helper()
-	ownerSet := map[string]bool{}
-	for _, owner := range owners {
-		ownerSet[owner] = true
-	}
-	for id, rep := range reps {
-		rec, has, err := rep.Read(ctx, key)
-		if err != nil {
-			t.Fatalf("scale_link owner %s read key %q: %v", id, key, err)
-		}
-		if ownerSet[id] && (!has || rec.Kind != clusterstate.ScaleLinkKindAllocation || rec.Group != group) {
-			t.Fatalf("scale_link owner %s missing allocation key %q group %q; owners=%v rec=%+v", id, key, group, owners, rec)
-		}
-		if !ownerSet[id] && has {
-			t.Fatalf("scale_link non-owner %s unexpectedly has allocation key %q; owners=%v rec=%+v", id, key, owners, rec)
-		}
-	}
+	return false
 }
 
 func TestRoutingNodeOwnerUsesLinkOwner(t *testing.T) {
@@ -364,11 +409,8 @@ func TestNodeListHeartbeatRefreshIsConfigurable(t *testing.T) {
 func TestNodeListReplicatesToLocatedOwnerSet(t *testing.T) {
 	ctx := context.Background()
 	view := clusterstate.MemberView{Version: 1, Members: []string{"a", "b", "c"}}
-	rb, rc := clusterstate.NewMemoryNodeListReplica(), clusterstate.NewMemoryNodeListReplica()
-	kv := clusterstore.OpenMemory(100)
-	defer kv.Close()
-	stores := NewClusterStores(kv, "a", view, 1, 1, nil, nil)
-	stores.SetNodeListTopology([]clusterstate.MemberView{view}, 2, map[string]clusterstate.NodeListReplica{"b": rb, "c": rc})
+	cluster := newShardStoreCluster(t, []string{"a", "b", "c"}, 1, 1, 1, 2)
+	stores := cluster["a"]
 
 	entry := clusterstate.NodeListEntry{NodeID: "n1", Labels: map[string]string{"pool": "p"}, LastHeartbeatUnix: time.Now().Unix()}
 	if err := stores.PutNodeListEntry(ctx, entry); err != nil {
@@ -378,33 +420,12 @@ func TestNodeListReplicatesToLocatedOwnerSet(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	reps := map[string]func() bool{
-		"a": func() bool {
-			_, found, _ := stores.LocalNodeListReplica().Read(ctx, "n1")
-			return found
-		},
-		"b": func() bool { _, found, _ := rb.Read(ctx, "n1"); return found },
-		"c": func() bool { _, found, _ := rc.Read(ctx, "n1"); return found },
-	}
-	ownerSet := map[string]bool{}
-	for _, owner := range owners {
-		ownerSet[owner] = true
-	}
-	for id, has := range reps {
-		if ownerSet[id] && !has() {
-			t.Fatalf("node_list owner %s missing replicated entry; owners=%v", id, owners)
-		}
-		if !ownerSet[id] && has() {
-			t.Fatalf("node_list non-owner %s unexpectedly has replicated entry; owners=%v", id, owners)
-		}
-	}
+	assertShardRecordOwners(t, ctx, cluster, shardkv.Namespace(clusterstate.NamespaceNodeList), clusterstate.NodeListShard, clusterstate.NodeListRecordKey("n1"), owners)
 }
 
 func TestNodeListTombstoneRejectsStaleProjection(t *testing.T) {
 	ctx := context.Background()
-	kv := clusterstore.OpenMemory(100)
-	defer kv.Close()
-	stores := NewClusterStores(kv, "a", clusterstate.MemberView{Version: 1, Members: []string{"a"}}, 1, 1, nil, nil)
+	stores := NewClusterStores("a", clusterstate.MemberView{Version: 1, Members: []string{"a"}}, 1, 1, 1, 1)
 
 	if err := stores.PutNodeListEntry(ctx, clusterstate.NodeListEntry{
 		NodeID: "n1", LastHeartbeatUnix: 100, Labels: map[string]string{"gen": "new"},
@@ -433,45 +454,59 @@ func TestNodeListTombstoneRejectsStaleProjection(t *testing.T) {
 
 func TestNodeListDuplicateProjectionDoesNotAdvanceRev(t *testing.T) {
 	ctx := context.Background()
-	kv := clusterstore.OpenMemory(100)
-	defer kv.Close()
-	stores := NewClusterStores(kv, "a", clusterstate.MemberView{Version: 1, Members: []string{"a"}}, 1, 1, nil, nil)
+	stores := NewClusterStores("a", clusterstate.MemberView{Version: 1, Members: []string{"a"}}, 1, 1, 1, 1)
 	entry := clusterstate.NodeListEntry{NodeID: "n1", LastHeartbeatUnix: 100, Labels: map[string]string{"pool": "p"}}
 
 	if err := stores.PutNodeListEntry(ctx, entry); err != nil {
 		t.Fatalf("PutNodeListEntry first: %v", err)
 	}
-	first, found, err := stores.LocalNodeListReplica().Read(ctx, "n1")
-	if err != nil || !found {
-		t.Fatalf("first read found=%v err=%v", found, err)
+	first, err := stores.NodeListRev(ctx)
+	if err != nil {
+		t.Fatalf("first rev: %v", err)
 	}
 	if err := stores.PutNodeListEntry(ctx, entry); err != nil {
 		t.Fatalf("PutNodeListEntry duplicate: %v", err)
 	}
-	second, found, err := stores.LocalNodeListReplica().Read(ctx, "n1")
-	if err != nil || !found {
-		t.Fatalf("second read found=%v err=%v", found, err)
+	second, err := stores.NodeListRev(ctx)
+	if err != nil {
+		t.Fatalf("second rev: %v", err)
 	}
-	if second.Meta.Rev != first.Meta.Rev {
-		t.Fatalf("duplicate projection advanced node_list rev: %d -> %d", first.Meta.Rev, second.Meta.Rev)
+	if second != first {
+		t.Fatalf("duplicate projection advanced node_list rev: %d -> %d", first, second)
 	}
 }
 
 func TestNodeListRangeRepairsLocalFromOwnerSet(t *testing.T) {
 	ctx := context.Background()
-	view := clusterstate.MemberView{Version: 1, Members: []string{"a", "b"}}
-	rb := clusterstate.NewMemoryNodeListReplica()
+	cluster := newShardStoreCluster(t, []string{"a", "b"}, 1, 1, 1, 2)
+	stores := cluster["a"]
 	seed := clusterstate.NodeListEntry{
 		Meta:   clusterstate.RecordMeta{Ballot: clusterstate.Ballot{Round: 5, Writer: "b"}, Rev: 3, UpdatedAt: time.Now()},
 		NodeID: "n-remote", Labels: map[string]string{"pool": "p"}, LastHeartbeatUnix: time.Now().Unix(),
 	}
-	if ok, err := rb.Accept(ctx, seed.NodeID, seed, seed.Meta.Ballot); err != nil || !ok {
-		t.Fatalf("seed remote node_list ok=%v err=%v", ok, err)
+	value, err := clusterstate.EncodeShardValue(seed)
+	if err != nil {
+		t.Fatal(err)
 	}
-	kv := clusterstore.OpenMemory(100)
-	defer kv.Close()
-	stores := NewClusterStores(kv, "a", view, 1, 1, nil, nil)
-	stores.SetNodeListTopology([]clusterstate.MemberView{view}, 2, map[string]clusterstate.NodeListReplica{"b": rb})
+	_, err = cluster["b"].ShardStore().Handle(ctx, shardkv.Request{
+		Op:        shardkv.OpRepair,
+		Namespace: shardkv.Namespace(clusterstate.NamespaceNodeList),
+		Shard:     clusterstate.NodeListShard,
+		Record: shardkv.Record{
+			Namespace: shardkv.Namespace(clusterstate.NamespaceNodeList),
+			Shard:     clusterstate.NodeListShard,
+			Key:       clusterstate.NodeListRecordKey(seed.NodeID),
+			Value:     value,
+			Meta: shardkv.RecordMeta{
+				Ballot:    shardkv.Ballot{Round: 5, Writer: shardkv.MemberID("b")},
+				Rev:       3,
+				UpdatedAt: time.Now(),
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("seed remote node_list: %v", err)
+	}
 
 	var got []clusterstate.NodeListEntry
 	if err := stores.RangeNodeList(ctx, func(entry clusterstate.NodeListEntry) error {
@@ -483,8 +518,78 @@ func TestNodeListRangeRepairsLocalFromOwnerSet(t *testing.T) {
 	if len(got) != 1 || got[0].NodeID != seed.NodeID {
 		t.Fatalf("unexpected range result: %+v", got)
 	}
-	if _, found, err := stores.LocalNodeListReplica().Read(ctx, seed.NodeID); err != nil || !found {
-		t.Fatalf("local repair found=%v err=%v", found, err)
+	if !localShardHasRecord(t, ctx, stores, shardkv.Namespace(clusterstate.NamespaceNodeList), clusterstate.NodeListShard, clusterstate.NodeListRecordKey(seed.NodeID)) {
+		t.Fatalf("local repair did not materialize node_list record")
+	}
+}
+
+func newShardStoreCluster(t *testing.T, members []string, routeOwners, nodeOwners, scaleOwners, nodeListOwners int) map[string]*Stores {
+	t.Helper()
+	view := clusterstate.MemberView{Version: 1, Members: members}
+	return newShardStoreClusterWithViews(t, []clusterstate.MemberView{view}, routeOwners, nodeOwners, scaleOwners, nodeListOwners)
+}
+
+func newShardStoreClusterWithViews(t *testing.T, views []clusterstate.MemberView, routeOwners, nodeOwners, scaleOwners, nodeListOwners int) map[string]*Stores {
+	t.Helper()
+	if len(views) == 0 {
+		t.Fatal("views are required")
+	}
+	memberSet := map[string]bool{}
+	var members []string
+	for _, view := range views {
+		for _, member := range view.Members {
+			if member == "" || memberSet[member] {
+				continue
+			}
+			memberSet[member] = true
+			members = append(members, member)
+		}
+	}
+	out := map[string]*Stores{}
+	for _, id := range members {
+		stores := NewClusterStoresWithViews(id, views, routeOwners, nodeOwners, nodeListOwners, scaleOwners)
+		stores.SetScaleLinkTopology(views, scaleOwners)
+		stores.SetNodeListTopology(views, nodeListOwners)
+		out[id] = stores
+	}
+	transport := shardkv.TransportFunc(func(ctx context.Context, member shardkv.MemberID, req shardkv.Request) (shardkv.Response, error) {
+		store := out[string(member)]
+		if store == nil || store.ShardStore() == nil {
+			return shardkv.Response{}, shardkv.ErrReplicaUnavailable
+		}
+		return store.ShardStore().Handle(ctx, req)
+	})
+	for _, stores := range out {
+		stores.SetShardTransport(transport, nil)
+	}
+	return out
+}
+
+func assertScaleImportShardOwners(t *testing.T, ctx context.Context, stores map[string]*Stores, owners []string, sourceID, ownerID string) {
+	t.Helper()
+	ownerSet := map[string]bool{}
+	for _, owner := range owners {
+		ownerSet[owner] = true
+	}
+	for id, store := range stores {
+		if !ownerSet[id] {
+			continue
+		}
+		sh, err := store.ShardStore().Shard(shardkv.Namespace(clusterstate.NamespaceScaleLink), clusterstate.ScaleImportSourceShard(sourceID))
+		if err != nil {
+			t.Fatalf("shard %s: %v", id, err)
+		}
+		rec, found, err := sh.Get(ctx, clusterstate.ScaleLinkStateRecord)
+		if err != nil || !found {
+			t.Fatalf("owner %s read found=%v err=%v", id, found, err)
+		}
+		state, err := clusterstate.DecodeShardValue[clusterstate.ScaleImportSourceState](rec.Value)
+		if err != nil {
+			t.Fatalf("owner %s decode: %v", id, err)
+		}
+		if state.SourceID != sourceID || state.OwnerID != ownerID {
+			t.Fatalf("owner %s state=%+v", id, state)
+		}
 	}
 }
 

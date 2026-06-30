@@ -20,15 +20,13 @@ import (
 	"golang.org/x/net/http2/h2c"
 
 	clusterstate "github.com/kuasar-sandbox/sandbox-orchestrator/internal/cluster"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/clusterstore"
+	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/cluster/shardkv"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/routesync"
 )
 
 func testRegWithBox(t *testing.T) *Registry {
 	t.Helper()
-	kv := clusterstore.OpenMemory(0)
-	t.Cleanup(func() { kv.Close() })
-	return New(NewStores(kv), nil, 5*time.Second, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	return New(NewStores(), nil, 5*time.Second, slog.New(slog.NewTextHandler(io.Discard, nil)))
 }
 
 const testMK = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
@@ -57,18 +55,19 @@ func placementWithToken(nodeID string) Placer {
 	})
 }
 
-func TestKeyPredistribution(t *testing.T) {
+func TestSelectorPatchRefreshesNodeLinkKeyCache(t *testing.T) {
 	ctx := context.Background()
 	reg := testRegWithBox(t)
 	reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1", Labels: map[string]string{"zone": "east"}})
 	var cmds []*routesync.Command
 	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(c *routesync.Command) { cmds = append(cmds, c) }})
 
-	pushKeyAllocation(reg, "/g", []string{"n1"}, testMK)
-	reg.reconcileKeys(ctx)
+	if err := pushSelectorPatch(reg, "/g", []string{"n1"}, testMK); err != nil {
+		t.Fatalf("push selector patch: %v", err)
+	}
 
 	if len(cmds) != 0 {
-		t.Fatalf("reconcileKeys should only update node_link cache, got commands %+v", cmds)
+		t.Fatalf("selector patch should only update node_link cache, got commands %+v", cmds)
 	}
 	reg.updateHeartbeat(ctx, "n1", &routesync.Heartbeat{})
 	if len(cmds) != 1 || cmds[0].Kind != routesync.CmdKeyPut || cmds[0].ManifestKey != testMK {
@@ -127,7 +126,7 @@ func TestHeartbeatRenewsManifestKeyBeforeLeaseExpiry(t *testing.T) {
 	}
 }
 
-func TestKeyDistributionRetriesFailedManifestKeyCacheWrite(t *testing.T) {
+func TestSelectorPatchRetriesFailedManifestKeyCacheWrite(t *testing.T) {
 	ctx := context.Background()
 	reg := testRegWithBox(t)
 	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1", Labels: map[string]string{"zone": "east"}}); err != nil {
@@ -135,11 +134,12 @@ func TestKeyDistributionRetriesFailedManifestKeyCacheWrite(t *testing.T) {
 	}
 	owner := &flakyManifestKeyOwner{remoteLifecycleOwner: remoteLifecycleOwner{reg: reg}}
 	reg.SetNodeOwner(owner)
-	pushKeyAllocation(reg, "/g", []string{"n1"}, testMK)
 
-	reg.reconcileKeys(ctx)
+	if err := pushSelectorPatch(reg, "/g", []string{"n1"}, testMK); err == nil {
+		t.Fatal("first selector patch should fail when node_link cache write fails")
+	}
 	if owner.putCalls != 1 {
-		t.Fatalf("first reconcile put calls=%d, want 1", owner.putCalls)
+		t.Fatalf("first patch put calls=%d, want 1", owner.putCalls)
 	}
 	node, found, err := reg.stores.GetNode(ctx, "n1")
 	if err != nil || !found {
@@ -149,9 +149,11 @@ func TestKeyDistributionRetriesFailedManifestKeyCacheWrite(t *testing.T) {
 		t.Fatalf("failed key cache write was persisted: %+v", node.ManifestKeys)
 	}
 
-	reg.reconcileKeys(ctx)
+	if err := pushSelectorPatch(reg, "/g", []string{"n1"}, testMK); err != nil {
+		t.Fatalf("second selector patch should retry successfully: %v", err)
+	}
 	if owner.putCalls != 2 {
-		t.Fatalf("second reconcile put calls=%d, want retry after failed cache write", owner.putCalls)
+		t.Fatalf("second patch put calls=%d, want retry after failed cache write", owner.putCalls)
 	}
 	node, found, err = reg.stores.GetNode(ctx, "n1")
 	if err != nil || !found || len(node.ManifestKeys) != 1 {
@@ -166,26 +168,28 @@ func TestKeyDropOnLeave(t *testing.T) {
 	var cmds []*routesync.Command
 	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(c *routesync.Command) { cmds = append(cmds, c) }})
 
-	pushKeyAllocation(reg, "/g", []string{"n1"}, testMK)
-	reg.reconcileKeys(ctx)
+	if err := pushSelectorPatch(reg, "/g", []string{"n1"}, testMK); err != nil {
+		t.Fatalf("push selector patch: %v", err)
+	}
 	reg.updateHeartbeat(ctx, "n1", &routesync.Heartbeat{})
-	pushKeyAllocation(reg, "/g", nil, "")
+	if err := pushSelectorPatch(reg, "/g", nil, ""); err != nil {
+		t.Fatalf("empty selector patch: %v", err)
+	}
 	cmds = nil
-	reg.reconcileKeys(ctx)
 
 	if len(cmds) != 0 {
-		t.Fatalf("drop should only update node_link cache; node TTL handles expiry, got %+v", cmds)
+		t.Fatalf("empty patch should not push key_drop; node TTL handles expiry, got %+v", cmds)
 	}
 	node, found, err := reg.stores.GetNode(ctx, "n1")
 	if err != nil || !found {
 		t.Fatalf("node found=%v err=%v", found, err)
 	}
-	if len(node.ManifestKeys) != 0 {
-		t.Fatalf("node_link key cache not cleared after allocation removal: %+v", node.ManifestKeys)
+	if len(node.ManifestKeys) != 1 {
+		t.Fatalf("node_link key cache should remain until TTL expiry: %+v", node.ManifestKeys)
 	}
 }
 
-func TestKeyDistributionUsesScalerAllocation(t *testing.T) {
+func TestSelectorPatchWritesOnlySelectedNodeKeyCache(t *testing.T) {
 	ctx := context.Background()
 	reg := testRegWithBox(t)
 	reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1", Labels: map[string]string{"zone": "east"}})
@@ -194,14 +198,15 @@ func TestKeyDistributionUsesScalerAllocation(t *testing.T) {
 	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(c *routesync.Command) { cmds["n1"] = append(cmds["n1"], c) }})
 	reg.addNode(&fakeConn{nodeID: "n2", onCmd: func(c *routesync.Command) { cmds["n2"] = append(cmds["n2"], c) }})
 
-	pushKeyAllocation(reg, "/g", []string{"n2"}, testMK)
-	reg.reconcileKeys(ctx)
+	if err := pushSelectorPatch(reg, "/g", []string{"n2"}, testMK); err != nil {
+		t.Fatalf("push selector patch: %v", err)
+	}
 
 	if len(cmds["n1"]) != 0 {
-		t.Fatalf("selector-matching n1 got commands despite scaler allocation to n2: %+v", cmds["n1"])
+		t.Fatalf("selector-matching n1 got commands despite selector patch targeting n2: %+v", cmds["n1"])
 	}
 	if len(cmds["n2"]) != 0 {
-		t.Fatalf("reconcileKeys should not push n2 commands immediately: %+v", cmds["n2"])
+		t.Fatalf("selector patch should not push n2 commands immediately: %+v", cmds["n2"])
 	}
 	n2, found, err := reg.stores.GetNode(ctx, "n2")
 	if err != nil || !found || len(n2.ManifestKeys) != 1 {
@@ -209,54 +214,58 @@ func TestKeyDistributionUsesScalerAllocation(t *testing.T) {
 	}
 
 	cmds = map[string][]*routesync.Command{}
-	pushKeyAllocation(reg, "/g", nil, "")
-	reg.reconcileKeys(ctx)
+	if err := pushSelectorPatch(reg, "/g", nil, ""); err != nil {
+		t.Fatalf("empty selector patch: %v", err)
+	}
 	if len(cmds["n2"]) != 0 {
-		t.Fatalf("empty scaler allocation should not push key_drop, commands=%+v", cmds["n2"])
+		t.Fatalf("empty selector patch should not push key_drop, commands=%+v", cmds["n2"])
 	}
 	n2, _, _ = reg.stores.GetNode(ctx, "n2")
-	if len(n2.ManifestKeys) != 0 {
-		t.Fatalf("empty scaler allocation should clear n2 cache: %+v", n2.ManifestKeys)
+	if len(n2.ManifestKeys) != 1 {
+		t.Fatalf("empty selector patch should leave n2 cache until TTL expiry: %+v", n2.ManifestKeys)
 	}
 }
 
-func TestKeyDistributionDropsRemovedAllocationAndRotatedKey(t *testing.T) {
+func TestSelectorPatchDoesNotDropRemovedTargetAndRotatesKey(t *testing.T) {
 	ctx := context.Background()
 	reg := testRegWithBox(t)
 	reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"})
 	var cmds []*routesync.Command
 	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(c *routesync.Command) { cmds = append(cmds, c) }})
 
-	pushKeyAllocation(reg, "/g", []string{"n1"}, testMK)
-	reg.reconcileKeys(ctx)
+	if err := pushSelectorPatch(reg, "/g", []string{"n1"}, testMK); err != nil {
+		t.Fatalf("push selector patch: %v", err)
+	}
 	if len(cmds) != 0 {
-		t.Fatalf("initial reconcile commands=%+v, want none", cmds)
+		t.Fatalf("initial patch commands=%+v, want none", cmds)
 	}
 
 	cmds = nil
-	pushKeyAllocation(reg, "/g", []string{"n1"}, testAuthKey)
-	reg.reconcileKeys(ctx)
+	if err := pushSelectorPatch(reg, "/g", []string{"n1"}, testAuthKey); err != nil {
+		t.Fatalf("rotate selector patch key: %v", err)
+	}
 	if len(cmds) != 0 {
-		t.Fatalf("rotated key reconcile commands=%+v, want none", cmds)
+		t.Fatalf("rotated key patch commands=%+v, want none", cmds)
 	}
 	node, _, _ := reg.stores.GetNode(ctx, "n1")
-	if len(node.ManifestKeys) != 1 || node.ManifestKeys[0].Fingerprint != keyFingerprint(testAuthKey) {
-		t.Fatalf("rotated key cache=%+v, want new key only", node.ManifestKeys)
+	if len(node.ManifestKeys) != 2 {
+		t.Fatalf("rotated key cache=%+v, want old and new keys until TTL expiry", node.ManifestKeys)
 	}
 
 	cmds = nil
-	pushKeyAllocation(reg, "/g", nil, "")
-	reg.reconcileKeys(ctx)
+	if err := pushSelectorPatch(reg, "/g", nil, ""); err != nil {
+		t.Fatalf("empty selector patch: %v", err)
+	}
 	if len(cmds) != 0 {
-		t.Fatalf("removed allocation commands=%+v, want none", cmds)
+		t.Fatalf("removed selector patch target commands=%+v, want none", cmds)
 	}
 	node, _, _ = reg.stores.GetNode(ctx, "n1")
-	if len(node.ManifestKeys) != 0 {
-		t.Fatalf("removed allocation cache=%+v, want empty", node.ManifestKeys)
+	if len(node.ManifestKeys) != 2 {
+		t.Fatalf("removed selector patch target cache=%+v, want unchanged until TTL expiry", node.ManifestKeys)
 	}
 }
 
-func TestKeyDistributionCachesKeysInNodeLink(t *testing.T) {
+func TestSelectorPatchCachesKeysInNodeLink(t *testing.T) {
 	ctx := context.Background()
 	reg := testRegWithBox(t)
 	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"}); err != nil {
@@ -264,8 +273,9 @@ func TestKeyDistributionCachesKeysInNodeLink(t *testing.T) {
 	}
 	reg.addNode(&fakeConn{nodeID: "n1"})
 
-	pushKeyAllocation(reg, "/g", []string{"n1"}, testMK)
-	reg.reconcileKeys(ctx)
+	if err := pushSelectorPatch(reg, "/g", []string{"n1"}, testMK); err != nil {
+		t.Fatalf("push selector patch: %v", err)
+	}
 
 	node, found, err := reg.stores.GetNode(ctx, "n1")
 	if err != nil || !found {
@@ -288,30 +298,33 @@ func TestKeyDistributionCachesKeysInNodeLink(t *testing.T) {
 	}
 }
 
-func TestKeyAllocationTTLExpiresNodeLinkCache(t *testing.T) {
+func TestManifestKeyTTLExpiresNodeLinkCache(t *testing.T) {
 	ctx := context.Background()
 	reg := testRegWithBox(t)
-	reg.SetKeyAllocationTTL(20 * time.Millisecond)
 	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"}); err != nil {
 		t.Fatal(err)
 	}
 	reg.addNode(&fakeConn{nodeID: "n1"})
 
-	pushKeyAllocation(reg, "/g", []string{"n1"}, testMK)
-	reg.reconcileKeys(ctx)
+	if err := reg.stores.UpsertNodeManifestKey(ctx, "n1", clusterstate.NodeManifestKey{
+		Fingerprint: keyFingerprint(testMK), Type: clusterstate.SecretInline, Value: testMK, ExpiresUnix: time.Now().Unix() - 1,
+	}); err != nil {
+		t.Fatalf("upsert expired key: %v", err)
+	}
 	node, found, err := reg.stores.GetNode(ctx, "n1")
 	if err != nil || !found || len(node.ManifestKeys) != 1 {
 		t.Fatalf("initial key cache=%+v found=%v err=%v", node, found, err)
 	}
 
-	time.Sleep(25 * time.Millisecond)
-	reg.reconcileKeys(ctx)
+	if err := reg.stores.PruneExpiredNodeManifestKeys(ctx, "n1", time.Now().Unix()); err != nil {
+		t.Fatalf("prune expired keys: %v", err)
+	}
 	node, found, err = reg.stores.GetNode(ctx, "n1")
 	if err != nil || !found {
 		t.Fatalf("node found=%v err=%v", found, err)
 	}
 	if len(node.ManifestKeys) != 0 {
-		t.Fatalf("expired allocation kept node_link key cache: %+v", node.ManifestKeys)
+		t.Fatalf("expired manifest key kept node_link key cache: %+v", node.ManifestKeys)
 	}
 }
 
@@ -329,48 +342,47 @@ func TestSelectorPatchRequiresCurrentImportSourceLease(t *testing.T) {
 		t.Fatalf("lease term was not assigned: %+v", lease)
 	}
 	stale := &routesync.SelectorPatch{
-		Group: "/g", NodeIDs: []string{"n1"}, NodeAllocation: true,
+		Group: "/g", NodeIDs: []string{"n1"},
 		KeyFingerprint: "stale", ManifestKeyType: clusterstate.SecretInline, ManifestKey: "mk-stale",
 		ImportSourceID: "source-a", ImportOwnerID: "s2", ImportRunID: "run-2", ImportTerm: lease.Term,
 	}
 	if err := reg.applySelectorPatch(ctx, stale); !errors.Is(err, errStaleImportSourceLease) {
 		t.Fatalf("stale source owner patch err=%v, want errStaleImportSourceLease", err)
 	}
-	if got := reg.keyAllocations(); len(got) != 0 {
-		t.Fatalf("stale patch changed allocations: %+v", got)
+	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"}); err != nil {
+		t.Fatal(err)
+	}
+	if node, found, err := reg.stores.GetNode(ctx, "n1"); err != nil || !found || len(node.ManifestKeys) != 0 {
+		t.Fatalf("stale patch changed node_link key cache: node=%+v found=%v err=%v", node, found, err)
 	}
 	good := &routesync.SelectorPatch{
-		Group: "/g", NodeIDs: []string{"n1"}, NodeAllocation: true,
+		Group: "/g", NodeIDs: []string{"n1"},
 		KeyFingerprint: "fresh", ManifestKeyType: clusterstate.SecretInline, ManifestKey: "mk-fresh",
 		ImportSourceID: "source-a", ImportOwnerID: lease.OwnerID, ImportRunID: lease.RunID, ImportTerm: lease.Term,
 	}
 	if err := reg.applySelectorPatch(ctx, good); err != nil {
 		t.Fatalf("current source owner patch was rejected: %v", err)
 	}
-	got := reg.keyAllocations()
-	if got["/g"].fp != "fresh" || got["/g"].keyValue != "mk-fresh" {
-		t.Fatalf("current patch not applied: %+v", got)
+	node, found, err := reg.stores.GetNode(ctx, "n1")
+	if err != nil || !found || len(node.ManifestKeys) != 1 || node.ManifestKeys[0].Fingerprint != "fresh" || node.ManifestKeys[0].Value != "mk-fresh" {
+		t.Fatalf("current patch not applied to node_link: node=%+v found=%v err=%v", node, found, err)
 	}
 }
 
 func testReg(t *testing.T) *Registry {
 	t.Helper()
-	kv := clusterstore.OpenMemory(0)
-	t.Cleanup(func() { kv.Close() })
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	return New(NewStores(kv), nil, 5*time.Second, log)
+	return New(NewStores(), nil, 5*time.Second, log)
 }
 
-func pushKeyAllocation(reg *Registry, group string, nodes []string, manifestKey string) {
-	patch := &routesync.SelectorPatch{Group: group, NodeIDs: nodes, NodeAllocation: true}
+func pushSelectorPatch(reg *Registry, group string, nodes []string, manifestKey string) error {
+	patch := &routesync.SelectorPatch{Group: group, NodeIDs: nodes}
 	if manifestKey != "" {
 		patch.KeyFingerprint = keyFingerprint(manifestKey)
 		patch.ManifestKeyType = clusterstate.SecretInline
 		patch.ManifestKey = manifestKey
 	}
-	if err := reg.applySelectorPatch(context.Background(), patch); err != nil {
-		panic(err)
-	}
+	return reg.applySelectorPatch(context.Background(), patch)
 }
 
 // fakeConn implements nodeConn; its onCmd hook lets a test simulate the node
@@ -688,9 +700,7 @@ func TestReserveSandboxCreateUsesPlacementMaterial(t *testing.T) {
 
 func TestReserveSandboxCreateUsesRemoteNodeOwner(t *testing.T) {
 	ctx := context.Background()
-	kv := clusterstore.OpenMemory(0)
-	defer kv.Close()
-	reg := New(NewStores(kv), placementWithToken("n-remote"), time.Second, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	reg := New(NewStores(), placementWithToken("n-remote"), time.Second, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n-remote", LinkOwner: "remote", DataEndpoint: "10.0.0.2:8443"}); err != nil {
 		t.Fatal(err)
 	}
@@ -708,9 +718,7 @@ func TestReserveSandboxCreateUsesRemoteNodeOwner(t *testing.T) {
 
 func TestReserveSandboxReadyRouteUsesRemoteNodeOwnerRuntime(t *testing.T) {
 	ctx := context.Background()
-	kv := clusterstore.OpenMemory(0)
-	defer kv.Close()
-	reg := New(NewStores(kv), placementFunc(func(context.Context, PlaceRequest) (*Placement, error) {
+	reg := New(NewStores(), placementFunc(func(context.Context, PlaceRequest) (*Placement, error) {
 		t.Fatal("ready route should not call placer")
 		return nil, nil
 	}), time.Second, slog.New(slog.NewTextHandler(io.Discard, nil)))
@@ -825,9 +833,7 @@ func TestOrphanRouteReportDeletesSandboxOnNode(t *testing.T) {
 
 func TestParkTimeoutRollback(t *testing.T) {
 	ctx := context.Background()
-	kv := clusterstore.OpenMemory(0)
-	defer kv.Close()
-	reg := New(NewStores(kv), nil, 200*time.Millisecond, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	reg := New(NewStores(), nil, 200*time.Millisecond, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	reg.SetPlacer(placementWithToken("n1"))
 	reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"})
 	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(cmd *routesync.Command) {
@@ -1035,7 +1041,7 @@ func TestNodeListWatchIgnoresHeartbeatWatermarks(t *testing.T) {
 	reg.updateHeartbeat(ctx, "n1", &routesync.Heartbeat{Allocated: 100, Pool: 200, Counts: 5, Draining: true})
 	select {
 	case ev := <-ch:
-		if ev.Type != clusterstore.EventPut || ev.Key != "n1" {
+		if ev.Type != WatchEventPut || ev.Key != "n1" {
 			t.Fatalf("draining update event=%+v", ev)
 		}
 		var raw map[string]any
@@ -1162,30 +1168,14 @@ func TestSandboxKeyNoCollision(t *testing.T) {
 
 func TestRangeSandboxesWarmsGroupViewAndPublishesRouteWatch(t *testing.T) {
 	ctx := context.Background()
-	kv := clusterstore.OpenMemory(0)
-	defer kv.Close()
-	remote := clusterstate.NewMemoryRouteReplica()
-	view := clusterstate.MemberView{Version: 1, Members: []string{"r1", "r2"}}
-	stores := NewClusterStores(kv, "r1", view, 2, 1, map[string]clusterstate.RouteReplica{"r2": remote}, nil)
+	cluster := newShardStoreCluster(t, []string{"r1", "r2"}, 2, 1, 1, 1)
+	stores := cluster["r1"]
+	seed := &SandboxRecord{Group: "/g", RouteKey: "rk", SID: "sb-warm", State: StateReady, NodeID: "n1"}
+	seedRouteShardRecord(t, ctx, cluster["r2"], seed, shardkv.Ballot{Round: 7, Writer: shardkv.MemberID("r2")}, 1)
 
-	rev, err := stores.RouteGroupRev(ctx, "/g")
+	ch, err := stores.WatchRouteGroup(ctx, "/g", 0)
 	if err != nil {
 		t.Fatal(err)
-	}
-	ch, err := stores.WatchRouteGroup(ctx, "/g", rev)
-	if err != nil {
-		t.Fatal(err)
-	}
-	seed := clusterstate.RouteRecord{
-		Meta:      clusterstate.RecordMeta{Ballot: clusterstate.Ballot{Round: 7, Writer: "remote"}, Rev: 1, UpdatedAt: time.Now()},
-		Group:     "/g",
-		RouteKey:  "rk",
-		SandboxID: "sb-warm",
-		State:     clusterstate.RouteReady,
-		NodeID:    "n1",
-	}
-	if ok, err := remote.Accept(ctx, clusterstate.RouteKey("/g", "rk"), seed, seed.Meta.Ballot); err != nil || !ok {
-		t.Fatalf("seed remote route ok=%v err=%v", ok, err)
 	}
 
 	var got []string
@@ -1200,7 +1190,7 @@ func TestRangeSandboxesWarmsGroupViewAndPublishesRouteWatch(t *testing.T) {
 	}
 	select {
 	case ev := <-ch:
-		if ev.Type != clusterstore.EventPut || ev.Key != "rk" {
+		if ev.Type != WatchEventPut || ev.Key != "rk" {
 			t.Fatalf("route watch event=%+v", ev)
 		}
 	case <-time.After(time.Second):
@@ -1241,24 +1231,14 @@ func TestNodeFullSnapshotDeletesMissingSandboxRefs(t *testing.T) {
 
 func TestStoresRouteLinkUsesQuorumRepair(t *testing.T) {
 	ctx := context.Background()
-	kv := clusterstore.OpenMemory(0)
-	defer kv.Close()
-	r2, r3 := clusterstate.NewMemoryRouteReplica(), clusterstate.NewMemoryRouteReplica()
-	view := clusterstate.MemberView{Version: 1, Members: []string{"r1", "r2", "r3"}}
-	stores := NewClusterStores(kv, "r1", view, 3, 1,
-		map[string]clusterstate.RouteReplica{"r2": r2, "r3": r3}, nil)
+	cluster := newShardStoreCluster(t, []string{"r1", "r2", "r3"}, 3, 1, 1, 1)
+	stores := cluster["r1"]
 	reg := New(stores, nil, 5*time.Second, slog.New(slog.NewTextHandler(io.Discard, nil)))
 
-	seed := clusterstate.RouteRecord{
-		Meta:      clusterstate.RecordMeta{Ballot: clusterstate.Ballot{Round: 7, Writer: "seed"}, Rev: 3, UpdatedAt: time.Now()},
-		Group:     "/g",
-		RouteKey:  "rk",
-		SandboxID: "sb-q",
-		State:     clusterstate.RouteReady,
-		NodeID:    "n1",
-	}
-	if ok, err := stores.LocalRouteReplica().Accept(ctx, clusterstate.RouteKey("/g", "rk"), seed, seed.Meta.Ballot); err != nil || !ok {
-		t.Fatalf("seed route accept ok=%v err=%v", ok, err)
+	seed := &SandboxRecord{Group: "/g", RouteKey: "rk", SID: "sb-q", State: StateReady, NodeID: "n1"}
+	seedRouteShardRecord(t, ctx, cluster["r1"], seed, shardkv.Ballot{Round: 7, Writer: shardkv.MemberID("seed")}, 3)
+	if !localShardHasRecord(t, ctx, cluster["r1"], shardkv.Namespace(clusterstate.NamespaceRouteLink), clusterstate.RouteLinkShard("/g"), clusterstate.RouteSandboxRecordKey("rk")) {
+		t.Fatal("seed route did not land on local shard")
 	}
 
 	got, rev, found, err := reg.stores.GetSandbox(ctx, "/g", "rk")
@@ -1268,30 +1248,21 @@ func TestStoresRouteLinkUsesQuorumRepair(t *testing.T) {
 	if got.SID != "sb-q" || got.State != StateReady || rev == 0 {
 		t.Fatalf("route from quorum = %+v rev=%d", got, rev)
 	}
-	if repaired, found, err := r2.Read(ctx, clusterstate.RouteKey("/g", "rk")); err != nil || !found || repaired.SandboxID != "sb-q" {
-		t.Fatalf("lagging route replica not repaired: %+v found=%v err=%v", repaired, found, err)
+	if !localShardHasRecord(t, ctx, cluster["r2"], shardkv.Namespace(clusterstate.NamespaceRouteLink), clusterstate.RouteLinkShard("/g"), clusterstate.RouteSandboxRecordKey("rk")) {
+		t.Fatalf("lagging route owner was not repaired")
 	}
 }
 
 func TestStoresNodeLinkUsesQuorumRepair(t *testing.T) {
 	ctx := context.Background()
-	kv := clusterstore.OpenMemory(0)
-	defer kv.Close()
-	n2, n3 := clusterstate.NewMemoryNodeReplica(), clusterstate.NewMemoryNodeReplica()
-	view := clusterstate.MemberView{Version: 1, Members: []string{"n1", "n2", "n3"}}
-	stores := NewClusterStores(kv, "n1", view, 1, 3,
-		nil, map[string]clusterstate.NodeReplica{"n2": n2, "n3": n3})
+	cluster := newShardStoreCluster(t, []string{"n1", "n2", "n3"}, 1, 3, 1, 1)
+	stores := cluster["n1"]
 	reg := New(stores, nil, 5*time.Second, slog.New(slog.NewTextHandler(io.Discard, nil)))
 
-	seed := clusterstate.NodeRecord{
-		Meta:         clusterstate.RecordMeta{Ballot: clusterstate.Ballot{Round: 9, Writer: "seed"}, Rev: 4, UpdatedAt: time.Now()},
-		NodeID:       "node-q",
-		State:        clusterstate.NodeLive,
-		Labels:       map[string]string{"pool": "p"},
-		DataEndpoint: "10.0.0.1:8443",
-	}
-	if ok, err := stores.LocalNodeReplica().Accept(ctx, "node-q", seed, seed.Meta.Ballot); err != nil || !ok {
-		t.Fatalf("seed node accept ok=%v err=%v", ok, err)
+	seed := &NodeRecord{NodeID: "node-q", Labels: map[string]string{"pool": "p"}, DataEndpoint: "10.0.0.1:8443"}
+	seedNodeProfileShardRecord(t, ctx, cluster["n1"], seed, shardkv.Ballot{Round: 9, Writer: shardkv.MemberID("seed")}, 4)
+	if !localShardHasRecord(t, ctx, cluster["n1"], shardkv.Namespace(clusterstate.NamespaceNodeLink), clusterstate.NodeLinkShard("node-q"), clusterstate.NodeLinkProfileRecord) {
+		t.Fatal("seed node did not land on local shard")
 	}
 
 	got, found, err := reg.stores.GetNode(ctx, "node-q")
@@ -1301,40 +1272,54 @@ func TestStoresNodeLinkUsesQuorumRepair(t *testing.T) {
 	if got.DataEndpoint != "10.0.0.1:8443" || got.Labels["pool"] != "p" {
 		t.Fatalf("node from quorum = %+v", got)
 	}
-	if repaired, found, err := n2.Read(ctx, "node-q"); err != nil || !found || repaired.DataEndpoint != "10.0.0.1:8443" {
-		t.Fatalf("lagging node replica not repaired: %+v found=%v err=%v", repaired, found, err)
+	if !localShardHasRecord(t, ctx, cluster["n2"], shardkv.Namespace(clusterstate.NamespaceNodeLink), clusterstate.NodeLinkShard("node-q"), clusterstate.NodeLinkProfileRecord) {
+		t.Fatalf("lagging node owner was not repaired")
 	}
 }
 
-func TestRouteLinkHandoffGateBlocksLiveWrites(t *testing.T) {
-	ctx := context.Background()
-	reg := testReg(t)
-	reg.stores.SetMembershipVersion(1)
-	reg.stores.SetRouteHandoffGate("/g", "rk", clusterstate.HandoffGate{
-		FromVersion: 1,
-		ToVersion:   2,
-		Phase:       clusterstate.HandoffSwitching,
+func seedRouteShardRecord(t *testing.T, ctx context.Context, store *Stores, route *SandboxRecord, ballot shardkv.Ballot, rev uint64) {
+	t.Helper()
+	value, err := clusterstate.EncodeShardValue(route)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = store.ShardStore().Handle(ctx, shardkv.Request{
+		Op:        shardkv.OpRepair,
+		Namespace: shardkv.Namespace(clusterstate.NamespaceRouteLink),
+		Shard:     clusterstate.RouteLinkShard(route.Group),
+		Record: shardkv.Record{
+			Namespace: shardkv.Namespace(clusterstate.NamespaceRouteLink),
+			Shard:     clusterstate.RouteLinkShard(route.Group),
+			Key:       clusterstate.RouteSandboxRecordKey(route.RouteKey),
+			Value:     value,
+			Meta:      shardkv.RecordMeta{Ballot: ballot, Rev: rev, UpdatedAt: time.Now()},
+		},
 	})
-	_, err := reg.stores.PutSandbox(ctx, &SandboxRecord{Group: "/g", RouteKey: "rk", SID: "sb", State: StateReady})
-	if !errors.Is(err, clusterstate.ErrHandoffRetry) {
-		t.Fatalf("handoff write err=%v, want retry", err)
+	if err != nil {
+		t.Fatalf("seed route shard: %v", err)
 	}
 }
 
-func TestNodeLinkHandoffGateReturnsMoved(t *testing.T) {
-	ctx := context.Background()
-	reg := testReg(t)
-	reg.stores.SetMembershipVersion(1)
-	reg.stores.SetNodeHandoffGate("n1", clusterstate.HandoffGate{
-		Move:        clusterstate.KeyMove{Key: "n1", To: []string{"m2", "m3"}},
-		FromVersion: 1,
-		ToVersion:   2,
-		Phase:       clusterstate.HandoffOldGrace,
-		GraceUntil:  time.Now().Add(time.Minute),
+func seedNodeProfileShardRecord(t *testing.T, ctx context.Context, store *Stores, node *NodeRecord, ballot shardkv.Ballot, rev uint64) {
+	t.Helper()
+	value, err := clusterstate.EncodeShardValue(nodeProfileFromRegistry(node))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = store.ShardStore().Handle(ctx, shardkv.Request{
+		Op:        shardkv.OpRepair,
+		Namespace: shardkv.Namespace(clusterstate.NamespaceNodeLink),
+		Shard:     clusterstate.NodeLinkShard(node.NodeID),
+		Record: shardkv.Record{
+			Namespace: shardkv.Namespace(clusterstate.NamespaceNodeLink),
+			Shard:     clusterstate.NodeLinkShard(node.NodeID),
+			Key:       clusterstate.NodeLinkProfileRecord,
+			Value:     value,
+			Meta:      shardkv.RecordMeta{Ballot: ballot, Rev: rev, UpdatedAt: time.Now()},
+		},
 	})
-	err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"})
-	if !errors.Is(err, clusterstate.ErrHandoffMoved) {
-		t.Fatalf("handoff node err=%v, want moved", err)
+	if err != nil {
+		t.Fatalf("seed node shard: %v", err)
 	}
 }
 

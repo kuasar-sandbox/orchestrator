@@ -9,7 +9,6 @@ import (
 	"testing"
 
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/clustercfg"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/clusterstore"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/registry"
 )
 
@@ -73,7 +72,7 @@ membership:
     scale_link: 2
     node_list: 2
 `)
-	views, _, _, _, _, nodeOwners, err := buildRegistryTopology(cfg, nil)
+	views, nodeOwners, err := buildRegistryTopology(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -89,9 +88,7 @@ func TestNewRegistryStoresSetsNodeListHeartbeatRefresh(t *testing.T) {
 	cfg := loadRegistryReloadTestConfig(t, registryReloadTestConfig(1, 0, "registry-b", map[int][]string{
 		1: {"registry-a", "registry-b", "registry-c"},
 	}))
-	kv := clusterstore.OpenMemory(cfg.NodeLink.RevisionRetention)
-	defer kv.Close()
-	stores, _, err := newRegistryStores(kv, cfg, nil)
+	stores, _, err := newRegistryStores(cfg, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -102,9 +99,7 @@ func TestNewRegistryStoresSetsNodeListHeartbeatRefresh(t *testing.T) {
 
 func newRegistryReloadTestRuntime(t *testing.T, cfg *clustercfg.RegistryConfig) (*registryRuntimeConfig, *registry.Registry) {
 	t.Helper()
-	kv := clusterstore.OpenMemory(cfg.NodeLink.RevisionRetention)
-	t.Cleanup(func() { kv.Close() })
-	stores, remoteNodeOwners, err := newRegistryStores(kv, cfg, nil)
+	stores, remoteNodeOwners, err := newRegistryStores(cfg, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
