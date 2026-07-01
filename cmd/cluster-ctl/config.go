@@ -99,7 +99,6 @@ node_link:
   # advertise: ""
   heartbeat_interval: 10s
   node_dead_after: 30s
-  revision_retention: 10000
 route_link:
   park_timeout: 30s
 node_list:

@@ -16,6 +16,7 @@ membership:
   owners:
     route_link: 1
     node_link: 1
+    scale_link: 1
     node_list: 1
 
 node_link:
@@ -23,7 +24,6 @@ node_link:
   # advertise: ""
   heartbeat_interval: 10s
   node_dead_after: 30s
-  revision_retention: 10000
 
 route_link:
   park_timeout: 30s
@@ -32,6 +32,7 @@ node_list:
   watch_retention: 10000
 
 scale_link:
+  scaler_label: scaler.default
   scaler_replica_count: 3
   min_ready_scalers: 1
   place_timeout: 2s

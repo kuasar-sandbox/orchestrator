@@ -66,7 +66,6 @@ membership:
 node_link:
   heartbeat_interval: 10s
   node_dead_after: 30s
-  revision_retention: 10000
   # listen: ""      # 空 = 复用 member.listen;非空 = 独立 node 长连接监听
   # advertise: ""
 
@@ -102,23 +101,33 @@ scale_link:
 Registry 成员集由运维配置和 membership version 定义。每个命名空间用 `pkg/maglev.LocateN` 从版本化
 成员表定位 owner set。
 
-| 命名空间 | shard key | owner set | 内容 |
-|---|---|---|---|
-| `route_link` | group | `LocateN(group,K)` | route 记录、build 执行态;每个 owner 持完整 group 执行态视图 |
-| `node_link` | node_id | `LocateN(node_id,N)` | node 连接、sandbox/build 清单、labels、水位、build 预算;每个 owner 持完整 node 视图 |
-| `node_list` | `node_list` | `LocateN("node_list",M)` | 低频节点目录与 labels;每个 node_list owner 持完整目录和 WATCH_LIST log |
-| `scale_link` | `import/source/<source_id>` | `LocateN(shard,S)` | import source lease/cursor;registry owner set 内全复制 |
+| 命名空间 | shard key | recordSet | owner set | 内容 |
+|---|---|---|---|---|
+| `route_link` | group | `sandbox`, `build` | `LocateN(group,K)` | route 记录、build 执行态;每个 owner 持完整 group 执行态视图 |
+| `node_link` | node_id | `profile`, `sandbox`, `build`, `manifest_key` | `LocateN(node_id,N)` | node 连接、sandbox/build 清单、labels、水位、build 预算、manifest key cache;每个 owner 持完整 node 视图 |
+| `node_list` | `node_list` | `nodes` | `LocateN("node_list",M)` | 低频节点目录与 labels;每个 node_list owner 持完整目录和 WATCH_LIST log |
+| `scale_link` | `import/source/<source_id>` | `import` | `LocateN(shard,S)` | import source lease/cursor;registry owner set 内全复制 |
 
 `scale_link.scaler_replica_count` 只控制 registry 调用 ready scaler 的 failover 候选数,不是 registry 内部
 `scale_link` 记录的 owner count。后者由 `membership.owners.scale_link` 控制。
 `membership.owners.route_link/node_link/scale_link/node_list` 分别控制对应 registry 命名空间的 owner 数量。
 
-`node_link` 中只有当前连接 owner 持有实际 node h2 stream;其余 owner 通过复制持有完整视图。
-node 记录携带 `link_owner`,route owner 需要下发 `create/key/build/delete` 时,通过 node-owner RPC 转发到
-持有该 h2 stream 的 registry 成员。`route_link` 的所有 owner 均可响应查询。写入达到要求 quorum 后提交,
-随后继续复制到全 owner set,用于完整视图和本地 waiter 唤醒。
-若某个 route owner 本地 group 视图尚未 ready,它只能按该 group 的 owner set 做 group-scoped catch-up,
-从分片内副本拉取同 group 记录并 read-repair 到本地;不能跨 group 扫描或把多个无关分片结果合并。
+`node_link` 的接入层和状态层分离:node 可以连接任意 registry 成员,接入成员按
+`LocateN(node_id,N)` 得到 node owner set,逐个尝试把 register/订阅转交给首个成功响应的状态 owner。
+若接入成员本身在 owner set 内,它可以直接成为状态 owner;否则它作为 link holder 透明 relay 该连接。
+node 记录携带 `link_owner`,route owner 需要下发
+`create/key/build/delete` 时,通过 node-owner RPC 转发到实际持有 h2 stream 的 registry 成员。
+同一 shard 下某个 recordSet 的所有 owner 均可响应该 recordSet 的查询和 watch。写入达到要求 quorum
+后提交,随后继续复制到全 owner set,用于完整视图和本地 waiter 唤醒。
+若某个 route owner 本地 group/recordSet 视图尚未 ready,它只能按该 group 的 owner set 做
+group-scoped catch-up,从分片内副本拉取同 group + recordSet 记录并安装到本地;不能跨 group 扫描或把
+多个无关分片结果合并。
+
+shardkv 成员 RPC 必须携带调用方解析出的 shard view label。接收方用本地 resolver 重新解析同一
+`(namespace,shard)` 并校验 label 与 owner 身份;label 不一致或本机不在该 shard owner set 中时拒绝请求。
+因此旧 membership owner 不能在 cutover 后继续用旧视图提交本地写。
+非 owner registry 成员可以作为 `Get/CAS/Delete` 协调者向 owner set 发起 quorum 读写,但不能提供
+`Snapshot/Watch` 本地完整视图;list/watch 类 endpoint 必须由 shard owner 响应。
 
 ## 4. Membership 与成员健康
 
@@ -168,8 +177,8 @@ join scaler memberlist;ready 状态由 scaler memberlist meta 表达:
 
 - 它参与的 owner set 降一格,只要可达 owner 数满足 quorum 即继续服务。
 - 若 quorum 不足,该 shard 停写(CP),不降级乱写。
-- 恢复成员不扫描全局 key 空间;后续同 shard key 的读写、node-link 上报或 group-scoped 操作触达该 key 时,
-  quorum read-repair 补齐本地副本。
+- 恢复成员不扫描全局 key 空间;后续同 shard key + recordSet 的读写、node-link 上报或 group-scoped
+  操作触达该数据域时,quorum catch-up / read-repair 补齐本地副本。
 
 ## 5. Joint Owner Set
 
@@ -212,23 +221,37 @@ reload 只允许两类 membership active 变化:同 active 下加载/取消同�
 
 ## 6. 状态复制
 
-`route_link`、`node_link`、`node_list` 和 registry 内部 `scale_link` 记录使用无主 quorum CAS。协议以唯一 ballot 定序写入:
-`(round, writer_id)` 按字典序比较,同一 key 的两个并发写不会撞同一个 version。写入分
-prepare/accept 两阶段;读 quorum 时必须把读到的最高 ballot/version 回写到落后 owner,完成
-read-repair。
+`route_link`、`node_link`、`node_list` 和 registry 内部 `scale_link` 记录使用同一套 shardkv 基本模型:
+带 namespace + shard key + recordSet 的无主 quorum KV。`namespace/shard` 只决定 owner set;recordSet
+是独立的数据复制、版本和 watch 域。协议以唯一 ballot 定序写入:`(round, writer_id)` 按字典序比较;
+写入分 prepare/accept 两阶段。每个 recordSet 维护全局单调 commit version,record 的 `rev` 是该 record
+最后一次修改对应的 recordSet commit version,不是 per-record 计数器。
+
+读 quorum 不能简单把单个 key 上看到的最高 `rev` 当作已提交值。读到记录后,必须确认该记录在
+recordSet 版本视角下对 quorum 可见:已达到该版本的成员应持有同一记录,未达到该版本的成员才可通过
+repair 补齐。若同一 recordSet head 出现分歧,catch-up 只选择“相同完整快照达到 shard quorum”的最高
+版本安装到本地和落后副本;不能按 key 合并多个成员的局部结果,否则会把未达 quorum 的部分写错误扩散。
 
 复制协议必须满足:
 
 - stable 模式写入经当前 owner set quorum 提交。
 - joint 模式写入经 old quorum + new quorum 提交。
 - 提交后继续 best-effort 复制到同 shard key 的 joint owner set。
-- 每条记录有单调 rev 和唯一 ballot;写条件必须校验 expected rev。
+- 每个 recordSet 的提交版本连续单调递增;每条记录保存最后修改时的 recordSet commit version 和唯一 ballot,
+  写条件必须校验 expected rev。
+- 成员 RPC 带 shard view label 并由接收方校验,防止旧视图成员在 membership 切换后继续接受写入。
 - cutover 后旧成员若仍在 `old_grace`,必须暴露新 active membership;旧版本不进入 owner view,旧 membership
   写入不能在旧 owner 本地提交。
-- 成员冷重启后本地副本为空;不通过跨片扫描发现 key。只有带 shard key 的访问、node-link 上报或
-  group-scoped 操作触达该 key 时才执行 quorum read-repair。
+- 成员冷重启后本地副本为空;不通过跨片扫描发现 key。只有带 shard key + recordSet 的访问、node-link
+  上报或 group-scoped 操作触达该数据域时才执行 quorum catch-up / read-repair。
+- tombstone 和空闲本地 shard 由 registry 后台 compactor 回收。回收只作用于本成员已持有的本地分片副本,
+  不做跨 shard 枚举、不触发数据迁移;活跃记录仍由对应 namespace 的事实源和同 shard 读写触达。
 
-size-1 模式中 `LocateN` 只返回本成员,quorum 退化为本地内存写;同样使用 expected rev + ballot
+当前 registry namespace 的 recordSet 集合由固定 schema 定义,不是从本地 map 扫描得到的事实源。如果未来
+某个 namespace 引入动态 recordSet 名称,目录本身也必须作为同 shard 下的保留 recordSet 维护,并遵守同一套
+CAS/Watch 规则。
+
+size-1 模式中 `LocateN` 只返回本成员,quorum 退化为本地内存写;同样使用 recordSet commit rev + ballot
 接口。size-1 用于开发和小规模部署,不提供 registry 成员故障 HA。
 
 ## 7. Namespace 收敛
@@ -242,11 +265,12 @@ patch 与 manifest-key cache refresh;node_link 由 node 连接、心跳和事件
 
 活动 node 连接持有者在进入 joint/cutover 后:
 
-1. register 和后续低频 liveness refresh 把 node_list 投影写入当前 owner set。
-2. heartbeat、sandbox/build event、清单变化继续写入当前 node_link owner set。
-3. 记录中的 `link_owner` 保留实际 h2 stream 持有者;新 route/node owner 通过 node-owner RPC 向该成员
+1. 接入成员按当前 membership 解析 node owner set,逐个尝试 owner,由首个成功 owner 发起或承接订阅。
+2. register 和后续低频 liveness refresh 把 node_list 投影写入当前 owner set。
+3. heartbeat、sandbox/build event、清单变化继续写入当前 node_link owner set。
+4. 记录中的 `link_owner` 保留实际 h2 stream 持有者;新 route/node owner 通过 node-owner RPC 向该成员
    下发 create/connect/delete/key/build 命令。
-4. 旧接入成员在 `old_grace` 期间不进入 owner set,但仍可作为 `link_owner` 接收转发命令。
+5. 旧接入成员在 `old_grace` 期间不进入 owner set,但仍可作为 `link_owner` 接收转发命令。
 
 已断开 node 不阻塞切换。它重连时按当前 membership 做全量 resync;不重连则按 dead/reconcile 收敛。
 
@@ -256,9 +280,9 @@ scaler 的 group provider/importer 是 group placement 与密钥材料的事实�
 也不实现 provider。group 从 provider 消失后,新的 Place/verify-key 直接按该 group 不存在处理;已写入
 node_link 的 manifest-key cache 不主动删除,由 node_link 与节点侧 TTL 淘汰。scaler 不复制 route 数据。
 route/build 执行态不做跨 group promoter;后续同 group 请求、node
-上报和 group-scoped list/export 会通过 quorum read-repair 补齐该 group 的 owner 副本。
+上报和 group-scoped list/export 会按对应 recordSet 做 quorum catch-up / read-repair,补齐该 group 的 owner 副本。
 
-route owner 内部维护按 group 分开的本地 watch log。这个 watch 只服务 registry 内部:
+route owner 内部使用 shardkv 的本地 watch log。这个 watch 只服务 registry 内部:
 
 - node owner 写入 READY/PAUSED/DEAD 后,group owner 的本地副本 accept/repair 触发 group event。
 - `ReserveSandbox` park 期间同时等待本进程 singleflight、该 group event,并用短周期 quorum read 兜底。
@@ -272,8 +296,8 @@ node_list 是固定 namespace 的逻辑分片:`LocateN("node_list",M)` 得到 ow
 node-link 连接持有者在 register、draining 变化和低频 liveness refresh 时,把 node_link 的低频投影以
 无主 CAS 写入当前 node_list owner set。owner 本地副本 accept/repair 会触发 WATCH_LIST 事件;本地视图未
 ready 时,只能从同一 node_list owner set 做 list + repair,不能跨 node shard 扫描,也不从 node_link
-重建第二条事实传播路径。watch token 编入 membership label;label 变化时 scaler 重新订阅 node_list owner
-set 并 reset + full snapshot。
+重建第二条事实传播路径。WATCH_LIST token 由 shardkv 生成,编码本地 epoch、shard view label 和 rev;
+epoch/label 不匹配或 changelog 已压缩时,scaler 重新订阅 node_list owner set 并 reset + full snapshot。
 
 ## 8. Route 模型
 
@@ -368,7 +392,8 @@ scaler 负责:
 - 在 scaler memberlist meta 中发布 `ready`、`ready_label` 和 `api_advertise`;Place 使用 registry observer
   看到的 ready scaler 视图。
 - source lease 胜者向 `scale_link` owner endpoint 推送 selector patch。patch 携带 source lease fencing
-  信息,registry 只接受当前 source lease owner,并直接更新目标 node 的 node_link manifest-key cache。
+  信息,registry 只接受当前 source lease owner,缺失或不匹配的 patch 会被拒绝,并直接更新目标 node
+  的 node_link manifest-key cache。
 - 对 registry 暴露 `POST /scale-link/place`。
 
 registry 对 group 做 scaler 选择:
@@ -448,7 +473,7 @@ registry export/import 不覆盖 sandbox-group provider 数据。group 配置、
 | router 崩溃 | 丢缓存;重启后 miss Reserve |
 | scaler 崩溃 | 冷放置受影响;热连接不受影响;registry failover 到同 group 的下一个 ready scaler |
 | node 崩溃/清空 | node owner / route owner 清理 route;下次 Reserve 重新放置 |
-| registry 单成员故障 | owner set quorum 足够时继续服务;故障成员由后续同 key 访问或事实源上报触发 read-repair |
+| registry 单成员故障 | owner set quorum 足够时继续服务;故障成员由后续同 shard + recordSet 访问或事实源上报触发 catch-up / read-repair |
 | registry 双成员故障 | 对应 shard 少于 quorum 时停写 |
 | membership 变更 | joint owner set + namespace 收敛 + old grace |
 | 整集群下电 | 不要求自动恢复运行中 sandbox |

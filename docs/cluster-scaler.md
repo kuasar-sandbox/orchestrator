@@ -45,14 +45,17 @@ registry reverse session,也不保存 scaler 目录。scaler 通过 registry mem
 node_list owner 候选与当前 registry label,向这些 owner 成员注册 memberlist seed,并始终只从一个
 node_list owner 订阅 WATCH_LIST;断线或 membership 变化后切换到下一候选。membership refresh 会尝试
 bootstrap 与已知成员并选择 active version 最新的结果。registry 收到 scaler register 后以 `role=observer`
-加入 scaler memberlist;ready scaler 视图来自 memberlist meta。scaler 在本地 API 提供:
+加入 scaler memberlist;ready scaler 视图来自 memberlist meta。scaler 本地 API 只提供 registry 调用的
+Place 与 key verify:
 
 ```text
 POST /scale-link/place
 GET  /scale-link/verify-key
-POST /scale-link/import-source-lease
-POST /scale-link/import-source-cursor
 ```
+
+`/scale-link/register`、`/scale-link/watch-node-list`、`/scale-link/import-source-lease`、
+`/scale-link/import-source-cursor` 和 `/scale-link/selector-patch` 是 registry 暴露给 scaler 的
+scale_link API。
 
 ## 4. Provider / Importer
 
@@ -103,7 +106,8 @@ WATCH_LIST 语义:
 1. scaler 按 active / next registry membership 得到 node_list owner 候选,但任一时刻只消费其中一个 owner
    的完整 WATCH_LIST。
 2. 首帧为 snapshot/reset,随后 delta,最后以 bookmark 标记初始视图完整。
-3. watch token 编入 membership label;label 变化或 token fingerprint 不匹配时全量重订。
+3. watch token 编入 registry 本地 epoch、node_list shard view label 和 rev;epoch/label 不匹配或
+   changelog 已压缩时全量重订。
 4. 高频负载不在该流中传播;普通 heartbeat 只更新 node_link,不会触发 node_list 事件。
 5. draining 变化和粗粒度 liveness 刷新更新 node_list。
 
@@ -157,12 +161,13 @@ registry 只把 scaler memberlist 中 `role=scaler`、alive、`ready=true` 且
    将 shuffle 约束合并进最终 selectors。
 6. 胜者计算 selector patch 目标 node set,并向 source 对应的 scale_link owner endpoint 发送 patch。
    patch 携带 `import_source_id/import_owner_id/import_run_id/import_term`;registry 只接受与当前 source
-   lease 匹配的 patch,并直接刷新目标 node 的 node_link manifest-key cache。
+   lease 匹配的 patch。缺失 lease fencing 字段或 term/run_id 不匹配会被拒绝;通过后 registry 直接刷新
+   目标 node 的 node_link manifest-key cache。
 7. 本页 patch 全部成功后,胜者向 `POST /scale-link/import-source-cursor` 提交 `cursor`。`NextCursor==""`
    时清空 cursor 并递增 `round`;失败或 owner 崩溃时 cursor 不推进,后续 lease owner 从上次成功 cursor
    继续或重放同一页。
 8. membership 切换期间保持 source lease/cursor 和 selector patch 通路在新 owner 可用;route/build 执行态仍由同 group
-   请求或 node 事件触发 read-repair。
+   请求或 node 事件按对应 recordSet 触发 catch-up / read-repair。
 
 scaler 会按 `placement.selector_patch_refresh_interval` 续推 unchanged selector patch,用于维持 node_link
 manifest-key cache。group 从 provider 消失时不主动删除 node_link key cache;registry/node TTL 到期后自动淘汰。
