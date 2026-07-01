@@ -45,7 +45,7 @@ func TestScaleLinkResolverUsesCachedMembership(t *testing.T) {
 	resolver := newScaleLinkResolver(regClient)
 
 	for _, source := range []string{"source-a", "source-b", "source-c"} {
-		links, err := resolver(context.Background(), clusterstate.ScaleLinkSourceKey(source))
+		links, err := resolver(context.Background(), string(clusterstate.ScaleImportSourceShard(source)))
 		if err != nil {
 			t.Fatalf("resolve %s: %v", source, err)
 		}

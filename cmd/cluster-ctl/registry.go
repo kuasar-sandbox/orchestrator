@@ -68,6 +68,11 @@ func runRegistry(args []string, log *slog.Logger) error {
 
 	reg := registry.New(stores, nil, cfg.RouteLink.ParkDur(), log)
 	reg.SetRemoteNodeOwners(remoteNodeOwners)
+	nodeLinkRelayPeers, err := buildRegistryNodeLinkRelayPeers(cfg)
+	if err != nil {
+		return err
+	}
+	reg.SetNodeLinkRelayPeers(nodeLinkRelayPeers)
 	reg.SetScalerMemberlistLabel(cfg.ScaleLink.ScalerLabel)
 	reg.SetScalerSeedJoiner(scalerObserver.JoinSeed)
 	reg.SetScalerPeerSource(scalerObserver.ReadyScalers)
@@ -83,6 +88,7 @@ func runRegistry(args []string, log *slog.Logger) error {
 	// Dead-node sweep (cluster.md §11): reset the sandboxes of nodes whose
 	// node-link dropped and whose last heartbeat predates node_dead_after.
 	go reg.RunReaper(ctx, cfg.NodeLink.NodeDeadDur())
+	go reg.RunCompactor(ctx, 5*time.Minute)
 
 	controlMux := http.NewServeMux()
 	memberHub.Mount(controlMux)
@@ -145,6 +151,7 @@ func mountRegistryControl(mux *http.ServeMux, reg *registry.Registry, cfgState *
 	mux.HandleFunc(registry.NodeOwnerRPCPath, func(w http.ResponseWriter, req *http.Request) {
 		registry.ServeNodeOwner(w, req, reg.LocalNodeOwner())
 	})
+	mux.HandleFunc(registry.NodeLinkRelayPath, reg.ServeNodeLinkRelay)
 	mux.HandleFunc("/cluster/membership", func(w http.ResponseWriter, req *http.Request) {
 		if req.Method != http.MethodGet {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -207,7 +214,6 @@ func reloadRegistryConfig(ctx context.Context, cfgPath string, old *clustercfg.R
 	if old.RouteLink.ParkTimeout != next.RouteLink.ParkTimeout ||
 		old.NodeLink.NodeDeadAfter != next.NodeLink.NodeDeadAfter ||
 		old.NodeLink.HeartbeatInterval != next.NodeLink.HeartbeatInterval ||
-		old.NodeLink.RevisionRetention != next.NodeLink.RevisionRetention ||
 		old.ScaleLink.ScalerLabel != next.ScaleLink.ScalerLabel {
 		return fmt.Errorf("registry reload: non-membership runtime changes require restart")
 	}
@@ -236,6 +242,11 @@ func reloadRegistryConfig(ctx context.Context, cfgPath string, old *clustercfg.R
 	reg.Stores().SetNodeListHeartbeatRefresh(nodeListHeartbeatRefresh(next.NodeLink.NodeDeadDur()))
 	reg.Stores().SetNodeListWatchRetention(next.NodeList.WatchRetention)
 	reg.SetRemoteNodeOwners(nodeOwners)
+	nodeLinkRelayPeers, err := buildRegistryNodeLinkRelayPeers(next)
+	if err != nil {
+		return err
+	}
+	reg.SetNodeLinkRelayPeers(nodeLinkRelayPeers)
 	reg.SetScaleReadyLabel(active.Label)
 	reg.SetScalerMemberlistLabel(next.ScaleLink.ScalerLabel)
 	reg.SetScalePolicy(next.ScaleLink.ScalerReplicaCount, next.ScaleLink.MinReadyScalers, next.ScaleLink.PlaceDur())
@@ -339,7 +350,7 @@ func buildRegistryTopology(cfg *clustercfg.RegistryConfig) ([]clusterstate.Membe
 	ownerVersions := cfg.Membership.OwnerVersions()
 	views := make([]clusterstate.MemberView, 0, len(ownerVersions))
 	for _, version := range ownerVersions {
-		views = append(views, clusterstate.MemberView{Version: version.Version, Members: version.MemberIDs()})
+		views = append(views, clusterstate.MemberView{Version: version.Version, Label: version.Label, Members: version.MemberIDs()})
 	}
 	nodeOwners := map[string]registry.NodeOwner{}
 	for _, member := range jointMembershipMembers(cfg.Membership.MemberVersions()) {
@@ -353,6 +364,21 @@ func buildRegistryTopology(cfg *clustercfg.RegistryConfig) ([]clusterstate.Membe
 		nodeOwners[member.ID] = registry.NewHTTPNodeOwner(base, client)
 	}
 	return views, nodeOwners, nil
+}
+
+func buildRegistryNodeLinkRelayPeers(cfg *clustercfg.RegistryConfig) (map[string]registry.NodeLinkRelayPeer, error) {
+	peers := map[string]registry.NodeLinkRelayPeer{}
+	for _, member := range jointMembershipMembers(cfg.Membership.MemberVersions()) {
+		if member.ID == "" || member.ID == cfg.Member.ID {
+			continue
+		}
+		base, client, err := registryMemberStreamClient(member.Advertise, cfg.Member.TLS)
+		if err != nil {
+			return nil, fmt.Errorf("registry node-link relay member %q: %w", member.ID, err)
+		}
+		peers[member.ID] = registry.NodeLinkRelayPeer{Endpoint: base, Client: client}
+	}
+	return peers, nil
 }
 
 func jointMembershipMembers(versions []clustercfg.MembershipVersion) []clustercfg.MembershipMember {
@@ -385,6 +411,53 @@ func registryMemberClient(advertise string, tlsMaterial clustercfg.TLS) (string,
 	base, client := controlHTTPClient(advertise, tlsCfg)
 	client.Timeout = 2 * time.Second
 	return base, client, nil
+}
+
+func registryMemberStreamClient(advertise string, tlsMaterial clustercfg.TLS) (string, *http.Client, error) {
+	if advertise == "" {
+		return "", nil, fmt.Errorf("advertise is required")
+	}
+	var tlsCfg *tls.Config
+	if endpointServerName(advertise) != "" && tlsMaterial.Enabled() {
+		cfg, err := tlsMaterial.ClientConfig(endpointServerName(advertise))
+		if err != nil {
+			return "", nil, err
+		}
+		tlsCfg = cfg
+	}
+	base := "http://" + advertise
+	var transport http.RoundTripper
+	switch {
+	case strings.HasPrefix(advertise, "/"):
+		base = "http://registry"
+		transport = &http2.Transport{
+			AllowHTTP: true,
+			DialTLSContext: func(ctx context.Context, _, _ string, _ *tls.Config) (net.Conn, error) {
+				return (&net.Dialer{}).DialContext(ctx, "unix", advertise)
+			},
+		}
+	case strings.HasPrefix(advertise, "https://"):
+		base = strings.TrimRight(advertise, "/")
+		transport = &http2.Transport{TLSClientConfig: tlsCfg}
+	case strings.HasPrefix(advertise, "http://"):
+		base = strings.TrimRight(advertise, "/")
+		transport = h2cRoundTripper()
+	case tlsCfg != nil:
+		base = "https://" + advertise
+		transport = &http2.Transport{TLSClientConfig: tlsCfg}
+	default:
+		transport = h2cRoundTripper()
+	}
+	return base, &http.Client{Transport: transport}, nil
+}
+
+func h2cRoundTripper() http.RoundTripper {
+	return &http2.Transport{
+		AllowHTTP: true,
+		DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, network, addr)
+		},
+	}
 }
 
 func serveClusterHTTP(ctx context.Context, name, addr string, tlsCfg clustercfg.TLS, handler http.Handler, log *slog.Logger) error {

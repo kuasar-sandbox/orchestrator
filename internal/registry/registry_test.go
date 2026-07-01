@@ -1,6 +1,7 @@
 package registry
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/binary"
@@ -341,6 +342,13 @@ func TestSelectorPatchRequiresCurrentImportSourceLease(t *testing.T) {
 	if lease.Term == 0 {
 		t.Fatalf("lease term was not assigned: %+v", lease)
 	}
+	missing := &routesync.SelectorPatch{
+		Group: "/g", NodeIDs: []string{"n1"},
+		KeyFingerprint: "missing", ManifestKeyType: clusterstate.SecretInline, ManifestKey: "mk-missing",
+	}
+	if err := reg.applySelectorPatch(ctx, missing); !errors.Is(err, errMissingImportSourceLease) {
+		t.Fatalf("missing source lease patch err=%v, want errMissingImportSourceLease", err)
+	}
 	stale := &routesync.SelectorPatch{
 		Group: "/g", NodeIDs: []string{"n1"},
 		KeyFingerprint: "stale", ManifestKeyType: clusterstate.SecretInline, ManifestKey: "mk-stale",
@@ -376,13 +384,24 @@ func testReg(t *testing.T) *Registry {
 }
 
 func pushSelectorPatch(reg *Registry, group string, nodes []string, manifestKey string) error {
+	ctx := context.Background()
+	resp, err := reg.acquireImportSourceLease(ctx, ImportSourceLeaseRequest{
+		SourceID: "test-source", OwnerID: "test-scaler", RunID: "test-run", TTLMillis: 1000,
+	})
+	if err != nil {
+		return err
+	}
 	patch := &routesync.SelectorPatch{Group: group, NodeIDs: nodes}
 	if manifestKey != "" {
 		patch.KeyFingerprint = keyFingerprint(manifestKey)
 		patch.ManifestKeyType = clusterstate.SecretInline
 		patch.ManifestKey = manifestKey
 	}
-	return reg.applySelectorPatch(context.Background(), patch)
+	patch.ImportSourceID = resp.Lease.SourceID
+	patch.ImportOwnerID = resp.Lease.OwnerID
+	patch.ImportRunID = resp.Lease.RunID
+	patch.ImportTerm = resp.Lease.Term
+	return reg.applySelectorPatch(ctx, patch)
 }
 
 // fakeConn implements nodeConn; its onCmd hook lets a test simulate the node
@@ -986,7 +1005,6 @@ func TestNodeListWatchTokenResumesOnlyMatchingMembershipLabel(t *testing.T) {
 	}
 	_ = readViewFrame(t, resp.Body) // n1 snapshot
 	bookmark := readViewFrame(t, resp.Body)
-	resp.Body.Close()
 	if bookmark.Type != "bookmark" || bookmark.Token == "" {
 		t.Fatalf("initial bookmark missing watch token: %+v", bookmark)
 	}
@@ -994,12 +1012,31 @@ func TestNodeListWatchTokenResumesOnlyMatchingMembershipLabel(t *testing.T) {
 	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n2", LastHeartbeatUnix: time.Now().Unix()}); err != nil {
 		t.Fatal(err)
 	}
+	live := readViewFrame(t, resp.Body)
+	if live.Type != "put" || live.Key != "n2" || live.Token == "" {
+		t.Fatalf("live event should carry token, got %+v", live)
+	}
+	resp.Body.Close()
+
+	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n3", LastHeartbeatUnix: time.Now().Unix()}); err != nil {
+		t.Fatal(err)
+	}
+	resp, err = http.Get(srv.URL + ScaleLinkNodeListWatchPath + "?from=" + url.QueryEscape(live.Token))
+	if err != nil {
+		t.Fatal(err)
+	}
+	delta := readViewFrame(t, resp.Body)
+	if delta.Type != "put" || delta.Key != "n3" {
+		t.Fatalf("live token should replay later delta without reset, got %+v", delta)
+	}
+	resp.Body.Close()
+
 	resp, err = http.Get(srv.URL + ScaleLinkNodeListWatchPath + "?from=" + url.QueryEscape(bookmark.Token))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
-	delta := readViewFrame(t, resp.Body)
+	delta = readViewFrame(t, resp.Body)
 	if delta.Type != "put" || delta.Key != "n2" {
 		t.Fatalf("matching token should replay delta without reset, got %+v", delta)
 	}
@@ -1011,6 +1048,98 @@ func TestNodeListWatchTokenResumesOnlyMatchingMembershipLabel(t *testing.T) {
 	defer resp2.Body.Close()
 	if got := readViewFrame(t, resp2.Body); got.Type != "reset" {
 		t.Fatalf("mismatched token should force full snapshot reset, got %+v", got)
+	}
+}
+
+func TestNodeListWatchTokenResetsAcrossRegistryRestart(t *testing.T) {
+	ctx := context.Background()
+	reg := testReg(t)
+	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1", LastHeartbeatUnix: time.Now().Unix()}); err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	reg.ServeScaleLink(mux)
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + ScaleLinkNodeListWatchPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := readViewFrame(t, resp.Body); got.Type != "reset" {
+		t.Fatalf("initial frame=%+v, want reset", got)
+	}
+	_ = readViewFrame(t, resp.Body)
+	bookmark := readViewFrame(t, resp.Body)
+	resp.Body.Close()
+	if bookmark.Token == "" {
+		t.Fatalf("bookmark missing token: %+v", bookmark)
+	}
+
+	restarted := testReg(t)
+	restartedMux := http.NewServeMux()
+	restarted.ServeScaleLink(restartedMux)
+	restartedSrv := httptest.NewServer(restartedMux)
+	defer restartedSrv.Close()
+	resp, err = http.Get(restartedSrv.URL + ScaleLinkNodeListWatchPath + "?from=" + url.QueryEscape(bookmark.Token))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if got := readViewFrame(t, resp.Body); got.Type != "reset" {
+		t.Fatalf("stale token across restart frame=%+v, want reset", got)
+	}
+}
+
+func TestSelectorPatchHTTPRejectsMissingImportSourceLease(t *testing.T) {
+	ctx := context.Background()
+	reg := testReg(t)
+	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"}); err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	reg.ServeScaleLink(mux)
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	body, err := json.Marshal(&routesync.SelectorPatch{
+		Group: "/g", NodeIDs: []string{"n1"},
+		KeyFingerprint: "missing", ManifestKeyType: clusterstate.SecretInline, ManifestKey: "mk-missing",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.Post(srv.URL+ScaleLinkSelectorPatchPath, "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status=%d, want 400", resp.StatusCode)
+	}
+	node, found, err := reg.stores.GetNode(ctx, "n1")
+	if err != nil || !found {
+		t.Fatalf("node found=%v err=%v", found, err)
+	}
+	if len(node.ManifestKeys) != 0 {
+		t.Fatalf("missing lease patch changed key cache: %+v", node.ManifestKeys)
+	}
+}
+
+func TestRunCompactorWithNilLogger(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	reg := New(NewStores(), nil, time.Second, nil)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		reg.RunCompactor(ctx, time.Millisecond)
+	}()
+	time.Sleep(5 * time.Millisecond)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("compactor did not stop")
 	}
 }
 
@@ -1168,10 +1297,11 @@ func TestSandboxKeyNoCollision(t *testing.T) {
 
 func TestRangeSandboxesWarmsGroupViewAndPublishesRouteWatch(t *testing.T) {
 	ctx := context.Background()
-	cluster := newShardStoreCluster(t, []string{"r1", "r2"}, 2, 1, 1, 1)
+	cluster := newShardStoreCluster(t, []string{"r1", "r2", "r3"}, 3, 1, 1, 1)
 	stores := cluster["r1"]
 	seed := &SandboxRecord{Group: "/g", RouteKey: "rk", SID: "sb-warm", State: StateReady, NodeID: "n1"}
 	seedRouteShardRecord(t, ctx, cluster["r2"], seed, shardkv.Ballot{Round: 7, Writer: shardkv.MemberID("r2")}, 1)
+	seedRouteShardRecord(t, ctx, cluster["r3"], seed, shardkv.Ballot{Round: 7, Writer: shardkv.MemberID("r2")}, 1)
 
 	ch, err := stores.WatchRouteGroup(ctx, "/g", 0)
 	if err != nil {
@@ -1237,7 +1367,8 @@ func TestStoresRouteLinkUsesQuorumRepair(t *testing.T) {
 
 	seed := &SandboxRecord{Group: "/g", RouteKey: "rk", SID: "sb-q", State: StateReady, NodeID: "n1"}
 	seedRouteShardRecord(t, ctx, cluster["r1"], seed, shardkv.Ballot{Round: 7, Writer: shardkv.MemberID("seed")}, 3)
-	if !localShardHasRecord(t, ctx, cluster["r1"], shardkv.Namespace(clusterstate.NamespaceRouteLink), clusterstate.RouteLinkShard("/g"), clusterstate.RouteSandboxRecordKey("rk")) {
+	seedRouteShardRecord(t, ctx, cluster["r3"], seed, shardkv.Ballot{Round: 7, Writer: shardkv.MemberID("seed")}, 3)
+	if !localShardHasRecord(t, ctx, cluster["r1"], shardkv.Namespace(clusterstate.NamespaceRouteLink), clusterstate.RouteLinkShard("/g"), clusterstate.RecordSetRouteSandbox, clusterstate.RouteSandboxRecordKey("rk")) {
 		t.Fatal("seed route did not land on local shard")
 	}
 
@@ -1248,7 +1379,7 @@ func TestStoresRouteLinkUsesQuorumRepair(t *testing.T) {
 	if got.SID != "sb-q" || got.State != StateReady || rev == 0 {
 		t.Fatalf("route from quorum = %+v rev=%d", got, rev)
 	}
-	if !localShardHasRecord(t, ctx, cluster["r2"], shardkv.Namespace(clusterstate.NamespaceRouteLink), clusterstate.RouteLinkShard("/g"), clusterstate.RouteSandboxRecordKey("rk")) {
+	if !localShardHasRecord(t, ctx, cluster["r2"], shardkv.Namespace(clusterstate.NamespaceRouteLink), clusterstate.RouteLinkShard("/g"), clusterstate.RecordSetRouteSandbox, clusterstate.RouteSandboxRecordKey("rk")) {
 		t.Fatalf("lagging route owner was not repaired")
 	}
 }
@@ -1261,7 +1392,8 @@ func TestStoresNodeLinkUsesQuorumRepair(t *testing.T) {
 
 	seed := &NodeRecord{NodeID: "node-q", Labels: map[string]string{"pool": "p"}, DataEndpoint: "10.0.0.1:8443"}
 	seedNodeProfileShardRecord(t, ctx, cluster["n1"], seed, shardkv.Ballot{Round: 9, Writer: shardkv.MemberID("seed")}, 4)
-	if !localShardHasRecord(t, ctx, cluster["n1"], shardkv.Namespace(clusterstate.NamespaceNodeLink), clusterstate.NodeLinkShard("node-q"), clusterstate.NodeLinkProfileRecord) {
+	seedNodeProfileShardRecord(t, ctx, cluster["n3"], seed, shardkv.Ballot{Round: 9, Writer: shardkv.MemberID("seed")}, 4)
+	if !localShardHasRecord(t, ctx, cluster["n1"], shardkv.Namespace(clusterstate.NamespaceNodeLink), clusterstate.NodeLinkShard("node-q"), clusterstate.RecordSetNodeProfile, clusterstate.NodeLinkProfileRecord) {
 		t.Fatal("seed node did not land on local shard")
 	}
 
@@ -1272,7 +1404,7 @@ func TestStoresNodeLinkUsesQuorumRepair(t *testing.T) {
 	if got.DataEndpoint != "10.0.0.1:8443" || got.Labels["pool"] != "p" {
 		t.Fatalf("node from quorum = %+v", got)
 	}
-	if !localShardHasRecord(t, ctx, cluster["n2"], shardkv.Namespace(clusterstate.NamespaceNodeLink), clusterstate.NodeLinkShard("node-q"), clusterstate.NodeLinkProfileRecord) {
+	if !localShardHasRecord(t, ctx, cluster["n2"], shardkv.Namespace(clusterstate.NamespaceNodeLink), clusterstate.NodeLinkShard("node-q"), clusterstate.RecordSetNodeProfile, clusterstate.NodeLinkProfileRecord) {
 		t.Fatalf("lagging node owner was not repaired")
 	}
 }
@@ -1287,9 +1419,11 @@ func seedRouteShardRecord(t *testing.T, ctx context.Context, store *Stores, rout
 		Op:        shardkv.OpRepair,
 		Namespace: shardkv.Namespace(clusterstate.NamespaceRouteLink),
 		Shard:     clusterstate.RouteLinkShard(route.Group),
+		RecordSet: clusterstate.RecordSetRouteSandbox,
 		Record: shardkv.Record{
 			Namespace: shardkv.Namespace(clusterstate.NamespaceRouteLink),
 			Shard:     clusterstate.RouteLinkShard(route.Group),
+			RecordSet: clusterstate.RecordSetRouteSandbox,
 			Key:       clusterstate.RouteSandboxRecordKey(route.RouteKey),
 			Value:     value,
 			Meta:      shardkv.RecordMeta{Ballot: ballot, Rev: rev, UpdatedAt: time.Now()},
@@ -1310,9 +1444,11 @@ func seedNodeProfileShardRecord(t *testing.T, ctx context.Context, store *Stores
 		Op:        shardkv.OpRepair,
 		Namespace: shardkv.Namespace(clusterstate.NamespaceNodeLink),
 		Shard:     clusterstate.NodeLinkShard(node.NodeID),
+		RecordSet: clusterstate.RecordSetNodeProfile,
 		Record: shardkv.Record{
 			Namespace: shardkv.Namespace(clusterstate.NamespaceNodeLink),
 			Shard:     clusterstate.NodeLinkShard(node.NodeID),
+			RecordSet: clusterstate.RecordSetNodeProfile,
 			Key:       clusterstate.NodeLinkProfileRecord,
 			Value:     value,
 			Meta:      shardkv.RecordMeta{Ballot: ballot, Rev: rev, UpdatedAt: time.Now()},

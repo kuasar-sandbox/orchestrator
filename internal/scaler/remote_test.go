@@ -132,6 +132,16 @@ func TestScalerUsesSingleNodeListSourceAndRegistersAllRegistryMembers(t *testing
 	}
 }
 
+func TestRemoteLinksWithGroupsDefaultsNilLogger(t *testing.T) {
+	svc := NewRemoteLinksWithGroups(nil, nil, nil, clustercfg.PlacementConfig{}, 30, nil)
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("RegisterLoopDynamic with nil logger panic: %v", r)
+		}
+	}()
+	svc.RegisterLoopDynamic(context.Background(), "", "", "", "")
+}
+
 func TestSetNodeListLinksSameLinksPreservesReadyView(t *testing.T) {
 	svc := NewRemoteLinks([]RegistryLink{{Name: "r1", BaseURL: "http://r1", Client: http.DefaultClient}},
 		clustercfg.PlacementConfig{Candidates: 1}, 30, slog.New(slog.NewTextHandler(io.Discard, nil)))
@@ -316,6 +326,37 @@ func TestScalerRefreshesUnchangedNodeLinkKeyCache(t *testing.T) {
 	waitForNodeKey(t, ctx, reg, "n1", true)
 	if calls := src.rangeCalls.Load(); calls < 2 {
 		t.Fatalf("Range calls=%d, want repeated refresh cycles", calls)
+	}
+}
+
+func TestScalerStartIsIdempotent(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	discard := slog.New(slog.NewTextHandler(io.Discard, nil))
+	_, srv := testScaleRegistry(t, ctx, "n1")
+	defer srv.Close()
+	defer cancel()
+
+	src := newCountingGroupSource("/g")
+	svc := NewRemoteLinksWithGroups(
+		[]RegistryLink{{Name: "registry", BaseURL: srv.URL, Client: srv.Client()}},
+		src, testImportSources("counting-source", src),
+		clustercfg.PlacementConfig{Candidates: 1, ImportSourceOwnerCount: 1, ImportSourceLeaseTTL: "500ms", SelectorPatchRefresh: "1h"},
+		30,
+		discard,
+	)
+	seedNodeListView(t, svc, "n1")
+	svc.Start(ctx)
+	svc.Start(ctx)
+
+	for i := 0; i < 100; i++ {
+		if src.rangeCalls.Load() > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if calls := src.rangeCalls.Load(); calls != 1 {
+		t.Fatalf("Range calls after duplicate Start=%d, want 1", calls)
 	}
 }
 

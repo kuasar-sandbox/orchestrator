@@ -7,11 +7,14 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/apikey"
 	clusterstate "github.com/kuasar-sandbox/sandbox-orchestrator/internal/cluster"
+	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/cluster/shardkv"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/routesync"
 )
 
@@ -21,7 +24,10 @@ var ErrNoNode = errors.New("registry: no eligible node")
 // ErrNodeGone is returned when the node owner cannot reach the target node.
 var ErrNodeGone = errors.New("registry: node owner cannot reach node")
 
-var errStaleImportSourceLease = errors.New("registry: stale import source lease")
+var (
+	errMissingImportSourceLease = errors.New("registry: import source lease fields are required")
+	errStaleImportSourceLease   = errors.New("registry: stale import source lease")
+)
 
 const lifecycleAckTimeout = 5 * time.Second
 
@@ -79,10 +85,12 @@ type Registry struct {
 	sidKeys  map[string][2]string              // sid -> {group, route_key} (delete-by-sid from the route stream)
 	acks     map[string]chan *routesync.CmdAck // cmd_id -> ack waiter (synchronous key commands)
 
-	localNodeOwner NodeOwner
-	nodeOwner      NodeOwner
-	deadAfter      time.Duration
-	reaperCtx      context.Context
+	localNodeOwner     NodeOwner
+	nodeOwner          NodeOwner
+	deadAfter          time.Duration
+	reaperCtx          context.Context
+	nodeLinkRelayMu    sync.RWMutex
+	nodeLinkRelayPeers map[string]NodeLinkRelayPeer
 
 	scalerMu         sync.Mutex
 	scaleReadyLabel  string
@@ -111,7 +119,6 @@ type ImportSourceLease struct {
 	Term          uint64 `json:"term"`
 	Cursor        string `json:"cursor,omitempty"`
 	Round         uint64 `json:"round,omitempty"`
-	ReadyLabel    string `json:"ready_label,omitempty"`
 	NextRunUnixMs int64  `json:"next_run_unix_ms,omitempty"`
 	LastError     string `json:"last_error,omitempty"`
 	ExpiresUnixMs int64  `json:"expires_unix_ms"`
@@ -149,6 +156,9 @@ func New(stores *Stores, placer Placer, parkTimeout time.Duration, log *slog.Log
 	if parkTimeout <= 0 {
 		parkTimeout = 30 * time.Second
 	}
+	if log == nil {
+		log = slog.Default()
+	}
 	r := &Registry{
 		stores:          stores,
 		placer:          placer,
@@ -174,8 +184,8 @@ func New(stores *Stores, placer Placer, parkTimeout time.Duration, log *slog.Log
 // actively deleted: node_link and node side TTLs expire entries that stop being
 // renewed.
 func (r *Registry) applySelectorPatch(ctx context.Context, p *routesync.SelectorPatch) error {
-	if !r.selectorPatchLeaseOK(ctx, p) {
-		return errStaleImportSourceLease
+	if err := r.checkSelectorPatchLease(ctx, p); err != nil {
+		return err
 	}
 	if p.KeyFingerprint == "" || len(p.NodeIDs) == 0 {
 		return nil
@@ -202,11 +212,14 @@ func (r *Registry) applySelectorPatch(ctx context.Context, p *routesync.Selector
 	return nil
 }
 
-func (r *Registry) selectorPatchLeaseOK(ctx context.Context, p *routesync.SelectorPatch) bool {
-	if p == nil || p.ImportSourceID == "" {
-		return true
+func (r *Registry) checkSelectorPatchLease(ctx context.Context, p *routesync.SelectorPatch) error {
+	if p == nil || p.ImportSourceID == "" || p.ImportOwnerID == "" || p.ImportRunID == "" || p.ImportTerm == 0 {
+		return errMissingImportSourceLease
 	}
-	return r.stores.CheckScaleLinkSourceLease(ctx, p.ImportSourceID, p.ImportOwnerID, p.ImportRunID, p.ImportTerm)
+	if !r.stores.CheckScaleLinkSourceLease(ctx, p.ImportSourceID, p.ImportOwnerID, p.ImportRunID, p.ImportTerm) {
+		return errStaleImportSourceLease
+	}
+	return nil
 }
 
 // SetScaleReadyLabel sets the registry membership label a scaler must advertise
@@ -307,6 +320,23 @@ func (r *Registry) SetNodeOwner(owner NodeOwner) {
 
 func (r *Registry) SetRemoteNodeOwners(remotes map[string]NodeOwner) {
 	r.nodeOwner = newRoutingNodeOwner(r, r.localNodeOwner, remotes)
+}
+
+func (r *Registry) SetNodeLinkRelayPeers(peers map[string]NodeLinkRelayPeer) {
+	cp := make(map[string]NodeLinkRelayPeer, len(peers))
+	for id, peer := range peers {
+		if id == "" || peer.Endpoint == "" {
+			continue
+		}
+		if peer.Client == nil {
+			peer.Client = http.DefaultClient
+		}
+		peer.Endpoint = strings.TrimRight(peer.Endpoint, "/")
+		cp[id] = peer
+	}
+	r.nodeLinkRelayMu.Lock()
+	r.nodeLinkRelayPeers = cp
+	r.nodeLinkRelayMu.Unlock()
 }
 
 func (r *Registry) LocalNodeOwner() NodeOwner { return r.localNodeOwner }
@@ -883,7 +913,7 @@ func (r *Registry) removeNode(c nodeConn) {
 
 // updateNodeRegister upserts the node table row from a node's register frame.
 func (r *Registry) updateNodeRegister(ctx context.Context, nr *routesync.NodeRegister) error {
-	rec, found, err := r.stores.GetNode(ctx, nr.NodeID)
+	rec, found, err := r.getNodeForLinkUpdate(ctx, nr.NodeID)
 	if err != nil {
 		return err
 	}
@@ -903,7 +933,7 @@ func (r *Registry) updateNodeRegister(ctx context.Context, nr *routesync.NodeReg
 
 // updateHeartbeat folds a node's water level into its record + stamps liveness.
 func (r *Registry) updateHeartbeat(ctx context.Context, nodeID string, hb *routesync.Heartbeat) {
-	rec, found, err := r.stores.GetNode(ctx, nodeID)
+	rec, found, err := r.getNodeForLinkUpdate(ctx, nodeID)
 	if err != nil || !found {
 		return
 	}
@@ -930,12 +960,20 @@ func (r *Registry) refreshNodeManifestKeys(ctx context.Context, rec *NodeRecord)
 }
 
 func (r *Registry) updateNodeResume(ctx context.Context, nodeID, token string) {
-	rec, found, err := r.stores.GetNode(ctx, nodeID)
+	rec, found, err := r.getNodeForLinkUpdate(ctx, nodeID)
 	if err != nil || !found {
 		return
 	}
 	rec.ResumeToken = token
 	_ = r.stores.PutNodeRuntime(ctx, rec)
+}
+
+func (r *Registry) getNodeForLinkUpdate(ctx context.Context, nodeID string) (*NodeRecord, bool, error) {
+	rec, found, err := r.stores.GetNode(ctx, nodeID)
+	if errors.Is(err, shardkv.ErrInvalidView) {
+		return r.stores.GetNodeProfile(ctx, nodeID)
+	}
+	return rec, found, err
 }
 
 // RunReaper configures event-driven dead-node cleanup. A node-link disconnect
@@ -949,6 +987,29 @@ func (r *Registry) RunReaper(ctx context.Context, deadAfter time.Duration) {
 	r.deadAfter = deadAfter
 	r.mu.Unlock()
 	<-ctx.Done()
+}
+
+func (r *Registry) RunCompactor(ctx context.Context, interval time.Duration) {
+	if interval <= 0 {
+		interval = 5 * time.Minute
+	}
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-t.C:
+			stats, err := r.stores.Compact(ctx, now)
+			if err != nil {
+				r.log.Warn("registry: shardkv compaction failed", "err", err)
+				continue
+			}
+			if stats.Tombstones > 0 || stats.Shards > 0 {
+				r.log.Debug("registry: shardkv compacted", "tombstones", stats.Tombstones, "shards", stats.Shards)
+			}
+		}
+	}
 }
 
 func (r *Registry) scheduleNodeReap(nodeID string) {

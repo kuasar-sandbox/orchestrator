@@ -6,8 +6,6 @@ import (
 	"errors"
 	"io"
 	"net/http"
-	"strconv"
-	"strings"
 	"time"
 
 	clusterstate "github.com/kuasar-sandbox/sandbox-orchestrator/internal/cluster"
@@ -45,11 +43,10 @@ type ScalerRegister struct {
 }
 
 type ImportSourceLeaseRequest struct {
-	SourceID   string `json:"source_id"`
-	OwnerID    string `json:"owner_id"`
-	RunID      string `json:"run_id"`
-	ReadyLabel string `json:"ready_label,omitempty"`
-	TTLMillis  int64  `json:"ttl_ms"`
+	SourceID  string `json:"source_id"`
+	OwnerID   string `json:"owner_id"`
+	RunID     string `json:"run_id"`
+	TTLMillis int64  `json:"ttl_ms"`
 }
 
 type ImportSourceLeaseResponse struct {
@@ -74,49 +71,13 @@ func (r *Registry) serveNodeListWatch(w http.ResponseWriter, req *http.Request) 
 		return
 	}
 	ctx := req.Context()
-	label := r.nodeListWatchLabel()
-	if token := req.URL.Query().Get("from"); token != "" {
-		tokenLabel, fromRev, ok := parseNodeListWatchToken(token)
-		if ok && tokenLabel == label && fromRev > 0 {
-			ch, err := r.stores.WatchNodeList(ctx, fromRev)
-			if err == nil {
-				r.streamNodeListView(ctx, w, flusher, ch, label)
-				return
-			}
-			if err != ErrWatchCompacted {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return
-			}
-		}
-	}
-	rev0, err := r.stores.NodeListRev(ctx)
+	token := req.URL.Query().Get("from")
+	ch, err := r.stores.WatchNodeListToken(ctx, token)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	ch, err := r.stores.WatchNodeList(ctx, rev0)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	token := makeNodeListWatchToken(label, rev0)
-	if err := writeFrame(w, &ViewEvent{Type: "reset", Rev: rev0, Token: token}); err != nil {
-		return
-	}
-	if err := r.stores.RangeNodeList(ctx, func(entry clusterstate.NodeListEntry) error {
-		val, err := json.Marshal(entry)
-		if err != nil {
-			return err
-		}
-		return writeFrame(w, &ViewEvent{Type: "put", Key: entry.NodeID, Value: val, Rev: rev0, Token: token})
-	}); err != nil {
-		return
-	}
-	if err := writeFrame(w, &ViewEvent{Type: "bookmark", Rev: rev0, Token: token}); err != nil {
-		return
-	}
-	flusher.Flush()
-	r.streamNodeListView(ctx, w, flusher, ch, label)
+	r.streamNodeListView(ctx, w, flusher, ch)
 }
 
 // ServeScaleLink mounts the scaler-facing scale_link API: node_list WATCH_LIST,
@@ -177,6 +138,10 @@ func (r *Registry) serveSelectorPatch(w http.ResponseWriter, req *http.Request) 
 		return
 	}
 	if err := r.applySelectorPatch(req.Context(), &patch); err != nil {
+		if errors.Is(err, errMissingImportSourceLease) {
+			http.Error(w, "import source lease fields are required", http.StatusBadRequest)
+			return
+		}
 		if errors.Is(err, errStaleImportSourceLease) {
 			http.Error(w, "stale import source lease", http.StatusConflict)
 			return
@@ -242,7 +207,7 @@ func (r *Registry) acquireImportSourceLease(ctx context.Context, in ImportSource
 	if ttl <= 0 {
 		ttl = 15 * time.Second
 	}
-	rec, acquired, err := r.stores.AcquireScaleLinkSourceLease(ctx, in.SourceID, in.OwnerID, in.RunID, in.ReadyLabel, ttl)
+	rec, acquired, err := r.stores.AcquireScaleLinkSourceLease(ctx, in.SourceID, in.OwnerID, in.RunID, ttl)
 	if err != nil {
 		return ImportSourceLeaseResponse{}, err
 	}
@@ -252,12 +217,12 @@ func (r *Registry) acquireImportSourceLease(ctx context.Context, in ImportSource
 func importSourceLeaseFromState(rec clusterstate.ScaleImportSourceState) ImportSourceLease {
 	return ImportSourceLease{
 		SourceID: rec.SourceID, OwnerID: rec.OwnerID, RunID: rec.RunID, Term: rec.Term,
-		Cursor: rec.Cursor, Round: rec.Round, ReadyLabel: rec.ReadyLabel,
+		Cursor: rec.Cursor, Round: rec.Round,
 		NextRunUnixMs: rec.NextRunUnixMs, LastError: rec.LastError, ExpiresUnixMs: rec.ExpiresUnixMs,
 	}
 }
 
-func (r *Registry) streamNodeListView(ctx context.Context, w io.Writer, flusher http.Flusher, ch <-chan WatchEvent, label string) {
+func (r *Registry) streamNodeListView(ctx context.Context, w io.Writer, flusher http.Flusher, ch <-chan WatchEvent) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -268,10 +233,14 @@ func (r *Registry) streamNodeListView(ctx context.Context, w io.Writer, flusher 
 			}
 			var ve *ViewEvent
 			switch ev.Type {
+			case WatchEventReset:
+				ve = &ViewEvent{Type: "reset", Rev: ev.Rev, Token: ev.Token}
 			case WatchEventPut:
-				ve = &ViewEvent{Type: "put", Key: ev.Key, Value: ev.Value, Rev: ev.Rev, Token: makeNodeListWatchToken(label, ev.Rev)}
+				ve = &ViewEvent{Type: "put", Key: ev.Key, Value: ev.Value, Rev: ev.Rev, Token: ev.Token}
 			case WatchEventDelete:
-				ve = &ViewEvent{Type: "delete", Key: ev.Key, Rev: ev.Rev, Token: makeNodeListWatchToken(label, ev.Rev)}
+				ve = &ViewEvent{Type: "delete", Key: ev.Key, Rev: ev.Rev, Token: ev.Token}
+			case WatchEventBookmark:
+				ve = &ViewEvent{Type: "bookmark", Rev: ev.Rev, Token: ev.Token}
 			default:
 				continue
 			}
@@ -281,29 +250,4 @@ func (r *Registry) streamNodeListView(ctx context.Context, w io.Writer, flusher 
 			flusher.Flush()
 		}
 	}
-}
-
-func (r *Registry) nodeListWatchLabel() string {
-	r.scalerMu.Lock()
-	defer r.scalerMu.Unlock()
-	return r.scaleReadyLabel
-}
-
-func makeNodeListWatchToken(label string, rev int64) string {
-	if label == "" || rev <= 0 {
-		return ""
-	}
-	return label + ":" + strconv.FormatInt(rev, 10)
-}
-
-func parseNodeListWatchToken(token string) (string, int64, bool) {
-	i := strings.LastIndexByte(token, ':')
-	if i <= 0 || i == len(token)-1 {
-		return "", 0, false
-	}
-	rev, err := strconv.ParseInt(token[i+1:], 10, 64)
-	if err != nil {
-		return "", 0, false
-	}
-	return token[:i], rev, true
 }

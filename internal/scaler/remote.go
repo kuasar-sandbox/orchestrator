@@ -78,6 +78,9 @@ func NewRemoteLinks(links []RegistryLink, cfg clustercfg.PlacementConfig, deadAf
 }
 
 func NewRemoteLinksWithGroups(links []RegistryLink, provider clusterstate.SandboxGroupProvider, sources []ImportSource, cfg clustercfg.PlacementConfig, deadAfter int64, log *slog.Logger) *Service {
+	if log == nil {
+		log = slog.Default()
+	}
 	if cfg.Candidates <= 0 {
 		cfg.Candidates = 2
 	}
@@ -204,13 +207,17 @@ func minReadyLinks(n int) int {
 // registry. node_list is low-frequency catalog data; hot load/budget is validated
 // by registry/node owner on the cold placement path.
 func (s *Service) Start(ctx context.Context) {
+	startReconcile := false
 	s.linksMu.Lock()
 	if s.startedCtx == nil {
 		s.startedCtx = ctx
 		s.startWatchLinkLocked(ctx)
+		startReconcile = true
 	}
 	s.linksMu.Unlock()
-	go s.reconcileSelectorPatches(ctx)
+	if startReconcile {
+		go s.reconcileSelectorPatches(ctx)
+	}
 }
 
 func (s *Service) SetRegistryLinks(ctx context.Context, links []RegistryLink) {
@@ -649,7 +656,7 @@ func (s *Service) acquireImportSourceLeaseToken(ctx context.Context, sourceID st
 	if self == "" {
 		self = "local"
 	}
-	links := s.scaleLinkLinks(ctx, clusterstate.ScaleLinkSourceKey(sourceID))
+	links := s.scaleLinkLinks(ctx, string(clusterstate.ScaleImportSourceShard(sourceID)))
 	for _, link := range links {
 		resp, err := s.acquireImportSourceLease(ctx, link, sourceID, self)
 		if err != nil {
@@ -701,7 +708,7 @@ func (s *Service) checkpointImportSource(ctx context.Context, sourceID string, l
 		SourceID: sourceID, OwnerID: lease.lease.OwnerID, RunID: lease.lease.RunID, Term: lease.lease.Term,
 		Cursor: cursor, Complete: complete, Error: lastErr,
 	}
-	links := s.scaleLinkLinks(ctx, clusterstate.ScaleLinkSourceKey(sourceID))
+	links := s.scaleLinkLinks(ctx, string(clusterstate.ScaleImportSourceShard(sourceID)))
 	var lastPostErr error
 	for _, link := range links {
 		if err := s.postJSON(ctx, link, registry.ScaleLinkSourceCursorPath, reqBody); err != nil {
@@ -727,7 +734,7 @@ func (s *Service) pushSelectorPatches(ctx context.Context, sourceID string, node
 			nodeIDs = nil
 			fp, keyType, keyValue, keyRef = "", "", "", ""
 		}
-		links := s.scaleLinkLinks(ctx, clusterstate.ScaleLinkSourceKey(sourceID))
+		links := s.scaleLinkLinks(ctx, string(clusterstate.ScaleImportSourceShard(sourceID)))
 		linkSig := registryLinkSignature(links)
 		key := selectorPatchSignature(selectors, nodeIDs, fp, keyType, keyValue, keyRef, linkSig)
 		state := last[g.group]

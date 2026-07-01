@@ -76,7 +76,6 @@ type NodeLinkConfig struct {
 	TLS               TLS    `yaml:"tls"`
 	HeartbeatInterval string `yaml:"heartbeat_interval"` // default 10s
 	NodeDeadAfter     string `yaml:"node_dead_after"`    // default 30s
-	RevisionRetention int    `yaml:"revision_retention"` // change-log depth for resume_from; default 10000
 }
 
 // RouteLinkConfig configures route_link behavior. The HTTP listener is member.listen.
@@ -388,7 +387,7 @@ func DefaultRegistry() RegistryConfig {
 			}},
 			Owners: MembershipOwnerConfig{RouteLink: 1, NodeLink: 1, ScaleLink: 1, NodeList: 1},
 		},
-		NodeLink:  NodeLinkConfig{HeartbeatInterval: "10s", NodeDeadAfter: "30s", RevisionRetention: 10000},
+		NodeLink:  NodeLinkConfig{HeartbeatInterval: "10s", NodeDeadAfter: "30s"},
 		RouteLink: RouteLinkConfig{ParkTimeout: "30s"},
 		NodeList:  NodeListConfig{WatchRetention: 10000},
 		ScaleLink: ScaleLinkConfig{ScalerReplicaCount: 3, MinReadyScalers: 1, ScalerLabel: "scaler.default", PlaceTimeout: "2s"},
@@ -459,9 +458,6 @@ func (c *RegistryConfig) applyDefaults() {
 	}
 	if c.NodeLink.NodeDeadAfter == "" {
 		c.NodeLink.NodeDeadAfter = d.NodeLink.NodeDeadAfter
-	}
-	if c.NodeLink.RevisionRetention == 0 {
-		c.NodeLink.RevisionRetention = d.NodeLink.RevisionRetention
 	}
 	if c.RouteLink.ParkTimeout == "" {
 		c.RouteLink.ParkTimeout = d.RouteLink.ParkTimeout
@@ -556,9 +552,6 @@ func (c *RegistryConfig) Validate() error {
 	}
 	if c.Membership.Owners.NodeList <= 0 {
 		return fmt.Errorf("clustercfg: membership.owners.node_list must be positive")
-	}
-	if c.NodeLink.RevisionRetention <= 0 {
-		return fmt.Errorf("clustercfg: node_link.revision_retention must be positive")
 	}
 	if c.NodeList.WatchRetention <= 0 {
 		return fmt.Errorf("clustercfg: node_list.watch_retention must be positive")

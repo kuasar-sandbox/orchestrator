@@ -30,7 +30,7 @@ func TestLoadRegistryPartialAppliesDefaults(t *testing.T) {
 	if c.Membership.Active != 1 || len(c.Membership.Versions) != 1 || c.Membership.Owners.RouteLink != 1 || c.Membership.Owners.ScaleLink != 1 {
 		t.Fatalf("membership defaults not filled: %+v", c.Membership)
 	}
-	if c.NodeLink.RevisionRetention != 10000 || c.NodeLink.HeartbeatInterval != "10s" {
+	if c.NodeLink.HeartbeatInterval != "10s" || c.NodeLink.NodeDeadAfter != "30s" {
 		t.Fatalf("node_link defaults not filled: %+v", c.NodeLink)
 	}
 	if c.RouteLink.ParkTimeout != "30s" || c.NodeList.WatchRetention != 10000 ||

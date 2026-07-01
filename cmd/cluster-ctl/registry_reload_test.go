@@ -79,6 +79,9 @@ membership:
 	if len(views) != 1 || views[0].Version != 2 {
 		t.Fatalf("old_grace version must not enter owner views: %+v", views)
 	}
+	if !strings.HasPrefix(views[0].Label, "registry.2.") {
+		t.Fatalf("owner view label = %q, want computed registry.2 label", views[0].Label)
+	}
 	if _, ok := nodeOwners["registry-a"]; !ok {
 		t.Fatalf("old_grace peer registry-a missing from node owner remotes: %+v", nodeOwners)
 	}

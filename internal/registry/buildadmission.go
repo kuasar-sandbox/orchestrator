@@ -75,7 +75,7 @@ func (o *localNodeOwner) RefreshManifestKeys(ctx context.Context, nodeID string,
 }
 
 func (o *localNodeOwner) AdmitBuild(ctx context.Context, nodeID, buildID string, want *routesync.BuildResources) bool {
-	node, found, err := o.reg.stores.GetNode(ctx, nodeID)
+	node, found, err := o.reg.stores.GetNodeProfile(ctx, nodeID)
 	if err != nil || !found {
 		return false
 	}
@@ -87,7 +87,7 @@ func (o *localNodeOwner) ReleaseBuild(ctx context.Context, buildID string) {
 }
 
 func (o *localNodeOwner) Runtime(ctx context.Context, nodeID string) (*NodeRecord, bool, error) {
-	return o.reg.stores.GetNode(ctx, nodeID)
+	return o.reg.stores.GetNodeProfile(ctx, nodeID)
 }
 
 func (o *localNodeOwner) DeleteSandbox(ctx context.Context, nodeID, sid string) error {
@@ -145,7 +145,7 @@ func newRoutingNodeOwner(reg *Registry, local NodeOwner, remotes map[string]Node
 }
 
 func (o *routingNodeOwner) ownerFor(ctx context.Context, nodeID string) NodeOwner {
-	node, found, err := o.reg.stores.GetNode(ctx, nodeID)
+	node, found, err := o.reg.stores.GetNodeProfile(ctx, nodeID)
 	if err != nil || !found || node.LinkOwner == "" || node.LinkOwner == o.reg.stores.WriterID() {
 		return o.local
 	}
