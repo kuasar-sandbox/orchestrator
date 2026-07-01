@@ -9,10 +9,14 @@ package nodelink
 import (
 	"context"
 	"crypto/tls"
+	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
+	"strings"
 	"time"
 
 	"golang.org/x/net/http2"
@@ -44,12 +48,15 @@ type Node interface {
 // node's identity, then streams its sandbox routes while executing registry
 // commands, reconnecting with capped backoff.
 type Client struct {
-	dial      func(ctx context.Context) (net.Conn, error)
-	identity  routesync.NodeRegister
-	node      Node
-	heartbeat time.Duration
-	tlsConfig *tls.Config // non-nil = dial the registry over (m)TLS instead of h2c
-	log       *slog.Logger
+	dial          func(ctx context.Context) (net.Conn, error)
+	dialEndpoint  func(ctx context.Context, endpoint string) (net.Conn, error)
+	endpoint      string
+	allowRedirect bool
+	identity      routesync.NodeRegister
+	node          Node
+	heartbeat     time.Duration
+	tlsConfig     *tls.Config // non-nil = dial the registry over (m)TLS instead of h2c
+	log           *slog.Logger
 }
 
 // New builds a Client. dial returns a fresh connection to the registry's
@@ -59,40 +66,60 @@ func New(dial func(ctx context.Context) (net.Conn, error), identity routesync.No
 	if heartbeat <= 0 {
 		heartbeat = 10 * time.Second
 	}
+	if log == nil {
+		log = slog.Default()
+	}
 	return &Client{dial: dial, identity: identity, node: node, heartbeat: heartbeat, tlsConfig: tlsConfig, log: log}
+}
+
+// NewWithEndpoint builds a Client that knows the registry endpoint it is dialing.
+// When allowRedirect is true the node advertises redirect support and will
+// reconnect to owner endpoints returned by the registry.
+func NewWithEndpoint(endpoint string, dial func(ctx context.Context, endpoint string) (net.Conn, error), identity routesync.NodeRegister, node Node, heartbeat time.Duration, tlsConfig *tls.Config, log *slog.Logger, allowRedirect bool) *Client {
+	if heartbeat <= 0 {
+		heartbeat = 10 * time.Second
+	}
+	if log == nil {
+		log = slog.Default()
+	}
+	identity.AcceptRedirect = allowRedirect
+	return &Client{
+		dialEndpoint: dial, endpoint: endpoint, allowRedirect: allowRedirect,
+		identity: identity, node: node, heartbeat: heartbeat, tlsConfig: tlsConfig, log: log,
+	}
 }
 
 // Run keeps a single node-link session alive, reconnecting with capped backoff
 // until ctx is cancelled.
 func (c *Client) Run(ctx context.Context) {
-	tr := &http2.Transport{}
-	if c.tlsConfig != nil {
-		// mTLS: dial plain, then complete a TLS handshake with the node's client
-		// cert (the registry verifies it; SAN/fingerprint backs node_id, §5.4).
-		tr.DialTLSContext = func(ctx context.Context, _, _ string, _ *tls.Config) (net.Conn, error) {
-			conn, err := c.dial(ctx)
-			if err != nil {
-				return nil, err
-			}
-			tc := tls.Client(conn, c.tlsConfig)
-			if err := tc.HandshakeContext(ctx); err != nil {
-				conn.Close()
-				return nil, err
-			}
-			return tc, nil
-		}
-	} else {
-		tr.AllowHTTP = true
-		tr.DialTLSContext = func(ctx context.Context, _, _ string, _ *tls.Config) (net.Conn, error) {
-			return c.dial(ctx)
-		}
-	}
-	defer tr.CloseIdleConnections()
 	backoff := 200 * time.Millisecond
+	endpoint := c.endpoint
+	var redirectTargets []routesync.NodeLinkTarget
+	redirectIndex := 0
 	for ctx.Err() == nil {
-		err := c.session(ctx, tr)
+		err := c.session(ctx, endpoint)
 		if ctx.Err() != nil {
 			return
+		}
+		var redir nodeLinkRedirect
+		if errors.As(err, &redir) && c.allowRedirect && c.dialEndpoint != nil {
+			redirectTargets = redir.targets
+			redirectIndex = 0
+			endpoint = redirectTargets[0].Endpoint
+			c.log.Info("node-link: redirecting to node owner", "node", c.identity.NodeID, "member", redirectTargets[0].MemberID, "endpoint", endpoint)
+			backoff = 200 * time.Millisecond
+			continue
+		}
+		if c.allowRedirect && len(redirectTargets) > 0 && redirectIndex+1 < len(redirectTargets) {
+			redirectIndex++
+			endpoint = redirectTargets[redirectIndex].Endpoint
+			c.log.Warn("node-link: trying next redirected owner", "node", c.identity.NodeID, "member", redirectTargets[redirectIndex].MemberID, "endpoint", endpoint, "err", err)
+			continue
+		}
+		if c.allowRedirect && endpoint != c.endpoint {
+			redirectTargets = nil
+			redirectIndex = 0
+			endpoint = c.endpoint
 		}
 		c.log.Warn("node-link: session ended; reconnecting", "node", c.identity.NodeID, "err", err)
 		select {
@@ -108,17 +135,18 @@ func (c *Client) Run(ctx context.Context) {
 // body = NodeRegister then the route stream) and reads the down stream (response
 // body = Hello then commands), full-duplex over h2c. The node is the authority,
 // so it WRITES routes and READS commands (the inverse of a proxy subscriber).
-func (c *Client) session(ctx context.Context, tr *http2.Transport) error {
+func (c *Client) session(ctx context.Context, endpoint string) error {
 	sctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	tr, scheme, host, err := c.transport(endpoint)
+	if err != nil {
+		return err
+	}
+	defer tr.CloseIdleConnections()
 	pr, pw := io.Pipe()
 	defer pw.Close()
 
-	scheme := "http"
-	if c.tlsConfig != nil {
-		scheme = "https"
-	}
-	req, err := http.NewRequestWithContext(sctx, http.MethodPut, scheme+"://registry"+routesync.NodeLinkPath, pr)
+	req, err := http.NewRequestWithContext(sctx, http.MethodPut, scheme+"://"+host+routesync.NodeLinkPath, pr)
 	if err != nil {
 		return err
 	}
@@ -144,6 +172,9 @@ func (c *Client) session(ctx context.Context, tr *http2.Transport) error {
 	hello, err := routesync.ReadMsg(resp.Body)
 	if err != nil {
 		return err
+	}
+	if redir := nodeLinkRedirectFromHello(hello); len(redir.targets) > 0 {
+		return redir
 	}
 
 	// Stream the node's routes (to pw) while executing commands (from resp.Body),
@@ -211,4 +242,114 @@ func (c *Client) session(ctx context.Context, tr *http2.Transport) error {
 	}()
 	routesync.StreamAuthority(sctx, pw, func() {}, resp.Body, c.node, reg, onUp, outbox, c.log)
 	return sctx.Err()
+}
+
+func (c *Client) transport(endpoint string) (*http2.Transport, string, string, error) {
+	scheme, host, dialEndpoint, err := normalizeEndpoint(endpoint, c.tlsConfig != nil)
+	if err != nil {
+		return nil, "", "", err
+	}
+	tr := &http2.Transport{}
+	dial := func(ctx context.Context) (net.Conn, error) {
+		if c.dialEndpoint != nil {
+			return c.dialEndpoint(ctx, dialEndpoint)
+		}
+		if c.dial != nil {
+			return c.dial(ctx)
+		}
+		return nil, fmt.Errorf("node-link: no dialer configured")
+	}
+	if scheme == "https" {
+		tr.DialTLSContext = func(ctx context.Context, _, _ string, _ *tls.Config) (net.Conn, error) {
+			conn, err := dial(ctx)
+			if err != nil {
+				return nil, err
+			}
+			cfg := tlsConfigForHost(c.tlsConfig, host)
+			tc := tls.Client(conn, cfg)
+			if err := tc.HandshakeContext(ctx); err != nil {
+				conn.Close()
+				return nil, err
+			}
+			return tc, nil
+		}
+		return tr, scheme, host, nil
+	}
+	tr.AllowHTTP = true
+	tr.DialTLSContext = func(ctx context.Context, _, _ string, _ *tls.Config) (net.Conn, error) {
+		return dial(ctx)
+	}
+	return tr, scheme, host, nil
+}
+
+func normalizeEndpoint(endpoint string, tlsEnabled bool) (scheme, host, dialEndpoint string, err error) {
+	scheme = "http"
+	if tlsEnabled {
+		scheme = "https"
+	}
+	host = "registry"
+	dialEndpoint = endpoint
+	if endpoint == "" {
+		return scheme, host, dialEndpoint, nil
+	}
+	if strings.HasPrefix(endpoint, "http://") || strings.HasPrefix(endpoint, "https://") {
+		u, err := url.Parse(endpoint)
+		if err != nil {
+			return "", "", "", err
+		}
+		if u.Scheme != "http" && u.Scheme != "https" {
+			return "", "", "", fmt.Errorf("node-link: unsupported endpoint scheme %q", u.Scheme)
+		}
+		if u.Host == "" {
+			return "", "", "", fmt.Errorf("node-link: endpoint host is required")
+		}
+		return u.Scheme, u.Host, u.Host, nil
+	}
+	if strings.HasPrefix(endpoint, "/") {
+		return "http", "registry", endpoint, nil
+	}
+	return scheme, endpoint, endpoint, nil
+}
+
+func tlsConfigForHost(base *tls.Config, host string) *tls.Config {
+	var cfg *tls.Config
+	if base != nil {
+		cfg = base.Clone()
+	} else {
+		cfg = &tls.Config{}
+	}
+	if cfg.ServerName == "" {
+		cfg.ServerName = serverName(host)
+	}
+	return cfg
+}
+
+func serverName(hostport string) string {
+	host, _, err := net.SplitHostPort(hostport)
+	if err == nil {
+		return host
+	}
+	return hostport
+}
+
+type nodeLinkRedirect struct {
+	targets []routesync.NodeLinkTarget
+}
+
+func (e nodeLinkRedirect) Error() string {
+	return fmt.Sprintf("node-link redirected to %d owner target(s)", len(e.targets))
+}
+
+func nodeLinkRedirectFromHello(m *routesync.Msg) nodeLinkRedirect {
+	if m == nil || m.Type != routesync.TypeHello || m.Hello == nil || m.Hello.Redirect == nil {
+		return nodeLinkRedirect{}
+	}
+	out := make([]routesync.NodeLinkTarget, 0, len(m.Hello.Redirect.Targets))
+	for _, target := range m.Hello.Redirect.Targets {
+		if target.Endpoint == "" {
+			continue
+		}
+		out = append(out, target)
+	}
+	return nodeLinkRedirect{targets: out}
 }

@@ -120,3 +120,61 @@ func TestNodeLinkReserveRoundTrip(t *testing.T) {
 		t.Fatalf("reserve result: %+v", res)
 	}
 }
+
+func TestNodeLinkClientFollowsRedirect(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	reg := registry.New(registry.NewStores(), testPlacer{}, 5*time.Second, log)
+
+	ownerMux := http.NewServeMux()
+	ownerMux.HandleFunc(routesync.NodeLinkPath, reg.ServeNodeLink)
+	ownerSrv := httptest.NewServer(h2c.NewHandler(ownerMux, &http2.Server{}))
+	defer ownerSrv.Close()
+
+	ingressMux := http.NewServeMux()
+	ingressMux.HandleFunc(routesync.NodeLinkPath, func(w http.ResponseWriter, req *http.Request) {
+		first, err := routesync.ReadMsg(req.Body)
+		if err != nil || first.Type != routesync.TypeNodeRegister || first.NodeReg == nil {
+			http.Error(w, "bad register", http.StatusBadRequest)
+			return
+		}
+		if !first.NodeReg.AcceptRedirect {
+			http.Error(w, "redirect not accepted", http.StatusConflict)
+			return
+		}
+		if err := routesync.WriteMsg(w, &routesync.Msg{Type: routesync.TypeHello, Hello: &routesync.Hello{
+			Version: routesync.Version,
+			Redirect: &routesync.NodeLinkRedirect{Targets: []routesync.NodeLinkTarget{{
+				MemberID: "owner", Endpoint: ownerSrv.URL,
+			}}},
+		}}); err != nil {
+			return
+		}
+		w.(http.Flusher).Flush()
+	})
+	ingressSrv := httptest.NewServer(h2c.NewHandler(ingressMux, &http2.Server{}))
+	defer ingressSrv.Close()
+
+	node := newFakeNode()
+	client := NewWithEndpoint(
+		ingressSrv.URL,
+		func(ctx context.Context, endpoint string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "tcp", endpoint)
+		},
+		routesync.NodeRegister{NodeID: "n1", DataEndpoint: "10.0.0.1:8443"},
+		node, 50*time.Millisecond, nil, log, true,
+	)
+	go client.Run(ctx)
+
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if got, found, _ := reg.Stores().GetNode(ctx, "n1"); found && got.DataEndpoint == "10.0.0.1:8443" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("node never registered after redirect")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}

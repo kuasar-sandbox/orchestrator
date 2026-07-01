@@ -623,13 +623,18 @@ func (n *stubNode) start(parent context.Context) {
 	}
 	n.mu.Unlock()
 
-	dial := func(ctx context.Context) (net.Conn, error) {
-		if strings.HasPrefix(n.NodeLink, "/") {
-			return (&net.Dialer{}).DialContext(ctx, "unix", n.NodeLink)
+	dial := func(ctx context.Context, endpoint string) (net.Conn, error) {
+		if strings.HasPrefix(endpoint, "http://") || strings.HasPrefix(endpoint, "https://") {
+			if u, err := http.NewRequest(http.MethodGet, endpoint, nil); err == nil && u.URL.Host != "" {
+				endpoint = u.URL.Host
+			}
 		}
-		return (&net.Dialer{}).DialContext(ctx, "tcp", n.NodeLink)
+		if strings.HasPrefix(endpoint, "/") {
+			return (&net.Dialer{}).DialContext(ctx, "unix", endpoint)
+		}
+		return (&net.Dialer{}).DialContext(ctx, "tcp", endpoint)
 	}
-	client := nodelink.New(dial, identity, n, n.HeartbeatInterval, nil, n.log)
+	client := nodelink.NewWithEndpoint(n.NodeLink, dial, identity, n, n.HeartbeatInterval, nil, n.log, true)
 	go client.Run(ctx)
 	n.svc.logEvent(n.ID, "node_start", map[string]any{"session": n.session})
 }

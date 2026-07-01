@@ -15,8 +15,9 @@ import (
 const NodeLinkRelayPath = "/internal/node-link/relay"
 
 type NodeLinkRelayPeer struct {
-	Endpoint string
-	Client   *http.Client
+	Endpoint         string
+	RedirectEndpoint string
+	Client           *http.Client
 }
 
 // nodeChannel is the registry's per-node node_link handle: it writes commands to
@@ -61,13 +62,30 @@ func (r *Registry) ServeNodeLink(w http.ResponseWriter, req *http.Request) {
 	}
 	nr := first.NodeReg
 
-	if r.localOwnsNodeLink(ctx, nr.NodeID) {
+	owners, err := r.stores.NodeOwnerCandidates(ctx, nr.NodeID)
+	if err != nil || len(owners) == 0 {
+		owners = []string{r.stores.WriterID()}
+	}
+	if memberInList(r.stores.WriterID(), owners) {
 		if err := r.serveNodeLinkLocal(ctx, w, flusher.Flush, body, nr); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 		}
 		return
 	}
-	if err := r.relayNodeLink(w, flusher.Flush, req, first, body); err != nil {
+	if nr.AcceptRedirect {
+		if targets := r.nodeLinkRedirectTargets(owners); len(targets) > 0 {
+			if err := routesync.WriteMsg(w, &routesync.Msg{Type: routesync.TypeHello, Hello: &routesync.Hello{
+				Version:  routesync.Version,
+				Redirect: &routesync.NodeLinkRedirect{Targets: targets},
+			}}); err != nil {
+				r.log.Warn("node-link: redirect response failed", "node", nr.NodeID, "err", err)
+				return
+			}
+			flusher.Flush()
+			return
+		}
+	}
+	if err := r.relayNodeLink(w, flusher.Flush, req, first, body, owners); err != nil {
 		r.log.Warn("node-link: relay failed", "node", nr.NodeID, "err", err)
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 	}
@@ -87,14 +105,42 @@ func (r *Registry) localOwnsNodeLink(ctx context.Context, nodeID string) bool {
 	return false
 }
 
-func (r *Registry) relayNodeLink(w http.ResponseWriter, flush func(), req *http.Request, first *routesync.Msg, body io.Reader) error {
+func memberInList(member string, members []string) bool {
+	for _, cur := range members {
+		if cur == member {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *Registry) nodeLinkRedirectTargets(owners []string) []routesync.NodeLinkTarget {
+	local := r.stores.WriterID()
+	var targets []routesync.NodeLinkTarget
+	for _, owner := range owners {
+		if owner == "" || owner == local {
+			continue
+		}
+		peer, ok := r.nodeLinkRelayPeer(owner)
+		if !ok {
+			continue
+		}
+		endpoint := peer.RedirectEndpoint
+		if endpoint == "" {
+			endpoint = peer.Endpoint
+		}
+		if endpoint == "" {
+			continue
+		}
+		targets = append(targets, routesync.NodeLinkTarget{MemberID: owner, Endpoint: endpoint})
+	}
+	return targets
+}
+
+func (r *Registry) relayNodeLink(w http.ResponseWriter, flush func(), req *http.Request, first *routesync.Msg, body io.Reader, owners []string) error {
 	nodeID := ""
 	if first != nil && first.NodeReg != nil {
 		nodeID = first.NodeReg.NodeID
-	}
-	owners, err := r.stores.NodeOwnerCandidates(req.Context(), nodeID)
-	if err != nil {
-		return err
 	}
 	local := r.stores.WriterID()
 	var errs []string

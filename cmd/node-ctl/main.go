@@ -167,15 +167,24 @@ func serve(args []string, log *slog.Logger) error {
 		}
 		core.SetClusterContext(ctx) // node-link async work (boots) cancels on serve shutdown
 		capacity, buildCap, runtimeDigest := core.ClusterNodeInfo()
-		nl := nodelink.New(
-			func(dctx context.Context) (net.Conn, error) {
-				return (&net.Dialer{}).DialContext(dctx, "tcp", regAddr)
+		nl := nodelink.NewWithEndpoint(
+			regAddr,
+			func(dctx context.Context, endpoint string) (net.Conn, error) {
+				if strings.HasPrefix(endpoint, "http://") || strings.HasPrefix(endpoint, "https://") {
+					if req, err := http.NewRequest(http.MethodGet, endpoint, nil); err == nil && req.URL.Host != "" {
+						endpoint = req.URL.Host
+					}
+				}
+				if strings.HasPrefix(endpoint, "/") {
+					return (&net.Dialer{}).DialContext(dctx, "unix", endpoint)
+				}
+				return (&net.Dialer{}).DialContext(dctx, "tcp", endpoint)
 			},
 			routesync.NodeRegister{
 				NodeID: nodeID, Labels: cfg.Cluster.Labels, DataEndpoint: dataEndpoint,
 				Capacity: capacity, BuildCapacity: buildCap, RuntimeDigest: runtimeDigest,
 			},
-			core, hbInterval, clientTLS, log,
+			core, hbInterval, clientTLS, log, true,
 		)
 		go nl.Run(ctx)
 		log.Info("node-ctl serve: node-link to cluster registry", "registry", regAddr, "node_id", nodeID)

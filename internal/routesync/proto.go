@@ -127,9 +127,10 @@ type Msg struct {
 
 // Hello is the orchestrator's first down-frame; it carries the operational Policy.
 type Hello struct {
-	Version    int    `json:"version"`
-	Policy     Policy `json:"policy,omitempty"`
-	ResumeFrom string `json:"resume_from,omitempty"` // node-link subscriber request; empty means full sync
+	Version    int               `json:"version"`
+	Policy     Policy            `json:"policy,omitempty"`
+	ResumeFrom string            `json:"resume_from,omitempty"` // node-link subscriber request; empty means full sync
+	Redirect   *NodeLinkRedirect `json:"redirect,omitempty"`
 }
 
 // Register is the subscriber's first up-frame: the capabilities it wants wired. The

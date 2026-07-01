@@ -54,9 +54,9 @@ membership:
   versions:
     - version: 1
       members:
-        - { id: A, advertise: "https://A:7700" }
-        - { id: B, advertise: "https://B:7700" }
-        - { id: C, advertise: "https://C:7700" }
+        - { id: A, advertise: "https://A:7700", node_advertise: "A:7700" }
+        - { id: B, advertise: "https://B:7700", node_advertise: "B:7700" }
+        - { id: C, advertise: "https://C:7700", node_advertise: "C:7700" }
   owners:
     route_link: 3
     node_link: 3
@@ -67,7 +67,7 @@ node_link:
   heartbeat_interval: 10s
   node_dead_after: 30s
   # listen: ""      # 空 = 复用 member.listen;非空 = 独立 node 长连接监听
-  # advertise: ""
+  # advertise: ""   # node redirect 使用的本成员 node_link 地址;空 = member.advertise
 
 route_link:
   park_timeout: 30s
@@ -114,7 +114,9 @@ Registry 成员集由运维配置和 membership version 定义。每个命名空
 
 `node_link` 的接入层和状态层分离:node 可以连接任意 registry 成员,接入成员按
 `LocateN(node_id,N)` 得到 node owner set,逐个尝试把 register/订阅转交给首个成功响应的状态 owner。
-若接入成员本身在 owner set 内,它可以直接成为状态 owner;否则它作为 link holder 透明 relay 该连接。
+若接入成员本身在 owner set 内,它可以直接成为状态 owner;否则优先向支持 redirect 的 node 返回
+owner `node_advertise` 目标,让 node 直接重连到状态 owner;node 不支持 redirect 或没有可用目标时,
+接入成员作为 link holder 透明 relay 该连接。
 node 记录携带 `link_owner`,route owner 需要下发
 `create/key/build/delete` 时,通过 node-owner RPC 转发到实际持有 h2 stream 的 registry 成员。
 同一 shard 下某个 recordSet 的所有 owner 均可响应该 recordSet 的查询和 watch。写入达到要求 quorum
@@ -265,7 +267,8 @@ patch 与 manifest-key cache refresh;node_link 由 node 连接、心跳和事件
 
 活动 node 连接持有者在进入 joint/cutover 后:
 
-1. 接入成员按当前 membership 解析 node owner set,逐个尝试 owner,由首个成功 owner 发起或承接订阅。
+1. 接入成员按当前 membership 解析 node owner set。若 node 支持 redirect 且 owner 有 `node_advertise`,
+   接入成员返回 owner 列表让 node 直接重连;否则逐个尝试 owner relay,由首个成功 owner 发起或承接订阅。
 2. register 和后续低频 liveness refresh 把 node_list 投影写入当前 owner set。
 3. heartbeat、sandbox/build event、清单变化继续写入当前 node_link owner set。
 4. 记录中的 `link_owner` 保留实际 h2 stream 持有者;新 route/node owner 通过 node-owner RPC 向该成员

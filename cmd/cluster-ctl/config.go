@@ -88,7 +88,7 @@ membership:
   versions:
     - version: 1
       members:
-        - { id: registry-1, advertise: "https://registry-1.example:7700" }
+        - { id: registry-1, advertise: "https://registry-1.example:7700", node_advertise: "registry-1.example:7700" }
   owners:
     route_link: 1
     node_link: 1
@@ -96,7 +96,7 @@ membership:
     node_list: 1
 node_link:
   # listen: ""                       # optional split listener for node streams; empty = member.listen
-  # advertise: ""
+  # advertise: ""                    # endpoint returned to redirect-capable nodes; empty = member.advertise
   heartbeat_interval: 10s
   node_dead_after: 30s
 route_link:

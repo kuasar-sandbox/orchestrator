@@ -27,6 +27,9 @@ func TestLoadRegistryPartialAppliesDefaults(t *testing.T) {
 	if c.Member.Listen != ":8800" || c.NodeListen() != ":8800" {
 		t.Fatalf("member/node listen defaults not filled: member=%+v node=%+v", c.Member, c.NodeLink)
 	}
+	if got := c.Membership.Versions[0].Members[0].NodeAdvertise; got != c.NodeAdvertise() {
+		t.Fatalf("self node_advertise default=%q, want %q", got, c.NodeAdvertise())
+	}
 	if c.Membership.Active != 1 || len(c.Membership.Versions) != 1 || c.Membership.Owners.RouteLink != 1 || c.Membership.Owners.ScaleLink != 1 {
 		t.Fatalf("membership defaults not filled: %+v", c.Membership)
 	}

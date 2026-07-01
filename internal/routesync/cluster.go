@@ -102,12 +102,22 @@ const (
 // so the registry can place sandboxes (and later builds) on it and forward the
 // data plane to it (cluster.md §5.1 / §6.1).
 type NodeRegister struct {
-	NodeID        string            `json:"node_id"`
-	Labels        map[string]string `json:"labels,omitempty"`         // zone / pool / slot / node (nodeSelectors)
-	Capacity      int               `json:"capacity,omitempty"`       // max sandboxes (headroom signal)
-	BuildCapacity *BuildResources   `json:"build_capacity,omitempty"` // CPU/mem/storage build pool (§7.5)
-	DataEndpoint  string            `json:"data_endpoint,omitempty"`  // host:port the router forwards data-plane to
-	RuntimeDigest string            `json:"runtime_digest,omitempty"` // guest runtime identity
+	NodeID         string            `json:"node_id"`
+	Labels         map[string]string `json:"labels,omitempty"`          // zone / pool / slot / node (nodeSelectors)
+	Capacity       int               `json:"capacity,omitempty"`        // max sandboxes (headroom signal)
+	BuildCapacity  *BuildResources   `json:"build_capacity,omitempty"`  // CPU/mem/storage build pool (§7.5)
+	DataEndpoint   string            `json:"data_endpoint,omitempty"`   // host:port the router forwards data-plane to
+	RuntimeDigest  string            `json:"runtime_digest,omitempty"`  // guest runtime identity
+	AcceptRedirect bool              `json:"accept_redirect,omitempty"` // node can reconnect to owner endpoints from Hello.Redirect
+}
+
+type NodeLinkRedirect struct {
+	Targets []NodeLinkTarget `json:"targets"`
+}
+
+type NodeLinkTarget struct {
+	MemberID string `json:"member_id,omitempty"`
+	Endpoint string `json:"endpoint"`
 }
 
 // BuildResources is a node's build resource pool (or a build's request), kept

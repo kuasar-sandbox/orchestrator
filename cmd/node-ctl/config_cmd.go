@@ -202,6 +202,7 @@ checkpoint:                                        # paused-state tiering
 # cluster:                                         # connect this node to registry node_link (node.md §10)
 #   node_link:                                    # how to reach registry node_link
 #     endpoint: registry.cluster.example.com:7700 # "" = standalone single-node
+#     # node supports registry owner redirect; registry returns member node_advertise targets when available
 #     tls: { cert: "", key: "", ca: "" }          # node_link client mTLS; empty = plain h2c
 #   node_id: ""                                   # "" = hostname
 #   labels: { zone: z1, pool: default }

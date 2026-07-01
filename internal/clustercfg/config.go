@@ -57,8 +57,9 @@ type MembershipVersion struct {
 }
 
 type MembershipMember struct {
-	ID        string `yaml:"id" json:"id"`
-	Advertise string `yaml:"advertise" json:"advertise"`
+	ID            string `yaml:"id" json:"id"`
+	Advertise     string `yaml:"advertise" json:"advertise"`
+	NodeAdvertise string `yaml:"node_advertise,omitempty" json:"node_advertise,omitempty"`
 }
 
 type MembershipOwnerConfig struct {
@@ -438,6 +439,10 @@ func (c *RegistryConfig) applyDefaults() {
 				c.Membership.Versions[vi].Members[mi].Advertise == "" {
 				c.Membership.Versions[vi].Members[mi].Advertise = c.ControlAdvertise()
 			}
+			if c.Membership.Versions[vi].Members[mi].ID == c.Member.ID &&
+				c.Membership.Versions[vi].Members[mi].NodeAdvertise == "" {
+				c.Membership.Versions[vi].Members[mi].NodeAdvertise = c.NodeAdvertise()
+			}
 		}
 		c.Membership.Versions[vi] = c.Membership.Versions[vi].WithComputedLabel()
 	}
@@ -594,6 +599,13 @@ func (c *RegistryConfig) NodeListen() string {
 		return c.NodeLink.Listen
 	}
 	return c.Member.Listen
+}
+
+func (c *RegistryConfig) NodeAdvertise() string {
+	if c.NodeLink.Advertise != "" {
+		return c.NodeLink.Advertise
+	}
+	return c.ControlAdvertise()
 }
 
 // NodeLinkSplit reports whether node_link should bind a separate listener.

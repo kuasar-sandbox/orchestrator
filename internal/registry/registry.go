@@ -332,6 +332,7 @@ func (r *Registry) SetNodeLinkRelayPeers(peers map[string]NodeLinkRelayPeer) {
 			peer.Client = http.DefaultClient
 		}
 		peer.Endpoint = strings.TrimRight(peer.Endpoint, "/")
+		peer.RedirectEndpoint = strings.TrimRight(peer.RedirectEndpoint, "/")
 		cp[id] = peer
 	}
 	r.nodeLinkRelayMu.Lock()

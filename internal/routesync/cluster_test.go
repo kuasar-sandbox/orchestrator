@@ -22,10 +22,17 @@ func TestNodeLinkCodecRoundTrip(t *testing.T) {
 	nr := roundTrip(t, &Msg{Type: TypeNodeRegister, NodeReg: &NodeRegister{
 		NodeID: "n1", Labels: map[string]string{"zone": "z1", "slot": "c01-s03"},
 		BuildCapacity: &BuildResources{CPU: 4000, Mem: 8 << 30, Storage: 64 << 30},
-		DataEndpoint:  "10.0.0.1:8443",
+		DataEndpoint:  "10.0.0.1:8443", AcceptRedirect: true,
 	}})
-	if nr.NodeReg == nil || nr.NodeReg.NodeID != "n1" || nr.NodeReg.Labels["slot"] != "c01-s03" || nr.NodeReg.BuildCapacity.Mem != 8<<30 {
+	if nr.NodeReg == nil || nr.NodeReg.NodeID != "n1" || nr.NodeReg.Labels["slot"] != "c01-s03" || nr.NodeReg.BuildCapacity.Mem != 8<<30 || !nr.NodeReg.AcceptRedirect {
 		t.Fatalf("node_register round-trip: %+v", nr.NodeReg)
+	}
+
+	hello := roundTrip(t, &Msg{Type: TypeHello, Hello: &Hello{Version: Version, Redirect: &NodeLinkRedirect{Targets: []NodeLinkTarget{
+		{MemberID: "registry-2", Endpoint: "127.0.0.1:7702"},
+	}}}})
+	if hello.Hello == nil || hello.Hello.Redirect == nil || len(hello.Hello.Redirect.Targets) != 1 || hello.Hello.Redirect.Targets[0].MemberID != "registry-2" {
+		t.Fatalf("hello redirect round-trip: %+v", hello.Hello)
 	}
 
 	c := roundTrip(t, &Msg{Type: TypeCommand, Rev: 42, Cmd: &Command{

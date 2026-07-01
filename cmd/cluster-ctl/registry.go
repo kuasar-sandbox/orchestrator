@@ -376,9 +376,16 @@ func buildRegistryNodeLinkRelayPeers(cfg *clustercfg.RegistryConfig) (map[string
 		if err != nil {
 			return nil, fmt.Errorf("registry node-link relay member %q: %w", member.ID, err)
 		}
-		peers[member.ID] = registry.NodeLinkRelayPeer{Endpoint: base, Client: client}
+		peers[member.ID] = registry.NodeLinkRelayPeer{Endpoint: base, RedirectEndpoint: registryMemberNodeLinkEndpoint(member), Client: client}
 	}
 	return peers, nil
+}
+
+func registryMemberNodeLinkEndpoint(member clustercfg.MembershipMember) string {
+	if member.NodeAdvertise != "" {
+		return member.NodeAdvertise
+	}
+	return member.Advertise
 }
 
 func jointMembershipMembers(versions []clustercfg.MembershipVersion) []clustercfg.MembershipMember {

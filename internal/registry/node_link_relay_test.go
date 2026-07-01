@@ -63,6 +63,82 @@ func TestNodeLinkIngressRelaysToNodeOwner(t *testing.T) {
 	}
 }
 
+func TestNodeLinkIngressRedirectsToNodeOwner(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cluster := newShardStoreCluster(t, []string{"ingress", "owner"}, 1, 1, 1, 1)
+	nodeID := nodeOwnedBy(t, cluster["ingress"], "owner")
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	owner := New(cluster["owner"], placementWithToken(nodeID), 5*time.Second, log)
+	ingress := New(cluster["ingress"], placementWithToken(nodeID), 5*time.Second, log)
+
+	ownerMux := http.NewServeMux()
+	ownerMux.HandleFunc(NodeLinkRelayPath, owner.ServeNodeLinkRelay)
+	ownerSrv := httptest.NewServer(h2c.NewHandler(ownerMux, &http2.Server{}))
+	defer ownerSrv.Close()
+	ingress.SetNodeLinkRelayPeers(map[string]NodeLinkRelayPeer{"owner": {
+		Endpoint: ownerSrv.URL, RedirectEndpoint: "127.0.0.1:17702", Client: testH2CClient(),
+	}})
+
+	ingressMux := http.NewServeMux()
+	ingressMux.HandleFunc(routesync.NodeLinkPath, ingress.ServeNodeLink)
+	ingressSrv := httptest.NewServer(h2c.NewHandler(ingressMux, &http2.Server{}))
+	defer ingressSrv.Close()
+
+	pr, pw := io.Pipe()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, "http://registry"+routesync.NodeLinkPath, pr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr := &http2.Transport{
+		AllowHTTP: true,
+		DialTLSContext: func(ctx context.Context, _, _ string, _ *tls.Config) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "tcp", ingressSrv.Listener.Addr().String())
+		},
+	}
+	defer tr.CloseIdleConnections()
+	respCh := make(chan *http.Response, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		resp, err := tr.RoundTrip(req)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		respCh <- resp
+	}()
+	if err := routesync.WriteMsg(pw, &routesync.Msg{Type: routesync.TypeNodeRegister, NodeReg: &routesync.NodeRegister{
+		NodeID: nodeID, DataEndpoint: "10.0.0.1:8443", AcceptRedirect: true,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	defer pw.Close()
+	var resp *http.Response
+	select {
+	case resp = <-respCh:
+	case err := <-errCh:
+		t.Fatal(err)
+	case <-time.After(3 * time.Second):
+		t.Fatal("node-link redirect did not return response")
+	}
+	defer resp.Body.Close()
+	hello, err := routesync.ReadMsg(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hello.Type != routesync.TypeHello || hello.Hello == nil || hello.Hello.Redirect == nil ||
+		len(hello.Hello.Redirect.Targets) != 1 || hello.Hello.Redirect.Targets[0].MemberID != "owner" ||
+		hello.Hello.Redirect.Targets[0].Endpoint != "127.0.0.1:17702" {
+		t.Fatalf("redirect hello=%+v", hello.Hello)
+	}
+	if _, live := ingress.node(nodeID); live {
+		t.Fatal("ingress member unexpectedly holds redirected node_link stream")
+	}
+	if _, live := owner.node(nodeID); live {
+		t.Fatal("owner should not hold stream until node reconnects")
+	}
+}
+
 func testH2CClient() *http.Client {
 	return &http.Client{Transport: &http2.Transport{
 		AllowHTTP: true,
