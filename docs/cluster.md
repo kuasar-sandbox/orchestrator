@@ -45,12 +45,12 @@ registry 默认只有一个控制面监听,所有协议按 path 区分:
 member:
   id: A
   listen: "0.0.0.0:7700"
-  advertise: "https://A:7700"
 
 membership:
   active: 1
   # next: 2       # joint 阶段: active + next owner set 同时提交
   # old_grace: 1  # cutover 后:旧成员只作为 peer/node_link 接入保留,不进入 owner set
+  reload_ready_timeout: 10s
   versions:
     - version: 1
       members:
@@ -67,7 +67,6 @@ node_link:
   heartbeat_interval: 10s
   node_dead_after: 30s
   # listen: ""      # 空 = 复用 member.listen;非空 = 独立 node 长连接监听
-  # advertise: ""   # node redirect 使用的本成员 node_link 地址;空 = member.advertise
 
 route_link:
   park_timeout: 30s
@@ -151,6 +150,11 @@ registry 可以同时持有 `active`、`next` 和 `old_grace`:
 router、scaler 通过 `GET /cluster/membership` 获取成员表。刷新时会从 bootstrap 和已知成员中选择 active
 version 最新的 membership,避免单个 bootstrap 滞后影响切换。
 
+registry 初始启动先绑定统一监听,再让 memberlist 与 shardkv 访问自然收敛;否则 HTTP transport 还未监听,
+无法等待其他成员就绪。`reload_ready_timeout` 只作用于运行期 membership reload/cutover:新配置加载后,
+registry 会先加入 active/next 对应 memberlist 域并等待这些 owner 版本成员 ready,成功后才切换本地 topology。
+超时表示新 membership 尚未就绪,本次 reload 失败且旧 topology 继续服务,运维可在修复成员可达性后重试。
+
 ### 4.2 成员健康
 
 registry 成员之间按 membership label 启动独立 memberlist 故障检测域。成员清单仍只来自配置;memberlist
@@ -208,6 +212,7 @@ repair:        best-effort 写满 jointOwners
 ```text
 stable(v1)
   -> load_config(v2)
+  -> wait_membership_ready(v2)
   -> joint_node_link(v1,v2)
   -> node_list_refresh(v2)
   -> wait_scaler_ready(v2)
@@ -221,6 +226,10 @@ reload 只允许两类 membership active 变化:同 active 下加载/取消同�
 切到新的 `active`。不能从 stable(v1) 直接跳到 stable(v2)。cutover 配置可以带 `old_grace=v1`,让旧成员
 继续作为 node_link 接入和 node-owner RPC 目标,但 owner views 只包含 v2。
 
+registry reload 会先加入新 membership label 对应的 memberlist 域,等待 active/next owner versions 的成员
+全部 alive 后才切换 shard topology。`old_grace` 版本不参与该 barrier,避免旧接入成员影响新 owner set
+生效。
+
 ## 6. 状态复制
 
 `route_link`、`node_link`、`node_list` 和 registry 内部 `scale_link` 记录使用同一套 shardkv 基本模型:
@@ -233,6 +242,12 @@ reload 只允许两类 membership active 变化:同 active 下加载/取消同�
 recordSet 版本视角下对 quorum 可见:已达到该版本的成员应持有同一记录,未达到该版本的成员才可通过
 repair 补齐。若同一 recordSet head 出现分歧,catch-up 只选择“相同完整快照达到 shard quorum”的最高
 版本安装到本地和落后副本;不能按 key 合并多个成员的局部结果,否则会把未达 quorum 的部分写错误扩散。
+
+点读默认走 quorum。调用方可传 `ReadOptions{MinRev}`:若本成员已有该 recordSet 在当前 label 下的完整
+本地视图且 ready rev 不小于 `MinRev`,直接读取本地视图;否则回退 quorum。`ReadLocal` 只读本地完整视图,
+视图不存在、ready rev 不足或目标记录版本超过 ready rev 时返回 local-view-behind 错误。
+本地完整视图只由 `EnsureReady` / `Snapshot` / `Watch` 建立;普通 CAS、accept 或 read-repair 把记录安装到
+本地副本,但不会把该 recordSet 标记为完整 ready 视图。
 
 复制协议必须满足:
 
@@ -449,12 +464,16 @@ Build 记录按 group 存在 route_link;执行态和实时预算归 node owner�
 
 流程:
 
-1. route owner 收到 `ReserveBuild(group, resources)`。
+1. router 为一次 build register 生成稳定 `build_id/template_id`,然后向 route owner 调
+   `ReserveBuild(group, build_id, template_id, resources)`。同一次请求在 route owner
+   故障转移或重试时复用相同 id,避免重复创建 build。
 2. 调 scaler `PlaceBuild`。
 3. 向 node owner 请求 `AdmitBuild(build_id, resources, ttl)`。
 4. admission 成功后写 group build record。
 5. 下发 `build_register`。
-6. 失败路径 release admission;终态 build_event 释放预算。
+6. 若 `build_register` 命令写出后等待 `cmd_ack` 超时,route owner 保留已提交 build record
+   并返回 `BuildReserveResult`;后续 build_event 或 node 断连清理继续收敛。明确拒绝或发送失败
+   才 release admission 并回滚记录。终态 build_event 释放预算。
 
 `build_id` 查询必须带 group。若 node owner 发现预算不足,直接拒绝,route owner 重调度。
 

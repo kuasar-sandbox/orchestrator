@@ -16,6 +16,8 @@ type recordingNodeOwner struct {
 	allow    bool
 	admitted []string
 	released []string
+	ack      *routesync.CmdAck
+	ackErr   error
 }
 
 func (a *recordingNodeOwner) PutManifestKey(ctx context.Context, nodeID, fingerprint, keyType, keyValue string, expiresUnix int64) error {
@@ -48,6 +50,12 @@ func (a *recordingNodeOwner) SendCommand(ctx context.Context, nodeID string, cmd
 }
 
 func (a *recordingNodeOwner) SendCommandAndWait(ctx context.Context, nodeID string, cmd *routesync.Command, timeout time.Duration) (*routesync.CmdAck, error) {
+	if a.ackErr != nil {
+		return nil, a.ackErr
+	}
+	if a.ack != nil {
+		return a.ack, nil
+	}
 	return &routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted}, nil
 }
 
@@ -78,6 +86,35 @@ func TestReserveBuildUsesNodeOwnerBoundary(t *testing.T) {
 	reg.applyBuildEvent(ctx, "n1", &routesync.BuildEvent{Group: "/g", BuildID: res.BuildID, State: string(BuildReady)})
 	if len(admitter.released) != 1 || admitter.released[0] != res.BuildID {
 		t.Fatalf("released=%v, want %s", admitter.released, res.BuildID)
+	}
+}
+
+func TestReserveBuildKeepsCommittedBuildOnAckTimeout(t *testing.T) {
+	ctx := context.Background()
+	reg := testReg(t)
+	reg.SetPlacer(placementWithToken("n1"))
+	owner := &recordingNodeOwner{allow: true, ackErr: context.DeadlineExceeded}
+	reg.SetNodeOwner(owner)
+
+	res, err := reg.ReserveBuild(ctx, BuildReserveReq{
+		Group: "/g", BuildID: "bld-fixed", TemplateID: "transient-fixed",
+		Resources: &routesync.BuildResources{CPU: 2000},
+	})
+	if err != nil {
+		t.Fatalf("reserve build should return the committed build on ack timeout: %v", err)
+	}
+	if res.BuildID != "bld-fixed" || res.TemplateID != "transient-fixed" || res.NodeID != "n1" {
+		t.Fatalf("reserve result=%+v", res)
+	}
+	rec, found, err := reg.stores.GetBuildInGroup(ctx, "/g", "bld-fixed")
+	if err != nil || !found {
+		t.Fatalf("build record found=%v err=%v", found, err)
+	}
+	if rec.State != BuildRegistered || rec.TemplateID != "transient-fixed" {
+		t.Fatalf("build record after timeout=%+v", rec)
+	}
+	if len(owner.released) != 0 {
+		t.Fatalf("ack timeout should not release an ambiguous build admission: %v", owner.released)
 	}
 }
 

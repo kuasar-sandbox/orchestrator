@@ -27,11 +27,14 @@ func TestLoadRegistryPartialAppliesDefaults(t *testing.T) {
 	if c.Member.Listen != ":8800" || c.NodeListen() != ":8800" {
 		t.Fatalf("member/node listen defaults not filled: member=%+v node=%+v", c.Member, c.NodeLink)
 	}
-	if got := c.Membership.Versions[0].Members[0].NodeAdvertise; got != c.NodeAdvertise() {
-		t.Fatalf("self node_advertise default=%q, want %q", got, c.NodeAdvertise())
+	if got := c.SelfNodeAdvertise(); got != defaultRegistryBootstrap {
+		t.Fatalf("self node_advertise default=%q, want %q", got, defaultRegistryBootstrap)
 	}
 	if c.Membership.Active != 1 || len(c.Membership.Versions) != 1 || c.Membership.Owners.RouteLink != 1 || c.Membership.Owners.ScaleLink != 1 {
 		t.Fatalf("membership defaults not filled: %+v", c.Membership)
+	}
+	if c.Membership.ReloadReadyTimeout != "10s" {
+		t.Fatalf("membership reload_ready_timeout default=%q, want 10s", c.Membership.ReloadReadyTimeout)
 	}
 	if c.NodeLink.HeartbeatInterval != "10s" || c.NodeLink.NodeDeadAfter != "30s" {
 		t.Fatalf("node_link defaults not filled: %+v", c.NodeLink)
@@ -84,6 +87,11 @@ func TestRegistryValidateRejects(t *testing.T) {
 	if err := c.Validate(); err == nil {
 		t.Fatal("bad duration should be rejected")
 	}
+	c = DefaultRegistry()
+	c.Membership.ReloadReadyTimeout = "notaduration"
+	if err := c.Validate(); err == nil {
+		t.Fatal("bad membership reload_ready_timeout should be rejected")
+	}
 }
 
 func TestRegistryMembershipNextAllowsNextOnlyMember(t *testing.T) {
@@ -92,8 +100,14 @@ func TestRegistryMembershipNextAllowsNextOnlyMember(t *testing.T) {
 	c.Membership.Active = 1
 	c.Membership.Next = 2
 	c.Membership.Versions = []MembershipVersion{
-		{Version: 1, Members: []MembershipMember{{ID: "a"}, {ID: "b"}}},
-		{Version: 2, Members: []MembershipMember{{ID: "b"}, {ID: "c"}}},
+		{Version: 1, Members: []MembershipMember{
+			{ID: "a", Advertise: "http://a.example.test"},
+			{ID: "b", Advertise: "http://b.example.test"},
+		}},
+		{Version: 2, Members: []MembershipMember{
+			{ID: "b", Advertise: "http://b.example.test"},
+			{ID: "c", Advertise: "http://c.example.test"},
+		}},
 	}
 	if err := c.Validate(); err != nil {
 		t.Fatalf("next-only member should validate: %v", err)

@@ -27,10 +27,10 @@ cluster-ctl scaler --config /etc/cluster-ctl/scaler.yaml
 | 字段 | 说明 |
 |---|---|
 | `registry.bootstrap` | registry bootstrap endpoint,用于拉取 membership |
-| `member.id` | scaler 实例 id |
-| `member.listen` | scaler HTTP API 监听 |
-| `member.advertise` | registry 调用 scaler 的地址 |
-| `memberlist.label` | scaler memberlist label,默认 `scaler.default` |
+| `scaler.id` | scaler 实例 id |
+| `scaler.listen` | scaler HTTP API 监听 |
+| `scaler.advertise` | registry 调用 scaler 的地址,同时也是 scaler memberlist HTTP transport 地址 |
+| `scaler.memberlist_label` | scaler memberlist label,默认 `scaler.default` |
 | `import_groups[]` | standalone scaler 的 group source;首版内置 `source_type=file` |
 | `placement.candidates` | scaler 内部 node P2C 候选数量 |
 | `placement.zone_admit_max` | 可放置最高水位 |
@@ -117,11 +117,11 @@ node_list owner 分片内全复制,所以 scaler 不需要也不能把多个 own
 
 ## 6. Scale-link 成员域
 
-scaler 启动后加入 `memberlist.label` 指定的 scaler memberlist,并周期性向每个 active / next registry
+scaler 启动后加入 `scaler.memberlist_label` 指定的 scaler memberlist,并周期性向每个 active / next registry
 owner 成员注册 seed:
 
 ```json
-{"id":"s1","advertise":"https://s1:7800","memberlist_label":"scaler.default","memberlist_advertise":"https://s1:7800"}
+{"id":"s1","advertise":"https://s1:7800","memberlist_label":"scaler.default"}
 ```
 
 scaler ready 的条件:
@@ -199,7 +199,7 @@ registry 不对 scaler 做 P2C。P2C 只用于 scaler 内部从 node 候选中�
 
 ### 7.4 PlaceBuild
 
-输入:`group, resources`
+输入:`group, build_id, template_id, resources`
 
 流程与 sandbox 类似,但候选需要 build_capacity 满足请求。最终预算权威在 node owner:
 

@@ -2,6 +2,7 @@ package registry
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -21,9 +22,11 @@ type BuildReserveResult struct {
 // BuildReserveReq is the router's build-register ask: the group + the (optional)
 // declared build resources + the template config metadata (cpu/memory/headers).
 type BuildReserveReq struct {
-	Group     string                    `json:"group"`
-	Resources *routesync.BuildResources `json:"resources,omitempty"`
-	Metadata  map[string]string         `json:"metadata,omitempty"`
+	Group      string                    `json:"group"`
+	BuildID    string                    `json:"build_id,omitempty"`
+	TemplateID string                    `json:"template_id,omitempty"`
+	Resources  *routesync.BuildResources `json:"resources,omitempty"`
+	Metadata   map[string]string         `json:"metadata,omitempty"`
 }
 
 // defaultBuildResources is one build's resource footprint when the request omits
@@ -46,8 +49,21 @@ func (r *Registry) ReserveBuild(ctx context.Context, req BuildReserveReq) (*Buil
 	if resources == nil {
 		resources = defaultBuildResources
 	}
-	buildID := "bld-" + newID()
-	templateID := "transient-" + newID()
+	buildID := req.BuildID
+	if buildID == "" {
+		buildID = "bld-" + newID()
+	}
+	templateID := req.TemplateID
+	if templateID == "" {
+		templateID = "transient-" + newID()
+	}
+	if req.BuildID != "" {
+		if rec, found, err := r.stores.GetBuildInGroup(ctx, req.Group, req.BuildID); err != nil {
+			return nil, err
+		} else if found {
+			return r.buildReserveResult(ctx, rec), nil
+		}
+	}
 
 	// Place + commit, re-asking once if the suggested node lacks headroom for THIS
 	// build given the already-RESERVED builds (the registry is authoritative, §7.5).
@@ -68,7 +84,7 @@ func (r *Registry) ReserveBuild(ctx context.Context, req BuildReserveReq) (*Buil
 			return nil, ErrNoNode
 		}
 		// Commit the group build record after node-owner admission succeeds.
-		rec := &BuildRecord{Group: req.Group, BuildID: buildID, NodeID: id, Resources: resources, State: BuildRegistered}
+		rec := &BuildRecord{Group: req.Group, BuildID: buildID, NodeID: id, Resources: resources, State: BuildRegistered, TemplateID: templateID}
 		if err := r.stores.PutBuild(ctx, rec); err != nil {
 			r.releaseBuildAdmission(buildID)
 			return nil, err
@@ -87,6 +103,9 @@ func (r *Registry) ReserveBuild(ctx context.Context, req BuildReserveReq) (*Buil
 			return nil, ErrNodeGone
 		}
 		ack, err := r.nodeOwner.SendCommandAndWait(ctx, id, cmd, buildRegisterAckTimeout)
+		if buildAckTimeout(ctx, err) {
+			return r.buildReserveResult(ctx, rec), nil
+		}
 		if err != nil || ack == nil || ack.Status != routesync.AckAccepted {
 			_ = r.stores.DeleteBuild(ctx, req.Group, buildID) // roll back the reservation
 			_ = r.stores.RemoveNodeBuildRef(ctx, id, req.Group, buildID)
@@ -108,7 +127,23 @@ func (r *Registry) ReserveBuild(ctx context.Context, req BuildReserveReq) (*Buil
 	if nodeID == "" {
 		return nil, ErrNoNode
 	}
-	return &BuildReserveResult{BuildID: buildID, TemplateID: templateID, NodeID: nodeID, DataEndpoint: r.nodeDataEndpoint(ctx, nodeID)}, nil
+	return r.buildReserveResult(ctx, &BuildRecord{Group: req.Group, BuildID: buildID, TemplateID: templateID, NodeID: nodeID}), nil
+}
+
+func buildAckTimeout(ctx context.Context, err error) bool {
+	return err != nil && ctx.Err() == nil && errors.Is(err, context.DeadlineExceeded)
+}
+
+func (r *Registry) buildReserveResult(ctx context.Context, rec *BuildRecord) *BuildReserveResult {
+	if rec == nil {
+		return nil
+	}
+	return &BuildReserveResult{
+		BuildID:      rec.BuildID,
+		TemplateID:   rec.TemplateID,
+		NodeID:       rec.NodeID,
+		DataEndpoint: r.nodeDataEndpoint(ctx, rec.NodeID),
+	}
 }
 
 func (r *Registry) admitBuild(ctx context.Context, nodeID, buildID string, want *routesync.BuildResources) bool {

@@ -2,6 +2,7 @@ package registry
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -14,6 +15,7 @@ type rpcNodeOwner struct {
 	ops      []string
 	admit    bool
 	released []string
+	ackErr   error
 }
 
 func (o *rpcNodeOwner) PutManifestKey(ctx context.Context, nodeID, fingerprint, keyType, keyValue string, expiresUnix int64) error {
@@ -51,6 +53,9 @@ func (o *rpcNodeOwner) SendCommand(ctx context.Context, nodeID string, cmd *rout
 
 func (o *rpcNodeOwner) SendCommandAndWait(ctx context.Context, nodeID string, cmd *routesync.Command, timeout time.Duration) (*routesync.CmdAck, error) {
 	o.ops = append(o.ops, "wait:"+nodeID+":"+cmd.Kind)
+	if o.ackErr != nil {
+		return nil, o.ackErr
+	}
 	return &routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted}, nil
 }
 
@@ -98,5 +103,20 @@ func TestHTTPNodeOwner(t *testing.T) {
 	}
 	if len(owner.released) != 1 || owner.released[0] != "b1" {
 		t.Fatalf("released=%v", owner.released)
+	}
+}
+
+func TestHTTPNodeOwnerPreservesCommandWaitDeadline(t *testing.T) {
+	ctx := context.Background()
+	owner := &rpcNodeOwner{ackErr: context.DeadlineExceeded}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ServeNodeOwner(w, r, owner)
+	}))
+	defer srv.Close()
+
+	client := NewHTTPNodeOwner(srv.URL, srv.Client())
+	_, err := client.SendCommandAndWait(ctx, "n1", &routesync.Command{CmdID: "c1", Kind: routesync.CmdBuildRegister}, time.Second)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("SendCommandAndWait err=%v, want context deadline", err)
 	}
 }

@@ -36,10 +36,9 @@ type ViewEvent struct {
 }
 
 type ScalerRegister struct {
-	ID                  string `json:"id"`
-	Advertise           string `json:"advertise"`
-	MemberlistLabel     string `json:"memberlist_label"`
-	MemberlistAdvertise string `json:"memberlist_advertise"`
+	ID              string `json:"id"`
+	Advertise       string `json:"advertise"`
+	MemberlistLabel string `json:"memberlist_label"`
 }
 
 type ImportSourceLeaseRequest struct {
@@ -112,11 +111,7 @@ func (r *Registry) serveScalerRegister(w http.ResponseWriter, req *http.Request)
 		http.Error(w, "memberlist_label does not match registry scale_link.scaler_label", http.StatusConflict)
 		return
 	}
-	memberlistAdvertise := in.MemberlistAdvertise
-	if memberlistAdvertise == "" {
-		memberlistAdvertise = in.Advertise
-	}
-	if err := r.joinScalerSeed(req.Context(), in.ID, label, memberlistAdvertise); err != nil {
+	if err := r.joinScalerSeed(req.Context(), in.ID, label, in.Advertise); err != nil {
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
 	}

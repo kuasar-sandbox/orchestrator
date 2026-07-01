@@ -60,38 +60,43 @@ func runScaler(args []string, log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	activeLabel, err := regClient.ActiveLabel(ctx)
+	if err != nil {
+		return err
+	}
 	links := registryLinks(eps)
 	groupInputs, err := scaler.NewConfiguredGroupInputs(cfg.ImportGroups)
 	if err != nil {
 		return err
 	}
 	svc := scaler.NewRemoteLinksWithGroups(links, groupInputs.Provider, groupInputs.Sources, cfg.Placement, deadAfter, log)
-	svc.SetNodeListLinks(ctx, registryLinks(nodeListEps))
+	svc.SetNodeListLinksForLabel(ctx, registryLinks(nodeListEps), activeLabel)
 	svc.SetScaleLinkResolver(newScaleLinkResolver(regClient))
+	svc.SetScaleLinkRefresher(regClient.Refresh)
 	memberHub := membergroup.NewHub()
-	memberlistTLS, err := membergroupTLSConfig(cfg.Member.TLS)
+	memberlistTLS, err := membergroupTLSConfig(cfg.Scaler.TLS)
 	if err != nil {
 		return fmt.Errorf("scaler memberlist tls: %w", err)
 	}
 	scalerGroup, err := membergroup.New(membergroup.Options{
-		Label: cfg.Memberlist.Label, Name: cfg.Member.ID, Hub: memberHub, Log: log,
+		Label: cfg.Scaler.MemberlistLabel, Name: cfg.Scaler.ID, Hub: memberHub, Log: log,
 		TLSConfig: memberlistTLS,
 		Meta: membergroup.Meta{
-			Role: membergroup.RoleScaler, ID: cfg.Member.ID,
-			APIAdvertise: cfg.Member.Advertise, MemberlistAdvertise: cfg.Member.Advertise,
+			Role: membergroup.RoleScaler, ID: cfg.Scaler.ID,
+			APIAdvertise: cfg.Scaler.Advertise, MemberlistAdvertise: cfg.Scaler.Advertise,
 		},
 	})
 	if err != nil {
 		return err
 	}
 	defer scalerGroup.Shutdown()
-	svc.SetImportSourceOwnerSource(cfg.Member.ID, func() []string {
+	svc.SetImportSourceOwnerSource(cfg.Scaler.ID, func() []string {
 		if err := regClient.Refresh(ctx); err != nil {
-			return []string{cfg.Member.ID}
+			return []string{cfg.Scaler.ID}
 		}
 		label, err := regClient.ActiveLabel(ctx)
 		if err != nil {
-			return []string{cfg.Member.ID}
+			return []string{cfg.Scaler.ID}
 		}
 		metas := scalerGroup.ReadyScalers(label)
 		ids := make([]string, 0, len(metas))
@@ -101,21 +106,25 @@ func runScaler(args []string, log *slog.Logger) error {
 			}
 		}
 		if len(ids) == 0 {
-			ids = append(ids, cfg.Member.ID)
+			ids = append(ids, cfg.Scaler.ID)
 		}
 		return ids
 	})
 	mux := http.NewServeMux()
 	memberHub.Mount(mux)
 	svc.ServeScaleLink(mux)
+	httpServer, err := newClusterHTTPServer("scaler", cfg.Scaler.Listen, cfg.Scaler.TLS, mux)
+	if err != nil {
+		return err
+	}
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- serveClusterHTTP(ctx, "scaler", cfg.Member.Listen, cfg.Member.TLS, mux, log)
+		errCh <- httpServer.Serve(ctx, log)
 	}()
 	svc.Start(ctx)
 	go runScalerRegistryLinks(ctx, regClient, svc, log)
-	go runScalerMemberMeta(ctx, scalerGroup, svc, regClient, cfg.Member.Advertise, log)
-	go svc.RegisterLoopDynamic(ctx, cfg.Member.ID, cfg.Member.Advertise, cfg.Memberlist.Label, cfg.Member.Advertise)
+	go runScalerMemberMeta(ctx, scalerGroup, svc, regClient, cfg.Scaler.Advertise, log)
+	go svc.RegisterLoop(ctx, cfg.Scaler.ID, cfg.Scaler.Advertise, cfg.Scaler.MemberlistLabel)
 	log.Info("cluster-ctl scaler", "registry", registryAddr, "registry_members", len(links), "registry_tls", registryTLS != nil,
 		"group_sources", len(cfg.ImportGroups), "candidates", cfg.Placement.Candidates, "zone_admit_max", cfg.Placement.ZoneAdmitMax,
 		"shuffle_rules", len(cfg.Placement.ShuffleSharding))
@@ -131,18 +140,15 @@ func runScalerMemberMeta(ctx context.Context, group *membergroup.Group, svc *sca
 	t := time.NewTicker(time.Second)
 	defer t.Stop()
 	update := func() {
-		ready := svc.Ready()
 		label := ""
-		if ready {
-			if err := regClient.Refresh(ctx); err != nil {
-				log.Warn("scaler: memberlist ready label", "err", err)
-				ready = false
-			} else if got, err := regClient.ActiveLabel(ctx); err != nil {
-				log.Warn("scaler: memberlist active label", "err", err)
-				ready = false
-			} else {
-				label = got
-			}
+		ready := false
+		if err := regClient.Refresh(ctx); err != nil {
+			log.Warn("scaler: memberlist ready label", "err", err)
+		} else if got, err := regClient.ActiveLabel(ctx); err != nil {
+			log.Warn("scaler: memberlist active label", "err", err)
+		} else {
+			label = got
+			ready = svc.ReadyForLabel(label)
 		}
 		if err := group.UpdateMeta(membergroup.Meta{
 			Role: membergroup.RoleScaler, ID: group.Name(),
@@ -181,8 +187,13 @@ func runScalerRegistryLinks(ctx context.Context, regClient *clusterclient.Regist
 			log.Warn("scaler: node_list endpoints", "err", err)
 			return
 		}
+		label, err := regClient.ActiveLabel(ctx)
+		if err != nil {
+			log.Warn("scaler: active label", "err", err)
+			return
+		}
 		svc.SetRegistryLinks(ctx, registryLinks(eps))
-		svc.SetNodeListLinks(ctx, registryLinks(nodeListEps))
+		svc.SetNodeListLinksForLabel(ctx, registryLinks(nodeListEps), label)
 	}
 	refresh()
 	for {

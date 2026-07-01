@@ -25,7 +25,8 @@ func TestScaleLinkRegisterSeedsScalerObserverMemberlist(t *testing.T) {
 
 	cfg := clustercfg.DefaultRegistry()
 	cfg.Member.ID = "registry-1"
-	cfg.Member.Advertise = regSrv.URL
+	cfg.Membership.Versions[0].Members[0].ID = "registry-1"
+	cfg.Membership.Versions[0].Members[0].Advertise = regSrv.URL
 	cfg.ScaleLink.ScalerLabel = "scaler.default"
 	observer, err := newScalerObserverRuntime(&cfg, regHub, log)
 	if err != nil {
@@ -60,7 +61,7 @@ func TestScaleLinkRegisterSeedsScalerObserverMemberlist(t *testing.T) {
 	var body bytes.Buffer
 	if err := json.NewEncoder(&body).Encode(registry.ScalerRegister{
 		ID: "scaler-1", Advertise: scalerSrv.URL,
-		MemberlistLabel: "scaler.default", MemberlistAdvertise: scalerSrv.URL,
+		MemberlistLabel: "scaler.default",
 	}); err != nil {
 		t.Fatal(err)
 	}

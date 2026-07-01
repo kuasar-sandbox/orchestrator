@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -13,14 +14,17 @@ import (
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/registry"
 )
 
+var (
+	registryMembershipReadyPoll = 100 * time.Millisecond
+)
+
 type registryMemberRuntime struct {
-	mu      sync.RWMutex
-	hub     *membergroup.Hub
-	groups  map[string]*managedMemberGroup
-	selfID  string
-	selfURL string
-	tlsCfg  *tls.Config
-	log     *slog.Logger
+	mu     sync.RWMutex
+	hub    *membergroup.Hub
+	groups map[string]*managedMemberGroup
+	selfID string
+	tlsCfg *tls.Config
+	log    *slog.Logger
 }
 
 type managedMemberGroup struct {
@@ -36,7 +40,7 @@ func newRegistryMemberRuntime(ctx context.Context, cfg *clustercfg.RegistryConfi
 	}
 	rt := &registryMemberRuntime{
 		hub: hub, groups: map[string]*managedMemberGroup{},
-		selfID: cfg.Member.ID, selfURL: cfg.Member.Advertise, tlsCfg: tlsCfg, log: log,
+		selfID: cfg.Member.ID, tlsCfg: tlsCfg, log: log,
 	}
 	if err := rt.Sync(ctx, cfg); err != nil {
 		return nil, err
@@ -73,9 +77,10 @@ func (r *registryMemberRuntime) Sync(ctx context.Context, cfg *clustercfg.Regist
 			name = fmt.Sprintf("observer.%s.%d", cfg.Member.ID, version.Version)
 			role = membergroup.RoleObserver
 		}
+		selfAdvertise := cfg.SelfAdvertise()
 		meta := membergroup.Meta{
-			Role: role, ID: name, APIAdvertise: cfg.Member.Advertise,
-			MemberlistAdvertise: cfg.Member.Advertise,
+			Role: role, ID: name, APIAdvertise: selfAdvertise,
+			MemberlistAdvertise: selfAdvertise,
 		}
 		g, err := membergroup.New(membergroup.Options{
 			Label: label, Name: name, Hub: r.hub, Seeds: seeds, Meta: meta, Log: r.log, TLSConfig: r.tlsCfg,
@@ -101,6 +106,64 @@ func (r *registryMemberRuntime) Sync(ctx context.Context, cfg *clustercfg.Regist
 	}
 	r.mu.Unlock()
 	return nil
+}
+
+func (r *registryMemberRuntime) WaitReady(ctx context.Context, cfg *clustercfg.RegistryConfig) error {
+	if r == nil {
+		return nil
+	}
+	waitCtx := ctx
+	cancel := func() {}
+	if timeout := cfg.Membership.ReloadReadyTimeoutDur(); timeout > 0 {
+		waitCtx, cancel = context.WithTimeout(ctx, timeout)
+	}
+	defer cancel()
+	ticker := time.NewTicker(registryMembershipReadyPoll)
+	defer ticker.Stop()
+	for {
+		missing := r.missingOwnerMembers(cfg.Membership.OwnerVersions())
+		if len(missing) == 0 {
+			return nil
+		}
+		select {
+		case <-waitCtx.Done():
+			return fmt.Errorf("registry memberlist barrier: %w; missing %s", waitCtx.Err(), strings.Join(missing, ","))
+		case <-ticker.C:
+		}
+	}
+}
+
+func (r *registryMemberRuntime) missingOwnerMembers(versions []clustercfg.MembershipVersion) []string {
+	var missing []string
+	for _, version := range versions {
+		mg, ok := r.group(version.Label)
+		if !ok {
+			missing = append(missing, version.Label+":<group>")
+			continue
+		}
+		for _, member := range version.Members {
+			if member.ID == "" {
+				continue
+			}
+			if !mg.group.Alive(member.ID) {
+				missing = append(missing, version.Label+":"+member.ID)
+			}
+		}
+	}
+	return missing
+}
+
+func (r *registryMemberRuntime) Shutdown() {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for label, mg := range r.groups {
+		mg.cancel()
+		_ = mg.group.Shutdown()
+		delete(r.groups, label)
+	}
 }
 
 func (r *registryMemberRuntime) group(label string) (*managedMemberGroup, bool) {
@@ -173,7 +236,7 @@ func newScalerObserverRuntime(cfg *clustercfg.RegistryConfig, hub *membergroup.H
 		Label: label, Name: name, Hub: hub, Log: log, TLSConfig: tlsCfg,
 		Meta: membergroup.Meta{
 			Role: membergroup.RoleObserver, ID: name,
-			APIAdvertise: cfg.Member.Advertise, MemberlistAdvertise: cfg.Member.Advertise,
+			APIAdvertise: cfg.SelfAdvertise(), MemberlistAdvertise: cfg.SelfAdvertise(),
 		},
 	})
 	if err != nil {

@@ -14,7 +14,7 @@ import (
 const (
 	RouteLinkReservePath      = "/route-link/reserve"       // POST ?group=&route_key= -> ReserveResult
 	RouteLinkRoutePath        = "/route-link/route"         // GET  ?group=&route_key=&sid= -> RouteResolve
-	RouteLinkReserveBuildPath = "/route-link/reserve-build" // POST {group,resources,metadata} -> BuildReserveResult
+	RouteLinkReserveBuildPath = "/route-link/reserve-build" // POST {group,build_id,template_id,resources,metadata} -> BuildReserveResult
 	RouteLinkBuildPath        = "/route-link/build"         // GET  ?group=&build_id=  -> BuildReserveResult (resolve)
 	RouteLinkListPath         = "/route-link/list"          // GET  ?group=            -> the group's sandbox shard
 	RouteLinkVerifyKeyPath    = "/route-link/verify-key"    // GET  ?group=&api_key=   -> 200 valid / 403 invalid

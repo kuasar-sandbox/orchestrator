@@ -62,6 +62,95 @@ func TestShardCASGetDeleteSizeOne(t *testing.T) {
 	}
 }
 
+func TestRecordSetReadLocalRequiresReadyView(t *testing.T) {
+	ctx := context.Background()
+	store := newSingleStore(t, "m1")
+	sh := mustRecordSet(t, store, testNS, "s1", testRS)
+
+	if _, ok, err := sh.CAS(ctx, "k1", 0, []byte("v1")); err != nil || !ok {
+		t.Fatalf("CAS create ok=%v err=%v", ok, err)
+	}
+	if _, _, err := sh.Get(ctx, "k1", ReadOptions{Policy: ReadLocal}); !errors.Is(err, ErrLocalViewBehind) {
+		t.Fatalf("ReadLocal before ready err=%v, want ErrLocalViewBehind", err)
+	}
+	if _, err := sh.Snapshot(ctx); err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	got, found, err := sh.Get(ctx, "k1", ReadOptions{Policy: ReadLocal})
+	if err != nil || !found || string(got.Value) != "v1" {
+		t.Fatalf("ReadLocal after ready got=%q found=%v err=%v", string(got.Value), found, err)
+	}
+}
+
+func TestRecordSetReadDefaultMinRevUsesReadyLocalView(t *testing.T) {
+	ctx := context.Background()
+	ready := newReadyMap()
+	cluster := newTestCluster(t, []MemberID{"m1", "m2", "m3"}, 3, ready)
+	sh := mustRecordSet(t, cluster["m1"], testNS, "s1", testRS)
+
+	if _, ok, err := sh.CAS(ctx, "k1", 0, []byte("v1")); err != nil || !ok {
+		t.Fatalf("CAS k1 ok=%v err=%v", ok, err)
+	}
+	if _, err := sh.Snapshot(ctx); err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	if _, ok, err := sh.CAS(ctx, "k2", 0, []byte("v2")); err != nil || !ok {
+		t.Fatalf("CAS k2 ok=%v err=%v", ok, err)
+	}
+	ready.set("m2", false)
+	ready.set("m3", false)
+
+	got, found, err := sh.Get(ctx, "k1", ReadOptions{MinRev: 1})
+	if err != nil || !found || string(got.Value) != "v1" {
+		t.Fatalf("ReadDefault+MinRev local got=%q found=%v err=%v", string(got.Value), found, err)
+	}
+	if _, _, err := sh.Get(ctx, "k2", ReadOptions{Policy: ReadLocal, MinRev: 1}); !errors.Is(err, ErrLocalViewBehind) {
+		t.Fatalf("ReadLocal saw record beyond ready rev err=%v, want ErrLocalViewBehind", err)
+	}
+	if _, _, err := sh.Get(ctx, "k2", ReadOptions{MinRev: 2}); !errors.Is(err, ErrQuorum) {
+		t.Fatalf("ReadDefault+MinRev fallback err=%v, want ErrQuorum", err)
+	}
+}
+
+func TestRecordSetCASConcurrentDifferentKeys(t *testing.T) {
+	ctx := context.Background()
+	cluster := newTestCluster(t, []MemberID{"m1", "m2", "m3"}, 3, nil)
+	sh := mustRecordSet(t, cluster["m1"], testNS, "s1", testRS)
+	const writers = 24
+	start := make(chan struct{})
+	errCh := make(chan error, writers)
+	for i := 0; i < writers; i++ {
+		i := i
+		go func() {
+			<-start
+			key := RecordKey(fmt.Sprintf("k%02d", i))
+			_, ok, err := sh.CAS(ctx, key, 0, []byte(fmt.Sprintf("v%02d", i)))
+			if err != nil {
+				errCh <- err
+				return
+			}
+			if !ok {
+				errCh <- fmt.Errorf("CAS %s returned ok=false", key)
+				return
+			}
+			errCh <- nil
+		}()
+	}
+	close(start)
+	for i := 0; i < writers; i++ {
+		if err := <-errCh; err != nil {
+			t.Fatalf("concurrent CAS failed: %v", err)
+		}
+	}
+	snap, err := sh.Snapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snap.Rev != writers || len(snap.Records) != writers {
+		t.Fatalf("snapshot rev=%d records=%d, want %d/%d", snap.Rev, len(snap.Records), writers, writers)
+	}
+}
+
 func TestShardRepairsLaggingReplica(t *testing.T) {
 	ctx := context.Background()
 	cluster := newTestCluster(t, []MemberID{"m1", "m2", "m3"}, 3, nil)
@@ -289,6 +378,98 @@ func TestWatchResetAndIncrementalEvents(t *testing.T) {
 	token, ok := parseWatchToken(live.Token)
 	if !ok || token.Label != "v1" {
 		t.Fatalf("live token=%q parsed=%+v ok=%v, want label v1", live.Token, token, ok)
+	}
+}
+
+func TestWatchSurvivesSnapshotInstallReset(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	store := newSingleStore(t, "m1")
+	sh := mustRecordSet(t, store, testNS, "s1", testRS)
+	w, err := sh.Watch(ctx, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertEvent(t, w.Events, EventReset, "")
+	assertEvent(t, w.Events, EventBookmark, "")
+
+	ls, err := store.getLocalShard(testNS, "s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	localSet := ls.recordSet(testRS, time.Now())
+	installed := localSet.install([]Record{{
+		Namespace: testNS, Shard: "s1", RecordSet: testRS, Key: "k1", Value: []byte("v1"),
+		Meta: RecordMeta{Ballot: Ballot{Round: 1, Writer: "repair"}, Rev: 1, UpdatedAt: time.Now()},
+	}}, 1, time.Now())
+	if !installed {
+		t.Fatal("install snapshot failed")
+	}
+	assertEvent(t, w.Events, EventReset, "")
+	assertEvent(t, w.Events, EventPut, "k1")
+	assertEvent(t, w.Events, EventBookmark, "")
+
+	if _, ok, err := sh.CAS(ctx, "k2", 0, []byte("v2")); err != nil || !ok {
+		t.Fatalf("CAS k2 ok=%v err=%v", ok, err)
+	}
+	assertEvent(t, w.Events, EventPut, "k2")
+}
+
+func TestWatchResetStreamsLargeSnapshotWithoutBlocking(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	store := newSingleStore(t, "m1")
+	sh := mustRecordSet(t, store, testNS, "s1", testRS)
+	ls, err := store.getLocalShard(testNS, "s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	localSet := ls.recordSet(testRS, time.Now())
+	records := make([]Record, 0, 1500)
+	for i := 0; i < 1500; i++ {
+		key := RecordKey(fmt.Sprintf("k-%04d", i))
+		records = append(records, Record{
+			Namespace: testNS, Shard: "s1", RecordSet: testRS, Key: key, Value: []byte("v"),
+			Meta: RecordMeta{Ballot: Ballot{Round: uint64(i + 1), Writer: "seed"}, Rev: uint64(i + 1), UpdatedAt: time.Now()},
+		})
+	}
+	if !localSet.install(records, 1500, time.Now()) {
+		t.Fatal("install large snapshot failed")
+	}
+
+	type watchResult struct {
+		w   Watch
+		err error
+	}
+	done := make(chan watchResult, 1)
+	go func() {
+		w, err := sh.Watch(ctx, "bad-token")
+		done <- watchResult{w: w, err: err}
+	}()
+	var w Watch
+	select {
+	case res := <-done:
+		if res.err != nil {
+			t.Fatal(res.err)
+		}
+		w = res.w
+	case <-time.After(time.Second):
+		t.Fatal("Watch blocked while preparing a large reset snapshot")
+	}
+	assertEvent(t, w.Events, EventReset, "")
+	count := 0
+	for {
+		ev := assertAnyEvent(t, w.Events)
+		if ev.Type == EventBookmark {
+			break
+		}
+		if ev.Type != EventPut {
+			t.Fatalf("event=%+v, want put/bookmark", ev)
+		}
+		count++
+	}
+	if count != 1500 {
+		t.Fatalf("reset put count=%d, want 1500", count)
 	}
 }
 
@@ -592,16 +773,43 @@ func TestCompactEmptyShardGC(t *testing.T) {
 	}
 }
 
+func TestRecordSetCoordinatorStateIsBounded(t *testing.T) {
+	ctx := context.Background()
+	store := newSingleStore(t, "m1")
+	if len(store.stripes) != defaultRecordSetStripes {
+		t.Fatalf("recordSet stripes=%d, want %d", len(store.stripes), defaultRecordSetStripes)
+	}
+	for i := 0; i < 128; i++ {
+		rs := mustRecordSet(t, store, testNS, ShardKey(fmt.Sprintf("s-%d", i)), RecordSetName(fmt.Sprintf("rs-%d", i)))
+		rec, ok, err := rs.CAS(ctx, "k", 0, []byte("v"))
+		if err != nil || !ok {
+			t.Fatalf("CAS %d ok=%v err=%v", i, ok, err)
+		}
+		if _, ok, err := rs.Delete(ctx, "k", rec.Meta.Rev); err != nil || !ok {
+			t.Fatalf("Delete %d ok=%v err=%v", i, ok, err)
+		}
+	}
+	if len(store.stripes) != defaultRecordSetStripes {
+		t.Fatalf("recordSet stripes grew to %d, want %d", len(store.stripes), defaultRecordSetStripes)
+	}
+}
+
 func assertEvent(t *testing.T, ch <-chan WatchEvent, typ EventType, key RecordKey) WatchEvent {
+	t.Helper()
+	ev := assertAnyEvent(t, ch)
+	if ev.Type != typ || ev.Key != key {
+		t.Fatalf("event=%+v, want type=%s key=%s", ev, typ, key)
+	}
+	return ev
+}
+
+func assertAnyEvent(t *testing.T, ch <-chan WatchEvent) WatchEvent {
 	t.Helper()
 	select {
 	case ev := <-ch:
-		if ev.Type != typ || ev.Key != key {
-			t.Fatalf("event=%+v, want type=%s key=%s", ev, typ, key)
-		}
 		return ev
 	case <-time.After(time.Second):
-		t.Fatalf("timeout waiting for %s %s", typ, key)
+		t.Fatal("timeout waiting for watch event")
 	}
 	return WatchEvent{}
 }

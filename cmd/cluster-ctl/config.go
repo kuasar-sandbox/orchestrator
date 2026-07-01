@@ -79,12 +79,12 @@ const registryConfigSkeleton = `# cluster-ctl registry config — cluster-ctl re
 member:                              # unified HTTP control plane
   id: registry-1
   listen: ":7700"
-  advertise: "https://registry-1.example:7700"
   # tls: { cert: ..., key: ..., ca: ... }   # server mTLS
 membership:
   active: 1
   # next: 2                         # joint owner set target during membership change
   # old_grace: 1                    # previous version kept as peer/node_link ingress after cutover
+  reload_ready_timeout: 10s          # wait for active/next members before applying reload
   versions:
     - version: 1
       members:
@@ -96,7 +96,6 @@ membership:
     node_list: 1
 node_link:
   # listen: ""                       # optional split listener for node streams; empty = member.listen
-  # advertise: ""                    # endpoint returned to redirect-capable nodes; empty = member.advertise
   heartbeat_interval: 10s
   node_dead_after: 30s
 route_link:
@@ -132,13 +131,12 @@ cache:
 const scalerConfigSkeleton = `# cluster-ctl scaler config — cluster-ctl scaler --config <this> (cluster-scaler.md §3).
 # Standalone placement scheduler; starts from registry membership and connects
 # every active registry member.
-member:
+scaler:
   id: scaler-1
   listen: ":7800"
   advertise: "https://scaler-1.example:7800"
+  memberlist_label: scaler.default
   # tls: { cert: ..., key: ..., ca: ... }   # server mTLS for scaler Place API
-memberlist:
-  label: scaler.default
 registry:
   bootstrap: registry-1.example:7700
   # tls: { cert: ..., key: ..., ca: ... }   # client mTLS to registry control plane

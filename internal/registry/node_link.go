@@ -127,9 +127,6 @@ func (r *Registry) nodeLinkRedirectTargets(owners []string) []routesync.NodeLink
 		}
 		endpoint := peer.RedirectEndpoint
 		if endpoint == "" {
-			endpoint = peer.Endpoint
-		}
-		if endpoint == "" {
 			continue
 		}
 		targets = append(targets, routesync.NodeLinkTarget{MemberID: owner, Endpoint: endpoint})

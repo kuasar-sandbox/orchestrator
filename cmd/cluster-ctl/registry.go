@@ -228,6 +228,9 @@ func reloadRegistryConfig(ctx context.Context, cfgPath string, old *clustercfg.R
 		if err := members.Sync(ctx, next); err != nil {
 			return err
 		}
+		if err := members.WaitReady(ctx, next); err != nil {
+			return err
+		}
 	}
 	views, nodeOwners, err := buildRegistryTopology(next)
 	if err != nil {
@@ -320,7 +323,7 @@ func configureRegistryShardTransport(stores *registry.Stores, cfg *clustercfg.Re
 		if member.ID == "" || member.ID == cfg.Member.ID {
 			continue
 		}
-		base, client, err := registryMemberClient(member.Advertise, cfg.Member.TLS)
+		base, client, err := registryMemberShortClient(member.Advertise, cfg.Member.TLS)
 		if err != nil {
 			return fmt.Errorf("registry shardkv member %q: %w", member.ID, err)
 		}
@@ -382,10 +385,7 @@ func buildRegistryNodeLinkRelayPeers(cfg *clustercfg.RegistryConfig) (map[string
 }
 
 func registryMemberNodeLinkEndpoint(member clustercfg.MembershipMember) string {
-	if member.NodeAdvertise != "" {
-		return member.NodeAdvertise
-	}
-	return member.Advertise
+	return member.NodeAdvertise
 }
 
 func jointMembershipMembers(versions []clustercfg.MembershipVersion) []clustercfg.MembershipMember {
@@ -416,6 +416,14 @@ func registryMemberClient(advertise string, tlsMaterial clustercfg.TLS) (string,
 		tlsCfg = cfg
 	}
 	base, client := controlHTTPClient(advertise, tlsCfg)
+	return base, client, nil
+}
+
+func registryMemberShortClient(advertise string, tlsMaterial clustercfg.TLS) (string, *http.Client, error) {
+	base, client, err := registryMemberClient(advertise, tlsMaterial)
+	if err != nil {
+		return "", nil, err
+	}
 	client.Timeout = 2 * time.Second
 	return base, client, nil
 }
@@ -468,29 +476,50 @@ func h2cRoundTripper() http.RoundTripper {
 }
 
 func serveClusterHTTP(ctx context.Context, name, addr string, tlsCfg clustercfg.TLS, handler http.Handler, log *slog.Logger) error {
+	server, err := newClusterHTTPServer(name, addr, tlsCfg, handler)
+	if err != nil {
+		return err
+	}
+	return server.Serve(ctx, log)
+}
+
+type clusterHTTPServer struct {
+	name     string
+	addr     string
+	useTLS   bool
+	server   *http.Server
+	listener net.Listener
+}
+
+func newClusterHTTPServer(name, addr string, tlsCfg clustercfg.TLS, handler http.Handler) (*clusterHTTPServer, error) {
 	ln, err := listenLink(addr)
 	if err != nil {
-		return fmt.Errorf("cluster: %s listen %s: %w", name, addr, err)
+		return nil, fmt.Errorf("cluster: %s listen %s: %w", name, addr, err)
 	}
 	srv := &http.Server{Handler: h2c.NewHandler(handler, &http2.Server{})}
 	useTLS := tlsCfg.Enabled() && !strings.HasPrefix(addr, "/")
 	if useTLS {
 		stls, terr := tlsCfg.ServerConfig()
 		if terr != nil {
-			return fmt.Errorf("cluster: %s tls: %w", name, terr)
+			_ = ln.Close()
+			return nil, fmt.Errorf("cluster: %s tls: %w", name, terr)
 		}
 		srv = &http.Server{Handler: handler, TLSConfig: stls}
 	}
+	return &clusterHTTPServer{name: name, addr: addr, useTLS: useTLS, server: srv, listener: ln}, nil
+}
+
+func (s *clusterHTTPServer) Serve(ctx context.Context, log *slog.Logger) error {
 	go func() {
 		<-ctx.Done()
-		srv.Close()
+		s.server.Close()
 	}()
-	log.Info("cluster listener", "name", name, "listen", addr, "tls", useTLS)
+	log.Info("cluster listener", "name", s.name, "listen", s.addr, "tls", s.useTLS)
 	var serveErr error
-	if useTLS {
-		serveErr = srv.ServeTLS(ln, "", "")
+	if s.useTLS {
+		serveErr = s.server.ServeTLS(s.listener, "", "")
 	} else {
-		serveErr = srv.Serve(ln)
+		serveErr = s.server.Serve(s.listener)
 	}
 	if serveErr != nil && serveErr != http.ErrServerClosed {
 		return serveErr

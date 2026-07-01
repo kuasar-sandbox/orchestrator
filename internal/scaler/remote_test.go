@@ -136,10 +136,10 @@ func TestRemoteLinksWithGroupsDefaultsNilLogger(t *testing.T) {
 	svc := NewRemoteLinksWithGroups(nil, nil, nil, clustercfg.PlacementConfig{}, 30, nil)
 	defer func() {
 		if r := recover(); r != nil {
-			t.Fatalf("RegisterLoopDynamic with nil logger panic: %v", r)
+			t.Fatalf("RegisterLoop with nil logger panic: %v", r)
 		}
 	}()
-	svc.RegisterLoopDynamic(context.Background(), "", "", "", "")
+	svc.RegisterLoop(context.Background(), "", "", "")
 }
 
 func TestSetNodeListLinksSameLinksPreservesReadyView(t *testing.T) {
@@ -223,19 +223,19 @@ func TestRegisterLoopReportsMemberlistSeed(t *testing.T) {
 
 	svc := NewRemoteLinks([]RegistryLink{{Name: "r1", BaseURL: srv.URL, Client: srv.Client()}},
 		clustercfg.PlacementConfig{Candidates: 1}, 30, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	go svc.RegisterLoopDynamic(ctx, "s1", srv.URL, "scaler.default", srv.URL)
+	go svc.RegisterLoop(ctx, "s1", srv.URL, "scaler.default")
 
 	select {
 	case reg := <-got:
-		if reg.MemberlistLabel != "scaler.default" || reg.MemberlistAdvertise != srv.URL {
-			t.Fatalf("scaler registered wrong memberlist seed: %+v", reg)
+		if reg.MemberlistLabel != "scaler.default" || reg.Advertise != srv.URL {
+			t.Fatalf("scaler registered wrong seed: %+v", reg)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("scaler did not register")
 	}
 }
 
-func TestRegisterLoopDynamicRetriesFailedRegisterQuickly(t *testing.T) {
+func TestRegisterLoopRetriesFailedRegisterQuickly(t *testing.T) {
 	oldRetry := scalerRegisterRetryInterval
 	scalerRegisterRetryInterval = 10 * time.Millisecond
 	t.Cleanup(func() { scalerRegisterRetryInterval = oldRetry })
@@ -264,7 +264,7 @@ func TestRegisterLoopDynamicRetriesFailedRegisterQuickly(t *testing.T) {
 
 	svc := NewRemoteLinks([]RegistryLink{{Name: "r1", BaseURL: srv.URL, Client: srv.Client()}},
 		clustercfg.PlacementConfig{Candidates: 1}, 30, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	go svc.RegisterLoopDynamic(ctx, "s1", srv.URL, "scaler.default", srv.URL)
+	go svc.RegisterLoop(ctx, "s1", srv.URL, "scaler.default")
 
 	select {
 	case <-gotSecond:
@@ -344,6 +344,7 @@ func TestScalerStartIsIdempotent(t *testing.T) {
 		30,
 		discard,
 	)
+	svc.SetNodeListLinks(ctx, nil)
 	seedNodeListView(t, svc, "n1")
 	svc.Start(ctx)
 	svc.Start(ctx)
@@ -395,10 +396,148 @@ func TestReconcileKeyAllocationsRunsWhenNodeListBecomesReady(t *testing.T) {
 	t.Fatal("reconcile did not run after node_list became ready")
 }
 
+func TestReconcileRunsWhenReadyNodeListChanges(t *testing.T) {
+	oldPoll := scalerReadyPollInterval
+	scalerReadyPollInterval = time.Hour
+	t.Cleanup(func() { scalerReadyPollInterval = oldPoll })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	discard := slog.New(slog.NewTextHandler(io.Discard, nil))
+	_, srv := testScaleRegistry(t, ctx, "n1")
+	defer srv.Close()
+	defer cancel()
+
+	src := newCountingGroupSource("/g")
+	svc := NewRemoteLinksWithGroups(
+		[]RegistryLink{{Name: "registry", BaseURL: srv.URL, Client: srv.Client()}},
+		src, testImportSources("counting-source", src),
+		clustercfg.PlacementConfig{Candidates: 1, ImportSourceOwnerCount: 1, ImportSourceLeaseTTL: "500ms", SelectorPatchRefresh: "1h"},
+		30,
+		discard,
+	)
+	empty := svc.nodes.source("node_list")
+	empty.reset()
+	empty.bookmark()
+	go svc.reconcileSelectorPatches(ctx)
+
+	for i := 0; i < 100; i++ {
+		if src.rangeCalls.Load() > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if calls := src.rangeCalls.Load(); calls == 0 {
+		t.Fatal("initial ready empty node_list did not reconcile")
+	}
+
+	sink := svc.nodes.sourceWithNotify("node_list", svc.notifyNodeListChanged)
+	raw, err := json.Marshal(clusterstate.NodeListEntry{
+		NodeID: "n1", Labels: map[string]string{"pool": "p"}, LastHeartbeatUnix: time.Now().Unix(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sink.put("n1", raw)
+	for i := 0; i < 100; i++ {
+		if src.rangeCalls.Load() > 1 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("node_list change did not trigger reconcile; Range calls=%d", src.rangeCalls.Load())
+}
+
 func TestReconcileIntervalUsesSelectorPatchRefreshCadence(t *testing.T) {
 	svc := NewRemoteLinks(nil, clustercfg.PlacementConfig{SelectorPatchRefresh: "1m"}, 30, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if got := svc.reconcileInterval(); got != time.Minute {
 		t.Fatalf("reconcile interval=%v, want selector_patch_refresh_interval", got)
+	}
+}
+
+func TestReadyForLabelRequiresMatchingNodeListSnapshot(t *testing.T) {
+	svc := NewRemoteLinks(nil, clustercfg.PlacementConfig{}, 30, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	oldSink := svc.nodes.sourceWithNotifyLabel("node_list", "registry.1.old", nil)
+	oldSink.reset()
+	oldSink.bookmark()
+
+	if !svc.Ready() {
+		t.Fatal("Ready() should accept any completed node_list snapshot")
+	}
+	if svc.ReadyForLabel("registry.2.new") {
+		t.Fatal("ReadyForLabel accepted a node_list snapshot from a different registry label")
+	}
+
+	newSink := svc.nodes.sourceWithNotifyLabel("node_list", "registry.2.new", nil)
+	newSink.reset()
+	newSink.bookmark()
+	if !svc.ReadyForLabel("registry.2.new") {
+		t.Fatal("ReadyForLabel did not accept matching node_list snapshot")
+	}
+}
+
+func TestReconcileImportSourceRefreshesAndRetriesTransientPatchFailure(t *testing.T) {
+	oldDelay := scaleLinkRetryDelay
+	scaleLinkRetryDelay = time.Millisecond
+	t.Cleanup(func() { scaleLinkRetryDelay = oldDelay })
+
+	ctx := context.Background()
+	src := newCountingGroupSource("/g")
+	var patches atomic.Int32
+	var refreshes atomic.Int32
+	var cursorUpdates atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		switch req.URL.Path {
+		case registry.ScaleLinkImportSourcePath:
+			var in registry.ImportSourceLeaseRequest
+			if err := json.NewDecoder(req.Body).Decode(&in); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(registry.ImportSourceLeaseResponse{
+				Acquired: true,
+				Lease: registry.ImportSourceLease{
+					SourceID: in.SourceID, OwnerID: in.OwnerID, RunID: in.RunID, Term: 1,
+					ExpiresUnixMs: time.Now().Add(time.Second).UnixMilli(),
+				},
+			})
+		case registry.ScaleLinkSelectorPatchPath:
+			if patches.Add(1) == 1 {
+				http.Error(w, "transient patch failure", http.StatusServiceUnavailable)
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
+		case registry.ScaleLinkSourceCursorPath:
+			cursorUpdates.Add(1)
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.NotFound(w, req)
+		}
+	}))
+	defer srv.Close()
+
+	svc := NewRemoteLinksWithGroups(
+		[]RegistryLink{{Name: "registry", BaseURL: srv.URL, Client: srv.Client()}},
+		src, testImportSources("counting-source", src),
+		clustercfg.PlacementConfig{Candidates: 1, ImportSourceOwnerCount: 1, ImportSourceLeaseTTL: "1s", SelectorPatchRefresh: "1m"},
+		30,
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+	)
+	svc.SetScaleLinkRefresher(func(context.Context) error {
+		refreshes.Add(1)
+		return nil
+	})
+	nodes := []*registry.NodeRecord{{NodeID: "n1", Labels: map[string]string{"pool": "p"}, LastHeartbeatUnix: time.Now().Unix()}}
+
+	svc.reconcileImportSources(ctx, nodes, map[string]selectorPatchState{})
+
+	if got := refreshes.Load(); got != 1 {
+		t.Fatalf("refreshes=%d, want 1", got)
+	}
+	if got := patches.Load(); got != 2 {
+		t.Fatalf("patch attempts=%d, want 2", got)
+	}
+	if got := cursorUpdates.Load(); got != 1 {
+		t.Fatalf("cursor updates=%d, want 1", got)
 	}
 }
 

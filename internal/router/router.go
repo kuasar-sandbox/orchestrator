@@ -808,11 +808,15 @@ func routeMatchesIdentity(rr *routeResolve, group, routeKey string) bool {
 }
 
 func newRouteKey() string {
+	return "rk-" + randomHexID()
+}
+
+func randomHexID() string {
 	var b [16]byte
 	if _, err := rand.Read(b[:]); err != nil {
-		return fmt.Sprintf("rk-%d", time.Now().UnixNano())
+		return fmt.Sprintf("%d", time.Now().UnixNano())
 	}
-	return "rk-" + hex.EncodeToString(b[:])
+	return hex.EncodeToString(b[:])
 }
 
 func (rt *Router) cachedRouteByKey(group, routeKey string) *routeResolve {
@@ -872,7 +876,9 @@ func (rt *Router) reserveByKey(ctx context.Context, group, routeKey string) (*re
 }
 
 func (rt *Router) routeLinkReserveBuild(ctx context.Context, group string, resources *buildResources) (*buildReserveResult, error) {
-	reqBody, _ := json.Marshal(map[string]any{"group": group, "resources": resources})
+	reqBody, _ := json.Marshal(map[string]any{
+		"group": group, "build_id": "bld-" + randomHexID(), "template_id": "transient-" + randomHexID(), "resources": resources,
+	})
 	resp, err := rt.routeLinkHTTP(ctx, group, http.MethodPost, registry.RouteLinkReserveBuildPath, reqBody, map[string]string{"Content-Type": "application/json"})
 	if err != nil {
 		return nil, err

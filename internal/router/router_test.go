@@ -77,6 +77,49 @@ func TestRouteLinkHTTPRefreshesMembershipAndRetries(t *testing.T) {
 	}
 }
 
+func TestReserveBuildRequestCarriesStableIDsAcrossRouteLinkRetry(t *testing.T) {
+	var bodies []map[string]any
+	first := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		var body map[string]any
+		if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		bodies = append(bodies, body)
+		return textResponse(http.StatusServiceUnavailable, "try next owner"), nil
+	})}
+	second := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		var body map[string]any
+		if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		bodies = append(bodies, body)
+		return textResponse(http.StatusOK, `{"build_id":"`+body["build_id"].(string)+`","template_id":"`+body["template_id"].(string)+`","node_id":"n1"}`), nil
+	})}
+	rt := &Router{routeRegistry: routeRegistryFunc(func(context.Context, string) ([]clusterclient.Endpoint, error) {
+		return []clusterclient.Endpoint{
+			{MemberID: "r1", BaseURL: "http://r1", Client: first},
+			{MemberID: "r2", BaseURL: "http://r2", Client: second},
+		}, nil
+	})}
+
+	res, err := rt.routeLinkReserveBuild(context.Background(), "/g", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(bodies) != 2 {
+		t.Fatalf("bodies=%d, want 2", len(bodies))
+	}
+	if bodies[0]["build_id"] == "" || bodies[0]["template_id"] == "" {
+		t.Fatalf("first reserve-build body missing stable ids: %v", bodies[0])
+	}
+	if bodies[0]["build_id"] != bodies[1]["build_id"] || bodies[0]["template_id"] != bodies[1]["template_id"] {
+		t.Fatalf("reserve-build retry changed ids: %v then %v", bodies[0], bodies[1])
+	}
+	if res.BuildID != bodies[0]["build_id"] || res.TemplateID != bodies[0]["template_id"] {
+		t.Fatalf("reserve result=%+v bodies=%v", res, bodies)
+	}
+}
+
 func TestHandleListPropagatesRouteLinkStatus(t *testing.T) {
 	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {

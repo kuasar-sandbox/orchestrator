@@ -35,7 +35,7 @@ membership:
   versions:
     - version: 1
       members:
-        - { id: registry }
+        - { id: registry, advertise: "` + endpoint + `" }
   owners:
     route_link: 1
     node_link: 1

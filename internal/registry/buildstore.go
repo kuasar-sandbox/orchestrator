@@ -29,7 +29,7 @@ type BuildRecord struct {
 	NodeID     string                    `json:"node_id"`
 	Resources  *routesync.BuildResources `json:"resources,omitempty"`
 	State      BuildState                `json:"state"`
-	TemplateID string                    `json:"template_id,omitempty"` // persist id once ready
+	TemplateID string                    `json:"template_id,omitempty"` // assigned template id, refreshed from terminal node events
 	Reason     string                    `json:"reason,omitempty"`
 	CreatedU   int64                     `json:"created_unix,omitempty"`
 }

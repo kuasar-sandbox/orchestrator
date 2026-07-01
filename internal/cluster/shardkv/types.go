@@ -42,6 +42,23 @@ type Record struct {
 	Meta      RecordMeta    `json:"meta"`
 }
 
+type ReadPolicy int
+
+const (
+	ReadDefault ReadPolicy = iota
+	ReadLocal
+)
+
+type ReadOptions struct {
+	Policy ReadPolicy
+	// MinRev is a lower bound for the recordSet commit revision visible to a
+	// local complete view. It is not an MVCC historical revision. A local view is
+	// complete only after EnsureReady, Snapshot, or Watch has caught up this member;
+	// local accept/repair installation alone does not mark the view ready.
+	// ReadDefault falls back to quorum when the local view cannot satisfy MinRev.
+	MinRev uint64
+}
+
 type NamespaceSpec struct {
 	ShardMemberCount   int           `json:"shard_member_count"`
 	TombstoneRetention time.Duration `json:"tombstone_retention"`
@@ -165,6 +182,7 @@ var (
 	ErrConflict           = errors.New("shardkv: record conflict")
 	ErrStaleBallot        = errors.New("shardkv: stale ballot")
 	ErrReplicaUnavailable = errors.New("shardkv: replica unavailable")
+	ErrLocalViewBehind    = errors.New("shardkv: local view behind")
 	ErrCompacted          = errors.New("shardkv: watch compacted")
 	ErrClosed             = errors.New("shardkv: store closed")
 )

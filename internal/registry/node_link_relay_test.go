@@ -139,6 +139,17 @@ func TestNodeLinkIngressRedirectsToNodeOwner(t *testing.T) {
 	}
 }
 
+func TestNodeLinkRedirectDoesNotFallbackToRelayEndpoint(t *testing.T) {
+	cluster := newShardStoreCluster(t, []string{"ingress", "owner"}, 1, 1, 1, 1)
+	ingress := New(cluster["ingress"], nil, 5*time.Second, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ingress.SetNodeLinkRelayPeers(map[string]NodeLinkRelayPeer{"owner": {
+		Endpoint: "http://owner-control.example.test",
+	}})
+	if targets := ingress.nodeLinkRedirectTargets([]string{"owner"}); len(targets) != 0 {
+		t.Fatalf("redirect targets=%+v, want none without explicit RedirectEndpoint", targets)
+	}
+}
+
 func testH2CClient() *http.Client {
 	return &http.Client{Transport: &http2.Transport{
 		AllowHTTP: true,

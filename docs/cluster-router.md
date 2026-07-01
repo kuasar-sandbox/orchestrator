@@ -124,7 +124,7 @@ router 校验 API key 与 group 关系时调用 route owner `verify-key`;route o
 | create/connect | 调 Reserve;READY 后返回 |
 | pause/kill/timeout | route owner 解析 node 后转发 |
 | get/list | 读 group route_link |
-| build register | 调 ReserveBuild |
+| build register | 生成稳定 build_id/template_id 后调 ReserveBuild |
 | build status/files | 按 group+build_id 定位 node 后转发 |
 
 ## 8. 数据面

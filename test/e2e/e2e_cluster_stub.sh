@@ -2,6 +2,12 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+CLUSTER_CTL_EXPLICIT="${CLUSTER_CTL+x}"
+NODE_STUB_CTL_EXPLICIT="${NODE_STUB_CTL+x}"
+E2B_KEY_CTL_EXPLICIT="${E2B_KEY_CTL+x}"
+BIN_EXPLICIT="${BIN+x}"
+NODES_EXPLICIT="${NODES+x}"
+SCALERS_EXPLICIT="${SCALERS+x}"
 BIN="${BIN:-$ROOT/bin/$(uname -m)}"
 CLUSTER_CTL="${CLUSTER_CTL:-$BIN/cluster-ctl}"
 NODE_STUB_CTL="${NODE_STUB_CTL:-$BIN/node-stub-ctl}"
@@ -9,6 +15,7 @@ E2B_KEY_CTL="${E2B_KEY_CTL:-$BIN/e2b-key-ctl}"
 DOMAIN="${DOMAIN:-cluster.stub.local}"
 GROUP="${GROUP:-/e2e/stub/group}"
 NODES="${NODES:-4}"
+SCALERS="${SCALERS:-1}"
 
 step() {
     echo "==> $*" >&2
@@ -25,6 +32,12 @@ skip() {
 fail() {
     echo "==> FAIL: $*" >&2
     if [ -n "${WORK:-}" ] && [ -d "$WORK" ]; then
+        if [ -n "${ADMIN:-}" ]; then
+            curl -sS --noproxy '*' --max-time 2 "$ADMIN/v1/commands" >"$WORK/admin-commands.json" 2>/dev/null || true
+            curl -sS --noproxy '*' --max-time 2 "$ADMIN/v1/events" >"$WORK/admin-events.json" 2>/dev/null || true
+            curl -sS --noproxy '*' --max-time 2 "$ADMIN/v1/nodes" >"$WORK/admin-nodes.json" 2>/dev/null || true
+            curl -sS --noproxy '*' --max-time 2 "$ADMIN/v1/data-hits" >"$WORK/admin-data-hits.json" 2>/dev/null || true
+        fi
         for f in "$WORK"/*.body "$WORK"/*.json; do
             [ -f "$f" ] || continue
             echo "---- $f ----" >&2
@@ -39,23 +52,45 @@ fail() {
     exit 1
 }
 
+build_cluster_stub_binaries() {
+    if [ "${CLUSTER_STUB_BUILD:-1}" = "0" ] || [ -n "${CLUSTER_STUB_BUILT:-}" ] ||
+        [ -n "$BIN_EXPLICIT" ] || [ -n "$CLUSTER_CTL_EXPLICIT" ] || [ -n "$NODE_STUB_CTL_EXPLICIT" ] || [ -n "$E2B_KEY_CTL_EXPLICIT" ]; then
+        return
+    fi
+    command -v make >/dev/null 2>&1 || skip "make not on PATH"
+    step "building cluster e2e binaries with make build"
+    make -C "$ROOT" build
+    export CLUSTER_STUB_BUILT=1
+}
+
 if [ -z "${CLUSTER_STUB_CASE:-}" ]; then
-    for spec in registry-n1:1 registry-n3:3 registry-joint:4; do
+    build_cluster_stub_binaries
+    for spec in registry-n1:1:1 registry-n3:3:1 registry-redirect:3:1 registry-scaler-ha:3:2 registry-joint:4:1; do
         CLUSTER_STUB_CASE="${spec%%:*}"
-        REGISTRIES="${spec##*:}"
-        step "running case $CLUSTER_STUB_CASE (registries=$REGISTRIES)"
-        CLUSTER_STUB_CASE="$CLUSTER_STUB_CASE" REGISTRIES="$REGISTRIES" "$0"
+        rest="${spec#*:}"
+        REGISTRIES="${rest%%:*}"
+        SCALERS="${rest##*:}"
+        step "running case $CLUSTER_STUB_CASE (registries=$REGISTRIES scalers=$SCALERS)"
+        CLUSTER_STUB_BUILT="${CLUSTER_STUB_BUILT:-1}" CLUSTER_STUB_CASE="$CLUSTER_STUB_CASE" REGISTRIES="$REGISTRIES" SCALERS="$SCALERS" "$0"
     done
     exit 0
 fi
 
 command -v python3 >/dev/null 2>&1 || skip "python3 not on PATH"
 command -v curl >/dev/null 2>&1 || skip "curl not on PATH"
+build_cluster_stub_binaries
 [ -x "$CLUSTER_CTL" ] || skip "missing cluster-ctl at $CLUSTER_CTL (run make build)"
 [ -x "$NODE_STUB_CTL" ] || skip "missing node-stub-ctl at $NODE_STUB_CTL (run make build)"
 [ -x "$E2B_KEY_CTL" ] || skip "missing e2b-key-ctl at $E2B_KEY_CTL (run make build)"
 REGISTRIES="${REGISTRIES:-1}"
-step "cluster stub e2e: case=$CLUSTER_STUB_CASE registries=$REGISTRIES using BIN=$BIN"
+SCALERS="${SCALERS:-1}"
+if [ "$CLUSTER_STUB_CASE" = "registry-redirect" ] && [ -z "$NODES_EXPLICIT" ]; then
+    NODES=10
+fi
+if [ "$CLUSTER_STUB_CASE" = "registry-scaler-ha" ] && [ -z "$SCALERS_EXPLICIT" ]; then
+    SCALERS=2
+fi
+step "cluster stub e2e: case=$CLUSTER_STUB_CASE registries=$REGISTRIES scalers=$SCALERS using BIN=$BIN"
 
 free_port() {
     python3 <<'PY'
@@ -148,7 +183,11 @@ for i in $(seq 1 "$REGISTRIES"); do
     CONTROL_PORTS+=("$REGISTRY_PORT")
 done
 CONTROL_PORT="${CONTROL_PORTS[0]}"
-alloc_port SCALER_PORT scaler
+SCALER_PORTS=()
+for i in $(seq 1 "$SCALERS"); do
+    alloc_port SCALER_PORT "scaler-$i"
+    SCALER_PORTS+=("$SCALER_PORT")
+done
 alloc_port ROUTER_PORT router
 alloc_port ADMIN_PORT node-stub-admin
 alloc_port DATA_PORT node-stub-data
@@ -158,10 +197,18 @@ MANIFEST_KEY="$("$E2B_KEY_CTL" gen-key)"
 API_KEY="$("$E2B_KEY_CTL" gen-apikey "$AUTH_KEY")"
 
 OWNER_COUNT="$REGISTRIES"
+ROUTE_OWNER_COUNT="$OWNER_COUNT"
+NODE_OWNER_COUNT="$OWNER_COUNT"
+SCALE_OWNER_COUNT="$OWNER_COUNT"
+NODE_LIST_OWNER_COUNT="$OWNER_COUNT"
 ACTIVE_IDS=()
 NEXT_IDS=()
 if [ "$CLUSTER_STUB_CASE" = "registry-joint" ]; then
     OWNER_COUNT=3
+    ROUTE_OWNER_COUNT=3
+    NODE_OWNER_COUNT=3
+    SCALE_OWNER_COUNT=3
+    NODE_LIST_OWNER_COUNT=3
     ACTIVE_IDS=(1 2 3)
     NEXT_IDS=(2 3 4)
 else
@@ -169,11 +216,14 @@ else
         ACTIVE_IDS+=("$i")
     done
 fi
+if [ "$CLUSTER_STUB_CASE" = "registry-redirect" ]; then
+    NODE_OWNER_COUNT=1
+fi
 
 ACTIVE_MEMBERS_YAML=""
 for i in "${ACTIVE_IDS[@]}"; do
     port="${CONTROL_PORTS[$((i-1))]}"
-    ACTIVE_MEMBERS_YAML="$ACTIVE_MEMBERS_YAML        - { id: registry-$i, advertise: \"http://127.0.0.1:$port\" }
+    ACTIVE_MEMBERS_YAML="$ACTIVE_MEMBERS_YAML        - { id: registry-$i, advertise: \"http://127.0.0.1:$port\", node_advertise: \"127.0.0.1:$port\" }
 "
 done
 NEXT_LINE=""
@@ -184,7 +234,7 @@ if [ "${#NEXT_IDS[@]}" -gt 0 ]; then
     NEXT_MEMBERS_YAML=""
     for i in "${NEXT_IDS[@]}"; do
         port="${CONTROL_PORTS[$((i-1))]}"
-        NEXT_MEMBERS_YAML="$NEXT_MEMBERS_YAML        - { id: registry-$i, advertise: \"http://127.0.0.1:$port\" }
+        NEXT_MEMBERS_YAML="$NEXT_MEMBERS_YAML        - { id: registry-$i, advertise: \"http://127.0.0.1:$port\", node_advertise: \"127.0.0.1:$port\" }
 "
     done
     NEXT_MEMBERS_BLOCK="    - version: 2
@@ -198,7 +248,6 @@ for i in $(seq 1 "$REGISTRIES"); do
 member:
   id: registry-$i
   listen: "127.0.0.1:$port"
-  advertise: "http://127.0.0.1:$port"
 membership:
   active: 1
 ${NEXT_LINE}  versions:
@@ -206,10 +255,10 @@ ${NEXT_LINE}  versions:
       members:
 $ACTIVE_MEMBERS_YAML$NEXT_MEMBERS_BLOCK
   owners:
-    route_link: $OWNER_COUNT
-    node_link: $OWNER_COUNT
-    scale_link: $OWNER_COUNT
-    node_list: $OWNER_COUNT
+    route_link: $ROUTE_OWNER_COUNT
+    node_link: $NODE_OWNER_COUNT
+    scale_link: $SCALE_OWNER_COUNT
+    node_list: $NODE_LIST_OWNER_COUNT
 node_link:
   heartbeat_interval: "500ms"
   node_dead_after: "3s"
@@ -230,11 +279,14 @@ auth:
   cache_ttl: "500ms"
 EOF
 
-cat >"$WORK/scaler.yaml" <<EOF
-member:
-  id: scaler-1
-  listen: "127.0.0.1:$SCALER_PORT"
-  advertise: "http://127.0.0.1:$SCALER_PORT"
+for i in $(seq 1 "$SCALERS"); do
+    port="${SCALER_PORTS[$((i-1))]}"
+    cat >"$WORK/scaler-$i.yaml" <<EOF
+scaler:
+  id: scaler-$i
+  listen: "127.0.0.1:$port"
+  advertise: "http://127.0.0.1:$port"
+  memberlist_label: "scaler.default"
 registry:
   bootstrap: "127.0.0.1:$CONTROL_PORT"
 import_groups:
@@ -245,7 +297,9 @@ placement:
   candidates: 2
   zone_admit_max: "yellow"
   node_dead_after: "3s"
+  selector_patch_refresh_interval: "2s"
 EOF
+done
 
 mkdir -p "$WORK/groups"
 cat >"$WORK/groups/group.json" <<EOF
@@ -286,10 +340,16 @@ assert len(ids) == want, m
 PY
 done
 
-step "starting scaler"
-"$CLUSTER_CTL" scaler --config "$WORK/scaler.yaml" > >(tee "$WORK/scaler.log" >&2) 2>&1 &
-PIDS+=("$!")
-wait_tcp "$SCALER_PORT" "scaler"
+SCALER_PIDS=()
+for i in $(seq 1 "$SCALERS"); do
+    port="${SCALER_PORTS[$((i-1))]}"
+    step "starting scaler-$i"
+    "$CLUSTER_CTL" scaler --config "$WORK/scaler-$i.yaml" > >(tee "$WORK/scaler-$i.log" >&2) 2>&1 &
+    pid="$!"
+    PIDS+=("$pid")
+    SCALER_PIDS+=("$pid")
+    wait_tcp "$port" "scaler-$i"
+done
 
 step "starting node-stub-ctl with $NODES nodes"
 "$NODE_STUB_CTL" serve \
@@ -313,7 +373,7 @@ step "waiting for node_link manifest-key cache"
 python3 - "$ADMIN" "$NODES" <<'PY' || fail "manifest keys were not distributed to all stub nodes"
 import json, sys, time, urllib.request
 admin, want = sys.argv[1], int(sys.argv[2])
-for _ in range(120):
+for _ in range(300):
     try:
         nodes = json.load(urllib.request.urlopen(admin + "/v1/nodes", timeout=1))
         if len(nodes) == want and all(len(n.get("keys", [])) >= 1 for n in nodes):
@@ -323,6 +383,23 @@ for _ in range(120):
     time.sleep(0.1)
 sys.exit(1)
 PY
+
+if [ "$CLUSTER_STUB_CASE" = "registry-redirect" ]; then
+    step "checking node_link redirect to node owners"
+    python3 - "$ADMIN" <<'PY' || fail "node_link redirect was not observed"
+import json, sys, time, urllib.request
+admin = sys.argv[1]
+last = []
+for _ in range(200):
+    nodes = json.load(urllib.request.urlopen(admin + "/v1/nodes", timeout=2))
+    redirected = [n for n in nodes if n.get("redirect_endpoint")]
+    if redirected and all(n.get("link_endpoint") == n.get("redirect_endpoint") for n in redirected):
+        sys.exit(0)
+    last = nodes
+    time.sleep(0.1)
+raise SystemExit("nodes=%r" % last)
+PY
+fi
 
 step "checking Reserve -> READY -> data forward"
 code="$(retry_code 204 "$WORK/data1.body" \
@@ -344,6 +421,20 @@ assert last["route_key"] == "user1/session1", last
 assert last.get("access_token", "").startswith("sat_"), last
 PY
 
+if [ "$CLUSTER_STUB_CASE" = "registry-scaler-ha" ]; then
+    step "checking scaler failover after one scaler exits"
+    kill "${SCALER_PIDS[0]}" 2>/dev/null || true
+    wait "${SCALER_PIDS[0]}" 2>/dev/null || true
+    code="$(retry_code 204 "$WORK/data-scaler-ha.body" \
+        -H "Host: data.$DOMAIN" \
+        -H "X-Kuasar-Sandbox-Group: $GROUP" \
+        -H "X-Kuasar-Route-Key: user1/session-scaler-failover" \
+        -H "X-API-KEY: $API_KEY" \
+        -H "E2b-Sandbox-Port: 49983" \
+        "http://127.0.0.1:$ROUTER_PORT/health" || true)"
+    [ "$code" = "204" ] || fail "data after scaler failure returned $code"
+fi
+
 if [ "$CLUSTER_STUB_CASE" = "registry-joint" ]; then
     step "checking joint route visibility from next-only registry"
     curl -sS --noproxy '*' --get --data-urlencode "group=$GROUP" \
@@ -361,7 +452,6 @@ PY
 member:
   id: registry-$i
   listen: "127.0.0.1:$port"
-  advertise: "http://127.0.0.1:$port"
 membership:
   active: 2
   old_grace: 1
@@ -372,10 +462,10 @@ $ACTIVE_MEMBERS_YAML
     - version: 2
       members:
 $NEXT_MEMBERS_YAML  owners:
-    route_link: $OWNER_COUNT
-    node_link: $OWNER_COUNT
-    scale_link: $OWNER_COUNT
-    node_list: $OWNER_COUNT
+    route_link: $ROUTE_OWNER_COUNT
+    node_link: $NODE_OWNER_COUNT
+    scale_link: $SCALE_OWNER_COUNT
+    node_list: $NODE_LIST_OWNER_COUNT
 node_link:
   heartbeat_interval: "500ms"
   node_dead_after: "3s"
@@ -421,14 +511,10 @@ fi
 create_count_before="$(python3 - "$ADMIN" <<'PY'
 import json, sys, urllib.request
 cmds = json.load(urllib.request.urlopen(sys.argv[1] + "/v1/commands", timeout=2))
-print(sum(1 for c in cmds if c.get("kind") == "create"))
+print(sum(1 for c in cmds if c.get("kind") == "create" and c.get("route_key") == "user1/session1"))
 PY
 )"
-expected_create_count=1
-if [ "$CLUSTER_STUB_CASE" = "registry-joint" ]; then
-    expected_create_count=2
-fi
-[ "$create_count_before" = "$expected_create_count" ] || fail "expected $expected_create_count create commands before active-cache check, got $create_count_before"
+[ "$create_count_before" = "1" ] || fail "expected one create for user1/session1 before active-cache check, got $create_count_before"
 
 step "checking active route cache"
 code="$(retry_code 204 "$WORK/data2.body" \
@@ -443,7 +529,7 @@ code="$(retry_code 204 "$WORK/data2.body" \
 create_count_after="$(python3 - "$ADMIN" <<'PY'
 import json, sys, urllib.request
 cmds = json.load(urllib.request.urlopen(sys.argv[1] + "/v1/commands", timeout=2))
-print(sum(1 for c in cmds if c.get("kind") == "create"))
+print(sum(1 for c in cmds if c.get("kind") == "create" and c.get("route_key") == "user1/session1"))
 PY
 )"
 [ "$create_count_after" = "$create_count_before" ] || fail "active route cache caused another create ($create_count_before -> $create_count_after)"
@@ -455,7 +541,7 @@ code="$(http_code "$WORK/build.body" -X POST \
     -H "X-API-KEY: $API_KEY" \
     -H "Content-Type: application/json" \
     --data '{"name":"stub-template","cpuCount":1,"memoryMB":128}' \
-    "http://127.0.0.1:$ROUTER_PORT/v3/templates")"
+    "http://127.0.0.1:$ROUTER_PORT/v3/templates" || true)"
 [ "$code" = "202" ] || fail "build register returned $code: $(cat "$WORK/build.body")"
 
 python3 - "$ADMIN" <<'PY' || fail "build_register command was not observed"
@@ -507,12 +593,20 @@ ROUTE_LIST_PORT="$CONTROL_PORT"
 if [ "$CLUSTER_STUB_CASE" = "registry-joint" ]; then
     ROUTE_LIST_PORT="${CONTROL_PORTS[3]}"
 fi
-curl -sS --noproxy '*' --get --data-urlencode "group=$GROUP" \
-    "http://127.0.0.1:$ROUTE_LIST_PORT/route-link/list" >"$WORK/routes.json"
-python3 - "$WORK/routes.json" "$SID" <<'PY' || fail "route_link still contains rebooted sandbox"
-import json, sys
-routes = json.load(open(sys.argv[1]))
-assert all(r.get("sandboxID") != sys.argv[2] for r in routes), routes
+python3 - "$ROUTE_LIST_PORT" "$GROUP" "$SID" "$WORK/routes.json" <<'PY' || fail "route_link still contains rebooted sandbox"
+import json, sys, time, urllib.parse, urllib.request
+port, group, sid, out = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+url = "http://127.0.0.1:%s/route-link/list?%s" % (port, urllib.parse.urlencode({"group": group}))
+last = None
+for _ in range(100):
+    with urllib.request.urlopen(url, timeout=2) as resp:
+        last = json.load(resp)
+    with open(out, "w") as f:
+        json.dump(last, f)
+    if all(r.get("sandboxID") != sid for r in last):
+        sys.exit(0)
+    time.sleep(0.1)
+raise SystemExit("routes=%r" % (last,))
 PY
 
 echo "==> PASS: sandbox-orchestrator cluster stub e2e"

@@ -76,15 +76,68 @@ func (s *RecordSet) LocalOwner(ctx context.Context) (bool, error) {
 	return localInShardView(view, s.store.local), nil
 }
 
-func (s *RecordSet) Get(ctx context.Context, key RecordKey) (Record, bool, error) {
-	best, found, err := s.GetRecord(ctx, key)
+func (s *RecordSet) Get(ctx context.Context, key RecordKey, opts ...ReadOptions) (Record, bool, error) {
+	best, found, err := s.GetRecord(ctx, key, opts...)
 	if err != nil || !found || best.Deleted {
 		return Record{}, false, err
 	}
 	return best, true, nil
 }
 
-func (s *RecordSet) GetRecord(ctx context.Context, key RecordKey) (Record, bool, error) {
+func (s *RecordSet) GetRecord(ctx context.Context, key RecordKey, opts ...ReadOptions) (Record, bool, error) {
+	readOpt, err := normalizeReadOptions(opts)
+	if err != nil {
+		return Record{}, false, err
+	}
+	if readOpt.Policy == ReadLocal || readOpt.MinRev > 0 {
+		view, err := s.View(ctx)
+		if err != nil {
+			return Record{}, false, err
+		}
+		rec, found, ready, err := s.getLocalReadyRecord(view, key, readOpt.MinRev)
+		if ready {
+			return rec, found, nil
+		}
+		if readOpt.Policy == ReadLocal {
+			if err != nil {
+				return Record{}, false, err
+			}
+			return Record{}, false, ErrLocalViewBehind
+		}
+	}
+	return s.getRecordQuorum(ctx, key)
+}
+
+func normalizeReadOptions(opts []ReadOptions) (ReadOptions, error) {
+	if len(opts) == 0 {
+		return ReadOptions{}, nil
+	}
+	opt := opts[len(opts)-1]
+	switch opt.Policy {
+	case ReadDefault, ReadLocal:
+		return opt, nil
+	default:
+		return ReadOptions{}, ErrInvalidView
+	}
+}
+
+func (s *RecordSet) getLocalReadyRecord(view ShardView, key RecordKey, minRev uint64) (Record, bool, bool, error) {
+	if !localInShardView(view, s.store.local) {
+		return Record{}, false, false, ErrInvalidView
+	}
+	local, err := s.store.getLocalShardNoTouch(s.namespace, s.shard)
+	if err != nil {
+		return Record{}, false, false, err
+	}
+	localSet := local.recordSetNoTouch(s.name)
+	if localSet == nil {
+		return Record{}, false, false, nil
+	}
+	rec, found, _, ready := localSet.readReady(view.Label, key, minRev)
+	return rec, found, ready, nil
+}
+
+func (s *RecordSet) getRecordQuorum(ctx context.Context, key RecordKey) (Record, bool, error) {
 	for attempt := 0; attempt < s.store.maxAttempts; attempt++ {
 		view, err := s.View(ctx)
 		if err != nil {
@@ -96,17 +149,7 @@ func (s *RecordSet) GetRecord(ctx context.Context, key RecordKey) (Record, bool,
 		}
 		best, found := highest(reads)
 		if found && recordVisibleQuorum(best, reads, view.Sets) {
-			records, head, ok, err := s.fetchCommittedSnapshot(ctx, view)
-			if err == nil && ok {
-				s.installSnapshotBestEffort(ctx, view, records, head)
-				if rec, found := recordFromSnapshot(records, key); found {
-					return cloneRecord(rec), true, nil
-				}
-				return Record{}, false, nil
-			}
-			if err != nil {
-				return Record{}, false, err
-			}
+			s.repairRecordBestEffort(ctx, view, best, recordRepairTargets(best, reads))
 			return cloneRecord(best), true, nil
 		}
 		if found {
@@ -142,12 +185,14 @@ func (s *RecordSet) DeleteValue(ctx context.Context, key RecordKey, expectRev ui
 }
 
 func (s *RecordSet) cas(ctx context.Context, key RecordKey, expectRev uint64, value []byte, deleted bool) (Record, bool, error) {
+	roundKey := recordSetRoundKey(s.namespace, s.shard, s.name)
+	unlock := s.store.lockRecordSet(roundKey)
+	defer unlock()
 	for attempt := 0; attempt < s.store.maxAttempts; attempt++ {
 		view, err := s.View(ctx)
 		if err != nil {
 			return Record{}, false, err
 		}
-		roundKey := recordSetRoundKey(s.namespace, s.shard, s.name)
 		ballot := s.store.nextBallot(roundKey, Ballot{})
 		_, prepared, _, promised := s.prepare(ctx, view, key, ballot)
 		if !promised.IsZero() && !promised.Less(ballot) {
@@ -182,10 +227,13 @@ func (s *RecordSet) cas(ctx context.Context, key RecordKey, expectRev uint64, va
 			Value: append([]byte(nil), value...), Deleted: deleted,
 			Meta: RecordMeta{Ballot: ballot, Rev: head + 1, UpdatedAt: s.store.now()},
 		}
-		accepted, promised := s.accept(ctx, view, key, next, ballot, eligible)
+		accepted, responded, promised := s.accept(ctx, view, key, next, ballot, eligible)
 		if !quorumSatisfied(accepted, view.Sets) {
 			if !promised.IsZero() && !promised.Less(ballot) {
 				s.store.bumpRound(roundKey, promised)
+				continue
+			}
+			if quorumSatisfied(responded, view.Sets) {
 				continue
 			}
 			return Record{}, false, ErrQuorum
@@ -345,7 +393,7 @@ func (s *RecordSet) prepare(ctx context.Context, view ShardView, key RecordKey, 
 	return reads, prepared, heads, maxPromised
 }
 
-func (s *RecordSet) accept(ctx context.Context, view ShardView, key RecordKey, rec Record, ballot Ballot, prepared map[MemberID]bool) (map[MemberID]bool, Ballot) {
+func (s *RecordSet) accept(ctx context.Context, view ShardView, key RecordKey, rec Record, ballot Ballot, prepared map[MemberID]bool) (map[MemberID]bool, map[MemberID]bool, Ballot) {
 	req := Request{Op: OpAccept, Namespace: s.namespace, Shard: s.shard, RecordSet: s.name, Key: key, Ballot: ballot, Record: rec}
 	type result struct {
 		member   MemberID
@@ -361,12 +409,14 @@ func (s *RecordSet) accept(ctx context.Context, view ShardView, key RecordKey, r
 		}()
 	}
 	accepted := map[MemberID]bool{}
+	responded := map[MemberID]bool{}
 	var maxPromised Ballot
 	for range prepared {
 		res := <-ch
 		if res.err != nil {
 			continue
 		}
+		responded[res.member] = true
 		if !res.response.OK {
 			if maxPromised.Less(res.response.Promised) {
 				maxPromised = res.response.Promised
@@ -375,7 +425,7 @@ func (s *RecordSet) accept(ctx context.Context, view ShardView, key RecordKey, r
 		}
 		accepted[res.member] = true
 	}
-	return accepted, maxPromised
+	return accepted, responded, maxPromised
 }
 
 func (s *RecordSet) repairRecordBestEffort(ctx context.Context, view ShardView, rec Record, targets map[MemberID]bool) {
@@ -538,6 +588,16 @@ func recordVisibleQuorum(rec Record, reads []recordRead, sets []ShardMemberSet) 
 		}
 	}
 	return quorumSatisfied(ok, sets)
+}
+
+func recordRepairTargets(rec Record, reads []recordRead) map[MemberID]bool {
+	targets := map[MemberID]bool{}
+	for _, read := range reads {
+		if !read.found || !sameRecordVersion(read.record, rec) {
+			targets[read.member] = true
+		}
+	}
+	return targets
 }
 
 func intersectMembers(a, b map[MemberID]bool) map[MemberID]bool {

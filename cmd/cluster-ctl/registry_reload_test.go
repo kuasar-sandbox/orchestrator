@@ -7,8 +7,10 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/clustercfg"
+	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/membergroup"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/registry"
 )
 
@@ -87,6 +89,23 @@ membership:
 	}
 }
 
+func TestRegistryMemberClientsSeparateShardAndNodeOwnerTimeouts(t *testing.T) {
+	_, nodeOwnerClient, err := registryMemberClient("http://registry-a.example.test", clustercfg.TLS{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nodeOwnerClient.Timeout <= 2*time.Second {
+		t.Fatalf("node-owner member client timeout=%s, want longer than shard short RPC timeout", nodeOwnerClient.Timeout)
+	}
+	_, shardClient, err := registryMemberShortClient("http://registry-a.example.test", clustercfg.TLS{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if shardClient.Timeout != 2*time.Second {
+		t.Fatalf("shard member client timeout=%s, want 2s", shardClient.Timeout)
+	}
+}
+
 func TestNewRegistryStoresSetsNodeListHeartbeatRefresh(t *testing.T) {
 	cfg := loadRegistryReloadTestConfig(t, registryReloadTestConfig(1, 0, "registry-b", map[int][]string{
 		1: {"registry-a", "registry-b", "registry-c"},
@@ -97,6 +116,28 @@ func TestNewRegistryStoresSetsNodeListHeartbeatRefresh(t *testing.T) {
 	}
 	if got := stores.NodeListHeartbeatRefreshSec(); got != 1 {
 		t.Fatalf("node_list heartbeat refresh sec = %d, want 1 for node_dead_after=3s", got)
+	}
+}
+
+func TestRegistryMemberRuntimeWaitReadyRejectsMissingOwner(t *testing.T) {
+	oldPoll := registryMembershipReadyPoll
+	registryMembershipReadyPoll = 5 * time.Millisecond
+	t.Cleanup(func() {
+		registryMembershipReadyPoll = oldPoll
+	})
+	cfg := loadRegistryReloadTestConfig(t, registryReloadTestConfig(1, 0, "registry-a", map[int][]string{
+		1: {"registry-a", "registry-b"},
+	}))
+	cfg.Membership.ReloadReadyTimeout = "30ms"
+	rt, err := newRegistryMemberRuntime(context.Background(), cfg, membergroup.NewHub(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rt.Shutdown()
+
+	err = rt.WaitReady(context.Background(), cfg)
+	if err == nil || !strings.Contains(err.Error(), "registry-b") {
+		t.Fatalf("WaitReady err=%v, want missing registry-b", err)
 	}
 }
 

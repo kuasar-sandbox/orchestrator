@@ -44,6 +44,11 @@ type Node interface {
 	BuildEvents() <-chan *routesync.BuildEvent
 }
 
+type nodeLinkObserver interface {
+	NodeLinkSession(endpoint string)
+	NodeLinkRedirect(target routesync.NodeLinkTarget)
+}
+
 // Client is a node's node-link client: it dials the registry, registers the
 // node's identity, then streams its sandbox routes while executing registry
 // commands, reconnecting with capped backoff.
@@ -106,6 +111,7 @@ func (c *Client) Run(ctx context.Context) {
 			redirectTargets = redir.targets
 			redirectIndex = 0
 			endpoint = redirectTargets[0].Endpoint
+			c.notifyRedirect(redirectTargets[0])
 			c.log.Info("node-link: redirecting to node owner", "node", c.identity.NodeID, "member", redirectTargets[0].MemberID, "endpoint", endpoint)
 			backoff = 200 * time.Millisecond
 			continue
@@ -113,6 +119,7 @@ func (c *Client) Run(ctx context.Context) {
 		if c.allowRedirect && len(redirectTargets) > 0 && redirectIndex+1 < len(redirectTargets) {
 			redirectIndex++
 			endpoint = redirectTargets[redirectIndex].Endpoint
+			c.notifyRedirect(redirectTargets[redirectIndex])
 			c.log.Warn("node-link: trying next redirected owner", "node", c.identity.NodeID, "member", redirectTargets[redirectIndex].MemberID, "endpoint", endpoint, "err", err)
 			continue
 		}
@@ -176,6 +183,7 @@ func (c *Client) session(ctx context.Context, endpoint string) error {
 	if redir := nodeLinkRedirectFromHello(hello); len(redir.targets) > 0 {
 		return redir
 	}
+	c.notifySession(endpoint)
 
 	// Stream the node's routes (to pw) while executing commands (from resp.Body),
 	// reusing the shared authority loop. Subscribe(kind=registry) makes the loop
@@ -242,6 +250,18 @@ func (c *Client) session(ctx context.Context, endpoint string) error {
 	}()
 	routesync.StreamAuthority(sctx, pw, func() {}, resp.Body, c.node, reg, onUp, outbox, c.log)
 	return sctx.Err()
+}
+
+func (c *Client) notifySession(endpoint string) {
+	if obs, ok := c.node.(nodeLinkObserver); ok {
+		obs.NodeLinkSession(endpoint)
+	}
+}
+
+func (c *Client) notifyRedirect(target routesync.NodeLinkTarget) {
+	if obs, ok := c.node.(nodeLinkObserver); ok {
+		obs.NodeLinkRedirect(target)
+	}
 }
 
 func (c *Client) transport(endpoint string) (*http2.Transport, string, string, error) {

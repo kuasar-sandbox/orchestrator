@@ -14,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -32,7 +33,10 @@ const scalerRegisterInterval = 15 * time.Second
 var (
 	scalerRegisterRetryInterval = time.Second
 	scalerReadyPollInterval     = time.Second
+	scaleLinkRetryDelay         = 200 * time.Millisecond
 )
+
+const scaleLinkFailureRetries = 2
 
 // Service is the standalone scaler placement engine. It keeps node_list/group
 // views synced, computes placement over the local view, and returns suggestions
@@ -41,6 +45,7 @@ type Service struct {
 	linksMu     sync.RWMutex
 	links       []RegistryLink
 	watchLinks  []RegistryLink
+	watchLabel  string
 	watchCancel context.CancelFunc
 	startedCtx  context.Context
 
@@ -59,6 +64,8 @@ type Service struct {
 	sourceLeaseTTL     time.Duration
 	selectorPatchEvery time.Duration
 	scaleLinkResolver  func(context.Context, string) ([]RegistryLink, error)
+	scaleLinkRefresher func(context.Context) error
+	nodeChanges        chan struct{}
 }
 
 type RegistryLink struct {
@@ -110,6 +117,7 @@ func NewRemoteLinksWithGroups(links []RegistryLink, provider clusterstate.Sandbo
 		sourceOwnerID:      "local",
 		sourceLeaseTTL:     sourceLeaseTTL,
 		selectorPatchEvery: selectorPatchEvery,
+		nodeChanges:        make(chan struct{}, 1),
 	}
 }
 
@@ -211,7 +219,9 @@ func (s *Service) Start(ctx context.Context) {
 	s.linksMu.Lock()
 	if s.startedCtx == nil {
 		s.startedCtx = ctx
-		s.startWatchLinkLocked(ctx)
+		if len(s.watchLinks) > 0 {
+			s.startWatchLinkLocked(ctx)
+		}
 		startReconcile = true
 	}
 	s.linksMu.Unlock()
@@ -228,14 +238,19 @@ func (s *Service) SetRegistryLinks(ctx context.Context, links []RegistryLink) {
 }
 
 func (s *Service) SetNodeListLinks(ctx context.Context, links []RegistryLink) {
+	s.SetNodeListLinksForLabel(ctx, links, "")
+}
+
+func (s *Service) SetNodeListLinksForLabel(ctx context.Context, links []RegistryLink, label string) {
 	links = normalizeRegistryLinks(links)
 	s.linksMu.Lock()
 	defer s.linksMu.Unlock()
-	if sameRegistryLinkTargets(s.watchLinks, links) {
+	if sameRegistryLinkTargets(s.watchLinks, links) && s.watchLabel == label {
 		s.watchLinks = links
 		return
 	}
 	s.watchLinks = links
+	s.watchLabel = label
 	s.nodes.removeSource("node_list")
 	if s.watchCancel != nil {
 		s.watchCancel()
@@ -259,6 +274,12 @@ func (s *Service) SetImportSourceOwnerSource(ownerID string, peerSource func() [
 func (s *Service) SetScaleLinkResolver(resolver func(context.Context, string) ([]RegistryLink, error)) {
 	s.linksMu.Lock()
 	s.scaleLinkResolver = resolver
+	s.linksMu.Unlock()
+}
+
+func (s *Service) SetScaleLinkRefresher(refresher func(context.Context) error) {
+	s.linksMu.Lock()
+	s.scaleLinkRefresher = refresher
 	s.linksMu.Unlock()
 }
 
@@ -335,14 +356,6 @@ func (s *Service) serveVerifyKey(w http.ResponseWriter, req *http.Request) {
 }
 
 func (s *Service) RegisterLoop(ctx context.Context, id, advertise, memberlistLabel string) {
-	s.RegisterLoopDynamic(ctx, id, advertise, memberlistLabel, advertise)
-}
-
-func (s *Service) Ready() bool {
-	return s.nodes.ready()
-}
-
-func (s *Service) RegisterLoopDynamic(ctx context.Context, id, advertise, memberlistLabel, memberlistAdvertise string) {
 	if id == "" || advertise == "" {
 		s.log.Warn("scaler: registration disabled; member id/advertise missing")
 		return
@@ -352,7 +365,7 @@ func (s *Service) RegisterLoopDynamic(ctx context.Context, id, advertise, member
 		for _, link := range s.RegistryLinks() {
 			if err := s.postJSON(ctx, link, registry.ScaleLinkRegisterPath, registry.ScalerRegister{
 				ID: id, Advertise: advertise,
-				MemberlistLabel: memberlistLabel, MemberlistAdvertise: memberlistAdvertise,
+				MemberlistLabel: memberlistLabel,
 			}); err != nil {
 				ok = false
 				s.log.Warn("scaler: register", "registry", link.Name, "err", err)
@@ -368,6 +381,14 @@ func (s *Service) RegisterLoopDynamic(ctx context.Context, id, advertise, member
 		case <-time.After(wait):
 		}
 	}
+}
+
+func (s *Service) Ready() bool {
+	return s.nodes.ready()
+}
+
+func (s *Service) ReadyForLabel(label string) bool {
+	return s.nodes.readyForLabel(label)
 }
 
 // answer computes a placement for a reverse request over the local view. It
@@ -513,6 +534,11 @@ func (s *Service) reconcileSelectorPatches(ctx context.Context) {
 			return
 		case <-readyPoll.C:
 			reconcileIfReady()
+		case <-s.nodeChanges:
+			if s.nodes.ready() {
+				wasReady = true
+				s.reconcileImportSources(ctx, s.nodes.values(), last)
+			}
 		case <-t.C:
 			ready := s.nodes.ready()
 			wasReady = ready
@@ -548,8 +574,16 @@ func (s *Service) reconcileImportSources(ctx context.Context, nodes []*registry.
 }
 
 func (s *Service) reconcileImportSource(ctx context.Context, source ImportSource, nodes []*registry.NodeRecord, last map[string]selectorPatchState) {
+	retries := 0
 	for {
-		lease, ok := s.acquireImportSourceLeaseToken(ctx, source.SourceID)
+		lease, ok, err := s.acquireImportSourceLeaseToken(ctx, source.SourceID)
+		if err != nil {
+			if s.retryScaleLinkFailure(ctx, source.SourceID, err, &retries) {
+				continue
+			}
+			s.log.Warn("scaler: import source lease", "source", source.SourceID, "err", err)
+			return
+		}
 		if !ok {
 			return
 		}
@@ -564,17 +598,50 @@ func (s *Service) reconcileImportSource(ctx context.Context, source ImportSource
 			return
 		}
 		if err := s.pushSelectorPatches(ctx, source.SourceID, nodes, groups, lease, last); err != nil {
+			if s.retryScaleLinkFailure(ctx, source.SourceID, err, &retries) {
+				continue
+			}
 			s.log.Warn("scaler: selector patch", "source", source.SourceID, "err", err)
 			return
 		}
 		complete := page.NextCursor == ""
 		if err := s.checkpointImportSource(ctx, source.SourceID, lease, page.NextCursor, complete, ""); err != nil {
+			if s.retryScaleLinkFailure(ctx, source.SourceID, err, &retries) {
+				continue
+			}
 			s.log.Warn("scaler: source cursor", "source", source.SourceID, "cursor", page.NextCursor, "err", err)
 			return
 		}
+		retries = 0
 		if complete {
 			return
 		}
+	}
+}
+
+func (s *Service) retryScaleLinkFailure(ctx context.Context, sourceID string, err error, attempts *int) bool {
+	if attempts == nil || *attempts >= scaleLinkFailureRetries {
+		return false
+	}
+	s.linksMu.RLock()
+	refresher := s.scaleLinkRefresher
+	s.linksMu.RUnlock()
+	if refresher == nil {
+		return false
+	}
+	*attempts++
+	if refreshErr := refresher(ctx); refreshErr != nil {
+		s.log.Warn("scaler: refresh registry membership after scale_link failure", "source", sourceID, "err", refreshErr, "cause", err)
+	} else {
+		s.log.Warn("scaler: retry scale_link operation after membership refresh", "source", sourceID, "attempt", *attempts, "err", err)
+	}
+	timer := time.NewTimer(scaleLinkRetryDelay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
 	}
 }
 
@@ -651,24 +718,29 @@ func (s *Service) sourceOwnerSnapshot() (string, []string) {
 	return self, source()
 }
 
-func (s *Service) acquireImportSourceLeaseToken(ctx context.Context, sourceID string) (importLeaseToken, bool) {
+func (s *Service) acquireImportSourceLeaseToken(ctx context.Context, sourceID string) (importLeaseToken, bool, error) {
 	self, _ := s.sourceOwnerSnapshot()
 	if self == "" {
 		self = "local"
 	}
 	links := s.scaleLinkLinks(ctx, string(clusterstate.ScaleImportSourceShard(sourceID)))
+	var lastErr error
 	for _, link := range links {
 		resp, err := s.acquireImportSourceLease(ctx, link, sourceID, self)
 		if err != nil {
+			lastErr = err
 			s.log.Warn("scaler: import source lease", "registry", link.Name, "source", sourceID, "err", err)
 			continue
 		}
 		if !resp.Acquired {
-			return importLeaseToken{sourceID: sourceID, lease: resp.Lease}, false
+			return importLeaseToken{sourceID: sourceID, lease: resp.Lease}, false, nil
 		}
-		return importLeaseToken{sourceID: sourceID, lease: resp.Lease}, true
+		return importLeaseToken{sourceID: sourceID, lease: resp.Lease}, true, nil
 	}
-	return importLeaseToken{}, false
+	if lastErr != nil {
+		return importLeaseToken{}, false, lastErr
+	}
+	return importLeaseToken{}, false, nil
 }
 
 func (s *Service) acquireImportSourceLease(ctx context.Context, link RegistryLink, sourceID, ownerID string) (registry.ImportSourceLeaseResponse, error) {
@@ -871,6 +943,7 @@ func (s *Service) watchNodeList(ctx context.Context) {
 	for ctx.Err() == nil {
 		s.linksMu.RLock()
 		links := append([]RegistryLink(nil), s.watchLinks...)
+		label := s.watchLabel
 		s.linksMu.RUnlock()
 		if len(links) == 0 {
 			s.nodes.removeSource("node_list")
@@ -891,7 +964,7 @@ func (s *Service) watchNodeList(ctx context.Context) {
 			token = ""
 			s.nodes.removeSource("node_list")
 		}
-		sink := s.nodes.source("node_list")
+		sink := s.nodes.sourceWithNotifyLabel("node_list", label, s.notifyNodeListChanged)
 		nextToken, err := s.subscribeOnce(ctx, link, registry.ScaleLinkNodeListWatchPath, token, sink)
 		token = nextToken
 		if ctx.Err() != nil {
@@ -903,6 +976,13 @@ func (s *Service) watchNodeList(ctx context.Context) {
 			return
 		case <-time.After(500 * time.Millisecond):
 		}
+	}
+}
+
+func (s *Service) notifyNodeListChanged() {
+	select {
+	case s.nodeChanges <- struct{}{}:
+	default:
 	}
 }
 
@@ -1028,11 +1108,14 @@ type nodeSource struct {
 	shadow  map[string]*registry.NodeRecord
 	syncing bool
 	synced  bool
+	label   string
 }
 
 type nodeViewSink struct {
-	view   *nodeView
-	source string
+	view     *nodeView
+	source   string
+	label    string
+	onChange func()
 }
 
 func newNodeView(minReady int) *nodeView {
@@ -1043,13 +1126,22 @@ func newNodeView(minReady int) *nodeView {
 }
 
 func (v *nodeView) source(name string) viewSink {
+	return v.sourceWithNotify(name, nil)
+}
+
+func (v *nodeView) sourceWithNotify(name string, notify func()) viewSink {
+	return v.sourceWithNotifyLabel(name, "", notify)
+}
+
+func (v *nodeView) sourceWithNotifyLabel(name, label string, notify func()) viewSink {
 	if name == "" {
 		name = "registry"
 	}
 	v.mu.Lock()
-	v.ensureLocked(name)
+	src := v.ensureLocked(name)
+	src.label = label
 	v.mu.Unlock()
-	return nodeViewSink{view: v, source: name}
+	return nodeViewSink{view: v, source: name, label: label, onChange: notify}
 }
 
 func (v *nodeView) setMinReady(n int) {
@@ -1079,6 +1171,7 @@ func (v *nodeView) ensureLocked(name string) *nodeSource {
 func (s nodeViewSink) reset() {
 	s.view.mu.Lock()
 	src := s.view.ensureLocked(s.source)
+	src.label = s.label
 	src.shadow = map[string]*registry.NodeRecord{}
 	src.syncing = true
 	s.view.mu.Unlock()
@@ -1091,42 +1184,85 @@ func (s nodeViewSink) put(key string, raw json.RawMessage) {
 	}
 	s.view.mu.Lock()
 	src := s.view.ensureLocked(s.source)
+	changed := false
 	if src.syncing {
 		src.shadow[key] = v
 	} else {
+		changed = true
 		src.live[key] = v
 	}
 	s.view.mu.Unlock()
+	if changed {
+		s.notifyChange()
+	}
 }
 
 func (s nodeViewSink) del(key string) {
 	s.view.mu.Lock()
 	src := s.view.ensureLocked(s.source)
+	changed := false
 	if src.syncing {
 		delete(src.shadow, key)
 	} else {
+		_, changed = src.live[key]
 		delete(src.live, key)
 	}
 	s.view.mu.Unlock()
+	if changed {
+		s.notifyChange()
+	}
 }
 
 func (s nodeViewSink) bookmark() {
 	s.view.mu.Lock()
 	src := s.view.ensureLocked(s.source)
+	oldLabel := src.label
+	wasSynced := src.synced
+	changed := !wasSynced || oldLabel != s.label
 	if src.syncing {
+		if wasSynced && !nodeRecordMapsEqual(src.live, src.shadow) {
+			changed = true
+		}
 		src.live, src.shadow = src.shadow, nil
 		src.syncing = false
 	}
+	src.label = s.label
 	src.synced = true
 	s.view.mu.Unlock()
+	if changed {
+		s.notifyChange()
+	}
+}
+
+func nodeRecordMapsEqual(a, b map[string]*registry.NodeRecord) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for key, av := range a {
+		bv, ok := b[key]
+		if !ok || !reflect.DeepEqual(av, bv) {
+			return false
+		}
+	}
+	return true
+}
+
+func (s nodeViewSink) notifyChange() {
+	if s.onChange != nil {
+		s.onChange()
+	}
 }
 
 func (v *nodeView) ready() bool {
+	return v.readyForLabel("")
+}
+
+func (v *nodeView) readyForLabel(label string) bool {
 	v.mu.RLock()
 	defer v.mu.RUnlock()
 	ready := 0
 	for _, src := range v.sources {
-		if src.synced {
+		if src.synced && (label == "" || src.label == label) {
 			ready++
 		}
 	}

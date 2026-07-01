@@ -570,19 +570,21 @@ type stubNode struct {
 	svc *service
 	log *slog.Logger
 
-	mu          sync.Mutex
-	online      bool
-	cancel      context.CancelFunc
-	draining    bool
-	session     int64
-	sandboxes   map[string]*stubSandbox
-	builds      map[string]*stubBuild
-	keys        map[string]stubKey
-	commands    []commandLog
-	cmdSeq      int64
-	subs        map[int]chan routesync.Event
-	subSeq      int
-	buildEvents chan *routesync.BuildEvent
+	mu           sync.Mutex
+	online       bool
+	cancel       context.CancelFunc
+	draining     bool
+	session      int64
+	linkEndpoint string
+	redirectTo   routesync.NodeLinkTarget
+	sandboxes    map[string]*stubSandbox
+	builds       map[string]*stubBuild
+	keys         map[string]stubKey
+	commands     []commandLog
+	cmdSeq       int64
+	subs         map[int]chan routesync.Event
+	subSeq       int
+	buildEvents  chan *routesync.BuildEvent
 }
 
 func newStubNode(opts stubNodeOptions, svc *service) *stubNode {
@@ -644,6 +646,7 @@ func (n *stubNode) crash() {
 	cancel := n.cancel
 	n.cancel = nil
 	n.online = false
+	n.linkEndpoint = ""
 	n.mu.Unlock()
 	if cancel != nil {
 		cancel()
@@ -681,6 +684,20 @@ func (n *stubNode) setDraining(v bool) {
 	n.draining = v
 	n.mu.Unlock()
 	n.svc.logEvent(n.ID, "node_drain", map[string]any{"draining": v})
+}
+
+func (n *stubNode) NodeLinkSession(endpoint string) {
+	n.mu.Lock()
+	n.linkEndpoint = endpoint
+	n.mu.Unlock()
+	n.svc.logEvent(n.ID, "node_link_session", map[string]string{"endpoint": endpoint})
+}
+
+func (n *stubNode) NodeLinkRedirect(target routesync.NodeLinkTarget) {
+	n.mu.Lock()
+	n.redirectTo = target
+	n.mu.Unlock()
+	n.svc.logEvent(n.ID, "node_link_redirect", target)
 }
 
 func (n *stubNode) Range(ctx context.Context, fn func(routesync.RouteEntry) error) error {
@@ -1007,6 +1024,7 @@ func (n *stubNode) snapshot() nodeSnapshot {
 	return nodeSnapshot{
 		NodeID: n.ID, Online: n.online, Labels: cloneStringMap(n.Labels), Capacity: n.Capacity,
 		DataEndpoint: n.DataEndpoint, RuntimeDigest: n.RuntimeDigest, Draining: n.draining,
+		LinkEndpoint: n.linkEndpoint, RedirectMemberID: n.redirectTo.MemberID, RedirectEndpoint: n.redirectTo.Endpoint,
 		Sandboxes: n.sandboxSnapshotsLocked(), Builds: n.buildSnapshotsLocked(), Keys: n.keySnapshotsLocked(),
 		CommandCounts: n.commandCountsLocked(),
 	}
@@ -1211,17 +1229,20 @@ type dataHit struct {
 }
 
 type nodeSnapshot struct {
-	NodeID        string            `json:"node_id"`
-	Online        bool              `json:"online"`
-	Labels        map[string]string `json:"labels,omitempty"`
-	Capacity      int               `json:"capacity,omitempty"`
-	DataEndpoint  string            `json:"data_endpoint,omitempty"`
-	RuntimeDigest string            `json:"runtime_digest,omitempty"`
-	Draining      bool              `json:"draining,omitempty"`
-	Sandboxes     []sandboxSnapshot `json:"sandboxes,omitempty"`
-	Builds        []buildSnapshot   `json:"builds,omitempty"`
-	Keys          []stubKey         `json:"keys,omitempty"`
-	CommandCounts map[string]int    `json:"command_counts,omitempty"`
+	NodeID           string            `json:"node_id"`
+	Online           bool              `json:"online"`
+	Labels           map[string]string `json:"labels,omitempty"`
+	Capacity         int               `json:"capacity,omitempty"`
+	DataEndpoint     string            `json:"data_endpoint,omitempty"`
+	RuntimeDigest    string            `json:"runtime_digest,omitempty"`
+	Draining         bool              `json:"draining,omitempty"`
+	LinkEndpoint     string            `json:"link_endpoint,omitempty"`
+	RedirectMemberID string            `json:"redirect_member_id,omitempty"`
+	RedirectEndpoint string            `json:"redirect_endpoint,omitempty"`
+	Sandboxes        []sandboxSnapshot `json:"sandboxes,omitempty"`
+	Builds           []buildSnapshot   `json:"builds,omitempty"`
+	Keys             []stubKey         `json:"keys,omitempty"`
+	CommandCounts    map[string]int    `json:"command_counts,omitempty"`
 }
 
 type sandboxSnapshot struct {

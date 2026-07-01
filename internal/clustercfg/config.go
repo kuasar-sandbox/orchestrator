@@ -24,17 +24,16 @@ const (
 )
 
 // ===========================================================================
-// Shared sub-types (reused across the three role schemas).
+// Shared sub-types (reused across role schemas).
 // ===========================================================================
 
-// MemberConfig is a registry member's unified control-plane endpoint. node_link,
-// route_link, scale_link, and member RPC are path namespaces on this listener
-// unless node_link.listen is explicitly split out.
+// MemberConfig identifies a registry process and its local unified control-plane
+// listener. The externally reachable registry address is versioned in
+// membership.versions[].members[].advertise, not duplicated here.
 type MemberConfig struct {
-	ID        string `yaml:"id"`
-	Listen    string `yaml:"listen"`    // unified control-plane listener
-	Advertise string `yaml:"advertise"` // address peers/clients use to reach this member
-	TLS       TLS    `yaml:"tls"`       // server mTLS for the unified listener
+	ID     string `yaml:"id"`
+	Listen string `yaml:"listen"` // unified control-plane listener
+	TLS    TLS    `yaml:"tls"`    // server mTLS for the unified listener
 }
 
 // MembershipConfig is the versioned registry member view. The active version is
@@ -43,11 +42,12 @@ type MemberConfig struct {
 // old_grace keeps a previous version reachable for peer/node-owner RPC without
 // adding it to owner quorums.
 type MembershipConfig struct {
-	Active   int64                 `yaml:"active" json:"active"`
-	Next     int64                 `yaml:"next,omitempty" json:"next,omitempty"`
-	OldGrace int64                 `yaml:"old_grace,omitempty" json:"old_grace,omitempty"`
-	Versions []MembershipVersion   `yaml:"versions" json:"versions"`
-	Owners   MembershipOwnerConfig `yaml:"owners" json:"owners"`
+	Active             int64                 `yaml:"active" json:"active"`
+	Next               int64                 `yaml:"next,omitempty" json:"next,omitempty"`
+	OldGrace           int64                 `yaml:"old_grace,omitempty" json:"old_grace,omitempty"`
+	ReloadReadyTimeout string                `yaml:"reload_ready_timeout,omitempty" json:"reload_ready_timeout,omitempty"`
+	Versions           []MembershipVersion   `yaml:"versions" json:"versions"`
+	Owners             MembershipOwnerConfig `yaml:"owners" json:"owners"`
 }
 
 type MembershipVersion struct {
@@ -69,11 +69,10 @@ type MembershipOwnerConfig struct {
 	NodeList  int `yaml:"node_list" json:"node_list"`
 }
 
-// NodeLinkConfig configures node_link behavior. listen/advertise are optional
-// production split points for node long-lived streams; empty means reuse member.
+// NodeLinkConfig configures node_link behavior. listen is the optional production
+// split point for node long-lived streams; empty means reuse member.listen.
 type NodeLinkConfig struct {
 	Listen            string `yaml:"listen"`
-	Advertise         string `yaml:"advertise"`
 	TLS               TLS    `yaml:"tls"`
 	HeartbeatInterval string `yaml:"heartbeat_interval"` // default 10s
 	NodeDeadAfter     string `yaml:"node_dead_after"`    // default 30s
@@ -94,10 +93,6 @@ type ScaleLinkConfig struct {
 	MinReadyScalers    int    `yaml:"min_ready_scalers"`
 	ScalerLabel        string `yaml:"scaler_label"`
 	PlaceTimeout       string `yaml:"place_timeout"`
-}
-
-type ScalerMemberlistConfig struct {
-	Label string `yaml:"label"`
 }
 
 // RegistryDialConfig is how a consumer reaches the registry bootstrap endpoint.
@@ -142,6 +137,17 @@ type GroupSourceConfig struct {
 	SourceID   string `yaml:"source_id"`
 	SourceType string `yaml:"source_type"`
 	Path       string `yaml:"path,omitempty"`
+}
+
+// ScalerProcessConfig is the standalone scaler's own control plane. The same
+// advertise address is used for scaler API calls and scaler memberlist HTTP
+// transport.
+type ScalerProcessConfig struct {
+	ID              string `yaml:"id"`
+	Listen          string `yaml:"listen"`
+	Advertise       string `yaml:"advertise"`
+	MemberlistLabel string `yaml:"memberlist_label"`
+	TLS             TLS    `yaml:"tls"`
 }
 
 // ShuffleRule pins each matching group to n deterministic shards of the node set
@@ -237,6 +243,10 @@ func (c *PlacementConfig) ImportSourceLeaseTTLDur() time.Duration {
 }
 func (c *PlacementConfig) SelectorPatchRefreshDur() time.Duration {
 	d, _ := time.ParseDuration(c.SelectorPatchRefresh)
+	return d
+}
+func (m MembershipConfig) ReloadReadyTimeoutDur() time.Duration {
+	d, _ := time.ParseDuration(m.ReloadReadyTimeout)
 	return d
 }
 
@@ -381,10 +391,10 @@ func DefaultRegistry() RegistryConfig {
 	return RegistryConfig{
 		Member: MemberConfig{ID: "registry", Listen: ":7700"},
 		Membership: MembershipConfig{
-			Active: 1,
+			Active: 1, ReloadReadyTimeout: "10s",
 			Versions: []MembershipVersion{{
 				Version: 1,
-				Members: []MembershipMember{{ID: "registry"}},
+				Members: []MembershipMember{{ID: "registry", Advertise: defaultRegistryBootstrap, NodeAdvertise: defaultRegistryBootstrap}},
 			}},
 			Owners: MembershipOwnerConfig{RouteLink: 1, NodeLink: 1, ScaleLink: 1, NodeList: 1},
 		},
@@ -424,26 +434,16 @@ func (c *RegistryConfig) applyDefaults() {
 	if c.Member.Listen == "" {
 		c.Member.Listen = d.Member.Listen
 	}
-	if c.Member.Advertise == "" {
-		c.Member.Advertise = c.Member.Listen
-	}
 	if c.Membership.Active == 0 {
 		c.Membership.Active = d.Membership.Active
+	}
+	if c.Membership.ReloadReadyTimeout == "" {
+		c.Membership.ReloadReadyTimeout = d.Membership.ReloadReadyTimeout
 	}
 	if len(c.Membership.Versions) == 0 {
 		c.Membership.Versions = d.Membership.Versions
 	}
 	for vi := range c.Membership.Versions {
-		for mi := range c.Membership.Versions[vi].Members {
-			if c.Membership.Versions[vi].Members[mi].ID == c.Member.ID &&
-				c.Membership.Versions[vi].Members[mi].Advertise == "" {
-				c.Membership.Versions[vi].Members[mi].Advertise = c.ControlAdvertise()
-			}
-			if c.Membership.Versions[vi].Members[mi].ID == c.Member.ID &&
-				c.Membership.Versions[vi].Members[mi].NodeAdvertise == "" {
-				c.Membership.Versions[vi].Members[mi].NodeAdvertise = c.NodeAdvertise()
-			}
-		}
 		c.Membership.Versions[vi] = c.Membership.Versions[vi].WithComputedLabel()
 	}
 	if c.Membership.Owners.RouteLink == 0 {
@@ -524,6 +524,19 @@ func (c *RegistryConfig) Validate() error {
 		if len(v.Members) == 0 {
 			return fmt.Errorf("clustercfg: membership version %d has no members", v.Version)
 		}
+		seenMembers := map[string]bool{}
+		for _, member := range v.Members {
+			if member.ID == "" {
+				return fmt.Errorf("clustercfg: membership version %d has member with empty id", v.Version)
+			}
+			if seenMembers[member.ID] {
+				return fmt.Errorf("clustercfg: membership version %d has duplicate member id %q", v.Version, member.ID)
+			}
+			seenMembers[member.ID] = true
+			if member.Advertise == "" {
+				return fmt.Errorf("clustercfg: membership version %d member %q advertise is required", v.Version, member.ID)
+			}
+		}
 		if v.Version == c.Membership.Active ||
 			(c.Membership.Next != 0 && v.Version == c.Membership.Next) ||
 			(c.Membership.OldGrace != 0 && v.Version == c.Membership.OldGrace) {
@@ -545,6 +558,12 @@ func (c *RegistryConfig) Validate() error {
 	}
 	if !selfInServingVersion {
 		return fmt.Errorf("clustercfg: member.id %q is not in active, next, or old_grace membership", c.Member.ID)
+	}
+	if err := c.validateSelfMemberConsistency(); err != nil {
+		return err
+	}
+	if err := c.validateScalerLabelDoesNotConflict(); err != nil {
+		return err
 	}
 	if c.Membership.Owners.RouteLink <= 0 {
 		return fmt.Errorf("clustercfg: membership.owners.route_link must be positive")
@@ -574,22 +593,82 @@ func (c *RegistryConfig) Validate() error {
 		return fmt.Errorf("clustercfg: scale_link.scaler_label is required")
 	}
 	return validateDurations(map[string]string{
-		"node_link.heartbeat_interval": c.NodeLink.HeartbeatInterval,
-		"node_link.node_dead_after":    c.NodeLink.NodeDeadAfter,
-		"route_link.park_timeout":      c.RouteLink.ParkTimeout,
-		"scale_link.place_timeout":     c.ScaleLink.PlaceTimeout,
+		"membership.reload_ready_timeout": c.Membership.ReloadReadyTimeout,
+		"node_link.heartbeat_interval":    c.NodeLink.HeartbeatInterval,
+		"node_link.node_dead_after":       c.NodeLink.NodeDeadAfter,
+		"route_link.park_timeout":         c.RouteLink.ParkTimeout,
+		"scale_link.place_timeout":        c.ScaleLink.PlaceTimeout,
 	})
 }
 
 // ControlListen is the unified registry listener.
 func (c *RegistryConfig) ControlListen() string { return c.Member.Listen }
 
-// ControlAdvertise is the address other components should use for this member.
-func (c *RegistryConfig) ControlAdvertise() string {
-	if c.Member.Advertise != "" {
-		return c.Member.Advertise
+// SelfMember returns this registry process' member entry from the serving
+// membership versions. Validate guarantees that repeated entries are consistent.
+func (c *RegistryConfig) SelfMember() (MembershipMember, bool) {
+	for _, version := range c.Membership.MemberVersions() {
+		for _, member := range version.Members {
+			if member.ID == c.Member.ID {
+				return member, true
+			}
+		}
 	}
-	return c.Member.Listen
+	return MembershipMember{}, false
+}
+
+func (c *RegistryConfig) SelfAdvertise() string {
+	member, ok := c.SelfMember()
+	if !ok {
+		return ""
+	}
+	return member.Advertise
+}
+
+func (c *RegistryConfig) SelfNodeAdvertise() string {
+	member, ok := c.SelfMember()
+	if !ok {
+		return ""
+	}
+	return member.NodeAdvertise
+}
+
+func (c *RegistryConfig) validateSelfMemberConsistency() error {
+	var seen bool
+	var advertise, nodeAdvertise string
+	for _, version := range c.Membership.MemberVersions() {
+		for _, member := range version.Members {
+			if member.ID != c.Member.ID {
+				continue
+			}
+			if !seen {
+				seen = true
+				advertise = member.Advertise
+				nodeAdvertise = member.NodeAdvertise
+				continue
+			}
+			if member.Advertise != advertise {
+				return fmt.Errorf("clustercfg: member.id %q has inconsistent advertise across membership versions", c.Member.ID)
+			}
+			if member.NodeAdvertise != nodeAdvertise {
+				return fmt.Errorf("clustercfg: member.id %q has inconsistent node_advertise across membership versions", c.Member.ID)
+			}
+		}
+	}
+	return nil
+}
+
+func (c *RegistryConfig) validateScalerLabelDoesNotConflict() error {
+	if c.ScaleLink.ScalerLabel == "" {
+		return nil
+	}
+	for _, version := range c.Membership.Versions {
+		label := version.WithComputedLabel().Label
+		if label == c.ScaleLink.ScalerLabel {
+			return fmt.Errorf("clustercfg: scale_link.scaler_label %q conflicts with registry membership label", c.ScaleLink.ScalerLabel)
+		}
+	}
+	return nil
 }
 
 // NodeListen is the node_link listener; empty node_link.listen means reuse the
@@ -599,13 +678,6 @@ func (c *RegistryConfig) NodeListen() string {
 		return c.NodeLink.Listen
 	}
 	return c.Member.Listen
-}
-
-func (c *RegistryConfig) NodeAdvertise() string {
-	if c.NodeLink.Advertise != "" {
-		return c.NodeLink.Advertise
-	}
-	return c.ControlAdvertise()
 }
 
 // NodeLinkSplit reports whether node_link should bind a separate listener.
@@ -729,18 +801,16 @@ func (c *RouterConfig) RouteIdleDur() time.Duration {
 // membership through the bootstrap endpoint, pushes itself to scale_link, and
 // answers placement calls from registry route owners.
 type ScalerConfig struct {
-	Member       MemberConfig           `yaml:"member"`
-	Memberlist   ScalerMemberlistConfig `yaml:"memberlist"`
-	Registry     RegistryDialConfig     `yaml:"registry"` // upstream: registry bootstrap/membership
-	ImportGroups []GroupSourceConfig    `yaml:"import_groups,omitempty"`
-	Placement    PlacementConfig        `yaml:"placement"` // placement policy
+	Scaler       ScalerProcessConfig `yaml:"scaler"`
+	Registry     RegistryDialConfig  `yaml:"registry"` // upstream: registry bootstrap/membership
+	ImportGroups []GroupSourceConfig `yaml:"import_groups,omitempty"`
+	Placement    PlacementConfig     `yaml:"placement"` // placement policy
 }
 
 // DefaultScaler returns the scaler config with all non-required fields set.
 func DefaultScaler() ScalerConfig {
 	return ScalerConfig{
-		Member:       MemberConfig{ID: "scaler", Listen: ":7800"},
-		Memberlist:   ScalerMemberlistConfig{Label: "scaler.default"},
+		Scaler:       ScalerProcessConfig{ID: "scaler", Listen: ":7800", Advertise: "127.0.0.1:7800", MemberlistLabel: "scaler.default"},
 		Registry:     RegistryDialConfig{Bootstrap: defaultRegistryBootstrap},
 		ImportGroups: nil,
 		Placement: PlacementConfig{
@@ -771,17 +841,17 @@ func LoadScaler(path string) (*ScalerConfig, error) {
 
 func (c *ScalerConfig) applyDefaults() {
 	d := DefaultScaler()
-	if c.Member.ID == "" {
-		c.Member.ID = d.Member.ID
+	if c.Scaler.ID == "" {
+		c.Scaler.ID = d.Scaler.ID
 	}
-	if c.Member.Listen == "" {
-		c.Member.Listen = d.Member.Listen
+	if c.Scaler.Listen == "" {
+		c.Scaler.Listen = d.Scaler.Listen
 	}
-	if c.Member.Advertise == "" {
-		c.Member.Advertise = c.Member.Listen
+	if c.Scaler.Advertise == "" {
+		c.Scaler.Advertise = d.Scaler.Advertise
 	}
-	if c.Memberlist.Label == "" {
-		c.Memberlist.Label = d.Memberlist.Label
+	if c.Scaler.MemberlistLabel == "" {
+		c.Scaler.MemberlistLabel = d.Scaler.MemberlistLabel
 	}
 	if c.Registry.Bootstrap == "" {
 		c.Registry.Bootstrap = d.Registry.Bootstrap
@@ -807,17 +877,20 @@ func (c *ScalerConfig) applyDefaults() {
 }
 
 func (c *ScalerConfig) Validate() error {
-	if c.Member.ID == "" {
-		return fmt.Errorf("clustercfg: member.id is required")
+	if c.Scaler.ID == "" {
+		return fmt.Errorf("clustercfg: scaler.id is required")
 	}
-	if c.Member.Listen == "" {
-		return fmt.Errorf("clustercfg: member.listen is required")
+	if c.Scaler.Listen == "" {
+		return fmt.Errorf("clustercfg: scaler.listen is required")
+	}
+	if c.Scaler.Advertise == "" {
+		return fmt.Errorf("clustercfg: scaler.advertise is required")
 	}
 	if c.Registry.Bootstrap == "" {
 		return fmt.Errorf("clustercfg: registry.bootstrap is required")
 	}
-	if c.Memberlist.Label == "" {
-		return fmt.Errorf("clustercfg: memberlist.label is required")
+	if c.Scaler.MemberlistLabel == "" {
+		return fmt.Errorf("clustercfg: scaler.memberlist_label is required")
 	}
 	switch c.Placement.ZoneAdmitMax {
 	case "", "green", "yellow", "red":

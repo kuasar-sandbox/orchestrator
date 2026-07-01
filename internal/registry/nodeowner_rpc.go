@@ -147,6 +147,9 @@ func (o *HTTPNodeOwner) SendCommand(ctx context.Context, nodeID string, cmd *rou
 
 func (o *HTTPNodeOwner) SendCommandAndWait(ctx context.Context, nodeID string, cmd *routesync.Command, timeout time.Duration) (*routesync.CmdAck, error) {
 	out, err := o.call(ctx, nodeOwnerRequest{Op: "send_command_wait", NodeID: nodeID, Command: cmd, TimeoutMS: timeout.Milliseconds()})
+	if err != nil && err.Error() == context.DeadlineExceeded.Error() {
+		return out.Ack, context.DeadlineExceeded
+	}
 	return out.Ack, err
 }
 
