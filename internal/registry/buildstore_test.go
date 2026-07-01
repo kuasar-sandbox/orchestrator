@@ -151,7 +151,7 @@ func TestBuildStoreUsesRouteLinkBuildShardAndDoesNotLeakToSandboxList(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	assertShardRecordOwners(t, ctx, cluster, shardkv.Namespace(clusterstate.NamespaceRouteLink), clusterstate.RouteLinkShard("/g"), clusterstate.RouteBuildRecordKey("bld-1"), owners)
+	assertShardRecordOwners(t, ctx, cluster, shardkv.Namespace(clusterstate.NamespaceRouteLink), clusterstate.RouteLinkShard("/g"), clusterstate.RecordSetRouteBuild, clusterstate.RouteBuildRecordKey("bld-1"), owners)
 
 	var sandboxes []string
 	if err := stores.RangeSandboxes(ctx, "/g", func(s *SandboxRecord) error {

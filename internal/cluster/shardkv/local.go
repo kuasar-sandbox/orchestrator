@@ -118,36 +118,81 @@ func (s *Store) Handle(ctx context.Context, req Request) (Response, error) {
 	if err := ctx.Err(); err != nil {
 		return Response{}, err
 	}
+	if err := s.validateRequest(req); err != nil {
+		return Response{}, err
+	}
 	switch req.Op {
 	case OpSnapshot:
 		ls, err := s.getLocalShardNoTouch(req.Namespace, req.Shard)
 		if err != nil {
 			return Response{}, err
 		}
-		records, rev := ls.snapshotRecords(true)
+		rs := ls.recordSetNoTouch(req.RecordSet)
+		if rs == nil {
+			return Response{OK: true}, nil
+		}
+		records, rev := rs.snapshotRecords(true)
 		return Response{Records: records, OK: true, Rev: rev}, nil
 	case OpRepair:
 		ls, err := s.getLocalShardNoTouch(req.Namespace, req.Shard)
 		if err != nil {
 			return Response{}, err
 		}
-		ok := ls.repair(req.Record, s.now())
+		rs := ls.recordSetNoTouch(req.RecordSet)
+		if rs == nil {
+			if req.Record.Key == "" {
+				return Response{OK: false}, nil
+			}
+			rs = ls.recordSet(req.RecordSet, s.now())
+		}
+		ok := rs.repair(req.Record, s.now())
 		return Response{OK: ok}, nil
+	case OpInstall:
+		ls, err := s.getLocalShardNoTouch(req.Namespace, req.Shard)
+		if err != nil {
+			return Response{}, err
+		}
+		rs := ls.recordSet(req.RecordSet, s.now())
+		ok := rs.install(req.Records, req.Rev, s.now())
+		return Response{OK: ok, Rev: req.Rev}, nil
 	}
 	ls, err := s.getLocalShard(req.Namespace, req.Shard)
 	if err != nil {
 		return Response{}, err
 	}
+	rs := ls.recordSet(req.RecordSet, s.now())
 	switch req.Op {
+	case OpRead:
+		rec, found, rev := rs.read(req.Key)
+		return Response{Record: rec, Found: found, OK: true, Rev: rev}, nil
 	case OpPrepare:
-		rec, found, ok, promised := ls.prepare(req.Key, req.Ballot)
-		return Response{Record: rec, Found: found, OK: ok, Promised: promised}, nil
+		rec, found, rev, ok, promised := rs.prepare(req.Key, req.Ballot)
+		return Response{Record: rec, Found: found, OK: ok, Promised: promised, Rev: rev}, nil
 	case OpAccept:
-		ok, promised := ls.accept(req.Key, req.Record, req.Ballot, s.now())
-		return Response{OK: ok, Promised: promised}, nil
+		ok, promised := rs.accept(req.Key, req.Record, req.Ballot, s.now())
+		return Response{OK: ok, Promised: promised, Rev: req.Record.Meta.Rev}, nil
 	default:
 		return Response{}, fmt.Errorf("shardkv: unknown op %q", req.Op)
 	}
+}
+
+func (s *Store) validateRequest(req Request) error {
+	if req.Namespace == "" || req.Shard == "" || req.RecordSet == "" {
+		return ErrInvalidView
+	}
+	view, err := s.resolver.ResolveShard(req.Namespace, req.Shard)
+	if err != nil {
+		return err
+	}
+	if req.Label != "" && req.Label != view.Label {
+		return ErrInvalidView
+	}
+	for _, member := range shardMembers(view) {
+		if member == s.local {
+			return nil
+		}
+	}
+	return ErrInvalidView
 }
 
 func (s *Store) Close() error {
@@ -229,8 +274,8 @@ func localShardKey(ns Namespace, shard ShardKey) string {
 	return string(ns) + "\x00" + string(shard)
 }
 
-func recordRoundKey(ns Namespace, shard ShardKey, key RecordKey) string {
-	return string(ns) + "\x00" + string(shard) + "\x00" + string(key)
+func recordSetRoundKey(ns Namespace, shard ShardKey, recordSet RecordSetName) string {
+	return string(ns) + "\x00" + string(shard) + "\x00" + string(recordSet)
 }
 
 type localShard struct {
@@ -240,23 +285,49 @@ type localShard struct {
 	retention int
 
 	mu         sync.Mutex
-	records    map[RecordKey]Record
-	promised   map[RecordKey]Ballot
-	rev        uint64
-	log        []WatchEvent
-	subs       map[int]chan WatchEvent
-	nextSub    int
-	readyLabel map[string]bool
+	recordSets map[RecordSetName]*localRecordSet
 	lastAccess time.Time
+}
+
+type localRecordSet struct {
+	namespace Namespace
+	shard     ShardKey
+	name      RecordSetName
+	epoch     string
+	retention int
+
+	mu          sync.Mutex
+	records     map[RecordKey]Record
+	promised    map[RecordKey]Ballot
+	setPromised Ballot
+	rev         uint64
+	log         []WatchEvent
+	subs        map[int]watchSub
+	nextSub     int
+	readyLabel  map[string]uint64
+	lastAccess  time.Time
 }
 
 func newLocalShard(ns Namespace, shard ShardKey, epoch string, retention int, now time.Time) *localShard {
 	return &localShard{
 		namespace: ns, shard: shard, epoch: epoch, retention: retention,
-		records: map[RecordKey]Record{}, promised: map[RecordKey]Ballot{},
-		subs: map[int]chan WatchEvent{}, readyLabel: map[string]bool{},
+		recordSets: map[RecordSetName]*localRecordSet{},
 		lastAccess: now,
 	}
+}
+
+func newLocalRecordSet(ns Namespace, shard ShardKey, name RecordSetName, epoch string, retention int, now time.Time) *localRecordSet {
+	return &localRecordSet{
+		namespace: ns, shard: shard, name: name, epoch: epoch, retention: retention,
+		records: map[RecordKey]Record{}, promised: map[RecordKey]Ballot{},
+		subs: map[int]watchSub{}, readyLabel: map[string]uint64{},
+		lastAccess: now,
+	}
+}
+
+type watchSub struct {
+	label string
+	ch    chan WatchEvent
 }
 
 func (s *localShard) touch(now time.Time) {
@@ -265,42 +336,106 @@ func (s *localShard) touch(now time.Time) {
 	s.mu.Unlock()
 }
 
-func (s *localShard) prepare(key RecordKey, ballot Ballot) (Record, bool, bool, Ballot) {
+func (s *localShard) recordSet(name RecordSetName, now time.Time) *localRecordSet {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	promised := s.promised[key]
-	if ballot.Less(promised) {
-		return Record{}, false, false, promised
+	s.lastAccess = now
+	rs := s.recordSets[name]
+	if rs == nil {
+		rs = newLocalRecordSet(s.namespace, s.shard, name, s.epoch, s.retention, now)
+		s.recordSets[name] = rs
 	}
-	s.promised[key] = ballot
-	rec, found := s.records[key]
-	return cloneRecord(rec), found, true, ballot
+	rs.touch(now)
+	return rs
 }
 
-func (s *localShard) accept(key RecordKey, rec Record, ballot Ballot, now time.Time) (bool, Ballot) {
+func (s *localShard) recordSetNoTouch(name RecordSetName) *localRecordSet {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.recordSets[name]
+}
+
+func (s *localShard) recordSetNames() []RecordSetName {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]RecordSetName, 0, len(s.recordSets))
+	for name := range s.recordSets {
+		out = append(out, name)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
+}
+
+func (s *localRecordSet) touch(now time.Time) {
+	s.mu.Lock()
+	s.lastAccess = now
+	s.mu.Unlock()
+}
+
+func (s *localRecordSet) read(key RecordKey) (Record, bool, uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rec, found := s.records[key]
+	return cloneRecord(rec), found, s.rev
+}
+
+func (s *localRecordSet) prepare(key RecordKey, ballot Ballot) (Record, bool, uint64, bool, Ballot) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	promised := s.promised[key]
+	if promised.Less(s.setPromised) {
+		promised = s.setPromised
+	}
+	if ballot.Less(promised) {
+		return Record{}, false, s.rev, false, promised
+	}
+	s.setPromised = ballot
+	s.promised[key] = ballot
+	rec, found := s.records[key]
+	return cloneRecord(rec), found, s.rev, true, ballot
+}
+
+func (s *localRecordSet) accept(key RecordKey, rec Record, ballot Ballot, now time.Time) (bool, Ballot) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	promised := s.promised[key]
+	if promised.Less(s.setPromised) {
+		promised = s.setPromised
+	}
 	if ballot.Less(promised) {
 		return false, promised
 	}
+	if rec.Meta.Rev == 0 || rec.Meta.Rev > s.rev+1 {
+		return false, promised
+	}
 	cur, found := s.records[key]
+	if rec.Meta.Rev <= s.rev {
+		if found && sameCommittedRecord(rec, cur) {
+			s.setPromised = ballot
+			s.promised[key] = ballot
+			return true, ballot
+		}
+		return false, promised
+	}
 	if found && rec.Meta.Ballot.Less(cur.Meta.Ballot) {
 		if promised.Less(cur.Meta.Ballot) {
 			s.promised[key] = cur.Meta.Ballot
+			s.setPromised = cur.Meta.Ballot
 		}
 		return false, s.promised[key]
 	}
 	rec.Namespace = s.namespace
 	rec.Shard = s.shard
+	rec.RecordSet = s.name
 	rec.Key = key
 	rec.Value = append([]byte(nil), rec.Value...)
+	s.setPromised = ballot
 	s.promised[key] = ballot
 	s.putLocked(rec, now)
 	return true, ballot
 }
 
-func (s *localShard) repair(rec Record, now time.Time) bool {
+func (s *localRecordSet) repair(rec Record, now time.Time) bool {
 	if rec.Key == "" {
 		return false
 	}
@@ -311,19 +446,86 @@ func (s *localShard) repair(rec Record, now time.Time) bool {
 		if s.promised[rec.Key].Less(cur.Meta.Ballot) {
 			s.promised[rec.Key] = cur.Meta.Ballot
 		}
+		if s.setPromised.Less(cur.Meta.Ballot) {
+			s.setPromised = cur.Meta.Ballot
+		}
 		return false
 	}
 	rec.Namespace = s.namespace
 	rec.Shard = s.shard
+	rec.RecordSet = s.name
 	rec.Value = append([]byte(nil), rec.Value...)
 	s.putLocked(rec, now)
 	if s.promised[rec.Key].Less(rec.Meta.Ballot) {
 		s.promised[rec.Key] = rec.Meta.Ballot
 	}
+	if s.setPromised.Less(rec.Meta.Ballot) {
+		s.setPromised = rec.Meta.Ballot
+	}
 	return true
 }
 
-func (s *localShard) putLocked(rec Record, now time.Time) {
+func (s *localRecordSet) install(records []Record, rev uint64, now time.Time) bool {
+	return s.installLocked(records, rev, now, true)
+}
+
+func (s *localRecordSet) installNoTouch(records []Record, rev uint64) bool {
+	return s.installLocked(records, rev, time.Time{}, false)
+}
+
+func (s *localRecordSet) installLocked(records []Record, rev uint64, now time.Time, touch bool) bool {
+	next := make(map[RecordKey]Record, len(records))
+	var maxRev uint64
+	for _, rec := range records {
+		if rec.Key == "" {
+			return false
+		}
+		rec.Namespace = s.namespace
+		rec.Shard = s.shard
+		rec.RecordSet = s.name
+		rec.Value = append([]byte(nil), rec.Value...)
+		if maxRev < rec.Meta.Rev {
+			maxRev = rec.Meta.Rev
+		}
+		next[rec.Key] = rec
+	}
+	if rev < maxRev {
+		return false
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	changed := s.rev != rev || len(s.records) != len(next)
+	if !changed {
+		for key, rec := range next {
+			cur, ok := s.records[key]
+			if !ok || !sameCommittedRecord(rec, cur) || !rec.Meta.Ballot.IsZero() && cur.Meta.Ballot != rec.Meta.Ballot {
+				changed = true
+				break
+			}
+		}
+	}
+	s.records = next
+	s.rev = rev
+	if touch {
+		s.lastAccess = now
+	}
+	for key, rec := range s.records {
+		if s.promised[key].Less(rec.Meta.Ballot) {
+			s.promised[key] = rec.Meta.Ballot
+		}
+		if s.setPromised.Less(rec.Meta.Ballot) {
+			s.setPromised = rec.Meta.Ballot
+		}
+	}
+	if changed {
+		s.resetWatchersLocked()
+		s.log = nil
+	}
+	return true
+}
+
+func (s *localRecordSet) putLocked(rec Record, now time.Time) {
 	cur, found := s.records[rec.Key]
 	changed := !found || cur.Deleted != rec.Deleted || cur.Meta.Rev != rec.Meta.Rev || !bytes.Equal(cur.Value, rec.Value)
 	s.records[rec.Key] = rec
@@ -331,10 +533,20 @@ func (s *localShard) putLocked(rec Record, now time.Time) {
 	if !changed {
 		return
 	}
-	s.rev++
+	previousRev := s.rev
+	if rec.Meta.Rev > s.rev {
+		s.rev = rec.Meta.Rev
+	}
+	if rec.Meta.Rev <= previousRev {
+		return
+	}
+	if rec.Meta.Rev > previousRev+1 {
+		s.resetWatchersLocked()
+		s.log = nil
+	}
 	ev := WatchEvent{
-		Namespace: s.namespace, Shard: s.shard, Key: rec.Key, Record: cloneRecord(rec),
-		Rev: s.rev, Token: makeWatchToken(s.epoch, "", s.rev),
+		Namespace: s.namespace, Shard: s.shard, RecordSet: s.name, Key: rec.Key, Record: cloneRecord(rec),
+		Rev: rec.Meta.Rev, Token: makeWatchToken(s.epoch, "", s.name, rec.Meta.Rev),
 	}
 	if rec.Deleted {
 		ev.Type = EventDelete
@@ -349,17 +561,33 @@ func (s *localShard) putLocked(rec Record, now time.Time) {
 		copy(s.log, s.log[len(s.log)-s.retention:])
 		s.log = s.log[:s.retention]
 	}
-	for id, ch := range s.subs {
+	for id, sub := range s.subs {
+		out := ev
+		out.Token = makeWatchToken(s.epoch, sub.label, s.name, rec.Meta.Rev)
 		select {
-		case ch <- ev:
+		case sub.ch <- out:
 		default:
 			delete(s.subs, id)
-			close(ch)
+			close(sub.ch)
 		}
 	}
 }
 
-func (s *localShard) snapshotRecords(includeDeleted bool) ([]Record, uint64) {
+func sameCommittedRecord(a, b Record) bool {
+	return a.Key == b.Key &&
+		a.Deleted == b.Deleted &&
+		a.Meta.Rev == b.Meta.Rev &&
+		bytes.Equal(a.Value, b.Value)
+}
+
+func (s *localRecordSet) resetWatchersLocked() {
+	for id, sub := range s.subs {
+		delete(s.subs, id)
+		close(sub.ch)
+	}
+}
+
+func (s *localRecordSet) snapshotRecords(includeDeleted bool) ([]Record, uint64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	out := make([]Record, 0, len(s.records))
@@ -373,28 +601,45 @@ func (s *localShard) snapshotRecords(includeDeleted bool) ([]Record, uint64) {
 	return out, s.rev
 }
 
-func (s *localShard) markReady(label string) {
+func (s *localRecordSet) markReady(label string, rev uint64) {
 	s.mu.Lock()
-	s.readyLabel[label] = true
+	if rev > s.rev {
+		if rev > s.rev+1 {
+			s.resetWatchersLocked()
+			s.log = nil
+		}
+		s.rev = rev
+	}
+	if s.readyLabel[label] < rev {
+		s.readyLabel[label] = rev
+	}
 	s.mu.Unlock()
 }
 
-func (s *localShard) ready(label string) bool {
+func (s *localRecordSet) ready(label string, rev uint64) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.readyLabel[label]
+	return s.readyLabel[label] >= rev && s.rev >= rev
 }
 
 func (s *localShard) close() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for id, ch := range s.subs {
-		delete(s.subs, id)
-		close(ch)
+	for _, rs := range s.recordSets {
+		rs.close()
 	}
 }
 
-func (s *localShard) snapshot(label string) Snapshot {
+func (s *localRecordSet) close() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for id, sub := range s.subs {
+		delete(s.subs, id)
+		close(sub.ch)
+	}
+}
+
+func (s *localRecordSet) snapshot(label string) Snapshot {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	records := make([]Record, 0, len(s.records))
@@ -405,24 +650,24 @@ func (s *localShard) snapshot(label string) Snapshot {
 		records = append(records, cloneRecord(rec))
 	}
 	sort.Slice(records, func(i, j int) bool { return records[i].Key < records[j].Key })
-	token := makeWatchToken(s.epoch, label, s.rev)
-	return Snapshot{Namespace: s.namespace, Shard: s.shard, Label: label, Epoch: s.epoch, Rev: s.rev, Token: token, Records: records}
+	token := makeWatchToken(s.epoch, label, s.name, s.rev)
+	return Snapshot{Namespace: s.namespace, Shard: s.shard, RecordSet: s.name, Label: label, Epoch: s.epoch, Rev: s.rev, Token: token, Records: records}
 }
 
-func (s *localShard) watch(ctx context.Context, label, token string) Watch {
+func (s *localRecordSet) watch(ctx context.Context, label, token string) Watch {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	parsed, ok := parseWatchToken(token)
-	reset := token == "" || !ok || parsed.Epoch != s.epoch || parsed.Label != label
+	reset := token == "" || !ok || parsed.Epoch != s.epoch || parsed.Label != label || parsed.RecordSet != s.name
 	fromRev := parsed.Rev
 	if !reset && len(s.log) > 0 && fromRev < s.log[0].Rev-1 {
 		reset = true
 	}
 
 	ch := make(chan WatchEvent, 1024)
-	currentToken := makeWatchToken(s.epoch, label, s.rev)
+	currentToken := makeWatchToken(s.epoch, label, s.name, s.rev)
 	if reset {
-		ch <- WatchEvent{Type: EventReset, Namespace: s.namespace, Shard: s.shard, Rev: s.rev, Token: currentToken}
+		ch <- WatchEvent{Type: EventReset, Namespace: s.namespace, Shard: s.shard, RecordSet: s.name, Rev: s.rev, Token: currentToken}
 		keys := make([]RecordKey, 0, len(s.records))
 		for key, rec := range s.records {
 			if !rec.Deleted {
@@ -432,33 +677,33 @@ func (s *localShard) watch(ctx context.Context, label, token string) Watch {
 		sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
 		for _, key := range keys {
 			rec := cloneRecord(s.records[key])
-			ch <- WatchEvent{Type: EventPut, Namespace: s.namespace, Shard: s.shard, Key: key, Record: rec, Rev: s.rev, Token: currentToken}
+			ch <- WatchEvent{Type: EventPut, Namespace: s.namespace, Shard: s.shard, RecordSet: s.name, Key: key, Record: rec, Rev: s.rev, Token: currentToken}
 		}
-		ch <- WatchEvent{Type: EventBookmark, Namespace: s.namespace, Shard: s.shard, Rev: s.rev, Token: currentToken}
+		ch <- WatchEvent{Type: EventBookmark, Namespace: s.namespace, Shard: s.shard, RecordSet: s.name, Rev: s.rev, Token: currentToken}
 	} else {
 		for _, ev := range s.log {
 			if ev.Rev > fromRev {
-				ev.Token = makeWatchToken(s.epoch, label, ev.Rev)
+				ev.Token = makeWatchToken(s.epoch, label, s.name, ev.Rev)
 				ch <- ev
 			}
 		}
 	}
 	id := s.nextSub
 	s.nextSub++
-	s.subs[id] = ch
+	s.subs[id] = watchSub{label: label, ch: ch}
 	go func() {
 		<-ctx.Done()
 		s.mu.Lock()
 		if cur, ok := s.subs[id]; ok {
 			delete(s.subs, id)
-			close(cur)
+			close(cur.ch)
 		}
 		s.mu.Unlock()
 	}()
 	return Watch{Reset: reset, Token: currentToken, Events: ch}
 }
 
-func (s *localShard) watchSince(ctx context.Context, label string, fromRev uint64) (Watch, error) {
+func (s *localRecordSet) watchSince(ctx context.Context, label string, fromRev uint64) (Watch, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if fromRev > 0 && len(s.log) > 0 && fromRev < s.log[0].Rev-1 {
@@ -466,22 +711,22 @@ func (s *localShard) watchSince(ctx context.Context, label string, fromRev uint6
 	}
 
 	ch := make(chan WatchEvent, 1024)
-	currentToken := makeWatchToken(s.epoch, label, s.rev)
+	currentToken := makeWatchToken(s.epoch, label, s.name, s.rev)
 	for _, ev := range s.log {
 		if ev.Rev > fromRev {
-			ev.Token = makeWatchToken(s.epoch, label, ev.Rev)
+			ev.Token = makeWatchToken(s.epoch, label, s.name, ev.Rev)
 			ch <- ev
 		}
 	}
 	id := s.nextSub
 	s.nextSub++
-	s.subs[id] = ch
+	s.subs[id] = watchSub{label: label, ch: ch}
 	go func() {
 		<-ctx.Done()
 		s.mu.Lock()
 		if cur, ok := s.subs[id]; ok {
 			delete(s.subs, id)
-			close(cur)
+			close(cur.ch)
 		}
 		s.mu.Unlock()
 	}()
@@ -489,13 +734,14 @@ func (s *localShard) watchSince(ctx context.Context, label string, fromRev uint6
 }
 
 type watchToken struct {
-	Epoch string `json:"epoch"`
-	Label string `json:"label"`
-	Rev   uint64 `json:"rev"`
+	Epoch     string        `json:"epoch"`
+	Label     string        `json:"label"`
+	RecordSet RecordSetName `json:"record_set"`
+	Rev       uint64        `json:"rev"`
 }
 
-func makeWatchToken(epoch, label string, rev uint64) string {
-	raw, _ := json.Marshal(watchToken{Epoch: epoch, Label: label, Rev: rev})
+func makeWatchToken(epoch, label string, recordSet RecordSetName, rev uint64) string {
+	raw, _ := json.Marshal(watchToken{Epoch: epoch, Label: label, RecordSet: recordSet, Rev: rev})
 	return base64.RawURLEncoding.EncodeToString(raw)
 }
 

@@ -10,6 +10,15 @@ import (
 )
 
 const (
+	RecordSetRouteSandbox    shardkv.RecordSetName = "sandbox"
+	RecordSetRouteBuild      shardkv.RecordSetName = "build"
+	RecordSetNodeProfile     shardkv.RecordSetName = "profile"
+	RecordSetNodeSandbox     shardkv.RecordSetName = "sandbox"
+	RecordSetNodeBuild       shardkv.RecordSetName = "build"
+	RecordSetNodeManifestKey shardkv.RecordSetName = "manifest_key"
+	RecordSetNodeListNodes   shardkv.RecordSetName = "nodes"
+	RecordSetScaleImport     shardkv.RecordSetName = "import"
+
 	NodeLinkProfileRecord  shardkv.RecordKey = "profile"
 	RouteLinkProfileRecord shardkv.RecordKey = "profile"
 	ScaleLinkStateRecord   shardkv.RecordKey = "state"
@@ -21,15 +30,15 @@ func NodeLinkShard(nodeID string) shardkv.ShardKey {
 }
 
 func NodeSandboxRecordKey(group, routeKey string) shardkv.RecordKey {
-	return shardkv.RecordKey("sandbox/" + group + "\x00" + routeKey)
+	return shardkv.RecordKey(group + "\x00" + routeKey)
 }
 
 func NodeBuildRecordKey(group, buildID string) shardkv.RecordKey {
-	return shardkv.RecordKey("build/" + group + "\x00" + buildID)
+	return shardkv.RecordKey(group + "\x00" + buildID)
 }
 
 func NodeManifestKeyRecordKey(fingerprint string) shardkv.RecordKey {
-	return shardkv.RecordKey("manifest_key/" + fingerprint)
+	return shardkv.RecordKey(fingerprint)
 }
 
 func RouteLinkShard(group string) shardkv.ShardKey {
@@ -37,11 +46,11 @@ func RouteLinkShard(group string) shardkv.ShardKey {
 }
 
 func RouteSandboxRecordKey(routeKey string) shardkv.RecordKey {
-	return shardkv.RecordKey("sandbox/" + routeKey)
+	return shardkv.RecordKey(routeKey)
 }
 
 func RouteBuildRecordKey(buildID string) shardkv.RecordKey {
-	return shardkv.RecordKey("build/" + buildID)
+	return shardkv.RecordKey(buildID)
 }
 
 func NodeListRecordKey(nodeID string) shardkv.RecordKey {
@@ -53,26 +62,23 @@ func ScaleImportSourceShard(sourceID string) shardkv.ShardKey {
 }
 
 func ParseNodeSandboxRecordKey(key shardkv.RecordKey) (group, routeKey string, ok bool) {
-	return parseTwoPartRecordKey(string(key), "sandbox/")
+	return parseTwoPartRecordKey(string(key))
 }
 
 func ParseNodeBuildRecordKey(key shardkv.RecordKey) (group, buildID string, ok bool) {
-	return parseTwoPartRecordKey(string(key), "build/")
+	return parseTwoPartRecordKey(string(key))
 }
 
 func ParseNodeManifestKeyRecordKey(key shardkv.RecordKey) (fingerprint string, ok bool) {
-	value, ok := strings.CutPrefix(string(key), "manifest_key/")
-	return value, ok && value != ""
+	return string(key), key != ""
 }
 
 func ParseRouteSandboxRecordKey(key shardkv.RecordKey) (routeKey string, ok bool) {
-	value, ok := strings.CutPrefix(string(key), "sandbox/")
-	return value, ok && value != ""
+	return string(key), key != ""
 }
 
 func ParseRouteBuildRecordKey(key shardkv.RecordKey) (buildID string, ok bool) {
-	value, ok := strings.CutPrefix(string(key), "build/")
-	return value, ok && value != ""
+	return string(key), key != ""
 }
 
 func ParseScaleImportSourceShard(shard shardkv.ShardKey) (sourceID string, ok bool) {
@@ -80,12 +86,8 @@ func ParseScaleImportSourceShard(shard shardkv.ShardKey) (sourceID string, ok bo
 	return value, ok && value != ""
 }
 
-func parseTwoPartRecordKey(key, prefix string) (string, string, bool) {
-	value, ok := strings.CutPrefix(key, prefix)
-	if !ok {
-		return "", "", false
-	}
-	left, right, ok := strings.Cut(value, "\x00")
+func parseTwoPartRecordKey(key string) (string, string, bool) {
+	left, right, ok := strings.Cut(key, "\x00")
 	return left, right, ok && left != "" && right != ""
 }
 
@@ -117,7 +119,6 @@ type ScaleImportSourceState struct {
 	Term          uint64 `json:"term,omitempty"`
 	Cursor        string `json:"cursor,omitempty"`
 	Round         uint64 `json:"round,omitempty"`
-	ReadyLabel    string `json:"ready_label,omitempty"`
 	NextRunUnixMs int64  `json:"next_run_unix_ms,omitempty"`
 	LastError     string `json:"last_error,omitempty"`
 	ExpiresUnixMs int64  `json:"expires_unix_ms,omitempty"`

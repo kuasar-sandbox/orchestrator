@@ -23,6 +23,10 @@ func ServeHTTP(store *Store) http.HandlerFunc {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
+		if in.Label == "" {
+			http.Error(w, "shardkv: request label is required", http.StatusBadRequest)
+			return
+		}
 		out, err := store.Handle(req.Context(), in)
 		w.Header().Set("Content-Type", "application/json")
 		if err != nil {

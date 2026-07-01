@@ -8,6 +8,7 @@ import (
 
 type Namespace string
 type ShardKey string
+type RecordSetName string
 type RecordKey string
 type MemberID string
 
@@ -32,12 +33,13 @@ type RecordMeta struct {
 }
 
 type Record struct {
-	Namespace Namespace  `json:"namespace"`
-	Shard     ShardKey   `json:"shard"`
-	Key       RecordKey  `json:"key"`
-	Value     []byte     `json:"value,omitempty"`
-	Deleted   bool       `json:"deleted,omitempty"`
-	Meta      RecordMeta `json:"meta"`
+	Namespace Namespace     `json:"namespace"`
+	Shard     ShardKey      `json:"shard"`
+	RecordSet RecordSetName `json:"record_set"`
+	Key       RecordKey     `json:"key"`
+	Value     []byte        `json:"value,omitempty"`
+	Deleted   bool          `json:"deleted,omitempty"`
+	Meta      RecordMeta    `json:"meta"`
 }
 
 type NamespaceSpec struct {
@@ -88,19 +90,25 @@ func (f TransportFunc) Call(ctx context.Context, member MemberID, req Request) (
 type Op string
 
 const (
+	OpRead     Op = "read"
 	OpPrepare  Op = "prepare"
 	OpAccept   Op = "accept"
 	OpRepair   Op = "repair"
 	OpSnapshot Op = "snapshot"
+	OpInstall  Op = "install"
 )
 
 type Request struct {
-	Op        Op        `json:"op"`
-	Namespace Namespace `json:"namespace"`
-	Shard     ShardKey  `json:"shard"`
-	Key       RecordKey `json:"key,omitempty"`
-	Ballot    Ballot    `json:"ballot,omitempty"`
-	Record    Record    `json:"record,omitempty"`
+	Op        Op            `json:"op"`
+	Label     string        `json:"label,omitempty"`
+	Namespace Namespace     `json:"namespace"`
+	Shard     ShardKey      `json:"shard"`
+	RecordSet RecordSetName `json:"record_set"`
+	Key       RecordKey     `json:"key,omitempty"`
+	Ballot    Ballot        `json:"ballot,omitempty"`
+	Record    Record        `json:"record,omitempty"`
+	Records   []Record      `json:"records,omitempty"`
+	Rev       uint64        `json:"rev,omitempty"`
 }
 
 type Response struct {
@@ -114,13 +122,14 @@ type Response struct {
 }
 
 type Snapshot struct {
-	Namespace Namespace `json:"namespace"`
-	Shard     ShardKey  `json:"shard"`
-	Label     string    `json:"label"`
-	Epoch     string    `json:"epoch"`
-	Rev       uint64    `json:"rev"`
-	Token     string    `json:"token"`
-	Records   []Record  `json:"records"`
+	Namespace Namespace     `json:"namespace"`
+	Shard     ShardKey      `json:"shard"`
+	RecordSet RecordSetName `json:"record_set"`
+	Label     string        `json:"label"`
+	Epoch     string        `json:"epoch"`
+	Rev       uint64        `json:"rev"`
+	Token     string        `json:"token"`
+	Records   []Record      `json:"records"`
 }
 
 type EventType string
@@ -133,13 +142,14 @@ const (
 )
 
 type WatchEvent struct {
-	Type      EventType `json:"type"`
-	Namespace Namespace `json:"namespace"`
-	Shard     ShardKey  `json:"shard"`
-	Key       RecordKey `json:"key,omitempty"`
-	Record    Record    `json:"record,omitempty"`
-	Rev       uint64    `json:"rev,omitempty"`
-	Token     string    `json:"token,omitempty"`
+	Type      EventType     `json:"type"`
+	Namespace Namespace     `json:"namespace"`
+	Shard     ShardKey      `json:"shard"`
+	RecordSet RecordSetName `json:"record_set"`
+	Key       RecordKey     `json:"key,omitempty"`
+	Record    Record        `json:"record,omitempty"`
+	Rev       uint64        `json:"rev,omitempty"`
+	Token     string        `json:"token,omitempty"`
 }
 
 type Watch struct {
@@ -165,13 +175,10 @@ func cloneRecord(in Record) Record {
 }
 
 func recordNewer(a, b Record) bool {
-	if b.Meta.Ballot.Less(a.Meta.Ballot) {
-		return true
+	if a.Meta.Rev != b.Meta.Rev {
+		return a.Meta.Rev > b.Meta.Rev
 	}
-	if a.Meta.Ballot == b.Meta.Ballot && b.Meta.Rev < a.Meta.Rev {
-		return true
-	}
-	return false
+	return b.Meta.Ballot.Less(a.Meta.Ballot)
 }
 
 func highest(records []recordRead) (Record, bool) {
@@ -190,6 +197,8 @@ func highest(records []recordRead) (Record, bool) {
 }
 
 type recordRead struct {
+	member MemberID
 	record Record
 	found  bool
+	head   uint64
 }

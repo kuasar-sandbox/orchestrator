@@ -78,6 +78,8 @@ type WatchEventType int
 const (
 	WatchEventPut WatchEventType = iota + 1
 	WatchEventDelete
+	WatchEventReset
+	WatchEventBookmark
 )
 
 // WatchEvent is the registry typed watch surface exposed by node_list and
@@ -87,6 +89,7 @@ type WatchEvent struct {
 	Key   string
 	Value []byte
 	Rev   int64
+	Token string
 }
 
 var ErrWatchCompacted = shardkv.ErrCompacted
@@ -169,6 +172,37 @@ func NewClusterStoresWithViews(
 }
 
 func (s *Stores) WriterID() string { return s.writerID }
+
+func (s *Stores) NodeOwnerCandidates(ctx context.Context, nodeID string) ([]string, error) {
+	store := s.ShardStore()
+	if store == nil {
+		return nil, errors.New("registry: shard store is not initialized")
+	}
+	sh, err := store.Shard(shardkv.Namespace(clusterstate.NamespaceNodeLink), clusterstate.NodeLinkShard(nodeID))
+	if err != nil {
+		return nil, err
+	}
+	view, err := sh.View(ctx)
+	if err != nil {
+		return nil, err
+	}
+	seen := map[string]bool{}
+	var out []string
+	for _, set := range view.Sets {
+		for _, member := range set.Members {
+			id := string(member)
+			if id == "" || seen[id] {
+				continue
+			}
+			seen[id] = true
+			out = append(out, id)
+		}
+	}
+	if len(out) == 0 && s.writerID != "" {
+		out = append(out, s.writerID)
+	}
+	return out, nil
+}
 
 func (s *Stores) SetNodeListHeartbeatRefresh(d time.Duration) {
 	sec := int64(d.Seconds())
@@ -306,6 +340,14 @@ func (s *Stores) ShardStore() *shardkv.Store {
 	return s.shardStore
 }
 
+func (s *Stores) Compact(ctx context.Context, now time.Time) (shardkv.GCStats, error) {
+	store := s.ShardStore()
+	if store == nil {
+		return shardkv.GCStats{}, nil
+	}
+	return store.Compact(ctx, now)
+}
+
 func (s *Stores) SetShardTransport(transport shardkv.Transport, ready shardkv.MemberReadyProvider) {
 	s.shardMu.Lock()
 	s.shardTransport = transport
@@ -355,7 +397,7 @@ func (s *Stores) rebuildShardStore() {
 		}
 		clusterViews = append(clusterViews, shardkv.ClusterView{
 			Version: view.Version,
-			Label:   fmt.Sprintf("membership.%d", view.Version),
+			Label:   view.LabelOrDefault(),
 			Members: members,
 		})
 	}
@@ -399,8 +441,8 @@ var (
 	errScaleLinkStaleLease = errors.New("registry: stale scale_link source lease")
 )
 
-func (s *Stores) AcquireScaleLinkSourceLease(ctx context.Context, sourceID, ownerID, runID, readyLabel string, ttl time.Duration) (clusterstate.ScaleImportSourceState, bool, error) {
-	return s.acquireScaleImportSourceShard(ctx, sourceID, ownerID, runID, readyLabel, ttl)
+func (s *Stores) AcquireScaleLinkSourceLease(ctx context.Context, sourceID, ownerID, runID string, ttl time.Duration) (clusterstate.ScaleImportSourceState, bool, error) {
+	return s.acquireScaleImportSourceShard(ctx, sourceID, ownerID, runID, ttl)
 }
 
 func (s *Stores) CheckScaleLinkSourceLease(ctx context.Context, sourceID, ownerID, runID string, term uint64) bool {
@@ -429,6 +471,10 @@ func (s *Stores) PutNodeRuntime(ctx context.Context, n *NodeRecord) error {
 
 func (s *Stores) GetNode(ctx context.Context, id string) (*NodeRecord, bool, error) {
 	return s.getNodeShard(ctx, id)
+}
+
+func (s *Stores) GetNodeProfile(ctx context.Context, id string) (*NodeRecord, bool, error) {
+	return s.getNodeProfileShard(ctx, id)
 }
 
 func (s *Stores) DeleteNode(ctx context.Context, id string) error {
@@ -635,7 +681,7 @@ func (s *Stores) NodeListRev(ctx context.Context) (int64, error) {
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
-	sh, err := s.nodeListShard()
+	sh, err := s.nodeListRecordSet()
 	if err != nil {
 		return 0, err
 	}
@@ -660,7 +706,7 @@ func (s *Stores) WatchNodeList(ctx context.Context, fromRev int64) (<-chan Watch
 	if fromRev < 0 {
 		fromRev = 0
 	}
-	sh, err := s.nodeListShard()
+	sh, err := s.nodeListRecordSet()
 	if err != nil {
 		return nil, err
 	}
@@ -668,6 +714,36 @@ func (s *Stores) WatchNodeList(ctx context.Context, fromRev int64) (<-chan Watch
 	if errors.Is(err, shardkv.ErrCompacted) {
 		return nil, ErrWatchCompacted
 	}
+	if err != nil {
+		return nil, err
+	}
+	ch := make(chan WatchEvent, 1024)
+	go func() {
+		defer close(ch)
+		for ev := range watch.Events {
+			out, ok, err := nodeListWatchEvent(ev)
+			if err != nil || !ok {
+				continue
+			}
+			select {
+			case ch <- out:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	return ch, nil
+}
+
+func (s *Stores) WatchNodeListToken(ctx context.Context, token string) (<-chan WatchEvent, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	sh, err := s.nodeListRecordSet()
+	if err != nil {
+		return nil, err
+	}
+	watch, err := sh.Watch(ctx, token)
 	if err != nil {
 		return nil, err
 	}
@@ -697,7 +773,7 @@ func (s *Stores) PutNodeListEntry(ctx context.Context, entry clusterstate.NodeLi
 		return fmt.Errorf("registry: node_list node_id is required")
 	}
 	entry.Deleted = false
-	sh, err := s.nodeListShard()
+	sh, err := s.nodeListRecordSet()
 	if err != nil {
 		return err
 	}
@@ -748,7 +824,7 @@ func (s *Stores) DeleteNodeListWithSource(ctx context.Context, nodeID string, so
 	if nodeID == "" {
 		return nil
 	}
-	sh, err := s.nodeListShard()
+	sh, err := s.nodeListRecordSet()
 	if err != nil {
 		return err
 	}
@@ -795,7 +871,7 @@ func (s *Stores) RouteGroupRev(ctx context.Context, group string) (int64, error)
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
-	sh, err := s.routeLinkShard(group)
+	sh, err := s.routeLinkRecordSet(group, clusterstate.RecordSetRouteSandbox)
 	if err != nil {
 		return 0, err
 	}
@@ -816,7 +892,7 @@ func (s *Stores) WatchRouteGroup(ctx context.Context, group string, fromRev int6
 	if fromRev < 0 {
 		fromRev = 0
 	}
-	sh, err := s.routeLinkShard(group)
+	sh, err := s.routeLinkRecordSet(group, clusterstate.RecordSetRouteSandbox)
 	if err != nil {
 		return nil, err
 	}

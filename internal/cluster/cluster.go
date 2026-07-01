@@ -17,7 +17,18 @@ import (
 // view, never SWIM's live set; SWIM only affects availability/retry decisions.
 type MemberView struct {
 	Version int64
+	Label   string
 	Members []string
+}
+
+func (v MemberView) LabelOrDefault() string {
+	if v.Label != "" {
+		return v.Label
+	}
+	if v.Version > 0 {
+		return fmt.Sprintf("membership.%d", v.Version)
+	}
+	return "membership.0"
 }
 
 // Owners returns the deterministic owner set for key. The caller chooses n

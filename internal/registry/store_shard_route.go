@@ -14,7 +14,7 @@ func (s *Stores) putRouteSandboxShard(ctx context.Context, r *SandboxRecord) (ui
 	if r == nil || r.Group == "" || r.RouteKey == "" {
 		return 0, nil
 	}
-	sh, err := s.routeLinkShard(r.Group)
+	sh, err := s.routeLinkRecordSet(r.Group, clusterstate.RecordSetRouteSandbox)
 	if err != nil {
 		return 0, err
 	}
@@ -33,7 +33,7 @@ func (s *Stores) casRouteSandboxShard(ctx context.Context, r *SandboxRecord, exp
 	if r == nil || r.Group == "" || r.RouteKey == "" {
 		return 0, false, nil
 	}
-	sh, err := s.routeLinkShard(r.Group)
+	sh, err := s.routeLinkRecordSet(r.Group, clusterstate.RecordSetRouteSandbox)
 	if err != nil {
 		return 0, false, err
 	}
@@ -52,7 +52,7 @@ func (s *Stores) getRouteSandboxShard(ctx context.Context, group, routeKey strin
 	if group == "" || routeKey == "" {
 		return nil, 0, false, nil
 	}
-	sh, err := s.routeLinkShard(group)
+	sh, err := s.routeLinkRecordSet(group, clusterstate.RecordSetRouteSandbox)
 	if err != nil {
 		return nil, 0, false, err
 	}
@@ -74,7 +74,7 @@ func (s *Stores) deleteRouteSandboxShard(ctx context.Context, group, routeKey st
 	if group == "" || routeKey == "" {
 		return nil
 	}
-	sh, err := s.routeLinkShard(group)
+	sh, err := s.routeLinkRecordSet(group, clusterstate.RecordSetRouteSandbox)
 	if err != nil {
 		return err
 	}
@@ -85,7 +85,7 @@ func (s *Stores) putRouteBuildShard(ctx context.Context, b *BuildRecord) (uint64
 	if b == nil || b.Group == "" || b.BuildID == "" {
 		return 0, nil
 	}
-	sh, err := s.routeLinkShard(b.Group)
+	sh, err := s.routeLinkRecordSet(b.Group, clusterstate.RecordSetRouteBuild)
 	if err != nil {
 		return 0, err
 	}
@@ -104,7 +104,7 @@ func (s *Stores) getRouteBuildShard(ctx context.Context, group, buildID string) 
 	if group == "" || buildID == "" {
 		return nil, 0, false, nil
 	}
-	sh, err := s.routeLinkShard(group)
+	sh, err := s.routeLinkRecordSet(group, clusterstate.RecordSetRouteBuild)
 	if err != nil {
 		return nil, 0, false, err
 	}
@@ -123,7 +123,7 @@ func (s *Stores) deleteRouteBuildShard(ctx context.Context, group, buildID strin
 	if group == "" || buildID == "" {
 		return nil
 	}
-	sh, err := s.routeLinkShard(group)
+	sh, err := s.routeLinkRecordSet(group, clusterstate.RecordSetRouteBuild)
 	if err != nil {
 		return err
 	}
@@ -131,7 +131,7 @@ func (s *Stores) deleteRouteBuildShard(ctx context.Context, group, buildID strin
 }
 
 func (s *Stores) rangeRouteSandboxesShard(ctx context.Context, group string, fn func(*SandboxRecord) error) error {
-	sh, err := s.routeLinkShard(group)
+	sh, err := s.routeLinkRecordSet(group, clusterstate.RecordSetRouteSandbox)
 	if err != nil {
 		return err
 	}
@@ -160,7 +160,7 @@ func (s *Stores) rangeRouteSandboxesShard(ctx context.Context, group string, fn 
 }
 
 func (s *Stores) rangeRouteBuildsShard(ctx context.Context, group string, fn func(*BuildRecord) error) error {
-	sh, err := s.routeLinkShard(group)
+	sh, err := s.routeLinkRecordSet(group, clusterstate.RecordSetRouteBuild)
 	if err != nil {
 		return err
 	}
@@ -196,7 +196,15 @@ func (s *Stores) routeLinkShard(group string) (*shardkv.Shard, error) {
 	return store.Shard(shardkv.Namespace(clusterstate.NamespaceRouteLink), clusterstate.RouteLinkShard(group))
 }
 
-func shardUpsertReturn(ctx context.Context, sh *shardkv.Shard, key shardkv.RecordKey, value []byte) (shardkv.Record, error) {
+func (s *Stores) routeLinkRecordSet(group string, recordSet shardkv.RecordSetName) (*shardkv.RecordSet, error) {
+	sh, err := s.routeLinkShard(group)
+	if err != nil {
+		return nil, err
+	}
+	return sh.RecordSet(recordSet)
+}
+
+func shardUpsertReturn(ctx context.Context, sh *shardkv.RecordSet, key shardkv.RecordKey, value []byte) (shardkv.Record, error) {
 	for attempt := 0; attempt < 5; attempt++ {
 		cur, found, err := sh.Get(ctx, key)
 		if err != nil {

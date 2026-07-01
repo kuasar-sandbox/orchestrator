@@ -13,7 +13,7 @@ func (s *Stores) putNodeProfileShard(ctx context.Context, n *NodeRecord) error {
 	if n == nil || n.NodeID == "" {
 		return nil
 	}
-	sh, err := s.nodeLinkShard(n.NodeID)
+	sh, err := s.nodeLinkRecordSet(n.NodeID, clusterstate.RecordSetNodeProfile)
 	if err != nil {
 		return err
 	}
@@ -28,7 +28,7 @@ func (s *Stores) putNodeShard(ctx context.Context, n *NodeRecord) (uint64, error
 	if n == nil || n.NodeID == "" {
 		return 0, nil
 	}
-	sh, err := s.nodeLinkShard(n.NodeID)
+	sh, err := s.nodeLinkRecordSet(n.NodeID, clusterstate.RecordSetNodeProfile)
 	if err != nil {
 		return 0, err
 	}
@@ -63,7 +63,7 @@ func (s *Stores) addNodeSandboxRefShard(ctx context.Context, nodeID string, ref 
 	if nodeID == "" || ref.Group == "" || ref.RouteKey == "" {
 		return nil
 	}
-	sh, err := s.nodeLinkShard(nodeID)
+	sh, err := s.nodeLinkRecordSet(nodeID, clusterstate.RecordSetNodeSandbox)
 	if err != nil {
 		return err
 	}
@@ -78,7 +78,7 @@ func (s *Stores) removeNodeSandboxRefShard(ctx context.Context, nodeID, group, r
 	if nodeID == "" || group == "" || routeKey == "" {
 		return nil
 	}
-	sh, err := s.nodeLinkShard(nodeID)
+	sh, err := s.nodeLinkRecordSet(nodeID, clusterstate.RecordSetNodeSandbox)
 	if err != nil {
 		return err
 	}
@@ -89,7 +89,7 @@ func (s *Stores) addNodeBuildRefShard(ctx context.Context, nodeID string, ref cl
 	if nodeID == "" || ref.Group == "" || ref.BuildID == "" {
 		return nil
 	}
-	sh, err := s.nodeLinkShard(nodeID)
+	sh, err := s.nodeLinkRecordSet(nodeID, clusterstate.RecordSetNodeBuild)
 	if err != nil {
 		return err
 	}
@@ -104,7 +104,7 @@ func (s *Stores) removeNodeBuildRefShard(ctx context.Context, nodeID, group, bui
 	if nodeID == "" || group == "" || buildID == "" {
 		return nil
 	}
-	sh, err := s.nodeLinkShard(nodeID)
+	sh, err := s.nodeLinkRecordSet(nodeID, clusterstate.RecordSetNodeBuild)
 	if err != nil {
 		return err
 	}
@@ -115,7 +115,7 @@ func (s *Stores) upsertNodeManifestKeyShard(ctx context.Context, nodeID string, 
 	if nodeID == "" || key.Fingerprint == "" {
 		return nil
 	}
-	sh, err := s.nodeLinkShard(nodeID)
+	sh, err := s.nodeLinkRecordSet(nodeID, clusterstate.RecordSetNodeManifestKey)
 	if err != nil {
 		return err
 	}
@@ -130,7 +130,7 @@ func (s *Stores) dropNodeManifestKeyShard(ctx context.Context, nodeID, fingerpri
 	if nodeID == "" || fingerprint == "" {
 		return nil
 	}
-	sh, err := s.nodeLinkShard(nodeID)
+	sh, err := s.nodeLinkRecordSet(nodeID, clusterstate.RecordSetNodeManifestKey)
 	if err != nil {
 		return err
 	}
@@ -141,7 +141,7 @@ func (s *Stores) getNodeManifestKeyShard(ctx context.Context, nodeID, fingerprin
 	if nodeID == "" || fingerprint == "" {
 		return clusterstate.NodeManifestKey{}, 0, false, nil
 	}
-	sh, err := s.nodeLinkShard(nodeID)
+	sh, err := s.nodeLinkRecordSet(nodeID, clusterstate.RecordSetNodeManifestKey)
 	if err != nil {
 		return clusterstate.NodeManifestKey{}, 0, false, err
 	}
@@ -160,19 +160,26 @@ func (s *Stores) deleteNodeShard(ctx context.Context, nodeID string) error {
 	if nodeID == "" {
 		return nil
 	}
-	sh, err := s.nodeLinkShard(nodeID)
-	if err != nil {
-		return err
-	}
-	snap, err := sh.Snapshot(ctx)
-	if err != nil {
-		return err
-	}
-	for _, rec := range snap.Records {
-		if _, ok, err := sh.Delete(ctx, rec.Key, rec.Meta.Rev); err != nil {
+	for _, recordSet := range []shardkv.RecordSetName{
+		clusterstate.RecordSetNodeProfile,
+		clusterstate.RecordSetNodeSandbox,
+		clusterstate.RecordSetNodeBuild,
+		clusterstate.RecordSetNodeManifestKey,
+	} {
+		sh, err := s.nodeLinkRecordSet(nodeID, recordSet)
+		if err != nil {
 			return err
-		} else if !ok {
-			return shardkv.ErrConflict
+		}
+		snap, err := sh.Snapshot(ctx)
+		if err != nil {
+			return err
+		}
+		for _, rec := range snap.Records {
+			if _, ok, err := sh.Delete(ctx, rec.Key, rec.Meta.Rev); err != nil {
+				return err
+			} else if !ok {
+				return shardkv.ErrConflict
+			}
 		}
 	}
 	return nil
@@ -182,46 +189,54 @@ func (s *Stores) getNodeShard(ctx context.Context, nodeID string) (*NodeRecord, 
 	if nodeID == "" {
 		return nil, false, nil
 	}
-	sh, err := s.nodeLinkShard(nodeID)
-	if err != nil {
-		return nil, false, err
-	}
-	profileRec, found, err := sh.Get(ctx, clusterstate.NodeLinkProfileRecord)
+	out, found, err := s.getNodeProfileShard(ctx, nodeID)
 	if err != nil || !found {
 		return nil, found, err
 	}
-	profile, err := clusterstate.DecodeShardValue[clusterstate.NodeProfileRecord](profileRec.Value)
+	sandboxSet, err := s.nodeLinkRecordSet(nodeID, clusterstate.RecordSetNodeSandbox)
 	if err != nil {
 		return nil, false, err
 	}
-	out := nodeRecordFromProfile(profile, profileRec.Meta)
-	snap, err := sh.Snapshot(ctx)
+	snap, err := sandboxSet.Snapshot(ctx)
 	if err != nil {
 		return nil, false, err
 	}
 	for _, rec := range snap.Records {
-		switch {
-		case rec.Key == clusterstate.NodeLinkProfileRecord:
-			continue
-		case isNodeSandboxRecord(rec.Key):
-			ref, err := clusterstate.DecodeShardValue[clusterstate.NodeSandboxRef](rec.Value)
-			if err != nil {
-				return nil, false, err
-			}
-			out.Sandboxes = append(out.Sandboxes, ref)
-		case isNodeBuildRecord(rec.Key):
-			ref, err := clusterstate.DecodeShardValue[clusterstate.NodeBuildRef](rec.Value)
-			if err != nil {
-				return nil, false, err
-			}
-			out.Builds = append(out.Builds, ref)
-		case isNodeManifestKeyRecord(rec.Key):
-			key, err := clusterstate.DecodeShardValue[clusterstate.NodeManifestKey](rec.Value)
-			if err != nil {
-				return nil, false, err
-			}
-			out.ManifestKeys = append(out.ManifestKeys, key)
+		ref, err := clusterstate.DecodeShardValue[clusterstate.NodeSandboxRef](rec.Value)
+		if err != nil {
+			return nil, false, err
 		}
+		out.Sandboxes = append(out.Sandboxes, ref)
+	}
+	buildSet, err := s.nodeLinkRecordSet(nodeID, clusterstate.RecordSetNodeBuild)
+	if err != nil {
+		return nil, false, err
+	}
+	buildSnap, err := buildSet.Snapshot(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	for _, rec := range buildSnap.Records {
+		ref, err := clusterstate.DecodeShardValue[clusterstate.NodeBuildRef](rec.Value)
+		if err != nil {
+			return nil, false, err
+		}
+		out.Builds = append(out.Builds, ref)
+	}
+	keySet, err := s.nodeLinkRecordSet(nodeID, clusterstate.RecordSetNodeManifestKey)
+	if err != nil {
+		return nil, false, err
+	}
+	keySnap, err := keySet.Snapshot(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	for _, rec := range keySnap.Records {
+		key, err := clusterstate.DecodeShardValue[clusterstate.NodeManifestKey](rec.Value)
+		if err != nil {
+			return nil, false, err
+		}
+		out.ManifestKeys = append(out.ManifestKeys, key)
 	}
 	sort.Slice(out.Sandboxes, func(i, j int) bool {
 		if out.Sandboxes[i].Group != out.Sandboxes[j].Group {
@@ -239,6 +254,25 @@ func (s *Stores) getNodeShard(ctx context.Context, nodeID string) (*NodeRecord, 
 	return out, true, nil
 }
 
+func (s *Stores) getNodeProfileShard(ctx context.Context, nodeID string) (*NodeRecord, bool, error) {
+	if nodeID == "" {
+		return nil, false, nil
+	}
+	sh, err := s.nodeLinkRecordSet(nodeID, clusterstate.RecordSetNodeProfile)
+	if err != nil {
+		return nil, false, err
+	}
+	profileRec, found, err := sh.Get(ctx, clusterstate.NodeLinkProfileRecord)
+	if err != nil || !found {
+		return nil, found, err
+	}
+	profile, err := clusterstate.DecodeShardValue[clusterstate.NodeProfileRecord](profileRec.Value)
+	if err != nil {
+		return nil, false, err
+	}
+	return nodeRecordFromProfile(profile, profileRec.Meta), true, nil
+}
+
 func (s *Stores) nodeLinkShard(nodeID string) (*shardkv.Shard, error) {
 	store := s.ShardStore()
 	if store == nil {
@@ -247,7 +281,15 @@ func (s *Stores) nodeLinkShard(nodeID string) (*shardkv.Shard, error) {
 	return store.Shard(shardkv.Namespace(clusterstate.NamespaceNodeLink), clusterstate.NodeLinkShard(nodeID))
 }
 
-func shardUpsert(ctx context.Context, sh *shardkv.Shard, key shardkv.RecordKey, value []byte) error {
+func (s *Stores) nodeLinkRecordSet(nodeID string, recordSet shardkv.RecordSetName) (*shardkv.RecordSet, error) {
+	sh, err := s.nodeLinkShard(nodeID)
+	if err != nil {
+		return nil, err
+	}
+	return sh.RecordSet(recordSet)
+}
+
+func shardUpsert(ctx context.Context, sh *shardkv.RecordSet, key shardkv.RecordKey, value []byte) error {
 	for attempt := 0; attempt < 5; attempt++ {
 		cur, found, err := sh.Get(ctx, key)
 		if err != nil {
@@ -268,7 +310,7 @@ func shardUpsert(ctx context.Context, sh *shardkv.Shard, key shardkv.RecordKey, 
 	return shardkv.ErrConflict
 }
 
-func shardDeleteIfFound(ctx context.Context, sh *shardkv.Shard, key shardkv.RecordKey) error {
+func shardDeleteIfFound(ctx context.Context, sh *shardkv.RecordSet, key shardkv.RecordKey) error {
 	for attempt := 0; attempt < 5; attempt++ {
 		cur, found, err := sh.Get(ctx, key)
 		if err != nil || !found {

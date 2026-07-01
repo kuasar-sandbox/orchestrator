@@ -14,7 +14,7 @@ func (s *Stores) putNodeListEntryShard(ctx context.Context, entry clusterstate.N
 	if entry.NodeID == "" {
 		return nil
 	}
-	sh, err := s.nodeListShard()
+	sh, err := s.nodeListRecordSet()
 	if err != nil {
 		return err
 	}
@@ -29,7 +29,7 @@ func (s *Stores) deleteNodeListEntryShard(ctx context.Context, nodeID string) er
 	if nodeID == "" {
 		return nil
 	}
-	sh, err := s.nodeListShard()
+	sh, err := s.nodeListRecordSet()
 	if err != nil {
 		return err
 	}
@@ -37,7 +37,7 @@ func (s *Stores) deleteNodeListEntryShard(ctx context.Context, nodeID string) er
 }
 
 func (s *Stores) rangeNodeListShard(ctx context.Context, fn func(clusterstate.NodeListEntry) error) error {
-	sh, err := s.nodeListShard()
+	sh, err := s.nodeListRecordSet()
 	if err != nil {
 		return err
 	}
@@ -73,14 +73,28 @@ func (s *Stores) nodeListShard() (*shardkv.Shard, error) {
 	return store.Shard(shardkv.Namespace(clusterstate.NamespaceNodeList), clusterstate.NodeListShard)
 }
 
+func (s *Stores) nodeListRecordSet() (*shardkv.RecordSet, error) {
+	sh, err := s.nodeListShard()
+	if err != nil {
+		return nil, err
+	}
+	return sh.RecordSet(clusterstate.RecordSetNodeListNodes)
+}
+
 func nodeListWatchEvent(ev shardkv.WatchEvent) (WatchEvent, bool, error) {
 	nodeID := string(ev.Key)
-	if nodeID == "" {
-		return WatchEvent{}, false, nil
-	}
-	out := WatchEvent{Key: nodeID, Rev: int64(ev.Rev)}
+	out := WatchEvent{Key: nodeID, Rev: int64(ev.Rev), Token: ev.Token}
 	switch ev.Type {
+	case shardkv.EventReset:
+		out.Type = WatchEventReset
+		return out, true, nil
+	case shardkv.EventBookmark:
+		out.Type = WatchEventBookmark
+		return out, true, nil
 	case shardkv.EventPut:
+		if nodeID == "" {
+			return WatchEvent{}, false, nil
+		}
 		entry, err := clusterstate.DecodeShardValue[clusterstate.NodeListEntry](ev.Record.Value)
 		if err != nil {
 			return WatchEvent{}, false, err
@@ -97,6 +111,9 @@ func nodeListWatchEvent(ev shardkv.WatchEvent) (WatchEvent, bool, error) {
 		out.Value = raw
 		return out, true, nil
 	case shardkv.EventDelete:
+		if nodeID == "" {
+			return WatchEvent{}, false, nil
+		}
 		out.Type = WatchEventDelete
 		return out, true, nil
 	default:

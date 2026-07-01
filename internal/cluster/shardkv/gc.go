@@ -37,16 +37,24 @@ func (s *Store) Compact(ctx context.Context, now time.Time) (GCStats, error) {
 		spec := namespaceSpec(view.Namespace, s.resolver)
 		if spec.TombstoneRetention > 0 && s.allMembersReady(view) {
 			sh := &Shard{store: s, namespace: ls.namespace, shard: ls.shard}
-			records, ok, err := sh.fetchAllShardRecords(ctx, view)
-			if err != nil || !ok {
-				continue
+			for _, setName := range ls.recordSetNames() {
+				rs, err := sh.RecordSet(setName)
+				if err != nil {
+					continue
+				}
+				localSet := ls.recordSetNoTouch(setName)
+				if localSet == nil {
+					continue
+				}
+				records, head, ok, err := rs.fetchAllShardRecords(ctx, view)
+				if err != nil || !ok {
+					continue
+				}
+				localSet.installNoTouch(records, head)
+				rs.installSnapshotBestEffort(ctx, view, records, head, true)
+				localSet.markReady(view.Label, head)
+				stats.Tombstones += localSet.compactTombstones(now, spec.TombstoneRetention)
 			}
-			for _, rec := range records {
-				ls.repair(rec, now)
-			}
-			sh.repairRecordsBestEffort(ctx, view, records)
-			ls.markReady(view.Label)
-			stats.Tombstones += ls.compactTombstones(now, spec.TombstoneRetention)
 		}
 		if spec.Pinned || spec.IdleShardTTL <= 0 {
 			continue
@@ -105,7 +113,7 @@ func (r *MaglevResolver) NamespaceSpec(ns Namespace) (NamespaceSpec, bool) {
 	return spec, ok
 }
 
-func (s *localShard) compactTombstones(now time.Time, retention time.Duration) int {
+func (s *localRecordSet) compactTombstones(now time.Time, retention time.Duration) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	n := 0
@@ -121,6 +129,20 @@ func (s *localShard) compactTombstones(now time.Time, retention time.Duration) i
 }
 
 func (s *localShard) emptyAndIdle(now time.Time, ttl time.Duration) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.lastAccess.IsZero() || now.Sub(s.lastAccess) < ttl {
+		return false
+	}
+	for _, rs := range s.recordSets {
+		if !rs.emptyAndIdle(now, ttl) {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *localRecordSet) emptyAndIdle(now time.Time, ttl time.Duration) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return len(s.records) == 0 && !s.lastAccess.IsZero() && now.Sub(s.lastAccess) >= ttl

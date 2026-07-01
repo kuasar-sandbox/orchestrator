@@ -9,14 +9,14 @@ import (
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/cluster/shardkv"
 )
 
-func (s *Stores) acquireScaleImportSourceShard(ctx context.Context, sourceID, ownerID, runID, readyLabel string, ttl time.Duration) (clusterstate.ScaleImportSourceState, bool, error) {
+func (s *Stores) acquireScaleImportSourceShard(ctx context.Context, sourceID, ownerID, runID string, ttl time.Duration) (clusterstate.ScaleImportSourceState, bool, error) {
 	if sourceID == "" || ownerID == "" || runID == "" {
 		return clusterstate.ScaleImportSourceState{}, false, errors.New("registry: source_id, owner_id and run_id are required")
 	}
 	if ttl <= 0 {
 		ttl = 15 * time.Second
 	}
-	sh, err := s.scaleImportSourceShard(sourceID)
+	sh, err := s.scaleImportSourceRecordSet(sourceID)
 	if err != nil {
 		return clusterstate.ScaleImportSourceState{}, false, err
 	}
@@ -46,7 +46,6 @@ func (s *Stores) acquireScaleImportSourceShard(ctx context.Context, sourceID, ow
 		next.SourceID = sourceID
 		next.OwnerID = ownerID
 		next.RunID = runID
-		next.ReadyLabel = readyLabel
 		next.ExpiresUnixMs = now.Add(ttl).UnixMilli()
 		value, err := clusterstate.EncodeShardValue(next)
 		if err != nil {
@@ -68,10 +67,10 @@ func (s *Stores) acquireScaleImportSourceShard(ctx context.Context, sourceID, ow
 }
 
 func (s *Stores) checkScaleImportSourceShard(ctx context.Context, sourceID, ownerID, runID string, term uint64) bool {
-	if sourceID == "" {
-		return true
+	if sourceID == "" || ownerID == "" || runID == "" || term == 0 {
+		return false
 	}
-	sh, err := s.scaleImportSourceShard(sourceID)
+	sh, err := s.scaleImportSourceRecordSet(sourceID)
 	if err != nil {
 		return false
 	}
@@ -91,7 +90,7 @@ func (s *Stores) checkpointScaleImportSourceShard(ctx context.Context, sourceID,
 	if sourceID == "" || ownerID == "" || runID == "" || term == 0 {
 		return clusterstate.ScaleImportSourceState{}, errors.New("registry: source_id, owner_id, run_id and term are required")
 	}
-	sh, err := s.scaleImportSourceShard(sourceID)
+	sh, err := s.scaleImportSourceRecordSet(sourceID)
 	if err != nil {
 		return clusterstate.ScaleImportSourceState{}, err
 	}
@@ -141,6 +140,14 @@ func (s *Stores) scaleImportSourceShard(sourceID string) (*shardkv.Shard, error)
 		return nil, errors.New("registry: shard store is not initialized")
 	}
 	return store.Shard(shardkv.Namespace(clusterstate.NamespaceScaleLink), clusterstate.ScaleImportSourceShard(sourceID))
+}
+
+func (s *Stores) scaleImportSourceRecordSet(sourceID string) (*shardkv.RecordSet, error) {
+	sh, err := s.scaleImportSourceShard(sourceID)
+	if err != nil {
+		return nil, err
+	}
+	return sh.RecordSet(clusterstate.RecordSetScaleImport)
 }
 
 func scaleImportLeaseLiveForOther(cur clusterstate.ScaleImportSourceState, ownerID, runID string, now time.Time) bool {

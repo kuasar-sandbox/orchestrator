@@ -36,8 +36,6 @@ type RecordMeta struct {
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
-func ScaleLinkSourceKey(sourceID string) string { return "import/source/" + sourceID }
-
 type RouteState string
 
 const (

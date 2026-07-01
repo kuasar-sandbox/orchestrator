@@ -3,6 +3,7 @@ package registry
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -25,7 +26,7 @@ func TestClusterStoresRouteAndNodeUseLocatedOwners(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	assertShardRecordOwners(t, ctx, cluster, shardkv.Namespace(clusterstate.NamespaceRouteLink), clusterstate.RouteLinkShard(group), clusterstate.RouteSandboxRecordKey(routeKey), routeOwners)
+	assertShardRecordOwners(t, ctx, cluster, shardkv.Namespace(clusterstate.NamespaceRouteLink), clusterstate.RouteLinkShard(group), clusterstate.RecordSetRouteSandbox, clusterstate.RouteSandboxRecordKey(routeKey), routeOwners)
 
 	nodeID := "node-located"
 	if err := stores.PutNode(ctx, &NodeRecord{NodeID: nodeID}); err != nil {
@@ -35,7 +36,7 @@ func TestClusterStoresRouteAndNodeUseLocatedOwners(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	assertShardRecordOwners(t, ctx, cluster, shardkv.Namespace(clusterstate.NamespaceNodeLink), clusterstate.NodeLinkShard(nodeID), clusterstate.NodeLinkProfileRecord, nodeOwners)
+	assertShardRecordOwners(t, ctx, cluster, shardkv.Namespace(clusterstate.NamespaceNodeLink), clusterstate.NodeLinkShard(nodeID), clusterstate.RecordSetNodeProfile, clusterstate.NodeLinkProfileRecord, nodeOwners)
 }
 
 func TestStoresBuildShardKVNamespaces(t *testing.T) {
@@ -188,7 +189,7 @@ func TestNodeListShardFixedShard(t *testing.T) {
 func TestScaleLinkImportSourceShard(t *testing.T) {
 	ctx := context.Background()
 	stores := NewStores()
-	state, acquired, err := stores.acquireScaleImportSourceShard(ctx, "source-a", "s1", "run-1", "registry.1", time.Minute)
+	state, acquired, err := stores.acquireScaleImportSourceShard(ctx, "source-a", "s1", "run-1", time.Minute)
 	if err != nil || !acquired {
 		t.Fatalf("acquire state=%+v acquired=%v err=%v", state, acquired, err)
 	}
@@ -198,7 +199,7 @@ func TestScaleLinkImportSourceShard(t *testing.T) {
 	if ok := stores.checkScaleImportSourceShard(ctx, "source-a", "s1", "run-1", state.Term); !ok {
 		t.Fatal("lease check failed")
 	}
-	held, acquired, err := stores.acquireScaleImportSourceShard(ctx, "source-a", "s2", "run-2", "registry.1", time.Minute)
+	held, acquired, err := stores.acquireScaleImportSourceShard(ctx, "source-a", "s2", "run-2", time.Minute)
 	if err != nil || acquired || held.OwnerID != "s1" {
 		t.Fatalf("second acquire held=%+v acquired=%v err=%v", held, acquired, err)
 	}
@@ -215,7 +216,7 @@ func TestClusterStoresScaleLinkSourceLeaseUsesLocatedOwners(t *testing.T) {
 	stores := cluster["a"]
 
 	sourceID := "source-a"
-	rec, acquired, err := stores.AcquireScaleLinkSourceLease(ctx, sourceID, "s1", "run-1", "registry.1.test", time.Second)
+	rec, acquired, err := stores.AcquireScaleLinkSourceLease(ctx, sourceID, "s1", "run-1", time.Second)
 	if err != nil {
 		t.Fatalf("AcquireScaleLinkSourceLease: %v", err)
 	}
@@ -230,7 +231,7 @@ func TestClusterStoresScaleLinkSourceLeaseUsesLocatedOwners(t *testing.T) {
 	}
 	assertScaleImportShardOwners(t, ctx, cluster, owners, sourceID, "s1")
 
-	held, acquired, err := stores.AcquireScaleLinkSourceLease(ctx, sourceID, "s2", "run-2", "registry.1.test", time.Second)
+	held, acquired, err := stores.AcquireScaleLinkSourceLease(ctx, sourceID, "s2", "run-2", time.Second)
 	if err != nil {
 		t.Fatalf("second AcquireScaleLinkSourceLease: %v", err)
 	}
@@ -243,7 +244,7 @@ func TestClusterStoresScaleLinkSourceCursorUsesLeaseFencing(t *testing.T) {
 	ctx := context.Background()
 	stores := NewStores()
 
-	rec, acquired, err := stores.AcquireScaleLinkSourceLease(ctx, "source-a", "s1", "run-1", "registry.1.test", time.Second)
+	rec, acquired, err := stores.AcquireScaleLinkSourceLease(ctx, "source-a", "s1", "run-1", time.Second)
 	if err != nil || !acquired {
 		t.Fatalf("AcquireScaleLinkSourceLease acquired=%v err=%v", acquired, err)
 	}
@@ -282,7 +283,7 @@ func TestClusterStoresJointMembershipWritesBothOwnerSets(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		assertShardRecordPresent(t, ctx, cluster, shardkv.Namespace(clusterstate.NamespaceRouteLink), clusterstate.RouteLinkShard(group), clusterstate.RouteSandboxRecordKey(routeKey), owners)
+		assertShardRecordPresent(t, ctx, cluster, shardkv.Namespace(clusterstate.NamespaceRouteLink), clusterstate.RouteLinkShard(group), clusterstate.RecordSetRouteSandbox, clusterstate.RouteSandboxRecordKey(routeKey), owners)
 	}
 
 	nodeID := "node-joint"
@@ -294,46 +295,49 @@ func TestClusterStoresJointMembershipWritesBothOwnerSets(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		assertShardRecordPresent(t, ctx, cluster, shardkv.Namespace(clusterstate.NamespaceNodeLink), clusterstate.NodeLinkShard(nodeID), clusterstate.NodeLinkProfileRecord, owners)
+		assertShardRecordPresent(t, ctx, cluster, shardkv.Namespace(clusterstate.NamespaceNodeLink), clusterstate.NodeLinkShard(nodeID), clusterstate.RecordSetNodeProfile, clusterstate.NodeLinkProfileRecord, owners)
 	}
 }
 
-func assertShardRecordPresent(t *testing.T, ctx context.Context, stores map[string]*Stores, ns shardkv.Namespace, shard shardkv.ShardKey, key shardkv.RecordKey, owners []string) {
+func assertShardRecordPresent(t *testing.T, ctx context.Context, stores map[string]*Stores, ns shardkv.Namespace, shard shardkv.ShardKey, recordSet shardkv.RecordSetName, key shardkv.RecordKey, owners []string) {
 	t.Helper()
 	for _, id := range owners {
 		store := stores[id]
 		if store == nil {
 			t.Fatalf("owner %s missing store", id)
 		}
-		has := localShardHasRecord(t, ctx, store, ns, shard, key)
+		has := localShardHasRecord(t, ctx, store, ns, shard, recordSet, key)
 		if !has {
-			t.Fatalf("owner %s missing %s/%s key %q; owners=%v", id, ns, shard, key, owners)
+			t.Fatalf("owner %s missing %s/%s/%s key %q; owners=%v", id, ns, shard, recordSet, key, owners)
 		}
 	}
 }
 
-func assertShardRecordOwners(t *testing.T, ctx context.Context, stores map[string]*Stores, ns shardkv.Namespace, shard shardkv.ShardKey, key shardkv.RecordKey, owners []string) {
+func assertShardRecordOwners(t *testing.T, ctx context.Context, stores map[string]*Stores, ns shardkv.Namespace, shard shardkv.ShardKey, recordSet shardkv.RecordSetName, key shardkv.RecordKey, owners []string) {
 	t.Helper()
 	ownerSet := map[string]bool{}
 	for _, owner := range owners {
 		ownerSet[owner] = true
 	}
 	for id, store := range stores {
-		has := localShardHasRecord(t, ctx, store, ns, shard, key)
+		has := localShardHasRecord(t, ctx, store, ns, shard, recordSet, key)
 		if ownerSet[id] && !has {
-			t.Fatalf("owner %s missing %s/%s key %q; owners=%v", id, ns, shard, key, owners)
+			t.Fatalf("owner %s missing %s/%s/%s key %q; owners=%v", id, ns, shard, recordSet, key, owners)
 		}
 		if !ownerSet[id] && has {
-			t.Fatalf("non-owner %s unexpectedly has %s/%s key %q; owners=%v", id, ns, shard, key, owners)
+			t.Fatalf("non-owner %s unexpectedly has %s/%s/%s key %q; owners=%v", id, ns, shard, recordSet, key, owners)
 		}
 	}
 }
 
-func localShardHasRecord(t *testing.T, ctx context.Context, store *Stores, ns shardkv.Namespace, shard shardkv.ShardKey, key shardkv.RecordKey) bool {
+func localShardHasRecord(t *testing.T, ctx context.Context, store *Stores, ns shardkv.Namespace, shard shardkv.ShardKey, recordSet shardkv.RecordSetName, key shardkv.RecordKey) bool {
 	t.Helper()
-	resp, err := store.ShardStore().Handle(ctx, shardkv.Request{Op: shardkv.OpSnapshot, Namespace: ns, Shard: shard})
+	resp, err := store.ShardStore().Handle(ctx, shardkv.Request{Op: shardkv.OpSnapshot, Namespace: ns, Shard: shard, RecordSet: recordSet})
 	if err != nil {
-		t.Fatalf("snapshot %s/%s: %v", ns, shard, err)
+		if errors.Is(err, shardkv.ErrInvalidView) {
+			return false
+		}
+		t.Fatalf("snapshot %s/%s/%s: %v", ns, shard, recordSet, err)
 	}
 	for _, rec := range resp.Records {
 		if rec.Key == key && !rec.Deleted {
@@ -374,6 +378,61 @@ func TestRoutingNodeOwnerUsesLinkOwner(t *testing.T) {
 	}
 	if len(remote.released) != 1 || remote.released[0] != "b1" {
 		t.Fatalf("remote released=%v", remote.released)
+	}
+}
+
+func TestNodeOwnerUsesProfileReadWhenLocalIsNotNodeShardOwner(t *testing.T) {
+	ctx := context.Background()
+	view := clusterstate.MemberView{Version: 1, Members: []string{"a", "b", "c"}}
+	cluster := newShardStoreCluster(t, view.Members, 1, 1, 1, 1)
+	nodeID := nodeNotOwnedBy(t, view, "a")
+	if err := cluster["b"].PutNode(ctx, &NodeRecord{
+		NodeID: nodeID, LinkOwner: "remote", Capacity: 10,
+		BuildCapacity: &routesync.BuildResources{CPU: 1000},
+		DataEndpoint:  "127.0.0.1:12345",
+	}); err != nil {
+		t.Fatalf("seed node: %v", err)
+	}
+
+	if _, _, err := cluster["a"].GetNode(ctx, nodeID); !errors.Is(err, shardkv.ErrInvalidView) {
+		t.Fatalf("non-owner full GetNode err=%v, want ErrInvalidView", err)
+	}
+	profile, found, err := cluster["a"].GetNodeProfile(ctx, nodeID)
+	if err != nil || !found || profile.DataEndpoint != "127.0.0.1:12345" || profile.LinkOwner != "remote" {
+		t.Fatalf("profile=%+v found=%v err=%v", profile, found, err)
+	}
+
+	reg := New(cluster["a"], nil, time.Second, nil)
+	if node, found, err := reg.localNodeOwner.Runtime(ctx, nodeID); err != nil || !found || node.DataEndpoint != "127.0.0.1:12345" {
+		t.Fatalf("local runtime profile=%+v found=%v err=%v", node, found, err)
+	}
+	remote := &routingNodeOwnerRecorder{allow: true}
+	reg.SetRemoteNodeOwners(map[string]NodeOwner{"remote": remote})
+	if !reg.nodeOwner.AdmitBuild(ctx, nodeID, "b1", &routesync.BuildResources{CPU: 1}) {
+		t.Fatal("routed AdmitBuild returned false")
+	}
+	if len(remote.admitted) != 1 || remote.admitted[0] != nodeID+"/b1" {
+		t.Fatalf("remote admitted=%v", remote.admitted)
+	}
+}
+
+func TestNodeRegisterUsesProfileReadWhenLocalIsNotNodeShardOwner(t *testing.T) {
+	ctx := context.Background()
+	view := clusterstate.MemberView{Version: 1, Members: []string{"a", "b", "c"}}
+	cluster := newShardStoreCluster(t, view.Members, 1, 1, 1, 1)
+	nodeID := nodeNotOwnedBy(t, view, "a")
+	if err := cluster["b"].PutNode(ctx, &NodeRecord{NodeID: nodeID, LinkOwner: "b", DataEndpoint: "old"}); err != nil {
+		t.Fatalf("seed node: %v", err)
+	}
+	reg := New(cluster["a"], nil, time.Second, nil)
+	if err := reg.updateNodeRegister(ctx, &routesync.NodeRegister{
+		NodeID: nodeID, Capacity: 10, DataEndpoint: "new", Labels: map[string]string{"pool": "p"},
+	}); err != nil {
+		t.Fatalf("non-owner node register: %v", err)
+	}
+	profile, found, err := cluster["b"].GetNodeProfile(ctx, nodeID)
+	if err != nil || !found || profile.LinkOwner != "a" || profile.DataEndpoint != "new" {
+		t.Fatalf("profile after register=%+v found=%v err=%v", profile, found, err)
 	}
 }
 
@@ -420,7 +479,7 @@ func TestNodeListReplicatesToLocatedOwnerSet(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	assertShardRecordOwners(t, ctx, cluster, shardkv.Namespace(clusterstate.NamespaceNodeList), clusterstate.NodeListShard, clusterstate.NodeListRecordKey("n1"), owners)
+	assertShardRecordOwners(t, ctx, cluster, shardkv.Namespace(clusterstate.NamespaceNodeList), clusterstate.NodeListShard, clusterstate.RecordSetNodeListNodes, clusterstate.NodeListRecordKey("n1"), owners)
 }
 
 func TestNodeListTombstoneRejectsStaleProjection(t *testing.T) {
@@ -478,35 +537,14 @@ func TestNodeListDuplicateProjectionDoesNotAdvanceRev(t *testing.T) {
 
 func TestNodeListRangeRepairsLocalFromOwnerSet(t *testing.T) {
 	ctx := context.Background()
-	cluster := newShardStoreCluster(t, []string{"a", "b"}, 1, 1, 1, 2)
+	cluster := newShardStoreCluster(t, []string{"a", "b", "c"}, 1, 1, 1, 3)
 	stores := cluster["a"]
 	seed := clusterstate.NodeListEntry{
 		Meta:   clusterstate.RecordMeta{Ballot: clusterstate.Ballot{Round: 5, Writer: "b"}, Rev: 3, UpdatedAt: time.Now()},
 		NodeID: "n-remote", Labels: map[string]string{"pool": "p"}, LastHeartbeatUnix: time.Now().Unix(),
 	}
-	value, err := clusterstate.EncodeShardValue(seed)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = cluster["b"].ShardStore().Handle(ctx, shardkv.Request{
-		Op:        shardkv.OpRepair,
-		Namespace: shardkv.Namespace(clusterstate.NamespaceNodeList),
-		Shard:     clusterstate.NodeListShard,
-		Record: shardkv.Record{
-			Namespace: shardkv.Namespace(clusterstate.NamespaceNodeList),
-			Shard:     clusterstate.NodeListShard,
-			Key:       clusterstate.NodeListRecordKey(seed.NodeID),
-			Value:     value,
-			Meta: shardkv.RecordMeta{
-				Ballot:    shardkv.Ballot{Round: 5, Writer: shardkv.MemberID("b")},
-				Rev:       3,
-				UpdatedAt: time.Now(),
-			},
-		},
-	})
-	if err != nil {
-		t.Fatalf("seed remote node_list: %v", err)
-	}
+	seedNodeListShardRecord(t, ctx, cluster["b"], seed, shardkv.Ballot{Round: 5, Writer: shardkv.MemberID("b")}, 3)
+	seedNodeListShardRecord(t, ctx, cluster["c"], seed, shardkv.Ballot{Round: 5, Writer: shardkv.MemberID("b")}, 3)
 
 	var got []clusterstate.NodeListEntry
 	if err := stores.RangeNodeList(ctx, func(entry clusterstate.NodeListEntry) error {
@@ -518,9 +556,50 @@ func TestNodeListRangeRepairsLocalFromOwnerSet(t *testing.T) {
 	if len(got) != 1 || got[0].NodeID != seed.NodeID {
 		t.Fatalf("unexpected range result: %+v", got)
 	}
-	if !localShardHasRecord(t, ctx, stores, shardkv.Namespace(clusterstate.NamespaceNodeList), clusterstate.NodeListShard, clusterstate.NodeListRecordKey(seed.NodeID)) {
+	if !localShardHasRecord(t, ctx, stores, shardkv.Namespace(clusterstate.NamespaceNodeList), clusterstate.NodeListShard, clusterstate.RecordSetNodeListNodes, clusterstate.NodeListRecordKey(seed.NodeID)) {
 		t.Fatalf("local repair did not materialize node_list record")
 	}
+}
+
+func seedNodeListShardRecord(t *testing.T, ctx context.Context, store *Stores, entry clusterstate.NodeListEntry, ballot shardkv.Ballot, rev uint64) {
+	t.Helper()
+	value, err := clusterstate.EncodeShardValue(entry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = store.ShardStore().Handle(ctx, shardkv.Request{
+		Op:        shardkv.OpRepair,
+		Namespace: shardkv.Namespace(clusterstate.NamespaceNodeList),
+		Shard:     clusterstate.NodeListShard,
+		RecordSet: clusterstate.RecordSetNodeListNodes,
+		Record: shardkv.Record{
+			Namespace: shardkv.Namespace(clusterstate.NamespaceNodeList),
+			Shard:     clusterstate.NodeListShard,
+			RecordSet: clusterstate.RecordSetNodeListNodes,
+			Key:       clusterstate.NodeListRecordKey(entry.NodeID),
+			Value:     value,
+			Meta:      shardkv.RecordMeta{Ballot: ballot, Rev: rev, UpdatedAt: time.Now()},
+		},
+	})
+	if err != nil {
+		t.Fatalf("seed node_list shard: %v", err)
+	}
+}
+
+func nodeNotOwnedBy(t *testing.T, view clusterstate.MemberView, local string) string {
+	t.Helper()
+	for i := 0; i < 1000; i++ {
+		nodeID := fmt.Sprintf("node-non-owner-%d", i)
+		owners, err := view.Owners(nodeID, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(owners) == 1 && owners[0] != local {
+			return nodeID
+		}
+	}
+	t.Fatalf("could not find node not owned by %s", local)
+	return ""
 }
 
 func newShardStoreCluster(t *testing.T, members []string, routeOwners, nodeOwners, scaleOwners, nodeListOwners int) map[string]*Stores {
@@ -579,7 +658,11 @@ func assertScaleImportShardOwners(t *testing.T, ctx context.Context, stores map[
 		if err != nil {
 			t.Fatalf("shard %s: %v", id, err)
 		}
-		rec, found, err := sh.Get(ctx, clusterstate.ScaleLinkStateRecord)
+		rs, err := sh.RecordSet(clusterstate.RecordSetScaleImport)
+		if err != nil {
+			t.Fatalf("record set %s: %v", id, err)
+		}
+		rec, found, err := rs.Get(ctx, clusterstate.ScaleLinkStateRecord)
 		if err != nil || !found {
 			t.Fatalf("owner %s read found=%v err=%v", id, found, err)
 		}
