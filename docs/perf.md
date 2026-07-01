@@ -595,6 +595,47 @@ cache-ctl 预算(典型 1–2 GiB),否则 cache 增长会挤掉沙箱内存。
   sandbox-ctl stdout)。perf harness 仍主要依赖 audit.log + cgroup events 做断言,
   应用 stdout 可用作辅助信号
 
+### 3.8 cluster 控制面冷路径
+
+cluster 性能口径应区分热路径与冷路径。热路径是 router 已有活动连接缓存后的
+数据转发,不应进入 registry Reserve;冷路径是首次连接、沙箱创建、build 创建、
+node 状态变化、group 导入与成员切换。这些路径进入 registry/scaler,目标是
+保证可靠性和扩展线性,而不是把所有 QPS 都压到 registry 上。
+
+```
+hot path:
+
+client ── data stream ──► router active connection cache ──► node/proxy/envd
+          no Reserve while same route connection is alive
+
+cold path:
+
+router ── Reserve(group,sandbox) ──► registry route_link ── Place ──► scaler
+node   ── state/heartbeat/events ──► registry node_link/node_list
+scaler ── group import / key selector ──► registry route_link/node_link
+```
+
+性能回归应覆盖:
+
+- registry N=1 与 N>1 两种模式:单成员必须退化为无网络复制路径;多成员验证
+  shardkv CAS、WATCH 与成员健康变化。
+- `membership_version` 变更:配置 reload 后不同 label 的成员集群并存,旧版本
+  grace 期间继续服务已有分片;新版本 READY 后新写进入新逻辑分片。业务无损的
+  目标是避免把所有记录全局扫描迁移,由节点心跳、group import 与分片内复制
+  自然补齐活动数据。
+- node_link 重定向/转发:任意 registry 接入 node 时,若自身不是 node owner,
+  应逐个尝试 owner;节点支持 redirect 时可重连到 owner,否则在 relay 链路上
+  订阅并复制状态。
+- router cache:同一 route 的活动连接存在时,新连接不走 Reserve;活动连接过期
+  或路由失效后才回到冷路径。
+- scaler import:同一个 `source_id` 的导入任务由 scale_link 中的 lease 串行
+  执行;文件源只用于开发/e2e,生产源通过 provider/importer 接口实现。
+
+`sandbox-orchestrator` 的 cluster stub e2e 应作为当前主要回归入口:由
+`make build` 产生真实 `cluster-ctl`/`node-stub-ctl` 二进制,启动 registry、
+router、scaler 和指定数量 stub node,覆盖 N=1、多成员、成员变更、node
+重启、sandbox/build 创建删除、route 查询与 WATCH_LIST。
+
 ## 4. 已知测量局限
 
 - **vCPU 并发**:当前数据是 1 vCPU,fault 几乎无并发竞态;4-8 vCPU 下的 batch
@@ -643,7 +684,8 @@ make perf-density
 
 ## 6. See Also
 
-- [`cache.md`](cache.md) —— cache-ctl 架构,本文 §1 关注其运行特征
-- [`sandbox.md`](sandbox.md) —— sandbox-ctl 架构,本文 §2 关注其运行特征
-- [`node-resource.md`](node-resource.md) —— 节点资源控制器架构与协议规范
+- [`../../sandbox-accelerator/docs/cache.md`](../../sandbox-accelerator/docs/cache.md) —— cache-ctl 架构,本文 §1 关注其运行特征
+- [`../../sandbox-runtime/docs/sandbox.md`](../../sandbox-runtime/docs/sandbox.md) —— sandbox-ctl 架构,本文 §2 关注其运行特征
+- [`../../sandbox-orchestrator/docs/node-resource.md`](../../sandbox-orchestrator/docs/node-resource.md) —— 节点资源控制器架构与协议规范
+- [`../../sandbox-orchestrator/docs/cluster.md`](../../sandbox-orchestrator/docs/cluster.md) —— cluster registry/router/scaler 设计
 - [`kuasar-sandbox.md`](kuasar-sandbox.md) §1.3 / §7 —— 系统级 SLO 与规模推算的来源

@@ -101,15 +101,25 @@ Warm Pool),共享同一套基础设施:内容定义分块、收敛加密、内�
 
 ### 2.1 总体拓扑
 
-按节点角色组织:计算节点承载沙箱运行与本地缓存;可用区内部署 L2 缓存集群;
-区域内是对象存储与代管理;镜像展平在计算节点的构建沙箱内完成(§8)。
+按节点角色组织:计算节点承载沙箱运行与本地缓存;cluster 控制面提供跨节点
+入口、放置与 registry 状态复制;可用区内部署 L2 缓存集群;区域内是对象存储与
+代管理;镜像展平在计算节点的构建沙箱内完成(§8)。
 
 ```
         ┌── Platform mgmt plane  (out of scope) ───────────────────────────────────────────────────────────┐
         │   sandbox mgmt platform      /      image registry                                              │
         └──────────────────────────────────────────────────────────────────────────────────────────────────┘
-      per-sandbox config & keys / build creds   │
+      e2b API / build API / group config         │
                                                 ▼
+  ┌── Cluster control plane ───────────────────────────────────────────────────────────┐
+  │  cluster-ctl router ── reserve/query ──► cluster-ctl registry                     │
+  │       data ingress                 shardkv state cluster                           │
+  │                                    ▲                                               │
+  │                                    └── place/import ── cluster-ctl scaler          │
+  │                                                    WATCH_LIST + provider/importer  │
+  └──────────────────────────────────────────────┬────────────────────────────────────┘
+      node_link / route target / key refresh      │
+                                                  ▼
   ┌── Compute node  (×N per AZ) ───────────────────────────────────────────────────────┐
   │                                                                                    │
   │  node-ctl          (e2b-compatible ingress)                                        │
@@ -136,9 +146,13 @@ Warm Pool),共享同一套基础设施:内容定义分块、收敛加密、内�
                                                             └────────────────────────────────────────────────────────┘
 ```
 
-分层缓存(L1/L2)是可替换的访问加速层:延迟与吞吐达标时可由托管 NAS 加速服务
-(如 SFS Turbo,对 OBS 提供近端加速)承担,对上层提供相同访问语义。GC 与代管理
-作用于对象存储,处于控制平面,不在读写热路径上。进程归属、端口与启停依赖见
+cluster 控制面由 `cluster-ctl` 的 registry/router/scaler 三个角色组成。
+registry 是可靠状态集群,以 group/node 等逻辑键分片,分片内全复制并提供 CAS
+与 WATCH;router 只处理数据面入口与活动连接缓存;scaler 通过 node_list 与
+sandbox group provider/importer 做放置决策。分层缓存(L1/L2)是可替换的访问
+加速层:延迟与吞吐达标时可由托管 NAS 加速服务(如 SFS Turbo,对 OBS 提供近端
+加速)承担,对上层提供相同访问语义。GC 与代管理作用于对象存储,处于控制平面,
+不在读写热路径上。进程归属、端口与启停依赖见
 [`deployment.md`](deployment.md)。
 
 ### 2.2 子系统分工
@@ -149,7 +163,7 @@ Warm Pool),共享同一套基础设施:内容定义分块、收敛加密、内�
 | **sandbox-runtime** | microVM 生命周期引擎:一沙箱一进程的沙箱控制(块设备/快照代理、内存统一持有、balloon 环)+ Guest 一号进程 | `sandbox-ctl`、`sandbox-init`、`sandbox-runtime.erofs` | `pkg/resource`(资源控制协议+Client) | `sandbox-runtime/docs/sandbox.md`、`sandbox-runtime.md` |
 | **sandbox-accelerator** | 存储加速 + 镜像构建:分块/收敛加密/清单库 + 内容寻址存储 + 分层缓存 + OCI → EROFS 确定性展平(远程拉取 + Referrers 幂等) | `manifest-ctl`、`store-ctl`、`cache-ctl`、`flatten-ctl` | `pkg/manifest`、`pkg/image`、`pkg/{cache,store}/client` | `sandbox-accelerator/docs/{manifest,store,cache,flatten}.md` |
 | **sandbox-vswitch** | eBPF/TC 虚拟交换机:单节点 4096 端口隔离网络 + tapfd 交接 | `vswitch-ctl`、`tapfd-get` | `pkg/tapfd`(fd 交接规约) | `sandbox-vswitch/docs/{vswitch,tapfd}.md` |
-| **sandbox-orchestrator** | 单机沙箱编排 + e2b 兼容 ingress:控制面 REST、envd-in-guest 反代、模板构建(沙箱内三阶段)、密钥派生 + 节点级资源守护(准入/额度分配/主动回收)+ 集群控制面(registry/router/scaler) | `node-ctl`、`cluster-ctl`、`e2b-key-ctl`、`sandbox-runtime-{e2b,builder}.erofs` | — | `sandbox-orchestrator/docs/{node,node-proxy,node-resource,cluster}.md` |
+| **sandbox-orchestrator** | 单机沙箱编排 + e2b 兼容 ingress:控制面 REST、envd-in-guest 反代、模板构建(沙箱内三阶段)、密钥派生 + 节点级资源守护(准入/额度分配/主动回收)+ 集群控制面(registry/router/scaler)与 stub e2e 节点 | `node-ctl`、`cluster-ctl`、`node-stub-ctl`、`e2b-key-ctl`、`sandbox-runtime-{e2b,builder}.erofs` | — | `sandbox-orchestrator/docs/{node,node-proxy,node-resource,cluster,cluster-router,cluster-scaler}.md` |
 | **sandbox-deps** | 原生依赖:定制 Guest 内核、VMM 补丁、erofs 工具 | `vmlinux`、`cloud-hypervisor`、`mkfs.erofs` | 构建脚本 + patches + configs | `sandbox-deps/docs/{cloud-hypervisor,sandbox-kernel,build}.md` |
 
 ### 2.3 依赖关系
@@ -729,6 +743,11 @@ Cold boot (1 GiB image):                 Snapshot restore (512 MiB):
   + `store-ctl`(sidecar)+ `sandbox-ctl × ~3K`(每沙箱一进程,派生
   `cloud-hypervisor`);e2b 模板构建在本节点的构建沙箱内进行(`sandbox-builder@<bid>`
   → 三阶段,见 `deployment.md` §5),无独立展平池。
+- **Cluster 控制面**(AZ 级或 Region 级):`cluster-ctl registry` 按
+  membership 配置形成可靠状态集群;`cluster-ctl router` 提供 group-scoped
+  数据入口与活动连接缓存;`cluster-ctl scaler` 订阅 node_list、导入 group
+  配置并执行放置。registry 与 scaler 各自通过 memberlist 健康检测隔离成员
+  label,成员清单由配置和注册路径提供。
 - **L2 缓存集群**(AZ 级,100-200 节点):`cache-ctl shard`,RS 4+1 + Maglev
   一致性哈希,纯密文 KV。
 - **Region 级**:对象存储桶 + GC 与代管理(控制平面)+ 平台管理面(平台外)。
