@@ -9,10 +9,12 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/envdsign"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/proxy"
 )
 
@@ -78,9 +80,13 @@ func TestProxyForwardAndAuth(t *testing.T) {
 	ts := httptest.NewServer(px)
 	defer ts.Close()
 
-	do := func(token, query string) (int, string) {
-		req, _ := http.NewRequest("GET", ts.URL+"/echo"+query, nil)
-		req.Header.Set("E2b-Sandbox-Id", "s1")
+	do := func(token, path, query, host string) (int, string) {
+		req, _ := http.NewRequest("GET", ts.URL+path+query, nil)
+		if host == "" {
+			req.Header.Set("E2b-Sandbox-Id", "s1")
+		} else {
+			req.Host = host
+		}
 		if token != "" {
 			req.Header.Set("X-Access-Token", token)
 		}
@@ -93,24 +99,35 @@ func TestProxyForwardAndAuth(t *testing.T) {
 		return resp.StatusCode, string(b)
 	}
 
-	if code, body := do("tok", ""); code != 200 || body != "hello from envd" {
+	if code, body := do("tok", "/echo", "", ""); code != 200 || body != "hello from envd" {
 		t.Fatalf("valid token: code=%d body=%q", code, body)
 	}
-	if code, _ := do("wrong", ""); code != 401 {
+	if code, _ := do("wrong", "/echo", "", ""); code != 401 {
 		t.Fatalf("wrong token: code=%d (want 401)", code)
 	}
-	if code, _ := do("", ""); code != 401 {
+	if code, _ := do("", "/echo", "", ""); code != 401 {
 		t.Fatalf("missing token: code=%d (want 401)", code)
 	}
-	if code, _ := do("", "?signature=abc&username=user"); code != 200 {
-		t.Fatalf("pre-signed file url: code=%d (want 200)", code)
+	if code, _ := do("", "/echo", "?signature=abc&username=user", ""); code != 401 {
+		t.Fatalf("non-file signature bypass: code=%d (want 401)", code)
+	}
+	sig := envdsign.Signature("/tmp/a.txt", "", envdsign.OperationRead, "tok", nil)
+	query := "?path=" + url.QueryEscape("/tmp/a.txt") + "&signature=" + url.QueryEscape(sig)
+	if code, body := do("", "/files", query, ""); code != 200 || body != "hello from envd" {
+		t.Fatalf("pre-signed file url: code=%d body=%q", code, body)
+	}
+	if code, _ := do("", "/files", "?path=/tmp/a.txt&signature=bad", ""); code != 401 {
+		t.Fatalf("bad file signature: code=%d (want 401)", code)
+	}
+	if code, _ := do("", "/files", query, "8080-s1.test.local"); code != 401 {
+		t.Fatalf("file signature on user port: code=%d (want 401)", code)
 	}
 	mode = "off"
-	if code, _ := do("", ""); code != 200 {
+	if code, _ := do("", "/echo", "", ""); code != 200 {
 		t.Fatalf("auth off: code=%d (want 200)", code)
 	}
 	mode = "log"
-	if code, body := do("wrong", ""); code != 200 || body != "hello from envd" {
+	if code, body := do("wrong", "/echo", "", ""); code != 200 || body != "hello from envd" {
 		t.Fatalf("auth log forwards: code=%d body=%q", code, body)
 	}
 }

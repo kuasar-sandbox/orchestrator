@@ -20,11 +20,13 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/clusterclient"
+	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/envdsign"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/metrics"
 	proxypkg "github.com/kuasar-sandbox/sandbox-orchestrator/internal/proxy"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/registry"
@@ -542,6 +544,11 @@ func (rt *Router) serveData(w http.ResponseWriter, r *http.Request, host string)
 		http.Error(w, "bad data host (want <port>-<sid>.<domain>)", http.StatusBadRequest)
 		return
 	}
+	port, err := strconv.Atoi(sub[:i])
+	if err != nil || port <= 0 {
+		http.Error(w, "bad data host (want <port>-<sid>.<domain>)", http.StatusBadRequest)
+		return
+	}
 	sid := sub[i+1:]
 	group := r.Header.Get(HeaderGroup)
 	if group == "" {
@@ -583,26 +590,33 @@ func (rt *Router) serveData(w http.ResponseWriter, r *http.Request, host string)
 		http.Error(w, "sandbox not ready", http.StatusServiceUnavailable)
 		return
 	}
-	// Data-plane token enforcement (cluster-router.md §8): enforce requires the
-	// caller to present the sandbox's access token; log warns on mismatch; off (and
-	// unset) skips. The token is (re)injected for the node below regardless.
+	// Data-plane credential enforcement (cluster-router.md §8): enforce requires
+	// either the sandbox's access token or a valid envd /files signature; log warns
+	// on mismatch; off (and unset) skips. Token-auth traffic is re-injected for the
+	// node, but signed /files traffic stays headerless so node proxy and envd verify
+	// the same URL.
+	injectAccessToken := true
 	if rt.dataPlaneAuth == "enforce" || rt.dataPlaneAuth == "log" {
-		if r.Header.Get(HeaderAccessTok) != rr.AccessToken {
+		auth := envdsign.CheckDataPlaneAuth(r, port, rr.AccessToken, time.Now())
+		if auth.OK {
+			injectAccessToken = !auth.Signed
+		} else {
 			if rt.dataPlaneAuth == "enforce" {
 				http.Error(w, "invalid access token", http.StatusUnauthorized)
 				return
 			}
-			rt.log.Warn("router: data-plane token mismatch (log mode)", "sid", sid)
+			rt.log.Warn("router: data-plane auth mismatch (log mode)", "sid", sid, "err", auth.Err)
 		}
 	}
-	rt.forwardSandboxData(w, r, rr, r.Host, sid)
+	rt.forwardSandboxData(w, r, rr, r.Host, sid, injectAccessToken)
 }
 
 // forwardSandboxData two-hop forwards a data-plane request to the sandbox's node:
 // sandboxHost is the <port>-<sid>.<domain> authority the node proxy resolves from
-// (preserved for by-sid; synthesized for by-(group,route-key)). The access token
-// is injected; CONNECT is tunneled (ReverseProxy can't).
-func (rt *Router) forwardSandboxData(w http.ResponseWriter, r *http.Request, rr *routeResolve, sandboxHost, sid string) {
+// (preserved for by-sid; synthesized for by-(group,route-key)). Token-auth traffic
+// gets the access token injected; signed /files traffic is forwarded without it.
+// CONNECT is tunneled (ReverseProxy can't).
+func (rt *Router) forwardSandboxData(w http.ResponseWriter, r *http.Request, rr *routeResolve, sandboxHost, sid string, injectAccessToken bool) {
 	r.Host = sandboxHost
 	doneActive := rt.beginActiveRoute(rr)
 	defer doneActive()
@@ -619,7 +633,11 @@ func (rt *Router) forwardSandboxData(w http.ResponseWriter, r *http.Request, rr 
 		req.URL.Scheme = target.Scheme
 		req.URL.Host = target.Host
 		req.Host = sandboxHost
-		req.Header.Set(HeaderAccessTok, tok)
+		if injectAccessToken {
+			req.Header.Set(HeaderAccessTok, tok)
+		} else {
+			req.Header.Del(HeaderAccessTok)
+		}
 	}
 	proxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, e error) {
 		// A cached route that fails is likely stale (sandbox moved/gone): evict it so
@@ -654,7 +672,7 @@ func (rt *Router) serveDataByKey(w http.ResponseWriter, r *http.Request, group, 
 	if port == "" {
 		port = "49983"
 	}
-	rt.forwardSandboxData(w, r, rr, port+"-"+rr.SID+"."+rt.domain, rr.SID)
+	rt.forwardSandboxData(w, r, rr, port+"-"+rr.SID+"."+rt.domain, rr.SID, true)
 }
 
 // tunnelData chains a CONNECT to the node's data endpoint (the node tunnels onward

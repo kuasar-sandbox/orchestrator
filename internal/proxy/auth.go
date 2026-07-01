@@ -1,10 +1,11 @@
 package proxy
 
 import (
-	"crypto/subtle"
 	"net/http"
+	"time"
 
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/config"
+	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/envdsign"
 )
 
 // authorized enforces the data-plane access token. The e2b SDK (secure sandboxes,
@@ -13,23 +14,21 @@ import (
 // (defense in depth, and the only check for ports envd does not front: the
 // code-interpreter port and user floatingip ports).
 //
-// Exemptions: auth off, a route with no token (bare), and envd pre-signed file
-// URLs (a `signature` query, which envd itself validates — no header is sent).
-func (p *Proxy) authorized(r *http.Request, route Route) bool {
+// Exemptions: auth off, a route with no token (bare), and envd pre-signed
+// /files URLs. The proxy verifies those signatures before forwarding; envd then
+// verifies the same URL again in-guest.
+func (p *Proxy) authorized(r *http.Request, route Route, port int) bool {
 	mode := p.authMode()
 	if mode == config.AuthOff || route.AccessToken == "" {
 		return true
 	}
-	if r.URL.Query().Get("signature") != "" {
-		return true // envd pre-signed file URL; envd validates the signature
-	}
-	tok := r.Header.Get("X-Access-Token")
-	if subtle.ConstantTimeCompare([]byte(tok), []byte(route.AccessToken)) == 1 {
+	res := envdsign.CheckDataPlaneAuth(r, port, route.AccessToken, time.Now())
+	if res.OK {
 		return true
 	}
 	if mode == config.AuthLog {
-		p.log.Warn("data-plane access token mismatch (log mode; forwarding anyway)",
-			"has_header", tok != "", "path", r.URL.Path)
+		p.log.Warn("data-plane auth mismatch (log mode; forwarding anyway)",
+			"has_header", r.Header.Get(envdsign.AccessTokenHeader) != "", "path", r.URL.Path, "err", res.Err)
 		return true
 	}
 	return false

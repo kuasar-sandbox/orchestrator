@@ -76,7 +76,7 @@ worker 读 `proxy.yaml` 取共享策略与端点,命令行只给每实例身份�
 |---|---|---|
 | `proxy.mode` | `internal` | 数据面承载:`internal` / `external` / `off`(§5) |
 | `proxy.park_timeout` | `30s` | 数据面请求挂起预算:等路由同步 / paused 沙箱 resume 的上限(§5) |
-| `proxy.auth` | `enforce` | 数据面鉴权:`off` / `log` / `enforce`,校验 `X-Access-Token`(§7) |
+| `proxy.auth` | `enforce` | 数据面鉴权:`off` / `log` / `enforce`,校验 `X-Access-Token` 或 envd `/files` signature(§7) |
 | `proxy.metrics_listen` | 空 | serve 内置 proxy 的 Prometheus 端点 |
 | `mmds.enabled` | `false` | envd 鉴权姿态(§8):false = proxy 单闸门;true = FC MMDS v2 + envd re-key |
 
@@ -86,9 +86,9 @@ external 模式下 `proxy.auth` / `park_timeout` 经握手 `Policy` 下推到 wo
 ## 4. 转发数据通路
 
 按 `Host`(`<port>-<sid>.<domain>`)或 `E2b-Sandbox-Id` / `E2b-Sandbox-Port` 头解析
-`(sid, port)` → 路由判定 → 校验 `X-Access-Token`(§7)→ 转发。来源可以是客户端直连,
-也可以是 cluster-ctl router 转发进来的机群流量(后者已注入 `E2b-Sandbox-Id` +
-`X-Access-Token`,与直连无异)。两种部署形态共用同一路由判定函数:
+`(sid, port)` → 路由判定 → 校验 `X-Access-Token` 或 envd `/files` signature(§7)→
+转发。来源可以是客户端直连,也可以是 cluster-ctl router 转发进来的机群流量;普通 token
+流量会携带 `X-Access-Token`,envd 预签名文件 URL 不携带该头。两种部署形态共用同一路由判定函数:
 
 ```
 profile=e2b  且 port ∈ {49983, 49999}  → dial UDS (envd.sock / ci.sock)
@@ -211,8 +211,13 @@ external 模式拓扑(数据面字节流不经 serve;**worker 主动注册,serve
 - `proxy.auth ∈ {off | log | enforce}`,默认 **enforce**(不符回 401);`log` 告警但
   放行;external 模式校验在 worker(策略下推,兜底转发路径上 serve 不校验、由 worker
   校验)。
-- **例外放行**:`auth=off`;路由无 token(bare);envd 预签名文件 URL(带 `signature`
-  query,envd 自行验签、不带头)。
+- **signature 凭证**:仅 `port=49983`、`GET/POST /files`、且带非空 `signature`
+  query 时可替代 `X-Access-Token`。proxy 按 envd 算法复算
+  `v1_ + base64raw(sha256(path:operation:username:accessToken[:expiration]))`;
+  `GET` 对应 `read`,`POST` 对应 `write`,`signature_expiration` 参与签名并按 Unix
+  秒过期校验。该路径不补 `X-Access-Token`,envd 最后一跳继续自验。同一请求若带了
+  非空但错误的 `X-Access-Token`,不回退到 signature。
+- **例外放行**:`auth=off`;路由无 token(bare)。
 - envd 是否**另行**自校验此 token 由 `mmds.enabled` 决定(§8)。无论哪种姿态,envd
   仅经 proxy 的 host-UDS 可达(49983/49999 走 `--connect` UDS,非 floatingip),沙箱
   间无通路。

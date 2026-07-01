@@ -159,7 +159,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		p.mx.Inc(`data_requests_total{result="denied"}`)
 		http.Error(w, "data plane not available on this sandbox", http.StatusNotImplemented)
 	case KindUDS, KindTCP:
-		if !p.authorized(r, route) {
+		if !p.authorized(r, route, port) {
 			p.mx.Inc(`data_requests_total{result="unauthorized"}`)
 			http.Error(w, "invalid access token", http.StatusUnauthorized)
 			return

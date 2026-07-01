@@ -34,6 +34,7 @@ cluster-ctl router --config /etc/cluster-ctl/router.yaml
 | `registry.bootstrap` | registry bootstrap endpoint,用于拉取 membership |
 | `registry.tls` | 到 registry 控制面的 mTLS |
 | `auth.api_key` | `enforce` / `log` / `off` |
+| `auth.data_plane` | 数据面凭证校验:`enforce` / `log` / `off`,默认 `enforce` |
 | `auth.cache_ttl` | API key 校验缓存 |
 | `cache.route_ttl` | 路由解析缓存 TTL |
 | `cache.idle_timeout` | 活动连接空闲淘汰 |
@@ -128,13 +129,23 @@ router 校验 API key 与 group 关系时调用 route owner `verify-key`;route o
 
 ## 8. 数据面
 
-router 转发时注入:
+router 在 sid-host 数据面路径先校验凭证:
+
+- 普通数据面请求必须带 `X-Access-Token: <route_link.access_token>`。
+- envd 预签名文件 URL 可不带 token,但仅限 `port=49983`、`GET/POST /files`、非空
+  `signature` query。router 使用 route_link 返回的 `access_token` 复算 envd signature;
+  `GET` 对应 `read`,`POST` 对应 `write`,`path`、`username`、可选
+  `signature_expiration` 都参与签名。
+- 同一请求若带了非空但错误的 `X-Access-Token`,不回退到 signature。
+
+普通 token 请求转发时注入:
 
 - `E2b-Sandbox-Id: <sandbox_id>`
 - `X-Access-Token: <route_link.access_token>`
 
-node proxy 执行最后一跳 `(sandbox_id,port) -> guest envd/floatingip` 并校验 token。bare 与 e2b 在
-cluster router 看来一致,差别在 node 最后一跳。
+signature 请求转发时不注入 `X-Access-Token`,让 node proxy 和 envd 继续按同一 URL
+验签。node proxy 执行最后一跳 `(sandbox_id,port) -> guest envd/floatingip` 并再次校验
+token 或 signature。bare 与 e2b 在 cluster router 看来一致,差别在 node 最后一跳。
 
 ## 9. 可靠性与性能
 

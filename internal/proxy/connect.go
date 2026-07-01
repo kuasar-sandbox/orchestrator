@@ -62,7 +62,7 @@ func (p *Proxy) serveConnect(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "routing error", http.StatusBadGateway)
 		return
 	}
-	if !p.authorized(r, route) {
+	if !p.authorized(r, route, port) {
 		p.mx.Inc(`data_requests_total{result="unauthorized"}`)
 		http.Error(w, "invalid access token", http.StatusUnauthorized)
 		return
@@ -119,7 +119,7 @@ func Tunnel(w http.ResponseWriter, r *http.Request, backend net.Conn) {
 			f.Flush()
 		}
 		done := make(chan struct{}, 2)
-		go func() { _, _ = io.Copy(backend, r.Body); done <- struct{}{} }()       // client -> backend
+		go func() { _, _ = io.Copy(backend, r.Body); done <- struct{}{} }()         // client -> backend
 		go func() { _, _ = io.Copy(flushWriter{w}, backend); done <- struct{}{} }() // backend -> client
 		<-done
 		return

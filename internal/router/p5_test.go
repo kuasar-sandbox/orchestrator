@@ -7,10 +7,13 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/envdsign"
 )
 
 // TestAuthModeOff: with router.auth=off, caller auth is skipped (front with an
@@ -133,6 +136,79 @@ func TestServeDataSidHostDoesNotUseByKeyReserve(t *testing.T) {
 	}
 	if gotHost != "49983-sb-1.test.local" {
 		t.Fatalf("node saw Host=%q, want original sid host", gotHost)
+	}
+}
+
+func TestServeDataSignedFileURLAuth(t *testing.T) {
+	var nodeHits int32
+	var gotTokens []string
+	node := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&nodeHits, 1)
+		gotTokens = append(gotTokens, r.Header.Get(HeaderAccessTok))
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer node.Close()
+	nodeHost := strings.TrimPrefix(node.URL, "http://")
+	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/route-link/route" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(routeResolve{SID: "sb-1", Group: "/g", RouteKey: "rk", NodeID: "n1", DataEndpoint: nodeHost, AccessToken: "tok", State: "ready"})
+	}))
+	defer control.Close()
+
+	rt := New(strings.TrimPrefix(control.URL, "http://"), "test.local", 0, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	rt.SetAuthMode("off")
+	rt.SetDataPlaneAuth("enforce")
+	srv := httptest.NewServer(rt.Handler())
+	defer srv.Close()
+
+	signedQuery := func(signature string) string {
+		return "?path=" + url.QueryEscape("/tmp/a.txt") + "&signature=" + url.QueryEscape(signature)
+	}
+	sig := envdsign.Signature("/tmp/a.txt", "", envdsign.OperationRead, "tok", nil)
+	do := func(host, path, query, token string) int {
+		req, _ := http.NewRequest(http.MethodGet, srv.URL+path+query, nil)
+		req.Host = host
+		req.Header.Set(HeaderGroup, "/g")
+		req.Header.Set(HeaderRouteKey, "rk")
+		if token != "" {
+			req.Header.Set(HeaderAccessTok, token)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	if code := do("49983-sb-1.test.local", "/files", signedQuery(sig), ""); code != http.StatusNoContent {
+		t.Fatalf("valid signed file status=%d, want 204", code)
+	}
+	if got := gotTokens[len(gotTokens)-1]; got != "" {
+		t.Fatalf("signed file forwarded X-Access-Token=%q, want empty", got)
+	}
+
+	if code := do("49983-sb-1.test.local", "/files", signedQuery("bad"), ""); code != http.StatusUnauthorized {
+		t.Fatalf("bad signature status=%d, want 401", code)
+	}
+	if code := do("49983-sb-1.test.local", "/files", signedQuery(sig), "wrong"); code != http.StatusUnauthorized {
+		t.Fatalf("wrong header with valid signature status=%d, want 401", code)
+	}
+	if code := do("8080-sb-1.test.local", "/files", signedQuery(sig), ""); code != http.StatusUnauthorized {
+		t.Fatalf("signature on user port status=%d, want 401", code)
+	}
+	if got := atomic.LoadInt32(&nodeHits); got != 1 {
+		t.Fatalf("node hits after rejected signed requests=%d, want 1", got)
+	}
+
+	if code := do("49983-sb-1.test.local", "/health", "", "tok"); code != http.StatusNoContent {
+		t.Fatalf("valid token status=%d, want 204", code)
+	}
+	if got := gotTokens[len(gotTokens)-1]; got != "tok" {
+		t.Fatalf("token-auth forward X-Access-Token=%q, want tok", got)
 	}
 }
 
