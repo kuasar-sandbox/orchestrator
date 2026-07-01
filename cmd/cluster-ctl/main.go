@@ -1,12 +1,12 @@
 // Command cluster-ctl is the kuasar-sandbox cluster control plane (cluster.md).
 //
-//	cluster-ctl registry  --config <registry.yaml>   # state authority + node_link hub
+//	cluster-ctl registry  --config <registry.yaml>   # state cluster + node_link hub
 //	cluster-ctl router    --config <router.yaml>     # e2b-compatible unified ingress
 //	cluster-ctl scaler    --config <scaler.yaml>     # placement scheduler
 //	cluster-ctl config <registry|router|scaler> [--template|--config <f>|--resolve]  # config diagnose / generate
 //	cluster-ctl version
 //
-// One binary, three roles as independent processes (cluster.md §1/§4.2).
+// One binary, three roles as independent processes.
 package main
 
 import (

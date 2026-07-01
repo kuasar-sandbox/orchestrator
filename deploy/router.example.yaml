@@ -1,5 +1,5 @@
 # cluster-ctl router config — cluster-ctl router --config /etc/cluster-ctl/router.yaml.
-# e2b-compatible unified ingress (cluster-router.md §3). Required: domain.
+# e2b-compatible unified ingress (docs/cluster-router.md). Required: domain.
 # Validate with `cluster-ctl config router --config router.yaml`.
 
 domain: sandboxes.example.com
@@ -19,5 +19,9 @@ auth:
   api_key: enforce                    # caller api_key auth: off | log | enforce
   data_plane: enforce                 # data-plane access-token check: off | log | enforce
   cache_ttl: 60s                      # api_key↔group verification cache
+
+cache:
+  route_ttl: 5m                       # local route resolution max age
+  idle_timeout: 2m                    # active/route cache idle age
 
 # metrics_listen: ":9910"             # optional Prometheus text endpoint

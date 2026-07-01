@@ -1,5 +1,5 @@
 // Package clustercfg loads cluster-ctl's configuration. Each role runs as its own
-// process with its OWN config file and schema (cluster.md §3) — there is no shared
+// process with its OWN config file and schema; there is no shared
 // file: registry.yaml / router.yaml / scaler.yaml each carry only what that role
 // needs, grouped by the cluster link they operate: node_link, route_link,
 // scale_link, and node_list.
@@ -151,7 +151,7 @@ type ScalerProcessConfig struct {
 }
 
 // ShuffleRule pins each matching group to n deterministic shards of the node set
-// bucketed by a label (cluster-scaler.md §4.4).
+// bucketed by a node label.
 type ShuffleRule struct {
 	Selector map[string]string `yaml:"selector"` // label(s) a group's nodeSelectors and a node's labels must carry
 	ShardBy  string            `yaml:"shard_by"` // node label whose distinct values are the shards
@@ -371,7 +371,7 @@ func validateDurations(m map[string]string) error {
 }
 
 // ===========================================================================
-// registry.yaml — registry member unified control plane (cluster.md §2).
+// registry.yaml — registry member unified control plane.
 // ===========================================================================
 
 // RegistryConfig is the registry role's config. member.listen is the default

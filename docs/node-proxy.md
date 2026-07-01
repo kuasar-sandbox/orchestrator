@@ -13,6 +13,16 @@
 集群下,cluster-ctl router 把机群数据面转发进本节点(注入 `E2b-Sandbox-Id` +
 `X-Access-Token`),proxy 照常按 sid 寻址,**无逻辑改动**(cluster-router.md)。
 
+```text
+cluster router
+  │ E2b-Sandbox-Id + X-Access-Token
+  ▼
+node proxy
+  │ local route table only
+  ├─ e2b 49983/49999 ─► envd UDS
+  └─ user port ───────► floatingip:port
+```
+
 ### 1.1 设计原则
 
 - **转发层与控制面分离**:proxy 只做"路由判定 + 鉴权 + 转发",不持久化、不调度;
@@ -32,7 +42,7 @@
 - 依赖 **sandbox-vswitch** 的 mgmt-extract 把 MMDS VIP 直译到本进程(§8)。
 - 上游是 guest **envd**(经 host-UDS)或沙箱 **floatingip**;envd 协议见 node.md §4.3。
 - 须与 serve 同节点(本地拨 envd-UDS / floatingip)。集群下的 cluster-ctl router 是更上一级
-  入口,经本节点数据端点转发进来(cluster-router.md §5),仍落到本节点 proxy。
+  入口,经本节点数据端点转发进来(cluster-router.md),仍落到本节点 proxy。
 
 ## 2. 命令行:`node-ctl proxy`
 
@@ -190,8 +200,8 @@ external 模式拓扑(数据面字节流不经 serve;**worker 主动注册,serve
   - `mmds_secret`:该沙箱的 MMDS 会话签名密钥(hex),由 `manifest_key + sid` 确定性派生
     (§8),不服务 MMDS 的订阅者忽略即可。
 - **断点续传(opt-in)**:每条 `upsert`/`delete` 带**分片单调版本号 `rev`**;订阅者记最后应用的
-  `rev`,重连 `register` 带 `resume_from=<rev>`——serve 在留存窗口内只重放增量 + `bookmark`,否则退回
-  逐条全量。避免高密度下重连发全量(cluster.md §5.3 把此机制用于集群通道与外部 watch)。
+	  `rev`,重连 `register` 带 `resume_from=<rev>`——serve 在留存窗口内只重放增量 + `bookmark`,否则退回
+	  逐条全量。避免高密度下重连发全量;node-link 集群通道复用同一机制(cluster.md)。
 - 容错:连接断 → 订阅者指数退避重连重注册(0.2s 起、5s 封顶),重连即 `register`(带 `resume_from`)
   + 增量 / 全量重同步;订阅积压 → serve 掐掉该订阅、订阅者重连重同步。Wake 的 resume 由 serve 端
   单飞去重。
@@ -199,7 +209,7 @@ external 模式拓扑(数据面字节流不经 serve;**worker 主动注册,serve
 注:routesync 同一引擎服务两类订阅者——**本机** worker / 观察者(`kind=route` / `route_wake`,订阅者
 拨 serve)与**集群 registry**(`kind=registry`)。集群接入**复用此权威侧**:node 拨 registry 后
 **反向注册**,registry 在该连接以 `kind=registry` 订阅本节点路由 + `build` 事件、并上行下发命令——
-故 node-link 不是另一套协议,而是 routesync 的一个订阅 kind(node.md §10、cluster.md §5)。
+故 node-link 不是另一套协议,而是 routesync 的一个订阅 kind(node.md §10、cluster.md)。
 
 ## 7. 数据面鉴权(X-Access-Token)
 
@@ -207,7 +217,7 @@ external 模式拓扑(数据面字节流不经 serve;**worker 主动注册,serve
   沙箱自 SDK v2.0.0 默认开,SDK 每次数据面调用携带)。create 铸造(派生与落盘见
   node.md §7)→ 回 SDK → 随路由分发;**proxy 逐请求校验**其与该沙箱 token
   一致(常数时间比较)。集群下,token 由 cluster-ctl router 从 Reserve 结果注入再转发,
-  proxy 校验不变(cluster-router.md §7)。
+  proxy 校验不变(cluster-router.md)。
 - `proxy.auth ∈ {off | log | enforce}`,默认 **enforce**(不符回 401);`log` 告警但
   放行;external 模式校验在 worker(策略下推,兜底转发路径上 serve 不校验、由 worker
   校验)。
@@ -277,7 +287,7 @@ HTTP/2 经 `WriteHeader(200)` + 请求 / 响应流对拷。它覆盖每条数据
 - **控制面兜底网关**(external):`httputil.ReverseProxy` 不能隧道 CONNECT,故网关向选中
   的 worker 经其 UDS 发**链式 CONNECT**(带上 sandbox id + access token),收到 200 后
   对接——client → 网关 → worker → 沙箱(无环,沿用 h2mux 式链式隧道)。集群下 cluster-ctl
-  router 的端口转发同样经链式 CONNECT 转发进本节点(cluster-router.md §7)。
+  router 的端口转发同样经链式 CONNECT 转发进本节点(cluster-router.md)。
 
 ## 10. 可靠性
 
@@ -288,7 +298,7 @@ HTTP/2 经 `WriteHeader(200)` + 请求 / 响应流对拷。它覆盖每条数据
   逐条 upsert + bookmark;重同步全程旧路由表仍在服务,无路由空窗(§6)。
 - **resume 单飞**:park / Wake 触发的 resume 由 serve 端单飞去重(internal 直接、
   external 经 routesync `Wake` 上行),并发请求只触发一次恢复(node.md §8)。集群级
-  会话亲和的单飞在 registry 端(cluster.md §7)。
+	  会话亲和的单飞在 registry 端(cluster.md)。
 - **语义化失败**:未知 / 未就绪 sid → 404;鉴权失败 → 401;无数据面(bare / off)→ 501;
   兜底无 worker → 502。
 

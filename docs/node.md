@@ -169,7 +169,7 @@ export E2B_DOMAIN=sandboxes.example.com        # 生产(TLS, §13)
 # dev: E2B_API_URL=http://host:3000  E2B_SANDBOX_URL=http://host:3000
 ```
 
-集群模式下密钥由 registry 经 node-link 租约下发(§10、cluster.md §12),无须手动
+集群模式下密钥由 registry 经 node-link 租约下发(§10、cluster.md),无须手动
 `manifest-key add`。
 
 ### 2.2 `node-ctl serve`
@@ -249,7 +249,7 @@ create/build 白名单(`manifest_keys` 表)管理,是 serve daemon **admin 平�
 客户端(经本机控制 socket,§6)——daemon 是该表唯一写者,CLI 不开 DB、不读 config,
 只需 `--socket`(或 `NODE_CTL_SOCKET` env,默认 `/run/sandbox/node-ctl.socket`)。
 key 取自位置参数或 `MANIFEST_KEY` env;输出只含指纹,绝不回显 key。集群下该表另由
-registry 经 node-link 以租约项写入(§10、cluster.md §12),与手动项共存。
+registry 经 node-link 以租约项写入(§10、cluster.md),与手动项共存。
 
 ```
 node-ctl manifest-key add    [--label L] [--ttl 24h]
@@ -354,9 +354,9 @@ node-ctl 同目录 → PATH"自动发现。
 | `mmds.enabled` | `false` | envd 鉴权姿态开关(§9.2、node-proxy.md §8):false = `-isnotfc` + proxy 单闸门;true = FC 模式 + MMDS re-key |
 | `mmds.listen` | `127.0.0.1:19254` | MMDS 监听地址(vswitch `--mgmt-service` 的转换目标) |
 | `cluster.node_link.endpoint` | 空 | registry 的 node_link 地址(§10);空 = 独立模式,不接入集群 |
-| `cluster.node_link.tls` | 空 | node_link mTLS 证书 / key / CA(`{cert,key,ca}`;生产必配,§10 / cluster.md §5.4) |
-| `cluster.node_id` | (接入集群必填) | 本节点唯一标识(node-link 注册,cluster.md §5) |
-| `cluster.labels` | 空 | 节点标签 `{zone,pool,slot,node}`(scaler nodeSelectors 匹配,cluster-scaler.md §4.3) |
+| `cluster.node_link.tls` | 空 | node_link mTLS 证书 / key / CA(`{cert,key,ca}`;生产必配,§10 / cluster.md) |
+| `cluster.node_id` | (接入集群必填) | 本节点唯一标识(node-link 注册,cluster.md) |
+| `cluster.labels` | 空 | 节点标签 `{zone,pool,slot,node}`(scaler nodeSelectors 匹配,cluster-scaler.md) |
 | `cluster.data_endpoint` | 空 | 本节点数据面端点(供 router 转发);缺省由 `api.domain` + `proxy`/`api` 监听推导 |
 | `resource_listen` | 缺省(不内置) | 内置资源控制器整块(调参内联,无独立文件):`enabled` 开关、`socket`(控制器 UDS,**唯一权威**;空 = `pkg/resource` 默认,与 sandbox-ctl 一致),其余 `state_path`/`audit_path`/`cgroup_scan_paths`/`resources`/`watermarks`/`rate_limits`/`admission`/`dampening` 均有默认(语义见 node-resource.md §3.2);整块省略或 `enabled: false` = 不内置(沙箱用静态 cgroup) |
 
@@ -464,7 +464,7 @@ JSON 对象)注入,零 SDK/API 改动。命名空间是 sandbox-runtime `config.
 | `launch` | `launch.{exec,args,env,workdir,restart,user,stop_signal,plugin}`——**仅 bare**;e2b profile 拒(envd 占用 launch) |
 | `init` / `mounts` / `files` | 直透 `init[]` / `mounts[]` / `files[]` |
 | `metadata` | `SANDBOX_CONFIG.metadata` 透传(如 `e2b.start_cmd`) |
-| `cluster` | `{group, route_key}`——集群调度 / 路由身份,经 node-link 上报 registry(§10、cluster.md §5.1);独立模式无 node-link 时仅作记录 |
+| `cluster` | `{group, route_key}`——集群调度 / 路由身份,经 node-link 上报 registry(§10、cluster.md);独立模式无 node-link 时仅作记录 |
 
 - **渲染**:serve 建 `config.SandboxConfig` 基座(boot/tapfd/control/capacity/已解析
   网络)再叠租户命名空间,yaml 序列化经 config-socket 交 sandbox-ctl。深校验(ValidateCold)
@@ -701,7 +701,7 @@ id 二次注册自动反注册(并断链)前者。鉴权:配 `paths.plugin_pidfi
   - **单飞**:同一 sid 的并发数据面请求经 per-sid single-flight 合并为一次 resume,
     杜绝重复 IP 分配 / attach / StartUnit 竞态。internal 模式 proxy 在请求内同步触发;
     external 模式经 routesync `Wake` 上行,serve 端同样单飞(§9.2)。集群级会话亲和的
-    单飞在 registry 端按 (group, route-key) 进行(cluster.md §7)。
+    单飞在 registry 端按 (group, route-key) 进行(cluster.md)。
   - resume 同时是 `POST /sandboxes/{id}/connect` 的实现;带 `timeout` 则顺带续期。
 - **每实例配置**(create/构建经 metadata + `X-Kuasar-Sandbox-*` 头,命名空间化,详见
   §4.6):配置随沙箱持久化(`metadata_json`),resume 时重新解析、全生命周期一致;无白名单
@@ -772,7 +772,7 @@ internal 直接在进程内挂转发层;external 下 serve 不绑数据口,改�
 函数;部署拓扑、SO_REUSEPORT 与确定性 MMDS 密钥(多 worker 对等)等细节见 node-proxy.md §5,
 转发判定与即时刷流见 node-proxy.md §4。集群下,cluster-ctl router 把数据面转发进本节点的
 数据端点(internal 的 `api.listen`/`data_listen` 或 external worker 的数据口),节点侧
-按 `E2b-Sandbox-Id` 寻址照常处理(cluster-router.md §5),无须区分来源。
+按 `E2b-Sandbox-Id` 寻址照常处理(cluster-router.md),无须区分来源。
 
 ### 9.2 路由权威与广播
 
@@ -799,52 +799,104 @@ sid 的 FNV 哈希在**活跃注册的 worker 集**上挑一个,经其 `--socket
 亲和),由 worker 照常处理(含鉴权);`CONNECT` 经链式 CONNECT relay 转发,无 worker
 注册时回 502。链式隧道与转发细节见 node-proxy.md §9。
 
-## 10. 集群接入(node-link:复用 routesync)
+## 10. 集群接入(node-link)
 
-配 `cluster.node_link.endpoint`(§3)时,`node-ctl serve` 拨 registry 把本节点接入集群,交由 cluster-ctl
-(registry / router / scaler)编排。**节点接入复用其既有 routesync 引擎**(node-proxy.md §6):节点
-拨 registry、注册身份、**反向监听**,registry 在该连接上以 `register{subscribe:{kind:registry}}` 作
-**路由订阅者**,此后节点作**路由 / 构建权威**下行流式上报、registry 上行下发命令。线格式与枢纽
-语义由 **cluster.md §5** 权威定义;本节只讲节点侧角色。空 `cluster.node_link.endpoint` = 独立模式,本节不生效。
+配 `cluster.node_link.endpoint`(§3)时,`node-ctl serve` 拨 registry 把本节点接入集群,交由
+`cluster-ctl registry/router/scaler` 编排。node-link 复用 routesync 的帧化 JSON over h2c 引擎
+(node-proxy.md §6),但角色相反:node 是本节点路由 / 构建权威,registry 是订阅者和命令下发方。
 
-集群下两条到节点的路径:**node-link**(本节,承载注册 / 心跳 / 路由+构建事件 / 命令 / 密钥),与
-cluster router **转发到本节点 e2b 控制面 / 数据面**的请求——pause/kill/timeout、build trigger/status/
-files 转发本机 e2b 控制面(§4),数据面业务流量经 router 注入 `E2b-Sandbox-Id` + `X-Access-Token` 转发
-本机 proxy(node-proxy.md)。后者复用节点既有 e2b API,**节点侧零改动**。
+本节只讲 node 侧行为。registry 的 owner 选择、redirect/relay、shardkv 复制和 membership 变更由
+[cluster.md](cluster.md) 定义。
 
-- **接入即注册**:拨 registry 的 `node_link.listen`(全双工 h2c,生产 mTLS),首帧发
-  `register{node_id, labels, capacity, build_capacity, data_endpoint, runtime_digest}`(取自 `cluster.*`
-  配置与本机能力;`build_capacity{cpu,mem,storage}` 源自 builder slice + scratch 预算,§12)。registry
-  回 ack 后节点反向监听(cluster.md §5.1)。
-- **心跳上报**:周期发 `heartbeat{zone, allocated, pool, build_alloc, counts, draining}`——沙箱水位取自
-  资源控制器(node-resource.md),`build_alloc` 为本机在跑 / 预留构建占用,`draining` 由节点侧 drain
-  (§2.5 即 node-resource.md `resource drain`)置位;喂集群 P2C / 放置排除(cluster-scaler.md §4)。
-- **路由 / 构建事件上报**(节点为权威,下行):沙箱状态变化发 `sandbox{sid, group, route_key, state,
-  snap_loc, access_token, migration_token?, template_id}`;构建状态变化发 `build{build_id, group, state, template_id?,
-  reason?}`;消失发 `delete{sid|build_id}`;首 / 重连末尾 `bookmark`。全量 Range 结束的 bookmark 带
-  `full_sync=true`,registry 据此清理本 node 记录中本轮未出现的 sandbox refs;增量 replay 的 bookmark
-  不触发缺失清理。**group / route_key 从沙箱 metadata 的 `kuasar-sandbox.cluster` 命名空间解析**(§4.6)。
-- **命令受理**(registry 上行下发):serve 以**既有 e2b 生命周期原语**(§8 / §8.1)执行,以 sid /
-  build_id 幂等,受理即回 `cmd_ack`,终态经上述事件上报(cluster.md §5.2):
+```text
+node-ctl serve
+  │ dial registry node_link endpoint
+  │ register node profile
+  │ stream heartbeat + sandbox/build events
+  │ receive create/connect/delete/key/build commands
+  ▼
+registry node_link owner or relay holder
+```
+
+集群下两条到节点的路径:
+
+- **node-link**:注册、心跳、sandbox/build 事件、命令、manifest key 租约。
+- **router 转发到本节点 e2b 控制面 / 数据面**:pause/kill/timeout、build status/files 转发本机 e2b
+  控制面;数据面经 router 注入 `E2b-Sandbox-Id` + `X-Access-Token` 后进入本机 proxy(node-proxy.md)。
+
+### 10.1 注册与 redirect
+
+节点拨 registry 的 node_link endpoint 后,首帧发送:
+
+```text
+register{
+  node_id,
+  labels,
+  capacity,
+  build_capacity,
+  data_endpoint,
+  runtime_digest,
+  accept_redirect
+}
+```
+
+若接入成员不是该 node 的 node_link owner,且节点支持 redirect,registry 可返回 owner `node_advertise`
+列表。node 会按返回顺序重连 owner;失败时尝试下一个目标。若没有 redirect 目标或未启用 redirect,接入成员
+可以 relay 到首个可用 owner。
+
+### 10.2 心跳与低频目录
+
+节点周期发送:
+
+```text
+heartbeat{zone, allocated, pool, build_alloc, counts, draining}
+```
+
+沙箱水位取自资源控制器(node-resource.md),`build_alloc` 为本机在跑 / 预留构建占用,`draining` 由节点侧
+资源 drain 或维护策略置位。普通 heartbeat 用于 node_link liveness 和本地水位;只有 draining 变化、
+首次上报或低频 liveness refresh 才驱动 registry 更新 node_list。
+
+### 10.3 sandbox/build 事件
+
+节点作为权威上报本机执行态:
+
+```text
+sandbox{sid, group, route_key, state, snap_loc, access_token, template_id}
+build{build_id, group, state, template_id?, reason?}
+delete{sid|build_id}
+bookmark{full_sync}
+```
+
+`group / route_key` 从沙箱 metadata 的 `kuasar-sandbox.cluster` 命名空间解析(§4.6)。全量 Range 结束的
+bookmark 带 `full_sync=true`,registry 可用本轮未出现的精确 `(group,route_key,sandbox_id)` 做缺失清理;
+增量 replay 的 bookmark 只推进 resume token,不触发缺失清理。
+
+### 10.4 命令受理
+
+registry 上行下发命令。serve 复用既有 e2b 生命周期原语(§8 / §8.1)执行,以 sid / build_id 幂等,
+受理即回 `cmd_ack`,终态经 sandbox/build 事件上报:
 
   | 命令 | 节点动作 |
   |---|---|
   | `create{cmd_id, sid, group, route_key, template_ref, key_fp, config}` | 冷启 `template_ref` + 合并 `config`(§8;snp 模板 = 快照恢复快启);`key_fp` 选本机租约 manifest_key;group/route_key 注入沙箱 metadata |
   | `connect{cmd_id, sid}` | 恢复本机 PAUSED 沙箱(§8 auto-resume) |
   | `delete{cmd_id, sid|build_id}` | 销毁沙箱 / 构建(§5 kill) |
-  | `key_put` / `key_drop{fingerprint, manifest_key?, expires_unix}` | `key_put` 写 / 重发续租 `manifest_keys` 租约项;`key_drop` best-effort 清理,正确性依赖 TTL 淘汰(§7);**registry 的密钥分发**(cluster.md §12) |
+  | `key_put` / `key_drop{fingerprint, manifest_key?, expires_unix}` | `key_put` 写 / 重发续租 `manifest_keys` 租约项;`key_drop` best-effort 清理,正确性依赖 TTL 淘汰(§7);registry 的密钥分发见 cluster.md |
   | `build_register{build_id, template_id, group, resources, image_repo, registry_auth, key_fp, config}` | 预配 registry 分配的构建(§12;按指纹解析 key、建 build 记录、瞬态用镜像凭据);构建态经 `build_event` 上报 |
 
-  无 `drain` 命令——节点排空 / 维护由**节点侧**发起(node-resource.md §2.5 资源 drain 或本机维护策略),
-  集群侧仅停止向其分配(cluster-scaler.md §4),不由 registry 命令(cluster.md §7.3)。
-- **断线增量重连**:断连指数退避重连重注册,带 `resume_from=<rev>` 请增量重放(registry 留存窗口内
-  只补增量,否则逐条全量 + `bookmark`,cluster.md §5.3)。registry 重启亦然。
-- **安全**:node-link 生产走 mTLS(`cluster.node_link.tls`);下行 `manifest_key` 仅入加密存储(§7),上行
-  `access_token` 属沙箱级敏感,在 mTLS 内传输(cluster.md §5.4)。
-- **与本机 plugin 平面统一**:接入集群即"节点作路由权威、registry 作订阅者"——与本机 config-socket
-  plugin 平面(proxy worker / 观察者订阅本节点路由,§6 / node-proxy.md §6)**同一 routesync 引擎、
-  同一线格式**,仅订阅者 `kind` 不同(`route` / `route_wake` / `registry`)。router **不**订阅节点
-  plugin 平面,机群路由经 registry 聚合。
+无 `drain` 命令。节点排空 / 维护由节点侧发起(node-resource.md §2.5 资源 drain 或本机维护策略),
+集群侧只停止向其分配。
+
+### 10.5 断线与安全
+
+断线后节点指数退避重连并重注册,带 `resume_from=<rev>` 请求增量重放。registry/node 留存窗口内只补增量,
+否则逐条全量 + bookmark。registry 重启亦然。
+
+node-link 生产走 mTLS(`cluster.node_link.tls`)。下行 `manifest_key` 只进入加密存储和运行期内存;上行
+`access_token` 属沙箱级敏感,在 mTLS 内传输。
+
+接入集群与本机 plugin 平面使用同一 routesync 引擎和线格式,仅订阅者 kind 不同。router 不订阅节点
+plugin 平面,机群路由经 registry 聚合。
 
 ## 11. guest profile:envd 嵌入
 
@@ -1032,7 +1084,7 @@ external worker 的 `data_listen`,proxy.yaml),证书同一张。dev:`E2B_API_URL
 |---|---|---|
 | `sandbox-ctl`(runtime) | 经 run-sandbox(单元)`execve`:`run --config <sid>.yaml --manifest-config … --run-root … --cgroup-adopt [--restore] [--connect]`;run-builder 以直接子进程 `run` 阶段沙箱,经 `exec --env/--stdin-from/--stdout-to` 做平台接力(flatten-ctl 调用、配置注入、工件流、探针),收尾 `snapshot --output` / `upload-snapshot` / `info --json`;serve 调 `snapshot --upload`(pause) | 非密配置文件 + 密钥 env;资源准入在其内部;e2b 语义命令不走它(走 envd,§12) |
 | 资源控制器(node-resource.md) | serve 内置(`resource_listen`,调参内联);沙箱经 `sandbox.resources.control_socket` 拨号(`pkg/resource` 协议) | 单元 cgroup 即沙箱 cgroup,控制器原地仲裁;不配 control_socket = 静态 cgroup(`--cgroup-adopt`),配了才进 SANDBOX_CONFIG `resources.control.controller` |
-| registry(cluster-ctl) | node-link:serve 拨 registry、反向注册为路由权威,上报 register/heartbeat/sandbox/build_event 事件、受理 create/connect/delete/key_put/key_drop/build_register 命令(§10、cluster.md §5) | mTLS;命令复用 §8 / §8.1 生命周期原语;空 `cluster.node_link.endpoint` = 独立模式不接入 |
+| registry(cluster-ctl) | node-link:serve 拨 registry、反向注册为路由权威,上报 register/heartbeat/sandbox/build_event 事件、受理 create/connect/delete/key_put/key_drop/build_register 命令(§10、cluster.md) | mTLS;命令复用 §8 / §8.1 生命周期原语;空 `cluster.node_link.endpoint` = 独立模式不接入 |
 | `vswitch-ctl`(vswitch) | CLI:`attach <switch> --inner-ip [--transit-*]` / `detach --port`;`open-port` 作 SANDBOX_CONFIG `network.tapfd.exec`(sandbox-ctl 执行,经 `TAPFD_SOCKET` 收 tap fd) | 交换机预先起好(`vswitch-ctl start`,内核态数据面);port 对外、slot 内部;一个构建复用一个槽 |
 | `flatten-ctl`(builder) | **guest 内**(builder runtime 自带,经 sandbox-ctl exec 驱动):`export --output -`(import 拉取 / steps 导出)、`mountpoint`;宿主侧:`info --json`(读镜像运行时配置,本地工件或 manifest://) | 租户 `FLATTEN_*` 仅经 exec env 入 guest;tarstream 镜像工件经 exec stdio 接力 |
 | `manifest-ctl`(accelerator) | `store <image.img>`(img-only 构建的收尾上传) | manifest key 经 stdout 回收;`MANIFEST_KEY` 经 env |
@@ -1084,7 +1136,7 @@ serve 重启后以 `ListUnitsByPatterns("sandbox-runner@*.service")` 为存活�
 | proxy worker 崩溃(external) | 该 worker 上的连接断;SO_REUSEPORT 下其余 worker 继续接新连接 | systemd 重启 → worker 重新注册重新同步,无状态恢复 |
 | runner 单元/CH 崩溃 | 该沙箱死(`Restart=no`,有状态不重试) | 对账标 dead;客户重新 create(或从 paused 快照 resume) |
 | routesync 断流 | worker 路由表停更 | 订阅者指数退避重连重注册,重连即重新同步(逐条 upsert + bookmark,node-proxy.md §6) |
-| node-link 断流(集群) | registry 暂失本节点视图 | 节点指数退避重连重注册重报沙箱集(§10、cluster.md §5.3);本节点沙箱不受影响 |
+| node-link 断流(集群) | registry 暂失本节点视图 | 节点指数退避重连重注册重报沙箱集(§10、cluster.md);本节点沙箱不受影响 |
 | sqlite 损坏 | 控制面不可用 | 文件级备份/重建;沙箱单元仍可被 ListUnits 发现并由运维处置 |
 
 ## 16. 测试

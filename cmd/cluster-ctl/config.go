@@ -75,7 +75,7 @@ func configCmd(args []string) error {
 	return err
 }
 
-const registryConfigSkeleton = `# cluster-ctl registry config — cluster-ctl registry --config <this> (cluster.md §2).
+const registryConfigSkeleton = `# cluster-ctl registry config — cluster-ctl registry --config <this> (docs/cluster.md).
 member:                              # unified HTTP control plane
   id: registry-1
   listen: ":7700"
@@ -109,7 +109,7 @@ scale_link:
   place_timeout: 2s
 `
 
-const routerConfigSkeleton = `# cluster-ctl router config — cluster-ctl router --config <this> (cluster-router.md §3).
+const routerConfigSkeleton = `# cluster-ctl router config — cluster-ctl router --config <this> (docs/cluster-router.md).
 # e2b-compatible unified ingress. Required: domain.
 domain: sandboxes.example.com
 registry:                            # bootstrap endpoint for registry membership
@@ -128,9 +128,9 @@ cache:
 # metrics_listen: ":9910"            # optional Prometheus text endpoint
 `
 
-const scalerConfigSkeleton = `# cluster-ctl scaler config — cluster-ctl scaler --config <this> (cluster-scaler.md §3).
-# Standalone placement scheduler; starts from registry membership and connects
-# every active registry member.
+const scalerConfigSkeleton = `# cluster-ctl scaler config — cluster-ctl scaler --config <this> (docs/cluster-scaler.md).
+# Standalone placement scheduler; starts from registry membership, joins the
+# scaler memberlist label, consumes node_list, and provides placement.
 scaler:
   id: scaler-1
   listen: ":7800"
@@ -151,7 +151,7 @@ placement:
   import_source_owner_count: 3       # candidates that may race for each source lease
   import_source_lease_ttl: 15s       # registry-side source lease TTL
   selector_patch_refresh_interval: 1m # refresh unchanged selector patches before node key TTL
-  # shuffle_sharding:                # empty = static nodeSelectors only (cluster-scaler.md §4.4)
+  # shuffle_sharding:                # empty = static nodeSelectors only
   #   - selector: { pool: gpu }
   #     shard_by: zone
   #     n: 2

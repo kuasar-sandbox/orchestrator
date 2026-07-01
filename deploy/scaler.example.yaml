@@ -1,28 +1,34 @@
 # cluster-ctl scaler config — cluster-ctl scaler --config /etc/cluster-ctl/scaler.yaml.
-# Standalone placement scheduler (cluster-scaler.md §3): it starts from registry
-# membership, connects every active registry member, and provides placement for
-# registry callers.
+# Standalone placement scheduler (docs/cluster-scaler.md): it starts from registry
+# membership, joins the scaler memberlist label, consumes node_list, and provides
+# placement for registry callers.
 # Validate with `cluster-ctl config scaler --config scaler.yaml`.
 
-member:
+scaler:
   id: scaler-1
   listen: ":7800"
   advertise: "https://scaler-1.example:7800"
+  memberlist_label: scaler.default
   # tls: { cert: ..., key: ..., ca: ... }   # server mTLS for scaler Place API
 
 registry:
   bootstrap: registry-1.example:7700
   # tls: { cert: ..., key: ..., ca: ... }   # client mTLS to registry control plane
 
-# Sandbox-group records are imported into scaler/provider side, for example:
-#   cluster-ctl scaler import --config scaler.yaml -i groups.jsonl
+import_groups:
+  - source_id: example-file-source
+    source_type: file
+    path: /var/lib/kuasar/groups
 
 placement:
   candidates: 2                       # P2C sample size
   zone_admit_max: yellow              # exclude nodes hotter than this (green|yellow|red)
   node_dead_after: 30s                # exclude nodes silent longer than this
+  import_source_owner_count: 3        # candidates that may race for each source lease
+  import_source_lease_ttl: 15s        # registry-side source lease TTL
+  selector_patch_refresh_interval: 1m # refresh unchanged selector patches before node key TTL
   # shuffle_sharding: pin matching groups to n deterministic shards of the node set,
-  # bucketed by a node label (cluster-scaler.md §4.4). Empty = static nodeSelectors only.
+  # bucketed by a node label. Empty = static nodeSelectors only.
   # shuffle_sharding:
   #   - selector: { pool: gpu }
   #     shard_by: zone

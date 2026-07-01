@@ -27,9 +27,8 @@ import (
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/routesync"
 )
 
-// runRegistry starts the registry role: the state authority + node_link /
-// route_link / scale_link hub (cluster.md §4.1). node_link serves nodes; route_link
-// serves routers/admin tools; scale_link serves scalers.
+// runRegistry starts the registry role: shardkv state cluster plus node_link,
+// route_link, node_list, and scale_link endpoints.
 func runRegistry(args []string, log *slog.Logger) error {
 	if len(args) > 0 {
 		switch args[0] {
@@ -85,8 +84,8 @@ func runRegistry(args []string, log *slog.Logger) error {
 
 	go runRegistryReload(ctx, *cfgPath, cfgState, reg, registryMembers, healthProvider, log)
 
-	// Dead-node sweep (cluster.md §11): reset the sandboxes of nodes whose
-	// node-link dropped and whose last heartbeat predates node_dead_after.
+	// Dead-node sweep: reset the sandboxes of nodes whose node-link dropped and
+	// whose last heartbeat predates node_dead_after.
 	go reg.RunReaper(ctx, cfg.NodeLink.NodeDeadDur())
 	go reg.RunCompactor(ctx, 5*time.Minute)
 

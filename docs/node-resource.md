@@ -82,7 +82,7 @@ admission worker、memory allocator、active reclaimer、idle sweeper 与 state
 persister(§7)。`resource_listen` 的子字段(`socket` / `state_path` /
 `cgroup_scan_paths` / `resources` / `watermarks` / …)是内联在 serve.yaml 里的控制器调参(§3)。
 集群下,控制器上报的节点水位(zone / allocated / pool)经 serve 的 node-link 心跳喂
-集群 P2C 放置(node.md §10、cluster.md §5 / cluster-scaler.md §4)。
+集群 P2C 放置(node.md §10、cluster.md / cluster-scaler.md)。
 
 ### 2.3 `node-ctl resource status`
 
@@ -109,7 +109,7 @@ node-ctl resource drain [--socket /run/sandbox-resource.sock] [--disable]
 
 通知控制器不再接受新沙箱准入;`--disable` 取消排空。运维命令——典型用于
 节点维护前清空沙箱。**集群下节点排空仍是节点侧动作**(本命令 / 本机深空闲自提升上送远程快照),
-集群侧仅停止向其分配——**不下发 drain 命令**(cluster.md §7.3、node.md §10)。
+集群侧仅停止向其分配——**不下发 drain 命令**(cluster.md、node.md §10)。
 
 ### 2.6 `node-ctl resource grant`
 
