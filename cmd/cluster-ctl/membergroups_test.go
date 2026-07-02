@@ -49,8 +49,8 @@ func TestScaleLinkRegisterSeedsScalerObserverMemberlist(t *testing.T) {
 		Label: "scaler.default", Name: "scaler-1", Hub: scalerHub, FastTimers: true,
 		Meta: membergroup.Meta{
 			Role: membergroup.RoleScaler, ID: "scaler-1",
-			APIAdvertise: scalerSrv.URL, MemberlistAdvertise: scalerSrv.URL,
-			Ready: true, ReadyLabel: "registry.1.test",
+			Advertise: scalerSrv.URL,
+			Ready:     true, ReadyLabel: "registry.1.test",
 		},
 	})
 	if err != nil {

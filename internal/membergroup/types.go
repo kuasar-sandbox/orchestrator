@@ -19,12 +19,11 @@ const (
 
 // Meta is the small memberlist metadata payload used by registry/scaler roles.
 type Meta struct {
-	Role                string `json:"role"`
-	ID                  string `json:"id"`
-	APIAdvertise        string `json:"api_advertise,omitempty"`
-	MemberlistAdvertise string `json:"memberlist_advertise,omitempty"`
-	Ready               bool   `json:"ready,omitempty"`
-	ReadyLabel          string `json:"ready_label,omitempty"`
+	Role       string `json:"role"`
+	ID         string `json:"id"`
+	Advertise  string `json:"advertise,omitempty"`
+	Ready      bool   `json:"ready,omitempty"`
+	ReadyLabel string `json:"ready_label,omitempty"`
 }
 
 func encodeMeta(meta Meta, limit int) []byte {

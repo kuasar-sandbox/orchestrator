@@ -75,8 +75,7 @@ func newHarness(t *testing.T) *harness {
 	observer, err := membergroup.New(membergroup.Options{
 		Label: "scaler.default", Name: "observer.registry", Hub: regHub, FastTimers: true,
 		Meta: membergroup.Meta{
-			Role: membergroup.RoleObserver, ID: "observer.registry",
-			APIAdvertise: links.URL, MemberlistAdvertise: links.URL,
+			Role: membergroup.RoleObserver, ID: "observer.registry", Advertise: links.URL,
 		},
 	})
 	if err != nil {
@@ -91,7 +90,7 @@ func newHarness(t *testing.T) *harness {
 		metas := observer.ReadyScalers(label)
 		out := make([]registry.ScalerPeer, 0, len(metas))
 		for _, meta := range metas {
-			out = append(out, registry.ScalerPeer{ID: meta.ID, Advertise: meta.APIAdvertise, ReadyLabel: meta.ReadyLabel})
+			out = append(out, registry.ScalerPeer{ID: meta.ID, Advertise: meta.Advertise, ReadyLabel: meta.ReadyLabel})
 		}
 		return out
 	})
@@ -115,8 +114,7 @@ func newHarness(t *testing.T) *harness {
 	scalerGroup, err := membergroup.New(membergroup.Options{
 		Label: "scaler.default", Name: "s1", Hub: scalerHub, FastTimers: true,
 		Meta: membergroup.Meta{
-			Role: membergroup.RoleScaler, ID: "s1",
-			APIAdvertise: scalerSrv.URL, MemberlistAdvertise: scalerSrv.URL,
+			Role: membergroup.RoleScaler, ID: "s1", Advertise: scalerSrv.URL,
 			Ready: true, ReadyLabel: "registry.1.test",
 		},
 	})

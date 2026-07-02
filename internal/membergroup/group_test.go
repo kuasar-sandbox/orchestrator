@@ -15,7 +15,7 @@ func TestHTTPMemberlistJoinAndMetaUpdate(t *testing.T) {
 	gA, err := New(Options{
 		Label: "registry.1.test", Name: "a", Hub: hubA, FastTimers: true,
 		Seeds: map[string]string{"b": srvB.URL},
-		Meta:  Meta{Role: RoleRegistry, ID: "a", APIAdvertise: srvA.URL, MemberlistAdvertise: srvA.URL},
+		Meta:  Meta{Role: RoleRegistry, ID: "a", Advertise: srvA.URL},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -24,7 +24,7 @@ func TestHTTPMemberlistJoinAndMetaUpdate(t *testing.T) {
 	gB, err := New(Options{
 		Label: "registry.1.test", Name: "b", Hub: hubB, FastTimers: true,
 		Seeds: map[string]string{"a": srvA.URL},
-		Meta:  Meta{Role: RoleRegistry, ID: "b", APIAdvertise: srvB.URL, MemberlistAdvertise: srvB.URL},
+		Meta:  Meta{Role: RoleRegistry, ID: "b", Advertise: srvB.URL},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -36,14 +36,14 @@ func TestHTTPMemberlistJoinAndMetaUpdate(t *testing.T) {
 	waitFor(t, func() bool { return gA.Alive("b") && gB.Alive("a") })
 
 	if err := gB.UpdateMeta(Meta{
-		Role: RoleScaler, ID: "b", APIAdvertise: srvB.URL, MemberlistAdvertise: srvB.URL,
+		Role: RoleScaler, ID: "b", Advertise: srvB.URL,
 		Ready: true, ReadyLabel: "registry.2.test",
 	}); err != nil {
 		t.Fatal(err)
 	}
 	waitFor(t, func() bool {
 		scalers := gA.ReadyScalers("registry.2.test")
-		return len(scalers) == 1 && scalers[0].ID == "b" && scalers[0].APIAdvertise == srvB.URL
+		return len(scalers) == 1 && scalers[0].ID == "b" && scalers[0].Advertise == srvB.URL
 	})
 }
 
@@ -53,7 +53,7 @@ func TestHTTPMemberlistLabelsAreIsolated(t *testing.T) {
 	gA, err := New(Options{
 		Label: "registry.1.test", Name: "a", Hub: hubA, FastTimers: true,
 		Seeds: map[string]string{"b": srvB.URL},
-		Meta:  Meta{Role: RoleRegistry, ID: "a", APIAdvertise: srvA.URL, MemberlistAdvertise: srvA.URL},
+		Meta:  Meta{Role: RoleRegistry, ID: "a", Advertise: srvA.URL},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -62,7 +62,7 @@ func TestHTTPMemberlistLabelsAreIsolated(t *testing.T) {
 	gB, err := New(Options{
 		Label: "registry.2.test", Name: "b", Hub: hubB, FastTimers: true,
 		Seeds: map[string]string{"a": srvA.URL},
-		Meta:  Meta{Role: RoleRegistry, ID: "b", APIAdvertise: srvB.URL, MemberlistAdvertise: srvB.URL},
+		Meta:  Meta{Role: RoleRegistry, ID: "b", Advertise: srvB.URL},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -83,7 +83,7 @@ func TestHTTPMemberlistJoinOverTLS(t *testing.T) {
 	gA, err := New(Options{
 		Label: "registry.1.test", Name: "a", Hub: hubA, FastTimers: true, TLSConfig: tlsCfg,
 		Seeds: map[string]string{"b": srvB.URL},
-		Meta:  Meta{Role: RoleRegistry, ID: "a", APIAdvertise: srvA.URL, MemberlistAdvertise: srvA.URL},
+		Meta:  Meta{Role: RoleRegistry, ID: "a", Advertise: srvA.URL},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -92,7 +92,7 @@ func TestHTTPMemberlistJoinOverTLS(t *testing.T) {
 	gB, err := New(Options{
 		Label: "registry.1.test", Name: "b", Hub: hubB, FastTimers: true, TLSConfig: tlsCfg,
 		Seeds: map[string]string{"a": srvA.URL},
-		Meta:  Meta{Role: RoleRegistry, ID: "b", APIAdvertise: srvB.URL, MemberlistAdvertise: srvB.URL},
+		Meta:  Meta{Role: RoleRegistry, ID: "b", Advertise: srvB.URL},
 	})
 	if err != nil {
 		t.Fatal(err)

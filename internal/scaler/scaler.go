@@ -25,7 +25,7 @@ type placeParams struct {
 	targetRuntimeDigest string // when set, require node.RuntimeDigest == it (runtime match, §4.2)
 }
 
-// placeSandbox runs the sandbox placement algorithm (cluster-scaler.md §4.2):
+// placeSandbox runs the sandbox placement algorithm (cluster-scaler.md):
 // matchSelectors ∧ ¬draining ∧ alive ∧ zone≤max ∧ runtime-match ∧ shuffle
 // slot, then P2C by water level. (Build placement is resource-aware — placeBuild.)
 func placeSandbox(p placeParams) (string, error) {
@@ -47,7 +47,7 @@ func placeSandbox(p placeParams) (string, error) {
 	return p2c(eligible, p.candidates, sandboxLoad).NodeID, nil
 }
 
-// placeBuild runs resource-aware build placement (cluster-scaler.md §4.5): among
+// placeBuild runs resource-aware build placement (cluster-scaler.md): among
 // matching/alive/non-draining nodes with build headroom (build_alloc <
 // build_capacity), P2C by build utilization. The per-build requested-resources
 // check + RESERVED occupancy live in the registry's BuildStore commit (P4); here
@@ -100,7 +100,7 @@ func eligibleNode(n *registry.NodeRecord, p placeParams, maxZone int) bool {
 		return false
 	}
 	if p.deadAfter > 0 && n.LastHeartbeatUnix > 0 && n.LastHeartbeatUnix < p.now-p.deadAfter {
-		return false // stale: disconnected but not yet swept (cluster-scaler.md §4.2 "node alive")
+		return false // stale: disconnected but not yet swept (cluster-scaler.md "node alive")
 	}
 	if p.zoneAdmitMax != "" && zoneRank(n.Zone) > maxZone {
 		return false // hotter than admit (red/critical excluded)
@@ -126,7 +126,7 @@ func zoneRank(z string) int {
 	}
 }
 
-// sandboxLoad is a node's sandbox load for ranking (cluster-scaler.md §4.2):
+// sandboxLoad is a node's sandbox load for ranking (cluster-scaler.md):
 // preferred = allocated/pool water level; fallback = sandbox count / capacity
 // headroom; last resort = raw count.
 func sandboxLoad(n *registry.NodeRecord) float64 {
@@ -140,7 +140,7 @@ func sandboxLoad(n *registry.NodeRecord) float64 {
 }
 
 // shuffleSlots returns the deterministic set of shard_by label values this group
-// is pinned to (cluster-scaler.md §4.4), or (nil,"") when no shuffle rule
+// is pinned to (cluster-scaler.md), or (nil,"") when no shuffle rule
 // applies. It buckets the given nodes by each rule's shard_by label and uses
 // maglev.LocateN to pick the group's n slots from that set.
 func shuffleSlots(group string, nodes []*registry.NodeRecord, rules []clustercfg.ShuffleRule) (map[string]bool, string) {
@@ -181,7 +181,7 @@ func shuffleSlots(group string, nodes []*registry.NodeRecord, rules []clustercfg
 }
 
 // effectiveSelectors narrows a group's static nodeSelectors to its shuffle slots
-// (cluster-scaler.md §4.4): the cross-product of the static selectors with
+// (cluster-scaler.md): the cross-product of the static selectors with
 // {shard_by ∈ pinned slots}. Returns (sel, true) when a shuffle rule applies, so
 // the registry's key distribution (§7.6) predistributes only to the pinned nodes;
 // (nil, false) when no shuffle rule narrows (key dist uses the static selectors).

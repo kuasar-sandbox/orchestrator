@@ -82,8 +82,7 @@ func runScaler(args []string, log *slog.Logger) error {
 		Label: cfg.Scaler.MemberlistLabel, Name: cfg.Scaler.ID, Hub: memberHub, Log: log,
 		TLSConfig: memberlistTLS,
 		Meta: membergroup.Meta{
-			Role: membergroup.RoleScaler, ID: cfg.Scaler.ID,
-			APIAdvertise: cfg.Scaler.Advertise, MemberlistAdvertise: cfg.Scaler.Advertise,
+			Role: membergroup.RoleScaler, ID: cfg.Scaler.ID, Advertise: cfg.Scaler.Advertise,
 		},
 	})
 	if err != nil {
@@ -151,8 +150,7 @@ func runScalerMemberMeta(ctx context.Context, group *membergroup.Group, svc *sca
 			ready = svc.ReadyForLabel(label)
 		}
 		if err := group.UpdateMeta(membergroup.Meta{
-			Role: membergroup.RoleScaler, ID: group.Name(),
-			APIAdvertise: advertise, MemberlistAdvertise: advertise,
+			Role: membergroup.RoleScaler, ID: group.Name(), Advertise: advertise,
 			Ready: ready, ReadyLabel: label,
 		}); err != nil {
 			log.Debug("scaler: memberlist meta update", "err", err)

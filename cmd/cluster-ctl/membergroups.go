@@ -79,8 +79,7 @@ func (r *registryMemberRuntime) Sync(ctx context.Context, cfg *clustercfg.Regist
 		}
 		selfAdvertise := cfg.SelfAdvertise()
 		meta := membergroup.Meta{
-			Role: role, ID: name, APIAdvertise: selfAdvertise,
-			MemberlistAdvertise: selfAdvertise,
+			Role: role, ID: name, Advertise: selfAdvertise,
 		}
 		g, err := membergroup.New(membergroup.Options{
 			Label: label, Name: name, Hub: r.hub, Seeds: seeds, Meta: meta, Log: r.log, TLSConfig: r.tlsCfg,
@@ -236,7 +235,7 @@ func newScalerObserverRuntime(cfg *clustercfg.RegistryConfig, hub *membergroup.H
 		Label: label, Name: name, Hub: hub, Log: log, TLSConfig: tlsCfg,
 		Meta: membergroup.Meta{
 			Role: membergroup.RoleObserver, ID: name,
-			APIAdvertise: cfg.SelfAdvertise(), MemberlistAdvertise: cfg.SelfAdvertise(),
+			Advertise: cfg.SelfAdvertise(),
 		},
 	})
 	if err != nil {
@@ -272,7 +271,7 @@ func (s *scalerObserverRuntime) ReadyScalers(readyLabel string) []registry.Scale
 	metas := s.group.ReadyScalers(readyLabel)
 	out := make([]registry.ScalerPeer, 0, len(metas))
 	for _, meta := range metas {
-		out = append(out, registry.ScalerPeer{ID: meta.ID, Advertise: meta.APIAdvertise, ReadyLabel: meta.ReadyLabel})
+		out = append(out, registry.ScalerPeer{ID: meta.ID, Advertise: meta.Advertise, ReadyLabel: meta.ReadyLabel})
 	}
 	return out
 }

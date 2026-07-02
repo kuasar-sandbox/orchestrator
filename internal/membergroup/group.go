@@ -53,8 +53,8 @@ func New(opts Options) (*Group, error) {
 	if meta.ID == "" {
 		meta.ID = opts.Name
 	}
-	if meta.MemberlistAdvertise != "" {
-		book.Set(opts.Name, meta.MemberlistAdvertise)
+	if meta.Advertise != "" {
+		book.Set(opts.Name, meta.Advertise)
 	}
 	d := &delegate{meta: meta, book: book, seenIDs: map[string]bool{meta.ID: true}}
 	tr := NewHTTPTransport(opts.Label, opts.Name, book.Resolve, opts.TLSConfig)
@@ -113,8 +113,8 @@ func (g *Group) UpdateMeta(meta Meta) error {
 		meta.ID = g.name
 	}
 	g.delegate.setMeta(meta)
-	if meta.MemberlistAdvertise != "" {
-		g.book.Set(g.name, meta.MemberlistAdvertise)
+	if meta.Advertise != "" {
+		g.book.Set(g.name, meta.Advertise)
 	}
 	return g.ml.UpdateNode(2 * time.Second)
 }
@@ -161,7 +161,7 @@ func (g *Group) ReadyScalers(readyLabel string) []Meta {
 		if readyLabel != "" && meta.ReadyLabel != readyLabel {
 			continue
 		}
-		if meta.APIAdvertise == "" {
+		if meta.Advertise == "" {
 			continue
 		}
 		out = append(out, meta)
@@ -229,8 +229,8 @@ func (d *delegate) learn(n *memberlist.Node) {
 	}
 	d.seenIDs[meta.ID] = true
 	d.mu.Unlock()
-	if meta.MemberlistAdvertise != "" {
-		d.book.Set(meta.ID, meta.MemberlistAdvertise)
+	if meta.Advertise != "" {
+		d.book.Set(meta.ID, meta.Advertise)
 	}
 }
 

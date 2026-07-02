@@ -200,7 +200,7 @@ group import 不构成全局 ready 门槛。每个 Place 只解析请求中的 g
 registry 只根据 memberlist meta 选择 ready scaler:
 
 ```json
-{"role":"scaler","id":"s1","api_advertise":"https://s1:7800","memberlist_advertise":"https://s1:7800","ready":true,"ready_label":"registry.2.hash"}
+{"role":"scaler","id":"s1","advertise":"https://s1:7800","ready":true,"ready_label":"registry.2.hash"}
 ```
 
 `scale_link/register` 不是 ready 状态源,也不是 scaler 目录存储。
