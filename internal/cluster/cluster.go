@@ -16,9 +16,10 @@ import (
 // MemberView is the versioned registry member set. LocateN must use this stable
 // view, never SWIM's live set; SWIM only affects availability/retry decisions.
 type MemberView struct {
-	Version int64
-	Label   string
-	Members []string
+	Version  int64
+	Label    string
+	Members  []string
+	ReadOnly bool
 }
 
 func (v MemberView) LabelOrDefault() string {

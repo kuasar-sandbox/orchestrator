@@ -154,6 +154,10 @@ membership:
 	if len(owners) != 1 || owners[0].Version != 2 {
 		t.Fatalf("old_grace version must not be part of owner views: %+v", owners)
 	}
+	shards := c.Membership.ShardVersions()
+	if len(shards) != 2 || shards[0].Version != 2 || shards[1].Version != 1 {
+		t.Fatalf("shard versions should include active then old_grace: %+v", shards)
+	}
 	members := c.Membership.MemberVersions()
 	if len(members) != 2 || members[0].Version != 2 || members[1].Version != 1 {
 		t.Fatalf("member versions should include active then old_grace: %+v", members)

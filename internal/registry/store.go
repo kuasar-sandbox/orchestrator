@@ -44,7 +44,7 @@ type NodeRecord struct {
 	Counts        int                       `json:"counts,omitempty"`
 	Draining      bool                      `json:"draining,omitempty"`
 	// LastHeartbeatUnix is the last sign of life (register or heartbeat); the
-	// dead-node sweep (§11) resets a disconnected node whose last beat predates
+	// dead-node sweep resets a disconnected node whose last beat predates
 	// node_dead_after.
 	LastHeartbeatUnix int64                          `json:"last_heartbeat_unix,omitempty"`
 	ResumeToken       string                         `json:"resume_token,omitempty"`
@@ -188,7 +188,7 @@ func (s *Stores) NodeOwnerCandidates(ctx context.Context, nodeID string) ([]stri
 	}
 	seen := map[string]bool{}
 	var out []string
-	for _, set := range view.Sets {
+	for _, set := range view.WriteSets {
 		for _, member := range set.Members {
 			id := string(member)
 			if id == "" || seen[id] {
@@ -396,9 +396,10 @@ func (s *Stores) rebuildShardStore() {
 			}
 		}
 		clusterViews = append(clusterViews, shardkv.ClusterView{
-			Version: view.Version,
-			Label:   view.LabelOrDefault(),
-			Members: members,
+			Version:  view.Version,
+			Label:    view.LabelOrDefault(),
+			Members:  members,
+			ReadOnly: view.ReadOnly,
 		})
 	}
 	if len(clusterViews) == 0 {
@@ -465,7 +466,7 @@ func (s *Stores) PutNode(ctx context.Context, n *NodeRecord) error {
 // PutNodeRuntime updates node_link high-frequency state only. Heartbeats must not
 // write node_list, otherwise every water-level tick fans out to scaler WATCH_LIST.
 func (s *Stores) PutNodeRuntime(ctx context.Context, n *NodeRecord) error {
-	_, err := s.putNodeLink(ctx, n)
+	_, err := s.putNodeProfileShardReturn(ctx, n)
 	return err
 }
 
@@ -548,7 +549,7 @@ func (s *Stores) updateNodeRuntime(ctx context.Context, nodeID string, mutate fu
 			return err
 		}
 		mutate(rec)
-		if _, err := s.putNodeLink(ctx, rec); err == clusterstate.ErrConflict {
+		if _, err := s.putNodeProfileShardReturn(ctx, rec); err == clusterstate.ErrConflict {
 			continue
 		} else {
 			return err

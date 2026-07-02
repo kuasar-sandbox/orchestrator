@@ -146,13 +146,39 @@ func newRoutingNodeOwner(reg *Registry, local NodeOwner, remotes map[string]Node
 
 func (o *routingNodeOwner) ownerFor(ctx context.Context, nodeID string) NodeOwner {
 	node, found, err := o.reg.stores.GetNodeProfile(ctx, nodeID)
-	if err != nil || !found || node.LinkOwner == "" || node.LinkOwner == o.reg.stores.WriterID() {
+	if err == nil && found && node.LinkOwner != "" {
+		if node.LinkOwner == o.reg.stores.WriterID() {
+			return o.local
+		}
+		if remote := o.remotes[node.LinkOwner]; remote != nil {
+			return remote
+		}
+		return missingNodeOwner{memberID: node.LinkOwner}
+	}
+	return o.ownerForShard(ctx, nodeID)
+}
+
+func (o *routingNodeOwner) ownerForShard(ctx context.Context, nodeID string) NodeOwner {
+	owners, err := o.reg.stores.NodeOwnerCandidates(ctx, nodeID)
+	if err != nil || len(owners) == 0 {
 		return o.local
 	}
-	if remote := o.remotes[node.LinkOwner]; remote != nil {
-		return remote
+	local := o.reg.stores.WriterID()
+	for _, owner := range owners {
+		if owner == local {
+			return o.local
+		}
 	}
-	return missingNodeOwner{memberID: node.LinkOwner}
+	for _, owner := range owners {
+		if owner == "" {
+			continue
+		}
+		if remote := o.remotes[owner]; remote != nil {
+			return remote
+		}
+		return missingNodeOwner{memberID: owner}
+	}
+	return o.local
 }
 
 func (o *routingNodeOwner) PutManifestKey(ctx context.Context, nodeID, fingerprint, keyType, keyValue string, expiresUnix int64) error {

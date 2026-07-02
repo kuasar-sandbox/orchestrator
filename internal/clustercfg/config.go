@@ -295,6 +295,22 @@ func (m MembershipConfig) OwnerVersions() []MembershipVersion {
 	return out
 }
 
+func (m MembershipConfig) ShardVersions() []MembershipVersion {
+	seen := map[int64]bool{}
+	out := make([]MembershipVersion, 0, 3)
+	for _, v := range m.OwnerVersions() {
+		if seen[v.Version] {
+			continue
+		}
+		seen[v.Version] = true
+		out = append(out, v)
+	}
+	if oldGrace, ok := m.OldGraceVersion(); ok && !seen[oldGrace.Version] {
+		out = append(out, oldGrace)
+	}
+	return out
+}
+
 func (m MembershipConfig) MemberVersions() []MembershipVersion {
 	seen := map[int64]bool{}
 	out := make([]MembershipVersion, 0, len(m.Versions))

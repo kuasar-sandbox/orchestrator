@@ -50,7 +50,7 @@ func TestRegistryReloadAllowsCutoverFromConfiguredNextMembership(t *testing.T) {
 	}
 }
 
-func TestBuildRegistryTopologyKeepsOldGracePeersOutOfOwnerViews(t *testing.T) {
+func TestBuildRegistryTopologyMarksOldGraceReadOnly(t *testing.T) {
 	cfg := loadRegistryReloadTestConfig(t, `member:
   id: registry-b
   listen: "127.0.0.1:0"
@@ -78,8 +78,8 @@ membership:
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(views) != 1 || views[0].Version != 2 {
-		t.Fatalf("old_grace version must not enter owner views: %+v", views)
+	if len(views) != 2 || views[0].Version != 2 || views[0].ReadOnly || views[1].Version != 1 || !views[1].ReadOnly {
+		t.Fatalf("old_grace version must enter shard views as read-only: %+v", views)
 	}
 	if !strings.HasPrefix(views[0].Label, "registry.2.") {
 		t.Fatalf("owner view label = %q, want computed registry.2 label", views[0].Label)

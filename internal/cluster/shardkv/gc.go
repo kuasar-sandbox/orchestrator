@@ -46,12 +46,12 @@ func (s *Store) Compact(ctx context.Context, now time.Time) (GCStats, error) {
 				if localSet == nil {
 					continue
 				}
-				records, head, ok, err := rs.fetchAllShardRecords(ctx, view)
+				records, head, certificate, ok, err := rs.fetchCommittedSnapshot(ctx, view)
 				if err != nil || !ok {
 					continue
 				}
-				localSet.installNoTouch(records, head)
-				rs.installSnapshotBestEffort(ctx, view, records, head, true)
+				localSet.installNoTouch(records, head, certificate)
+				rs.installSnapshotBestEffort(ctx, view, records, head, certificate, true)
 				localSet.markReady(view.Label, head)
 				stats.Tombstones += localSet.compactTombstones(now, spec.TombstoneRetention)
 			}
@@ -81,7 +81,7 @@ func (s *Store) allMembersReady(view ShardView) bool {
 	if s.ready == nil {
 		return true
 	}
-	for _, member := range shardMembers(view) {
+	for _, member := range writeMembers(view) {
 		if member == s.local {
 			continue
 		}

@@ -10,21 +10,11 @@ import (
 )
 
 func (s *Stores) putNodeProfileShard(ctx context.Context, n *NodeRecord) error {
-	if n == nil || n.NodeID == "" {
-		return nil
-	}
-	sh, err := s.nodeLinkRecordSet(n.NodeID, clusterstate.RecordSetNodeProfile)
-	if err != nil {
-		return err
-	}
-	value, err := clusterstate.EncodeShardValue(nodeProfileFromRegistry(n))
-	if err != nil {
-		return err
-	}
-	return shardUpsert(ctx, sh, clusterstate.NodeLinkProfileRecord, value)
+	_, err := s.putNodeProfileShardReturn(ctx, n)
+	return err
 }
 
-func (s *Stores) putNodeShard(ctx context.Context, n *NodeRecord) (uint64, error) {
+func (s *Stores) putNodeProfileShardReturn(ctx context.Context, n *NodeRecord) (uint64, error) {
 	if n == nil || n.NodeID == "" {
 		return 0, nil
 	}
@@ -39,6 +29,18 @@ func (s *Stores) putNodeShard(ctx context.Context, n *NodeRecord) (uint64, error
 	profile, err := shardUpsertReturn(ctx, sh, clusterstate.NodeLinkProfileRecord, value)
 	if err != nil {
 		return 0, err
+	}
+	n.Meta = clusterRecordMeta(profile.Meta)
+	return profile.Meta.Rev, nil
+}
+
+func (s *Stores) putNodeShard(ctx context.Context, n *NodeRecord) (uint64, error) {
+	rev, err := s.putNodeProfileShardReturn(ctx, n)
+	if err != nil {
+		return 0, err
+	}
+	if n == nil || n.NodeID == "" {
+		return rev, nil
 	}
 	for _, ref := range n.Sandboxes {
 		if err := s.addNodeSandboxRefShard(ctx, n.NodeID, ref); err != nil {
@@ -55,8 +57,7 @@ func (s *Stores) putNodeShard(ctx context.Context, n *NodeRecord) (uint64, error
 			return 0, err
 		}
 	}
-	n.Meta = clusterRecordMeta(profile.Meta)
-	return profile.Meta.Rev, nil
+	return rev, nil
 }
 
 func (s *Stores) addNodeSandboxRefShard(ctx context.Context, nodeID string, ref clusterstate.NodeSandboxRef) error {

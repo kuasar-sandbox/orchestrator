@@ -9,9 +9,10 @@ import (
 )
 
 type ClusterView struct {
-	Version int64      `json:"version"`
-	Label   string     `json:"label"`
-	Members []MemberID `json:"members"`
+	Version  int64      `json:"version"`
+	Label    string     `json:"label"`
+	Members  []MemberID `json:"members"`
+	ReadOnly bool       `json:"read_only,omitempty"`
 }
 
 type MaglevResolverConfig struct {
@@ -75,17 +76,20 @@ func (r *MaglevResolver) ResolveShard(ns Namespace, shard ShardKey) (ShardView, 
 			Members: owners,
 			Quorum:  len(owners)/2 + 1,
 		}
-		out.Sets = append(out.Sets, set)
-		out.Label = view.Label
+		out.ReadSets = append(out.ReadSets, set)
+		if !view.ReadOnly {
+			out.WriteSets = append(out.WriteSets, set)
+			out.Label = view.Label
+		}
 	}
 	return out, validateView(out)
 }
 
 func validateView(view ShardView) error {
-	if view.Namespace == "" || view.Shard == "" || view.Local == "" || len(view.Sets) == 0 {
+	if view.Namespace == "" || view.Shard == "" || view.Local == "" || view.Label == "" || len(view.WriteSets) == 0 || len(view.ReadSets) == 0 {
 		return ErrInvalidView
 	}
-	for _, set := range view.Sets {
+	for _, set := range append(append([]ShardMemberSet(nil), view.WriteSets...), view.ReadSets...) {
 		if len(set.Members) == 0 || set.Quorum <= 0 || set.Quorum > len(set.Members) {
 			return ErrInvalidView
 		}
@@ -135,10 +139,26 @@ func normalizeMembers(in []MemberID) []MemberID {
 	return out
 }
 
-func shardMembers(view ShardView) []MemberID {
+func readMembers(view ShardView) []MemberID {
 	seen := map[MemberID]bool{}
 	var out []MemberID
-	for _, set := range view.Sets {
+	for _, set := range view.ReadSets {
+		for _, member := range set.Members {
+			if member == "" || seen[member] {
+				continue
+			}
+			seen[member] = true
+			out = append(out, member)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
+}
+
+func writeMembers(view ShardView) []MemberID {
+	seen := map[MemberID]bool{}
+	var out []MemberID
+	for _, set := range view.WriteSets {
 		for _, member := range set.Members {
 			if member == "" || seen[member] {
 				continue
@@ -153,15 +173,19 @@ func shardMembers(view ShardView) []MemberID {
 
 func quorumSatisfied(ok map[MemberID]bool, sets []ShardMemberSet) bool {
 	for _, set := range sets {
-		count := 0
-		for _, member := range set.Members {
-			if ok[member] {
-				count++
-			}
-		}
-		if count < set.Quorum {
+		if !quorumSatisfiedSet(ok, set) {
 			return false
 		}
 	}
 	return true
+}
+
+func quorumSatisfiedSet(ok map[MemberID]bool, set ShardMemberSet) bool {
+	count := 0
+	for _, member := range set.Members {
+		if ok[member] {
+			count++
+		}
+	}
+	return count >= set.Quorum
 }

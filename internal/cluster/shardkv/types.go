@@ -42,6 +42,18 @@ type Record struct {
 	Meta      RecordMeta    `json:"meta"`
 }
 
+type CommitCertificate struct {
+	Rev     uint64     `json:"rev,omitempty"`
+	Digest  string     `json:"digest,omitempty"`
+	Ballot  Ballot     `json:"ballot,omitempty"`
+	Labels  []string   `json:"labels,omitempty"`
+	Members []MemberID `json:"members,omitempty"`
+}
+
+func (p CommitCertificate) IsZero() bool {
+	return p.Rev == 0 && p.Digest == "" && p.Ballot.IsZero() && len(p.Labels) == 0 && len(p.Members) == 0
+}
+
 type ReadPolicy int
 
 const (
@@ -83,7 +95,8 @@ type ShardView struct {
 	Shard     ShardKey         `json:"shard"`
 	Local     MemberID         `json:"local"`
 	Label     string           `json:"label"`
-	Sets      []ShardMemberSet `json:"sets"`
+	WriteSets []ShardMemberSet `json:"write_sets"`
+	ReadSets  []ShardMemberSet `json:"read_sets"`
 }
 
 type ShardResolver interface {
@@ -116,26 +129,31 @@ const (
 )
 
 type Request struct {
-	Op        Op            `json:"op"`
-	Label     string        `json:"label,omitempty"`
-	Namespace Namespace     `json:"namespace"`
-	Shard     ShardKey      `json:"shard"`
-	RecordSet RecordSetName `json:"record_set"`
-	Key       RecordKey     `json:"key,omitempty"`
-	Ballot    Ballot        `json:"ballot,omitempty"`
-	Record    Record        `json:"record,omitempty"`
-	Records   []Record      `json:"records,omitempty"`
-	Rev       uint64        `json:"rev,omitempty"`
+	Op          Op                `json:"op"`
+	Label       string            `json:"label,omitempty"`
+	Namespace   Namespace         `json:"namespace"`
+	Shard       ShardKey          `json:"shard"`
+	RecordSet   RecordSetName     `json:"record_set"`
+	Key         RecordKey         `json:"key,omitempty"`
+	Ballot      Ballot            `json:"ballot,omitempty"`
+	Record      Record            `json:"record,omitempty"`
+	Accepted    Record            `json:"accepted,omitempty"`
+	Certificate CommitCertificate `json:"certificate,omitempty"`
+	Records     []Record          `json:"records,omitempty"`
+	Rev         uint64            `json:"rev,omitempty"`
 }
 
 type Response struct {
-	Record   Record   `json:"record,omitempty"`
-	Records  []Record `json:"records,omitempty"`
-	Found    bool     `json:"found,omitempty"`
-	OK       bool     `json:"ok,omitempty"`
-	Promised Ballot   `json:"promised,omitempty"`
-	Rev      uint64   `json:"rev,omitempty"`
-	Error    string   `json:"error,omitempty"`
+	Record        Record            `json:"record,omitempty"`
+	Records       []Record          `json:"records,omitempty"`
+	Accepted      Record            `json:"accepted,omitempty"`
+	Certificate   CommitCertificate `json:"certificate,omitempty"`
+	Found         bool              `json:"found,omitempty"`
+	AcceptedFound bool              `json:"accepted_found,omitempty"`
+	OK            bool              `json:"ok,omitempty"`
+	Promised      Ballot            `json:"promised,omitempty"`
+	Rev           uint64            `json:"rev,omitempty"`
+	Error         string            `json:"error,omitempty"`
 }
 
 type Snapshot struct {
@@ -192,6 +210,12 @@ func cloneRecord(in Record) Record {
 	return in
 }
 
+func cloneCommitCertificate(in CommitCertificate) CommitCertificate {
+	in.Labels = append([]string(nil), in.Labels...)
+	in.Members = append([]MemberID(nil), in.Members...)
+	return in
+}
+
 func recordNewer(a, b Record) bool {
 	if a.Meta.Rev != b.Meta.Rev {
 		return a.Meta.Rev > b.Meta.Rev
@@ -215,8 +239,10 @@ func highest(records []recordRead) (Record, bool) {
 }
 
 type recordRead struct {
-	member MemberID
-	record Record
-	found  bool
-	head   uint64
+	member        MemberID
+	record        Record
+	found         bool
+	head          uint64
+	accepted      Record
+	acceptedFound bool
 }

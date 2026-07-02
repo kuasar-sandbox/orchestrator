@@ -349,10 +349,16 @@ func (r registryShardReady) Ready(_ string, member shardkv.MemberID) bool {
 }
 
 func buildRegistryTopology(cfg *clustercfg.RegistryConfig) ([]clusterstate.MemberView, map[string]registry.NodeOwner, error) {
-	ownerVersions := cfg.Membership.OwnerVersions()
-	views := make([]clusterstate.MemberView, 0, len(ownerVersions))
-	for _, version := range ownerVersions {
-		views = append(views, clusterstate.MemberView{Version: version.Version, Label: version.Label, Members: version.MemberIDs()})
+	shardVersions := cfg.Membership.ShardVersions()
+	_, oldGrace := cfg.Membership.OldGraceVersion()
+	views := make([]clusterstate.MemberView, 0, len(shardVersions))
+	for _, version := range shardVersions {
+		views = append(views, clusterstate.MemberView{
+			Version:  version.Version,
+			Label:    version.Label,
+			Members:  version.MemberIDs(),
+			ReadOnly: oldGrace && version.Version == cfg.Membership.OldGrace,
+		})
 	}
 	nodeOwners := map[string]registry.NodeOwner{}
 	for _, member := range jointMembershipMembers(cfg.Membership.MemberVersions()) {

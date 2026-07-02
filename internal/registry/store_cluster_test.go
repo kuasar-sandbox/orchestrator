@@ -69,7 +69,7 @@ func TestStoresBuildShardKVNamespaces(t *testing.T) {
 		if err != nil {
 			t.Fatalf("View(%s,%s): %v", tc.ns, tc.shard, err)
 		}
-		if len(got.Sets) != 1 || len(got.Sets[0].Members) != tc.want {
+		if len(got.WriteSets) != 1 || len(got.WriteSets[0].Members) != tc.want {
 			t.Fatalf("View(%s,%s)=%+v, want %d members", tc.ns, tc.shard, got, tc.want)
 		}
 	}
@@ -110,6 +110,45 @@ func TestNodeLinkShardRecordsAssembleNodeView(t *testing.T) {
 	}
 	if len(got.ManifestKeys) != 0 {
 		t.Fatalf("manifest keys after tombstone=%+v", got.ManifestKeys)
+	}
+}
+
+func TestPutNodeRuntimeUpdatesProfileOnly(t *testing.T) {
+	ctx := context.Background()
+	stores := NewStores()
+	node := &NodeRecord{
+		NodeID: "n-runtime", Labels: map[string]string{"pool": "p"}, Capacity: 10,
+		DataEndpoint: "10.0.0.1:8443", LastHeartbeatUnix: time.Now().Unix(), LinkOwner: "r1",
+		Sandboxes: []clusterstate.NodeSandboxRef{{Group: "/g", RouteKey: "rk", SandboxID: "sb"}},
+		Builds:    []clusterstate.NodeBuildRef{{Group: "/g", BuildID: "b1"}},
+		ManifestKeys: []clusterstate.NodeManifestKey{{
+			Fingerprint: "fp", Type: clusterstate.SecretInline, Value: "mk", ExpiresUnix: 123,
+		}},
+	}
+	if err := stores.PutNode(ctx, node); err != nil {
+		t.Fatalf("PutNode: %v", err)
+	}
+	profileBefore := mustNodeRecordSetSnapshot(t, ctx, stores, "n-runtime", clusterstate.RecordSetNodeProfile).Rev
+	sandboxBefore := mustNodeRecordSetSnapshot(t, ctx, stores, "n-runtime", clusterstate.RecordSetNodeSandbox).Rev
+	buildBefore := mustNodeRecordSetSnapshot(t, ctx, stores, "n-runtime", clusterstate.RecordSetNodeBuild).Rev
+	keyBefore := mustNodeRecordSetSnapshot(t, ctx, stores, "n-runtime", clusterstate.RecordSetNodeManifestKey).Rev
+
+	node.Counts = 7
+	node.LastHeartbeatUnix++
+	if err := stores.PutNodeRuntime(ctx, node); err != nil {
+		t.Fatalf("PutNodeRuntime: %v", err)
+	}
+	profileAfter := mustNodeRecordSetSnapshot(t, ctx, stores, "n-runtime", clusterstate.RecordSetNodeProfile).Rev
+	sandboxAfter := mustNodeRecordSetSnapshot(t, ctx, stores, "n-runtime", clusterstate.RecordSetNodeSandbox).Rev
+	buildAfter := mustNodeRecordSetSnapshot(t, ctx, stores, "n-runtime", clusterstate.RecordSetNodeBuild).Rev
+	keyAfter := mustNodeRecordSetSnapshot(t, ctx, stores, "n-runtime", clusterstate.RecordSetNodeManifestKey).Rev
+
+	if profileAfter <= profileBefore {
+		t.Fatalf("profile rev did not advance: before=%d after=%d", profileBefore, profileAfter)
+	}
+	if sandboxAfter != sandboxBefore || buildAfter != buildBefore || keyAfter != keyBefore {
+		t.Fatalf("runtime update rewrote side recordSets: sandbox %d->%d build %d->%d key %d->%d",
+			sandboxBefore, sandboxAfter, buildBefore, buildAfter, keyBefore, keyAfter)
 	}
 }
 
@@ -299,6 +338,46 @@ func TestClusterStoresJointMembershipWritesBothOwnerSets(t *testing.T) {
 	}
 }
 
+func TestClusterStoresCutoverReadsColdOldGraceRoute(t *testing.T) {
+	ctx := context.Background()
+	oldView := clusterstate.MemberView{Version: 1, Label: "v1", Members: []string{"a", "b", "c"}}
+	newView := clusterstate.MemberView{Version: 2, Label: "v2", Members: []string{"c", "d", "e"}}
+	cluster := newShardStoreClusterWithViews(t, []clusterstate.MemberView{oldView}, 3, 3, 3, 3)
+	group, routeKey := "/cluster/cold-cutover/group", "rk"
+	if _, err := cluster["a"].PutSandbox(ctx, &SandboxRecord{Group: group, RouteKey: routeKey, SID: "sb-old", State: StateReady}); err != nil {
+		t.Fatalf("old PutSandbox: %v", err)
+	}
+
+	cutoverViews := []clusterstate.MemberView{
+		{Version: oldView.Version, Label: oldView.Label, Members: oldView.Members, ReadOnly: true},
+		newView,
+	}
+	for _, id := range []string{"d", "e"} {
+		cluster[id] = NewClusterStoresWithViews(id, cutoverViews, 3, 3, 3, 3)
+	}
+	transport := shardkv.TransportFunc(func(ctx context.Context, member shardkv.MemberID, req shardkv.Request) (shardkv.Response, error) {
+		store := cluster[string(member)]
+		if store == nil || store.ShardStore() == nil {
+			return shardkv.Response{}, shardkv.ErrReplicaUnavailable
+		}
+		return store.ShardStore().Handle(ctx, req)
+	})
+	for _, store := range cluster {
+		store.SetMemberViews(cutoverViews)
+		store.SetShardTransport(transport, nil)
+	}
+
+	got, _, found, err := cluster["d"].GetSandbox(ctx, group, routeKey)
+	if err != nil || !found || got.SID != "sb-old" {
+		t.Fatalf("cold old_grace GetSandbox got=%+v found=%v err=%v", got, found, err)
+	}
+	newOwners, err := newView.Owners(group, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertShardRecordPresent(t, ctx, cluster, shardkv.Namespace(clusterstate.NamespaceRouteLink), clusterstate.RouteLinkShard(group), clusterstate.RecordSetRouteSandbox, clusterstate.RouteSandboxRecordKey(routeKey), newOwners)
+}
+
 func assertShardRecordPresent(t *testing.T, ctx context.Context, stores map[string]*Stores, ns shardkv.Namespace, shard shardkv.ShardKey, recordSet shardkv.RecordSetName, key shardkv.RecordKey, owners []string) {
 	t.Helper()
 	for _, id := range owners {
@@ -345,6 +424,19 @@ func localShardHasRecord(t *testing.T, ctx context.Context, store *Stores, ns sh
 		}
 	}
 	return false
+}
+
+func mustNodeRecordSetSnapshot(t *testing.T, ctx context.Context, stores *Stores, nodeID string, recordSet shardkv.RecordSetName) shardkv.Snapshot {
+	t.Helper()
+	sh, err := stores.nodeLinkRecordSet(nodeID, recordSet)
+	if err != nil {
+		t.Fatalf("node recordSet %s: %v", recordSet, err)
+	}
+	snap, err := sh.Snapshot(ctx)
+	if err != nil {
+		t.Fatalf("snapshot node %s recordSet %s: %v", nodeID, recordSet, err)
+	}
+	return snap
 }
 
 func TestRoutingNodeOwnerUsesLinkOwner(t *testing.T) {
@@ -416,6 +508,27 @@ func TestNodeOwnerUsesProfileReadWhenLocalIsNotNodeShardOwner(t *testing.T) {
 	}
 }
 
+func TestRoutingNodeOwnerFallsBackToShardOwnerWhenProfileMissing(t *testing.T) {
+	ctx := context.Background()
+	view := clusterstate.MemberView{Version: 1, Members: []string{"a", "b", "c"}}
+	cluster := newShardStoreCluster(t, view.Members, 1, 1, 1, 1)
+	nodeID := nodeNotOwnedBy(t, view, "a")
+	owners, err := view.Owners(nodeID, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	remote := &routingNodeOwnerRecorder{allow: true}
+	reg := New(cluster["a"], nil, time.Second, nil)
+	reg.SetRemoteNodeOwners(map[string]NodeOwner{owners[0]: remote})
+
+	if err := reg.nodeOwner.SendCommand(ctx, nodeID, &routesync.Command{Kind: routesync.CmdDelete, SID: "sb1"}); err != nil {
+		t.Fatalf("SendCommand: %v", err)
+	}
+	if len(remote.deleted) != 1 || remote.deleted[0] != nodeID+"/"+routesync.CmdDelete {
+		t.Fatalf("remote deleted=%v", remote.deleted)
+	}
+}
+
 func TestNodeRegisterUsesProfileReadWhenLocalIsNotNodeShardOwner(t *testing.T) {
 	ctx := context.Background()
 	view := clusterstate.MemberView{Version: 1, Members: []string{"a", "b", "c"}}
@@ -432,6 +545,24 @@ func TestNodeRegisterUsesProfileReadWhenLocalIsNotNodeShardOwner(t *testing.T) {
 	}
 	profile, found, err := cluster["b"].GetNodeProfile(ctx, nodeID)
 	if err != nil || !found || profile.LinkOwner != "a" || profile.DataEndpoint != "new" {
+		t.Fatalf("profile after register=%+v found=%v err=%v", profile, found, err)
+	}
+}
+
+func TestNodeRegisterDoesNotFailWhenNodeListProjectionUnavailable(t *testing.T) {
+	ctx := context.Background()
+	view := clusterstate.MemberView{Version: 1, Members: []string{"a", "b"}}
+	stores := NewClusterStores("a", view, 1, 1, 2, 1)
+	nodeID := nodeOwnedBy(t, stores, "a")
+	reg := New(stores, nil, time.Second, nil)
+
+	if err := reg.updateNodeRegister(ctx, &routesync.NodeRegister{
+		NodeID: nodeID, Capacity: 10, DataEndpoint: "127.0.0.1:19001", Labels: map[string]string{"pool": "p"},
+	}); err != nil {
+		t.Fatalf("updateNodeRegister should keep node_link alive when node_list projection fails: %v", err)
+	}
+	profile, found, err := stores.GetNodeProfile(ctx, nodeID)
+	if err != nil || !found || profile.DataEndpoint != "127.0.0.1:19001" || profile.LinkOwner != "a" {
 		t.Fatalf("profile after register=%+v found=%v err=%v", profile, found, err)
 	}
 }

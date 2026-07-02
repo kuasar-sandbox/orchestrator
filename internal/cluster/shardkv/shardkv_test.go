@@ -24,7 +24,7 @@ func TestMaglevResolverRejectsUnknownNamespace(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(view.Sets) != 1 || len(view.Sets[0].Members) != 2 || view.Sets[0].Quorum != 2 {
+	if len(view.WriteSets) != 1 || len(view.WriteSets[0].Members) != 2 || view.WriteSets[0].Quorum != 2 {
 		t.Fatalf("view=%+v, want 2 members quorum 2", view)
 	}
 }
@@ -241,6 +241,220 @@ func TestMemberReadyFailFastDoesNotChangeQuorum(t *testing.T) {
 	}
 }
 
+func TestRecordSetCommitCertificateRestoresAvailabilityAfterDifferentReplicaFailure(t *testing.T) {
+	ctx := context.Background()
+	ready := newReadyMap()
+	ready.set("m3", false)
+	cluster := newTestCluster(t, []MemberID{"m1", "m2", "m3"}, 3, ready)
+
+	if _, ok, err := mustRecordSet(t, cluster["m1"], testNS, "s1", testRS).CAS(ctx, "k1", 0, []byte("v1")); err != nil || !ok {
+		t.Fatalf("CAS k1 with m3 down ok=%v err=%v", ok, err)
+	}
+
+	ready.set("m3", true)
+	ready.set("m1", false)
+	rec, ok, err := mustRecordSet(t, cluster["m2"], testNS, "s1", testRS).CAS(ctx, "k2", 0, []byte("v2"))
+	if err != nil || !ok {
+		t.Fatalf("CAS k2 with m1 down after m3 returns ok=%v err=%v", ok, err)
+	}
+	if rec.Meta.Rev != 2 {
+		t.Fatalf("k2 rev=%d, want 2", rec.Meta.Rev)
+	}
+
+	snap, err := mustRecordSet(t, cluster["m2"], testNS, "s1", testRS).Snapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keys := map[RecordKey]string{}
+	for _, rec := range snap.Records {
+		keys[rec.Key] = string(rec.Value)
+	}
+	if snap.Rev != 2 || keys["k1"] != "v1" || keys["k2"] != "v2" {
+		t.Fatalf("snapshot=%+v keys=%+v, want k1/k2 at rev 2", snap, keys)
+	}
+}
+
+func TestRecordSetJointViewAcceptsCommittedHeadFromActiveCertificate(t *testing.T) {
+	ctx := context.Background()
+	oldView := ClusterView{Version: 1, Label: "v1", Members: []MemberID{"m1", "m2", "m3"}}
+	newView := ClusterView{Version: 2, Label: "v2", Members: []MemberID{"m3", "m4", "m5"}}
+	stores := map[MemberID]*Store{}
+	transport := TransportFunc(func(ctx context.Context, member MemberID, req Request) (Response, error) {
+		store := stores[member]
+		if store == nil {
+			return Response{}, ErrReplicaUnavailable
+		}
+		return store.Handle(ctx, req)
+	})
+	for _, member := range oldView.Members {
+		resolver := newTestResolverWithViews(t, member, []ClusterView{oldView}, 3)
+		store, err := NewStore(StoreOptions{
+			Local: member, Resolver: resolver, Transport: transport, Epoch: "epoch-" + string(member),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		stores[member] = store
+	}
+
+	oldCoordinator := mustRecordSet(t, stores["m1"], testNS, "s-joint", testRS)
+	if _, ok, err := oldCoordinator.CAS(ctx, "k1", 0, []byte("v1")); err != nil || !ok {
+		t.Fatalf("old CAS ok=%v err=%v", ok, err)
+	}
+
+	jointViews := []ClusterView{oldView, newView}
+	for _, member := range []MemberID{"m1", "m2", "m3", "m4", "m5"} {
+		resolver := newTestResolverWithViews(t, member, jointViews, 3)
+		if store := stores[member]; store != nil {
+			if err := store.Configure(resolver, transport, nil, 10000); err != nil {
+				t.Fatalf("configure %s: %v", member, err)
+			}
+			continue
+		}
+		store, err := NewStore(StoreOptions{
+			Local: member, Resolver: resolver, Transport: transport, Epoch: "epoch-" + string(member),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		stores[member] = store
+	}
+
+	jointCoordinator := mustRecordSet(t, stores["m4"], testNS, "s-joint", testRS)
+	rec, ok, err := jointCoordinator.CAS(ctx, "k2", 0, []byte("v2"))
+	if err != nil || !ok {
+		t.Fatalf("joint CAS ok=%v err=%v", ok, err)
+	}
+	if rec.Meta.Rev != 2 {
+		t.Fatalf("joint CAS rev=%d, want 2", rec.Meta.Rev)
+	}
+	snap, err := mustRecordSet(t, stores["m5"], testNS, "s-joint", testRS).Snapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keys := map[RecordKey]string{}
+	for _, rec := range snap.Records {
+		keys[rec.Key] = string(rec.Value)
+	}
+	if snap.Rev != 2 || keys["k1"] != "v1" || keys["k2"] != "v2" {
+		t.Fatalf("joint snapshot=%+v keys=%+v, want old and new records at rev 2", snap, keys)
+	}
+}
+
+func TestRecordSetCutoverReadsColdOldGraceHead(t *testing.T) {
+	ctx := context.Background()
+	oldView := ClusterView{Version: 1, Label: "v1", Members: []MemberID{"m1", "m2", "m3"}}
+	newView := ClusterView{Version: 2, Label: "v2", Members: []MemberID{"m3", "m4", "m5"}}
+	stores := map[MemberID]*Store{}
+	transport := TransportFunc(func(ctx context.Context, member MemberID, req Request) (Response, error) {
+		store := stores[member]
+		if store == nil {
+			return Response{}, ErrReplicaUnavailable
+		}
+		return store.Handle(ctx, req)
+	})
+	for _, member := range oldView.Members {
+		resolver := newTestResolverWithViews(t, member, []ClusterView{oldView}, 3)
+		store, err := NewStore(StoreOptions{
+			Local: member, Resolver: resolver, Transport: transport, Epoch: "epoch-" + string(member),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		stores[member] = store
+	}
+	if _, ok, err := mustRecordSet(t, stores["m1"], testNS, "s-cold-cutover", testRS).CAS(ctx, "k1", 0, []byte("v1")); err != nil || !ok {
+		t.Fatalf("old CAS ok=%v err=%v", ok, err)
+	}
+
+	cutoverViews := []ClusterView{
+		{Version: oldView.Version, Label: oldView.Label, Members: oldView.Members, ReadOnly: true},
+		newView,
+	}
+	for _, member := range []MemberID{"m1", "m2", "m3", "m4", "m5"} {
+		resolver := newTestResolverWithViews(t, member, cutoverViews, 3)
+		if store := stores[member]; store != nil {
+			if err := store.Configure(resolver, transport, nil, 10000); err != nil {
+				t.Fatalf("configure %s: %v", member, err)
+			}
+			continue
+		}
+		store, err := NewStore(StoreOptions{
+			Local: member, Resolver: resolver, Transport: transport, Epoch: "epoch-" + string(member),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		stores[member] = store
+	}
+
+	got, found, err := mustRecordSet(t, stores["m4"], testNS, "s-cold-cutover", testRS).Get(ctx, "k1")
+	if err != nil || !found || string(got.Value) != "v1" {
+		t.Fatalf("cold cutover read got=%q found=%v err=%v, want v1", string(got.Value), found, err)
+	}
+	snap, err := mustRecordSet(t, stores["m5"], testNS, "s-cold-cutover", testRS).Snapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snap.Rev != 1 || len(snap.Records) != 1 || snap.Records[0].Key != "k1" || string(snap.Records[0].Value) != "v1" {
+		t.Fatalf("new owner snapshot after cold repair=%+v, want k1=v1 rev 1", snap)
+	}
+
+	delete(stores, "m1")
+	delete(stores, "m2")
+	got, found, err = mustRecordSet(t, stores["m5"], testNS, "s-cold-cutover", testRS).Get(ctx, "k1")
+	if err != nil || !found || string(got.Value) != "v1" {
+		t.Fatalf("repaired read without old_grace quorum got=%q found=%v err=%v, want v1", string(got.Value), found, err)
+	}
+	rec, ok, err := mustRecordSet(t, stores["m4"], testNS, "s-cold-cutover", testRS).CAS(ctx, "k2", 0, []byte("v2"))
+	if err != nil || !ok || rec.Meta.Rev != 2 {
+		t.Fatalf("active write after cold repair without old_grace quorum rec=%+v ok=%v err=%v, want rev 2", rec, ok, err)
+	}
+}
+
+func TestRecordSetWatchDoesNotEmitUncommittedAccept(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stores := map[MemberID]*Store{}
+	transport := TransportFunc(func(ctx context.Context, member MemberID, req Request) (Response, error) {
+		if req.Op == OpAccept {
+			return Response{}, ErrReplicaUnavailable
+		}
+		store := stores[member]
+		if store == nil {
+			return Response{}, ErrReplicaUnavailable
+		}
+		return store.Handle(ctx, req)
+	})
+	for _, member := range []MemberID{"m1", "m2", "m3"} {
+		resolver := newTestResolver(t, member, []MemberID{"m1", "m2", "m3"}, 3)
+		store, err := NewStore(StoreOptions{
+			Local: member, Resolver: resolver, Transport: transport, Epoch: "epoch-" + string(member),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		stores[member] = store
+	}
+
+	sh := mustRecordSet(t, stores["m1"], testNS, "s1", testRS)
+	w, err := sh.Watch(ctx, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertEvent(t, w.Events, EventReset, "")
+	assertEvent(t, w.Events, EventBookmark, "")
+
+	if _, _, err := sh.CAS(ctx, "k1", 0, []byte("v1")); !errors.Is(err, ErrQuorum) {
+		t.Fatalf("CAS with remote accept failures err=%v, want ErrQuorum", err)
+	}
+	select {
+	case ev := <-w.Events:
+		t.Fatalf("watch emitted uncommitted event: %+v", ev)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
 func TestNonOwnerCanCoordinateWritesButCannotServeLocalView(t *testing.T) {
 	ctx := context.Background()
 	cluster := newTestCluster(t, []MemberID{"m1", "m2", "m3"}, 1, nil)
@@ -401,7 +615,7 @@ func TestWatchSurvivesSnapshotInstallReset(t *testing.T) {
 	installed := localSet.install([]Record{{
 		Namespace: testNS, Shard: "s1", RecordSet: testRS, Key: "k1", Value: []byte("v1"),
 		Meta: RecordMeta{Ballot: Ballot{Round: 1, Writer: "repair"}, Rev: 1, UpdatedAt: time.Now()},
-	}}, 1, time.Now())
+	}}, 1, CommitCertificate{}, time.Now())
 	if !installed {
 		t.Fatal("install snapshot failed")
 	}
@@ -433,7 +647,7 @@ func TestWatchResetStreamsLargeSnapshotWithoutBlocking(t *testing.T) {
 			Meta: RecordMeta{Ballot: Ballot{Round: uint64(i + 1), Writer: "seed"}, Rev: uint64(i + 1), UpdatedAt: time.Now()},
 		})
 	}
-	if !localSet.install(records, 1500, time.Now()) {
+	if !localSet.install(records, 1500, CommitCertificate{}, time.Now()) {
 		t.Fatal("install large snapshot failed")
 	}
 
@@ -699,6 +913,90 @@ func TestShardRejectsStaleAcceptThatWouldRegressRecord(t *testing.T) {
 	}
 }
 
+func TestShardRejectsStaleInstallThatWouldRegressRecordSet(t *testing.T) {
+	ctx := context.Background()
+	store := newSingleStore(t, "m1")
+	sh := mustRecordSet(t, store, testNS, "s1", testRS)
+	_, ok, err := sh.CAS(ctx, "k1", 0, []byte("v1"))
+	if err != nil || !ok {
+		t.Fatalf("CAS k1 ok=%v err=%v", ok, err)
+	}
+	old, err := sh.Snapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldSnapshot, err := store.Handle(ctx, Request{
+		Op: OpSnapshot, Label: "v1", Namespace: testNS, Shard: "s1", RecordSet: testRS,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := sh.CAS(ctx, "k2", 0, []byte("v2")); err != nil || !ok {
+		t.Fatalf("CAS k2 ok=%v err=%v", ok, err)
+	}
+
+	resp, err := store.Handle(ctx, Request{
+		Op: OpInstall, Label: "v1", Namespace: testNS, Shard: "s1", RecordSet: testRS,
+		Records: oldSnapshot.Records, Rev: old.Rev, Certificate: oldSnapshot.Certificate,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.OK {
+		t.Fatal("stale install ok=true, want reject")
+	}
+	snap, err := sh.Snapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keys := map[RecordKey]string{}
+	for _, rec := range snap.Records {
+		keys[rec.Key] = string(rec.Value)
+	}
+	if snap.Rev != 2 || keys["k1"] != "v1" || keys["k2"] != "v2" {
+		t.Fatalf("snapshot regressed rev=%d keys=%+v, want rev 2 with k1/k2", snap.Rev, keys)
+	}
+}
+
+func TestShardRejectsSameRevDifferentInstall(t *testing.T) {
+	ctx := context.Background()
+	store := newSingleStore(t, "m1")
+	sh := mustRecordSet(t, store, testNS, "s1", testRS)
+	r1, ok, err := sh.CAS(ctx, "k1", 0, []byte("v1"))
+	if err != nil || !ok {
+		t.Fatalf("CAS k1 ok=%v err=%v", ok, err)
+	}
+	conflict := Record{
+		Namespace: testNS, Shard: "s1", RecordSet: testRS, Key: "k2", Value: []byte("v2"),
+		Meta: RecordMeta{Ballot: Ballot{Round: r1.Meta.Ballot.Round + 1, Writer: "other"}, Rev: r1.Meta.Rev, UpdatedAt: time.Now()},
+	}
+	view, err := sh.View(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certificate, err := makeCommitCertificate(r1.Meta.Rev, []Record{conflict}, conflict.Meta.Ballot, map[MemberID]bool{"m1": true}, view.WriteSets)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := store.Handle(ctx, Request{
+		Op: OpInstall, Label: "v1", Namespace: testNS, Shard: "s1", RecordSet: testRS,
+		Records: []Record{conflict}, Rev: r1.Meta.Rev, Certificate: certificate,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.OK {
+		t.Fatal("same-rev different install ok=true, want reject")
+	}
+	snap, err := sh.Snapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snap.Rev != 1 || len(snap.Records) != 1 || snap.Records[0].Key != "k1" || string(snap.Records[0].Value) != "v1" {
+		t.Fatalf("snapshot changed to conflicting same rev: %+v", snap)
+	}
+}
+
 func TestCompactTombstoneRequiresReadyMembers(t *testing.T) {
 	ctx := context.Background()
 	ready := newReadyMap()
@@ -729,6 +1027,39 @@ func TestCompactTombstoneRequiresReadyMembers(t *testing.T) {
 	}
 	if stats.Tombstones != 1 {
 		t.Fatalf("compact stats=%+v, want one tombstone", stats)
+	}
+}
+
+func TestCompactedTombstoneSnapshotRemainsCertificateEquivalent(t *testing.T) {
+	ctx := context.Background()
+	cluster := newTestCluster(t, []MemberID{"m1", "m2", "m3"}, 3, nil)
+	sh := mustRecordSet(t, cluster["m1"], testNS, "s1", testRS)
+	rec, ok, err := sh.CAS(ctx, "k1", 0, []byte("v1"))
+	if err != nil || !ok {
+		t.Fatalf("CAS ok=%v err=%v", ok, err)
+	}
+	if _, ok, err := sh.Delete(ctx, "k1", rec.Meta.Rev); err != nil || !ok {
+		t.Fatalf("Delete ok=%v err=%v", ok, err)
+	}
+	for _, store := range cluster {
+		markTombstoneOld(t, store, "s1", "k1", 2*time.Hour)
+	}
+	compactLocalTombstones(t, cluster["m1"], "s1", testRS, time.Hour)
+	compactLocalTombstones(t, cluster["m2"], "s1", testRS, time.Hour)
+
+	snap, err := mustRecordSet(t, cluster["m3"], testNS, "s1", testRS).Snapshot(ctx)
+	if err != nil {
+		t.Fatalf("Snapshot after mixed tombstone compaction: %v", err)
+	}
+	if snap.Rev != 2 || len(snap.Records) != 0 {
+		t.Fatalf("snapshot=%+v, want rev 2 without live records", snap)
+	}
+	recreated, ok, err := sh.CAS(ctx, "k1", 0, []byte("v2"))
+	if err != nil || !ok {
+		t.Fatalf("CAS recreate after mixed tombstone compaction ok=%v err=%v", ok, err)
+	}
+	if recreated.Meta.Rev != 3 {
+		t.Fatalf("recreate rev=%d, want 3", recreated.Meta.Rev)
 	}
 }
 
@@ -850,9 +1181,14 @@ func newTestCluster(t *testing.T, members []MemberID, count int, ready MemberRea
 
 func newTestResolver(t *testing.T, local MemberID, members []MemberID, count int) *MaglevResolver {
 	t.Helper()
+	return newTestResolverWithViews(t, local, []ClusterView{{Version: 1, Label: "v1", Members: members}}, count)
+}
+
+func newTestResolverWithViews(t *testing.T, local MemberID, views []ClusterView, count int) *MaglevResolver {
+	t.Helper()
 	resolver, err := NewMaglevResolver(MaglevResolverConfig{
 		Local: local,
-		Views: []ClusterView{{Version: 1, Label: "v1", Members: members}},
+		Views: views,
 		Layout: Layout{Namespaces: map[Namespace]NamespaceSpec{
 			testNS: {ShardMemberCount: count, TombstoneRetention: time.Hour, WatchRetention: 100},
 		}},
@@ -890,7 +1226,7 @@ func shardNotOwnedBy(t *testing.T, store *Store, local MemberID) (ShardKey, Memb
 		if err != nil {
 			t.Fatal(err)
 		}
-		members := shardMembers(view)
+		members := writeMembers(view)
 		owned := false
 		for _, member := range members {
 			if member == local {
@@ -924,6 +1260,21 @@ func markTombstoneOld(t *testing.T, store *Store, shard ShardKey, key RecordKey,
 	rs.lastAccess = time.Now().Add(-age)
 }
 
+func compactLocalTombstones(t *testing.T, store *Store, shard ShardKey, recordSet RecordSetName, retention time.Duration) {
+	t.Helper()
+	ls, err := store.getLocalShard(testNS, shard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rs := ls.recordSetNoTouch(recordSet)
+	if rs == nil {
+		t.Fatalf("recordSet %s/%s not found", shard, recordSet)
+	}
+	if n := rs.compactTombstones(time.Now(), retention); n != 1 {
+		t.Fatalf("compact local tombstone count=%d, want 1", n)
+	}
+}
+
 func installLocalSnapshot(t *testing.T, store *Store, shard ShardKey, recordSet RecordSetName, records []Record, rev uint64) {
 	t.Helper()
 	ls, err := store.getLocalShard(testNS, shard)
@@ -931,7 +1282,7 @@ func installLocalSnapshot(t *testing.T, store *Store, shard ShardKey, recordSet 
 		t.Fatal(err)
 	}
 	rs := ls.recordSet(recordSet, time.Now())
-	if !rs.install(records, rev, time.Now()) {
+	if !rs.install(records, rev, CommitCertificate{}, time.Now()) {
 		t.Fatalf("install local snapshot %s/%s rev %d failed", shard, recordSet, rev)
 	}
 }

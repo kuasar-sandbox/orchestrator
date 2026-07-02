@@ -139,8 +139,8 @@ func (s *Store) Handle(ctx context.Context, req Request) (Response, error) {
 		if rs == nil {
 			return Response{OK: true}, nil
 		}
-		records, rev := rs.snapshotRecords(true)
-		return Response{Records: records, OK: true, Rev: rev}, nil
+		records, rev, certificate := rs.snapshotRecords(true)
+		return Response{Records: records, Certificate: certificate, OK: true, Rev: rev}, nil
 	case OpRepair:
 		ls, err := s.getLocalShardNoTouch(req.Namespace, req.Shard)
 		if err != nil {
@@ -161,7 +161,7 @@ func (s *Store) Handle(ctx context.Context, req Request) (Response, error) {
 			return Response{}, err
 		}
 		rs := ls.recordSet(req.RecordSet, s.now())
-		ok := rs.install(req.Records, req.Rev, s.now())
+		ok := rs.install(req.Records, req.Rev, req.Certificate, s.now())
 		return Response{OK: ok, Rev: req.Rev}, nil
 	}
 	ls, err := s.getLocalShard(req.Namespace, req.Shard)
@@ -174,8 +174,8 @@ func (s *Store) Handle(ctx context.Context, req Request) (Response, error) {
 		rec, found, rev := rs.read(req.Key)
 		return Response{Record: rec, Found: found, OK: true, Rev: rev}, nil
 	case OpPrepare:
-		rec, found, rev, ok, promised := rs.prepare(req.Key, req.Ballot)
-		return Response{Record: rec, Found: found, OK: ok, Promised: promised, Rev: rev}, nil
+		rec, found, rev, ok, promised, accepted, acceptedFound := rs.prepare(req.Key, req.Ballot)
+		return Response{Record: rec, Found: found, Accepted: accepted, AcceptedFound: acceptedFound, OK: ok, Promised: promised, Rev: rev}, nil
 	case OpAccept:
 		ok, promised := rs.accept(req.Key, req.Record, req.Ballot, s.now())
 		return Response{OK: ok, Promised: promised, Rev: req.Record.Meta.Rev}, nil
@@ -195,7 +195,16 @@ func (s *Store) validateRequest(req Request) error {
 	if req.Label != "" && req.Label != view.Label {
 		return ErrInvalidView
 	}
-	for _, member := range shardMembers(view) {
+	var members []MemberID
+	switch req.Op {
+	case OpRead, OpSnapshot:
+		members = readMembers(view)
+	case OpPrepare, OpAccept, OpInstall, OpRepair:
+		members = writeMembers(view)
+	default:
+		return fmt.Errorf("shardkv: unknown op %q", req.Op)
+	}
+	for _, member := range members {
 		if member == s.local {
 			return nil
 		}
@@ -331,8 +340,10 @@ type localRecordSet struct {
 
 	mu          sync.Mutex
 	records     map[RecordKey]Record
+	accepted    map[uint64]Record
 	promised    map[RecordKey]Ballot
 	setPromised Ballot
+	certificate CommitCertificate
 	rev         uint64
 	log         []WatchEvent
 	subs        map[int]*watchSub
@@ -352,7 +363,7 @@ func newLocalShard(ns Namespace, shard ShardKey, epoch string, retention int, no
 func newLocalRecordSet(ns Namespace, shard ShardKey, name RecordSetName, epoch string, retention int, now time.Time) *localRecordSet {
 	return &localRecordSet{
 		namespace: ns, shard: shard, name: name, epoch: epoch, retention: retention,
-		records: map[RecordKey]Record{}, promised: map[RecordKey]Ballot{},
+		records: map[RecordKey]Record{}, accepted: map[uint64]Record{}, promised: map[RecordKey]Ballot{},
 		subs: map[int]*watchSub{}, readyLabel: map[string]uint64{},
 		lastAccess: now,
 	}
@@ -428,7 +439,7 @@ func (s *localRecordSet) readReady(label string, key RecordKey, minRev uint64) (
 	return cloneRecord(rec), found, readyRev, true
 }
 
-func (s *localRecordSet) prepare(key RecordKey, ballot Ballot) (Record, bool, uint64, bool, Ballot) {
+func (s *localRecordSet) prepare(key RecordKey, ballot Ballot) (Record, bool, uint64, bool, Ballot, Record, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	promised := s.promised[key]
@@ -436,12 +447,13 @@ func (s *localRecordSet) prepare(key RecordKey, ballot Ballot) (Record, bool, ui
 		promised = s.setPromised
 	}
 	if ballot.Less(promised) {
-		return Record{}, false, s.rev, false, promised
+		return Record{}, false, s.rev, false, promised, Record{}, false
 	}
 	s.setPromised = ballot
 	s.promised[key] = ballot
 	rec, found := s.records[key]
-	return cloneRecord(rec), found, s.rev, true, ballot
+	accepted, acceptedFound := s.highestAcceptedLocked()
+	return cloneRecord(rec), found, s.rev, true, ballot, accepted, acceptedFound
 }
 
 func (s *localRecordSet) accept(key RecordKey, rec Record, ballot Ballot, now time.Time) (bool, Ballot) {
@@ -466,10 +478,10 @@ func (s *localRecordSet) accept(key RecordKey, rec Record, ballot Ballot, now ti
 		}
 		return false, promised
 	}
-	if found && rec.Meta.Ballot.Less(cur.Meta.Ballot) {
-		if promised.Less(cur.Meta.Ballot) {
-			s.promised[key] = cur.Meta.Ballot
-			s.setPromised = cur.Meta.Ballot
+	if accepted, ok := s.accepted[rec.Meta.Rev]; ok && rec.Meta.Ballot.Less(accepted.Meta.Ballot) {
+		if promised.Less(accepted.Meta.Ballot) {
+			s.promised[key] = accepted.Meta.Ballot
+			s.setPromised = accepted.Meta.Ballot
 		}
 		return false, s.promised[key]
 	}
@@ -480,8 +492,24 @@ func (s *localRecordSet) accept(key RecordKey, rec Record, ballot Ballot, now ti
 	rec.Value = append([]byte(nil), rec.Value...)
 	s.setPromised = ballot
 	s.promised[key] = ballot
-	s.putLocked(rec, now)
+	s.accepted[rec.Meta.Rev] = rec
+	s.lastAccess = now
 	return true, ballot
+}
+
+func (s *localRecordSet) highestAcceptedLocked() (Record, bool) {
+	var out Record
+	found := false
+	for _, rec := range s.accepted {
+		if rec.Meta.Rev <= s.rev {
+			continue
+		}
+		if !found || recordNewer(rec, out) {
+			out = cloneRecord(rec)
+			found = true
+		}
+	}
+	return out, found
 }
 
 func (s *localRecordSet) repair(rec Record, now time.Time) bool {
@@ -504,7 +532,7 @@ func (s *localRecordSet) repair(rec Record, now time.Time) bool {
 	rec.Shard = s.shard
 	rec.RecordSet = s.name
 	rec.Value = append([]byte(nil), rec.Value...)
-	s.putLocked(rec, now)
+	s.putLocked(rec, now, true)
 	if s.promised[rec.Key].Less(rec.Meta.Ballot) {
 		s.promised[rec.Key] = rec.Meta.Ballot
 	}
@@ -514,15 +542,15 @@ func (s *localRecordSet) repair(rec Record, now time.Time) bool {
 	return true
 }
 
-func (s *localRecordSet) install(records []Record, rev uint64, now time.Time) bool {
-	return s.installLocked(records, rev, now, true)
+func (s *localRecordSet) install(records []Record, rev uint64, certificate CommitCertificate, now time.Time) bool {
+	return s.installLocked(records, rev, certificate, now, true)
 }
 
-func (s *localRecordSet) installNoTouch(records []Record, rev uint64) bool {
-	return s.installLocked(records, rev, time.Time{}, false)
+func (s *localRecordSet) installNoTouch(records []Record, rev uint64, certificate CommitCertificate) bool {
+	return s.installLocked(records, rev, certificate, time.Time{}, false)
 }
 
-func (s *localRecordSet) installLocked(records []Record, rev uint64, now time.Time, touch bool) bool {
+func (s *localRecordSet) installLocked(records []Record, rev uint64, certificate CommitCertificate, now time.Time, touch bool) bool {
 	next := make(map[RecordKey]Record, len(records))
 	var maxRev uint64
 	for _, rec := range records {
@@ -544,6 +572,9 @@ func (s *localRecordSet) installLocked(records []Record, rev uint64, now time.Ti
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if rev < s.rev && !s.certificate.IsZero() {
+		return false
+	}
 	changed := s.rev != rev || len(s.records) != len(next)
 	if !changed {
 		for key, rec := range next {
@@ -554,11 +585,85 @@ func (s *localRecordSet) installLocked(records []Record, rev uint64, now time.Ti
 			}
 		}
 	}
+	if rev == s.rev {
+		if changed {
+			if !s.certificate.IsZero() && !s.sameLogicalSnapshotLocked(next, rev) {
+				return false
+			}
+		} else {
+			if !certificate.IsZero() {
+				s.certificate = cloneCommitCertificate(certificate)
+			}
+			for acceptedRev := range s.accepted {
+				if acceptedRev <= rev {
+					delete(s.accepted, acceptedRev)
+				}
+			}
+			if touch {
+				s.lastAccess = now
+			}
+			s.refreshPromisesLocked()
+			return true
+		}
+	}
+	if changed && !certificate.IsZero() {
+		if rec, ok := s.incrementalInstallRecordLocked(next, rev); ok {
+			s.certificate = cloneCommitCertificate(certificate)
+			for acceptedRev := range s.accepted {
+				if acceptedRev <= rev {
+					delete(s.accepted, acceptedRev)
+				}
+			}
+			s.putLocked(rec, now, touch)
+			if s.promised[rec.Key].Less(rec.Meta.Ballot) {
+				s.promised[rec.Key] = rec.Meta.Ballot
+			}
+			if s.setPromised.Less(rec.Meta.Ballot) {
+				s.setPromised = rec.Meta.Ballot
+			}
+			return true
+		}
+	}
 	s.records = next
 	s.rev = rev
+	s.certificate = cloneCommitCertificate(certificate)
+	for acceptedRev := range s.accepted {
+		if acceptedRev <= rev {
+			delete(s.accepted, acceptedRev)
+		}
+	}
 	if touch {
 		s.lastAccess = now
 	}
+	s.refreshPromisesLocked()
+	if changed {
+		s.log = nil
+		s.broadcastResetLocked()
+	}
+	return true
+}
+
+func (s *localRecordSet) sameLogicalSnapshotLocked(next map[RecordKey]Record, rev uint64) bool {
+	curRecords := make([]Record, 0, len(s.records))
+	for _, rec := range s.records {
+		curRecords = append(curRecords, cloneRecord(rec))
+	}
+	nextRecords := make([]Record, 0, len(next))
+	for _, rec := range next {
+		nextRecords = append(nextRecords, cloneRecord(rec))
+	}
+	curDigest, err := snapshotDigest(rev, normalizeSnapshotRecords(curRecords))
+	if err != nil {
+		return false
+	}
+	nextDigest, err := snapshotDigest(rev, normalizeSnapshotRecords(nextRecords))
+	if err != nil {
+		return false
+	}
+	return curDigest == nextDigest
+}
+
+func (s *localRecordSet) refreshPromisesLocked() {
 	for key, rec := range s.records {
 		if s.promised[key].Less(rec.Meta.Ballot) {
 			s.promised[key] = rec.Meta.Ballot
@@ -567,18 +672,44 @@ func (s *localRecordSet) installLocked(records []Record, rev uint64, now time.Ti
 			s.setPromised = rec.Meta.Ballot
 		}
 	}
-	if changed {
-		s.log = nil
-		s.broadcastResetLocked()
-	}
-	return true
 }
 
-func (s *localRecordSet) putLocked(rec Record, now time.Time) {
+func (s *localRecordSet) incrementalInstallRecordLocked(next map[RecordKey]Record, rev uint64) (Record, bool) {
+	if rev != s.rev+1 {
+		return Record{}, false
+	}
+	var changed Record
+	changedCount := 0
+	for key, cur := range s.records {
+		rec, ok := next[key]
+		if !ok {
+			return Record{}, false
+		}
+		if !sameCommittedRecord(rec, cur) || !rec.Meta.Ballot.IsZero() && cur.Meta.Ballot != rec.Meta.Ballot {
+			changed = rec
+			changedCount++
+		}
+	}
+	for key, rec := range next {
+		if _, ok := s.records[key]; ok {
+			continue
+		}
+		changed = rec
+		changedCount++
+	}
+	if changedCount != 1 || changed.Meta.Rev != rev {
+		return Record{}, false
+	}
+	return cloneRecord(changed), true
+}
+
+func (s *localRecordSet) putLocked(rec Record, now time.Time, touch bool) {
 	cur, found := s.records[rec.Key]
 	changed := !found || cur.Deleted != rec.Deleted || cur.Meta.Rev != rec.Meta.Rev || !bytes.Equal(cur.Value, rec.Value)
 	s.records[rec.Key] = rec
-	s.lastAccess = now
+	if touch {
+		s.lastAccess = now
+	}
 	if !changed {
 		return
 	}
@@ -656,7 +787,7 @@ func (s *localRecordSet) enqueueWatchEventLocked(id int, sub *watchSub, ev Watch
 	}
 }
 
-func (s *localRecordSet) snapshotRecords(includeDeleted bool) ([]Record, uint64) {
+func (s *localRecordSet) snapshotRecords(includeDeleted bool) ([]Record, uint64, CommitCertificate) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	out := make([]Record, 0, len(s.records))
@@ -667,7 +798,7 @@ func (s *localRecordSet) snapshotRecords(includeDeleted bool) ([]Record, uint64)
 		out = append(out, cloneRecord(rec))
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Key < out[j].Key })
-	return out, s.rev
+	return out, s.rev, cloneCommitCertificate(s.certificate)
 }
 
 func (s *localRecordSet) markReady(label string, rev uint64) {
