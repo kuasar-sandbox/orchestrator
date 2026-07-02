@@ -152,7 +152,7 @@ http_code() {
 retry_code() {
     local want="$1" out="$2"; shift 2
     local code="000"
-    for _ in $(seq 1 120); do
+    for _ in $(seq 1 "${CLUSTER_STUB_RETRY_LIMIT:-120}"); do
         code="$(http_code "$out" "$@" 2>/dev/null || echo 000)"
         if [ "$code" = "$want" ]; then
             echo "$code"
@@ -165,6 +165,7 @@ retry_code() {
 }
 
 WORK="$(mktemp -d)"
+step "work dir: $WORK"
 PIDS=()
 cleanup() {
     for pid in "${PIDS[@]:-}"; do
@@ -173,7 +174,11 @@ cleanup() {
     for pid in "${PIDS[@]:-}"; do
         wait "$pid" 2>/dev/null || true
     done
-    rm -rf "$WORK"
+    if [ "${CLUSTER_STUB_KEEP_WORK:-0}" = "1" ]; then
+        step "keeping work dir: $WORK"
+    else
+        rm -rf "$WORK"
+    fi
 }
 trap cleanup EXIT
 

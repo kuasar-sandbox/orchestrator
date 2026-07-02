@@ -41,7 +41,7 @@ type nodeConn interface {
 // Placer suggests a node for a new sandbox: the scaler suggests, the registry
 // commits by CAS.
 // PlaceRequest is a placement ask. Build marks a build placement (resource-aware,
-// cluster-scaler.md §4.5); TargetRuntimeDigest lets the scaler prefer compatible
+// cluster-scaler.md); TargetRuntimeDigest lets the scaler prefer compatible
 // node runtimes when the caller knows the required runtime identity.
 type PlaceRequest struct {
 	Group               string
@@ -72,7 +72,8 @@ type Placer interface {
 	Place(ctx context.Context, req PlaceRequest) (*Placement, error)
 }
 
-// Registry is the cluster control plane's state authority + node_link hub.
+// Registry owns the route_link/node_link/scale_link shardkv views and accepts
+// node_link streams.
 type Registry struct {
 	stores      *Stores
 	placer      Placer
@@ -139,7 +140,7 @@ type reserveCall struct {
 	createConfig    map[string]string
 }
 
-// ReserveResult is what a satisfied ReserveSandbox returns (cluster.md §7.2). The
+// ReserveResult is what a satisfied ReserveSandbox returns (cluster.md). The
 // router injects AccessToken and forwards to the node's DataEndpoint.
 type ReserveResult struct {
 	NodeID       string `json:"node_id"`
@@ -313,7 +314,7 @@ func (r *Registry) readyScalerPeers(time.Duration) []ScalerPeer {
 func (r *Registry) SetPlacer(p Placer) { r.placer = p }
 
 // SetNodeOwner replaces the local node-owner adapter. Reserve/build/key/orphan
-// flows stay the same; execution-state authority moves behind this interface.
+// flows stay the same; execution-state mutation moves behind this interface.
 func (r *Registry) SetNodeOwner(owner NodeOwner) {
 	r.nodeOwner = owner
 }
@@ -349,7 +350,7 @@ func flightKey(group, routeKey string) string { return group + "\x00" + routeKey
 
 // ReserveSandbox resolves (group, route_key) to a running sandbox, placing +
 // creating (or resuming a PAUSED sandbox) on a node and waiting for the node to
-// report it running, single-flight per key (cluster.md §7.2).
+// report it running, single-flight per key (cluster.md).
 func (r *Registry) ReserveSandbox(ctx context.Context, group, routeKey string, createConfig map[string]string) (*ReserveResult, error) {
 	if group == "" || routeKey == "" {
 		return nil, fmt.Errorf("registry: group and route_key are required")
@@ -416,7 +417,7 @@ func (r *Registry) getSandboxForReserve(ctx context.Context, group, routeKey str
 }
 
 // rollbackReserve restores a (group, route_key) to its pre-reserve state when a
-// Reserve fails without reaching READY (cluster.md §7.4): a pre-existing PAUSED
+// Reserve fails without reaching READY (cluster.md): a pre-existing PAUSED
 // row is put back and a fresh one is deleted, but only while the row is still
 // RESERVED (a late running route may have won).
 func (r *Registry) rollbackReserve(group, routeKey string, orig *SandboxRecord, found bool) {
@@ -474,7 +475,7 @@ func (r *Registry) startReserve(ctx context.Context, group, routeKey string, rec
 
 // placeAndCreate places a node and sends the create command, CASing the RESERVED
 // record. It re-reads + re-asks the placer once on a dead-node suggestion OR a CAS
-// conflict (a lagging view / concurrent mutation, cluster.md §4.3/§5). It is
+// conflict (a lagging view / concurrent mutation, cluster.md/§5). It is
 // re-drivable: a rejected create re-invokes it (re-Place once, §7.4), which
 // re-reads the current rev and places afresh.
 func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, orig *SandboxRecord, found bool, createConfig map[string]string) error {
@@ -595,7 +596,7 @@ func (r *Registry) ackCommand(ack *routesync.CmdAck) {
 
 // applyRoute is called by the channel reader for each sandbox route the node
 // streams up. It converges SandboxStore and, on a running route, satisfies a
-// waiting ReserveSandbox (cluster.md §5.1 / §7.2).
+// waiting ReserveSandbox (cluster.md / §7.2).
 func (r *Registry) applyRoute(ctx context.Context, nodeID string, e *routesync.RouteEntry) {
 	if e.Group == "" || e.RouteKey == "" {
 		return // not a cluster-scoped sandbox route
@@ -929,7 +930,13 @@ func (r *Registry) updateNodeRegister(ctx context.Context, nr *routesync.NodeReg
 	rec.RuntimeDigest = nr.RuntimeDigest
 	rec.LastHeartbeatUnix = time.Now().Unix()
 	rec.LinkOwner = r.stores.WriterID()
-	return r.stores.PutNode(ctx, rec)
+	if _, err := r.stores.putNodeLink(ctx, rec); err != nil {
+		return err
+	}
+	if err := r.stores.PutNodeList(ctx, rec); err != nil {
+		r.log.Warn("node-link: node_list projection failed", "node", nr.NodeID, "err", err)
+	}
+	return nil
 }
 
 // updateHeartbeat folds a node's water level into its record + stamps liveness.

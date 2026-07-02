@@ -178,3 +178,38 @@ func TestNodeLinkClientFollowsRedirect(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 }
+
+func TestNodeLinkOutboxPrioritizesHighPriorityFramesBeforeHeartbeat(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	outbox := make(chan *routesync.Msg, 2)
+	highOut := make(chan *routesync.Msg, 1)
+	hbUpdate := make(chan struct{}, 1)
+	var hbMu sync.Mutex
+	heartbeat := &routesync.Msg{Type: routesync.TypeHeartbeat, Beat: &routesync.Heartbeat{Counts: 7}}
+	latestHeartbeat := heartbeat
+
+	highOut <- &routesync.Msg{Type: routesync.TypeCmdAck, Ack: &routesync.CmdAck{CmdID: "cmd-1", Status: routesync.AckAccepted}}
+	hbUpdate <- struct{}{}
+	go runNodeLinkOutbox(ctx, outbox, highOut, hbUpdate, &hbMu, &latestHeartbeat)
+
+	first := receiveOutboxMsg(t, outbox)
+	if first.Type != routesync.TypeCmdAck || first.Ack == nil || first.Ack.CmdID != "cmd-1" {
+		t.Fatalf("first outbox msg=%+v, want cmd_ack before heartbeat", first)
+	}
+	second := receiveOutboxMsg(t, outbox)
+	if second.Type != routesync.TypeHeartbeat || second.Beat == nil || second.Beat.Counts != 7 {
+		t.Fatalf("second outbox msg=%+v, want latest heartbeat", second)
+	}
+}
+
+func receiveOutboxMsg(t *testing.T, ch <-chan *routesync.Msg) *routesync.Msg {
+	t.Helper()
+	select {
+	case msg := <-ch:
+		return msg
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for outbox msg")
+	}
+	return nil
+}

@@ -183,6 +183,18 @@ func StreamAuthority(ctx context.Context, w io.Writer, flush func(), body io.Rea
 
 	for {
 		select {
+		case ev, ok := <-ch:
+			if !ok {
+				return // lagged + dropped by the source; the subscriber reconnects + re-syncs
+			}
+			if err := writeEvent(w, ev); err != nil {
+				return
+			}
+			flush()
+			continue
+		default:
+		}
+		select {
 		case <-sctx.Done():
 			return
 		case m, ok := <-outbox:

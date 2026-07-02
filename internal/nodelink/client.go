@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/net/http2"
@@ -37,7 +38,7 @@ type Node interface {
 	HandleCommand(ctx context.Context, cmd *routesync.Command) *routesync.CmdAck
 	// Heartbeat is the node's current water level (live sandbox count, drain),
 	// sent periodically so the registry tracks liveness (the dead-node sweep) and
-	// placement headroom (cluster.md §5.1 / §11).
+	// placement headroom (cluster.md / §11).
 	Heartbeat() *routesync.Heartbeat
 	// BuildEvents streams the node's build state transitions (registered/building/
 	// ready/error) up to the registry, which converges the BuildStore (§5.1/§7.5).
@@ -192,19 +193,24 @@ func (c *Client) session(ctx context.Context, endpoint string) error {
 	if hello.Type == routesync.TypeHello && hello.Hello != nil {
 		reg.ResumeFrom = hello.Hello.ResumeFrom
 	}
-	outbox := make(chan *routesync.Msg, 32)
+	outbox := make(chan *routesync.Msg)
+	highOut := make(chan *routesync.Msg, 32)
+	hbUpdate := make(chan struct{}, 1)
+	var hbMu sync.Mutex
+	var latestHeartbeat *routesync.Msg
+	go runNodeLinkOutbox(sctx, outbox, highOut, hbUpdate, &hbMu, &latestHeartbeat)
 	onUp := func(uctx context.Context, m *routesync.Msg) {
 		if m.Type == routesync.TypeCommand && m.Cmd != nil {
 			if ack := c.node.HandleCommand(uctx, m.Cmd); ack != nil {
 				select {
-				case outbox <- &routesync.Msg{Type: routesync.TypeCmdAck, Ack: ack}:
+				case highOut <- &routesync.Msg{Type: routesync.TypeCmdAck, Ack: ack}:
 				case <-uctx.Done():
 				}
 			}
 		}
 	}
 	// Periodic heartbeat (node -> registry): liveness for the dead-node sweep +
-	// water level for placement (cluster.md §5.1 / §11), serialized via the outbox.
+	// water level for placement (cluster.md / §11), serialized via the outbox.
 	go func() {
 		t := time.NewTicker(c.heartbeat)
 		defer t.Stop()
@@ -217,16 +223,18 @@ func (c *Client) session(ctx context.Context, endpoint string) error {
 				if hb == nil {
 					continue
 				}
+				hbMu.Lock()
+				latestHeartbeat = &routesync.Msg{Type: routesync.TypeHeartbeat, Beat: hb}
+				hbMu.Unlock()
 				select {
-				case outbox <- &routesync.Msg{Type: routesync.TypeHeartbeat, Beat: hb}:
-				case <-sctx.Done():
-					return
+				case hbUpdate <- struct{}{}:
+				default:
 				}
 			}
 		}
 	}()
 	// Build events (node -> registry): the BuildStore converges from these + releases
-	// reserved resources on a terminal state (cluster.md §5.1 / §7.5).
+	// reserved resources on a terminal state (cluster.md / §7.5).
 	go func() {
 		evs := c.node.BuildEvents()
 		if evs == nil {
@@ -241,7 +249,7 @@ func (c *Client) session(ctx context.Context, endpoint string) error {
 					continue
 				}
 				select {
-				case outbox <- &routesync.Msg{Type: routesync.TypeBuildEvent, Build: ev}:
+				case highOut <- &routesync.Msg{Type: routesync.TypeBuildEvent, Build: ev}:
 				case <-sctx.Done():
 					return
 				}
@@ -250,6 +258,71 @@ func (c *Client) session(ctx context.Context, endpoint string) error {
 	}()
 	routesync.StreamAuthority(sctx, pw, func() {}, resp.Body, c.node, reg, onUp, outbox, c.log)
 	return sctx.Err()
+}
+
+func runNodeLinkOutbox(
+	ctx context.Context,
+	outbox chan<- *routesync.Msg,
+	highOut <-chan *routesync.Msg,
+	hbUpdate <-chan struct{},
+	hbMu *sync.Mutex,
+	latestHeartbeat **routesync.Msg,
+) {
+	heartbeatPending := false
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case m := <-highOut:
+			if !sendNodeLinkOutbox(ctx, outbox, m) {
+				return
+			}
+			continue
+		default:
+		}
+		if heartbeatPending {
+			msg := takeLatestHeartbeat(hbMu, latestHeartbeat)
+			if msg == nil {
+				heartbeatPending = false
+				continue
+			}
+			if !sendNodeLinkOutbox(ctx, outbox, msg) {
+				return
+			}
+			heartbeatPending = false
+			continue
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case m := <-highOut:
+			if !sendNodeLinkOutbox(ctx, outbox, m) {
+				return
+			}
+		case <-hbUpdate:
+			heartbeatPending = true
+		}
+	}
+}
+
+func sendNodeLinkOutbox(ctx context.Context, outbox chan<- *routesync.Msg, msg *routesync.Msg) bool {
+	if msg == nil {
+		return true
+	}
+	select {
+	case outbox <- msg:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+func takeLatestHeartbeat(mu *sync.Mutex, latest **routesync.Msg) *routesync.Msg {
+	mu.Lock()
+	defer mu.Unlock()
+	msg := *latest
+	*latest = nil
+	return msg
 }
 
 func (c *Client) notifySession(endpoint string) {

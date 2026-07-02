@@ -296,6 +296,10 @@ func (r *Registry) serveNodeLinkLocal(ctx context.Context, w io.Writer, flush fu
 	defer r.removeNode(conn)
 	r.log.Info("node-link: node connected", "node", nr.NodeID, "labels", nr.Labels)
 
+	heartbeatCh := make(chan *routesync.Heartbeat, 1)
+	go r.runNodeHeartbeatUpdates(ctx, nr.NodeID, heartbeatCh)
+	defer close(heartbeatCh)
+
 	collectingFull := true
 	fullSeen := map[string]string{}
 	for {
@@ -318,7 +322,7 @@ func (r *Registry) serveNodeLinkLocal(ctx context.Context, w io.Writer, flush fu
 			r.applyDeleteBySID(ctx, nr.NodeID, m.SID)
 		case routesync.TypeHeartbeat:
 			if m.Beat != nil {
-				r.updateHeartbeat(ctx, nr.NodeID, m.Beat)
+				queueLatestHeartbeat(heartbeatCh, m.Beat)
 			}
 		case routesync.TypeCmdAck:
 			// Command receipt wakes the matching node-owner SendCommandAndWait.
@@ -339,5 +343,41 @@ func (r *Registry) serveNodeLinkLocal(ctx context.Context, w io.Writer, flush fu
 				r.updateNodeResume(ctx, nr.NodeID, m.RevToken)
 			}
 		}
+	}
+}
+
+func (r *Registry) runNodeHeartbeatUpdates(ctx context.Context, nodeID string, ch <-chan *routesync.Heartbeat) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case hb, ok := <-ch:
+			if !ok {
+				return
+			}
+			if hb != nil {
+				r.updateHeartbeat(ctx, nodeID, hb)
+			}
+		}
+	}
+}
+
+func queueLatestHeartbeat(ch chan *routesync.Heartbeat, hb *routesync.Heartbeat) {
+	if hb == nil {
+		return
+	}
+	cp := *hb
+	select {
+	case ch <- &cp:
+		return
+	default:
+	}
+	select {
+	case <-ch:
+	default:
+	}
+	select {
+	case ch <- &cp:
+	default:
 	}
 }

@@ -428,6 +428,40 @@ type remoteLifecycleOwner struct {
 	commands int
 }
 
+type remoteRouteWriteOwner struct {
+	node     *NodeRecord
+	onCreate func(*routesync.Command)
+}
+
+func (o *remoteRouteWriteOwner) PutManifestKey(context.Context, string, string, string, string, int64) error {
+	return nil
+}
+
+func (o *remoteRouteWriteOwner) DropManifestKey(context.Context, string, string) error { return nil }
+
+func (o *remoteRouteWriteOwner) AdmitBuild(context.Context, string, string, *routesync.BuildResources) bool {
+	return true
+}
+
+func (o *remoteRouteWriteOwner) ReleaseBuild(context.Context, string) {}
+
+func (o *remoteRouteWriteOwner) Runtime(context.Context, string) (*NodeRecord, bool, error) {
+	return o.node, o.node != nil, nil
+}
+
+func (o *remoteRouteWriteOwner) DeleteSandbox(context.Context, string, string) error { return nil }
+
+func (o *remoteRouteWriteOwner) SendCommand(context.Context, string, *routesync.Command) error {
+	return nil
+}
+
+func (o *remoteRouteWriteOwner) SendCommandAndWait(ctx context.Context, nodeID string, cmd *routesync.Command, timeout time.Duration) (*routesync.CmdAck, error) {
+	if o.onCreate != nil && cmd != nil && cmd.Kind == routesync.CmdCreate {
+		o.onCreate(cmd)
+	}
+	return &routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted}, nil
+}
+
 type flakyManifestKeyOwner struct {
 	remoteLifecycleOwner
 	putCalls int
@@ -607,6 +641,39 @@ func TestReserveSandboxJoinerWakesWhenReadyObservedByQuorumRead(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("joiner reserve was not woken by ready quorum read")
+	}
+}
+
+func TestReserveSandboxWakesFromRemoteRouteLinkWrite(t *testing.T) {
+	ctx := context.Background()
+	cluster := newShardStoreCluster(t, []string{"a", "b", "c"}, 3, 1, 1, 1)
+	nodeID := "node-remote"
+	waiter := New(cluster["a"], placementWithToken(nodeID), 2*time.Second, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	reporter := New(cluster["b"], nil, 2*time.Second, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	owner := &remoteRouteWriteOwner{
+		node: &NodeRecord{NodeID: nodeID, DataEndpoint: "127.0.0.1:12345"},
+		onCreate: func(cmd *routesync.Command) {
+			go func() {
+				time.Sleep(20 * time.Millisecond)
+				reporter.applyRoute(context.Background(), nodeID, &routesync.RouteEntry{
+					Group: cmd.Group, RouteKey: cmd.RouteKey, SandboxID: cmd.SID,
+					State: routesync.StateRunning, TemplateID: cmd.TemplateRef, AccessToken: cmd.AccessToken,
+				})
+			}()
+		},
+	}
+	waiter.SetNodeOwner(owner)
+
+	res, err := waiter.ReserveSandbox(ctx, "/g", "rk", nil)
+	if err != nil {
+		t.Fatalf("ReserveSandbox: %v", err)
+	}
+	if res.NodeID != nodeID || res.SID == "" || res.DataEndpoint != "127.0.0.1:12345" {
+		t.Fatalf("reserve result=%+v", res)
+	}
+	rec, _, found, err := cluster["c"].GetSandbox(ctx, "/g", "rk")
+	if err != nil || !found || rec.State != StateReady || rec.SID != res.SID {
+		t.Fatalf("replicated ready route=%+v found=%v err=%v", rec, found, err)
 	}
 }
 

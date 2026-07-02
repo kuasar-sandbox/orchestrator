@@ -9,19 +9,21 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
 
+	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/nodelink"
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/routesync"
 )
 
 func TestNodeLinkIngressRelaysToNodeOwner(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	cluster := newShardStoreCluster(t, []string{"ingress", "owner"}, 1, 1, 1, 1)
+	cluster := newShardStoreCluster(t, []string{"ingress", "peer", "owner"}, 3, 1, 1, 1)
 	nodeID := nodeOwnedBy(t, cluster["ingress"], "owner")
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	owner := New(cluster["owner"], placementWithToken(nodeID), 5*time.Second, log)
@@ -139,6 +141,58 @@ func TestNodeLinkIngressRedirectsToNodeOwner(t *testing.T) {
 	}
 }
 
+func TestNodeLinkRedirectReconnectsToOwnerAndReserveCompletes(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cluster := newShardStoreCluster(t, []string{"ingress", "owner"}, 1, 1, 1, 1)
+	nodeID := nodeOwnedBy(t, cluster["ingress"], "owner")
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	owner := New(cluster["owner"], placementWithToken(nodeID), 5*time.Second, log)
+	ingress := New(cluster["ingress"], placementWithToken(nodeID), 5*time.Second, log)
+
+	ownerMux := http.NewServeMux()
+	ownerMux.HandleFunc(routesync.NodeLinkPath, owner.ServeNodeLink)
+	ownerMux.HandleFunc(NodeOwnerRPCPath, func(w http.ResponseWriter, req *http.Request) {
+		ServeNodeOwner(w, req, owner.LocalNodeOwner())
+	})
+	ownerSrv := httptest.NewServer(h2c.NewHandler(ownerMux, &http2.Server{}))
+	defer ownerSrv.Close()
+	ingress.SetRemoteNodeOwners(map[string]NodeOwner{"owner": NewHTTPNodeOwner(ownerSrv.URL, ownerSrv.Client())})
+	ingress.SetNodeLinkRelayPeers(map[string]NodeLinkRelayPeer{"owner": {
+		Endpoint: ownerSrv.URL, RedirectEndpoint: ownerSrv.Listener.Addr().String(), Client: testH2CClient(),
+	}})
+
+	ingressMux := http.NewServeMux()
+	ingressMux.HandleFunc(routesync.NodeLinkPath, ingress.ServeNodeLink)
+	ingressSrv := httptest.NewServer(h2c.NewHandler(ingressMux, &http2.Server{}))
+	defer ingressSrv.Close()
+
+	node := newRedirectNodeStub(nodeID)
+	client := nodelink.NewWithEndpoint(ingressSrv.Listener.Addr().String(), testNodeLinkDial, routesync.NodeRegister{
+		NodeID: nodeID, Capacity: 10, DataEndpoint: "127.0.0.1:19191",
+	}, node, 20*time.Millisecond, nil, log, true)
+	go client.Run(ctx)
+
+	waitNodeLinkRecord(t, ctx, owner.stores, nodeID, "owner")
+	waitNodeLinkProfile(t, ctx, ingress.stores, nodeID, "owner")
+	if _, live := ingress.node(nodeID); live {
+		t.Fatal("ingress member unexpectedly holds redirected node_link stream")
+	}
+	waitRegistryNodeLive(t, owner, nodeID)
+
+	res, err := ingress.ReserveSandbox(ctx, "/g", "rk", nil)
+	if err != nil {
+		t.Fatalf("reserve through redirected node-link: %v", err)
+	}
+	if res.NodeID != nodeID || res.SID == "" || res.DataEndpoint != "127.0.0.1:19191" {
+		t.Fatalf("reserve result=%+v, want node %s endpoint 127.0.0.1:19191", res, nodeID)
+	}
+	cmd := node.waitCommand(t, routesync.CmdCreate)
+	if cmd.Group != "/g" || cmd.RouteKey != "rk" || cmd.SID != res.SID {
+		t.Fatalf("redirected command=%+v, reserve=%+v", cmd, res)
+	}
+}
+
 func TestNodeLinkRedirectDoesNotFallbackToRelayEndpoint(t *testing.T) {
 	cluster := newShardStoreCluster(t, []string{"ingress", "owner"}, 1, 1, 1, 1)
 	ingress := New(cluster["ingress"], nil, 5*time.Second, slog.New(slog.NewTextHandler(io.Discard, nil)))
@@ -147,6 +201,150 @@ func TestNodeLinkRedirectDoesNotFallbackToRelayEndpoint(t *testing.T) {
 	}})
 	if targets := ingress.nodeLinkRedirectTargets([]string{"owner"}); len(targets) != 0 {
 		t.Fatalf("redirect targets=%+v, want none without explicit RedirectEndpoint", targets)
+	}
+}
+
+func testNodeLinkDial(ctx context.Context, endpoint string) (net.Conn, error) {
+	if endpoint == "" {
+		return nil, fmt.Errorf("empty node-link endpoint")
+	}
+	return (&net.Dialer{}).DialContext(ctx, "tcp", endpoint)
+}
+
+type redirectNodeStub struct {
+	nodeID string
+
+	mu     sync.Mutex
+	routes map[string]routesync.RouteEntry
+	subs   map[int]chan routesync.Event
+	next   int
+	cmdCh  chan *routesync.Command
+}
+
+func newRedirectNodeStub(nodeID string) *redirectNodeStub {
+	return &redirectNodeStub{
+		nodeID: nodeID,
+		routes: map[string]routesync.RouteEntry{},
+		subs:   map[int]chan routesync.Event{},
+		cmdCh:  make(chan *routesync.Command, 16),
+	}
+}
+
+func (n *redirectNodeStub) Range(ctx context.Context, fn func(routesync.RouteEntry) error) error {
+	n.mu.Lock()
+	routes := make([]routesync.RouteEntry, 0, len(n.routes))
+	for _, route := range n.routes {
+		routes = append(routes, route)
+	}
+	n.mu.Unlock()
+	for _, route := range routes {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+			if err := fn(route); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (n *redirectNodeStub) Subscribe() (<-chan routesync.Event, func()) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.next++
+	id := n.next
+	ch := make(chan routesync.Event, 16)
+	n.subs[id] = ch
+	return ch, func() {
+		n.mu.Lock()
+		if cur, ok := n.subs[id]; ok {
+			delete(n.subs, id)
+			close(cur)
+		}
+		n.mu.Unlock()
+	}
+}
+
+func (n *redirectNodeStub) HandleCommand(ctx context.Context, cmd *routesync.Command) *routesync.CmdAck {
+	if cmd == nil {
+		return nil
+	}
+	copied := *cmd
+	select {
+	case n.cmdCh <- &copied:
+	default:
+	}
+	if cmd.Kind == routesync.CmdCreate || cmd.Kind == routesync.CmdConnect {
+		go func() {
+			time.Sleep(10 * time.Millisecond)
+			n.publish(routesync.RouteEntry{
+				SandboxID: cmd.SID, Group: cmd.Group, RouteKey: cmd.RouteKey,
+				State: routesync.StateRunning, AccessToken: cmd.AccessToken,
+			})
+		}()
+	}
+	if cmd.Kind == routesync.CmdDelete {
+		n.mu.Lock()
+		var sid string
+		for key, route := range n.routes {
+			if route.SandboxID == cmd.SID {
+				delete(n.routes, key)
+				sid = route.SandboxID
+			}
+		}
+		n.mu.Unlock()
+		if sid != "" {
+			n.publishEvent(routesync.Event{Kind: routesync.TypeDelete, SID: sid})
+		}
+	}
+	return &routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted}
+}
+
+func (n *redirectNodeStub) Heartbeat() *routesync.Heartbeat {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return &routesync.Heartbeat{Counts: len(n.routes)}
+}
+
+func (n *redirectNodeStub) BuildEvents() <-chan *routesync.BuildEvent { return nil }
+func (n *redirectNodeStub) OnWake(ctx context.Context, sid string)    {}
+func (n *redirectNodeStub) Policy() routesync.Policy                  { return routesync.Policy{} }
+
+func (n *redirectNodeStub) publish(route routesync.RouteEntry) {
+	key := route.Group + "\x00" + route.RouteKey
+	n.mu.Lock()
+	n.routes[key] = route
+	n.mu.Unlock()
+	n.publishEvent(routesync.Event{Kind: routesync.TypeUpsert, Route: route})
+}
+
+func (n *redirectNodeStub) publishEvent(ev routesync.Event) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	for id, ch := range n.subs {
+		select {
+		case ch <- ev:
+		default:
+			close(ch)
+			delete(n.subs, id)
+		}
+	}
+}
+
+func (n *redirectNodeStub) waitCommand(t *testing.T, kind string) *routesync.Command {
+	t.Helper()
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case cmd := <-n.cmdCh:
+			if cmd.Kind == kind {
+				return cmd
+			}
+		case <-deadline:
+			t.Fatalf("timeout waiting for command %s", kind)
+		}
 	}
 }
 
@@ -314,6 +512,20 @@ func waitNodeLinkProfile(t *testing.T, ctx context.Context, stores *Stores, node
 			owners, ownerErr := stores.NodeOwnerCandidates(ctx, nodeID)
 			t.Fatalf("node %s profile link_owner not readable as %s from writer %s: candidates=%v candidate_err=%v found=%v node=%+v err=%v",
 				nodeID, linkOwner, stores.WriterID(), owners, ownerErr, lastFound, last, lastErr)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func waitRegistryNodeLive(t *testing.T, reg *Registry, nodeID string) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if _, live := reg.node(nodeID); live {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("node %s is not live on registry writer %s", nodeID, reg.stores.WriterID())
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
