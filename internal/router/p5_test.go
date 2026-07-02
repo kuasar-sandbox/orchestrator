@@ -213,7 +213,7 @@ func TestServeDataSignedFileURLAuth(t *testing.T) {
 }
 
 // TestServeDataByKey: a data-plane request carrying group + route-key headers (no
-// prior create) Reserves and forwards to the node (router §4).
+// prior create) Reserves and forwards to the node (cluster-router.md).
 func TestServeDataByKey(t *testing.T) {
 	var gotHost string
 	var reserveHits int

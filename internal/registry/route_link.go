@@ -62,7 +62,7 @@ func (r *Registry) serveVerifyKey(w http.ResponseWriter, req *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
-// ListItem is one row of a group's sandbox listing (cluster-router.md §6: list is
+// ListItem is one row of a group's sandbox listing (cluster-router.md: list is
 // served from the group's SandboxStore shard, no cross-group).
 type ListItem struct {
 	SandboxID  string `json:"sandboxID"`

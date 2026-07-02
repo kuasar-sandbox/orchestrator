@@ -30,13 +30,13 @@ type BuildReserveReq struct {
 }
 
 // defaultBuildResources is one build's resource footprint when the request omits
-// it (cluster.md §7.5 "不指定则使用默认"); a coarse single-build slot.
+// it (cluster.md "不指定则使用默认"); a coarse single-build slot.
 var defaultBuildResources = &routesync.BuildResources{CPU: 1000, Mem: 1 << 30}
 
 const buildRegisterAckTimeout = 5 * time.Second
 
 // ReserveBuild places a build on a resource-eligible node and pre-provisions it
-// (cluster.md §7.5): the registry assigns the build/template ids, resource-aware
+// (cluster.md): the registry assigns the build/template ids, resource-aware
 // PlaceBuild picks a node, the BuildStore commit RESERVES that node's build pool
 // IMMEDIATELY (so concurrent builds don't oversubscribe before heartbeats catch
 // up), and a build_register command hands the node the ids + image-pull creds.

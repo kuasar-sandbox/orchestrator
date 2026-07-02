@@ -21,7 +21,7 @@ import (
 // (group, route_key) identity, so a registry Reserve converges on it).
 
 // HandleCommand executes a registry node-link command and returns a receipt ack
-// (cluster.md §5.1): accepted once the synchronous preconditions hold (key
+// (cluster.md): accepted once the synchronous preconditions hold (key
 // installed, template valid), rejected otherwise. Slow work (a boot/resume/
 // teardown) runs asynchronously so the ack is prompt and the node-link reader
 // isn't blocked; the terminal sandbox state is reported on the route stream,
@@ -55,7 +55,7 @@ func (o *Orchestrator) HandleCommand(ctx context.Context, cmd *routesync.Command
 		}()
 		return accept(cmd)
 	case routesync.CmdKeyPut:
-		// Key distribution (cluster.md §12): refresh the manifest-key allowlist
+		// Key distribution (cluster.md): refresh the manifest-key allowlist
 		// lease so create/build can resolve it by fingerprint. The registry sends
 		// this from node_link heartbeat maintenance, not on the Place path.
 		if cmd.ManifestKeyType == "ref" || cmd.ManifestKeyRef != "" {
@@ -79,7 +79,7 @@ func (o *Orchestrator) HandleCommand(ctx context.Context, cmd *routesync.Command
 		}
 		return accept(cmd)
 	case routesync.CmdBuildRegister:
-		// Pre-provision a registry-assigned build (cluster.md §7.5): create the build
+		// Pre-provision a registry-assigned build (cluster.md): create the build
 		// record with the registry's ids + resolved key, stash the image-pull creds
 		// for this build, and report `registered` up. The e2b trigger (router-
 		// forwarded) then runs it; state flows back as build events.
@@ -107,7 +107,7 @@ type ResourceProbe interface {
 func (o *Orchestrator) SetResourceProbe(p ResourceProbe) { o.probe = p }
 
 // registerClusterBuild pre-provisions a build the registry assigned + placed here
-// (cluster.md §7.5): resolve the tenant key by the predistributed fingerprint,
+// (cluster.md): resolve the tenant key by the predistributed fingerprint,
 // create the build record under the registry's ids, stash the transient image-pull
 // creds, and report `registered` up the node-link.
 func (o *Orchestrator) registerClusterBuild(ctx context.Context, cmd *routesync.Command) error {
@@ -167,7 +167,7 @@ func (o *Orchestrator) publishBuildState(buildID, state, templateID, reason stri
 
 // clusterBuildCreds returns a cluster build's transient image-pull creds (registry
 // auth) if it is registry-driven, so resolveBuildCreds uses them instead of the
-// node's stored registry_auth_enc (cluster.md §7.5: creds are not persisted here).
+// node's stored registry_auth_enc (cluster.md: creds are not persisted here).
 func (o *Orchestrator) clusterBuildCreds(buildID string) (string, bool) {
 	o.clusterBuildMu.Lock()
 	defer o.clusterBuildMu.Unlock()
@@ -180,7 +180,7 @@ func (o *Orchestrator) clusterBuildCreds(buildID string) (string, bool) {
 
 // Heartbeat reports the node's water level for the registry (nodelink.Node):
 // sandbox count + (when resource_listen is on) zone/allocated/pool/draining, and
-// the in-flight build resource alloc. The cluster placer (cluster-scaler.md §4.2)
+// the in-flight build resource alloc. The cluster placer (cluster-scaler.md)
 // excludes draining nodes, filters by zone, and ranks by the water level / count.
 func (o *Orchestrator) Heartbeat() *routesync.Heartbeat {
 	o.mu.Lock()
@@ -202,7 +202,7 @@ const nodectlZoneGreen = "green"
 
 // buildAlloc is the in-flight build resource usage: live builds × the per-build
 // pool (builder vcpu/memory + diff_template scratch). Feeds resource-aware build
-// placement (cluster-scaler.md §4.5); nil when no builds are running.
+// placement (cluster-scaler.md); nil when no builds are running.
 func (o *Orchestrator) buildAlloc() *routesync.BuildResources {
 	o.pendMu.Lock()
 	n := int64(len(o.pend))
@@ -390,7 +390,7 @@ func (o *Orchestrator) deriveSandboxAPIKey(ctx context.Context, sid string) (str
 
 // dropClusterKey removes a manifest key from the node's allowlist by fingerprint.
 // It is best-effort; normal withdrawal relies on TTL expiry when heartbeat
-// refresh stops (cluster.md §12).
+// refresh stops (cluster.md).
 func (o *Orchestrator) dropClusterKey(ctx context.Context, fingerprint string) error {
 	keys, err := o.st.AllowedManifestKeysByHash(ctx, fingerprint)
 	if err != nil {

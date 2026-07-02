@@ -32,7 +32,7 @@ import (
 	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/registry"
 )
 
-// Headers the cluster ingress reads (cluster.md §1.4).
+// Headers the cluster ingress reads (cluster.md).
 const (
 	HeaderGroup     = "X-Kuasar-Sandbox-Group"
 	HeaderRouteKey  = "X-Kuasar-Route-Key"
@@ -407,7 +407,7 @@ func extractBuildID(path string) string {
 // --- sandbox control verbs (forward by sid / group shard) ---
 
 // handleSandboxVerb forwards a sid-scoped control verb (get/kill/pause/timeout/
-// connect/export) to the node holding the sandbox (cluster-router.md §6); kill's
+// connect/export) to the node holding the sandbox (cluster-router.md); kill's
 // teardown propagates back as a route delete, converging the registry.
 func (rt *Router) handleSandboxVerb(w http.ResponseWriter, r *http.Request) {
 	group := r.Header.Get(HeaderGroup)
@@ -427,7 +427,7 @@ func (rt *Router) handleSandboxVerb(w http.ResponseWriter, r *http.Request) {
 	}
 	// Authenticate the caller against the sandbox's group before forwarding (the
 	// node re-authenticates too, but the ingress must not be an open relay / sid
-	// oracle — cluster-router.md §6/§8).
+	// oracle — cluster-router.md/§8).
 	if !rt.authorize(w, r.Context(), group, r.Header.Get(HeaderAPIKey)) {
 		return
 	}
@@ -439,7 +439,7 @@ func (rt *Router) handleSandboxVerb(w http.ResponseWriter, r *http.Request) {
 	rt.forwardToNode(w, r, rr.DataEndpoint)
 }
 
-// handleList returns the group's sandbox shard (cluster-router.md §6: list is
+// handleList returns the group's sandbox shard (cluster-router.md: list is
 // group-local — the registry holds every node's sandboxes for the group).
 func (rt *Router) handleList(w http.ResponseWriter, r *http.Request) {
 	group := r.Header.Get(HeaderGroup)
@@ -590,7 +590,7 @@ func (rt *Router) serveData(w http.ResponseWriter, r *http.Request, host string)
 		http.Error(w, "sandbox not ready", http.StatusServiceUnavailable)
 		return
 	}
-	// Data-plane credential enforcement (cluster-router.md §8): enforce requires
+	// Data-plane credential enforcement (cluster-router.md): enforce requires
 	// either the sandbox's access token or a valid envd /files signature; log warns
 	// on mismatch; off (and unset) skips. Token-auth traffic is re-injected for the
 	// node, but signed /files traffic stays headerless so node proxy and envd verify
@@ -650,7 +650,7 @@ func (rt *Router) forwardSandboxData(w http.ResponseWriter, r *http.Request, rr 
 	proxy.ServeHTTP(w, r)
 }
 
-// serveDataByKey handles by-(group,route-key) data-plane addressing (router §4):
+// serveDataByKey handles by-(group,route-key) data-plane addressing (cluster-router.md):
 // business traffic with no prior create. The caller authenticates by api_key (the
 // per-sandbox token is router-injected, not caller-held); the router Reserves the
 // (group, route_key) sandbox and forwards to it on port E2b-Sandbox-Port.
@@ -1025,7 +1025,7 @@ func (rt *Router) cacheRouteLocked(cacheKey string, now time.Time) *routeResolve
 }
 
 // verifyAuth checks an api key against a group via the control API, caching a
-// valid result for authTTL (cluster-router.md §8). It returns (ok, err): a
+// valid result for authTTL (cluster-router.md). It returns (ok, err): a
 // non-nil err means the control API was unreachable (caller → 503); ok==false
 // with nil err means the key was rejected (caller → 403).
 func (rt *Router) verifyAuth(ctx context.Context, group, apiKey string) (bool, error) {

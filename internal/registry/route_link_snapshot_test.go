@@ -22,7 +22,7 @@ func TestSnapshotRouteRoundTrip(t *testing.T) {
 	}
 
 	var raw bytes.Buffer
-	sum, err := src.ExportSnapshot(ctx, &raw, SnapshotOptions{Kind: "routes", Group: "/g"})
+	sum, err := src.ExportSnapshot(ctx, &raw, SnapshotOptions{Kind: "route_link", Group: "/g"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -61,7 +61,7 @@ func TestSnapshotIncludesBuildRecords(t *testing.T) {
 	}
 
 	var raw bytes.Buffer
-	sum, err := src.ExportSnapshot(ctx, &raw, SnapshotOptions{Kind: "routes", Group: "/g"})
+	sum, err := src.ExportSnapshot(ctx, &raw, SnapshotOptions{Kind: "route_link", Group: "/g"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -113,7 +113,7 @@ func TestSnapshotExportRequiresGroup(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
 	var raw bytes.Buffer
-	if _, err := reg.ExportSnapshot(ctx, &raw, SnapshotOptions{Kind: "routes"}); err == nil {
+	if _, err := reg.ExportSnapshot(ctx, &raw, SnapshotOptions{Kind: "route_link"}); err == nil {
 		t.Fatal("expected group-scoped export to require group")
 	}
 }

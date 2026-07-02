@@ -90,7 +90,7 @@ func runRouter(args []string, log *slog.Logger) error {
 		}()
 	}
 
-	// SO_REUSEPORT so multiple same-host router replicas can share :443 (router §10).
+	// SO_REUSEPORT so multiple same-host router replicas can share :443 (cluster-router.md).
 	lc := net.ListenConfig{Control: func(_, _ string, c syscall.RawConn) error {
 		var serr error
 		if err := c.Control(func(fd uintptr) {

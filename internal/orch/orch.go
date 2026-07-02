@@ -79,7 +79,7 @@ type Orchestrator struct {
 
 // clusterBuild is a registry-driven build's node-side context: its group (for
 // build events) + the transient image-pull creds (used for this build only, never
-// persisted — cluster.md §7.5).
+// persisted — cluster.md).
 type clusterBuild struct {
 	group        string
 	imageRepo    string

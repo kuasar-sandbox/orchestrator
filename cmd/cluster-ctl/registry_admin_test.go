@@ -10,7 +10,7 @@ import (
 	"testing"
 )
 
-func TestRegistryExportDefaultKindUsesRoutes(t *testing.T) {
+func TestRegistryExportDefaultKindUsesRouteLink(t *testing.T) {
 	reg := registry.New(registry.NewStores(), nil, 0, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	mux := http.NewServeMux()
 	reg.ServeRouteLink(mux)
@@ -18,7 +18,7 @@ func TestRegistryExportDefaultKindUsesRoutes(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	cfgPath := writeRegistryAdminTestConfig(t, srv.URL)
-	outPath := t.TempDir() + "/routes.jsonl"
+	outPath := t.TempDir() + "/route_link.jsonl"
 	if err := registryExportCmd([]string{"--config", cfgPath, "--group", "/g", "-o", outPath}); err != nil {
 		t.Fatalf("registry export default kind failed: %v", err)
 	}

@@ -39,10 +39,10 @@ type SnapshotSummary struct {
 
 func (o SnapshotOptions) normalized() (SnapshotOptions, error) {
 	if o.Kind == "" {
-		o.Kind = "routes"
+		o.Kind = "route_link"
 	}
 	switch o.Kind {
-	case "routes":
+	case "route_link":
 	default:
 		return SnapshotOptions{}, fmt.Errorf("registry snapshot: invalid kind %q", o.Kind)
 	}

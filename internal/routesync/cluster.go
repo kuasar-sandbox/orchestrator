@@ -1,6 +1,6 @@
 package routesync
 
-// Cluster node-link message types (node.md §10 / cluster.md §5). They extend the
+// Cluster node-link message types (node.md §10 / cluster.md). They extend the
 // Msg union for the node <-> registry channel: the node DIALS the registry and is
 // the route authority (its sandbox routes flow as Upsert/Delete + Bookmark, with
 // Group/RouteKey set on each RouteEntry), while the registry
@@ -72,12 +72,12 @@ const (
 	CmdCreate        = "create"         // boot a sandbox from a template
 	CmdConnect       = "connect"        // resume a node-local PAUSED sandbox
 	CmdDelete        = "delete"         // destroy a sandbox
-	CmdKeyPut        = "key_put"        // install / renew a manifest-key lease (heartbeat refresh; cluster.md §12)
+	CmdKeyPut        = "key_put"        // install / renew a manifest-key lease (heartbeat refresh; cluster.md)
 	CmdKeyDrop       = "key_drop"       // drop a key lease
 	CmdBuildRegister = "build_register" // pre-provision a build on the node (registry-assigned ids, §7.5)
 )
 
-// TypeBuildEvent: node -> registry, a build's state transition (cluster.md §5.1);
+// TypeBuildEvent: node -> registry, a build's state transition (cluster.md);
 // the registry converges the BuildStore (§6.1) + releases the build's reserved
 // resources on a terminal state.
 const TypeBuildEvent = "build_event"
@@ -100,7 +100,7 @@ const (
 
 // NodeRegister is the node's first up-frame on node-link: its identity + capacity,
 // so the registry can place sandboxes (and later builds) on it and forward the
-// data plane to it (cluster.md §5.1 / §6.1).
+// data plane to it (cluster.md / §6.1).
 type NodeRegister struct {
 	NodeID         string            `json:"node_id"`
 	Labels         map[string]string `json:"labels,omitempty"`          // zone / pool / slot / node (nodeSelectors)
@@ -128,7 +128,7 @@ type BuildResources struct {
 	Storage int64 `json:"storage,omitempty"` // bytes
 }
 
-// Heartbeat is the node's periodic water-level report (cluster.md §5.1). Draining
+// Heartbeat is the node's periodic water-level report (cluster.md). Draining
 // is set by node-side drain (node-resource.md §2.5) so placement excludes the node.
 type Heartbeat struct {
 	Zone       string          `json:"zone,omitempty"`

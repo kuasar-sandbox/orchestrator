@@ -32,7 +32,7 @@ func registryExportCmd(args []string) error {
 	fs := flag.NewFlagSet("registry export", flag.ExitOnError)
 	cfgPath := fs.String("config", "/etc/cluster-ctl/registry.yaml", "registry config file")
 	endpoint := fs.String("endpoint", "", "registry control endpoint override")
-	kind := fs.String("kind", "routes", "records to export: route_link routes and builds")
+	kind := fs.String("kind", "route_link", "records to export: route_link sandbox and build records")
 	group := fs.String("group", "", "exact sandbox-group filter")
 	outPath := fs.String("o", "", "output JSONL file (default stdout)")
 	_ = fs.Parse(args)

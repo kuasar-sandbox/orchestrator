@@ -82,7 +82,7 @@ member:
 membership:
   active: 1
   # next: 2                    # joint 阶段目标版本
-  # old_grace: 1               # cutover 后保留旧成员用于 peer/node_link 入口
+  # old_grace: 1               # cutover 后保留旧成员作为 read-only shardkv 证书/快照来源
   reload_ready_timeout: 10s
   versions:
     - version: 1
@@ -146,7 +146,7 @@ registry 可同时持有三个视图:
 - `active`:客户端定位 route/node/node_list/scale_link owner 的版本。
 - `next`:joint 阶段的目标版本。写入必须同时满足 active quorum 和 next quorum。
 - `old_grace`:cutover 后保留的旧版本。旧成员可作为 peer/node_link 接入或 node-owner RPC 目标,
-  但不参与 owner set,也不能用旧视图提交写入。
+  并作为 shardkv read-only set 提供旧 head 的 snapshot/certificate;但不参与写 owner set,也不能用旧视图提交写入。
 
 ```text
 stable(v1)
@@ -197,7 +197,7 @@ scaler 使用独立 label,默认 `scaler.default`。registry 不配置 scaler �
 ready scaler 由 scaler memberlist meta 表达:
 
 ```json
-{"role":"scaler","id":"s1","api_advertise":"https://s1:7800","memberlist_advertise":"https://s1:7800","ready":true,"ready_label":"registry.2.hash"}
+{"role":"scaler","id":"s1","advertise":"https://s1:7800","ready":true,"ready_label":"registry.2.hash"}
 ```
 
 registry 只把 `role=scaler && alive && ready=true && ready_label==active_registry_label` 的成员作为
@@ -212,7 +212,6 @@ namespace
   └── shardKey
         └── recordSet
               ├── commit Rev
-              ├── recordKey -> value
               ├── recordKey -> value
               └── tombstone(recordKey)
 ```
@@ -264,12 +263,32 @@ owner count 是 registry 内部复制因子。`scale_link.scaler_replica_count` 
 
 ### 4.4 读写协议
 
-写入使用唯一 ballot `(round, writer_id)` 和两阶段 prepare/accept。stable 模式提交条件是当前 owner set
-quorum;joint 模式提交条件是 old quorum + new quorum。
+shardkv 要解决的问题是:registry 不引入每 group/node 的 primary,但任意接入成员都能在目标 shard owner set
+内完成 CAS、读取和 WATCH;同时在单成员故障、membership joint view、局部 repair、tombstone 回收时仍保持
+recordSet committed history 单调一致。
+
+解决思路是把“成员分片”和“数据复制”分开:
+
+- `shardKey` 只决定 owner set。
+- `recordSet` 是 CAS、Rev、WATCH 和提交证书的复制单元。
+- 写入使用唯一 ballot `(round, writer_id)` 和两阶段 prepare/accept。
+- accepted state 先不可见;只有被 quorum 选择出的 committed snapshot 才能安装到 committed view。
+- committed snapshot 携带 `CommitCertificate`,让后续读写即使只看到一个最新副本也能证明该 Rev 已被 quorum
+  决定。
+
+shardkv 在每个 shard view 内区分两个集合:
+
+- `WriteSets`:允许 prepare/accept/install 的集合。stable 为 active;joint 为 active+next;
+  cutover old_grace 阶段为 active。
+- `ReadSets`:允许 read/snapshot/certificate 验证的集合。stable 为 active;joint 为 active+next;
+  cutover old_grace 阶段为 active+old_grace。
+
+stable 模式提交条件是当前 `WriteSets` quorum;joint 模式提交条件是 active quorum + next quorum。
+old_grace 只参与读取和证明旧 head,不参与新写提交。
 
 ```text
 coordinator
-   │ prepare(ballot, expected_rev)
+   │ prepare(ballot)
    ├──────────────► owner A
    ├──────────────► owner B
    └──────────────► owner C
@@ -279,11 +298,125 @@ coordinator
    ├──────────────► owner B
    └──────────────► owner C
           quorum accepted
-   │
-   └── best-effort repair/install to all owners
+   │ install(snapshot, commit_certificate)
+   ├──────────────► owner A
+   ├──────────────► owner B
+   └──────────────► owner C
+          quorum installed, laggards repaired best-effort
 ```
 
-点读默认走 quorum。读不能只取某个 key 的最高 rev;必须确认 recordSet head 在 quorum 视角下可见。
+#### 4.4.1 不变量
+
+shardkv 的正确性建立在以下不变量上:
+
+1. **复制单元是 recordSet**。同一 `(namespace, shardKey, recordSet)` 下只有一条单调递增的 `Rev`
+   序列。一次 commit 最多改变一个 `recordKey`,但它占用整个 recordSet 的下一个 `Rev`。
+2. **成员分片和数据复制分离**。`shardKey` 只决定 owner set;`recordSet` 决定 Rev、CAS 和 WATCH 域。
+   同一 shard 下不同 recordSet 的 Rev 独立递增。
+3. **ballot 全局作用于 recordSet**。`prepare` 会提升 recordSet 级 promise。这样不同 key 的并发写也会
+   在同一 recordSet Rev 序列上定序,不会各自分配相同 `Rev+1`。
+4. **accept 不可见**。owner 收到 `accept` 后只保存 pending accepted record,不写入 committed records,
+   不触发 WATCH,不让普通读返回。只有带提交证书的 install 或 quorum 可验证的 snapshot 才进入
+   committed view。
+5. **每个 owner 持有完整 committed view**。ready owner 可以在本地提供 Snapshot/WATCH;未 ready 的本地
+   view 只能参与 quorum 协议,不能作为完整本地读源。
+
+系统假设 registry 成员是 crash/fail-stop 模型,不会伪造对端响应;通信可能超时、断开、重复,但请求体不被
+拜占庭篡改。`UpdatedAt` 只服务 TTL/GC,不参与一致性排序。
+
+#### 4.4.2 提交证书
+
+accept quorum 已经决定了某个 `Rev` 的值,但只把 accepted state 留在内存里会带来一个可用性问题:如果
+随后一个 accepted 成员故障,剩余 quorum 可能只看到一个最新副本和一个旧副本,无法通过“相同 snapshot
+达到 quorum”恢复最新提交。
+
+因此 coordinator 在 accept quorum 后生成 `CommitCertificate`:
+
+```text
+CommitCertificate {
+  rev      = committed recordSet Rev
+  digest   = hash(rev + canonical live records)
+  ballot   = accepted ballot
+  labels   = membership labels whose owner set accepted quorum
+  members  = accept quorum member ids
+}
+```
+
+`canonical live records` 只包含未删除记录。删除操作仍推进 recordSet `Rev`,因此 delete commit 会改变
+`digest`;但过期 tombstone 是否仍被某个 owner 本地保留,不影响该 `Rev` 的逻辑 committed state。
+
+install 把 full committed snapshot 和 certificate 一起写到 owner。之后 quorum 读 snapshot 时,可用两种方式
+确认 committed head:
+
+```text
+case A: same (rev,digest) snapshot is returned by quorum
+case B: one snapshot carries valid certificate, and certificate.members proves one ReadSet quorum
+```
+
+`case B` 允许“m1/m2 已提交, m3 当时故障;随后 m1 故障, m2+m3 仍可继续写”:m2 携带的 certificate 证明
+`Rev` 已被 m1/m2 accept quorum 决定,coordinator 可把该 snapshot repair 到 m3 后继续分配 `Rev+1`。
+
+`labels` 解决 membership 变更阶段的旧 head 识别问题。V1 稳定阶段提交的 certificate 带 `labels=[V1]`。
+进入 V1+V2 joint 后,第一次触达某个冷 recordSet 时,V2 owner 可能还没有该 head;只要某个 snapshot 携带的
+certificate 对 V1 owner set 满足 quorum,它仍然是已提交 head。coordinator 先把这个 head install/repair 到
+joint owner set,再执行下一次写。joint 阶段产生的新 certificate 会同时带 V1/V2 labels,因为新写必须满足
+old quorum + new quorum。
+
+cutover 到 `active=V2,old_grace=V1` 后,V1 不再进入 `WriteSets`,但仍进入 `ReadSets`。冷 recordSet 第一次
+由 V2 访问时,V1 certificate 仍可证明旧 head;registry 会把旧 head repair 到 V2 write owners 后继续读写。
+一旦 V2 write owners 已持有带 certificate 的 committed head,后续读写只要求 V2 write quorum 在线;不再要求
+V1 old_grace quorum 同时在线。
+只有 `old_grace` 退出后,V1 certificate 才不再作为当前 shard view 的证明来源。切换期间仍禁止绕过 joint view
+的 old-only 写和 new-only 写并发执行。
+
+如果 coordinator 在 accept quorum 之后、install quorum 之前失败,下一次写的 prepare 会读到 pending accepted
+record。新 coordinator 必须先用新 ballot 完成该 pending record 并安装 certificate,再处理自己的写。对调用方而言,
+这种阶段性失败的 CAS 返回 `ErrQuorum` 时结果是 unknown:调用方必须按 `(recordKey, expectRev)` 重新读/重试,
+不能假设该写一定未发生。
+
+install 还必须遵守本地单调规则:
+
+- 本地 view 已持有提交证书时,不能被更低 `Rev` 覆盖。
+- 同一 `Rev` 下,只有 canonical digest 相同的 snapshot 才能互相替换;这用于 tombstone 保留/压缩形态转换。
+- 同一 `Rev` 下 canonical digest 不同,代表两个不同 committed histories,必须拒绝并让上层重试/报冲突。
+- 无证书本地 view 只视为待修复缓存,可被 quorum 选择出的 committed snapshot 覆盖。
+
+#### 4.4.3 写正确性
+
+一次成功 CAS 的线性化点是 accept quorum 决定该 `Rev` 的时刻;成功返回则额外要求 install quorum 已保存
+committed snapshot/certificate,保证后续即使另一个成员故障也能恢复该提交。
+
+为什么两个不同值不能同时以同一 Rev 提交:
+
+- 每次写使用唯一 ballot `(round, writer_id)`。
+- 任意两个 quorum 在同一个 member set 内相交;joint view 要求 old quorum 和 new quorum 都满足,因此与
+  old-only / new-only 操作也保持交集。membership 变更期间不能允许绕过 joint view 的 old-only 写和
+  new-only 写并发执行。
+- 相交 owner 在 prepare 后会拒绝更低 ballot 的 accept。
+- 如果相交 owner 已保存 pending accepted record,后续更高 ballot 的 writer 会在 prepare 响应中看到它,
+  并先完成该 record。新写不会跳过已 accepted 的 `head+1`。
+- owner 拒绝 `rec.rev > local_rev+1` 的 accept,防止 coordinator 跳过中间 Rev。
+
+因此 recordSet 的 committed history 是一条线性序列。CAS 的 `expectRev` 匹配的是目标 record 的最后修改
+Rev;当目标 key 未变化而其他 key 推进了 recordSet Rev 时,该 key 的 `expectRev` 不会被无关写破坏。
+
+#### 4.4.4 读正确性
+
+点读默认走 quorum,但不必每次都拉取 full snapshot:
+
+```text
+read(key) from all ReadSet members
+  ├─ if same record version is visible on WriteSet quorum: return it and repair write laggards
+  ├─ if ReadSet quorum reports not found and no ReadSet member reports a record: return not found
+  └─ otherwise fetch committed snapshot, choose committed head, install/repair, then read key
+```
+
+返回某个 record version 的条件是该版本本身在 quorum 中可见。若该 key 在更高 Rev 被修改/删除,成功返回的
+写已把新版本安装到 `WriteSets` quorum;读到的 `ReadSets` 与当前/旧提交证书集合相交,不会把旧版本误判为
+quorum-visible。not found 也必须由 `ReadSets` quorum 证明;old_grace 阶段不能只凭 active 空副本判定旧
+recordSet 不存在。若存在单副本高版本、或不同副本冲突,点读必须退回 committed snapshot 选择逻辑。
+
+Snapshot/EnsureReady 总是先选择 committed head,再 install 到本地并标记 `(label, Rev)` ready。
 若本地 recordSet 视图已经 ready,调用方可使用 `ReadOptions`:
 
 | 选项 | 行为 |
@@ -293,8 +426,46 @@ coordinator
 | `ReadLocal` | 只读本地 ready view;未 ready 返回 local-view-behind |
 | `ReadLocal + MinRev` | 本地 ready view 的 Rev 不足时返回 local-view-behind |
 
-本地完整视图只由 `EnsureReady` / `Snapshot` / `Watch` 建立。普通 accept 或 read-repair 把记录安装到本地,
-但不会把该 recordSet 标记为完整 ready。
+本地完整视图只由 `EnsureReady` / `Snapshot` / `Watch` 建立。普通 accept 只保存 pending accepted;
+read-repair 可安装单条 committed record,但不会把该 recordSet 标记为完整 ready。
+
+#### 4.4.5 WATCH 正确性
+
+WATCH 只基于 committed records:
+
+- accept pending 不入 watch log,也不会唤醒订阅者。
+- 连续单条 commit 以 put/delete delta 追加 watch log。
+- install snapshot 若不是本地 `rev+1` 的单条提交,会 reset 订阅者,要求消费者重新接收完整 snapshot。
+- token 包含 epoch、membership label 和 recordSet Rev。epoch/label 不匹配或 log 被压缩时,消费者必须
+  重新订阅 reset。
+
+因此 WATCH 是 committed view 的增量缓存,不是复制协议本身。复制和修复仍由 quorum read/CAS/install 保证。
+
+#### 4.4.6 效率边界
+
+当前实现优先优化“海量 shard、每个 recordSet 小到中等规模”的场景:
+
+| 操作 | RPC 轮次 | 载荷 | 说明 |
+|---|---:|---|---|
+| 点读命中 quorum-visible record | 1 | O(1) record | 热路径;可顺带 repair laggard |
+| 点读全 quorum miss | 1 | O(1) record | 没有 ReadSet 成员返回该 key 时直接 not found |
+| 点读冲突/落后 | read + snapshot/install | O(recordSet) snapshot | 用于确认 committed head |
+| CAS | prepare + snapshot + accept + install | snapshot/install 为 O(recordSet) | 冷路径;并行打 owner set |
+| Snapshot/Watch 初始 | snapshot + install | O(recordSet) | 建立本地完整 ready view |
+| WATCH delta | 0 额外 RPC | O(1) event | 仅本地 committed install 后广播 |
+
+`N=3` 时稳定写通常是 4 个并行 RPC round。Reserve/create/build/import lease 都是冷路径,相对沙箱启动和构建
+耗时可接受;router 数据面热路径不写 shardkv。成本主要随单个 recordSet 的记录数增长,不随全局 group/node
+数量增长,因为 registry 不跨 shard 扫描。
+
+设计约束:
+
+- recordSet 不应承载无界大表。group 下 sandbox/build、node 下 sandbox/build/key、node_list 低频目录都应
+  保持可分页/可淘汰/可按事实源重投影。
+- 如果未来某 recordSet 需要高频大表写,应把提交证书改成基于前一 digest 的 delta certificate,或拆分
+  recordSet;不能继续依赖 full snapshot install。
+- member readiness 只做 fail-fast 和 liveness,不改变 quorum 计算;owner count=3 时运行期只承诺逻辑分片视角
+  的单成员故障容忍。
 
 ### 4.5 WATCH
 
@@ -314,12 +485,23 @@ route owner 内部也使用 shardkv watch log 唤醒本进程 waiter,但这不�
 
 ### 4.6 GC
 
-shardkv compactor 只回收本成员已经持有的本地副本:
+GC 要解决的是本地存储和 WATCH reset snapshot 膨胀,不是数据迁移。它必须保持两个边界:
+
+- 不跨 shard 枚举。
+- 不改变 recordSet committed history。
+
+tombstone 是 delete 后的保留记录,用于短期 `GetRecord`、WATCH reset 和调试;逻辑读写只关心“该 key 当前是否
+存在”。因此 tombstone 保留期到期后可以只在本地删除。提交证书的 canonical digest 排除 deleted records,
+所以同一 `Rev` 下“仍保留 tombstone”和“已压缩 tombstone”的 owner 是等价 committed snapshot,不会产生
+同 Rev 冲突。
+
+compactor 的执行规则:
 
 - tombstone 保留期到期且 owner 成员 ready 时,删除本地 tombstone。
+- compact 前先通过 recordSet 的 committed-head 选择修复本地视图,避免在落后副本上回收。
 - 非 pinned namespace 的空闲本地 shard 到期后释放。
 
-GC 不跨 shard 枚举,不触发数据迁移。活跃记录仍由对应 namespace 的事实源和同 shard 读写触达。
+GC 不触发数据迁移。活跃记录仍由对应 namespace 的事实源和同 shard 读写触达。
 
 ## 5. Membership 变更
 
@@ -340,7 +522,7 @@ repair            = best-effort to jointOwners
 V1 owners for group G: A,B,C
 V2 owners for group G: B,D,E
 
-joint owner set: A,B,C,D,E
+joint write sets: A,B,C + B,D,E
 commit requires: quorum(A,B,C) + quorum(B,D,E)
 ```
 
@@ -353,6 +535,11 @@ membership 切换不是全局迁移任务。registry 不扫描所有 group/node�
 - node owner 按当前 membership 持续把低频 profile 投影到 node_list。
 - group 请求、node 上报、group-scoped list/export 触达对应 route_link recordSet 时做 catch-up/read-repair。
 - scaler import/source lease、cursor、selector patch 通过 `scale_link` 当前 owner set 维护。
+
+首次触达旧 recordSet 时,旧 membership certificate 可证明旧 head,随后由同一次读写 repair 到当前 `WriteSets`。
+因此 joint/cutover 变更不需要跨 shard 扫描。cutover 后的 `old_grace` 继续作为 `ReadSets` 的 read-only 来源,
+保证冷 recordSet 不会被 active 空副本误判为不存在。但 cutover 必须是受控动作:在 active/next joint 期间,
+所有新写都必须使用 joint view;不能让部分成员提前只按 next view 写,否则不同 membership quorum 之间不再有协议保证。
 
 ## 6. node_link
 
@@ -397,8 +584,24 @@ node_link 维护以下 recordSet:
 - `build`:该 node 上 build 的 group/build_id/state。
 - `manifest_key`:selector patch 刷新的 key cache。
 
-高频水位保留在 node_link owner 本地,不通过 node_list 高频扇出。低频 liveness / draining / profile 变化才投影
-到 node_list。
+心跳只更新 `profile` recordSet 中的 runtime/liveness 字段,不得重写 `sandbox`、`build`、`manifest_key`
+recordSet。后三个 recordSet 只能由对应事实事件或 selector patch 更新,避免高频心跳把无关 recordSet 的 CAS
+队列拖慢。
+
+node_link 流按事件重要性处理:
+
+- `upsert/delete` route event、`cmd_ack` 和 build event 是收敛关键事件,必须在读循环中立即处理。
+- heartbeat 是最新值语义。registry 读循环只把最新 heartbeat 投递给每 node 一个异步合并 updater;updater 慢时
+  旧 heartbeat 可被覆盖。
+- node 侧发送也分优先级:command ack/build event 先进 high-priority outbox;heartbeat 只保留最新一条。
+- `StreamAuthority` 在写侧优先刷新 route event,避免 route READY/DEAD 排在心跳后面。
+
+这样 Reserve 的 READY route report 不会被心跳持久化阻塞。若 READY 晚于 park timeout 到达,route owner 会按
+当前 `(group,route_key,sandbox_id)` 判定为 orphan 并删除 node 上孤儿 sandbox;但这应是异常退避路径,不是常态。
+
+高频水位不通过 node_list 高频扇出。低频 liveness / draining / profile 变化才投影到 node_list。
+node_link profile 写入失败会拒绝订阅;node_list 投影失败不应断开 node_link,后续 register/heartbeat/resync 会再次
+投影。
 
 ### 6.3 增量订阅
 
@@ -654,15 +857,13 @@ node_link build_register command
 node build_event releases/adapts state
 ```
 
-node owner 若资源余量不足直接拒绝,route owner 重新调度。`build_id` 查询必须带 group。没有 `build_link`
-namespace。
+node owner 若资源余量不足直接拒绝,route owner 重新调度。`build_id` 查询必须带 group。
 
 ## 13. 导入导出
 
 registry export/import 覆盖 registry 执行态灾备数据:
 
-- route records
-- build execution records
+- `kind=route_link`:导出指定 group 下的 `route_link/sandbox` route records 和 `route_link/build` build execution records
 
 JSONL 行使用显式类型:
 
@@ -686,7 +887,7 @@ manifest_key 由 scaler/provider 侧负责导入导出。
 | node 整机重启 | node 清空运行态;缺失 sandbox 经 node 上报/清理收敛为 dead route |
 | registry 单成员故障 | owner set quorum 足够时继续服务;恢复后由同 shard 访问或事实源上报触发 read-repair |
 | registry 多成员故障导致 quorum 不足 | 对应 shard 停写,不降级乱写 |
-| membership 变更 | active/next joint quorum + old_grace 接入保留 |
+| membership 变更 | active/next joint 写 quorum + old_grace read-only 证书/快照来源 |
 | 整集群下电 | 不自动恢复运行中 sandbox;可手动导入外部持久化执行态 |
 
 ## 15. 性能

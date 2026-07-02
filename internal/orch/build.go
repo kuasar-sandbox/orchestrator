@@ -168,7 +168,7 @@ func (o *Orchestrator) resolveBuildCreds(ctx context.Context, b *types.Build, pu
 	case regUser != "":
 		creds = regcreds.Creds{Username: regUser, Password: regPass}
 	case isCluster:
-		// Cluster build: use the registry-delivered transient creds (cluster.md §7.5),
+		// Cluster build: use the registry-delivered transient creds (cluster.md),
 		// not the node's stored registry_auth_enc.
 		creds = regcreds.CredsForImage(clusterAuth, b.FromImage)
 	default:

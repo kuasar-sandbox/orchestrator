@@ -155,7 +155,7 @@ func TestReserveBuildResourceAware(t *testing.T) {
 }
 
 // TestReserveBuildDefaultResources: an unspecified request uses the default pool
-// footprint (cluster.md §7.5 "不指定则使用默认").
+// footprint (cluster.md "不指定则使用默认").
 func TestReserveBuildDefaultResources(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
