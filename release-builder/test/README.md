@@ -1,34 +1,41 @@
 # Cross-repo e2e / perf harness
 
-System-level integration + performance suites for the kuasar-sandbox platform
-(shell-driven; they build the binaries, boot real microVMs, and drive the
-full stack end to end). This is their home because they span every sub-repo.
+System-level integration and performance suites for the kuasar-sandbox
+platform. This directory is the umbrella test home under
+`orchestrator/release-builder` because these cases span multiple sibling repos
+and consume the aggregated `bin/<arch>/` artifact set.
 
-## Status after the monorepo → multi-repo split
+## Entry Points
 
-The scripts were authored against the single-repo layout: they call
-`make build` / `make cloud-hypervisor` / `make vmlinux` at one root and expect
-all binaries under one `bin/`. Under the org layout each binary is produced by
-its own repo, so the harness's **build + binary-discovery steps need
-adaptation**. Two equivalent ways to supply binaries:
+From `orchestrator/release-builder`:
 
-1. Build the aggregated bundle and point the harness at it:
+```bash
+make build
+make test-e2e
+make test-e2e-sandbox-cold
+make perf
+make demo
+```
 
-   ```bash
-   ../scripts/release.sh v0.1.0 --with-natives
-   export SANDBOX_BIN=../dist/kuasar-sandbox-v0.1.0-linux-$(uname -m)/bin
-   ```
+From the org root:
 
-2. Build each repo (`GOWORK=off make build` in accelerator / -runtime /
-   -sentinel / -builder / -vswitch, and `make` targets in guest-runtime/native-deps) and
-   collect the binaries into one directory.
+```bash
+make -C orchestrator/release-builder build
+make -C orchestrator/release-builder test-e2e
+make -C orchestrator/release-builder release
+```
 
-The test bodies themselves are unchanged; the inline node-ctl client in
-`e2e/e2e_node_ctl.sh` already imports the relocated protocol
-(`sandboxer/pkg/resource`, aliased `nodectl`).
+`make build` drives `guest-runtime/native-deps`, `accelerator`, `sandboxer`,
+`guest-runtime`, `connector`, and `orchestrator`, then collects their artifacts
+into `orchestrator/release-builder/bin/<arch>/`. Individual scripts default to
+`SCRIPT_DIR/../../bin`, so release-package layout and source-tree layout use the
+same binary discovery convention. `BIN=/path/to/bin` can override it.
 
 ## Suites
 
-- `e2e/` — cold boot, tapfd networking, snapshot/restore, node-ctl protocol, density.
-- `perf/` — density system load harness + dedup report.
-- `scripts/`, `results/` — helpers and recorded baselines.
+- `e2e/` — cold boot, tapfd networking, snapshot/restore, manifest/cache/store,
+  node orchestration, e2b-compatible execution, and cluster stub coverage.
+- `perf/` — sandbox latency, manifest path latency, and density harnesses.
+- `demo/` — e2b SDK walkthrough driven by `demo_prep.sh` and `demo_e2b.sh`.
+
+See `QUICKSTART.md` for release-package usage and prerequisite details.

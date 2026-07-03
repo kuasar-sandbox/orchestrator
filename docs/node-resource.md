@@ -743,4 +743,4 @@ cache-ctl / store-ctl 的资源占用是 host 预留的一部分,计入
 - [`cache.md`](cache.md) / [`store.md`](store.md) —— 资源预留计入 host_reserved
   的两个组件
 - [`perf.md`](perf.md) —— agent-intermittent 工作负载模型实测、密度调优
-- `kuasar-sandbox/docs/kuasar-sandbox.md` §1.1 / §4.7 —— 高密度承载与超分场景的业务定位
+- `orchestrator/release-builder/docs/kuasar-sandbox.md` §1.1 / §4.7 —— 高密度承载与超分场景的业务定位

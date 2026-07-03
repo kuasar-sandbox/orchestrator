@@ -319,4 +319,4 @@ HTTP/2 经 `WriteHeader(200)` + 请求 / 响应流对拷。它覆盖每条数据
 - [cluster-router.md](cluster-router.md) — 集群级数据面入口:经本节点数据端点转发进 proxy,
   注入 `E2b-Sandbox-Id` + `X-Access-Token`。
 - `connector/docs/vswitch.md` — mgmt-extract 把 MMDS VIP 直译到本进程(§8)。
-- `kuasar-sandbox/docs/deployment.md` — 部署拓扑、端口与故障域。
+- `orchestrator/release-builder/docs/deployment.md` — 部署拓扑、端口与故障域。

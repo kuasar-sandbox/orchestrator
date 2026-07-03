@@ -1142,7 +1142,7 @@ serve 重启后以 `ListUnitsByPatterns("sandbox-runner@*.service")` 为存活�
 往返)/routetable(世代清扫)、plugin 注册表(同 id 顶替/分片)、proxy CONNECT 隧道 +
 网关链式 relay、mmds(确定性密钥)、单飞、沙箱配置注入(命名空间解析/容量折叠/网络合并)、
 migrate、node-link(注册/事件/命令往返)等)。跨仓 e2e 集中在 umbrella
-`kuasar-sandbox/test/e2e/`(需多仓产物:vmlinux/cloud-hypervisor/mkfs.erofs/
+`orchestrator/release-builder/test/e2e/`(需多仓产物:vmlinux/cloud-hypervisor/mkfs.erofs/
 sandbox-runtime.erofs 等),均已注册为 umbrella make 目标,缺前置则自跳过
 (`REQUIRE_*=1` 改为硬失败):
 
@@ -1156,7 +1156,7 @@ sandbox-runtime.erofs 等),均已注册为 umbrella make 目标,缺前置则自�
 | `orchestrator/test/e2e/e2e_cluster_stub.sh` | 用 `make build` 产物真实启动 `cluster-ctl registry/router/placer` + `node-stub-ctl`,覆盖 group 导入、key 分发、Reserve→READY→数据面转发、活动路由缓存、build_register、孤儿 route 清理、节点清空和 registry joint/old_grace cutover | `orchestrator: make test-e2e` |
 
 本仓 `make test-e2e` 运行集群 stub e2e,不依赖 KVM/root/systemd。真实 microVM 端到端路径由
-umbrella 仓的 e2e 脚本聚合执行。
+`orchestrator/release-builder` umbrella 目录的 e2e 脚本聚合执行。
 
 ## 17. See Also
 
@@ -1175,5 +1175,5 @@ umbrella 仓的 e2e 脚本聚合执行。
   `FLATTEN_REGISTRY_*`
 - `accelerator/docs/manifest.md` —— manifest 内容键、收敛加密与去重域
   (§7 的存储侧)
-- `kuasar-sandbox/docs/deployment.md` —— 节点部署拓扑中本组件的位置与单元安装
-- `kuasar-sandbox/test/demo/DEMO.md` —— e2b CLI/SDK 全流程演示
+- `orchestrator/release-builder/docs/deployment.md` —— 节点部署拓扑中本组件的位置与单元安装
+- `orchestrator/release-builder/test/demo/DEMO.md` —— e2b CLI/SDK 全流程演示

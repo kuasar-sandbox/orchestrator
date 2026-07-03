@@ -920,4 +920,4 @@ import、key 分发、Reserve、数据面转发、active cache、BuildRegister�
 - [cluster-placer.md](cluster-placer.md) — group provider/importer、WATCH_LIST、Place 与 key distribution。
 - [node.md](node.md) — node-ctl 单机主机与 node-link 节点侧行为。
 - [node-proxy.md](node-proxy.md) — node 数据面 proxy、routesync 与 CONNECT。
-- `kuasar-sandbox/docs/deployment.md` — 部署拓扑、端口、启停与故障域。
+- `orchestrator/release-builder/docs/deployment.md` — 部署拓扑、端口、启停与故障域。
