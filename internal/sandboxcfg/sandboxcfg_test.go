@@ -74,7 +74,7 @@ func baseParams(profile types.Profile) Params {
 	tmpl := types.TemplateID{Profile: profile, Kind: types.KindImg, Key: strings.Repeat("a", 64)}
 	return Params{
 		Sandbox:  &types.Sandbox{ID: "s1", TemplateID: tmpl.String(), InnerIP: "10.0.0.5/30", PortMAC: "02:00:00:00:00:01"},
-		Template: tmpl, RuntimeE2B: "/r/e2b.erofs", RuntimeBase: "/r/base.erofs", Kernel: "/r/vmlinux",
+		Template: tmpl, Runtime: "/r/sandbox-runtime.erofs", Kernel: "/r/vmlinux",
 		VCPU: 2, Memory: "2GiB",
 	}
 }

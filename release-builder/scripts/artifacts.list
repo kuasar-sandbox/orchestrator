@@ -9,11 +9,9 @@ accelerator              cache-ctl
 accelerator              flatten-ctl
 sandboxer                sandbox-ctl
 sandboxer                sandbox-init
-sandboxer                sandbox-runtime.erofs
+guest-runtime            sandbox-runtime.erofs
 orchestrator             node-ctl
 orchestrator             cluster-ctl
 orchestrator             node-stub-ctl
 connector                connector-ctl
 orchestrator             e2b-key-ctl
-orchestrator             sandbox-runtime-e2b.erofs
-orchestrator             sandbox-runtime-builder.erofs

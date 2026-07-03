@@ -39,9 +39,10 @@ GO_REPOS       := accelerator sandboxer connector orchestrator
 
 # Cross-repo e2e tests this repo carries (each needs binaries from multiple
 # sub-repos: vmlinux/CH/mkfs.erofs from guest-runtime/native-deps,
+# sandbox-runtime.erofs from guest-runtime,
 # manifest-ctl/store-ctl/cache-ctl/flatten-ctl from accelerator,
-# sandbox-ctl from sandboxer, connector-ctl from connector, node-ctl from
-# orchestrator, etc.).
+# sandbox-ctl/sandbox-init from sandboxer, connector-ctl from connector,
+# node-ctl from orchestrator, etc.).
 #
 # Auto-derived from the filesystem so `make test-e2e` always runs EVERY e2e script
 # (drop an e2e_*.sh into test/e2e/ and it is included — no list to forget). The
@@ -59,26 +60,18 @@ PERF_TARGETS := perf-sandbox perf-sandbox-manifest perf-density
 
 all: build
 
-# Full platform build. Sub-repo order matters: guest-runtime/native-deps leads (mkfs.erofs
-# is needed by sandboxer to pack the guest erofs). Each sub-repo's
-# `build` builds every binary it ships. After all sub-builds, `collect`
+# Full platform build. Sub-repo order matters: guest-runtime/native-deps leads
+# (mkfs.erofs is needed by guest-runtime), sandboxer builds sandbox-init before
+# guest-runtime packs the guest erofs. Each sub-repo's `build` builds every binary it ships. After all sub-builds, `collect`
 # assembles every artifact under bin/$(TARGET_ARCH)/; then the e2b guest runtime
-# (sandbox-runtime-e2b.erofs) is assembled from the collected envd + base erofs +
-# erofs tools, and a second `collect` folds it into bin/$(TARGET_ARCH)/.
+# the single guest runtime already contains envd/flatten-ctl/mkfs.erofs.
 build:
 	$(MAKE) -C $(ORG)/guest-runtime/native-deps build
 	$(MAKE) -C $(ORG)/accelerator build
 	$(MAKE) -C $(ORG)/sandboxer build
+	$(MAKE) -C $(ORG)/guest-runtime build
 	$(MAKE) -C $(ORG)/connector build
 	$(MAKE) -C $(ORG)/orchestrator build
-	@$(MAKE) collect
-	$(MAKE) -C $(ORG)/orchestrator sandbox-runtime-e2b \
-	  BASE_RUNTIME=$(SBIN)/sandbox-runtime.erofs ENVD=$(SBIN)/envd \
-	  FSCK=$(SBIN)/fsck.erofs MKFS=$(SBIN)/mkfs.erofs
-	$(MAKE) -C $(ORG)/orchestrator sandbox-runtime-builder \
-	  BASE_RUNTIME=$(SBIN)/sandbox-runtime.erofs ENVD=$(SBIN)/envd \
-	  FSCK=$(SBIN)/fsck.erofs MKFS=$(SBIN)/mkfs.erofs \
-	  FLATTEN_CTL=$(SBIN)/flatten-ctl MKFS_GUEST=$(SBIN)/mkfs.erofs
 	@$(MAKE) collect
 
 # Assemble bin/$(TARGET_ARCH)/ from each sub-repo's per-arch bin per the
@@ -159,7 +152,7 @@ test:
 	@for r in $(GO_REPOS); do echo "== test $$r =="; $(MAKE) -C $(ORG)/$$r test || exit 1; done
 
 clean:
-	@for r in $(GO_REPOS) guest-runtime/native-deps; do $(MAKE) -C $(ORG)/$$r clean 2>/dev/null || true; done
+	@for r in $(GO_REPOS) guest-runtime; do $(MAKE) -C $(ORG)/$$r clean 2>/dev/null || true; done
 	rm -rf bin build dist
 
 help:

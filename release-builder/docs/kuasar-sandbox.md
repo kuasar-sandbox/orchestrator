@@ -160,24 +160,27 @@ sandbox group provider/importer 做放置决策。分层缓存(L1/L2)是可替�
 | 仓 | 角色 | 关键进程/产物 | 导出面 | 详设 |
 |---|---|---|---|---|
 | **kuasar-sandbox**(本仓) | 系统文档 + 发布聚合 + 跨仓 e2e/perf | `release.sh` 下载即用包 | — | 本文 + `deployment.md`/`perf.md` |
-| **sandbox-runtime** | microVM 生命周期引擎:一沙箱一进程的沙箱控制(块设备/快照代理、内存统一持有、balloon 环)+ Guest 一号进程 | `sandbox-ctl`、`sandbox-init`、`sandbox-runtime.erofs` | `pkg/resource`(资源控制协议+Client) | `sandboxer/docs/sandbox.md`、`sandbox-runtime.md` |
+| **sandboxer** | microVM 生命周期引擎:一沙箱一进程的沙箱控制(块设备/快照代理、内存统一持有、balloon 环)+ Guest 一号进程源码 | `sandbox-ctl`、`sandbox-init` | `pkg/resource`(资源控制协议+Client) | `sandboxer/docs/sandbox.md`、`sandboxer/docs/sandbox-runtime.md` |
 | **accelerator** | 存储加速 + 镜像构建:分块/收敛加密/清单库 + 内容寻址存储 + 分层缓存 + OCI → EROFS 确定性展平(远程拉取 + Referrers 幂等) | `manifest-ctl`、`store-ctl`、`cache-ctl`、`flatten-ctl` | `pkg/manifest`、`pkg/image`、`pkg/{cache,store}/client` | `accelerator/docs/{manifest,store,cache,flatten}.md` |
 | **connector** | eBPF/TC 虚拟交换机:单节点 4096 端口隔离网络 + tapfd 交接 | `connector-ctl vswitch`、`connector-ctl tapfd get` | `pkg/tapfd`(fd 交接规约) | `connector/docs/{vswitch,tapfd}.md` |
-| **orchestrator** | 单机沙箱编排 + e2b 兼容 ingress:控制面 REST、envd-in-guest 反代、模板构建(沙箱内三阶段)、密钥派生 + 节点级资源守护(准入/额度分配/主动回收)+ 集群控制面(registry/router/placer)与 stub e2e 节点 | `node-ctl`、`cluster-ctl`、`node-stub-ctl`、`e2b-key-ctl`、`sandbox-runtime-{e2b,builder}.erofs` | — | `orchestrator/docs/{node,node-proxy,node-resource,cluster,cluster-router,cluster-placer}.md` |
-| **guest-runtime/native-deps** | 原生依赖:定制 Guest 内核、VMM 补丁、erofs 工具 | `vmlinux`、`cloud-hypervisor`、`mkfs.erofs` | 构建脚本 + patches + configs | `guest-runtime/native-deps/docs/{cloud-hypervisor,sandbox-kernel,build}.md` |
+| **orchestrator** | 单机沙箱编排 + e2b 兼容 ingress:控制面 REST、envd-in-guest 反代、模板构建(沙箱内三阶段)、密钥派生 + 节点级资源守护(准入/额度分配/主动回收)+ 集群控制面(registry/router/placer)与 stub e2e 节点 | `node-ctl`、`cluster-ctl`、`node-stub-ctl`、`e2b-key-ctl` | — | `orchestrator/docs/{node,node-proxy,node-resource,cluster,cluster-router,cluster-placer}.md` |
+| **guest-runtime** | Guest runtime 镜像与原生依赖:打包 `sandbox-init`,构建定制 Guest 内核、VMM 补丁、erofs 工具 | `sandbox-runtime.erofs`、`vmlinux`、`cloud-hypervisor`、`mkfs.erofs` | 构建脚本 + patches + configs | `guest-runtime/docs/sandbox-runtime.md`、`guest-runtime/native-deps/docs/{cloud-hypervisor,sandbox-kernel,build}.md` |
 
 ### 2.3 依赖关系
 
 ```
- accelerator   connector   guest-runtime/native-deps        (T0: no internal deps)
+ accelerator   connector   guest-runtime/native-deps        (T0: no internal Go deps)
    (storage + flatten)       ▲
         ▲                    │ pkg/tapfd
         │ pkg/manifest+image │
         └────────────────────┤
- sandbox-runtime ────────────┘                              (T1)
+ sandboxer ─────────────────┘                              (T1: sandbox engine)
         ▲
         │ pkg/resource  (orchestrator CLI: run-sandbox→sandbox-ctl + connector-ctl vswitch;run-builder→沙箱内 flatten-ctl)
  orchestrator   (e2b ingress + node-ctl)            (T2)
+
+ guest-runtime consumes sandboxer/bin/<arch>/sandbox-init and native-deps/mkfs.erofs
+ to build sandbox-runtime.erofs; it is a release artifact dependency, not a Go import edge.
 ```
 
 实线是 Go 导入边。`orchestrator` 不 import 任何兄弟仓(`CGO_ENABLED=0`
@@ -761,7 +764,8 @@ Cold boot (1 GiB image):                 Snapshot restore (512 MiB):
   依赖、故障域。
 - [`perf.md`](perf.md) — 实测性能基线、回归 checklist 与调优杠杆。
 - `sandboxer/docs/sandbox.md` — 沙箱控制(`sandbox-ctl`)完整生命周期与
-  配置 schema;`sandbox-runtime.md` — Guest 一号进程。
+  配置 schema;`sandboxer/docs/sandbox-runtime.md` — Guest 一号进程协议与实现。
+- `guest-runtime/docs/sandbox-runtime.md` — Guest runtime 镜像打包与发布边界。
 - `accelerator/docs/{manifest,store,cache}.md` — 清单格式与读写管线、
   内容寻址存储与代轮转、分层缓存三形态。
 - `accelerator/docs/flatten.md` — 确定性展平、远程拉取与 Referrers 幂等。

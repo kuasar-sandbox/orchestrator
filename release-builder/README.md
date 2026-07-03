@@ -20,17 +20,18 @@
 | 仓 | 角色 | 导出面 / 产物 |
 |---|---|---|
 | **orchestrator/release-builder**(本目录) | 系统文档 + 发布聚合 + 跨仓 e2e/perf | `scripts/release.sh`、`docs/`、`test/` |
-| **sandboxer** | microVM 生命周期引擎(host `sandbox-ctl` + guest `sandbox-init`)+ vhost 块后端 | `pkg/resource`(资源控制协议+Client)、`sandbox-runtime.erofs` |
-| **orchestrator** | 单机 e2b 兼容沙箱编排/ingress(控制面 + envd-in-guest 反代 + 模板构建)+ 节点级资源守护(准入/分配/回收,3,000+ 密度) | `node-ctl` + `cluster-ctl` + `e2b-key-ctl`、`sandbox-runtime-{e2b,builder}.erofs` |
+| **sandboxer** | microVM 生命周期引擎(host `sandbox-ctl` + guest `sandbox-init`)+ vhost 块后端 | `pkg/resource`(资源控制协议+Client)、`sandbox-ctl`、`sandbox-init` |
+| **orchestrator** | 单机 e2b 兼容沙箱编排/ingress(控制面 + envd-in-guest 反代 + 模板构建)+ 节点级资源守护(准入/分配/回收,3,000+ 密度) | `node-ctl` + `cluster-ctl` + `node-stub-ctl` + `e2b-key-ctl` |
 | **accelerator** | 存储加速 + 镜像构建:内容寻址存储 + 分层缓存 + 收敛加密 + OCI → EROFS 确定性展平 | `pkg/manifest`、`pkg/image`、`pkg/{cache,store}/client` + `flatten-ctl` |
 | **connector** | eBPF/TC 虚拟交换机 + tapfd 交接 | `pkg/tapfd`(fd 交接规约)+ `connector-ctl vswitch`/`connector-ctl tapfd get` |
-| **guest-runtime/native-deps** | 原生依赖:vmlinux / cloud-hypervisor / mkfs.erofs / envd | 构建脚本 + patches + configs |
+| **guest-runtime** | Guest runtime 镜像与原生依赖:vmlinux / cloud-hypervisor / mkfs.erofs / envd | `sandbox-runtime.erofs`、native-deps 构建脚本 + patches + configs |
 
 ## 构建
 
 **完整构建入口(本仓 Makefile)**:`make build` 按依赖序编排全部子仓构建,按
-`scripts/artifacts.list` 收集制品到 `bin/$(TARGET_ARCH)/`,并装配出注入 envd 的
-`sandbox-runtime-e2b.erofs`:
+`scripts/artifacts.list` 收集制品到 `bin/$(TARGET_ARCH)/`;单一
+`sandbox-runtime.erofs` 由 `guest-runtime` 构建,已内置 envd、flatten-ctl 与
+mkfs.erofs:
 
 ```bash
 make -C orchestrator/release-builder all        # = build:全部子仓 + 装配 bin/

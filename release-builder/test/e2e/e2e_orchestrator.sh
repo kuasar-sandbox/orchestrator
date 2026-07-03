@@ -91,7 +91,7 @@ paths: { run_root: $WORK/run, base_root: $WORK/lib, config_socket: $WORK/node-ct
 units: { dir: $UNIT_DIR }
 sandbox:
   network: { switch: $SWITCH }
-  boot: { kernel: $BIN/vmlinux, runtime_e2b: $BIN/sandbox-runtime-e2b.erofs, runtime_base: $BIN/sandbox-runtime.erofs }
+  boot: { kernel: $BIN/vmlinux, runtime: $BIN/sandbox-runtime.erofs }
 checkpoint: { mode: remote }
 EOF
 mkdir -p "$WORK/run" "$WORK/lib"

@@ -14,7 +14,7 @@ node-ctl 既可**独立运行**(直供 e2b SDK / CLI,单机即可用),也可经 
 **控制面 create / pause / kill / 模板构建始终在本节点**,集群只下发高层命令复用这些原语(§10)。
 
 沙箱本体由 `sandbox-ctl` 运行(microVM,cloud-hypervisor);e2b profile 的 guest 内
-跑原版 envd(经注入 envd 的 `sandbox-runtime-e2b.erofs`,§11),serve 经 UDS
+跑原版 envd(由单一 `sandbox-runtime.erofs` 内置,§11),serve 经 UDS
 反代其单端口协议(49983/Connect-RPC)。密钥模型以租户 **manifest_key** 为根:api_key
 由它派生(MAC 令牌),库内只存 AES-GCM 密文,密钥永不落明文盘(§7)。
 
@@ -337,14 +337,13 @@ node-ctl 同目录 → PATH"自动发现。
 | `sandbox.network.dns` | `[169.254.169.253]` | 注入 guest `/etc/resolv.conf` 的 nameserver;该地址需部署侧路由到真实 DNS |
 | `sandbox.network.e2b` / `.bare` | `169.254.0.21/30`+`169.254.0.22` / `169.254.1.1/31`+`169.254.1.0` | 按 profile 的 guest 内 `{inner_ip, nexthop}`:每 profile 复用同一对,沙箱唯一身份是 floatingip;e2b 的 /30 + 网关让 envd 端口转发可用 |
 | `sandbox.boot.kernel` | – | vmlinux 路径 |
-| `sandbox.boot.runtime_e2b` / `.runtime_base` | – | 两 profile 的 guest runtime erofs(§11) |
+| `sandbox.boot.runtime` | – | 单一 guest runtime erofs;内置 envd、flatten-ctl、mkfs.erofs(§11) |
 | `sandbox.boot.overlay_diff_template` | – | 预格式化空 ext4,img 冷启时稀疏复制为可写 upper(裸空 diff 非合法 fs 会被拒);部署方 `mkfs.ext4` 于稀疏文件提供;restore 不需要(overlay 链来自快照) |
 | `builder.max_concurrent` | `2` | 构建池并发(serve 内计数信号量,§12) |
 | `builder.cpu_quota` / `.memory_max` | 空 | 施加到 `sandbox-builder.slice` 的 `CPUQuota`/`MemoryMax` |
 | `builder.insecure_registry` | `false` | 经明文 HTTP 拉取 base 镜像(dev/本机 registry) |
 | `builder.platform` | 空 | 拉取平台,如 `linux/amd64` |
 | `builder.image_uri_mask` | 空 | 客户端推送镜像的命名约定(含 `{templateID}`/`{buildID}` 占位,须与 e2b CLI 的 `E2B_IMAGE_URI_MASK` 一致);trigger 缺 `fromImage` 时据此推导;**须从构建沙箱内可达**——拉取在 guest 内进行(§12) |
-| `builder.runtime_builder` | – | 构建沙箱的 guest runtime erofs(e2b flavor + flatten-ctl + mkfs.erofs;umbrella `make sandbox-runtime-builder` 产出) |
 | `builder.diff_template` | – | 构建沙箱可写盘的预格式化 ext4(拉取缓存 + steps 增量 + 导出 scratch;稀疏文件,建议 ≥ 最大预期镜像的 3 倍) |
 | `builder.vcpu` / `.memory` | `2` / `4GiB` | 每台构建沙箱(阶段 microVM)的容量 |
 | `builder.{pull,step,ready,total}_timeout_sec` | `600`/`600`/`120`/`1800` | 阶段超时:guest 内拉取+展平、单条 RUN step(经 `Connect-Timeout-Ms` 同步到 guest 侧)、readyCmd 轮询预算(2s 间隔;缺省 readyCmd = `sleep 20`)、整个构建(单元 `TimeoutStartSec` = total+60) |
@@ -603,7 +602,7 @@ serve 在 UDS `paths.config_socket`(默认 `/run/sandbox/node-ctl.socket`,**0600
   (+kind), steps[], start_cmd, ready_cmd, env, paths, net, vcpu, memory,
   mmds_enabled, envd_token, insecure, platform, timeouts}`——`env` 含
   `MANIFEST_KEY` + 租户 `FLATTEN_*` 拉取凭据;`paths` 是宿主侧工件与工具
-  (kernel / runtime_e2b / runtime_builder / 两个 diff template / sandbox-ctl /
+  (kernel / runtime / 两个 diff template / sandbox-ctl /
   flatten-ctl / manifest-ctl / manifest_config);`net` 是 serve 预先 attach 的
   网络槽(tapfd exec、mac、inner_ip、nexthop、hostname、dns),全构建复用。
   run-builder 据此自建阶段沙箱(§12);仅在该构建单元运行期间可取(serve 持挂
@@ -898,14 +897,14 @@ node-link 生产走 mTLS(`cluster.node_link.tls`)。下行 `manifest_key` 只进
 接入集群与本机 plugin 平面使用同一 routesync 引擎和线格式,仅订阅者 kind 不同。router 不订阅节点
 plugin 平面,机群路由经 registry 聚合。
 
-## 11. guest profile:envd 嵌入
+## 11. guest profile:envd 与工具链
 
-- 独立 **`sandbox-runtime-e2b.erofs`**(主 runtime 保持精简):`deps/build-runtime-e2b.sh`
-  (`make sandbox-runtime-e2b` 调用,纯 shell,shell out `fsck.erofs`/`mkfs.erofs`)把
-  固定版本 envd 注入运行时层的 `/opt/sandbox-runtime/bin/envd`,确定性重打(与
-  flatten 同款 mkfs 参数),并把成品**补齐到 2 MiB 对齐**(virtio-pmem 后端要求,
-  否则 cloud-hypervisor 报 `PmemSizeNotAligned`;EROFS superblock 自描述范围,尾部
-  稀疏 padding 对 guest mount 不可见)。
+- 单一 **`sandbox-runtime.erofs`** 由 `guest-runtime` 构建:把 `sandboxer` 产出的
+  `sandbox-init` 打成 virtio-pmem/DAX runtime,并在 `/opt/sandbox-runtime/bin/`
+  内置固定版本 `envd`、`flatten-ctl`、`mkfs.erofs`。runtime 构建保持确定性 mkfs
+  参数,并把成品**补齐到 2 MiB 对齐**(virtio-pmem 后端要求,否则 cloud-hypervisor
+  报 `PmemSizeNotAligned`;EROFS superblock 自描述范围,尾部稀疏 padding 对 guest
+  mount 不可见)。
 - **零 sandbox-init 改动**:`/opt/sandbox-runtime` 被 sandbox-init 自动 bind-mount 进
   guest 同名路径,envd 直接作 `launch.exec`:
   `/opt/sandbox-runtime/bin/envd -isnotfc -port 49983`(`mmds.enabled` 时去
@@ -914,9 +913,8 @@ plugin 平面,机群路由经 registry 聚合。
   非 root 的 envd 会 exec EPERM);工作负载本身仍以目标用户执行。
 - envd 是 **guest-runtime/native-deps** 的原生构建产物(与 cloud-hypervisor/vmlinux/mkfs.erofs
   并列):`make -C guest-runtime/native-deps envd` 拉取 e2b-dev/infra 发布 tarball(默认 tag
-  `2026.22`,`ENVD_TARBALL` 可覆盖)→ `go build packages/envd`。本仓
-  `make sandbox-runtime-e2b` 再把它注入裸 runtime(输入路径 `BASE_RUNTIME`/`ENVD`/
-  `FSCK`/`MKFS` 可覆盖,默认取 umbrella 聚合 `bin/`)。
+  `2026.22`,`ENVD_TARBALL` 可覆盖)→ `go build packages/envd`。`guest-runtime make
+  sandbox-runtime` 负责把它和构建工具链一起注入 runtime。
 - **userland 门槛**(对 base/客户镜像的约束):须有 `bash`、`coreutils`/`util-linux`、
   预建默认用户(默认 `user`,含 `/home/user`)、cgroup v2、可写 `/run`。envd 跑每条
   guest 命令以默认用户、并包一层 `ionice -c 2 -n 4 nice -n N "$@"`——缺用户或缺
@@ -950,9 +948,8 @@ microVM(`sandbox-ctl run` 直接子进程);A 阶段就绪探针 = guest 内
 `flatten-ctl mountpoint /.probe`,B/C 阶段以 envd `/health` 为就绪:
 
 - **A import**(有 fromImage):**空**单盘沙箱——root 即 `builder.diff_template`
-  复制出的可写 ext4(无 base 镜像),`launch.placeholder` 锚定;guest runtime 用
-  **builder flavor**(`builder.runtime_builder`:e2b flavor + flatten-ctl +
-  mkfs.erofs,经 `/opt/sandbox-runtime` 投影进任意 rootfs)。guest 内
+  复制出的可写 ext4(无 base 镜像),`launch.placeholder` 锚定;单一 guest runtime
+  经 `/opt/sandbox-runtime` 投影出 `flatten-ctl` 与 `mkfs.erofs`。guest 内
   `flatten-ctl export --output - <fromImage>` 以租户凭据(`FLATTEN_*` 仅经 exec env
   入 guest)拉取 + 展平,tarstream 镜像工件经 exec stdio 流回宿主 `workdir/image.img`。
 - **B steps**(有 steps):以 base 镜像为 root(本地工件或 `manifest://`)+ builder
@@ -1086,9 +1083,9 @@ external worker 的 `data_listen`,proxy.yaml),证书同一张。dev:`E2B_API_URL
 | 资源控制器(node-resource.md) | serve 内置(`resource_listen`,调参内联);沙箱经 `sandbox.resources.control_socket` 拨号(`pkg/resource` 协议) | 单元 cgroup 即沙箱 cgroup,控制器原地仲裁;不配 control_socket = 静态 cgroup(`--cgroup-adopt`),配了才进 SANDBOX_CONFIG `resources.control.controller` |
 | registry(cluster-ctl) | node-link:serve 拨 registry、反向注册为路由权威,上报 register/heartbeat/sandbox/build_event 事件、受理 create/connect/delete/key_put/key_drop/build_register 命令(§10、cluster.md) | mTLS;命令复用 §8 / §8.1 生命周期原语;空 `cluster.node_link.endpoint` = 独立模式不接入 |
 | `connector-ctl vswitch`(vswitch) | CLI:`attach <switch> --inner-ip [--transit-*]` / `detach --port`;`open-port` 作 SANDBOX_CONFIG `network.tapfd.exec`(sandbox-ctl 执行,经 `TAPFD_SOCKET` 收 tap fd) | 交换机预先起好(`connector-ctl vswitch start`,内核态数据面);port 对外、slot 内部;一个构建复用一个槽 |
-| `flatten-ctl`(builder) | **guest 内**(builder runtime 自带,经 sandbox-ctl exec 驱动):`export --output -`(import 拉取 / steps 导出)、`mountpoint`;宿主侧:`info --json`(读镜像运行时配置,本地工件或 manifest://) | 租户 `FLATTEN_*` 仅经 exec env 入 guest;tarstream 镜像工件经 exec stdio 接力 |
+| `flatten-ctl`(builder) | **guest 内**(guest runtime 自带,经 sandbox-ctl exec 驱动):`export --output -`(import 拉取 / steps 导出)、`mountpoint`;宿主侧:`info --json`(读镜像运行时配置,本地工件或 manifest://) | 租户 `FLATTEN_*` 仅经 exec env 入 guest;tarstream 镜像工件经 exec stdio 接力 |
 | `manifest-ctl`(accelerator) | `store <image.img>`(img-only 构建的收尾上传) | manifest key 经 stdout 回收;`MANIFEST_KEY` 经 env |
-| `fsck.erofs`/`mkfs.erofs`(deps) | CLI(`deps/build-runtime-e2b.sh`、`deps/build-runtime-builder.sh`) | 确定性重打 e2b / builder runtime(§11、§12) |
+| `mkfs.erofs`(deps) | guest-runtime `make sandbox-runtime` 与 guest 内 `flatten-ctl` 后端 | 确定性打包 runtime;构建沙箱内导出 EROFS 镜像(§11、§12) |
 | guest envd | UDS(sandbox-ctl `--connect` 映射);构建流水线另以最小 connect+JSON 客户端调 `process.Start`(steps/startCmd/readyCmd,§12) | 原版不改;协议 pin 见 §4.3/§4.5 |
 | systemd | D-Bus:StartUnit/StopUnit/ResetFailed/ListUnitsByPatterns/Reload | 进程管理 + 单元自装(§5) |
 | `node-ctl proxy`(external) | UDS routesync(双向 h2c 帧化 JSON)+ 兜底反代 | 同节点、运维带外起;数据口 SO_REUSEPORT 共享(node-proxy.md §5) |
@@ -1146,7 +1143,7 @@ serve 重启后以 `ListUnitsByPatterns("sandbox-runner@*.service")` 为存活�
 网关链式 relay、mmds(确定性密钥)、单飞、沙箱配置注入(命名空间解析/容量折叠/网络合并)、
 migrate、node-link(注册/事件/命令往返)等)。跨仓 e2e 集中在 umbrella
 `kuasar-sandbox/test/e2e/`(需多仓产物:vmlinux/cloud-hypervisor/mkfs.erofs/
-sandbox-runtime-e2b.erofs 等),均已注册为 umbrella make 目标,缺前置则自跳过
+sandbox-runtime.erofs 等),均已注册为 umbrella make 目标,缺前置则自跳过
 (`REQUIRE_*=1` 改为硬失败):
 
 | 脚本 | 覆盖 | make 目标 |

@@ -12,8 +12,7 @@
 │                              mkfs.erofs / fsck.erofs / envd / manifest-ctl /
 │                              store-ctl / cache-ctl / flatten-ctl / sandbox-ctl /
 │                              sandbox-init / node-ctl / connector-ctl /
-│                              e2b-key-ctl /
-│                              sandbox-runtime.erofs / sandbox-runtime-e2b.erofs)
+│                              e2b-key-ctl / sandbox-runtime.erofs)
 ├── README.md                  项目入口
 ├── docs/                      系统设计 + 模块设计 + 部署 + 性能基线
 ├── deploy/                    运维配置样例 + systemd 单元(config.example.yaml /
@@ -118,8 +117,7 @@ for f in test/e2e/*.sh; do bash "$f" || break; done
 
 > **前置(比其他 e2e 重)**:这组脚本另需 systemd 为 PID1 + root、`zot`、
 > `docker`;`e2e_run_builder`/`e2e_execute`/`e2e_orchestrator_proxy` 还需
-> `/dev/kvm` 与 `mkfs.ext4`(run_builder 另需 `bin/sandbox-runtime-builder.erofs`,
-> `make sandbox-runtime-builder` 产出);demo 另需 e2b Python SDK
+> `/dev/kvm` 与 `mkfs.ext4`;demo 另需 e2b Python SDK
 > (`pip install e2b e2b-code-interpreter`)、`openssl`、`sqlite3`、`iptables`。
 > 脚本会自检,缺失即 skip。
 

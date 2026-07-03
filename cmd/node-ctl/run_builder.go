@@ -6,7 +6,7 @@ package main
 // microVM it spawns as a DIRECT child (sandbox-ctl run, in this unit's
 // cgroup), reusing ONE pre-attached network slot sequentially:
 //
-//	A import   — an EMPTY single-disk sandbox on the builder runtime flavor
+//	A import   — an EMPTY single-disk sandbox on the single guest runtime
 //	             (flatten-ctl/mkfs.erofs ride /opt/sandbox-runtime, bind-
 //	             mounted into any rootfs); flatten-ctl pulls the image WITH
 //	             TENANT creds (exec env, never host-side) over the tenant

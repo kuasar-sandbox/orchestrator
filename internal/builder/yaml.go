@@ -47,9 +47,8 @@ func (p *buildPipeline) dnsFiles() []map[string]any {
 	return []map[string]any{{"path": "/etc/resolv.conf", "content": b.String(), "mode": "0644"}}
 }
 
-// importYAML: an EMPTY single-disk sandbox (no base image at all) on the
-// builder runtime flavor — the writable ext4 root doubles as the pull
-// scratch. launch.placeholder anchors it; the toolchain rides the
+// importYAML: an EMPTY single-disk sandbox (no base image at all). The writable
+// ext4 root doubles as the pull scratch. launch.placeholder anchors it; the toolchain rides the
 // /opt/sandbox-runtime projection.
 func (p *buildPipeline) importYAML() map[string]any {
 	s := p.spec
@@ -58,7 +57,7 @@ func (p *buildPipeline) importYAML() map[string]any {
 		"network":   p.networkDoc(),
 		"boot": map[string]any{
 			"kernel":  "file://" + s.Paths.Kernel,
-			"runtime": "file://" + s.Paths.RuntimeBuilder,
+			"runtime": "file://" + s.Paths.Runtime,
 			"root": map[string]any{
 				"diff_template": "file://" + s.Paths.BuilderDiffTpl,
 			},
@@ -84,7 +83,7 @@ func (p *buildPipeline) rootDoc(diffTpl string) map[string]any {
 }
 
 // stepsYAML: the base image as root, a big writable upper (steps delta +
-// export scratch), the builder runtime for the toolchain, and envd as
+// export scratch), the runtime-projected toolchain, and envd as
 // the app — RUN steps go through the e2b exec channel. This envd is a
 // build tool, not a tenant data plane: always -isnotfc, never
 // /init-armed (its in-memory state dies with the phase; its only disk
@@ -96,7 +95,7 @@ func (p *buildPipeline) stepsYAML() map[string]any {
 		"network":   p.networkDoc(),
 		"boot": map[string]any{
 			"kernel":  "file://" + s.Paths.Kernel,
-			"runtime": "file://" + s.Paths.RuntimeBuilder,
+			"runtime": "file://" + s.Paths.Runtime,
 			"root":    p.rootDoc("file://" + s.Paths.BuilderDiffTpl),
 		},
 		"launch": map[string]any{
@@ -116,8 +115,8 @@ func (p *buildPipeline) stepsYAML() map[string]any {
 	return doc
 }
 
-// templateYAML: a PRODUCTION e2b sandbox — the e2b runtime flavor (frozen
-// into the snapshot as runtime_ref), envd as the app (FC mode per the
+// templateYAML: a PRODUCTION e2b sandbox — the runtime is frozen into the
+// snapshot as runtime_ref, envd as the app (FC mode per the
 // deployment's MMDS posture), and the e2b start/ready metadata recorded
 // into snapshot.cfg so the template is self-describing.
 func (p *buildPipeline) templateYAML() map[string]any {
@@ -136,7 +135,7 @@ func (p *buildPipeline) templateYAML() map[string]any {
 		"metadata":  meta,
 		"boot": map[string]any{
 			"kernel":  "file://" + s.Paths.Kernel,
-			"runtime": "file://" + s.Paths.RuntimeE2B,
+			"runtime": "file://" + s.Paths.Runtime,
 			"root":    p.rootDoc("file://" + s.Paths.OverlayDiffTpl),
 		},
 		"launch": map[string]any{

@@ -38,7 +38,6 @@ e2b 兼容沙箱平台的**节点主机**与**集群控制面**,两个生产二�
 | `internal/{apikey,secretbox,keys,regcreds}` | api_key 派生 MAC、manifest_key 落盘 AES-GCM、数据面 token、镜像拉取凭据 |
 | `internal/{config,clustercfg,sandboxcfg,store}` | 节点 / 集群配置加载、SANDBOX_CONFIG 渲染、节点本地 sqlite 状态(sandboxes/builds/manifest_keys) |
 | `internal/{mmds,metrics,launcher,vswitch,util}` | MMDS 元数据(envd re-key)、Prometheus 文本、systemd D-Bus、connector-ctl vswitch 封装、内联工具 |
-| `deps/build-runtime-{e2b,builder}.sh` | 把 envd(+构建工具链 flatten-ctl/mkfs.erofs)注入基础 runtime → `sandbox-runtime-{e2b,builder}.erofs`(确定性重打 + 2MiB 对齐) |
 | `deploy/` | 每角色配置样例(`{conductor,proxy}.example.yaml`、`{registry,router,placer}.example.yaml`)与 systemd 单元(`node-ctl.service`、`node-proxy@.service`、`cluster-{registry,router,placer}.service`) |
 
 ## 构建
@@ -46,13 +45,12 @@ e2b 兼容沙箱平台的**节点主机**与**集群控制面**,两个生产二�
 ```bash
 make build                      # bin/<arch>/{node-ctl,cluster-ctl,node-stub-ctl,e2b-key-ctl};纯 Go,CGO_ENABLED=0
 make build TARGET_ARCH=aarch64  # 交叉编译(别名 amd64 / arm64)
-make sandbox-runtime-e2b        # 注入 envd 的 guest runtime(需 guest-runtime/native-deps 的 envd/fsck.erofs/mkfs.erofs)
-make sandbox-runtime-builder    # 构建沙箱 guest runtime(e2b flavor + flatten-ctl + mkfs.erofs)
 make test                       # 单元测试
 make test-e2e                   # 启动真实 registry/router/placer + node-stub-ctl 做集群 stub e2e
 ```
 
-运行需要 systemd(D-Bus 管单元)与 root;沙箱本体另需 KVM 与 vswitch(见各自仓)。
+运行需要 systemd(D-Bus 管单元)与 root;沙箱本体另需 KVM、connector、sandboxer
+和 guest-runtime 构建出的 `sandbox-runtime.erofs`。
 
 ## 快速开始
 

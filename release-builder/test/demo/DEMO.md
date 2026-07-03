@@ -29,8 +29,7 @@ SDK 零修改,仅靠环境变量 + 本机 `/etc/hosts` + 自签 TLS(`SSL_CERT_FI
 ## 前置条件
 
 - 二进制(`make -C kuasar-sandbox build`):`node-ctl`、`store-ctl`、**`cache-ctl`**(CGO/rocksdb)、
-  `flatten-ctl`、`e2b-key-ctl`、`connector-ctl vswitch`、`cloud-hypervisor`、`vmlinux`、`sandbox-runtime-e2b.erofs`、
-  `sandbox-runtime-builder.erofs`(`make sandbox-runtime-builder`;构建沙箱的 guest 运行时)。
+  `flatten-ctl`、`e2b-key-ctl`、`connector-ctl vswitch`、`cloud-hypervisor`、`vmlinux`、`sandbox-runtime.erofs`。
 - 主机:**systemd 为 PID1 + root**(编排经 D-Bus 驱动单元;TLS :443;KVM);可读写 `/dev/kvm`。
 - **e2b Python SDK**:`pip install e2b e2b-code-interpreter`。
 - 工具:`python3`、`openssl`、`iproute2(ip)`、`curl`、`sqlite3`、`iptables`;`demo_prep.sh` 另需 `docker`(一次性把

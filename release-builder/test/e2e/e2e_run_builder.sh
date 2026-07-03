@@ -65,8 +65,8 @@ fail() { echo "==> FAIL: $*" >&2; exit 1; }
 for b in node-ctl sandbox-ctl e2b-key-ctl connector-ctl cloud-hypervisor flatten-ctl manifest-ctl store-ctl; do
     [ -x "$BIN/$b" ] || skip "missing $BIN/$b — run 'make build'"
 done
-for f in vmlinux sandbox-runtime.erofs sandbox-runtime-e2b.erofs sandbox-runtime-builder.erofs; do
-    [ -f "$BIN/$f" ] || skip "missing $BIN/$f — run 'make all' + 'make sandbox-runtime-builder'"
+for f in vmlinux sandbox-runtime.erofs; do
+    [ -f "$BIN/$f" ] || skip "missing $BIN/$f — run 'make all'"
 done
 command -v curl >/dev/null 2>&1 || skip "curl not on PATH"
 command -v docker >/dev/null 2>&1 || skip "docker not on PATH"
@@ -232,12 +232,10 @@ sandbox:
   network: { switch: $SWITCH }
   boot:
     kernel: $BIN/vmlinux
-    runtime_e2b: $BIN/sandbox-runtime-e2b.erofs
-    runtime_base: $BIN/sandbox-runtime.erofs
+    runtime: $BIN/sandbox-runtime.erofs
     overlay_diff_template: $OVL
 builder:
   insecure_registry: true
-  runtime_builder: $BIN/sandbox-runtime-builder.erofs
   diff_template: $BLDDIFF
   vcpu: 1
   memory: 1GiB

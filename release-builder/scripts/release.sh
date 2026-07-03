@@ -54,6 +54,7 @@ DOCS=(
   # microVM runtime
   "sandboxer/docs/sandbox.md"
   "sandboxer/docs/sandbox-runtime.md"
+  "guest-runtime/docs/sandbox-runtime.md:guest-runtime.md"
   # node orchestrator — single-node control plane + data-plane proxy + resource daemon
   "orchestrator/docs/node.md"
   "orchestrator/docs/node-proxy.md"

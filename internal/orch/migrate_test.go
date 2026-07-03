@@ -24,7 +24,7 @@ func TestExportImportRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg := &config.Config{}
-	cfg.Sandbox.Boot.RuntimeE2B = rt
+	cfg.Sandbox.Boot.Runtime = rt
 	cfg.Paths.RunRoot, cfg.Paths.BaseRoot = dir+"/run", dir+"/lib"
 	o := testOrchCfg(t, cfg)
 	ctx := context.Background()

@@ -9,7 +9,7 @@
 #                                flattens -> a ready e2b-img template in the store
 #   POST /sandboxes            -> sandbox-runner@<sid> -> sandbox-ctl boots
 #                                cloud-hypervisor (KVM) from the template +
-#                                sandbox-runtime-e2b.erofs; envd comes up at 49983,
+#                                sandbox-runtime.erofs; envd comes up at 49983,
 #                                exposed as envd.sock; orchestrator waitReady(/health)
 #                                + envdInit(/init). 201 == microVM booted + envd ready.
 #                                The create injects sandbox config via the
@@ -19,7 +19,7 @@
 #   DELETE                     -> teardown.
 #
 # Needs systemd+root, /dev/kvm (rw), the vswitch eBPF stack, store-ctl, zot, docker,
-# mkfs.erofs, and the built kernel + runtime erofs (incl. sandbox-runtime-builder.erofs)
+# mkfs.erofs, and the built kernel + runtime erofs
 # in bin. Missing prereqs -> exit 0 ("skipped") unless REQUIRE_EXEC=1.
 
 set -euo pipefail
@@ -38,8 +38,7 @@ fail() { echo "==> FAIL: $*" >&2; exit 1; }
 
 for b in node-ctl sandbox-ctl flatten-ctl store-ctl e2b-key-ctl connector-ctl cloud-hypervisor; do [ -x "$BIN/$b" ] || skip "missing $BIN/$b"; done
 [ -f "$BIN/vmlinux" ] || skip "missing $BIN/vmlinux"
-[ -f "$BIN/sandbox-runtime-e2b.erofs" ] || skip "missing $BIN/sandbox-runtime-e2b.erofs"
-[ -f "$BIN/sandbox-runtime-builder.erofs" ] || skip "missing $BIN/sandbox-runtime-builder.erofs (make sandbox-runtime-builder)"
+[ -f "$BIN/sandbox-runtime.erofs" ] || skip "missing $BIN/sandbox-runtime.erofs"
 command -v curl >/dev/null 2>&1 || skip "curl not on PATH"
 command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1 || skip "docker not usable"
 [ -n "$ZOT_BIN" ] && [ -x "$ZOT_BIN" ] || skip "zot not on PATH"
@@ -190,10 +189,9 @@ units: { dir: $UNIT_DIR }
 sandbox:
   timeout_sec: 120
   network: { switch: $SWITCH }
-  boot: { kernel: $BIN/vmlinux, runtime_e2b: $BIN/sandbox-runtime-e2b.erofs, runtime_base: $BIN/sandbox-runtime.erofs, overlay_diff_template: $OVL }
+  boot: { kernel: $BIN/vmlinux, runtime: $BIN/sandbox-runtime.erofs, overlay_diff_template: $OVL }
 builder:
   insecure_registry: true
-  runtime_builder: $BIN/sandbox-runtime-builder.erofs
   diff_template: $BLD
   vcpu: 1
   memory: 1GiB

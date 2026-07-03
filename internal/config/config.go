@@ -359,15 +359,14 @@ type ProfileNet struct {
 // BootConfig is the boot artifacts that define a sandbox instance.
 type BootConfig struct {
 	Kernel              string `yaml:"kernel"`                // vmlinux path
-	RuntimeE2B          string `yaml:"runtime_e2b"`           // e2b profile guest runtime erofs
-	RuntimeBase         string `yaml:"runtime_base"`          // bare profile guest runtime erofs
+	Runtime             string `yaml:"runtime"`               // guest runtime erofs
 	OverlayDiffTemplate string `yaml:"overlay_diff_template"` // pre-formatted ext4 seeding the cold-boot overlay upper
 }
 
 // BuilderConfig is the build-instance settings. Concurrency is admitted in
 // node-ctl; the CPU/memory ceiling is applied to sandbox-builder.slice.
 // Builds run INSIDE build sandboxes (tenant network + isolation): import and
-// step execution happen in microVMs booted from runtime_builder; only artifact
+// step execution happen in microVMs booted from the same guest runtime; only artifact
 // streaming and the final uploads run on the host (run-builder).
 type BuilderConfig struct {
 	MaxConcurrent    int    `yaml:"max_concurrent"`    // default 2
@@ -381,9 +380,6 @@ type BuilderConfig struct {
 	// when a build trigger omits fromImage, it is derived from this.
 	ImageURIMask string `yaml:"image_uri_mask"`
 
-	// RuntimeBuilder is the build-sandbox guest runtime erofs
-	// (sandbox-runtime-builder.erofs: e2b flavor + flatten-ctl + mkfs.erofs).
-	RuntimeBuilder string `yaml:"runtime_builder"`
 	// DiffTemplate is the pre-formatted ext4 seeding a build sandbox's
 	// writable disk (pull cache + steps delta + export scratch): size it
 	// 2-3x the largest expected image (the ext4 size is fixed at mkfs).

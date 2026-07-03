@@ -194,8 +194,7 @@ func (n NetworkSpec) IsZero() bool {
 type Params struct {
 	Sandbox          *types.Sandbox
 	Template         types.TemplateID
-	RuntimeE2B       string // erofs path for e2b profile (file path, no scheme)
-	RuntimeBase      string // erofs path for bare profile
+	Runtime          string // erofs path (file path, no scheme)
 	Kernel           string // vmlinux path
 	OverlayDiffTpl   string // pre-formatted ext4 seeding the cold-boot overlay upper (file path)
 	TapFDExec        []string
@@ -227,10 +226,6 @@ func (p Params) BuildYAML() ([]byte, error) {
 }
 
 func (p Params) build() (*rtconfig.SandboxConfig, error) {
-	runtime := p.RuntimeBase
-	if p.Template.Profile == types.ProfileE2B {
-		runtime = p.RuntimeE2B
-	}
 	c := &rtconfig.SandboxConfig{}
 
 	// --- resources ---
@@ -261,7 +256,7 @@ func (p Params) build() (*rtconfig.SandboxConfig, error) {
 
 	// --- boot ---
 	c.Boot.Kernel = "file://" + p.Kernel
-	c.Boot.Runtime = "file://" + runtime
+	c.Boot.Runtime = "file://" + p.Runtime
 	c.Boot.Root.Overlay = &rtconfig.OverlayConfig{}
 	// boot.root.base is the read-only rootfs. Cold boot (img) = the flattened image
 	// manifest; restore (snp/resume) lets snapshot.cfg fill it (omit).

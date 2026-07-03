@@ -526,7 +526,8 @@ func (o *Orchestrator) sandboxConfigPath(sb *types.Sandbox) string {
 func (o *Orchestrator) sandboxParams(sb *types.Sandbox, tmpl types.TemplateID, spec sandboxcfg.SandboxSpec) sandboxcfg.Params {
 	return sandboxcfg.Params{
 		Sandbox: sb, Template: tmpl,
-		RuntimeE2B: o.cfg.Sandbox.Boot.RuntimeE2B, RuntimeBase: o.cfg.Sandbox.Boot.RuntimeBase, Kernel: o.cfg.Sandbox.Boot.Kernel,
+		Runtime:        o.cfg.Sandbox.Boot.Runtime,
+		Kernel:         o.cfg.Sandbox.Boot.Kernel,
 		OverlayDiffTpl: o.cfg.Sandbox.Boot.OverlayDiffTemplate,
 		TapFDExec:      o.vs.TapFDExec(sb.VswitchPort), EnvVars: sb.Env,
 		VCPU: o.cfg.Sandbox.Resources.VCPU, Memory: o.cfg.Sandbox.Resources.Memory, ControllerSocket: o.cfg.Sandbox.Resources.ControlSocket,

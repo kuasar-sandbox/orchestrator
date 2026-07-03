@@ -147,13 +147,11 @@ sandbox:                                          # sandbox-instance defaults
     bare: { inner_ip: 169.254.1.1/31,  nexthop: 169.254.1.0 }
   boot:
     kernel: /opt/sandbox/kernel/6.1/vmlinux
-    runtime_e2b: /opt/sandbox/runtime/v1/sandbox-runtime-e2b.erofs
-    runtime_base: /opt/sandbox/runtime/v1/sandbox-runtime.erofs
+    runtime: /opt/sandbox/runtime/v1/sandbox-runtime.erofs
     # Pre-formatted empty ext4 seeding the cold-boot overlay upper (required for img templates).
     overlay_diff_template: /opt/sandbox/overlay-templates/basic-1G.ext4
 builder:                                           # builds run INSIDE build sandboxes
   max_concurrent: 2
-  runtime_builder: /opt/sandbox/runtime/v1/sandbox-runtime-builder.erofs  # build-sandbox guest runtime
   diff_template: /opt/sandbox/overlay-templates/builder-8G.ext4  # build VM writable disk (pull cache + export scratch)
   # vcpu: 2                                       # per build-sandbox capacity
   # memory: 4GiB

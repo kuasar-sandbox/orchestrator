@@ -508,8 +508,7 @@ func (o *Orchestrator) BuildSpecFor(ctx context.Context, configID string) (*conf
 		Env:              env,
 		Paths: configsock.BuildPaths{
 			Kernel:         o.cfg.Sandbox.Boot.Kernel,
-			RuntimeE2B:     o.cfg.Sandbox.Boot.RuntimeE2B,
-			RuntimeBuilder: o.cfg.Builder.RuntimeBuilder,
+			Runtime:        o.cfg.Sandbox.Boot.Runtime,
 			OverlayDiffTpl: o.cfg.Sandbox.Boot.OverlayDiffTemplate,
 			BuilderDiffTpl: o.cfg.Builder.DiffTemplate,
 			SandboxCtl:     o.cfg.SandboxCtl(),

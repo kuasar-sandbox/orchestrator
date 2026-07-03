@@ -135,8 +135,7 @@ type BuildStep struct {
 // BuildPaths is every host artifact/binary path the pipeline shells out to.
 type BuildPaths struct {
 	Kernel         string `json:"kernel"`
-	RuntimeE2B     string `json:"runtime_e2b"`     // phase C (production flavor — frozen into the template)
-	RuntimeBuilder string `json:"runtime_builder"` // phases A/B (toolchain flavor)
+	Runtime        string `json:"runtime"` // guest runtime erofs
 	OverlayDiffTpl string `json:"overlay_diff_tpl"`
 	BuilderDiffTpl string `json:"builder_diff_tpl"`
 	SandboxCtl     string `json:"sandbox_ctl"`

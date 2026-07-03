@@ -12,7 +12,7 @@
 //	node-ctl version
 //
 // Templates are built through the e2b API (POST /v3/templates ...), not a CLI.
-// sandbox-runtime-e2b.erofs is assembled by deps/build-runtime-e2b.sh (Makefile).
+// The guest runtime image is built by the guest-runtime repo.
 package main
 
 import (

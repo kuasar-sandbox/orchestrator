@@ -199,12 +199,9 @@ func (o *Orchestrator) importSandboxWithKey(ctx context.Context, mk, token strin
 	return sb.ID, nil
 }
 
-// runtimeFileFor returns the guest runtime erofs path for a profile.
+// runtimeFileFor returns the guest runtime erofs path.
 func (o *Orchestrator) runtimeFileFor(p types.Profile) string {
-	if p == types.ProfileBare {
-		return o.cfg.Sandbox.Boot.RuntimeBase
-	}
-	return o.cfg.Sandbox.Boot.RuntimeE2B
+	return o.cfg.Sandbox.Boot.Runtime
 }
 
 func sha256File(path string) (string, error) {

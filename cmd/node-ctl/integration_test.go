@@ -40,7 +40,7 @@ func startCtlSocket(t *testing.T) string {
 		"manifest_config: " + dir + "/manifest.yaml\n" +
 		"paths: { run_root: " + dir + ", base_root: " + dir + ", config_socket: " + sock + " }\n" +
 		"sandbox:\n" +
-		"  boot: { kernel: " + dir + "/k, runtime_e2b: " + dir + "/e, runtime_base: " + dir + "/b, overlay_diff_template: " + dir + "/o }\n"
+		"  boot: { kernel: " + dir + "/k, runtime: " + dir + "/rt, overlay_diff_template: " + dir + "/o }\n"
 	cfgPath := filepath.Join(dir, "config.yaml")
 	if err := os.WriteFile(cfgPath, []byte(yaml), 0o644); err != nil {
 		t.Fatal(err)

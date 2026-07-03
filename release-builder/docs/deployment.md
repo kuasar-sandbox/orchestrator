@@ -221,8 +221,8 @@ e2b 模板构建在 compute 节点上进行,**无独立展平池**:每个构建�
 
 | 阶段 | 触发 | 做什么 |
 |---|---|---|
-| A import | 有 fromImage | 空单盘沙箱 + **builder runtime flavor**(`sandbox-runtime-builder.erofs`:e2b flavor + flatten-ctl + mkfs.erofs);guest 内 `flatten-ctl export -` 以租户凭据拉取 + 确定性展平,tarstream 工件经 exec stdio 流回宿主 |
-| B steps | 有 steps | base 镜像 + builder runtime + 大可写层;**envd 为 app**,RUN/ENV/ARG/WORKDIR/USER 经 envd `process.Start` 执行(与 e2b 同形);导出新镜像工件 |
+| A import | 有 fromImage | 空单盘沙箱 + 单一 `sandbox-runtime.erofs` 内置的 flatten-ctl/mkfs.erofs;guest 内 `flatten-ctl export -` 以租户凭据拉取 + 确定性展平,tarstream 工件经 exec stdio 流回宿主 |
+| B steps | 有 steps | base 镜像 + 单一 runtime + 大可写层;**envd 为 app**,RUN/ENV/ARG/WORKDIR/USER 经 envd `process.Start` 执行(与 e2b 同形);导出新镜像工件 |
 | C template | 有 startCmd | 生产 e2b runtime 冷启最终镜像;startCmd 经 envd 启动、readyCmd 轮询;`sandbox-ctl snapshot` 出本地快照 bundle |
 
 两类 guest 信道刻意分离:e2b 语义(steps/startCmd/readyCmd)走 **envd**,平台机制(flatten 拉取/
@@ -479,7 +479,7 @@ Cluster Control Plane:  registry 自聚簇(N 副本,按 group/node 逻辑分片)
 | `cluster-ctl placer` | `--config /etc/cluster-ctl/placer.yaml` | `placer.id/listen/advertise/memberlist_label`;`registry.bootstrap`;`import_groups[]`;`placement` | `orchestrator/docs/cluster-placer.md` |
 | `sandbox-ctl run` | `--config <path>`(`SANDBOX_CONFIG`)+ `--manifest-config <path>`(`MANIFEST_CONFIG`)| **per-sandbox**,由 `node-ctl` 生成,落在 `/run/sandbox/<sid>/` | [`docs/sandbox.md`](sandbox.md) §3 |
 | `manifest-ctl` | `--manifest-config <path>`(`MANIFEST_CONFIG`)| 与 `sandbox-ctl` 共享格式;只连本机 store-ctl + cache-ctl | [`docs/manifest.md`](manifest.md) §3 |
-| `flatten-ctl` | CLI flag + `--manifest-config`(`MANIFEST_CONFIG`,`--upload` 时)+ `--config`(`FLATTEN_CONFIG`,registry 源时);凭据走 `FLATTEN_REGISTRY_*` env | 经 builder runtime flavor 在构建沙箱 guest 内运行(`run-builder` 驱动,§5)| [`docs/flatten.md`](flatten.md) §2 |
+| `flatten-ctl` | CLI flag + `--manifest-config`(`MANIFEST_CONFIG`,`--upload` 时)+ `--config`(`FLATTEN_CONFIG`,registry 源时);凭据走 `FLATTEN_REGISTRY_*` env | 经单一 guest runtime 在构建沙箱 guest 内运行(`run-builder` 驱动,§5)| [`docs/flatten.md`](flatten.md) §2 |
 
 构建产物路径、跨架构、release 打包见 [`docs/build.md`](build.md);性能基线、
 回归 checklist 见 [`docs/perf.md`](perf.md)。
