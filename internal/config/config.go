@@ -8,6 +8,7 @@
 package config
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -447,7 +448,7 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("config: read %s: %w", path, err)
 	}
 	var c Config
-	if err := yaml.Unmarshal(b, &c); err != nil {
+	if err := decodeKnownYAML(b, &c); err != nil {
 		return nil, fmt.Errorf("config: parse %s: %w", path, err)
 	}
 	c.applyDefaults()
@@ -573,6 +574,12 @@ func (c *Config) validate() error {
 	if c.EncryptionKeySpec() == "" {
 		return fmt.Errorf("config: encryption_key (or NODE_CONFIG_ENCRYPTION_KEY env) is required")
 	}
+	if c.Sandbox.Boot.Kernel == "" {
+		return fmt.Errorf("config: sandbox.boot.kernel is required")
+	}
+	if c.Sandbox.Boot.Runtime == "" {
+		return fmt.Errorf("config: sandbox.boot.runtime is required")
+	}
 	switch c.Checkpoint.Mode {
 	case CheckpointLocal, CheckpointRemote:
 	default:
@@ -631,7 +638,7 @@ func LoadProxy(path string) (*ProxyFileConfig, error) {
 		return nil, fmt.Errorf("proxy config: read %s: %w", path, err)
 	}
 	var p ProxyFileConfig
-	if err := yaml.Unmarshal(b, &p); err != nil {
+	if err := decodeKnownYAML(b, &p); err != nil {
 		return nil, fmt.Errorf("proxy config: parse %s: %w", path, err)
 	}
 	p.applyDefaults()
@@ -672,4 +679,10 @@ func (p *ProxyFileConfig) ParkTimeoutDur() time.Duration {
 		return 30 * time.Second
 	}
 	return d
+}
+
+func decodeKnownYAML(b []byte, out any) error {
+	dec := yaml.NewDecoder(bytes.NewReader(b))
+	dec.KnownFields(true)
+	return dec.Decode(out)
 }

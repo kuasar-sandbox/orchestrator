@@ -560,8 +560,8 @@ serve 不预建 cgroup、不做进程搬迁。LaunchSpec 给 sandbox-ctl 带
 沙箱栈的 app stdio 与 guest 内核 dmesg 全部直写 journald(无临时日志文件),由
 `SYSLOG_IDENTIFIER` 标签区分;journald 按写入进程的 cgroup 自动盖 `_SYSTEMD_UNIT`,
 故"标签 + 单元"二元组即选定一路流。写者是 **sandbox-ctl** 的 stdio bridge
-(`--stdout-to/--stderr-to/--console journald=<tag>`,语义见 sandbox-runtime
-sandbox.md §2.2)与 run-builder(自身里程碑 + envd RUN 输出回放,`go-systemd/journal`
+(`--stdout-to/--stderr-to/--console journald=<tag>`,语义见 `sandboxer/docs/sandbox.md`
+§2.2)与 run-builder(自身里程碑 + envd RUN 输出回放,`go-systemd/journal`
 纯 Go 直发):
 
 | 标签 | 写者 / 单元 | 内容 | 去向 |

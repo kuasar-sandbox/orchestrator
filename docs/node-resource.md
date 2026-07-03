@@ -413,7 +413,7 @@ T3  block read AdmitResponse(可能立即,也可能在 queue 中等待)
 T4  if rejected: exit 2(上层调度决定 retry / 换节点)
 T4' if admitted: continue(可能伴随 queued_for_ms > 0,仅作 log 用)
 T5  cgroup join(静态 cgroup / 动态控制模式写限制;无 cgroup 模式跳过)
-T6  ... 启动序列继续(详见 sandbox.md §冷启动数据流)
+T6  ... 启动序列继续(详见 `sandboxer/docs/sandbox.md` §冷启动数据流)
 ```
 
 sandbox.yaml `resources.startup.memory` 是 sandbox 期望的 startup 阶段
@@ -714,7 +714,7 @@ correlation = independent          # 沙箱独立 burst,可改 50% 同步
 - **解耦**:控制器不直接管 CH 进程,不直接读 guest 状态;只跟 sandbox-ctl
   对话,sandbox-ctl 负责把决策落到 CH/cgroup
 
-详见 [`sandbox.md`](sandbox.md) §与 node-ctl 的资源协议。
+详见 `sandboxer/docs/sandbox.md` §与 node-ctl 的资源协议。
 
 ### 10.2 与 cache-ctl / store-ctl
 
@@ -736,9 +736,9 @@ cache-ctl / store-ctl 的资源占用是 host 预留的一部分,计入
 
 - [node.md](node.md) §10 —— 内置控制器(`resource_listen`)的宿主 `node-ctl conductor serve` 与
   node-link 集群接入(节点水位经心跳喂集群 P2C)
-- [`sandbox.md`](sandbox.md) §资源模型 / §与 node-ctl 的资源协议 —— sandbox-ctl
+- `sandboxer/docs/sandbox.md` §资源模型 / §与 node-ctl 的资源协议 —— sandbox-ctl
   侧的执行器行为(本协议本侧)
-- [`sandbox.md`](sandbox.md) §恢复时的资源衔接 —— 恢复路径下的 Admit 字段
+- `sandboxer/docs/sandbox.md` §恢复时的资源衔接 —— 恢复路径下的 Admit 字段
   `allocatable_at_snapshot` 派生
 - [`cache.md`](cache.md) / [`store.md`](store.md) —— 资源预留计入 host_reserved
   的两个组件
