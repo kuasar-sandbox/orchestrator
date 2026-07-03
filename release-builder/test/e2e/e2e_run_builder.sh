@@ -1,0 +1,470 @@
+#!/usr/bin/env bash
+#
+# e2e_run_builder.sh — the orchestrator's three-phase build pipeline
+# (run-builder), end to end on real microVMs. Builds run INSIDE build
+# sandboxes: the base image is pulled + flattened in-guest over the tenant
+# network (zot reached via the vswitch mgmt NIC), steps and startCmd/readyCmd
+# run THROUGH ENVD (the e2b exec channel, /bin/bash -l -c), and the template
+# snapshot is taken from a production-runtime VM with the start command left
+# as an envd-managed process. One orchestrator, three builds + one create:
+#
+#   B1  fromImage (in-guest pull + flatten)                → e2b-img template
+#   B2  fromTemplate(B1, img) + steps + startCmd/readyCmd  → e2b-snp template
+#       boots the steps VM from manifest://, applies RUN/ENV/WORKDIR, exports
+#       (config merge), runs startCmd/readyCmd on the production runtime,
+#       snapshots, then ONE upload-snapshot uploads bundle + image + overlay
+#   B3  fromTemplate(B2, snp) + steps only                 → e2b-snp template
+#       extracts the base image from B2's snapshot.cfg and INHERITS its
+#       startCmd/readyCmd (reaching ready proves both ran)
+#   B4  COPY build context (versitygw; skipped if absent)  → e2b-img template
+#       files endpoint → presigned direct-to-bucket PUT → in-build extract via
+#       flatten-ctl; a RUN step asserts content + default/--chown ownership
+#   create from B3 → 201 → list → kill                     (the template restores)
+#
+# Plus the negative surface: COPY without files_storage → 501; with it, a COPY
+# missing its filesHash → 400 and an un-uploaded context → 400.
+# Deep asserts via the artifact chain: B2's snapshot.cfg carries
+# e2b.start_cmd metadata + a manifest:// base whose image config holds the
+# merged ENV/WORKDIR; B3's RUN step only succeeds if B2's RUN persisted.
+#
+# Requires systemd as PID1 + root (units over D-Bus), /dev/kvm, docker (seeds
+# the base image), zot, mkfs.ext4, and bin/: node-ctl sandbox-ctl
+# e2b-key-ctl vswitch-ctl cloud-hypervisor flatten-ctl manifest-ctl store-ctl
+# + vmlinux + sandbox-runtime{,-e2b,-builder}.erofs. Missing prerequisites →
+# exit 0 ("skipped") unless REQUIRE_BUILDER=1.
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+BIN="${BIN:-$REPO_ROOT/bin}"
+DOMAIN="${DOMAIN:-sandboxes.e2e.local}"
+# Builds with steps/startCmd carry the e2b contract: envd runs them as
+# `/bin/bash -l -c` — the image must have bash (python:3.12-slim does).
+E2E_IMAGE="${E2E_IMAGE:-python:3.12-slim}"
+ZOT_BIN="${ZOT_BIN:-$(command -v zot || true)}"
+# versitygw (S3 gateway) backs COPY build contexts; absent → the COPY chain is
+# skipped (the rest still runs). Look in bin/, then the sandbox-deps bin (opt-in
+# `make versitygw`, not in the default umbrella collect), then PATH.
+if [ -z "${VGW_BIN:-}" ]; then
+    for cand in "${BIN:-}/versitygw" "$REPO_ROOT/../sandbox-deps/bin/versitygw" "$(command -v versitygw 2>/dev/null || true)"; do
+        [ -n "$cand" ] && [ -x "$cand" ] && { VGW_BIN="$cand"; break; }
+    done
+fi
+SWITCH="${SWITCH:-swbld}"; SW_NETNS="${SW_NETNS:-e2ebld_sw}"; SW_MGMT="${SW_MGMT:-swbldm0}"
+MGMT_VIP="169.254.169.254"                   # host-side mgmt NIC IP; guests route 0/0 here
+
+skip() {
+    echo
+    echo "==> e2e_run_builder: skipping ($*)"
+    [ "${REQUIRE_BUILDER:-0}" = "1" ] && { echo "REQUIRE_BUILDER=1 set; failing instead" >&2; exit 1; }
+    exit 0
+}
+fail() { echo "==> FAIL: $*" >&2; exit 1; }
+
+# ---- prerequisite checks --------------------------------------------------
+for b in node-ctl sandbox-ctl e2b-key-ctl vswitch-ctl cloud-hypervisor flatten-ctl manifest-ctl store-ctl; do
+    [ -x "$BIN/$b" ] || skip "missing $BIN/$b — run 'make build'"
+done
+for f in vmlinux sandbox-runtime.erofs sandbox-runtime-e2b.erofs sandbox-runtime-builder.erofs; do
+    [ -f "$BIN/$f" ] || skip "missing $BIN/$f — run 'make all' + 'make sandbox-runtime-builder'"
+done
+command -v curl >/dev/null 2>&1 || skip "curl not on PATH"
+command -v docker >/dev/null 2>&1 || skip "docker not on PATH"
+docker info >/dev/null 2>&1 || skip "docker daemon not usable"
+[ -n "$ZOT_BIN" ] && [ -x "$ZOT_BIN" ] || skip "zot not on PATH"
+command -v mkfs.ext4 >/dev/null 2>&1 || [ -x /sbin/mkfs.ext4 ] || skip "mkfs.ext4 not found"
+[ -d /run/systemd/system ] || skip "systemd is not PID1 (orchestrator drives units over D-Bus)"
+[ -e /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ] || skip "/dev/kvm not available (rw)"
+docker image inspect "$E2E_IMAGE" >/dev/null 2>&1 || docker pull "$E2E_IMAGE" >/dev/null 2>&1 \
+    || skip "seed image $E2E_IMAGE not cached and pull failed (set E2E_IMAGE)"
+
+if [ "$(id -u)" -ne 0 ]; then
+    exec sudo -nE "$0" "$@"
+fi
+
+WORK="$(mktemp -d /tmp/e2e-builder-XXXXXX)"
+# Units must live in a real systemd load path; we only remove what we created.
+UNIT_DIR="/run/systemd/system"
+UNIT_NAMES=(sandbox-runner@.service sandbox-builder@.service sandbox-runner.slice sandbox-builder.slice)
+declare -a OURS=()
+for u in "${UNIT_NAMES[@]}"; do
+    [ -e "$UNIT_DIR/$u" ] && skip "$UNIT_DIR/$u already exists (real deployment?); refusing to clobber"
+    OURS+=("$UNIT_DIR/$u")
+done
+mkdir -p "$WORK/run" "$WORK/lib" "$WORK/saved" "$WORK/store" "$WORK/zot" "$WORK/vgw"
+declare -a PIDS=() TAGS=()
+cleanup() {
+    set +e
+    systemctl stop 'sandbox-runner@*.service' 'sandbox-builder@*.service' 2>/dev/null
+    for p in "${PIDS[@]:-}"; do [ -n "$p" ] && kill "$p" 2>/dev/null; done
+    "$BIN/vswitch-ctl" stop "$SWITCH" --force >/dev/null 2>&1
+    ip netns del "$SW_NETNS" 2>/dev/null
+    for u in "${OURS[@]:-}"; do [ -n "$u" ] && rm -f "$u"; done
+    systemctl daemon-reload 2>/dev/null
+    for t in "${TAGS[@]:-}"; do [ -n "$t" ] && docker rmi -f "$t" >/dev/null 2>&1; done
+    [ -n "${E2E_KEEP:-}" ] && echo "kept work dir: $WORK" || rm -rf "$WORK"
+}
+trap cleanup EXIT
+
+free_port() { python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()'; }
+wait_port() { # host port name
+    for _ in $(seq 1 60); do
+        (exec 3<>"/dev/tcp/$1/$2") 2>/dev/null && { exec 3>&- 3<&-; return 0; }
+        sleep 0.5
+    done
+    fail "$3 did not open $1:$2"
+}
+
+# ---- store-ctl (fs backend, generation G1) --------------------------------
+STORE_PORT="$(free_port)"
+cat > "$WORK/store.yaml" <<EOF
+listen: 127.0.0.1:$STORE_PORT
+backend: fs
+fs:
+  root: $WORK/store
+  verify_content_key: true
+EOF
+"$BIN/store-ctl" init --config "$WORK/store.yaml" --generation G1 >"$WORK/store-init.log" 2>&1 \
+    || { cat "$WORK/store-init.log"; fail "store-ctl init"; }
+"$BIN/store-ctl" serve --config "$WORK/store.yaml" >"$WORK/store-serve.log" 2>&1 &
+PIDS+=($!)
+wait_port 127.0.0.1 "$STORE_PORT" store-ctl
+echo "==> store-ctl up (127.0.0.1:$STORE_PORT, fs backend, G1)"
+
+# ---- zot (anonymous, insecure) + seed --------------------------------------
+# Bound to 0.0.0.0: the host pushes via 127.0.0.1, the BUILD SANDBOX pulls via
+# the vswitch mgmt VIP ($MGMT_VIP) — guest loopback is not the host's.
+ZOT_PORT="$(free_port)"
+cat > "$WORK/zot.json" <<EOF
+{
+  "storage": { "rootDirectory": "$WORK/zot", "dedupe": false, "gc": false },
+  "http": { "address": "0.0.0.0", "port": "$ZOT_PORT", "compat": ["docker2s2"] },
+  "log": { "level": "warn", "output": "$WORK/zot.log" }
+}
+EOF
+"$ZOT_BIN" serve "$WORK/zot.json" >"$WORK/zot.stdout" 2>&1 &
+PIDS+=($!)
+wait_port 127.0.0.1 "$ZOT_PORT" zot
+PUSH_REF="127.0.0.1:$ZOT_PORT/e2e/base:v1"
+PULL_REF="$MGMT_VIP:$ZOT_PORT/e2e/base:v1"
+docker tag "$E2E_IMAGE" "$PUSH_REF"; TAGS+=("$PUSH_REF")
+docker push "$PUSH_REF" >"$WORK/push.log" 2>&1 || { cat "$WORK/push.log"; fail "docker push $PUSH_REF"; }
+echo "==> zot up (0.0.0.0:$ZOT_PORT); seeded $E2E_IMAGE → $PUSH_REF (guest pulls $PULL_REF)"
+
+# ---- vswitch (guest network for the build sandboxes) -----------------------
+"$BIN/vswitch-ctl" stop "$SWITCH" --force >/dev/null 2>&1 || true
+ip netns del "$SW_NETNS" 2>/dev/null || true
+ip netns add "$SW_NETNS"
+# --mgmt-extract puts $MGMT_VIP on host NIC $SW_MGMT and routes guest 0/0 to it;
+# that is the only path the builds need (zot on the host). No NAT required.
+"$BIN/vswitch-ctl" start "$SWITCH" --netns="$SW_NETNS" --ports=16 --mac-addr=02:00:00:00:01:01 \
+    --floating-ip-base=100.100.112.0 --mode=tap \
+    --mgmt-extract=:$SW_MGMT:$MGMT_VIP,0.0.0.0/0 >"$WORK/vswitch.log" 2>&1 \
+    || { cat "$WORK/vswitch.log"; fail "vswitch start"; }
+echo "==> vswitch up ($SWITCH; mgmt $SW_MGMT=$MGMT_VIP)"
+
+# ---- manifest config + diff templates ---------------------------------------
+KEYLESS_CACHE=""   # no cache-ctl: empty endpoint falls back to store-as-cache
+cat > "$WORK/manifest.yaml" <<EOF
+manifest:
+  key: ""
+store:
+  endpoint: 127.0.0.1:$STORE_PORT
+  pool: 4
+  timeout: 30s
+cache:
+  endpoint: "$KEYLESS_CACHE"
+chunker:
+  mode: cdc
+  cdc: { min: 128KiB, avg: 512KiB, max: 1MiB }
+crypto:
+  chunk: aes
+  manifest: aes
+EOF
+MKFS_EXT4="$(command -v mkfs.ext4 || echo /sbin/mkfs.ext4)"
+OVL="$WORK/overlay-1G.ext4"             # cold-boot overlay upper (template VMs)
+truncate -s 1G "$OVL" && "$MKFS_EXT4" -F -q -b 4096 "$OVL"
+BLDDIFF="$WORK/builder-2G.ext4"         # build VM writable disk (pull cache + steps delta + export scratch)
+truncate -s 2G "$BLDDIFF" && "$MKFS_EXT4" -F -q -b 4096 "$BLDDIFF"
+
+# ---- versitygw (S3 gateway for COPY build contexts; optional) ---------------
+# Backs builder.files_storage: the client direct-uploads a COPY context here
+# (presigned PUT) and the build sandbox fetches it (presigned GET). Bound to
+# 127.0.0.1 — both the client (this script) and the build-side fetch
+# (run-builder, host) reach it from the host. Absent → the COPY chain skips.
+VGW_AK="e2eaccess"; VGW_SK="e2esecretkey0123"; VGW_BUCKET="build-files"
+FILES_STORAGE_YAML=""
+if [ -n "$VGW_BIN" ] && [ -x "$VGW_BIN" ]; then
+    VGW_PORT="$(free_port)"
+    mkdir -p "$WORK/vgw/$VGW_BUCKET"   # posix backend: a bucket is a top-level dir
+    ROOT_ACCESS_KEY="$VGW_AK" ROOT_SECRET_KEY="$VGW_SK" \
+        "$VGW_BIN" --port "127.0.0.1:$VGW_PORT" posix "$WORK/vgw" >"$WORK/vgw.log" 2>&1 &
+    PIDS+=($!)
+    wait_port 127.0.0.1 "$VGW_PORT" versitygw
+    FILES_STORAGE_YAML=$(cat <<EOF
+  files_storage:
+    endpoint: http://127.0.0.1:$VGW_PORT
+    region: us-east-1
+    bucket: $VGW_BUCKET
+    access_key: $VGW_AK
+    secret_key: $VGW_SK
+    force_path_style: true
+EOF
+)
+    echo "==> versitygw up (127.0.0.1:$VGW_PORT, posix, bucket=$VGW_BUCKET) — COPY chain enabled"
+else
+    echo "==> versitygw absent — COPY chain will be skipped (set VGW_BIN or 'make versitygw')"
+fi
+
+# ---- tenant credentials + orchestrator --------------------------------------
+MK="$("$BIN/e2b-key-ctl" gen-key)"
+AK="$("$BIN/e2b-key-ctl" gen-apikey "$MK")"
+ENC="$("$BIN/e2b-key-ctl" gen-key)"
+PORT="$(free_port)"
+
+cat > "$WORK/config.yaml" <<EOF
+api: { domain: $DOMAIN, listen: ":$PORT" }
+encryption_key: "$ENC"
+manifest_config: $WORK/manifest.yaml
+paths: { run_root: $WORK/run, base_root: $WORK/lib, config_socket: $WORK/node-ctl.socket }
+units: { dir: $UNIT_DIR }
+sandbox:
+  network: { switch: $SWITCH }
+  boot:
+    kernel: $BIN/vmlinux
+    runtime_e2b: $BIN/sandbox-runtime-e2b.erofs
+    runtime_base: $BIN/sandbox-runtime.erofs
+    overlay_diff_template: $OVL
+builder:
+  insecure_registry: true
+  runtime_builder: $BIN/sandbox-runtime-builder.erofs
+  diff_template: $BLDDIFF
+  vcpu: 1
+  memory: 1GiB
+  pull_timeout_sec: 300
+  step_timeout_sec: 180
+  ready_timeout_sec: 60
+  total_timeout_sec: 1200
+$FILES_STORAGE_YAML
+checkpoint: { mode: local, local_dir: $WORK/saved }
+EOF
+
+"$BIN/node-ctl" serve --config "$WORK/config.yaml" >"$WORK/orch.log" 2>&1 &
+PIDS+=($!)
+for _ in $(seq 1 30); do
+    curl -sS --noproxy '*' -o /dev/null "http://127.0.0.1:$PORT/health" -H "Host: api.$DOMAIN" 2>/dev/null && break
+    kill -0 "${PIDS[-1]}" 2>/dev/null || { sed 's/^/    /' "$WORK/orch.log"; fail "orchestrator serve exited"; }
+    sleep 0.5
+done
+"$BIN/node-ctl" manifest-key add --socket "$WORK/node-ctl.socket" "$MK" >/dev/null || fail "manifest-key add"
+echo "==> orchestrator up (dev http :$PORT); tenant allowlisted"
+
+req() { # method path key [body]
+    local method="$1" path="$2" key="$3" body="${4:-}"
+    local args=(-sS --noproxy '*' -o "$WORK/resp.body" -w '%{http_code}' -X "$method"
+                -H "Host: api.$DOMAIN" -H "X-API-KEY: $key")
+    [ -n "$body" ] && args+=(-H 'Content-Type: application/json' -d "$body")
+    curl "${args[@]}" "http://127.0.0.1:$PORT$path"
+}
+register() { # name → sets TID/BID
+    local code; code=$(req POST /v3/templates "$AK" "{\"name\":\"$1\"}")
+    [ "$code" = "202" ] || { cat "$WORK/resp.body"; fail "register $1 = $code (want 202)"; }
+    TID=$(grep -o '"templateID":"[^"]*"' "$WORK/resp.body" | head -1 | cut -d'"' -f4)
+    BID=$(grep -o '"buildID":"[^"]*"'    "$WORK/resp.body" | head -1 | cut -d'"' -f4)
+}
+diag() { # bid — failure diagnostics (workdir is reaped by the orchestrator)
+    echo "---- orchestrator log (tail) ----"
+    tail -40 "$WORK/orch.log" 2>/dev/null | sed 's/^/    /'
+    echo "---- journal sandbox-builder@$1 (tail) ----"
+    journalctl -u "sandbox-builder@$1.service" --no-pager -n 120 2>/dev/null | sed 's/^/    /'
+}
+wait_ready() { # tid bid label → sets PERSIST (e2b-{img,snp}-<64hex>)
+    local tid="$1" bid="$2" label="$3" status="" code
+    for _ in $(seq 1 240); do
+        code=$(req GET "/templates/$tid/builds/$bid/status" "$AK")
+        [ "$code" = "200" ] || fail "$label status = $code (want 200)"
+        status=$(grep -o '"status":"[^"]*"' "$WORK/resp.body" | head -1 | cut -d'"' -f4)
+        case "$status" in
+            ready)
+                PERSIST=$(grep -oE 'e2b-(img|snp)-[0-9a-f]{64}' "$WORK/resp.body" | head -1)
+                [ -n "$PERSIST" ] || fail "$label ready but no persist id: $(cat "$WORK/resp.body")"
+                return 0;;
+            error)
+                echo "    $label error response: $(cat "$WORK/resp.body")"
+                diag "$bid"; fail "$label build status=error";;
+        esac
+        sleep 2
+    done
+    diag "$bid"; fail "$label did not reach ready (last status=$status)"
+}
+
+# ---- negative surface: COPY gating depends on files_storage posture ---------
+register neg
+if [ -z "$FILES_STORAGE_YAML" ]; then
+    # Unconfigured: COPY and the files endpoint are unsupported → 501 (loud).
+    code=$(req POST "/v2/templates/$TID/builds/$BID" "$AK" \
+        "{\"fromImage\":\"$PULL_REF\",\"steps\":[{\"type\":\"COPY\",\"args\":[\"a\",\"b\"],\"filesHash\":\"x\"}]}")
+    [ "$code" = "501" ] || fail "COPY trigger (no files_storage) = $code (want 501)"
+    code=$(req GET "/templates/$TID/files/deadbeef" "$AK")
+    [ "$code" = "501" ] || fail "files endpoint (no files_storage) = $code (want 501)"
+    echo "==> PASS: without files_storage, COPY + files endpoint report 501"
+else
+    # Configured: a COPY with no filesHash is a malformed request → 400.
+    code=$(req POST "/v2/templates/$TID/builds/$BID" "$AK" \
+        "{\"fromImage\":\"$PULL_REF\",\"steps\":[{\"type\":\"COPY\",\"args\":[\"a\",\"b\"]}]}")
+    [ "$code" = "400" ] || fail "COPY trigger (no filesHash) = $code (want 400)"
+    echo "==> PASS: COPY without a filesHash rejected (400); files-storage configured (B4 exercises it)"
+fi
+
+# ---- B1: fromImage → e2b-img -----------------------------------------------
+echo "==> B1: fromImage=$PULL_REF (in-guest pull + flatten)"
+register e2e-img
+B1_TID="$TID"; B1_BID="$BID"
+code=$(req POST "/v2/templates/$B1_TID/builds/$B1_BID" "$AK" "{\"fromImage\":\"$PULL_REF\"}")
+[ "$code" = "202" ] || { cat "$WORK/resp.body"; fail "B1 trigger = $code (want 202)"; }
+wait_ready "$B1_TID" "$B1_BID" B1
+B1_PERSIST="$PERSIST"
+case "$B1_PERSIST" in e2b-img-*) : ;; *) fail "B1 persist=$B1_PERSIST (want e2b-img-…)";; esac
+echo "==> PASS: B1 ready → $B1_PERSIST"
+
+# ---- B2: fromTemplate(img) + steps + startCmd/readyCmd → e2b-snp ------------
+echo "==> B2: fromTemplate=$B1_PERSIST + steps + startCmd/readyCmd"
+register e2e-tpl
+B2_TID="$TID"; B2_BID="$BID"
+B2_BODY=$(cat <<EOF
+{"fromTemplate":"$B1_PERSIST",
+ "steps":[
+   {"type":"RUN","args":["useradd -m -d /home/user user || adduser -D user"]},
+   {"type":"RUN","args":["echo b2 > /etc/b2-marker"]},
+   {"type":"ENV","args":["BUILT","yes"]},
+   {"type":"WORKDIR","args":["/home/user"]}],
+ "startCmd":"touch /home/user/started; exec sleep 86400",
+ "readyCmd":"test -f /home/user/started"}
+EOF
+)
+code=$(req POST "/v2/templates/$B2_TID/builds/$B2_BID" "$AK" "$B2_BODY")
+[ "$code" = "202" ] || { cat "$WORK/resp.body"; fail "B2 trigger = $code (want 202)"; }
+wait_ready "$B2_TID" "$B2_BID" B2
+B2_PERSIST="$PERSIST"
+case "$B2_PERSIST" in e2b-snp-*) : ;; *) fail "B2 persist=$B2_PERSIST (want e2b-snp-…)";; esac
+echo "==> PASS: B2 ready → $B2_PERSIST"
+
+# Deep asserts through the artifact chain: the uploaded snapshot.cfg names a
+# manifest:// base image and carries the e2b start/ready metadata; the base
+# image's runtime config holds the merged ENV/WORKDIR from the steps.
+B2_HEX="${B2_PERSIST##*-}"
+MANIFEST_KEY="$MK" "$BIN/sandbox-ctl" info --json --manifest-config "$WORK/manifest.yaml" \
+    "manifest://$B2_HEX" >"$WORK/b2.cfg.json" 2>"$WORK/b2.cfg.err" \
+    || { cat "$WORK/b2.cfg.err"; fail "sandbox-ctl info manifest://$B2_HEX"; }
+grep -q '"e2b.start_cmd": *"touch /home/user/started' "$WORK/b2.cfg.json" \
+    || fail "B2 snapshot.cfg missing e2b.start_cmd metadata: $(cat "$WORK/b2.cfg.json")"
+grep -q '"e2b.ready_cmd": *"test -f /home/user/started"' "$WORK/b2.cfg.json" \
+    || fail "B2 snapshot.cfg missing e2b.ready_cmd metadata"
+B2_IMG_HEX=$(grep -o '"BaseRef": *"manifest://[0-9a-f]*"' "$WORK/b2.cfg.json" | grep -o '[0-9a-f]\{64\}' | head -1)
+[ -n "$B2_IMG_HEX" ] || fail "B2 snapshot.cfg base is not manifest:// (upload-snapshot did not rewrite?): $(cat "$WORK/b2.cfg.json")"
+MANIFEST_KEY="$MK" "$BIN/flatten-ctl" info --json --manifest-config "$WORK/manifest.yaml" \
+    "manifest://$B2_IMG_HEX" >"$WORK/b2.img.json" 2>"$WORK/b2.img.err" \
+    || { cat "$WORK/b2.img.err"; fail "flatten-ctl info manifest://$B2_IMG_HEX"; }
+grep -q '"BUILT=yes"' "$WORK/b2.img.json" || fail "B2 image config missing merged ENV BUILT=yes: $(cat "$WORK/b2.img.json")"
+grep -q '"WorkingDir": *"/home/user"' "$WORK/b2.img.json" || fail "B2 image config missing merged WORKDIR"
+echo "==> PASS: B2 artifacts — snapshot.cfg metadata + manifest:// base + merged ENV/WORKDIR"
+
+# ---- B3: fromTemplate(snp) + steps only (start/ready inherited) -------------
+echo "==> B3: fromTemplate=$B2_PERSIST + steps (inherits startCmd/readyCmd)"
+register e2e-child
+B3_TID="$TID"; B3_BID="$BID"
+code=$(req POST "/v2/templates/$B3_TID/builds/$B3_BID" "$AK" \
+    "{\"fromTemplate\":\"$B2_PERSIST\",\"steps\":[{\"type\":\"RUN\",\"args\":[\"test -f /etc/b2-marker\"]}]}")
+[ "$code" = "202" ] || { cat "$WORK/resp.body"; fail "B3 trigger = $code (want 202)"; }
+wait_ready "$B3_TID" "$B3_BID" B3
+B3_PERSIST="$PERSIST"
+case "$B3_PERSIST" in e2b-snp-*) : ;; *) fail "B3 persist=$B3_PERSIST (want e2b-snp-…)";; esac
+# ready is only reachable if: the RUN saw B2's marker (base extraction worked)
+# AND the inherited startCmd/readyCmd ran on the new template VM.
+echo "==> PASS: B3 ready → $B3_PERSIST (base-image extraction + start/ready inheritance)"
+
+# ---- B4: COPY build context via files endpoint + presigned direct upload ----
+# Acts as the e2b client: GET the files endpoint (present=false) → PUT the
+# gzipped context straight to the bucket → GET again (present=true), then build
+# fromImage with COPY steps and assert (via a RUN step) that the files landed
+# with the right ownership. Skipped without versitygw.
+if [ -n "$FILES_STORAGE_YAML" ]; then
+    echo "==> B4: COPY build context (files endpoint → presigned PUT → in-build extract)"
+    register e2e-copy
+    B4_TID="$TID"; B4_BID="$BID"
+
+    # Build the COPY context: ./hello.txt + ./sub/nested.txt, gzipped tar with
+    # arcnames relative to the context (the e2b SDK's layout).
+    CTX="$WORK/ctx"; mkdir -p "$CTX/sub"
+    echo "COPY-MARKER-$RANDOM" > "$CTX/hello.txt"; MARKER="$(cat "$CTX/hello.txt")"
+    echo nested > "$CTX/sub/nested.txt"
+    ( cd "$CTX" && tar czf "$WORK/ctx.tgz" . )
+    HASH="$(sha256sum "$WORK/ctx.tgz" | cut -d' ' -f1)"
+
+    # 1. files endpoint: not present yet, returns a presigned PUT url.
+    code=$(req GET "/templates/$B4_TID/files/$HASH" "$AK")
+    [ "$code" = "201" ] || { cat "$WORK/resp.body"; fail "files GET = $code (want 201)"; }
+    # Parse with a real JSON reader (not grep): the presigned url carries '&',
+    # which stdlib json escapes to & — every real client (the e2b SDK)
+    # decodes it; a sed extraction would not.
+    present=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["present"])' "$WORK/resp.body")
+    [ "$present" = "False" ] || fail "files: expected present=false on first GET: $(cat "$WORK/resp.body")"
+    PUT_URL="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["url"])' "$WORK/resp.body")"
+    [ -n "$PUT_URL" ] || fail "files: no presigned url"
+
+    # 2. client uploads the context straight to the bucket (bytes skip the orchestrator).
+    pcode=$(curl -sS --noproxy '*' -o /dev/null -w '%{http_code}' -X PUT --data-binary @"$WORK/ctx.tgz" "$PUT_URL")
+    [ "$pcode" = "200" ] || fail "presigned PUT = $pcode (want 200)"
+
+    # 3. now present (idempotency: client skips re-upload).
+    code=$(req GET "/templates/$B4_TID/files/$HASH" "$AK")
+    [ "$code" = "201" ] || fail "files GET#2 = $code"
+    present=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["present"])' "$WORK/resp.body")
+    [ "$present" = "True" ] || fail "files: expected present=true after upload: $(cat "$WORK/resp.body")"
+    echo "==> PASS: files endpoint round-trip (present false→PUT→true; direct-to-bucket upload)"
+
+    # Negative: a COPY referencing an un-uploaded context → 400 at trigger.
+    code=$(req POST "/v2/templates/$B4_TID/builds/$B4_BID" "$AK" \
+        "{\"fromImage\":\"$PULL_REF\",\"steps\":[{\"type\":\"COPY\",\"args\":[\".\",\"/opt/x\"],\"filesHash\":\"deadbeefdeadbeef\"}]}")
+    [ "$code" = "400" ] || { cat "$WORK/resp.body"; fail "COPY w/ unuploaded context = $code (want 400)"; }
+    echo "==> PASS: COPY referencing an un-uploaded context rejected (400)"
+
+    # Real build: COPY whole context to /opt/ct (default owner 0:0), the single
+    # file to /opt/ct2/ with --chown 1000:1000, then RUN asserts presence+owner.
+    # Reaching ready proves the extract + ownership are correct.
+    B4_BODY=$(cat <<EOF
+{"fromImage":"$PULL_REF",
+ "steps":[
+   {"type":"COPY","args":[".","/opt/ct"],"filesHash":"$HASH"},
+   {"type":"COPY","args":["hello.txt","/opt/ct2/","1000:1000"],"filesHash":"$HASH"},
+   {"type":"RUN","args":["test \"\$(cat /opt/ct/hello.txt)\" = \"$MARKER\" && test -f /opt/ct/sub/nested.txt && test \"\$(stat -c %u:%g /opt/ct/hello.txt)\" = 0:0 && test \"\$(stat -c %u:%g /opt/ct2/hello.txt)\" = 1000:1000"]}]}
+EOF
+)
+    code=$(req POST "/v2/templates/$B4_TID/builds/$B4_BID" "$AK" "$B4_BODY")
+    [ "$code" = "202" ] || { cat "$WORK/resp.body"; fail "B4 trigger = $code (want 202)"; }
+    wait_ready "$B4_TID" "$B4_BID" B4
+    B4_PERSIST="$PERSIST"
+    case "$B4_PERSIST" in e2b-img-*) : ;; *) fail "B4 persist=$B4_PERSIST (want e2b-img-…)";; esac
+    echo "==> PASS: B4 ready → $B4_PERSIST (COPY extract + default/--chown ownership verified in-build)"
+else
+    echo "==> SKIP B4 COPY chain (no versitygw)"
+fi
+
+# ---- create a sandbox from the built template -------------------------------
+echo "==> create sandbox from $B3_PERSIST (snapshot restore path)"
+code=$(req POST /sandboxes "$AK" "{\"templateID\":\"$B3_PERSIST\",\"timeout\":60}")
+[ "$code" = "201" ] || { cat "$WORK/resp.body"; diag "$B3_BID"; fail "create = $code (want 201)"; }
+SID=$(grep -o '"sandboxID":"[^"]*"' "$WORK/resp.body" | head -1 | cut -d'"' -f4)
+[ -n "$SID" ] || fail "create returned no sandboxID"
+code=$(req GET /v2/sandboxes "$AK"); [ "$code" = "200" ] || fail "list = $code (want 200)"
+grep -q "$SID" "$WORK/resp.body" || fail "created sandbox $SID not in list"
+code=$(req DELETE "/sandboxes/$SID" "$AK"); [ "$code" = "204" ] || fail "kill = $code (want 204)"
+echo "==> PASS: sandbox create → list → kill from the built template"
+
+# store actually holds the uploaded chunks/manifests
+objs=$(find "$WORK/store" -type f | wc -l)
+[ "$objs" -gt 0 ] || fail "store has no objects after the builds"
+echo "==> store holds $objs object(s)"
+
+echo
+echo "==> e2e_run_builder: OK   (B1=$B1_PERSIST B2=$B2_PERSIST B3=$B3_PERSIST${B4_PERSIST:+ B4=$B4_PERSIST})"
