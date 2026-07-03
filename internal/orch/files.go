@@ -3,7 +3,7 @@ package orch
 import (
 	"context"
 
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/api"
+	"github.com/kuasar-sandbox/orchestrator/internal/api"
 )
 
 // FilesUpload backs GET /templates/{tid}/files/{hash}: it authorizes the build

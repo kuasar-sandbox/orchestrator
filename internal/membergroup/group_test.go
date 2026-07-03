@@ -36,14 +36,14 @@ func TestHTTPMemberlistJoinAndMetaUpdate(t *testing.T) {
 	waitFor(t, func() bool { return gA.Alive("b") && gB.Alive("a") })
 
 	if err := gB.UpdateMeta(Meta{
-		Role: RoleScaler, ID: "b", Advertise: srvB.URL,
+		Role: RolePlacer, ID: "b", Advertise: srvB.URL,
 		Ready: true, ReadyLabel: "registry.2.test",
 	}); err != nil {
 		t.Fatal(err)
 	}
 	waitFor(t, func() bool {
-		scalers := gA.ReadyScalers("registry.2.test")
-		return len(scalers) == 1 && scalers[0].ID == "b" && scalers[0].Advertise == srvB.URL
+		placers := gA.ReadyPlacers("registry.2.test")
+		return len(placers) == 1 && placers[0].ID == "b" && placers[0].Advertise == srvB.URL
 	})
 }
 

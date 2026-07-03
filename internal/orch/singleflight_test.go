@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/routesync"
+	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 )
 
 // TestFlightGroupCollapses proves the resume dedupe: while one call for a key is

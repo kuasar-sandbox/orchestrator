@@ -8,9 +8,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/apikey"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/config"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/types"
+	"github.com/kuasar-sandbox/orchestrator/internal/apikey"
+	"github.com/kuasar-sandbox/orchestrator/internal/config"
+	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
 // TestExportImportRoundTrip exercises the migration core that connect's auto-import

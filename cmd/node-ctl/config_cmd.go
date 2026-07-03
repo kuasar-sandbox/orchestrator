@@ -7,23 +7,23 @@ import (
 	"os"
 	"strconv"
 
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/config"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/nodectl"
+	"github.com/kuasar-sandbox/orchestrator/internal/config"
+	"github.com/kuasar-sandbox/orchestrator/internal/nodectl"
 	"gopkg.in/yaml.v3"
 )
 
 // configCmd implements `node-ctl config <role>` — a per-role config diagnose +
-// generate tool (role ∈ {serve, proxy}; cluster-ctl has its own registry/router/
-// scaler). The role disambiguates the schema, so the skeleton + validation are
+// generate tool (role ∈ {conductor, proxy}; cluster-ctl has its own registry/router/
+// placer). The role disambiguates the schema, so the skeleton + validation are
 // role-specific:
 //
-//	node-ctl config serve --template            # commented skeleton for serve.yaml
-//	node-ctl config proxy --config proxy.yaml   # normalize + validate, re-emit
-//	node-ctl config serve --config serve.yaml --resolve   # + expand auto/derived
-//	  [-o <file>]                                          # write to file (default stdout)
+//	node-ctl config conductor --template                 # commented skeleton
+//	node-ctl config proxy --config proxy.yaml            # normalize + validate, re-emit
+//	node-ctl config conductor --config conductor.yaml --resolve
+//	  [-o <file>]                                        # write to file (default stdout)
 func configCmd(args []string, _ *slog.Logger) error {
 	if len(args) < 1 {
-		return fmt.Errorf("usage: node-ctl config <serve|proxy> [--template | --config <f> [--resolve]] [-o <f>]")
+		return fmt.Errorf("usage: node-ctl config <conductor|proxy> [--template | --config <f> [--resolve]] [-o <f>]")
 	}
 	role := args[0]
 	fs := flag.NewFlagSet("config "+role, flag.ExitOnError)
@@ -38,12 +38,12 @@ func configCmd(args []string, _ *slog.Logger) error {
 		err    error
 	)
 	switch role {
-	case "serve":
-		output, err = renderServeConfig(*template, *resolve, *cfgPath)
+	case "conductor":
+		output, err = renderConductorConfig(*template, *resolve, *cfgPath)
 	case "proxy":
 		output, err = renderProxyConfig(*template, *cfgPath)
 	default:
-		return fmt.Errorf("config: unknown role %q (serve|proxy)", role)
+		return fmt.Errorf("config: unknown role %q (conductor|proxy)", role)
 	}
 	if err != nil {
 		return err
@@ -55,15 +55,15 @@ func configCmd(args []string, _ *slog.Logger) error {
 	return err
 }
 
-// renderServeConfig handles `config serve`. --resolve additionally expands the
+// renderConductorConfig handles `config conductor`. --resolve additionally expands the
 // resource controller's "auto" memory/cpu (and validates its watermarks) so the
 // operator sees the effective numbers.
-func renderServeConfig(template, resolve bool, path string) ([]byte, error) {
+func renderConductorConfig(template, resolve bool, path string) ([]byte, error) {
 	if template {
-		return []byte(serveConfigSkeleton), nil
+		return []byte(conductorConfigSkeleton), nil
 	}
 	if path == "" {
-		return nil, fmt.Errorf("config serve: --config <file> or --template required")
+		return nil, fmt.Errorf("config conductor: --config <file> or --template required")
 	}
 	cfg, err := config.Load(path) // applies defaults + validates
 	if err != nil {
@@ -97,11 +97,11 @@ func renderProxyConfig(template bool, path string) ([]byte, error) {
 	return yaml.Marshal(cfg)
 }
 
-// serveConfigSkeleton is the commented authoring template for serve.yaml
-// (deploy/serve.example.yaml is the curated copy). Config is grouped by concern;
-// external binaries (sandbox-ctl, vswitch-ctl, flatten-ctl, …) are auto-discovered
+// conductorConfigSkeleton is the commented authoring template for conductor.yaml
+// (deploy/conductor.example.yaml is the curated copy). Config is grouped by concern;
+// external binaries (sandbox-ctl, connector-ctl, flatten-ctl, ...) are auto-discovered
 // next to node-ctl then on PATH.
-const serveConfigSkeleton = `# node-ctl serve config — node-ctl serve --config <this>.
+const conductorConfigSkeleton = `# node-ctl conductor serve config — node-ctl conductor serve --config <this>.
 # The unmodified e2b SDK reaches this node via E2B_DOMAIN/E2B_API_KEY (dev:
 # E2B_API_URL/E2B_SANDBOX_URL http). Required: api.domain + encryption_key.
 api:
@@ -170,7 +170,7 @@ builder:                                           # builds run INSIDE build san
   # image_uri_mask: "docker.sandboxes.example.com/e2b/custom-envs/{templateID}:{buildID}"
   # files_storage: COPY build contexts; client direct-uploads (presigned PUT) to
   # this bucket, build fetches (presigned GET). Unset → COPY rejected (501).
-  # Local/single-node: point at versitygw (sandbox-deps: make versitygw).
+  # Local/single-node: point at versitygw (guest-runtime/native-deps: make versitygw).
   # files_storage:
   #   endpoint: https://obs.cn-north-4.example.com   # versitygw: http://127.0.0.1:7070
   #   region: cn-north-4
@@ -212,7 +212,7 @@ checkpoint:                                        # paused-state tiering
 
 // proxyConfigSkeleton is the commented authoring template for proxy.yaml
 // (deploy/proxy.example.yaml is the curated copy).
-const proxyConfigSkeleton = `# node-ctl proxy worker config — node-ctl proxy --config <this> --id <name>.
+const proxyConfigSkeleton = `# node-ctl proxy worker config — node-ctl proxy serve --config <this> --id <name>.
 # External data-plane mode (serve's proxy.mode: external). One file shared by all
 # worker instances; per-instance identity is on the command line:
 #   --id <name>            unique per worker (required)

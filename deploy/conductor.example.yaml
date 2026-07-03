@@ -1,11 +1,11 @@
-# node-ctl serve config — node-ctl serve --config /etc/node-ctl/serve.yaml.
-# See sandbox-orchestrator/docs/node.md §3. Generate a fresh skeleton with
-# `node-ctl config serve --template`; validate yours with
-# `node-ctl config serve --config serve.yaml [--resolve]`.
+# node-ctl conductor serve config — node-ctl conductor serve --config /etc/node-ctl/conductor.yaml.
+# See orchestrator/docs/node.md §3. Generate a fresh skeleton with
+# `node-ctl config conductor --template`; validate yours with
+# `node-ctl config conductor --config conductor.yaml [--resolve]`.
 # The unmodified e2b SDK reaches this node via: E2B_DOMAIN=<domain> E2B_API_KEY=<key>
 # (dev: E2B_API_URL=http://host:3000 E2B_SANDBOX_URL=http://<port>-<sid>.host:3000).
 #
-# Config is grouped by concern. External binaries (sandbox-ctl, vswitch-ctl,
+# Config is grouped by concern. External binaries (sandbox-ctl, connector-ctl,
 # flatten-ctl, …) are auto-discovered next to the node-ctl binary, then on
 # PATH — they are not configured here.
 
@@ -145,7 +145,7 @@ checkpoint:
 #     sole data-plane gate (so proxy.auth must be enforce). Snapshot forks still work.
 #   enabled — envd runs in FC mode and is re-keyed to a fresh per-identity token at /init
 #     via a Firecracker MMDS v2 service hosted in the proxy component. The vswitch
-#     translates the metadata VIP to the listener (vswitch-ctl --mgmt-service ...).
+#     translates the metadata VIP to the listener (connector-ctl vswitch start --mgmt-service ...).
 #     Requires proxy.mode != off; external mode serves it on a worker started with --mmds.
 # mmds:
 #   enabled: false

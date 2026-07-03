@@ -9,8 +9,8 @@ import (
 	"os"
 	"time"
 
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/configsock"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/regcreds"
+	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
+	"github.com/kuasar-sandbox/orchestrator/internal/regcreds"
 )
 
 // buildRegistryAuth produces the tenant-default registry auth (a docker config.json)

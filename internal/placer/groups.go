@@ -1,4 +1,4 @@
-package scaler
+package placer
 
 import (
 	"context"
@@ -11,9 +11,9 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/apikey"
-	clusterstate "github.com/kuasar-sandbox/sandbox-orchestrator/internal/cluster"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/clustercfg"
+	"github.com/kuasar-sandbox/orchestrator/internal/apikey"
+	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
+	"github.com/kuasar-sandbox/orchestrator/internal/clustercfg"
 )
 
 const defaultGroupPageLimit = 1024
@@ -44,7 +44,7 @@ func NewConfiguredGroupInputs(sources []clustercfg.GroupSourceConfig) (Configure
 			out = append(out, src)
 			imports = append(imports, ImportSource{SourceID: cfg.SourceID, Importer: src})
 		default:
-			return ConfiguredGroupInputs{}, fmt.Errorf("scaler: unsupported group source type %q", cfg.SourceType)
+			return ConfiguredGroupInputs{}, fmt.Errorf("placer: unsupported group source type %q", cfg.SourceType)
 		}
 	}
 	return ConfiguredGroupInputs{Provider: multiGroupProvider{sources: out}, Sources: imports}, nil
@@ -52,17 +52,17 @@ func NewConfiguredGroupInputs(sources []clustercfg.GroupSourceConfig) (Configure
 
 func NewFileGroupSource(sourceID, dir string) (*fileGroupSource, error) {
 	if sourceID == "" {
-		return nil, fmt.Errorf("scaler: file group source id is required")
+		return nil, fmt.Errorf("placer: file group source id is required")
 	}
 	if dir == "" {
-		return nil, fmt.Errorf("scaler: file group source %q path is required", sourceID)
+		return nil, fmt.Errorf("placer: file group source %q path is required", sourceID)
 	}
 	info, err := os.Stat(dir)
 	if err != nil {
-		return nil, fmt.Errorf("scaler: file group source %q stat %s: %w", sourceID, dir, err)
+		return nil, fmt.Errorf("placer: file group source %q stat %s: %w", sourceID, dir, err)
 	}
 	if !info.IsDir() {
-		return nil, fmt.Errorf("scaler: file group source %q path %s is not a directory", sourceID, dir)
+		return nil, fmt.Errorf("placer: file group source %q path %s is not a directory", sourceID, dir)
 	}
 	return &fileGroupSource{sourceID: sourceID, dir: dir}, nil
 }
@@ -170,7 +170,7 @@ func (m multiGroupProvider) GetAuthKey(ctx context.Context, group string) (clust
 }
 
 func duplicateGroupError(group, firstSource, secondSource string) error {
-	return fmt.Errorf("scaler: group %q is defined by multiple sources (%s, %s)", group, firstSource, secondSource)
+	return fmt.Errorf("placer: group %q is defined by multiple sources (%s, %s)", group, firstSource, secondSource)
 }
 
 type fileGroupSource struct {
@@ -263,7 +263,7 @@ func (s *fileGroupSource) records(ctx context.Context) ([]clusterstate.SandboxGr
 	}
 	entries, err := os.ReadDir(s.dir)
 	if err != nil {
-		return nil, fmt.Errorf("scaler: file group source %q read %s: %w", s.sourceID, s.dir, err)
+		return nil, fmt.Errorf("placer: file group source %q read %s: %w", s.sourceID, s.dir, err)
 	}
 	records := make([]clusterstate.SandboxGroupRecord, 0, len(entries))
 	seen := map[string]string{}
@@ -276,7 +276,7 @@ func (s *fileGroupSource) records(ctx context.Context) ([]clusterstate.SandboxGr
 		}
 		rec, err := readGroupRecord(filepath.Join(s.dir, entry.Name()))
 		if err != nil {
-			return nil, fmt.Errorf("scaler: file group source %q: %w", s.sourceID, err)
+			return nil, fmt.Errorf("placer: file group source %q: %w", s.sourceID, err)
 		}
 		if !groupRecordActive(rec) {
 			continue
@@ -315,7 +315,7 @@ func parseGroupCursor(cursor string) (int, error) {
 	}
 	start, err := strconv.Atoi(cursor)
 	if err != nil || start < 0 {
-		return 0, fmt.Errorf("scaler: invalid group cursor %q", cursor)
+		return 0, fmt.Errorf("placer: invalid group cursor %q", cursor)
 	}
 	return start, nil
 }
@@ -336,7 +336,7 @@ func inlineSecret(kind string, s clusterstate.Secret) (string, error) {
 		return "", nil
 	}
 	if s.Type != clusterstate.SecretInline {
-		return "", fmt.Errorf("scaler: %s secret type %q requires an out-of-band resolver", kind, s.Type)
+		return "", fmt.Errorf("placer: %s secret type %q requires an out-of-band resolver", kind, s.Type)
 	}
 	return s.Value, nil
 }
@@ -353,16 +353,16 @@ func manifestKeyPatch(group string, key clusterstate.Secret) (fp, keyType, keyVa
 	case clusterstate.SecretInline:
 		fp = manifestKeyFingerprint(key.Value)
 		if fp == "" {
-			return "", "", "", "", fmt.Errorf("scaler: invalid manifest_key for group %q", group)
+			return "", "", "", "", fmt.Errorf("placer: invalid manifest_key for group %q", group)
 		}
 		return fp, keyType, key.Value, "", nil
 	case clusterstate.SecretRef:
 		if key.Fingerprint == "" {
-			return "", "", "", "", fmt.Errorf("scaler: manifest_key ref for group %q missing fingerprint", group)
+			return "", "", "", "", fmt.Errorf("placer: manifest_key ref for group %q missing fingerprint", group)
 		}
 		return key.Fingerprint, keyType, "", key.Value, nil
 	default:
-		return "", "", "", "", fmt.Errorf("scaler: unknown manifest_key type %q", keyType)
+		return "", "", "", "", fmt.Errorf("placer: unknown manifest_key type %q", keyType)
 	}
 }
 

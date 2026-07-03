@@ -43,10 +43,10 @@ const (
 // Auto-discovered external binary names (resolved via Config.Bin against the
 // orchestrator binary's dir, then PATH). They are intentionally not config keys.
 const (
-	BinSandboxCtl = "sandbox-ctl"
-	BinVswitchCtl = "vswitch-ctl"
-	BinFlattenCtl = "flatten-ctl"
-	BinNodeCtl    = "node-ctl"
+	BinSandboxCtl   = "sandbox-ctl"
+	BinConnectorCtl = "connector-ctl"
+	BinFlattenCtl   = "flatten-ctl"
+	BinNodeCtl      = "node-ctl"
 )
 
 // Config is the grouped node-local configuration.
@@ -557,7 +557,7 @@ func (c *Config) Bin(name string) string {
 // Resolved external-binary paths (auto-discovered via Bin; not configurable).
 func (c *Config) SandboxCtl() string      { return c.Bin(BinSandboxCtl) }
 func (c *Config) ManifestCtl() string     { return c.Bin("manifest-ctl") }
-func (c *Config) VswitchCtl() string      { return c.Bin(BinVswitchCtl) }
+func (c *Config) ConnectorCtl() string    { return c.Bin(BinConnectorCtl) }
 func (c *Config) FlattenCtl() string      { return c.Bin(BinFlattenCtl) }
 func (c *Config) OrchestratorCtl() string { return c.Bin(BinNodeCtl) }
 
@@ -615,7 +615,7 @@ func (c *Config) validateProxy() error {
 }
 
 // ProxyFileConfig is the external data-plane proxy worker's config
-// (node-ctl proxy --config <this>). The worker shares serve's wildcard cert + data
+// (node-ctl proxy serve --config <this>). The worker shares serve's wildcard cert + data
 // port, but keeps its OWN bootstrap auth/park fallback — serve pushes the
 // authoritative policy over the registration stream once connected. Per-instance
 // identity (--id / --socket) and the per-instance --metrics-listen stay flags.

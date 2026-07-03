@@ -16,12 +16,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/api"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/config"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/configsock"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/orch"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/secretbox"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/store"
+	"github.com/kuasar-sandbox/orchestrator/internal/api"
+	"github.com/kuasar-sandbox/orchestrator/internal/config"
+	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
+	"github.com/kuasar-sandbox/orchestrator/internal/orch"
+	"github.com/kuasar-sandbox/orchestrator/internal/secretbox"
+	"github.com/kuasar-sandbox/orchestrator/internal/store"
 )
 
 func startCtlSocket(t *testing.T) string {

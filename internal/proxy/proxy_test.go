@@ -14,8 +14,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/envdsign"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/proxy"
+	"github.com/kuasar-sandbox/orchestrator/internal/envdsign"
+	"github.com/kuasar-sandbox/orchestrator/internal/proxy"
 )
 
 type stubRouter struct{ r proxy.Route }

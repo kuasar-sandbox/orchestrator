@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/routesync"
+	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 )
 
 type rpcNodeOwner struct {

@@ -93,7 +93,7 @@ Warm Pool),共享同一套基础设施:内容定义分块、收敛加密、内�
 
 - 平台覆盖沙箱运行与数据按需加载/访问加速两层,向下消费 KVM、对象存储与网络。
 - 向上对接平台管理面(沙箱管理平台、镜像仓库,平台外);二者由部署在每个计算
-  节点上的 sandbox-orchestrator 衔接——对外提供 e2b 兼容 API、驱动沙箱生命周期。
+  节点上的 orchestrator 衔接——对外提供 e2b 兼容 API、驱动沙箱生命周期。
   与平台管理面的桥接代理(platform-agent)在平台外。
 - 平台不要求管理面了解分块、加密、缓存与 VMM 实现细节。
 
@@ -115,7 +115,7 @@ Warm Pool),共享同一套基础设施:内容定义分块、收敛加密、内�
   │  cluster-ctl router ── reserve/query ──► cluster-ctl registry                     │
   │       data ingress                 shardkv state cluster                           │
   │                                    ▲                                               │
-  │                                    └── place/import ── cluster-ctl scaler          │
+  │                                    └── place/import ── cluster-ctl placer          │
   │                                                    WATCH_LIST + provider/importer  │
   └──────────────────────────────────────────────┬────────────────────────────────────┘
       node_link / route target / key refresh      │
@@ -146,9 +146,9 @@ Warm Pool),共享同一套基础设施:内容定义分块、收敛加密、内�
                                                             └────────────────────────────────────────────────────────┘
 ```
 
-cluster 控制面由 `cluster-ctl` 的 registry/router/scaler 三个角色组成。
+cluster 控制面由 `cluster-ctl` 的 registry/router/placer 三个角色组成。
 registry 是可靠状态集群,以 group/node 等逻辑键分片,分片内全复制并提供 CAS
-与 WATCH;router 只处理数据面入口与活动连接缓存;scaler 通过 node_list 与
+与 WATCH;router 只处理数据面入口与活动连接缓存;placer 通过 node_list 与
 sandbox group provider/importer 做放置决策。分层缓存(L1/L2)是可替换的访问
 加速层:延迟与吞吐达标时可由托管 NAS 加速服务(如 SFS Turbo,对 OBS 提供近端
 加速)承担,对上层提供相同访问语义。GC 与代管理作用于对象存储,处于控制平面,
@@ -160,30 +160,30 @@ sandbox group provider/importer 做放置决策。分层缓存(L1/L2)是可替�
 | 仓 | 角色 | 关键进程/产物 | 导出面 | 详设 |
 |---|---|---|---|---|
 | **kuasar-sandbox**(本仓) | 系统文档 + 发布聚合 + 跨仓 e2e/perf | `release.sh` 下载即用包 | — | 本文 + `deployment.md`/`perf.md` |
-| **sandbox-runtime** | microVM 生命周期引擎:一沙箱一进程的沙箱控制(块设备/快照代理、内存统一持有、balloon 环)+ Guest 一号进程 | `sandbox-ctl`、`sandbox-init`、`sandbox-runtime.erofs` | `pkg/resource`(资源控制协议+Client) | `sandbox-runtime/docs/sandbox.md`、`sandbox-runtime.md` |
-| **sandbox-accelerator** | 存储加速 + 镜像构建:分块/收敛加密/清单库 + 内容寻址存储 + 分层缓存 + OCI → EROFS 确定性展平(远程拉取 + Referrers 幂等) | `manifest-ctl`、`store-ctl`、`cache-ctl`、`flatten-ctl` | `pkg/manifest`、`pkg/image`、`pkg/{cache,store}/client` | `sandbox-accelerator/docs/{manifest,store,cache,flatten}.md` |
-| **sandbox-vswitch** | eBPF/TC 虚拟交换机:单节点 4096 端口隔离网络 + tapfd 交接 | `vswitch-ctl`、`tapfd-get` | `pkg/tapfd`(fd 交接规约) | `sandbox-vswitch/docs/{vswitch,tapfd}.md` |
-| **sandbox-orchestrator** | 单机沙箱编排 + e2b 兼容 ingress:控制面 REST、envd-in-guest 反代、模板构建(沙箱内三阶段)、密钥派生 + 节点级资源守护(准入/额度分配/主动回收)+ 集群控制面(registry/router/scaler)与 stub e2e 节点 | `node-ctl`、`cluster-ctl`、`node-stub-ctl`、`e2b-key-ctl`、`sandbox-runtime-{e2b,builder}.erofs` | — | `sandbox-orchestrator/docs/{node,node-proxy,node-resource,cluster,cluster-router,cluster-scaler}.md` |
-| **sandbox-deps** | 原生依赖:定制 Guest 内核、VMM 补丁、erofs 工具 | `vmlinux`、`cloud-hypervisor`、`mkfs.erofs` | 构建脚本 + patches + configs | `sandbox-deps/docs/{cloud-hypervisor,sandbox-kernel,build}.md` |
+| **sandbox-runtime** | microVM 生命周期引擎:一沙箱一进程的沙箱控制(块设备/快照代理、内存统一持有、balloon 环)+ Guest 一号进程 | `sandbox-ctl`、`sandbox-init`、`sandbox-runtime.erofs` | `pkg/resource`(资源控制协议+Client) | `sandboxer/docs/sandbox.md`、`sandbox-runtime.md` |
+| **accelerator** | 存储加速 + 镜像构建:分块/收敛加密/清单库 + 内容寻址存储 + 分层缓存 + OCI → EROFS 确定性展平(远程拉取 + Referrers 幂等) | `manifest-ctl`、`store-ctl`、`cache-ctl`、`flatten-ctl` | `pkg/manifest`、`pkg/image`、`pkg/{cache,store}/client` | `accelerator/docs/{manifest,store,cache,flatten}.md` |
+| **connector** | eBPF/TC 虚拟交换机:单节点 4096 端口隔离网络 + tapfd 交接 | `connector-ctl vswitch`、`connector-ctl tapfd get` | `pkg/tapfd`(fd 交接规约) | `connector/docs/{vswitch,tapfd}.md` |
+| **orchestrator** | 单机沙箱编排 + e2b 兼容 ingress:控制面 REST、envd-in-guest 反代、模板构建(沙箱内三阶段)、密钥派生 + 节点级资源守护(准入/额度分配/主动回收)+ 集群控制面(registry/router/placer)与 stub e2e 节点 | `node-ctl`、`cluster-ctl`、`node-stub-ctl`、`e2b-key-ctl`、`sandbox-runtime-{e2b,builder}.erofs` | — | `orchestrator/docs/{node,node-proxy,node-resource,cluster,cluster-router,cluster-placer}.md` |
+| **guest-runtime/native-deps** | 原生依赖:定制 Guest 内核、VMM 补丁、erofs 工具 | `vmlinux`、`cloud-hypervisor`、`mkfs.erofs` | 构建脚本 + patches + configs | `guest-runtime/native-deps/docs/{cloud-hypervisor,sandbox-kernel,build}.md` |
 
 ### 2.3 依赖关系
 
 ```
- sandbox-accelerator   sandbox-vswitch   sandbox-deps        (T0: no internal deps)
+ accelerator   connector   guest-runtime/native-deps        (T0: no internal deps)
    (storage + flatten)       ▲
         ▲                    │ pkg/tapfd
         │ pkg/manifest+image │
         └────────────────────┤
  sandbox-runtime ────────────┘                              (T1)
         ▲
-        │ pkg/resource  (orchestrator CLI: run-sandbox→sandbox-ctl + vswitch-ctl;run-builder→沙箱内 flatten-ctl)
- sandbox-orchestrator   (e2b ingress + node-ctl)            (T2)
+        │ pkg/resource  (orchestrator CLI: run-sandbox→sandbox-ctl + connector-ctl vswitch;run-builder→沙箱内 flatten-ctl)
+ orchestrator   (e2b ingress + node-ctl)            (T2)
 ```
 
-实线是 Go 导入边。`sandbox-orchestrator` 不 import 任何兄弟仓(`CGO_ENABLED=0`
+实线是 Go 导入边。`orchestrator` 不 import 任何兄弟仓(`CGO_ENABLED=0`
 叶子),在计算节点上经 `run-sandbox`/`run-builder` 驱动 `sandbox-ctl`(拉起/快照沙箱)、
-`vswitch-ctl`(编排网络);模板构建在构建沙箱内跑三阶段(`flatten-ctl` 经 builder runtime
-flavor 投影进 guest 执行,详见 `sandbox-orchestrator/docs/node.md` §12)。各 Go 导出面均为纯 Go、
+`connector-ctl vswitch`(编排网络);模板构建在构建沙箱内跑三阶段(`flatten-ctl` 经 builder runtime
+flavor 投影进 guest 执行,详见 `orchestrator/docs/node.md` §12)。各 Go 导出面均为纯 Go、
 无 CGO;重后端(rocksdb/对象存储 SDK/eBPF)隔离在各仓 `server`/`rocks`/
 `internal` 内,不进入下游导入闭包。唯一 CGO 二进制是 accelerator 的
 `cache-ctl`(静态链 librocksdb)。
@@ -214,7 +214,7 @@ Guest 内经 overlayfs 组装为完整 rootfs。定制 init(Guest 一号进程,�
 二进制)顺序执行:环境准备(挂载、根组装、网络)→ 启动握手取回启动配置 →
 拉起客户应用并监督其生命周期。该进程同时承载 vsock 控制面,响应快照前清理、
 内存上报等指令——无独立的 Guest Agent 进程。Guest 内核从最小配置起步,只开
-沙箱必需的子系统与驱动(`sandbox-deps/docs/sandbox-kernel.md`)。
+沙箱必需的子系统与驱动(`guest-runtime/native-deps/docs/sandbox-kernel.md`)。
 
 ## 3. 端到端数据流
 
@@ -377,7 +377,7 @@ Warm Pool 生命周期:预热(冷启动 → 应用就绪 → 清理 → 捕获 �
 10 GiB 镜像 ÷ 512 KiB 均值 chunk ≈ 20,000 条目 × 56 B ≈ 1.1 MiB + 密钥表
 ~0.7 MiB ≈ 1.8 MiB(0.018%)。变长 chunk 二分定位,20,000 chunk 约 15 次比较。
 Header 的 ChunkMode 指定分块策略,读取层据此选择索引方式。格式与读写管线见
-`sandbox-accelerator/docs/manifest.md`。
+`accelerator/docs/manifest.md`。
 
 ### 4.2 内容定义分块(FastCDC)
 
@@ -574,14 +574,14 @@ KASLR/ASLR 降低安全性,对短生命周期、网络隔离的 VM 可接受;Sna
   Guest 周期上报的 MemAvailable 推 inflate target,按实际需求保留物理内存。
 - **节点环**:令牌桶限制创建速率与并发、按高/低/应急三档水位发放内存额度、把
   已稳定沙箱的额度向实际用量收敛(留冷却窗口)、状态持久化于内存盘 + 扫描恢复。
-  两环经资源协议对话(`sandbox-runtime/pkg/resource`),断连降级为按当前额度
+  两环经资源协议对话(`sandboxer/pkg/resource`),断连降级为按当前额度
   继续运行。
 - KSM 对确定性配置下 >90% 内存一致的实例尤为有效;CPU 经 cgroup 权重与配额表达,
   无需热插拔。
 - 快照恢复路径下内存按需加载,初始工作集约 25%,天然减少物理占用;单沙箱底噪
   (VMM 进程 + 已驻留 Guest 页)<60 MiB,其中 VMM 进程开销 ~10 MiB 量级。
 
-密度实测与调优杠杆见 [`perf.md`](perf.md) §3,协议与算法见 `sandbox-orchestrator/docs/node-resource.md`。
+密度实测与调优杠杆见 [`perf.md`](perf.md) §3,协议与算法见 `orchestrator/docs/node-resource.md`。
 
 ## 5. 设计取舍
 
@@ -633,7 +633,7 @@ KASLR/ASLR 降低安全性,对短生命周期、网络隔离的 VM 可接受;Sna
 
 解密仅发生在沙箱控制的代理层——最靠近 VM 的位置。存储与缓存全程只处理密文,
 被攻破也不暴露明文;密文相同 = 内容相同,缓存可跨租户共享,无需每租户隔离。
-沙箱间的网络隔离由 sandbox-vswitch 提供(无 port→port 转发路径的结构性隔离,
+沙箱间的网络隔离由 connector 提供(无 port→port 转发路径的结构性隔离,
 `vswitch.md` §7)。
 
 ### 6.2 威胁缓解
@@ -745,8 +745,8 @@ Cold boot (1 GiB image):                 Snapshot restore (512 MiB):
   → 三阶段,见 `deployment.md` §5),无独立展平池。
 - **Cluster 控制面**(AZ 级或 Region 级):`cluster-ctl registry` 按
   membership 配置形成可靠状态集群;`cluster-ctl router` 提供 group-scoped
-  数据入口与活动连接缓存;`cluster-ctl scaler` 订阅 node_list、导入 group
-  配置并执行放置。registry 与 scaler 各自通过 memberlist 健康检测隔离成员
+  数据入口与活动连接缓存;`cluster-ctl placer` 订阅 node_list、导入 group
+  配置并执行放置。registry 与 placer 各自通过 memberlist 健康检测隔离成员
   label,成员清单由配置和注册路径提供。
 - **L2 缓存集群**(AZ 级,100-200 节点):`cache-ctl shard`,RS 4+1 + Maglev
   一致性哈希,纯密文 KV。
@@ -760,17 +760,17 @@ Cold boot (1 GiB image):                 Snapshot restore (512 MiB):
 - [`deployment.md`](deployment.md) — 部署拓扑与组件清单:进程归属、端口、启停
   依赖、故障域。
 - [`perf.md`](perf.md) — 实测性能基线、回归 checklist 与调优杠杆。
-- `sandbox-runtime/docs/sandbox.md` — 沙箱控制(`sandbox-ctl`)完整生命周期与
+- `sandboxer/docs/sandbox.md` — 沙箱控制(`sandbox-ctl`)完整生命周期与
   配置 schema;`sandbox-runtime.md` — Guest 一号进程。
-- `sandbox-accelerator/docs/{manifest,store,cache}.md` — 清单格式与读写管线、
+- `accelerator/docs/{manifest,store,cache}.md` — 清单格式与读写管线、
   内容寻址存储与代轮转、分层缓存三形态。
-- `sandbox-accelerator/docs/flatten.md` — 确定性展平、远程拉取与 Referrers 幂等。
-- `sandbox-vswitch/docs/vswitch.md` — eBPF 虚拟交换机;`tapfd.md` — tap fd 交接
+- `accelerator/docs/flatten.md` — 确定性展平、远程拉取与 Referrers 幂等。
+- `connector/docs/vswitch.md` — eBPF 虚拟交换机;`tapfd.md` — tap fd 交接
   协议。
-- `sandbox-orchestrator/docs/node-resource.md` — 节点资源仲裁协议与算法。
-- `sandbox-orchestrator/docs/node.md` — e2b 兼容控制面、模板构建、密钥与归属模型、
+- `orchestrator/docs/node-resource.md` — 节点资源仲裁协议与算法。
+- `orchestrator/docs/node.md` — e2b 兼容控制面、模板构建、密钥与归属模型、
   集群接入(node-link)。
-- `sandbox-orchestrator/docs/cluster.md` — 集群级 registry 自聚簇 / Reserve 状态机 /
-  scaler 放置与密钥分发。
-- `sandbox-deps/docs/{cloud-hypervisor,sandbox-kernel,build}.md` — VMM 补丁集、
+- `orchestrator/docs/cluster.md` — 集群级 registry 自聚簇 / Reserve 状态机 /
+  placer 放置与密钥分发。
+- `guest-runtime/native-deps/docs/{cloud-hypervisor,sandbox-kernel,build}.md` — VMM 补丁集、
   Guest 内核契约、原生依赖构建。

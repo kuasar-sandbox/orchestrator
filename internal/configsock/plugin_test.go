@@ -3,7 +3,7 @@ package configsock
 import (
 	"testing"
 
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/routesync"
+	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 )
 
 func proxyCaps(path string) routesync.Register {

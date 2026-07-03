@@ -65,12 +65,12 @@ build_cluster_stub_binaries() {
 
 if [ -z "${CLUSTER_STUB_CASE:-}" ]; then
     build_cluster_stub_binaries
-    for spec in registry-n1:1:1 registry-n3:3:1 registry-redirect:3:1 registry-scaler-ha:3:2 registry-joint:4:1; do
+    for spec in registry-n1:1:1 registry-n3:3:1 registry-redirect:3:1 registry-placer-ha:3:2 registry-joint:4:1; do
         CLUSTER_STUB_CASE="${spec%%:*}"
         rest="${spec#*:}"
         REGISTRIES="${rest%%:*}"
         SCALERS="${rest##*:}"
-        step "running case $CLUSTER_STUB_CASE (registries=$REGISTRIES scalers=$SCALERS)"
+        step "running case $CLUSTER_STUB_CASE (registries=$REGISTRIES placers=$SCALERS)"
         CLUSTER_STUB_BUILT="${CLUSTER_STUB_BUILT:-1}" CLUSTER_STUB_CASE="$CLUSTER_STUB_CASE" REGISTRIES="$REGISTRIES" SCALERS="$SCALERS" "$0"
     done
     exit 0
@@ -87,10 +87,10 @@ SCALERS="${SCALERS:-1}"
 if [ "$CLUSTER_STUB_CASE" = "registry-redirect" ] && [ -z "$NODES_EXPLICIT" ]; then
     NODES=10
 fi
-if [ "$CLUSTER_STUB_CASE" = "registry-scaler-ha" ] && [ -z "$SCALERS_EXPLICIT" ]; then
+if [ "$CLUSTER_STUB_CASE" = "registry-placer-ha" ] && [ -z "$SCALERS_EXPLICIT" ]; then
     SCALERS=2
 fi
-step "cluster stub e2e: case=$CLUSTER_STUB_CASE registries=$REGISTRIES scalers=$SCALERS using BIN=$BIN"
+step "cluster stub e2e: case=$CLUSTER_STUB_CASE registries=$REGISTRIES placers=$SCALERS using BIN=$BIN"
 
 free_port() {
     python3 <<'PY'
@@ -190,7 +190,7 @@ done
 CONTROL_PORT="${CONTROL_PORTS[0]}"
 SCALER_PORTS=()
 for i in $(seq 1 "$SCALERS"); do
-    alloc_port SCALER_PORT "scaler-$i"
+    alloc_port SCALER_PORT "placer-$i"
     SCALER_PORTS+=("$SCALER_PORT")
 done
 alloc_port ROUTER_PORT router
@@ -262,7 +262,7 @@ $ACTIVE_MEMBERS_YAML$NEXT_MEMBERS_BLOCK
   owners:
     route_link: $ROUTE_OWNER_COUNT
     node_link: $NODE_OWNER_COUNT
-    scale_link: $SCALE_OWNER_COUNT
+    placer_link: $SCALE_OWNER_COUNT
     node_list: $NODE_LIST_OWNER_COUNT
 node_link:
   heartbeat_interval: "500ms"
@@ -286,12 +286,12 @@ EOF
 
 for i in $(seq 1 "$SCALERS"); do
     port="${SCALER_PORTS[$((i-1))]}"
-    cat >"$WORK/scaler-$i.yaml" <<EOF
-scaler:
-  id: scaler-$i
+    cat >"$WORK/placer-$i.yaml" <<EOF
+placer:
+  id: placer-$i
   listen: "127.0.0.1:$port"
   advertise: "http://127.0.0.1:$port"
-  memberlist_label: "scaler.default"
+  memberlist_label: "placer.default"
 registry:
   bootstrap: "127.0.0.1:$CONTROL_PORT"
 import_groups:
@@ -348,12 +348,12 @@ done
 SCALER_PIDS=()
 for i in $(seq 1 "$SCALERS"); do
     port="${SCALER_PORTS[$((i-1))]}"
-    step "starting scaler-$i"
-    "$CLUSTER_CTL" scaler --config "$WORK/scaler-$i.yaml" > >(tee "$WORK/scaler-$i.log" >&2) 2>&1 &
+    step "starting placer-$i"
+    "$CLUSTER_CTL" placer --config "$WORK/placer-$i.yaml" > >(tee "$WORK/placer-$i.log" >&2) 2>&1 &
     pid="$!"
     PIDS+=("$pid")
     SCALER_PIDS+=("$pid")
-    wait_tcp "$port" "scaler-$i"
+    wait_tcp "$port" "placer-$i"
 done
 
 step "starting node-stub-ctl with $NODES nodes"
@@ -426,18 +426,18 @@ assert last["route_key"] == "user1/session1", last
 assert last.get("access_token", "").startswith("sat_"), last
 PY
 
-if [ "$CLUSTER_STUB_CASE" = "registry-scaler-ha" ]; then
-    step "checking scaler failover after one scaler exits"
+if [ "$CLUSTER_STUB_CASE" = "registry-placer-ha" ]; then
+    step "checking placer failover after one placer exits"
     kill "${SCALER_PIDS[0]}" 2>/dev/null || true
     wait "${SCALER_PIDS[0]}" 2>/dev/null || true
-    code="$(retry_code 204 "$WORK/data-scaler-ha.body" \
+    code="$(retry_code 204 "$WORK/data-placer-ha.body" \
         -H "Host: data.$DOMAIN" \
         -H "X-Kuasar-Sandbox-Group: $GROUP" \
-        -H "X-Kuasar-Route-Key: user1/session-scaler-failover" \
+        -H "X-Kuasar-Route-Key: user1/session-placer-failover" \
         -H "X-API-KEY: $API_KEY" \
         -H "E2b-Sandbox-Port: 49983" \
         "http://127.0.0.1:$ROUTER_PORT/health" || true)"
-    [ "$code" = "204" ] || fail "data after scaler failure returned $code"
+    [ "$code" = "204" ] || fail "data after placer failure returned $code"
 fi
 
 if [ "$CLUSTER_STUB_CASE" = "registry-joint" ]; then
@@ -469,7 +469,7 @@ $ACTIVE_MEMBERS_YAML
 $NEXT_MEMBERS_YAML  owners:
     route_link: $ROUTE_OWNER_COUNT
     node_link: $NODE_OWNER_COUNT
-    scale_link: $SCALE_OWNER_COUNT
+    placer_link: $SCALE_OWNER_COUNT
     node_list: $NODE_LIST_OWNER_COUNT
 node_link:
   heartbeat_interval: "500ms"
@@ -493,7 +493,7 @@ assert m.get("old_grace", m.get("OldGrace")) == 1, m
 PY
     done
 
-    step "checking router/scaler refresh through known members after cutover"
+    step "checking router/placer refresh through known members after cutover"
     code="$(retry_code 204 "$WORK/data-cutover.body" \
         -H "Host: data.$DOMAIN" \
         -H "X-Kuasar-Sandbox-Group: $GROUP" \
@@ -614,4 +614,4 @@ for _ in range(100):
 raise SystemExit("routes=%r" % (last,))
 PY
 
-echo "==> PASS: sandbox-orchestrator cluster stub e2e"
+echo "==> PASS: orchestrator cluster stub e2e"

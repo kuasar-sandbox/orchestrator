@@ -3,7 +3,7 @@ package registry
 import (
 	"context"
 
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/routesync"
+	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 )
 
 // BuildStore is the registry-facing view of build execution state. Builds are

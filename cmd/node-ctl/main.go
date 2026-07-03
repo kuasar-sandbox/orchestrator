@@ -1,11 +1,11 @@
 // Command node-ctl is the single-node, e2b-compatible sandbox orchestrator.
 //
-//	node-ctl serve     --config <serve.yaml>                    # run the daemon
-//	node-ctl proxy     --config <proxy.yaml> --id <name>        # external data-plane worker
+//	node-ctl conductor serve --config <conductor.yaml>          # run the node conductor
+//	node-ctl proxy serve --config <proxy.yaml> --id <name>      # external data-plane worker
 //	node-ctl run-sandbox --pidfile=<f> --config-socket=<uds> --sandbox-id=<sid>
 //	node-ctl run-builder --pidfile=<f> --config-socket=<uds> --build-id=<bid>
 //	                                                                    # in-unit launchers (not for humans)
-//	node-ctl config <serve|proxy> [--template|--config <f>|--resolve]  # config diagnose / generate
+//	node-ctl config <conductor|proxy> [--template|--config <f>|--resolve]  # config diagnose / generate
 //	node-ctl manifest-key <add|list|remove> ...                 # tenant root-key whitelist (admin socket)
 //	node-ctl export-sandbox|import-sandbox ...                  # paused-snapshot egress / ingress
 //	node-ctl resource <status|list|drain|grant|reclaim>        # node resource controller (hosted in serve via resource_listen)
@@ -29,20 +29,20 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/api"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/clustercfg"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/config"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/configsock"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/launcher"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/metrics"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/mmds"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/nodelink"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/orch"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/proxy"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/routesync"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/secretbox"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/store"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/vswitch"
+	"github.com/kuasar-sandbox/orchestrator/internal/api"
+	"github.com/kuasar-sandbox/orchestrator/internal/clustercfg"
+	"github.com/kuasar-sandbox/orchestrator/internal/config"
+	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
+	"github.com/kuasar-sandbox/orchestrator/internal/launcher"
+	"github.com/kuasar-sandbox/orchestrator/internal/metrics"
+	"github.com/kuasar-sandbox/orchestrator/internal/mmds"
+	"github.com/kuasar-sandbox/orchestrator/internal/nodelink"
+	"github.com/kuasar-sandbox/orchestrator/internal/orch"
+	"github.com/kuasar-sandbox/orchestrator/internal/proxy"
+	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
+	"github.com/kuasar-sandbox/orchestrator/internal/secretbox"
+	"github.com/kuasar-sandbox/orchestrator/internal/store"
+	"github.com/kuasar-sandbox/orchestrator/internal/vswitch"
 )
 
 var version = "0.2.0-dev"
@@ -54,10 +54,10 @@ func main() {
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	var err error
 	switch os.Args[1] {
-	case "serve":
-		err = serve(os.Args[2:], log)
+	case "conductor":
+		err = conductorCmd(os.Args[2:], log)
 	case "proxy":
-		err = runProxy(os.Args[2:], log)
+		err = proxyCmd(os.Args[2:], log)
 	case "run-sandbox":
 		err = runSandbox(os.Args[2:], log)
 	case "run-builder":
@@ -84,13 +84,27 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: node-ctl {serve|proxy|run-sandbox|run-builder|config|manifest-key|export-sandbox|import-sandbox|resource|version} [flags]")
+	fmt.Fprintln(os.Stderr, "usage: node-ctl {conductor|proxy|run-sandbox|run-builder|config|manifest-key|export-sandbox|import-sandbox|resource|version} [args]")
 	os.Exit(2)
 }
 
-func serve(args []string, log *slog.Logger) error {
-	fs := flag.NewFlagSet("serve", flag.ExitOnError)
-	cfgPath := fs.String("config", "/etc/node-ctl/serve.yaml", "config file")
+func conductorCmd(args []string, log *slog.Logger) error {
+	if len(args) < 1 || args[0] != "serve" {
+		return fmt.Errorf("usage: node-ctl conductor serve [--config <conductor.yaml>]")
+	}
+	return runConductor(args[1:], log)
+}
+
+func proxyCmd(args []string, log *slog.Logger) error {
+	if len(args) < 1 || args[0] != "serve" {
+		return fmt.Errorf("usage: node-ctl proxy serve [--config <proxy.yaml>] --id <name>")
+	}
+	return runProxy(args[1:], log)
+}
+
+func runConductor(args []string, log *slog.Logger) error {
+	fs := flag.NewFlagSet("conductor serve", flag.ExitOnError)
+	cfgPath := fs.String("config", "/etc/node-ctl/conductor.yaml", "config file")
 	_ = fs.Parse(args)
 
 	cfg, err := config.Load(*cfgPath)
@@ -119,7 +133,7 @@ func serve(args []string, log *slog.Logger) error {
 	}
 	defer lc.Close()
 
-	core := orch.New(cfg, st, lc, vswitch.New(cfg.VswitchCtl(), cfg.Sandbox.Network.Switch), log)
+	core := orch.New(cfg, st, lc, vswitch.New(cfg.ConnectorCtl(), cfg.Sandbox.Network.Switch), log)
 	if err := core.InstallUnits(ctx); err != nil {
 		return err
 	}
@@ -187,7 +201,7 @@ func serve(args []string, log *slog.Logger) error {
 			core, hbInterval, clientTLS, log, true,
 		)
 		go nl.Run(ctx)
-		log.Info("node-ctl serve: node-link to cluster registry", "registry", regAddr, "node_id", nodeID)
+		log.Info("node-ctl conductor: node-link to cluster registry", "registry", regAddr, "node_id", nodeID)
 	}
 
 	// North api handler (e2b control plane + export/import). Built once and shared by

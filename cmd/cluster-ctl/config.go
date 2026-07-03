@@ -7,21 +7,21 @@ import (
 
 	"gopkg.in/yaml.v3"
 
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/clustercfg"
+	"github.com/kuasar-sandbox/orchestrator/internal/clustercfg"
 )
 
 // configCmd implements `cluster-ctl config <role>` — a per-role config diagnose +
-// generate tool (role ∈ {registry, router, scaler}), mirroring `node-ctl config`.
+// generate tool (role ∈ {registry, router, placer}), mirroring `node-ctl config`.
 // Each role has its own file + schema, so the skeleton and validation are
-// role-specific (registry/router/scaler.yaml are independent — no shared file).
+// role-specific (registry/router/placer.yaml are independent — no shared file).
 //
 //	cluster-ctl config registry --template            # commented skeleton for registry.yaml
 //	cluster-ctl config router   --config router.yaml  # normalize + validate, re-emit
-//	cluster-ctl config scaler   --config scaler.yaml --resolve   # + defaulted effective form
+//	cluster-ctl config placer   --config placer.yaml --resolve   # + defaulted effective form
 //	  [-o <file>]                                                # write to file (default stdout)
 func configCmd(args []string) error {
 	if len(args) < 1 {
-		return fmt.Errorf("usage: cluster-ctl config <registry|router|scaler> [--template | --config <f> [--resolve]] [-o <f>]")
+		return fmt.Errorf("usage: cluster-ctl config <registry|router|placer> [--template | --config <f> [--resolve]] [-o <f>]")
 	}
 	role := args[0]
 	fs := flag.NewFlagSet("config "+role, flag.ExitOnError)
@@ -44,11 +44,11 @@ func configCmd(args []string) error {
 	case "router":
 		skeleton = routerConfigSkeleton
 		load = func(p string) (any, error) { return clustercfg.LoadRouter(p) }
-	case "scaler":
-		skeleton = scalerConfigSkeleton
-		load = func(p string) (any, error) { return clustercfg.LoadScaler(p) }
+	case "placer":
+		skeleton = placerConfigSkeleton
+		load = func(p string) (any, error) { return clustercfg.LoadPlacer(p) }
 	default:
-		return fmt.Errorf("config: unknown role %q (registry|router|scaler)", role)
+		return fmt.Errorf("config: unknown role %q (registry|router|placer)", role)
 	}
 
 	var output []byte
@@ -92,7 +92,7 @@ membership:
   owners:
     route_link: 1
     node_link: 1
-    scale_link: 1
+    placer_link: 1
     node_list: 1
 node_link:
   # listen: ""                       # optional split listener for node streams; empty = member.listen
@@ -102,10 +102,10 @@ route_link:
   park_timeout: 30s
 node_list:
   watch_retention: 10000
-scale_link:
-  scaler_label: scaler.default          # scaler memberlist label; not a configured scaler list
-  scaler_replica_count: 3
-  min_ready_scalers: 1
+placer_link:
+  placer_label: placer.default          # placer memberlist label; not a configured placer list
+  placer_replica_count: 3
+  min_ready_placers: 1
   place_timeout: 2s
 `
 
@@ -128,19 +128,19 @@ cache:
 # metrics_listen: ":9910"            # optional Prometheus text endpoint
 `
 
-const scalerConfigSkeleton = `# cluster-ctl scaler config — cluster-ctl scaler --config <this> (docs/cluster-scaler.md).
+const placerConfigSkeleton = `# cluster-ctl placer config — cluster-ctl placer --config <this> (docs/cluster-placer.md).
 # Standalone placement scheduler; starts from registry membership, joins the
-# scaler memberlist label, consumes node_list, and provides placement.
-scaler:
-  id: scaler-1
+# placer memberlist label, consumes node_list, and provides placement.
+placer:
+  id: placer-1
   listen: ":7800"
-  advertise: "https://scaler-1.example:7800"
-  memberlist_label: scaler.default
-  # tls: { cert: ..., key: ..., ca: ... }   # server mTLS for scaler Place API
+  advertise: "https://placer-1.example:7800"
+  memberlist_label: placer.default
+  # tls: { cert: ..., key: ..., ca: ... }   # server mTLS for placer Place API
 registry:
   bootstrap: registry-1.example:7700
   # tls: { cert: ..., key: ..., ca: ... }   # client mTLS to registry control plane
-import_groups:                         # standalone scaler requires at least one source
+import_groups:                         # standalone placer requires at least one source
   - source_id: example-file-source
     source_type: file
     path: /var/lib/kuasar/groups

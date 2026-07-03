@@ -3,7 +3,7 @@ package orch
 import (
 	"testing"
 
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/config"
+	"github.com/kuasar-sandbox/orchestrator/internal/config"
 )
 
 type stubProbe struct {

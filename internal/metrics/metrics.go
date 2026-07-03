@@ -1,6 +1,6 @@
 // Package metrics is a tiny dependency-free counter registry with a Prometheus
 // text exposition handler. It is intentionally minimal (no histograms, no client
-// library) so both node-ctl serve and the proxy worker can surface
+// library) so both node-ctl conductor serve and the proxy worker can surface
 // data-plane / route-sync counters without pulling in a metrics dependency.
 //
 // Counter names may carry Prometheus labels inline, e.g. Inc(`data_requests_total{result="ok"}`).

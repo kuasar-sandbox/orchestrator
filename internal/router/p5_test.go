@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/envdsign"
+	"github.com/kuasar-sandbox/orchestrator/internal/envdsign"
 )
 
 // TestAuthModeOff: with router.auth=off, caller auth is skipped (front with an

@@ -12,13 +12,13 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/api"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/configsock"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/keys"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/regcreds"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/sandboxcfg"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/types"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/vswitch"
+	"github.com/kuasar-sandbox/orchestrator/internal/api"
+	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
+	"github.com/kuasar-sandbox/orchestrator/internal/keys"
+	"github.com/kuasar-sandbox/orchestrator/internal/regcreds"
+	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
+	"github.com/kuasar-sandbox/orchestrator/internal/types"
+	"github.com/kuasar-sandbox/orchestrator/internal/vswitch"
 )
 
 var hexKeyRe = regexp.MustCompile(`^[0-9a-f]{64}$`)

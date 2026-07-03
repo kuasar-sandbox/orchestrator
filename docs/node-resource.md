@@ -2,8 +2,8 @@
 
 节点级**资源控制器**跟节点上所有动态控制模式 sandbox-ctl 通过沙箱资源控制
 协议对话,完成跨沙箱仲裁、burst 申请、settled 收回、admission 控制。它由
-`node-ctl serve` 经 `resource_listen` 内置(node.md §3 / §10),配置内联在
-serve.yaml 里,无独立 daemon 入口、无单独配置文件;本文档统称其为"控制器"。
+`node-ctl conductor serve` 经 `resource_listen` 内置(node.md §3 / §10),配置内联在
+conductor.yaml 里,无独立 daemon 入口、无单独配置文件;本文档统称其为"控制器"。
 
 控制器是协议的**对端角色**,不是某个具体进程:任何遵循 §5 定义的实现都可
 作为 sandbox-ctl 的对端,`node-ctl` 的内置控制器是参考实现。本文档同时定义
@@ -61,7 +61,7 @@ serve.yaml 里,无独立 daemon 入口、无单独配置文件;本文档统称�
 
 ## 2. 命令行接口
 
-控制器由 `node-ctl serve` 内置(配 `resource_listen`,node.md §3 / §10);只读巡检
+控制器由 `node-ctl conductor serve` 内置(配 `resource_listen`,node.md §3 / §10);只读巡检
 与运维动词在 `node-ctl resource` 子命令组下。
 
 ### 2.1 子命令总览
@@ -75,14 +75,14 @@ serve.yaml 里,无独立 daemon 入口、无单独配置文件;本文档统称�
 | `resource grant` | 强制下发 budget(调试) |
 | `resource reclaim` | 强制收回(运维) |
 
-### 2.2 控制器启动(`node-ctl serve` 内置)
+### 2.2 控制器启动(`node-ctl conductor serve` 内置)
 
-控制器随 `node-ctl serve` 起:配 `resource_listen`(§3)即在该 UDS 起 RPC server、
+控制器随 `node-ctl conductor serve` 起:配 `resource_listen`(§3)即在该 UDS 起 RPC server、
 admission worker、memory allocator、active reclaimer、idle sweeper 与 state
 persister(§7)。`resource_listen` 的子字段(`socket` / `state_path` /
-`cgroup_scan_paths` / `resources` / `watermarks` / …)是内联在 serve.yaml 里的控制器调参(§3)。
+`cgroup_scan_paths` / `resources` / `watermarks` / …)是内联在 conductor.yaml 里的控制器调参(§3)。
 集群下,控制器上报的节点水位(zone / allocated / pool)经 serve 的 node-link 心跳喂
-集群 P2C 放置(node.md §10、cluster.md / cluster-scaler.md)。
+集群 P2C 放置(node.md §10、cluster.md / cluster-placer.md)。
 
 ### 2.3 `node-ctl resource status`
 
@@ -133,8 +133,8 @@ node-ctl resource reclaim <sid> --memory <target> [--socket /run/sandbox-resourc
 
 ### 3.1 resource_listen 配置块
 
-控制器配置是 `node-ctl serve` 配置(node.md §3)的 `resource_listen` 块,内联在
-serve.yaml 里(无独立配置文件);`enabled: true` 即在其 `socket` 起控制器。字段
+控制器配置是 `node-ctl conductor serve` 配置(node.md §3)的 `resource_listen` 块,内联在
+conductor.yaml 里(无独立配置文件);`enabled: true` 即在其 `socket` 起控制器。字段
 (yaml 形态,均挂在 `resource_listen:` 下):
 
 ```yaml
@@ -284,7 +284,7 @@ UDS,长度前缀(4 字节 LE uint32)+ JSON 消息——简单、调试友好、�
 
 每个 sandbox-ctl 启动时 `Admit` 后建立长连,直到沙箱退出。连接生命周期与
 沙箱生命周期对齐。wire 格式与 `Client` 的唯一定义点是
-`sandbox-runtime/pkg/resource`,client/server 共用。
+`sandboxer/pkg/resource`,client/server 共用。
 
 ### 5.2 消息类型
 
@@ -529,11 +529,11 @@ end
 
 ## 7. node-ctl 内部组织
 
-`node-ctl` 的内置控制器是协议的参考实现,随 `node-ctl serve` 起(配 `resource_listen`)。
+`node-ctl` 的内置控制器是协议的参考实现,随 `node-ctl conductor serve` 起(配 `resource_listen`)。
 它内部组织成四个角色,共享 in-memory state 与 /run 持久化:
 
 ```
-controller (node-ctl serve resource_listen)
+controller (node-ctl conductor serve resource_listen)
 ├── RPC server               处理协议消息
 ├── Admission Controller     §6 准入与速率限制
 ├── Memory Allocator         §4.3 仲裁与 grant
@@ -734,7 +734,7 @@ cache-ctl / store-ctl 的资源占用是 host 预留的一部分,计入
 
 ## 11. See Also
 
-- [node.md](node.md) §10 —— 内置控制器(`resource_listen`)的宿主 `node-ctl serve` 与
+- [node.md](node.md) §10 —— 内置控制器(`resource_listen`)的宿主 `node-ctl conductor serve` 与
   node-link 集群接入(节点水位经心跳喂集群 P2C)
 - [`sandbox.md`](sandbox.md) §资源模型 / §与 node-ctl 的资源协议 —— sandbox-ctl
   侧的执行器行为(本协议本侧)

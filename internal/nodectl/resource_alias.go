@@ -3,15 +3,15 @@
 // budget reclaim, persistence and audit.
 //
 // The wire protocol and the client it speaks are defined once in
-// sandbox-runtime/pkg/resource (sandbox-ctl is the client). This file
+// sandboxer/pkg/resource (sandbox-ctl is the client). This file
 // re-exports those protocol symbols under their local names so the
 // controller and its CLI reference the protocol without churn; the
 // definitions live in sandbox-runtime.
 package nodectl
 
-import "github.com/kuasar-sandbox/sandbox-runtime/pkg/resource"
+import "github.com/kuasar-sandbox/sandboxer/pkg/resource"
 
-// Protocol types + client (defined in sandbox-runtime/pkg/resource).
+// Protocol types + client (defined in sandboxer/pkg/resource).
 type (
 	Message           = resource.Message
 	Client            = resource.Client

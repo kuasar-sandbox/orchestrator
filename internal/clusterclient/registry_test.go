@@ -9,8 +9,8 @@ import (
 	"strconv"
 	"testing"
 
-	clusterstate "github.com/kuasar-sandbox/sandbox-orchestrator/internal/cluster"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/clustercfg"
+	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
+	"github.com/kuasar-sandbox/orchestrator/internal/clustercfg"
 )
 
 func TestRouteCandidatesFetchMembership(t *testing.T) {
@@ -121,7 +121,7 @@ func TestNodeListEndpointsUseLocatedJointOwners(t *testing.T) {
 			active,
 			next,
 		},
-		Owners: clustercfg.MembershipOwnerConfig{RouteLink: 1, NodeLink: 1, ScaleLink: 2, NodeList: 2},
+		Owners: clustercfg.MembershipOwnerConfig{RouteLink: 1, NodeLink: 1, PlacerLink: 2, NodeList: 2},
 	}
 	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		return jsonResponse(200, membership), nil
@@ -152,7 +152,7 @@ func TestNodeListEndpointsUseLocatedJointOwners(t *testing.T) {
 	}
 }
 
-func TestScaleLinkEndpointsUseLocatedJointOwners(t *testing.T) {
+func TestPlacerLinkEndpointsUseLocatedJointOwners(t *testing.T) {
 	active := clustercfg.MembershipVersion{
 		Version: 1,
 		Members: []clustercfg.MembershipMember{
@@ -176,16 +176,16 @@ func TestScaleLinkEndpointsUseLocatedJointOwners(t *testing.T) {
 			active,
 			next,
 		},
-		Owners: clustercfg.MembershipOwnerConfig{RouteLink: 1, NodeLink: 1, ScaleLink: 2, NodeList: 1},
+		Owners: clustercfg.MembershipOwnerConfig{RouteLink: 1, NodeLink: 1, PlacerLink: 2, NodeList: 1},
 	}
 	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		return jsonResponse(200, membership), nil
 	})}
 	reg := NewRegistryWithClient("http://bootstrap:7700", client)
-	shardKey := string(clusterstate.ScaleImportSourceShard("source-a"))
-	eps, err := reg.ScaleLinkEndpoints(t.Context(), shardKey)
+	shardKey := string(clusterstate.PlacerImportSourceShard("source-a"))
+	eps, err := reg.PlacerLinkEndpoints(t.Context(), shardKey)
 	if err != nil {
-		t.Fatalf("scale_link endpoints: %v", err)
+		t.Fatalf("placer_link endpoints: %v", err)
 	}
 	wantSet := map[string]bool{}
 	for _, version := range []clustercfg.MembershipVersion{active, next} {
@@ -199,11 +199,11 @@ func TestScaleLinkEndpointsUseLocatedJointOwners(t *testing.T) {
 		}
 	}
 	if len(eps) != len(wantSet) {
-		t.Fatalf("scale_link endpoints=%+v want owners=%v", eps, wantSet)
+		t.Fatalf("placer_link endpoints=%+v want owners=%v", eps, wantSet)
 	}
 	for _, ep := range eps {
 		if !wantSet[ep.MemberID] {
-			t.Fatalf("unexpected scale_link endpoint %+v want owners=%v", ep, wantSet)
+			t.Fatalf("unexpected placer_link endpoint %+v want owners=%v", ep, wantSet)
 		}
 	}
 }

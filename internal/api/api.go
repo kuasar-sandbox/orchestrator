@@ -12,9 +12,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/apikey"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/sandboxcfg"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/types"
+	"github.com/kuasar-sandbox/orchestrator/internal/apikey"
+	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
+	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
 // configHeaderNs maps each X-Kuasar-Sandbox-<Ns> request header to the namespaced
@@ -346,12 +346,12 @@ func (a *API) timeout(w http.ResponseWriter, r *http.Request) {
 
 func (a *API) registerTemplate(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Name        string   `json:"name"`
-		Tags        []string `json:"tags"`
-		CPUCount    int      `json:"cpuCount"`
-		CPUCountSn  int      `json:"cpu_count"`
-		MemoryMB    int      `json:"memoryMB"`
-		MemoryMBSn  int      `json:"memory_mb"`
+		Name       string   `json:"name"`
+		Tags       []string `json:"tags"`
+		CPUCount   int      `json:"cpuCount"`
+		CPUCountSn int      `json:"cpu_count"`
+		MemoryMB   int      `json:"memoryMB"`
+		MemoryMBSn int      `json:"memory_mb"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&body)
 	// Template config: X-Kuasar-Sandbox-* headers, with the e2b cpu/memory folded

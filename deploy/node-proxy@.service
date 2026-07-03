@@ -1,4 +1,4 @@
-# node-proxy@.service — external data-plane proxy worker (serve.yaml proxy.mode=external).
+# node-proxy@.service — external data-plane proxy worker (conductor.yaml proxy.mode=external).
 #
 # Run one or more instances (node-proxy@1, @2, ...). All instances read one shared
 # /etc/node-ctl/proxy.yaml (config_socket / data_listen / tls / auth / park_timeout)
@@ -8,7 +8,7 @@
 # node-ctl needs NO static socket list — it learns workers from their registrations
 # and forwards by sandbox-id hash over the live set:
 #
-#   # serve.yaml
+#   # conductor.yaml
 #   proxy:
 #     mode: external
 #
@@ -16,7 +16,7 @@
 # stateless: it serves only what it syncs over the registration stream, so a
 # crash/restart re-registers and re-syncs from scratch. It must run on the same node
 # as node-ctl (it dials the config-socket + per-sandbox envd UDS / floatingip
-# locally). Optionally gate registration with serve.yaml paths.plugin_pidfile.
+# locally). Optionally gate registration with conductor.yaml paths.plugin_pidfile.
 [Unit]
 Description=kuasar node-ctl data-plane proxy %i
 After=network-online.target node-ctl.service
@@ -27,7 +27,7 @@ Type=exec
 # --config points at the shared worker config; --id is this worker's unique plugin
 # id (the gateway-forward --socket defaults to <dir(config_socket)>/<id>.sock).
 # --metrics-listen is per-instance (ports must differ across workers). Add --mmds on
-# exactly one instance when serve runs envd in FC mode (serve.yaml mmds.enabled).
+# exactly one instance when serve runs envd in FC mode (conductor.yaml mmds.enabled).
 ExecStart=/usr/bin/node-ctl proxy \
   --config=/etc/node-ctl/proxy.yaml \
   --id=proxy-%i \

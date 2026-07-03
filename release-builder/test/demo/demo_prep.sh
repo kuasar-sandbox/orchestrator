@@ -38,11 +38,11 @@ E2E_IMAGE="${E2E_IMAGE:-e2bdev/code-interpreter:latest}"
 REGISTRY_NS="${REGISTRY_NS:-e2b}"
 ZOT_BIN="${ZOT_BIN:-$(command -v zot || true)}"
 # versitygw (S3 gateway) backs COPY build contexts (builder.files_storage). It is
-# opt-in (sandbox-deps `make versitygw`) and NOT in the umbrella bin, so locate it
-# like the e2e: $BIN, then the sibling sandbox-deps bin, then PATH. Absent → COPY
+# opt-in (guest-runtime/native-deps `make versitygw`) and NOT in the umbrella bin, so locate it
+# like the e2e: $BIN, then the sibling guest-runtime/native-deps bin, then PATH. Absent → COPY
 # is disabled and demo_e2b.sh's build omits the COPY step (the rest still runs).
 if [ -z "${VGW_BIN:-}" ]; then
-    for cand in "$BIN/versitygw" "$REPO_ROOT/../sandbox-deps/bin/versitygw" "$(command -v versitygw 2>/dev/null || true)"; do
+    for cand in "$BIN/versitygw" "$REPO_ROOT/../guest-runtime/native-deps/bin/versitygw" "$(command -v versitygw 2>/dev/null || true)"; do
         [ -n "$cand" ] && [ -x "$cand" ] && { VGW_BIN="$cand"; break; }
     done
 fi
@@ -162,7 +162,7 @@ if [ -n "${VGW_BIN:-}" ]; then
         || die "versitygw did not bind 127.0.0.1:$VGW_PORT (see $LOG_DIR/vgw.log)"
     ok "versitygw (S3, COPY contexts) on $VGW_ENDPOINT (bucket $VGW_BUCKET, data $DEMO_DATA_DIR/vgw)"
 else
-    say "versitygw not found — COPY build contexts disabled (run 'make -C ../sandbox-deps versitygw'); the demo build will omit COPY"
+    say "versitygw not found — COPY build contexts disabled (run 'make -C ../guest-runtime/native-deps versitygw'); the demo build will omit COPY"
 fi
 
 # ---- seed the base image into the registry (once; cached on reruns) --------

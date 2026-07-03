@@ -9,11 +9,11 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/config"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/regcreds"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/secretbox"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/store"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/types"
+	"github.com/kuasar-sandbox/orchestrator/internal/config"
+	"github.com/kuasar-sandbox/orchestrator/internal/regcreds"
+	"github.com/kuasar-sandbox/orchestrator/internal/secretbox"
+	"github.com/kuasar-sandbox/orchestrator/internal/store"
+	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
 func testOrch(t *testing.T) *Orchestrator { return testOrchCfg(t, &config.Config{}) }

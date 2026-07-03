@@ -206,7 +206,7 @@ EOF
     } > "$WORK/$sid.yaml"
 }
 
-# The resource controller is hosted in `node-ctl serve` (resource_listen); there is
+# The resource controller is hosted in `node-ctl conductor serve` (resource_listen); there is
 # no standalone daemon. We run a minimal serve (install_units=false, api on a
 # throwaway port, temp paths) whose only live subsystem is the controller on
 # resource_listen.socket — sandboxes are still launched directly by sandbox-ctl
@@ -217,7 +217,7 @@ start_daemon() {
     DAEMON_PID=$!
     for _ in $(seq 1 60); do
         [ -S "$WORK/sandbox-resource.sock" ] && return 0
-        kill -0 "$DAEMON_PID" 2>/dev/null || { cat "$WORK/daemon.log"; fail "node-ctl serve exited before binding the resource socket"; }
+        kill -0 "$DAEMON_PID" 2>/dev/null || { cat "$WORK/daemon.log"; fail "node-ctl conductor serve exited before binding the resource socket"; }
         sleep 0.25
     done
     fail "resource socket not created in time"
@@ -239,7 +239,7 @@ cleanup_sb() {
     ip link delete "${sid}-tap" 2>/dev/null || true
 }
 
-# Minimal `node-ctl serve` config: only the in-process resource controller
+# Minimal `node-ctl conductor serve` config: only the in-process resource controller
 # (resource_listen) is exercised. The serve scaffold (api/encryption_key/paths/
 # units) is inert here — install_units=false, api on a throwaway port — so serve
 # touches neither host systemd nor real ports.

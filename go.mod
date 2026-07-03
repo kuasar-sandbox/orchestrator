@@ -1,4 +1,4 @@
-module github.com/kuasar-sandbox/sandbox-orchestrator
+module github.com/kuasar-sandbox/orchestrator
 
 go 1.24.0
 
@@ -10,8 +10,8 @@ require (
 	github.com/aws/smithy-go v1.25.1
 	github.com/coreos/go-systemd/v22 v22.5.0
 	github.com/google/uuid v1.6.0
-	github.com/kuasar-sandbox/sandbox-accelerator v0.0.0
-	github.com/kuasar-sandbox/sandbox-runtime v0.0.0
+	github.com/kuasar-sandbox/accelerator v0.0.0
+	github.com/kuasar-sandbox/sandboxer v0.0.0
 	golang.org/x/net v0.49.0
 	golang.org/x/sys v0.40.0
 	gopkg.in/yaml.v3 v3.0.1
@@ -19,11 +19,11 @@ require (
 )
 
 // Cross-repo local resolution (single-repo offline build; go.work covers the
-// workspace). sandbox-orchestrator imports sandbox-runtime/pkg/config to build
-// sandbox.yaml from one source of truth; that transitively needs accelerator.
+// workspace). orchestrator imports sandboxer/pkg/config to build sandbox.yaml
+// from one source of truth; that transitively needs accelerator.
 replace (
-	github.com/kuasar-sandbox/sandbox-accelerator => ../sandbox-accelerator
-	github.com/kuasar-sandbox/sandbox-runtime => ../sandbox-runtime
+	github.com/kuasar-sandbox/accelerator => ../accelerator
+	github.com/kuasar-sandbox/sandboxer => ../sandboxer
 )
 
 require (

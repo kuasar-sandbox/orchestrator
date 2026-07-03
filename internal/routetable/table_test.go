@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/routesync"
+	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 )
 
 func running(sid string) routesync.RouteEntry {

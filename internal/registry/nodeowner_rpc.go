@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/routesync"
+	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 )
 
 const NodeOwnerRPCPath = "/internal/node-owner"

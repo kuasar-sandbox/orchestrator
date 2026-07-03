@@ -4,8 +4,8 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/config"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/envdsign"
+	"github.com/kuasar-sandbox/orchestrator/internal/config"
+	"github.com/kuasar-sandbox/orchestrator/internal/envdsign"
 )
 
 // authorized enforces the data-plane access token. The e2b SDK (secure sandboxes,

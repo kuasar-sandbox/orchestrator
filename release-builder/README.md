@@ -19,12 +19,12 @@
 
 | 仓 | 角色 | 导出面 / 产物 |
 |---|---|---|
-| **kuasar-sandbox**(本仓) | 系统文档 + 发布聚合 + 跨仓 e2e/perf | `scripts/release.sh`、`docs/`、`test/` |
-| **sandbox-runtime** | microVM 生命周期引擎(host `sandbox-ctl` + guest `sandbox-init`)+ vhost 块后端 | `pkg/resource`(资源控制协议+Client) |
-| **sandbox-orchestrator** | 单机 e2b 兼容沙箱编排/ingress(控制面 + envd-in-guest 反代 + 模板构建)+ 节点级资源守护(准入/分配/回收,3,000+ 密度) | `node-ctl` + `cluster-ctl` + `e2b-key-ctl`、`sandbox-runtime-{e2b,builder}.erofs` |
-| **sandbox-accelerator** | 存储加速 + 镜像构建:内容寻址存储 + 分层缓存 + 收敛加密 + OCI → EROFS 确定性展平 | `pkg/manifest`、`pkg/image`、`pkg/{cache,store}/client` + `flatten-ctl` |
-| **sandbox-vswitch** | eBPF/TC 虚拟交换机 + tapfd 交接 | `pkg/tapfd`(fd 交接规约)+ `vswitch-ctl`/`tapfd-get` |
-| **sandbox-deps** | 原生依赖:vmlinux / cloud-hypervisor / mkfs.erofs | 构建脚本 + patches + configs |
+| **orchestrator/release-builder**(本目录) | 系统文档 + 发布聚合 + 跨仓 e2e/perf | `scripts/release.sh`、`docs/`、`test/` |
+| **sandboxer** | microVM 生命周期引擎(host `sandbox-ctl` + guest `sandbox-init`)+ vhost 块后端 | `pkg/resource`(资源控制协议+Client)、`sandbox-runtime.erofs` |
+| **orchestrator** | 单机 e2b 兼容沙箱编排/ingress(控制面 + envd-in-guest 反代 + 模板构建)+ 节点级资源守护(准入/分配/回收,3,000+ 密度) | `node-ctl` + `cluster-ctl` + `e2b-key-ctl`、`sandbox-runtime-{e2b,builder}.erofs` |
+| **accelerator** | 存储加速 + 镜像构建:内容寻址存储 + 分层缓存 + 收敛加密 + OCI → EROFS 确定性展平 | `pkg/manifest`、`pkg/image`、`pkg/{cache,store}/client` + `flatten-ctl` |
+| **connector** | eBPF/TC 虚拟交换机 + tapfd 交接 | `pkg/tapfd`(fd 交接规约)+ `connector-ctl vswitch`/`connector-ctl tapfd get` |
+| **guest-runtime/native-deps** | 原生依赖:vmlinux / cloud-hypervisor / mkfs.erofs / envd | 构建脚本 + patches + configs |
 
 ## 构建
 
@@ -33,9 +33,9 @@
 `sandbox-runtime-e2b.erofs`:
 
 ```bash
-make -C kuasar-sandbox all        # = build:全部子仓 + 装配 bin/
-make -C kuasar-sandbox release    # 打包 dist/kuasar-sandbox-<ver>-linux-<arch>.tar.gz
-make -C kuasar-sandbox help       # 全部目标(test-e2e / perf / bench / demo / ...)
+make -C orchestrator/release-builder all        # = build:全部子仓 + 装配 bin/
+make -C orchestrator/release-builder release    # 打包 dist/kuasar-sandbox-<ver>-linux-<arch>.tar.gz
+make -C orchestrator/release-builder help       # 全部目标(test-e2e / perf / bench / demo / ...)
 ```
 
 发布包聚合 `bin/` + 精选 `docs/` + 跨仓 e2e/perf/demo 脚本 + `deploy/` 样例,
@@ -45,7 +45,7 @@ make -C kuasar-sandbox help       # 全部目标(test-e2e / perf / bench / demo 
 clone 全组织为兄弟目录后即可离线构建,无需 GOPROXY 或版本 tag:
 
 ```bash
-cd sandbox-runtime && GOWORK=off make build     # 同理各仓
+cd sandboxer && GOWORK=off make build           # 同理各仓
 ```
 
 **统一开发(go.work)**:org 根 `go.work` 把所有 module 纳入一个工作区,首次
@@ -57,9 +57,9 @@ cd sandbox-runtime && GOWORK=off make build     # 同理各仓
 (真实 microVM 启动、快照/恢复、去重、密度、e2b 编排):
 
 ```bash
-make -C kuasar-sandbox test-e2e          # 全部跨仓 e2e + 各子仓自有 e2e
-make -C kuasar-sandbox test-e2e-<name>   # 单个,如 test-e2e-sandbox-cold
-make -C kuasar-sandbox perf              # 性能 harness 全套
+make -C orchestrator/release-builder test-e2e          # 全部跨仓 e2e + 各子仓自有 e2e
+make -C orchestrator/release-builder test-e2e-<name>   # 单个,如 test-e2e-sandbox-cold
+make -C orchestrator/release-builder perf              # 性能 harness 全套
 ```
 
 脚本清单、前置条件与排错见 [test/QUICKSTART.md](test/QUICKSTART.md)。
@@ -71,5 +71,5 @@ make -C kuasar-sandbox perf              # 性能 harness 全套
 - [docs/deployment.md](docs/deployment.md) — 部署拓扑与组件清单:进程归属、
   端口、启停依赖、故障域。
 - [docs/perf.md](docs/perf.md) — 实测性能基线、回归 checklist 与调优杠杆。
-- 模块设计文档随各自仓(如 `sandbox-runtime/docs/sandbox.md`、
-  `sandbox-accelerator/docs/manifest.md`、`sandbox-orchestrator/docs/node.md`)。
+- 模块设计文档随各自仓(如 `sandboxer/docs/sandbox.md`、
+  `accelerator/docs/manifest.md`、`orchestrator/docs/node.md`)。

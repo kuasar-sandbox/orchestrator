@@ -13,10 +13,10 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/configsock"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/metrics"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/proxy"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/routesync"
+	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
+	"github.com/kuasar-sandbox/orchestrator/internal/metrics"
+	"github.com/kuasar-sandbox/orchestrator/internal/proxy"
+	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 )
 
 type connectStubRouter struct{ r proxy.Route }

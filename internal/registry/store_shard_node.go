@@ -5,8 +5,8 @@ import (
 	"errors"
 	"sort"
 
-	clusterstate "github.com/kuasar-sandbox/sandbox-orchestrator/internal/cluster"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/cluster/shardkv"
+	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
+	"github.com/kuasar-sandbox/orchestrator/internal/cluster/shardkv"
 )
 
 func (s *Stores) putNodeProfileShard(ctx context.Context, n *NodeRecord) error {

@@ -19,7 +19,7 @@ import (
 	"strings"
 )
 
-// Flatten env var names (mirror sandbox-accelerator/pkg/remote/auth.go; token wins).
+// Flatten env var names (mirror accelerator/pkg/remote/auth.go; token wins).
 const (
 	EnvToken    = "FLATTEN_REGISTRY_TOKEN"
 	EnvUsername = "FLATTEN_REGISTRY_USERNAME"

@@ -9,7 +9,7 @@
 #
 #   envd          e2b data plane (run-builder drives RUN steps through it)
 #   flatten-ctl   in-guest image import/export (+ mountpoint, tar tooling)
-#   mkfs.erofs    flatten's mkfs backend (static build from sandbox-deps)
+#   mkfs.erofs    flatten's mkfs backend (static build from guest-runtime/native-deps)
 #
 #   build-runtime-builder.sh --base <erofs> --envd <bin> --flatten-ctl <bin>
 #                            --mkfs-binary <bin> [--out <path>]

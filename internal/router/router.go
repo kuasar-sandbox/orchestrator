@@ -25,11 +25,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/clusterclient"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/envdsign"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/metrics"
-	proxypkg "github.com/kuasar-sandbox/sandbox-orchestrator/internal/proxy"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/registry"
+	"github.com/kuasar-sandbox/orchestrator/internal/clusterclient"
+	"github.com/kuasar-sandbox/orchestrator/internal/envdsign"
+	"github.com/kuasar-sandbox/orchestrator/internal/metrics"
+	proxypkg "github.com/kuasar-sandbox/orchestrator/internal/proxy"
+	"github.com/kuasar-sandbox/orchestrator/internal/registry"
 )
 
 // Headers the cluster ingress reads (cluster.md).

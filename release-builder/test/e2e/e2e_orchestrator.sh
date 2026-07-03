@@ -79,8 +79,8 @@ req() {
 }
 
 # The control-plane / unit-install / build-API / ownership tests below do NOT need
-# a running vswitch — node-ctl only dials vswitch-ctl on sandbox *create*
-# (the gated data-plane step at the end). So no `vswitch-ctl serve` here.
+# a running vswitch — node-ctl only dials connector-ctl vswitch on sandbox *create*
+# (the gated data-plane step at the end). So no `connector-ctl vswitch serve` here.
 
 # ---- orchestrator config (dev http; transient paths) ----------------------
 cat > "$WORK/config.yaml" <<EOF
@@ -101,13 +101,13 @@ manifest:
   key: ""
 EOF
 
-# ---- 2. start node-ctl serve --------------------------------------
-echo "==> node-ctl serve (dev http :$PORT, unit_dir=$UNIT_DIR)"
+# ---- 2. start node-ctl conductor serve --------------------------------------
+echo "==> node-ctl conductor serve (dev http :$PORT, unit_dir=$UNIT_DIR)"
 "$BIN/node-ctl" serve --config "$WORK/config.yaml" >"$WORK/orch.log" 2>&1 &
 PIDS+=($!)
 for i in $(seq 1 30); do
     curl -sS --noproxy '*' -o /dev/null "http://127.0.0.1:$PORT/health" -H "Host: api.$DOMAIN" 2>/dev/null && break
-    kill -0 "${PIDS[-1]}" 2>/dev/null || { sed 's/^/    /' "$WORK/orch.log"; skip "node-ctl serve exited (see log)"; }
+    kill -0 "${PIDS[-1]}" 2>/dev/null || { sed 's/^/    /' "$WORK/orch.log"; skip "node-ctl conductor serve exited (see log)"; }
     sleep 0.5
 done
 

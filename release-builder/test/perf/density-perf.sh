@@ -311,7 +311,7 @@ EOF
     } > "$WORK/$sid.yaml"
 }
 
-# ---- node-ctl serve config (only the resource_listen controller is live) ----
+# ---- node-ctl conductor serve config (only the resource_listen controller is live) ----
 # install_units=false + api on a throwaway port keep serve from touching host
 # systemd / real ports; sandboxes are still launched directly by sandbox-ctl
 # against resource_listen.socket.
@@ -433,7 +433,7 @@ say "   workload:     $WORKLOAD_DESC"
 say "   timing:       workload=${WL_DURATION}s  admit_deadline=${ADMIT_DEADLINE}s  observe=${OBSERVE_DURATION}s  (queue_ttl=${ADMIT_DEADLINE}s)"
 say ""
 
-# ---- spin up the resource controller (node-ctl serve, resource_listen) ----
+# ---- spin up the resource controller (node-ctl conductor serve, resource_listen) ----
 "$BIN/node-ctl" serve --config "$WORK/node-ctl.yaml" >"$WORK/daemon.log" 2>&1 &
 DAEMON_PID=$!
 for _ in $(seq 1 60); do
@@ -441,7 +441,7 @@ for _ in $(seq 1 60); do
     kill -0 "$DAEMON_PID" 2>/dev/null || break
     sleep 0.25
 done
-[ -S "$WORK/sandbox-resource.sock" ] || { say " FATAL: node-ctl serve did not bind the resource socket"; cat "$WORK/daemon.log" >&2; exit 1; }
+[ -S "$WORK/sandbox-resource.sock" ] || { say " FATAL: node-ctl conductor serve did not bind the resource socket"; cat "$WORK/daemon.log" >&2; exit 1; }
 
 # ---- baseline host memory (taken AFTER daemon up, BEFORE first sandbox) ----
 host_baseline_avail=$(read_avail)

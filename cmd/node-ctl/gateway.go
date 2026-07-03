@@ -12,9 +12,9 @@ import (
 	"net/http/httputil"
 	"strings"
 
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/configsock"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/metrics"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/proxy"
+	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
+	"github.com/kuasar-sandbox/orchestrator/internal/metrics"
+	"github.com/kuasar-sandbox/orchestrator/internal/proxy"
 )
 
 // gateway is the external-mode fallback: when a data-plane request lands on the

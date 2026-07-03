@@ -12,10 +12,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/apikey"
-	clusterstate "github.com/kuasar-sandbox/sandbox-orchestrator/internal/cluster"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/cluster/shardkv"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/routesync"
+	"github.com/kuasar-sandbox/orchestrator/internal/apikey"
+	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
+	"github.com/kuasar-sandbox/orchestrator/internal/cluster/shardkv"
+	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 )
 
 // ErrNoNode is returned when no eligible node can host a sandbox.
@@ -38,10 +38,10 @@ type nodeConn interface {
 	send(*routesync.Command) error
 }
 
-// Placer suggests a node for a new sandbox: the scaler suggests, the registry
+// Placer suggests a node for a new sandbox: the placer suggests, the registry
 // commits by CAS.
 // PlaceRequest is a placement ask. Build marks a build placement (resource-aware,
-// cluster-scaler.md); TargetRuntimeDigest lets the scaler prefer compatible
+// cluster-placer.md); TargetRuntimeDigest lets the placer prefer compatible
 // node runtimes when the caller knows the required runtime identity.
 type PlaceRequest struct {
 	Group               string
@@ -52,7 +52,7 @@ type PlaceRequest struct {
 	TargetRuntimeDigest string
 }
 
-// Placement is a scaler answer plus the group-derived material the registry must
+// Placement is a placer answer plus the group-derived material the registry must
 // place on node commands. Registry route owners persist AccessToken in route_link
 // and never call a sandbox-group provider on the hot/read path.
 type Placement struct {
@@ -66,13 +66,13 @@ type Placement struct {
 }
 
 // Placer suggests a node and group-derived create/build material. Production
-// placement calls scaler over scale_link; the builtin placer is the size-1/test
+// placement calls placer over placer_link; the builtin placer is the size-1/test
 // fallback and only fills NodeID.
 type Placer interface {
 	Place(ctx context.Context, req PlaceRequest) (*Placement, error)
 }
 
-// Registry owns the route_link/node_link/scale_link shardkv views and accepts
+// Registry owns the route_link/node_link/placer_link shardkv views and accepts
 // node_link streams.
 type Registry struct {
 	stores      *Stores
@@ -93,25 +93,25 @@ type Registry struct {
 	nodeLinkRelayMu    sync.RWMutex
 	nodeLinkRelayPeers map[string]NodeLinkRelayPeer
 
-	scalerMu         sync.Mutex
+	placerMu         sync.Mutex
 	scaleReadyLabel  string
-	scalerLabel      string
-	scalePeerSource  ScalerPeerSource
-	scalerSeedJoiner ScalerSeedJoiner
-	scaleReplicas    int
-	minReadyScalers  int
-	scaleTimeout     time.Duration
+	placerLabel      string
+	placerPeerSource PlacerPeerSource
+	placerSeedJoiner PlacerSeedJoiner
+	placerReplicas   int
+	minReadyPlacers  int
+	placerTimeout    time.Duration
 }
 
-type ScalerPeer struct {
+type PlacerPeer struct {
 	ID         string
 	Advertise  string
 	ReadyLabel string
 }
 
-type ScalerPeerSource func(readyLabel string) []ScalerPeer
+type PlacerPeerSource func(readyLabel string) []PlacerPeer
 
-type ScalerSeedJoiner func(ctx context.Context, id, label, advertise string) error
+type PlacerSeedJoiner func(ctx context.Context, id, label, advertise string) error
 
 type ImportSourceLease struct {
 	SourceID      string `json:"source_id"`
@@ -149,7 +149,7 @@ type ReserveResult struct {
 	DataEndpoint string `json:"data_endpoint"`
 }
 
-// New builds a Registry. Production callers set a scale_link placer explicitly.
+// New builds a Registry. Production callers set a placer_link placer explicitly.
 func New(stores *Stores, placer Placer, parkTimeout time.Duration, log *slog.Logger) *Registry {
 	if placer == nil {
 		placer = noPlacer{}
@@ -169,9 +169,9 @@ func New(stores *Stores, placer Placer, parkTimeout time.Duration, log *slog.Log
 		inflight:        make(map[string]*reserveCall),
 		sidKeys:         make(map[string][2]string),
 		acks:            make(map[string]chan *routesync.CmdAck),
-		scaleReplicas:   1,
-		minReadyScalers: 1,
-		scaleTimeout:    2 * time.Second,
+		placerReplicas:  1,
+		minReadyPlacers: 1,
+		placerTimeout:   2 * time.Second,
 	}
 	localOwner := newLocalNodeOwner(r)
 	r.localNodeOwner = localOwner
@@ -179,8 +179,8 @@ func New(stores *Stores, placer Placer, parkTimeout time.Duration, log *slog.Log
 	return r
 }
 
-// applySelectorPatch renews the scaler-selected node manifest-key cache. The
-// scaler owns selector/shuffle decisions; registry only writes the current key
+// applySelectorPatch renews the placer-selected node manifest-key cache. The
+// placer owns selector/shuffle decisions; registry only writes the current key
 // lease into node_link for the explicit nodes in the patch. Old keys are not
 // actively deleted: node_link and node side TTLs expire entries that stop being
 // renewed.
@@ -217,55 +217,55 @@ func (r *Registry) checkSelectorPatchLease(ctx context.Context, p *routesync.Sel
 	if p == nil || p.ImportSourceID == "" || p.ImportOwnerID == "" || p.ImportRunID == "" || p.ImportTerm == 0 {
 		return errMissingImportSourceLease
 	}
-	if !r.stores.CheckScaleLinkSourceLease(ctx, p.ImportSourceID, p.ImportOwnerID, p.ImportRunID, p.ImportTerm) {
+	if !r.stores.CheckPlacerLinkSourceLease(ctx, p.ImportSourceID, p.ImportOwnerID, p.ImportRunID, p.ImportTerm) {
 		return errStaleImportSourceLease
 	}
 	return nil
 }
 
-// SetScaleReadyLabel sets the registry membership label a scaler must advertise
+// SetPlacerReadyLabel sets the registry membership label a placer must advertise
 // before it is used for Place requests.
-func (r *Registry) SetScaleReadyLabel(label string) {
-	r.scalerMu.Lock()
+func (r *Registry) SetPlacerReadyLabel(label string) {
+	r.placerMu.Lock()
 	r.scaleReadyLabel = label
-	r.scalerMu.Unlock()
+	r.placerMu.Unlock()
 }
 
-func (r *Registry) SetScalerMemberlistLabel(label string) {
-	r.scalerMu.Lock()
-	r.scalerLabel = label
-	r.scalerMu.Unlock()
+func (r *Registry) SetPlacerMemberlistLabel(label string) {
+	r.placerMu.Lock()
+	r.placerLabel = label
+	r.placerMu.Unlock()
 }
 
-func (r *Registry) scalerMemberlistLabel() string {
-	r.scalerMu.Lock()
-	defer r.scalerMu.Unlock()
-	return r.scalerLabel
+func (r *Registry) placerMemberlistLabel() string {
+	r.placerMu.Lock()
+	defer r.placerMu.Unlock()
+	return r.placerLabel
 }
 
-func (r *Registry) SetScalerPeerSource(source ScalerPeerSource) {
-	r.scalerMu.Lock()
-	r.scalePeerSource = source
-	r.scalerMu.Unlock()
+func (r *Registry) SetPlacerPeerSource(source PlacerPeerSource) {
+	r.placerMu.Lock()
+	r.placerPeerSource = source
+	r.placerMu.Unlock()
 }
 
-func (r *Registry) SetScalerSeedJoiner(joiner ScalerSeedJoiner) {
-	r.scalerMu.Lock()
-	r.scalerSeedJoiner = joiner
-	r.scalerMu.Unlock()
+func (r *Registry) SetPlacerSeedJoiner(joiner PlacerSeedJoiner) {
+	r.placerMu.Lock()
+	r.placerSeedJoiner = joiner
+	r.placerMu.Unlock()
 }
 
-func (r *Registry) joinScalerSeed(ctx context.Context, id, label, advertise string) error {
-	r.scalerMu.Lock()
-	joiner := r.scalerSeedJoiner
-	r.scalerMu.Unlock()
+func (r *Registry) joinPlacerSeed(ctx context.Context, id, label, advertise string) error {
+	r.placerMu.Lock()
+	joiner := r.placerSeedJoiner
+	r.placerMu.Unlock()
 	if joiner == nil {
 		return nil
 	}
 	return joiner(ctx, id, label, advertise)
 }
 
-func (r *Registry) SetScalePolicy(replicaCount, minReady int, timeout time.Duration) {
+func (r *Registry) SetPlacerPolicy(replicaCount, minReady int, timeout time.Duration) {
 	if replicaCount <= 0 {
 		replicaCount = 1
 	}
@@ -275,29 +275,29 @@ func (r *Registry) SetScalePolicy(replicaCount, minReady int, timeout time.Durat
 	if timeout <= 0 {
 		timeout = 2 * time.Second
 	}
-	r.scalerMu.Lock()
-	r.scaleReplicas = replicaCount
-	r.minReadyScalers = minReady
-	r.scaleTimeout = timeout
-	r.scalerMu.Unlock()
+	r.placerMu.Lock()
+	r.placerReplicas = replicaCount
+	r.minReadyPlacers = minReady
+	r.placerTimeout = timeout
+	r.placerMu.Unlock()
 }
 
 func (r *Registry) scalePolicy() (replicaCount, minReady int, timeout time.Duration) {
-	r.scalerMu.Lock()
-	defer r.scalerMu.Unlock()
-	return r.scaleReplicas, r.minReadyScalers, r.scaleTimeout
+	r.placerMu.Lock()
+	defer r.placerMu.Unlock()
+	return r.placerReplicas, r.minReadyPlacers, r.placerTimeout
 }
 
-func (r *Registry) readyScalerPeers(time.Duration) []ScalerPeer {
-	r.scalerMu.Lock()
-	source := r.scalePeerSource
+func (r *Registry) readyPlacerPeers(time.Duration) []PlacerPeer {
+	r.placerMu.Lock()
+	source := r.placerPeerSource
 	readyLabel := r.scaleReadyLabel
-	r.scalerMu.Unlock()
+	r.placerMu.Unlock()
 	if source == nil {
 		return nil
 	}
 	src := source(readyLabel)
-	out := make([]ScalerPeer, 0, len(src))
+	out := make([]PlacerPeer, 0, len(src))
 	for _, peer := range src {
 		if peer.ID == "" || peer.Advertise == "" {
 			continue

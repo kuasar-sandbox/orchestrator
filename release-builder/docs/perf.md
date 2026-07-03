@@ -16,8 +16,8 @@ make perf-sandbox
 make perf-density
 ```
 
-`perf-cache` 由 `make perf` 内部委派给 `sandbox-accelerator`(本仓无同名目标);
-单独跑用 `make -C sandbox-accelerator perf-cache`。
+`perf-cache` 由 `make perf` 内部委派给 `accelerator`(本仓无同名目标);
+单独跑用 `make -C accelerator perf-cache`。
 
 ## 1. cache 子系统
 
@@ -599,7 +599,7 @@ cache-ctl 预算(典型 1–2 GiB),否则 cache 增长会挤掉沙箱内存。
 
 cluster 性能口径应区分热路径与冷路径。热路径是 router 已有活动连接缓存后的
 数据转发,不应进入 registry Reserve;冷路径是首次连接、沙箱创建、build 创建、
-node 状态变化、group 导入与成员切换。这些路径进入 registry/scaler,目标是
+node 状态变化、group 导入与成员切换。这些路径进入 registry/placer,目标是
 保证可靠性和扩展线性,而不是把所有 QPS 都压到 registry 上。
 
 ```
@@ -610,9 +610,9 @@ client ── data stream ──► router active connection cache ──► nod
 
 cold path:
 
-router ── Reserve(group,sandbox) ──► registry route_link ── Place ──► scaler
+router ── Reserve(group,sandbox) ──► registry route_link ── Place ──► placer
 node   ── state/heartbeat/events ──► registry node_link/node_list
-scaler ── group import / key selector ──► registry route_link/node_link
+placer ── group import / key selector ──► registry route_link/node_link
 ```
 
 性能回归应覆盖:
@@ -628,12 +628,12 @@ scaler ── group import / key selector ──► registry route_link/node_lin
   订阅并复制状态。
 - router cache:同一 route 的活动连接存在时,新连接不走 Reserve;活动连接过期
   或路由失效后才回到冷路径。
-- scaler import:同一个 `source_id` 的导入任务由 scale_link 中的 lease 串行
+- placer import:同一个 `source_id` 的导入任务由 placer_link 中的 lease 串行
   执行;文件源只用于开发/e2e,生产源通过 provider/importer 接口实现。
 
-`sandbox-orchestrator` 的 cluster stub e2e 应作为当前主要回归入口:由
+`orchestrator` 的 cluster stub e2e 应作为当前主要回归入口:由
 `make build` 产生真实 `cluster-ctl`/`node-stub-ctl` 二进制,启动 registry、
-router、scaler 和指定数量 stub node,覆盖 N=1、多成员、成员变更、node
+router、placer 和指定数量 stub node,覆盖 N=1、多成员、成员变更、node
 重启、sandbox/build 创建删除、route 查询与 WATCH_LIST。
 
 ## 4. 已知测量局限
@@ -653,7 +653,7 @@ router、scaler 和指定数量 stub node,覆盖 N=1、多成员、成员变更�
 ```bash
 go vet ./...
 make test
-bash test/e2e/e2e_cache.sh                # cache-ctl + manifest-ctl 集成(脚本在 sandbox-accelerator)
+bash test/e2e/e2e_cache.sh                # cache-ctl + manifest-ctl 集成(脚本在 accelerator)
 BENCH_SCENARIO=tiered-shard-l2 CLIENT_CORES=0-1 SERVER_CORES=2-7 \
     CONCS='1 2 4' PREFILL=500 DURATION=30s bash test/scripts/bench_cache.sh
 ```
@@ -675,7 +675,7 @@ make perf-sandbox
 改 `pkg/nodectl/*` 或 `pkg/sandbox/*` 中的资源控制路径时:
 
 ```bash
-make -C sandbox-orchestrator test-e2e-node-ctl   # node-ctl 资源协议 e2e(orchestrator 仓;umbrella test-e2e 经其调用)
+make -C orchestrator test-e2e-node-ctl   # node-ctl 资源协议 e2e(orchestrator 仓;umbrella test-e2e 经其调用)
 make test-e2e-density
 make perf-density
 ```
@@ -684,8 +684,8 @@ make perf-density
 
 ## 6. See Also
 
-- [`../../sandbox-accelerator/docs/cache.md`](../../sandbox-accelerator/docs/cache.md) —— cache-ctl 架构,本文 §1 关注其运行特征
-- [`../../sandbox-runtime/docs/sandbox.md`](../../sandbox-runtime/docs/sandbox.md) —— sandbox-ctl 架构,本文 §2 关注其运行特征
-- [`../../sandbox-orchestrator/docs/node-resource.md`](../../sandbox-orchestrator/docs/node-resource.md) —— 节点资源控制器架构与协议规范
-- [`../../sandbox-orchestrator/docs/cluster.md`](../../sandbox-orchestrator/docs/cluster.md) —— cluster registry/router/scaler 设计
+- [`../../accelerator/docs/cache.md`](../../accelerator/docs/cache.md) —— cache-ctl 架构,本文 §1 关注其运行特征
+- [`../../sandboxer/docs/sandbox.md`](../../sandboxer/docs/sandbox.md) —— sandbox-ctl 架构,本文 §2 关注其运行特征
+- [`../../orchestrator/docs/node-resource.md`](../../orchestrator/docs/node-resource.md) —— 节点资源控制器架构与协议规范
+- [`../../orchestrator/docs/cluster.md`](../../orchestrator/docs/cluster.md) —— cluster registry/router/placer 设计
 - [`kuasar-sandbox.md`](kuasar-sandbox.md) §1.3 / §7 —— 系统级 SLO 与规模推算的来源

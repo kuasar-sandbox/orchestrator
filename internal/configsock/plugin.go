@@ -6,7 +6,7 @@ import (
 	"slices"
 	"sync"
 
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/routesync"
+	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 )
 
 // --- plugin plane: subscriber registry + registration handler ---

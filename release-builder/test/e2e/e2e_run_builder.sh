@@ -29,7 +29,7 @@
 #
 # Requires systemd as PID1 + root (units over D-Bus), /dev/kvm, docker (seeds
 # the base image), zot, mkfs.ext4, and bin/: node-ctl sandbox-ctl
-# e2b-key-ctl vswitch-ctl cloud-hypervisor flatten-ctl manifest-ctl store-ctl
+# e2b-key-ctl connector-ctl vswitch cloud-hypervisor flatten-ctl manifest-ctl store-ctl
 # + vmlinux + sandbox-runtime{,-e2b,-builder}.erofs. Missing prerequisites →
 # exit 0 ("skipped") unless REQUIRE_BUILDER=1.
 
@@ -43,10 +43,10 @@ DOMAIN="${DOMAIN:-sandboxes.e2e.local}"
 E2E_IMAGE="${E2E_IMAGE:-python:3.12-slim}"
 ZOT_BIN="${ZOT_BIN:-$(command -v zot || true)}"
 # versitygw (S3 gateway) backs COPY build contexts; absent → the COPY chain is
-# skipped (the rest still runs). Look in bin/, then the sandbox-deps bin (opt-in
+# skipped (the rest still runs). Look in bin/, then the guest-runtime/native-deps bin (opt-in
 # `make versitygw`, not in the default umbrella collect), then PATH.
 if [ -z "${VGW_BIN:-}" ]; then
-    for cand in "${BIN:-}/versitygw" "$REPO_ROOT/../sandbox-deps/bin/versitygw" "$(command -v versitygw 2>/dev/null || true)"; do
+    for cand in "${BIN:-}/versitygw" "$REPO_ROOT/../guest-runtime/native-deps/bin/versitygw" "$(command -v versitygw 2>/dev/null || true)"; do
         [ -n "$cand" ] && [ -x "$cand" ] && { VGW_BIN="$cand"; break; }
     done
 fi
@@ -62,7 +62,7 @@ skip() {
 fail() { echo "==> FAIL: $*" >&2; exit 1; }
 
 # ---- prerequisite checks --------------------------------------------------
-for b in node-ctl sandbox-ctl e2b-key-ctl vswitch-ctl cloud-hypervisor flatten-ctl manifest-ctl store-ctl; do
+for b in node-ctl sandbox-ctl e2b-key-ctl connector-ctl cloud-hypervisor flatten-ctl manifest-ctl store-ctl; do
     [ -x "$BIN/$b" ] || skip "missing $BIN/$b — run 'make build'"
 done
 for f in vmlinux sandbox-runtime.erofs sandbox-runtime-e2b.erofs sandbox-runtime-builder.erofs; do
@@ -97,7 +97,7 @@ cleanup() {
     set +e
     systemctl stop 'sandbox-runner@*.service' 'sandbox-builder@*.service' 2>/dev/null
     for p in "${PIDS[@]:-}"; do [ -n "$p" ] && kill "$p" 2>/dev/null; done
-    "$BIN/vswitch-ctl" stop "$SWITCH" --force >/dev/null 2>&1
+    "$BIN/connector-ctl" vswitch stop "$SWITCH" --force >/dev/null 2>&1
     ip netns del "$SW_NETNS" 2>/dev/null
     for u in "${OURS[@]:-}"; do [ -n "$u" ] && rm -f "$u"; done
     systemctl daemon-reload 2>/dev/null
@@ -152,12 +152,12 @@ docker push "$PUSH_REF" >"$WORK/push.log" 2>&1 || { cat "$WORK/push.log"; fail "
 echo "==> zot up (0.0.0.0:$ZOT_PORT); seeded $E2E_IMAGE → $PUSH_REF (guest pulls $PULL_REF)"
 
 # ---- vswitch (guest network for the build sandboxes) -----------------------
-"$BIN/vswitch-ctl" stop "$SWITCH" --force >/dev/null 2>&1 || true
+"$BIN/connector-ctl" vswitch stop "$SWITCH" --force >/dev/null 2>&1 || true
 ip netns del "$SW_NETNS" 2>/dev/null || true
 ip netns add "$SW_NETNS"
 # --mgmt-extract puts $MGMT_VIP on host NIC $SW_MGMT and routes guest 0/0 to it;
 # that is the only path the builds need (zot on the host). No NAT required.
-"$BIN/vswitch-ctl" start "$SWITCH" --netns="$SW_NETNS" --ports=16 --mac-addr=02:00:00:00:01:01 \
+"$BIN/connector-ctl" vswitch start "$SWITCH" --netns="$SW_NETNS" --ports=16 --mac-addr=02:00:00:00:01:01 \
     --floating-ip-base=100.100.112.0 --mode=tap \
     --mgmt-extract=:$SW_MGMT:$MGMT_VIP,0.0.0.0/0 >"$WORK/vswitch.log" 2>&1 \
     || { cat "$WORK/vswitch.log"; fail "vswitch start"; }

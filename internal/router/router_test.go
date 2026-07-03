@@ -10,7 +10,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/clusterclient"
+	"github.com/kuasar-sandbox/orchestrator/internal/clusterclient"
 )
 
 func TestExtractBuildID(t *testing.T) {

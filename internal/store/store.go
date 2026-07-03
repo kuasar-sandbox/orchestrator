@@ -13,9 +13,9 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/apikey"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/secretbox"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/types"
+	"github.com/kuasar-sandbox/orchestrator/internal/apikey"
+	"github.com/kuasar-sandbox/orchestrator/internal/secretbox"
+	"github.com/kuasar-sandbox/orchestrator/internal/types"
 	_ "modernc.org/sqlite"
 )
 

@@ -152,10 +152,10 @@ func (g *Group) Seen(id string) bool {
 	return g.delegate.hasSeen(id)
 }
 
-func (g *Group) ReadyScalers(readyLabel string) []Meta {
+func (g *Group) ReadyPlacers(readyLabel string) []Meta {
 	var out []Meta
 	for _, meta := range g.Members() {
-		if meta.Role != RoleScaler || !meta.Ready {
+		if meta.Role != RolePlacer || !meta.Ready {
 			continue
 		}
 		if readyLabel != "" && meta.ReadyLabel != readyLabel {

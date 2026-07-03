@@ -3,7 +3,7 @@ package cluster
 import (
 	"testing"
 
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/cluster/shardkv"
+	"github.com/kuasar-sandbox/orchestrator/internal/cluster/shardkv"
 )
 
 func TestShardRecordKeys(t *testing.T) {
@@ -31,18 +31,18 @@ func TestShardRecordKeys(t *testing.T) {
 	if got, ok := ParseRouteBuildRecordKey(RouteBuildRecordKey("b1")); !ok || got != "b1" {
 		t.Fatalf("route build parse=%q ok=%v", got, ok)
 	}
-	sourceID, ok := ParseScaleImportSourceShard(ScaleImportSourceShard("source-a"))
+	sourceID, ok := ParsePlacerImportSourceShard(PlacerImportSourceShard("source-a"))
 	if !ok || sourceID != "source-a" {
 		t.Fatalf("scale import parse source=%q ok=%v", sourceID, ok)
 	}
 }
 
 func TestShardValueCodec(t *testing.T) {
-	raw, err := EncodeShardValue(ScaleImportSourceState{SourceID: "src", OwnerID: "s1", Term: 2})
+	raw, err := EncodeShardValue(PlacerImportSourceState{SourceID: "src", OwnerID: "s1", Term: 2})
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := DecodeShardValue[ScaleImportSourceState](raw)
+	got, err := DecodeShardValue[PlacerImportSourceState](raw)
 	if err != nil {
 		t.Fatal(err)
 	}

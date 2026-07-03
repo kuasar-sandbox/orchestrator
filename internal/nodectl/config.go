@@ -6,13 +6,13 @@ import (
 	"runtime"
 	"time"
 
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/config"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/util"
+	"github.com/kuasar-sandbox/orchestrator/internal/config"
+	"github.com/kuasar-sandbox/orchestrator/internal/util"
 )
 
 // Resolved is the post-default, post-parse form of the resource controller's
 // configuration (config.ResourceListenConfig): sizes expanded, "auto" values
-// detected, durations parsed. node-ctl serve builds it via Resolve when it hosts
+// detected, durations parsed. node-ctl conductor serve builds it via Resolve when it hosts
 // the controller in-process (resource_listen, node-resource.md §3). There is no
 // standalone daemon and no separate config file — the tuning is inlined in serve's
 // config and consumed directly here.

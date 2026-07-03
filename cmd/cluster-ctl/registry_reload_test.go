@@ -9,9 +9,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/clustercfg"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/membergroup"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/registry"
+	"github.com/kuasar-sandbox/orchestrator/internal/clustercfg"
+	"github.com/kuasar-sandbox/orchestrator/internal/membergroup"
+	"github.com/kuasar-sandbox/orchestrator/internal/registry"
 )
 
 func TestRegistryReloadRejectsDirectActiveSwitchWithoutJointConfig(t *testing.T) {
@@ -71,7 +71,7 @@ membership:
   owners:
     route_link: 2
     node_link: 2
-    scale_link: 2
+    placer_link: 2
     node_list: 2
 `)
 	views, nodeOwners, err := buildRegistryTopology(cfg)
@@ -199,7 +199,7 @@ func registryReloadTestConfig(active, next int, self string, versions map[int][]
 		}
 	}
 	b.WriteString("  owners:\n")
-	for _, ns := range []string{"route_link", "node_link", "scale_link", "node_list"} {
+	for _, ns := range []string{"route_link", "node_link", "placer_link", "node_list"} {
 		b.WriteString("    ")
 		b.WriteString(ns)
 		b.WriteString(": 2\n")

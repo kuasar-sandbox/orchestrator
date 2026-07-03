@@ -1,5 +1,5 @@
 // Package nodelink is the node side of the cluster node-link channel (node.md
-// §10): a node-ctl serve dials the registry, registers its identity, then — as
+// §10): a node-ctl conductor serve dials the registry, registers its identity, then — as
 // the route authority — streams its sandbox routes up while executing the
 // registry's lifecycle/key commands. It reuses the routesync engine (the frame
 // codec + StreamAuthority): the only node-link-specific bits are sending a
@@ -22,7 +22,7 @@ import (
 
 	"golang.org/x/net/http2"
 
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/routesync"
+	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 )
 
 // Node is what the node-link client needs from the node's orchestrator: a route

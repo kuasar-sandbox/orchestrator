@@ -2,9 +2,9 @@
 #
 # Umbrella cluster e2e entry.
 #
-# This delegates to sandbox-orchestrator's cluster stub suite while using the
+# This delegates to orchestrator's cluster stub suite while using the
 # binaries produced by this repo's `make build`. The delegated suite starts real
-# cluster-ctl registry/router/scaler processes and node-stub-ctl; node-stub-ctl
+# cluster-ctl registry/router/placer processes and node-stub-ctl; node-stub-ctl
 # simulates node-link, key distribution, sandbox/build commands, node reboot and
 # data forwarding without launching microVMs.
 
@@ -19,8 +19,8 @@ case "$HOST_ARCH" in
 esac
 
 BIN="${BIN:-$REPO_ROOT/bin/$HOST_ARCH}"
-ORCH_BIN="$ORG_ROOT/sandbox-orchestrator/bin/$HOST_ARCH"
-ORCH_E2E="$ORG_ROOT/sandbox-orchestrator/test/e2e/e2e_cluster_stub.sh"
+ORCH_BIN="$ORG_ROOT/orchestrator/bin/$HOST_ARCH"
+ORCH_E2E="$ORG_ROOT/orchestrator/test/e2e/e2e_cluster_stub.sh"
 REQUIRE_CLUSTER_STUB="${REQUIRE_CLUSTER_STUB:-${REQUIRE_EXEC:-0}}"
 
 skip() {
@@ -40,7 +40,7 @@ if [ ! -x "$BIN/cluster-ctl" ] || [ ! -x "$BIN/node-stub-ctl" ] || [ ! -x "$BIN/
   fi
 fi
 
-echo "==> e2e_cluster: running sandbox-orchestrator cluster stub suite" >&2
+echo "==> e2e_cluster: running orchestrator cluster stub suite" >&2
 echo "==> e2e_cluster: BIN=$BIN" >&2
 
 BIN="$BIN" REQUIRE_CLUSTER_STUB="$REQUIRE_CLUSTER_STUB" bash "$ORCH_E2E"

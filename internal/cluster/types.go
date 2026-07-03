@@ -3,14 +3,14 @@ package cluster
 import (
 	"time"
 
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/routesync"
+	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 )
 
 const (
-	NamespaceRouteLink = "route_link"
-	NamespaceNodeLink  = "node_link"
-	NamespaceNodeList  = "node_list"
-	NamespaceScaleLink = "scale_link"
+	NamespaceRouteLink  = "route_link"
+	NamespaceNodeLink   = "node_link"
+	NamespaceNodeList   = "node_list"
+	NamespacePlacerLink = "placer_link"
 )
 
 // Ballot is the unique write id used by registry replicated namespaces. Multi-member
@@ -47,7 +47,7 @@ const (
 )
 
 // RouteRecord is the group-sharded route_link value. AccessToken is the
-// scaler-derived data-plane token for the current SandboxID generation; registry
+// placer-derived data-plane token for the current SandboxID generation; registry
 // route owners return it without consulting sandbox-group providers.
 type RouteRecord struct {
 	Meta           RecordMeta                `json:"meta"`
@@ -120,7 +120,7 @@ type NodeBuildRef struct {
 	BuildID string `json:"build_id"`
 }
 
-// NodeListEntry is the low-frequency WATCH_LIST projection consumed by scaler.
+// NodeListEntry is the low-frequency WATCH_LIST projection consumed by placer.
 // High-frequency load stays in node_link and is fetched at placement time.
 type NodeListEntry struct {
 	Meta              RecordMeta                `json:"meta"`

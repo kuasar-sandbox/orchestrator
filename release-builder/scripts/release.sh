@@ -27,7 +27,7 @@ ARCH="${TARGET_ARCH:-$(uname -m)}"
 case "$ARCH" in amd64) ARCH=x86_64 ;; arm64) ARCH=aarch64 ;; esac
 
 UMBRELLA_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-ORG="$(cd "$UMBRELLA_DIR/.." && pwd)"
+ORG="$(cd "$UMBRELLA_DIR/../.." && pwd)"
 SRC_BIN="$UMBRELLA_DIR/bin/$ARCH"
 NAME="kuasar-sandbox-$VERSION-linux-$ARCH"
 OUT="$UMBRELLA_DIR/dist/$NAME"
@@ -39,109 +39,109 @@ OUT="$UMBRELLA_DIR/dist/$NAME"
 
 # Docs — "system design + product usage" only. Entries are `src[:dst_basename]`
 # rooted at $ORG; rename suffix avoids name collisions in the flat <release>/docs/.
-# Excluded (pure build workflow, not user-facing): sandbox-deps/docs/build.md.
+# Excluded (pure build workflow, not user-facing): guest-runtime/native-deps/docs/build.md.
 DOCS=(
   # umbrella system-level
-  "kuasar-sandbox/docs/kuasar-sandbox.md"
-  "kuasar-sandbox/docs/deployment.md"
-  "kuasar-sandbox/docs/perf.md"
+  "orchestrator/release-builder/docs/kuasar-sandbox.md"
+  "orchestrator/release-builder/docs/deployment.md"
+  "orchestrator/release-builder/docs/perf.md"
   # storage accelerator
-  "sandbox-accelerator/docs/cache.md"
-  "sandbox-accelerator/docs/manifest.md"
-  "sandbox-accelerator/docs/store.md"
+  "accelerator/docs/cache.md"
+  "accelerator/docs/manifest.md"
+  "accelerator/docs/store.md"
   # image builder (folded into the accelerator)
-  "sandbox-accelerator/docs/flatten.md"
+  "accelerator/docs/flatten.md"
   # microVM runtime
-  "sandbox-runtime/docs/sandbox.md"
-  "sandbox-runtime/docs/sandbox-runtime.md"
+  "sandboxer/docs/sandbox.md"
+  "sandboxer/docs/sandbox-runtime.md"
   # node orchestrator — single-node control plane + data-plane proxy + resource daemon
-  "sandbox-orchestrator/docs/node.md"
-  "sandbox-orchestrator/docs/node-proxy.md"
-  "sandbox-orchestrator/docs/node-resource.md"
-  # cluster tier — registry + router + scaler
-  "sandbox-orchestrator/docs/cluster.md"
-  "sandbox-orchestrator/docs/cluster-router.md"
-  "sandbox-orchestrator/docs/cluster-scaler.md"
+  "orchestrator/docs/node.md"
+  "orchestrator/docs/node-proxy.md"
+  "orchestrator/docs/node-resource.md"
+  # cluster tier — registry + router + placer
+  "orchestrator/docs/cluster.md"
+  "orchestrator/docs/cluster-router.md"
+  "orchestrator/docs/cluster-placer.md"
   # virtual switch
-  "sandbox-vswitch/docs/vswitch.md"
-  "sandbox-vswitch/docs/tapfd.md"
+  "connector/docs/vswitch.md"
+  "connector/docs/tapfd.md"
   # platform native dependencies — VMM patches + guest kernel contracts
-  "sandbox-deps/docs/cloud-hypervisor.md"
-  "sandbox-deps/docs/sandbox-kernel.md"
+  "guest-runtime/native-deps/docs/cloud-hypervisor.md"
+  "guest-runtime/native-deps/docs/sandbox-kernel.md"
 )
 
 # Cross-repo e2e — all scripts use `SCRIPT_DIR/../../bin` for BIN default, so
 # placing them at <release>/test/e2e/ makes BIN resolve to <release>/bin/ with
-# no script edits. Excluded: sandbox-orchestrator/test/e2e/e2e_node_ctl.sh —
+# no script edits. Excluded: orchestrator/test/e2e/e2e_node_ctl.sh —
 # generates Go drivers via heredoc and runs them with `go run`, requiring a
 # checkout of sandbox-{orchestrator,runtime} sources. Keep it in the source repo.
 E2ES=(
   # umbrella (25)
-  "kuasar-sandbox/test/e2e/e2e_density.sh"
-  "kuasar-sandbox/test/e2e/e2e_manifest.sh"
-  "kuasar-sandbox/test/e2e/e2e_obs.sh"
-  "kuasar-sandbox/test/e2e/e2e_sandbox_cold.sh"
-  "kuasar-sandbox/test/e2e/e2e_sandbox_cold_manifest.sh"
-  "kuasar-sandbox/test/e2e/e2e_sandbox_cold_target.sh"
-  "kuasar-sandbox/test/e2e/e2e_sandbox_diff_template.sh"
-  "kuasar-sandbox/test/e2e/e2e_sandbox_disks.sh"
-  "kuasar-sandbox/test/e2e/e2e_sandbox_launchspec.sh"
-  "kuasar-sandbox/test/e2e/e2e_sandbox_local_merge.sh"
-  "kuasar-sandbox/test/e2e/e2e_sandbox_placeholder.sh"
-  "kuasar-sandbox/test/e2e/e2e_sandbox_proto.sh"
-  "kuasar-sandbox/test/e2e/e2e_sandbox_restore.sh"
-  "kuasar-sandbox/test/e2e/e2e_sandbox_restore_files.sh"
-  "kuasar-sandbox/test/e2e/e2e_sandbox_snapshot.sh"
-  "kuasar-sandbox/test/e2e/e2e_sandbox_stdio.sh"
-  "kuasar-sandbox/test/e2e/e2e_sandbox_tapfd.sh"
-  "kuasar-sandbox/test/e2e/e2e_sandbox_upload_restore.sh"
-  "kuasar-sandbox/test/e2e/e2e_warmpool_dedup.sh"
-  "kuasar-sandbox/test/e2e/e2e_orchestrator.sh"
-  "kuasar-sandbox/test/e2e/e2e_runtask.sh"
+  "orchestrator/release-builder/test/e2e/e2e_density.sh"
+  "orchestrator/release-builder/test/e2e/e2e_manifest.sh"
+  "orchestrator/release-builder/test/e2e/e2e_obs.sh"
+  "orchestrator/release-builder/test/e2e/e2e_sandbox_cold.sh"
+  "orchestrator/release-builder/test/e2e/e2e_sandbox_cold_manifest.sh"
+  "orchestrator/release-builder/test/e2e/e2e_sandbox_cold_target.sh"
+  "orchestrator/release-builder/test/e2e/e2e_sandbox_diff_template.sh"
+  "orchestrator/release-builder/test/e2e/e2e_sandbox_disks.sh"
+  "orchestrator/release-builder/test/e2e/e2e_sandbox_launchspec.sh"
+  "orchestrator/release-builder/test/e2e/e2e_sandbox_local_merge.sh"
+  "orchestrator/release-builder/test/e2e/e2e_sandbox_placeholder.sh"
+  "orchestrator/release-builder/test/e2e/e2e_sandbox_proto.sh"
+  "orchestrator/release-builder/test/e2e/e2e_sandbox_restore.sh"
+  "orchestrator/release-builder/test/e2e/e2e_sandbox_restore_files.sh"
+  "orchestrator/release-builder/test/e2e/e2e_sandbox_snapshot.sh"
+  "orchestrator/release-builder/test/e2e/e2e_sandbox_stdio.sh"
+  "orchestrator/release-builder/test/e2e/e2e_sandbox_tapfd.sh"
+  "orchestrator/release-builder/test/e2e/e2e_sandbox_upload_restore.sh"
+  "orchestrator/release-builder/test/e2e/e2e_warmpool_dedup.sh"
+  "orchestrator/release-builder/test/e2e/e2e_orchestrator.sh"
+  "orchestrator/release-builder/test/e2e/e2e_runtask.sh"
   # e2b build + execute (real microVM / Python SDK; self-skip without their prereqs)
-  "kuasar-sandbox/test/e2e/e2e_run_builder.sh"
-  "kuasar-sandbox/test/e2e/e2e_execute.sh"
-  "kuasar-sandbox/test/e2e/e2e_orchestrator_proxy.sh"
+  "orchestrator/release-builder/test/e2e/e2e_run_builder.sh"
+  "orchestrator/release-builder/test/e2e/e2e_execute.sh"
+  "orchestrator/release-builder/test/e2e/e2e_orchestrator_proxy.sh"
   # cluster tier (real cluster processes + node-stub-ctl control-plane/data-forwarding stub)
-  "kuasar-sandbox/test/e2e/e2e_cluster.sh"
+  "orchestrator/release-builder/test/e2e/e2e_cluster.sh"
   # accelerator (3)
-  "sandbox-accelerator/test/e2e/e2e_cache.sh"
-  "sandbox-accelerator/test/e2e/e2e_cluster_rolling.sh"
-  "sandbox-accelerator/test/e2e/e2e_store_cache_listen.sh"
+  "accelerator/test/e2e/e2e_cache.sh"
+  "accelerator/test/e2e/e2e_cluster_rolling.sh"
+  "accelerator/test/e2e/e2e_store_cache_listen.sh"
 )
 
 # Perf + dedup-analysis helpers (same `../../bin` path convention).
 PERFS=(
   # umbrella (4)
-  "kuasar-sandbox/test/perf/sandbox-perf.sh"
-  "kuasar-sandbox/test/perf/sandbox-perf-manifest.sh"
-  "kuasar-sandbox/test/perf/density-perf.sh"
-  "kuasar-sandbox/test/perf/workload.py"
+  "orchestrator/release-builder/test/perf/sandbox-perf.sh"
+  "orchestrator/release-builder/test/perf/sandbox-perf-manifest.sh"
+  "orchestrator/release-builder/test/perf/density-perf.sh"
+  "orchestrator/release-builder/test/perf/workload.py"
   # accelerator bench/dedup helpers (5)
-  "sandbox-accelerator/test/scripts/bench_cache.sh"
-  "sandbox-accelerator/test/scripts/bench_cache_remote.sh"
-  "sandbox-accelerator/test/scripts/dedup_report.sh"
-  "sandbox-accelerator/test/scripts/procmon.sh"
-  "sandbox-accelerator/test/scripts/proc_analyze.py"
+  "accelerator/test/scripts/bench_cache.sh"
+  "accelerator/test/scripts/bench_cache_remote.sh"
+  "accelerator/test/scripts/dedup_report.sh"
+  "accelerator/test/scripts/procmon.sh"
+  "accelerator/test/scripts/proc_analyze.py"
 )
 
 # Deploy assets — operator-facing example configs + systemd units staged under
 # <release>/deploy/: one example config per daemon role (node serve/proxy +
-# cluster registry/router/scaler) and the matching units. node-ctl additionally
+# cluster registry/router/placer) and the matching units. node-ctl additionally
 # self-installs its sandbox template units at startup (see node.md §5).
 DEPLOYS=(
   # node roles
-  "sandbox-orchestrator/deploy/serve.example.yaml"
-  "sandbox-orchestrator/deploy/proxy.example.yaml"
-  "sandbox-orchestrator/deploy/node-ctl.service"
-  "sandbox-orchestrator/deploy/node-proxy@.service"
+  "orchestrator/deploy/conductor.example.yaml"
+  "orchestrator/deploy/proxy.example.yaml"
+  "orchestrator/deploy/node-ctl.service"
+  "orchestrator/deploy/node-proxy@.service"
   # cluster roles
-  "sandbox-orchestrator/deploy/registry.example.yaml"
-  "sandbox-orchestrator/deploy/router.example.yaml"
-  "sandbox-orchestrator/deploy/scaler.example.yaml"
-  "sandbox-orchestrator/deploy/cluster-registry.service"
-  "sandbox-orchestrator/deploy/cluster-router.service"
-  "sandbox-orchestrator/deploy/cluster-scaler.service"
+  "orchestrator/deploy/registry.example.yaml"
+  "orchestrator/deploy/router.example.yaml"
+  "orchestrator/deploy/placer.example.yaml"
+  "orchestrator/deploy/cluster-registry.service"
+  "orchestrator/deploy/cluster-router.service"
+  "orchestrator/deploy/cluster-placer.service"
 )
 
 # The e2b end-to-end demo (prep + run scripts + guide) — the headline "try it"
@@ -150,9 +150,9 @@ DEPLOYS=(
 # Heavier host prereqs than the e2e (e2b CLI + zot + docker + /dev/kvm + openssl
 # + mkfs.ext4); checks + skips.
 DEMOS=(
-  "kuasar-sandbox/test/demo/demo_prep.sh"
-  "kuasar-sandbox/test/demo/demo_e2b.sh"
-  "kuasar-sandbox/test/demo/DEMO.md"
+  "orchestrator/release-builder/test/demo/demo_prep.sh"
+  "orchestrator/release-builder/test/demo/demo_e2b.sh"
+  "orchestrator/release-builder/test/demo/DEMO.md"
 )
 
 # ----------------------------------------------------------------------------
@@ -181,30 +181,30 @@ done
 # its e2e (E2ES) and its bench/dedup helpers (PERFS). runtime/vswitch ship no
 # test scripts; orchestrator's sole e2e needs a source checkout (kept out).
 ACC_E2E_EXCLUDE=( "e2e_flatten.sh" )   # flatten-registry e2e: finds binaries via PATH/env, not the ../../bin convention; stays in the source repo
-for f in "$ORG"/sandbox-accelerator/test/e2e/*.sh; do
+for f in "$ORG"/accelerator/test/e2e/*.sh; do
   [ -e "$f" ] || continue
   b="$(basename "$f")"
   printf '%s\n' "${E2ES[@]}" | grep -q "/$b\$" && continue
   printf '%s\n' "${ACC_E2E_EXCLUDE[@]:-}" | grep -qx "$b" && continue
-  missing+=("sandbox-accelerator/test/e2e/$b — not in E2ES or ACC_E2E_EXCLUDE (release manifest drift)")
+  missing+=("accelerator/test/e2e/$b — not in E2ES or ACC_E2E_EXCLUDE (release manifest drift)")
 done
 ACC_SCRIPTS_EXCLUDE=()   # add basenames intentionally kept out of the release, with a reason
-for f in "$ORG"/sandbox-accelerator/test/scripts/*; do
+for f in "$ORG"/accelerator/test/scripts/*; do
   [ -e "$f" ] || continue
   b="$(basename "$f")"
   printf '%s\n' "${PERFS[@]}" | grep -q "/$b\$" && continue
   printf '%s\n' "${ACC_SCRIPTS_EXCLUDE[@]:-}" | grep -qx "$b" && continue
-  missing+=("sandbox-accelerator/test/scripts/$b — not in PERFS or ACC_SCRIPTS_EXCLUDE (release manifest drift)")
+  missing+=("accelerator/test/scripts/$b — not in PERFS or ACC_SCRIPTS_EXCLUDE (release manifest drift)")
 done
 # Same drift guard for the operator deploy assets (DEPLOYS): a newly-added role
 # config or unit must be bundled or excluded, else it silently misses the tarball.
 DEPLOY_EXCLUDE=()   # add basenames intentionally kept out of the release, with a reason
-for f in "$ORG"/sandbox-orchestrator/deploy/*; do
+for f in "$ORG"/orchestrator/deploy/*; do
   [ -e "$f" ] || continue
   b="$(basename "$f")"
   printf '%s\n' "${DEPLOYS[@]}" | grep -q "/$b\$" && continue
   printf '%s\n' "${DEPLOY_EXCLUDE[@]:-}" | grep -qx "$b" && continue
-  missing+=("sandbox-orchestrator/deploy/$b — not in DEPLOYS or DEPLOY_EXCLUDE (release manifest drift)")
+  missing+=("orchestrator/deploy/$b — not in DEPLOYS or DEPLOY_EXCLUDE (release manifest drift)")
 done
 if [ "${#missing[@]}" -gt 0 ]; then
   echo "release.sh: missing inputs:" >&2

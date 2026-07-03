@@ -10,14 +10,14 @@ import (
 // Stage names mirror the per-sandbox state machine in
 // docs/sandbox.md §10.1.
 const (
-	StageAdmitted   = "admitted"
-	StageCreating   = "creating"
-	StageStartup    = "startup"
-	StageRestoring  = "restoring"
-	StageSettled    = "settled"
-	StageBurst      = "burst"
-	StageRecover    = "recover"
-	StageReleased   = "released"
+	StageAdmitted  = "admitted"
+	StageCreating  = "creating"
+	StageStartup   = "startup"
+	StageRestoring = "restoring"
+	StageSettled   = "settled"
+	StageBurst     = "burst"
+	StageRecover   = "recover"
+	StageReleased  = "released"
 )
 
 // Resources is a per-dimension headroom record. CPUMilli is allocatable.cpu * 1000.
@@ -72,10 +72,10 @@ type Reservation struct {
 	// AllocatableNowMem (main-pool charge), which keeps tracking grow/shrink.
 	EffectiveStartupBudget uint64 `json:"effective_startup_budget,omitempty"`
 
-	Stage             string    `json:"stage"`
-	StageEnteredAt    time.Time `json:"stage_entered_at"`
-	LastHeartbeatAt   time.Time `json:"last_heartbeat_at"`
-	OOMCount          uint64    `json:"oom_count"`
+	Stage           string    `json:"stage"`
+	StageEnteredAt  time.Time `json:"stage_entered_at"`
+	LastHeartbeatAt time.Time `json:"last_heartbeat_at"`
+	OOMCount        uint64    `json:"oom_count"`
 
 	// LastReportedRSS is the cgroup memory.current most recently reported
 	// by sandbox-ctl in a Heartbeat / Settled message. Used by the active
@@ -102,11 +102,11 @@ type Watermarks struct {
 type State struct {
 	mu sync.Mutex
 
-	NodeBudget        Resources              `json:"node_budget"`
-	HostReserved      Resources              `json:"host_reserved"`
-	OperationalMargin Resources              `json:"operational_margin"`
-	AllocatablePool   Resources              `json:"allocatable_pool"`
-	Wm                Watermarks             `json:"watermarks"`
+	NodeBudget        Resources               `json:"node_budget"`
+	HostReserved      Resources               `json:"host_reserved"`
+	OperationalMargin Resources               `json:"operational_margin"`
+	AllocatablePool   Resources               `json:"allocatable_pool"`
+	Wm                Watermarks              `json:"watermarks"`
 	Reservations      map[string]*Reservation `json:"reservations"`
 
 	Version int `json:"version"`
@@ -184,10 +184,10 @@ func (s *State) StartupInFlightLocked() uint64 {
 type Zone string
 
 const (
-	ZoneGreen     Zone = "green"
-	ZoneYellow    Zone = "yellow"
-	ZoneRed       Zone = "red"
-	ZoneCritical  Zone = "critical"
+	ZoneGreen    Zone = "green"
+	ZoneYellow   Zone = "yellow"
+	ZoneRed      Zone = "red"
+	ZoneCritical Zone = "critical"
 )
 
 // MemoryZone returns the current memory water-mark zone (drives

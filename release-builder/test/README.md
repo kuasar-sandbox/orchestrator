@@ -19,13 +19,13 @@ adaptation**. Two equivalent ways to supply binaries:
    export SANDBOX_BIN=../dist/kuasar-sandbox-v0.1.0-linux-$(uname -m)/bin
    ```
 
-2. Build each repo (`GOWORK=off make build` in sandbox-accelerator / -runtime /
-   -sentinel / -builder / -vswitch, and `make` targets in sandbox-deps) and
+2. Build each repo (`GOWORK=off make build` in accelerator / -runtime /
+   -sentinel / -builder / -vswitch, and `make` targets in guest-runtime/native-deps) and
    collect the binaries into one directory.
 
 The test bodies themselves are unchanged; the inline node-ctl client in
 `e2e/e2e_node_ctl.sh` already imports the relocated protocol
-(`sandbox-runtime/pkg/resource`, aliased `nodectl`).
+(`sandboxer/pkg/resource`, aliased `nodectl`).
 
 ## Suites
 

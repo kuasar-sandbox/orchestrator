@@ -11,21 +11,21 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/clustercfg"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/clusterclient"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/membergroup"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/scaler"
+	"github.com/kuasar-sandbox/orchestrator/internal/clustercfg"
+	"github.com/kuasar-sandbox/orchestrator/internal/clusterclient"
+	"github.com/kuasar-sandbox/orchestrator/internal/membergroup"
+	"github.com/kuasar-sandbox/orchestrator/internal/placer"
 )
 
-// runScaler starts the standalone scaler: it uses registry membership as the
+// runPlacer starts the standalone placer: it uses registry membership as the
 // bootstrap source, keeps node/group placement views synced, and answers registry
 // placement requests.
-func runScaler(args []string, log *slog.Logger) error {
-	fs := flag.NewFlagSet("scaler", flag.ExitOnError)
-	cfgPath := fs.String("config", "/etc/cluster-ctl/scaler.yaml", "config file")
+func runPlacer(args []string, log *slog.Logger) error {
+	fs := flag.NewFlagSet("placer", flag.ExitOnError)
+	cfgPath := fs.String("config", "/etc/cluster-ctl/placer.yaml", "config file")
 	_ = fs.Parse(args)
 
-	cfg, err := clustercfg.LoadScaler(*cfgPath)
+	cfg, err := clustercfg.LoadPlacer(*cfgPath)
 	if err != nil {
 		return err
 	}
@@ -35,7 +35,7 @@ func runScaler(args []string, log *slog.Logger) error {
 	var registryTLS *tls.Config
 	if endpointServerName(registryAddr) != "" && cfg.Registry.TLS.Enabled() {
 		if registryTLS, err = cfg.Registry.TLS.ClientConfig(endpointServerName(registryAddr)); err != nil {
-			return fmt.Errorf("scaler: registry tls: %w", err)
+			return fmt.Errorf("placer: registry tls: %w", err)
 		}
 	}
 
@@ -51,10 +51,10 @@ func runScaler(args []string, log *slog.Logger) error {
 		return err
 	}
 	if len(eps) == 0 {
-		return fmt.Errorf("scaler: registry membership has no members")
+		return fmt.Errorf("placer: registry membership has no members")
 	}
 	if len(cfg.ImportGroups) == 0 {
-		return fmt.Errorf("scaler: standalone mode requires at least one import_groups source")
+		return fmt.Errorf("placer: standalone mode requires at least one import_groups source")
 	}
 	nodeListEps, err := regClient.NodeListEndpoints(ctx)
 	if err != nil {
@@ -65,39 +65,39 @@ func runScaler(args []string, log *slog.Logger) error {
 		return err
 	}
 	links := registryLinks(eps)
-	groupInputs, err := scaler.NewConfiguredGroupInputs(cfg.ImportGroups)
+	groupInputs, err := placer.NewConfiguredGroupInputs(cfg.ImportGroups)
 	if err != nil {
 		return err
 	}
-	svc := scaler.NewRemoteLinksWithGroups(links, groupInputs.Provider, groupInputs.Sources, cfg.Placement, deadAfter, log)
+	svc := placer.NewRemoteLinksWithGroups(links, groupInputs.Provider, groupInputs.Sources, cfg.Placement, deadAfter, log)
 	svc.SetNodeListLinksForLabel(ctx, registryLinks(nodeListEps), activeLabel)
-	svc.SetScaleLinkResolver(newScaleLinkResolver(regClient))
-	svc.SetScaleLinkRefresher(regClient.Refresh)
+	svc.SetPlacerLinkResolver(newPlacerLinkResolver(regClient))
+	svc.SetPlacerLinkRefresher(regClient.Refresh)
 	memberHub := membergroup.NewHub()
-	memberlistTLS, err := membergroupTLSConfig(cfg.Scaler.TLS)
+	memberlistTLS, err := membergroupTLSConfig(cfg.Placer.TLS)
 	if err != nil {
-		return fmt.Errorf("scaler memberlist tls: %w", err)
+		return fmt.Errorf("placer memberlist tls: %w", err)
 	}
-	scalerGroup, err := membergroup.New(membergroup.Options{
-		Label: cfg.Scaler.MemberlistLabel, Name: cfg.Scaler.ID, Hub: memberHub, Log: log,
+	placerGroup, err := membergroup.New(membergroup.Options{
+		Label: cfg.Placer.MemberlistLabel, Name: cfg.Placer.ID, Hub: memberHub, Log: log,
 		TLSConfig: memberlistTLS,
 		Meta: membergroup.Meta{
-			Role: membergroup.RoleScaler, ID: cfg.Scaler.ID, Advertise: cfg.Scaler.Advertise,
+			Role: membergroup.RolePlacer, ID: cfg.Placer.ID, Advertise: cfg.Placer.Advertise,
 		},
 	})
 	if err != nil {
 		return err
 	}
-	defer scalerGroup.Shutdown()
-	svc.SetImportSourceOwnerSource(cfg.Scaler.ID, func() []string {
+	defer placerGroup.Shutdown()
+	svc.SetImportSourceOwnerSource(cfg.Placer.ID, func() []string {
 		if err := regClient.Refresh(ctx); err != nil {
-			return []string{cfg.Scaler.ID}
+			return []string{cfg.Placer.ID}
 		}
 		label, err := regClient.ActiveLabel(ctx)
 		if err != nil {
-			return []string{cfg.Scaler.ID}
+			return []string{cfg.Placer.ID}
 		}
-		metas := scalerGroup.ReadyScalers(label)
+		metas := placerGroup.ReadyPlacers(label)
 		ids := make([]string, 0, len(metas))
 		for _, meta := range metas {
 			if meta.ID != "" {
@@ -105,14 +105,14 @@ func runScaler(args []string, log *slog.Logger) error {
 			}
 		}
 		if len(ids) == 0 {
-			ids = append(ids, cfg.Scaler.ID)
+			ids = append(ids, cfg.Placer.ID)
 		}
 		return ids
 	})
 	mux := http.NewServeMux()
 	memberHub.Mount(mux)
-	svc.ServeScaleLink(mux)
-	httpServer, err := newClusterHTTPServer("scaler", cfg.Scaler.Listen, cfg.Scaler.TLS, mux)
+	svc.ServePlacerLink(mux)
+	httpServer, err := newClusterHTTPServer("placer", cfg.Placer.Listen, cfg.Placer.TLS, mux)
 	if err != nil {
 		return err
 	}
@@ -121,10 +121,10 @@ func runScaler(args []string, log *slog.Logger) error {
 		errCh <- httpServer.Serve(ctx, log)
 	}()
 	svc.Start(ctx)
-	go runScalerRegistryLinks(ctx, regClient, svc, log)
-	go runScalerMemberMeta(ctx, scalerGroup, svc, regClient, cfg.Scaler.Advertise, log)
-	go svc.RegisterLoop(ctx, cfg.Scaler.ID, cfg.Scaler.Advertise, cfg.Scaler.MemberlistLabel)
-	log.Info("cluster-ctl scaler", "registry", registryAddr, "registry_members", len(links), "registry_tls", registryTLS != nil,
+	go runPlacerRegistryLinks(ctx, regClient, svc, log)
+	go runPlacerMemberMeta(ctx, placerGroup, svc, regClient, cfg.Placer.Advertise, log)
+	go svc.RegisterLoop(ctx, cfg.Placer.ID, cfg.Placer.Advertise, cfg.Placer.MemberlistLabel)
+	log.Info("cluster-ctl placer", "registry", registryAddr, "registry_members", len(links), "registry_tls", registryTLS != nil,
 		"group_sources", len(cfg.ImportGroups), "candidates", cfg.Placement.Candidates, "zone_admit_max", cfg.Placement.ZoneAdmitMax,
 		"shuffle_rules", len(cfg.Placement.ShuffleSharding))
 	select {
@@ -135,25 +135,25 @@ func runScaler(args []string, log *slog.Logger) error {
 	}
 }
 
-func runScalerMemberMeta(ctx context.Context, group *membergroup.Group, svc *scaler.Service, regClient *clusterclient.Registry, advertise string, log *slog.Logger) {
+func runPlacerMemberMeta(ctx context.Context, group *membergroup.Group, svc *placer.Service, regClient *clusterclient.Registry, advertise string, log *slog.Logger) {
 	t := time.NewTicker(time.Second)
 	defer t.Stop()
 	update := func() {
 		label := ""
 		ready := false
 		if err := regClient.Refresh(ctx); err != nil {
-			log.Warn("scaler: memberlist ready label", "err", err)
+			log.Warn("placer: memberlist ready label", "err", err)
 		} else if got, err := regClient.ActiveLabel(ctx); err != nil {
-			log.Warn("scaler: memberlist active label", "err", err)
+			log.Warn("placer: memberlist active label", "err", err)
 		} else {
 			label = got
 			ready = svc.ReadyForLabel(label)
 		}
 		if err := group.UpdateMeta(membergroup.Meta{
-			Role: membergroup.RoleScaler, ID: group.Name(), Advertise: advertise,
+			Role: membergroup.RolePlacer, ID: group.Name(), Advertise: advertise,
 			Ready: ready, ReadyLabel: label,
 		}); err != nil {
-			log.Debug("scaler: memberlist meta update", "err", err)
+			log.Debug("placer: memberlist meta update", "err", err)
 		}
 	}
 	update()
@@ -167,27 +167,27 @@ func runScalerMemberMeta(ctx context.Context, group *membergroup.Group, svc *sca
 	}
 }
 
-func runScalerRegistryLinks(ctx context.Context, regClient *clusterclient.Registry, svc *scaler.Service, log *slog.Logger) {
+func runPlacerRegistryLinks(ctx context.Context, regClient *clusterclient.Registry, svc *placer.Service, log *slog.Logger) {
 	t := time.NewTicker(5 * time.Second)
 	defer t.Stop()
 	refresh := func() {
 		if err := regClient.Refresh(ctx); err != nil {
-			log.Warn("scaler: membership refresh", "err", err)
+			log.Warn("placer: membership refresh", "err", err)
 			return
 		}
 		eps, err := regClient.OwnerEndpoints(ctx)
 		if err != nil {
-			log.Warn("scaler: owner endpoints", "err", err)
+			log.Warn("placer: owner endpoints", "err", err)
 			return
 		}
 		nodeListEps, err := regClient.NodeListEndpoints(ctx)
 		if err != nil {
-			log.Warn("scaler: node_list endpoints", "err", err)
+			log.Warn("placer: node_list endpoints", "err", err)
 			return
 		}
 		label, err := regClient.ActiveLabel(ctx)
 		if err != nil {
-			log.Warn("scaler: active label", "err", err)
+			log.Warn("placer: active label", "err", err)
 			return
 		}
 		svc.SetRegistryLinks(ctx, registryLinks(eps))
@@ -204,9 +204,9 @@ func runScalerRegistryLinks(ctx context.Context, regClient *clusterclient.Regist
 	}
 }
 
-func newScaleLinkResolver(regClient *clusterclient.Registry) func(context.Context, string) ([]scaler.RegistryLink, error) {
-	return func(ctx context.Context, recordKey string) ([]scaler.RegistryLink, error) {
-		eps, err := regClient.ScaleLinkEndpoints(ctx, recordKey)
+func newPlacerLinkResolver(regClient *clusterclient.Registry) func(context.Context, string) ([]placer.RegistryLink, error) {
+	return func(ctx context.Context, recordKey string) ([]placer.RegistryLink, error) {
+		eps, err := regClient.PlacerLinkEndpoints(ctx, recordKey)
 		if err != nil {
 			return nil, err
 		}
@@ -214,10 +214,10 @@ func newScaleLinkResolver(regClient *clusterclient.Registry) func(context.Contex
 	}
 }
 
-func registryLinks(eps []clusterclient.Endpoint) []scaler.RegistryLink {
-	links := make([]scaler.RegistryLink, 0, len(eps))
+func registryLinks(eps []clusterclient.Endpoint) []placer.RegistryLink {
+	links := make([]placer.RegistryLink, 0, len(eps))
 	for _, ep := range eps {
-		links = append(links, scaler.RegistryLink{Name: ep.MemberID, BaseURL: ep.BaseURL, Client: ep.Client})
+		links = append(links, placer.RegistryLink{Name: ep.MemberID, BaseURL: ep.BaseURL, Client: ep.Client})
 	}
 	return links
 }

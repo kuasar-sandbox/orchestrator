@@ -8,8 +8,8 @@ import (
 	"strings"
 	"sync"
 
-	clusterstate "github.com/kuasar-sandbox/sandbox-orchestrator/internal/cluster"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/routesync"
+	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
+	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 )
 
 const NodeLinkRelayPath = "/internal/node-link/relay"

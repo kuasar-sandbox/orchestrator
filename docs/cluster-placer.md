@@ -1,6 +1,6 @@
-# cluster-scaler — group 导入、WATCH_LIST 与放置
+# cluster-placer — group 导入、WATCH_LIST 与放置
 
-`cluster-ctl scaler` 是独立放置调度器。它不持 node 连接,不拥有 sandbox 生命周期,也不实现 registry
+`cluster-ctl placer` 是独立放置调度器。它不持 node 连接,不拥有 sandbox 生命周期,也不实现 registry
 状态复制。它通过 `SandboxGroupProvider` / `SandboxGroupImporter` 获取 group 配置与密钥材料,消费
 registry 的 `node_list` WATCH_LIST,并向 registry 提供 `PlaceSandbox` / `PlaceBuild` / `verify-key`。
 
@@ -12,7 +12,7 @@ registry 的 `node_list` WATCH_LIST,并向 registry 提供 `PlaceSandbox` / `Pla
 SandboxGroupProvider / Importer
           │
           ▼
-      scaler
+      placer
           │  selector patch / Place / verify-key
           ▼
       registry
@@ -21,7 +21,7 @@ SandboxGroupProvider / Importer
         node
 ```
 
-scaler 负责:
+placer 负责:
 
 - group provider/importer 接入。
 - `node_list` WATCH_LIST 消费。
@@ -30,7 +30,7 @@ scaler 负责:
 - `PlaceSandbox` / `PlaceBuild` 建议。
 - API key verify 的 provider 侧校验。
 
-scaler 不负责:
+placer 不负责:
 
 - 连接 node。
 - 下发 `key_put` / create / delete / build 命令。
@@ -39,30 +39,30 @@ scaler 不负责:
 
 ### 1.2 原则
 
-1. **registry 不实现 group provider**:Provider/Importer 属于 scaler 或外部平台。
-2. **WATCH_LIST 仅给 scaler**:router 不消费 node_list。
+1. **registry 不实现 group provider**:Provider/Importer 属于 placer 或外部平台。
+2. **WATCH_LIST 仅给 placer**:router 不消费 node_list。
 3. **高频负载不走 WATCH_LIST**:WATCH_LIST 只承载低频目录字段;最终资源确认由 node owner admission 完成。
-4. **source_id 是 import 执行单元**:多个 scaler 配置相同 `source_id` 时,竞争同一条 source lease。
+4. **source_id 是 import 执行单元**:多个 placer 配置相同 `source_id` 时,竞争同一条 source lease。
 5. **shuffle 只影响新建**:不迁移正在运行的 sandbox。
 6. **key 分发只影响 create/build 前置条件**:key drop 或租约过期不影响已经运行的 sandbox。
 
 ## 2. 命令行
 
 ```text
-cluster-ctl scaler --config /etc/cluster-ctl/scaler.yaml
+cluster-ctl placer --config /etc/cluster-ctl/placer.yaml
 ```
 
-standalone scaler 必须配置至少一个 `import_groups` source。嵌入式或生产集成可以直接注入自定义
+standalone placer 必须配置至少一个 `import_groups` source。嵌入式或生产集成可以直接注入自定义
 `SandboxGroupProvider` / `SandboxGroupImporter`。
 
 ## 3. 配置
 
 ```yaml
-scaler:
-  id: scaler-1
+placer:
+  id: placer-1
   listen: ":7800"
-  advertise: "https://scaler-1.example:7800"
-  memberlist_label: scaler.default
+  advertise: "https://placer-1.example:7800"
+  memberlist_label: placer.default
 
 registry:
   bootstrap: registry-1.example:7700
@@ -88,25 +88,25 @@ placement:
 | 字段 | 说明 |
 |---|---|
 | `registry.bootstrap` | registry bootstrap endpoint,用于拉取 membership |
-| `scaler.id` | scaler 实例 id |
-| `scaler.listen` | scaler HTTP API 监听 |
-| `scaler.advertise` | registry 调用 scaler 的地址,同时作为 scaler memberlist HTTP transport 地址 |
-| `scaler.memberlist_label` | scaler memberlist label,默认 `scaler.default` |
-| `import_groups[]` | standalone scaler 的 group source;内置 `source_type=file` |
-| `placement.candidates` | scaler 内部 P2C 候选数量 |
+| `placer.id` | placer 实例 id |
+| `placer.listen` | placer HTTP API 监听 |
+| `placer.advertise` | registry 调用 placer 的地址,同时作为 placer memberlist HTTP transport 地址 |
+| `placer.memberlist_label` | placer memberlist label,默认 `placer.default` |
+| `import_groups[]` | standalone placer 的 group source;内置 `source_type=file` |
+| `placement.candidates` | placer 内部 P2C 候选数量 |
 | `placement.zone_admit_max` | 可放置最高水位 |
 | `placement.node_dead_after` | 排除静默过久 node 的窗口 |
-| `placement.import_source_owner_count` | 每个 source 可参与 lease 竞争的 scaler 候选数 |
+| `placement.import_source_owner_count` | 每个 source 可参与 lease 竞争的 placer 候选数 |
 | `placement.import_source_lease_ttl` | registry 侧 source lease TTL |
 | `placement.selector_patch_refresh_interval` | unchanged selector patch 刷新周期 |
 | `placement.shuffle_sharding` | shuffle-sharding 规则 |
 
-registry 侧 `scale_link.scaler_label` 指定 scaler memberlist 域;`scale_link.scaler_replica_count` 指定 registry
-对一个 group 调 scaler 的 failover 候选数。它不是 registry 内部 `scale_link` namespace 的 owner count。
+registry 侧 `placer_link.placer_label` 指定 placer memberlist 域;`placer_link.placer_replica_count` 指定 registry
+对一个 group 调 placer 的 failover 候选数。它不是 registry 内部 `placer_link` namespace 的 owner count。
 
 ## 4. Provider / Importer
 
-scaler 使用统一接口:
+placer 使用统一接口:
 
 ```text
 SandboxGroupProvider:
@@ -159,37 +159,37 @@ registry node owners
 node_list owner set
   │ reset + delta + bookmark
   ▼
-scaler local node view
+placer local node view
 ```
 
 WATCH_LIST 语义:
 
-1. scaler 按 active membership 得到 node_list owner 候选,任一时刻只消费其中一个 owner 的完整 WATCH_LIST。
+1. placer 按 active membership 得到 node_list owner 候选,任一时刻只消费其中一个 owner 的完整 WATCH_LIST。
 2. 首帧为 reset,随后 delta,bookmark 标记初始视图完整。
 3. watch token 编入 registry 本地 epoch、node_list shard view label 和 Rev。
-4. epoch/label 不匹配或 changelog 已压缩时,scaler 全量重订。
+4. epoch/label 不匹配或 changelog 已压缩时,placer 全量重订。
 5. 普通 heartbeat 不触发 WATCH_LIST;draining 变化和粗粒度 liveness refresh 触发 node_list 更新。
 
-node_list owner 分片内全复制。scaler 不需要也不能把多个 node_list owner 的结果合并。当前 owner 断线时,
-scaler 清空该源视图并 failover 到另一个候选 owner,重新 reset + bookmark。完成 bookmark 前 scaler
+node_list owner 分片内全复制。placer 不需要也不能把多个 node_list owner 的结果合并。当前 owner 断线时,
+placer 清空该源视图并 failover 到另一个候选 owner,重新 reset + bookmark。完成 bookmark 前 placer
 不应声明 ready。
 
-## 6. scaler memberlist 域
+## 6. placer memberlist 域
 
-scaler 启动后加入 `scaler.memberlist_label` 指定的 scaler memberlist,并周期性向 active / next registry
+placer 启动后加入 `placer.memberlist_label` 指定的 placer memberlist,并周期性向 active / next registry
 成员注册 seed:
 
 ```json
-{"id":"s1","advertise":"https://s1:7800","memberlist_label":"scaler.default"}
+{"id":"s1","advertise":"https://s1:7800","memberlist_label":"placer.default"}
 ```
 
 ```text
-scaler S1 ── register seed ──► registry A
+placer S1 ── register seed ──► registry A
     │                            │
-    └──── scaler.default memberlist ◄──── registry observer
+    └──── placer.default memberlist ◄──── registry observer
 ```
 
-scaler ready 条件:
+placer ready 条件:
 
 - 已拉取当前 registry membership。
 - 一个 active node_list WATCH_LIST 已完成 reset/bookmark。
@@ -197,13 +197,13 @@ scaler ready 条件:
 group import 不构成全局 ready 门槛。每个 Place 只解析请求中的 group;该 group 未命中时返回 NoNode /
 不可用,不阻塞其他 group。
 
-registry 只根据 memberlist meta 选择 ready scaler:
+registry 只根据 memberlist meta 选择 ready placer:
 
 ```json
-{"role":"scaler","id":"s1","advertise":"https://s1:7800","ready":true,"ready_label":"registry.2.hash"}
+{"role":"placer","id":"s1","advertise":"https://s1:7800","ready":true,"ready_label":"registry.2.hash"}
 ```
 
-`scale_link/register` 不是 ready 状态源,也不是 scaler 目录存储。
+`placer_link/register` 不是 ready 状态源,也不是 placer 目录存储。
 
 ## 7. Import Reconcile
 
@@ -212,17 +212,17 @@ registry 只根据 memberlist meta 选择 ready scaler:
 每个 source 独立执行:
 
 ```text
-readyScalers = scaler memberlist nodes where ready_label == active_registry_label
-sourceOwners = LocateN(source_id, readyScalers, import_source_owner_count)
+readyPlacers = placer memberlist nodes where ready_label == active_registry_label
+sourceOwners = LocateN(source_id, readyPlacers, import_source_owner_count)
 
 sourceOwners race:
-  POST /scale-link/import-source-lease
+  POST /placer-link/import-source-lease
 ```
 
 source lease 存在 registry shardkv:
 
 ```text
-namespace = scale_link
+namespace = placer_link
 shardKey  = import/source/<source_id>
 recordSet = import
 recordKey = state
@@ -260,23 +260,23 @@ owner 从上次成功 cursor 继续或重放同一页。
 
 ### 7.3 selector patch refresh
 
-scaler 按 `placement.selector_patch_refresh_interval` 续推 unchanged selector patch,用于维持 node_link
+placer 按 `placement.selector_patch_refresh_interval` 续推 unchanged selector patch,用于维持 node_link
 manifest key cache。group 从 provider 消失时不主动删除 node_link key cache;TTL 到期后自动淘汰。
 
 ## 8. Placement
 
-### 8.1 Registry 选择 scaler
+### 8.1 Registry 选择 placer
 
 registry 对 group 只做确定性 failover:
 
 ```text
-readyScalers = scaler memberlist nodes where role=scaler and alive and ready=true
+readyPlacers = placer memberlist nodes where role=placer and alive and ready=true
                and ready_label == active_registry_label
-candidates   = LocateN(group, readyScalers, scale_link.scaler_replica_count)
+candidates   = LocateN(group, readyPlacers, placer_link.placer_replica_count)
 try candidates in order until success
 ```
 
-registry 不对 scaler 做 P2C。P2C 只用于 scaler 内部从 node 候选中选择放置目标。
+registry 不对 placer 做 P2C。P2C 只用于 placer 内部从 node 候选中选择放置目标。
 
 ### 8.2 PlaceSandbox
 
@@ -307,7 +307,7 @@ P2C over candidates
 return node_id + create_spec + key intent + access_token + runtime/template hints
 ```
 
-若 node owner admission 或 create 后续拒绝,route owner 可换下一个 scaler 或重新 Place。
+若 node owner admission 或 create 后续拒绝,route owner 可换下一个 placer 或重新 Place。
 
 ### 8.3 PlaceBuild
 
@@ -319,14 +319,14 @@ group, build_id, template_id, resources
 
 Build placement 与 sandbox 类似,但候选需要 build headroom。最终预算权威在 node owner:
 
-1. scaler 返回建议 node。
+1. placer 返回建议 node。
 2. route owner 调 node owner `AdmitBuild(build_id, resources, ttl)`。
 3. node owner 若余量不足直接拒绝。
 4. route owner 重调度。
 
 ## 9. Key Distribution
 
-scaler 主管 selector patch 和 manifest key cache refresh:
+placer 主管 selector patch 和 manifest key cache refresh:
 
 1. 获取 group 的 typed `manifest_key` 和 `auth_key`。
 2. 根据 placement selectors 和 shuffle 结果得到目标 node set。
@@ -342,8 +342,8 @@ scaler 主管 selector patch 和 manifest key cache refresh:
 
 | 事件 | 行为 |
 |---|---|
-| scaler 崩溃 | registry failover 到同 group 的下一个 ready scaler;热路径不受影响 |
-| WATCH_LIST 断线 | scaler 清空 node_list 视图并 failover 到另一个 owner 全量重订;完成 bookmark 前 not-ready |
+| placer 崩溃 | registry failover 到同 group 的下一个 ready placer;热路径不受影响 |
+| WATCH_LIST 断线 | placer 清空 node_list 视图并 failover 到另一个 owner 全量重订;完成 bookmark 前 not-ready |
 | provider 不可用 | 受影响 group 的 Place/verify-key 返回不可用 |
 | node labels 旧 | node owner admission/create 兜底拒绝 |
 | source owner 崩溃 | source lease 到期后其他候选从已提交 cursor 接管;旧 owner patch/cursor 被 fencing 拒绝 |
@@ -353,13 +353,13 @@ scaler 主管 selector patch 和 manifest key cache refresh:
 ## 11. 性能
 
 - WATCH_LIST 只传低频字段,避免高频水位扇出。
-- Place QPS 通过 ready scaler 集合按 group `LocateN` 分散。
-- scaler 内部只对 P2C 候选做实时比较。
+- Place QPS 通过 ready placer 集合按 group `LocateN` 分散。
+- placer 内部只对 P2C 候选做实时比较。
 - import/source 独立分页,不同 source 之间不做全量合并。
 - selector patch 是慢路径,可限速;unchanged patch 只用于刷新 TTL。
 
 ## 12. See Also
 
-- [cluster.md](cluster.md) — registry membership、shardkv、node_link、route_link、scale_link 总设计。
+- [cluster.md](cluster.md) — registry membership、shardkv、node_link、route_link、placer_link 总设计。
 - [cluster-router.md](cluster-router.md) — router Reserve 消费、active connection cache 和数据面转发。
 - [node.md](node.md) — node-link 节点侧注册、心跳、命令执行和 key TTL。

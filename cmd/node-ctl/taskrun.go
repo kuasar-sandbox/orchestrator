@@ -15,7 +15,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/configsock"
+	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 )
 
 // launchTask locks+writes the pidfile, fetches the LaunchSpec for configID

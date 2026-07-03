@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/secretbox"
+	"github.com/kuasar-sandbox/orchestrator/internal/secretbox"
 )
 
 func testStore(t *testing.T) *Store {

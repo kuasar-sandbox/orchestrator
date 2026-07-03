@@ -1,4 +1,4 @@
-package scaler
+package placer
 
 import (
 	"bytes"
@@ -21,24 +21,24 @@ import (
 	"sync"
 	"time"
 
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/maglev"
-	clusterstate "github.com/kuasar-sandbox/sandbox-orchestrator/internal/cluster"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/clustercfg"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/registry"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/routesync"
+	"github.com/kuasar-sandbox/accelerator/pkg/maglev"
+	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
+	"github.com/kuasar-sandbox/orchestrator/internal/clustercfg"
+	"github.com/kuasar-sandbox/orchestrator/internal/registry"
+	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 )
 
-const scalerRegisterInterval = 15 * time.Second
+const placerRegisterInterval = 15 * time.Second
 
 var (
-	scalerRegisterRetryInterval = time.Second
-	scalerReadyPollInterval     = time.Second
+	placerRegisterRetryInterval = time.Second
+	placerReadyPollInterval     = time.Second
 	scaleLinkRetryDelay         = 200 * time.Millisecond
 )
 
 const scaleLinkFailureRetries = 2
 
-// Service is the standalone scaler placement engine. It keeps node_list/group
+// Service is the standalone placer placement engine. It keeps node_list/group
 // views synced, computes placement over the local view, and returns suggestions
 // that the registry commits through route/node owner state.
 type Service struct {
@@ -74,7 +74,7 @@ type RegistryLink struct {
 	Client  *http.Client
 }
 
-// NewRemote builds a standalone scaler connected to registry control paths. The
+// NewRemote builds a standalone placer connected to registry control paths. The
 // address may be a UDS path, host:port, or http(s) URL.
 func NewRemote(scaleAddr string, scaleTLS *tls.Config, cfg clustercfg.PlacementConfig, deadAfter int64, log *slog.Logger) *Service {
 	return NewRemoteLinks([]RegistryLink{registryLinkFromAddress("registry", scaleAddr, scaleTLS)}, cfg, deadAfter, log)
@@ -157,7 +157,7 @@ func registryLinkFromAddress(name, scaleAddr string, scaleTLS *tls.Config) Regis
 			return link
 		}
 	case strings.HasPrefix(scaleAddr, "/"):
-		link.BaseURL = "http://scale-link"
+		link.BaseURL = "http://placer-link"
 		dial := func(ctx context.Context, _, _ string) (net.Conn, error) {
 			return (&net.Dialer{}).DialContext(ctx, "unix", scaleAddr)
 		}
@@ -211,7 +211,7 @@ func minReadyLinks(n int) int {
 }
 
 // Start launches the node_list watch loop and selector patch reconcile.
-// sandbox-group data is imported into the scaler/provider side, not watched from
+// sandbox-group data is imported into the placer/provider side, not watched from
 // registry. node_list is low-frequency catalog data; hot load/budget is validated
 // by registry/node owner on the cold placement path.
 func (s *Service) Start(ctx context.Context) {
@@ -271,13 +271,13 @@ func (s *Service) SetImportSourceOwnerSource(ownerID string, peerSource func() [
 	s.sourceMu.Unlock()
 }
 
-func (s *Service) SetScaleLinkResolver(resolver func(context.Context, string) ([]RegistryLink, error)) {
+func (s *Service) SetPlacerLinkResolver(resolver func(context.Context, string) ([]RegistryLink, error)) {
 	s.linksMu.Lock()
 	s.scaleLinkResolver = resolver
 	s.linksMu.Unlock()
 }
 
-func (s *Service) SetScaleLinkRefresher(refresher func(context.Context) error) {
+func (s *Service) SetPlacerLinkRefresher(refresher func(context.Context) error) {
 	s.linksMu.Lock()
 	s.scaleLinkRefresher = refresher
 	s.linksMu.Unlock()
@@ -310,9 +310,9 @@ func (s *Service) startWatchLinkLocked(ctx context.Context) {
 	go s.watchNodeList(wctx)
 }
 
-func (s *Service) ServeScaleLink(mux *http.ServeMux) {
-	mux.HandleFunc(registry.ScaleLinkPlacePath, s.servePlace)
-	mux.HandleFunc(registry.ScaleLinkVerifyKeyPath, s.serveVerifyKey)
+func (s *Service) ServePlacerLink(mux *http.ServeMux) {
+	mux.HandleFunc(registry.PlacerLinkPlacePath, s.servePlace)
+	mux.HandleFunc(registry.PlacerLinkVerifyKeyPath, s.serveVerifyKey)
 }
 
 func (s *Service) servePlace(w http.ResponseWriter, req *http.Request) {
@@ -357,23 +357,23 @@ func (s *Service) serveVerifyKey(w http.ResponseWriter, req *http.Request) {
 
 func (s *Service) RegisterLoop(ctx context.Context, id, advertise, memberlistLabel string) {
 	if id == "" || advertise == "" {
-		s.log.Warn("scaler: registration disabled; member id/advertise missing")
+		s.log.Warn("placer: registration disabled; member id/advertise missing")
 		return
 	}
 	for {
 		ok := true
 		for _, link := range s.RegistryLinks() {
-			if err := s.postJSON(ctx, link, registry.ScaleLinkRegisterPath, registry.ScalerRegister{
+			if err := s.postJSON(ctx, link, registry.PlacerLinkRegisterPath, registry.PlacerRegister{
 				ID: id, Advertise: advertise,
 				MemberlistLabel: memberlistLabel,
 			}); err != nil {
 				ok = false
-				s.log.Warn("scaler: register", "registry", link.Name, "err", err)
+				s.log.Warn("placer: register", "registry", link.Name, "err", err)
 			}
 		}
-		wait := scalerRegisterInterval
+		wait := placerRegisterInterval
 		if !ok {
-			wait = scalerRegisterRetryInterval
+			wait = placerRegisterRetryInterval
 		}
 		select {
 		case <-ctx.Done():
@@ -510,14 +510,14 @@ type importLeaseToken struct {
 }
 
 // reconcileSelectorPatches computes each imported group's shuffle-effective
-// selectors and manifest-key node set, then pushes them through scale_link. Only
+// selectors and manifest-key node set, then pushes them through placer_link. Only
 // the source lease winner runs Range for a source_id; unchanged patches are
 // refreshed so node_link manifest-key TTLs stay live.
 func (s *Service) reconcileSelectorPatches(ctx context.Context) {
 	last := map[string]selectorPatchState{} // group -> derived key + owner-set signature + last successful push
 	t := time.NewTicker(s.reconcileInterval())
 	defer t.Stop()
-	readyPoll := time.NewTicker(scalerReadyPollInterval)
+	readyPoll := time.NewTicker(placerReadyPollInterval)
 	defer readyPoll.Stop()
 	wasReady := false
 	reconcileIfReady := func() {
@@ -578,10 +578,10 @@ func (s *Service) reconcileImportSource(ctx context.Context, source ImportSource
 	for {
 		lease, ok, err := s.acquireImportSourceLeaseToken(ctx, source.SourceID)
 		if err != nil {
-			if s.retryScaleLinkFailure(ctx, source.SourceID, err, &retries) {
+			if s.retryPlacerLinkFailure(ctx, source.SourceID, err, &retries) {
 				continue
 			}
-			s.log.Warn("scaler: import source lease", "source", source.SourceID, "err", err)
+			s.log.Warn("placer: import source lease", "source", source.SourceID, "err", err)
 			return
 		}
 		if !ok {
@@ -589,27 +589,27 @@ func (s *Service) reconcileImportSource(ctx context.Context, source ImportSource
 		}
 		page, err := source.Importer.Range(ctx, lease.lease.Cursor, defaultGroupPageLimit)
 		if err != nil {
-			s.log.Warn("scaler: group import", "source", source.SourceID, "cursor", lease.lease.Cursor, "err", err)
+			s.log.Warn("placer: group import", "source", source.SourceID, "cursor", lease.lease.Cursor, "err", err)
 			return
 		}
 		groups, err := s.selectorPatchGroupsForImportPage(ctx, page.Groups)
 		if err != nil {
-			s.log.Warn("scaler: group import", "source", source.SourceID, "err", err)
+			s.log.Warn("placer: group import", "source", source.SourceID, "err", err)
 			return
 		}
 		if err := s.pushSelectorPatches(ctx, source.SourceID, nodes, groups, lease, last); err != nil {
-			if s.retryScaleLinkFailure(ctx, source.SourceID, err, &retries) {
+			if s.retryPlacerLinkFailure(ctx, source.SourceID, err, &retries) {
 				continue
 			}
-			s.log.Warn("scaler: selector patch", "source", source.SourceID, "err", err)
+			s.log.Warn("placer: selector patch", "source", source.SourceID, "err", err)
 			return
 		}
 		complete := page.NextCursor == ""
 		if err := s.checkpointImportSource(ctx, source.SourceID, lease, page.NextCursor, complete, ""); err != nil {
-			if s.retryScaleLinkFailure(ctx, source.SourceID, err, &retries) {
+			if s.retryPlacerLinkFailure(ctx, source.SourceID, err, &retries) {
 				continue
 			}
-			s.log.Warn("scaler: source cursor", "source", source.SourceID, "cursor", page.NextCursor, "err", err)
+			s.log.Warn("placer: source cursor", "source", source.SourceID, "cursor", page.NextCursor, "err", err)
 			return
 		}
 		retries = 0
@@ -619,7 +619,7 @@ func (s *Service) reconcileImportSource(ctx context.Context, source ImportSource
 	}
 }
 
-func (s *Service) retryScaleLinkFailure(ctx context.Context, sourceID string, err error, attempts *int) bool {
+func (s *Service) retryPlacerLinkFailure(ctx context.Context, sourceID string, err error, attempts *int) bool {
 	if attempts == nil || *attempts >= scaleLinkFailureRetries {
 		return false
 	}
@@ -631,9 +631,9 @@ func (s *Service) retryScaleLinkFailure(ctx context.Context, sourceID string, er
 	}
 	*attempts++
 	if refreshErr := refresher(ctx); refreshErr != nil {
-		s.log.Warn("scaler: refresh registry membership after scale_link failure", "source", sourceID, "err", refreshErr, "cause", err)
+		s.log.Warn("placer: refresh registry membership after placer_link failure", "source", sourceID, "err", refreshErr, "cause", err)
 	} else {
-		s.log.Warn("scaler: retry scale_link operation after membership refresh", "source", sourceID, "attempt", *attempts, "err", err)
+		s.log.Warn("placer: retry placer_link operation after membership refresh", "source", sourceID, "attempt", *attempts, "err", err)
 	}
 	timer := time.NewTimer(scaleLinkRetryDelay)
 	defer timer.Stop()
@@ -723,13 +723,13 @@ func (s *Service) acquireImportSourceLeaseToken(ctx context.Context, sourceID st
 	if self == "" {
 		self = "local"
 	}
-	links := s.scaleLinkLinks(ctx, string(clusterstate.ScaleImportSourceShard(sourceID)))
+	links := s.scaleLinkLinks(ctx, string(clusterstate.PlacerImportSourceShard(sourceID)))
 	var lastErr error
 	for _, link := range links {
 		resp, err := s.acquireImportSourceLease(ctx, link, sourceID, self)
 		if err != nil {
 			lastErr = err
-			s.log.Warn("scaler: import source lease", "registry", link.Name, "source", sourceID, "err", err)
+			s.log.Warn("placer: import source lease", "registry", link.Name, "source", sourceID, "err", err)
 			continue
 		}
 		if !resp.Acquired {
@@ -754,7 +754,7 @@ func (s *Service) acquireImportSourceLease(ctx context.Context, link RegistryLin
 	}
 	reqCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, link.BaseURL+registry.ScaleLinkImportSourcePath, &body)
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, link.BaseURL+registry.PlacerLinkImportSourcePath, &body)
 	if err != nil {
 		return registry.ImportSourceLeaseResponse{}, err
 	}
@@ -780,12 +780,12 @@ func (s *Service) checkpointImportSource(ctx context.Context, sourceID string, l
 		SourceID: sourceID, OwnerID: lease.lease.OwnerID, RunID: lease.lease.RunID, Term: lease.lease.Term,
 		Cursor: cursor, Complete: complete, Error: lastErr,
 	}
-	links := s.scaleLinkLinks(ctx, string(clusterstate.ScaleImportSourceShard(sourceID)))
+	links := s.scaleLinkLinks(ctx, string(clusterstate.PlacerImportSourceShard(sourceID)))
 	var lastPostErr error
 	for _, link := range links {
-		if err := s.postJSON(ctx, link, registry.ScaleLinkSourceCursorPath, reqBody); err != nil {
+		if err := s.postJSON(ctx, link, registry.PlacerLinkSourceCursorPath, reqBody); err != nil {
 			lastPostErr = err
-			s.log.Warn("scaler: source cursor", "registry", link.Name, "source", sourceID, "err", err)
+			s.log.Warn("placer: source cursor", "registry", link.Name, "source", sourceID, "err", err)
 			continue
 		}
 		return nil
@@ -793,7 +793,7 @@ func (s *Service) checkpointImportSource(ctx context.Context, sourceID string, l
 	if lastPostErr != nil {
 		return lastPostErr
 	}
-	return fmt.Errorf("scaler: no registry link for source %s cursor checkpoint", sourceID)
+	return fmt.Errorf("placer: no registry link for source %s cursor checkpoint", sourceID)
 }
 
 func (s *Service) pushSelectorPatches(ctx context.Context, sourceID string, nodes []*registry.NodeRecord, groups []selectorPatchGroup, lease importLeaseToken, last map[string]selectorPatchState) error {
@@ -802,11 +802,11 @@ func (s *Service) pushSelectorPatches(ctx context.Context, sourceID string, node
 		selectors, nodeIDs := selectorPatchTargets(g.group, nodes, g.hint.NodeSelectors, s.cfg.ShuffleSharding)
 		fp, keyType, keyValue, keyRef, err := manifestKeyPatch(g.group, g.manifestKey)
 		if err != nil {
-			s.log.Warn("scaler: manifest key", "group", g.group, "err", err)
+			s.log.Warn("placer: manifest key", "group", g.group, "err", err)
 			nodeIDs = nil
 			fp, keyType, keyValue, keyRef = "", "", "", ""
 		}
-		links := s.scaleLinkLinks(ctx, string(clusterstate.ScaleImportSourceShard(sourceID)))
+		links := s.scaleLinkLinks(ctx, string(clusterstate.PlacerImportSourceShard(sourceID)))
 		linkSig := registryLinkSignature(links)
 		key := selectorPatchSignature(selectors, nodeIDs, fp, keyType, keyValue, keyRef, linkSig)
 		state := last[g.group]
@@ -820,8 +820,8 @@ func (s *Service) pushSelectorPatches(ctx context.Context, sourceID string, node
 		}
 		pushed := false
 		for _, link := range links {
-			if err := s.postJSON(ctx, link, registry.ScaleLinkSelectorPatchPath, patch); err != nil {
-				s.log.Warn("scaler: selector patch", "registry", link.Name, "source", sourceID, "group", g.group, "err", err)
+			if err := s.postJSON(ctx, link, registry.PlacerLinkSelectorPatchPath, patch); err != nil {
+				s.log.Warn("placer: selector patch", "registry", link.Name, "source", sourceID, "group", g.group, "err", err)
 				continue
 			}
 			last[g.group] = selectorPatchState{key: key, sentAt: now}
@@ -829,7 +829,7 @@ func (s *Service) pushSelectorPatches(ctx context.Context, sourceID string, node
 			break
 		}
 		if !pushed {
-			return fmt.Errorf("scaler: selector patch failed for source %s group %s", sourceID, g.group)
+			return fmt.Errorf("placer: selector patch failed for source %s group %s", sourceID, g.group)
 		}
 	}
 	return nil
@@ -845,7 +845,7 @@ func (s *Service) scaleLinkLinks(ctx context.Context, recordKey string) []Regist
 	}
 	links, err := resolver(ctx, recordKey)
 	if err != nil {
-		s.log.Warn("scaler: scale_link owner links", "key", recordKey, "err", err)
+		s.log.Warn("placer: placer_link owner links", "key", recordKey, "err", err)
 		return fallback
 	}
 	links = normalizeRegistryLinks(links)
@@ -965,12 +965,12 @@ func (s *Service) watchNodeList(ctx context.Context) {
 			s.nodes.removeSource("node_list")
 		}
 		sink := s.nodes.sourceWithNotifyLabel("node_list", label, s.notifyNodeListChanged)
-		nextToken, err := s.subscribeOnce(ctx, link, registry.ScaleLinkNodeListWatchPath, token, sink)
+		nextToken, err := s.subscribeOnce(ctx, link, registry.PlacerLinkNodeListWatchPath, token, sink)
 		token = nextToken
 		if ctx.Err() != nil {
 			return
 		}
-		s.log.Warn("scaler: node_list watch ended; failing over", "registry", link.Name, "err", err)
+		s.log.Warn("placer: node_list watch ended; failing over", "registry", link.Name, "err", err)
 		select {
 		case <-ctx.Done():
 			return
@@ -986,7 +986,7 @@ func (s *Service) notifyNodeListChanged() {
 	}
 }
 
-// subscribe keeps a view synced from registry scale_link, reconnecting with
+// subscribe keeps a view synced from registry placer_link, reconnecting with
 // capped backoff and resuming from the last applied rev (mirrors the router).
 func (s *Service) subscribe(ctx context.Context, link RegistryLink, path string, sink viewSink) {
 	backoff := 200 * time.Millisecond
@@ -997,7 +997,7 @@ func (s *Service) subscribe(ctx context.Context, link RegistryLink, path string,
 		if ctx.Err() != nil {
 			return
 		}
-		s.log.Warn("scaler: view watch ended; reconnecting", "registry", link.Name, "path", path, "err", err)
+		s.log.Warn("placer: view watch ended; reconnecting", "registry", link.Name, "path", path, "err", err)
 		select {
 		case <-ctx.Done():
 			return

@@ -30,7 +30,7 @@ func TestLoadRegistryPartialAppliesDefaults(t *testing.T) {
 	if got := c.SelfNodeAdvertise(); got != defaultRegistryBootstrap {
 		t.Fatalf("self node_advertise default=%q, want %q", got, defaultRegistryBootstrap)
 	}
-	if c.Membership.Active != 1 || len(c.Membership.Versions) != 1 || c.Membership.Owners.RouteLink != 1 || c.Membership.Owners.ScaleLink != 1 {
+	if c.Membership.Active != 1 || len(c.Membership.Versions) != 1 || c.Membership.Owners.RouteLink != 1 || c.Membership.Owners.PlacerLink != 1 {
 		t.Fatalf("membership defaults not filled: %+v", c.Membership)
 	}
 	if c.Membership.ReloadReadyTimeout != "10s" {
@@ -40,15 +40,15 @@ func TestLoadRegistryPartialAppliesDefaults(t *testing.T) {
 		t.Fatalf("node_link defaults not filled: %+v", c.NodeLink)
 	}
 	if c.RouteLink.ParkTimeout != "30s" || c.NodeList.WatchRetention != 10000 ||
-		c.ScaleLink.PlaceTimeout != "2s" {
-		t.Fatalf("link defaults not filled: route=%+v node_list=%+v scale=%+v", c.RouteLink, c.NodeList, c.ScaleLink)
+		c.PlacerLink.PlaceTimeout != "2s" {
+		t.Fatalf("link defaults not filled: route=%+v node_list=%+v scale=%+v", c.RouteLink, c.NodeList, c.PlacerLink)
 	}
 }
 
-func TestLoadScalerPartialAppliesDefaults(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "scaler.yaml")
+func TestLoadPlacerPartialAppliesDefaults(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "placer.yaml")
 	os.WriteFile(path, []byte("placement:\n  candidates: 3\n"), 0o600)
-	c, err := LoadScaler(path)
+	c, err := LoadPlacer(path)
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
@@ -57,20 +57,20 @@ func TestLoadScalerPartialAppliesDefaults(t *testing.T) {
 		t.Fatalf("placement merge wrong: %+v", c.Placement)
 	}
 	if c.Registry.Bootstrap == "" {
-		t.Fatal("scaler registry.bootstrap default not filled")
+		t.Fatal("placer registry.bootstrap default not filled")
 	}
 }
 
-func TestScalerImportGroupsValidatesFileSource(t *testing.T) {
+func TestPlacerImportGroupsValidatesFileSource(t *testing.T) {
 	dir := t.TempDir()
-	path := filepath.Join(t.TempDir(), "scaler.yaml")
+	path := filepath.Join(t.TempDir(), "placer.yaml")
 	raw := []byte("import_groups:\n  - source_id: file-a\n    source_type: file\n    path: " + dir + "\n")
 	if err := os.WriteFile(path, raw, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	c, err := LoadScaler(path)
+	c, err := LoadPlacer(path)
 	if err != nil {
-		t.Fatalf("load scaler file source: %v", err)
+		t.Fatalf("load placer file source: %v", err)
 	}
 	if len(c.ImportGroups) != 1 || c.ImportGroups[0].Path != dir {
 		t.Fatalf("import_groups not loaded: %+v", c.ImportGroups)
@@ -140,7 +140,7 @@ membership:
   owners:
     route_link: 2
     node_link: 2
-    scale_link: 2
+    placer_link: 2
     node_list: 2
 `
 	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {

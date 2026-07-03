@@ -1,4 +1,4 @@
-package scaler
+package placer
 
 import (
 	"context"
@@ -18,12 +18,12 @@ import (
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
 
-	clusterstate "github.com/kuasar-sandbox/sandbox-orchestrator/internal/cluster"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/clustercfg"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/registry"
+	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
+	"github.com/kuasar-sandbox/orchestrator/internal/clustercfg"
+	"github.com/kuasar-sandbox/orchestrator/internal/registry"
 )
 
-func TestScalerDirectPlace(t *testing.T) {
+func TestPlacerDirectPlace(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	discard := slog.New(slog.NewTextHandler(io.Discard, nil))
 	stores := registry.NewStores()
@@ -31,11 +31,11 @@ func TestScalerDirectPlace(t *testing.T) {
 	stores.PutNode(ctx, &registry.NodeRecord{NodeID: "n2", Labels: map[string]string{"pool": "p"}, Counts: 0})
 
 	reg := registry.New(stores, nil, 0, discard)
-	placer := registry.NewHTTPScalePlacer(reg, 2, 2*time.Second)
+	placer := registry.NewHTTPPlacer(reg, 2, 2*time.Second)
 	reg.SetPlacer(placer)
 
 	mux := http.NewServeMux()
-	reg.ServeScaleLink(mux)
+	reg.ServePlacerLink(mux)
 	controlSrv := httptest.NewServer(h2c.NewHandler(mux, &http2.Server{}))
 	defer controlSrv.Close()
 	defer cancel()
@@ -45,12 +45,12 @@ func TestScalerDirectPlace(t *testing.T) {
 		clusterstate.SandboxGroupRecord{Group: "/x", NodeSelectors: []map[string]string{{"pool": "absent"}}},
 	)
 	svc := NewRemoteLinksWithGroups([]RegistryLink{registryLinkFromAddress("registry", strings.TrimPrefix(controlSrv.URL, "http://"), nil)}, src, testImportSources("test", src), clustercfg.PlacementConfig{Candidates: 2}, 30, discard)
-	scalerMux := http.NewServeMux()
-	svc.ServeScaleLink(scalerMux)
-	scalerSrv := httptest.NewServer(scalerMux)
-	defer scalerSrv.Close()
-	reg.SetScalerPeerSource(func(string) []registry.ScalerPeer {
-		return []registry.ScalerPeer{{ID: "s1", Advertise: scalerSrv.URL}}
+	placerMux := http.NewServeMux()
+	svc.ServePlacerLink(placerMux)
+	placerSrv := httptest.NewServer(placerMux)
+	defer placerSrv.Close()
+	reg.SetPlacerPeerSource(func(string) []registry.PlacerPeer {
+		return []registry.PlacerPeer{{ID: "s1", Advertise: placerSrv.URL}}
 	})
 	svc.Start(ctx)
 
@@ -76,7 +76,7 @@ func TestScalerDirectPlace(t *testing.T) {
 	t.Fatal("unplaceable group never returned ErrNoNode")
 }
 
-func TestScalerUsesSingleNodeListSourceAndRegistersAllRegistryMembers(t *testing.T) {
+func TestPlacerUsesSingleNodeListSourceAndRegistersAllRegistryMembers(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	discard := slog.New(slog.NewTextHandler(io.Discard, nil))
 
@@ -90,15 +90,15 @@ func TestScalerUsesSingleNodeListSourceAndRegistersAllRegistryMembers(t *testing
 		{Name: "r1", BaseURL: srv1.URL, Client: srv1.Client()},
 		{Name: "r2", BaseURL: srv2.URL, Client: srv2.Client()},
 	}, src, testImportSources("test", src), clustercfg.PlacementConfig{Candidates: 1}, 30, discard)
-	scalerMux := http.NewServeMux()
-	svc.ServeScaleLink(scalerMux)
-	scalerSrv := httptest.NewServer(scalerMux)
-	defer scalerSrv.Close()
-	reg1.SetScalerPeerSource(func(string) []registry.ScalerPeer {
-		return []registry.ScalerPeer{{ID: "s1", Advertise: scalerSrv.URL}}
+	placerMux := http.NewServeMux()
+	svc.ServePlacerLink(placerMux)
+	placerSrv := httptest.NewServer(placerMux)
+	defer placerSrv.Close()
+	reg1.SetPlacerPeerSource(func(string) []registry.PlacerPeer {
+		return []registry.PlacerPeer{{ID: "s1", Advertise: placerSrv.URL}}
 	})
-	reg2.SetScalerPeerSource(func(string) []registry.ScalerPeer {
-		return []registry.ScalerPeer{{ID: "s1", Advertise: scalerSrv.URL}}
+	reg2.SetPlacerPeerSource(func(string) []registry.PlacerPeer {
+		return []registry.PlacerPeer{{ID: "s1", Advertise: placerSrv.URL}}
 	})
 	defer cancel()
 	svc.Start(ctx)
@@ -114,8 +114,8 @@ func TestScalerUsesSingleNodeListSourceAndRegistersAllRegistryMembers(t *testing
 	}
 
 	for name, placer := range map[string]registry.Placer{
-		"reg1": registry.NewHTTPScalePlacer(reg1, 1, 2*time.Second),
-		"reg2": registry.NewHTTPScalePlacer(reg2, 1, 2*time.Second),
+		"reg1": registry.NewHTTPPlacer(reg1, 1, 2*time.Second),
+		"reg2": registry.NewHTTPPlacer(reg2, 1, 2*time.Second),
 	} {
 		var placement *registry.Placement
 		var err error
@@ -202,13 +202,13 @@ func TestSubscribeOnceUsesOpaqueWatchToken(t *testing.T) {
 func TestRegisterLoopReportsMemberlistSeed(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	got := make(chan registry.ScalerRegister, 1)
+	got := make(chan registry.PlacerRegister, 1)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		if req.URL.Path != registry.ScaleLinkRegisterPath {
+		if req.URL.Path != registry.PlacerLinkRegisterPath {
 			http.NotFound(w, req)
 			return
 		}
-		var in registry.ScalerRegister
+		var in registry.PlacerRegister
 		if err := json.NewDecoder(req.Body).Decode(&in); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
@@ -223,29 +223,29 @@ func TestRegisterLoopReportsMemberlistSeed(t *testing.T) {
 
 	svc := NewRemoteLinks([]RegistryLink{{Name: "r1", BaseURL: srv.URL, Client: srv.Client()}},
 		clustercfg.PlacementConfig{Candidates: 1}, 30, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	go svc.RegisterLoop(ctx, "s1", srv.URL, "scaler.default")
+	go svc.RegisterLoop(ctx, "s1", srv.URL, "placer.default")
 
 	select {
 	case reg := <-got:
-		if reg.MemberlistLabel != "scaler.default" || reg.Advertise != srv.URL {
-			t.Fatalf("scaler registered wrong seed: %+v", reg)
+		if reg.MemberlistLabel != "placer.default" || reg.Advertise != srv.URL {
+			t.Fatalf("placer registered wrong seed: %+v", reg)
 		}
 	case <-time.After(time.Second):
-		t.Fatal("scaler did not register")
+		t.Fatal("placer did not register")
 	}
 }
 
 func TestRegisterLoopRetriesFailedRegisterQuickly(t *testing.T) {
-	oldRetry := scalerRegisterRetryInterval
-	scalerRegisterRetryInterval = 10 * time.Millisecond
-	t.Cleanup(func() { scalerRegisterRetryInterval = oldRetry })
+	oldRetry := placerRegisterRetryInterval
+	placerRegisterRetryInterval = 10 * time.Millisecond
+	t.Cleanup(func() { placerRegisterRetryInterval = oldRetry })
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	var calls atomic.Int32
 	gotSecond := make(chan struct{}, 1)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		if req.URL.Path != registry.ScaleLinkRegisterPath {
+		if req.URL.Path != registry.PlacerLinkRegisterPath {
 			http.NotFound(w, req)
 			return
 		}
@@ -264,7 +264,7 @@ func TestRegisterLoopRetriesFailedRegisterQuickly(t *testing.T) {
 
 	svc := NewRemoteLinks([]RegistryLink{{Name: "r1", BaseURL: srv.URL, Client: srv.Client()}},
 		clustercfg.PlacementConfig{Candidates: 1}, 30, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	go svc.RegisterLoop(ctx, "s1", srv.URL, "scaler.default")
+	go svc.RegisterLoop(ctx, "s1", srv.URL, "placer.default")
 
 	select {
 	case <-gotSecond:
@@ -273,7 +273,7 @@ func TestRegisterLoopRetriesFailedRegisterQuickly(t *testing.T) {
 	}
 }
 
-func TestImportSourceLeaseAllowsOnlyOneScalerToRange(t *testing.T) {
+func TestImportSourceLeaseAllowsOnlyOnePlacerToRange(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	discard := slog.New(slog.NewTextHandler(io.Discard, nil))
 	_, srv := testScaleRegistry(t, ctx, "n1")
@@ -303,7 +303,7 @@ func TestImportSourceLeaseAllowsOnlyOneScalerToRange(t *testing.T) {
 	}
 }
 
-func TestScalerRefreshesUnchangedNodeLinkKeyCache(t *testing.T) {
+func TestPlacerRefreshesUnchangedNodeLinkKeyCache(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	discard := slog.New(slog.NewTextHandler(io.Discard, nil))
 	reg, srv := testScaleRegistry(t, ctx, "n1")
@@ -329,7 +329,7 @@ func TestScalerRefreshesUnchangedNodeLinkKeyCache(t *testing.T) {
 	}
 }
 
-func TestScalerStartIsIdempotent(t *testing.T) {
+func TestPlacerStartIsIdempotent(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	discard := slog.New(slog.NewTextHandler(io.Discard, nil))
 	_, srv := testScaleRegistry(t, ctx, "n1")
@@ -362,9 +362,9 @@ func TestScalerStartIsIdempotent(t *testing.T) {
 }
 
 func TestReconcileKeyAllocationsRunsWhenNodeListBecomesReady(t *testing.T) {
-	oldPoll := scalerReadyPollInterval
-	scalerReadyPollInterval = 10 * time.Millisecond
-	t.Cleanup(func() { scalerReadyPollInterval = oldPoll })
+	oldPoll := placerReadyPollInterval
+	placerReadyPollInterval = 10 * time.Millisecond
+	t.Cleanup(func() { placerReadyPollInterval = oldPoll })
 
 	ctx, cancel := context.WithCancel(context.Background())
 	discard := slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -397,9 +397,9 @@ func TestReconcileKeyAllocationsRunsWhenNodeListBecomesReady(t *testing.T) {
 }
 
 func TestReconcileRunsWhenReadyNodeListChanges(t *testing.T) {
-	oldPoll := scalerReadyPollInterval
-	scalerReadyPollInterval = time.Hour
-	t.Cleanup(func() { scalerReadyPollInterval = oldPoll })
+	oldPoll := placerReadyPollInterval
+	placerReadyPollInterval = time.Hour
+	t.Cleanup(func() { placerReadyPollInterval = oldPoll })
 
 	ctx, cancel := context.WithCancel(context.Background())
 	discard := slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -487,7 +487,7 @@ func TestReconcileImportSourceRefreshesAndRetriesTransientPatchFailure(t *testin
 	var cursorUpdates atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		switch req.URL.Path {
-		case registry.ScaleLinkImportSourcePath:
+		case registry.PlacerLinkImportSourcePath:
 			var in registry.ImportSourceLeaseRequest
 			if err := json.NewDecoder(req.Body).Decode(&in); err != nil {
 				http.Error(w, err.Error(), http.StatusBadRequest)
@@ -500,13 +500,13 @@ func TestReconcileImportSourceRefreshesAndRetriesTransientPatchFailure(t *testin
 					ExpiresUnixMs: time.Now().Add(time.Second).UnixMilli(),
 				},
 			})
-		case registry.ScaleLinkSelectorPatchPath:
+		case registry.PlacerLinkSelectorPatchPath:
 			if patches.Add(1) == 1 {
 				http.Error(w, "transient patch failure", http.StatusServiceUnavailable)
 				return
 			}
 			w.WriteHeader(http.StatusNoContent)
-		case registry.ScaleLinkSourceCursorPath:
+		case registry.PlacerLinkSourceCursorPath:
 			cursorUpdates.Add(1)
 			w.WriteHeader(http.StatusNoContent)
 		default:
@@ -522,7 +522,7 @@ func TestReconcileImportSourceRefreshesAndRetriesTransientPatchFailure(t *testin
 		30,
 		slog.New(slog.NewTextHandler(io.Discard, nil)),
 	)
-	svc.SetScaleLinkRefresher(func(context.Context) error {
+	svc.SetPlacerLinkRefresher(func(context.Context) error {
 		refreshes.Add(1)
 		return nil
 	})
@@ -557,7 +557,7 @@ func TestReconcileImportSourcePushesCompletedPagesBeforeLaterPageError(t *testin
 	cursor := ""
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		switch req.URL.Path {
-		case registry.ScaleLinkImportSourcePath:
+		case registry.PlacerLinkImportSourcePath:
 			var in registry.ImportSourceLeaseRequest
 			if err := json.NewDecoder(req.Body).Decode(&in); err != nil {
 				http.Error(w, err.Error(), http.StatusBadRequest)
@@ -570,7 +570,7 @@ func TestReconcileImportSourcePushesCompletedPagesBeforeLaterPageError(t *testin
 					ExpiresUnixMs: time.Now().Add(time.Second).UnixMilli(),
 				},
 			})
-		case registry.ScaleLinkSourceCursorPath:
+		case registry.PlacerLinkSourceCursorPath:
 			var in registry.ImportSourceCursorRequest
 			if err := json.NewDecoder(req.Body).Decode(&in); err != nil {
 				http.Error(w, err.Error(), http.StatusBadRequest)
@@ -578,7 +578,7 @@ func TestReconcileImportSourcePushesCompletedPagesBeforeLaterPageError(t *testin
 			}
 			cursor = in.Cursor
 			w.WriteHeader(http.StatusNoContent)
-		case registry.ScaleLinkSelectorPatchPath:
+		case registry.PlacerLinkSelectorPatchPath:
 			var patch struct {
 				Group string `json:"group"`
 			}
@@ -619,7 +619,7 @@ func TestReconcileImportSourceDoesNotAdvanceCursorWhenPatchFails(t *testing.T) {
 	var cursorUpdates atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		switch req.URL.Path {
-		case registry.ScaleLinkImportSourcePath:
+		case registry.PlacerLinkImportSourcePath:
 			var in registry.ImportSourceLeaseRequest
 			if err := json.NewDecoder(req.Body).Decode(&in); err != nil {
 				http.Error(w, err.Error(), http.StatusBadRequest)
@@ -632,10 +632,10 @@ func TestReconcileImportSourceDoesNotAdvanceCursorWhenPatchFails(t *testing.T) {
 					ExpiresUnixMs: time.Now().Add(time.Second).UnixMilli(),
 				},
 			})
-		case registry.ScaleLinkSourceCursorPath:
+		case registry.PlacerLinkSourceCursorPath:
 			cursorUpdates.Add(1)
 			w.WriteHeader(http.StatusNoContent)
-		case registry.ScaleLinkSelectorPatchPath:
+		case registry.PlacerLinkSelectorPatchPath:
 			http.Error(w, "patch failed", http.StatusServiceUnavailable)
 		default:
 			http.NotFound(w, req)
@@ -775,14 +775,14 @@ func testScaleRegistry(t *testing.T, ctx context.Context, nodeID string) (*regis
 	}
 	reg := registry.New(stores, nil, 0, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	mux := http.NewServeMux()
-	reg.ServeScaleLink(mux)
+	reg.ServePlacerLink(mux)
 	return reg, httptest.NewServer(h2c.NewHandler(mux, &http2.Server{}))
 }
 
-func TestHTTPScalePlacerNoScaler(t *testing.T) {
+func TestHTTPPlacerNoPlacer(t *testing.T) {
 	reg := registry.New(registry.NewStores(), nil, 0, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	placer := registry.NewHTTPScalePlacer(reg, 1, 200*time.Millisecond)
+	placer := registry.NewHTTPPlacer(reg, 1, 200*time.Millisecond)
 	if _, err := placer.Place(context.Background(), registry.PlaceRequest{Group: "/g"}); err != registry.ErrNoNode {
-		t.Fatalf("no scaler → want ErrNoNode, got %v", err)
+		t.Fatalf("no placer → want ErrNoNode, got %v", err)
 	}
 }

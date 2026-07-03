@@ -13,8 +13,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/clustercfg"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/registry"
+	"github.com/kuasar-sandbox/orchestrator/internal/clustercfg"
+	"github.com/kuasar-sandbox/orchestrator/internal/registry"
 )
 
 func registryAdminCmd(args []string) error {

@@ -20,8 +20,8 @@ import (
 	"os"
 	"strings"
 
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/apikey"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/regcreds"
+	"github.com/kuasar-sandbox/orchestrator/internal/apikey"
+	"github.com/kuasar-sandbox/orchestrator/internal/regcreds"
 )
 
 var version = "0.1.0-dev"

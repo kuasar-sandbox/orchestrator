@@ -15,7 +15,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/configsock"
+	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 )
 
 // --- phase A: import -------------------------------------------------------

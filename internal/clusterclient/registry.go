@@ -15,8 +15,8 @@ import (
 	"sync"
 	"time"
 
-	clusterstate "github.com/kuasar-sandbox/sandbox-orchestrator/internal/cluster"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/clustercfg"
+	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
+	"github.com/kuasar-sandbox/orchestrator/internal/clustercfg"
 )
 
 const MembershipPath = "/cluster/membership"
@@ -205,12 +205,12 @@ func (r *Registry) NodeListEndpoints(ctx context.Context) ([]Endpoint, error) {
 	return r.jointOwnerEndpoints(ctx, m, string(clusterstate.NodeListShard), m.Owners.NodeList)
 }
 
-func (r *Registry) ScaleLinkEndpoints(ctx context.Context, shardKey string) ([]Endpoint, error) {
+func (r *Registry) PlacerLinkEndpoints(ctx context.Context, shardKey string) ([]Endpoint, error) {
 	m, err := r.Membership(ctx)
 	if err != nil {
 		return nil, err
 	}
-	return r.jointOwnerEndpoints(ctx, m, shardKey, m.Owners.ScaleLink)
+	return r.jointOwnerEndpoints(ctx, m, shardKey, m.Owners.PlacerLink)
 }
 
 func (r *Registry) ActiveEndpoints(ctx context.Context) ([]Endpoint, error) {

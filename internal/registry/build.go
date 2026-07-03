@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"time"
 
-	clusterstate "github.com/kuasar-sandbox/sandbox-orchestrator/internal/cluster"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/routesync"
+	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
+	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 )
 
 // BuildReserveResult is the registry-assigned identity + placement for a build

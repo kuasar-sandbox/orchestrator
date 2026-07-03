@@ -1,16 +1,16 @@
-package scaler
+package placer
 
 import (
 	"testing"
 
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/maglev"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/clustercfg"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/registry"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/routesync"
+	"github.com/kuasar-sandbox/accelerator/pkg/maglev"
+	"github.com/kuasar-sandbox/orchestrator/internal/clustercfg"
+	"github.com/kuasar-sandbox/orchestrator/internal/registry"
+	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 )
 
 // The placement algorithm is now a pure function over a node slice + a group's
-// selectors (the standalone scaler runs it over its subscribed view).
+// selectors (the standalone placer runs it over its subscribed view).
 
 func nodes(ns ...*registry.NodeRecord) []*registry.NodeRecord { return ns }
 

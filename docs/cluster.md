@@ -2,12 +2,12 @@
 
 `cluster-ctl` 是大规模部署的集群控制面,由三个独立角色组成:
 
-- `registry`:有状态可靠集群,维护 node / route / scaler import 等执行态。
+- `registry`:有状态可靠集群,维护 node / route / placer import 等执行态。
 - `router`:e2b 兼容统一入口,按 sandbox-group 定位 route owner,热路径直转 node。
-- `scaler`:group provider/importer 与放置调度器,消费 `node_list`,向 registry 提供 Place / verify-key。
+- `placer`:group provider/importer 与放置调度器,消费 `node_list`,向 registry 提供 Place / verify-key。
 
 Registry 的基础能力是按 `namespace + shard key + recordSet + record key` 组织的一致性 KV。所有
-`node_link`、`route_link`、`node_list`、`scale_link` 记录都复用这套模型:分片间不遍历,分片内全复制,
+`node_link`、`route_link`、`node_list`、`placer_link` 记录都复用这套模型:分片间不遍历,分片内全复制,
 通过 quorum 读写、CAS、WATCH 和 read-repair 收敛。
 
 ## 1. 概述
@@ -26,19 +26,19 @@ Registry 的基础能力是按 `namespace + shard key + recordSet + record key` 
                                │ route_link Reserve/Resolve
                                ▼
 ┌────────────┐          ┌──────────────────────┐          ┌────────────┐
-│ node-ctl   │ node_link│      registry        │ scale_link│   scaler   │
+│ node-ctl   │ node_link│      registry        │ placer_link│   placer   │
 │ serve      │◄────────►│   state cluster      │◄────────►│ placement  │
 │ sandbox VM │          │ shardkv namespaces   │          │ importer   │
 └────────────┘          └──────────────────────┘          └────────────┘
                                ▲
                                │ node_list WATCH_LIST
-                               └────────────── scaler consumes one owner
+                               └────────────── placer consumes one owner
 ```
 
 稳态数据面不经过 registry。只有 cold/miss/fail-fast 路径需要 registry:
 
 - router miss 时调用 `ReserveSandbox` / `ReserveBuild`。
-- registry 调 scaler `PlaceSandbox` / `PlaceBuild`。
+- registry 调 placer `PlaceSandbox` / `PlaceBuild`。
 - registry 经 node owner 下发 create/connect/delete/build/key 命令。
 - node 经 node_link 上报 sandbox/build 状态和低频节点目录。
 
@@ -55,7 +55,7 @@ Registry 的基础能力是按 `namespace + shard key + recordSet + record key` 
    memberlist 只做健康检测和 meta 传播。
 6. **node 是运行态真相之源**:sandbox/build 是否仍存在以 node 上报为准。node 整机重启直接清空,
    不重拉旧 sandbox。
-7. **scaler 不拥有生命周期**:scaler 只做 group 导入、selector patch、shuffle-sharding、P2C 与 Place
+7. **placer 不拥有生命周期**:placer 只做 group 导入、selector patch、shuffle-sharding、P2C 与 Place
    建议。最终资源确认在 node owner admission。
 8. **router 不订阅海量 group**:Reserve 返回 READY 或失败;router 只维护 route cache 和 active connection
    cache。
@@ -64,9 +64,9 @@ Registry 的基础能力是按 `namespace + shard key + recordSet + record key` 
 
 | 角色 | 职责 |
 |---|---|
-| registry member | 组成 registry 自聚簇,承载 `route_link` / `node_link` / `node_list` / `scale_link` 执行态和 membership |
+| registry member | 组成 registry 自聚簇,承载 `route_link` / `node_link` / `node_list` / `placer_link` 执行态和 membership |
 | router | e2b 统一入口;按 group 定位 route owner;miss 时 Reserve;热路径复用活动连接 |
-| scaler | 消费 `node_list` WATCH_LIST;通过 provider/importer 导入 group;维护 placement 与 selector patch;提供 Place / verify-key |
+| placer | 消费 `node_list` WATCH_LIST;通过 provider/importer 导入 group;维护 placement 与 selector patch;提供 Place / verify-key |
 | node | 运行 sandbox/build;通过 node_link 上报全量清单和事件;接收 create/connect/delete/build/key 命令 |
 
 ## 2. 配置与监听
@@ -93,7 +93,7 @@ membership:
   owners:
     route_link: 3
     node_link: 3
-    scale_link: 3
+    placer_link: 3
     node_list: 3
 
 node_link:
@@ -107,10 +107,10 @@ route_link:
 node_list:
   watch_retention: 10000
 
-scale_link:
-  scaler_label: scaler.default
-  scaler_replica_count: 3      # registry 调 scaler 的 failover 候选数
-  min_ready_scalers: 1
+placer_link:
+  placer_label: placer.default
+  placer_replica_count: 3      # registry 调 placer 的 failover 候选数
+  min_ready_placers: 1
   place_timeout: 2s
 ```
 
@@ -120,7 +120,7 @@ scale_link:
 /cluster/membership
 /node-link/*
 /route-link/*
-/scale-link/*
+/placer-link/*
 /internal/registry-member/shardkv
 /internal/node-owner
 /internal/node-link/relay
@@ -143,7 +143,7 @@ registry.<version>.<sha256(sort(member_ids))>
 
 registry 可同时持有三个视图:
 
-- `active`:客户端定位 route/node/node_list/scale_link owner 的版本。
+- `active`:客户端定位 route/node/node_list/placer_link owner 的版本。
 - `next`:joint 阶段的目标版本。写入必须同时满足 active quorum 和 next quorum。
 - `old_grace`:cutover 后保留的旧版本。旧成员可作为 peer/node_link 接入或 node-owner RPC 目标,
   并作为 shardkv read-only set 提供旧 head 的 snapshot/certificate;但不参与写 owner set,也不能用旧视图提交写入。
@@ -180,7 +180,7 @@ label=registry.1.hash(A,B,C)
 memberlist 只用于:
 
 - 判断配置成员是否运行期可达。
-- 发布 registry/scaler 的 ready meta。
+- 发布 registry/placer 的 ready meta。
 - 给 RPC fail-fast / cooldown 提供信号。
 
 memberlist 不用于:
@@ -190,17 +190,17 @@ memberlist 不用于:
 - 做数据复制。
 - 把 suspect/dead 转化为 reshard。
 
-### 3.3 scaler memberlist 域
+### 3.3 placer memberlist 域
 
-scaler 使用独立 label,默认 `scaler.default`。registry 不配置 scaler 列表,而是作为
-`role=observer` 加入 scaler memberlist。`POST /scale-link/register` 只提供 seed,用于 registry 初始 join。
-ready scaler 由 scaler memberlist meta 表达:
+placer 使用独立 label,默认 `placer.default`。registry 不配置 placer 列表,而是作为
+`role=observer` 加入 placer memberlist。`POST /placer-link/register` 只提供 seed,用于 registry 初始 join。
+ready placer 由 placer memberlist meta 表达:
 
 ```json
-{"role":"scaler","id":"s1","advertise":"https://s1:7800","ready":true,"ready_label":"registry.2.hash"}
+{"role":"placer","id":"s1","advertise":"https://s1:7800","ready":true,"ready_label":"registry.2.hash"}
 ```
 
-registry 只把 `role=scaler && alive && ready=true && ready_label==active_registry_label` 的成员作为
+registry 只把 `role=placer && alive && ready=true && ready_label==active_registry_label` 的成员作为
 Place / verify-key 候选。
 
 ## 4. Registry 状态模型
@@ -241,9 +241,9 @@ owner set
  full copy   full copy   full copy
 ```
 
-`membership.owners.route_link/node_link/scale_link/node_list` 分别控制各 namespace 的 owner 数量。
-owner count 是 registry 内部复制因子。`scale_link.scaler_replica_count` 只控制 registry 调 ready scaler
-的 failover 候选数,不是 `scale_link` namespace 的 owner count。
+`membership.owners.route_link/node_link/placer_link/node_list` 分别控制各 namespace 的 owner 数量。
+owner count 是 registry 内部复制因子。`placer_link.placer_replica_count` 只控制 registry 调 ready placer
+的 failover 候选数,不是 `placer_link` namespace 的 owner count。
 
 ### 4.3 namespace schema
 
@@ -256,7 +256,7 @@ owner count 是 registry 内部复制因子。`scale_link.scaler_replica_count` 
 | `node_link` | node_id | `build` | group + build_id | node 维度 build 清单 |
 | `node_link` | node_id | `manifest_key` | fingerprint | node key cache |
 | `node_list` | `node_list` | `nodes` | node_id | 低频节点目录和 WATCH_LIST |
-| `scale_link` | `import/source/<source_id>` | `import` | `state` | import source lease/cursor |
+| `placer_link` | `import/source/<source_id>` | `import` | `state` | import source lease/cursor |
 
 当前 recordSet 集合由固定 schema 定义。如果未来某 namespace 引入动态 recordSet 名称,recordSet 目录也必须
 作为同 shard 下的保留 recordSet 维护,并遵守同一套 CAS/WATCH 规则。
@@ -534,7 +534,7 @@ membership 切换不是全局迁移任务。registry 不扫描所有 group/node�
 - 活动 node 连接、心跳、sandbox/build 事件持续写入当前 node_link owner set。
 - node owner 按当前 membership 持续把低频 profile 投影到 node_list。
 - group 请求、node 上报、group-scoped list/export 触达对应 route_link recordSet 时做 catch-up/read-repair。
-- scaler import/source lease、cursor、selector patch 通过 `scale_link` 当前 owner set 维护。
+- placer import/source lease、cursor、selector patch 通过 `placer_link` 当前 owner set 维护。
 
 首次触达旧 recordSet 时,旧 membership certificate 可证明旧 head,随后由同一次读写 repair 到当前 `WriteSets`。
 因此 joint/cutover 变更不需要跨 shard 扫描。cutover 后的 `old_grace` 继续作为 `ReadSets` 的 read-only 来源,
@@ -635,11 +635,11 @@ node_list owner set: LocateN("node_list", M)
   ▲
   │ WATCH_LIST
   ▼
-scaler consumes one owner at a time
+placer consumes one owner at a time
 ```
 
-node_list owner 分片内全复制,所以 scaler 不需要也不能把多个 owner 的结果做片间合并。若当前 owner 断线,
-scaler 清空该源视图并切换到另一个 owner 重新 reset + bookmark。
+node_list owner 分片内全复制,所以 placer 不需要也不能把多个 owner 的结果做片间合并。若当前 owner 断线,
+placer 清空该源视图并切换到另一个 owner 重新 reset + bookmark。
 
 node_list 未 ready 时,只能从同一 node_list owner set 做 list + repair。不能跨 node shard 扫描,也不能从
 node_link 重建第二条事实传播路径。
@@ -684,7 +684,7 @@ route_link owner
   │ existing ready? return
   │ none/paused? CAS reserved
   ▼
-scaler PlaceSandbox
+placer PlaceSandbox
   │ choose node + access_token
   ▼
 node owner
@@ -706,41 +706,41 @@ route_link 更新。
 孤儿清理由 route owner 判定:node 上报的 `(group,route_key,sandbox_id)` 在 route_link 中不存在或已被替换,
 则下发 delete/kill 到该 node。该过程不经过数据面,也不依赖 access token。
 
-## 9. scale_link 与 scaler
+## 9. placer_link 与 placer
 
-### 9.1 scaler 发现
+### 9.1 placer 发现
 
 ```text
-scaler S1
-  │ POST /scale-link/register {id, advertise, memberlist_label}
+placer S1
+  │ POST /placer-link/register {id, advertise, memberlist_label}
   ▼
-registry observer joins scaler.default memberlist
+registry observer joins placer.default memberlist
   │
   ▼
-ready scaler view from memberlist meta
+ready placer view from memberlist meta
 ```
 
 registry 对 group 做确定性 failover:
 
 ```text
-readyScalers = scaler memberlist nodes where role=scaler and alive and ready=true
+readyPlacers = placer memberlist nodes where role=placer and alive and ready=true
                and ready_label == active_registry_label
-candidates   = LocateN(group, readyScalers, scale_link.scaler_replica_count)
+candidates   = LocateN(group, readyPlacers, placer_link.placer_replica_count)
 try candidates in order until success
 ```
 
-registry 不对 scaler 做 P2C。P2C 属于 scaler 内部从 node 候选中选择目标。
+registry 不对 placer 做 P2C。P2C 属于 placer 内部从 node 候选中选择目标。
 
 ### 9.2 import/source
 
 ```text
 source_id = file-prod-a
 
-ready scalers ── LocateN(source_id, readyScalers, import_source_owner_count)
+ready placers ── LocateN(source_id, readyPlacers, import_source_owner_count)
        │
        ▼
 candidates race CAS lease:
-  namespace = scale_link
+  namespace = placer_link
   shardKey  = import/source/file-prod-a
   recordSet = import
   recordKey = state
@@ -754,14 +754,14 @@ lease winner
 node_link manifest_key cache refreshed
 ```
 
-`source_id` 是 importer 的唯一执行单元。多个 scaler 配置相同 `source_id` 时,它们竞争同一条
-`scale_link` source execution record。Provider 的点查可以跨多个 source 去重;Importer 的 Range 不把多个
+`source_id` 是 importer 的唯一执行单元。多个 placer 配置相同 `source_id` 时,它们竞争同一条
+`placer_link` source execution record。Provider 的点查可以跨多个 source 去重;Importer 的 Range 不把多个
 source 合并成一个视图。
 
 ### 9.3 group provider 边界
 
 registry 不实现 `SandboxGroupProvider` / `SandboxGroupImporter`。group 配置、placement hint、auth_key、
-manifest_key 属于 scaler/provider。registry 只保存执行态和 node key cache。
+manifest_key 属于 placer/provider。registry 只保存执行态和 node key cache。
 
 group 从 provider 消失后,新的 Place/verify-key 按 group 不存在处理。已经进入 node_link 的 manifest key
 cache 不主动删除,由 registry/node 侧 TTL 淘汰。
@@ -791,7 +791,7 @@ request(group, route_key, sandbox_id)
 route owner。membership refresh 会尝试 bootstrap 和已知 active/next/old_grace 成员,选择 active version
 最新的结果。
 
-router 调 route owner 的 verify-key;route owner 只 failover 到 ready scaler 校验。router 和 registry 都不
+router 调 route owner 的 verify-key;route owner 只 failover 到 ready placer 校验。router 和 registry 都不
 读取 `manifest_key`。
 
 ## 11. 密钥与鉴权
@@ -800,8 +800,8 @@ group 有两个密钥域:
 
 | 名称 | 持有者 | 用途 |
 |---|---|---|
-| `auth_key` | provider/scaler;router 通过 verify-key 间接使用 | 验 API key,派生 access token |
-| `manifest_key` | provider/scaler/node | 解密镜像/快照内容;router 不接触 |
+| `auth_key` | provider/placer;router 通过 verify-key 间接使用 | 验 API key,派生 access token |
+| `manifest_key` | provider/placer/node | 解密镜像/快照内容;router 不接触 |
 
 数据面 token:
 
@@ -809,14 +809,14 @@ group 有两个密钥域:
 access_token = MAC(auth_key, sandbox_id)
 ```
 
-scaler 在 Place 时生成当前 sandbox_id 的 token,registry 保存到 route_link。READY/ResolveSID 只读 route_link,
+placer 在 Place 时生成当前 sandbox_id 的 token,registry 保存到 route_link。READY/ResolveSID 只读 route_link,
 不回查 provider。
 
 `manifest_key` 和 `registry_auth` 都是 typed secret,支持 inline 或 ref 带外交付。密钥分发只发生在
 shuffle-sharding/import/selector patch 路径:
 
 ```text
-scaler selector patch
+placer selector patch
   │ target node set + manifest_key material/ref
   ▼
 registry/node owner
@@ -842,7 +842,7 @@ router build register
 route owner ReserveBuild
   │ PlaceBuild
   ▼
-scaler suggests node
+placer suggests node
   │
   ▼
 node owner AdmitBuild(build_id, resources, ttl)
@@ -873,7 +873,7 @@ JSONL 行使用显式类型:
 ```
 
 registry export/import 不覆盖 sandbox-group provider 数据。group 配置、placement hint、auth_key、
-manifest_key 由 scaler/provider 侧负责导入导出。
+manifest_key 由 placer/provider 侧负责导入导出。
 
 整套 registry 完全下电后不要求自动恢复运行中 sandbox。灾难场景可通过外部持久化的 export/import 做手动恢复。
 
@@ -882,7 +882,7 @@ manifest_key 由 scaler/provider 侧负责导入导出。
 | 事件 | 行为 |
 |---|---|
 | router 崩溃 | 丢本地缓存;重启后 miss 重新 Reserve |
-| scaler 崩溃 | registry 对同 group failover 到下一个 ready scaler;热路径不受影响 |
+| placer 崩溃 | registry 对同 group failover 到下一个 ready placer;热路径不受影响 |
 | node_link 断线 | node owner 保留最后视图,node_dead_after 后 node_list 失效;node 重连后全量/增量重报 |
 | node 整机重启 | node 清空运行态;缺失 sandbox 经 node 上报/清理收敛为 dead route |
 | registry 单成员故障 | owner set quorum 足够时继续服务;恢复后由同 shard 访问或事实源上报触发 read-repair |
@@ -893,8 +893,8 @@ manifest_key 由 scaler/provider 侧负责导入导出。
 ## 15. 性能
 
 - 数据面热路径:router active cache / route cache 命中后直转 node,不访问 registry。
-- Place 冷路径:group 经 route_link owner -> ready scaler failover -> node owner admission。
-- 海量 group:router 不订阅 group;registry 不跨 group 扫描;scaler import 按 source_id 独立分页。
+- Place 冷路径:group 经 route_link owner -> ready placer failover -> node owner admission。
+- 海量 group:router 不订阅 group;registry 不跨 group 扫描;placer import 按 source_id 独立分页。
 - 海量 node:node_link 按 node_id 分片;node_list 只承载低频目录,不承载高频水位。
 - membership 变更:不做全局 promoter;由 node 上报、group 请求、source import、read-repair 自然收敛。
 
@@ -910,14 +910,14 @@ node,但不启动 microVM。除 microVM/应用进程外,它模拟节点控制面
 - 提供 admin/data API 查询节点、sandbox、build、key、command 和 data hit。
 - 支持 `restart-link`、`reboot-empty`、`crash/start` 等节点动作。
 
-`make test-e2e` 先 `make build`,再用产物真实启动 `cluster-ctl registry/router/scaler` 与 `node-stub-ctl`。
+`make test-e2e` 先 `make build`,再用产物真实启动 `cluster-ctl registry/router/placer` 与 `node-stub-ctl`。
 `test/e2e/e2e_cluster_stub.sh` 覆盖 N=1 registry、多 registry、membership joint/old_grace cutover、group
 import、key 分发、Reserve、数据面转发、active cache、BuildRegister、孤儿 route 清理和节点清空收敛。
 
 ## 17. See Also
 
 - [cluster-router.md](cluster-router.md) — router 入口、活动连接缓存和数据面转发。
-- [cluster-scaler.md](cluster-scaler.md) — group provider/importer、WATCH_LIST、Place 与 key distribution。
+- [cluster-placer.md](cluster-placer.md) — group provider/importer、WATCH_LIST、Place 与 key distribution。
 - [node.md](node.md) — node-ctl 单机主机与 node-link 节点侧行为。
 - [node-proxy.md](node-proxy.md) — node 数据面 proxy、routesync 与 CONNECT。
 - `kuasar-sandbox/docs/deployment.md` — 部署拓扑、端口、启停与故障域。

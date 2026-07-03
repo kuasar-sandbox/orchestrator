@@ -36,7 +36,7 @@ SW_NETNS="${SW_NETNS:-e2e_sw}"
 skip() { echo; echo "==> e2e_execute: skipping ($*)"; [ "${REQUIRE_EXEC:-0}" = "1" ] && { echo "REQUIRE_EXEC=1; failing" >&2; exit 1; }; exit 0; }
 fail() { echo "==> FAIL: $*" >&2; exit 1; }
 
-for b in node-ctl sandbox-ctl flatten-ctl store-ctl e2b-key-ctl vswitch-ctl cloud-hypervisor; do [ -x "$BIN/$b" ] || skip "missing $BIN/$b"; done
+for b in node-ctl sandbox-ctl flatten-ctl store-ctl e2b-key-ctl connector-ctl cloud-hypervisor; do [ -x "$BIN/$b" ] || skip "missing $BIN/$b"; done
 [ -f "$BIN/vmlinux" ] || skip "missing $BIN/vmlinux"
 [ -f "$BIN/sandbox-runtime-e2b.erofs" ] || skip "missing $BIN/sandbox-runtime-e2b.erofs"
 [ -f "$BIN/sandbox-runtime-builder.erofs" ] || skip "missing $BIN/sandbox-runtime-builder.erofs (make sandbox-runtime-builder)"
@@ -65,7 +65,7 @@ cleanup() {
     set +e
     systemctl stop 'sandbox-runner@*.service' 'sandbox-builder@*.service' 2>/dev/null
     for p in "${PIDS[@]:-}"; do [ -n "$p" ] && kill "$p" 2>/dev/null; done
-    [ -n "$SW_STARTED" ] && "$BIN/vswitch-ctl" stop "$SWITCH" >/dev/null 2>&1
+    [ -n "$SW_STARTED" ] && "$BIN/connector-ctl" vswitch stop "$SWITCH" >/dev/null 2>&1
     ip netns del "$SW_NETNS" 2>/dev/null
     for u in "${OURS[@]:-}"; do [ -n "$u" ] && rm -f "$u"; done
     systemctl daemon-reload 2>/dev/null
@@ -143,12 +143,12 @@ echo "==> store-ctl + zot up; built+seeded $REF (user + ionice/nice shims)"
 # switch of the same name (eBPF maps are pinned and survive a crash; --force
 # drains orphaned ports), then create the netns fresh.
 MGMT_VIP="169.254.169.254"
-"$BIN/vswitch-ctl" stop "$SWITCH" --force >/dev/null 2>&1 || true
+"$BIN/connector-ctl" vswitch stop "$SWITCH" --force >/dev/null 2>&1 || true
 ip netns del "$SW_NETNS" 2>/dev/null || true
 ip netns del "$SWITCH" 2>/dev/null || true
 ip netns add "$SW_NETNS" 2>/dev/null || true
 echo "==> starting vswitch $SWITCH (netns=$SW_NETNS)"
-"$BIN/vswitch-ctl" start "$SWITCH" \
+"$BIN/connector-ctl" vswitch start "$SWITCH" \
     --netns="$SW_NETNS" \
     --ports=64 \
     --mac-addr=02:00:00:00:00:01 \

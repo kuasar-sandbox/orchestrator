@@ -9,9 +9,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/clustercfg"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/membergroup"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/registry"
+	"github.com/kuasar-sandbox/orchestrator/internal/clustercfg"
+	"github.com/kuasar-sandbox/orchestrator/internal/membergroup"
+	"github.com/kuasar-sandbox/orchestrator/internal/registry"
 )
 
 var (
@@ -218,18 +218,18 @@ func (r *registryMemberRuntime) AliveAny(id string) bool {
 	return !seen
 }
 
-type scalerObserverRuntime struct {
+type placerObserverRuntime struct {
 	mu    sync.Mutex
 	group *membergroup.Group
 	label string
 }
 
-func newScalerObserverRuntime(cfg *clustercfg.RegistryConfig, hub *membergroup.Hub, log *slog.Logger) (*scalerObserverRuntime, error) {
+func newPlacerObserverRuntime(cfg *clustercfg.RegistryConfig, hub *membergroup.Hub, log *slog.Logger) (*placerObserverRuntime, error) {
 	tlsCfg, err := membergroupTLSConfig(cfg.Member.TLS)
 	if err != nil {
-		return nil, fmt.Errorf("scaler observer memberlist tls: %w", err)
+		return nil, fmt.Errorf("placer observer memberlist tls: %w", err)
 	}
-	label := cfg.ScaleLink.ScalerLabel
+	label := cfg.PlacerLink.PlacerLabel
 	name := "observer." + cfg.Member.ID
 	g, err := membergroup.New(membergroup.Options{
 		Label: label, Name: name, Hub: hub, Log: log, TLSConfig: tlsCfg,
@@ -241,21 +241,21 @@ func newScalerObserverRuntime(cfg *clustercfg.RegistryConfig, hub *membergroup.H
 	if err != nil {
 		return nil, err
 	}
-	return &scalerObserverRuntime{group: g, label: label}, nil
+	return &placerObserverRuntime{group: g, label: label}, nil
 }
 
-func (s *scalerObserverRuntime) JoinSeed(_ context.Context, id, label, advertise string) error {
+func (s *placerObserverRuntime) JoinSeed(_ context.Context, id, label, advertise string) error {
 	if s == nil || s.group == nil {
-		return fmt.Errorf("scaler observer is not initialized")
+		return fmt.Errorf("placer observer is not initialized")
 	}
 	if label == "" {
 		label = s.label
 	}
 	if label != s.label {
-		return fmt.Errorf("scaler label %q does not match %q", label, s.label)
+		return fmt.Errorf("placer label %q does not match %q", label, s.label)
 	}
 	if id == "" || advertise == "" {
-		return fmt.Errorf("scaler seed id and advertise are required")
+		return fmt.Errorf("placer seed id and advertise are required")
 	}
 	s.mu.Lock()
 	s.group.AddSeed(id, advertise)
@@ -264,14 +264,14 @@ func (s *scalerObserverRuntime) JoinSeed(_ context.Context, id, label, advertise
 	return err
 }
 
-func (s *scalerObserverRuntime) ReadyScalers(readyLabel string) []registry.ScalerPeer {
+func (s *placerObserverRuntime) ReadyPlacers(readyLabel string) []registry.PlacerPeer {
 	if s == nil || s.group == nil {
 		return nil
 	}
-	metas := s.group.ReadyScalers(readyLabel)
-	out := make([]registry.ScalerPeer, 0, len(metas))
+	metas := s.group.ReadyPlacers(readyLabel)
+	out := make([]registry.PlacerPeer, 0, len(metas))
 	for _, meta := range metas {
-		out = append(out, registry.ScalerPeer{ID: meta.ID, Advertise: meta.Advertise, ReadyLabel: meta.ReadyLabel})
+		out = append(out, registry.PlacerPeer{ID: meta.ID, Advertise: meta.Advertise, ReadyLabel: meta.ReadyLabel})
 	}
 	return out
 }

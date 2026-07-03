@@ -4,7 +4,7 @@
 
 数据面 proxy 是沙箱流量的 **L7 反代**:把外部(e2b SDK/CLI 或端口转发)请求按
 `(sid, port)` 路由到目标沙箱的 guest envd 或 floatingip 用户端口。控制面(e2b API、
-生命周期、密钥、模板构建)由 `node-ctl serve` 承载,见
+生命周期、密钥、模板构建)由 `node-ctl conductor serve` 承载,见
 [node.md](node.md);本文档只讲数据面**转发层**:路由判定、部署形态、
 路由分发协议(routesync)、数据面鉴权、envd 鉴权姿态与 CONNECT 隧道。
 
@@ -39,7 +39,7 @@ node proxy
 
 - 依赖 serve 的 **config-socket plugin 平面**(注册 + routesync,见
   node.md §6)。
-- 依赖 **sandbox-vswitch** 的 mgmt-extract 把 MMDS VIP 直译到本进程(§8)。
+- 依赖 **connector** 的 mgmt-extract 把 MMDS VIP 直译到本进程(§8)。
 - 上游是 guest **envd**(经 host-UDS)或沙箱 **floatingip**;envd 协议见 node.md §4.3。
 - 须与 serve 同节点(本地拨 envd-UDS / floatingip)。集群下的 cluster-ctl router 是更上一级
   入口,经本节点数据端点转发进来(cluster-router.md),仍落到本节点 proxy。
@@ -50,7 +50,7 @@ node proxy
 与 serve 同节点。
 
 ```
-node-ctl proxy --config /etc/node-ctl/proxy.yaml --id <name>
+node-ctl proxy serve --config /etc/node-ctl/proxy.yaml --id <name>
                [--socket <uds>] [--metrics-listen <addr>] [--mmds]
 ```
 
@@ -135,7 +135,7 @@ external 模式拓扑(数据面字节流不经 serve;**worker 主动注册,serve
                  └─ dials serve's config-socket: PUT /internal/plugin/{id}/register
                        worker → serve : register(caps) → Wake{sid}
                        serve → worker : Hello(policy) → Upsert* → Bookmark → Upsert/Delete
- client / cluster-router ──► node-ctl serve  :443 (fallback: data-plane request hits the
+ client / cluster-router ──► node-ctl conductor serve  :443 (fallback: data-plane request hits the
                  │                        control listener)
                  └─ forwards to one REGISTERED worker over its UDS (picked by sid hash;
                     CONNECT → chained CONNECT relay, §9)
@@ -318,5 +318,5 @@ HTTP/2 经 `WriteHeader(200)` + 请求 / 响应流对拷。它覆盖每条数据
 - [node-resource.md](node-resource.md) — 节点资源控制协议(与数据面正交)。
 - [cluster-router.md](cluster-router.md) — 集群级数据面入口:经本节点数据端点转发进 proxy,
   注入 `E2b-Sandbox-Id` + `X-Access-Token`。
-- `sandbox-vswitch/docs/vswitch.md` — mgmt-extract 把 MMDS VIP 直译到本进程(§8)。
+- `connector/docs/vswitch.md` — mgmt-extract 把 MMDS VIP 直译到本进程(§8)。
 - `kuasar-sandbox/docs/deployment.md` — 部署拓扑、端口与故障域。

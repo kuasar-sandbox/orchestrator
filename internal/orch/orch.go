@@ -20,23 +20,23 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/api"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/config"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/configsock"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/filestore"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/keys"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/launcher"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/proxy"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/routesync"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/sandboxcfg"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/store"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/types"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/vswitch"
+	"github.com/kuasar-sandbox/orchestrator/internal/api"
+	"github.com/kuasar-sandbox/orchestrator/internal/config"
+	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
+	"github.com/kuasar-sandbox/orchestrator/internal/filestore"
+	"github.com/kuasar-sandbox/orchestrator/internal/keys"
+	"github.com/kuasar-sandbox/orchestrator/internal/launcher"
+	"github.com/kuasar-sandbox/orchestrator/internal/proxy"
+	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
+	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
+	"github.com/kuasar-sandbox/orchestrator/internal/store"
+	"github.com/kuasar-sandbox/orchestrator/internal/types"
+	"github.com/kuasar-sandbox/orchestrator/internal/vswitch"
 )
 
 // vsClient is the vswitch surface the orchestrator uses; the production impl is
 // *vswitch.CLI. Declared as an interface so the port attach/detach/tap-fd path
-// can be substituted in tests (and launch exercised without a real vswitch-ctl).
+// can be substituted in tests (and launch exercised without a real connector-ctl vswitch).
 type vsClient interface {
 	Attach(ctx context.Context, req vswitch.AttachReq) (*vswitch.Port, error)
 	Detach(ctx context.Context, port string) error

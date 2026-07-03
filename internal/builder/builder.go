@@ -47,7 +47,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/configsock"
+	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 )
 
 // Run drives the build pipeline for spec and returns its Result. The result

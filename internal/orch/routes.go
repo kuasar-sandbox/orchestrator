@@ -7,10 +7,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/keys"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/routesync"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/sandboxcfg"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/types"
+	"github.com/kuasar-sandbox/orchestrator/internal/keys"
+	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
+	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
+	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
 const routeLogLimit = 4096

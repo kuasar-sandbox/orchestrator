@@ -53,7 +53,7 @@ pause(){ [ -n "${DEMO_PAUSE:-}" ] && { printf "${c_dim}  ⏎ to continue…${c_o
 die()  { echo $'\e[1;31m'"  ✗ $*"$'\e[0m' >&2; exit 1; }
 
 # ---- prerequisites --------------------------------------------------------
-for b in node-ctl e2b-key-ctl vswitch-ctl cloud-hypervisor; do [ -x "$BIN/$b" ] || die "missing $BIN/$b — run 'make build'"; done
+for b in node-ctl e2b-key-ctl connector-ctl cloud-hypervisor; do [ -x "$BIN/$b" ] || die "missing $BIN/$b — run 'make build'"; done
 [ -f "$BIN/vmlinux" ] && [ -f "$BIN/sandbox-runtime-e2b.erofs" ] || die "missing kernel/runtime erofs in $BIN"
 [ -f "$BIN/sandbox-runtime-builder.erofs" ] || die "missing $BIN/sandbox-runtime-builder.erofs — run 'make sandbox-runtime-builder' (builds run in-guest)"
 [ -S "${STORE_SOCK:-}" ] || die "store socket $STORE_SOCK absent — run demo_prep.sh"
@@ -88,7 +88,7 @@ cleanup() {
         r3) iptables -t nat -D POSTROUTING -s "$FIP_CIDR" -j MASQUERADE 2>/dev/null;;
         dns-*) iptables -t nat -D PREROUTING -d "$GUEST_DNS" -p "${r#dns-}" --dport 53 -j DNAT --to-destination "${HOST_DNS:-}:53" 2>/dev/null;;
     esac; done
-    "$BIN/vswitch-ctl" stop "$SWITCH" --force >/dev/null 2>&1
+    "$BIN/connector-ctl" vswitch stop "$SWITCH" --force >/dev/null 2>&1
     ip netns del "$SW_NETNS" 2>/dev/null
     for u in "${OURS[@]:-}"; do [ -n "$u" ] && rm -f "$u"; done; systemctl daemon-reload 2>/dev/null
     sed -i "/# demo-e2b-$$\$/d" /etc/hosts 2>/dev/null
@@ -178,10 +178,10 @@ checkpoint: { mode: local, local_dir: $WORK/saved }
 EOF
 
 # eBPF/TC switch + host NAT (per run; the storage tier is persistent, not the network).
-"$BIN/vswitch-ctl" stop "$SWITCH" --force >/dev/null 2>&1 || true; ip netns del "$SW_NETNS" 2>/dev/null || true
+"$BIN/connector-ctl" vswitch stop "$SWITCH" --force >/dev/null 2>&1 || true; ip netns del "$SW_NETNS" 2>/dev/null || true
 ip netns add "$SW_NETNS" 2>/dev/null || true
-say "vswitch-ctl start — eBPF/TC switch; --mgmt-extract adds host NIC $SW_MGMT (169.254.169.254)"
-"$BIN/vswitch-ctl" start "$SWITCH" --netns="$SW_NETNS" --ports=64 --mac-addr=02:00:00:00:00:01 \
+say "connector-ctl vswitch start — eBPF/TC switch; --mgmt-extract adds host NIC $SW_MGMT (169.254.169.254)"
+"$BIN/connector-ctl" vswitch start "$SWITCH" --netns="$SW_NETNS" --ports=64 --mac-addr=02:00:00:00:00:01 \
     --floating-ip-base=100.100.96.0 --mode=tap \
     --mgmt-extract=:$SW_MGMT:169.254.169.254,0.0.0.0/0 $MMDS_SVC >"$WORK/vswitch.log" 2>&1 || { cat "$WORK/vswitch.log"; die "vswitch start"; }
 iptables -C FORWARD -o "$SW_MGMT" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null \
@@ -205,7 +205,7 @@ if [ -n "${DEMO_MMDS:-}" ]; then
 fi
 
 hosts_add "api.$DOMAIN"
-say "node-ctl serve — e2b control plane + data-plane proxy (TLS :$TLS_PORT)"
+say "node-ctl conductor serve — e2b control plane + data-plane proxy (TLS :$TLS_PORT)"
 "$BIN/node-ctl" serve --config "$WORK/config.yaml" >"$WORK/orch.log" 2>&1 & PIDS+=($!)
 for _ in $(seq 1 40); do (exec 3<>"/dev/tcp/127.0.0.1/$TLS_PORT") 2>/dev/null && { exec 3>&- 3<&-; break; }; kill -0 "${PIDS[-1]}" 2>/dev/null || { sed 's/^/    /' "$WORK/orch.log"; die "orchestrator exited"; }; sleep 0.5; done
 ok "orchestrator serving https://api.$DOMAIN"

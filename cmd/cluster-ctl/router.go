@@ -16,9 +16,9 @@ import (
 	"golang.org/x/net/http2/h2c"
 	"golang.org/x/sys/unix"
 
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/clustercfg"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/clusterclient"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/router"
+	"github.com/kuasar-sandbox/orchestrator/internal/clustercfg"
+	"github.com/kuasar-sandbox/orchestrator/internal/clusterclient"
+	"github.com/kuasar-sandbox/orchestrator/internal/router"
 )
 
 // runRouter starts the router role: the e2b-compatible unified ingress

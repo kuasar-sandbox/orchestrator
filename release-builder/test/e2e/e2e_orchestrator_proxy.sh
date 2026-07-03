@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # e2e_orchestrator_proxy.sh — exercise proxy_mode=external end to end with REAL
-# components: node-ctl serve (control plane), a separate node-ctl
+# components: node-ctl conductor serve (control plane), a separate node-ctl
 # proxy worker (data plane, SO_REUSEPORT) that REGISTERS on the config-socket plugin
 # plane and syncs its route table from it, a REAL microVM sandbox with REAL envd, and
 # data-plane traffic driven THROUGH the proxy (not the orchestrator):
@@ -37,7 +37,7 @@ SW_NETNS="${SW_NETNS:-e2e_sw}"
 skip() { echo; echo "==> e2e_orchestrator_proxy: skipping ($*)"; [ "${REQUIRE_PROXY:-0}" = "1" ] && { echo "REQUIRE_PROXY=1; failing" >&2; exit 1; }; exit 0; }
 fail() { echo "==> FAIL: $*" >&2; exit 1; }
 
-for b in node-ctl sandbox-ctl flatten-ctl store-ctl e2b-key-ctl vswitch-ctl cloud-hypervisor; do [ -x "$BIN/$b" ] || skip "missing $BIN/$b"; done
+for b in node-ctl sandbox-ctl flatten-ctl store-ctl e2b-key-ctl connector-ctl cloud-hypervisor; do [ -x "$BIN/$b" ] || skip "missing $BIN/$b"; done
 [ -f "$BIN/vmlinux" ] || skip "missing $BIN/vmlinux"
 [ -f "$BIN/sandbox-runtime-e2b.erofs" ] || skip "missing $BIN/sandbox-runtime-e2b.erofs"
 [ -f "$BIN/sandbox-runtime-builder.erofs" ] || skip "missing $BIN/sandbox-runtime-builder.erofs (make sandbox-runtime-builder)"
@@ -67,7 +67,7 @@ cleanup() {
     set +e
     systemctl stop 'sandbox-runner@*.service' 'sandbox-builder@*.service' 2>/dev/null
     for p in "${PIDS[@]:-}"; do [ -n "$p" ] && kill "$p" 2>/dev/null; done
-    [ -n "$SW_STARTED" ] && "$BIN/vswitch-ctl" stop "$SWITCH" >/dev/null 2>&1
+    [ -n "$SW_STARTED" ] && "$BIN/connector-ctl" vswitch stop "$SWITCH" >/dev/null 2>&1
     ip netns del "$SW_NETNS" 2>/dev/null
     for u in "${OURS[@]:-}"; do [ -n "$u" ] && rm -f "$u"; done
     systemctl daemon-reload 2>/dev/null
@@ -151,10 +151,10 @@ echo "==> store-ctl + zot up; built+seeded $REF"
 # BEFORE the build: the image pull runs INSIDE a build sandbox, so the build
 # needs a network slot and reaches zot via the mgmt VIP.
 MGMT_VIP="169.254.169.254"
-"$BIN/vswitch-ctl" stop "$SWITCH" --force >/dev/null 2>&1 || true
+"$BIN/connector-ctl" vswitch stop "$SWITCH" --force >/dev/null 2>&1 || true
 ip netns del "$SW_NETNS" 2>/dev/null || true; ip netns del "$SWITCH" 2>/dev/null || true
 ip netns add "$SW_NETNS" 2>/dev/null || true
-"$BIN/vswitch-ctl" start "$SWITCH" --netns="$SW_NETNS" --ports=64 --mac-addr=02:00:00:00:00:01 \
+"$BIN/connector-ctl" vswitch start "$SWITCH" --netns="$SW_NETNS" --ports=64 --mac-addr=02:00:00:00:00:01 \
     --floating-ip-base=100.100.96.0 --mode=tap \
     --mgmt-extract=:${SWITCH}m0:$MGMT_VIP,0.0.0.0/0 >"$WORK/vswitch-start.log" 2>&1 || { sed 's/^/  /' "$WORK/vswitch-start.log"; fail "vswitch start"; }
 SW_STARTED=1
@@ -204,7 +204,7 @@ EOF
 
 # ---- start serve (control plane), then the proxy worker -------------------
 # The proxy now DIALS serve's config-socket to register, so serve comes up first.
-echo "==> node-ctl serve (control :$PORT, proxy_mode=external)"
+echo "==> node-ctl conductor serve (control :$PORT, proxy_mode=external)"
 "$BIN/node-ctl" serve --config "$WORK/config.yaml" >"$WORK/orch.log" 2>&1 &
 PIDS+=($!)
 for _ in $(seq 1 30); do

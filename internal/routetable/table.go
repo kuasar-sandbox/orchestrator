@@ -12,7 +12,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/routesync"
+	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 )
 
 // Table is concurrency-safe and shared by the proxy's data-plane handlers and its

@@ -8,21 +8,21 @@ import (
 	"net/http"
 	"time"
 
-	clusterstate "github.com/kuasar-sandbox/sandbox-orchestrator/internal/cluster"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/routesync"
+	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
+	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 )
 
-// Node view watches are low-frequency control-plane streams for scaler views.
+// Node view watches are low-frequency control-plane streams for placer views.
 // Router does not subscribe to a global route stream. node_list is projected from
-// node_link quorum state; sandbox-group data is imported on scaler/provider side.
+// node_link quorum state; sandbox-group data is imported on placer/provider side.
 const (
-	ScaleLinkNodeListWatchPath = "/scale-link/watch-node-list" // scaler node_list WATCH_LIST
-	ScaleLinkRegisterPath      = "/scale-link/register"
-	ScaleLinkSelectorPatchPath = "/scale-link/selector-patch"
-	ScaleLinkImportSourcePath  = "/scale-link/import-source-lease"
-	ScaleLinkSourceCursorPath  = "/scale-link/import-source-cursor"
-	ScaleLinkPlacePath         = "/scale-link/place"
-	ScaleLinkVerifyKeyPath     = "/scale-link/verify-key"
+	PlacerLinkNodeListWatchPath = "/placer-link/watch-node-list" // placer node_list WATCH_LIST
+	PlacerLinkRegisterPath      = "/placer-link/register"
+	PlacerLinkSelectorPatchPath = "/placer-link/selector-patch"
+	PlacerLinkImportSourcePath  = "/placer-link/import-source-lease"
+	PlacerLinkSourceCursorPath  = "/placer-link/import-source-cursor"
+	PlacerLinkPlacePath         = "/placer-link/place"
+	PlacerLinkVerifyKeyPath     = "/placer-link/verify-key"
 )
 
 // ViewEvent is one frame on a view watch ([4B LE len][ViewEvent]); Value is the
@@ -35,7 +35,7 @@ type ViewEvent struct {
 	Token string          `json:"token,omitempty"`
 }
 
-type ScalerRegister struct {
+type PlacerRegister struct {
 	ID              string `json:"id"`
 	Advertise       string `json:"advertise"`
 	MemberlistLabel string `json:"memberlist_label"`
@@ -79,22 +79,22 @@ func (r *Registry) serveNodeListWatch(w http.ResponseWriter, req *http.Request) 
 	r.streamNodeListView(ctx, w, flusher, ch)
 }
 
-// ServeScaleLink mounts the scaler-facing scale_link API: node_list WATCH_LIST,
-// scaler registration, import source leases, and selector patches.
-func (r *Registry) ServeScaleLink(mux *http.ServeMux) {
-	mux.HandleFunc(ScaleLinkNodeListWatchPath, r.serveNodeListWatch)
-	mux.HandleFunc(ScaleLinkRegisterPath, r.serveScalerRegister)
-	mux.HandleFunc(ScaleLinkSelectorPatchPath, r.serveSelectorPatch)
-	mux.HandleFunc(ScaleLinkImportSourcePath, r.serveImportSourceLease)
-	mux.HandleFunc(ScaleLinkSourceCursorPath, r.serveImportSourceCursor)
+// ServePlacerLink mounts the placer-facing placer_link API: node_list WATCH_LIST,
+// placer registration, import source leases, and selector patches.
+func (r *Registry) ServePlacerLink(mux *http.ServeMux) {
+	mux.HandleFunc(PlacerLinkNodeListWatchPath, r.serveNodeListWatch)
+	mux.HandleFunc(PlacerLinkRegisterPath, r.servePlacerRegister)
+	mux.HandleFunc(PlacerLinkSelectorPatchPath, r.serveSelectorPatch)
+	mux.HandleFunc(PlacerLinkImportSourcePath, r.serveImportSourceLease)
+	mux.HandleFunc(PlacerLinkSourceCursorPath, r.serveImportSourceCursor)
 }
 
-func (r *Registry) serveScalerRegister(w http.ResponseWriter, req *http.Request) {
+func (r *Registry) servePlacerRegister(w http.ResponseWriter, req *http.Request) {
 	if req.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	var in ScalerRegister
+	var in PlacerRegister
 	if err := json.NewDecoder(io.LimitReader(req.Body, 1<<20)).Decode(&in); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -105,13 +105,13 @@ func (r *Registry) serveScalerRegister(w http.ResponseWriter, req *http.Request)
 	}
 	label := in.MemberlistLabel
 	if label == "" {
-		label = r.scalerMemberlistLabel()
+		label = r.placerMemberlistLabel()
 	}
-	if want := r.scalerMemberlistLabel(); want != "" && label != want {
-		http.Error(w, "memberlist_label does not match registry scale_link.scaler_label", http.StatusConflict)
+	if want := r.placerMemberlistLabel(); want != "" && label != want {
+		http.Error(w, "memberlist_label does not match registry placer_link.placer_label", http.StatusConflict)
 		return
 	}
-	if err := r.joinScalerSeed(req.Context(), in.ID, label, in.Advertise); err != nil {
+	if err := r.joinPlacerSeed(req.Context(), in.ID, label, in.Advertise); err != nil {
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
 	}
@@ -184,9 +184,9 @@ func (r *Registry) serveImportSourceCursor(w http.ResponseWriter, req *http.Requ
 		http.Error(w, "source_id, owner_id, run_id and term are required", http.StatusBadRequest)
 		return
 	}
-	rec, err := r.stores.CheckpointScaleLinkSource(req.Context(), in.SourceID, in.OwnerID, in.RunID, in.Term, in.Cursor, in.Complete, in.Error)
+	rec, err := r.stores.CheckpointPlacerLinkSource(req.Context(), in.SourceID, in.OwnerID, in.RunID, in.Term, in.Cursor, in.Complete, in.Error)
 	if err != nil {
-		if errors.Is(err, errScaleLinkStaleLease) {
+		if errors.Is(err, errPlacerLinkStaleLease) {
 			http.Error(w, "stale import source lease", http.StatusConflict)
 			return
 		}
@@ -202,14 +202,14 @@ func (r *Registry) acquireImportSourceLease(ctx context.Context, in ImportSource
 	if ttl <= 0 {
 		ttl = 15 * time.Second
 	}
-	rec, acquired, err := r.stores.AcquireScaleLinkSourceLease(ctx, in.SourceID, in.OwnerID, in.RunID, ttl)
+	rec, acquired, err := r.stores.AcquirePlacerLinkSourceLease(ctx, in.SourceID, in.OwnerID, in.RunID, ttl)
 	if err != nil {
 		return ImportSourceLeaseResponse{}, err
 	}
 	return ImportSourceLeaseResponse{Acquired: acquired, Lease: importSourceLeaseFromState(rec)}, nil
 }
 
-func importSourceLeaseFromState(rec clusterstate.ScaleImportSourceState) ImportSourceLease {
+func importSourceLeaseFromState(rec clusterstate.PlacerImportSourceState) ImportSourceLease {
 	return ImportSourceLease{
 		SourceID: rec.SourceID, OwnerID: rec.OwnerID, RunID: rec.RunID, Term: rec.Term,
 		Cursor: rec.Cursor, Round: rec.Round,

@@ -6,7 +6,7 @@
 # with a fresh network identity.
 #
 # Stage 1 (cold + connectivity):
-#   sandbox.yaml network.tapfd.exec = `tapfd-get --new <tap>`, which CREATES the
+#   sandbox.yaml network.tapfd.exec = `connector-ctl tapfd get --new <tap>`, which CREATES the
 #   tap (host-side IP, up) and OPENS an IFF_VNET_HDR queue fd, handing it to
 #   sandbox-ctl over SCM_RIGHTS. CH is driven with --net fd=<N>,mac=,id=_net0.
 #   The guest gets eth0=169.254.1.1/31 and an app prints NETUP then sleeps.
@@ -32,7 +32,7 @@ skip() {
 }
 
 [ -e /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ] || skip "/dev/kvm not accessible"
-for b in cloud-hypervisor sandbox-ctl sandbox-init sandbox-runtime.erofs tapfd-get; do
+for b in cloud-hypervisor sandbox-ctl sandbox-init sandbox-runtime.erofs connector-ctl; do
     [ -e "$BIN/$b" ] || skip "missing $BIN/$b"
 done
 VMLINUX="${VMLINUX:-$BIN/vmlinux}"
@@ -50,7 +50,7 @@ if [ -z "$BLK0_IMAGE" ]; then
 fi
 
 WORK="$(mktemp -d /tmp/e2e-tapfd-XXXXXX)"
-# No tap cleanup needed: tapfd-get --new auto-allocates a non-persistent tap
+# No tap cleanup needed: connector-ctl tapfd get --new auto-allocates a non-persistent tap
 # that vanishes when the consuming VM (CH) exits.
 trap '[ -n "${E2E_KEEP:-}" ] && echo "kept: $WORK" || rm -rf "$WORK"; true' EXIT
 
@@ -72,7 +72,7 @@ resources:
   allocatable: { cpu: 1, memory: 512MiB }
 network:
   tapfd:
-    exec: ["$BIN/tapfd-get", "--new", "--host-cidr", "$hcidr",
+    exec: ["$BIN/connector-ctl", "tapfd", "get", "--new", "--host-cidr", "$hcidr",
            "--mac", "$GUEST_MAC", "--ip", "$gip", "--mtu", "1400"]   # auto-named tap
   ip: $gip/31          # mask source; provider sends bare ip → keeps /31
   hostname: e2e-tapfd

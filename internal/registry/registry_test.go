@@ -20,9 +20,9 @@ import (
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
 
-	clusterstate "github.com/kuasar-sandbox/sandbox-orchestrator/internal/cluster"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/cluster/shardkv"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/routesync"
+	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
+	"github.com/kuasar-sandbox/orchestrator/internal/cluster/shardkv"
+	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 )
 
 func testRegWithBox(t *testing.T) *Registry {
@@ -386,7 +386,7 @@ func testReg(t *testing.T) *Registry {
 func pushSelectorPatch(reg *Registry, group string, nodes []string, manifestKey string) error {
 	ctx := context.Background()
 	resp, err := reg.acquireImportSourceLease(ctx, ImportSourceLeaseRequest{
-		SourceID: "test-source", OwnerID: "test-scaler", RunID: "test-run", TTLMillis: 1000,
+		SourceID: "test-source", OwnerID: "test-placer", RunID: "test-run", TTLMillis: 1000,
 	})
 	if err != nil {
 		return err
@@ -1014,11 +1014,11 @@ func TestNodeListWatchProjectsLowFrequencyFields(t *testing.T) {
 	})
 
 	mux := http.NewServeMux()
-	reg.ServeScaleLink(mux)
+	reg.ServePlacerLink(mux)
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
-	resp, err := http.Get(srv.URL + ScaleLinkNodeListWatchPath)
+	resp, err := http.Get(srv.URL + PlacerLinkNodeListWatchPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1053,16 +1053,16 @@ func TestNodeListWatchProjectsLowFrequencyFields(t *testing.T) {
 func TestNodeListWatchTokenResumesOnlyMatchingMembershipLabel(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
-	reg.SetScaleReadyLabel("registry.1.test")
+	reg.SetPlacerReadyLabel("registry.1.test")
 	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1", LastHeartbeatUnix: time.Now().Unix()}); err != nil {
 		t.Fatal(err)
 	}
 	mux := http.NewServeMux()
-	reg.ServeScaleLink(mux)
+	reg.ServePlacerLink(mux)
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
-	resp, err := http.Get(srv.URL + ScaleLinkNodeListWatchPath)
+	resp, err := http.Get(srv.URL + PlacerLinkNodeListWatchPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1088,7 +1088,7 @@ func TestNodeListWatchTokenResumesOnlyMatchingMembershipLabel(t *testing.T) {
 	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n3", LastHeartbeatUnix: time.Now().Unix()}); err != nil {
 		t.Fatal(err)
 	}
-	resp, err = http.Get(srv.URL + ScaleLinkNodeListWatchPath + "?from=" + url.QueryEscape(live.Token))
+	resp, err = http.Get(srv.URL + PlacerLinkNodeListWatchPath + "?from=" + url.QueryEscape(live.Token))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1098,7 +1098,7 @@ func TestNodeListWatchTokenResumesOnlyMatchingMembershipLabel(t *testing.T) {
 	}
 	resp.Body.Close()
 
-	resp, err = http.Get(srv.URL + ScaleLinkNodeListWatchPath + "?from=" + url.QueryEscape(bookmark.Token))
+	resp, err = http.Get(srv.URL + PlacerLinkNodeListWatchPath + "?from=" + url.QueryEscape(bookmark.Token))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1108,7 +1108,7 @@ func TestNodeListWatchTokenResumesOnlyMatchingMembershipLabel(t *testing.T) {
 		t.Fatalf("matching token should replay delta without reset, got %+v", delta)
 	}
 
-	resp2, err := http.Get(srv.URL + ScaleLinkNodeListWatchPath + "?from=" + url.QueryEscape("registry.2.test:1"))
+	resp2, err := http.Get(srv.URL + PlacerLinkNodeListWatchPath + "?from=" + url.QueryEscape("registry.2.test:1"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1125,11 +1125,11 @@ func TestNodeListWatchTokenResetsAcrossRegistryRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	mux := http.NewServeMux()
-	reg.ServeScaleLink(mux)
+	reg.ServePlacerLink(mux)
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
-	resp, err := http.Get(srv.URL + ScaleLinkNodeListWatchPath)
+	resp, err := http.Get(srv.URL + PlacerLinkNodeListWatchPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1145,10 +1145,10 @@ func TestNodeListWatchTokenResetsAcrossRegistryRestart(t *testing.T) {
 
 	restarted := testReg(t)
 	restartedMux := http.NewServeMux()
-	restarted.ServeScaleLink(restartedMux)
+	restarted.ServePlacerLink(restartedMux)
 	restartedSrv := httptest.NewServer(restartedMux)
 	defer restartedSrv.Close()
-	resp, err = http.Get(restartedSrv.URL + ScaleLinkNodeListWatchPath + "?from=" + url.QueryEscape(bookmark.Token))
+	resp, err = http.Get(restartedSrv.URL + PlacerLinkNodeListWatchPath + "?from=" + url.QueryEscape(bookmark.Token))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1165,7 +1165,7 @@ func TestSelectorPatchHTTPRejectsMissingImportSourceLease(t *testing.T) {
 		t.Fatal(err)
 	}
 	mux := http.NewServeMux()
-	reg.ServeScaleLink(mux)
+	reg.ServePlacerLink(mux)
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
@@ -1176,7 +1176,7 @@ func TestSelectorPatchHTTPRejectsMissingImportSourceLease(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp, err := http.Post(srv.URL+ScaleLinkSelectorPatchPath, "application/json", bytes.NewReader(body))
+	resp, err := http.Post(srv.URL+PlacerLinkSelectorPatchPath, "application/json", bytes.NewReader(body))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1591,32 +1591,32 @@ func TestSweepDeadNodes(t *testing.T) {
 	}
 }
 
-func TestHTTPScalePlacerHonorsMinReadyScalers(t *testing.T) {
+func TestHTTPPlacerHonorsMinReadyPlacers(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
-	reg.SetScalerPeerSource(func(string) []ScalerPeer {
-		return []ScalerPeer{{ID: "s1", Advertise: "http://127.0.0.1:1"}}
+	reg.SetPlacerPeerSource(func(string) []PlacerPeer {
+		return []PlacerPeer{{ID: "s1", Advertise: "http://127.0.0.1:1"}}
 	})
-	placer := NewHTTPScalePlacerWithMinReady(reg, 1, 2, 100*time.Millisecond)
+	placer := NewHTTPPlacerWithMinReady(reg, 1, 2, 100*time.Millisecond)
 	if _, err := placer.Place(ctx, PlaceRequest{Group: "/g", RouteKey: "rk"}); err != ErrNoNode {
-		t.Fatalf("Place with one ready scaler and min_ready=2 err=%v, want ErrNoNode", err)
+		t.Fatalf("Place with one ready placer and min_ready=2 err=%v, want ErrNoNode", err)
 	}
 	if _, err := reg.VerifyAPIKeyWithMinReady(ctx, "/g", "key", 1, 2, 100*time.Millisecond); err != ErrNoNode {
-		t.Fatalf("VerifyAPIKey with one ready scaler and min_ready=2 err=%v, want ErrNoNode", err)
+		t.Fatalf("VerifyAPIKey with one ready placer and min_ready=2 err=%v, want ErrNoNode", err)
 	}
 }
 
-func TestReadyScalerPeersUseMemberlistSource(t *testing.T) {
+func TestReadyPlacerPeersUseMemberlistSource(t *testing.T) {
 	reg := testReg(t)
-	reg.SetScaleReadyLabel("registry.1.test")
-	reg.SetScalerPeerSource(func(label string) []ScalerPeer {
+	reg.SetPlacerReadyLabel("registry.1.test")
+	reg.SetPlacerPeerSource(func(label string) []PlacerPeer {
 		if label != "registry.1.test" {
 			t.Fatalf("ready label passed to source = %q", label)
 		}
-		return []ScalerPeer{{ID: "s1", Advertise: "http://scaler-1", ReadyLabel: label}}
+		return []PlacerPeer{{ID: "s1", Advertise: "http://placer-1", ReadyLabel: label}}
 	})
-	peers := reg.readyScalerPeers(time.Minute)
-	if len(peers) != 1 || peers[0].ID != "s1" || peers[0].Advertise != "http://scaler-1" {
-		t.Fatalf("ready scaler peers=%+v", peers)
+	peers := reg.readyPlacerPeers(time.Minute)
+	if len(peers) != 1 || peers[0].ID != "s1" || peers[0].Advertise != "http://placer-1" {
+		t.Fatalf("ready placer peers=%+v", peers)
 	}
 }

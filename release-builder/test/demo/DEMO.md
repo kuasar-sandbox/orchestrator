@@ -1,7 +1,7 @@
 # e2b 兼容沙箱主机 — 端到端演示
 
 `demo_e2b.sh` 用**未改造的 e2b Python SDK**(`pip install e2b e2b-code-interpreter`)把
-`sandbox-orchestrator` 的全链路跑一遍:`Template().from_image()` 构建模板(**拉取 + 展平在构建沙箱
+`orchestrator` 的全链路跑一遍:`Template().from_image()` 构建模板(**拉取 + 展平在构建沙箱
 microVM 内进行,客户端不再 docker build/push**)→ 启动真实 microVM → guest 内执行命令 →
 **端口转发 + 出网** → 暂停/恢复 → **暂停态转模板扇出** → **一步迁移**(import+resume)→ 销毁。
 SDK 零修改,仅靠环境变量 + 本机 `/etc/hosts` + 自签 TLS(`SSL_CERT_FILE`)指向本节点
@@ -29,7 +29,7 @@ SDK 零修改,仅靠环境变量 + 本机 `/etc/hosts` + 自签 TLS(`SSL_CERT_FI
 ## 前置条件
 
 - 二进制(`make -C kuasar-sandbox build`):`node-ctl`、`store-ctl`、**`cache-ctl`**(CGO/rocksdb)、
-  `flatten-ctl`、`e2b-key-ctl`、`vswitch-ctl`、`cloud-hypervisor`、`vmlinux`、`sandbox-runtime-e2b.erofs`、
+  `flatten-ctl`、`e2b-key-ctl`、`connector-ctl vswitch`、`cloud-hypervisor`、`vmlinux`、`sandbox-runtime-e2b.erofs`、
   `sandbox-runtime-builder.erofs`(`make sandbox-runtime-builder`;构建沙箱的 guest 运行时)。
 - 主机:**systemd 为 PID1 + root**(编排经 D-Bus 驱动单元;TLS :443;KVM);可读写 `/dev/kvm`。
 - **e2b Python SDK**:`pip install e2b e2b-code-interpreter`。
@@ -73,7 +73,7 @@ e2b profile 的 guest 网卡是一个 link-local **inner IP** `169.254.0.21/30`�
           ─► host NAT MASQUERADE (-s 100.100.96.0/20, ip_forward=1) ─► internet
 ```
 
-1. **`vswitch-ctl start … --mgmt-extract=:sw0m0:169.254.169.254,0.0.0.0/0`** 在 host(root netns) 建管理网卡
+1. **`connector-ctl vswitch start … --mgmt-extract=:sw0m0:169.254.169.254,0.0.0.0/0`** 在 host(root netns) 建管理网卡
    `sw0m0`、自动加路由 `100.100.96.0/20 dev sw0m0`。eBPF 在 sw0m0 侧 ARP 代答 + 把 host 发往 floatingip 的包
    **DNAT** 成沙箱 inner IP、重定向到对应 tap,回包再 **SNAT** 回 floatingip;`mgmt_cidrs` 含 `0.0.0.0/0` ⇒ 出网入口。
 2. **host NAT**(脚本幂等加、退出删):`iptables -A FORWARD -{i,o} sw0m0 …` + `-t nat -A POSTROUTING -s 100.100.96.0/20 -j MASQUERADE`。
@@ -111,7 +111,7 @@ e2b SDK 用 `E2B_DOMAIN` 推出控制面 `https://api.<domain>` 与数据面 `ht
   `launch.user=0:0`,不沿用镜像 `Config.User`)。
 - **持久存储复用**:`demo_prep.sh` 的 store/cache/仓库常驻、数据落 `DEMO_DATA_DIR`(默认 `~/.cache/kuasar-demo`),
   跨多次演示去重缓存 → 复跑快;`demo_prep.sh reset` 清空重来。
-- **自签 TLS** 仅为本机演示;生产用通配 `*.<domain>` 正式证书(见 `sandbox-orchestrator/docs/node.md` §13)。
+- **自签 TLS** 仅为本机演示;生产用通配 `*.<domain>` 正式证书(见 `orchestrator/docs/node.md` §13)。
 
 自动化回归(断言版、非讲解版)见 `kuasar-sandbox/test/e2e/`:`e2e_run_builder.sh`(三阶段构建流水线:
 guest 内拉取展平 → steps → 模板快照 → 从产物模板 create)与 `e2e_execute.sh`(启动+执行+暂停/恢复状态存活)。

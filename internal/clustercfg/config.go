@@ -1,8 +1,8 @@
 // Package clustercfg loads cluster-ctl's configuration. Each role runs as its own
 // process with its OWN config file and schema; there is no shared
-// file: registry.yaml / router.yaml / scaler.yaml each carry only what that role
+// file: registry.yaml / router.yaml / placer.yaml each carry only what that role
 // needs, grouped by the cluster link they operate: node_link, route_link,
-// scale_link, and node_list.
+// placer_link, and node_list.
 package clustercfg
 
 import (
@@ -63,10 +63,10 @@ type MembershipMember struct {
 }
 
 type MembershipOwnerConfig struct {
-	RouteLink int `yaml:"route_link" json:"route_link"`
-	NodeLink  int `yaml:"node_link" json:"node_link"`
-	ScaleLink int `yaml:"scale_link" json:"scale_link"`
-	NodeList  int `yaml:"node_list" json:"node_list"`
+	RouteLink  int `yaml:"route_link" json:"route_link"`
+	NodeLink   int `yaml:"node_link" json:"node_link"`
+	PlacerLink int `yaml:"placer_link" json:"placer_link"`
+	NodeList   int `yaml:"node_list" json:"node_list"`
 }
 
 // NodeLinkConfig configures node_link behavior. listen is the optional production
@@ -87,11 +87,11 @@ type NodeListConfig struct {
 	WatchRetention int `yaml:"watch_retention"`
 }
 
-// ScaleLinkConfig configures scaler discovery/placement over the unified member listener.
-type ScaleLinkConfig struct {
-	ScalerReplicaCount int    `yaml:"scaler_replica_count"`
-	MinReadyScalers    int    `yaml:"min_ready_scalers"`
-	ScalerLabel        string `yaml:"scaler_label"`
+// PlacerLinkConfig configures placer discovery/placement over the unified member listener.
+type PlacerLinkConfig struct {
+	PlacerReplicaCount int    `yaml:"placer_replica_count"`
+	MinReadyPlacers    int    `yaml:"min_ready_placers"`
+	PlacerLabel        string `yaml:"placer_label"`
 	PlaceTimeout       string `yaml:"place_timeout"`
 }
 
@@ -122,12 +122,12 @@ type RouterCache struct {
 	IdleTimeout string `yaml:"idle_timeout"` // route resolution idle age; default 2m
 }
 
-// PlacementConfig groups the scaler's placement policy.
+// PlacementConfig groups the placer's placement policy.
 type PlacementConfig struct {
 	Candidates             int           `yaml:"candidates"`                // P2C sample size; default 2
 	ZoneAdmitMax           string        `yaml:"zone_admit_max"`            // exclude nodes hotter than this; default yellow
 	NodeDeadAfter          string        `yaml:"node_dead_after"`           // exclude nodes silent longer than this; default 30s
-	ImportSourceOwnerCount int           `yaml:"import_source_owner_count"` // scaler candidates that may race for one source lease
+	ImportSourceOwnerCount int           `yaml:"import_source_owner_count"` // placer candidates that may race for one source lease
 	ImportSourceLeaseTTL   string        `yaml:"import_source_lease_ttl"`   // registry-side source lease TTL
 	SelectorPatchRefresh   string        `yaml:"selector_patch_refresh_interval"`
 	ShuffleSharding        []ShuffleRule `yaml:"shuffle_sharding"` // empty = static nodeSelectors only
@@ -139,10 +139,10 @@ type GroupSourceConfig struct {
 	Path       string `yaml:"path,omitempty"`
 }
 
-// ScalerProcessConfig is the standalone scaler's own control plane. The same
-// advertise address is used for scaler API calls and scaler memberlist HTTP
+// PlacerProcessConfig is the standalone placer's own control plane. The same
+// advertise address is used for placer API calls and placer memberlist HTTP
 // transport.
-type ScalerProcessConfig struct {
+type PlacerProcessConfig struct {
 	ID              string `yaml:"id"`
 	Listen          string `yaml:"listen"`
 	Advertise       string `yaml:"advertise"`
@@ -233,7 +233,7 @@ func (c *RouteLinkConfig) ParkDur() time.Duration {
 	d, _ := time.ParseDuration(c.ParkTimeout)
 	return d
 }
-func (c *ScaleLinkConfig) PlaceDur() time.Duration {
+func (c *PlacerLinkConfig) PlaceDur() time.Duration {
 	d, _ := time.ParseDuration(c.PlaceTimeout)
 	return d
 }
@@ -339,7 +339,7 @@ func (m MembershipConfig) WithComputedLabels() MembershipConfig {
 
 // WithComputedLabel returns a copy with label set to
 // registry.<version>.<sha256(sort(member ids))>. The label is used to isolate
-// scaler ready state and watch tokens from different membership versions.
+// placer ready state and watch tokens from different membership versions.
 func (v MembershipVersion) WithComputedLabel() MembershipVersion {
 	if v.Label != "" {
 		return v
@@ -391,7 +391,7 @@ func validateDurations(m map[string]string) error {
 // ===========================================================================
 
 // RegistryConfig is the registry role's config. member.listen is the default
-// listener for node_link, route_link, scale_link, and member RPC. node_link.listen
+// listener for node_link, route_link, placer_link, and member RPC. node_link.listen
 // may split long-lived node streams onto another listener.
 type RegistryConfig struct {
 	Member     MemberConfig     `yaml:"member"`
@@ -399,7 +399,7 @@ type RegistryConfig struct {
 	NodeLink   NodeLinkConfig   `yaml:"node_link"`
 	RouteLink  RouteLinkConfig  `yaml:"route_link"`
 	NodeList   NodeListConfig   `yaml:"node_list"`
-	ScaleLink  ScaleLinkConfig  `yaml:"scale_link"`
+	PlacerLink PlacerLinkConfig `yaml:"placer_link"`
 }
 
 // DefaultRegistry returns the registry config with all non-required fields set.
@@ -412,12 +412,12 @@ func DefaultRegistry() RegistryConfig {
 				Version: 1,
 				Members: []MembershipMember{{ID: "registry", Advertise: defaultRegistryBootstrap, NodeAdvertise: defaultRegistryBootstrap}},
 			}},
-			Owners: MembershipOwnerConfig{RouteLink: 1, NodeLink: 1, ScaleLink: 1, NodeList: 1},
+			Owners: MembershipOwnerConfig{RouteLink: 1, NodeLink: 1, PlacerLink: 1, NodeList: 1},
 		},
-		NodeLink:  NodeLinkConfig{HeartbeatInterval: "10s", NodeDeadAfter: "30s"},
-		RouteLink: RouteLinkConfig{ParkTimeout: "30s"},
-		NodeList:  NodeListConfig{WatchRetention: 10000},
-		ScaleLink: ScaleLinkConfig{ScalerReplicaCount: 3, MinReadyScalers: 1, ScalerLabel: "scaler.default", PlaceTimeout: "2s"},
+		NodeLink:   NodeLinkConfig{HeartbeatInterval: "10s", NodeDeadAfter: "30s"},
+		RouteLink:  RouteLinkConfig{ParkTimeout: "30s"},
+		NodeList:   NodeListConfig{WatchRetention: 10000},
+		PlacerLink: PlacerLinkConfig{PlacerReplicaCount: 3, MinReadyPlacers: 1, PlacerLabel: "placer.default", PlaceTimeout: "2s"},
 	}
 }
 
@@ -468,8 +468,8 @@ func (c *RegistryConfig) applyDefaults() {
 	if c.Membership.Owners.NodeLink == 0 {
 		c.Membership.Owners.NodeLink = d.Membership.Owners.NodeLink
 	}
-	if c.Membership.Owners.ScaleLink == 0 {
-		c.Membership.Owners.ScaleLink = d.Membership.Owners.ScaleLink
+	if c.Membership.Owners.PlacerLink == 0 {
+		c.Membership.Owners.PlacerLink = d.Membership.Owners.PlacerLink
 	}
 	if c.Membership.Owners.NodeList == 0 {
 		c.Membership.Owners.NodeList = d.Membership.Owners.NodeList
@@ -486,17 +486,17 @@ func (c *RegistryConfig) applyDefaults() {
 	if c.NodeList.WatchRetention == 0 {
 		c.NodeList.WatchRetention = d.NodeList.WatchRetention
 	}
-	if c.ScaleLink.ScalerReplicaCount == 0 {
-		c.ScaleLink.ScalerReplicaCount = d.ScaleLink.ScalerReplicaCount
+	if c.PlacerLink.PlacerReplicaCount == 0 {
+		c.PlacerLink.PlacerReplicaCount = d.PlacerLink.PlacerReplicaCount
 	}
-	if c.ScaleLink.MinReadyScalers == 0 {
-		c.ScaleLink.MinReadyScalers = d.ScaleLink.MinReadyScalers
+	if c.PlacerLink.MinReadyPlacers == 0 {
+		c.PlacerLink.MinReadyPlacers = d.PlacerLink.MinReadyPlacers
 	}
-	if c.ScaleLink.ScalerLabel == "" {
-		c.ScaleLink.ScalerLabel = d.ScaleLink.ScalerLabel
+	if c.PlacerLink.PlacerLabel == "" {
+		c.PlacerLink.PlacerLabel = d.PlacerLink.PlacerLabel
 	}
-	if c.ScaleLink.PlaceTimeout == "" {
-		c.ScaleLink.PlaceTimeout = d.ScaleLink.PlaceTimeout
+	if c.PlacerLink.PlaceTimeout == "" {
+		c.PlacerLink.PlaceTimeout = d.PlacerLink.PlaceTimeout
 	}
 }
 
@@ -578,7 +578,7 @@ func (c *RegistryConfig) Validate() error {
 	if err := c.validateSelfMemberConsistency(); err != nil {
 		return err
 	}
-	if err := c.validateScalerLabelDoesNotConflict(); err != nil {
+	if err := c.validatePlacerLabelDoesNotConflict(); err != nil {
 		return err
 	}
 	if c.Membership.Owners.RouteLink <= 0 {
@@ -587,8 +587,8 @@ func (c *RegistryConfig) Validate() error {
 	if c.Membership.Owners.NodeLink <= 0 {
 		return fmt.Errorf("clustercfg: membership.owners.node_link must be positive")
 	}
-	if c.Membership.Owners.ScaleLink <= 0 {
-		return fmt.Errorf("clustercfg: membership.owners.scale_link must be positive")
+	if c.Membership.Owners.PlacerLink <= 0 {
+		return fmt.Errorf("clustercfg: membership.owners.placer_link must be positive")
 	}
 	if c.Membership.Owners.NodeList <= 0 {
 		return fmt.Errorf("clustercfg: membership.owners.node_list must be positive")
@@ -596,24 +596,24 @@ func (c *RegistryConfig) Validate() error {
 	if c.NodeList.WatchRetention <= 0 {
 		return fmt.Errorf("clustercfg: node_list.watch_retention must be positive")
 	}
-	if c.ScaleLink.ScalerReplicaCount <= 0 {
-		return fmt.Errorf("clustercfg: scale_link.scaler_replica_count must be positive")
+	if c.PlacerLink.PlacerReplicaCount <= 0 {
+		return fmt.Errorf("clustercfg: placer_link.placer_replica_count must be positive")
 	}
-	if c.ScaleLink.MinReadyScalers <= 0 {
-		return fmt.Errorf("clustercfg: scale_link.min_ready_scalers must be positive")
+	if c.PlacerLink.MinReadyPlacers <= 0 {
+		return fmt.Errorf("clustercfg: placer_link.min_ready_placers must be positive")
 	}
-	if c.ScaleLink.MinReadyScalers > c.ScaleLink.ScalerReplicaCount {
-		return fmt.Errorf("clustercfg: scale_link.min_ready_scalers must not exceed scaler_replica_count")
+	if c.PlacerLink.MinReadyPlacers > c.PlacerLink.PlacerReplicaCount {
+		return fmt.Errorf("clustercfg: placer_link.min_ready_placers must not exceed placer_replica_count")
 	}
-	if c.ScaleLink.ScalerLabel == "" {
-		return fmt.Errorf("clustercfg: scale_link.scaler_label is required")
+	if c.PlacerLink.PlacerLabel == "" {
+		return fmt.Errorf("clustercfg: placer_link.placer_label is required")
 	}
 	return validateDurations(map[string]string{
 		"membership.reload_ready_timeout": c.Membership.ReloadReadyTimeout,
 		"node_link.heartbeat_interval":    c.NodeLink.HeartbeatInterval,
 		"node_link.node_dead_after":       c.NodeLink.NodeDeadAfter,
 		"route_link.park_timeout":         c.RouteLink.ParkTimeout,
-		"scale_link.place_timeout":        c.ScaleLink.PlaceTimeout,
+		"placer_link.place_timeout":       c.PlacerLink.PlaceTimeout,
 	})
 }
 
@@ -674,14 +674,14 @@ func (c *RegistryConfig) validateSelfMemberConsistency() error {
 	return nil
 }
 
-func (c *RegistryConfig) validateScalerLabelDoesNotConflict() error {
-	if c.ScaleLink.ScalerLabel == "" {
+func (c *RegistryConfig) validatePlacerLabelDoesNotConflict() error {
+	if c.PlacerLink.PlacerLabel == "" {
 		return nil
 	}
 	for _, version := range c.Membership.Versions {
 		label := version.WithComputedLabel().Label
-		if label == c.ScaleLink.ScalerLabel {
-			return fmt.Errorf("clustercfg: scale_link.scaler_label %q conflicts with registry membership label", c.ScaleLink.ScalerLabel)
+		if label == c.PlacerLink.PlacerLabel {
+			return fmt.Errorf("clustercfg: placer_link.placer_label %q conflicts with registry membership label", c.PlacerLink.PlacerLabel)
 		}
 	}
 	return nil
@@ -810,23 +810,23 @@ func (c *RouterConfig) RouteIdleDur() time.Duration {
 }
 
 // ===========================================================================
-// scaler.yaml — placement scheduler (cluster-scaler.md).
+// placer.yaml — placement scheduler (cluster-placer.md).
 // ===========================================================================
 
-// ScalerConfig is the standalone scaler's config. It discovers registry
-// membership through the bootstrap endpoint, pushes itself to scale_link, and
+// PlacerConfig is the standalone placer's config. It discovers registry
+// membership through the bootstrap endpoint, pushes itself to placer_link, and
 // answers placement calls from registry route owners.
-type ScalerConfig struct {
-	Scaler       ScalerProcessConfig `yaml:"scaler"`
+type PlacerConfig struct {
+	Placer       PlacerProcessConfig `yaml:"placer"`
 	Registry     RegistryDialConfig  `yaml:"registry"` // upstream: registry bootstrap/membership
 	ImportGroups []GroupSourceConfig `yaml:"import_groups,omitempty"`
 	Placement    PlacementConfig     `yaml:"placement"` // placement policy
 }
 
-// DefaultScaler returns the scaler config with all non-required fields set.
-func DefaultScaler() ScalerConfig {
-	return ScalerConfig{
-		Scaler:       ScalerProcessConfig{ID: "scaler", Listen: ":7800", Advertise: "127.0.0.1:7800", MemberlistLabel: "scaler.default"},
+// DefaultPlacer returns the placer config with all non-required fields set.
+func DefaultPlacer() PlacerConfig {
+	return PlacerConfig{
+		Placer:       PlacerProcessConfig{ID: "placer", Listen: ":7800", Advertise: "127.0.0.1:7800", MemberlistLabel: "placer.default"},
 		Registry:     RegistryDialConfig{Bootstrap: defaultRegistryBootstrap},
 		ImportGroups: nil,
 		Placement: PlacementConfig{
@@ -836,9 +836,9 @@ func DefaultScaler() ScalerConfig {
 	}
 }
 
-// LoadScaler reads, defaults, and validates scaler.yaml.
-func LoadScaler(path string) (*ScalerConfig, error) {
-	c := DefaultScaler()
+// LoadPlacer reads, defaults, and validates placer.yaml.
+func LoadPlacer(path string) (*PlacerConfig, error) {
+	c := DefaultPlacer()
 	if path != "" {
 		raw, err := os.ReadFile(path)
 		if err != nil {
@@ -855,19 +855,19 @@ func LoadScaler(path string) (*ScalerConfig, error) {
 	return &c, nil
 }
 
-func (c *ScalerConfig) applyDefaults() {
-	d := DefaultScaler()
-	if c.Scaler.ID == "" {
-		c.Scaler.ID = d.Scaler.ID
+func (c *PlacerConfig) applyDefaults() {
+	d := DefaultPlacer()
+	if c.Placer.ID == "" {
+		c.Placer.ID = d.Placer.ID
 	}
-	if c.Scaler.Listen == "" {
-		c.Scaler.Listen = d.Scaler.Listen
+	if c.Placer.Listen == "" {
+		c.Placer.Listen = d.Placer.Listen
 	}
-	if c.Scaler.Advertise == "" {
-		c.Scaler.Advertise = d.Scaler.Advertise
+	if c.Placer.Advertise == "" {
+		c.Placer.Advertise = d.Placer.Advertise
 	}
-	if c.Scaler.MemberlistLabel == "" {
-		c.Scaler.MemberlistLabel = d.Scaler.MemberlistLabel
+	if c.Placer.MemberlistLabel == "" {
+		c.Placer.MemberlistLabel = d.Placer.MemberlistLabel
 	}
 	if c.Registry.Bootstrap == "" {
 		c.Registry.Bootstrap = d.Registry.Bootstrap
@@ -892,21 +892,21 @@ func (c *ScalerConfig) applyDefaults() {
 	}
 }
 
-func (c *ScalerConfig) Validate() error {
-	if c.Scaler.ID == "" {
-		return fmt.Errorf("clustercfg: scaler.id is required")
+func (c *PlacerConfig) Validate() error {
+	if c.Placer.ID == "" {
+		return fmt.Errorf("clustercfg: placer.id is required")
 	}
-	if c.Scaler.Listen == "" {
-		return fmt.Errorf("clustercfg: scaler.listen is required")
+	if c.Placer.Listen == "" {
+		return fmt.Errorf("clustercfg: placer.listen is required")
 	}
-	if c.Scaler.Advertise == "" {
-		return fmt.Errorf("clustercfg: scaler.advertise is required")
+	if c.Placer.Advertise == "" {
+		return fmt.Errorf("clustercfg: placer.advertise is required")
 	}
 	if c.Registry.Bootstrap == "" {
 		return fmt.Errorf("clustercfg: registry.bootstrap is required")
 	}
-	if c.Scaler.MemberlistLabel == "" {
-		return fmt.Errorf("clustercfg: scaler.memberlist_label is required")
+	if c.Placer.MemberlistLabel == "" {
+		return fmt.Errorf("clustercfg: placer.memberlist_label is required")
 	}
 	switch c.Placement.ZoneAdmitMax {
 	case "", "green", "yellow", "red":
@@ -944,8 +944,8 @@ func (c *ScalerConfig) Validate() error {
 	})
 }
 
-// NodeDeadDur is how long a node may be silent before the scaler excludes it.
-func (c *ScalerConfig) NodeDeadDur() time.Duration {
+// NodeDeadDur is how long a node may be silent before the placer excludes it.
+func (c *PlacerConfig) NodeDeadDur() time.Duration {
 	d, _ := time.ParseDuration(c.Placement.NodeDeadAfter)
 	return d
 }

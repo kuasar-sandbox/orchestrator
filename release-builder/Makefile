@@ -11,7 +11,7 @@
 # + runs this repo's own cross-repo e2e sub-targets. Same for `perf` and `bench`.
 
 SHELL    := /bin/bash
-ORG      := $(abspath $(CURDIR)/..)
+ORG      := $(abspath $(CURDIR)/../..)
 VERSION  ?= v0.1.1
 
 # ---------------------------------------------------------------------------
@@ -35,11 +35,13 @@ export TARGET_ARCH
 BINDIR         := bin/$(TARGET_ARCH)
 SBIN           := $(abspath $(BINDIR))
 ARTIFACTS_LIST := scripts/artifacts.list
-GO_REPOS       := sandbox-accelerator sandbox-runtime sandbox-vswitch sandbox-orchestrator
+GO_REPOS       := accelerator sandboxer connector orchestrator
 
 # Cross-repo e2e tests this repo carries (each needs binaries from multiple
-# sub-repos: vmlinux/CH/mkfs.erofs from sandbox-deps, manifest-ctl/store-ctl/
-# cache-ctl/flatten-ctl from sandbox-accelerator, node-ctl from sandbox-orchestrator, etc.).
+# sub-repos: vmlinux/CH/mkfs.erofs from guest-runtime/native-deps,
+# manifest-ctl/store-ctl/cache-ctl/flatten-ctl from accelerator,
+# sandbox-ctl from sandboxer, connector-ctl from connector, node-ctl from
+# orchestrator, etc.).
 #
 # Auto-derived from the filesystem so `make test-e2e` always runs EVERY e2e script
 # (drop an e2e_*.sh into test/e2e/ and it is included — no list to forget). The
@@ -57,21 +59,26 @@ PERF_TARGETS := perf-sandbox perf-sandbox-manifest perf-density
 
 all: build
 
-# Full platform build. Sub-repo order matters: sandbox-deps leads (mkfs.erofs
-# is needed by sandbox-runtime to pack the guest erofs). Each sub-repo's
+# Full platform build. Sub-repo order matters: guest-runtime/native-deps leads (mkfs.erofs
+# is needed by sandboxer to pack the guest erofs). Each sub-repo's
 # `build` builds every binary it ships. After all sub-builds, `collect`
 # assembles every artifact under bin/$(TARGET_ARCH)/; then the e2b guest runtime
 # (sandbox-runtime-e2b.erofs) is assembled from the collected envd + base erofs +
 # erofs tools, and a second `collect` folds it into bin/$(TARGET_ARCH)/.
 build:
-	$(MAKE) -C $(ORG)/sandbox-deps build
-	$(MAKE) -C $(ORG)/sandbox-accelerator build
-	$(MAKE) -C $(ORG)/sandbox-runtime build
-	$(MAKE) -C $(ORG)/sandbox-vswitch build
-	$(MAKE) -C $(ORG)/sandbox-orchestrator build
+	$(MAKE) -C $(ORG)/guest-runtime/native-deps build
+	$(MAKE) -C $(ORG)/accelerator build
+	$(MAKE) -C $(ORG)/sandboxer build
+	$(MAKE) -C $(ORG)/connector build
+	$(MAKE) -C $(ORG)/orchestrator build
 	@$(MAKE) collect
-	$(MAKE) -C $(ORG)/sandbox-orchestrator sandbox-runtime-e2b
-	$(MAKE) -C $(ORG)/sandbox-orchestrator sandbox-runtime-builder
+	$(MAKE) -C $(ORG)/orchestrator sandbox-runtime-e2b \
+	  BASE_RUNTIME=$(SBIN)/sandbox-runtime.erofs ENVD=$(SBIN)/envd \
+	  FSCK=$(SBIN)/fsck.erofs MKFS=$(SBIN)/mkfs.erofs
+	$(MAKE) -C $(ORG)/orchestrator sandbox-runtime-builder \
+	  BASE_RUNTIME=$(SBIN)/sandbox-runtime.erofs ENVD=$(SBIN)/envd \
+	  FSCK=$(SBIN)/fsck.erofs MKFS=$(SBIN)/mkfs.erofs \
+	  FLATTEN_CTL=$(SBIN)/flatten-ctl MKFS_GUEST=$(SBIN)/mkfs.erofs
 	@$(MAKE) collect
 
 # Assemble bin/$(TARGET_ARCH)/ from each sub-repo's per-arch bin per the
@@ -111,8 +118,8 @@ $(UMBRELLA_E2E): test-e2e-%: build
 
 # Aggregate test-e2e: every umbrella sub-target + each sub-repo's test-e2e.
 test-e2e: build $(UMBRELLA_E2E)
-	$(MAKE) -C $(ORG)/sandbox-accelerator test-e2e
-	$(MAKE) -C $(ORG)/sandbox-vswitch test-e2e
+	$(MAKE) -C $(ORG)/accelerator test-e2e
+	$(MAKE) -C $(ORG)/connector test-e2e
 
 # perf harnesses living in this repo (cross-repo binary use).
 perf-sandbox: build
@@ -124,7 +131,7 @@ perf-density: build
 
 # Aggregate perf: accelerator's perf-cache + this repo's perfs.
 perf: build
-	$(MAKE) -C $(ORG)/sandbox-accelerator perf-cache
+	$(MAKE) -C $(ORG)/accelerator perf-cache
 	$(MAKE) $(PERF_TARGETS)
 
 # Go micro-benchmarks across every Go sub-repo.
@@ -133,7 +140,7 @@ bench:
 
 # Dedup analysis report (lives in accelerator).
 dedup-report:
-	$(MAKE) -C $(ORG)/sandbox-accelerator dedup-report
+	$(MAKE) -C $(ORG)/accelerator dedup-report
 
 # e2b end-to-end demo — the "try it" walkthrough driven by the unmodified e2b CLI
 # (build template → boot microVM → exec → pause/resume → kill). DEMO_PAUSE=1 to
@@ -152,7 +159,7 @@ test:
 	@for r in $(GO_REPOS); do echo "== test $$r =="; $(MAKE) -C $(ORG)/$$r test || exit 1; done
 
 clean:
-	@for r in $(GO_REPOS) sandbox-deps; do $(MAKE) -C $(ORG)/$$r clean 2>/dev/null || true; done
+	@for r in $(GO_REPOS) guest-runtime/native-deps; do $(MAKE) -C $(ORG)/$$r clean 2>/dev/null || true; done
 	rm -rf bin build dist
 
 help:
@@ -165,7 +172,7 @@ help:
 	@echo "  demo          run the e2b end-to-end demo (test/demo/demo_e2b.sh; DEMO_PAUSE=1 to step through)"
 	@echo "  perf          aggregate: accelerator perf-cache + this repo's perf-sandbox/-manifest/-density"
 	@echo "  bench         Go micro-benchmarks across every Go sub-repo"
-	@echo "  dedup-report  delegate to sandbox-accelerator"
+	@echo "  dedup-report  delegate to accelerator"
 	@echo "  vet / test    drive each Go sub-repo's vet/test target"
 	@echo "  clean         clean every sub-repo + this repo's bin/ build/ dist/"
 	@echo "  TARGET_ARCH   x86_64 (default) | aarch64  (exported to sub-makes)"

@@ -3,7 +3,7 @@ package clustercfg
 import "testing"
 
 // TestValidateRejectsBadValues exercises each role's Validate over the bad values it
-// owns (durations/membership → registry, zones/candidates → scaler, auth → router).
+// owns (durations/membership → registry, zones/candidates → placer, auth → router).
 func TestValidateRejectsBadValues(t *testing.T) {
 	t.Run("registry bad duration", func(t *testing.T) {
 		c := DefaultRegistry()
@@ -19,15 +19,15 @@ func TestValidateRejectsBadValues(t *testing.T) {
 			t.Error("Validate accepted a member.id outside active membership")
 		}
 	})
-	t.Run("scaler bad zone_admit_max", func(t *testing.T) {
-		c := DefaultScaler()
+	t.Run("placer bad zone_admit_max", func(t *testing.T) {
+		c := DefaultPlacer()
 		c.Placement.ZoneAdmitMax = "purple"
 		if err := c.Validate(); err == nil {
 			t.Error("Validate accepted a bad zone_admit_max")
 		}
 	})
-	t.Run("scaler negative candidates", func(t *testing.T) {
-		c := DefaultScaler()
+	t.Run("placer negative candidates", func(t *testing.T) {
+		c := DefaultPlacer()
 		c.Placement.Candidates = -1
 		if err := c.Validate(); err == nil {
 			t.Error("Validate accepted a negative placement.candidates")
@@ -51,9 +51,9 @@ func TestValidateRejectsBadValues(t *testing.T) {
 		if err := rt.Validate(); err != nil {
 			t.Fatalf("a valid default router failed Validate: %v", err)
 		}
-		s := DefaultScaler()
+		s := DefaultPlacer()
 		if err := s.Validate(); err != nil {
-			t.Fatalf("a valid default scaler failed Validate: %v", err)
+			t.Fatalf("a valid default placer failed Validate: %v", err)
 		}
 	})
 }

@@ -11,8 +11,8 @@ import (
 	"encoding/hex"
 	"fmt"
 
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/apikey"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/configsock"
+	"github.com/kuasar-sandbox/orchestrator/internal/apikey"
+	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 )
 
 // AddManifestKey adds key (64-hex) to the allowlist, or refreshes it if it already

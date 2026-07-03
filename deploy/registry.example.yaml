@@ -18,7 +18,7 @@ membership:
   owners:
     route_link: 1
     node_link: 1
-    scale_link: 1
+    placer_link: 1
     node_list: 1
 
 node_link:
@@ -32,8 +32,8 @@ route_link:
 node_list:
   watch_retention: 10000
 
-scale_link:
-  scaler_label: scaler.default
-  scaler_replica_count: 3
-  min_ready_scalers: 1
+placer_link:
+  placer_label: placer.default
+  placer_replica_count: 3
+  min_ready_placers: 1
   place_timeout: 2s

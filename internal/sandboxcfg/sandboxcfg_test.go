@@ -4,8 +4,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/types"
-	rtconfig "github.com/kuasar-sandbox/sandbox-runtime/pkg/config"
+	"github.com/kuasar-sandbox/orchestrator/internal/types"
+	rtconfig "github.com/kuasar-sandbox/sandboxer/pkg/config"
 )
 
 func TestParseSpecNamespaces(t *testing.T) {

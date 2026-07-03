@@ -1,6 +1,6 @@
 package cluster
 
-import "github.com/kuasar-sandbox/sandbox-orchestrator/internal/cluster/shardkv"
+import "github.com/kuasar-sandbox/orchestrator/internal/cluster/shardkv"
 
 var (
 	ErrConflict = shardkv.ErrConflict

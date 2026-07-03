@@ -16,8 +16,8 @@ import (
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
 
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/nodelink"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/routesync"
+	"github.com/kuasar-sandbox/orchestrator/internal/nodelink"
+	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 )
 
 func TestNodeLinkIngressRelaysToNodeOwner(t *testing.T) {

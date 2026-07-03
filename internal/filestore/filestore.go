@@ -21,7 +21,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/smithy-go"
 
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/config"
+	"github.com/kuasar-sandbox/orchestrator/internal/config"
 )
 
 // Store presigns and probes objects in one bucket.

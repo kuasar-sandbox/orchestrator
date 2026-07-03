@@ -46,8 +46,8 @@ import (
 	"fmt"
 	"log/slog"
 
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/builder"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/configsock"
+	"github.com/kuasar-sandbox/orchestrator/internal/builder"
+	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 )
 
 func runBuilder(args []string, log *slog.Logger) error {

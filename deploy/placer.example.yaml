@@ -1,15 +1,15 @@
-# cluster-ctl scaler config — cluster-ctl scaler --config /etc/cluster-ctl/scaler.yaml.
-# Standalone placement scheduler (docs/cluster-scaler.md): it starts from registry
-# membership, joins the scaler memberlist label, consumes node_list, and provides
+# cluster-ctl placer config — cluster-ctl placer --config /etc/cluster-ctl/placer.yaml.
+# Standalone placement scheduler (docs/cluster-placer.md): it starts from registry
+# membership, joins the placer memberlist label, consumes node_list, and provides
 # placement for registry callers.
-# Validate with `cluster-ctl config scaler --config scaler.yaml`.
+# Validate with `cluster-ctl config placer --config placer.yaml`.
 
-scaler:
-  id: scaler-1
+placer:
+  id: placer-1
   listen: ":7800"
-  advertise: "https://scaler-1.example:7800"
-  memberlist_label: scaler.default
-  # tls: { cert: ..., key: ..., ca: ... }   # server mTLS for scaler Place API
+  advertise: "https://placer-1.example:7800"
+  memberlist_label: placer.default
+  # tls: { cert: ..., key: ..., ca: ... }   # server mTLS for placer Place API
 
 registry:
   bootstrap: registry-1.example:7700

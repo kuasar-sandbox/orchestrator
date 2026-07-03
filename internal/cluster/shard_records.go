@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/cluster/shardkv"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/routesync"
+	"github.com/kuasar-sandbox/orchestrator/internal/cluster/shardkv"
+	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 )
 
 const (
@@ -17,11 +17,11 @@ const (
 	RecordSetNodeBuild       shardkv.RecordSetName = "build"
 	RecordSetNodeManifestKey shardkv.RecordSetName = "manifest_key"
 	RecordSetNodeListNodes   shardkv.RecordSetName = "nodes"
-	RecordSetScaleImport     shardkv.RecordSetName = "import"
+	RecordSetPlacerImport    shardkv.RecordSetName = "import"
 
 	NodeLinkProfileRecord  shardkv.RecordKey = "profile"
 	RouteLinkProfileRecord shardkv.RecordKey = "profile"
-	ScaleLinkStateRecord   shardkv.RecordKey = "state"
+	PlacerLinkStateRecord  shardkv.RecordKey = "state"
 	NodeListShard          shardkv.ShardKey  = "node_list"
 )
 
@@ -57,7 +57,7 @@ func NodeListRecordKey(nodeID string) shardkv.RecordKey {
 	return shardkv.RecordKey(nodeID)
 }
 
-func ScaleImportSourceShard(sourceID string) shardkv.ShardKey {
+func PlacerImportSourceShard(sourceID string) shardkv.ShardKey {
 	return shardkv.ShardKey("import/source/" + sourceID)
 }
 
@@ -81,7 +81,7 @@ func ParseRouteBuildRecordKey(key shardkv.RecordKey) (buildID string, ok bool) {
 	return string(key), key != ""
 }
 
-func ParseScaleImportSourceShard(shard shardkv.ShardKey) (sourceID string, ok bool) {
+func ParsePlacerImportSourceShard(shard shardkv.ShardKey) (sourceID string, ok bool) {
 	value, ok := strings.CutPrefix(string(shard), "import/source/")
 	return value, ok && value != ""
 }
@@ -112,7 +112,7 @@ type NodeProfileRecord struct {
 	LinkOwner         string                    `json:"link_owner,omitempty"`
 }
 
-type ScaleImportSourceState struct {
+type PlacerImportSourceState struct {
 	SourceID      string `json:"source_id"`
 	OwnerID       string `json:"owner_id,omitempty"`
 	RunID         string `json:"run_id,omitempty"`

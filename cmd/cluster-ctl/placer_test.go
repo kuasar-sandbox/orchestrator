@@ -8,12 +8,12 @@ import (
 	"sync/atomic"
 	"testing"
 
-	clusterstate "github.com/kuasar-sandbox/sandbox-orchestrator/internal/cluster"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/clustercfg"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/clusterclient"
+	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
+	"github.com/kuasar-sandbox/orchestrator/internal/clustercfg"
+	"github.com/kuasar-sandbox/orchestrator/internal/clusterclient"
 )
 
-func TestScaleLinkResolverUsesCachedMembership(t *testing.T) {
+func TestPlacerLinkResolverUsesCachedMembership(t *testing.T) {
 	var hits atomic.Int32
 	var srv *httptest.Server
 	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
@@ -32,7 +32,7 @@ func TestScaleLinkResolverUsesCachedMembership(t *testing.T) {
 					{ID: "c", Advertise: srv.URL},
 				},
 			}},
-			Owners: clustercfg.MembershipOwnerConfig{RouteLink: 1, NodeLink: 1, ScaleLink: 2, NodeList: 1},
+			Owners: clustercfg.MembershipOwnerConfig{RouteLink: 1, NodeLink: 1, PlacerLink: 2, NodeList: 1},
 		})
 	}))
 	defer srv.Close()
@@ -42,10 +42,10 @@ func TestScaleLinkResolverUsesCachedMembership(t *testing.T) {
 		t.Fatal(err)
 	}
 	hits.Store(0)
-	resolver := newScaleLinkResolver(regClient)
+	resolver := newPlacerLinkResolver(regClient)
 
 	for _, source := range []string{"source-a", "source-b", "source-c"} {
-		links, err := resolver(context.Background(), string(clusterstate.ScaleImportSourceShard(source)))
+		links, err := resolver(context.Background(), string(clusterstate.PlacerImportSourceShard(source)))
 		if err != nil {
 			t.Fatalf("resolve %s: %v", source, err)
 		}

@@ -2,15 +2,15 @@
 
 `node-ctl` 是计算节点上的单实例常驻 daemon,对外提供一套 **e2b 兼容 API**,把节点上的
 microVM 沙箱以 e2b 协议暴露给客户端——未改造的 e2b SDK(python / js `e2b`、
-`@e2b/code-interpreter`)与 e2b CLI 可直接指向本机运行。`node-ctl serve` 一身兼数职:
+`@e2b/code-interpreter`)与 e2b CLI 可直接指向本机运行。`node-ctl conductor serve` 一身兼数职:
 **api**(控制面 REST:沙箱生命周期、模板构建、鉴权)、**主机**(经 systemd 模板单元
-拉起/停止 `sandbox-ctl` 与 `flatten-ctl`,调 `vswitch-ctl` 编排网络)、**proxy**(把
+拉起/停止 `sandbox-ctl` 与 `flatten-ctl`,调 `connector-ctl vswitch` 编排网络)、**proxy**(把
 客户端到沙箱的数据面流量反代到 guest)、可选的**资源控制器**(节点级资源仲裁,经
 `resource_listen` 内置,node-resource.md)、以及 **node-link 客户端**(接入集群,把本节点
 交由 cluster-ctl 编排,§10)。
 
 node-ctl 既可**独立运行**(直供 e2b SDK / CLI,单机即可用),也可经 node-link **接入集群**
-由 registry / router / scaler 编排(cluster.md);两态共用同一套 e2b 控制面与生命周期原语——
+由 registry / router / placer 编排(cluster.md);两态共用同一套 e2b 控制面与生命周期原语——
 **控制面 create / pause / kill / 模板构建始终在本节点**,集群只下发高层命令复用这些原语(§10)。
 
 沙箱本体由 `sandbox-ctl` 运行(microVM,cloud-hypervisor);e2b profile 的 guest 内
@@ -38,11 +38,11 @@ node-ctl 补这一层,并刻意选择 **e2b 协议兼容**而非自定义 API:e2
 
 ### 1.2 设计原则
 
-1. **依赖面薄,经 CLI 组合**:驱动 `sandbox-ctl`(run/snapshot)、`vswitch-ctl`
+1. **依赖面薄,经 CLI 组合**:驱动 `sandbox-ctl`(run/snapshot)、`connector-ctl vswitch`
    (attach/detach)、`flatten-ctl`(export)全部经子进程 CLI,不 import 兄弟仓内部包;
    经 systemd D-Bus 管单元;经 UDS 反代 envd。叶子组件,纯 Go,`CGO_ENABLED=0`。
 2. **资源仲裁内置且可分离**:沙箱准入/配额由 `sandbox-ctl`(`pkg/resource` 的 client)
-   与节点级**资源控制器**对话完成;控制器由 `node-ctl serve` 经 `resource_listen` 内置
+   与节点级**资源控制器**对话完成;控制器由 `node-ctl conductor serve` 经 `resource_listen` 内置
    (node-resource.md),调参随 serve 配置内联。它仍是与 serve 的 api / 主机 / proxy
    逻辑解耦的可分离子系统。构建任务的资源池由 serve 自管(§12)。
 3. **进程管理交给 systemd**:一沙箱一单元(`sandbox-runner@<sid>`),单元 cgroup 即
@@ -90,14 +90,14 @@ node-ctl 补这一层,并刻意选择 **e2b 协议兼容**而非自定义 API:e2
 
 ```
           e2b SDK / CLI                                    cluster-ctl (cluster.md)
-               │ https://api.<domain>          │           registry · router · scaler
+               │ https://api.<domain>          │           registry · router · placer
                ▼                                ▼                    ▲
-      ┌─ node-ctl serve ──────────────────────┐   ┌─ data plane ──┐ │ node-link (§10):
+      ┌─ node-ctl conductor serve ──────────────────────┐   ┌─ data plane ──┐ │ node-link (§10):
       │ api: e2b control plane (REST)         │   │ proxy         │ │  up: register/HB/
       │   sandboxes create/connect/pause/...  │   │ (internal /   │ │      sandbox events
       │   templates register/trigger/status   │   │  external     │ │  down: create/connect/
       │ host:                                 │   │  workers,     │ │       delete/key_put/key_drop
-      │   vswitch-ctl attach → floatingip     │   │  route-synced)│ │
+      │   connector-ctl vswitch attach → floatingip     │   │  route-synced)│ │
       │   StartUnit(sandbox-runner@<sid>)     │   │ 49983/49999   │ └─ node-link client ───┐
       │   envd /init → sqlite + TTL           │   │  → UDS (envd) │                        │
       │ build: builds table → pool →          │   │ other ports → │◄── cluster-ctl router  │
@@ -115,7 +115,7 @@ node-ctl 补这一层,并刻意选择 **e2b 协议兼容**而非自定义 API:e2
 ```
 
 create 流程:建 `<run_root>/<sid>/`(tmpfs)+ `<base_root>/<sid>/`(disk)→
-`vswitch-ctl attach` 拿 `{port, floatingip, mac}` → 写非密配置 `<sid>.yaml` → 登记
+`connector-ctl vswitch attach` 拿 `{port, floatingip, mac}` → 写非密配置 `<sid>.yaml` → 登记
 sqlite → `StartUnit(sandbox-runner@<sid>)` → 单元内 `run-sandbox` 经 config-socket 取
 LaunchSpec(密钥经 env)后 `execve` 成 `sandbox-ctl run` → 起 microVM → (e2b)等
 envd `/health` 就绪(60s 上限)→ `POST /init` 置 env/默认用户 → 起 TTL。集群下,该
@@ -172,15 +172,15 @@ export E2B_DOMAIN=sandboxes.example.com        # 生产(TLS, §13)
 集群模式下密钥由 registry 经 node-link 租约下发(§10、cluster.md),无须手动
 `manifest-key add`。
 
-### 2.2 `node-ctl serve`
+### 2.2 `node-ctl conductor serve`
 
 ```
-node-ctl serve [--config /etc/node-ctl/serve.yaml]
+node-ctl conductor serve [--config /etc/node-ctl/conductor.yaml]
 ```
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
-| `--config` | `/etc/node-ctl/serve.yaml` | 配置文件(§3);`proxy.mode` 等一律以文件为准 |
+| `--config` | `/etc/node-ctl/conductor.yaml` | 配置文件(§3);`proxy.mode` 等一律以文件为准 |
 
 启动序列:打开 sqlite(文件 chmod 0600)→ 生成并安装 systemd 模板单元(§5)→
 重启对账(§15)→ 起 reaper(TTL,5s 周期)与构建池(§12)→ 起本机控制 socket(§6)
@@ -197,7 +197,7 @@ node-ctl serve [--config /etc/node-ctl/serve.yaml]
 (`proxy.yaml`,自带 schema,见 [node-proxy.md](node-proxy.md) §2),命令行只剩每实例身份:
 
 ```
-node-ctl proxy --config /etc/node-ctl/proxy.yaml --id <name>
+node-ctl proxy serve --config /etc/node-ctl/proxy.yaml --id <name>
                [--socket <uds>] [--metrics-listen <addr>] [--mmds]
 ```
 
@@ -239,7 +239,7 @@ node-ctl config <serve|proxy> --config <file> --resolve   # 再展开 auto/派�
                               -o <file>             # 写文件(默认 stdout)
 ```
 
-角色作首参以消歧 schema:`serve` 对应 `serve.yaml`(§3),`proxy` 对应 `proxy.yaml`
+角色作首参以消歧 schema:`serve` 对应 `conductor.yaml`(§3),`proxy` 对应 `proxy.yaml`
 (node-proxy.md §2)。`--resolve` 对 `serve` 额外展开 `resource_listen` 的 `auto` 内存/CPU
 (并深校验水位),其余角色与 `--config` 等价。骨架与 `deploy/{serve,proxy}.example.yaml` 对应。
 
@@ -299,13 +299,13 @@ e2b-key-ctl seal-pull-token [<MANIFEST_KEY>] {--registry-username U --registry-p
 
 ## 3. 配置
 
-serve daemon 的配置文件是 `serve.yaml`。完整带注释样例见 `deploy/serve.example.yaml`
-(`node-ctl config serve --template` 输出同形骨架),权威结构是 `internal/config/config.go`。
+serve daemon 的配置文件是 `conductor.yaml`。完整带注释样例见 `deploy/conductor.example.yaml`
+(`node-ctl config conductor --template` 输出同形骨架),权威结构是 `internal/config/config.go`。
 配置按关注点分组:`api`、`proxy`、`paths`、`units`、`sandbox`(实例级默认,子组
 `resources`/`network`/`boot`)、`builder`、`checkpoint`、`mmds`、`cluster`(node-link,§10)、
 `resource_listen`(内置资源控制器,调参全部内联,node-resource.md),外加顶层单值
 `encryption_key`、`manifest_config`。**必填仅 `api.domain` 与 `encryption_key`**(后者可用
-`NODE_CONFIG_ENCRYPTION_KEY` env 覆盖)。外部二进制(sandbox-ctl/vswitch-ctl/flatten-ctl)**不配置**:按"与
+`NODE_CONFIG_ENCRYPTION_KEY` env 覆盖)。外部二进制(sandbox-ctl/connector-ctl vswitch/flatten-ctl)**不配置**:按"与
 node-ctl 同目录 → PATH"自动发现。
 
 | 字段 | 默认 | 说明 |
@@ -356,7 +356,7 @@ node-ctl 同目录 → PATH"自动发现。
 | `cluster.node_link.endpoint` | 空 | registry 的 node_link 地址(§10);空 = 独立模式,不接入集群 |
 | `cluster.node_link.tls` | 空 | node_link mTLS 证书 / key / CA(`{cert,key,ca}`;生产必配,§10 / cluster.md) |
 | `cluster.node_id` | (接入集群必填) | 本节点唯一标识(node-link 注册,cluster.md) |
-| `cluster.labels` | 空 | 节点标签 `{zone,pool,slot,node}`(scaler nodeSelectors 匹配,cluster-scaler.md) |
+| `cluster.labels` | 空 | 节点标签 `{zone,pool,slot,node}`(placer nodeSelectors 匹配,cluster-placer.md) |
 | `cluster.data_endpoint` | 空 | 本节点数据面端点(供 router 转发);缺省由 `api.domain` + `proxy`/`api` 监听推导 |
 | `resource_listen` | 缺省(不内置) | 内置资源控制器整块(调参内联,无独立文件):`enabled` 开关、`socket`(控制器 UDS,**唯一权威**;空 = `pkg/resource` 默认,与 sandbox-ctl 一致),其余 `state_path`/`audit_path`/`cgroup_scan_paths`/`resources`/`watermarks`/`rate_limits`/`admission`/`dampening` 均有默认(语义见 node-resource.md §3.2);整块省略或 `enabled: false` = 不内置(沙箱用静态 cgroup) |
 
@@ -443,7 +443,7 @@ transient templateID = transient-<uuidv7>       构建注册期临时句柄,buil
   `E2B_API_URL`/`E2B_SANDBOX_URL`(http/h2c)。控制面要求 Host 命中 `api.*`。
 - api_key 形态:`e2b_` + 72 hex(共 76 字符);e2b SDK 以 `/^e2b_[0-9a-f]+$/` 校验
   格式,服务端另验 MAC(§7)。
-- envd 版本 pin:按 e2b-dev/infra 发布 tag 定版(sandbox-deps `ENVD_TARBALL`,默认
+- envd 版本 pin:按 e2b-dev/infra 发布 tag 定版(guest-runtime/native-deps `ENVD_TARBALL`,默认
   `2026.22`,对应 envd 0.6.x);SDK:`e2b` js 2.27.x / py 2.25.x 实测兼容。
 - 数据面鉴权头 `X-Access-Token`(= `envdAccessToken`):secure 沙箱自 SDK v2.0.0
   默认开,SDK 每次数据面调用携带。
@@ -533,7 +533,7 @@ Slice=sandbox-builder.slice   # 构建池 cgroup 上限(builder.cpu_quota/memory
 `Type=oneshot` 使 `StartUnit` 阻塞至流水线退出,`KillMode=control-group` 保证
 StopUnit/超时连阶段 VM 一并回收。
 
-- **kill**:`StopUnit`(连 CH 一并 SIGKILL)→ `ResetFailedUnit` → `vswitch-ctl detach`
+- **kill**:`StopUnit`(连 CH 一并 SIGKILL)→ `ResetFailedUnit` → `connector-ctl vswitch detach`
   → 删运行目录 → 删库行。`kill` 在进程层生效,不受 guest 内 restart 策略阻挡。
 - **就绪**:`Type=exec` 下 exec 成功即视为单元已启动;e2b profile 再轮询 envd
   `/health`(UDS,60s 上限)判数据面就绪。
@@ -801,15 +801,15 @@ sid 的 FNV 哈希在**活跃注册的 worker 集**上挑一个,经其 `--socket
 
 ## 10. 集群接入(node-link)
 
-配 `cluster.node_link.endpoint`(§3)时,`node-ctl serve` 拨 registry 把本节点接入集群,交由
-`cluster-ctl registry/router/scaler` 编排。node-link 复用 routesync 的帧化 JSON over h2c 引擎
+配 `cluster.node_link.endpoint`(§3)时,`node-ctl conductor serve` 拨 registry 把本节点接入集群,交由
+`cluster-ctl registry/router/placer` 编排。node-link 复用 routesync 的帧化 JSON over h2c 引擎
 (node-proxy.md §6),但角色相反:node 是本节点路由 / 构建权威,registry 是订阅者和命令下发方。
 
 本节只讲 node 侧行为。registry 的 owner 选择、redirect/relay、shardkv 复制和 membership 变更由
 [cluster.md](cluster.md) 定义。
 
 ```text
-node-ctl serve
+node-ctl conductor serve
   │ dial registry node_link endpoint
   │ register node profile
   │ stream heartbeat + sandbox/build events
@@ -912,8 +912,8 @@ plugin 平面,机群路由经 registry 聚合。
   `-isnotfc`,node-proxy.md §8),`restart=always`,**以 root(`user: "0:0"`)运行**——envd 需要
   `CAP_SETUID/SETGID` 才能按镜像配置的用户跑工作负载命令(镜像设了 `Config.User` 时
   非 root 的 envd 会 exec EPERM);工作负载本身仍以目标用户执行。
-- envd 是 **sandbox-deps** 的原生构建产物(与 cloud-hypervisor/vmlinux/mkfs.erofs
-  并列):`make -C sandbox-deps envd` 拉取 e2b-dev/infra 发布 tarball(默认 tag
+- envd 是 **guest-runtime/native-deps** 的原生构建产物(与 cloud-hypervisor/vmlinux/mkfs.erofs
+  并列):`make -C guest-runtime/native-deps envd` 拉取 e2b-dev/infra 发布 tarball(默认 tag
   `2026.22`,`ENVD_TARBALL` 可覆盖)→ `go build packages/envd`。本仓
   `make sandbox-runtime-e2b` 再把它注入裸 runtime(输入路径 `BASE_RUNTIME`/`ENVD`/
   `FSCK`/`MKFS` 可覆盖,默认取 umbrella 聚合 `bin/`)。
@@ -939,7 +939,7 @@ plugin 平面,机群路由经 registry 聚合。
 (microVM)内**——租户的网络流量与镜像内容不触宿主用户态,宿主侧只做工件接力与
 收尾上传。
 
-**serve 侧(每构建一次)**:建 workdir → `vswitch-ctl attach` 一个网络槽(整个构建
+**serve 侧(每构建一次)**:建 workdir → `connector-ctl vswitch attach` 一个网络槽(整个构建
 复用,各阶段顺序交接 tapfd)→ 铸 envd token →(`mmds.enabled` 时)挂一行合成路由,
 让模板阶段 FC 模式的 envd 能按 floatingip 自解析 → `StartUnit`(oneshot,阻塞至
 流水线退出)→ 读 `<bid>.result` JSON → 终态落库:产物为快照 ⇒ `kind=snp`、为镜像 ⇒
@@ -1008,7 +1008,7 @@ COPY)。三段:
    铁律(源码无权威洞元数据,零即数据)。单源 COPY(e2b executor 同限)。
 
 **对象存储(`builder.files_storage`,§3)**:S3/OBS;serve 只 presign + HEAD,
-唯一 aws-sdk 落点;本地/单机无云对象存储时指向 versitygw(`sandbox-deps make
+唯一 aws-sdk 落点;本地/单机无云对象存储时指向 versitygw(`guest-runtime/native-deps make
 versitygw`)。force_path_style 默认 false(虚拟主机式;versitygw/minio 置 true)。
 
 **收尾上传(平台凭据唯一出现点)**:img-only ⇒ `manifest-ctl store image.img`
@@ -1085,7 +1085,7 @@ external worker 的 `data_listen`,proxy.yaml),证书同一张。dev:`E2B_API_URL
 | `sandbox-ctl`(runtime) | 经 run-sandbox(单元)`execve`:`run --config <sid>.yaml --manifest-config … --run-root … --cgroup-adopt [--restore] [--connect]`;run-builder 以直接子进程 `run` 阶段沙箱,经 `exec --env/--stdin-from/--stdout-to` 做平台接力(flatten-ctl 调用、配置注入、工件流、探针),收尾 `snapshot --output` / `upload-snapshot` / `info --json`;serve 调 `snapshot --upload`(pause) | 非密配置文件 + 密钥 env;资源准入在其内部;e2b 语义命令不走它(走 envd,§12) |
 | 资源控制器(node-resource.md) | serve 内置(`resource_listen`,调参内联);沙箱经 `sandbox.resources.control_socket` 拨号(`pkg/resource` 协议) | 单元 cgroup 即沙箱 cgroup,控制器原地仲裁;不配 control_socket = 静态 cgroup(`--cgroup-adopt`),配了才进 SANDBOX_CONFIG `resources.control.controller` |
 | registry(cluster-ctl) | node-link:serve 拨 registry、反向注册为路由权威,上报 register/heartbeat/sandbox/build_event 事件、受理 create/connect/delete/key_put/key_drop/build_register 命令(§10、cluster.md) | mTLS;命令复用 §8 / §8.1 生命周期原语;空 `cluster.node_link.endpoint` = 独立模式不接入 |
-| `vswitch-ctl`(vswitch) | CLI:`attach <switch> --inner-ip [--transit-*]` / `detach --port`;`open-port` 作 SANDBOX_CONFIG `network.tapfd.exec`(sandbox-ctl 执行,经 `TAPFD_SOCKET` 收 tap fd) | 交换机预先起好(`vswitch-ctl start`,内核态数据面);port 对外、slot 内部;一个构建复用一个槽 |
+| `connector-ctl vswitch`(vswitch) | CLI:`attach <switch> --inner-ip [--transit-*]` / `detach --port`;`open-port` 作 SANDBOX_CONFIG `network.tapfd.exec`(sandbox-ctl 执行,经 `TAPFD_SOCKET` 收 tap fd) | 交换机预先起好(`connector-ctl vswitch start`,内核态数据面);port 对外、slot 内部;一个构建复用一个槽 |
 | `flatten-ctl`(builder) | **guest 内**(builder runtime 自带,经 sandbox-ctl exec 驱动):`export --output -`(import 拉取 / steps 导出)、`mountpoint`;宿主侧:`info --json`(读镜像运行时配置,本地工件或 manifest://) | 租户 `FLATTEN_*` 仅经 exec env 入 guest;tarstream 镜像工件经 exec stdio 接力 |
 | `manifest-ctl`(accelerator) | `store <image.img>`(img-only 构建的收尾上传) | manifest key 经 stdout 回收;`MANIFEST_KEY` 经 env |
 | `fsck.erofs`/`mkfs.erofs`(deps) | CLI(`deps/build-runtime-e2b.sh`、`deps/build-runtime-builder.sh`) | 确定性重打 e2b / builder runtime(§11、§12) |
@@ -1156,7 +1156,7 @@ sandbox-runtime-e2b.erofs 等),均已注册为 umbrella make 目标,缺前置则
 | `e2e_run_builder.sh` | 三阶段构建流水线(KVM + vswitch + store-ctl + zot,guest 经 mgmt VIP 拉取):fromImage → e2b-img;fromTemplate(img)+steps+startCmd → e2b-snp(manifest:// base、配置合并、snapshot.cfg metadata 断言);fromTemplate(snp)+steps → e2b-snp(start/ready 继承);再从产物模板 create/list/kill;COPY 与 files 端点 501 | `test-e2e-run-builder` |
 | `e2e_execute.sh` | 从已建模板冷启真实 microVM、guest 内 exec、pause(snapshot)→ resume 全链路;create 经 `X-Kuasar-Sandbox-Network` 注入 hostname 并在 guest 校验(§4.6) | `test-e2e-execute` |
 | `e2e_node_proxy.sh` | `proxy.mode=external` 全链路:serve + 独立 worker(plugin 平面注册 + SO_REUSEPORT)+ 真实 microVM/envd,数据面经 proxy 走(401/转发/wake/resume/CONNECT 隧道/兜底网关 relay/metrics) | `test-e2e-node-proxy` |
-| `sandbox-orchestrator/test/e2e/e2e_cluster_stub.sh` | 用 `make build` 产物真实启动 `cluster-ctl registry/router/scaler` + `node-stub-ctl`,覆盖 group 导入、key 分发、Reserve→READY→数据面转发、活动路由缓存、build_register、孤儿 route 清理、节点清空和 registry joint/old_grace cutover | `sandbox-orchestrator: make test-e2e` |
+| `orchestrator/test/e2e/e2e_cluster_stub.sh` | 用 `make build` 产物真实启动 `cluster-ctl registry/router/placer` + `node-stub-ctl`,覆盖 group 导入、key 分发、Reserve→READY→数据面转发、活动路由缓存、build_register、孤儿 route 清理、节点清空和 registry joint/old_grace cutover | `orchestrator: make test-e2e` |
 
 本仓 `make test-e2e` 运行集群 stub e2e,不依赖 KVM/root/systemd。真实 microVM 端到端路径由
 umbrella 仓的 e2e 脚本聚合执行。
@@ -1168,15 +1168,15 @@ umbrella 仓的 e2e 脚本聚合执行。
 - [node-resource.md](node-resource.md) —— 节点资源控制协议(`sandbox.resources.control_socket`
   的对端)与控制器内部组织(serve 经 `resource_listen` 内置,调参内联)
 - [cluster.md](cluster.md) —— 集群控制面:node-link 线格式(§5,本文 §10 的对端)、注册表、
-  Reserve 状态机;[cluster-router.md](cluster-router.md) 数据面入口、[cluster-scaler.md](cluster-scaler.md)
+  Reserve 状态机;[cluster-router.md](cluster-router.md) 数据面入口、[cluster-placer.md](cluster-placer.md)
   放置与密钥分发
-- `sandbox-runtime/docs/sandbox.md` —— sandbox-ctl:SANDBOX_CONFIG 模式、
+- `sandboxer/docs/sandbox.md` —— sandbox-ctl:SANDBOX_CONFIG 模式、
   run/snapshot/restore/connect 原语、cgroup 模型
-- `sandbox-vswitch/docs/vswitch.md` —— attach/detach/open-port、floatingip 与
+- `connector/docs/vswitch.md` —— attach/detach/open-port、floatingip 与
   mgmt-service(MMDS VIP 转换)语义
-- `sandbox-accelerator/docs/flatten.md` —— flatten-ctl export 与 OCI Referrers 幂等流、
+- `accelerator/docs/flatten.md` —— flatten-ctl export 与 OCI Referrers 幂等流、
   `FLATTEN_REGISTRY_*`
-- `sandbox-accelerator/docs/manifest.md` —— manifest 内容键、收敛加密与去重域
+- `accelerator/docs/manifest.md` —— manifest 内容键、收敛加密与去重域
   (§7 的存储侧)
 - `kuasar-sandbox/docs/deployment.md` —— 节点部署拓扑中本组件的位置与单元安装
 - `kuasar-sandbox/test/demo/DEMO.md` —— e2b CLI/SDK 全流程演示

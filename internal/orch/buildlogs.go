@@ -9,8 +9,8 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/api"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/configsock"
+	"github.com/kuasar-sandbox/orchestrator/internal/api"
+	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 )
 
 // BuildLogs backs the e2b build-status logs: it returns the build's curated

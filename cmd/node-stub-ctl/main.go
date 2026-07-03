@@ -24,8 +24,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/nodelink"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/routesync"
+	"github.com/kuasar-sandbox/orchestrator/internal/nodelink"
+	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 )
 
 var version = "0.1.0-dev"

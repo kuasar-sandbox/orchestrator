@@ -19,16 +19,16 @@ import (
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
 
-	clusterstate "github.com/kuasar-sandbox/sandbox-orchestrator/internal/cluster"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/cluster/shardkv"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/clustercfg"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/membergroup"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/registry"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/routesync"
+	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
+	"github.com/kuasar-sandbox/orchestrator/internal/cluster/shardkv"
+	"github.com/kuasar-sandbox/orchestrator/internal/clustercfg"
+	"github.com/kuasar-sandbox/orchestrator/internal/membergroup"
+	"github.com/kuasar-sandbox/orchestrator/internal/registry"
+	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 )
 
 // runRegistry starts the registry role: shardkv state cluster plus node_link,
-// route_link, node_list, and scale_link endpoints.
+// route_link, node_list, and placer_link endpoints.
 func runRegistry(args []string, log *slog.Logger) error {
 	if len(args) > 0 {
 		switch args[0] {
@@ -51,7 +51,7 @@ func runRegistry(args []string, log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	scalerObserver, err := newScalerObserverRuntime(cfg, memberHub, log)
+	placerObserver, err := newPlacerObserverRuntime(cfg, memberHub, log)
 	if err != nil {
 		return err
 	}
@@ -72,14 +72,14 @@ func runRegistry(args []string, log *slog.Logger) error {
 		return err
 	}
 	reg.SetNodeLinkRelayPeers(nodeLinkRelayPeers)
-	reg.SetScalerMemberlistLabel(cfg.ScaleLink.ScalerLabel)
-	reg.SetScalerSeedJoiner(scalerObserver.JoinSeed)
-	reg.SetScalerPeerSource(scalerObserver.ReadyScalers)
+	reg.SetPlacerMemberlistLabel(cfg.PlacerLink.PlacerLabel)
+	reg.SetPlacerSeedJoiner(placerObserver.JoinSeed)
+	reg.SetPlacerPeerSource(placerObserver.ReadyPlacers)
 	if active, ok := cfg.Membership.ActiveVersion(); ok {
-		reg.SetScaleReadyLabel(active.Label)
+		reg.SetPlacerReadyLabel(active.Label)
 	}
-	reg.SetScalePolicy(cfg.ScaleLink.ScalerReplicaCount, cfg.ScaleLink.MinReadyScalers, cfg.ScaleLink.PlaceDur())
-	reg.SetPlacer(registry.NewHTTPScalePlacerWithMinReady(reg, cfg.ScaleLink.ScalerReplicaCount, cfg.ScaleLink.MinReadyScalers, cfg.ScaleLink.PlaceDur()))
+	reg.SetPlacerPolicy(cfg.PlacerLink.PlacerReplicaCount, cfg.PlacerLink.MinReadyPlacers, cfg.PlacerLink.PlaceDur())
+	reg.SetPlacer(registry.NewHTTPPlacerWithMinReady(reg, cfg.PlacerLink.PlacerReplicaCount, cfg.PlacerLink.MinReadyPlacers, cfg.PlacerLink.PlaceDur()))
 	cfgState := newRegistryRuntimeConfig(cfg)
 
 	go runRegistryReload(ctx, *cfgPath, cfgState, reg, registryMembers, healthProvider, log)
@@ -138,7 +138,7 @@ func (s *registryRuntimeConfig) set(cfg *clustercfg.RegistryConfig) {
 
 func mountRegistryControl(mux *http.ServeMux, reg *registry.Registry, cfgState *registryRuntimeConfig, cfgPath string, members *registryMemberRuntime, healthProvider func(string) clusterstate.ReplicaAvailability) {
 	reg.ServeRouteLink(mux)
-	reg.ServeScaleLink(mux)
+	reg.ServePlacerLink(mux)
 	mux.HandleFunc(shardkv.HTTPPath, func(w http.ResponseWriter, req *http.Request) {
 		store := reg.Stores().ShardStore()
 		if store == nil {
@@ -213,7 +213,7 @@ func reloadRegistryConfig(ctx context.Context, cfgPath string, old *clustercfg.R
 	if old.RouteLink.ParkTimeout != next.RouteLink.ParkTimeout ||
 		old.NodeLink.NodeDeadAfter != next.NodeLink.NodeDeadAfter ||
 		old.NodeLink.HeartbeatInterval != next.NodeLink.HeartbeatInterval ||
-		old.ScaleLink.ScalerLabel != next.ScaleLink.ScalerLabel {
+		old.PlacerLink.PlacerLabel != next.PlacerLink.PlacerLabel {
 		return fmt.Errorf("registry reload: non-membership runtime changes require restart")
 	}
 	if err := validateRegistryMembershipReload(old.Membership, next.Membership); err != nil {
@@ -236,7 +236,7 @@ func reloadRegistryConfig(ctx context.Context, cfgPath string, old *clustercfg.R
 		return err
 	}
 	reg.Stores().SetClusterTopology(views, next.Membership.Owners.RouteLink, next.Membership.Owners.NodeLink)
-	reg.Stores().SetScaleLinkTopology(views, next.Membership.Owners.ScaleLink)
+	reg.Stores().SetPlacerLinkTopology(views, next.Membership.Owners.PlacerLink)
 	reg.Stores().SetNodeListTopology(views, next.Membership.Owners.NodeList)
 	if err := configureRegistryShardTransport(reg.Stores(), next, healthProvider); err != nil {
 		return err
@@ -249,10 +249,10 @@ func reloadRegistryConfig(ctx context.Context, cfgPath string, old *clustercfg.R
 		return err
 	}
 	reg.SetNodeLinkRelayPeers(nodeLinkRelayPeers)
-	reg.SetScaleReadyLabel(active.Label)
-	reg.SetScalerMemberlistLabel(next.ScaleLink.ScalerLabel)
-	reg.SetScalePolicy(next.ScaleLink.ScalerReplicaCount, next.ScaleLink.MinReadyScalers, next.ScaleLink.PlaceDur())
-	reg.SetPlacer(registry.NewHTTPScalePlacerWithMinReady(reg, next.ScaleLink.ScalerReplicaCount, next.ScaleLink.MinReadyScalers, next.ScaleLink.PlaceDur()))
+	reg.SetPlacerReadyLabel(active.Label)
+	reg.SetPlacerMemberlistLabel(next.PlacerLink.PlacerLabel)
+	reg.SetPlacerPolicy(next.PlacerLink.PlacerReplicaCount, next.PlacerLink.MinReadyPlacers, next.PlacerLink.PlaceDur())
+	reg.SetPlacer(registry.NewHTTPPlacerWithMinReady(reg, next.PlacerLink.PlacerReplicaCount, next.PlacerLink.MinReadyPlacers, next.PlacerLink.PlaceDur()))
 	cfgState.set(next)
 	return nil
 }
@@ -305,8 +305,8 @@ func newRegistryStores(cfg *clustercfg.RegistryConfig, healthProvider func(strin
 	}
 	stores := registry.NewClusterStoresWithViews(cfg.Member.ID, views,
 		cfg.Membership.Owners.RouteLink, cfg.Membership.Owners.NodeLink,
-		cfg.Membership.Owners.NodeList, cfg.Membership.Owners.ScaleLink)
-	stores.SetScaleLinkTopology(views, cfg.Membership.Owners.ScaleLink)
+		cfg.Membership.Owners.NodeList, cfg.Membership.Owners.PlacerLink)
+	stores.SetPlacerLinkTopology(views, cfg.Membership.Owners.PlacerLink)
 	stores.SetNodeListTopology(views, cfg.Membership.Owners.NodeList)
 	if err := configureRegistryShardTransport(stores, cfg, healthProvider); err != nil {
 		return nil, nil, err

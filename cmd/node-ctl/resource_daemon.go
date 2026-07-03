@@ -6,9 +6,9 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/config"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/nodectl"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/orch"
+	"github.com/kuasar-sandbox/orchestrator/internal/config"
+	"github.com/kuasar-sandbox/orchestrator/internal/nodectl"
+	"github.com/kuasar-sandbox/orchestrator/internal/orch"
 )
 
 // resourceProbe adapts the resource controller's State + AdmissionController to

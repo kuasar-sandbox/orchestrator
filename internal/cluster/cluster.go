@@ -1,5 +1,5 @@
 // Package cluster contains shared contracts for the cluster control plane:
-// versioned member placement, route/node records, and scaler-side sandbox-group
+// versioned member placement, route/node records, and placer-side sandbox-group
 // provider/importer interfaces.
 package cluster
 
@@ -10,7 +10,7 @@ import (
 	"fmt"
 	"sort"
 
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/maglev"
+	"github.com/kuasar-sandbox/accelerator/pkg/maglev"
 )
 
 // MemberView is the versioned registry member set. LocateN must use this stable
@@ -53,7 +53,7 @@ func (v MemberView) Owners(key string, n int) ([]string, error) {
 	return owners, nil
 }
 
-// Secret is a typed secret value. Inline values are carried by registry/scaler;
+// Secret is a typed secret value. Inline values are carried by registry/placer;
 // ref values are resolved out-of-band by the node or provider.
 type Secret struct {
 	Type        string `json:"type"`                  // inline | ref
@@ -95,7 +95,7 @@ const (
 	SecretRef    = "ref"
 )
 
-// SandboxGroup is the group-level configuration consumed by route_link/scaler.
+// SandboxGroup is the group-level configuration consumed by route_link/placer.
 type SandboxGroup struct {
 	Group        string            `json:"group"`
 	Config       map[string]string `json:"sandbox_config,omitempty"`
@@ -105,8 +105,8 @@ type SandboxGroup struct {
 	Metadata     map[string]string `json:"metadata,omitempty"`
 }
 
-// SandboxGroupRecord is the importer record owned by scaler/provider side. It is
-// intentionally richer than SandboxGroup: scaler needs placement selectors and
+// SandboxGroupRecord is the importer record owned by placer/provider side. It is
+// intentionally richer than SandboxGroup: placer needs placement selectors and
 // secret material to answer Place and refresh node_link manifest-key cache.
 type SandboxGroupRecord struct {
 	Group         string              `json:"group"`
@@ -122,7 +122,7 @@ type SandboxGroupRecord struct {
 	ShuffleLabels map[string]string   `json:"shuffle_labels,omitempty"`
 }
 
-// PlacementHint is the raw placement input. Scaler folds shuffle-sharding into
+// PlacementHint is the raw placement input. Placer folds shuffle-sharding into
 // effective selectors before writing the group placement record.
 type PlacementHint struct {
 	NodeSelectors []map[string]string `json:"node_selectors,omitempty"`

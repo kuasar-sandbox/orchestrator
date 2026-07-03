@@ -1,6 +1,6 @@
 // Package membergroup wraps hashicorp/memberlist for the cluster control plane.
 //
-// Membership lists still come from registry configuration or scale_link seeds.
+// Membership lists still come from registry configuration or placer_link seeds.
 // memberlist is used only as a failure detector and metadata propagation channel.
 package membergroup
 
@@ -10,14 +10,14 @@ import (
 )
 
 const (
-	DefaultScalerLabel = "scaler.default"
+	DefaultPlacerLabel = "placer.default"
 
 	RoleRegistry = "registry"
-	RoleScaler   = "scaler"
+	RolePlacer   = "placer"
 	RoleObserver = "observer"
 )
 
-// Meta is the small memberlist metadata payload used by registry/scaler roles.
+// Meta is the small memberlist metadata payload used by registry/placer roles.
 type Meta struct {
 	Role       string `json:"role"`
 	ID         string `json:"id"`
@@ -49,7 +49,7 @@ func DecodeMeta(raw []byte) (Meta, bool) {
 }
 
 // AddressBook is the name -> HTTP base URL map used by the HTTP transport.
-// Configured registry members and scale_link scaler seeds populate it; memberlist
+// Configured registry members and placer_link placer seeds populate it; memberlist
 // metadata updates keep it fresh after join.
 type AddressBook struct {
 	mu    sync.RWMutex

@@ -25,8 +25,8 @@ import (
 // effective concurrent-creating count varies with per-sandbox startup
 // budget size.
 type AdmissionPolicy struct {
-	Rate          int           // token bucket fill rate (tokens/sec)
-	Burst         int           // token bucket capacity
+	Rate          int // token bucket fill rate (tokens/sec)
+	Burst         int // token bucket capacity
 	StartupTTL    time.Duration
 	QueueTTL      time.Duration
 	QueueMaxDepth int
@@ -36,26 +36,26 @@ type AdmissionPolicy struct {
 type BlockReason int
 
 const (
-	BlockNone               BlockReason = iota
-	BlockedByMainBudget                 // effective_startup_budget > main_headroom (waits for Settled/Released)
-	BlockedByStartupBudget              // effective_startup_budget > startup_headroom (waits for Settled/Released-before-settled)
-	BlockedByTokenBucket                // token bucket empty (waits for refill — uses one-shot timer)
+	BlockNone              BlockReason = iota
+	BlockedByMainBudget                // effective_startup_budget > main_headroom (waits for Settled/Released)
+	BlockedByStartupBudget             // effective_startup_budget > startup_headroom (waits for Settled/Released-before-settled)
+	BlockedByTokenBucket               // token bucket empty (waits for refill — uses one-shot timer)
 )
 
 // Outcome captures a decision the admission worker can take.
 type OutcomeStatus int
 
 const (
-	OutcomeAdmitted        OutcomeStatus = iota
-	OutcomeLongTermReject                // drained / zone red / exceeds pool
-	OutcomeShortTermBlock                // entry should wait in queue
-	OutcomePreCheckReject                // request shape itself is invalid (e.g. burst > pool)
+	OutcomeAdmitted       OutcomeStatus = iota
+	OutcomeLongTermReject               // drained / zone red / exceeds pool
+	OutcomeShortTermBlock               // entry should wait in queue
+	OutcomePreCheckReject               // request shape itself is invalid (e.g. burst > pool)
 )
 
 // Outcome is what TryAdmit/AnalyzeBlock returns.
 type Outcome struct {
 	Status     OutcomeStatus
-	Block      BlockReason   // populated when Status==OutcomeShortTermBlock
+	Block      BlockReason // populated when Status==OutcomeShortTermBlock
 	RejectMsg  string
 	RejectCode string // machine-readable reason: drained / zone_critical / exceeds_node_capacity / exceeds_startup_pool / invalid_burst
 }
@@ -63,10 +63,10 @@ type Outcome struct {
 // PendingAdmit is a server-side queued admit. The connection is held
 // open until the worker writes either an Admitted or Rejected response.
 type PendingAdmit struct {
-	req        *Message    // the full Admit request
-	conn       net.Conn
-	queuedAt   time.Time
-	queuedPos  int         // queue depth at insertion (informational, for metadata)
+	req       *Message // the full Admit request
+	conn      net.Conn
+	queuedAt  time.Time
+	queuedPos int // queue depth at insertion (informational, for metadata)
 
 	// Closed by the per-entry TTL timer. Worker checks on each sweep.
 	// Client-side disconnect is detected lazily: the worker's response
@@ -106,12 +106,12 @@ type AdmissionController struct {
 	tokenTimer *time.Timer // one-shot, set when head is BlockedByTokenBucket
 
 	// Worker fan-outs.
-	state         *State                 // for budget checks
-	auditor       *Auditor               // optional
-	logf          func(string, ...any)
-	processFn     func(*PendingAdmit) (*Message, error) // builds the AdmitResponse (reservation insert etc.)
-	stopCh        chan struct{}
-	stoppedCh     chan struct{}
+	state     *State   // for budget checks
+	auditor   *Auditor // optional
+	logf      func(string, ...any)
+	processFn func(*PendingAdmit) (*Message, error) // builds the AdmitResponse (reservation insert etc.)
+	stopCh    chan struct{}
+	stoppedCh chan struct{}
 }
 
 // NewAdmissionController initializes with a full token bucket and empty

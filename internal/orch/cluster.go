@@ -8,11 +8,11 @@ import (
 	"os"
 	"time"
 
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/apikey"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/keys"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/routesync"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/sandboxcfg"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/types"
+	"github.com/kuasar-sandbox/orchestrator/internal/apikey"
+	"github.com/kuasar-sandbox/orchestrator/internal/keys"
+	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
+	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
+	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
 // This file makes the orchestrator the node side of the cluster node-link
@@ -180,7 +180,7 @@ func (o *Orchestrator) clusterBuildCreds(buildID string) (string, bool) {
 
 // Heartbeat reports the node's water level for the registry (nodelink.Node):
 // sandbox count + (when resource_listen is on) zone/allocated/pool/draining, and
-// the in-flight build resource alloc. The cluster placer (cluster-scaler.md)
+// the in-flight build resource alloc. The cluster placer (cluster-placer.md)
 // excludes draining nodes, filters by zone, and ranks by the water level / count.
 func (o *Orchestrator) Heartbeat() *routesync.Heartbeat {
 	o.mu.Lock()
@@ -202,7 +202,7 @@ const nodectlZoneGreen = "green"
 
 // buildAlloc is the in-flight build resource usage: live builds × the per-build
 // pool (builder vcpu/memory + diff_template scratch). Feeds resource-aware build
-// placement (cluster-scaler.md); nil when no builds are running.
+// placement (cluster-placer.md); nil when no builds are running.
 func (o *Orchestrator) buildAlloc() *routesync.BuildResources {
 	o.pendMu.Lock()
 	n := int64(len(o.pend))

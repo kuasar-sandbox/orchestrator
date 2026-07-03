@@ -15,12 +15,12 @@ const (
 	TypeCmdAck       = "cmd_ack"       // node -> registry (command accepted / rejected)
 )
 
-// NodeLinkPath is the HTTP path node-ctl serve dials to open its node_link
+// NodeLinkPath is the HTTP path node-ctl conductor serve dials to open its node_link
 // channel to the registry.
 const NodeLinkPath = "/node-link/session"
 
-// PlaceReq is a registry placement request to the scaler.
-// TargetRuntimeDigest lets the scaler require a matching guest runtime; empty
+// PlaceReq is a registry placement request to the placer.
+// TargetRuntimeDigest lets the placer require a matching guest runtime; empty
 // means no runtime constraint.
 type PlaceReq struct {
 	ReqID               string            `json:"req_id"`
@@ -32,7 +32,7 @@ type PlaceReq struct {
 	TargetRuntimeDigest string            `json:"target_runtime,omitempty"`
 }
 
-// PlaceResult is the scaler's answer (NodeID set, or NoNode when nothing eligible).
+// PlaceResult is the placer's answer (NodeID set, or NoNode when nothing eligible).
 type PlaceResult struct {
 	ReqID          string            `json:"req_id"`
 	NodeID         string            `json:"node_id,omitempty"`
@@ -46,7 +46,7 @@ type PlaceResult struct {
 	RegistryAuth   string            `json:"registry_auth,omitempty"`
 }
 
-// SelectorPatch is the scaler's placement projection for a group. NodeIDs is the
+// SelectorPatch is the placer's placement projection for a group. NodeIDs is the
 // explicit node set that should hold the group's manifest key; Selectors carries
 // the shuffle-effective selector projection.
 type SelectorPatch struct {

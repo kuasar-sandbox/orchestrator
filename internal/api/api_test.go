@@ -4,7 +4,7 @@ import (
 	"net/http"
 	"testing"
 
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/sandboxcfg"
+	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 )
 
 func TestMergeConfigHeaders(t *testing.T) {

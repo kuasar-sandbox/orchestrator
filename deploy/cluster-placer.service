@@ -1,0 +1,16 @@
+# cluster-placer.service — cluster placement scheduler (cluster-placer.md).
+# Starts the placer member API, follows registry membership, consumes node_list
+# WATCH_LIST and serves Place/verify-key for registry callers. Operator-managed.
+[Unit]
+Description=kuasar cluster-ctl placer (placement scheduler)
+After=network-online.target cluster-registry.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/cluster-ctl placer --config /etc/cluster-ctl/placer.yaml
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

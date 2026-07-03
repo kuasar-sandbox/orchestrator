@@ -192,9 +192,9 @@ func TestAdmission_PreCheckExceedsStartupPool(t *testing.T) {
 
 func TestAdmission_EffectiveBudget_RespectsAllMaxes(t *testing.T) {
 	cases := []struct {
-		name                   string
-		startup, floor, snap   uint64
-		want                   uint64
+		name                 string
+		startup, floor, snap uint64
+		want                 uint64
 	}{
 		{"cold burst dominates", 4 << 30, 1 << 30, 0, 4 << 30},
 		{"cold floor dominates", 1 << 30, 4 << 30, 0, 4 << 30},

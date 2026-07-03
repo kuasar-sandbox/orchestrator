@@ -7,9 +7,9 @@ import (
 	"testing"
 	"time"
 
-	clusterstate "github.com/kuasar-sandbox/sandbox-orchestrator/internal/cluster"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/cluster/shardkv"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/routesync"
+	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
+	"github.com/kuasar-sandbox/orchestrator/internal/cluster/shardkv"
+	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 )
 
 func TestClusterStoresRouteAndNodeUseLocatedOwners(t *testing.T) {
@@ -44,7 +44,7 @@ func TestStoresBuildShardKVNamespaces(t *testing.T) {
 
 	stores := NewClusterStores("r1", view, 2, 3, 1, 2)
 	stores.SetNodeListTopology([]clusterstate.MemberView{view}, 1)
-	stores.SetScaleLinkTopology([]clusterstate.MemberView{view}, 2)
+	stores.SetPlacerLinkTopology([]clusterstate.MemberView{view}, 2)
 
 	shards := stores.ShardStore()
 	if shards == nil {
@@ -58,7 +58,7 @@ func TestStoresBuildShardKVNamespaces(t *testing.T) {
 		{shardkv.Namespace(clusterstate.NamespaceRouteLink), clusterstate.RouteLinkShard("/g"), 2},
 		{shardkv.Namespace(clusterstate.NamespaceNodeLink), clusterstate.NodeLinkShard("n1"), 3},
 		{shardkv.Namespace(clusterstate.NamespaceNodeList), clusterstate.NodeListShard, 1},
-		{shardkv.Namespace(clusterstate.NamespaceScaleLink), clusterstate.ScaleImportSourceShard("source-a"), 2},
+		{shardkv.Namespace(clusterstate.NamespacePlacerLink), clusterstate.PlacerImportSourceShard("source-a"), 2},
 	}
 	for _, tc := range cases {
 		sh, err := shards.Shard(tc.ns, tc.shard)
@@ -225,81 +225,81 @@ func TestNodeListShardFixedShard(t *testing.T) {
 	}
 }
 
-func TestScaleLinkImportSourceShard(t *testing.T) {
+func TestPlacerLinkImportSourceShard(t *testing.T) {
 	ctx := context.Background()
 	stores := NewStores()
-	state, acquired, err := stores.acquireScaleImportSourceShard(ctx, "source-a", "s1", "run-1", time.Minute)
+	state, acquired, err := stores.acquirePlacerImportSourceShard(ctx, "source-a", "s1", "run-1", time.Minute)
 	if err != nil || !acquired {
 		t.Fatalf("acquire state=%+v acquired=%v err=%v", state, acquired, err)
 	}
 	if state.SourceID != "source-a" || state.OwnerID != "s1" || state.Term == 0 {
 		t.Fatalf("unexpected state=%+v", state)
 	}
-	if ok := stores.checkScaleImportSourceShard(ctx, "source-a", "s1", "run-1", state.Term); !ok {
+	if ok := stores.checkPlacerImportSourceShard(ctx, "source-a", "s1", "run-1", state.Term); !ok {
 		t.Fatal("lease check failed")
 	}
-	held, acquired, err := stores.acquireScaleImportSourceShard(ctx, "source-a", "s2", "run-2", time.Minute)
+	held, acquired, err := stores.acquirePlacerImportSourceShard(ctx, "source-a", "s2", "run-2", time.Minute)
 	if err != nil || acquired || held.OwnerID != "s1" {
 		t.Fatalf("second acquire held=%+v acquired=%v err=%v", held, acquired, err)
 	}
-	next, err := stores.checkpointScaleImportSourceShard(ctx, "source-a", "s1", "run-1", state.Term, "cursor-1", false, "")
+	next, err := stores.checkpointPlacerImportSourceShard(ctx, "source-a", "s1", "run-1", state.Term, "cursor-1", false, "")
 	if err != nil || next.Cursor != "cursor-1" {
 		t.Fatalf("checkpoint next=%+v err=%v", next, err)
 	}
 }
 
-func TestClusterStoresScaleLinkSourceLeaseUsesLocatedOwners(t *testing.T) {
+func TestClusterStoresPlacerLinkSourceLeaseUsesLocatedOwners(t *testing.T) {
 	ctx := context.Background()
 	view := clusterstate.MemberView{Version: 1, Members: []string{"a", "b", "c"}}
 	cluster := newShardStoreCluster(t, []string{"a", "b", "c"}, 2, 2, 2, 1)
 	stores := cluster["a"]
 
 	sourceID := "source-a"
-	rec, acquired, err := stores.AcquireScaleLinkSourceLease(ctx, sourceID, "s1", "run-1", time.Second)
+	rec, acquired, err := stores.AcquirePlacerLinkSourceLease(ctx, sourceID, "s1", "run-1", time.Second)
 	if err != nil {
-		t.Fatalf("AcquireScaleLinkSourceLease: %v", err)
+		t.Fatalf("AcquirePlacerLinkSourceLease: %v", err)
 	}
 	if !acquired || rec.SourceID != sourceID || rec.OwnerID != "s1" || rec.RunID != "run-1" || rec.Term == 0 {
 		t.Fatalf("unexpected lease acquired=%v rec=%+v", acquired, rec)
 	}
 
-	shard := clusterstate.ScaleImportSourceShard(sourceID)
+	shard := clusterstate.PlacerImportSourceShard(sourceID)
 	owners, err := view.Owners(string(shard), 2)
 	if err != nil {
 		t.Fatal(err)
 	}
-	assertScaleImportShardOwners(t, ctx, cluster, owners, sourceID, "s1")
+	assertPlacerImportShardOwners(t, ctx, cluster, owners, sourceID, "s1")
 
-	held, acquired, err := stores.AcquireScaleLinkSourceLease(ctx, sourceID, "s2", "run-2", time.Second)
+	held, acquired, err := stores.AcquirePlacerLinkSourceLease(ctx, sourceID, "s2", "run-2", time.Second)
 	if err != nil {
-		t.Fatalf("second AcquireScaleLinkSourceLease: %v", err)
+		t.Fatalf("second AcquirePlacerLinkSourceLease: %v", err)
 	}
 	if acquired || held.OwnerID != "s1" || held.RunID != "run-1" {
 		t.Fatalf("live lease was not fenced: acquired=%v held=%+v", acquired, held)
 	}
 }
 
-func TestClusterStoresScaleLinkSourceCursorUsesLeaseFencing(t *testing.T) {
+func TestClusterStoresPlacerLinkSourceCursorUsesLeaseFencing(t *testing.T) {
 	ctx := context.Background()
 	stores := NewStores()
 
-	rec, acquired, err := stores.AcquireScaleLinkSourceLease(ctx, "source-a", "s1", "run-1", time.Second)
+	rec, acquired, err := stores.AcquirePlacerLinkSourceLease(ctx, "source-a", "s1", "run-1", time.Second)
 	if err != nil || !acquired {
-		t.Fatalf("AcquireScaleLinkSourceLease acquired=%v err=%v", acquired, err)
+		t.Fatalf("AcquirePlacerLinkSourceLease acquired=%v err=%v", acquired, err)
 	}
-	if _, err := stores.CheckpointScaleLinkSource(ctx, "source-a", "s2", "run-2", rec.Term, "next", false, ""); !errors.Is(err, errScaleLinkStaleLease) {
-		t.Fatalf("stale checkpoint err=%v, want errScaleLinkStaleLease", err)
+	if _, err := stores.CheckpointPlacerLinkSource(ctx, "source-a", "s2", "run-2", rec.Term, "next", false, ""); !errors.Is(err, errPlacerLinkStaleLease) {
+		t.Fatalf("stale checkpoint err=%v, want errPlacerLinkStaleLease", err)
 	}
-	next, err := stores.CheckpointScaleLinkSource(ctx, "source-a", "s1", "run-1", rec.Term, "next", false, "")
+	next, err := stores.CheckpointPlacerLinkSource(ctx, "source-a", "s1", "run-1", rec.Term, "next", false, "")
 	if err != nil {
-		t.Fatalf("CheckpointScaleLinkSource: %v", err)
+		t.Fatalf("CheckpointPlacerLinkSource: %v", err)
 	}
 	if next.Cursor != "next" || next.Round != 0 {
 		t.Fatalf("checkpoint did not preserve cursor/round: %+v", next)
 	}
-	done, err := stores.CheckpointScaleLinkSource(ctx, "source-a", "s1", "run-1", rec.Term, "", true, "")
+	done, err := stores.CheckpointPlacerLinkSource(ctx, "source-a", "s1", "run-1", rec.Term, "", true, "")
 	if err != nil {
-		t.Fatalf("complete CheckpointScaleLinkSource: %v", err)
+		t.Fatalf("complete CheckpointPlacerLinkSource: %v", err)
 	}
 	if done.Cursor != "" || done.Round != 1 {
 		t.Fatalf("complete checkpoint did not advance round: %+v", done)
@@ -758,7 +758,7 @@ func newShardStoreClusterWithViews(t *testing.T, views []clusterstate.MemberView
 	out := map[string]*Stores{}
 	for _, id := range members {
 		stores := NewClusterStoresWithViews(id, views, routeOwners, nodeOwners, nodeListOwners, scaleOwners)
-		stores.SetScaleLinkTopology(views, scaleOwners)
+		stores.SetPlacerLinkTopology(views, scaleOwners)
 		stores.SetNodeListTopology(views, nodeListOwners)
 		out[id] = stores
 	}
@@ -775,7 +775,7 @@ func newShardStoreClusterWithViews(t *testing.T, views []clusterstate.MemberView
 	return out
 }
 
-func assertScaleImportShardOwners(t *testing.T, ctx context.Context, stores map[string]*Stores, owners []string, sourceID, ownerID string) {
+func assertPlacerImportShardOwners(t *testing.T, ctx context.Context, stores map[string]*Stores, owners []string, sourceID, ownerID string) {
 	t.Helper()
 	ownerSet := map[string]bool{}
 	for _, owner := range owners {
@@ -785,19 +785,19 @@ func assertScaleImportShardOwners(t *testing.T, ctx context.Context, stores map[
 		if !ownerSet[id] {
 			continue
 		}
-		sh, err := store.ShardStore().Shard(shardkv.Namespace(clusterstate.NamespaceScaleLink), clusterstate.ScaleImportSourceShard(sourceID))
+		sh, err := store.ShardStore().Shard(shardkv.Namespace(clusterstate.NamespacePlacerLink), clusterstate.PlacerImportSourceShard(sourceID))
 		if err != nil {
 			t.Fatalf("shard %s: %v", id, err)
 		}
-		rs, err := sh.RecordSet(clusterstate.RecordSetScaleImport)
+		rs, err := sh.RecordSet(clusterstate.RecordSetPlacerImport)
 		if err != nil {
 			t.Fatalf("record set %s: %v", id, err)
 		}
-		rec, found, err := rs.Get(ctx, clusterstate.ScaleLinkStateRecord)
+		rec, found, err := rs.Get(ctx, clusterstate.PlacerLinkStateRecord)
 		if err != nil || !found {
 			t.Fatalf("owner %s read found=%v err=%v", id, found, err)
 		}
-		state, err := clusterstate.DecodeShardValue[clusterstate.ScaleImportSourceState](rec.Value)
+		state, err := clusterstate.DecodeShardValue[clusterstate.PlacerImportSourceState](rec.Value)
 		if err != nil {
 			t.Fatalf("owner %s decode: %v", id, err)
 		}

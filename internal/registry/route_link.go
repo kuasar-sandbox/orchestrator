@@ -6,7 +6,7 @@ import (
 	"errors"
 	"net/http"
 
-	clusterstate "github.com/kuasar-sandbox/sandbox-orchestrator/internal/cluster"
+	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 )
 
 // route_link paths. Routers and operator tools dial this link for group-scoped
@@ -44,9 +44,9 @@ func (r *Registry) ServeRouteLink(mux *http.ServeMux) {
 	mux.HandleFunc(RouteLinkImportPath, r.serveImport) // operator JSONL import
 }
 
-// serveVerifyKey verifies an api key through the scaler-owned group provider
+// serveVerifyKey verifies an api key through the placer-owned group provider
 // view. Registry route owners do not read auth_key; they only fail over across
-// ready scalers. A 403 hides both a bad key and an unknown group.
+// ready placers. A 403 hides both a bad key and an unknown group.
 func (r *Registry) serveVerifyKey(w http.ResponseWriter, req *http.Request) {
 	q := req.URL.Query()
 	replicas, minReady, timeout := r.scalePolicy()

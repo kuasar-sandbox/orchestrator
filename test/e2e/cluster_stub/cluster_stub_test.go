@@ -22,14 +22,14 @@ import (
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
 
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/apikey"
-	clusterstate "github.com/kuasar-sandbox/sandbox-orchestrator/internal/cluster"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/clustercfg"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/membergroup"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/registry"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/router"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/routesync"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/scaler"
+	"github.com/kuasar-sandbox/orchestrator/internal/apikey"
+	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
+	"github.com/kuasar-sandbox/orchestrator/internal/clustercfg"
+	"github.com/kuasar-sandbox/orchestrator/internal/membergroup"
+	"github.com/kuasar-sandbox/orchestrator/internal/placer"
+	"github.com/kuasar-sandbox/orchestrator/internal/registry"
+	"github.com/kuasar-sandbox/orchestrator/internal/router"
+	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 )
 
 const (
@@ -59,21 +59,21 @@ func newHarness(t *testing.T) *harness {
 	stores := registry.NewStores()
 
 	reg := registry.New(stores, nil, 5*time.Second, log)
-	placer := registry.NewHTTPScalePlacer(reg, 1, 2*time.Second)
-	reg.SetPlacer(placer)
-	reg.SetScalerMemberlistLabel("scaler.default")
-	reg.SetScaleReadyLabel("registry.1.test")
+	httpPlacer := registry.NewHTTPPlacer(reg, 1, 2*time.Second)
+	reg.SetPlacer(httpPlacer)
+	reg.SetPlacerMemberlistLabel("placer.default")
+	reg.SetPlacerReadyLabel("registry.1.test")
 
 	regHub := membergroup.NewHub()
 	mux := http.NewServeMux()
 	regHub.Mount(mux)
 	reg.ServeRouteLink(mux)
-	reg.ServeScaleLink(mux)
+	reg.ServePlacerLink(mux)
 	mux.HandleFunc(routesync.NodeLinkPath, reg.ServeNodeLink)
 	links := httptest.NewServer(h2c.NewHandler(mux, &http2.Server{}))
 	linkAddr := strings.TrimPrefix(links.URL, "http://")
 	observer, err := membergroup.New(membergroup.Options{
-		Label: "scaler.default", Name: "observer.registry", Hub: regHub, FastTimers: true,
+		Label: "placer.default", Name: "observer.registry", Hub: regHub, FastTimers: true,
 		Meta: membergroup.Meta{
 			Role: membergroup.RoleObserver, ID: "observer.registry", Advertise: links.URL,
 		},
@@ -81,40 +81,40 @@ func newHarness(t *testing.T) *harness {
 	if err != nil {
 		t.Fatal(err)
 	}
-	reg.SetScalerSeedJoiner(func(ctx context.Context, id, label, advertise string) error {
+	reg.SetPlacerSeedJoiner(func(ctx context.Context, id, label, advertise string) error {
 		observer.AddSeed(id, advertise)
 		_, err := observer.Join(id)
 		return err
 	})
-	reg.SetScalerPeerSource(func(label string) []registry.ScalerPeer {
-		metas := observer.ReadyScalers(label)
-		out := make([]registry.ScalerPeer, 0, len(metas))
+	reg.SetPlacerPeerSource(func(label string) []registry.PlacerPeer {
+		metas := observer.ReadyPlacers(label)
+		out := make([]registry.PlacerPeer, 0, len(metas))
 		for _, meta := range metas {
-			out = append(out, registry.ScalerPeer{ID: meta.ID, Advertise: meta.Advertise, ReadyLabel: meta.ReadyLabel})
+			out = append(out, registry.PlacerPeer{ID: meta.ID, Advertise: meta.Advertise, ReadyLabel: meta.ReadyLabel})
 		}
 		return out
 	})
 
 	groupDir := t.TempDir()
 	writeStubGroup(t, groupDir)
-	groupSource, err := scaler.NewFileGroupSource("stub", groupDir)
+	groupSource, err := placer.NewFileGroupSource("stub", groupDir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	svc := scaler.NewRemoteLinksWithGroups(
-		[]scaler.RegistryLink{{Name: "registry", BaseURL: "http://" + linkAddr, Client: http.DefaultClient}},
-		groupSource, []scaler.ImportSource{{SourceID: "stub", Importer: groupSource}},
+	svc := placer.NewRemoteLinksWithGroups(
+		[]placer.RegistryLink{{Name: "registry", BaseURL: "http://" + linkAddr, Client: http.DefaultClient}},
+		groupSource, []placer.ImportSource{{SourceID: "stub", Importer: groupSource}},
 		clustercfg.PlacementConfig{Candidates: 1, ZoneAdmitMax: "yellow"}, 30, log,
 	)
-	scalerHub := membergroup.NewHub()
-	scalerMux := http.NewServeMux()
-	scalerHub.Mount(scalerMux)
-	svc.ServeScaleLink(scalerMux)
-	scalerSrv := httptest.NewServer(scalerMux)
-	scalerGroup, err := membergroup.New(membergroup.Options{
-		Label: "scaler.default", Name: "s1", Hub: scalerHub, FastTimers: true,
+	placerHub := membergroup.NewHub()
+	placerMux := http.NewServeMux()
+	placerHub.Mount(placerMux)
+	svc.ServePlacerLink(placerMux)
+	placerSrv := httptest.NewServer(placerMux)
+	placerGroup, err := membergroup.New(membergroup.Options{
+		Label: "placer.default", Name: "s1", Hub: placerHub, FastTimers: true,
 		Meta: membergroup.Meta{
-			Role: membergroup.RoleScaler, ID: "s1", Advertise: scalerSrv.URL,
+			Role: membergroup.RolePlacer, ID: "s1", Advertise: placerSrv.URL,
 			Ready: true, ReadyLabel: "registry.1.test",
 		},
 	})
@@ -122,7 +122,7 @@ func newHarness(t *testing.T) *harness {
 		t.Fatal(err)
 	}
 	svc.Start(ctx)
-	go svc.RegisterLoop(ctx, "s1", scalerSrv.URL, "scaler.default")
+	go svc.RegisterLoop(ctx, "s1", placerSrv.URL, "placer.default")
 
 	dataHits := make(chan *http.Request, 16)
 	dataToken := make(chan string, 16)
@@ -134,7 +134,7 @@ func newHarness(t *testing.T) *harness {
 	t.Cleanup(nodeHTTP.Close)
 
 	node := startNodeStub(t, ctx, links.URL, strings.TrimPrefix(nodeHTTP.URL, "http://"))
-	waitForPlacement(t, ctx, placer, links.URL)
+	waitForPlacement(t, ctx, httpPlacer, links.URL)
 	rt := router.New(linkAddr, testDomain, time.Minute, nil, log)
 	rt.SetDataPlaneAuth("off")
 	routerSrv := httptest.NewServer(rt.Handler())
@@ -155,9 +155,9 @@ func newHarness(t *testing.T) *harness {
 	t.Cleanup(func() {
 		cancel()
 		_ = observer.Shutdown()
-		_ = scalerGroup.Shutdown()
+		_ = placerGroup.Shutdown()
 		node.close()
-		scalerSrv.Close()
+		placerSrv.Close()
 		routerSrv.Close()
 		links.Close()
 	})
@@ -192,11 +192,11 @@ func waitForPlacement(t *testing.T, ctx context.Context, placer registry.Placer,
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatalf("scaler placement did not become ready: %v; node_list=%s", last,
-		readScaleSnapshot(t, linksURL+registry.ScaleLinkNodeListWatchPath))
+	t.Fatalf("placer placement did not become ready: %v; node_list=%s", last,
+		readPlacerSnapshot(t, linksURL+registry.PlacerLinkNodeListWatchPath))
 }
 
-func readScaleSnapshot(t *testing.T, u string) string {
+func readPlacerSnapshot(t *testing.T, u string) string {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()

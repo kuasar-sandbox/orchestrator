@@ -21,7 +21,7 @@ router
 route_link owner
   │ Reserve / Resolve
   ▼
-node owner / scaler / node
+node owner / placer / node
 ```
 
 ### 1.2 原则
@@ -31,7 +31,7 @@ node owner / scaler / node
 3. **热路径优先复用活动连接**:同一路由已有活动连接或近期解析缓存时,新请求不触发 Reserve。
 4. **fail-fast 失效**:node 返回 sandbox 不存在、token 不匹配、连接失败时,router 淘汰本地缓存并重新 Reserve。
 5. **数据面字节不进 registry**:registry 只参与 cold/miss/fail-fast 控制面。
-6. **鉴权材料来自 scaler/provider 侧**:router 调 route owner 的 verify-key;registry failover 到 ready scaler,
+6. **鉴权材料来自 placer/provider 侧**:router 调 route owner 的 verify-key;registry failover 到 ready placer,
    不读取 auth_key;router 不接触 manifest_key。
 
 ## 2. 命令行
@@ -174,8 +174,8 @@ client C ── CONNECT ───────┘
 
 ## 7. 控制面
 
-router 校验 API key 与 group 关系时调用 route owner `verify-key`;route owner failover 到 ready scaler,
-实际校验使用 scaler/provider 侧 `auth_key` 或等价 verify 能力。router 不接触 `manifest_key`。
+router 校验 API key 与 group 关系时调用 route owner `verify-key`;route owner failover 到 ready placer,
+实际校验使用 placer/provider 侧 `auth_key` 或等价 verify 能力。router 不接触 `manifest_key`。
 
 | 操作 | 行为 |
 |---|---|
@@ -228,5 +228,5 @@ idle/TTL 或 fail-fast 失效。
 ## 11. See Also
 
 - [cluster.md](cluster.md) — registry membership、route_link、Reserve 与数据模型。
-- [cluster-scaler.md](cluster-scaler.md) — verify-key、Place 和 key distribution 来源。
+- [cluster-placer.md](cluster-placer.md) — verify-key、Place 和 key distribution 来源。
 - [node-proxy.md](node-proxy.md) — node 内部数据面转发、CONNECT 和 envd signature。

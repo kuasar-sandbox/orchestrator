@@ -38,7 +38,7 @@ import (
 	"golang.org/x/net/http2/h2c"
 	"golang.org/x/sys/unix"
 
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/routesync"
+	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 )
 
 // Plane paths. The task/admin planes live under /internal/ (a prefix the e2b SDK
@@ -201,13 +201,13 @@ type AdminKeyResponse struct {
 
 // Deps wires the planes for New.
 type Deps struct {
-	Provider     Provider         // task plane (LaunchSpec by config-id)
-	Admin        Admin            // admin plane (manifest-key allowlist)
-	API          http.Handler     // api plane (e2b control plane + export/import); the fallback
-	AdminPidfile string           // optional PID allowlist gating the admin plane ("" => socket perms only)
-	RouteSource  routesync.Source // plugin plane: route authority a subscriber streams from (nil => plane off)
-	Plugins      *Registry        // plugin plane: live registration registry (shared with the gateway)
-	PluginPidfile string          // optional PID allowlist gating the plugin plane ("" => socket perms only)
+	Provider      Provider         // task plane (LaunchSpec by config-id)
+	Admin         Admin            // admin plane (manifest-key allowlist)
+	API           http.Handler     // api plane (e2b control plane + export/import); the fallback
+	AdminPidfile  string           // optional PID allowlist gating the admin plane ("" => socket perms only)
+	RouteSource   routesync.Source // plugin plane: route authority a subscriber streams from (nil => plane off)
+	Plugins       *Registry        // plugin plane: live registration registry (shared with the gateway)
+	PluginPidfile string           // optional PID allowlist gating the plugin plane ("" => socket perms only)
 }
 
 type Server struct {

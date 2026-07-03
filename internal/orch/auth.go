@@ -4,8 +4,8 @@ import (
 	"context"
 	"encoding/hex"
 
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/apikey"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/types"
+	"github.com/kuasar-sandbox/orchestrator/internal/apikey"
+	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
 // verifyKey reports whether apiKey was genuinely minted from the manifest key

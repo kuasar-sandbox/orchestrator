@@ -11,13 +11,13 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/apikey"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/config"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/launcher"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/secretbox"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/store"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/types"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/vswitch"
+	"github.com/kuasar-sandbox/orchestrator/internal/apikey"
+	"github.com/kuasar-sandbox/orchestrator/internal/config"
+	"github.com/kuasar-sandbox/orchestrator/internal/launcher"
+	"github.com/kuasar-sandbox/orchestrator/internal/secretbox"
+	"github.com/kuasar-sandbox/orchestrator/internal/store"
+	"github.com/kuasar-sandbox/orchestrator/internal/types"
+	"github.com/kuasar-sandbox/orchestrator/internal/vswitch"
 )
 
 // countingLauncher records how many times a unit was started — the launch count.

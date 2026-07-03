@@ -1,7 +1,7 @@
 package main
 
 import (
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/registry"
+	"github.com/kuasar-sandbox/orchestrator/internal/registry"
 	"io"
 	"log/slog"
 	"net/http"
@@ -39,7 +39,7 @@ membership:
   owners:
     route_link: 1
     node_link: 1
-    scale_link: 1
+    placer_link: 1
     node_list: 1
 `
 	if err := os.WriteFile(path, []byte(cfg), 0o600); err != nil {

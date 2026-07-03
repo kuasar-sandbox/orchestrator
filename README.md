@@ -1,4 +1,4 @@
-# sandbox-orchestrator
+# orchestrator
 
 e2b 兼容沙箱平台的**节点主机**与**集群控制面**,两个生产二进制、一个 e2e 辅助二进制、两层:
 
@@ -10,7 +10,7 @@ e2b 兼容沙箱平台的**节点主机**与**集群控制面**,两个生产二�
 - **`cluster-ctl`**(集群)——面向大规模部署的控制面,把机群里数千个 `node-ctl` 聚合成一个
   逻辑沙箱池,**三角色均为独立进程**(无同进程内存模式):**registry**(shardkv 状态集群 +
   节点通道枢纽)、**router**(集群级数据面入口,按 sandbox-group + route-key 会话亲和转发)、
-  **scaler**(group provider/importer、WATCH_LIST 消费方与放置调度器)。
+  **placer**(group provider/importer、WATCH_LIST 消费方与放置调度器)。
   沙箱按需创建 / 恢复 / 迁移,空闲下沉到节点本机快照乃至远程快照(可移植、不绑节点)。registry
   自身按 sandbox-group 分片复制状态;整套 registry 完全下电后不自动恢复运行中沙箱,可通过
   group/route 导入导出支持外部持久化和灾难恢复。
@@ -25,31 +25,31 @@ e2b 兼容沙箱平台的**节点主机**与**集群控制面**,两个生产二�
 | 路径 | 角色 |
 | --- | --- |
 | `cmd/node-ctl` | 节点主二进制:`serve`(daemon:控制面 + 数据面 + 可选 `resource_listen` 资源控制器 + node-link 客户端)/ `proxy`(外置数据面 worker)/ `run-sandbox`·`run-builder`(单元内启动器)/ `resource {status,list,drain,grant,reclaim}` / `config` / `manifest-key` / `export-sandbox`·`import-sandbox` / `version` |
-| `cmd/cluster-ctl` | 集群主二进制(三角色均独立进程):`registry`(shardkv 执行态 + node_link / route_link / node_list / scale_link)/ `router`(e2b 入口)/ `scaler`(provider/importer + WATCH_LIST + Place)/ `config` / `version` |
+| `cmd/cluster-ctl` | 集群主二进制(三角色均独立进程):`registry`(shardkv 执行态 + node_link / route_link / node_list / placer_link)/ `router`(e2b 入口)/ `placer`(provider/importer + WATCH_LIST + Place)/ `config` / `version` |
 | `cmd/node-stub-ctl` | 集群 e2e 辅助二进制:一个进程模拟多个 node-link 节点,提供 admin/data API 控制重启、清空、沙箱/build 状态和故障注入,不启动 microVM |
 | `cmd/e2b-key-ctl` | 纯派生凭据工具(无 DB/config):`gen-key` / `gen-apikey` / `fingerprint` / `seal-pull-token` |
 | `internal/orch` | 节点编排核心:生命周期、构建池、本节点路由权威、单元生成、重启对账 |
 | `internal/nodectl` | 资源控制器:两环仲裁、四级水位 + 应急池、cgroup 真相源对账恢复、审计 |
 | `internal/nodelink` | node-link 通道(serve ↔ registry):注册 / 心跳 / 沙箱事件 / 命令,帧化 JSON over h2c |
-| `internal/{registry,router,scaler}` | 集群三角色:registry shardkv namespace + Reserve/Build 状态机 + node_link key cache / e2b 数据面入口与 active cache / provider/importer、WATCH_LIST、P2C 放置 |
+| `internal/{registry,router,placer}` | 集群三角色:registry shardkv namespace + Reserve/Build 状态机 + node_link key cache / e2b 数据面入口与 active cache / provider/importer、WATCH_LIST、P2C 放置 |
 | `internal/api` | e2b 控制面 REST(X-API-KEY 鉴权、export/import 扩展) |
 | `internal/proxy` `internal/routetable` `internal/routesync` | 数据面 L7 反代(含 CONNECT 隧道)、订阅者本地路由表(park/wake、世代清扫)、路由同步协议(注册 + bookmark) |
 | `internal/configsock` | 本机控制 socket:task(LaunchSpec/BuildSpec)/ admin(manifest-key)/ plugin(proxy 注册 + 路由流)/ api 四平面,SO_PEERCRED 鉴权 |
 | `internal/{apikey,secretbox,keys,regcreds}` | api_key 派生 MAC、manifest_key 落盘 AES-GCM、数据面 token、镜像拉取凭据 |
 | `internal/{config,clustercfg,sandboxcfg,store}` | 节点 / 集群配置加载、SANDBOX_CONFIG 渲染、节点本地 sqlite 状态(sandboxes/builds/manifest_keys) |
-| `internal/{mmds,metrics,launcher,vswitch,util}` | MMDS 元数据(envd re-key)、Prometheus 文本、systemd D-Bus、vswitch-ctl 封装、内联工具 |
+| `internal/{mmds,metrics,launcher,vswitch,util}` | MMDS 元数据(envd re-key)、Prometheus 文本、systemd D-Bus、connector-ctl vswitch 封装、内联工具 |
 | `deps/build-runtime-{e2b,builder}.sh` | 把 envd(+构建工具链 flatten-ctl/mkfs.erofs)注入基础 runtime → `sandbox-runtime-{e2b,builder}.erofs`(确定性重打 + 2MiB 对齐) |
-| `deploy/` | 每角色配置样例(`{serve,proxy}.example.yaml`、`{registry,router,scaler}.example.yaml`)与 systemd 单元(`node-ctl.service`、`node-proxy@.service`、`cluster-{registry,router,scaler}.service`) |
+| `deploy/` | 每角色配置样例(`{conductor,proxy}.example.yaml`、`{registry,router,placer}.example.yaml`)与 systemd 单元(`node-ctl.service`、`node-proxy@.service`、`cluster-{registry,router,placer}.service`) |
 
 ## 构建
 
 ```bash
 make build                      # bin/<arch>/{node-ctl,cluster-ctl,node-stub-ctl,e2b-key-ctl};纯 Go,CGO_ENABLED=0
 make build TARGET_ARCH=aarch64  # 交叉编译(别名 amd64 / arm64)
-make sandbox-runtime-e2b        # 注入 envd 的 guest runtime(需 sandbox-deps 的 envd/fsck.erofs/mkfs.erofs)
+make sandbox-runtime-e2b        # 注入 envd 的 guest runtime(需 guest-runtime/native-deps 的 envd/fsck.erofs/mkfs.erofs)
 make sandbox-runtime-builder    # 构建沙箱 guest runtime(e2b flavor + flatten-ctl + mkfs.erofs)
 make test                       # 单元测试
-make test-e2e                   # 启动真实 registry/router/scaler + node-stub-ctl 做集群 stub e2e
+make test-e2e                   # 启动真实 registry/router/placer + node-stub-ctl 做集群 stub e2e
 ```
 
 运行需要 systemd(D-Bus 管单元)与 root;沙箱本体另需 KVM 与 vswitch(见各自仓)。
@@ -62,14 +62,14 @@ MK=$(e2b-key-ctl gen-key)
 node-ctl manifest-key add "$MK" --label tenant-a
 export E2B_API_KEY=$(e2b-key-ctl gen-apikey "$MK")
 
-# 启动节点 daemon(必填仅 api.domain + encryption_key;骨架: node-ctl config serve --template)
-# serve.yaml 内联 resource_listen 即内置资源控制器;配 cluster.node_link 即接入集群
-node-ctl serve --config /etc/node-ctl/serve.yaml
+# 启动节点 daemon(必填仅 api.domain + encryption_key;骨架: node-ctl config conductor --template)
+# conductor.yaml 内联 resource_listen 即内置资源控制器;配 cluster.node_link 即接入集群
+node-ctl conductor serve --config /etc/node-ctl/conductor.yaml
 
 # 可选:集群控制面——三角色各为独立进程、各自配置文件
 cluster-ctl registry --config /etc/cluster-ctl/registry.yaml
 cluster-ctl router   --config /etc/cluster-ctl/router.yaml
-cluster-ctl scaler   --config /etc/cluster-ctl/scaler.yaml
+cluster-ctl placer   --config /etc/cluster-ctl/placer.yaml
 
 # e2b SDK/CLI 直连本机(独立模式)
 export E2B_DOMAIN=sandboxes.example.com     # dev: E2B_API_URL/E2B_SANDBOX_URL http
@@ -88,8 +88,8 @@ python -c 'from e2b import Sandbox; s = Sandbox.create("e2b-img-<key>"); print(s
 - [docs/node-resource.md](docs/node-resource.md) — 节点资源控制协议(`sandbox-ctl` 拨号目标)与
   控制器(`serve` 经内联 `resource_listen` 内置):准入 / 水位额度 / 主动回收 / 无强一致状态恢复。
 - [docs/cluster.md](docs/cluster.md) — 集群控制面:registry membership、shardkv 状态模型、
-  node_link / route_link / node_list / scale_link、Reserve 状态机、成员变更与 e2e。
+  node_link / route_link / node_list / placer_link、Reserve 状态机、成员变更与 e2e。
 - [docs/cluster-router.md](docs/cluster-router.md) — 集群级数据面入口:e2b 头解析、调用方鉴权、
   Reserve 消费、两跳转发与 CONNECT、token 注入。
-- [docs/cluster-scaler.md](docs/cluster-scaler.md) — 放置调度器:SandboxGroupProvider/Importer、
-  scaler memberlist、node_list WATCH_LIST、source lease、selector patch、PlaceSandbox / PlaceBuild。
+- [docs/cluster-placer.md](docs/cluster-placer.md) — 放置调度器:SandboxGroupProvider/Importer、
+  placer memberlist、node_list WATCH_LIST、source lease、selector patch、PlaceSandbox / PlaceBuild。

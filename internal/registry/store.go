@@ -1,7 +1,7 @@
 // Package registry is the cluster control plane's route/node owner and node_link
-// hub. route_link, node_link, node_list, and scale_link records go through the
+// hub. route_link, node_link, node_list, and placer_link records go through the
 // registry-owned quorum kernel; sandbox-group provider state lives on
-// scaler/provider side.
+// placer/provider side.
 package registry
 
 import (
@@ -12,9 +12,9 @@ import (
 	"sync"
 	"time"
 
-	clusterstate "github.com/kuasar-sandbox/sandbox-orchestrator/internal/cluster"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/cluster/shardkv"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/routesync"
+	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
+	"github.com/kuasar-sandbox/orchestrator/internal/cluster/shardkv"
+	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 )
 
 // SandboxState mirrors cluster.md route state. A missing/dead sandbox is
@@ -311,7 +311,7 @@ func (s *Stores) SetNodeListTopology(views []clusterstate.MemberView, ownerCount
 	s.rebuildShardStore()
 }
 
-func (s *Stores) SetScaleLinkTopology(views []clusterstate.MemberView, ownerCount int) {
+func (s *Stores) SetPlacerLinkTopology(views []clusterstate.MemberView, ownerCount int) {
 	cleanViews := make([]clusterstate.MemberView, 0, len(views))
 	seenVersion := map[int64]bool{}
 	for _, view := range views {
@@ -409,10 +409,10 @@ func (s *Stores) rebuildShardStore() {
 		Local: shardkv.MemberID(writerID),
 		Views: clusterViews,
 		Layout: shardkv.Layout{Namespaces: map[shardkv.Namespace]shardkv.NamespaceSpec{
-			shardkv.Namespace(clusterstate.NamespaceRouteLink): {ShardMemberCount: routeOwners, TombstoneRetention: time.Hour, WatchRetention: 10000, IdleShardTTL: time.Hour},
-			shardkv.Namespace(clusterstate.NamespaceNodeLink):  {ShardMemberCount: nodeOwners, TombstoneRetention: time.Hour, WatchRetention: 10000, IdleShardTTL: time.Hour},
-			shardkv.Namespace(clusterstate.NamespaceNodeList):  {ShardMemberCount: nodeListOwners, TombstoneRetention: time.Hour, WatchRetention: nodeListWatchRetention, Pinned: true},
-			shardkv.Namespace(clusterstate.NamespaceScaleLink): {ShardMemberCount: scaleOwners, TombstoneRetention: time.Hour, WatchRetention: 10000, IdleShardTTL: time.Hour},
+			shardkv.Namespace(clusterstate.NamespaceRouteLink):  {ShardMemberCount: routeOwners, TombstoneRetention: time.Hour, WatchRetention: 10000, IdleShardTTL: time.Hour},
+			shardkv.Namespace(clusterstate.NamespaceNodeLink):   {ShardMemberCount: nodeOwners, TombstoneRetention: time.Hour, WatchRetention: 10000, IdleShardTTL: time.Hour},
+			shardkv.Namespace(clusterstate.NamespaceNodeList):   {ShardMemberCount: nodeListOwners, TombstoneRetention: time.Hour, WatchRetention: nodeListWatchRetention, Pinned: true},
+			shardkv.Namespace(clusterstate.NamespacePlacerLink): {ShardMemberCount: scaleOwners, TombstoneRetention: time.Hour, WatchRetention: 10000, IdleShardTTL: time.Hour},
 		}},
 	})
 	if err != nil {
@@ -439,19 +439,19 @@ func (s *Stores) rebuildShardStore() {
 }
 
 var (
-	errScaleLinkStaleLease = errors.New("registry: stale scale_link source lease")
+	errPlacerLinkStaleLease = errors.New("registry: stale placer_link source lease")
 )
 
-func (s *Stores) AcquireScaleLinkSourceLease(ctx context.Context, sourceID, ownerID, runID string, ttl time.Duration) (clusterstate.ScaleImportSourceState, bool, error) {
-	return s.acquireScaleImportSourceShard(ctx, sourceID, ownerID, runID, ttl)
+func (s *Stores) AcquirePlacerLinkSourceLease(ctx context.Context, sourceID, ownerID, runID string, ttl time.Duration) (clusterstate.PlacerImportSourceState, bool, error) {
+	return s.acquirePlacerImportSourceShard(ctx, sourceID, ownerID, runID, ttl)
 }
 
-func (s *Stores) CheckScaleLinkSourceLease(ctx context.Context, sourceID, ownerID, runID string, term uint64) bool {
-	return s.checkScaleImportSourceShard(ctx, sourceID, ownerID, runID, term)
+func (s *Stores) CheckPlacerLinkSourceLease(ctx context.Context, sourceID, ownerID, runID string, term uint64) bool {
+	return s.checkPlacerImportSourceShard(ctx, sourceID, ownerID, runID, term)
 }
 
-func (s *Stores) CheckpointScaleLinkSource(ctx context.Context, sourceID, ownerID, runID string, term uint64, cursor string, complete bool, lastErr string) (clusterstate.ScaleImportSourceState, error) {
-	return s.checkpointScaleImportSourceShard(ctx, sourceID, ownerID, runID, term, cursor, complete, lastErr)
+func (s *Stores) CheckpointPlacerLinkSource(ctx context.Context, sourceID, ownerID, runID string, term uint64, cursor string, complete bool, lastErr string) (clusterstate.PlacerImportSourceState, error) {
+	return s.checkpointPlacerImportSourceShard(ctx, sourceID, ownerID, runID, term, cursor, complete, lastErr)
 }
 
 // --- node_link ---
@@ -464,7 +464,7 @@ func (s *Stores) PutNode(ctx context.Context, n *NodeRecord) error {
 }
 
 // PutNodeRuntime updates node_link high-frequency state only. Heartbeats must not
-// write node_list, otherwise every water-level tick fans out to scaler WATCH_LIST.
+// write node_list, otherwise every water-level tick fans out to placer WATCH_LIST.
 func (s *Stores) PutNodeRuntime(ctx context.Context, n *NodeRecord) error {
 	_, err := s.putNodeProfileShardReturn(ctx, n)
 	return err

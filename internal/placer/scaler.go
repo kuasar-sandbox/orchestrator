@@ -1,18 +1,18 @@
-// Package scaler is the cluster placement scheduler. Placement combines
+// Package placer is the cluster placement scheduler. Placement combines
 // nodeSelectors, shuffle-sharding, zone/water-level admission, runtime matching,
-// and P2C least-load over the scaler's local node_list/group view; registry
+// and P2C least-load over the placer's local node_list/group view; registry
 // route/node owners commit the suggested node.
-package scaler
+package placer
 
 import (
 	"math/rand"
 
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/maglev"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/clustercfg"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/registry"
+	"github.com/kuasar-sandbox/accelerator/pkg/maglev"
+	"github.com/kuasar-sandbox/orchestrator/internal/clustercfg"
+	"github.com/kuasar-sandbox/orchestrator/internal/registry"
 )
 
-// placeParams is one placement evaluation over the scaler's local view.
+// placeParams is one placement evaluation over the placer's local view.
 type placeParams struct {
 	group               string
 	nodes               []*registry.NodeRecord
@@ -25,7 +25,7 @@ type placeParams struct {
 	targetRuntimeDigest string // when set, require node.RuntimeDigest == it (runtime match, §4.2)
 }
 
-// placeSandbox runs the sandbox placement algorithm (cluster-scaler.md):
+// placeSandbox runs the sandbox placement algorithm (cluster-placer.md):
 // matchSelectors ∧ ¬draining ∧ alive ∧ zone≤max ∧ runtime-match ∧ shuffle
 // slot, then P2C by water level. (Build placement is resource-aware — placeBuild.)
 func placeSandbox(p placeParams) (string, error) {
@@ -47,11 +47,11 @@ func placeSandbox(p placeParams) (string, error) {
 	return p2c(eligible, p.candidates, sandboxLoad).NodeID, nil
 }
 
-// placeBuild runs resource-aware build placement (cluster-scaler.md): among
+// placeBuild runs resource-aware build placement (cluster-placer.md): among
 // matching/alive/non-draining nodes with build headroom (build_alloc <
 // build_capacity), P2C by build utilization. The per-build requested-resources
 // check + RESERVED occupancy live in the registry's BuildStore commit (P4); here
-// the scaler suggests over its view.
+// the placer suggests over its view.
 func placeBuild(p placeParams) (string, error) {
 	maxZone := zoneRank(p.zoneAdmitMax)
 	var eligible []*registry.NodeRecord
@@ -100,7 +100,7 @@ func eligibleNode(n *registry.NodeRecord, p placeParams, maxZone int) bool {
 		return false
 	}
 	if p.deadAfter > 0 && n.LastHeartbeatUnix > 0 && n.LastHeartbeatUnix < p.now-p.deadAfter {
-		return false // stale: disconnected but not yet swept (cluster-scaler.md "node alive")
+		return false // stale: disconnected but not yet swept (cluster-placer.md "node alive")
 	}
 	if p.zoneAdmitMax != "" && zoneRank(n.Zone) > maxZone {
 		return false // hotter than admit (red/critical excluded)
@@ -126,7 +126,7 @@ func zoneRank(z string) int {
 	}
 }
 
-// sandboxLoad is a node's sandbox load for ranking (cluster-scaler.md):
+// sandboxLoad is a node's sandbox load for ranking (cluster-placer.md):
 // preferred = allocated/pool water level; fallback = sandbox count / capacity
 // headroom; last resort = raw count.
 func sandboxLoad(n *registry.NodeRecord) float64 {
@@ -140,7 +140,7 @@ func sandboxLoad(n *registry.NodeRecord) float64 {
 }
 
 // shuffleSlots returns the deterministic set of shard_by label values this group
-// is pinned to (cluster-scaler.md), or (nil,"") when no shuffle rule
+// is pinned to (cluster-placer.md), or (nil,"") when no shuffle rule
 // applies. It buckets the given nodes by each rule's shard_by label and uses
 // maglev.LocateN to pick the group's n slots from that set.
 func shuffleSlots(group string, nodes []*registry.NodeRecord, rules []clustercfg.ShuffleRule) (map[string]bool, string) {
@@ -181,7 +181,7 @@ func shuffleSlots(group string, nodes []*registry.NodeRecord, rules []clustercfg
 }
 
 // effectiveSelectors narrows a group's static nodeSelectors to its shuffle slots
-// (cluster-scaler.md): the cross-product of the static selectors with
+// (cluster-placer.md): the cross-product of the static selectors with
 // {shard_by ∈ pinned slots}. Returns (sel, true) when a shuffle rule applies, so
 // the registry's key distribution (§7.6) predistributes only to the pinned nodes;
 // (nil, false) when no shuffle rule narrows (key dist uses the static selectors).
@@ -232,7 +232,7 @@ func labelsContain(labels, want map[string]string) bool {
 }
 
 // p2c picks the least-loaded (by load) of k DISTINCT random candidates
-// (power-of-two-choices when k=2): decorrelated, herd-resistant (cluster-scaler.md
+// (power-of-two-choices when k=2): decorrelated, herd-resistant (cluster-placer.md
 // §4.2). Sampling is WITHOUT replacement — with replacement, k=2 over a 2-node set
 // returns the more-loaded node ~25% of the time, exactly the eligible-set size
 // shuffle-sharding produces. Fisher-Yates also randomizes tie order.

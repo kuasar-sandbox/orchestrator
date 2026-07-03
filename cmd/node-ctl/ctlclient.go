@@ -14,7 +14,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/configsock"
+	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 )
 
 const defaultSocket = "/run/sandbox/node-ctl.socket"
@@ -54,7 +54,7 @@ func udsDo(socket, method, path string, hdr map[string]string, reqBody any) (int
 	}
 	resp, err := configsock.HTTPClient(socket).Do(req)
 	if err != nil {
-		return 0, nil, fmt.Errorf("reach orchestrator at %s: %w (is `node-ctl serve` running?)", socket, err)
+		return 0, nil, fmt.Errorf("reach orchestrator at %s: %w (is `node-ctl conductor serve` running?)", socket, err)
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)

@@ -13,7 +13,7 @@ import (
 	"golang.org/x/net/http2/h2c"
 	"golang.org/x/sys/unix"
 
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/metrics"
+	"github.com/kuasar-sandbox/orchestrator/internal/metrics"
 )
 
 // serveListener serves handler on ln until ctx is cancelled. With tlsCert/tlsKey

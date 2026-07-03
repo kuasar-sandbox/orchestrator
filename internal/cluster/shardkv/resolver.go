@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"sort"
 
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/maglev"
+	"github.com/kuasar-sandbox/accelerator/pkg/maglev"
 )
 
 type ClusterView struct {

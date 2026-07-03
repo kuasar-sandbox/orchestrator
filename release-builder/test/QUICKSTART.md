@@ -11,7 +11,7 @@
 ├── bin/                       平台全部二进制(cloud-hypervisor / vmlinux /
 │                              mkfs.erofs / fsck.erofs / envd / manifest-ctl /
 │                              store-ctl / cache-ctl / flatten-ctl / sandbox-ctl /
-│                              sandbox-init / node-ctl / vswitch-ctl / tapfd-get /
+│                              sandbox-init / node-ctl / connector-ctl /
 │                              e2b-key-ctl /
 │                              sandbox-runtime.erofs / sandbox-runtime-e2b.erofs)
 ├── README.md                  项目入口
@@ -140,15 +140,15 @@ for f in test/e2e/*.sh; do bash "$f" || break; done
 
 ## 6. 留在源仓的 e2e
 
-`sandbox-orchestrator/test/e2e/e2e_node_ctl.sh` **未打包**。该脚本通过 heredoc 内
+`orchestrator/test/e2e/e2e_node_ctl.sh` **未打包**。该脚本通过 heredoc 内
 联生成 Go driver 文件并 `go run` 执行(驱动 import
-`github.com/kuasar-sandbox/sandbox-runtime/pkg/resource`),运行时需要源码工
+`github.com/kuasar-sandbox/sandboxer/pkg/resource`),运行时需要源码工
 作区。如需跑:
 
 ```bash
-git clone https://github.com/kuasar-sandbox/sandbox-orchestrator
-git clone https://github.com/kuasar-sandbox/sandbox-runtime  # 兄弟目录
-cd sandbox-orchestrator && GOWORK=off make node-ctl
+git clone https://github.com/kuasar-sandbox/orchestrator
+git clone https://github.com/kuasar-sandbox/sandboxer  # 兄弟目录
+cd orchestrator && GOWORK=off make node-ctl
 bash test/e2e/e2e_node_ctl.sh
 ```
 

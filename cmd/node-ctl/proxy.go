@@ -11,12 +11,12 @@ import (
 	"path/filepath"
 	"syscall"
 
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/config"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/metrics"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/mmds"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/proxy"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/routesync"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/routetable"
+	"github.com/kuasar-sandbox/orchestrator/internal/config"
+	"github.com/kuasar-sandbox/orchestrator/internal/metrics"
+	"github.com/kuasar-sandbox/orchestrator/internal/mmds"
+	"github.com/kuasar-sandbox/orchestrator/internal/proxy"
+	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
+	"github.com/kuasar-sandbox/orchestrator/internal/routetable"
 )
 
 // runProxy is the external data-plane proxy worker (proxy_mode=external). It reads
@@ -34,10 +34,10 @@ import (
 //     workers share one port), forwarding to envd UDS / floatingip from its synced
 //     route table, parking a request until the route is ready (Wake -> resume).
 //
-//     node-ctl proxy --config <proxy.yaml> --id <name> [--socket <uds>]
+//     node-ctl proxy serve --config <proxy.yaml> --id <name> [--socket <uds>]
 //     [--metrics-listen <addr>] [--mmds]
 func runProxy(args []string, log *slog.Logger) error {
-	fs := flag.NewFlagSet("proxy", flag.ExitOnError)
+	fs := flag.NewFlagSet("proxy serve", flag.ExitOnError)
 	cfgPath := fs.String("config", "/etc/node-ctl/proxy.yaml", "worker config file")
 	id := fs.String("id", "", "this worker's plugin id, unique per worker (required)")
 	socket := fs.String("socket", "", `UDS this worker serves for gateway-forwarded requests; "" = <dir(config_socket)>/<id>.sock`)

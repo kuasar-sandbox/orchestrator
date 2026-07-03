@@ -31,7 +31,7 @@ import (
 
 type envdExec struct {
 	uds   string
-	token string    // X-Access-Token, once /init armed envd (mmds posture)
+	token string // X-Access-Token, once /init armed envd (mmds posture)
 	log   *slog.Logger
 	out   io.Writer // RUN/startCmd output relay → build journal (tag build); nil = drop
 }

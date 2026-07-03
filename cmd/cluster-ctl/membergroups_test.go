@@ -10,12 +10,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/clustercfg"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/membergroup"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/registry"
+	"github.com/kuasar-sandbox/orchestrator/internal/clustercfg"
+	"github.com/kuasar-sandbox/orchestrator/internal/membergroup"
+	"github.com/kuasar-sandbox/orchestrator/internal/registry"
 )
 
-func TestScaleLinkRegisterSeedsScalerObserverMemberlist(t *testing.T) {
+func TestPlacerLinkRegisterSeedsPlacerObserverMemberlist(t *testing.T) {
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	regHub := membergroup.NewHub()
 	regMux := http.NewServeMux()
@@ -27,45 +27,45 @@ func TestScaleLinkRegisterSeedsScalerObserverMemberlist(t *testing.T) {
 	cfg.Member.ID = "registry-1"
 	cfg.Membership.Versions[0].Members[0].ID = "registry-1"
 	cfg.Membership.Versions[0].Members[0].Advertise = regSrv.URL
-	cfg.ScaleLink.ScalerLabel = "scaler.default"
-	observer, err := newScalerObserverRuntime(&cfg, regHub, log)
+	cfg.PlacerLink.PlacerLabel = "placer.default"
+	observer, err := newPlacerObserverRuntime(&cfg, regHub, log)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer observer.group.Shutdown()
 	reg := registry.New(registry.NewStores(), nil, time.Second, log)
-	reg.SetScalerMemberlistLabel("scaler.default")
-	reg.SetScalerSeedJoiner(observer.JoinSeed)
-	reg.SetScalerPeerSource(observer.ReadyScalers)
-	reg.SetScaleReadyLabel("registry.1.test")
-	reg.ServeScaleLink(regMux)
+	reg.SetPlacerMemberlistLabel("placer.default")
+	reg.SetPlacerSeedJoiner(observer.JoinSeed)
+	reg.SetPlacerPeerSource(observer.ReadyPlacers)
+	reg.SetPlacerReadyLabel("registry.1.test")
+	reg.ServePlacerLink(regMux)
 
-	scalerHub := membergroup.NewHub()
-	scalerMux := http.NewServeMux()
-	scalerHub.Mount(scalerMux)
-	scalerSrv := httptest.NewServer(scalerMux)
-	defer scalerSrv.Close()
-	scalerGroup, err := membergroup.New(membergroup.Options{
-		Label: "scaler.default", Name: "scaler-1", Hub: scalerHub, FastTimers: true,
+	placerHub := membergroup.NewHub()
+	placerMux := http.NewServeMux()
+	placerHub.Mount(placerMux)
+	placerSrv := httptest.NewServer(placerMux)
+	defer placerSrv.Close()
+	placerGroup, err := membergroup.New(membergroup.Options{
+		Label: "placer.default", Name: "placer-1", Hub: placerHub, FastTimers: true,
 		Meta: membergroup.Meta{
-			Role: membergroup.RoleScaler, ID: "scaler-1",
-			Advertise: scalerSrv.URL,
+			Role: membergroup.RolePlacer, ID: "placer-1",
+			Advertise: placerSrv.URL,
 			Ready:     true, ReadyLabel: "registry.1.test",
 		},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer scalerGroup.Shutdown()
+	defer placerGroup.Shutdown()
 
 	var body bytes.Buffer
-	if err := json.NewEncoder(&body).Encode(registry.ScalerRegister{
-		ID: "scaler-1", Advertise: scalerSrv.URL,
-		MemberlistLabel: "scaler.default",
+	if err := json.NewEncoder(&body).Encode(registry.PlacerRegister{
+		ID: "placer-1", Advertise: placerSrv.URL,
+		MemberlistLabel: "placer.default",
 	}); err != nil {
 		t.Fatal(err)
 	}
-	resp, err := http.Post(regSrv.URL+registry.ScaleLinkRegisterPath, "application/json", &body)
+	resp, err := http.Post(regSrv.URL+registry.PlacerLinkRegisterPath, "application/json", &body)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -76,11 +76,11 @@ func TestScaleLinkRegisterSeedsScalerObserverMemberlist(t *testing.T) {
 
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		peers := observer.ReadyScalers("registry.1.test")
-		if len(peers) == 1 && peers[0].ID == "scaler-1" && peers[0].Advertise == scalerSrv.URL {
+		peers := observer.ReadyPlacers("registry.1.test")
+		if len(peers) == 1 && peers[0].ID == "placer-1" && peers[0].Advertise == placerSrv.URL {
 			return
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	t.Fatalf("observer did not learn ready scaler: %+v", observer.ReadyScalers("registry.1.test"))
+	t.Fatalf("observer did not learn ready placer: %+v", observer.ReadyPlacers("registry.1.test"))
 }

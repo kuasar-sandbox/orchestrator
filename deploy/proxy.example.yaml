@@ -1,12 +1,12 @@
-# node-ctl proxy worker config — node-ctl proxy --config /etc/node-ctl/proxy.yaml --id <name>.
-# Used only in external data-plane mode (serve.yaml proxy.mode: external). One file is
+# node-ctl proxy worker config — node-ctl proxy serve --config /etc/node-ctl/proxy.yaml --id <name>.
+# Used only in external data-plane mode (conductor.yaml proxy.mode: external). One file is
 # shared by all worker instances (node-proxy@1, @2, …); per-instance identity is on the
 # command line (node-proxy@.service passes --id %i):
 #   --id <name>            unique per worker (required)
 #   --socket <uds>         gateway-forward UDS; default <dir(config_socket)>/<id>.sock
 #   --metrics-listen <a>   optional Prometheus endpoint, per-instance (ports must differ)
 #   --mmds                 host the FC MMDS service on this instance (addr = mmds_listen)
-# See sandbox-orchestrator/docs/node-proxy.md §2. Validate with
+# See orchestrator/docs/node-proxy.md §2. Validate with
 # `node-ctl config proxy --config proxy.yaml`.
 
 # serve's control socket: the worker registers on its plugin plane and streams the

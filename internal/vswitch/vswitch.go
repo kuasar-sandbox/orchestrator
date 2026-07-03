@@ -1,8 +1,8 @@
-// Package vswitch wraps the vswitch-ctl CLI for per-sandbox port allocation.
+// Package vswitch wraps `connector-ctl vswitch` for per-sandbox port allocation.
 //
-//	attach <switch> --inner-ip=<ip> [--port=0] [--transit-*]  -> JSON AttachOutput (tap mode)
-//	open-port <switch> --port=<N>  (TAPFD_SOCKET) -> tap-fd handoff (Network.TapFD.Exec)
-//	detach <switch> --port=<N>                    -> plain text
+//	vswitch attach <switch> --inner-ip=<ip> [--port=0] [--transit-*]  -> JSON AttachOutput
+//	vswitch open-port <switch> --port=<N>  (TAPFD_SOCKET) -> tap-fd handoff
+//	vswitch detach <switch> --port=<N>                    -> plain text
 //
 // The orchestrator runs in tap mode (the port's tap fd goes to cloud-hypervisor).
 // MTU is not returned by attach; it arrives in the tap-fd handoff metadata.
@@ -17,7 +17,7 @@ import (
 	"strconv"
 )
 
-// attachOutput mirrors sandbox-vswitch pkg/vswitch AttachOutput (subset we use).
+// attachOutput mirrors connector pkg/vswitch AttachOutput (subset we use).
 type attachOutput struct {
 	Port       uint32 `json:"port"`
 	PortMAC    string `json:"port_mac"`
@@ -53,7 +53,7 @@ type AttachReq struct {
 
 // Attach allocates a tap port on the switch for the request's guest inner IP.
 func (c *CLI) Attach(ctx context.Context, req AttachReq) (*Port, error) {
-	args := []string{"attach", c.sw, "--inner-ip=" + req.InnerIP, "--port=0"}
+	args := []string{"vswitch", "attach", c.sw, "--inner-ip=" + req.InnerIP, "--port=0"}
 	if req.TransitGatewayIP != "" {
 		args = append(args, "--transit-gateway-ip="+req.TransitGatewayIP)
 	}
@@ -67,11 +67,11 @@ func (c *CLI) Attach(ctx context.Context, req AttachReq) (*Port, error) {
 	var out, errb bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &errb
 	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("vswitch attach %s: %w: %s", c.sw, err, errb.String())
+		return nil, fmt.Errorf("connector vswitch attach %s: %w: %s", c.sw, err, errb.String())
 	}
 	var a attachOutput
 	if err := json.Unmarshal(out.Bytes(), &a); err != nil {
-		return nil, fmt.Errorf("vswitch attach %s: parse %q: %w", c.sw, out.String(), err)
+		return nil, fmt.Errorf("connector vswitch attach %s: parse %q: %w", c.sw, out.String(), err)
 	}
 	return &Port{
 		Port:       strconv.FormatUint(uint64(a.Port), 10),
@@ -84,7 +84,7 @@ func (c *CLI) Attach(ctx context.Context, req AttachReq) (*Port, error) {
 // TapFDExec returns the argv for Network.TapFD.Exec: sandbox-ctl execs it with
 // TAPFD_SOCKET set and receives this port's vnet_hdr tap queue fd via SCM_RIGHTS.
 func (c *CLI) TapFDExec(port string) []string {
-	return []string{c.bin, "open-port", c.sw, "--port=" + port}
+	return []string{c.bin, "vswitch", "open-port", c.sw, "--port=" + port}
 }
 
 // Detach releases the port.
@@ -92,11 +92,11 @@ func (c *CLI) Detach(ctx context.Context, port string) error {
 	if port == "" {
 		return nil
 	}
-	cmd := exec.CommandContext(ctx, c.bin, "detach", c.sw, "--port="+port)
+	cmd := exec.CommandContext(ctx, c.bin, "vswitch", "detach", c.sw, "--port="+port)
 	var errb bytes.Buffer
 	cmd.Stderr = &errb
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("vswitch detach %s port %s: %w: %s", c.sw, port, err, errb.String())
+		return fmt.Errorf("connector vswitch detach %s port %s: %w: %s", c.sw, port, err, errb.String())
 	}
 	return nil
 }

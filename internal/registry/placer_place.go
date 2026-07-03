@@ -12,13 +12,13 @@ import (
 	"strings"
 	"time"
 
-	"github.com/kuasar-sandbox/sandbox-accelerator/pkg/maglev"
-	"github.com/kuasar-sandbox/sandbox-orchestrator/internal/routesync"
+	"github.com/kuasar-sandbox/accelerator/pkg/maglev"
+	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 )
 
-const scalerPeerMaxAge = 30 * time.Second
+const placerPeerMaxAge = 30 * time.Second
 
-type HTTPScalePlacer struct {
+type HTTPPlacer struct {
 	r            *Registry
 	replicaCount int
 	minReady     int
@@ -26,11 +26,11 @@ type HTTPScalePlacer struct {
 	client       *http.Client
 }
 
-func NewHTTPScalePlacer(r *Registry, replicaCount int, timeout time.Duration) Placer {
-	return NewHTTPScalePlacerWithMinReady(r, replicaCount, 1, timeout)
+func NewHTTPPlacer(r *Registry, replicaCount int, timeout time.Duration) Placer {
+	return NewHTTPPlacerWithMinReady(r, replicaCount, 1, timeout)
 }
 
-func NewHTTPScalePlacerWithMinReady(r *Registry, replicaCount, minReady int, timeout time.Duration) Placer {
+func NewHTTPPlacerWithMinReady(r *Registry, replicaCount, minReady int, timeout time.Duration) Placer {
 	if replicaCount <= 0 {
 		replicaCount = 1
 	}
@@ -40,7 +40,7 @@ func NewHTTPScalePlacerWithMinReady(r *Registry, replicaCount, minReady int, tim
 	if timeout <= 0 {
 		timeout = 2 * time.Second
 	}
-	return &HTTPScalePlacer{
+	return &HTTPPlacer{
 		r:            r,
 		replicaCount: replicaCount,
 		minReady:     minReady,
@@ -49,12 +49,12 @@ func NewHTTPScalePlacerWithMinReady(r *Registry, replicaCount, minReady int, tim
 	}
 }
 
-func (p *HTTPScalePlacer) Place(ctx context.Context, req PlaceRequest) (*Placement, error) {
-	peers := p.r.readyScalerPeers(scalerPeerMaxAge)
+func (p *HTTPPlacer) Place(ctx context.Context, req PlaceRequest) (*Placement, error) {
+	peers := p.r.readyPlacerPeers(placerPeerMaxAge)
 	if len(peers) < p.minReady {
 		return nil, ErrNoNode
 	}
-	byID := make(map[string]ScalerPeer, len(peers))
+	byID := make(map[string]PlacerPeer, len(peers))
 	ids := make([]string, 0, len(peers))
 	for _, peer := range peers {
 		byID[peer.ID] = peer
@@ -85,7 +85,7 @@ func (p *HTTPScalePlacer) Place(ctx context.Context, req PlaceRequest) (*Placeme
 	return nil, ErrNoNode
 }
 
-func (p *HTTPScalePlacer) placeOne(ctx context.Context, peer ScalerPeer, req PlaceRequest) (*Placement, error) {
+func (p *HTTPPlacer) placeOne(ctx context.Context, peer PlacerPeer, req PlaceRequest) (*Placement, error) {
 	if peer.Advertise == "" {
 		return nil, ErrNoNode
 	}
@@ -98,7 +98,7 @@ func (p *HTTPScalePlacer) placeOne(ctx context.Context, peer ScalerPeer, req Pla
 		Build:               req.Build,
 		TargetRuntimeDigest: req.TargetRuntimeDigest,
 	})
-	u, err := scaleURL(peer.Advertise, ScaleLinkPlacePath)
+	u, err := placerURL(peer.Advertise, PlacerLinkPlacePath)
 	if err != nil {
 		return nil, err
 	}
@@ -116,14 +116,14 @@ func (p *HTTPScalePlacer) placeOne(ctx context.Context, peer ScalerPeer, req Pla
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return nil, fmt.Errorf("scale_link place %s: %s", resp.Status, strings.TrimSpace(string(b)))
+		return nil, fmt.Errorf("placer_link place %s: %s", resp.Status, strings.TrimSpace(string(b)))
 	}
 	var out routesync.PlaceResult
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return nil, err
 	}
 	if out.Error != "" {
-		return nil, fmt.Errorf("scale_link place: %s", out.Error)
+		return nil, fmt.Errorf("placer_link place: %s", out.Error)
 	}
 	if out.NoNode || out.NodeID == "" {
 		return nil, ErrNoNode
@@ -149,11 +149,11 @@ func (r *Registry) VerifyAPIKeyWithMinReady(ctx context.Context, group, apiKey s
 	if timeout <= 0 {
 		timeout = 2 * time.Second
 	}
-	peers := r.readyScalerPeers(scalerPeerMaxAge)
+	peers := r.readyPlacerPeers(placerPeerMaxAge)
 	if len(peers) < minReady {
 		return false, ErrNoNode
 	}
-	byID := make(map[string]ScalerPeer, len(peers))
+	byID := make(map[string]PlacerPeer, len(peers))
 	ids := make([]string, 0, len(peers))
 	for _, peer := range peers {
 		byID[peer.ID] = peer
@@ -183,11 +183,11 @@ func (r *Registry) VerifyAPIKeyWithMinReady(ctx context.Context, group, apiKey s
 	return false, ErrNoNode
 }
 
-func verifyAPIKeyOne(ctx context.Context, client *http.Client, timeout time.Duration, peer ScalerPeer, group, apiKey string) (bool, error) {
+func verifyAPIKeyOne(ctx context.Context, client *http.Client, timeout time.Duration, peer PlacerPeer, group, apiKey string) (bool, error) {
 	if peer.Advertise == "" {
 		return false, ErrNoNode
 	}
-	u, err := scaleURL(peer.Advertise, ScaleLinkVerifyKeyPath)
+	u, err := placerURL(peer.Advertise, PlacerLinkVerifyKeyPath)
 	if err != nil {
 		return false, err
 	}
@@ -213,15 +213,15 @@ func verifyAPIKeyOne(ctx context.Context, client *http.Client, timeout time.Dura
 		return false, nil
 	default:
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return false, fmt.Errorf("scale_link verify-key %s: %s", resp.Status, strings.TrimSpace(string(b)))
+		return false, fmt.Errorf("placer_link verify-key %s: %s", resp.Status, strings.TrimSpace(string(b)))
 	}
 }
 
-func scaleURL(advertise, path string) (string, error) {
+func placerURL(advertise, path string) (string, error) {
 	if strings.HasPrefix(advertise, "http://") || strings.HasPrefix(advertise, "https://") {
 		u, err := url.Parse(advertise)
 		if err != nil || u.Host == "" {
-			return "", fmt.Errorf("scale_link: invalid scaler advertise %q", advertise)
+			return "", fmt.Errorf("placer_link: invalid placer advertise %q", advertise)
 		}
 		u.Path = strings.TrimRight(u.Path, "/") + path
 		return u.String(), nil
