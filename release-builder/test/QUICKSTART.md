@@ -1,22 +1,23 @@
-# test — release 包内的 e2e / perf 入口指南
+# test — release 组件包内的 e2e / perf 入口指南
 
-本文件随 release tarball 一并下发,位于 `<release>/test/QUICKSTART.md`。
-适用于已解开 `kuasar-sandbox-<ver>-linux-<arch>.tar.gz` 的用户,目的是把
-"如何把这堆脚本跑起来"压缩为一页。
+本文件随 orchestrator 组件包一并下发,位于 `<release-dir>/test/QUICKSTART.md`。
+适用于把 `release-v*` 下发的多个组件包解到同一个目录后的用户,目的是把
+"如何把组件包合并后的脚本跑起来"压缩为一页。
 
 ## 1. 解包后的布局
 
 ```
-<release>/
+<release-dir>/
 ├── bin/                       平台全部二进制(cloud-hypervisor / vmlinux /
 │                              mkfs.erofs / fsck.erofs / envd / manifest-ctl /
 │                              store-ctl / cache-ctl / flatten-ctl / sandbox-ctl /
 │                              sandbox-init / node-ctl / connector-ctl /
 │                              e2b-key-ctl / sandbox-runtime.erofs)
-├── README.md                  项目入口
-├── docs/                      系统设计 + 模块设计 + 部署 + 性能基线
+├── docs/                      平铺语义文档(kuasar-sandbox.md / sandboxer.md /
+│                              cloud-hypervisor.md / vmlinux.md / ...)
 ├── deploy/                    运维配置样例 + systemd 单元(config.example.yaml /
 │                              node-ctl.service / node-proxy@.service)
+├── release/                   组件包元数据
 └── test/
     ├── QUICKSTART.md          本文件
     ├── e2e/                   跨仓 e2e 脚本(一键跑,零环境变量)
@@ -43,8 +44,10 @@
 ## 3. 三十秒上手
 
 ```bash
-tar xzf kuasar-sandbox-<ver>-linux-<arch>.tar.gz
-cd kuasar-sandbox-<ver>-linux-<arch>
+mkdir kuasar-sandbox-release && cd kuasar-sandbox-release
+for f in ../*-<ver>-linux-<arch>.tar.gz ../sandbox-runtime-<arch>-<ver>.tar.gz ../vmlinux-<arch>-<ver>.tar.gz; do
+  tar xzf "$f"
+done
 bash test/e2e/e2e_sandbox_cold.sh      # 冷启 python:3.12-slim 并验证退出
 ```
 

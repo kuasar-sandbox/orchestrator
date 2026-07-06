@@ -11,7 +11,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-ORG_ROOT="$(cd "$REPO_ROOT/.." && pwd)"
+ORG_ROOT="$(cd "$REPO_ROOT/../.." && pwd)"
 HOST_ARCH="$(uname -m)"
 case "$HOST_ARCH" in
   amd64) HOST_ARCH=x86_64 ;;

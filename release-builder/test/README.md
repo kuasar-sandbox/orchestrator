@@ -3,7 +3,7 @@
 System-level integration and performance suites for the kuasar-sandbox
 platform. This directory is the umbrella test home under
 `orchestrator/release-builder` because these cases span multiple sibling repos
-and consume the aggregated `bin/<arch>/` artifact set.
+and consume the assembled `bin/<arch>/` artifact set.
 
 ## Entry Points
 
@@ -27,9 +27,10 @@ make -C orchestrator/release-builder release
 
 `make build` drives `guest-runtime/native-deps`, `accelerator`, `sandboxer`,
 `guest-runtime`, `connector`, and `orchestrator`, then collects their artifacts
-into `orchestrator/release-builder/bin/<arch>/`. Individual scripts default to
-`SCRIPT_DIR/../../bin`, so release-package layout and source-tree layout use the
-same binary discovery convention. `BIN=/path/to/bin` can override it.
+into `orchestrator/release-builder/bin/<arch>/`. In release archives, runnable
+scripts are staged under `test/e2e`, `test/perf`, and `test/demo`, so they keep
+the same `SCRIPT_DIR/../../bin` binary discovery convention after component
+packages are extracted into one directory. `BIN=/path/to/bin` can override it.
 
 ## Suites
 

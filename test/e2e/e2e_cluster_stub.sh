@@ -105,14 +105,30 @@ except PermissionError:
 PY
 }
 
+ALLOCATED_PORTS=()
+
 alloc_port() {
     local var="$1"
     local name="$2"
     local port
-    if ! port="$(free_port)"; then
-        skip "cannot allocate local TCP port for $name (socket permission denied in this environment)"
-    fi
-    printf -v "$var" '%s' "$port"
+    for _ in $(seq 1 100); do
+        if ! port="$(free_port)"; then
+            skip "cannot allocate local TCP port for $name (socket permission denied in this environment)"
+        fi
+        local used=0
+        for existing in "${ALLOCATED_PORTS[@]:-}"; do
+            if [ "$existing" = "$port" ]; then
+                used=1
+                break
+            fi
+        done
+        if [ "$used" = "0" ]; then
+            ALLOCATED_PORTS+=("$port")
+            printf -v "$var" '%s' "$port"
+            return
+        fi
+    done
+    fail "could not allocate a unique local TCP port for $name"
 }
 
 wait_tcp() {

@@ -8,7 +8,7 @@
 #   3. restore with a host.yaml carrying files:[/etc/instance-id="clone-<n>"]
 #   4. assert the resumed app starts printing ID=clone-<n>
 #
-# This proves the restore-window file injection (docs/sandbox-runtime.md
+# This proves the restore-window file injection (docs/sandbox-init.md
 # §4.3) is visible to the already-running app.
 
 set -euo pipefail

@@ -203,7 +203,7 @@ fi
 
 hosts_add "api.$DOMAIN"
 say "node-ctl conductor serve — e2b control plane + data-plane proxy (TLS :$TLS_PORT)"
-"$BIN/node-ctl" serve --config "$WORK/config.yaml" >"$WORK/orch.log" 2>&1 & PIDS+=($!)
+"$BIN/node-ctl" conductor serve --config "$WORK/config.yaml" >"$WORK/orch.log" 2>&1 & PIDS+=($!)
 for _ in $(seq 1 40); do (exec 3<>"/dev/tcp/127.0.0.1/$TLS_PORT") 2>/dev/null && { exec 3>&- 3<&-; break; }; kill -0 "${PIDS[-1]}" 2>/dev/null || { sed 's/^/    /' "$WORK/orch.log"; die "orchestrator exited"; }; sleep 0.5; done
 ok "orchestrator serving https://api.$DOMAIN"
 pause

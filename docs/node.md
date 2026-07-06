@@ -911,7 +911,7 @@ plugin 平面,机群路由经 registry 聚合。
   `-isnotfc`,node-proxy.md §8),`restart=always`,**以 root(`user: "0:0"`)运行**——envd 需要
   `CAP_SETUID/SETGID` 才能按镜像配置的用户跑工作负载命令(镜像设了 `Config.User` 时
   非 root 的 envd 会 exec EPERM);工作负载本身仍以目标用户执行。
-- envd 是 **guest-runtime/native-deps** 的原生构建产物(与 cloud-hypervisor/vmlinux/mkfs.erofs
+- envd 是 **guest-runtime/native-deps** 的原生构建产物(与 vmlinux/mkfs.erofs
   并列):`make -C guest-runtime/native-deps envd` 拉取 e2b-dev/infra 发布 tarball(默认 tag
   `2026.22`,`ENVD_TARBALL` 可覆盖)→ `go build packages/envd`。`guest-runtime make
   sandbox-runtime` 负责把它和构建工具链一起注入 runtime。
@@ -1171,7 +1171,7 @@ sandbox-runtime.erofs 等),均已注册为 umbrella make 目标,缺前置则自�
   run/snapshot/restore/connect 原语、cgroup 模型
 - `connector/docs/vswitch.md` —— attach/detach/open-port、floatingip 与
   mgmt-service(MMDS VIP 转换)语义
-- `accelerator/docs/flatten.md` —— flatten-ctl export 与 OCI Referrers 幂等流、
+- `guest-runtime/docs/flatten.md` —— flatten-ctl export 与 OCI Referrers 幂等流、
   `FLATTEN_REGISTRY_*`
 - `accelerator/docs/manifest.md` —— manifest 内容键、收敛加密与去重域
   (§7 的存储侧)

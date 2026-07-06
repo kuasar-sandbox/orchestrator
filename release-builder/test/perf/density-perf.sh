@@ -103,7 +103,7 @@ command -v mkfs.ext4 >/dev/null 2>&1 || skip "mkfs.ext4 not on PATH"
 command -v python3  >/dev/null 2>&1 || skip "python3 not on PATH"
 
 for b in sandbox-ctl node-ctl sandbox-init sandbox-runtime.erofs flatten-ctl cloud-hypervisor; do
-    [ -e "$BIN/$b" ] || skip "missing $BIN/$b — run 'make build cloud-hypervisor'"
+    [ -e "$BIN/$b" ] || skip "missing $BIN/$b — run 'make build'"
 done
 VMLINUX="${VMLINUX:-$BIN/vmlinux}"
 [ -f "$VMLINUX" ] || skip "no vmlinux at $VMLINUX (run make vmlinux)"
@@ -319,6 +319,10 @@ cat > "$WORK/node-ctl.yaml" <<EOF
 api: { domain: density.local, listen: "127.0.0.1:0" }
 encryption_key: "0000000000000000000000000000000000000000000000000000000000000000"
 proxy: { mode: internal, auth: enforce }
+sandbox:
+  boot:
+    kernel: $BIN/vmlinux
+    runtime: $BIN/sandbox-runtime.erofs
 paths:
   run_root: $WORK/run
   base_root: $WORK/lib
@@ -434,7 +438,7 @@ say "   timing:       workload=${WL_DURATION}s  admit_deadline=${ADMIT_DEADLINE}
 say ""
 
 # ---- spin up the resource controller (node-ctl conductor serve, resource_listen) ----
-"$BIN/node-ctl" serve --config "$WORK/node-ctl.yaml" >"$WORK/daemon.log" 2>&1 &
+"$BIN/node-ctl" conductor serve --config "$WORK/node-ctl.yaml" >"$WORK/daemon.log" 2>&1 &
 DAEMON_PID=$!
 for _ in $(seq 1 60); do
     [ -S "$WORK/sandbox-resource.sock" ] && break

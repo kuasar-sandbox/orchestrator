@@ -11,7 +11,7 @@
 #
 # Prerequisites (the script checks each and prints what's missing):
 #   1. KVM accessible:                /dev/kvm exists, current user has rw
-#   2. cloud-hypervisor built:        bin/cloud-hypervisor (make cloud-hypervisor)
+#   2. cloud-hypervisor built:        bin/cloud-hypervisor (make build)
 #   3. sandbox-* binaries built:      bin/sandbox-ctl, bin/sandbox-init,
 #                                      bin/sandbox-runtime.erofs, bin/flatten-ctl
 #   4. Kernel image:                  $VMLINUX (default $REPO/bin/vmlinux)
@@ -49,7 +49,7 @@ skip() {
 [ -r /dev/kvm ] && [ -w /dev/kvm ] || skip "/dev/kvm not accessible to current user"
 
 for b in cloud-hypervisor sandbox-ctl sandbox-init sandbox-runtime.erofs flatten-ctl; do
-    [ -e "$BIN/$b" ] || skip "missing $BIN/$b — run 'make build' and 'make cloud-hypervisor'"
+    [ -e "$BIN/$b" ] || skip "missing $BIN/$b — run 'make build'"
 done
 
 VMLINUX="${VMLINUX:-$BIN/vmlinux}"

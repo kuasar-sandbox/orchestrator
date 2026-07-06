@@ -1,9 +1,9 @@
 # kuasar-sandbox — complete build entry point for the platform.
 #
 # `make build` drives every sub-repo's build (via their Makefiles) and then
-# assembles all platform artifacts into bin/$(TARGET_ARCH)/ (with native-arch
-# symlinks under bin/). `make release` packages that bin/ into a download-
-# and-run tarball.
+# assembles all platform runtime files into bin/$(TARGET_ARCH)/ (with native-arch
+# symlinks under bin/). `make release` produces merge-safe component tarballs
+# under dist/ for the release-v* aggregate.
 #
 # Cross-repo e2e/perf tests (those that need binaries from multiple sub-repos)
 # live in this repo's test/; per-repo tests live in their own repo's test/.
@@ -12,7 +12,7 @@
 
 SHELL    := /bin/bash
 ORG      := $(abspath $(CURDIR)/../..)
-VERSION  ?= v0.1.1
+VERSION  ?= v0.1.0
 
 # ---------------------------------------------------------------------------
 # Architecture selection (identical normalization across kuasar-sandbox repos)
@@ -34,14 +34,15 @@ export TARGET_ARCH
 
 BINDIR         := bin/$(TARGET_ARCH)
 SBIN           := $(abspath $(BINDIR))
-ARTIFACTS_LIST := scripts/artifacts.list
-GO_REPOS       := accelerator sandboxer connector orchestrator
+BIN_INPUTS_MANIFEST := scripts/bin-inputs.manifest
+GO_REPOS       := accelerator sandboxer guest-runtime connector orchestrator
 
 # Cross-repo e2e tests this repo carries (each needs binaries from multiple
-# sub-repos: vmlinux/CH/mkfs.erofs from guest-runtime/native-deps,
+# sub-repos: vmlinux/mkfs.erofs from guest-runtime/native-deps,
 # sandbox-runtime.erofs from guest-runtime,
-# manifest-ctl/store-ctl/cache-ctl/flatten-ctl from accelerator,
-# sandbox-ctl/sandbox-init from sandboxer, connector-ctl from connector,
+# manifest-ctl/store-ctl/cache-ctl from accelerator,
+# sandbox-ctl/sandbox-init/cloud-hypervisor from sandboxer, flatten-ctl from
+# guest-runtime, connector-ctl from connector,
 # node-ctl from orchestrator, etc.).
 #
 # Auto-derived from the filesystem so `make test-e2e` always runs EVERY e2e script
@@ -61,10 +62,11 @@ PERF_TARGETS := perf-sandbox perf-sandbox-manifest perf-density
 all: build
 
 # Full platform build. Sub-repo order matters: guest-runtime/native-deps leads
-# (mkfs.erofs is needed by guest-runtime), sandboxer builds sandbox-init before
-# guest-runtime packs the guest erofs. Each sub-repo's `build` builds every binary it ships. After all sub-builds, `collect`
-# assembles every artifact under bin/$(TARGET_ARCH)/; then the e2b guest runtime
-# the single guest runtime already contains envd/flatten-ctl/mkfs.erofs.
+# (mkfs.erofs is needed by guest-runtime), sandboxer builds sandbox-init and
+# cloud-hypervisor, then guest-runtime packs the guest erofs and builds
+# flatten-ctl. Each sub-repo's `build` builds every binary it ships. After all
+# sub-builds, `collect` assembles every artifact under bin/$(TARGET_ARCH)/; the
+# single guest runtime already contains envd/flatten-ctl/mkfs.erofs.
 build:
 	$(MAKE) -C $(ORG)/guest-runtime/native-deps build
 	$(MAKE) -C $(ORG)/accelerator build
@@ -75,11 +77,12 @@ build:
 	@$(MAKE) collect
 
 # Assemble bin/$(TARGET_ARCH)/ from each sub-repo's per-arch bin per the
-# artifacts manifest. Native builds drop a bin/<name> symlink to the per-arch
+# binary-input manifest. Native builds drop a bin/<name> symlink to the per-arch
 # binary. Idempotent; missing inputs only warn.
 collect:
 	@rm -rf $(BINDIR); mkdir -p $(BINDIR)
 	@while read repo name; do \
+	  case "$$repo" in ''|\#*) continue ;; esac; \
 	  [ -n "$$repo" ] || continue; \
 	  src="$(ORG)/$$repo/bin/$(TARGET_ARCH)/$$name"; \
 	  if [ -e "$$src" ]; then \
@@ -87,16 +90,19 @@ collect:
 	  else \
 	    echo "  ! missing: $$repo/bin/$(TARGET_ARCH)/$$name" >&2; \
 	  fi; \
-	done < $(ARTIFACTS_LIST)
+	done < $(BIN_INPUTS_MANIFEST)
 	@if [ "$(HOST_ARCH)" = "$(TARGET_ARCH)" ]; then \
 	   while read repo name; do \
+	     case "$$repo" in ''|\#*) continue ;; esac; \
 	     [ -n "$$repo" ] || continue; \
 	     [ -e $(BINDIR)/$$name ] && ln -sfn $(TARGET_ARCH)/$$name bin/$$name; \
-	   done < $(ARTIFACTS_LIST); \
+	   done < $(BIN_INPUTS_MANIFEST); \
 	 fi
 	@echo "==> assembled $(BINDIR)/"
 
-# Aggregate bin/$(TARGET_ARCH)/ into a download-and-run tarball.
+# Produce merge-safe component packages. release-v* uploads these original
+# component tarballs and checksums directly; it does not create another aggregate
+# tarball.
 release: build
 	bash scripts/release.sh $(VERSION)
 
@@ -111,7 +117,7 @@ $(UMBRELLA_E2E): test-e2e-%: build
 
 # Aggregate test-e2e: every umbrella sub-target + each sub-repo's test-e2e.
 test-e2e: build $(UMBRELLA_E2E)
-	$(MAKE) -C $(ORG)/accelerator test-e2e
+	$(MAKE) -C $(ORG)/accelerator test-e2e SBIN=$(SBIN)
 	$(MAKE) -C $(ORG)/connector test-e2e
 
 # perf harnesses living in this repo (cross-repo binary use).
@@ -152,14 +158,14 @@ test:
 	@for r in $(GO_REPOS); do echo "== test $$r =="; $(MAKE) -C $(ORG)/$$r test || exit 1; done
 
 clean:
-	@for r in $(GO_REPOS) guest-runtime; do $(MAKE) -C $(ORG)/$$r clean 2>/dev/null || true; done
+	@for r in $(GO_REPOS); do $(MAKE) -C $(ORG)/$$r clean 2>/dev/null || true; done
 	rm -rf bin build dist
 
 help:
 	@echo "kuasar-sandbox — platform build entry. Targets:"
 	@echo "  build         build every sub-repo + assemble bin/\$$(TARGET_ARCH)/ (multi-min cold)"
 	@echo "  collect       re-assemble bin/\$$(TARGET_ARCH)/ from existing sub-repo outputs"
-	@echo "  release       build + package dist/kuasar-sandbox-\$$(VERSION)-linux-\$$(TARGET_ARCH).tar.gz"
+	@echo "  release       build + package merge-safe component tarballs under dist/"
 	@echo "  test-e2e      aggregate: drive each sub-repo's test-e2e + run this repo's cross-repo e2e ($(words $(UMBRELLA_E2E)))"
 	@echo "  test-e2e-<X>  one e2e sub-target (X in {manifest,obs,density,sandbox-{cold,..},orchestrator,run-builder,execute,..})"
 	@echo "  demo          run the e2b end-to-end demo (test/demo/demo_e2b.sh; DEMO_PAUSE=1 to step through)"

@@ -197,7 +197,7 @@ builder:
   memory: 1GiB
 checkpoint: { mode: remote }
 EOF
-"$BIN/node-ctl" serve --config "$WORK/config.yaml" >"$WORK/orch.log" 2>&1 &
+"$BIN/node-ctl" conductor serve --config "$WORK/config.yaml" >"$WORK/orch.log" 2>&1 &
 PIDS+=($!)
 for _ in $(seq 1 30); do
     curl -sS --noproxy '*' -o /dev/null "http://127.0.0.1:$PORT/health" -H "Host: api.$DOMAIN" 2>/dev/null && break

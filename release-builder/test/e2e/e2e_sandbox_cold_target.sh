@@ -39,7 +39,7 @@ skip() {
 [ -r /dev/kvm ] && [ -w /dev/kvm ] || skip "/dev/kvm not accessible to current user"
 
 for b in cloud-hypervisor sandbox-ctl sandbox-init sandbox-runtime.erofs flatten-ctl; do
-    [ -e "$BIN/$b" ] || skip "missing $BIN/$b — run 'make build' and 'make cloud-hypervisor'"
+    [ -e "$BIN/$b" ] || skip "missing $BIN/$b — run 'make build'"
 done
 
 VMLINUX="${VMLINUX:-$BIN/vmlinux}"

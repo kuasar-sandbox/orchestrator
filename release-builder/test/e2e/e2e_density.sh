@@ -213,7 +213,7 @@ EOF
 # against that socket.
 start_daemon() {
     local cfg="$1"
-    "$BIN/node-ctl" serve --config "$cfg" >"$WORK/daemon.log" 2>&1 &
+    "$BIN/node-ctl" conductor serve --config "$cfg" >"$WORK/daemon.log" 2>&1 &
     DAEMON_PID=$!
     for _ in $(seq 1 60); do
         [ -S "$WORK/sandbox-resource.sock" ] && return 0
@@ -248,6 +248,10 @@ write_default_config() {
 api: { domain: density.local, listen: "127.0.0.1:0" }
 encryption_key: "0000000000000000000000000000000000000000000000000000000000000000"
 proxy: { mode: internal, auth: enforce }
+sandbox:
+  boot:
+    kernel: $BIN/vmlinux
+    runtime: $BIN/sandbox-runtime.erofs
 paths:
   run_root: $WORK/run
   base_root: $WORK/lib
@@ -293,6 +297,10 @@ write_compact_config() {
 api: { domain: density.local, listen: "127.0.0.1:0" }
 encryption_key: "0000000000000000000000000000000000000000000000000000000000000000"
 proxy: { mode: internal, auth: enforce }
+sandbox:
+  boot:
+    kernel: $BIN/vmlinux
+    runtime: $BIN/sandbox-runtime.erofs
 paths:
   run_root: $WORK/run
   base_root: $WORK/lib

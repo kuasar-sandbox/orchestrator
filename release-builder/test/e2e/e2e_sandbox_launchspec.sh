@@ -2,7 +2,7 @@
 #
 # e2e_sandbox_launchspec.sh — cold-start a sandbox with a populated launch
 # spec (mounts + files + init + non-root user) and verify each piece took
-# effect inside the guest. Exercises docs/sandbox-runtime.md §3.1-§3.2:
+# effect inside the guest. Exercises docs/sandbox-init.md §3.1-§3.2:
 #
 #   - mounts: tmpfs /tmp + empty (volume) /var/log
 #   - files:  /etc/resolv.conf injected (tmpfs+bind, memory-only)
@@ -31,7 +31,7 @@ skip() {
 [ -e /dev/kvm ] || skip "/dev/kvm not present"
 [ -r /dev/kvm ] && [ -w /dev/kvm ] || skip "/dev/kvm not accessible to current user"
 for b in cloud-hypervisor sandbox-ctl sandbox-init sandbox-runtime.erofs flatten-ctl; do
-    [ -e "$BIN/$b" ] || skip "missing $BIN/$b — run 'make build' and 'make cloud-hypervisor'"
+    [ -e "$BIN/$b" ] || skip "missing $BIN/$b — run 'make build'"
 done
 VMLINUX="${VMLINUX:-$BIN/vmlinux}"
 [ -f "$VMLINUX" ] || skip "no vmlinux at $VMLINUX (run 'make vmlinux' or set VMLINUX env var)"

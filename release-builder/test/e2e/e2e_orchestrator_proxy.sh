@@ -7,7 +7,7 @@
 # data-plane traffic driven THROUGH the proxy (not the orchestrator):
 #
 #   serve(proxy_mode=external)                          # control plane on :PORT
-#   proxy --config <proxy.yaml> --id=.. --socket=<uds>  # data-plane on :PROXY_PORT
+#   proxy serve --config <proxy.yaml> --id=.. --socket=<uds>  # data-plane on :PROXY_PORT
 #         # registers on the config-socket plugin plane + syncs the route table
 #   POST /sandboxes  -> real VM + envd ; serve streams the route to the proxy
 #   GET <proxy>/health (Host 49983-<sid>): no token -> 401 (enforce);
@@ -203,7 +203,7 @@ EOF
 # ---- start serve (control plane), then the proxy worker -------------------
 # The proxy now DIALS serve's config-socket to register, so serve comes up first.
 echo "==> node-ctl conductor serve (control :$PORT, proxy_mode=external)"
-"$BIN/node-ctl" serve --config "$WORK/config.yaml" >"$WORK/orch.log" 2>&1 &
+"$BIN/node-ctl" conductor serve --config "$WORK/config.yaml" >"$WORK/orch.log" 2>&1 &
 PIDS+=($!)
 for _ in $(seq 1 30); do
     curl -sS --noproxy '*' -o /dev/null "http://127.0.0.1:$PORT/health" -H "Host: api.$DOMAIN" 2>/dev/null && break
@@ -222,7 +222,7 @@ data_listen: 127.0.0.1:$PROXY_PORT
 auth: enforce
 park_timeout: 90s
 EOF
-"$BIN/node-ctl" proxy --config "$WORK/proxy.yaml" --id=proxy-1 \
+"$BIN/node-ctl" proxy serve --config "$WORK/proxy.yaml" --id=proxy-1 \
     --socket="$PROXY_SOCK" --metrics-listen="127.0.0.1:$METRICS_PORT" >"$WORK/proxy.log" 2>&1 &
 PIDS+=($!)
 wait_port 127.0.0.1 "$PROXY_PORT" proxy
