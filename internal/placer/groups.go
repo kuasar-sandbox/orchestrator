@@ -327,6 +327,7 @@ func groupRecordToGroup(rec clusterstate.SandboxGroupRecord) clusterstate.Sandbo
 		ImageRepo:    rec.ImageRepo,
 		RegistryAuth: rec.RegistryAuth,
 		TemplateRef:  rec.TemplateRef,
+		TargetPort:   rec.TargetPort,
 		Metadata:     cloneStringMap(rec.Metadata),
 	}
 }

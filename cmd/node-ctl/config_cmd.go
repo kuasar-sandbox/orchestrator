@@ -214,11 +214,11 @@ const proxyConfigSkeleton = `# node-ctl proxy worker config — node-ctl proxy s
 # External data-plane mode (serve's proxy.mode: external). One file shared by all
 # worker instances; per-instance identity is on the command line:
 #   --id <name>            unique per worker (required)
-#   --socket <uds>         gateway-forward UDS; default <dir(config_socket)>/<id>.sock
+#   --socket <uds>         proxyForwarder UDS; default <dir(config_socket)>/<id>.sock
 #   --metrics-listen <a>   optional Prometheus endpoint, per-instance (ports must differ)
 #   --mmds                 host the FC MMDS service on this instance (addr = mmds_listen)
 config_socket: /run/sandbox/node-ctl.socket      # serve's control socket (= serve paths.config_socket)
-data_listen: ":443"                              # SO_REUSEPORT ingress (all workers share it); "" = UDS-only gateway-forward
+data_listen: ":443"                              # SO_REUSEPORT ingress (all workers share it); "" = UDS-only proxyForwarder
 tls: { cert: /etc/node-ctl/tls/fullchain.pem, key: /etc/node-ctl/tls/privkey.pem }   # = serve's wildcard cert; omit = h2c
 auth: enforce                                    # bootstrap fallback until serve pushes policy: off | log | enforce
 park_timeout: 30s                                # bootstrap fallback

@@ -28,7 +28,7 @@ import (
 //     down + Wake up — internal/routesync);
 //
 //   - serves an h2c UDS (--socket, default <dir(config_socket)>/<id>.sock) for the
-//     data-plane requests serve's gateway forwards to it (advertised at registration);
+//     data-plane requests serve's proxyForwarder forwards to it (advertised at registration);
 //
 //   - serves the data-plane ingress on data_listen with SO_REUSEPORT (so several
 //     workers share one port), forwarding to envd UDS / floatingip from its synced
@@ -40,7 +40,7 @@ func runProxy(args []string, log *slog.Logger) error {
 	fs := flag.NewFlagSet("proxy serve", flag.ExitOnError)
 	cfgPath := fs.String("config", "/etc/node-ctl/proxy.yaml", "worker config file")
 	id := fs.String("id", "", "this worker's plugin id, unique per worker (required)")
-	socket := fs.String("socket", "", `UDS this worker serves for gateway-forwarded requests; "" = <dir(config_socket)>/<id>.sock`)
+	socket := fs.String("socket", "", `UDS this worker serves for proxyForwarder requests; "" = <dir(config_socket)>/<id>.sock`)
 	metricsListen := fs.String("metrics-listen", "", "optional Prometheus text endpoint (per-instance), e.g. 127.0.0.1:9095")
 	enableMMDS := fs.Bool("mmds", false, "host the FC MMDS metadata service on this worker (addr = mmds.listen); set on exactly one worker")
 	_ = fs.Parse(args)
@@ -87,7 +87,7 @@ func runProxy(args []string, log *slog.Logger) error {
 	}
 	go routesync.NewSubscriber(dial, *id, reg, tbl, tbl, log).Run(ctx)
 
-	// UDS: the data-plane requests serve's gateway forwards to this worker.
+	// UDS: the data-plane requests serve's proxyForwarder forwards to this worker.
 	_ = os.Remove(socketPath)
 	udsLn, err := net.Listen("unix", socketPath)
 	if err != nil {
@@ -124,7 +124,7 @@ func runProxy(args []string, log *slog.Logger) error {
 	}
 
 	if cfg.DataListen == "" {
-		log.Warn("proxy: no data_listen; serving gateway-forward over UDS only", "socket", socketPath)
+		log.Warn("proxy: no data_listen; serving proxyForwarder over UDS only", "socket", socketPath)
 		<-ctx.Done()
 		return nil
 	}

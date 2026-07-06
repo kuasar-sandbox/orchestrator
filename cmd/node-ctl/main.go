@@ -220,8 +220,8 @@ func runConductor(args []string, log *slog.Logger) error {
 	// admin_pidfile or, when unset, the socket's 0600 perms), and the api plane over
 	// plain h2c (X-API-KEY). See docs §6.
 	// The plugin registry is shared: the config-socket plugin plane Adds/Removes
-	// registrations (proxy workers, route observers); the external-mode gateway reads
-	// it to forward data-plane requests to a registered proxy worker.
+	// registrations (proxy workers, route observers); the external-mode proxyForwarder
+	// reads it to forward data-plane requests to a registered proxy worker.
 	plugins := configsock.NewRegistry()
 	cs := configsock.New(cfg.Paths.ConfigSocket, configsock.Deps{
 		Provider:      core,
@@ -239,7 +239,7 @@ func runConductor(args []string, log *slog.Logger) error {
 	}()
 
 	// Data-plane handler depends on proxy_mode: in-process proxy (internal),
-	// forward-to-worker gateway (external), or reject (off). External mode also
+	// proxyForwarder to worker (external), or reject (off). External mode also
 	// starts the route-sync client that pushes the route table to each worker.
 	mx := metrics.New()
 	dataH := buildDataPlane(cfg, core, plugins, mx, log)
@@ -314,9 +314,9 @@ func buildDataPlane(cfg *config.Config, core *orch.Orchestrator, plugins *config
 		})
 	case config.ProxyExternal:
 		// Proxy workers register on the config-socket plugin plane (and stream the
-		// route table from there); the gateway forwards to the live registered set.
+		// route table from there); the proxy forwarder forwards to the live registered set.
 		log.Info("external proxy mode: workers register on the config socket")
-		return newGateway(plugins, mx, log)
+		return newProxyForwarder(plugins, mx, log)
 	default: // internal
 		return proxy.New(core, func() string { return cfg.Proxy.Auth }, log, mx)
 	}

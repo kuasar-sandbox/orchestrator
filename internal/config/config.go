@@ -601,7 +601,7 @@ func (c *Config) validateProxy() error {
 		return fmt.Errorf("config: proxy.auth %q (want off|log|enforce)", c.Proxy.Auth)
 	}
 	// proxy.mode=external needs no static socket list: proxy workers register
-	// themselves on the config-socket plugin plane (the gateway forwards to the
+	// themselves on the config-socket plugin plane (proxyForwarder forwards to the
 	// live registered set), so there is nothing to require here.
 
 	// MMDS off => envd is non-secure, so the proxy must be the enforcing sole gate.
@@ -624,7 +624,7 @@ func (c *Config) validateProxy() error {
 // identity (--id / --socket) and the per-instance --metrics-listen stay flags.
 type ProxyFileConfig struct {
 	ConfigSocket string    `yaml:"config_socket"` // serve control socket to register + sync on (= serve paths.config_socket)
-	DataListen   string    `yaml:"data_listen"`   // SO_REUSEPORT data-plane ingress (workers share it); "" = UDS-only gateway-forward
+	DataListen   string    `yaml:"data_listen"`   // SO_REUSEPORT data-plane ingress (workers share it); "" = UDS-only proxyForwarder
 	TLS          TLSConfig `yaml:"tls"`           // data-plane listener cert (= serve's wildcard); "" = h2c
 	Auth         string    `yaml:"auth"`          // bootstrap fallback until serve pushes policy: off|log|enforce (default enforce)
 	ParkTimeout  string    `yaml:"park_timeout"`  // bootstrap fallback; default 30s

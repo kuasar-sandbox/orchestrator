@@ -484,14 +484,22 @@ func (s *service) serveData(w http.ResponseWriter, r *http.Request) {
 		s.serveControlStub(w, r)
 		return
 	}
-	sid := sidFromHost(host)
+	sid := r.Header.Get("E2b-Sandbox-Id")
+	if sid == "" {
+		sid = sidFromHost(host)
+	}
 	if sid == "" {
 		http.Error(w, "bad sandbox host", http.StatusBadRequest)
 		return
 	}
 	n, sb := s.findSandbox(sid)
 	if sb == nil {
+		w.Header().Set("X-Kuasar-Proxy-Error", "not_found")
 		http.Error(w, "sandbox not found", http.StatusNotFound)
+		return
+	}
+	if r.Method == http.MethodConnect {
+		s.serveDataConnect(w, r, n, sb)
 		return
 	}
 	status, body := sb.response()
@@ -499,10 +507,6 @@ func (s *service) serveData(w http.ResponseWriter, r *http.Request) {
 		NodeID: n.ID, SandboxID: sb.SID, Group: sb.Group, RouteKey: sb.RouteKey,
 		Host: r.Host, Path: r.URL.Path, Method: r.Method, AccessToken: r.Header.Get(headerAccessToken),
 	})
-	if r.Method == http.MethodConnect {
-		w.WriteHeader(http.StatusOK)
-		return
-	}
 	if status == 0 {
 		status = http.StatusNoContent
 	}
@@ -510,6 +514,51 @@ func (s *service) serveData(w http.ResponseWriter, r *http.Request) {
 	if body != "" {
 		_, _ = io.WriteString(w, body)
 	}
+}
+
+func (s *service) serveDataConnect(w http.ResponseWriter, r *http.Request, n *stubNode, sb *stubSandbox) {
+	hj, ok := w.(http.Hijacker)
+	if !ok {
+		http.Error(w, "connect unsupported", http.StatusInternalServerError)
+		return
+	}
+	conn, br, err := hj.Hijack()
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+	if _, err := io.WriteString(conn, "HTTP/1.1 200 Connection established\r\n\r\n"); err != nil {
+		return
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	inner, err := http.ReadRequest(br.Reader)
+	if err != nil {
+		return
+	}
+	_ = conn.SetReadDeadline(time.Time{})
+	if inner.Body != nil {
+		defer inner.Body.Close()
+	}
+	status, body := sb.response()
+	if status == 0 {
+		status = http.StatusNoContent
+	}
+	s.appendDataHit(dataHit{
+		NodeID: n.ID, SandboxID: sb.SID, Group: sb.Group, RouteKey: sb.RouteKey,
+		Host: inner.Host, Path: inner.URL.Path, Method: inner.Method, AccessToken: inner.Header.Get(headerAccessToken),
+	})
+	resp := &http.Response{
+		StatusCode:    status,
+		Status:        fmt.Sprintf("%d %s", status, http.StatusText(status)),
+		Proto:         "HTTP/1.1",
+		ProtoMajor:    1,
+		ProtoMinor:    1,
+		Header:        make(http.Header),
+		Body:          io.NopCloser(strings.NewReader(body)),
+		ContentLength: int64(len(body)),
+		Request:       inner,
+	}
+	_ = resp.Write(conn)
 }
 
 func (s *service) serveControlStub(w http.ResponseWriter, r *http.Request) {
@@ -787,7 +836,9 @@ func (n *stubNode) handleCreate(cmd *routesync.Command) *routesync.CmdAck {
 	}
 	sb := &stubSandbox{
 		SID: cmd.SID, Group: cmd.Group, RouteKey: cmd.RouteKey, State: "creating",
-		TemplateID: cmd.TemplateRef, AccessToken: cmd.AccessToken, Behavior: beh, CreatedAt: time.Now().UTC().Format(time.RFC3339Nano),
+		TemplateID: cmd.TemplateRef, AccessToken: cmd.AccessToken,
+		TrafficAccessToken: "traffic-" + cmd.SID,
+		Behavior:           beh, CreatedAt: time.Now().UTC().Format(time.RFC3339Nano),
 	}
 	n.mu.Lock()
 	n.sandboxes[sb.SID] = sb
@@ -945,7 +996,9 @@ func (n *stubNode) createAdminSandbox(req sandboxAdminRequest) (*sandboxSnapshot
 	beh := behaviorFromMap(req.Behavior, n.CreateDelay, n.BuildDelay)
 	sb := &stubSandbox{
 		SID: req.SID, Group: req.Group, RouteKey: req.RouteKey, State: state,
-		TemplateID: req.TemplateID, AccessToken: req.AccessToken, Behavior: beh, CreatedAt: time.Now().UTC().Format(time.RFC3339Nano),
+		TemplateID: req.TemplateID, AccessToken: req.AccessToken,
+		TrafficAccessToken: "traffic-" + req.SID,
+		Behavior:           beh, CreatedAt: time.Now().UTC().Format(time.RFC3339Nano),
 	}
 	n.mu.Lock()
 	n.sandboxes[sb.SID] = sb
@@ -1085,27 +1138,30 @@ func (n *stubNode) commandCountsLocked() map[string]int {
 }
 
 type stubSandbox struct {
-	SID         string       `json:"sid"`
-	Group       string       `json:"group"`
-	RouteKey    string       `json:"route_key"`
-	State       string       `json:"state"`
-	TemplateID  string       `json:"template_id,omitempty"`
-	AccessToken string       `json:"access_token,omitempty"`
-	Behavior    stubBehavior `json:"behavior,omitempty"`
-	CreatedAt   string       `json:"created_at,omitempty"`
+	SID                string       `json:"sid"`
+	Group              string       `json:"group"`
+	RouteKey           string       `json:"route_key"`
+	State              string       `json:"state"`
+	TemplateID         string       `json:"template_id,omitempty"`
+	AccessToken        string       `json:"access_token,omitempty"`
+	TrafficAccessToken string       `json:"traffic_access_token,omitempty"`
+	Behavior           stubBehavior `json:"behavior,omitempty"`
+	CreatedAt          string       `json:"created_at,omitempty"`
 }
 
 func (s *stubSandbox) routeEntry() routesync.RouteEntry {
 	return routesync.RouteEntry{
 		SandboxID: s.SID, Group: s.Group, RouteKey: s.RouteKey, State: s.State,
-		TemplateID: s.TemplateID, AccessToken: s.AccessToken, Profile: "e2b",
+		TemplateID: s.TemplateID, AccessToken: s.AccessToken,
+		TrafficAccessToken: s.TrafficAccessToken, Profile: "e2b",
 	}
 }
 
 func (s *stubSandbox) snapshot(nodeID string) sandboxSnapshot {
 	return sandboxSnapshot{
 		NodeID: nodeID, SID: s.SID, Group: s.Group, RouteKey: s.RouteKey, State: s.State,
-		TemplateID: s.TemplateID, AccessToken: s.AccessToken, Behavior: s.Behavior, CreatedAt: s.CreatedAt,
+		TemplateID: s.TemplateID, AccessToken: s.AccessToken, TrafficAccessToken: s.TrafficAccessToken,
+		Behavior: s.Behavior, CreatedAt: s.CreatedAt,
 	}
 }
 
@@ -1246,15 +1302,16 @@ type nodeSnapshot struct {
 }
 
 type sandboxSnapshot struct {
-	NodeID      string       `json:"node_id,omitempty"`
-	SID         string       `json:"sid"`
-	Group       string       `json:"group"`
-	RouteKey    string       `json:"route_key"`
-	State       string       `json:"state"`
-	TemplateID  string       `json:"template_id,omitempty"`
-	AccessToken string       `json:"access_token,omitempty"`
-	Behavior    stubBehavior `json:"behavior,omitempty"`
-	CreatedAt   string       `json:"created_at,omitempty"`
+	NodeID             string       `json:"node_id,omitempty"`
+	SID                string       `json:"sid"`
+	Group              string       `json:"group"`
+	RouteKey           string       `json:"route_key"`
+	State              string       `json:"state"`
+	TemplateID         string       `json:"template_id,omitempty"`
+	AccessToken        string       `json:"access_token,omitempty"`
+	TrafficAccessToken string       `json:"traffic_access_token,omitempty"`
+	Behavior           stubBehavior `json:"behavior,omitempty"`
+	CreatedAt          string       `json:"created_at,omitempty"`
 }
 
 type buildSnapshot struct {

@@ -126,12 +126,11 @@ func newHarness(t *testing.T) *harness {
 
 	dataHits := make(chan *http.Request, 16)
 	dataToken := make(chan string, 16)
-	nodeHTTP := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	nodeHTTP := newClusterDataTunnelServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		dataHits <- r.Clone(r.Context())
 		dataToken <- r.Header.Get(router.HeaderAccessTok)
 		w.WriteHeader(http.StatusNoContent)
 	}))
-	t.Cleanup(nodeHTTP.Close)
 
 	node := startNodeStub(t, ctx, links.URL, strings.TrimPrefix(nodeHTTP.URL, "http://"))
 	waitForPlacement(t, ctx, httpPlacer, links.URL)
@@ -162,6 +161,42 @@ func newHarness(t *testing.T) *harness {
 		links.Close()
 	})
 	return h
+}
+
+func newClusterDataTunnelServer(t *testing.T, h http.HandlerFunc) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodConnect {
+			h(w, r)
+			return
+		}
+		hj, ok := w.(http.Hijacker)
+		if !ok {
+			http.Error(w, "connect unsupported", http.StatusInternalServerError)
+			return
+		}
+		conn, br, err := hj.Hijack()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		if _, err := io.WriteString(conn, "HTTP/1.1 200 Connection established\r\n\r\n"); err != nil {
+			return
+		}
+		_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+		inner, err := http.ReadRequest(br.Reader)
+		if err != nil {
+			return
+		}
+		_ = conn.SetReadDeadline(time.Time{})
+		rec := httptest.NewRecorder()
+		h(rec, inner)
+		resp := rec.Result()
+		defer resp.Body.Close()
+		_ = resp.Write(conn)
+	}))
+	t.Cleanup(srv.Close)
+	return srv
 }
 
 func writeStubGroup(t *testing.T, dir string) {

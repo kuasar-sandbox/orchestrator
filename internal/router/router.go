@@ -6,7 +6,6 @@
 package router
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"crypto/rand"
@@ -42,21 +41,25 @@ const (
 
 // reserveResult / routeResolve mirror registry route_link JSON.
 type reserveResult struct {
-	NodeID       string `json:"node_id"`
-	SID          string `json:"sid"`
-	AccessToken  string `json:"access_token"`
-	DataEndpoint string `json:"data_endpoint"`
+	NodeID             string `json:"node_id"`
+	SID                string `json:"sid"`
+	AccessToken        string `json:"access_token"`
+	TrafficAccessToken string `json:"traffic_access_token,omitempty"`
+	TargetPort         int    `json:"target_port,omitempty"`
+	DataEndpoint       string `json:"data_endpoint"`
 }
 type routeResolve struct {
-	SID          string `json:"sid"`
-	Group        string `json:"group"`
-	RouteKey     string `json:"route_key"`
-	NodeID       string `json:"node_id"`
-	DataEndpoint string `json:"data_endpoint"`
-	AccessToken  string `json:"access_token"`
-	State        string `json:"state"`
-	cachedAt     time.Time
-	lastUsed     time.Time
+	SID                string `json:"sid"`
+	Group              string `json:"group"`
+	RouteKey           string `json:"route_key"`
+	NodeID             string `json:"node_id"`
+	DataEndpoint       string `json:"data_endpoint"`
+	AccessToken        string `json:"access_token"`
+	TrafficAccessToken string `json:"traffic_access_token,omitempty"`
+	TargetPort         int    `json:"target_port,omitempty"`
+	State              string `json:"state"`
+	cachedAt           time.Time
+	lastUsed           time.Time
 }
 
 type activeRoute struct {
@@ -103,7 +106,7 @@ type Router struct {
 	routeTTL         time.Duration
 	routeIdleTimeout time.Duration
 
-	fwdTransport *http.Transport // pooled transport for node (data/control/build) forwards
+	fwdTransport *http.Transport // pooled transport for node control/build forwards
 
 }
 
@@ -185,7 +188,7 @@ func (rt *Router) SetRouteCache(routeTTL, idleTimeout time.Duration) {
 }
 
 // SetAuthMode sets the caller api_key auth mode (off | log | enforce, §8): off
-// skips it (front with an external mTLS/JWT gateway), log warns but allows.
+// skips it when a front auth layer enforces mTLS/JWT, log warns but allows.
 func (rt *Router) SetAuthMode(mode string) {
 	if mode != "" {
 		rt.authMode = mode
@@ -218,24 +221,38 @@ func (rt *Router) serveControl(w http.ResponseWriter, r *http.Request) {
 	rt.mx.Inc(`router_requests_total{plane="control"}`)
 	path := r.URL.Path
 	switch {
-	case r.Method == http.MethodPost && strings.HasSuffix(path, "/sandboxes"):
+	case r.Method == http.MethodGet && path == "/health":
+		w.WriteHeader(http.StatusNoContent)
+	case r.Method == http.MethodPost && isSandboxCollectionPath(path):
 		// e2b create: reserve by (group, route_key).
 		rt.handleCreate(w, r)
-	case r.Method == http.MethodPost && strings.HasSuffix(path, "/templates"):
+	case r.Method == http.MethodPost && isTemplateCollectionPath(path):
 		// e2b build register: reserve a build node, forward, record build_id -> node.
 		rt.handleBuildRegister(w, r)
 	case strings.Contains(path, "/builds/"):
 		// build trigger / status / files: route by build_id to the recorded node.
 		rt.handleBuildForward(w, r)
-	case r.Method == http.MethodGet && strings.HasSuffix(path, "/sandboxes"):
+	case r.Method == http.MethodGet && isSandboxCollectionPath(path):
 		// list: the group's sandbox shard (no cross-group).
 		rt.handleList(w, r)
-	case strings.Contains(path, "/sandboxes/"):
+	case isSandboxVerbPath(path):
 		// get / kill / pause / timeout / connect / export: forward to the node by sid.
 		rt.handleSandboxVerb(w, r)
 	default:
 		http.Error(w, "cluster router: control verb not supported", http.StatusNotImplemented)
 	}
+}
+
+func isSandboxCollectionPath(path string) bool {
+	return path == "/sandboxes" || path == "/v2/sandboxes"
+}
+
+func isTemplateCollectionPath(path string) bool {
+	return path == "/templates" || path == "/v3/templates"
+}
+
+func isSandboxVerbPath(path string) bool {
+	return strings.HasPrefix(path, "/sandboxes/") || strings.HasPrefix(path, "/v2/sandboxes/")
 }
 
 func (rt *Router) handleCreate(w http.ResponseWriter, r *http.Request) {
@@ -244,7 +261,7 @@ func (rt *Router) handleCreate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, HeaderGroup+" required", http.StatusBadRequest)
 		return
 	}
-	if !rt.authorize(w, r.Context(), group, r.Header.Get(HeaderAPIKey)) {
+	if !rt.authorize(w, r.Context(), group, apiKeyFromRequest(r)) {
 		return
 	}
 	routeKey := r.Header.Get(HeaderRouteKey)
@@ -262,11 +279,13 @@ func (rt *Router) handleCreate(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	_ = json.NewEncoder(w).Encode(map[string]any{
-		"sandboxID":   res.SID,
-		"routeKey":    routeKey,
-		"clientID":    res.NodeID,
-		"accessToken": res.AccessToken,
-		"domain":      rt.domain,
+		"sandboxID":          res.SID,
+		"routeKey":           routeKey,
+		"clientID":           res.NodeID,
+		"accessToken":        res.AccessToken,
+		"envdAccessToken":    res.AccessToken,
+		"trafficAccessToken": res.TrafficAccessToken,
+		"domain":             rt.domain,
 	})
 }
 
@@ -292,7 +311,7 @@ func (rt *Router) handleBuildRegister(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, HeaderGroup+" required", http.StatusBadRequest)
 		return
 	}
-	if !rt.authorize(w, r.Context(), group, r.Header.Get(HeaderAPIKey)) {
+	if !rt.authorize(w, r.Context(), group, apiKeyFromRequest(r)) {
 		return
 	}
 	var body struct {
@@ -347,7 +366,7 @@ func (rt *Router) handleBuildForward(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, HeaderGroup+" required", http.StatusBadRequest)
 		return
 	}
-	if !rt.authorize(w, r.Context(), group, r.Header.Get(HeaderAPIKey)) {
+	if !rt.authorize(w, r.Context(), group, apiKeyFromRequest(r)) {
 		return
 	}
 	bid := extractBuildID(r.URL.Path)
@@ -428,7 +447,7 @@ func (rt *Router) handleSandboxVerb(w http.ResponseWriter, r *http.Request) {
 	// Authenticate the caller against the sandbox's group before forwarding (the
 	// node re-authenticates too, but the ingress must not be an open relay / sid
 	// oracle — cluster-router.md/§8).
-	if !rt.authorize(w, r.Context(), group, r.Header.Get(HeaderAPIKey)) {
+	if !rt.authorize(w, r.Context(), group, apiKeyFromRequest(r)) {
 		return
 	}
 	rr := rt.resolveRoute(r.Context(), group, routeKey, sid)
@@ -447,7 +466,7 @@ func (rt *Router) handleList(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, HeaderGroup+" required", http.StatusBadRequest)
 		return
 	}
-	if !rt.authorize(w, r.Context(), group, r.Header.Get(HeaderAPIKey)) {
+	if !rt.authorize(w, r.Context(), group, apiKeyFromRequest(r)) {
 		return
 	}
 	path := fmt.Sprintf("%s?group=%s", registry.RouteLinkListPath, url.QueryEscape(group))
@@ -549,6 +568,11 @@ func (rt *Router) serveData(w http.ResponseWriter, r *http.Request, host string)
 		http.Error(w, "bad data host (want <port>-<sid>.<domain>)", http.StatusBadRequest)
 		return
 	}
+	explicitPort, hasExplicitPort, err := requestedDataPort(r, port, true)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 	sid := sub[i+1:]
 	group := r.Header.Get(HeaderGroup)
 	if group == "" {
@@ -583,11 +607,21 @@ func (rt *Router) serveData(w http.ResponseWriter, r *http.Request, host string)
 	// then forwards to the resumed node.
 	if (rr.State != "ready" || rr.DataEndpoint == "") && rr.Group != "" {
 		if res, err := rt.reserveByKey(r.Context(), rr.Group, rr.RouteKey); err == nil && res.DataEndpoint != "" {
-			rr = &routeResolve{SID: res.SID, Group: rr.Group, RouteKey: rr.RouteKey, NodeID: res.NodeID, DataEndpoint: res.DataEndpoint, AccessToken: res.AccessToken, State: "ready"}
+			rr = &routeResolve{
+				SID: res.SID, Group: rr.Group, RouteKey: rr.RouteKey, NodeID: res.NodeID,
+				DataEndpoint: res.DataEndpoint, AccessToken: res.AccessToken,
+				TrafficAccessToken: res.TrafficAccessToken, TargetPort: res.TargetPort,
+				State: "ready",
+			}
 		}
 	}
 	if rr.State != "ready" || rr.DataEndpoint == "" {
 		http.Error(w, "sandbox not ready", http.StatusServiceUnavailable)
+		return
+	}
+	effectivePort, err := effectiveDataPort(explicitPort, hasExplicitPort, rr.TargetPort)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	// Data-plane credential enforcement (cluster-router.md): enforce requires
@@ -597,7 +631,7 @@ func (rt *Router) serveData(w http.ResponseWriter, r *http.Request, host string)
 	// the same URL.
 	injectAccessToken := true
 	if rt.dataPlaneAuth == "enforce" || rt.dataPlaneAuth == "log" {
-		auth := envdsign.CheckDataPlaneAuth(r, port, rr.AccessToken, time.Now())
+		auth := envdsign.CheckDataPlaneAuth(r, effectivePort, rr.AccessToken, time.Now())
 		if auth.OK {
 			injectAccessToken = !auth.Signed
 		} else {
@@ -608,54 +642,68 @@ func (rt *Router) serveData(w http.ResponseWriter, r *http.Request, host string)
 			rt.log.Warn("router: data-plane auth mismatch (log mode)", "sid", sid, "err", auth.Err)
 		}
 	}
-	rt.forwardSandboxData(w, r, rr, r.Host, sid, injectAccessToken)
+	rt.forwardSandboxData(w, r, rr, r.Host, sid, effectivePort, injectAccessToken)
 }
 
 // forwardSandboxData two-hop forwards a data-plane request to the sandbox's node:
 // sandboxHost is the <port>-<sid>.<domain> authority the node proxy resolves from
 // (preserved for by-sid; synthesized for by-(group,route-key)). Token-auth traffic
 // gets the access token injected; signed /files traffic is forwarded without it.
-// CONNECT is tunneled (ReverseProxy can't).
-func (rt *Router) forwardSandboxData(w http.ResponseWriter, r *http.Request, rr *routeResolve, sandboxHost, sid string, injectAccessToken bool) {
+// Every request first opens a one-shot CONNECT to node proxy; ordinary HTTP is
+// written inside that tunnel and then the backend connection is closed.
+func (rt *Router) forwardSandboxData(w http.ResponseWriter, r *http.Request, rr *routeResolve, sandboxHost, sid string, port int, injectAccessToken bool) {
 	r.Host = sandboxHost
 	doneActive := rt.beginActiveRoute(rr)
 	defer doneActive()
 	rt.mx.Inc(`router_requests_total{plane="data"}`)
-	if r.Method == http.MethodConnect {
-		rt.tunnelData(w, r, rr)
+	backend, br, resp, err := proxypkg.DialSandboxConnect(r.Context(), "tcp", rr.DataEndpoint, sid, port, rr.AccessToken)
+	if err != nil {
+		rt.evictRoute(rr.Group, rr.RouteKey, sid)
+		rt.mx.Inc(`router_requests_total{plane="data",result="bad_gateway"}`)
+		rt.log.Warn("router: data connect", "sid", sid, "node", rr.NodeID, "err", err)
+		http.Error(w, "bad gateway", http.StatusBadGateway)
 		return
 	}
-	target := &url.URL{Scheme: "http", Host: rr.DataEndpoint}
-	proxy := httputil.NewSingleHostReverseProxy(target)
-	proxy.Transport = rt.fwdTransport
+	if resp.StatusCode != http.StatusOK {
+		backend.Close()
+		if staleProxyError(resp.Header.Get(proxypkg.HeaderProxyError)) {
+			rt.evictRoute(rr.Group, rr.RouteKey, sid)
+		}
+		rt.mx.Inc(`router_requests_total{plane="data",result="connect_refused"}`)
+		http.Error(w, "connect refused by node", resp.StatusCode)
+		return
+	}
+	if r.Method == http.MethodConnect {
+		proxypkg.TunnelBuffered(w, r, backend, br)
+		return
+	}
+	defer backend.Close()
 	tok := rr.AccessToken
-	proxy.Director = func(req *http.Request) {
-		req.URL.Scheme = target.Scheme
-		req.URL.Host = target.Host
+	resp, err = proxypkg.ForwardHTTPOnce(r, backend, br, func(req *http.Request) {
 		req.Host = sandboxHost
 		if injectAccessToken {
 			req.Header.Set(HeaderAccessTok, tok)
 		} else {
 			req.Header.Del(HeaderAccessTok)
 		}
-	}
-	proxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, e error) {
-		// A cached route that fails is likely stale (sandbox moved/gone): evict it so
-		// the next request re-resolves via route_link control (§5 stale → fallback).
-		rt.evictRoute(rr.Group, rr.RouteKey, sid)
+	})
+	if err != nil {
 		rt.mx.Inc(`router_requests_total{plane="data",result="bad_gateway"}`)
-		rt.log.Warn("router: data forward", "sid", sid, "node", rr.NodeID, "err", e)
+		rt.log.Warn("router: data forward", "sid", sid, "node", rr.NodeID, "err", err)
 		http.Error(w, "bad gateway", http.StatusBadGateway)
+		return
 	}
-	proxy.ServeHTTP(w, r)
+	defer resp.Body.Close()
+	proxypkg.WriteHTTPResponse(w, resp)
 }
 
 // serveDataByKey handles by-(group,route-key) data-plane addressing (cluster-router.md):
 // business traffic with no prior create. The caller authenticates by api_key (the
 // per-sandbox token is router-injected, not caller-held); the router Reserves the
-// (group, route_key) sandbox and forwards to it on port E2b-Sandbox-Port.
+// (group, route_key) sandbox and forwards to an explicit request port or the
+// route's target_port.
 func (rt *Router) serveDataByKey(w http.ResponseWriter, r *http.Request, group, routeKey string) {
-	if !rt.authorize(w, r.Context(), group, r.Header.Get(HeaderAPIKey)) {
+	if !rt.authorize(w, r.Context(), group, apiKeyFromRequest(r)) {
 		return
 	}
 	rr := rt.cachedRouteByKey(group, routeKey)
@@ -665,55 +713,102 @@ func (rt *Router) serveDataByKey(w http.ResponseWriter, r *http.Request, group, 
 			http.Error(w, "reserve failed", http.StatusServiceUnavailable)
 			return
 		}
-		rr = &routeResolve{SID: res.SID, Group: group, RouteKey: routeKey, NodeID: res.NodeID, DataEndpoint: res.DataEndpoint, AccessToken: res.AccessToken, State: "ready"}
+		rr = &routeResolve{
+			SID: res.SID, Group: group, RouteKey: routeKey, NodeID: res.NodeID,
+			DataEndpoint: res.DataEndpoint, AccessToken: res.AccessToken,
+			TrafficAccessToken: res.TrafficAccessToken, TargetPort: res.TargetPort,
+			State: "ready",
+		}
 		rt.rememberRoute(rr)
 	}
-	port := r.Header.Get("E2b-Sandbox-Port")
-	if port == "" {
-		port = "49983"
-	}
-	rt.forwardSandboxData(w, r, rr, port+"-"+rr.SID+"."+rt.domain, rr.SID, true)
-}
-
-// tunnelData chains a CONNECT to the node's data endpoint (the node tunnels onward
-// to the sandbox), carrying the <port>-<sid>.<domain> authority + access token,
-// then splices client <-> node (httputil.ReverseProxy can't tunnel CONNECT).
-func (rt *Router) tunnelData(w http.ResponseWriter, r *http.Request, rr *routeResolve) {
-	backend, err := (&net.Dialer{}).DialContext(r.Context(), "tcp", rr.DataEndpoint)
+	explicitPort, hasExplicitPort, err := requestedDataPort(r, 0, false)
 	if err != nil {
-		http.Error(w, "node unreachable", http.StatusBadGateway)
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	hdr := "CONNECT " + r.Host + " HTTP/1.1\r\nHost: " + r.Host + "\r\n" + HeaderAccessTok + ": " + rr.AccessToken + "\r\n\r\n"
-	if _, err := io.WriteString(backend, hdr); err != nil {
-		backend.Close()
-		http.Error(w, "node unreachable", http.StatusBadGateway)
+	port, err := effectiveDataPort(explicitPort, hasExplicitPort, rr.TargetPort)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	br := bufio.NewReader(backend)
-	resp, err := http.ReadResponse(br, &http.Request{Method: http.MethodConnect})
-	if err != nil || resp.StatusCode != http.StatusOK {
-		backend.Close()
-		code := http.StatusBadGateway
-		if err == nil {
-			code = resp.StatusCode
+	rt.forwardSandboxData(w, r, rr, fmt.Sprintf("%d-%s.%s", port, rr.SID, rt.domain), rr.SID, port, true)
+}
+
+func staleProxyError(kind string) bool {
+	return kind == proxypkg.ProxyErrorNotFound || kind == proxypkg.ProxyErrorUnauthorized
+}
+
+func requestedDataPort(r *http.Request, hostPort int, hasHostPort bool) (int, bool, error) {
+	var port int
+	var found bool
+	add := func(p int, source string) error {
+		if p <= 0 {
+			return fmt.Errorf("bad sandbox port from %s", source)
 		}
-		rt.evictRoute(rr.Group, rr.RouteKey, rr.SID)
-		http.Error(w, "connect refused by node", code)
-		return
+		if found && port != p {
+			return fmt.Errorf("conflicting sandbox ports")
+		}
+		port = p
+		found = true
+		return nil
 	}
-	// br may hold tunnel bytes prefetched past the CONNECT response; read through it.
-	proxypkg.Tunnel(w, r, &bufConn{Conn: backend, r: br})
+	if hasHostPort {
+		if err := add(hostPort, "host"); err != nil {
+			return 0, false, err
+		}
+	}
+	if h := r.Header.Get(proxypkg.HeaderSandboxPort); h != "" {
+		p, err := strconv.Atoi(h)
+		if err != nil {
+			return 0, false, fmt.Errorf("bad %s", proxypkg.HeaderSandboxPort)
+		}
+		if err := add(p, proxypkg.HeaderSandboxPort); err != nil {
+			return 0, false, err
+		}
+	}
+	if r.Method == http.MethodConnect {
+		if p, ok, err := connectAuthorityPort(r); err != nil {
+			return 0, false, err
+		} else if ok {
+			if err := add(p, "CONNECT authority"); err != nil {
+				return 0, false, err
+			}
+		}
+	}
+	return port, found, nil
 }
 
-// bufConn reads from a bufio.Reader (which may hold bytes prefetched past the
-// CONNECT response) before the underlying conn.
-type bufConn struct {
-	net.Conn
-	r *bufio.Reader
+func connectAuthorityPort(r *http.Request) (int, bool, error) {
+	target := r.URL.Host
+	if target == "" {
+		target = r.Host
+	}
+	if target == "" {
+		return 0, false, nil
+	}
+	_, ps, err := net.SplitHostPort(target)
+	if err != nil {
+		return 0, false, fmt.Errorf("bad CONNECT authority")
+	}
+	p, err := strconv.Atoi(ps)
+	if err != nil || p <= 0 {
+		return 0, false, fmt.Errorf("bad CONNECT authority")
+	}
+	return p, true, nil
 }
 
-func (c *bufConn) Read(p []byte) (int, error) { return c.r.Read(p) }
+func effectiveDataPort(explicit int, hasExplicit bool, targetPort int) (int, error) {
+	if targetPort > 0 {
+		if hasExplicit && explicit != targetPort {
+			return 0, fmt.Errorf("target port mismatch")
+		}
+		return targetPort, nil
+	}
+	if hasExplicit {
+		return explicit, nil
+	}
+	return 0, fmt.Errorf("target port required")
+}
 
 func (rt *Router) evictRoute(group, routeKey, sid string) {
 	rt.cacheMu.Lock()
@@ -864,7 +959,9 @@ func (rt *Router) reserveByKey(ctx context.Context, group, routeKey string) (*re
 	if f.err == nil && f.res != nil {
 		rt.rememberRoute(&routeResolve{
 			SID: f.res.SID, Group: group, RouteKey: routeKey, NodeID: f.res.NodeID,
-			DataEndpoint: f.res.DataEndpoint, AccessToken: f.res.AccessToken, State: "ready",
+			DataEndpoint: f.res.DataEndpoint, AccessToken: f.res.AccessToken,
+			TrafficAccessToken: f.res.TrafficAccessToken, TargetPort: f.res.TargetPort,
+			State: "ready",
 		})
 	}
 	close(f.done)
@@ -1059,12 +1156,23 @@ func (rt *Router) verifyAuth(ctx context.Context, group, apiKey string) (bool, e
 	}
 }
 
+func apiKeyFromRequest(r *http.Request) string {
+	if key := r.Header.Get(HeaderAPIKey); key != "" {
+		return key
+	}
+	auth := strings.TrimSpace(r.Header.Get("Authorization"))
+	if len(auth) > len("Bearer ") && strings.EqualFold(auth[:len("Bearer ")], "Bearer ") {
+		return strings.TrimSpace(auth[len("Bearer "):])
+	}
+	return ""
+}
+
 // authorize verifies (group, api_key) and writes the right error on failure: 503
 // when the control API is unreachable (don't 403-storm on a transient blip), 403
 // when the key is rejected. Returns false on failure.
 func (rt *Router) authorize(w http.ResponseWriter, ctx context.Context, group, apiKey string) bool {
 	if rt.authMode == "off" {
-		return true // caller auth delegated to a front gateway (§8)
+		return true // caller auth delegated to a front auth layer (§8)
 	}
 	ok, err := rt.verifyAuth(ctx, group, apiKey)
 	if err != nil {

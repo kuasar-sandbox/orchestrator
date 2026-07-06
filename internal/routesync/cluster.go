@@ -39,6 +39,7 @@ type PlaceResult struct {
 	NoNode         bool              `json:"no_node,omitempty"`
 	Error          string            `json:"error,omitempty"`
 	TemplateRef    string            `json:"template_ref,omitempty"`
+	TargetPort     int               `json:"target_port,omitempty"`
 	Config         map[string]string `json:"config,omitempty"`
 	KeyFingerprint string            `json:"key_fp,omitempty"`
 	AccessToken    string            `json:"access_token,omitempty"`

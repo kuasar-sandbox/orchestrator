@@ -150,6 +150,70 @@ func TestHandleListPropagatesRouteLinkStatus(t *testing.T) {
 	}
 }
 
+func TestControlForwardTransportIsEndpointScoped(t *testing.T) {
+	var node1Hits, node2Hits int
+	node1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		node1Hits++
+		if r.URL.Path != "/sandboxes/sb-1" {
+			t.Fatalf("node1 saw path %q", r.URL.Path)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer node1.Close()
+	node2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		node2Hits++
+		if r.URL.Path != "/sandboxes/sb-2" {
+			t.Fatalf("node2 saw path %q", r.URL.Path)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer node2.Close()
+	node1Host := strings.TrimPrefix(node1.URL, "http://")
+	node2Host := strings.TrimPrefix(node2.URL, "http://")
+	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/route-link/route":
+			switch r.URL.Query().Get("sid") {
+			case "sb-1":
+				_ = json.NewEncoder(w).Encode(routeResolve{SID: "sb-1", Group: "/g", RouteKey: "rk1", DataEndpoint: node1Host, State: "ready"})
+			case "sb-2":
+				_ = json.NewEncoder(w).Encode(routeResolve{SID: "sb-2", Group: "/g", RouteKey: "rk2", DataEndpoint: node2Host, State: "ready"})
+			default:
+				w.WriteHeader(http.StatusNotFound)
+			}
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer control.Close()
+	rt := New(strings.TrimPrefix(control.URL, "http://"), "test.local", 0, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	rt.SetAuthMode("off")
+	srv := httptest.NewServer(rt.Handler())
+	defer srv.Close()
+
+	client := &http.Client{}
+	for _, tc := range []struct {
+		sid      string
+		routeKey string
+	}{{"sb-1", "rk1"}, {"sb-2", "rk2"}} {
+		req, _ := http.NewRequest(http.MethodDelete, srv.URL+"/sandboxes/"+tc.sid, nil)
+		req.Host = "api.test.local"
+		req.Header.Set(HeaderGroup, "/g")
+		req.Header.Set(HeaderRouteKey, tc.routeKey)
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusNoContent {
+			t.Fatalf("%s status=%d, want 204", tc.sid, resp.StatusCode)
+		}
+	}
+	if node1Hits != 1 || node2Hits != 1 {
+		t.Fatalf("node hits node1=%d node2=%d, want one hit each", node1Hits, node2Hits)
+	}
+}
+
 type routeRegistryFunc func(context.Context, string) ([]clusterclient.Endpoint, error)
 
 func (f routeRegistryFunc) RouteCandidates(ctx context.Context, group string) ([]clusterclient.Endpoint, error) {

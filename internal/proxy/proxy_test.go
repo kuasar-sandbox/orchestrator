@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/envdsign"
@@ -22,6 +23,19 @@ type stubRouter struct{ r proxy.Route }
 
 func (s stubRouter) Route(ctx context.Context, sid string, port int) (proxy.Route, error) {
 	return s.r, nil
+}
+
+type countingListener struct {
+	net.Listener
+	accepts atomic.Int32
+}
+
+func (l *countingListener) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if err == nil {
+		l.accepts.Add(1)
+	}
+	return c, err
 }
 
 func TestRouteForTarget(t *testing.T) {
@@ -50,8 +64,14 @@ func TestParseSandbox(t *testing.T) {
 	}
 	req = httptest.NewRequest("GET", "http://x/y", nil)
 	req.Header.Set("E2b-Sandbox-Id", "zzz")
+	req.Header.Set("E2b-Sandbox-Port", "49983")
 	if sid, port, ok := proxy.ParseSandbox(req); !ok || sid != "zzz" || port != 49983 {
 		t.Fatalf("header parse: %q %d %v", sid, port, ok)
+	}
+	req = httptest.NewRequest("GET", "http://x/y", nil)
+	req.Header.Set("E2b-Sandbox-Id", "zzz")
+	if _, _, ok := proxy.ParseSandbox(req); ok {
+		t.Fatal("expected parse failure when E2b-Sandbox-Port is missing")
 	}
 	req = httptest.NewRequest("GET", "http://noport/y", nil)
 	req.Host = "noport"
@@ -84,6 +104,7 @@ func TestProxyForwardAndAuth(t *testing.T) {
 		req, _ := http.NewRequest("GET", ts.URL+path+query, nil)
 		if host == "" {
 			req.Header.Set("E2b-Sandbox-Id", "s1")
+			req.Header.Set("E2b-Sandbox-Port", "49983")
 		} else {
 			req.Host = host
 		}
@@ -132,6 +153,47 @@ func TestProxyForwardAndAuth(t *testing.T) {
 	}
 }
 
+func TestProxyDoesNotReuseBackendConnections(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	upSock := filepath.Join(t.TempDir(), "up.sock")
+	rawLn, err := net.Listen("unix", upSock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	upLn := &countingListener{Listener: rawLn}
+	defer upLn.Close()
+	up := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, "ok")
+	})}
+	go up.Serve(upLn)
+	defer up.Close()
+
+	px := proxy.New(stubRouter{proxy.Route{Kind: proxy.KindUDS, UDS: upSock, AccessToken: "tok"}},
+		func() string { return "enforce" }, log, nil)
+	ts := httptest.NewServer(px)
+	defer ts.Close()
+
+	client := &http.Client{}
+	for i := 0; i < 2; i++ {
+		req, _ := http.NewRequest("GET", ts.URL+"/echo", nil)
+		req.Header.Set("E2b-Sandbox-Id", "s1")
+		req.Header.Set("E2b-Sandbox-Port", "49983")
+		req.Header.Set("X-Access-Token", "tok")
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("request %d status=%d, want 200", i, resp.StatusCode)
+		}
+	}
+	if got := upLn.accepts.Load(); got != 2 {
+		t.Fatalf("backend accepts=%d, want 2 (one fresh upstream connection per request)", got)
+	}
+}
+
 // TestConnectTunnel drives an HTTP/1.1 CONNECT: the target host is ignored (only the
 // port is honored), the access token is enforced, and bytes splice both ways to the
 // resolved backend.
@@ -167,7 +229,7 @@ func TestConnectTunnel(t *testing.T) {
 		}
 		var hdr strings.Builder
 		// Target host "ignored" proves the host is dropped; only :<bport> matters.
-		fmt.Fprintf(&hdr, "CONNECT ignored:%s HTTP/1.1\r\nHost: ignored:%s\r\nE2b-Sandbox-Id: s1\r\n", bport, bport)
+		fmt.Fprintf(&hdr, "CONNECT ignored:%s HTTP/1.1\r\nHost: ignored:%s\r\nE2b-Sandbox-Id: s1\r\nE2b-Sandbox-Port: %s\r\n", bport, bport, bport)
 		if token != "" {
 			fmt.Fprintf(&hdr, "X-Access-Token: %s\r\n", token)
 		}
@@ -216,6 +278,7 @@ func TestProxyNotFoundAndDeny(t *testing.T) {
 		ts := httptest.NewServer(tc.px)
 		req, _ := http.NewRequest("GET", ts.URL+"/x", nil)
 		req.Header.Set("E2b-Sandbox-Id", "s1")
+		req.Header.Set("E2b-Sandbox-Port", "49983")
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
 			t.Fatal(err)

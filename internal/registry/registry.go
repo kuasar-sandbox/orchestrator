@@ -58,6 +58,7 @@ type PlaceRequest struct {
 type Placement struct {
 	NodeID         string
 	TemplateRef    string
+	TargetPort     int
 	Config         map[string]string
 	KeyFingerprint string
 	AccessToken    string
@@ -143,10 +144,12 @@ type reserveCall struct {
 // ReserveResult is what a satisfied ReserveSandbox returns (cluster.md). The
 // router injects AccessToken and forwards to the node's DataEndpoint.
 type ReserveResult struct {
-	NodeID       string `json:"node_id"`
-	SID          string `json:"sid"`
-	AccessToken  string `json:"access_token"`
-	DataEndpoint string `json:"data_endpoint"`
+	NodeID             string `json:"node_id"`
+	SID                string `json:"sid"`
+	AccessToken        string `json:"access_token"`
+	TrafficAccessToken string `json:"traffic_access_token,omitempty"`
+	TargetPort         int    `json:"target_port,omitempty"`
+	DataEndpoint       string `json:"data_endpoint"`
 }
 
 // New builds a Registry. Production callers set a placer_link placer explicitly.
@@ -503,6 +506,7 @@ func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, o
 		reserved := &SandboxRecord{
 			Group: group, RouteKey: routeKey, SID: sid, State: StateReserved, NodeID: nodeID,
 			TemplateID: placement.TemplateRef, AccessToken: placement.AccessToken,
+			TargetPort: placement.TargetPort,
 		}
 		if _, ok, cerr := r.stores.CASSandbox(ctx, reserved, expect); cerr != nil {
 			return cerr
@@ -610,7 +614,8 @@ func (r *Registry) applyRoute(ctx context.Context, nodeID string, e *routesync.R
 	rec := &SandboxRecord{
 		Group: e.Group, RouteKey: e.RouteKey, SID: e.SandboxID, NodeID: nodeID,
 		SnapLoc: e.SnapshotLocation, TemplateID: e.TemplateID, AccessToken: e.AccessToken,
-		LastActive: time.Now().Unix(),
+		TrafficAccessToken: e.TrafficAccessToken,
+		LastActive:         time.Now().Unix(),
 	}
 	switch e.State {
 	case routesync.StateRunning:
@@ -665,6 +670,12 @@ func (r *Registry) tryApplyLiveRoute(ctx context.Context, nodeID string, e *rout
 	if rec.AccessToken == "" {
 		rec.AccessToken = cur.AccessToken
 	}
+	if rec.TrafficAccessToken == "" {
+		rec.TrafficAccessToken = cur.TrafficAccessToken
+	}
+	if rec.TargetPort == 0 {
+		rec.TargetPort = cur.TargetPort
+	}
 	if _, err := r.stores.PutSandbox(ctx, rec); err != nil {
 		if transientRouteRead(err) {
 			return false
@@ -675,7 +686,11 @@ func (r *Registry) tryApplyLiveRoute(ctx context.Context, nodeID string, e *rout
 	_ = r.stores.AddNodeSandboxRef(ctx, nodeID, clusterstate.NodeSandboxRef{Group: e.Group, RouteKey: e.RouteKey, SandboxID: e.SandboxID})
 	r.indexSID(e.SandboxID, e.Group, e.RouteKey)
 	if rec.State == StateReady {
-		r.finish(flightKey(e.Group, e.RouteKey), &ReserveResult{NodeID: nodeID, SID: e.SandboxID, AccessToken: rec.AccessToken, DataEndpoint: r.nodeDataEndpoint(ctx, nodeID)}, nil)
+		r.finish(flightKey(e.Group, e.RouteKey), &ReserveResult{
+			NodeID: nodeID, SID: e.SandboxID, AccessToken: rec.AccessToken,
+			TrafficAccessToken: rec.TrafficAccessToken, TargetPort: rec.TargetPort,
+			DataEndpoint: r.nodeDataEndpoint(ctx, nodeID),
+		}, nil)
 	}
 	return true
 }
@@ -867,6 +882,7 @@ func (r *Registry) readyResultFromRecord(ctx context.Context, rec *SandboxRecord
 	}
 	return &ReserveResult{
 		NodeID: rec.NodeID, SID: rec.SID, AccessToken: rec.AccessToken,
+		TrafficAccessToken: rec.TrafficAccessToken, TargetPort: rec.TargetPort,
 		DataEndpoint: node.DataEndpoint,
 	}, true
 }

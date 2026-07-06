@@ -30,16 +30,17 @@ type routeLogEntry struct {
 // carried on every entry — subscribers that don't serve MMDS simply ignore it.
 func (o *Orchestrator) routeEntry(sb *types.Sandbox) routesync.RouteEntry {
 	e := routesync.RouteEntry{
-		SandboxID:        sb.ID,
-		Profile:          string(sb.Profile()),
-		TemplateID:       sb.TemplateID,
-		State:            string(sb.State),
-		EnvdUDS:          sb.EnvdUDS,
-		CiUDS:            sb.CiUDS,
-		FloatingIP:       sb.FloatingIP,
-		AccessToken:      sb.EnvdAccessToken,
-		SnapshotLocation: snapshotLocation(sb.SnapshotRef),
-		MmdsSecret:       hex.EncodeToString(keys.MmdsSecret(sb.ManifestKey, sb.ID)),
+		SandboxID:          sb.ID,
+		Profile:            string(sb.Profile()),
+		TemplateID:         sb.TemplateID,
+		State:              string(sb.State),
+		EnvdUDS:            sb.EnvdUDS,
+		CiUDS:              sb.CiUDS,
+		FloatingIP:         sb.FloatingIP,
+		AccessToken:        sb.EnvdAccessToken,
+		TrafficAccessToken: sb.TrafficAccessToken,
+		SnapshotLocation:   snapshotLocation(sb.SnapshotRef),
+		MmdsSecret:         hex.EncodeToString(keys.MmdsSecret(sb.ManifestKey, sb.ID)),
 	}
 	// Cluster routing identity (node-link): the (group, route_key) the registry
 	// keys SandboxStore by, carried in the cluster metadata namespace (node.md §4.6).

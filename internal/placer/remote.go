@@ -460,6 +460,7 @@ func (s *Service) answer(ctx context.Context, req *routesync.PlaceReq) *routesyn
 			}
 		} else {
 			res.TemplateRef = g.group.TemplateRef
+			res.TargetPort = g.group.TargetPort
 			res.Config = mergeConfig(g.group.Config, req.Config)
 		}
 	}

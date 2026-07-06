@@ -662,6 +662,8 @@ node_link 重建第二条事实传播路径。
 | `state` | `reserved` / `ready` / `paused` / `dead` |
 | `node_id` | 当前承载节点 |
 | `access_token` | 当前实例数据面 token |
+| `traffic_access_token` | SDK 兼容返回字段,不作为数据面强制鉴权头 |
+| `target_port` | group/provider 返回的强制数据面端口;为 0 时请求必须显式携带端口 |
 | `updated_at` | timeout/reconcile 使用 |
 
 状态机:
@@ -685,7 +687,7 @@ route_link owner
   │ none/paused? CAS reserved
   ▼
 placer PlaceSandbox
-  │ choose node + access_token
+  │ choose node + access_token + target_port
   ▼
 node owner
   │ admit + create/connect

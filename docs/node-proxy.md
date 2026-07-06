@@ -32,8 +32,8 @@ node proxy
 - **零 gRPC**:路由分发是帧化 JSON over h2c(§6),无 protobuf/gRPC 依赖。
 - **确定性密钥多实例一致**:MMDS 会话密钥由 `manifest_key + sid` 派生(§8),N 个对等
   worker 与节点内故障转移天然一致,无主从 / 共享内存。
-- **即时刷流透传**:`ReverseProxy{FlushInterval:-1}`,流式接口(`process.Start` /
-  `WatchDir` / `/files` / Connect 流)零缓冲。
+- **即时刷流透传**:普通 HTTP 每请求新建到 envd-UDS / floatingip 的连接,边读边刷;
+  CONNECT 走原始隧道。数据面不复用上游连接。
 
 ### 1.2 边界与依赖
 
@@ -63,7 +63,7 @@ worker 读 `proxy.yaml` 取共享策略与端点,命令行只给每实例身份�
 |---|---|---|
 | `--config` | `/etc/node-ctl/proxy.yaml` | worker 配置文件 |
 | `--id` | (必填) | 本 worker 的 plugin id,每 worker 唯一(同 id 二次注册顶掉前者) |
-| `--socket` | `<dir(config_socket)>/<id>.sock` | 本 worker 服务兜底网关转发的 UDS(注册时上报给 serve) |
+| `--socket` | `<dir(config_socket)>/<id>.sock` | 本 worker 服务 proxyForwarder 转发的 UDS(注册时上报给 serve) |
 | `--metrics-listen` | 空 | Prometheus 文本端点(`/metrics`),每实例独立(同机多 worker 端口须异) |
 | `--mmds` | 关 | 在本实例起 FC MMDS 元数据服务(地址取 `mmds_listen`);serve 配 `mmds.enabled` 时挑一个 worker 开(§8) |
 
@@ -107,8 +107,9 @@ profile=bare 且 port ∈ {49983, 49999}  → 501 (no data plane)
 未知 sid / 挂起超时仍未 running         → 404
 ```
 
-普通 HTTP 经 `httputil.ReverseProxy{FlushInterval:-1}` 即时刷流反代(上游走 HTTP/1.1,
-envd 双栈,Connect 流在 h1 上承载,透传不缓冲);`CONNECT` 请求另走原始 TCP 隧道(§9)。
+普通 HTTP 每请求解析 route、鉴权、拨一次 envd-UDS 或 floatingip:port,写入一条 HTTP 请求并
+即时刷流返回;响应结束即关闭上游连接。`CONNECT` 请求走原始 TCP 隧道(§9)。数据面不使用
+反代连接池或 pooled transport,避免不同 sandbox/port 复用同一条上游 TCP 连接。
 envd 的两个控制端口(49983/49999)仅经 proxy 的 host-UDS 可达(sandbox-ctl `--connect`
 映射,非 floatingip),沙箱间无通路。
 
@@ -155,16 +156,16 @@ external 模式拓扑(数据面字节流不经 serve;**worker 主动注册,serve
   首个 Bookmark 到达前的请求同样先等同步完成。
 - **运营策略集中下推**:握手 Hello 携带 `Policy{domain, auth_mode, park_timeout_ms}`;
   worker 的 `auth` / `park_timeout`(proxy.yaml)仅为策略到达前的回退。
-- **兜底网关**:数据面请求误达 serve 监听口时,serve 按 sid 的 FNV 哈希在**活跃注册的
-  worker 集**上挑一个,经其 `--socket` UDS 反代过去(连接亲和),由 worker 照常处理(含
-  鉴权);`CONNECT` 经链式 CONNECT relay 转发(§9)。无 worker 注册时回 502。
+- **proxyForwarder**:数据面请求误达 serve 监听口时,serve 按 sid 的 FNV 哈希在**活跃注册的
+  worker 集**上挑一个,经其 `--socket` UDS 建立一次性 chained CONNECT,由 worker 照常处理(含
+  鉴权)。普通 HTTP 也写入该 CONNECT 隧道,不使用反代连接池。无 worker 注册时回 502。
 - **多 worker**:plugin 注册 + SO_REUSEPORT + 确定性 MMDS 密钥(§8)使 N 个对等 worker
   进程各自独立注册、各持本地路由表、共享数据口即可工作,无需主从 / 共享内存。
 - worker 由运维带外管理(`deploy/node-proxy@.service`),serve 不自动安装;须与
   serve 同节点(本地拨 envd-UDS / floatingip)。
 - **可观测**:`proxy.metrics_listen`(serve)/ `--metrics-listen`(worker)暴露
   Prometheus 文本:`data_requests_total{result=ok|unauthorized|notfound|denied|…}`、
-  `gateway_forward_total{result=ok|error|no_worker}` 等。
+  `proxy_forwarder_total{result=ok|error|no_worker}` 等。
 
 ## 6. routesync 协议
 
@@ -273,7 +274,7 @@ envd 硬编码访问 `169.254.169.254:80`;部署侧用 vswitch
 
 ## 9. CONNECT 隧道
 
-数据面除反代普通 HTTP 外,还支持 `CONNECT` 开原始 TCP 隧道(端口转发、非 HTTP 协议)。
+数据面除普通 HTTP 转发外,还支持 `CONNECT` 开原始 TCP 隧道(端口转发、非 HTTP 协议)。
 按数据面模型,**CONNECT 目标主机被忽略**(统一是沙箱 floatingip),仅取其端口;沙箱 id
 仍来自 `E2b-Sandbox-Id` 头(或 authority 的 `<port>-<sid>` 标签)。路由解析与
 `X-Access-Token` 校验同普通请求(§4/§7),随后把客户端连接对接到后端(envd-control UDS
@@ -284,15 +285,15 @@ HTTP/2 经 `WriteHeader(200)` + 请求 / 响应流对拷。它覆盖每条数据
 的数据面与控制面转发的数据面都支持 CONNECT:
 
 - **proxy 直收**(及 internal 模式):直接隧道到沙箱;
-- **控制面兜底网关**(external):`httputil.ReverseProxy` 不能隧道 CONNECT,故网关向选中
-  的 worker 经其 UDS 发**链式 CONNECT**(带上 sandbox id + access token),收到 200 后
-  对接——client → 网关 → worker → 沙箱(无环,沿用 h2mux 式链式隧道)。集群下 cluster-ctl
-  router 的端口转发同样经链式 CONNECT 转发进本节点(cluster-router.md)。
+- **proxyForwarder**(external):serve 监听口收到数据面请求时,向选中的 worker 经其 UDS 发
+  **链式 CONNECT**(带上 sandbox id、port 与 access token)。普通 HTTP 在该隧道内发送一条
+  请求;CONNECT 则收到 200 后直接对接——client → proxyForwarder → worker → 沙箱。集群下
+  cluster-ctl router 也以同样的 chained CONNECT 转发进本节点(cluster-router.md)。
 
 ## 10. 可靠性
 
 - **worker 崩溃**:持挂连接断 → serve 反注册该 worker;SO_REUSEPORT 下其余
-  worker 继续收数据口;serve 兜底网关只在活跃注册集上选 worker(§5),无 worker 回 502。
+  worker 继续收数据口;serve proxyForwarder 只在活跃注册集上选 worker(§5),无 worker 回 502。
   worker 重启自动重连重注册重同步。
 - **routesync 重同步**:连接断 → 指数退避重连(0.2s 起、5s 封顶)→ 重新 register +
   逐条 upsert + bookmark;重同步全程旧路由表仍在服务,无路由空窗(§6)。

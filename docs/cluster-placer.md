@@ -131,6 +131,22 @@ import_groups:
 该 source 枚举目录下的 `*.json` 文件。每个文件是一个 `SandboxGroupRecord` JSON。文件数量预期较小,
 `Get/GetPlacementHint/GetKey/GetAuthKey` 可直接扫描目录解析。生产环境应通过接口接入实际 group 源。
 
+示例:
+
+```json
+{
+  "group": "/cell/project/app/group",
+  "template_ref": "tmpl-1",
+  "target_port": 49983,
+  "auth_key": {"type": "inline", "value": "<hex>"},
+  "manifest_key": {"type": "inline", "value": "<hex>"},
+  "node_selectors": [{"pool": "default"}]
+}
+```
+
+`target_port` 是数据面强制端口,随 Place 结果返回给 route_link/router。它不参与节点筛选;
+节点筛选仍只由 `node_selectors` 与 shuffle-sharding 配置决定。
+
 多个 source 的语义需要区分:
 
 - Provider 点查可以按 source 顺序查找 group,若同一个 group 被多个 source 定义则报错。

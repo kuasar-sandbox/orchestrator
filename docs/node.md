@@ -317,7 +317,7 @@ node-ctl 同目录 → PATH"自动发现。
 | `proxy.data_listen` | 空 | internal 模式专用数据面监听;空 = 与 `api.listen` 共口。external 模式数据口在 worker 的 `proxy.yaml`(serve 不绑) |
 | `proxy.park_timeout` | `30s` | 数据面请求挂起预算:等路由同步 / paused 沙箱 resume 的上限(node-proxy.md §5) |
 | `proxy.auth` | `enforce` | 数据面鉴权:`off`/`log`/`enforce`,校验 `X-Access-Token`(node-proxy.md §7) |
-| `proxy.metrics_listen` | 空(关) | Prometheus 文本端点(`data_requests_total{result=…}`、`gateway_forward_total` 等) |
+| `proxy.metrics_listen` | 空(关) | Prometheus 文本端点(`data_requests_total{result=…}`、`proxy_forwarder_total` 等) |
 | `encryption_key` | (必填) | manifest_key 落盘加密的 AES-256 密钥:`:` 分隔多个 64-hex,首个为活动密钥,其余备用解旧记录(轮换);`NODE_CONFIG_ENCRYPTION_KEY` env 优先 |
 | `manifest_config` | `/opt/sandbox/manifest.yaml` | 共享远程 manifest store 配置(`manifest.key` 留空,租户 key 经 env 按任务下发) |
 | `paths.run_root` | `/run/sandbox` | tmpfs 运行态:`<sid>/` 运行目录、UDS、pidfile |
@@ -361,7 +361,7 @@ node-ctl 同目录 → PATH"自动发现。
 
 配置自洽校验:`mmds.enabled=false` 时 `proxy.auth` 必须为 `enforce`(envd 非 secure,
 proxy 是唯一数据面闸门);`mmds.enabled=true` 时 `proxy.mode` 不得为 `off`(MMDS 寄宿
-proxy 组件)。external 模式无须静态 worker 列表——worker 自行经 plugin 平面注册,网关
+proxy 组件)。external 模式无须静态 worker 列表——worker 自行经 plugin 平面注册,proxyForwarder
 按活跃注册集转发(§9.1、§9.3)。配 `cluster.node_link.endpoint` 时 `cluster.node_id` 必填;配
 `resource_listen` 时 `sandbox.resources.control_socket` 通常指向它(否则控制器空跑)。
 
@@ -623,7 +623,7 @@ worker,或路由观察者如平台 agent)注册其能力并**持挂该 h2c 连�
 租约 + 路由流(routesync,线格式见 node-proxy.md §6)。请求体首帧是 `register{caps}`,之后(route_wake)是
 `wake` 上行;响应体下行 `hello(policy) → upsert* → bookmark → upsert/delete`。能力相互
 **独立、不强制组合**:`subscribe`(`route` | `route_wake`)、`proxy{socket{path}}`
-(声明 serve 兜底网关转发数据面请求的目标 UDS)、`mmds`。**断连即反注册**;同
+(声明 serve proxyForwarder 转发数据面请求的目标 UDS)、`mmds`。**断连即反注册**;同
 id 二次注册自动反注册(并断链)前者。鉴权:配 `paths.plugin_pidfile` 则 peer pid 须在
 其中,未配则仅靠 socket 0600(同 admin)。external proxy worker、平台 agent 均经此订阅。
 此平面是**节点本地** UDS,与接入集群的 node-link(§10,跨网 mTLS)正交。
@@ -753,7 +753,7 @@ e2b API/CLI 零改动。
 数据面**转发层**——L7 反代:按 `(sid, port)` 路由到 guest envd / floatingip,逐请求
 鉴权,CONNECT 隧道,MMDS,以及 routesync 线格式——自成一文,见 [node-proxy.md](node-proxy.md)。
 本节只讲 serve 控制面对数据面的三项职责:按 `proxy.mode` 装配承载、作本节点路由
-权威向订阅者广播、以及兜底网关。
+权威向订阅者广播、以及 proxyForwarder。
 
 ### 9.1 按 proxy.mode 装配
 
@@ -791,12 +791,13 @@ plugin 平面的注册与鉴权见 §6。机群级路由权威是 registry(clust
   `proxy.auth=enforce`);`true` = proxy 组件内起 FC MMDS v2、经 `/init` re-key 每身份新
   token,使快照扇出沙箱数据面可用。姿态对比与 MMDS 两段式协议见 node-proxy.md §8。
 
-### 9.3 兜底网关
+### 9.3 proxyForwarder
 
 数据面请求误达 serve 控制面监听口时(external 模式下客户端未分流到数据口),serve 按
-sid 的 FNV 哈希在**活跃注册的 worker 集**上挑一个,经其 `--socket` UDS 反代过去(连接
-亲和),由 worker 照常处理(含鉴权);`CONNECT` 经链式 CONNECT relay 转发,无 worker
-注册时回 502。链式隧道与转发细节见 node-proxy.md §9。
+sid 的 FNV 哈希在**活跃注册的 worker 集**上挑一个,经其 `--socket` UDS 建立一次性
+chained CONNECT,由 worker 照常处理(含鉴权)。普通 HTTP 在该隧道内发送一条请求,
+CONNECT 则直接 splice 客户端与 worker;无 worker 注册时回 502。链式隧道与转发细节见
+node-proxy.md §9。
 
 ## 10. 集群接入(node-link)
 
@@ -1140,7 +1141,7 @@ serve 重启后以 `ListUnitsByPatterns("sandbox-runner@*.service")` 为存活�
 
 单元测试:`make test`(handler 路由、apikey/secretbox/regcreds、routesync(注册/bookmark
 往返)/routetable(世代清扫)、plugin 注册表(同 id 顶替/分片)、proxy CONNECT 隧道 +
-网关链式 relay、mmds(确定性密钥)、单飞、沙箱配置注入(命名空间解析/容量折叠/网络合并)、
+proxyForwarder 链式 relay、mmds(确定性密钥)、单飞、沙箱配置注入(命名空间解析/容量折叠/网络合并)、
 migrate、node-link(注册/事件/命令往返)等)。跨仓 e2e 集中在 umbrella
 `orchestrator/release-builder/test/e2e/`(需多仓产物:vmlinux/cloud-hypervisor/mkfs.erofs/
 sandbox-runtime.erofs 等),均已注册为 umbrella make 目标,缺前置则自跳过
@@ -1152,7 +1153,7 @@ sandbox-runtime.erofs 等),均已注册为 umbrella make 目标,缺前置则自�
 | `e2e_runtask.sh` | run-sandbox/run-builder 启动器(纯用户态,无 root/systemd/KVM):pidfile 锁/双起拒绝、HTTP 取 LaunchSpec、execve、`TASK_*` 剥除;`config` CLI 往返 | `test-e2e-runtask` |
 | `e2e_run_builder.sh` | 三阶段构建流水线(KVM + vswitch + store-ctl + zot,guest 经 mgmt VIP 拉取):fromImage → e2b-img;fromTemplate(img)+steps+startCmd → e2b-snp(manifest:// base、配置合并、snapshot.cfg metadata 断言);fromTemplate(snp)+steps → e2b-snp(start/ready 继承);再从产物模板 create/list/kill;COPY 与 files 端点 501 | `test-e2e-run-builder` |
 | `e2e_execute.sh` | 从已建模板冷启真实 microVM、guest 内 exec、pause(snapshot)→ resume 全链路;create 经 `X-Kuasar-Sandbox-Network` 注入 hostname 并在 guest 校验(§4.6) | `test-e2e-execute` |
-| `e2e_node_proxy.sh` | `proxy.mode=external` 全链路:serve + 独立 worker(plugin 平面注册 + SO_REUSEPORT)+ 真实 microVM/envd,数据面经 proxy 走(401/转发/wake/resume/CONNECT 隧道/兜底网关 relay/metrics) | `test-e2e-node-proxy` |
+| `e2e_node_proxy.sh` | `proxy.mode=external` 全链路:serve + 独立 worker(plugin 平面注册 + SO_REUSEPORT)+ 真实 microVM/envd,数据面经 proxy 走(401/转发/wake/resume/CONNECT 隧道/proxyForwarder relay/metrics) | `test-e2e-node-proxy` |
 | `orchestrator/test/e2e/e2e_cluster_stub.sh` | 用 `make build` 产物真实启动 `cluster-ctl registry/router/placer` + `node-stub-ctl`,覆盖 group 导入、key 分发、Reserve→READY→数据面转发、活动路由缓存、build_register、孤儿 route 清理、节点清空和 registry joint/old_grace cutover | `orchestrator: make test-e2e` |
 
 本仓 `make test-e2e` 运行集群 stub e2e,不依赖 KVM/root/systemd。真实 microVM 端到端路径由

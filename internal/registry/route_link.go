@@ -23,13 +23,15 @@ const (
 // RouteResolve is the data-plane forwarding target the router needs for a sid
 // (the hot path: client -> router -> node DataEndpoint -> guest).
 type RouteResolve struct {
-	SID          string `json:"sid"`
-	Group        string `json:"group"`
-	RouteKey     string `json:"route_key"`
-	NodeID       string `json:"node_id"`
-	DataEndpoint string `json:"data_endpoint"`
-	AccessToken  string `json:"access_token"`
-	State        string `json:"state"`
+	SID                string `json:"sid"`
+	Group              string `json:"group"`
+	RouteKey           string `json:"route_key"`
+	NodeID             string `json:"node_id"`
+	DataEndpoint       string `json:"data_endpoint"`
+	AccessToken        string `json:"access_token"`
+	TrafficAccessToken string `json:"traffic_access_token,omitempty"`
+	TargetPort         int    `json:"target_port,omitempty"`
+	State              string `json:"state"`
 }
 
 // ServeRouteLink mounts the router/admin-facing route_link API.
@@ -168,6 +170,7 @@ func (r *Registry) ResolveSID(ctx context.Context, group, routeKey, sid string) 
 	return &RouteResolve{
 		SID: rec.SID, Group: rec.Group, RouteKey: rec.RouteKey, NodeID: rec.NodeID,
 		DataEndpoint: r.nodeDataEndpoint(ctx, rec.NodeID), AccessToken: rec.AccessToken,
+		TrafficAccessToken: rec.TrafficAccessToken, TargetPort: rec.TargetPort,
 		State: string(rec.State),
 	}, true, nil
 }

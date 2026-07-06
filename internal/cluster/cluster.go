@@ -102,6 +102,7 @@ type SandboxGroup struct {
 	ImageRepo    string            `json:"image_repo,omitempty"`
 	RegistryAuth Secret            `json:"registry_auth,omitempty"`
 	TemplateRef  string            `json:"template_ref,omitempty"`
+	TargetPort   int               `json:"target_port,omitempty"`
 	Metadata     map[string]string `json:"metadata,omitempty"`
 }
 
@@ -117,6 +118,7 @@ type SandboxGroupRecord struct {
 	Config        map[string]string   `json:"sandbox_config,omitempty"`
 	ImageRepo     string              `json:"image_repo,omitempty"`
 	TemplateRef   string              `json:"template_ref,omitempty"`
+	TargetPort    int                 `json:"target_port,omitempty"`
 	Metadata      map[string]string   `json:"metadata,omitempty"`
 	NodeSelectors []map[string]string `json:"node_selectors,omitempty"`
 	ShuffleLabels map[string]string   `json:"shuffle_labels,omitempty"`

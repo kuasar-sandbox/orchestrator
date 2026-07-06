@@ -57,20 +57,22 @@ type NodeRecord struct {
 // SandboxRecord is the registry-facing route_link view, keyed by
 // (group, route_key).
 type SandboxRecord struct {
-	Group          string                    `json:"group"`
-	RouteKey       string                    `json:"route_key"`
-	SID            string                    `json:"sid,omitempty"`
-	State          SandboxState              `json:"state"`
-	NodeID         string                    `json:"node_id,omitempty"`
-	SnapLoc        string                    `json:"snap_loc,omitempty"`
-	TemplateID     string                    `json:"template_id,omitempty"`
-	AccessToken    string                    `json:"access_token,omitempty"`
-	LastActive     int64                     `json:"last_active,omitempty"`
-	BuildID        string                    `json:"build_id,omitempty"`
-	BuildState     BuildState                `json:"build_state,omitempty"`
-	BuildResources *routesync.BuildResources `json:"build_resources,omitempty"`
-	BuildReason    string                    `json:"build_reason,omitempty"`
-	CreatedU       int64                     `json:"created_unix,omitempty"`
+	Group              string                    `json:"group"`
+	RouteKey           string                    `json:"route_key"`
+	SID                string                    `json:"sid,omitempty"`
+	State              SandboxState              `json:"state"`
+	NodeID             string                    `json:"node_id,omitempty"`
+	SnapLoc            string                    `json:"snap_loc,omitempty"`
+	TemplateID         string                    `json:"template_id,omitempty"`
+	AccessToken        string                    `json:"access_token,omitempty"`
+	TrafficAccessToken string                    `json:"traffic_access_token,omitempty"`
+	TargetPort         int                       `json:"target_port,omitempty"`
+	LastActive         int64                     `json:"last_active,omitempty"`
+	BuildID            string                    `json:"build_id,omitempty"`
+	BuildState         BuildState                `json:"build_state,omitempty"`
+	BuildResources     *routesync.BuildResources `json:"build_resources,omitempty"`
+	BuildReason        string                    `json:"build_reason,omitempty"`
+	CreatedU           int64                     `json:"created_unix,omitempty"`
 }
 
 type WatchEventType int

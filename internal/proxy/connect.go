@@ -1,12 +1,15 @@
 package proxy
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"strconv"
+	"strings"
 )
 
 // This file adds CONNECT tunneling to the data plane: a client opens a raw TCP
@@ -15,7 +18,7 @@ import (
 // the sandbox id comes from E2b-Sandbox-Id (or the authority label). The route is
 // resolved + access-token-checked exactly like a forwarded request, then the client
 // connection is spliced to the backend. The same Tunnel primitive serves both the
-// proxy's direct ingress and the external-mode gateway's CONNECT relay.
+// proxy's direct ingress and the external-mode proxyForwarder's CONNECT relay.
 
 // dialRoute opens a connection to a resolved route's backend — the single dial used
 // by both the reverse-proxy Transport and CONNECT tunneling.
@@ -38,39 +41,39 @@ func (p *Proxy) serveConnect(w http.ResponseWriter, r *http.Request) {
 	sid, port, ok := parseConnect(r)
 	if !ok {
 		p.mx.Inc(`data_requests_total{result="badrequest"}`)
-		http.Error(w, "bad connect target", http.StatusBadRequest)
+		writeProxyError(w, http.StatusBadRequest, "bad connect target", ProxyErrorBadRequest)
 		return
 	}
 	route, err := p.router.Route(r.Context(), sid, port)
 	if err != nil {
 		p.mx.Inc(`data_requests_total{result="route_error"}`)
-		http.Error(w, "routing error", http.StatusBadGateway)
+		writeProxyError(w, http.StatusBadGateway, "routing error", ProxyErrorRouteError)
 		return
 	}
 	switch route.Kind {
 	case KindNotFound:
 		p.mx.Inc(`data_requests_total{result="notfound"}`)
-		http.Error(w, "sandbox not found", http.StatusNotFound)
+		writeProxyError(w, http.StatusNotFound, "sandbox not found", ProxyErrorNotFound)
 		return
 	case KindDeny:
 		p.mx.Inc(`data_requests_total{result="denied"}`)
-		http.Error(w, "data plane not available on this sandbox", http.StatusNotImplemented)
+		writeProxyError(w, http.StatusNotImplemented, "data plane not available on this sandbox", ProxyErrorDenied)
 		return
 	case KindUDS, KindTCP:
 	default:
 		p.mx.Inc(`data_requests_total{result="route_error"}`)
-		http.Error(w, "routing error", http.StatusBadGateway)
+		writeProxyError(w, http.StatusBadGateway, "routing error", ProxyErrorRouteError)
 		return
 	}
 	if !p.authorized(r, route, port) {
 		p.mx.Inc(`data_requests_total{result="unauthorized"}`)
-		http.Error(w, "invalid access token", http.StatusUnauthorized)
+		writeProxyError(w, http.StatusUnauthorized, "invalid access token", ProxyErrorUnauthorized)
 		return
 	}
 	backend, err := dialRoute(r.Context(), route)
 	if err != nil {
 		p.mx.Inc(`data_requests_total{result="upstream_error"}`)
-		http.Error(w, "upstream error", http.StatusBadGateway)
+		writeProxyError(w, http.StatusBadGateway, "upstream error", ProxyErrorUpstreamError)
 		return
 	}
 	p.mx.Inc(`data_requests_total{result="ok"}`)
@@ -81,13 +84,20 @@ func (p *Proxy) serveConnect(w http.ResponseWriter, r *http.Request) {
 // authority's <port>-<sid> label as a fallback), port from the CONNECT target
 // authority — the target host itself is ignored (uniformly the sandbox's floating IP).
 func parseConnect(r *http.Request) (sid string, port int, ok bool) {
-	sid = r.Header.Get("E2b-Sandbox-Id")
+	sid = r.Header.Get(HeaderSandboxID)
 	if sid == "" {
 		if s, _, parsed := ParseSandbox(r); parsed {
 			sid = s
 		}
 	}
 	if sid == "" {
+		return "", 0, false
+	}
+	if hp := r.Header.Get(HeaderSandboxPort); hp != "" {
+		p, err := strconv.Atoi(hp)
+		if err == nil && p > 0 {
+			return sid, p, true
+		}
 		return "", 0, false
 	}
 	target := r.URL.Host
@@ -105,10 +115,97 @@ func parseConnect(r *http.Request) (sid string, port int, ok bool) {
 	return sid, port, true
 }
 
+// WriteSandboxConnect issues the node/proxy-worker data-plane CONNECT handshake.
+// The CONNECT authority is deliberately generic: sandbox identity and port are
+// carried as explicit headers, so intermediates do not parse route-key or host
+// labels and the backend connection is bound to exactly one sandbox port.
+func WriteSandboxConnect(w io.Writer, sid string, port int, token string) error {
+	if sid == "" || port <= 0 {
+		return fmt.Errorf("proxy: sandbox id and port are required for CONNECT")
+	}
+	target := fmt.Sprintf("sandbox:%d", port)
+	var b strings.Builder
+	fmt.Fprintf(&b, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n", target, target)
+	fmt.Fprintf(&b, "%s: %s\r\n%s: %d\r\n", HeaderSandboxID, sid, HeaderSandboxPort, port)
+	if token != "" {
+		fmt.Fprintf(&b, "%s: %s\r\n", HeaderAccessToken, token)
+	}
+	b.WriteString("\r\n")
+	_, err := io.WriteString(w, b.String())
+	return err
+}
+
+// DialSandboxConnect dials addr and performs WriteSandboxConnect. The caller owns
+// conn and must close it unless it passes the connection to Tunnel/TunnelBuffered.
+func DialSandboxConnect(ctx context.Context, network, addr, sid string, port int, token string) (net.Conn, *bufio.Reader, *http.Response, error) {
+	conn, err := (&net.Dialer{}).DialContext(ctx, network, addr)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if err := WriteSandboxConnect(conn, sid, port, token); err != nil {
+		conn.Close()
+		return nil, nil, nil, err
+	}
+	br := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(br, &http.Request{Method: http.MethodConnect})
+	if err != nil {
+		conn.Close()
+		return nil, nil, nil, err
+	}
+	return conn, br, resp, nil
+}
+
+// ForwardHTTPOnce sends r through one already-connected backend connection and
+// reads exactly one response. It does not retain or pool the connection.
+func ForwardHTTPOnce(r *http.Request, backend net.Conn, br *bufio.Reader, mutate func(*http.Request)) (*http.Response, error) {
+	if br == nil {
+		br = bufio.NewReader(backend)
+	}
+	out := r.Clone(r.Context())
+	out.RequestURI = ""
+	if out.URL == nil {
+		out.URL = &url.URL{}
+	} else {
+		u := *out.URL
+		out.URL = &u
+	}
+	out.URL.Scheme = "http"
+	if out.Host != "" {
+		out.URL.Host = out.Host
+	} else if out.URL.Host == "" {
+		out.URL.Host = "sandbox"
+	}
+	out.Close = true
+	removeHopHeaders(out.Header)
+	if mutate != nil {
+		mutate(out)
+	}
+	if err := out.Write(backend); err != nil {
+		return nil, err
+	}
+	return http.ReadResponse(br, out)
+}
+
+func removeHopHeaders(h http.Header) {
+	for _, k := range []string{
+		"Connection",
+		"Proxy-Connection",
+		"Keep-Alive",
+		"Proxy-Authenticate",
+		"Proxy-Authorization",
+		"Te",
+		"Trailer",
+		"Transfer-Encoding",
+		"Upgrade",
+	} {
+		h.Del(k)
+	}
+}
+
 // Tunnel splices the client connection (the CONNECT request) to backend,
 // bidirectionally, for both HTTP/1.1 (Hijack + "200 Connection established") and
 // HTTP/2 (200 response + request/response stream copy). It closes backend on return.
-// Exported so the external-mode gateway can reuse it when relaying a CONNECT to a
+// Exported so the external-mode proxyForwarder can reuse it when relaying a CONNECT to a
 // proxy worker.
 func Tunnel(w http.ResponseWriter, r *http.Request, backend net.Conn) {
 	defer backend.Close()
@@ -143,6 +240,17 @@ func Tunnel(w http.ResponseWriter, r *http.Request, backend net.Conn) {
 	go func() { _, _ = io.Copy(client, backend); done <- struct{}{} }()
 	<-done
 }
+
+func TunnelBuffered(w http.ResponseWriter, r *http.Request, backend net.Conn, br *bufio.Reader) {
+	Tunnel(w, r, &bufferedConn{Conn: backend, r: br})
+}
+
+type bufferedConn struct {
+	net.Conn
+	r *bufio.Reader
+}
+
+func (c *bufferedConn) Read(p []byte) (int, error) { return c.r.Read(p) }
 
 // flushWriter flushes after each write so the HTTP/2 backend->client tunnel half
 // streams promptly instead of buffering.

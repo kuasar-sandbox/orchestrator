@@ -82,6 +82,10 @@ type RouteEntry struct {
 	CiUDS       string `json:"ci_uds,omitempty"`       // e2b code-interpreter port 49999
 	FloatingIP  string `json:"floatingip,omitempty"`   // host-reachable addr for user ports
 	AccessToken string `json:"access_token,omitempty"` // envdAccessToken; X-Access-Token must match
+	// TrafficAccessToken is the SDK compatibility token returned by create. It is
+	// reported by the node route authority and preserved by route_link, but is not
+	// used as the data-plane X-Access-Token.
+	TrafficAccessToken string `json:"traffic_access_token,omitempty"`
 	// SnapshotLocation is "" for running/dead, else "local" (node-bound checkpoint
 	// bundle — blocks a node drain unless migrated) or "remote" (uploaded, portable).
 	// A subscriber (e.g. the platform agent) reads it to decide migration; the actual
@@ -139,7 +143,7 @@ type Hello struct {
 // are all the subscriber's own call).
 type Register struct {
 	Subscribe *Subscribe `json:"subscribe,omitempty"` // route stream; nil = lease only (no routes)
-	Proxy     *Proxy     `json:"proxy,omitempty"`     // accepts gateway-forwarded data-plane requests
+	Proxy     *Proxy     `json:"proxy,omitempty"`     // accepts proxyForwarder data-plane requests
 	Mmds      bool       `json:"mmds,omitempty"`      // serves MMDS (the per-sandbox secret ships on every entry)
 	// ResumeFrom (opt-in) asks the authority to replay the route changelog strictly
 	// after this token instead of a full re-sync. The token is intentionally a
@@ -153,7 +157,7 @@ type Subscribe struct {
 	Kind string `json:"kind"` // KindRoute | KindRouteWake
 }
 
-// Proxy declares the UDS the orchestrator's control-plane gateway forwards
+// Proxy declares the UDS the orchestrator's proxyForwarder forwards
 // data-plane requests to (this subscriber serves them from its synced table).
 type Proxy struct {
 	Socket Socket `json:"socket"`

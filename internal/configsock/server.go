@@ -205,7 +205,7 @@ type Deps struct {
 	API           http.Handler     // api plane (e2b control plane + export/import); the fallback
 	AdminPidfile  string           // optional PID allowlist gating the admin plane ("" => socket perms only)
 	RouteSource   routesync.Source // plugin plane: route authority a subscriber streams from (nil => plane off)
-	Plugins       *Registry        // plugin plane: live registration registry (shared with the gateway)
+	Plugins       *Registry        // plugin plane: live registration registry (shared with proxyForwarder)
 	PluginPidfile string           // optional PID allowlist gating the plugin plane ("" => socket perms only)
 }
 

@@ -99,7 +99,7 @@ router 不参与 registry 成员健康检测,不订阅 route,也不订阅 node_l
 | connect/resume | group + route_key / sandbox_id | 定位 route owner 后调用 `ReserveSandbox` 恢复 |
 | pause/kill/timeout | group + route_key/sandbox_id | 定位 route owner 后转发到 node |
 | list/get | group | 读取 group 分片 |
-| data plane | group + route_key + sandbox_id + port | cache 命中直转;miss Reserve |
+| data plane | group + route_key + sandbox_id + port | cache 命中后建立一次性 CONNECT;miss Reserve |
 | build register | group + build_id | 生成稳定 id 后调用 `ReserveBuild` |
 | build status/files | group + build_id | 定位 build node 后转发 |
 
@@ -137,24 +137,27 @@ key:
 value:
 
 ```text
-{node_id, data_endpoint, sandbox_id, access_token, route_rev, expires, last_used}
+{node_id, data_endpoint, sandbox_id, access_token, traffic_access_token, target_port, route_rev, expires, last_used}
 ```
 
-端口和协议不参与 route owner 解析;它们保留在 `<port>-<sandbox_id>.<domain>` Host、CONNECT authority
-或请求头中,由 node proxy 执行最后一跳。
+端口不从 route_key 解析。数据面端口来自请求显式端口(`E2b-Sandbox-Port`、`<port>-<sandbox_id>` Host
+或 CONNECT authority)或 route_link 返回的 `target_port`。`target_port>0` 表示强制端口:请求未显式带端口时
+使用它;请求显式端口与它不一致时拒绝 400。两者都缺失时拒绝 400,router 不默认 49983。
 
-### 6.3 active connection cache
+### 6.3 active route cache
 
-HTTP keep-alive 请求复用到 node 的 pooled transport。CONNECT/WebSocket 不能复用同一个 tunnel,但会维持
-route active 标记和 route resolution cache。
+active cache 只表示某个 `(group, route_key, sandbox_id)` 正有请求在途,用于避免 route cache 被普通
+TTL/idle 清理时让同一路由的新请求重新 Reserve。它不保存、复用或共享任何数据面 TCP 连接。
 
 ```text
-client A ── HTTP/2 stream ─┐
-client B ── HTTP/2 stream ─┼─ same route active ─► node proxy transport
+client A ── data request ──┐
+client B ── data request ──┼─ same active route ─► each request opens its own CONNECT to node proxy
 client C ── CONNECT ───────┘
 ```
 
-同一路由已有活动连接时,新请求不重新 Reserve。连接失败、idle timeout 或明确语义化错误后再淘汰。
+同一路由已有活动请求时,新请求可复用本地 route decision,但转发到 node proxy 时总是重新建立一次性
+CONNECT。普通 HTTP 请求也先对 node proxy 发 CONNECT,再在隧道内发送一条 HTTP 请求;外部 CONNECT
+请求则把该隧道直接交给客户端。这样不会出现不同沙箱或不同端口复用同一条 router→node TCP 连接。
 
 ### 6.4 singleflight
 
@@ -164,13 +167,12 @@ client C ── CONNECT ───────┘
 
 以下情况淘汰缓存:
 
-- node proxy 返回 401/403:token 或鉴权材料陈旧。
-- node 返回 404:sandbox 不存在。
-- node 连接失败、502、connection reset。
+- node proxy 在 CONNECT 握手阶段返回带 `X-Kuasar-Proxy-Error: not_found|unauthorized` 的 404/401。
+- node data_endpoint 连接失败。
 - route TTL 或 idle timeout 到期。
 
-淘汰后下一次请求重新 Reserve。迁移/恢复时允许首个请求付出一次 fail-fast 代价,不为此维护 router route
-订阅。
+握手成功后的 HTTP 401/403/404 是沙箱内应用或 envd 的响应,不淘汰 route。淘汰后下一次请求重新
+Reserve。迁移/恢复时允许首个请求付出一次 fail-fast 代价,不为此维护 router route 订阅。
 
 ## 7. 控制面
 
@@ -196,15 +198,18 @@ router 在 sid-host 数据面路径先校验凭证:
 普通 token 请求转发时注入:
 
 ```text
+CONNECT sandbox:<port> HTTP/1.1
 E2b-Sandbox-Id: <sandbox_id>
+E2b-Sandbox-Port: <port>
 X-Access-Token: <route_link.access_token>
 ```
 
-signature 请求转发时不注入 `X-Access-Token`,让 node proxy 和 envd 继续按同一 URL 验签。node proxy 执行
-最后一跳 `(sandbox_id, port) -> guest envd/floatingip` 并再次校验 token 或 signature。
+router 对 node proxy 的 CONNECT 握手总携带 `X-Access-Token`,由 node proxy 完成最后一跳鉴权。握手成功后,
+普通 token 请求在隧道内写入 HTTP 请求并继续带 `X-Access-Token`;signature 请求的隧道内 HTTP 请求不注入
+`X-Access-Token`,让 envd 继续按同一 URL 验签。
 
-CONNECT/WebSocket 长连接使用同一 route resolution,但 tunnel 自身不复用。连接断开后保留 route cache 至
-idle/TTL 或 fail-fast 失效。
+CONNECT 长连接使用同一 route resolution,但 tunnel 自身不复用。连接断开后保留 route cache 至 idle/TTL
+或 fail-fast 失效。
 
 ## 9. 可靠性
 
@@ -215,15 +220,15 @@ idle/TTL 或 fail-fast 失效。
 | registry owner 故障 | owner set 内按顺序 failover |
 | Reserve timeout | 返回 503/504;本地 singleflight 释放 |
 | stale cache | fail-fast 淘汰并重试 |
-| node data endpoint 失败 | 淘汰 active/route cache,重新 Reserve |
+| node data endpoint 失败 | 淘汰 route cache,重新 Reserve |
 
 ## 10. 性能
 
-- active cache 命中:一次本地查表 + pooled transport 转发。
-- route cache 命中:本地 route resolution + node 转发。
+- active cache 命中:一次本地查表 + 一条新的 router→node CONNECT。
+- route cache 命中:本地 route resolution + 一条新的 router→node CONNECT。
 - miss:一次 registry Reserve/Resolve + node 快照恢复/启动。
 - router 不因 group 总量增长而维护全量 route 流。
-- route cache key 必须包含 group、route_key、sandbox_id,连接池 key 必须包含目标 node/route,不能用常量 host。
+- 控制面转发可使用 HTTP transport 连接池,连接池按 `data_endpoint` 隔离;数据面转发不使用 pooled transport。
 
 ## 11. See Also
 

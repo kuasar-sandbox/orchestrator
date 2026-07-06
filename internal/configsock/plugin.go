@@ -24,9 +24,9 @@ type Plugin struct {
 }
 
 // Registry tracks live plugin registrations. The plugin-plane handler Adds on
-// register and Removes on disconnect; the external-mode gateway reads ProxyTargets
+// register and Removes on disconnect; the external-mode proxyForwarder reads ProxyTargets
 // to forward data-plane requests to a registered proxy worker. Concurrency-safe and
-// shared between the config-socket server and the gateway.
+// shared between the config-socket server and the proxyForwarder.
 type Registry struct {
 	mu sync.Mutex
 	m  map[string]*Plugin

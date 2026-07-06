@@ -13,10 +13,9 @@ package proxy
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
-	"net"
 	"net/http"
-	"net/http/httputil"
 	"strconv"
 	"strings"
 
@@ -41,6 +40,20 @@ type Route struct {
 	Addr        string // KindTCP, host:port
 	AccessToken string // expected envd access token ("" = no data-plane auth, e.g. bare)
 }
+
+const (
+	HeaderSandboxID   = "E2b-Sandbox-Id"
+	HeaderSandboxPort = "E2b-Sandbox-Port"
+	HeaderAccessToken = "X-Access-Token"
+	HeaderProxyError  = "X-Kuasar-Proxy-Error"
+
+	ProxyErrorBadRequest    = "bad_request"
+	ProxyErrorRouteError    = "route_error"
+	ProxyErrorNotFound      = "not_found"
+	ProxyErrorDenied        = "denied"
+	ProxyErrorUnauthorized  = "unauthorized"
+	ProxyErrorUpstreamError = "upstream_error"
+)
 
 // Router resolves a (sandboxID, port) to a Route. It may block to auto-resume a
 // paused sandbox (internal) or park awaiting a route push (external), returning
@@ -67,31 +80,11 @@ func RouteForTarget(profile, envdUDS, ciUDS, floatingIP, accessToken string, por
 	return Route{Kind: KindTCP, Addr: fmt.Sprintf("%s:%d", floatingIP, port), AccessToken: accessToken}
 }
 
-// poolKey is the ReverseProxy Transport's idle-connection pool key for a route —
-// distinct per backend (floatingip:port for TCP, the UDS path for control) so a
-// kept-alive connection is NEVER reused across sandboxes/ports/UDS targets. The
-// real dial is DialContext's (from the route in context); this is only the pool
-// key (and the addr it ignores). A constant key here is the cross-route-reuse
-// bug: a port-forward could reuse an envd-control connection and hit envd.
-func poolKey(r Route) string {
-	switch r.Kind {
-	case KindTCP:
-		return r.Addr
-	case KindUDS:
-		return "uds." + strings.ReplaceAll(strings.Trim(r.UDS, "/"), "/", "-")
-	default:
-		return "sandbox"
-	}
-}
-
-type routeKey struct{}
-
 type Proxy struct {
 	router   Router
 	authMode func() string // config.Auth* (off|log|enforce), read per-request so a
 	log      *slog.Logger  // pushed routesync policy can change it centrally
 	mx       *metrics.M
-	rp       *httputil.ReverseProxy
 }
 
 // New builds a proxy over router. authMode is read per request and returns one of
@@ -100,38 +93,7 @@ func New(router Router, authMode func() string, log *slog.Logger, mx *metrics.M)
 	if authMode == nil {
 		authMode = func() string { return config.AuthEnforce }
 	}
-	p := &Proxy{router: router, authMode: authMode, log: log, mx: mx}
-	tr := &http.Transport{
-		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			r, _ := ctx.Value(routeKey{}).(Route)
-			return dialRoute(ctx, r)
-		},
-		ForceAttemptHTTP2:     false, // envd's h2c server also serves h1; h1 carries Connect streams
-		MaxIdleConnsPerHost:   64,
-		ResponseHeaderTimeout: 0,
-	}
-	p.rp = &httputil.ReverseProxy{
-		Director: func(req *http.Request) {
-			req.URL.Scheme = "http"
-			// Key the idle-connection pool by the RESOLVED route. The Transport
-			// pools keep-alive connections by req.URL.Host; a single constant
-			// here let one sandbox's request reuse a kept-alive connection that
-			// DialContext had opened for a DIFFERENT route (e.g. a port-forward
-			// reusing an envd-control UDS connection from a prior exec → the
-			// request hits envd and 404s). DialContext still does the real dial
-			// from the route in context; the upstream Host header stays req.Host
-			// (the client's). Per-route keys confine reuse to the same backend.
-			r, _ := req.Context().Value(routeKey{}).(Route)
-			req.URL.Host = poolKey(r)
-		},
-		Transport:     tr,
-		FlushInterval: -1, // stream immediately (process.Start / WatchDir / files)
-		ErrorHandler: func(w http.ResponseWriter, _ *http.Request, err error) {
-			p.mx.Inc(`data_requests_total{result="upstream_error"}`)
-			http.Error(w, "upstream error", http.StatusBadGateway)
-		},
-	}
-	return p
+	return &Proxy{router: router, authMode: authMode, log: log, mx: mx}
 }
 
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -142,46 +104,59 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	sid, port, ok := ParseSandbox(r)
 	if !ok {
 		p.mx.Inc(`data_requests_total{result="badrequest"}`)
-		http.Error(w, "bad sandbox host", http.StatusBadRequest)
+		writeProxyError(w, http.StatusBadRequest, "bad sandbox host", ProxyErrorBadRequest)
 		return
 	}
 	route, err := p.router.Route(r.Context(), sid, port)
 	if err != nil {
 		p.mx.Inc(`data_requests_total{result="route_error"}`)
-		http.Error(w, "routing error", http.StatusBadGateway)
+		writeProxyError(w, http.StatusBadGateway, "routing error", ProxyErrorRouteError)
 		return
 	}
 	switch route.Kind {
 	case KindNotFound:
 		p.mx.Inc(`data_requests_total{result="notfound"}`)
-		http.Error(w, "sandbox not found", http.StatusNotFound)
+		writeProxyError(w, http.StatusNotFound, "sandbox not found", ProxyErrorNotFound)
 	case KindDeny:
 		p.mx.Inc(`data_requests_total{result="denied"}`)
-		http.Error(w, "data plane not available on this sandbox", http.StatusNotImplemented)
+		writeProxyError(w, http.StatusNotImplemented, "data plane not available on this sandbox", ProxyErrorDenied)
 	case KindUDS, KindTCP:
 		if !p.authorized(r, route, port) {
 			p.mx.Inc(`data_requests_total{result="unauthorized"}`)
-			http.Error(w, "invalid access token", http.StatusUnauthorized)
+			writeProxyError(w, http.StatusUnauthorized, "invalid access token", ProxyErrorUnauthorized)
 			return
 		}
+		backend, err := dialRoute(r.Context(), route)
+		if err != nil {
+			p.mx.Inc(`data_requests_total{result="upstream_error"}`)
+			writeProxyError(w, http.StatusBadGateway, "upstream error", ProxyErrorUpstreamError)
+			return
+		}
+		defer backend.Close()
+		resp, err := ForwardHTTPOnce(r, backend, nil, nil)
+		if err != nil {
+			p.mx.Inc(`data_requests_total{result="upstream_error"}`)
+			writeProxyError(w, http.StatusBadGateway, "upstream error", ProxyErrorUpstreamError)
+			return
+		}
+		defer resp.Body.Close()
 		p.mx.Inc(`data_requests_total{result="ok"}`)
-		ctx := context.WithValue(r.Context(), routeKey{}, route)
-		p.rp.ServeHTTP(w, r.WithContext(ctx))
+		WriteHTTPResponse(w, resp)
 	default:
 		p.mx.Inc(`data_requests_total{result="route_error"}`)
-		http.Error(w, "routing error", http.StatusBadGateway)
+		writeProxyError(w, http.StatusBadGateway, "routing error", ProxyErrorRouteError)
 	}
 }
 
 // ParseSandbox extracts (sid, port) from the Host header <port>-<sid>.<domain>,
 // falling back to the E2b-Sandbox-Id / E2b-Sandbox-Port headers the SDK always
-// sets. Exported so the external-mode gateway can shard by sandbox id.
+// sets. Exported so the external-mode proxyForwarder can shard by sandbox id.
 func ParseSandbox(r *http.Request) (sid string, port int, ok bool) {
-	if h := r.Header.Get("E2b-Sandbox-Id"); h != "" {
+	if h := r.Header.Get(HeaderSandboxID); h != "" {
 		sid = h
-		port, _ = strconv.Atoi(r.Header.Get("E2b-Sandbox-Port"))
-		if port == 0 {
-			port = 49983
+		port, _ = strconv.Atoi(r.Header.Get(HeaderSandboxPort))
+		if port <= 0 {
+			return "", 0, false
 		}
 		return sid, port, true
 	}
@@ -208,4 +183,30 @@ func ParseSandbox(r *http.Request) (sid string, port int, ok bool) {
 		return "", 0, false
 	}
 	return sid, port, true
+}
+
+func writeProxyError(w http.ResponseWriter, status int, msg, kind string) {
+	if kind != "" {
+		w.Header().Set(HeaderProxyError, kind)
+	}
+	http.Error(w, msg, status)
+}
+
+// WriteHTTPResponse copies an upstream response to the client and flushes as data
+// arrives, preserving streaming semantics without keeping a reusable upstream
+// connection alive.
+func WriteHTTPResponse(w http.ResponseWriter, resp *http.Response) {
+	copyHeader(w.Header(), resp.Header)
+	w.WriteHeader(resp.StatusCode)
+	if resp.Body != nil {
+		_, _ = io.Copy(flushWriter{w}, resp.Body)
+	}
+}
+
+func copyHeader(dst, src http.Header) {
+	for k, vals := range src {
+		for _, v := range vals {
+			dst.Add(k, v)
+		}
+	}
 }
