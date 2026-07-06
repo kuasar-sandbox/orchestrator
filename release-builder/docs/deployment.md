@@ -24,7 +24,7 @@ vsock / UDS)协作。本文档定义这些进程在生产部署中的归属、�
 | 资源 | 用途 |
 |---|---|
 | OBS 桶 | L3 chunk 与 Manifest 持久化(`store-ctl` 后端) |
-| 平台管理面 | 沙箱实例调度、配置、租户管控、模板构建凭据(registry 拉取令牌 / 客户密钥)↔ **cluster 控制面**(向 placer/provider 导入 sandbox-group 配置)与 compute 节点 `node-ctl` 对话 |
+| 平台管理面 | 沙箱实例调度、配置、租户管控、模板构建凭据(registry 拉取令牌 / 客户密钥);通过 **cluster 控制面**向 placer/provider 导入 sandbox-group 配置,或在单机部署中直接调用 `node-ctl` e2b API |
 | 容器镜像仓库 | 租户镜像来源;构建沙箱内 `flatten-ctl` 按需拉取(OCI v1.1,支持 Referrers) |
 
 ## 2. Compute Node
@@ -34,7 +34,6 @@ vsock / UDS)协作。本文档定义这些进程在生产部署中的归属、�
 | 进程 | 角色 | 数量 | 启停 | 归属 |
 |---|---|---|---|---|
 | `node-ctl`(`serve`)| 本机沙箱编排 + e2b 兼容控制面 + 数据面 proxy(反代 guest envd/floatingip)+ 节点级资源仲裁(`resource_listen`)+ node-link 集群接入客户端;经模板单元 `sandbox-runner@<sid>`/`sandbox-builder@<bid>` 驱动 sandbox-ctl | 单实例 | systemd | 平台内,`orchestrator/docs/node.md`(资源协议见 node-resource.md)|
-| `platform-agent`| 打通平台管理面(区域级 platform-service) ↔ 本机 node-ctl 的桥接(多节点) | 单实例 | systemd | **平台外** |
 | `cache-ctl`(`mode: tiered`)| 节点本地数据入口:L1 RocksDB + EC 客户端(→ L2)+ L3 origin | 单实例 | systemd,先于 node-ctl | 平台内,`docs/cache.md` |
 | `store-ctl` | 本机 OBS 读写代理(sidecar);**所有**远端 OBS 流量走这里 | 单实例 | systemd | 平台内,`docs/store.md` |
 | `sandbox-ctl`(`run`) | 单个沙箱的控制平面(类 `runc run`);非 daemon | 每沙箱一个,~3K | 由 node-ctl 经 `sandbox-runner@<sid>` 单元(`run-sandbox`)启动 | 平台内,`docs/sandbox.md` |
@@ -68,7 +67,7 @@ vsock / UDS)协作。本文档定义这些进程在生产部署中的归属、�
 运维侧:`/run/sandbox/<sid>/ctl.sock` 除了承载 snapshot,也是 `sandbox-ctl exec
 --sandbox-id <sid> -- CMD` 的入口——在不打断应用的前提下进入一个运行中的
 沙箱排障(命令跑在应用的命名空间内,如 `docker exec`)。完整规格见
-[`docs/sandbox.md`](sandbox.md) §2.4。
+`sandboxer/docs/sandbox.md` §2.4(发布包平铺名:`docs/sandbox.md`)。
 
 ### 2.3 持久化与运行时目录
 
@@ -135,8 +134,8 @@ per-沙箱 `MANIFEST_KEY` env;经 `run-sandbox`(单元)以 flag 传入 sandbox-c
 - **per-sandbox 密钥**:每沙箱用各自租户的客户密钥;node-ctl 经**共享**
   `MANIFEST_CONFIG`(`manifest.key` 留空)+ per-沙箱 `MANIFEST_KEY` env 注入(e2b 路径下
   `MANIFEST_KEY` 为该租户 manifest 根密钥——node-ctl 从加密存储解出;**api_key 由它
-  派生**,见 `orchestrator/docs/node.md` §7),或由 platform-agent 从平台管理面取密钥落地
-  `/run/sandbox/<sid>/manifest.yaml`,生命周期跟沙箱走
+  派生**,见 `orchestrator/docs/node.md` §7)。外部管理面若选择直接对接单机
+  `node-ctl`,也必须按同一 per-sandbox 生命周期落地 manifest 配置
 - **共享格式**:`manifest-ctl` 与 `sandbox-ctl` 用**同一**配置格式;两者都
   **只**连本机 store-ctl(`127.0.0.1:7100`)+ 本机 cache-ctl(`127.0.0.1:7070`),
   yaml 里的 endpoint 写 loopback
@@ -199,13 +198,18 @@ yaml 显式 access_key/secret_key  →  ~/.obsconfig  →  AWS SDK 默认凭证�
 每节点的 `store-ctl` sidecar 通过同一套凭据访问同一个桶——节点本身**无状态**,
 重启不丢数据。
 
-### 4.2 平台管理面
+### 4.2 外部管理面接口
 
 region 级、独立运营,平台外。与平台的接口:
 
-- 平台管理面 ↔ 各 compute 节点 `platform-agent`(→ node-ctl):沙箱实例配置 / 客户密钥 /
-  生命周期事件 / 模板构建凭据(registry 拉取令牌、客户加密凭据)——构建在 compute 节点的
-  构建沙箱内进行(§5),无独立展平管理面/数据面池
+- 多节点部署:平台管理面向 `cluster-ctl placer` 的 provider/importer 侧导入
+  sandbox-group 配置、selector、客户密钥引用和模板构建凭据。
+- 单节点部署:平台管理面可直接调用 `node-ctl` e2b API,并按 §2.2 的配置契约
+  提供 per-sandbox manifest 配置。
+- 节点侧桥接进程若由外部系统提供,不属于本发布件,也不改变本页列出的进程、
+  配置和启动依赖。
+
+构建在 compute 节点的构建沙箱内进行(§5),无独立展平管理面/数据面池。
 
 ## 5. 镜像构建(构建沙箱内三阶段)
 
@@ -399,8 +403,8 @@ cluster-ctl placer
 
 4. `store-ctl`(sidecar)→ active generation 已 init,gRPC 健康
 5. `cache-ctl tiered` → 与 L2 peer 拨号、与本机 `store-ctl` origin 拨号成功
-6. `node-ctl conductor serve`(`resource_listen`)→ state 恢复或冷启;e2b SDK 直连(或 cluster
-   registry / platform-agent attach)后开始接受新沙箱
+6. `node-ctl conductor serve`(`resource_listen`)→ state 恢复或冷启;e2b SDK
+   直连或 cluster registry 接入后开始接受新沙箱
 
 注:`cache-ctl tiered` 启动**不需要**等 L2 全员在线——tier chain 把瞬时
 故障层视作 miss 下穿(详见 `docs/cache.md` §错误模型)。**写**路径
@@ -470,26 +474,27 @@ Cluster Control Plane:  registry 自聚簇(N 副本,按 group/node 逻辑分片)
 
 | 进程 | 配置位置 | 部署惯例 | Schema 文档 |
 |---|---|---|---|
-| `store-ctl` | `--config <path>` | `listen: 127.0.0.1:7100`(节点本机)| [`docs/store.md`](store.md) §3 |
-| `cache-ctl tiered` | `--config <path>` | `listen: 127.0.0.1:7070`(节点本机);`tiers[].cluster.peers` 写本 AZ L2 全集群 | [`docs/cache.md`](cache.md) §3.4 |
-| `cache-ctl shard` | `--config <path>` | `listen: 0.0.0.0:7070`(对外服务)| [`docs/cache.md`](cache.md) §3.3 |
-| `node-ctl conductor serve(resource_listen)` | `/etc/node-ctl/conductor.yaml` 的内联 `resource_listen` 块 | `socket: /run/sandbox-resource.sock` | [`docs/node-resource.md`](node-resource.md) §3 |
-| `cluster-ctl registry` | `--config /etc/cluster-ctl/registry.yaml` | `member.id/listen`;`membership.active/versions[].members[].advertise/node_advertise/owners`;`node_link`、`route_link`、`node_list`、`placer_link` | `orchestrator/docs/cluster.md` |
-| `cluster-ctl router` | `--config /etc/cluster-ctl/router.yaml` | `registry.bootstrap` 指向 registry 控制面;router `:443`(LB 后 N 副本);请求必须带 `X-Kuasar-Sandbox-Group` | `orchestrator/docs/cluster-router.md` |
-| `cluster-ctl placer` | `--config /etc/cluster-ctl/placer.yaml` | `placer.id/listen/advertise/memberlist_label`;`registry.bootstrap`;`import_groups[]`;`placement` | `orchestrator/docs/cluster-placer.md` |
-| `sandbox-ctl run` | `--config <path>`(`SANDBOX_CONFIG`)+ `--manifest-config <path>`(`MANIFEST_CONFIG`)| **per-sandbox**,由 `node-ctl` 生成,落在 `/run/sandbox/<sid>/` | [`docs/sandbox.md`](sandbox.md) §3 |
-| `manifest-ctl` | `--manifest-config <path>`(`MANIFEST_CONFIG`)| 与 `sandbox-ctl` 共享格式;只连本机 store-ctl + cache-ctl | [`docs/manifest.md`](manifest.md) §3 |
-| `flatten-ctl` | CLI flag + `--manifest-config`(`MANIFEST_CONFIG`,`--upload` 时)+ `--config`(`FLATTEN_CONFIG`,registry 源时);凭据走 `FLATTEN_REGISTRY_*` env | 经单一 guest runtime 在构建沙箱 guest 内运行(`run-builder` 驱动,§5)| [`docs/flatten.md`](flatten.md) §2 |
+| `store-ctl` | `--config <path>` | `listen: 127.0.0.1:7100`(节点本机)| 源仓 `accelerator/docs/store.md` §3;发布包 `docs/store.md` |
+| `cache-ctl tiered` | `--config <path>` | `listen: 127.0.0.1:7070`(节点本机);`tiers[].cluster.peers` 写本 AZ L2 全集群 | 源仓 `accelerator/docs/cache.md` §3.4;发布包 `docs/cache.md` |
+| `cache-ctl shard` | `--config <path>` | `listen: 0.0.0.0:7070`(对外服务)| 源仓 `accelerator/docs/cache.md` §3.3;发布包 `docs/cache.md` |
+| `node-ctl conductor serve(resource_listen)` | `/etc/node-ctl/conductor.yaml` 的内联 `resource_listen` 块 | `socket: /run/sandbox-resource.sock` | 源仓 `orchestrator/docs/node-resource.md` §3;发布包 `docs/node-resource.md` |
+| `cluster-ctl registry` | `--config /etc/cluster-ctl/registry.yaml` | `member.id/listen`;`membership.active/versions[].members[].advertise/node_advertise/owners`;`node_link`、`route_link`、`node_list`、`placer_link` | 源仓 `orchestrator/docs/cluster.md`;发布包 `docs/cluster.md` |
+| `cluster-ctl router` | `--config /etc/cluster-ctl/router.yaml` | `registry.bootstrap` 指向 registry 控制面;router `:443`(LB 后 N 副本);请求必须带 `X-Kuasar-Sandbox-Group` | 源仓 `orchestrator/docs/cluster-router.md`;发布包 `docs/cluster-router.md` |
+| `cluster-ctl placer` | `--config /etc/cluster-ctl/placer.yaml` | `placer.id/listen/advertise/memberlist_label`;`registry.bootstrap`;`import_groups[]`;`placement` | 源仓 `orchestrator/docs/cluster-placer.md`;发布包 `docs/cluster-placer.md` |
+| `sandbox-ctl run` | `--config <path>`(`SANDBOX_CONFIG`)+ `--manifest-config <path>`(`MANIFEST_CONFIG`)| **per-sandbox**,由 `node-ctl` 生成,落在 `/run/sandbox/<sid>/` | 源仓 `sandboxer/docs/sandbox.md` §3;发布包 `docs/sandbox.md` |
+| `manifest-ctl` | `--manifest-config <path>`(`MANIFEST_CONFIG`)| 与 `sandbox-ctl` 共享格式;只连本机 store-ctl + cache-ctl | 源仓 `accelerator/docs/manifest.md` §3;发布包 `docs/manifest.md` |
+| `flatten-ctl` | CLI flag + `--manifest-config`(`MANIFEST_CONFIG`,`--upload` 时)+ `--config`(`FLATTEN_CONFIG`,registry 源时);凭据走 `FLATTEN_REGISTRY_*` env | 经单一 guest runtime 在构建沙箱 guest 内运行(`run-builder` 驱动,§5)| 源仓 `guest-runtime/docs/flatten.md` §2;发布包 `docs/flatten.md` |
 
-构建产物路径、跨架构、release 打包见 [`docs/build.md`](build.md);性能基线、
-回归 checklist 见 [`docs/perf.md`](perf.md)。
+构建产物路径、跨架构、release 打包见 `orchestrator/release-builder/README.md`
+和 `orchestrator/release-builder/scripts/release.sh`;发布包解压与测试入口见
+`test/QUICKSTART.md`;性能基线、回归 checklist 见 [`perf.md`](perf.md)。
 
 ## 12. See Also
 
 - [`docs/kuasar-sandbox.md`](kuasar-sandbox.md) — 系统设计总览:业务目标、子系统分工、端到端数据流
-- [`docs/sandbox.md`](sandbox.md) — compute node 上 `sandbox-ctl` 的完整生命周期
-- [`docs/cache.md`](cache.md) §3.1 — `local` / `shard` / `tiered` 三形态选择;§4.9 Maglev 一致性哈希
-- [`docs/store.md`](store.md) — 后端选择(fs / obs)与代轮转
-- [`docs/node-resource.md`](node-resource.md) — 节点资源控制协议
+- `sandboxer/docs/sandbox.md`(发布包:`docs/sandbox.md`) — compute node 上 `sandbox-ctl` 的完整生命周期
+- `accelerator/docs/cache.md`(发布包:`docs/cache.md`) §3.1 — `local` / `shard` / `tiered` 三形态选择;§4.9 Maglev 一致性哈希
+- `accelerator/docs/store.md`(发布包:`docs/store.md`) — 后端选择(fs / obs)与代轮转
+- `orchestrator/docs/node-resource.md`(发布包:`docs/node-resource.md`) — 节点资源控制协议
 - `orchestrator/docs/node.md` — e2b 兼容控制面与节点主机;`cluster.md` — 集群级注册表 / 路由 / 放置
-- [`docs/manifest.md`](manifest.md) — `MANIFEST_CONFIG` 格式与 loader 契约
+- `accelerator/docs/manifest.md`(发布包:`docs/manifest.md`) — `MANIFEST_CONFIG` 格式与 loader 契约
