@@ -450,6 +450,23 @@ func (rt *Router) handleSandboxVerb(w http.ResponseWriter, r *http.Request) {
 	if !rt.authorize(w, r.Context(), group, apiKeyFromRequest(r)) {
 		return
 	}
+	if r.Method == http.MethodDelete {
+		status, msg, err := rt.routeLinkDelete(r.Context(), group, routeKey, sid)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		if status != http.StatusNoContent {
+			if msg == "" {
+				msg = http.StatusText(status)
+			}
+			http.Error(w, msg, status)
+			return
+		}
+		rt.evictRoute(group, routeKey, sid)
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
 	rr := rt.resolveRoute(r.Context(), group, routeKey, sid)
 	if rr == nil || rr.DataEndpoint == "" {
 		http.Error(w, "sandbox not found", http.StatusNotFound)
@@ -1008,6 +1025,17 @@ func (rt *Router) routeLinkRoute(ctx context.Context, group, routeKey, sid strin
 		return nil, err
 	}
 	return &rr, nil
+}
+
+func (rt *Router) routeLinkDelete(ctx context.Context, group, routeKey, sid string) (int, string, error) {
+	path := fmt.Sprintf("%s?group=%s&route_key=%s&sid=%s", registry.RouteLinkDeletePath, url.QueryEscape(group), url.QueryEscape(routeKey), url.QueryEscape(sid))
+	resp, err := rt.routeLinkHTTP(ctx, group, http.MethodDelete, path, nil, nil)
+	if err != nil {
+		return 0, "", err
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+	return resp.StatusCode, strings.TrimSpace(string(b)), nil
 }
 
 func (rt *Router) routeLinkCall(ctx context.Context, group, method, path string, body []byte, headers map[string]string, out any) error {

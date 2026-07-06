@@ -167,7 +167,7 @@ help:
 	@echo "  collect       re-assemble bin/\$$(TARGET_ARCH)/ from existing sub-repo outputs"
 	@echo "  release       build + package merge-safe component tarballs under dist/"
 	@echo "  test-e2e      aggregate: drive each sub-repo's test-e2e + run this repo's cross-repo e2e ($(words $(UMBRELLA_E2E)))"
-	@echo "  test-e2e-<X>  one e2e sub-target (X in {manifest,obs,density,sandbox-{cold,..},orchestrator,run-builder,execute,..})"
+	@echo "  test-e2e-<X>  one e2e sub-target (X in {manifest,obs,density,sandbox-{cold,..},orchestrator,run-builder,execute,cluster-real,..})"
 	@echo "  demo          run the e2b end-to-end demo (test/demo/demo_e2b.sh; DEMO_PAUSE=1 to step through)"
 	@echo "  perf          aggregate: accelerator perf-cache + this repo's perf-sandbox/-manifest/-density"
 	@echo "  bench         Go micro-benchmarks across every Go sub-repo"

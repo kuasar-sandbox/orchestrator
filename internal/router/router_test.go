@@ -196,7 +196,7 @@ func TestControlForwardTransportIsEndpointScoped(t *testing.T) {
 		sid      string
 		routeKey string
 	}{{"sb-1", "rk1"}, {"sb-2", "rk2"}} {
-		req, _ := http.NewRequest(http.MethodDelete, srv.URL+"/sandboxes/"+tc.sid, nil)
+		req, _ := http.NewRequest(http.MethodGet, srv.URL+"/sandboxes/"+tc.sid, nil)
 		req.Host = "api.test.local"
 		req.Header.Set(HeaderGroup, "/g")
 		req.Header.Set(HeaderRouteKey, tc.routeKey)

@@ -97,7 +97,8 @@ router 不参与 registry 成员健康检测,不订阅 route,也不订阅 node_l
 |---|---|---|
 | create | group + route_key(可缺省生成) | 定位 route owner 后调用 `ReserveSandbox` |
 | connect/resume | group + route_key / sandbox_id | 定位 route owner 后调用 `ReserveSandbox` 恢复 |
-| pause/kill/timeout | group + route_key/sandbox_id | 定位 route owner 后转发到 node |
+| kill | group + route_key + sandbox_id | 定位 route owner 后由 registry 经 node-link 下发 `CmdDelete` |
+| get/connect/pause/timeout/export | group + route_key + sandbox_id | route owner 解析 node 后转发到 node 控制面 |
 | list/get | group | 读取 group 分片 |
 | data plane | group + route_key + sandbox_id + port | cache 命中后建立一次性 CONNECT;miss Reserve |
 | build register | group + build_id | 生成稳定 id 后调用 `ReserveBuild` |
@@ -182,7 +183,8 @@ router 校验 API key 与 group 关系时调用 route owner `verify-key`;route o
 | 操作 | 行为 |
 |---|---|
 | create/connect | 调 Reserve;READY 后返回 |
-| pause/kill/timeout | route owner 解析 node 后转发 |
+| kill | route owner 精确匹配 group + route_key + sandbox_id,经 node-link 下发 `CmdDelete` |
+| get/connect/pause/timeout/export | route owner 解析 node 后转发 |
 | get/list | 读 group route_link |
 | build register | 生成稳定 build_id/template_id 后调 ReserveBuild |
 | build status/files | 按 group+build_id 定位 node 后转发 |

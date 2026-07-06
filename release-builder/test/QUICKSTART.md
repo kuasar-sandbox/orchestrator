@@ -117,10 +117,12 @@ for f in test/e2e/*.sh; do bash "$f" || break; done
 | `e2e_run_builder.sh` | 三阶段构建流水线(KVM):guest 内拉取展平 → steps → 模板快照;fromImage/fromTemplate 三链 + 从产物模板 create |
 | `e2e_execute.sh` | 启真实 microVM(KVM)→ envd 内执行 → 暂停/恢复状态存活 → kill |
 | `e2e_orchestrator_proxy.sh` | external proxy(SO_REUSEPORT + routesync)+ 数据面 X-Access-Token + auto-resume |
+| `e2e_cluster_real.sh` | cluster-ctl registry/router/placer + 真实 node-ctl + 真实 microVM;阶段一 N=1 registry,阶段二 N=3 registry + node-link redirect |
 
 > **前置(比其他 e2e 重)**:这组脚本另需 systemd 为 PID1 + root、`zot`、
 > `docker`;`e2e_run_builder`/`e2e_execute`/`e2e_orchestrator_proxy` 还需
-> `/dev/kvm` 与 `mkfs.ext4`;demo 另需 e2b Python SDK
+> `/dev/kvm` 与 `mkfs.ext4`;`e2e_cluster_real` 还需 `cluster-ctl` / `node-ctl`
+> / `connector-ctl` / `store-ctl` 等完整 release-builder `bin/`;demo 另需 e2b Python SDK
 > (`pip install e2b e2b-code-interpreter`)、`openssl`、`sqlite3`、`iptables`。
 > 脚本会自检,缺失即 skip。
 

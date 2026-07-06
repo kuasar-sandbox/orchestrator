@@ -887,6 +887,41 @@ func (r *Registry) readyResultFromRecord(ctx context.Context, rec *SandboxRecord
 	}, true
 }
 
+// DeleteSandboxRoute sends the authoritative delete command for an exact
+// group-scoped route. The caller must provide group + route_key + current sid so
+// a stale client cannot delete a replacement sandbox generation.
+func (r *Registry) DeleteSandboxRoute(ctx context.Context, group, routeKey, sid string) (bool, error) {
+	if group == "" || routeKey == "" || sid == "" {
+		return false, nil
+	}
+	rec, _, found, err := r.stores.GetSandbox(ctx, group, routeKey)
+	if err != nil || !found {
+		return false, err
+	}
+	if rec.SID != sid {
+		return false, nil
+	}
+	if r.nodeOwner == nil || rec.NodeID == "" {
+		if err := r.stores.DeleteSandbox(ctx, group, routeKey); err != nil {
+			return false, err
+		}
+		r.dropSID(sid)
+		return true, nil
+	}
+	if err := r.nodeOwner.DeleteSandbox(ctx, rec.NodeID, sid); err != nil {
+		if !errors.Is(err, ErrNodeGone) {
+			return false, err
+		}
+		if err := r.stores.DeleteSandbox(ctx, group, routeKey); err != nil {
+			return false, err
+		}
+		_ = r.stores.RemoveNodeSandboxRef(ctx, rec.NodeID, group, routeKey, sid)
+		r.dropSID(sid)
+		return true, nil
+	}
+	return true, nil
+}
+
 // --- node channel registry ---
 
 func (r *Registry) node(id string) (nodeConn, bool) {

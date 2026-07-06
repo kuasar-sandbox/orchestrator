@@ -127,6 +127,37 @@ func TestHeartbeatRenewsManifestKeyBeforeLeaseExpiry(t *testing.T) {
 	}
 }
 
+func TestDeleteSandboxRouteSendsNodeLinkCommand(t *testing.T) {
+	ctx := context.Background()
+	reg := testRegWithBox(t)
+	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1", DataEndpoint: "127.0.0.1:1"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reg.stores.PutSandbox(ctx, &SandboxRecord{
+		Group: "/g", RouteKey: "rk", SID: "sb-1", NodeID: "n1", State: StateReady,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var cmds []*routesync.Command
+	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(c *routesync.Command) { cmds = append(cmds, c) }})
+
+	deleted, err := reg.DeleteSandboxRoute(ctx, "/g", "rk", "sb-old")
+	if err != nil || deleted {
+		t.Fatalf("stale sid delete deleted=%v err=%v", deleted, err)
+	}
+	if len(cmds) != 0 {
+		t.Fatalf("stale sid sent commands: %+v", cmds)
+	}
+
+	deleted, err = reg.DeleteSandboxRoute(ctx, "/g", "rk", "sb-1")
+	if err != nil || !deleted {
+		t.Fatalf("delete route deleted=%v err=%v", deleted, err)
+	}
+	if len(cmds) != 1 || cmds[0].Kind != routesync.CmdDelete || cmds[0].SID != "sb-1" {
+		t.Fatalf("delete command=%+v", cmds)
+	}
+}
+
 func TestSelectorPatchRetriesFailedManifestKeyCacheWrite(t *testing.T) {
 	ctx := context.Background()
 	reg := testRegWithBox(t)

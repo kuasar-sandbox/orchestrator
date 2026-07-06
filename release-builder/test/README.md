@@ -35,7 +35,8 @@ packages are extracted into one directory. `BIN=/path/to/bin` can override it.
 ## Suites
 
 - `e2e/` — cold boot, tapfd networking, snapshot/restore, manifest/cache/store,
-  node orchestration, e2b-compatible execution, and cluster stub coverage.
+  node orchestration, e2b-compatible execution, cluster stub coverage, and real
+  cluster-to-microVM coverage.
 - `perf/` — sandbox latency, manifest path latency, and density harnesses.
 - `demo/` — e2b SDK walkthrough driven by `demo_prep.sh` and `demo_e2b.sh`.
 

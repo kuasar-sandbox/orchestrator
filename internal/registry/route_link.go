@@ -14,6 +14,7 @@ import (
 const (
 	RouteLinkReservePath      = "/route-link/reserve"       // POST ?group=&route_key= -> ReserveResult
 	RouteLinkRoutePath        = "/route-link/route"         // GET  ?group=&route_key=&sid= -> RouteResolve
+	RouteLinkDeletePath       = "/route-link/delete"        // DELETE ?group=&route_key=&sid= -> node-link CmdDelete
 	RouteLinkReserveBuildPath = "/route-link/reserve-build" // POST {group,build_id,template_id,resources,metadata} -> BuildReserveResult
 	RouteLinkBuildPath        = "/route-link/build"         // GET  ?group=&build_id=  -> BuildReserveResult (resolve)
 	RouteLinkListPath         = "/route-link/list"          // GET  ?group=            -> the group's sandbox shard
@@ -38,6 +39,7 @@ type RouteResolve struct {
 func (r *Registry) ServeRouteLink(mux *http.ServeMux) {
 	mux.HandleFunc(RouteLinkReservePath, r.serveReserve)
 	mux.HandleFunc(RouteLinkRoutePath, r.serveRoute)
+	mux.HandleFunc(RouteLinkDeletePath, r.serveDelete)
 	mux.HandleFunc(RouteLinkReserveBuildPath, r.serveReserveBuild)
 	mux.HandleFunc(RouteLinkBuildPath, r.serveBuild) // resolve build_id -> node (router restart)
 	mux.HandleFunc(RouteLinkListPath, r.serveList)
@@ -151,6 +153,24 @@ func (r *Registry) serveRoute(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	writeJSON(w, rr)
+}
+
+func (r *Registry) serveDelete(w http.ResponseWriter, req *http.Request) {
+	if req.Method != http.MethodDelete {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	q := req.URL.Query()
+	deleted, err := r.DeleteSandboxRoute(req.Context(), q.Get("group"), q.Get("route_key"), q.Get("sid"))
+	if err != nil {
+		http.Error(w, err.Error(), routeLinkStatus(err))
+		return
+	}
+	if !deleted {
+		http.Error(w, "sandbox not found", http.StatusNotFound)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // ResolveSID maps a group-scoped (route_key, sid) pair to its data-plane

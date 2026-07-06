@@ -1,7 +1,6 @@
 package router
 
 import (
-	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
@@ -39,21 +38,24 @@ func TestAuthRejectsBadKey(t *testing.T) {
 	}
 }
 
-// TestSandboxVerbForward checks the Phase 7f control plane: a sid-scoped verb is
-// forwarded to the node that holds the sandbox (resolved via the control API).
-func TestSandboxVerbForward(t *testing.T) {
-	var gotPath, gotMethod string
+// TestSandboxDeleteUsesRouteOwnerCommand checks the cluster control plane delete
+// path: DELETE is a lifecycle command owned by route_link/node_link, not a
+// reverse proxy to the node's local e2b API. This keeps cluster auth_key
+// independent from the node-local manifest_key.
+func TestSandboxDeleteUsesRouteOwnerCommand(t *testing.T) {
+	var deletePath, deleteQuery string
+	var nodeHits int
 	node := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotPath, gotMethod = r.URL.Path, r.Method
-		w.WriteHeader(http.StatusOK)
+		nodeHits++
+		w.WriteHeader(http.StatusTeapot)
 	}))
 	defer node.Close()
-	nodeHost := strings.TrimPrefix(node.URL, "http://")
 
 	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/route-link/route":
-			_ = json.NewEncoder(w).Encode(routeResolve{SID: "sb-1", Group: "/g", RouteKey: "rk", DataEndpoint: nodeHost, State: "ready"})
+		case "/route-link/delete":
+			deletePath, deleteQuery = r.URL.Path, r.URL.RawQuery
+			w.WriteHeader(http.StatusNoContent)
 		case "/route-link/verify-key":
 			w.WriteHeader(http.StatusOK)
 		default:
@@ -76,10 +78,13 @@ func TestSandboxVerbForward(t *testing.T) {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("verb status=%d, want 200", resp.StatusCode)
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("delete status=%d, want 204", resp.StatusCode)
 	}
-	if gotPath != "/sandboxes/sb-1" || gotMethod != http.MethodDelete {
-		t.Fatalf("node saw %s %s, want DELETE /sandboxes/sb-1", gotMethod, gotPath)
+	if nodeHits != 0 {
+		t.Fatalf("DELETE was forwarded to node %d time(s), want route_link command path only", nodeHits)
+	}
+	if deletePath != "/route-link/delete" || !strings.Contains(deleteQuery, "group=%2Fg") || !strings.Contains(deleteQuery, "route_key=rk") || !strings.Contains(deleteQuery, "sid=sb-1") {
+		t.Fatalf("route_link delete path=%q query=%q", deletePath, deleteQuery)
 	}
 }
