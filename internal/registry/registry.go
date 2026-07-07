@@ -30,6 +30,7 @@ var (
 )
 
 const lifecycleAckTimeout = 5 * time.Second
+const nodeListProjectionRetryInterval = 200 * time.Millisecond
 
 // nodeConn is the registry's handle to one connected node's channel — it sends
 // commands toward the node. channel.go implements it over the wire; tests fake it.
@@ -93,6 +94,9 @@ type Registry struct {
 	reaperCtx          context.Context
 	nodeLinkRelayMu    sync.RWMutex
 	nodeLinkRelayPeers map[string]NodeLinkRelayPeer
+	nodeListProjectMu  sync.Mutex
+	nodeListProject    map[string]*NodeRecord
+	nodeListProjectRun bool
 
 	placerMu         sync.Mutex
 	scaleReadyLabel  string
@@ -172,6 +176,7 @@ func New(stores *Stores, placer Placer, parkTimeout time.Duration, log *slog.Log
 		inflight:        make(map[string]*reserveCall),
 		sidKeys:         make(map[string][2]string),
 		acks:            make(map[string]chan *routesync.CmdAck),
+		nodeListProject: make(map[string]*NodeRecord),
 		placerReplicas:  1,
 		minReadyPlacers: 1,
 		placerTimeout:   2 * time.Second,
@@ -984,9 +989,7 @@ func (r *Registry) updateNodeRegister(ctx context.Context, nr *routesync.NodeReg
 	if _, err := r.stores.putNodeLink(ctx, rec); err != nil {
 		return err
 	}
-	if err := r.stores.PutNodeList(ctx, rec); err != nil {
-		r.log.Warn("node-link: node_list projection failed", "node", nr.NodeID, "err", err)
-	}
+	r.putNodeListProjection(ctx, rec)
 	return nil
 }
 
@@ -1004,8 +1007,131 @@ func (r *Registry) updateHeartbeat(ctx context.Context, nodeID string, hb *route
 	_ = r.stores.PutNodeRuntime(ctx, rec)
 	r.refreshNodeManifestKeys(ctx, rec)
 	if rec.Draining != oldDraining || oldHeartbeat <= 0 || rec.LastHeartbeatUnix-oldHeartbeat >= r.stores.NodeListHeartbeatRefreshSec() {
-		_ = r.stores.PutNodeList(ctx, rec)
+		r.putNodeListProjection(ctx, rec)
+		return
 	}
+	r.retryPendingNodeListProjection(ctx, rec)
+}
+
+func (r *Registry) putNodeListProjection(ctx context.Context, rec *NodeRecord) {
+	if r == nil || r.stores == nil || rec == nil || rec.NodeID == "" {
+		return
+	}
+	if err := r.stores.PutNodeList(ctx, rec); err == nil {
+		r.clearPendingNodeListProjection(rec)
+		return
+	} else if ctx.Err() != nil {
+		return
+	} else if !isNodeListProjectionRetryable(err) {
+		r.log.Warn("node-link: node_list projection rejected", "node", rec.NodeID, "err", err)
+		return
+	}
+	r.enqueueNodeListProjection(ctx, rec)
+}
+
+func (r *Registry) retryPendingNodeListProjection(ctx context.Context, rec *NodeRecord) {
+	if r == nil || rec == nil || rec.NodeID == "" {
+		return
+	}
+	r.nodeListProjectMu.Lock()
+	_, pending := r.nodeListProject[rec.NodeID]
+	r.nodeListProjectMu.Unlock()
+	if pending {
+		r.putNodeListProjection(ctx, rec)
+	}
+}
+
+func (r *Registry) enqueueNodeListProjection(ctx context.Context, rec *NodeRecord) {
+	if r == nil || rec == nil || rec.NodeID == "" || ctx.Err() != nil {
+		return
+	}
+	next := cloneNodeRecord(rec)
+	r.nodeListProjectMu.Lock()
+	if cur := r.nodeListProject[next.NodeID]; cur == nil || nodeRecordProjectionNewer(next, cur) {
+		r.nodeListProject[next.NodeID] = next
+	}
+	if !r.nodeListProjectRun {
+		r.nodeListProjectRun = true
+		go r.runNodeListProjectionRetry(ctx)
+	}
+	r.nodeListProjectMu.Unlock()
+}
+
+func (r *Registry) runNodeListProjectionRetry(ctx context.Context) {
+	ticker := time.NewTicker(nodeListProjectionRetryInterval)
+	defer ticker.Stop()
+	defer func() {
+		r.nodeListProjectMu.Lock()
+		r.nodeListProjectRun = false
+		r.nodeListProjectMu.Unlock()
+	}()
+	for {
+		if r.flushNodeListProjection(ctx) {
+			return
+		}
+		select {
+		case <-ticker.C:
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+func (r *Registry) flushNodeListProjection(ctx context.Context) bool {
+	if err := ctx.Err(); err != nil {
+		return false
+	}
+	r.nodeListProjectMu.Lock()
+	batch := make([]*NodeRecord, 0, len(r.nodeListProject))
+	for _, rec := range r.nodeListProject {
+		batch = append(batch, cloneNodeRecord(rec))
+	}
+	r.nodeListProjectMu.Unlock()
+	if len(batch) == 0 {
+		return true
+	}
+	for _, rec := range batch {
+		if err := r.stores.PutNodeList(ctx, rec); err != nil {
+			if ctx.Err() != nil {
+				return false
+			}
+			continue
+		}
+		r.clearPendingNodeListProjection(rec)
+	}
+	r.nodeListProjectMu.Lock()
+	empty := len(r.nodeListProject) == 0
+	r.nodeListProjectMu.Unlock()
+	return empty
+}
+
+func (r *Registry) clearPendingNodeListProjection(rec *NodeRecord) {
+	if r == nil || rec == nil || rec.NodeID == "" {
+		return
+	}
+	r.nodeListProjectMu.Lock()
+	defer r.nodeListProjectMu.Unlock()
+	cur := r.nodeListProject[rec.NodeID]
+	if cur == nil || !nodeRecordProjectionNewer(cur, rec) {
+		delete(r.nodeListProject, rec.NodeID)
+	}
+}
+
+func nodeRecordProjectionNewer(next, cur *NodeRecord) bool {
+	if next == nil {
+		return false
+	}
+	if cur == nil {
+		return true
+	}
+	return nodeListProjectionNewer(projectNodeListRecord(next), projectNodeListRecord(cur))
+}
+
+func isNodeListProjectionRetryable(err error) bool {
+	return errors.Is(err, shardkv.ErrQuorum) ||
+		errors.Is(err, shardkv.ErrConflict) ||
+		errors.Is(err, shardkv.ErrReplicaUnavailable) ||
+		errors.Is(err, context.DeadlineExceeded)
 }
 
 func (r *Registry) refreshNodeManifestKeys(ctx context.Context, rec *NodeRecord) {

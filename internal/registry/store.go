@@ -1019,6 +1019,33 @@ func toClusterNode(n *NodeRecord) clusterstate.NodeRecord {
 	}
 }
 
+func cloneNodeRecord(n *NodeRecord) *NodeRecord {
+	if n == nil {
+		return nil
+	}
+	return &NodeRecord{
+		Meta:              n.Meta,
+		NodeID:            n.NodeID,
+		Labels:            cloneStringMap(n.Labels),
+		Capacity:          n.Capacity,
+		BuildCapacity:     cloneBuildResources(n.BuildCapacity),
+		DataEndpoint:      n.DataEndpoint,
+		RuntimeDigest:     n.RuntimeDigest,
+		Zone:              n.Zone,
+		Allocated:         n.Allocated,
+		Pool:              n.Pool,
+		BuildAlloc:        cloneBuildResources(n.BuildAlloc),
+		Counts:            n.Counts,
+		Draining:          n.Draining,
+		LastHeartbeatUnix: n.LastHeartbeatUnix,
+		ResumeToken:       n.ResumeToken,
+		LinkOwner:         n.LinkOwner,
+		ManifestKeys:      cloneNodeManifestKeys(n.ManifestKeys),
+		Sandboxes:         cloneNodeSandboxRefs(n.Sandboxes),
+		Builds:            cloneNodeBuildRefs(n.Builds),
+	}
+}
+
 func cloneStringMap(in map[string]string) map[string]string {
 	if len(in) == 0 {
 		return nil

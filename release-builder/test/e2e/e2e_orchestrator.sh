@@ -10,13 +10,15 @@
 #   3. build API (e2b v3)   POST /v3/templates (register, transient id) →
 #                          POST /v2/templates/{tid}/builds/{bid} (trigger) →
 #                          GET …/status (poll). Cross-key access → 404 (ownership).
-#   4. data plane (gated)   if /dev/kvm + a prebuilt TEMPLATE_ID are present:
+#   4. optional data plane  if TEMPLATE_ID is explicitly provided:
 #                          POST /sandboxes (bare) → GET /v2/sandboxes → DELETE.
+#                          The self-contained data-plane e2e lives in
+#                          e2e_execute.sh / e2e_orchestrator_proxy.sh.
 #
 # node-ctl needs systemd (it drives units over D-Bus), so this test
 # requires systemd as PID1 and root. Missing prerequisites → exit 0 ("skipped on
 # this host") unless REQUIRE_ORCH=1. The control-plane tests need only systemd +
-# root; the data-plane create step additionally needs vswitch + /dev/kvm (gated).
+# root.
 
 set -euo pipefail
 
@@ -170,8 +172,9 @@ case "$status" in
     *) fail "unexpected build status '$status'";;
 esac
 
-# ---- 4. data-plane create (gated on KVM + a prebuilt template) ------------
-if [ -e /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ] && [ -n "${TEMPLATE_ID:-}" ]; then
+# ---- 4. optional data-plane create for manual TEMPLATE_ID validation --------
+if [ -n "${TEMPLATE_ID:-}" ]; then
+    [ -e /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ] || fail "TEMPLATE_ID was set but /dev/kvm is not available (rw)"
     echo "==> create bare sandbox from TEMPLATE_ID=$TEMPLATE_ID"
     code=$(req POST /sandboxes "$AK" "{\"templateID\":\"$TEMPLATE_ID\",\"timeout\":30}")
     [ "$code" = "201" ] || { cat "$WORK/resp.body"; fail "create = $code (want 201)"; }
@@ -181,8 +184,6 @@ if [ -e /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ] && [ -n "${TEMPLATE_ID:
     grep -q "$SID" "$WORK/resp.body" || fail "created sandbox $SID not in list"
     code=$(req DELETE "/sandboxes/$SID" "$AK"); [ "$code" = "204" ] || fail "kill = $code (want 204)"
     echo "==> PASS: sandbox create → list → kill"
-else
-    echo "==> SKIP data-plane create (need /dev/kvm + TEMPLATE_ID=<prebuilt persist id>)"
 fi
 
 echo "==> e2e_orchestrator: OK"

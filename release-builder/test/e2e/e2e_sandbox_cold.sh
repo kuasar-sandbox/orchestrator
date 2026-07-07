@@ -152,7 +152,7 @@ set +e
 # PERF_STATS_JSON: external stats.json sink (used by test/perf/sandbox-perf.sh
 # to harvest runtime metrics). Defaults to a path inside $WORK (cleaned on exit).
 STATS_JSON="${PERF_STATS_JSON:-$WORK/stats.json}"
-timeout 60 "$BIN/sandbox-ctl" run \
+timeout -k 10s 60 "$BIN/sandbox-ctl" run \
     --config "$WORK/sandbox.yaml" \
     --ch-binary "$BIN/cloud-hypervisor" \
     --run-root "$WORK/runtime" \
@@ -219,7 +219,8 @@ echo "==> guest-side milestones (from sandbox-init [T+Xms] prefix):"
 grep -oE '\[sandbox-init\]\[T\+[0-9]+ms\][^"]*' "$LOG" | head -10 | sed 's/^/    /' || true
 
 if [ "$EXIT" = "124" ] && ! grep -q "PYBOOT-OK" "$LOG"; then
-    skip "sandbox run timed out at 60s — guest didn't reach app. Inspect $LOG"
+    echo "==> FAIL: sandbox run timed out at 60s — guest didn't reach app. Inspect $LOG"
+    exit 1
 fi
 
 # Validate the guest produced its output. Marker "PYBOOT-OK 312" can

@@ -201,7 +201,7 @@ fi
 # ff88f5f), so the EROFS no longer starts at offset 0 — a bare truncate won't expose
 # it. Extract the payload (entry "image") and verify the EROFS magic at offset 1024
 # of the pure erofs.
-"$BIN/flatten-ctl" tar extract -f "$TMPDIR/image-a.erofs" --dense "image:$TMPDIR/image-a.pure.erofs"
+"$BIN/flatten-ctl" tar extract -f "$TMPDIR/image-a.erofs" --dense --no-chown "image:$TMPDIR/image-a.pure.erofs"
 MAGIC_HEX=$(dd if="$TMPDIR/image-a.pure.erofs" bs=1 count=4 skip=1024 2>/dev/null | od -An -tx1 | tr -d ' \n')
 if [ "$MAGIC_HEX" = "e2e1f5e0" ]; then
     ok "extracted EROFS payload retains magic at offset 1024"
@@ -359,7 +359,7 @@ assert_eq "$ZERO_W" "$INFO_ZERO" "info reports same zero count as store summary"
 # Round-trip: load the artifact, extract its payload (--dense materializes the
 # zero chunks), and compare SHA256 to the original.
 "$BIN/manifest-ctl" load $COMMON --no-progress --output "$TMPDIR/sparse.rt.tar" "$MKEY_SPARSE"
-"$BIN/flatten-ctl" tar extract -f "$TMPDIR/sparse.rt.tar" --dense "image:$TMPDIR/sparse.rt"
+"$BIN/flatten-ctl" tar extract -f "$TMPDIR/sparse.rt.tar" --dense --no-chown "image:$TMPDIR/sparse.rt"
 RT_HASH=$(sha256sum "$TMPDIR/sparse.rt" | awk '{print $1}')
 assert_eq "$SPARSE_HASH" "$RT_HASH" "sparse file payload roundtrip matches"
 
@@ -422,7 +422,7 @@ fi
 # behavior is covered by flatten-ctl's own extract tests; here we assert the
 # byte-exact payload roundtrip.
 "$BIN/manifest-ctl" load $COMMON --no-progress --output "$TMPDIR/holed.rt.tar" "$MKEY_HOLED"
-"$BIN/flatten-ctl" tar extract -f "$TMPDIR/holed.rt.tar" --dense "image:$TMPDIR/holed.rt"
+"$BIN/flatten-ctl" tar extract -f "$TMPDIR/holed.rt.tar" --dense --no-chown "image:$TMPDIR/holed.rt"
 RT_HASH=$(sha256sum "$TMPDIR/holed.rt" | awk '{print $1}')
 assert_eq "$HOLED_HASH" "$RT_HASH" "sparse-hole payload roundtrip matches (holes materialized as zeros)"
 

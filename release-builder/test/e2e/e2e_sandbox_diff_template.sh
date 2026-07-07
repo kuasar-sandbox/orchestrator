@@ -84,7 +84,7 @@ echo "==> sandbox.yaml:"; sed 's/^/    /' "$WORK/sandbox.yaml"
 
 LOG="$WORK/run.log"
 set +e
-timeout 60 "$BIN/sandbox-ctl" run \
+timeout -k 10s 60 "$BIN/sandbox-ctl" run \
     --config "$WORK/sandbox.yaml" \
     --ch-binary "$BIN/cloud-hypervisor" \
     --run-root "$WORK/run" \
@@ -95,7 +95,8 @@ set -e
 
 echo "==> last 30 lines:"; tail -30 "$LOG"
 if [ "$EXIT" = "124" ] && ! grep -q "PYBOOT-OK" "$LOG"; then
-    skip "timed out; inspect $LOG"
+    echo "==> FAIL: timed out; inspect $LOG"
+    exit 1
 fi
 if grep -qE "PYBOOT-OK [0-9]+" "$LOG"; then
     echo "==> PASS: booted on a template-seeded auto-default diff ($(grep -oE 'PYBOOT-OK [0-9]+' "$LOG" | head -1))"

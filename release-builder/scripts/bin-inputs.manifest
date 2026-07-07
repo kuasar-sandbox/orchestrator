@@ -5,6 +5,7 @@ guest-runtime/native-deps mkfs.erofs
 guest-runtime/native-deps fsck.erofs
 guest-runtime/native-deps vmlinux
 guest-runtime/native-deps envd
+guest-runtime/native-deps versitygw
 accelerator              manifest-ctl
 accelerator              store-ctl
 accelerator              cache-ctl

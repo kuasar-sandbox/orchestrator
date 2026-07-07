@@ -101,12 +101,12 @@ EOF
 
 SID1=dk-1
 echo "==> [cold] boot multi-disk sandbox"
-timeout 120 "$BIN/sandbox-ctl" run --config "$WORK/cold.yaml" --sandbox-id "$SID1" \
+timeout -k 10s 120 "$BIN/sandbox-ctl" run --config "$WORK/cold.yaml" --sandbox-id "$SID1" \
     --ch-binary "$BIN/cloud-hypervisor" --run-root "$RR" > "$WORK/run1.log" 2>&1 &
 P1=$!
 ready() { # $1=sid
     for _ in $(seq 1 90); do
-        if timeout 6 "$BIN/sandbox-ctl" exec --sandbox-id "$1" --run-root "$RR" -- /bin/sh -c 'echo R' >"$WORK/r.out" 2>/dev/null && grep -q R "$WORK/r.out"; then return 0; fi
+        if timeout -k 2s 6 "$BIN/sandbox-ctl" exec --sandbox-id "$1" --run-root "$RR" -- /bin/sh -c 'echo R' >"$WORK/r.out" 2>/dev/null && grep -q R "$WORK/r.out"; then return 0; fi
         sleep 1
     done
     return 1
@@ -151,7 +151,7 @@ boot:
     - { name: dataset, base: file://$WORK/dataset.img, overlay: { diff: file://$WORK/dataset-r.ext4, size: 256MiB } }
 EOF
 SID2=dk-2
-timeout 120 "$BIN/sandbox-ctl" run --restore "$SNAP" --config "$WORK/restore.yaml" --sandbox-id "$SID2" \
+timeout -k 10s 120 "$BIN/sandbox-ctl" run --restore "$SNAP" --config "$WORK/restore.yaml" --sandbox-id "$SID2" \
     --ch-binary "$BIN/cloud-hypervisor" --run-root "$RR" > "$WORK/run2.log" 2>&1 &
 P2=$!
 ready "$SID2" || { echo "FAIL: restore not ready"; tail -60 "$WORK/run2.log"; exit 1; }

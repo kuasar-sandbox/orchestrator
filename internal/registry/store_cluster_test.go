@@ -550,7 +550,8 @@ func TestNodeRegisterUsesProfileReadWhenLocalIsNotNodeShardOwner(t *testing.T) {
 }
 
 func TestNodeRegisterDoesNotFailWhenNodeListProjectionUnavailable(t *testing.T) {
-	ctx := context.Background()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	view := clusterstate.MemberView{Version: 1, Members: []string{"a", "b"}}
 	stores := NewClusterStores("a", view, 1, 1, 2, 1)
 	nodeID := nodeOwnedBy(t, stores, "a")
@@ -564,6 +565,54 @@ func TestNodeRegisterDoesNotFailWhenNodeListProjectionUnavailable(t *testing.T) 
 	profile, found, err := stores.GetNodeProfile(ctx, nodeID)
 	if err != nil || !found || profile.DataEndpoint != "127.0.0.1:19001" || profile.LinkOwner != "a" {
 		t.Fatalf("profile after register=%+v found=%v err=%v", profile, found, err)
+	}
+}
+
+func TestNodeRegisterRetriesNodeListProjectionAfterQuorumRecovers(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	view := clusterstate.MemberView{Version: 1, Members: []string{"a", "b"}}
+	cluster := map[string]*Stores{
+		"a": NewClusterStores("a", view, 1, 1, 2, 1),
+		"b": NewClusterStores("b", view, 1, 1, 2, 1),
+	}
+	nodeID := nodeOwnedBy(t, cluster["a"], "a")
+	reg := New(cluster["a"], nil, time.Second, nil)
+
+	if err := reg.updateNodeRegister(ctx, &routesync.NodeRegister{
+		NodeID: nodeID, Capacity: 10, DataEndpoint: "127.0.0.1:19001", Labels: map[string]string{"pool": "p"},
+	}); err != nil {
+		t.Fatalf("updateNodeRegister: %v", err)
+	}
+
+	transport := shardkv.TransportFunc(func(ctx context.Context, member shardkv.MemberID, req shardkv.Request) (shardkv.Response, error) {
+		store := cluster[string(member)]
+		if store == nil || store.ShardStore() == nil {
+			return shardkv.Response{}, shardkv.ErrReplicaUnavailable
+		}
+		return store.ShardStore().Handle(ctx, req)
+	})
+	for _, stores := range cluster {
+		stores.SetShardTransport(transport, nil)
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	var lastErr error
+	for {
+		found := false
+		lastErr = cluster["a"].RangeNodeList(ctx, func(entry clusterstate.NodeListEntry) error {
+			if entry.NodeID == nodeID && entry.DataEndpoint == "127.0.0.1:19001" && entry.Labels["pool"] == "p" {
+				found = true
+			}
+			return nil
+		})
+		if lastErr == nil && found {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("node_list projection did not recover; lastErr=%v", lastErr)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 

@@ -129,7 +129,7 @@ echo "==> sandbox.yaml:"; sed 's/^/    /' "$WORK/sandbox.yaml"
 
 # ---- boot (background; a placeholder never exits on its own) ---------------
 echo "==> launching placeholder sandbox (background)"
-timeout 120 "$BIN/sandbox-ctl" run \
+timeout -k 10s 120 "$BIN/sandbox-ctl" run \
     --config "$WORK/sandbox.yaml" --sandbox-id "$SID" \
     --ch-binary "$BIN/cloud-hypervisor" --run-root "$RUNROOT" \
     > "$RUNLOG" 2>&1 &
@@ -141,7 +141,7 @@ exec1() { "$BIN/sandbox-ctl" exec --sandbox-id "$SID" --run-root "$RUNROOT" "$@"
 echo "==> waiting for the sandbox to become exec-ready"
 READY=0
 for _ in $(seq 1 90); do
-    if timeout 6 "$BIN/sandbox-ctl" exec --sandbox-id "$SID" --run-root "$RUNROOT" \
+    if timeout -k 2s 6 "$BIN/sandbox-ctl" exec --sandbox-id "$SID" --run-root "$RUNROOT" \
          -- /bin/sh -c 'echo READY' >"$WORK/ready.out" 2>/dev/null && grep -q READY "$WORK/ready.out"; then
         READY=1; break
     fi

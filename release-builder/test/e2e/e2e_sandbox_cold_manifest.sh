@@ -237,7 +237,7 @@ LOG="$WORK/run.log"
 T0_NS=$(date +%s%N)
 set +e
 STATS_JSON="${PERF_STATS_JSON:-$WORK/stats.json}"
-timeout 90 "$BIN/sandbox-ctl" run \
+timeout -k 10s 90 "$BIN/sandbox-ctl" run \
     --config "$WORK/sandbox.yaml" \
     --manifest-config "$WORK/accelerator.yaml" \
     --ch-binary "${CH_BINARY:-$BIN/cloud-hypervisor}" \
@@ -289,7 +289,8 @@ else
 fi
 
 if [ "$EXIT" = "124" ] && ! grep -q "PYBOOT-OK" "$LOG"; then
-    skip "sandbox run timed out at 90s — guest didn't reach app. Inspect $LOG"
+    echo "==> FAIL: sandbox run timed out at 90s — guest didn't reach app. Inspect $LOG"
+    exit 1
 fi
 
 if grep -qE "PYBOOT-OK [0-9]+" "$LOG"; then

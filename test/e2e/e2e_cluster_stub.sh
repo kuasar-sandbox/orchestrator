@@ -184,10 +184,9 @@ WORK="$(mktemp -d)"
 step "work dir: $WORK"
 PIDS=()
 cleanup() {
-    for pid in "${PIDS[@]:-}"; do
+    for ((i=${#PIDS[@]}-1; i>=0; i--)); do
+        pid="${PIDS[$i]}"
         kill "$pid" 2>/dev/null || true
-    done
-    for pid in "${PIDS[@]:-}"; do
         wait "$pid" 2>/dev/null || true
     done
     if [ "${CLUSTER_STUB_KEEP_WORK:-0}" = "1" ]; then

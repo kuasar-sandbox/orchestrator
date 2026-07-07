@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -579,6 +580,9 @@ func (s *Service) reconcileImportSource(ctx context.Context, source ImportSource
 	for {
 		lease, ok, err := s.acquireImportSourceLeaseToken(ctx, source.SourceID)
 		if err != nil {
+			if isPlacerShutdownError(ctx, err) {
+				return
+			}
 			if s.retryPlacerLinkFailure(ctx, source.SourceID, err, &retries) {
 				continue
 			}
@@ -599,6 +603,9 @@ func (s *Service) reconcileImportSource(ctx context.Context, source ImportSource
 			return
 		}
 		if err := s.pushSelectorPatches(ctx, source.SourceID, nodes, groups, lease, last); err != nil {
+			if isPlacerShutdownError(ctx, err) {
+				return
+			}
 			if s.retryPlacerLinkFailure(ctx, source.SourceID, err, &retries) {
 				continue
 			}
@@ -607,6 +614,9 @@ func (s *Service) reconcileImportSource(ctx context.Context, source ImportSource
 		}
 		complete := page.NextCursor == ""
 		if err := s.checkpointImportSource(ctx, source.SourceID, lease, page.NextCursor, complete, ""); err != nil {
+			if isPlacerShutdownError(ctx, err) {
+				return
+			}
 			if s.retryPlacerLinkFailure(ctx, source.SourceID, err, &retries) {
 				continue
 			}
@@ -621,6 +631,9 @@ func (s *Service) reconcileImportSource(ctx context.Context, source ImportSource
 }
 
 func (s *Service) retryPlacerLinkFailure(ctx context.Context, sourceID string, err error, attempts *int) bool {
+	if isPlacerShutdownError(ctx, err) {
+		return false
+	}
 	if attempts == nil || *attempts >= scaleLinkFailureRetries {
 		return false
 	}
@@ -644,6 +657,20 @@ func (s *Service) retryPlacerLinkFailure(ctx context.Context, sourceID string, e
 	case <-timer.C:
 		return true
 	}
+}
+
+func isPlacerShutdownError(ctx context.Context, err error) bool {
+	if ctx != nil && ctx.Err() != nil {
+		return true
+	}
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) {
+		return true
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "terminated signal received") || strings.Contains(msg, "context canceled")
 }
 
 func (s *Service) selectorPatchGroupsForImportPage(ctx context.Context, groups []string) ([]selectorPatchGroup, error) {
@@ -729,6 +756,9 @@ func (s *Service) acquireImportSourceLeaseToken(ctx context.Context, sourceID st
 	for _, link := range links {
 		resp, err := s.acquireImportSourceLease(ctx, link, sourceID, self)
 		if err != nil {
+			if isPlacerShutdownError(ctx, err) {
+				return importLeaseToken{}, false, err
+			}
 			lastErr = err
 			s.log.Warn("placer: import source lease", "registry", link.Name, "source", sourceID, "err", err)
 			continue
@@ -785,6 +815,9 @@ func (s *Service) checkpointImportSource(ctx context.Context, sourceID string, l
 	var lastPostErr error
 	for _, link := range links {
 		if err := s.postJSON(ctx, link, registry.PlacerLinkSourceCursorPath, reqBody); err != nil {
+			if isPlacerShutdownError(ctx, err) {
+				return err
+			}
 			lastPostErr = err
 			s.log.Warn("placer: source cursor", "registry", link.Name, "source", sourceID, "err", err)
 			continue
@@ -822,6 +855,9 @@ func (s *Service) pushSelectorPatches(ctx context.Context, sourceID string, node
 		pushed := false
 		for _, link := range links {
 			if err := s.postJSON(ctx, link, registry.PlacerLinkSelectorPatchPath, patch); err != nil {
+				if isPlacerShutdownError(ctx, err) {
+					return err
+				}
 				s.log.Warn("placer: selector patch", "registry", link.Name, "source", sourceID, "group", g.group, "err", err)
 				continue
 			}
@@ -846,6 +882,9 @@ func (s *Service) scaleLinkLinks(ctx context.Context, recordKey string) []Regist
 	}
 	links, err := resolver(ctx, recordKey)
 	if err != nil {
+		if isPlacerShutdownError(ctx, err) {
+			return fallback
+		}
 		s.log.Warn("placer: placer_link owner links", "key", recordKey, "err", err)
 		return fallback
 	}

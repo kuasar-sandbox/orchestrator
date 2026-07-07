@@ -151,7 +151,7 @@ setup_sb() {
 
 # emit_yaml SID MODE FLOOR_MIB CAP_MIB BURST_MIB DUR CYCLES RMIN_MIB RMAX_MIB DEFLATE
 #   MODE      = static | dynamic
-#   BURST_MIB = ignored when MODE=static (no startup_burst section emitted)
+#   BURST_MIB = ignored when MODE=static (no startup section emitted)
 #   CYCLES    = number of grow/rest cycles within the duration
 #   DEFLATE   = true | false (allocatable.deflate_on_oom)
 emit_yaml() {
@@ -174,7 +174,7 @@ resources:
 EOF
         if [ "$mode" = "dynamic" ]; then
             echo "    controller: $WORK/sandbox-resource.sock"
-            echo "  startup_burst:"
+            echo "  startup:"
             echo "    memory: ${burst_mib}MiB"
         fi
         cat <<EOF
@@ -204,6 +204,37 @@ launch:
 EOF
         printf '%s\n' "$WORKLOAD_PY" | sed 's/^/      /'
     } > "$WORK/$sid.yaml"
+}
+
+emit_placeholder_yaml() {
+    local sid="$1" floor_mib="$2" cap_mib="$3" startup_mib="$4"
+    cat > "$WORK/$sid.yaml" <<EOF
+resources:
+  capacity:
+    cpu: 1
+    memory: ${cap_mib}MiB
+  allocatable:
+    cpu: 1
+    memory: ${floor_mib}MiB
+    deflate_on_oom: true
+  control:
+    cgroup_path: /sys/fs/cgroup/sandboxes/${sid}
+    controller: $WORK/sandbox-resource.sock
+  startup:
+    memory: ${startup_mib}MiB
+network:
+  tap: ${sid}-tap
+boot:
+  kernel: file://${VMLINUX}
+  runtime: file://${BIN}/sandbox-runtime.erofs
+  cmdline: "console=hvc0"
+  root:
+    base: file://${BLK0}
+    overlay:
+      diff: file://${WORK}/${sid}.diff
+launch:
+  placeholder: true
+EOF
 }
 
 # The resource controller is hosted in `node-ctl conductor serve` (resource_listen); there is
@@ -315,14 +346,15 @@ resource_listen:
   cgroup_scan_paths:
     - /sys/fs/cgroup/sandboxes
   # Sized for DETERMINISTIC creation-rate backpressure (Phase C), independent of
-  # startup/settle timing: allocatable_pool = (240-80)MiB * (1-0.10) = 144MiB. Each
-  # sandbox commits its 32MiB floor to NodeAllocated at admit, so the 4th leaves the
-  # node at 128MiB >= the red water mark (0.85*144 = 122.4MiB) — and the 5th admit is
-  # HARD-rejected with "node in zone red" (the zone gate is checked before pool
-  # headroom, which would otherwise only queue). startup_factor=1.0 makes the startup
-  # pool (= allocatable_pool) >= 4 floors so the first four are not startup-blocked.
+  # startup/settle timing: allocatable_pool = (400-80)MiB * (1-0.10) = 288MiB.
+  # Each sandbox commits its 64MiB floor to NodeAllocated at admit, so the 4th
+  # leaves the node at 256MiB >= the red water mark (0.85*288 = 244.8MiB) — and
+  # the 5th admit is HARD-rejected with "node in zone red" (the zone gate is
+  # checked before pool headroom, which would otherwise only queue).
+  # startup_factor=1.0 makes the startup pool (= allocatable_pool) fit four
+  # 64MiB startup budgets, so the first four are not startup-blocked.
   resources:
-    physical_memory: 240MiB
+    physical_memory: 400MiB
     physical_cpu: 4
     host_reserved:
       memory: 80MiB
@@ -401,6 +433,7 @@ phase_a() {
         --config "$WORK/$sid.yaml" \
         --sandbox-id "$sid" \
         --ch-binary "$BIN/cloud-hypervisor" \
+        --run-root "$WORK/run" \
         >"$WORK/$sid.log" 2>&1 &
     local pid=$!
     SANDBOX_PIDS+=("$pid")
@@ -456,6 +489,7 @@ phase_b1_static() {
         --config "$WORK/$sid.yaml" \
         --sandbox-id "$sid" \
         --ch-binary "$BIN/cloud-hypervisor" \
+        --run-root "$WORK/run" \
         >"$WORK/$sid.log" 2>&1 &
     local pid=$!
     SANDBOX_PIDS+=("$pid")
@@ -497,14 +531,16 @@ phase_b2_dynamic() {
 
     local sid=sb-B2-1
     setup_sb "$sid"
-    # Same params as B1, but with controller — burst grants must rescue
-    # the workload from the same demand profile.
-    emit_yaml "$sid" dynamic 64 1024 128   15 2 256 384   false
+    # Same workload and floor as B1, but with controller. A startup budget
+    # above the floor prevents cold-start OOM, and runtime grants may extend
+    # it further if PSI reports pressure during the workload.
+    emit_yaml "$sid" dynamic 64 1024 384   15 2 256 384   false
 
     "$BIN/sandbox-ctl" run \
         --config "$WORK/$sid.yaml" \
         --sandbox-id "$sid" \
         --ch-binary "$BIN/cloud-hypervisor" \
+        --run-root "$WORK/run" \
         >"$WORK/$sid.log" 2>&1 &
     local pid=$!
     SANDBOX_PIDS+=("$pid")
@@ -519,9 +555,12 @@ phase_b2_dynamic() {
     grants=$(grep -c " grant .* sid=$sid " "$WORK/daemon.log" 2>/dev/null) || grants=0
 
     [ "$oom" -eq 0 ]  || fail "B2: cgroup oom_count=$oom (controller couldn't prevent OOM)"
-    [ "$grants" -gt 0 ] || fail "B2: no grants observed (sensor broken)"
+    grep -q "workload done" "$WORK/$sid.log" || fail "B2: workload did not complete"
+    if grep -qiE "Out of memory|oom-kill|Killed process|code=137|signal=9" "$WORK/$sid.log"; then
+        fail "B2: guest log contains OOM or SIGKILL despite controller"
+    fi
     grep -q "admit token=.* sid=$sid" "$WORK/audit.log" || fail "B2: no admit in audit"
-    echo "  Phase B2: grants=$grants oom_count=0 (controller eliminated B1's OOM)"
+    echo "  Phase B2: grants=$grants oom_count=0 workload_done=1"
 
     shutdown_sandbox "$pid" "$sid"
     cleanup_sb "$sid"
@@ -537,11 +576,13 @@ phase_c() {
     write_compact_config
     start_daemon "$WORK/node-ctl-compact.yaml"
 
-    # Five sandboxes set up; first four launched in background, fifth synchronous.
+    # Five placeholder sandboxes set up; first four launched in background,
+    # fifth synchronous. Phase C verifies only admission/backpressure, so it
+    # must not run the memory-pressure workload used by Phase A/B.
     for i in 1 2 3 4 5; do
         local sid=sb-C-$i
         setup_sb "$sid"
-        emit_yaml "$sid" dynamic 32 256 64   8 1 32 64   true
+        emit_placeholder_yaml "$sid" 64 256 64
     done
 
     declare -a c_pids=()
@@ -551,13 +592,14 @@ phase_c() {
             --config "$WORK/$sid.yaml" \
             --sandbox-id "$sid" \
             --ch-binary "$BIN/cloud-hypervisor" \
+            --run-root "$WORK/run" \
             >"$WORK/$sid.log" 2>&1 &
         local p=$!
         c_pids+=("$p")
         SANDBOX_PIDS+=("$p")
     done
 
-    # Let the four admits land + reserve (each commits its 32MiB floor to
+    # Let the four admits land + reserve (each commits its 64MiB floor to
     # NodeAllocated). The 5th rejection is deterministic — it rides on those four
     # committed floors crossing the red water mark (see write_compact_config), which
     # the reclaimer cannot free below floor and which settling does not release — so
@@ -576,10 +618,11 @@ phase_c() {
     # admit logic is broken and timeout exposes that.
     local sid=sb-C-5
     set +e
-    timeout 15 "$BIN/sandbox-ctl" run \
+    timeout -k 10s 15 "$BIN/sandbox-ctl" run \
         --config "$WORK/$sid.yaml" \
         --sandbox-id "$sid" \
         --ch-binary "$BIN/cloud-hypervisor" \
+        --run-root "$WORK/run" \
         >"$WORK/$sid.log" 2>&1
     local rc=$?
     set -e

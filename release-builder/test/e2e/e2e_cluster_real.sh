@@ -22,7 +22,7 @@ REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 BIN="${BIN:-$REPO_ROOT/bin}"
 DOMAIN="${DOMAIN:-cluster.real.local}"
 SWITCH="${SWITCH:-sw0}"
-E2E_IMAGE="${E2E_IMAGE:-test-app-a:latest}"
+E2E_IMAGE="${E2E_IMAGE:-python:3.12-slim}"
 ZOT_BIN="${ZOT_BIN:-$(command -v zot || true)}"
 SW_NETNS="${SW_NETNS:-e2e_cluster_sw}"
 
@@ -95,7 +95,8 @@ command -v mkfs.erofs >/dev/null 2>&1 || [ -x "$BIN/mkfs.erofs" ] || skip "mkfs.
 command -v ip >/dev/null 2>&1 || skip "iproute2 (ip) not found"
 [ -d /run/systemd/system ] || skip "systemd not PID1"
 [ -e /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ] || skip "/dev/kvm not available (rw)"
-docker image inspect "$E2E_IMAGE" >/dev/null 2>&1 || skip "base image $E2E_IMAGE not cached"
+docker image inspect "$E2E_IMAGE" >/dev/null 2>&1 || docker pull "$E2E_IMAGE" >/dev/null 2>&1 \
+    || skip "base image $E2E_IMAGE unavailable (set E2E_IMAGE to a local or pullable image)"
 
 if [ "$(id -u)" -ne 0 ]; then
     exec sudo -nE "$0" "$@"
@@ -120,8 +121,11 @@ SW_STARTED=""
 cleanup() {
     set +e
     systemctl stop 'sandbox-runner@*.service' 'sandbox-builder@*.service' 2>/dev/null
-    for p in "${PIDS[@]:-}"; do [ -n "$p" ] && kill "$p" 2>/dev/null; done
-    for p in "${PIDS[@]:-}"; do [ -n "$p" ] && wait "$p" 2>/dev/null; done
+    for ((i=${#PIDS[@]}-1; i>=0; i--)); do
+        p="${PIDS[$i]}"
+        [ -n "$p" ] && kill "$p" 2>/dev/null
+        [ -n "$p" ] && wait "$p" 2>/dev/null
+    done
     [ -n "$SW_STARTED" ] && "$BIN/connector-ctl" vswitch stop "$SWITCH" --force >/dev/null 2>&1
     ip netns del "$SW_NETNS" 2>/dev/null
     ip netns del "$SWITCH" 2>/dev/null
@@ -210,7 +214,11 @@ retry_data_by_key() {
             echo "$code"
             return 0
         fi
-        step "data-plane attempt $i returned $code; retrying after control-plane convergence"
+        if grep -qiE 'no allowlisted manifest key|key not distributed' "$WORK/data-health.body" 2>/dev/null; then
+            cat "$WORK/data-health.body" >&2
+            fail "data-plane hit node before manifest-key cache was ready"
+        fi
+        step "data-plane attempt $i returned $code; retrying while sandbox boot converges"
         sleep 2
     done
     echo "$code"
@@ -235,7 +243,7 @@ EOF
   "http": { "address": "0.0.0.0", "port": "$ZOT_PORT", "compat": ["docker2s2"] },
   "log": { "level": "warn", "output": "$WORK/zot.log" } }
 EOF
-    "$ZOT_BIN" serve "$WORK/zot.json" > >(tee "$WORK/zot.stdout" >&2) 2>&1 &
+    "$ZOT_BIN" serve "$WORK/zot.json" >"$WORK/zot.stdout" 2>&1 &
     PIDS+=("$!")
     wait_port "$ZOT_PORT" zot
 
@@ -256,7 +264,15 @@ SH
 FROM $E2E_IMAGE
 COPY niceshim /usr/bin/ionice
 COPY niceshim /usr/bin/nice
-RUN chmod +x /usr/bin/ionice /usr/bin/nice && (adduser -D -h /home/user user || useradd -m -d /home/user user)
+RUN chmod +x /usr/bin/ionice /usr/bin/nice \
+ && if ! id -u user >/dev/null 2>&1; then \
+      if command -v useradd >/dev/null 2>&1; then useradd -m -d /home/user -s /bin/sh user; \
+      elif command -v adduser >/dev/null 2>&1; then adduser -D -h /home/user -s /bin/sh user; \
+      else echo "missing useradd/adduser" >&2; exit 1; fi; \
+    fi \
+ && mkdir -p /home/user \
+ && chown user:user /home/user \
+ && id user >/dev/null
 EOF
     docker build --network=none -t "$REF" -f "$WORK/Dockerfile.e2e" "$WORK" > >(tee "$WORK/imgbuild.log" >&2) 2>&1 || fail "docker build e2e image"
     TAGS+=("$REF")
@@ -573,6 +589,21 @@ EOF
     fi
 }
 
+wait_cluster_node_manifest_key() {
+    step "waiting for node_link manifest-key cache on $NODE_ID"
+    for _ in $(seq 1 120); do
+        if "$BIN/node-ctl" manifest-key list --socket "$WORK/cn.sock" >"$WORK/cluster-node-keys.out" 2>&1; then
+            if grep -q "^$MANIFEST_FP[[:space:]]" "$WORK/cluster-node-keys.out"; then
+                step "node manifest-key cache ready: $MANIFEST_FP"
+                return 0
+            fi
+        fi
+        sleep 0.5
+    done
+    cat "$WORK/cluster-node-keys.out" >&2 || true
+    fail "node manifest-key cache did not receive $MANIFEST_FP"
+}
+
 run_cluster_flow() {
     local code sid
     step "checking by-key data request uses group target_port (no E2b-Sandbox-Port header)"
@@ -619,6 +650,7 @@ PY
 
 step "cluster real e2e case=$CLUSTER_REAL_CASE work=$WORK using BIN=$BIN"
 MANIFEST_KEY="$("$BIN/e2b-key-ctl" gen-key)"
+MANIFEST_FP="$("$BIN/e2b-key-ctl" fingerprint "$MANIFEST_KEY")"
 AUTH_KEY="$("$BIN/e2b-key-ctl" gen-key)"
 BUILD_API_KEY="$("$BIN/e2b-key-ctl" gen-apikey "$MANIFEST_KEY")"
 CLUSTER_API_KEY="$("$BIN/e2b-key-ctl" gen-apikey "$AUTH_KEY")"
@@ -646,6 +678,7 @@ if [ "$CLUSTER_REAL_CASE" = "registry-redirect" ]; then
     step "selected redirected node_id=$NODE_ID"
 fi
 start_cluster_node "$NODE_ID"
+wait_cluster_node_manifest_key
 run_cluster_flow
 
 echo "==> PASS: e2e_cluster_real $CLUSTER_REAL_CASE"

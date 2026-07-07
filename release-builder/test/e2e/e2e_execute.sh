@@ -29,7 +29,7 @@ BIN="${BIN:-$REPO_ROOT/bin}"
 DOMAIN="${DOMAIN:-sandboxes.e2e.local}"
 PORT="${PORT:-3000}"
 SWITCH="${SWITCH:-sw0}"
-E2E_IMAGE="${E2E_IMAGE:-test-app-a:latest}"
+E2E_IMAGE="${E2E_IMAGE:-python:3.12-slim}"
 ZOT_BIN="${ZOT_BIN:-$(command -v zot || true)}"
 SW_NETNS="${SW_NETNS:-e2e_sw}"
 
@@ -46,7 +46,8 @@ command -v mkfs.erofs >/dev/null 2>&1 || [ -x "$BIN/mkfs.erofs" ] || skip "mkfs.
 command -v ip >/dev/null 2>&1 || skip "iproute2 (ip) not found"
 [ -d /run/systemd/system ] || skip "systemd not PID1"
 [ -e /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ] || skip "/dev/kvm not available (rw)"
-docker image inspect "$E2E_IMAGE" >/dev/null 2>&1 || skip "base image $E2E_IMAGE not cached"
+docker image inspect "$E2E_IMAGE" >/dev/null 2>&1 || docker pull "$E2E_IMAGE" >/dev/null 2>&1 \
+    || skip "base image $E2E_IMAGE unavailable (set E2E_IMAGE to a local or pullable image)"
 
 if [ "$(id -u)" -ne 0 ]; then exec sudo -nE "$0" "$@"; fi
 if ! command -v mkfs.erofs >/dev/null 2>&1; then export PATH="$BIN:$PATH"; fi
@@ -129,7 +130,15 @@ cat > "$WORK/Dockerfile.e2e" <<EOF
 FROM $E2E_IMAGE
 COPY niceshim /usr/bin/ionice
 COPY niceshim /usr/bin/nice
-RUN chmod +x /usr/bin/ionice /usr/bin/nice && (adduser -D -h /home/user user || useradd -m -d /home/user user)
+RUN chmod +x /usr/bin/ionice /usr/bin/nice \
+ && if ! id -u user >/dev/null 2>&1; then \
+      if command -v useradd >/dev/null 2>&1; then useradd -m -d /home/user -s /bin/sh user; \
+      elif command -v adduser >/dev/null 2>&1; then adduser -D -h /home/user -s /bin/sh user; \
+      else echo "missing useradd/adduser" >&2; exit 1; fi; \
+    fi \
+ && mkdir -p /home/user \
+ && chown user:user /home/user \
+ && id user >/dev/null
 EOF
 docker build --network=none -t "$REF" -f "$WORK/Dockerfile.e2e" "$WORK" >"$WORK/imgbuild.log" 2>&1 || { cat "$WORK/imgbuild.log"; fail "docker build (e2b-compliant image)"; }
 TAGS+=("$REF")
@@ -283,7 +292,8 @@ while i + 5 <= len(data):
     if "end" in ev: exit_code = ev["end"].get("exitCode", 0)
 print("HTTP_STATUS", r.status)
 print("EXIT_CODE", exit_code)
-print("ERROR", json.dumps(err))
+if err is not None:
+    print("API_ERROR", json.dumps(err))
 sys.stdout.write("OUTPUT_BEGIN\n"); sys.stdout.flush()
 sys.stdout.buffer.write(out); sys.stdout.write("\nOUTPUT_END\n")
 PY

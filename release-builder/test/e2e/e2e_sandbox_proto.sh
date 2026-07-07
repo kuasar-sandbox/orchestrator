@@ -115,7 +115,7 @@ LOG="$WORK/run.log"
 STATS_JSON="$WORK/stats.json"
 T0_NS=$(date +%s%N)
 set +e
-timeout 30 "$BIN/sandbox-ctl" run \
+timeout -k 10s 30 "$BIN/sandbox-ctl" run \
     --config "$WORK/sandbox.yaml" \
     --ch-binary "$BIN/cloud-hypervisor" \
     --run-root "$WORK/runtime" \
@@ -133,7 +133,8 @@ tail -40 "$LOG"
 
 if [ "$EXIT" != "0" ]; then
     if [ "$EXIT" = "124" ]; then
-        skip "sandbox run timed out at 30s — guest did not reach quit"
+        echo "==> FAIL: sandbox run timed out at 30s — guest did not reach quit"
+        exit 1
     fi
     echo "==> FAIL: sandbox-ctl exit=$EXIT"
     exit 1

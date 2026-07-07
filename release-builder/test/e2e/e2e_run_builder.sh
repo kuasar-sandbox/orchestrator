@@ -16,7 +16,7 @@
 #   B3  fromTemplate(B2, snp) + steps only                 → e2b-snp template
 #       extracts the base image from B2's snapshot.cfg and INHERITS its
 #       startCmd/readyCmd (reaching ready proves both ran)
-#   B4  COPY build context (versitygw; skipped if absent)  → e2b-img template
+#   B4  COPY build context (versitygw required)            → e2b-img template
 #       files endpoint → presigned direct-to-bucket PUT → in-build extract via
 #       flatten-ctl; a RUN step asserts content + default/--chown ownership
 #   create from B3 → 201 → list → kill                     (the template restores)
@@ -42,11 +42,13 @@ DOMAIN="${DOMAIN:-sandboxes.e2e.local}"
 # `/bin/bash -l -c` — the image must have bash (python:3.12-slim does).
 E2E_IMAGE="${E2E_IMAGE:-python:3.12-slim}"
 ZOT_BIN="${ZOT_BIN:-$(command -v zot || true)}"
-# versitygw (S3 gateway) backs COPY build contexts; absent → the COPY chain is
-# skipped (the rest still runs). Look in bin/, then the guest-runtime/native-deps bin (opt-in
-# `make versitygw`, not in the default umbrella collect), then PATH.
+# versitygw (S3 gateway) backs COPY build contexts and is required by the full
+# test-e2e suite. Look in bin/, then guest-runtime/native-deps per-arch bin,
+# then PATH.
 if [ -z "${VGW_BIN:-}" ]; then
-    for cand in "${BIN:-}/versitygw" "$REPO_ROOT/../guest-runtime/native-deps/bin/versitygw" "$(command -v versitygw 2>/dev/null || true)"; do
+    for cand in "${BIN:-}/versitygw" \
+        "$REPO_ROOT/../guest-runtime/native-deps/bin/${TARGET_ARCH:-x86_64}/versitygw" \
+        "$(command -v versitygw 2>/dev/null || true)"; do
         [ -n "$cand" ] && [ -x "$cand" ] && { VGW_BIN="$cand"; break; }
     done
 fi
@@ -188,11 +190,12 @@ truncate -s 1G "$OVL" && "$MKFS_EXT4" -F -q -b 4096 "$OVL"
 BLDDIFF="$WORK/builder-2G.ext4"         # build VM writable disk (pull cache + steps delta + export scratch)
 truncate -s 2G "$BLDDIFF" && "$MKFS_EXT4" -F -q -b 4096 "$BLDDIFF"
 
-# ---- versitygw (S3 gateway for COPY build contexts; optional) ---------------
+# ---- versitygw (S3 gateway for COPY build contexts) ------------------------
 # Backs builder.files_storage: the client direct-uploads a COPY context here
 # (presigned PUT) and the build sandbox fetches it (presigned GET). Bound to
 # 127.0.0.1 — both the client (this script) and the build-side fetch
-# (run-builder, host) reach it from the host. Absent → the COPY chain skips.
+# (run-builder, host) reach it from the host. Full e2e requires it so the COPY
+# chain is covered.
 VGW_AK="e2eaccess"; VGW_SK="e2esecretkey0123"; VGW_BUCKET="build-files"
 FILES_STORAGE_YAML=""
 if [ -n "$VGW_BIN" ] && [ -x "$VGW_BIN" ]; then
@@ -214,7 +217,7 @@ EOF
 )
     echo "==> versitygw up (127.0.0.1:$VGW_PORT, posix, bucket=$VGW_BUCKET) — COPY chain enabled"
 else
-    echo "==> versitygw absent — COPY chain will be skipped (set VGW_BIN or 'make versitygw')"
+    fail "versitygw missing; COPY chain is required by test-e2e (set VGW_BIN or build guest-runtime/native-deps versitygw)"
 fi
 
 # ---- tenant credentials + orchestrator --------------------------------------
@@ -446,7 +449,7 @@ EOF
     case "$B4_PERSIST" in e2b-img-*) : ;; *) fail "B4 persist=$B4_PERSIST (want e2b-img-…)";; esac
     echo "==> PASS: B4 ready → $B4_PERSIST (COPY extract + default/--chown ownership verified in-build)"
 else
-    echo "==> SKIP B4 COPY chain (no versitygw)"
+    fail "B4 COPY chain requires files_storage; versitygw was not configured"
 fi
 
 # ---- create a sandbox from the built template -------------------------------

@@ -486,12 +486,12 @@ echo "    snapshot --upload #2 wallclock:  ${UP2_MS} ms (same content, expect hi
 echo "    chained restore (snap2→snap1):    TICK $WANT_TICK2 in ${RESTORE2_MS} ms (2-layer; disk blk0 fall-through OK)"
 echo "    chained restore (snap3→snap2→snap1): TICK $WANT_TICK3 in ${RESTORE3_MS} ms (3-layer; disk blk0 fall-through OK)"
 echo
-echo "    snap1 dedup line:   $(grep -oE 'snapshot total=[0-9]+ dedup=[0-9]+' $SNAP1_LOG | head -1)"
-echo "    snap1 overlay dedup: $(grep -oE 'overlay total=[0-9]+ dedup=[0-9]+' $SNAP1_LOG | head -1)"
-echo "    snap2 dedup line:   $(grep -oE 'snapshot total=[0-9]+ dedup=[0-9]+' $SNAP2_LOG | head -1)"
-echo "    snap2 overlay dedup: $(grep -oE 'overlay total=[0-9]+ dedup=[0-9]+' $SNAP2_LOG | head -1)"
-echo "    snap3 dedup line:   $(grep -oE 'snapshot total=[0-9]+ dedup=[0-9]+' $SNAP3_LOG | head -1)"
-echo "    snap3 overlay dedup: $(grep -oE 'overlay total=[0-9]+ dedup=[0-9]+' $SNAP3_LOG | head -1)"
+echo "    snap1 snapshot dedup: $(grep -oE 'snapshot stored=[0-9]+ dedup=[0-9]+' "$SNAP1_LOG" | head -1)"
+echo "    snap1 overlay dedup:  $(grep -oE 'overlay stored=[0-9]+ dedup=[0-9]+' "$SNAP1_LOG" | head -1)"
+echo "    snap2 snapshot dedup: $(grep -oE 'snapshot stored=[0-9]+ dedup=[0-9]+' "$SNAP2_LOG" | head -1)"
+echo "    snap2 overlay dedup:  $(grep -oE 'overlay stored=[0-9]+ dedup=[0-9]+' "$SNAP2_LOG" | head -1)"
+echo "    snap3 snapshot dedup: $(grep -oE 'snapshot stored=[0-9]+ dedup=[0-9]+' "$SNAP3_LOG" | head -1)"
+echo "    snap3 overlay dedup:  $(grep -oE 'overlay stored=[0-9]+ dedup=[0-9]+' "$SNAP3_LOG" | head -1)"
 
 echo
 echo "==> e2e_sandbox_upload_restore: OK"

@@ -130,7 +130,7 @@ sed 's/^/    /' "$WORK/sandbox.yaml"
 LOG="$WORK/run.log"
 echo "==> launching sandbox-ctl run (timeout 60s)"
 set +e
-timeout 60 "$BIN/sandbox-ctl" run \
+timeout -k 10s 60 "$BIN/sandbox-ctl" run \
     --config "$WORK/sandbox.yaml" \
     --ch-binary "$BIN/cloud-hypervisor" \
     --run-root "$WORK/runtime" \
@@ -142,7 +142,8 @@ echo "==> last 50 lines of log:"
 tail -50 "$LOG"
 
 if [ "$EXIT" = "124" ] && ! grep -q "LS-DONE" "$LOG"; then
-    skip "sandbox run timed out at 60s — guest didn't reach app. Inspect $LOG"
+    echo "==> FAIL: sandbox run timed out at 60s — guest didn't reach app. Inspect $LOG"
+    exit 1
 fi
 
 echo

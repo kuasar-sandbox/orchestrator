@@ -442,7 +442,30 @@ count_files() {
         echo 0
         return
     fi
-    find "$dir" "$@" -type f 2>/dev/null | wc -l | awk '{print $1}'
+    python3 - "$dir" "$@" <<'PY'
+import fnmatch
+import os
+import sys
+
+root = sys.argv[1]
+patterns = []
+args = sys.argv[2:]
+i = 0
+while i < len(args):
+    if args[i] == "-name" and i + 1 < len(args):
+        patterns.append(args[i + 1])
+        i += 2
+    else:
+        i += 1
+
+count = 0
+for base, _, files in os.walk(root):
+    for name in files:
+        if patterns and not any(fnmatch.fnmatch(name, pat) for pat in patterns):
+            continue
+        count += 1
+print(count)
+PY
 }
 
 echo

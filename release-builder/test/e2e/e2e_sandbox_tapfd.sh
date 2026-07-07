@@ -114,7 +114,7 @@ write_yaml "$WORK/cold.yaml" "169.254.1.1" "$DIFF0" "169.254.1.0/31" 1
 SID="tapfd-e2e"
 LOG="$WORK/cold.log"
 mkdir -p "$WORK/runtime/$SID"
-timeout 120 "$BIN/sandbox-ctl" run --config "$WORK/cold.yaml" \
+timeout -k 10s 120 "$BIN/sandbox-ctl" run --config "$WORK/cold.yaml" \
     --ch-binary "$BIN/cloud-hypervisor" --run-root "$WORK/runtime" --sandbox-id "$SID" \
     > "$LOG" 2>&1 &
 RUNPID=$!
@@ -123,7 +123,9 @@ if wait_marker "^NETUP$" "$LOG" "$RUNPID"; then
     ok "guest booted via tapfd handoff (NETUP)"
 else
     echo "--- cold.log tail ---"; tail -40 "$LOG"
-    kill "$RUNPID" 2>/dev/null || true; skip "guest did not reach NETUP"
+    kill "$RUNPID" 2>/dev/null || true
+    echo "==> FAIL: guest did not reach NETUP"
+    exit 1
 fi
 grep -q "tapfd: received tap fd" "$LOG" && ok "tapfd handoff engaged in sandbox-ctl" || bad "no tapfd handoff log"
 grep -qE "net fd=[0-9]+,mac=$GUEST_MAC,id=_net0" "$LOG" && ok "CH driven with --net fd=,mac=,id=_net0" || bad "fd-mode --net not in log"
@@ -145,7 +147,7 @@ if [ -f "$SNAP_FILE" ]; then
     DIFF1="$WORK/blk1.restore.diff"; mkdiff "$DIFF1"
     write_yaml "$WORK/restore.yaml" "169.254.4.1" "$DIFF1" "169.254.4.0/31" 0
     SIDR="tapfd-e2e-r"; RLOG="$WORK/restore.log"; mkdir -p "$WORK/runtime2/$SIDR"
-    timeout 120 "$BIN/sandbox-ctl" run --restore "$SNAP_FILE" --config "$WORK/restore.yaml" \
+    timeout -k 10s 120 "$BIN/sandbox-ctl" run --restore "$SNAP_FILE" --config "$WORK/restore.yaml" \
         --ch-binary "$BIN/cloud-hypervisor" --run-root "$WORK/runtime2" --sandbox-id "$SIDR" \
         > "$RLOG" 2>&1 &
     RPID=$!

@@ -95,7 +95,7 @@ echo "==> case 1: --stdout-to FILE"
 write_yaml "$WORK/c1.yaml" "$WORK/runtime/c1.diff"
 OUT1="$WORK/c1.stdout"
 LOG1="$WORK/c1.sandbox.log"
-timeout 30 "$BIN/sandbox-ctl" run \
+timeout -k 10s 30 "$BIN/sandbox-ctl" run \
     --config "$WORK/c1.yaml" \
     --ch-binary "$BIN/cloud-hypervisor" \
     --run-root "$WORK/runtime" \
@@ -120,7 +120,7 @@ fi
 echo "==> case 2: --stdout=false"
 write_yaml "$WORK/c2.yaml" "$WORK/runtime/c2.diff"
 OUT2="$WORK/c2.stdout"
-timeout 30 "$BIN/sandbox-ctl" run \
+timeout -k 10s 30 "$BIN/sandbox-ctl" run \
     --config "$WORK/c2.yaml" \
     --ch-binary "$BIN/cloud-hypervisor" \
     --run-root "$WORK/runtime" \
@@ -139,7 +139,7 @@ echo "    PASS: marker absent (silenced)"
 echo "==> case 3: default stdout"
 write_yaml "$WORK/c3.yaml" "$WORK/runtime/c3.diff"
 OUT3="$WORK/c3.stdout"
-timeout 30 "$BIN/sandbox-ctl" run \
+timeout -k 10s 30 "$BIN/sandbox-ctl" run \
     --config "$WORK/c3.yaml" \
     --ch-binary "$BIN/cloud-hypervisor" \
     --run-root "$WORK/runtime" \

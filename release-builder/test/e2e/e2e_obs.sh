@@ -27,6 +27,10 @@ BIN="${BIN:-$REPO_ROOT/bin}"
 
 skip() {
     echo
+    if [ "${OBS_E2E:-0}" = "1" ]; then
+        echo "==> e2e_obs: FAIL ($*)" >&2
+        exit 1
+    fi
     echo "==> e2e_obs: skipping ($*)"
     exit 0
 }

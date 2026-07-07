@@ -294,7 +294,7 @@ func runConductor(args []string, log *slog.Logger) error {
 	}
 
 	if cfg.API.TLS.Cert == "" || cfg.API.TLS.Key == "" {
-		log.Warn("serving plain HTTP (dev): point the SDK with E2B_API_URL/E2B_SANDBOX_URL")
+		log.Info("serving plain HTTP (dev): point the SDK with E2B_API_URL/E2B_SANDBOX_URL")
 	}
 	ln, err := net.Listen("tcp", cfg.API.Listen)
 	if err != nil {

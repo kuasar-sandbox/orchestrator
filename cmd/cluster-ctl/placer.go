@@ -170,36 +170,53 @@ func runPlacerMemberMeta(ctx context.Context, group *membergroup.Group, svc *pla
 func runPlacerRegistryLinks(ctx context.Context, regClient *clusterclient.Registry, svc *placer.Service, log *slog.Logger) {
 	t := time.NewTicker(5 * time.Second)
 	defer t.Stop()
-	refresh := func() {
+	refresh := func() bool {
 		if err := regClient.Refresh(ctx); err != nil {
+			if ctx.Err() != nil {
+				return false
+			}
 			log.Warn("placer: membership refresh", "err", err)
-			return
+			return true
 		}
 		eps, err := regClient.OwnerEndpoints(ctx)
 		if err != nil {
+			if ctx.Err() != nil {
+				return false
+			}
 			log.Warn("placer: owner endpoints", "err", err)
-			return
+			return true
 		}
 		nodeListEps, err := regClient.NodeListEndpoints(ctx)
 		if err != nil {
+			if ctx.Err() != nil {
+				return false
+			}
 			log.Warn("placer: node_list endpoints", "err", err)
-			return
+			return true
 		}
 		label, err := regClient.ActiveLabel(ctx)
 		if err != nil {
+			if ctx.Err() != nil {
+				return false
+			}
 			log.Warn("placer: active label", "err", err)
-			return
+			return true
 		}
 		svc.SetRegistryLinks(ctx, registryLinks(eps))
 		svc.SetNodeListLinksForLabel(ctx, registryLinks(nodeListEps), label)
+		return true
 	}
-	refresh()
+	if !refresh() {
+		return
+	}
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			refresh()
+			if !refresh() {
+				return
+			}
 		}
 	}
 }

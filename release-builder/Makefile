@@ -48,10 +48,15 @@ GO_REPOS       := accelerator sandboxer guest-runtime connector orchestrator
 # Auto-derived from the filesystem so `make test-e2e` always runs EVERY e2e script
 # (drop an e2e_*.sh into test/e2e/ and it is included — no list to forget). The
 # target name maps to the file with '_' → '-': e2e_sandbox_cold.sh → test-e2e-sandbox-cold
-# (the pattern rule below reverses it). Each script self-skips (exit 0) when its
-# prerequisites are absent, so coverage is never silently dropped.
+# (the pattern rule below reverses it). `test-e2e` is the full suite: missing
+# local prerequisites fail the run. e2e_obs is the only environment-gated
+# exception because it needs external OBS credentials/bucket configuration.
 E2E_SCRIPTS  := $(sort $(wildcard test/e2e/e2e_*.sh))
 UMBRELLA_E2E := $(foreach s,$(E2E_SCRIPTS),test-e2e-$(subst _,-,$(patsubst e2e_%.sh,%,$(notdir $(s)))))
+E2E_REQUIRE_ENV := REQUIRE_KVM=1 REQUIRE_EXEC=1 REQUIRE_CLUSTER_STUB=1 \
+	REQUIRE_CLUSTER_REAL=1 REQUIRE_ORCH=1 REQUIRE_PROXY=1 \
+	REQUIRE_BUILDER=1 REQUIRE_RUNTASK=1 REQUIRE_CONNECTOR_E2E=1 \
+	REQUIRE_GUEST_RUNTIME=1
 
 PERF_TARGETS := perf-sandbox perf-sandbox-manifest perf-density
 
@@ -68,7 +73,7 @@ all: build
 # sub-builds, `collect` assembles every artifact under bin/$(TARGET_ARCH)/; the
 # single guest runtime already contains envd/flatten-ctl/mkfs.erofs.
 build:
-	$(MAKE) -C $(ORG)/guest-runtime/native-deps build
+	$(MAKE) -C $(ORG)/guest-runtime/native-deps build versitygw
 	$(MAKE) -C $(ORG)/accelerator build
 	$(MAKE) -C $(ORG)/sandboxer build
 	$(MAKE) -C $(ORG)/guest-runtime build
@@ -113,12 +118,14 @@ release: build
 # test/e2e/e2e_<sub>.sh, with dashes in <sub> mapped to underscores so
 # test-e2e-sandbox-cold → e2e_sandbox_cold.sh.
 $(UMBRELLA_E2E): test-e2e-%: build
-	BIN=$(SBIN) bash test/e2e/e2e_$(subst -,_,$*).sh
+	$(E2E_REQUIRE_ENV) BIN=$(SBIN) bash test/e2e/e2e_$(subst -,_,$*).sh
 
 # Aggregate test-e2e: every umbrella sub-target + each sub-repo's test-e2e.
 test-e2e: build $(UMBRELLA_E2E)
-	$(MAKE) -C $(ORG)/accelerator test-e2e SBIN=$(SBIN)
-	$(MAKE) -C $(ORG)/connector test-e2e
+	$(E2E_REQUIRE_ENV) $(MAKE) -C $(ORG)/accelerator test-e2e SBIN=$(SBIN)
+	$(E2E_REQUIRE_ENV) $(MAKE) -C $(ORG)/connector test-e2e
+	$(E2E_REQUIRE_ENV) $(MAKE) -C $(ORG)/guest-runtime test-e2e \
+		FLATTEN_CTL=$(SBIN)/flatten-ctl STORE_CTL=$(SBIN)/store-ctl
 
 # perf harnesses living in this repo (cross-repo binary use).
 perf-sandbox: build

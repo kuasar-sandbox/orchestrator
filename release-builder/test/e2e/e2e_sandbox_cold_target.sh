@@ -4,13 +4,15 @@
 # product's target spec:
 #
 #   capacity:    2 vCPU, 8 GiB     (what guest OS sees)
-#   allocatable: 0.1 vCPU, 128 MiB (cgroup limits on the CH process)
+#   allocatable: 0.1 vCPU, 128 MiB (steady-state floor)
+#   startup:     512 MiB           (controller-granted cold-start budget)
 #
 # Same workload as e2e_sandbox_cold.sh (python:3.12-slim → PYBOOT-OK)
 # but exercises the production-shaped resources block:
-#  - CH boots with --cpus boot=2 / --memory size=8GiB (capacity)
-#  - sandbox-ctl applies cgroup v2 cpu.weight + memory.max from allocatable
-#  - guest sees 2 vCPU + 8 GiB; only ~50-100 MiB ever residency-fault in
+#  - CH boots with --cpus boot=2 / --memory-zone size=8GiB (capacity)
+#  - node-ctl resource controller admits a startup budget above the 128MiB floor
+#  - CH initial balloon uses that startup budget; Heartbeat/reclaim can later
+#    converge the sandbox back to the floor
 #
 # This is the "Agent app at idle in warm pool" footprint: very small
 # allocatable so a node can pack thousands; capacity is the burst ceiling
@@ -38,7 +40,7 @@ skip() {
 [ -e /dev/kvm ] || skip "/dev/kvm not present"
 [ -r /dev/kvm ] && [ -w /dev/kvm ] || skip "/dev/kvm not accessible to current user"
 
-for b in cloud-hypervisor sandbox-ctl sandbox-init sandbox-runtime.erofs flatten-ctl; do
+for b in cloud-hypervisor sandbox-ctl node-ctl sandbox-init sandbox-runtime.erofs flatten-ctl; do
     [ -e "$BIN/$b" ] || skip "missing $BIN/$b — run 'make build'"
 done
 
@@ -63,12 +65,85 @@ if ! ip link show "$TAP_NAME" >/dev/null 2>&1; then
 fi
 
 WORK="$(mktemp -d /tmp/e2e-target-XXXXXX)"
+DAEMON_PID=""
+SBPID=""
 cleanup_target() {
+    if [ -n "$SBPID" ] && kill -0 "$SBPID" 2>/dev/null; then
+        kill -TERM "$SBPID" 2>/dev/null || true
+        sleep 1
+        kill -KILL "$SBPID" 2>/dev/null || true
+    fi
+    if [ -n "$DAEMON_PID" ] && kill -0 "$DAEMON_PID" 2>/dev/null; then
+        kill -TERM "$DAEMON_PID" 2>/dev/null || true
+        wait "$DAEMON_PID" 2>/dev/null || true
+    fi
+    pkill -KILL -f "cloud-hypervisor.*$WORK/runtime" 2>/dev/null || true
     [ -d "${SB_CGROUP:-}" ] && rmdir "$SB_CGROUP" 2>/dev/null || true
     [ -n "${E2E_KEEP:-}" ] && echo "kept work dir: $WORK" || rm -rf "$WORK"
     [ "$TAP_CREATED_BY_TEST" = "1" ] && ip link del "$TAP_NAME" 2>/dev/null || true
 }
 trap cleanup_target EXIT
+
+start_resource_controller() {
+    cat > "$WORK/node-ctl.yaml" <<EOF
+api: { domain: cold-target.local, listen: "127.0.0.1:0" }
+encryption_key: "0000000000000000000000000000000000000000000000000000000000000000"
+proxy: { mode: internal, auth: enforce }
+sandbox:
+  boot:
+    kernel: $VMLINUX
+    runtime: $BIN/sandbox-runtime.erofs
+paths:
+  run_root: $WORK/node-run
+  base_root: $WORK/node-lib
+  config_socket: $WORK/node-ctl.socket
+  db_path: $WORK/node-ctl.db
+units: { dir: $WORK/units, install: false }
+resource_listen:
+  enabled: true
+  socket: $WORK/sandbox-resource.sock
+  state_path: $WORK/state.json
+  audit_path: $WORK/audit.log
+  cgroup_scan_paths:
+    - $CGROUP_ROOT
+  resources:
+    physical_memory: 4GiB
+    physical_cpu: 4
+    host_reserved:
+      memory: 512MiB
+      cpu: 1
+  watermarks:
+    operational_margin_factor: 0.10
+    high_factor: 0.85
+    low_factor: 0.70
+    emergency_factor: 0.05
+    startup_factor: 0.50
+  rate_limits:
+    memory_grant_per_sec_factor: 0.20
+  admission:
+    rate: 50
+    burst: 50
+    startup_ttl: 120s
+    queue_ttl: 30s
+    queue_max_depth: 256
+  dampening:
+    recover_duration: 30s
+    cooldown_periods: 5
+  log_level: info
+EOF
+    "$BIN/node-ctl" conductor serve --config "$WORK/node-ctl.yaml" >"$WORK/node-ctl.log" 2>&1 &
+    DAEMON_PID=$!
+    for _ in $(seq 1 80); do
+        [ -S "$WORK/sandbox-resource.sock" ] && return 0
+        if ! kill -0 "$DAEMON_PID" 2>/dev/null; then
+            cat "$WORK/node-ctl.log" >&2
+            return 1
+        fi
+        sleep 0.25
+    done
+    cat "$WORK/node-ctl.log" >&2
+    return 1
+}
 
 BLK0_IMAGE="${BLK0_IMAGE:-}"
 if [ -z "$BLK0_IMAGE" ]; then
@@ -108,14 +183,22 @@ mkfs.ext4 -q -F "$DIFF_FILE"
 # fault VAs from either region to the correct memfd offset.
 CAP_MEM="${CAP_MEM:-8GiB}"
 ALLOC_MEM="${ALLOC_MEM:-128MiB}"
+STARTUP_MEM="${STARTUP_MEM:-512MiB}"
 CAP_CPU="${CAP_CPU:-2}"
 ALLOC_CPU="${ALLOC_CPU:-0.1}"
 
 # Fractional allocatable.cpu (0.1) requires a cgroup_path for cpu.weight;
-# config validator rejects it otherwise. Provision a fresh leaf cgroup
-# under /sys/fs/cgroup/sb-target-$$ for this test run.
-SB_CGROUP="/sys/fs/cgroup/sb-target-$$"
+# config validator rejects it otherwise. Provision a fresh leaf cgroup under
+# /sys/fs/cgroup/sandboxes so the embedded resource controller can scan the
+# same root it is configured with.
+CGROUP_ROOT="/sys/fs/cgroup/sandboxes"
+mkdir -p "$CGROUP_ROOT" 2>/dev/null || skip "cannot create cgroup root at $CGROUP_ROOT (need root + cgroup v2)"
+echo "+memory +cpu" > "$CGROUP_ROOT/cgroup.subtree_control" 2>/dev/null || true
+SB_CGROUP="$CGROUP_ROOT/sb-target-$$"
 mkdir -p "$SB_CGROUP" 2>/dev/null || skip "cannot create cgroup at $SB_CGROUP (need root + cgroup v2)"
+
+echo "==> starting node-ctl resource controller"
+start_resource_controller || skip "node-ctl resource controller did not start"
 
 cat > "$WORK/sandbox.yaml" <<EOF
 resources:
@@ -127,6 +210,9 @@ resources:
     memory: $ALLOC_MEM
   control:
     cgroup_path: $SB_CGROUP
+    controller: $WORK/sandbox-resource.sock
+  startup:
+    memory: $STARTUP_MEM
 network:
   tap: $TAP_NAME
   interface: eth0
@@ -160,7 +246,7 @@ STATS_JSON="${PERF_STATS_JSON:-$WORK/stats.json}"
 
 T0_NS=$(date +%s%N)
 set +e
-timeout "$TIMEOUT_S" "$BIN/sandbox-ctl" run \
+timeout -k 10s "$TIMEOUT_S" "$BIN/sandbox-ctl" run \
     --config "$WORK/sandbox.yaml" \
     --ch-binary "$BIN/cloud-hypervisor" \
     --run-root "$WORK/runtime" \
@@ -192,7 +278,7 @@ echo "==> last 60 lines of log:"
 tail -60 "$LOG"
 
 echo
-echo "==> cold-start timing (wallclock, target spec 2c8G / 0.1c128M):"
+echo "==> cold-start timing (wallclock, target spec 2c8G / 0.1c128M floor / startup $STARTUP_MEM):"
 if [ -n "$T_APP_NS" ]; then
     APP_MS=$(ms_delta "$T0_NS" "$T_APP_NS")
     echo "    T0 → app first stdout (PYBOOT-OK):  ${APP_MS} ms"
@@ -211,7 +297,8 @@ grep -oE -- '--cpus [^ ]+' "$LOG" | head -1 | sed 's/^/    /' || true
 grep -oE -- '--memory [^ ]+' "$LOG" | head -1 | sed 's/^/    /' || true
 
 if [ "$EXIT" = "124" ] && ! grep -q "PYBOOT-OK" "$LOG"; then
-    skip "sandbox run timed out at ${TIMEOUT_S}s — guest didn't reach app. Inspect $LOG"
+    echo "==> FAIL: sandbox run timed out at ${TIMEOUT_S}s — guest didn't reach app. Inspect $LOG"
+    exit 1
 fi
 
 if grep -qE "PYBOOT-OK [0-9]+" "$LOG"; then
@@ -245,5 +332,32 @@ else
     echo "==> FAIL: CH --memory-zone did not reflect capacity=$CAP_MEM"
     exit 1
 fi
+
+startup_bytes=$(awk -v s="$STARTUP_MEM" 'BEGIN{
+    if (s ~ /GiB$/) { sub(/GiB/,"",s); printf "%.0f", s*1024*1024*1024; exit }
+    if (s ~ /MiB$/) { sub(/MiB/,"",s); printf "%.0f", s*1024*1024; exit }
+    print s+0
+}')
+cap_bytes=$(awk -v c="$CAP_MEM" 'BEGIN{
+    if (c ~ /GiB$/) { sub(/GiB/,"",c); printf "%.0f", c*1024*1024*1024; exit }
+    if (c ~ /MiB$/) { sub(/MiB/,"",c); printf "%.0f", c*1024*1024; exit }
+    print c+0
+}')
+want_balloon=$((cap_bytes - startup_bytes))
+if grep -q -- "--balloon size=${want_balloon}" "$LOG"; then
+    echo "==> PASS: CH initial balloon reflects startup allocatable ($STARTUP_MEM)"
+else
+    echo "==> FAIL: CH initial balloon did not reflect startup allocatable ($STARTUP_MEM)"
+    exit 1
+fi
+
+grep -q "controller admit ok, initial allocatable=${startup_bytes}" "$LOG" || {
+    echo "==> FAIL: sandbox-ctl did not log controller startup admit for $STARTUP_MEM"
+    exit 1
+}
+grep -q "settled .* sid=" "$WORK/node-ctl.log" 2>/dev/null || {
+    echo "==> FAIL: resource controller did not record settled transition"
+    exit 1
+}
 
 echo "==> e2e_sandbox_cold_target: OK"
