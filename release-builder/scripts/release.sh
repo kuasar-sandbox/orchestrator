@@ -69,6 +69,10 @@ write_metadata() {
   local stage="$1"
   local name="$2"
   local archive="$3"
+  local repo="$name"
+  case "$name" in
+    sandbox-runtime|vmlinux) repo="guest-runtime" ;;
+  esac
   mkdir -p "$stage/release"
   cat >"$stage/release/$name.json" <<EOF
 {
@@ -76,7 +80,7 @@ write_metadata() {
   "version": "$VERSION",
   "arch": "$ARCH",
   "archive": "$archive",
-  "commit": "$(git -C "$ORG/orchestrator" rev-parse --short HEAD 2>/dev/null || echo unknown)",
+  "commit": "$(git -C "$ORG/$repo" rev-parse --short HEAD 2>/dev/null || echo unknown)",
   "built": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 }
 EOF
