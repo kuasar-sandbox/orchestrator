@@ -137,7 +137,8 @@ EOF
 "$BIN/cache-ctl" serve --config "$WORK/cache-ctl.yaml" >"$WORK/cache.log" 2>&1 &
 PIDS+=($!)
 for _ in $(seq 1 50); do
-    if "$BIN/cache-ctl" ping --endpoint "127.0.0.1:$CACHE_HEALTH_PORT" 2>/dev/null | grep -q SERVING; then break; fi
+    ping_out=$("$BIN/cache-ctl" ping --endpoint "127.0.0.1:$CACHE_HEALTH_PORT" 2>/dev/null || true)
+    if [[ "$ping_out" == *SERVING* ]]; then break; fi
     sleep 0.1
 done
 echo "==> store=127.0.0.1:$STORE_PORT cache=127.0.0.1:$CACHE_PORT"
@@ -429,9 +430,19 @@ compute_matrix() {
         m2=$(echo "$sorted" | sed -n "$((mid+1))p")
         median=$(awk -v a="$m1" -v b="$m2" 'BEGIN{printf "%.2f", (a+b)/2}')
     fi
-    min=$(echo "$sorted" | head -1)
-    max=$(echo "$sorted" | tail -1)
+    min=$(printf '%s\n' "$sorted" | awk 'NR == 1 { first = $0 } END { print first }')
+    max=$(printf '%s\n' "$sorted" | awk 'NF { last = $0 } END { print last }')
     echo "  [$label] n=$n pairs=$count  median=${median}%  min=${min}%  max=${max}%"
+}
+
+count_files() {
+    local dir="$1"
+    shift
+    if [ ! -d "$dir" ]; then
+        echo 0
+        return
+    fi
+    find "$dir" "$@" -type f 2>/dev/null | wc -l | awk '{print $1}'
 }
 
 echo
@@ -456,12 +467,12 @@ compute_matrix "memory snapshot" "${SNAP_FILES[@]}"
 
 echo
 echo "==> store-side: total chunks ingested vs pairwise sum"
-total_chunks_in_store=$(find "$WORK/store-data" -type f -name '*.chunk' 2>/dev/null | wc -l)
-total_chunks_in_store_alt=$(find "$WORK/store-data/chunk" -type f 2>/dev/null | wc -l)
+total_chunks_in_store=$(count_files "$WORK/store-data" -name '*.chunk')
+total_chunks_in_store_alt=$(count_files "$WORK/store-data/chunk")
 [ "$total_chunks_in_store" -eq 0 ] && total_chunks_in_store="$total_chunks_in_store_alt"
 sum_per_manifest=0
 for f in "$LOCAL/blk0.manifest" "${BLK1_FILES[@]}" "${SNAP_FILES[@]}"; do
-    n=$("$BIN/manifest-ctl" info "$f" 2>/dev/null | awk '/^chunk count:/ {print $3; exit}')
+    n=$("$BIN/manifest-ctl" info "$f" 2>/dev/null | awk '/^chunk count:/ { n = $3 } END { if (n != "") print n }')
     if [ -n "$n" ] && [ "$n" -eq "$n" ] 2>/dev/null; then
         sum_per_manifest=$((sum_per_manifest + n))
     fi
