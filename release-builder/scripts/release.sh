@@ -227,7 +227,7 @@ package_component "orchestrator" "orchestrator-$VERSION-linux-$ARCH.tar.gz" \
     "orchestrator/deploy/conductor.example.yaml" \
     "orchestrator/deploy/proxy.example.yaml" \
     "orchestrator/deploy/node-ctl.service" \
-    "orchestrator/deploy/node-proxy@.service" \
+    "orchestrator/deploy/node-proxy.service" \
     "orchestrator/deploy/registry.example.yaml" \
     "orchestrator/deploy/router.example.yaml" \
     "orchestrator/deploy/placer.example.yaml" \
