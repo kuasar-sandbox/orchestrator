@@ -6,12 +6,10 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	"syscall"
 	"time"
 
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
-	"golang.org/x/sys/unix"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/metrics"
 )
@@ -40,23 +38,6 @@ func serveListener(ctx context.Context, ln net.Listener, handler http.Handler, t
 		return nil
 	}
 	return err
-}
-
-// listenReusePort binds addr with SO_REUSEPORT so multiple proxy worker processes
-// can share one data-plane port (the kernel load-balances accepted connections).
-func listenReusePort(ctx context.Context, network, addr string) (net.Listener, error) {
-	lc := net.ListenConfig{
-		Control: func(_, _ string, c syscall.RawConn) error {
-			var serr error
-			if err := c.Control(func(fd uintptr) {
-				serr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEPORT, 1)
-			}); err != nil {
-				return err
-			}
-			return serr
-		},
-	}
-	return lc.Listen(ctx, network, addr)
 }
 
 // serveMetrics runs a tiny /metrics endpoint until ctx is cancelled.

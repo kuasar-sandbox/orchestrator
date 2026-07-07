@@ -24,7 +24,7 @@ import (
 // docs/orchestrator.md §9 covers how serve assembles the chosen mode.
 const (
 	ProxyInternal = "internal" // in-process proxy (default)
-	ProxyExternal = "external" // offloaded to node-ctl proxy worker processes
+	ProxyExternal = "external" // offloaded to node-ctl proxy master + workers
 	ProxyOff      = "off"      // data plane disabled on this node
 )
 
@@ -245,8 +245,8 @@ type TLSConfig struct {
 }
 
 // ProxyConfig is the data-plane proxy. mode ∈ {internal,external,off}. In external
-// mode the orchestrator dials each sockets UDS and pushes the route table; the
-// proxy workers own the data-plane listener. data_listen "" shares api.listen.
+// mode conductor forwards fallback data-plane requests to the proxy master's
+// registered UDS; the proxy master owns data-plane listener sockets.
 type ProxyConfig struct {
 	Mode          string `yaml:"mode"`           // internal (default) | external | off
 	DataListen    string `yaml:"data_listen"`    // dedicated data-plane listener; "" = share api.listen
@@ -260,7 +260,7 @@ type ProxyConfig struct {
 // to a fresh per-identity value at /init — required for snapshot-fork data-plane auth.
 // enabled=false keeps envd in -isnotfc (non-secure); the proxy then enforces
 // X-Access-Token as the sole gate. The MMDS is hosted by the proxy component
-// (internal: serve binds Listen; external: a proxy worker started with --mmds). envd
+// (internal: serve binds Listen; external: proxy workers share the master's mmds_listen fd). envd
 // hard-codes 169.254.169.254:80, so the vswitch's --mgmt-service translates that VIP to
 // Listen in its datapath (no iptables); a loopback Listen needs route_localnet=1 on the
 // mgmt dev.
@@ -600,9 +600,9 @@ func (c *Config) validateProxy() error {
 	default:
 		return fmt.Errorf("config: proxy.auth %q (want off|log|enforce)", c.Proxy.Auth)
 	}
-	// proxy.mode=external needs no static socket list: proxy workers register
-	// themselves on the config-socket plugin plane (proxyForwarder forwards to the
-	// live registered set), so there is nothing to require here.
+	// proxy.mode=external needs no static socket list: the proxy master registers
+	// its proxy_socket on the config-socket plugin plane, so there is nothing to
+	// require here.
 
 	// MMDS off => envd is non-secure, so the proxy must be the enforcing sole gate.
 	if !c.MMDS.Enabled && c.Proxy.Auth != AuthEnforce {
@@ -617,21 +617,26 @@ func (c *Config) validateProxy() error {
 	return nil
 }
 
-// ProxyFileConfig is the external data-plane proxy worker's config
-// (node-ctl proxy serve --config <this>). The worker shares serve's wildcard cert + data
-// port, but keeps its OWN bootstrap auth/park fallback — serve pushes the
-// authoritative policy over the registration stream once connected. Per-instance
-// identity (--id / --socket) and the per-instance --metrics-listen stay flags.
+// ProxyFileConfig is the external data-plane proxy master's config
+// (node-ctl proxy serve --config <this>). The master owns the routesync
+// subscription, shared route table, listener fds, and worker supervision. Serve
+// still pushes the authoritative auth/park policy over the registration stream;
+// local values are bootstrap fallbacks until that handshake completes.
 type ProxyFileConfig struct {
-	ConfigSocket string    `yaml:"config_socket"` // serve control socket to register + sync on (= serve paths.config_socket)
-	DataListen   string    `yaml:"data_listen"`   // SO_REUSEPORT data-plane ingress (workers share it); "" = UDS-only proxyForwarder
-	TLS          TLSConfig `yaml:"tls"`           // data-plane listener cert (= serve's wildcard); "" = h2c
-	Auth         string    `yaml:"auth"`          // bootstrap fallback until serve pushes policy: off|log|enforce (default enforce)
-	ParkTimeout  string    `yaml:"park_timeout"`  // bootstrap fallback; default 30s
-	MMDSListen   string    `yaml:"mmds_listen"`   // FC MMDS service addr this worker binds when started with --mmds; default 127.0.0.1:19254
+	ConfigSocket  string    `yaml:"config_socket"`  // serve control socket to register + sync on (= serve paths.config_socket)
+	DataListen    string    `yaml:"data_listen"`    // data-plane ingress; "" = UDS-only proxyForwarder
+	ProxySocket   string    `yaml:"proxy_socket"`   // UDS registered for conductor proxyForwarder; default <dir(config_socket)>/proxy.sock
+	ShmPath       string    `yaml:"shm_path"`       // shared route table path; default <dir(config_socket)>/proxy-routes.shm
+	RouteCapacity int       `yaml:"route_capacity"` // fixed shared route slots; default 65536
+	Workers       int       `yaml:"workers"`        // worker processes supervised by this master; default 1
+	TLS           TLSConfig `yaml:"tls"`            // data-plane listener cert (= serve's wildcard); "" = h2c
+	Auth          string    `yaml:"auth"`           // bootstrap fallback until serve pushes policy: off|log|enforce (default enforce)
+	ParkTimeout   string    `yaml:"park_timeout"`   // bootstrap fallback; default 30s
+	MMDSListen    string    `yaml:"mmds_listen"`    // FC MMDS service addr workers share; empty = disabled
+	MetricsListen string    `yaml:"metrics_listen"` // master metrics endpoint; aggregates worker data-plane counters
 }
 
-// LoadProxy reads the proxy worker config, applies defaults, and validates.
+// LoadProxy reads the proxy master config, applies defaults, and validates.
 func LoadProxy(path string) (*ProxyFileConfig, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -649,14 +654,23 @@ func (p *ProxyFileConfig) applyDefaults() {
 	if p.ConfigSocket == "" {
 		p.ConfigSocket = "/run/sandbox/node-ctl.socket"
 	}
+	if p.ProxySocket == "" {
+		p.ProxySocket = filepath.Join(filepath.Dir(p.ConfigSocket), "proxy.sock")
+	}
+	if p.ShmPath == "" {
+		p.ShmPath = filepath.Join(filepath.Dir(p.ConfigSocket), "proxy-routes.shm")
+	}
+	if p.Workers == 0 {
+		p.Workers = 1
+	}
+	if p.RouteCapacity == 0 {
+		p.RouteCapacity = 65536
+	}
 	if p.Auth == "" {
 		p.Auth = AuthEnforce
 	}
 	if p.ParkTimeout == "" {
 		p.ParkTimeout = "30s"
-	}
-	if p.MMDSListen == "" {
-		p.MMDSListen = "127.0.0.1:19254"
 	}
 }
 
@@ -668,6 +682,12 @@ func (p *ProxyFileConfig) validate() error {
 	}
 	if _, err := time.ParseDuration(p.ParkTimeout); err != nil {
 		return fmt.Errorf("proxy config: park_timeout %q: %w", p.ParkTimeout, err)
+	}
+	if p.Workers <= 0 {
+		return fmt.Errorf("proxy config: workers must be positive")
+	}
+	if p.RouteCapacity <= 0 {
+		return fmt.Errorf("proxy config: route_capacity must be positive")
 	}
 	return nil
 }

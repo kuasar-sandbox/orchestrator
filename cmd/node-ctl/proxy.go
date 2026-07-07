@@ -2,149 +2,431 @@ package main
 
 import (
 	"context"
+	"encoding/binary"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"syscall"
+	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/metrics"
 	"github.com/kuasar-sandbox/orchestrator/internal/mmds"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxy"
+	"github.com/kuasar-sandbox/orchestrator/internal/proxyshm"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
-	"github.com/kuasar-sandbox/orchestrator/internal/routetable"
 )
 
-// runProxy is the external data-plane proxy worker (proxy_mode=external). It reads
-// the worker config (--config, default /etc/node-ctl/proxy.yaml) for the shared
-// policy + endpoints, and takes only per-instance identity on the command line. It:
-//
-//   - registers on serve's config-socket plugin plane (config_socket + --id) and
-//     keeps its route table synced over that single held connection (route push
-//     down + Wake up — internal/routesync);
-//
-//   - serves an h2c UDS (--socket, default <dir(config_socket)>/<id>.sock) for the
-//     data-plane requests serve's proxyForwarder forwards to it (advertised at registration);
-//
-//   - serves the data-plane ingress on data_listen with SO_REUSEPORT (so several
-//     workers share one port), forwarding to envd UDS / floatingip from its synced
-//     route table, parking a request until the route is ready (Wake -> resume).
-//
-//     node-ctl proxy serve --config <proxy.yaml> --id <name> [--socket <uds>]
-//     [--metrics-listen <addr>] [--mmds]
+const (
+	proxyPluginID = "proxy"
+
+	envProxyDataFD    = "KUASAR_PROXY_DATA_FD"
+	envProxyForwardFD = "KUASAR_PROXY_FORWARD_FD"
+	envProxyMMDSFD    = "KUASAR_PROXY_MMDS_FD"
+	envProxyWakeFD    = "KUASAR_PROXY_WAKE_FD"
+	envProxyNotifyFD  = "KUASAR_PROXY_NOTIFY_FD"
+	envProxyMetricsFD = "KUASAR_PROXY_METRICS_FD"
+	envProxyWorkerID  = "KUASAR_PROXY_WORKER_ID"
+)
+
+// runProxy is the external data-plane proxy master. It is the only process that
+// registers on conductor's config-socket plugin plane. The master keeps routesync
+// connected, writes the shared route table, owns listener sockets, and supervises
+// worker processes. Workers inherit listener fds and read the shared table locally;
+// they never register as plugins.
 func runProxy(args []string, log *slog.Logger) error {
 	fs := flag.NewFlagSet("proxy serve", flag.ExitOnError)
-	cfgPath := fs.String("config", "/etc/node-ctl/proxy.yaml", "worker config file")
-	id := fs.String("id", "", "this worker's plugin id, unique per worker (required)")
-	socket := fs.String("socket", "", `UDS this worker serves for proxyForwarder requests; "" = <dir(config_socket)>/<id>.sock`)
-	metricsListen := fs.String("metrics-listen", "", "optional Prometheus text endpoint (per-instance), e.g. 127.0.0.1:9095")
-	enableMMDS := fs.Bool("mmds", false, "host the FC MMDS metadata service on this worker (addr = mmds.listen); set on exactly one worker")
+	cfgPath := fs.String("config", "/etc/node-ctl/proxy.yaml", "proxy config file")
+	worker := fs.Bool("worker", false, "internal: run a proxy worker process")
 	_ = fs.Parse(args)
-	if *id == "" {
-		return fmt.Errorf("proxy: --id is required")
-	}
+
 	cfg, err := config.LoadProxy(*cfgPath)
 	if err != nil {
 		return err
 	}
-	socketPath := *socket
-	if socketPath == "" {
-		socketPath = filepath.Join(filepath.Dir(cfg.ConfigSocket), *id+".sock")
-	}
-	mmdsListen := ""
-	if *enableMMDS {
-		mmdsListen = cfg.MMDSListen
-	}
-
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	if *worker {
+		return runProxyWorker(ctx, cfg, log)
+	}
+	return runProxyMaster(ctx, *cfgPath, cfg, log)
+}
+
+func runProxyMaster(ctx context.Context, cfgPath string, cfg *config.ProxyFileConfig, log *slog.Logger) error {
+	table, err := proxyshm.Create(cfg.ShmPath, cfg.RouteCapacity)
+	if err != nil {
+		return fmt.Errorf("proxy: create shared route table: %w", err)
+	}
+	defer table.Close()
+	defer os.Remove(cfg.ShmPath)
+
+	view := proxyshm.NewMasterView(table, cfg.ParkTimeoutDur(), log)
+	view.SetPolicy(routesync.Policy{AuthMode: cfg.Auth, ParkTimeoutMS: int(cfg.ParkTimeoutDur() / time.Millisecond)})
+
+	forwardLn, err := listenUnix(cfg.ProxySocket)
+	if err != nil {
+		return fmt.Errorf("proxy: listen proxy_socket %s: %w", cfg.ProxySocket, err)
+	}
+	defer forwardLn.Close()
+
+	var dataLn net.Listener
+	if cfg.DataListen != "" {
+		dataLn, err = net.Listen("tcp", cfg.DataListen)
+		if err != nil {
+			return fmt.Errorf("proxy: listen data_listen %s: %w", cfg.DataListen, err)
+		}
+		defer dataLn.Close()
+	}
+
+	var mmdsLn net.Listener
+	if cfg.MMDSListen != "" {
+		mmdsLn, err = net.Listen("tcp", cfg.MMDSListen)
+		if err != nil {
+			return fmt.Errorf("proxy: listen mmds_listen %s: %w", cfg.MMDSListen, err)
+		}
+		defer mmdsLn.Close()
+	}
 
 	mx := metrics.New()
-	tbl := routetable.New(cfg.ParkTimeoutDur())
-	// Auth mode prefers serve's pushed policy, falling back to the worker's config.
-	authMode := func() string {
-		if m := tbl.Policy().AuthMode; m != "" {
-			return m
-		}
-		return cfg.Auth
+	if cfg.MetricsListen != "" {
+		go serveMetrics(ctx, cfg.MetricsListen, mx, log)
 	}
-	px := proxy.New(tableRouter{tbl}, authMode, log, mx)
 
-	// Register on serve's config-socket plugin plane and keep the route table synced
-	// over that held connection (the table is both the Sink and, since this is a proxy
-	// that resumes sandboxes, the WakeSource).
+	for i := 0; i < cfg.Workers; i++ {
+		go superviseProxyWorker(ctx, i, cfgPath, cfg, dataLn, forwardLn, mmdsLn, view, mx, log)
+	}
+
 	reg := routesync.Register{
 		Subscribe: &routesync.Subscribe{Kind: routesync.KindRouteWake},
-		Proxy:     &routesync.Proxy{Socket: routesync.Socket{Path: socketPath}},
-		Mmds:      *enableMMDS,
+		Proxy:     &routesync.Proxy{Socket: routesync.Socket{Path: cfg.ProxySocket}},
+		Mmds:      cfg.MMDSListen != "",
 	}
 	dial := func(ctx context.Context) (net.Conn, error) {
 		return (&net.Dialer{}).DialContext(ctx, "unix", cfg.ConfigSocket)
 	}
-	go routesync.NewSubscriber(dial, *id, reg, tbl, tbl, log).Run(ctx)
+	go routesync.NewSubscriber(dial, proxyPluginID, reg, view, view, log).Run(ctx)
 
-	// UDS: the data-plane requests serve's proxyForwarder forwards to this worker.
-	_ = os.Remove(socketPath)
-	udsLn, err := net.Listen("unix", socketPath)
-	if err != nil {
-		return fmt.Errorf("proxy: listen %s: %w", socketPath, err)
-	}
-	if err := os.Chmod(socketPath, 0o600); err != nil {
-		log.Warn("proxy: chmod socket", "err", err)
-	}
-	go func() {
-		if err := serveListener(ctx, udsLn, px, "", "", log); err != nil {
-			log.Error("proxy: uds server", "err", err)
-		}
-	}()
-
-	if *metricsListen != "" {
-		go serveMetrics(ctx, *metricsListen, mx, log)
-	}
-
-	// MMDS metadata service: serve envd's access-token hash keyed by the guest's
-	// (SNAT'd) source floating IP, from the synced route table. Required when serve
-	// runs sandboxes in FC mode (mmds.enabled); enable on exactly one worker (--mmds);
-	// the host redirects 169.254.169.254:80 to mmds.listen.
-	if mmdsListen != "" {
-		mln, err := net.Listen("tcp", mmdsListen)
-		if err != nil {
-			return fmt.Errorf("proxy: mmds listen %s: %w", mmdsListen, err)
-		}
-		log.Info("proxy mmds metadata service", "mmds_listen", mmdsListen)
-		go func() {
-			if err := mmds.New(tbl, cfg.ParkTimeoutDur(), log).Serve(ctx, mln); err != nil {
-				log.Error("proxy: mmds service", "err", err)
-			}
-		}()
-	}
-
-	if cfg.DataListen == "" {
-		log.Warn("proxy: no data_listen; serving proxyForwarder over UDS only", "socket", socketPath)
-		<-ctx.Done()
-		return nil
-	}
-	dataLn, err := listenReusePort(ctx, "tcp", cfg.DataListen)
-	if err != nil {
-		return fmt.Errorf("proxy: listen %s: %w", cfg.DataListen, err)
-	}
-	log.Info("node-ctl proxy serving", "data_listen", cfg.DataListen, "socket", socketPath, "id", *id,
-		"config_socket", cfg.ConfigSocket, "tls", cfg.TLS.Cert != "", "auth_fallback", cfg.Auth)
-	return serveListener(ctx, dataLn, px, cfg.TLS.Cert, cfg.TLS.Key, log)
+	log.Info("node-ctl proxy master serving",
+		"workers", cfg.Workers,
+		"data_listen", cfg.DataListen,
+		"proxy_socket", cfg.ProxySocket,
+		"mmds_listen", cfg.MMDSListen,
+		"config_socket", cfg.ConfigSocket,
+		"shm_path", cfg.ShmPath,
+		"route_capacity", cfg.RouteCapacity,
+	)
+	<-ctx.Done()
+	return nil
 }
 
-// tableRouter adapts the synced route table to proxy.Router: resolve (parking +
-// Wake) then classify the port with the shared RouteForTarget.
-type tableRouter struct{ tbl *routetable.Table }
-
-func (a tableRouter) Route(ctx context.Context, sid string, port int) (proxy.Route, error) {
-	r, ok := a.tbl.Resolve(ctx, sid)
-	if !ok {
-		return proxy.Route{Kind: proxy.KindNotFound}, nil
+func runProxyWorker(ctx context.Context, cfg *config.ProxyFileConfig, log *slog.Logger) error {
+	workerID := os.Getenv(envProxyWorkerID)
+	if workerID == "" {
+		workerID = "worker"
 	}
-	return proxy.RouteForTarget(r.Profile, r.EnvdUDS, r.CiUDS, r.FloatingIP, r.AccessToken, port), nil
+	table, err := proxyshm.Open(cfg.ShmPath)
+	if err != nil {
+		return fmt.Errorf("proxy worker: open shared route table: %w", err)
+	}
+	defer table.Close()
+
+	updates := proxyshm.NewUpdatesFromFD(fdEnv(envProxyNotifyFD))
+	wakes := proxyshm.NewWakeWriterFromFD(fdEnv(envProxyWakeFD))
+	if wakes != nil {
+		defer wakes.Close()
+	}
+	var wakeFn func(string)
+	if wakes != nil {
+		wakeFn = wakes.Wake
+	}
+	view := proxyshm.NewWorkerView(table, updates, wakeFn, cfg.ParkTimeoutDur())
+	authMode := func() string {
+		if m := view.Policy().AuthMode; m != "" {
+			return m
+		}
+		return cfg.Auth
+	}
+	mx := newMetricsPipeCounter(ctx, fdEnv(envProxyMetricsFD), log.With("proxy_worker", workerID))
+	px := proxy.New(view, authMode, log.With("proxy_worker", workerID), mx)
+
+	errCh := make(chan error, 3)
+	forwardLn, err := listenerFromFD(fdEnv(envProxyForwardFD), "proxy-forward")
+	if err != nil {
+		return err
+	}
+	if forwardLn == nil {
+		return fmt.Errorf("proxy worker: missing forward listener fd")
+	}
+	go func() { errCh <- serveListener(ctx, forwardLn, px, "", "", log) }()
+
+	if dataLn, err := listenerFromFD(fdEnv(envProxyDataFD), "proxy-data"); err != nil {
+		return err
+	} else if dataLn != nil {
+		go func() { errCh <- serveListener(ctx, dataLn, px, cfg.TLS.Cert, cfg.TLS.Key, log) }()
+	}
+
+	if mmdsLn, err := listenerFromFD(fdEnv(envProxyMMDSFD), "proxy-mmds"); err != nil {
+		return err
+	} else if mmdsLn != nil {
+		go func() { errCh <- mmds.New(view, cfg.ParkTimeoutDur(), log).Serve(ctx, mmdsLn) }()
+	}
+
+	log.Info("node-ctl proxy worker serving", "worker", workerID)
+	select {
+	case <-ctx.Done():
+		return nil
+	case err := <-errCh:
+		if ctx.Err() != nil {
+			return nil
+		}
+		return err
+	}
+}
+
+func superviseProxyWorker(ctx context.Context, idx int, cfgPath string, cfg *config.ProxyFileConfig, dataLn, forwardLn, mmdsLn net.Listener, view *proxyshm.MasterView, mx *metrics.M, log *slog.Logger) {
+	workerID := fmt.Sprintf("proxy-%d", idx)
+	for ctx.Err() == nil {
+		err := runProxyWorkerProcess(ctx, workerID, cfgPath, dataLn, forwardLn, mmdsLn, view, mx, log)
+		if ctx.Err() != nil {
+			return
+		}
+		log.Warn("proxy worker exited; restarting", "worker", workerID, "err", err)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+}
+
+func runProxyWorkerProcess(ctx context.Context, workerID, cfgPath string, dataLn, forwardLn, mmdsLn net.Listener, view *proxyshm.MasterView, mx *metrics.M, log *slog.Logger) error {
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	var files []*os.File
+	env := os.Environ()
+	nextFD := 3
+	addFile := func(name string, f *os.File) {
+		if f == nil {
+			env = append(env, name+"=-1")
+			return
+		}
+		files = append(files, f)
+		env = append(env, name+"="+strconv.Itoa(nextFD))
+		nextFD++
+	}
+
+	dataFile, err := listenerFile(dataLn)
+	if err != nil {
+		closeFiles(files)
+		return err
+	}
+	forwardFile, err := listenerFile(forwardLn)
+	if err != nil {
+		closeFiles(append(files, dataFile))
+		return err
+	}
+	mmdsFile, err := listenerFile(mmdsLn)
+	if err != nil {
+		closeFiles(append(files, dataFile, forwardFile))
+		return err
+	}
+
+	wakeR, wakeW, err := os.Pipe()
+	if err != nil {
+		closeFiles(append(files, dataFile, forwardFile, mmdsFile))
+		return err
+	}
+	notifyR, notifyW, err := os.Pipe()
+	if err != nil {
+		closeFiles(append(files, dataFile, forwardFile, mmdsFile, wakeR, wakeW))
+		return err
+	}
+	metricsR, metricsW, err := os.Pipe()
+	if err != nil {
+		closeFiles(append(files, dataFile, forwardFile, mmdsFile, wakeR, wakeW, notifyR, notifyW))
+		return err
+	}
+	removeNotify := view.RegisterNotifyWriter(notifyW)
+	go proxyshm.ReadWakeLoop(ctx, wakeR, view.Wake)
+	go readMetricsLoop(ctx, metricsR, mx)
+
+	addFile(envProxyDataFD, dataFile)
+	addFile(envProxyForwardFD, forwardFile)
+	addFile(envProxyMMDSFD, mmdsFile)
+	addFile(envProxyWakeFD, wakeW)
+	addFile(envProxyNotifyFD, notifyR)
+	addFile(envProxyMetricsFD, metricsW)
+	env = append(env, envProxyWorkerID+"="+workerID)
+
+	cmd := exec.CommandContext(ctx, exe, "proxy", "serve", "--config", cfgPath, "--worker")
+	cmd.Env = env
+	cmd.ExtraFiles = files
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		removeNotify()
+		closeFiles(files)
+		return err
+	}
+	closeFiles(files)
+	defer removeNotify()
+	err = cmd.Wait()
+	if ctx.Err() != nil {
+		return nil
+	}
+	return err
+}
+
+func listenUnix(path string) (net.Listener, error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return nil, err
+	}
+	_ = os.Remove(path)
+	ln, err := net.Listen("unix", path)
+	if err != nil {
+		return nil, err
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		_ = ln.Close()
+		return nil, err
+	}
+	return ln, nil
+}
+
+func listenerFile(ln net.Listener) (*os.File, error) {
+	if ln == nil {
+		return nil, nil
+	}
+	switch l := ln.(type) {
+	case *net.TCPListener:
+		return l.File()
+	case *net.UnixListener:
+		return l.File()
+	default:
+		return nil, fmt.Errorf("proxy: unsupported listener type %T", ln)
+	}
+}
+
+func listenerFromFD(fd int, name string) (net.Listener, error) {
+	if fd < 0 {
+		return nil, nil
+	}
+	f := os.NewFile(uintptr(fd), name)
+	if f == nil {
+		return nil, fmt.Errorf("proxy worker: bad fd %d for %s", fd, name)
+	}
+	defer f.Close()
+	return net.FileListener(f)
+}
+
+func fdEnv(name string) int {
+	v := os.Getenv(name)
+	if v == "" {
+		return -1
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return -1
+	}
+	return n
+}
+
+func closeFiles(files []*os.File) {
+	for _, f := range files {
+		if f != nil {
+			_ = f.Close()
+		}
+	}
+}
+
+type metricsPipeCounter struct {
+	f  *os.File
+	ch chan string
+}
+
+func newMetricsPipeCounter(ctx context.Context, fd int, log *slog.Logger) *metricsPipeCounter {
+	if fd < 0 {
+		return nil
+	}
+	c := &metricsPipeCounter{
+		f:  os.NewFile(uintptr(fd), "proxy-metrics"),
+		ch: make(chan string, 4096),
+	}
+	go c.run(ctx, log)
+	return c
+}
+
+func (c *metricsPipeCounter) Inc(name string) {
+	if c == nil || name == "" || strings.ContainsAny(name, "\r\n") || len(name) > 1024 {
+		return
+	}
+	select {
+	case c.ch <- name:
+	default:
+	}
+}
+
+func (c *metricsPipeCounter) run(ctx context.Context, log *slog.Logger) {
+	defer c.f.Close()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case name := <-c.ch:
+			if err := writeMetricFrame(c.f, name); err != nil {
+				if log != nil {
+					log.Warn("proxy metrics pipe", "err", err)
+				}
+				return
+			}
+		}
+	}
+}
+
+func readMetricsLoop(ctx context.Context, f *os.File, mx *metrics.M) {
+	defer f.Close()
+	for ctx.Err() == nil {
+		name, err := readMetricFrame(f)
+		if err != nil {
+			return
+		}
+		mx.Inc(name)
+	}
+}
+
+func writeMetricFrame(w io.Writer, name string) error {
+	var lenbuf [4]byte
+	b := []byte(name)
+	binary.LittleEndian.PutUint32(lenbuf[:], uint32(len(b)))
+	if _, err := w.Write(lenbuf[:]); err != nil {
+		return err
+	}
+	_, err := w.Write(b)
+	return err
+}
+
+func readMetricFrame(r io.Reader) (string, error) {
+	var lenbuf [4]byte
+	if _, err := io.ReadFull(r, lenbuf[:]); err != nil {
+		return "", err
+	}
+	n := binary.LittleEndian.Uint32(lenbuf[:])
+	if n == 0 || n > 1024 {
+		return "", fmt.Errorf("proxy metrics: bad frame length %d", n)
+	}
+	buf := make([]byte, n)
+	if _, err := io.ReadFull(r, buf); err != nil {
+		return "", err
+	}
+	return string(buf), nil
 }

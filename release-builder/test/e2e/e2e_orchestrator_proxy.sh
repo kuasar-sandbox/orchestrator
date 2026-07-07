@@ -2,20 +2,20 @@
 #
 # e2e_orchestrator_proxy.sh — exercise proxy_mode=external end to end with REAL
 # components: node-ctl conductor serve (control plane), a separate node-ctl
-# proxy worker (data plane, SO_REUSEPORT) that REGISTERS on the config-socket plugin
-# plane and syncs its route table from it, a REAL microVM sandbox with REAL envd, and
+# proxy master that REGISTERS once on the config-socket plugin plane, syncs routes
+# into shared memory, supervises workers, a REAL microVM sandbox with REAL envd, and
 # data-plane traffic driven THROUGH the proxy (not the orchestrator):
 #
 #   serve(proxy_mode=external)                          # control plane on :PORT
-#   proxy serve --config <proxy.yaml> --id=.. --socket=<uds>  # data-plane on :PROXY_PORT
-#         # registers on the config-socket plugin plane + syncs the route table
+#   proxy serve --config <proxy.yaml>                    # data-plane on :PROXY_PORT
+#         # one master plugin registration + N workers sharing inherited listeners
 #   POST /sandboxes  -> real VM + envd ; serve streams the route to the proxy
 #   GET <proxy>/health (Host 49983-<sid>): no token -> 401 (enforce);
 #                                          right X-Access-Token -> forwarded to envd
 #   CONNECT through the proxy (token on the CONNECT) -> tunnel to envd (best-effort)
 #   GET <proxy> for an unknown sandbox -> wake -> 404 (orchestrator says gone)
 #   pause -> GET <proxy> -> wake -> auto-resume -> forwarded (best-effort)
-#   /metrics on the proxy reports data_requests_total
+#   /metrics on the proxy master reports worker data-plane counters
 #
 # Setup mirrors e2e_execute.sh (real VM boot). Same heavy prerequisites: systemd+
 # root, /dev/kvm, vswitch, zot, docker, store-ctl, mkfs.ext4, the built kernel + e2b
@@ -58,7 +58,7 @@ UNIT_NAMES=(sandbox-runner@.service sandbox-builder@.service sandbox-runner.slic
 declare -a OURS=()
 for u in "${UNIT_NAMES[@]}"; do [ -e "$UNIT_DIR/$u" ] && skip "$UNIT_DIR/$u exists; refusing to clobber"; OURS+=("$UNIT_DIR/$u"); done
 mkdir -p "$WORK/run" "$WORK/lib" "$WORK/store" "$WORK/zot/data"
-PROXY_SOCK="$WORK/run/proxy-1.sock"
+PROXY_SOCK="$WORK/run/proxy.sock"
 declare -a PIDS=()
 declare -a TAGS=()
 SW_STARTED=""
@@ -200,8 +200,8 @@ builder:
 checkpoint: { mode: remote }
 EOF
 
-# ---- start serve (control plane), then the proxy worker -------------------
-# The proxy now DIALS serve's config-socket to register, so serve comes up first.
+# ---- start serve (control plane), then the proxy master -------------------
+# The proxy master DIALS serve's config-socket to register, so serve comes up first.
 echo "==> node-ctl conductor serve (control :$PORT, proxy_mode=external)"
 "$BIN/node-ctl" conductor serve --config "$WORK/config.yaml" >"$WORK/orch.log" 2>&1 &
 PIDS+=($!)
@@ -212,21 +212,25 @@ for _ in $(seq 1 30); do
 done
 "$BIN/node-ctl" manifest-key add --socket "$WORK/node-ctl.socket" "$MK" >/dev/null || fail "manifest-key add"
 
-echo "==> node-ctl proxy (registers on config-socket, data-plane :$PROXY_PORT)"
-# The worker reads its policy/endpoints from proxy.yaml; only per-instance identity
-# (--id/--socket) + the per-instance metrics port stay on the command line. h2c here
-# (no tls), matching serve's plain-http listener.
+echo "==> node-ctl proxy master (single plugin registration, data-plane :$PROXY_PORT, workers=2)"
+# The master reads policy/endpoints from proxy.yaml, registers once, then supervises
+# workers that inherit listener fds and read the shared route table. h2c here (no tls),
+# matching serve's plain-http listener.
 cat > "$WORK/proxy.yaml" <<EOF
 config_socket: $WORK/node-ctl.socket
 data_listen: 127.0.0.1:$PROXY_PORT
+proxy_socket: $PROXY_SOCK
+shm_path: $WORK/run/proxy-routes.shm
+route_capacity: 1024
+workers: 2
 auth: enforce
 park_timeout: 90s
+metrics_listen: 127.0.0.1:$METRICS_PORT
 EOF
-"$BIN/node-ctl" proxy serve --config "$WORK/proxy.yaml" --id=proxy-1 \
-    --socket="$PROXY_SOCK" --metrics-listen="127.0.0.1:$METRICS_PORT" >"$WORK/proxy.log" 2>&1 &
+"$BIN/node-ctl" proxy serve --config "$WORK/proxy.yaml" >"$WORK/proxy.log" 2>&1 &
 PIDS+=($!)
 wait_port 127.0.0.1 "$PROXY_PORT" proxy
-echo "==> control plane up; proxy registered on the config-socket plugin plane"
+echo "==> control plane up; proxy master registered on the config-socket plugin plane"
 
 # ---- build a ready e2b template (native v3) --------------------------------
 code=$(req POST /v3/templates "$AK" '{"name":"proxy-tmpl"}')
@@ -286,8 +290,8 @@ else echo "    (note: unknown-sandbox via proxy = $code; expected 404 after wake
 
 # ---- (3) metrics ----------------------------------------------------------
 if curl -sS --noproxy '*' "http://127.0.0.1:$METRICS_PORT/metrics" 2>/dev/null | grep -q 'data_requests_total'; then
-    echo "==> PASS: proxy /metrics reports data_requests_total"
-else echo "    (note: proxy /metrics did not report data_requests_total)"; fi
+    echo "==> PASS: proxy master /metrics reports aggregated worker data_requests_total"
+else echo "    (note: proxy master /metrics did not report data_requests_total)"; fi
 
 # ---- (3b) CONNECT tunnel THROUGH the proxy to envd control (best-effort) ---
 # curl issues CONNECT 49983-<sid>.<domain>:49983 to the proxy (token on the CONNECT via

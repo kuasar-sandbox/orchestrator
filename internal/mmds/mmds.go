@@ -15,10 +15,10 @@
 //     untrusted, so we trust the token we minted, not a re-read of the source), then
 //     return that sandbox's current {instanceID, envID, accessTokenHash}.
 //
-// Hosted by the proxy component (proxy_mode=internal: the serve daemon; external: the
-// proxy worker). envd hard-codes 169.254.169.254:80, so the host redirects that to the
-// configured listen address (deployment config; keeps this process off a privileged
-// port / root).
+// Hosted by the proxy component (proxy_mode=internal: the serve daemon; external:
+// proxy workers sharing the master's listener fd). envd hard-codes
+// 169.254.169.254:80, so the host redirects that to the configured listen address
+// (deployment config; keeps this process off a privileged port / root).
 package mmds
 
 import (
@@ -46,7 +46,7 @@ type Source interface {
 	SandboxInfo(sandboxID string) (templateID, accessToken string, ok bool)
 	// MmdsSecret returns sid's per-sandbox session-token signing key — deterministic
 	// from the manifest key + id, so a token minted by any proxy worker verifies in
-	// any other. ok=false for an unknown sandbox.
+	// any other through the same shared route view. ok=false for an unknown sandbox.
 	MmdsSecret(sandboxID string) (secret []byte, ok bool)
 }
 

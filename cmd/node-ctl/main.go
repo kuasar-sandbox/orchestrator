@@ -1,7 +1,7 @@
 // Command node-ctl is the single-node, e2b-compatible sandbox orchestrator.
 //
 //	node-ctl conductor serve --config <conductor.yaml>          # run the node conductor
-//	node-ctl proxy serve --config <proxy.yaml> --id <name>      # external data-plane worker
+//	node-ctl proxy serve --config <proxy.yaml>                  # external data-plane proxy master
 //	node-ctl run-sandbox --pidfile=<f> --config-socket=<uds> --sandbox-id=<sid>
 //	node-ctl run-builder --pidfile=<f> --config-socket=<uds> --build-id=<bid>
 //	                                                                    # in-unit launchers (not for humans)
@@ -97,7 +97,7 @@ func conductorCmd(args []string, log *slog.Logger) error {
 
 func proxyCmd(args []string, log *slog.Logger) error {
 	if len(args) < 1 || args[0] != "serve" {
-		return fmt.Errorf("usage: node-ctl proxy serve [--config <proxy.yaml>] --id <name>")
+		return fmt.Errorf("usage: node-ctl proxy serve [--config <proxy.yaml>]")
 	}
 	return runProxy(args[1:], log)
 }
@@ -220,8 +220,8 @@ func runConductor(args []string, log *slog.Logger) error {
 	// admin_pidfile or, when unset, the socket's 0600 perms), and the api plane over
 	// plain h2c (X-API-KEY). See docs §6.
 	// The plugin registry is shared: the config-socket plugin plane Adds/Removes
-	// registrations (proxy workers, route observers); the external-mode proxyForwarder
-	// reads it to forward data-plane requests to a registered proxy worker.
+	// registrations (proxy master, route observers); the external-mode proxyForwarder
+	// reads it to forward fallback data-plane requests to the registered proxy socket.
 	plugins := configsock.NewRegistry()
 	cs := configsock.New(cfg.Paths.ConfigSocket, configsock.Deps{
 		Provider:      core,
@@ -260,8 +260,8 @@ func runConductor(args []string, log *slog.Logger) error {
 	if cfg.Proxy.MetricsListen != "" {
 		go serveMetrics(ctx, cfg.Proxy.MetricsListen, mx, log)
 	}
-	// Optional dedicated data-plane listener. In external mode the proxy workers
-	// own data_listen (SO_REUSEPORT), so the orchestrator does not bind it.
+	// Optional dedicated data-plane listener. In external mode the proxy master
+	// owns data_listen, so the conductor does not bind it.
 	if cfg.Proxy.Mode != config.ProxyExternal && cfg.Proxy.DataListen != "" {
 		ln, err := net.Listen("tcp", cfg.Proxy.DataListen)
 		if err != nil {
@@ -277,9 +277,9 @@ func runConductor(args []string, log *slog.Logger) error {
 
 	// MMDS metadata service (mmds.enabled): re-keys envd (launched in FC mode) to fresh
 	// per-identity tokens at /init. Internal mode serves it here from the orchestrator's
-	// live sandbox set; external mode's proxy worker serves it from its synced route
-	// table (a worker started with --mmds, on proxy.yaml mmds_listen). The host must
-	// redirect 169.254.169.254:80 -> mmds.listen.
+	// live sandbox set; external mode's proxy workers serve it from the shared
+	// route table on the master's mmds_listen. The host must redirect
+	// 169.254.169.254:80 -> mmds.listen.
 	if cfg.MMDS.Enabled && cfg.Proxy.Mode == config.ProxyInternal {
 		mln, err := net.Listen("tcp", cfg.MMDS.Listen)
 		if err != nil {
@@ -313,9 +313,9 @@ func buildDataPlane(cfg *config.Config, core *orch.Orchestrator, plugins *config
 			http.Error(w, "data plane disabled (proxy_mode=off)", http.StatusNotImplemented)
 		})
 	case config.ProxyExternal:
-		// Proxy workers register on the config-socket plugin plane (and stream the
-		// route table from there); the proxy forwarder forwards to the live registered set.
-		log.Info("external proxy mode: workers register on the config socket")
+		// The proxy master registers on the config-socket plugin plane and exposes
+		// one UDS for proxyForwarder fallback requests.
+		log.Info("external proxy mode: proxy master registers on the config socket")
 		return newProxyForwarder(plugins, mx, log)
 	default: // internal
 		return proxy.New(core, func() string { return cfg.Proxy.Auth }, log, mx)

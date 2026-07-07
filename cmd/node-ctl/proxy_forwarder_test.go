@@ -25,9 +25,9 @@ func (s connectStubRouter) Route(ctx context.Context, sid string, port int) (pro
 	return s.r, nil
 }
 
-// TestProxyForwarderConnectRelay drives a chained CONNECT end to end: client -> proxyForwarder ->
-// proxy worker (over its UDS) -> backend. It exercises the explicit chained
-// CONNECT path.
+// TestProxyForwarderConnectRelay drives a chained CONNECT end to end: client ->
+// proxyForwarder -> proxy UDS -> backend. It exercises the explicit chained
+// CONNECT path used by the external proxy fallback.
 func TestProxyForwarderConnectRelay(t *testing.T) {
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 
@@ -47,7 +47,7 @@ func TestProxyForwarderConnectRelay(t *testing.T) {
 		}
 	}()
 
-	// Proxy worker: serves CONNECT (to the backend) over its UDS (HTTP/1.1).
+	// Proxy endpoint: serves CONNECT (to the backend) over its UDS (HTTP/1.1).
 	workerSock := filepath.Join(t.TempDir(), "px.sock")
 	wln, err := net.Listen("unix", workerSock)
 	if err != nil {
@@ -60,7 +60,7 @@ func TestProxyForwarderConnectRelay(t *testing.T) {
 	go wsrv.Serve(wln)
 	defer wsrv.Close()
 
-	// Registry with the worker registered as a proxy forward target.
+	// Registry with the proxy endpoint registered as a forward target.
 	reg := configsock.NewRegistry()
 	reg.Add(&configsock.Plugin{ID: "px0", Caps: routesync.Register{Proxy: &routesync.Proxy{Socket: routesync.Socket{Path: workerSock}}}})
 

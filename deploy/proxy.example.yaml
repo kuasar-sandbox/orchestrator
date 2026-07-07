@@ -1,21 +1,21 @@
-# node-ctl proxy worker config — node-ctl proxy serve --config /etc/node-ctl/proxy.yaml --id <name>.
-# Used only in external data-plane mode (conductor.yaml proxy.mode: external). One file is
-# shared by all worker instances (node-proxy@1, @2, …); per-instance identity is on the
-# command line (node-proxy@.service passes --id %i):
-#   --id <name>            unique per worker (required)
-#   --socket <uds>         gateway-forward UDS; default <dir(config_socket)>/<id>.sock
-#   --metrics-listen <a>   optional Prometheus endpoint, per-instance (ports must differ)
-#   --mmds                 host the FC MMDS service on this instance (addr = mmds_listen)
+# node-ctl proxy master config — node-ctl proxy serve --config /etc/node-ctl/proxy.yaml.
+# Used only in external data-plane mode (conductor.yaml proxy.mode: external). A
+# single master registers on conductor's plugin plane, owns listener sockets, and
+# supervises worker processes that read a shared-memory route table.
 # See orchestrator/docs/node-proxy.md §2. Validate with
 # `node-ctl config proxy --config proxy.yaml`.
 
-# serve's control socket: the worker registers on its plugin plane and streams the
+# serve's control socket: the master registers on its plugin plane and streams the
 # route table from it (= serve paths.config_socket).
 config_socket: /run/sandbox/node-ctl.socket
 
-# Data-plane ingress. All workers bind this with SO_REUSEPORT (the kernel
-# load-balances connections). "" = serve only gateway-forwards over the per-worker UDS.
+# Data-plane ingress. The master binds once and passes the same listener fd to all
+# workers. "" = serve only proxy-forwards over proxy_socket.
 data_listen: ":443"
+proxy_socket: /run/sandbox/proxy.sock
+shm_path: /run/sandbox/proxy-routes.shm
+route_capacity: 65536
+workers: 2
 
 # Data-plane listener cert — the same wildcard cert serve presents (*.<domain>).
 # Omit for h2c (dev / when fronted by a TLS terminator).
@@ -29,4 +29,5 @@ tls:
 auth: enforce
 park_timeout: 30s
 
-# mmds_listen: 127.0.0.1:19254   # FC MMDS addr the --mmds worker binds (only when serve has mmds.enabled)
+# mmds_listen: 127.0.0.1:19254   # FC MMDS addr workers share when serve has mmds.enabled
+# metrics_listen: 127.0.0.1:9095 # master metrics endpoint (aggregates worker counters)

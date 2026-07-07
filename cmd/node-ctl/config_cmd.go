@@ -210,17 +210,19 @@ checkpoint:                                        # paused-state tiering
 
 // proxyConfigSkeleton is the commented authoring template for proxy.yaml
 // (deploy/proxy.example.yaml is the curated copy).
-const proxyConfigSkeleton = `# node-ctl proxy worker config — node-ctl proxy serve --config <this> --id <name>.
-# External data-plane mode (serve's proxy.mode: external). One file shared by all
-# worker instances; per-instance identity is on the command line:
-#   --id <name>            unique per worker (required)
-#   --socket <uds>         proxyForwarder UDS; default <dir(config_socket)>/<id>.sock
-#   --metrics-listen <a>   optional Prometheus endpoint, per-instance (ports must differ)
-#   --mmds                 host the FC MMDS service on this instance (addr = mmds_listen)
+const proxyConfigSkeleton = `# node-ctl proxy master config — node-ctl proxy serve --config <this>.
+# External data-plane mode (serve's proxy.mode: external). A single master registers
+# on conductor's plugin plane, owns listener sockets, and supervises workers that
+# read a shared-memory route table.
 config_socket: /run/sandbox/node-ctl.socket      # serve's control socket (= serve paths.config_socket)
-data_listen: ":443"                              # SO_REUSEPORT ingress (all workers share it); "" = UDS-only proxyForwarder
+data_listen: ":443"                              # master-bound ingress passed to workers; "" = UDS-only proxyForwarder
+proxy_socket: /run/sandbox/proxy.sock            # UDS registered for conductor proxyForwarder
+shm_path: /run/sandbox/proxy-routes.shm           # shared route table path
+route_capacity: 65536                            # fixed route slots
+workers: 2                                       # worker processes supervised by the master
 tls: { cert: /etc/node-ctl/tls/fullchain.pem, key: /etc/node-ctl/tls/privkey.pem }   # = serve's wildcard cert; omit = h2c
 auth: enforce                                    # bootstrap fallback until serve pushes policy: off | log | enforce
 park_timeout: 30s                                # bootstrap fallback
-# mmds_listen: 127.0.0.1:19254                    # FC MMDS addr the --mmds worker binds (only when serve has mmds.enabled)
+# mmds_listen: 127.0.0.1:19254                    # FC MMDS addr workers share when serve has mmds.enabled
+# metrics_listen: 127.0.0.1:9095                  # master metrics endpoint (aggregates worker counters)
 `

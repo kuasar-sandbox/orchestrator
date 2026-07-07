@@ -9,15 +9,15 @@
 //	orchestrator -> subscriber :  Hello(policy)  -> Upsert* -> Bookmark -> Upsert/Delete (live deltas)
 //
 // The orchestrator is the route authority and the connection responder: it no longer
-// dials anyone. The subscriber (internal/routetable on a proxy worker; or an observer)
-// is the dialer + lease holder — the connection IS the registration. Closing it
+// dials anyone. The subscriber (the proxy master, or an observer) is the dialer +
+// lease holder — the connection IS the registration. Closing it
 // deregisters; a second registration with the same id evicts (and closes) the first.
 //
 // The initial route set is streamed one Upsert per sandbox, then a Bookmark marks
 // "initial sync complete" — no materialized all-routes frame (bounded send-side
 // memory at high sandbox density). The subscriber applies the stream against a sync
 // generation and, on the Bookmark, drops entries it did not see this stream (which
-// recovers deletions that happened while it was disconnected — see internal/routetable).
+// recovers deletions that happened while it was disconnected.
 //
 // On a Wake the orchestrator resumes the sandbox (single-flight) and the resulting
 // Upsert flows back down, unparking the proxy's held request. The wire is
@@ -92,7 +92,8 @@ type RouteEntry struct {
 	// MIGRATION_TOKEN is minted on demand by export-sandbox, never broadcast here.
 	SnapshotLocation string `json:"snap_loc,omitempty"`
 	// MmdsSecret is the per-sandbox MMDS signing key (hex), derived deterministically
-	// from the manifest key + id (keys.MmdsSecret) so every proxy worker agrees on it.
+	// from the manifest key + id (keys.MmdsSecret) so every proxy worker reads the
+	// same key from the shared route view.
 	MmdsSecret string `json:"mmds_secret,omitempty"`
 	// Cluster node-link fields (node.md §10 / cluster.md): set when the route
 	// authority is a node reporting sandboxes to the registry; empty on the local

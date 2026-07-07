@@ -19,11 +19,10 @@ api:
 
 # Data-plane policy. mode selects how sandbox traffic (<port>-<sid>.<domain>) is served:
 #   internal (default) — in-process proxy (single binary, no extra moving parts).
-#   external           — offload to node-ctl proxy workers (deploy/proxy.example.yaml
-#                        + node-proxy@.service): the workers own the data-plane port
-#                        (SO_REUSEPORT) and read proxy.yaml; serve forwards by sandbox-id
-#                        hash over the live registered set. The data port lives in
-#                        proxy.yaml, NOT here.
+#   external           — offload to node-ctl proxy master (deploy/proxy.example.yaml
+#                        + node-proxy.service): the master owns the data-plane port,
+#                        registers one proxy_socket, and supervises workers. The data
+#                        port lives in proxy.yaml, NOT here.
 #   off                — reject data-plane traffic on this node.
 # auth: the proxy validates X-Access-Token (= envdAccessToken) — enforce (default)
 # rejects mismatches (401); log warns but forwards; off disables. park_timeout bounds
@@ -54,7 +53,7 @@ paths:
   # Local control socket — one UDS, four planes over h2c: task LaunchSpec fetch (task),
   # manifest-key allowlist (admin), proxy/agent registration + route stream (plugin),
   # and the e2b api plane (a plain-h2c twin of api.listen, incl. export/import). The
-  # manifest-key / export-sandbox / import-sandbox CLIs and external proxy workers are
+  # manifest-key / export-sandbox / import-sandbox CLIs and the external proxy master are
   # clients of this socket — they do not open the DB or read this config.
   config_socket: /run/sandbox/node-ctl.socket
   # db_path: /var/lib/sandbox/node-ctl.db     # default = <base_root>/node-ctl.db
@@ -144,7 +143,7 @@ checkpoint:
 #   enabled — envd runs in FC mode and is re-keyed to a fresh per-identity token at /init
 #     via a Firecracker MMDS v2 service hosted in the proxy component. The vswitch
 #     translates the metadata VIP to the listener (connector-ctl vswitch start --mgmt-service ...).
-#     Requires proxy.mode != off; external mode serves it on a worker started with --mmds.
+#     Requires proxy.mode != off; external mode serves it from proxy.yaml mmds_listen.
 # mmds:
 #   enabled: false
 #   listen: 127.0.0.1:19254

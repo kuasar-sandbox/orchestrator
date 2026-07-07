@@ -33,8 +33,8 @@ type WakeSource interface {
 	NextWake(ctx context.Context) (sid string, ok bool)
 }
 
-// Subscriber is the subscriber side of the route stream (a proxy worker's route
-// table, or a route observer). It dials the orchestrator's config-socket, registers
+// Subscriber is the subscriber side of the route stream (the proxy master's shared
+// route table, or a route observer). It dials the orchestrator's config-socket, registers
 // (PUT /internal/plugin/{id}/register) with its caps, and keeps its Sink in sync over
 // a persistent, auto-reconnecting bidi h2c stream — forwarding Wakes up for route_wake.
 type Subscriber struct {

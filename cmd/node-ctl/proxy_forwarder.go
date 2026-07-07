@@ -10,12 +10,10 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/proxy"
 )
 
-// proxyForwarder is the external-mode fallback: when a data-plane request lands on the
-// orchestrator's own listener (rather than directly on a proxy worker's
-// data_listen), it is forwarded to one of the registered proxy workers over
-// its UDS. The proxy then serves it from its synced route table exactly like a
-// direct request. Workers are picked by sandbox-id hash over the live registered
-// set (from the plugin registry) for affinity, but each request uses a fresh
+// proxyForwarder is the external-mode fallback: when a data-plane request lands on
+// the conductor's own listener (rather than directly on the proxy data listener),
+// it is forwarded to a registered proxy UDS. The proxy then serves it from the
+// shared route view exactly like a direct request. Each request uses a fresh
 // CONNECT tunnel and never reuses a worker connection.
 type proxyForwarder struct {
 	reg *configsock.Registry
@@ -35,8 +33,8 @@ func (pf *proxyForwarder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	targets := pf.reg.ProxyTargets()
 	if len(targets) == 0 {
-		pf.mx.Inc(`proxy_forwarder_total{result="no_worker"}`)
-		http.Error(w, "no proxy workers registered", http.StatusBadGateway)
+		pf.mx.Inc(`proxy_forwarder_total{result="no_proxy"}`)
+		http.Error(w, "no proxy registered", http.StatusBadGateway)
 		return
 	}
 	h := fnv.New32a()
@@ -45,7 +43,7 @@ func (pf *proxyForwarder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	pf.forward(w, r, sock, sid, port)
 }
 
-// forward sends a CONNECT to a proxy worker over its UDS as a chained
+// forward sends a CONNECT to a proxy UDS as a chained
 // CONNECT: dial the worker, issue a CONNECT carrying the sandbox identity + access
 // token, and on 200 splice the client to the worker (which tunnels onward to the
 // sandbox). Ordinary HTTP is then written through the same one-shot tunnel.
@@ -53,7 +51,7 @@ func (pf *proxyForwarder) forward(w http.ResponseWriter, r *http.Request, sock, 
 	backend, br, resp, err := proxy.DialSandboxConnect(r.Context(), "unix", sock, sid, port, r.Header.Get(proxy.HeaderAccessToken))
 	if err != nil {
 		pf.mx.Inc(`proxy_forwarder_total{result="error"}`)
-		http.Error(w, "proxy worker unreachable", http.StatusBadGateway)
+		http.Error(w, "proxy unreachable", http.StatusBadGateway)
 		return
 	}
 	if resp.StatusCode != http.StatusOK {
@@ -71,7 +69,7 @@ func (pf *proxyForwarder) forward(w http.ResponseWriter, r *http.Request, sock, 
 	innerResp, err := proxy.ForwardHTTPOnce(r, backend, br, nil)
 	if err != nil {
 		pf.mx.Inc(`proxy_forwarder_total{result="error"}`)
-		http.Error(w, "proxy worker unreachable", http.StatusBadGateway)
+		http.Error(w, "proxy unreachable", http.StatusBadGateway)
 		return
 	}
 	defer innerResp.Body.Close()

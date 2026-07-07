@@ -82,8 +82,8 @@ node-ctl 补这一层,并刻意选择 **e2b 协议兼容**而非自定义 API:e2
 - 节点本地:路由、存储、单元管理都是节点本地的;跨机协作经远程 manifest store 携带
   快照/模板(§8.1)与 cluster-ctl 的 node-link 编排(§10)。
 - 依赖:stdlib + `modernc.org/sqlite`(纯 Go)+ `golang.org/x/net/http2`(h2c,
-  config-socket 与 node-link 共用)+ `golang.org/x/sys`(pidfile 锁 / SO_REUSEPORT /
-  SO_PEERCRED)+ `coreos/go-systemd`(D-Bus)+ `google/uuid`(v7)+ `gopkg.in/yaml.v3`。
+  config-socket 与 node-link 共用)+ `golang.org/x/sys`(pidfile 锁 / SO_PEERCRED /
+  mmap)+ `coreos/go-systemd`(D-Bus)+ `google/uuid`(v7)+ `gopkg.in/yaml.v3`。
   无 gRPC/protobuf。
 
 ### 1.5 架构与数据通路
@@ -193,17 +193,17 @@ node-ctl conductor serve [--config /etc/node-ctl/conductor.yaml]
 
 ### 2.3 `node-ctl proxy`
 
-外置数据面 worker(`proxy.mode=external`);运维带外起、与 serve 同节点。配置文件驱动
-(`proxy.yaml`,自带 schema,见 [node-proxy.md](node-proxy.md) §2),命令行只剩每实例身份:
+外置数据面 master(`proxy.mode=external`);运维带外起、与 serve 同节点。配置文件驱动
+(`proxy.yaml`,自带 schema,见 [node-proxy.md](node-proxy.md) §2),worker 由 master
+内部 reexec 和监督:
 
 ```
-node-ctl proxy serve --config /etc/node-ctl/proxy.yaml --id <name>
-               [--socket <uds>] [--metrics-listen <addr>] [--mmds]
+node-ctl proxy serve --config /etc/node-ctl/proxy.yaml
 ```
 
-策略与端点(`config_socket`/`data_listen`/`tls`/`auth`/`park_timeout`/`mmds_listen`)在
-`proxy.yaml`;`--id` 必填,`--socket` 缺省 `<dir(config_socket)>/<id>.sock`,`--metrics-listen`
-每实例(端口须异),`--mmds` 让本实例起 MMDS(地址取 `mmds_listen`)。部署模式与拓扑见
+策略与端点(`config_socket`/`data_listen`/`proxy_socket`/`shm_path`/`workers`/`tls`/
+`auth`/`park_timeout`/`mmds_listen`)在 `proxy.yaml`;master 在 plugin 平面注册一次,
+维护共享路由视图并把 listener fd 传给 worker。部署模式与拓扑见
 node-proxy.md §2、§5——转发层自成一文,本仓控制面只在 §9 讲如何按 `proxy.mode` 装配它。
 
 ### 2.4 `node-ctl run-sandbox` / `run-builder`
@@ -317,7 +317,7 @@ node-ctl 同目录 → PATH"自动发现。
 | `proxy.data_listen` | 空 | internal 模式专用数据面监听;空 = 与 `api.listen` 共口。external 模式数据口在 worker 的 `proxy.yaml`(serve 不绑) |
 | `proxy.park_timeout` | `30s` | 数据面请求挂起预算:等路由同步 / paused 沙箱 resume 的上限(node-proxy.md §5) |
 | `proxy.auth` | `enforce` | 数据面鉴权:`off`/`log`/`enforce`,校验 `X-Access-Token`(node-proxy.md §7) |
-| `proxy.metrics_listen` | 空(关) | Prometheus 文本端点(`data_requests_total{result=…}`、`proxy_forwarder_total` 等) |
+| `proxy.metrics_listen` | 空(关) | conductor 进程 Prometheus 文本端点:internal 模式含 `data_requests_total`,external 模式主要含 `proxy_forwarder_total`;external worker 数据面指标在 proxy.yaml `metrics_listen` |
 | `encryption_key` | (必填) | manifest_key 落盘加密的 AES-256 密钥:`:` 分隔多个 64-hex,首个为活动密钥,其余备用解旧记录(轮换);`NODE_CONFIG_ENCRYPTION_KEY` env 优先 |
 | `manifest_config` | `/opt/sandbox/manifest.yaml` | 共享远程 manifest store 配置(`manifest.key` 留空,租户 key 经 env 按任务下发) |
 | `paths.run_root` | `/run/sandbox` | tmpfs 运行态:`<sid>/` 运行目录、UDS、pidfile |
@@ -619,13 +619,13 @@ serve 在 UDS `paths.config_socket`(默认 `/run/sandbox/node-ctl.socket`,**0600
 租约项;未续租 key 按 TTL 淘汰,`key_drop` 只作为 best-effort 清理命令(§10)。
 
 **③ plugin 平面** — `PUT /internal/plugin/{id}/register`:一个订阅者(external proxy
-worker,或路由观察者如平台 agent)注册其能力并**持挂该 h2c 连接**——连接本身即它的
+master,或路由观察者如平台 agent)注册其能力并**持挂该 h2c 连接**——连接本身即它的
 租约 + 路由流(routesync,线格式见 node-proxy.md §6)。请求体首帧是 `register{caps}`,之后(route_wake)是
 `wake` 上行;响应体下行 `hello(policy) → upsert* → bookmark → upsert/delete`。能力相互
 **独立、不强制组合**:`subscribe`(`route` | `route_wake`)、`proxy{socket{path}}`
 (声明 serve proxyForwarder 转发数据面请求的目标 UDS)、`mmds`。**断连即反注册**;同
 id 二次注册自动反注册(并断链)前者。鉴权:配 `paths.plugin_pidfile` 则 peer pid 须在
-其中,未配则仅靠 socket 0600(同 admin)。external proxy worker、平台 agent 均经此订阅。
+其中,未配则仅靠 socket 0600(同 admin)。external proxy master、平台 agent 均经此订阅。
 此平面是**节点本地** UDS,与接入集群的 node-link(§10,跨网 mTLS)正交。
 
 **④ api 平面** — 其余路径回落到 e2b 控制面 handler(与 TLS `api.listen` **同一个**
@@ -763,22 +763,22 @@ serve 启动末段按 `proxy.mode`(§3)装配数据面;控制面 `api.<domain>` 
 | 模式 | 数据面承载 | 进程 |
 |---|---|---|
 | **internal**(默认) | serve 进程内 proxy(与控制面同一 `http.Handler`,按 Host 分流) | 单二进制 |
-| **external** | 独立 `node-ctl proxy` worker(≥1)经 plugin 平面注册、SO_REUSEPORT 共享数据口 | serve + N×proxy |
+| **external** | 独立 `node-ctl proxy` master 注册一次,内部 worker 共享继承 listener fd 与 shm 路由视图 | serve + proxy master + N×worker |
 | **off** | 拒绝(501) | – |
 
 internal 直接在进程内挂转发层;external 下 serve 不绑数据口,改为在 plugin 平面(§6)
-接受 worker 注册并向其广播路由(§9.2),数据面字节流不经 serve。两模式共用同一转发判定
-函数;部署拓扑、SO_REUSEPORT 与确定性 MMDS 密钥(多 worker 对等)等细节见 node-proxy.md §5,
+接受 proxy master 注册并向其广播路由(§9.2),数据面字节流不经 serve。两模式共用同一转发判定
+函数;部署拓扑、共享内存路由视图与确定性 MMDS 密钥(多 worker 对等)等细节见 node-proxy.md §5,
 转发判定与即时刷流见 node-proxy.md §4。集群下,cluster-ctl router 把数据面转发进本节点的
-数据端点(internal 的 `api.listen`/`data_listen` 或 external worker 的数据口),节点侧
+数据端点(internal 的 `api.listen`/`data_listen` 或 external proxy master 的数据口),节点侧
 按 `E2b-Sandbox-Id` 寻址照常处理(cluster-router.md),无须区分来源。
 
 ### 9.2 路由权威与广播
 
 serve 是**本节点**路由与生命周期的权威:create/resume/pause/kill 实时更新路由,经
-**routesync** 广播 Upsert/Delete 给所有 plugin 平面订阅者(external proxy worker 与路由
-观察者如平台 agent)。订阅者持只读缓存独立服务数据面 / 感知状态,不回调控制面;广播逐条
-upsert + 末尾 bookmark(高密度下发端内存有界)。线格式(帧化 JSON over h2c)、容错重同步、
+**routesync** 广播 Upsert/Delete 给所有 plugin 平面订阅者(external proxy master 与路由
+观察者如平台 agent)。proxy master 把路由投影到共享内存,worker 只读;观察者持只读缓存
+感知状态。广播逐条 upsert + 末尾 bookmark(高密度下发端内存有界)。线格式(帧化 JSON over h2c)、容错重同步、
 `RouteEntry` 字段(含驱动迁移的 `snap_loc`、扇出用的 `mmds_secret`)见 node-proxy.md §6;
 plugin 平面的注册与鉴权见 §6。机群级路由权威是 registry(cluster.md);serve 经 node-link
 把本节点沙箱事件上报 registry(§10),与本节点 plugin 平面的路由广播是两条正交通道。
@@ -793,10 +793,9 @@ plugin 平面的注册与鉴权见 §6。机群级路由权威是 registry(clust
 
 ### 9.3 proxyForwarder
 
-数据面请求误达 serve 控制面监听口时(external 模式下客户端未分流到数据口),serve 按
-sid 的 FNV 哈希在**活跃注册的 worker 集**上挑一个,经其 `--socket` UDS 建立一次性
-chained CONNECT,由 worker 照常处理(含鉴权)。普通 HTTP 在该隧道内发送一条请求,
-CONNECT 则直接 splice 客户端与 worker;无 worker 注册时回 502。链式隧道与转发细节见
+数据面请求误达 serve 控制面监听口时(external 模式下客户端未分流到数据口),serve 经
+已注册的 `proxy_socket` UDS 建立一次性 chained CONNECT,由 proxy worker 照常处理(含鉴权)。
+普通 HTTP 在该隧道内发送一条请求,CONNECT 则直接 splice 客户端与 worker;无 proxy 注册时回 502。链式隧道与转发细节见
 node-proxy.md §9。
 
 ## 10. 集群接入(node-link)
@@ -1089,7 +1088,7 @@ external worker 的 `data_listen`,proxy.yaml),证书同一张。dev:`E2B_API_URL
 | `mkfs.erofs`(deps) | guest-runtime `make sandbox-runtime` 与 guest 内 `flatten-ctl` 后端 | 确定性打包 runtime;构建沙箱内导出 EROFS 镜像(§11、§12) |
 | guest envd | UDS(sandbox-ctl `--connect` 映射);构建流水线另以最小 connect+JSON 客户端调 `process.Start`(steps/startCmd/readyCmd,§12) | 原版不改;协议 pin 见 §4.3/§4.5 |
 | systemd | D-Bus:StartUnit/StopUnit/ResetFailed/ListUnitsByPatterns/Reload | 进程管理 + 单元自装(§5) |
-| `node-ctl proxy`(external) | UDS routesync(双向 h2c 帧化 JSON)+ 兜底反代 | 同节点、运维带外起;数据口 SO_REUSEPORT 共享(node-proxy.md §5) |
+| `node-ctl proxy`(external) | UDS routesync(双向 h2c 帧化 JSON)+ 兜底反代 | 同节点、运维带外起;proxy master 注册一次,worker 共享继承 listener fd + shm 路由视图(node-proxy.md §5) |
 
 不新增导出包;`CGO_ENABLED=0`;依赖层级 = 叶子。
 
@@ -1130,17 +1129,18 @@ serve 重启后以 `ListUnitsByPatterns("sandbox-runner@*.service")` 为存活�
 
 | 故障 | 影响 | 自愈 |
 |---|---|---|
-| serve 崩溃/重启 | 控制面与 internal 数据面中断;沙箱(microVM/单元)不受影响 | systemd 重启 → 重启对账收养;external worker 凭本地路由表继续转发 running 流量(Wake 无人应答,paused 唤醒挂起至超时);集群下 node-link 重连重报 |
-| proxy worker 崩溃(external) | 该 worker 上的连接断;SO_REUSEPORT 下其余 worker 继续接新连接 | systemd 重启 → worker 重新注册重新同步,无状态恢复 |
+| serve 崩溃/重启 | 控制面与 internal 数据面中断;沙箱(microVM/单元)不受影响 | systemd 重启 → 重启对账收养;external proxy master 仍可用共享路由视图服务 running 流量(Wake 无人应答,paused 唤醒挂起至超时);集群下 node-link 重连重报 |
+| proxy worker 崩溃(external) | 该 worker 上的连接断;其余 worker 继续接新连接 | proxy master 重启该 worker;worker 重新读取共享路由视图 |
+| proxy master 崩溃(external) | external 数据面中断,plugin 租约断开 | systemd 重启 master → 重新注册、重建共享表、启动 worker |
 | runner 单元/CH 崩溃 | 该沙箱死(`Restart=no`,有状态不重试) | 对账标 dead;客户重新 create(或从 paused 快照 resume) |
-| routesync 断流 | worker 路由表停更 | 订阅者指数退避重连重注册,重连即重新同步(逐条 upsert + bookmark,node-proxy.md §6) |
+| routesync 断流 | external 共享路由视图停更 | proxy master 指数退避重连重注册,重连即重新同步(逐条 upsert + bookmark,node-proxy.md §6) |
 | node-link 断流(集群) | registry 暂失本节点视图 | 节点指数退避重连重注册重报沙箱集(§10、cluster.md);本节点沙箱不受影响 |
 | sqlite 损坏 | 控制面不可用 | 文件级备份/重建;沙箱单元仍可被 ListUnits 发现并由运维处置 |
 
 ## 16. 测试
 
 单元测试:`make test`(handler 路由、apikey/secretbox/regcreds、routesync(注册/bookmark
-往返)/routetable(世代清扫)、plugin 注册表(同 id 顶替/分片)、proxy CONNECT 隧道 +
+往返)/proxyshm(共享路由表、park/wake、世代清扫)、plugin 注册表(同 id 顶替)、proxy CONNECT 隧道 +
 proxyForwarder 链式 relay、mmds(确定性密钥)、单飞、沙箱配置注入(命名空间解析/容量折叠/网络合并)、
 migrate、node-link(注册/事件/命令往返)等)。跨仓 e2e 集中在 umbrella
 `orchestrator/release-builder/test/e2e/`(需多仓产物:vmlinux/cloud-hypervisor/mkfs.erofs/
@@ -1153,7 +1153,7 @@ sandbox-runtime.erofs 等),均已注册为 umbrella make 目标,缺前置则自�
 | `e2e_runtask.sh` | run-sandbox/run-builder 启动器(纯用户态,无 root/systemd/KVM):pidfile 锁/双起拒绝、HTTP 取 LaunchSpec、execve、`TASK_*` 剥除;`config` CLI 往返 | `test-e2e-runtask` |
 | `e2e_run_builder.sh` | 三阶段构建流水线(KVM + vswitch + store-ctl + zot,guest 经 mgmt VIP 拉取):fromImage → e2b-img;fromTemplate(img)+steps+startCmd → e2b-snp(manifest:// base、配置合并、snapshot.cfg metadata 断言);fromTemplate(snp)+steps → e2b-snp(start/ready 继承);再从产物模板 create/list/kill;COPY 与 files 端点 501 | `test-e2e-run-builder` |
 | `e2e_execute.sh` | 从已建模板冷启真实 microVM、guest 内 exec、pause(snapshot)→ resume 全链路;create 经 `X-Kuasar-Sandbox-Network` 注入 hostname 并在 guest 校验(§4.6) | `test-e2e-execute` |
-| `e2e_node_proxy.sh` | `proxy.mode=external` 全链路:serve + 独立 worker(plugin 平面注册 + SO_REUSEPORT)+ 真实 microVM/envd,数据面经 proxy 走(401/转发/wake/resume/CONNECT 隧道/proxyForwarder relay/metrics) | `test-e2e-node-proxy` |
+| `e2e_node_proxy.sh` | `proxy.mode=external` 全链路:serve + proxy master + 多 worker(shm 路由视图 + 继承 listener fd)+ 真实 microVM/envd,数据面经 proxy 走(401/转发/wake/resume/CONNECT 隧道/proxyForwarder relay) | `test-e2e-node-proxy` |
 | `orchestrator/test/e2e/e2e_cluster_stub.sh` | 用 `make build` 产物真实启动 `cluster-ctl registry/router/placer` + `node-stub-ctl`,覆盖 group 导入、key 分发、Reserve→READY→数据面转发、活动路由缓存、build_register、孤儿 route 清理、节点清空和 registry joint/old_grace cutover | `orchestrator: make test-e2e` |
 
 本仓 `make test-e2e` 运行集群 stub e2e,不依赖 KVM/root/systemd。真实 microVM 端到端路径由

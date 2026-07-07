@@ -6,8 +6,9 @@
 //
 // The same Proxy serves both deployment modes — only the Router differs:
 //   - internal: the orchestrator itself resolves the route (single-flight resume);
-//   - external: the proxy worker resolves it from its synced route table (parking
-//     a request and prompting a Wake until the orchestrator resumes the sandbox).
+//   - external: a proxy worker resolves it from the shared route view written by
+//     the proxy master (parking a request and prompting a Wake until the
+//     orchestrator resumes the sandbox).
 package proxy
 
 import (
@@ -20,7 +21,6 @@ import (
 	"strings"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
-	"github.com/kuasar-sandbox/orchestrator/internal/metrics"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
@@ -62,6 +62,15 @@ type Router interface {
 	Route(ctx context.Context, sandboxID string, port int) (Route, error)
 }
 
+// Counter is the narrow metrics surface the proxy needs.
+type Counter interface {
+	Inc(name string)
+}
+
+type noopCounter struct{}
+
+func (noopCounter) Inc(string) {}
+
 // RouteForTarget builds the forwarding decision for a resolved, running sandbox
 // from its targets + the requested port. Shared by the internal router (orch) and
 // the external route table so both classify ports identically.
@@ -84,14 +93,17 @@ type Proxy struct {
 	router   Router
 	authMode func() string // config.Auth* (off|log|enforce), read per-request so a
 	log      *slog.Logger  // pushed routesync policy can change it centrally
-	mx       *metrics.M
+	mx       Counter
 }
 
 // New builds a proxy over router. authMode is read per request and returns one of
 // config.AuthOff/Log/Enforce (nil => enforce). mx may be nil (metrics off).
-func New(router Router, authMode func() string, log *slog.Logger, mx *metrics.M) *Proxy {
+func New(router Router, authMode func() string, log *slog.Logger, mx Counter) *Proxy {
 	if authMode == nil {
 		authMode = func() string { return config.AuthEnforce }
+	}
+	if mx == nil {
+		mx = noopCounter{}
 	}
 	return &Proxy{router: router, authMode: authMode, log: log, mx: mx}
 }

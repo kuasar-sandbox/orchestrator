@@ -1,0 +1,19 @@
+# node-proxy.service — external data-plane proxy master (conductor.yaml proxy.mode=external).
+#
+# Run one master per node. The master registers once on conductor's config-socket
+# plugin plane, owns data/proxy/MMDS listener sockets, and supervises worker
+# processes. Worker count and shared-memory route table sizing live in
+# /etc/node-ctl/proxy.yaml.
+[Unit]
+Description=kuasar node-ctl data-plane proxy
+After=network-online.target node-ctl.service
+Wants=network-online.target
+
+[Service]
+Type=exec
+ExecStart=/usr/bin/node-ctl proxy serve --config=/etc/node-ctl/proxy.yaml
+Restart=always
+RestartSec=1
+
+[Install]
+WantedBy=multi-user.target
