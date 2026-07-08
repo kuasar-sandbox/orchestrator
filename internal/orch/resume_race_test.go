@@ -39,7 +39,7 @@ func (stubVS) Attach(context.Context, vswitch.AttachReq) (*vswitch.Port, error) 
 	return &vswitch.Port{Port: "1", FloatingIP: "169.254.1.2", MAC: "02:00:00:00:00:01", InnerIP: "169.254.1.1"}, nil
 }
 func (stubVS) Detach(context.Context, string) error { return nil }
-func (stubVS) TapFDExec(port string) []string       { return []string{"true", port} }
+func (stubVS) TapFD(port string) vswitch.TapFD      { return vswitch.TapFD{Exec: []string{"true", port}} }
 
 // TestResumeRace_ConnectAndRouteSingleLaunch is the regression guard for the
 // control-plane resume race: a paused sandbox hit concurrently by /connect

@@ -107,6 +107,28 @@ func TestBuildInjectsNetworkMetadata(t *testing.T) {
 	}
 }
 
+func TestBuildRendersTapFDSocket(t *testing.T) {
+	p := baseParams(types.ProfileE2B)
+	p.TapFD = TapFD{
+		Socket:  "/run/kuasar/connector/sw0/tapfd.sock",
+		Request: "VSWITCH=sw0 PORT=7",
+	}
+	b, err := p.BuildYAML()
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := string(b)
+	for _, want := range []string{
+		"tapfd:",
+		"socket: /run/kuasar/connector/sw0/tapfd.sock",
+		"request: VSWITCH=sw0 PORT=7",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("rendered yaml missing %q:\n%s", want, out)
+		}
+	}
+}
+
 func TestSetCapacityRoundTrip(t *testing.T) {
 	// cpu/memory fold into a well-formed resource namespace ParseSpec reads back.
 	meta := SetCapacity(nil, 4, 8192)

@@ -85,6 +85,7 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 WORK="$(mktemp -d /tmp/e2e-builder-XXXXXX)"
+TAPFD_SOCKET="$WORK/tapfd.sock"
 # Units must live in a real systemd load path; we only remove what we created.
 UNIT_DIR="/run/systemd/system"
 UNIT_NAMES=(sandbox-runner@.service sandbox-builder@.service sandbox-runner.slice sandbox-builder.slice)
@@ -159,11 +160,21 @@ ip netns del "$SW_NETNS" 2>/dev/null || true
 ip netns add "$SW_NETNS"
 # --mgmt-extract puts $MGMT_VIP on host NIC $SW_MGMT and routes guest 0/0 to it;
 # that is the only path the builds need (zot on the host). No NAT required.
-"$BIN/connector-ctl" vswitch start "$SWITCH" --netns="$SW_NETNS" --ports=16 --mac-addr=02:00:00:00:01:01 \
+"$BIN/connector-ctl" vswitch serve "$SWITCH" --netns="$SW_NETNS" --ports=16 --mac-addr=02:00:00:00:01:01 \
     --floating-ip-base=100.100.112.0 --mode=tap \
-    --mgmt-extract=:$SW_MGMT:$MGMT_VIP,0.0.0.0/0 >"$WORK/vswitch.log" 2>&1 \
-    || { cat "$WORK/vswitch.log"; fail "vswitch start"; }
-echo "==> vswitch up ($SWITCH; mgmt $SW_MGMT=$MGMT_VIP)"
+    --mgmt-extract=:$SW_MGMT:$MGMT_VIP,0.0.0.0/0 \
+    --tapfd-listen="$TAPFD_SOCKET" --watch-interval=2s >"$WORK/vswitch.log" 2>&1 &
+PIDS+=($!)
+for _ in $(seq 1 100); do
+    if [ -S "$TAPFD_SOCKET" ] && "$BIN/connector-ctl" vswitch status "$SWITCH" --ready >/dev/null 2>&1; then
+        break
+    fi
+    kill -0 "${PIDS[-1]}" 2>/dev/null || { cat "$WORK/vswitch.log"; fail "vswitch serve exited"; }
+    sleep 0.2
+done
+"$BIN/connector-ctl" vswitch status "$SWITCH" --ready >/dev/null 2>&1 \
+    || { cat "$WORK/vswitch.log"; fail "vswitch not ready"; }
+echo "==> vswitch up ($SWITCH; mgmt $SW_MGMT=$MGMT_VIP; tapfd_socket=$TAPFD_SOCKET)"
 
 # ---- manifest config + diff templates ---------------------------------------
 KEYLESS_CACHE=""   # no cache-ctl: empty endpoint falls back to store-as-cache
@@ -232,7 +243,9 @@ manifest_config: $WORK/manifest.yaml
 paths: { run_root: $WORK/run, base_root: $WORK/lib, config_socket: $WORK/node-ctl.socket }
 units: { dir: $UNIT_DIR }
 sandbox:
-  network: { switch: $SWITCH }
+  network:
+    switch: $SWITCH
+    tapfd_socket: $TAPFD_SOCKET
   boot:
     kernel: $BIN/vmlinux
     runtime: $BIN/sandbox-runtime.erofs

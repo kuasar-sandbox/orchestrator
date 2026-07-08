@@ -59,6 +59,23 @@ type ResourceSpec struct {
 	Allocatable *rtconfig.AllocatableConfig `json:"allocatable,omitempty" yaml:"allocatable,omitempty"`
 }
 
+// TapFD is the node-managed tapfd transport rendered into runtime config.
+type TapFD struct {
+	Exec    []string
+	Socket  string
+	Request string
+	Timeout string
+}
+
+func (t TapFD) runtime() rtconfig.TapFDConfig {
+	return rtconfig.TapFDConfig{
+		Exec:    append([]string(nil), t.Exec...),
+		Socket:  t.Socket,
+		Request: t.Request,
+		Timeout: t.Timeout,
+	}
+}
+
 // SandboxSpec is the tenant-controllable config subset, parsed from the
 // kuasar-sandbox.<ns> metadata keys. It excludes node-managed fields (boot,
 // resources.control, network.tapfd) — those are the orchestrator's.
@@ -197,7 +214,7 @@ type Params struct {
 	Runtime          string // erofs path (file path, no scheme)
 	Kernel           string // vmlinux path
 	OverlayDiffTpl   string // pre-formatted ext4 seeding the cold-boot overlay upper (file path)
-	TapFDExec        []string
+	TapFD            TapFD
 	EnvVars          map[string]string // create-time launch env
 	VCPU             int               // resources.capacity.cpu (already resolved: snapshot-pinned for restore)
 	Memory           string            // resources.capacity.memory
@@ -270,7 +287,8 @@ func (p Params) build() (*rtconfig.SandboxConfig, error) {
 	}
 
 	// --- network (guest side) ---
-	c.Network.TapFD = &rtconfig.TapFDConfig{Exec: p.TapFDExec}
+	tapFD := p.TapFD.runtime()
+	c.Network.TapFD = &tapFD
 	if p.Sandbox.PortMAC != "" {
 		c.Network.MAC = p.Sandbox.PortMAC
 	}

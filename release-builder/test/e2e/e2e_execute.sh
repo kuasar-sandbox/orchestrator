@@ -63,6 +63,7 @@ if [ "$(id -u)" -ne 0 ]; then exec sudo -nE "$0" "$@"; fi
 if ! command -v mkfs.erofs >/dev/null 2>&1; then export PATH="$BIN:$PATH"; fi
 
 WORK="$(mktemp -d /tmp/e2e-exec-XXXXXX)"
+TAPFD_SOCKET="$WORK/tapfd.sock"
 UNIT_DIR="/run/systemd/system"
 UNIT_NAMES=(sandbox-runner@.service sandbox-builder@.service sandbox-runner.slice sandbox-builder.slice)
 declare -a OURS=()
@@ -210,18 +211,29 @@ ip netns del "$SW_NETNS" 2>/dev/null || true
 ip netns del "$SWITCH" 2>/dev/null || true
 ip netns add "$SW_NETNS" 2>/dev/null || true
 echo "==> starting vswitch $SWITCH (netns=$SW_NETNS)"
-"$BIN/connector-ctl" vswitch start "$SWITCH" \
+"$BIN/connector-ctl" vswitch serve "$SWITCH" \
     --netns="$SW_NETNS" \
     --ports=64 \
     --mac-addr=02:00:00:00:00:01 \
     --floating-ip-base=100.100.96.0 \
     --mode=tap \
     --mgmt-extract=:${SWITCH}m0:$MGMT_VIP,0.0.0.0/0 \
-    --mgmt-service=$MGMT_VIP:80:$PROXY_NS_IP:$MMDS_PORT >"$WORK/vswitch-start.log" 2>&1 || { echo "vswitch start failed:"; sed 's/^/  /' "$WORK/vswitch-start.log"; fail "vswitch start"; }
+    --mgmt-service=$MGMT_VIP:80:$PROXY_NS_IP:$MMDS_PORT \
+    --tapfd-listen="$TAPFD_SOCKET" --watch-interval=2s >"$WORK/vswitch-start.log" 2>&1 &
+PIDS+=($!)
+for _ in $(seq 1 100); do
+    if [ -S "$TAPFD_SOCKET" ] && "$BIN/connector-ctl" vswitch status "$SWITCH" --ready >/dev/null 2>&1; then
+        break
+    fi
+    kill -0 "${PIDS[-1]}" 2>/dev/null || { echo "vswitch serve failed:"; sed 's/^/  /' "$WORK/vswitch-start.log"; fail "vswitch serve exited"; }
+    sleep 0.2
+done
+"$BIN/connector-ctl" vswitch status "$SWITCH" --ready >/dev/null 2>&1 \
+    || { echo "vswitch not ready:"; sed 's/^/  /' "$WORK/vswitch-start.log"; fail "vswitch not ready"; }
 SW_STARTED=1
 allow_proxy_forwarding
 GUEST_REF="$MGMT_VIP:$ZOT_PORT/e2e/app:v1"
-echo "==> vswitch up (build sandboxes pull $GUEST_REF; internal proxy_netns=$PROXY_NETNS reaches $FIP_CIDR)"
+echo "==> vswitch up (build sandboxes pull $GUEST_REF; tapfd_socket=$TAPFD_SOCKET; internal proxy_netns=$PROXY_NETNS reaches $FIP_CIDR)"
 
 cat > "$WORK/manifest.yaml" <<EOF
 manifest: { key: "" }
@@ -255,7 +267,9 @@ paths: { run_root: $WORK/run, base_root: $WORK/lib, config_socket: $WORK/node-ct
 units: { dir: $UNIT_DIR }
 sandbox:
   timeout_sec: 120
-  network: { switch: $SWITCH }
+  network:
+    switch: $SWITCH
+    tapfd_socket: $TAPFD_SOCKET
   boot: { kernel: $BIN/vmlinux, runtime: $BIN/sandbox-runtime.erofs, overlay_diff_template: $OVL }
 builder:
   insecure_registry: true

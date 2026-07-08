@@ -34,12 +34,33 @@ type Port struct {
 	InnerIP    string // echoes the inner ip we requested
 }
 
-type CLI struct {
-	bin string
-	sw  string
+// TapFD describes how sandbox-ctl should acquire this port's tap queue fd.
+type TapFD struct {
+	Exec    []string
+	Socket  string
+	Request string
+	Timeout string
 }
 
-func New(bin, sw string) *CLI { return &CLI{bin: bin, sw: sw} }
+type CLI struct {
+	bin         string
+	sw          string
+	tapFDSocket string
+}
+
+type Option func(*CLI)
+
+func WithTapFDSocket(path string) Option {
+	return func(c *CLI) { c.tapFDSocket = path }
+}
+
+func New(bin, sw string, opts ...Option) *CLI {
+	c := &CLI{bin: bin, sw: sw}
+	for _, opt := range opts {
+		opt(c)
+	}
+	return c
+}
 
 // AttachReq is a per-sandbox attach: the guest inner IP (plain, not CIDR) plus
 // optional GENEVE transit parameters (tenant-network overlay) when overridden via
@@ -85,6 +106,17 @@ func (c *CLI) Attach(ctx context.Context, req AttachReq) (*Port, error) {
 // TAPFD_SOCKET set and receives this port's vnet_hdr tap queue fd via SCM_RIGHTS.
 func (c *CLI) TapFDExec(port string) []string {
 	return []string{c.bin, "vswitch", "open-port", c.sw, "--port=" + port}
+}
+
+// TapFD returns the configured tapfd transport for a port.
+func (c *CLI) TapFD(port string) TapFD {
+	if c.tapFDSocket != "" {
+		return TapFD{
+			Socket:  c.tapFDSocket,
+			Request: fmt.Sprintf("VSWITCH=%s PORT=%s", c.sw, port),
+		}
+	}
+	return TapFD{Exec: c.TapFDExec(port)}
 }
 
 // Detach releases the port.

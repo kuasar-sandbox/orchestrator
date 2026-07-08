@@ -40,7 +40,7 @@ import (
 type vsClient interface {
 	Attach(ctx context.Context, req vswitch.AttachReq) (*vswitch.Port, error)
 	Detach(ctx context.Context, port string) error
-	TapFDExec(port string) []string
+	TapFD(port string) vswitch.TapFD
 }
 
 type Orchestrator struct {
@@ -529,11 +529,20 @@ func (o *Orchestrator) sandboxParams(sb *types.Sandbox, tmpl types.TemplateID, s
 		Runtime:        o.cfg.Sandbox.Boot.Runtime,
 		Kernel:         o.cfg.Sandbox.Boot.Kernel,
 		OverlayDiffTpl: o.cfg.Sandbox.Boot.OverlayDiffTemplate,
-		TapFDExec:      o.vs.TapFDExec(sb.VswitchPort), EnvVars: sb.Env,
+		TapFD:          sandboxTapFD(o.vs.TapFD(sb.VswitchPort)), EnvVars: sb.Env,
 		VCPU: o.cfg.Sandbox.Resources.VCPU, Memory: o.cfg.Sandbox.Resources.Memory, ControllerSocket: o.cfg.Sandbox.Resources.ControlSocket,
 		Network:     o.resolveNetwork(sb, tmpl, spec.Network),
 		MMDSEnabled: o.cfg.MMDS.Enabled,
 		Spec:        spec,
+	}
+}
+
+func sandboxTapFD(t vswitch.TapFD) sandboxcfg.TapFD {
+	return sandboxcfg.TapFD{
+		Exec:    append([]string(nil), t.Exec...),
+		Socket:  t.Socket,
+		Request: t.Request,
+		Timeout: t.Timeout,
 	}
 }
 

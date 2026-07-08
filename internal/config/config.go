@@ -344,11 +344,12 @@ func parseMiB(s string) int {
 // into the guest via SANDBOX_CONFIG network.hostname + files:), and the per-profile
 // guest inner IP / default-route gateway.
 type NetworkConfig struct {
-	Switch   string     `yaml:"switch"`   // vswitch name, e.g. "sw0"
-	Hostname string     `yaml:"hostname"` // guest hostname (sethostname + /etc/hosts entry); default "sandbox"
-	DNS      []string   `yaml:"dns"`      // /etc/resolv.conf nameservers injected into the guest
-	E2B      ProfileNet `yaml:"e2b"`      // e2b profile inner IP / gateway (envd port-forward needs the /30)
-	Bare     ProfileNet `yaml:"bare"`     // bare profile inner IP / gateway
+	Switch      string     `yaml:"switch"`       // vswitch name, e.g. "sw0"
+	TapFDSocket string     `yaml:"tapfd_socket"` // optional persistent connector tapfd provider UDS; empty = exec open-port
+	Hostname    string     `yaml:"hostname"`     // guest hostname (sethostname + /etc/hosts entry); default "sandbox"
+	DNS         []string   `yaml:"dns"`          // /etc/resolv.conf nameservers injected into the guest
+	E2B         ProfileNet `yaml:"e2b"`          // e2b profile inner IP / gateway (envd port-forward needs the /30)
+	Bare        ProfileNet `yaml:"bare"`         // bare profile inner IP / gateway
 }
 
 // ProfileNet is one profile's guest inner IP (CIDR) and default-route gateway,
@@ -580,6 +581,9 @@ func (c *Config) validate() error {
 	}
 	if c.Sandbox.Boot.Runtime == "" {
 		return fmt.Errorf("config: sandbox.boot.runtime is required")
+	}
+	if c.Sandbox.Network.TapFDSocket != "" && !filepath.IsAbs(c.Sandbox.Network.TapFDSocket) {
+		return fmt.Errorf("config: sandbox.network.tapfd_socket must be absolute")
 	}
 	switch c.Checkpoint.Mode {
 	case CheckpointLocal, CheckpointRemote:

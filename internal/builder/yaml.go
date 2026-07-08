@@ -7,6 +7,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+
+	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 )
 
 // --- yaml renderers -----------------------------------------------------------
@@ -14,7 +16,7 @@ import (
 func (p *buildPipeline) networkDoc() map[string]any {
 	n := p.spec.Net
 	doc := map[string]any{
-		"tapfd":    map[string]any{"exec": n.TapFDExec},
+		"tapfd":    tapFDDoc(n.TapFD),
 		"hostname": n.Hostname,
 	}
 	if n.MAC != "" {
@@ -25,6 +27,23 @@ func (p *buildPipeline) networkDoc() map[string]any {
 		if n.Nexthop != "" {
 			doc["nexthop"] = n.Nexthop
 		}
+	}
+	return doc
+}
+
+func tapFDDoc(t configsock.TapFDConfig) map[string]any {
+	doc := map[string]any{}
+	if len(t.Exec) > 0 {
+		doc["exec"] = t.Exec
+	}
+	if t.Socket != "" {
+		doc["socket"] = t.Socket
+	}
+	if t.Request != "" {
+		doc["request"] = t.Request
+	}
+	if t.Timeout != "" {
+		doc["timeout"] = t.Timeout
 	}
 	return doc
 }

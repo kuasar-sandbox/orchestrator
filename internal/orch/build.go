@@ -297,11 +297,20 @@ type buildResult struct {
 type pendingBuild struct {
 	build     *types.Build
 	workdir   string
-	tapExec   []string
+	tapFD     vswitch.TapFD
 	mac       string
 	innerIP   string // CIDR
 	floating  string
 	envdToken string
+}
+
+func buildTapFD(t vswitch.TapFD) configsock.TapFDConfig {
+	return configsock.TapFDConfig{
+		Exec:    append([]string(nil), t.Exec...),
+		Socket:  t.Socket,
+		Request: t.Request,
+		Timeout: t.Timeout,
+	}
 }
 
 // executeBuild runs the three-phase pipeline in a sandbox-builder@<bid>
@@ -378,7 +387,7 @@ func (o *Orchestrator) runBuildUnit(ctx context.Context, b *types.Build) (*build
 	envdTok, _ := keys.MintToken()
 	pend := &pendingBuild{
 		build: b, workdir: dir,
-		tapExec: o.vs.TapFDExec(port.Port), mac: port.MAC,
+		tapFD: o.vs.TapFD(port.Port), mac: port.MAC,
 		innerIP: cidrIP, floating: port.FloatingIP, envdToken: envdTok,
 	}
 	o.pendMu.Lock()
@@ -517,12 +526,12 @@ func (o *Orchestrator) BuildSpecFor(ctx context.Context, configID string) (*conf
 			ManifestConfig: o.cfg.ManifestConfig,
 		},
 		Net: configsock.BuildNet{
-			TapFDExec: pend.tapExec,
-			MAC:       pend.mac,
-			InnerIP:   pend.innerIP,
-			Nexthop:   o.innerGateway(types.ProfileE2B),
-			Hostname:  "build-" + shortID(b.BuildID),
-			DNS:       o.cfg.Sandbox.Network.DNS,
+			TapFD:    buildTapFD(pend.tapFD),
+			MAC:      pend.mac,
+			InnerIP:  pend.innerIP,
+			Nexthop:  o.innerGateway(types.ProfileE2B),
+			Hostname: "build-" + shortID(b.BuildID),
+			DNS:      o.cfg.Sandbox.Network.DNS,
 		},
 		VCPU:        vcpu,
 		Memory:      mem,

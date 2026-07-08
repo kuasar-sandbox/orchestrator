@@ -134,7 +134,11 @@ func runConductor(args []string, log *slog.Logger) error {
 	}
 	defer lc.Close()
 
-	core := orch.New(cfg, st, lc, vswitch.New(cfg.ConnectorCtl(), cfg.Sandbox.Network.Switch), log)
+	core := orch.New(cfg, st, lc, vswitch.New(
+		cfg.ConnectorCtl(),
+		cfg.Sandbox.Network.Switch,
+		vswitch.WithTapFDSocket(cfg.Sandbox.Network.TapFDSocket),
+	), log)
 	if err := core.InstallUnits(ctx); err != nil {
 		return err
 	}

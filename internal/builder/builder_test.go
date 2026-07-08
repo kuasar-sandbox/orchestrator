@@ -1,6 +1,10 @@
 package builder
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
+)
 
 // TestParseTemplateDisk covers the fromTemplate disk extraction: a base
 // template's `sandbox-ctl info --json` must yield both the erofs base image
@@ -62,5 +66,28 @@ func TestParseTemplateDisk(t *testing.T) {
 	// malformed JSON is an error.
 	if _, _, _, err = parseTemplateDisk([]byte(`not json`)); err == nil {
 		t.Error("malformed json: expected error, got nil")
+	}
+}
+
+func TestNetworkDocTapFDSocket(t *testing.T) {
+	p := &buildPipeline{spec: &configsock.BuildSpec{
+		Net: configsock.BuildNet{
+			TapFD: configsock.TapFDConfig{
+				Socket:  "/run/kuasar/connector/sw0/tapfd.sock",
+				Request: "VSWITCH=sw0 PORT=9",
+			},
+			Hostname: "build-test",
+		},
+	}}
+	doc := p.networkDoc()
+	tapfdDoc, ok := doc["tapfd"].(map[string]any)
+	if !ok {
+		t.Fatalf("tapfd doc = %#v", doc["tapfd"])
+	}
+	if tapfdDoc["socket"] != "/run/kuasar/connector/sw0/tapfd.sock" || tapfdDoc["request"] != "VSWITCH=sw0 PORT=9" {
+		t.Fatalf("tapfd doc = %#v", tapfdDoc)
+	}
+	if _, ok := tapfdDoc["exec"]; ok {
+		t.Fatalf("tapfd doc unexpectedly has exec: %#v", tapfdDoc)
 	}
 }

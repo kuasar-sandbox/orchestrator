@@ -148,12 +148,19 @@ type BuildPaths struct {
 // sandboxes reuse sequentially (the tapfd handoff re-acquires the same
 // port's queue fd each boot).
 type BuildNet struct {
-	TapFDExec []string `json:"tapfd_exec"`
-	MAC       string   `json:"mac"`
-	InnerIP   string   `json:"inner_ip"` // CIDR
-	Nexthop   string   `json:"nexthop"`
-	Hostname  string   `json:"hostname"`
-	DNS       []string `json:"dns,omitempty"`
+	TapFD    TapFDConfig `json:"tapfd"`
+	MAC      string      `json:"mac"`
+	InnerIP  string      `json:"inner_ip"` // CIDR
+	Nexthop  string      `json:"nexthop"`
+	Hostname string      `json:"hostname"`
+	DNS      []string    `json:"dns,omitempty"`
+}
+
+type TapFDConfig struct {
+	Exec    []string `json:"exec,omitempty"`
+	Socket  string   `json:"socket,omitempty"`
+	Request string   `json:"request,omitempty"`
+	Timeout string   `json:"timeout,omitempty"`
 }
 
 // BuildTimeouts are per-phase budgets in seconds.

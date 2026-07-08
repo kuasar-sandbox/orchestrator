@@ -142,6 +142,7 @@ sandbox:                                          # sandbox-instance defaults
     #                                              # Set this to resource_listen.socket when hosting the controller below.
   network:
     switch: sw0
+    # tapfd_socket: /run/kuasar/connector/sw0/tapfd.sock # persistent tapfd; connector: vswitch serve --tapfd-listen <same path>
     hostname: sandbox                             # guest hostname (sethostname + /etc/hosts)
     dns: [169.254.169.253]                        # /etc/resolv.conf nameserver(s) injected into the guest
     e2b:  { inner_ip: 169.254.0.21/30, nexthop: 169.254.0.22 }   # e2b: /30 + gateway for envd port-forward

@@ -69,6 +69,52 @@ sandbox:
 	}
 }
 
+func TestLoadAcceptsTapFDSocket(t *testing.T) {
+	t.Setenv("NODE_CONFIG_ENCRYPTION_KEY", "")
+	path := writeConfig(t, `
+api:
+  domain: example.test
+encryption_key: test-key
+sandbox:
+  network:
+    tapfd_socket: /run/kuasar/connector/sw0/tapfd.sock
+  boot:
+    kernel: /opt/sandbox/vmlinux
+    runtime: /opt/sandbox/sandbox-runtime.erofs
+`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+	if got := cfg.Sandbox.Network.TapFDSocket; got != "/run/kuasar/connector/sw0/tapfd.sock" {
+		t.Fatalf("tapfd_socket = %q", got)
+	}
+}
+
+func TestLoadRejectsRelativeTapFDSocket(t *testing.T) {
+	t.Setenv("NODE_CONFIG_ENCRYPTION_KEY", "")
+	path := writeConfig(t, `
+api:
+  domain: example.test
+encryption_key: test-key
+sandbox:
+  network:
+    tapfd_socket: tapfd.sock
+  boot:
+    kernel: /opt/sandbox/vmlinux
+    runtime: /opt/sandbox/sandbox-runtime.erofs
+`)
+
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("Load succeeded with relative tapfd_socket")
+	}
+	if !strings.Contains(err.Error(), "tapfd_socket") {
+		t.Fatalf("error %q does not mention tapfd_socket", err)
+	}
+}
+
 func TestLoadAcceptsInternalProxyNetNS(t *testing.T) {
 	t.Setenv("NODE_CONFIG_ENCRYPTION_KEY", "")
 	path := writeConfig(t, `
