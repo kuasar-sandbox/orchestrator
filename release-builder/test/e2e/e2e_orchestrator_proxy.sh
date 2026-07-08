@@ -8,7 +8,8 @@
 #
 #   serve(proxy_mode=external)                          # control plane on :PORT
 #   proxy serve --config <proxy.yaml>                    # data-plane on :PROXY_PORT
-#         # one master plugin registration + N workers sharing inherited listeners
+#         # one master plugin registration + N workers sharing inherited listeners;
+#         # workers run in PROXY_NETNS, and mmds_listen is bound there
 #   POST /sandboxes  -> real VM + envd ; serve streams the route to the proxy
 #   GET <proxy>/health (Host 49983-<sid>): no token -> 401 (enforce);
 #                                          right X-Access-Token -> forwarded to envd
@@ -35,6 +36,12 @@ if [ -z "${ZOT_BIN:-}" ]; then
     ZOT_BIN="$(command -v zot || true)"
 fi
 SW_NETNS="${SW_NETNS:-e2e_sw}"
+PROXY_NETNS="${PROXY_NETNS:-e2e_proxy}"
+PROXY_VETH_HOST="${PROXY_VETH_HOST:-e2eph0}"
+PROXY_VETH_NS="${PROXY_VETH_NS:-e2epn0}"
+PROXY_HOST_IP="${PROXY_HOST_IP:-172.31.254.1}"
+PROXY_NS_IP="${PROXY_NS_IP:-172.31.254.2}"
+FIP_CIDR="${FIP_CIDR:-100.100.96.0/20}"
 
 skip() { echo; echo "==> e2e_orchestrator_proxy: skipping ($*)"; [ "${REQUIRE_PROXY:-0}" = "1" ] && { echo "REQUIRE_PROXY=1; failing" >&2; exit 1; }; exit 0; }
 fail() { echo "==> FAIL: $*" >&2; exit 1; }
@@ -48,6 +55,7 @@ command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1 || skip "docker
 [ -n "$ZOT_BIN" ] && [ -x "$ZOT_BIN" ] || skip "zot not found (set ZOT_BIN or install zot on PATH)"
 command -v mkfs.erofs >/dev/null 2>&1 || [ -x "$BIN/mkfs.erofs" ] || skip "mkfs.erofs not found"
 command -v ip >/dev/null 2>&1 || skip "iproute2 (ip) not found"
+command -v iptables >/dev/null 2>&1 || skip "iptables not found"
 [ -d /run/systemd/system ] || skip "systemd not PID1"
 [ -e /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ] || skip "/dev/kvm not available (rw)"
 docker image inspect "$E2E_IMAGE" >/dev/null 2>&1 || docker pull "$E2E_IMAGE" >/dev/null 2>&1 \
@@ -66,12 +74,18 @@ PROXY_SOCK="$WORK/run/proxy.sock"
 declare -a PIDS=()
 declare -a TAGS=()
 SW_STARTED=""
+ORIG_IP_FORWARD=""
 cleanup() {
     set +e
     systemctl stop 'sandbox-runner@*.service' 'sandbox-builder@*.service' 2>/dev/null
     for p in "${PIDS[@]:-}"; do [ -n "$p" ] && kill "$p" 2>/dev/null; done
     [ -n "$SW_STARTED" ] && "$BIN/connector-ctl" vswitch stop "$SWITCH" >/dev/null 2>&1
+    iptables -D FORWARD -i "$PROXY_VETH_HOST" -o "${SWITCH}m0" -j ACCEPT 2>/dev/null
+    iptables -D FORWARD -i "${SWITCH}m0" -o "$PROXY_VETH_HOST" -j ACCEPT 2>/dev/null
+    ip link del "$PROXY_VETH_HOST" 2>/dev/null
+    ip netns del "$PROXY_NETNS" 2>/dev/null
     ip netns del "$SW_NETNS" 2>/dev/null
+    [ -n "$ORIG_IP_FORWARD" ] && sysctl -q -w "net.ipv4.ip_forward=$ORIG_IP_FORWARD" 2>/dev/null
     for u in "${OURS[@]:-}"; do [ -n "$u" ] && rm -f "$u"; done
     systemctl daemon-reload 2>/dev/null
     for t in "${TAGS[@]:-}"; do [ -n "$t" ] && docker rmi -f "$t" >/dev/null 2>&1; done
@@ -81,6 +95,62 @@ trap cleanup EXIT
 
 free_port() { python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()'; }
 wait_port() { for _ in $(seq 1 60); do (exec 3<>"/dev/tcp/$1/$2") 2>/dev/null && { exec 3>&- 3<&-; return 0; }; sleep 0.5; done; fail "$3 did not open $1:$2"; }
+wait_mmds_listener() {
+    local hex
+    hex="$(printf '%04X' "$MMDS_PORT")"
+    for _ in $(seq 1 60); do
+        ip netns exec "$PROXY_NETNS" awk -v p=":$hex" '$2 ~ p && $4 == "0A" { found = 1 } END { exit(found ? 0 : 1) }' /proc/net/tcp 2>/dev/null && return 0
+        sleep 0.5
+    done
+    fail "mmds listener did not appear in proxy_netns=$PROXY_NETNS on $PROXY_NS_IP:$MMDS_PORT"
+}
+child_worker_pids() {
+    local parent="$1" p stat ppid cmd
+    for d in /proc/[0-9]*; do
+        p="${d##*/}"
+        [ -r "$d/stat" ] || continue
+        stat="$(cat "$d/stat" 2>/dev/null || true)"
+        ppid="$(printf '%s\n' "$stat" | awk '{print $4}')"
+        [ "$ppid" = "$parent" ] || continue
+        cmd="$(tr '\0' ' ' < "$d/cmdline" 2>/dev/null || true)"
+        case "$cmd" in *"node-ctl proxy serve"*"--worker"*) printf '%s\n' "$p";; esac
+    done
+}
+wait_proxy_workers_in_netns() {
+    local master="$1" target workers got
+    target="$(stat -Lc '%i' "/var/run/netns/$PROXY_NETNS")"
+    for _ in $(seq 1 60); do
+        workers="$(child_worker_pids "$master" | tr '\n' ' ')"
+        [ -n "$workers" ] && break
+        sleep 0.5
+    done
+    [ -n "${workers:-}" ] || fail "proxy workers did not start under master pid $master"
+    for wp in $workers; do
+        got="$(stat -Lc '%i' "/proc/$wp/ns/net" 2>/dev/null || true)"
+        [ "$got" = "$target" ] || fail "proxy worker $wp netns inode=$got, want proxy_netns inode=$target"
+    done
+}
+setup_proxy_netns() {
+    ip link del "$PROXY_VETH_HOST" 2>/dev/null || true
+    ip netns del "$PROXY_NETNS" 2>/dev/null || true
+    ip netns add "$PROXY_NETNS"
+    ip link add "$PROXY_VETH_HOST" type veth peer name "$PROXY_VETH_NS"
+    ip link set "$PROXY_VETH_NS" netns "$PROXY_NETNS"
+    ip addr add "$PROXY_HOST_IP/30" dev "$PROXY_VETH_HOST"
+    ip link set "$PROXY_VETH_HOST" up
+    ip netns exec "$PROXY_NETNS" ip addr add "$PROXY_NS_IP/30" dev "$PROXY_VETH_NS"
+    ip netns exec "$PROXY_NETNS" ip link set lo up
+    ip netns exec "$PROXY_NETNS" ip link set "$PROXY_VETH_NS" up
+    ip netns exec "$PROXY_NETNS" ip route add "$FIP_CIDR" via "$PROXY_HOST_IP"
+    ORIG_IP_FORWARD="$(sysctl -n net.ipv4.ip_forward 2>/dev/null || true)"
+    sysctl -q -w net.ipv4.ip_forward=1
+}
+allow_proxy_forwarding() {
+    iptables -C FORWARD -i "$PROXY_VETH_HOST" -o "${SWITCH}m0" -j ACCEPT 2>/dev/null \
+        || iptables -A FORWARD -i "$PROXY_VETH_HOST" -o "${SWITCH}m0" -j ACCEPT
+    iptables -C FORWARD -i "${SWITCH}m0" -o "$PROXY_VETH_HOST" -j ACCEPT 2>/dev/null \
+        || iptables -A FORWARD -i "${SWITCH}m0" -o "$PROXY_VETH_HOST" -j ACCEPT
+}
 
 # control-plane request (api.<domain> on :PORT)
 req() {
@@ -92,7 +162,7 @@ req() {
 # data-plane request through the PROXY (:PROXY_PORT), Host <port>-<sid>.<domain>
 dp() {
     local port_sid="$1" path="$2" token="${3:-}"
-    local args=(-sS --noproxy '*' -o "$WORK/dp.body" -w '%{http_code}' -H "Host: $port_sid.$DOMAIN")
+    local args=(-sS --max-time "${DP_MAX_TIME:-120}" --noproxy '*' -o "$WORK/dp.body" -w '%{http_code}' -H "Host: $port_sid.$DOMAIN")
     [ -n "$token" ] && args+=(-H "X-Access-Token: $token")
     curl "${args[@]}" "http://127.0.0.1:$PROXY_PORT$path"
 }
@@ -162,15 +232,19 @@ echo "==> store-ctl + zot up; built+seeded $REF"
 # BEFORE the build: the image pull runs INSIDE a build sandbox, so the build
 # needs a network slot and reaches zot via the mgmt VIP.
 MGMT_VIP="169.254.169.254"
+MMDS_PORT="$(free_port)"
+setup_proxy_netns
 "$BIN/connector-ctl" vswitch stop "$SWITCH" --force >/dev/null 2>&1 || true
 ip netns del "$SW_NETNS" 2>/dev/null || true; ip netns del "$SWITCH" 2>/dev/null || true
 ip netns add "$SW_NETNS" 2>/dev/null || true
 "$BIN/connector-ctl" vswitch start "$SWITCH" --netns="$SW_NETNS" --ports=64 --mac-addr=02:00:00:00:00:01 \
     --floating-ip-base=100.100.96.0 --mode=tap \
-    --mgmt-extract=:${SWITCH}m0:$MGMT_VIP,0.0.0.0/0 >"$WORK/vswitch-start.log" 2>&1 || { sed 's/^/  /' "$WORK/vswitch-start.log"; fail "vswitch start"; }
+    --mgmt-extract=:${SWITCH}m0:$MGMT_VIP,0.0.0.0/0 \
+    --mgmt-service=$MGMT_VIP:80:$PROXY_NS_IP:$MMDS_PORT >"$WORK/vswitch-start.log" 2>&1 || { sed 's/^/  /' "$WORK/vswitch-start.log"; fail "vswitch start"; }
 SW_STARTED=1
+allow_proxy_forwarding
 GUEST_REF="$MGMT_VIP:$ZOT_PORT/e2e/app:v1"
-echo "==> vswitch up (build sandboxes pull $GUEST_REF)"
+echo "==> vswitch up (build sandboxes pull $GUEST_REF; proxy_netns=$PROXY_NETNS reaches $FIP_CIDR via $PROXY_VETH_HOST)"
 
 cat > "$WORK/manifest.yaml" <<EOF
 manifest: { key: "" }
@@ -196,6 +270,7 @@ truncate -s 2G "$BLD"
 cat > "$WORK/config.yaml" <<EOF
 api: { domain: $DOMAIN, listen: ":$PORT" }
 proxy: { mode: external, auth: enforce, park_timeout: 90s }
+mmds: { enabled: true, listen: "$PROXY_NS_IP:$MMDS_PORT" }
 encryption_key: "$ENC"
 manifest_config: $WORK/manifest.yaml
 paths: { run_root: $WORK/run, base_root: $WORK/lib, config_socket: $WORK/node-ctl.socket }
@@ -227,22 +302,29 @@ done
 echo "==> node-ctl proxy master (single plugin registration, data-plane :$PROXY_PORT, workers=2)"
 # The master reads policy/endpoints from proxy.yaml, registers once, then supervises
 # workers that inherit listener fds and read the shared route table. h2c here (no tls),
-# matching serve's plain-http listener.
+# matching serve's plain-http listener. proxy_netns exercises external direct mode:
+# workers run inside that netns, so floatingip TCP dials need its route table.
 cat > "$WORK/proxy.yaml" <<EOF
 config_socket: $WORK/node-ctl.socket
 data_listen: 127.0.0.1:$PROXY_PORT
+proxy_netns: $PROXY_NETNS
 proxy_socket: $PROXY_SOCK
 shm_path: $WORK/run/proxy-routes.shm
 route_capacity: 1024
 workers: 2
 auth: enforce
 park_timeout: 90s
+mmds_listen: $PROXY_NS_IP:$MMDS_PORT
 metrics_listen: 127.0.0.1:$METRICS_PORT
 EOF
 "$BIN/node-ctl" proxy serve --config "$WORK/proxy.yaml" >"$WORK/proxy.log" 2>&1 &
 PIDS+=($!)
+PROXY_MASTER_PID="${PIDS[-1]}"
 wait_port 127.0.0.1 "$PROXY_PORT" proxy
+wait_mmds_listener
+wait_proxy_workers_in_netns "$PROXY_MASTER_PID"
 echo "==> control plane up; proxy master registered on the config-socket plugin plane"
+echo "==> PASS: external proxy workers and mmds_listen are in proxy_netns=$PROXY_NETNS"
 
 # ---- build a ready e2b template (native v3) --------------------------------
 code=$(req POST /v3/templates "$AK" '{"name":"proxy-tmpl"}')
@@ -277,6 +359,60 @@ ENVD_TOKEN=$(grep -o '"envdAccessToken":"[^"]*"' "$WORK/resp.body" | head -1 | c
 [ -n "$SID" ] && [ -n "$ENVD_TOKEN" ] || fail "missing sandboxID/envdAccessToken in create response"
 echo "==> PASS: sandbox $SID running (envd token captured)"
 
+ENVD_SOCK="$WORK/run/$SID/envd.sock"
+for _ in $(seq 1 40); do [ -S "$ENVD_SOCK" ] && break; sleep 0.25; done
+[ -S "$ENVD_SOCK" ] || fail "envd.sock not found at $ENVD_SOCK"
+cat > "$WORK/envd_exec.py" <<'PY'
+import http.client, socket, struct, json, base64, sys
+sock_path, token, cmd = sys.argv[1], sys.argv[2], sys.argv[3]
+class UDS(http.client.HTTPConnection):
+    def __init__(s): super().__init__("envd")
+    def connect(s):
+        s.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.sock.connect(sock_path)
+req = {"process": {"cmd": "/bin/sh", "args": ["-c", cmd]}}
+body = json.dumps(req).encode()
+env = b"\x00" + struct.pack(">I", len(body)) + body
+c = UDS()
+c.request("POST", "/process.Process/Start", body=env, headers={
+    "Content-Type": "application/connect+json",
+    "Connect-Protocol-Version": "1",
+    "X-Access-Token": token,
+})
+r = c.getresponse()
+data = r.read()
+out = b""
+exit_code = None
+err = None
+i = 0
+while i + 5 <= len(data):
+    flag = data[i]
+    ln = struct.unpack(">I", data[i+1:i+5])[0]
+    msg = data[i+5:i+5+ln]
+    i += 5 + ln
+    j = json.loads(msg) if msg else {}
+    if flag & 2:
+        if j.get("error"):
+            err = j
+        continue
+    ev = j.get("event", {})
+    if "data" in ev:
+        d = ev["data"]
+        for k in ("stdout", "stderr"):
+            if d.get(k):
+                out += base64.b64decode(d[k])
+    if "end" in ev:
+        exit_code = ev["end"].get("exitCode", 0)
+print("HTTP_STATUS", r.status)
+print("EXIT_CODE", exit_code)
+if err is not None:
+    print("API_ERROR", json.dumps(err))
+sys.stdout.write("OUTPUT_BEGIN\n")
+sys.stdout.flush()
+sys.stdout.buffer.write(out)
+sys.stdout.write("\nOUTPUT_END\n")
+PY
+
 # ---- (1) data plane THROUGH the proxy: route-sync + forward + auth ---------
 ok=""
 for _ in $(seq 1 20); do
@@ -294,6 +430,20 @@ echo "==> PASS: proxy enforces X-Access-Token (missing -> 401)"
 code=$(dp "49983-$SID" /health "wrong-token")
 [ "$code" = "401" ] || { dump_logs; fail "envd /health via proxy with WRONG token = $code (want 401)"; }
 echo "==> PASS: proxy rejects a wrong token (401)"
+
+USER_MARK="proxy-netns-user-port-$RANDOM"
+python3 "$WORK/envd_exec.py" "$ENVD_SOCK" "$ENVD_TOKEN" \
+    "mkdir -p /home/user/e2e-site; echo '$USER_MARK' > /home/user/e2e-site/index.html; cd /home/user/e2e-site; python3 -m http.server 8000 --bind 0.0.0.0 >/tmp/e2e-http-8000.log 2>&1 &" \
+    >"$WORK/start-user-port.out" 2>&1 || true
+grep -q 'EXIT_CODE 0' "$WORK/start-user-port.out" || { sed 's/^/  envd| /' "$WORK/start-user-port.out"; fail "start guest user-port server"; }
+ok=""
+for _ in $(seq 1 30); do
+    code=$(DP_MAX_TIME=8 dp "8000-$SID" / "$ENVD_TOKEN" || true)
+    grep -q "$USER_MARK" "$WORK/dp.body" 2>/dev/null && { ok=1; break; }
+    sleep 0.5
+done
+[ -n "$ok" ] || { echo "last code=$code"; cat "$WORK/dp.body"; dump_logs; fail "user port via proxy_netns -> floatingip did not return marker"; }
+echo "==> PASS: proxy_netns worker reached sandbox floatingip:8000 (real user port, marker=$USER_MARK)"
 
 # ---- (2) unknown sandbox via proxy -> wake -> 404 -------------------------
 code=$(dp "49983-deadbeefdeadbeef" /health "$ENVD_TOKEN")

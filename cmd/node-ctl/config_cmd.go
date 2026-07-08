@@ -113,6 +113,7 @@ proxy:                                           # data-plane policy (<port>-<si
   auth: enforce                                  # off | log | enforce: validate X-Access-Token
   # data_listen: ":8443"                          # internal-mode dedicated listener; "" = share api.listen.
   #                                               # external mode: the data port lives in proxy.yaml (workers own it).
+  # proxy_netns: sw0_mgmt                         # internal-mode forwarding netns for floatingip dials + MMDS listen.
   # park_timeout: 30s
   # metrics_listen: ":9900"                       # serve's own Prometheus text endpoint
 # AES-256 keys for manifest keys at rest (":"-separated, first active). Prefer the
@@ -216,6 +217,7 @@ const proxyConfigSkeleton = `# node-ctl proxy master config — node-ctl proxy s
 # read a shared-memory route table.
 config_socket: /run/sandbox/node-ctl.socket      # serve's control socket (= serve paths.config_socket)
 data_listen: ":443"                              # master-bound ingress passed to workers; "" = UDS-only proxyForwarder
+# proxy_netns: sw0_mgmt                          # forwarding netns for workers' floatingip dials + mmds_listen; "" = current netns
 proxy_socket: /run/sandbox/proxy.sock            # UDS registered for conductor proxyForwarder
 shm_path: /run/sandbox/proxy-routes.shm           # shared route table path
 route_capacity: 65536                            # fixed route slots

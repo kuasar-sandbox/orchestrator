@@ -20,9 +20,9 @@ import (
 // connection is spliced to the backend. The same Tunnel primitive serves both the
 // proxy's direct ingress and the external-mode proxyForwarder's CONNECT relay.
 
-// dialRoute opens a connection to a resolved route's backend — the single dial used
-// by both the reverse-proxy Transport and CONNECT tunneling.
-func dialRoute(ctx context.Context, r Route) (net.Conn, error) {
+// directDialRoute opens a connection to a resolved route's backend in the
+// process's current network namespace.
+func directDialRoute(ctx context.Context, r Route) (net.Conn, error) {
 	d := net.Dialer{}
 	switch r.Kind {
 	case KindUDS:
@@ -70,7 +70,7 @@ func (p *Proxy) serveConnect(w http.ResponseWriter, r *http.Request) {
 		writeProxyError(w, http.StatusUnauthorized, "invalid access token", ProxyErrorUnauthorized)
 		return
 	}
-	backend, err := dialRoute(r.Context(), route)
+	backend, err := p.dial(r.Context(), route)
 	if err != nil {
 		p.mx.Inc(`data_requests_total{result="upstream_error"}`)
 		writeProxyError(w, http.StatusBadGateway, "upstream error", ProxyErrorUpstreamError)

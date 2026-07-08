@@ -250,6 +250,7 @@ type TLSConfig struct {
 type ProxyConfig struct {
 	Mode          string `yaml:"mode"`           // internal (default) | external | off
 	DataListen    string `yaml:"data_listen"`    // dedicated data-plane listener; "" = share api.listen
+	ProxyNetNS    string `yaml:"proxy_netns"`    // optional forwarding netns for floatingip TCP dials and internal MMDS listen
 	ParkTimeout   string `yaml:"park_timeout"`   // hold a data-plane request awaiting route/resume; default 30s
 	Auth          string `yaml:"auth"`           // off | log | enforce (default): validate X-Access-Token
 	MetricsListen string `yaml:"metrics_listen"` // optional Prometheus text endpoint; "" = off
@@ -603,6 +604,9 @@ func (c *Config) validateProxy() error {
 	// proxy.mode=external needs no static socket list: the proxy master registers
 	// its proxy_socket on the config-socket plugin plane, so there is nothing to
 	// require here.
+	if c.Proxy.ProxyNetNS != "" && c.Proxy.Mode != ProxyInternal {
+		return fmt.Errorf("config: proxy.proxy_netns requires proxy.mode=internal (external mode uses proxy.yaml proxy_netns)")
+	}
 
 	// MMDS off => envd is non-secure, so the proxy must be the enforcing sole gate.
 	if !c.MMDS.Enabled && c.Proxy.Auth != AuthEnforce {
@@ -625,6 +629,7 @@ func (c *Config) validateProxy() error {
 type ProxyFileConfig struct {
 	ConfigSocket  string    `yaml:"config_socket"`  // serve control socket to register + sync on (= serve paths.config_socket)
 	DataListen    string    `yaml:"data_listen"`    // data-plane ingress; "" = UDS-only proxyForwarder
+	ProxyNetNS    string    `yaml:"proxy_netns"`    // optional forwarding netns for floatingip TCP dials and MMDS listen
 	ProxySocket   string    `yaml:"proxy_socket"`   // UDS registered for conductor proxyForwarder; default <dir(config_socket)>/proxy.sock
 	ShmPath       string    `yaml:"shm_path"`       // shared route table path; default <dir(config_socket)>/proxy-routes.shm
 	RouteCapacity int       `yaml:"route_capacity"` // fixed shared route slots; default 65536

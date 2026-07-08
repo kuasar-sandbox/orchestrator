@@ -29,6 +29,9 @@ node proxy worker
 - **listener fd 继承**:master 绑定 data/proxy/MMDS listener,把同一个 fd 传给所有
   worker;worker 执行 accept 和转发。后续可把 master bind 替换为 systemd socket
   activation,worker 模型不变。
+- **转发 netns 可配置**:`proxy_netns` 指向 connector 管理平面 netns 时,proxy 到
+  `floatingip:port` 的访问和 MMDS listener 都在该 netns。internal 模式用 per-dial
+  netns dialer;external 模式让 worker 进程直接在该 netns 内运行。
 - **无上游连接池**:普通 HTTP 每请求拨一次后端并关闭;CONNECT 是一条请求绑定一条
   TCP/UDS 连接。不同 sandbox/port 不复用上游连接。
 - **确定性 MMDS 密钥**:`MmdsSecret = MAC(manifest_key, sid)`,PUT 和 GET 即使落到
@@ -50,6 +53,7 @@ master 内部 reexec 当前 `node-ctl` 二进制启动 worker;内部 worker 模�
 |---|---|---|
 | `config_socket` | `/run/sandbox/node-ctl.socket` | conductor config-socket;master 在 plugin 平面注册并同步路由 |
 | `data_listen` | 空 | 数据面入口;空 = 只接受 conductor proxyForwarder 兜底 UDS |
+| `proxy_netns` | 空 | 转发平面 netns;空 = 当前 netns。非空时 external worker 在该 netns 内运行,`mmds_listen` 也在该 netns 绑定;`data_listen` 仍在 master 当前 netns |
 | `proxy_socket` | `<dir(config_socket)>/proxy.sock` | master 注册给 conductor proxyForwarder 的 UDS |
 | `shm_path` | `<dir(config_socket)>/proxy-routes.shm` | 共享路由表 mmap 文件 |
 | `route_capacity` | `65536` | 固定路由槽位数;满时新路由写入失败并告警 |
@@ -142,7 +146,8 @@ unknown or not running before timeout   → 404
 
 1. worker 从共享表解析 route;
 2. 校验 `X-Access-Token` 或 `/files` signature;
-3. 拨一次 envd UDS 或 `floatingip:port`;
+3. 拨一次 envd UDS 或 `floatingip:port`。配置 `proxy_netns` 时,`floatingip:port` 在该
+   netns 内拨号;
 4. 写入一条 HTTP 请求,流式复制响应,响应结束关闭后端连接。
 
 CONNECT:
@@ -178,7 +183,8 @@ proxy 逐请求常数时间比较请求 token 与 route 中的 `access_token`。
 
 `mmds.enabled=true` 时,envd 在 FC 模式下通过 Firecracker MMDS v2 获取当前身份的
 access-token hash。internal 模式由 conductor 进程内服务;external 模式由 proxy
-worker 层服务。master 绑定 `mmds_listen` 并把同一个 listener fd 传给所有 worker。
+worker 层服务。配置 `proxy_netns` 时,`mmds.listen` / `mmds_listen` 在该 netns 绑定;
+external 模式由 master 绑定后把同一个 listener fd 传给所有 worker。
 
 ```text
 guest envd

@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -71,6 +72,9 @@ type noopCounter struct{}
 
 func (noopCounter) Inc(string) {}
 
+// RouteDialer opens a backend connection for a resolved route.
+type RouteDialer func(context.Context, Route) (net.Conn, error)
+
 // RouteForTarget builds the forwarding decision for a resolved, running sandbox
 // from its targets + the requested port. Shared by the internal router (orch) and
 // the external route table so both classify ports identically.
@@ -94,18 +98,28 @@ type Proxy struct {
 	authMode func() string // config.Auth* (off|log|enforce), read per-request so a
 	log      *slog.Logger  // pushed routesync policy can change it centrally
 	mx       Counter
+	dial     RouteDialer
 }
 
 // New builds a proxy over router. authMode is read per request and returns one of
 // config.AuthOff/Log/Enforce (nil => enforce). mx may be nil (metrics off).
 func New(router Router, authMode func() string, log *slog.Logger, mx Counter) *Proxy {
+	return NewWithDialer(router, authMode, log, mx, nil)
+}
+
+// NewWithDialer builds a proxy with an explicit backend dialer. A nil dialer uses
+// the process's current network namespace.
+func NewWithDialer(router Router, authMode func() string, log *slog.Logger, mx Counter, dial RouteDialer) *Proxy {
 	if authMode == nil {
 		authMode = func() string { return config.AuthEnforce }
 	}
 	if mx == nil {
 		mx = noopCounter{}
 	}
-	return &Proxy{router: router, authMode: authMode, log: log, mx: mx}
+	if dial == nil {
+		dial = directDialRoute
+	}
+	return &Proxy{router: router, authMode: authMode, log: log, mx: mx, dial: dial}
 }
 
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -138,7 +152,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			writeProxyError(w, http.StatusUnauthorized, "invalid access token", ProxyErrorUnauthorized)
 			return
 		}
-		backend, err := dialRoute(r.Context(), route)
+		backend, err := p.dial(r.Context(), route)
 		if err != nil {
 			p.mx.Inc(`data_requests_total{result="upstream_error"}`)
 			writeProxyError(w, http.StatusBadGateway, "upstream error", ProxyErrorUpstreamError)

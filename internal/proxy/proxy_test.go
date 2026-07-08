@@ -194,6 +194,61 @@ func TestProxyDoesNotReuseBackendConnections(t *testing.T) {
 	}
 }
 
+func TestProxyUsesCustomDialerForHTTP(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	backLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backLn.Close()
+	go func() {
+		for {
+			c, err := backLn.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				br := bufio.NewReader(c)
+				if _, err := http.ReadRequest(br); err != nil {
+					return
+				}
+				_, _ = io.WriteString(c, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+			}(c)
+		}
+	}()
+
+	var dials atomic.Int32
+	px := proxy.NewWithDialer(stubRouter{proxy.Route{Kind: proxy.KindTCP, Addr: backLn.Addr().String(), AccessToken: "tok"}},
+		func() string { return "enforce" }, log, nil,
+		func(ctx context.Context, r proxy.Route) (net.Conn, error) {
+			dials.Add(1)
+			if r.Kind != proxy.KindTCP {
+				return nil, fmt.Errorf("dial route kind = %v, want KindTCP", r.Kind)
+			}
+			return (&net.Dialer{}).DialContext(ctx, "tcp", r.Addr)
+		})
+	ts := httptest.NewServer(px)
+	defer ts.Close()
+
+	req, _ := http.NewRequest("GET", ts.URL+"/echo", nil)
+	req.Header.Set("E2b-Sandbox-Id", "s1")
+	req.Header.Set("E2b-Sandbox-Port", "8080")
+	req.Header.Set("X-Access-Token", "tok")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK || string(b) != "ok" {
+		t.Fatalf("response code=%d body=%q", resp.StatusCode, string(b))
+	}
+	if got := dials.Load(); got != 1 {
+		t.Fatalf("custom dials=%d, want 1", got)
+	}
+}
+
 // TestConnectTunnel drives an HTTP/1.1 CONNECT: the target host is ignored (only the
 // port is honored), the access token is enforced, and bytes splice both ways to the
 // resolved backend.
@@ -216,8 +271,16 @@ func TestConnectTunnel(t *testing.T) {
 		}
 	}()
 
-	px := proxy.New(stubRouter{proxy.Route{Kind: proxy.KindTCP, Addr: backLn.Addr().String(), AccessToken: "tok"}},
-		func() string { return "enforce" }, log, nil)
+	var dials atomic.Int32
+	px := proxy.NewWithDialer(stubRouter{proxy.Route{Kind: proxy.KindTCP, Addr: backLn.Addr().String(), AccessToken: "tok"}},
+		func() string { return "enforce" }, log, nil,
+		func(ctx context.Context, r proxy.Route) (net.Conn, error) {
+			dials.Add(1)
+			if r.Kind != proxy.KindTCP {
+				return nil, fmt.Errorf("dial route kind = %v, want KindTCP", r.Kind)
+			}
+			return (&net.Dialer{}).DialContext(ctx, "tcp", r.Addr)
+		})
 	ts := httptest.NewServer(px)
 	defer ts.Close()
 	_, bport, _ := net.SplitHostPort(backLn.Addr().String())
@@ -258,6 +321,9 @@ func TestConnectTunnel(t *testing.T) {
 		t.Fatalf("tunnel echo = %q (want ping)", line)
 	}
 	c.Close()
+	if got := dials.Load(); got != 1 {
+		t.Fatalf("CONNECT custom dials=%d, want 1", got)
+	}
 
 	// Missing token in enforce mode: 401, no tunnel.
 	code, c2, _ := connect("")
@@ -265,6 +331,9 @@ func TestConnectTunnel(t *testing.T) {
 		t.Fatalf("CONNECT without token = %d (want 401)", code)
 	}
 	c2.Close()
+	if got := dials.Load(); got != 1 {
+		t.Fatalf("CONNECT unauthorized dials=%d, want still 1", got)
+	}
 }
 
 func TestProxyNotFoundAndDeny(t *testing.T) {

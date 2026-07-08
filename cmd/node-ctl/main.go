@@ -36,6 +36,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/launcher"
 	"github.com/kuasar-sandbox/orchestrator/internal/metrics"
 	"github.com/kuasar-sandbox/orchestrator/internal/mmds"
+	"github.com/kuasar-sandbox/orchestrator/internal/netns"
 	"github.com/kuasar-sandbox/orchestrator/internal/nodelink"
 	"github.com/kuasar-sandbox/orchestrator/internal/orch"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxy"
@@ -242,7 +243,16 @@ func runConductor(args []string, log *slog.Logger) error {
 	// proxyForwarder to worker (external), or reject (off). External mode also
 	// starts the route-sync client that pushes the route table to each worker.
 	mx := metrics.New()
-	dataH := buildDataPlane(cfg, core, plugins, mx, log)
+	var proxyNS *netns.NetNS
+	if cfg.Proxy.Mode == config.ProxyInternal && cfg.Proxy.ProxyNetNS != "" {
+		proxyNS, err = openProxyNetNS(cfg.Proxy.ProxyNetNS)
+		if err != nil {
+			return err
+		}
+		defer proxyNS.Close()
+		log.Info("node-ctl internal proxy forwarding netns", "proxy_netns", cfg.Proxy.ProxyNetNS)
+	}
+	dataH := buildDataPlane(cfg, core, plugins, mx, log, proxyNS)
 
 	// North handler: api.<domain> -> control plane; <port>-<sid>.<domain> -> data plane.
 	mux := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -281,11 +291,11 @@ func runConductor(args []string, log *slog.Logger) error {
 	// route table on the master's mmds_listen. The host must redirect
 	// 169.254.169.254:80 -> mmds.listen.
 	if cfg.MMDS.Enabled && cfg.Proxy.Mode == config.ProxyInternal {
-		mln, err := net.Listen("tcp", cfg.MMDS.Listen)
+		mln, err := listenTCPInNetNS(proxyNS, cfg.MMDS.Listen)
 		if err != nil {
 			return fmt.Errorf("mmds listen %s: %w", cfg.MMDS.Listen, err)
 		}
-		log.Info("mmds metadata service", "listen", cfg.MMDS.Listen)
+		log.Info("mmds metadata service", "listen", cfg.MMDS.Listen, "proxy_netns", cfg.Proxy.ProxyNetNS)
 		go func() {
 			if err := mmds.New(core, cfg.ParkTimeoutDur(), log).Serve(ctx, mln); err != nil {
 				log.Error("mmds service", "err", err)
@@ -305,7 +315,7 @@ func runConductor(args []string, log *slog.Logger) error {
 }
 
 // buildDataPlane wires the data-plane handler for the configured proxy_mode.
-func buildDataPlane(cfg *config.Config, core *orch.Orchestrator, plugins *configsock.Registry, mx *metrics.M, log *slog.Logger) http.Handler {
+func buildDataPlane(cfg *config.Config, core *orch.Orchestrator, plugins *configsock.Registry, mx *metrics.M, log *slog.Logger, proxyNS *netns.NetNS) http.Handler {
 	switch cfg.Proxy.Mode {
 	case config.ProxyOff:
 		return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -318,6 +328,6 @@ func buildDataPlane(cfg *config.Config, core *orch.Orchestrator, plugins *config
 		log.Info("external proxy mode: proxy master registers on the config socket")
 		return newProxyForwarder(plugins, mx, log)
 	default: // internal
-		return proxy.New(core, func() string { return cfg.Proxy.Auth }, log, mx)
+		return proxy.NewWithDialer(core, func() string { return cfg.Proxy.Auth }, log, mx, routeDialerInNetNS(proxyNS))
 	}
 }

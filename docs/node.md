@@ -201,7 +201,7 @@ node-ctl conductor serve [--config /etc/node-ctl/conductor.yaml]
 node-ctl proxy serve --config /etc/node-ctl/proxy.yaml
 ```
 
-策略与端点(`config_socket`/`data_listen`/`proxy_socket`/`shm_path`/`workers`/`tls`/
+策略与端点(`config_socket`/`data_listen`/`proxy_netns`/`proxy_socket`/`shm_path`/`workers`/`tls`/
 `auth`/`park_timeout`/`mmds_listen`)在 `proxy.yaml`;master 在 plugin 平面注册一次,
 维护共享路由视图并把 listener fd 传给 worker。部署模式与拓扑见
 node-proxy.md §2、§5——转发层自成一文,本仓控制面只在 §9 讲如何按 `proxy.mode` 装配它。
@@ -315,6 +315,7 @@ node-ctl 同目录 → PATH"自动发现。
 | `api.tls.cert/key` | 空 | 通配证书(`*.<domain>` 与 `api.<domain>`,§13);空 = 明文 |
 | `proxy.mode` | `internal` | 数据面承载:`internal`/`external`/`off`(装配见 §9.1,部署模式见 node-proxy.md §5) |
 | `proxy.data_listen` | 空 | internal 模式专用数据面监听;空 = 与 `api.listen` 共口。external 模式数据口在 worker 的 `proxy.yaml`(serve 不绑) |
+| `proxy.proxy_netns` | 空 | internal 模式转发平面 netns:proxy 到 `floatingip:port` 的 TCP dial 与 `mmds.listen` 绑定都在该 netns;external 模式在 `proxy.yaml` 配同名字段 |
 | `proxy.park_timeout` | `30s` | 数据面请求挂起预算:等路由同步 / paused 沙箱 resume 的上限(node-proxy.md §5) |
 | `proxy.auth` | `enforce` | 数据面鉴权:`off`/`log`/`enforce`,校验 `X-Access-Token`(node-proxy.md §7) |
 | `proxy.metrics_listen` | 空(关) | conductor 进程 Prometheus 文本端点:internal 模式含 `data_requests_total`,external 模式主要含 `proxy_forwarder_total`;external worker 数据面指标在 proxy.yaml `metrics_listen` |
@@ -361,7 +362,8 @@ node-ctl 同目录 → PATH"自动发现。
 
 配置自洽校验:`mmds.enabled=false` 时 `proxy.auth` 必须为 `enforce`(envd 非 secure,
 proxy 是唯一数据面闸门);`mmds.enabled=true` 时 `proxy.mode` 不得为 `off`(MMDS 寄宿
-proxy 组件)。external 模式无须静态 worker 列表——worker 自行经 plugin 平面注册,proxyForwarder
+proxy 组件)。`proxy.proxy_netns` 仅在 internal 模式有效;external 模式在 `proxy.yaml`
+配置 `proxy_netns`。external 模式无须静态 worker 列表——worker 自行经 plugin 平面注册,proxyForwarder
 按活跃注册集转发(§9.1、§9.3)。配 `cluster.node_link.endpoint` 时 `cluster.node_id` 必填;配
 `resource_listen` 时 `sandbox.resources.control_socket` 通常指向它(否则控制器空跑)。
 

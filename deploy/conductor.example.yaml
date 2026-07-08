@@ -31,6 +31,7 @@ proxy:
   mode: internal
   auth: enforce
   # data_listen: ""                              # internal-mode dedicated addr; "" = share api.listen
+  # proxy_netns: sw0_mgmt                        # internal-mode floatingip dials + MMDS listen netns
   # park_timeout: 30s
   # metrics_listen: 127.0.0.1:9095               # serve's own metrics; "" = off
 

@@ -12,6 +12,12 @@ config_socket: /run/sandbox/node-ctl.socket
 # Data-plane ingress. The master binds once and passes the same listener fd to all
 # workers. "" = serve only proxy-forwards over proxy_socket.
 data_listen: ":443"
+
+# Forwarding plane netns. Set this to the connector --mgmt-extract netns so workers'
+# floatingip dials and mmds_listen live with the vswitch management plane. data_listen
+# stays in the master process's current netns.
+# proxy_netns: sw0_mgmt
+
 proxy_socket: /run/sandbox/proxy.sock
 shm_path: /run/sandbox/proxy-routes.shm
 route_capacity: 65536

@@ -34,6 +34,12 @@ if [ -z "${ZOT_BIN:-}" ]; then
     ZOT_BIN="$(command -v zot || true)"
 fi
 SW_NETNS="${SW_NETNS:-e2e_sw}"
+PROXY_NETNS="${PROXY_NETNS:-e2e_proxy_int}"
+PROXY_VETH_HOST="${PROXY_VETH_HOST:-e2eih0}"
+PROXY_VETH_NS="${PROXY_VETH_NS:-e2ein0}"
+PROXY_HOST_IP="${PROXY_HOST_IP:-172.31.253.1}"
+PROXY_NS_IP="${PROXY_NS_IP:-172.31.253.2}"
+FIP_CIDR="${FIP_CIDR:-100.100.96.0/20}"
 
 skip() { echo; echo "==> e2e_execute: skipping ($*)"; [ "${REQUIRE_EXEC:-0}" = "1" ] && { echo "REQUIRE_EXEC=1; failing" >&2; exit 1; }; exit 0; }
 fail() { echo "==> FAIL: $*" >&2; exit 1; }
@@ -47,6 +53,7 @@ command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1 || skip "docker
 [ -n "$ZOT_BIN" ] && [ -x "$ZOT_BIN" ] || skip "zot not found (set ZOT_BIN or install zot on PATH)"
 command -v mkfs.erofs >/dev/null 2>&1 || [ -x "$BIN/mkfs.erofs" ] || skip "mkfs.erofs not found"
 command -v ip >/dev/null 2>&1 || skip "iproute2 (ip) not found"
+command -v iptables >/dev/null 2>&1 || skip "iptables not found"
 [ -d /run/systemd/system ] || skip "systemd not PID1"
 [ -e /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ] || skip "/dev/kvm not available (rw)"
 docker image inspect "$E2E_IMAGE" >/dev/null 2>&1 || docker pull "$E2E_IMAGE" >/dev/null 2>&1 \
@@ -64,12 +71,18 @@ mkdir -p "$WORK/run" "$WORK/lib" "$WORK/store" "$WORK/zot/data"
 declare -a PIDS=()
 declare -a TAGS=()
 SW_STARTED=""
+ORIG_IP_FORWARD=""
 cleanup() {
     set +e
     systemctl stop 'sandbox-runner@*.service' 'sandbox-builder@*.service' 2>/dev/null
     for p in "${PIDS[@]:-}"; do [ -n "$p" ] && kill "$p" 2>/dev/null; done
     [ -n "$SW_STARTED" ] && "$BIN/connector-ctl" vswitch stop "$SWITCH" >/dev/null 2>&1
+    iptables -D FORWARD -i "$PROXY_VETH_HOST" -o "${SWITCH}m0" -j ACCEPT 2>/dev/null
+    iptables -D FORWARD -i "${SWITCH}m0" -o "$PROXY_VETH_HOST" -j ACCEPT 2>/dev/null
+    ip link del "$PROXY_VETH_HOST" 2>/dev/null
+    ip netns del "$PROXY_NETNS" 2>/dev/null
     ip netns del "$SW_NETNS" 2>/dev/null
+    [ -n "$ORIG_IP_FORWARD" ] && sysctl -q -w "net.ipv4.ip_forward=$ORIG_IP_FORWARD" 2>/dev/null
     for u in "${OURS[@]:-}"; do [ -n "$u" ] && rm -f "$u"; done
     systemctl daemon-reload 2>/dev/null
     for t in "${TAGS[@]:-}"; do [ -n "$t" ] && docker rmi -f "$t" >/dev/null 2>&1; done
@@ -79,6 +92,36 @@ trap cleanup EXIT
 
 free_port() { python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()'; }
 wait_port() { for _ in $(seq 1 60); do (exec 3<>"/dev/tcp/$1/$2") 2>/dev/null && { exec 3>&- 3<&-; return 0; }; sleep 0.5; done; fail "$3 did not open $1:$2"; }
+wait_mmds_listener() {
+    local hex
+    hex="$(printf '%04X' "$MMDS_PORT")"
+    for _ in $(seq 1 60); do
+        ip netns exec "$PROXY_NETNS" awk -v p=":$hex" '$2 ~ p && $4 == "0A" { found = 1 } END { exit(found ? 0 : 1) }' /proc/net/tcp 2>/dev/null && return 0
+        sleep 0.5
+    done
+    fail "internal mmds listener did not appear in proxy_netns=$PROXY_NETNS on $PROXY_NS_IP:$MMDS_PORT"
+}
+setup_proxy_netns() {
+    ip link del "$PROXY_VETH_HOST" 2>/dev/null || true
+    ip netns del "$PROXY_NETNS" 2>/dev/null || true
+    ip netns add "$PROXY_NETNS"
+    ip link add "$PROXY_VETH_HOST" type veth peer name "$PROXY_VETH_NS"
+    ip link set "$PROXY_VETH_NS" netns "$PROXY_NETNS"
+    ip addr add "$PROXY_HOST_IP/30" dev "$PROXY_VETH_HOST"
+    ip link set "$PROXY_VETH_HOST" up
+    ip netns exec "$PROXY_NETNS" ip addr add "$PROXY_NS_IP/30" dev "$PROXY_VETH_NS"
+    ip netns exec "$PROXY_NETNS" ip link set lo up
+    ip netns exec "$PROXY_NETNS" ip link set "$PROXY_VETH_NS" up
+    ip netns exec "$PROXY_NETNS" ip route add "$FIP_CIDR" via "$PROXY_HOST_IP"
+    ORIG_IP_FORWARD="$(sysctl -n net.ipv4.ip_forward 2>/dev/null || true)"
+    sysctl -q -w net.ipv4.ip_forward=1
+}
+allow_proxy_forwarding() {
+    iptables -C FORWARD -i "$PROXY_VETH_HOST" -o "${SWITCH}m0" -j ACCEPT 2>/dev/null \
+        || iptables -A FORWARD -i "$PROXY_VETH_HOST" -o "${SWITCH}m0" -j ACCEPT
+    iptables -C FORWARD -i "${SWITCH}m0" -o "$PROXY_VETH_HOST" -j ACCEPT 2>/dev/null \
+        || iptables -A FORWARD -i "${SWITCH}m0" -o "$PROXY_VETH_HOST" -j ACCEPT
+}
 req() {
     local method="$1" path="$2" key="$3" body="${4:-}"
     local args=(-sS --noproxy '*' -o "$WORK/resp.body" -w '%{http_code}' -X "$method" -H "Host: api.$DOMAIN" -H "X-API-KEY: $key")
@@ -86,6 +129,12 @@ req() {
     # network spec to exercise X-Kuasar-Sandbox-Network on a create.
     [ -n "${REQ_NET_HEADER:-}" ] && args+=(-H "X-Kuasar-Sandbox-Network: ${REQ_NET_HEADER}")
     [ -n "$body" ] && args+=(-H 'Content-Type: application/json' -d "$body")
+    curl "${args[@]}" "http://127.0.0.1:$PORT$path"
+}
+dp() {
+    local port_sid="$1" path="$2" token="${3:-}"
+    local args=(-sS --max-time "${DP_MAX_TIME:-120}" --noproxy '*' -o "$WORK/dp.body" -w '%{http_code}' -H "Host: $port_sid.$DOMAIN")
+    [ -n "$token" ] && args+=(-H "X-Access-Token: $token")
     curl "${args[@]}" "http://127.0.0.1:$PORT$path"
 }
 
@@ -154,6 +203,8 @@ echo "==> store-ctl + zot up; built+seeded $REF (user + ionice/nice shims)"
 # switch of the same name (eBPF maps are pinned and survive a crash; --force
 # drains orphaned ports), then create the netns fresh.
 MGMT_VIP="169.254.169.254"
+MMDS_PORT="$(free_port)"
+setup_proxy_netns
 "$BIN/connector-ctl" vswitch stop "$SWITCH" --force >/dev/null 2>&1 || true
 ip netns del "$SW_NETNS" 2>/dev/null || true
 ip netns del "$SWITCH" 2>/dev/null || true
@@ -165,10 +216,12 @@ echo "==> starting vswitch $SWITCH (netns=$SW_NETNS)"
     --mac-addr=02:00:00:00:00:01 \
     --floating-ip-base=100.100.96.0 \
     --mode=tap \
-    --mgmt-extract=:${SWITCH}m0:$MGMT_VIP,0.0.0.0/0 >"$WORK/vswitch-start.log" 2>&1 || { echo "vswitch start failed:"; sed 's/^/  /' "$WORK/vswitch-start.log"; fail "vswitch start"; }
+    --mgmt-extract=:${SWITCH}m0:$MGMT_VIP,0.0.0.0/0 \
+    --mgmt-service=$MGMT_VIP:80:$PROXY_NS_IP:$MMDS_PORT >"$WORK/vswitch-start.log" 2>&1 || { echo "vswitch start failed:"; sed 's/^/  /' "$WORK/vswitch-start.log"; fail "vswitch start"; }
 SW_STARTED=1
+allow_proxy_forwarding
 GUEST_REF="$MGMT_VIP:$ZOT_PORT/e2e/app:v1"
-echo "==> vswitch up (build sandboxes pull $GUEST_REF)"
+echo "==> vswitch up (build sandboxes pull $GUEST_REF; internal proxy_netns=$PROXY_NETNS reaches $FIP_CIDR)"
 
 cat > "$WORK/manifest.yaml" <<EOF
 manifest: { key: "" }
@@ -194,6 +247,8 @@ truncate -s 2G "$BLD"
 
 cat > "$WORK/config.yaml" <<EOF
 api: { domain: $DOMAIN, listen: ":$PORT" }
+proxy: { mode: internal, auth: enforce, proxy_netns: $PROXY_NETNS }
+mmds: { enabled: true, listen: "$PROXY_NS_IP:$MMDS_PORT" }
 encryption_key: "$ENC"
 manifest_config: $WORK/manifest.yaml
 paths: { run_root: $WORK/run, base_root: $WORK/lib, config_socket: $WORK/node-ctl.socket }
@@ -217,6 +272,8 @@ for _ in $(seq 1 30); do
     sleep 0.5
 done
 echo "==> node-ctl up (:$PORT)"
+wait_mmds_listener
+echo "==> PASS: internal mmds.listen is bound in proxy_netns=$PROXY_NETNS"
 "$BIN/node-ctl" manifest-key add --socket "$WORK/node-ctl.socket" "$MK" >/dev/null || fail "manifest-key add"
 
 # ---- build a ready template (native v3, proven) ---------------------------
@@ -311,6 +368,21 @@ echo "==> PASS: command executed in guest (saw $MARK, exit 0)"
 # hostname. Best-effort (the main flow already passed); a note rather than a failure.
 if grep -q "$CFG_HOST" "$WORK/exec.out"; then echo "==> PASS: config injected (guest hostname=$CFG_HOST via X-Kuasar-Sandbox-Network)"
 else echo "    (note: guest hostname != $CFG_HOST; config-injection check inconclusive)"; fi
+
+# ---- internal proxy_netns -> floatingip user port -------------------------
+USER_MARK="internal-proxy-netns-user-port-$RANDOM"
+python3 "$WORK/envd_exec.py" "$ENVD_SOCK" "$ENVD_TOKEN" \
+    "mkdir -p /home/user/e2e-site; echo '$USER_MARK' > /home/user/e2e-site/index.html; cd /home/user/e2e-site; python3 -m http.server 8000 --bind 0.0.0.0 >/tmp/e2e-http-8000.log 2>&1 &" \
+    >"$WORK/start-user-port.out" 2>&1 || true
+grep -q 'EXIT_CODE 0' "$WORK/start-user-port.out" || { sed 's/^/  envd| /' "$WORK/start-user-port.out"; fail "start guest user-port server"; }
+ok=""
+for _ in $(seq 1 30); do
+    code=$(DP_MAX_TIME=8 dp "8000-$SID" / "$ENVD_TOKEN" || true)
+    grep -q "$USER_MARK" "$WORK/dp.body" 2>/dev/null && { ok=1; break; }
+    sleep 0.5
+done
+[ -n "$ok" ] || { echo "last code=$code"; cat "$WORK/dp.body"; sed 's/^/  orch| /' "$WORK/orch.log"; fail "internal proxy_netns -> floatingip user port did not return marker"; }
+echo "==> PASS: internal proxy per-dial proxy_netns reached sandbox floatingip:8000 (marker=$USER_MARK)"
 
 # ---- pause (snapshot+upload) -> resume -> verify state survived ------------
 # Write a marker file in the guest BEFORE pausing; after resume it must still be

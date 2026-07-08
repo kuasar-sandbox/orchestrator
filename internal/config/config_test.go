@@ -69,6 +69,69 @@ sandbox:
 	}
 }
 
+func TestLoadAcceptsInternalProxyNetNS(t *testing.T) {
+	t.Setenv("NODE_CONFIG_ENCRYPTION_KEY", "")
+	path := writeConfig(t, `
+api:
+  domain: example.test
+encryption_key: test-key
+proxy:
+  mode: internal
+  proxy_netns: sw0_mgmt
+sandbox:
+  boot:
+    kernel: /opt/sandbox/vmlinux
+    runtime: /opt/sandbox/sandbox-runtime.erofs
+`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+	if got := cfg.Proxy.ProxyNetNS; got != "sw0_mgmt" {
+		t.Fatalf("proxy.proxy_netns = %q", got)
+	}
+}
+
+func TestLoadRejectsExternalConductorProxyNetNS(t *testing.T) {
+	t.Setenv("NODE_CONFIG_ENCRYPTION_KEY", "")
+	path := writeConfig(t, `
+api:
+  domain: example.test
+encryption_key: test-key
+proxy:
+  mode: external
+  proxy_netns: sw0_mgmt
+sandbox:
+  boot:
+    kernel: /opt/sandbox/vmlinux
+    runtime: /opt/sandbox/sandbox-runtime.erofs
+`)
+
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("Load succeeded with proxy.proxy_netns in external mode")
+	}
+	if !strings.Contains(err.Error(), "proxy.proxy_netns") {
+		t.Fatalf("error %q does not mention proxy.proxy_netns", err)
+	}
+}
+
+func TestLoadProxyAcceptsProxyNetNS(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "proxy.yaml")
+	if err := os.WriteFile(path, []byte("proxy_netns: sw0_mgmt\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := LoadProxy(path)
+	if err != nil {
+		t.Fatalf("LoadProxy failed: %v", err)
+	}
+	if got := cfg.ProxyNetNS; got != "sw0_mgmt" {
+		t.Fatalf("proxy_netns = %q", got)
+	}
+}
+
 func writeConfig(t *testing.T, body string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "node.yaml")

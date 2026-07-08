@@ -20,6 +20,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/metrics"
 	"github.com/kuasar-sandbox/orchestrator/internal/mmds"
+	"github.com/kuasar-sandbox/orchestrator/internal/netns"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxy"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxyshm"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
@@ -71,6 +72,14 @@ func runProxyMaster(ctx context.Context, cfgPath string, cfg *config.ProxyFileCo
 	view := proxyshm.NewMasterView(table, cfg.ParkTimeoutDur(), log)
 	view.SetPolicy(routesync.Policy{AuthMode: cfg.Auth, ParkTimeoutMS: int(cfg.ParkTimeoutDur() / time.Millisecond)})
 
+	proxyNS, err := openProxyNetNS(cfg.ProxyNetNS)
+	if err != nil {
+		return err
+	}
+	if proxyNS != nil {
+		defer proxyNS.Close()
+	}
+
 	forwardLn, err := listenUnix(cfg.ProxySocket)
 	if err != nil {
 		return fmt.Errorf("proxy: listen proxy_socket %s: %w", cfg.ProxySocket, err)
@@ -88,7 +97,7 @@ func runProxyMaster(ctx context.Context, cfgPath string, cfg *config.ProxyFileCo
 
 	var mmdsLn net.Listener
 	if cfg.MMDSListen != "" {
-		mmdsLn, err = net.Listen("tcp", cfg.MMDSListen)
+		mmdsLn, err = listenTCPInNetNS(proxyNS, cfg.MMDSListen)
 		if err != nil {
 			return fmt.Errorf("proxy: listen mmds_listen %s: %w", cfg.MMDSListen, err)
 		}
@@ -101,7 +110,7 @@ func runProxyMaster(ctx context.Context, cfgPath string, cfg *config.ProxyFileCo
 	}
 
 	for i := 0; i < cfg.Workers; i++ {
-		go superviseProxyWorker(ctx, i, cfgPath, cfg, dataLn, forwardLn, mmdsLn, view, mx, log)
+		go superviseProxyWorker(ctx, i, cfgPath, cfg, proxyNS, dataLn, forwardLn, mmdsLn, view, mx, log)
 	}
 
 	reg := routesync.Register{
@@ -119,6 +128,7 @@ func runProxyMaster(ctx context.Context, cfgPath string, cfg *config.ProxyFileCo
 		"data_listen", cfg.DataListen,
 		"proxy_socket", cfg.ProxySocket,
 		"mmds_listen", cfg.MMDSListen,
+		"proxy_netns", cfg.ProxyNetNS,
 		"config_socket", cfg.ConfigSocket,
 		"shm_path", cfg.ShmPath,
 		"route_capacity", cfg.RouteCapacity,
@@ -191,10 +201,10 @@ func runProxyWorker(ctx context.Context, cfg *config.ProxyFileConfig, log *slog.
 	}
 }
 
-func superviseProxyWorker(ctx context.Context, idx int, cfgPath string, cfg *config.ProxyFileConfig, dataLn, forwardLn, mmdsLn net.Listener, view *proxyshm.MasterView, mx *metrics.M, log *slog.Logger) {
+func superviseProxyWorker(ctx context.Context, idx int, cfgPath string, cfg *config.ProxyFileConfig, proxyNS *netns.NetNS, dataLn, forwardLn, mmdsLn net.Listener, view *proxyshm.MasterView, mx *metrics.M, log *slog.Logger) {
 	workerID := fmt.Sprintf("proxy-%d", idx)
 	for ctx.Err() == nil {
-		err := runProxyWorkerProcess(ctx, workerID, cfgPath, dataLn, forwardLn, mmdsLn, view, mx, log)
+		err := runProxyWorkerProcess(ctx, workerID, cfgPath, proxyNS, dataLn, forwardLn, mmdsLn, view, mx, log)
 		if ctx.Err() != nil {
 			return
 		}
@@ -207,7 +217,7 @@ func superviseProxyWorker(ctx context.Context, idx int, cfgPath string, cfg *con
 	}
 }
 
-func runProxyWorkerProcess(ctx context.Context, workerID, cfgPath string, dataLn, forwardLn, mmdsLn net.Listener, view *proxyshm.MasterView, mx *metrics.M, log *slog.Logger) error {
+func runProxyWorkerProcess(ctx context.Context, workerID, cfgPath string, proxyNS *netns.NetNS, dataLn, forwardLn, mmdsLn net.Listener, view *proxyshm.MasterView, mx *metrics.M, log *slog.Logger) error {
 	exe, err := os.Executable()
 	if err != nil {
 		return err
@@ -273,7 +283,7 @@ func runProxyWorkerProcess(ctx context.Context, workerID, cfgPath string, dataLn
 	cmd.ExtraFiles = files
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	if err := cmd.Start(); err != nil {
+	if err := startCommandInNetNS(proxyNS, cmd); err != nil {
 		removeNotify()
 		closeFiles(files)
 		return err
