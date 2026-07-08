@@ -2,10 +2,7 @@
 # This manifest only drives release-builder/bin/<arch>/ assembly for local e2e,
 # demos, and release packaging. It is not the release package layout.
 guest-runtime/native-deps mkfs.erofs
-guest-runtime/native-deps fsck.erofs
 guest-runtime/native-deps vmlinux
-guest-runtime/native-deps envd
-guest-runtime/native-deps versitygw
 accelerator              manifest-ctl
 accelerator              store-ctl
 accelerator              cache-ctl

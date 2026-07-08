@@ -161,7 +161,7 @@ sandbox group provider/importer 做放置决策。分层缓存(L1/L2)是可替�
 
 | 仓 | 角色 | 关键进程/产物 | 导出面 | 详设 |
 |---|---|---|---|---|
-| **orchestrator/release-builder** | 系统文档 + 发布聚合 + 跨仓 e2e/perf | `release.sh` 可合并组件包 | — | 本文 + `deployment.md`/`perf.md` |
+| **orchestrator/release-builder** | 系统文档 + 发布聚合 + 跨仓 e2e/perf | `release.sh` 可合并组件包;源码树 `make e2e-tools` 可辅助获取测试环境工具 | — | 本文 + `deployment.md`/`perf.md` |
 | **sandboxer** | microVM 生命周期引擎:一沙箱一进程的沙箱控制(块设备/快照代理、内存统一持有、balloon 环)+ Guest 一号进程源码 | `sandbox-ctl`、`sandbox-init` | `pkg/resource`(资源控制协议+Client) | `sandboxer/docs/sandbox.md`、`sandboxer/docs/sandbox-init.md` |
 | **accelerator** | 内容加速:分块/收敛加密/清单库 + 内容寻址存储 + 分层缓存 | `manifest-ctl`、`store-ctl`、`cache-ctl` | `pkg/manifest`、`pkg/{cache,store}/client` | `accelerator/docs/{manifest,store,cache}.md` |
 | **connector** | eBPF/TC 虚拟交换机:单节点 4096 端口隔离网络 + tapfd 交接 | `connector-ctl vswitch`、`connector-ctl tapfd get` | `pkg/tapfd`(fd 交接规约) | `connector/docs/{vswitch,tapfd}.md` |

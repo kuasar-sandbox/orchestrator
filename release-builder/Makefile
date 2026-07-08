@@ -34,8 +34,12 @@ export TARGET_ARCH
 
 BINDIR         := bin/$(TARGET_ARCH)
 SBIN           := $(abspath $(BINDIR))
+E2E_TOOL_DIR   := build/e2e-tools/$(TARGET_ARCH)
+E2E_ZOT_BIN    := $(abspath $(E2E_TOOL_DIR)/zot)
+E2E_VGW_BIN    := $(abspath $(E2E_TOOL_DIR)/versitygw)
 BIN_INPUTS_MANIFEST := scripts/bin-inputs.manifest
 GO_REPOS       := accelerator sandboxer guest-runtime connector orchestrator
+ZOT_VERSION    ?= v2.1.17
 
 # Cross-repo e2e tests this repo carries (each needs binaries from multiple
 # sub-repos: vmlinux/mkfs.erofs from guest-runtime/native-deps,
@@ -60,7 +64,7 @@ E2E_REQUIRE_ENV := REQUIRE_KVM=1 REQUIRE_EXEC=1 REQUIRE_CLUSTER_STUB=1 \
 
 PERF_TARGETS := perf-sandbox perf-sandbox-manifest perf-density
 
-.PHONY: all build collect release vet test clean help demo \
+.PHONY: all build collect e2e-tools release vet test clean help demo \
         bench test-e2e perf dedup-report \
         $(UMBRELLA_E2E) $(PERF_TARGETS)
 
@@ -70,16 +74,21 @@ all: build
 # (mkfs.erofs is needed by guest-runtime), sandboxer builds sandbox-init and
 # cloud-hypervisor, then guest-runtime packs the guest erofs and builds
 # flatten-ctl. Each sub-repo's `build` builds every binary it ships. After all
-# sub-builds, `collect` assembles every artifact under bin/$(TARGET_ARCH)/; the
-# single guest runtime already contains envd/flatten-ctl/mkfs.erofs.
+# sub-builds, `collect` assembles sub-repo artifacts under bin/$(TARGET_ARCH)/.
+# Environment tools used only by tests are kept under build/e2e-tools/ and are
+# never packaged as release artifacts.
 build:
-	$(MAKE) -C $(ORG)/guest-runtime/native-deps build versitygw
+	$(MAKE) -C $(ORG)/guest-runtime/native-deps build
 	$(MAKE) -C $(ORG)/accelerator build
 	$(MAKE) -C $(ORG)/sandboxer build
 	$(MAKE) -C $(ORG)/guest-runtime build
 	$(MAKE) -C $(ORG)/connector build
 	$(MAKE) -C $(ORG)/orchestrator build
 	@$(MAKE) collect
+
+e2e-tools:
+	BINDIR="$(abspath $(E2E_TOOL_DIR))" TARGET_ARCH="$(TARGET_ARCH)" ZOT_VERSION="$(ZOT_VERSION)" bash scripts/ensure-zot.sh
+	BINDIR="$(abspath $(E2E_TOOL_DIR))" TARGET_ARCH="$(TARGET_ARCH)" bash scripts/ensure-versitygw.sh
 
 # Assemble bin/$(TARGET_ARCH)/ from each sub-repo's per-arch bin per the
 # binary-input manifest. Native builds drop a bin/<name> symlink to the per-arch
@@ -97,6 +106,7 @@ collect:
 	  fi; \
 	done < $(BIN_INPUTS_MANIFEST)
 	@if [ "$(HOST_ARCH)" = "$(TARGET_ARCH)" ]; then \
+	   find bin -maxdepth 1 -type l -delete 2>/dev/null || true; \
 	   while read repo name; do \
 	     case "$$repo" in ''|\#*) continue ;; esac; \
 	     [ -n "$$repo" ] || continue; \
@@ -117,15 +127,15 @@ release: build
 # Static pattern rule (bound to $(UMBRELLA_E2E)): `test-e2e-<sub>` runs
 # test/e2e/e2e_<sub>.sh, with dashes in <sub> mapped to underscores so
 # test-e2e-sandbox-cold → e2e_sandbox_cold.sh.
-$(UMBRELLA_E2E): test-e2e-%: build
-	$(E2E_REQUIRE_ENV) BIN=$(SBIN) bash test/e2e/e2e_$(subst -,_,$*).sh
+$(UMBRELLA_E2E): test-e2e-%: build e2e-tools
+	$(E2E_REQUIRE_ENV) BIN=$(SBIN) ZOT_BIN=$(E2E_ZOT_BIN) VGW_BIN=$(E2E_VGW_BIN) bash test/e2e/e2e_$(subst -,_,$*).sh
 
 # Aggregate test-e2e: every umbrella sub-target + each sub-repo's test-e2e.
-test-e2e: build $(UMBRELLA_E2E)
+test-e2e: build e2e-tools $(UMBRELLA_E2E)
 	$(E2E_REQUIRE_ENV) $(MAKE) -C $(ORG)/accelerator test-e2e SBIN=$(SBIN)
 	$(E2E_REQUIRE_ENV) $(MAKE) -C $(ORG)/connector test-e2e
 	$(E2E_REQUIRE_ENV) $(MAKE) -C $(ORG)/guest-runtime test-e2e \
-		FLATTEN_CTL=$(SBIN)/flatten-ctl STORE_CTL=$(SBIN)/store-ctl
+		FLATTEN_CTL=$(SBIN)/flatten-ctl STORE_CTL=$(SBIN)/store-ctl ZOT_BIN=$(E2E_ZOT_BIN)
 
 # perf harnesses living in this repo (cross-repo binary use).
 perf-sandbox: build
@@ -151,8 +161,8 @@ dedup-report:
 # e2b end-to-end demo — the "try it" walkthrough driven by the unmodified e2b CLI
 # (build template → boot microVM → exec → pause/resume → kill). DEMO_PAUSE=1 to
 # step through and drive the CLI from another terminal; see test/demo/DEMO.md.
-demo: build
-	BIN=$(SBIN) bash test/demo/demo_prep.sh   # persistent store/cache/registry (idempotent; honors REGISTRY=…)
+demo: build e2e-tools
+	BIN=$(SBIN) ZOT_BIN=$(E2E_ZOT_BIN) VGW_BIN=$(E2E_VGW_BIN) bash test/demo/demo_prep.sh   # persistent store/cache/registry (idempotent; honors REGISTRY=…)
 	BIN=$(SBIN) bash test/demo/demo_e2b.sh
 
 # ---------------------------------------------------------------------------
@@ -172,6 +182,7 @@ help:
 	@echo "kuasar-sandbox — platform build entry. Targets:"
 	@echo "  build         build every sub-repo + assemble bin/\$$(TARGET_ARCH)/ (multi-min cold)"
 	@echo "  collect       re-assemble bin/\$$(TARGET_ARCH)/ from existing sub-repo outputs"
+	@echo "  e2e-tools     ensure local test environment tools under build/e2e-tools/\$$(TARGET_ARCH)/"
 	@echo "  release       build + package merge-safe component tarballs under dist/"
 	@echo "  test-e2e      aggregate: drive each sub-repo's test-e2e + run this repo's cross-repo e2e ($(words $(UMBRELLA_E2E)))"
 	@echo "  test-e2e-<X>  one e2e sub-target (X in {manifest,obs,density,sandbox-{cold,..},orchestrator,run-builder,execute,cluster-real,..})"

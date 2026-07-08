@@ -23,7 +23,9 @@ BIN="${BIN:-$REPO_ROOT/bin}"
 DOMAIN="${DOMAIN:-cluster.real.local}"
 SWITCH="${SWITCH:-sw0}"
 E2E_IMAGE="${E2E_IMAGE:-python:3.12-slim}"
-ZOT_BIN="${ZOT_BIN:-$(command -v zot || true)}"
+if [ -z "${ZOT_BIN:-}" ]; then
+    ZOT_BIN="$(command -v zot || true)"
+fi
 SW_NETNS="${SW_NETNS:-e2e_cluster_sw}"
 
 step() { echo "==> $*" >&2; }
@@ -90,7 +92,7 @@ done
 command -v python3 >/dev/null 2>&1 || skip "python3 not on PATH"
 command -v curl >/dev/null 2>&1 || skip "curl not on PATH"
 command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1 || skip "docker not usable"
-[ -n "$ZOT_BIN" ] && [ -x "$ZOT_BIN" ] || skip "zot not on PATH"
+[ -n "$ZOT_BIN" ] && [ -x "$ZOT_BIN" ] || skip "zot not found (set ZOT_BIN or install zot on PATH)"
 command -v mkfs.erofs >/dev/null 2>&1 || [ -x "$BIN/mkfs.erofs" ] || skip "mkfs.erofs not found"
 command -v ip >/dev/null 2>&1 || skip "iproute2 (ip) not found"
 [ -d /run/systemd/system ] || skip "systemd not PID1"

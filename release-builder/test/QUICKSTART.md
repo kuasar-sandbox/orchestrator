@@ -9,7 +9,7 @@
 ```
 <release-dir>/
 ├── bin/                       平台全部二进制(cloud-hypervisor / vmlinux /
-│                              mkfs.erofs / fsck.erofs / envd / manifest-ctl /
+│                              mkfs.erofs / manifest-ctl /
 │                              store-ctl / cache-ctl / flatten-ctl / sandbox-ctl /
 │                              sandbox-init / node-ctl / connector-ctl /
 │                              e2b-key-ctl / sandbox-runtime.erofs)
@@ -31,12 +31,15 @@
 
 ## 2. 前置条件
 
-每个 e2e 脚本头部都内置 `skip()` 探测,缺什么就打印什么并以 0 退出。设
-`REQUIRE_KVM=1` 把"跳过"改为"硬失败"。常见前置:
+每个 e2e 脚本头部都内置前置探测。直接运行单个脚本时,部分重型前置缺失会
+以 0 退出,方便在开发机上做局部验证;统一入口 `test/e2e/run_all.sh` 默认设置
+所有 `REQUIRE_*` 标志,除 OBS 凭据场景外,缺前置即失败。常见前置:
 
 - `/dev/kvm` 可读写(嵌套 KVM 亦可)
 - pre-existing TAP 设备已 up(默认名 `sb-tap0`,env `TAP_NAME` 覆盖)
 - `docker` 可用(用于 `docker pull` 拉镜像;可用 `BLK0_IMAGE=...` 提供预制 erofs 跳过)
+- `zot` 可用(本地 OCI registry;安装到 PATH 或设置 `ZOT_BIN=/path/to/zot`)
+- `versitygw` 可用(COPY/files_storage e2e;安装到 PATH 或设置 `VGW_BIN=/path/to/versitygw`)
 - 部分脚本需要 root(cgroup、network namespace、uffd)
 
 `bin/cloud-hypervisor` 和 `bin/vmlinux` 已在包内;脚本会自动指向它们。
@@ -54,7 +57,7 @@ bash test/e2e/e2e_sandbox_cold.sh      # 冷启 python:3.12-slim 并验证退出
 跑全套(顺序执行,每个独立):
 
 ```bash
-for f in test/e2e/*.sh; do bash "$f" || break; done
+bash test/e2e/run_all.sh
 ```
 
 ## 4. e2e 脚本清单
@@ -119,12 +122,14 @@ for f in test/e2e/*.sh; do bash "$f" || break; done
 | `e2e_orchestrator_proxy.sh` | external proxy(master routesync + shm route view + worker fd inheritance)+ 数据面 X-Access-Token + auto-resume |
 | `e2e_cluster_real.sh` | cluster-ctl registry/router/placer + 真实 node-ctl + 真实 microVM;阶段一 N=1 registry,阶段二 N=3 registry + node-link redirect |
 
-> **前置(比其他 e2e 重)**:这组脚本另需 systemd 为 PID1 + root、`zot`、
-> `docker`;`e2e_run_builder`/`e2e_execute`/`e2e_orchestrator_proxy` 还需
+> **前置(比其他 e2e 重)**:这组脚本另需 systemd 为 PID1 + root、`docker`、
+> `zot`(安装到 PATH 或设置 `ZOT_BIN`);`e2e_run_builder` 还需 `versitygw`
+> (安装到 PATH 或设置 `VGW_BIN`);`e2e_execute`/`e2e_orchestrator_proxy` 还需
 > `/dev/kvm` 与 `mkfs.ext4`;`e2e_cluster_real` 还需 `cluster-ctl` / `node-ctl`
 > / `connector-ctl` / `store-ctl` 等完整 release-builder `bin/`;demo 另需 e2b Python SDK
 > (`pip install e2b e2b-code-interpreter`)、`openssl`、`sqlite3`、`iptables`。
-> 脚本会自检,缺失即 skip。
+> `run_all.sh` 会打开所有 REQUIRE 标志,除 `e2e_obs.sh` 在 `OBS_E2E=1`
+> 未设置时允许跳过外,缺失前置都会失败。
 
 ## 5. perf / 分析脚本清单
 

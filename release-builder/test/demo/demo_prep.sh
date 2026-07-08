@@ -36,15 +36,14 @@ PID_DIR="$DEMO_DATA_DIR/pids"
 LOG_DIR="$DEMO_DATA_DIR/logs"
 E2E_IMAGE="${E2E_IMAGE:-e2bdev/code-interpreter:latest}"
 REGISTRY_NS="${REGISTRY_NS:-e2b}"
-ZOT_BIN="${ZOT_BIN:-$(command -v zot || true)}"
-# versitygw (S3 gateway) backs COPY build contexts (builder.files_storage). It is
-# opt-in (guest-runtime/native-deps `make versitygw`) and NOT in the umbrella bin, so locate it
-# like the e2e: $BIN, then the sibling guest-runtime/native-deps bin, then PATH. Absent → COPY
-# is disabled and demo_e2b.sh's build omits the COPY step (the rest still runs).
+if [ -z "${ZOT_BIN:-}" ]; then
+    ZOT_BIN="$(command -v zot || true)"
+fi
+# versitygw (S3 gateway) backs COPY build contexts (builder.files_storage).
+# Use VGW_BIN or a versitygw already on PATH. Absent -> COPY is disabled and
+# demo_e2b.sh's build omits the COPY step (the rest still runs).
 if [ -z "${VGW_BIN:-}" ]; then
-    for cand in "$BIN/versitygw" "$REPO_ROOT/../guest-runtime/native-deps/bin/versitygw" "$(command -v versitygw 2>/dev/null || true)"; do
-        [ -n "$cand" ] && [ -x "$cand" ] && { VGW_BIN="$cand"; break; }
-    done
+    VGW_BIN="$(command -v versitygw 2>/dev/null || true)"
 fi
 VGW_PORT="${VGW_PORT:-5050}"
 VGW_BUCKET="${VGW_BUCKET:-build-files}"
@@ -94,7 +93,7 @@ if [ -n "${REGISTRY:-}" ]; then
         ok "docker login $REGISTRY"
     fi
 else
-    [ -n "$ZOT_BIN" ] && [ -x "$ZOT_BIN" ] || die "no REGISTRY set and zot not on PATH — set REGISTRY=<host:port> or install zot"
+    [ -n "$ZOT_BIN" ] && [ -x "$ZOT_BIN" ] || die "no REGISTRY set and zot not found — set REGISTRY=<host:port>, set ZOT_BIN, or install zot on PATH"
     ZOT_PORT="${ZOT_PORT:-5000}"
     REGISTRY="127.0.0.1:$ZOT_PORT"; REGISTRY_INSECURE=1
     # 0.0.0.0: builds pull IN-GUEST — the build sandbox reaches this zot via the
@@ -162,7 +161,7 @@ if [ -n "${VGW_BIN:-}" ]; then
         || die "versitygw did not bind 127.0.0.1:$VGW_PORT (see $LOG_DIR/vgw.log)"
     ok "versitygw (S3, COPY contexts) on $VGW_ENDPOINT (bucket $VGW_BUCKET, data $DEMO_DATA_DIR/vgw)"
 else
-    say "versitygw not found — COPY build contexts disabled (run 'make -C ../guest-runtime/native-deps versitygw'); the demo build will omit COPY"
+    say "versitygw not found — COPY build contexts disabled (set VGW_BIN or install versitygw on PATH); the demo build will omit COPY"
 fi
 
 # ---- seed the base image into the registry (once; cached on reruns) --------

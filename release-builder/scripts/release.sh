@@ -195,6 +195,7 @@ package_component "orchestrator" "orchestrator-$VERSION-linux-$ARCH.tar.gz" \
   --tests \
     "orchestrator/release-builder/test/README.md:README.md" \
     "orchestrator/release-builder/test/QUICKSTART.md:QUICKSTART.md" \
+    "orchestrator/release-builder/test/e2e/run_all.sh:e2e/run_all.sh" \
     "orchestrator/release-builder/test/e2e/e2e_density.sh:e2e/e2e_density.sh" \
     "orchestrator/release-builder/test/e2e/e2e_manifest.sh:e2e/e2e_manifest.sh" \
     "orchestrator/release-builder/test/e2e/e2e_obs.sh:e2e/e2e_obs.sh" \
@@ -257,7 +258,7 @@ package_component "accelerator" "accelerator-$VERSION-linux-$ARCH.tar.gz" \
     "accelerator/test/scripts/proc_analyze.py:scripts/proc_analyze.py"
 
 package_component "guest-runtime" "guest-runtime-$VERSION-linux-$ARCH.tar.gz" \
-  --bins flatten-ctl mkfs.erofs fsck.erofs envd \
+  --bins flatten-ctl mkfs.erofs \
   --docs \
     "guest-runtime/README.md:guest-runtime.md" \
     "guest-runtime/docs/flatten.md" \
@@ -287,7 +288,6 @@ package_component "connector" "connector-$VERSION-linux-$ARCH.tar.gz" \
     "connector/examples/manage_switch.sh:connector/examples/manage_switch.sh" \
     "connector/examples/mgmt_isolation_test.sh:connector/examples/mgmt_isolation_test.sh" \
     "connector/examples/tap_test.sh:connector/examples/tap_test.sh" \
-    "connector/examples/tapfd_receiver:connector/examples/tapfd_receiver" \
     "connector/examples/perf_bench.sh:connector/examples/perf_bench.sh" \
     "connector/examples/provision_test.sh:connector/examples/provision_test.sh" \
     "connector/examples/start_perf_bench.sh:connector/examples/start_perf_bench.sh" \

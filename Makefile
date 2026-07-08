@@ -88,7 +88,7 @@ clean:
 test-e2e: build test-e2e-cluster-stub
 
 test-e2e-cluster-stub:
-	BIN="$(CURDIR)/$(BINDIR)" bash test/e2e/e2e_cluster_stub.sh
+	REQUIRE_CLUSTER_STUB=1 BIN="$(CURDIR)/$(BINDIR)" bash test/e2e/e2e_cluster_stub.sh
 
 help:
 	@echo "orchestrator. Targets:"

@@ -12,9 +12,9 @@
 #   POST /sandboxes  -> real VM + envd ; serve streams the route to the proxy
 #   GET <proxy>/health (Host 49983-<sid>): no token -> 401 (enforce);
 #                                          right X-Access-Token -> forwarded to envd
-#   CONNECT through the proxy (token on the CONNECT) -> tunnel to envd (best-effort)
+#   CONNECT through the proxy (token on the CONNECT) -> tunnel to envd
 #   GET <proxy> for an unknown sandbox -> wake -> 404 (orchestrator says gone)
-#   pause -> GET <proxy> -> wake -> auto-resume -> forwarded (best-effort)
+#   pause -> GET <proxy> -> wake -> auto-resume -> forwarded
 #   /metrics on the proxy master reports worker data-plane counters
 #
 # Setup mirrors e2e_execute.sh (real VM boot). Same heavy prerequisites: systemd+
@@ -31,7 +31,9 @@ PROXY_PORT="${PROXY_PORT:-3443}"
 METRICS_PORT="${METRICS_PORT:-3990}"
 SWITCH="${SWITCH:-sw0}"
 E2E_IMAGE="${E2E_IMAGE:-python:3.12-slim}"
-ZOT_BIN="${ZOT_BIN:-$(command -v zot || true)}"
+if [ -z "${ZOT_BIN:-}" ]; then
+    ZOT_BIN="$(command -v zot || true)"
+fi
 SW_NETNS="${SW_NETNS:-e2e_sw}"
 
 skip() { echo; echo "==> e2e_orchestrator_proxy: skipping ($*)"; [ "${REQUIRE_PROXY:-0}" = "1" ] && { echo "REQUIRE_PROXY=1; failing" >&2; exit 1; }; exit 0; }
@@ -41,8 +43,9 @@ for b in node-ctl sandbox-ctl flatten-ctl store-ctl e2b-key-ctl connector-ctl cl
 [ -f "$BIN/vmlinux" ] || skip "missing $BIN/vmlinux"
 [ -f "$BIN/sandbox-runtime.erofs" ] || skip "missing $BIN/sandbox-runtime.erofs"
 command -v curl >/dev/null 2>&1 || skip "curl not on PATH"
+command -v python3 >/dev/null 2>&1 || skip "python3 not on PATH"
 command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1 || skip "docker not usable"
-[ -n "$ZOT_BIN" ] && [ -x "$ZOT_BIN" ] || skip "zot not on PATH"
+[ -n "$ZOT_BIN" ] && [ -x "$ZOT_BIN" ] || skip "zot not found (set ZOT_BIN or install zot on PATH)"
 command -v mkfs.erofs >/dev/null 2>&1 || [ -x "$BIN/mkfs.erofs" ] || skip "mkfs.erofs not found"
 command -v ip >/dev/null 2>&1 || skip "iproute2 (ip) not found"
 [ -d /run/systemd/system ] || skip "systemd not PID1"
@@ -295,24 +298,58 @@ echo "==> PASS: proxy rejects a wrong token (401)"
 # ---- (2) unknown sandbox via proxy -> wake -> 404 -------------------------
 code=$(dp "49983-deadbeefdeadbeef" /health "$ENVD_TOKEN")
 if [ "$code" = "404" ]; then echo "==> PASS: unknown sandbox via proxy -> 404 (orchestrator resolved the wake as gone)"
-else echo "    (note: unknown-sandbox via proxy = $code; expected 404 after wake)"; fi
+else dump_logs; fail "unknown sandbox via proxy = $code (want 404 after wake)"; fi
 
 # ---- (3) metrics ----------------------------------------------------------
 if curl -sS --noproxy '*' "http://127.0.0.1:$METRICS_PORT/metrics" 2>/dev/null | grep -q 'data_requests_total'; then
     echo "==> PASS: proxy master /metrics reports aggregated worker data_requests_total"
-else echo "    (note: proxy master /metrics did not report data_requests_total)"; fi
+else dump_logs; fail "proxy master /metrics did not report data_requests_total"; fi
 
-# ---- (3b) CONNECT tunnel THROUGH the proxy to envd control (best-effort) ---
-# curl issues CONNECT 49983-<sid>.<domain>:49983 to the proxy (token on the CONNECT via
-# --proxy-header); the proxy auths + tunnels to the envd control UDS, then curl sends
-# GET /health over the tunnel. --proxytunnel/--proxy-header support varies by curl.
-cc=$(curl --proxytunnel -sS --noproxy '*' -x "http://127.0.0.1:$PROXY_PORT" \
-        --proxy-header "X-Access-Token: $ENVD_TOKEN" \
-        -o /dev/null -w '%{http_code}' "http://49983-$SID.$DOMAIN:49983/health" 2>/dev/null || true)
-if [ "$cc" = "204" ] || [ "$cc" = "200" ]; then echo "==> PASS: CONNECT tunnel through the proxy reached envd /health ($cc)"
-else echo "    (note: CONNECT tunnel check = ${cc:-err}; curl --proxytunnel/--proxy-header support varies)"; fi
+# ---- (3b) CONNECT tunnel THROUGH the proxy to envd control -----------------
+# Drive CONNECT with raw TCP so the test does not depend on curl proxy-header
+# feature variations. The proxy auths the CONNECT and then tunnels a GET /health
+# request to the envd control socket.
+cc=$(python3 - "$PROXY_PORT" "49983-$SID.$DOMAIN:49983" "$ENVD_TOKEN" <<'PY'
+import socket, sys
 
-# ---- (4) auto-resume THROUGH the proxy (best-effort: needs snapshot) ------
+proxy_port, target, token = int(sys.argv[1]), sys.argv[2], sys.argv[3]
+with socket.create_connection(("127.0.0.1", proxy_port), timeout=10) as s:
+    s.settimeout(10)
+    req = (
+        f"CONNECT {target} HTTP/1.1\r\n"
+        f"Host: {target}\r\n"
+        f"X-Access-Token: {token}\r\n"
+        "\r\n"
+    )
+    s.sendall(req.encode())
+    data = b""
+    while b"\r\n\r\n" not in data:
+        chunk = s.recv(4096)
+        if not chunk:
+            break
+        data += chunk
+    status = data.split(b"\r\n", 1)[0].decode("latin1", "replace")
+    if " 200 " not in status and not status.endswith(" 200"):
+        print(status or "no-connect-response")
+        sys.exit(0)
+    s.sendall(f"GET /health HTTP/1.1\r\nHost: {target}\r\nConnection: close\r\n\r\n".encode())
+    data = b""
+    while b"\r\n" not in data:
+        chunk = s.recv(4096)
+        if not chunk:
+            break
+        data += chunk
+    print((data.split(b"\r\n", 1)[0] or b"no-health-response").decode("latin1", "replace"))
+PY
+)
+if echo "$cc" | grep -Eq 'HTTP/[0-9.]+ (200|204)'; then
+    echo "==> PASS: CONNECT tunnel through the proxy reached envd /health ($cc)"
+else
+    dump_logs
+    fail "CONNECT tunnel through proxy failed: $cc"
+fi
+
+# ---- (4) auto-resume THROUGH the proxy ------------------------------------
 echo "==> pause $SID, then drive the proxy to trigger wake -> auto-resume"
 code=$(req POST "/sandboxes/$SID/pause" "$AK")
 if [ "$code" = "204" ]; then
@@ -323,8 +360,8 @@ if [ "$code" = "204" ]; then
         sleep 0.5
     done
     if [ -n "$ok" ]; then echo "==> PASS: auto-resume through the proxy (wake -> resume -> forwarded, code=$code)"
-    else echo "    (note: auto-resume via proxy did not complete, last code=$code — snapshot/restore may be unsupported in this build)"; fi
-else echo "    (note: pause returned $code; skipping auto-resume-through-proxy check)"; fi
+    else dump_logs; fail "auto-resume via proxy did not complete, last code=$code"; fi
+else dump_logs; fail "pause returned $code (want 204 before auto-resume check)"; fi
 
 # ---- teardown -------------------------------------------------------------
 code=$(req DELETE "/sandboxes/$SID" "$AK"); [ "$code" = "204" ] || { dump_logs; fail "kill=$code (want 204)"; }

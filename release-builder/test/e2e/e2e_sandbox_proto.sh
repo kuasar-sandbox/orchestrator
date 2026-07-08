@@ -194,7 +194,8 @@ print(f"==> PASS: ping attempts={attempts} success={success} timeout={timeout} d
 print(f"          rtt avg={rtt_avg/1000:.1f}us p99={rtt_p99/1000:.1f}us max={rtt_max/1000:.1f}us")
 PY
 else
-    echo "==> SKIP: python3 missing for stats-json validation; size=$(stat -c%s "$STATS_JSON") bytes"
+    echo "==> FAIL: python3 missing for stats-json validation; size=$(stat -c%s "$STATS_JSON") bytes"
+    exit 1
 fi
 
 echo "==> e2e_sandbox_proto: OK"

@@ -275,7 +275,8 @@ print(f"==> PASS: stats-json {b0['name']} reqs={b0['read']['count']} "
       f"p50={b0['read']['p50_ns']/1000:.1f}us p99={b0['read']['p99_ns']/1000:.1f}us")
 PY
 else
-    echo "==> SKIP: python3 missing for stats-json validation; file size $(stat -c%s "$STATS_JSON") bytes"
+    echo "==> FAIL: python3 missing for stats-json validation; file size $(stat -c%s "$STATS_JSON") bytes"
+    exit 1
 fi
 
 echo "==> e2e_sandbox_cold: OK"

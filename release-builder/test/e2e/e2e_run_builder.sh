@@ -41,16 +41,14 @@ DOMAIN="${DOMAIN:-sandboxes.e2e.local}"
 # Builds with steps/startCmd carry the e2b contract: envd runs them as
 # `/bin/bash -l -c` — the image must have bash (python:3.12-slim does).
 E2E_IMAGE="${E2E_IMAGE:-python:3.12-slim}"
-ZOT_BIN="${ZOT_BIN:-$(command -v zot || true)}"
+if [ -z "${ZOT_BIN:-}" ]; then
+    ZOT_BIN="$(command -v zot || true)"
+fi
 # versitygw (S3 gateway) backs COPY build contexts and is required by the full
-# test-e2e suite. Look in bin/, then guest-runtime/native-deps per-arch bin,
-# then PATH.
+# test-e2e suite. Use VGW_BIN or a versitygw already on PATH; source-tree
+# `make e2e-tools` prepares VGW_BIN under build/e2e-tools/.
 if [ -z "${VGW_BIN:-}" ]; then
-    for cand in "${BIN:-}/versitygw" \
-        "$REPO_ROOT/../guest-runtime/native-deps/bin/${TARGET_ARCH:-x86_64}/versitygw" \
-        "$(command -v versitygw 2>/dev/null || true)"; do
-        [ -n "$cand" ] && [ -x "$cand" ] && { VGW_BIN="$cand"; break; }
-    done
+    VGW_BIN="$(command -v versitygw 2>/dev/null || true)"
 fi
 VGW_BIN="${VGW_BIN:-}"
 SWITCH="${SWITCH:-swbld}"; SW_NETNS="${SW_NETNS:-e2ebld_sw}"; SW_MGMT="${SW_MGMT:-swbldm0}"
@@ -72,9 +70,10 @@ for f in vmlinux sandbox-runtime.erofs; do
     [ -f "$BIN/$f" ] || skip "missing $BIN/$f — run 'make all'"
 done
 command -v curl >/dev/null 2>&1 || skip "curl not on PATH"
+command -v python3 >/dev/null 2>&1 || skip "python3 not on PATH"
 command -v docker >/dev/null 2>&1 || skip "docker not on PATH"
 docker info >/dev/null 2>&1 || skip "docker daemon not usable"
-[ -n "$ZOT_BIN" ] && [ -x "$ZOT_BIN" ] || skip "zot not on PATH"
+[ -n "$ZOT_BIN" ] && [ -x "$ZOT_BIN" ] || skip "zot not found (set ZOT_BIN or install zot on PATH)"
 command -v mkfs.ext4 >/dev/null 2>&1 || [ -x /sbin/mkfs.ext4 ] || skip "mkfs.ext4 not found"
 [ -d /run/systemd/system ] || skip "systemd is not PID1 (orchestrator drives units over D-Bus)"
 [ -e /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ] || skip "/dev/kvm not available (rw)"
@@ -217,7 +216,7 @@ EOF
 )
     echo "==> versitygw up (127.0.0.1:$VGW_PORT, posix, bucket=$VGW_BUCKET) — COPY chain enabled"
 else
-    fail "versitygw missing; COPY chain is required by test-e2e (set VGW_BIN or build guest-runtime/native-deps versitygw)"
+    fail "versitygw missing; COPY chain is required by test-e2e (set VGW_BIN or install versitygw on PATH)"
 fi
 
 # ---- tenant credentials + orchestrator --------------------------------------
