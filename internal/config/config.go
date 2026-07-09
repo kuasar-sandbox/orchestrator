@@ -41,6 +41,12 @@ const (
 	CheckpointRemote = "remote" // sandbox-ctl snapshot --upload → manifest (portable; = a template)
 )
 
+// Sandbox restore local file reference policies.
+const (
+	RestoreFileRefsVerify = "verify" // re-hash local file:// refs against snapshot.cfg digests (default)
+	RestoreFileRefsTrust  = "trust"  // trust snapshot.cfg digests; skip local file content hashing
+)
+
 // Auto-discovered external binary names (resolved via Config.Bin against the
 // orchestrator binary's dir, then PATH). They are intentionally not config keys.
 const (
@@ -295,6 +301,12 @@ type SandboxConfig struct {
 	Resources  ResourcesConfig `yaml:"resources"`   // capacity + resource control
 	Network    NetworkConfig   `yaml:"network"`     // vswitch + inner IP
 	Boot       BootConfig      `yaml:"boot"`        // boot artifacts (kernel / guest runtime / overlay)
+	Restore    RestoreConfig   `yaml:"restore"`     // restore-time local file ref policy
+}
+
+// RestoreConfig tunes sandbox-ctl run --restore behavior.
+type RestoreConfig struct {
+	FileRefs string `yaml:"file_refs"` // verify | trust
 }
 
 // ResourcesConfig is per-sandbox capacity + resource-control wiring.
@@ -512,6 +524,7 @@ func (c *Config) applyDefaults() {
 		c.Sandbox.Resources.VCPU = 2
 	}
 	def(&c.Sandbox.Resources.Memory, "2GiB")
+	def(&c.Sandbox.Restore.FileRefs, RestoreFileRefsVerify)
 	// Sandbox.Resources.ControlSocket is intentionally NOT defaulted: empty =
 	// static cgroup mode (the sandbox adopts its systemd unit's own cgroup via
 	// --cgroup-adopt). The node-ctl resource controller is opt-in.
@@ -613,6 +626,11 @@ func (c *Config) validate() error {
 	}
 	if c.Sandbox.Network.TapFDSocket != "" && !filepath.IsAbs(c.Sandbox.Network.TapFDSocket) {
 		return fmt.Errorf("config: sandbox.network.tapfd_socket must be absolute")
+	}
+	switch c.Sandbox.Restore.FileRefs {
+	case RestoreFileRefsVerify, RestoreFileRefsTrust:
+	default:
+		return fmt.Errorf("config: sandbox.restore.file_refs %q (want verify|trust)", c.Sandbox.Restore.FileRefs)
 	}
 	if c.Builder.Referer.Enabled && c.Builder.Referer.Desc == "" {
 		return fmt.Errorf("config: builder.referer.desc is required when builder.referer.enabled=true")

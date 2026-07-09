@@ -337,6 +337,7 @@ node-ctl 同目录 → PATH"自动发现。
 | `sandbox.network.hostname` | `sandbox` | guest 主机名:sethostname + `/etc/hosts` 条目(§11) |
 | `sandbox.network.dns` | `[169.254.169.253]` | 注入 guest `/etc/resolv.conf` 的 nameserver;该地址需部署侧路由到真实 DNS |
 | `sandbox.network.e2b` / `.bare` | `169.254.0.21/30`+`169.254.0.22` / `169.254.1.1/31`+`169.254.1.0` | 按 profile 的 guest 内 `{inner_ip, nexthop}`:每 profile 复用同一对,沙箱唯一身份是 floatingip;e2b 的 /30 + 网关让 envd 端口转发可用 |
+| `sandbox.restore.file_refs` | `verify` | restore 时本地 `file://` runtime/base 引用校验策略:`verify` 重算 SHA256 并比对 snapshot.cfg;`trust` 只校验协议、basename 和文件存在,由 LaunchSpec 传给 `sandbox-ctl --restore-file-refs trust`,仅适合受信本地性能模式 |
 | `sandbox.boot.kernel` | – | vmlinux 路径 |
 | `sandbox.boot.runtime` | – | 单一 guest runtime erofs;内置 envd、flatten-ctl、mkfs.erofs(§11) |
 | `sandbox.boot.overlay_diff_template` | – | 预格式化空 ext4,img 冷启时稀疏复制为可写 upper(裸空 diff 非合法 fs 会被拒);部署方 `mkfs.ext4` 于稀疏文件提供;restore 不需要(overlay 链来自快照) |
@@ -607,7 +608,9 @@ serve 在 UDS `paths.config_socket`(默认 `/run/sandbox/node-ctl.socket`,**0600
   → **LaunchSpec** `{exec, args, workdir, env}`:`exec=sandbox-ctl`,
   `args=[run --sandbox-id <sid> --config <rundir>/<sid>.yaml --manifest-config
   <shared> --run-root <run_root> --cgroup-adopt (--restore <ref>)
-  (--connect <uds:ip:port>)…]`,`env={MANIFEST_KEY}`。`--run-root` 把 sandbox-ctl
+  (--restore-file-refs trust) (--connect <uds:ip:port>)…]`,`env={MANIFEST_KEY}`。
+  `--restore-file-refs trust` 只在 restore 且 `sandbox.restore.file_refs=trust`
+  时追加。`--run-root` 把 sandbox-ctl
   的 socket/staging 目录(`ch.sock`/`ctl.sock`/…)钉到 serve 的 run_root,
   pause/snapshot 客户端(同 `--run-root`)才能拨到 `ctl.sock`。
 - `POST /internal/task/buildspec`(run-builder;req `{config_id: "build:<bid>"}`)

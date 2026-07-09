@@ -69,6 +69,50 @@ sandbox:
 	}
 }
 
+func TestLoadSandboxRestoreFileRefsDefaults(t *testing.T) {
+	t.Setenv("NODE_CONFIG_ENCRYPTION_KEY", "")
+	path := writeConfig(t, `
+api:
+  domain: example.test
+encryption_key: test-key
+sandbox:
+  boot:
+    kernel: /opt/sandbox/vmlinux
+    runtime: /opt/sandbox/sandbox-runtime.erofs
+`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+	if got := cfg.Sandbox.Restore.FileRefs; got != RestoreFileRefsVerify {
+		t.Fatalf("sandbox.restore.file_refs default = %q, want %q", got, RestoreFileRefsVerify)
+	}
+}
+
+func TestLoadRejectsInvalidSandboxRestoreFileRefs(t *testing.T) {
+	t.Setenv("NODE_CONFIG_ENCRYPTION_KEY", "")
+	path := writeConfig(t, `
+api:
+  domain: example.test
+encryption_key: test-key
+sandbox:
+  restore:
+    file_refs: maybe
+  boot:
+    kernel: /opt/sandbox/vmlinux
+    runtime: /opt/sandbox/sandbox-runtime.erofs
+`)
+
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("Load succeeded with invalid sandbox.restore.file_refs")
+	}
+	if !strings.Contains(err.Error(), "sandbox.restore.file_refs") {
+		t.Fatalf("error %q does not mention sandbox.restore.file_refs", err)
+	}
+}
+
 func TestLoadBuilderRefererDefaults(t *testing.T) {
 	t.Setenv("NODE_CONFIG_ENCRYPTION_KEY", "")
 	path := writeConfig(t, `

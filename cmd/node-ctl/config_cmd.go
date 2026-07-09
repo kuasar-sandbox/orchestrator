@@ -147,6 +147,8 @@ sandbox:                                          # sandbox-instance defaults
     dns: [169.254.169.253]                        # /etc/resolv.conf nameserver(s) injected into the guest
     e2b:  { inner_ip: 169.254.0.21/30, nexthop: 169.254.0.22 }   # e2b: /30 + gateway for envd port-forward
     bare: { inner_ip: 169.254.1.1/31,  nexthop: 169.254.1.0 }
+  restore:
+    file_refs: verify                             # verify | trust local file:// runtime/base refs on restore
   boot:
     kernel: /opt/sandbox/kernel/6.1/vmlinux
     runtime: /opt/sandbox/runtime/v1/sandbox-runtime.erofs

@@ -85,6 +85,8 @@ sandbox:
     # is the per-slot floating IP). e2b needs the /30 + gateway for envd port-forward.
     e2b:  { inner_ip: 169.254.0.21/30, nexthop: 169.254.0.22 }
     bare: { inner_ip: 169.254.1.1/31,  nexthop: 169.254.1.0 }
+  restore:
+    file_refs: verify                             # verify | trust local file:// runtime/base refs on restore
   boot:
     kernel: /opt/sandbox/kernel/6.1/vmlinux
     runtime: /opt/sandbox/runtime/v1/sandbox-runtime.erofs
