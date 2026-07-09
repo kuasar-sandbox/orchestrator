@@ -108,6 +108,13 @@ builder:
   # ready_timeout_sec: 120
   # total_timeout_sec: 1800
   # image_uri_mask: "docker.sandboxes.example.com/e2b/custom-envs/{templateID}:{buildID}"
+  # referer:                                        # optional OCI Referrers import cache
+  #   enabled: false                                # lookup before pull+flatten
+  #   fallback: true                                # unsupported/unavailable registry continues without writeback
+  #   writeback: true                               # after miss+upload, put referrer; failure fails the build
+  #   desc: ""                                      # public owner descriptor; required when enabled
+  #   key: ""                                       # HMAC message paired with MANIFEST_KEY; empty = desc
+  #   validity: ""                                  # optional Go duration, e.g. 720h
   # files_storage:                                # COPY build contexts (presigned PUT/GET); unset → COPY rejected (501)
   #   endpoint: https://obs.cn-north-4.example.com  # versitygw: http://127.0.0.1:7070
   #   region: cn-north-4

@@ -345,6 +345,7 @@ node-ctl 同目录 → PATH"自动发现。
 | `builder.insecure_registry` | `false` | 经明文 HTTP 拉取 base 镜像(dev/本机 registry) |
 | `builder.platform` | 空 | 拉取平台,如 `linux/amd64` |
 | `builder.image_uri_mask` | 空 | 客户端推送镜像的命名约定(含 `{templateID}`/`{buildID}` 占位,须与 e2b CLI 的 `E2B_IMAGE_URI_MASK` 一致);trigger 缺 `fromImage` 时据此推导;**须从构建沙箱内可达**——拉取在 guest 内进行(§12) |
+| `builder.referer` | 关 | fromImage import 的 OCI Referrers cache:`enabled` 默认 false;`fallback`/`writeback` 默认 true;`desc` 为公开 owner descriptor(启用时必填);`key` 为空则等于 desc;`validity` 为可选 Go duration。build 可经 `X-Kuasar-Sandbox-Builder` 进一步禁用 lookup/writeback,不能越权启用(§4.6、§12) |
 | `builder.diff_template` | – | 构建沙箱可写盘的预格式化 ext4(拉取缓存 + steps 增量 + 导出 scratch;稀疏文件,建议 ≥ 最大预期镜像的 3 倍) |
 | `builder.vcpu` / `.memory` | `2` / `4GiB` | 每台构建沙箱(阶段 microVM)的容量 |
 | `builder.{pull,step,ready,total}_timeout_sec` | `600`/`600`/`120`/`1800` | 阶段超时:guest 内拉取+展平、单条 RUN step(经 `Connect-Timeout-Ms` 同步到 guest 侧)、readyCmd 轮询预算(2s 间隔;缺省 readyCmd = `sleep 20`)、整个构建(单元 `TimeoutStartSec` = total+60) |
@@ -403,7 +404,7 @@ envd,回占位 token,数据面控制端口 501。`trafficAccessToken` 为 SDK �
 | 操作 | 方法 + 路径 | 要点 |
 |---|---|---|
 | register | `POST /v3/templates` → 202 | body `{name, tags, cpuCount, memoryMB}` + `X-Kuasar-Sandbox-*` 头 → 模板默认配置(cpu/memory→`resource.capacity`,§4.6);回 `{templateID: transient-<uuidv7>, buildID, names, tags, aliases, public:false}` |
-| trigger | `POST /v2/templates/{tid}/builds/{bid}` → 202 | body 兼容 `{fromImage, fromTemplate, fromImageRegistry{username,password}, steps[], startCmd, readyCmd}` 与 CLI 形态 `{start_cmd, ready_cmd, …}`;`fromImage`/`fromTemplate` 互斥,皆缺时由 `builder.image_uri_mask` 推 fromImage;steps 支持 `RUN/ENV/ARG/WORKDIR/USER/COPY`(COPY 须先经 files 端点上传 context:未配 files_storage→**501**、未上传→**400**,§12);`startCmd` 非空或 fromTemplate ⇒ 暂记 snp(终态以流水线产物为准,§12),否则 img;fromTemplate 且无 steps 无 startCmd ⇒ 拒绝(无事可做);`cpu_count`/`memory_mb` + `X-Kuasar-Sandbox-*` 头 → 模板配置,**覆盖 register**(§4.6) |
+| trigger | `POST /v2/templates/{tid}/builds/{bid}` → 202 | body 兼容 `{fromImage, fromTemplate, fromImageRegistry{username,password}, steps[], startCmd, readyCmd}` 与 CLI 形态 `{start_cmd, ready_cmd, …}`;`fromImage`/`fromTemplate` 互斥,皆缺时由 `builder.image_uri_mask` 推 fromImage;steps 支持 `RUN/ENV/ARG/WORKDIR/USER/COPY`(COPY 须先经 files 端点上传 context:未配 files_storage→**501**、未上传→**400**,§12);`startCmd` 非空或 fromTemplate ⇒ 暂记 snp(终态以流水线产物为准,§12),否则 img;fromTemplate 且无 steps 无 startCmd ⇒ 拒绝(无事可做);`cpu_count`/`memory_mb` + `X-Kuasar-Sandbox-*` 头 → 模板配置,**覆盖 register**;`X-Kuasar-Sandbox-Builder` → build-only 配置(§4.6) |
 | status | `GET /templates/{tid}/builds/{bid}/status` | 回 `{templateID, buildID, status, logs:[], logEntries:[]}` + 失败时 `reason{message}`;`logs`/`logEntries` 取自 journald 构建流(tag build),按 `?logsOffset`(已读条数)分页,SDK `on_build_logs` 即据此流式输出(§12);**进行中恒报 `building`**(registered/waiting/building 均映射,CLI wait 循环仅在 `building` 续轮询),终态 `ready`/`error`;失败 `reason` 通用(详情在日志流);ready 后 `templateID` 即报持久 id,并附 `names`/`aliases` |
 | files | `GET /templates/{tid}/files/{hash}` → 201 | COPY context 上传协商:`tid→build→归属`校验后回 `{present, url}`——present 即对象已在桶(客户端跳过上传),url 为**直传桶的 presigned PUT**(字节不过控制面);未配 `files_storage`→**501**,未知/非属主 tid→**404**。详见 §12 |
 | list | `GET /templates` | 本租户 ready 模板;`templateID` 列为持久 id |
@@ -467,14 +468,24 @@ JSON 对象)注入,零 SDK/API 改动。命名空间是 sandbox-runtime `config.
 | `metadata` | `SANDBOX_CONFIG.metadata` 透传(如 `e2b.start_cmd`) |
 | `cluster` | `{group, route_key}`——集群调度 / 路由身份,经 node-link 上报 registry(§10、cluster.md);独立模式无 node-link 时仅作记录 |
 
+构建端点额外接受 **build-only** 命名空间 `kuasar-sandbox.builder`,对应请求头
+`X-Kuasar-Sandbox-Builder`,当前形态:
+
+```json
+{"referer":{"enabled":false,"writeback":false}}
+```
+
+它只控制本次模板构建的 import referer 行为,解析后从模板 sandbox metadata 中剥离,
+持久化到 `builds.builder_json`;不会随模板 create/resume 进入运行时配置。
+
 - **渲染**:serve 建 `config.SandboxConfig` 基座(boot/tapfd/control/capacity/已解析
   网络)再叠租户命名空间,yaml 序列化经 config-socket 交 sandbox-ctl。深校验(ValidateCold)
   在 sandbox-ctl——serve 侧 yaml 是半成品(cgroup_path 经 `--cgroup-adopt`、base 经
   快照填),这里只对租户网络做格式校验。
 - **两个注入面**:e2b metadata,与 `X-Kuasar-Sandbox-<Ns>` 请求头(API 边缘归一化进
   metadata,**同名头胜过 metadata 键**)。create 与模板构建(register/trigger)都支持;
-  构建配置存 `builds.metadata_json`。集群下 `create` 命令亦经 metadata 注入 `cluster`
-  命名空间(§10)。
+  runtime sandbox 配置存 `builds.metadata_json`,build-only 配置存 `builds.builder_json`。
+  集群下 `create` 命令亦经 metadata 注入 `cluster` 命名空间(§10)。
 - **优先级**:`节点默认 ⊕ 模板配置 ⊕ create 配置`(create 按命名空间胜)。模板配置:snp
   经快照、img 经 `builds.metadata_json`。构建内 `register ⊕ trigger`(trigger 胜);
   register/trigger 的 `cpuCount`/`memoryMB` → `resource.capacity`(胜过 resource 头),决定
@@ -485,7 +496,7 @@ JSON 对象)注入,零 SDK/API 改动。命名空间是 sandbox-runtime `config.
   `SANDBOX_CONFIG.metadata["kuasar-sandbox.network"]`,随 snapshot.cfg 落盘并跨 restore 继承;
   restore 时 serve 读回,填 create 未指定的网络字段(**显式 create 胜**,§8)。迁移
   token 同样携带 metadata。其余命名空间只在冷启生效或已冻入快照,故只 network 需随快照。
-- **持久化**:`sandboxes.metadata_json` / `builds.metadata_json`。
+- **持久化**:`sandboxes.metadata_json` / `builds.metadata_json` / `builds.builder_json`。
 
 ## 5. 进程管理(systemd 模板单元,启动时自动生成安装)
 
@@ -951,9 +962,17 @@ microVM(`sandbox-ctl run` 直接子进程);A 阶段就绪探针 = guest 内
 
 - **A import**(有 fromImage):**空**单盘沙箱——root 即 `builder.diff_template`
   复制出的可写 ext4(无 base 镜像),`launch.placeholder` 锚定;单一 guest runtime
-  经 `/opt/sandbox-runtime` 投影出 `flatten-ctl` 与 `mkfs.erofs`。guest 内
-  `flatten-ctl export --output - <fromImage>` 以租户凭据(`FLATTEN_*` 仅经 exec env
-  入 guest)拉取 + 展平,tarstream 镜像工件经 exec stdio 流回宿主 `workdir/image.img`。
+  经 `/opt/sandbox-runtime` 投影出 `flatten-ctl` 与 `mkfs.erofs`。若
+  `builder.referer.enabled=true`,guest 先以租户 registry 凭据执行
+  `flatten-ctl referer lookup --json --owner <owner> <fromImage>`;hit 时宿主校验
+  返回的 manifest id 后直接用 `manifest://<id>` 作 base,跳过拉取与展平。lookup
+  unsupported/error 时按 `fallback` 继续或失败。miss 时 guest 内
+  `flatten-ctl export --output - <fromImage>` 拉取 + 展平,tarstream 镜像工件经 exec
+  stdio 流回宿主 `workdir/image.img`;若 lookup 已确认 registry 支持 Referrers,
+  宿主立即 `manifest-ctl store image.img` 得到 manifest id 并把 base 改为
+  `manifest://<id>`,随后在 guest 内 `flatten-ctl referer put --owner <owner>
+  --manifest-id <id> <subject>` 回写。`writeback=true` 时回写失败即构建失败;
+  `MANIFEST_KEY` 只在宿主用于计算 owner token,不进入 guest referer 命令。
 - **B steps**(有 steps):以 base 镜像为 root(本地工件或 `manifest://`)+ builder
   runtime + 大可写 upper(同一 diff_template),**envd 为 app**(构建工具姿态:恒
   `-isnotfc`、不 `/init`、无 token;唯一盘足迹 `/run/e2b` 落在 tmpfs 挂载上,导出
@@ -1011,9 +1030,10 @@ COPY)。三段:
 versitygw`)。force_path_style 默认 false(虚拟主机式;versitygw/minio 置 true)。
 
 **收尾上传(平台凭据唯一出现点)**:img-only ⇒ `manifest-ctl store image.img`
-(stdout = 64-hex manifest key);产出快照 ⇒ **一条** `sandbox-ctl upload-snapshot
-<bundle>`——自动上传 snapshot.cfg 引用的全部本地工件(base 镜像、overlay)并把引用
-改写为 `manifest://`(runtime_ref 不动,宿主提供)。结果 JSON
+(stdout = 64-hex manifest key;若 import referer hit/miss 已得到 base manifest id 则直接
+复用);产出快照 ⇒ **一条** `sandbox-ctl upload-snapshot <bundle>`——自动上传
+snapshot.cfg 引用的全部本地工件(base 镜像、overlay)并把引用改写为
+`manifest://`(runtime_ref 不动,宿主提供)。结果 JSON
 `{image_key|snapshot_key, start_cmd, ready_cmd, error}` 打 stdout → `<bid>.result`;
 快照模板的 start/ready 同时记进 snapshot.cfg metadata,模板自描述(fromTemplate
 继承与 create 都读它)。

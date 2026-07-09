@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/apikey"
+	"github.com/kuasar-sandbox/orchestrator/internal/buildcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/keys"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
@@ -118,6 +119,13 @@ func (o *Orchestrator) registerClusterBuild(ctx context.Context, cmd *routesync.
 	if err != nil {
 		return err
 	}
+	meta, builderOpts, err := buildcfg.Extract(cmd.Config)
+	if err != nil {
+		return err
+	}
+	if err := o.validateBuildOptions(builderOpts, false); err != nil {
+		return err
+	}
 	b := &types.Build{
 		BuildID:     cmd.BuildID,
 		TemplateID:  cmd.TemplateRef,
@@ -126,7 +134,8 @@ func (o *Orchestrator) registerClusterBuild(ctx context.Context, cmd *routesync.
 		Kind:        types.KindImg,
 		Status:      types.BuildRegistered,
 		FromImage:   o.imageURIFromMask(cmd.TemplateRef, cmd.BuildID),
-		Metadata:    cmd.Config,
+		Metadata:    meta,
+		Builder:     builderOpts,
 		CreatedUnix: time.Now().Unix(),
 	}
 	if err := o.st.PutBuild(ctx, b); err != nil {

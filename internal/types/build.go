@@ -51,6 +51,17 @@ type TemplateStep struct {
 	Force     bool     `json:"force,omitempty"`
 }
 
+// BuildOptions are build-only controls. They are intentionally separate from
+// Build.Metadata, which becomes the template's default sandbox config.
+type BuildOptions struct {
+	Referer *BuildRefererOptions `json:"referer,omitempty" yaml:"referer,omitempty"`
+}
+
+type BuildRefererOptions struct {
+	Enabled   *bool `json:"enabled,omitempty" yaml:"enabled,omitempty"`
+	Writeback *bool `json:"writeback,omitempty" yaml:"writeback,omitempty"`
+}
+
 // Build is one template build, doubling as the template record.
 type Build struct {
 	BuildID      string  // e2b build id (uuidv7)
@@ -74,6 +85,8 @@ type Build struct {
 	// headers land here; trigger overrides). It drives the build's phase-C capacity
 	// and is layered under a create's own config (create wins) when launching from
 	// this template.
-	Metadata    map[string]string
+	Metadata map[string]string
+	Builder  BuildOptions
+
 	CreatedUnix int64
 }

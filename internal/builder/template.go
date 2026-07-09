@@ -153,6 +153,9 @@ func udsHTTP(uds string) *http.Client {
 // --- finale: uploads ---------------------------------------------------------
 
 func (p *buildPipeline) uploadImage() (string, error) {
+	if p.baseImageKey != "" {
+		return p.baseImageKey, nil
+	}
 	p.progress("uploading image to the content store")
 	out, err := p.hostCmdEnv(p.spec.Env, p.spec.Paths.ManifestCtl,
 		"store", "--no-progress", "--manifest-config", p.spec.Paths.ManifestConfig, p.imagePath)
@@ -163,6 +166,7 @@ func (p *buildPipeline) uploadImage() (string, error) {
 	if len(key) != 64 {
 		return "", fmt.Errorf("manifest-ctl store output %q (want 64-hex key)", key)
 	}
+	p.baseImageKey = key
 	p.progress("uploaded image: %s", key)
 	return key, nil
 }

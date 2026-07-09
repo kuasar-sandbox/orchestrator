@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/apikey"
+	"github.com/kuasar-sandbox/orchestrator/internal/buildcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
@@ -30,6 +31,8 @@ var configHeaderNs = []struct{ header, metaKey string }{
 	{"X-Kuasar-Sandbox-Files", sandboxcfg.NsFiles},
 	{"X-Kuasar-Sandbox-Metadata", sandboxcfg.NsMetadata},
 }
+
+const builderHeader = "X-Kuasar-Sandbox-Builder"
 
 // pickInt returns a if non-zero, else b (camelCase vs snake_case e2b field aliases).
 func pickInt(a, b int) int {
@@ -52,6 +55,17 @@ func mergeConfigHeaders(meta map[string]string, h http.Header) map[string]string
 			meta = map[string]string{}
 		}
 		meta[m.metaKey] = v
+	}
+	return meta
+}
+
+func mergeBuildConfigHeaders(meta map[string]string, h http.Header) map[string]string {
+	meta = mergeConfigHeaders(meta, h)
+	if v := h.Get(builderHeader); v != "" {
+		if meta == nil {
+			meta = map[string]string{}
+		}
+		meta[buildcfg.NsBuilder] = v
 	}
 	return meta
 }
@@ -356,7 +370,7 @@ func (a *API) registerTemplate(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewDecoder(r.Body).Decode(&body)
 	// Template config: X-Kuasar-Sandbox-* headers, with the e2b cpu/memory folded
 	// into the resource namespace (cpu/memory win over a resource header).
-	meta := mergeConfigHeaders(nil, r.Header)
+	meta := mergeBuildConfigHeaders(nil, r.Header)
 	meta = sandboxcfg.SetCapacity(meta, pickInt(body.CPUCount, body.CPUCountSn), pickInt(body.MemoryMB, body.MemoryMBSn))
 	b, err := a.core.RegisterBuild(r.Context(), apiKeyFrom(r.Context()), body.Name, body.Tags, meta)
 	if err != nil {
@@ -420,7 +434,7 @@ func (a *API) triggerBuild(w http.ResponseWriter, r *http.Request) {
 		RegistryPassword: body.FromImageRegistry.Password,
 	}
 	// Trigger-time template config overrides register: headers + e2b cpu/memory.
-	meta := mergeConfigHeaders(nil, r.Header)
+	meta := mergeBuildConfigHeaders(nil, r.Header)
 	meta = sandboxcfg.SetCapacity(meta, pickInt(body.CPUCount, body.CPUCountSn), pickInt(body.MemoryMB, body.MemoryMBSn))
 	err := a.core.TriggerBuild(r.Context(), apiKeyFrom(r.Context()),
 		r.PathValue("tid"), r.PathValue("bid"), TriggerSpec{
@@ -645,6 +659,8 @@ func (a *API) fail(w http.ResponseWriter, err error) {
 		writeErr(w, 404, "not found")
 	case errors.Is(err, ErrNotAllowed):
 		writeErr(w, 403, "manifest key not allowed")
+	case errors.Is(err, ErrBadRequest):
+		writeErr(w, 400, err.Error())
 	default:
 		a.log.Warn("api error", "err", err)
 		writeErr(w, 500, "internal error")

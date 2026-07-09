@@ -69,6 +69,82 @@ sandbox:
 	}
 }
 
+func TestLoadBuilderRefererDefaults(t *testing.T) {
+	t.Setenv("NODE_CONFIG_ENCRYPTION_KEY", "")
+	path := writeConfig(t, `
+api:
+  domain: example.test
+encryption_key: test-key
+sandbox:
+  boot:
+    kernel: /opt/sandbox/vmlinux
+    runtime: /opt/sandbox/sandbox-runtime.erofs
+builder:
+  referer:
+    enabled: true
+    desc: acme-prod
+`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+	if !cfg.Builder.Referer.FallbackEnabled() || !cfg.Builder.Referer.WritebackEnabled() {
+		t.Fatalf("referer defaults not enabled: %+v", cfg.Builder.Referer)
+	}
+	if cfg.Builder.Referer.Key != "acme-prod" {
+		t.Fatalf("referer key default = %q", cfg.Builder.Referer.Key)
+	}
+}
+
+func TestLoadRejectsBuilderRefererWithoutDesc(t *testing.T) {
+	t.Setenv("NODE_CONFIG_ENCRYPTION_KEY", "")
+	path := writeConfig(t, `
+api:
+  domain: example.test
+encryption_key: test-key
+sandbox:
+  boot:
+    kernel: /opt/sandbox/vmlinux
+    runtime: /opt/sandbox/sandbox-runtime.erofs
+builder:
+  referer:
+    enabled: true
+`)
+
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("Load succeeded with referer enabled but no desc")
+	}
+	if !strings.Contains(err.Error(), "builder.referer.desc") {
+		t.Fatalf("error %q does not mention builder.referer.desc", err)
+	}
+}
+
+func TestLoadRejectsBuilderRefererInvalidValidity(t *testing.T) {
+	t.Setenv("NODE_CONFIG_ENCRYPTION_KEY", "")
+	path := writeConfig(t, `
+api:
+  domain: example.test
+encryption_key: test-key
+sandbox:
+  boot:
+    kernel: /opt/sandbox/vmlinux
+    runtime: /opt/sandbox/sandbox-runtime.erofs
+builder:
+  referer:
+    validity: soon
+`)
+
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("Load succeeded with invalid referer validity")
+	}
+	if !strings.Contains(err.Error(), "builder.referer.validity") {
+		t.Fatalf("error %q does not mention builder.referer.validity", err)
+	}
+}
+
 func TestLoadAcceptsTapFDSocket(t *testing.T) {
 	t.Setenv("NODE_CONFIG_ENCRYPTION_KEY", "")
 	path := writeConfig(t, `

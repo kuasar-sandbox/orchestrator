@@ -1,6 +1,7 @@
 package builder
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
@@ -66,6 +67,18 @@ func TestParseTemplateDisk(t *testing.T) {
 	// malformed JSON is an error.
 	if _, _, _, err = parseTemplateDisk([]byte(`not json`)); err == nil {
 		t.Error("malformed json: expected error, got nil")
+	}
+}
+
+func TestUploadImageReusesBaseImageKey(t *testing.T) {
+	key := strings.Repeat("a", 64)
+	p := &buildPipeline{baseImageKey: key}
+	got, err := p.uploadImage()
+	if err != nil {
+		t.Fatalf("uploadImage: %v", err)
+	}
+	if got != key {
+		t.Fatalf("uploadImage = %q, want %q", got, key)
 	}
 }
 

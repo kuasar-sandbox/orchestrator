@@ -168,6 +168,13 @@ builder:                                           # builds run INSIDE build san
   # image_uri_mask must match the CLI's E2B_IMAGE_URI_MASK ({templateID}/{buildID} tokens)
   # AND be reachable from inside a build sandbox (the pull runs in the guest):
   # image_uri_mask: "docker.sandboxes.example.com/e2b/custom-envs/{templateID}:{buildID}"
+  # referer:                                        # optional OCI Referrers import cache
+  #   enabled: false                                # lookup before pull+flatten
+  #   fallback: true                                # unsupported/unavailable registry continues without writeback
+  #   writeback: true                               # after miss+upload, put referrer; failure fails the build
+  #   desc: ""                                      # public owner descriptor; required when enabled
+  #   key: ""                                       # HMAC message paired with MANIFEST_KEY; empty = desc
+  #   validity: ""                                  # optional Go duration, e.g. 720h
   # files_storage: COPY build contexts; client direct-uploads (presigned PUT) to
   # this bucket, build fetches (presigned GET). Unset → COPY rejected (501).
   # Local/single-node: point at versitygw (guest-runtime/native-deps: make versitygw).

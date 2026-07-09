@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/regcreds"
 	"github.com/kuasar-sandbox/orchestrator/internal/secretbox"
@@ -70,5 +71,38 @@ func TestResolveBuildCreds(t *testing.T) {
 	// a malformed / wrong-tenant token errors (fails the build loudly).
 	if _, err := o.resolveBuildCreds(ctx, b, "kpt_garbage", "", ""); err == nil {
 		t.Fatal("bad token should error")
+	}
+}
+
+func TestValidateBuildOptionsCannotEnableNodeDisabledReferer(t *testing.T) {
+	o := testOrch(t)
+	enabled := true
+	err := o.validateBuildOptions(types.BuildOptions{Referer: &types.BuildRefererOptions{Enabled: &enabled}}, false)
+	if err == nil || !strings.Contains(err.Error(), api.ErrBadRequest.Error()) {
+		t.Fatalf("expected bad request, got %v", err)
+	}
+}
+
+func TestEffectiveImportRefererComputesOwnerToken(t *testing.T) {
+	o := testOrchCfg(t, &config.Config{})
+	o.cfg.Builder.Referer.Enabled = true
+	o.cfg.Builder.Referer.Desc = "acme-prod"
+	o.cfg.Builder.Referer.Key = "acme-prod"
+	b := &types.Build{
+		ManifestKey: strings.Repeat("4", 64),
+		FromImage:   "reg.example.com/app:tag",
+	}
+	got, err := o.effectiveImportReferer(b)
+	if err != nil {
+		t.Fatalf("effectiveImportReferer: %v", err)
+	}
+	if !got.Enabled || !got.Fallback || !got.Writeback {
+		t.Fatalf("unexpected referer defaults: %+v", got)
+	}
+	if !strings.HasSuffix(got.Owner, " acme-prod") {
+		t.Fatalf("owner token missing descriptor: %q", got.Owner)
+	}
+	if strings.Contains(got.Owner, b.ManifestKey) {
+		t.Fatalf("owner token leaked manifest key: %q", got.Owner)
 	}
 }

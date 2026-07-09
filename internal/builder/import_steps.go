@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"compress/gzip"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -29,6 +30,34 @@ func (p *buildPipeline) phaseImport() error {
 	defer sb.teardown()
 	if err := sb.waitExecReady(p.ctx, 60*time.Second); err != nil {
 		return err
+	}
+
+	var refSupported bool
+	var refSubject string
+	if s.ImportReferer.Enabled {
+		lookup, err := p.lookupImportReferer(sb)
+		switch {
+		case err != nil:
+			if !s.ImportReferer.Fallback {
+				return fmt.Errorf("referer lookup: %w", err)
+			}
+			p.progress("import: referer lookup failed (%v); falling back to pull+flatten", err)
+		case !lookup.Supported:
+			if !s.ImportReferer.Fallback {
+				return fmt.Errorf("referer lookup: registry does not support OCI referrers")
+			}
+			p.progress("import: registry does not support OCI referrers; falling back to pull+flatten")
+		case lookup.Hit:
+			if err := p.useImportRefererHit(lookup.ManifestID); err != nil {
+				return err
+			}
+			p.progress("import: referer hit %s", lookup.ManifestID)
+			return nil
+		default:
+			refSupported = true
+			refSubject = lookup.Subject
+			p.progress("import: referer miss for %s", refSubject)
+		}
 	}
 
 	// No --no-progress: flatten-ctl's pull/flatten progress goes to the guest
@@ -57,7 +86,108 @@ func (p *buildPipeline) phaseImport() error {
 	p.baseRef = "file://" + p.imagePath
 	p.overlayBase = "" // a freshly imported image is a complete base, no overlay lower
 	p.progress("import: image artifact ready")
+	if refSupported {
+		key, err := p.uploadImage()
+		if err != nil {
+			return fmt.Errorf("upload referer base image: %w", err)
+		}
+		p.baseRef = "manifest://" + key
+		if s.ImportReferer.Writeback {
+			if err := p.writeImportReferer(sb, refSubject, key); err != nil {
+				return fmt.Errorf("referer writeback: %w", err)
+			}
+			p.progress("import: referer writeback complete")
+		}
+	}
 	return nil
+}
+
+type importRefererLookup struct {
+	Supported  bool   `json:"supported"`
+	Subject    string `json:"subject"`
+	Hit        bool   `json:"hit"`
+	ManifestID string `json:"manifest_id"`
+}
+
+func (p *buildPipeline) lookupImportReferer(sb *phaseSandbox) (importRefererLookup, error) {
+	s := p.spec
+	if s.ImportReferer.Owner == "" {
+		return importRefererLookup{}, fmt.Errorf("owner token is empty")
+	}
+	outPath := filepath.Join(s.Workdir, "referer.lookup.json")
+	args := []string{"referer", "lookup", "--json", "--owner", s.ImportReferer.Owner}
+	if s.Insecure {
+		args = append(args, "--insecure")
+	}
+	if s.Platform != "" {
+		args = append(args, "--platform", s.Platform)
+	}
+	args = append(args, s.FromImage)
+	ctx, cancel := context.WithTimeout(p.ctx, time.Duration(s.Timeouts.PullSec)*time.Second)
+	defer cancel()
+	p.progress("import: checking image referer")
+	if err := sb.exec(ctx, execOpts{env: p.tenantEnv(), stdoutTo: outPath, stderrTo: "journald=" + buildTag},
+		append([]string{guestFlatten}, args...)...); err != nil {
+		return importRefererLookup{}, err
+	}
+	data, err := os.ReadFile(outPath)
+	if err != nil {
+		return importRefererLookup{}, err
+	}
+	var out importRefererLookup
+	if err := json.Unmarshal(data, &out); err != nil {
+		return importRefererLookup{}, fmt.Errorf("parse lookup result: %w", err)
+	}
+	if out.Supported && out.Subject == "" {
+		return importRefererLookup{}, fmt.Errorf("lookup result missing subject")
+	}
+	return out, nil
+}
+
+func (p *buildPipeline) useImportRefererHit(id string) error {
+	if !validManifestKey(id) {
+		return fmt.Errorf("referer manifest id %q is not a 64-hex key", id)
+	}
+	out, err := p.hostCmdEnv(p.spec.Env, p.spec.Paths.FlattenCtl,
+		"info", "--json", "--manifest-config", p.spec.Paths.ManifestConfig, "manifest://"+id)
+	if err != nil {
+		return fmt.Errorf("validate referer manifest %s: %w (%s)", id, err, firstLine(out))
+	}
+	p.baseImageKey = id
+	p.baseRef = "manifest://" + id
+	p.imagePath = ""
+	p.overlayBase = ""
+	return nil
+}
+
+func (p *buildPipeline) writeImportReferer(sb *phaseSandbox, subject, manifestID string) error {
+	s := p.spec
+	if subject == "" {
+		return fmt.Errorf("subject is empty")
+	}
+	args := []string{"referer", "put", "--owner", s.ImportReferer.Owner, "--manifest-id", manifestID}
+	if s.ImportReferer.Validity != "" {
+		args = append(args, "--validity", s.ImportReferer.Validity)
+	}
+	if s.Insecure {
+		args = append(args, "--insecure")
+	}
+	if s.Platform != "" {
+		args = append(args, "--platform", s.Platform)
+	}
+	args = append(args, subject)
+	ctx, cancel := context.WithTimeout(p.ctx, time.Duration(s.Timeouts.PullSec)*time.Second)
+	defer cancel()
+	return sb.exec(ctx, execOpts{env: p.tenantEnv(), stderrTo: "journald=" + buildTag},
+		append([]string{guestFlatten}, args...)...)
+}
+
+func validManifestKey(id string) bool {
+	if len(id) != 64 {
+		return false
+	}
+	_, err := hex.DecodeString(id)
+	return err == nil
 }
 
 // tenantEnv is the FLATTEN_* (registry credential) subset of the spec env —
@@ -166,6 +296,7 @@ func (p *buildPipeline) phaseSteps() error {
 	if err := os.Rename(newImg, p.imagePath); err != nil {
 		return err
 	}
+	p.baseImageKey = ""
 	p.baseRef = "file://" + p.imagePath
 	p.overlayBase = "" // the exported image flattens base+overlay+steps into one layer
 	return nil

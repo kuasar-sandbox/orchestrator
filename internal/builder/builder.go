@@ -74,11 +74,12 @@ type buildPipeline struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	imagePath   string // workdir/image.img once a local image exists
-	baseRef     string // phase B/C boot.root.base ("file://..." | "manifest://...")
-	overlayBase string // phase B/C boot.root.overlay.base: fromTemplate's accumulated diff, stacked read-only under the fresh overlay ("" = none)
-	startCmd    string // effective (request else template-inherited)
-	readyCmd    string
+	imagePath    string // workdir/image.img once a local image exists
+	baseImageKey string // manifest id for an already-uploaded base image
+	baseRef      string // phase B/C boot.root.base ("file://..." | "manifest://...")
+	overlayBase  string // phase B/C boot.root.overlay.base: fromTemplate's accumulated diff, stacked read-only under the fresh overlay ("" = none)
+	startCmd     string // effective (request else template-inherited)
+	readyCmd     string
 }
 
 const guestFlatten = "/opt/sandbox-runtime/bin/flatten-ctl"
@@ -136,7 +137,7 @@ func (p *buildPipeline) run() (res Result) {
 			return fail(fmt.Errorf("upload snapshot: %w", err))
 		}
 		res.SnapshotKey = key
-	case p.imagePath != "":
+	case p.imagePath != "" || p.baseImageKey != "":
 		key, err := p.uploadImage()
 		if err != nil {
 			return fail(fmt.Errorf("upload image: %w", err))

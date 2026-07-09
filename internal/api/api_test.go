@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"testing"
 
+	"github.com/kuasar-sandbox/orchestrator/internal/buildcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 )
 
@@ -27,6 +28,25 @@ func TestMergeConfigHeaders(t *testing.T) {
 	got := mergeConfigHeaders(meta, header("X-Kuasar-Sandbox-Network", `{"hostname":"from-header"}`))
 	if got[sandboxcfg.NsNetwork] != `{"hostname":"from-header"}` {
 		t.Fatalf("header should win over metadata: %+v", got)
+	}
+
+	// Builder is build-only and is not folded by the generic sandbox header path.
+	got = mergeConfigHeaders(nil, header("X-Kuasar-Sandbox-Builder", `{"referer":{"enabled":false}}`))
+	if got != nil {
+		t.Fatalf("builder header should not enter sandbox metadata: %+v", got)
+	}
+}
+
+func TestMergeBuildConfigHeaders(t *testing.T) {
+	h := http.Header{}
+	h.Set("X-Kuasar-Sandbox-Builder", `{"referer":{"enabled":false}}`)
+	h.Set("X-Kuasar-Sandbox-Network", `{"hostname":"build"}`)
+	got := mergeBuildConfigHeaders(nil, h)
+	if got[buildcfg.NsBuilder] != `{"referer":{"enabled":false}}` {
+		t.Fatalf("builder header not normalized: %+v", got)
+	}
+	if got[sandboxcfg.NsNetwork] != `{"hostname":"build"}` {
+		t.Fatalf("sandbox build header not normalized: %+v", got)
 	}
 }
 

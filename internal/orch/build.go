@@ -12,7 +12,10 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuasar-sandbox/accelerator/pkg/manifest"
+	"github.com/kuasar-sandbox/accelerator/pkg/remote"
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
+	"github.com/kuasar-sandbox/orchestrator/internal/buildcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/orchestrator/internal/keys"
 	"github.com/kuasar-sandbox/orchestrator/internal/regcreds"
@@ -28,6 +31,13 @@ var hexKeyRe = regexp.MustCompile(`^[0-9a-f]{64}$`)
 // builder_image_uri_mask — the convention the e2b CLI pushes its client-built
 // image under ({templateID}/{buildID}); the v3 trigger may still override it.
 func (o *Orchestrator) newRegisteredBuild(ctx context.Context, apiKey, name string, tags []string, metadata map[string]string) (*types.Build, error) {
+	metadata, builderOpts, err := buildcfg.Extract(metadata)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
+	}
+	if err := o.validateBuildOptions(builderOpts, false); err != nil {
+		return nil, err
+	}
 	manifestKey, err := o.resolveAllowed(ctx, apiKey)
 	if err != nil {
 		return nil, err
@@ -55,6 +65,7 @@ func (o *Orchestrator) newRegisteredBuild(ctx context.Context, apiKey, name stri
 		Names:       nonEmpty(name),
 		Aliases:     append([]string{}, tags...),
 		Metadata:    metadata,
+		Builder:     builderOpts,
 		CreatedUnix: time.Now().Unix(),
 	}
 	if err := o.st.PutBuild(ctx, b); err != nil {
@@ -82,6 +93,10 @@ func (o *Orchestrator) TriggerBuild(ctx context.Context, apiKey, tid, bid string
 	}
 	if spec.FromImage != "" && spec.FromTemplate != "" {
 		return fmt.Errorf("build: fromImage and fromTemplate are mutually exclusive")
+	}
+	triggerMeta, triggerBuilder, err := buildcfg.Extract(spec.Metadata)
+	if err != nil {
+		return fmt.Errorf("%w: %v", api.ErrBadRequest, err)
 	}
 	// COPY steps need files_storage configured AND the referenced context
 	// already uploaded (client → files endpoint → bucket). Verify both up
@@ -135,7 +150,11 @@ func (o *Orchestrator) TriggerBuild(ctx context.Context, apiKey, tid, bid string
 	b.Steps = spec.Steps
 	b.StartCmd = spec.StartCmd
 	b.ReadyCmd = spec.ReadyCmd
-	b.Metadata = sandboxcfg.MergeMetadata(b.Metadata, spec.Metadata) // trigger overrides register
+	b.Metadata = sandboxcfg.MergeMetadata(b.Metadata, triggerMeta) // trigger overrides register
+	b.Builder = buildcfg.Merge(b.Builder, triggerBuilder)
+	if err := o.validateBuildOptions(b.Builder, b.FromTemplate != ""); err != nil {
+		return err
+	}
 	b.Kind = types.KindImg
 	if spec.StartCmd != "" || b.FromTemplate != "" {
 		// snp is provisional: the pipeline reports what it actually
@@ -148,6 +167,70 @@ func (o *Orchestrator) TriggerBuild(ctx context.Context, apiKey, tid, bid string
 	}
 	b.Status = types.BuildWaiting
 	return o.st.PutBuild(ctx, b)
+}
+
+func (o *Orchestrator) validateBuildOptions(opts types.BuildOptions, fromTemplate bool) error {
+	r := opts.Referer
+	if r == nil {
+		return nil
+	}
+	explicitReferer := r.Enabled != nil && *r.Enabled
+	explicitWriteback := r.Writeback != nil && *r.Writeback
+	if fromTemplate && (explicitReferer || explicitWriteback) {
+		return fmt.Errorf("%w: builder.referer applies only to fromImage builds", api.ErrBadRequest)
+	}
+	if r.Enabled != nil && !*r.Enabled && explicitWriteback {
+		return fmt.Errorf("%w: builder.referer.writeback=true requires builder.referer.enabled=true", api.ErrBadRequest)
+	}
+	cfg := o.cfg.Builder.Referer
+	if explicitReferer && !cfg.Enabled {
+		return fmt.Errorf("%w: builder.referer.enabled=true exceeds node builder.referer.enabled=false", api.ErrBadRequest)
+	}
+	if explicitWriteback {
+		switch {
+		case !cfg.Enabled:
+			return fmt.Errorf("%w: builder.referer.writeback=true exceeds node builder.referer.enabled=false", api.ErrBadRequest)
+		case !cfg.WritebackEnabled():
+			return fmt.Errorf("%w: builder.referer.writeback=true exceeds node builder.referer.writeback=false", api.ErrBadRequest)
+		}
+	}
+	return nil
+}
+
+func (o *Orchestrator) effectiveImportReferer(b *types.Build) (configsock.BuildImportReferer, error) {
+	cfg := o.cfg.Builder.Referer
+	if !cfg.Enabled || b.FromImage == "" {
+		return configsock.BuildImportReferer{}, nil
+	}
+	enabled := true
+	writeback := cfg.WritebackEnabled()
+	if r := b.Builder.Referer; r != nil {
+		if r.Enabled != nil {
+			enabled = *r.Enabled
+		}
+		if r.Writeback != nil {
+			writeback = *r.Writeback
+		}
+	}
+	if !enabled {
+		return configsock.BuildImportReferer{}, nil
+	}
+	ck, err := manifest.ParseHexKey(b.ManifestKey)
+	if err != nil {
+		return configsock.BuildImportReferer{}, fmt.Errorf("build: manifest key: %w", err)
+	}
+	owner := remote.Owner{
+		ArtifactType: remote.RefererArtifactType,
+		Desc:         cfg.Desc,
+		Key:          cfg.Key,
+	}.OwnerValue(ck[:])
+	return configsock.BuildImportReferer{
+		Enabled:   true,
+		Fallback:  cfg.FallbackEnabled(),
+		Writeback: writeback,
+		Owner:     owner,
+		Validity:  cfg.Validity,
+	}, nil
 }
 
 // resolveBuildCreds picks the registry pull credentials for this build and returns
@@ -504,6 +587,10 @@ func (o *Orchestrator) BuildSpecFor(ctx context.Context, configID string) (*conf
 			mem = cfgSpec.Resource.Capacity.Memory
 		}
 	}
+	importReferer, err := o.effectiveImportReferer(b)
+	if err != nil {
+		return nil, "", false, err
+	}
 
 	spec := &configsock.BuildSpec{
 		BuildID:          b.BuildID,
@@ -533,12 +620,13 @@ func (o *Orchestrator) BuildSpecFor(ctx context.Context, configID string) (*conf
 			Hostname: "build-" + shortID(b.BuildID),
 			DNS:      o.cfg.Sandbox.Network.DNS,
 		},
-		VCPU:        vcpu,
-		Memory:      mem,
-		MMDSEnabled: o.cfg.MMDS.Enabled,
-		EnvdToken:   pend.envdToken,
-		Insecure:    o.cfg.Builder.InsecureRegistry,
-		Platform:    o.cfg.Builder.Platform,
+		VCPU:          vcpu,
+		Memory:        mem,
+		MMDSEnabled:   o.cfg.MMDS.Enabled,
+		EnvdToken:     pend.envdToken,
+		Insecure:      o.cfg.Builder.InsecureRegistry,
+		Platform:      o.cfg.Builder.Platform,
+		ImportReferer: importReferer,
 		Timeouts: configsock.BuildTimeouts{
 			PullSec:  o.cfg.Builder.PullTimeoutSec,
 			StepSec:  o.cfg.Builder.StepTimeoutSec,

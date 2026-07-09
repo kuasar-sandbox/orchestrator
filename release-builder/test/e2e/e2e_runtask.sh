@@ -43,7 +43,7 @@ grep -q "domain:" "$WORK/orch.yaml" || fail "node-ctl config conductor --templat
 
 "$FLATTEN" config --template > "$WORK/flatten.yaml"
 grep -q "referer:" "$WORK/flatten.yaml" || fail "flatten-ctl config --template missing referer"
-grep -q "enabled:" "$WORK/flatten.yaml" || fail "flatten-ctl config --template missing referer.enabled"
+grep -q "validity:" "$WORK/flatten.yaml" || fail "flatten-ctl config --template missing referer.validity"
 "$FLATTEN" config --config "$WORK/flatten.yaml" >/dev/null || fail "flatten-ctl config --config did not load"
 
 "$SANDBOX" config --template > "$WORK/sb.yaml" 2>/dev/null || true

@@ -100,25 +100,34 @@ type Provider interface {
 // template snapshot) needs. Secrets (manifest key, tenant registry
 // creds) ride here over the socket, never on disk.
 type BuildSpec struct {
-	BuildID          string            `json:"build_id"`
-	Workdir          string            `json:"workdir"` // build scratch dir (artifacts, run roots)
-	FromImage        string            `json:"from_image,omitempty"`
-	FromTemplate     string            `json:"from_template,omitempty"` // snapshot manifest key (hex) of the base template
-	FromTemplateKind string            `json:"from_template_kind,omitempty"`
-	Steps            []BuildStep       `json:"steps,omitempty"`
-	StartCmd         string            `json:"start_cmd,omitempty"`
-	ReadyCmd         string            `json:"ready_cmd,omitempty"`
-	Env              map[string]string `json:"env,omitempty"` // secret env: MANIFEST_KEY + FLATTEN_REGISTRY_* (guest exec gets only the FLATTEN_* subset)
-	Paths            BuildPaths        `json:"paths"`
-	Net              BuildNet          `json:"net"`
-	VCPU             int               `json:"vcpu"`
-	Memory           string            `json:"memory"`
-	MMDSEnabled      bool              `json:"mmds_enabled"`
-	EnvdToken        string            `json:"envd_token,omitempty"` // phase C envd /init token (mmds posture)
-	Insecure         bool              `json:"insecure,omitempty"`   // registry plain-HTTP/skip-TLS
-	Platform         string            `json:"platform,omitempty"`
-	Timeouts         BuildTimeouts     `json:"timeouts"`
-	Error            string            `json:"error,omitempty"`
+	BuildID          string             `json:"build_id"`
+	Workdir          string             `json:"workdir"` // build scratch dir (artifacts, run roots)
+	FromImage        string             `json:"from_image,omitempty"`
+	FromTemplate     string             `json:"from_template,omitempty"` // snapshot manifest key (hex) of the base template
+	FromTemplateKind string             `json:"from_template_kind,omitempty"`
+	Steps            []BuildStep        `json:"steps,omitempty"`
+	StartCmd         string             `json:"start_cmd,omitempty"`
+	ReadyCmd         string             `json:"ready_cmd,omitempty"`
+	Env              map[string]string  `json:"env,omitempty"` // secret env: MANIFEST_KEY + FLATTEN_REGISTRY_* (guest exec gets only the FLATTEN_* subset)
+	Paths            BuildPaths         `json:"paths"`
+	Net              BuildNet           `json:"net"`
+	VCPU             int                `json:"vcpu"`
+	Memory           string             `json:"memory"`
+	MMDSEnabled      bool               `json:"mmds_enabled"`
+	EnvdToken        string             `json:"envd_token,omitempty"` // phase C envd /init token (mmds posture)
+	Insecure         bool               `json:"insecure,omitempty"`   // registry plain-HTTP/skip-TLS
+	Platform         string             `json:"platform,omitempty"`
+	ImportReferer    BuildImportReferer `json:"import_referer,omitempty"`
+	Timeouts         BuildTimeouts      `json:"timeouts"`
+	Error            string             `json:"error,omitempty"`
+}
+
+type BuildImportReferer struct {
+	Enabled   bool   `json:"enabled,omitempty"`
+	Fallback  bool   `json:"fallback,omitempty"`
+	Writeback bool   `json:"writeback,omitempty"`
+	Owner     string `json:"owner,omitempty"`
+	Validity  string `json:"validity,omitempty"`
 }
 
 // BuildStep mirrors types.TemplateStep (kept dependency-free here).

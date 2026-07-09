@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/secretbox"
+	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
 func testStore(t *testing.T) *Store {
@@ -116,5 +117,37 @@ func TestManifestKeyRegistryAuth(t *testing.T) {
 	}
 	if a, _ := st.RegistryAuthForKey(ctx, mk); a != auth2 {
 		t.Fatalf("re-add with auth should update: %q", a)
+	}
+}
+
+func TestBuildOptionsRoundTrip(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	enabled, writeback := false, false
+	b := &types.Build{
+		BuildID:     "b1",
+		TemplateID:  "transient-t1",
+		ManifestKey: strings.Repeat("3", 64),
+		Profile:     types.ProfileE2B,
+		Kind:        types.KindImg,
+		Status:      types.BuildRegistered,
+		Builder: types.BuildOptions{Referer: &types.BuildRefererOptions{
+			Enabled:   &enabled,
+			Writeback: &writeback,
+		}},
+		CreatedUnix: time.Now().Unix(),
+	}
+	if err := st.PutBuild(ctx, b); err != nil {
+		t.Fatalf("PutBuild: %v", err)
+	}
+	got, err := st.GetBuild(ctx, "b1")
+	if err != nil {
+		t.Fatalf("GetBuild: %v", err)
+	}
+	if got.Builder.Referer == nil || got.Builder.Referer.Enabled == nil || *got.Builder.Referer.Enabled {
+		t.Fatalf("referer.enabled did not round-trip false: %+v", got.Builder)
+	}
+	if got.Builder.Referer.Writeback == nil || *got.Builder.Referer.Writeback {
+		t.Fatalf("referer.writeback did not round-trip false: %+v", got.Builder)
 	}
 }

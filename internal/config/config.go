@@ -383,6 +383,8 @@ type BuilderConfig struct {
 	// when a build trigger omits fromImage, it is derived from this.
 	ImageURIMask string `yaml:"image_uri_mask"`
 
+	Referer BuilderRefererConfig `yaml:"referer"`
+
 	// DiffTemplate is the pre-formatted ext4 seeding a build sandbox's
 	// writable disk (pull cache + steps delta + export scratch): size it
 	// 2-3x the largest expected image (the ext4 size is fixed at mkfs).
@@ -403,6 +405,23 @@ type BuilderConfig struct {
 	// Unset → COPY steps are rejected (501). For local/single-node without a
 	// cloud object store, point it at a versitygw gateway. (§11)
 	FilesStorage *FilesStorageConfig `yaml:"files_storage"`
+}
+
+type BuilderRefererConfig struct {
+	Enabled   bool   `yaml:"enabled"`
+	Fallback  *bool  `yaml:"fallback"`
+	Writeback *bool  `yaml:"writeback"`
+	Desc      string `yaml:"desc"`
+	Key       string `yaml:"key"`
+	Validity  string `yaml:"validity"`
+}
+
+func (r BuilderRefererConfig) FallbackEnabled() bool {
+	return r.Fallback == nil || *r.Fallback
+}
+
+func (r BuilderRefererConfig) WritebackEnabled() bool {
+	return r.Writeback == nil || *r.Writeback
 }
 
 // FilesStorageConfig configures the COPY build-context object store. The
@@ -463,6 +482,11 @@ func (c *Config) applyDefaults() {
 			*p = v
 		}
 	}
+	defBool := func(p **bool, v bool) {
+		if *p == nil {
+			*p = &v
+		}
+	}
 	def(&c.API.Listen, ":443")
 	def(&c.Proxy.Mode, ProxyInternal)
 	def(&c.Proxy.Auth, AuthEnforce)
@@ -518,6 +542,11 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Builder.MaxConcurrent <= 0 {
 		c.Builder.MaxConcurrent = 2
+	}
+	defBool(&c.Builder.Referer.Fallback, true)
+	defBool(&c.Builder.Referer.Writeback, true)
+	if c.Builder.Referer.Key == "" {
+		c.Builder.Referer.Key = c.Builder.Referer.Desc
 	}
 	def(&c.Checkpoint.Mode, CheckpointLocal)
 	def(&c.Checkpoint.LocalDir, "/var/lib/sandbox-saved")
@@ -584,6 +613,14 @@ func (c *Config) validate() error {
 	}
 	if c.Sandbox.Network.TapFDSocket != "" && !filepath.IsAbs(c.Sandbox.Network.TapFDSocket) {
 		return fmt.Errorf("config: sandbox.network.tapfd_socket must be absolute")
+	}
+	if c.Builder.Referer.Enabled && c.Builder.Referer.Desc == "" {
+		return fmt.Errorf("config: builder.referer.desc is required when builder.referer.enabled=true")
+	}
+	if c.Builder.Referer.Validity != "" {
+		if _, err := time.ParseDuration(c.Builder.Referer.Validity); err != nil {
+			return fmt.Errorf("config: builder.referer.validity %q: %w", c.Builder.Referer.Validity, err)
+		}
 	}
 	switch c.Checkpoint.Mode {
 	case CheckpointLocal, CheckpointRemote:
