@@ -12,13 +12,13 @@ import (
 // node-ctl drives, then daemon-reloads if anything changed. It is a
 // no-op when install_units=false (operator manages units out of band).
 //
-//   - <runner>  (sandbox-runner@.service): one microVM sandbox; also runs snapshot
-//     builds. ExecStart=node-ctl run-sandbox (exec-replaces into sandbox-ctl
-//     run), config pulled over the config-socket.
-//   - <builder> (sandbox-builder@.service): one template build. ExecStart=node-ctl
-//     run-builder, which pulls the BuildSpec (MANIFEST_KEY + tenant registry creds in
-//     env) over the config-socket and drives the three-phase pipeline itself
-//     (import/steps/template sandboxes as direct children; result JSON on stdout).
+//   - <runner>  (sandbox-runner@.service): one run-id unit that waits for a sandbox
+//     assignment, then exec-replaces into sandbox-ctl run with config pulled over
+//     the config-socket.
+//   - <builder> (sandbox-builder@.service): one run-id unit that waits for a build
+//     assignment, pulls the BuildSpec (MANIFEST_KEY + tenant registry creds in env)
+//     over the config-socket, drives the three-phase pipeline itself, and posts the
+//     result back to the socket.
 //
 // Both run in their own cgroup (KillMode=control-group / a dedicated slice) so the
 // reaper and the builder resource pool can account and reclaim them.
@@ -52,16 +52,16 @@ func (o *Orchestrator) InstallUnits(ctx context.Context) error {
 
 func (o *Orchestrator) runnerUnitFile() string {
 	return fmt.Sprintf(`[Unit]
-Description=kuasar sandbox %%i
-# node-ctl prepares %s/%%i and %s/%%i + writes %s/%%i/%%i.yaml before start.
+Description=kuasar sandbox runner %%i
+# %%i is a run-id, not a sandbox id. node-ctl run-sandbox waits on the config
+# socket until this run-id is assigned a sandbox id, then fetches the sandbox's
+# LaunchSpec and exec-replaces into sandbox-ctl.
 
 [Service]
 Type=exec
-WorkingDirectory=%s/%%i
-# run-sandbox locks+writes the pidfile, pulls the launch spec (exec=sandbox-ctl, the
-# secret MANIFEST_KEY in env) over the config-socket, then exec-replaces into
-# sandbox-ctl so it inherits this PID + the unit cgroup (sandbox-ctl --cgroup-adopt).
-ExecStart=%s run-sandbox --pidfile=%s/%%i/%%i.pid --config-socket=%s --sandbox-id=%%i
+WorkingDirectory=%s
+ExecStart=%s run-sandbox --pidfile=%s/runs/%%i.pid --config-socket=%s --run-id=%%i
+ExecStopPost=/bin/rm -f %s/runs/%%i.pid
 # One process per sandbox, stateful: a crash means the sandbox is gone, not retryable.
 Restart=no
 KillMode=control-group
@@ -73,36 +73,36 @@ Delegate=yes
 # --cgroup-adopt (in the launch spec) makes THIS unit's cgroup the sandbox resource
 # cgroup: sandbox-ctl + cloud-hypervisor share it, sentinel manages it in place, and
 # KillMode=control-group SIGKILLs the whole group on StopUnit.
-`, o.cfg.Paths.RunRoot, o.cfg.Paths.BaseRoot, o.cfg.Paths.RunRoot, o.cfg.Paths.RunRoot,
-		o.cfg.OrchestratorCtl(), o.cfg.Paths.RunRoot, o.cfg.Paths.ConfigSocket)
+`, o.cfg.Paths.RunRoot, o.cfg.OrchestratorCtl(), o.cfg.Paths.RunRoot, o.cfg.Paths.ConfigSocket, o.cfg.Paths.RunRoot)
 }
 
 func (o *Orchestrator) builderUnitFile() string {
 	return fmt.Sprintf(`[Unit]
-Description=kuasar image build %%i
+Description=kuasar image build runner %%i
+# %%i is a run-id, not a build id. node-ctl run-builder waits on the config
+# socket until this run-id is assigned a build id, then fetches the BuildSpec,
+# runs one build, posts the result back over the socket, and exits.
 
 [Service]
-Type=oneshot
-WorkingDirectory=%s/%%i
-# run-builder's stdout (the result JSON) is captured here for the orchestrator.
-# StandardError=journal keeps pipeline progress/errors OUT of the result file
-# (StandardError defaults to inherit, which would mirror stdout into the file).
-StandardOutput=file:%s/%%i/%%i.result
+Type=exec
+WorkingDirectory=%s
 StandardError=journal
 # Builds are few and we want the FULL detail in the journal (every phase
 # sandbox console line + flatten/RUN progress); disable journald rate limiting
 # for this unit so no line is dropped. (Runner units keep the default limit —
 # thousands of sandboxes must not flood the journal.)
 LogRateLimitIntervalSec=0
-# run-builder pulls the BuildSpec (secrets in env, never on disk) over the
-# config-socket and drives the three-phase pipeline itself — its phase
-# sandboxes (sandbox-ctl run + cloud-hypervisor) are direct children, so the
-# whole build accounts to this unit's cgroup under sandbox-builder.slice.
-ExecStart=%s run-builder --pidfile=%s/%%i/%%i.pid --config-socket=%s --build-id=%%i
+# run-builder pulls its assignment and BuildSpec (secrets in env, never on disk)
+# over the config-socket, drives the three-phase pipeline itself, and posts the
+# result back to the socket. Its phase sandboxes (sandbox-ctl run +
+# cloud-hypervisor) are direct children, so the whole build accounts to this
+# unit's cgroup under sandbox-builder.slice.
+ExecStart=%s run-builder --pidfile=%s/runs/%%i.pid --config-socket=%s --run-id=%%i
+ExecStopPost=/bin/rm -f %s/runs/%%i.pid
 TimeoutStartSec=%d
 KillMode=control-group
 Slice=sandbox-builder.slice
-`, o.cfg.Paths.RunRoot, o.cfg.Paths.RunRoot, o.cfg.OrchestratorCtl(), o.cfg.Paths.RunRoot, o.cfg.Paths.ConfigSocket, o.cfg.Builder.TotalTimeoutSec+60)
+`, o.cfg.Paths.RunRoot, o.cfg.OrchestratorCtl(), o.cfg.Paths.RunRoot, o.cfg.Paths.ConfigSocket, o.cfg.Paths.RunRoot, o.cfg.Builder.TotalTimeoutSec+60)
 }
 
 func sliceFile(desc, caps string) string {
@@ -129,16 +129,20 @@ func instanceUnit(tmpl, id string) string {
 	return strings.TrimSuffix(tmpl, ".service") + id + ".service"
 }
 
-func (o *Orchestrator) runnerUnit(sid string) string  { return instanceUnit(o.cfg.Units.Runner, sid) }
-func (o *Orchestrator) builderUnit(bid string) string { return instanceUnit(o.cfg.Units.Builder, bid) }
+func (o *Orchestrator) runnerUnit(runID string) string {
+	return instanceUnit(o.cfg.Units.Runner, runID)
+}
+func (o *Orchestrator) builderUnit(runID string) string {
+	return instanceUnit(o.cfg.Units.Builder, runID)
+}
 
 // runnerPattern is the ListUnitsByPatterns glob for live runner instances.
 func (o *Orchestrator) runnerPattern() string {
 	return strings.TrimSuffix(o.cfg.Units.Runner, ".service") + "*.service"
 }
 
-// unitToSID extracts the sandbox id from a runner instance unit name.
-func (o *Orchestrator) unitToSID(name string) string {
+// unitToRunID extracts the run-id from a template instance unit name.
+func (o *Orchestrator) unitToRunID(name string) string {
 	name = strings.TrimPrefix(name, strings.TrimSuffix(o.cfg.Units.Runner, ".service"))
 	return strings.TrimSuffix(name, ".service")
 }

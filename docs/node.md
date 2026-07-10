@@ -45,9 +45,9 @@ node-ctl 补这一层,并刻意选择 **e2b 协议兼容**而非自定义 API:e2
    与节点级**资源控制器**对话完成;控制器由 `node-ctl conductor serve` 经 `resource_listen` 内置
    (node-resource.md),调参随 serve 配置内联。它仍是与 serve 的 api / 主机 / proxy
    逻辑解耦的可分离子系统。构建任务的资源池由 serve 自管(§12)。
-3. **进程管理交给 systemd**:一沙箱一单元(`sandbox-runner@<sid>`),单元 cgroup 即
-   沙箱资源 cgroup(`--cgroup-adopt`,§5.1),`StopUnit` 即完整回收;serve 不
-   自己当进程监督者。
+3. **进程管理交给 systemd**:runner/builder 模板单元以 run-id 为实例名,可预启动等待
+   config-socket 下发 assignment;分配后单元 cgroup 即沙箱/构建资源 cgroup
+   (`--cgroup-adopt`,§5.1),`StopUnit` 即完整回收;serve 不自己当进程监督者。
 4. **密钥不落明文盘**:租户 manifest_key 库内 AES-256-GCM 加密,运行期只经内存与
    启动器 LaunchSpec 的 env 帧传递(§6、§7);集群下经 node-link 下行的 manifest_key
    同样仅加密落盘(§10)。
@@ -98,10 +98,10 @@ node-ctl 补这一层,并刻意选择 **e2b 协议兼容**而非自定义 API:e2
       │   templates register/trigger/status   │   │  external     │ │  down: create/connect/
       │ host:                                 │   │  workers,     │ │       delete/key_put/key_drop
       │   connector-ctl vswitch attach → floatingip     │   │  route-synced)│ │
-      │   StartUnit(sandbox-runner@<sid>)     │   │ 49983/49999   │ └─ node-link client ───┐
+      │   assign sandbox-runner@<run-id>      │   │ 49983/49999   │ └─ node-link client ───┐
       │   envd /init → sqlite + TTL           │   │  → UDS (envd) │                        │
       │ build: builds table → pool →          │   │ other ports → │◄── cluster-ctl router  │
-      │   StartUnit(sandbox-builder@<bid>)    │   │  floatingip   │    forwards data plane  │
+      │   assign sandbox-builder@<run-id>     │   │  floatingip   │    forwards data plane  │
       │ [resource_listen]: resource ctrl      │   └──────┬────────┘                        │
       └──────┬───────────────┬────────────────┘         │                                 │
              │ D-Bus         │ UDS config-socket         │                                 │
@@ -115,10 +115,12 @@ node-ctl 补这一层,并刻意选择 **e2b 协议兼容**而非自定义 API:e2
 ```
 
 create 流程:建 `<run_root>/<sid>/`(tmpfs)+ `<base_root>/<sid>/`(disk)→
-`connector-ctl vswitch attach` 拿 `{port, floatingip, mac}` → 写非密配置 `<sid>.yaml` → 登记
-sqlite → `StartUnit(sandbox-runner@<sid>)` → 单元内 `run-sandbox` 经 config-socket 取
-LaunchSpec(密钥经 env)后 `execve` 成 `sandbox-ctl run` → 起 microVM → (e2b)等
-envd `/health` 就绪(60s 上限)→ `POST /init` 置 env/默认用户 → 起 TTL。集群下,该
+`connector-ctl vswitch attach` 拿 `{port, floatingip, mac}` → 写非密配置 `<sid>.yaml`
+→ 从 runner pool 分配一个 run-id(无 idle 时按需 `StartUnit(sandbox-runner@<run-id>)`)
+→ 持久化 `sid ↔ run-id` → 单元内 `run-sandbox` 经 config-socket 的
+WaitAssignment 取得 sid,再取 LaunchSpec(密钥经 env)后 `execve` 成 `sandbox-ctl run`
+→ 起 microVM → (e2b)等 envd `/health` 就绪(60s 上限)→ `POST /init` 置 env/默认用户
+→ 起 TTL。集群下,该
 create 由 node-link 的 `create` 命令触发,group / route-key 经 metadata 注入并随事件回报
 registry(§10、§4.6)。
 
@@ -208,25 +210,26 @@ node-proxy.md §2、§5——转发层自成一文,本仓控制面只在 §9 讲
 
 ### 2.4 `node-ctl run-sandbox` / `run-builder`
 
-systemd 单元的 ExecStart,非给人用。共用的进入骨架:`--pidfile` 以
-`fcntl(F_SETLK)` 排他锁防重入、写本 PID → 拨 `--config-socket` 取规约(§6)。
-之后两者分道:
+systemd 单元的 ExecStart,非给人用。共用的进入骨架:`--run-id` 是 systemd 实例名,
+`--pidfile` 指向 `<run_root>/runs/<run-id>.pid`,以 `fcntl(F_SETLK)` 排他锁防重入并写本
+PID → 拨 `--config-socket` WaitAssignment 取得业务 id(§6)。之后两者分道:
 
-- **run-sandbox**:取 LaunchSpec → `chdir(workdir)`、剥除 `TASK_*` 引导变量、合入
+- **run-sandbox**:取得 sid 后锁 `<run_root>/<sid>/<sid>.pid`,取 LaunchSpec →
+  `chdir(workdir)`、剥除 `TASK_*` 引导变量、合入
   `spec.env`(密钥)→ `execve` 替换为 `sandbox-ctl run`,目标继承本 PID 与单元
   cgroup(锁 fd 已清 `FD_CLOEXEC`,随 execve 存活)。
-- **run-builder**:取 BuildSpec → **驻留**驱动三阶段构建流水线(§12):各阶段沙箱
-  (`sandbox-ctl run`)是它的直接子进程,整个构建计入本单元 cgroup;结束把结果 JSON
-  (`{image_key|snapshot_key, start_cmd, ready_cmd, error}`)打到 stdout,由单元
-  `StandardOutput=file:` 捕获为 `<bid>.result`。
+- **run-builder**:取得 bid 后锁 `<run_root>/<bid>/<bid>.pid`,取 BuildSpec →
+  **驻留**驱动三阶段构建流水线(§12):各阶段沙箱(`sandbox-ctl run`)是它的直接子进程,
+  整个构建计入本单元 cgroup;结束把结果
+  `{image_key|snapshot_key, start_cmd, ready_cmd, error}` 经 config-socket 回传。
 
 ```
-node-ctl run-sandbox --pidfile=<f> --config-socket=<uds> --sandbox-id=<sid>
-node-ctl run-builder --pidfile=<f> --config-socket=<uds> --build-id=<bid>
+node-ctl run-sandbox --pidfile=<f> --config-socket=<uds> --run-id=<rid>
+node-ctl run-builder --pidfile=<f> --config-socket=<uds> --run-id=<rid>
 ```
 
-flags 缺省回落 `TASK_PIDFILE` / `TASK_CONFIG_SOCKET` / `TASK_SANDBOX_ID` /
-`TASK_BUILD_ID` env(systemd `%i` 接线用)。
+flags 缺省回落 `TASK_PIDFILE` / `TASK_CONFIG_SOCKET` / `TASK_RUN_ID`
+env(systemd `%i` 接线用)。
 
 ### 2.5 `node-ctl config`
 
@@ -324,11 +327,13 @@ node-ctl 同目录 → PATH"自动发现。
 | `paths.run_root` | `/run/sandbox` | tmpfs 运行态:`<sid>/` 运行目录、UDS、pidfile |
 | `paths.base_root` | `/var/lib/sandbox` | 持久态根 |
 | `paths.db_path` | `<base_root>/node-ctl.db` | sqlite 路径(§15) |
-| `paths.config_socket` | `/run/sandbox/node-ctl.socket` | 本机控制 socket(四平面 h2c,§6);manifest-key/export/import CLI 与 external proxy / 平台 agent 的连接点 |
+| `paths.config_socket` | `/run/sandbox/node-ctl.socket` | 本机控制 socket(run assignment/result + task/admin/plugin/api,§6);manifest-key/export/import CLI 与 external proxy / 平台 agent 的连接点 |
 | `paths.admin_pidfile` | 空 | admin 平面的多行 PID 白名单(`#` 注释);未配则仅靠 socket 0600 |
 | `paths.plugin_pidfile` | 空 | plugin 平面(proxy/agent 注册)的多行 PID 白名单;未配则仅靠 socket 0600 |
 | `units.dir` | `/etc/systemd/system` | 模板单元安装目录 |
 | `units.runner` / `units.builder` | `sandbox-runner@.service` / `sandbox-builder@.service` | 模板单元名 |
+| `units.runner_pool_size` / `units.builder_pool_size` | `0` / `0` | 空闲预启动 run-id 单元数;0 = 不保留 idle,有任务时仍按需经 WaitAssignment 流程启动 |
+| `units.pool_wait_timeout` | `5s` | `StartUnit` 成功后等待单元进入 WaitAssignment 的上限;超时清理该 run-id 并补池 |
 | `units.install` | `true` | `false` = 单元由运维带外管理,serve 不生成安装 |
 | `sandbox.timeout_sec` | `300` | 沙箱默认 TTL(秒) |
 | `sandbox.resources.vcpu` / `.memory` | `2` / `2GiB` | 每沙箱容量;同时回显在 e2b list/get 的 `cpuCount`/`memoryMB`。**restore 类启动(snp 模板 create / resume / 迁移导入)按快照内 snapshot.cfg 的 capacity 覆盖**——快照自描述,可与本机默认不同(如构建预算下产出的模板) |
@@ -506,15 +511,16 @@ serve 启动时生成并安装两个模板单元 + 两个 slice(`sandbox-runner.
 `units.install: false` 则交由运维带外管理。ExecStart 里的 `node-ctl` 路径
 取自 serve 自身所在目录(自动发现,§3)。
 
-**runner 单元**(`%i` = sid):
+**runner 单元**(`%i` = run-id):
 
 ```ini
 # sandbox-runner@.service (生成内容,路径按配置渲染)
 [Service]
 Type=exec
-WorkingDirectory=/run/sandbox/%i
-ExecStart=<node-ctl> run-sandbox --pidfile=/run/sandbox/%i/%i.pid \
-          --config-socket=/run/sandbox/node-ctl.socket --sandbox-id=%i
+WorkingDirectory=/run/sandbox
+ExecStart=<node-ctl> run-sandbox --pidfile=/run/sandbox/runs/%i.pid \
+          --config-socket=/run/sandbox/node-ctl.socket --run-id=%i
+ExecStopPost=/bin/rm -f /run/sandbox/runs/%i.pid
 Restart=no                  # 一进程一沙箱、有状态:崩 = 该沙箱已死,不重试
 KillMode=control-group      # StopUnit 连 cloud-hypervisor 一并 SIGKILL(§5.1)
 TimeoutStopSec=20
@@ -522,36 +528,37 @@ Slice=sandbox-runner.slice
 Delegate=yes                # 委派控制器,--cgroup-adopt 才能写 cpu.max/memory.max(§5.1)
 ```
 
-**builder 单元**(`%i` = build id,§12):
+**builder 单元**(`%i` = run-id,§12):
 
 ```ini
 # sandbox-builder@.service (生成内容)
 [Service]
-Type=oneshot
-WorkingDirectory=/run/sandbox/%i
-StandardOutput=file:/run/sandbox/%i/%i.result   # 捕获 run-builder stdout 的构建结果 JSON
-StandardError=journal                           # 流水线进度/报错进 journal,不污染 .result
+Type=exec
+WorkingDirectory=/run/sandbox
+StandardError=journal
 LogRateLimitIntervalSec=0                        # 构建少且要全量细节(每阶段控制台 + flatten/RUN 进度):关本单元限流不丢行(runner 单元保留默认限流,§5.2)
-ExecStart=<node-ctl> run-builder --pidfile=/run/sandbox/%i/%i.pid \
-          --config-socket=/run/sandbox/node-ctl.socket --build-id=%i
+ExecStart=<node-ctl> run-builder --pidfile=/run/sandbox/runs/%i.pid \
+          --config-socket=/run/sandbox/node-ctl.socket --run-id=%i
+ExecStopPost=/bin/rm -f /run/sandbox/runs/%i.pid
 TimeoutStartSec=1860              # builder.total_timeout_sec + 60
 KillMode=control-group
 Slice=sandbox-builder.slice   # 构建池 cgroup 上限(builder.cpu_quota/memory_max)
 ```
 
-两单元的 ExecStart 都是启动器(§2.4),锁 pidfile 后经 config-socket 取规约,然后
-分道:runner `execve` 替换为 `sandbox-ctl run`(继承单元主 PID 与 cgroup,
-`Type=exec` 故无需 sd_notify);builder **驻留**驱动三阶段流水线(§12),阶段沙箱
-(`sandbox-ctl run` + cloud-hypervisor)是其直接子进程、整个构建计入本单元 cgroup,
-`Type=oneshot` 使 `StartUnit` 阻塞至流水线退出,`KillMode=control-group` 保证
-StopUnit/超时连阶段 VM 一并回收。
+两单元的 ExecStart 都先锁 run-id pidfile,再经 config-socket WaitAssignment 等待
+业务 id。runner 取得 sid 后再锁 `<run_root>/<sid>/<sid>.pid`,取 LaunchSpec 并
+`execve` 替换为 `sandbox-ctl run`(继承单元主 PID 与 cgroup,`Type=exec` 故无需
+sd_notify);builder 取得 bid 后再锁 `<run_root>/<bid>/<bid>.pid`,取 BuildSpec,
+**驻留**驱动三阶段流水线(§12),阶段沙箱(`sandbox-ctl run` + cloud-hypervisor)是其
+直接子进程、整个构建计入本单元 cgroup,结果经 config-socket 回传。`KillMode=control-group`
+保证 StopUnit/超时连阶段 VM 一并回收。
 
 - **kill**:`StopUnit`(连 CH 一并 SIGKILL)→ `ResetFailedUnit` → `connector-ctl vswitch detach`
   → 删运行目录 → 删库行。`kill` 在进程层生效,不受 guest 内 restart 策略阻挡。
 - **就绪**:`Type=exec` 下 exec 成功即视为单元已启动;e2b profile 再轮询 envd
   `/health`(UDS,60s 上限)判数据面就绪。
-- **存活权威**:`ListUnitsByPatterns("sandbox-runner@*.service")` 一次拿权威存活集
-  (§15)。
+- **存活权威**:`ListUnitsByPatterns("sandbox-runner@*.service")` 一次拿权威存活
+  run-id 集,再与库内 `sandboxes.run_id` 对账(§15)。
 - 宿主 `Restart=no` 与 guest 内 envd `restart=always`(sandbox-init 管)是两层,
   互不相干。
 
@@ -561,7 +568,7 @@ serve 不预建 cgroup、不做进程搬迁。LaunchSpec 给 sandbox-ctl 带
 **`--cgroup-adopt`**:它接管自己所在 systemd 单元的 cgroup 作为沙箱资源 cgroup——读
 `/proc/self/cgroup` 求出路径,cloud-hypervisor 与自身都留在其中。于是:
 
-- 一个单元 = 一个沙箱 cgroup;资源控制器(配置了 `control_socket` 时)在该路径上原地
+- 一个已分配 runner 单元 = 一个沙箱 cgroup;资源控制器(配置了 `control_socket` 时)在该路径上原地
   仲裁;`KillMode=control-group` 使 `StopUnit` 连 CH 一起 SIGKILL,无需 serve
   排空/rmdir 安全网。
 - 单元必须 `Delegate=yes`:否则单元 cgroup 的控制器接口文件(`cpu.max`/`memory.max`)
@@ -572,24 +579,25 @@ serve 不预建 cgroup、不做进程搬迁。LaunchSpec 给 sandbox-ctl 带
 ### 5.2 日志:journald 单汇 + 标签词表
 
 沙箱栈的 app stdio 与 guest 内核 dmesg 全部直写 journald(无临时日志文件),由
-`SYSLOG_IDENTIFIER` 标签区分;journald 按写入进程的 cgroup 自动盖 `_SYSTEMD_UNIT`,
-故"标签 + 单元"二元组即选定一路流。写者是 **sandbox-ctl** 的 stdio bridge
+`SYSLOG_IDENTIFIER` 标签区分,并附加 `KUASAR_RUN_ID` / `KUASAR_SANDBOX_ID` /
+`KUASAR_BUILD_ID` 等字段。用户侧按业务 id 查询,无需知道 run-id 或单元实例名。
+写者是 **sandbox-ctl** 的 stdio bridge
 (`--stdout-to/--stderr-to/--console journald=<tag>`,语义见 `sandboxer/docs/sandbox.md`
 §2.2)与 run-builder(自身里程碑 + envd RUN 输出回放,`go-systemd/journal`
 纯 Go 直发):
 
 | 标签 | 写者 / 单元 | 内容 | 去向 |
 |---|---|---|---|
-| `sandbox` | runner 沙箱 / `sandbox-runner@<sid>` | 沙箱 app stdio | 仅宿主排障 |
-| `build` | builder 阶段沙箱 + run-builder / `sandbox-builder@<bid>` | 阶段 app stdio + 里程碑 + RUN 回放 + flatten 进度 | **SDK 构建日志**(§12);宿主亦可见 |
+| `sandbox` | runner 沙箱 / `KUASAR_SANDBOX_ID=<sid>` | 沙箱 app stdio | 仅宿主排障 |
+| `build` | builder 阶段沙箱 + run-builder / `KUASAR_BUILD_ID=<bid>` | 阶段 app stdio + 里程碑 + RUN 回放 + flatten 进度 | **SDK 构建日志**(§12);宿主亦可见 |
 | `console` | runner / builder 两类沙箱 | guest 内核 dmesg | **仅宿主**(故意不入 SDK 构建日志) |
 
 - **runner**:LaunchSpec(§6)给 sandbox-ctl 带 `--stdout-to journald=sandbox
   --stderr-to journald=sandbox --console journald=console`;exec 替换后在 runner 单元
-  cgroup 内直写,标签自动归 `sandbox-runner@<sid>`。`journalctl -u
-  sandbox-runner@<sid>.service [SYSLOG_IDENTIFIER=sandbox|console]` 按沙箱取流。
+  cgroup 内直写,并带 `KUASAR_SANDBOX_ID=<sid>`。`journalctl KUASAR_SANDBOX_ID=<sid>
+  SYSLOG_IDENTIFIER=sandbox` 按沙箱取流。
 - **builder**:run-builder 给每台阶段沙箱带 `journald=build`(app)/`journald=console`
-  (内核);单元 `LogRateLimitIntervalSec=0` 保证不丢行(§5)。
+  (内核),并带 `KUASAR_BUILD_ID=<bid>`;单元 `LogRateLimitIntervalSec=0` 保证不丢行(§5)。
 - **限流策略**:builder 单元关限流(构建少、要全量细节);runner 单元保留默认限流
   (数千沙箱不得刷爆 journal)。
 - sandbox-ctl 自身进程日志(其 stderr)随单元落 journal 但**不带标签**——属宿主排障,
@@ -949,14 +957,15 @@ plugin 平面,机群路由经 registry 聚合。
 ## 12. 模板构建(三阶段流水线,构建在沙箱内进行)
 
 构建经 e2b API 提交(端点见 §4.2;无独立构建 CLI),落 `builds` 表,由资源池调度,
-每个构建一个 `sandbox-builder@<bid>` 单元。**镜像拉取与 step 执行都发生在构建沙箱
+每次执行绑定一个 `sandbox-builder@<run-id>` 单元。**镜像拉取与 step 执行都发生在构建沙箱
 (microVM)内**——租户的网络流量与镜像内容不触宿主用户态,宿主侧只做工件接力与
 收尾上传。
 
 **serve 侧(每构建一次)**:建 workdir → `connector-ctl vswitch attach` 一个网络槽(整个构建
 复用,各阶段顺序交接 tapfd)→ 铸 envd token →(`mmds.enabled` 时)挂一行合成路由,
-让模板阶段 FC 模式的 envd 能按 floatingip 自解析 → `StartUnit`(oneshot,阻塞至
-流水线退出)→ 读 `<bid>.result` JSON → 终态落库:产物为快照 ⇒ `kind=snp`、为镜像 ⇒
+让模板阶段 FC 模式的 envd 能按 floatingip 自解析 → 从 builder pool 分配 run-id
+(无 idle 时按需 `StartUnit`)→ run-builder WaitAssignment 取得 bid 后执行流水线
+→ 经 config-socket 回传结果 → 终态落库:产物为快照 ⇒ `kind=snp`、为镜像 ⇒
 `img`,持久 id `e2b-<kind>-<key>` 写入 names/aliases。
 
 **单元内(run-builder,§2.4)** 依 BuildSpec(§6)最多跑三个阶段,每阶段一台
@@ -1036,15 +1045,15 @@ versitygw`)。force_path_style 默认 false(虚拟主机式;versitygw/minio 置 
 (stdout = 64-hex manifest key;若 import referer hit/miss 已得到 base manifest id 则直接
 复用);产出快照 ⇒ **一条** `sandbox-ctl upload-snapshot <bundle>`——自动上传
 snapshot.cfg 引用的全部本地工件(base 镜像、overlay)并把引用改写为
-`manifest://`(runtime_ref 不动,宿主提供)。结果 JSON
-`{image_key|snapshot_key, start_cmd, ready_cmd, error}` 打 stdout → `<bid>.result`;
+`manifest://`(runtime_ref 不动,宿主提供)。结果
+`{image_key|snapshot_key, start_cmd, ready_cmd, error}` 经 config-socket 回传;
 快照模板的 start/ready 同时记进 snapshot.cfg metadata,模板自描述(fromTemplate
 继承与 create 都读它)。
 
 **构建日志流(journald 单汇 → status API → SDK on_build_logs)**:构建进度对 SDK
 实时可见,零临时文件——全部写 journald 标签 `build`(机制 + 标签词表见 §5.2),
-serve 按需查询单元日志回给 SDK。**写入**(tag build,单元
-`sandbox-builder@<bid>`):run-builder 里程碑(`import: pulling…`、`step N: RUN…`、
+serve 按需查询日志回给 SDK。**写入**(tag build,`KUASAR_BUILD_ID=<bid>`):
+run-builder 里程碑(`import: pulling…`、`step N: RUN…`、
 `template: ready`、`uploading…`)经 `go-systemd/journal` 直发;RUN/startCmd 输出由
 持流的 run-builder 从 envd 流回放进同一汇(envd 自身无 journal);阶段 app stdio 由
 sandbox-ctl `--stdout-to/--stderr-to journald=build` 直写;flatten 拉取/导出进度经
@@ -1052,14 +1061,14 @@ sandbox-ctl `--stdout-to/--stderr-to journald=build` 直写;flatten 拉取/导�
 `pull: N/M layers`、`flatten: …` 滚动);失败时 run-builder 补写一行
 `build failed: <err>`。guest 内核 dmesg(tag console)与 sandbox-ctl 自身日志不在此
 过滤,SDK 见干净构建日志。**读取**:status(§4.2)按 `?logsOffset`(已读条数)分页;
-serve `journalctl _SYSTEMD_UNIT=sandbox-builder@<bid>.service
-SYSLOG_IDENTIFIER=build --output=json` 取 MESSAGE/PRIORITY/时间戳,PRIORITY→e2b level
+serve `journalctl KUASAR_BUILD_ID=<bid> SYSLOG_IDENTIFIER=build --output=json`
+取 MESSAGE/PRIORITY/时间戳,PRIORITY→e2b level
 (≤3 error、4 warn、≥7 debug、余 info),切片 `[offset:]` 回
 `{logs[], logEntries[{timestamp, level, message}]}`;尽力而为(非 systemd / 无日志 →
 空,不阻断 status)。CGO-free:sdjournal 读需 CGO,故 journalctl 子进程读、
 `go-systemd/journal` 纯 Go 写。**失败语义**:流水线失败 ⇒ `reason.message` 保持通用
 (`build failed; see build logs`),详情已在日志流里(零额外机制);基础设施失败
-(流水线未起、无 .result)无构建日志,`reason` 直陈宿主侧错误。
+(流水线未起或未回传结果)无构建日志,`reason` 直陈宿主侧错误。
 
 **fromImage 的来源**:trigger body 显式给出;或(e2b CLI 在客户端 `docker build` +
 `docker push` 到约定名、trigger 不带镜像引用的工作流)由 `builder.image_uri_mask`

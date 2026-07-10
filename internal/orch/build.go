@@ -363,20 +363,11 @@ func (o *Orchestrator) BuildPool(ctx context.Context, interval time.Duration) {
 	}
 }
 
-// buildResult is what run-builder prints on stdout (captured to
-// <bid>.result by the unit): the manifest keys of what the pipeline
-// actually produced, plus the effective start/ready commands
-// (fromTemplate inheritance resolves inside the pipeline).
-type buildResult struct {
-	ImageKey    string `json:"image_key,omitempty"`
-	SnapshotKey string `json:"snapshot_key,omitempty"`
-	StartCmd    string `json:"start_cmd,omitempty"`
-	ReadyCmd    string `json:"ready_cmd,omitempty"`
-	Error       string `json:"error,omitempty"`
-}
+type buildResult = configsock.BuildResult
 
 // pendingBuild is the per-execution state BuildSpecFor serves while the
-// build unit runs: the pre-attached network slot + minted envd token.
+// build run-id unit executes: the pre-attached network slot, minted envd token,
+// and result channel.
 type pendingBuild struct {
 	build     *types.Build
 	workdir   string
@@ -385,6 +376,7 @@ type pendingBuild struct {
 	innerIP   string // CIDR
 	floating  string
 	envdToken string
+	result    chan configsock.BuildResult
 }
 
 func buildTapFD(t vswitch.TapFD) configsock.TapFDConfig {
@@ -396,13 +388,13 @@ func buildTapFD(t vswitch.TapFD) configsock.TapFDConfig {
 	}
 }
 
-// executeBuild runs the three-phase pipeline in a sandbox-builder@<bid>
-// unit: node-ctl run-builder fetches the BuildSpec over the
-// config-socket and drives import/steps/template sandboxes itself (as
-// direct children, in the unit's cgroup). This side owns what spans the
-// unit: the workdir, ONE vswitch slot the phases reuse sequentially,
-// and — for the template phase under mmds.enabled — a synthetic route
-// entry so the build sandbox's FC-mode envd can resolve itself.
+// executeBuild runs the three-phase pipeline in a sandbox-builder@<run-id> unit:
+// node-ctl run-builder waits for a build assignment, fetches the BuildSpec over
+// the config-socket, and drives import/steps/template sandboxes itself (as direct
+// children, in the unit's cgroup). This side owns what spans the unit: the
+// workdir, one vswitch slot the phases reuse sequentially, and — for the template
+// phase under mmds.enabled — a synthetic route entry so the build sandbox's
+// FC-mode envd can resolve itself.
 func (o *Orchestrator) executeBuild(ctx context.Context, b *types.Build) {
 	res, err := o.runBuildUnit(ctx, b)
 	switch {
@@ -472,6 +464,7 @@ func (o *Orchestrator) runBuildUnit(ctx context.Context, b *types.Build) (*build
 		build: b, workdir: dir,
 		tapFD: o.vs.TapFD(port.Port), mac: port.MAC,
 		innerIP: cidrIP, floating: port.FloatingIP, envdToken: envdTok,
+		result: make(chan configsock.BuildResult, 1),
 	}
 	o.pendMu.Lock()
 	o.pend[b.BuildID] = pend
@@ -499,29 +492,42 @@ func (o *Orchestrator) runBuildUnit(ctx context.Context, b *types.Build) (*build
 		}()
 	}
 
-	unit := o.builderUnit(b.BuildID)
-	_ = o.lc.ResetFailed(ctx, unit)
-	startErr := o.lc.Start(ctx, unit) // Type=oneshot: returns when run-builder exits
-	out, readErr := os.ReadFile(filepath.Join(dir, b.BuildID+".result"))
-	_ = o.lc.Stop(ctx, unit)
-	_ = o.lc.ResetFailed(ctx, unit)
+	var unit string
+	if _, err := o.builderRunPool.Assign(ctx, b.BuildID, func(runID string) error {
+		b.RunID = runID
+		unit = o.builderUnit(runID)
+		return o.st.PutBuild(ctx, b)
+	}); err != nil {
+		return nil, err
+	}
+	defer func() { _ = o.lc.ResetFailed(context.Background(), unit) }()
 
-	var res buildResult
-	if len(out) > 0 {
-		if jerr := json.Unmarshal(out, &res); jerr != nil {
-			return nil, fmt.Errorf("build: result file: %w (unit err: %v)", jerr, startErr)
+	timeout := time.Duration(o.cfg.Builder.TotalTimeoutSec+60) * time.Second
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	tick := time.NewTicker(500 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		select {
+		case res := <-pend.result:
+			return &res, nil
+		case <-ctx.Done():
+			_ = o.lc.Stop(context.Background(), unit)
+			return nil, ctx.Err()
+		case <-timer.C:
+			_ = o.lc.Stop(context.Background(), unit)
+			return nil, fmt.Errorf("build: result timeout after %s", timeout)
+		case <-tick.C:
+			select {
+			case res := <-pend.result:
+				return &res, nil
+			default:
+			}
+			if !o.unitActive(ctx, unit) {
+				return nil, fmt.Errorf("build: unit %s exited without result", unit)
+			}
 		}
 	}
-	if startErr != nil {
-		if res.Error != "" {
-			return &res, nil // the pipeline reported its own failure
-		}
-		return nil, startErr
-	}
-	if readErr != nil {
-		return nil, fmt.Errorf("build: no result file: %w", readErr)
-	}
-	return &res, nil
 }
 
 // --- configsock.Provider (build) ---
@@ -594,6 +600,7 @@ func (o *Orchestrator) BuildSpecFor(ctx context.Context, configID string) (*conf
 
 	spec := &configsock.BuildSpec{
 		BuildID:          b.BuildID,
+		RunID:            b.RunID,
 		Workdir:          pend.workdir,
 		FromImage:        b.FromImage,
 		FromTemplate:     fromTemplate,

@@ -21,9 +21,22 @@ import (
 )
 
 // countingLauncher records how many times a unit was started — the launch count.
-type countingLauncher struct{ starts atomic.Int64 }
+type countingLauncher struct {
+	starts atomic.Int64
+	orch   *Orchestrator
+}
 
-func (l *countingLauncher) Start(context.Context, string) error       { l.starts.Add(1); return nil }
+func (l *countingLauncher) Start(ctx context.Context, unit string) error {
+	l.starts.Add(1)
+	if l.orch != nil {
+		prefix := strings.TrimSuffix(l.orch.cfg.Units.Runner, ".service")
+		if strings.HasPrefix(unit, prefix) {
+			runID := l.orch.unitToRunID(unit)
+			go func() { _, _, _ = l.orch.WaitAssignment(ctx, runKindSandbox, runID) }()
+		}
+	}
+	return nil
+}
 func (l *countingLauncher) Stop(context.Context, string) error        { return nil }
 func (l *countingLauncher) ResetFailed(context.Context, string) error { return nil }
 func (l *countingLauncher) List(context.Context, string) ([]launcher.Unit, error) {
@@ -69,7 +82,10 @@ func TestResumeRace_ConnectAndRouteSingleLaunch(t *testing.T) {
 
 	lc := &countingLauncher{}
 	o := New(cfg, st, lc, stubVS{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	ctx := context.Background()
+	lc.orch = o
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	o.StartRunPools(ctx)
 
 	// bare-img with no snapshot ref → launch reaches lc.Start without the e2b
 	// readiness wait or the snapshot-probe exec (RestoreRefFor returns "").

@@ -288,10 +288,21 @@ type PathsConfig struct {
 
 // UnitsConfig manages the systemd template units (generated + installed at startup).
 type UnitsConfig struct {
-	Dir     string `yaml:"dir"`     // default /etc/systemd/system
-	Runner  string `yaml:"runner"`  // default sandbox-runner@.service
-	Builder string `yaml:"builder"` // default sandbox-builder@.service
-	Install *bool  `yaml:"install"` // default true; false = manage out of band
+	Dir             string `yaml:"dir"`               // default /etc/systemd/system
+	Runner          string `yaml:"runner"`            // default sandbox-runner@.service
+	Builder         string `yaml:"builder"`           // default sandbox-builder@.service
+	RunnerPoolSize  int    `yaml:"runner_pool_size"`  // idle prestarted runner units; 0 = disabled
+	BuilderPoolSize int    `yaml:"builder_pool_size"` // idle prestarted builder units; 0 = disabled
+	PoolWaitTimeout string `yaml:"pool_wait_timeout"` // StartUnit -> WaitAssignment deadline; default 5s
+	Install         *bool  `yaml:"install"`           // default true; false = manage out of band
+}
+
+func (u UnitsConfig) PoolWaitDuration() time.Duration {
+	d, err := time.ParseDuration(u.PoolWaitTimeout)
+	if err != nil || d <= 0 {
+		return 5 * time.Second
+	}
+	return d
 }
 
 // SandboxConfig is the sandbox-instance defaults, sub-grouped for clarity.
@@ -513,6 +524,7 @@ func (c *Config) applyDefaults() {
 	def(&c.Units.Dir, "/etc/systemd/system")
 	def(&c.Units.Runner, "sandbox-runner@.service")
 	def(&c.Units.Builder, "sandbox-builder@.service")
+	def(&c.Units.PoolWaitTimeout, "5s")
 	if c.Units.Install == nil {
 		t := true
 		c.Units.Install = &t
@@ -639,6 +651,15 @@ func (c *Config) validate() error {
 		if _, err := time.ParseDuration(c.Builder.Referer.Validity); err != nil {
 			return fmt.Errorf("config: builder.referer.validity %q: %w", c.Builder.Referer.Validity, err)
 		}
+	}
+	if c.Units.RunnerPoolSize < 0 {
+		return fmt.Errorf("config: units.runner_pool_size must be >= 0")
+	}
+	if c.Units.BuilderPoolSize < 0 {
+		return fmt.Errorf("config: units.builder_pool_size must be >= 0")
+	}
+	if _, err := time.ParseDuration(c.Units.PoolWaitTimeout); err != nil {
+		return fmt.Errorf("config: units.pool_wait_timeout %q: %w", c.Units.PoolWaitTimeout, err)
 	}
 	switch c.Checkpoint.Mode {
 	case CheckpointLocal, CheckpointRemote:

@@ -1,7 +1,7 @@
 package main
 
-// run-builder is the ExecStart of sandbox-builder@<bid>.service: the build
-// pipeline orchestrator. It fetches the BuildSpec over the config-socket and
+// run-builder is the ExecStart of sandbox-builder@<run-id>.service: the build
+// pipeline orchestrator. It waits for a build assignment, fetches the BuildSpec and
 // hands it to internal/builder, which drives up to three phases, each a
 // microVM it spawns as a DIRECT child (sandbox-ctl run, in this unit's
 // cgroup), reusing ONE pre-attached network slot sequentially:
@@ -34,17 +34,18 @@ package main
 // which works on any rootfs and carries raw stdio.
 //
 // The finale uploads what was produced — platform credentials appear ONLY
-// here: an image-only build runs `manifest-ctl store image.img`; a snapshot
-// build runs ONE `sandbox-ctl upload-snapshot` (it auto-uploads every local
-// artifact the snapshot.cfg references, the base image included, and
-// rewrites the refs to manifest://). The result JSON goes to stdout, which
-// the unit captures to <bid>.result for the orchestrator.
+// here: an image-only build runs `manifest-ctl store image.img`; a snapshot build
+// runs ONE `sandbox-ctl upload-snapshot` (it auto-uploads every local artifact the
+// snapshot.cfg references, the base image included, and rewrites the refs to
+// manifest://). The result returns over the config-socket.
 
 import (
-	"encoding/json"
+	"context"
 	"flag"
 	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/builder"
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
@@ -54,27 +55,52 @@ func runBuilder(args []string, log *slog.Logger) error {
 	fs := flag.NewFlagSet("run-builder", flag.ExitOnError)
 	pidfile := fs.String("pidfile", "", "pidfile to lock+write (TASK_PIDFILE)")
 	socket := fs.String("config-socket", "", "config-socket UDS (TASK_CONFIG_SOCKET)")
-	bid := fs.String("build-id", "", "build id (TASK_BUILD_ID)")
+	runID := fs.String("run-id", "", "run id (TASK_RUN_ID)")
 	_ = fs.Parse(args)
 	envDefault(pidfile, "TASK_PIDFILE")
 	envDefault(socket, "TASK_CONFIG_SOCKET")
-	envDefault(bid, "TASK_BUILD_ID")
-	if *socket == "" || *bid == "" {
-		return fmt.Errorf("run-builder: --config-socket and --build-id required")
+	envDefault(runID, "TASK_RUN_ID")
+	if *socket == "" || *runID == "" {
+		return fmt.Errorf("run-builder: --config-socket and --run-id required")
 	}
 	if *pidfile != "" {
 		if err := lockPidfile(*pidfile); err != nil {
 			return err
 		}
 	}
-	spec, err := configsock.FetchBuildSpec(*socket, "build:"+*bid)
+	bid, err := configsock.WaitAssignment(context.Background(), *socket, "build", *runID)
 	if err != nil {
+		return fmt.Errorf("wait assignment: %w", err)
+	}
+	if *pidfile == "" {
+		return fmt.Errorf("run-builder: --pidfile required for build assignment")
+	}
+	runRoot := filepath.Dir(filepath.Dir(*pidfile))
+	if err := lockPidfile(filepath.Join(runRoot, bid, bid+".pid")); err != nil {
+		return err
+	}
+	spec, err := configsock.FetchBuildSpec(*socket, "build:"+bid)
+	if err != nil {
+		postErr := configsock.PostBuildResult(*socket, *runID, bid, configsock.BuildResult{Error: err.Error()})
+		if postErr != nil {
+			return fmt.Errorf("fetch build spec: %w (post result: %v)", err, postErr)
+		}
 		return fmt.Errorf("fetch build spec: %w", err)
+	}
+	if spec.Workdir != "" {
+		if err := os.Chdir(spec.Workdir); err != nil {
+			return fmt.Errorf("chdir %s: %w", spec.Workdir, err)
+		}
 	}
 
 	res := builder.Run(spec, log)
-	out, _ := json.Marshal(res)
-	fmt.Println(string(out)) // stdout → <bid>.result (unit StandardOutput)
+	post := configsock.BuildResult{
+		ImageKey: res.ImageKey, SnapshotKey: res.SnapshotKey,
+		StartCmd: res.StartCmd, ReadyCmd: res.ReadyCmd, Error: res.Error,
+	}
+	if err := configsock.PostBuildResult(*socket, *runID, bid, post); err != nil {
+		return fmt.Errorf("post build result: %w", err)
+	}
 	if res.Error != "" {
 		return fmt.Errorf("build failed: %s", res.Error)
 	}

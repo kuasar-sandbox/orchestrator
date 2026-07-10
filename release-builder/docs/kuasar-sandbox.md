@@ -126,7 +126,7 @@ Warm Pool),共享同一套基础设施:内容定义分块、收敛加密、内�
   │                                                                                    │
   │  node-ctl          (e2b-compatible ingress)                                        │
   │    lands per-sandbox config & keys / invokes run / drives in-sandbox build         │
-  │        │ run                                  │ build  (sandbox-builder@<bid>)     │
+  │        │ run                                  │ build  (sandbox-builder@<run-id>)  │
   │        ▼                                      ▼                                    │
   │  sandbox control (one per sandbox)   ◄─ proto ─►   node resource control           │
   │    block dev / snapshot / unified memory /      admission / quota /                │
@@ -747,7 +747,7 @@ Cold boot (1 GiB image):                 Snapshot restore (512 MiB):
 
 - **计算节点**(~5,000/AZ):`node-ctl` + `cache-ctl tiered`
   + `store-ctl`(sidecar)+ `sandbox-ctl × ~3K`(每沙箱一进程,派生
-  `cloud-hypervisor`);e2b 模板构建在本节点的构建沙箱内进行(`sandbox-builder@<bid>`
+  `cloud-hypervisor`);e2b 模板构建在本节点的构建沙箱内进行(`sandbox-builder@<run-id>`
   → 三阶段,见 `deployment.md` §5),无独立展平池。
 - **Cluster 控制面**(AZ 级或 Region 级):`cluster-ctl registry` 按
   membership 配置形成可靠状态集群;`cluster-ctl router` 提供 group-scoped

@@ -2,9 +2,13 @@
 // UDS that multiplexes several planes over HTTP (h2c, with HTTP/1.1 fallback), each
 // with its own authentication:
 //
-//   - task   (POST /internal/task/launchspec): node-ctl run-sandbox / run-builder
-//     fetch their generic LaunchSpec by config-id, then exec-replace into the target. Authed by
-//     SO_PEERCRED peer pid == the id's pidfile (/run/sandbox/<id>/<id>.pid).
+//   - run    (POST /internal/run/assignment, /internal/run/build-result):
+//     prestarted run-id units wait for their sandbox/build assignment; run-builder
+//     posts its result back here. Authed by SO_PEERCRED peer pid == the run-id
+//     pidfile (/run/sandbox/runs/<run-id>.pid).
+//   - task   (POST /internal/task/launchspec, /internal/task/buildspec):
+//     assigned tasks fetch their LaunchSpec or BuildSpec by business id. Authed by
+//     SO_PEERCRED peer pid == the task pidfile (/run/sandbox/<id>/<id>.pid).
 //   - admin  (/internal/admin/manifest-keys): manifest-key allowlist management.
 //     Authed by SO_PEERCRED peer pid ∈ admin_pidfile (or, when that is unset, by the
 //     socket's 0600 permissions alone = same uid / root).
@@ -17,8 +21,9 @@
 //     http.Handler served over TLS at api.<domain> — reached locally over plain h2c
 //     and authed by X-API-KEY. Includes the export-sandbox / import-sandbox routes.
 //
-// The socket is the sole channel for the secret-bearing task env (manifest key);
-// bulky non-secret config is a plain file referenced by the spec's args.
+// The socket is the sole channel for the secret-bearing task env (manifest key)
+// and run assignment/result traffic; bulky non-secret config is a plain file
+// referenced by the spec's args.
 package configsock
 
 import (
@@ -46,19 +51,21 @@ import (
 const (
 	PathTaskLaunchSpec   = "/internal/task/launchspec"
 	PathTaskBuildSpec    = "/internal/task/buildspec"
+	PathRunAssignment    = "/internal/run/assignment"
+	PathRunBuildResult   = "/internal/run/build-result"
 	PathAdminManifestKey = "/internal/admin/manifest-keys"
 )
 
 // journald SYSLOG_IDENTIFIER tags the sandbox stack writes under (shared so the
 // producers — sandbox-ctl, the build pipeline — and the orchestrator's log query
-// all agree on one vocabulary). The producer writes the tag; journald auto-stamps
-// _SYSTEMD_UNIT (the writer's unit cgroup), so a tag+unit pair selects one stream.
+// all agree on one vocabulary). Producers also include KUASAR_* fields so user-
+// facing log queries can select by sandbox/build id instead of unit instance name.
 //
-//   - BuildLogTag ("build")   curated build progress under sandbox-builder@<bid>:
+//   - BuildLogTag ("build")   curated build progress with KUASAR_BUILD_ID:
 //     run-builder's milestones + relayed RUN output + the phase sandboxes' own
 //     app stdio. This is the ONLY tag the orchestrator surfaces to the SDK.
-//   - RunnerLogTag ("sandbox") a live sandbox's app stdio under
-//     sandbox-runner@<sid>; host-only telemetry.
+//   - RunnerLogTag ("sandbox") a live sandbox's app stdio with KUASAR_SANDBOX_ID;
+//     host-only telemetry.
 //   - ConsoleTag ("console")  guest kernel dmesg, written by BOTH runner and
 //     builder sandboxes; host-only (deliberately NOT in the SDK build log).
 const (
@@ -71,6 +78,36 @@ const (
 type Request struct {
 	ConfigID string `json:"config_id"`
 	Version  int    `json:"version"`
+}
+
+type AssignmentRequest struct {
+	Kind  string `json:"kind"`
+	RunID string `json:"run_id"`
+}
+
+type AssignmentResponse struct {
+	Kind   string `json:"kind,omitempty"`
+	RunID  string `json:"run_id,omitempty"`
+	TaskID string `json:"task_id,omitempty"`
+	Error  string `json:"error,omitempty"`
+}
+
+type BuildResult struct {
+	ImageKey    string `json:"image_key,omitempty"`
+	SnapshotKey string `json:"snapshot_key,omitempty"`
+	StartCmd    string `json:"start_cmd,omitempty"`
+	ReadyCmd    string `json:"ready_cmd,omitempty"`
+	Error       string `json:"error,omitempty"`
+}
+
+type BuildResultRequest struct {
+	RunID   string      `json:"run_id"`
+	BuildID string      `json:"build_id"`
+	Result  BuildResult `json:"result"`
+}
+
+type BuildResultResponse struct {
+	Error string `json:"error,omitempty"`
 }
 
 // LaunchSpec is the generic launch config the launcher applies and then exec-replaces
@@ -93,6 +130,9 @@ type Provider interface {
 	// run-builder orchestrates (it does NOT exec-replace — the spec is a
 	// work order, not a launch).
 	BuildSpecFor(ctx context.Context, configID string) (resp *BuildSpec, pidFile string, ok bool, err error)
+	RunPidFile(kind, runID string) (pidFile string, ok bool)
+	WaitAssignment(ctx context.Context, kind, runID string) (taskID string, ok bool, err error)
+	PostBuildResult(ctx context.Context, runID, buildID string, result BuildResult) error
 }
 
 // BuildSpec is the work order node-ctl run-builder fetches for
@@ -101,6 +141,7 @@ type Provider interface {
 // creds) ride here over the socket, never on disk.
 type BuildSpec struct {
 	BuildID          string             `json:"build_id"`
+	RunID            string             `json:"run_id,omitempty"`
 	Workdir          string             `json:"workdir"` // build scratch dir (artifacts, run roots)
 	FromImage        string             `json:"from_image,omitempty"`
 	FromTemplate     string             `json:"from_template,omitempty"` // snapshot manifest key (hex) of the base template
@@ -245,6 +286,10 @@ func peerFrom(ctx context.Context) (int, bool) {
 
 // Serve binds the UDS (0600) and serves the three planes over h2c until ctx ends.
 func (s *Server) Serve(ctx context.Context) error {
+	return s.ServeReady(ctx, nil)
+}
+
+func (s *Server) ServeReady(ctx context.Context, ready chan<- struct{}) error {
 	_ = os.Remove(s.path)
 	ln, err := net.ListenUnix("unix", &net.UnixAddr{Name: s.path, Net: "unix"})
 	if err != nil {
@@ -253,6 +298,9 @@ func (s *Server) Serve(ctx context.Context) error {
 	if err := os.Chmod(s.path, 0o600); err != nil {
 		ln.Close()
 		return fmt.Errorf("configsock: chmod: %w", err)
+	}
+	if ready != nil {
+		close(ready)
 	}
 	srv := &http.Server{
 		Handler:           h2c.NewHandler(s.router(), &http2.Server{}),
@@ -284,6 +332,8 @@ func (s *Server) router() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST "+PathTaskLaunchSpec, s.handleTask)
 	mux.HandleFunc("POST "+PathTaskBuildSpec, s.handleBuildTask)
+	mux.HandleFunc("POST "+PathRunAssignment, s.handleRunAssignment)
+	mux.HandleFunc("POST "+PathRunBuildResult, s.handleBuildResult)
 	mux.HandleFunc(PathAdminManifestKey, s.handleAdminKeys) // GET=list, POST=add/remove/check
 	if s.deps.RouteSource != nil && s.deps.Plugins != nil {
 		mux.HandleFunc(routesync.PluginRegisterPattern, s.handlePluginRegister) // plugin plane: register + route stream
@@ -355,6 +405,67 @@ func (s *Server) handleBuildTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, spec)
+}
+
+func (s *Server) handleRunAssignment(w http.ResponseWriter, r *http.Request) {
+	peer, ok := peerFrom(r.Context())
+	if !ok {
+		writeJSON(w, http.StatusForbidden, &AssignmentResponse{Error: "no peer credentials"})
+		return
+	}
+	var req AssignmentRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Kind == "" || req.RunID == "" {
+		writeJSON(w, http.StatusBadRequest, &AssignmentResponse{Error: "bad request"})
+		return
+	}
+	pidFile, ok := s.deps.Provider.RunPidFile(req.Kind, req.RunID)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, &AssignmentResponse{Error: "unknown run"})
+		return
+	}
+	if !s.taskAuthed(req.Kind+":"+req.RunID, pidFile, peer) {
+		writeJSON(w, http.StatusForbidden, &AssignmentResponse{Error: "not authorized"})
+		return
+	}
+	taskID, ok, err := s.deps.Provider.WaitAssignment(r.Context(), req.Kind, req.RunID)
+	if err != nil {
+		s.log.Warn("configsock assignment", "kind", req.Kind, "run_id", req.RunID, "err", err)
+		writeJSON(w, http.StatusInternalServerError, &AssignmentResponse{Error: err.Error()})
+		return
+	}
+	if !ok {
+		writeJSON(w, http.StatusNotFound, &AssignmentResponse{Error: "unknown run"})
+		return
+	}
+	writeJSON(w, http.StatusOK, &AssignmentResponse{Kind: req.Kind, RunID: req.RunID, TaskID: taskID})
+}
+
+func (s *Server) handleBuildResult(w http.ResponseWriter, r *http.Request) {
+	peer, ok := peerFrom(r.Context())
+	if !ok {
+		writeJSON(w, http.StatusForbidden, &BuildResultResponse{Error: "no peer credentials"})
+		return
+	}
+	var req BuildResultRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.RunID == "" || req.BuildID == "" {
+		writeJSON(w, http.StatusBadRequest, &BuildResultResponse{Error: "bad request"})
+		return
+	}
+	pidFile, ok := s.deps.Provider.RunPidFile("build", req.RunID)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, &BuildResultResponse{Error: "unknown run"})
+		return
+	}
+	if !s.taskAuthed("build-result:"+req.RunID, pidFile, peer) {
+		writeJSON(w, http.StatusForbidden, &BuildResultResponse{Error: "not authorized"})
+		return
+	}
+	if err := s.deps.Provider.PostBuildResult(r.Context(), req.RunID, req.BuildID, req.Result); err != nil {
+		s.log.Warn("configsock build result", "run_id", req.RunID, "build_id", req.BuildID, "err", err)
+		writeJSON(w, http.StatusInternalServerError, &BuildResultResponse{Error: err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, &BuildResultResponse{})
 }
 
 // taskAuthed verifies the connecting pid matches the id's pidfile (SO_PEERCRED).

@@ -1,5 +1,5 @@
-// Package launcher abstracts how a sandbox-ctl process is supervised. The primary
-// implementation drives systemd template units (sandbox-runner@<sid>.service) over
+// Package launcher abstracts how sandbox/build runner units are supervised. The
+// primary implementation drives systemd template units keyed by run-id over
 // D-Bus; a fork-exec fallback can implement the same interface for non-systemd hosts.
 package launcher
 
@@ -19,7 +19,7 @@ type Unit struct {
 
 // Launcher supervises sandbox-ctl instances.
 type Launcher interface {
-	// Start launches the template instance for sid ("replace" job mode) and waits
+	// Start launches the template instance ("replace" job mode) and waits
 	// for the start job to settle.
 	Start(ctx context.Context, unit string) error
 	// Stop stops the unit (SIGTERM then SIGKILL after TimeoutStopSec via the unit).

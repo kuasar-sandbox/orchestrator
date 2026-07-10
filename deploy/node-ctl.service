@@ -1,5 +1,5 @@
 # node-ctl daemon unit — the e2b-compatible node host + in-process node resource
-# controller. It launches each sandbox as a sandbox-runner@<sid>.service instance
+# controller. It launches sandbox/build runner template instances keyed by run-id
 # over systemd D-Bus, so it needs the system bus and cgroup write access. Start
 # after the data-plane daemons.
 [Unit]

@@ -33,10 +33,10 @@ vsock / UDS)协作。本文档定义这些进程在生产部署中的归属、�
 
 | 进程 | 角色 | 数量 | 启停 | 归属 |
 |---|---|---|---|---|
-| `node-ctl`(`serve`)| 本机沙箱编排 + e2b 兼容控制面 + 数据面 proxy(反代 guest envd/floatingip)+ 节点级资源仲裁(`resource_listen`)+ node-link 集群接入客户端;经模板单元 `sandbox-runner@<sid>`/`sandbox-builder@<bid>` 驱动 sandbox-ctl | 单实例 | systemd | 平台内,`orchestrator/docs/node.md`(资源协议见 node-resource.md)|
+| `node-ctl`(`serve`)| 本机沙箱编排 + e2b 兼容控制面 + 数据面 proxy(反代 guest envd/floatingip)+ 节点级资源仲裁(`resource_listen`)+ node-link 集群接入客户端;经 run-id 模板单元 `sandbox-runner@<run-id>`/`sandbox-builder@<run-id>` 驱动 sandbox-ctl | 单实例 | systemd | 平台内,`orchestrator/docs/node.md`(资源协议见 node-resource.md)|
 | `cache-ctl`(`mode: tiered`)| 节点本地数据入口:L1 RocksDB + EC 客户端(→ L2)+ L3 origin | 单实例 | systemd,先于 node-ctl | 平台内,`docs/cache.md` |
 | `store-ctl` | 本机 OBS 读写代理(sidecar);**所有**远端 OBS 流量走这里 | 单实例 | systemd | 平台内,`docs/store.md` |
-| `sandbox-ctl`(`run`) | 单个沙箱的控制平面(类 `runc run`);非 daemon | 每沙箱一个,~3K | 由 node-ctl 经 `sandbox-runner@<sid>` 单元(`run-sandbox`)启动 | 平台内,`docs/sandbox.md` |
+| `sandbox-ctl`(`run`) | 单个沙箱的控制平面(类 `runc run`);非 daemon | 每沙箱一个,~3K | 由 node-ctl 经 `sandbox-runner@<run-id>` 单元(`run-sandbox`)assignment 后启动 | 平台内,`docs/sandbox.md` |
 | `cloud-hypervisor` | VMM(patched);`sandbox-ctl` 子进程 | 每沙箱一个 | `sandbox-ctl` 派生 | 平台内,`docs/cloud-hypervisor.md` |
 
 ### 2.2 端口与套接字
@@ -56,10 +56,10 @@ vsock / UDS)协作。本文档定义这些进程在生产部署中的归属、�
 
 `cache-ctl tiered` 的 EC 客户端通过节点对外网络拨号 L2 cluster 节点的 `7070`
 端口(详见 §3)。**对外服务端口仅 `node-ctl` 一处**(e2b ingress);其余本机进程均 loopback/UDS。
-`sandbox-ctl` 由 `node-ctl` 经 systemd **模板单元 `sandbox-runner@<sid>.service`** 拉起
-(`StartUnit` → 单元内 `run-sandbox` `execve` 为 `sandbox-ctl run`,非自行 fork-exec)。e2b 模板构建
-另走第二个模板单元 **`sandbox-builder@<bid>.service`**(单元内 `run-builder` **驻留驱动构建沙箱内的
-三阶段流水线** import / steps / template,每阶段一台 microVM 作其直接子进程;镜像拉取与 step 执行
+`sandbox-ctl` 由 `node-ctl` 经 systemd **模板单元 `sandbox-runner@<run-id>.service`** 拉起
+(`StartUnit`/预启动 → 单元内 `run-sandbox` WaitAssignment 后 `execve` 为 `sandbox-ctl run`,非自行 fork-exec)。e2b 模板构建
+另走第二个模板单元 **`sandbox-builder@<run-id>.service`**(单元内 `run-builder` WaitAssignment 后
+**驻留驱动构建沙箱内的三阶段流水线** import / steps / template,每阶段一台 microVM 作其直接子进程;镜像拉取与 step 执行
 都在沙箱内,详见 §5 与 `orchestrator/docs/node.md` §12)。两个模板单元由
 `node-ctl conductor serve` 启动时自动生成并安装(`install_units:false` 则交由运维带外管理),完整设计见
 `orchestrator/docs/node.md` §5/§12。
@@ -213,8 +213,8 @@ region 级、独立运营,平台外。与平台的接口:
 
 ## 5. 镜像构建(构建沙箱内三阶段)
 
-e2b 模板构建在 compute 节点上进行,**无独立展平池**:每个构建一个 `sandbox-builder@<bid>`
-单元(`run-builder` 驻留驱动),镜像拉取与 step 执行都在**构建沙箱(microVM)内**——租户网络
+e2b 模板构建在 compute 节点上进行,**无独立展平池**:每个构建执行绑定一个
+`sandbox-builder@<run-id>` 单元(`run-builder` 驻留驱动),镜像拉取与 step 执行都在**构建沙箱(microVM)内**——租户网络
 流量与镜像内容不触宿主用户态,宿主侧只做工件接力与收尾上传。完整语义见
 `orchestrator/docs/node.md` §12。
 
@@ -372,7 +372,7 @@ cluster-ctl placer
 ```
    ┌─ Compute Node ── e2b template build  (§5) ───────────────────────────────────────────────────────┐
    │                                                                                                  │
-   │   node-ctl          ── StartUnit ──►  sandbox-builder@<bid>  ( run-builder, resident )            │
+   │   node-ctl          ── assign ──►  sandbox-builder@<run-id>  ( run-builder, resident )            │
    │                                              │  drives 3 stage VMs (sandbox-ctl run + CH)         │
    │                                              ▼                                                    │
    │     A import ──► B steps ──► C template      ( guest: flatten-ctl / envd; tenant net stays in VM )│

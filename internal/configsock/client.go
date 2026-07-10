@@ -16,8 +16,12 @@ import (
 // the run-sandbox / run-builder launchers (task plane) and the manifest-key /
 // export-sandbox / import-sandbox CLIs.
 func HTTPClient(socket string) *http.Client {
+	return HTTPClientWithTimeout(socket, 30*time.Second)
+}
+
+func HTTPClientWithTimeout(socket string, timeout time.Duration) *http.Client {
 	return &http.Client{
-		Timeout: 30 * time.Second,
+		Timeout: timeout,
 		Transport: &http.Transport{
 			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 				var d net.Dialer
@@ -25,6 +29,53 @@ func HTTPClient(socket string) *http.Client {
 			},
 		},
 	}
+}
+
+func WaitAssignment(ctx context.Context, socket, kind, runID string) (string, error) {
+	body, _ := json.Marshal(AssignmentRequest{Kind: kind, RunID: runID})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://localhost"+PathRunAssignment, bytes.NewReader(body))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := HTTPClientWithTimeout(socket, 0).Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	var out AssignmentResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return "", fmt.Errorf("configsock: decode assignment: %w", err)
+	}
+	if out.Error != "" {
+		return "", errors.New(out.Error)
+	}
+	if out.TaskID == "" {
+		return "", errors.New("empty assignment")
+	}
+	return out.TaskID, nil
+}
+
+func PostBuildResult(socket, runID, buildID string, result BuildResult) error {
+	body, _ := json.Marshal(BuildResultRequest{RunID: runID, BuildID: buildID, Result: result})
+	req, err := http.NewRequest(http.MethodPost, "http://localhost"+PathRunBuildResult, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := HTTPClient(socket).Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	var out BuildResultResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return fmt.Errorf("configsock: decode build result: %w", err)
+	}
+	if out.Error != "" {
+		return errors.New(out.Error)
+	}
+	return nil
 }
 
 // FetchLaunchSpec dials the config-socket and pulls the LaunchSpec for configID.

@@ -51,7 +51,7 @@ manifest_config: /opt/sandbox/manifest.yaml
 paths:
   run_root: /run/sandbox                          # tmpfs run state
   base_root: /var/lib/sandbox                     # persistent state
-  # Local control socket — one UDS, four planes over h2c: task LaunchSpec fetch (task),
+  # Local control socket — one UDS over h2c: run assignment/result, task specs,
   # manifest-key allowlist (admin), proxy/agent registration + route stream (plugin),
   # and the e2b api plane (a plain-h2c twin of api.listen, incl. export/import). The
   # manifest-key / export-sandbox / import-sandbox CLIs and the external proxy master are
@@ -66,6 +66,9 @@ paths:
 #   dir: /etc/systemd/system
 #   runner: sandbox-runner@.service
 #   builder: sandbox-builder@.service
+#   runner_pool_size: 0
+#   builder_pool_size: 0
+#   pool_wait_timeout: 5s
 #   install: true                                 # false = manage out of band
 
 # Sandbox-instance defaults.
