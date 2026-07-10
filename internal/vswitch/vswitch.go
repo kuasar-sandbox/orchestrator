@@ -5,7 +5,8 @@
 //	vswitch detach <switch> --port=<N>                    -> plain text
 //
 // The orchestrator runs in tap mode (the port's tap fd goes to cloud-hypervisor).
-// MTU is not returned by attach; it arrives in the tap-fd handoff metadata.
+// Guest MTU is sandbox/node configuration; the tap-fd handoff only carries fd
+// ownership plus the port identity metadata required by the VMM.
 package vswitch
 
 import (
