@@ -32,6 +32,7 @@ CREATE TABLE IF NOT EXISTS sandboxes (
   deadline_unix        INTEGER NOT NULL DEFAULT 0,
   run_dir              TEXT NOT NULL,
   base_dir             TEXT NOT NULL,
+  run_id               TEXT NOT NULL DEFAULT '',
   envd_uds             TEXT NOT NULL DEFAULT '',
   ci_uds               TEXT NOT NULL DEFAULT '',
   floatingip           TEXT NOT NULL DEFAULT '',
@@ -65,6 +66,7 @@ CREATE TABLE IF NOT EXISTS builds (
   steps_json        TEXT NOT NULL DEFAULT '[]',
   status            TEXT NOT NULL,
   reason            TEXT NOT NULL DEFAULT '',
+  run_id            TEXT NOT NULL DEFAULT '',
   names_json        TEXT NOT NULL DEFAULT '[]',
   aliases_json      TEXT NOT NULL DEFAULT '[]',
 	  created_unix      INTEGER NOT NULL,
@@ -99,6 +101,14 @@ func Open(path string, box *secretbox.Box) (*Store, error) {
 		return nil, fmt.Errorf("store: init schema: %w", err)
 	}
 	if err := ensureColumn(ctx, db, "builds", "builder_json", `TEXT NOT NULL DEFAULT '{}'`); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("store: init schema: %w", err)
+	}
+	if err := ensureColumn(ctx, db, "sandboxes", "run_id", `TEXT NOT NULL DEFAULT ''`); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("store: init schema: %w", err)
+	}
+	if err := ensureColumn(ctx, db, "builds", "run_id", `TEXT NOT NULL DEFAULT ''`); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("store: init schema: %w", err)
 	}
@@ -202,20 +212,20 @@ func (s *Store) Put(ctx context.Context, sb *types.Sandbox) error {
 		return fmt.Errorf("store: put %s: %w", sb.ID, err)
 	}
 	_, err = s.db.ExecContext(ctx, `
-INSERT INTO sandboxes (id,template_id,state,deadline_unix,run_dir,base_dir,envd_uds,ci_uds,
+INSERT INTO sandboxes (id,template_id,state,deadline_unix,run_dir,base_dir,run_id,envd_uds,ci_uds,
   floatingip,vswitch_port,inner_ip,port_mac,manifest_key_hash,manifest_key_enc,snapshot_ref,
   envd_access_token,traffic_access_token,metadata_json,env_json,created_unix)
-VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 ON CONFLICT(id) DO UPDATE SET
   template_id=excluded.template_id, state=excluded.state, deadline_unix=excluded.deadline_unix,
-  run_dir=excluded.run_dir, base_dir=excluded.base_dir, envd_uds=excluded.envd_uds,
+  run_dir=excluded.run_dir, base_dir=excluded.base_dir, run_id=excluded.run_id, envd_uds=excluded.envd_uds,
   ci_uds=excluded.ci_uds, floatingip=excluded.floatingip, vswitch_port=excluded.vswitch_port,
   inner_ip=excluded.inner_ip, port_mac=excluded.port_mac,
   manifest_key_hash=excluded.manifest_key_hash, manifest_key_enc=excluded.manifest_key_enc,
   snapshot_ref=excluded.snapshot_ref, envd_access_token=excluded.envd_access_token,
   traffic_access_token=excluded.traffic_access_token,
   metadata_json=excluded.metadata_json, env_json=excluded.env_json`,
-		sb.ID, sb.TemplateID, string(sb.State), sb.DeadlineUnix, sb.RunDir, sb.BaseDir, sb.EnvdUDS,
+		sb.ID, sb.TemplateID, string(sb.State), sb.DeadlineUnix, sb.RunDir, sb.BaseDir, sb.RunID, sb.EnvdUDS,
 		sb.CiUDS, sb.FloatingIP, sb.VswitchPort, sb.InnerIP, sb.PortMAC, hash, enc, sb.SnapshotRef,
 		sb.EnvdAccessToken, sb.TrafficAccessToken, mj(sb.Metadata), mj(sb.Env), sb.CreatedUnix)
 	if err != nil {
@@ -224,7 +234,7 @@ ON CONFLICT(id) DO UPDATE SET
 	return nil
 }
 
-var cols = `id,template_id,state,deadline_unix,run_dir,base_dir,envd_uds,ci_uds,floatingip,
+var cols = `id,template_id,state,deadline_unix,run_dir,base_dir,run_id,envd_uds,ci_uds,floatingip,
   vswitch_port,inner_ip,port_mac,manifest_key_hash,manifest_key_enc,snapshot_ref,
   envd_access_token,traffic_access_token,metadata_json,env_json,created_unix`
 
@@ -232,7 +242,7 @@ func (s *Store) scan(row interface{ Scan(...any) error }) (*types.Sandbox, error
 	var sb types.Sandbox
 	var st, meta, env, mkHash, mkEnc string
 	if err := row.Scan(&sb.ID, &sb.TemplateID, &st, &sb.DeadlineUnix, &sb.RunDir, &sb.BaseDir,
-		&sb.EnvdUDS, &sb.CiUDS, &sb.FloatingIP, &sb.VswitchPort, &sb.InnerIP, &sb.PortMAC,
+		&sb.RunID, &sb.EnvdUDS, &sb.CiUDS, &sb.FloatingIP, &sb.VswitchPort, &sb.InnerIP, &sb.PortMAC,
 		&mkHash, &mkEnc, &sb.SnapshotRef, &sb.EnvdAccessToken, &sb.TrafficAccessToken,
 		&meta, &env, &sb.CreatedUnix); err != nil {
 		return nil, err
@@ -365,13 +375,13 @@ func (s *Store) Delete(ctx context.Context, id string) error {
 // --- builds (also the template registry) ---
 
 var buildCols = `build_id,template_id,persist_id,manifest_key_hash,manifest_key_enc,profile,kind,
-  from_image,from_template,start_cmd,ready_cmd,steps_json,status,reason,names_json,aliases_json,created_unix,registry_auth_enc,metadata_json,builder_json`
+  from_image,from_template,start_cmd,ready_cmd,steps_json,status,reason,run_id,names_json,aliases_json,created_unix,registry_auth_enc,metadata_json,builder_json`
 
 func (s *Store) scanBuild(row interface{ Scan(...any) error }) (*types.Build, error) {
 	var b types.Build
 	var profile, kind, status, names, aliases, mkHash, mkEnc, raEnc, steps, meta, builder string
 	if err := row.Scan(&b.BuildID, &b.TemplateID, &b.PersistID, &mkHash, &mkEnc, &profile, &kind,
-		&b.FromImage, &b.FromTemplate, &b.StartCmd, &b.ReadyCmd, &steps, &status, &b.Reason, &names, &aliases, &b.CreatedUnix, &raEnc, &meta, &builder); err != nil {
+		&b.FromImage, &b.FromTemplate, &b.StartCmd, &b.ReadyCmd, &steps, &status, &b.Reason, &b.RunID, &names, &aliases, &b.CreatedUnix, &raEnc, &meta, &builder); err != nil {
 		return nil, err
 	}
 	b.Metadata = uj(meta)
@@ -418,20 +428,20 @@ func (s *Store) PutBuild(ctx context.Context, b *types.Build) error {
 	}
 	_, err = s.db.ExecContext(ctx, `
 	INSERT INTO builds (build_id,template_id,persist_id,manifest_key_hash,manifest_key_enc,profile,kind,
-	  from_image,from_template,start_cmd,ready_cmd,steps_json,status,reason,names_json,aliases_json,created_unix,registry_auth_enc,metadata_json,builder_json)
-	VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+	  from_image,from_template,start_cmd,ready_cmd,steps_json,status,reason,run_id,names_json,aliases_json,created_unix,registry_auth_enc,metadata_json,builder_json)
+	VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 	ON CONFLICT(build_id) DO UPDATE SET
 	  template_id=excluded.template_id, persist_id=excluded.persist_id,
 	  manifest_key_hash=excluded.manifest_key_hash, manifest_key_enc=excluded.manifest_key_enc,
 	  profile=excluded.profile, kind=excluded.kind, from_image=excluded.from_image,
 	  from_template=excluded.from_template, start_cmd=excluded.start_cmd,
 	  ready_cmd=excluded.ready_cmd, steps_json=excluded.steps_json,
-	  status=excluded.status, reason=excluded.reason,
+	  status=excluded.status, reason=excluded.reason, run_id=excluded.run_id,
 	  names_json=excluded.names_json, aliases_json=excluded.aliases_json,
 	  registry_auth_enc=excluded.registry_auth_enc, metadata_json=excluded.metadata_json,
 	  builder_json=excluded.builder_json`,
 		b.BuildID, b.TemplateID, b.PersistID, hash, enc, string(b.Profile), string(b.Kind),
-		b.FromImage, b.FromTemplate, b.StartCmd, b.ReadyCmd, stepsJSON, string(b.Status), b.Reason, mjs(b.Names), mjs(b.Aliases), b.CreatedUnix, raEnc, mj(b.Metadata), mb(b.Builder))
+		b.FromImage, b.FromTemplate, b.StartCmd, b.ReadyCmd, stepsJSON, string(b.Status), b.Reason, b.RunID, mjs(b.Names), mjs(b.Aliases), b.CreatedUnix, raEnc, mj(b.Metadata), mb(b.Builder))
 	if err != nil {
 		return fmt.Errorf("store: put build %s: %w", b.BuildID, err)
 	}

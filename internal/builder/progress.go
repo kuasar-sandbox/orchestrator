@@ -27,11 +27,19 @@ import (
 type buildJournal struct {
 	mu       sync.Mutex
 	buf      []byte
+	fields   map[string]string
 	fallback io.Writer // non-nil ⇒ journald unavailable
 }
 
-func newBuildJournal() *buildJournal {
-	b := &buildJournal{}
+func newBuildJournal(runID, buildID string) *buildJournal {
+	fields := map[string]string{"SYSLOG_IDENTIFIER": buildTag}
+	if runID != "" {
+		fields["KUASAR_RUN_ID"] = runID
+	}
+	if buildID != "" {
+		fields["KUASAR_BUILD_ID"] = buildID
+	}
+	b := &buildJournal{fields: fields}
 	if !journal.Enabled() {
 		b.fallback = os.Stderr
 	}
@@ -75,7 +83,7 @@ func (b *buildJournal) emit(line []byte) {
 		fmt.Fprintf(b.fallback, "[%s] %s\n", buildTag, line)
 		return
 	}
-	_ = journal.Send(string(line), journal.PriInfo, map[string]string{"SYSLOG_IDENTIFIER": buildTag})
+	_ = journal.Send(string(line), journal.PriInfo, b.fields)
 }
 
 func (b *buildJournal) Close() error {

@@ -79,6 +79,7 @@ type Sandbox struct {
 	DeadlineUnix       int64 // 0 = no deadline
 	RunDir             string
 	BaseDir            string
+	RunID              string // current systemd runner instance id
 	EnvdUDS            string // empty for bare
 	CiUDS              string // empty for bare
 	FloatingIP         string

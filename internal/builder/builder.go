@@ -1,7 +1,7 @@
-// Package builder is the build pipeline orchestrator behind run-builder (the
-// ExecStart of sandbox-builder@<bid>.service). It fetches the BuildSpec over
-// the config-socket and drives up to three phases, each a microVM it spawns as
-// a DIRECT child (sandbox-ctl run, in this unit's cgroup), reusing ONE
+// Package builder is the build pipeline orchestrator behind run-builder inside a
+// sandbox-builder@<run-id>.service instance. It receives the BuildSpec over the
+// config-socket and drives up to three phases, each a microVM it spawns as a
+// DIRECT child (sandbox-ctl run, in this unit's cgroup), reusing ONE
 // pre-attached network slot sequentially:
 //
 //	A import   — an EMPTY single-disk sandbox on the single guest runtime
@@ -35,8 +35,8 @@
 // here: an image-only build runs `manifest-ctl store image.img`; a snapshot
 // build runs ONE `sandbox-ctl upload-snapshot` (it auto-uploads every local
 // artifact the snapshot.cfg references, the base image included, and
-// rewrites the refs to manifest://). The result JSON goes to stdout, which
-// the unit captures to <bid>.result for the orchestrator.
+// rewrites the refs to manifest://). The result returns to the orchestrator over
+// the config-socket.
 package builder
 
 import (
@@ -50,8 +50,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 )
 
-// Run drives the build pipeline for spec and returns its Result. The result
-// JSON is serialized by the caller to <bid>.result.
+// Run drives the build pipeline for spec and returns its Result.
 func Run(spec *configsock.BuildSpec, log *slog.Logger) Result {
 	p := &buildPipeline{spec: spec, log: log}
 	return p.run()
@@ -97,7 +96,7 @@ func (p *buildPipeline) run() (res Result) {
 	p.ctx, p.cancel = context.WithTimeout(context.Background(),
 		time.Duration(s.Timeouts.TotalSec)*time.Second)
 	defer p.cancel()
-	p.out = newBuildJournal()
+	p.out = newBuildJournal(s.RunID, s.BuildID)
 	defer p.out.Close()
 	fail := func(err error) Result {
 		p.log.Error("build", "bid", s.BuildID, "err", err)

@@ -32,6 +32,33 @@ func (s stubProvider) BuildSpecFor(_ context.Context, id string) (*BuildSpec, st
 	return &BuildSpec{BuildID: "x", Workdir: "/tmp"}, s.pidFile, true, nil
 }
 
+func (s stubProvider) RunPidFile(kind, runID string) (string, bool) {
+	if kind == "sandbox" && runID == "sr-test" {
+		return s.pidFile, true
+	}
+	if kind == "build" && runID == "br-test" {
+		return s.pidFile, true
+	}
+	return "", false
+}
+
+func (s stubProvider) WaitAssignment(_ context.Context, kind, runID string) (string, bool, error) {
+	if kind == "sandbox" && runID == "sr-test" {
+		return "x", true, nil
+	}
+	if kind == "build" && runID == "br-test" {
+		return "x", true, nil
+	}
+	return "", false, nil
+}
+
+func (s stubProvider) PostBuildResult(_ context.Context, runID, buildID string, _ BuildResult) error {
+	if runID == "br-test" && buildID == "x" {
+		return nil
+	}
+	return os.ErrNotExist
+}
+
 type stubAdmin struct{ keys map[string]string }
 
 func (a *stubAdmin) AddManifestKey(_ context.Context, key, label string, _ int64, _ string) (bool, string, error) {

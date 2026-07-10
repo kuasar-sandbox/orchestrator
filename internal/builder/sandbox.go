@@ -45,9 +45,9 @@ func (p *buildPipeline) startSandbox(phase string, doc map[string]any, connect [
 
 	args := []string{"run", "--config", yamlPath, "--run-root", runRoot, "--sandbox-id", sid,
 		// App stdio + kernel dmesg → journald straight from sandbox-ctl (it's
-		// our child, in this unit's cgroup, so journald tags _SYSTEMD_UNIT=
-		// sandbox-builder@<bid>): app under "build" (SDK-visible build log),
-		// kernel under "console" (host-only). No per-phase log file.
+		// our child, in this run-id unit's cgroup). App output is tagged "build"
+		// with KUASAR_BUILD_ID for SDK-visible build logs; kernel output is tagged
+		// "console" for host-only diagnostics. No per-phase log file.
 		"--stdout-to", "journald=" + buildTag,
 		"--stderr-to", "journald=" + buildTag,
 		"--console", "journald=" + consoleTag}
@@ -58,10 +58,13 @@ func (p *buildPipeline) startSandbox(phase string, doc map[string]any, connect [
 		args = append(args, "--connect", c)
 	}
 	cmd := exec.Command(s.Paths.SandboxCtl, args...)
-	cmd.Env = append(os.Environ(), "MANIFEST_KEY="+s.Env["MANIFEST_KEY"])
-	// sandbox-ctl's OWN logs (its process stdio; the app/kernel are off on
-	// journald) inherit run-builder's stderr → builder unit journal, untagged
-	// (host debug). NOT stdout: that is reserved for run-builder's result JSON.
+	cmd.Env = append(os.Environ(),
+		"MANIFEST_KEY="+s.Env["MANIFEST_KEY"],
+		"KUASAR_RUN_ID="+s.RunID,
+		"KUASAR_BUILD_ID="+s.BuildID,
+	)
+	// sandbox-ctl's own process stdio (the app/kernel are off on journald) inherit
+	// run-builder's stderr → builder unit journal for host diagnostics.
 	cmd.Stdout, cmd.Stderr = os.Stderr, os.Stderr
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("spawn sandbox-ctl: %w", err)

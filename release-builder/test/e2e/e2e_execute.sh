@@ -7,7 +7,7 @@
 #                                runs INSIDE a build sandbox on the tenant network)
 #   build (native v3)          -> import build sandbox pulls via the mgmt VIP +
 #                                flattens -> a ready e2b-img template in the store
-#   POST /sandboxes            -> sandbox-runner@<sid> -> sandbox-ctl boots
+#   POST /sandboxes            -> sandbox-runner@<run-id> assignment -> sandbox-ctl boots
 #                                cloud-hypervisor (KVM) from the template +
 #                                sandbox-runtime.erofs; envd comes up at 49983,
 #                                exposed as envd.sock; orchestrator waitReady(/health)

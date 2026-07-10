@@ -2,8 +2,8 @@
 //
 //	node-ctl conductor serve --config <conductor.yaml>          # run the node conductor
 //	node-ctl proxy serve --config <proxy.yaml>                  # external data-plane proxy master
-//	node-ctl run-sandbox --pidfile=<f> --config-socket=<uds> --sandbox-id=<sid>
-//	node-ctl run-builder --pidfile=<f> --config-socket=<uds> --build-id=<bid>
+//	node-ctl run-sandbox --pidfile=<f> --config-socket=<uds> --run-id=<rid>
+//	node-ctl run-builder --pidfile=<f> --config-socket=<uds> --run-id=<rid>
 //	                                                                    # in-unit launchers (not for humans)
 //	node-ctl config <conductor|proxy> [--template|--config <f>|--resolve]  # config diagnose / generate
 //	node-ctl manifest-key <add|list|remove> ...                 # tenant root-key whitelist (admin socket)
@@ -146,7 +146,6 @@ func runConductor(args []string, log *slog.Logger) error {
 		log.Warn("reconcile", "err", err)
 	}
 	go core.Reaper(ctx, 5*time.Second)
-	go core.BuildPool(ctx, 2*time.Second)
 
 	// Optionally host the node resource controller in-process (resource_listen,
 	// node-resource.md). Disabled => sandboxes use static cgroup.
@@ -220,9 +219,9 @@ func runConductor(args []string, log *slog.Logger) error {
 	res := api.Resources{VCPU: cfg.Sandbox.Resources.VCPU, MemoryMB: cfg.Sandbox.Resources.MemoryMiB(), DiskMB: diskMB}
 	apiH := api.New(core, cfg.API.Domain, res, log).Handler()
 
-	// Local control socket: one UDS, three planes — task LaunchSpec (run-sandbox /
-	// run-builder; SO_PEERCRED pid == id pidfile), manifest-key management (admin plane, pid ∈
-	// admin_pidfile or, when unset, the socket's 0600 perms), and the api plane over
+	// Local control socket: one UDS multiplexes run assignment/result, task specs,
+	// manifest-key management (admin plane, pid ∈ admin_pidfile or, when unset,
+	// the socket's 0600 perms), plugin route registration, and the api plane over
 	// plain h2c (X-API-KEY). See docs §6.
 	// The plugin registry is shared: the config-socket plugin plane Adds/Removes
 	// registrations (proxy master, route observers); the external-mode proxyForwarder
@@ -237,11 +236,19 @@ func runConductor(args []string, log *slog.Logger) error {
 		Plugins:       plugins,
 		PluginPidfile: cfg.Paths.PluginPidfile,
 	}, log)
+	configReady := make(chan struct{})
 	go func() {
-		if err := cs.Serve(ctx); err != nil {
+		if err := cs.ServeReady(ctx, configReady); err != nil {
 			log.Error("config-socket", "err", err)
 		}
 	}()
+	select {
+	case <-configReady:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	core.StartRunPools(ctx)
+	go core.BuildPool(ctx, 2*time.Second)
 
 	// Data-plane handler depends on proxy_mode: in-process proxy (internal),
 	// proxyForwarder to worker (external), or reject (off). External mode also

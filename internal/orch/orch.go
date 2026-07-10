@@ -67,6 +67,9 @@ type Orchestrator struct {
 	pendMu sync.Mutex
 	pend   map[string]*pendingBuild // builds whose unit is running (BuildSpecFor source)
 
+	runnerPool     *runPool
+	builderRunPool *runPool
+
 	files *filestore.Store // COPY build-context object store; nil = unconfigured (COPY → 501)
 
 	clusterCtx context.Context // node-link async work lifetime (set by serve); nil = background
@@ -96,6 +99,9 @@ func New(cfg *config.Config, st *store.Store, lc launcher.Launcher, vs vsClient,
 		clusterBuilds: map[string]*clusterBuild{},
 		buildEvents:   make(chan *routesync.BuildEvent, 64),
 	}
+	wait := cfg.Units.PoolWaitDuration()
+	o.runnerPool = newRunPool(runKindSandbox, cfg.Units.RunnerPoolSize, wait, cfg.Paths.RunRoot, lc, o.runnerUnit, log.With("pool", "runner"))
+	o.builderRunPool = newRunPool(runKindBuild, cfg.Units.BuilderPoolSize, wait, cfg.Paths.RunRoot, lc, o.builderUnit, log.With("pool", "builder"))
 	if fc := cfg.Builder.FilesStorage; fc != nil {
 		fs, err := filestore.New(fc)
 		if err != nil {
@@ -105,6 +111,11 @@ func New(cfg *config.Config, st *store.Store, lc launcher.Launcher, vs vsClient,
 		}
 	}
 	return o
+}
+
+func (o *Orchestrator) StartRunPools(ctx context.Context) {
+	o.runnerPool.Start(ctx)
+	o.builderRunPool.Start(ctx)
 }
 
 // --- api.Core ---
@@ -224,12 +235,14 @@ func (o *Orchestrator) launch(ctx context.Context, sb *types.Sandbox, tmpl types
 	if err := p.WriteYAML(o.sandboxConfigPath(sb)); err != nil {
 		return err
 	}
-	if err := o.st.Put(ctx, sb); err != nil {
-		return err
-	}
-	o.cache(sb)
-
-	if err := o.lc.Start(ctx, o.runnerUnit(sb.ID)); err != nil {
+	if _, err := o.runnerPool.Assign(ctx, sb.ID, func(runID string) error {
+		sb.RunID = runID
+		if err := o.st.Put(ctx, sb); err != nil {
+			return err
+		}
+		o.cache(sb)
+		return nil
+	}); err != nil {
 		return err
 	}
 	if tmpl.Profile == types.ProfileE2B {
@@ -314,8 +327,10 @@ func (o *Orchestrator) pauseSandbox(ctx context.Context, sb *types.Sandbox) erro
 	_ = o.st.SetSnapshotRef(ctx, sb.ID, ref)
 	_ = o.st.SetState(ctx, sb.ID, types.StatePaused)
 	o.cache(sb)
-	_ = o.lc.Stop(ctx, o.runnerUnit(sb.ID))
-	_ = o.lc.ResetFailed(ctx, o.runnerUnit(sb.ID))
+	if sb.RunID != "" {
+		_ = o.lc.Stop(ctx, o.runnerUnit(sb.RunID))
+		_ = o.lc.ResetFailed(ctx, o.runnerUnit(sb.RunID))
+	}
 	_ = o.vs.Detach(ctx, sb.VswitchPort)
 	o.publishUpsert(sb) // proxies keep the (now paused) route so traffic triggers a Wake
 	return nil
@@ -611,12 +626,9 @@ func (o *Orchestrator) sandboxLaunchSpec(ctx context.Context, sid string) (*conf
 		"--manifest-config", o.cfg.ManifestConfig,
 		"--run-root", o.cfg.Paths.RunRoot,
 		"--cgroup-adopt",
-		// Route the sandbox's stdio + kernel dmesg to journald under this runner
-		// unit (sandbox-runner@<sid>): app stdout/stderr tagged "sandbox", guest
-		// dmesg tagged "console" — host-only telemetry, queryable per-sandbox via
-		// `journalctl -u sandbox-runner@<sid>.service [SYSLOG_IDENTIFIER=…]`.
-		// sandbox-ctl exec-replaces run-sandbox into this unit's cgroup, so
-		// journald stamps the right _SYSTEMD_UNIT automatically.
+		// Route the sandbox's stdio + kernel dmesg to journald from this run-id
+		// unit. App stdout/stderr is tagged "sandbox" with KUASAR_SANDBOX_ID; guest
+		// dmesg is tagged "console" for host-only diagnostics.
 		"--stdout-to", "journald=" + configsock.RunnerLogTag,
 		"--stderr-to", "journald=" + configsock.RunnerLogTag,
 		"--console", "journald=" + configsock.ConsoleTag,
@@ -634,7 +646,11 @@ func (o *Orchestrator) sandboxLaunchSpec(ctx context.Context, sid string) (*conf
 		Exec:    o.cfg.SandboxCtl(),
 		Args:    args,
 		Workdir: sb.RunDir,
-		Env:     map[string]string{"MANIFEST_KEY": sb.ManifestKey},
+		Env: map[string]string{
+			"MANIFEST_KEY":      sb.ManifestKey,
+			"KUASAR_RUN_ID":     sb.RunID,
+			"KUASAR_SANDBOX_ID": sb.ID,
+		},
 	}
 	return spec, sb.PidFile(), true, nil
 }
@@ -685,7 +701,7 @@ func (o *Orchestrator) Reconcile(ctx context.Context) error {
 	alive := map[string]bool{}
 	for _, u := range units {
 		if u.ActiveState == "active" || u.ActiveState == "activating" {
-			alive[o.unitToSID(u.Name)] = true
+			alive[o.unitToRunID(u.Name)] = true
 		}
 	}
 	// Adopt live sandboxes in-memory inline (o.cache is not a store write);
@@ -693,7 +709,7 @@ func (o *Orchestrator) Reconcile(ctx context.Context) error {
 	// SetState write the store and must not run while the read cursor is open.
 	var dead []*types.Sandbox
 	if err := o.st.RangeByState(ctx, types.StateRunning, func(sb *types.Sandbox) error {
-		if alive[sb.ID] {
+		if sb.RunID != "" && alive[sb.RunID] {
 			o.cache(sb) // re-adopt: route + TTL already in store
 		} else {
 			dead = append(dead, sb)
@@ -708,6 +724,23 @@ func (o *Orchestrator) Reconcile(ctx context.Context) error {
 		_ = o.st.SetState(ctx, sb.ID, types.StateDead)
 	}
 	return nil
+}
+
+func (o *Orchestrator) unitActive(ctx context.Context, unit string) bool {
+	if unit == "" {
+		return false
+	}
+	units, err := o.lc.List(ctx, unit)
+	if err != nil {
+		o.log.Debug("unit liveness check failed", "unit", unit, "err", err)
+		return true
+	}
+	for _, u := range units {
+		if u.Name == unit && (u.ActiveState == "active" || u.ActiveState == "activating") {
+			return true
+		}
+	}
+	return false
 }
 
 // --- helpers ---
@@ -792,8 +825,10 @@ func (o *Orchestrator) teardown(ctx context.Context, sb *types.Sandbox) {
 	// The sandbox runs in its systemd unit's own cgroup (sandbox-ctl --cgroup-adopt),
 	// and the unit is KillMode=control-group, so StopUnit SIGKILLs every straggler
 	// (cloud-hypervisor included). No separate cgroup drain/rmdir is needed.
-	_ = o.lc.Stop(ctx, o.runnerUnit(sb.ID))
-	_ = o.lc.ResetFailed(ctx, o.runnerUnit(sb.ID))
+	if sb.RunID != "" {
+		_ = o.lc.Stop(ctx, o.runnerUnit(sb.RunID))
+		_ = o.lc.ResetFailed(ctx, o.runnerUnit(sb.RunID))
+	}
 	_ = o.vs.Detach(ctx, sb.VswitchPort)
 	_ = os.RemoveAll(sb.RunDir)
 	o.uncache(sb.ID)

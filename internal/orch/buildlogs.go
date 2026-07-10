@@ -15,10 +15,10 @@ import (
 
 // BuildLogs backs the e2b build-status logs: it returns the build's curated
 // progress entries from offset onward. The build pipeline writes that progress
-// to journald tagged SYSLOG_IDENTIFIER=build under the sandbox-builder@<bid>
-// unit (run-builder's milestones + relayed RUN output + sandbox-ctl-streamed
-// flatten progress); guest kernel dmesg (tag "console") and sandbox-ctl's own
-// logs are deliberately NOT in this filter, so the SDK sees a clean build log.
+// to journald tagged SYSLOG_IDENTIFIER=build and KUASAR_BUILD_ID=<bid>
+// (run-builder's milestones + relayed RUN output + sandbox-ctl-streamed flatten
+// progress); guest kernel dmesg (tag "console") and sandbox-ctl's own logs are
+// deliberately NOT in this filter, so the SDK sees a clean build log.
 // journald is the single sink — no temp files — and journalctl the reader
 // (sdjournal needs CGO; this binary is CGO-free).
 func (o *Orchestrator) BuildLogs(ctx context.Context, apiKey, tid, bid string, offset int) ([]api.BuildLogEntry, error) {
@@ -39,13 +39,13 @@ func (o *Orchestrator) BuildLogs(ctx context.Context, apiKey, tid, bid string, o
 	return entries[offset:], nil
 }
 
-// readBuildJournal queries the build unit's journal for the tagged progress
+// readBuildJournal queries journald for the build's tagged progress
 // stream. A journalctl failure (not under systemd, unit never logged) yields no
 // entries rather than an error — build logs are best-effort telemetry, not a
 // gate on the build status itself.
 func (o *Orchestrator) readBuildJournal(ctx context.Context, bid string) []api.BuildLogEntry {
 	cmd := exec.CommandContext(ctx, "journalctl",
-		"_SYSTEMD_UNIT="+o.builderUnit(bid),
+		"KUASAR_BUILD_ID="+bid,
 		"SYSLOG_IDENTIFIER="+configsock.BuildLogTag,
 		"--output=json", "--no-pager",
 		"--output-fields=MESSAGE,PRIORITY,__REALTIME_TIMESTAMP")

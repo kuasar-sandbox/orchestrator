@@ -18,7 +18,7 @@ type BuildState string
 const (
 	BuildRegistered BuildState = "registered" // POST /v3/templates done, not yet triggered
 	BuildWaiting    BuildState = "waiting"    // triggered, queued for the builder pool
-	BuildBuilding   BuildState = "building"   // a pool slot is executing it
+	BuildBuilding   BuildState = "building"   // a builder run is executing it
 	BuildReady      BuildState = "ready"      // persist id available in PersistID/names/aliases
 	BuildError      BuildState = "error"      // see Reason
 )
@@ -78,6 +78,7 @@ type Build struct {
 	Steps        []TemplateStep
 	Status       BuildState
 	Reason       string   // error detail
+	RunID        string   // current systemd builder runner instance id
 	Names        []string // user-supplied name(s) + persist id (when ready)
 	Aliases      []string // user-supplied alias(es) + persist id (when ready)
 	// Metadata is the template's default sandbox config — the same kuasar-sandbox.<ns>

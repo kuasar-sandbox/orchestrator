@@ -81,7 +81,7 @@ func lockPidfile(path string) error {
 func taskEnv(add map[string]string) []string {
 	skip := map[string]bool{
 		"TASK_PIDFILE": true, "TASK_CONFIG_SOCKET": true,
-		"TASK_SANDBOX_ID": true, "TASK_BUILD_ID": true,
+		"TASK_RUN_ID": true, "TASK_SANDBOX_ID": true, "TASK_BUILD_ID": true,
 	}
 	out := make([]string, 0, len(os.Environ())+len(add))
 	for _, kv := range os.Environ() {
