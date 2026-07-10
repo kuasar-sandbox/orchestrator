@@ -368,7 +368,7 @@ func parseMiB(s string) int {
 // guest inner IP / default-route gateway.
 type NetworkConfig struct {
 	Switch      string     `yaml:"switch"`       // vswitch name, e.g. "sw0"
-	TapFDSocket string     `yaml:"tapfd_socket"` // optional persistent connector tapfd provider UDS; empty = exec open-port
+	TapFDSocket string     `yaml:"tapfd_socket"` // optional persistent connector TAPFD/1 UDS; empty = CLI attach/open/detach
 	Hostname    string     `yaml:"hostname"`     // guest hostname (sethostname + /etc/hosts entry); default "sandbox"
 	DNS         []string   `yaml:"dns"`          // /etc/resolv.conf nameservers injected into the guest
 	E2B         ProfileNet `yaml:"e2b"`          // e2b profile inner IP / gateway (envd port-forward needs the /30)
