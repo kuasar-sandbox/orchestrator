@@ -47,14 +47,19 @@ func TestExportImportRoundTrip(t *testing.T) {
 	if err := o.st.Put(ctx, sb); err != nil {
 		t.Fatal(err)
 	}
+	o.cache(sb)
 
-	// export (move): mints a token, deletes the source row.
+	// export (move): mints a token, deletes the source row, and removes any
+	// cached source so an immediate connect+import cannot resume stale local state.
 	tok, err := o.ExportSandbox(ctx, apiKey, sid, false, false)
 	if err != nil {
 		t.Fatalf("export: %v", err)
 	}
 	if s, _ := o.st.Get(ctx, sid); s != nil {
 		t.Fatal("move export should delete the source row")
+	}
+	if s := o.lookup(sid); s != nil {
+		t.Fatalf("move export should uncache the source row: %+v", s)
 	}
 
 	// import: re-inserts the paused row (the snapshot persists in the remote store).

@@ -81,6 +81,8 @@ func (o *Orchestrator) ExportSandbox(ctx context.Context, apiKey, sid string, to
 		_ = o.st.SetSnapshotRef(ctx, sid, mref)
 		_ = os.RemoveAll(filepath.Dir(ref)) // drop the now-redundant local bundle dir
 		sb.SnapshotRef, ref = mref, mref
+		o.cache(sb)
+		o.publishUpsert(sb)
 	}
 	key := strings.TrimPrefix(ref, "manifest://")
 
@@ -96,6 +98,8 @@ func (o *Orchestrator) ExportSandbox(ctx context.Context, apiKey, sid string, to
 	}
 	if !keepSource {
 		_ = o.st.Delete(ctx, sid) // move: relinquish the source (the remote snapshot persists)
+		o.uncache(sid)
+		o.publishDelete(sid)
 	}
 	return tok, nil
 }
