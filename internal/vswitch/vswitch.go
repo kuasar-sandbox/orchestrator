@@ -1,4 +1,7 @@
 // Package vswitch wraps `connector-ctl vswitch` for per-sandbox port allocation.
+// When a persistent tapfd socket is configured, attach/detach use TAPFD/1
+// PREPARE/RELEASE on that socket; otherwise they fall back to short-lived CLI
+// commands.
 //
 //	vswitch attach <switch> --inner-ip=<ip> [--port=0] [--transit-*]  -> JSON AttachOutput
 //	vswitch open-port <switch> --port=<N>  (TAPFD_SOCKET) -> tap-fd handoff
@@ -10,12 +13,22 @@
 package vswitch
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"os/exec"
 	"strconv"
+	"strings"
+	"time"
+)
+
+const (
+	tapfdRequestVersion = "TAPFD/1"
+	tapfdMaxLineSize    = 512
+	tapfdSocketTimeout  = 5 * time.Second
 )
 
 // attachOutput mirrors connector pkg/vswitch AttachOutput (subset we use).
@@ -75,6 +88,9 @@ type AttachReq struct {
 
 // Attach allocates a tap port on the switch for the request's guest inner IP.
 func (c *CLI) Attach(ctx context.Context, req AttachReq) (*Port, error) {
+	if c.tapFDSocket != "" {
+		return c.prepare(ctx, req)
+	}
 	args := []string{"vswitch", "attach", c.sw, "--inner-ip=" + req.InnerIP, "--port=0"}
 	if req.TransitGatewayIP != "" {
 		args = append(args, "--transit-gateway-ip="+req.TransitGatewayIP)
@@ -125,6 +141,9 @@ func (c *CLI) Detach(ctx context.Context, port string) error {
 	if port == "" {
 		return nil
 	}
+	if c.tapFDSocket != "" {
+		return c.release(ctx, port)
+	}
 	cmd := exec.CommandContext(ctx, c.bin, "vswitch", "detach", c.sw, "--port="+port)
 	var errb bytes.Buffer
 	cmd.Stderr = &errb
@@ -132,4 +151,155 @@ func (c *CLI) Detach(ctx context.Context, port string) error {
 		return fmt.Errorf("connector vswitch detach %s port %s: %w: %s", c.sw, port, err, errb.String())
 	}
 	return nil
+}
+
+func (c *CLI) prepare(ctx context.Context, req AttachReq) (*Port, error) {
+	fields := []string{
+		"VSWITCH=" + c.sw,
+		"INNER_IP=" + req.InnerIP,
+	}
+	if req.TransitGatewayIP != "" {
+		fields = append(fields, "TRANSIT_GATEWAY_IP="+req.TransitGatewayIP)
+	}
+	if req.TransitGeneveVNI != 0 {
+		fields = append(fields, "TRANSIT_GENEVE_VNI="+strconv.FormatUint(uint64(req.TransitGeneveVNI), 10))
+	}
+	if req.TransitMAC != "" {
+		fields = append(fields, "TRANSIT_MAC="+req.TransitMAC)
+	}
+	out, err := c.tapfdCall(ctx, "PREPARE", fields...)
+	if err != nil {
+		return nil, err
+	}
+	port := out["port"]
+	if port == "" {
+		return nil, fmt.Errorf("connector tapfd prepare %s: missing port in response", c.sw)
+	}
+	if _, err := strconv.ParseUint(port, 10, 32); err != nil {
+		return nil, fmt.Errorf("connector tapfd prepare %s: invalid port %q: %w", c.sw, port, err)
+	}
+	if mode := out["mode"]; mode != "" && mode != "tap" {
+		return nil, fmt.Errorf("connector tapfd prepare %s: prepared port %s is %s, not tap", c.sw, port, mode)
+	}
+	return &Port{
+		Port:       port,
+		FloatingIP: out["floating_ip"],
+		MAC:        out["mac"],
+		InnerIP:    out["ip"],
+	}, nil
+}
+
+func (c *CLI) release(ctx context.Context, port string) error {
+	if _, err := strconv.ParseUint(port, 10, 32); err != nil {
+		return fmt.Errorf("connector tapfd release %s: invalid port %q: %w", c.sw, port, err)
+	}
+	_, err := c.tapfdCall(ctx, "RELEASE", "VSWITCH="+c.sw, "PORT="+port)
+	return err
+}
+
+func (c *CLI) tapfdCall(ctx context.Context, op string, fields ...string) (map[string]string, error) {
+	line := tapfdRequestVersion + " " + op
+	for _, field := range fields {
+		if err := validateTapFDToken(field); err != nil {
+			return nil, err
+		}
+		line += " " + field
+	}
+	if len(line)+1 > tapfdMaxLineSize {
+		return nil, fmt.Errorf("connector tapfd %s %s: request line too long", strings.ToLower(op), c.sw)
+	}
+
+	conn, err := (&net.Dialer{}).DialContext(ctx, "unix", c.tapFDSocket)
+	if err != nil {
+		return nil, fmt.Errorf("connector tapfd %s %s: dial %s: %w", strings.ToLower(op), c.sw, c.tapFDSocket, err)
+	}
+	defer conn.Close()
+	setTapFDDeadline(ctx, conn)
+	if _, err := conn.Write([]byte(line + "\n")); err != nil {
+		return nil, fmt.Errorf("connector tapfd %s %s: write request: %w", strings.ToLower(op), c.sw, err)
+	}
+	resp, err := readTapFDLine(bufio.NewReader(conn))
+	if err != nil {
+		return nil, fmt.Errorf("connector tapfd %s %s: read response: %w", strings.ToLower(op), c.sw, err)
+	}
+	fieldsMap, err := parseTapFDResponse(resp)
+	if err != nil {
+		return nil, fmt.Errorf("connector tapfd %s %s: %w", strings.ToLower(op), c.sw, err)
+	}
+	return fieldsMap, nil
+}
+
+func setTapFDDeadline(ctx context.Context, conn net.Conn) {
+	deadline := time.Now().Add(tapfdSocketTimeout)
+	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
+		deadline = ctxDeadline
+	}
+	_ = conn.SetDeadline(deadline)
+}
+
+func validateTapFDToken(tok string) error {
+	if tok == "" || strings.ContainsAny(tok, " \t\r\n\x00") || !strings.Contains(tok, "=") {
+		return fmt.Errorf("invalid tapfd request token %q", tok)
+	}
+	return nil
+}
+
+func readTapFDLine(r *bufio.Reader) (string, error) {
+	var b strings.Builder
+	for b.Len() < tapfdMaxLineSize {
+		c, err := r.ReadByte()
+		if err != nil {
+			return "", err
+		}
+		if c == '\n' {
+			return b.String(), nil
+		}
+		if c == 0 {
+			return "", fmt.Errorf("response line contains NUL")
+		}
+		b.WriteByte(c)
+	}
+	return "", fmt.Errorf("response line too long: %d > %d", b.Len()+1, tapfdMaxLineSize)
+}
+
+func parseTapFDResponse(line string) (map[string]string, error) {
+	toks := strings.Fields(strings.TrimRight(strings.TrimSpace(line), "\r"))
+	if len(toks) < 2 {
+		return nil, fmt.Errorf("malformed response %q", line)
+	}
+	if toks[0] != tapfdRequestVersion {
+		return nil, fmt.Errorf("unsupported response version %q", toks[0])
+	}
+	fields, err := parseTapFDFields(toks[2:])
+	if err != nil {
+		return nil, err
+	}
+	switch toks[1] {
+	case "OK":
+		return fields, nil
+	case "ERR":
+		code := fields["code"]
+		if code == "" {
+			code = "PROVIDER_INTERNAL"
+		}
+		msg := fields["message"]
+		if msg != "" {
+			return nil, fmt.Errorf("provider error %s: %s", code, msg)
+		}
+		return nil, fmt.Errorf("provider error %s", code)
+	default:
+		return nil, fmt.Errorf("unsupported response status %q", toks[1])
+	}
+}
+
+func parseTapFDFields(toks []string) (map[string]string, error) {
+	fields := make(map[string]string, len(toks))
+	for _, tok := range toks {
+		key, val, ok := strings.Cut(tok, "=")
+		if !ok || key == "" {
+			return nil, fmt.Errorf("malformed response token %q", tok)
+		}
+		fields[key] = val
+	}
+	return fields, nil
 }
