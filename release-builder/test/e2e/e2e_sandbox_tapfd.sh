@@ -73,8 +73,9 @@ resources:
 network:
   tapfd:
     exec: ["$BIN/connector-ctl", "tapfd", "get", "--new", "--host-cidr", "$hcidr",
-           "--mac", "$GUEST_MAC", "--ip", "$gip", "--mtu", "1400"]   # auto-named tap
+           "--mac", "$GUEST_MAC", "--ip", "$gip"]   # auto-named tap
   ip: $gip/31          # mask source; provider sends bare ip → keeps /31
+  mtu: 1400            # guest MTU is sandbox config, not tapfd metadata
   hostname: e2e-tapfd
 boot:
   kernel: file://$VMLINUX
@@ -87,7 +88,7 @@ EOF
     if [ "$launch" = "1" ]; then
         cat >> "$out" <<EOF
 launch:
-  args: ["-c", "import time,sys; print('NETUP', flush=True); time.sleep(60)"]
+  args: ["-c", "import time; print('MTU='+open('/sys/class/net/eth0/mtu').read().strip(), flush=True); print('NETUP', flush=True); time.sleep(60)"]
   restart: never
 EOF
     fi
@@ -129,6 +130,7 @@ else
 fi
 grep -q "tapfd: received tap fd" "$LOG" && ok "tapfd handoff engaged in sandbox-ctl" || bad "no tapfd handoff log"
 grep -qE "net fd=[0-9]+,mac=$GUEST_MAC,id=_net0" "$LOG" && ok "CH driven with --net fd=,mac=,id=_net0" || bad "fd-mode --net not in log"
+grep -q "^MTU=1400$" "$LOG" && ok "guest MTU came from sandbox network config" || bad "guest MTU was not 1400"
 ping_guest 169.254.1.1 && ok "host pinged guest 169.254.1.1 over the vnet_hdr fd" \
     || { echo "--- log ---"; tail -25 "$LOG"; ip -br addr || true; bad "ping 169.254.1.1 failed"; }
 
