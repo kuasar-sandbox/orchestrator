@@ -74,15 +74,20 @@ func (o *Orchestrator) ExportSandbox(ctx context.Context, apiKey, sid string, to
 	// path; promote it to a manifest and repoint the row (local files redundant).
 	ref := sb.SnapshotRef
 	if !strings.HasPrefix(ref, "manifest://") {
-		mref, err := o.promote(ctx, sb, ref)
+		localRef := ref
+		mref, err := o.promote(ctx, sb, localRef)
 		if err != nil {
 			return "", err
 		}
-		_ = o.st.SetSnapshotRef(ctx, sid, mref)
-		_ = os.RemoveAll(filepath.Dir(ref)) // drop the now-redundant local bundle dir
+		if err := o.st.SetSnapshotRef(ctx, sid, mref); err != nil {
+			return "", fmt.Errorf("export-sandbox: persist promoted snapshot ref for %s: %w", sid, err)
+		}
 		sb.SnapshotRef, ref = mref, mref
 		o.cache(sb)
 		o.publishUpsert(sb)
+		if err := os.RemoveAll(filepath.Dir(localRef)); err != nil {
+			o.log.Warn("export-sandbox: remove redundant local snapshot", "sid", sid, "path", filepath.Dir(localRef), "err", err)
+		}
 	}
 	key := strings.TrimPrefix(ref, "manifest://")
 
@@ -97,7 +102,9 @@ func (o *Orchestrator) ExportSandbox(ctx context.Context, apiKey, sid string, to
 		return "", err
 	}
 	if !keepSource {
-		_ = o.st.Delete(ctx, sid) // move: relinquish the source (the remote snapshot persists)
+		if err := o.st.Delete(ctx, sid); err != nil { // move: remote snapshot persists
+			return "", fmt.Errorf("export-sandbox: delete source %s: %w", sid, err)
+		}
 		o.uncache(sid)
 		o.publishDelete(sid)
 	}

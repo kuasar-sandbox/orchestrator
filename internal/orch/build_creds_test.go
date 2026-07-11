@@ -20,12 +20,16 @@ import (
 func testOrch(t *testing.T) *Orchestrator { return testOrchCfg(t, &config.Config{}) }
 
 func testOrchCfg(t *testing.T, cfg *config.Config) *Orchestrator {
+	return testOrchCfgAt(t, cfg, filepath.Join(t.TempDir(), "t.db"))
+}
+
+func testOrchCfgAt(t *testing.T, cfg *config.Config, dbPath string) *Orchestrator {
 	t.Helper()
 	box, err := secretbox.NewFromColonHex(strings.Repeat("0", 64))
 	if err != nil {
 		t.Fatal(err)
 	}
-	st, err := store.Open(filepath.Join(t.TempDir(), "t.db"), box)
+	st, err := store.Open(dbPath, box)
 	if err != nil {
 		t.Fatal(err)
 	}
