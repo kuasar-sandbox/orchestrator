@@ -495,6 +495,20 @@ func (s *Store) BuildsByStatus(ctx context.Context, status types.BuildState) ([]
 	return out, rows.Err()
 }
 
+// SetBuildRunID records the systemd runner assigned to a build without
+// rewriting status or other fields that may have changed since admission.
+func (s *Store) SetBuildRunID(ctx context.Context, buildID, runID string) error {
+	res, err := s.db.ExecContext(ctx, `UPDATE builds SET run_id=? WHERE build_id=?`, runID, buildID)
+	if err != nil {
+		return fmt.Errorf("store: set build %s run id: %w", buildID, err)
+	}
+	n, _ := res.RowsAffected()
+	if n != 1 {
+		return fmt.Errorf("store: set build %s run id: build not found", buildID)
+	}
+	return nil
+}
+
 // CASBuildStatus atomically moves a build from one status to another, returning
 // whether it won the transition (lets multiple pool workers race for a build).
 func (s *Store) CASBuildStatus(ctx context.Context, buildID string, from, to types.BuildState) (bool, error) {
