@@ -342,7 +342,10 @@ banner "网络：端口转发 (host→沙箱 floatingip) + 沙箱出网 (NAT)"
 # set at build time) is ALREADY running in the sandbox, serving the COPY'd+RUN-built
 # page — reaching it proves the start_cmd survived create (snapshot→restore).
 say "the template's start command already serves the built site on :8000 (frozen under envd; /etc/hosts+resolv.conf injected by orchestrator via files:)"
-FIP="$(sqlite3 "$WORK/lib/orchestrator.db" "select floatingip from sandboxes where id='$SID'" 2>/dev/null)"
+DB="$WORK/lib/node-ctl.db"
+[ -s "$DB" ] || DB="$WORK/lib/orchestrator.db"
+FIP="$(sqlite3 "$DB" "select floatingip from sandboxes where id='$SID'" 2>/dev/null || true)"
+[ -n "$FIP" ] || die "could not resolve floatingip for sandbox $SID from $DB"
 say "沙箱 floatingip = ${FIP:-?}  (host 经 $SW_MGMT 直达)"
 echo "${c_cmd}  \$ curl http://$FIP:8000/    # served by the template's start command${c_off}"
 out=""; for _ in $(seq 1 8); do out="$(curl -s --max-time 5 --noproxy '*' "http://$FIP:8000/" 2>&1)" || true; case "$out" in *"$BUILT_MARKER"*) break;; esac; sleep 1; done

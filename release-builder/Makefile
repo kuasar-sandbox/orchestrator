@@ -135,7 +135,8 @@ test-e2e: build e2e-tools $(UMBRELLA_E2E)
 	$(E2E_REQUIRE_ENV) $(MAKE) -C $(ORG)/accelerator test-e2e SBIN=$(SBIN)
 	$(E2E_REQUIRE_ENV) $(MAKE) -C $(ORG)/connector test-e2e
 	$(E2E_REQUIRE_ENV) $(MAKE) -C $(ORG)/guest-runtime test-e2e \
-		FLATTEN_CTL=$(SBIN)/flatten-ctl STORE_CTL=$(SBIN)/store-ctl ZOT_BIN=$(E2E_ZOT_BIN)
+		FLATTEN_CTL=$(SBIN)/flatten-ctl STORE_CTL=$(SBIN)/store-ctl \
+		ZOT_BIN=$(E2E_ZOT_BIN) MKFS_EROFS_PATH=$(SBIN)/mkfs.erofs
 
 # perf harnesses living in this repo (cross-repo binary use).
 perf-sandbox: build
