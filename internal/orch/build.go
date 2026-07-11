@@ -348,7 +348,12 @@ func (o *Orchestrator) BuildPool(ctx context.Context, interval time.Duration) {
 				default:
 					break admit // pool full this tick
 				}
-				won, _ := o.st.CASBuildStatus(ctx, b.BuildID, types.BuildWaiting, types.BuildBuilding)
+				won, err := o.claimWaitingBuild(ctx, b)
+				if err != nil {
+					<-sem
+					o.log.Warn("build admission", "bid", b.BuildID, "err", err)
+					continue
+				}
 				if !won {
 					<-sem
 					continue
@@ -361,6 +366,17 @@ func (o *Orchestrator) BuildPool(ctx context.Context, interval time.Duration) {
 			}
 		}
 	}
+}
+
+// claimWaitingBuild keeps the claimed row and the in-memory value aligned for
+// the execution path after admission.
+func (o *Orchestrator) claimWaitingBuild(ctx context.Context, b *types.Build) (bool, error) {
+	won, err := o.st.CASBuildStatus(ctx, b.BuildID, types.BuildWaiting, types.BuildBuilding)
+	if err != nil || !won {
+		return won, err
+	}
+	b.Status = types.BuildBuilding
+	return true, nil
 }
 
 type buildResult = configsock.BuildResult
@@ -496,7 +512,7 @@ func (o *Orchestrator) runBuildUnit(ctx context.Context, b *types.Build) (*build
 	if _, err := o.builderRunPool.Assign(ctx, b.BuildID, func(runID string) error {
 		b.RunID = runID
 		unit = o.builderUnit(runID)
-		return o.st.PutBuild(ctx, b)
+		return o.st.SetBuildRunID(ctx, b.BuildID, runID)
 	}); err != nil {
 		return nil, err
 	}
