@@ -1,0 +1,49 @@
+name: BMS E2E
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bms-e2e-${{ github.repository }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  e2e:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on:
+      - self-hosted
+      - Linux
+      - X64
+      - kuasar-e2e
+      - kvm
+      - cgroup-v2
+    timeout-minutes: 120
+
+    steps:
+      - name: Check out the candidate
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Build the platform and run the E2E demo
+        env:
+          UPDATE_BASELINE: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+        run: /opt/kuasar-ci/bin/run-e2e "$GITHUB_REPOSITORY" "$GITHUB_WORKSPACE" "$UPDATE_BASELINE"
+
+      - name: Upload E2E logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bms-e2e-${{ github.event.repository.name }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .ci-logs/
+          if-no-files-found: warn
+          include-hidden-files: true
+          retention-days: 14
