@@ -284,7 +284,7 @@ func peerFrom(ctx context.Context) (int, bool) {
 	return v, ok
 }
 
-// Serve binds the UDS (0600) and serves the three planes over h2c until ctx ends.
+// Serve binds the UDS (0600) and serves all control planes over h2c until ctx ends.
 func (s *Server) Serve(ctx context.Context) error {
 	return s.ServeReady(ctx, nil)
 }

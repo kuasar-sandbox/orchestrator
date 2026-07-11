@@ -1,10 +1,8 @@
 package main
 
-// Shared scaffold for the in-unit task launchers run-sandbox / run-builder: lock the
-// pidfile (double-start guard), fetch a LaunchSpec over the config-socket, then
-// exec-replace into the target so it inherits this PID (the unit's main pid + cgroup).
-// The two commands are thin wrappers over launchTask — separate so each can grow its
-// own task-specific behaviour (a build will become more than fetch-and-exec).
+// Shared scaffold for the in-unit sandbox launcher: lock the task pidfile
+// (double-start guard), fetch a LaunchSpec over the config-socket, then exec-replace
+// into the target so it inherits this PID (the unit's main pid + cgroup).
 
 import (
 	"fmt"
@@ -18,9 +16,9 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 )
 
-// launchTask locks+writes the pidfile, fetches the LaunchSpec for configID
-// ("sandbox:<sid>" | "build:<bid>") over the config-socket, applies its workdir/env,
-// and exec-replaces into the target (which inherits this PID and the unit cgroup).
+// launchTask locks+writes the pidfile, fetches the LaunchSpec for
+// "sandbox:<sid>" over the config-socket, applies its workdir/env, and
+// exec-replaces into the target (which inherits this PID and the unit cgroup).
 func launchTask(socket, configID, pidfile string) error {
 	if pidfile != "" {
 		if err := lockPidfile(pidfile); err != nil {

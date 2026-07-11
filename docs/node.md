@@ -97,7 +97,7 @@ node-ctl 补这一层,并刻意选择 **e2b 协议兼容**而非自定义 API:e2
       │   sandboxes create/connect/pause/...  │   │ (internal /   │ │      sandbox events
       │   templates register/trigger/status   │   │  external     │ │  down: create/connect/
       │ host:                                 │   │  workers,     │ │       delete/key_put/key_drop
-      │   connector-ctl vswitch attach → floatingip     │   │  route-synced)│ │
+      │   vswitch PREPARE/attach → floatingip           │   │  route-synced)│ │
       │   assign sandbox-runner@<run-id>      │   │ 49983/49999   │ └─ node-link client ───┐
       │   envd /init → sqlite + TTL           │   │  → UDS (envd) │                        │
       │ build: builds table → pool →          │   │ other ports → │◄── cluster-ctl router  │
@@ -115,7 +115,8 @@ node-ctl 补这一层,并刻意选择 **e2b 协议兼容**而非自定义 API:e2
 ```
 
 create 流程:建 `<run_root>/<sid>/`(tmpfs)+ `<base_root>/<sid>/`(disk)→
-`connector-ctl vswitch attach` 拿 `{port, floatingip, mac}` → 写非密配置 `<sid>.yaml`
+配 `tapfd_socket` 时经 `TAPFD/1 PREPARE`、否则经 `connector-ctl vswitch attach` 拿
+`{port, floatingip, mac}` → 写非密配置 `<sid>.yaml`
 → 从 runner pool 分配一个 run-id(无 idle 时按需 `StartUnit(sandbox-runner@<run-id>)`)
 → 持久化 `sid ↔ run-id` → 单元内 `run-sandbox` 经 config-socket 的
 WaitAssignment 取得 sid,再取 LaunchSpec(密钥经 env)后 `execve` 成 `sandbox-ctl run`
@@ -185,8 +186,9 @@ node-ctl conductor serve [--config /etc/node-ctl/conductor.yaml]
 | `--config` | `/etc/node-ctl/conductor.yaml` | 配置文件(§3);`proxy.mode` 等一律以文件为准 |
 
 启动序列:打开 sqlite(文件 chmod 0600)→ 生成并安装 systemd 模板单元(§5)→
-重启对账(§15)→ 起 reaper(TTL,5s 周期)与构建池(§12)→ 起本机控制 socket(§6)
-→(配 `resource_listen` 则起内置资源控制器,node-resource.md)→ 按 `proxy.mode` 装配
+重启对账(§15)→ 起 reaper(TTL,5s 周期)→(配 `resource_listen` 则起内置资源控制器,
+node-resource.md)→ 起本机控制 socket并确认监听成功(§6)→ 起 runner/builder 预启动池与
+构建准入循环(§12)→ 按 `proxy.mode` 装配
 数据面(§9)→(配 `cluster.node_link.endpoint` 则拨 registry 起 node-link 客户端,§10)→
 监听 `api.listen`。`api.<domain>`(及任何 `api.` 前缀 Host)路由到控制面,其余 Host
 进数据面。TLS 证书缺省时以明文 h2c 服务(dev:SDK 走 `E2B_API_URL`/`E2B_SANDBOX_URL`)。
@@ -333,7 +335,7 @@ node-ctl 同目录 → PATH"自动发现。
 | `units.dir` | `/etc/systemd/system` | 模板单元安装目录 |
 | `units.runner` / `units.builder` | `sandbox-runner@.service` / `sandbox-builder@.service` | 模板单元名 |
 | `units.runner_pool_size` / `units.builder_pool_size` | `0` / `0` | 空闲预启动 run-id 单元数;0 = 不保留 idle,有任务时仍按需经 WaitAssignment 流程启动 |
-| `units.pool_wait_timeout` | `5s` | `StartUnit` 成功后等待单元进入 WaitAssignment 的上限;超时清理该 run-id 并补池 |
+| `units.pool_wait_timeout` | `5s` | 从调用 `StartUnit` 到单元进入 WaitAssignment 的正数时限;超时清理该 run-id 并补池 |
 | `units.install` | `true` | `false` = 单元由运维带外管理,serve 不生成安装 |
 | `sandbox.timeout_sec` | `300` | 沙箱默认 TTL(秒) |
 | `sandbox.resources.vcpu` / `.memory` | `2` / `2GiB` | 每沙箱容量;同时回显在 e2b list/get 的 `cpuCount`/`memoryMB`。**restore 类启动(snp 模板 create / resume / 迁移导入)按快照内 snapshot.cfg 的 capacity 覆盖**——快照自描述,可与本机默认不同(如构建预算下产出的模板) |
@@ -540,7 +542,6 @@ LogRateLimitIntervalSec=0                        # 构建少且要全量细节(�
 ExecStart=<node-ctl> run-builder --pidfile=/run/sandbox/runs/%i.pid \
           --config-socket=/run/sandbox/node-ctl.socket --run-id=%i
 ExecStopPost=/bin/rm -f /run/sandbox/runs/%i.pid
-TimeoutStartSec=1860              # builder.total_timeout_sec + 60
 KillMode=control-group
 Slice=sandbox-builder.slice   # 构建池 cgroup 上限(builder.cpu_quota/memory_max)
 ```
@@ -553,7 +554,15 @@ sd_notify);builder 取得 bid 后再锁 `<run_root>/<bid>/<bid>.pid`,取 BuildSp
 直接子进程、整个构建计入本单元 cgroup,结果经 config-socket 回传。`KillMode=control-group`
 保证 StopUnit/超时连阶段 VM 一并回收。
 
-- **kill**:`StopUnit`(连 CH 一并 SIGKILL)→ `ResetFailedUnit` → `connector-ctl vswitch detach`
+serve 分别维护 runner/builder 的目标 idle 数量。分配会消费一个已进入 WaitAssignment
+的单元并立即登记异步补池;无 idle 时也生成 run-id、按同一路径启动单元并等待其
+WaitAssignment,不存在另一套直接启动模型。Start/Stop 请求只由一个固定控制循环串行
+执行,状态循环通过 channel 投递请求,不为每次补池派生启动协程。`pool_wait_timeout` 覆盖
+`StartUnit` 调用到 WaitAssignment 的完整区间;启动失败、等待超时或等待连接取消都会
+`StopUnit` + `ResetFailedUnit`,再生成新的 UUIDv7 run-id 补足目标数量。
+
+- **kill**:`StopUnit`(连 CH 一并 SIGKILL)→ `ResetFailedUnit` → tapfd `RELEASE` 或
+  `connector-ctl vswitch detach`
   → 删运行目录 → 删库行。`kill` 在进程层生效,不受 guest 内 restart 策略阻挡。
 - **就绪**:`Type=exec` 下 exec 成功即视为单元已启动;e2b profile 再轮询 envd
   `/health`(UDS,60s 上限)判数据面就绪。
@@ -601,12 +610,12 @@ serve 不预建 cgroup、不做进程搬迁。LaunchSpec 给 sandbox-ctl 带
 - **限流策略**:builder 单元关限流(构建少、要全量细节);runner 单元保留默认限流
   (数千沙箱不得刷爆 journal)。
 - sandbox-ctl 自身进程日志(其 stderr)随单元落 journal 但**不带标签**——属宿主排障,
-  不进任何标签过滤流(也不入 .result:那是 run-builder stdout 专用)。
+  不进任何标签过滤流。
 
-## 6. 本机控制 socket(task / admin / plugin / api 平面)
+## 6. 本机控制 socket(run / task / admin / plugin / api 平面)
 
 serve 在 UDS `paths.config_socket`(默认 `/run/sandbox/node-ctl.socket`,**0600**)
-跑一个 h2c HTTP 服务(兼容 HTTP/1.1):单 socket 复用四个平面、各自鉴权。连接建立时
+跑一个 h2c HTTP 服务(兼容 HTTP/1.1):单 socket 复用五个平面、各自鉴权。连接建立时
 经 **`SO_PEERCRED`** 取 peer pid 注入请求上下文;socket 0600 ⇒ 仅同 uid / root 可连,
 各平面在此之上再细分。`/internal/*` 前缀 e2b SDK 永不使用,与 api 路径不冲突。
 
@@ -961,8 +970,9 @@ plugin 平面,机群路由经 registry 聚合。
 (microVM)内**——租户的网络流量与镜像内容不触宿主用户态,宿主侧只做工件接力与
 收尾上传。
 
-**serve 侧(每构建一次)**:建 workdir → `connector-ctl vswitch attach` 一个网络槽(整个构建
-复用,各阶段顺序交接 tapfd)→ 铸 envd token →(`mmds.enabled` 时)挂一行合成路由,
+**serve 侧(每构建一次)**:建 workdir → 配 `tapfd_socket` 时经 `TAPFD/1 PREPARE`、否则经
+`connector-ctl vswitch attach` 分配一个网络槽(整个构建复用,各阶段顺序交接 tapfd)→
+铸 envd token →(`mmds.enabled` 时)挂一行合成路由,
 让模板阶段 FC 模式的 envd 能按 floatingip 自解析 → 从 builder pool 分配 run-id
 (无 idle 时按需 `StartUnit`)→ run-builder WaitAssignment 取得 bid 后执行流水线
 → 经 config-socket 回传结果 → 终态落库:产物为快照 ⇒ `kind=snp`、为镜像 ⇒
@@ -1156,6 +1166,8 @@ serve 重启后以 `ListUnitsByPatterns("sandbox-runner@*.service")` 为存活�
 - 单元 active/activating 且库内 running ⇒ **收养**(重挂内存路由、TTL 继续生效,
   external 模式随快照重新推给 worker;集群下经 node-link 重报);
 - 库内 running 但无对应活单元 ⇒ 清理(StopUnit/detach/删运行目录)并标 `dead`;
+- 无 running 行对应的 runner 单元属于上一个 pool 的 idle/orphan run-id ⇒
+  `StopUnit` + `ResetFailedUnit`,随后由新 pool 按配置补足;
 - `run_root` 为 tmpfs ⇒ 整机重启后 running 全部判 dead;`paused` 行与 snp 模板保留,
   可被 connect/auto-resume 重新拉起(本机快照存于磁盘 `checkpoint.local_dir`)。
 

@@ -18,6 +18,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"os/exec"
 	"strconv"
@@ -175,8 +176,12 @@ func (c *CLI) prepare(ctx context.Context, req AttachReq) (*Port, error) {
 	if port == "" {
 		return nil, fmt.Errorf("connector tapfd prepare %s: missing port in response", c.sw)
 	}
-	if _, err := strconv.ParseUint(port, 10, 32); err != nil {
+	portNum, err := strconv.ParseUint(port, 10, 32)
+	if err != nil {
 		return nil, fmt.Errorf("connector tapfd prepare %s: invalid port %q: %w", c.sw, port, err)
+	}
+	if portNum == 0 {
+		return nil, fmt.Errorf("connector tapfd prepare %s: invalid port %q", c.sw, port)
 	}
 	if mode := out["mode"]; mode != "" && mode != "tap" {
 		return nil, fmt.Errorf("connector tapfd prepare %s: prepared port %s is %s, not tap", c.sw, port, mode)
@@ -190,10 +195,14 @@ func (c *CLI) prepare(ctx context.Context, req AttachReq) (*Port, error) {
 }
 
 func (c *CLI) release(ctx context.Context, port string) error {
-	if _, err := strconv.ParseUint(port, 10, 32); err != nil {
+	portNum, err := strconv.ParseUint(port, 10, 32)
+	if err != nil {
 		return fmt.Errorf("connector tapfd release %s: invalid port %q: %w", c.sw, port, err)
 	}
-	_, err := c.tapfdCall(ctx, "RELEASE", "VSWITCH="+c.sw, "PORT="+port)
+	if portNum == 0 {
+		return fmt.Errorf("connector tapfd release %s: invalid port %q", c.sw, port)
+	}
+	_, err = c.tapfdCall(ctx, "RELEASE", "VSWITCH="+c.sw, "PORT="+port)
 	return err
 }
 
@@ -215,7 +224,7 @@ func (c *CLI) tapfdCall(ctx context.Context, op string, fields ...string) (map[s
 	}
 	defer conn.Close()
 	setTapFDDeadline(ctx, conn)
-	if _, err := conn.Write([]byte(line + "\n")); err != nil {
+	if _, err := io.Copy(conn, strings.NewReader(line+"\n")); err != nil {
 		return nil, fmt.Errorf("connector tapfd %s %s: write request: %w", strings.ToLower(op), c.sw, err)
 	}
 	resp, err := readTapFDLine(bufio.NewReader(conn))

@@ -99,10 +99,9 @@ LogRateLimitIntervalSec=0
 # unit's cgroup under sandbox-builder.slice.
 ExecStart=%s run-builder --pidfile=%s/runs/%%i.pid --config-socket=%s --run-id=%%i
 ExecStopPost=/bin/rm -f %s/runs/%%i.pid
-TimeoutStartSec=%d
 KillMode=control-group
 Slice=sandbox-builder.slice
-`, o.cfg.Paths.RunRoot, o.cfg.OrchestratorCtl(), o.cfg.Paths.RunRoot, o.cfg.Paths.ConfigSocket, o.cfg.Paths.RunRoot, o.cfg.Builder.TotalTimeoutSec+60)
+`, o.cfg.Paths.RunRoot, o.cfg.OrchestratorCtl(), o.cfg.Paths.RunRoot, o.cfg.Paths.ConfigSocket, o.cfg.Paths.RunRoot)
 }
 
 func sliceFile(desc, caps string) string {

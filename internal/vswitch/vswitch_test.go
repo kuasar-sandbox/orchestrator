@@ -63,6 +63,18 @@ func TestTapFDSocketErrorResponse(t *testing.T) {
 	}
 }
 
+func TestTapFDSocketRejectsZeroPort(t *testing.T) {
+	sock, _, closeFn := serveTapFDOnce(t, "TAPFD/1 OK port=0 mode=tap\n")
+	defer closeFn()
+	c := New("connector-ctl", "sw0", WithTapFDSocket(sock))
+	if _, err := c.Attach(context.Background(), AttachReq{InnerIP: "169.254.0.21"}); err == nil {
+		t.Fatal("Attach accepted port zero")
+	}
+	if err := c.Detach(context.Background(), "0"); err == nil {
+		t.Fatal("Detach accepted port zero")
+	}
+}
+
 func serveTapFDOnce(t *testing.T, response string) (path string, reqCh <-chan string, closeFn func()) {
 	t.Helper()
 	path = filepath.Join(t.TempDir(), "tapfd.sock")

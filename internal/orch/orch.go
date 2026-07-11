@@ -113,9 +113,14 @@ func New(cfg *config.Config, st *store.Store, lc launcher.Launcher, vs vsClient,
 	return o
 }
 
-func (o *Orchestrator) StartRunPools(ctx context.Context) {
-	o.runnerPool.Start(ctx)
-	o.builderRunPool.Start(ctx)
+func (o *Orchestrator) StartRunPools(ctx context.Context) error {
+	if err := o.runnerPool.Start(ctx); err != nil {
+		return fmt.Errorf("start runner pool: %w", err)
+	}
+	if err := o.builderRunPool.Start(ctx); err != nil {
+		return fmt.Errorf("start builder pool: %w", err)
+	}
+	return nil
 }
 
 // --- api.Core ---
@@ -582,9 +587,9 @@ func (o *Orchestrator) resolveNetwork(sb *types.Sandbox, tmpl types.TemplateID, 
 	}
 }
 
-// LaunchSpecFor resolves a launcher config-id ("sandbox:<sid>" | "build:<bid>")
-// to the LaunchSpec the launcher exec-replaces into. The secret manifest key rides in
-// LaunchSpec.Env; the bulky non-secret config is the file referenced by the args.
+// LaunchSpecFor resolves "sandbox:<sid>" to the LaunchSpec the launcher
+// exec-replaces into. The secret manifest key rides in LaunchSpec.Env; the bulky
+// non-secret config is the file referenced by the args.
 func (o *Orchestrator) LaunchSpecFor(ctx context.Context, configID string) (*configsock.LaunchSpec, string, bool, error) {
 	kind, id, found := strings.Cut(configID, ":")
 	if !found {
@@ -708,7 +713,11 @@ func (o *Orchestrator) Reconcile(ctx context.Context) error {
 	// collect the dead ones and tear them down after the scan, since teardown +
 	// SetState write the store and must not run while the read cursor is open.
 	var dead []*types.Sandbox
+	knownRuns := make(map[string]bool)
 	if err := o.st.RangeByState(ctx, types.StateRunning, func(sb *types.Sandbox) error {
+		if sb.RunID != "" {
+			knownRuns[sb.RunID] = true
+		}
 		if sb.RunID != "" && alive[sb.RunID] {
 			o.cache(sb) // re-adopt: route + TTL already in store
 		} else {
@@ -722,6 +731,18 @@ func (o *Orchestrator) Reconcile(ctx context.Context) error {
 		o.log.Info("reconcile: dead sandbox", "sid", sb.ID)
 		o.teardown(ctx, sb)
 		_ = o.st.SetState(ctx, sb.ID, types.StateDead)
+	}
+	// Idle prestarted units have no sandbox row. They cannot be adopted by a new
+	// pool instance because their old WaitAssignment request belonged to the
+	// previous config-socket, so stop/reset any such orphan before refilling.
+	for _, u := range units {
+		runID := o.unitToRunID(u.Name)
+		if runID == "" || knownRuns[runID] {
+			continue
+		}
+		o.log.Info("reconcile: orphan runner", "run_id", runID, "unit", u.Name)
+		_ = o.lc.Stop(ctx, u.Name)
+		_ = o.lc.ResetFailed(ctx, u.Name)
 	}
 	return nil
 }
