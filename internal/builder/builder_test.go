@@ -82,6 +82,19 @@ func TestUploadImageReusesBaseImageKey(t *testing.T) {
 	}
 }
 
+func TestBuildJournalIdentityFields(t *testing.T) {
+	b := newBuildJournal("br-test", "build-test")
+	if got := b.fields["SYSLOG_IDENTIFIER"]; got != buildTag {
+		t.Fatalf("SYSLOG_IDENTIFIER = %q, want %q", got, buildTag)
+	}
+	if got := b.fields["KUASAR_RUN_ID"]; got != "br-test" {
+		t.Fatalf("KUASAR_RUN_ID = %q", got)
+	}
+	if got := b.fields["KUASAR_BUILD_ID"]; got != "build-test" {
+		t.Fatalf("KUASAR_BUILD_ID = %q", got)
+	}
+}
+
 func TestNetworkDocTapFDSocket(t *testing.T) {
 	p := &buildPipeline{spec: &configsock.BuildSpec{
 		Net: configsock.BuildNet{

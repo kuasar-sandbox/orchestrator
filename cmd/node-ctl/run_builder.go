@@ -60,20 +60,15 @@ func runBuilder(args []string, log *slog.Logger) error {
 	envDefault(pidfile, "TASK_PIDFILE")
 	envDefault(socket, "TASK_CONFIG_SOCKET")
 	envDefault(runID, "TASK_RUN_ID")
-	if *socket == "" || *runID == "" {
-		return fmt.Errorf("run-builder: --config-socket and --run-id required")
+	if *pidfile == "" || *socket == "" || *runID == "" {
+		return fmt.Errorf("run-builder: --pidfile, --config-socket, and --run-id required")
 	}
-	if *pidfile != "" {
-		if err := lockPidfile(*pidfile); err != nil {
-			return err
-		}
+	if err := lockPidfile(*pidfile); err != nil {
+		return err
 	}
 	bid, err := configsock.WaitAssignment(context.Background(), *socket, "build", *runID)
 	if err != nil {
 		return fmt.Errorf("wait assignment: %w", err)
-	}
-	if *pidfile == "" {
-		return fmt.Errorf("run-builder: --pidfile required for build assignment")
 	}
 	runRoot := filepath.Dir(filepath.Dir(*pidfile))
 	if err := lockPidfile(filepath.Join(runRoot, bid, bid+".pid")); err != nil {

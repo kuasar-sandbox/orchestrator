@@ -658,8 +658,12 @@ func (c *Config) validate() error {
 	if c.Units.BuilderPoolSize < 0 {
 		return fmt.Errorf("config: units.builder_pool_size must be >= 0")
 	}
-	if _, err := time.ParseDuration(c.Units.PoolWaitTimeout); err != nil {
+	poolWait, err := time.ParseDuration(c.Units.PoolWaitTimeout)
+	if err != nil {
 		return fmt.Errorf("config: units.pool_wait_timeout %q: %w", c.Units.PoolWaitTimeout, err)
+	}
+	if poolWait <= 0 {
+		return fmt.Errorf("config: units.pool_wait_timeout must be > 0")
 	}
 	switch c.Checkpoint.Mode {
 	case CheckpointLocal, CheckpointRemote:

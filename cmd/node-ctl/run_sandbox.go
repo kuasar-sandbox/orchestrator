@@ -24,20 +24,15 @@ func runSandbox(args []string, _ *slog.Logger) error {
 	envDefault(pidfile, "TASK_PIDFILE")
 	envDefault(socket, "TASK_CONFIG_SOCKET")
 	envDefault(runID, "TASK_RUN_ID")
-	if *socket == "" || *runID == "" {
-		return fmt.Errorf("run-sandbox: --config-socket and --run-id required")
+	if *pidfile == "" || *socket == "" || *runID == "" {
+		return fmt.Errorf("run-sandbox: --pidfile, --config-socket, and --run-id required")
 	}
-	if *pidfile != "" {
-		if err := lockPidfile(*pidfile); err != nil {
-			return err
-		}
+	if err := lockPidfile(*pidfile); err != nil {
+		return err
 	}
 	sid, err := configsock.WaitAssignment(context.Background(), *socket, "sandbox", *runID)
 	if err != nil {
 		return fmt.Errorf("wait assignment: %w", err)
-	}
-	if *pidfile == "" {
-		return fmt.Errorf("run-sandbox: --pidfile required for sandbox assignment")
 	}
 	runRoot := filepath.Dir(filepath.Dir(*pidfile))
 	return launchTask(*socket, "sandbox:"+sid, filepath.Join(runRoot, sid, sid+".pid"))

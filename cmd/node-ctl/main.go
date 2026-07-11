@@ -237,17 +237,27 @@ func runConductor(args []string, log *slog.Logger) error {
 		PluginPidfile: cfg.Paths.PluginPidfile,
 	}, log)
 	configReady := make(chan struct{})
+	configDone := make(chan error, 1)
 	go func() {
-		if err := cs.ServeReady(ctx, configReady); err != nil {
+		err := cs.ServeReady(ctx, configReady)
+		if err != nil {
 			log.Error("config-socket", "err", err)
 		}
+		configDone <- err
 	}()
 	select {
 	case <-configReady:
+	case err := <-configDone:
+		if err == nil {
+			return fmt.Errorf("config-socket stopped before becoming ready")
+		}
+		return err
 	case <-ctx.Done():
 		return ctx.Err()
 	}
-	core.StartRunPools(ctx)
+	if err := core.StartRunPools(ctx); err != nil {
+		return err
+	}
 	go core.BuildPool(ctx, 2*time.Second)
 
 	// Data-plane handler depends on proxy_mode: in-process proxy (internal),

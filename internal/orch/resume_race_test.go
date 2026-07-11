@@ -32,7 +32,9 @@ func (l *countingLauncher) Start(ctx context.Context, unit string) error {
 		prefix := strings.TrimSuffix(l.orch.cfg.Units.Runner, ".service")
 		if strings.HasPrefix(unit, prefix) {
 			runID := l.orch.unitToRunID(unit)
-			go func() { _, _, _ = l.orch.WaitAssignment(ctx, runKindSandbox, runID) }()
+			// The systemd StartUnit call context only bounds the D-Bus job. The
+			// launched process has its own lifetime and keeps waiting afterward.
+			go func() { _, _, _ = l.orch.WaitAssignment(context.Background(), runKindSandbox, runID) }()
 		}
 	}
 	return nil
@@ -85,7 +87,9 @@ func TestResumeRace_ConnectAndRouteSingleLaunch(t *testing.T) {
 	lc.orch = o
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	o.StartRunPools(ctx)
+	if err := o.StartRunPools(ctx); err != nil {
+		t.Fatal(err)
+	}
 
 	// bare-img with no snapshot ref → launch reaches lc.Start without the e2b
 	// readiness wait or the snapshot-probe exec (RestoreRefFor returns "").

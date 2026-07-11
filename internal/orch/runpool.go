@@ -72,8 +72,8 @@ func newRunPool(kind string, size int, waitTimeout time.Duration, runRoot string
 		kind: kind, size: size, waitTimeout: waitTimeout, runRoot: runRoot, lc: lc, unitName: unitName, log: log,
 		consumeCh:   make(chan *runConsumeReq),
 		waitCh:      make(chan *runWaitReq),
-		startDoneCh: make(chan runStartDone, 64),
-		controlCh:   make(chan runControlReq, 64),
+		startDoneCh: make(chan runStartDone),
+		controlCh:   make(chan runControlReq),
 	}
 }
 
@@ -81,9 +81,13 @@ func (p *runPool) runPidFile(runID string) string {
 	return filepath.Join(p.runRoot, "runs", runID+".pid")
 }
 
-func (p *runPool) Start(ctx context.Context) {
+func (p *runPool) Start(ctx context.Context) error {
+	if err := os.MkdirAll(filepath.Join(p.runRoot, "runs"), 0o700); err != nil {
+		return fmt.Errorf("run pool: create pidfile directory: %w", err)
+	}
 	go p.controlLoop(ctx)
 	go p.loop(ctx)
+	return nil
 }
 
 func (p *runPool) Assign(ctx context.Context, taskID string, commit func(runID string) error) (string, error) {
@@ -123,8 +127,16 @@ func (p *runPool) loop(ctx context.Context) {
 	starting := map[string]startingRun{}
 	var idle []idleRun
 	var pending []*runConsumeReq
+	var startControls, stopControls []runControlReq
 	tick := time.NewTicker(200 * time.Millisecond)
 	defer tick.Stop()
+	queueControl := func(req runControlReq) {
+		if req.op == "stop" {
+			stopControls = append(stopControls, req)
+			return
+		}
+		startControls = append(startControls, req)
+	}
 
 	ensure := func() {
 		need := p.size + len(pending) - len(idle) - len(starting)
@@ -135,7 +147,7 @@ func (p *runPool) loop(ctx context.Context) {
 				return
 			}
 			starting[runID] = startingRun{}
-			p.controlCh <- runControlReq{op: "start", runID: runID}
+			queueControl(runControlReq{op: "start", runID: runID})
 		}
 	}
 
@@ -147,10 +159,14 @@ func (p *runPool) loop(ctx context.Context) {
 			}
 			delete(starting, runID)
 			p.log.Warn("run pool: wait assignment timeout", "kind", p.kind, "run_id", runID)
-			p.controlCh <- runControlReq{op: "stop", runID: runID}
+			queueControl(runControlReq{op: "stop", runID: runID})
 		}
 		idle = slices.DeleteFunc(idle, func(w idleRun) bool {
-			return w.ctx.Err() != nil
+			if w.ctx.Err() == nil {
+				return false
+			}
+			queueControl(runControlReq{op: "stop", runID: w.runID})
+			return true
 		})
 		pending = slices.DeleteFunc(pending, func(req *runConsumeReq) bool {
 			if req.ctx.Err() == nil {
@@ -166,6 +182,7 @@ func (p *runPool) loop(ctx context.Context) {
 			w := idle[0]
 			idle = idle[1:]
 			if w.ctx.Err() != nil {
+				queueControl(runControlReq{op: "stop", runID: w.runID})
 				continue
 			}
 			var req *runConsumeReq
@@ -197,12 +214,27 @@ func (p *runPool) loop(ctx context.Context) {
 			w := idle[len(idle)-1]
 			idle = idle[:len(idle)-1]
 			w.resp <- runWaitResp{err: fmt.Errorf("run pool: idle capacity retired")}
-			p.controlCh <- runControlReq{op: "stop", runID: w.runID}
+			queueControl(runControlReq{op: "stop", runID: w.runID})
 		}
 	}
 
 	ensure()
 	for {
+		for len(startControls) > 0 {
+			if _, ok := starting[startControls[0].runID]; ok {
+				break
+			}
+			startControls = startControls[1:]
+		}
+		var controlOut chan runControlReq
+		var control runControlReq
+		controlIsStop := false
+		switch {
+		case len(stopControls) > 0:
+			controlOut, control, controlIsStop = p.controlCh, stopControls[0], true
+		case len(startControls) > 0:
+			controlOut, control = p.controlCh, startControls[0]
+		}
 		select {
 		case <-ctx.Done():
 			for _, w := range idle {
@@ -211,10 +243,17 @@ func (p *runPool) loop(ctx context.Context) {
 			for _, req := range pending {
 				req.resp <- runConsumeResp{err: ctx.Err()}
 			}
-			for runID := range starting {
-				p.controlCh <- runControlReq{op: "stop", runID: runID}
-			}
 			return
+		case controlOut <- control:
+			if controlIsStop {
+				stopControls = stopControls[1:]
+				continue
+			}
+			startControls = startControls[1:]
+			if st, ok := starting[control.runID]; ok && st.started.IsZero() {
+				st.started = time.Now()
+				starting[control.runID] = st
+			}
 		case req := <-p.consumeCh:
 			if req.ctx.Err() != nil {
 				req.resp <- runConsumeResp{err: req.ctx.Err()}
@@ -225,13 +264,22 @@ func (p *runPool) loop(ctx context.Context) {
 			trimIdle()
 			ensure()
 		case req := <-p.waitCh:
-			if _, ok := starting[req.runID]; !ok {
+			st, ok := starting[req.runID]
+			if !ok {
 				req.resp <- runWaitResp{ok: false, err: fmt.Errorf("run %s is not starting", req.runID)}
+				continue
+			}
+			if !st.started.IsZero() && time.Since(st.started) > p.waitTimeout {
+				delete(starting, req.runID)
+				req.resp <- runWaitResp{err: fmt.Errorf("run %s exceeded wait timeout", req.runID)}
+				queueControl(runControlReq{op: "stop", runID: req.runID})
+				ensure()
 				continue
 			}
 			delete(starting, req.runID)
 			if req.ctx.Err() != nil {
 				req.resp <- runWaitResp{err: req.ctx.Err()}
+				queueControl(runControlReq{op: "stop", runID: req.runID})
 				ensure()
 				continue
 			}
@@ -240,12 +288,18 @@ func (p *runPool) loop(ctx context.Context) {
 			trimIdle()
 			ensure()
 		case done := <-p.startDoneCh:
+			st, ok := starting[done.runID]
+			if !ok {
+				continue
+			}
 			if done.err != nil {
 				delete(starting, done.runID)
 				p.log.Warn("run pool: start failed", "kind", p.kind, "run_id", done.runID, "err", done.err)
-				ensure()
-			} else if st, ok := starting[done.runID]; ok {
-				st.started = time.Now()
+				queueControl(runControlReq{op: "stop", runID: done.runID})
+			} else {
+				if st.started.IsZero() {
+					st.started = time.Now()
+				}
 				starting[done.runID] = st
 			}
 		case <-tick.C:
@@ -258,7 +312,6 @@ func (p *runPool) loop(ctx context.Context) {
 }
 
 func (p *runPool) controlLoop(ctx context.Context) {
-	_ = os.MkdirAll(filepath.Join(p.runRoot, "runs"), 0o700)
 	for {
 		select {
 		case <-ctx.Done():
@@ -267,8 +320,14 @@ func (p *runPool) controlLoop(ctx context.Context) {
 			unit := p.unitName(req.runID)
 			switch req.op {
 			case "start":
-				err := p.lc.Start(ctx, unit)
-				p.startDoneCh <- runStartDone{runID: req.runID, err: err}
+				startCtx, cancel := context.WithTimeout(ctx, p.waitTimeout)
+				err := p.lc.Start(startCtx, unit)
+				cancel()
+				select {
+				case p.startDoneCh <- runStartDone{runID: req.runID, err: err}:
+				case <-ctx.Done():
+					return
+				}
 			case "stop":
 				_ = p.lc.Stop(context.Background(), unit)
 				_ = p.lc.ResetFailed(context.Background(), unit)

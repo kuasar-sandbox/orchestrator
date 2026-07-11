@@ -121,10 +121,12 @@ done
 for u in sandbox-runner@.service sandbox-builder@.service sandbox-runner.slice sandbox-builder.slice; do
     [ -f "$UNIT_DIR/$u" ] || fail "unit $u was not generated into $UNIT_DIR"
 done
-grep -q "run-sandbox .*--sandbox-id=" "$UNIT_DIR/sandbox-runner@.service" || fail "runner unit ExecStart is not run-sandbox"
-grep -q "run-builder .*--build-id="   "$UNIT_DIR/sandbox-builder@.service" || fail "builder unit ExecStart is not run-builder"
-grep -q "StandardOutput=file:"            "$UNIT_DIR/sandbox-builder@.service" || fail "builder unit missing StandardOutput=file (build-result capture)"
-echo "==> PASS: unit auto-install (runner+builder+slices; run-sandbox/run-builder launchers + build-result capture)"
+grep -q "run-sandbox .*--run-id=%i" "$UNIT_DIR/sandbox-runner@.service" || fail "runner unit ExecStart is not run-id based"
+grep -q "run-builder .*--run-id=%i" "$UNIT_DIR/sandbox-builder@.service" || fail "builder unit ExecStart is not run-id based"
+grep -q "ExecStopPost=/bin/rm -f .*runs/%i.pid" "$UNIT_DIR/sandbox-runner@.service" || fail "runner unit does not clean its run pidfile"
+grep -q "ExecStopPost=/bin/rm -f .*runs/%i.pid" "$UNIT_DIR/sandbox-builder@.service" || fail "builder unit does not clean its run pidfile"
+grep -q "StandardOutput=file:" "$UNIT_DIR/sandbox-builder@.service" && fail "builder unit still uses obsolete result-file capture"
+echo "==> PASS: unit auto-install (runner+builder+slices; run-id assignment + config-socket build result)"
 
 # ---- 2. control plane: health + auth --------------------------------------
 code=$(req GET /health "")

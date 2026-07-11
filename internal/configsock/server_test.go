@@ -14,7 +14,7 @@ import (
 	"time"
 )
 
-// --- stubs for the three planes ---
+// --- plane stubs ---
 
 type stubProvider struct{ pidFile string }
 
@@ -158,6 +158,31 @@ func TestTaskPlane(t *testing.T) {
 	mustWrite(t, pf, strconv.Itoa(os.Getpid()+1)) // pidfile no longer matches peer
 	if _, err := FetchLaunchSpec(sock, "sandbox:x"); err == nil || err.Error() != "not authorized" {
 		t.Fatalf("wrong pid should be not authorized, got %v", err)
+	}
+}
+
+func TestRunPlane(t *testing.T) {
+	pf := filepath.Join(t.TempDir(), "run.pid")
+	mustWrite(t, pf, strconv.Itoa(os.Getpid()))
+	sock, _ := startTestServer(t, Deps{Provider: stubProvider{pidFile: pf}})
+
+	taskID, err := WaitAssignment(context.Background(), sock, "sandbox", "sr-test")
+	if err != nil || taskID != "x" {
+		t.Fatalf("WaitAssignment = %q, %v; want x, nil", taskID, err)
+	}
+	if err := PostBuildResult(sock, "br-test", "x", BuildResult{ImageKey: "image"}); err != nil {
+		t.Fatalf("PostBuildResult: %v", err)
+	}
+	if _, err := WaitAssignment(context.Background(), sock, "sandbox", "sr-missing"); err == nil {
+		t.Fatal("unknown run should fail assignment")
+	}
+
+	mustWrite(t, pf, strconv.Itoa(os.Getpid()+1))
+	if _, err := WaitAssignment(context.Background(), sock, "sandbox", "sr-test"); err == nil || err.Error() != "not authorized" {
+		t.Fatalf("wrong pid assignment error = %v, want not authorized", err)
+	}
+	if err := PostBuildResult(sock, "br-test", "x", BuildResult{}); err == nil || err.Error() != "not authorized" {
+		t.Fatalf("wrong pid build-result error = %v, want not authorized", err)
 	}
 }
 

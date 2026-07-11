@@ -69,6 +69,29 @@ sandbox:
 	}
 }
 
+func TestLoadRejectsNonPositivePoolWaitTimeout(t *testing.T) {
+	t.Setenv("NODE_CONFIG_ENCRYPTION_KEY", "")
+	for _, value := range []string{"0s", "-1s"} {
+		t.Run(value, func(t *testing.T) {
+			path := writeConfig(t, `
+api:
+  domain: example.test
+encryption_key: test-key
+units:
+  pool_wait_timeout: `+value+`
+sandbox:
+  boot:
+    kernel: /opt/sandbox/vmlinux
+    runtime: /opt/sandbox/sandbox-runtime.erofs
+`)
+			_, err := Load(path)
+			if err == nil || !strings.Contains(err.Error(), "units.pool_wait_timeout") {
+				t.Fatalf("Load error = %v, want units.pool_wait_timeout validation", err)
+			}
+		})
+	}
+}
+
 func TestLoadSandboxRestoreFileRefsDefaults(t *testing.T) {
 	t.Setenv("NODE_CONFIG_ENCRYPTION_KEY", "")
 	path := writeConfig(t, `
