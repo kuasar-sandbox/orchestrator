@@ -102,21 +102,6 @@ free_port() { python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0)
 py() { HOME="$WORK/home" E2B_DOMAIN="$DOMAIN" E2B_API_KEY="$AK" E2B_ACCESS_TOKEN="sk_demo" \
        SSL_CERT_FILE="$WORK/tls.crt" REQUESTS_CA_BUNDLE="$WORK/tls.crt" NO_PROXY='*' python3 - "$@"; }
 
-wait_cache_fills() {
-    local why="$1" ep="${CACHE_HEALTH_SOCK:-}"
-    if [ -z "$ep" ] && [ -n "${CACHE_SOCK:-}" ]; then
-        case "$CACHE_SOCK" in
-            *.sock) ep="${CACHE_SOCK%.sock}-health.sock" ;;
-            *) ep="${CACHE_SOCK}-health" ;;
-        esac
-    fi
-    [ -n "$ep" ] || return 0
-    [ -S "$ep" ] || return 0
-    say "cache tiered fill/writeback drain after $why"
-    "$BIN/cache-ctl" wait-fills --endpoint "unix://$ep" --timeout "${DEMO_CACHE_WAIT_TIMEOUT:-60s}" >/dev/null \
-        || die "cache fills did not drain after $why"
-}
-
 # ===========================================================================
 banner "Per-run node stack (orchestrator + eBPF switch; storage tier already up)"
 # ---------------------------------------------------------------------------
@@ -306,7 +291,6 @@ PY
 )" || die "template build failed (see $WORK/orch.log)"
 [ -n "$TEMPLATE" ] || die "no template id from build"
 ok "snapshot template built → $TEMPLATE  (start command frozen under envd)"
-wait_cache_fills "template build upload"
 pause
 
 # ===========================================================================
@@ -409,7 +393,6 @@ echo "${c_cmd}  \$ node-ctl export-sandbox $SID --to-template --keep-source${c_o
 FORK_TMPL="$(E2B_API_KEY="$AK" "$BIN/node-ctl" export-sandbox "$SID" --to-template --keep-source --socket "$WORK/node-ctl.socket")" \
   || die "export-sandbox --to-template failed"
 ok "paused state → template $FORK_TMPL"
-wait_cache_fills "export-sandbox --to-template"
 say "create a NEW sandbox from that template — it carries the forked state:"
 CHILD="$(py <<PY
 from e2b import Sandbox
@@ -435,7 +418,6 @@ banner "一步迁移 (export move → connect with X-Kuasar-Migration-Token = im
 say "export (move) mints a one-line token and relinquishes the source row; connect with the token re-imports + resumes in ONE SDK call."
 echo "${c_cmd}  \$ TOKEN=\$(node-ctl export-sandbox $SID)${c_off}"
 MIG_TOKEN="$(E2B_API_KEY="$AK" "$BIN/node-ctl" export-sandbox "$SID" --socket "$WORK/node-ctl.socket")" || die "export-sandbox (move) failed"
-wait_cache_fills "export-sandbox move"
 say "source row now gone; resume on (logically) another node with the token in api_headers:"
 py <<PY || die "connect-with-migration-token failed"
 from e2b import Sandbox
