@@ -321,7 +321,7 @@ if [ "$code" != "201" ]; then
     echo "create=$code body:"; cat "$WORK/resp.body"; echo
     echo "==> orchestrator log:"; sed 's/^/  orch| /' "$WORK/orch.log"
     SID=$(ls "$WORK/run" 2>/dev/null | head -1)
-    [ -n "$SID" ] && { echo "==> runner unit journal:"; journalctl -u "sandbox-runner@$SID.service" --no-pager -n 60 2>/dev/null | sed 's/^/  unit| /'; }
+    [ -n "$SID" ] && { echo "==> sandbox journal:"; journalctl KUASAR_SANDBOX_ID="$SID" --no-pager -n 60 2>/dev/null | sed 's/^/  sandbox| /'; }
     fail "create=$code (want 201) — VM boot/envd readiness failed"
 fi
 SID=$(grep -o '"sandboxID":"[^"]*"' "$WORK/resp.body" | head -1 | cut -d'"' -f4)
@@ -422,7 +422,7 @@ if [ "$code" = "204" ]; then
 else
     echo "==> NOTE: pause=$code — snapshot error (diagnostic):"
     grep -iE 'snapshot|pause|api error' "$WORK/orch.log" | tail -10 | sed 's/^/  orch| /'
-    SID_JOURNAL=$(journalctl -u "sandbox-runner@$SID.service" --no-pager -n 30 2>/dev/null | grep -iE 'snapshot|ctl.sock|error' | tail -8)
+    SID_JOURNAL=$(journalctl KUASAR_SANDBOX_ID="$SID" --no-pager -n 30 2>/dev/null | grep -iE 'snapshot|ctl.sock|error' | tail -8)
     [ -n "$SID_JOURNAL" ] && echo "$SID_JOURNAL" | sed 's/^/  unit| /'
     PAUSE_FAILED=1
 fi

@@ -351,7 +351,7 @@ code=$(req POST /sandboxes "$AK" "{\"templateID\":\"$TEMPLATE\",\"timeout\":120}
 if [ "$code" != "201" ]; then
     echo "create=$code body:"; cat "$WORK/resp.body"; echo; dump_logs
     SID=$(ls "$WORK/run" 2>/dev/null | grep -v proxy | head -1)
-    [ -n "$SID" ] && { echo "==> runner journal:"; journalctl -u "sandbox-runner@$SID.service" --no-pager -n 60 2>/dev/null | sed 's/^/  unit| /'; }
+    [ -n "$SID" ] && { echo "==> sandbox journal:"; journalctl KUASAR_SANDBOX_ID="$SID" --no-pager -n 60 2>/dev/null | sed 's/^/  sandbox| /'; }
     fail "create=$code (want 201)"
 fi
 SID=$(grep -o '"sandboxID":"[^"]*"' "$WORK/resp.body" | head -1 | cut -d'"' -f4)
