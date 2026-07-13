@@ -35,6 +35,13 @@ var defaultBuildResources = &routesync.BuildResources{CPU: 1000, Mem: 1 << 30}
 
 const buildRegisterAckTimeout = 5 * time.Second
 
+const (
+	terminalBuildStoreAttempts   = 5
+	terminalBuildStoreRetryDelay = 20 * time.Millisecond
+)
+
+var errNodeBuildIDConflict = errors.New("registry: build id is already owned by another group on this node")
+
 // ReserveBuild places a build on a resource-eligible node and pre-provisions it
 // (cluster.md): the registry assigns the build/template ids, resource-aware
 // PlaceBuild picks a node, the BuildStore commit RESERVES that node's build pool
@@ -45,6 +52,11 @@ func (r *Registry) ReserveBuild(ctx context.Context, req BuildReserveReq) (*Buil
 	if req.Group == "" {
 		return nil, fmt.Errorf("registry: group is required")
 	}
+	metadata, err := clusterstate.WithObjectLocation(req.Metadata, clusterstate.ObjectLocation{Group: req.Group})
+	if err != nil {
+		return nil, err
+	}
+	req.Metadata = metadata
 	resources := req.Resources
 	if resources == nil {
 		resources = defaultBuildResources
@@ -52,6 +64,10 @@ func (r *Registry) ReserveBuild(ctx context.Context, req BuildReserveReq) (*Buil
 	buildID := req.BuildID
 	if buildID == "" {
 		buildID = "bld-" + newID()
+	}
+	ref, err := clusterstate.NodeBuildRefFromMetadata(buildID, metadata)
+	if err != nil {
+		return nil, err
 	}
 	templateID := req.TemplateID
 	if templateID == "" {
@@ -101,26 +117,35 @@ func (r *Registry) ReserveBuild(ctx context.Context, req BuildReserveReq) (*Buil
 			excluded.add(id)
 			continue
 		}
-		if !r.admitBuild(ctx, id, buildID, resources) {
+		if !r.admitBuild(ctx, id, req.Group, buildID, resources) {
 			excluded.add(id)
 			continue
 		}
 		// Commit the group build record after node-owner admission succeeds.
 		rec := &BuildRecord{Group: req.Group, BuildID: buildID, NodeID: id, Resources: resources, State: BuildRegistered, TemplateID: templateID}
 		if err := r.stores.PutBuild(ctx, rec); err != nil {
-			r.releaseBuildAdmission(buildID)
+			r.releaseBuildAdmission(id, req.Group, buildID)
 			return nil, err
 		}
-		_ = r.stores.AddNodeBuildRef(ctx, id, clusterstate.NodeBuildRef{Group: req.Group, BuildID: buildID})
+		if err := r.stores.AddNodeBuildRef(ctx, id, ref); err != nil {
+			_ = r.stores.DeleteBuild(ctx, req.Group, buildID)
+			r.releaseBuildAdmission(id, req.Group, buildID)
+			if errors.Is(err, errNodeBuildIDConflict) {
+				lastFailure = err
+				excluded.add(id)
+				continue
+			}
+			return nil, err
+		}
 		cmd := &routesync.Command{
-			CmdID: newID(), Kind: routesync.CmdBuildRegister, Group: req.Group,
+			CmdID: newID(), Kind: routesync.CmdBuildRegister,
 			BuildID: buildID, TemplateRef: templateID, BuildResources: resources, Config: req.Metadata,
 			KeyFingerprint: placement.KeyFingerprint, ImageRepo: placement.ImageRepo, RegistryAuth: placement.RegistryAuth,
 		}
 		if r.nodeOwner == nil {
 			_ = r.stores.DeleteBuild(ctx, req.Group, buildID)
-			_ = r.stores.RemoveNodeBuildRef(ctx, id, req.Group, buildID)
-			r.releaseBuildAdmission(buildID)
+			_ = r.stores.RemoveNodeBuildRef(ctx, id, buildID)
+			r.releaseBuildAdmission(id, req.Group, buildID)
 			lastFailure = ErrNodeGone
 			excluded.add(id)
 			continue
@@ -134,16 +159,16 @@ func (r *Registry) ReserveBuild(ctx context.Context, req BuildReserveReq) (*Buil
 				return r.buildReserveResult(ctx, rec), nil
 			}
 			_ = r.stores.DeleteBuild(ctx, req.Group, buildID) // command definitively did not reach the node
-			_ = r.stores.RemoveNodeBuildRef(ctx, id, req.Group, buildID)
-			r.releaseBuildAdmission(buildID)
+			_ = r.stores.RemoveNodeBuildRef(ctx, id, buildID)
+			r.releaseBuildAdmission(id, req.Group, buildID)
 			lastFailure = err
 			excluded.add(id)
 			continue
 		}
 		if ack == nil || ack.Status != routesync.AckAccepted {
 			_ = r.stores.DeleteBuild(ctx, req.Group, buildID) // roll back the reservation
-			_ = r.stores.RemoveNodeBuildRef(ctx, id, req.Group, buildID)
-			r.releaseBuildAdmission(buildID)
+			_ = r.stores.RemoveNodeBuildRef(ctx, id, buildID)
+			r.releaseBuildAdmission(id, req.Group, buildID)
 			reason := ""
 			if ack != nil {
 				reason = ack.Reason
@@ -168,27 +193,33 @@ func (r *Registry) buildReserveResult(ctx context.Context, rec *BuildRecord) *Bu
 	}
 }
 
-func (r *Registry) admitBuild(ctx context.Context, nodeID, buildID string, want *routesync.BuildResources) bool {
+func (r *Registry) admitBuild(ctx context.Context, nodeID, group, buildID string, want *routesync.BuildResources) bool {
 	if r.nodeOwner == nil {
 		return false
 	}
-	return r.nodeOwner.AdmitBuild(ctx, nodeID, buildID, want)
+	return r.nodeOwner.AdmitBuild(ctx, nodeID, buildAdmissionID(group, buildID), want)
 }
 
-func (r *Registry) releaseBuildAdmission(buildID string) {
+func (r *Registry) releaseBuildAdmission(nodeID, group, buildID string) {
 	if r.nodeOwner != nil {
-		r.nodeOwner.ReleaseBuild(context.Background(), buildID)
+		r.nodeOwner.ReleaseBuild(context.Background(), nodeID, buildAdmissionID(group, buildID))
 	}
 }
+
+func buildAdmissionID(group, buildID string) string { return group + "\x00" + buildID }
 
 // applyBuildEvent converges a build's state from a node's build event (§5.1): it
 // updates the BuildStore (releasing the reservation on a terminal state, since the
 // headroom sum counts only registered/building builds).
 func (r *Registry) applyBuildEvent(ctx context.Context, nodeID string, e *routesync.BuildEvent) {
-	if e.Group == "" || e.BuildID == "" {
+	if e == nil || e.BuildID == "" {
 		return
 	}
-	rec, found, err := r.stores.GetBuildInGroup(ctx, e.Group, e.BuildID)
+	ref, found, err := r.lookupNodeBuildRef(ctx, nodeID, e.BuildID)
+	if err != nil || !found {
+		return
+	}
+	rec, found, err := r.stores.GetBuildInGroup(ctx, ref.Group, e.BuildID)
 	if err != nil || !found {
 		return
 	}
@@ -200,11 +231,70 @@ func (r *Registry) applyBuildEvent(ctx context.Context, nodeID string, e *routes
 		rec.TemplateID = e.TemplateID
 	}
 	rec.Reason = e.Reason
-	_ = r.stores.PutBuild(ctx, rec)
-	if !rec.occupies() {
-		r.releaseBuildAdmission(rec.BuildID)
-		_ = r.stores.RemoveNodeBuildRef(ctx, rec.NodeID, rec.Group, rec.BuildID)
+	terminal := !rec.occupies()
+	if terminal {
+		// Build events are transition-only. Free the volatile capacity lease even
+		// when route_link persistence is temporarily unavailable.
+		r.releaseBuildAdmission(rec.NodeID, rec.Group, rec.BuildID)
 	}
+	put := func(writeCtx context.Context) error { return r.stores.PutBuild(writeCtx, rec) }
+	var writeErr error
+	if terminal {
+		writeErr = retryTerminalBuildStore(ctx, put)
+	} else {
+		writeErr = put(ctx)
+	}
+	if writeErr != nil {
+		r.log.Warn("registry: persist build event", "node", nodeID, "build", rec.BuildID, "state", rec.State, "err", writeErr)
+		return
+	}
+	if terminal {
+		if err := retryTerminalBuildStore(ctx, func(writeCtx context.Context) error {
+			return r.stores.RemoveNodeBuildRef(writeCtx, rec.NodeID, rec.BuildID)
+		}); err != nil {
+			r.log.Warn("registry: remove terminal build ownership", "node", nodeID, "build", rec.BuildID, "err", err)
+		}
+	}
+}
+
+func retryTerminalBuildStore(ctx context.Context, operation func(context.Context) error) error {
+	retryCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), lifecycleAckTimeout)
+	defer cancel()
+	var lastErr error
+	for attempt := 0; attempt < terminalBuildStoreAttempts; attempt++ {
+		if lastErr = operation(retryCtx); lastErr == nil {
+			return nil
+		}
+		if attempt+1 == terminalBuildStoreAttempts {
+			break
+		}
+		timer := time.NewTimer(time.Duration(attempt+1) * terminalBuildStoreRetryDelay)
+		select {
+		case <-retryCtx.Done():
+			timer.Stop()
+			return retryCtx.Err()
+		case <-timer.C:
+		}
+	}
+	return lastErr
+}
+
+func (r *Registry) lookupNodeBuildRef(ctx context.Context, nodeID, buildID string) (clusterstate.NodeBuildRef, bool, error) {
+	var ref clusterstate.NodeBuildRef
+	var found bool
+	var err error
+	for attempt := 0; attempt < 5; attempt++ {
+		ref, found, err = r.stores.GetNodeBuildRef(ctx, nodeID, buildID)
+		if err == nil || !transientRouteRead(err) {
+			return ref, found, err
+		}
+		select {
+		case <-ctx.Done():
+			return clusterstate.NodeBuildRef{}, false, ctx.Err()
+		case <-time.After(time.Duration(attempt+1) * 10 * time.Millisecond):
+		}
+	}
+	return ref, found, err
 }
 
 // ResolveBuild maps a group's build_id to its node (router restart recovery: the

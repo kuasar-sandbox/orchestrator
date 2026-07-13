@@ -76,9 +76,9 @@ func usage() {
   node-stub-ctl nodes|events|data-hits|commands --admin http://HOST:PORT
   node-stub-ctl node {restart-link|reboot-empty|crash|start|drain|undrain} NODE --admin http://HOST:PORT
   node-stub-ctl sandbox list --admin http://HOST:PORT [--node NODE]
-  node-stub-ctl sandbox create --admin http://HOST:PORT --node NODE --group G --route-key R [--sid SID]
+  node-stub-ctl sandbox create --admin http://HOST:PORT --node NODE [--sid SID] [--metadata k=v ...]
   node-stub-ctl sandbox delete --admin http://HOST:PORT --node NODE --sid SID
-  node-stub-ctl sandbox orphan --admin http://HOST:PORT --node NODE --group G --route-key R --sid SID
+  node-stub-ctl sandbox orphan --admin http://HOST:PORT --node NODE --sid SID [--metadata k=v ...]
   node-stub-ctl build list --admin http://HOST:PORT [--node NODE]
   node-stub-ctl version`)
 	os.Exit(2)
@@ -385,11 +385,11 @@ func (s *service) serveRoutes(w http.ResponseWriter, r *http.Request, n *stubNod
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		if req.SID == "" || req.Group == "" || req.RouteKey == "" {
-			http.Error(w, "sid, group, and route_key are required", http.StatusBadRequest)
+		if req.SID == "" {
+			http.Error(w, "sid is required", http.StatusBadRequest)
 			return
 		}
-		n.publishRoute(routesync.RouteEntry{SandboxID: req.SID, Group: req.Group, RouteKey: req.RouteKey, State: routesync.StateRunning})
+		n.publishRoute(routesync.RouteEntry{SandboxID: req.SID, State: routesync.StateRunning})
 		s.logEvent(n.ID, "orphan_route", req)
 		s.writeJSON(w, map[string]any{"ok": true})
 		return
@@ -504,7 +504,7 @@ func (s *service) serveData(w http.ResponseWriter, r *http.Request) {
 	}
 	status, body := sb.response()
 	s.appendDataHit(dataHit{
-		NodeID: n.ID, SandboxID: sb.SID, Group: sb.Group, RouteKey: sb.RouteKey,
+		NodeID: n.ID, SandboxID: sb.SID, Metadata: cloneStringMap(sb.Metadata),
 		Host: r.Host, Path: r.URL.Path, Method: r.Method, AccessToken: r.Header.Get(headerAccessToken),
 	})
 	if status == 0 {
@@ -544,7 +544,7 @@ func (s *service) serveDataConnect(w http.ResponseWriter, r *http.Request, n *st
 		status = http.StatusNoContent
 	}
 	s.appendDataHit(dataHit{
-		NodeID: n.ID, SandboxID: sb.SID, Group: sb.Group, RouteKey: sb.RouteKey,
+		NodeID: n.ID, SandboxID: sb.SID, Metadata: cloneStringMap(sb.Metadata),
 		Host: inner.Host, Path: inner.URL.Path, Method: inner.Method, AccessToken: inner.Header.Get(headerAccessToken),
 	})
 	resp := &http.Response{
@@ -714,7 +714,7 @@ func (n *stubNode) rebootEmpty() {
 	n.mu.Lock()
 	var old []routesync.RouteEntry
 	for _, sb := range n.sandboxes {
-		old = append(old, routesync.RouteEntry{SandboxID: sb.SID, Group: sb.Group, RouteKey: sb.RouteKey, State: routesync.StateDead})
+		old = append(old, routesync.RouteEntry{SandboxID: sb.SID, State: routesync.StateDead})
 	}
 	n.sandboxes = map[string]*stubSandbox{}
 	n.builds = map[string]*stubBuild{}
@@ -824,8 +824,8 @@ func (n *stubNode) HandleCommand(ctx context.Context, cmd *routesync.Command) *r
 }
 
 func (n *stubNode) handleCreate(cmd *routesync.Command) *routesync.CmdAck {
-	if cmd.SID == "" || cmd.Group == "" || cmd.RouteKey == "" {
-		return ack(cmd, routesync.AckRejected, "sid, group, and route_key are required")
+	if cmd.SID == "" {
+		return ack(cmd, routesync.AckRejected, "sid is required")
 	}
 	if n.StrictKeys && cmd.KeyFingerprint != "" && !n.hasKey(cmd.KeyFingerprint) {
 		return ack(cmd, routesync.AckRejected, "manifest key not installed")
@@ -835,7 +835,7 @@ func (n *stubNode) handleCreate(cmd *routesync.Command) *routesync.CmdAck {
 		return ack(cmd, routesync.AckRejected, "stub create rejected")
 	}
 	sb := &stubSandbox{
-		SID: cmd.SID, Group: cmd.Group, RouteKey: cmd.RouteKey, State: "creating",
+		SID: cmd.SID, Metadata: cloneStringMap(cmd.Config), State: "creating",
 		TemplateID: cmd.TemplateRef, AccessToken: cmd.AccessToken,
 		TrafficAccessToken: "traffic-" + cmd.SID,
 		Behavior:           beh, CreatedAt: time.Now().UTC().Format(time.RFC3339Nano),
@@ -882,8 +882,8 @@ func (n *stubNode) handleConnect(cmd *routesync.Command) *routesync.CmdAck {
 }
 
 func (n *stubNode) handleBuildRegister(cmd *routesync.Command) *routesync.CmdAck {
-	if cmd.BuildID == "" || cmd.Group == "" {
-		return ack(cmd, routesync.AckRejected, "build_id and group are required")
+	if cmd.BuildID == "" {
+		return ack(cmd, routesync.AckRejected, "build_id is required")
 	}
 	if n.StrictKeys && cmd.KeyFingerprint != "" && !n.hasKey(cmd.KeyFingerprint) {
 		return ack(cmd, routesync.AckRejected, "manifest key not installed")
@@ -893,7 +893,7 @@ func (n *stubNode) handleBuildRegister(cmd *routesync.Command) *routesync.CmdAck
 		return ack(cmd, routesync.AckRejected, "stub build rejected")
 	}
 	b := &stubBuild{
-		BuildID: cmd.BuildID, Group: cmd.Group, State: "registered", TemplateID: cmd.TemplateRef,
+		BuildID: cmd.BuildID, Metadata: cloneStringMap(cmd.Config), State: "registered", TemplateID: cmd.TemplateRef,
 		Resources: cloneBuildResources(cmd.BuildResources), CreatedAt: time.Now().UTC().Format(time.RFC3339Nano), Behavior: beh,
 	}
 	n.mu.Lock()
@@ -974,7 +974,7 @@ func (n *stubNode) recordCommand(cmd *routesync.Command) {
 	n.cmdSeq++
 	log := commandLog{
 		Seq: n.cmdSeq, Time: time.Now().UTC().Format(time.RFC3339Nano), NodeID: n.ID,
-		CmdID: cmd.CmdID, Kind: cmd.Kind, SID: cmd.SID, Group: cmd.Group, RouteKey: cmd.RouteKey,
+		CmdID: cmd.CmdID, Kind: cmd.Kind, SID: cmd.SID, Metadata: cloneStringMap(cmd.Config),
 		BuildID: cmd.BuildID, KeyFingerprint: cmd.KeyFingerprint,
 	}
 	n.commands = append(n.commands, log)
@@ -983,9 +983,6 @@ func (n *stubNode) recordCommand(cmd *routesync.Command) {
 }
 
 func (n *stubNode) createAdminSandbox(req sandboxAdminRequest) (*sandboxSnapshot, error) {
-	if req.Group == "" || req.RouteKey == "" {
-		return nil, fmt.Errorf("group and route_key are required")
-	}
 	if req.SID == "" {
 		req.SID = "sb-admin-" + randHex(4)
 	}
@@ -995,7 +992,7 @@ func (n *stubNode) createAdminSandbox(req sandboxAdminRequest) (*sandboxSnapshot
 	}
 	beh := behaviorFromMap(req.Behavior, n.CreateDelay, n.BuildDelay)
 	sb := &stubSandbox{
-		SID: req.SID, Group: req.Group, RouteKey: req.RouteKey, State: state,
+		SID: req.SID, Metadata: cloneStringMap(req.Metadata), State: state,
 		TemplateID: req.TemplateID, AccessToken: req.AccessToken,
 		TrafficAccessToken: "traffic-" + req.SID,
 		Behavior:           beh, CreatedAt: time.Now().UTC().Format(time.RFC3339Nano),
@@ -1038,7 +1035,7 @@ func (n *stubNode) setBuildState(buildID, state, templateID, reason string, publ
 	if reason != "" {
 		b.Reason = reason
 	}
-	ev := &routesync.BuildEvent{Group: b.Group, BuildID: b.BuildID, State: b.State, TemplateID: b.TemplateID, Reason: b.Reason}
+	ev := &routesync.BuildEvent{BuildID: b.BuildID, State: b.State, TemplateID: b.TemplateID, Reason: b.Reason}
 	n.mu.Unlock()
 	if publish {
 		select {
@@ -1055,6 +1052,7 @@ func (n *stubNode) getSandbox(sid string) *stubSandbox {
 	defer n.mu.Unlock()
 	if sb := n.sandboxes[sid]; sb != nil {
 		cp := *sb
+		cp.Metadata = cloneStringMap(sb.Metadata)
 		return &cp
 	}
 	return nil
@@ -1065,6 +1063,7 @@ func (n *stubNode) getBuild(buildID string) *stubBuild {
 	defer n.mu.Unlock()
 	if b := n.builds[buildID]; b != nil {
 		cp := *b
+		cp.Metadata = cloneStringMap(b.Metadata)
 		cp.Resources = cloneBuildResources(b.Resources)
 		return &cp
 	}
@@ -1138,20 +1137,19 @@ func (n *stubNode) commandCountsLocked() map[string]int {
 }
 
 type stubSandbox struct {
-	SID                string       `json:"sid"`
-	Group              string       `json:"group"`
-	RouteKey           string       `json:"route_key"`
-	State              string       `json:"state"`
-	TemplateID         string       `json:"template_id,omitempty"`
-	AccessToken        string       `json:"access_token,omitempty"`
-	TrafficAccessToken string       `json:"traffic_access_token,omitempty"`
-	Behavior           stubBehavior `json:"behavior,omitempty"`
-	CreatedAt          string       `json:"created_at,omitempty"`
+	SID                string            `json:"sid"`
+	Metadata           map[string]string `json:"metadata,omitempty"`
+	State              string            `json:"state"`
+	TemplateID         string            `json:"template_id,omitempty"`
+	AccessToken        string            `json:"access_token,omitempty"`
+	TrafficAccessToken string            `json:"traffic_access_token,omitempty"`
+	Behavior           stubBehavior      `json:"behavior,omitempty"`
+	CreatedAt          string            `json:"created_at,omitempty"`
 }
 
 func (s *stubSandbox) routeEntry() routesync.RouteEntry {
 	return routesync.RouteEntry{
-		SandboxID: s.SID, Group: s.Group, RouteKey: s.RouteKey, State: s.State,
+		SandboxID: s.SID, State: s.State,
 		TemplateID: s.TemplateID, AccessToken: s.AccessToken,
 		TrafficAccessToken: s.TrafficAccessToken, Profile: "e2b",
 	}
@@ -1159,7 +1157,7 @@ func (s *stubSandbox) routeEntry() routesync.RouteEntry {
 
 func (s *stubSandbox) snapshot(nodeID string) sandboxSnapshot {
 	return sandboxSnapshot{
-		NodeID: nodeID, SID: s.SID, Group: s.Group, RouteKey: s.RouteKey, State: s.State,
+		NodeID: nodeID, SID: s.SID, Metadata: cloneStringMap(s.Metadata), State: s.State,
 		TemplateID: s.TemplateID, AccessToken: s.AccessToken, TrafficAccessToken: s.TrafficAccessToken,
 		Behavior: s.Behavior, CreatedAt: s.CreatedAt,
 	}
@@ -1175,7 +1173,7 @@ func (s *stubSandbox) response() (int, string) {
 
 type stubBuild struct {
 	BuildID    string                    `json:"build_id"`
-	Group      string                    `json:"group"`
+	Metadata   map[string]string         `json:"metadata,omitempty"`
 	State      string                    `json:"state"`
 	TemplateID string                    `json:"template_id,omitempty"`
 	Reason     string                    `json:"reason,omitempty"`
@@ -1186,7 +1184,7 @@ type stubBuild struct {
 
 func (b *stubBuild) snapshot(nodeID string) buildSnapshot {
 	return buildSnapshot{
-		NodeID: nodeID, BuildID: b.BuildID, Group: b.Group, State: b.State, TemplateID: b.TemplateID, Reason: b.Reason,
+		NodeID: nodeID, BuildID: b.BuildID, Metadata: cloneStringMap(b.Metadata), State: b.State, TemplateID: b.TemplateID, Reason: b.Reason,
 		Resources: cloneBuildResources(b.Resources), Behavior: b.Behavior, CreatedAt: b.CreatedAt,
 	}
 }
@@ -1259,29 +1257,27 @@ type eventLog struct {
 }
 
 type commandLog struct {
-	Seq            int64  `json:"seq"`
-	Time           string `json:"time"`
-	NodeID         string `json:"node_id"`
-	CmdID          string `json:"cmd_id"`
-	Kind           string `json:"kind"`
-	SID            string `json:"sid,omitempty"`
-	Group          string `json:"group,omitempty"`
-	RouteKey       string `json:"route_key,omitempty"`
-	BuildID        string `json:"build_id,omitempty"`
-	KeyFingerprint string `json:"key_fp,omitempty"`
+	Seq            int64             `json:"seq"`
+	Time           string            `json:"time"`
+	NodeID         string            `json:"node_id"`
+	CmdID          string            `json:"cmd_id"`
+	Kind           string            `json:"kind"`
+	SID            string            `json:"sid,omitempty"`
+	Metadata       map[string]string `json:"metadata,omitempty"`
+	BuildID        string            `json:"build_id,omitempty"`
+	KeyFingerprint string            `json:"key_fp,omitempty"`
 }
 
 type dataHit struct {
-	Seq         int64  `json:"seq"`
-	Time        string `json:"time"`
-	NodeID      string `json:"node_id"`
-	SandboxID   string `json:"sid"`
-	Group       string `json:"group"`
-	RouteKey    string `json:"route_key"`
-	Host        string `json:"host"`
-	Path        string `json:"path"`
-	Method      string `json:"method"`
-	AccessToken string `json:"access_token,omitempty"`
+	Seq         int64             `json:"seq"`
+	Time        string            `json:"time"`
+	NodeID      string            `json:"node_id"`
+	SandboxID   string            `json:"sid"`
+	Metadata    map[string]string `json:"metadata,omitempty"`
+	Host        string            `json:"host"`
+	Path        string            `json:"path"`
+	Method      string            `json:"method"`
+	AccessToken string            `json:"access_token,omitempty"`
 }
 
 type nodeSnapshot struct {
@@ -1302,22 +1298,21 @@ type nodeSnapshot struct {
 }
 
 type sandboxSnapshot struct {
-	NodeID             string       `json:"node_id,omitempty"`
-	SID                string       `json:"sid"`
-	Group              string       `json:"group"`
-	RouteKey           string       `json:"route_key"`
-	State              string       `json:"state"`
-	TemplateID         string       `json:"template_id,omitempty"`
-	AccessToken        string       `json:"access_token,omitempty"`
-	TrafficAccessToken string       `json:"traffic_access_token,omitempty"`
-	Behavior           stubBehavior `json:"behavior,omitempty"`
-	CreatedAt          string       `json:"created_at,omitempty"`
+	NodeID             string            `json:"node_id,omitempty"`
+	SID                string            `json:"sid"`
+	Metadata           map[string]string `json:"metadata,omitempty"`
+	State              string            `json:"state"`
+	TemplateID         string            `json:"template_id,omitempty"`
+	AccessToken        string            `json:"access_token,omitempty"`
+	TrafficAccessToken string            `json:"traffic_access_token,omitempty"`
+	Behavior           stubBehavior      `json:"behavior,omitempty"`
+	CreatedAt          string            `json:"created_at,omitempty"`
 }
 
 type buildSnapshot struct {
 	NodeID     string                    `json:"node_id,omitempty"`
 	BuildID    string                    `json:"build_id"`
-	Group      string                    `json:"group"`
+	Metadata   map[string]string         `json:"metadata,omitempty"`
 	State      string                    `json:"state"`
 	TemplateID string                    `json:"template_id,omitempty"`
 	Reason     string                    `json:"reason,omitempty"`
@@ -1328,8 +1323,7 @@ type buildSnapshot struct {
 
 type sandboxAdminRequest struct {
 	SID         string            `json:"sid"`
-	Group       string            `json:"group"`
-	RouteKey    string            `json:"route_key"`
+	Metadata    map[string]string `json:"metadata,omitempty"`
 	State       string            `json:"state,omitempty"`
 	TemplateID  string            `json:"template_id,omitempty"`
 	AccessToken string            `json:"access_token,omitempty"`
@@ -1453,11 +1447,15 @@ func runSandbox(args []string) error {
 	fs := flag.NewFlagSet("sandbox", flag.ExitOnError)
 	admin := fs.String("admin", "http://127.0.0.1:18080", "node-stub admin URL")
 	nodeID := fs.String("node", "", "node id")
-	group := fs.String("group", "", "sandbox group")
-	routeKey := fs.String("route-key", "", "route key")
 	sid := fs.String("sid", "", "sandbox id")
 	state := fs.String("state", routesync.StateRunning, "sandbox state")
+	var metadata multiFlag
+	fs.Var(&metadata, "metadata", "sandbox metadata k=v; repeatable")
 	_ = fs.Parse(args[1:])
+	metadataMap, err := parseLabels(metadata)
+	if err != nil {
+		return err
+	}
 	baseAdmin := strings.TrimRight(*admin, "/")
 	base := fmt.Sprintf("%s/v1/nodes/%s", baseAdmin, *nodeID)
 	switch action {
@@ -1470,7 +1468,7 @@ func runSandbox(args []string) error {
 		if *nodeID == "" {
 			return fmt.Errorf("--node is required")
 		}
-		body := sandboxAdminRequest{SID: *sid, Group: *group, RouteKey: *routeKey, State: *state}
+		body := sandboxAdminRequest{SID: *sid, Metadata: metadataMap, State: *state}
 		return printRequest(http.MethodPost, base+"/sandboxes", body)
 	case "delete":
 		if *nodeID == "" {
@@ -1484,7 +1482,7 @@ func runSandbox(args []string) error {
 		if *nodeID == "" {
 			return fmt.Errorf("--node is required")
 		}
-		body := sandboxAdminRequest{SID: *sid, Group: *group, RouteKey: *routeKey}
+		body := sandboxAdminRequest{SID: *sid, Metadata: metadataMap}
 		return printRequest(http.MethodPost, base+"/routes/orphan", body)
 	default:
 		return fmt.Errorf("unknown sandbox action %q", action)

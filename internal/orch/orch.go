@@ -76,15 +76,13 @@ type Orchestrator struct {
 	probe      ResourceProbe   // node water level for cluster heartbeat (set by serve when resource_listen on); nil = none
 
 	clusterBuildMu sync.Mutex
-	clusterBuilds  map[string]*clusterBuild   // build_id -> cluster build (group + transient image-pull creds, §7.5)
+	clusterBuilds  map[string]*clusterBuild   // build_id -> transient cluster image-pull creds (§7.5)
 	buildEvents    chan *routesync.BuildEvent // node -> registry build state, drained by the node-link client
 }
 
-// clusterBuild is a registry-driven build's node-side context: its group (for
-// build events) + the transient image-pull creds (used for this build only, never
-// persisted — cluster.md).
+// clusterBuild is a registry-driven build's transient image-pull context. Cluster
+// identity remains opaque in Build.Metadata and is never interpreted here.
 type clusterBuild struct {
-	group        string
 	imageRepo    string
 	registryAuth string
 }
@@ -355,10 +353,7 @@ func (o *Orchestrator) Connect(ctx context.Context, id, apiKey, migrationToken s
 		if ierr != nil {
 			return nil, ierr
 		}
-		if imported != id {
-			_ = o.st.Delete(ctx, imported) // token was for a different sandbox; don't leave it
-			return nil, fmt.Errorf("connect %s: migration token is for sandbox %s", id, imported)
-		}
+		id = imported
 		if sb, err = o.st.Get(ctx, id); err != nil {
 			return nil, err
 		}

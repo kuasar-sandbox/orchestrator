@@ -2,9 +2,9 @@ package routesync
 
 // Cluster node-link message types (node.md §10 / cluster.md). They extend the
 // Msg union for the node <-> registry channel: the node DIALS the registry and is
-// the route authority (its sandbox routes flow as Upsert/Delete + Bookmark, with
-// Group/RouteKey set on each RouteEntry), while the registry
-// subscribes (KindRegistry) and sends Commands the other way. The frame codec and
+// the execution-state authority (its sandbox routes flow as ID-only
+// Upsert/Delete + Bookmark), while the registry resolves cluster identity from
+// its per-node ownership table and sends Commands the other way. The frame codec and
 // the ServeAuthority loop are the same routesync engine the proxy plane uses;
 // only the handshake (NodeRegister vs Hello) and the uplink (Command vs Wake)
 // differ. Build events arrive with Phase 5.
@@ -84,11 +84,10 @@ const (
 // resources on a terminal state.
 const TypeBuildEvent = "build_event"
 
-// BuildEvent reports a build's state up the node-link (§5.1). State is one of
-// registered/building/ready/error; TemplateID carries the persist id on ready.
+// BuildEvent reports a build's state up the node-link (§5.1). The node-link
+// owner resolves cluster identity from its per-node build table.
 type BuildEvent struct {
 	BuildID    string `json:"build_id"`
-	Group      string `json:"group"`
 	State      string `json:"state"`
 	TemplateID string `json:"template_id,omitempty"`
 	Reason     string `json:"reason,omitempty"`
@@ -146,11 +145,9 @@ type Heartbeat struct {
 // and reports the terminal sandbox state via the route stream; commands are
 // idempotent by SID. Fields are populated per Kind.
 type Command struct {
-	CmdID    string `json:"cmd_id"`
-	Kind     string `json:"kind"` // CmdCreate | CmdConnect | CmdDelete | CmdKey*
-	SID      string `json:"sid,omitempty"`
-	Group    string `json:"group,omitempty"`
-	RouteKey string `json:"route_key,omitempty"`
+	CmdID string `json:"cmd_id"`
+	Kind  string `json:"kind"` // CmdCreate | CmdConnect | CmdDelete | CmdKey*
+	SID   string `json:"sid,omitempty"`
 	// create
 	TemplateRef    string            `json:"template_ref,omitempty"` // snapshot template ref (cold start = fast restore)
 	KeyFingerprint string            `json:"key_fp,omitempty"`       // manifest-key fingerprint the node must already hold

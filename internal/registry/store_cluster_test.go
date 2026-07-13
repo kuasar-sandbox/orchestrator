@@ -114,6 +114,34 @@ func TestNodeLinkShardRecordsAssembleNodeView(t *testing.T) {
 	}
 }
 
+func TestNodeObjectRefsAreScopedByNodeID(t *testing.T) {
+	ctx := context.Background()
+	stores := NewStores()
+	if err := stores.AddNodeSandboxRef(ctx, "n1", clusterstate.NodeSandboxRef{SandboxID: "same", Group: "/g1", RouteKey: "rk1"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := stores.AddNodeSandboxRef(ctx, "n2", clusterstate.NodeSandboxRef{SandboxID: "same", Group: "/g2", RouteKey: "rk2"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		node, group string
+	}{
+		{node: "n1", group: "/g1"},
+		{node: "n2", group: "/g2"},
+	} {
+		ref, found, err := stores.GetNodeSandboxRef(ctx, tc.node, "same")
+		if err != nil || !found || ref.Group != tc.group {
+			t.Fatalf("node %s ref=%+v found=%v err=%v", tc.node, ref, found, err)
+		}
+	}
+	if err := stores.AddNodeSandboxRef(ctx, "n1", clusterstate.NodeSandboxRef{Group: "/g"}); err == nil {
+		t.Fatal("invalid sandbox ref was accepted")
+	}
+	if err := stores.AddNodeBuildRef(ctx, "n1", clusterstate.NodeBuildRef{BuildID: "b"}); err == nil {
+		t.Fatal("invalid build ref was accepted")
+	}
+}
+
 func TestPutNodeRuntimeUpdatesProfileOnly(t *testing.T) {
 	ctx := context.Background()
 	stores := NewStores()
@@ -458,7 +486,7 @@ func TestRoutingNodeOwnerUsesLinkOwner(t *testing.T) {
 	if err := reg.nodeOwner.DeleteSandbox(ctx, "n1", "sb1"); err != nil {
 		t.Fatalf("DeleteSandbox: %v", err)
 	}
-	reg.nodeOwner.ReleaseBuild(ctx, "b1")
+	reg.nodeOwner.ReleaseBuild(ctx, "n1", "b1")
 
 	if len(remote.keys) != 1 || remote.keys[0] != "n1/fp" {
 		t.Fatalf("remote keys=%v", remote.keys)
@@ -469,8 +497,32 @@ func TestRoutingNodeOwnerUsesLinkOwner(t *testing.T) {
 	if len(remote.deleted) != 1 || remote.deleted[0] != "n1/sb1" {
 		t.Fatalf("remote deleted=%v", remote.deleted)
 	}
-	if len(remote.released) != 1 || remote.released[0] != "b1" {
+	if len(remote.released) != 1 || remote.released[0] != "n1/b1" {
 		t.Fatalf("remote released=%v", remote.released)
+	}
+}
+
+func TestRoutingNodeOwnerReleasesBuildFromEveryPossibleAdmittingOwner(t *testing.T) {
+	ctx := context.Background()
+	reg := testReg(t)
+	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1", LinkOwner: "new-owner"}); err != nil {
+		t.Fatal(err)
+	}
+	oldOwner := &routingNodeOwnerRecorder{}
+	newOwner := &routingNodeOwnerRecorder{}
+	reg.SetRemoteNodeOwners(map[string]NodeOwner{
+		"old-owner": oldOwner,
+		"new-owner": newOwner,
+	})
+
+	reg.nodeOwner.ReleaseBuild(ctx, "n1", "b1")
+	for name, owner := range map[string]*routingNodeOwnerRecorder{
+		"old": oldOwner,
+		"new": newOwner,
+	} {
+		if len(owner.released) != 1 || owner.released[0] != "n1/b1" {
+			t.Fatalf("%s owner releases=%v, want n1/b1", name, owner.released)
+		}
 	}
 }
 
@@ -1060,8 +1112,8 @@ func (r *routingNodeOwnerRecorder) AdmitBuild(ctx context.Context, nodeID, build
 	return r.allow
 }
 
-func (r *routingNodeOwnerRecorder) ReleaseBuild(ctx context.Context, buildID string) {
-	r.released = append(r.released, buildID)
+func (r *routingNodeOwnerRecorder) ReleaseBuild(ctx context.Context, nodeID, buildID string) {
+	r.released = append(r.released, nodeID+"/"+buildID)
 }
 
 func (r *routingNodeOwnerRecorder) Runtime(ctx context.Context, nodeID string) (*NodeRecord, bool, error) {

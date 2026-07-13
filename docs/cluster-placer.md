@@ -337,7 +337,7 @@ Build placement 与 sandbox 类似,但候选需要 build headroom。最终预算
 
 1. placer 返回建议 node。
 2. route owner 先通过 node owner 确认 node-link 仍在线。
-3. route owner 调 node owner `AdmitBuild(build_id, resources, ttl)`。
+3. route owner 调 node owner `AdmitBuild(node_id, build_id, resources)`。
 4. node owner 若余量不足直接拒绝。
 5. route owner 排除该候选并重调度。
 

@@ -40,8 +40,8 @@ func (o *rpcNodeOwner) AdmitBuild(ctx context.Context, nodeID, buildID string, w
 	return o.admit
 }
 
-func (o *rpcNodeOwner) ReleaseBuild(ctx context.Context, buildID string) {
-	o.released = append(o.released, buildID)
+func (o *rpcNodeOwner) ReleaseBuild(ctx context.Context, nodeID, buildID string) {
+	o.released = append(o.released, nodeID+":"+buildID)
 }
 
 func (o *rpcNodeOwner) Runtime(ctx context.Context, nodeID string) (*NodeRecord, bool, error) {
@@ -90,7 +90,7 @@ func TestHTTPNodeOwner(t *testing.T) {
 	if !client.AdmitBuild(ctx, "n1", "b1", &routesync.BuildResources{CPU: 1000}) {
 		t.Fatal("admit build returned false")
 	}
-	client.ReleaseBuild(ctx, "b1")
+	client.ReleaseBuild(ctx, "n1", "b1")
 	node, found, err := client.Runtime(ctx, "n1")
 	if err != nil || !found || node.DataEndpoint == "" {
 		t.Fatalf("runtime node=%+v found=%v err=%v", node, found, err)
@@ -114,7 +114,7 @@ func TestHTTPNodeOwner(t *testing.T) {
 			t.Fatalf("ops=%v want %v", owner.ops, wantOps)
 		}
 	}
-	if len(owner.released) != 1 || owner.released[0] != "b1" {
+	if len(owner.released) != 1 || owner.released[0] != "n1:b1" {
 		t.Fatalf("released=%v", owner.released)
 	}
 }

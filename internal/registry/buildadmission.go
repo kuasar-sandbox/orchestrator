@@ -15,7 +15,7 @@ type NodeOwner interface {
 	PutManifestKey(ctx context.Context, nodeID, fingerprint, keyType, keyValue string, expiresUnix int64) error
 	DropManifestKey(ctx context.Context, nodeID, fingerprint string) error
 	AdmitBuild(ctx context.Context, nodeID, buildID string, want *routesync.BuildResources) bool
-	ReleaseBuild(ctx context.Context, buildID string)
+	ReleaseBuild(ctx context.Context, nodeID, buildID string)
 	Runtime(ctx context.Context, nodeID string) (*NodeRecord, bool, error)
 	DeleteSandbox(ctx context.Context, nodeID, sid string) error
 	SendCommand(ctx context.Context, nodeID string, cmd *routesync.Command) error
@@ -111,8 +111,8 @@ func (o *localNodeOwner) AdmitBuild(ctx context.Context, nodeID, buildID string,
 	return o.leases.admit(nodeID, buildID, node.BuildCapacity, want)
 }
 
-func (o *localNodeOwner) ReleaseBuild(ctx context.Context, buildID string) {
-	o.leases.release(buildID)
+func (o *localNodeOwner) ReleaseBuild(ctx context.Context, nodeID, buildID string) {
+	o.leases.release(nodeID, buildID)
 }
 
 func (o *localNodeOwner) Runtime(ctx context.Context, nodeID string) (*NodeRecord, bool, error) {
@@ -272,10 +272,10 @@ func (o *routingNodeOwner) AdmitBuild(ctx context.Context, nodeID, buildID strin
 	return o.ownerFor(ctx, nodeID).AdmitBuild(ctx, nodeID, buildID, want)
 }
 
-func (o *routingNodeOwner) ReleaseBuild(ctx context.Context, buildID string) {
-	o.local.ReleaseBuild(ctx, buildID)
+func (o *routingNodeOwner) ReleaseBuild(ctx context.Context, nodeID, buildID string) {
+	o.local.ReleaseBuild(ctx, nodeID, buildID)
 	for _, remote := range o.remotes {
-		remote.ReleaseBuild(ctx, buildID)
+		remote.ReleaseBuild(ctx, nodeID, buildID)
 	}
 }
 
@@ -311,7 +311,7 @@ func (o missingNodeOwner) AdmitBuild(context.Context, string, string, *routesync
 	return false
 }
 
-func (o missingNodeOwner) ReleaseBuild(context.Context, string) {}
+func (o missingNodeOwner) ReleaseBuild(context.Context, string, string) {}
 
 func (o missingNodeOwner) Runtime(context.Context, string) (*NodeRecord, bool, error) {
 	return nil, false, o.err()
@@ -331,15 +331,13 @@ func (o missingNodeOwner) SendCommandAndWait(context.Context, string, *routesync
 // It is intentionally volatile: a node/registry restart clears execution leases,
 // matching the cluster rule that node execution state is not restored from disk.
 type buildAdmissionManager struct {
-	mu      sync.Mutex
-	byNode  map[string]map[string]*routesync.BuildResources
-	byBuild map[string]string
+	mu     sync.Mutex
+	byNode map[string]map[string]*routesync.BuildResources
 }
 
 func newBuildAdmissionManager() *buildAdmissionManager {
 	return &buildAdmissionManager{
-		byNode:  map[string]map[string]*routesync.BuildResources{},
-		byBuild: map[string]string{},
+		byNode: map[string]map[string]*routesync.BuildResources{},
 	}
 }
 
@@ -349,8 +347,8 @@ func (m *buildAdmissionManager) admit(nodeID, buildID string, cap, want *routesy
 	if nodeID == "" || buildID == "" {
 		return false
 	}
-	if prev := m.byBuild[buildID]; prev != "" {
-		return prev == nodeID
+	if _, exists := m.byNode[nodeID][buildID]; exists {
+		return true
 	}
 	if cap != nil {
 		var used routesync.BuildResources
@@ -366,18 +364,15 @@ func (m *buildAdmissionManager) admit(nodeID, buildID string, cap, want *routesy
 		m.byNode[nodeID] = map[string]*routesync.BuildResources{}
 	}
 	m.byNode[nodeID][buildID] = cloneBuildResources(want)
-	m.byBuild[buildID] = nodeID
 	return true
 }
 
-func (m *buildAdmissionManager) release(buildID string) {
+func (m *buildAdmissionManager) release(nodeID, buildID string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	nodeID := m.byBuild[buildID]
-	if nodeID == "" {
+	if nodeID == "" || buildID == "" {
 		return
 	}
-	delete(m.byBuild, buildID)
 	delete(m.byNode[nodeID], buildID)
 	if len(m.byNode[nodeID]) == 0 {
 		delete(m.byNode, nodeID)

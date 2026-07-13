@@ -67,8 +67,8 @@ func (n *fakeNode) HandleCommand(ctx context.Context, cmd *routesync.Command) *r
 		return ack
 	}
 	e := routesync.RouteEntry{
-		SandboxID: cmd.SID, Group: cmd.Group, RouteKey: cmd.RouteKey,
-		State: routesync.StateRunning, AccessToken: cmd.AccessToken,
+		SandboxID: cmd.SID,
+		State:     routesync.StateRunning, AccessToken: cmd.AccessToken,
 	}
 	n.mu.Lock()
 	n.routes[cmd.SID] = e

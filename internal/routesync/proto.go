@@ -95,11 +95,6 @@ type RouteEntry struct {
 	// from the manifest key + id (keys.MmdsSecret) so every proxy worker reads the
 	// same key from the shared route view.
 	MmdsSecret string `json:"mmds_secret,omitempty"`
-	// Cluster node-link fields (node.md §10 / cluster.md): set when the route
-	// authority is a node reporting sandboxes to the registry; empty on the local
-	// proxy plane. The registry keys SandboxStore by (Group, RouteKey).
-	Group    string `json:"group,omitempty"`     // sandbox-group (shard key)
-	RouteKey string `json:"route_key,omitempty"` // {user,session} routing key (session affinity)
 }
 
 // Policy is the operational policy the orchestrator pushes to a proxy at handshake

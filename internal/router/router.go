@@ -89,7 +89,7 @@ type Router struct {
 	log           *slog.Logger
 
 	buildsMu sync.Mutex
-	builds   map[string]buildEntry // build_id -> node (a build is node-bound); TTL-evicted
+	builds   map[string]buildEntry // group\x00build_id -> node; TTL-evicted
 
 	cacheMu sync.RWMutex
 	cache   map[string]*routeResolve // group\x00route_key\x00sid -> resolved data-plane target
@@ -332,7 +332,7 @@ func (rt *Router) handleBuildRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rt.buildsMu.Lock()
-	rt.builds[res.BuildID] = buildEntry{node: res.DataEndpoint, at: time.Now()}
+	rt.builds[buildCacheKey(group, res.BuildID)] = buildEntry{node: res.DataEndpoint, at: time.Now()}
 	rt.buildsMu.Unlock()
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
@@ -370,8 +370,9 @@ func (rt *Router) handleBuildForward(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	bid := extractBuildID(r.URL.Path)
+	cacheKey := buildCacheKey(group, bid)
 	rt.buildsMu.Lock()
-	e, ok := rt.builds[bid]
+	e, ok := rt.builds[cacheKey]
 	rt.buildsMu.Unlock()
 	node := e.node
 	if !ok {
@@ -382,10 +383,14 @@ func (rt *Router) handleBuildForward(w http.ResponseWriter, r *http.Request) {
 		}
 		node = res.DataEndpoint
 		rt.buildsMu.Lock()
-		rt.builds[bid] = buildEntry{node: node, at: time.Now()}
+		rt.builds[cacheKey] = buildEntry{node: node, at: time.Now()}
 		rt.buildsMu.Unlock()
 	}
 	rt.forwardBuild(w, r, node)
+}
+
+func buildCacheKey(group, buildID string) string {
+	return group + "\x00" + buildID
 }
 
 // forwardBuild proxies a build control call (trigger / status / files) to the node

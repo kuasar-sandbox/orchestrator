@@ -29,12 +29,12 @@ func NodeLinkShard(nodeID string) shardkv.ShardKey {
 	return shardkv.ShardKey(nodeID)
 }
 
-func NodeSandboxRecordKey(group, routeKey string) shardkv.RecordKey {
-	return shardkv.RecordKey(group + "\x00" + routeKey)
+func NodeSandboxRecordKey(sandboxID string) shardkv.RecordKey {
+	return shardkv.RecordKey(sandboxID)
 }
 
-func NodeBuildRecordKey(group, buildID string) shardkv.RecordKey {
-	return shardkv.RecordKey(group + "\x00" + buildID)
+func NodeBuildRecordKey(buildID string) shardkv.RecordKey {
+	return shardkv.RecordKey(buildID)
 }
 
 func NodeManifestKeyRecordKey(fingerprint string) shardkv.RecordKey {
@@ -61,12 +61,12 @@ func PlacerImportSourceShard(sourceID string) shardkv.ShardKey {
 	return shardkv.ShardKey("import/source/" + sourceID)
 }
 
-func ParseNodeSandboxRecordKey(key shardkv.RecordKey) (group, routeKey string, ok bool) {
-	return parseTwoPartRecordKey(string(key))
+func ParseNodeSandboxRecordKey(key shardkv.RecordKey) (sandboxID string, ok bool) {
+	return string(key), key != ""
 }
 
-func ParseNodeBuildRecordKey(key shardkv.RecordKey) (group, buildID string, ok bool) {
-	return parseTwoPartRecordKey(string(key))
+func ParseNodeBuildRecordKey(key shardkv.RecordKey) (buildID string, ok bool) {
+	return string(key), key != ""
 }
 
 func ParseNodeManifestKeyRecordKey(key shardkv.RecordKey) (fingerprint string, ok bool) {
@@ -84,11 +84,6 @@ func ParseRouteBuildRecordKey(key shardkv.RecordKey) (buildID string, ok bool) {
 func ParsePlacerImportSourceShard(shard shardkv.ShardKey) (sourceID string, ok bool) {
 	value, ok := strings.CutPrefix(string(shard), "import/source/")
 	return value, ok && value != ""
-}
-
-func parseTwoPartRecordKey(key string) (string, string, bool) {
-	left, right, ok := strings.Cut(key, "\x00")
-	return left, right, ok && left != "" && right != ""
 }
 
 // NodeProfileRecord is the node_link profile record. Per-node sandboxes, builds,

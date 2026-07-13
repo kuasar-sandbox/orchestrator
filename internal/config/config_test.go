@@ -190,7 +190,9 @@ builder:
 
 func TestLoadRejectsBuilderRefererInvalidValidity(t *testing.T) {
 	t.Setenv("NODE_CONFIG_ENCRYPTION_KEY", "")
-	path := writeConfig(t, `
+	for _, validity := range []string{"soon", "0s", "-1h"} {
+		t.Run(validity, func(t *testing.T) {
+			path := writeConfig(t, `
 api:
   domain: example.test
 encryption_key: test-key
@@ -200,15 +202,17 @@ sandbox:
     runtime: /opt/sandbox/sandbox-runtime.erofs
 builder:
   referer:
-    validity: soon
+    validity: `+validity+`
 `)
 
-	_, err := Load(path)
-	if err == nil {
-		t.Fatal("Load succeeded with invalid referer validity")
-	}
-	if !strings.Contains(err.Error(), "builder.referer.validity") {
-		t.Fatalf("error %q does not mention builder.referer.validity", err)
+			_, err := Load(path)
+			if err == nil {
+				t.Fatal("Load succeeded with invalid referer validity")
+			}
+			if !strings.Contains(err.Error(), "builder.referer.validity") {
+				t.Fatalf("error %q does not mention builder.referer.validity", err)
+			}
+		})
 	}
 }
 

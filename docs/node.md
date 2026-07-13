@@ -286,7 +286,7 @@ node-ctl import-sandbox <token> [--socket S]
 - `export-sandbox <sid>`:打印单行 base64 迁移 token(默认 move,回收源行;
   `--keep-source` = copy)。
 - `export-sandbox <sid> --to-template`:晋升为远程快照并打印持久 templateID(扇出用)。
-- `import-sandbox <token>`:在本机插入 paused 行并打印 sid,随后 `e2b sandbox resume`
+- `import-sandbox <token>`:以新 UUIDv7 在本机插入 paused 行并打印新 sid,随后 `e2b sandbox resume`
   即可在本机恢复。
 
 ### 2.8 `e2b-key-ctl`
@@ -474,7 +474,11 @@ JSON 对象)注入,零 SDK/API 改动。命名空间是 sandbox-runtime `config.
 | `launch` | `launch.{exec,args,env,workdir,restart,user,stop_signal,plugin}`——**仅 bare**;e2b profile 拒(envd 占用 launch) |
 | `init` / `mounts` / `files` | 直透 `init[]` / `mounts[]` / `files[]` |
 | `metadata` | `SANDBOX_CONFIG.metadata` 透传(如 `e2b.start_cmd`) |
-| `cluster` | `{group, route_key}`——集群调度 / 路由身份,经 node-link 上报 registry(§10、cluster.md);独立模式无 node-link 时仅作记录 |
+
+`kuasar-sandbox.cluster` 不属于上述租户配置命名空间。cluster registry 在放置后把
+`{group,route_key}` 作为 cluster 自有字段写入普通 sandbox/build metadata,并覆盖请求中
+可能存在的同名值。node 只原样保存和转交 metadata,不会解析该字段、建立 group 状态或
+在 node-link 事件中回传 group;只有 cluster 层解释它。
 
 构建端点额外接受 **build-only** 命名空间 `kuasar-sandbox.builder`,对应请求头
 `X-Kuasar-Sandbox-Builder`,当前形态:
@@ -764,16 +768,17 @@ e2b API/CLI 零改动。
 - **晋升 / 转模板**(`--to-template`,须 paused):确保远程后,组装并打印自描述持久
   id `<profile>-snp-<key>`(不写 builds 表)。之后 `e2b sandbox create <id>` 即从该
   快照扇出新沙箱(新 sid);create 解密用的租户 key 仍由 api_key→白名单解析。
-- **迁移(同 sid 跨机)**:`export-sandbox <sid>` 确保远程后导出**单行 base64 token**
+- **迁移(新 sid 跨机)**:`export-sandbox <sid>` 确保远程后导出**单行 base64 token**
   = 沙箱行(env/metadata/deadline/数据面 token + runtime erofs 摘要;manifest_key
   仅指纹、不含密钥);默认回收源行(move,`--keep-source` = copy)。目标机
   `import-sandbox <token>`:api_key → 白名单解析租户 key(须先 `manifest-key add`,
-  与 create 同前置)、校验 token 指纹与本机 runtime 摘要一致,插入 paused 行;随后
-  `connect` 在新机恢复。目标机须共享同一 `manifest_config`(远程 store)。
+  与 create 同前置)、校验 token 指纹与本机 runtime 摘要一致,分配新 UUIDv7 并插入
+  paused 行;随后对新 sid 执行 `connect`。源 sid 不在目标机复用。目标机须共享同一
+  `manifest_config`(远程 store)。
 - **一步迁移**:`Sandbox.connect(<sid>, api_headers={"X-Kuasar-Migration-Token":
   <token>})`——目标机本地无此 sid 且带迁移 token 时,connect 在 resume 前自动
-  import(同上校验,且 token 内 id 须等于所连 sid,否则报错并回收误插行),迁移收敛
-  为单次 SDK 调用;`import-sandbox` CLI 保留作显式预导入。
+  import(同上校验),改用 import 返回的新 sid 恢复并在响应中返回该 sid,迁移收敛为
+  单次 SDK 调用;`import-sandbox` CLI 保留作显式预导入。
 - **状态感知驱动迁移**:暂停态的本地/远程经 `RouteEntry.snap_loc`(`local`|`remote`)随
   路由流下发(node-proxy.md §6);订阅 plugin 平面的平台 agent(`subscribe=route`)据此识别哪些 paused
   沙箱节点绑定(腾空节点前须先迁移)、哪些已可移植,再按需调 export-sandbox 铸造
@@ -894,15 +899,20 @@ node_list；首次注册和 draining 变化驱动低频目录投影。registry n
 节点作为权威上报本机执行态:
 
 ```text
-sandbox{sid, group, route_key, state, snap_loc, access_token, template_id}
-build{build_id, group, state, template_id?, reason?}
-delete{sid|build_id}
+sandbox{sid, state, snap_loc, access_token, template_id}
+build{build_id, state, template_id?, reason?}
+delete{sid}
 bookmark{full_sync}
 ```
 
-`group / route_key` 从沙箱 metadata 的 `kuasar-sandbox.cluster` 命名空间解析(§4.6)。全量 Range 结束的
-bookmark 带 `full_sync=true`,registry 可用本轮未出现的精确 `(group,route_key,sandbox_id)` 做缺失清理;
-增量 replay 的 bookmark 只推进 resume token,不触发缺失清理。
+node 不解释 sandbox/build metadata 中的 cluster 字段。nodelink owner 在任务下发前已维护
+本节点完整的 sandbox/build 归属表,收到事件后以 `(node_id,sid)` 或
+`(node_id,build_id)` 查表取得 group/route_key。生产 ID 由 UUIDv7 或等价随机机制保证
+全局唯一,但事件处理不依赖该假设,也不存在 cluster 全局 ID 索引。
+
+全量 Range 结束的 bookmark 带 `full_sync=true`。nodelink owner 仅将本轮出现的 sid 与
+订阅建立前捕获的本节点归属表基线比较;清理前再次确认当前表项仍与基线一致,避免删除
+同步期间新下发或重新绑定的任务。增量 replay 的 bookmark 只推进 resume token。
 
 ### 10.4 命令受理
 
@@ -911,11 +921,11 @@ registry 上行下发命令。serve 复用既有 e2b 生命周期原语(§8 / §
 
   | 命令 | 节点动作 |
   |---|---|
-  | `create{cmd_id, sid, group, route_key, template_ref, key_fp, config}` | 冷启 `template_ref` + 合并 `config`(§8;snp 模板 = 快照恢复快启);`key_fp` 选本机租约 manifest_key;group/route_key 注入沙箱 metadata |
+  | `create{cmd_id, sid, template_ref, key_fp, config}` | 冷启 `template_ref` + 保存/合并 `config`(§8;snp 模板 = 快照恢复快启);`key_fp` 选本机租约 manifest_key;cluster 身份已由 registry 放在 `config` metadata 中,node 不解析 |
   | `connect{cmd_id, sid}` | 恢复本机 PAUSED 沙箱(§8 auto-resume) |
-  | `delete{cmd_id, sid|build_id}` | 销毁沙箱 / 构建(§5 kill) |
+  | `delete{cmd_id, sid}` | 销毁沙箱(§5 kill) |
   | `key_put` / `key_drop{fingerprint, manifest_key?, expires_unix}` | `key_put` 写 / 重发续租 `manifest_keys` 租约项;`key_drop` best-effort 清理,正确性依赖 TTL 淘汰(§7);registry 的密钥分发见 cluster.md |
-  | `build_register{build_id, template_id, group, resources, image_repo, registry_auth, key_fp, config}` | 预配 registry 分配的构建(§12;按指纹解析 key、建 build 记录、瞬态用镜像凭据);构建态经 `build_event` 上报 |
+  | `build_register{build_id, template_id, resources, image_repo, registry_auth, key_fp, config}` | 预配 registry 分配的构建(§12;按指纹解析 key、建 build 记录、瞬态用镜像凭据);`config` metadata 原样保存,构建态经 `build_event` 上报 |
 
 无 `drain` 命令。节点排空 / 维护由节点侧发起(node-resource.md §2.5 资源 drain 或本机维护策略),
 集群侧只停止向其分配。
@@ -987,15 +997,16 @@ microVM(`sandbox-ctl run` 直接子进程);A 阶段就绪探针 = guest 内
   复制出的可写 ext4(无 base 镜像),`launch.placeholder` 锚定;单一 guest runtime
   经 `/opt/sandbox-runtime` 投影出 `flatten-ctl` 与 `mkfs.erofs`。若
   `builder.referer.enabled=true`,guest 先以租户 registry 凭据执行
-  `flatten-ctl referer lookup --json --owner <owner> <fromImage>`;hit 时宿主校验
+  `flatten-ctl referer lookup --json --owner <owner> <fromImage>`;lookup 只接受格式有效且
+  未过期的 referrer,hit 时宿主校验
   返回的 manifest id 后直接用 `manifest://<id>` 作 base,跳过拉取与展平。lookup
   unsupported/error 时按 `fallback` 继续或失败。miss 时 guest 内
   `flatten-ctl export --output - <fromImage>` 拉取 + 展平,tarstream 镜像工件经 exec
-  stdio 流回宿主 `workdir/image.img`;若 lookup 已确认 registry 支持 Referrers,
-  宿主立即 `manifest-ctl store image.img` 得到 manifest id 并把 base 改为
-  `manifest://<id>`,随后在 guest 内 `flatten-ctl referer put --owner <owner>
-  --manifest-id <id> <subject>` 回写。`writeback=true` 时回写失败即构建失败;
-  `MANIFEST_KEY` 只在宿主用于计算 owner token,不进入 guest referer 命令。
+  stdio 流回宿主 `workdir/image.img`;若 lookup 已确认 registry 支持 Referrers 且
+  `writeback=true`,宿主立即 `manifest-ctl store image.img` 得到 manifest id 并把 base
+  改为 `manifest://<id>`,随后在 guest 内 `flatten-ctl referer put --owner <owner>
+  --manifest-id <id> <subject>` 回写。writeback 失败即构建失败;禁用 writeback 时不做
+  这次中间上传。`MANIFEST_KEY` 只在宿主用于计算 owner token,不进入 guest referer 命令。
 - **B steps**(有 steps):以 base 镜像为 root(本地工件或 `manifest://`)+ builder
   runtime + 大可写 upper(同一 diff_template),**envd 为 app**(构建工具姿态:恒
   `-isnotfc`、不 `/init`、无 token;唯一盘足迹 `/run/e2b` 落在 tmpfs 挂载上,导出

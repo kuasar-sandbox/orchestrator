@@ -289,7 +289,11 @@ func TestClusterStubReserveAndDataPlane(t *testing.T) {
 		t.Fatalf("data by key status=%d, want 204", resp.StatusCode)
 	}
 	create := h.node.waitCommand(t, routesync.CmdCreate)
-	if create.Group != testGroup || create.RouteKey != "u1:s1" || create.TemplateRef != "tmpl-1" || create.Config["from_group"] != "yes" {
+	location, err := clusterstate.ObjectLocationFromMetadata(create.Config)
+	if err != nil {
+		t.Fatalf("create command metadata: %v", err)
+	}
+	if location.Group != testGroup || location.RouteKey != "u1:s1" || create.TemplateRef != "tmpl-1" || create.Config["from_group"] != "yes" {
 		t.Fatalf("create command = %+v", create)
 	}
 	if create.KeyFingerprint == "" || create.AccessToken == "" {
@@ -353,21 +357,20 @@ func TestClusterStubBuildRegister(t *testing.T) {
 		t.Fatalf("build register status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(b)))
 	}
 	cmd := h.node.waitCommand(t, routesync.CmdBuildRegister)
-	if cmd.Group != testGroup || cmd.BuildID == "" || cmd.TemplateRef == "" || cmd.KeyFingerprint == "" {
+	location, err := clusterstate.ObjectLocationFromMetadata(cmd.Config)
+	if err != nil {
+		t.Fatalf("build command metadata: %v", err)
+	}
+	if location.Group != testGroup || cmd.BuildID == "" || cmd.TemplateRef == "" || cmd.KeyFingerprint == "" {
 		t.Fatalf("build_register command = %+v", cmd)
 	}
 }
 
-func TestClusterStubOrphanReportDeletesNodeSandbox(t *testing.T) {
+func TestClusterStubUnownedReportDoesNotDeleteNodeSandbox(t *testing.T) {
 	h := newHarness(t)
 
-	h.node.sendRoute(t, routesync.RouteEntry{
-		SandboxID: "sb-orphan", Group: testGroup, RouteKey: "missing", State: routesync.StateRunning,
-	})
-	cmd := h.node.waitCommand(t, routesync.CmdDelete)
-	if cmd.SID != "sb-orphan" {
-		t.Fatalf("orphan delete command=%+v, want sid sb-orphan", cmd)
-	}
+	h.node.sendRoute(t, routesync.RouteEntry{SandboxID: "sb-orphan", State: routesync.StateRunning})
+	h.node.assertNoCommand(t, routesync.CmdDelete, "sb-orphan", 500*time.Millisecond)
 }
 
 func (h *harness) doDataByKey(t *testing.T, routeKey string) *http.Response {
@@ -483,12 +486,12 @@ func (n *nodeStub) readLoop() {
 		switch cmd.Kind {
 		case routesync.CmdCreate, routesync.CmdConnect:
 			n.sendRoute(n.t, routesync.RouteEntry{
-				SandboxID: cmd.SID, Group: cmd.Group, RouteKey: cmd.RouteKey,
-				State: routesync.StateRunning, AccessToken: cmd.AccessToken, TemplateID: cmd.TemplateRef,
+				SandboxID: cmd.SID, State: routesync.StateRunning,
+				AccessToken: cmd.AccessToken, TemplateID: cmd.TemplateRef,
 			})
 		case routesync.CmdBuildRegister:
 			n.write(n.t, &routesync.Msg{Type: routesync.TypeBuildEvent, Build: &routesync.BuildEvent{
-				Group: cmd.Group, BuildID: cmd.BuildID, State: string(registry.BuildBuilding),
+				BuildID: cmd.BuildID, State: string(registry.BuildBuilding),
 			}})
 		}
 	}
@@ -529,6 +532,25 @@ func (n *nodeStub) countKind(kind string) int {
 		}
 	}
 	return ncmd
+}
+
+func (n *nodeStub) assertNoCommand(t *testing.T, kind, sid string, duration time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(duration)
+	for {
+		n.mu.Lock()
+		for _, cmd := range n.cmds {
+			if cmd.Kind == kind && cmd.SID == sid {
+				n.mu.Unlock()
+				t.Fatalf("unexpected command kind=%s sid=%s", kind, sid)
+			}
+		}
+		n.mu.Unlock()
+		if time.Now().After(deadline) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 func (n *nodeStub) commandKinds() []string {

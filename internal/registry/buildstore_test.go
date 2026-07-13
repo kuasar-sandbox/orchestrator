@@ -36,8 +36,8 @@ func (a *recordingNodeOwner) AdmitBuild(ctx context.Context, nodeID, buildID str
 	return a.allow
 }
 
-func (a *recordingNodeOwner) ReleaseBuild(ctx context.Context, buildID string) {
-	a.released = append(a.released, buildID)
+func (a *recordingNodeOwner) ReleaseBuild(ctx context.Context, nodeID, buildID string) {
+	a.released = append(a.released, nodeID+"/"+buildID)
 }
 
 func (a *recordingNodeOwner) Runtime(ctx context.Context, nodeID string) (*NodeRecord, bool, error) {
@@ -83,12 +83,115 @@ func TestReserveBuildUsesNodeOwnerBoundary(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reserve build: %v", err)
 	}
-	if len(admitter.admitted) != 1 || admitter.admitted[0] != "n1/"+res.BuildID {
-		t.Fatalf("admitted=%v, want n1/%s", admitter.admitted, res.BuildID)
+	wantLease := buildAdmissionID("/g", res.BuildID)
+	if len(admitter.admitted) != 1 || admitter.admitted[0] != "n1/"+wantLease {
+		t.Fatalf("admitted=%v, want n1/%q", admitter.admitted, wantLease)
 	}
-	reg.applyBuildEvent(ctx, "n1", &routesync.BuildEvent{Group: "/g", BuildID: res.BuildID, State: string(BuildReady)})
-	if len(admitter.released) != 1 || admitter.released[0] != res.BuildID {
-		t.Fatalf("released=%v, want %s", admitter.released, res.BuildID)
+	reg.applyBuildEvent(ctx, "n1", &routesync.BuildEvent{BuildID: res.BuildID, State: string(BuildReady)})
+	if len(admitter.released) != 1 || admitter.released[0] != "n1/"+wantLease {
+		t.Fatalf("released=%v, want n1/%q", admitter.released, wantLease)
+	}
+}
+
+func TestBuildAdmissionIsNodeScoped(t *testing.T) {
+	m := newBuildAdmissionManager()
+	cap := &routesync.BuildResources{CPU: 1000}
+	want := &routesync.BuildResources{CPU: 1000}
+	if !m.admit("n1", "same-build", cap, want) || !m.admit("n2", "same-build", cap, want) {
+		t.Fatal("same build id on different nodes should have independent admission")
+	}
+	if m.admit("n1", "other-build", cap, want) || m.admit("n2", "other-build", cap, want) {
+		t.Fatal("node-local capacity was not enforced")
+	}
+	m.release("n1", "same-build")
+	if !m.admit("n1", "other-build", cap, want) {
+		t.Fatal("releasing n1 did not free n1 capacity")
+	}
+	if m.admit("n2", "other-build", cap, want) {
+		t.Fatal("releasing n1 incorrectly freed n2 capacity")
+	}
+}
+
+func TestReserveBuildRejectsSameNodeIDCollisionAcrossGroups(t *testing.T) {
+	ctx := context.Background()
+	reg := testReg(t)
+	reg.SetPlacer(placementWithToken("n1"))
+	owner := &recordingNodeOwner{allow: true}
+	reg.SetNodeOwner(owner)
+
+	const buildID = "shared-build"
+	first, err := reg.ReserveBuild(ctx, BuildReserveReq{Group: "/g1", BuildID: buildID})
+	if err != nil {
+		t.Fatalf("first reserve: %v", err)
+	}
+	if first.NodeID != "n1" {
+		t.Fatalf("first placement=%+v", first)
+	}
+	if _, err := reg.ReserveBuild(ctx, BuildReserveReq{Group: "/g2", BuildID: buildID}); !errors.Is(err, errNodeBuildIDConflict) {
+		t.Fatalf("second reserve err=%v, want node build-id conflict", err)
+	}
+
+	ref, found, err := reg.stores.GetNodeBuildRef(ctx, "n1", buildID)
+	if err != nil || !found || ref.Group != "/g1" {
+		t.Fatalf("original ownership ref=%+v found=%v err=%v", ref, found, err)
+	}
+	if _, found, err := reg.stores.GetBuildInGroup(ctx, "/g2", buildID); err != nil || found {
+		t.Fatalf("conflicting build record remained: found=%v err=%v", found, err)
+	}
+	wantReleased := "n1/" + buildAdmissionID("/g2", buildID)
+	if len(owner.released) != 1 || owner.released[0] != wantReleased {
+		t.Fatalf("released=%q, want [%q]", owner.released, wantReleased)
+	}
+}
+
+func TestBuildEventsResolveSameIDByNodeOwnerTable(t *testing.T) {
+	ctx := context.Background()
+	reg := testReg(t)
+	for _, tc := range []struct {
+		node  string
+		group string
+	}{
+		{node: "n1", group: "/g1"},
+		{node: "n2", group: "/g2"},
+	} {
+		if err := reg.stores.PutBuild(ctx, &BuildRecord{Group: tc.group, BuildID: "same-build", NodeID: tc.node, State: BuildRegistered}); err != nil {
+			t.Fatal(err)
+		}
+		if err := reg.stores.AddNodeBuildRef(ctx, tc.node, clusterstate.NodeBuildRef{Group: tc.group, BuildID: "same-build"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	reg.applyBuildEvent(ctx, "n1", &routesync.BuildEvent{BuildID: "same-build", State: string(BuildBuilding)})
+	g1, found, err := reg.stores.GetBuildInGroup(ctx, "/g1", "same-build")
+	if err != nil || !found || g1.State != BuildBuilding {
+		t.Fatalf("g1 build=%+v found=%v err=%v", g1, found, err)
+	}
+	g2, found, err := reg.stores.GetBuildInGroup(ctx, "/g2", "same-build")
+	if err != nil || !found || g2.State != BuildRegistered {
+		t.Fatalf("n1 event changed g2 build=%+v found=%v err=%v", g2, found, err)
+	}
+}
+
+func TestTerminalBuildStoreRetryOutlivesLinkContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	attempts := 0
+	err := retryTerminalBuildStore(ctx, func(writeCtx context.Context) error {
+		if err := writeCtx.Err(); err != nil {
+			t.Fatalf("retry inherited canceled node-link context: %v", err)
+		}
+		attempts++
+		if attempts < 3 {
+			return shardkv.ErrQuorum
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("retry terminal build store: %v", err)
+	}
+	if attempts != 3 {
+		t.Fatalf("attempts=%d, want 3", attempts)
 	}
 }
 
@@ -273,7 +376,7 @@ func TestReserveBuildResourceAware(t *testing.T) {
 	}
 
 	// The first build finishes → releases the pool → a second build now fits.
-	reg.applyBuildEvent(ctx, "n1", &routesync.BuildEvent{BuildID: r1.BuildID, Group: "/g", State: "ready", TemplateID: "e2b-img-x"})
+	reg.applyBuildEvent(ctx, "n1", &routesync.BuildEvent{BuildID: r1.BuildID, State: "ready", TemplateID: "e2b-img-x"})
 	if rec, _, _ := reg.stores.GetBuildInGroup(ctx, "/g", r1.BuildID); rec.occupies() {
 		t.Fatal("a ready build should not occupy the pool")
 	}
