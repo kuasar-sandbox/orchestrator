@@ -123,7 +123,7 @@ func (r *Registry) ReserveBuild(ctx context.Context, req BuildReserveReq) (*Buil
 			continue
 		}
 		ack, err := r.nodeOwner.SendCommandAndWait(ctx, id, cmd, buildRegisterAckTimeout)
-		if buildAckTimeout(ctx, err) {
+		if commandAckTimedOut(ctx, err) {
 			return r.buildReserveResult(ctx, rec), nil
 		}
 		if err != nil || ack == nil || ack.Status != routesync.AckAccepted {
@@ -144,10 +144,6 @@ func (r *Registry) ReserveBuild(ctx context.Context, req BuildReserveReq) (*Buil
 		}
 		return r.buildReserveResult(ctx, rec), nil
 	}
-}
-
-func buildAckTimeout(ctx context.Context, err error) bool {
-	return err != nil && ctx.Err() == nil && errors.Is(err, context.DeadlineExceeded)
 }
 
 func (r *Registry) buildReserveResult(ctx context.Context, rec *BuildRecord) *BuildReserveResult {

@@ -12,10 +12,11 @@ import (
 )
 
 type rpcNodeOwner struct {
-	ops      []string
-	admit    bool
-	released []string
-	ackErr   error
+	ops        []string
+	admit      bool
+	released   []string
+	ackErr     error
+	runtimeErr error
 }
 
 func (o *rpcNodeOwner) PutManifestKey(ctx context.Context, nodeID, fingerprint, keyType, keyValue string, expiresUnix int64) error {
@@ -38,6 +39,9 @@ func (o *rpcNodeOwner) ReleaseBuild(ctx context.Context, buildID string) {
 }
 
 func (o *rpcNodeOwner) Runtime(ctx context.Context, nodeID string) (*NodeRecord, bool, error) {
+	if o.runtimeErr != nil {
+		return nil, false, o.runtimeErr
+	}
 	return &NodeRecord{NodeID: nodeID, DataEndpoint: "10.0.0.1:8443"}, true, nil
 }
 
@@ -118,5 +122,18 @@ func TestHTTPNodeOwnerPreservesCommandWaitDeadline(t *testing.T) {
 	_, err := client.SendCommandAndWait(ctx, "n1", &routesync.Command{CmdID: "c1", Kind: routesync.CmdBuildRegister}, time.Second)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("SendCommandAndWait err=%v, want context deadline", err)
+	}
+}
+
+func TestHTTPNodeOwnerPreservesNodeGone(t *testing.T) {
+	owner := &rpcNodeOwner{runtimeErr: ErrNodeGone}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ServeNodeOwner(w, r, owner)
+	}))
+	defer srv.Close()
+
+	client := NewHTTPNodeOwner(srv.URL, srv.Client())
+	if _, _, err := client.Runtime(context.Background(), "n1"); !errors.Is(err, ErrNodeGone) {
+		t.Fatalf("Runtime err=%v, want ErrNodeGone", err)
 	}
 }

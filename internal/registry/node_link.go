@@ -294,6 +294,7 @@ func (r *Registry) serveNodeLinkLocal(ctx context.Context, w io.Writer, flush fu
 
 	r.addNode(conn)
 	defer r.removeNode(conn)
+	go r.projectRegisteredNode(ctx, nr.NodeID)
 	r.log.Info("node-link: node connected", "node", nr.NodeID, "labels", nr.Labels)
 
 	heartbeatCh := make(chan *routesync.Heartbeat, 1)

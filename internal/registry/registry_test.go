@@ -761,6 +761,8 @@ type remoteLifecycleOwner struct {
 type remoteRouteWriteOwner struct {
 	node     *NodeRecord
 	onCreate func(*routesync.Command)
+	ackErr   error
+	commands int
 }
 
 func (o *remoteRouteWriteOwner) PutManifestKey(context.Context, string, string, string, string, int64) error {
@@ -786,8 +788,12 @@ func (o *remoteRouteWriteOwner) SendCommand(context.Context, string, *routesync.
 }
 
 func (o *remoteRouteWriteOwner) SendCommandAndWait(ctx context.Context, nodeID string, cmd *routesync.Command, timeout time.Duration) (*routesync.CmdAck, error) {
+	o.commands++
 	if o.onCreate != nil && cmd != nil && cmd.Kind == routesync.CmdCreate {
 		o.onCreate(cmd)
+	}
+	if o.ackErr != nil {
+		return nil, o.ackErr
 	}
 	return &routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted}, nil
 }
@@ -1268,6 +1274,37 @@ func TestParkTimeoutRollback(t *testing.T) {
 	}
 }
 
+func TestRollbackReserveDropsReplacementNodeRef(t *testing.T) {
+	ctx := context.Background()
+	reg := testReg(t)
+	orig := &SandboxRecord{Group: "/g", RouteKey: "rk", SID: "sb-old", State: StateReady, NodeID: "old"}
+	reserved := &SandboxRecord{Group: "/g", RouteKey: "rk", SID: "sb-new", State: StateReserved, NodeID: "new"}
+	if _, err := reg.stores.PutSandbox(ctx, reserved); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "new"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.stores.AddNodeSandboxRef(ctx, "new", clusterstate.NodeSandboxRef{
+		Group: "/g", RouteKey: "rk", SandboxID: "sb-new",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	reg.rollbackReserve("/g", "rk", orig, true)
+	got, _, found, err := reg.stores.GetSandbox(ctx, "/g", "rk")
+	if err != nil || !found || got.SID != "sb-old" || got.NodeID != "old" {
+		t.Fatalf("restored route=%+v found=%v err=%v", got, found, err)
+	}
+	node, found, err := reg.stores.GetNode(ctx, "new")
+	if err != nil || !found {
+		t.Fatalf("replacement node=%+v found=%v err=%v", node, found, err)
+	}
+	if len(node.Sandboxes) != 0 {
+		t.Fatalf("replacement node retained sandbox ref: %+v", node.Sandboxes)
+	}
+}
+
 func TestReplaceOnRejectSucceeds(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
@@ -1328,6 +1365,11 @@ func TestReserveSandboxSkipsDisconnectedCatalogNode(t *testing.T) {
 	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "live"}); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := reg.stores.PutSandbox(ctx, &SandboxRecord{
+		Group: "/g", RouteKey: "rk", SID: "sb-stale", State: StateReady, NodeID: "stale",
+	}); err != nil {
+		t.Fatal(err)
+	}
 	reg.addNode(&fakeConn{nodeID: "live", onCmd: func(cmd *routesync.Command) {
 		if cmd.Kind != routesync.CmdCreate {
 			return
@@ -1344,6 +1386,27 @@ func TestReserveSandboxSkipsDisconnectedCatalogNode(t *testing.T) {
 	}
 	if res.NodeID != "live" || !sawExclusion {
 		t.Fatalf("result=%+v saw stale exclusion=%v", res, sawExclusion)
+	}
+}
+
+func TestReserveSandboxDoesNotRePlaceAfterCreateAckTimeout(t *testing.T) {
+	ctx := context.Background()
+	placements := 0
+	reg := New(NewStores(), placementFunc(func(context.Context, PlaceRequest) (*Placement, error) {
+		placements++
+		return &Placement{NodeID: "n1"}, nil
+	}), 30*time.Millisecond, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	owner := &remoteRouteWriteOwner{
+		node:   &NodeRecord{NodeID: "n1", DataEndpoint: "127.0.0.1:12345"},
+		ackErr: context.DeadlineExceeded,
+	}
+	reg.SetNodeOwner(owner)
+
+	if _, err := reg.ReserveSandbox(ctx, "/g", "rk", nil); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("ReserveSandbox err=%v, want park timeout", err)
+	}
+	if placements != 1 || owner.commands != 1 {
+		t.Fatalf("ambiguous create was retried: placements=%d commands=%d", placements, owner.commands)
 	}
 }
 

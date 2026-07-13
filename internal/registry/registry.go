@@ -436,6 +436,9 @@ func (r *Registry) rollbackReserve(group, routeKey string, orig *SandboxRecord, 
 		return // already resolved (READY) / gone — nothing to roll back
 	}
 	if found {
+		if cur.NodeID != "" && (cur.NodeID != orig.NodeID || cur.SID != orig.SID) {
+			_ = r.stores.RemoveNodeSandboxRef(ctx, cur.NodeID, group, routeKey, cur.SID)
+		}
 		_, _ = r.stores.PutSandbox(ctx, orig)
 	} else {
 		_ = r.stores.DeleteSandbox(ctx, group, routeKey)
@@ -479,14 +482,19 @@ func (r *Registry) startReserve(ctx context.Context, group, routeKey string, rec
 	}
 
 	// NONE: place + create.
-	return r.placeAndCreate(ctx, group, routeKey, createConfig)
+	var replaceReady *SandboxRecord
+	if found && rec != nil && rec.State == StateReady {
+		copy := *rec
+		replaceReady = &copy
+	}
+	return r.placeAndCreate(ctx, group, routeKey, createConfig, replaceReady)
 }
 
 // placeAndCreate places a node and sends the create command, CASing the RESERVED
 // record. node_list is only a catalog: the selected node owner validates its
 // live connection before commit. An unusable candidate is excluded from the next
 // placement request so stale catalog entries cannot prevent a live alternative.
-func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, createConfig map[string]string) error {
+func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, createConfig map[string]string, replaceReady *SandboxRecord) error {
 	excluded := placementExclusions{}
 	casConflicts := 0
 	var lastFailure error
@@ -498,8 +506,8 @@ func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, c
 		if err != nil {
 			return err
 		}
-		if curFound && cur.State == StateReady {
-			return nil // a concurrent attempt already won; the running route finishes the Reserve
+		if curFound && cur.State == StateReady && !sameSandboxGeneration(cur, replaceReady) {
+			return nil // a concurrent replacement already won; the running route finishes the Reserve
 		}
 		sid := "sb-" + newID()
 		placement, perr := r.placer.Place(ctx, PlaceRequest{
@@ -560,9 +568,15 @@ func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, c
 			continue
 		}
 		ack, err := r.nodeOwner.SendCommandAndWait(ctx, nodeID, cmd, lifecycleAckTimeout)
+		if commandAckTimedOut(ctx, err) {
+			return nil // delivery is ambiguous; wait for the authoritative route event
+		}
 		if err != nil {
 			_ = r.stores.DeleteSandbox(ctx, group, routeKey)
 			_ = r.stores.RemoveNodeSandboxRef(ctx, nodeID, group, routeKey, sid)
+			if !errors.Is(err, ErrNodeGone) {
+				return err
+			}
 			lastFailure = err
 			excluded.add(nodeID)
 			continue
@@ -1010,8 +1024,18 @@ func (r *Registry) updateNodeRegister(ctx context.Context, nr *routesync.NodeReg
 	if _, err := r.stores.putNodeLink(ctx, rec); err != nil {
 		return err
 	}
-	r.putNodeListProjection(ctx, rec)
 	return nil
+}
+
+func (r *Registry) projectRegisteredNode(ctx context.Context, nodeID string) {
+	if _, live := r.node(nodeID); !live {
+		return
+	}
+	rec, found, err := r.getNodeForLinkUpdate(ctx, nodeID)
+	if err != nil || !found {
+		return
+	}
+	r.putNodeListProjection(ctx, rec)
 }
 
 // updateHeartbeat folds a node's water level into its record + stamps liveness.

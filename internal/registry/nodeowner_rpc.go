@@ -173,6 +173,9 @@ func (o *HTTPNodeOwner) call(ctx context.Context, in nodeOwnerRequest) (nodeOwne
 		return nodeOwnerResponse{}, err
 	}
 	if out.Error != "" {
+		if out.Error == ErrNodeGone.Error() {
+			return out, ErrNodeGone
+		}
 		return out, fmt.Errorf("%s", out.Error)
 	}
 	if resp.StatusCode >= 300 {

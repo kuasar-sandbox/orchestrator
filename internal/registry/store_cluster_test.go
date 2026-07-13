@@ -551,6 +551,39 @@ func TestNodeRegisterUsesProfileReadWhenLocalIsNotNodeShardOwner(t *testing.T) {
 	}
 }
 
+func TestNodeRegisterProjectsOnlyAfterConnectionIsLive(t *testing.T) {
+	ctx := context.Background()
+	reg := testReg(t)
+	if err := reg.updateNodeRegister(ctx, &routesync.NodeRegister{
+		NodeID: "n1", Capacity: 10, DataEndpoint: "127.0.0.1:19001",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	reg.projectRegisteredNode(ctx, "n1")
+	found := false
+	if err := reg.stores.RangeNodeList(ctx, func(entry clusterstate.NodeListEntry) error {
+		found = found || entry.NodeID == "n1"
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if found {
+		t.Fatal("registering node was projected before its node-link became live")
+	}
+
+	reg.addNode(&fakeConn{nodeID: "n1"})
+	reg.projectRegisteredNode(ctx, "n1")
+	if err := reg.stores.RangeNodeList(ctx, func(entry clusterstate.NodeListEntry) error {
+		found = found || entry.NodeID == "n1"
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !found {
+		t.Fatal("live registered node was not projected")
+	}
+}
+
 func TestNodeRegisterDoesNotFailWhenNodeListProjectionUnavailable(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -564,6 +597,8 @@ func TestNodeRegisterDoesNotFailWhenNodeListProjectionUnavailable(t *testing.T) 
 	}); err != nil {
 		t.Fatalf("updateNodeRegister should keep node_link alive when node_list projection fails: %v", err)
 	}
+	reg.addNode(&fakeConn{nodeID: nodeID})
+	reg.projectRegisteredNode(ctx, nodeID)
 	profile, found, err := stores.GetNodeProfile(ctx, nodeID)
 	if err != nil || !found || profile.DataEndpoint != "127.0.0.1:19001" || profile.LinkOwner != "a" {
 		t.Fatalf("profile after register=%+v found=%v err=%v", profile, found, err)
@@ -586,6 +621,8 @@ func TestNodeRegisterRetriesNodeListProjectionAfterQuorumRecovers(t *testing.T) 
 	}); err != nil {
 		t.Fatalf("updateNodeRegister: %v", err)
 	}
+	reg.addNode(&fakeConn{nodeID: nodeID})
+	reg.projectRegisteredNode(ctx, nodeID)
 
 	transport := shardkv.TransportFunc(func(ctx context.Context, member shardkv.MemberID, req shardkv.Request) (shardkv.Response, error) {
 		store := cluster[string(member)]
@@ -627,6 +664,8 @@ func TestConcurrentHeartbeatsDoNotRewriteNodeListAcrossDeadAfter(t *testing.T) {
 		if err := reg.updateNodeRegister(ctx, &routesync.NodeRegister{NodeID: nodeID, Capacity: 1}); err != nil {
 			t.Fatalf("register %s: %v", nodeID, err)
 		}
+		reg.addNode(&fakeConn{nodeID: nodeID})
+		reg.projectRegisteredNode(ctx, nodeID)
 	}
 	before, err := reg.stores.NodeListRev(ctx)
 	if err != nil {

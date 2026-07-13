@@ -2,6 +2,7 @@ package registry
 
 import (
 	"context"
+	"errors"
 	"sort"
 )
 
@@ -48,4 +49,12 @@ func (r *Registry) nodeRuntimeLive(ctx context.Context, nodeID string) error {
 		return ErrNodeGone
 	}
 	return nil
+}
+
+func sameSandboxGeneration(a, b *SandboxRecord) bool {
+	return a != nil && b != nil && a.SID == b.SID && a.NodeID == b.NodeID
+}
+
+func commandAckTimedOut(ctx context.Context, err error) bool {
+	return err != nil && ctx.Err() == nil && errors.Is(err, context.DeadlineExceeded)
 }
