@@ -50,9 +50,8 @@ type Service struct {
 	watchCancel context.CancelFunc
 	startedCtx  context.Context
 
-	cfg       clustercfg.PlacementConfig
-	deadAfter int64 // node_dead_after seconds (node-alive eligibility, §4.2)
-	log       *slog.Logger
+	cfg clustercfg.PlacementConfig
+	log *slog.Logger
 
 	nodes    *nodeView
 	provider clusterstate.SandboxGroupProvider
@@ -77,15 +76,15 @@ type RegistryLink struct {
 
 // NewRemote builds a standalone placer connected to registry control paths. The
 // address may be a UDS path, host:port, or http(s) URL.
-func NewRemote(scaleAddr string, scaleTLS *tls.Config, cfg clustercfg.PlacementConfig, deadAfter int64, log *slog.Logger) *Service {
-	return NewRemoteLinks([]RegistryLink{registryLinkFromAddress("registry", scaleAddr, scaleTLS)}, cfg, deadAfter, log)
+func NewRemote(scaleAddr string, scaleTLS *tls.Config, cfg clustercfg.PlacementConfig, log *slog.Logger) *Service {
+	return NewRemoteLinks([]RegistryLink{registryLinkFromAddress("registry", scaleAddr, scaleTLS)}, cfg, log)
 }
 
-func NewRemoteLinks(links []RegistryLink, cfg clustercfg.PlacementConfig, deadAfter int64, log *slog.Logger) *Service {
-	return NewRemoteLinksWithGroups(links, emptyGroupProvider{}, nil, cfg, deadAfter, log)
+func NewRemoteLinks(links []RegistryLink, cfg clustercfg.PlacementConfig, log *slog.Logger) *Service {
+	return NewRemoteLinksWithGroups(links, emptyGroupProvider{}, nil, cfg, log)
 }
 
-func NewRemoteLinksWithGroups(links []RegistryLink, provider clusterstate.SandboxGroupProvider, sources []ImportSource, cfg clustercfg.PlacementConfig, deadAfter int64, log *slog.Logger) *Service {
+func NewRemoteLinksWithGroups(links []RegistryLink, provider clusterstate.SandboxGroupProvider, sources []ImportSource, cfg clustercfg.PlacementConfig, log *slog.Logger) *Service {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -110,7 +109,7 @@ func NewRemoteLinksWithGroups(links []RegistryLink, provider clusterstate.Sandbo
 	runID := newRunID()
 	return &Service{
 		links: links, watchLinks: links,
-		cfg: cfg, deadAfter: deadAfter, log: log,
+		cfg: cfg, log: log,
 		nodes:              newNodeView(1),
 		provider:           provider,
 		runID:              runID,
@@ -433,7 +432,7 @@ func (s *Service) answer(ctx context.Context, req *routesync.PlaceReq) *routesyn
 	p := placeParams{
 		group: req.Group, nodes: s.nodes.values(), selectors: g.hint.NodeSelectors,
 		rules: s.cfg.ShuffleSharding, candidates: s.cfg.Candidates,
-		zoneAdmitMax: s.cfg.ZoneAdmitMax, deadAfter: s.deadAfter, now: time.Now().Unix(),
+		zoneAdmitMax: s.cfg.ZoneAdmitMax, excludedNodeIDs: nodeIDSet(req.ExcludeNodeIDs),
 		targetRuntimeDigest: req.TargetRuntimeDigest,
 	}
 	var node string
@@ -1120,9 +1119,9 @@ func decodeNodeList(raw json.RawMessage) (*registry.NodeRecord, bool) {
 		return nil, false
 	}
 	return &registry.NodeRecord{
+		Meta:   n.SourceMeta,
 		NodeID: n.NodeID, Labels: n.Labels, Capacity: n.Capacity, BuildCapacity: n.BuildCapacity,
 		DataEndpoint: n.DataEndpoint, RuntimeDigest: n.RuntimeDigest, Draining: n.Draining,
-		LastHeartbeatUnix: n.LastHeartbeatUnix,
 	}, true
 }
 
@@ -1333,10 +1332,29 @@ func (v *nodeView) values() []*registry.NodeRecord {
 }
 
 func fresherNode(a, b *registry.NodeRecord) bool {
-	if a.LastHeartbeatUnix != b.LastHeartbeatUnix {
-		return a.LastHeartbeatUnix > b.LastHeartbeatUnix
+	if a.Meta.Ballot.Less(b.Meta.Ballot) {
+		return false
+	}
+	if b.Meta.Ballot.Less(a.Meta.Ballot) {
+		return true
+	}
+	if a.Meta.Rev != b.Meta.Rev {
+		return a.Meta.Rev > b.Meta.Rev
 	}
 	return a.NodeID < b.NodeID
+}
+
+func nodeIDSet(ids []string) map[string]struct{} {
+	if len(ids) == 0 {
+		return nil
+	}
+	out := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		if id != "" {
+			out[id] = struct{}{}
+		}
+	}
+	return out
 }
 
 func cloneNodeRecord(in *registry.NodeRecord) *registry.NodeRecord {

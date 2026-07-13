@@ -43,18 +43,30 @@ func TestPlaceDraining(t *testing.T) {
 	}
 }
 
-func TestPlaceZoneAndAlive(t *testing.T) {
-	// A red node is excluded when zone_admit_max=yellow; a stale node is excluded.
+func TestPlaceZoneAndRequestExclusions(t *testing.T) {
 	ns := nodes(
 		&registry.NodeRecord{NodeID: "red", Zone: "red", Counts: 0},
-		&registry.NodeRecord{NodeID: "ok", Zone: "yellow", Counts: 9, LastHeartbeatUnix: 1000},
-		&registry.NodeRecord{NodeID: "stale", Zone: "green", Counts: 0, LastHeartbeatUnix: 100},
+		&registry.NodeRecord{NodeID: "ok", Zone: "yellow", Counts: 9},
+		&registry.NodeRecord{NodeID: "excluded", Zone: "green", Counts: 0},
 	)
 	for i := 0; i < 30; i++ {
-		node, err := placeSandbox(placeParams{group: "/g", nodes: ns, candidates: 3, zoneAdmitMax: "yellow", deadAfter: 30, now: 1000})
+		node, err := placeSandbox(placeParams{
+			group: "/g", nodes: ns, candidates: 3, zoneAdmitMax: "yellow",
+			excludedNodeIDs: map[string]struct{}{"excluded": {}},
+		})
 		if err != nil || node != "ok" {
-			t.Fatalf("placed %q err=%v (want ok: red zone + stale excluded)", node, err)
+			t.Fatalf("placed %q err=%v (want ok: red zone + request exclusion)", node, err)
 		}
+	}
+}
+
+func TestPlaceDoesNotInferLivenessFromCatalogTimestamp(t *testing.T) {
+	node, err := placeSandbox(placeParams{
+		group: "/g",
+		nodes: nodes(&registry.NodeRecord{NodeID: "n1", LastHeartbeatUnix: 1}),
+	})
+	if err != nil || node != "n1" {
+		t.Fatalf("placed %q err=%v, want catalog candidate n1", node, err)
 	}
 }
 

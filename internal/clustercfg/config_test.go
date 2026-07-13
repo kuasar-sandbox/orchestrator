@@ -52,7 +52,7 @@ func TestLoadPlacerPartialAppliesDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	if c.Placement.Candidates != 3 || c.Placement.ZoneAdmitMax != "yellow" || c.Placement.NodeDeadAfter != "30s" ||
+	if c.Placement.Candidates != 3 || c.Placement.ZoneAdmitMax != "yellow" ||
 		c.Placement.ImportSourceOwnerCount != 3 || c.Placement.ImportSourceLeaseTTL != "15s" || c.Placement.SelectorPatchRefresh != "1m" {
 		t.Fatalf("placement merge wrong: %+v", c.Placement)
 	}

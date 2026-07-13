@@ -38,7 +38,7 @@ func (a *recordingNodeOwner) ReleaseBuild(ctx context.Context, buildID string) {
 }
 
 func (a *recordingNodeOwner) Runtime(ctx context.Context, nodeID string) (*NodeRecord, bool, error) {
-	return nil, false, nil
+	return &NodeRecord{NodeID: nodeID}, true, nil
 }
 
 func (a *recordingNodeOwner) DeleteSandbox(ctx context.Context, nodeID, sid string) error {
@@ -115,6 +115,62 @@ func TestReserveBuildKeepsCommittedBuildOnAckTimeout(t *testing.T) {
 	}
 	if len(owner.released) != 0 {
 		t.Fatalf("ack timeout should not release an ambiguous build admission: %v", owner.released)
+	}
+}
+
+func TestReserveBuildSkipsDisconnectedCatalogNode(t *testing.T) {
+	ctx := context.Background()
+	reg := testReg(t)
+	var sawExclusion bool
+	reg.SetPlacer(placementFunc(func(_ context.Context, req PlaceRequest) (*Placement, error) {
+		for _, nodeID := range req.ExcludeNodeIDs {
+			if nodeID == "stale" {
+				sawExclusion = true
+				return &Placement{NodeID: "live"}, nil
+			}
+		}
+		return &Placement{NodeID: "stale"}, nil
+	}))
+	for _, nodeID := range []string{"stale", "live"} {
+		if err := reg.stores.PutNode(ctx, &NodeRecord{
+			NodeID: nodeID, BuildCapacity: &routesync.BuildResources{CPU: 2000},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	reg.addNode(buildAckConn(reg, "live"))
+
+	res, err := reg.ReserveBuild(ctx, BuildReserveReq{
+		Group: "/g", Resources: &routesync.BuildResources{CPU: 1000},
+	})
+	if err != nil {
+		t.Fatalf("ReserveBuild: %v", err)
+	}
+	if res.NodeID != "live" || !sawExclusion {
+		t.Fatalf("result=%+v saw stale exclusion=%v", res, sawExclusion)
+	}
+}
+
+func TestLocalNodeOwnerRequiresLiveConnection(t *testing.T) {
+	ctx := context.Background()
+	reg := testReg(t)
+	if err := reg.stores.PutNode(ctx, &NodeRecord{
+		NodeID: "n1", BuildCapacity: &routesync.BuildResources{CPU: 2000},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if node, found, err := reg.localNodeOwner.Runtime(ctx, "n1"); !errors.Is(err, ErrNodeGone) || found || node != nil {
+		t.Fatalf("disconnected Runtime node=%+v found=%v err=%v", node, found, err)
+	}
+	if reg.localNodeOwner.AdmitBuild(ctx, "n1", "b1", &routesync.BuildResources{CPU: 1000}) {
+		t.Fatal("disconnected node was admitted for build")
+	}
+	reg.addNode(&fakeConn{nodeID: "n1"})
+	if node, found, err := reg.localNodeOwner.Runtime(ctx, "n1"); err != nil || !found || node == nil {
+		t.Fatalf("connected Runtime node=%+v found=%v err=%v", node, found, err)
+	}
+	if !reg.localNodeOwner.AdmitBuild(ctx, "n1", "b1", &routesync.BuildResources{CPU: 1000}) {
+		t.Fatal("connected node was not admitted for build")
 	}
 }
 

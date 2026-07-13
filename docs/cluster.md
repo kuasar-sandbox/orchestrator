@@ -99,7 +99,7 @@ membership:
 node_link:
   # listen: ""                 # 空 = 复用 member.listen;非空 = 独立 node 长连接监听
   heartbeat_interval: 10s
-  node_dead_after: 30s
+  node_dead_after: 30s          # node-link 断线后清理持久状态的等待时间
 
 route_link:
   park_timeout: 30s
@@ -599,9 +599,10 @@ node_link 流按事件重要性处理:
 这样 Reserve 的 READY route report 不会被心跳持久化阻塞。若 READY 晚于 park timeout 到达,route owner 会按
 当前 `(group,route_key,sandbox_id)` 判定为 orphan 并删除 node 上孤儿 sandbox;但这应是异常退避路径,不是常态。
 
-高频水位不通过 node_list 高频扇出。低频 liveness / draining / profile 变化才投影到 node_list。
-node_link profile 写入失败会拒绝订阅;node_list 投影失败不应断开 node_link,后续 register/heartbeat/resync 会再次
-投影。
+高频水位和 liveness 不投影到 node_list。node_list 只承载注册时的 labels/capacity/endpoint/runtime 等目录字段
+以及 draining 变化。node owner 持有的当前 node-link 连接是唯一存活权威；route owner 在 create/build 提交前
+验证连接，失败候选加入本次 placement 的排除集合并重选。node_link profile 写入失败会拒绝订阅；node_list
+投影失败不应断开 node_link，后续 register/heartbeat/resync 会重试待完成的目录投影。
 
 ### 6.3 增量订阅
 
@@ -885,7 +886,7 @@ manifest_key 由 placer/provider 侧负责导入导出。
 |---|---|
 | router 崩溃 | 丢本地缓存;重启后 miss 重新 Reserve |
 | placer 崩溃 | registry 对同 group failover 到下一个 ready placer;热路径不受影响 |
-| node_link 断线 | node owner 保留最后视图,node_dead_after 后 node_list 失效;node 重连后全量/增量重报 |
+| node_link 断线 | node owner 立即拒绝该 node 的新提交；route owner 排除并重选；node_dead_after 后清理 node profile/node_list 和关联执行态；node 重连后全量/增量重报 |
 | node 整机重启 | node 清空运行态;缺失 sandbox 经 node 上报/清理收敛为 dead route |
 | registry 单成员故障 | owner set quorum 足够时继续服务;恢复后由同 shard 访问或事实源上报触发 read-repair |
 | registry 多成员故障导致 quorum 不足 | 对应 shard 停写,不降级乱写 |
@@ -895,7 +896,7 @@ manifest_key 由 placer/provider 侧负责导入导出。
 ## 15. 性能
 
 - 数据面热路径:router active cache / route cache 命中后直转 node,不访问 registry。
-- Place 冷路径:group 经 route_link owner -> ready placer failover -> node owner admission。
+- Place 冷路径:group 经 route_link owner -> ready placer failover -> node owner 在线校验/admission；失败候选排除后重选。
 - 海量 group:router 不订阅 group;registry 不跨 group 扫描;placer import 按 source_id 独立分页。
 - 海量 node:node_link 按 node_id 分片;node_list 只承载低频目录,不承载高频水位。
 - membership 变更:不做全局 promoter;由 node 上报、group 请求、source import、read-repair 自然收敛。

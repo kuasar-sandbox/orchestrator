@@ -1271,32 +1271,79 @@ func TestParkTimeoutRollback(t *testing.T) {
 func TestReplaceOnRejectSucceeds(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
-	reg.SetPlacer(placementWithToken("n1"))
+	reg.SetPlacer(placementFunc(func(_ context.Context, req PlaceRequest) (*Placement, error) {
+		for _, nodeID := range req.ExcludeNodeIDs {
+			if nodeID == "n1" {
+				return &Placement{NodeID: "n2"}, nil
+			}
+		}
+		return &Placement{NodeID: "n1"}, nil
+	}))
 	reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"})
+	reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n2"})
 	creates := 0
-	conn := &fakeConn{nodeID: "n1"}
-	conn.onCmd = func(cmd *routesync.Command) {
+	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(cmd *routesync.Command) {
 		if cmd.Kind != routesync.CmdCreate {
 			return
 		}
 		creates++
-		if creates == 1 {
-			go reg.ackCommand(&routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckRejected, Reason: "transient"})
+		go reg.ackCommand(&routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckRejected, Reason: "transient"})
+	}})
+	reg.addNode(&fakeConn{nodeID: "n2", onCmd: func(cmd *routesync.Command) {
+		if cmd.Kind != routesync.CmdCreate {
 			return
 		}
+		creates++
 		go reg.ackCommand(&routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted})
-		go reg.applyRoute(context.Background(), "n1", &routesync.RouteEntry{
+		go reg.applyRoute(context.Background(), "n2", &routesync.RouteEntry{
 			SandboxID: cmd.SID, Group: cmd.Group, RouteKey: cmd.RouteKey, State: routesync.StateRunning, AccessToken: "tok",
 		})
-	}
-	reg.addNode(conn)
+	}})
 
 	res, err := reg.ReserveSandbox(ctx, "/g", "rk", nil)
 	if err != nil {
-		t.Fatalf("reserve should succeed after one re-place: %v", err)
+		t.Fatalf("reserve should succeed after excluding the rejected node: %v", err)
 	}
-	if res.NodeID != "n1" || creates != 2 {
-		t.Fatalf("expected 2 creates (reject then re-place success); got %d creates, res=%+v", creates, res)
+	if res.NodeID != "n2" || creates != 2 {
+		t.Fatalf("expected n1 reject then n2 success; got %d creates, res=%+v", creates, res)
+	}
+}
+
+func TestReserveSandboxSkipsDisconnectedCatalogNode(t *testing.T) {
+	ctx := context.Background()
+	reg := testReg(t)
+	var sawExclusion bool
+	reg.SetPlacer(placementFunc(func(_ context.Context, req PlaceRequest) (*Placement, error) {
+		for _, nodeID := range req.ExcludeNodeIDs {
+			if nodeID == "stale" {
+				sawExclusion = true
+				return &Placement{NodeID: "live"}, nil
+			}
+		}
+		return &Placement{NodeID: "stale"}, nil
+	}))
+	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "stale"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "live"}); err != nil {
+		t.Fatal(err)
+	}
+	reg.addNode(&fakeConn{nodeID: "live", onCmd: func(cmd *routesync.Command) {
+		if cmd.Kind != routesync.CmdCreate {
+			return
+		}
+		go reg.ackCommand(&routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted})
+		go reg.applyRoute(context.Background(), "live", &routesync.RouteEntry{
+			SandboxID: cmd.SID, Group: cmd.Group, RouteKey: cmd.RouteKey, State: routesync.StateRunning,
+		})
+	}})
+
+	res, err := reg.ReserveSandbox(ctx, "/g", "rk", nil)
+	if err != nil {
+		t.Fatalf("ReserveSandbox: %v", err)
+	}
+	if res.NodeID != "live" || !sawExclusion {
+		t.Fatalf("result=%+v saw stale exclusion=%v", res, sawExclusion)
 	}
 }
 
@@ -1364,13 +1411,13 @@ func TestNodeListWatchProjectsLowFrequencyFields(t *testing.T) {
 	if err := json.Unmarshal(put.Value, &raw); err != nil {
 		t.Fatal(err)
 	}
-	if raw["node_id"] != "n1" || raw["data_endpoint"] == "" || raw["runtime_digest"] != "rt1" || raw["last_heartbeat_unix"] == nil {
+	if raw["node_id"] != "n1" || raw["data_endpoint"] == "" || raw["runtime_digest"] != "rt1" {
 		t.Fatalf("node_list value = %v", raw)
 	}
 	if _, ok := raw["build_capacity"].(map[string]any); !ok {
 		t.Fatalf("node_list missing build_capacity: %v", raw)
 	}
-	for _, field := range []string{"allocated", "pool", "counts", "build_alloc"} {
+	for _, field := range []string{"last_heartbeat_unix", "allocated", "pool", "counts", "build_alloc"} {
 		if _, ok := raw[field]; ok {
 			t.Fatalf("node_list exposed high-frequency field %q: %v", field, raw)
 		}

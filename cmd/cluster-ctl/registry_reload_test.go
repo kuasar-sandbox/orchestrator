@@ -106,19 +106,6 @@ func TestRegistryMemberClientsSeparateShardAndNodeOwnerTimeouts(t *testing.T) {
 	}
 }
 
-func TestNewRegistryStoresSetsNodeListHeartbeatRefresh(t *testing.T) {
-	cfg := loadRegistryReloadTestConfig(t, registryReloadTestConfig(1, 0, "registry-b", map[int][]string{
-		1: {"registry-a", "registry-b", "registry-c"},
-	}))
-	stores, _, err := newRegistryStores(cfg, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := stores.NodeListHeartbeatRefreshSec(); got != 1 {
-		t.Fatalf("node_list heartbeat refresh sec = %d, want 1 for node_dead_after=3s", got)
-	}
-}
-
 func TestRegistryMemberRuntimeWaitReadyRejectsMissingOwner(t *testing.T) {
 	oldPoll := registryMembershipReadyPoll
 	registryMembershipReadyPoll = 5 * time.Millisecond

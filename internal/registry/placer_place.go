@@ -97,6 +97,7 @@ func (p *HTTPPlacer) placeOne(ctx context.Context, peer PlacerPeer, req PlaceReq
 		Config:              req.Config,
 		Build:               req.Build,
 		TargetRuntimeDigest: req.TargetRuntimeDigest,
+		ExcludeNodeIDs:      req.ExcludeNodeIDs,
 	})
 	u, err := placerURL(peer.Advertise, PlacerLinkPlacePath)
 	if err != nil {

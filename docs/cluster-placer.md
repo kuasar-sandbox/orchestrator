@@ -75,7 +75,6 @@ import_groups:
 placement:
   candidates: 2
   zone_admit_max: yellow
-  node_dead_after: 30s
   import_source_owner_count: 3
   import_source_lease_ttl: 15s
   selector_patch_refresh_interval: 1m
@@ -95,7 +94,6 @@ placement:
 | `import_groups[]` | standalone placer 的 group source;内置 `source_type=file` |
 | `placement.candidates` | placer 内部 P2C 候选数量 |
 | `placement.zone_admit_max` | 可放置最高水位 |
-| `placement.node_dead_after` | 排除静默过久 node 的窗口 |
 | `placement.import_source_owner_count` | 每个 source 可参与 lease 竞争的 placer 候选数 |
 | `placement.import_source_lease_ttl` | registry 侧 source lease TTL |
 | `placement.selector_patch_refresh_interval` | unchanged selector patch 刷新周期 |
@@ -299,7 +297,7 @@ registry 不对 placer 做 P2C。P2C 只用于 placer 内部从 node 候选中�
 输入:
 
 ```text
-group, route_key, sandbox_id, target_runtime_digest?, config?
+group, route_key, sandbox_id, target_runtime_digest?, config?, exclude_node_ids?
 ```
 
 流程:
@@ -311,7 +309,7 @@ provider.GetPlacementHint(group)
 filter node_list:
   selector match
   not draining
-  alive
+  not in exclude_node_ids
   zone <= admit max
   runtime digest match
   shuffle slot match
@@ -323,7 +321,9 @@ P2C over candidates
 return node_id + create_spec + key intent + access_token + runtime/template hints
 ```
 
-若 node owner admission 或 create 后续拒绝,route owner 可换下一个 placer 或重新 Place。
+`node_list` 只提供低频目录,不判定 node 是否在线。route owner 在提交前向 node owner 查询当前
+node-link 连接；断线、admission 拒绝或命令拒绝的候选加入 `exclude_node_ids`,随后重新 Place,直到选中
+在线候选或 placer 返回无候选。node owner 是唯一存活权威。
 
 ### 8.3 PlaceBuild
 
@@ -336,9 +336,10 @@ group, build_id, template_id, resources
 Build placement 与 sandbox 类似,但候选需要 build headroom。最终预算权威在 node owner:
 
 1. placer 返回建议 node。
-2. route owner 调 node owner `AdmitBuild(build_id, resources, ttl)`。
-3. node owner 若余量不足直接拒绝。
-4. route owner 重调度。
+2. route owner 先通过 node owner 确认 node-link 仍在线。
+3. route owner 调 node owner `AdmitBuild(build_id, resources, ttl)`。
+4. node owner 若余量不足直接拒绝。
+5. route owner 排除该候选并重调度。
 
 ## 9. Key Distribution
 

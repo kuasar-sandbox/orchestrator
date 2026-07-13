@@ -20,13 +20,12 @@ type placeParams struct {
 	rules               []clustercfg.ShuffleRule
 	candidates          int
 	zoneAdmitMax        string // exclude nodes hotter than this (green<yellow<red<critical); "" = no zone filter
-	deadAfter           int64  // exclude nodes whose last heartbeat predates now-deadAfter (0 = skip)
-	now                 int64
 	targetRuntimeDigest string // when set, require node.RuntimeDigest == it (runtime match, §4.2)
+	excludedNodeIDs     map[string]struct{}
 }
 
 // placeSandbox runs the sandbox placement algorithm (cluster-placer.md):
-// matchSelectors ∧ ¬draining ∧ alive ∧ zone≤max ∧ runtime-match ∧ shuffle
+// matchSelectors ∧ ¬draining ∧ zone≤max ∧ runtime-match ∧ shuffle
 // slot, then P2C by water level. (Build placement is resource-aware — placeBuild.)
 func placeSandbox(p placeParams) (string, error) {
 	slotSet, shardBy := shuffleSlots(p.group, p.nodes, p.rules)
@@ -48,7 +47,7 @@ func placeSandbox(p placeParams) (string, error) {
 }
 
 // placeBuild runs resource-aware build placement (cluster-placer.md): among
-// matching/alive/non-draining nodes with build headroom (build_alloc <
+// matching/non-draining nodes with build headroom (build_alloc <
 // build_capacity), P2C by build utilization. The per-build requested-resources
 // check + RESERVED occupancy live in the registry's BuildStore commit (P4); here
 // the placer suggests over its view.
@@ -94,13 +93,13 @@ func buildLoad(n *registry.NodeRecord) float64 {
 }
 
 // eligibleNode is the shared eligibility predicate (sans shuffle slot): not
-// draining, alive, zone within admit, runtime-compatible, selector match.
+// draining, not excluded, zone within admit, runtime-compatible, selector match.
 func eligibleNode(n *registry.NodeRecord, p placeParams, maxZone int) bool {
 	if n.Draining || !matchSelectors(n.Labels, p.selectors) {
 		return false
 	}
-	if p.deadAfter > 0 && n.LastHeartbeatUnix > 0 && n.LastHeartbeatUnix < p.now-p.deadAfter {
-		return false // stale: disconnected but not yet swept (cluster-placer.md "node alive")
+	if _, excluded := p.excludedNodeIDs[n.NodeID]; excluded {
+		return false
 	}
 	if p.zoneAdmitMax != "" && zoneRank(n.Zone) > maxZone {
 		return false // hotter than admit (red/critical excluded)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -495,6 +496,7 @@ func TestNodeOwnerUsesProfileReadWhenLocalIsNotNodeShardOwner(t *testing.T) {
 	}
 
 	reg := New(cluster["a"], nil, time.Second, nil)
+	reg.addNode(&fakeConn{nodeID: nodeID})
 	if node, found, err := reg.localNodeOwner.Runtime(ctx, nodeID); err != nil || !found || node.DataEndpoint != "127.0.0.1:12345" {
 		t.Fatalf("local runtime profile=%+v found=%v err=%v", node, found, err)
 	}
@@ -616,32 +618,59 @@ func TestNodeRegisterRetriesNodeListProjectionAfterQuorumRecovers(t *testing.T) 
 	}
 }
 
-func TestNodeListHeartbeatRefreshIsConfigurable(t *testing.T) {
+func TestConcurrentHeartbeatsDoNotRewriteNodeListAcrossDeadAfter(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
-	reg.stores.SetNodeListHeartbeatRefresh(time.Second)
-	if err := reg.updateNodeRegister(ctx, &routesync.NodeRegister{NodeID: "n1", Capacity: 1}); err != nil {
-		t.Fatal(err)
+	const nodes = 8
+	for i := 0; i < nodes; i++ {
+		nodeID := fmt.Sprintf("n-%d", i)
+		if err := reg.updateNodeRegister(ctx, &routesync.NodeRegister{NodeID: nodeID, Capacity: 1}); err != nil {
+			t.Fatalf("register %s: %v", nodeID, err)
+		}
 	}
-	rev1, err := reg.stores.NodeListRev(ctx)
+	before, err := reg.stores.NodeListRev(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	node, found, err := reg.stores.GetNode(ctx, "n1")
-	if err != nil || !found {
-		t.Fatalf("node found=%v err=%v", found, err)
+	started := time.Now()
+	stop := make(chan struct{})
+	timer := time.AfterFunc(3100*time.Millisecond, func() { close(stop) })
+	defer timer.Stop()
+	var wg sync.WaitGroup
+	for i := 0; i < nodes; i++ {
+		nodeID := fmt.Sprintf("n-%d", i)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ticker := time.NewTicker(20 * time.Millisecond)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-stop:
+					return
+				case <-ticker.C:
+					reg.updateHeartbeat(ctx, nodeID, &routesync.Heartbeat{Counts: 1})
+				}
+			}
+		}()
 	}
-	node.LastHeartbeatUnix -= 2
-	if err := reg.stores.PutNodeRuntime(ctx, node); err != nil {
-		t.Fatal(err)
+	wg.Wait()
+	if elapsed := time.Since(started); elapsed < 3*time.Second {
+		t.Fatalf("heartbeat run crossed only %s, want at least 3s", elapsed)
 	}
-	reg.updateHeartbeat(ctx, "n1", &routesync.Heartbeat{})
-	rev2, err := reg.stores.NodeListRev(ctx)
+	after, err := reg.stores.NodeListRev(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rev2 <= rev1 {
-		t.Fatalf("node_list rev did not advance after heartbeat refresh: %d -> %d", rev1, rev2)
+	if after != before {
+		t.Fatalf("heartbeat-only updates advanced node_list rev: %d -> %d", before, after)
+	}
+	for i := 0; i < nodes; i++ {
+		nodeID := fmt.Sprintf("n-%d", i)
+		node, found, err := reg.stores.GetNodeProfile(ctx, nodeID)
+		if err != nil || !found || node.LastHeartbeatUnix < started.Unix() {
+			t.Fatalf("node %s profile did not retain live heartbeat: node=%+v found=%v err=%v", nodeID, node, found, err)
+		}
 	}
 }
 
@@ -651,7 +680,7 @@ func TestNodeListReplicatesToLocatedOwnerSet(t *testing.T) {
 	cluster := newShardStoreCluster(t, []string{"a", "b", "c"}, 1, 1, 1, 2)
 	stores := cluster["a"]
 
-	entry := clusterstate.NodeListEntry{NodeID: "n1", Labels: map[string]string{"pool": "p"}, LastHeartbeatUnix: time.Now().Unix()}
+	entry := clusterstate.NodeListEntry{NodeID: "n1", Labels: map[string]string{"pool": "p"}}
 	if err := stores.PutNodeListEntry(ctx, entry); err != nil {
 		t.Fatalf("PutNodeListEntry: %v", err)
 	}
@@ -667,7 +696,7 @@ func TestNodeListTombstoneRejectsStaleProjection(t *testing.T) {
 	stores := NewClusterStores("a", clusterstate.MemberView{Version: 1, Members: []string{"a"}}, 1, 1, 1, 1)
 
 	if err := stores.PutNodeListEntry(ctx, clusterstate.NodeListEntry{
-		NodeID: "n1", LastHeartbeatUnix: 100, Labels: map[string]string{"gen": "new"},
+		NodeID: "n1", SourceMeta: clusterstate.RecordMeta{Ballot: clusterstate.Ballot{Round: 2, Writer: "a"}, Rev: 2}, Labels: map[string]string{"gen": "new"},
 	}); err != nil {
 		t.Fatalf("PutNodeListEntry new: %v", err)
 	}
@@ -675,7 +704,7 @@ func TestNodeListTombstoneRejectsStaleProjection(t *testing.T) {
 		t.Fatalf("DeleteNodeList: %v", err)
 	}
 	if err := stores.PutNodeListEntry(ctx, clusterstate.NodeListEntry{
-		NodeID: "n1", LastHeartbeatUnix: 99, Labels: map[string]string{"gen": "stale"},
+		NodeID: "n1", SourceMeta: clusterstate.RecordMeta{Ballot: clusterstate.Ballot{Round: 1, Writer: "a"}, Rev: 1}, Labels: map[string]string{"gen": "stale"},
 	}); err != nil {
 		t.Fatalf("PutNodeListEntry stale: %v", err)
 	}
@@ -694,7 +723,9 @@ func TestNodeListTombstoneRejectsStaleProjection(t *testing.T) {
 func TestNodeListDuplicateProjectionDoesNotAdvanceRev(t *testing.T) {
 	ctx := context.Background()
 	stores := NewClusterStores("a", clusterstate.MemberView{Version: 1, Members: []string{"a"}}, 1, 1, 1, 1)
-	entry := clusterstate.NodeListEntry{NodeID: "n1", LastHeartbeatUnix: 100, Labels: map[string]string{"pool": "p"}}
+	entry := clusterstate.NodeListEntry{
+		NodeID: "n1", SourceMeta: clusterstate.RecordMeta{Ballot: clusterstate.Ballot{Round: 1, Writer: "a"}, Rev: 1}, Labels: map[string]string{"pool": "p"},
+	}
 
 	if err := stores.PutNodeListEntry(ctx, entry); err != nil {
 		t.Fatalf("PutNodeListEntry first: %v", err)
@@ -721,7 +752,7 @@ func TestNodeListRangeRepairsLocalFromOwnerSet(t *testing.T) {
 	stores := cluster["a"]
 	seed := clusterstate.NodeListEntry{
 		Meta:   clusterstate.RecordMeta{Ballot: clusterstate.Ballot{Round: 5, Writer: "b"}, Rev: 3, UpdatedAt: time.Now()},
-		NodeID: "n-remote", Labels: map[string]string{"pool": "p"}, LastHeartbeatUnix: time.Now().Unix(),
+		NodeID: "n-remote", Labels: map[string]string{"pool": "p"},
 	}
 	seedNodeListShardRecord(t, ctx, cluster["b"], seed, shardkv.Ballot{Round: 5, Writer: shardkv.MemberID("b")}, 3)
 	seedNodeListShardRecord(t, ctx, cluster["c"], seed, shardkv.Ballot{Round: 5, Writer: shardkv.MemberID("b")}, 3)

@@ -93,7 +93,7 @@ func (o *localNodeOwner) RefreshManifestKeys(ctx context.Context, nodeID string,
 }
 
 func (o *localNodeOwner) AdmitBuild(ctx context.Context, nodeID, buildID string, want *routesync.BuildResources) bool {
-	node, found, err := o.reg.stores.GetNodeProfile(ctx, nodeID)
+	node, found, err := o.Runtime(ctx, nodeID)
 	if err != nil || !found {
 		return false
 	}
@@ -105,6 +105,9 @@ func (o *localNodeOwner) ReleaseBuild(ctx context.Context, buildID string) {
 }
 
 func (o *localNodeOwner) Runtime(ctx context.Context, nodeID string) (*NodeRecord, bool, error) {
+	if _, live := o.reg.node(nodeID); !live {
+		return nil, false, ErrNodeGone
+	}
 	return o.reg.stores.GetNodeProfile(ctx, nodeID)
 }
 

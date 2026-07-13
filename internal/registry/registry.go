@@ -51,6 +51,7 @@ type PlaceRequest struct {
 	Config              map[string]string
 	Build               bool
 	TargetRuntimeDigest string
+	ExcludeNodeIDs      []string
 }
 
 // Placement is a placer answer plus the group-derived material the registry must
@@ -478,16 +479,21 @@ func (r *Registry) startReserve(ctx context.Context, group, routeKey string, rec
 	}
 
 	// NONE: place + create.
-	return r.placeAndCreate(ctx, group, routeKey, rec, found, createConfig)
+	return r.placeAndCreate(ctx, group, routeKey, createConfig)
 }
 
 // placeAndCreate places a node and sends the create command, CASing the RESERVED
-// record. It re-reads + re-asks the placer once on a dead-node suggestion OR a CAS
-// conflict (a lagging view / concurrent mutation, cluster.md/§5). It is
-// re-drivable: a rejected create re-invokes it (re-Place once, §7.4), which
-// re-reads the current rev and places afresh.
-func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, orig *SandboxRecord, found bool, createConfig map[string]string) error {
-	for attempt := 0; attempt < 2; attempt++ {
+// record. node_list is only a catalog: the selected node owner validates its
+// live connection before commit. An unusable candidate is excluded from the next
+// placement request so stale catalog entries cannot prevent a live alternative.
+func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, createConfig map[string]string) error {
+	excluded := placementExclusions{}
+	casConflicts := 0
+	var lastFailure error
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		cur, curRev, curFound, err := r.stores.GetSandbox(ctx, group, routeKey)
 		if err != nil {
 			return err
@@ -496,14 +502,31 @@ func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, o
 			return nil // a concurrent attempt already won; the running route finishes the Reserve
 		}
 		sid := "sb-" + newID()
-		placement, perr := r.placer.Place(ctx, PlaceRequest{Group: group, RouteKey: routeKey, SandboxID: sid, Config: createConfig})
+		placement, perr := r.placer.Place(ctx, PlaceRequest{
+			Group: group, RouteKey: routeKey, SandboxID: sid, Config: createConfig,
+			ExcludeNodeIDs: excluded.values(),
+		})
 		if perr != nil {
+			if errors.Is(perr, ErrNoNode) && lastFailure != nil {
+				return lastFailure
+			}
 			return perr
 		}
 		if placement == nil || placement.NodeID == "" {
 			return ErrNoNode
 		}
 		nodeID := placement.NodeID
+		if excluded.has(nodeID) {
+			if lastFailure != nil {
+				return lastFailure
+			}
+			return ErrNoNode
+		}
+		if err := r.nodeRuntimeLive(ctx, nodeID); err != nil {
+			lastFailure = err
+			excluded.add(nodeID)
+			continue
+		}
 		expect := int64(0)
 		if curFound {
 			expect = curRev
@@ -516,8 +539,9 @@ func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, o
 		if _, ok, cerr := r.stores.CASSandbox(ctx, reserved, expect); cerr != nil {
 			return cerr
 		} else if !ok {
-			if attempt == 0 {
-				continue // CAS conflict: re-read + re-ask once (§4.3)
+			if casConflicts == 0 {
+				casConflicts++
+				continue
 			}
 			return ErrNoNode
 		}
@@ -531,32 +555,31 @@ func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, o
 		if r.nodeOwner == nil {
 			_ = r.stores.DeleteSandbox(ctx, group, routeKey)
 			_ = r.stores.RemoveNodeSandboxRef(ctx, nodeID, group, routeKey, sid)
-			return ErrNodeGone
+			lastFailure = ErrNodeGone
+			excluded.add(nodeID)
+			continue
 		}
 		ack, err := r.nodeOwner.SendCommandAndWait(ctx, nodeID, cmd, lifecycleAckTimeout)
 		if err != nil {
 			_ = r.stores.DeleteSandbox(ctx, group, routeKey)
 			_ = r.stores.RemoveNodeSandboxRef(ctx, nodeID, group, routeKey, sid)
-			if attempt == 0 && errors.Is(err, ErrNodeGone) {
-				continue
-			}
-			return err
+			lastFailure = err
+			excluded.add(nodeID)
+			continue
 		}
 		if ack == nil || ack.Status != routesync.AckAccepted {
 			_ = r.stores.DeleteSandbox(ctx, group, routeKey)
 			_ = r.stores.RemoveNodeSandboxRef(ctx, nodeID, group, routeKey, sid)
-			if attempt == 0 {
-				continue
-			}
 			reason := ""
 			if ack != nil {
 				reason = ack.Reason
 			}
-			return fmt.Errorf("registry: create rejected: %s", reason)
+			lastFailure = fmt.Errorf("registry: create rejected: %s", reason)
+			excluded.add(nodeID)
+			continue
 		}
 		return nil
 	}
-	return ErrNoNode
 }
 
 // sendAndWait sends a command and blocks until the node acknowledges receipt or
@@ -998,12 +1021,11 @@ func (r *Registry) updateHeartbeat(ctx context.Context, nodeID string, hb *route
 		return
 	}
 	oldDraining := rec.Draining
-	oldHeartbeat := rec.LastHeartbeatUnix
 	rec.Zone, rec.Allocated, rec.Pool = hb.Zone, hb.Allocated, hb.Pool
 	rec.BuildAlloc, rec.Counts, rec.Draining = hb.BuildAlloc, hb.Counts, hb.Draining
 	rec.LastHeartbeatUnix = time.Now().Unix()
 	_ = r.stores.PutNodeRuntime(ctx, rec)
-	if rec.Draining != oldDraining || oldHeartbeat <= 0 || rec.LastHeartbeatUnix-oldHeartbeat >= r.stores.NodeListHeartbeatRefreshSec() {
+	if rec.Draining != oldDraining {
 		r.putNodeListProjection(ctx, rec)
 		return
 	}

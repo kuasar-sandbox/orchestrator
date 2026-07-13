@@ -44,7 +44,7 @@ func TestPlacerDirectPlace(t *testing.T) {
 		clusterstate.SandboxGroupRecord{Group: "/g", NodeSelectors: []map[string]string{{"pool": "p"}}},
 		clusterstate.SandboxGroupRecord{Group: "/x", NodeSelectors: []map[string]string{{"pool": "absent"}}},
 	)
-	svc := NewRemoteLinksWithGroups([]RegistryLink{registryLinkFromAddress("registry", strings.TrimPrefix(controlSrv.URL, "http://"), nil)}, src, testImportSources("test", src), clustercfg.PlacementConfig{Candidates: 2}, 30, discard)
+	svc := NewRemoteLinksWithGroups([]RegistryLink{registryLinkFromAddress("registry", strings.TrimPrefix(controlSrv.URL, "http://"), nil)}, src, testImportSources("test", src), clustercfg.PlacementConfig{Candidates: 2}, discard)
 	placerMux := http.NewServeMux()
 	svc.ServePlacerLink(placerMux)
 	placerSrv := httptest.NewServer(placerMux)
@@ -64,6 +64,11 @@ func TestPlacerDirectPlace(t *testing.T) {
 	}
 	if err != nil || (placement.NodeID != "n1" && placement.NodeID != "n2") {
 		t.Fatalf("direct Place = %+v err=%v (want n1 or n2)", placement, err)
+	}
+	if _, err := placer.Place(ctx, registry.PlaceRequest{
+		Group: "/g", RouteKey: "rk", ExcludeNodeIDs: []string{"n1", "n2"},
+	}); err != registry.ErrNoNode {
+		t.Fatalf("Place with all catalog nodes excluded err=%v, want ErrNoNode", err)
 	}
 
 	for i := 0; i < 300; i++ {
@@ -89,7 +94,7 @@ func TestPlacerUsesSingleNodeListSourceAndRegistersAllRegistryMembers(t *testing
 	svc := NewRemoteLinksWithGroups([]RegistryLink{
 		{Name: "r1", BaseURL: srv1.URL, Client: srv1.Client()},
 		{Name: "r2", BaseURL: srv2.URL, Client: srv2.Client()},
-	}, src, testImportSources("test", src), clustercfg.PlacementConfig{Candidates: 1}, 30, discard)
+	}, src, testImportSources("test", src), clustercfg.PlacementConfig{Candidates: 1}, discard)
 	placerMux := http.NewServeMux()
 	svc.ServePlacerLink(placerMux)
 	placerSrv := httptest.NewServer(placerMux)
@@ -133,7 +138,7 @@ func TestPlacerUsesSingleNodeListSourceAndRegistersAllRegistryMembers(t *testing
 }
 
 func TestRemoteLinksWithGroupsDefaultsNilLogger(t *testing.T) {
-	svc := NewRemoteLinksWithGroups(nil, nil, nil, clustercfg.PlacementConfig{}, 30, nil)
+	svc := NewRemoteLinksWithGroups(nil, nil, nil, clustercfg.PlacementConfig{}, nil)
 	defer func() {
 		if r := recover(); r != nil {
 			t.Fatalf("RegisterLoop with nil logger panic: %v", r)
@@ -144,7 +149,7 @@ func TestRemoteLinksWithGroupsDefaultsNilLogger(t *testing.T) {
 
 func TestSetNodeListLinksSameLinksPreservesReadyView(t *testing.T) {
 	svc := NewRemoteLinks([]RegistryLink{{Name: "r1", BaseURL: "http://r1", Client: http.DefaultClient}},
-		clustercfg.PlacementConfig{Candidates: 1}, 30, slog.New(slog.NewTextHandler(io.Discard, nil)))
+		clustercfg.PlacementConfig{Candidates: 1}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	seedNodeListView(t, svc, "n1")
 	if !svc.nodes.ready() || len(svc.nodes.values()) != 1 {
 		t.Fatal("seeded node_list view is not ready")
@@ -159,7 +164,7 @@ func TestSetNodeListLinksSameLinksPreservesReadyView(t *testing.T) {
 
 func TestSetNodeListLinksChangedLinksResetsReadyView(t *testing.T) {
 	svc := NewRemoteLinks([]RegistryLink{{Name: "r1", BaseURL: "http://r1", Client: http.DefaultClient}},
-		clustercfg.PlacementConfig{Candidates: 1}, 30, slog.New(slog.NewTextHandler(io.Discard, nil)))
+		clustercfg.PlacementConfig{Candidates: 1}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	seedNodeListView(t, svc, "n1")
 
 	svc.SetNodeListLinks(context.Background(), []RegistryLink{{Name: "r2", BaseURL: "http://r2", Client: http.DefaultClient}})
@@ -180,7 +185,7 @@ func TestSubscribeOnceUsesOpaqueWatchToken(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	svc := NewRemoteLinks(nil, clustercfg.PlacementConfig{Candidates: 1}, 30, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	svc := NewRemoteLinks(nil, clustercfg.PlacementConfig{Candidates: 1}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	token, err := svc.subscribeOnce(context.Background(),
 		RegistryLink{Name: "r1", BaseURL: srv.URL, Client: srv.Client()},
 		"/watch", "registry.1.test:7", svc.nodes.source("node_list"))
@@ -222,7 +227,7 @@ func TestRegisterLoopReportsMemberlistSeed(t *testing.T) {
 	defer srv.Close()
 
 	svc := NewRemoteLinks([]RegistryLink{{Name: "r1", BaseURL: srv.URL, Client: srv.Client()}},
-		clustercfg.PlacementConfig{Candidates: 1}, 30, slog.New(slog.NewTextHandler(io.Discard, nil)))
+		clustercfg.PlacementConfig{Candidates: 1}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	go svc.RegisterLoop(ctx, "s1", srv.URL, "placer.default")
 
 	select {
@@ -263,7 +268,7 @@ func TestRegisterLoopRetriesFailedRegisterQuickly(t *testing.T) {
 	defer srv.Close()
 
 	svc := NewRemoteLinks([]RegistryLink{{Name: "r1", BaseURL: srv.URL, Client: srv.Client()}},
-		clustercfg.PlacementConfig{Candidates: 1}, 30, slog.New(slog.NewTextHandler(io.Discard, nil)))
+		clustercfg.PlacementConfig{Candidates: 1}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	go svc.RegisterLoop(ctx, "s1", srv.URL, "placer.default")
 
 	select {
@@ -286,8 +291,8 @@ func TestImportSourceLeaseAllowsOnlyOnePlacerToRange(t *testing.T) {
 		Candidates: 1, ImportSourceOwnerCount: 2, ImportSourceLeaseTTL: "500ms", SelectorPatchRefresh: "50ms",
 	}
 	link := RegistryLink{Name: "registry", BaseURL: srv.URL, Client: srv.Client()}
-	svc1 := NewRemoteLinksWithGroups([]RegistryLink{link}, src1, testImportSources("counting-source", src1), cfg, 30, discard)
-	svc2 := NewRemoteLinksWithGroups([]RegistryLink{link}, src2, testImportSources("counting-source", src2), cfg, 30, discard)
+	svc1 := NewRemoteLinksWithGroups([]RegistryLink{link}, src1, testImportSources("counting-source", src1), cfg, discard)
+	svc2 := NewRemoteLinksWithGroups([]RegistryLink{link}, src2, testImportSources("counting-source", src2), cfg, discard)
 	peers := func() []string { return []string{"s1", "s2"} }
 	svc1.SetImportSourceOwnerSource("s1", peers)
 	svc2.SetImportSourceOwnerSource("s2", peers)
@@ -316,7 +321,7 @@ func TestPlacerRefreshesUnchangedNodeLinkKeyCache(t *testing.T) {
 	}
 	svc := NewRemoteLinksWithGroups(
 		[]RegistryLink{{Name: "registry", BaseURL: srv.URL, Client: srv.Client()}},
-		src, testImportSources("counting-source", src), cfg, 30, discard,
+		src, testImportSources("counting-source", src), cfg, discard,
 	)
 	seedNodeListView(t, svc, "n1")
 	svc.Start(ctx)
@@ -341,7 +346,6 @@ func TestPlacerStartIsIdempotent(t *testing.T) {
 		[]RegistryLink{{Name: "registry", BaseURL: srv.URL, Client: srv.Client()}},
 		src, testImportSources("counting-source", src),
 		clustercfg.PlacementConfig{Candidates: 1, ImportSourceOwnerCount: 1, ImportSourceLeaseTTL: "500ms", SelectorPatchRefresh: "1h"},
-		30,
 		discard,
 	)
 	svc.SetNodeListLinks(ctx, nil)
@@ -377,7 +381,6 @@ func TestReconcileKeyAllocationsRunsWhenNodeListBecomesReady(t *testing.T) {
 		[]RegistryLink{{Name: "registry", BaseURL: srv.URL, Client: srv.Client()}},
 		src, testImportSources("counting-source", src),
 		clustercfg.PlacementConfig{Candidates: 1, ImportSourceOwnerCount: 1, ImportSourceLeaseTTL: "500ms", SelectorPatchRefresh: "1h"},
-		30,
 		discard,
 	)
 	go svc.reconcileSelectorPatches(ctx)
@@ -412,7 +415,6 @@ func TestReconcileRunsWhenReadyNodeListChanges(t *testing.T) {
 		[]RegistryLink{{Name: "registry", BaseURL: srv.URL, Client: srv.Client()}},
 		src, testImportSources("counting-source", src),
 		clustercfg.PlacementConfig{Candidates: 1, ImportSourceOwnerCount: 1, ImportSourceLeaseTTL: "500ms", SelectorPatchRefresh: "1h"},
-		30,
 		discard,
 	)
 	empty := svc.nodes.source("node_list")
@@ -432,7 +434,7 @@ func TestReconcileRunsWhenReadyNodeListChanges(t *testing.T) {
 
 	sink := svc.nodes.sourceWithNotify("node_list", svc.notifyNodeListChanged)
 	raw, err := json.Marshal(clusterstate.NodeListEntry{
-		NodeID: "n1", Labels: map[string]string{"pool": "p"}, LastHeartbeatUnix: time.Now().Unix(),
+		NodeID: "n1", Labels: map[string]string{"pool": "p"},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -448,14 +450,14 @@ func TestReconcileRunsWhenReadyNodeListChanges(t *testing.T) {
 }
 
 func TestReconcileIntervalUsesSelectorPatchRefreshCadence(t *testing.T) {
-	svc := NewRemoteLinks(nil, clustercfg.PlacementConfig{SelectorPatchRefresh: "1m"}, 30, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	svc := NewRemoteLinks(nil, clustercfg.PlacementConfig{SelectorPatchRefresh: "1m"}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if got := svc.reconcileInterval(); got != time.Minute {
 		t.Fatalf("reconcile interval=%v, want selector_patch_refresh_interval", got)
 	}
 }
 
 func TestReadyForLabelRequiresMatchingNodeListSnapshot(t *testing.T) {
-	svc := NewRemoteLinks(nil, clustercfg.PlacementConfig{}, 30, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	svc := NewRemoteLinks(nil, clustercfg.PlacementConfig{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	oldSink := svc.nodes.sourceWithNotifyLabel("node_list", "registry.1.old", nil)
 	oldSink.reset()
 	oldSink.bookmark()
@@ -519,7 +521,6 @@ func TestReconcileImportSourceRefreshesAndRetriesTransientPatchFailure(t *testin
 		[]RegistryLink{{Name: "registry", BaseURL: srv.URL, Client: srv.Client()}},
 		src, testImportSources("counting-source", src),
 		clustercfg.PlacementConfig{Candidates: 1, ImportSourceOwnerCount: 1, ImportSourceLeaseTTL: "1s", SelectorPatchRefresh: "1m"},
-		30,
 		slog.New(slog.NewTextHandler(io.Discard, nil)),
 	)
 	svc.SetPlacerLinkRefresher(func(context.Context) error {
@@ -598,7 +599,6 @@ func TestReconcileImportSourcePushesCompletedPagesBeforeLaterPageError(t *testin
 		[]RegistryLink{{Name: "registry", BaseURL: srv.URL, Client: srv.Client()}},
 		src, testImportSources("paged-source", src),
 		clustercfg.PlacementConfig{Candidates: 1, ImportSourceOwnerCount: 1, ImportSourceLeaseTTL: "1s", SelectorPatchRefresh: "1m"},
-		30,
 		slog.New(slog.NewTextHandler(io.Discard, nil)),
 	)
 	nodes := []*registry.NodeRecord{{NodeID: "n1", Labels: map[string]string{"pool": "p"}, LastHeartbeatUnix: time.Now().Unix()}}
@@ -647,7 +647,6 @@ func TestReconcileImportSourceDoesNotAdvanceCursorWhenPatchFails(t *testing.T) {
 		[]RegistryLink{{Name: "registry", BaseURL: srv.URL, Client: srv.Client()}},
 		src, testImportSources("paged-source", src),
 		clustercfg.PlacementConfig{Candidates: 1, ImportSourceOwnerCount: 1, ImportSourceLeaseTTL: "1s", SelectorPatchRefresh: "1m"},
-		30,
 		slog.New(slog.NewTextHandler(io.Discard, nil)),
 	)
 	nodes := []*registry.NodeRecord{{NodeID: "n1", Labels: map[string]string{"pool": "p"}, LastHeartbeatUnix: time.Now().Unix()}}
@@ -683,7 +682,7 @@ func seedNodeListView(t *testing.T, svc *Service, nodeID string) {
 	sink := svc.nodes.source("node_list")
 	sink.reset()
 	raw, err := json.Marshal(clusterstate.NodeListEntry{
-		NodeID: nodeID, Labels: map[string]string{"pool": "p"}, LastHeartbeatUnix: time.Now().Unix(),
+		NodeID: nodeID, Labels: map[string]string{"pool": "p"},
 	})
 	if err != nil {
 		t.Fatal(err)

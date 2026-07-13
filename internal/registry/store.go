@@ -106,17 +106,14 @@ type Stores struct {
 	scaleLinkOwnerCount int
 	replicaMu           sync.RWMutex
 
-	nodeListMu                  sync.Mutex
-	nodeListWatchRetention      int
-	nodeListHeartbeatRefreshSec int64
+	nodeListMu             sync.Mutex
+	nodeListWatchRetention int
 
 	shardMu        sync.RWMutex
 	shardStore     *shardkv.Store
 	shardTransport shardkv.Transport
 	shardReady     shardkv.MemberReadyProvider
 }
-
-const defaultNodeListHeartbeatRefreshSec = 60
 
 // NewStores builds a size-1 registry shardkv store.
 func NewStores() *Stores {
@@ -147,14 +144,13 @@ func NewClusterStores(
 		scaleLinkOwnerCount = routeOwnerCount
 	}
 	stores := &Stores{
-		writerID:                    writerID,
-		memberViews:                 []clusterstate.MemberView{view},
-		routeOwnerCount:             routeOwnerCount,
-		nodeOwnerCount:              nodeOwnerCount,
-		nodeListOwnerCount:          nodeListOwnerCount,
-		scaleLinkOwnerCount:         scaleLinkOwnerCount,
-		nodeListWatchRetention:      10000,
-		nodeListHeartbeatRefreshSec: defaultNodeListHeartbeatRefreshSec,
+		writerID:               writerID,
+		memberViews:            []clusterstate.MemberView{view},
+		routeOwnerCount:        routeOwnerCount,
+		nodeOwnerCount:         nodeOwnerCount,
+		nodeListOwnerCount:     nodeListOwnerCount,
+		scaleLinkOwnerCount:    scaleLinkOwnerCount,
+		nodeListWatchRetention: 10000,
 	}
 	stores.rebuildShardStore()
 	return stores
@@ -206,16 +202,6 @@ func (s *Stores) NodeOwnerCandidates(ctx context.Context, nodeID string) ([]stri
 	return out, nil
 }
 
-func (s *Stores) SetNodeListHeartbeatRefresh(d time.Duration) {
-	sec := int64(d.Seconds())
-	if sec < 1 {
-		sec = 1
-	}
-	s.nodeListMu.Lock()
-	s.nodeListHeartbeatRefreshSec = sec
-	s.nodeListMu.Unlock()
-}
-
 func (s *Stores) SetNodeListWatchRetention(n int) {
 	if n <= 0 {
 		n = 10000
@@ -224,15 +210,6 @@ func (s *Stores) SetNodeListWatchRetention(n int) {
 	s.nodeListWatchRetention = n
 	s.nodeListMu.Unlock()
 	s.rebuildShardStore()
-}
-
-func (s *Stores) NodeListHeartbeatRefreshSec() int64 {
-	s.nodeListMu.Lock()
-	defer s.nodeListMu.Unlock()
-	if s.nodeListHeartbeatRefreshSec <= 0 {
-		return defaultNodeListHeartbeatRefreshSec
-	}
-	return s.nodeListHeartbeatRefreshSec
 }
 
 func (s *Stores) SetMemberViews(views []clusterstate.MemberView) {
@@ -645,12 +622,6 @@ func compareProjectionSource(next, cur clusterstate.NodeListEntry) int {
 		return 1
 	case curHasSource:
 		return -1
-	}
-	switch {
-	case next.LastHeartbeatUnix > cur.LastHeartbeatUnix:
-		return 1
-	case next.LastHeartbeatUnix < cur.LastHeartbeatUnix:
-		return -1
 	default:
 		return 0
 	}
@@ -842,7 +813,6 @@ func (s *Stores) DeleteNodeListWithSource(ctx context.Context, nodeID string, so
 		tombstone := clusterstate.NodeListEntry{NodeID: nodeID, SourceMeta: source, Deleted: true}
 		if recordMetaZero(source) {
 			tombstone.SourceMeta = cur.SourceMeta
-			tombstone.LastHeartbeatUnix = cur.LastHeartbeatUnix
 		}
 		if !nodeListProjectionNewer(tombstone, cur) {
 			return nil
