@@ -120,7 +120,32 @@ func (s *Stores) addNodeBuildRefShard(ctx context.Context, nodeID string, ref cl
 	if err != nil {
 		return err
 	}
-	return shardUpsert(ctx, sh, clusterstate.NodeBuildRecordKey(ref.BuildID), value)
+	key := clusterstate.NodeBuildRecordKey(ref.BuildID)
+	for attempt := 0; attempt < 5; attempt++ {
+		cur, found, err := sh.Get(ctx, key)
+		if err != nil {
+			return err
+		}
+		if found {
+			existing, err := clusterstate.DecodeShardValue[clusterstate.NodeBuildRef](cur.Value)
+			if err != nil {
+				return err
+			}
+			if existing.BuildID != ref.BuildID || existing.Group == "" {
+				return errors.New("registry: invalid node build ref")
+			}
+			if existing.Group != ref.Group {
+				return errNodeBuildIDConflict
+			}
+			return nil
+		}
+		if _, ok, err := sh.CAS(ctx, key, 0, value); err != nil {
+			return err
+		} else if ok {
+			return nil
+		}
+	}
+	return shardkv.ErrConflict
 }
 
 func (s *Stores) getNodeBuildRefShard(ctx context.Context, nodeID, buildID string) (clusterstate.NodeBuildRef, bool, error) {

@@ -35,6 +35,8 @@ var defaultBuildResources = &routesync.BuildResources{CPU: 1000, Mem: 1 << 30}
 
 const buildRegisterAckTimeout = 5 * time.Second
 
+var errNodeBuildIDConflict = errors.New("registry: build id is already owned by another group on this node")
+
 // ReserveBuild places a build on a resource-eligible node and pre-provisions it
 // (cluster.md): the registry assigns the build/template ids, resource-aware
 // PlaceBuild picks a node, the BuildStore commit RESERVES that node's build pool
@@ -110,19 +112,24 @@ func (r *Registry) ReserveBuild(ctx context.Context, req BuildReserveReq) (*Buil
 			excluded.add(id)
 			continue
 		}
-		if !r.admitBuild(ctx, id, buildID, resources) {
+		if !r.admitBuild(ctx, id, req.Group, buildID, resources) {
 			excluded.add(id)
 			continue
 		}
 		// Commit the group build record after node-owner admission succeeds.
 		rec := &BuildRecord{Group: req.Group, BuildID: buildID, NodeID: id, Resources: resources, State: BuildRegistered, TemplateID: templateID}
 		if err := r.stores.PutBuild(ctx, rec); err != nil {
-			r.releaseBuildAdmission(id, buildID)
+			r.releaseBuildAdmission(id, req.Group, buildID)
 			return nil, err
 		}
 		if err := r.stores.AddNodeBuildRef(ctx, id, ref); err != nil {
 			_ = r.stores.DeleteBuild(ctx, req.Group, buildID)
-			r.releaseBuildAdmission(id, buildID)
+			r.releaseBuildAdmission(id, req.Group, buildID)
+			if errors.Is(err, errNodeBuildIDConflict) {
+				lastFailure = err
+				excluded.add(id)
+				continue
+			}
 			return nil, err
 		}
 		cmd := &routesync.Command{
@@ -133,7 +140,7 @@ func (r *Registry) ReserveBuild(ctx context.Context, req BuildReserveReq) (*Buil
 		if r.nodeOwner == nil {
 			_ = r.stores.DeleteBuild(ctx, req.Group, buildID)
 			_ = r.stores.RemoveNodeBuildRef(ctx, id, buildID)
-			r.releaseBuildAdmission(id, buildID)
+			r.releaseBuildAdmission(id, req.Group, buildID)
 			lastFailure = ErrNodeGone
 			excluded.add(id)
 			continue
@@ -148,7 +155,7 @@ func (r *Registry) ReserveBuild(ctx context.Context, req BuildReserveReq) (*Buil
 			}
 			_ = r.stores.DeleteBuild(ctx, req.Group, buildID) // command definitively did not reach the node
 			_ = r.stores.RemoveNodeBuildRef(ctx, id, buildID)
-			r.releaseBuildAdmission(id, buildID)
+			r.releaseBuildAdmission(id, req.Group, buildID)
 			lastFailure = err
 			excluded.add(id)
 			continue
@@ -156,7 +163,7 @@ func (r *Registry) ReserveBuild(ctx context.Context, req BuildReserveReq) (*Buil
 		if ack == nil || ack.Status != routesync.AckAccepted {
 			_ = r.stores.DeleteBuild(ctx, req.Group, buildID) // roll back the reservation
 			_ = r.stores.RemoveNodeBuildRef(ctx, id, buildID)
-			r.releaseBuildAdmission(id, buildID)
+			r.releaseBuildAdmission(id, req.Group, buildID)
 			reason := ""
 			if ack != nil {
 				reason = ack.Reason
@@ -181,18 +188,20 @@ func (r *Registry) buildReserveResult(ctx context.Context, rec *BuildRecord) *Bu
 	}
 }
 
-func (r *Registry) admitBuild(ctx context.Context, nodeID, buildID string, want *routesync.BuildResources) bool {
+func (r *Registry) admitBuild(ctx context.Context, nodeID, group, buildID string, want *routesync.BuildResources) bool {
 	if r.nodeOwner == nil {
 		return false
 	}
-	return r.nodeOwner.AdmitBuild(ctx, nodeID, buildID, want)
+	return r.nodeOwner.AdmitBuild(ctx, nodeID, buildAdmissionID(group, buildID), want)
 }
 
-func (r *Registry) releaseBuildAdmission(nodeID, buildID string) {
+func (r *Registry) releaseBuildAdmission(nodeID, group, buildID string) {
 	if r.nodeOwner != nil {
-		r.nodeOwner.ReleaseBuild(context.Background(), nodeID, buildID)
+		r.nodeOwner.ReleaseBuild(context.Background(), nodeID, buildAdmissionID(group, buildID))
 	}
 }
+
+func buildAdmissionID(group, buildID string) string { return group + "\x00" + buildID }
 
 // applyBuildEvent converges a build's state from a node's build event (§5.1): it
 // updates the BuildStore (releasing the reservation on a terminal state, since the
@@ -221,7 +230,7 @@ func (r *Registry) applyBuildEvent(ctx context.Context, nodeID string, e *routes
 		return
 	}
 	if !rec.occupies() {
-		r.releaseBuildAdmission(rec.NodeID, rec.BuildID)
+		r.releaseBuildAdmission(rec.NodeID, rec.Group, rec.BuildID)
 		_ = r.stores.RemoveNodeBuildRef(ctx, rec.NodeID, rec.BuildID)
 	}
 }

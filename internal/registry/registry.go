@@ -134,9 +134,10 @@ type ImportSourceLease struct {
 // reserveCall is one in-flight ReserveSandbox; joiners wait on done, the channel
 // reader fills result + closes done when the sandbox goes running.
 type reserveCall struct {
-	done   chan struct{}
-	result *ReserveResult
-	err    error
+	done       chan struct{}
+	finishOnce sync.Once
+	result     *ReserveResult
+	err        error
 	// re-Place context (§7.4): a rejected create re-places once on another node
 	// before failing the Reserve. orig is the pre-reserve record to restore on
 	// timeout/reject while the row is still RESERVED.
@@ -460,8 +461,10 @@ func (r *Registry) ReserveSandbox(ctx context.Context, group, routeKey string, c
 	res, rerr := r.waitReserveCall(wctx, call)
 	if rerr != nil {
 		// Park timeout / caller cancel: undo a RESERVED that never reached READY, so
-		// it doesn't strand on a live node (the sweep only clears dead-node rows).
-		r.rollbackReserve(group, routeKey, rec, found)
+		// it doesn't strand the route. Keep the ownership ref because command
+		// delivery may have succeeded; a late live event must still be deleted as
+		// registry-owned rather than ignored as a node-local sandbox.
+		r.rollbackReserveRetainingOwnership(group, routeKey, rec, found)
 		r.finish(key, nil, rerr)
 		return nil, rerr
 	}
@@ -490,28 +493,52 @@ func (r *Registry) getSandboxForReserve(ctx context.Context, group, routeKey str
 // row is put back and a fresh one is deleted, but only while the row is still
 // RESERVED (a late running route may have won).
 func (r *Registry) rollbackReserve(group, routeKey string, orig *SandboxRecord, found bool) {
+	r.rollbackReserveWithRefPolicy(group, routeKey, orig, found, true)
+}
+
+func (r *Registry) rollbackReserveRetainingOwnership(group, routeKey string, orig *SandboxRecord, found bool) {
+	r.rollbackReserveWithRefPolicy(group, routeKey, orig, found, false)
+}
+
+func (r *Registry) rollbackReserveWithRefPolicy(group, routeKey string, orig *SandboxRecord, found, dropCurrentRef bool) {
 	ctx := context.Background() // must complete even if the caller's ctx is done
-	cur, _, curFound, err := r.stores.GetSandbox(ctx, group, routeKey)
+	cur, rev, curFound, err := r.stores.GetSandbox(ctx, group, routeKey)
 	if err != nil || !curFound || cur.State != StateReserved {
 		return // already resolved (READY) / gone — nothing to roll back
 	}
+	r.rollbackReservedAtRevision(ctx, group, routeKey, cur, rev, orig, found, dropCurrentRef)
+}
+
+func (r *Registry) rollbackReservedAtRevision(ctx context.Context, group, routeKey string, cur *SandboxRecord, rev int64, orig *SandboxRecord, found, dropCurrentRef bool) bool {
 	if found {
-		if cur.NodeID != "" && (cur.NodeID != orig.NodeID || cur.SID != orig.SID) {
+		if orig == nil {
+			return false
+		}
+		if _, ok, err := r.stores.CASSandbox(ctx, orig, rev); err != nil || !ok {
+			return false
+		}
+		if dropCurrentRef && cur.NodeID != "" && (cur.NodeID != orig.NodeID || cur.SID != orig.SID) {
 			_ = r.stores.RemoveNodeSandboxRef(ctx, cur.NodeID, cur.SID)
 		}
-		if _, err := r.stores.PutSandbox(ctx, orig); err == nil {
-			if orig.NodeID != "" {
-				_ = r.stores.AddNodeSandboxRef(ctx, orig.NodeID, clusterstate.NodeSandboxRef{
-					Group: group, RouteKey: routeKey, SandboxID: orig.SID,
-				})
-			}
+		if orig.NodeID != "" {
+			_ = r.stores.AddNodeSandboxRef(ctx, orig.NodeID, clusterstate.NodeSandboxRef{
+				Group: group, RouteKey: routeKey, SandboxID: orig.SID,
+			})
 		}
-	} else {
-		_ = r.stores.DeleteSandbox(ctx, group, routeKey)
-		if cur.NodeID != "" {
-			_ = r.stores.RemoveNodeSandboxRef(ctx, cur.NodeID, cur.SID)
-		}
+		return true
 	}
+	return r.deleteSandboxAtRevision(ctx, group, routeKey, cur, rev, dropCurrentRef)
+}
+
+func (r *Registry) deleteSandboxAtRevision(ctx context.Context, group, routeKey string, cur *SandboxRecord, rev int64, dropCurrentRef bool) bool {
+	deleted, err := r.stores.DeleteSandboxIfRevision(ctx, group, routeKey, rev)
+	if err != nil || !deleted {
+		return false
+	}
+	if dropCurrentRef && cur != nil && cur.NodeID != "" {
+		_ = r.stores.RemoveNodeSandboxRef(ctx, cur.NodeID, cur.SID)
+	}
+	return true
 }
 
 // startReserve drives the placement + command for the leader of a single-flight.
@@ -529,17 +556,17 @@ func (r *Registry) startReserve(ctx context.Context, group, routeKey string, rec
 			return cas(err, ok)
 		}
 		if err := r.stores.AddNodeSandboxRef(ctx, rec.NodeID, clusterstate.NodeSandboxRef{Group: group, RouteKey: routeKey, SandboxID: rec.SID}); err != nil {
-			_, _ = r.stores.PutSandbox(ctx, rec)
+			r.rollbackReserve(group, routeKey, rec, true)
 			return err
 		}
 		ccmd := &routesync.Command{CmdID: newID(), Kind: routesync.CmdConnect, SID: rec.SID}
 		ack, err := r.nodeOwner.SendCommandAndWait(ctx, rec.NodeID, ccmd, lifecycleAckTimeout)
 		if err != nil {
-			_, _ = r.stores.PutSandbox(ctx, rec) // roll back RESERVED -> PAUSED (connect never reached the node)
+			r.rollbackReserve(group, routeKey, rec, true)
 			return err
 		}
 		if ack == nil || ack.Status != routesync.AckAccepted {
-			_, _ = r.stores.PutSandbox(ctx, rec)
+			r.rollbackReserve(group, routeKey, rec, true)
 			reason := ""
 			if ack != nil {
 				reason = ack.Reason
@@ -809,7 +836,6 @@ func (r *Registry) tryApplyLiveRoute(ctx context.Context, nodeID string, e *rout
 	}
 	if !found || (cur.SID != "" && cur.SID != e.SandboxID) || (cur.NodeID != "" && cur.NodeID != nodeID) {
 		r.deleteOrphanSandbox(ctx, nodeID, e.SandboxID, rec.Group, rec.RouteKey)
-		_ = r.stores.RemoveNodeSandboxRef(ctx, nodeID, e.SandboxID)
 		return true
 	}
 	if rec.TemplateID == "" {
@@ -936,12 +962,10 @@ func (r *Registry) finish(key string, res *ReserveResult, err error) {
 	if call == nil {
 		return
 	}
-	select {
-	case <-call.done:
-	default:
+	call.finishOnce.Do(func() {
 		call.result, call.err = res, err
 		close(call.done)
-	}
+	})
 }
 
 func waitCall(ctx context.Context, call *reserveCall) (*ReserveResult, error) {
@@ -1367,7 +1391,7 @@ func (r *Registry) sweepNode(ctx context.Context, nodeID string, deadAfter time.
 	}
 	reset := 0
 	for _, ref := range append([]clusterstate.NodeSandboxRef(nil), rec.Sandboxes...) {
-		s, _, found, err := r.stores.GetSandbox(ctx, ref.Group, ref.RouteKey)
+		s, rev, found, err := r.stores.GetSandbox(ctx, ref.Group, ref.RouteKey)
 		if err != nil || !found || s.NodeID != nodeID || s.SID != ref.SandboxID {
 			continue
 		}
@@ -1378,8 +1402,9 @@ func (r *Registry) sweepNode(ctx context.Context, nodeID string, deadAfter time.
 		if !shouldReset {
 			continue
 		}
-		_ = r.stores.DeleteSandbox(ctx, s.Group, s.RouteKey)
-		_ = r.stores.RemoveNodeSandboxRef(ctx, nodeID, s.SID)
+		if !r.deleteSandboxAtRevision(ctx, s.Group, s.RouteKey, s, rev, true) {
+			continue
+		}
 		reset++
 	}
 	deadBuilds := 0
@@ -1391,7 +1416,7 @@ func (r *Registry) sweepNode(ctx context.Context, nodeID string, deadAfter time.
 		b.State, b.Reason = BuildError, "node disconnected"
 		_ = r.stores.PutBuild(ctx, b)
 		_ = r.stores.RemoveNodeBuildRef(ctx, nodeID, b.BuildID)
-		r.releaseBuildAdmission(nodeID, b.BuildID)
+		r.releaseBuildAdmission(nodeID, b.Group, b.BuildID)
 		deadBuilds++
 	}
 	_ = r.stores.DeleteNode(ctx, nodeID)

@@ -83,12 +83,13 @@ func TestReserveBuildUsesNodeOwnerBoundary(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reserve build: %v", err)
 	}
-	if len(admitter.admitted) != 1 || admitter.admitted[0] != "n1/"+res.BuildID {
-		t.Fatalf("admitted=%v, want n1/%s", admitter.admitted, res.BuildID)
+	wantLease := buildAdmissionID("/g", res.BuildID)
+	if len(admitter.admitted) != 1 || admitter.admitted[0] != "n1/"+wantLease {
+		t.Fatalf("admitted=%v, want n1/%q", admitter.admitted, wantLease)
 	}
 	reg.applyBuildEvent(ctx, "n1", &routesync.BuildEvent{BuildID: res.BuildID, State: string(BuildReady)})
-	if len(admitter.released) != 1 || admitter.released[0] != "n1/"+res.BuildID {
-		t.Fatalf("released=%v, want n1/%s", admitter.released, res.BuildID)
+	if len(admitter.released) != 1 || admitter.released[0] != "n1/"+wantLease {
+		t.Fatalf("released=%v, want n1/%q", admitter.released, wantLease)
 	}
 }
 
@@ -108,6 +109,38 @@ func TestBuildAdmissionIsNodeScoped(t *testing.T) {
 	}
 	if m.admit("n2", "other-build", cap, want) {
 		t.Fatal("releasing n1 incorrectly freed n2 capacity")
+	}
+}
+
+func TestReserveBuildRejectsSameNodeIDCollisionAcrossGroups(t *testing.T) {
+	ctx := context.Background()
+	reg := testReg(t)
+	reg.SetPlacer(placementWithToken("n1"))
+	owner := &recordingNodeOwner{allow: true}
+	reg.SetNodeOwner(owner)
+
+	const buildID = "shared-build"
+	first, err := reg.ReserveBuild(ctx, BuildReserveReq{Group: "/g1", BuildID: buildID})
+	if err != nil {
+		t.Fatalf("first reserve: %v", err)
+	}
+	if first.NodeID != "n1" {
+		t.Fatalf("first placement=%+v", first)
+	}
+	if _, err := reg.ReserveBuild(ctx, BuildReserveReq{Group: "/g2", BuildID: buildID}); !errors.Is(err, errNodeBuildIDConflict) {
+		t.Fatalf("second reserve err=%v, want node build-id conflict", err)
+	}
+
+	ref, found, err := reg.stores.GetNodeBuildRef(ctx, "n1", buildID)
+	if err != nil || !found || ref.Group != "/g1" {
+		t.Fatalf("original ownership ref=%+v found=%v err=%v", ref, found, err)
+	}
+	if _, found, err := reg.stores.GetBuildInGroup(ctx, "/g2", buildID); err != nil || found {
+		t.Fatalf("conflicting build record remained: found=%v err=%v", found, err)
+	}
+	wantReleased := "n1/" + buildAdmissionID("/g2", buildID)
+	if len(owner.released) != 1 || owner.released[0] != wantReleased {
+		t.Fatalf("released=%q, want [%q]", owner.released, wantReleased)
 	}
 }
 

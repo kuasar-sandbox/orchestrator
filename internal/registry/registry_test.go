@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -1379,6 +1380,44 @@ func TestLateDeadReportDoesNotDeleteReplacementRoute(t *testing.T) {
 	}
 }
 
+func TestStaleLiveReportRetainsOwnershipUntilDead(t *testing.T) {
+	ctx := context.Background()
+	reg := testReg(t)
+	if _, err := reg.stores.PutSandbox(ctx, &SandboxRecord{
+		Group: "/g", RouteKey: "rk", SID: "sb-new", State: StateReady, NodeID: "n1",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.stores.AddNodeSandboxRef(ctx, "n1", clusterstate.NodeSandboxRef{
+		SandboxID: "sb-old", Group: "/g", RouteKey: "rk",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var deletes int
+	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(cmd *routesync.Command) {
+		if cmd.Kind == routesync.CmdDelete && cmd.SID == "sb-old" {
+			deletes++
+		}
+	}})
+
+	reg.applyRoute(ctx, "n1", &routesync.RouteEntry{SandboxID: "sb-old", State: routesync.StateRunning})
+	if deletes != 1 {
+		t.Fatalf("stale live report sent %d delete commands, want 1", deletes)
+	}
+	if _, found, err := reg.stores.GetNodeSandboxRef(ctx, "n1", "sb-old"); err != nil || !found {
+		t.Fatalf("stale live ownership was removed before DEAD: found=%v err=%v", found, err)
+	}
+
+	reg.applyRoute(ctx, "n1", &routesync.RouteEntry{SandboxID: "sb-old", State: routesync.StateDead})
+	if _, found, err := reg.stores.GetNodeSandboxRef(ctx, "n1", "sb-old"); err != nil || found {
+		t.Fatalf("stale ownership remained after DEAD: found=%v err=%v", found, err)
+	}
+	got, _, found, err := reg.stores.GetSandbox(ctx, "/g", "rk")
+	if err != nil || !found || got.SID != "sb-new" {
+		t.Fatalf("replacement route=%+v found=%v err=%v", got, found, err)
+	}
+}
+
 func TestUnownedRouteReportDoesNotDeleteNodeLocalSandbox(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
@@ -1430,9 +1469,17 @@ func TestParkTimeoutRollback(t *testing.T) {
 	reg := New(NewStores(), nil, 200*time.Millisecond, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	reg.SetPlacer(placementWithToken("n1"))
 	reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"})
+	var sid string
+	var deletes int
 	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(cmd *routesync.Command) {
-		if cmd.Kind == routesync.CmdCreate {
+		switch cmd.Kind {
+		case routesync.CmdCreate:
+			sid = cmd.SID
 			go reg.ackCommand(&routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted})
+		case routesync.CmdDelete:
+			if cmd.SID == sid {
+				deletes++
+			}
 		}
 	}}) // accepts create but never reports running
 
@@ -1443,6 +1490,23 @@ func TestParkTimeoutRollback(t *testing.T) {
 	// The RESERVED record (never reached READY) must be rolled back, not stranded.
 	if _, _, found, _ := reg.stores.GetSandbox(ctx, "/g", "rk"); found {
 		t.Fatal("RESERVED record stranded after park timeout (not rolled back)")
+	}
+	if _, found, err := reg.stores.GetNodeSandboxRef(ctx, "n1", sid); err != nil || !found {
+		t.Fatalf("ambiguous create ownership was dropped: sid=%q found=%v err=%v", sid, found, err)
+	}
+
+	// A create that completed after the caller timed out is still recognized as
+	// registry-owned, deleted, and retained until the node confirms DEAD.
+	reg.applyRoute(ctx, "n1", &routesync.RouteEntry{SandboxID: sid, State: routesync.StateRunning})
+	if deletes != 1 {
+		t.Fatalf("late running route sent %d delete commands, want 1", deletes)
+	}
+	if _, found, err := reg.stores.GetNodeSandboxRef(ctx, "n1", sid); err != nil || !found {
+		t.Fatalf("late running ownership was removed before DEAD: found=%v err=%v", found, err)
+	}
+	reg.applyRoute(ctx, "n1", &routesync.RouteEntry{SandboxID: sid, State: routesync.StateDead})
+	if _, found, err := reg.stores.GetNodeSandboxRef(ctx, "n1", sid); err != nil || found {
+		t.Fatalf("late sandbox ownership remained after DEAD: found=%v err=%v", found, err)
 	}
 }
 
@@ -1501,6 +1565,70 @@ func TestRollbackReserveRestoresOriginalSameNodeRef(t *testing.T) {
 	}
 	if len(node.Sandboxes) != 1 || node.Sandboxes[0].SandboxID != "sb-old" {
 		t.Fatalf("same-node rollback refs=%+v, want sb-old", node.Sandboxes)
+	}
+}
+
+func TestRollbackReserveRevisionFencesConcurrentWinner(t *testing.T) {
+	for _, restore := range []bool{false, true} {
+		t.Run(fmt.Sprintf("restore=%v", restore), func(t *testing.T) {
+			ctx := context.Background()
+			reg := testReg(t)
+			reserved := &SandboxRecord{Group: "/g", RouteKey: "rk", SID: "sb-reserved", State: StateReserved, NodeID: "candidate"}
+			if _, err := reg.stores.PutSandbox(ctx, reserved); err != nil {
+				t.Fatal(err)
+			}
+			if err := reg.stores.AddNodeSandboxRef(ctx, "candidate", clusterstate.NodeSandboxRef{
+				Group: "/g", RouteKey: "rk", SandboxID: reserved.SID,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			observed, rev, found, err := reg.stores.GetSandbox(ctx, "/g", "rk")
+			if err != nil || !found {
+				t.Fatalf("read reserved found=%v err=%v", found, err)
+			}
+			winner := &SandboxRecord{Group: "/g", RouteKey: "rk", SID: "sb-winner", State: StateReady, NodeID: "winner"}
+			if _, err := reg.stores.PutSandbox(ctx, winner); err != nil {
+				t.Fatal(err)
+			}
+			original := &SandboxRecord{Group: "/g", RouteKey: "rk", SID: "sb-original", State: StatePaused, NodeID: "original"}
+
+			if reg.rollbackReservedAtRevision(ctx, "/g", "rk", observed, rev, original, restore, true) {
+				t.Fatal("stale rollback replaced a concurrently committed winner")
+			}
+			got, _, found, err := reg.stores.GetSandbox(ctx, "/g", "rk")
+			if err != nil || !found || got.SID != winner.SID || got.State != StateReady {
+				t.Fatalf("winner=%+v found=%v err=%v", got, found, err)
+			}
+			if _, found, err := reg.stores.GetNodeSandboxRef(ctx, "candidate", reserved.SID); err != nil || !found {
+				t.Fatalf("stale rollback mutated ownership: found=%v err=%v", found, err)
+			}
+		})
+	}
+}
+
+func TestReserveFinishIsSingleAssignment(t *testing.T) {
+	reg := testReg(t)
+	call := &reserveCall{done: make(chan struct{})}
+	reg.inflight["/g\x00rk"] = call
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < 100; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			reg.finish("/g\x00rk", &ReserveResult{SID: fmt.Sprintf("sb-%d", i)}, nil)
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	select {
+	case <-call.done:
+	default:
+		t.Fatal("reserve call was not completed")
+	}
+	if call.result == nil || call.result.SID == "" {
+		t.Fatalf("reserve result=%+v", call.result)
 	}
 }
 
