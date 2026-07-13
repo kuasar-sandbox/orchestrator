@@ -289,8 +289,8 @@ register() { # name → sets TID/BID
 diag() { # bid — failure diagnostics (workdir is reaped by the orchestrator)
     echo "---- orchestrator log (tail) ----"
     tail -40 "$WORK/orch.log" 2>/dev/null | sed 's/^/    /'
-    echo "---- journal sandbox-builder@$1 (tail) ----"
-    journalctl -u "sandbox-builder@$1.service" --no-pager -n 120 2>/dev/null | sed 's/^/    /'
+    echo "---- journal build $1 (tail) ----"
+    journalctl KUASAR_BUILD_ID="$1" --no-pager -n 120 2>/dev/null | sed 's/^/    /'
 }
 wait_ready() { # tid bid label → sets PERSIST (e2b-{img,snp}-<64hex>)
     local tid="$1" bid="$2" label="$3" status="" code

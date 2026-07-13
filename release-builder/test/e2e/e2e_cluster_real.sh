@@ -63,8 +63,8 @@ fail() {
         if [ -d "$WORK/cr" ]; then
             while IFS= read -r sid; do
                 [ -n "$sid" ] || continue
-                echo "---- journal sandbox-runner@$sid.service ----" >&2
-                journalctl -u "sandbox-runner@$sid.service" --no-pager -n 100 2>/dev/null | sed 's/^/  unit| /' >&2 || true
+                echo "---- journal sandbox $sid ----" >&2
+                journalctl KUASAR_SANDBOX_ID="$sid" --no-pager -n 100 2>/dev/null | sed 's/^/  sandbox| /' >&2 || true
             done < <(find "$WORK/cr" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null)
         fi
     fi
