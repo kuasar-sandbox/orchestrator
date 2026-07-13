@@ -2554,8 +2554,47 @@ func TestSweepKeepsInflightReserved(t *testing.T) {
 	if _, _, found, _ := reg.stores.GetSandbox(ctx, "/g", "live"); !found {
 		t.Fatal("swept a RESERVED row owned by an in-flight reserve")
 	}
+	if ref, found, err := reg.stores.GetNodeSandboxRef(ctx, "dead", "sb-r"); err != nil || !found || ref.RouteKey != "live" {
+		t.Fatalf("in-flight ownership ref=%+v found=%v err=%v", ref, found, err)
+	}
 	if _, _, found, _ := reg.stores.GetSandbox(ctx, "/g", "stale"); found {
 		t.Fatal("did not sweep a stale RESERVED row on a dead node")
+	}
+}
+
+func TestClaimedNodeProfileRejectsStaleRuntimeWriters(t *testing.T) {
+	ctx := context.Background()
+	reg := testReg(t)
+	const nodeID = "reaping"
+	if err := reg.stores.PutNode(ctx, &NodeRecord{
+		NodeID: nodeID, LastHeartbeatUnix: time.Now().Add(-time.Hour).Unix(),
+		Sandboxes: []clusterstate.NodeSandboxRef{{Group: "/g", RouteKey: "rk", SandboxID: "sb-old"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	stale, found, err := reg.getNodeForLinkUpdate(ctx, nodeID)
+	if err != nil || !found || len(stale.Sandboxes) != 1 {
+		t.Fatalf("stale node=%+v found=%v err=%v", stale, found, err)
+	}
+	claimed, err := reg.stores.claimNodeProfileReapShard(ctx, nodeID, stale.Meta.Rev)
+	if err != nil || !claimed {
+		t.Fatalf("claim=%v err=%v", claimed, err)
+	}
+	reg.updateHeartbeat(ctx, nodeID, &routesync.Heartbeat{Allocated: 9})
+	reg.updateNodeResume(ctx, nodeID, "stale-resume")
+	if _, found, err := reg.stores.GetNodeProfile(ctx, nodeID); err != nil || found {
+		t.Fatalf("runtime update recreated claimed profile: found=%v err=%v", found, err)
+	}
+	stale.DataEndpoint = "stale"
+	if _, ok, err := reg.stores.casNodeProfileShard(ctx, stale, stale.Meta.Rev); err != nil || ok {
+		t.Fatalf("stale registration CAS ok=%v err=%v", ok, err)
+	}
+	registered, err := reg.updateNodeRegister(ctx, &routesync.NodeRegister{NodeID: nodeID, DataEndpoint: "fresh"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if registered.DataEndpoint != "fresh" || len(registered.Sandboxes) != 0 {
+		t.Fatalf("registration reused stale node view: %+v", registered)
 	}
 }
 

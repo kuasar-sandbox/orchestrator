@@ -112,6 +112,25 @@ func (s *Stores) putRouteBuildShard(ctx context.Context, b *BuildRecord) (uint64
 	return rec.Meta.Rev, nil
 }
 
+func (s *Stores) casRouteBuildShard(ctx context.Context, b *BuildRecord, expectRev uint64) (uint64, bool, error) {
+	if b == nil || b.Group == "" || b.BuildID == "" {
+		return 0, false, nil
+	}
+	sh, err := s.routeLinkRecordSet(b.Group, clusterstate.RecordSetRouteBuild)
+	if err != nil {
+		return 0, false, err
+	}
+	value, err := clusterstate.EncodeShardValue(b)
+	if err != nil {
+		return 0, false, err
+	}
+	rec, ok, err := sh.CAS(ctx, clusterstate.RouteBuildRecordKey(b.BuildID), expectRev, value)
+	if err != nil || !ok {
+		return 0, ok, err
+	}
+	return rec.Meta.Rev, true, nil
+}
+
 func (s *Stores) getRouteBuildShard(ctx context.Context, group, buildID string) (*BuildRecord, uint64, bool, error) {
 	if group == "" || buildID == "" {
 		return nil, 0, false, nil

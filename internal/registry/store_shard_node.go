@@ -9,6 +9,27 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/cluster/shardkv"
 )
 
+type nodeReapSandboxRef struct {
+	Ref      clusterstate.NodeSandboxRef
+	Revision uint64
+}
+
+type nodeReapBuildRef struct {
+	Ref      clusterstate.NodeBuildRef
+	Revision uint64
+}
+
+type nodeReapManifestKey struct {
+	Fingerprint string
+	Revision    uint64
+}
+
+type nodeReapSnapshot struct {
+	Sandboxes    []nodeReapSandboxRef
+	Builds       []nodeReapBuildRef
+	ManifestKeys []nodeReapManifestKey
+}
+
 func (s *Stores) putNodeProfileShard(ctx context.Context, n *NodeRecord) error {
 	_, err := s.putNodeProfileShardReturn(ctx, n)
 	return err
@@ -32,6 +53,26 @@ func (s *Stores) putNodeProfileShardReturn(ctx context.Context, n *NodeRecord) (
 	}
 	n.Meta = clusterRecordMeta(profile.Meta)
 	return profile.Meta.Rev, nil
+}
+
+func (s *Stores) casNodeProfileShard(ctx context.Context, n *NodeRecord, expectRev uint64) (uint64, bool, error) {
+	if n == nil || n.NodeID == "" {
+		return 0, false, nil
+	}
+	sh, err := s.nodeLinkRecordSet(n.NodeID, clusterstate.RecordSetNodeProfile)
+	if err != nil {
+		return 0, false, err
+	}
+	value, err := clusterstate.EncodeShardValue(nodeProfileFromRegistry(n))
+	if err != nil {
+		return 0, false, err
+	}
+	profile, ok, err := sh.CAS(ctx, clusterstate.NodeLinkProfileRecord, expectRev, value)
+	if err != nil || !ok {
+		return 0, ok, err
+	}
+	n.Meta = clusterRecordMeta(profile.Meta)
+	return profile.Meta.Rev, true, nil
 }
 
 func (s *Stores) putNodeShard(ctx context.Context, n *NodeRecord) (uint64, error) {
@@ -108,6 +149,18 @@ func (s *Stores) removeNodeSandboxRefShard(ctx context.Context, nodeID, sandboxI
 	return shardDeleteIfFound(ctx, sh, clusterstate.NodeSandboxRecordKey(sandboxID))
 }
 
+func (s *Stores) removeNodeSandboxRefShardAtRevision(ctx context.Context, nodeID, sandboxID string, expectRev uint64) (bool, error) {
+	if nodeID == "" || sandboxID == "" || expectRev == 0 {
+		return false, nil
+	}
+	sh, err := s.nodeLinkRecordSet(nodeID, clusterstate.RecordSetNodeSandbox)
+	if err != nil {
+		return false, err
+	}
+	_, ok, err := sh.Delete(ctx, clusterstate.NodeSandboxRecordKey(sandboxID), expectRev)
+	return ok, err
+}
+
 func (s *Stores) addNodeBuildRefShard(ctx context.Context, nodeID string, ref clusterstate.NodeBuildRef) error {
 	if nodeID == "" || ref.Group == "" || ref.BuildID == "" {
 		return errors.New("registry: invalid node build ref")
@@ -137,7 +190,12 @@ func (s *Stores) addNodeBuildRefShard(ctx context.Context, nodeID string, ref cl
 			if existing.Group != ref.Group {
 				return errNodeBuildIDConflict
 			}
-			return nil
+			if _, ok, err := sh.CAS(ctx, key, cur.Meta.Rev, value); err != nil {
+				return err
+			} else if ok {
+				return nil
+			}
+			continue
 		}
 		if _, ok, err := sh.CAS(ctx, key, 0, value); err != nil {
 			return err
@@ -181,6 +239,18 @@ func (s *Stores) removeNodeBuildRefShard(ctx context.Context, nodeID, buildID st
 	return shardDeleteIfFound(ctx, sh, clusterstate.NodeBuildRecordKey(buildID))
 }
 
+func (s *Stores) removeNodeBuildRefShardAtRevision(ctx context.Context, nodeID, buildID string, expectRev uint64) (bool, error) {
+	if nodeID == "" || buildID == "" || expectRev == 0 {
+		return false, nil
+	}
+	sh, err := s.nodeLinkRecordSet(nodeID, clusterstate.RecordSetNodeBuild)
+	if err != nil {
+		return false, err
+	}
+	_, ok, err := sh.Delete(ctx, clusterstate.NodeBuildRecordKey(buildID), expectRev)
+	return ok, err
+}
+
 func (s *Stores) upsertNodeManifestKeyShard(ctx context.Context, nodeID string, key clusterstate.NodeManifestKey) error {
 	if nodeID == "" || key.Fingerprint == "" {
 		return nil
@@ -205,6 +275,18 @@ func (s *Stores) dropNodeManifestKeyShard(ctx context.Context, nodeID, fingerpri
 		return err
 	}
 	return shardDeleteIfFound(ctx, sh, clusterstate.NodeManifestKeyRecordKey(fingerprint))
+}
+
+func (s *Stores) dropNodeManifestKeyShardAtRevision(ctx context.Context, nodeID, fingerprint string, expectRev uint64) (bool, error) {
+	if nodeID == "" || fingerprint == "" || expectRev == 0 {
+		return false, nil
+	}
+	sh, err := s.nodeLinkRecordSet(nodeID, clusterstate.RecordSetNodeManifestKey)
+	if err != nil {
+		return false, err
+	}
+	_, ok, err := sh.Delete(ctx, clusterstate.NodeManifestKeyRecordKey(fingerprint), expectRev)
+	return ok, err
 }
 
 func (s *Stores) getNodeManifestKeyShard(ctx context.Context, nodeID, fingerprint string) (clusterstate.NodeManifestKey, uint64, bool, error) {
@@ -261,33 +343,84 @@ func (s *Stores) markNodeManifestKeyAckedShard(ctx context.Context, nodeID strin
 	return false, shardkv.ErrConflict
 }
 
-func (s *Stores) deleteNodeShard(ctx context.Context, nodeID string) error {
+func (s *Stores) snapshotNodeReapShard(ctx context.Context, nodeID string) (*nodeReapSnapshot, error) {
 	if nodeID == "" {
-		return nil
+		return nil, nil
 	}
-	for _, recordSet := range []shardkv.RecordSetName{
-		clusterstate.RecordSetNodeProfile,
-		clusterstate.RecordSetNodeSandbox,
-		clusterstate.RecordSetNodeBuild,
-		clusterstate.RecordSetNodeManifestKey,
-	} {
-		sh, err := s.nodeLinkRecordSet(nodeID, recordSet)
-		if err != nil {
-			return err
-		}
-		snap, err := sh.Snapshot(ctx)
-		if err != nil {
-			return err
-		}
-		for _, rec := range snap.Records {
-			if _, ok, err := sh.Delete(ctx, rec.Key, rec.Meta.Rev); err != nil {
-				return err
-			} else if !ok {
-				return shardkv.ErrConflict
-			}
-		}
+	out := &nodeReapSnapshot{}
+	sandboxSet, err := s.nodeLinkRecordSet(nodeID, clusterstate.RecordSetNodeSandbox)
+	if err != nil {
+		return nil, err
 	}
-	return nil
+	sandboxSnap, err := sandboxSet.Snapshot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, rec := range sandboxSnap.Records {
+		ref, err := clusterstate.DecodeShardValue[clusterstate.NodeSandboxRef](rec.Value)
+		if err != nil {
+			return nil, err
+		}
+		sandboxID, ok := clusterstate.ParseNodeSandboxRecordKey(rec.Key)
+		if !ok || ref.SandboxID != sandboxID || ref.Group == "" || ref.RouteKey == "" {
+			return nil, errors.New("registry: invalid node sandbox ref")
+		}
+		out.Sandboxes = append(out.Sandboxes, nodeReapSandboxRef{Ref: ref, Revision: rec.Meta.Rev})
+	}
+	buildSet, err := s.nodeLinkRecordSet(nodeID, clusterstate.RecordSetNodeBuild)
+	if err != nil {
+		return nil, err
+	}
+	buildSnap, err := buildSet.Snapshot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, rec := range buildSnap.Records {
+		ref, err := clusterstate.DecodeShardValue[clusterstate.NodeBuildRef](rec.Value)
+		if err != nil {
+			return nil, err
+		}
+		buildID, ok := clusterstate.ParseNodeBuildRecordKey(rec.Key)
+		if !ok || ref.BuildID != buildID || ref.Group == "" {
+			return nil, errors.New("registry: invalid node build ref")
+		}
+		out.Builds = append(out.Builds, nodeReapBuildRef{Ref: ref, Revision: rec.Meta.Rev})
+	}
+	keySet, err := s.nodeLinkRecordSet(nodeID, clusterstate.RecordSetNodeManifestKey)
+	if err != nil {
+		return nil, err
+	}
+	keySnap, err := keySet.Snapshot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, rec := range keySnap.Records {
+		key, err := clusterstate.DecodeShardValue[clusterstate.NodeManifestKey](rec.Value)
+		if err != nil {
+			return nil, err
+		}
+		fingerprint, ok := clusterstate.ParseNodeManifestKeyRecordKey(rec.Key)
+		if !ok || key.Fingerprint != fingerprint {
+			return nil, errors.New("registry: invalid node manifest key")
+		}
+		out.ManifestKeys = append(out.ManifestKeys, nodeReapManifestKey{Fingerprint: fingerprint, Revision: rec.Meta.Rev})
+	}
+	sort.Slice(out.Sandboxes, func(i, j int) bool { return out.Sandboxes[i].Ref.SandboxID < out.Sandboxes[j].Ref.SandboxID })
+	sort.Slice(out.Builds, func(i, j int) bool { return out.Builds[i].Ref.BuildID < out.Builds[j].Ref.BuildID })
+	sort.Slice(out.ManifestKeys, func(i, j int) bool { return out.ManifestKeys[i].Fingerprint < out.ManifestKeys[j].Fingerprint })
+	return out, nil
+}
+
+func (s *Stores) claimNodeProfileReapShard(ctx context.Context, nodeID string, expectRev uint64) (bool, error) {
+	if nodeID == "" || expectRev == 0 {
+		return false, nil
+	}
+	sh, err := s.nodeLinkRecordSet(nodeID, clusterstate.RecordSetNodeProfile)
+	if err != nil {
+		return false, err
+	}
+	_, ok, err := sh.Delete(ctx, clusterstate.NodeLinkProfileRecord, expectRev)
+	return ok, err
 }
 
 func (s *Stores) getNodeShard(ctx context.Context, nodeID string) (*NodeRecord, bool, error) {
