@@ -130,12 +130,12 @@ func (r *Registry) ReserveBuild(ctx context.Context, req BuildReserveReq) (*Buil
 			return r.buildReserveResult(ctx, rec), nil
 		}
 		if err != nil {
-			_ = r.stores.DeleteBuild(ctx, req.Group, buildID) // roll back the reservation
+			if !errors.Is(err, ErrNodeGone) {
+				return r.buildReserveResult(ctx, rec), nil
+			}
+			_ = r.stores.DeleteBuild(ctx, req.Group, buildID) // command definitively did not reach the node
 			_ = r.stores.RemoveNodeBuildRef(ctx, id, req.Group, buildID)
 			r.releaseBuildAdmission(buildID)
-			if !errors.Is(err, ErrNodeGone) {
-				return nil, err
-			}
 			lastFailure = err
 			excluded.add(id)
 			continue

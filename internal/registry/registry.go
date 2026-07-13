@@ -427,10 +427,14 @@ func (r *Registry) ReserveSandbox(ctx context.Context, group, routeKey string, c
 		return nil, err
 	}
 	if found && rec.State == StateReady {
-		if res, live := r.readyResultFromRecord(ctx, rec); live {
+		res, live, err := r.readyResultFromRecord(ctx, rec)
+		if err != nil {
+			return nil, err
+		}
+		if live {
 			return res, nil
 		}
-		// Missing node runtime: fall through to re-place (dead-node sweep also resets it).
+		// Definitive node loss: fall through to re-place (dead-node sweep also resets it).
 	}
 
 	key := flightKey(group, routeKey)
@@ -634,8 +638,7 @@ func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, c
 			KeyFingerprint: placement.KeyFingerprint, AccessToken: placement.AccessToken,
 		}
 		if r.nodeOwner == nil {
-			_ = r.stores.DeleteSandbox(ctx, group, routeKey)
-			_ = r.stores.RemoveNodeSandboxRef(ctx, nodeID, group, routeKey, sid)
+			r.rollbackReserve(group, routeKey, replaceReady, replaceReady != nil)
 			lastFailure = ErrNodeGone
 			excluded.add(nodeID)
 			continue
@@ -645,18 +648,16 @@ func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, c
 			return nil // delivery is ambiguous; wait for the authoritative route event
 		}
 		if err != nil {
-			_ = r.stores.DeleteSandbox(ctx, group, routeKey)
-			_ = r.stores.RemoveNodeSandboxRef(ctx, nodeID, group, routeKey, sid)
 			if !errors.Is(err, ErrNodeGone) {
-				return err
+				return nil // delivery is ambiguous; keep RESERVED and wait for the route event
 			}
+			r.rollbackReserve(group, routeKey, replaceReady, replaceReady != nil)
 			lastFailure = err
 			excluded.add(nodeID)
 			continue
 		}
 		if ack == nil || ack.Status != routesync.AckAccepted {
-			_ = r.stores.DeleteSandbox(ctx, group, routeKey)
-			_ = r.stores.RemoveNodeSandboxRef(ctx, nodeID, group, routeKey, sid)
+			r.rollbackReserve(group, routeKey, replaceReady, replaceReady != nil)
 			reason := ""
 			if ack != nil {
 				reason = ack.Reason
@@ -991,23 +992,28 @@ func (r *Registry) reserveReadyResult(ctx context.Context, group, routeKey strin
 	if err != nil || !found || rec.State != StateReady {
 		return nil, false, err
 	}
-	res, live := r.readyResultFromRecord(ctx, rec)
-	return res, live, nil
+	return r.readyResultFromRecord(ctx, rec)
 }
 
-func (r *Registry) readyResultFromRecord(ctx context.Context, rec *SandboxRecord) (*ReserveResult, bool) {
+func (r *Registry) readyResultFromRecord(ctx context.Context, rec *SandboxRecord) (*ReserveResult, bool, error) {
 	if rec == nil || rec.NodeID == "" || r.nodeOwner == nil {
-		return nil, false
+		return nil, false, nil
 	}
 	node, found, err := r.nodeOwner.Runtime(ctx, rec.NodeID)
-	if err != nil || !found || node == nil {
-		return nil, false
+	if errors.Is(err, ErrNodeGone) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	if !found || node == nil {
+		return nil, false, fmt.Errorf("registry: runtime profile for connected node %q is unavailable", rec.NodeID)
 	}
 	return &ReserveResult{
 		NodeID: rec.NodeID, SID: rec.SID, AccessToken: rec.AccessToken,
 		TrafficAccessToken: rec.TrafficAccessToken, TargetPort: rec.TargetPort,
 		DataEndpoint: node.DataEndpoint,
-	}, true
+	}, true, nil
 }
 
 // DeleteSandboxRoute sends the authoritative delete command for an exact

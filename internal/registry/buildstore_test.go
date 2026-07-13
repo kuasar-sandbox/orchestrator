@@ -121,7 +121,7 @@ func TestReserveBuildKeepsCommittedBuildOnAckTimeout(t *testing.T) {
 	}
 }
 
-func TestReserveBuildDoesNotRePlaceAfterAmbiguousCommandError(t *testing.T) {
+func TestReserveBuildKeepsCommittedBuildAfterAmbiguousCommandError(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
 	placements := 0
@@ -133,18 +133,25 @@ func TestReserveBuildDoesNotRePlaceAfterAmbiguousCommandError(t *testing.T) {
 	owner := &recordingNodeOwner{allow: true, ackErr: ackErr}
 	reg.SetNodeOwner(owner)
 
-	_, err := reg.ReserveBuild(ctx, BuildReserveReq{Group: "/g", BuildID: "bld-fixed"})
-	if !errors.Is(err, ackErr) {
-		t.Fatalf("ReserveBuild err=%v, want ambiguous command error", err)
+	res, err := reg.ReserveBuild(ctx, BuildReserveReq{Group: "/g", BuildID: "bld-fixed"})
+	if err != nil {
+		t.Fatalf("ReserveBuild: %v", err)
+	}
+	if res == nil || res.BuildID != "bld-fixed" || res.NodeID != "n1" {
+		t.Fatalf("ReserveBuild result=%+v", res)
 	}
 	if placements != 1 || len(owner.admitted) != 1 {
 		t.Fatalf("ambiguous build was retried: placements=%d admitted=%v", placements, owner.admitted)
 	}
-	if _, found, err := reg.stores.GetBuildInGroup(ctx, "/g", "bld-fixed"); err != nil || found {
-		t.Fatalf("build record found=%v err=%v, want rolled back", found, err)
+	if rec, found, err := reg.stores.GetBuildInGroup(ctx, "/g", "bld-fixed"); err != nil || !found || rec.State != BuildRegistered {
+		t.Fatalf("build record=%+v found=%v err=%v, want committed REGISTERED", rec, found, err)
 	}
-	if len(owner.released) != 1 || owner.released[0] != "bld-fixed" {
-		t.Fatalf("released=%v, want bld-fixed", owner.released)
+	if len(owner.released) != 0 {
+		t.Fatalf("ambiguous build admission was released: %v", owner.released)
+	}
+	res, err = reg.ReserveBuild(ctx, BuildReserveReq{Group: "/g", BuildID: "bld-fixed"})
+	if err != nil || res == nil || res.NodeID != "n1" || placements != 1 || len(owner.admitted) != 1 {
+		t.Fatalf("stable build replay result=%+v err=%v placements=%d admitted=%v", res, err, placements, owner.admitted)
 	}
 }
 
@@ -328,21 +335,21 @@ func TestBuildStoreUsesRouteLinkBuildShardAndDoesNotLeakToSandboxList(t *testing
 	}
 }
 
-func TestReserveBuildReleasesAdmissionOnSendFailure(t *testing.T) {
+func TestReserveBuildReleasesAdmissionOnDefinitiveSendFailure(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
 	reg.SetPlacer(placementWithToken("n1"))
 	reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1", BuildCapacity: &routesync.BuildResources{CPU: 2000}})
-	reg.addNode(&fakeConn{nodeID: "n1", err: errors.New("send failed")})
+	reg.addNode(&fakeConn{nodeID: "n1", err: ErrNodeGone})
 
 	if _, err := reg.ReserveBuild(ctx, BuildReserveReq{Group: "/g", Resources: &routesync.BuildResources{CPU: 2000}}); err == nil {
-		t.Fatal("first build should fail when build_register send fails")
+		t.Fatal("first build should fail when the node is gone")
 	}
 
 	reg.addNode(buildAckConn(reg, "n1"))
 	res, err := reg.ReserveBuild(ctx, BuildReserveReq{Group: "/g", Resources: &routesync.BuildResources{CPU: 2000}})
 	if err != nil || res.NodeID != "n1" {
-		t.Fatalf("admission lease was not released after send failure: res=%+v err=%v", res, err)
+		t.Fatalf("admission lease was not released after definitive send failure: res=%+v err=%v", res, err)
 	}
 }
 
