@@ -157,6 +157,41 @@ func (s *Stores) getNodeManifestKeyShard(ctx context.Context, nodeID, fingerprin
 	return key, rec.Meta.Rev, true, nil
 }
 
+func (s *Stores) markNodeManifestKeyAckedShard(ctx context.Context, nodeID string, expected clusterstate.NodeManifestKey) (bool, error) {
+	sh, err := s.nodeLinkRecordSet(nodeID, clusterstate.RecordSetNodeManifestKey)
+	if err != nil {
+		return false, err
+	}
+	recordKey := clusterstate.NodeManifestKeyRecordKey(expected.Fingerprint)
+	for attempt := 0; attempt < 5; attempt++ {
+		rec, found, err := sh.Get(ctx, recordKey)
+		if err != nil || !found {
+			return false, err
+		}
+		current, err := clusterstate.DecodeShardValue[clusterstate.NodeManifestKey](rec.Value)
+		if err != nil {
+			return false, err
+		}
+		if current.ExpiresUnix != expected.ExpiresUnix || !sameNodeManifestKeyMaterial(current, expected) {
+			return false, nil
+		}
+		if current.AckedExpiresUnix >= expected.ExpiresUnix {
+			return true, nil
+		}
+		current.AckedExpiresUnix = expected.ExpiresUnix
+		value, err := clusterstate.EncodeShardValue(current)
+		if err != nil {
+			return false, err
+		}
+		if _, ok, err := sh.CAS(ctx, recordKey, rec.Meta.Rev, value); err != nil {
+			return false, err
+		} else if ok {
+			return true, nil
+		}
+	}
+	return false, shardkv.ErrConflict
+}
+
 func (s *Stores) deleteNodeShard(ctx context.Context, nodeID string) error {
 	if nodeID == "" {
 		return nil
