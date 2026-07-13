@@ -17,6 +17,7 @@ func (s *Store) Compact(ctx context.Context, now time.Time) (GCStats, error) {
 	if now.IsZero() {
 		now = s.now()
 	}
+	config := s.configSnapshot()
 	s.mu.Lock()
 	keys := make([]string, 0, len(s.shards))
 	for key := range s.shards {
@@ -30,12 +31,12 @@ func (s *Store) Compact(ctx context.Context, now time.Time) (GCStats, error) {
 		if ls == nil {
 			continue
 		}
-		view, err := s.resolver.ResolveShard(ls.namespace, ls.shard)
+		view, err := config.resolver.ResolveShard(ls.namespace, ls.shard)
 		if err != nil {
 			continue
 		}
-		spec := namespaceSpec(view.Namespace, s.resolver)
-		if spec.TombstoneRetention > 0 && s.allMembersReady(view) {
+		spec := namespaceSpec(view.Namespace, config.resolver)
+		if spec.TombstoneRetention > 0 && s.allMembersReady(view, config.ready) {
 			sh := &Shard{store: s, namespace: ls.namespace, shard: ls.shard}
 			for _, setName := range ls.recordSetNames() {
 				rs, err := sh.RecordSet(setName)
@@ -77,15 +78,15 @@ func (s *Store) localShardByID(id string) *localShard {
 	return s.shards[id]
 }
 
-func (s *Store) allMembersReady(view ShardView) bool {
-	if s.ready == nil {
+func (s *Store) allMembersReady(view ShardView, ready MemberReadyProvider) bool {
+	if ready == nil {
 		return true
 	}
 	for _, member := range writeMembers(view) {
 		if member == s.local {
 			continue
 		}
-		if !s.ready.Ready(view.Label, member) {
+		if !ready.Ready(view.Label, member) {
 			return false
 		}
 	}

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 )
@@ -341,6 +342,51 @@ func TestRecordSetJointViewAcceptsCommittedHeadFromActiveCertificate(t *testing.
 	}
 }
 
+func TestStoreConfigureConcurrentShardResolution(t *testing.T) {
+	ctx := context.Background()
+	resolvers := []ShardResolver{
+		newTestResolver(t, "m1", []MemberID{"m1"}, 1),
+		newTestResolver(t, "m1", []MemberID{"m1"}, 1),
+	}
+	store, err := NewStore(StoreOptions{Local: "m1", Resolver: resolvers[0], Epoch: "epoch-m1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	start := make(chan struct{})
+	errs := make(chan error, 4)
+	var wg sync.WaitGroup
+	for worker := 0; worker < cap(errs); worker++ {
+		wg.Add(1)
+		go func(worker int) {
+			defer wg.Done()
+			<-start
+			for i := 0; i < 500; i++ {
+				sh, err := store.Shard(testNS, ShardKey(fmt.Sprintf("s-%d", worker)))
+				if err != nil {
+					errs <- err
+					return
+				}
+				if _, err := sh.View(ctx); err != nil {
+					errs <- err
+					return
+				}
+			}
+		}(worker)
+	}
+	close(start)
+	for i := 0; i < 500; i++ {
+		if err := store.Configure(resolvers[i%len(resolvers)], nil, nil, 100+i%2); err != nil {
+			t.Fatal(err)
+		}
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+}
+
 func TestRecordSetCutoverReadsColdOldGraceHead(t *testing.T) {
 	ctx := context.Background()
 	oldView := ClusterView{Version: 1, Label: "v1", Members: []MemberID{"m1", "m2", "m3"}}
@@ -504,7 +550,10 @@ func TestShardKVOverHTTPTransport(t *testing.T) {
 		return endpoint, ok
 	}))
 	for _, store := range stores {
-		store.transport = transport
+		config := store.configSnapshot()
+		if err := store.Configure(config.resolver, transport, config.ready, config.defaultWatchRetention); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	sh := mustRecordSet(t, stores["m1"], testNS, "s-http", testRS)
@@ -1222,7 +1271,7 @@ func shardNotOwnedBy(t *testing.T, store *Store, local MemberID) (ShardKey, Memb
 	t.Helper()
 	for i := 0; i < 1000; i++ {
 		shard := ShardKey(fmt.Sprintf("s-non-owner-%d", i))
-		view, err := store.resolver.ResolveShard(testNS, shard)
+		view, err := store.configSnapshot().resolver.ResolveShard(testNS, shard)
 		if err != nil {
 			t.Fatal(err)
 		}
