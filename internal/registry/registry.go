@@ -89,15 +89,18 @@ type Registry struct {
 	inflight map[string]*reserveCall           // single-flight ReserveSandbox per (group,route_key)
 	acks     map[string]chan *routesync.CmdAck // cmd_id -> command acknowledgement waiter
 
-	localNodeOwner     NodeOwner
-	nodeOwner          NodeOwner
-	deadAfter          time.Duration
-	reaperCtx          context.Context
-	nodeLinkRelayMu    sync.RWMutex
-	nodeLinkRelayPeers map[string]NodeLinkRelayPeer
-	nodeListProjectMu  sync.Mutex
-	nodeListProject    map[string]clusterstate.NodeListEntry
-	nodeListProjectRun bool
+	localNodeOwner      NodeOwner
+	nodeOwner           NodeOwner
+	deadAfter           time.Duration
+	reaperCtx           context.Context
+	nodeLinkRelayMu     sync.RWMutex
+	nodeLinkRelayPeers  map[string]NodeLinkRelayPeer
+	nodeListProjectMu   sync.Mutex
+	nodeListProject     map[string]clusterstate.NodeListEntry
+	nodeListProjectCtx  context.Context
+	nodeListProjectGen  uint64
+	nodeListProjectRoot bool
+	nodeListProjectRun  bool
 
 	placerMu         sync.Mutex
 	scaleReadyLabel  string
@@ -1210,37 +1213,67 @@ func (r *Registry) enqueueNodeListProjection(ctx context.Context, entry clusters
 	if r == nil || entry.NodeID == "" || ctx.Err() != nil {
 		return
 	}
+	retryCtx := ctx
+	lifecycleCtx := false
+	r.mu.Lock()
+	if r.reaperCtx != nil {
+		retryCtx = r.reaperCtx
+		lifecycleCtx = true
+	}
+	r.mu.Unlock()
 	next := cloneNodeListProjection(entry)
 	r.nodeListProjectMu.Lock()
 	if cur, found := r.nodeListProject[next.NodeID]; !found || nodeListProjectionNewer(next, cur) {
 		r.nodeListProject[next.NodeID] = next
 	}
+	replaceCtx := r.nodeListProjectCtx == nil || r.nodeListProjectCtx.Err() != nil
+	if lifecycleCtx && !r.nodeListProjectRoot {
+		replaceCtx = true
+	}
+	if replaceCtx {
+		r.nodeListProjectCtx = retryCtx
+		r.nodeListProjectGen++
+		r.nodeListProjectRoot = lifecycleCtx
+	}
 	if !r.nodeListProjectRun {
 		r.nodeListProjectRun = true
-		go r.runNodeListProjectionRetry(ctx)
+		go r.runNodeListProjectionRetry()
 	}
 	r.nodeListProjectMu.Unlock()
 }
 
-func (r *Registry) runNodeListProjectionRetry(ctx context.Context) {
+func (r *Registry) runNodeListProjectionRetry() {
 	ticker := time.NewTicker(nodeListProjectionRetryInterval)
 	defer ticker.Stop()
 	for {
-		r.flushNodeListProjection(ctx)
 		r.nodeListProjectMu.Lock()
-		if len(r.nodeListProject) == 0 {
+		ctx := r.nodeListProjectCtx
+		ctxGen := r.nodeListProjectGen
+		if ctx == nil || ctx.Err() != nil {
 			r.nodeListProjectRun = false
+			r.nodeListProjectCtx = nil
+			r.nodeListProjectRoot = false
 			r.nodeListProjectMu.Unlock()
 			return
 		}
 		r.nodeListProjectMu.Unlock()
+		r.flushNodeListProjection(ctx)
+		r.nodeListProjectMu.Lock()
+		if len(r.nodeListProject) == 0 {
+			r.nodeListProjectRun = false
+			r.nodeListProjectCtx = nil
+			r.nodeListProjectRoot = false
+			r.nodeListProjectMu.Unlock()
+			return
+		}
+		nextCtxGen := r.nodeListProjectGen
+		r.nodeListProjectMu.Unlock()
+		if nextCtxGen != ctxGen {
+			continue
+		}
 		select {
 		case <-ticker.C:
 		case <-ctx.Done():
-			r.nodeListProjectMu.Lock()
-			r.nodeListProjectRun = false
-			r.nodeListProjectMu.Unlock()
-			return
 		}
 	}
 }
@@ -1355,6 +1388,17 @@ func (r *Registry) RunReaper(ctx context.Context, deadAfter time.Duration) {
 	r.reaperCtx = ctx
 	r.deadAfter = deadAfter
 	r.mu.Unlock()
+	r.nodeListProjectMu.Lock()
+	if len(r.nodeListProject) > 0 {
+		r.nodeListProjectCtx = ctx
+		r.nodeListProjectGen++
+		r.nodeListProjectRoot = true
+		if !r.nodeListProjectRun {
+			r.nodeListProjectRun = true
+			go r.runNodeListProjectionRetry()
+		}
+	}
+	r.nodeListProjectMu.Unlock()
 	<-ctx.Done()
 }
 

@@ -940,8 +940,11 @@ func TestNodeRegisterRetriesNodeListProjectionAfterQuorumRecovers(t *testing.T) 
 }
 
 func TestNodeReapRetriesNodeListTombstoneAfterQuorumRecovers(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := context.Background()
+	requestCtx, cancelRequest := context.WithCancel(ctx)
+	defer cancelRequest()
+	lifecycleCtx, cancelLifecycle := context.WithCancel(ctx)
+	defer cancelLifecycle()
 	view := clusterstate.MemberView{Version: 1, Members: []string{"a", "b"}}
 	cluster := map[string]*Stores{
 		"a": NewClusterStores("a", view, 1, 1, 2, 1),
@@ -949,13 +952,29 @@ func TestNodeReapRetriesNodeListTombstoneAfterQuorumRecovers(t *testing.T) {
 	reg := New(cluster["a"], nil, time.Second, nil)
 	const nodeID = "reap-projection-retry"
 	source := clusterstate.RecordMeta{Ballot: clusterstate.Ballot{Round: 2, Writer: "a"}, Rev: 2}
-	reg.deleteNodeListProjection(ctx, nodeID, source)
+	reg.deleteNodeListProjection(requestCtx, nodeID, source)
 	reg.nodeListProjectMu.Lock()
 	pending, found := reg.nodeListProject[nodeID]
+	requestGeneration := reg.nodeListProjectGen
 	reg.nodeListProjectMu.Unlock()
 	if !found || !pending.Deleted || compareRecordMeta(pending.SourceMeta, source) != 0 {
 		t.Fatalf("pending reap projection=%+v found=%v", pending, found)
 	}
+	go reg.RunReaper(lifecycleCtx, time.Second)
+	deadline := time.Now().Add(time.Second)
+	for {
+		reg.nodeListProjectMu.Lock()
+		adopted := reg.nodeListProjectGen > requestGeneration
+		reg.nodeListProjectMu.Unlock()
+		if adopted {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("projection retry did not adopt the registry lifecycle context")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	cancelRequest()
 
 	cluster["b"] = NewClusterStores("b", view, 1, 1, 2, 1)
 	transport := shardkv.TransportFunc(func(ctx context.Context, member shardkv.MemberID, req shardkv.Request) (shardkv.Response, error) {
@@ -969,7 +988,7 @@ func TestNodeReapRetriesNodeListTombstoneAfterQuorumRecovers(t *testing.T) {
 		stores.SetShardTransport(transport, nil)
 	}
 
-	deadline := time.Now().Add(3 * time.Second)
+	deadline = time.Now().Add(3 * time.Second)
 	for {
 		sh, err := cluster["a"].nodeListRecordSet()
 		if err != nil {
