@@ -39,7 +39,6 @@ func runPlacer(args []string, log *slog.Logger) error {
 		}
 	}
 
-	deadAfter := int64(cfg.NodeDeadDur().Seconds())
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	regClient, err := clusterclient.NewRegistry(registryAddr, registryTLS)
@@ -69,7 +68,7 @@ func runPlacer(args []string, log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	svc := placer.NewRemoteLinksWithGroups(links, groupInputs.Provider, groupInputs.Sources, cfg.Placement, deadAfter, log)
+	svc := placer.NewRemoteLinksWithGroups(links, groupInputs.Provider, groupInputs.Sources, cfg.Placement, log)
 	svc.SetNodeListLinksForLabel(ctx, registryLinks(nodeListEps), activeLabel)
 	svc.SetPlacerLinkResolver(newPlacerLinkResolver(regClient))
 	svc.SetPlacerLinkRefresher(regClient.Refresh)

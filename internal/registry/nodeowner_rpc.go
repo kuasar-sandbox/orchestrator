@@ -50,6 +50,9 @@ func ServeNodeOwner(w http.ResponseWriter, req *http.Request, owner NodeOwner) {
 	var out nodeOwnerResponse
 	var err error
 	switch in.Op {
+	case "connected":
+		err = owner.Connected(req.Context(), in.NodeID)
+		out.OK = err == nil
 	case "put_manifest_key":
 		keyType, keyValue := in.ManifestKeyType, in.ManifestKey
 		if keyType == "ref" {
@@ -103,6 +106,11 @@ func NewHTTPNodeOwner(endpoint string, client *http.Client) *HTTPNodeOwner {
 		client = http.DefaultClient
 	}
 	return &HTTPNodeOwner{endpoint: strings.TrimRight(endpoint, "/"), client: client}
+}
+
+func (o *HTTPNodeOwner) Connected(ctx context.Context, nodeID string) error {
+	_, err := o.call(ctx, nodeOwnerRequest{Op: "connected", NodeID: nodeID})
+	return err
 }
 
 func (o *HTTPNodeOwner) PutManifestKey(ctx context.Context, nodeID, fingerprint, keyType, keyValue string, expiresUnix int64) error {
@@ -173,6 +181,9 @@ func (o *HTTPNodeOwner) call(ctx context.Context, in nodeOwnerRequest) (nodeOwne
 		return nodeOwnerResponse{}, err
 	}
 	if out.Error != "" {
+		if out.Error == ErrNodeGone.Error() {
+			return out, ErrNodeGone
+		}
 		return out, fmt.Errorf("%s", out.Error)
 	}
 	if resp.StatusCode >= 300 {

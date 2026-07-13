@@ -120,27 +120,26 @@ type NodeBuildRef struct {
 	BuildID string `json:"build_id"`
 }
 
-// NodeListEntry is the low-frequency WATCH_LIST projection consumed by placer.
-// High-frequency load stays in node_link and is fetched at placement time.
+// NodeListEntry is the low-frequency WATCH_LIST catalog consumed by placer.
+// Liveness and high-frequency load remain authoritative at the node owner.
 type NodeListEntry struct {
-	Meta              RecordMeta                `json:"meta"`
-	SourceMeta        RecordMeta                `json:"source_meta,omitempty"`
-	NodeID            string                    `json:"node_id"`
-	Labels            map[string]string         `json:"labels,omitempty"`
-	Capacity          int                       `json:"capacity,omitempty"`
-	BuildCapacity     *routesync.BuildResources `json:"build_capacity,omitempty"`
-	DataEndpoint      string                    `json:"data_endpoint,omitempty"`
-	RuntimeDigest     string                    `json:"runtime_digest,omitempty"`
-	Draining          bool                      `json:"draining,omitempty"`
-	LastHeartbeatUnix int64                     `json:"last_heartbeat_unix,omitempty"`
-	Deleted           bool                      `json:"deleted,omitempty"`
+	Meta          RecordMeta                `json:"meta"`
+	SourceMeta    RecordMeta                `json:"source_meta,omitempty"`
+	NodeID        string                    `json:"node_id"`
+	Labels        map[string]string         `json:"labels,omitempty"`
+	Capacity      int                       `json:"capacity,omitempty"`
+	BuildCapacity *routesync.BuildResources `json:"build_capacity,omitempty"`
+	DataEndpoint  string                    `json:"data_endpoint,omitempty"`
+	RuntimeDigest string                    `json:"runtime_digest,omitempty"`
+	Draining      bool                      `json:"draining,omitempty"`
+	Deleted       bool                      `json:"deleted,omitempty"`
 }
 
 func ProjectNodeList(n NodeRecord) NodeListEntry {
 	return NodeListEntry{
 		SourceMeta: n.Meta, NodeID: n.NodeID, Labels: cloneStringMap(n.Labels), Capacity: n.Capacity,
 		BuildCapacity: cloneBuildResources(n.BuildCapacity), DataEndpoint: n.DataEndpoint,
-		RuntimeDigest: n.RuntimeDigest, Draining: n.Draining, LastHeartbeatUnix: n.LastHeartbeatUnix,
+		RuntimeDigest: n.RuntimeDigest, Draining: n.Draining,
 	}
 }
 

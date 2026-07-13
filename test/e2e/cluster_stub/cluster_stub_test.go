@@ -104,7 +104,7 @@ func newHarness(t *testing.T) *harness {
 	svc := placer.NewRemoteLinksWithGroups(
 		[]placer.RegistryLink{{Name: "registry", BaseURL: "http://" + linkAddr, Client: http.DefaultClient}},
 		groupSource, []placer.ImportSource{{SourceID: "stub", Importer: groupSource}},
-		clustercfg.PlacementConfig{Candidates: 1, ZoneAdmitMax: "yellow"}, 30, log,
+		clustercfg.PlacementConfig{Candidates: 1, ZoneAdmitMax: "yellow"}, log,
 	)
 	placerHub := membergroup.NewHub()
 	placerMux := http.NewServeMux()

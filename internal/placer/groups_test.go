@@ -104,7 +104,7 @@ func TestFileRemovalStopsNewPlacement(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	svc := NewRemoteLinksWithGroups(nil, src, testImportSources("test", src), clustercfg.PlacementConfig{Candidates: 1}, 30, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	svc := NewRemoteLinksWithGroups(nil, src, testImportSources("test", src), clustercfg.PlacementConfig{Candidates: 1}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	putNodeList(t, svc, clusterstate.NodeListEntry{NodeID: "n1", Labels: map[string]string{"pool": "p"}})
 
 	if res := svc.answer(context.Background(), &routesync.PlaceReq{Group: "/g", RouteKey: "rk"}); res.NoNode || res.Error != "" {
@@ -121,7 +121,7 @@ func TestFileRemovalStopsNewPlacement(t *testing.T) {
 func testServiceWithGroups(t *testing.T, groups ...clusterstate.SandboxGroupRecord) *Service {
 	t.Helper()
 	src := testGroupSource(t, groups...)
-	return NewRemoteLinksWithGroups(nil, src, testImportSources("test", src), clustercfg.PlacementConfig{Candidates: 1}, 30, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	return NewRemoteLinksWithGroups(nil, src, testImportSources("test", src), clustercfg.PlacementConfig{Candidates: 1}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 }
 
 func testGroupSource(t *testing.T, groups ...clusterstate.SandboxGroupRecord) *fileGroupSource {

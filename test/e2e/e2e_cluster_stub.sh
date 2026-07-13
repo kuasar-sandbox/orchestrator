@@ -316,7 +316,6 @@ import_groups:
 placement:
   candidates: 2
   zone_admit_max: "yellow"
-  node_dead_after: "3s"
   selector_patch_refresh_interval: "2s"
 EOF
 done

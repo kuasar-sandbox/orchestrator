@@ -62,7 +62,6 @@ func runRegistry(args []string, log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	stores.SetNodeListHeartbeatRefresh(nodeListHeartbeatRefresh(cfg.NodeLink.NodeDeadDur()))
 	stores.SetNodeListWatchRetention(cfg.NodeList.WatchRetention)
 
 	reg := registry.New(stores, nil, cfg.RouteLink.ParkDur(), log)
@@ -241,7 +240,6 @@ func reloadRegistryConfig(ctx context.Context, cfgPath string, old *clustercfg.R
 	if err := configureRegistryShardTransport(reg.Stores(), next, healthProvider); err != nil {
 		return err
 	}
-	reg.Stores().SetNodeListHeartbeatRefresh(nodeListHeartbeatRefresh(next.NodeLink.NodeDeadDur()))
 	reg.Stores().SetNodeListWatchRetention(next.NodeList.WatchRetention)
 	reg.SetRemoteNodeOwners(nodeOwners)
 	nodeLinkRelayPeers, err := buildRegistryNodeLinkRelayPeers(next)
@@ -281,20 +279,6 @@ func validateRegistryMembershipReload(old, next clustercfg.MembershipConfig) err
 	return nil
 }
 
-func nodeListHeartbeatRefresh(deadAfter time.Duration) time.Duration {
-	if deadAfter <= 0 {
-		return time.Minute
-	}
-	d := deadAfter / 3
-	if d < time.Second {
-		d = time.Second
-	}
-	if d > time.Minute {
-		d = time.Minute
-	}
-	return d
-}
-
 func newRegistryStores(cfg *clustercfg.RegistryConfig, healthProvider func(string) clusterstate.ReplicaAvailability) (*registry.Stores, map[string]registry.NodeOwner, error) {
 	if _, ok := cfg.Membership.ActiveVersion(); !ok {
 		return nil, nil, fmt.Errorf("registry: active membership %d not found", cfg.Membership.Active)
@@ -311,7 +295,6 @@ func newRegistryStores(cfg *clustercfg.RegistryConfig, healthProvider func(strin
 	if err := configureRegistryShardTransport(stores, cfg, healthProvider); err != nil {
 		return nil, nil, err
 	}
-	stores.SetNodeListHeartbeatRefresh(nodeListHeartbeatRefresh(cfg.NodeLink.NodeDeadDur()))
 	stores.SetNodeListWatchRetention(cfg.NodeList.WatchRetention)
 	return stores, nodeOwners, nil
 }

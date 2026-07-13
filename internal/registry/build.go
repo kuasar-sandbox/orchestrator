@@ -65,23 +65,45 @@ func (r *Registry) ReserveBuild(ctx context.Context, req BuildReserveReq) (*Buil
 		}
 	}
 
-	// Place + commit, re-asking once if the suggested node lacks headroom for THIS
-	// build given the already-RESERVED builds (the registry is authoritative, §7.5).
-	var nodeID string
-	for attempt := 0; attempt < 2; attempt++ {
-		placement, err := r.placer.Place(ctx, PlaceRequest{Group: req.Group, RouteKey: "build", Build: true, Config: req.Metadata})
+	// Place + commit. node_list supplies candidates; the node owner validates the
+	// live connection and authoritative build budget before the build is committed.
+	excluded := placementExclusions{}
+	var lastFailure error
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		placement, err := r.placer.Place(ctx, PlaceRequest{
+			Group: req.Group, RouteKey: "build", Build: true, Config: req.Metadata,
+			ExcludeNodeIDs: excluded.values(),
+		})
 		if err != nil {
+			if errors.Is(err, ErrNoNode) && lastFailure != nil {
+				return nil, lastFailure
+			}
 			return nil, err
 		}
 		if placement == nil || placement.NodeID == "" {
 			return nil, ErrNoNode
 		}
 		id := placement.NodeID
-		if !r.admitBuild(ctx, id, buildID, resources) {
-			if attempt == 0 {
-				continue // node owner budget rejected; re-ask the placer
+		if excluded.has(id) {
+			if lastFailure != nil {
+				return nil, lastFailure
 			}
 			return nil, ErrNoNode
+		}
+		if err := r.nodeRuntimeLive(ctx, id); err != nil {
+			if !errors.Is(err, ErrNodeGone) {
+				return nil, err
+			}
+			lastFailure = err
+			excluded.add(id)
+			continue
+		}
+		if !r.admitBuild(ctx, id, buildID, resources) {
+			excluded.add(id)
+			continue
 		}
 		// Commit the group build record after node-owner admission succeeds.
 		rec := &BuildRecord{Group: req.Group, BuildID: buildID, NodeID: id, Resources: resources, State: BuildRegistered, TemplateID: templateID}
@@ -90,7 +112,6 @@ func (r *Registry) ReserveBuild(ctx context.Context, req BuildReserveReq) (*Buil
 			return nil, err
 		}
 		_ = r.stores.AddNodeBuildRef(ctx, id, clusterstate.NodeBuildRef{Group: req.Group, BuildID: buildID})
-		nodeID = id
 		cmd := &routesync.Command{
 			CmdID: newID(), Kind: routesync.CmdBuildRegister, Group: req.Group,
 			BuildID: buildID, TemplateRef: templateID, BuildResources: resources, Config: req.Metadata,
@@ -100,38 +121,39 @@ func (r *Registry) ReserveBuild(ctx context.Context, req BuildReserveReq) (*Buil
 			_ = r.stores.DeleteBuild(ctx, req.Group, buildID)
 			_ = r.stores.RemoveNodeBuildRef(ctx, id, req.Group, buildID)
 			r.releaseBuildAdmission(buildID)
-			return nil, ErrNodeGone
+			lastFailure = ErrNodeGone
+			excluded.add(id)
+			continue
 		}
 		ack, err := r.nodeOwner.SendCommandAndWait(ctx, id, cmd, buildRegisterAckTimeout)
-		if buildAckTimeout(ctx, err) {
+		if commandAckTimedOut(ctx, err) {
 			return r.buildReserveResult(ctx, rec), nil
 		}
-		if err != nil || ack == nil || ack.Status != routesync.AckAccepted {
+		if err != nil {
+			if !errors.Is(err, ErrNodeGone) {
+				return r.buildReserveResult(ctx, rec), nil
+			}
+			_ = r.stores.DeleteBuild(ctx, req.Group, buildID) // command definitively did not reach the node
+			_ = r.stores.RemoveNodeBuildRef(ctx, id, req.Group, buildID)
+			r.releaseBuildAdmission(buildID)
+			lastFailure = err
+			excluded.add(id)
+			continue
+		}
+		if ack == nil || ack.Status != routesync.AckAccepted {
 			_ = r.stores.DeleteBuild(ctx, req.Group, buildID) // roll back the reservation
 			_ = r.stores.RemoveNodeBuildRef(ctx, id, req.Group, buildID)
 			r.releaseBuildAdmission(buildID)
-			if attempt == 0 {
-				continue
-			}
-			if err != nil {
-				return nil, err
-			}
 			reason := ""
 			if ack != nil {
 				reason = ack.Reason
 			}
-			return nil, fmt.Errorf("registry: build_register rejected: %s", reason)
+			lastFailure = fmt.Errorf("registry: build_register rejected: %s", reason)
+			excluded.add(id)
+			continue
 		}
-		break
+		return r.buildReserveResult(ctx, rec), nil
 	}
-	if nodeID == "" {
-		return nil, ErrNoNode
-	}
-	return r.buildReserveResult(ctx, &BuildRecord{Group: req.Group, BuildID: buildID, TemplateID: templateID, NodeID: nodeID}), nil
-}
-
-func buildAckTimeout(ctx context.Context, err error) bool {
-	return err != nil && ctx.Err() == nil && errors.Is(err, context.DeadlineExceeded)
 }
 
 func (r *Registry) buildReserveResult(ctx context.Context, rec *BuildRecord) *BuildReserveResult {

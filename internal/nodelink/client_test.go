@@ -2,6 +2,7 @@ package nodelink
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
@@ -108,9 +109,17 @@ func TestNodeLinkReserveRoundTrip(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 
-	res, err := reg.ReserveSandbox(ctx, "/cell/proj/app/g1", "u1:sess1", nil)
-	if err != nil {
-		t.Fatalf("reserve over node-link: %v", err)
+	var res *registry.ReserveResult
+	var err error
+	for {
+		res, err = reg.ReserveSandbox(ctx, "/cell/proj/app/g1", "u1:sess1", nil)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, registry.ErrNodeGone) || time.Now().After(deadline) {
+			t.Fatalf("reserve over node-link: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 	want, err := clusterstate.DeriveAccessToken(testAuthKey, res.SID)
 	if err != nil {

@@ -885,8 +885,9 @@ heartbeat{zone, allocated, pool, build_alloc, counts, draining}
 ```
 
 沙箱水位取自资源控制器(node-resource.md),`build_alloc` 为本机在跑 / 预留构建占用,`draining` 由节点侧
-资源 drain 或维护策略置位。普通 heartbeat 用于 node_link liveness 和本地水位;只有 draining 变化、
-首次上报或低频 liveness refresh 才驱动 registry 更新 node_list。
+资源 drain 或维护策略置位。普通 heartbeat 只更新 node_link profile 中的 liveness 和本地水位，不更新
+node_list；首次注册和 draining 变化驱动低频目录投影。registry node owner 持有的当前连接是 placement
+提交时唯一的存活判断。
 
 ### 10.3 sandbox/build 事件
 

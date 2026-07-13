@@ -30,6 +30,7 @@ type PlaceReq struct {
 	Config              map[string]string `json:"config,omitempty"`
 	Build               bool              `json:"build,omitempty"` // a build placement (resource-aware, §4.5)
 	TargetRuntimeDigest string            `json:"target_runtime,omitempty"`
+	ExcludeNodeIDs      []string          `json:"exclude_node_ids,omitempty"`
 }
 
 // PlaceResult is the placer's answer (NodeID set, or NoNode when nothing eligible).

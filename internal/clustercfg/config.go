@@ -126,7 +126,6 @@ type RouterCache struct {
 type PlacementConfig struct {
 	Candidates             int           `yaml:"candidates"`                // P2C sample size; default 2
 	ZoneAdmitMax           string        `yaml:"zone_admit_max"`            // exclude nodes hotter than this; default yellow
-	NodeDeadAfter          string        `yaml:"node_dead_after"`           // exclude nodes silent longer than this; default 30s
 	ImportSourceOwnerCount int           `yaml:"import_source_owner_count"` // placer candidates that may race for one source lease
 	ImportSourceLeaseTTL   string        `yaml:"import_source_lease_ttl"`   // registry-side source lease TTL
 	SelectorPatchRefresh   string        `yaml:"selector_patch_refresh_interval"`
@@ -830,7 +829,7 @@ func DefaultPlacer() PlacerConfig {
 		Registry:     RegistryDialConfig{Bootstrap: defaultRegistryBootstrap},
 		ImportGroups: nil,
 		Placement: PlacementConfig{
-			Candidates: 2, ZoneAdmitMax: "yellow", NodeDeadAfter: "30s",
+			Candidates: 2, ZoneAdmitMax: "yellow",
 			ImportSourceOwnerCount: 3, ImportSourceLeaseTTL: "15s", SelectorPatchRefresh: "1m",
 		},
 	}
@@ -877,9 +876,6 @@ func (c *PlacerConfig) applyDefaults() {
 	}
 	if c.Placement.ZoneAdmitMax == "" {
 		c.Placement.ZoneAdmitMax = d.Placement.ZoneAdmitMax
-	}
-	if c.Placement.NodeDeadAfter == "" {
-		c.Placement.NodeDeadAfter = d.Placement.NodeDeadAfter
 	}
 	if c.Placement.ImportSourceOwnerCount == 0 {
 		c.Placement.ImportSourceOwnerCount = d.Placement.ImportSourceOwnerCount
@@ -938,14 +934,7 @@ func (c *PlacerConfig) Validate() error {
 		}
 	}
 	return validateDurations(map[string]string{
-		"placement.node_dead_after":                 c.Placement.NodeDeadAfter,
 		"placement.import_source_lease_ttl":         c.Placement.ImportSourceLeaseTTL,
 		"placement.selector_patch_refresh_interval": c.Placement.SelectorPatchRefresh,
 	})
-}
-
-// NodeDeadDur is how long a node may be silent before the placer excludes it.
-func (c *PlacerConfig) NodeDeadDur() time.Duration {
-	d, _ := time.ParseDuration(c.Placement.NodeDeadAfter)
-	return d
 }
