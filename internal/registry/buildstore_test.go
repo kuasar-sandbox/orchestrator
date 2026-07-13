@@ -118,6 +118,33 @@ func TestReserveBuildKeepsCommittedBuildOnAckTimeout(t *testing.T) {
 	}
 }
 
+func TestReserveBuildDoesNotRePlaceAfterAmbiguousCommandError(t *testing.T) {
+	ctx := context.Background()
+	reg := testReg(t)
+	placements := 0
+	reg.SetPlacer(placementFunc(func(context.Context, PlaceRequest) (*Placement, error) {
+		placements++
+		return &Placement{NodeID: fmt.Sprintf("n%d", placements)}, nil
+	}))
+	ackErr := errors.New("build acknowledgement response lost")
+	owner := &recordingNodeOwner{allow: true, ackErr: ackErr}
+	reg.SetNodeOwner(owner)
+
+	_, err := reg.ReserveBuild(ctx, BuildReserveReq{Group: "/g", BuildID: "bld-fixed"})
+	if !errors.Is(err, ackErr) {
+		t.Fatalf("ReserveBuild err=%v, want ambiguous command error", err)
+	}
+	if placements != 1 || len(owner.admitted) != 1 {
+		t.Fatalf("ambiguous build was retried: placements=%d admitted=%v", placements, owner.admitted)
+	}
+	if _, found, err := reg.stores.GetBuildInGroup(ctx, "/g", "bld-fixed"); err != nil || found {
+		t.Fatalf("build record found=%v err=%v, want rolled back", found, err)
+	}
+	if len(owner.released) != 1 || owner.released[0] != "bld-fixed" {
+		t.Fatalf("released=%v, want bld-fixed", owner.released)
+	}
+}
+
 func TestReserveBuildSkipsDisconnectedCatalogNode(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)

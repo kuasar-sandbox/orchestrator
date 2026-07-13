@@ -126,19 +126,26 @@ func (r *Registry) ReserveBuild(ctx context.Context, req BuildReserveReq) (*Buil
 		if commandAckTimedOut(ctx, err) {
 			return r.buildReserveResult(ctx, rec), nil
 		}
-		if err != nil || ack == nil || ack.Status != routesync.AckAccepted {
+		if err != nil {
 			_ = r.stores.DeleteBuild(ctx, req.Group, buildID) // roll back the reservation
 			_ = r.stores.RemoveNodeBuildRef(ctx, id, req.Group, buildID)
 			r.releaseBuildAdmission(buildID)
-			if err != nil {
-				lastFailure = err
-			} else {
-				reason := ""
-				if ack != nil {
-					reason = ack.Reason
-				}
-				lastFailure = fmt.Errorf("registry: build_register rejected: %s", reason)
+			if !errors.Is(err, ErrNodeGone) {
+				return nil, err
 			}
+			lastFailure = err
+			excluded.add(id)
+			continue
+		}
+		if ack == nil || ack.Status != routesync.AckAccepted {
+			_ = r.stores.DeleteBuild(ctx, req.Group, buildID) // roll back the reservation
+			_ = r.stores.RemoveNodeBuildRef(ctx, id, req.Group, buildID)
+			r.releaseBuildAdmission(buildID)
+			reason := ""
+			if ack != nil {
+				reason = ack.Reason
+			}
+			lastFailure = fmt.Errorf("registry: build_register rejected: %s", reason)
 			excluded.add(id)
 			continue
 		}
