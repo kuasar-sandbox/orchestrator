@@ -173,6 +173,31 @@ func TestBuildEventsResolveSameIDByNodeOwnerTable(t *testing.T) {
 	}
 }
 
+func TestDeadBuildCASDoesNotOverwriteReplacement(t *testing.T) {
+	ctx := context.Background()
+	stores := NewStores()
+	original := &BuildRecord{Group: "/g", BuildID: "same-build", NodeID: "n1", State: BuildRegistered, TemplateID: "old"}
+	if err := stores.PutBuild(ctx, original); err != nil {
+		t.Fatal(err)
+	}
+	stale, rev, found, err := stores.getRouteBuildShard(ctx, original.Group, original.BuildID)
+	if err != nil || !found {
+		t.Fatalf("stale build found=%v err=%v", found, err)
+	}
+	replacement := &BuildRecord{Group: "/g", BuildID: "same-build", NodeID: "n1", State: BuildRegistered, TemplateID: "new"}
+	if err := stores.PutBuild(ctx, replacement); err != nil {
+		t.Fatal(err)
+	}
+	stale.State, stale.Reason = BuildError, "node disconnected"
+	if _, ok, err := stores.casRouteBuildShard(ctx, stale, rev); err != nil || ok {
+		t.Fatalf("stale dead-build CAS ok=%v err=%v", ok, err)
+	}
+	got, found, err := stores.GetBuildInGroup(ctx, replacement.Group, replacement.BuildID)
+	if err != nil || !found || got.State != BuildRegistered || got.TemplateID != "new" {
+		t.Fatalf("replacement build=%+v found=%v err=%v", got, found, err)
+	}
+}
+
 func TestTerminalBuildStoreRetryOutlivesLinkContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()

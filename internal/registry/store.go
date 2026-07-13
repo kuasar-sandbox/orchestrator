@@ -17,6 +17,8 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 )
 
+const nodeListTombstoneRetention = time.Hour
+
 // SandboxState mirrors cluster.md route state. A missing/dead sandbox is
 // represented by no route row.
 type SandboxState string
@@ -324,7 +326,15 @@ func (s *Stores) Compact(ctx context.Context, now time.Time) (shardkv.GCStats, e
 	if store == nil {
 		return shardkv.GCStats{}, nil
 	}
-	return store.Compact(ctx, now)
+	stats, err := store.Compact(ctx, now)
+	if err != nil {
+		return stats, err
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	_, err = s.compactNodeListValueTombstones(ctx, now, nodeListTombstoneRetention)
+	return stats, err
 }
 
 func (s *Stores) SetShardTransport(transport shardkv.Transport, ready shardkv.MemberReadyProvider) {
@@ -390,7 +400,7 @@ func (s *Stores) rebuildShardStore() {
 		Layout: shardkv.Layout{Namespaces: map[shardkv.Namespace]shardkv.NamespaceSpec{
 			shardkv.Namespace(clusterstate.NamespaceRouteLink):  {ShardMemberCount: routeOwners, TombstoneRetention: time.Hour, WatchRetention: 10000, IdleShardTTL: time.Hour},
 			shardkv.Namespace(clusterstate.NamespaceNodeLink):   {ShardMemberCount: nodeOwners, TombstoneRetention: time.Hour, WatchRetention: 10000, IdleShardTTL: time.Hour},
-			shardkv.Namespace(clusterstate.NamespaceNodeList):   {ShardMemberCount: nodeListOwners, TombstoneRetention: time.Hour, WatchRetention: nodeListWatchRetention, Pinned: true},
+			shardkv.Namespace(clusterstate.NamespaceNodeList):   {ShardMemberCount: nodeListOwners, TombstoneRetention: nodeListTombstoneRetention, WatchRetention: nodeListWatchRetention, Pinned: true},
 			shardkv.Namespace(clusterstate.NamespacePlacerLink): {ShardMemberCount: scaleOwners, TombstoneRetention: time.Hour, WatchRetention: 10000, IdleShardTTL: time.Hour},
 		}},
 	})
@@ -442,33 +452,12 @@ func (s *Stores) PutNode(ctx context.Context, n *NodeRecord) error {
 	return s.PutNodeList(ctx, n)
 }
 
-// PutNodeRuntime updates node_link high-frequency state only. Heartbeats must not
-// write node_list, otherwise every water-level tick fans out to placer WATCH_LIST.
-func (s *Stores) PutNodeRuntime(ctx context.Context, n *NodeRecord) error {
-	_, err := s.putNodeProfileShardReturn(ctx, n)
-	return err
-}
-
 func (s *Stores) GetNode(ctx context.Context, id string) (*NodeRecord, bool, error) {
 	return s.getNodeShard(ctx, id)
 }
 
 func (s *Stores) GetNodeProfile(ctx context.Context, id string) (*NodeRecord, bool, error) {
 	return s.getNodeProfileShard(ctx, id)
-}
-
-func (s *Stores) DeleteNode(ctx context.Context, id string) error {
-	rec, found, err := s.getNodeShard(ctx, id)
-	if err != nil {
-		return err
-	}
-	if err := s.deleteNodeShard(ctx, id); err != nil {
-		return err
-	}
-	if found {
-		return s.DeleteNodeListWithSource(ctx, id, rec.Meta)
-	}
-	return s.DeleteNodeList(ctx, id)
 }
 
 func (s *Stores) PutNodeList(ctx context.Context, n *NodeRecord) error {
@@ -504,22 +493,6 @@ func (s *Stores) GetNodeBuildRef(ctx context.Context, nodeID, buildID string) (c
 
 func (s *Stores) RemoveNodeBuildRef(ctx context.Context, nodeID, buildID string) error {
 	return s.removeNodeBuildRefShard(ctx, nodeID, buildID)
-}
-
-func (s *Stores) updateNodeRuntime(ctx context.Context, nodeID string, mutate func(*NodeRecord)) error {
-	for attempt := 0; attempt < 3; attempt++ {
-		rec, found, err := s.GetNode(ctx, nodeID)
-		if err != nil || !found {
-			return err
-		}
-		mutate(rec)
-		if _, err := s.putNodeProfileShardReturn(ctx, rec); err == clusterstate.ErrConflict {
-			continue
-		} else {
-			return err
-		}
-	}
-	return clusterstate.ErrConflict
 }
 
 func (s *Stores) UpsertNodeManifestKey(ctx context.Context, nodeID string, key clusterstate.NodeManifestKey) error {
@@ -748,7 +721,7 @@ func (s *Stores) PutNodeListEntry(ctx context.Context, entry clusterstate.NodeLi
 			return nil
 		}
 		expect := uint64(0)
-		if found {
+		if found && !curRec.Deleted {
 			expect = curRec.Meta.Rev
 		}
 		value, err := clusterstate.EncodeShardValue(entry)
@@ -788,25 +761,34 @@ func (s *Stores) DeleteNodeListWithSource(ctx context.Context, nodeID string, so
 		if err != nil {
 			return err
 		}
-		if !found {
-			return nil
-		}
-		cur, err := clusterstate.DecodeShardValue[clusterstate.NodeListEntry](curRec.Value)
-		if err != nil {
-			return err
+		var cur clusterstate.NodeListEntry
+		if found {
+			cur, err = clusterstate.DecodeShardValue[clusterstate.NodeListEntry](curRec.Value)
+			if err != nil {
+				return err
+			}
 		}
 		tombstone := clusterstate.NodeListEntry{NodeID: nodeID, SourceMeta: source, Deleted: true}
 		if recordMetaZero(source) {
+			if !found {
+				return nil
+			}
 			tombstone.SourceMeta = cur.SourceMeta
 		}
-		if !nodeListProjectionNewer(tombstone, cur) {
+		if found && !nodeListProjectionNewer(tombstone, cur) {
 			return nil
 		}
 		value, err := clusterstate.EncodeShardValue(tombstone)
 		if err != nil {
 			return err
 		}
-		_, ok, err := sh.DeleteValue(ctx, key, curRec.Meta.Rev, value)
+		// Keep node-list deletion as an ordered value tombstone. A physical
+		// shard tombstone cannot be revision-updated or revived by profile order.
+		expect := uint64(0)
+		if found && !curRec.Deleted {
+			expect = curRec.Meta.Rev
+		}
+		_, ok, err := sh.CAS(ctx, key, expect, value)
 		if err != nil {
 			return err
 		}

@@ -114,6 +114,172 @@ func TestNodeLinkShardRecordsAssembleNodeView(t *testing.T) {
 	}
 }
 
+func TestNodeReapProfileFenceAcrossOwners(t *testing.T) {
+	ctx := context.Background()
+	cluster := newShardStoreCluster(t, []string{"a", "b", "c"}, 1, 3, 1, 3)
+	const nodeID = "node-reconnect-fence"
+	if err := cluster["a"].PutNode(ctx, &NodeRecord{
+		NodeID: nodeID, DataEndpoint: "old", LastHeartbeatUnix: time.Now().Add(-time.Hour).Unix(), LinkOwner: "a",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	stale, found, err := cluster["a"].GetNodeProfile(ctx, nodeID)
+	if err != nil || !found {
+		t.Fatalf("stale profile found=%v err=%v", found, err)
+	}
+	fresh := *stale
+	fresh.DataEndpoint = "new"
+	fresh.LastHeartbeatUnix = time.Now().Unix()
+	fresh.LinkOwner = "b"
+	if err := cluster["b"].putNodeProfileShard(ctx, &fresh); err != nil {
+		t.Fatalf("fresh profile: %v", err)
+	}
+	claimed, err := cluster["a"].claimNodeProfileReapShard(ctx, nodeID, stale.Meta.Rev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimed {
+		t.Fatal("stale owner claimed a profile advanced by the reconnecting owner")
+	}
+	got, found, err := cluster["a"].GetNodeProfile(ctx, nodeID)
+	if err != nil || !found || got.DataEndpoint != "new" || got.LinkOwner != "b" {
+		t.Fatalf("fresh profile=%+v found=%v err=%v", got, found, err)
+	}
+}
+
+func TestNodeReapClaimPreservesReconnectStateAcrossOwners(t *testing.T) {
+	ctx := context.Background()
+	cluster := newShardStoreCluster(t, []string{"a", "b", "c"}, 1, 3, 1, 3)
+	const nodeID = "node-reap-wins"
+	oldRef := clusterstate.NodeSandboxRef{Group: "/g", RouteKey: "rk", SandboxID: "sb"}
+	if err := cluster["a"].PutNode(ctx, &NodeRecord{
+		NodeID: nodeID, DataEndpoint: "old", LastHeartbeatUnix: time.Now().Add(-time.Hour).Unix(),
+		LinkOwner: "a", Sandboxes: []clusterstate.NodeSandboxRef{oldRef},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	stale, found, err := cluster["a"].GetNodeProfile(ctx, nodeID)
+	if err != nil || !found {
+		t.Fatalf("stale profile found=%v err=%v", found, err)
+	}
+	snapshot, err := cluster["a"].snapshotNodeReapShard(ctx, nodeID)
+	if err != nil || len(snapshot.Sandboxes) != 1 {
+		t.Fatalf("reap snapshot=%+v err=%v", snapshot, err)
+	}
+	claimed, err := cluster["a"].claimNodeProfileReapShard(ctx, nodeID, stale.Meta.Rev)
+	if err != nil || !claimed {
+		t.Fatalf("claim=%v err=%v", claimed, err)
+	}
+	if err := cluster["a"].DeleteNodeListWithSource(ctx, nodeID, stale.Meta); err != nil {
+		t.Fatal(err)
+	}
+
+	regB := New(cluster["b"], nil, time.Second, nil)
+	registered, err := regB.updateNodeRegister(ctx, &routesync.NodeRegister{NodeID: nodeID, DataEndpoint: "new"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if registered.LinkOwner != "b" || len(registered.Sandboxes) != 0 {
+		t.Fatalf("reconnect did not start from a clean profile: %+v", registered)
+	}
+	regB.addNode(&fakeConn{nodeID: nodeID})
+	regB.projectRegisteredNode(ctx, registered)
+	if err := cluster["b"].AddNodeSandboxRef(ctx, nodeID, oldRef); err != nil {
+		t.Fatal(err)
+	}
+
+	// Cleanup delayed past the reconnect must lose to both new projections.
+	if err := cluster["a"].DeleteNodeListWithSource(ctx, nodeID, stale.Meta); err != nil {
+		t.Fatal(err)
+	}
+	if deleted, err := cluster["a"].removeNodeSandboxRefShardAtRevision(ctx, nodeID, oldRef.SandboxID, snapshot.Sandboxes[0].Revision); err != nil || deleted {
+		t.Fatalf("stale child cleanup deleted reconnect ref: deleted=%v err=%v", deleted, err)
+	}
+	profile, found, err := cluster["a"].GetNodeProfile(ctx, nodeID)
+	if err != nil || !found || profile.LinkOwner != "b" || profile.DataEndpoint != "new" {
+		t.Fatalf("reconnect profile=%+v found=%v err=%v", profile, found, err)
+	}
+	found = false
+	if err := cluster["a"].RangeNodeList(ctx, func(entry clusterstate.NodeListEntry) error {
+		if entry.NodeID == nodeID && entry.DataEndpoint == "new" {
+			found = true
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !found {
+		sh, err := cluster["a"].nodeListRecordSet()
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw, rawFound, rawErr := sh.GetRecord(ctx, clusterstate.NodeListRecordKey(nodeID))
+		t.Fatalf("stale reap removed the reconnect node_list projection: stale=%+v fresh=%+v raw=%+v found=%v err=%v", stale.Meta, registered.Meta, raw, rawFound, rawErr)
+	}
+}
+
+func TestNodeReapSnapshotDoesNotDeleteNewChildRevisions(t *testing.T) {
+	ctx := context.Background()
+	stores := NewStores()
+	const nodeID = "node-child-fence"
+	if err := stores.PutNode(ctx, &NodeRecord{NodeID: nodeID, LastHeartbeatUnix: time.Now().Add(-time.Hour).Unix()}); err != nil {
+		t.Fatal(err)
+	}
+	sandboxRef := clusterstate.NodeSandboxRef{Group: "/g", RouteKey: "rk", SandboxID: "sb"}
+	buildRef := clusterstate.NodeBuildRef{Group: "/g", BuildID: "build"}
+	manifestKey := clusterstate.NodeManifestKey{Fingerprint: "fp", Type: clusterstate.SecretInline, Value: "old"}
+	if err := stores.AddNodeSandboxRef(ctx, nodeID, sandboxRef); err != nil {
+		t.Fatal(err)
+	}
+	if err := stores.AddNodeBuildRef(ctx, nodeID, buildRef); err != nil {
+		t.Fatal(err)
+	}
+	if err := stores.UpsertNodeManifestKey(ctx, nodeID, manifestKey); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := stores.snapshotNodeReapShard(ctx, nodeID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile, found, err := stores.GetNodeProfile(ctx, nodeID)
+	if err != nil || !found {
+		t.Fatalf("profile found=%v err=%v", found, err)
+	}
+	claimed, err := stores.claimNodeProfileReapShard(ctx, nodeID, profile.Meta.Rev)
+	if err != nil || !claimed {
+		t.Fatalf("claim=%v err=%v", claimed, err)
+	}
+	if err := stores.AddNodeSandboxRef(ctx, nodeID, sandboxRef); err != nil {
+		t.Fatal(err)
+	}
+	if err := stores.AddNodeBuildRef(ctx, nodeID, buildRef); err != nil {
+		t.Fatal(err)
+	}
+	manifestKey.Value = "new"
+	if err := stores.UpsertNodeManifestKey(ctx, nodeID, manifestKey); err != nil {
+		t.Fatal(err)
+	}
+	if deleted, err := stores.removeNodeSandboxRefShardAtRevision(ctx, nodeID, sandboxRef.SandboxID, snapshot.Sandboxes[0].Revision); err != nil || deleted {
+		t.Fatalf("old sandbox cleanup deleted replacement: deleted=%v err=%v", deleted, err)
+	}
+	if deleted, err := stores.removeNodeBuildRefShardAtRevision(ctx, nodeID, buildRef.BuildID, snapshot.Builds[0].Revision); err != nil || deleted {
+		t.Fatalf("old build cleanup deleted replacement: deleted=%v err=%v", deleted, err)
+	}
+	if deleted, err := stores.dropNodeManifestKeyShardAtRevision(ctx, nodeID, manifestKey.Fingerprint, snapshot.ManifestKeys[0].Revision); err != nil || deleted {
+		t.Fatalf("old key cleanup deleted replacement: deleted=%v err=%v", deleted, err)
+	}
+	if _, found, err := stores.GetNodeSandboxRef(ctx, nodeID, sandboxRef.SandboxID); err != nil || !found {
+		t.Fatalf("replacement sandbox ref found=%v err=%v", found, err)
+	}
+	if _, found, err := stores.GetNodeBuildRef(ctx, nodeID, buildRef.BuildID); err != nil || !found {
+		t.Fatalf("replacement build ref found=%v err=%v", found, err)
+	}
+	gotKey, _, found, err := stores.getNodeManifestKeyShard(ctx, nodeID, manifestKey.Fingerprint)
+	if err != nil || !found || gotKey.Value != "new" {
+		t.Fatalf("replacement key=%+v found=%v err=%v", gotKey, found, err)
+	}
+}
+
 func TestNodeObjectRefsAreScopedByNodeID(t *testing.T) {
 	ctx := context.Background()
 	stores := NewStores()
@@ -139,45 +305,6 @@ func TestNodeObjectRefsAreScopedByNodeID(t *testing.T) {
 	}
 	if err := stores.AddNodeBuildRef(ctx, "n1", clusterstate.NodeBuildRef{BuildID: "b"}); err == nil {
 		t.Fatal("invalid build ref was accepted")
-	}
-}
-
-func TestPutNodeRuntimeUpdatesProfileOnly(t *testing.T) {
-	ctx := context.Background()
-	stores := NewStores()
-	node := &NodeRecord{
-		NodeID: "n-runtime", Labels: map[string]string{"pool": "p"}, Capacity: 10,
-		DataEndpoint: "10.0.0.1:8443", LastHeartbeatUnix: time.Now().Unix(), LinkOwner: "r1",
-		Sandboxes: []clusterstate.NodeSandboxRef{{Group: "/g", RouteKey: "rk", SandboxID: "sb"}},
-		Builds:    []clusterstate.NodeBuildRef{{Group: "/g", BuildID: "b1"}},
-		ManifestKeys: []clusterstate.NodeManifestKey{{
-			Fingerprint: "fp", Type: clusterstate.SecretInline, Value: "mk", ExpiresUnix: 123,
-		}},
-	}
-	if err := stores.PutNode(ctx, node); err != nil {
-		t.Fatalf("PutNode: %v", err)
-	}
-	profileBefore := mustNodeRecordSetSnapshot(t, ctx, stores, "n-runtime", clusterstate.RecordSetNodeProfile).Rev
-	sandboxBefore := mustNodeRecordSetSnapshot(t, ctx, stores, "n-runtime", clusterstate.RecordSetNodeSandbox).Rev
-	buildBefore := mustNodeRecordSetSnapshot(t, ctx, stores, "n-runtime", clusterstate.RecordSetNodeBuild).Rev
-	keyBefore := mustNodeRecordSetSnapshot(t, ctx, stores, "n-runtime", clusterstate.RecordSetNodeManifestKey).Rev
-
-	node.Counts = 7
-	node.LastHeartbeatUnix++
-	if err := stores.PutNodeRuntime(ctx, node); err != nil {
-		t.Fatalf("PutNodeRuntime: %v", err)
-	}
-	profileAfter := mustNodeRecordSetSnapshot(t, ctx, stores, "n-runtime", clusterstate.RecordSetNodeProfile).Rev
-	sandboxAfter := mustNodeRecordSetSnapshot(t, ctx, stores, "n-runtime", clusterstate.RecordSetNodeSandbox).Rev
-	buildAfter := mustNodeRecordSetSnapshot(t, ctx, stores, "n-runtime", clusterstate.RecordSetNodeBuild).Rev
-	keyAfter := mustNodeRecordSetSnapshot(t, ctx, stores, "n-runtime", clusterstate.RecordSetNodeManifestKey).Rev
-
-	if profileAfter <= profileBefore {
-		t.Fatalf("profile rev did not advance: before=%d after=%d", profileBefore, profileAfter)
-	}
-	if sandboxAfter != sandboxBefore || buildAfter != buildBefore || keyAfter != keyBefore {
-		t.Fatalf("runtime update rewrote side recordSets: sandbox %d->%d build %d->%d key %d->%d",
-			sandboxBefore, sandboxAfter, buildBefore, buildAfter, keyBefore, keyAfter)
 	}
 }
 
@@ -812,6 +939,170 @@ func TestNodeRegisterRetriesNodeListProjectionAfterQuorumRecovers(t *testing.T) 
 	}
 }
 
+func TestNodeReapRetriesNodeListTombstoneAfterQuorumRecovers(t *testing.T) {
+	ctx := context.Background()
+	requestCtx, cancelRequest := context.WithCancel(ctx)
+	defer cancelRequest()
+	lifecycleCtx, cancelLifecycle := context.WithCancel(ctx)
+	defer cancelLifecycle()
+	view := clusterstate.MemberView{Version: 1, Members: []string{"a", "b"}}
+	cluster := map[string]*Stores{
+		"a": NewClusterStores("a", view, 1, 1, 2, 1),
+	}
+	reg := New(cluster["a"], nil, time.Second, nil)
+	const nodeID = "reap-projection-retry"
+	source := clusterstate.RecordMeta{Ballot: clusterstate.Ballot{Round: 2, Writer: "a"}, Rev: 2}
+	reg.deleteNodeListProjection(requestCtx, nodeID, source)
+	reg.nodeListProjectMu.Lock()
+	pending, found := reg.nodeListProject[nodeID]
+	requestGeneration := reg.nodeListProjectGen
+	reg.nodeListProjectMu.Unlock()
+	if !found || !pending.Deleted || compareRecordMeta(pending.SourceMeta, source) != 0 {
+		t.Fatalf("pending reap projection=%+v found=%v", pending, found)
+	}
+	go reg.RunReaper(lifecycleCtx, time.Second)
+	deadline := time.Now().Add(time.Second)
+	for {
+		reg.nodeListProjectMu.Lock()
+		adopted := reg.nodeListProjectGen > requestGeneration
+		reg.nodeListProjectMu.Unlock()
+		if adopted {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("projection retry did not adopt the registry lifecycle context")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	cancelRequest()
+
+	cluster["b"] = NewClusterStores("b", view, 1, 1, 2, 1)
+	transport := shardkv.TransportFunc(func(ctx context.Context, member shardkv.MemberID, req shardkv.Request) (shardkv.Response, error) {
+		store := cluster[string(member)]
+		if store == nil || store.ShardStore() == nil {
+			return shardkv.Response{}, shardkv.ErrReplicaUnavailable
+		}
+		return store.ShardStore().Handle(ctx, req)
+	})
+	for _, stores := range cluster {
+		stores.SetShardTransport(transport, nil)
+	}
+
+	deadline = time.Now().Add(3 * time.Second)
+	for {
+		sh, err := cluster["a"].nodeListRecordSet()
+		if err != nil {
+			t.Fatal(err)
+		}
+		rec, found, err := sh.GetRecord(ctx, clusterstate.NodeListRecordKey(nodeID))
+		if err == nil && found && !rec.Deleted {
+			entry, decodeErr := clusterstate.DecodeShardValue[clusterstate.NodeListEntry](rec.Value)
+			if decodeErr != nil {
+				t.Fatal(decodeErr)
+			}
+			if entry.Deleted && compareRecordMeta(entry.SourceMeta, source) == 0 {
+				break
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("reap tombstone did not converge after quorum recovery: found=%v err=%v", found, err)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err := cluster["a"].PutNodeListEntry(ctx, clusterstate.NodeListEntry{
+		NodeID: nodeID, SourceMeta: source, Labels: map[string]string{"generation": "stale"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := cluster["a"].RangeNodeList(ctx, func(entry clusterstate.NodeListEntry) error {
+		if entry.NodeID == nodeID {
+			t.Fatal("stale projection crossed the retried reap tombstone")
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestNodeListRetryUsesRequestContextForLiveProjection(t *testing.T) {
+	reg := testReg(t)
+	requestCtx, cancelRequest := context.WithCancel(context.Background())
+	defer cancelRequest()
+	lifecycleCtx, cancelLifecycle := context.WithCancel(context.Background())
+	defer cancelLifecycle()
+	reg.mu.Lock()
+	reg.reaperCtx = lifecycleCtx
+	reg.mu.Unlock()
+	reg.nodeListProjectMu.Lock()
+	reg.nodeListProjectRun = true
+	reg.nodeListProjectMu.Unlock()
+
+	live := clusterstate.NodeListEntry{
+		NodeID: "live-context", SourceMeta: clusterstate.RecordMeta{Ballot: clusterstate.Ballot{Round: 1, Writer: "a"}, Rev: 1},
+	}
+	reg.enqueueNodeListProjection(requestCtx, live)
+	reg.nodeListProjectMu.Lock()
+	if reg.nodeListProjectCtx != requestCtx || reg.nodeListProjectRoot {
+		t.Fatalf("live retry context=%v lifecycle=%v", reg.nodeListProjectCtx, reg.nodeListProjectRoot)
+	}
+	reg.nodeListProjectMu.Unlock()
+
+	deleted := live
+	deleted.SourceMeta.Rev++
+	deleted.Deleted = true
+	reg.enqueueNodeListProjection(requestCtx, deleted)
+	reg.nodeListProjectMu.Lock()
+	defer reg.nodeListProjectMu.Unlock()
+	if reg.nodeListProjectCtx != lifecycleCtx || !reg.nodeListProjectRoot {
+		t.Fatalf("delete retry context=%v lifecycle=%v", reg.nodeListProjectCtx, reg.nodeListProjectRoot)
+	}
+}
+
+func TestNodeListRetrySkipsDisconnectedAndSupersededLiveProjection(t *testing.T) {
+	ctx := context.Background()
+	reg := testReg(t)
+	stale := clusterstate.NodeListEntry{
+		NodeID: "retry-order", SourceMeta: clusterstate.RecordMeta{Ballot: clusterstate.Ballot{Round: 1, Writer: "a"}, Rev: 1},
+		Labels: map[string]string{"generation": "stale"},
+	}
+	reg.nodeListProjectMu.Lock()
+	reg.nodeListProject[stale.NodeID] = stale
+	reg.nodeListProjectMu.Unlock()
+	reg.flushNodeListProjectionEntry(ctx, stale)
+	reg.nodeListProjectMu.Lock()
+	_, pending := reg.nodeListProject[stale.NodeID]
+	reg.nodeListProjectMu.Unlock()
+	if pending {
+		t.Fatal("disconnected live projection remained queued")
+	}
+
+	reg.addNode(&fakeConn{nodeID: stale.NodeID})
+	deleted := stale
+	deleted.SourceMeta.Rev++
+	deleted.Deleted = true
+	reg.nodeListProjectMu.Lock()
+	reg.nodeListProject[stale.NodeID] = deleted
+	reg.nodeListProjectMu.Unlock()
+	reg.flushNodeListProjectionEntry(ctx, stale)
+	reg.nodeListProjectMu.Lock()
+	current, pending := reg.nodeListProject[stale.NodeID]
+	reg.nodeListProjectMu.Unlock()
+	if !pending || !current.Deleted {
+		t.Fatalf("superseding tombstone lost: pending=%v entry=%+v", pending, current)
+	}
+	found := false
+	if err := reg.stores.RangeNodeList(ctx, func(entry clusterstate.NodeListEntry) error {
+		found = found || entry.NodeID == stale.NodeID
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if found {
+		t.Fatal("superseded live batch entry was projected")
+	}
+	reg.flushNodeListProjectionEntry(ctx, deleted)
+}
+
 func TestConcurrentHeartbeatsDoNotRewriteNodeListAcrossDeadAfter(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
@@ -914,6 +1205,98 @@ func TestNodeListTombstoneRejectsStaleProjection(t *testing.T) {
 	}
 	if found {
 		t.Fatal("stale node_list projection resurrected after delete")
+	}
+	if err := stores.PutNodeListEntry(ctx, clusterstate.NodeListEntry{
+		NodeID: "n1", SourceMeta: clusterstate.RecordMeta{Ballot: clusterstate.Ballot{Round: 3, Writer: "a"}, Rev: 3}, Labels: map[string]string{"gen": "fresh"},
+	}); err != nil {
+		t.Fatalf("PutNodeListEntry fresh: %v", err)
+	}
+	found = false
+	if err := stores.RangeNodeList(ctx, func(got clusterstate.NodeListEntry) error {
+		found = found || got.NodeID == "n1" && got.Labels["gen"] == "fresh"
+		return nil
+	}); err != nil {
+		t.Fatalf("RangeNodeList fresh: %v", err)
+	}
+	if !found {
+		t.Fatal("fresh node_list projection did not replace the tombstone")
+	}
+}
+
+func TestNodeListTombstoneFencesDelayedInitialProjection(t *testing.T) {
+	ctx := context.Background()
+	stores := NewClusterStores("a", clusterstate.MemberView{Version: 1, Members: []string{"a"}}, 1, 1, 1, 1)
+	staleSource := clusterstate.RecordMeta{Ballot: clusterstate.Ballot{Round: 2, Writer: "a"}, Rev: 2}
+	if err := stores.DeleteNodeListWithSource(ctx, "n1", staleSource); err != nil {
+		t.Fatalf("DeleteNodeListWithSource: %v", err)
+	}
+	if err := stores.PutNodeListEntry(ctx, clusterstate.NodeListEntry{
+		NodeID: "n1", SourceMeta: staleSource, Labels: map[string]string{"gen": "stale"},
+	}); err != nil {
+		t.Fatalf("PutNodeListEntry stale: %v", err)
+	}
+	found := false
+	if err := stores.RangeNodeList(ctx, func(got clusterstate.NodeListEntry) error {
+		found = found || got.NodeID == "n1"
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if found {
+		t.Fatal("delayed initial projection crossed the reap tombstone")
+	}
+}
+
+func TestNodeListValueTombstoneCompactsToPhysicalTombstone(t *testing.T) {
+	ctx := context.Background()
+	stores := NewClusterStores("a", clusterstate.MemberView{Version: 1, Members: []string{"a"}}, 1, 1, 1, 1)
+	source := clusterstate.RecordMeta{Ballot: clusterstate.Ballot{Round: 2, Writer: "a"}, Rev: 2}
+	entry := clusterstate.NodeListEntry{NodeID: "n1", SourceMeta: source, Labels: map[string]string{"gen": "old"}}
+	if err := stores.PutNodeListEntry(ctx, entry); err != nil {
+		t.Fatal(err)
+	}
+	if err := stores.DeleteNodeListWithSource(ctx, entry.NodeID, source); err != nil {
+		t.Fatal(err)
+	}
+	sh, err := stores.nodeListRecordSet()
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := clusterstate.NodeListRecordKey(entry.NodeID)
+	valueTombstone, found, err := sh.GetRecord(ctx, key)
+	if err != nil || !found || valueTombstone.Deleted {
+		t.Fatalf("value tombstone=%+v found=%v err=%v", valueTombstone, found, err)
+	}
+	compacted, err := stores.compactNodeListValueTombstones(ctx, valueTombstone.Meta.UpdatedAt.Add(nodeListTombstoneRetention+time.Second), nodeListTombstoneRetention)
+	if err != nil || compacted != 1 {
+		t.Fatalf("compacted=%d err=%v", compacted, err)
+	}
+	physical, found, err := sh.GetRecord(ctx, key)
+	if err != nil || !found || !physical.Deleted {
+		t.Fatalf("physical tombstone=%+v found=%v err=%v", physical, found, err)
+	}
+	preserved, err := clusterstate.DecodeShardValue[clusterstate.NodeListEntry](physical.Value)
+	if err != nil || !preserved.Deleted || compareRecordMeta(preserved.SourceMeta, source) != 0 {
+		t.Fatalf("preserved tombstone=%+v err=%v", preserved, err)
+	}
+	if err := stores.PutNodeListEntry(ctx, entry); err != nil {
+		t.Fatal(err)
+	}
+	if current, found, err := sh.GetRecord(ctx, key); err != nil || !found || !current.Deleted {
+		t.Fatalf("stale projection revived compacted tombstone: current=%+v found=%v err=%v", current, found, err)
+	}
+	fresh := entry
+	fresh.SourceMeta.Rev++
+	fresh.Labels = map[string]string{"gen": "fresh"}
+	if err := stores.PutNodeListEntry(ctx, fresh); err != nil {
+		t.Fatal(err)
+	}
+	found = false
+	if err := stores.RangeNodeList(ctx, func(got clusterstate.NodeListEntry) error {
+		found = found || got.NodeID == fresh.NodeID && got.Labels["gen"] == "fresh"
+		return nil
+	}); err != nil || !found {
+		t.Fatalf("fresh projection after compaction found=%v err=%v", found, err)
 	}
 }
 

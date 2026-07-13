@@ -89,15 +89,18 @@ type Registry struct {
 	inflight map[string]*reserveCall           // single-flight ReserveSandbox per (group,route_key)
 	acks     map[string]chan *routesync.CmdAck // cmd_id -> command acknowledgement waiter
 
-	localNodeOwner     NodeOwner
-	nodeOwner          NodeOwner
-	deadAfter          time.Duration
-	reaperCtx          context.Context
-	nodeLinkRelayMu    sync.RWMutex
-	nodeLinkRelayPeers map[string]NodeLinkRelayPeer
-	nodeListProjectMu  sync.Mutex
-	nodeListProject    map[string]*NodeRecord
-	nodeListProjectRun bool
+	localNodeOwner      NodeOwner
+	nodeOwner           NodeOwner
+	deadAfter           time.Duration
+	reaperCtx           context.Context
+	nodeLinkRelayMu     sync.RWMutex
+	nodeLinkRelayPeers  map[string]NodeLinkRelayPeer
+	nodeListProjectMu   sync.Mutex
+	nodeListProject     map[string]clusterstate.NodeListEntry
+	nodeListProjectCtx  context.Context
+	nodeListProjectGen  uint64
+	nodeListProjectRoot bool
+	nodeListProjectRun  bool
 
 	placerMu         sync.Mutex
 	scaleReadyLabel  string
@@ -177,7 +180,7 @@ func New(stores *Stores, placer Placer, parkTimeout time.Duration, log *slog.Log
 		nodes:           make(map[string]nodeConn),
 		inflight:        make(map[string]*reserveCall),
 		acks:            make(map[string]chan *routesync.CmdAck),
-		nodeListProject: make(map[string]*NodeRecord),
+		nodeListProject: make(map[string]clusterstate.NodeListEntry),
 		placerReplicas:  1,
 		minReadyPlacers: 1,
 		placerTimeout:   2 * time.Second,
@@ -1115,27 +1118,20 @@ func (r *Registry) removeNode(c nodeConn) {
 	}
 }
 
-// updateNodeRegister upserts the node table row from a node's register frame.
+// updateNodeRegister claims one profile revision for this registration. A reap
+// that deletes the profile between read and write makes the CAS retry from an
+// empty node view, so stale child refs cannot be replayed into the new session.
 func (r *Registry) updateNodeRegister(ctx context.Context, nr *routesync.NodeRegister) (*NodeRecord, error) {
-	rec, found, err := r.getNodeForLinkUpdate(ctx, nr.NodeID)
-	if err != nil {
-		return nil, err
-	}
-	if !found {
-		rec = &NodeRecord{}
-	}
-	rec.NodeID = nr.NodeID
-	rec.Labels = nr.Labels
-	rec.Capacity = nr.Capacity
-	rec.BuildCapacity = nr.BuildCapacity
-	rec.DataEndpoint = nr.DataEndpoint
-	rec.RuntimeDigest = nr.RuntimeDigest
-	rec.LastHeartbeatUnix = time.Now().Unix()
-	rec.LinkOwner = r.stores.WriterID()
-	if _, err := r.stores.putNodeLink(ctx, rec); err != nil {
-		return nil, err
-	}
-	return rec, nil
+	rec, _, err := r.updateNodeProfile(ctx, nr.NodeID, true, func(rec *NodeRecord) {
+		rec.Labels = nr.Labels
+		rec.Capacity = nr.Capacity
+		rec.BuildCapacity = nr.BuildCapacity
+		rec.DataEndpoint = nr.DataEndpoint
+		rec.RuntimeDigest = nr.RuntimeDigest
+		rec.LastHeartbeatUnix = time.Now().Unix()
+		rec.LinkOwner = r.stores.WriterID()
+	})
+	return rec, err
 }
 
 func (r *Registry) projectRegisteredNode(ctx context.Context, rec *NodeRecord) {
@@ -1150,15 +1146,16 @@ func (r *Registry) projectRegisteredNode(ctx context.Context, rec *NodeRecord) {
 
 // updateHeartbeat folds a node's water level into its record + stamps liveness.
 func (r *Registry) updateHeartbeat(ctx context.Context, nodeID string, hb *routesync.Heartbeat) {
-	rec, found, err := r.getNodeForLinkUpdate(ctx, nodeID)
+	oldDraining := false
+	rec, found, err := r.updateNodeProfile(ctx, nodeID, false, func(rec *NodeRecord) {
+		oldDraining = rec.Draining
+		rec.Zone, rec.Allocated, rec.Pool = hb.Zone, hb.Allocated, hb.Pool
+		rec.BuildAlloc, rec.Counts, rec.Draining = hb.BuildAlloc, hb.Counts, hb.Draining
+		rec.LastHeartbeatUnix = time.Now().Unix()
+	})
 	if err != nil || !found {
 		return
 	}
-	oldDraining := rec.Draining
-	rec.Zone, rec.Allocated, rec.Pool = hb.Zone, hb.Allocated, hb.Pool
-	rec.BuildAlloc, rec.Counts, rec.Draining = hb.BuildAlloc, hb.Counts, hb.Draining
-	rec.LastHeartbeatUnix = time.Now().Unix()
-	_ = r.stores.PutNodeRuntime(ctx, rec)
 	if rec.Draining != oldDraining {
 		r.putNodeListProjection(ctx, rec)
 		return
@@ -1170,16 +1167,34 @@ func (r *Registry) putNodeListProjection(ctx context.Context, rec *NodeRecord) {
 	if r == nil || r.stores == nil || rec == nil || rec.NodeID == "" {
 		return
 	}
-	if err := r.stores.PutNodeList(ctx, rec); err == nil {
-		r.clearPendingNodeListProjection(rec)
+	r.applyNodeListProjection(ctx, projectNodeListRecord(rec))
+}
+
+func (r *Registry) deleteNodeListProjection(ctx context.Context, nodeID string, source clusterstate.RecordMeta) {
+	if r == nil || r.stores == nil || nodeID == "" {
+		return
+	}
+	r.applyNodeListProjection(ctx, clusterstate.NodeListEntry{NodeID: nodeID, SourceMeta: source, Deleted: true})
+}
+
+func (r *Registry) applyNodeListProjection(ctx context.Context, entry clusterstate.NodeListEntry) {
+	if err := r.writeNodeListProjection(ctx, entry); err == nil {
+		r.clearPendingNodeListProjection(entry)
 		return
 	} else if ctx.Err() != nil {
 		return
 	} else if !isNodeListProjectionRetryable(err) {
-		r.log.Warn("node-link: node_list projection rejected", "node", rec.NodeID, "err", err)
+		r.log.Warn("node-link: node_list projection rejected", "node", entry.NodeID, "deleted", entry.Deleted, "err", err)
 		return
 	}
-	r.enqueueNodeListProjection(ctx, rec)
+	r.enqueueNodeListProjection(ctx, entry)
+}
+
+func (r *Registry) writeNodeListProjection(ctx context.Context, entry clusterstate.NodeListEntry) error {
+	if entry.Deleted {
+		return r.stores.DeleteNodeListWithSource(ctx, entry.NodeID, entry.SourceMeta)
+	}
+	return r.stores.PutNodeListEntry(ctx, entry)
 }
 
 func (r *Registry) retryPendingNodeListProjection(ctx context.Context, rec *NodeRecord) {
@@ -1194,90 +1209,141 @@ func (r *Registry) retryPendingNodeListProjection(ctx context.Context, rec *Node
 	}
 }
 
-func (r *Registry) enqueueNodeListProjection(ctx context.Context, rec *NodeRecord) {
-	if r == nil || rec == nil || rec.NodeID == "" || ctx.Err() != nil {
+func (r *Registry) enqueueNodeListProjection(ctx context.Context, entry clusterstate.NodeListEntry) {
+	if r == nil || entry.NodeID == "" || ctx.Err() != nil {
 		return
 	}
-	next := cloneNodeRecord(rec)
+	retryCtx := ctx
+	lifecycleCtx := false
+	if entry.Deleted {
+		r.mu.Lock()
+		if r.reaperCtx != nil {
+			retryCtx = r.reaperCtx
+			lifecycleCtx = true
+		}
+		r.mu.Unlock()
+	}
+	next := cloneNodeListProjection(entry)
 	r.nodeListProjectMu.Lock()
-	if cur := r.nodeListProject[next.NodeID]; cur == nil || nodeRecordProjectionNewer(next, cur) {
+	if cur, found := r.nodeListProject[next.NodeID]; !found || nodeListProjectionNewer(next, cur) {
 		r.nodeListProject[next.NodeID] = next
+	}
+	replaceCtx := r.nodeListProjectCtx == nil || r.nodeListProjectCtx.Err() != nil
+	if lifecycleCtx && !r.nodeListProjectRoot {
+		replaceCtx = true
+	}
+	if replaceCtx {
+		r.nodeListProjectCtx = retryCtx
+		r.nodeListProjectGen++
+		r.nodeListProjectRoot = lifecycleCtx
 	}
 	if !r.nodeListProjectRun {
 		r.nodeListProjectRun = true
-		go r.runNodeListProjectionRetry(ctx)
+		go r.runNodeListProjectionRetry()
 	}
 	r.nodeListProjectMu.Unlock()
 }
 
-func (r *Registry) runNodeListProjectionRetry(ctx context.Context) {
+func (r *Registry) runNodeListProjectionRetry() {
 	ticker := time.NewTicker(nodeListProjectionRetryInterval)
 	defer ticker.Stop()
-	defer func() {
-		r.nodeListProjectMu.Lock()
-		r.nodeListProjectRun = false
-		r.nodeListProjectMu.Unlock()
-	}()
 	for {
-		if r.flushNodeListProjection(ctx) {
+		r.nodeListProjectMu.Lock()
+		ctx := r.nodeListProjectCtx
+		ctxGen := r.nodeListProjectGen
+		if ctx == nil || ctx.Err() != nil {
+			r.nodeListProjectRun = false
+			r.nodeListProjectCtx = nil
+			r.nodeListProjectRoot = false
+			r.nodeListProjectMu.Unlock()
 			return
+		}
+		r.nodeListProjectMu.Unlock()
+		r.flushNodeListProjection(ctx)
+		r.nodeListProjectMu.Lock()
+		if len(r.nodeListProject) == 0 {
+			r.nodeListProjectRun = false
+			r.nodeListProjectCtx = nil
+			r.nodeListProjectRoot = false
+			r.nodeListProjectMu.Unlock()
+			return
+		}
+		nextCtxGen := r.nodeListProjectGen
+		r.nodeListProjectMu.Unlock()
+		if nextCtxGen != ctxGen {
+			continue
 		}
 		select {
 		case <-ticker.C:
 		case <-ctx.Done():
+		}
+	}
+}
+
+func (r *Registry) flushNodeListProjection(ctx context.Context) {
+	if err := ctx.Err(); err != nil {
+		return
+	}
+	r.nodeListProjectMu.Lock()
+	batch := make([]clusterstate.NodeListEntry, 0, len(r.nodeListProject))
+	for _, entry := range r.nodeListProject {
+		batch = append(batch, cloneNodeListProjection(entry))
+	}
+	r.nodeListProjectMu.Unlock()
+	for _, entry := range batch {
+		r.flushNodeListProjectionEntry(ctx, entry)
+	}
+}
+
+func (r *Registry) flushNodeListProjectionEntry(ctx context.Context, entry clusterstate.NodeListEntry) {
+	if !r.nodeListProjectionPending(entry) {
+		return
+	}
+	if !entry.Deleted {
+		if _, connected := r.node(entry.NodeID); !connected {
+			r.clearPendingNodeListProjection(entry)
 			return
 		}
 	}
+	if err := r.writeNodeListProjection(ctx, entry); err != nil {
+		if ctx.Err() != nil {
+			return
+		}
+		if !isNodeListProjectionRetryable(err) {
+			r.log.Warn("node-link: node_list projection retry rejected", "node", entry.NodeID, "deleted", entry.Deleted, "err", err)
+			r.clearPendingNodeListProjection(entry)
+		}
+		return
+	}
+	r.clearPendingNodeListProjection(entry)
 }
 
-func (r *Registry) flushNodeListProjection(ctx context.Context) bool {
-	if err := ctx.Err(); err != nil {
+func (r *Registry) nodeListProjectionPending(entry clusterstate.NodeListEntry) bool {
+	if r == nil || entry.NodeID == "" {
 		return false
 	}
 	r.nodeListProjectMu.Lock()
-	batch := make([]*NodeRecord, 0, len(r.nodeListProject))
-	for _, rec := range r.nodeListProject {
-		batch = append(batch, cloneNodeRecord(rec))
-	}
-	r.nodeListProjectMu.Unlock()
-	if len(batch) == 0 {
-		return true
-	}
-	for _, rec := range batch {
-		if err := r.stores.PutNodeList(ctx, rec); err != nil {
-			if ctx.Err() != nil {
-				return false
-			}
-			continue
-		}
-		r.clearPendingNodeListProjection(rec)
-	}
-	r.nodeListProjectMu.Lock()
-	empty := len(r.nodeListProject) == 0
-	r.nodeListProjectMu.Unlock()
-	return empty
+	defer r.nodeListProjectMu.Unlock()
+	cur, found := r.nodeListProject[entry.NodeID]
+	return found && compareProjectionSource(cur, entry) == 0 && cur.Deleted == entry.Deleted
 }
 
-func (r *Registry) clearPendingNodeListProjection(rec *NodeRecord) {
-	if r == nil || rec == nil || rec.NodeID == "" {
+func (r *Registry) clearPendingNodeListProjection(entry clusterstate.NodeListEntry) {
+	if r == nil || entry.NodeID == "" {
 		return
 	}
 	r.nodeListProjectMu.Lock()
 	defer r.nodeListProjectMu.Unlock()
-	cur := r.nodeListProject[rec.NodeID]
-	if cur == nil || !nodeRecordProjectionNewer(cur, rec) {
-		delete(r.nodeListProject, rec.NodeID)
+	cur, found := r.nodeListProject[entry.NodeID]
+	if !found || !nodeListProjectionNewer(cur, entry) {
+		delete(r.nodeListProject, entry.NodeID)
 	}
 }
 
-func nodeRecordProjectionNewer(next, cur *NodeRecord) bool {
-	if next == nil {
-		return false
-	}
-	if cur == nil {
-		return true
-	}
-	return nodeListProjectionNewer(projectNodeListRecord(next), projectNodeListRecord(cur))
+func cloneNodeListProjection(entry clusterstate.NodeListEntry) clusterstate.NodeListEntry {
+	entry.Labels = cloneStringMap(entry.Labels)
+	entry.BuildCapacity = cloneBuildResources(entry.BuildCapacity)
+	return entry
 }
 
 func isNodeListProjectionRetryable(err error) bool {
@@ -1298,12 +1364,38 @@ func (r *Registry) refreshNodeManifestKeys(ctx context.Context, rec *NodeRecord)
 }
 
 func (r *Registry) updateNodeResume(ctx context.Context, nodeID, token string) {
-	rec, found, err := r.getNodeForLinkUpdate(ctx, nodeID)
-	if err != nil || !found {
-		return
+	_, _, _ = r.updateNodeProfile(ctx, nodeID, false, func(rec *NodeRecord) {
+		rec.ResumeToken = token
+	})
+}
+
+func (r *Registry) updateNodeProfile(ctx context.Context, nodeID string, create bool, mutate func(*NodeRecord)) (*NodeRecord, bool, error) {
+	if nodeID == "" {
+		return nil, false, nil
 	}
-	rec.ResumeToken = token
-	_ = r.stores.PutNodeRuntime(ctx, rec)
+	for attempt := 0; attempt < 5; attempt++ {
+		rec, found, err := r.getNodeForLinkUpdate(ctx, nodeID)
+		if err != nil {
+			return nil, false, err
+		}
+		if !found {
+			if !create {
+				return nil, false, nil
+			}
+			rec = &NodeRecord{NodeID: nodeID}
+		}
+		expectRev := rec.Meta.Rev
+		mutate(rec)
+		if _, ok, err := r.stores.casNodeProfileShard(ctx, rec, expectRev); err != nil {
+			return nil, false, err
+		} else if ok {
+			return rec, true, nil
+		}
+		if !create {
+			return nil, false, shardkv.ErrConflict
+		}
+	}
+	return nil, false, shardkv.ErrConflict
 }
 
 func (r *Registry) getNodeForLinkUpdate(ctx context.Context, nodeID string) (*NodeRecord, bool, error) {
@@ -1324,6 +1416,24 @@ func (r *Registry) RunReaper(ctx context.Context, deadAfter time.Duration) {
 	r.reaperCtx = ctx
 	r.deadAfter = deadAfter
 	r.mu.Unlock()
+	r.nodeListProjectMu.Lock()
+	pendingDelete := false
+	for _, entry := range r.nodeListProject {
+		if entry.Deleted {
+			pendingDelete = true
+			break
+		}
+	}
+	if pendingDelete {
+		r.nodeListProjectCtx = ctx
+		r.nodeListProjectGen++
+		r.nodeListProjectRoot = true
+		if !r.nodeListProjectRun {
+			r.nodeListProjectRun = true
+			go r.runNodeListProjectionRetry()
+		}
+	}
+	r.nodeListProjectMu.Unlock()
 	<-ctx.Done()
 }
 
@@ -1373,7 +1483,23 @@ func (r *Registry) scheduleNodeReap(nodeID string) {
 	}()
 }
 
-// sweepNode resets one disconnected node's route/build refs from that node shard.
+type sandboxReapPlan struct {
+	ref         nodeReapSandboxRef
+	record      *SandboxRecord
+	revision    int64
+	deleteRoute bool
+}
+
+type buildReapPlan struct {
+	ref      nodeReapBuildRef
+	record   *BuildRecord
+	revision uint64
+	markDead bool
+}
+
+// sweepNode claims a stale profile revision before applying any destructive
+// cleanup. Route/build and child-ref writes are then limited to revisions read
+// before that claim, so a reconnect can safely win either side of the CAS.
 func (r *Registry) sweepNode(ctx context.Context, nodeID string, deadAfter time.Duration) {
 	if nodeID == "" {
 		return
@@ -1381,7 +1507,7 @@ func (r *Registry) sweepNode(ctx context.Context, nodeID string, deadAfter time.
 	if _, connected := r.node(nodeID); connected {
 		return
 	}
-	rec, found, err := r.stores.GetNode(ctx, nodeID)
+	rec, found, err := r.stores.GetNodeProfile(ctx, nodeID)
 	if err != nil || !found {
 		return
 	}
@@ -1389,37 +1515,88 @@ func (r *Registry) sweepNode(ctx context.Context, nodeID string, deadAfter time.
 	if rec.LastHeartbeatUnix <= 0 || rec.LastHeartbeatUnix >= cutoff {
 		return
 	}
-	reset := 0
-	for _, ref := range append([]clusterstate.NodeSandboxRef(nil), rec.Sandboxes...) {
-		s, rev, found, err := r.stores.GetSandbox(ctx, ref.Group, ref.RouteKey)
-		if err != nil || !found || s.NodeID != nodeID || s.SID != ref.SandboxID {
+	snapshot, err := r.stores.snapshotNodeReapShard(ctx, nodeID)
+	if err != nil || snapshot == nil {
+		return
+	}
+	sandboxPlans := make([]sandboxReapPlan, 0, len(snapshot.Sandboxes))
+	for _, child := range snapshot.Sandboxes {
+		ref := child.Ref
+		s, rev, routeFound, err := r.stores.GetSandbox(ctx, ref.Group, ref.RouteKey)
+		if err != nil {
+			return
+		}
+		plan := sandboxReapPlan{ref: child}
+		if !routeFound || s.NodeID != nodeID || s.SID != ref.SandboxID {
+			sandboxPlans = append(sandboxPlans, plan)
 			continue
 		}
 		shouldReset := s.State == StateReady || s.State == StatePaused
-		if s.State == StateReserved && !r.hasInflight(flightKey(s.Group, s.RouteKey)) {
+		if s.State == StateReserved {
+			if r.hasInflight(flightKey(s.Group, s.RouteKey)) {
+				continue
+			}
 			shouldReset = true
 		}
 		if !shouldReset {
+			sandboxPlans = append(sandboxPlans, plan)
 			continue
 		}
-		if !r.deleteSandboxAtRevision(ctx, s.Group, s.RouteKey, s, rev, true) {
+		plan.record, plan.revision, plan.deleteRoute = s, rev, true
+		sandboxPlans = append(sandboxPlans, plan)
+	}
+	buildPlans := make([]buildReapPlan, 0, len(snapshot.Builds))
+	for _, child := range snapshot.Builds {
+		ref := child.Ref
+		b, rev, buildFound, err := r.stores.getRouteBuildShard(ctx, ref.Group, ref.BuildID)
+		if err != nil {
+			return
+		}
+		plan := buildReapPlan{ref: child}
+		if !buildFound || b.NodeID != nodeID || !b.occupies() {
+			buildPlans = append(buildPlans, plan)
 			continue
 		}
-		reset++
+		plan.record, plan.revision, plan.markDead = b, rev, true
+		buildPlans = append(buildPlans, plan)
+	}
+	claimed, err := r.stores.claimNodeProfileReapShard(ctx, nodeID, rec.Meta.Rev)
+	if err != nil || !claimed {
+		return
+	}
+	r.deleteNodeListProjection(ctx, nodeID, rec.Meta)
+	reset := 0
+	for _, plan := range sandboxPlans {
+		if plan.deleteRoute && !r.deleteSandboxAtRevision(ctx, plan.record.Group, plan.record.RouteKey, plan.record, plan.revision, false) {
+			continue
+		}
+		if _, err := r.stores.removeNodeSandboxRefShardAtRevision(ctx, nodeID, plan.ref.Ref.SandboxID, plan.ref.Revision); err != nil {
+			r.log.Warn("registry: remove reaped sandbox ownership", "node", nodeID, "sandbox", plan.ref.Ref.SandboxID, "err", err)
+			continue
+		}
+		if plan.deleteRoute {
+			reset++
+		}
 	}
 	deadBuilds := 0
-	for _, ref := range append([]clusterstate.NodeBuildRef(nil), rec.Builds...) {
-		b, found, err := r.stores.GetBuildInGroup(ctx, ref.Group, ref.BuildID)
-		if err != nil || !found || b.NodeID != nodeID || !b.occupies() {
-			continue
+	for _, plan := range buildPlans {
+		if plan.markDead {
+			plan.record.State, plan.record.Reason = BuildError, "node disconnected"
+			if _, ok, err := r.stores.casRouteBuildShard(ctx, plan.record, plan.revision); err != nil || !ok {
+				continue
+			}
+			r.releaseBuildAdmission(nodeID, plan.record.Group, plan.record.BuildID)
+			deadBuilds++
 		}
-		b.State, b.Reason = BuildError, "node disconnected"
-		_ = r.stores.PutBuild(ctx, b)
-		_ = r.stores.RemoveNodeBuildRef(ctx, nodeID, b.BuildID)
-		r.releaseBuildAdmission(nodeID, b.Group, b.BuildID)
-		deadBuilds++
+		if _, err := r.stores.removeNodeBuildRefShardAtRevision(ctx, nodeID, plan.ref.Ref.BuildID, plan.ref.Revision); err != nil {
+			r.log.Warn("registry: remove reaped build ownership", "node", nodeID, "build", plan.ref.Ref.BuildID, "err", err)
+		}
 	}
-	_ = r.stores.DeleteNode(ctx, nodeID)
+	for _, key := range snapshot.ManifestKeys {
+		if _, err := r.stores.dropNodeManifestKeyShardAtRevision(ctx, nodeID, key.Fingerprint, key.Revision); err != nil {
+			r.log.Warn("registry: remove reaped manifest key", "node", nodeID, "fingerprint", key.Fingerprint, "err", err)
+		}
+	}
 	r.log.Warn("registry: swept dead node", "node", nodeID, "sandboxes_reset", reset, "builds_errored", deadBuilds)
 }
 
