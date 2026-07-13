@@ -31,6 +31,7 @@ var (
 
 const lifecycleAckTimeout = 5 * time.Second
 const nodeListProjectionRetryInterval = 200 * time.Millisecond
+const selectorPatchWriteConcurrency = 16
 
 // nodeConn is the registry's handle to one connected node's channel — it sends
 // commands toward the node. channel.go implements it over the wire; tests fake it.
@@ -211,15 +212,72 @@ func (r *Registry) applySelectorPatch(ctx context.Context, p *routesync.Selector
 		return nil
 	}
 	expiresUnix := time.Now().Add(keyLeaseTTL).Unix()
-	for _, nodeID := range p.NodeIDs {
-		if nodeID == "" || r.nodeOwner == nil {
+	return r.putManifestKeyTargets(ctx, p.NodeIDs, p.KeyFingerprint, keyType, keyValue, expiresUnix)
+}
+
+func (r *Registry) putManifestKeyTargets(ctx context.Context, nodeIDs []string, fingerprint, keyType, keyValue string, expiresUnix int64) error {
+	if r.nodeOwner == nil || len(nodeIDs) == 0 {
+		return nil
+	}
+	workers := len(nodeIDs)
+	if workers > selectorPatchWriteConcurrency {
+		workers = selectorPatchWriteConcurrency
+	}
+	workCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	jobs := make(chan string)
+	errCh := make(chan error, 1)
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-workCtx.Done():
+					return
+				case nodeID, ok := <-jobs:
+					if !ok {
+						return
+					}
+					err := r.nodeOwner.PutManifestKey(workCtx, nodeID, fingerprint, keyType, keyValue, expiresUnix)
+					if err == nil || errors.Is(err, ErrNodeGone) {
+						continue
+					}
+					select {
+					case errCh <- err:
+						cancel()
+					default:
+					}
+					return
+				}
+			}
+		}()
+	}
+	seen := make(map[string]struct{}, len(nodeIDs))
+sendTargets:
+	for _, nodeID := range nodeIDs {
+		if nodeID == "" {
 			continue
 		}
-		if err := r.nodeOwner.PutManifestKey(ctx, nodeID, p.KeyFingerprint, keyType, keyValue, expiresUnix); err != nil && !errors.Is(err, ErrNodeGone) {
-			return err
+		if _, duplicate := seen[nodeID]; duplicate {
+			continue
+		}
+		seen[nodeID] = struct{}{}
+		select {
+		case jobs <- nodeID:
+		case <-workCtx.Done():
+			break sendTargets
 		}
 	}
-	return nil
+	close(jobs)
+	wg.Wait()
+	select {
+	case err := <-errCh:
+		return err
+	default:
+		return ctx.Err()
+	}
 }
 
 func (r *Registry) checkSelectorPatchLease(ctx context.Context, p *routesync.SelectorPatch) error {

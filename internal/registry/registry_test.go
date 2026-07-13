@@ -489,6 +489,23 @@ func TestSelectorPatchRetriesFailedManifestKeyCacheWrite(t *testing.T) {
 	}
 }
 
+func TestSelectorPatchWritesManifestKeyTargetsConcurrently(t *testing.T) {
+	reg := testRegWithBox(t)
+	owner := &concurrentManifestKeyOwner{want: 4, ready: make(chan struct{})}
+	owner.reg = reg
+	reg.SetNodeOwner(owner)
+
+	if err := pushSelectorPatch(reg, "/g", []string{"n1", "n2", "n3", "n4"}, testMK); err != nil {
+		t.Fatalf("selector patch fan-out: %v", err)
+	}
+	owner.mu.Lock()
+	started := owner.started
+	owner.mu.Unlock()
+	if started != 4 {
+		t.Fatalf("manifest key writes started=%d, want 4", started)
+	}
+}
+
 func TestKeyDropOnLeave(t *testing.T) {
 	ctx := context.Background()
 	reg := testRegWithBox(t)
@@ -818,6 +835,30 @@ func (o *flakyManifestKeyOwner) PutManifestKey(ctx context.Context, nodeID, fing
 		key.Value = keyValue
 	}
 	return o.reg.stores.UpsertNodeManifestKey(ctx, nodeID, key)
+}
+
+type concurrentManifestKeyOwner struct {
+	remoteLifecycleOwner
+	mu      sync.Mutex
+	started int
+	want    int
+	ready   chan struct{}
+	once    sync.Once
+}
+
+func (o *concurrentManifestKeyOwner) PutManifestKey(context.Context, string, string, string, string, int64) error {
+	o.mu.Lock()
+	o.started++
+	if o.started >= o.want {
+		o.once.Do(func() { close(o.ready) })
+	}
+	o.mu.Unlock()
+	select {
+	case <-o.ready:
+		return nil
+	case <-time.After(time.Second):
+		return errors.New("manifest key writes were serialized")
+	}
 }
 
 func (o *remoteLifecycleOwner) PutManifestKey(ctx context.Context, nodeID, fingerprint, keyType, keyValue string, expiresUnix int64) error {
