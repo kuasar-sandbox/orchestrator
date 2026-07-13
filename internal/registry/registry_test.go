@@ -1395,6 +1395,125 @@ func TestRollbackReserveRestoresOriginalSameNodeRef(t *testing.T) {
 	}
 }
 
+func TestReadyReplacementClearsOldIndexesAndRollbackRestoresThem(t *testing.T) {
+	ctx := context.Background()
+	reg := testReg(t)
+	reg.SetPlacer(placementWithToken("new"))
+	orig := &SandboxRecord{Group: "/g", RouteKey: "rk", SID: "sb-old", State: StateReady, NodeID: "old"}
+	if _, err := reg.stores.PutSandbox(ctx, orig); err != nil {
+		t.Fatal(err)
+	}
+	for _, nodeID := range []string{"old", "new"} {
+		if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: nodeID}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := reg.stores.AddNodeSandboxRef(ctx, "old", clusterstate.NodeSandboxRef{
+		Group: "/g", RouteKey: "rk", SandboxID: "sb-old",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	reg.indexSID("sb-old", "/g", "rk")
+
+	var replacementSID string
+	reg.addNode(&fakeConn{nodeID: "new", onCmd: func(cmd *routesync.Command) {
+		if cmd.Kind == routesync.CmdCreate {
+			replacementSID = cmd.SID
+			reg.ackCommand(&routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted})
+		}
+	}})
+	if err := reg.placeAndCreate(ctx, "/g", "rk", nil, orig); err != nil {
+		t.Fatalf("placeAndCreate: %v", err)
+	}
+	reserved, _, found, err := reg.stores.GetSandbox(ctx, "/g", "rk")
+	if err != nil || !found || reserved.State != StateReserved || reserved.SID != replacementSID {
+		t.Fatalf("replacement route=%+v found=%v err=%v", reserved, found, err)
+	}
+	oldNode, found, err := reg.stores.GetNode(ctx, "old")
+	if err != nil || !found || len(oldNode.Sandboxes) != 0 {
+		t.Fatalf("old node after replacement=%+v found=%v err=%v", oldNode, found, err)
+	}
+	reg.mu.Lock()
+	_, oldIndexed := reg.sidKeys["sb-old"]
+	reg.mu.Unlock()
+	if oldIndexed {
+		t.Fatal("replacement left old SID indexed")
+	}
+
+	reg.rollbackReserve("/g", "rk", orig, true)
+	restored, _, found, err := reg.stores.GetSandbox(ctx, "/g", "rk")
+	if err != nil || !found || restored.SID != "sb-old" || restored.NodeID != "old" {
+		t.Fatalf("restored route=%+v found=%v err=%v", restored, found, err)
+	}
+	oldNode, found, err = reg.stores.GetNode(ctx, "old")
+	if err != nil || !found || len(oldNode.Sandboxes) != 1 || oldNode.Sandboxes[0].SandboxID != "sb-old" {
+		t.Fatalf("restored old node=%+v found=%v err=%v", oldNode, found, err)
+	}
+	newNode, found, err := reg.stores.GetNode(ctx, "new")
+	if err != nil || !found || len(newNode.Sandboxes) != 0 {
+		t.Fatalf("new node after rollback=%+v found=%v err=%v", newNode, found, err)
+	}
+	reg.mu.Lock()
+	_, oldIndexed = reg.sidKeys["sb-old"]
+	_, replacementIndexed := reg.sidKeys[replacementSID]
+	reg.mu.Unlock()
+	if !oldIndexed || replacementIndexed {
+		t.Fatalf("rollback SID indexes: old=%v replacement=%v", oldIndexed, replacementIndexed)
+	}
+}
+
+func TestStaleNodeDeleteDoesNotDeleteReplacementGeneration(t *testing.T) {
+	tests := []struct {
+		name   string
+		report func(context.Context, *Registry)
+	}{
+		{name: "delete by SID", report: func(ctx context.Context, reg *Registry) {
+			reg.applyDeleteBySID(ctx, "n1", "sb-old")
+		}},
+		{name: "dead route", report: func(ctx context.Context, reg *Registry) {
+			reg.applyRoute(ctx, "n1", &routesync.RouteEntry{
+				SandboxID: "sb-old", Group: "/g", RouteKey: "rk", State: routesync.StateDead,
+			})
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			reg := testReg(t)
+			if _, err := reg.stores.PutSandbox(ctx, &SandboxRecord{
+				Group: "/g", RouteKey: "rk", SID: "sb-new", State: StateReady, NodeID: "n1",
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"}); err != nil {
+				t.Fatal(err)
+			}
+			if err := reg.stores.AddNodeSandboxRef(ctx, "n1", clusterstate.NodeSandboxRef{
+				Group: "/g", RouteKey: "rk", SandboxID: "sb-new",
+			}); err != nil {
+				t.Fatal(err)
+			}
+			reg.indexSID("sb-old", "/g", "rk")
+
+			tt.report(ctx, reg)
+			got, _, found, err := reg.stores.GetSandbox(ctx, "/g", "rk")
+			if err != nil || !found || got.SID != "sb-new" {
+				t.Fatalf("replacement route=%+v found=%v err=%v", got, found, err)
+			}
+			node, found, err := reg.stores.GetNode(ctx, "n1")
+			if err != nil || !found || len(node.Sandboxes) != 1 || node.Sandboxes[0].SandboxID != "sb-new" {
+				t.Fatalf("replacement node ref=%+v found=%v err=%v", node, found, err)
+			}
+			reg.mu.Lock()
+			_, oldIndexed := reg.sidKeys["sb-old"]
+			reg.mu.Unlock()
+			if oldIndexed {
+				t.Fatal("stale SID remained indexed after delete report")
+			}
+		})
+	}
+}
+
 func TestReplaceOnRejectSucceeds(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)

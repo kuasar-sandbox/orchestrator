@@ -488,7 +488,7 @@ func (s *Stores) RemoveNodeSandboxRef(ctx context.Context, nodeID, group, routeK
 		return nil
 	}
 	if group != "" && routeKey != "" {
-		return s.removeNodeSandboxRefShard(ctx, nodeID, group, routeKey)
+		return s.removeNodeSandboxRefShard(ctx, nodeID, group, routeKey, sid)
 	}
 	if sid == "" {
 		return nil
@@ -499,7 +499,7 @@ func (s *Stores) RemoveNodeSandboxRef(ctx context.Context, nodeID, group, routeK
 	}
 	for _, ref := range rec.Sandboxes {
 		if ref.SandboxID == sid {
-			if err := s.removeNodeSandboxRefShard(ctx, nodeID, ref.Group, ref.RouteKey); err != nil {
+			if err := s.removeNodeSandboxRefShard(ctx, nodeID, ref.Group, ref.RouteKey, sid); err != nil {
 				return err
 			}
 		}
@@ -929,6 +929,13 @@ func (s *Stores) CASSandbox(ctx context.Context, r *SandboxRecord, expectRev int
 
 func (s *Stores) DeleteSandbox(ctx context.Context, group, routeKey string) error {
 	return s.deleteRouteSandboxShard(ctx, group, routeKey)
+}
+
+func (s *Stores) DeleteSandboxIfRevision(ctx context.Context, group, routeKey string, expectRev int64) (bool, error) {
+	if expectRev < 0 {
+		return false, fmt.Errorf("registry: negative route_link revision %d", expectRev)
+	}
+	return s.deleteRouteSandboxShardIfRevision(ctx, group, routeKey, uint64(expectRev))
 }
 
 // RangeSandboxes streams a group's route_link rows.

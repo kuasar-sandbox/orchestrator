@@ -75,7 +75,7 @@ func (s *Stores) addNodeSandboxRefShard(ctx context.Context, nodeID string, ref 
 	return shardUpsert(ctx, sh, clusterstate.NodeSandboxRecordKey(ref.Group, ref.RouteKey), value)
 }
 
-func (s *Stores) removeNodeSandboxRefShard(ctx context.Context, nodeID, group, routeKey string) error {
+func (s *Stores) removeNodeSandboxRefShard(ctx context.Context, nodeID, group, routeKey, sid string) error {
 	if nodeID == "" || group == "" || routeKey == "" {
 		return nil
 	}
@@ -83,7 +83,26 @@ func (s *Stores) removeNodeSandboxRefShard(ctx context.Context, nodeID, group, r
 	if err != nil {
 		return err
 	}
-	return shardDeleteIfFound(ctx, sh, clusterstate.NodeSandboxRecordKey(group, routeKey))
+	key := clusterstate.NodeSandboxRecordKey(group, routeKey)
+	for attempt := 0; attempt < 5; attempt++ {
+		rec, found, err := sh.Get(ctx, key)
+		if err != nil || !found {
+			return err
+		}
+		current, err := clusterstate.DecodeShardValue[clusterstate.NodeSandboxRef](rec.Value)
+		if err != nil {
+			return err
+		}
+		if sid != "" && current.SandboxID != "" && current.SandboxID != sid {
+			return nil
+		}
+		if _, ok, err := sh.Delete(ctx, key, rec.Meta.Rev); err != nil {
+			return err
+		} else if ok {
+			return nil
+		}
+	}
+	return shardkv.ErrConflict
 }
 
 func (s *Stores) addNodeBuildRefShard(ctx context.Context, nodeID string, ref clusterstate.NodeBuildRef) error {
