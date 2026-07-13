@@ -285,6 +285,7 @@ func (r *Registry) serveNodeLinkLocal(ctx context.Context, w io.Writer, flush fu
 	// maintenance may send key refresh commands on this same h2 stream under
 	// nodeChannel.mu; Hello goes out first while this is still the only writer.
 	resumeFrom := registered.ResumeToken
+	fullExpected := append([]clusterstate.NodeSandboxRef(nil), registered.Sandboxes...)
 	if err := routesync.WriteMsg(w, &routesync.Msg{Type: routesync.TypeHello, Hello: &routesync.Hello{Version: routesync.Version, ResumeFrom: resumeFrom}}); err != nil {
 		return nil
 	}
@@ -300,7 +301,7 @@ func (r *Registry) serveNodeLinkLocal(ctx context.Context, w io.Writer, flush fu
 	defer close(heartbeatCh)
 
 	collectingFull := true
-	fullSeen := map[string]string{}
+	fullSeen := map[string]struct{}{}
 	for {
 		m, err := routesync.ReadMsg(body)
 		if err != nil {
@@ -312,8 +313,8 @@ func (r *Registry) serveNodeLinkLocal(ctx context.Context, w io.Writer, flush fu
 		switch m.Type {
 		case routesync.TypeUpsert:
 			if m.Route != nil {
-				if collectingFull && m.Route.Group != "" && m.Route.RouteKey != "" {
-					fullSeen[clusterstate.RouteKey(m.Route.Group, m.Route.RouteKey)] = m.Route.SandboxID
+				if collectingFull && m.Route.SandboxID != "" {
+					fullSeen[m.Route.SandboxID] = struct{}{}
 				}
 				r.applyRoute(ctx, nr.NodeID, m.Route)
 			}
@@ -334,7 +335,7 @@ func (r *Registry) serveNodeLinkLocal(ctx context.Context, w io.Writer, flush fu
 			}
 		case routesync.TypeBookmark:
 			if collectingFull && m.FullSync {
-				r.applyNodeFullSnapshot(ctx, nr.NodeID, fullSeen)
+				r.applyNodeFullSnapshot(ctx, nr.NodeID, fullExpected, fullSeen)
 			}
 			collectingFull = false
 			fullSeen = nil

@@ -477,48 +477,33 @@ func (s *Stores) PutNodeList(ctx context.Context, n *NodeRecord) error {
 }
 
 func (s *Stores) AddNodeSandboxRef(ctx context.Context, nodeID string, ref clusterstate.NodeSandboxRef) error {
-	if nodeID == "" || ref.Group == "" || ref.RouteKey == "" {
-		return nil
+	if nodeID == "" || ref.SandboxID == "" || ref.Group == "" || ref.RouteKey == "" {
+		return errors.New("registry: node sandbox ref requires node_id, sandbox_id, group, and route_key")
 	}
 	return s.addNodeSandboxRefShard(ctx, nodeID, ref)
 }
 
-func (s *Stores) RemoveNodeSandboxRef(ctx context.Context, nodeID, group, routeKey, sid string) error {
-	if nodeID == "" {
-		return nil
-	}
-	if group != "" && routeKey != "" {
-		return s.removeNodeSandboxRefShard(ctx, nodeID, group, routeKey, sid)
-	}
-	if sid == "" {
-		return nil
-	}
-	rec, found, err := s.getNodeShard(ctx, nodeID)
-	if err != nil || !found {
-		return err
-	}
-	for _, ref := range rec.Sandboxes {
-		if ref.SandboxID == sid {
-			if err := s.removeNodeSandboxRefShard(ctx, nodeID, ref.Group, ref.RouteKey, sid); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
+func (s *Stores) GetNodeSandboxRef(ctx context.Context, nodeID, sandboxID string) (clusterstate.NodeSandboxRef, bool, error) {
+	return s.getNodeSandboxRefShard(ctx, nodeID, sandboxID)
+}
+
+func (s *Stores) RemoveNodeSandboxRef(ctx context.Context, nodeID, sandboxID string) error {
+	return s.removeNodeSandboxRefShard(ctx, nodeID, sandboxID)
 }
 
 func (s *Stores) AddNodeBuildRef(ctx context.Context, nodeID string, ref clusterstate.NodeBuildRef) error {
 	if nodeID == "" || ref.Group == "" || ref.BuildID == "" {
-		return nil
+		return errors.New("registry: node build ref requires node_id, build_id, and group")
 	}
 	return s.addNodeBuildRefShard(ctx, nodeID, ref)
 }
 
-func (s *Stores) RemoveNodeBuildRef(ctx context.Context, nodeID, group, buildID string) error {
-	if nodeID == "" || group == "" || buildID == "" {
-		return nil
-	}
-	return s.removeNodeBuildRefShard(ctx, nodeID, group, buildID)
+func (s *Stores) GetNodeBuildRef(ctx context.Context, nodeID, buildID string) (clusterstate.NodeBuildRef, bool, error) {
+	return s.getNodeBuildRefShard(ctx, nodeID, buildID)
+}
+
+func (s *Stores) RemoveNodeBuildRef(ctx context.Context, nodeID, buildID string) error {
+	return s.removeNodeBuildRefShard(ctx, nodeID, buildID)
 }
 
 func (s *Stores) updateNodeRuntime(ctx context.Context, nodeID string, mutate func(*NodeRecord)) error {

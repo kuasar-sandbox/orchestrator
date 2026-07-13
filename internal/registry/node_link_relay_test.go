@@ -16,9 +16,19 @@ import (
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
 
+	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/nodelink"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 )
+
+func commandLocation(t *testing.T, cmd *routesync.Command) clusterstate.ObjectLocation {
+	t.Helper()
+	location, err := clusterstate.ObjectLocationFromMetadata(cmd.Config)
+	if err != nil {
+		t.Fatalf("command metadata: %v", err)
+	}
+	return location
+}
 
 func TestNodeLinkIngressRelaysToNodeOwner(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -60,7 +70,8 @@ func TestNodeLinkIngressRelaysToNodeOwner(t *testing.T) {
 		t.Fatalf("reserve result=%+v, want node %s", res, nodeID)
 	}
 	cmd := node.waitCommand(t, routesync.CmdCreate)
-	if cmd.Group != "/g" || cmd.RouteKey != "rk" || cmd.SID != res.SID {
+	location := commandLocation(t, cmd)
+	if location.Group != "/g" || location.RouteKey != "rk" || cmd.SID != res.SID {
 		t.Fatalf("relayed command=%+v, reserve=%+v", cmd, res)
 	}
 }
@@ -188,7 +199,8 @@ func TestNodeLinkRedirectReconnectsToOwnerAndReserveCompletes(t *testing.T) {
 		t.Fatalf("reserve result=%+v, want node %s endpoint 127.0.0.1:19191", res, nodeID)
 	}
 	cmd := node.waitCommand(t, routesync.CmdCreate)
-	if cmd.Group != "/g" || cmd.RouteKey != "rk" || cmd.SID != res.SID {
+	location := commandLocation(t, cmd)
+	if location.Group != "/g" || location.RouteKey != "rk" || cmd.SID != res.SID {
 		t.Fatalf("redirected command=%+v, reserve=%+v", cmd, res)
 	}
 }
@@ -280,8 +292,8 @@ func (n *redirectNodeStub) HandleCommand(ctx context.Context, cmd *routesync.Com
 		go func() {
 			time.Sleep(10 * time.Millisecond)
 			n.publish(routesync.RouteEntry{
-				SandboxID: cmd.SID, Group: cmd.Group, RouteKey: cmd.RouteKey,
-				State: routesync.StateRunning, AccessToken: cmd.AccessToken,
+				SandboxID: cmd.SID,
+				State:     routesync.StateRunning, AccessToken: cmd.AccessToken,
 			})
 		}()
 	}
@@ -313,9 +325,8 @@ func (n *redirectNodeStub) OnWake(ctx context.Context, sid string)    {}
 func (n *redirectNodeStub) Policy() routesync.Policy                  { return routesync.Policy{} }
 
 func (n *redirectNodeStub) publish(route routesync.RouteEntry) {
-	key := route.Group + "\x00" + route.RouteKey
 	n.mu.Lock()
-	n.routes[key] = route
+	n.routes[route.SandboxID] = route
 	n.mu.Unlock()
 	n.publishEvent(routesync.Event{Kind: routesync.TypeUpsert, Route: route})
 }
@@ -430,7 +441,7 @@ func (n *relayNodeStub) readLoop(t *testing.T) {
 		_ = routesync.WriteMsg(n.pw, &routesync.Msg{Type: routesync.TypeCmdAck, Ack: &routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted}})
 		if cmd.Kind == routesync.CmdCreate || cmd.Kind == routesync.CmdConnect {
 			_ = routesync.WriteMsg(n.pw, &routesync.Msg{Type: routesync.TypeUpsert, Route: &routesync.RouteEntry{
-				SandboxID: cmd.SID, Group: cmd.Group, RouteKey: cmd.RouteKey, State: routesync.StateRunning, AccessToken: cmd.AccessToken,
+				SandboxID: cmd.SID, State: routesync.StateRunning, AccessToken: cmd.AccessToken,
 			}})
 		}
 	}

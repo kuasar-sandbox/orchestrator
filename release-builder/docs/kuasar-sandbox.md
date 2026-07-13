@@ -56,8 +56,8 @@ Warm Pool),共享同一套基础设施:内容定义分块、收敛加密、内�
    userfaultfd 拦截缺页),配合三层缓存把绝大多数请求留在近端。
 3. **内容寻址 + 收敛加密**:相同内容产生相同密文,密文层面跨租户去重;存储与
    缓存全程零明文。
-4. **分代组织**:salt 源于 Generation,同代去重、跨代隔离,O(1) 整代回收,
-   兼带缓存热点分散。
+4. **存储内部分代**:`store-ctl` 用内部 generation 切换 opaque salt 与写入域;
+   manifest、cache、sandbox 等消费端只处理内容键,不感知 generation。
 5. **确定性**:镜像展平逐字节可重现,Guest 配置最大化跨实例内存/磁盘一致性——
    确定性是去重率的前提。
 6. **两环资源控制**:每沙箱 balloon 环回收闲置内存,节点环做准入/额度/回收,
@@ -438,46 +438,20 @@ same content → same key → same ciphertext → dedup on ciphertext
 代价:对已知明文攻击有理论弱点(可确认某内容是否存在)。对本场景可接受——
 存储的是系统级数据(OS、运行时),非用户敏感数据。
 
-### 4.4 Salt、Generation 与分代 GC
+### 4.4 Opaque Salt 与存储内部 Generation
 
-salt 源于 Generation ID,一个机制同时回答三个问题:
+`store-ctl` 内部用 generation 组织对象和管理写入域,任一时刻只有一个 active
+generation 接收新写入;读取按 newest-first 查找仍保留的 generation。rollout 和
+purge 是存储管理员操作,不进入 manifest 或 sandbox 生命周期。
 
-**去重域**。同代内相同内容 → 相同 chunk_name → 去重;跨代无共享。
+存储服务通过 `GetSalt()` 只返回 32-byte opaque salt。manifest ingest 使用该 salt
+派生收敛加密键,但 API、manifest 格式和内容键均不携带 generation。消费端因此没有
+"本地 generation"、generation purge/GC 或代次迁移逻辑;对象在存储中不存在时只得到
+普通 miss。具体 generation 名称、salt 派生和 active 切换全部封装在 `store-ctl`。
 
-**热点分散**。基础层(libc、Python 运行时)被大量镜像共享,其哈希固定 → 一致性
-哈希永远映射到相同缓存节点,单节点故障影响面大。不同代不同 salt → 相同内容产生
-不同密文/哈希 → 映射到不同节点;3 个活跃代把热点流量分散到 3 倍节点。
-
-**空间回收**。百万级 Manifest 共享十亿级 chunk,引用计数(逐 chunk 原子操作)
-与标记-清除(全量遍历 + 一致性窗口)都不可行。代是自包含的回收单元:
-
-```
-┌───────────┐     ┌───────────┐     ┌───────────┐     ┌───────────┐
-│ Active    │────►│ Retired   │────►│ Expired   │────►│ Deleted   │
-│ (R/W,     │     │ (R only,  │     │ (alarm on │     │ (gone)    │
-│  new      │     │  migrate  │     │  read,    │     │           │
-│  writes)  │     │  active   │     │  auto-    │     │           │
-│           │     │  manifests│     │  pause    │     │           │
-│           │     │  to new   │     │  delete)  │     │           │
-│           │     │  gen)     │     │           │     │           │
-└───────────┘     └───────────┘     └───────────┘     └───────────┘
-```
-
-整代删除 = 删一个目录,O(1);Expired 态被读触发告警并自动暂停删除(安全网)。
-退役代中仍被引用的 Manifest 解密后用新代 salt 重加密迁移,走后台路径;高去重率
-使每代唯一 chunk 占比小,且应用频繁重部署使旧 Manifest 多在退役前已被替代。
-
-内容寻址存储按代组织目录(两级哈希前缀防单目录过大),PUT 幂等:
-
-```
-{store_root}/
-├── G1/  a1/b2/a1b2c3...        ← retired (salt_1)
-├── G2/  a1/b2/a1b2...          ← active  (salt_2)
-└── G3/  ...                    ← active  (salt_3)
-```
-
-代价:同一内容在活跃代间各存一份(3 代 ≈ 3× 单代去重后大小)——相比无去重的
-原始数据仍节省数量级。后端与代轮转见 `store.md`。
+同一 opaque salt 域内相同明文产生相同密文与内容键,可以去重;切换存储写入域后 salt
+变化,新写入与旧域隔离。非 active generation 何时 purge 由存储容量和保留策略决定,
+执行前必须由存储管理面确认其中对象已不再需要。后端布局和管理命令见 `store.md`。
 
 ### 4.5 分层缓存
 

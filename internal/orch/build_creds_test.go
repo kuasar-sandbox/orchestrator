@@ -87,6 +87,42 @@ func TestValidateBuildOptionsCannotEnableNodeDisabledReferer(t *testing.T) {
 	}
 }
 
+func TestValidateBuildOptionsRestrictsRefererCapabilitySubset(t *testing.T) {
+	enabled, disabled := true, false
+	tests := []struct {
+		name      string
+		configure func(*config.Config)
+		opts      types.BuildOptions
+	}{
+		{
+			name: "writeback needs lookup",
+			opts: types.BuildOptions{Referer: &types.BuildRefererOptions{
+				Enabled: &disabled, Writeback: &enabled,
+			}},
+		},
+		{
+			name: "writeback cannot exceed node",
+			configure: func(cfg *config.Config) {
+				cfg.Builder.Referer.Enabled = true
+				cfg.Builder.Referer.Writeback = &disabled
+			},
+			opts: types.BuildOptions{Referer: &types.BuildRefererOptions{Writeback: &enabled}},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &config.Config{}
+			if tt.configure != nil {
+				tt.configure(cfg)
+			}
+			o := testOrchCfg(t, cfg)
+			if err := o.validateBuildOptions(tt.opts, false); err == nil {
+				t.Fatal("invalid referer capability escalation was accepted")
+			}
+		})
+	}
+}
+
 func TestEffectiveImportRefererComputesOwnerToken(t *testing.T) {
 	o := testOrchCfg(t, &config.Config{})
 	o.cfg.Builder.Referer.Enabled = true
@@ -108,5 +144,37 @@ func TestEffectiveImportRefererComputesOwnerToken(t *testing.T) {
 	}
 	if strings.Contains(got.Owner, b.ManifestKey) {
 		t.Fatalf("owner token leaked manifest key: %q", got.Owner)
+	}
+}
+
+func TestEffectiveImportRefererHonorsPerBuildDisableSubset(t *testing.T) {
+	o := testOrchCfg(t, &config.Config{})
+	o.cfg.Builder.Referer.Enabled = true
+	o.cfg.Builder.Referer.Desc = "acme-prod"
+	o.cfg.Builder.Referer.Key = "acme-prod"
+	disabled := false
+	b := &types.Build{
+		ManifestKey: strings.Repeat("4", 64),
+		FromImage:   "reg.example.com/app:tag",
+		Builder: types.BuildOptions{Referer: &types.BuildRefererOptions{
+			Enabled: &disabled,
+		}},
+	}
+	got, err := o.effectiveImportReferer(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Enabled || got.Writeback {
+		t.Fatalf("per-build disable produced %+v", got)
+	}
+
+	b.Builder.Referer.Enabled = nil
+	b.Builder.Referer.Writeback = &disabled
+	got, err = o.effectiveImportReferer(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Enabled || got.Writeback {
+		t.Fatalf("writeback-only disable produced %+v", got)
 	}
 }

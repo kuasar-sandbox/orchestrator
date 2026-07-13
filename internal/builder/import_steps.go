@@ -86,18 +86,16 @@ func (p *buildPipeline) phaseImport() error {
 	p.baseRef = "file://" + p.imagePath
 	p.overlayBase = "" // a freshly imported image is a complete base, no overlay lower
 	p.progress("import: image artifact ready")
-	if refSupported {
+	if refSupported && s.ImportReferer.Writeback {
 		key, err := p.uploadImage()
 		if err != nil {
 			return fmt.Errorf("upload referer base image: %w", err)
 		}
 		p.baseRef = "manifest://" + key
-		if s.ImportReferer.Writeback {
-			if err := p.writeImportReferer(sb, refSubject, key); err != nil {
-				return fmt.Errorf("referer writeback: %w", err)
-			}
-			p.progress("import: referer writeback complete")
+		if err := p.writeImportReferer(sb, refSubject, key); err != nil {
+			return fmt.Errorf("referer writeback: %w", err)
 		}
+		p.progress("import: referer writeback complete")
 	}
 	return nil
 }

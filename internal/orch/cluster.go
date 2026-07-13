@@ -3,7 +3,6 @@ package orch
 import (
 	"context"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"os"
 	"time"
@@ -12,14 +11,13 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/buildcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/keys"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
-	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
 // This file makes the orchestrator the node side of the cluster node-link
 // (nodelink.Node): it executes the registry's lifecycle commands and reports the
-// terminal state on the route stream (routes.go already carries the cluster
-// (group, route_key) identity, so a registry Reserve converges on it).
+// terminal state by sandbox/build ID. Cluster routing metadata is stored opaquely
+// on the object; the nodelink owner resolves it from its per-node ownership table.
 
 // HandleCommand executes a registry node-link command and returns a receipt ack
 // (cluster.md): accepted once the synchronous preconditions hold (key
@@ -37,7 +35,7 @@ func (o *Orchestrator) HandleCommand(ctx context.Context, cmd *routesync.Command
 		}
 		go func() {
 			if _, err := o.bootCluster(o.asyncCtx(), cmd, manifestKey, tmpl); err != nil {
-				o.log.Error("cluster create", "sid", cmd.SID, "group", cmd.Group, "err", err)
+				o.log.Error("cluster create", "sid", cmd.SID, "err", err)
 			}
 		}()
 		return accept(cmd)
@@ -142,7 +140,7 @@ func (o *Orchestrator) registerClusterBuild(ctx context.Context, cmd *routesync.
 		return err
 	}
 	o.clusterBuildMu.Lock()
-	o.clusterBuilds[cmd.BuildID] = &clusterBuild{group: cmd.Group, imageRepo: cmd.ImageRepo, registryAuth: cmd.RegistryAuth}
+	o.clusterBuilds[cmd.BuildID] = &clusterBuild{imageRepo: cmd.ImageRepo, registryAuth: cmd.RegistryAuth}
 	o.clusterBuildMu.Unlock()
 	o.publishBuildState(cmd.BuildID, "registered", "", "")
 	return nil
@@ -162,7 +160,7 @@ func (o *Orchestrator) publishBuildState(buildID, state, templateID, reason stri
 	if cb == nil {
 		return // not a cluster-driven build
 	}
-	ev := &routesync.BuildEvent{BuildID: buildID, Group: cb.group, State: state, TemplateID: templateID, Reason: reason}
+	ev := &routesync.BuildEvent{BuildID: buildID, State: state, TemplateID: templateID, Reason: reason}
 	select {
 	case o.buildEvents <- ev:
 	default:
@@ -299,9 +297,8 @@ func (o *Orchestrator) precheckCluster(ctx context.Context, cmd *routesync.Comma
 	return manifestKey, tmpl, nil
 }
 
-// bootCluster builds + launches the sandbox (registry-minted sid, resolved key,
-// cluster (group, route_key) metadata) and publishes its route — which satisfies
-// the registry's Reserve.
+// bootCluster builds + launches the sandbox from the registry-supplied metadata
+// and publishes its route, which satisfies the registry's Reserve.
 func (o *Orchestrator) bootCluster(ctx context.Context, cmd *routesync.Command, manifestKey string, tmpl types.TemplateID) (*types.Sandbox, error) {
 	envdTok := cmd.AccessToken
 	if envdTok == "" {
@@ -309,15 +306,10 @@ func (o *Orchestrator) bootCluster(ctx context.Context, cmd *routesync.Command, 
 	}
 	trafTok, _ := keys.MintToken()
 
-	meta := map[string]string{}
+	meta := make(map[string]string, len(cmd.Config))
 	for k, v := range cmd.Config {
 		meta[k] = v
 	}
-	cm, _ := json.Marshal(struct {
-		Group    string `json:"group"`
-		RouteKey string `json:"route_key"`
-	}{cmd.Group, cmd.RouteKey})
-	meta[sandboxcfg.NsCluster] = string(cm)
 
 	sb := &types.Sandbox{
 		ID:                 cmd.SID,

@@ -45,6 +45,11 @@ func (r *Registry) ReserveBuild(ctx context.Context, req BuildReserveReq) (*Buil
 	if req.Group == "" {
 		return nil, fmt.Errorf("registry: group is required")
 	}
+	metadata, err := clusterstate.WithObjectLocation(req.Metadata, clusterstate.ObjectLocation{Group: req.Group})
+	if err != nil {
+		return nil, err
+	}
+	req.Metadata = metadata
 	resources := req.Resources
 	if resources == nil {
 		resources = defaultBuildResources
@@ -52,6 +57,10 @@ func (r *Registry) ReserveBuild(ctx context.Context, req BuildReserveReq) (*Buil
 	buildID := req.BuildID
 	if buildID == "" {
 		buildID = "bld-" + newID()
+	}
+	ref, err := clusterstate.NodeBuildRefFromMetadata(buildID, metadata)
+	if err != nil {
+		return nil, err
 	}
 	templateID := req.TemplateID
 	if templateID == "" {
@@ -108,19 +117,23 @@ func (r *Registry) ReserveBuild(ctx context.Context, req BuildReserveReq) (*Buil
 		// Commit the group build record after node-owner admission succeeds.
 		rec := &BuildRecord{Group: req.Group, BuildID: buildID, NodeID: id, Resources: resources, State: BuildRegistered, TemplateID: templateID}
 		if err := r.stores.PutBuild(ctx, rec); err != nil {
-			r.releaseBuildAdmission(buildID)
+			r.releaseBuildAdmission(id, buildID)
 			return nil, err
 		}
-		_ = r.stores.AddNodeBuildRef(ctx, id, clusterstate.NodeBuildRef{Group: req.Group, BuildID: buildID})
+		if err := r.stores.AddNodeBuildRef(ctx, id, ref); err != nil {
+			_ = r.stores.DeleteBuild(ctx, req.Group, buildID)
+			r.releaseBuildAdmission(id, buildID)
+			return nil, err
+		}
 		cmd := &routesync.Command{
-			CmdID: newID(), Kind: routesync.CmdBuildRegister, Group: req.Group,
+			CmdID: newID(), Kind: routesync.CmdBuildRegister,
 			BuildID: buildID, TemplateRef: templateID, BuildResources: resources, Config: req.Metadata,
 			KeyFingerprint: placement.KeyFingerprint, ImageRepo: placement.ImageRepo, RegistryAuth: placement.RegistryAuth,
 		}
 		if r.nodeOwner == nil {
 			_ = r.stores.DeleteBuild(ctx, req.Group, buildID)
-			_ = r.stores.RemoveNodeBuildRef(ctx, id, req.Group, buildID)
-			r.releaseBuildAdmission(buildID)
+			_ = r.stores.RemoveNodeBuildRef(ctx, id, buildID)
+			r.releaseBuildAdmission(id, buildID)
 			lastFailure = ErrNodeGone
 			excluded.add(id)
 			continue
@@ -134,16 +147,16 @@ func (r *Registry) ReserveBuild(ctx context.Context, req BuildReserveReq) (*Buil
 				return r.buildReserveResult(ctx, rec), nil
 			}
 			_ = r.stores.DeleteBuild(ctx, req.Group, buildID) // command definitively did not reach the node
-			_ = r.stores.RemoveNodeBuildRef(ctx, id, req.Group, buildID)
-			r.releaseBuildAdmission(buildID)
+			_ = r.stores.RemoveNodeBuildRef(ctx, id, buildID)
+			r.releaseBuildAdmission(id, buildID)
 			lastFailure = err
 			excluded.add(id)
 			continue
 		}
 		if ack == nil || ack.Status != routesync.AckAccepted {
 			_ = r.stores.DeleteBuild(ctx, req.Group, buildID) // roll back the reservation
-			_ = r.stores.RemoveNodeBuildRef(ctx, id, req.Group, buildID)
-			r.releaseBuildAdmission(buildID)
+			_ = r.stores.RemoveNodeBuildRef(ctx, id, buildID)
+			r.releaseBuildAdmission(id, buildID)
 			reason := ""
 			if ack != nil {
 				reason = ack.Reason
@@ -175,9 +188,9 @@ func (r *Registry) admitBuild(ctx context.Context, nodeID, buildID string, want 
 	return r.nodeOwner.AdmitBuild(ctx, nodeID, buildID, want)
 }
 
-func (r *Registry) releaseBuildAdmission(buildID string) {
+func (r *Registry) releaseBuildAdmission(nodeID, buildID string) {
 	if r.nodeOwner != nil {
-		r.nodeOwner.ReleaseBuild(context.Background(), buildID)
+		r.nodeOwner.ReleaseBuild(context.Background(), nodeID, buildID)
 	}
 }
 
@@ -185,10 +198,14 @@ func (r *Registry) releaseBuildAdmission(buildID string) {
 // updates the BuildStore (releasing the reservation on a terminal state, since the
 // headroom sum counts only registered/building builds).
 func (r *Registry) applyBuildEvent(ctx context.Context, nodeID string, e *routesync.BuildEvent) {
-	if e.Group == "" || e.BuildID == "" {
+	if e == nil || e.BuildID == "" {
 		return
 	}
-	rec, found, err := r.stores.GetBuildInGroup(ctx, e.Group, e.BuildID)
+	ref, found, err := r.lookupNodeBuildRef(ctx, nodeID, e.BuildID)
+	if err != nil || !found {
+		return
+	}
+	rec, found, err := r.stores.GetBuildInGroup(ctx, ref.Group, e.BuildID)
 	if err != nil || !found {
 		return
 	}
@@ -200,11 +217,31 @@ func (r *Registry) applyBuildEvent(ctx context.Context, nodeID string, e *routes
 		rec.TemplateID = e.TemplateID
 	}
 	rec.Reason = e.Reason
-	_ = r.stores.PutBuild(ctx, rec)
-	if !rec.occupies() {
-		r.releaseBuildAdmission(rec.BuildID)
-		_ = r.stores.RemoveNodeBuildRef(ctx, rec.NodeID, rec.Group, rec.BuildID)
+	if err := r.stores.PutBuild(ctx, rec); err != nil {
+		return
 	}
+	if !rec.occupies() {
+		r.releaseBuildAdmission(rec.NodeID, rec.BuildID)
+		_ = r.stores.RemoveNodeBuildRef(ctx, rec.NodeID, rec.BuildID)
+	}
+}
+
+func (r *Registry) lookupNodeBuildRef(ctx context.Context, nodeID, buildID string) (clusterstate.NodeBuildRef, bool, error) {
+	var ref clusterstate.NodeBuildRef
+	var found bool
+	var err error
+	for attempt := 0; attempt < 5; attempt++ {
+		ref, found, err = r.stores.GetNodeBuildRef(ctx, nodeID, buildID)
+		if err == nil || !transientRouteRead(err) {
+			return ref, found, err
+		}
+		select {
+		case <-ctx.Done():
+			return clusterstate.NodeBuildRef{}, false, ctx.Err()
+		case <-time.After(time.Duration(attempt+1) * 10 * time.Millisecond):
+		}
+	}
+	return ref, found, err
 }
 
 // ResolveBuild maps a group's build_id to its node (router restart recovery: the

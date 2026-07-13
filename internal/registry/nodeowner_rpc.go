@@ -66,7 +66,7 @@ func ServeNodeOwner(w http.ResponseWriter, req *http.Request, owner NodeOwner) {
 	case "admit_build":
 		out.OK = owner.AdmitBuild(req.Context(), in.NodeID, in.BuildID, in.Resources)
 	case "release_build":
-		owner.ReleaseBuild(req.Context(), in.BuildID)
+		owner.ReleaseBuild(req.Context(), in.NodeID, in.BuildID)
 		out.OK = true
 	case "runtime":
 		out.Node, out.Found, err = owner.Runtime(req.Context(), in.NodeID)
@@ -134,8 +134,8 @@ func (o *HTTPNodeOwner) AdmitBuild(ctx context.Context, nodeID, buildID string, 
 	return err == nil && out.OK
 }
 
-func (o *HTTPNodeOwner) ReleaseBuild(ctx context.Context, buildID string) {
-	_, _ = o.call(ctx, nodeOwnerRequest{Op: "release_build", BuildID: buildID})
+func (o *HTTPNodeOwner) ReleaseBuild(ctx context.Context, nodeID, buildID string) {
+	_, _ = o.call(ctx, nodeOwnerRequest{Op: "release_build", NodeID: nodeID, BuildID: buildID})
 }
 
 func (o *HTTPNodeOwner) Runtime(ctx context.Context, nodeID string) (*NodeRecord, bool, error) {

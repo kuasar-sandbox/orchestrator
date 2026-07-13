@@ -1,9 +1,9 @@
 package orch
 
 // Sandbox export/import: turn a paused sandbox's remote (portable) snapshot into
-// either a reusable template (--to-template; fork/fan-out, new sid) or a one-line
-// migration token that recreates the SAME sandbox on another node (move, same
-// sid). Both ride existing sandbox-ctl primitives (snapshot --upload /
+// either a reusable template (--to-template; fork/fan-out) or a one-line
+// migration token that restores the snapshot under a fresh sandbox id on another
+// node. Both ride existing sandbox-ctl primitives (snapshot --upload /
 // upload-snapshot / run --restore) + the e2b CLI (create / resume); nothing about
 // the e2b API/CLI changes. The token carries the sandbox row minus system
 // secrets: the tenant manifest_key appears only as a fingerprint — the target
@@ -22,27 +22,26 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/kuasar-sandbox/orchestrator/internal/apikey"
+	"github.com/kuasar-sandbox/orchestrator/internal/keys"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
 const sandboxTokenVersion = 1
 
 // SandboxToken is the portable, base64-encoded migration handle from export-sandbox.
-// It is "sandbox-sensitive" (carries the sandbox's own env/metadata/data-plane
-// tokens) but contains NO system key — manifest_key is a fingerprint only.
+// It carries portable snapshot state but no sandbox identity or data-plane
+// credentials. manifest_key is represented by a fingerprint only.
 type SandboxToken struct {
 	V             int               `json:"v"`
-	ID            string            `json:"id"`
 	TemplateID    string            `json:"template_id"`
 	SnapshotRef   string            `json:"snapshot_ref"` // manifest://<key> (always remote)
 	Profile       string            `json:"profile"`
 	Env           map[string]string `json:"env,omitempty"`
 	Metadata      map[string]string `json:"metadata,omitempty"`
 	DeadlineUnix  int64             `json:"deadline_unix,omitempty"`
-	CreatedUnix   int64             `json:"created_unix,omitempty"`
-	EnvdAccessTok string            `json:"envd_access_token,omitempty"` // sandbox data-plane token (not a system key)
-	TrafAccessTok string            `json:"traffic_access_token,omitempty"`
 	MKFingerprint string            `json:"mk_fingerprint"` // hex SHA256(manifest_key)[:12]; NOT the key
 	RuntimeDigest string            `json:"runtime_digest"` // sha256 of the profile's guest runtime erofs
 }
@@ -50,7 +49,7 @@ type SandboxToken struct {
 // ExportSandbox authorizes apiKey against the paused sandbox, ensures its snapshot
 // is remote (promoting a local checkpoint if needed), then either returns the
 // derived persist template id (toTemplate; fork) or a one-line base64 migration
-// token (default; same-sid move). A move relinquishes the source row unless
+// token (default). A move relinquishes the source row unless
 // keepSource (copy) — the remote snapshot persists either way.
 func (o *Orchestrator) ExportSandbox(ctx context.Context, apiKey, sid string, toTemplate, keepSource bool) (string, error) {
 	if apiKey == "" {
@@ -124,10 +123,9 @@ func (o *Orchestrator) mintSandboxToken(sb *types.Sandbox, ref string) (string, 
 	}
 	rawMK, _ := hex.DecodeString(sb.ManifestKey)
 	b, err := json.Marshal(SandboxToken{
-		V: sandboxTokenVersion, ID: sb.ID, TemplateID: sb.TemplateID, SnapshotRef: ref,
+		V: sandboxTokenVersion, TemplateID: sb.TemplateID, SnapshotRef: ref,
 		Profile: string(tmpl.Profile), Env: sb.Env, Metadata: sb.Metadata,
-		DeadlineUnix: sb.DeadlineUnix, CreatedUnix: sb.CreatedUnix,
-		EnvdAccessTok: sb.EnvdAccessToken, TrafAccessTok: sb.TrafficAccessToken,
+		DeadlineUnix:  sb.DeadlineUnix,
 		MKFingerprint: hex.EncodeToString(apikey.Fingerprint(rawMK)), RuntimeDigest: dig,
 	})
 	if err != nil {
@@ -166,8 +164,8 @@ func (o *Orchestrator) importSandboxWithKey(ctx context.Context, mk, token strin
 		return "", fmt.Errorf("import-sandbox: bad token: %w", err)
 	}
 	var tok SandboxToken
-	if err := json.Unmarshal(raw, &tok); err != nil || tok.ID == "" || tok.SnapshotRef == "" {
-		return "", fmt.Errorf("import-sandbox: bad token (id/snapshot_ref missing)")
+	if err := json.Unmarshal(raw, &tok); err != nil || tok.TemplateID == "" || tok.SnapshotRef == "" || tok.Profile == "" {
+		return "", fmt.Errorf("import-sandbox: bad token (template_id/snapshot_ref/profile missing)")
 	}
 	rawMK, _ := hex.DecodeString(mk)
 	if hex.EncodeToString(apikey.Fingerprint(rawMK)) != tok.MKFingerprint {
@@ -185,19 +183,25 @@ func (o *Orchestrator) importSandboxWithKey(ctx context.Context, mk, token strin
 				tok.Profile, short(dig), short(tok.RuntimeDigest))
 		}
 	}
-	if existing, _ := o.st.Get(ctx, tok.ID); existing != nil {
-		return "", fmt.Errorf("import-sandbox: sandbox %s already exists on this node", tok.ID)
+	id, err := uuid.NewV7()
+	if err != nil {
+		return "", fmt.Errorf("import-sandbox: new id: %w", err)
 	}
-	created := tok.CreatedUnix
-	if created == 0 {
-		created = time.Now().Unix()
+	sid := id.String()
+	envdToken, err := keys.MintToken()
+	if err != nil {
+		return "", fmt.Errorf("import-sandbox: mint envd token: %w", err)
+	}
+	trafficToken, err := keys.MintToken()
+	if err != nil {
+		return "", fmt.Errorf("import-sandbox: mint traffic token: %w", err)
 	}
 	sb := &types.Sandbox{
-		ID: tok.ID, TemplateID: tok.TemplateID, State: types.StatePaused,
-		DeadlineUnix: tok.DeadlineUnix, CreatedUnix: created,
-		RunDir: o.cfg.Paths.RunRoot + "/" + tok.ID, BaseDir: o.cfg.Paths.BaseRoot + "/" + tok.ID,
+		ID: sid, TemplateID: tok.TemplateID, State: types.StatePaused,
+		DeadlineUnix: tok.DeadlineUnix, CreatedUnix: time.Now().Unix(),
+		RunDir: o.cfg.Paths.RunRoot + "/" + sid, BaseDir: o.cfg.Paths.BaseRoot + "/" + sid,
 		ManifestKey: mk, SnapshotRef: tok.SnapshotRef,
-		EnvdAccessToken: tok.EnvdAccessTok, TrafficAccessToken: tok.TrafAccessTok,
+		EnvdAccessToken: envdToken, TrafficAccessToken: trafficToken,
 		Metadata: tok.Metadata, Env: tok.Env,
 	}
 	if types.Profile(tok.Profile) == types.ProfileE2B {

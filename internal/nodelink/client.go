@@ -26,8 +26,7 @@ import (
 )
 
 // Node is what the node-link client needs from the node's orchestrator: a route
-// Source for the node's sandboxes (RouteEntry with Group/RouteKey set) and
-// execution of registry commands. internal/orch implements it.
+// source for the node's sandboxes and execution of registry commands.
 type Node interface {
 	routesync.Source
 	// HandleCommand executes a registry lifecycle / key command (create / connect

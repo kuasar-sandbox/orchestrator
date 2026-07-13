@@ -61,8 +61,8 @@ func (s *Stores) putNodeShard(ctx context.Context, n *NodeRecord) (uint64, error
 }
 
 func (s *Stores) addNodeSandboxRefShard(ctx context.Context, nodeID string, ref clusterstate.NodeSandboxRef) error {
-	if nodeID == "" || ref.Group == "" || ref.RouteKey == "" {
-		return nil
+	if nodeID == "" || ref.SandboxID == "" || ref.Group == "" || ref.RouteKey == "" {
+		return errors.New("registry: invalid node sandbox ref")
 	}
 	sh, err := s.nodeLinkRecordSet(nodeID, clusterstate.RecordSetNodeSandbox)
 	if err != nil {
@@ -72,42 +72,45 @@ func (s *Stores) addNodeSandboxRefShard(ctx context.Context, nodeID string, ref 
 	if err != nil {
 		return err
 	}
-	return shardUpsert(ctx, sh, clusterstate.NodeSandboxRecordKey(ref.Group, ref.RouteKey), value)
+	return shardUpsert(ctx, sh, clusterstate.NodeSandboxRecordKey(ref.SandboxID), value)
 }
 
-func (s *Stores) removeNodeSandboxRefShard(ctx context.Context, nodeID, group, routeKey, sid string) error {
-	if nodeID == "" || group == "" || routeKey == "" {
+func (s *Stores) getNodeSandboxRefShard(ctx context.Context, nodeID, sandboxID string) (clusterstate.NodeSandboxRef, bool, error) {
+	if nodeID == "" || sandboxID == "" {
+		return clusterstate.NodeSandboxRef{}, false, nil
+	}
+	sh, err := s.nodeLinkRecordSet(nodeID, clusterstate.RecordSetNodeSandbox)
+	if err != nil {
+		return clusterstate.NodeSandboxRef{}, false, err
+	}
+	rec, found, err := sh.Get(ctx, clusterstate.NodeSandboxRecordKey(sandboxID))
+	if err != nil || !found {
+		return clusterstate.NodeSandboxRef{}, found, err
+	}
+	ref, err := clusterstate.DecodeShardValue[clusterstate.NodeSandboxRef](rec.Value)
+	if err != nil {
+		return clusterstate.NodeSandboxRef{}, false, err
+	}
+	if ref.SandboxID != sandboxID || ref.Group == "" || ref.RouteKey == "" {
+		return clusterstate.NodeSandboxRef{}, false, errors.New("registry: invalid node sandbox ref")
+	}
+	return ref, true, nil
+}
+
+func (s *Stores) removeNodeSandboxRefShard(ctx context.Context, nodeID, sandboxID string) error {
+	if nodeID == "" || sandboxID == "" {
 		return nil
 	}
 	sh, err := s.nodeLinkRecordSet(nodeID, clusterstate.RecordSetNodeSandbox)
 	if err != nil {
 		return err
 	}
-	key := clusterstate.NodeSandboxRecordKey(group, routeKey)
-	for attempt := 0; attempt < 5; attempt++ {
-		rec, found, err := sh.Get(ctx, key)
-		if err != nil || !found {
-			return err
-		}
-		current, err := clusterstate.DecodeShardValue[clusterstate.NodeSandboxRef](rec.Value)
-		if err != nil {
-			return err
-		}
-		if sid != "" && current.SandboxID != "" && current.SandboxID != sid {
-			return nil
-		}
-		if _, ok, err := sh.Delete(ctx, key, rec.Meta.Rev); err != nil {
-			return err
-		} else if ok {
-			return nil
-		}
-	}
-	return shardkv.ErrConflict
+	return shardDeleteIfFound(ctx, sh, clusterstate.NodeSandboxRecordKey(sandboxID))
 }
 
 func (s *Stores) addNodeBuildRefShard(ctx context.Context, nodeID string, ref clusterstate.NodeBuildRef) error {
 	if nodeID == "" || ref.Group == "" || ref.BuildID == "" {
-		return nil
+		return errors.New("registry: invalid node build ref")
 	}
 	sh, err := s.nodeLinkRecordSet(nodeID, clusterstate.RecordSetNodeBuild)
 	if err != nil {
@@ -117,18 +120,40 @@ func (s *Stores) addNodeBuildRefShard(ctx context.Context, nodeID string, ref cl
 	if err != nil {
 		return err
 	}
-	return shardUpsert(ctx, sh, clusterstate.NodeBuildRecordKey(ref.Group, ref.BuildID), value)
+	return shardUpsert(ctx, sh, clusterstate.NodeBuildRecordKey(ref.BuildID), value)
 }
 
-func (s *Stores) removeNodeBuildRefShard(ctx context.Context, nodeID, group, buildID string) error {
-	if nodeID == "" || group == "" || buildID == "" {
+func (s *Stores) getNodeBuildRefShard(ctx context.Context, nodeID, buildID string) (clusterstate.NodeBuildRef, bool, error) {
+	if nodeID == "" || buildID == "" {
+		return clusterstate.NodeBuildRef{}, false, nil
+	}
+	sh, err := s.nodeLinkRecordSet(nodeID, clusterstate.RecordSetNodeBuild)
+	if err != nil {
+		return clusterstate.NodeBuildRef{}, false, err
+	}
+	rec, found, err := sh.Get(ctx, clusterstate.NodeBuildRecordKey(buildID))
+	if err != nil || !found {
+		return clusterstate.NodeBuildRef{}, found, err
+	}
+	ref, err := clusterstate.DecodeShardValue[clusterstate.NodeBuildRef](rec.Value)
+	if err != nil {
+		return clusterstate.NodeBuildRef{}, false, err
+	}
+	if ref.BuildID != buildID || ref.Group == "" {
+		return clusterstate.NodeBuildRef{}, false, errors.New("registry: invalid node build ref")
+	}
+	return ref, true, nil
+}
+
+func (s *Stores) removeNodeBuildRefShard(ctx context.Context, nodeID, buildID string) error {
+	if nodeID == "" || buildID == "" {
 		return nil
 	}
 	sh, err := s.nodeLinkRecordSet(nodeID, clusterstate.RecordSetNodeBuild)
 	if err != nil {
 		return err
 	}
-	return shardDeleteIfFound(ctx, sh, clusterstate.NodeBuildRecordKey(group, buildID))
+	return shardDeleteIfFound(ctx, sh, clusterstate.NodeBuildRecordKey(buildID))
 }
 
 func (s *Stores) upsertNodeManifestKeyShard(ctx context.Context, nodeID string, key clusterstate.NodeManifestKey) error {
@@ -261,6 +286,10 @@ func (s *Stores) getNodeShard(ctx context.Context, nodeID string) (*NodeRecord, 
 		if err != nil {
 			return nil, false, err
 		}
+		sandboxID, ok := clusterstate.ParseNodeSandboxRecordKey(rec.Key)
+		if !ok || ref.SandboxID != sandboxID || ref.Group == "" || ref.RouteKey == "" {
+			return nil, false, errors.New("registry: invalid node sandbox ref")
+		}
 		out.Sandboxes = append(out.Sandboxes, ref)
 	}
 	buildSet, err := s.nodeLinkRecordSet(nodeID, clusterstate.RecordSetNodeBuild)
@@ -275,6 +304,10 @@ func (s *Stores) getNodeShard(ctx context.Context, nodeID string) (*NodeRecord, 
 		ref, err := clusterstate.DecodeShardValue[clusterstate.NodeBuildRef](rec.Value)
 		if err != nil {
 			return nil, false, err
+		}
+		buildID, ok := clusterstate.ParseNodeBuildRecordKey(rec.Key)
+		if !ok || ref.BuildID != buildID || ref.Group == "" {
+			return nil, false, errors.New("registry: invalid node build ref")
 		}
 		out.Builds = append(out.Builds, ref)
 	}
@@ -293,16 +326,8 @@ func (s *Stores) getNodeShard(ctx context.Context, nodeID string) (*NodeRecord, 
 		}
 		out.ManifestKeys = append(out.ManifestKeys, key)
 	}
-	sort.Slice(out.Sandboxes, func(i, j int) bool {
-		if out.Sandboxes[i].Group != out.Sandboxes[j].Group {
-			return out.Sandboxes[i].Group < out.Sandboxes[j].Group
-		}
-		return out.Sandboxes[i].RouteKey < out.Sandboxes[j].RouteKey
-	})
+	sort.Slice(out.Sandboxes, func(i, j int) bool { return out.Sandboxes[i].SandboxID < out.Sandboxes[j].SandboxID })
 	sort.Slice(out.Builds, func(i, j int) bool {
-		if out.Builds[i].Group != out.Builds[j].Group {
-			return out.Builds[i].Group < out.Builds[j].Group
-		}
 		return out.Builds[i].BuildID < out.Builds[j].BuildID
 	})
 	sortNodeManifestKeys(out.ManifestKeys)
@@ -412,12 +437,12 @@ func clusterRecordMeta(meta shardkv.RecordMeta) clusterstate.RecordMeta {
 }
 
 func isNodeSandboxRecord(key shardkv.RecordKey) bool {
-	_, _, ok := clusterstate.ParseNodeSandboxRecordKey(key)
+	_, ok := clusterstate.ParseNodeSandboxRecordKey(key)
 	return ok
 }
 
 func isNodeBuildRecord(key shardkv.RecordKey) bool {
-	_, _, ok := clusterstate.ParseNodeBuildRecordKey(key)
+	_, ok := clusterstate.ParseNodeBuildRecordKey(key)
 	return ok
 }
 

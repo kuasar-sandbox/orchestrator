@@ -36,10 +36,10 @@ func TestNodeLinkCodecRoundTrip(t *testing.T) {
 	}
 
 	c := roundTrip(t, &Msg{Type: TypeCommand, Rev: 42, Cmd: &Command{
-		CmdID: "x1", Kind: CmdCreate, SID: "s1", Group: "/c/p/a/g1", RouteKey: "u1:sess1",
+		CmdID: "x1", Kind: CmdCreate, SID: "s1", Config: map[string]string{"kuasar-sandbox.cluster": `{"group":"/c/p/a/g1","route_key":"u1:sess1"}`},
 		TemplateRef: "manifest://abc", KeyFingerprint: "e2b_deadbeef",
 	}})
-	if c.Cmd == nil || c.Cmd.Kind != CmdCreate || c.Cmd.Group != "/c/p/a/g1" || c.Rev != 42 {
+	if c.Cmd == nil || c.Cmd.Kind != CmdCreate || c.Cmd.Config["kuasar-sandbox.cluster"] == "" || c.Rev != 42 {
 		t.Fatalf("command round-trip: %+v rev=%d", c.Cmd, c.Rev)
 	}
 	k := roundTrip(t, &Msg{Type: TypeCommand, Cmd: &Command{
@@ -49,12 +49,12 @@ func TestNodeLinkCodecRoundTrip(t *testing.T) {
 		t.Fatalf("key_put ref round-trip: %+v", k.Cmd)
 	}
 
-	// a sandbox route reuses RouteEntry with the cluster fields set
+	// Sandbox routes carry runtime state only; the node-link owner supplies cluster identity.
 	r := roundTrip(t, &Msg{Type: TypeUpsert, Route: &RouteEntry{
-		SandboxID: "s1", State: StateRunning, Group: "/c/p/a/g1", RouteKey: "u1:sess1",
+		SandboxID: "s1", State: StateRunning,
 		FloatingIP: "100.100.96.5", AccessToken: "tok",
 	}})
-	if r.Route == nil || r.Route.Group != "/c/p/a/g1" || r.Route.RouteKey != "u1:sess1" {
+	if r.Route == nil || r.Route.SandboxID != "s1" || r.Route.State != StateRunning {
 		t.Fatalf("sandbox route round-trip: %+v", r.Route)
 	}
 

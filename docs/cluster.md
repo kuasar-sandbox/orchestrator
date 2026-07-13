@@ -252,8 +252,8 @@ owner count 是 registry 内部复制因子。`placer_link.placer_replica_count`
 | `route_link` | group | `sandbox` | route_key | route 记录 |
 | `route_link` | group | `build` | build_id | build 执行态 |
 | `node_link` | node_id | `profile` | `profile` | node profile、labels、liveness、link_owner、低频容量 |
-| `node_link` | node_id | `sandbox` | group + route_key | node 维度 sandbox 清单 |
-| `node_link` | node_id | `build` | group + build_id | node 维度 build 清单 |
+| `node_link` | node_id | `sandbox` | sandbox_id | node 维度 sandbox 归属表,值含 group + route_key |
+| `node_link` | node_id | `build` | build_id | node 维度 build 归属表,值含 group |
 | `node_link` | node_id | `manifest_key` | fingerprint | node key cache |
 | `node_list` | `node_list` | `nodes` | node_id | 低频节点目录和 WATCH_LIST |
 | `placer_link` | `import/source/<source_id>` | `import` | `state` | import source lease/cursor |
@@ -580,13 +580,14 @@ membership 重新解析 owner。
 node_link 维护以下 recordSet:
 
 - `profile`:node_id、labels、runtime_digest、data_endpoint、build_capacity、draining、liveness、link_owner。
-- `sandbox`:该 node 上 sandbox 的 group/route_key/sandbox_id/state。
-- `build`:该 node 上 build 的 group/build_id/state。
+- `sandbox`:该 node 上 sandbox 的 `sandbox_id -> {group,route_key}` 完整归属表。
+- `build`:该 node 上 build 的 `build_id -> group` 完整归属表。
 - `manifest_key`:selector patch 刷新的 key cache。
 
 心跳只更新 `profile` recordSet 中的 runtime/liveness 字段,不得重写 `sandbox`、`build`、`manifest_key`
-recordSet。后三个 recordSet 只能由对应事实事件或 selector patch 更新,避免高频心跳把无关 recordSet 的 CAS
-队列拖慢。
+recordSet。sandbox/build 表由 cluster 在任务下发前写入,终态清理;manifest_key 由 selector patch 更新。
+node 既不生成也不解析 group,只把 sandbox/build metadata 原样保存。这样高频心跳不会把无关 recordSet
+的 CAS 队列拖慢。
 
 node_link 流按事件重要性处理:
 
@@ -596,8 +597,9 @@ node_link 流按事件重要性处理:
 - node 侧发送也分优先级:command ack/build event 先进 high-priority outbox;heartbeat 只保留最新一条。
 - `StreamAuthority` 在写侧优先刷新 route event,避免 route READY/DEAD 排在心跳后面。
 
-这样 Reserve 的 READY route report 不会被心跳持久化阻塞。若 READY 晚于 park timeout 到达,route owner 会按
-当前 `(group,route_key,sandbox_id)` 判定为 orphan 并删除 node 上孤儿 sandbox;但这应是异常退避路径,不是常态。
+这样 Reserve 的 READY route report 不会被心跳持久化阻塞。事件仅携带 sandbox/build ID 与执行态;
+nodelink owner 以 `(node_id,id)` 查本节点归属表得到 group/route_key,再更新 route_link。若 READY 晚于
+park timeout 到达,归属表已删除,该事件被判定为 orphan 并触发 node 上孤儿 sandbox 清理。
 
 高频水位和 liveness 不投影到 node_list。node_list 只承载注册时的 labels/capacity/endpoint/runtime 等目录字段
 以及 draining 变化。node owner 持有的当前 node-link 连接是唯一存活权威；route owner 在 create/build 提交前
@@ -610,8 +612,9 @@ node owner 发起订阅时可传 opaque rev 字符串。推荐编码 `source_fin
 fingerprint 匹配且 changelog 可用时 replay 增量;否则全量 resync。node owner 还应以 1h-6h 随机打散周期
 做全量 resync。
 
-全量 bookmark 表示本轮同步结束。node owner 可用 `(group,route_key,sandbox_id)` 精确比对缺失 sandbox,
-并让 route owner 判定孤儿清理。增量 replay 的 bookmark 只推进 resume token,不做缺失清理。
+全量订阅开始前,nodelink owner 捕获本节点 sandbox 归属表基线。bookmark 表示本轮同步结束时,只清理
+基线中未按 sandbox_id 出现的条目;清理前再次读取并确认当前 `{group,route_key}` 仍等于基线,从而保护
+同步期间新下发或重新绑定的任务。增量 replay 的 bookmark 只推进 resume token,不做缺失清理。
 
 ## 7. node_list
 
@@ -650,8 +653,9 @@ node_link 重建第二条事实传播路径。
 ### 8.1 身份
 
 - 稳定会话身份:`(group, route_key)`。
-- 当前运行实例:`sandbox_id`。它是不透明字符串,可包含保存/恢复代际,外部不解析。
-- cluster 内部总是同时维护 `group`、`route_key`、`sandbox_id`。
+- 当前运行实例:`sandbox_id`。生产创建和跨节点导入都分配全局唯一新 ID,外部不解析。
+- cluster 在 route_link 和 node 归属表中维护 `group`、`route_key`、`sandbox_id`,但 node 事件不携带
+  group,事件定位也不依赖 sandbox/build ID 全局唯一。不存在 cluster 全局 ID 索引。
 
 ### 8.2 route 记录
 
@@ -690,8 +694,12 @@ route_link owner
 placer PlaceSandbox
   │ choose node + access_token + target_port
   ▼
+route owner
+  │ inject canonical {group,route_key} into metadata
+  │ record node_id/sandbox_id ownership
+  ▼
 node owner
-  │ admit + create/connect
+  │ create/connect (metadata is opaque to node)
   ▼
 node reports RUNNING/READY
   │
@@ -706,8 +714,9 @@ Reserve returns READY
 node READY 事件到达后,route owner 通过本地 group WATCH 或短周期 quorum read 唤醒 waiter。router 不订阅
 route_link 更新。
 
-孤儿清理由 route owner 判定:node 上报的 `(group,route_key,sandbox_id)` 在 route_link 中不存在或已被替换,
-则下发 delete/kill 到该 node。该过程不经过数据面,也不依赖 access token。
+孤儿清理由 nodelink owner 和 route owner 共同收敛:先以 `(node_id,sandbox_id)` 查归属表;表项不存在,
+或表项指向的 `(group,route_key)` 已不存在/被其他实例替换,则下发 delete/kill 到该 node。该过程不经过
+数据面,不依赖 access token 或全局 sandbox ID 查询。
 
 ## 9. placer_link 与 placer
 
@@ -774,6 +783,7 @@ cache 不主动删除,由 registry/node 侧 TTL 淘汰。
 router 是无状态北向入口,但持本地缓存:
 
 - route resolution cache:`(group, route_key, sandbox_id)` -> node endpoint / access token / route Rev。
+- build forwarding cache:`(group, build_id)` -> node endpoint;不能只以 build_id 为键。
 - active connection cache:同一路由已有活动 HTTP/CONNECT/WebSocket 时,新请求不调用 Reserve。
 - singleflight:同一 `(group, route_key)` 并发 miss 只发起一次 Reserve。
 
@@ -848,7 +858,7 @@ route owner ReserveBuild
 placer suggests node
   │
   ▼
-node owner AdmitBuild(build_id, resources, ttl)
+node owner AdmitBuild(node_id, build_id, resources)
   │
   ▼
 route_link build record CAS
@@ -860,7 +870,9 @@ node_link build_register command
 node build_event releases/adapts state
 ```
 
-node owner 若资源余量不足直接拒绝,route owner 重新调度。`build_id` 查询必须带 group。
+node owner 的 admission 以 `(node_id,build_id)` 记账;同一 build_id 出现在不同 node 时互不影响。若资源
+余量不足则直接拒绝,route owner 重新调度。build event 只携带 build_id,nodelink owner 查本节点归属表
+得到 group;终态调用 `ReleaseBuild(node_id,build_id)`。北向查询和 router cache 始终带 group。
 
 ## 13. 导入导出
 

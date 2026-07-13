@@ -648,8 +648,12 @@ func (c *Config) validate() error {
 		return fmt.Errorf("config: builder.referer.desc is required when builder.referer.enabled=true")
 	}
 	if c.Builder.Referer.Validity != "" {
-		if _, err := time.ParseDuration(c.Builder.Referer.Validity); err != nil {
+		validity, err := time.ParseDuration(c.Builder.Referer.Validity)
+		if err != nil {
 			return fmt.Errorf("config: builder.referer.validity %q: %w", c.Builder.Referer.Validity, err)
+		}
+		if validity <= 0 {
+			return fmt.Errorf("config: builder.referer.validity must be positive")
 		}
 	}
 	if c.Units.RunnerPoolSize < 0 {

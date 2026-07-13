@@ -10,13 +10,13 @@ func TestShardRecordKeys(t *testing.T) {
 	if got := NodeLinkShard("n1"); got != shardkv.ShardKey("n1") {
 		t.Fatalf("NodeLinkShard=%q", got)
 	}
-	group, routeKey, ok := ParseNodeSandboxRecordKey(NodeSandboxRecordKey("/g", "rk"))
-	if !ok || group != "/g" || routeKey != "rk" {
-		t.Fatalf("node sandbox parse group=%q route=%q ok=%v", group, routeKey, ok)
+	sandboxID, ok := ParseNodeSandboxRecordKey(NodeSandboxRecordKey("sb1"))
+	if !ok || sandboxID != "sb1" {
+		t.Fatalf("node sandbox parse=%q ok=%v", sandboxID, ok)
 	}
-	group, buildID, ok := ParseNodeBuildRecordKey(NodeBuildRecordKey("/g", "b1"))
-	if !ok || group != "/g" || buildID != "b1" {
-		t.Fatalf("node build parse group=%q build=%q ok=%v", group, buildID, ok)
+	buildID, ok := ParseNodeBuildRecordKey(NodeBuildRecordKey("b1"))
+	if !ok || buildID != "b1" {
+		t.Fatalf("node build parse=%q ok=%v", buildID, ok)
 	}
 	fp, ok := ParseNodeManifestKeyRecordKey(NodeManifestKeyRecordKey("fp1"))
 	if !ok || fp != "fp1" {

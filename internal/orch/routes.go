@@ -3,13 +3,11 @@ package orch
 import (
 	"context"
 	"encoding/hex"
-	"encoding/json"
 	"strings"
 	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/keys"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
-	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
@@ -41,17 +39,6 @@ func (o *Orchestrator) routeEntry(sb *types.Sandbox) routesync.RouteEntry {
 		TrafficAccessToken: sb.TrafficAccessToken,
 		SnapshotLocation:   snapshotLocation(sb.SnapshotRef),
 		MmdsSecret:         hex.EncodeToString(keys.MmdsSecret(sb.ManifestKey, sb.ID)),
-	}
-	// Cluster routing identity (node-link): the (group, route_key) the registry
-	// keys SandboxStore by, carried in the cluster metadata namespace (node.md §4.6).
-	if cm := sb.Metadata[sandboxcfg.NsCluster]; cm != "" {
-		var c struct {
-			Group    string `json:"group"`
-			RouteKey string `json:"route_key"`
-		}
-		if json.Unmarshal([]byte(cm), &c) == nil {
-			e.Group, e.RouteKey = c.Group, c.RouteKey
-		}
 	}
 	return e
 }

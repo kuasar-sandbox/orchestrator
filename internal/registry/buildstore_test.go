@@ -36,8 +36,8 @@ func (a *recordingNodeOwner) AdmitBuild(ctx context.Context, nodeID, buildID str
 	return a.allow
 }
 
-func (a *recordingNodeOwner) ReleaseBuild(ctx context.Context, buildID string) {
-	a.released = append(a.released, buildID)
+func (a *recordingNodeOwner) ReleaseBuild(ctx context.Context, nodeID, buildID string) {
+	a.released = append(a.released, nodeID+"/"+buildID)
 }
 
 func (a *recordingNodeOwner) Runtime(ctx context.Context, nodeID string) (*NodeRecord, bool, error) {
@@ -86,9 +86,57 @@ func TestReserveBuildUsesNodeOwnerBoundary(t *testing.T) {
 	if len(admitter.admitted) != 1 || admitter.admitted[0] != "n1/"+res.BuildID {
 		t.Fatalf("admitted=%v, want n1/%s", admitter.admitted, res.BuildID)
 	}
-	reg.applyBuildEvent(ctx, "n1", &routesync.BuildEvent{Group: "/g", BuildID: res.BuildID, State: string(BuildReady)})
-	if len(admitter.released) != 1 || admitter.released[0] != res.BuildID {
-		t.Fatalf("released=%v, want %s", admitter.released, res.BuildID)
+	reg.applyBuildEvent(ctx, "n1", &routesync.BuildEvent{BuildID: res.BuildID, State: string(BuildReady)})
+	if len(admitter.released) != 1 || admitter.released[0] != "n1/"+res.BuildID {
+		t.Fatalf("released=%v, want n1/%s", admitter.released, res.BuildID)
+	}
+}
+
+func TestBuildAdmissionIsNodeScoped(t *testing.T) {
+	m := newBuildAdmissionManager()
+	cap := &routesync.BuildResources{CPU: 1000}
+	want := &routesync.BuildResources{CPU: 1000}
+	if !m.admit("n1", "same-build", cap, want) || !m.admit("n2", "same-build", cap, want) {
+		t.Fatal("same build id on different nodes should have independent admission")
+	}
+	if m.admit("n1", "other-build", cap, want) || m.admit("n2", "other-build", cap, want) {
+		t.Fatal("node-local capacity was not enforced")
+	}
+	m.release("n1", "same-build")
+	if !m.admit("n1", "other-build", cap, want) {
+		t.Fatal("releasing n1 did not free n1 capacity")
+	}
+	if m.admit("n2", "other-build", cap, want) {
+		t.Fatal("releasing n1 incorrectly freed n2 capacity")
+	}
+}
+
+func TestBuildEventsResolveSameIDByNodeOwnerTable(t *testing.T) {
+	ctx := context.Background()
+	reg := testReg(t)
+	for _, tc := range []struct {
+		node  string
+		group string
+	}{
+		{node: "n1", group: "/g1"},
+		{node: "n2", group: "/g2"},
+	} {
+		if err := reg.stores.PutBuild(ctx, &BuildRecord{Group: tc.group, BuildID: "same-build", NodeID: tc.node, State: BuildRegistered}); err != nil {
+			t.Fatal(err)
+		}
+		if err := reg.stores.AddNodeBuildRef(ctx, tc.node, clusterstate.NodeBuildRef{Group: tc.group, BuildID: "same-build"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	reg.applyBuildEvent(ctx, "n1", &routesync.BuildEvent{BuildID: "same-build", State: string(BuildBuilding)})
+	g1, found, err := reg.stores.GetBuildInGroup(ctx, "/g1", "same-build")
+	if err != nil || !found || g1.State != BuildBuilding {
+		t.Fatalf("g1 build=%+v found=%v err=%v", g1, found, err)
+	}
+	g2, found, err := reg.stores.GetBuildInGroup(ctx, "/g2", "same-build")
+	if err != nil || !found || g2.State != BuildRegistered {
+		t.Fatalf("n1 event changed g2 build=%+v found=%v err=%v", g2, found, err)
 	}
 }
 
@@ -273,7 +321,7 @@ func TestReserveBuildResourceAware(t *testing.T) {
 	}
 
 	// The first build finishes → releases the pool → a second build now fits.
-	reg.applyBuildEvent(ctx, "n1", &routesync.BuildEvent{BuildID: r1.BuildID, Group: "/g", State: "ready", TemplateID: "e2b-img-x"})
+	reg.applyBuildEvent(ctx, "n1", &routesync.BuildEvent{BuildID: r1.BuildID, State: "ready", TemplateID: "e2b-img-x"})
 	if rec, _, _ := reg.stores.GetBuildInGroup(ctx, "/g", r1.BuildID); rec.occupies() {
 		t.Fatal("a ready build should not occupy the pool")
 	}

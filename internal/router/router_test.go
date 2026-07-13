@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/clusterclient"
 )
@@ -259,8 +260,8 @@ func textResponse(code int, body string) *http.Response {
 }
 
 // TestBuildRoutingThroughRouter checks the Phase 5 path: a build register
-// reserves a node and the router records build_id -> node, so a follow-up trigger
-// (which carries no group) still routes to the same node.
+// reserves a node and the router records (group, build_id) -> node, so a
+// follow-up trigger routes to the same node.
 func TestBuildRoutingThroughRouter(t *testing.T) {
 	var triggeredBuild string
 	node := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -328,5 +329,50 @@ func TestBuildRoutingThroughRouter(t *testing.T) {
 	}
 	if triggeredBuild != "b1" {
 		t.Fatalf("node saw build %q, want b1 (router build-id routing)", triggeredBuild)
+	}
+}
+
+func TestBuildCacheIsGroupScoped(t *testing.T) {
+	var hits [2]int
+	nodes := make([]*httptest.Server, 2)
+	for i := range nodes {
+		idx := i
+		nodes[i] = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			hits[idx]++
+			w.WriteHeader(http.StatusAccepted)
+		}))
+		defer nodes[i].Close()
+	}
+	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/route-link/verify-key" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer control.Close()
+
+	rt := New(strings.TrimPrefix(control.URL, "http://"), "test.local", 0, nil, slog.Default())
+	rt.builds[buildCacheKey("/g1", "b1")] = buildEntry{node: strings.TrimPrefix(nodes[0].URL, "http://"), at: time.Now()}
+	rt.builds[buildCacheKey("/g2", "b1")] = buildEntry{node: strings.TrimPrefix(nodes[1].URL, "http://"), at: time.Now()}
+	srv := httptest.NewServer(rt.Handler())
+	defer srv.Close()
+
+	for _, group := range []string{"/g1", "/g2"} {
+		req, _ := http.NewRequest(http.MethodPost, srv.URL+"/v2/templates/t1/builds/b1", nil)
+		req.Host = "api.test.local"
+		req.Header.Set(HeaderGroup, group)
+		req.Header.Set(HeaderAPIKey, "e2b_test")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusAccepted {
+			t.Fatalf("group %s status=%d, want 202", group, resp.StatusCode)
+		}
+	}
+	if hits != [2]int{1, 1} {
+		t.Fatalf("node hits=%v, want [1 1]", hits)
 	}
 }

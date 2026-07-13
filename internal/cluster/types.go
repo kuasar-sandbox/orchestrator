@@ -112,7 +112,7 @@ type NodeManifestKey struct {
 type NodeSandboxRef struct {
 	Group     string `json:"group"`
 	RouteKey  string `json:"route_key"`
-	SandboxID string `json:"sandbox_id,omitempty"`
+	SandboxID string `json:"sandbox_id"`
 }
 
 type NodeBuildRef struct {

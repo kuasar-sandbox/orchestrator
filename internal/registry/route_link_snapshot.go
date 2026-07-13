@@ -8,6 +8,8 @@ import (
 	"io"
 	"net/http"
 	"strings"
+
+	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 )
 
 const (
@@ -106,8 +108,13 @@ func (r *Registry) ImportSnapshot(ctx context.Context, rd io.Reader) (SnapshotSu
 			if _, err := r.stores.PutSandbox(ctx, &route); err != nil {
 				return sum, fmt.Errorf("registry snapshot line %d: put route %q/%q: %w", line, route.Group, route.RouteKey, err)
 			}
-			if route.SID != "" {
-				r.indexSID(route.SID, route.Group, route.RouteKey)
+			if route.SID != "" && route.NodeID != "" {
+				if err := r.stores.AddNodeSandboxRef(ctx, route.NodeID, clusterstate.NodeSandboxRef{
+					SandboxID: route.SID, Group: route.Group, RouteKey: route.RouteKey,
+				}); err != nil {
+					_ = r.stores.DeleteSandbox(ctx, route.Group, route.RouteKey)
+					return sum, fmt.Errorf("registry snapshot line %d: put node sandbox %q: %w", line, route.SID, err)
+				}
 			}
 			sum.Routes++
 		case SnapshotKindBuild:
@@ -117,6 +124,12 @@ func (r *Registry) ImportSnapshot(ctx context.Context, rd io.Reader) (SnapshotSu
 			build := *rec.Build
 			if err := r.stores.PutBuild(ctx, &build); err != nil {
 				return sum, fmt.Errorf("registry snapshot line %d: put build %q/%q: %w", line, build.Group, build.BuildID, err)
+			}
+			if build.occupies() && build.NodeID != "" {
+				if err := r.stores.AddNodeBuildRef(ctx, build.NodeID, clusterstate.NodeBuildRef{BuildID: build.BuildID, Group: build.Group}); err != nil {
+					_ = r.stores.DeleteBuild(ctx, build.Group, build.BuildID)
+					return sum, fmt.Errorf("registry snapshot line %d: put node build %q: %w", line, build.BuildID, err)
+				}
 			}
 			sum.Builds++
 		default:

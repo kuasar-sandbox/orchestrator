@@ -3,11 +3,15 @@ package orch
 import (
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/google/uuid"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/apikey"
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
@@ -16,8 +20,8 @@ import (
 
 // TestExportImportRoundTrip exercises the migration core that connect's auto-import
 // builds on: export (move) mints a token and relinquishes the source; import on a
-// node with the tenant key + matching runtime re-inserts the paused row; re-import
-// is rejected.
+// node with the tenant key + matching runtime inserts a paused row with a fresh
+// globally unique id.
 func TestExportImportRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	rt := filepath.Join(dir, "rt-e2b.erofs")
@@ -43,7 +47,7 @@ func TestExportImportRoundTrip(t *testing.T) {
 		ManifestKey: mk, SnapshotRef: "manifest://" + strings.Repeat("b", 64),
 		RunDir: dir + "/run/" + sid, BaseDir: dir + "/lib/" + sid,
 		Env: map[string]string{"FOO": "bar"}, Metadata: map[string]string{"k": "v"},
-		CreatedUnix: 1,
+		CreatedUnix: 1, EnvdAccessToken: "source-envd-token", TrafficAccessToken: "source-traffic-token",
 	}
 	if err := o.st.Put(ctx, sb); err != nil {
 		t.Fatal(err)
@@ -62,20 +66,50 @@ func TestExportImportRoundTrip(t *testing.T) {
 	if s := o.lookup(sid); s != nil {
 		t.Fatalf("move export should uncache the source row: %+v", s)
 	}
+	rawToken, err := base64.StdEncoding.DecodeString(tok)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var tokenFields map[string]json.RawMessage
+	if err := json.Unmarshal(rawToken, &tokenFields); err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{"id", "created_unix", "envd_access_token", "traffic_access_token"} {
+		if _, found := tokenFields[field]; found {
+			t.Fatalf("migration token retained identity field %q", field)
+		}
+	}
 
-	// import: re-inserts the paused row (the snapshot persists in the remote store).
+	// Import allocates a fresh UUIDv7 while preserving the portable snapshot state.
 	imported, err := o.ImportSandbox(ctx, apiKey, tok)
-	if err != nil || imported != sid {
+	if err != nil || imported == sid {
 		t.Fatalf("import: imported=%q err=%v", imported, err)
 	}
-	got, _ := o.st.Get(ctx, sid)
+	parsed, err := uuid.Parse(imported)
+	if err != nil || parsed.Version() != 7 {
+		t.Fatalf("imported id=%q, want UUIDv7: %v", imported, err)
+	}
+	got, _ := o.st.Get(ctx, imported)
 	if got == nil || got.State != types.StatePaused || got.Env["FOO"] != "bar" || got.SnapshotRef != sb.SnapshotRef {
 		t.Fatalf("imported row wrong: %+v", got)
 	}
+	if got.EnvdAccessToken == "" || got.TrafficAccessToken == "" ||
+		got.EnvdAccessToken == sb.EnvdAccessToken || got.TrafficAccessToken == sb.TrafficAccessToken {
+		t.Fatalf("import reused source data-plane credentials: %+v", got)
+	}
+	if got.CreatedUnix == sb.CreatedUnix {
+		t.Fatalf("import preserved source creation identity: got %d", got.CreatedUnix)
+	}
 
-	// re-import is rejected (already present on this node).
-	if _, err := o.ImportSandbox(ctx, apiKey, tok); err == nil {
-		t.Fatal("re-import should error (sandbox already exists)")
+	// Reusing a portable token creates another independently addressable sandbox;
+	// neither import reuses the source id or collides with the other.
+	importedAgain, err := o.ImportSandbox(ctx, apiKey, tok)
+	if err != nil || importedAgain == sid || importedAgain == imported {
+		t.Fatalf("second import=%q first=%q source=%q err=%v", importedAgain, imported, sid, err)
+	}
+	gotAgain, _ := o.st.Get(ctx, importedAgain)
+	if gotAgain == nil || gotAgain.EnvdAccessToken == got.EnvdAccessToken || gotAgain.TrafficAccessToken == got.TrafficAccessToken {
+		t.Fatalf("second import did not mint independent credentials: first=%+v second=%+v", got, gotAgain)
 	}
 }
 
