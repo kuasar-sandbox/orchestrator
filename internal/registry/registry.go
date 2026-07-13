@@ -497,7 +497,11 @@ func (r *Registry) rollbackReserve(group, routeKey string, orig *SandboxRecord, 
 		if cur.NodeID != "" && (cur.NodeID != orig.NodeID || cur.SID != orig.SID) {
 			_ = r.stores.RemoveNodeSandboxRef(ctx, cur.NodeID, group, routeKey, cur.SID)
 		}
-		_, _ = r.stores.PutSandbox(ctx, orig)
+		if _, err := r.stores.PutSandbox(ctx, orig); err == nil && orig.NodeID != "" {
+			_ = r.stores.AddNodeSandboxRef(ctx, orig.NodeID, clusterstate.NodeSandboxRef{
+				Group: group, RouteKey: routeKey, SandboxID: orig.SID,
+			})
+		}
 	} else {
 		_ = r.stores.DeleteSandbox(ctx, group, routeKey)
 		if cur.NodeID != "" {
@@ -589,6 +593,9 @@ func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, c
 			return ErrNoNode
 		}
 		if err := r.nodeRuntimeLive(ctx, nodeID); err != nil {
+			if !errors.Is(err, ErrNodeGone) {
+				return err
+			}
 			lastFailure = err
 			excluded.add(nodeID)
 			continue
@@ -1063,10 +1070,10 @@ func (r *Registry) removeNode(c nodeConn) {
 }
 
 // updateNodeRegister upserts the node table row from a node's register frame.
-func (r *Registry) updateNodeRegister(ctx context.Context, nr *routesync.NodeRegister) error {
+func (r *Registry) updateNodeRegister(ctx context.Context, nr *routesync.NodeRegister) (*NodeRecord, error) {
 	rec, found, err := r.getNodeForLinkUpdate(ctx, nr.NodeID)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if !found {
 		rec = &NodeRecord{}
@@ -1080,17 +1087,16 @@ func (r *Registry) updateNodeRegister(ctx context.Context, nr *routesync.NodeReg
 	rec.LastHeartbeatUnix = time.Now().Unix()
 	rec.LinkOwner = r.stores.WriterID()
 	if _, err := r.stores.putNodeLink(ctx, rec); err != nil {
-		return err
+		return nil, err
 	}
-	return nil
+	return rec, nil
 }
 
-func (r *Registry) projectRegisteredNode(ctx context.Context, nodeID string) {
-	if _, live := r.node(nodeID); !live {
+func (r *Registry) projectRegisteredNode(ctx context.Context, rec *NodeRecord) {
+	if rec == nil {
 		return
 	}
-	rec, found, err := r.getNodeForLinkUpdate(ctx, nodeID)
-	if err != nil || !found {
+	if _, live := r.node(rec.NodeID); !live {
 		return
 	}
 	r.putNodeListProjection(ctx, rec)

@@ -13,12 +13,15 @@ import (
 )
 
 type recordingNodeOwner struct {
-	allow    bool
-	admitted []string
-	released []string
-	ack      *routesync.CmdAck
-	ackErr   error
+	allow        bool
+	admitted     []string
+	released     []string
+	connectedErr error
+	ack          *routesync.CmdAck
+	ackErr       error
 }
+
+func (a *recordingNodeOwner) Connected(context.Context, string) error { return a.connectedErr }
 
 func (a *recordingNodeOwner) PutManifestKey(ctx context.Context, nodeID, fingerprint, keyType, keyValue string, expiresUnix int64) error {
 	return nil
@@ -178,6 +181,25 @@ func TestReserveBuildSkipsDisconnectedCatalogNode(t *testing.T) {
 	}
 }
 
+func TestReserveBuildDoesNotExcludeOnConnectionCheckError(t *testing.T) {
+	ctx := context.Background()
+	placements := 0
+	reg := New(NewStores(), placementFunc(func(context.Context, PlaceRequest) (*Placement, error) {
+		placements++
+		return &Placement{NodeID: "n1"}, nil
+	}), time.Second, nil)
+	checkErr := errors.New("node owner temporarily unavailable")
+	owner := &recordingNodeOwner{allow: true, connectedErr: checkErr}
+	reg.SetNodeOwner(owner)
+
+	if _, err := reg.ReserveBuild(ctx, BuildReserveReq{Group: "/g"}); !errors.Is(err, checkErr) {
+		t.Fatalf("ReserveBuild err=%v, want connection check error", err)
+	}
+	if placements != 1 || len(owner.admitted) != 0 {
+		t.Fatalf("connection check error retried/admitted: placements=%d admitted=%v", placements, owner.admitted)
+	}
+}
+
 func TestLocalNodeOwnerRequiresLiveConnection(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
@@ -198,6 +220,22 @@ func TestLocalNodeOwnerRequiresLiveConnection(t *testing.T) {
 	}
 	if !reg.localNodeOwner.AdmitBuild(ctx, "n1", "b1", &routesync.BuildResources{CPU: 1000}) {
 		t.Fatal("connected node was not admitted for build")
+	}
+}
+
+func TestLocalNodeOwnerConnectedDoesNotRequireProfile(t *testing.T) {
+	ctx := context.Background()
+	reg := testReg(t)
+	reg.addNode(&fakeConn{nodeID: "n1"})
+
+	if err := reg.localNodeOwner.Connected(ctx, "n1"); err != nil {
+		t.Fatalf("Connected: %v", err)
+	}
+	if _, found, err := reg.localNodeOwner.Runtime(ctx, "n1"); err != nil || found {
+		t.Fatalf("Runtime found=%v err=%v, want missing profile", found, err)
+	}
+	if err := reg.nodeRuntimeLive(ctx, "n1"); err != nil {
+		t.Fatalf("liveness check depended on profile: %v", err)
 	}
 }
 

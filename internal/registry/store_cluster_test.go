@@ -510,7 +510,7 @@ func TestNodeOwnerUsesProfileReadWhenLocalIsNotNodeShardOwner(t *testing.T) {
 	}
 }
 
-func TestRoutingNodeOwnerFallsBackToShardOwnerWhenProfileMissing(t *testing.T) {
+func TestRoutingNodeOwnerProbesShardOwnerWhenProfileReadFails(t *testing.T) {
 	ctx := context.Background()
 	view := clusterstate.MemberView{Version: 1, Members: []string{"a", "b", "c"}}
 	cluster := newShardStoreCluster(t, view.Members, 1, 1, 1, 1)
@@ -522,7 +522,60 @@ func TestRoutingNodeOwnerFallsBackToShardOwnerWhenProfileMissing(t *testing.T) {
 	remote := &routingNodeOwnerRecorder{allow: true}
 	reg := New(cluster["a"], nil, time.Second, nil)
 	reg.SetRemoteNodeOwners(map[string]NodeOwner{owners[0]: remote})
+	delete(cluster, owners[0])
+	if _, _, err := reg.stores.GetNodeProfile(ctx, nodeID); err == nil {
+		t.Fatal("profile read unexpectedly succeeded without its shard owner")
+	}
+	if err := reg.nodeOwner.Connected(ctx, nodeID); err != nil {
+		t.Fatalf("Connected: %v", err)
+	}
+	if len(remote.connected) != 1 || remote.connected[0] != nodeID {
+		t.Fatalf("remote connected probes=%v, want %s", remote.connected, nodeID)
+	}
 
+	if err := reg.nodeOwner.SendCommand(ctx, nodeID, &routesync.Command{Kind: routesync.CmdDelete, SID: "sb1"}); err != nil {
+		t.Fatalf("SendCommand: %v", err)
+	}
+	if len(remote.deleted) != 1 || remote.deleted[0] != nodeID+"/"+routesync.CmdDelete {
+		t.Fatalf("remote deleted=%v", remote.deleted)
+	}
+}
+
+func TestRoutingNodeOwnerUsesConnectedShardOwnerWhenLocalIsCandidate(t *testing.T) {
+	ctx := context.Background()
+	cluster := newShardStoreCluster(t, []string{"a", "b", "c"}, 1, 2, 1, 1)
+
+	var nodeID, remoteID string
+	for i := 0; i < 1000; i++ {
+		candidate := fmt.Sprintf("node-local-candidate-%d", i)
+		owners, err := cluster["a"].NodeOwnerCandidates(ctx, candidate)
+		if err != nil {
+			t.Fatal(err)
+		}
+		localCandidate := false
+		for _, owner := range owners {
+			if owner == "a" {
+				localCandidate = true
+			} else if owner != "" {
+				remoteID = owner
+			}
+		}
+		if localCandidate && remoteID != "" {
+			nodeID = candidate
+			break
+		}
+		remoteID = ""
+	}
+	if nodeID == "" {
+		t.Fatal("could not find node with local and remote shard owners")
+	}
+
+	remote := &routingNodeOwnerRecorder{allow: true}
+	reg := New(cluster["a"], nil, time.Second, nil)
+	reg.SetRemoteNodeOwners(map[string]NodeOwner{remoteID: remote})
+	if err := reg.nodeOwner.Connected(ctx, nodeID); err != nil {
+		t.Fatalf("Connected: %v", err)
+	}
 	if err := reg.nodeOwner.SendCommand(ctx, nodeID, &routesync.Command{Kind: routesync.CmdDelete, SID: "sb1"}); err != nil {
 		t.Fatalf("SendCommand: %v", err)
 	}
@@ -540,7 +593,7 @@ func TestNodeRegisterUsesProfileReadWhenLocalIsNotNodeShardOwner(t *testing.T) {
 		t.Fatalf("seed node: %v", err)
 	}
 	reg := New(cluster["a"], nil, time.Second, nil)
-	if err := reg.updateNodeRegister(ctx, &routesync.NodeRegister{
+	if _, err := reg.updateNodeRegister(ctx, &routesync.NodeRegister{
 		NodeID: nodeID, Capacity: 10, DataEndpoint: "new", Labels: map[string]string{"pool": "p"},
 	}); err != nil {
 		t.Fatalf("non-owner node register: %v", err)
@@ -554,12 +607,13 @@ func TestNodeRegisterUsesProfileReadWhenLocalIsNotNodeShardOwner(t *testing.T) {
 func TestNodeRegisterProjectsOnlyAfterConnectionIsLive(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
-	if err := reg.updateNodeRegister(ctx, &routesync.NodeRegister{
+	registered, err := reg.updateNodeRegister(ctx, &routesync.NodeRegister{
 		NodeID: "n1", Capacity: 10, DataEndpoint: "127.0.0.1:19001",
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatal(err)
 	}
-	reg.projectRegisteredNode(ctx, "n1")
+	reg.projectRegisteredNode(ctx, registered)
 	found := false
 	if err := reg.stores.RangeNodeList(ctx, func(entry clusterstate.NodeListEntry) error {
 		found = found || entry.NodeID == "n1"
@@ -572,7 +626,7 @@ func TestNodeRegisterProjectsOnlyAfterConnectionIsLive(t *testing.T) {
 	}
 
 	reg.addNode(&fakeConn{nodeID: "n1"})
-	reg.projectRegisteredNode(ctx, "n1")
+	reg.projectRegisteredNode(ctx, registered)
 	if err := reg.stores.RangeNodeList(ctx, func(entry clusterstate.NodeListEntry) error {
 		found = found || entry.NodeID == "n1"
 		return nil
@@ -584,6 +638,55 @@ func TestNodeRegisterProjectsOnlyAfterConnectionIsLive(t *testing.T) {
 	}
 }
 
+func TestRegisteredNodeProjectionDoesNotReReadProfile(t *testing.T) {
+	ctx := context.Background()
+	view := clusterstate.MemberView{Version: 1, Members: []string{"a", "b", "c"}}
+	nodeListOwners, err := view.Owners(string(clusterstate.NodeListShard), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var nodeID, profileOwner string
+	for i := 0; i < 1000; i++ {
+		candidate := fmt.Sprintf("projection-node-%d", i)
+		owners, err := view.Owners(candidate, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if owners[0] != "a" && owners[0] != nodeListOwners[0] {
+			nodeID, profileOwner = candidate, owners[0]
+			break
+		}
+	}
+	if nodeID == "" {
+		t.Fatal("failed to choose disjoint node profile and node_list owners")
+	}
+	cluster := newShardStoreCluster(t, view.Members, 1, 1, 1, 1)
+	reg := New(cluster["a"], nil, time.Second, nil)
+	registered, err := reg.updateNodeRegister(ctx, &routesync.NodeRegister{
+		NodeID: nodeID, Capacity: 10, DataEndpoint: "127.0.0.1:19001",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reg.addNode(&fakeConn{nodeID: nodeID})
+	delete(cluster, profileOwner)
+	if _, _, err := reg.stores.GetNodeProfile(ctx, nodeID); err == nil {
+		t.Fatal("profile read unexpectedly succeeded without its shard owner")
+	}
+
+	reg.projectRegisteredNode(ctx, registered)
+	found := false
+	if err := reg.stores.RangeNodeList(ctx, func(entry clusterstate.NodeListEntry) error {
+		found = found || entry.NodeID == nodeID
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !found {
+		t.Fatal("committed registration was not projected after profile read became unavailable")
+	}
+}
+
 func TestNodeRegisterDoesNotFailWhenNodeListProjectionUnavailable(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -592,13 +695,14 @@ func TestNodeRegisterDoesNotFailWhenNodeListProjectionUnavailable(t *testing.T) 
 	nodeID := nodeOwnedBy(t, stores, "a")
 	reg := New(stores, nil, time.Second, nil)
 
-	if err := reg.updateNodeRegister(ctx, &routesync.NodeRegister{
+	registered, err := reg.updateNodeRegister(ctx, &routesync.NodeRegister{
 		NodeID: nodeID, Capacity: 10, DataEndpoint: "127.0.0.1:19001", Labels: map[string]string{"pool": "p"},
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("updateNodeRegister should keep node_link alive when node_list projection fails: %v", err)
 	}
 	reg.addNode(&fakeConn{nodeID: nodeID})
-	reg.projectRegisteredNode(ctx, nodeID)
+	reg.projectRegisteredNode(ctx, registered)
 	profile, found, err := stores.GetNodeProfile(ctx, nodeID)
 	if err != nil || !found || profile.DataEndpoint != "127.0.0.1:19001" || profile.LinkOwner != "a" {
 		t.Fatalf("profile after register=%+v found=%v err=%v", profile, found, err)
@@ -616,13 +720,14 @@ func TestNodeRegisterRetriesNodeListProjectionAfterQuorumRecovers(t *testing.T) 
 	nodeID := nodeOwnedBy(t, cluster["a"], "a")
 	reg := New(cluster["a"], nil, time.Second, nil)
 
-	if err := reg.updateNodeRegister(ctx, &routesync.NodeRegister{
+	registered, err := reg.updateNodeRegister(ctx, &routesync.NodeRegister{
 		NodeID: nodeID, Capacity: 10, DataEndpoint: "127.0.0.1:19001", Labels: map[string]string{"pool": "p"},
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("updateNodeRegister: %v", err)
 	}
 	reg.addNode(&fakeConn{nodeID: nodeID})
-	reg.projectRegisteredNode(ctx, nodeID)
+	reg.projectRegisteredNode(ctx, registered)
 
 	transport := shardkv.TransportFunc(func(ctx context.Context, member shardkv.MemberID, req shardkv.Request) (shardkv.Response, error) {
 		store := cluster[string(member)]
@@ -661,11 +766,12 @@ func TestConcurrentHeartbeatsDoNotRewriteNodeListAcrossDeadAfter(t *testing.T) {
 	const nodes = 8
 	for i := 0; i < nodes; i++ {
 		nodeID := fmt.Sprintf("n-%d", i)
-		if err := reg.updateNodeRegister(ctx, &routesync.NodeRegister{NodeID: nodeID, Capacity: 1}); err != nil {
+		registered, err := reg.updateNodeRegister(ctx, &routesync.NodeRegister{NodeID: nodeID, Capacity: 1})
+		if err != nil {
 			t.Fatalf("register %s: %v", nodeID, err)
 		}
 		reg.addNode(&fakeConn{nodeID: nodeID})
-		reg.projectRegisteredNode(ctx, nodeID)
+		reg.projectRegisteredNode(ctx, registered)
 	}
 	before, err := reg.stores.NodeListRev(ctx)
 	if err != nil {
@@ -927,11 +1033,17 @@ func assertPlacerImportShardOwners(t *testing.T, ctx context.Context, stores map
 }
 
 type routingNodeOwnerRecorder struct {
-	allow    bool
-	keys     []string
-	admitted []string
-	deleted  []string
-	released []string
+	allow     bool
+	connected []string
+	keys      []string
+	admitted  []string
+	deleted   []string
+	released  []string
+}
+
+func (r *routingNodeOwnerRecorder) Connected(ctx context.Context, nodeID string) error {
+	r.connected = append(r.connected, nodeID)
+	return nil
 }
 
 func (r *routingNodeOwnerRecorder) PutManifestKey(ctx context.Context, nodeID, fingerprint, keyType, keyValue string, expiresUnix int64) error {

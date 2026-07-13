@@ -94,6 +94,9 @@ func (r *Registry) ReserveBuild(ctx context.Context, req BuildReserveReq) (*Buil
 			return nil, ErrNoNode
 		}
 		if err := r.nodeRuntimeLive(ctx, id); err != nil {
+			if !errors.Is(err, ErrNodeGone) {
+				return nil, err
+			}
 			lastFailure = err
 			excluded.add(id)
 			continue

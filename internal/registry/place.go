@@ -41,14 +41,7 @@ func (r *Registry) nodeRuntimeLive(ctx context.Context, nodeID string) error {
 	if r.nodeOwner == nil {
 		return ErrNodeGone
 	}
-	node, found, err := r.nodeOwner.Runtime(ctx, nodeID)
-	if err != nil {
-		return err
-	}
-	if !found || node == nil {
-		return ErrNodeGone
-	}
-	return nil
+	return r.nodeOwner.Connected(ctx, nodeID)
 }
 
 func sameSandboxGeneration(a, b *SandboxRecord) bool {

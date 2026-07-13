@@ -11,6 +11,7 @@ import (
 )
 
 type NodeOwner interface {
+	Connected(ctx context.Context, nodeID string) error
 	PutManifestKey(ctx context.Context, nodeID, fingerprint, keyType, keyValue string, expiresUnix int64) error
 	DropManifestKey(ctx context.Context, nodeID, fingerprint string) error
 	AdmitBuild(ctx context.Context, nodeID, buildID string, want *routesync.BuildResources) bool
@@ -28,6 +29,16 @@ type localNodeOwner struct {
 
 func newLocalNodeOwner(reg *Registry) *localNodeOwner {
 	return &localNodeOwner{reg: reg, leases: newBuildAdmissionManager()}
+}
+
+func (o *localNodeOwner) Connected(ctx context.Context, nodeID string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if _, live := o.reg.node(nodeID); !live {
+		return ErrNodeGone
+	}
+	return nil
 }
 
 func (o *localNodeOwner) PutManifestKey(ctx context.Context, nodeID, fingerprint, keyType, keyValue string, expiresUnix int64) error {
@@ -105,8 +116,8 @@ func (o *localNodeOwner) ReleaseBuild(ctx context.Context, buildID string) {
 }
 
 func (o *localNodeOwner) Runtime(ctx context.Context, nodeID string) (*NodeRecord, bool, error) {
-	if _, live := o.reg.node(nodeID); !live {
-		return nil, false, ErrNodeGone
+	if err := o.Connected(ctx, nodeID); err != nil {
+		return nil, false, err
 	}
 	return o.reg.stores.GetNodeProfile(ctx, nodeID)
 }
@@ -168,15 +179,19 @@ func newRoutingNodeOwner(reg *Registry, local NodeOwner, remotes map[string]Node
 func (o *routingNodeOwner) ownerFor(ctx context.Context, nodeID string) NodeOwner {
 	node, found, err := o.reg.stores.GetNodeProfile(ctx, nodeID)
 	if err == nil && found && node.LinkOwner != "" {
-		if node.LinkOwner == o.reg.stores.WriterID() {
-			return o.local
-		}
-		if remote := o.remotes[node.LinkOwner]; remote != nil {
-			return remote
-		}
-		return missingNodeOwner{memberID: node.LinkOwner}
+		return o.ownerByMember(node.LinkOwner)
 	}
 	return o.ownerForShard(ctx, nodeID)
+}
+
+func (o *routingNodeOwner) ownerByMember(memberID string) NodeOwner {
+	if memberID == o.reg.stores.WriterID() {
+		return o.local
+	}
+	if remote := o.remotes[memberID]; remote != nil {
+		return remote
+	}
+	return missingNodeOwner{memberID: memberID}
 }
 
 func (o *routingNodeOwner) ownerForShard(ctx context.Context, nodeID string) NodeOwner {
@@ -184,22 +199,65 @@ func (o *routingNodeOwner) ownerForShard(ctx context.Context, nodeID string) Nod
 	if err != nil || len(owners) == 0 {
 		return o.local
 	}
-	local := o.reg.stores.WriterID()
-	for _, owner := range owners {
-		if owner == local {
-			return o.local
-		}
-	}
-	for _, owner := range owners {
-		if owner == "" {
+	var fallback NodeOwner
+	var uncertain NodeOwner
+	for _, memberID := range owners {
+		if memberID == "" {
 			continue
 		}
-		if remote := o.remotes[owner]; remote != nil {
-			return remote
+		candidate := o.ownerByMember(memberID)
+		if fallback == nil {
+			fallback = candidate
 		}
-		return missingNodeOwner{memberID: owner}
+		probeErr := candidate.Connected(ctx, nodeID)
+		if probeErr == nil {
+			return candidate
+		}
+		if !errors.Is(probeErr, ErrNodeGone) && uncertain == nil {
+			uncertain = candidate
+		}
+	}
+	if uncertain != nil {
+		return uncertain
+	}
+	if fallback != nil {
+		return fallback
 	}
 	return o.local
+}
+
+func (o *routingNodeOwner) Connected(ctx context.Context, nodeID string) error {
+	node, found, err := o.reg.stores.GetNodeProfile(ctx, nodeID)
+	if err == nil && found && node.LinkOwner != "" {
+		return o.ownerByMember(node.LinkOwner).Connected(ctx, nodeID)
+	}
+	owners, ownerErr := o.reg.stores.NodeOwnerCandidates(ctx, nodeID)
+	if ownerErr != nil {
+		if err != nil {
+			return err
+		}
+		return ownerErr
+	}
+	var uncertain error
+	for _, memberID := range owners {
+		if memberID == "" {
+			continue
+		}
+		probeErr := o.ownerByMember(memberID).Connected(ctx, nodeID)
+		if probeErr == nil {
+			return nil
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if !errors.Is(probeErr, ErrNodeGone) && uncertain == nil {
+			uncertain = probeErr
+		}
+	}
+	if uncertain != nil {
+		return uncertain
+	}
+	return ErrNodeGone
 }
 
 func (o *routingNodeOwner) PutManifestKey(ctx context.Context, nodeID, fingerprint, keyType, keyValue string, expiresUnix int64) error {
@@ -240,6 +298,8 @@ func (o *routingNodeOwner) SendCommandAndWait(ctx context.Context, nodeID string
 type missingNodeOwner struct{ memberID string }
 
 func (o missingNodeOwner) err() error { return ErrNodeGone }
+
+func (o missingNodeOwner) Connected(context.Context, string) error { return o.err() }
 
 func (o missingNodeOwner) PutManifestKey(context.Context, string, string, string, string, int64) error {
 	return o.err()

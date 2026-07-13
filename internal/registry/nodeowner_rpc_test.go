@@ -12,11 +12,17 @@ import (
 )
 
 type rpcNodeOwner struct {
-	ops        []string
-	admit      bool
-	released   []string
-	ackErr     error
-	runtimeErr error
+	ops          []string
+	admit        bool
+	released     []string
+	ackErr       error
+	runtimeErr   error
+	connectedErr error
+}
+
+func (o *rpcNodeOwner) Connected(ctx context.Context, nodeID string) error {
+	o.ops = append(o.ops, "connected:"+nodeID)
+	return o.connectedErr
 }
 
 func (o *rpcNodeOwner) PutManifestKey(ctx context.Context, nodeID, fingerprint, keyType, keyValue string, expiresUnix int64) error {
@@ -72,6 +78,9 @@ func TestHTTPNodeOwner(t *testing.T) {
 	defer srv.Close()
 
 	client := NewHTTPNodeOwner(srv.URL, srv.Client())
+	if err := client.Connected(ctx, "n1"); err != nil {
+		t.Fatal(err)
+	}
 	if err := client.PutManifestKey(ctx, "n1", "fp", "inline", "mk", 123); err != nil {
 		t.Fatal(err)
 	}
@@ -96,7 +105,7 @@ func TestHTTPNodeOwner(t *testing.T) {
 	if err != nil || ack == nil || ack.Status != routesync.AckAccepted {
 		t.Fatalf("send wait ack=%+v err=%v", ack, err)
 	}
-	wantOps := []string{"put:n1:fp:inline:mk", "drop:n1:fp", "admit:n1:b1", "delete:n1:sb1", "send:n1:delete", "wait:n1:create"}
+	wantOps := []string{"connected:n1", "put:n1:fp:inline:mk", "drop:n1:fp", "admit:n1:b1", "delete:n1:sb1", "send:n1:delete", "wait:n1:create"}
 	if len(owner.ops) != len(wantOps) {
 		t.Fatalf("ops=%v want %v", owner.ops, wantOps)
 	}
@@ -126,13 +135,16 @@ func TestHTTPNodeOwnerPreservesCommandWaitDeadline(t *testing.T) {
 }
 
 func TestHTTPNodeOwnerPreservesNodeGone(t *testing.T) {
-	owner := &rpcNodeOwner{runtimeErr: ErrNodeGone}
+	owner := &rpcNodeOwner{runtimeErr: ErrNodeGone, connectedErr: ErrNodeGone}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ServeNodeOwner(w, r, owner)
 	}))
 	defer srv.Close()
 
 	client := NewHTTPNodeOwner(srv.URL, srv.Client())
+	if err := client.Connected(context.Background(), "n1"); !errors.Is(err, ErrNodeGone) {
+		t.Fatalf("Connected err=%v, want ErrNodeGone", err)
+	}
 	if _, _, err := client.Runtime(context.Background(), "n1"); !errors.Is(err, ErrNodeGone) {
 		t.Fatalf("Runtime err=%v, want ErrNodeGone", err)
 	}

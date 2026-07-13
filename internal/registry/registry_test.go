@@ -634,7 +634,7 @@ func TestSelectorPatchCachesKeysInNodeLink(t *testing.T) {
 	}
 
 	registered := &routesync.NodeRegister{NodeID: "n1", Capacity: 10, DataEndpoint: "10.0.0.1:8443"}
-	if err := reg.updateNodeRegister(ctx, registered); err != nil {
+	if _, err := reg.updateNodeRegister(ctx, registered); err != nil {
 		t.Fatalf("updateNodeRegister: %v", err)
 	}
 	node, found, err = reg.stores.GetNode(ctx, "n1")
@@ -776,10 +776,11 @@ type remoteLifecycleOwner struct {
 }
 
 type remoteRouteWriteOwner struct {
-	node     *NodeRecord
-	onCreate func(*routesync.Command)
-	ackErr   error
-	commands int
+	node         *NodeRecord
+	onCreate     func(*routesync.Command)
+	connectedErr error
+	ackErr       error
+	commands     int
 }
 
 func (o *remoteRouteWriteOwner) PutManifestKey(context.Context, string, string, string, string, int64) error {
@@ -793,6 +794,16 @@ func (o *remoteRouteWriteOwner) AdmitBuild(context.Context, string, string, *rou
 }
 
 func (o *remoteRouteWriteOwner) ReleaseBuild(context.Context, string) {}
+
+func (o *remoteRouteWriteOwner) Connected(context.Context, string) error {
+	if o.connectedErr != nil {
+		return o.connectedErr
+	}
+	if o.node == nil {
+		return ErrNodeGone
+	}
+	return nil
+}
 
 func (o *remoteRouteWriteOwner) Runtime(context.Context, string) (*NodeRecord, bool, error) {
 	return o.node, o.node != nil, nil
@@ -859,6 +870,17 @@ func (o *concurrentManifestKeyOwner) PutManifestKey(context.Context, string, str
 	case <-time.After(time.Second):
 		return errors.New("manifest key writes were serialized")
 	}
+}
+
+func (o *remoteLifecycleOwner) Connected(ctx context.Context, nodeID string) error {
+	_, found, err := o.Runtime(ctx, nodeID)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return ErrNodeGone
+	}
+	return nil
 }
 
 func (o *remoteLifecycleOwner) PutManifestKey(ctx context.Context, nodeID, fingerprint, keyType, keyValue string, expiresUnix int64) error {
@@ -1346,6 +1368,33 @@ func TestRollbackReserveDropsReplacementNodeRef(t *testing.T) {
 	}
 }
 
+func TestRollbackReserveRestoresOriginalSameNodeRef(t *testing.T) {
+	ctx := context.Background()
+	reg := testReg(t)
+	orig := &SandboxRecord{Group: "/g", RouteKey: "rk", SID: "sb-old", State: StateReady, NodeID: "n1"}
+	reserved := &SandboxRecord{Group: "/g", RouteKey: "rk", SID: "sb-new", State: StateReserved, NodeID: "n1"}
+	if _, err := reg.stores.PutSandbox(ctx, reserved); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.stores.AddNodeSandboxRef(ctx, "n1", clusterstate.NodeSandboxRef{
+		Group: "/g", RouteKey: "rk", SandboxID: "sb-new",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	reg.rollbackReserve("/g", "rk", orig, true)
+	node, found, err := reg.stores.GetNode(ctx, "n1")
+	if err != nil || !found {
+		t.Fatalf("node=%+v found=%v err=%v", node, found, err)
+	}
+	if len(node.Sandboxes) != 1 || node.Sandboxes[0].SandboxID != "sb-old" {
+		t.Fatalf("same-node rollback refs=%+v, want sb-old", node.Sandboxes)
+	}
+}
+
 func TestReplaceOnRejectSucceeds(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
@@ -1427,6 +1476,27 @@ func TestReserveSandboxSkipsDisconnectedCatalogNode(t *testing.T) {
 	}
 	if res.NodeID != "live" || !sawExclusion {
 		t.Fatalf("result=%+v saw stale exclusion=%v", res, sawExclusion)
+	}
+}
+
+func TestReserveSandboxDoesNotExcludeOnConnectionCheckError(t *testing.T) {
+	ctx := context.Background()
+	placements := 0
+	reg := New(NewStores(), placementFunc(func(context.Context, PlaceRequest) (*Placement, error) {
+		placements++
+		return &Placement{NodeID: "n1"}, nil
+	}), time.Second, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	checkErr := errors.New("node owner temporarily unavailable")
+	owner := &remoteRouteWriteOwner{
+		node: &NodeRecord{NodeID: "n1"}, connectedErr: checkErr,
+	}
+	reg.SetNodeOwner(owner)
+
+	if _, err := reg.ReserveSandbox(ctx, "/g", "rk", nil); !errors.Is(err, checkErr) {
+		t.Fatalf("ReserveSandbox err=%v, want connection check error", err)
+	}
+	if placements != 1 || owner.commands != 0 {
+		t.Fatalf("connection check error retried/executed: placements=%d commands=%d", placements, owner.commands)
 	}
 }
 

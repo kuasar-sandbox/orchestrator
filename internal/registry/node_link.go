@@ -273,7 +273,8 @@ func (r *Registry) ServeNodeLinkRelay(w http.ResponseWriter, req *http.Request) 
 }
 
 func (r *Registry) serveNodeLinkLocal(ctx context.Context, w io.Writer, flush func(), body io.Reader, nr *routesync.NodeRegister) error {
-	if err := r.updateNodeRegister(ctx, nr); err != nil {
+	registered, err := r.updateNodeRegister(ctx, nr)
+	if err != nil {
 		r.log.Error("node-link: register", "node", nr.NodeID, "err", err)
 		return fmt.Errorf("node-link: register failed: %w", err)
 	}
@@ -283,10 +284,7 @@ func (r *Registry) serveNodeLinkLocal(ctx context.Context, w io.Writer, flush fu
 	// Write Hello BEFORE exposing the node_link. After addNode, heartbeat
 	// maintenance may send key refresh commands on this same h2 stream under
 	// nodeChannel.mu; Hello goes out first while this is still the only writer.
-	resumeFrom := ""
-	if rec, found, err := r.stores.GetNode(ctx, nr.NodeID); err == nil && found {
-		resumeFrom = rec.ResumeToken
-	}
+	resumeFrom := registered.ResumeToken
 	if err := routesync.WriteMsg(w, &routesync.Msg{Type: routesync.TypeHello, Hello: &routesync.Hello{Version: routesync.Version, ResumeFrom: resumeFrom}}); err != nil {
 		return nil
 	}
@@ -294,7 +292,7 @@ func (r *Registry) serveNodeLinkLocal(ctx context.Context, w io.Writer, flush fu
 
 	r.addNode(conn)
 	defer r.removeNode(conn)
-	go r.projectRegisteredNode(ctx, nr.NodeID)
+	go r.projectRegisteredNode(ctx, registered)
 	r.log.Info("node-link: node connected", "node", nr.NodeID, "labels", nr.Labels)
 
 	heartbeatCh := make(chan *routesync.Heartbeat, 1)
