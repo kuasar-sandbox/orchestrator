@@ -577,17 +577,14 @@ cmds = json.load(urllib.request.urlopen(sys.argv[1] + "/v1/commands", timeout=2)
 assert any(c.get("kind") == "build_register" for c in cmds), cmds
 PY
 
-step "checking orphan route cleanup"
+step "checking unowned node-local route isolation"
 "$NODE_STUB_CTL" sandbox orphan --admin "$ADMIN" --node stub-1 --sid sb-orphan >"$WORK/orphan.out"
-python3 - "$ADMIN" <<'PY' || fail "orphan route did not trigger delete command"
+python3 - "$ADMIN" <<'PY' || fail "unowned node-local route triggered a delete command"
 import json, sys, time, urllib.request
 admin = sys.argv[1]
-for _ in range(100):
-    cmds = json.load(urllib.request.urlopen(admin + "/v1/nodes/stub-1/commands", timeout=2))
-    if any(c.get("kind") == "delete" and c.get("sid") == "sb-orphan" for c in cmds):
-        sys.exit(0)
-    time.sleep(0.1)
-sys.exit(1)
+time.sleep(1)
+cmds = json.load(urllib.request.urlopen(admin + "/v1/nodes/stub-1/commands", timeout=2))
+assert not any(c.get("kind") == "delete" and c.get("sid") == "sb-orphan" for c in cmds), cmds
 PY
 
 step "checking reboot-empty cleanup"

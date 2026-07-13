@@ -366,14 +366,11 @@ func TestClusterStubBuildRegister(t *testing.T) {
 	}
 }
 
-func TestClusterStubOrphanReportDeletesNodeSandbox(t *testing.T) {
+func TestClusterStubUnownedReportDoesNotDeleteNodeSandbox(t *testing.T) {
 	h := newHarness(t)
 
 	h.node.sendRoute(t, routesync.RouteEntry{SandboxID: "sb-orphan", State: routesync.StateRunning})
-	cmd := h.node.waitCommand(t, routesync.CmdDelete)
-	if cmd.SID != "sb-orphan" {
-		t.Fatalf("orphan delete command=%+v, want sid sb-orphan", cmd)
-	}
+	h.node.assertNoCommand(t, routesync.CmdDelete, "sb-orphan", 500*time.Millisecond)
 }
 
 func (h *harness) doDataByKey(t *testing.T, routeKey string) *http.Response {
@@ -535,6 +532,25 @@ func (n *nodeStub) countKind(kind string) int {
 		}
 	}
 	return ncmd
+}
+
+func (n *nodeStub) assertNoCommand(t *testing.T, kind, sid string, duration time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(duration)
+	for {
+		n.mu.Lock()
+		for _, cmd := range n.cmds {
+			if cmd.Kind == kind && cmd.SID == sid {
+				n.mu.Unlock()
+				t.Fatalf("unexpected command kind=%s sid=%s", kind, sid)
+			}
+		}
+		n.mu.Unlock()
+		if time.Now().After(deadline) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 func (n *nodeStub) commandKinds() []string {
