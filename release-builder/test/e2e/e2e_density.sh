@@ -448,18 +448,24 @@ memory_event_count() {
     awk -v event="$event" '$1 == event { print $2; found=1 } END { if (!found) print 0 }' "$events"
 }
 
-wait_for_memory_pressure() {
+guest_oom_observed() {
+    local sid="$1"
+    grep -qiE 'oom-kill:|Out of memory: Killed process|app exited code=137|app_exited code=137' \
+        "$WORK/$sid.log" 2>/dev/null
+}
+
+wait_for_guest_oom() {
     local sid="$1" pid="$2" timeout="$3"
     local deadline=$((SECONDS + timeout))
     while [ "$SECONDS" -lt "$deadline" ]; do
-        if [ "$(memory_event_count "$sid" oom)" -gt 0 ] \
-            || [ "$(memory_event_count "$sid" high)" -gt 0 ]; then
-            return 0
+        guest_oom_observed "$sid" && return 0
+        if ! kill -0 "$pid" 2>/dev/null; then
+            guest_oom_observed "$sid" && return 0
+            fail "$sid: sandbox exited without guest OOM evidence"
         fi
-        kill -0 "$pid" 2>/dev/null || return 0
-        sleep 0.5
+        sleep 0.25
     done
-    fail "$sid: no memory pressure event within ${timeout}s"
+    fail "$sid: no guest OOM evidence within ${timeout}s"
 }
 
 reservation_count() {
@@ -555,12 +561,11 @@ phase_b1_static() {
     local pid=$!
     SANDBOX_PIDS+=("$pid")
 
-    # The assertion is the pressure event, not elapsed wall time.
-    wait_for_memory_pressure "$sid" "$pid" 35
+    # The assertion is guest OOM, not elapsed wall time or host pressure.
+    wait_for_guest_oom "$sid" "$pid" 35
 
-    # Inspect cgroup memory.events.local for the OOM signature BEFORE
-    # rmdir. Note: the OOM is INSIDE the guest, but the host's cgroup
-    # also tracks under-pressure events.
+    # Host cgroup pressure is useful diagnostics, but it is not authoritative
+    # for an OOM enforced by the guest kernel inside the VM.
     local oom=0 high=0
     if [ -f "/sys/fs/cgroup/sandboxes/$sid/memory.events.local" ]; then
         oom=$(awk '$1=="oom" {print $2}' "/sys/fs/cgroup/sandboxes/$sid/memory.events.local") || oom=0
@@ -569,13 +574,8 @@ phase_b1_static() {
         [ -z "$high" ] && high=0
     fi
 
-    # On the guest-internal OOM path, host cgroup may not see oom but
-    # it sees PSI throttling (high events). Either is enough evidence
-    # the floor was insufficient; we assert at least one fired.
-    if [ "$oom" -eq 0 ] && [ "$high" -eq 0 ]; then
-        fail "B1: no oom or high events — workload may have completed unexpectedly"
-    fi
-    echo "  Phase B1: cgroup oom_count=$oom high_count=$high (insufficient floor)"
+    guest_oom_observed "$sid" || fail "B1: guest OOM evidence disappeared"
+    echo "  Phase B1: guest_oom=1 cgroup_oom=$oom cgroup_high=$high"
 
     shutdown_sandbox "$pid" "$sid"
     cleanup_sb "$sid"
@@ -617,7 +617,7 @@ phase_b2_dynamic() {
 
     [ "$oom" -eq 0 ]  || fail "B2: cgroup oom_count=$oom (controller couldn't prevent OOM)"
     grep -q "workload done" "$WORK/$sid.log" || fail "B2: workload did not complete"
-    if grep -qiE "Out of memory|oom-kill|Killed process|code=137|signal=9" "$WORK/$sid.log"; then
+    if guest_oom_observed "$sid"; then
         fail "B2: guest log contains OOM or SIGKILL despite controller"
     fi
     grep -q "admit token=.* sid=$sid" "$WORK/audit.log" || fail "B2: no admit in audit"
