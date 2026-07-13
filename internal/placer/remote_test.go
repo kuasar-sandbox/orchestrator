@@ -206,7 +206,6 @@ func TestSubscribeOnceUsesOpaqueWatchToken(t *testing.T) {
 
 func TestRegisterLoopReportsMemberlistSeed(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	got := make(chan registry.PlacerRegister, 1)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		if req.URL.Path != registry.PlacerLinkRegisterPath {
@@ -228,7 +227,19 @@ func TestRegisterLoopReportsMemberlistSeed(t *testing.T) {
 
 	svc := NewRemoteLinks([]RegistryLink{{Name: "r1", BaseURL: srv.URL, Client: srv.Client()}},
 		clustercfg.PlacementConfig{Candidates: 1}, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	go svc.RegisterLoop(ctx, "s1", srv.URL, "placer.default")
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		svc.RegisterLoop(ctx, "s1", srv.URL, "placer.default")
+	}()
+	defer func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("placer register loop did not stop")
+		}
+	}()
 
 	select {
 	case reg := <-got:
