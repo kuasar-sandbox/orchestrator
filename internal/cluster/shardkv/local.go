@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -25,20 +26,24 @@ type StoreOptions struct {
 }
 
 type Store struct {
-	local                 MemberID
-	resolver              ShardResolver
-	transport             Transport
-	ready                 MemberReadyProvider
-	now                   func() time.Time
-	epoch                 string
-	defaultWatchRetention int
-	maxAttempts           int
-	repairTimeout         time.Duration
+	local         MemberID
+	config        atomic.Pointer[storeConfig]
+	now           func() time.Time
+	epoch         string
+	maxAttempts   int
+	repairTimeout time.Duration
 
 	mu      sync.Mutex
 	closed  bool
 	shards  map[string]*localShard
 	stripes []recordSetStripe
+}
+
+type storeConfig struct {
+	resolver              ShardResolver
+	transport             Transport
+	ready                 MemberReadyProvider
+	defaultWatchRetention int
 }
 
 const defaultRecordSetStripes = 4096
@@ -73,19 +78,24 @@ func NewStore(opts StoreOptions) (*Store, error) {
 	if opts.RepairTimeout <= 0 {
 		opts.RepairTimeout = 250 * time.Millisecond
 	}
-	return &Store{
-		local: opts.Local, resolver: opts.Resolver, transport: opts.Transport, ready: opts.Ready,
-		now: now, epoch: epoch, defaultWatchRetention: opts.DefaultWatchRetention,
+	store := &Store{
+		local: opts.Local, now: now, epoch: epoch,
 		maxAttempts: opts.MaxAttempts, repairTimeout: opts.RepairTimeout,
 		shards: map[string]*localShard{}, stripes: make([]recordSetStripe, defaultRecordSetStripes),
-	}, nil
+	}
+	store.config.Store(&storeConfig{
+		resolver: opts.Resolver, transport: opts.Transport, ready: opts.Ready,
+		defaultWatchRetention: opts.DefaultWatchRetention,
+	})
+	return store, nil
 }
 
 func (s *Store) Shard(ns Namespace, shard ShardKey) (*Shard, error) {
 	if s == nil {
 		return nil, ErrClosed
 	}
-	view, err := s.resolver.ResolveShard(ns, shard)
+	config := s.configSnapshot()
+	view, err := config.resolver.ResolveShard(ns, shard)
 	if err != nil {
 		return nil, err
 	}
@@ -105,21 +115,26 @@ func (s *Store) Configure(resolver ShardResolver, transport Transport, ready Mem
 	if defaultWatchRetention <= 0 {
 		defaultWatchRetention = 10000
 	}
+	next := &storeConfig{
+		resolver: resolver, transport: transport, ready: ready,
+		defaultWatchRetention: defaultWatchRetention,
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
 		return ErrClosed
 	}
-	s.resolver = resolver
-	s.transport = transport
-	s.ready = ready
-	s.defaultWatchRetention = defaultWatchRetention
 	for _, shard := range s.shards {
 		shard.mu.Lock()
-		shard.retention = s.watchRetentionLocked(shard.namespace)
+		shard.retention = watchRetention(shard.namespace, next)
 		shard.mu.Unlock()
 	}
+	s.config.Store(next)
 	return nil
+}
+
+func (s *Store) configSnapshot() *storeConfig {
+	return s.config.Load()
 }
 
 func (s *Store) Handle(ctx context.Context, req Request) (Response, error) {
@@ -188,7 +203,8 @@ func (s *Store) validateRequest(req Request) error {
 	if req.Namespace == "" || req.Shard == "" || req.RecordSet == "" {
 		return ErrInvalidView
 	}
-	view, err := s.resolver.ResolveShard(req.Namespace, req.Shard)
+	config := s.configSnapshot()
+	view, err := config.resolver.ResolveShard(req.Namespace, req.Shard)
 	if err != nil {
 		return err
 	}
@@ -234,7 +250,7 @@ func (s *Store) getLocalShard(ns Namespace, shard ShardKey) (*localShard, error)
 	key := localShardKey(ns, shard)
 	ls := s.shards[key]
 	if ls == nil {
-		ls = newLocalShard(ns, shard, s.epoch, s.watchRetentionLocked(ns), s.now())
+		ls = newLocalShard(ns, shard, s.epoch, watchRetention(ns, s.configSnapshot()), s.now())
 		s.shards[key] = ls
 	}
 	ls.touch(s.now())
@@ -250,15 +266,15 @@ func (s *Store) getLocalShardNoTouch(ns Namespace, shard ShardKey) (*localShard,
 	key := localShardKey(ns, shard)
 	ls := s.shards[key]
 	if ls == nil {
-		ls = newLocalShard(ns, shard, s.epoch, s.watchRetentionLocked(ns), s.now())
+		ls = newLocalShard(ns, shard, s.epoch, watchRetention(ns, s.configSnapshot()), s.now())
 		s.shards[key] = ls
 	}
 	return ls, nil
 }
 
-func (s *Store) watchRetentionLocked(ns Namespace) int {
-	retention := s.defaultWatchRetention
-	if spec := namespaceSpec(ns, s.resolver); spec.WatchRetention > 0 {
+func watchRetention(ns Namespace, config *storeConfig) int {
+	retention := config.defaultWatchRetention
+	if spec := namespaceSpec(ns, config.resolver); spec.WatchRetention > 0 {
 		retention = spec.WatchRetention
 	}
 	if retention <= 0 {

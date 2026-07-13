@@ -44,7 +44,8 @@ func (s *Shard) View(ctx context.Context) (ShardView, error) {
 	if err := ctx.Err(); err != nil {
 		return ShardView{}, err
 	}
-	view, err := s.store.resolver.ResolveShard(s.namespace, s.shard)
+	config := s.store.configSnapshot()
+	view, err := config.resolver.ResolveShard(s.namespace, s.shard)
 	if err != nil {
 		return ShardView{}, err
 	}
@@ -63,7 +64,8 @@ func (s *RecordSet) View(ctx context.Context) (ShardView, error) {
 	if err := ctx.Err(); err != nil {
 		return ShardView{}, err
 	}
-	view, err := s.store.resolver.ResolveShard(s.namespace, s.shard)
+	config := s.store.configSnapshot()
+	view, err := config.resolver.ResolveShard(s.namespace, s.shard)
 	if err != nil {
 		return ShardView{}, err
 	}
@@ -585,13 +587,14 @@ func (s *RecordSet) call(ctx context.Context, label string, member MemberID, req
 	if member == s.store.local {
 		return s.store.Handle(ctx, req)
 	}
-	if s.store.ready != nil && !s.store.ready.Ready(label, member) {
+	config := s.store.configSnapshot()
+	if config.ready != nil && !config.ready.Ready(label, member) {
 		return Response{}, ErrReplicaUnavailable
 	}
-	if s.store.transport == nil {
+	if config.transport == nil {
 		return Response{}, ErrReplicaUnavailable
 	}
-	resp, err := s.store.transport.Call(ctx, member, req)
+	resp, err := config.transport.Call(ctx, member, req)
 	if err != nil {
 		return Response{}, err
 	}
