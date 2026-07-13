@@ -349,7 +349,8 @@ placer 主管 selector patch 和 manifest key cache refresh:
 3. 将目标 node set 与 key material/ref 作为 selector patch 推给 registry。
 4. registry/node owner 把每个 node 的 desired key list 写入 node_link `manifest_key` recordSet,并在 owner set
    内 CAS 复制。
-5. node_link heartbeat 只对未下发或进入续租窗口的条目执行 `key_put`。
+5. node_link heartbeat 只对未获 `AckAccepted` 或已进入续租窗口的条目执行 `key_put`；只有匹配当前
+   desired lease 的 ACK 才推进已交付状态。
 6. 未续租 key 由节点 TTL 淘汰,`key_drop` 不作为正确性依赖。
 
 密钥是 create/build 前置条件。key cache 删除、key_drop 或租约过期不影响已经运行的 sandbox。
@@ -363,7 +364,7 @@ placer 主管 selector patch 和 manifest key cache refresh:
 | provider 不可用 | 受影响 group 的 Place/verify-key 返回不可用 |
 | node labels 旧 | node owner admission/create 兜底拒绝 |
 | source owner 崩溃 | source lease 到期后其他候选从已提交 cursor 接管;旧 owner patch/cursor 被 fencing 拒绝 |
-| key 续租投递失败 | create/build 在 node 侧 reject,route owner 重调度或返回失败;下一次 heartbeat refresh 重试 |
+| key 续租投递失败 | timeout、断线或 reject 都不推进已交付状态；create/build 在 node 侧 reject，下一次 heartbeat refresh 重试 |
 | build 预算泄漏 | admission lease 超时释放 |
 
 ## 11. 性能

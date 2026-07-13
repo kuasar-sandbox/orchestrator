@@ -571,22 +571,17 @@ func (s *Stores) UpsertNodeManifestKey(ctx context.Context, nodeID string, key c
 	if err != nil {
 		return err
 	}
-	if found && sameNodeManifestKeyMaterial(cur, key) && key.SentExpiresUnix == 0 {
-		key.SentExpiresUnix = cur.SentExpiresUnix
+	if found && sameNodeManifestKeyMaterial(cur, key) && key.AckedExpiresUnix == 0 {
+		key.AckedExpiresUnix = cur.AckedExpiresUnix
 	}
 	return s.upsertNodeManifestKeyShard(ctx, nodeID, key)
 }
 
-func (s *Stores) MarkNodeManifestKeySent(ctx context.Context, nodeID, fingerprint string, sentExpiresUnix int64) error {
-	if nodeID == "" || fingerprint == "" || sentExpiresUnix <= 0 {
-		return nil
+func (s *Stores) MarkNodeManifestKeyAcked(ctx context.Context, nodeID string, expected clusterstate.NodeManifestKey) (bool, error) {
+	if nodeID == "" || expected.Fingerprint == "" || expected.ExpiresUnix <= 0 {
+		return false, nil
 	}
-	key, _, found, err := s.getNodeManifestKeyShard(ctx, nodeID, fingerprint)
-	if err != nil || !found {
-		return err
-	}
-	key.SentExpiresUnix = sentExpiresUnix
-	return s.upsertNodeManifestKeyShard(ctx, nodeID, key)
+	return s.markNodeManifestKeyAckedShard(ctx, nodeID, expected)
 }
 
 func (s *Stores) DropNodeManifestKey(ctx context.Context, nodeID, fingerprint string) error {

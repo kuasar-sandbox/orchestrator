@@ -86,7 +86,7 @@ type Registry struct {
 	nodes    map[string]nodeConn               // node_id -> channel
 	inflight map[string]*reserveCall           // single-flight ReserveSandbox per (group,route_key)
 	sidKeys  map[string][2]string              // sid -> {group, route_key} (delete-by-sid from the route stream)
-	acks     map[string]chan *routesync.CmdAck // cmd_id -> ack waiter (synchronous key commands)
+	acks     map[string]chan *routesync.CmdAck // cmd_id -> command receipt waiter
 
 	localNodeOwner     NodeOwner
 	nodeOwner          NodeOwner
@@ -559,9 +559,8 @@ func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, o
 	return ErrNoNode
 }
 
-// sendAndWait sends a lifecycle/build command and blocks until the node acks it
-// (or timeout). key_put refreshes are best-effort heartbeat maintenance and do
-// not use this path.
+// sendAndWait sends a command and blocks until the node acknowledges receipt or
+// the caller's context/timeout ends.
 func (r *Registry) sendAndWait(ctx context.Context, conn nodeConn, cmd *routesync.Command, timeout time.Duration) (*routesync.CmdAck, error) {
 	ch := make(chan *routesync.CmdAck, 1)
 	r.mu.Lock()
@@ -586,8 +585,7 @@ func (r *Registry) sendAndWait(ctx context.Context, conn nodeConn, cmd *routesyn
 }
 
 // ackCommand handles a node's CmdAck and wakes the matching SendCommandAndWait
-// waiter. Lifecycle rejection/retry is handled synchronously by the node owner
-// command caller.
+// waiter. Rejection/retry policy is handled by the command caller.
 func (r *Registry) ackCommand(ack *routesync.CmdAck) {
 	if ack == nil {
 		return
@@ -1005,7 +1003,6 @@ func (r *Registry) updateHeartbeat(ctx context.Context, nodeID string, hb *route
 	rec.BuildAlloc, rec.Counts, rec.Draining = hb.BuildAlloc, hb.Counts, hb.Draining
 	rec.LastHeartbeatUnix = time.Now().Unix()
 	_ = r.stores.PutNodeRuntime(ctx, rec)
-	r.refreshNodeManifestKeys(ctx, rec)
 	if rec.Draining != oldDraining || oldHeartbeat <= 0 || rec.LastHeartbeatUnix-oldHeartbeat >= r.stores.NodeListHeartbeatRefreshSec() {
 		r.putNodeListProjection(ctx, rec)
 		return

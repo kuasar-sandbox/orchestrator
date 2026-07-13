@@ -33,6 +33,14 @@ func testRegWithBox(t *testing.T) *Registry {
 const testMK = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
 const testAuthKey = "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100"
 
+func updateHeartbeatAndRefreshManifestKeys(reg *Registry, ctx context.Context, nodeID string, hb *routesync.Heartbeat) {
+	reg.updateHeartbeat(ctx, nodeID, hb)
+	rec, found, err := reg.getNodeForLinkUpdate(ctx, nodeID)
+	if err == nil && found {
+		reg.refreshNodeManifestKeys(ctx, rec)
+	}
+}
+
 type placementFunc func(context.Context, PlaceRequest) (*Placement, error)
 
 func (f placementFunc) Place(ctx context.Context, req PlaceRequest) (*Placement, error) {
@@ -61,7 +69,10 @@ func TestSelectorPatchRefreshesNodeLinkKeyCache(t *testing.T) {
 	reg := testRegWithBox(t)
 	reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1", Labels: map[string]string{"zone": "east"}})
 	var cmds []*routesync.Command
-	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(c *routesync.Command) { cmds = append(cmds, c) }})
+	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(c *routesync.Command) {
+		cmds = append(cmds, c)
+		reg.ackCommand(&routesync.CmdAck{CmdID: c.CmdID, Status: routesync.AckAccepted})
+	}})
 
 	if err := pushSelectorPatch(reg, "/g", []string{"n1"}, testMK); err != nil {
 		t.Fatalf("push selector patch: %v", err)
@@ -70,7 +81,7 @@ func TestSelectorPatchRefreshesNodeLinkKeyCache(t *testing.T) {
 	if len(cmds) != 0 {
 		t.Fatalf("selector patch should only update node_link cache, got commands %+v", cmds)
 	}
-	reg.updateHeartbeat(ctx, "n1", &routesync.Heartbeat{})
+	updateHeartbeatAndRefreshManifestKeys(reg, ctx, "n1", &routesync.Heartbeat{})
 	if len(cmds) != 1 || cmds[0].Kind != routesync.CmdKeyPut || cmds[0].ManifestKey != testMK {
 		t.Fatalf("expected heartbeat key_put with the group key, got %+v", cmds)
 	}
@@ -78,12 +89,12 @@ func TestSelectorPatchRefreshesNodeLinkKeyCache(t *testing.T) {
 	if err != nil || !found || len(node.ManifestKeys) != 1 {
 		t.Fatalf("node key state found=%v err=%v node=%+v", found, err, node)
 	}
-	if node.ManifestKeys[0].SentExpiresUnix != cmds[0].ExpiresUnix || node.ManifestKeys[0].SentExpiresUnix <= time.Now().Unix() {
-		t.Fatalf("sent key lease not persisted in node_link: key=%+v cmd=%+v", node.ManifestKeys[0], cmds[0])
+	if node.ManifestKeys[0].AckedExpiresUnix != cmds[0].ExpiresUnix || node.ManifestKeys[0].AckedExpiresUnix <= time.Now().Unix() {
+		t.Fatalf("acknowledged key lease not persisted in node_link: key=%+v cmd=%+v", node.ManifestKeys[0], cmds[0])
 	}
 
 	cmds = nil
-	reg.updateHeartbeat(ctx, "n1", &routesync.Heartbeat{})
+	updateHeartbeatAndRefreshManifestKeys(reg, ctx, "n1", &routesync.Heartbeat{})
 	if len(cmds) != 0 {
 		t.Fatalf("heartbeat resent manifest key before stored TTL expired: %+v", cmds)
 	}
@@ -94,19 +105,22 @@ func TestHeartbeatRenewsManifestKeyBeforeLeaseExpiry(t *testing.T) {
 	reg := testRegWithBox(t)
 	now := time.Now().Unix()
 	key := clusterstate.NodeManifestKey{
-		Fingerprint:     "fp",
-		Type:            clusterstate.SecretInline,
-		Value:           "mk",
-		ExpiresUnix:     now + int64(keyLeaseTTL.Seconds()),
-		SentExpiresUnix: now + int64((keyRenewBefore / 2).Seconds()),
+		Fingerprint:      "fp",
+		Type:             clusterstate.SecretInline,
+		Value:            "mk",
+		ExpiresUnix:      now + int64(keyLeaseTTL.Seconds()),
+		AckedExpiresUnix: now + int64((keyRenewBefore / 2).Seconds()),
 	}
 	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1", ManifestKeys: []clusterstate.NodeManifestKey{key}}); err != nil {
 		t.Fatal(err)
 	}
 	var cmds []*routesync.Command
-	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(c *routesync.Command) { cmds = append(cmds, c) }})
+	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(c *routesync.Command) {
+		cmds = append(cmds, c)
+		reg.ackCommand(&routesync.CmdAck{CmdID: c.CmdID, Status: routesync.AckAccepted})
+	}})
 
-	reg.updateHeartbeat(ctx, "n1", &routesync.Heartbeat{})
+	updateHeartbeatAndRefreshManifestKeys(reg, ctx, "n1", &routesync.Heartbeat{})
 
 	if len(cmds) != 1 || cmds[0].Kind != routesync.CmdKeyPut || cmds[0].KeyFingerprint != "fp" {
 		t.Fatalf("heartbeat did not renew key approaching expiry: %+v", cmds)
@@ -117,13 +131,295 @@ func TestHeartbeatRenewsManifestKeyBeforeLeaseExpiry(t *testing.T) {
 	if err != nil || !found {
 		t.Fatalf("node found=%v err=%v", found, err)
 	}
-	node.ManifestKeys[0].SentExpiresUnix = now + int64((keyRenewBefore + time.Hour).Seconds())
+	node.ManifestKeys[0].AckedExpiresUnix = now + int64((keyRenewBefore + time.Hour).Seconds())
 	if err := reg.stores.PutNode(ctx, node); err != nil {
 		t.Fatal(err)
 	}
-	reg.updateHeartbeat(ctx, "n1", &routesync.Heartbeat{})
+	updateHeartbeatAndRefreshManifestKeys(reg, ctx, "n1", &routesync.Heartbeat{})
 	if len(cmds) != 0 {
 		t.Fatalf("heartbeat renewed key before renew window: %+v", cmds)
+	}
+}
+
+func TestHeartbeatRetriesRejectedManifestKey(t *testing.T) {
+	ctx := context.Background()
+	reg := testRegWithBox(t)
+	key := clusterstate.NodeManifestKey{
+		Fingerprint: "fp", Type: clusterstate.SecretInline, Value: "mk",
+		ExpiresUnix: time.Now().Add(keyLeaseTTL).Unix(),
+	}
+	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1", ManifestKeys: []clusterstate.NodeManifestKey{key}}); err != nil {
+		t.Fatal(err)
+	}
+	sends := 0
+	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(cmd *routesync.Command) {
+		sends++
+		reg.ackCommand(&routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckRejected, Reason: "not installed"})
+	}})
+
+	updateHeartbeatAndRefreshManifestKeys(reg, ctx, "n1", &routesync.Heartbeat{})
+	updateHeartbeatAndRefreshManifestKeys(reg, ctx, "n1", &routesync.Heartbeat{})
+
+	got, found, err := reg.stores.GetNode(ctx, "n1")
+	if err != nil || !found || len(got.ManifestKeys) != 1 {
+		t.Fatalf("node found=%v err=%v state=%+v", found, err, got)
+	}
+	if sends != 2 || got.ManifestKeys[0].AckedExpiresUnix != 0 {
+		t.Fatalf("rejected key sends=%d state=%+v, want two attempts and no acknowledgement", sends, got.ManifestKeys[0])
+	}
+}
+
+func TestRejectedManifestKeyDoesNotBlockOtherKeys(t *testing.T) {
+	ctx := context.Background()
+	reg := testRegWithBox(t)
+	expires := time.Now().Add(keyLeaseTTL).Unix()
+	keys := []clusterstate.NodeManifestKey{
+		{Fingerprint: "a", Type: clusterstate.SecretInline, Value: "mk-a", ExpiresUnix: expires},
+		{Fingerprint: "b", Type: clusterstate.SecretInline, Value: "mk-b", ExpiresUnix: expires},
+	}
+	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1", ManifestKeys: keys}); err != nil {
+		t.Fatal(err)
+	}
+	var sends []string
+	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(cmd *routesync.Command) {
+		sends = append(sends, cmd.KeyFingerprint)
+		status := routesync.AckAccepted
+		if cmd.KeyFingerprint == "a" {
+			status = routesync.AckRejected
+		}
+		reg.ackCommand(&routesync.CmdAck{CmdID: cmd.CmdID, Status: status})
+	}})
+
+	updateHeartbeatAndRefreshManifestKeys(reg, ctx, "n1", &routesync.Heartbeat{})
+
+	got, _, _ := reg.stores.GetNode(ctx, "n1")
+	if len(sends) != 2 || sends[0] != "a" || sends[1] != "b" {
+		t.Fatalf("delivery order=%v, want both keys", sends)
+	}
+	if len(got.ManifestKeys) != 2 || got.ManifestKeys[0].AckedExpiresUnix != 0 || got.ManifestKeys[1].AckedExpiresUnix != expires {
+		t.Fatalf("key states=%+v, want rejected a and acknowledged b", got.ManifestKeys)
+	}
+}
+
+func TestHeartbeatRetriesManifestKeyAfterMissingAck(t *testing.T) {
+	reg := testRegWithBox(t)
+	key := clusterstate.NodeManifestKey{
+		Fingerprint: "fp", Type: clusterstate.SecretInline, Value: "mk",
+		ExpiresUnix: time.Now().Add(keyLeaseTTL).Unix(),
+	}
+	if err := reg.stores.PutNode(context.Background(), &NodeRecord{NodeID: "n1", ManifestKeys: []clusterstate.NodeManifestKey{key}}); err != nil {
+		t.Fatal(err)
+	}
+	sends := 0
+	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(*routesync.Command) { sends++ }})
+	waitCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	updateHeartbeatAndRefreshManifestKeys(reg, waitCtx, "n1", &routesync.Heartbeat{})
+
+	got, found, err := reg.stores.GetNode(context.Background(), "n1")
+	if err != nil || !found || len(got.ManifestKeys) != 1 {
+		t.Fatalf("node found=%v err=%v state=%+v", found, err, got)
+	}
+	if got.ManifestKeys[0].AckedExpiresUnix != 0 {
+		t.Fatalf("missing ACK advanced acknowledged lease: %+v", got.ManifestKeys[0])
+	}
+	reg.mu.Lock()
+	waiters := len(reg.acks)
+	reg.mu.Unlock()
+	if waiters != 0 {
+		t.Fatalf("missing ACK left %d waiter(s)", waiters)
+	}
+
+	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(cmd *routesync.Command) {
+		sends++
+		reg.ackCommand(&routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted})
+	}})
+	updateHeartbeatAndRefreshManifestKeys(reg, context.Background(), "n1", &routesync.Heartbeat{})
+	got, _, _ = reg.stores.GetNode(context.Background(), "n1")
+	if sends != 2 || got.ManifestKeys[0].AckedExpiresUnix != key.ExpiresUnix {
+		t.Fatalf("retry sends=%d state=%+v, want accepted second delivery", sends, got.ManifestKeys[0])
+	}
+}
+
+func TestMissingManifestKeyAckStopsCurrentRefreshBatch(t *testing.T) {
+	reg := testRegWithBox(t)
+	expires := time.Now().Add(keyLeaseTTL).Unix()
+	keys := []clusterstate.NodeManifestKey{
+		{Fingerprint: "a", Type: clusterstate.SecretInline, Value: "mk-a", ExpiresUnix: expires},
+		{Fingerprint: "b", Type: clusterstate.SecretInline, Value: "mk-b", ExpiresUnix: expires},
+	}
+	if err := reg.stores.PutNode(context.Background(), &NodeRecord{NodeID: "n1", ManifestKeys: keys}); err != nil {
+		t.Fatal(err)
+	}
+	sends := 0
+	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(*routesync.Command) { sends++ }})
+	waitCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	updateHeartbeatAndRefreshManifestKeys(reg, waitCtx, "n1", &routesync.Heartbeat{})
+
+	if sends != 1 {
+		t.Fatalf("missing ACK sent %d keys, want one before ending the batch", sends)
+	}
+	got, _, _ := reg.stores.GetNode(context.Background(), "n1")
+	if len(got.ManifestKeys) != 2 || got.ManifestKeys[0].AckedExpiresUnix != 0 || got.ManifestKeys[1].AckedExpiresUnix != 0 {
+		t.Fatalf("missing ACK advanced key state: %+v", got.ManifestKeys)
+	}
+}
+
+func TestHeartbeatRetriesManifestKeyAfterDisconnect(t *testing.T) {
+	reg := testRegWithBox(t)
+	key := clusterstate.NodeManifestKey{
+		Fingerprint: "fp", Type: clusterstate.SecretInline, Value: "mk",
+		ExpiresUnix: time.Now().Add(keyLeaseTTL).Unix(),
+	}
+	if err := reg.stores.PutNode(context.Background(), &NodeRecord{NodeID: "n1", ManifestKeys: []clusterstate.NodeManifestKey{key}}); err != nil {
+		t.Fatal(err)
+	}
+	linkCtx, disconnect := context.WithCancel(context.Background())
+	sends := 0
+	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(*routesync.Command) {
+		sends++
+		disconnect()
+	}})
+	updateHeartbeatAndRefreshManifestKeys(reg, linkCtx, "n1", &routesync.Heartbeat{})
+
+	got, _, _ := reg.stores.GetNode(context.Background(), "n1")
+	if got.ManifestKeys[0].AckedExpiresUnix != 0 {
+		t.Fatalf("disconnected delivery advanced acknowledged lease: %+v", got.ManifestKeys[0])
+	}
+	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(cmd *routesync.Command) {
+		sends++
+		reg.ackCommand(&routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted})
+	}})
+	updateHeartbeatAndRefreshManifestKeys(reg, context.Background(), "n1", &routesync.Heartbeat{})
+	got, _, _ = reg.stores.GetNode(context.Background(), "n1")
+	if sends != 2 || got.ManifestKeys[0].AckedExpiresUnix != key.ExpiresUnix {
+		t.Fatalf("reconnected retry sends=%d state=%+v", sends, got.ManifestKeys[0])
+	}
+}
+
+func TestStaleManifestKeyAckDoesNotOverwriteNewDesiredLease(t *testing.T) {
+	ctx := context.Background()
+	reg := testRegWithBox(t)
+	initial := clusterstate.NodeManifestKey{
+		Fingerprint: "fp", Type: clusterstate.SecretInline, Value: "mk",
+		ExpiresUnix: time.Now().Add(2 * time.Hour).Unix(),
+	}
+	newer := initial
+	newer.ExpiresUnix = initial.ExpiresUnix + int64(time.Hour.Seconds())
+	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1", ManifestKeys: []clusterstate.NodeManifestKey{initial}}); err != nil {
+		t.Fatal(err)
+	}
+	var expiries []int64
+	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(cmd *routesync.Command) {
+		expiries = append(expiries, cmd.ExpiresUnix)
+		if len(expiries) == 1 {
+			if err := reg.stores.UpsertNodeManifestKey(ctx, "n1", newer); err != nil {
+				t.Fatalf("update desired lease: %v", err)
+			}
+		}
+		reg.ackCommand(&routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted})
+	}})
+
+	updateHeartbeatAndRefreshManifestKeys(reg, ctx, "n1", &routesync.Heartbeat{})
+	got, _, _ := reg.stores.GetNode(ctx, "n1")
+	if got.ManifestKeys[0].ExpiresUnix != newer.ExpiresUnix || got.ManifestKeys[0].AckedExpiresUnix != 0 {
+		t.Fatalf("stale ACK changed newer desired lease: %+v", got.ManifestKeys[0])
+	}
+	updateHeartbeatAndRefreshManifestKeys(reg, ctx, "n1", &routesync.Heartbeat{})
+	got, _, _ = reg.stores.GetNode(ctx, "n1")
+	if len(expiries) != 2 || expiries[0] != initial.ExpiresUnix || expiries[1] != newer.ExpiresUnix || got.ManifestKeys[0].AckedExpiresUnix != newer.ExpiresUnix {
+		t.Fatalf("delivery expiries=%v state=%+v", expiries, got.ManifestKeys[0])
+	}
+}
+
+func TestManifestKeyAckWaitDoesNotBlockOtherNode(t *testing.T) {
+	reg := testRegWithBox(t)
+	expires := time.Now().Add(keyLeaseTTL).Unix()
+	for _, nodeID := range []string{"n1", "n2"} {
+		key := clusterstate.NodeManifestKey{Fingerprint: "fp-" + nodeID, Type: clusterstate.SecretInline, Value: "mk-" + nodeID, ExpiresUnix: expires}
+		if err := reg.stores.PutNode(context.Background(), &NodeRecord{NodeID: nodeID, ManifestKeys: []clusterstate.NodeManifestKey{key}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	started := make(chan struct{})
+	blockedCtx, unblock := context.WithCancel(context.Background())
+	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(*routesync.Command) { close(started) }})
+	blockedDone := make(chan struct{})
+	go func() {
+		updateHeartbeatAndRefreshManifestKeys(reg, blockedCtx, "n1", &routesync.Heartbeat{})
+		close(blockedDone)
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("first node did not start key delivery")
+	}
+
+	reg.addNode(&fakeConn{nodeID: "n2", onCmd: func(cmd *routesync.Command) {
+		reg.ackCommand(&routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted})
+	}})
+	updateHeartbeatAndRefreshManifestKeys(reg, context.Background(), "n2", &routesync.Heartbeat{})
+	got, _, _ := reg.stores.GetNode(context.Background(), "n2")
+	if got.ManifestKeys[0].AckedExpiresUnix != expires {
+		t.Fatalf("second node was blocked by first node's ACK wait: %+v", got.ManifestKeys[0])
+	}
+	unblock()
+	select {
+	case <-blockedDone:
+	case <-time.After(time.Second):
+		t.Fatal("cancelled ACK wait did not return")
+	}
+}
+
+func TestManifestKeyAckWaitDoesNotDelayHeartbeatState(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	reg := testRegWithBox(t)
+	key := clusterstate.NodeManifestKey{
+		Fingerprint: "fp", Type: clusterstate.SecretInline, Value: "mk",
+		ExpiresUnix: time.Now().Add(keyLeaseTTL).Unix(),
+	}
+	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1", ManifestKeys: []clusterstate.NodeManifestKey{key}}); err != nil {
+		t.Fatal(err)
+	}
+	keyStarted := make(chan struct{})
+	var once sync.Once
+	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(*routesync.Command) {
+		once.Do(func() { close(keyStarted) })
+	}})
+	heartbeats := make(chan *routesync.Heartbeat, 2)
+	done := make(chan struct{})
+	go func() {
+		reg.runNodeHeartbeatUpdates(ctx, "n1", heartbeats)
+		close(done)
+	}()
+	heartbeats <- &routesync.Heartbeat{Allocated: 1, Pool: 10}
+	select {
+	case <-keyStarted:
+	case <-time.After(time.Second):
+		t.Fatal("manifest-key delivery did not start")
+	}
+
+	heartbeats <- &routesync.Heartbeat{Allocated: 7, Pool: 10, Draining: true}
+	deadline := time.Now().Add(time.Second)
+	for {
+		got, found, err := reg.stores.GetNode(context.Background(), "n1")
+		if err == nil && found && got.Allocated == 7 && got.Draining {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("heartbeat state did not advance while key ACK was pending: found=%v err=%v state=%+v", found, err, got)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("heartbeat updater did not stop")
 	}
 }
 
@@ -198,12 +494,15 @@ func TestKeyDropOnLeave(t *testing.T) {
 	reg := testRegWithBox(t)
 	reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1", Labels: map[string]string{"zone": "east"}})
 	var cmds []*routesync.Command
-	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(c *routesync.Command) { cmds = append(cmds, c) }})
+	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(c *routesync.Command) {
+		cmds = append(cmds, c)
+		reg.ackCommand(&routesync.CmdAck{CmdID: c.CmdID, Status: routesync.AckAccepted})
+	}})
 
 	if err := pushSelectorPatch(reg, "/g", []string{"n1"}, testMK); err != nil {
 		t.Fatalf("push selector patch: %v", err)
 	}
-	reg.updateHeartbeat(ctx, "n1", &routesync.Heartbeat{})
+	updateHeartbeatAndRefreshManifestKeys(reg, ctx, "n1", &routesync.Heartbeat{})
 	if err := pushSelectorPatch(reg, "/g", nil, ""); err != nil {
 		t.Fatalf("empty selector patch: %v", err)
 	}

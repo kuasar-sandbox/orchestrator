@@ -101,12 +101,12 @@ type NodeRecord struct {
 }
 
 type NodeManifestKey struct {
-	Fingerprint     string `json:"fingerprint"`
-	Type            string `json:"type,omitempty"`
-	Value           string `json:"value,omitempty"`
-	Ref             string `json:"ref,omitempty"`
-	ExpiresUnix     int64  `json:"expires_unix,omitempty"`
-	SentExpiresUnix int64  `json:"sent_expires_unix,omitempty"`
+	Fingerprint      string `json:"fingerprint"`
+	Type             string `json:"type,omitempty"`
+	Value            string `json:"value,omitempty"`
+	Ref              string `json:"ref,omitempty"`
+	ExpiresUnix      int64  `json:"expires_unix,omitempty"`
+	AckedExpiresUnix int64  `json:"acked_expires_unix,omitempty"`
 }
 
 type NodeSandboxRef struct {

@@ -8,4 +8,5 @@ import "time"
 const (
 	keyLeaseTTL    = 3 * time.Hour // lease lifetime pushed to nodes
 	keyRenewBefore = time.Hour     // refresh node leases before they reach expiry
+	keyAckTimeout  = 5 * time.Second
 )

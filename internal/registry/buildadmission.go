@@ -53,7 +53,7 @@ func (o *localNodeOwner) RefreshManifestKeys(ctx context.Context, nodeID string,
 		if key.Fingerprint == "" || (key.ExpiresUnix > 0 && key.ExpiresUnix <= now) {
 			continue
 		}
-		if key.SentExpiresUnix-now > int64(keyRenewBefore.Seconds()) {
+		if key.AckedExpiresUnix-now > int64(keyRenewBefore.Seconds()) {
 			continue
 		}
 		cmd := &routesync.Command{
@@ -68,8 +68,26 @@ func (o *localNodeOwner) RefreshManifestKeys(ctx context.Context, nodeID string,
 		if cmd.ManifestKeyType == "" {
 			cmd.ManifestKeyType = clusterstate.SecretInline
 		}
-		if err := o.SendCommand(ctx, nodeID, cmd); err == nil {
-			_ = o.reg.stores.MarkNodeManifestKeySent(ctx, nodeID, key.Fingerprint, key.ExpiresUnix)
+		ack, err := o.SendCommandAndWait(ctx, nodeID, cmd, keyAckTimeout)
+		if err != nil || ack == nil {
+			o.reg.log.Debug("node-link: manifest key acknowledgement missing",
+				"node", nodeID, "fingerprint", key.Fingerprint, "cmd_id", cmd.CmdID, "err", err)
+			return
+		}
+		if ack.Status != routesync.AckAccepted {
+			o.reg.log.Warn("node-link: manifest key rejected",
+				"node", nodeID, "fingerprint", key.Fingerprint, "cmd_id", cmd.CmdID, "reason", ack.Reason)
+			continue
+		}
+		marked, err := o.reg.stores.MarkNodeManifestKeyAcked(ctx, nodeID, key)
+		if err != nil {
+			o.reg.log.Warn("node-link: record manifest key acknowledgement",
+				"node", nodeID, "fingerprint", key.Fingerprint, "cmd_id", cmd.CmdID, "err", err)
+			continue
+		}
+		if !marked {
+			o.reg.log.Debug("node-link: manifest key desired lease changed before acknowledgement",
+				"node", nodeID, "fingerprint", key.Fingerprint, "cmd_id", cmd.CmdID)
 		}
 	}
 }
