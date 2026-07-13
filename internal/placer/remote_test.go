@@ -246,7 +246,6 @@ func TestRegisterLoopRetriesFailedRegisterQuickly(t *testing.T) {
 	t.Cleanup(func() { placerRegisterRetryInterval = oldRetry })
 
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	var calls atomic.Int32
 	gotSecond := make(chan struct{}, 1)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
@@ -269,7 +268,19 @@ func TestRegisterLoopRetriesFailedRegisterQuickly(t *testing.T) {
 
 	svc := NewRemoteLinks([]RegistryLink{{Name: "r1", BaseURL: srv.URL, Client: srv.Client()}},
 		clustercfg.PlacementConfig{Candidates: 1}, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	go svc.RegisterLoop(ctx, "s1", srv.URL, "placer.default")
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		svc.RegisterLoop(ctx, "s1", srv.URL, "placer.default")
+	}()
+	defer func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("placer register loop did not stop")
+		}
+	}()
 
 	select {
 	case <-gotSecond:
