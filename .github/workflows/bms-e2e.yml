@@ -11,7 +11,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: bms-e2e-${{ github.repository }}-${{ github.event.pull_request.number || github.ref }}
+  group: bms-e2e-${{ github.repository }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -24,26 +24,88 @@ jobs:
       - kuasar-e2e
       - kvm
       - cgroup-v2
-    timeout-minutes: 120
+    timeout-minutes: 30
+    env:
+      GOPROXY: https://goproxy.cn,direct
+      GOSUMDB: sum.golang.google.cn
+      GOTOOLCHAIN: local
+      RUSTUP_DIST_SERVER: https://rsproxy.cn
+      RUSTUP_UPDATE_ROOT: https://rsproxy.cn/rustup
+      CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+      PIP_INDEX_URL: https://pypi.tuna.tsinghua.edu.cn/simple
 
     steps:
-      - name: Check out the candidate
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Create source token
+        id: source-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
-          fetch-depth: 1
-          persist-credentials: false
+          client-id: ${{ vars.KUASAR_CI_APP_CLIENT_ID }}
+          private-key: ${{ secrets.KUASAR_CI_APP_PRIVATE_KEY }}
+          owner: kuasar-sandbox
+          repositories: accelerator,connector,guest-runtime,orchestrator,sandboxer
+          permission-contents: read
 
-      - name: Build the platform and run the E2E demo
+      - name: Assemble the five-repository workspace
         env:
-          UPDATE_BASELINE: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-        run: /opt/kuasar-ci/bin/run-e2e "$GITHUB_REPOSITORY" "$GITHUB_WORKSPACE" "$UPDATE_BASELINE"
+          GH_TOKEN: ${{ steps.source-token.outputs.token }}
+          CANDIDATE_REPOSITORY: ${{ github.repository }}
+          CANDIDATE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
 
-      - name: Upload E2E logs
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: bms-e2e-${{ github.event.repository.name }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: .ci-logs/
-          if-no-files-found: warn
-          include-hidden-files: true
-          retention-days: 14
+          repos=(accelerator connector guest-runtime orchestrator sandboxer)
+          rm -rf src
+          for repo in "${repos[@]}"; do
+            ref=main
+            if [[ "kuasar-sandbox/$repo" == "$CANDIDATE_REPOSITORY" ]]; then
+              ref="$CANDIDATE_SHA"
+            fi
+
+            mkdir -p "src/$repo"
+            curl --fail --show-error --silent --location \
+              --retry 4 --retry-all-errors --connect-timeout 10 --max-time 120 \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/repos/kuasar-sandbox/$repo/tarball/$ref" \
+              | tar -xz --strip-components=1 -C "src/$repo"
+          done
+
+          cd src
+          go work init ./accelerator ./connector ./guest-runtime ./orchestrator ./sandboxer
+
+      - name: Attach runner caches
+        run: |
+          set -euo pipefail
+
+          install -d -m 0755 /var/cache/kuasar/tarballs
+          for path in \
+            src/accelerator/build/tarball \
+            src/guest-runtime/native-deps/build/tarball \
+            src/sandboxer/native-deps/build/tarball
+          do
+            mkdir -p "$(dirname "$path")"
+            ln -sfn /var/cache/kuasar/tarballs "$path"
+          done
+
+          linux_file=$(awk '/^LINUX_TARBALL[[:space:]]*\?=/ { url=$3; sub(/\\#.*/, "", url); n=split(url, part, "/"); print part[n]; exit }' src/guest-runtime/native-deps/Makefile)
+          [[ "$linux_file" =~ ^linux-([0-9]+)\..*\.tar\.gz$ ]]
+          echo "LINUX_TARBALL=https://mirrors.tuna.tsinghua.edu.cn/kernel/v${BASH_REMATCH[1]}.x/$linux_file" >> "$GITHUB_ENV"
+
+          for image in python:3.12-slim python:3.12-alpine alpine:3.19 alpine:3.20 busybox:latest; do
+            if ! docker image inspect "$image" >/dev/null 2>&1; then
+              mirror="m.daocloud.io/docker.io/library/$image"
+              timeout 3m docker pull "$mirror"
+              docker tag "$mirror" "$image"
+            fi
+          done
+
+          tool_dir=src/orchestrator/release-builder/build/e2e-tools/x86_64
+          mkdir -p "$tool_dir"
+          ln -sfn /var/lib/kuasar-ci/tools/zot "$tool_dir/zot"
+          ln -sfn /var/lib/kuasar-ci/tools/versitygw "$tool_dir/versitygw"
+
+      - name: Build and test the platform
+        working-directory: src/orchestrator/release-builder
+        run: make test-e2e
