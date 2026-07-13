@@ -1215,12 +1215,14 @@ func (r *Registry) enqueueNodeListProjection(ctx context.Context, entry clusters
 	}
 	retryCtx := ctx
 	lifecycleCtx := false
-	r.mu.Lock()
-	if r.reaperCtx != nil {
-		retryCtx = r.reaperCtx
-		lifecycleCtx = true
+	if entry.Deleted {
+		r.mu.Lock()
+		if r.reaperCtx != nil {
+			retryCtx = r.reaperCtx
+			lifecycleCtx = true
+		}
+		r.mu.Unlock()
 	}
-	r.mu.Unlock()
 	next := cloneNodeListProjection(entry)
 	r.nodeListProjectMu.Lock()
 	if cur, found := r.nodeListProject[next.NodeID]; !found || nodeListProjectionNewer(next, cur) {
@@ -1289,18 +1291,41 @@ func (r *Registry) flushNodeListProjection(ctx context.Context) {
 	}
 	r.nodeListProjectMu.Unlock()
 	for _, entry := range batch {
-		if err := r.writeNodeListProjection(ctx, entry); err != nil {
-			if ctx.Err() != nil {
-				return
-			}
-			if !isNodeListProjectionRetryable(err) {
-				r.log.Warn("node-link: node_list projection retry rejected", "node", entry.NodeID, "deleted", entry.Deleted, "err", err)
-				r.clearPendingNodeListProjection(entry)
-			}
-			continue
-		}
-		r.clearPendingNodeListProjection(entry)
+		r.flushNodeListProjectionEntry(ctx, entry)
 	}
+}
+
+func (r *Registry) flushNodeListProjectionEntry(ctx context.Context, entry clusterstate.NodeListEntry) {
+	if !r.nodeListProjectionPending(entry) {
+		return
+	}
+	if !entry.Deleted {
+		if _, connected := r.node(entry.NodeID); !connected {
+			r.clearPendingNodeListProjection(entry)
+			return
+		}
+	}
+	if err := r.writeNodeListProjection(ctx, entry); err != nil {
+		if ctx.Err() != nil {
+			return
+		}
+		if !isNodeListProjectionRetryable(err) {
+			r.log.Warn("node-link: node_list projection retry rejected", "node", entry.NodeID, "deleted", entry.Deleted, "err", err)
+			r.clearPendingNodeListProjection(entry)
+		}
+		return
+	}
+	r.clearPendingNodeListProjection(entry)
+}
+
+func (r *Registry) nodeListProjectionPending(entry clusterstate.NodeListEntry) bool {
+	if r == nil || entry.NodeID == "" {
+		return false
+	}
+	r.nodeListProjectMu.Lock()
+	defer r.nodeListProjectMu.Unlock()
+	cur, found := r.nodeListProject[entry.NodeID]
+	return found && compareProjectionSource(cur, entry) == 0 && cur.Deleted == entry.Deleted
 }
 
 func (r *Registry) clearPendingNodeListProjection(entry clusterstate.NodeListEntry) {
@@ -1366,6 +1391,9 @@ func (r *Registry) updateNodeProfile(ctx context.Context, nodeID string, create 
 		} else if ok {
 			return rec, true, nil
 		}
+		if !create {
+			return nil, false, shardkv.ErrConflict
+		}
 	}
 	return nil, false, shardkv.ErrConflict
 }
@@ -1389,7 +1417,14 @@ func (r *Registry) RunReaper(ctx context.Context, deadAfter time.Duration) {
 	r.deadAfter = deadAfter
 	r.mu.Unlock()
 	r.nodeListProjectMu.Lock()
-	if len(r.nodeListProject) > 0 {
+	pendingDelete := false
+	for _, entry := range r.nodeListProject {
+		if entry.Deleted {
+			pendingDelete = true
+			break
+		}
+	}
+	if pendingDelete {
 		r.nodeListProjectCtx = ctx
 		r.nodeListProjectGen++
 		r.nodeListProjectRoot = true

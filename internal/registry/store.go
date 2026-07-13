@@ -17,6 +17,8 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 )
 
+const nodeListTombstoneRetention = time.Hour
+
 // SandboxState mirrors cluster.md route state. A missing/dead sandbox is
 // represented by no route row.
 type SandboxState string
@@ -324,7 +326,15 @@ func (s *Stores) Compact(ctx context.Context, now time.Time) (shardkv.GCStats, e
 	if store == nil {
 		return shardkv.GCStats{}, nil
 	}
-	return store.Compact(ctx, now)
+	stats, err := store.Compact(ctx, now)
+	if err != nil {
+		return stats, err
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	_, err = s.compactNodeListValueTombstones(ctx, now, nodeListTombstoneRetention)
+	return stats, err
 }
 
 func (s *Stores) SetShardTransport(transport shardkv.Transport, ready shardkv.MemberReadyProvider) {
@@ -390,7 +400,7 @@ func (s *Stores) rebuildShardStore() {
 		Layout: shardkv.Layout{Namespaces: map[shardkv.Namespace]shardkv.NamespaceSpec{
 			shardkv.Namespace(clusterstate.NamespaceRouteLink):  {ShardMemberCount: routeOwners, TombstoneRetention: time.Hour, WatchRetention: 10000, IdleShardTTL: time.Hour},
 			shardkv.Namespace(clusterstate.NamespaceNodeLink):   {ShardMemberCount: nodeOwners, TombstoneRetention: time.Hour, WatchRetention: 10000, IdleShardTTL: time.Hour},
-			shardkv.Namespace(clusterstate.NamespaceNodeList):   {ShardMemberCount: nodeListOwners, TombstoneRetention: time.Hour, WatchRetention: nodeListWatchRetention, Pinned: true},
+			shardkv.Namespace(clusterstate.NamespaceNodeList):   {ShardMemberCount: nodeListOwners, TombstoneRetention: nodeListTombstoneRetention, WatchRetention: nodeListWatchRetention, Pinned: true},
 			shardkv.Namespace(clusterstate.NamespacePlacerLink): {ShardMemberCount: scaleOwners, TombstoneRetention: time.Hour, WatchRetention: 10000, IdleShardTTL: time.Hour},
 		}},
 	})

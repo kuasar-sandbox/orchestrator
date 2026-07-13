@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"sort"
+	"time"
 
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/cluster/shardkv"
@@ -34,6 +35,39 @@ func (s *Stores) deleteNodeListEntryShard(ctx context.Context, nodeID string) er
 		return err
 	}
 	return shardDeleteIfFound(ctx, sh, clusterstate.NodeListRecordKey(nodeID))
+}
+
+func (s *Stores) compactNodeListValueTombstones(ctx context.Context, now time.Time, retention time.Duration) (int, error) {
+	if retention <= 0 {
+		return 0, nil
+	}
+	sh, err := s.nodeListRecordSet()
+	if err != nil {
+		return 0, err
+	}
+	snapshot, err := sh.Snapshot(ctx)
+	if err != nil {
+		return 0, err
+	}
+	compacted := 0
+	for _, rec := range snapshot.Records {
+		if rec.Meta.UpdatedAt.IsZero() || now.Sub(rec.Meta.UpdatedAt) < retention {
+			continue
+		}
+		entry, err := clusterstate.DecodeShardValue[clusterstate.NodeListEntry](rec.Value)
+		if err != nil {
+			return compacted, err
+		}
+		if !entry.Deleted {
+			continue
+		}
+		if _, ok, err := sh.DeleteValue(ctx, rec.Key, rec.Meta.Rev, rec.Value); err != nil {
+			return compacted, err
+		} else if ok {
+			compacted++
+		}
+	}
+	return compacted, nil
 }
 
 func (s *Stores) rangeNodeListShard(ctx context.Context, fn func(clusterstate.NodeListEntry) error) error {

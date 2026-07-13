@@ -2598,6 +2598,39 @@ func TestClaimedNodeProfileRejectsStaleRuntimeWriters(t *testing.T) {
 	}
 }
 
+func TestRuntimeProfileWriterDoesNotRetryIntoReconnectGeneration(t *testing.T) {
+	ctx := context.Background()
+	reg := testReg(t)
+	const nodeID = "runtime-generation-fence"
+	if _, err := reg.updateNodeRegister(ctx, &routesync.NodeRegister{NodeID: nodeID, DataEndpoint: "old"}); err != nil {
+		t.Fatal(err)
+	}
+	var interleaveErr error
+	interleaved := false
+	_, found, err := reg.updateNodeProfile(ctx, nodeID, false, func(rec *NodeRecord) {
+		if !interleaved {
+			interleaved = true
+			claimed, claimErr := reg.stores.claimNodeProfileReapShard(ctx, nodeID, rec.Meta.Rev)
+			if claimErr != nil || !claimed {
+				interleaveErr = fmt.Errorf("claim=%v err=%w", claimed, claimErr)
+				return
+			}
+			_, interleaveErr = reg.updateNodeRegister(ctx, &routesync.NodeRegister{NodeID: nodeID, DataEndpoint: "fresh"})
+		}
+		rec.ResumeToken = "stale-session"
+	})
+	if interleaveErr != nil {
+		t.Fatal(interleaveErr)
+	}
+	if !errors.Is(err, shardkv.ErrConflict) || found {
+		t.Fatalf("stale runtime writer found=%v err=%v", found, err)
+	}
+	profile, found, err := reg.stores.GetNodeProfile(ctx, nodeID)
+	if err != nil || !found || profile.DataEndpoint != "fresh" || profile.ResumeToken != "" {
+		t.Fatalf("fresh profile=%+v found=%v err=%v", profile, found, err)
+	}
+}
+
 func TestSweepDeadNodes(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
