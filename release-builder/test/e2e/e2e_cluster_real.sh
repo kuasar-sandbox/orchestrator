@@ -188,6 +188,9 @@ node_req() {
     [ -n "$body" ] && args+=(-H 'Content-Type: application/json' -d "$body")
     curl "${args[@]}" "http://127.0.0.1:$port$path"
 }
+json_field() {
+    python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[sys.argv[2]])' "$1" "$2"
+}
 
 router_req() {
     local method="$1" path="$2" key="$3" route_key="${4:-}" body="${5:-}"
@@ -347,18 +350,18 @@ EOF
     local code tid bid status
     code="$(node_req "$BUILD_PORT" POST /v3/templates "$BUILD_API_KEY" '{"name":"cluster-real-tmpl"}')"
     [ "$code" = "202" ] || { cat "$WORK/node-resp.body"; fail "template register returned $code"; }
-    tid="$(grep -o '"templateID":"[^"]*"' "$WORK/node-resp.body" | head -1 | cut -d'"' -f4)"
-    bid="$(grep -o '"buildID":"[^"]*"' "$WORK/node-resp.body" | head -1 | cut -d'"' -f4)"
+    tid="$(json_field "$WORK/node-resp.body" templateID)"
+    bid="$(json_field "$WORK/node-resp.body" buildID)"
     step "building template through temporary node: templateID=$tid buildID=$bid"
     code="$(node_req "$BUILD_PORT" POST "/v2/templates/$tid/builds/$bid" "$BUILD_API_KEY" "{\"fromImage\":\"$GUEST_REF\"}")"
     [ "$code" = "202" ] || { cat "$WORK/node-resp.body"; fail "template build trigger returned $code"; }
     TEMPLATE_REF=""
     for _ in $(seq 1 180); do
         node_req "$BUILD_PORT" GET "/templates/$tid/builds/$bid/status" "$BUILD_API_KEY" >/dev/null
-        status="$(grep -o '"status":"[^"]*"' "$WORK/node-resp.body" | head -1 | cut -d'"' -f4)"
+        status="$(json_field "$WORK/node-resp.body" status)"
         case "$status" in
             ready)
-                TEMPLATE_REF="$(grep -oE 'e2b-img-[0-9a-f]{64}' "$WORK/node-resp.body" | head -1)"
+                TEMPLATE_REF="$(json_field "$WORK/node-resp.body" templateID)"
                 break
                 ;;
             error)

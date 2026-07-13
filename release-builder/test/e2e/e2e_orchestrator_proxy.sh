@@ -159,6 +159,9 @@ req() {
     [ -n "$body" ] && args+=(-H 'Content-Type: application/json' -d "$body")
     curl "${args[@]}" "http://127.0.0.1:$PORT$path"
 }
+json_field() {
+    python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[sys.argv[2]])' "$1" "$2"
+}
 # data-plane request through the PROXY (:PROXY_PORT), Host <port>-<sid>.<domain>
 dp() {
     local port_sid="$1" path="$2" token="${3:-}"
@@ -269,7 +272,7 @@ truncate -s 2G "$BLD"
 # ---- orchestrator config: proxy_mode=external -----------------------------
 cat > "$WORK/config.yaml" <<EOF
 api: { domain: $DOMAIN, listen: ":$PORT" }
-proxy: { mode: external, auth: enforce, park_timeout: 90s }
+proxy: { mode: external, auth: enforce, park_timeout: 2s }
 mmds: { enabled: true, listen: "$PROXY_NS_IP:$MMDS_PORT" }
 encryption_key: "$ENC"
 manifest_config: $WORK/manifest.yaml
@@ -313,7 +316,7 @@ shm_path: $WORK/run/proxy-routes.shm
 route_capacity: 1024
 workers: 2
 auth: enforce
-park_timeout: 90s
+park_timeout: 2s
 mmds_listen: $PROXY_NS_IP:$MMDS_PORT
 metrics_listen: 127.0.0.1:$METRICS_PORT
 EOF
@@ -329,16 +332,16 @@ echo "==> PASS: external proxy workers and mmds_listen are in proxy_netns=$PROXY
 # ---- build a ready e2b template (native v3) --------------------------------
 code=$(req POST /v3/templates "$AK" '{"name":"proxy-tmpl"}')
 [ "$code" = "202" ] || { cat "$WORK/resp.body"; fail "register=$code"; }
-TID=$(grep -o '"templateID":"[^"]*"' "$WORK/resp.body" | head -1 | cut -d'"' -f4)
-BID=$(grep -o '"buildID":"[^"]*"' "$WORK/resp.body" | head -1 | cut -d'"' -f4)
+TID=$(json_field "$WORK/resp.body" templateID)
+BID=$(json_field "$WORK/resp.body" buildID)
 code=$(req POST "/v2/templates/$TID/builds/$BID" "$AK" "{\"fromImage\":\"$GUEST_REF\"}")
 [ "$code" = "202" ] || { cat "$WORK/resp.body"; fail "trigger=$code"; }
 TEMPLATE=""
 for _ in $(seq 1 120); do
     req GET "/templates/$TID/builds/$BID/status" "$AK" >/dev/null
-    st=$(grep -o '"status":"[^"]*"' "$WORK/resp.body" | head -1 | cut -d'"' -f4)
+    st=$(json_field "$WORK/resp.body" status)
     case "$st" in
-        ready) TEMPLATE=$(grep -oE 'e2b-img-[0-9a-f]{64}' "$WORK/resp.body" | head -1); break;;
+        ready) TEMPLATE=$(json_field "$WORK/resp.body" templateID); break;;
         error) cat "$WORK/resp.body"; fail "build error";;
     esac; sleep 1
 done
@@ -354,8 +357,8 @@ if [ "$code" != "201" ]; then
     [ -n "$SID" ] && { echo "==> sandbox journal:"; journalctl KUASAR_SANDBOX_ID="$SID" --no-pager -n 60 2>/dev/null | sed 's/^/  sandbox| /'; }
     fail "create=$code (want 201)"
 fi
-SID=$(grep -o '"sandboxID":"[^"]*"' "$WORK/resp.body" | head -1 | cut -d'"' -f4)
-ENVD_TOKEN=$(grep -o '"envdAccessToken":"[^"]*"' "$WORK/resp.body" | head -1 | cut -d'"' -f4)
+SID=$(json_field "$WORK/resp.body" sandboxID)
+ENVD_TOKEN=$(json_field "$WORK/resp.body" envdAccessToken)
 [ -n "$SID" ] && [ -n "$ENVD_TOKEN" ] || fail "missing sandboxID/envdAccessToken in create response"
 echo "==> PASS: sandbox $SID running (envd token captured)"
 

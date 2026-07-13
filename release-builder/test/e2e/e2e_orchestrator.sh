@@ -79,6 +79,9 @@ req() {
     [ -n "$body" ] && args+=(-H 'Content-Type: application/json' -d "$body")
     curl "${args[@]}" "http://127.0.0.1:$PORT$path"
 }
+json_field() {
+    python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[sys.argv[2]])' "$1" "$2"
+}
 
 # The control-plane / unit-install / build-API / ownership tests below do NOT need
 # a running vswitch — node-ctl only dials connector-ctl vswitch on sandbox *create*
@@ -146,8 +149,8 @@ echo "==> PASS: non-allowlisted manifest key refused (403)"
 # ---- 3. build API (e2b v3) + ownership ------------------------------------
 code=$(req POST /v3/templates "$AK" '{"name":"e2e-tmpl","tags":["e2e"]}')
 [ "$code" = "202" ] || { cat "$WORK/resp.body"; fail "register = $code (want 202)"; }
-TID=$(grep -o '"templateID":"[^"]*"' "$WORK/resp.body" | head -1 | cut -d'"' -f4)
-BID=$(grep -o '"buildID":"[^"]*"'    "$WORK/resp.body" | head -1 | cut -d'"' -f4)
+TID=$(json_field "$WORK/resp.body" templateID)
+BID=$(json_field "$WORK/resp.body" buildID)
 case "$TID" in transient-*) : ;; *) fail "register templateID=$TID (want transient-…)";; esac
 echo "==> register: templateID=$TID buildID=$BID"
 
@@ -164,7 +167,7 @@ status=""
 for i in $(seq 1 20); do
     code=$(req GET "/templates/$TID/builds/$BID/status" "$AK")
     [ "$code" = "200" ] || fail "status = $code (want 200)"
-    status=$(grep -o '"status":"[^"]*"' "$WORK/resp.body" | head -1 | cut -d'"' -f4)
+    status=$(json_field "$WORK/resp.body" status)
     echo "    build status: $status"
     case "$status" in ready|error) break;; esac
     sleep 1
@@ -180,7 +183,7 @@ if [ -n "${TEMPLATE_ID:-}" ]; then
     echo "==> create bare sandbox from TEMPLATE_ID=$TEMPLATE_ID"
     code=$(req POST /sandboxes "$AK" "{\"templateID\":\"$TEMPLATE_ID\",\"timeout\":30}")
     [ "$code" = "201" ] || { cat "$WORK/resp.body"; fail "create = $code (want 201)"; }
-    SID=$(grep -o '"sandboxID":"[^"]*"' "$WORK/resp.body" | head -1 | cut -d'"' -f4)
+    SID=$(json_field "$WORK/resp.body" sandboxID)
     echo "    sandboxID=$SID"
     code=$(req GET /v2/sandboxes "$AK"); [ "$code" = "200" ] || fail "list = $code"
     grep -q "$SID" "$WORK/resp.body" || fail "created sandbox $SID not in list"

@@ -280,11 +280,14 @@ req() { # method path key [body]
     [ -n "$body" ] && args+=(-H 'Content-Type: application/json' -d "$body")
     curl "${args[@]}" "http://127.0.0.1:$PORT$path"
 }
+json_field() {
+    python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[sys.argv[2]])' "$1" "$2"
+}
 register() { # name → sets TID/BID
     local code; code=$(req POST /v3/templates "$AK" "{\"name\":\"$1\"}")
     [ "$code" = "202" ] || { cat "$WORK/resp.body"; fail "register $1 = $code (want 202)"; }
-    TID=$(grep -o '"templateID":"[^"]*"' "$WORK/resp.body" | head -1 | cut -d'"' -f4)
-    BID=$(grep -o '"buildID":"[^"]*"'    "$WORK/resp.body" | head -1 | cut -d'"' -f4)
+    TID=$(json_field "$WORK/resp.body" templateID)
+    BID=$(json_field "$WORK/resp.body" buildID)
 }
 diag() { # bid — failure diagnostics (workdir is reaped by the orchestrator)
     echo "---- orchestrator log (tail) ----"
@@ -297,11 +300,11 @@ wait_ready() { # tid bid label → sets PERSIST (e2b-{img,snp}-<64hex>)
     for _ in $(seq 1 240); do
         code=$(req GET "/templates/$tid/builds/$bid/status" "$AK")
         [ "$code" = "200" ] || fail "$label status = $code (want 200)"
-        status=$(grep -o '"status":"[^"]*"' "$WORK/resp.body" | head -1 | cut -d'"' -f4)
+        status=$(json_field "$WORK/resp.body" status)
         case "$status" in
             ready)
-                PERSIST=$(grep -oE 'e2b-(img|snp)-[0-9a-f]{64}' "$WORK/resp.body" | head -1)
-                [ -n "$PERSIST" ] || fail "$label ready but no persist id: $(cat "$WORK/resp.body")"
+                PERSIST=$(json_field "$WORK/resp.body" templateID)
+                [[ "$PERSIST" =~ ^e2b-(img|snp)-[0-9a-f]{64}$ ]] || fail "$label ready but invalid persist id: $(cat "$WORK/resp.body")"
                 return 0;;
             error)
                 echo "    $label error response: $(cat "$WORK/resp.body")"
@@ -468,7 +471,7 @@ fi
 echo "==> create sandbox from $B3_PERSIST (snapshot restore path)"
 code=$(req POST /sandboxes "$AK" "{\"templateID\":\"$B3_PERSIST\",\"timeout\":60}")
 [ "$code" = "201" ] || { cat "$WORK/resp.body"; diag "$B3_BID"; fail "create = $code (want 201)"; }
-SID=$(grep -o '"sandboxID":"[^"]*"' "$WORK/resp.body" | head -1 | cut -d'"' -f4)
+SID=$(json_field "$WORK/resp.body" sandboxID)
 [ -n "$SID" ] || fail "create returned no sandboxID"
 code=$(req GET /v2/sandboxes "$AK"); [ "$code" = "200" ] || fail "list = $code (want 200)"
 grep -q "$SID" "$WORK/resp.body" || fail "created sandbox $SID not in list"
