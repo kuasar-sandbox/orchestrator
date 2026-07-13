@@ -418,6 +418,66 @@ shutdown_sandbox() {
     return 1
 }
 
+wait_for_workload() {
+    local sid="$1" pid="$2" timeout="$3"
+    local deadline=$((SECONDS + timeout))
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        grep -q "workload done" "$WORK/$sid.log" 2>/dev/null && return 0
+        kill -0 "$pid" 2>/dev/null || fail "$sid: sandbox exited before workload completed"
+        sleep 0.5
+    done
+    fail "$sid: workload did not complete within ${timeout}s"
+}
+
+wait_for_controller_activity() {
+    local sid="$1" timeout="$2"
+    local deadline=$((SECONDS + timeout))
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        if grep -q " grant .* sid=$sid " "$WORK/daemon.log" 2>/dev/null \
+            || grep -q "reclaim sid=$sid" "$WORK/audit.log" 2>/dev/null; then
+            return 0
+        fi
+        sleep 0.5
+    done
+    fail "$sid: controller recorded neither a grant nor a reclaim within ${timeout}s"
+}
+
+memory_event_count() {
+    local sid="$1" event="$2" events="/sys/fs/cgroup/sandboxes/$sid/memory.events.local"
+    [ -f "$events" ] || { echo 0; return; }
+    awk -v event="$event" '$1 == event { print $2; found=1 } END { if (!found) print 0 }' "$events"
+}
+
+wait_for_memory_pressure() {
+    local sid="$1" pid="$2" timeout="$3"
+    local deadline=$((SECONDS + timeout))
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        if [ "$(memory_event_count "$sid" oom)" -gt 0 ] \
+            || [ "$(memory_event_count "$sid" high)" -gt 0 ]; then
+            return 0
+        fi
+        kill -0 "$pid" 2>/dev/null || return 0
+        sleep 0.5
+    done
+    fail "$sid: no memory pressure event within ${timeout}s"
+}
+
+reservation_count() {
+    python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1])).get("reservations", {})))' \
+        "$WORK/state.json" 2>/dev/null || echo 0
+}
+
+wait_for_reservations() {
+    local want="$1" timeout="$2" count=0
+    local deadline=$((SECONDS + timeout))
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        count=$(reservation_count)
+        [ "$count" -ge "$want" ] && { echo "$count"; return 0; }
+        sleep 0.25
+    done
+    fail "only $count reservations after ${timeout}s (expected $want)"
+}
+
 phase_a() {
     echo
     echo "==> Phase A: auto resource allocation (1 sandbox, dynamic)"
@@ -438,9 +498,10 @@ phase_a() {
     local pid=$!
     SANDBOX_PIDS+=("$pid")
 
-    # Wait for guest cold-start (5-15s) + workload (20s) + margin for
-    # grant/reclaim observation. Cold cache amplifies guest boot variance.
-    sleep 45
+    # Bound cold-start and workload completion independently from controller
+    # activity so a fast run does not pay the full worst-case allowance.
+    wait_for_workload "$sid" "$pid" 40
+    wait_for_controller_activity "$sid" 10
 
     # Inspect post-conditions BEFORE shutting the sandbox down.
     grep -q "admit token=.* sid=$sid" "$WORK/audit.log" || fail "A: no admit in audit"
@@ -494,8 +555,8 @@ phase_b1_static() {
     local pid=$!
     SANDBOX_PIDS+=("$pid")
 
-    # Guest boot + 15s workload + margin; OOM may fire mid-grow.
-    sleep 35
+    # The assertion is the pressure event, not elapsed wall time.
+    wait_for_memory_pressure "$sid" "$pid" 35
 
     # Inspect cgroup memory.events.local for the OOM signature BEFORE
     # rmdir. Note: the OOM is INSIDE the guest, but the host's cgroup
@@ -545,7 +606,7 @@ phase_b2_dynamic() {
     local pid=$!
     SANDBOX_PIDS+=("$pid")
 
-    sleep 35
+    wait_for_workload "$sid" "$pid" 35
 
     local oom=0 grants=0
     if [ -f "/sys/fs/cgroup/sandboxes/$sid/memory.events.local" ]; then
@@ -599,18 +660,8 @@ phase_c() {
         SANDBOX_PIDS+=("$p")
     done
 
-    # Let the four admits land + reserve (each commits its 64MiB floor to
-    # NodeAllocated). The 5th rejection is deterministic — it rides on those four
-    # committed floors crossing the red water mark (see write_compact_config), which
-    # the reclaimer cannot free below floor and which settling does not release — so
-    # this wait is just to ensure the four reservations exist, not a timing bet.
-    sleep 5
-
     local nres
-    nres=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(len(d.get("reservations", {})))' "$WORK/state.json" 2>/dev/null || echo 0)
-    if [ "$nres" -lt 4 ]; then
-        fail "C: only $nres reservations after 4 admits (expected 4)"
-    fi
+    nres=$(wait_for_reservations 4 10)
     echo "  $nres reservations after 4 sandboxes launched"
 
     # 5th synchronous attempt — must be rejected at admit. Capped at 15s
@@ -635,9 +686,8 @@ phase_c() {
     fi
     echo "  5th sandbox-ctl run rc=$rc with reject message"
 
-    # Workload duration is 8s; let the 4 finish their workload then SIGTERM
-    # to avoid hanging on CH reboot path.
-    sleep 10
+    # Phase C exercises admission only; stop the placeholders as soon as the
+    # rejection has been observed.
     local idx=0
     for p in "${c_pids[@]}"; do
         idx=$((idx+1))
