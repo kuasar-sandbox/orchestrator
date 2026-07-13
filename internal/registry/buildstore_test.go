@@ -173,6 +173,28 @@ func TestBuildEventsResolveSameIDByNodeOwnerTable(t *testing.T) {
 	}
 }
 
+func TestTerminalBuildStoreRetryOutlivesLinkContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	attempts := 0
+	err := retryTerminalBuildStore(ctx, func(writeCtx context.Context) error {
+		if err := writeCtx.Err(); err != nil {
+			t.Fatalf("retry inherited canceled node-link context: %v", err)
+		}
+		attempts++
+		if attempts < 3 {
+			return shardkv.ErrQuorum
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("retry terminal build store: %v", err)
+	}
+	if attempts != 3 {
+		t.Fatalf("attempts=%d, want 3", attempts)
+	}
+}
+
 func TestReserveBuildKeepsCommittedBuildOnAckTimeout(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)

@@ -76,9 +76,9 @@ func usage() {
   node-stub-ctl nodes|events|data-hits|commands --admin http://HOST:PORT
   node-stub-ctl node {restart-link|reboot-empty|crash|start|drain|undrain} NODE --admin http://HOST:PORT
   node-stub-ctl sandbox list --admin http://HOST:PORT [--node NODE]
-  node-stub-ctl sandbox create --admin http://HOST:PORT --node NODE --group G --route-key R [--sid SID]
+  node-stub-ctl sandbox create --admin http://HOST:PORT --node NODE [--sid SID] [--metadata k=v ...]
   node-stub-ctl sandbox delete --admin http://HOST:PORT --node NODE --sid SID
-  node-stub-ctl sandbox orphan --admin http://HOST:PORT --node NODE --group G --route-key R --sid SID
+  node-stub-ctl sandbox orphan --admin http://HOST:PORT --node NODE --sid SID [--metadata k=v ...]
   node-stub-ctl build list --admin http://HOST:PORT [--node NODE]
   node-stub-ctl version`)
 	os.Exit(2)

@@ -35,6 +35,11 @@ var defaultBuildResources = &routesync.BuildResources{CPU: 1000, Mem: 1 << 30}
 
 const buildRegisterAckTimeout = 5 * time.Second
 
+const (
+	terminalBuildStoreAttempts   = 5
+	terminalBuildStoreRetryDelay = 20 * time.Millisecond
+)
+
 var errNodeBuildIDConflict = errors.New("registry: build id is already owned by another group on this node")
 
 // ReserveBuild places a build on a resource-eligible node and pre-provisions it
@@ -226,13 +231,52 @@ func (r *Registry) applyBuildEvent(ctx context.Context, nodeID string, e *routes
 		rec.TemplateID = e.TemplateID
 	}
 	rec.Reason = e.Reason
-	if err := r.stores.PutBuild(ctx, rec); err != nil {
+	terminal := !rec.occupies()
+	if terminal {
+		// Build events are transition-only. Free the volatile capacity lease even
+		// when route_link persistence is temporarily unavailable.
+		r.releaseBuildAdmission(rec.NodeID, rec.Group, rec.BuildID)
+	}
+	put := func(writeCtx context.Context) error { return r.stores.PutBuild(writeCtx, rec) }
+	var writeErr error
+	if terminal {
+		writeErr = retryTerminalBuildStore(ctx, put)
+	} else {
+		writeErr = put(ctx)
+	}
+	if writeErr != nil {
+		r.log.Warn("registry: persist build event", "node", nodeID, "build", rec.BuildID, "state", rec.State, "err", writeErr)
 		return
 	}
-	if !rec.occupies() {
-		r.releaseBuildAdmission(rec.NodeID, rec.Group, rec.BuildID)
-		_ = r.stores.RemoveNodeBuildRef(ctx, rec.NodeID, rec.BuildID)
+	if terminal {
+		if err := retryTerminalBuildStore(ctx, func(writeCtx context.Context) error {
+			return r.stores.RemoveNodeBuildRef(writeCtx, rec.NodeID, rec.BuildID)
+		}); err != nil {
+			r.log.Warn("registry: remove terminal build ownership", "node", nodeID, "build", rec.BuildID, "err", err)
+		}
 	}
+}
+
+func retryTerminalBuildStore(ctx context.Context, operation func(context.Context) error) error {
+	retryCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), lifecycleAckTimeout)
+	defer cancel()
+	var lastErr error
+	for attempt := 0; attempt < terminalBuildStoreAttempts; attempt++ {
+		if lastErr = operation(retryCtx); lastErr == nil {
+			return nil
+		}
+		if attempt+1 == terminalBuildStoreAttempts {
+			break
+		}
+		timer := time.NewTimer(time.Duration(attempt+1) * terminalBuildStoreRetryDelay)
+		select {
+		case <-retryCtx.Done():
+			timer.Stop()
+			return retryCtx.Err()
+		case <-timer.C:
+		}
+	}
+	return lastErr
 }
 
 func (r *Registry) lookupNodeBuildRef(ctx context.Context, nodeID, buildID string) (clusterstate.NodeBuildRef, bool, error) {
