@@ -161,14 +161,6 @@ func (r *Registry) importSnapshotRoute(ctx context.Context, route *SandboxRecord
 			return err
 		}
 	}
-	if previousFound && previous.NodeID != "" && previous.SID != "" &&
-		(previous.NodeID != route.NodeID || previous.SID != route.SID) {
-		if err := r.stores.removeNodeSandboxRefShardIfMatch(ctx, previous.NodeID, clusterstate.NodeSandboxRef{
-			SandboxID: previous.SID, Group: previous.Group, RouteKey: previous.RouteKey,
-		}); err != nil {
-			return fmt.Errorf("remove previous node sandbox %q: %w", previous.SID, err)
-		}
-	}
 	return nil
 }
 

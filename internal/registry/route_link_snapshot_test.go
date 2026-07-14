@@ -191,9 +191,11 @@ func TestSnapshotImportRestoresExistingRouteOnOwnershipConflict(t *testing.T) {
 	}
 }
 
-func TestSnapshotImportReplacesExistingRouteOwnership(t *testing.T) {
+func TestSnapshotImportRetainsReplacedRouteOwnershipUntilNodeDeletes(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
+	owner := &routingNodeOwnerRecorder{}
+	reg.nodeOwner = owner
 	previous := &SandboxRecord{
 		Group: "/target", RouteKey: "rk", SID: "old", NodeID: "n1", State: StateReady,
 	}
@@ -219,11 +221,27 @@ func TestSnapshotImportReplacesExistingRouteOwnership(t *testing.T) {
 	if err != nil || !found || got.SID != imported.SID || got.NodeID != imported.NodeID {
 		t.Fatalf("imported route=%+v found=%v err=%v", got, found, err)
 	}
-	if ref, found, err := reg.stores.GetNodeSandboxRef(ctx, previous.NodeID, previous.SID); err != nil || found {
+	if ref, found, err := reg.stores.GetNodeSandboxRef(ctx, previous.NodeID, previous.SID); err != nil || !found || ref.Group != previous.Group || ref.RouteKey != previous.RouteKey {
 		t.Fatalf("previous ownership=%+v found=%v err=%v", ref, found, err)
 	}
 	if ref, found, err := reg.stores.GetNodeSandboxRef(ctx, imported.NodeID, imported.SID); err != nil || !found || ref.Group != imported.Group || ref.RouteKey != imported.RouteKey {
 		t.Fatalf("imported ownership=%+v found=%v err=%v", ref, found, err)
+	}
+	reg.applyRoute(ctx, previous.NodeID, &routesync.RouteEntry{
+		SandboxID: previous.SID, State: routesync.StateRunning,
+	})
+	if len(owner.deleted) != 1 || owner.deleted[0] != previous.NodeID+"/"+previous.SID {
+		t.Fatalf("orphan deletes=%v", owner.deleted)
+	}
+	reg.applyRoute(ctx, previous.NodeID, &routesync.RouteEntry{
+		SandboxID: previous.SID, State: routesync.StateDead,
+	})
+	if ref, found, err := reg.stores.GetNodeSandboxRef(ctx, previous.NodeID, previous.SID); err != nil || found {
+		t.Fatalf("deleted ownership=%+v found=%v err=%v", ref, found, err)
+	}
+	got, _, found, err = reg.stores.GetSandbox(ctx, imported.Group, imported.RouteKey)
+	if err != nil || !found || got.SID != imported.SID || got.NodeID != imported.NodeID {
+		t.Fatalf("imported route after old delete=%+v found=%v err=%v", got, found, err)
 	}
 }
 
