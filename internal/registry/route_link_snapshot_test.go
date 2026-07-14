@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
+	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 )
 
@@ -110,6 +112,37 @@ func TestSnapshotRouteLinkAPI(t *testing.T) {
 	}
 	if route, _, found, err := reg.stores.GetSandbox(ctx, "/g", "rk"); err != nil || !found || route.SID != "sb-1" || route.AccessToken != "tok" {
 		t.Fatalf("imported route=%+v found=%v err=%v", route, found, err)
+	}
+}
+
+func TestSnapshotImportRejectsSameNodeSandboxIDCollision(t *testing.T) {
+	ctx := context.Background()
+	reg := testReg(t)
+	existing := &SandboxRecord{
+		Group: "/existing", RouteKey: "rk-existing", SID: "same", NodeID: "n1", State: StateReady,
+	}
+	if _, err := reg.stores.PutSandbox(ctx, existing); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.stores.AddNodeSandboxRef(ctx, "n1", clusterstate.NodeSandboxRef{
+		Group: existing.Group, RouteKey: existing.RouteKey, SandboxID: existing.SID,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var raw bytes.Buffer
+	if err := json.NewEncoder(&raw).Encode(SnapshotRecord{Type: SnapshotKindRoute, Route: &SandboxRecord{
+		Group: "/imported", RouteKey: "rk-imported", SID: "same", NodeID: "n1", State: StateReady,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reg.ImportSnapshot(ctx, &raw); !errors.Is(err, errNodeSandboxIDConflict) {
+		t.Fatalf("ImportSnapshot err=%v", err)
+	}
+	if ref, found, err := reg.stores.GetNodeSandboxRef(ctx, "n1", "same"); err != nil || !found || ref.Group != existing.Group || ref.RouteKey != existing.RouteKey {
+		t.Fatalf("original ownership=%+v found=%v err=%v", ref, found, err)
+	}
+	if _, _, found, err := reg.stores.GetSandbox(ctx, "/imported", "rk-imported"); err != nil || found {
+		t.Fatalf("conflicting imported route found=%v err=%v", found, err)
 	}
 }
 
