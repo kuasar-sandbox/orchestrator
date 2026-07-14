@@ -585,7 +585,8 @@ node_link 维护以下 recordSet:
 - `manifest_key`:selector patch 刷新的 key cache。
 
 心跳只更新 `profile` recordSet 中的 runtime/liveness 字段,不得重写 `sandbox`、`build`、`manifest_key`
-recordSet。sandbox/build 表由 cluster 在任务下发前写入,终态清理;manifest_key 由 selector patch 更新。
+recordSet。sandbox/build 表由 cluster 在任务下发前写入。build 终态只释放容量,归属记录保留到对应
+build record 删除;manifest_key 由 selector patch 更新。
 node 既不生成也不解析 group,只把 sandbox/build metadata 原样保存。这样高频心跳不会把无关 recordSet
 的 CAS 队列拖慢。
 

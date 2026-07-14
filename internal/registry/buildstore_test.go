@@ -127,6 +127,7 @@ func TestReserveBuildRejectsSameNodeIDCollisionAcrossGroups(t *testing.T) {
 	if first.NodeID != "n1" {
 		t.Fatalf("first placement=%+v", first)
 	}
+	reg.applyBuildEvent(ctx, "n1", &routesync.BuildEvent{BuildID: buildID, State: string(BuildReady)})
 	if _, err := reg.ReserveBuild(ctx, BuildReserveReq{Group: "/g2", BuildID: buildID}); !errors.Is(err, errNodeBuildIDConflict) {
 		t.Fatalf("second reserve err=%v, want node build-id conflict", err)
 	}
@@ -138,9 +139,12 @@ func TestReserveBuildRejectsSameNodeIDCollisionAcrossGroups(t *testing.T) {
 	if _, found, err := reg.stores.GetBuildInGroup(ctx, "/g2", buildID); err != nil || found {
 		t.Fatalf("conflicting build record remained: found=%v err=%v", found, err)
 	}
-	wantReleased := "n1/" + buildAdmissionID("/g2", buildID)
-	if len(owner.released) != 1 || owner.released[0] != wantReleased {
-		t.Fatalf("released=%q, want [%q]", owner.released, wantReleased)
+	wantReleased := []string{
+		"n1/" + buildAdmissionID("/g1", buildID),
+		"n1/" + buildAdmissionID("/g2", buildID),
+	}
+	if len(owner.released) != len(wantReleased) || owner.released[0] != wantReleased[0] || owner.released[1] != wantReleased[1] {
+		t.Fatalf("released=%q, want %q", owner.released, wantReleased)
 	}
 }
 

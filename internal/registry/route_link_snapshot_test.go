@@ -55,7 +55,7 @@ func TestSnapshotIncludesBuildRecords(t *testing.T) {
 	src := testReg(t)
 	if err := src.stores.PutBuild(ctx, &BuildRecord{
 		Group: "/g", BuildID: "bld-1", NodeID: "n1", Resources: &routesync.BuildResources{CPU: 1000},
-		State: BuildBuilding, TemplateID: "tmpl-1", Reason: "running", CreatedU: 99,
+		State: BuildReady, TemplateID: "tmpl-1", CreatedU: 99,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -77,8 +77,12 @@ func TestSnapshotIncludesBuildRecords(t *testing.T) {
 		t.Fatal(err)
 	}
 	got, found, err := dst.stores.GetBuildInGroup(ctx, "/g", "bld-1")
-	if err != nil || !found || got.State != BuildBuilding || got.Resources == nil || got.Resources.CPU != 1000 || got.CreatedU != 99 {
+	if err != nil || !found || got.State != BuildReady || got.Resources == nil || got.Resources.CPU != 1000 || got.CreatedU != 99 {
 		t.Fatalf("imported build=%+v found=%v err=%v", got, found, err)
+	}
+	ref, found, err := dst.stores.GetNodeBuildRef(ctx, "n1", "bld-1")
+	if err != nil || !found || ref.Group != "/g" {
+		t.Fatalf("imported terminal ownership=%+v found=%v err=%v", ref, found, err)
 	}
 }
 
