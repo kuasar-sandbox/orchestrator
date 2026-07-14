@@ -16,6 +16,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/go-containerregistry/pkg/name"
+
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 )
 
@@ -34,8 +36,12 @@ func (p *buildPipeline) phaseImport() error {
 
 	var refSupported bool
 	var refSubject string
+	importRef := s.FromImage
 	if s.ImportReferer.Enabled {
 		lookup, err := p.lookupImportReferer(sb)
+		if err == nil {
+			importRef = importSourceReference(s.FromImage, lookup)
+		}
 		switch {
 		case err != nil:
 			if !s.ImportReferer.Fallback {
@@ -70,12 +76,12 @@ func (p *buildPipeline) phaseImport() error {
 	if s.Platform != "" {
 		args = append(args, "--platform", s.Platform)
 	}
-	args = append(args, "--output", "-", s.FromImage)
+	args = append(args, "--output", "-", importRef)
 
 	p.imagePath = filepath.Join(s.Workdir, "image.img")
 	ctx, cancel := context.WithTimeout(p.ctx, time.Duration(s.Timeouts.PullSec)*time.Second)
 	defer cancel()
-	p.progress("import: pulling + flattening %s", s.FromImage)
+	p.progress("import: pulling + flattening %s", importRef)
 	if err := sb.exec(ctx, execOpts{env: p.tenantEnv(), stdoutTo: p.imagePath, stderrTo: "journald=" + buildTag},
 		append([]string{guestFlatten}, args...)...); err != nil {
 		return err
@@ -107,6 +113,26 @@ type importRefererLookup struct {
 	ManifestID string `json:"manifest_id"`
 }
 
+func importSourceReference(original string, lookup importRefererLookup) string {
+	if lookup.Supported {
+		return lookup.Subject
+	}
+	return original
+}
+
+func decodeImportRefererLookup(data []byte) (importRefererLookup, error) {
+	var out importRefererLookup
+	if err := json.Unmarshal(data, &out); err != nil {
+		return importRefererLookup{}, fmt.Errorf("parse lookup result: %w", err)
+	}
+	if out.Supported {
+		if _, err := name.NewDigest(out.Subject); err != nil {
+			return importRefererLookup{}, fmt.Errorf("lookup result subject is not a digest: %w", err)
+		}
+	}
+	return out, nil
+}
+
 func (p *buildPipeline) lookupImportReferer(sb *phaseSandbox) (importRefererLookup, error) {
 	s := p.spec
 	if s.ImportReferer.Owner == "" {
@@ -132,14 +158,7 @@ func (p *buildPipeline) lookupImportReferer(sb *phaseSandbox) (importRefererLook
 	if err != nil {
 		return importRefererLookup{}, err
 	}
-	var out importRefererLookup
-	if err := json.Unmarshal(data, &out); err != nil {
-		return importRefererLookup{}, fmt.Errorf("parse lookup result: %w", err)
-	}
-	if out.Supported && out.Subject == "" {
-		return importRefererLookup{}, fmt.Errorf("lookup result missing subject")
-	}
-	return out, nil
+	return decodeImportRefererLookup(data)
 }
 
 func (p *buildPipeline) useImportRefererHit(id string) error {
