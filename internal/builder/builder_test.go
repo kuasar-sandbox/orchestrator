@@ -1,11 +1,37 @@
 package builder
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 )
+
+func TestDecodeImportRefererLookupRequiresDigestSubject(t *testing.T) {
+	digest := strings.Repeat("a", 64)
+	valid := fmt.Sprintf(`{"supported":true,"subject":"registry.example/repo@sha256:%s"}`, digest)
+	got, err := decodeImportRefererLookup([]byte(valid))
+	if err != nil || got.Subject != "registry.example/repo@sha256:"+digest {
+		t.Fatalf("valid lookup=%+v err=%v", got, err)
+	}
+	if ref := importSourceReference("registry.example/repo:latest", got); ref != got.Subject {
+		t.Fatalf("supported import ref = %q, want %q", ref, got.Subject)
+	}
+	for _, raw := range []string{
+		`{"supported":true,"subject":"registry.example/repo:latest"}`,
+		`{"supported":true,"subject":""}`,
+	} {
+		if _, err := decodeImportRefererLookup([]byte(raw)); err == nil {
+			t.Fatalf("accepted mutable/empty supported subject: %s", raw)
+		}
+	}
+	if got, err := decodeImportRefererLookup([]byte(`{"supported":false,"subject":""}`)); err != nil || got.Supported {
+		t.Fatalf("unsupported lookup=%+v err=%v", got, err)
+	} else if ref := importSourceReference("registry.example/repo:latest", got); ref != "registry.example/repo:latest" {
+		t.Fatalf("unsupported import ref = %q", ref)
+	}
+}
 
 // TestParseTemplateDisk covers the fromTemplate disk extraction: a base
 // template's `sandbox-ctl info --json` must yield both the erofs base image

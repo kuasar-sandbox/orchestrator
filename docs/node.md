@@ -1001,7 +1001,8 @@ microVM(`sandbox-ctl run` 直接子进程);A 阶段就绪探针 = guest 内
   未过期的 referrer,hit 时宿主校验
   返回的 manifest id 后直接用 `manifest://<id>` 作 base,跳过拉取与展平。lookup
   unsupported/error 时按 `fallback` 继续或失败。miss 时 guest 内
-  `flatten-ctl export --output - <fromImage>` 拉取 + 展平,tarstream 镜像工件经 exec
+  `flatten-ctl export --output - <subject digest>` 拉取 + 展平,确保 lookup、export 与后续
+  writeback 使用同一不可变镜像身份;tarstream 镜像工件经 exec
   stdio 流回宿主 `workdir/image.img`;若 lookup 已确认 registry 支持 Referrers 且
   `writeback=true`,宿主立即 `manifest-ctl store image.img` 得到 manifest id 并把 base
   改为 `manifest://<id>`,随后在 guest 内 `flatten-ctl referer put --owner <owner>
