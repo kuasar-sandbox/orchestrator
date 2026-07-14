@@ -227,6 +227,37 @@ func TestSnapshotImportReplacesExistingRouteOwnership(t *testing.T) {
 	}
 }
 
+func TestSnapshotRouteRollbackOutlivesCanceledRequest(t *testing.T) {
+	ctx := context.Background()
+	reg := testReg(t)
+	previous := &SandboxRecord{
+		Group: "/g", RouteKey: "rk", SID: "old", NodeID: "n1", State: StateReady,
+	}
+	if _, err := reg.stores.PutSandbox(ctx, previous); err != nil {
+		t.Fatal(err)
+	}
+	_, previousRev, found, err := reg.stores.GetSandbox(ctx, previous.Group, previous.RouteKey)
+	if err != nil || !found {
+		t.Fatalf("previous route found=%v err=%v", found, err)
+	}
+	imported := &SandboxRecord{
+		Group: previous.Group, RouteKey: previous.RouteKey, SID: "imported", NodeID: "n2", State: StateReady,
+	}
+	importRev, ok, err := reg.stores.CASSandbox(ctx, imported, previousRev)
+	if err != nil || !ok {
+		t.Fatalf("install imported route ok=%v err=%v", ok, err)
+	}
+	canceled, cancel := context.WithCancel(ctx)
+	cancel()
+	if err := reg.restoreSnapshotRoute(canceled, imported, importRev, previous, true); err != nil {
+		t.Fatalf("restore canceled import: %v", err)
+	}
+	got, _, found, err := reg.stores.GetSandbox(ctx, previous.Group, previous.RouteKey)
+	if err != nil || !found || got.SID != previous.SID || got.NodeID != previous.NodeID {
+		t.Fatalf("restored route=%+v found=%v err=%v", got, found, err)
+	}
+}
+
 func TestSnapshotExportRequiresGroup(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
