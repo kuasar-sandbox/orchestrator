@@ -149,30 +149,25 @@ func (s *Stores) addNodeSandboxRefShard(ctx context.Context, nodeID string, ref 
 }
 
 func (s *Stores) getNodeSandboxRefShard(ctx context.Context, nodeID, sandboxID string) (clusterstate.NodeSandboxRef, bool, error) {
-	ref, _, found, err := s.getNodeSandboxRefShardWithRevision(ctx, nodeID, sandboxID)
-	return ref, found, err
-}
-
-func (s *Stores) getNodeSandboxRefShardWithRevision(ctx context.Context, nodeID, sandboxID string) (clusterstate.NodeSandboxRef, uint64, bool, error) {
 	if nodeID == "" || sandboxID == "" {
-		return clusterstate.NodeSandboxRef{}, 0, false, nil
+		return clusterstate.NodeSandboxRef{}, false, nil
 	}
 	sh, err := s.nodeLinkRecordSet(nodeID, clusterstate.RecordSetNodeSandbox)
 	if err != nil {
-		return clusterstate.NodeSandboxRef{}, 0, false, err
+		return clusterstate.NodeSandboxRef{}, false, err
 	}
 	rec, found, err := sh.Get(ctx, clusterstate.NodeSandboxRecordKey(sandboxID))
 	if err != nil || !found {
-		return clusterstate.NodeSandboxRef{}, 0, found, err
+		return clusterstate.NodeSandboxRef{}, found, err
 	}
 	ref, err := clusterstate.DecodeShardValue[clusterstate.NodeSandboxRef](rec.Value)
 	if err != nil {
-		return clusterstate.NodeSandboxRef{}, 0, false, err
+		return clusterstate.NodeSandboxRef{}, false, err
 	}
 	if ref.SandboxID != sandboxID || ref.Group == "" || ref.RouteKey == "" {
-		return clusterstate.NodeSandboxRef{}, 0, false, errors.New("registry: invalid node sandbox ref")
+		return clusterstate.NodeSandboxRef{}, false, errors.New("registry: invalid node sandbox ref")
 	}
-	return ref, rec.Meta.Rev, true, nil
+	return ref, true, nil
 }
 
 func (s *Stores) removeNodeSandboxRefShard(ctx context.Context, nodeID, sandboxID string) error {
@@ -184,29 +179,6 @@ func (s *Stores) removeNodeSandboxRefShard(ctx context.Context, nodeID, sandboxI
 		return err
 	}
 	return shardDeleteIfFound(ctx, sh, clusterstate.NodeSandboxRecordKey(sandboxID))
-}
-
-func (s *Stores) removeNodeSandboxRefShardIfMatch(ctx context.Context, nodeID string, expected clusterstate.NodeSandboxRef) error {
-	if nodeID == "" || expected.SandboxID == "" || expected.Group == "" || expected.RouteKey == "" {
-		return errors.New("registry: invalid node sandbox ref")
-	}
-	for attempt := 0; attempt < 5; attempt++ {
-		current, rev, found, err := s.getNodeSandboxRefShardWithRevision(ctx, nodeID, expected.SandboxID)
-		if err != nil || !found {
-			return err
-		}
-		if current != expected {
-			return nil
-		}
-		deleted, err := s.removeNodeSandboxRefShardAtRevision(ctx, nodeID, expected.SandboxID, rev)
-		if err != nil {
-			return err
-		}
-		if deleted {
-			return nil
-		}
-	}
-	return shardkv.ErrConflict
 }
 
 func (s *Stores) removeNodeSandboxRefShardAtRevision(ctx context.Context, nodeID, sandboxID string, expectRev uint64) (bool, error) {
