@@ -50,8 +50,9 @@ type Orchestrator struct {
 	vs  vsClient
 	log *slog.Logger
 
-	mu  sync.Mutex
-	reg map[string]*types.Sandbox // in-memory cache (hot path: Route/LaunchSpecFor)
+	mu             sync.Mutex
+	reg            map[string]*types.Sandbox // in-memory cache (hot path: Route/LaunchSpecFor)
+	clusterCreates map[string]struct{}       // cluster creates claimed before async launch
 
 	sf flightGroup // per-sid single-flight for resume (dedup concurrent data-plane wakeups)
 
@@ -90,12 +91,13 @@ type clusterBuild struct {
 func New(cfg *config.Config, st *store.Store, lc launcher.Launcher, vs vsClient, log *slog.Logger) *Orchestrator {
 	o := &Orchestrator{
 		cfg: cfg, st: st, lc: lc, vs: vs, log: log,
-		reg:           map[string]*types.Sandbox{},
-		subs:          map[int]chan routesync.Event{},
-		routeFP:       uuid.NewString(),
-		pend:          map[string]*pendingBuild{},
-		clusterBuilds: map[string]*clusterBuild{},
-		buildEvents:   make(chan *routesync.BuildEvent, 64),
+		reg:            map[string]*types.Sandbox{},
+		clusterCreates: map[string]struct{}{},
+		subs:           map[int]chan routesync.Event{},
+		routeFP:        uuid.NewString(),
+		pend:           map[string]*pendingBuild{},
+		clusterBuilds:  map[string]*clusterBuild{},
+		buildEvents:    make(chan *routesync.BuildEvent, 64),
 	}
 	wait := cfg.Units.PoolWaitDuration()
 	o.runnerPool = newRunPool(runKindSandbox, cfg.Units.RunnerPoolSize, wait, cfg.Paths.RunRoot, lc, o.runnerUnit, log.With("pool", "runner"))

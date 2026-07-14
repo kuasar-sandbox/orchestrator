@@ -33,7 +33,12 @@ func (o *Orchestrator) HandleCommand(ctx context.Context, cmd *routesync.Command
 			o.log.Warn("cluster create rejected", "sid", cmd.SID, "err", err)
 			return reject(cmd, err)
 		}
+		if err := o.claimClusterCreate(ctx, cmd.SID); err != nil {
+			o.log.Warn("cluster create rejected", "sid", cmd.SID, "err", err)
+			return reject(cmd, err)
+		}
 		go func() {
+			defer o.releaseClusterCreate(cmd.SID)
 			if _, err := o.bootCluster(o.asyncCtx(), cmd, manifestKey, tmpl); err != nil {
 				o.log.Error("cluster create", "sid", cmd.SID, "err", err)
 			}
@@ -89,6 +94,40 @@ func (o *Orchestrator) HandleCommand(ctx context.Context, cmd *routesync.Command
 	default:
 		return reject(cmd, fmt.Errorf("unhandled command kind %q", cmd.Kind))
 	}
+}
+
+func (o *Orchestrator) claimClusterCreate(ctx context.Context, sid string) error {
+	if sid == "" {
+		return fmt.Errorf("cluster create: sandbox id is required")
+	}
+	o.mu.Lock()
+	if o.reg[sid] != nil {
+		o.mu.Unlock()
+		return fmt.Errorf("cluster create: sandbox %q already exists", sid)
+	}
+	if _, claimed := o.clusterCreates[sid]; claimed {
+		o.mu.Unlock()
+		return fmt.Errorf("cluster create: sandbox %q is already being created", sid)
+	}
+	o.clusterCreates[sid] = struct{}{}
+	o.mu.Unlock()
+
+	existing, err := o.st.Get(ctx, sid)
+	if err != nil {
+		o.releaseClusterCreate(sid)
+		return err
+	}
+	if existing != nil {
+		o.releaseClusterCreate(sid)
+		return fmt.Errorf("cluster create: sandbox %q already exists", sid)
+	}
+	return nil
+}
+
+func (o *Orchestrator) releaseClusterCreate(sid string) {
+	o.mu.Lock()
+	delete(o.clusterCreates, sid)
+	o.mu.Unlock()
 }
 
 // ResourceProbe surfaces the node's water level for the cluster heartbeat. serve

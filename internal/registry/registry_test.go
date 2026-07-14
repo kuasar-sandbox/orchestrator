@@ -1464,6 +1464,62 @@ func TestRouteEventsResolveSameIDByNodeOwnerTable(t *testing.T) {
 	}
 }
 
+func TestReserveRetriesSameNodeAfterSandboxIDCollision(t *testing.T) {
+	ctx := context.Background()
+	reg := testReg(t)
+	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"}); err != nil {
+		t.Fatal(err)
+	}
+	var firstSID string
+	placeCalls := 0
+	basePlacer := placementWithToken("n1")
+	reg.SetPlacer(placementFunc(func(ctx context.Context, req PlaceRequest) (*Placement, error) {
+		placeCalls++
+		if placeCalls == 1 {
+			firstSID = req.SandboxID
+			if _, err := reg.stores.PutSandbox(ctx, &SandboxRecord{
+				Group: "/existing", RouteKey: "rk-existing", SID: firstSID, NodeID: "n1", State: StateReady,
+			}); err != nil {
+				return nil, err
+			}
+			if err := reg.stores.AddNodeSandboxRef(ctx, "n1", clusterstate.NodeSandboxRef{
+				Group: "/existing", RouteKey: "rk-existing", SandboxID: firstSID,
+			}); err != nil {
+				return nil, err
+			}
+		}
+		return basePlacer.Place(ctx, req)
+	}))
+	var createSIDs []string
+	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(cmd *routesync.Command) {
+		if cmd.Kind != routesync.CmdCreate {
+			return
+		}
+		createSIDs = append(createSIDs, cmd.SID)
+		go func() {
+			reg.ackCommand(&routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted})
+			reg.applyRoute(ctx, "n1", &routesync.RouteEntry{SandboxID: cmd.SID, State: routesync.StateRunning})
+		}()
+	}})
+
+	res, err := reg.ReserveSandbox(ctx, "/new", "rk-new", nil)
+	if err != nil {
+		t.Fatalf("ReserveSandbox: %v", err)
+	}
+	if placeCalls != 2 || firstSID == "" || res.SID == firstSID {
+		t.Fatalf("placeCalls=%d firstSID=%q result=%+v", placeCalls, firstSID, res)
+	}
+	if len(createSIDs) != 1 || createSIDs[0] != res.SID {
+		t.Fatalf("create commands=%v result=%+v", createSIDs, res)
+	}
+	if ref, found, err := reg.stores.GetNodeSandboxRef(ctx, "n1", firstSID); err != nil || !found || ref.Group != "/existing" || ref.RouteKey != "rk-existing" {
+		t.Fatalf("original ownership=%+v found=%v err=%v", ref, found, err)
+	}
+	if ref, found, err := reg.stores.GetNodeSandboxRef(ctx, "n1", res.SID); err != nil || !found || ref.Group != "/new" || ref.RouteKey != "rk-new" {
+		t.Fatalf("replacement ownership=%+v found=%v err=%v", ref, found, err)
+	}
+}
+
 func TestParkTimeoutRollback(t *testing.T) {
 	ctx := context.Background()
 	reg := New(NewStores(), nil, 200*time.Millisecond, slog.New(slog.NewTextHandler(io.Discard, nil)))

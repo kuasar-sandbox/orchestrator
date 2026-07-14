@@ -9,6 +9,8 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/cluster/shardkv"
 )
 
+var errNodeSandboxIDConflict = errors.New("registry: sandbox id is already owned by another route on this node")
+
 type nodeReapSandboxRef struct {
 	Ref      clusterstate.NodeSandboxRef
 	Revision uint64
@@ -113,7 +115,37 @@ func (s *Stores) addNodeSandboxRefShard(ctx context.Context, nodeID string, ref 
 	if err != nil {
 		return err
 	}
-	return shardUpsert(ctx, sh, clusterstate.NodeSandboxRecordKey(ref.SandboxID), value)
+	key := clusterstate.NodeSandboxRecordKey(ref.SandboxID)
+	for attempt := 0; attempt < 5; attempt++ {
+		cur, found, err := sh.Get(ctx, key)
+		if err != nil {
+			return err
+		}
+		if found {
+			existing, err := clusterstate.DecodeShardValue[clusterstate.NodeSandboxRef](cur.Value)
+			if err != nil {
+				return err
+			}
+			if existing.SandboxID != ref.SandboxID || existing.Group == "" || existing.RouteKey == "" {
+				return errors.New("registry: invalid node sandbox ref")
+			}
+			if existing.Group != ref.Group || existing.RouteKey != ref.RouteKey {
+				return errNodeSandboxIDConflict
+			}
+			if _, ok, err := sh.CAS(ctx, key, cur.Meta.Rev, value); err != nil {
+				return err
+			} else if ok {
+				return nil
+			}
+			continue
+		}
+		if _, ok, err := sh.CAS(ctx, key, 0, value); err != nil {
+			return err
+		} else if ok {
+			return nil
+		}
+	}
+	return shardkv.ErrConflict
 }
 
 func (s *Stores) getNodeSandboxRefShard(ctx context.Context, nodeID, sandboxID string) (clusterstate.NodeSandboxRef, bool, error) {

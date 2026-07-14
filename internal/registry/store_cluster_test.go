@@ -283,7 +283,8 @@ func TestNodeReapSnapshotDoesNotDeleteNewChildRevisions(t *testing.T) {
 func TestNodeObjectRefsAreScopedByNodeID(t *testing.T) {
 	ctx := context.Background()
 	stores := NewStores()
-	if err := stores.AddNodeSandboxRef(ctx, "n1", clusterstate.NodeSandboxRef{SandboxID: "same", Group: "/g1", RouteKey: "rk1"}); err != nil {
+	n1Ref := clusterstate.NodeSandboxRef{SandboxID: "same", Group: "/g1", RouteKey: "rk1"}
+	if err := stores.AddNodeSandboxRef(ctx, "n1", n1Ref); err != nil {
 		t.Fatal(err)
 	}
 	if err := stores.AddNodeSandboxRef(ctx, "n2", clusterstate.NodeSandboxRef{SandboxID: "same", Group: "/g2", RouteKey: "rk2"}); err != nil {
@@ -299,6 +300,17 @@ func TestNodeObjectRefsAreScopedByNodeID(t *testing.T) {
 		if err != nil || !found || ref.Group != tc.group {
 			t.Fatalf("node %s ref=%+v found=%v err=%v", tc.node, ref, found, err)
 		}
+	}
+	if err := stores.AddNodeSandboxRef(ctx, "n1", n1Ref); err != nil {
+		t.Fatalf("idempotent same-node sandbox ref: %v", err)
+	}
+	if err := stores.AddNodeSandboxRef(ctx, "n1", clusterstate.NodeSandboxRef{
+		SandboxID: "same", Group: "/other", RouteKey: "other",
+	}); !errors.Is(err, errNodeSandboxIDConflict) {
+		t.Fatalf("same-node ownership collision err=%v", err)
+	}
+	if ref, found, err := stores.GetNodeSandboxRef(ctx, "n1", "same"); err != nil || !found || ref != n1Ref {
+		t.Fatalf("original sandbox ref=%+v found=%v err=%v", ref, found, err)
 	}
 	if err := stores.AddNodeSandboxRef(ctx, "n1", clusterstate.NodeSandboxRef{Group: "/g"}); err == nil {
 		t.Fatal("invalid sandbox ref was accepted")

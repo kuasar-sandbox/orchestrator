@@ -589,6 +589,10 @@ recordSet。sandbox/build 表由 cluster 在任务下发前写入,终态清理;m
 node 既不生成也不解析 group,只把 sandbox/build metadata 原样保存。这样高频心跳不会把无关 recordSet
 的 CAS 队列拖慢。
 
+同一 node 内 `sandbox_id` 归属以 CAS 写入:相同 `{group,route_key}` 重放为幂等刷新,不同归属返回冲突且
+不得覆盖旧值。create 在下发 node 命令前遇到该冲突时,仅回滚本次 RESERVED record,生成新 sandbox_id
+后重试同一健康 node;node 端也必须在异步 launch 前同步拒绝已有或正在创建的 sandbox_id。
+
 node_link 流按事件重要性处理:
 
 - `upsert/delete` route event、`cmd_ack` 和 build event 是收敛关键事件,必须在读循环中立即处理。

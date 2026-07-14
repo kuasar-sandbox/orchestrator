@@ -456,7 +456,11 @@ func (r *Registry) ReserveSandbox(ctx context.Context, group, routeKey string, c
 
 	if err := r.startReserve(ctx, group, routeKey, rec, rev, found, createConfig); err != nil {
 		r.finish(key, nil, err)
-		r.rollbackReserve(group, routeKey, rec, found)
+		if errors.Is(err, errNodeSandboxIDConflict) {
+			r.rollbackReserveRetainingOwnership(group, routeKey, rec, found)
+		} else {
+			r.rollbackReserve(group, routeKey, rec, found)
+		}
 		return waitCall(ctx, call)
 	}
 	wctx, cancel := context.WithTimeout(ctx, r.parkTimeout)
@@ -559,7 +563,11 @@ func (r *Registry) startReserve(ctx context.Context, group, routeKey string, rec
 			return cas(err, ok)
 		}
 		if err := r.stores.AddNodeSandboxRef(ctx, rec.NodeID, clusterstate.NodeSandboxRef{Group: group, RouteKey: routeKey, SandboxID: rec.SID}); err != nil {
-			r.rollbackReserve(group, routeKey, rec, true)
+			if errors.Is(err, errNodeSandboxIDConflict) {
+				r.rollbackReserveRetainingOwnership(group, routeKey, rec, true)
+			} else {
+				r.rollbackReserve(group, routeKey, rec, true)
+			}
 			return err
 		}
 		ccmd := &routesync.Command{CmdID: newID(), Kind: routesync.CmdConnect, SID: rec.SID}
@@ -653,7 +661,8 @@ func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, c
 			TemplateID: placement.TemplateRef, AccessToken: placement.AccessToken,
 			TargetPort: placement.TargetPort,
 		}
-		if _, ok, cerr := r.stores.CASSandbox(ctx, reserved, expect); cerr != nil {
+		reservedRev, ok, cerr := r.stores.CASSandbox(ctx, reserved, expect)
+		if cerr != nil {
 			return cerr
 		} else if !ok {
 			if casConflicts == 0 {
@@ -663,6 +672,13 @@ func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, c
 			return ErrNoNode
 		}
 		if err := r.stores.AddNodeSandboxRef(ctx, nodeID, ref); err != nil {
+			if errors.Is(err, errNodeSandboxIDConflict) {
+				if !r.rollbackReservedAtRevision(ctx, group, routeKey, reserved, reservedRev,
+					replaceReady, replaceReady != nil, false) {
+					return err
+				}
+				continue
+			}
 			// Keep RESERVED in place so ReserveSandbox's outer rollback can
 			// restore the previous row (or remove a newly-created row).
 			return err
