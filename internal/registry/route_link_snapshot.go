@@ -173,15 +173,17 @@ func (r *Registry) importSnapshotRoute(ctx context.Context, route *SandboxRecord
 }
 
 func (r *Registry) restoreSnapshotRoute(ctx context.Context, imported *SandboxRecord, importRev int64, previous *SandboxRecord, previousFound bool) error {
+	rollbackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), lifecycleAckTimeout)
+	defer cancel()
 	if previousFound {
-		if _, ok, err := r.stores.CASSandbox(ctx, previous, importRev); err != nil {
+		if _, ok, err := r.stores.CASSandbox(rollbackCtx, previous, importRev); err != nil {
 			return err
 		} else if !ok {
 			return fmt.Errorf("route changed before rollback")
 		}
 		return nil
 	}
-	deleted, err := r.stores.DeleteSandboxIfRevision(ctx, imported.Group, imported.RouteKey, importRev)
+	deleted, err := r.stores.DeleteSandboxIfRevision(rollbackCtx, imported.Group, imported.RouteKey, importRev)
 	if err != nil {
 		return err
 	}
