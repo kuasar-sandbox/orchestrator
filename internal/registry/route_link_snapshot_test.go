@@ -142,6 +142,87 @@ func TestSnapshotImportRejectsSameNodeSandboxIDCollision(t *testing.T) {
 	}
 }
 
+func TestSnapshotImportRestoresExistingRouteOnOwnershipConflict(t *testing.T) {
+	ctx := context.Background()
+	reg := testReg(t)
+	previous := &SandboxRecord{
+		Group: "/target", RouteKey: "rk", SID: "old", NodeID: "n2", State: StateReady,
+	}
+	if _, err := reg.stores.PutSandbox(ctx, previous); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.stores.AddNodeSandboxRef(ctx, "n2", clusterstate.NodeSandboxRef{
+		Group: previous.Group, RouteKey: previous.RouteKey, SandboxID: previous.SID,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reg.stores.PutSandbox(ctx, &SandboxRecord{
+		Group: "/owner", RouteKey: "rk-owner", SID: "same", NodeID: "n1", State: StateReady,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.stores.AddNodeSandboxRef(ctx, "n1", clusterstate.NodeSandboxRef{
+		Group: "/owner", RouteKey: "rk-owner", SandboxID: "same",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var raw bytes.Buffer
+	if err := json.NewEncoder(&raw).Encode(SnapshotRecord{Type: SnapshotKindRoute, Route: &SandboxRecord{
+		Group: previous.Group, RouteKey: previous.RouteKey, SID: "same", NodeID: "n1", State: StateReady,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reg.ImportSnapshot(ctx, &raw); !errors.Is(err, errNodeSandboxIDConflict) {
+		t.Fatalf("ImportSnapshot err=%v", err)
+	}
+	got, _, found, err := reg.stores.GetSandbox(ctx, previous.Group, previous.RouteKey)
+	if err != nil || !found || got.SID != previous.SID || got.NodeID != previous.NodeID {
+		t.Fatalf("restored route=%+v found=%v err=%v", got, found, err)
+	}
+	if ref, found, err := reg.stores.GetNodeSandboxRef(ctx, "n2", previous.SID); err != nil || !found || ref.Group != previous.Group || ref.RouteKey != previous.RouteKey {
+		t.Fatalf("previous ownership=%+v found=%v err=%v", ref, found, err)
+	}
+	if ref, found, err := reg.stores.GetNodeSandboxRef(ctx, "n1", "same"); err != nil || !found || ref.Group != "/owner" || ref.RouteKey != "rk-owner" {
+		t.Fatalf("conflicting ownership=%+v found=%v err=%v", ref, found, err)
+	}
+}
+
+func TestSnapshotImportReplacesExistingRouteOwnership(t *testing.T) {
+	ctx := context.Background()
+	reg := testReg(t)
+	previous := &SandboxRecord{
+		Group: "/target", RouteKey: "rk", SID: "old", NodeID: "n1", State: StateReady,
+	}
+	if _, err := reg.stores.PutSandbox(ctx, previous); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.stores.AddNodeSandboxRef(ctx, previous.NodeID, clusterstate.NodeSandboxRef{
+		Group: previous.Group, RouteKey: previous.RouteKey, SandboxID: previous.SID,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	imported := &SandboxRecord{
+		Group: previous.Group, RouteKey: previous.RouteKey, SID: "new", NodeID: "n2", State: StateReady,
+	}
+	var raw bytes.Buffer
+	if err := json.NewEncoder(&raw).Encode(SnapshotRecord{Type: SnapshotKindRoute, Route: imported}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reg.ImportSnapshot(ctx, &raw); err != nil {
+		t.Fatal(err)
+	}
+	got, _, found, err := reg.stores.GetSandbox(ctx, imported.Group, imported.RouteKey)
+	if err != nil || !found || got.SID != imported.SID || got.NodeID != imported.NodeID {
+		t.Fatalf("imported route=%+v found=%v err=%v", got, found, err)
+	}
+	if ref, found, err := reg.stores.GetNodeSandboxRef(ctx, previous.NodeID, previous.SID); err != nil || found {
+		t.Fatalf("previous ownership=%+v found=%v err=%v", ref, found, err)
+	}
+	if ref, found, err := reg.stores.GetNodeSandboxRef(ctx, imported.NodeID, imported.SID); err != nil || !found || ref.Group != imported.Group || ref.RouteKey != imported.RouteKey {
+		t.Fatalf("imported ownership=%+v found=%v err=%v", ref, found, err)
+	}
+}
+
 func TestSnapshotExportRequiresGroup(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
