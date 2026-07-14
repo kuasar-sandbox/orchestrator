@@ -248,13 +248,6 @@ func (r *Registry) applyBuildEvent(ctx context.Context, nodeID string, e *routes
 		r.log.Warn("registry: persist build event", "node", nodeID, "build", rec.BuildID, "state", rec.State, "err", writeErr)
 		return
 	}
-	if terminal {
-		if err := retryTerminalBuildStore(ctx, func(writeCtx context.Context) error {
-			return r.stores.RemoveNodeBuildRef(writeCtx, rec.NodeID, rec.BuildID)
-		}); err != nil {
-			r.log.Warn("registry: remove terminal build ownership", "node", nodeID, "build", rec.BuildID, "err", err)
-		}
-	}
 }
 
 func retryTerminalBuildStore(ctx context.Context, operation func(context.Context) error) error {

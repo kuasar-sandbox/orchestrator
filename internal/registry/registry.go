@@ -1491,10 +1491,11 @@ type sandboxReapPlan struct {
 }
 
 type buildReapPlan struct {
-	ref      nodeReapBuildRef
-	record   *BuildRecord
-	revision uint64
-	markDead bool
+	ref       nodeReapBuildRef
+	record    *BuildRecord
+	revision  uint64
+	markDead  bool
+	removeRef bool
 }
 
 // sweepNode claims a stale profile revision before applying any destructive
@@ -1553,7 +1554,12 @@ func (r *Registry) sweepNode(ctx context.Context, nodeID string, deadAfter time.
 			return
 		}
 		plan := buildReapPlan{ref: child}
-		if !buildFound || b.NodeID != nodeID || !b.occupies() {
+		if !buildFound || b.NodeID != nodeID {
+			plan.removeRef = true
+			buildPlans = append(buildPlans, plan)
+			continue
+		}
+		if !b.occupies() {
 			buildPlans = append(buildPlans, plan)
 			continue
 		}
@@ -1587,6 +1593,9 @@ func (r *Registry) sweepNode(ctx context.Context, nodeID string, deadAfter time.
 			}
 			r.releaseBuildAdmission(nodeID, plan.record.Group, plan.record.BuildID)
 			deadBuilds++
+		}
+		if !plan.removeRef {
+			continue
 		}
 		if _, err := r.stores.removeNodeBuildRefShardAtRevision(ctx, nodeID, plan.ref.Ref.BuildID, plan.ref.Revision); err != nil {
 			r.log.Warn("registry: remove reaped build ownership", "node", nodeID, "build", plan.ref.Ref.BuildID, "err", err)

@@ -125,7 +125,7 @@ func (r *Registry) ImportSnapshot(ctx context.Context, rd io.Reader) (SnapshotSu
 			if err := r.stores.PutBuild(ctx, &build); err != nil {
 				return sum, fmt.Errorf("registry snapshot line %d: put build %q/%q: %w", line, build.Group, build.BuildID, err)
 			}
-			if build.occupies() && build.NodeID != "" {
+			if build.NodeID != "" {
 				if err := r.stores.AddNodeBuildRef(ctx, build.NodeID, clusterstate.NodeBuildRef{BuildID: build.BuildID, Group: build.Group}); err != nil {
 					_ = r.stores.DeleteBuild(ctx, build.Group, build.BuildID)
 					return sum, fmt.Errorf("registry snapshot line %d: put node build %q: %w", line, build.BuildID, err)

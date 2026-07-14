@@ -2663,6 +2663,59 @@ func TestSweepDeadNodes(t *testing.T) {
 	}
 }
 
+func TestSweepDeadNodeRetainsBuildRecordOwnership(t *testing.T) {
+	ctx := context.Background()
+	reg := testReg(t)
+	owner := &recordingNodeOwner{allow: true}
+	reg.SetNodeOwner(owner)
+	refs := []clusterstate.NodeBuildRef{
+		{Group: "/g", BuildID: "active"},
+		{Group: "/g", BuildID: "terminal"},
+		{Group: "/g", BuildID: "orphan"},
+		{Group: "/g", BuildID: "moved"},
+	}
+	if err := reg.stores.PutNode(ctx, &NodeRecord{
+		NodeID: "dead", LastHeartbeatUnix: time.Now().Add(-time.Hour).Unix(), Builds: refs,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, build := range []*BuildRecord{
+		{Group: "/g", BuildID: "active", NodeID: "dead", State: BuildBuilding},
+		{Group: "/g", BuildID: "terminal", NodeID: "dead", State: BuildReady},
+		{Group: "/g", BuildID: "moved", NodeID: "other", State: BuildBuilding},
+	} {
+		if err := reg.stores.PutBuild(ctx, build); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	reg.sweepNode(ctx, "dead", 30*time.Second)
+
+	active, found, err := reg.stores.GetBuildInGroup(ctx, "/g", "active")
+	if err != nil || !found || active.State != BuildError || active.Reason != "node disconnected" {
+		t.Fatalf("active build=%+v found=%v err=%v", active, found, err)
+	}
+	terminal, found, err := reg.stores.GetBuildInGroup(ctx, "/g", "terminal")
+	if err != nil || !found || terminal.State != BuildReady {
+		t.Fatalf("terminal build=%+v found=%v err=%v", terminal, found, err)
+	}
+	for _, buildID := range []string{"active", "terminal"} {
+		ref, found, err := reg.stores.GetNodeBuildRef(ctx, "dead", buildID)
+		if err != nil || !found || ref.Group != "/g" {
+			t.Fatalf("retained ref %s=%+v found=%v err=%v", buildID, ref, found, err)
+		}
+	}
+	for _, buildID := range []string{"orphan", "moved"} {
+		if ref, found, err := reg.stores.GetNodeBuildRef(ctx, "dead", buildID); err != nil || found {
+			t.Fatalf("stale ref %s=%+v found=%v err=%v", buildID, ref, found, err)
+		}
+	}
+	wantRelease := "dead/" + buildAdmissionID("/g", "active")
+	if len(owner.released) != 1 || owner.released[0] != wantRelease {
+		t.Fatalf("released=%q, want [%q]", owner.released, wantRelease)
+	}
+}
+
 func TestHTTPPlacerHonorsMinReadyPlacers(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
