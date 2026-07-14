@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -105,16 +106,8 @@ func (r *Registry) ImportSnapshot(ctx context.Context, rd io.Reader) (SnapshotSu
 				return sum, fmt.Errorf("registry snapshot line %d: route record missing group or route_key", line)
 			}
 			route := *rec.Route
-			if _, err := r.stores.PutSandbox(ctx, &route); err != nil {
+			if err := r.importSnapshotRoute(ctx, &route); err != nil {
 				return sum, fmt.Errorf("registry snapshot line %d: put route %q/%q: %w", line, route.Group, route.RouteKey, err)
-			}
-			if route.SID != "" && route.NodeID != "" {
-				if err := r.stores.AddNodeSandboxRef(ctx, route.NodeID, clusterstate.NodeSandboxRef{
-					SandboxID: route.SID, Group: route.Group, RouteKey: route.RouteKey,
-				}); err != nil {
-					_ = r.stores.DeleteSandbox(ctx, route.Group, route.RouteKey)
-					return sum, fmt.Errorf("registry snapshot line %d: put node sandbox %q: %w", line, route.SID, err)
-				}
 			}
 			sum.Routes++
 		case SnapshotKindBuild:
@@ -140,6 +133,62 @@ func (r *Registry) ImportSnapshot(ctx context.Context, rd io.Reader) (SnapshotSu
 		return sum, err
 	}
 	return sum, nil
+}
+
+func (r *Registry) importSnapshotRoute(ctx context.Context, route *SandboxRecord) error {
+	previous, previousRev, previousFound, err := r.stores.GetSandbox(ctx, route.Group, route.RouteKey)
+	if err != nil {
+		return err
+	}
+	expectRev := int64(0)
+	if previousFound {
+		expectRev = previousRev
+	}
+	importRev, ok, err := r.stores.CASSandbox(ctx, route, expectRev)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("route changed during import")
+	}
+	if route.SID != "" && route.NodeID != "" {
+		if err := r.stores.AddNodeSandboxRef(ctx, route.NodeID, clusterstate.NodeSandboxRef{
+			SandboxID: route.SID, Group: route.Group, RouteKey: route.RouteKey,
+		}); err != nil {
+			if rollbackErr := r.restoreSnapshotRoute(ctx, route, importRev, previous, previousFound); rollbackErr != nil {
+				return errors.Join(err, fmt.Errorf("restore previous route: %w", rollbackErr))
+			}
+			return err
+		}
+	}
+	if previousFound && previous.NodeID != "" && previous.SID != "" &&
+		(previous.NodeID != route.NodeID || previous.SID != route.SID) {
+		if err := r.stores.removeNodeSandboxRefShardIfMatch(ctx, previous.NodeID, clusterstate.NodeSandboxRef{
+			SandboxID: previous.SID, Group: previous.Group, RouteKey: previous.RouteKey,
+		}); err != nil {
+			return fmt.Errorf("remove previous node sandbox %q: %w", previous.SID, err)
+		}
+	}
+	return nil
+}
+
+func (r *Registry) restoreSnapshotRoute(ctx context.Context, imported *SandboxRecord, importRev int64, previous *SandboxRecord, previousFound bool) error {
+	if previousFound {
+		if _, ok, err := r.stores.CASSandbox(ctx, previous, importRev); err != nil {
+			return err
+		} else if !ok {
+			return fmt.Errorf("route changed before rollback")
+		}
+		return nil
+	}
+	deleted, err := r.stores.DeleteSandboxIfRevision(ctx, imported.Group, imported.RouteKey, importRev)
+	if err != nil {
+		return err
+	}
+	if !deleted {
+		return fmt.Errorf("route changed before rollback")
+	}
+	return nil
 }
 
 func (r *Registry) serveExport(w http.ResponseWriter, req *http.Request) {
