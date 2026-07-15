@@ -36,11 +36,12 @@ jobs:
       PIP_INDEX_URL: https://pypi.tuna.tsinghua.edu.cn/simple
 
     steps:
-      - name: Reset interrupted E2E unit state
+      - name: Reset interrupted E2E state
         run: |
           set -euo pipefail
 
           systemctl stop 'sandbox-runner@*.service' 'sandbox-builder@*.service' 2>/dev/null || true
+          ip link delete sb-tap0 2>/dev/null || true
           rm -f \
             /run/systemd/system/sandbox-runner@.service \
             /run/systemd/system/sandbox-builder@.service \
