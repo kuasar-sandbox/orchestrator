@@ -10,8 +10,8 @@
 #   tap (host-side IP, up) and OPENS an IFF_VNET_HDR queue fd, handing it to
 #   sandbox-ctl over SCM_RIGHTS. CH is driven with --net fd=<N>,mac=,id=_net0.
 #   The guest gets eth0=169.254.1.1/31 and an app prints NETUP then sleeps.
-#   The host pings 169.254.1.1 across the tap — success proves the fd carries
-#   traffic with correct vnet_hdr framing.
+#   The host binds its ping to that per-run tap and reaches 169.254.1.1 — success
+#   proves the handed-off fd carries traffic with correct vnet_hdr framing.
 #
 # Stage 2 (restore with new identity):
 #   snapshot the running VM, then `run --restore` with a NEW ip
@@ -24,6 +24,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 BIN="${BIN:-$REPO_ROOT/bin}"
+TAP_NAME="$(printf 'etf%x' "$$")"
 
 skip() {
     echo; echo "==> e2e_sandbox_tapfd: skipping ($*)"
@@ -50,8 +51,8 @@ if [ -z "$BLK0_IMAGE" ]; then
 fi
 
 WORK="$(mktemp -d /tmp/e2e-tapfd-XXXXXX)"
-# No tap cleanup needed: connector-ctl tapfd get --new auto-allocates a non-persistent tap
-# that vanishes when the consuming VM (CH) exits.
+# No tap cleanup needed: connector-ctl creates a non-persistent, per-run tap that
+# vanishes when the consuming VM (CH) exits.
 trap '[ -n "${E2E_KEEP:-}" ] && echo "kept: $WORK" || rm -rf "$WORK"; true' EXIT
 
 if [ -z "$BLK0_IMAGE" ]; then
@@ -73,7 +74,7 @@ resources:
 network:
   tapfd:
     exec: ["$BIN/connector-ctl", "tapfd", "get", "--new", "--host-cidr", "$hcidr",
-           "--mac", "$GUEST_MAC", "--ip", "$gip"]   # auto-named tap
+           "--mac", "$GUEST_MAC", "--ip", "$gip", "$TAP_NAME"]
   ip: $gip/31          # mask source; provider sends bare ip → keeps /31
   mtu: 1400            # guest MTU is sandbox config, not tapfd metadata
   hostname: e2e-tapfd
@@ -102,7 +103,7 @@ wait_marker() { # <regex> <log> <pid>
     done
     return 1
 }
-ping_guest() { for _ in $(seq 1 24); do ping -c1 -W1 "$1" >/dev/null 2>&1 && return 0; sleep 0.25; done; return 1; }
+ping_guest() { for _ in $(seq 1 24); do ping -I "$TAP_NAME" -c1 -W1 "$1" >/dev/null 2>&1 && return 0; sleep 0.25; done; return 1; }
 
 PASS=0; FAIL=0
 ok()  { echo "  PASS: $1"; PASS=$((PASS+1)); }
@@ -131,7 +132,7 @@ fi
 grep -q "tapfd: received tap fd" "$LOG" && ok "tapfd handoff engaged in sandbox-ctl" || bad "no tapfd handoff log"
 grep -qE "net fd=[0-9]+,mac=$GUEST_MAC,id=_net0" "$LOG" && ok "CH driven with --net fd=,mac=,id=_net0" || bad "fd-mode --net not in log"
 grep -q "^MTU=1400$" "$LOG" && ok "guest MTU came from sandbox network config" || bad "guest MTU was not 1400"
-ping_guest 169.254.1.1 && ok "host pinged guest 169.254.1.1 over the vnet_hdr fd" \
+ping_guest 169.254.1.1 && ok "host pinged guest 169.254.1.1 through $TAP_NAME over the vnet_hdr fd" \
     || { echo "--- log ---"; tail -25 "$LOG"; ip -br addr || true; bad "ping 169.254.1.1 failed"; }
 
 # snapshot the running VM (default --resume=false shuts it down → run exits)
@@ -144,7 +145,7 @@ SNAP_FILE="$SNAP/$SID.snapshot"
 # ===================== Stage 2: restore with NEW identity ==================
 if [ -f "$SNAP_FILE" ]; then
     echo "==> Stage 2: restore with fresh identity 169.254.4.1 (flush-and-replace)"
-    # The fake provider recreates the (non-persistent) tap on the restore
+    # The fake provider recreates the named, non-persistent tap on the restore
     # handoff and assigns the new host /31 via --host-cidr — no manual setup.
     DIFF1="$WORK/blk1.restore.diff"; mkdiff "$DIFF1"
     write_yaml "$WORK/restore.yaml" "169.254.4.1" "$DIFF1" "169.254.4.0/31" 0
@@ -157,7 +158,7 @@ if [ -f "$SNAP_FILE" ]; then
         && ok "restore completed" || { echo "--- restore.log tail ---"; tail -40 "$RLOG"; bad "restore did not complete"; }
     grep -q "tapfd: received tap fd for restore" "$RLOG" && ok "tapfd re-handoff on restore" || bad "no restore re-handoff log"
     grep -q "net_fds=\[_net0@\[" "$RLOG" && ok "CH restore re-bound fd via net_fds" || bad "no net_fds in restore log"
-    ping_guest 169.254.4.1 && ok "host pinged restored guest at NEW ip 169.254.4.1 (re-config worked)" \
+    ping_guest 169.254.4.1 && ok "host pinged restored guest at NEW ip 169.254.4.1 through $TAP_NAME (re-config worked)" \
         || { echo "--- restore.log tail ---"; tail -30 "$RLOG"; bad "ping restored 169.254.4.1 failed"; }
     kill -TERM "$RPID" 2>/dev/null || true; wait "$RPID" 2>/dev/null || true
 else
