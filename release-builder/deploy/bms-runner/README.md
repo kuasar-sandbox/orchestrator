@@ -10,6 +10,9 @@ directory. The containers share only:
 - `/var/lib/kuasar-ci/tools`, read-only test tool binaries;
 - `/usr/local/go` and the host kernel module tree, read-only.
 
+Each slot receives a different bpffs subtree at `/sys/fs/bpf`; pinned BPF paths
+cannot collide across concurrent jobs.
+
 The containers are privileged resource-name isolation, not a security boundary
 for untrusted jobs. They deliberately receive KVM, TUN, vhost devices, all
 capabilities, Docker keyring syscalls, and the `bpf` syscall required by the

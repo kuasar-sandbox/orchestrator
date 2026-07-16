@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+BPF_ROOT=${KUASAR_CI_BPF_ROOT:-/sys/fs/bpf}
+
+install -d -m 0755 "$BPF_ROOT"
+if ! mountpoint -q "$BPF_ROOT"; then
+    mount -t bpf bpf "$BPF_ROOT"
+fi
+[ "$(stat -fc %T "$BPF_ROOT")" = bpf_fs ] || {
+    echo "$BPF_ROOT is not a bpffs mount" >&2
+    exit 1
+}
+for machine in kuasar-ci-1 kuasar-ci-2; do
+    install -d -m 0700 "$BPF_ROOT/$machine"
+done

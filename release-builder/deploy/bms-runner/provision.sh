@@ -114,6 +114,8 @@ install_host_support() {
         "$MACHINE_ROOT"
     install -m 0755 "$SCRIPT_DIR/kuasar-ci-network" /usr/local/libexec/kuasar-ci-network
     install -m 0644 "$SCRIPT_DIR/kuasar-ci-network.service" /etc/systemd/system/kuasar-ci-network.service
+    install -m 0755 "$SCRIPT_DIR/kuasar-ci-bpf" /usr/local/libexec/kuasar-ci-bpf
+    install -m 0644 "$SCRIPT_DIR/kuasar-ci-bpf.service" /etc/systemd/system/kuasar-ci-bpf.service
     install -m 0755 "$SCRIPT_DIR/provision.sh" /usr/local/sbin/kuasar-ci-runner-provision
 
     local uplink
@@ -126,7 +128,7 @@ SUBNET=$SUBNET
 UPLINK_IFACE=$uplink
 EOF
     systemctl daemon-reload
-    systemctl enable --now kuasar-ci-network.service
+    systemctl enable --now kuasar-ci-network.service kuasar-ci-bpf.service
     modprobe bridge
     modprobe overlay
     modprobe tun
@@ -234,6 +236,7 @@ Bind=/var/cache/kuasar
 BindReadOnly=/var/lib/kuasar-ci/tools
 BindReadOnly=/usr/local/go
 BindReadOnly=/usr/lib/modules
+Bind=/sys/fs/bpf/$machine:/sys/fs/bpf
 Bind=/dev/kvm
 Bind=/dev/net/tun
 Bind=/dev/vhost-net
@@ -246,8 +249,8 @@ EOF
     install -d -m 0755 "/etc/systemd/system/systemd-nspawn@$machine.service.d"
     cat >"/etc/systemd/system/systemd-nspawn@$machine.service.d/override.conf" <<EOF
 [Unit]
-Requires=kuasar-ci-network.service
-After=kuasar-ci-network.service
+Requires=kuasar-ci-network.service kuasar-ci-bpf.service
+After=kuasar-ci-network.service kuasar-ci-bpf.service
 
 [Service]
 DeviceAllow=/dev/kvm rw
@@ -427,8 +430,8 @@ verify_slots() {
             docker info >/dev/null
             ip route get 223.5.5.5 >/dev/null
             curl --fail --silent --show-error --connect-timeout 5 --max-time 20 https://goproxy.cn >/dev/null
-            mkdir -p /sys/fs/bpf
-            mountpoint -q /sys/fs/bpf || mount -t bpf bpf /sys/fs/bpf
+            mountpoint -q /sys/fs/bpf
+            [ "$(stat -fc %T /sys/fs/bpf)" = bpf_fs ]
             ip netns add kuasar-isolation-probe
             ip netns del kuasar-isolation-probe
             systemctl is-active --quiet actions-runner.service
@@ -441,7 +444,7 @@ verify_slots() {
     fi
     run_in_slot 1 /usr/bin/rm -f /run/kuasar-slot-isolation-probe
 
-    local leader1 leader2 mnt1 mnt2 net1 net2 cgroup1 cgroup2
+    local leader1 leader2 mnt1 mnt2 net1 net2 cgroup1 cgroup2 bpfroot1 bpfroot2
     leader1="$(machinectl show kuasar-ci-1 -p Leader --value)"
     leader2="$(machinectl show kuasar-ci-2 -p Leader --value)"
     mnt1="$(readlink "/proc/$leader1/ns/mnt")"
@@ -450,9 +453,12 @@ verify_slots() {
     net2="$(readlink "/proc/$leader2/ns/net")"
     cgroup1="$(cat "/proc/$leader1/cgroup")"
     cgroup2="$(cat "/proc/$leader2/cgroup")"
+    bpfroot1="$(run_in_slot 1 /usr/bin/findmnt -n -o FSROOT --target /sys/fs/bpf)"
+    bpfroot2="$(run_in_slot 2 /usr/bin/findmnt -n -o FSROOT --target /sys/fs/bpf)"
     [ "$mnt1" != "$mnt2" ] || die "slots share a mount namespace"
     [ "$net1" != "$net2" ] || die "slots share a network namespace"
     [ "$cgroup1" != "$cgroup2" ] || die "slots share a host cgroup"
+    [ "$bpfroot1" != "$bpfroot2" ] || die "slots share a bpffs root"
     log "slot isolation checks passed"
 }
 
