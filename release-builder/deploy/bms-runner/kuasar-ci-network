@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+CONFIG=${KUASAR_CI_NETWORK_CONFIG:-/etc/kuasar-ci-network.conf}
+[ -r "$CONFIG" ] || { echo "missing $CONFIG" >&2; exit 1; }
+# shellcheck disable=SC1090
+source "$CONFIG"
+
+: "${BRIDGE:=kuasar-ci0}"
+: "${BRIDGE_ADDRESS:=10.203.0.1/24}"
+: "${SUBNET:=10.203.0.0/24}"
+: "${UPLINK_IFACE:=$(ip route show default | awk 'NR == 1 { print $5 }')}"
+
+ensure_rule() {
+    local table=$1
+    shift
+    if [ "$table" = filter ]; then
+        iptables -w 10 -C "$@" 2>/dev/null || iptables -w 10 -I "$@"
+    else
+        iptables -w 10 -t "$table" -C "$@" 2>/dev/null || iptables -w 10 -t "$table" -I "$@"
+    fi
+}
+
+delete_rule() {
+    local table=$1
+    shift
+    if [ "$table" = filter ]; then
+        while iptables -w 10 -C "$@" 2>/dev/null; do iptables -w 10 -D "$@"; done
+    else
+        while iptables -w 10 -t "$table" -C "$@" 2>/dev/null; do iptables -w 10 -t "$table" -D "$@"; done
+    fi
+}
+
+start_network() {
+    if ! ip link show "$BRIDGE" >/dev/null 2>&1; then
+        ip link add name "$BRIDGE" type bridge
+    fi
+    ip address replace "$BRIDGE_ADDRESS" dev "$BRIDGE"
+    ip link set "$BRIDGE" up
+    sysctl -q -w net.ipv4.ip_forward=1
+
+    ensure_rule nat POSTROUTING -s "$SUBNET" -o "$UPLINK_IFACE" \
+        -m comment --comment kuasar-ci-nspawn -j MASQUERADE
+    ensure_rule filter FORWARD 1 -i "$BRIDGE" \
+        -m comment --comment kuasar-ci-nspawn -j ACCEPT
+    ensure_rule filter FORWARD 1 -o "$BRIDGE" -m conntrack --ctstate RELATED,ESTABLISHED \
+        -m comment --comment kuasar-ci-nspawn -j ACCEPT
+}
+
+stop_network() {
+    delete_rule nat POSTROUTING -s "$SUBNET" -o "$UPLINK_IFACE" \
+        -m comment --comment kuasar-ci-nspawn -j MASQUERADE
+    delete_rule filter FORWARD -i "$BRIDGE" \
+        -m comment --comment kuasar-ci-nspawn -j ACCEPT
+    delete_rule filter FORWARD -o "$BRIDGE" -m conntrack --ctstate RELATED,ESTABLISHED \
+        -m comment --comment kuasar-ci-nspawn -j ACCEPT
+    if ip link show "$BRIDGE" >/dev/null 2>&1; then
+        ip link set "$BRIDGE" down
+        ip link delete "$BRIDGE" type bridge
+    fi
+}
+
+case "${1:-}" in
+    start|refresh) start_network ;;
+    stop) stop_network ;;
+    *) echo "usage: kuasar-ci-network start|refresh|stop" >&2; exit 2 ;;
+esac

@@ -1,0 +1,15 @@
+[Unit]
+Description=Private network for kuasar BMS CI containers
+After=network-online.target docker.service
+Wants=network-online.target
+Before=systemd-nspawn@kuasar-ci-1.service systemd-nspawn@kuasar-ci-2.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/kuasar-ci-network start
+ExecReload=/usr/local/libexec/kuasar-ci-network refresh
+ExecStop=/usr/local/libexec/kuasar-ci-network stop
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

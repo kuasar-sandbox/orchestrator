@@ -1,0 +1,21 @@
+[Unit]
+Description=Kuasar organization GitHub Actions runner
+After=network-online.target docker.service
+Wants=network-online.target docker.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/actions-runner
+Environment=RUNNER_ALLOW_RUNASROOT=1
+ExecStart=/opt/actions-runner/runsvc.sh
+Restart=always
+RestartSec=5s
+KillMode=process
+KillSignal=SIGTERM
+TimeoutStopSec=5min
+LimitNOFILE=1048576
+LimitMEMLOCK=infinity
+
+[Install]
+WantedBy=multi-user.target
