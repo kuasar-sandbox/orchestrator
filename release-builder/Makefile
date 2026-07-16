@@ -38,6 +38,7 @@ E2E_TOOL_DIR   := build/e2e-tools/$(TARGET_ARCH)
 E2E_ZOT_BIN    := $(abspath $(E2E_TOOL_DIR)/zot)
 E2E_VGW_BIN    := $(abspath $(E2E_TOOL_DIR)/versitygw)
 BIN_INPUTS_MANIFEST := scripts/bin-inputs.manifest
+CI_TIMED       := scripts/ci-timed.sh
 GO_REPOS       := accelerator sandboxer guest-runtime connector orchestrator
 ZOT_VERSION    ?= v2.1.17
 
@@ -64,7 +65,7 @@ E2E_REQUIRE_ENV := REQUIRE_KVM=1 REQUIRE_EXEC=1 REQUIRE_CLUSTER_STUB=1 \
 
 PERF_TARGETS := perf-sandbox perf-sandbox-manifest perf-density
 
-.PHONY: all build collect e2e-tools release vet test clean help demo \
+.PHONY: all build collect e2e-tools release vet test test-ci-tools clean help demo \
         bench test-e2e perf dedup-report \
         $(UMBRELLA_E2E) $(PERF_TARGETS)
 
@@ -78,17 +79,17 @@ all: build
 # Environment tools used only by tests are kept under build/e2e-tools/ and are
 # never packaged as release artifacts.
 build:
-	$(MAKE) -C $(ORG)/guest-runtime/native-deps build
-	$(MAKE) -C $(ORG)/accelerator build
-	$(MAKE) -C $(ORG)/sandboxer build
-	$(MAKE) -C $(ORG)/guest-runtime build
-	$(MAKE) -C $(ORG)/connector build
-	$(MAKE) -C $(ORG)/orchestrator build
-	@$(MAKE) collect
+	$(CI_TIMED) build/guest-native $(MAKE) -C $(ORG)/guest-runtime/native-deps build
+	$(CI_TIMED) build/accelerator $(MAKE) -C $(ORG)/accelerator build
+	$(CI_TIMED) build/sandboxer $(MAKE) -C $(ORG)/sandboxer build
+	$(CI_TIMED) build/guest-runtime $(MAKE) -C $(ORG)/guest-runtime build
+	$(CI_TIMED) build/connector $(MAKE) -C $(ORG)/connector build
+	$(CI_TIMED) build/orchestrator $(MAKE) -C $(ORG)/orchestrator build
+	@$(CI_TIMED) build/collect $(MAKE) collect
 
 e2e-tools:
-	BINDIR="$(abspath $(E2E_TOOL_DIR))" TARGET_ARCH="$(TARGET_ARCH)" ZOT_VERSION="$(ZOT_VERSION)" bash scripts/ensure-zot.sh
-	BINDIR="$(abspath $(E2E_TOOL_DIR))" TARGET_ARCH="$(TARGET_ARCH)" bash scripts/ensure-versitygw.sh
+	$(CI_TIMED) tools/zot env BINDIR="$(abspath $(E2E_TOOL_DIR))" TARGET_ARCH="$(TARGET_ARCH)" ZOT_VERSION="$(ZOT_VERSION)" bash scripts/ensure-zot.sh
+	$(CI_TIMED) tools/versitygw env BINDIR="$(abspath $(E2E_TOOL_DIR))" TARGET_ARCH="$(TARGET_ARCH)" bash scripts/ensure-versitygw.sh
 
 # Assemble bin/$(TARGET_ARCH)/ from each sub-repo's per-arch bin per the
 # binary-input manifest. Native builds drop a bin/<name> symlink to the per-arch
@@ -128,13 +129,13 @@ release: build
 # test/e2e/e2e_<sub>.sh, with dashes in <sub> mapped to underscores so
 # test-e2e-sandbox-cold → e2e_sandbox_cold.sh.
 $(UMBRELLA_E2E): test-e2e-%: build e2e-tools
-	$(E2E_REQUIRE_ENV) BIN=$(SBIN) ZOT_BIN=$(E2E_ZOT_BIN) VGW_BIN=$(E2E_VGW_BIN) bash test/e2e/e2e_$(subst -,_,$*).sh
+	$(CI_TIMED) e2e/orchestrator/$* env $(E2E_REQUIRE_ENV) BIN=$(SBIN) ZOT_BIN=$(E2E_ZOT_BIN) VGW_BIN=$(E2E_VGW_BIN) bash test/e2e/e2e_$(subst -,_,$*).sh
 
 # Aggregate test-e2e: every umbrella sub-target + each sub-repo's test-e2e.
 test-e2e: build e2e-tools $(UMBRELLA_E2E)
-	$(E2E_REQUIRE_ENV) $(MAKE) -C $(ORG)/accelerator test-e2e SBIN=$(SBIN)
-	$(E2E_REQUIRE_ENV) $(MAKE) -C $(ORG)/connector test-e2e
-	$(E2E_REQUIRE_ENV) $(MAKE) -C $(ORG)/guest-runtime test-e2e \
+	$(CI_TIMED) e2e/accelerator env $(E2E_REQUIRE_ENV) $(MAKE) -C $(ORG)/accelerator test-e2e SBIN=$(SBIN)
+	$(CI_TIMED) e2e/connector env $(E2E_REQUIRE_ENV) $(MAKE) -C $(ORG)/connector test-e2e
+	$(CI_TIMED) e2e/guest-runtime env $(E2E_REQUIRE_ENV) $(MAKE) -C $(ORG)/guest-runtime test-e2e \
 		FLATTEN_CTL=$(SBIN)/flatten-ctl STORE_CTL=$(SBIN)/store-ctl \
 		ZOT_BIN=$(E2E_ZOT_BIN) MKFS_EROFS_PATH=$(SBIN)/mkfs.erofs
 
@@ -174,6 +175,9 @@ vet:
 
 test:
 	@for r in $(GO_REPOS); do echo "== test $$r =="; $(MAKE) -C $(ORG)/$$r test || exit 1; done
+
+test-ci-tools:
+	bash scripts/test-ci-tools.sh
 
 clean:
 	@for r in $(GO_REPOS); do $(MAKE) -C $(ORG)/$$r clean 2>/dev/null || true; done
