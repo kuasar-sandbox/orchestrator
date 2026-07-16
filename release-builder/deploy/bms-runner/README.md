@@ -13,6 +13,18 @@ directory. The containers share only:
 Each slot receives a different bpffs subtree at `/sys/fs/bpf`; pinned BPF paths
 cannot collide across concurrent jobs.
 
+The host must preload the pinned x86_64 E2E tools instead of downloading their
+large release artifacts during a job:
+
+| Path | SHA-256 |
+| --- | --- |
+| `/var/lib/kuasar-ci/tools/zot` | `523e5bf29a013db09115f780c3152af98fc5b65fc408a0d3e6c293643dc9bde7` |
+| `/var/lib/kuasar-ci/tools/versitygw` | `e839f0ce24a51dbf0a7a925e08a28a0bfa190d05290c13f2c4536852bc5f3a7d` |
+
+Transfer these verified files from the operator host before running `check`.
+The provisioner rejects missing or mismatched tools and mounts the directory
+read-only into both slots.
+
 The containers are privileged resource-name isolation, not a security boundary
 for untrusted jobs. They deliberately receive KVM, TUN, vhost devices, all
 capabilities, Docker keyring syscalls, and the `bpf` syscall required by the
@@ -50,6 +62,12 @@ used by the RocksDB-linked `cache-ctl` and the Redis server used by Accelerator
 E2E are installed from the same mirror. GNU `time` provides per-stage CPU,
 memory, and I/O metrics. Every install reconciles the package manifest so
 existing slots receive newly added build dependencies.
+
+The host install also writes `/etc/modules-load.d/kuasar-ci.conf` for bridge,
+overlay, TUN, and vhost devices. Enabled slots therefore retain their required
+bind devices after a host reboot. Space checks follow the filesystems that hold
+the template and `/var/lib/machines`; a shared filesystem requires 15 GiB free,
+while separate filesystems require 5 GiB and 10 GiB respectively.
 
 The existing runner distribution is copied without credentials, logs, or its
 large work directory. Runner self-update is disabled so containers do not

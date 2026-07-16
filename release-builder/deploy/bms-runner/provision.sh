@@ -14,6 +14,9 @@ BRIDGE_ADDRESS=${KUASAR_CI_BRIDGE_ADDRESS:-10.203.0.1/24}
 MEMORY_MAX=${KUASAR_SLOT_MEMORY_MAX:-176G}
 MEMORY_HIGH=${KUASAR_SLOT_MEMORY_HIGH:-168G}
 SOURCE_CACHE=${KUASAR_SOURCE_CACHE:-/var/cache/kuasar/sources}
+TOOL_ROOT=/var/lib/kuasar-ci/tools
+ZOT_TOOL_SHA256=523e5bf29a013db09115f780c3152af98fc5b65fc408a0d3e6c293643dc9bde7
+VERSITYGW_TOOL_SHA256=e839f0ce24a51dbf0a7a925e08a28a0bfa190d05290c13f2c4536852bc5f3a7d
 UTIL_LINUX_SRPM_URL=${KUASAR_UTIL_LINUX_SRPM_URL:-https://mirrors.huaweicloud.com/openeuler/openEuler-24.03-LTS-SP4/source/Packages/util-linux-2.39.1-38.oe2403sp4.src.rpm}
 UTIL_LINUX_SRPM_SHA256=${KUASAR_UTIL_LINUX_SRPM_SHA256:-40324d3ab54be52ef67544732a71ec14f6aecb2e92f5d8fa0aaaac532c55c0bf}
 UTIL_LINUX_TARBALL_SHA256=${KUASAR_UTIL_LINUX_TARBALL_SHA256:-890ae8ff810247bd19e274df76e8371d202cda01ad277681b0ea88eeaa00286b}
@@ -67,6 +70,15 @@ slot_root() {
     printf '%s/%s' "$MACHINE_ROOT" "$(machine_name "$1")"
 }
 
+assert_distinct_slot_machine_ids() {
+    local id1 id2
+    id1="$(cat "$(slot_root 1)/etc/machine-id" 2>/dev/null || true)"
+    id2="$(cat "$(slot_root 2)/etc/machine-id" 2>/dev/null || true)"
+    [[ "$id1" =~ ^[0-9a-f]{32}$ ]] || die "slot 1 has an invalid machine ID"
+    [[ "$id2" =~ ^[0-9a-f]{32}$ ]] || die "slot 2 has an invalid machine ID"
+    [ "$id1" != "$id2" ] || die "slots share a machine ID"
+}
+
 slot_value() {
     local slot=$1 field=$2 variable
     variable="SLOT${slot}_${field}"
@@ -96,7 +108,14 @@ assert_china_repositories() {
 }
 
 assert_host_runner_idle() {
-    local service_file="$RUNNER_SOURCE/.service" service
+    local proc comm service_file="$RUNNER_SOURCE/.service" service
+    for proc in /proc/[0-9]*; do
+        [ -r "$proc/comm" ] || continue
+        IFS= read -r comm <"$proc/comm" || continue
+        if [ "$comm" = Runner.Worker ]; then
+            die "host Runner.Worker process ${proc##*/} must exit before installation"
+        fi
+    done
     [ -f "$service_file" ] || return
     service="$(<"$service_file")"
     if systemctl is-active --quiet "$service"; then
@@ -117,6 +136,48 @@ assert_slots_stopped() {
 verify_sha256() {
     local path=$1 expected=$2
     printf '%s  %s\n' "$expected" "$path" | sha256sum --check --status
+}
+
+assert_e2e_tools() {
+    [ -x "$TOOL_ROOT/zot" ] \
+        || die "preload the pinned zot binary at $TOOL_ROOT/zot before installation"
+    [ -x "$TOOL_ROOT/versitygw" ] \
+        || die "preload the pinned versitygw binary at $TOOL_ROOT/versitygw before installation"
+    verify_sha256 "$TOOL_ROOT/zot" "$ZOT_TOOL_SHA256" \
+        || die "zot checksum mismatch at $TOOL_ROOT/zot"
+    verify_sha256 "$TOOL_ROOT/versitygw" "$VERSITYGW_TOOL_SHA256" \
+        || die "versitygw checksum mismatch at $TOOL_ROOT/versitygw"
+}
+
+existing_ancestor() {
+    local path=$1 parent
+    [[ "$path" = /* ]] || die "installation paths must be absolute: $path"
+    while [ ! -e "$path" ]; do
+        parent=${path%/*}
+        path=${parent:-/}
+    done
+    printf '%s' "$path"
+}
+
+require_free_space() {
+    local path=$1 gib=$2 label=$3 free_kib
+    free_kib="$(df --output=avail -k "$path" | tail -1)"
+    [ "$free_kib" -ge $((gib * 1024 * 1024)) ] \
+        || die "$label filesystem requires at least $gib GiB free space"
+}
+
+assert_install_space() {
+    local template_path machine_path template_device machine_device
+    template_path="$(existing_ancestor "$TEMPLATE_ROOT")"
+    machine_path="$(existing_ancestor "$MACHINE_ROOT")"
+    template_device="$(stat -c %d "$template_path")"
+    machine_device="$(stat -c %d "$machine_path")"
+    if [ "$template_device" = "$machine_device" ]; then
+        require_free_space "$template_path" 15 "template and machine root"
+    else
+        require_free_space "$template_path" 5 "template root"
+        require_free_space "$machine_path" 10 "machine root"
+    fi
 }
 
 install_static_libuuid() {
@@ -173,6 +234,7 @@ check_host() {
     require_root
     assert_supported_host
     assert_china_repositories
+    assert_e2e_tools
     local package missing=()
     for package in "${HOST_PACKAGES[@]}" "${PACKAGES[@]}"; do
         if ! dnf -q repoquery --available --qf '%{name}' "$package" | grep -qx "$package"; then
@@ -180,7 +242,7 @@ check_host() {
         fi
     done
     [ "${#missing[@]}" -eq 0 ] || die "packages unavailable from enabled mirrors: ${missing[*]}"
-    log "host, devices, cgroup v2, China mirrors, and package set are ready"
+    log "host, devices, cgroup v2, China mirrors, pinned E2E tools, and package set are ready"
 }
 
 install_host_support() {
@@ -192,7 +254,7 @@ install_host_support() {
     fi
     install -d -m 0755 \
         /usr/local/libexec /etc/systemd/system /etc/systemd/nspawn /etc/kuasar-ci \
-        "$MACHINE_ROOT"
+        /etc/modules-load.d /var/cache/kuasar /usr/local/go "$TOOL_ROOT" "$MACHINE_ROOT"
     install -m 0755 "$SCRIPT_DIR/kuasar-ci-network" /usr/local/libexec/kuasar-ci-network
     install -m 0644 "$SCRIPT_DIR/kuasar-ci-network.service" /etc/systemd/system/kuasar-ci-network.service
     install -m 0755 "$SCRIPT_DIR/kuasar-ci-bpf" /usr/local/libexec/kuasar-ci-bpf
@@ -208,13 +270,20 @@ BRIDGE_ADDRESS=$BRIDGE_ADDRESS
 SUBNET=$SUBNET
 UPLINK_IFACE=$uplink
 EOF
+    cat >/etc/modules-load.d/kuasar-ci.conf <<'EOF'
+bridge
+overlay
+tun
+vhost_net
+vhost_vsock
+EOF
     systemctl daemon-reload
-    systemctl enable --now kuasar-ci-network.service kuasar-ci-bpf.service
     modprobe bridge
     modprobe overlay
     modprobe tun
     modprobe vhost_net
     modprobe vhost_vsock
+    systemctl enable --now kuasar-ci-network.service kuasar-ci-bpf.service
 }
 
 copy_runner_distribution() {
@@ -355,8 +424,8 @@ EOF
     install -d -m 0755 "/etc/systemd/system/systemd-nspawn@$machine.service.d"
     cat >"/etc/systemd/system/systemd-nspawn@$machine.service.d/override.conf" <<EOF
 [Unit]
-Requires=kuasar-ci-network.service kuasar-ci-bpf.service
-After=kuasar-ci-network.service kuasar-ci-bpf.service
+Requires=systemd-modules-load.service kuasar-ci-network.service kuasar-ci-bpf.service
+After=systemd-modules-load.service kuasar-ci-network.service kuasar-ci-bpf.service
 
 [Service]
 DeviceAllow=/dev/kvm rw
@@ -386,7 +455,6 @@ prepare_slot() {
         [ ! -e "$root" ] || die "partial slot root exists: $root"
         log "copying rootfs for $machine"
         cp -a "$TEMPLATE_ROOT" "$root"
-        touch "$root/.kuasar-ci-slot"
         new_slot=1
     fi
     if [ "$new_slot" -eq 0 ]; then
@@ -402,12 +470,20 @@ prepare_slot() {
     install -m 0644 "$TEMPLATE_ROOT/usr/lib64/.kuasar-libuuid-build-id" \
         "$root/usr/lib64/.kuasar-libuuid-build-id"
 
-    if [ "$new_slot" -eq 1 ]; then
+    local machine_id template_machine_id
+    machine_id="$(cat "$root/etc/machine-id" 2>/dev/null || true)"
+    template_machine_id="$(cat "$TEMPLATE_ROOT/etc/machine-id" 2>/dev/null || true)"
+    if [ "$new_slot" -eq 1 ] \
+        || ! [[ "$machine_id" =~ ^[0-9a-f]{32}$ ]] \
+        || { [ -n "$template_machine_id" ] && [ "$machine_id" = "$template_machine_id" ]; }; then
         rm -f "$root/etc/machine-id" "$root/var/lib/dbus/machine-id"
         : >"$root/etc/machine-id"
         systemd-machine-id-setup --root="$root" >/dev/null
-        ln -sfn /etc/machine-id "$root/var/lib/dbus/machine-id"
     fi
+    ln -sfn /etc/machine-id "$root/var/lib/dbus/machine-id"
+    machine_id="$(cat "$root/etc/machine-id")"
+    [[ "$machine_id" =~ ^[0-9a-f]{32}$ ]] \
+        || die "$machine has an invalid machine ID"
     printf '%s\n' "$machine" >"$root/etc/hostname"
     cat >"$root/etc/hosts" <<EOF
 127.0.0.1 localhost
@@ -430,6 +506,7 @@ EOF
         "$root/etc/systemd/system/actions-runner.service"
     systemctl --root="$root" enable systemd-networkd.service docker.service >/dev/null
     write_nspawn_config "$slot"
+    touch "$root/.kuasar-ci-slot"
 }
 
 install_slots() {
@@ -438,13 +515,13 @@ install_slots() {
     assert_china_repositories
     assert_host_runner_idle
     assert_slots_stopped
-    local free_kib
-    free_kib="$(df --output=avail -k / | tail -1)"
-    [ "$free_kib" -ge $((15 * 1024 * 1024)) ] || die "at least 15 GiB free space is required"
+    assert_e2e_tools
+    assert_install_space
     install_host_support
     build_template_root
     prepare_slot 1
     prepare_slot 2
+    assert_distinct_slot_machine_ids
     systemctl daemon-reload
     log "slots installed but not started; register each slot next"
 }
@@ -488,12 +565,17 @@ register_slot() {
 
 start_slots() {
     require_root
-    systemctl start kuasar-ci-network.service
     local slot machine root
     for slot in 1 2; do
         machine="$(machine_name "$slot")"
         root="$(slot_root "$slot")"
         [ -f "$root/opt/actions-runner/.runner" ] || die "$machine is not registered"
+    done
+    assert_distinct_slot_machine_ids
+
+    systemctl start kuasar-ci-network.service
+    for slot in 1 2; do
+        machine="$(machine_name "$slot")"
         systemctl enable --now "systemd-nspawn@$machine.service"
     done
     wait_slot_ready 1
@@ -572,6 +654,8 @@ verify_slots() {
             systemctl is-active --quiet actions-runner.service
         '
     done
+
+    assert_distinct_slot_machine_ids
 
     run_in_slot 1 /usr/bin/touch /run/kuasar-slot-isolation-probe
     if run_in_slot 2 /usr/bin/test -e /run/kuasar-slot-isolation-probe; then
