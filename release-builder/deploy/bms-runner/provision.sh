@@ -24,8 +24,11 @@ GO_TARBALL_SHA256=5c2c3b16caefa1d968a94c1daca04a7ca301a496d9b086e17ad77bb81393f0
 GO_BINARY_SHA256=8da5fd321795754b994c64e3eb8a5a14ff47bd285559a7e876f3c79abafc67f9
 UTIL_LINUX_SRPM_URL=${KUASAR_UTIL_LINUX_SRPM_URL:-https://mirrors.huaweicloud.com/openeuler/openEuler-24.03-LTS-SP4/source/Packages/util-linux-2.39.1-38.oe2403sp4.src.rpm}
 UTIL_LINUX_SRPM_SHA256=${KUASAR_UTIL_LINUX_SRPM_SHA256:-40324d3ab54be52ef67544732a71ec14f6aecb2e92f5d8fa0aaaac532c55c0bf}
+UTIL_LINUX_SOURCE_ARCHIVE=${KUASAR_UTIL_LINUX_SOURCE_ARCHIVE:-util-linux-2.39.1.tar.xz}
 UTIL_LINUX_TARBALL_SHA256=${KUASAR_UTIL_LINUX_TARBALL_SHA256:-890ae8ff810247bd19e274df76e8371d202cda01ad277681b0ea88eeaa00286b}
 LIBUUID_BUILD_SCHEMA=util-linux-static-v1
+SLOT_OWNER_MARKER=.kuasar-ci-slot-owner
+SLOT_OWNER_ID=kuasar-ci-bms-runner-v1
 
 SLOT1_CPUS=${KUASAR_SLOT1_CPUS:-0-21,44-65}
 SLOT2_CPUS=${KUASAR_SLOT2_CPUS:-22-43,66-87}
@@ -73,6 +76,20 @@ machine_name() {
 
 slot_root() {
     printf '%s/%s' "$MACHINE_ROOT" "$(machine_name "$1")"
+}
+
+slot_root_owned() {
+    local root=$1 owner
+    [ -d "$root" ] && [ ! -L "$root" ] || return 1
+    IFS= read -r owner <"$root/$SLOT_OWNER_MARKER" || return 1
+    [ "$owner" = "$SLOT_OWNER_ID" ]
+}
+
+assert_slot_root_owned() {
+    local slot=$1 root
+    root="$(slot_root "$slot")"
+    slot_root_owned "$root" \
+        || die "refusing to manage unowned slot root $root"
 }
 
 assert_distinct_slot_machine_ids() {
@@ -228,10 +245,14 @@ assert_install_space() {
 
 install_static_libuuid() {
     local marker="$TEMPLATE_ROOT/usr/lib64/.kuasar-libuuid-build-id" build_id
+    case "$UTIL_LINUX_SOURCE_ARCHIVE" in
+        ""|.|..|*/*) die "util-linux source archive must be a file name" ;;
+    esac
     build_id="$({
         printf 'schema=%s\n' "$LIBUUID_BUILD_SCHEMA"
         printf 'srpm_url=%s\n' "$UTIL_LINUX_SRPM_URL"
         printf 'srpm_sha256=%s\n' "$UTIL_LINUX_SRPM_SHA256"
+        printf 'source_archive=%s\n' "$UTIL_LINUX_SOURCE_ARCHIVE"
         printf 'tarball_sha256=%s\n' "$UTIL_LINUX_TARBALL_SHA256"
     } | sha256sum | awk '{print $1}')"
     if [ -s "$TEMPLATE_ROOT/usr/lib64/libuuid.a" ] \
@@ -261,11 +282,12 @@ install_static_libuuid() {
     rm -rf "$work"
     install -d -m 0755 "$work/srpm" "$work/src"
     (cd "$work/srpm" && rpm2cpio "$srpm" | cpio -idm --quiet)
-    source="$work/srpm/util-linux-2.39.1.tar.xz"
-    [ -f "$source" ] || die "util-linux source tarball is missing from $srpm"
+    source="$work/srpm/$UTIL_LINUX_SOURCE_ARCHIVE"
+    [ -f "$source" ] \
+        || die "$UTIL_LINUX_SOURCE_ARCHIVE is missing from $srpm"
     verify_sha256 "$source" "$UTIL_LINUX_TARBALL_SHA256" \
         || die "util-linux source tarball checksum mismatch"
-    tar -xJf "$source" --strip-components=1 -C "$work/src"
+    tar -xf "$source" --strip-components=1 -C "$work/src"
 
     log "building static libuuid inside the runner root"
     chroot "$TEMPLATE_ROOT" /bin/bash -ceu '
@@ -502,18 +524,32 @@ EOF
 }
 
 prepare_slot() {
-    local slot=$1 machine root ip new_slot=0
+    local slot=$1 machine root ip new_slot=0 staging
     machine="$(machine_name "$slot")"
     root="$(slot_root "$slot")"
     ip="$(slot_value "$slot" IP)"
 
+    if [ -e "$root" ] || [ -L "$root" ]; then
+        slot_root_owned "$root" \
+            || die "refusing to replace or modify unowned slot root $root"
+    fi
     if [ ! -f "$root/.kuasar-ci-slot" ]; then
         if [ -e "$root" ]; then
             log "removing interrupted slot root $root"
             rm -rf "$root"
         fi
         log "copying rootfs for $machine"
-        cp -a "$TEMPLATE_ROOT" "$root"
+        staging="$(mktemp -d "$MACHINE_ROOT/.${machine}.install.XXXXXX")"
+        chmod 0755 "$staging"
+        printf '%s\n' "$SLOT_OWNER_ID" >"$staging/$SLOT_OWNER_MARKER"
+        if ! cp -a "$TEMPLATE_ROOT/." "$staging/"; then
+            rm -rf "$staging"
+            die "failed to copy rootfs for $machine"
+        fi
+        if ! mv -T -- "$staging" "$root"; then
+            rm -rf "$staging"
+            die "failed to install owned slot root $root"
+        fi
         new_slot=1
     fi
     if [ "$new_slot" -eq 0 ]; then
@@ -593,6 +629,7 @@ register_slot() {
     [ -n "$token" ] || die "registration token must be provided on stdin"
     machine="$(machine_name "$slot")"
     root="$(slot_root "$slot")"
+    assert_slot_root_owned "$slot"
     [ -f "$root/.kuasar-ci-slot" ] || die "slot $slot is not installed"
     systemctl is-active --quiet "systemd-nspawn@$machine.service" \
         && die "$machine must be stopped before registration"
@@ -628,6 +665,7 @@ start_slots() {
     for slot in 1 2; do
         machine="$(machine_name "$slot")"
         root="$(slot_root "$slot")"
+        assert_slot_root_owned "$slot"
         [ -f "$root/opt/actions-runner/.runner" ] || die "$machine is not registered"
     done
     assert_distinct_slot_machine_ids
@@ -686,6 +724,7 @@ verify_slots() {
     local slot machine
     for slot in 1 2; do
         machine="$(machine_name "$slot")"
+        assert_slot_root_owned "$slot"
         wait_slot_ready "$slot"
         [ "$(machinectl show "$machine" -p State --value)" = running ] || die "$machine is not running"
         run_in_slot "$slot" /bin/bash -ceu '

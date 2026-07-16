@@ -11,6 +11,12 @@ source "$CONFIG"
 : "${BRIDGE_ADDRESS:=10.203.0.1/24}"
 : "${SUBNET:=10.203.0.0/24}"
 : "${UPLINK_IFACE:=$(ip route show default | awk 'NR == 1 { print $5 }')}"
+BRIDGE_OWNER=kuasar-ci-bms-runner-v1
+
+bridge_owned() {
+    [ -d "/sys/class/net/$BRIDGE/bridge" ] \
+        && [ "$(cat "/sys/class/net/$BRIDGE/ifalias" 2>/dev/null || true)" = "$BRIDGE_OWNER" ]
+}
 
 ensure_rule() {
     local table=$1 chain=$2
@@ -35,8 +41,15 @@ delete_rule() {
 }
 
 start_network() {
-    if ! ip link show "$BRIDGE" >/dev/null 2>&1; then
+    if ip link show "$BRIDGE" >/dev/null 2>&1; then
+        bridge_owned \
+            || { echo "refusing to manage unowned bridge $BRIDGE" >&2; return 1; }
+    else
         ip link add name "$BRIDGE" type bridge
+        if ! ip link set dev "$BRIDGE" alias "$BRIDGE_OWNER"; then
+            ip link delete "$BRIDGE" type bridge
+            return 1
+        fi
     fi
     ip address replace "$BRIDGE_ADDRESS" dev "$BRIDGE"
     ip link set "$BRIDGE" up
@@ -51,6 +64,10 @@ start_network() {
 }
 
 stop_network() {
+    if ip link show "$BRIDGE" >/dev/null 2>&1 && ! bridge_owned; then
+        echo "refusing to delete unowned bridge $BRIDGE" >&2
+        return 1
+    fi
     delete_rule nat POSTROUTING -s "$SUBNET" -o "$UPLINK_IFACE" \
         -m comment --comment kuasar-ci-nspawn -j MASQUERADE
     delete_rule filter FORWARD -i "$BRIDGE" \

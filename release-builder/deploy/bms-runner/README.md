@@ -45,7 +45,9 @@ connector datapath.
 | 2 | `bms-tmp-kuasar-e2e-2` | NUMA1: `22-43,66-87` | high 168 GiB, max 176 GiB | `10.203.0.12/24` |
 
 The host bridge is `kuasar-ci0` at `10.203.0.1/24`. Exact iptables rules NAT
-that subnet through the current default uplink. The provisioner refuses to run
+that subnet through the current default uplink. The network service records its
+ownership in the bridge interface alias and refuses to modify or delete an
+unowned interface with the configured name. The provisioner refuses to run
 while the existing host runner has an active `Runner.Worker`, requires cgroup
 v2, and rejects enabled DNF repositories outside configured Chinese mirrors.
 
@@ -70,13 +72,21 @@ E2E are installed from the same mirror. GNU `time` provides per-stage CPU,
 memory, and I/O metrics. Every install reconciles the package manifest so
 existing slots receive newly added build dependencies.
 
+Changing the pinned util-linux source requires overriding the complete source
+descriptor together: `KUASAR_UTIL_LINUX_SRPM_URL`,
+`KUASAR_UTIL_LINUX_SRPM_SHA256`, `KUASAR_UTIL_LINUX_SOURCE_ARCHIVE`, and
+`KUASAR_UTIL_LINUX_TARBALL_SHA256`. The archive name is validated as a plain
+file name and is included in the static-library build identity.
+
 The host install also writes `/etc/modules-load.d/kuasar-ci.conf` for bridge,
 overlay, TUN, and vhost devices. Enabled slots therefore retain their required
 bind devices after a host reboot. Space checks follow the filesystems that hold
 the template and `/var/lib/machines`; a shared filesystem requires 15 GiB free,
 while separate filesystems require 5 GiB and 10 GiB respectively.
-Markerless template or slot roots are owned incomplete installations and are
-rebuilt automatically on retry. Completed roots are always reconciled in place.
+The provisioner makes a slot root visible only after writing a separate owner
+marker into a staging root. An incomplete owned root is rebuilt automatically
+on retry; a markerless or mismatched root is never modified or deleted.
+Completed owned roots are always reconciled in place.
 
 The existing runner distribution is copied without credentials, logs, or its
 large work directory. Runner self-update is disabled so containers do not
