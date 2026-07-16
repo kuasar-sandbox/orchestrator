@@ -37,7 +37,7 @@ PACKAGES=(
     lz4-devel zstd-devel zlib-devel snappy-devel
     rust cargo rust-std-static clang llvm bpftool
     python3 python3-pip python3-devel python3-pyyaml
-    moby-engine moby-client e2fsprogs unzip zip zstd lz4
+    moby-engine moby-client redis e2fsprogs unzip zip zstd lz4
 )
 BOOTSTRAP_PACKAGES=(filesystem glibc bash coreutils)
 HOST_PACKAGES=(systemd-container systemd-nspawn rpm cpio)
