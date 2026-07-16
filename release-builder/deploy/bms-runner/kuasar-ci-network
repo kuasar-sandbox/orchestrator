@@ -13,12 +13,14 @@ source "$CONFIG"
 : "${UPLINK_IFACE:=$(ip route show default | awk 'NR == 1 { print $5 }')}"
 
 ensure_rule() {
-    local table=$1
-    shift
+    local table=$1 chain=$2
+    shift 2
     if [ "$table" = filter ]; then
-        iptables -w 10 -C "$@" 2>/dev/null || iptables -w 10 -I "$@"
+        iptables -w 10 -C "$chain" "$@" 2>/dev/null \
+            || iptables -w 10 -I "$chain" 1 "$@"
     else
-        iptables -w 10 -t "$table" -C "$@" 2>/dev/null || iptables -w 10 -t "$table" -I "$@"
+        iptables -w 10 -t "$table" -C "$chain" "$@" 2>/dev/null \
+            || iptables -w 10 -t "$table" -I "$chain" 1 "$@"
     fi
 }
 
@@ -42,9 +44,9 @@ start_network() {
 
     ensure_rule nat POSTROUTING -s "$SUBNET" -o "$UPLINK_IFACE" \
         -m comment --comment kuasar-ci-nspawn -j MASQUERADE
-    ensure_rule filter FORWARD 1 -i "$BRIDGE" \
+    ensure_rule filter FORWARD -i "$BRIDGE" \
         -m comment --comment kuasar-ci-nspawn -j ACCEPT
-    ensure_rule filter FORWARD 1 -o "$BRIDGE" -m conntrack --ctstate RELATED,ESTABLISHED \
+    ensure_rule filter FORWARD -o "$BRIDGE" -m conntrack --ctstate RELATED,ESTABLISHED \
         -m comment --comment kuasar-ci-nspawn -j ACCEPT
 }
 

@@ -7,7 +7,7 @@ ORG=${KUASAR_ORG:-kuasar-sandbox}
 RUNNER_GROUP=${KUASAR_RUNNER_GROUP:-kuasar-e2e}
 RUNNER_SOURCE=${KUASAR_RUNNER_SOURCE:-/opt/actions-runner}
 TEMPLATE_ROOT=${KUASAR_TEMPLATE_ROOT:-/var/lib/kuasar-ci/rootfs-template}
-MACHINE_ROOT=${KUASAR_MACHINE_ROOT:-/var/lib/machines}
+MACHINE_ROOT=/var/lib/machines
 BRIDGE=${KUASAR_CI_BRIDGE:-kuasar-ci0}
 SUBNET=${KUASAR_CI_SUBNET:-10.203.0.0/24}
 BRIDGE_ADDRESS=${KUASAR_CI_BRIDGE_ADDRESS:-10.203.0.1/24}
@@ -40,7 +40,11 @@ PACKAGES=(
     moby-engine moby-client redis e2fsprogs unzip zip zstd lz4
 )
 BOOTSTRAP_PACKAGES=(filesystem glibc bash coreutils)
-HOST_PACKAGES=(systemd-container systemd-nspawn rpm cpio)
+HOST_PACKAGES=(
+    bash coreutils findutils grep gawk tar xz curl rsync util-linux procps-ng
+    systemd systemd-container systemd-nspawn dnf rpm cpio
+    iproute iptables kmod
+)
 
 die() {
     echo "provision: $*" >&2
@@ -182,6 +186,10 @@ check_host() {
 install_host_support() {
     dnf -y --setopt=install_weak_deps=False install "${HOST_PACKAGES[@]}"
     command -v systemd-nspawn >/dev/null || die "systemd-nspawn was not installed"
+    if systemctl is-active --quiet kuasar-ci-network.service; then
+        log "stopping the active CI network before replacing its configuration"
+        systemctl stop kuasar-ci-network.service
+    fi
     install -d -m 0755 \
         /usr/local/libexec /etc/systemd/system /etc/systemd/nspawn /etc/kuasar-ci \
         "$MACHINE_ROOT"
@@ -240,6 +248,7 @@ reconcile_root_packages() {
     dnf -y --installroot="$root" --releasever=24.03 \
         --setopt=install_weak_deps=False --setopt=keepcache=False \
         install "${PACKAGES[@]}"
+    sync_root_repositories "$root"
 }
 
 build_template_root() {
@@ -458,12 +467,19 @@ register_slot() {
         "$root/opt/actions-runner/.runner" \
         "$root/opt/actions-runner/.runner_migrated" \
         "$root/opt/actions-runner/.service"
-    RUNNER_ALLOW_RUNASROOT=1 systemd-nspawn --quiet --pipe --settings=no --register=no \
-        --directory="$root" --setenv=RUNNER_ALLOW_RUNASROOT=1 \
-        /opt/actions-runner/config.sh --unattended --replace --disableupdate \
-        --url "https://github.com/$ORG" --token "$token" \
-        --name "bms-tmp-kuasar-e2e-$slot" --runnergroup "$RUNNER_GROUP" \
-        --labels "kuasar-e2e,kvm,cgroup-v2,bms-slot-$slot" --work _work
+    printf '%s\n' "$token" \
+        | RUNNER_ALLOW_RUNASROOT=1 systemd-nspawn --quiet --pipe --settings=no --register=no \
+            --directory="$root" --setenv=RUNNER_ALLOW_RUNASROOT=1 \
+            /bin/bash -ceu '
+                IFS= read -r token
+                [ -n "$token" ]
+                export ACTIONS_RUNNER_INPUT_TOKEN="$token"
+                unset token
+                exec /opt/actions-runner/config.sh --unattended --replace --disableupdate \
+                    --url "$1" --name "$2" --runnergroup "$3" \
+                    --labels "$4" --work _work
+            ' register-runner "https://github.com/$ORG" "bms-tmp-kuasar-e2e-$slot" \
+            "$RUNNER_GROUP" "kuasar-e2e,kvm,cgroup-v2,bms-slot-$slot"
     printf '/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin\n' \
         >"$root/opt/actions-runner/.path"
     systemctl --root="$root" enable actions-runner.service >/dev/null
@@ -486,10 +502,17 @@ start_slots() {
 
 stop_slots() {
     require_root
-    local slot machine
+    local slot machine unit
     for slot in 1 2; do
         machine="$(machine_name "$slot")"
-        systemctl disable --now "systemd-nspawn@$machine.service" 2>/dev/null || true
+        unit="systemd-nspawn@$machine.service"
+        if systemctl is-active --quiet "$unit" || systemctl is-enabled --quiet "$unit"; then
+            systemctl disable --now "$unit" \
+                || die "failed to stop $machine"
+        fi
+        if systemctl is-active --quiet "$unit"; then
+            die "$machine is still active after stop"
+        fi
     done
 }
 

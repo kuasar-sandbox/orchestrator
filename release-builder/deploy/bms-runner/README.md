@@ -60,13 +60,15 @@ install. Existing container slots must also be stopped while their package
 sets and runner files are reconciled.
 
 Each installroot transaction replaces the openEuler release package's default
-metalink configuration with the host repository files after they pass the
-China-mirror check. Keep `/etc/yum.repos.d/*.repo` on the host pointed at a
+metalink configuration with the host repository files both before and after the
+package operation. This prevents an `openEuler-release` update from restoring
+international metalinks. Keep `/etc/yum.repos.d/*.repo` on the host pointed at a
 direct China mirror; the same configuration is propagated to both slots.
 
 Generate short-lived organization registration tokens with an authenticated
-`gh` client and stream them over SSH; do not put them in command arguments or
-files:
+`gh` client and stream them over SSH. The provisioner forwards the token over
+the container's stdin as the runner's `ACTIONS_RUNNER_INPUT_TOKEN`; it never
+places the token in command arguments or files:
 
 ```bash
 gh api --method POST /orgs/kuasar-sandbox/actions/runners/registration-token \
@@ -88,7 +90,8 @@ ssh bms.tmp '/usr/local/sbin/kuasar-ci-runner-provision start'
 ssh bms.tmp '/usr/local/sbin/kuasar-ci-runner-provision verify'
 ```
 
-For rollback, stop both container slots without deleting their state:
+For rollback, stop both container slots without deleting their state. A failed
+container stop makes the command fail instead of leaving a slot running:
 
 ```bash
 ssh bms.tmp '/usr/local/sbin/kuasar-ci-runner-provision stop'
