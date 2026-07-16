@@ -7,6 +7,8 @@ WORKSPACE_ROOT="${KUASAR_WORKSPACE_ROOT:-$(cd "$SCRIPT_DIR/../../.." && pwd)}"
 CACHE_ROOT="${KUASAR_NATIVE_CACHE_ROOT:-/var/cache/kuasar/native}"
 CACHE_SCHEMA="v1"
 METRICS_FILE="${KUASAR_NATIVE_CACHE_METRICS:-}"
+MAX_ENTRIES="${KUASAR_NATIVE_CACHE_MAX_ENTRIES:-4}"
+MIN_ENTRY_AGE_SECONDS="${KUASAR_NATIVE_CACHE_MIN_AGE_SECONDS:-3600}"
 
 TARGET_ARCH="${TARGET_ARCH:-$(uname -m)}"
 case "$TARGET_ARCH" in
@@ -142,7 +144,12 @@ component_environment() {
     local names=(SOURCE_DATE_EPOCH)
     case "$component" in
         vmlinux)
-            names+=(LINUX_TARBALL LINUX_TARBALL_SHA256 LINUX_BASE_TAG CROSS_PREFIX KERNEL_ARCH KCFLAGS)
+            names+=(
+                LINUX_TARBALL LINUX_TARBALL_SHA256 LINUX_BASE_TAG CROSS_PREFIX KERNEL_ARCH
+                LOCALVERSION KBUILD_BUILD_TIMESTAMP KBUILD_BUILD_USER KBUILD_BUILD_HOST
+                KBUILD_BUILD_VERSION KBUILD_BUILD_SALT KCFLAGS KAFLAGS KCPPFLAGS
+                HOSTCFLAGS HOSTCXXFLAGS HOSTLDFLAGS LDFLAGS_vmlinux
+            )
             ;;
         erofs)
             names+=(EROFS_TARBALL EROFS_TARBALL_SHA256 CROSS_PREFIX CFLAGS CXXFLAGS LDFLAGS)
@@ -384,35 +391,78 @@ publish_entry() {
     chmod -R a-w "$entry"
 }
 
+prune_component_entries() {
+    local component=$1 protected_entry=$2 component_root prune_lock now
+    [[ "$MAX_ENTRIES" =~ ^[1-9][0-9]*$ ]] \
+        || die "KUASAR_NATIVE_CACHE_MAX_ENTRIES must be a positive integer"
+    [[ "$MIN_ENTRY_AGE_SECONDS" =~ ^[0-9]+$ ]] \
+        || die "KUASAR_NATIVE_CACHE_MIN_AGE_SECONDS must be a non-negative integer"
+
+    component_root="$CACHE_ROOT/$CACHE_SCHEMA/$TARGET_ARCH/$component"
+    prune_lock="$CACHE_ROOT/$CACHE_SCHEMA/.locks/prune.$TARGET_ARCH.$component.lock"
+    exec {prune_fd}>"$prune_lock"
+    flock "$prune_fd"
+
+    local entries=() entry key lock mtime age index=0
+    mapfile -t entries < <(
+        find "$component_root" -mindepth 1 -maxdepth 1 -type d -printf '%T@\t%p\n' \
+            | sort -t $'\t' -k1,1nr | cut -f2-
+    )
+    now=$(date +%s)
+    for entry in "${entries[@]}"; do
+        key=${entry##*/}
+        [[ "$key" =~ ^[0-9a-f]{64}$ ]] || continue
+        index=$((index + 1))
+        [ "$index" -gt "$MAX_ENTRIES" ] || continue
+        [ "$entry" != "$protected_entry" ] || continue
+        mtime=$(stat -c %Y "$entry" 2>/dev/null || printf '%s' "$now")
+        age=$((now - mtime))
+        [ "$age" -ge "$MIN_ENTRY_AGE_SECONDS" ] || continue
+
+        lock="$CACHE_ROOT/$CACHE_SCHEMA/.locks/$TARGET_ARCH.$component.$key.lock"
+        exec {entry_fd}>"$lock"
+        if flock --nonblock "$entry_fd"; then
+            chmod -R u+w "$entry"
+            rm -rf "$entry"
+            flock -u "$entry_fd"
+        fi
+        exec {entry_fd}>&-
+    done
+    flock -u "$prune_fd"
+    exec {prune_fd}>&-
+}
+
 restore_or_build() {
-    local component=$1 descriptor key component_root entry lock start status
+    local component=$1 descriptor key component_root entry lock start status existed_before_lock=0
     start="$(now_ns)"
     descriptor="$(mktemp)"
     key="$(compute_key "$component" "$descriptor")"
     component_root="$CACHE_ROOT/$CACHE_SCHEMA/$TARGET_ARCH/$component"
     entry="$component_root/$key"
-    lock="$CACHE_ROOT/$CACHE_SCHEMA/.locks/$component.$key.lock"
+    lock="$CACHE_ROOT/$CACHE_SCHEMA/.locks/$TARGET_ARCH.$component.$key.lock"
     mkdir -p "$component_root" "$(dirname "$lock")" "$CACHE_ROOT/$CACHE_SCHEMA/.tmp"
 
+    [ -d "$entry" ] && existed_before_lock=1
+    exec {lock_fd}>"$lock"
+    flock "$lock_fd"
     if [ -d "$entry" ]; then
         restore_entry "$component" "$entry" "$key"
-        status=hit
-    else
-        exec {lock_fd}>"$lock"
-        flock "$lock_fd"
-        if [ -d "$entry" ]; then
-            restore_entry "$component" "$entry" "$key"
-            status=hit-after-wait
+        if [ "$existed_before_lock" -eq 1 ]; then
+            status=hit
         else
-            log "$component cache miss (${key:0:12}); building"
-            build_component "$component"
-            publish_entry "$component" "$key" "$descriptor" "$entry"
-            restore_entry "$component" "$entry" "$key"
-            status=miss-built
+            status=hit-after-wait
         fi
-        flock -u "$lock_fd"
-        exec {lock_fd}>&-
+    else
+        log "$component cache miss (${key:0:12}); building"
+        build_component "$component"
+        publish_entry "$component" "$key" "$descriptor" "$entry"
+        restore_entry "$component" "$entry" "$key"
+        status=miss-built
     fi
+    touch "$entry"
+    flock -u "$lock_fd"
+    exec {lock_fd}>&-
+    prune_component_entries "$component" "$entry"
     rm -f "$descriptor"
     local elapsed
     elapsed="$(elapsed_seconds "$start" "$(now_ns)")"

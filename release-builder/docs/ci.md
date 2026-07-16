@@ -39,9 +39,14 @@ DaoCloud 国内镜像。
 编译工具二进制/版本与系统包版本。每个条目包含 `inputs.tsv`、`provenance.txt`、
 `payload.tar` 和 `SHA256SUMS`。
 
-同 key miss 持有 `flock` 直到构建、校验和原子发布完成;等待者随后验证并恢复同一
-条目。发布后的目录去除写权限。命中恢复前会校验 descriptor hash、payload hash
-和 tar 路径。损坏条目直接失败,不会在原路径修补。
+同 key 的构建和命中恢复都持有条目 `flock`;miss 直到构建、校验和原子发布完成才
+释放,等待者随后验证并恢复同一条目。发布后的目录去除写权限。命中恢复前会校验
+descriptor hash、payload hash 和 tar 路径。损坏条目直接失败,不会在原路径修补。
+
+每个架构、组件保留最近使用的 4 个 input hash。淘汰器只删除超过 1 小时保护期且
+能非阻塞取得条目锁的旧目录,因此并发恢复或构建中的制品不会被删除。留存数和保护
+期可分别用 `KUASAR_NATIVE_CACHE_MAX_ENTRIES`、
+`KUASAR_NATIVE_CACHE_MIN_AGE_SECONDS` 调整。
 
 cache miss 只允许在 CI 新装配、尚无原生源码目录的 workspace 中构建。脚本发现
 已有 kernel/Cloud Hypervisor 等源码树时会拒绝删除,避免破坏开发者 WIP。
@@ -52,8 +57,8 @@ cache miss 只允许在 CI 新装配、尚无原生源码目录的 workspace 中
 make -C orchestrator/release-builder test-ci-tools
 ```
 
-它覆盖热命中、环境/工具链输入失效、损坏拒绝、同 key 并发 miss 只构建一次和
-源码归档留存上限。
+它覆盖热命中、环境/工具链/Kbuild 输入失效、损坏拒绝、同 key 并发 miss 只构建
+一次,以及源码和原生制品归档留存上限。
 
 ## Run artifacts
 

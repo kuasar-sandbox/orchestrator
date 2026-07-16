@@ -31,6 +31,17 @@ setup_erofs_workspace() {
     printf 'build erofs fixture\n' >"$root/guest-runtime/native-deps/deps/build-erofs.sh"
 }
 
+setup_vmlinux_workspace() {
+    local root=$1
+    mkdir -p "$root/guest-runtime/native-deps/deps/vmlinux" \
+        "$root/guest-runtime/native-deps/deps/linux-patches"
+    printf 'vmlinux target fixture\n' >"$root/guest-runtime/native-deps/Makefile"
+    printf 'common fixture\n' >"$root/guest-runtime/native-deps/deps/common.sh"
+    printf 'build vmlinux fixture\n' >"$root/guest-runtime/native-deps/deps/build-vmlinux.sh"
+    printf 'config fixture\n' >"$root/guest-runtime/native-deps/deps/vmlinux/test.config"
+    printf 'patch fixture\n' >"$root/guest-runtime/native-deps/deps/linux-patches/test.patch"
+}
+
 mkdir -p "$TMP/bin"
 cat >"$TMP/bin/make" <<'EOF'
 #!/usr/bin/env bash
@@ -113,6 +124,16 @@ cross_key_v2="$(env PATH="$TMP/bin:$PATH" CROSS_PREFIX="$TMP/bin/custom-" \
     "$SCRIPT_DIR/native-cache.sh" key erofs | cut -f2)"
 [ "$cross_key_v1" != "$cross_key_v2" ] || fail "custom cross compiler did not invalidate the key"
 
+vmlinux_workspace="$TMP/vmlinux-workspace"
+setup_vmlinux_workspace "$vmlinux_workspace"
+vmlinux_key_plain="$(env PATH="$TMP/bin:$PATH" KUASAR_WORKSPACE_ROOT="$vmlinux_workspace" \
+    "$SCRIPT_DIR/native-cache.sh" key vmlinux | cut -f2)"
+vmlinux_key_versioned="$(env PATH="$TMP/bin:$PATH" LOCALVERSION=-ci KBUILD_BUILD_USER=builder \
+    KUASAR_WORKSPACE_ROOT="$vmlinux_workspace" \
+    "$SCRIPT_DIR/native-cache.sh" key vmlinux | cut -f2)"
+[ "$vmlinux_key_plain" != "$vmlinux_key_versioned" ] \
+    || fail "Kbuild overrides did not invalidate the vmlinux key"
+
 env PATH="$TMP/bin:$PATH" FAKE_BUILD_COUNTER="$counter" \
     KUASAR_WORKSPACE_ROOT="$workspace" KUASAR_NATIVE_CACHE_ROOT="$cache" \
     KUASAR_NATIVE_CACHE_METRICS="$metrics" \
@@ -161,6 +182,20 @@ wait "$pid_b"
 [ "$(wc -l <"$concurrent_counter")" -eq 1 ] || fail "same-key concurrent misses built more than once"
 grep -q 'miss-built' "$TMP/a.log" "$TMP/b.log" || fail "concurrent miss was not recorded"
 grep -q 'hit-after-wait' "$TMP/a.log" "$TMP/b.log" || fail "concurrent waiter did not restore the published entry"
+
+retained_cache="$TMP/retained-cache"
+retained_workspace="$TMP/retained-workspace"
+retained_counter="$TMP/retained-counter"
+setup_workspace "$retained_workspace"
+for n in 1 2 3 4; do
+    printf 'input-%s\n' "$n" >"$retained_workspace/guest-runtime/native-deps/deps/build-envd.sh"
+    env PATH="$TMP/bin:$PATH" FAKE_BUILD_COUNTER="$retained_counter" \
+        KUASAR_WORKSPACE_ROOT="$retained_workspace" KUASAR_NATIVE_CACHE_ROOT="$retained_cache" \
+        KUASAR_NATIVE_CACHE_MAX_ENTRIES=2 KUASAR_NATIVE_CACHE_MIN_AGE_SECONDS=0 \
+        "$SCRIPT_DIR/native-cache.sh" restore-or-build envd >/dev/null
+done
+[ "$(find "$retained_cache/v1/x86_64/envd" -mindepth 1 -maxdepth 1 -type d | wc -l)" -eq 2 ] \
+    || fail "native cache retention limit was not enforced"
 
 source_cache="$TMP/source-cache"
 mkdir -p "$source_cache"

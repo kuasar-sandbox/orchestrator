@@ -34,13 +34,30 @@ jobs:
       CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
       CARGO_NET_GIT_FETCH_WITH_CLI: "true"
       PIP_INDEX_URL: https://pypi.tuna.tsinghua.edu.cn/simple
-      KUASAR_CI_DIR: ${{ github.workspace }}/ci-metrics
-      KUASAR_CI_TIMINGS: ${{ github.workspace }}/ci-metrics/timings.tsv
-      KUASAR_NATIVE_CACHE_METRICS: ${{ github.workspace }}/ci-metrics/native-cache.tsv
-      KUASAR_REVISION_MANIFEST: ${{ github.workspace }}/ci-metrics/revisions.tsv
+      KUASAR_CI_DIR: ${{ github.workspace }}/ci-metrics/${{ github.run_id }}-${{ github.run_attempt }}
+      KUASAR_CI_TIMINGS: ${{ github.workspace }}/ci-metrics/${{ github.run_id }}-${{ github.run_attempt }}/timings.tsv
+      KUASAR_NATIVE_CACHE_METRICS: ${{ github.workspace }}/ci-metrics/${{ github.run_id }}-${{ github.run_attempt }}/native-cache.tsv
+      KUASAR_REVISION_MANIFEST: ${{ github.workspace }}/ci-metrics/${{ github.run_id }}-${{ github.run_attempt }}/revisions.tsv
       KUASAR_SOURCE_CACHE_MAX_ENTRIES: "32"
+      KUASAR_NATIVE_CACHE_MAX_ENTRIES: "4"
 
     steps:
+      - name: Initialize CI metadata
+        env:
+          CANDIDATE_REPOSITORY: ${{ github.repository }}
+          CANDIDATE_SHA: ${{ github.sha }}
+          CANDIDATE_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+
+          rm -rf "${KUASAR_CI_DIR%/*}"
+          mkdir -p "$KUASAR_CI_DIR"
+          printf 'event_name\tcandidate_repository\tcandidate_event_sha\tcandidate_head_sha\n' \
+            > "$KUASAR_CI_DIR/run.tsv"
+          printf '%s\t%s\t%s\t%s\n' \
+            "${{ github.event_name }}" "$CANDIDATE_REPOSITORY" "$CANDIDATE_SHA" "$CANDIDATE_HEAD_SHA" \
+            >> "$KUASAR_CI_DIR/run.tsv"
+
       - name: Reset interrupted E2E state
         run: |
           set -euo pipefail
@@ -87,13 +104,7 @@ jobs:
           trap 'rm -f "${archive_tmp:-}" "${checksum_tmp:-}"' EXIT
           started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
           started_ns=$(date +%s%N)
-          rm -rf "$KUASAR_CI_DIR"
-          mkdir -p "$KUASAR_CI_DIR"
           printf 'repository\trequested_ref\tresolved_sha\trole\n' > "$KUASAR_REVISION_MANIFEST"
-          printf 'event_name\tcandidate_repository\tcandidate_event_sha\tcandidate_head_sha\n' > "$KUASAR_CI_DIR/run.tsv"
-          printf '%s\t%s\t%s\t%s\n' \
-            "${{ github.event_name }}" "$CANDIDATE_REPOSITORY" "$CANDIDATE_SHA" "$CANDIDATE_HEAD_SHA" \
-            >> "$KUASAR_CI_DIR/run.tsv"
           printf 'repository\tresolved_sha\tstatus\tsha256\n' > "$KUASAR_CI_DIR/source-cache.tsv"
           rm -rf src
           for repo in "${repos[@]}"; do
@@ -219,6 +230,6 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ci-metadata-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ci-metrics
+          path: ${{ env.KUASAR_CI_DIR }}
           if-no-files-found: warn
           retention-days: 30
