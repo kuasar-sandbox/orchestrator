@@ -33,6 +33,7 @@ PACKAGES=(
     python3 python3-pip python3-devel python3-pyyaml
     moby-engine moby-client e2fsprogs unzip zip zstd lz4
 )
+BOOTSTRAP_PACKAGES=(filesystem glibc bash coreutils)
 
 die() {
     echo "provision: $*" >&2
@@ -56,7 +57,8 @@ slot_root() {
 }
 
 slot_value() {
-    local slot=$1 field=$2 variable="SLOT${slot}_${field}"
+    local slot=$1 field=$2 variable
+    variable="SLOT${slot}_${field}"
     printf '%s' "${!variable}"
 }
 
@@ -144,7 +146,12 @@ build_template_root() {
     if [ ! -f "$TEMPLATE_ROOT/.kuasar-ci-template" ]; then
         [ ! -e "$TEMPLATE_ROOT" ] || die "partial template root exists: $TEMPLATE_ROOT"
         install -d -m 0755 "$TEMPLATE_ROOT"
+        install -d -m 0755 "$TEMPLATE_ROOT/dev" "$TEMPLATE_ROOT/proc" "$TEMPLATE_ROOT/sys"
+        mknod -m 0666 "$TEMPLATE_ROOT/dev/null" c 1 3
         log "installing container packages from configured China mirrors"
+        dnf -y --installroot="$TEMPLATE_ROOT" --releasever=24.03 \
+            --setopt=install_weak_deps=False --setopt=keepcache=False \
+            install "${BOOTSTRAP_PACKAGES[@]}"
         dnf -y --installroot="$TEMPLATE_ROOT" --releasever=24.03 \
             --setopt=install_weak_deps=False --setopt=keepcache=False \
             install "${PACKAGES[@]}"
