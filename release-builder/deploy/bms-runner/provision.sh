@@ -34,6 +34,7 @@ PACKAGES=(
     moby-engine moby-client e2fsprogs unzip zip zstd lz4
 )
 BOOTSTRAP_PACKAGES=(filesystem glibc bash coreutils)
+HOST_PACKAGES=(systemd-container systemd-nspawn)
 
 die() {
     echo "provision: $*" >&2
@@ -96,7 +97,7 @@ check_host() {
     assert_supported_host
     assert_china_repositories
     local package missing=()
-    for package in "${PACKAGES[@]}"; do
+    for package in "${HOST_PACKAGES[@]}" "${PACKAGES[@]}"; do
         if ! dnf -q repoquery --available --qf '%{name}' "$package" | grep -qx "$package"; then
             missing+=("$package")
         fi
@@ -106,8 +107,11 @@ check_host() {
 }
 
 install_host_support() {
-    dnf -y --setopt=install_weak_deps=False install systemd-container
-    install -d -m 0755 /usr/local/libexec /etc/systemd/system /etc/systemd/nspawn /etc/kuasar-ci
+    dnf -y --setopt=install_weak_deps=False install "${HOST_PACKAGES[@]}"
+    command -v systemd-nspawn >/dev/null || die "systemd-nspawn was not installed"
+    install -d -m 0755 \
+        /usr/local/libexec /etc/systemd/system /etc/systemd/nspawn /etc/kuasar-ci \
+        "$MACHINE_ROOT"
     install -m 0755 "$SCRIPT_DIR/kuasar-ci-network" /usr/local/libexec/kuasar-ci-network
     install -m 0644 "$SCRIPT_DIR/kuasar-ci-network.service" /etc/systemd/system/kuasar-ci-network.service
     install -m 0755 "$SCRIPT_DIR/provision.sh" /usr/local/sbin/kuasar-ci-runner-provision
