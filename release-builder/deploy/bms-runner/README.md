@@ -50,6 +50,8 @@ ownership in the bridge interface alias and refuses to modify or delete an
 unowned interface with the configured name. The provisioner refuses to run
 while the existing host runner has an active `Runner.Worker`, requires cgroup
 v2, and rejects enabled DNF repositories outside configured Chinese mirrors.
+`check` can run before `kmod` is installed; `install` obtains the host package
+set first, then loads the required modules and validates all device nodes.
 
 ## Install
 
@@ -136,6 +138,11 @@ Start and verify infrastructure isolation:
 ssh bms.tmp '/usr/local/sbin/kuasar-ci-runner-provision start'
 ssh bms.tmp '/usr/local/sbin/kuasar-ci-runner-provision verify'
 ```
+
+`start` rechecks that the retained legacy host runner is stopped. If either
+container fails to start or become ready, it stops every slot started by that
+command and restores each unit's previous enabled state; slots that were already
+active are left active.
 
 For rollback, stop both container slots without deleting their state. A failed
 container stop makes the command fail instead of leaving a slot running:

@@ -148,6 +148,12 @@ load_required_modules() {
     done
 }
 
+assert_required_devices() {
+    [ -c /dev/kvm ] && [ -c /dev/net/tun ] \
+        && [ -c /dev/vhost-net ] && [ -c /dev/vhost-vsock ] \
+        || die "KVM/TUN/vhost-net/vhost-vsock devices are required"
+}
+
 assert_supported_host() {
     # shellcheck disable=SC1091
     source /etc/os-release
@@ -155,10 +161,6 @@ assert_supported_host() {
     [ "${VERSION_ID:-}" = 24.03 ] || die "expected openEuler 24.03, found ${VERSION_ID:-unknown}"
     [ "$(uname -m)" = x86_64 ] || die "this runner layout and pinned tools require x86_64"
     [ "$(stat -fc %T /sys/fs/cgroup)" = cgroup2fs ] || die "host must use cgroup v2"
-    load_required_modules
-    [ -c /dev/kvm ] && [ -c /dev/net/tun ] \
-        && [ -c /dev/vhost-net ] && [ -c /dev/vhost-vsock ] \
-        || die "KVM/TUN/vhost-net/vhost-vsock devices are required"
 }
 
 assert_china_repositories() {
@@ -173,19 +175,29 @@ assert_china_repositories() {
     done <<<"$urls"
 }
 
+runner_worker_in_managed_slot() {
+    local proc=$1 slot
+    [ -r "$proc/cgroup" ] || return 1
+    for slot in 1 2; do
+        grep -Fq "/systemd-nspawn@$(machine_name "$slot").service" "$proc/cgroup" \
+            && return 0
+    done
+    return 1
+}
+
 assert_host_runner_idle() {
     local proc comm service_file="$RUNNER_SOURCE/.service" service
     for proc in /proc/[0-9]*; do
         [ -r "$proc/comm" ] || continue
         IFS= read -r comm <"$proc/comm" || continue
-        if [ "$comm" = Runner.Worker ]; then
-            die "host Runner.Worker process ${proc##*/} must exit before installation"
+        if [ "$comm" = Runner.Worker ] && ! runner_worker_in_managed_slot "$proc"; then
+            die "host Runner.Worker process ${proc##*/} must exit before managing container slots"
         fi
     done
-    [ -f "$service_file" ] || return
+    [ -f "$service_file" ] || return 0
     service="$(<"$service_file")"
     if systemctl is-active --quiet "$service"; then
-        die "the existing host runner service must be stopped before installation: $service"
+        die "the existing host runner service must be stopped before managing container slots: $service"
     fi
 }
 
@@ -359,7 +371,14 @@ check_host() {
         fi
     done
     [ "${#missing[@]}" -eq 0 ] || die "packages unavailable from enabled mirrors: ${missing[*]}"
-    log "host, devices, cgroup v2, China mirrors, pinned E2E tools, and package set are ready"
+    if command -v modprobe >/dev/null; then
+        load_required_modules
+        assert_required_devices
+        log "host devices are ready"
+    else
+        log "kmod is not installed; install will bootstrap it before validating devices"
+    fi
+    log "host platform, cgroup v2, China mirrors, pinned E2E tools, and package set are ready"
 }
 
 install_host_support() {
@@ -397,6 +416,7 @@ vhost_vsock
 EOF
     systemctl daemon-reload
     load_required_modules
+    assert_required_devices
     systemctl enable --now kuasar-ci-network.service kuasar-ci-bpf.service
 }
 
@@ -714,7 +734,9 @@ register_slot() {
 start_slots() {
     require_root
     acquire_provision_lock
-    local slot machine root
+    assert_host_runner_idle
+    local slot machine root unit was_active was_enabled
+    local -a startup_records=()
     for slot in 1 2; do
         machine="$(machine_name "$slot")"
         root="$(slot_root "$slot")"
@@ -726,10 +748,40 @@ start_slots() {
     systemctl start kuasar-ci-network.service
     for slot in 1 2; do
         machine="$(machine_name "$slot")"
-        systemctl enable --now "systemd-nspawn@$machine.service"
+        unit="systemd-nspawn@$machine.service"
+        was_active=no
+        was_enabled=no
+        if systemctl is-active --quiet "$unit"; then
+            was_active=yes
+        fi
+        if systemctl is-enabled --quiet "$unit"; then
+            was_enabled=yes
+        fi
+        startup_records+=("$unit|$was_active|$was_enabled")
+        if ! systemctl enable --now "$unit"; then
+            rollback_slot_startup "${startup_records[@]}"
+            die "failed to start $machine"
+        fi
     done
-    wait_slot_ready 1
-    wait_slot_ready 2
+    for slot in 1 2; do
+        if ! wait_slot_ready "$slot"; then
+            rollback_slot_startup "${startup_records[@]}"
+            die "$(machine_name "$slot") did not become network, Docker, and runner ready within 60s"
+        fi
+    done
+}
+
+rollback_slot_startup() {
+    local record unit was_active was_enabled
+    for record in "$@"; do
+        IFS='|' read -r unit was_active was_enabled <<<"$record"
+        if [ "$was_active" = no ] && ! systemctl stop "$unit"; then
+            log "rollback could not stop $unit"
+        fi
+        if [ "$was_enabled" = no ] && ! systemctl disable "$unit"; then
+            log "rollback could not disable $unit"
+        fi
+    done
 }
 
 stop_slots() {
@@ -778,7 +830,7 @@ wait_slot_ready() {
         fi
         sleep 1
     done
-    die "$machine did not become network, Docker, and runner ready within 60s"
+    return 1
 }
 
 verify_slots() {
@@ -789,7 +841,8 @@ verify_slots() {
         assert_slot_root_owned "$slot"
         runner_registration_complete "$(slot_root "$slot")" \
             || die "$machine registration is incomplete"
-        wait_slot_ready "$slot"
+        wait_slot_ready "$slot" \
+            || die "$machine did not become network, Docker, and runner ready within 60s"
         [ "$(machinectl show "$machine" -p State --value)" = running ] || die "$machine is not running"
         run_in_slot "$slot" /bin/bash -ceu '
             [ "$(cat /proc/1/comm)" = systemd ]
