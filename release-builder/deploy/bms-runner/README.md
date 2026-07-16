@@ -144,9 +144,10 @@ container stop makes the command fail instead of leaving a slot running:
 ssh bms.tmp '/usr/local/sbin/kuasar-ci-runner-provision stop'
 ```
 
-`start` and `verify` require the current container boot to report the runner's
-`Listening for Jobs` state, rather than treating an active retrying service as
-online. `verify` also checks PID1/systemd, cgroup v2, KVM/TUN/vhost access,
+`start` and `verify` require the current runner service invocation to report
+`Listening for Jobs`, rather than matching an older process from the same boot
+or treating an active retrying service as online. `verify` also checks
+PID1/systemd, cgroup v2, KVM/TUN/vhost access,
 private mount and network namespaces, distinct host cgroups, nested Docker,
 private bpffs/netns, the static `libuuid` build dependency, outbound access
 through the China-side proxy path, and active runner services. It is not an E2E

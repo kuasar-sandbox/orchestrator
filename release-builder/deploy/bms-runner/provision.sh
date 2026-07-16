@@ -767,7 +767,10 @@ wait_slot_ready() {
                 systemctl is-active --quiet systemd-networkd.service
                 systemctl is-active --quiet docker.service
                 systemctl is-active --quiet actions-runner.service
-                journalctl -b -u actions-runner.service --no-pager -o cat \
+                invocation_id="$(systemctl show actions-runner.service \
+                    --property=InvocationID --value)"
+                [[ "$invocation_id" =~ ^[0-9a-f]{32}$ ]]
+                journalctl "_SYSTEMD_INVOCATION_ID=$invocation_id" --no-pager -o cat \
                     | grep -Fq "Listening for Jobs"
                 ip route get 223.5.5.5 >/dev/null
             ' >/dev/null 2>&1; then
