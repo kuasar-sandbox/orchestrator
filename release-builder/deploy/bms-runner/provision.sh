@@ -6,7 +6,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ORG=${KUASAR_ORG:-kuasar-sandbox}
 RUNNER_GROUP=${KUASAR_RUNNER_GROUP:-kuasar-e2e}
 RUNNER_SOURCE=${KUASAR_RUNNER_SOURCE:-/opt/actions-runner}
-TEMPLATE_ROOT=${KUASAR_TEMPLATE_ROOT:-/var/lib/kuasar-ci/rootfs-template}
+TEMPLATE_ROOT=/var/lib/kuasar-ci/rootfs-template
 MACHINE_ROOT=/var/lib/machines
 BRIDGE=${KUASAR_CI_BRIDGE:-kuasar-ci0}
 SUBNET=${KUASAR_CI_SUBNET:-10.203.0.0/24}
@@ -17,10 +17,15 @@ SOURCE_CACHE=${KUASAR_SOURCE_CACHE:-/var/cache/kuasar/sources}
 TOOL_ROOT=/var/lib/kuasar-ci/tools
 ZOT_TOOL_SHA256=523e5bf29a013db09115f780c3152af98fc5b65fc408a0d3e6c293643dc9bde7
 VERSITYGW_TOOL_SHA256=e839f0ce24a51dbf0a7a925e08a28a0bfa190d05290c13f2c4536852bc5f3a7d
+GO_ROOT=/usr/local/go
+GO_VERSION=go1.26.5
+GO_TARBALL_URL=https://mirrors.aliyun.com/golang/go1.26.5.linux-amd64.tar.gz
+GO_TARBALL_SHA256=5c2c3b16caefa1d968a94c1daca04a7ca301a496d9b086e17ad77bb81393f053
+GO_BINARY_SHA256=8da5fd321795754b994c64e3eb8a5a14ff47bd285559a7e876f3c79abafc67f9
 UTIL_LINUX_SRPM_URL=${KUASAR_UTIL_LINUX_SRPM_URL:-https://mirrors.huaweicloud.com/openeuler/openEuler-24.03-LTS-SP4/source/Packages/util-linux-2.39.1-38.oe2403sp4.src.rpm}
 UTIL_LINUX_SRPM_SHA256=${KUASAR_UTIL_LINUX_SRPM_SHA256:-40324d3ab54be52ef67544732a71ec14f6aecb2e92f5d8fa0aaaac532c55c0bf}
 UTIL_LINUX_TARBALL_SHA256=${KUASAR_UTIL_LINUX_TARBALL_SHA256:-890ae8ff810247bd19e274df76e8371d202cda01ad277681b0ea88eeaa00286b}
-LIBUUID_BUILD_ID=util-linux-2.39.1-38.oe2403sp4-static-v1
+LIBUUID_BUILD_SCHEMA=util-linux-static-v1
 
 SLOT1_CPUS=${KUASAR_SLOT1_CPUS:-0-21,44-65}
 SLOT2_CPUS=${KUASAR_SLOT2_CPUS:-22-43,66-87}
@@ -90,6 +95,7 @@ assert_supported_host() {
     source /etc/os-release
     [ "${ID:-}" = openEuler ] || die "this provisioner targets openEuler, found ${ID:-unknown}"
     [ "${VERSION_ID:-}" = 24.03 ] || die "expected openEuler 24.03, found ${VERSION_ID:-unknown}"
+    [ "$(uname -m)" = x86_64 ] || die "this runner layout and pinned tools require x86_64"
     [ "$(stat -fc %T /sys/fs/cgroup)" = cgroup2fs ] || die "host must use cgroup v2"
     [ -c /dev/kvm ] && [ -c /dev/net/tun ] && [ -c /dev/vhost-vsock ] \
         || die "KVM/TUN/vhost-vsock devices are required"
@@ -149,6 +155,46 @@ assert_e2e_tools() {
         || die "versitygw checksum mismatch at $TOOL_ROOT/versitygw"
 }
 
+go_toolchain_valid() {
+    local root=$1
+    [ -x "$root/bin/go" ] \
+        && verify_sha256 "$root/bin/go" "$GO_BINARY_SHA256" \
+        && [ "$(env GOROOT="$root" "$root/bin/go" version 2>/dev/null)" = "go version $GO_VERSION linux/amd64" ] \
+        && [ "$(env GOROOT="$root" "$root/bin/go" env GOROOT 2>/dev/null)" = "$root" ] \
+        && [ "$(env GOROOT="$root" "$root/bin/go" tool compile -V=full 2>/dev/null)" = "compile version $GO_VERSION" ]
+}
+
+ensure_go_toolchain() {
+    go_toolchain_valid "$GO_ROOT" && return
+    case "$GO_TARBALL_URL" in
+        https://mirrors.aliyun.com/*) ;;
+        *) die "Go toolchain must use the configured China mirror" ;;
+    esac
+
+    local archive="$SOURCE_CACHE/${GO_TARBALL_URL##*/}" work
+    install -d -m 0755 "$SOURCE_CACHE"
+    if [ ! -f "$archive" ] || ! verify_sha256 "$archive" "$GO_TARBALL_SHA256"; then
+        rm -f "$archive"
+        log "downloading pinned $GO_VERSION toolchain from the Aliyun mirror"
+        curl --fail --location --retry 3 --output "$archive" "$GO_TARBALL_URL"
+    fi
+    verify_sha256 "$archive" "$GO_TARBALL_SHA256" \
+        || die "Go toolchain checksum mismatch: $archive"
+
+    work="$(mktemp -d /usr/local/kuasar-go.XXXXXX)"
+    if ! tar -xzf "$archive" -C "$work"; then
+        rm -rf "$work"
+        die "failed to extract the Go toolchain"
+    fi
+    if ! go_toolchain_valid "$work/go"; then
+        rm -rf "$work"
+        die "extracted Go toolchain failed validation"
+    fi
+    rm -rf "$GO_ROOT"
+    mv "$work/go" "$GO_ROOT"
+    rmdir "$work"
+}
+
 existing_ancestor() {
     local path=$1 parent
     [[ "$path" = /* ]] || die "installation paths must be absolute: $path"
@@ -181,9 +227,15 @@ assert_install_space() {
 }
 
 install_static_libuuid() {
-    local marker="$TEMPLATE_ROOT/usr/lib64/.kuasar-libuuid-build-id"
+    local marker="$TEMPLATE_ROOT/usr/lib64/.kuasar-libuuid-build-id" build_id
+    build_id="$({
+        printf 'schema=%s\n' "$LIBUUID_BUILD_SCHEMA"
+        printf 'srpm_url=%s\n' "$UTIL_LINUX_SRPM_URL"
+        printf 'srpm_sha256=%s\n' "$UTIL_LINUX_SRPM_SHA256"
+        printf 'tarball_sha256=%s\n' "$UTIL_LINUX_TARBALL_SHA256"
+    } | sha256sum | awk '{print $1}')"
     if [ -s "$TEMPLATE_ROOT/usr/lib64/libuuid.a" ] \
-        && [ "$(cat "$marker" 2>/dev/null || true)" = "$LIBUUID_BUILD_ID" ]; then
+        && [ "$(cat "$marker" 2>/dev/null || true)" = "$build_id" ]; then
         return
     fi
 
@@ -224,7 +276,7 @@ install_static_libuuid() {
         make -j"$(nproc)" libuuid.la >/dev/null
         install -m 0644 .libs/libuuid.a /usr/lib64/libuuid.a
     '
-    printf '%s\n' "$LIBUUID_BUILD_ID" >"$marker"
+    printf '%s\n' "$build_id" >"$marker"
     rm -rf "$work"
     [ -s "$TEMPLATE_ROOT/usr/lib64/libuuid.a" ] \
         || die "static libuuid build did not produce /usr/lib64/libuuid.a"
@@ -248,13 +300,14 @@ check_host() {
 install_host_support() {
     dnf -y --setopt=install_weak_deps=False install "${HOST_PACKAGES[@]}"
     command -v systemd-nspawn >/dev/null || die "systemd-nspawn was not installed"
+    ensure_go_toolchain
     if systemctl is-active --quiet kuasar-ci-network.service; then
         log "stopping the active CI network before replacing its configuration"
         systemctl stop kuasar-ci-network.service
     fi
     install -d -m 0755 \
         /usr/local/libexec /etc/systemd/system /etc/systemd/nspawn /etc/kuasar-ci \
-        /etc/modules-load.d /var/cache/kuasar /usr/local/go "$TOOL_ROOT" "$MACHINE_ROOT"
+        /etc/modules-load.d /var/cache/kuasar "$TOOL_ROOT" "$MACHINE_ROOT"
     install -m 0755 "$SCRIPT_DIR/kuasar-ci-network" /usr/local/libexec/kuasar-ci-network
     install -m 0644 "$SCRIPT_DIR/kuasar-ci-network.service" /etc/systemd/system/kuasar-ci-network.service
     install -m 0755 "$SCRIPT_DIR/kuasar-ci-bpf" /usr/local/libexec/kuasar-ci-bpf
@@ -322,7 +375,10 @@ reconcile_root_packages() {
 
 build_template_root() {
     if [ ! -f "$TEMPLATE_ROOT/.kuasar-ci-template" ]; then
-        [ ! -e "$TEMPLATE_ROOT" ] || die "partial template root exists: $TEMPLATE_ROOT"
+        if [ -e "$TEMPLATE_ROOT" ]; then
+            log "removing interrupted template root $TEMPLATE_ROOT"
+            rm -rf "$TEMPLATE_ROOT"
+        fi
         install -d -m 0755 "$TEMPLATE_ROOT"
         install -d -m 0755 "$TEMPLATE_ROOT/dev" "$TEMPLATE_ROOT/proc" "$TEMPLATE_ROOT/sys"
         mknod -m 0666 "$TEMPLATE_ROOT/dev/null" c 1 3
@@ -452,7 +508,10 @@ prepare_slot() {
     ip="$(slot_value "$slot" IP)"
 
     if [ ! -f "$root/.kuasar-ci-slot" ]; then
-        [ ! -e "$root" ] || die "partial slot root exists: $root"
+        if [ -e "$root" ]; then
+            log "removing interrupted slot root $root"
+            rm -rf "$root"
+        fi
         log "copying rootfs for $machine"
         cp -a "$TEMPLATE_ROOT" "$root"
         new_slot=1
@@ -644,6 +703,8 @@ verify_slots() {
             test -e /usr/lib64/liblz4.so
             test -e /usr/lib64/libsnappy.so
             test -x /usr/bin/time
+            [ "$(/usr/local/go/bin/go version)" = "go version go1.26.5 linux/amd64" ]
+            [ "$(/usr/local/go/bin/go tool compile -V=full)" = "compile version go1.26.5" ]
             redis-server --version >/dev/null
             ip route get 223.5.5.5 >/dev/null
             curl --fail --silent --show-error --connect-timeout 5 --max-time 20 https://goproxy.cn >/dev/null
