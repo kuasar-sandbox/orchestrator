@@ -19,10 +19,28 @@ case "$TARGET_ARCH" in
 esac
 
 ACTIVE_STAGE=""
+ACTIVE_STAGE_LOCK=""
+ACTIVE_STAGE_FD=""
+
+release_active_stage_lock() {
+    if [ -n "${ACTIVE_STAGE_FD:-}" ]; then
+        flock -u "$ACTIVE_STAGE_FD" 2>/dev/null || true
+        exec {ACTIVE_STAGE_FD}>&-
+        ACTIVE_STAGE_FD=""
+    fi
+    if [ -n "$ACTIVE_STAGE_LOCK" ]; then
+        rm -f "$ACTIVE_STAGE_LOCK"
+        ACTIVE_STAGE_LOCK=""
+    fi
+}
+
 cleanup() {
     if [ -n "$ACTIVE_STAGE" ] && [ -d "$ACTIVE_STAGE" ]; then
+        chmod -R u+w "$ACTIVE_STAGE" 2>/dev/null || true
         rm -rf "$ACTIVE_STAGE"
     fi
+    ACTIVE_STAGE=""
+    release_active_stage_lock
 }
 trap cleanup EXIT
 
@@ -212,8 +230,18 @@ cargo_config_identities() {
     file_identity cargo-config-toml "$cargo_home/config.toml"
 }
 
+effective_rust_target() {
+    # sandboxer/native-deps/Makefile derives and passes RUST_TARGET from
+    # TARGET_ARCH; an inherited shell variable does not override that makefile
+    # assignment. Derive the Cargo target the same way here.
+    case "$TARGET_ARCH" in
+        x86_64) printf 'x86_64-unknown-linux-gnu' ;;
+        aarch64) printf 'aarch64-unknown-linux-gnu' ;;
+    esac
+}
+
 component_environment() {
-    local component=$1 name
+    local component=$1 name rust_target rust_target_prefix
     local names=(SOURCE_DATE_EPOCH)
     case "$component" in
         vmlinux)
@@ -238,7 +266,10 @@ component_environment() {
             )
             ;;
         rocksdb)
-            names+=(ROCKSDB_TARBALL ROCKSDB_TARBALL_SHA256 CROSS_PREFIX CFLAGS CXXFLAGS LDFLAGS)
+            names+=(
+                ROCKSDB_TARBALL ROCKSDB_TARBALL_SHA256 CROSS_PREFIX
+                CC CXX CFLAGS CXXFLAGS LDFLAGS
+            )
             ;;
         cloud-hypervisor)
             names+=(
@@ -246,6 +277,12 @@ component_environment() {
                 CROSS_PREFIX RUST_TARGET RUSTFLAGS CARGO_ENCODED_RUSTFLAGS RUSTDOCFLAGS
                 RUSTC_WRAPPER RUSTC_WORKSPACE_WRAPPER CARGO_HOME CARGO_INCREMENTAL
                 CARGO_BUILD_RUSTC_WRAPPER CARGO_BUILD_TARGET
+            )
+            rust_target="$(effective_rust_target)"
+            rust_target_prefix="CARGO_TARGET_$(printf '%s' "$rust_target" | tr 'a-z-' 'A-Z_')"
+            names+=(
+                "${rust_target_prefix}_RUSTFLAGS"
+                "${rust_target_prefix}_LINKER"
             )
             ;;
     esac
@@ -310,6 +347,10 @@ component_toolchain() {
             package_identities 'golang' 'golang-go'
             ;;
         rocksdb)
+            if [ -z "$cross_prefix" ]; then
+                cc=${CC:-gcc}
+                cxx=${CXX:-g++}
+            fi
             tool_identity cc "$cc" --version
             tool_identity cxx "$cxx" --version
             tool_identity ar "$ar" --version
@@ -447,10 +488,63 @@ restore_entry() {
     validate_outputs "$component"
 }
 
+create_active_stage() {
+    local component=$1 key=$2 stage_root lock_root
+    local prune_lock prune_fd
+    stage_root="$CACHE_ROOT/$CACHE_SCHEMA/.tmp"
+    lock_root="$CACHE_ROOT/$CACHE_SCHEMA/.locks/staging"
+    prune_lock="$CACHE_ROOT/$CACHE_SCHEMA/.locks/prune-staging.lock"
+    mkdir -p "$stage_root" "$lock_root"
+
+    # Close the creation race with the orphan cleaner: the stage is visible
+    # only after its unique lock is held.
+    exec {prune_fd}>"$prune_lock"
+    flock "$prune_fd"
+    ACTIVE_STAGE="$(mktemp -d "$stage_root/$component.$key.XXXXXX")"
+    ACTIVE_STAGE_LOCK="$lock_root/${ACTIVE_STAGE##*/}.lock"
+    exec {ACTIVE_STAGE_FD}>"$ACTIVE_STAGE_LOCK"
+    flock "$ACTIVE_STAGE_FD"
+    flock -u "$prune_fd"
+    exec {prune_fd}>&-
+}
+
+prune_staging_directories() {
+    local stage_root lock_root prune_lock stage name lock
+    local prune_fd stage_fd
+    stage_root="$CACHE_ROOT/$CACHE_SCHEMA/.tmp"
+    lock_root="$CACHE_ROOT/$CACHE_SCHEMA/.locks/staging"
+    prune_lock="$CACHE_ROOT/$CACHE_SCHEMA/.locks/prune-staging.lock"
+    mkdir -p "$stage_root" "$lock_root"
+
+    exec {prune_fd}>"$prune_lock"
+    flock "$prune_fd"
+    while IFS= read -r -d '' stage; do
+        name=${stage##*/}
+        lock="$lock_root/$name.lock"
+        exec {stage_fd}>"$lock"
+        if flock --nonblock "$stage_fd"; then
+            chmod -R u+w "$stage" 2>/dev/null || true
+            rm -rf "$stage"
+            flock -u "$stage_fd"
+        fi
+        exec {stage_fd}>&-
+        [ -e "$stage" ] || rm -f "$lock"
+    done < <(find "$stage_root" -mindepth 1 -maxdepth 1 -type d -print0)
+
+    # A crash immediately after atomic publication can leave only the tiny
+    # external lock file. Stage names are mktemp-unique, so it is never reused.
+    while IFS= read -r -d '' lock; do
+        name=${lock##*/}
+        name=${name%.lock}
+        [ -e "$stage_root/$name" ] || rm -f "$lock"
+    done < <(find "$lock_root" -maxdepth 1 -type f -name '*.lock' -print0)
+    flock -u "$prune_fd"
+    exec {prune_fd}>&-
+}
+
 publish_entry() {
     local component=$1 key=$2 descriptor=$3 entry=$4 relative revision_hash=unavailable
-    ACTIVE_STAGE="$CACHE_ROOT/$CACHE_SCHEMA/.tmp/$component.$key.$$"
-    rm -rf "$ACTIVE_STAGE"
+    create_active_stage "$component" "$key"
     mkdir -p "$ACTIVE_STAGE/payload"
     while IFS= read -r relative; do
         mkdir -p "$ACTIVE_STAGE/payload/$(dirname "$relative")"
@@ -479,6 +573,7 @@ publish_entry() {
     verify_entry "$ACTIVE_STAGE" "$key"
     mv "$ACTIVE_STAGE" "$entry"
     ACTIVE_STAGE=""
+    release_active_stage_lock
     chmod -R a-w "$entry"
 }
 
@@ -532,6 +627,7 @@ restore_or_build() {
     entry="$component_root/$key"
     lock="$CACHE_ROOT/$CACHE_SCHEMA/.locks/$TARGET_ARCH.$component.$key.lock"
     mkdir -p "$component_root" "$(dirname "$lock")" "$CACHE_ROOT/$CACHE_SCHEMA/.tmp"
+    prune_staging_directories
 
     [ -d "$entry" ] && existed_before_lock=1
     exec {lock_fd}>"$lock"

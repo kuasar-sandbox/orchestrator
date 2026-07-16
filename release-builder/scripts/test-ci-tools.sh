@@ -52,6 +52,14 @@ setup_cloud_hypervisor_workspace() {
     printf 'patch fixture\n' >"$root/sandboxer/native-deps/deps/ch-patches/test.patch"
 }
 
+setup_rocksdb_workspace() {
+    local root=$1
+    mkdir -p "$root/accelerator/deps"
+    printf 'rocksdb target fixture\n' >"$root/accelerator/Makefile"
+    printf 'common fixture\n' >"$root/accelerator/deps/common.sh"
+    printf 'build rocksdb fixture\n' >"$root/accelerator/deps/build-rocksdb.sh"
+}
+
 mkdir -p "$TMP/bin"
 cat >"$TMP/bin/make" <<'EOF'
 #!/usr/bin/env bash
@@ -196,12 +204,37 @@ cloud_key_encoded="$(env PATH="$TMP/bin:$PATH" CARGO_HOME="$cargo_home" \
     "$SCRIPT_DIR/native-cache.sh" key cloud-hypervisor | cut -f2)"
 [ "$cloud_key_plain" != "$cloud_key_encoded" ] \
     || fail "CARGO_ENCODED_RUSTFLAGS did not invalidate the Cloud Hypervisor key"
+cloud_key_target_flags="$(env PATH="$TMP/bin:$PATH" CARGO_HOME="$cargo_home" \
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-Ctarget-cpu=x86-64-v3 \
+    KUASAR_WORKSPACE_ROOT="$cloud_workspace" \
+    "$SCRIPT_DIR/native-cache.sh" key cloud-hypervisor | cut -f2)"
+[ "$cloud_key_plain" != "$cloud_key_target_flags" ] \
+    || fail "target-specific Cargo rustflags did not invalidate the Cloud Hypervisor key"
 printf '[build]\nrustflags = ["-Cdebuginfo=1"]\n' >"$cargo_home/config.toml"
 cloud_key_config="$(env PATH="$TMP/bin:$PATH" CARGO_HOME="$cargo_home" \
     KUASAR_WORKSPACE_ROOT="$cloud_workspace" \
     "$SCRIPT_DIR/native-cache.sh" key cloud-hypervisor | cut -f2)"
 [ "$cloud_key_plain" != "$cloud_key_config" ] \
     || fail "Cargo config did not invalidate the Cloud Hypervisor key"
+
+rocks_workspace="$TMP/rocks-workspace"
+setup_rocksdb_workspace "$rocks_workspace"
+for tool in clang clang++; do
+    cat >"$TMP/bin/$tool" <<EOF
+#!/usr/bin/env bash
+printf '$tool v1\\n'
+EOF
+    chmod +x "$TMP/bin/$tool"
+done
+rocks_key_v1="$(env PATH="$TMP/bin:$PATH" CC=clang CXX=clang++ \
+    KUASAR_WORKSPACE_ROOT="$rocks_workspace" \
+    "$SCRIPT_DIR/native-cache.sh" key rocksdb | cut -f2)"
+printf '# compiler update\n' >>"$TMP/bin/clang"
+rocks_key_v2="$(env PATH="$TMP/bin:$PATH" CC=clang CXX=clang++ \
+    KUASAR_WORKSPACE_ROOT="$rocks_workspace" \
+    "$SCRIPT_DIR/native-cache.sh" key rocksdb | cut -f2)"
+[ "$rocks_key_v1" != "$rocks_key_v2" ] \
+    || fail "selected RocksDB compiler did not invalidate the key"
 
 env PATH="$TMP/bin:$PATH" FAKE_BUILD_COUNTER="$counter" \
     KUASAR_WORKSPACE_ROOT="$workspace" KUASAR_NATIVE_CACHE_ROOT="$cache" \
@@ -251,6 +284,27 @@ wait "$pid_b"
 [ "$(wc -l <"$concurrent_counter")" -eq 1 ] || fail "same-key concurrent misses built more than once"
 grep -q 'miss-built' "$TMP/a.log" "$TMP/b.log" || fail "concurrent miss was not recorded"
 grep -q 'hit-after-wait' "$TMP/a.log" "$TMP/b.log" || fail "concurrent waiter did not restore the published entry"
+
+staging_cache="$TMP/staging-cache"
+staging_workspace="$TMP/staging-workspace"
+staging_counter="$TMP/staging-counter"
+setup_workspace "$staging_workspace"
+orphan_stage="$staging_cache/v1/.tmp/envd.orphan.test"
+orphan_lock="$staging_cache/v1/.locks/staging/${orphan_stage##*/}.lock"
+mkdir -p "$orphan_stage/payload" "$(dirname "$orphan_lock")"
+exec 8>"$orphan_lock"
+flock 8
+env PATH="$TMP/bin:$PATH" FAKE_BUILD_COUNTER="$staging_counter" \
+    KUASAR_WORKSPACE_ROOT="$staging_workspace" KUASAR_NATIVE_CACHE_ROOT="$staging_cache" \
+    "$SCRIPT_DIR/native-cache.sh" restore-or-build envd >/dev/null
+[ -d "$orphan_stage" ] || fail "active native staging directory was pruned"
+flock -u 8
+exec 8>&-
+env PATH="$TMP/bin:$PATH" FAKE_BUILD_COUNTER="$staging_counter" \
+    KUASAR_WORKSPACE_ROOT="$staging_workspace" KUASAR_NATIVE_CACHE_ROOT="$staging_cache" \
+    "$SCRIPT_DIR/native-cache.sh" restore-or-build envd >/dev/null
+[ ! -e "$orphan_stage" ] || fail "orphaned native staging directory was not pruned"
+[ ! -e "$orphan_lock" ] || fail "orphaned native staging lock was not pruned"
 
 retained_cache="$TMP/retained-cache"
 retained_workspace="$TMP/retained-workspace"

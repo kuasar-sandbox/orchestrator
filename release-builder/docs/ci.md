@@ -36,13 +36,15 @@ DaoCloud 国内镜像。
 缓存路径为
 `/var/cache/kuasar/native/v1/<arch>/<component>/<input-hash>/`.输入 hash 覆盖
 构建定义和脚本、patch/config、固定的上游归档摘要、目标架构、Go 微架构、
-Cargo 编译选项、pkg-config 搜索环境及其解析到的元数据/库、编译工具
-二进制/版本与系统包版本。每个条目包含 `inputs.tsv`、`provenance.txt`、
-`payload.tar` 和 `SHA256SUMS`。
+Cargo 全局及 target-specific 编译选项、pkg-config 搜索环境及其解析到的
+元数据/库、实际选择的 C/C++ 编译工具二进制/版本与系统包版本。每个条目包含
+`inputs.tsv`、`provenance.txt`、`payload.tar` 和 `SHA256SUMS`。
 
 同 key 的构建和命中恢复都持有条目 `flock`;miss 直到构建、校验和原子发布完成才
 释放,等待者随后验证并恢复同一条目。发布后的目录去除写权限。命中恢复前会校验
 descriptor hash、payload hash 和 tar 路径。损坏条目直接失败,不会在原路径修补。
+发布 staging 目录使用独立锁；正常退出直接清理，强制取消或 runner 重启留下的
+目录由后续 run 在确认锁已释放后回收，不会误删另一个 slot 正在发布的 payload。
 
 每个架构、组件保留最近使用的 4 个 input hash。淘汰器只删除超过 1 小时保护期且
 能非阻塞取得条目锁的旧目录,因此并发恢复或构建中的制品不会被删除。留存数和保护
