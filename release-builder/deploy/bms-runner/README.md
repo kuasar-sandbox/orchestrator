@@ -55,7 +55,13 @@ large work directory. Runner self-update is disabled so containers do not
 download a large international release unexpectedly; update the host
 distribution and rerun installation deliberately when GitHub's runner support
 window requires it. The legacy host runner service must be stopped before an
-install, while container runner processes do not block an idempotent update.
+install. Existing container slots must also be stopped while their package
+sets and runner files are reconciled.
+
+Each installroot transaction replaces the openEuler release package's default
+metalink configuration with the host repository files after they pass the
+China-mirror check. Keep `/etc/yum.repos.d/*.repo` on the host pointed at a
+direct China mirror; the same configuration is propagated to both slots.
 
 Generate short-lived organization registration tokens with an authenticated
 `gh` client and stream them over SSH; do not put them in command arguments or

@@ -34,6 +34,7 @@ PACKAGES=(
     procps-ng which file hostname kmod iputils jq socat openssl sqlite
     gcc gcc-c++ libstdc++-static make cmake autoconf automake libtool pkgconf
     glibc-devel openssl-devel elfutils-libelf-devel ncurses-devel flex bison dwarves perl bc
+    lz4-devel zstd-devel zlib-devel snappy-devel
     rust cargo rust-std-static clang llvm bpftool
     python3 python3-pip python3-devel python3-pyyaml
     moby-engine moby-client e2fsprogs unzip zip zstd lz4
@@ -97,6 +98,16 @@ assert_host_runner_idle() {
     if systemctl is-active --quiet "$service"; then
         die "the existing host runner service must be stopped before installation: $service"
     fi
+}
+
+assert_slots_stopped() {
+    local slot machine
+    for slot in 1 2; do
+        machine="$(machine_name "$slot")"
+        if systemctl is-active --quiet "systemd-nspawn@$machine.service"; then
+            die "$machine must be stopped before installation"
+        fi
+    done
 }
 
 verify_sha256() {
@@ -210,6 +221,27 @@ copy_runner_distribution() {
         "$RUNNER_SOURCE/" "$destination/"
 }
 
+sync_root_repositories() {
+    local root=$1
+    local host_repos=(/etc/yum.repos.d/*.repo)
+    [ -e "${host_repos[0]}" ] || die "host has no yum repository files"
+
+    # openEuler-release installs its upstream metalink configuration into a new
+    # root. Replace it with the host configuration that passed the China-mirror
+    # check before every installroot transaction.
+    install -d -m 0755 "$root/etc/yum.repos.d"
+    rm -f "$root/etc/yum.repos.d/"*.repo
+    cp -a "${host_repos[@]}" "$root/etc/yum.repos.d/"
+}
+
+reconcile_root_packages() {
+    local root=$1
+    sync_root_repositories "$root"
+    dnf -y --installroot="$root" --releasever=24.03 \
+        --setopt=install_weak_deps=False --setopt=keepcache=False \
+        install "${PACKAGES[@]}"
+}
+
 build_template_root() {
     if [ ! -f "$TEMPLATE_ROOT/.kuasar-ci-template" ]; then
         [ ! -e "$TEMPLATE_ROOT" ] || die "partial template root exists: $TEMPLATE_ROOT"
@@ -224,9 +256,7 @@ build_template_root() {
 
     # Reconcile the complete package set on every install so additions to this
     # manifest also reach existing templates without rebuilding their rootfs.
-    dnf -y --installroot="$TEMPLATE_ROOT" --releasever=24.03 \
-        --setopt=install_weak_deps=False --setopt=keepcache=False \
-        install "${PACKAGES[@]}"
+    reconcile_root_packages "$TEMPLATE_ROOT"
     touch "$TEMPLATE_ROOT/.kuasar-ci-template"
 
     install_static_libuuid
@@ -350,6 +380,9 @@ prepare_slot() {
         touch "$root/.kuasar-ci-slot"
         new_slot=1
     fi
+    if [ "$new_slot" -eq 0 ]; then
+        reconcile_root_packages "$root"
+    fi
     copy_runner_distribution "$root/opt/actions-runner"
     install -d -m 0755 "$root/etc/docker" "$root/etc/pip" "$root/root/.cargo"
     install -m 0644 "$TEMPLATE_ROOT/etc/docker/daemon.json" "$root/etc/docker/daemon.json"
@@ -395,6 +428,7 @@ install_slots() {
     assert_supported_host
     assert_china_repositories
     assert_host_runner_idle
+    assert_slots_stopped
     local free_kib
     free_kib="$(df --output=avail -k / | tail -1)"
     [ "$free_kib" -ge $((15 * 1024 * 1024)) ] || die "at least 15 GiB free space is required"
@@ -502,6 +536,8 @@ verify_slots() {
             libstdcpp=$(gcc -print-file-name=libstdc++.a)
             test "$libstdcpp" != libstdc++.a
             test -s "$libstdcpp"
+            test -e /usr/lib64/liblz4.so
+            test -e /usr/lib64/libsnappy.so
             ip route get 223.5.5.5 >/dev/null
             curl --fail --silent --show-error --connect-timeout 5 --max-time 20 https://goproxy.cn >/dev/null
             mountpoint -q /sys/fs/bpf
