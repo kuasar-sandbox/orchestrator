@@ -281,6 +281,11 @@ prepare_slot() {
         new_slot=1
     fi
     copy_runner_distribution "$root/opt/actions-runner"
+    install -d -m 0755 "$root/etc/docker" "$root/etc/pip" "$root/root/.cargo"
+    install -m 0644 "$TEMPLATE_ROOT/etc/docker/daemon.json" "$root/etc/docker/daemon.json"
+    install -m 0644 "$TEMPLATE_ROOT/etc/pip.conf" "$root/etc/pip.conf"
+    install -m 0644 "$TEMPLATE_ROOT/root/.cargo/config.toml" "$root/root/.cargo/config.toml"
+    install -m 0644 "$TEMPLATE_ROOT/etc/resolv.conf" "$root/etc/resolv.conf"
 
     if [ "$new_slot" -eq 1 ]; then
         rm -f "$root/etc/machine-id" "$root/var/lib/dbus/machine-id"
