@@ -295,7 +295,8 @@ prepare_slot() {
 127.0.1.1 $machine
 ::1 localhost ip6-localhost ip6-loopback
 EOF
-    cat >"$root/etc/systemd/network/80-host0.network" <<EOF
+    rm -f "$root/etc/systemd/network/80-host0.network"
+    cat >"$root/etc/systemd/network/10-kuasar-host0.network" <<EOF
 [Match]
 Name=host0
 
@@ -368,6 +369,8 @@ start_slots() {
         [ -f "$root/opt/actions-runner/.runner" ] || die "$machine is not registered"
         systemctl enable --now "systemd-nspawn@$machine.service"
     done
+    wait_slot_ready 1
+    wait_slot_ready 2
 }
 
 stop_slots() {
@@ -385,11 +388,30 @@ run_in_slot() {
     systemd-run --quiet --wait --pipe --collect --machine="$(machine_name "$slot")" "$@"
 }
 
+wait_slot_ready() {
+    local slot=$1 machine attempt
+    machine="$(machine_name "$slot")"
+    for attempt in $(seq 1 60); do
+        if [ "$(machinectl show "$machine" -p State --value 2>/dev/null || true)" = running ] \
+            && run_in_slot "$slot" /bin/bash -ceu '
+                systemctl is-active --quiet systemd-networkd.service
+                systemctl is-active --quiet docker.service
+                systemctl is-active --quiet actions-runner.service
+                ip route get 223.5.5.5 >/dev/null
+            ' >/dev/null 2>&1; then
+            return
+        fi
+        sleep 1
+    done
+    die "$machine did not become network, Docker, and runner ready within 60s"
+}
+
 verify_slots() {
     require_root
     local slot machine
     for slot in 1 2; do
         machine="$(machine_name "$slot")"
+        wait_slot_ready "$slot"
         [ "$(machinectl show "$machine" -p State --value)" = running ] || die "$machine is not running"
         run_in_slot "$slot" /bin/bash -ceu '
             [ "$(cat /proc/1/comm)" = systemd ]
