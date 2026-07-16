@@ -30,15 +30,12 @@ import (
 // runRegistry starts the registry role: shardkv state cluster plus node_link,
 // route_link, node_list, and placer_link endpoints.
 func runRegistry(args []string, log *slog.Logger) error {
-	if len(args) > 0 {
-		switch args[0] {
-		case "export", "import":
-			return registryAdminCmd(args)
-		}
-	}
 	fs := flag.NewFlagSet("registry", flag.ExitOnError)
 	cfgPath := fs.String("config", "/etc/cluster-ctl/registry.yaml", "config file")
 	_ = fs.Parse(args)
+	if fs.NArg() != 0 {
+		return fmt.Errorf("registry: unexpected arguments: %s", strings.Join(fs.Args(), " "))
+	}
 
 	cfg, err := clustercfg.LoadRegistry(*cfgPath)
 	if err != nil {
@@ -405,6 +402,27 @@ func registryMemberClient(advertise string, tlsMaterial clustercfg.TLS) (string,
 	}
 	base, client := controlHTTPClient(advertise, tlsCfg)
 	return base, client, nil
+}
+
+func controlHTTPClient(addr string, tlsCfg *tls.Config) (string, *http.Client) {
+	transport := &http.Transport{}
+	base := "http://" + addr
+	switch {
+	case strings.HasPrefix(addr, "/"):
+		base = "http://registry"
+		transport = &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "unix", addr)
+		}}
+	case strings.HasPrefix(addr, "http://") || strings.HasPrefix(addr, "https://"):
+		base = strings.TrimRight(addr, "/")
+		if strings.HasPrefix(addr, "https://") {
+			transport = &http.Transport{TLSClientConfig: tlsCfg, ForceAttemptHTTP2: true}
+		}
+	case tlsCfg != nil:
+		base = "https://" + addr
+		transport = &http.Transport{TLSClientConfig: tlsCfg, ForceAttemptHTTP2: true}
+	}
+	return base, &http.Client{Timeout: 60 * time.Second, Transport: transport}
 }
 
 func registryMemberShortClient(advertise string, tlsMaterial clustercfg.TLS) (string, *http.Client, error) {

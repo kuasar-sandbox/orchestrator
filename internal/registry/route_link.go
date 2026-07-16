@@ -9,8 +9,8 @@ import (
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 )
 
-// route_link paths. Routers and operator tools dial this link for group-scoped
-// route/build operations, API-key verification, and import/export.
+// route_link paths. Routers dial this link for group-scoped route/build
+// operations and API-key verification.
 const (
 	RouteLinkReservePath      = "/route-link/reserve"       // POST ?group=&route_key= -> ReserveResult
 	RouteLinkRoutePath        = "/route-link/route"         // GET  ?group=&route_key=&sid= -> RouteResolve
@@ -44,8 +44,6 @@ func (r *Registry) ServeRouteLink(mux *http.ServeMux) {
 	mux.HandleFunc(RouteLinkBuildPath, r.serveBuild) // resolve build_id -> node (router restart)
 	mux.HandleFunc(RouteLinkListPath, r.serveList)
 	mux.HandleFunc(RouteLinkVerifyKeyPath, r.serveVerifyKey)
-	mux.HandleFunc(RouteLinkExportPath, r.serveExport) // operator JSONL export
-	mux.HandleFunc(RouteLinkImportPath, r.serveImport) // operator JSONL import
 }
 
 // serveVerifyKey verifies an api key through the placer-owned group provider
