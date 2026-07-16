@@ -31,7 +31,7 @@ PACKAGES=(
     bash coreutils findutils grep gawk sed diffutils patch tar gzip xz cpio
     ca-certificates curl libcurl libicu krb5-libs openssh-clients tzdata zlib
     git git-lfs rsync util-linux util-linux-devel iproute iptables nftables
-    procps-ng which file hostname kmod iputils jq socat openssl sqlite
+    procps-ng which time file hostname kmod iputils jq socat openssl sqlite
     gcc gcc-c++ libstdc++-static make cmake autoconf automake libtool pkgconf
     glibc-devel openssl-devel elfutils-libelf-devel ncurses-devel flex bison dwarves perl bc
     lz4-devel zstd-devel zlib-devel snappy-devel
@@ -538,6 +538,8 @@ verify_slots() {
             test -s "$libstdcpp"
             test -e /usr/lib64/liblz4.so
             test -e /usr/lib64/libsnappy.so
+            test -x /usr/bin/time
+            redis-server --version >/dev/null
             ip route get 223.5.5.5 >/dev/null
             curl --fail --silent --show-error --connect-timeout 5 --max-time 20 https://goproxy.cn >/dev/null
             mountpoint -q /sys/fs/bpf
