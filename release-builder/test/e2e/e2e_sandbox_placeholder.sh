@@ -63,12 +63,18 @@ WORK="$(mktemp -d /tmp/e2e-placeholder-XXXXXX)"
 RUNROOT="$WORK/runtime"; mkdir -p "$RUNROOT"
 RUNLOG="$WORK/run.log"
 RUNPID=""
+CTL_PID=""
 TAP_CREATED=0
 
 cleanup() {
     set +e
-    [ -n "$RUNPID" ] && kill -0 "$RUNPID" 2>/dev/null && kill -TERM "$RUNPID" 2>/dev/null
+    if [ -n "$CTL_PID" ] && kill -0 "$CTL_PID" 2>/dev/null; then
+        kill -TERM "$CTL_PID" 2>/dev/null
+    elif [ -n "$RUNPID" ] && kill -0 "$RUNPID" 2>/dev/null; then
+        kill -TERM "$RUNPID" 2>/dev/null
+    fi
     sleep 1
+    [ -n "$CTL_PID" ] && kill -0 "$CTL_PID" 2>/dev/null && kill -KILL "$CTL_PID" 2>/dev/null
     [ -n "$RUNPID" ] && kill -0 "$RUNPID" 2>/dev/null && kill -KILL "$RUNPID" 2>/dev/null
     pkill -f "cloud-hypervisor.*$SID" 2>/dev/null
     [ "$TAP_CREATED" = 1 ] && ip link del "$TAP_NAME" 2>/dev/null
@@ -134,6 +140,15 @@ timeout -k 10s 120 "$BIN/sandbox-ctl" run \
     --ch-binary "$BIN/cloud-hypervisor" --run-root "$RUNROOT" \
     > "$RUNLOG" 2>&1 &
 RUNPID=$!
+# timeout relays a handled signal to both its child PID and process group.
+# Capture sandbox-ctl so the graceful-stop assertion sends exactly one signal.
+for _ in $(seq 1 50); do
+    CTL_PID="$(pgrep -P "$RUNPID" -x sandbox-ctl 2>/dev/null | head -1 || true)"
+    [ -n "$CTL_PID" ] && break
+    kill -0 "$RUNPID" 2>/dev/null || { echo "==> FAIL: timeout wrapper exited before sandbox-ctl started"; exit 1; }
+    sleep 0.1
+done
+[ -n "$CTL_PID" ] || { echo "==> FAIL: could not resolve sandbox-ctl child of timeout pid=$RUNPID"; exit 1; }
 
 # Readiness: ctl.sock is created early (host listener), so it is NOT a boot
 # signal — a working exec is. Poll exec until the guest answers.
@@ -189,12 +204,19 @@ if grep -q "rebooting" "$RUNLOG"; then
 fi
 
 # ---- 4. graceful stop -----------------------------------------------------
-echo "==> [4] graceful stop (SIGTERM the run process)"
-kill -TERM "$RUNPID" 2>/dev/null || true
+echo "==> [4] graceful stop (SIGTERM sandbox-ctl directly)"
+kill -TERM "$CTL_PID"
 set +e; wait "$RUNPID"; RC=$?; set -e
 RUNPID=""
+CTL_PID=""
 echo "==> run exit code: $RC"
 [ "$RC" = 0 ] || { echo "==> FAIL: graceful stop exit=$RC (want 0)"; tail -40 "$RUNLOG"; exit 1; }
+SIGNAL_EVENTS="$(grep -c "received terminated" "$RUNLOG" || true)"
+[ "$SIGNAL_EVENTS" = 1 ] \
+    || { echo "==> FAIL: graceful stop delivered $SIGNAL_EVENTS SIGTERM events (want 1)"; tail -40 "$RUNLOG"; exit 1; }
+grep -q "while shutdown in progress" "$RUNLOG" \
+    && { echo "==> FAIL: graceful stop triggered second-signal escalation"; tail -40 "$RUNLOG"; exit 1; }
+echo "==> PASS: graceful stop delivered exactly one SIGTERM"
 
 echo
 echo "==> guest restart/reboot/placeholder log lines:"
