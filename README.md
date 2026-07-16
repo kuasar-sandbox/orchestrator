@@ -12,8 +12,10 @@ e2b 兼容沙箱平台的**节点主机**与**集群控制面**,两个生产二�
   节点通道枢纽)、**router**(集群级数据面入口,按 sandbox-group + route-key 会话亲和转发)、
   **placer**(group provider/importer、WATCH_LIST 消费方与放置调度器)。
   沙箱按需创建 / 恢复 / 迁移,空闲下沉到节点本机快照乃至远程快照(可移植、不绑节点)。registry
-  自身按 sandbox-group 分片复制状态;整套 registry 完全下电后不自动恢复运行中沙箱,可通过
-  group/route 导入导出支持外部持久化和灾难恢复。
+  自身按 sandbox-group 分片复制状态;整套 registry 下电但 shard 数据保留时可恢复原状态。执行 shard
+  不可恢复地丢失后不得从备份构造 node 执行态;存活 node 的投影恢复和 migration-token 持久 route
+  分别由 [#34](https://github.com/kuasar-sandbox/orchestrator/issues/34) 与
+  [#33](https://github.com/kuasar-sandbox/orchestrator/issues/33) 跟踪。
 
 是 [kuasar-sandbox](https://github.com/kuasar-sandbox/kuasar-sandbox) 平台的北向入口、节点
 资源仲裁与集群编排器,独立演进。两类沙箱 profile:**e2b**(guest 内 envd,完整数据面)与

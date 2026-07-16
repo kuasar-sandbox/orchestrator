@@ -879,23 +879,27 @@ node owner 的 admission 以 `(node_id,build_id)` 记账;同一 build_id 出现�
 余量不足则直接拒绝,route owner 重新调度。build event 只携带 build_id,nodelink owner 查本节点归属表
 得到 group;终态调用 `ReleaseBuild(node_id,build_id)`。北向查询和 router cache 始终带 group。
 
-## 13. 导入导出
+## 13. 状态所有权与灾备边界
 
-registry export/import 覆盖 registry 执行态灾备数据:
+node 是 sandbox/build 执行状态的事实源。`route_link` 中的 sandbox/build record、`node_link` 中的
+反向 ownership 和 admission 都是由节点事实派生的路由、查询或调度投影,不能由 operator 文件创建或
+转移。terminal build 仍是一次节点执行的查询投影;可持久复用的是 build 产出的 template/manifest,
+不是 BuildRecord。
 
-- `kind=route_link`:导出指定 group 下的 `route_link/sandbox` route records 和 `route_link/build` build execution records
+registry 正常控制面不提供执行态 import/export。尤其禁止导入现有 SID、NodeID、READY/PAUSED 状态、
+build execution、node ref、admission 或本机 checkpoint。节点仍存活但 registry 执行 shard 完全丢失时,
+应由带持久 cluster metadata 的 node-link full report 重建投影,不能预装 ownership 让旧事件看似合法。
+这条显式 recovery/bootstrap 协议尚未实现,由
+[issue #34](https://github.com/kuasar-sandbox/orchestrator/issues/34) 跟踪;当前不得用手工写入执行 row 规避该限制。
 
-JSONL 行使用显式类型:
+可移植 paused sandbox 的灾备对象是带 migration token 的**未绑定持久 route**,不是 SandboxRecord。
+它不携带旧 SID/NodeID/admission,恢复时重新 placement,由目标 node 校验 remote snapshot 后创建新身份,
+READY 上报才建立运行态 route。该 recovery-only workflow 由
+[issue #33](https://github.com/kuasar-sandbox/orchestrator/issues/33) 跟踪,不挂载在正常 route_link API。
 
-```json
-{"type":"route","route":{}}
-{"type":"build","build":{}}
-```
-
-registry export/import 不覆盖 sandbox-group provider 数据。group 配置、placement hint、auth_key、
-manifest_key 由 placer/provider 侧负责导入导出。
-
-整套 registry 完全下电后不要求自动恢复运行中 sandbox。灾难场景可通过外部持久化的 export/import 做手动恢复。
+sandbox-group 配置、placement hint、auth_key、manifest_key 仍由 placer/provider 自己的持久化和灾备流程负责。
+在 #33/#34 完成前,完整 registry 执行态丢失没有 operator runtime import 兜底;系统必须明确报告不可恢复,
+而不是构造可能与节点冲突的 route/build ownership。
 
 ## 14. 可靠性
 
@@ -907,8 +911,9 @@ manifest_key 由 placer/provider 侧负责导入导出。
 | node 整机重启 | node 清空运行态;缺失 sandbox 经 node 上报/清理收敛为 dead route |
 | registry 单成员故障 | owner set quorum 足够时继续服务;恢复后由同 shard 访问或事实源上报触发 read-repair |
 | registry 多成员故障导致 quorum 不足 | 对应 shard 停写,不降级乱写 |
+| registry 执行 shard 全失但 node 存活 | 不导入备份执行 row;进入显式 recovery mode,由 node 持久事实重建投影(#34;当前未实现) |
 | membership 变更 | active/next joint 写 quorum + old_grace read-only 证书/快照来源 |
-| 整集群下电 | 不自动恢复运行中 sandbox;可手动导入外部持久化执行态 |
+| 整集群下电 | 运行中和本机 checkpoint 不可恢复;仅 provider 持久数据、template/manifest 及未来 migration-token route(#33)可参与灾备 |
 
 ## 15. 性能
 
