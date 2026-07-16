@@ -13,6 +13,11 @@ SUBNET=${KUASAR_CI_SUBNET:-10.203.0.0/24}
 BRIDGE_ADDRESS=${KUASAR_CI_BRIDGE_ADDRESS:-10.203.0.1/24}
 MEMORY_MAX=${KUASAR_SLOT_MEMORY_MAX:-176G}
 MEMORY_HIGH=${KUASAR_SLOT_MEMORY_HIGH:-168G}
+SOURCE_CACHE=${KUASAR_SOURCE_CACHE:-/var/cache/kuasar/sources}
+UTIL_LINUX_SRPM_URL=${KUASAR_UTIL_LINUX_SRPM_URL:-https://mirrors.huaweicloud.com/openeuler/openEuler-24.03-LTS-SP4/source/Packages/util-linux-2.39.1-38.oe2403sp4.src.rpm}
+UTIL_LINUX_SRPM_SHA256=${KUASAR_UTIL_LINUX_SRPM_SHA256:-40324d3ab54be52ef67544732a71ec14f6aecb2e92f5d8fa0aaaac532c55c0bf}
+UTIL_LINUX_TARBALL_SHA256=${KUASAR_UTIL_LINUX_TARBALL_SHA256:-890ae8ff810247bd19e274df76e8371d202cda01ad277681b0ea88eeaa00286b}
+LIBUUID_BUILD_ID=util-linux-2.39.1-38.oe2403sp4-static-v1
 
 SLOT1_CPUS=${KUASAR_SLOT1_CPUS:-0-21,44-65}
 SLOT2_CPUS=${KUASAR_SLOT2_CPUS:-22-43,66-87}
@@ -34,7 +39,7 @@ PACKAGES=(
     moby-engine moby-client e2fsprogs unzip zip zstd lz4
 )
 BOOTSTRAP_PACKAGES=(filesystem glibc bash coreutils)
-HOST_PACKAGES=(systemd-container systemd-nspawn)
+HOST_PACKAGES=(systemd-container systemd-nspawn rpm cpio)
 
 die() {
     echo "provision: $*" >&2
@@ -86,10 +91,67 @@ assert_china_repositories() {
 }
 
 assert_host_runner_idle() {
-    if pgrep -af '/Runner.Worker' >/dev/null 2>&1; then
-        pgrep -af '/Runner.Worker' >&2 || true
-        die "the existing host runner is executing a job"
+    local service_file="$RUNNER_SOURCE/.service" service
+    [ -f "$service_file" ] || return
+    service="$(<"$service_file")"
+    if systemctl is-active --quiet "$service"; then
+        die "the existing host runner service must be stopped before installation: $service"
     fi
+}
+
+verify_sha256() {
+    local path=$1 expected=$2
+    printf '%s  %s\n' "$expected" "$path" | sha256sum --check --status
+}
+
+install_static_libuuid() {
+    local marker="$TEMPLATE_ROOT/usr/lib64/.kuasar-libuuid-build-id"
+    if [ -s "$TEMPLATE_ROOT/usr/lib64/libuuid.a" ] \
+        && [ "$(cat "$marker" 2>/dev/null || true)" = "$LIBUUID_BUILD_ID" ]; then
+        return
+    fi
+
+    case "$UTIL_LINUX_SRPM_URL" in
+        https://mirrors.huaweicloud.com/*) ;;
+        *) die "util-linux source RPM must use the configured Huawei Cloud mirror" ;;
+    esac
+
+    local srpm_name srpm work source
+    srpm_name=${UTIL_LINUX_SRPM_URL##*/}
+    srpm="$SOURCE_CACHE/$srpm_name"
+    install -d -m 0755 "$SOURCE_CACHE"
+
+    if [ ! -f "$srpm" ] || ! verify_sha256 "$srpm" "$UTIL_LINUX_SRPM_SHA256"; then
+        rm -f "$srpm"
+        log "downloading pinned util-linux source RPM from the China mirror"
+        curl --fail --location --retry 3 --output "$srpm" "$UTIL_LINUX_SRPM_URL"
+    fi
+    verify_sha256 "$srpm" "$UTIL_LINUX_SRPM_SHA256" \
+        || die "source RPM checksum mismatch: $srpm"
+
+    work="$TEMPLATE_ROOT/tmp/kuasar-libuuid-build"
+    rm -rf "$work"
+    install -d -m 0755 "$work/srpm" "$work/src"
+    (cd "$work/srpm" && rpm2cpio "$srpm" | cpio -idm --quiet)
+    source="$work/srpm/util-linux-2.39.1.tar.xz"
+    [ -f "$source" ] || die "util-linux source tarball is missing from $srpm"
+    verify_sha256 "$source" "$UTIL_LINUX_TARBALL_SHA256" \
+        || die "util-linux source tarball checksum mismatch"
+    tar -xJf "$source" --strip-components=1 -C "$work/src"
+
+    log "building static libuuid inside the runner root"
+    chroot "$TEMPLATE_ROOT" /bin/bash -ceu '
+        cd /tmp/kuasar-libuuid-build/src
+        ./configure --prefix=/usr --libdir=/usr/lib64 \
+            --disable-all-programs --enable-libuuid --enable-static \
+            --disable-shared --disable-nls >/dev/null
+        make -j"$(nproc)" libuuid.la >/dev/null
+        install -m 0644 .libs/libuuid.a /usr/lib64/libuuid.a
+    '
+    printf '%s\n' "$LIBUUID_BUILD_ID" >"$marker"
+    rm -rf "$work"
+    [ -s "$TEMPLATE_ROOT/usr/lib64/libuuid.a" ] \
+        || die "static libuuid build did not produce /usr/lib64/libuuid.a"
 }
 
 check_host() {
@@ -163,6 +225,8 @@ build_template_root() {
             install "${PACKAGES[@]}"
         touch "$TEMPLATE_ROOT/.kuasar-ci-template"
     fi
+
+    install_static_libuuid
 
     copy_runner_distribution "$TEMPLATE_ROOT/opt/actions-runner"
     install -d -m 0755 \
@@ -289,6 +353,9 @@ prepare_slot() {
     install -m 0644 "$TEMPLATE_ROOT/etc/pip.conf" "$root/etc/pip.conf"
     install -m 0644 "$TEMPLATE_ROOT/root/.cargo/config.toml" "$root/root/.cargo/config.toml"
     install -m 0644 "$TEMPLATE_ROOT/etc/resolv.conf" "$root/etc/resolv.conf"
+    install -m 0644 "$TEMPLATE_ROOT/usr/lib64/libuuid.a" "$root/usr/lib64/libuuid.a"
+    install -m 0644 "$TEMPLATE_ROOT/usr/lib64/.kuasar-libuuid-build-id" \
+        "$root/usr/lib64/.kuasar-libuuid-build-id"
 
     if [ "$new_slot" -eq 1 ]; then
         rm -f "$root/etc/machine-id" "$root/var/lib/dbus/machine-id"
@@ -428,6 +495,7 @@ verify_slots() {
             test -r /dev/vhost-vsock -a -w /dev/vhost-vsock
             systemctl is-active --quiet docker.service
             docker info >/dev/null
+            test -s /usr/lib64/libuuid.a
             ip route get 223.5.5.5 >/dev/null
             curl --fail --silent --show-error --connect-timeout 5 --max-time 20 https://goproxy.cn >/dev/null
             mountpoint -q /sys/fs/bpf

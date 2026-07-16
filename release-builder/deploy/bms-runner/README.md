@@ -40,12 +40,19 @@ Run from this directory on the BMS host as root:
 ```
 
 The install root is built once from the already configured Huawei Cloud
-openEuler mirror and copied into `/var/lib/machines/kuasar-ci-{1,2}`. The
-existing runner distribution is copied without credentials, logs, or its large
-work directory. Runner self-update is disabled so containers do not download a
-large international release unexpectedly; update the host distribution and
-rerun installation deliberately when GitHub's runner support window requires
-it.
+openEuler mirror and copied into `/var/lib/machines/kuasar-ci-{1,2}`. Because
+openEuler does not package the static `libuuid.a` required by the guest
+`mkfs.erofs`, the provisioner builds it inside the install root from the pinned
+openEuler `util-linux` source RPM. Both the source RPM and its upstream tarball
+are SHA-256 verified; the 8 MiB RPM is cached under `/var/cache/kuasar/sources`
+and downloaded from Huawei Cloud.
+
+The existing runner distribution is copied without credentials, logs, or its
+large work directory. Runner self-update is disabled so containers do not
+download a large international release unexpectedly; update the host
+distribution and rerun installation deliberately when GitHub's runner support
+window requires it. The legacy host runner service must be stopped before an
+install, while container runner processes do not block an idempotent update.
 
 Generate short-lived organization registration tokens with an authenticated
 `gh` client and stream them over SSH; do not put them in command arguments or
@@ -79,9 +86,9 @@ ssh bms.tmp '/usr/local/sbin/kuasar-ci-runner-provision stop'
 
 `verify` checks PID1/systemd, cgroup v2, KVM/TUN/vhost access, private mount and
 network namespaces, distinct host cgroups, nested Docker, private bpffs/netns,
-outbound access through the China-side proxy path, and active runner services.
-It is not an E2E wrapper. Repository workflows still execute `make test-e2e`
-directly.
+the static `libuuid` build dependency, outbound access through the China-side
+proxy path, and active runner services. It is not an E2E wrapper. Repository
+workflows still execute `make test-e2e` directly.
 
 Do not stop or unregister the existing host runner until both slots have passed
 the full five-repository E2E concurrently three times and cancellation cleanup
