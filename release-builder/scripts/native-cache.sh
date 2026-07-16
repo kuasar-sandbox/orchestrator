@@ -120,14 +120,17 @@ tool_identity() {
 }
 
 package_identities() {
-    local package result
+    local rpm_packages=$1 dpkg_packages=$2 package result
+    local packages=()
     if command -v rpm >/dev/null 2>&1; then
-        for package in "$@"; do
+        read -r -a packages <<<"$rpm_packages"
+        for package in "${packages[@]}"; do
             result="$(rpm -q --qf '%{NAME}-%{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH}' "$package" 2>/dev/null || printf '%s-missing' "$package")"
             printf 'package\t%s\n' "$result"
         done
     elif command -v dpkg-query >/dev/null 2>&1; then
-        for package in "$@"; do
+        read -r -a packages <<<"$dpkg_packages"
+        for package in "${packages[@]}"; do
             result="$(dpkg-query -W -f='${Package}=${Version}:${Architecture}' "$package" 2>/dev/null || printf '%s-missing' "$package")"
             printf 'package\t%s\n' "$result"
         done
@@ -145,7 +148,7 @@ component_environment() {
             names+=(EROFS_TARBALL EROFS_TARBALL_SHA256 CROSS_PREFIX CFLAGS CXXFLAGS LDFLAGS)
             ;;
         envd)
-            names+=(ENVD_TARBALL ENVD_TARBALL_SHA256 ENVD_GOFLAGS GOTOOLCHAIN GOEXPERIMENT)
+            names+=(ENVD_TARBALL ENVD_TARBALL_SHA256 ENVD_GOFLAGS GOFLAGS GOTOOLCHAIN GOEXPERIMENT)
             ;;
         rocksdb)
             names+=(ROCKSDB_TARBALL ROCKSDB_TARBALL_SHA256 CROSS_PREFIX CFLAGS CXXFLAGS LDFLAGS)
@@ -159,22 +162,37 @@ component_environment() {
     done
 }
 
-component_toolchain() {
-    local component=$1 cc=gcc cxx=g++ ar=ar
+effective_cross_prefix() {
+    if [ -n "${CROSS_PREFIX+x}" ]; then
+        printf '%s' "$CROSS_PREFIX"
+        return
+    fi
     if [ "$TARGET_ARCH" != "$(uname -m)" ]; then
         case "$TARGET_ARCH" in
-            x86_64) cc=x86_64-linux-gnu-gcc; cxx=x86_64-linux-gnu-g++; ar=x86_64-linux-gnu-ar ;;
-            aarch64) cc=aarch64-linux-gnu-gcc; cxx=aarch64-linux-gnu-g++; ar=aarch64-linux-gnu-ar ;;
+            x86_64) printf 'x86_64-linux-gnu-' ;;
+            aarch64) printf 'aarch64-linux-gnu-' ;;
         esac
     fi
+}
+
+component_toolchain() {
+    local component=$1 cross_prefix cc cxx ar ld
+    cross_prefix="$(effective_cross_prefix)"
+    cc="${cross_prefix}gcc"
+    cxx="${cross_prefix}g++"
+    ar="${cross_prefix}ar"
+    ld="${cross_prefix}ld"
+    printf 'toolchain\tcross_prefix\t%q\n' "$cross_prefix"
     case "$component" in
         vmlinux)
             tool_identity cc "$cc" --version
-            tool_identity ld ld --version
+            tool_identity ld "$ld" --version
             tool_identity make make --version
             tool_identity pahole pahole --version
             tool_identity pkg-config pkg-config --version
-            package_identities gcc make binutils openssl-devel elfutils-libelf-devel dwarves ncurses-devel flex bison perl
+            package_identities \
+                'gcc make binutils openssl-devel elfutils-libelf-devel dwarves ncurses-devel flex bison perl' \
+                'gcc make binutils libssl-dev libelf-dev dwarves libncurses-dev flex bison perl'
             ;;
         erofs)
             tool_identity cc "$cc" --version
@@ -185,12 +203,14 @@ component_toolchain() {
             tool_identity automake automake --version
             tool_identity libtoolize libtoolize --version
             tool_identity pkg-config pkg-config --version
-            package_identities gcc gcc-c++ make autoconf automake libtool libuuid-devel glibc-static
+            package_identities \
+                'gcc gcc-c++ make autoconf automake libtool libuuid-devel glibc-static' \
+                'gcc g++ make autoconf automake libtool uuid-dev libc6-dev'
             ;;
         envd)
             tool_identity go go version
-            tool_identity go-env go env GOOS GOARCH GOVERSION GOEXPERIMENT CGO_ENABLED
-            package_identities golang
+            tool_identity go-env go env GOOS GOARCH GOVERSION GOEXPERIMENT GOFLAGS CGO_ENABLED
+            package_identities 'golang' 'golang-go'
             ;;
         rocksdb)
             tool_identity cc "$cc" --version
@@ -198,15 +218,15 @@ component_toolchain() {
             tool_identity ar "$ar" --version
             tool_identity cmake cmake --version
             tool_identity make make --version
-            package_identities gcc gcc-c++ cmake make glibc-devel
+            package_identities 'gcc gcc-c++ cmake make glibc-devel' 'gcc g++ cmake make libc6-dev'
             ;;
         cloud-hypervisor)
             tool_identity rustc rustc -vV
             tool_identity cargo cargo -Vv
             tool_identity cc "$cc" --version
-            tool_identity ld ld --version
+            tool_identity ld "$ld" --version
             tool_identity glibc ldd --version
-            package_identities rust cargo gcc binutils glibc-devel
+            package_identities 'rust cargo gcc binutils glibc-devel' 'rustc cargo gcc binutils libc6-dev'
             ;;
     esac
 }
@@ -283,15 +303,16 @@ assert_clean_source_tree() {
 }
 
 build_component() {
-    local component=$1
+    local component=$1 cross_prefix
+    cross_prefix="$(effective_cross_prefix)"
     assert_clean_source_tree "$component"
     remove_outputs "$component"
     case "$component" in
-        vmlinux) make -C "$WORKSPACE_ROOT/guest-runtime/native-deps" TARGET_ARCH="$TARGET_ARCH" vmlinux ;;
-        erofs) make -C "$WORKSPACE_ROOT/guest-runtime/native-deps" TARGET_ARCH="$TARGET_ARCH" erofs ;;
-        envd) make -C "$WORKSPACE_ROOT/guest-runtime/native-deps" TARGET_ARCH="$TARGET_ARCH" envd ;;
-        rocksdb) make -C "$WORKSPACE_ROOT/accelerator" TARGET_ARCH="$TARGET_ARCH" deps-rocksdb ;;
-        cloud-hypervisor) make -C "$WORKSPACE_ROOT/sandboxer/native-deps" TARGET_ARCH="$TARGET_ARCH" cloud-hypervisor ;;
+        vmlinux) make -C "$WORKSPACE_ROOT/guest-runtime/native-deps" TARGET_ARCH="$TARGET_ARCH" CROSS_PREFIX="$cross_prefix" vmlinux ;;
+        erofs) make -C "$WORKSPACE_ROOT/guest-runtime/native-deps" TARGET_ARCH="$TARGET_ARCH" CROSS_PREFIX="$cross_prefix" erofs ;;
+        envd) make -C "$WORKSPACE_ROOT/guest-runtime/native-deps" TARGET_ARCH="$TARGET_ARCH" CROSS_PREFIX="$cross_prefix" envd ;;
+        rocksdb) make -C "$WORKSPACE_ROOT/accelerator" TARGET_ARCH="$TARGET_ARCH" CROSS_PREFIX="$cross_prefix" deps-rocksdb ;;
+        cloud-hypervisor) make -C "$WORKSPACE_ROOT/sandboxer/native-deps" TARGET_ARCH="$TARGET_ARCH" CROSS_PREFIX="$cross_prefix" cloud-hypervisor ;;
     esac
     validate_outputs "$component"
 }

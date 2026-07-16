@@ -38,6 +38,7 @@ jobs:
       KUASAR_CI_TIMINGS: ${{ github.workspace }}/ci-metrics/timings.tsv
       KUASAR_NATIVE_CACHE_METRICS: ${{ github.workspace }}/ci-metrics/native-cache.tsv
       KUASAR_REVISION_MANIFEST: ${{ github.workspace }}/ci-metrics/revisions.tsv
+      KUASAR_SOURCE_CACHE_MAX_ENTRIES: "32"
 
     steps:
       - name: Reset interrupted E2E state
@@ -118,7 +119,7 @@ jobs:
             source_dir="/var/cache/kuasar/sources/$repo"
             archive="$source_dir/$resolved_sha.tar.gz"
             checksum="$archive.sha256"
-            lock="$source_dir/$resolved_sha.lock"
+            lock="$source_dir/.cache.lock"
             install -d -m 0755 "$source_dir"
             exec {source_lock_fd}>"$lock"
             flock "$source_lock_fd"
@@ -148,13 +149,21 @@ jobs:
               checksum_tmp=""
             fi
             archive_sha=$(sha256sum "$archive" | awk '{print $1}')
+            touch "$archive" "$checksum"
+            mkdir -p "src/$repo"
+            tar -xzf "$archive" --strip-components=1 -C "src/$repo"
             flock -u "$source_lock_fd"
             exec {source_lock_fd}>&-
             printf '%s\t%s\t%s\t%s\n' "$repo" "$resolved_sha" "$cache_status" "$archive_sha" \
               >> "$KUASAR_CI_DIR/source-cache.tsv"
-            mkdir -p "src/$repo"
-            tar -xzf "$archive" --strip-components=1 -C "src/$repo"
           done
+
+          while IFS=$'\t' read -r repository _ resolved_sha _; do
+            repo=${repository#kuasar-sandbox/}
+            source_dir="/var/cache/kuasar/sources/$repo"
+            src/orchestrator/release-builder/scripts/source-cache-prune.sh \
+              "$source_dir" "$source_dir/$resolved_sha.tar.gz"
+          done < <(tail -n +2 "$KUASAR_REVISION_MANIFEST")
 
           cd src
           go work init ./accelerator ./connector ./guest-runtime ./orchestrator ./sandboxer

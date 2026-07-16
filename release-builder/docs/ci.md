@@ -19,7 +19,9 @@ PR 测试把 `github.sha` 对应的候选 merge commit 与其余四仓解析后�
 
 精确 SHA 的源码归档缓存在 `/var/cache/kuasar/sources/<repo>/<sha>.tar.gz`,命中
 时同时校验 SHA256 和 tar 结构。BMS 仅在新 SHA 首次出现时访问 GitHub 下载源码;
-Linux 源码和容器镜像仍分别使用清华 TUNA 与 DaoCloud 国内镜像。
+每个仓库以单一 `flock` 串行发布和解包归档，并保留最近使用的 32 个 SHA，避免
+长驻 runner 的磁盘占用无界增长。Linux 源码和容器镜像仍分别使用清华 TUNA 与
+DaoCloud 国内镜像。
 
 ## Native artifacts
 
@@ -50,7 +52,8 @@ cache miss 只允许在 CI 新装配、尚无原生源码目录的 workspace 中
 make -C orchestrator/release-builder test-ci-tools
 ```
 
-它覆盖热命中、输入失效、损坏拒绝以及同 key 并发 miss 只构建一次。
+它覆盖热命中、环境/工具链输入失效、损坏拒绝、同 key 并发 miss 只构建一次和
+源码归档留存上限。
 
 ## Run artifacts
 

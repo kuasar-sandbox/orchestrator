@@ -23,6 +23,14 @@ setup_workspace() {
     printf 'build envd fixture\n' >"$root/guest-runtime/native-deps/deps/build-envd.sh"
 }
 
+setup_erofs_workspace() {
+    local root=$1
+    mkdir -p "$root/guest-runtime/native-deps/deps"
+    printf 'erofs target fixture\n' >"$root/guest-runtime/native-deps/Makefile"
+    printf 'common fixture\n' >"$root/guest-runtime/native-deps/deps/common.sh"
+    printf 'build erofs fixture\n' >"$root/guest-runtime/native-deps/deps/build-erofs.sh"
+}
+
 mkdir -p "$TMP/bin"
 cat >"$TMP/bin/make" <<'EOF'
 #!/usr/bin/env bash
@@ -48,6 +56,25 @@ chmod +x "$workdir/bin/$arch/envd"
 EOF
 chmod +x "$TMP/bin/make"
 
+cat >"$TMP/bin/go" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+case "${1:-}" in
+    version) printf 'go version go1.test linux/amd64\n' ;;
+    env)
+        shift
+        for name in "$@"; do
+            case "$name" in
+                GOFLAGS) printf '%s\n' "${GOFLAGS:-}" ;;
+                *) printf '%s=test\n' "$name" ;;
+            esac
+        done
+        ;;
+    *) exit 2 ;;
+esac
+EOF
+chmod +x "$TMP/bin/go"
+
 timings="$TMP/timings.tsv"
 KUASAR_CI_TIMINGS="$timings" "$SCRIPT_DIR/ci-timed.sh" fixture/timing bash -c 'sleep 0.01'
 [ "$(wc -l <"$timings")" -eq 2 ] || fail "timing file must contain one header and one row"
@@ -61,6 +88,30 @@ cache="$TMP/cache"
 counter="$TMP/build-counter"
 metrics="$TMP/cache-metrics.tsv"
 setup_workspace "$workspace"
+
+plain_key="$(env PATH="$TMP/bin:$PATH" KUASAR_WORKSPACE_ROOT="$workspace" \
+    "$SCRIPT_DIR/native-cache.sh" key envd | cut -f2)"
+tagged_key="$(env PATH="$TMP/bin:$PATH" GOFLAGS=-tags=ci KUASAR_WORKSPACE_ROOT="$workspace" \
+    "$SCRIPT_DIR/native-cache.sh" key envd | cut -f2)"
+[ "$plain_key" != "$tagged_key" ] || fail "effective GOFLAGS did not invalidate the envd key"
+
+cross_workspace="$TMP/cross-workspace"
+setup_erofs_workspace "$cross_workspace"
+for tool in gcc g++ ar ld; do
+    cat >"$TMP/bin/custom-$tool" <<EOF
+#!/usr/bin/env bash
+printf 'custom-$tool v1\\n'
+EOF
+    chmod +x "$TMP/bin/custom-$tool"
+done
+cross_key_v1="$(env PATH="$TMP/bin:$PATH" CROSS_PREFIX="$TMP/bin/custom-" \
+    KUASAR_WORKSPACE_ROOT="$cross_workspace" \
+    "$SCRIPT_DIR/native-cache.sh" key erofs | cut -f2)"
+printf '# toolchain update\n' >>"$TMP/bin/custom-gcc"
+cross_key_v2="$(env PATH="$TMP/bin:$PATH" CROSS_PREFIX="$TMP/bin/custom-" \
+    KUASAR_WORKSPACE_ROOT="$cross_workspace" \
+    "$SCRIPT_DIR/native-cache.sh" key erofs | cut -f2)"
+[ "$cross_key_v1" != "$cross_key_v2" ] || fail "custom cross compiler did not invalidate the key"
 
 env PATH="$TMP/bin:$PATH" FAKE_BUILD_COUNTER="$counter" \
     KUASAR_WORKSPACE_ROOT="$workspace" KUASAR_NATIVE_CACHE_ROOT="$cache" \
@@ -110,5 +161,23 @@ wait "$pid_b"
 [ "$(wc -l <"$concurrent_counter")" -eq 1 ] || fail "same-key concurrent misses built more than once"
 grep -q 'miss-built' "$TMP/a.log" "$TMP/b.log" || fail "concurrent miss was not recorded"
 grep -q 'hit-after-wait' "$TMP/a.log" "$TMP/b.log" || fail "concurrent waiter did not restore the published entry"
+
+source_cache="$TMP/source-cache"
+mkdir -p "$source_cache"
+for n in 1 2 3 4; do
+    printf 'archive-%s\n' "$n" >"$source_cache/$n.tar.gz"
+    printf 'checksum-%s\n' "$n" >"$source_cache/$n.tar.gz.sha256"
+    touch -d "2026-01-0$n 00:00:00 UTC" "$source_cache/$n.tar.gz" "$source_cache/$n.tar.gz.sha256"
+done
+touch "$source_cache/stale.lock"
+printf 'orphan\n' >"$source_cache/orphan.tar.gz.sha256"
+KUASAR_SOURCE_CACHE_MAX_ENTRIES=2 \
+    "$SCRIPT_DIR/source-cache-prune.sh" "$source_cache" "$source_cache/1.tar.gz"
+[ -f "$source_cache/1.tar.gz" ] || fail "source cache pruned the protected archive"
+[ -f "$source_cache/4.tar.gz" ] || fail "source cache pruned the newest archive"
+[ "$(find "$source_cache" -maxdepth 1 -type f -name '*.tar.gz' | wc -l)" -eq 2 ] \
+    || fail "source cache retention limit was not enforced"
+[ ! -e "$source_cache/stale.lock" ] || fail "legacy source cache lock was not pruned"
+[ ! -e "$source_cache/orphan.tar.gz.sha256" ] || fail "orphan source checksum was not pruned"
 
 echo "test-ci-tools: PASS"
