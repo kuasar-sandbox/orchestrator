@@ -196,9 +196,8 @@ trusted-host = pypi.tuna.tsinghua.edu.cn
 timeout = 60
 retries = 5
 EOF
-    cat >"$TEMPLATE_ROOT/etc/docker/daemon.json" <<'EOF'
+cat >"$TEMPLATE_ROOT/etc/docker/daemon.json" <<'EOF'
 {
-  "log-driver": "local",
   "storage-driver": "overlay2"
 }
 EOF
