@@ -32,7 +32,7 @@ PACKAGES=(
     ca-certificates curl libcurl libicu krb5-libs openssh-clients tzdata zlib
     git git-lfs rsync util-linux util-linux-devel iproute iptables nftables
     procps-ng which file hostname kmod iputils jq socat openssl sqlite
-    gcc gcc-c++ make cmake autoconf automake libtool pkgconf
+    gcc gcc-c++ libstdc++-static make cmake autoconf automake libtool pkgconf
     glibc-devel openssl-devel elfutils-libelf-devel ncurses-devel flex bison dwarves perl bc
     rust cargo rust-std-static clang llvm bpftool
     python3 python3-pip python3-devel python3-pyyaml
@@ -220,11 +220,14 @@ build_template_root() {
         dnf -y --installroot="$TEMPLATE_ROOT" --releasever=24.03 \
             --setopt=install_weak_deps=False --setopt=keepcache=False \
             install "${BOOTSTRAP_PACKAGES[@]}"
-        dnf -y --installroot="$TEMPLATE_ROOT" --releasever=24.03 \
-            --setopt=install_weak_deps=False --setopt=keepcache=False \
-            install "${PACKAGES[@]}"
-        touch "$TEMPLATE_ROOT/.kuasar-ci-template"
     fi
+
+    # Reconcile the complete package set on every install so additions to this
+    # manifest also reach existing templates without rebuilding their rootfs.
+    dnf -y --installroot="$TEMPLATE_ROOT" --releasever=24.03 \
+        --setopt=install_weak_deps=False --setopt=keepcache=False \
+        install "${PACKAGES[@]}"
+    touch "$TEMPLATE_ROOT/.kuasar-ci-template"
 
     install_static_libuuid
 
@@ -496,6 +499,9 @@ verify_slots() {
             systemctl is-active --quiet docker.service
             docker info >/dev/null
             test -s /usr/lib64/libuuid.a
+            libstdcpp=$(gcc -print-file-name=libstdc++.a)
+            test "$libstdcpp" != libstdc++.a
+            test -s "$libstdcpp"
             ip route get 223.5.5.5 >/dev/null
             curl --fail --silent --show-error --connect-timeout 5 --max-time 20 https://goproxy.cn >/dev/null
             mountpoint -q /sys/fs/bpf
