@@ -1,0 +1,12 @@
+[Unit]
+Description=Kuasar CI per-slot bpffs roots
+After=local-fs.target
+Before=systemd-nspawn@kuasar-ci-1.service systemd-nspawn@kuasar-ci-2.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/kuasar-ci-bpf
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

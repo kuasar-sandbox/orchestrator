@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+CONFIG=${KUASAR_CI_NETWORK_CONFIG:-/etc/kuasar-ci-network.conf}
+[ -r "$CONFIG" ] || { echo "missing $CONFIG" >&2; exit 1; }
+# shellcheck disable=SC1090
+source "$CONFIG"
+
+: "${BRIDGE:=kuasar-ci0}"
+: "${BRIDGE_ADDRESS:=10.203.0.1/24}"
+: "${SUBNET:=10.203.0.0/24}"
+: "${UPLINK_IFACE:=$(ip route show default | awk 'NR == 1 { print $5 }')}"
+BRIDGE_OWNER=kuasar-ci-bms-runner-v1
+
+bridge_owned() {
+    [ -d "/sys/class/net/$BRIDGE/bridge" ] \
+        && [ "$(cat "/sys/class/net/$BRIDGE/ifalias" 2>/dev/null || true)" = "$BRIDGE_OWNER" ]
+}
+
+ensure_rule() {
+    local table=$1 chain=$2
+    shift 2
+    if [ "$table" = filter ]; then
+        iptables -w 10 -C "$chain" "$@" 2>/dev/null \
+            || iptables -w 10 -I "$chain" 1 "$@"
+    else
+        iptables -w 10 -t "$table" -C "$chain" "$@" 2>/dev/null \
+            || iptables -w 10 -t "$table" -I "$chain" 1 "$@"
+    fi
+}
+
+delete_rule() {
+    local table=$1
+    shift
+    if [ "$table" = filter ]; then
+        while iptables -w 10 -C "$@" 2>/dev/null; do iptables -w 10 -D "$@"; done
+    else
+        while iptables -w 10 -t "$table" -C "$@" 2>/dev/null; do iptables -w 10 -t "$table" -D "$@"; done
+    fi
+}
+
+start_network() {
+    if ip link show "$BRIDGE" >/dev/null 2>&1; then
+        bridge_owned \
+            || { echo "refusing to manage unowned bridge $BRIDGE" >&2; return 1; }
+    else
+        ip link add name "$BRIDGE" type bridge
+        if ! ip link set dev "$BRIDGE" alias "$BRIDGE_OWNER"; then
+            ip link delete "$BRIDGE" type bridge
+            return 1
+        fi
+    fi
+    ip address replace "$BRIDGE_ADDRESS" dev "$BRIDGE"
+    ip link set "$BRIDGE" up
+    sysctl -q -w net.ipv4.ip_forward=1
+
+    ensure_rule nat POSTROUTING -s "$SUBNET" -o "$UPLINK_IFACE" \
+        -m comment --comment kuasar-ci-nspawn -j MASQUERADE
+    ensure_rule filter FORWARD -i "$BRIDGE" \
+        -m comment --comment kuasar-ci-nspawn -j ACCEPT
+    ensure_rule filter FORWARD -o "$BRIDGE" -m conntrack --ctstate RELATED,ESTABLISHED \
+        -m comment --comment kuasar-ci-nspawn -j ACCEPT
+}
+
+stop_network() {
+    if ip link show "$BRIDGE" >/dev/null 2>&1 && ! bridge_owned; then
+        echo "refusing to delete unowned bridge $BRIDGE" >&2
+        return 1
+    fi
+    delete_rule nat POSTROUTING -s "$SUBNET" -o "$UPLINK_IFACE" \
+        -m comment --comment kuasar-ci-nspawn -j MASQUERADE
+    delete_rule filter FORWARD -i "$BRIDGE" \
+        -m comment --comment kuasar-ci-nspawn -j ACCEPT
+    delete_rule filter FORWARD -o "$BRIDGE" -m conntrack --ctstate RELATED,ESTABLISHED \
+        -m comment --comment kuasar-ci-nspawn -j ACCEPT
+    if ip link show "$BRIDGE" >/dev/null 2>&1; then
+        ip link set "$BRIDGE" down
+        ip link delete "$BRIDGE" type bridge
+    fi
+}
+
+case "${1:-}" in
+    start|refresh) start_network ;;
+    stop) stop_network ;;
+    *) echo "usage: kuasar-ci-network start|refresh|stop" >&2; exit 2 ;;
+esac
