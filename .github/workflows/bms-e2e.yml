@@ -34,8 +34,30 @@ jobs:
       CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
       CARGO_NET_GIT_FETCH_WITH_CLI: "true"
       PIP_INDEX_URL: https://pypi.tuna.tsinghua.edu.cn/simple
+      KUASAR_CI_DIR: ${{ github.workspace }}/ci-metrics/${{ github.run_id }}-${{ github.run_attempt }}
+      KUASAR_CI_TIMINGS: ${{ github.workspace }}/ci-metrics/${{ github.run_id }}-${{ github.run_attempt }}/timings.tsv
+      KUASAR_NATIVE_CACHE_METRICS: ${{ github.workspace }}/ci-metrics/${{ github.run_id }}-${{ github.run_attempt }}/native-cache.tsv
+      KUASAR_REVISION_MANIFEST: ${{ github.workspace }}/ci-metrics/${{ github.run_id }}-${{ github.run_attempt }}/revisions.tsv
+      KUASAR_SOURCE_CACHE_MAX_ENTRIES: "32"
+      KUASAR_NATIVE_CACHE_MAX_ENTRIES: "4"
 
     steps:
+      - name: Initialize CI metadata
+        env:
+          CANDIDATE_REPOSITORY: ${{ github.repository }}
+          CANDIDATE_SHA: ${{ github.sha }}
+          CANDIDATE_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+
+          rm -rf "${KUASAR_CI_DIR%/*}"
+          mkdir -p "$KUASAR_CI_DIR"
+          printf 'event_name\tcandidate_repository\tcandidate_event_sha\tcandidate_head_sha\n' \
+            > "$KUASAR_CI_DIR/run.tsv"
+          printf '%s\t%s\t%s\t%s\n' \
+            "${{ github.event_name }}" "$CANDIDATE_REPOSITORY" "$CANDIDATE_SHA" "$CANDIDATE_HEAD_SHA" \
+            >> "$KUASAR_CI_DIR/run.tsv"
+
       - name: Reset interrupted E2E state
         run: |
           set -euo pipefail
@@ -72,29 +94,161 @@ jobs:
           GH_TOKEN: ${{ steps.source-token.outputs.token }}
           CANDIDATE_REPOSITORY: ${{ github.repository }}
           CANDIDATE_SHA: ${{ github.sha }}
+          CANDIDATE_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           set -euo pipefail
 
           repos=(accelerator connector guest-runtime orchestrator sandboxer)
+          archive_tmp=""
+          checksum_tmp=""
+          zip_tmp=""
+          zip_stage=""
+          trap 'rm -f "${archive_tmp:-}" "${checksum_tmp:-}" "${zip_tmp:-}"; rm -rf "${zip_stage:-}"' EXIT
+          started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          started_ns=$(date +%s%N)
+          printf 'repository\trequested_ref\tresolved_sha\trole\n' > "$KUASAR_REVISION_MANIFEST"
+          printf 'repository\tresolved_sha\tstatus\tsha256\n' > "$KUASAR_CI_DIR/source-cache.tsv"
           rm -rf src
-          for repo in "${repos[@]}"; do
-            ref=main
-            if [[ "kuasar-sandbox/$repo" == "$CANDIDATE_REPOSITORY" ]]; then
-              ref="$CANDIDATE_SHA"
-            fi
 
-            mkdir -p "src/$repo"
-            curl --fail --show-error --silent --location \
-              --retry 4 --retry-all-errors --connect-timeout 10 --max-time 120 \
-              -H "Accept: application/vnd.github+json" \
+          revision_query='
+          query {
+            accelerator: repository(owner: "kuasar-sandbox", name: "accelerator") {
+              ref(qualifiedName: "refs/heads/main") { target { oid } }
+            }
+            connector: repository(owner: "kuasar-sandbox", name: "connector") {
+              ref(qualifiedName: "refs/heads/main") { target { oid } }
+            }
+            guest_runtime: repository(owner: "kuasar-sandbox", name: "guest-runtime") {
+              ref(qualifiedName: "refs/heads/main") { target { oid } }
+            }
+            orchestrator: repository(owner: "kuasar-sandbox", name: "orchestrator") {
+              ref(qualifiedName: "refs/heads/main") { target { oid } }
+            }
+            sandboxer: repository(owner: "kuasar-sandbox", name: "sandboxer") {
+              ref(qualifiedName: "refs/heads/main") { target { oid } }
+            }
+          }'
+          revision_response=$(jq -cn --arg query "$revision_query" '{query: $query}' \
+            | curl --fail --show-error --silent \
+              --retry 4 --retry-all-errors --connect-timeout 10 --max-time 60 \
               -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Content-Type: application/json" \
               -H "X-GitHub-Api-Version: 2022-11-28" \
-              "https://api.github.com/repos/kuasar-sandbox/$repo/tarball/$ref" \
-              | tar -xz --strip-components=1 -C "src/$repo"
+              --data-binary @- https://api.github.com/graphql)
+          if ! jq -e '
+            .errors == null
+            and ([
+              .data.accelerator.ref.target.oid,
+              .data.connector.ref.target.oid,
+              .data.guest_runtime.ref.target.oid,
+              .data.orchestrator.ref.target.oid,
+              .data.sandboxer.ref.target.oid
+            ] | all(type == "string" and test("^[0-9a-f]{40}$")))
+          ' <<< "$revision_response" >/dev/null; then
+            echo "GitHub GraphQL did not return the complete five-repository revision set" >&2
+            jq -c '{errors, data}' <<< "$revision_response" >&2 || true
+            exit 1
+          fi
+
+          for repo in "${repos[@]}"; do
+            requested_ref=main
+            role=sibling
+            if [[ "kuasar-sandbox/$repo" == "$CANDIDATE_REPOSITORY" ]]; then
+              requested_ref="$CANDIDATE_SHA"
+              resolved_sha="$CANDIDATE_SHA"
+              role=candidate
+            else
+              revision_key=$repo
+              if [ "$repo" = guest-runtime ]; then
+                revision_key=guest_runtime
+              fi
+              resolved_sha=$(jq -r --arg key "$revision_key" \
+                '.data[$key].ref.target.oid // empty' <<< "$revision_response")
+            fi
+            [[ "$resolved_sha" =~ ^[0-9a-f]{40}$ ]]
+            printf 'kuasar-sandbox/%s\t%s\t%s\t%s\n' \
+              "$repo" "$requested_ref" "$resolved_sha" "$role" >> "$KUASAR_REVISION_MANIFEST"
+
+            source_dir="/var/cache/kuasar/sources/$repo"
+            archive="$source_dir/$resolved_sha.tar.gz"
+            checksum="$archive.sha256"
+            lock="$source_dir/.cache.lock"
+            install -d -m 0755 "$source_dir"
+            exec {source_lock_fd}>"$lock"
+            flock "$source_lock_fd"
+            cache_status=hit
+            if ! [ -s "$archive" ] || ! [ -s "$checksum" ] \
+              || ! (cd "$source_dir" && sha256sum --quiet -c "$(basename "$checksum")") \
+              || ! tar -tzf "$archive" >/dev/null; then
+              cache_status=miss
+              archive_tmp="$archive.$$.tmp"
+              checksum_tmp="$checksum.$$.tmp"
+              zip_tmp="$archive.$$.zip.tmp"
+              zip_stage="$source_dir/.zip-stage.$$"
+              rm -f "$archive_tmp" "$checksum_tmp" "$zip_tmp"
+              rm -rf "$zip_stage"
+              if ! curl --fail --show-error --silent --location \
+                --retry 4 --retry-all-errors --connect-timeout 10 --max-time 120 \
+                -H "Accept: application/vnd.github+json" \
+                -H "Authorization: Bearer $GH_TOKEN" \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                "https://api.github.com/repos/kuasar-sandbox/$repo/tarball/$resolved_sha" \
+                -o "$archive_tmp"; then
+                cache_status=miss-zip-fallback
+                rm -f "$archive_tmp"
+                curl --fail --show-error --silent --location \
+                  --retry 4 --retry-all-errors --connect-timeout 10 --max-time 120 \
+                  -H "Accept: application/vnd.github+json" \
+                  -H "Authorization: Bearer $GH_TOKEN" \
+                  -H "X-GitHub-Api-Version: 2022-11-28" \
+                  "https://api.github.com/repos/kuasar-sandbox/$repo/zipball/$resolved_sha" \
+                  -o "$zip_tmp"
+                install -d -m 0755 "$zip_stage"
+                unzip -q "$zip_tmp" -d "$zip_stage"
+                mapfile -d '' zip_roots < <(find "$zip_stage" -mindepth 1 -maxdepth 1 -print0)
+                [ "${#zip_roots[@]}" -eq 1 ] && [ -d "${zip_roots[0]}" ]
+                tar -czf "$archive_tmp" -C "$zip_stage" "$(basename "${zip_roots[0]}")"
+                rm -f "$zip_tmp"
+                rm -rf "$zip_stage"
+                zip_tmp=""
+                zip_stage=""
+              fi
+              tar -tzf "$archive_tmp" >/dev/null
+              archive_sha=$(sha256sum "$archive_tmp" | awk '{print $1}')
+              printf '%s  %s\n' "$archive_sha" "$(basename "$archive")" > "$checksum_tmp"
+              chmod a-w "$archive_tmp" "$checksum_tmp"
+              rm -f "$archive" "$checksum"
+              mv "$archive_tmp" "$archive"
+              mv "$checksum_tmp" "$checksum"
+              archive_tmp=""
+              checksum_tmp=""
+            fi
+            archive_sha=$(sha256sum "$archive" | awk '{print $1}')
+            touch "$archive" "$checksum"
+            mkdir -p "src/$repo"
+            tar -xzf "$archive" --strip-components=1 -C "src/$repo"
+            flock -u "$source_lock_fd"
+            exec {source_lock_fd}>&-
+            printf '%s\t%s\t%s\t%s\n' "$repo" "$resolved_sha" "$cache_status" "$archive_sha" \
+              >> "$KUASAR_CI_DIR/source-cache.tsv"
           done
+
+          while IFS=$'\t' read -r repository _ resolved_sha _; do
+            repo=${repository#kuasar-sandbox/}
+            source_dir="/var/cache/kuasar/sources/$repo"
+            src/orchestrator/release-builder/scripts/source-cache-prune.sh \
+              "$source_dir" "$source_dir/$resolved_sha.tar.gz"
+          done < <(tail -n +2 "$KUASAR_REVISION_MANIFEST")
 
           cd src
           go work init ./accelerator ./connector ./guest-runtime ./orchestrator ./sandboxer
+          cd ..
+          elapsed=$(awk -v start="$started_ns" -v end="$(date +%s%N)" \
+            'BEGIN { printf "%.3f", (end - start) / 1000000000 }')
+          printf 'stage\tstarted_at\telapsed_seconds\tuser_seconds\tsystem_seconds\tcpu_percent\tmax_rss_kb\tfs_input\tfs_output\texit_code\n' \
+            > "$KUASAR_CI_TIMINGS"
+          printf 'workflow/assemble\t%s\t%s\tunavailable\tunavailable\tunavailable\tunavailable\tunavailable\tunavailable\t0\n' \
+            "$started_at" "$elapsed" >> "$KUASAR_CI_TIMINGS"
 
       - name: Attach runner caches
         run: |
@@ -127,6 +281,19 @@ jobs:
           ln -sfn /var/lib/kuasar-ci/tools/zot "$tool_dir/zot"
           ln -sfn /var/lib/kuasar-ci/tools/versitygw "$tool_dir/versitygw"
 
+      - name: Restore or build verified native artifacts
+        working-directory: src/orchestrator/release-builder
+        run: scripts/native-cache.sh restore-or-build
+
       - name: Build and test the platform
         working-directory: src/orchestrator/release-builder
         run: make test-e2e
+
+      - name: Upload revision and timing metadata
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ci-metadata-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.KUASAR_CI_DIR }}
+          if-no-files-found: warn
+          retention-days: 30
