@@ -267,7 +267,7 @@ component_environment() {
             ;;
         rocksdb)
             names+=(
-                ROCKSDB_TARBALL ROCKSDB_TARBALL_SHA256 CROSS_PREFIX
+                ROCKSDB_TARBALL ROCKSDB_TARBALL_SHA256 ROCKSDB_SOURCE_SHA256 CROSS_PREFIX
                 CC CXX CFLAGS CXXFLAGS LDFLAGS
             )
             ;;
