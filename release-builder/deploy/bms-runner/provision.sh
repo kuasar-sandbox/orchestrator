@@ -146,7 +146,7 @@ build_template_root() {
         install -d -m 0755 "$TEMPLATE_ROOT"
         log "installing container packages from configured China mirrors"
         dnf -y --installroot="$TEMPLATE_ROOT" --releasever=24.03 \
-            --setopt=install_weak_deps=False --setopt=keepcache=True \
+            --setopt=install_weak_deps=False --setopt=keepcache=False \
             install "${PACKAGES[@]}"
         touch "$TEMPLATE_ROOT/.kuasar-ci-template"
     fi
