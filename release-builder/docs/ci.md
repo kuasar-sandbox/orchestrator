@@ -15,15 +15,16 @@ make -C src/orchestrator/release-builder test-e2e
 PR 测试把 `github.sha` 对应的候选 merge commit 与其余四仓解析后的 `main` SHA
 写入 `ci-metrics/revisions.tsv`,再按精确 SHA 装配源码。不要从 `src/*` 执行
 `git rev-parse`:GitHub tarball 不含 `.git`,该命令会向上找到 runner checkout 并
-报告无关 revision。
+报告无关 revision。五仓 `main` revision 通过一次 GitHub GraphQL 查询取得并整体
+校验，避免逐仓 REST 请求造成 revision set 部分成功。
 
 精确 SHA 的源码归档缓存在 `/var/cache/kuasar/sources/<repo>/<sha>.tar.gz`,命中
 时同时校验 SHA256 和 tar 结构。BMS 仅在新 SHA 首次出现时访问 GitHub 下载源码;
 每个仓库以单一 `flock` 串行发布和解包归档，并保留最近使用的 32 个 SHA，避免
 长驻 runner 的磁盘占用无界增长。GitHub tarball endpoint 持续失败时，workflow
 使用同一官方 API 的 zipball endpoint，并在本地转换为单根目录 tar cache；不会
-把私有仓库 token 交给第三方代理。Linux 源码和容器镜像仍分别使用清华 TUNA 与
-DaoCloud 国内镜像。
+把私有仓库 token 交给第三方代理。revision 查询及源码归档下载均只访问 GitHub
+官方 API。Linux 源码和容器镜像仍分别使用清华 TUNA 与 DaoCloud 国内镜像。
 
 ## Native artifacts
 

@@ -109,6 +109,47 @@ jobs:
           printf 'repository\trequested_ref\tresolved_sha\trole\n' > "$KUASAR_REVISION_MANIFEST"
           printf 'repository\tresolved_sha\tstatus\tsha256\n' > "$KUASAR_CI_DIR/source-cache.tsv"
           rm -rf src
+
+          revision_query='
+          query {
+            accelerator: repository(owner: "kuasar-sandbox", name: "accelerator") {
+              ref(qualifiedName: "refs/heads/main") { target { oid } }
+            }
+            connector: repository(owner: "kuasar-sandbox", name: "connector") {
+              ref(qualifiedName: "refs/heads/main") { target { oid } }
+            }
+            guest_runtime: repository(owner: "kuasar-sandbox", name: "guest-runtime") {
+              ref(qualifiedName: "refs/heads/main") { target { oid } }
+            }
+            orchestrator: repository(owner: "kuasar-sandbox", name: "orchestrator") {
+              ref(qualifiedName: "refs/heads/main") { target { oid } }
+            }
+            sandboxer: repository(owner: "kuasar-sandbox", name: "sandboxer") {
+              ref(qualifiedName: "refs/heads/main") { target { oid } }
+            }
+          }'
+          revision_response=$(jq -cn --arg query "$revision_query" '{query: $query}' \
+            | curl --fail --show-error --silent \
+              --retry 4 --retry-all-errors --connect-timeout 10 --max-time 60 \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Content-Type: application/json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              --data-binary @- https://api.github.com/graphql)
+          if ! jq -e '
+            .errors == null
+            and ([
+              .data.accelerator.ref.target.oid,
+              .data.connector.ref.target.oid,
+              .data.guest_runtime.ref.target.oid,
+              .data.orchestrator.ref.target.oid,
+              .data.sandboxer.ref.target.oid
+            ] | all(type == "string" and test("^[0-9a-f]{40}$")))
+          ' <<< "$revision_response" >/dev/null; then
+            echo "GitHub GraphQL did not return the complete five-repository revision set" >&2
+            jq -c '{errors, data}' <<< "$revision_response" >&2 || true
+            exit 1
+          fi
+
           for repo in "${repos[@]}"; do
             requested_ref=main
             role=sibling
@@ -117,13 +158,12 @@ jobs:
               resolved_sha="$CANDIDATE_SHA"
               role=candidate
             else
-              resolved_sha=$(curl --fail --show-error --silent \
-                --retry 4 --retry-all-errors --connect-timeout 10 --max-time 60 \
-                -H "Accept: application/vnd.github+json" \
-                -H "Authorization: Bearer $GH_TOKEN" \
-                -H "X-GitHub-Api-Version: 2022-11-28" \
-                "https://api.github.com/repos/kuasar-sandbox/$repo/commits/main" \
-                | python3 -c 'import json,sys; print(json.load(sys.stdin)["sha"])')
+              revision_key=$repo
+              if [ "$repo" = guest-runtime ]; then
+                revision_key=guest_runtime
+              fi
+              resolved_sha=$(jq -r --arg key "$revision_key" \
+                '.data[$key].ref.target.oid // empty' <<< "$revision_response")
             fi
             [[ "$resolved_sha" =~ ^[0-9a-f]{40}$ ]]
             printf 'kuasar-sandbox/%s\t%s\t%s\t%s\n' \
