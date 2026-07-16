@@ -86,13 +86,18 @@ while separate filesystems require 5 GiB and 10 GiB respectively.
 The provisioner makes a slot root visible only after writing a separate owner
 marker into a staging root. An incomplete owned root is rebuilt automatically
 on retry; a markerless or mismatched root is never modified or deleted.
-Completed owned roots are always reconciled in place.
+Owned staging roots left by interruption are removed before the free-space
+check; an unowned staging path is refused. Completed owned roots are always
+reconciled in place. Mutating provision commands are serialized by a host lock.
 
 The existing runner distribution is copied without credentials, logs, or its
 large work directory. Runner self-update is disabled so containers do not
 download a large international release unexpectedly; update the host
 distribution and rerun installation deliberately when GitHub's runner support
-window requires it. The legacy host runner service must be stopped before an
+window requires it. Synchronization deletes files removed from the new runner
+distribution while preserving only the explicitly excluded credentials,
+diagnostics, work directory, environment, path, and registration marker. The
+legacy host runner service must be stopped before an
 install. Existing container slots must also be stopped while their package
 sets and runner files are reconciled.
 
@@ -115,6 +120,11 @@ gh api --method POST /orgs/kuasar-sandbox/actions/runners/registration-token \
   --jq .token | ssh bms.tmp '/usr/local/sbin/kuasar-ci-runner-provision register 2'
 ```
 
+A registration completion marker is written only after runner configuration,
+the fixed PATH, and service enablement all succeed. Supplying a fresh token
+retries any markerless partial registration through the runner's `--replace`
+flow; a completed registration is left unchanged.
+
 Both runners join the existing `kuasar-e2e` organization group with labels
 `kuasar-e2e,kvm,cgroup-v2` plus a slot label. The group must remain
 organization-wide (`visibility=all`) with no selected-repository or workflow
@@ -134,11 +144,13 @@ container stop makes the command fail instead of leaving a slot running:
 ssh bms.tmp '/usr/local/sbin/kuasar-ci-runner-provision stop'
 ```
 
-`verify` checks PID1/systemd, cgroup v2, KVM/TUN/vhost access, private mount and
-network namespaces, distinct host cgroups, nested Docker, private bpffs/netns,
-the static `libuuid` build dependency, outbound access through the China-side
-proxy path, and active runner services. It is not an E2E wrapper. Repository
-workflows still execute `make test-e2e` directly.
+`start` and `verify` require the current container boot to report the runner's
+`Listening for Jobs` state, rather than treating an active retrying service as
+online. `verify` also checks PID1/systemd, cgroup v2, KVM/TUN/vhost access,
+private mount and network namespaces, distinct host cgroups, nested Docker,
+private bpffs/netns, the static `libuuid` build dependency, outbound access
+through the China-side proxy path, and active runner services. It is not an E2E
+wrapper. Repository workflows still execute `make test-e2e` directly.
 
 Do not stop or unregister the existing host runner until both slots have passed
 the full five-repository E2E concurrently three times and cancellation cleanup

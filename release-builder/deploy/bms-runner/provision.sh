@@ -29,6 +29,8 @@ UTIL_LINUX_TARBALL_SHA256=${KUASAR_UTIL_LINUX_TARBALL_SHA256:-890ae8ff810247bd19
 LIBUUID_BUILD_SCHEMA=util-linux-static-v1
 SLOT_OWNER_MARKER=.kuasar-ci-slot-owner
 SLOT_OWNER_ID=kuasar-ci-bms-runner-v1
+RUNNER_REGISTRATION_MARKER=.kuasar-ci-registration-complete
+PROVISION_LOCK=/run/lock/kuasar-ci-runner-provision.lock
 
 SLOT1_CPUS=${KUASAR_SLOT1_CPUS:-0-21,44-65}
 SLOT2_CPUS=${KUASAR_SLOT2_CPUS:-22-43,66-87}
@@ -70,6 +72,12 @@ require_root() {
     [ "$(id -u)" -eq 0 ] || die "must run as root"
 }
 
+acquire_provision_lock() {
+    install -d -m 0755 "${PROVISION_LOCK%/*}"
+    exec 9>"$PROVISION_LOCK"
+    flock -n 9 || die "another runner provisioning command is active"
+}
+
 machine_name() {
     printf 'kuasar-ci-%s' "$1"
 }
@@ -92,6 +100,31 @@ assert_slot_root_owned() {
         || die "refusing to manage unowned slot root $root"
 }
 
+runner_registration_complete() {
+    local root=$1 runner="$1/opt/actions-runner"
+    [ -f "$runner/$RUNNER_REGISTRATION_MARKER" ] \
+        && [ -s "$runner/.runner" ] \
+        && [ -s "$runner/.path" ] \
+        && systemctl --root="$root" is-enabled --quiet actions-runner.service
+}
+
+cleanup_stale_slot_staging() {
+    local slot machine staging stale=()
+    [ -d "$MACHINE_ROOT" ] || return
+    for slot in 1 2; do
+        machine="$(machine_name "$slot")"
+        shopt -s nullglob
+        stale=("$MACHINE_ROOT/.${machine}.install."*)
+        shopt -u nullglob
+        for staging in "${stale[@]}"; do
+            slot_root_owned "$staging" \
+                || die "refusing to remove unowned staging root $staging"
+            log "removing interrupted staging root $staging"
+            rm -rf "$staging"
+        done
+    done
+}
+
 assert_distinct_slot_machine_ids() {
     local id1 id2
     id1="$(cat "$(slot_root 1)/etc/machine-id" 2>/dev/null || true)"
@@ -107,6 +140,14 @@ slot_value() {
     printf '%s' "${!variable}"
 }
 
+load_required_modules() {
+    local module
+    command -v modprobe >/dev/null || die "modprobe is required"
+    for module in bridge overlay tun vhost_net vhost_vsock; do
+        modprobe "$module" || die "failed to load required module $module"
+    done
+}
+
 assert_supported_host() {
     # shellcheck disable=SC1091
     source /etc/os-release
@@ -114,8 +155,10 @@ assert_supported_host() {
     [ "${VERSION_ID:-}" = 24.03 ] || die "expected openEuler 24.03, found ${VERSION_ID:-unknown}"
     [ "$(uname -m)" = x86_64 ] || die "this runner layout and pinned tools require x86_64"
     [ "$(stat -fc %T /sys/fs/cgroup)" = cgroup2fs ] || die "host must use cgroup v2"
-    [ -c /dev/kvm ] && [ -c /dev/net/tun ] && [ -c /dev/vhost-vsock ] \
-        || die "KVM/TUN/vhost-vsock devices are required"
+    load_required_modules
+    [ -c /dev/kvm ] && [ -c /dev/net/tun ] \
+        && [ -c /dev/vhost-net ] && [ -c /dev/vhost-vsock ] \
+        || die "KVM/TUN/vhost-net/vhost-vsock devices are required"
 }
 
 assert_china_repositories() {
@@ -353,11 +396,7 @@ vhost_net
 vhost_vsock
 EOF
     systemctl daemon-reload
-    modprobe bridge
-    modprobe overlay
-    modprobe tun
-    modprobe vhost_net
-    modprobe vhost_vsock
+    load_required_modules
     systemctl enable --now kuasar-ci-network.service kuasar-ci-bpf.service
 }
 
@@ -365,11 +404,12 @@ copy_runner_distribution() {
     local destination=$1
     [ -x "$RUNNER_SOURCE/config.sh" ] || die "runner distribution not found at $RUNNER_SOURCE"
     install -d -m 0755 "$destination"
-    rsync -a \
+    rsync -a --delete --delete-delay \
         --exclude '/_diag/' --exclude '/_work/' \
         --exclude '/.credentials' --exclude '/.credentials_rsaparams' \
         --exclude '/.runner' --exclude '/.runner_migrated' --exclude '/.service' \
         --exclude '/.env' --exclude '/.path' \
+        --exclude "/$RUNNER_REGISTRATION_MARKER" \
         "$RUNNER_SOURCE/" "$destination/"
 }
 
@@ -546,6 +586,7 @@ prepare_slot() {
             rm -rf "$staging"
             die "failed to copy rootfs for $machine"
         fi
+        printf '%s\n' "$SLOT_OWNER_ID" >"$staging/$SLOT_OWNER_MARKER"
         if ! mv -T -- "$staging" "$root"; then
             rm -rf "$staging"
             die "failed to install owned slot root $root"
@@ -606,11 +647,13 @@ EOF
 
 install_slots() {
     require_root
+    acquire_provision_lock
     assert_supported_host
     assert_china_repositories
     assert_host_runner_idle
     assert_slots_stopped
     assert_e2e_tools
+    cleanup_stale_slot_staging
     assert_install_space
     install_host_support
     build_template_root
@@ -623,50 +666,60 @@ install_slots() {
 
 register_slot() {
     require_root
-    local slot=${1:-} token machine root
+    acquire_provision_lock
+    local slot=${1:-} token machine root runner
     case "$slot" in 1|2) ;; *) die "register requires slot 1 or 2" ;; esac
     IFS= read -r token
     [ -n "$token" ] || die "registration token must be provided on stdin"
     machine="$(machine_name "$slot")"
     root="$(slot_root "$slot")"
+    runner="$root/opt/actions-runner"
     assert_slot_root_owned "$slot"
     [ -f "$root/.kuasar-ci-slot" ] || die "slot $slot is not installed"
     systemctl is-active --quiet "systemd-nspawn@$machine.service" \
         && die "$machine must be stopped before registration"
-    [ ! -f "$root/opt/actions-runner/.runner" ] || die "$machine is already registered"
+    runner_registration_complete "$root" && die "$machine is already registered"
 
-    rm -f "$root/opt/actions-runner/.credentials" \
-        "$root/opt/actions-runner/.credentials_rsaparams" \
-        "$root/opt/actions-runner/.runner" \
-        "$root/opt/actions-runner/.runner_migrated" \
-        "$root/opt/actions-runner/.service"
+    rm -f "$runner/.credentials" \
+        "$runner/.credentials_rsaparams" \
+        "$runner/.runner" \
+        "$runner/.runner_migrated" \
+        "$runner/.service" \
+        "$runner/.path" \
+        "$runner/$RUNNER_REGISTRATION_MARKER"
     printf '%s\n' "$token" \
         | RUNNER_ALLOW_RUNASROOT=1 systemd-nspawn --quiet --pipe --settings=no --register=no \
             --directory="$root" --setenv=RUNNER_ALLOW_RUNASROOT=1 \
             /bin/bash -ceu '
+                cd /opt/actions-runner
                 IFS= read -r token
                 [ -n "$token" ]
                 export ACTIONS_RUNNER_INPUT_TOKEN="$token"
                 unset token
-                exec /opt/actions-runner/config.sh --unattended --replace --disableupdate \
+                exec ./config.sh --unattended --replace --disableupdate \
                     --url "$1" --name "$2" --runnergroup "$3" \
                     --labels "$4" --work _work
             ' register-runner "https://github.com/$ORG" "bms-tmp-kuasar-e2e-$slot" \
             "$RUNNER_GROUP" "kuasar-e2e,kvm,cgroup-v2,bms-slot-$slot"
+    [ -s "$runner/.runner" ] || die "$machine registration did not produce runner metadata"
     printf '/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin\n' \
-        >"$root/opt/actions-runner/.path"
+        >"$runner/.path"
     systemctl --root="$root" enable actions-runner.service >/dev/null
+    touch "$runner/$RUNNER_REGISTRATION_MARKER"
+    runner_registration_complete "$root" \
+        || die "$machine registration did not complete"
     log "$machine registered"
 }
 
 start_slots() {
     require_root
+    acquire_provision_lock
     local slot machine root
     for slot in 1 2; do
         machine="$(machine_name "$slot")"
         root="$(slot_root "$slot")"
         assert_slot_root_owned "$slot"
-        [ -f "$root/opt/actions-runner/.runner" ] || die "$machine is not registered"
+        runner_registration_complete "$root" || die "$machine registration is incomplete"
     done
     assert_distinct_slot_machine_ids
 
@@ -681,7 +734,11 @@ start_slots() {
 
 stop_slots() {
     require_root
+    acquire_provision_lock
     local slot machine unit
+    for slot in 1 2; do
+        assert_slot_root_owned "$slot"
+    done
     for slot in 1 2; do
         machine="$(machine_name "$slot")"
         unit="systemd-nspawn@$machine.service"
@@ -710,6 +767,8 @@ wait_slot_ready() {
                 systemctl is-active --quiet systemd-networkd.service
                 systemctl is-active --quiet docker.service
                 systemctl is-active --quiet actions-runner.service
+                journalctl -b -u actions-runner.service --no-pager -o cat \
+                    | grep -Fq "Listening for Jobs"
                 ip route get 223.5.5.5 >/dev/null
             ' >/dev/null 2>&1; then
             return
@@ -725,6 +784,8 @@ verify_slots() {
     for slot in 1 2; do
         machine="$(machine_name "$slot")"
         assert_slot_root_owned "$slot"
+        runner_registration_complete "$(slot_root "$slot")" \
+            || die "$machine registration is incomplete"
         wait_slot_ready "$slot"
         [ "$(machinectl show "$machine" -p State --value)" = running ] || die "$machine is not running"
         run_in_slot "$slot" /bin/bash -ceu '
@@ -732,6 +793,7 @@ verify_slots() {
             [ "$(stat -fc %T /sys/fs/cgroup)" = cgroup2fs ]
             test -r /dev/kvm -a -w /dev/kvm
             test -r /dev/net/tun -a -w /dev/net/tun
+            test -r /dev/vhost-net -a -w /dev/vhost-net
             test -r /dev/vhost-vsock -a -w /dev/vhost-vsock
             systemctl is-active --quiet docker.service
             docker info >/dev/null
