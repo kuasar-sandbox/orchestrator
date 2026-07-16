@@ -139,6 +139,79 @@ package_identities() {
     fi
 }
 
+file_identity() {
+    local label=$1 path=$2 resolved hash=missing
+    if [ -f "$path" ]; then
+        resolved="$(readlink -f "$path")"
+        hash="$(sha256sum "$resolved" | awk '{print $1}')"
+        printf 'file-identity\t%s\t%q\t%s\n' "$label" "$resolved" "$hash"
+    else
+        printf 'file-identity\t%s\t%q\tmissing\n' "$label" "$path"
+    fi
+}
+
+pkg_config_module_identity() {
+    local module=$1 pkg_config=${PKG_CONFIG:-pkg-config}
+    local pc_path metadata metadata_hash pc_hash=missing libdir libs token name dir candidate
+    if ! command -v "$pkg_config" >/dev/null 2>&1 \
+        || ! "$pkg_config" --exists "$module" 2>/dev/null; then
+        printf 'pkg-config-module\t%s\tmissing\n' "$module"
+        return
+    fi
+
+    pc_path="$("$pkg_config" --path "$module" 2>/dev/null || true)"
+    metadata="$({
+        "$pkg_config" --modversion "$module"
+        "$pkg_config" --cflags "$module"
+        "$pkg_config" --libs "$module"
+        "$pkg_config" --libs --static "$module"
+    } 2>&1 || true)"
+    metadata_hash="$(printf '%s' "$metadata" | sha256sum | awk '{print $1}')"
+    if [ -f "$pc_path" ]; then
+        pc_hash="$(sha256sum "$pc_path" | awk '{print $1}')"
+    fi
+    printf 'pkg-config-module\t%s\t%q\t%s\t%s\n' \
+        "$module" "$pc_path" "$pc_hash" "$metadata_hash"
+
+    local search_dirs=() library_names=() absolute_libraries=()
+    libdir="$("$pkg_config" --variable=libdir "$module" 2>/dev/null || true)"
+    [ -z "$libdir" ] || search_dirs+=("$libdir")
+    libs="$("$pkg_config" --libs --static "$module" 2>/dev/null || true)"
+    read -r -a tokens <<<"$libs"
+    for token in "${tokens[@]}"; do
+        case "$token" in
+            -L*) search_dirs+=("${token#-L}") ;;
+            -l:*) library_names+=("${token#-l:}") ;;
+            -l*) library_names+=("lib${token#-l}") ;;
+            /*.a|/*.so|/*.so.*) absolute_libraries+=("$token") ;;
+        esac
+    done
+
+    declare -A seen=()
+    for candidate in "${absolute_libraries[@]}"; do
+        [ -z "${seen[$candidate]+x}" ] || continue
+        seen[$candidate]=1
+        file_identity "pkg-config:$module:library" "$candidate"
+    done
+    for name in "${library_names[@]}"; do
+        for dir in "${search_dirs[@]}"; do
+            for candidate in "$dir/$name" "$dir/$name.a" "$dir/$name.so"; do
+                [ -f "$candidate" ] || continue
+                [ -z "${seen[$candidate]+x}" ] || continue
+                seen[$candidate]=1
+                file_identity "pkg-config:$module:library" "$candidate"
+            done
+        done
+    done
+}
+
+cargo_config_identities() {
+    local cargo_home=${CARGO_HOME:-${HOME:-}/.cargo}
+    printf 'cargo-home\t%q\n' "$cargo_home"
+    file_identity cargo-config "$cargo_home/config"
+    file_identity cargo-config-toml "$cargo_home/config.toml"
+}
+
 component_environment() {
     local component=$1 name
     local names=(SOURCE_DATE_EPOCH)
@@ -149,19 +222,31 @@ component_environment() {
                 LOCALVERSION KBUILD_BUILD_TIMESTAMP KBUILD_BUILD_USER KBUILD_BUILD_HOST
                 KBUILD_BUILD_VERSION KBUILD_BUILD_SALT KCFLAGS KAFLAGS KCPPFLAGS
                 HOSTCFLAGS HOSTCXXFLAGS HOSTLDFLAGS LDFLAGS_vmlinux
+                PKG_CONFIG PKG_CONFIG_PATH PKG_CONFIG_LIBDIR PKG_CONFIG_SYSROOT_DIR
             )
             ;;
         erofs)
-            names+=(EROFS_TARBALL EROFS_TARBALL_SHA256 CROSS_PREFIX CFLAGS CXXFLAGS LDFLAGS)
+            names+=(
+                EROFS_TARBALL EROFS_TARBALL_SHA256 CROSS_PREFIX CFLAGS CXXFLAGS LDFLAGS
+                PKG_CONFIG PKG_CONFIG_PATH PKG_CONFIG_LIBDIR PKG_CONFIG_SYSROOT_DIR
+            )
             ;;
         envd)
-            names+=(ENVD_TARBALL ENVD_TARBALL_SHA256 ENVD_GOFLAGS GOFLAGS GOTOOLCHAIN GOEXPERIMENT)
+            names+=(
+                ENVD_TARBALL ENVD_TARBALL_SHA256 ENVD_GOFLAGS GOFLAGS GOTOOLCHAIN
+                GOEXPERIMENT GOAMD64 GOARM64
+            )
             ;;
         rocksdb)
             names+=(ROCKSDB_TARBALL ROCKSDB_TARBALL_SHA256 CROSS_PREFIX CFLAGS CXXFLAGS LDFLAGS)
             ;;
         cloud-hypervisor)
-            names+=(CLOUD_HYPERVISOR_TARBALL CLOUD_HYPERVISOR_TARBALL_SHA256 CH_BASE_TAG CROSS_PREFIX RUST_TARGET RUSTFLAGS RUSTDOCFLAGS CARGO_INCREMENTAL CARGO_BUILD_RUSTC_WRAPPER)
+            names+=(
+                CLOUD_HYPERVISOR_TARBALL CLOUD_HYPERVISOR_TARBALL_SHA256 CH_BASE_TAG
+                CROSS_PREFIX RUST_TARGET RUSTFLAGS CARGO_ENCODED_RUSTFLAGS RUSTDOCFLAGS
+                RUSTC_WRAPPER RUSTC_WORKSPACE_WRAPPER CARGO_HOME CARGO_INCREMENTAL
+                CARGO_BUILD_RUSTC_WRAPPER CARGO_BUILD_TARGET
+            )
             ;;
     esac
     for name in "${names[@]}"; do
@@ -183,12 +268,13 @@ effective_cross_prefix() {
 }
 
 component_toolchain() {
-    local component=$1 cross_prefix cc cxx ar ld
+    local component=$1 cross_prefix cc cxx ar ld pkg_config
     cross_prefix="$(effective_cross_prefix)"
     cc="${cross_prefix}gcc"
     cxx="${cross_prefix}g++"
     ar="${cross_prefix}ar"
     ld="${cross_prefix}ld"
+    pkg_config=${PKG_CONFIG:-pkg-config}
     printf 'toolchain\tcross_prefix\t%q\n' "$cross_prefix"
     case "$component" in
         vmlinux)
@@ -196,10 +282,13 @@ component_toolchain() {
             tool_identity ld "$ld" --version
             tool_identity make make --version
             tool_identity pahole pahole --version
-            tool_identity pkg-config pkg-config --version
+            tool_identity pkg-config "$pkg_config" --version
             package_identities \
                 'gcc make binutils openssl-devel elfutils-libelf-devel dwarves ncurses-devel flex bison perl' \
                 'gcc make binutils libssl-dev libelf-dev dwarves libncurses-dev flex bison perl'
+            pkg_config_module_identity libelf
+            pkg_config_module_identity libssl
+            pkg_config_module_identity openssl
             ;;
         erofs)
             tool_identity cc "$cc" --version
@@ -209,14 +298,15 @@ component_toolchain() {
             tool_identity autoconf autoconf --version
             tool_identity automake automake --version
             tool_identity libtoolize libtoolize --version
-            tool_identity pkg-config pkg-config --version
+            tool_identity pkg-config "$pkg_config" --version
             package_identities \
                 'gcc gcc-c++ make autoconf automake libtool libuuid-devel glibc-static' \
                 'gcc g++ make autoconf automake libtool uuid-dev libc6-dev'
+            pkg_config_module_identity uuid
             ;;
         envd)
             tool_identity go go version
-            tool_identity go-env go env GOOS GOARCH GOVERSION GOEXPERIMENT GOFLAGS CGO_ENABLED
+            tool_identity go-env go env GOOS GOARCH GOVERSION GOEXPERIMENT GOFLAGS GOAMD64 GOARM64 CGO_ENABLED
             package_identities 'golang' 'golang-go'
             ;;
         rocksdb)
@@ -234,6 +324,7 @@ component_toolchain() {
             tool_identity ld "$ld" --version
             tool_identity glibc ldd --version
             package_identities 'rust cargo gcc binutils glibc-devel' 'rustc cargo gcc binutils libc6-dev'
+            cargo_config_identities
             ;;
     esac
 }

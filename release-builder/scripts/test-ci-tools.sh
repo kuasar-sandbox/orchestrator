@@ -42,6 +42,16 @@ setup_vmlinux_workspace() {
     printf 'patch fixture\n' >"$root/guest-runtime/native-deps/deps/linux-patches/test.patch"
 }
 
+setup_cloud_hypervisor_workspace() {
+    local root=$1
+    mkdir -p "$root/sandboxer/native-deps/deps/ch-patches"
+    printf 'cloud-hypervisor target fixture\n' >"$root/sandboxer/native-deps/Makefile"
+    printf 'common fixture\n' >"$root/sandboxer/native-deps/deps/common.sh"
+    printf 'build cloud-hypervisor fixture\n' \
+        >"$root/sandboxer/native-deps/deps/build-cloud-hypervisor.sh"
+    printf 'patch fixture\n' >"$root/sandboxer/native-deps/deps/ch-patches/test.patch"
+}
+
 mkdir -p "$TMP/bin"
 cat >"$TMP/bin/make" <<'EOF'
 #!/usr/bin/env bash
@@ -77,6 +87,8 @@ case "${1:-}" in
         for name in "$@"; do
             case "$name" in
                 GOFLAGS) printf '%s\n' "${GOFLAGS:-}" ;;
+                GOAMD64) printf '%s\n' "${GOAMD64:-v1}" ;;
+                GOARM64) printf '%s\n' "${GOARM64:-v8.0}" ;;
                 *) printf '%s=test\n' "$name" ;;
             esac
         done
@@ -105,6 +117,9 @@ plain_key="$(env PATH="$TMP/bin:$PATH" KUASAR_WORKSPACE_ROOT="$workspace" \
 tagged_key="$(env PATH="$TMP/bin:$PATH" GOFLAGS=-tags=ci KUASAR_WORKSPACE_ROOT="$workspace" \
     "$SCRIPT_DIR/native-cache.sh" key envd | cut -f2)"
 [ "$plain_key" != "$tagged_key" ] || fail "effective GOFLAGS did not invalidate the envd key"
+microarch_key="$(env PATH="$TMP/bin:$PATH" GOAMD64=v3 KUASAR_WORKSPACE_ROOT="$workspace" \
+    "$SCRIPT_DIR/native-cache.sh" key envd | cut -f2)"
+[ "$plain_key" != "$microarch_key" ] || fail "GOAMD64 did not invalidate the envd key"
 
 cross_workspace="$TMP/cross-workspace"
 setup_erofs_workspace "$cross_workspace"
@@ -124,6 +139,39 @@ cross_key_v2="$(env PATH="$TMP/bin:$PATH" CROSS_PREFIX="$TMP/bin/custom-" \
     "$SCRIPT_DIR/native-cache.sh" key erofs | cut -f2)"
 [ "$cross_key_v1" != "$cross_key_v2" ] || fail "custom cross compiler did not invalidate the key"
 
+pkg_workspace="$TMP/pkg-workspace"
+pkg_fixture="$TMP/pkg-fixture"
+pkg_bin="$TMP/pkg-bin"
+setup_erofs_workspace "$pkg_workspace"
+mkdir -p "$pkg_fixture/lib" "$pkg_bin"
+printf 'Name: uuid fixture\nVersion: 1\n' >"$pkg_fixture/uuid.pc"
+printf 'static uuid v1\n' >"$pkg_fixture/lib/libuuid.a"
+cat >"$pkg_bin/pkg-config" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+: "${PKG_CONFIG_FIXTURE:?}"
+case "${1:-}" in
+    --version) printf 'pkg-config fixture 1\n' ;;
+    --exists) exit 0 ;;
+    --path) printf '%s/uuid.pc\n' "$PKG_CONFIG_FIXTURE" ;;
+    --modversion) printf '1\n' ;;
+    --cflags) printf '%s\n' "-I$PKG_CONFIG_FIXTURE/include" ;;
+    --libs) printf '%s\n' "-L$PKG_CONFIG_FIXTURE/lib -luuid" ;;
+    --variable=libdir) printf '%s/lib\n' "$PKG_CONFIG_FIXTURE" ;;
+    *) exit 2 ;;
+esac
+EOF
+chmod +x "$pkg_bin/pkg-config"
+pkg_key_v1="$(env PATH="$TMP/bin:$PATH" PKG_CONFIG="$pkg_bin/pkg-config" \
+    PKG_CONFIG_FIXTURE="$pkg_fixture" KUASAR_WORKSPACE_ROOT="$pkg_workspace" \
+    "$SCRIPT_DIR/native-cache.sh" key erofs | cut -f2)"
+printf 'static uuid v2\n' >"$pkg_fixture/lib/libuuid.a"
+pkg_key_v2="$(env PATH="$TMP/bin:$PATH" PKG_CONFIG="$pkg_bin/pkg-config" \
+    PKG_CONFIG_FIXTURE="$pkg_fixture" KUASAR_WORKSPACE_ROOT="$pkg_workspace" \
+    "$SCRIPT_DIR/native-cache.sh" key erofs | cut -f2)"
+[ "$pkg_key_v1" != "$pkg_key_v2" ] \
+    || fail "pkg-config selected library did not invalidate the erofs key"
+
 vmlinux_workspace="$TMP/vmlinux-workspace"
 setup_vmlinux_workspace "$vmlinux_workspace"
 vmlinux_key_plain="$(env PATH="$TMP/bin:$PATH" KUASAR_WORKSPACE_ROOT="$vmlinux_workspace" \
@@ -133,6 +181,27 @@ vmlinux_key_versioned="$(env PATH="$TMP/bin:$PATH" LOCALVERSION=-ci KBUILD_BUILD
     "$SCRIPT_DIR/native-cache.sh" key vmlinux | cut -f2)"
 [ "$vmlinux_key_plain" != "$vmlinux_key_versioned" ] \
     || fail "Kbuild overrides did not invalidate the vmlinux key"
+
+cloud_workspace="$TMP/cloud-workspace"
+cargo_home="$TMP/cargo-home"
+setup_cloud_hypervisor_workspace "$cloud_workspace"
+mkdir -p "$cargo_home"
+printf '[build]\nrustflags = ["-Cdebuginfo=0"]\n' >"$cargo_home/config.toml"
+cloud_key_plain="$(env PATH="$TMP/bin:$PATH" CARGO_HOME="$cargo_home" \
+    KUASAR_WORKSPACE_ROOT="$cloud_workspace" \
+    "$SCRIPT_DIR/native-cache.sh" key cloud-hypervisor | cut -f2)"
+cloud_key_encoded="$(env PATH="$TMP/bin:$PATH" CARGO_HOME="$cargo_home" \
+    CARGO_ENCODED_RUSTFLAGS=-Ctarget-cpu=x86-64-v3 \
+    KUASAR_WORKSPACE_ROOT="$cloud_workspace" \
+    "$SCRIPT_DIR/native-cache.sh" key cloud-hypervisor | cut -f2)"
+[ "$cloud_key_plain" != "$cloud_key_encoded" ] \
+    || fail "CARGO_ENCODED_RUSTFLAGS did not invalidate the Cloud Hypervisor key"
+printf '[build]\nrustflags = ["-Cdebuginfo=1"]\n' >"$cargo_home/config.toml"
+cloud_key_config="$(env PATH="$TMP/bin:$PATH" CARGO_HOME="$cargo_home" \
+    KUASAR_WORKSPACE_ROOT="$cloud_workspace" \
+    "$SCRIPT_DIR/native-cache.sh" key cloud-hypervisor | cut -f2)"
+[ "$cloud_key_plain" != "$cloud_key_config" ] \
+    || fail "Cargo config did not invalidate the Cloud Hypervisor key"
 
 env PATH="$TMP/bin:$PATH" FAKE_BUILD_COUNTER="$counter" \
     KUASAR_WORKSPACE_ROOT="$workspace" KUASAR_NATIVE_CACHE_ROOT="$cache" \

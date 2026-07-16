@@ -35,8 +35,9 @@ DaoCloud 国内镜像。
 
 缓存路径为
 `/var/cache/kuasar/native/v1/<arch>/<component>/<input-hash>/`.输入 hash 覆盖
-构建定义和脚本、patch/config、固定的上游归档摘要、目标架构、相关环境选项、
-编译工具二进制/版本与系统包版本。每个条目包含 `inputs.tsv`、`provenance.txt`、
+构建定义和脚本、patch/config、固定的上游归档摘要、目标架构、Go 微架构、
+Cargo 编译选项、pkg-config 搜索环境及其解析到的元数据/库、编译工具
+二进制/版本与系统包版本。每个条目包含 `inputs.tsv`、`provenance.txt`、
 `payload.tar` 和 `SHA256SUMS`。
 
 同 key 的构建和命中恢复都持有条目 `flock`;miss 直到构建、校验和原子发布完成才
