@@ -103,6 +103,12 @@ legacy host runner service must be stopped before an
 install. Existing container slots must also be stopped while their package
 sets and runner files are reconciled.
 
+The runner service refuses a direct manual stop and has no start-rate ceiling.
+This prevents an accidental `systemctl stop actions-runner` or a transient
+failure burst from leaving an otherwise healthy slot offline. Deliberate
+maintenance stops the owning `systemd-nspawn@kuasar-ci-N.service` through the
+provisioner's `stop` command instead.
+
 Each installroot transaction replaces the openEuler release package's default
 metalink configuration with the host repository files both before and after the
 package operation. This prevents an `openEuler-release` update from restoring

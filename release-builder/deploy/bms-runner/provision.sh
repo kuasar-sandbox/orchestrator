@@ -860,6 +860,8 @@ verify_slots() {
             test -e /usr/lib64/liblz4.so
             test -e /usr/lib64/libsnappy.so
             test -x /usr/bin/time
+            [ "$(systemctl show actions-runner.service --property=RefuseManualStop --value)" = yes ]
+            [ "$(systemctl show actions-runner.service --property=StartLimitIntervalUSec --value)" = 0 ]
             [ "$(/usr/local/go/bin/go version)" = "go version go1.26.5 linux/amd64" ]
             [ "$(/usr/local/go/bin/go tool compile -V=full)" = "compile version go1.26.5" ]
             redis-server --version >/dev/null
