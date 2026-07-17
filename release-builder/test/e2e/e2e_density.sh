@@ -10,12 +10,12 @@
 #             Verifies controller burst-grants on rising demand and
 #             reclaimer shrinks back during idle.
 #
-#   Phase B   OOM elimination via controller (A/B comparison)
-#             B1: static mode + allocatable.deflate_on_oom=false
-#                 + tight allocatable=64MiB → Python killed by guest OOM
-#                 (proves baseline is broken without the controller)
-#             B2: dynamic mode, same workload + same allocatable
-#                 → controller burst-grants → workload completes
+#   Phase B   emergency convergence vs proactive control (A/B comparison)
+#             B1: static mode, no node controller. The production guest
+#                 self-cap detects an infeasible balloon target, returns
+#                 memory, and the workload eventually completes.
+#             B2: dynamic mode, same floor/workload. Controller admission
+#                 and grants complete the workload without guest self-cap/OOM.
 #
 #   Phase C   creation rate backpressure
 #             Compact node-ctl pool sized so 4 concurrent admit succeed
@@ -136,6 +136,16 @@ echo "+memory +cpu" > /sys/fs/cgroup/sandboxes/cgroup.subtree_control 2>/dev/nul
 # full env/mode catalogue. e2e_density.sh always uses WL_MODE=cycles
 # for reproducibility; perf harnesses can override.
 WORKLOAD_PY="$(cat "$REPO_ROOT/test/perf/workload.py")"
+
+# Phase B uses one workload definition for both sides of the comparison. The
+# dynamic side additionally receives a controller-managed startup budget.
+B_FLOOR_MIB=320
+B_CAP_MIB=1024
+B_WORKLOAD_DURATION=15
+B_WORKLOAD_CYCLES=2
+B_WORKLOAD_RMIN_MIB=256
+B_WORKLOAD_RMAX_MIB=384
+B2_STARTUP_MIB=512
 
 # ---------- helpers ----------
 
@@ -396,9 +406,8 @@ EOF
 # expanding to ~11s wallclock. 60s = generous slack.
 shutdown_sandbox() {
     local pid="$1" sid="${2:-?}" waited=0 timeout=120
-    # Teardown success = the process is GONE, not its exit code. A B1 sandbox is
-    # meant to OOM, so its sandbox-ctl may exit non-zero — tolerate wait's code
-    # (|| true) so that doesn't abort teardown under set -e. Only a process still
+    # Teardown success = the process is GONE, not its exit code. Tolerate wait's
+    # code (|| true) so teardown still diagnoses a failed sandbox. Only a process
     # alive past the timeout (a real residual) is a failure (return 1 below).
     kill -TERM "$pid" 2>/dev/null || { wait "$pid" 2>/dev/null || true; return 0; }
     while [ "$waited" -lt "$timeout" ]; do
@@ -442,6 +451,28 @@ wait_for_controller_activity() {
     fail "$sid: controller recorded neither a grant nor a reclaim within ${timeout}s"
 }
 
+wait_for_controller_admit() {
+    local sid="$1" pid="$2" timeout="$3"
+    local deadline=$((SECONDS + timeout))
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        grep -q "admit token=.* sid=$sid" "$WORK/audit.log" 2>/dev/null && return 0
+        kill -0 "$pid" 2>/dev/null || fail "$sid: sandbox exited before controller admission"
+        sleep 0.25
+    done
+    fail "$sid: controller did not admit the sandbox within ${timeout}s"
+}
+
+wait_for_controller_grant() {
+    local sid="$1" pid="$2" timeout="$3"
+    local deadline=$((SECONDS + timeout))
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        grep -q " grant .* sid=$sid " "$WORK/daemon.log" 2>/dev/null && return 0
+        kill -0 "$pid" 2>/dev/null || fail "$sid: sandbox exited before a controller grant"
+        sleep 0.25
+    done
+    fail "$sid: controller did not grant memory within ${timeout}s"
+}
+
 memory_event_count() {
     local sid="$1" event="$2" events="/sys/fs/cgroup/sandboxes/$sid/memory.events.local"
     [ -f "$events" ] || { echo 0; return; }
@@ -454,18 +485,24 @@ guest_oom_observed() {
         "$WORK/$sid.log" 2>/dev/null
 }
 
-wait_for_guest_oom() {
+guest_self_cap_observed() {
+    local sid="$1"
+    grep -qE 'virtio_balloon: pressure at [0-9]+ pages -> cap [0-9]+ pages .*converging' \
+        "$WORK/$sid.log" 2>/dev/null
+}
+
+wait_for_guest_self_cap() {
     local sid="$1" pid="$2" timeout="$3"
     local deadline=$((SECONDS + timeout))
     while [ "$SECONDS" -lt "$deadline" ]; do
-        guest_oom_observed "$sid" && return 0
+        guest_self_cap_observed "$sid" && return 0
         if ! kill -0 "$pid" 2>/dev/null; then
-            guest_oom_observed "$sid" && return 0
-            fail "$sid: sandbox exited without guest OOM evidence"
+            guest_self_cap_observed "$sid" && return 0
+            fail "$sid: sandbox exited without guest self-cap evidence"
         fi
         sleep 0.25
     done
-    fail "$sid: no guest OOM evidence within ${timeout}s"
+    fail "$sid: no guest self-cap evidence within ${timeout}s"
 }
 
 reservation_count() {
@@ -539,18 +576,21 @@ phase_a() {
     echo "Phase A: PASS"
 }
 
-# ---------- Phase B1: static mode demonstrates OOM ----------
+# ---------- Phase B1: static guest emergency convergence ----------
 
-phase_b1_static() {
+phase_b1_static_self_cap() {
     echo
-    echo "==> Phase B1: static mode + deflate_on_oom=false → expected guest OOM"
+    echo "==> Phase B1: static mode → guest self-cap convergence and liveness"
     # No daemon. Static mode has no controller.
 
     local sid=sb-B1-1
     setup_sb "$sid"
-    # Tight floor=64 MiB and large demand 256-384 MiB → guest physical
-    # memory exhausted, no balloon escape (deflate_on_oom=false).
-    emit_yaml "$sid" static 64 1024 0   15 2 256 384   false
+    # The infeasible static target must trigger the production guest's sticky
+    # balloon self-cap. deflate_on_oom remains at its production default; the
+    # direct self-cap log, not an OOM race or host pressure, is authoritative.
+    emit_yaml "$sid" static "$B_FLOOR_MIB" "$B_CAP_MIB" 0 \
+        "$B_WORKLOAD_DURATION" "$B_WORKLOAD_CYCLES" \
+        "$B_WORKLOAD_RMIN_MIB" "$B_WORKLOAD_RMAX_MIB" true
 
     "$BIN/sandbox-ctl" run \
         --config "$WORK/$sid.yaml" \
@@ -561,11 +601,12 @@ phase_b1_static() {
     local pid=$!
     SANDBOX_PIDS+=("$pid")
 
-    # The assertion is guest OOM, not elapsed wall time or host pressure.
-    wait_for_guest_oom "$sid" "$pid" 35
+    # Observe the guest emergency mechanism before asserting terminal liveness.
+    wait_for_guest_self_cap "$sid" "$pid" 35
+    wait_for_workload "$sid" "$pid" 45
 
-    # Host cgroup pressure is useful diagnostics, but it is not authoritative
-    # for an OOM enforced by the guest kernel inside the VM.
+    # Host cgroup pressure remains diagnostics, not a substitute for the direct
+    # guest self-cap evidence above.
     local oom=0 high=0
     if [ -f "/sys/fs/cgroup/sandboxes/$sid/memory.events.local" ]; then
         oom=$(awk '$1=="oom" {print $2}' "/sys/fs/cgroup/sandboxes/$sid/memory.events.local") || oom=0
@@ -574,28 +615,34 @@ phase_b1_static() {
         [ -z "$high" ] && high=0
     fi
 
-    guest_oom_observed "$sid" || fail "B1: guest OOM evidence disappeared"
-    echo "  Phase B1: guest_oom=1 cgroup_oom=$oom cgroup_high=$high"
+    guest_self_cap_observed "$sid" || fail "B1: guest self-cap evidence disappeared"
+    guest_oom_observed "$sid" && fail "B1: guest OOM/SIGKILL despite self-cap convergence"
+    [ "$oom" -eq 0 ] || fail "B1: cgroup oom_count=$oom despite self-cap convergence"
+    if grep -q "sid=$sid" "$WORK/audit.log" "$WORK/daemon.log" 2>/dev/null; then
+        fail "B1: node-controller activity observed for static sandbox"
+    fi
+    echo "  Phase B1: self_cap=1 workload_done=1 cgroup_oom=0 cgroup_high=$high controller=none"
 
     shutdown_sandbox "$pid" "$sid"
     cleanup_sb "$sid"
     echo "Phase B1: PASS"
 }
 
-# ---------- Phase B2: dynamic mode prevents OOM ----------
+# ---------- Phase B2: proactive dynamic control ----------
 
-phase_b2_dynamic() {
+phase_b2_dynamic_control() {
     echo
-    echo "==> Phase B2: dynamic mode (same workload, same allocatable) → no OOM"
+    echo "==> Phase B2: dynamic mode (same floor/workload) → proactive grant, no emergency"
     write_default_config
     start_daemon "$WORK/node-ctl.yaml"
 
     local sid=sb-B2-1
     setup_sb "$sid"
-    # Same workload and floor as B1, but with controller. A startup budget
-    # above the floor prevents cold-start OOM, and runtime grants may extend
-    # it further if PSI reports pressure during the workload.
-    emit_yaml "$sid" dynamic 64 1024 384   15 2 256 384   false
+    # The startup budget is part of dynamic admission, while the steady-state
+    # floor, capacity, workload, and guest safety setting are identical to B1.
+    emit_yaml "$sid" dynamic "$B_FLOOR_MIB" "$B_CAP_MIB" "$B2_STARTUP_MIB" \
+        "$B_WORKLOAD_DURATION" "$B_WORKLOAD_CYCLES" \
+        "$B_WORKLOAD_RMIN_MIB" "$B_WORKLOAD_RMAX_MIB" true
 
     "$BIN/sandbox-ctl" run \
         --config "$WORK/$sid.yaml" \
@@ -606,7 +653,10 @@ phase_b2_dynamic() {
     local pid=$!
     SANDBOX_PIDS+=("$pid")
 
-    wait_for_workload "$sid" "$pid" 35
+    # Prove the proactive control path before checking terminal completion.
+    wait_for_controller_admit "$sid" "$pid" 15
+    wait_for_controller_grant "$sid" "$pid" 30
+    wait_for_workload "$sid" "$pid" 45
 
     local oom=0 grants=0
     if [ -f "/sys/fs/cgroup/sandboxes/$sid/memory.events.local" ]; then
@@ -616,9 +666,13 @@ phase_b2_dynamic() {
     grants=$(grep -c " grant .* sid=$sid " "$WORK/daemon.log" 2>/dev/null) || grants=0
 
     [ "$oom" -eq 0 ]  || fail "B2: cgroup oom_count=$oom (controller couldn't prevent OOM)"
+    [ "$grants" -gt 0 ] || fail "B2: workload completed without a controller grant"
     grep -q "workload done" "$WORK/$sid.log" || fail "B2: workload did not complete"
     if guest_oom_observed "$sid"; then
         fail "B2: guest log contains OOM or SIGKILL despite controller"
+    fi
+    if guest_self_cap_observed "$sid"; then
+        fail "B2: guest self-cap fired before proactive control could absorb pressure"
     fi
     grep -q "admit token=.* sid=$sid" "$WORK/audit.log" || fail "B2: no admit in audit"
     echo "  Phase B2: grants=$grants oom_count=0 workload_done=1"
@@ -704,13 +758,13 @@ phase_c() {
 # ---------- run all phases ----------
 
 phase_a
-phase_b1_static
-phase_b2_dynamic
+phase_b1_static_self_cap
+phase_b2_dynamic_control
 phase_c
 
 echo
 echo "==> e2e_density: PASS"
 echo "    Phase A: auto resource allocation (1 sandbox, controller-driven)"
-echo "    Phase B1: static + deflate=false → guest OOM (baseline broken)"
-echo "    Phase B2: dynamic + same allocatable → no OOM (controller fixes it)"
+echo "    Phase B1: static → guest self-cap convergence + workload liveness"
+echo "    Phase B2: dynamic + same floor/workload → proactive grant, no self-cap/OOM"
 echo "    Phase C: 4 admits ok, 5th rejected by water mark"

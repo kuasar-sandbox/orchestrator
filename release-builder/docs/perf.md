@@ -683,6 +683,13 @@ make test-e2e-density
 make perf-density
 ```
 
+`test-e2e-density` 的 Phase B 不以 guest OOM 作为静态模式基线。生产
+vmlinux 在 infeasible balloon target 下会由 guest sticky self-cap 主动归还内存，
+因此 B1 直接验证 self-cap 日志和 workload 最终存活；B2 在相同 floor/workload
+下验证 node controller admit/grant，并要求 workload 在没有 self-cap、guest OOM
+或 cgroup OOM 的情况下完成。host cgroup pressure 只作为诊断信息，不能替代
+guest 内的直接证据。
+
 对照 §3.3 的实测基线;`cgroup_oom_total > 0` 必须查明原因。
 
 ## 6. See Also
