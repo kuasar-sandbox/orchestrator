@@ -58,6 +58,7 @@ ZOT_VERSION    ?= v2.1.17
 # exception because it needs external OBS credentials/bucket configuration.
 E2E_SCRIPTS  := $(sort $(wildcard test/e2e/e2e_*.sh))
 UMBRELLA_E2E := $(foreach s,$(E2E_SCRIPTS),test-e2e-$(subst _,-,$(patsubst e2e_%.sh,%,$(notdir $(s)))))
+UMBRELLA_E2E_RUN := $(patsubst test-e2e-%,run-e2e-%,$(UMBRELLA_E2E))
 E2E_REQUIRE_ENV := REQUIRE_KVM=1 REQUIRE_EXEC=1 REQUIRE_CLUSTER_STUB=1 \
 	REQUIRE_CLUSTER_REAL=1 REQUIRE_ORCH=1 REQUIRE_PROXY=1 \
 	REQUIRE_BUILDER=1 REQUIRE_RUNTASK=1 REQUIRE_CONNECTOR_E2E=1 \
@@ -68,10 +69,7 @@ REPO_E2E_TARGETS := test-e2e-repo-accelerator test-e2e-repo-connector test-e2e-r
 
 .PHONY: all build collect e2e-tools release vet test test-ci-tools clean help demo \
         bench test-e2e perf dedup-report \
-        $(UMBRELLA_E2E) $(PERF_TARGETS) $(REPO_E2E_TARGETS)
-
-# Keep host-global systemd/KVM scenarios serial even when a caller supplies -j.
-.NOTPARALLEL: test-e2e
+        $(UMBRELLA_E2E) $(UMBRELLA_E2E_RUN) $(PERF_TARGETS) $(REPO_E2E_TARGETS)
 
 all: build
 
@@ -133,6 +131,9 @@ release: build
 # test/e2e/e2e_<sub>.sh, with dashes in <sub> mapped to underscores so
 # test-e2e-sandbox-cold → e2e_sandbox_cold.sh.
 $(UMBRELLA_E2E): test-e2e-%: build e2e-tools
+	$(MAKE) run-e2e-$*
+
+$(UMBRELLA_E2E_RUN): run-e2e-%:
 	$(CI_TIMED) e2e/orchestrator/$* env $(E2E_REQUIRE_ENV) BIN=$(SBIN) ZOT_BIN=$(E2E_ZOT_BIN) VGW_BIN=$(E2E_VGW_BIN) bash test/e2e/e2e_$(subst -,_,$*).sh
 
 # Accelerator opens many independently selected loopback ports, so keep it
@@ -150,7 +151,8 @@ test-e2e-repo-guest-runtime:
 		ZOT_BIN=$(E2E_ZOT_BIN) MKFS_EROFS_PATH=$(SBIN)/mkfs.erofs
 
 # Aggregate test-e2e: every umbrella sub-target + each sub-repo's test-e2e.
-test-e2e: build e2e-tools $(UMBRELLA_E2E)
+test-e2e: build e2e-tools
+	$(MAKE) -j1 $(UMBRELLA_E2E_RUN)
 	$(MAKE) test-e2e-repo-accelerator
 	$(MAKE) -j2 test-e2e-repo-connector test-e2e-repo-guest-runtime
 
