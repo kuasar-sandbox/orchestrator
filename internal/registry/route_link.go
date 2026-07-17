@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
@@ -15,7 +16,7 @@ const (
 	RouteLinkReservePath      = "/route-link/reserve"       // POST ?group=&route_key= -> ReserveResult
 	RouteLinkRoutePath        = "/route-link/route"         // GET  ?group=&route_key=&sid= -> RouteResolve
 	RouteLinkDeletePath       = "/route-link/delete"        // DELETE ?group=&route_key=&sid= -> node-link CmdDelete
-	RouteLinkReserveBuildPath = "/route-link/reserve-build" // POST {group,build_id,template_id,resources,metadata} -> BuildReserveResult
+	RouteLinkReserveBuildPath = "/route-link/reserve-build" // POST {group,build_id,template_id,profile,resources,metadata} -> BuildReserveResult
 	RouteLinkBuildPath        = "/route-link/build"         // GET  ?group=&build_id=  -> BuildReserveResult (resolve)
 	RouteLinkListPath         = "/route-link/list"          // GET  ?group=            -> the group's sandbox shard
 	RouteLinkVerifyKeyPath    = "/route-link/verify-key"    // GET  ?group=&api_key=   -> 200 valid / 403 invalid
@@ -103,6 +104,10 @@ func (r *Registry) serveReserveBuild(w http.ResponseWriter, req *http.Request) {
 	}
 	if br.Group == "" {
 		http.Error(w, "group is required", http.StatusBadRequest)
+		return
+	}
+	if !br.Profile.Valid() {
+		http.Error(w, fmt.Sprintf("unknown build profile %q", br.Profile), http.StatusBadRequest)
 		return
 	}
 	res, err := r.ReserveBuild(req.Context(), br)

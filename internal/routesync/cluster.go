@@ -146,7 +146,7 @@ type Heartbeat struct {
 // idempotent by SID. Fields are populated per Kind.
 type Command struct {
 	CmdID string `json:"cmd_id"`
-	Kind  string `json:"kind"` // CmdCreate | CmdConnect | CmdDelete | CmdKey*
+	Kind  string `json:"kind"` // CmdCreate | CmdConnect | CmdDelete | CmdKey* | CmdBuildRegister
 	SID   string `json:"sid,omitempty"`
 	// create
 	TemplateRef    string            `json:"template_ref,omitempty"` // snapshot template ref (cold start = fast restore)
@@ -162,6 +162,7 @@ type Command struct {
 	// reserved resources. ImageRepo/RegistryAuth are the group's image-pull creds,
 	// delivered WITH the build task and used transiently (never persisted on the node).
 	BuildID        string          `json:"build_id,omitempty"`
+	Profile        string          `json:"profile,omitempty"`
 	BuildResources *BuildResources `json:"build_resources,omitempty"`
 	ImageRepo      string          `json:"image_repo,omitempty"`
 	RegistryAuth   string          `json:"registry_auth,omitempty"` // docker config.json; transient

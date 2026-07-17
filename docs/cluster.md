@@ -855,7 +855,7 @@ Build 记录按 group 存在 `route_link` 的 `build` recordSet;执行态和实�
 
 ```text
 router build register
-  │ stable build_id/template_id
+  │ stable build_id/template_id + explicit profile
   ▼
 route owner ReserveBuild
   │ PlaceBuild
@@ -874,6 +874,11 @@ node_link build_register command
   ▼
 node build_event releases/adapts state
 ```
+
+北向 `/v3/templates` 将省略的 profile 按 e2b 端点语义解析为 `e2b`;进入集群内部后 profile 必须
+显式存在。route owner 将其持久化进 BuildRecord,并随 `build_register` 下发,节点将同一值写入本地
+build 与 BuildSpec;缺失或非法值直接拒绝,不得静默改写。bare build 只允许 image 产物,不接受
+start/ready 命令。
 
 node owner 的 admission 以 `(node_id,build_id)` 记账;同一 build_id 出现在不同 node 时互不影响。若资源
 余量不足则直接拒绝,route owner 重新调度。build event 只携带 build_id,nodelink owner 查本节点归属表

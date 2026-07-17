@@ -48,6 +48,7 @@ import (
 	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
+	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
 // Run drives the build pipeline for spec and returns its Result.
@@ -66,9 +67,10 @@ type Result struct {
 }
 
 type buildPipeline struct {
-	spec *configsock.BuildSpec
-	log  *slog.Logger
-	out  *buildJournal // curated build progress → journald SYSLOG_IDENTIFIER=build (SDK-visible)
+	spec    *configsock.BuildSpec
+	log     *slog.Logger
+	out     *buildJournal // curated build progress → journald SYSLOG_IDENTIFIER=build (SDK-visible)
+	profile types.Profile
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -103,6 +105,11 @@ func (p *buildPipeline) run() (res Result) {
 		p.progress("build failed: %v", err) // surface the failure in the build log too
 		return Result{Error: err.Error()}
 	}
+	profile, err := validateBuildProfile(s)
+	if err != nil {
+		return fail(err)
+	}
+	p.profile = profile
 
 	p.startCmd, p.readyCmd = s.StartCmd, s.ReadyCmd
 	if err := p.resolveBase(); err != nil {
@@ -120,7 +127,7 @@ func (p *buildPipeline) run() (res Result) {
 		}
 	}
 	var bundle string
-	if p.startCmd != "" {
+	if p.profile == types.ProfileE2B && p.startCmd != "" {
 		b, err := p.phaseTemplate()
 		if err != nil {
 			return fail(fmt.Errorf("template: %w", err))
@@ -149,6 +156,17 @@ func (p *buildPipeline) run() (res Result) {
 	return res
 }
 
+func validateBuildProfile(s *configsock.BuildSpec) (types.Profile, error) {
+	profile, err := types.ParseProfile(s.Profile)
+	if err != nil {
+		return "", fmt.Errorf("build profile: %w", err)
+	}
+	if profile == types.ProfileBare && (s.StartCmd != "" || s.ReadyCmd != "") {
+		return "", fmt.Errorf("bare profile does not support start or ready commands")
+	}
+	return profile, nil
+}
+
 // resolveBase fixes the phase B/C base ref and inherits start/ready from a
 // base template's snapshot.cfg metadata (e2b.start_cmd / e2b.ready_cmd).
 func (p *buildPipeline) resolveBase() error {
@@ -172,10 +190,10 @@ func (p *buildPipeline) resolveBase() error {
 		}
 		p.baseRef = baseRef
 		p.overlayBase = overlayBase
-		if p.startCmd == "" {
+		if p.profile == types.ProfileE2B && p.startCmd == "" {
 			p.startCmd = meta["e2b.start_cmd"]
 		}
-		if p.readyCmd == "" {
+		if p.profile == types.ProfileE2B && p.readyCmd == "" {
 			p.readyCmd = meta["e2b.ready_cmd"]
 		}
 		return nil

@@ -26,6 +26,7 @@ import (
 
 	"github.com/kuasar-sandbox/orchestrator/internal/nodelink"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
+	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
 var version = "0.1.0-dev"
@@ -882,8 +883,11 @@ func (n *stubNode) handleConnect(cmd *routesync.Command) *routesync.CmdAck {
 }
 
 func (n *stubNode) handleBuildRegister(cmd *routesync.Command) *routesync.CmdAck {
-	if cmd.BuildID == "" {
-		return ack(cmd, routesync.AckRejected, "build_id is required")
+	if cmd.BuildID == "" || cmd.TemplateRef == "" {
+		return ack(cmd, routesync.AckRejected, "build_id and template_ref are required")
+	}
+	if !types.Profile(cmd.Profile).Valid() {
+		return ack(cmd, routesync.AckRejected, "valid profile is required")
 	}
 	if n.StrictKeys && cmd.KeyFingerprint != "" && !n.hasKey(cmd.KeyFingerprint) {
 		return ack(cmd, routesync.AckRejected, "manifest key not installed")
@@ -893,10 +897,19 @@ func (n *stubNode) handleBuildRegister(cmd *routesync.Command) *routesync.CmdAck
 		return ack(cmd, routesync.AckRejected, "stub build rejected")
 	}
 	b := &stubBuild{
-		BuildID: cmd.BuildID, Metadata: cloneStringMap(cmd.Config), State: "registered", TemplateID: cmd.TemplateRef,
+		BuildID: cmd.BuildID, Profile: cmd.Profile, KeyFingerprint: cmd.KeyFingerprint,
+		Metadata: cloneStringMap(cmd.Config), State: "registered", TemplateID: cmd.TemplateRef,
 		Resources: cloneBuildResources(cmd.BuildResources), CreatedAt: time.Now().UTC().Format(time.RFC3339Nano), Behavior: beh,
 	}
 	n.mu.Lock()
+	if existing := n.builds[b.BuildID]; existing != nil {
+		conflict := existing.Profile != b.Profile || existing.TemplateID != b.TemplateID || existing.KeyFingerprint != b.KeyFingerprint
+		n.mu.Unlock()
+		if conflict {
+			return ack(cmd, routesync.AckRejected, "build identity conflicts with existing build")
+		}
+		return ack(cmd, routesync.AckAccepted, "")
+	}
 	n.builds[b.BuildID] = b
 	n.mu.Unlock()
 	n.svc.logEvent(n.ID, "build_register", b.snapshot(n.ID))
@@ -975,7 +988,7 @@ func (n *stubNode) recordCommand(cmd *routesync.Command) {
 	log := commandLog{
 		Seq: n.cmdSeq, Time: time.Now().UTC().Format(time.RFC3339Nano), NodeID: n.ID,
 		CmdID: cmd.CmdID, Kind: cmd.Kind, SID: cmd.SID, Metadata: cloneStringMap(cmd.Config),
-		BuildID: cmd.BuildID, KeyFingerprint: cmd.KeyFingerprint,
+		BuildID: cmd.BuildID, Profile: cmd.Profile, KeyFingerprint: cmd.KeyFingerprint,
 	}
 	n.commands = append(n.commands, log)
 	n.mu.Unlock()
@@ -1172,19 +1185,21 @@ func (s *stubSandbox) response() (int, string) {
 }
 
 type stubBuild struct {
-	BuildID    string                    `json:"build_id"`
-	Metadata   map[string]string         `json:"metadata,omitempty"`
-	State      string                    `json:"state"`
-	TemplateID string                    `json:"template_id,omitempty"`
-	Reason     string                    `json:"reason,omitempty"`
-	Resources  *routesync.BuildResources `json:"resources,omitempty"`
-	Behavior   stubBehavior              `json:"behavior,omitempty"`
-	CreatedAt  string                    `json:"created_at,omitempty"`
+	BuildID        string                    `json:"build_id"`
+	Profile        string                    `json:"profile"`
+	KeyFingerprint string                    `json:"-"`
+	Metadata       map[string]string         `json:"metadata,omitempty"`
+	State          string                    `json:"state"`
+	TemplateID     string                    `json:"template_id,omitempty"`
+	Reason         string                    `json:"reason,omitempty"`
+	Resources      *routesync.BuildResources `json:"resources,omitempty"`
+	Behavior       stubBehavior              `json:"behavior,omitempty"`
+	CreatedAt      string                    `json:"created_at,omitempty"`
 }
 
 func (b *stubBuild) snapshot(nodeID string) buildSnapshot {
 	return buildSnapshot{
-		NodeID: nodeID, BuildID: b.BuildID, Metadata: cloneStringMap(b.Metadata), State: b.State, TemplateID: b.TemplateID, Reason: b.Reason,
+		NodeID: nodeID, BuildID: b.BuildID, Profile: b.Profile, Metadata: cloneStringMap(b.Metadata), State: b.State, TemplateID: b.TemplateID, Reason: b.Reason,
 		Resources: cloneBuildResources(b.Resources), Behavior: b.Behavior, CreatedAt: b.CreatedAt,
 	}
 }
@@ -1265,6 +1280,7 @@ type commandLog struct {
 	SID            string            `json:"sid,omitempty"`
 	Metadata       map[string]string `json:"metadata,omitempty"`
 	BuildID        string            `json:"build_id,omitempty"`
+	Profile        string            `json:"profile,omitempty"`
 	KeyFingerprint string            `json:"key_fp,omitempty"`
 }
 
@@ -1312,6 +1328,7 @@ type sandboxSnapshot struct {
 type buildSnapshot struct {
 	NodeID     string                    `json:"node_id,omitempty"`
 	BuildID    string                    `json:"build_id"`
+	Profile    string                    `json:"profile"`
 	Metadata   map[string]string         `json:"metadata,omitempty"`
 	State      string                    `json:"state"`
 	TemplateID string                    `json:"template_id,omitempty"`

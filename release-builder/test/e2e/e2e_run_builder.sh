@@ -6,7 +6,7 @@
 # network (zot reached via the vswitch mgmt NIC), steps and startCmd/readyCmd
 # run THROUGH ENVD (the e2b exec channel, /bin/bash -l -c), and the template
 # snapshot is taken from a production-runtime VM with the start command left
-# as an envd-managed process. One orchestrator, three builds + one create:
+# as an envd-managed process. One orchestrator, five builds + two creates:
 #
 #   B1  fromImage (in-guest pull + flatten)                → e2b-img template
 #   B2  fromTemplate(B1, img) + steps + startCmd/readyCmd  → e2b-snp template
@@ -19,7 +19,9 @@
 #   B4  COPY build context (versitygw required)            → e2b-img template
 #       files endpoint → presigned direct-to-bucket PUT → in-build extract via
 #       flatten-ctl; a RUN step asserts content + default/--chown ownership
-#   create from B3 → 201 → list → kill                     (the template restores)
+#   B5  profile=bare + fromImage                            → bare-img template
+#       rejects start/ready, uses bare build network, and remains image-only
+#   create from B3 and B5 → 201 → list → kill              (snp restore + bare cold boot)
 #
 # Plus the negative surface: COPY without files_storage → 501; with it, a COPY
 # missing its filesHash → 400 and an un-uploaded context → 400.
@@ -283,11 +285,18 @@ req() { # method path key [body]
 json_field() {
     python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[sys.argv[2]])' "$1" "$2"
 }
-register() { # name → sets TID/BID
-    local code; code=$(req POST /v3/templates "$AK" "{\"name\":\"$1\"}")
+register() { # name [profile] → sets TID/BID
+    local code body expected_profile got_profile
+    expected_profile="${2:-e2b}"
+    body="{\"name\":\"$1\"}"
+    [ -z "${2:-}" ] || body="{\"name\":\"$1\",\"profile\":\"$2\"}"
+    code=$(req POST /v3/templates "$AK" "$body")
     [ "$code" = "202" ] || { cat "$WORK/resp.body"; fail "register $1 = $code (want 202)"; }
     TID=$(json_field "$WORK/resp.body" templateID)
     BID=$(json_field "$WORK/resp.body" buildID)
+    got_profile=$(json_field "$WORK/resp.body" profile)
+    [ "$got_profile" = "$expected_profile" ] \
+        || fail "register $1 profile=$got_profile (want $expected_profile)"
 }
 diag() { # bid — failure diagnostics (workdir is reaped by the orchestrator)
     echo "---- orchestrator log (tail) ----"
@@ -295,7 +304,7 @@ diag() { # bid — failure diagnostics (workdir is reaped by the orchestrator)
     echo "---- journal build $1 (tail) ----"
     journalctl KUASAR_BUILD_ID="$1" --no-pager -n 120 2>/dev/null | sed 's/^/    /'
 }
-wait_ready() { # tid bid label → sets PERSIST (e2b-{img,snp}-<64hex>)
+wait_ready() { # tid bid label → sets PERSIST (<profile>-{img,snp}-<64hex>)
     local tid="$1" bid="$2" label="$3" status="" code
     for _ in $(seq 1 240); do
         code=$(req GET "/templates/$tid/builds/$bid/status" "$AK")
@@ -304,7 +313,7 @@ wait_ready() { # tid bid label → sets PERSIST (e2b-{img,snp}-<64hex>)
         case "$status" in
             ready)
                 PERSIST=$(json_field "$WORK/resp.body" templateID)
-                [[ "$PERSIST" =~ ^e2b-(img|snp)-[0-9a-f]{64}$ ]] || fail "$label ready but invalid persist id: $(cat "$WORK/resp.body")"
+                [[ "$PERSIST" =~ ^(e2b|bare)-(img|snp)-[0-9a-f]{64}$ ]] || fail "$label ready but invalid persist id: $(cat "$WORK/resp.body")"
                 return 0;;
             error)
                 echo "    $label error response: $(cat "$WORK/resp.body")"
@@ -467,6 +476,20 @@ else
     fail "B4 COPY chain requires files_storage; versitygw was not configured"
 fi
 
+# ---- B5: bare profile fromImage → bare-img -------------------------------
+echo "==> B5: profile=bare fromImage=$PULL_REF (image-only, bare network)"
+register e2e-bare bare
+B5_TID="$TID"; B5_BID="$BID"
+code=$(req POST "/v2/templates/$B5_TID/builds/$B5_BID" "$AK" \
+    "{\"fromImage\":\"$PULL_REF\",\"startCmd\":\"sleep 60\"}")
+[ "$code" = "400" ] || { cat "$WORK/resp.body"; fail "B5 startCmd = $code (want 400)"; }
+code=$(req POST "/v2/templates/$B5_TID/builds/$B5_BID" "$AK" "{\"fromImage\":\"$PULL_REF\"}")
+[ "$code" = "202" ] || { cat "$WORK/resp.body"; fail "B5 trigger = $code (want 202)"; }
+wait_ready "$B5_TID" "$B5_BID" B5
+B5_PERSIST="$PERSIST"
+case "$B5_PERSIST" in bare-img-*) : ;; *) fail "B5 persist=$B5_PERSIST (want bare-img-…)";; esac
+echo "==> PASS: B5 ready → $B5_PERSIST (bare profile remained image-only)"
+
 # ---- create a sandbox from the built template -------------------------------
 echo "==> create sandbox from $B3_PERSIST (snapshot restore path)"
 code=$(req POST /sandboxes "$AK" "{\"templateID\":\"$B3_PERSIST\",\"timeout\":60}")
@@ -478,10 +501,20 @@ grep -q "$SID" "$WORK/resp.body" || fail "created sandbox $SID not in list"
 code=$(req DELETE "/sandboxes/$SID" "$AK"); [ "$code" = "204" ] || fail "kill = $code (want 204)"
 echo "==> PASS: sandbox create → list → kill from the built template"
 
+echo "==> create bare sandbox from $B5_PERSIST (image cold-boot path)"
+code=$(req POST /sandboxes "$AK" "{\"templateID\":\"$B5_PERSIST\",\"timeout\":60}")
+[ "$code" = "201" ] || { cat "$WORK/resp.body"; diag "$B5_BID"; fail "bare create = $code (want 201)"; }
+BARE_SID=$(json_field "$WORK/resp.body" sandboxID)
+[ -n "$BARE_SID" ] || fail "bare create returned no sandboxID"
+code=$(req GET /v2/sandboxes "$AK"); [ "$code" = "200" ] || fail "bare list = $code (want 200)"
+grep -q "$BARE_SID" "$WORK/resp.body" || fail "created bare sandbox $BARE_SID not in list"
+code=$(req DELETE "/sandboxes/$BARE_SID" "$AK"); [ "$code" = "204" ] || fail "bare kill = $code (want 204)"
+echo "==> PASS: bare sandbox create → list → kill from bare-img build"
+
 # store actually holds the uploaded chunks/manifests
 objs=$(find "$WORK/store" -type f | wc -l)
 [ "$objs" -gt 0 ] || fail "store has no objects after the builds"
 echo "==> store holds $objs object(s)"
 
 echo
-echo "==> e2e_run_builder: OK   (B1=$B1_PERSIST B2=$B2_PERSIST B3=$B3_PERSIST${B4_PERSIST:+ B4=$B4_PERSIST})"
+echo "==> e2e_run_builder: OK   (B1=$B1_PERSIST B2=$B2_PERSIST B3=$B3_PERSIST${B4_PERSIST:+ B4=$B4_PERSIST} B5=$B5_PERSIST)"

@@ -15,6 +15,16 @@ const (
 	ProfileBare Profile = "bare" // no envd; only floatingip network
 )
 
+func (p Profile) Valid() bool { return p == ProfileE2B || p == ProfileBare }
+
+func ParseProfile(s string) (Profile, error) {
+	p := Profile(s)
+	if !p.Valid() {
+		return "", fmt.Errorf("unknown profile %q", s)
+	}
+	return p, nil
+}
+
 // Kind selects the boot path.
 type Kind string
 
@@ -49,12 +59,11 @@ func ParseTemplateID(s string) (TemplateID, error) {
 	if len(parts) != 3 {
 		return t, fmt.Errorf("templateID %q: want <profile>-<kind>-<key>", s)
 	}
-	t.Profile, t.Kind, t.Key = Profile(parts[0]), Kind(parts[1]), parts[2]
-	switch t.Profile {
-	case ProfileE2B, ProfileBare:
-	default:
-		return t, fmt.Errorf("templateID %q: unknown profile %q", s, t.Profile)
+	profile, err := ParseProfile(parts[0])
+	if err != nil {
+		return t, fmt.Errorf("templateID %q: unknown profile %q", s, parts[0])
 	}
+	t.Profile, t.Kind, t.Key = profile, Kind(parts[1]), parts[2]
 	switch t.Kind {
 	case KindImg, KindSnp:
 	default:

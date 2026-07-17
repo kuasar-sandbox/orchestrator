@@ -48,6 +48,12 @@ func TestNodeLinkCodecRoundTrip(t *testing.T) {
 	if k.Cmd == nil || k.Cmd.ManifestKeyType != "ref" || k.Cmd.ManifestKeyRef != "vault://tenant/key" {
 		t.Fatalf("key_put ref round-trip: %+v", k.Cmd)
 	}
+	b := roundTrip(t, &Msg{Type: TypeCommand, Cmd: &Command{
+		CmdID: "b1", Kind: CmdBuildRegister, BuildID: "build-1", TemplateRef: "transient-1", Profile: "bare",
+	}})
+	if b.Cmd == nil || b.Cmd.BuildID != "build-1" || b.Cmd.Profile != "bare" {
+		t.Fatalf("build_register round-trip: %+v", b.Cmd)
+	}
 
 	// Sandbox routes carry runtime state only; the node-link owner supplies cluster identity.
 	r := roundTrip(t, &Msg{Type: TypeUpsert, Route: &RouteEntry{

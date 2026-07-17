@@ -411,11 +411,11 @@ envd,回占位 token,数据面控制端口 501。`trafficAccessToken` 为 SDK �
 
 | 操作 | 方法 + 路径 | 要点 |
 |---|---|---|
-| register | `POST /v3/templates` → 202 | body `{name, tags, cpuCount, memoryMB}` + `X-Kuasar-Sandbox-*` 头 → 模板默认配置(cpu/memory→`resource.capacity`,§4.6);回 `{templateID: transient-<uuidv7>, buildID, names, tags, aliases, public:false}` |
-| trigger | `POST /v2/templates/{tid}/builds/{bid}` → 202 | body 兼容 `{fromImage, fromTemplate, fromImageRegistry{username,password}, steps[], startCmd, readyCmd}` 与 CLI 形态 `{start_cmd, ready_cmd, …}`;`fromImage`/`fromTemplate` 互斥,皆缺时由 `builder.image_uri_mask` 推 fromImage;steps 支持 `RUN/ENV/ARG/WORKDIR/USER/COPY`(COPY 须先经 files 端点上传 context:未配 files_storage→**501**、未上传→**400**,§12);`startCmd` 非空或 fromTemplate ⇒ 暂记 snp(终态以流水线产物为准,§12),否则 img;fromTemplate 且无 steps 无 startCmd ⇒ 拒绝(无事可做);`cpu_count`/`memory_mb` + `X-Kuasar-Sandbox-*` 头 → 模板配置,**覆盖 register**;`X-Kuasar-Sandbox-Builder` → build-only 配置(§4.6) |
-| status | `GET /templates/{tid}/builds/{bid}/status` | 回 `{templateID, buildID, status, logs:[], logEntries:[]}` + 失败时 `reason{message}`;`logs`/`logEntries` 取自 journald 构建流(tag build),按 `?logsOffset`(已读条数)分页,SDK `on_build_logs` 即据此流式输出(§12);**进行中恒报 `building`**(registered/waiting/building 均映射,CLI wait 循环仅在 `building` 续轮询),终态 `ready`/`error`;失败 `reason` 通用(详情在日志流);ready 后 `templateID` 即报持久 id,并附 `names`/`aliases` |
+| register | `POST /v3/templates` → 202 | body `{name, tags, profile?, cpuCount, memoryMB}`;`profile∈{e2b,bare}`,省略按此 e2b 兼容端点语义取 `e2b`,注册后不可变;`X-Kuasar-Sandbox-*` 头 → 模板默认配置(cpu/memory→`resource.capacity`,§4.6);回 `{templateID: transient-<uuidv7>, buildID, profile, names, tags, aliases, public:false}` |
+| trigger | `POST /v2/templates/{tid}/builds/{bid}` → 202 | body 兼容 `{fromImage, fromTemplate, fromImageRegistry{username,password}, steps[], startCmd, readyCmd}` 与 CLI 形态 `{start_cmd, ready_cmd, …}`;`fromImage`/`fromTemplate` 互斥,皆缺时由 `builder.image_uri_mask` 推 fromImage;steps 支持 `RUN/ENV/ARG/WORKDIR/USER/COPY`(COPY 须先经 files 端点上传 context:未配 files_storage→**501**、未上传→**400**,§12);e2b 的 `startCmd` 非空或 fromTemplate ⇒ 暂记 snp(终态以流水线产物为准),否则 img;bare 禁止 start/ready(400)且恒为 image-only;fromTemplate 且无 steps 无 startCmd ⇒ 拒绝(无事可做);`cpu_count`/`memory_mb` + `X-Kuasar-Sandbox-*` 头 → 模板配置,**覆盖 register**;`X-Kuasar-Sandbox-Builder` → build-only 配置(§4.6) |
+| status | `GET /templates/{tid}/builds/{bid}/status` | 回 `{templateID, buildID, profile, status, logs:[], logEntries:[]}` + 失败时 `reason{message}`;`logs`/`logEntries` 取自 journald 构建流(tag build),按 `?logsOffset`(已读条数)分页,SDK `on_build_logs` 即据此流式输出(§12);**进行中恒报 `building`**(registered/waiting/building 均映射,CLI wait 循环仅在 `building` 续轮询),终态 `ready`/`error`;失败 `reason` 通用(详情在日志流);ready 后 `templateID` 即报持久 id,并附 `names`/`aliases` |
 | files | `GET /templates/{tid}/files/{hash}` → 201 | COPY context 上传协商:`tid→build→归属`校验后回 `{present, url}`——present 即对象已在桶(客户端跳过上传),url 为**直传桶的 presigned PUT**(字节不过控制面);未配 `files_storage`→**501**,未知/非属主 tid→**404**。详见 §12 |
-| list | `GET /templates` | 本租户 ready 模板;`templateID` 列为持久 id |
+| list | `GET /templates` | 本租户 ready 模板;`templateID` 列为持久 id,同时回不可变 `profile` |
 
 ### 4.3 数据面协议(envd,数据面仅透传)
 
@@ -635,7 +635,7 @@ serve 在 UDS `paths.config_socket`(默认 `/run/sandbox/node-ctl.socket`,**0600
   的 socket/staging 目录(`ch.sock`/`ctl.sock`/…)钉到 serve 的 run_root,
   pause/snapshot 客户端(同 `--run-root`)才能拨到 `ctl.sock`。
 - `POST /internal/task/buildspec`(run-builder;req `{config_id: "build:<bid>"}`)
-  → **BuildSpec(构建工作单)**:`{build_id, workdir, from_image | from_template
+  → **BuildSpec(构建工作单)**:`{build_id, profile, workdir, from_image | from_template
   (+kind), steps[], start_cmd, ready_cmd, env, paths, net, vcpu, memory,
   mmds_enabled, envd_token, insecure, platform, timeouts}`——`env` 含
   `MANIFEST_KEY` + 租户 `FLATTEN_*` 拉取凭据;`paths` 是宿主侧工件与工具
@@ -925,7 +925,7 @@ registry 上行下发命令。serve 复用既有 e2b 生命周期原语(§8 / §
   | `connect{cmd_id, sid}` | 恢复本机 PAUSED 沙箱(§8 auto-resume) |
   | `delete{cmd_id, sid}` | 销毁沙箱(§5 kill) |
   | `key_put` / `key_drop{fingerprint, manifest_key?, expires_unix}` | `key_put` 写 / 重发续租 `manifest_keys` 租约项;`key_drop` best-effort 清理,正确性依赖 TTL 淘汰(§7);registry 的密钥分发见 cluster.md |
-  | `build_register{build_id, template_id, resources, image_repo, registry_auth, key_fp, config}` | 预配 registry 分配的构建(§12;按指纹解析 key、建 build 记录、瞬态用镜像凭据);`config` metadata 原样保存,构建态经 `build_event` 上报 |
+  | `build_register{build_id, template_id, profile, resources, image_repo, registry_auth, key_fp, config}` | 预配 registry 分配的构建(§12;`profile` 必填且只接受 e2b/bare;按指纹解析 key、建 build 记录、瞬态用镜像凭据);`config` metadata 原样保存,构建态经 `build_event` 上报 |
 
 无 `drain` 命令。节点排空 / 维护由节点侧发起(node-resource.md §2.5 资源 drain 或本机维护策略),
 集群侧只停止向其分配。
@@ -987,7 +987,8 @@ plugin 平面,机群路由经 registry 聚合。
 让模板阶段 FC 模式的 envd 能按 floatingip 自解析 → 从 builder pool 分配 run-id
 (无 idle 时按需 `StartUnit`)→ run-builder WaitAssignment 取得 bid 后执行流水线
 → 经 config-socket 回传结果 → 终态落库:产物为快照 ⇒ `kind=snp`、为镜像 ⇒
-`img`,持久 id `e2b-<kind>-<key>` 写入 names/aliases。
+`img`,持久 id `<profile>-<kind>-<key>` 写入 names/aliases。profile 从注册到
+BuildSpec 全链路显式携带,网络槽的 inner IP/nexthop 亦按该 profile 选择。
 
 **单元内(run-builder,§2.4)** 依 BuildSpec(§6)最多跑三个阶段,每阶段一台
 microVM(`sandbox-ctl run` 直接子进程);A 阶段就绪探针 = guest 内
@@ -1020,7 +1021,7 @@ microVM(`sandbox-ctl run` 直接子进程);A 阶段就绪探针 = guest 内
   (自绑挂载点)+ `export --skip-mounts --runtime-config … --tmpdir /.kuasar-build
   --output - /` 导出新镜像工件流回——挂载点自身与 `/opt/sandbox-runtime` 投影都是
   挂载,被 `--skip-mounts` 排除,导出不自吞、工具链不进镜像。
-- **C template**(有 startCmd,显式或自 base 模板继承):**生产 e2b runtime** 冷启
+- **C template**(仅 e2b,有 startCmd,显式或自 base 模板继承):**生产 e2b runtime** 冷启
   最终镜像(runtime_ref 冻入快照——模板的子沙箱不得继承构建工具链),envd 为 app
   (MMDS 姿态随部署,node-proxy.md §8),`/init` 预置(此后 RPC 携 `X-Access-Token`)。startCmd
   **经 envd 启动**(e2b 默认身份 `user`、`/home/user`),流挂至就绪后断开——envd
@@ -1037,7 +1038,8 @@ microVM(`sandbox-ctl run` 直接子进程);A 阶段就绪探针 = guest 内
 **fromTemplate**:base 来自既有模板——img 模板直接用其镜像 key;snp 模板经
 `sandbox-ctl info --json manifest://<key>` 读 snapshot.cfg 取 `base_ref`,并继承
 metadata 里的 `e2b.start_cmd`/`e2b.ready_cmd`(请求显式给出者优先)。fromTemplate
-与 fromImage 互斥;fromTemplate 且无 steps 无 startCmd 拒绝(无事可做)。
+与 fromImage 互斥;fromTemplate 且无 steps 无 startCmd 拒绝(无事可做)。bare 不继承
+e2b start/ready metadata,也不进入 C 阶段,只上传 image 产物。
 
 **COPY/ADD step(构建上下文经对象存储直传)**:COPY 的本质是"把一份 tar 摊进
 rootfs"——文件系统操作,不是 e2b 进程语义,故走 sandbox-ctl exec + flatten-ctl(不经
@@ -1064,7 +1066,7 @@ COPY)。三段:
 唯一 aws-sdk 落点;本地/单机无云对象存储时指向 versitygw(`guest-runtime/native-deps make
 versitygw`)。force_path_style 默认 false(虚拟主机式;versitygw/minio 置 true)。
 
-**收尾上传(平台凭据唯一出现点)**:img-only ⇒ `manifest-ctl store image.img`
+**收尾上传(平台凭据唯一出现点)**:img-only(包括所有 bare build) ⇒ `manifest-ctl store image.img`
 (stdout = 64-hex manifest key;若 import referer hit/miss 已得到 base manifest id 则直接
 复用);产出快照 ⇒ **一条** `sandbox-ctl upload-snapshot <bundle>`——自动上传
 snapshot.cfg 引用的全部本地工件(base 镜像、overlay)并把引用改写为
@@ -1210,7 +1212,7 @@ sandbox-runtime.erofs 等),均已注册为 umbrella make 目标,缺前置则自�
 |---|---|---|
 | `e2e_node.sh` | 单元自动安装 + 控制面(`/health`、401 路径)+ 构建 API 生命周期(register/trigger/status、跨 key 归属 404)+(有 KVM 时)bare create/list/kill | `test-e2e-node` |
 | `e2e_runtask.sh` | run-sandbox/run-builder 启动器(纯用户态,无 root/systemd/KVM):pidfile 锁/双起拒绝、HTTP 取 LaunchSpec、execve、`TASK_*` 剥除;`config` CLI 往返 | `test-e2e-runtask` |
-| `e2e_run_builder.sh` | 三阶段构建流水线(KVM + vswitch + store-ctl + zot,guest 经 mgmt VIP 拉取):fromImage → e2b-img;fromTemplate(img)+steps+startCmd → e2b-snp(manifest:// base、配置合并、snapshot.cfg metadata 断言);fromTemplate(snp)+steps → e2b-snp(start/ready 继承);再从产物模板 create/list/kill;COPY 与 files 端点 501 | `test-e2e-run-builder` |
+| `e2e_run_builder.sh` | 三阶段构建流水线(KVM + vswitch + store-ctl + zot,guest 经 mgmt VIP 拉取):fromImage → e2b-img;fromTemplate(img)+steps+startCmd → e2b-snp(manifest:// base、配置合并、snapshot.cfg metadata 断言);fromTemplate(snp)+steps → e2b-snp(start/ready 继承);profile=bare fromImage → bare-img(拒绝 start、bare 网络、image-only);分别从 e2b-snp/bare-img create/list/kill;COPY 与 files 端点 501 | `test-e2e-run-builder` |
 | `e2e_execute.sh` | 从已建模板冷启真实 microVM、guest 内 exec、pause(snapshot)→ resume 全链路;create 经 `X-Kuasar-Sandbox-Network` 注入 hostname 并在 guest 校验(§4.6) | `test-e2e-execute` |
 | `e2e_node_proxy.sh` | `proxy.mode=external` 全链路:serve + proxy master + 多 worker(shm 路由视图 + 继承 listener fd)+ 真实 microVM/envd,数据面经 proxy 走(401/转发/wake/resume/CONNECT 隧道/proxyForwarder relay) | `test-e2e-node-proxy` |
 | `orchestrator/test/e2e/e2e_cluster_stub.sh` | 用 `make build` 产物真实启动 `cluster-ctl registry/router/placer` + `node-stub-ctl`,覆盖 group 导入、key 分发、Reserve→READY→数据面转发、活动路由缓存、build_register、孤儿 route 清理、节点清空和 registry joint/old_grace cutover | `orchestrator: make test-e2e` |

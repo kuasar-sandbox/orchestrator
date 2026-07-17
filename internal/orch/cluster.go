@@ -152,6 +152,10 @@ func (o *Orchestrator) registerClusterBuild(ctx context.Context, cmd *routesync.
 	if cmd.BuildID == "" || cmd.TemplateRef == "" {
 		return fmt.Errorf("build_register: missing build_id / template_id")
 	}
+	profile, err := types.ParseProfile(cmd.Profile)
+	if err != nil {
+		return fmt.Errorf("build_register: %w", err)
+	}
 	manifestKey, err := o.resolveByFingerprint(ctx, cmd.KeyFingerprint)
 	if err != nil {
 		return err
@@ -163,11 +167,26 @@ func (o *Orchestrator) registerClusterBuild(ctx context.Context, cmd *routesync.
 	if err := o.validateBuildOptions(builderOpts, false); err != nil {
 		return err
 	}
+	existing, err := o.st.GetBuild(ctx, cmd.BuildID)
+	if err != nil {
+		return err
+	}
+	if existing != nil {
+		if existing.TemplateID != cmd.TemplateRef || existing.Profile != profile || existing.ManifestKey != manifestKey {
+			return fmt.Errorf("build_register: build %s conflicts with existing identity", cmd.BuildID)
+		}
+		if existing.Status != types.BuildReady && existing.Status != types.BuildError {
+			o.clusterBuildMu.Lock()
+			o.clusterBuilds[cmd.BuildID] = &clusterBuild{imageRepo: cmd.ImageRepo, registryAuth: cmd.RegistryAuth}
+			o.clusterBuildMu.Unlock()
+		}
+		return nil
+	}
 	b := &types.Build{
 		BuildID:     cmd.BuildID,
 		TemplateID:  cmd.TemplateRef,
 		ManifestKey: manifestKey,
-		Profile:     types.ProfileE2B,
+		Profile:     profile,
 		Kind:        types.KindImg,
 		Status:      types.BuildRegistered,
 		FromImage:   o.imageURIFromMask(cmd.TemplateRef, cmd.BuildID),

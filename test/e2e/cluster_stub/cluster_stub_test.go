@@ -342,7 +342,7 @@ func (h *harness) waitForNodeKeyCache(t *testing.T, nodeID string) {
 func TestClusterStubBuildRegister(t *testing.T) {
 	h := newHarness(t)
 
-	req, _ := http.NewRequest(http.MethodPost, h.router.URL+"/v3/templates", strings.NewReader(`{"name":"tmpl"}`))
+	req, _ := http.NewRequest(http.MethodPost, h.router.URL+"/v3/templates", strings.NewReader(`{"name":"tmpl","profile":"bare"}`))
 	req.Host = "api." + testDomain
 	req.Header.Set(router.HeaderGroup, testGroup)
 	req.Header.Set(router.HeaderAPIKey, h.apiKey)
@@ -356,12 +356,18 @@ func TestClusterStubBuildRegister(t *testing.T) {
 		b, _ := io.ReadAll(resp.Body)
 		t.Fatalf("build register status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(b)))
 	}
+	var registered struct {
+		Profile string `json:"profile"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&registered); err != nil || registered.Profile != "bare" {
+		t.Fatalf("build register response profile=%q err=%v", registered.Profile, err)
+	}
 	cmd := h.node.waitCommand(t, routesync.CmdBuildRegister)
 	location, err := clusterstate.ObjectLocationFromMetadata(cmd.Config)
 	if err != nil {
 		t.Fatalf("build command metadata: %v", err)
 	}
-	if location.Group != testGroup || cmd.BuildID == "" || cmd.TemplateRef == "" || cmd.KeyFingerprint == "" {
+	if location.Group != testGroup || cmd.BuildID == "" || cmd.TemplateRef == "" || cmd.KeyFingerprint == "" || cmd.Profile != "bare" {
 		t.Fatalf("build_register command = %+v", cmd)
 	}
 }

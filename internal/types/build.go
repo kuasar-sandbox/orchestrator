@@ -68,13 +68,13 @@ type Build struct {
 	TemplateID   string  // transient-<uuidv7>, the register-time handle
 	PersistID    string  // <profile>-<kind>-<key>, set when ready
 	ManifestKey  string  // per-tenant manifest key (hex); ownership + crypto root
-	Profile      Profile // e2b (API builds are always e2b)
+	Profile      Profile // immutable output profile selected at registration
 	Kind         Kind    // img (flatten only) | snp (boot+snapshot)
 	FromImage    string  // OCI base image (the Dockerfile FROM); mutually exclusive with FromTemplate
 	FromTemplate string  // base template ref (its snapshot cfg supplies the base image + start/ready defaults)
 	RegistryAuth string  // resolved registry pull creds (regcreds.Creds JSON; "" = anonymous), stored encrypted
-	StartCmd     string  // non-empty => snapshot build (kind=snp)
-	ReadyCmd     string  // readiness probe run after StartCmd (poll until exit 0)
+	StartCmd     string  // e2b only; non-empty => snapshot build (kind=snp)
+	ReadyCmd     string  // e2b only; readiness probe run after StartCmd (poll until exit 0)
 	Steps        []TemplateStep
 	Status       BuildState
 	Reason       string   // error detail

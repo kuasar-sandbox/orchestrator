@@ -106,6 +106,16 @@ type BuildAuth struct {
 	RegistryPassword string
 }
 
+// RegisterSpec is the immutable identity/config selected when a template build
+// is registered. The e2b-compatible HTTP boundary supplies ProfileE2B when the
+// request omits profile; downstream build records always carry it explicitly.
+type RegisterSpec struct {
+	Name     string
+	Tags     []string
+	Profile  types.Profile
+	Metadata map[string]string
+}
+
 // TriggerSpec is the parsed build request (e2b TemplateBuildStartV2).
 type TriggerSpec struct {
 	FromImage    string
@@ -153,7 +163,7 @@ type Core interface {
 	// (register name/cpu/memory) → POST /v2/templates/{tid}/builds/{bid} (start, carries
 	// fromImage + fromImageRegistry + steps) → GET …/status (poll). The node pulls +
 	// flattens the named image server-side — no client-side docker build/push.
-	RegisterBuild(ctx context.Context, apiKey, name string, tags []string, metadata map[string]string) (*types.Build, error)
+	RegisterBuild(ctx context.Context, apiKey string, spec RegisterSpec) (*types.Build, error)
 	TriggerBuild(ctx context.Context, apiKey, templateID, buildID string, spec TriggerSpec, auth BuildAuth) error
 	BuildStatus(ctx context.Context, apiKey, templateID, buildID string) (*types.Build, error)
 	// BuildLogs returns the build's progress log entries from offset onward
@@ -362,17 +372,25 @@ func (a *API) registerTemplate(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Name       string   `json:"name"`
 		Tags       []string `json:"tags"`
+		Profile    string   `json:"profile"`
 		CPUCount   int      `json:"cpuCount"`
 		CPUCountSn int      `json:"cpu_count"`
 		MemoryMB   int      `json:"memoryMB"`
 		MemoryMBSn int      `json:"memory_mb"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&body)
+	profile, err := requestedBuildProfile(body.Profile)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	// Template config: X-Kuasar-Sandbox-* headers, with the e2b cpu/memory folded
 	// into the resource namespace (cpu/memory win over a resource header).
 	meta := mergeBuildConfigHeaders(nil, r.Header)
 	meta = sandboxcfg.SetCapacity(meta, pickInt(body.CPUCount, body.CPUCountSn), pickInt(body.MemoryMB, body.MemoryMBSn))
-	b, err := a.core.RegisterBuild(r.Context(), apiKeyFrom(r.Context()), body.Name, body.Tags, meta)
+	b, err := a.core.RegisterBuild(r.Context(), apiKeyFrom(r.Context()), RegisterSpec{
+		Name: body.Name, Tags: body.Tags, Profile: profile, Metadata: meta,
+	})
 	if err != nil {
 		a.fail(w, err)
 		return
@@ -384,7 +402,15 @@ func (a *API) registerTemplate(w http.ResponseWriter, r *http.Request) {
 		"names":      b.Names,
 		"tags":       b.Aliases,
 		"aliases":    b.Aliases,
+		"profile":    b.Profile,
 	})
+}
+
+func requestedBuildProfile(raw string) (types.Profile, error) {
+	if raw == "" {
+		return types.ProfileE2B, nil
+	}
+	return types.ParseProfile(raw)
 }
 
 func (a *API) triggerBuild(w http.ResponseWriter, r *http.Request) {
@@ -512,6 +538,7 @@ func (a *API) buildStatus(w http.ResponseWriter, r *http.Request) {
 	resp := map[string]any{
 		"templateID": tid,
 		"buildID":    b.BuildID,
+		"profile":    b.Profile,
 		"status":     b.Status.SDKStatus(),
 		"logs":       logs,
 		"logEntries": logEntries,
@@ -537,6 +564,7 @@ func (a *API) listTemplates(w http.ResponseWriter, r *http.Request) {
 		out = append(out, map[string]any{
 			"templateID":  b.PersistID, // list shows the persist id as the canonical template id
 			"buildID":     b.BuildID,
+			"profile":     b.Profile,
 			"names":       b.Names,
 			"aliases":     b.Aliases,
 			"public":      false,
