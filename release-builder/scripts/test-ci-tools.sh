@@ -114,6 +114,36 @@ awk -F '\t' 'NR == 1 && NF == 10 && $1 == "stage" { ok=1 } END { exit !ok }' "$t
 awk -F '\t' 'NR == 2 && NF == 10 && $1 == "fixture/timing" && $10 == 0 { ok=1 } END { exit !ok }' "$timings" \
     || fail "timing row is malformed"
 
+parallel_timings="$TMP/timings-parallel.tsv"
+timing_pids=()
+for i in $(seq 1 8); do
+    KUASAR_CI_TIMINGS="$parallel_timings" "$SCRIPT_DIR/ci-timed.sh" \
+        "fixture/parallel-$i" bash -c 'sleep 0.02' &
+    timing_pids+=("$!")
+done
+for pid in "${timing_pids[@]}"; do
+    wait "$pid"
+done
+awk -F '\t' '
+    NR == 1 {
+        if (NF != 10 || $1 != "stage") {
+            exit 1
+        }
+        next
+    }
+    NF != 10 || $1 !~ /^fixture\/parallel-[1-8]$/ || $10 != 0 {
+        exit 1
+    }
+    !seen[$1]++ {
+        stages++
+    }
+    END {
+        if (NR != 9 || stages != 8) {
+            exit 1
+        }
+    }
+' "$parallel_timings" || fail "parallel timing rows are malformed or incomplete"
+
 workspace="$TMP/workspace"
 cache="$TMP/cache"
 counter="$TMP/build-counter"
