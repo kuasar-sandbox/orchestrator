@@ -101,7 +101,7 @@ bash test/e2e/run_all.sh
 
 | 脚本 | 验证内容 |
 |---|---|
-| `e2e_density.sh` | agent 间歇式三模式密度 e2e |
+| `e2e_density.sh` | agent 间歇式密度 e2e:自动分配、静态 guest self-cap 收敛与动态主动 grant 对照、创建反压 |
 
 ### 沙箱编排 / e2b
 
