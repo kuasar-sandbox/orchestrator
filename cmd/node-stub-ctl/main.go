@@ -883,8 +883,8 @@ func (n *stubNode) handleConnect(cmd *routesync.Command) *routesync.CmdAck {
 }
 
 func (n *stubNode) handleBuildRegister(cmd *routesync.Command) *routesync.CmdAck {
-	if cmd.BuildID == "" {
-		return ack(cmd, routesync.AckRejected, "build_id is required")
+	if cmd.BuildID == "" || cmd.TemplateRef == "" {
+		return ack(cmd, routesync.AckRejected, "build_id and template_ref are required")
 	}
 	if !types.Profile(cmd.Profile).Valid() {
 		return ack(cmd, routesync.AckRejected, "valid profile is required")
@@ -897,10 +897,19 @@ func (n *stubNode) handleBuildRegister(cmd *routesync.Command) *routesync.CmdAck
 		return ack(cmd, routesync.AckRejected, "stub build rejected")
 	}
 	b := &stubBuild{
-		BuildID: cmd.BuildID, Profile: cmd.Profile, Metadata: cloneStringMap(cmd.Config), State: "registered", TemplateID: cmd.TemplateRef,
+		BuildID: cmd.BuildID, Profile: cmd.Profile, KeyFingerprint: cmd.KeyFingerprint,
+		Metadata: cloneStringMap(cmd.Config), State: "registered", TemplateID: cmd.TemplateRef,
 		Resources: cloneBuildResources(cmd.BuildResources), CreatedAt: time.Now().UTC().Format(time.RFC3339Nano), Behavior: beh,
 	}
 	n.mu.Lock()
+	if existing := n.builds[b.BuildID]; existing != nil {
+		conflict := existing.Profile != b.Profile || existing.TemplateID != b.TemplateID || existing.KeyFingerprint != b.KeyFingerprint
+		n.mu.Unlock()
+		if conflict {
+			return ack(cmd, routesync.AckRejected, "build identity conflicts with existing build")
+		}
+		return ack(cmd, routesync.AckAccepted, "")
+	}
 	n.builds[b.BuildID] = b
 	n.mu.Unlock()
 	n.svc.logEvent(n.ID, "build_register", b.snapshot(n.ID))
@@ -1176,15 +1185,16 @@ func (s *stubSandbox) response() (int, string) {
 }
 
 type stubBuild struct {
-	BuildID    string                    `json:"build_id"`
-	Profile    string                    `json:"profile"`
-	Metadata   map[string]string         `json:"metadata,omitempty"`
-	State      string                    `json:"state"`
-	TemplateID string                    `json:"template_id,omitempty"`
-	Reason     string                    `json:"reason,omitempty"`
-	Resources  *routesync.BuildResources `json:"resources,omitempty"`
-	Behavior   stubBehavior              `json:"behavior,omitempty"`
-	CreatedAt  string                    `json:"created_at,omitempty"`
+	BuildID        string                    `json:"build_id"`
+	Profile        string                    `json:"profile"`
+	KeyFingerprint string                    `json:"-"`
+	Metadata       map[string]string         `json:"metadata,omitempty"`
+	State          string                    `json:"state"`
+	TemplateID     string                    `json:"template_id,omitempty"`
+	Reason         string                    `json:"reason,omitempty"`
+	Resources      *routesync.BuildResources `json:"resources,omitempty"`
+	Behavior       stubBehavior              `json:"behavior,omitempty"`
+	CreatedAt      string                    `json:"created_at,omitempty"`
 }
 
 func (b *stubBuild) snapshot(nodeID string) buildSnapshot {
