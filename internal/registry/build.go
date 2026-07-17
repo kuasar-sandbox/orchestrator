@@ -8,23 +8,26 @@ import (
 
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
+	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
 // BuildReserveResult is the registry-assigned identity + placement for a build
 // (the router returns these to the e2b client + routes its follow-ups by build_id).
 type BuildReserveResult struct {
-	BuildID      string `json:"build_id"`
-	TemplateID   string `json:"template_id"`
-	NodeID       string `json:"node_id"`
-	DataEndpoint string `json:"data_endpoint"`
+	BuildID      string        `json:"build_id"`
+	TemplateID   string        `json:"template_id"`
+	NodeID       string        `json:"node_id"`
+	DataEndpoint string        `json:"data_endpoint"`
+	Profile      types.Profile `json:"profile"`
 }
 
-// BuildReserveReq is the router's build-register ask: the group + the (optional)
-// declared build resources + the template config metadata (cpu/memory/headers).
+// BuildReserveReq is the router's build-register ask: the group + profile, the
+// optional declared resources, and template config metadata (cpu/memory/headers).
 type BuildReserveReq struct {
 	Group      string                    `json:"group"`
 	BuildID    string                    `json:"build_id,omitempty"`
 	TemplateID string                    `json:"template_id,omitempty"`
+	Profile    types.Profile             `json:"profile"`
 	Resources  *routesync.BuildResources `json:"resources,omitempty"`
 	Metadata   map[string]string         `json:"metadata,omitempty"`
 }
@@ -52,6 +55,9 @@ func (r *Registry) ReserveBuild(ctx context.Context, req BuildReserveReq) (*Buil
 	if req.Group == "" {
 		return nil, fmt.Errorf("registry: group is required")
 	}
+	if !req.Profile.Valid() {
+		return nil, fmt.Errorf("registry: unknown build profile %q", req.Profile)
+	}
 	metadata, err := clusterstate.WithObjectLocation(req.Metadata, clusterstate.ObjectLocation{Group: req.Group})
 	if err != nil {
 		return nil, err
@@ -77,6 +83,9 @@ func (r *Registry) ReserveBuild(ctx context.Context, req BuildReserveReq) (*Buil
 		if rec, found, err := r.stores.GetBuildInGroup(ctx, req.Group, req.BuildID); err != nil {
 			return nil, err
 		} else if found {
+			if rec.Profile != req.Profile {
+				return nil, fmt.Errorf("registry: build %s profile is %q, requested %q", req.BuildID, rec.Profile, req.Profile)
+			}
 			return r.buildReserveResult(ctx, rec), nil
 		}
 	}
@@ -122,7 +131,7 @@ func (r *Registry) ReserveBuild(ctx context.Context, req BuildReserveReq) (*Buil
 			continue
 		}
 		// Commit the group build record after node-owner admission succeeds.
-		rec := &BuildRecord{Group: req.Group, BuildID: buildID, NodeID: id, Resources: resources, State: BuildRegistered, TemplateID: templateID}
+		rec := &BuildRecord{Group: req.Group, BuildID: buildID, NodeID: id, Profile: req.Profile, Resources: resources, State: BuildRegistered, TemplateID: templateID}
 		if err := r.stores.PutBuild(ctx, rec); err != nil {
 			r.releaseBuildAdmission(id, req.Group, buildID)
 			return nil, err
@@ -139,7 +148,7 @@ func (r *Registry) ReserveBuild(ctx context.Context, req BuildReserveReq) (*Buil
 		}
 		cmd := &routesync.Command{
 			CmdID: newID(), Kind: routesync.CmdBuildRegister,
-			BuildID: buildID, TemplateRef: templateID, BuildResources: resources, Config: req.Metadata,
+			BuildID: buildID, TemplateRef: templateID, Profile: string(req.Profile), BuildResources: resources, Config: req.Metadata,
 			KeyFingerprint: placement.KeyFingerprint, ImageRepo: placement.ImageRepo, RegistryAuth: placement.RegistryAuth,
 		}
 		if r.nodeOwner == nil {
@@ -190,6 +199,7 @@ func (r *Registry) buildReserveResult(ctx context.Context, rec *BuildRecord) *Bu
 		TemplateID:   rec.TemplateID,
 		NodeID:       rec.NodeID,
 		DataEndpoint: r.nodeDataEndpoint(ctx, rec.NodeID),
+		Profile:      rec.Profile,
 	}
 }
 
@@ -298,5 +308,8 @@ func (r *Registry) ResolveBuild(ctx context.Context, group, buildID string) (*Bu
 	if err != nil || !found {
 		return nil, false
 	}
-	return &BuildReserveResult{BuildID: b.BuildID, TemplateID: b.TemplateID, NodeID: b.NodeID, DataEndpoint: r.nodeDataEndpoint(ctx, b.NodeID)}, true
+	return &BuildReserveResult{
+		BuildID: b.BuildID, TemplateID: b.TemplateID, NodeID: b.NodeID,
+		DataEndpoint: r.nodeDataEndpoint(ctx, b.NodeID), Profile: b.Profile,
+	}, true
 }

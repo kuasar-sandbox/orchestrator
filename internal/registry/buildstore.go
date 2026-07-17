@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
+	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
 // BuildStore is the registry-facing view of build execution state. Builds are
@@ -27,6 +28,7 @@ type BuildRecord struct {
 	Group      string                    `json:"group"`
 	BuildID    string                    `json:"build_id"`
 	NodeID     string                    `json:"node_id"`
+	Profile    types.Profile             `json:"profile"`
 	Resources  *routesync.BuildResources `json:"resources,omitempty"`
 	State      BuildState                `json:"state"`
 	TemplateID string                    `json:"template_id,omitempty"` // assigned template id, refreshed from terminal node events

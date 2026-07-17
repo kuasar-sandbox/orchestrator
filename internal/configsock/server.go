@@ -141,6 +141,7 @@ type Provider interface {
 // creds) ride here over the socket, never on disk.
 type BuildSpec struct {
 	BuildID          string             `json:"build_id"`
+	Profile          string             `json:"profile"`
 	RunID            string             `json:"run_id,omitempty"`
 	Workdir          string             `json:"workdir"` // build scratch dir (artifacts, run roots)
 	FromImage        string             `json:"from_image,omitempty"`

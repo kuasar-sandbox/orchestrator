@@ -6,7 +6,29 @@ import (
 
 	"github.com/kuasar-sandbox/orchestrator/internal/buildcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
+	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
+
+func TestRequestedBuildProfile(t *testing.T) {
+	tests := []struct {
+		raw     string
+		want    types.Profile
+		wantErr bool
+	}{
+		{raw: "", want: types.ProfileE2B},
+		{raw: "e2b", want: types.ProfileE2B},
+		{raw: "bare", want: types.ProfileBare},
+		{raw: "unknown", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.raw, func(t *testing.T) {
+			got, err := requestedBuildProfile(tt.raw)
+			if (err != nil) != tt.wantErr || got != tt.want {
+				t.Fatalf("requestedBuildProfile(%q) = %q, %v; want %q, error=%t", tt.raw, got, err, tt.want, tt.wantErr)
+			}
+		})
+	}
+}
 
 func TestMergeConfigHeaders(t *testing.T) {
 	// No headers => no allocation.

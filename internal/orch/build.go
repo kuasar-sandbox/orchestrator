@@ -30,8 +30,11 @@ var hexKeyRe = regexp.MustCompile(`^[0-9a-f]{64}$`)
 // allowlist, and records a registered build. fromImage is pre-derived from
 // builder_image_uri_mask — the convention the e2b CLI pushes its client-built
 // image under ({templateID}/{buildID}); the v3 trigger may still override it.
-func (o *Orchestrator) newRegisteredBuild(ctx context.Context, apiKey, name string, tags []string, metadata map[string]string) (*types.Build, error) {
-	metadata, builderOpts, err := buildcfg.Extract(metadata)
+func (o *Orchestrator) newRegisteredBuild(ctx context.Context, apiKey string, spec api.RegisterSpec) (*types.Build, error) {
+	if !spec.Profile.Valid() {
+		return nil, fmt.Errorf("%w: unknown build profile %q", api.ErrBadRequest, spec.Profile)
+	}
+	metadata, builderOpts, err := buildcfg.Extract(spec.Metadata)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
 	}
@@ -58,12 +61,12 @@ func (o *Orchestrator) newRegisteredBuild(ctx context.Context, apiKey, name stri
 		BuildID:     bid.String(),
 		TemplateID:  templateID,
 		ManifestKey: manifestKey,
-		Profile:     types.ProfileE2B,
+		Profile:     spec.Profile,
 		Kind:        types.KindImg,
 		Status:      types.BuildRegistered,
 		FromImage:   o.imageURIFromMask(templateID, bid.String()),
-		Names:       nonEmpty(name),
-		Aliases:     append([]string{}, tags...),
+		Names:       nonEmpty(spec.Name),
+		Aliases:     append([]string{}, spec.Tags...),
 		Metadata:    metadata,
 		Builder:     builderOpts,
 		CreatedUnix: time.Now().Unix(),
@@ -76,13 +79,13 @@ func (o *Orchestrator) newRegisteredBuild(ctx context.Context, apiKey, name stri
 
 // RegisterBuild handles POST /v3/templates (e2b v2 build system): record a
 // registered build; the base image + start command arrive at trigger time.
-func (o *Orchestrator) RegisterBuild(ctx context.Context, apiKey, name string, tags []string, metadata map[string]string) (*types.Build, error) {
-	return o.newRegisteredBuild(ctx, apiKey, name, tags, metadata)
+func (o *Orchestrator) RegisterBuild(ctx context.Context, apiKey string, spec api.RegisterSpec) (*types.Build, error) {
+	return o.newRegisteredBuild(ctx, apiKey, spec)
 }
 
 // TriggerBuild handles POST /v2/templates/{tid}/builds/{bid}: record the base
-// image + steps + start command, pick the kind (snp if a start command is set,
-// else img), and queue the build for the pool.
+// image + steps + e2b start command and queue the build for the pool. Bare
+// builds reject start/ready commands and always produce an image.
 func (o *Orchestrator) TriggerBuild(ctx context.Context, apiKey, tid, bid string, spec api.TriggerSpec, auth api.BuildAuth) error {
 	b, err := o.st.GetBuild(ctx, bid)
 	if err != nil {
@@ -90,6 +93,12 @@ func (o *Orchestrator) TriggerBuild(ctx context.Context, apiKey, tid, bid string
 	}
 	if !ownsBuild(b, apiKey) || b.TemplateID != tid {
 		return api.ErrNotFound
+	}
+	if !b.Profile.Valid() {
+		return fmt.Errorf("%w: build has unknown profile %q", api.ErrBadRequest, b.Profile)
+	}
+	if b.Profile == types.ProfileBare && (spec.StartCmd != "" || spec.ReadyCmd != "") {
+		return fmt.Errorf("%w: bare profile builds do not support startCmd or readyCmd", api.ErrBadRequest)
 	}
 	if spec.FromImage != "" && spec.FromTemplate != "" {
 		return fmt.Errorf("build: fromImage and fromTemplate are mutually exclusive")
@@ -156,7 +165,7 @@ func (o *Orchestrator) TriggerBuild(ctx context.Context, apiKey, tid, bid string
 		return err
 	}
 	b.Kind = types.KindImg
-	if spec.StartCmd != "" || b.FromTemplate != "" {
+	if b.Profile == types.ProfileE2B && (spec.StartCmd != "" || b.FromTemplate != "") {
 		// snp is provisional: the pipeline reports what it actually
 		// produced (fromTemplate may inherit start/ready) and the
 		// finalizer recomputes the kind from the result.
@@ -434,6 +443,12 @@ func (o *Orchestrator) executeBuild(ctx context.Context, b *types.Build) {
 		o.log.Warn("build failed", "bid", b.BuildID, "err", err)
 		return
 	}
+	if b.Profile == types.ProfileBare && (res.SnapshotKey != "" || res.StartCmd != "" || res.ReadyCmd != "") {
+		b.Status, b.Reason = types.BuildError, "bare build produced non-image output"
+		_ = o.st.PutBuild(ctx, b)
+		o.publishBuildState(b.BuildID, "error", "", b.Reason)
+		return
+	}
 	switch {
 	case res.SnapshotKey != "":
 		b.Kind = types.KindSnp
@@ -457,6 +472,9 @@ func (o *Orchestrator) executeBuild(ctx context.Context, b *types.Build) {
 }
 
 func (o *Orchestrator) runBuildUnit(ctx context.Context, b *types.Build) (*buildResult, error) {
+	if !b.Profile.Valid() {
+		return nil, fmt.Errorf("build: unknown profile %q", b.Profile)
+	}
 	dir := filepath.Join(o.cfg.Paths.RunRoot, b.BuildID)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
@@ -465,7 +483,7 @@ func (o *Orchestrator) runBuildUnit(ctx context.Context, b *types.Build) (*build
 
 	// One network slot for the whole build; the phase sandboxes reuse it
 	// sequentially (tapfd handoff re-acquires the queue fd each boot).
-	plainIP, cidrIP, err := o.allocInnerIP(types.ProfileE2B, "")
+	plainIP, cidrIP, err := o.allocInnerIP(b.Profile, "")
 	if err != nil {
 		return nil, err
 	}
@@ -475,7 +493,10 @@ func (o *Orchestrator) runBuildUnit(ctx context.Context, b *types.Build) (*build
 	}
 	defer func() { _ = o.vs.Detach(context.Background(), port.Port) }()
 
-	envdTok, _ := keys.MintToken()
+	envdTok := ""
+	if b.Profile == types.ProfileE2B {
+		envdTok, _ = keys.MintToken()
+	}
 	pend := &pendingBuild{
 		build: b, workdir: dir,
 		tapFD: o.vs.TapFD(port.Port), mac: port.MAC,
@@ -493,7 +514,7 @@ func (o *Orchestrator) runBuildUnit(ctx context.Context, b *types.Build) (*build
 
 	// MMDS visibility for the template phase: a synthetic running route
 	// (FC-mode envd resolves {id, token-hash} by its floating IP).
-	if o.cfg.MMDS.Enabled {
+	if b.Profile == types.ProfileE2B && o.cfg.MMDS.Enabled {
 		row := &types.Sandbox{
 			ID: "build-" + b.BuildID, TemplateID: b.TemplateID,
 			State: types.StateRunning, FloatingIP: port.FloatingIP,
@@ -562,6 +583,9 @@ func (o *Orchestrator) BuildSpecFor(ctx context.Context, configID string) (*conf
 		return nil, "", false, nil
 	}
 	b := pend.build
+	if !b.Profile.Valid() {
+		return nil, "", false, fmt.Errorf("build: unknown profile %q", b.Profile)
+	}
 
 	env := map[string]string{"MANIFEST_KEY": b.ManifestKey}
 	if b.RegistryAuth != "" {
@@ -616,6 +640,7 @@ func (o *Orchestrator) BuildSpecFor(ctx context.Context, configID string) (*conf
 
 	spec := &configsock.BuildSpec{
 		BuildID:          b.BuildID,
+		Profile:          string(b.Profile),
 		RunID:            b.RunID,
 		Workdir:          pend.workdir,
 		FromImage:        b.FromImage,
@@ -639,13 +664,13 @@ func (o *Orchestrator) BuildSpecFor(ctx context.Context, configID string) (*conf
 			TapFD:    buildTapFD(pend.tapFD),
 			MAC:      pend.mac,
 			InnerIP:  pend.innerIP,
-			Nexthop:  o.innerGateway(types.ProfileE2B),
+			Nexthop:  o.innerGateway(b.Profile),
 			Hostname: "build-" + shortID(b.BuildID),
 			DNS:      o.cfg.Sandbox.Network.DNS,
 		},
 		VCPU:          vcpu,
 		Memory:        mem,
-		MMDSEnabled:   o.cfg.MMDS.Enabled,
+		MMDSEnabled:   b.Profile == types.ProfileE2B && o.cfg.MMDS.Enabled,
 		EnvdToken:     pend.envdToken,
 		Insecure:      o.cfg.Builder.InsecureRegistry,
 		Platform:      o.cfg.Builder.Platform,

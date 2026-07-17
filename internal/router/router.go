@@ -29,6 +29,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/metrics"
 	proxypkg "github.com/kuasar-sandbox/orchestrator/internal/proxy"
 	"github.com/kuasar-sandbox/orchestrator/internal/registry"
+	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
 // Headers the cluster ingress reads (cluster.md).
@@ -294,10 +295,11 @@ func (rt *Router) handleCreate(w http.ResponseWriter, r *http.Request) {
 // buildReserveResult mirrors registry.BuildReserveResult (the registry assigns the
 // build/template ids + places the build, §7.5).
 type buildReserveResult struct {
-	BuildID      string `json:"build_id"`
-	TemplateID   string `json:"template_id"`
-	NodeID       string `json:"node_id"`
-	DataEndpoint string `json:"data_endpoint"`
+	BuildID      string        `json:"build_id"`
+	TemplateID   string        `json:"template_id"`
+	NodeID       string        `json:"node_id"`
+	DataEndpoint string        `json:"data_endpoint"`
+	Profile      types.Profile `json:"profile"`
 }
 
 // handleBuildRegister reserves + pre-provisions a build via the registry (which
@@ -317,15 +319,25 @@ func (rt *Router) handleBuildRegister(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Name     string   `json:"name"`
 		Tags     []string `json:"tags"`
+		Profile  string   `json:"profile"`
 		CPUCount int      `json:"cpuCount"`
 		MemoryMB int      `json:"memoryMB"`
 	}
 	_ = json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body)
+	profile := types.ProfileE2B
+	if body.Profile != "" {
+		var err error
+		profile, err = types.ParseProfile(body.Profile)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+	}
 	var resources *buildResources
 	if body.CPUCount > 0 || body.MemoryMB > 0 {
 		resources = &buildResources{CPU: body.CPUCount * 1000, Mem: int64(body.MemoryMB) << 20}
 	}
-	res, err := rt.routeLinkReserveBuild(r.Context(), group, resources)
+	res, err := rt.routeLinkReserveBuild(r.Context(), group, profile, resources)
 	if err != nil {
 		rt.log.Warn("router: reserve-build", "group", group, "err", err)
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
@@ -339,6 +351,7 @@ func (rt *Router) handleBuildRegister(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"templateID": res.TemplateID, "buildID": res.BuildID,
 		"public": false, "names": nonEmptySlice(body.Name), "tags": body.Tags, "aliases": body.Tags,
+		"profile": res.Profile,
 	})
 }
 
@@ -994,9 +1007,9 @@ func (rt *Router) reserveByKey(ctx context.Context, group, routeKey string) (*re
 	return f.res, f.err
 }
 
-func (rt *Router) routeLinkReserveBuild(ctx context.Context, group string, resources *buildResources) (*buildReserveResult, error) {
+func (rt *Router) routeLinkReserveBuild(ctx context.Context, group string, profile types.Profile, resources *buildResources) (*buildReserveResult, error) {
 	reqBody, _ := json.Marshal(map[string]any{
-		"group": group, "build_id": "bld-" + randomHexID(), "template_id": "transient-" + randomHexID(), "resources": resources,
+		"group": group, "build_id": "bld-" + randomHexID(), "template_id": "transient-" + randomHexID(), "profile": profile, "resources": resources,
 	})
 	resp, err := rt.routeLinkHTTP(ctx, group, http.MethodPost, registry.RouteLinkReserveBuildPath, reqBody, map[string]string{"Content-Type": "application/json"})
 	if err != nil {

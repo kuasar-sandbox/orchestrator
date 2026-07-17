@@ -33,6 +33,31 @@ func TestDecodeImportRefererLookupRequiresDigestSubject(t *testing.T) {
 	}
 }
 
+func TestValidateBuildProfile(t *testing.T) {
+	tests := []struct {
+		name    string
+		spec    configsock.BuildSpec
+		want    string
+		wantErr bool
+	}{
+		{name: "e2b", spec: configsock.BuildSpec{Profile: "e2b"}, want: "e2b"},
+		{name: "e2b start", spec: configsock.BuildSpec{Profile: "e2b", StartCmd: "serve"}, want: "e2b"},
+		{name: "bare", spec: configsock.BuildSpec{Profile: "bare"}, want: "bare"},
+		{name: "bare start", spec: configsock.BuildSpec{Profile: "bare", StartCmd: "serve"}, wantErr: true},
+		{name: "bare ready", spec: configsock.BuildSpec{Profile: "bare", ReadyCmd: "check"}, wantErr: true},
+		{name: "missing", spec: configsock.BuildSpec{}, wantErr: true},
+		{name: "unknown", spec: configsock.BuildSpec{Profile: "other"}, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := validateBuildProfile(&tt.spec)
+			if (err != nil) != tt.wantErr || string(got) != tt.want {
+				t.Fatalf("validateBuildProfile() = %q, %v; want %q, error=%t", got, err, tt.want, tt.wantErr)
+			}
+		})
+	}
+}
+
 // TestParseTemplateDisk covers the fromTemplate disk extraction: a base
 // template's `sandbox-ctl info --json` must yield both the erofs base image
 // AND its accumulated overlay diff (the read-only lower a cold-start stacks

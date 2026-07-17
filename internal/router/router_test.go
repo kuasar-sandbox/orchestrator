@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/clusterclient"
+	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
 func TestExtractBuildID(t *testing.T) {
@@ -94,7 +95,7 @@ func TestReserveBuildRequestCarriesStableIDsAcrossRouteLinkRetry(t *testing.T) {
 			t.Fatal(err)
 		}
 		bodies = append(bodies, body)
-		return textResponse(http.StatusOK, `{"build_id":"`+body["build_id"].(string)+`","template_id":"`+body["template_id"].(string)+`","node_id":"n1"}`), nil
+		return textResponse(http.StatusOK, `{"build_id":"`+body["build_id"].(string)+`","template_id":"`+body["template_id"].(string)+`","node_id":"n1","profile":"`+body["profile"].(string)+`"}`), nil
 	})}
 	rt := &Router{routeRegistry: routeRegistryFunc(func(context.Context, string) ([]clusterclient.Endpoint, error) {
 		return []clusterclient.Endpoint{
@@ -103,7 +104,7 @@ func TestReserveBuildRequestCarriesStableIDsAcrossRouteLinkRetry(t *testing.T) {
 		}, nil
 	})}
 
-	res, err := rt.routeLinkReserveBuild(context.Background(), "/g", nil)
+	res, err := rt.routeLinkReserveBuild(context.Background(), "/g", types.ProfileBare, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -116,8 +117,14 @@ func TestReserveBuildRequestCarriesStableIDsAcrossRouteLinkRetry(t *testing.T) {
 	if bodies[0]["build_id"] != bodies[1]["build_id"] || bodies[0]["template_id"] != bodies[1]["template_id"] {
 		t.Fatalf("reserve-build retry changed ids: %v then %v", bodies[0], bodies[1])
 	}
+	if bodies[0]["profile"] != string(types.ProfileBare) || bodies[1]["profile"] != string(types.ProfileBare) {
+		t.Fatalf("reserve-build retry lost profile: %v then %v", bodies[0], bodies[1])
+	}
 	if res.BuildID != bodies[0]["build_id"] || res.TemplateID != bodies[0]["template_id"] {
 		t.Fatalf("reserve result=%+v bodies=%v", res, bodies)
+	}
+	if res.Profile != types.ProfileBare {
+		t.Fatalf("reserve profile=%q, want %q", res.Profile, types.ProfileBare)
 	}
 }
 
@@ -264,6 +271,7 @@ func textResponse(code int, body string) *http.Response {
 // follow-up trigger routes to the same node.
 func TestBuildRoutingThroughRouter(t *testing.T) {
 	var triggeredBuild string
+	var reserveProfiles []string
 	node := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/templates"):
@@ -283,7 +291,20 @@ func TestBuildRoutingThroughRouter(t *testing.T) {
 		case "/route-link/reserve-build":
 			// The registry assigns the build/template ids + places it (§7.5); the
 			// router synthesizes the e2b register response and routes follow-ups.
-			_ = json.NewEncoder(w).Encode(buildReserveResult{BuildID: "b1", TemplateID: "t1", NodeID: "n1", DataEndpoint: nodeHost})
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			profile, ok := body["profile"].(string)
+			if !ok {
+				http.Error(w, "profile missing", http.StatusBadRequest)
+				return
+			}
+			reserveProfiles = append(reserveProfiles, profile)
+			_ = json.NewEncoder(w).Encode(buildReserveResult{
+				BuildID: "b1", TemplateID: "t1", NodeID: "n1", DataEndpoint: nodeHost, Profile: types.ProfileE2B,
+			})
 		case "/route-link/verify-key":
 			w.WriteHeader(http.StatusOK)
 		default:
@@ -296,6 +317,19 @@ func TestBuildRoutingThroughRouter(t *testing.T) {
 	srv := httptest.NewServer(rt.Handler())
 	defer srv.Close()
 
+	badReq, _ := http.NewRequest(http.MethodPost, srv.URL+"/v3/templates", strings.NewReader(`{"profile":"unknown"}`))
+	badReq.Host = "api.test.local"
+	badReq.Header.Set(HeaderGroup, "/g")
+	badReq.Header.Set(HeaderAPIKey, "e2b_test")
+	badResp, err := http.DefaultClient.Do(badReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	badResp.Body.Close()
+	if badResp.StatusCode != http.StatusBadRequest || len(reserveProfiles) != 0 {
+		t.Fatalf("invalid profile status=%d reserveProfiles=%v", badResp.StatusCode, reserveProfiles)
+	}
+
 	// register a build via the router (control plane: Host api.<domain> + group).
 	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/v3/templates", nil)
 	req.Host = "api.test.local"
@@ -307,11 +341,12 @@ func TestBuildRoutingThroughRouter(t *testing.T) {
 	}
 	var reg struct {
 		BuildID string `json:"buildID"`
+		Profile string `json:"profile"`
 	}
 	_ = json.NewDecoder(resp.Body).Decode(&reg)
 	resp.Body.Close()
-	if reg.BuildID != "b1" {
-		t.Fatalf("register passed through buildID=%q, want b1", reg.BuildID)
+	if reg.BuildID != "b1" || reg.Profile != string(types.ProfileE2B) || len(reserveProfiles) != 1 || reserveProfiles[0] != string(types.ProfileE2B) {
+		t.Fatalf("register result=%+v reserveProfiles=%v", reg, reserveProfiles)
 	}
 
 	// a trigger for b1 (no group header) must route to the recorded node.

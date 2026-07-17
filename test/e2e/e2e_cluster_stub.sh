@@ -571,10 +571,10 @@ code="$(http_code "$WORK/build.body" -X POST \
     "http://127.0.0.1:$ROUTER_PORT/v3/templates" || true)"
 [ "$code" = "202" ] || fail "build register returned $code: $(cat "$WORK/build.body")"
 
-python3 - "$ADMIN" <<'PY' || fail "build_register command was not observed"
+python3 - "$ADMIN" <<'PY' || fail "build_register command with default e2b profile was not observed"
 import json, sys, urllib.request
 cmds = json.load(urllib.request.urlopen(sys.argv[1] + "/v1/commands", timeout=2))
-assert any(c.get("kind") == "build_register" for c in cmds), cmds
+assert any(c.get("kind") == "build_register" and c.get("profile") == "e2b" for c in cmds), cmds
 PY
 
 step "checking unowned node-local route isolation"
