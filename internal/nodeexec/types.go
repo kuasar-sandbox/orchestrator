@@ -46,31 +46,33 @@ const (
 )
 
 type DispatchRecord struct {
-	Kind               clusterstate.ExecutionKind
-	ObjectID           string
-	Group              string
-	RouteKey           string
-	NodeID             string
-	NodeEpoch          uint64
-	DataEndpoint       string
-	NormalizedDemand   []byte
-	DemandDigest       string
-	DispatchSpec       []byte
-	DispatchSpecDigest string
-	OpaqueBinding      string
-	BindingDigest      string
-	BuildDemand        placement.BuildDemand
+	Kind                  clusterstate.ExecutionKind
+	ObjectID              string
+	Group                 string
+	RouteKey              string
+	NodeID                string
+	NodeEpoch             uint64
+	DataEndpoint          string
+	NormalizedDemand      []byte
+	DemandDigest          string
+	DispatchSpec          []byte
+	DispatchSpecDigest    string
+	ProviderPolicyVersion string
+	OpaqueBinding         string
+	BindingDigest         string
+	BuildDemand           placement.BuildDemand
 }
 
 func DispatchRecordFromCommand(command session.DispatchCommand) (DispatchRecord, error) {
 	record := DispatchRecord{
 		Kind: command.Kind, ObjectID: command.ObjectID, Group: command.Group, RouteKey: command.RouteKey,
 		NodeID: command.NodeID, NodeEpoch: command.NodeEpoch, DataEndpoint: command.DataEndpoint,
-		NormalizedDemand:   append([]byte(nil), command.Intent.NormalizedDemand...),
-		DemandDigest:       command.Intent.DemandDigest,
-		DispatchSpec:       append([]byte(nil), command.Intent.DispatchSpec...),
-		DispatchSpecDigest: command.Intent.DispatchSpecDigest,
-		OpaqueBinding:      command.Binding.OpaqueBinding, BindingDigest: command.Binding.BindingDigest,
+		NormalizedDemand:      append([]byte(nil), command.Intent.NormalizedDemand...),
+		DemandDigest:          command.Intent.DemandDigest,
+		DispatchSpec:          append([]byte(nil), command.Intent.DispatchSpec...),
+		DispatchSpecDigest:    command.Intent.DispatchSpecDigest,
+		ProviderPolicyVersion: command.Intent.ProviderPolicyVersion,
+		OpaqueBinding:         command.Binding.OpaqueBinding, BindingDigest: command.Binding.BindingDigest,
 	}
 	if err := command.Intent.Validate(); err != nil {
 		return DispatchRecord{}, err
@@ -145,7 +147,7 @@ func DispatchCommandFromWire(wire *routesync.Command, local LocalSessionIdentity
 
 func (r DispatchRecord) Validate() error {
 	if r.ObjectID == "" || r.Group == "" || r.NodeID == "" || r.NodeEpoch == 0 || r.DataEndpoint == "" ||
-		len(r.NormalizedDemand) == 0 || len(r.DispatchSpec) == 0 || r.OpaqueBinding == "" {
+		len(r.NormalizedDemand) == 0 || len(r.DispatchSpec) == 0 || r.ProviderPolicyVersion == "" || r.OpaqueBinding == "" {
 		return errors.New("nodeexec: incomplete dispatch record")
 	}
 	if r.Kind == clusterstate.ExecutionKindSandbox && r.RouteKey == "" {
@@ -197,7 +199,8 @@ func (r DispatchRecord) SameDispatch(other DispatchRecord) bool {
 	return r.Kind == other.Kind && r.ObjectID == other.ObjectID && r.Group == other.Group &&
 		r.RouteKey == other.RouteKey && r.NodeID == other.NodeID && r.NodeEpoch == other.NodeEpoch &&
 		r.DataEndpoint == other.DataEndpoint && r.DemandDigest == other.DemandDigest &&
-		r.DispatchSpecDigest == other.DispatchSpecDigest && r.OpaqueBinding == other.OpaqueBinding &&
+		r.DispatchSpecDigest == other.DispatchSpecDigest && r.ProviderPolicyVersion == other.ProviderPolicyVersion &&
+		r.OpaqueBinding == other.OpaqueBinding &&
 		r.BindingDigest == other.BindingDigest && bytes.Equal(r.NormalizedDemand, other.NormalizedDemand) &&
 		bytes.Equal(r.DispatchSpec, other.DispatchSpec)
 }

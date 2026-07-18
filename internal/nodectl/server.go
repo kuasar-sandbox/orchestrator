@@ -649,16 +649,18 @@ func (i *IdleSweeper) sweep() {
 	i.State.Lock()
 	defer i.State.Unlock()
 
-	swept := false
+	removed := make(map[string]*Reservation)
+	preparedBefore := make(map[string]PreparedSandboxAdmission)
 	for token, res := range i.State.Reservations {
 		// Creating-stage TTL.
 		if IsPreSettled(res.Stage) &&
 			now.Sub(res.StageEnteredAt) > i.StartupTTL {
 			i.Logf("sweep: token %s sid=%s exceeded startup TTL, releasing",
 				token[:8], res.SandboxID)
-			i.Allocator.CleanupHistory(token)
+			i.rememberPreparedLocked(res, preparedBefore)
+			i.releasePreparedLocked(res, "reservation_expired", now)
+			removed[token] = res
 			delete(i.State.Reservations, token)
-			swept = true
 			continue
 		}
 		// Heartbeat staleness — only when conn is gone (live conn keeps
@@ -667,16 +669,51 @@ func (i *IdleSweeper) sweep() {
 			now.Sub(res.LastHeartbeatAt) > 3*i.Heartbeat {
 			i.Logf("sweep: token %s sid=%s no heartbeat for %v, releasing",
 				token[:8], res.SandboxID, now.Sub(res.LastHeartbeatAt))
-			i.Allocator.CleanupHistory(token)
+			i.rememberPreparedLocked(res, preparedBefore)
+			i.releasePreparedLocked(res, "reservation_heartbeat_expired", now)
+			removed[token] = res
 			delete(i.State.Reservations, token)
-			swept = true
 		}
 	}
-	if swept {
-		// Headroom may have just opened up — wake admission worker.
-		i.Admission.PushWake()
+	if len(removed) == 0 {
+		return
 	}
 	if err := i.Persister.Flush(i.State); err != nil {
+		for token, reservation := range removed {
+			i.State.Reservations[token] = reservation
+		}
+		for sandboxID, before := range preparedBefore {
+			if record := i.State.PreparedSandboxAdmissions[sandboxID]; record != nil {
+				*record = before
+			}
+		}
 		log.Printf("[node-ctl] sweep persist: %v", err)
+		return
 	}
+	for token := range removed {
+		i.Allocator.CleanupHistory(token)
+	}
+	// Durable release opens headroom for the admission worker.
+	i.Admission.PushWake()
+}
+
+func (i *IdleSweeper) rememberPreparedLocked(
+	res *Reservation,
+	before map[string]PreparedSandboxAdmission,
+) {
+	record := i.State.PreparedSandboxAdmissions[res.SandboxID]
+	if record != nil && record.ReservationToken == res.Token {
+		before[res.SandboxID] = *record
+	}
+}
+
+func (i *IdleSweeper) releasePreparedLocked(res *Reservation, reason string, now time.Time) {
+	record := i.State.PreparedSandboxAdmissions[res.SandboxID]
+	if record == nil || record.ReservationToken != res.Token ||
+		(record.State != PreparedAdmitted && record.State != PreparedClaimed) {
+		return
+	}
+	record.State = PreparedReleased
+	record.Reason = reason
+	record.UpdatedAt = now
 }

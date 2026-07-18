@@ -248,6 +248,22 @@ func (c *PreparedAdmissionController) ClaimAdmission(sandboxID, demandDigest str
 		c.state.Unlock()
 		return result, nil
 	}
+	reservation := c.state.Lookup(record.ReservationToken)
+	if reservation == nil || reservation.SandboxID != sandboxID {
+		previous := *record
+		record.State = PreparedReleased
+		record.Reason = "reservation_missing"
+		record.UpdatedAt = c.clock()
+		if err := c.persister.Flush(c.state); err != nil {
+			*record = previous
+			c.state.Unlock()
+			return PreparedAdmissionResult{}, err
+		}
+		result := preparedResult(record)
+		c.state.Unlock()
+		c.notify()
+		return result, nil
+	}
 	if record.State == PreparedAdmitted {
 		previous := *record
 		record.State = PreparedClaimed
@@ -356,12 +372,14 @@ func (c *PreparedAdmissionController) PromoteQueued() ([]PreparedAdmissionResult
 
 	changed := make([]PreparedAdmissionResult, 0)
 	for _, queued := range queue {
-		outcome := c.admission.AnalyzeAndConsume(queued.Demand.message(queued.SandboxID))
-		if outcome.Status == OutcomeShortTermBlock {
-			if c.queueTTL <= 0 || c.clock().Sub(queued.QueuedAt) < c.queueTTL {
+		var outcome Outcome
+		if c.queueTTL > 0 && c.clock().Sub(queued.QueuedAt) >= c.queueTTL {
+			outcome = Outcome{Status: OutcomeLongTermReject, RejectCode: "queue_expired"}
+		} else {
+			outcome = c.admission.AnalyzeAndConsume(queued.Demand.message(queued.SandboxID))
+			if outcome.Status == OutcomeShortTermBlock {
 				break
 			}
-			outcome = Outcome{Status: OutcomeLongTermReject, RejectCode: "queue_expired"}
 		}
 		c.state.Lock()
 		record := c.state.PreparedSandboxAdmissions[queued.SandboxID]

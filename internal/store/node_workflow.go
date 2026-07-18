@@ -23,7 +23,7 @@ var (
 )
 
 const workflowColumns = `object_kind,object_id,group_name,route_key,node_id,node_epoch,data_endpoint,
-  normalized_demand,demand_digest,dispatch_spec,dispatch_spec_digest,opaque_binding,binding_digest,
+  normalized_demand,demand_digest,dispatch_spec,dispatch_spec_digest,provider_policy_version,opaque_binding,binding_digest,
   build_demand_json,admission_state,result,reason,reservation_token,queue_sequence,resource_claimed,
   object_state,event_seq,acked_event_seq,latest_event_json,workflow_finalized`
 
@@ -36,7 +36,7 @@ func scanNodeWorkflow(row interface{ Scan(...any) error }) (*nodeexec.WorkflowRe
 	if err := row.Scan(
 		&kind, &record.ObjectID, &record.Group, &record.RouteKey, &record.NodeID, &nodeEpoch, &record.DataEndpoint,
 		&record.NormalizedDemand, &record.DemandDigest, &record.DispatchSpec, &record.DispatchSpecDigest,
-		&record.OpaqueBinding, &record.BindingDigest, &buildDemandJSON, &admissionState, &result,
+		&record.ProviderPolicyVersion, &record.OpaqueBinding, &record.BindingDigest, &buildDemandJSON, &admissionState, &result,
 		&record.Reason, &record.ReservationToken, &queueSequence, &resourceClaimed,
 		&record.ObjectState, &eventSeq, &ackedEventSeq, &latestEventJSON, &finalized,
 	); err != nil {
@@ -665,15 +665,15 @@ func insertNodeWorkflowTx(ctx context.Context, tx *sql.Tx, record *nodeexec.Work
 	}
 	now := time.Now().Unix()
 	_, err = tx.ExecContext(ctx, `
-INSERT INTO node_workflows (
-  object_kind,object_id,group_name,route_key,node_id,node_epoch,data_endpoint,normalized_demand,demand_digest,
-  dispatch_spec,dispatch_spec_digest,opaque_binding,binding_digest,build_demand_json,
-  admission_state,result,reason,reservation_token,queue_sequence,resource_claimed,object_state,
-  event_seq,acked_event_seq,latest_event_json,workflow_finalized,created_unix,updated_unix)
-VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+	INSERT INTO node_workflows (
+	  object_kind,object_id,group_name,route_key,node_id,node_epoch,data_endpoint,normalized_demand,demand_digest,
+	  dispatch_spec,dispatch_spec_digest,provider_policy_version,opaque_binding,binding_digest,build_demand_json,
+	  admission_state,result,reason,reservation_token,queue_sequence,resource_claimed,object_state,
+	  event_seq,acked_event_seq,latest_event_json,workflow_finalized,created_unix,updated_unix)
+	VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		record.Kind, record.ObjectID, record.Group, record.RouteKey, record.NodeID, encodeUint64(record.NodeEpoch),
 		record.DataEndpoint, record.NormalizedDemand, record.DemandDigest, record.DispatchSpec, record.DispatchSpecDigest,
-		record.OpaqueBinding, record.BindingDigest, string(buildDemandJSON), record.AdmissionState, record.Result,
+		record.ProviderPolicyVersion, record.OpaqueBinding, record.BindingDigest, string(buildDemandJSON), record.AdmissionState, record.Result,
 		record.Reason, record.ReservationToken, encodeUint64(record.QueueSequence), boolInt(record.ResourceClaimed),
 		record.ObjectState, encodeUint64(record.EventSeq), encodeUint64(record.AckedEventSeq), latestEventJSON,
 		boolInt(record.WorkflowFinalized), now, now)

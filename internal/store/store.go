@@ -115,6 +115,7 @@ CREATE TABLE IF NOT EXISTS node_workflows (
   demand_digest        TEXT NOT NULL,
   dispatch_spec        BLOB NOT NULL,
   dispatch_spec_digest TEXT NOT NULL,
+  provider_policy_version TEXT NOT NULL,
   opaque_binding       TEXT NOT NULL,
   binding_digest       TEXT NOT NULL,
   build_demand_json    TEXT NOT NULL DEFAULT '{}',

@@ -200,6 +200,127 @@ func TestPreparedAdmissionQueueExpiryIsDurableAndDefinitive(t *testing.T) {
 	}
 }
 
+func TestPreparedAdmissionExpiryWinsWhenCapacityBecomesAvailable(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	state := preparedTestState()
+	state.Lock()
+	state.Reservations["blocker"] = &Reservation{
+		Token: "blocker", AllocatableNowMem: 15 << 30,
+		Floor: Resources{MemoryBytes: 15 << 30}, Stage: StageSettled,
+	}
+	state.Unlock()
+	controller := preparedTestController(t, state, path, 4)
+	now := time.Unix(1000, 0)
+	controller.clock = func() time.Time { return now }
+	controller.queueTTL = time.Minute
+	digest := preparedDigest("expired-with-capacity")
+	queued, err := controller.PrepareAdmission("sandbox-1", digest, preparedTestDemand(1<<30))
+	if err != nil || queued.State != PreparedQueued {
+		t.Fatalf("queued = %+v, %v", queued, err)
+	}
+	state.Lock()
+	state.Remove("blocker")
+	state.Unlock()
+	now = now.Add(time.Minute)
+
+	changed, err := controller.PromoteQueued()
+	if err != nil || len(changed) != 1 || changed[0].State != PreparedRejected || changed[0].Reason != "queue_expired" {
+		t.Fatalf("expired with available capacity = %+v, %v", changed, err)
+	}
+	state.Lock()
+	defer state.Unlock()
+	if state.Lookup(queued.ReservationToken) != nil {
+		t.Fatal("expired queue entry consumed capacity")
+	}
+}
+
+func TestPreparedAdmissionClaimFailsClosedAfterReservationLoss(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	state := preparedTestState()
+	controller := preparedTestController(t, state, path, 4)
+	digest := preparedDigest("missing-reservation")
+	prepared, err := controller.PrepareAdmission("sandbox-1", digest, preparedTestDemand(1<<30))
+	if err != nil || prepared.State != PreparedAdmitted {
+		t.Fatalf("prepared = %+v, %v", prepared, err)
+	}
+	state.Lock()
+	state.Remove(prepared.ReservationToken)
+	state.Unlock()
+
+	claimed, err := controller.ClaimAdmission("sandbox-1", digest)
+	if err != nil || claimed.State != PreparedReleased || claimed.Reason != "reservation_missing" {
+		t.Fatalf("claim after reservation loss = %+v, %v", claimed, err)
+	}
+	loaded, err := (&Persister{Path: path}).Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record := loaded.PreparedSandboxAdmissions["sandbox-1"]; record == nil ||
+		record.State != PreparedReleased || record.Reason != "reservation_missing" {
+		t.Fatalf("durable missing-reservation fence = %+v", record)
+	}
+}
+
+func TestIdleSweeperReleasesPreparedAdmissionWithReservation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	state := preparedTestState()
+	controller := preparedTestController(t, state, path, 4)
+	digest := preparedDigest("swept-reservation")
+	prepared, err := controller.PrepareAdmission("sandbox-1", digest, preparedTestDemand(1<<30))
+	if err != nil || prepared.State != PreparedAdmitted {
+		t.Fatalf("prepared = %+v, %v", prepared, err)
+	}
+	state.Lock()
+	state.Reservations[prepared.ReservationToken].StageEnteredAt = time.Now().Add(-time.Minute)
+	state.Unlock()
+	sweeper := &IdleSweeper{
+		State: state, Admission: controller.admission,
+		Allocator: NewAllocator(AllocatorPolicy{}), Persister: &Persister{Path: path},
+		StartupTTL: time.Second, Logf: t.Logf,
+	}
+	sweeper.sweep()
+
+	result, err := controller.GetAdmission("sandbox-1", digest)
+	if err != nil || result.State != PreparedReleased || result.Reason != "reservation_expired" {
+		t.Fatalf("swept admission = %+v, %v", result, err)
+	}
+	state.Lock()
+	defer state.Unlock()
+	if state.Lookup(prepared.ReservationToken) != nil {
+		t.Fatal("swept reservation remains allocated")
+	}
+}
+
+func TestIdleSweeperDoesNotReleaseCapacityWithoutDurableState(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	state := preparedTestState()
+	controller := preparedTestController(t, state, path, 4)
+	digest := preparedDigest("failed-sweep")
+	prepared, err := controller.PrepareAdmission("sandbox-1", digest, preparedTestDemand(1<<30))
+	if err != nil || prepared.State != PreparedAdmitted {
+		t.Fatalf("prepared = %+v, %v", prepared, err)
+	}
+	state.Lock()
+	state.Reservations[prepared.ReservationToken].StageEnteredAt = time.Now().Add(-time.Minute)
+	state.Unlock()
+	sweeper := &IdleSweeper{
+		State: state, Admission: controller.admission,
+		Allocator: NewAllocator(AllocatorPolicy{}), Persister: &Persister{Path: "/dev/null/state.json"},
+		StartupTTL: time.Second, Logf: t.Logf,
+	}
+	sweeper.sweep()
+
+	result, err := controller.GetAdmission("sandbox-1", digest)
+	if err != nil || result.State != PreparedAdmitted {
+		t.Fatalf("failed sweep changed admission = %+v, %v", result, err)
+	}
+	state.Lock()
+	defer state.Unlock()
+	if state.Lookup(prepared.ReservationToken) == nil {
+		t.Fatal("failed sweep released capacity before durable state")
+	}
+}
+
 func TestPreparedAdmissionFinalizationRequiresReleasedResources(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.json")
 	state := preparedTestState()

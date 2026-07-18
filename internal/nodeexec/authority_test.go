@@ -199,6 +199,16 @@ func TestAuthorityBuildDispatchIsDurableAndSessionFenced(t *testing.T) {
 	if err != nil || retry != reply {
 		t.Fatalf("retry = %+v, %v; want %+v", retry, err, reply)
 	}
+	policyChanged := command
+	policyChanged.Intent.ProviderPolicyVersion = "provider-v2/policy-v2"
+	conflict, err := authority.AdmitAndDispatch(context.Background(), policyChanged)
+	if err != nil || conflict.Outcome != clusterstate.DispatchConflict {
+		t.Fatalf("policy-version conflict = %+v, %v", conflict, err)
+	}
+	stored, err := st.GetNodeWorkflow(context.Background(), clusterstate.ExecutionKindBuild, command.ObjectID)
+	if err != nil || stored.ProviderPolicyVersion != command.Intent.ProviderPolicyVersion {
+		t.Fatalf("durable policy version = %+v, %v", stored, err)
+	}
 	command.SessionSeq = 10
 	stale, err := authority.AdmitAndDispatch(context.Background(), command)
 	if err != nil || stale.Outcome != clusterstate.DispatchSessionMoved {
@@ -416,6 +426,7 @@ func TestDispatchCommandFromWireUsesBusinessIDAndExactIntent(t *testing.T) {
 	if got.Kind != clusterstate.ExecutionKindSandbox || got.ObjectID != want.ObjectID || got.Group != want.Group ||
 		got.RouteKey != want.RouteKey || got.NodeID != want.NodeID || got.NodeEpoch != want.NodeEpoch ||
 		got.SessionSeq != want.SessionSeq || got.Binding != want.Binding ||
+		got.Intent.ProviderPolicyVersion != want.Intent.ProviderPolicyVersion ||
 		!bytes.Equal(got.Intent.NormalizedDemand, want.Intent.NormalizedDemand) ||
 		!bytes.Equal(got.Intent.DispatchSpec, want.Intent.DispatchSpec) {
 		t.Fatalf("wire dispatch = %+v, want %+v", got, want)
