@@ -39,8 +39,8 @@ type WorkflowJournal interface {
 	AdmitQueuedSandbox(context.Context, string, string, string) (*WorkflowRecord, error)
 	ClaimSandboxWorkflow(context.Context, string, string, string) (*WorkflowRecord, error)
 	PrepareBuildWorkflow(context.Context, DispatchRecord, *types.Build, BuildCapacity, string) (*WorkflowRecord, error)
-	PromoteBuildQueue(context.Context, BuildCapacity, int) ([]*WorkflowRecord, error)
-	FailQueuedBuildWorkflows(context.Context, string, int) ([]*WorkflowRecord, error)
+	PromoteBuildQueue(context.Context, string, uint64, BuildCapacity, int) ([]*WorkflowRecord, error)
+	FailQueuedBuildWorkflows(context.Context, string, uint64, string, int) ([]*WorkflowRecord, error)
 	ClaimBuildWorkflow(context.Context, string, string) (*WorkflowRecord, error)
 	LaunchableNodeWorkflows(context.Context, clusterstate.ExecutionKind, string, uint64, string, int) ([]*WorkflowRecord, error)
 	SandboxWorkflowsForReconcile(context.Context, string, uint64, string, int) ([]*WorkflowRecord, error)
@@ -441,14 +441,23 @@ func (a *Authority) PromoteBuildQueue(ctx context.Context) ([]*WorkflowRecord, e
 		return nil, ErrSessionFenced
 	}
 	defer done()
+	identity, err := a.identity(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if err := identity.Validate(); err != nil {
+		return nil, err
+	}
 	capacity, safetyReason, err := a.buildCapacity(ctx)
 	if err != nil {
 		return nil, err
 	}
 	if safetyReason != "" {
-		return a.journal.FailQueuedBuildWorkflows(ctx, safetyReason, a.buildBatchSize)
+		return a.journal.FailQueuedBuildWorkflows(
+			ctx, identity.NodeID, identity.NodeEpoch, safetyReason, a.buildBatchSize)
 	}
-	promoted, err := a.journal.PromoteBuildQueue(ctx, capacity, a.buildBatchSize)
+	promoted, err := a.journal.PromoteBuildQueue(
+		ctx, identity.NodeID, identity.NodeEpoch, capacity, a.buildBatchSize)
 	if err == nil && len(promoted) > 0 {
 		a.notifyWork()
 	}

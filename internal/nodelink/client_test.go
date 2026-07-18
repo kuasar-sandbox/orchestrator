@@ -3,6 +3,7 @@ package nodelink
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -331,6 +332,40 @@ func TestNodeLinkOutboxPrioritizesCommandThenDurableEventBeforeHeartbeat(t *test
 	third := receiveOutboxMsg(t, outbox)
 	if third.Type != routesync.TypeHeartbeat || third.Beat == nil || third.Beat.Counts != 7 {
 		t.Fatalf("third outbox msg=%+v, want latest heartbeat", third)
+	}
+}
+
+func TestNodeLinkOutboxBoundsEventBurstBeforeHeartbeat(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	outbox := make(chan *routesync.Msg, 64)
+	highOut := make(chan *routesync.Msg)
+	eventOut := make(chan *routesync.Msg, 128)
+	hbUpdate := make(chan struct{}, 1)
+	var hbMu sync.Mutex
+	latestHeartbeat := &routesync.Msg{Type: routesync.TypeHeartbeat, Beat: &routesync.Heartbeat{Counts: 9}}
+	for index := 0; index < 100; index++ {
+		eventOut <- &routesync.Msg{
+			Type:           routesync.TypeExecutionEvent,
+			ExecutionEvent: &routesync.ExecutionEvent{ObjectID: fmt.Sprintf("sandbox-%d", index)},
+		}
+	}
+	hbUpdate <- struct{}{}
+	go runNodeLinkOutbox(ctx, outbox, highOut, eventOut, hbUpdate, &hbMu, &latestHeartbeat)
+
+	eventsBeforeHeartbeat := 0
+	for {
+		message := receiveOutboxMsg(t, outbox)
+		if message.Type == routesync.TypeHeartbeat {
+			break
+		}
+		eventsBeforeHeartbeat++
+		if eventsBeforeHeartbeat > 32 {
+			t.Fatal("sustained event backlog starved heartbeat")
+		}
+	}
+	if eventsBeforeHeartbeat == 0 {
+		t.Fatal("heartbeat bypassed the configured event-priority burst")
 	}
 }
 

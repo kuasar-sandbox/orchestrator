@@ -372,8 +372,29 @@ func runNodeLinkOutbox(
 	hbMu *sync.Mutex,
 	latestHeartbeat **routesync.Msg,
 ) {
+	const maxNonHeartbeatBurst = 32
 	heartbeatPending := false
+	nonHeartbeatBurst := 0
 	for {
+		select {
+		case <-hbUpdate:
+			heartbeatPending = true
+		default:
+		}
+		if heartbeatPending && nonHeartbeatBurst >= maxNonHeartbeatBurst {
+			msg := takeLatestHeartbeat(hbMu, latestHeartbeat)
+			if msg == nil {
+				heartbeatPending = false
+				nonHeartbeatBurst = 0
+				continue
+			}
+			if !sendNodeLinkOutbox(ctx, outbox, msg) {
+				return
+			}
+			heartbeatPending = false
+			nonHeartbeatBurst = 0
+			continue
+		}
 		select {
 		case <-ctx.Done():
 			return
@@ -381,6 +402,7 @@ func runNodeLinkOutbox(
 			if !sendNodeLinkOutbox(ctx, outbox, m) {
 				return
 			}
+			nonHeartbeatBurst++
 			continue
 		default:
 		}
@@ -391,6 +413,7 @@ func runNodeLinkOutbox(
 			if !sendNodeLinkOutbox(ctx, outbox, m) {
 				return
 			}
+			nonHeartbeatBurst++
 			continue
 		default:
 		}
@@ -404,6 +427,7 @@ func runNodeLinkOutbox(
 				return
 			}
 			heartbeatPending = false
+			nonHeartbeatBurst = 0
 			continue
 		}
 		select {
@@ -413,10 +437,12 @@ func runNodeLinkOutbox(
 			if !sendNodeLinkOutbox(ctx, outbox, m) {
 				return
 			}
+			nonHeartbeatBurst++
 		case m := <-eventOut:
 			if !sendNodeLinkOutbox(ctx, outbox, m) {
 				return
 			}
+			nonHeartbeatBurst++
 		case <-hbUpdate:
 			heartbeatPending = true
 		}

@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -96,6 +97,35 @@ func workflowBuild(id string) *types.Build {
 	}
 }
 
+func workflowDispatchEpoch(
+	t *testing.T,
+	kind clusterstate.ExecutionKind,
+	objectID string,
+	buildDemand placement.BuildDemand,
+	nodeEpoch uint64,
+) nodeexec.DispatchRecord {
+	t.Helper()
+	dispatch := workflowDispatch(t, kind, objectID, buildDemand)
+	binding, err := clusterstate.DecodeExecutionBinding(dispatch.OpaqueBinding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding.NodeEpoch = nodeEpoch
+	dispatch.NodeEpoch = nodeEpoch
+	dispatch.OpaqueBinding, err = clusterstate.EncodeExecutionBinding(binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dispatch.BindingDigest, err = clusterstate.ExecutionBindingDigest(dispatch.OpaqueBinding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := dispatch.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	return dispatch
+}
+
 func workflowSandbox(id string) *types.Sandbox {
 	return &types.Sandbox{
 		ID: id, TemplateID: "e2b-img-" + strings.Repeat("2", 64), ManifestKey: strings.Repeat("3", 64),
@@ -143,7 +173,7 @@ func TestBuildAdmissionIsIdempotentConflictSafeAndBounded(t *testing.T) {
 	if err != nil || rejected.Result != clusterstate.DispatchDefinitiveReject || rejected.Reason != "build_queue_full" {
 		t.Fatalf("rejected = %+v, %v", rejected, err)
 	}
-	all, claimed, err := st.BuildAdmissionUsage(ctx)
+	all, claimed, err := st.BuildAdmissionUsage(ctx, "node-1", 7)
 	if err != nil || all.Slots != 2 || claimed.Slots != 1 {
 		t.Fatalf("usage all=%+v claimed=%+v err=%v", all, claimed, err)
 	}
@@ -195,7 +225,7 @@ func TestConcurrentBuildAdmissionDoesNotOversubscribe(t *testing.T) {
 	if counts[clusterstate.DispatchAcceptedAdmitted] != 1 || counts[clusterstate.DispatchAcceptedQueued] != 1 {
 		t.Fatalf("outcomes = %+v", counts)
 	}
-	_, claimed, err := st.BuildAdmissionUsage(ctx)
+	_, claimed, err := st.BuildAdmissionUsage(ctx, "node-1", 7)
 	if err != nil || claimed.Slots != 1 {
 		t.Fatalf("claimed = %+v, %v", claimed, err)
 	}
@@ -276,11 +306,11 @@ func TestBuildTerminalEventReleasesCapacityAndAckCannotDropNewerEvent(t *testing
 		stored.Metadata[clusterstate.ObjectMetadataKey] != first.OpaqueBinding || stored.Metadata["user"] != "kept" {
 		t.Fatalf("stored Build = %+v, %v", stored, err)
 	}
-	all, claimed, err := st.BuildAdmissionUsage(ctx)
+	all, claimed, err := st.BuildAdmissionUsage(ctx, "node-1", 7)
 	if err != nil || all.Slots != 1 || claimed.Slots != 0 {
 		t.Fatalf("terminal usage all=%+v claimed=%+v err=%v", all, claimed, err)
 	}
-	promoted, err := st.PromoteBuildQueue(ctx, capacity, 4)
+	promoted, err := st.PromoteBuildQueue(ctx, "node-1", 7, capacity, 4)
 	if err != nil || len(promoted) != 1 || promoted[0].ObjectID != second.ObjectID ||
 		promoted[0].Result != clusterstate.DispatchAcceptedQueued || !promoted[0].ResourceClaimed {
 		t.Fatalf("promoted = %+v, %v", promoted, err)
@@ -370,6 +400,140 @@ func TestSandboxJournalPreservesTokenBindingAndMonotonicOutbox(t *testing.T) {
 	}
 }
 
+func TestSandboxEventPreservesNewerBusinessObjectFields(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	dispatch := workflowDispatch(t, clusterstate.ExecutionKindSandbox, "sandbox-preserve", placement.BuildDemand{})
+	decision := nodeexec.AdmissionDecision{
+		State: nodeexec.AdmissionAdmitted, Result: clusterstate.DispatchAcceptedAdmitted,
+		ReservationToken: "reservation-preserve",
+	}
+	if _, err := st.RecordSandboxWorkflow(ctx, dispatch, decision); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.ClaimSandboxWorkflow(ctx, dispatch.ObjectID, dispatch.DemandDigest, decision.ReservationToken); err != nil {
+		t.Fatal(err)
+	}
+	callback := workflowSandbox(dispatch.ObjectID)
+	if _, err := st.CommitSandboxEvent(ctx, callback, nodeexec.EventUpdate{
+		State: string(clusterstate.WorkflowRouteReady),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	current, err := st.Get(ctx, dispatch.ObjectID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	current.DeadlineUnix = 123456789
+	current.SnapshotRef = "manifest://newer-snapshot"
+	current.RunID = "newer-run"
+	current.Metadata["newer"] = "metadata"
+	current.Env = map[string]string{}
+	current.Env["newer"] = "env"
+	if err := st.Put(ctx, current); err != nil {
+		t.Fatal(err)
+	}
+
+	stale := cloneSandbox(callback)
+	stale.DeadlineUnix = 1
+	stale.SnapshotRef = "stale-snapshot"
+	stale.RunID = "stale-run"
+	stale.Metadata["newer"] = "stale"
+	if _, err := st.CommitSandboxEvent(ctx, stale, nodeexec.EventUpdate{
+		State: string(clusterstate.WorkflowRoutePaused),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := st.Get(ctx, dispatch.ObjectID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.State != types.StatePaused || stored.DeadlineUnix != 123456789 ||
+		stored.SnapshotRef != "manifest://newer-snapshot" || stored.RunID != "newer-run" ||
+		stored.Metadata["newer"] != "metadata" || stored.Env["newer"] != "env" {
+		t.Fatalf("stale callback rewrote Sandbox fields: %+v", stored)
+	}
+}
+
+func TestDuplicateBuildRegisteredEventPersistsLaunchIdentity(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	dispatch := workflowDispatch(t, clusterstate.ExecutionKindBuild, "build-launch-fields", placement.BuildDemand{Slots: 1})
+	if _, err := st.PrepareBuildWorkflow(ctx, dispatch, workflowBuild(dispatch.ObjectID),
+		nodeexec.BuildCapacity{Slots: 1, QueueLimit: 4}, ""); err != nil {
+		t.Fatal(err)
+	}
+	callback := workflowBuild(dispatch.ObjectID)
+	callback.RunID = "runner-1"
+	callback.Names = []string{"build-name"}
+	callback.Aliases = []string{"build-alias"}
+	if _, err := st.CommitBuildEvent(ctx, callback, nodeexec.EventUpdate{
+		State: string(clusterstate.BuildRegistered),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := st.GetBuild(ctx, dispatch.ObjectID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.RunID != "runner-1" || !slices.Equal(stored.Names, callback.Names) ||
+		!slices.Equal(stored.Aliases, callback.Aliases) {
+		t.Fatalf("duplicate registered event lost launch identity: %+v", stored)
+	}
+	if _, err := st.CommitBuildEvent(ctx, workflowBuild(dispatch.ObjectID), nodeexec.EventUpdate{
+		State: string(clusterstate.BuildRegistered),
+	}); err != nil {
+		t.Fatalf("empty duplicate erased launch identity: %v", err)
+	}
+	conflict := workflowBuild(dispatch.ObjectID)
+	conflict.RunID = "runner-2"
+	if _, err := st.CommitBuildEvent(ctx, conflict, nodeexec.EventUpdate{
+		State: string(clusterstate.BuildRegistered),
+	}); !errors.Is(err, ErrNodeWorkflowConflict) {
+		t.Fatalf("conflicting runner identity error = %v", err)
+	}
+}
+
+func TestBuildAdmissionAndPromotionExcludePriorNodeEpoch(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	capacity := nodeexec.BuildCapacity{Slots: 1, QueueLimit: 4}
+	oldRunning := workflowDispatchEpoch(t, clusterstate.ExecutionKindBuild, "old-running", placement.BuildDemand{Slots: 1}, 6)
+	oldQueued := workflowDispatchEpoch(t, clusterstate.ExecutionKindBuild, "old-queued", placement.BuildDemand{Slots: 1}, 6)
+	currentRunning := workflowDispatchEpoch(t, clusterstate.ExecutionKindBuild, "current-running", placement.BuildDemand{Slots: 1}, 7)
+	currentQueued := workflowDispatchEpoch(t, clusterstate.ExecutionKindBuild, "current-queued", placement.BuildDemand{Slots: 1}, 7)
+	for _, dispatch := range []nodeexec.DispatchRecord{oldRunning, oldQueued, currentRunning, currentQueued} {
+		record, err := st.PrepareBuildWorkflow(ctx, dispatch, workflowBuild(dispatch.ObjectID), capacity, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.HasSuffix(dispatch.ObjectID, "running") && record.AdmissionState != nodeexec.AdmissionAdmitted ||
+			strings.HasSuffix(dispatch.ObjectID, "queued") && record.AdmissionState != nodeexec.AdmissionQueued {
+			t.Fatalf("admission %s = %+v", dispatch.ObjectID, record)
+		}
+	}
+	all, claimed, err := st.BuildAdmissionUsage(ctx, "node-1", 7)
+	if err != nil || all.Slots != 2 || claimed.Slots != 1 {
+		t.Fatalf("current epoch usage all=%+v claimed=%+v err=%v", all, claimed, err)
+	}
+	if _, err := st.ClaimBuildWorkflow(ctx, currentRunning.ObjectID, currentRunning.DemandDigest); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.CommitBuildEvent(ctx, workflowBuild(currentRunning.ObjectID), nodeexec.EventUpdate{
+		State: string(clusterstate.BuildError), Reason: "done",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	promoted, err := st.PromoteBuildQueue(ctx, "node-1", 7, capacity, 4)
+	if err != nil || len(promoted) != 1 || promoted[0].ObjectID != currentQueued.ObjectID {
+		t.Fatalf("current epoch promotion = %+v, %v", promoted, err)
+	}
+	old, err := st.GetNodeWorkflow(ctx, clusterstate.ExecutionKindBuild, oldQueued.ObjectID)
+	if err != nil || old.AdmissionState != nodeexec.AdmissionQueued {
+		t.Fatalf("prior epoch queue was promoted = %+v, %v", old, err)
+	}
+}
+
 func TestBuildQueuePromotionIsStrictFIFO(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()
@@ -390,7 +554,7 @@ func TestBuildQueuePromotionIsStrictFIFO(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	promoted, err := st.PromoteBuildQueue(ctx, nodeexec.BuildCapacity{Slots: 1, QueueLimit: 4}, 4)
+	promoted, err := st.PromoteBuildQueue(ctx, "node-1", 7, nodeexec.BuildCapacity{Slots: 1, QueueLimit: 4}, 4)
 	if err != nil || len(promoted) != 0 {
 		t.Fatalf("strict FIFO promotion = %+v, %v", promoted, err)
 	}

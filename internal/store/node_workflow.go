@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -152,11 +153,11 @@ func (s *Store) PrepareBuildWorkflow(
 		record.Result = clusterstate.DispatchDefinitiveReject
 		record.Reason = "exceeds_build_capacity"
 	default:
-		claimed, err := buildUsageTx(ctx, tx, true)
+		claimed, err := buildUsageTx(ctx, tx, dispatch.NodeID, dispatch.NodeEpoch, true)
 		if err != nil {
 			return nil, err
 		}
-		queueDepth, err := buildQueueDepthTx(ctx, tx)
+		queueDepth, err := buildQueueDepthTx(ctx, tx, dispatch.NodeID, dispatch.NodeEpoch)
 		if err != nil {
 			return nil, err
 		}
@@ -174,7 +175,7 @@ func (s *Store) PrepareBuildWorkflow(
 		} else if queueDepth < capacity.QueueLimit {
 			record.AdmissionState = nodeexec.AdmissionQueued
 			record.Result = clusterstate.DispatchAcceptedQueued
-			record.QueueSequence, err = nextBuildQueueSequenceTx(ctx, tx)
+			record.QueueSequence, err = nextBuildQueueSequenceTx(ctx, tx, dispatch.NodeID, dispatch.NodeEpoch)
 			if err != nil {
 				return nil, err
 			}
@@ -350,9 +351,14 @@ func (s *Store) advanceAdmission(
 // never changes each command's original ACCEPTED_QUEUED result.
 func (s *Store) PromoteBuildQueue(
 	ctx context.Context,
+	nodeID string,
+	nodeEpoch uint64,
 	capacity nodeexec.BuildCapacity,
 	maxCount int,
 ) ([]*nodeexec.WorkflowRecord, error) {
+	if nodeID == "" || nodeEpoch == 0 {
+		return nil, errors.New("store: node identity is required for Build queue promotion")
+	}
 	if err := capacity.Validate(); err != nil {
 		return nil, err
 	}
@@ -364,13 +370,13 @@ func (s *Store) PromoteBuildQueue(
 		return nil, err
 	}
 	defer tx.Rollback()
-	usage, err := buildUsageTx(ctx, tx, true)
+	usage, err := buildUsageTx(ctx, tx, nodeID, nodeEpoch, true)
 	if err != nil {
 		return nil, err
 	}
 	rows, err := tx.QueryContext(ctx, `SELECT object_id FROM node_workflows
-WHERE object_kind=? AND admission_state=? ORDER BY queue_sequence, object_id LIMIT ?`,
-		clusterstate.ExecutionKindBuild, nodeexec.AdmissionQueued, maxCount)
+WHERE object_kind=? AND node_id=? AND node_epoch=? AND admission_state=? ORDER BY queue_sequence, object_id LIMIT ?`,
+		clusterstate.ExecutionKindBuild, nodeID, encodeUint64(nodeEpoch), nodeexec.AdmissionQueued, maxCount)
 	if err != nil {
 		return nil, err
 	}
@@ -438,9 +444,14 @@ WHERE object_kind=? AND admission_state=? ORDER BY queue_sequence, object_id LIM
 // queue entries stay bound to this node/build_id and are never dispatched again.
 func (s *Store) FailQueuedBuildWorkflows(
 	ctx context.Context,
+	nodeID string,
+	nodeEpoch uint64,
 	reason string,
 	maxCount int,
 ) ([]*nodeexec.WorkflowRecord, error) {
+	if nodeID == "" || nodeEpoch == 0 {
+		return nil, errors.New("store: node identity is required for queued Build failure")
+	}
 	if reason == "" {
 		return nil, errors.New("store: queued Build rejection requires a safety reason")
 	}
@@ -453,8 +464,8 @@ func (s *Store) FailQueuedBuildWorkflows(
 	}
 	defer tx.Rollback()
 	rows, err := tx.QueryContext(ctx, `SELECT object_id FROM node_workflows
-WHERE object_kind=? AND admission_state=? ORDER BY queue_sequence, object_id LIMIT ?`,
-		clusterstate.ExecutionKindBuild, nodeexec.AdmissionQueued, maxCount)
+WHERE object_kind=? AND node_id=? AND node_epoch=? AND admission_state=? ORDER BY queue_sequence, object_id LIMIT ?`,
+		clusterstate.ExecutionKindBuild, nodeID, encodeUint64(nodeEpoch), nodeexec.AdmissionQueued, maxCount)
 	if err != nil {
 		return nil, err
 	}
@@ -556,17 +567,24 @@ func (s *Store) ClaimBuildWorkflow(ctx context.Context, buildID, demandDigest st
 
 // BuildAdmissionUsage returns node-authoritative queued plus resource-claimed
 // totals. The former is the placement projection; the latter is physical usage.
-func (s *Store) BuildAdmissionUsage(ctx context.Context) (queuedAndClaimed, claimed nodeexec.BuildUsage, err error) {
+func (s *Store) BuildAdmissionUsage(
+	ctx context.Context,
+	nodeID string,
+	nodeEpoch uint64,
+) (queuedAndClaimed, claimed nodeexec.BuildUsage, err error) {
+	if nodeID == "" || nodeEpoch == 0 {
+		return nodeexec.BuildUsage{}, nodeexec.BuildUsage{}, errors.New("store: node identity is required for Build usage")
+	}
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		return nodeexec.BuildUsage{}, nodeexec.BuildUsage{}, err
 	}
 	defer tx.Rollback()
-	queuedAndClaimed, err = buildUsageTx(ctx, tx, false)
+	queuedAndClaimed, err = buildUsageTx(ctx, tx, nodeID, nodeEpoch, false)
 	if err != nil {
 		return nodeexec.BuildUsage{}, nodeexec.BuildUsage{}, err
 	}
-	claimed, err = buildUsageTx(ctx, tx, true)
+	claimed, err = buildUsageTx(ctx, tx, nodeID, nodeEpoch, true)
 	if err != nil {
 		return nodeexec.BuildUsage{}, nodeexec.BuildUsage{}, err
 	}
@@ -601,15 +619,6 @@ func (s *Store) CommitBuildEvent(
 	if err := validateBuildEventTransition(record, update); err != nil {
 		return nil, err
 	}
-	if record.LatestEvent != nil && record.ObjectState == update.State {
-		if eventUpdateMatches(record.LatestEvent, update) {
-			if err := tx.Commit(); err != nil {
-				return nil, err
-			}
-			return record, nil
-		}
-		return nil, ErrNodeWorkflowConflict
-	}
 	current, err := s.getBuildTx(ctx, tx, build.BuildID)
 	if err != nil {
 		return nil, err
@@ -617,14 +626,32 @@ func (s *Store) CommitBuildEvent(
 	if current == nil {
 		return nil, errors.New("store: accepted Build object is missing")
 	}
+	if record.LatestEvent != nil && record.ObjectState == update.State {
+		if eventUpdateMatches(record.LatestEvent, update) {
+			changed, mergeErr := mergeBuildLaunchFields(current, build)
+			if mergeErr != nil {
+				return nil, mergeErr
+			}
+			if changed {
+				if err := s.putBuild(ctx, tx, current); err != nil {
+					return nil, err
+				}
+			}
+			if err := tx.Commit(); err != nil {
+				return nil, err
+			}
+			return record, nil
+		}
+		return nil, ErrNodeWorkflowConflict
+	}
 	event, err := executionEventFor(record, update)
 	if err != nil {
 		return nil, err
 	}
 	stored := cloneBuild(current)
-	stored.RunID = build.RunID
-	stored.Names = append([]string(nil), build.Names...)
-	stored.Aliases = append([]string(nil), build.Aliases...)
+	if _, err := mergeBuildLaunchFields(stored, build); err != nil {
+		return nil, err
+	}
 	stored.Metadata, err = clusterstate.WithExecutionBinding(clusterstate.WithoutSystemMetadata(stored.Metadata), record.OpaqueBinding)
 	if err != nil {
 		return nil, err
@@ -675,17 +702,25 @@ func (s *Store) CommitSandboxEvent(
 	if record == nil {
 		return nil, ErrNodeWorkflowMissing
 	}
+	current, err := s.getSandboxTx(ctx, tx, sandbox.ID)
+	if err != nil {
+		return nil, err
+	}
+	eventSource := sandbox
+	if current != nil {
+		eventSource = current
+	}
 	if update.AccessToken == "" {
-		update.AccessToken = sandbox.EnvdAccessToken
+		update.AccessToken = eventSource.EnvdAccessToken
 	}
 	if update.TrafficAccessToken == "" {
-		update.TrafficAccessToken = sandbox.TrafficAccessToken
+		update.TrafficAccessToken = eventSource.TrafficAccessToken
 	}
 	if update.TemplateRef == "" {
-		update.TemplateRef = sandbox.TemplateID
+		update.TemplateRef = eventSource.TemplateID
 	}
 	if update.SnapshotLocation == "" {
-		update.SnapshotLocation = sandboxSnapshotLocation(sandbox.SnapshotRef)
+		update.SnapshotLocation = sandboxSnapshotLocation(eventSource.SnapshotRef)
 	}
 	if err := validateSandboxEventTransition(record, update); err != nil {
 		return nil, err
@@ -699,7 +734,9 @@ func (s *Store) CommitSandboxEvent(
 		}
 		return nil, ErrNodeWorkflowConflict
 	}
-	stored := cloneSandbox(sandbox)
+	stored := cloneSandbox(eventSource)
+	stored.EnvdAccessToken = update.AccessToken
+	stored.TrafficAccessToken = update.TrafficAccessToken
 	stored.Metadata, err = clusterstate.WithExecutionBinding(clusterstate.WithoutSystemMetadata(stored.Metadata), record.OpaqueBinding)
 	if err != nil {
 		return nil, err
@@ -828,6 +865,17 @@ func (s *Store) getBuildTx(ctx context.Context, tx *sql.Tx, buildID string) (*ty
 	return build, nil
 }
 
+func (s *Store) getSandboxTx(ctx context.Context, tx *sql.Tx, sandboxID string) (*types.Sandbox, error) {
+	sandbox, err := s.scan(tx.QueryRowContext(ctx, `SELECT `+cols+` FROM sandboxes WHERE id=?`, sandboxID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("store: get Sandbox transaction: %w", err)
+	}
+	return sandbox, nil
+}
+
 func updateNodeWorkflowTx(ctx context.Context, tx *sql.Tx, record *nodeexec.WorkflowRecord) error {
 	latestEventJSON := ""
 	if record.LatestEvent != nil {
@@ -937,6 +985,42 @@ func cloneSandbox(source *types.Sandbox) *types.Sandbox {
 	out.Metadata = cloneMetadata(source.Metadata)
 	out.Env = cloneMetadata(source.Env)
 	return &out
+}
+
+func mergeBuildLaunchFields(stored, incoming *types.Build) (bool, error) {
+	if stored == nil || incoming == nil {
+		return false, errors.New("store: Build launch field merge requires both objects")
+	}
+	changed := false
+	if incoming.RunID != "" {
+		if stored.RunID != "" && stored.RunID != incoming.RunID {
+			return false, ErrNodeWorkflowConflict
+		}
+		if stored.RunID == "" {
+			stored.RunID = incoming.RunID
+			changed = true
+		}
+	}
+	for _, field := range []struct {
+		name     string
+		stored   *[]string
+		incoming []string
+	}{
+		{name: "names", stored: &stored.Names, incoming: incoming.Names},
+		{name: "aliases", stored: &stored.Aliases, incoming: incoming.Aliases},
+	} {
+		if len(field.incoming) == 0 {
+			continue
+		}
+		if len(*field.stored) != 0 && !slices.Equal(*field.stored, field.incoming) {
+			return false, fmt.Errorf("%w: Build %s changed", ErrNodeWorkflowConflict, field.name)
+		}
+		if len(*field.stored) == 0 {
+			*field.stored = append([]string(nil), field.incoming...)
+			changed = true
+		}
+	}
+	return changed, nil
 }
 
 func cloneMetadata(source map[string]string) map[string]string {
@@ -1355,11 +1439,18 @@ func parseExecutionKind(value string) (clusterstate.ExecutionKind, error) {
 	}
 }
 
-func buildUsageTx(ctx context.Context, tx *sql.Tx, claimedOnly bool) (nodeexec.BuildUsage, error) {
+func buildUsageTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	nodeID string,
+	nodeEpoch uint64,
+	claimedOnly bool,
+) (nodeexec.BuildUsage, error) {
 	query := `SELECT build_demand_json FROM node_workflows
-WHERE object_kind=? AND admission_state IN (?,?,?,?)`
+WHERE object_kind=? AND node_id=? AND node_epoch=? AND admission_state IN (?,?,?,?)`
 	args := []any{
-		clusterstate.ExecutionKindBuild, nodeexec.AdmissionQueued, nodeexec.AdmissionAdmitted,
+		clusterstate.ExecutionKindBuild, nodeID, encodeUint64(nodeEpoch),
+		nodeexec.AdmissionQueued, nodeexec.AdmissionAdmitted,
 		nodeexec.AdmissionLaunching, nodeexec.AdmissionRunning,
 	}
 	if claimedOnly {
@@ -1385,15 +1476,17 @@ WHERE object_kind=? AND admission_state IN (?,?,?,?)`
 	return usage, rows.Err()
 }
 
-func buildQueueDepthTx(ctx context.Context, tx *sql.Tx) (int, error) {
+func buildQueueDepthTx(ctx context.Context, tx *sql.Tx, nodeID string, nodeEpoch uint64) (int, error) {
 	var depth int
-	err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM node_workflows WHERE object_kind=? AND admission_state=?`,
-		clusterstate.ExecutionKindBuild, nodeexec.AdmissionQueued).Scan(&depth)
+	err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM node_workflows
+WHERE object_kind=? AND node_id=? AND node_epoch=? AND admission_state=?`,
+		clusterstate.ExecutionKindBuild, nodeID, encodeUint64(nodeEpoch), nodeexec.AdmissionQueued).Scan(&depth)
 	return depth, err
 }
 
-func nextBuildQueueSequenceTx(ctx context.Context, tx *sql.Tx) (uint64, error) {
-	rows, err := tx.QueryContext(ctx, `SELECT queue_sequence FROM node_workflows WHERE object_kind=?`, clusterstate.ExecutionKindBuild)
+func nextBuildQueueSequenceTx(ctx context.Context, tx *sql.Tx, nodeID string, nodeEpoch uint64) (uint64, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT queue_sequence FROM node_workflows
+WHERE object_kind=? AND node_id=? AND node_epoch=?`, clusterstate.ExecutionKindBuild, nodeID, encodeUint64(nodeEpoch))
 	if err != nil {
 		return 0, err
 	}
