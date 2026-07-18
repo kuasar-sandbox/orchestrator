@@ -42,21 +42,75 @@ func (p *testPublisher) PublishSessionDelta(delta DirectoryDelta) {
 	p.deltas = append(p.deltas, delta)
 }
 
+type testEnrollmentAuthority struct {
+	active  map[string]NodeEnrollment
+	retired map[string]IdentityRetirement
+}
+
+func newTestEnrollmentAuthority(registrations ...Registration) *testEnrollmentAuthority {
+	a := &testEnrollmentAuthority{
+		active: make(map[string]NodeEnrollment), retired: make(map[string]IdentityRetirement),
+	}
+	for _, registration := range registrations {
+		a.enroll(registration)
+	}
+	return a
+}
+
+func (a *testEnrollmentAuthority) enroll(registration Registration) {
+	a.active[registration.NodeID] = NodeEnrollment{
+		NodeID: registration.NodeID, EnrollmentID: registration.EnrollmentID,
+		NodeEpoch: registration.NodeEpoch, DataEndpoint: registration.DataEndpoint,
+	}
+}
+
+func (a *testEnrollmentAuthority) retire(retirement IdentityRetirement) {
+	a.retired[retirement.NodeID] = retirement
+	delete(a.active, retirement.NodeID)
+}
+
+func (a *testEnrollmentAuthority) ValidateSessionRegistration(_ context.Context, enrollment NodeEnrollment) error {
+	current, found := a.active[enrollment.NodeID]
+	if !found {
+		return errors.New("identity is not enrolled")
+	}
+	if enrollment.EnrollmentID != current.EnrollmentID {
+		return ErrEnrollmentChanged
+	}
+	if enrollment.NodeEpoch != current.NodeEpoch {
+		return ErrStaleSession
+	}
+	if enrollment.DataEndpoint != current.DataEndpoint {
+		return ErrEndpointChanged
+	}
+	return nil
+}
+
+func (a *testEnrollmentAuthority) ValidateIdentityRetirement(_ context.Context, retirement IdentityRetirement) error {
+	current, found := a.retired[retirement.NodeID]
+	if !found || current != retirement {
+		return errors.New("identity retirement is not committed")
+	}
+	return nil
+}
+
 func TestHolderAcceptsOnlyIncreasingTupleAndFencesOldStream(t *testing.T) {
 	publisher := &testPublisher{}
-	holder, err := NewHolder("registry-a", 2, nil, testGate(true), publisher)
+	first := testRegistration("node-1", 7, 10, "10.0.0.1:8443")
+	authority := newTestEnrollmentAuthority(first)
+	holder, err := NewHolder("registry-a", 2, nil, testGate(true), publisher, authority)
 	if err != nil {
 		t.Fatal(err)
 	}
 	oldEndpoint := &testEndpoint{}
-	oldLease, err := holder.Register(testRegistration("node-1", 7, 10, "10.0.0.1:8443"), oldEndpoint)
+	oldLease, err := holder.Register(context.Background(), first, oldEndpoint)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer oldLease.Close()
 
 	newEndpoint := &testEndpoint{}
-	newLease, err := holder.Register(testRegistration("node-1", 7, 11, "10.0.0.1:8443"), newEndpoint)
+	newLease, err := holder.Register(context.Background(), testRegistration("node-1", 7, 11, "10.0.0.1:8443"), newEndpoint)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -64,10 +118,10 @@ func TestHolderAcceptsOnlyIncreasingTupleAndFencesOldStream(t *testing.T) {
 	if oldEndpoint.fenced != 1 {
 		t.Fatalf("old endpoint fenced %d times", oldEndpoint.fenced)
 	}
-	if _, err := holder.Register(testRegistration("node-1", 7, 11, "10.0.0.1:8443"), &testEndpoint{}); !errors.Is(err, ErrStaleSession) {
+	if _, err := holder.Register(context.Background(), testRegistration("node-1", 7, 11, "10.0.0.1:8443"), &testEndpoint{}); !errors.Is(err, ErrStaleSession) {
 		t.Fatalf("equal tuple error = %v", err)
 	}
-	if _, err := holder.Register(testRegistration("node-1", 6, 99, "10.0.0.1:8443"), &testEndpoint{}); !errors.Is(err, ErrStaleSession) {
+	if _, err := holder.Register(context.Background(), testRegistration("node-1", 6, 99, "10.0.0.1:8443"), &testEndpoint{}); !errors.Is(err, ErrStaleSession) {
 		t.Fatalf("lower epoch error = %v", err)
 	}
 	if len(publisher.deltas) != 2 || !publisher.deltas[0].Up || !publisher.deltas[1].Up {
@@ -76,30 +130,83 @@ func TestHolderAcceptsOnlyIncreasingTupleAndFencesOldStream(t *testing.T) {
 }
 
 func TestHolderRejectsEndpointChangeWithinNodeEpoch(t *testing.T) {
-	holder, err := NewHolder("registry-a", 1, nil, testGate(true), nil)
+	first := testRegistration("node-1", 7, 10, "10.0.0.1:8443")
+	authority := newTestEnrollmentAuthority(first)
+	holder, err := NewHolder("registry-a", 1, nil, testGate(true), nil, authority)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := holder.Register(testRegistration("node-1", 7, 10, "10.0.0.1:8443"), &testEndpoint{}); err != nil {
+	if _, err := holder.Register(context.Background(), first, &testEndpoint{}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := holder.Register(testRegistration("node-1", 7, 11, "10.0.0.2:8443"), &testEndpoint{}); !errors.Is(err, ErrEndpointChanged) {
+	if _, err := holder.Register(context.Background(), testRegistration("node-1", 7, 11, "10.0.0.2:8443"), &testEndpoint{}); !errors.Is(err, ErrEndpointChanged) {
 		t.Fatalf("changed endpoint error = %v", err)
 	}
-	if _, err := holder.Register(testRegistration("node-1", 8, 1, "10.0.0.2:8443"), &testEndpoint{}); err != nil {
+	newEpoch := testRegistration("node-1", 8, 1, "10.0.0.2:8443")
+	authority.enroll(newEpoch)
+	if _, err := holder.Register(context.Background(), newEpoch, &testEndpoint{}); err != nil {
 		t.Fatalf("new epoch endpoint change: %v", err)
+	}
+}
+
+func TestHolderUsesSharedEnrollmentFenceAcrossHolderChanges(t *testing.T) {
+	registration := testRegistration("node-1", 7, 10, "10.0.0.1:8443")
+	authority := newTestEnrollmentAuthority(registration)
+	first, err := NewHolder("registry-a", 1, nil, testGate(true), nil, authority)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := NewHolder("registry-b", 1, nil, testGate(true), nil, authority)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := first.Register(context.Background(), registration, &testEndpoint{}); err != nil {
+		t.Fatal(err)
+	}
+	changed := testRegistration("node-1", 7, 11, "10.0.0.2:8443")
+	if _, err := second.Register(context.Background(), changed, &testEndpoint{}); !errors.Is(err, ErrEndpointChanged) {
+		t.Fatalf("cross-Holder endpoint change error = %v", err)
+	}
+}
+
+func TestHolderDropsHighWatermarkOnlyAfterCommittedIdentityRetirement(t *testing.T) {
+	registration := testRegistration("node-1", 7, 10, "10.0.0.1:8443")
+	authority := newTestEnrollmentAuthority(registration)
+	holder, err := NewHolder("registry-a", 1, nil, testGate(true), nil, authority)
+	if err != nil {
+		t.Fatal(err)
+	}
+	endpoint := &testEndpoint{}
+	if _, err := holder.Register(context.Background(), registration, endpoint); err != nil {
+		t.Fatal(err)
+	}
+	retirement := IdentityRetirement{
+		NodeID: registration.NodeID, EnrollmentID: registration.EnrollmentID, LastNodeEpoch: registration.NodeEpoch,
+	}
+	if _, err := holder.RetireIdentity(context.Background(), retirement); err == nil {
+		t.Fatal("uncommitted retirement removed Holder fencing state")
+	}
+	authority.retire(retirement)
+	removed, err := holder.RetireIdentity(context.Background(), retirement)
+	if err != nil || !removed || holder.Active() != 0 || holder.TrackedIdentities() != 0 || endpoint.fenced != 1 {
+		t.Fatalf("retirement removed=%v active=%d tracked=%d fenced=%d err=%v",
+			removed, holder.Active(), holder.TrackedIdentities(), endpoint.fenced, err)
+	}
+	if _, err := holder.Register(context.Background(), registration, &testEndpoint{}); err == nil {
+		t.Fatal("retired identity registered again")
 	}
 }
 
 func TestHolderProbeUsesLocalObservationAndPermit(t *testing.T) {
 	now := time.Unix(10, 0)
 	clock := func() time.Time { return now }
-	holder, err := NewHolder("registry-a", 1, clock, testGate(true), nil)
+	authority := newTestEnrollmentAuthority(testRegistration("node-1", 7, 10, "10.0.0.1:8443"))
+	holder, err := NewHolder("registry-a", 1, clock, testGate(true), nil, authority)
 	if err != nil {
 		t.Fatal(err)
 	}
 	registration := testRegistration("node-1", 7, 10, "10.0.0.1:8443")
-	if _, err := holder.Register(registration, &testEndpoint{}); err != nil {
+	if _, err := holder.Register(context.Background(), registration, &testEndpoint{}); err != nil {
 		t.Fatal(err)
 	}
 	snapshot := testSnapshot(registration)
@@ -133,11 +240,11 @@ func TestHolderProbeUsesLocalObservationAndPermit(t *testing.T) {
 		t.Fatalf("stale probe = %+v, %v", response, err)
 	}
 
-	denied, err := NewHolder("registry-b", 1, clock, testGate(false), nil)
+	denied, err := NewHolder("registry-b", 1, clock, testGate(false), nil, authority)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := denied.Register(registration, &testEndpoint{}); err != nil {
+	if _, err := denied.Register(context.Background(), registration, &testEndpoint{}); err != nil {
 		t.Fatal(err)
 	}
 	if err := denied.UpdateSnapshot(registration.Tuple, snapshot); err != nil {
@@ -149,15 +256,17 @@ func TestHolderProbeUsesLocalObservationAndPermit(t *testing.T) {
 }
 
 func TestHolderLimitAndStaleSnapshot(t *testing.T) {
-	holder, err := NewHolder("registry-a", 1, nil, testGate(true), nil)
+	r1 := testRegistration("node-1", 7, 10, "10.0.0.1:8443")
+	r2 := testRegistration("node-2", 1, 1, "10.0.0.2:8443")
+	authority := newTestEnrollmentAuthority(r1, r2)
+	holder, err := NewHolder("registry-a", 1, nil, testGate(true), nil, authority)
 	if err != nil {
 		t.Fatal(err)
 	}
-	r1 := testRegistration("node-1", 7, 10, "10.0.0.1:8443")
-	if _, err := holder.Register(r1, &testEndpoint{}); err != nil {
+	if _, err := holder.Register(context.Background(), r1, &testEndpoint{}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := holder.Register(testRegistration("node-2", 1, 1, "10.0.0.2:8443"), &testEndpoint{}); !errors.Is(err, ErrHolderLimit) {
+	if _, err := holder.Register(context.Background(), r2, &testEndpoint{}); !errors.Is(err, ErrHolderLimit) {
 		t.Fatalf("limit error = %v", err)
 	}
 	snapshot := testSnapshot(r1)
@@ -170,13 +279,14 @@ func TestHolderLimitAndStaleSnapshot(t *testing.T) {
 }
 
 func TestHolderDispatchUsesCurrentTupleAndCommittedTarget(t *testing.T) {
-	holder, err := NewHolder("registry-a", 1, nil, testGate(true), nil)
+	registration := testRegistration("node-1", 7, 10, "10.0.0.1:8443")
+	authority := newTestEnrollmentAuthority(registration)
+	holder, err := NewHolder("registry-a", 1, nil, testGate(true), nil, authority)
 	if err != nil {
 		t.Fatal(err)
 	}
-	registration := testRegistration("node-1", 7, 10, "10.0.0.1:8443")
 	endpoint := &testEndpoint{}
-	if _, err := holder.Register(registration, endpoint); err != nil {
+	if _, err := holder.Register(context.Background(), registration, endpoint); err != nil {
 		t.Fatal(err)
 	}
 	command := testDispatchCommand(t, registration)
@@ -189,7 +299,8 @@ func TestHolderDispatchUsesCurrentTupleAndCommittedTarget(t *testing.T) {
 	}
 
 	newRegistration := testRegistration("node-1", 8, 1, "10.0.0.2:8443")
-	if _, err := holder.Register(newRegistration, &testEndpoint{}); err != nil {
+	authority.enroll(newRegistration)
+	if _, err := holder.Register(context.Background(), newRegistration, &testEndpoint{}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := holder.AdmitAndDispatch(context.Background(), command); !errors.Is(err, ErrSessionUnavailable) {
@@ -201,13 +312,14 @@ func TestHolderDispatchUsesCurrentTupleAndCommittedTarget(t *testing.T) {
 }
 
 func TestHolderDispatchFailsClosedWithoutPermit(t *testing.T) {
-	holder, err := NewHolder("registry-a", 1, nil, testGate(false), nil)
+	registration := testRegistration("node-1", 7, 10, "10.0.0.1:8443")
+	authority := newTestEnrollmentAuthority(registration)
+	holder, err := NewHolder("registry-a", 1, nil, testGate(false), nil, authority)
 	if err != nil {
 		t.Fatal(err)
 	}
-	registration := testRegistration("node-1", 7, 10, "10.0.0.1:8443")
 	endpoint := &testEndpoint{}
-	if _, err := holder.Register(registration, endpoint); err != nil {
+	if _, err := holder.Register(context.Background(), registration, endpoint); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := holder.AdmitAndDispatch(context.Background(), testDispatchCommand(t, registration)); !errors.Is(err, ErrPermitUnavailable) {
@@ -302,7 +414,8 @@ func TestWeightedRendezvousIsDeterministicAndSkipsUnavailable(t *testing.T) {
 
 func testRegistration(nodeID string, epoch, seq uint64, endpoint string) Registration {
 	return Registration{
-		NodeID: nodeID, Tuple: Tuple{NodeEpoch: epoch, SessionSeq: seq}, DataEndpoint: endpoint,
+		NodeID: nodeID, EnrollmentID: "enrollment-" + nodeID,
+		Tuple: Tuple{NodeEpoch: epoch, SessionSeq: seq}, DataEndpoint: endpoint,
 		RuntimeDigest: "runtime-v1", LoadModelVersion: placement.LoadModelVersion,
 		SandboxSlots: 10, BuildSlots: 4, BuildCPU: 4000, BuildMemory: 8 << 30, BuildStorage: 100 << 30,
 		FailureDomain: "zone-a",

@@ -20,13 +20,14 @@ func roundTrip(t *testing.T, m *Msg) *Msg {
 
 func TestNodeLinkCodecRoundTrip(t *testing.T) {
 	nr := roundTrip(t, &Msg{Type: TypeNodeRegister, NodeReg: &NodeRegister{
-		NodeID: "n1", Labels: map[string]string{"zone": "z1", "slot": "c01-s03"},
+		NodeID: "n1", EnrollmentID: "enrollment-1", Labels: map[string]string{"zone": "z1", "slot": "c01-s03"},
 		BuildCapacity: &BuildResources{CPU: 4000, Mem: 8 << 30, Storage: 64 << 30},
 		DataEndpoint:  "10.0.0.1:8443", NodeEpoch: 7, SessionSeq: 11,
 		LoadModelVersion: 1, AcceptRedirect: true,
 	}})
 	if nr.NodeReg == nil || nr.NodeReg.NodeID != "n1" || nr.NodeReg.Labels["slot"] != "c01-s03" || nr.NodeReg.BuildCapacity.Mem != 8<<30 ||
-		nr.NodeReg.NodeEpoch != 7 || nr.NodeReg.SessionSeq != 11 || nr.NodeReg.LoadModelVersion != 1 || !nr.NodeReg.AcceptRedirect {
+		nr.NodeReg.EnrollmentID != "enrollment-1" || nr.NodeReg.NodeEpoch != 7 || nr.NodeReg.SessionSeq != 11 ||
+		nr.NodeReg.LoadModelVersion != 1 || !nr.NodeReg.AcceptRedirect {
 		t.Fatalf("node_register round-trip: %+v", nr.NodeReg)
 	}
 

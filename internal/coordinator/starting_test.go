@@ -75,6 +75,7 @@ type pairProberStub struct {
 	responses map[string]placement.PlacementProbeResponse
 	calls     [][]string
 	events    *[]string
+	after     func()
 }
 
 func (p *pairProberStub) ProbePair(_ context.Context, _ session.ServeIdentity, requests []placement.PlacementProbeRequest) []session.ProbeResult {
@@ -91,6 +92,9 @@ func (p *pairProberStub) ProbePair(_ context.Context, _ session.ServeIdentity, r
 	p.calls = append(p.calls, ids)
 	if p.events != nil {
 		*p.events = append(*p.events, "probe:"+strings.Join(ids, ","))
+	}
+	if p.after != nil {
+		p.after()
 	}
 	return results
 }
@@ -311,6 +315,34 @@ func TestCommitFailurePreventsDispatch(t *testing.T) {
 	}
 	if len(dispatcher.requests) != 0 {
 		t.Fatalf("dispatch occurred without committed selection: %+v", dispatcher.requests)
+	}
+}
+
+func TestProbeRPCLatencyExpiresOtherwiseUsableSamples(t *testing.T) {
+	record := routeStartingRecord(t, "s1", 1, candidatePool("n1", "n2"), nil)
+	store := &workflowStoreStub{route: record}
+	now := time.Unix(10, 0)
+	prober := &pairProberStub{
+		responses: map[string]placement.PlacementProbeResponse{
+			"n1": probeResponse("n1", placement.ProbeImmediate, 1),
+			"n2": probeResponse("n2", placement.ProbeImmediate, 2),
+		},
+		after: func() { now = now.Add(placement.MaximumProbeSampleAge) },
+	}
+	dispatcher := &dispatcherStub{store: store, results: map[string][]session.DispatchReply{}}
+	coordinator, err := NewStartingCoordinator(Config{
+		ServeIdentity:       session.ServeIdentity{ClusterID: "c1", StorageGeneration: "g1", SystemEpoch: 1},
+		PlacementRoundLimit: 2, Clock: func() time.Time { return now }, TieBreaker: fixedTie(false),
+	}, prober, dispatcher, store, store, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := coordinator.RunRoute(context.Background(), record)
+	if err != nil || result.Status != RunNoUsableProbe {
+		t.Fatalf("result = %+v, err=%v", result, err)
+	}
+	if len(dispatcher.requests) != 0 || len(store.events) != 0 {
+		t.Fatalf("expired Probe caused side effects: dispatches=%d events=%v", len(dispatcher.requests), store.events)
 	}
 }
 

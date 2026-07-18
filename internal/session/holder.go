@@ -15,6 +15,7 @@ var (
 	ErrHolderLimit        = errors.New("session: Holder registration limit reached")
 	ErrStaleSession       = errors.New("session: stale node-link session")
 	ErrEndpointChanged    = errors.New("session: data endpoint changed within NodeEpoch")
+	ErrEnrollmentChanged  = errors.New("session: node enrollment identity changed")
 	ErrSessionUnavailable = errors.New("session: current node-link session is unavailable")
 	ErrPermitUnavailable  = errors.New("session: matching Serve Permit is unavailable")
 )
@@ -61,7 +62,8 @@ type DispatchReply struct {
 }
 
 type Registration struct {
-	NodeID string
+	NodeID       string
+	EnrollmentID string
 	Tuple
 	DataEndpoint     string
 	RuntimeDigest    string
@@ -75,7 +77,7 @@ type Registration struct {
 }
 
 func (r Registration) Validate() error {
-	if r.NodeID == "" || !r.Tuple.Valid() || r.DataEndpoint == "" || r.LoadModelVersion == 0 || r.SandboxSlots == 0 {
+	if r.NodeID == "" || r.EnrollmentID == "" || !r.Tuple.Valid() || r.DataEndpoint == "" || r.LoadModelVersion == 0 || r.SandboxSlots == 0 {
 		return errors.New("session: incomplete node registration")
 	}
 	return nil
@@ -114,34 +116,46 @@ type Holder struct {
 	clock    func() time.Time
 	gate     PermitGate
 	pub      DeltaPublisher
+	enroll   EnrollmentAuthority
 	active   map[string]*heldSession
 	high     map[string]Registration
 }
 
-func NewHolder(memberID string, limit int, clock func() time.Time, gate PermitGate, publisher DeltaPublisher) (*Holder, error) {
-	if memberID == "" || limit <= 0 {
-		return nil, errors.New("session: Holder member ID and positive limit are required")
+func NewHolder(memberID string, limit int, clock func() time.Time, gate PermitGate, publisher DeltaPublisher, enrollment EnrollmentAuthority) (*Holder, error) {
+	if memberID == "" || limit <= 0 || enrollment == nil {
+		return nil, errors.New("session: Holder member ID, positive limit, and Enrollment authority are required")
 	}
 	if clock == nil {
 		clock = time.Now
 	}
 	return &Holder{
-		memberID: memberID, limit: limit, clock: clock, gate: gate, pub: publisher,
+		memberID: memberID, limit: limit, clock: clock, gate: gate, pub: publisher, enroll: enrollment,
 		active: make(map[string]*heldSession), high: make(map[string]Registration),
 	}, nil
 }
 
-func (h *Holder) Register(registration Registration, endpoint SessionEndpoint) (*Lease, error) {
+func (h *Holder) Register(ctx context.Context, registration Registration, endpoint SessionEndpoint) (*Lease, error) {
 	if err := registration.Validate(); err != nil {
 		return nil, err
 	}
 	if endpoint == nil {
 		return nil, errors.New("session: node-link endpoint is required")
 	}
+	enrollment := NodeEnrollment{
+		NodeID: registration.NodeID, EnrollmentID: registration.EnrollmentID,
+		NodeEpoch: registration.NodeEpoch, DataEndpoint: registration.DataEndpoint,
+	}
+	if err := h.enroll.ValidateSessionRegistration(ctx, enrollment); err != nil {
+		return nil, err
+	}
 	var old SessionEndpoint
 	h.mu.Lock()
 	previous, seen := h.high[registration.NodeID]
 	if seen {
+		if registration.EnrollmentID != previous.EnrollmentID {
+			h.mu.Unlock()
+			return nil, ErrEnrollmentChanged
+		}
 		if registration.NodeEpoch == previous.NodeEpoch && registration.DataEndpoint != previous.DataEndpoint {
 			h.mu.Unlock()
 			return nil, ErrEndpointChanged
@@ -166,6 +180,40 @@ func (h *Holder) Register(registration Registration, endpoint SessionEndpoint) (
 	}
 	h.publish(DirectoryDelta{Entry: h.directoryEntry(registration), Up: true})
 	return &Lease{holder: h, nodeID: registration.NodeID, tuple: registration.Tuple}, nil
+}
+
+// RetireIdentity removes tuple fencing state only after the Enrollment
+// authority confirms that the node identity can never register again.
+func (h *Holder) RetireIdentity(ctx context.Context, retirement IdentityRetirement) (bool, error) {
+	if err := retirement.Validate(); err != nil {
+		return false, err
+	}
+	if err := h.enroll.ValidateIdentityRetirement(ctx, retirement); err != nil {
+		return false, err
+	}
+
+	var endpoint SessionEndpoint
+	var registration Registration
+	h.mu.Lock()
+	previous, seen := h.high[retirement.NodeID]
+	if !seen || previous.EnrollmentID != retirement.EnrollmentID || previous.NodeEpoch > retirement.LastNodeEpoch {
+		h.mu.Unlock()
+		return false, nil
+	}
+	delete(h.high, retirement.NodeID)
+	if held := h.active[retirement.NodeID]; held != nil &&
+		held.registration.EnrollmentID == retirement.EnrollmentID && held.registration.NodeEpoch <= retirement.LastNodeEpoch {
+		registration = held.registration
+		endpoint = held.endpoint
+		delete(h.active, retirement.NodeID)
+	}
+	h.mu.Unlock()
+
+	if endpoint != nil {
+		endpoint.FenceStaleSession()
+		h.publish(DirectoryDelta{Entry: h.directoryEntry(registration), Up: false})
+	}
+	return true, nil
 }
 
 func (h *Holder) UpdateSnapshot(tuple Tuple, snapshot placement.PlacementLoadSnapshot) error {
@@ -313,6 +361,12 @@ func (h *Holder) Active() int {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	return len(h.active)
+}
+
+func (h *Holder) TrackedIdentities() int {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return len(h.high)
 }
 
 func (h *Holder) Registration(nodeID string) (Registration, bool) {

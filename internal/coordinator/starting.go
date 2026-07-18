@@ -315,7 +315,10 @@ func (c *StartingCoordinator) selectCandidate(ctx context.Context, demand placem
 			continue
 		}
 		if len(requests) > 0 {
+			probeStarted := c.clock()
 			probed := c.prober.ProbePair(ctx, c.identity, requests)
+			probeFinished := c.clock()
+			probeElapsed := probeFinished.Sub(probeStarted)
 			if len(probed) != len(requests) {
 				return 0, session.ProbeResult{}, false, errors.New("coordinator: Pair Prober returned the wrong result count")
 			}
@@ -324,10 +327,10 @@ func (c *StartingCoordinator) selectCandidate(ctx context.Context, demand placem
 				if results[resultIndex].Response.NodeID != "" {
 					continue
 				}
-				result := probed[probeIndex]
+				result := accountProbeTransit(probed[probeIndex], probeElapsed)
 				probeIndex++
 				results[resultIndex] = result
-				cache[indices[resultIndex]] = cachedProbe{result: result, observedAt: c.clock()}
+				cache[indices[resultIndex]] = cachedProbe{result: result, observedAt: probeFinished}
 			}
 		}
 		usable := make([]int, 0, 2)
@@ -483,6 +486,20 @@ func probeStillFresh(now time.Time, cached cachedProbe) bool {
 	elapsed := now.Sub(cached.observedAt)
 	return elapsed >= 0 && cached.result.Response.SampleAge >= 0 &&
 		cached.result.Response.SampleAge+elapsed <= placement.MaximumProbeSampleAge
+}
+
+func accountProbeTransit(result session.ProbeResult, elapsed time.Duration) session.ProbeResult {
+	response := &result.Response
+	if response.Class != placement.ProbeImmediate && response.Class != placement.ProbeWouldQueue {
+		return result
+	}
+	if elapsed < 0 || response.SampleAge < 0 || elapsed > placement.MaximumProbeSampleAge-response.SampleAge {
+		response.Class = placement.ProbeStale
+		response.Reason = "placement sample expired during Probe RPC"
+		return result
+	}
+	response.SampleAge += elapsed
+	return result
 }
 
 func revisionAdvanced(previous, next cluster.Revision) bool {

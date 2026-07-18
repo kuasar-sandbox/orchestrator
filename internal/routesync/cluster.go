@@ -141,6 +141,7 @@ const (
 type NodeRegister struct {
 	Version          int               `json:"version"`
 	NodeID           string            `json:"node_id"`
+	EnrollmentID     string            `json:"enrollment_id,omitempty"`
 	NodeEpoch        uint64            `json:"node_epoch,omitempty"`
 	SessionSeq       uint64            `json:"session_seq,omitempty"`
 	LoadModelVersion uint16            `json:"load_model_version,omitempty"`
