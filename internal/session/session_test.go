@@ -185,26 +185,6 @@ func TestHolderAcceptsOnlyIncreasingTupleAndFencesOldStream(t *testing.T) {
 	}
 }
 
-func TestHolderAcceptsBuildOnlyRegistration(t *testing.T) {
-	registration := testRegistration("build-node", 1, 1, "10.0.0.2:8443")
-	registration.SandboxSlots = 0
-	authority := newTestEnrollmentAuthority(registration)
-	holder, err := NewHolder("registry-a", 1, nil, testGate(true), nil, authority)
-	if err != nil {
-		t.Fatal(err)
-	}
-	lease, err := holder.Register(context.Background(), registration, &testEndpoint{})
-	if err != nil {
-		t.Fatalf("build-only registration: %v", err)
-	}
-	lease.Close()
-
-	registration.BuildSlots = 0
-	if _, err := holder.Register(context.Background(), registration, &testEndpoint{}); err == nil {
-		t.Fatal("registration without sandbox or build capacity was accepted")
-	}
-}
-
 func TestHolderRejectsEndpointChangeWithinNodeEpoch(t *testing.T) {
 	first := testRegistration("node-1", 7, 10, "10.0.0.1:8443")
 	authority := newTestEnrollmentAuthority(first)

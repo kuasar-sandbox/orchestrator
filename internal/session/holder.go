@@ -77,8 +77,7 @@ type Registration struct {
 }
 
 func (r Registration) Validate() error {
-	if r.NodeID == "" || r.EnrollmentID == "" || !r.Tuple.Valid() || r.DataEndpoint == "" || r.LoadModelVersion == 0 ||
-		(r.SandboxSlots == 0 && r.BuildSlots == 0) {
+	if r.NodeID == "" || r.EnrollmentID == "" || !r.Tuple.Valid() || r.DataEndpoint == "" || r.LoadModelVersion == 0 || r.SandboxSlots == 0 {
 		return errors.New("session: incomplete node registration")
 	}
 	return nil
