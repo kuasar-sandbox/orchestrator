@@ -6,12 +6,17 @@ import (
 	"time"
 )
 
+const MaximumServePermitMillis = uint64(60_000)
+
 var (
 	ErrPermitMissing  = errors.New("raftstore: Serve Permit is missing")
 	ErrPermitExpired  = errors.New("raftstore: Serve Permit expired")
 	ErrPermitMismatch = errors.New("raftstore: Serve Permit identity mismatch")
 	ErrPermitDenied   = errors.New("raftstore: operation is closed by the Serve Permit")
+	ErrPermitCapacity = errors.New("raftstore: Serve Permit identity capacity exceeded")
 )
+
+const maximumCachedServePermits = 2
 
 type PermitOperation uint8
 
@@ -53,7 +58,7 @@ func (g PermitGrant) Validate() error {
 	if err := g.PermitIdentity.Validate(); err != nil {
 		return err
 	}
-	if g.CommitIndex == 0 || g.MaxLifetimeMillis == 0 {
+	if g.CommitIndex == 0 || g.MaxLifetimeMillis == 0 || g.MaxLifetimeMillis > MaximumServePermitMillis {
 		return errors.New("raftstore: permit grant is not quorum-confirmed")
 	}
 	return nil
@@ -106,16 +111,17 @@ func (p ServePermit) Authorize(now time.Time, identity PermitIdentity, operation
 }
 
 type PermitCache struct {
-	mu     sync.RWMutex
-	now    func() time.Time
-	permit ServePermit
+	mu             sync.RWMutex
+	now            func() time.Time
+	permits        map[PermitIdentity]ServePermit
+	retiredThrough uint64
 }
 
 func NewPermitCache(now func() time.Time) *PermitCache {
 	if now == nil {
 		now = time.Now
 	}
-	return &PermitCache{now: now}
+	return &PermitCache{now: now, permits: make(map[PermitIdentity]ServePermit, maximumCachedServePermits)}
 }
 
 func (c *PermitCache) Install(grant PermitGrant, proposalStarted time.Time) error {
@@ -125,22 +131,67 @@ func (c *PermitCache) Install(grant PermitGrant, proposalStarted time.Time) erro
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.permit.Grant.CommitIndex > grant.CommitIndex {
+	current, found := c.permits[grant.PermitIdentity]
+	if found && current.Grant.CommitIndex > grant.CommitIndex {
 		return errors.New("raftstore: older Serve Permit cannot replace a newer permit")
 	}
-	c.permit = permit
+	if found && current.Grant.CommitIndex == grant.CommitIndex {
+		if current.Grant != grant {
+			return errors.New("raftstore: Serve Permit commit index equivocation")
+		}
+		// Replaying one grant must not extend its original monotonic expiry.
+		return nil
+	}
+	for _, installed := range c.permits {
+		if installed.Grant.CommitIndex == grant.CommitIndex && installed.Grant != grant {
+			return errors.New("raftstore: Serve Permit commit index equivocation")
+		}
+	}
+	if grant.CommitIndex <= c.retiredThrough {
+		return errors.New("raftstore: retired Serve Permit cannot be reinstalled")
+	}
+	if !found && len(c.permits) == maximumCachedServePermits {
+		now := c.now()
+		for identity, installed := range c.permits {
+			if !now.Before(installed.expiresAt) {
+				if installed.Grant.CommitIndex > c.retiredThrough {
+					c.retiredThrough = installed.Grant.CommitIndex
+				}
+				delete(c.permits, identity)
+			}
+		}
+		if grant.CommitIndex <= c.retiredThrough {
+			return errors.New("raftstore: retired Serve Permit cannot be reinstalled")
+		}
+	}
+	if !found && len(c.permits) == maximumCachedServePermits {
+		return ErrPermitCapacity
+	}
+	c.permits[grant.PermitIdentity] = permit
 	return nil
 }
 
 func (c *PermitCache) Authorize(identity PermitIdentity, operation PermitOperation) error {
 	c.mu.RLock()
-	permit := c.permit
+	permit, found := c.permits[identity]
+	count := len(c.permits)
 	c.mu.RUnlock()
+	if !found {
+		if count == 0 {
+			return ErrPermitMissing
+		}
+		return ErrPermitMismatch
+	}
 	return permit.Authorize(c.now(), identity, operation)
 }
 
 func (c *PermitCache) Clear() {
 	c.mu.Lock()
-	c.permit = ServePermit{}
+	for _, permit := range c.permits {
+		if permit.Grant.CommitIndex > c.retiredThrough {
+			c.retiredThrough = permit.Grant.CommitIndex
+		}
+	}
+	clear(c.permits)
 	c.mu.Unlock()
 }

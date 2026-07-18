@@ -12,6 +12,7 @@ type DataLookup struct {
 	Route   *routeapi.ReadRouteRequest `json:"route,omitempty"`
 	Build   *routeapi.ReadBuildRequest `json:"build,omitempty"`
 	Pending *PendingLookup             `json:"pending,omitempty"`
+	Fence   *FenceLookup               `json:"fence,omitempty"`
 }
 
 func (q DataLookup) Validate() error {
@@ -34,6 +35,12 @@ func (q DataLookup) Validate() error {
 			return err
 		}
 	}
+	if q.Fence != nil {
+		present++
+		if err := q.Fence.Validate(); err != nil {
+			return err
+		}
+	}
 	if present != 1 {
 		return errors.New("raftstore: data lookup must contain exactly one query")
 	}
@@ -44,6 +51,7 @@ type DataLookupResult struct {
 	Route   *routeapi.ReadRouteResponse `json:"route,omitempty"`
 	Build   *routeapi.ReadBuildResponse `json:"build,omitempty"`
 	Pending *PendingLookupResult        `json:"pending,omitempty"`
+	Fence   *FenceLookupResult          `json:"fence,omitempty"`
 }
 
 func LookupData(state DataState, query DataLookup) (DataLookupResult, error) {
@@ -57,10 +65,52 @@ func LookupData(state DataState, query DataLookup) (DataLookupResult, error) {
 	case query.Build != nil:
 		response := lookupBuild(state, *query.Build)
 		return DataLookupResult{Build: &response}, nil
+	case query.Fence != nil:
+		response := lookupFence(state, *query.Fence)
+		return DataLookupResult{Fence: &response}, nil
 	default:
 		response := lookupPending(state, *query.Pending)
 		return DataLookupResult{Pending: &response}, nil
 	}
+}
+
+type FenceLookup struct {
+	Identity  ShardRequestIdentity `json:"identity"`
+	Group     string               `json:"group"`
+	RouteKey  string               `json:"route_key"`
+	SandboxID string               `json:"sandbox_id"`
+}
+
+func (q FenceLookup) Validate() error {
+	if err := q.Identity.Validate(); err != nil {
+		return err
+	}
+	if q.Group == "" || q.RouteKey == "" || q.SandboxID == "" {
+		return errors.New("raftstore: execution-fence lookup identity is incomplete")
+	}
+	return nil
+}
+
+type FenceLookupResult struct {
+	Fence *clusterstate.ExecutionFence `json:"fence,omitempty"`
+}
+
+func lookupFence(state DataState, query FenceLookup) FenceLookupResult {
+	if !state.Accepts(query.Identity) {
+		return FenceLookupResult{}
+	}
+	_, shardID, err := clusterstate.RouteShardFor(
+		query.Group, query.RouteKey, state.RouteBucketCount, state.VirtualShardCount,
+	)
+	if err != nil || shardID != state.ShardID || query.Identity.ShardID != state.ShardID {
+		return FenceLookupResult{}
+	}
+	fence, found := state.Fences[fenceMapKey(query.Group, query.RouteKey, query.SandboxID)]
+	if !found {
+		return FenceLookupResult{}
+	}
+	copy := fence
+	return FenceLookupResult{Fence: &copy}
 }
 
 func lookupRoute(state DataState, request routeapi.ReadRouteRequest) routeapi.ReadRouteResponse {

@@ -11,6 +11,8 @@ import (
 	"testing"
 	"time"
 
+	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
+	"github.com/kuasar-sandbox/orchestrator/internal/routeapi"
 	dragonboat "github.com/lni/dragonboat/v4"
 	dbconfig "github.com/lni/dragonboat/v4/config"
 	"github.com/lni/dragonboat/v4/logger"
@@ -38,10 +40,17 @@ func TestDragonboat4097GroupScaleGate(t *testing.T) {
 
 	addresses := make([]string, DefaultReplication)
 	nodeHosts := make([]*dragonboat.NodeHost, DefaultReplication)
+	stateEngines := make([]*PebbleStateEngine, DefaultReplication)
 	for index := range addresses {
 		addresses[index] = freeTCPAddress(t)
 	}
 	for index, address := range addresses {
+		stateEngine, err := OpenPebbleStateEngine(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		stateEngines[index] = stateEngine
+		t.Cleanup(func() { _ = stateEngine.Close() })
 		expert := dbconfig.GetDefaultExpertConfig()
 		expert.LogDB = dbconfig.GetTinyMemLogDBConfig()
 		expert.Engine.SnapshotShards = 4
@@ -72,18 +81,19 @@ func TestDragonboat4097GroupScaleGate(t *testing.T) {
 		2: addresses[1],
 		3: addresses[2],
 	}
+	routeKeys := scaleGateRouteKeys(t, manifest)
+	intent := testDispatchIntentNoFail()
 
 	startedAt := time.Now()
 	for logicalShardID := int64(-1); logicalShardID < int64(DefaultVirtualShards); logicalShardID++ {
 		raftShardID := SystemRaftShardID
-		factory := NewSystemStateMachine
 		if logicalShardID >= 0 {
 			raftShardID = DataRaftShardID(uint32(logicalShardID))
-			factory = NewDataStateMachine
 		}
 		for index, nodeHost := range nodeHosts {
-			if err := nodeHost.StartReplica(
-				initial, false, factory, scaleGateRaftConfig(raftShardID, uint64(index+1)),
+			if err := nodeHost.StartOnDiskReplica(
+				initial, false, stateEngines[index].NewStateMachine,
+				scaleGateRaftConfig(raftShardID, uint64(index+1)),
 			); err != nil {
 				t.Fatalf("start shard %d replica %d: %v", raftShardID, index+1, err)
 			}
@@ -139,6 +149,40 @@ func TestDragonboat4097GroupScaleGate(t *testing.T) {
 			if !applied.Applied {
 				return fmt.Errorf("initialize data shard %d: %s", logicalShardID, applied.Reason)
 			}
+			starting, ready, err := stateScaleReadyRoute(
+				manifest, "/dragonboat-scale", routeKeys[logicalShardID], logicalShardID, intent,
+			)
+			if err != nil {
+				return err
+			}
+			startingRaw, err := EncodeDataCommand(DataCommand{
+				Type: DataPutRoute, Identity: identity,
+				Expect: RevisionExpectation{Absent: true}, Route: &starting,
+			})
+			if err != nil {
+				return err
+			}
+			result, err = proposeScaleGate(groupContext, nodeHosts, DataRaftShardID(logicalShardID), startingRaw)
+			if err != nil {
+				return fmt.Errorf("start Route on data shard %d: %w", logicalShardID, err)
+			}
+			if err := json.Unmarshal(result.Data, &applied); err != nil || !applied.Applied {
+				return fmt.Errorf("start Route on data shard %d: result=%+v err=%v", logicalShardID, applied, err)
+			}
+			readyRaw, err := EncodeDataCommand(DataCommand{
+				Type: DataPutRoute, Identity: identity,
+				Expect: RevisionExpectation{LogIndex: applied.Revision}, Route: &ready,
+			})
+			if err != nil {
+				return err
+			}
+			result, err = proposeScaleGate(groupContext, nodeHosts, DataRaftShardID(logicalShardID), readyRaw)
+			if err != nil {
+				return fmt.Errorf("commit READY on data shard %d: %w", logicalShardID, err)
+			}
+			if err := json.Unmarshal(result.Data, &applied); err != nil || !applied.Applied {
+				return fmt.Errorf("commit READY on data shard %d: result=%+v err=%v", logicalShardID, applied, err)
+			}
 			return nil
 		})
 	}
@@ -150,22 +194,24 @@ func TestDragonboat4097GroupScaleGate(t *testing.T) {
 		t.Fatalf("4097-group startup and initialization took %s; limit %s", startupDuration, scaleGateStartupMax)
 	}
 
+	queries := make([]DataLookup, DefaultVirtualShards)
 	for logicalShardID := uint32(0); logicalShardID < DefaultVirtualShards; logicalShardID++ {
-		if _, err := nodeHosts[0].StaleRead(DataRaftShardID(logicalShardID), DataStateLookup{}); err != nil {
-			t.Fatalf("warm local read for shard %d: %v", logicalShardID, err)
+		queries[logicalShardID] = scaleGateReadyQuery(manifest, digest, logicalShardID, routeKeys[logicalShardID])
+		if err := awaitScaleGateReady(ctx, nodeHosts[0], logicalShardID, queries[logicalShardID]); err != nil {
+			t.Fatal(err)
 		}
 	}
 	latencies := make([]time.Duration, scaleGateReadCount)
 	for index := range latencies {
 		logicalShardID := uint32(index % int(DefaultVirtualShards))
 		started := time.Now()
-		value, err := nodeHosts[0].StaleRead(DataRaftShardID(logicalShardID), DataStateLookup{})
+		value, err := nodeHosts[0].StaleRead(DataRaftShardID(logicalShardID), queries[logicalShardID])
 		latencies[index] = time.Since(started)
 		if err != nil {
 			t.Fatalf("local read for shard %d: %v", logicalShardID, err)
 		}
-		state, ok := value.(DataState)
-		if !ok || !state.Initialized || state.ShardID != logicalShardID {
+		lookup, ok := value.(DataLookupResult)
+		if !ok || lookup.Route == nil || lookup.Route.Outcome != routeapi.ReadReady {
 			t.Fatalf("local read for shard %d returned %#v", logicalShardID, value)
 		}
 	}
@@ -188,10 +234,63 @@ func TestDragonboat4097GroupScaleGate(t *testing.T) {
 	var memory runtime.MemStats
 	runtime.ReadMemStats(&memory)
 	t.Logf(
-		"groups=%d replicas=%d startup=%s local_state_read_p50=%s local_state_read_p99=%s local_state_read_p99.9=%s max_rss=%.2fGiB heap_sys=%.2fGiB",
+		"groups=%d replicas=%d startup=%s local_ready_read_p50=%s local_ready_read_p99=%s local_ready_read_p99.9=%s max_rss=%.2fGiB heap_sys=%.2fGiB",
 		DefaultVirtualShards+1, (DefaultVirtualShards+1)*DefaultReplication, startupDuration,
 		p50, p99, p999, float64(rssBytes)/(1<<30), float64(memory.HeapSys)/(1<<30),
 	)
+}
+
+func scaleGateRouteKeys(t *testing.T, manifest Manifest) []string {
+	t.Helper()
+	keys := make([]string, manifest.VirtualShardCount)
+	remaining := manifest.VirtualShardCount
+	for candidate := uint32(0); remaining > 0; candidate++ {
+		key := fmt.Sprintf("route-%08d", candidate)
+		_, shardID, err := clusterstate.RouteShardFor(
+			"/dragonboat-scale", key, manifest.RouteBucketCount, manifest.VirtualShardCount,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if keys[shardID] == "" {
+			keys[shardID] = key
+			remaining--
+		}
+	}
+	return keys
+}
+
+func scaleGateReadyQuery(manifest Manifest, digest string, shardID uint32, routeKey string) DataLookup {
+	request := routeapi.ReadRouteRequest{
+		RequestIdentity: routeapi.RequestIdentity{
+			ClusterID: manifest.ClusterID, StorageGeneration: manifest.StorageGeneration,
+			SystemEpoch: 1, ManifestDigest: digest, ShardID: shardID,
+		},
+		Group: "/dragonboat-scale", RouteKey: routeKey,
+	}
+	return DataLookup{Route: &request}
+}
+
+func awaitScaleGateReady(
+	ctx context.Context,
+	nodeHost *dragonboat.NodeHost,
+	shardID uint32,
+	query DataLookup,
+) error {
+	for {
+		value, err := nodeHost.StaleRead(DataRaftShardID(shardID), query)
+		if err == nil {
+			result, ok := value.(DataLookupResult)
+			if ok && result.Route != nil && result.Route.Outcome == routeapi.ReadReady {
+				return nil
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("wait for local READY on shard %d: %w", shardID, ctx.Err())
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
 }
 
 func scaleGateRaftConfig(shardID, replicaID uint64) dbconfig.Config {

@@ -16,6 +16,8 @@ import (
 
 const runtimeConfigVersion = uint32(1)
 
+const maximumFenceRetentionMillis = uint64(30 * 24 * 60 * 60 * 1000)
+
 type StorageAttestor interface {
 	VerifyEncrypted(paths ...string) error
 }
@@ -31,16 +33,18 @@ type RaftTLS struct {
 }
 
 type RuntimeTuning struct {
-	RTTMillis          uint64
-	HeartbeatRTT       uint64
-	ElectionRTT        uint64
-	SnapshotEntries    uint64
-	CompactionOverhead uint64
-	MaxInMemLogBytes   uint64
-	MaxSendQueueBytes  uint64
-	MaxRecvQueueBytes  uint64
-	SnapshotWorkers    uint64
-	LogDBMemory        string
+	RTTMillis            uint64
+	HeartbeatRTT         uint64
+	ElectionRTT          uint64
+	SnapshotEntries      uint64
+	CompactionOverhead   uint64
+	MaxInMemLogBytes     uint64
+	MaxSendQueueBytes    uint64
+	MaxRecvQueueBytes    uint64
+	SnapshotWorkers      uint64
+	LogDBMemory          string
+	FenceRetentionMillis uint64
+	StateEngine          StateEngineTuning
 }
 
 func DefaultRuntimeTuning() RuntimeTuning {
@@ -49,6 +53,8 @@ func DefaultRuntimeTuning() RuntimeTuning {
 		SnapshotEntries: 100_000, CompactionOverhead: 10_000,
 		MaxInMemLogBytes: 128 << 20, MaxSendQueueBytes: 256 << 20,
 		MaxRecvQueueBytes: 256 << 20, SnapshotWorkers: 4, LogDBMemory: "medium",
+		FenceRetentionMillis: 60 * 60 * 1000,
+		StateEngine:          DefaultStateEngineTuning(),
 	}
 }
 
@@ -58,6 +64,12 @@ func (t RuntimeTuning) Validate() error {
 		t.MaxInMemLogBytes < 2*MaxRaftCommandBytes || t.MaxSendQueueBytes == 0 ||
 		t.MaxRecvQueueBytes == 0 || t.SnapshotWorkers == 0 {
 		return errors.New("raftstore: invalid bounded Raft tuning")
+	}
+	if t.FenceRetentionMillis == 0 || t.FenceRetentionMillis > maximumFenceRetentionMillis {
+		return errors.New("raftstore: execution-fence retention must be between one millisecond and 30 days")
+	}
+	if err := t.StateEngine.Validate(); err != nil {
+		return err
 	}
 	switch t.LogDBMemory {
 	case "tiny", "small", "medium", "large":
@@ -71,6 +83,7 @@ type RuntimeConfig struct {
 	MemberID          string
 	NodeHostDir       string
 	WALDir            string
+	StateEngineDir    string
 	ListenAddress     string
 	ManifestGuardPath string
 	EnrollmentPath    string
@@ -80,11 +93,12 @@ type RuntimeConfig struct {
 }
 
 func (c RuntimeConfig) validate(member RegistryMember) error {
-	if c.MemberID == "" || c.MemberID != member.MemberID || c.NodeHostDir == "" ||
+	if c.MemberID == "" || c.MemberID != member.MemberID || c.NodeHostDir == "" || c.StateEngineDir == "" ||
 		c.ManifestGuardPath == "" || c.EnrollmentPath == "" {
 		return errors.New("raftstore: incomplete local Registry member configuration")
 	}
 	if !filepath.IsAbs(c.NodeHostDir) || c.WALDir != "" && !filepath.IsAbs(c.WALDir) ||
+		!filepath.IsAbs(c.StateEngineDir) ||
 		!filepath.IsAbs(c.ManifestGuardPath) || !filepath.IsAbs(c.EnrollmentPath) {
 		return errors.New("raftstore: Raft storage and identity paths must be absolute")
 	}
@@ -98,9 +112,14 @@ func (c RuntimeConfig) validate(member RegistryMember) error {
 		return err
 	}
 	for _, identityPath := range []string{c.ManifestGuardPath, c.EnrollmentPath} {
-		if pathWithin(c.NodeHostDir, identityPath) || c.WALDir != "" && pathWithin(c.WALDir, identityPath) {
+		if pathWithin(c.NodeHostDir, identityPath) || c.WALDir != "" && pathWithin(c.WALDir, identityPath) ||
+			pathWithin(c.StateEngineDir, identityPath) {
 			return errors.New("raftstore: manifest/enrollment state must be outside Dragonboat data directories")
 		}
+	}
+	if pathWithin(c.NodeHostDir, c.StateEngineDir) || pathWithin(c.StateEngineDir, c.NodeHostDir) ||
+		c.WALDir != "" && (pathWithin(c.WALDir, c.StateEngineDir) || pathWithin(c.StateEngineDir, c.WALDir)) {
+		return errors.New("raftstore: Pebble state engine and Dragonboat storage must use distinct directories")
 	}
 	return nil
 }
@@ -152,13 +171,15 @@ func (c RuntimeConfig) digest(manifest Manifest, member RegistryMember) (string,
 		RaftAddress    string        `json:"raft_address"`
 		NodeHostDir    string        `json:"nodehost_dir"`
 		WALDir         string        `json:"wal_dir"`
+		StateEngineDir string        `json:"state_engine_dir"`
 		RuntimeTuning  RuntimeTuning `json:"runtime_tuning"`
 		MutualTLS      bool          `json:"mutual_tls"`
 		StaticRegistry bool          `json:"static_registry"`
 	}{
 		Version: runtimeConfigVersion, DeploymentID: deploymentID(manifest.ClusterID, manifest.StorageGeneration),
 		RaftAddress: member.RaftEndpoint, NodeHostDir: c.NodeHostDir, WALDir: c.WALDir,
-		RuntimeTuning: c.Tuning, MutualTLS: true, StaticRegistry: true,
+		StateEngineDir: c.StateEngineDir,
+		RuntimeTuning:  c.Tuning, MutualTLS: true, StaticRegistry: true,
 	}
 	raw, err := json.Marshal(value)
 	if err != nil {
@@ -169,7 +190,7 @@ func (c RuntimeConfig) digest(manifest Manifest, member RegistryMember) (string,
 }
 
 func (c RuntimeConfig) attestStorage() error {
-	paths := []string{c.NodeHostDir}
+	paths := []string{c.NodeHostDir, c.StateEngineDir}
 	if c.WALDir != "" && filepath.Clean(c.WALDir) != filepath.Clean(c.NodeHostDir) {
 		paths = append(paths, c.WALDir)
 	}

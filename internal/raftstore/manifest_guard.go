@@ -142,6 +142,23 @@ func (g ManifestGuard) AcceptSignedChain(
 	chain []SignedManifest,
 	keyring map[string]ed25519.PublicKey,
 ) (AcceptedManifest, error) {
+	accepted, err := g.EvaluateSignedChain(chain, keyring)
+	if err != nil {
+		return AcceptedManifest{}, err
+	}
+	if err := g.store(accepted); err != nil {
+		return AcceptedManifest{}, err
+	}
+	return accepted, nil
+}
+
+// EvaluateSignedChain verifies and advances a manifest lineage in memory. It
+// lets runtime bootstrap validate every local prerequisite before making the
+// anti-rollback decision durable.
+func (g ManifestGuard) EvaluateSignedChain(
+	chain []SignedManifest,
+	keyring map[string]ed25519.PublicKey,
+) (AcceptedManifest, error) {
 	if len(chain) == 0 || len(chain) > 1024 {
 		return AcceptedManifest{}, errors.New("raftstore: manifest chain must be non-empty and bounded")
 	}
@@ -149,11 +166,38 @@ func (g ManifestGuard) AcceptSignedChain(
 	if err != nil {
 		return AcceptedManifest{}, err
 	}
-	for _, signed := range chain {
+	digests := make([]string, len(chain))
+	for index, signed := range chain {
 		digest, verifyErr := signed.Verify(keyring)
 		if verifyErr != nil {
 			return AcceptedManifest{}, verifyErr
 		}
+		digests[index] = digest
+	}
+	start := 0
+	if current != nil {
+		anchor := -1
+		for index, signed := range chain {
+			if signed.Manifest.ClusterID == current.ClusterID &&
+				signed.Manifest.StorageGeneration == current.StorageGeneration &&
+				signed.Manifest.ManifestVersion == current.ManifestVersion && digests[index] == current.ManifestDigest {
+				anchor = index
+				break
+			}
+		}
+		if anchor >= 0 {
+			for index := 1; index <= anchor; index++ {
+				previous := acceptedManifest(chain[index-1].Manifest, digests[index-1])
+				if _, linkErr := previous.Accept(chain[index].Manifest, digests[index]); linkErr != nil {
+					return AcceptedManifest{}, fmt.Errorf("raftstore: invalid signed manifest chain link: %w", linkErr)
+				}
+			}
+			start = anchor + 1
+		}
+	}
+	for index := start; index < len(chain); index++ {
+		signed := chain[index]
+		digest := digests[index]
 		if current == nil {
 			accepted, acceptErr := FirstAcceptedManifest(signed.Manifest, digest)
 			if acceptErr != nil {
@@ -168,8 +212,8 @@ func (g ManifestGuard) AcceptSignedChain(
 		}
 		current = &accepted
 	}
-	if err := g.store(*current); err != nil {
-		return AcceptedManifest{}, err
+	if current == nil {
+		return AcceptedManifest{}, errors.New("raftstore: manifest chain did not produce an accepted state")
 	}
 	return *current, nil
 }

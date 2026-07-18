@@ -3,12 +3,16 @@ package raftstore
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/routeapi"
 )
 
 func (r *Runtime) ApplySystem(ctx context.Context, command SystemCommand) (SystemApplyResult, error) {
-	if command.Type == SystemBootstrap || command.Type == SystemRefreshPermit {
+	if command.Type == SystemBootstrap || command.Type == SystemRefreshPermit || command.Type == SystemConfirmDrain ||
+		command.Type == SystemAdvanceTransition || command.Type == SystemActivateTransition ||
+		command.Type == SystemConfirmTransitionDrain || command.Type == SystemFinalizeTransition ||
+		command.Type == SystemCloseGeneration {
 		return SystemApplyResult{}, errors.New("raftstore: use the dedicated bootstrap/permit operation")
 	}
 	if command.Type == SystemBeginTransition {
@@ -20,11 +24,149 @@ func (r *Runtime) ApplySystem(ctx context.Context, command SystemCommand) (Syste
 	return r.proposeSystem(ctx, command)
 }
 
+// CloseStorageGeneration permanently retires this generation and commits the
+// exact successor manifest intent. The successor's consensus proof outputs are
+// deliberately excluded from the intent because they are produced by this
+// commit; ConsensusPredecessorProof fills them afterwards.
+func (r *Runtime) CloseStorageGeneration(ctx context.Context, successor Manifest) (SystemState, error) {
+	state, err := r.ReadSystemStrong(ctx)
+	if err != nil {
+		return SystemState{}, err
+	}
+	if err := r.authorizeManifestState(state); err != nil {
+		return SystemState{}, err
+	}
+	predecessor := successor.Predecessor
+	if successor.ClusterID != state.ClusterID || successor.StorageGeneration == state.StorageGeneration ||
+		successor.ManifestVersion != 1 || predecessor == nil ||
+		predecessor.Kind != RolloverConsensusClosure ||
+		predecessor.StorageGeneration != state.StorageGeneration ||
+		predecessor.ManifestDigest != state.ActiveManifestDigest ||
+		predecessor.ServePermitMaxMillis != state.ServePermitMaxMillis {
+		return SystemState{}, errors.New("raftstore: successor manifest is not linked to the active generation")
+	}
+	intentDigest, err := successor.RolloverIntentDigest()
+	if err != nil {
+		return SystemState{}, err
+	}
+	if state.Retired {
+		if state.Closure != nil && state.Closure.TargetStorageGeneration == successor.StorageGeneration &&
+			state.Closure.TargetManifestIntentDigest == intentDigest {
+			return state, nil
+		}
+		return SystemState{}, errors.New("raftstore: generation is retired for another successor manifest")
+	}
+
+	result, proposeErr := r.proposeSystem(ctx, SystemCommand{
+		Type: SystemCloseGeneration,
+		Closure: &GenerationClosure{
+			TargetStorageGeneration:    successor.StorageGeneration,
+			TargetManifestIntentDigest: intentDigest,
+			Kind:                       RolloverConsensusClosure,
+		},
+	})
+	current, readErr := r.ReadSystemStrong(ctx)
+	if readErr == nil && current.Retired && current.Closure != nil &&
+		current.Closure.TargetStorageGeneration == successor.StorageGeneration &&
+		current.Closure.TargetManifestIntentDigest == intentDigest {
+		return current, nil
+	}
+	if proposeErr != nil {
+		return SystemState{}, proposeErr
+	}
+	if result.Conflict || !result.Applied {
+		return SystemState{}, errors.New(result.Reason)
+	}
+	if readErr != nil {
+		return SystemState{}, readErr
+	}
+	return SystemState{}, errors.New("raftstore: committed generation closure was not visible")
+}
+
+// ConfirmPredecessorPermitDrain waits a full predecessor permit lifetime from
+// a quorum-confirmed successor-state read before recording drain completion.
+// Restarting the caller restarts the full monotonic wait, which is conservative.
+func (r *Runtime) ConfirmPredecessorPermitDrain(ctx context.Context, evidenceDigest string) (SystemState, error) {
+	if !isSHA256(evidenceDigest) {
+		return SystemState{}, errors.New("raftstore: predecessor drain evidence digest is required")
+	}
+	state, err := r.ReadSystemStrong(ctx)
+	if err != nil {
+		return SystemState{}, err
+	}
+	if err := r.authorizeManifestState(state); err != nil {
+		return SystemState{}, err
+	}
+	if !state.HasPredecessor {
+		return SystemState{}, errors.New("raftstore: first generation has no predecessor permit to drain")
+	}
+	if state.PredecessorDrainComplete {
+		return state, nil
+	}
+	if state.PredecessorProofKind != RolloverConsensusClosure {
+		return SystemState{}, errors.New("raftstore: incomplete external fencing cannot be replaced by a timed drain")
+	}
+	wait := time.Duration(state.PredecessorPermitMaxMillis) * time.Millisecond
+	started := time.Now()
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return SystemState{}, ctx.Err()
+	case <-timer.C:
+	}
+	for time.Since(started) < wait {
+		remaining := wait - time.Since(started)
+		timer.Reset(remaining)
+		select {
+		case <-ctx.Done():
+			return SystemState{}, ctx.Err()
+		case <-timer.C:
+		}
+	}
+
+	current, err := r.ReadSystemStrong(ctx)
+	if err != nil {
+		return SystemState{}, err
+	}
+	if current.StorageGeneration != state.StorageGeneration || current.SystemEpoch != state.SystemEpoch ||
+		current.PredecessorGeneration != state.PredecessorGeneration ||
+		current.PredecessorProofDigest != state.PredecessorProofDigest ||
+		current.PredecessorPermitMaxMillis != state.PredecessorPermitMaxMillis {
+		return SystemState{}, errors.New("raftstore: predecessor drain identity changed during the wait")
+	}
+	if current.PredecessorDrainComplete {
+		return current, nil
+	}
+	elapsedMillis := uint64(time.Since(started) / time.Millisecond)
+	result, err := r.proposeSystem(ctx, SystemCommand{Type: SystemConfirmDrain, Drain: &DrainConfirmation{
+		PredecessorProofDigest: state.PredecessorProofDigest,
+		WaitedMillis:           elapsedMillis, EvidenceDigest: evidenceDigest,
+	}})
+	if err != nil {
+		return SystemState{}, err
+	}
+	if result.Conflict || !result.Applied {
+		return SystemState{}, errors.New(result.Reason)
+	}
+	confirmed, err := r.ReadSystemStrong(ctx)
+	if err != nil {
+		return SystemState{}, err
+	}
+	if !confirmed.PredecessorDrainComplete {
+		return SystemState{}, errors.New("raftstore: predecessor drain was not committed")
+	}
+	return confirmed, nil
+}
+
 func (r *Runtime) ReadData(ctx context.Context, query DataLookup) (DataLookupResult, error) {
 	if err := query.Validate(); err != nil {
 		return DataLookupResult{}, err
 	}
 	identity, logicalShardID, strong := lookupIdentity(query)
+	if err := r.authorizeLocalDataReplica(identity); err != nil {
+		return DataLookupResult{}, err
+	}
 	if err := r.permitCache.Authorize(identity.PermitIdentity, PermitRegistryRead); err != nil {
 		return DataLookupResult{}, err
 	}
@@ -50,12 +192,47 @@ func (r *Runtime) ReadData(ctx context.Context, query DataLookup) (DataLookupRes
 	return result, nil
 }
 
+func (r *Runtime) authorizeLocalDataReplica(identity ShardRequestIdentity) error {
+	r.mu.Lock()
+	position := r.replicaPosition(DataRaftShardID(identity.ShardID))
+	if position < 0 {
+		r.mu.Unlock()
+		return ErrNoLocalReplica
+	}
+	local := r.enrollment.Replicas[position]
+	r.mu.Unlock()
+	if local.LocalState != ReplicaActive || local.NonVoting {
+		return ErrNoLocalReplica
+	}
+	if identity.ManifestDigest != r.manifestDigest {
+		// A removed replica may serve only the preceding epoch while its
+		// already-issued Permit drains. DataState.Accepts performs the exact
+		// old-epoch check and the new manifest never routes new-epoch reads here.
+		return nil
+	}
+	if int(identity.ShardID) >= len(r.manifest.DataShards) {
+		return ErrNoLocalReplica
+	}
+	placement, found := replicaPlacementForMember(
+		r.manifest.DataShards[identity.ShardID].Replicas, r.member.MemberID,
+	)
+	if !found {
+		return ErrNoLocalReplica
+	}
+	if local.ReplicaID != placement.ReplicaID {
+		return ErrNoLocalReplica
+	}
+	return nil
+}
+
 func lookupIdentity(query DataLookup) (ShardRequestIdentity, uint32, bool) {
 	switch {
 	case query.Route != nil:
 		return shardIdentityFromRoute(query.Route.RequestIdentity), query.Route.ShardID, query.Route.Strong
 	case query.Build != nil:
 		return shardIdentityFromRoute(query.Build.RequestIdentity), query.Build.ShardID, query.Build.Strong
+	case query.Fence != nil:
+		return query.Fence.Identity, query.Fence.Identity.ShardID, true
 	default:
 		return query.Pending.Identity, query.Pending.Identity.ShardID, true
 	}

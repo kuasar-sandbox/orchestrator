@@ -4,22 +4,346 @@ import (
 	"context"
 	"errors"
 	"fmt"
+
+	dragonboat "github.com/lni/dragonboat/v4"
 )
 
 type ReplicaCatchUpProof struct {
 	ShardID        uint64 `json:"shard_id"`
 	ReplicaID      uint64 `json:"replica_id"`
+	MemberID       string `json:"member_id"`
 	ManifestDigest string `json:"manifest_digest"`
-	LeaderApplied  uint64 `json:"leader_applied"`
-	TargetApplied  uint64 `json:"target_applied"`
+	AppliedIndex   uint64 `json:"applied_index"`
 }
 
-func (p ReplicaCatchUpProof) Validate() error {
-	if p.ShardID == 0 || p.ReplicaID == 0 || !isSHA256(p.ManifestDigest) ||
-		p.LeaderApplied == 0 || p.TargetApplied < p.LeaderApplied {
+type ReplicaCatchUpRequest struct {
+	ShardID             uint64 `json:"shard_id"`
+	ReplicaID           uint64 `json:"replica_id"`
+	MemberID            string `json:"member_id"`
+	ManifestDigest      string `json:"manifest_digest"`
+	MinimumAppliedIndex uint64 `json:"minimum_applied_index"`
+}
+
+func (r ReplicaCatchUpRequest) Validate() error {
+	if r.ShardID == 0 || r.ReplicaID == 0 || r.MemberID == "" || !isSHA256(r.ManifestDigest) ||
+		r.MinimumAppliedIndex == 0 {
+		return errors.New("raftstore: replica catch-up request is incomplete")
+	}
+	return nil
+}
+
+func (p ReplicaCatchUpProof) Validate(request ReplicaCatchUpRequest) error {
+	if err := request.Validate(); err != nil {
+		return err
+	}
+	if p.ShardID != request.ShardID || p.ReplicaID != request.ReplicaID || p.MemberID != request.MemberID ||
+		p.ManifestDigest != request.ManifestDigest || p.AppliedIndex < request.MinimumAppliedIndex {
 		return errors.New("raftstore: replica catch-up proof is incomplete")
 	}
 	return nil
+}
+
+type ReplicaPromotionRequest struct {
+	ShardID        uint64 `json:"shard_id"`
+	ReplicaID      uint64 `json:"replica_id"`
+	MemberID       string `json:"member_id"`
+	ManifestDigest string `json:"manifest_digest"`
+}
+
+type ReplicaAppliedRequest struct {
+	ShardID             uint64 `json:"shard_id"`
+	ReplicaID           uint64 `json:"replica_id"`
+	MemberID            string `json:"member_id"`
+	ManifestDigest      string `json:"manifest_digest"`
+	MinimumAppliedIndex uint64 `json:"minimum_applied_index"`
+}
+
+func (r ReplicaAppliedRequest) Validate() error {
+	if r.ShardID < firstDataRaftShardID || r.ReplicaID == 0 || r.MemberID == "" ||
+		!isSHA256(r.ManifestDigest) || r.MinimumAppliedIndex == 0 {
+		return errors.New("raftstore: replica applied-index request is incomplete")
+	}
+	return nil
+}
+
+type ReplicaAppliedProof struct {
+	ShardID        uint64 `json:"shard_id"`
+	ReplicaID      uint64 `json:"replica_id"`
+	MemberID       string `json:"member_id"`
+	ManifestDigest string `json:"manifest_digest"`
+	AppliedIndex   uint64 `json:"applied_index"`
+}
+
+func (p ReplicaAppliedProof) Validate(request ReplicaAppliedRequest) error {
+	if err := request.Validate(); err != nil {
+		return err
+	}
+	if p.ShardID != request.ShardID || p.ReplicaID != request.ReplicaID || p.MemberID != request.MemberID ||
+		p.ManifestDigest != request.ManifestDigest || p.AppliedIndex < request.MinimumAppliedIndex {
+		return errors.New("raftstore: replica applied-index proof is incomplete")
+	}
+	return nil
+}
+
+func (r ReplicaPromotionRequest) Validate() error {
+	if r.ShardID == 0 || r.ReplicaID == 0 || r.MemberID == "" || !isSHA256(r.ManifestDigest) {
+		return errors.New("raftstore: replica promotion request is incomplete")
+	}
+	return nil
+}
+
+// ReplicaTransitionClient calls the target Registry member over the
+// authenticated internal control plane. Implementations must route both calls
+// to the exact MemberID.
+type ReplicaTransitionClient interface {
+	ProbeReplicaCatchUp(context.Context, ReplicaCatchUpRequest) (ReplicaCatchUpProof, error)
+	ProbeReplicaApplied(context.Context, ReplicaAppliedRequest) (ReplicaAppliedProof, error)
+	ConfirmReplicaPromoted(context.Context, ReplicaPromotionRequest) error
+}
+
+type ReplicaTransitionClientFuncs struct {
+	Probe   func(context.Context, ReplicaCatchUpRequest) (ReplicaCatchUpProof, error)
+	Applied func(context.Context, ReplicaAppliedRequest) (ReplicaAppliedProof, error)
+	Confirm func(context.Context, ReplicaPromotionRequest) error
+}
+
+func (f ReplicaTransitionClientFuncs) ProbeReplicaApplied(
+	ctx context.Context,
+	request ReplicaAppliedRequest,
+) (ReplicaAppliedProof, error) {
+	if f.Applied == nil {
+		return ReplicaAppliedProof{}, errors.New("raftstore: remote replica applied-index probe is unavailable")
+	}
+	return f.Applied(ctx, request)
+}
+
+func (f ReplicaTransitionClientFuncs) ProbeReplicaCatchUp(
+	ctx context.Context,
+	request ReplicaCatchUpRequest,
+) (ReplicaCatchUpProof, error) {
+	if f.Probe == nil {
+		return ReplicaCatchUpProof{}, errors.New("raftstore: remote replica catch-up probe is unavailable")
+	}
+	return f.Probe(ctx, request)
+}
+
+func (f ReplicaTransitionClientFuncs) ConfirmReplicaPromoted(
+	ctx context.Context,
+	request ReplicaPromotionRequest,
+) error {
+	if f.Confirm == nil {
+		return errors.New("raftstore: remote replica promotion confirmation is unavailable")
+	}
+	return f.Confirm(ctx, request)
+}
+
+// ProveLocalReplicaCaughtUp executes a linearizable read on the exact local
+// learner. It is the target-side handler for the authenticated catch-up probe;
+// callers cannot substitute process-local counters or heartbeat observations.
+func (r *Runtime) ProveLocalReplicaCaughtUp(
+	ctx context.Context,
+	request ReplicaCatchUpRequest,
+) (ReplicaCatchUpProof, error) {
+	if err := request.Validate(); err != nil {
+		return ReplicaCatchUpProof{}, err
+	}
+	if request.ManifestDigest != r.manifestDigest || request.MemberID != r.member.MemberID {
+		return ReplicaCatchUpProof{}, errors.New("raftstore: catch-up request targets another manifest member")
+	}
+	placement, err := r.placementForRaftShard(request.ShardID)
+	if err != nil {
+		return ReplicaCatchUpProof{}, err
+	}
+	placed := false
+	for _, replica := range placement {
+		if replica.ReplicaID == request.ReplicaID && replica.MemberID == request.MemberID {
+			placed = true
+			break
+		}
+	}
+	if !placed {
+		return ReplicaCatchUpProof{}, errors.New("raftstore: local learner is absent from the desired manifest")
+	}
+
+	r.mu.Lock()
+	position := r.replicaPosition(request.ShardID)
+	if position < 0 {
+		r.mu.Unlock()
+		return ReplicaCatchUpProof{}, ErrNoLocalReplica
+	}
+	local := r.enrollment.Replicas[position]
+	r.mu.Unlock()
+	if local.ReplicaID != request.ReplicaID || local.LocalState != ReplicaActive || !local.NonVoting {
+		return ReplicaCatchUpProof{}, errors.New("raftstore: requested local learner is not active and non-voting")
+	}
+	membership, err := r.nodeHost.SyncGetShardMembership(ctx, request.ShardID)
+	if err != nil {
+		return ReplicaCatchUpProof{}, err
+	}
+	if membership.NonVotings[request.ReplicaID] != r.member.RaftEndpoint {
+		return ReplicaCatchUpProof{}, errors.New("raftstore: consensus membership does not bind the local learner")
+	}
+
+	var applied uint64
+	if request.ShardID == SystemRaftShardID {
+		state, err := r.ReadSystemStrong(ctx)
+		if err != nil {
+			return ReplicaCatchUpProof{}, err
+		}
+		if _, err := r.requireManifestTransition(state); err != nil {
+			return ReplicaCatchUpProof{}, err
+		}
+		applied = state.LastApplied
+	} else {
+		logicalID, ok := LogicalShardID(request.ShardID)
+		if !ok {
+			return ReplicaCatchUpProof{}, errors.New("raftstore: unknown Raft shard")
+		}
+		state, err := r.readDataStateStrong(ctx, request.ShardID)
+		if err != nil {
+			return ReplicaCatchUpProof{}, err
+		}
+		if err := r.validateDataState(state, logicalID); err != nil {
+			return ReplicaCatchUpProof{}, err
+		}
+		prepared := false
+		for _, epoch := range state.ServingEpochs {
+			if epoch.ManifestDigest == request.ManifestDigest {
+				prepared = true
+				break
+			}
+		}
+		if !prepared {
+			return ReplicaCatchUpProof{}, errors.New("raftstore: local learner has not applied the target manifest epoch")
+		}
+		applied = state.LastApplied
+	}
+	proof := ReplicaCatchUpProof{
+		ShardID: request.ShardID, ReplicaID: request.ReplicaID, MemberID: request.MemberID,
+		ManifestDigest: request.ManifestDigest, AppliedIndex: applied,
+	}
+	if err := proof.Validate(request); err != nil {
+		return ReplicaCatchUpProof{}, err
+	}
+	return proof, nil
+}
+
+// ProveLocalReplicaApplied performs a linearizable read on one exact active
+// voter. It is used only by the fence-compaction coordinator.
+func (r *Runtime) ProveLocalReplicaApplied(
+	ctx context.Context,
+	request ReplicaAppliedRequest,
+) (ReplicaAppliedProof, error) {
+	if err := request.Validate(); err != nil {
+		return ReplicaAppliedProof{}, err
+	}
+	if request.ManifestDigest != r.manifestDigest || request.MemberID != r.member.MemberID {
+		return ReplicaAppliedProof{}, errors.New("raftstore: applied-index request targets another manifest member")
+	}
+	logicalID, ok := LogicalShardID(request.ShardID)
+	if !ok || int(logicalID) >= len(r.manifest.DataShards) {
+		return ReplicaAppliedProof{}, errors.New("raftstore: applied-index request targets an unknown data shard")
+	}
+	placement := r.manifest.DataShards[logicalID].Replicas
+	placed := false
+	for _, replica := range placement {
+		if replica.ReplicaID == request.ReplicaID && replica.MemberID == request.MemberID {
+			placed = true
+			break
+		}
+	}
+	if !placed {
+		return ReplicaAppliedProof{}, errors.New("raftstore: local voter is absent from the active manifest")
+	}
+	r.mu.Lock()
+	position := r.replicaPosition(request.ShardID)
+	if position < 0 {
+		r.mu.Unlock()
+		return ReplicaAppliedProof{}, ErrNoLocalReplica
+	}
+	local := r.enrollment.Replicas[position]
+	r.mu.Unlock()
+	if local.ReplicaID != request.ReplicaID || local.LocalState != ReplicaActive || local.NonVoting {
+		return ReplicaAppliedProof{}, errors.New("raftstore: requested local voter is not active")
+	}
+	membership, err := r.nodeHost.SyncGetShardMembership(ctx, request.ShardID)
+	if err != nil {
+		return ReplicaAppliedProof{}, err
+	}
+	if membership.Nodes[request.ReplicaID] != r.member.RaftEndpoint {
+		return ReplicaAppliedProof{}, errors.New("raftstore: consensus membership does not bind the local voter")
+	}
+	state, err := r.readDataStateStrong(ctx, request.ShardID)
+	if err != nil {
+		return ReplicaAppliedProof{}, err
+	}
+	if err := r.validateDataState(state, logicalID); err != nil {
+		return ReplicaAppliedProof{}, err
+	}
+	if len(state.ServingEpochs) != 1 || state.ServingEpochs[0].ManifestDigest != request.ManifestDigest {
+		return ReplicaAppliedProof{}, errors.New("raftstore: local voter does not serve the stable active manifest")
+	}
+	proof := ReplicaAppliedProof{
+		ShardID: request.ShardID, ReplicaID: request.ReplicaID, MemberID: request.MemberID,
+		ManifestDigest: request.ManifestDigest, AppliedIndex: state.LastApplied,
+	}
+	if err := proof.Validate(request); err != nil {
+		return ReplicaAppliedProof{}, err
+	}
+	return proof, nil
+}
+
+func (r *Runtime) probeReplicaCatchUp(
+	ctx context.Context,
+	request ReplicaCatchUpRequest,
+) (ReplicaCatchUpProof, error) {
+	if request.MemberID == r.member.MemberID {
+		return r.ProveLocalReplicaCaughtUp(ctx, request)
+	}
+	if r.transitionClient == nil {
+		return ReplicaCatchUpProof{}, errors.New("raftstore: authenticated remote replica catch-up probe is unavailable")
+	}
+	proof, err := r.transitionClient.ProbeReplicaCatchUp(ctx, request)
+	if err != nil {
+		return ReplicaCatchUpProof{}, err
+	}
+	if err := proof.Validate(request); err != nil {
+		return ReplicaCatchUpProof{}, err
+	}
+	return proof, nil
+}
+
+func (r *Runtime) probeReplicaApplied(
+	ctx context.Context,
+	request ReplicaAppliedRequest,
+) (ReplicaAppliedProof, error) {
+	if request.MemberID == r.member.MemberID {
+		return r.ProveLocalReplicaApplied(ctx, request)
+	}
+	if r.transitionClient == nil {
+		return ReplicaAppliedProof{}, errors.New("raftstore: authenticated remote applied-index probe is unavailable")
+	}
+	proof, err := r.transitionClient.ProbeReplicaApplied(ctx, request)
+	if err != nil {
+		return ReplicaAppliedProof{}, err
+	}
+	if err := proof.Validate(request); err != nil {
+		return ReplicaAppliedProof{}, err
+	}
+	return proof, nil
+}
+
+func (r *Runtime) confirmReplicaPromoted(ctx context.Context, request ReplicaPromotionRequest) error {
+	if err := request.Validate(); err != nil {
+		return err
+	}
+	if request.MemberID == r.member.MemberID {
+		return r.ConfirmLocalReplicaPromoted(ctx, request)
+	}
+	if r.transitionClient == nil {
+		return errors.New("raftstore: authenticated remote replica promotion confirmation is unavailable")
+	}
+	return r.transitionClient.ConfirmReplicaPromoted(ctx, request)
 }
 
 func (r *Runtime) AddNonVoting(ctx context.Context, shardID, replicaID uint64, memberID string) error {
@@ -30,6 +354,9 @@ func (r *Runtime) AddNonVoting(ctx context.Context, shardID, replicaID uint64, m
 	membership, err := r.nodeHost.SyncGetShardMembership(ctx, shardID)
 	if err != nil {
 		return err
+	}
+	if owner, found := membershipReplicaAtTarget(membership, target); found && owner != replicaID {
+		return fmt.Errorf("raftstore: Raft target is already bound to replica %d in shard %d", owner, shardID)
 	}
 	if _, removed := membership.Removed[replicaID]; removed {
 		return errors.New("raftstore: removed replica ID cannot be reused in a shard")
@@ -46,16 +373,44 @@ func (r *Runtime) AddNonVoting(ctx context.Context, shardID, replicaID uint64, m
 		}
 		return nil
 	}
-	if err := r.nodeHost.SyncRequestAddNonVoting(ctx, shardID, replicaID, target, membership.ConfigChangeID); err != nil {
-		return err
-	}
-	return r.verifyMembership(ctx, shardID, func(current *membershipView) bool {
+	requestErr := r.nodeHost.SyncRequestAddNonVoting(ctx, shardID, replicaID, target, membership.ConfigChangeID)
+	verifyErr := r.verifyMembership(ctx, shardID, func(current *membershipView) bool {
 		return current.nonVotings[replicaID] == target
 	})
+	if verifyErr == nil {
+		return nil
+	}
+	if requestErr != nil {
+		return requestErr
+	}
+	return verifyErr
 }
 
-func (r *Runtime) PromoteNonVoting(ctx context.Context, proof ReplicaCatchUpProof) error {
-	if err := proof.Validate(); err != nil {
+func membershipReplicaAtTarget(membership *dragonboat.Membership, target string) (uint64, bool) {
+	for replicaID, current := range membership.Nodes {
+		if current == target {
+			return replicaID, true
+		}
+	}
+	for replicaID, current := range membership.NonVotings {
+		if current == target {
+			return replicaID, true
+		}
+	}
+	for replicaID, current := range membership.Witnesses {
+		if current == target {
+			return replicaID, true
+		}
+	}
+	return 0, false
+}
+
+func (r *Runtime) promoteNonVoting(
+	ctx context.Context,
+	request ReplicaCatchUpRequest,
+	proof ReplicaCatchUpProof,
+) error {
+	if err := proof.Validate(request); err != nil {
 		return err
 	}
 	if proof.ManifestDigest != r.manifestDigest {
@@ -68,27 +423,52 @@ func (r *Runtime) PromoteNonVoting(ctx context.Context, proof ReplicaCatchUpProo
 	if !placementContainsReplica(placement, proof.ReplicaID) {
 		return errors.New("raftstore: promoted replica is absent from the desired manifest")
 	}
+	var expectedTarget string
+	for _, replica := range placement {
+		if replica.ReplicaID != proof.ReplicaID {
+			continue
+		}
+		if replica.MemberID != proof.MemberID {
+			return errors.New("raftstore: catch-up proof names the wrong manifest member")
+		}
+		expectedTarget, err = r.desiredReplicaTarget(proof.ShardID, replica.ReplicaID, replica.MemberID)
+		if err != nil {
+			return err
+		}
+		break
+	}
 	membership, err := r.nodeHost.SyncGetShardMembership(ctx, proof.ShardID)
 	if err != nil {
 		return err
 	}
-	if _, found := membership.Nodes[proof.ReplicaID]; found {
+	if current, found := membership.Nodes[proof.ReplicaID]; found {
+		if current != expectedTarget {
+			return errors.New("raftstore: voting replica ID is bound to another target")
+		}
 		return nil
 	}
 	target, found := membership.NonVotings[proof.ReplicaID]
 	if !found {
 		return errors.New("raftstore: target replica is not a non-voting member")
 	}
-	if err := r.nodeHost.SyncRequestAddReplica(
-		ctx, proof.ShardID, proof.ReplicaID, target, membership.ConfigChangeID,
-	); err != nil {
-		return err
+	if target != expectedTarget {
+		return errors.New("raftstore: non-voting replica ID is bound to another target")
 	}
-	return r.verifyMembership(ctx, proof.ShardID, func(current *membershipView) bool {
-		_, voting := current.nodes[proof.ReplicaID]
+	requestErr := r.nodeHost.SyncRequestAddReplica(
+		ctx, proof.ShardID, proof.ReplicaID, target, membership.ConfigChangeID,
+	)
+	verifyErr := r.verifyMembership(ctx, proof.ShardID, func(current *membershipView) bool {
+		votingTarget, voting := current.nodes[proof.ReplicaID]
 		_, nonVoting := current.nonVotings[proof.ReplicaID]
-		return voting && !nonVoting
+		return voting && votingTarget == expectedTarget && !nonVoting
 	})
+	if verifyErr == nil {
+		return nil
+	}
+	if requestErr != nil {
+		return requestErr
+	}
+	return verifyErr
 }
 
 func (r *Runtime) RemoveOldReplica(ctx context.Context, shardID, replicaID uint64) error {
@@ -117,13 +497,18 @@ func (r *Runtime) RemoveOldReplica(ctx context.Context, shardID, replicaID uint6
 	if len(membership.Nodes) < int(DefaultReplication)+1 {
 		return errors.New("raftstore: removal would reduce the voting set before replacement")
 	}
-	if err := r.nodeHost.SyncRequestDeleteReplica(ctx, shardID, replicaID, membership.ConfigChangeID); err != nil {
-		return err
-	}
-	return r.verifyMembership(ctx, shardID, func(current *membershipView) bool {
+	requestErr := r.nodeHost.SyncRequestDeleteReplica(ctx, shardID, replicaID, membership.ConfigChangeID)
+	verifyErr := r.verifyMembership(ctx, shardID, func(current *membershipView) bool {
 		_, removed := current.removed[replicaID]
 		return removed
 	})
+	if verifyErr == nil {
+		return nil
+	}
+	if requestErr != nil {
+		return requestErr
+	}
+	return verifyErr
 }
 
 func (r *Runtime) RemoveJoiningReplica(ctx context.Context, shardID, replicaID uint64) error {
@@ -137,32 +522,68 @@ func (r *Runtime) RemoveJoiningReplica(ctx context.Context, shardID, replicaID u
 	if _, found := membership.NonVotings[replicaID]; !found {
 		return errors.New("raftstore: abort target is not a non-voting replica")
 	}
-	if err := r.nodeHost.SyncRequestDeleteReplica(ctx, shardID, replicaID, membership.ConfigChangeID); err != nil {
-		return err
-	}
-	return r.verifyMembership(ctx, shardID, func(current *membershipView) bool {
+	requestErr := r.nodeHost.SyncRequestDeleteReplica(ctx, shardID, replicaID, membership.ConfigChangeID)
+	verifyErr := r.verifyMembership(ctx, shardID, func(current *membershipView) bool {
 		_, removed := current.removed[replicaID]
 		return removed
 	})
+	if verifyErr == nil {
+		return nil
+	}
+	if requestErr != nil {
+		return requestErr
+	}
+	return verifyErr
 }
 
-func (r *Runtime) MarkLocalReplicaPromoted(ctx context.Context, shardID uint64) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	position := r.replicaPosition(shardID)
-	if position < 0 {
-		return ErrNoLocalReplica
+func (r *Runtime) ConfirmLocalReplicaPromoted(ctx context.Context, request ReplicaPromotionRequest) error {
+	if err := request.Validate(); err != nil {
+		return err
 	}
-	replica := r.enrollment.Replicas[position]
-	if replica.LocalState != ReplicaActive {
-		return errors.New("raftstore: local replica is not active")
+	if request.ManifestDigest != r.manifestDigest || request.MemberID != r.member.MemberID {
+		return errors.New("raftstore: promotion confirmation targets another manifest member")
 	}
-	membership, err := r.nodeHost.SyncGetShardMembership(ctx, shardID)
+	placement, err := r.placementForRaftShard(request.ShardID)
 	if err != nil {
 		return err
 	}
-	if _, voting := membership.Nodes[replica.ReplicaID]; !voting {
+	placed := false
+	for _, replica := range placement {
+		if replica.ReplicaID == request.ReplicaID && replica.MemberID == request.MemberID {
+			placed = true
+			break
+		}
+	}
+	if !placed {
+		return errors.New("raftstore: promoted local replica is absent from the desired manifest")
+	}
+	r.mu.Lock()
+	position := r.replicaPosition(request.ShardID)
+	if position < 0 {
+		r.mu.Unlock()
+		return ErrNoLocalReplica
+	}
+	replica := r.enrollment.Replicas[position]
+	r.mu.Unlock()
+	if replica.ReplicaID != request.ReplicaID || replica.LocalState != ReplicaActive {
+		return errors.New("raftstore: local replica is not active")
+	}
+	membership, err := r.nodeHost.SyncGetShardMembership(ctx, request.ShardID)
+	if err != nil {
+		return err
+	}
+	if membership.Nodes[replica.ReplicaID] != r.member.RaftEndpoint {
 		return errors.New("raftstore: consensus membership has not promoted the local replica")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	position = r.replicaPosition(request.ShardID)
+	if position < 0 || r.enrollment.Replicas[position].ReplicaID != request.ReplicaID ||
+		r.enrollment.Replicas[position].LocalState != ReplicaActive {
+		return errors.New("raftstore: local replica enrollment changed during promotion confirmation")
+	}
+	if !r.enrollment.Replicas[position].NonVoting {
+		return nil
 	}
 	next := r.enrollment
 	next.Replicas = append([]LocalReplicaEnrollment(nil), r.enrollment.Replicas...)
@@ -176,24 +597,60 @@ func (r *Runtime) MarkLocalReplicaPromoted(ctx context.Context, shardID uint64) 
 
 func (r *Runtime) RemoveLocalReplicaData(ctx context.Context, shardID uint64) error {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	position := r.replicaPosition(shardID)
 	if position < 0 {
+		r.mu.Unlock()
 		return ErrNoLocalReplica
 	}
 	replica := r.enrollment.Replicas[position]
-	membership, err := r.nodeHost.SyncGetShardMembership(ctx, shardID)
-	if err != nil {
+	switch replica.LocalState {
+	case ReplicaRemoved:
+		r.mu.Unlock()
+		return nil
+	case ReplicaRemoving:
+		r.mu.Unlock()
+	case ReplicaActive:
+		r.mu.Unlock()
+		membership, err := r.nodeHost.SyncGetShardMembership(ctx, shardID)
+		if err != nil {
+			return err
+		}
+		if _, removed := membership.Removed[replica.ReplicaID]; !removed {
+			return errors.New("raftstore: local replica data cannot be removed before committed membership removal")
+		}
+		r.mu.Lock()
+		position = r.replicaPosition(shardID)
+		if position < 0 || r.enrollment.Replicas[position] != replica {
+			r.mu.Unlock()
+			return errors.New("raftstore: local replica enrollment changed during removal")
+		}
+		if err := r.setReplicaState(position, ReplicaRemoving); err != nil {
+			r.mu.Unlock()
+			return err
+		}
+		r.mu.Unlock()
+	default:
+		r.mu.Unlock()
+		return errors.New("raftstore: only an active local replica can be removed")
+	}
+	if r.nodeHost.HasNodeInfo(shardID, replica.ReplicaID) {
+		if err := r.nodeHost.StopReplica(shardID, replica.ReplicaID); err != nil &&
+			!errors.Is(err, dragonboat.ErrShardNotFound) {
+			return err
+		}
+		if err := r.nodeHost.SyncRemoveData(ctx, shardID, replica.ReplicaID); err != nil {
+			return err
+		}
+	}
+	if err := r.stateEngine.RemoveReplica(shardID, replica.ReplicaID); err != nil {
 		return err
 	}
-	if _, removed := membership.Removed[replica.ReplicaID]; !removed {
-		return errors.New("raftstore: local replica data cannot be removed before committed membership removal")
-	}
-	if err := r.nodeHost.StopReplica(shardID, replica.ReplicaID); err != nil {
-		return err
-	}
-	if err := r.nodeHost.SyncRemoveData(ctx, shardID, replica.ReplicaID); err != nil {
-		return err
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	position = r.replicaPosition(shardID)
+	if position < 0 || r.enrollment.Replicas[position].ReplicaID != replica.ReplicaID ||
+		r.enrollment.Replicas[position].LocalState != ReplicaRemoving {
+		return errors.New("raftstore: local replica enrollment changed during removal")
 	}
 	return r.setReplicaState(position, ReplicaRemoved)
 }

@@ -1,6 +1,10 @@
 package raftstore
 
 import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 )
@@ -42,11 +46,12 @@ func (r RecoveryEpoch) Validate() error {
 type TransitionStage string
 
 const (
-	TransitionPending    TransitionStage = "PENDING"
-	TransitionCatchingUp TransitionStage = "CATCHING_UP"
-	TransitionPromoted   TransitionStage = "PROMOTED"
-	TransitionOldRemoved TransitionStage = "OLD_REMOVED"
-	TransitionComplete   TransitionStage = "COMPLETE"
+	TransitionPending      TransitionStage = "PENDING"
+	TransitionCatchingUp   TransitionStage = "CATCHING_UP"
+	TransitionPromoted     TransitionStage = "PROMOTED"
+	TransitionOldRemoved   TransitionStage = "OLD_REMOVED"
+	TransitionComplete     TransitionStage = "COMPLETE"
+	TransitionEpochRetired TransitionStage = "EPOCH_RETIRED"
 )
 
 type ShardTransition struct {
@@ -55,16 +60,21 @@ type ShardTransition struct {
 }
 
 type ManifestTransition struct {
-	Version         uint64            `json:"version"`
-	Digest          string            `json:"digest"`
-	PreviousDigest  string            `json:"previous_digest"`
-	NextSystemEpoch uint64            `json:"next_system_epoch"`
-	Shards          []ShardTransition `json:"shards"`
+	Version                     uint64            `json:"version"`
+	Digest                      string            `json:"digest"`
+	PreviousDigest              string            `json:"previous_digest"`
+	NextSystemEpoch             uint64            `json:"next_system_epoch"`
+	Activated                   bool              `json:"activated"`
+	ActivationIndex             uint64            `json:"activation_index,omitempty"`
+	PreviousPermitDrainComplete bool              `json:"previous_permit_drain_complete"`
+	PreviousPermitDrainIndex    uint64            `json:"previous_permit_drain_index,omitempty"`
+	Shards                      []ShardTransition `json:"shards"`
 }
 
 func (t ManifestTransition) Validate(virtualShards uint32) error {
 	if t.Version == 0 || !isSHA256(t.Digest) || !isSHA256(t.PreviousDigest) || t.Digest == t.PreviousDigest ||
-		t.NextSystemEpoch == 0 || len(t.Shards) != int(virtualShards)+1 {
+		t.NextSystemEpoch == 0 || t.Activated || t.ActivationIndex != 0 || t.PreviousPermitDrainComplete ||
+		t.PreviousPermitDrainIndex != 0 || len(t.Shards) != int(virtualShards)+1 {
 		return errors.New("raftstore: incomplete manifest transition")
 	}
 	for i, shard := range t.Shards {
@@ -82,39 +92,66 @@ func (t ManifestTransition) Validate(virtualShards uint32) error {
 }
 
 type GenerationClosure struct {
-	TargetStorageGeneration string            `json:"target_storage_generation"`
-	TargetManifestDigest    string            `json:"target_manifest_digest"`
-	Kind                    RolloverProofKind `json:"kind"`
-	ProofDigest             string            `json:"proof_digest"`
-	CommitIndex             uint64            `json:"commit_index"`
+	TargetStorageGeneration    string            `json:"target_storage_generation"`
+	TargetManifestIntentDigest string            `json:"target_manifest_intent_digest"`
+	Kind                       RolloverProofKind `json:"kind"`
+	ProofDigest                string            `json:"proof_digest"`
+	CommitIndex                uint64            `json:"commit_index"`
 }
 
 type SystemState struct {
-	Initialized                bool                `json:"initialized"`
-	ClusterID                  string              `json:"cluster_id"`
-	StorageGeneration          string              `json:"storage_generation"`
-	SystemEpoch                uint64              `json:"system_epoch"`
-	SchemaVersion              uint32              `json:"schema_version"`
-	ProtocolVersion            uint32              `json:"protocol_version"`
-	VirtualShardCount          uint32              `json:"virtual_shard_count"`
-	ActiveManifestVersion      uint64              `json:"active_manifest_version"`
-	ActiveManifestDigest       string              `json:"active_manifest_digest"`
-	ServePermitMaxMillis       uint64              `json:"serve_permit_max_millis"`
-	HasPredecessor             bool                `json:"has_predecessor"`
-	PredecessorGeneration      string              `json:"predecessor_generation,omitempty"`
-	PredecessorManifestDigest  string              `json:"predecessor_manifest_digest,omitempty"`
-	PredecessorProofKind       RolloverProofKind   `json:"predecessor_proof_kind,omitempty"`
-	PredecessorProofDigest     string              `json:"predecessor_proof_digest,omitempty"`
-	PredecessorPermitMaxMillis uint64              `json:"predecessor_permit_max_millis,omitempty"`
-	ServeGate                  bool                `json:"serve_gate"`
-	WriteGate                  bool                `json:"write_gate"`
-	CutoverGate                bool                `json:"cutover_gate"`
-	PredecessorDrainComplete   bool                `json:"predecessor_drain_complete"`
-	Retired                    bool                `json:"retired"`
-	Transition                 *ManifestTransition `json:"transition,omitempty"`
-	Recovery                   *RecoveryEpoch      `json:"recovery,omitempty"`
-	Closure                    *GenerationClosure  `json:"closure,omitempty"`
-	LastApplied                uint64              `json:"last_applied"`
+	Initialized                           bool                `json:"initialized"`
+	ClusterID                             string              `json:"cluster_id"`
+	StorageGeneration                     string              `json:"storage_generation"`
+	SystemEpoch                           uint64              `json:"system_epoch"`
+	SchemaVersion                         uint32              `json:"schema_version"`
+	ProtocolVersion                       uint32              `json:"protocol_version"`
+	VirtualShardCount                     uint32              `json:"virtual_shard_count"`
+	ActiveManifestVersion                 uint64              `json:"active_manifest_version"`
+	ActiveManifestDigest                  string              `json:"active_manifest_digest"`
+	ServePermitMaxMillis                  uint64              `json:"serve_permit_max_millis"`
+	HasPredecessor                        bool                `json:"has_predecessor"`
+	PredecessorGeneration                 string              `json:"predecessor_generation,omitempty"`
+	PredecessorManifestDigest             string              `json:"predecessor_manifest_digest,omitempty"`
+	PredecessorProofKind                  RolloverProofKind   `json:"predecessor_proof_kind,omitempty"`
+	PredecessorProofDigest                string              `json:"predecessor_proof_digest,omitempty"`
+	PredecessorProofCommitIndex           uint64              `json:"predecessor_proof_commit_index,omitempty"`
+	PredecessorTargetManifestIntentDigest string              `json:"predecessor_target_manifest_intent_digest,omitempty"`
+	PredecessorPermitMaxMillis            uint64              `json:"predecessor_permit_max_millis,omitempty"`
+	ServeGate                             bool                `json:"serve_gate"`
+	WriteGate                             bool                `json:"write_gate"`
+	CutoverGate                           bool                `json:"cutover_gate"`
+	PredecessorDrainComplete              bool                `json:"predecessor_drain_complete"`
+	Retired                               bool                `json:"retired"`
+	Transition                            *ManifestTransition `json:"transition,omitempty"`
+	Recovery                              *RecoveryEpoch      `json:"recovery,omitempty"`
+	Closure                               *GenerationClosure  `json:"closure,omitempty"`
+	LastApplied                           uint64              `json:"last_applied"`
+}
+
+// ConsensusPredecessorProof exports the committed closure in the form a
+// successor manifest must carry. The closure is useful only after the source
+// generation has permanently retired.
+func (s SystemState) ConsensusPredecessorProof() (PredecessorProof, error) {
+	if err := s.Validate(); err != nil {
+		return PredecessorProof{}, err
+	}
+	if !s.Retired || s.Closure == nil || s.Closure.Kind != RolloverConsensusClosure {
+		return PredecessorProof{}, errors.New("raftstore: generation has no committed consensus closure")
+	}
+	proof := PredecessorProof{
+		StorageGeneration:          s.StorageGeneration,
+		ManifestDigest:             s.ActiveManifestDigest,
+		ServePermitMaxMillis:       s.ServePermitMaxMillis,
+		Kind:                       s.Closure.Kind,
+		TargetManifestIntentDigest: s.Closure.TargetManifestIntentDigest,
+		CommitIndex:                s.Closure.CommitIndex,
+		ProofDigest:                s.Closure.ProofDigest,
+	}
+	if err := proof.Validate(); err != nil {
+		return PredecessorProof{}, err
+	}
+	return proof, nil
 }
 
 func (s SystemState) Identity() PermitIdentity {
@@ -135,18 +172,32 @@ func (s SystemState) Validate() error {
 		return err
 	}
 	if s.SchemaVersion == 0 || s.ProtocolVersion == 0 || s.VirtualShardCount == 0 ||
-		s.ActiveManifestVersion == 0 || s.ServePermitMaxMillis == 0 || s.LastApplied == 0 {
+		s.ActiveManifestVersion == 0 || s.ServePermitMaxMillis == 0 ||
+		s.ServePermitMaxMillis > MaximumServePermitMillis || s.LastApplied == 0 {
 		return errors.New("raftstore: incomplete System Group state")
 	}
 	if s.HasPredecessor {
 		if s.PredecessorGeneration == "" || s.PredecessorGeneration == s.StorageGeneration ||
 			!isSHA256(s.PredecessorManifestDigest) || !isSHA256(s.PredecessorProofDigest) ||
-			s.PredecessorPermitMaxMillis == 0 ||
+			s.PredecessorPermitMaxMillis == 0 || s.PredecessorPermitMaxMillis > MaximumServePermitMillis ||
 			(s.PredecessorProofKind != RolloverConsensusClosure && s.PredecessorProofKind != RolloverExternalFence) {
 			return errors.New("raftstore: incomplete predecessor fencing state")
 		}
+		if s.PredecessorProofKind == RolloverConsensusClosure {
+			if s.PredecessorProofCommitIndex == 0 || !isSHA256(s.PredecessorTargetManifestIntentDigest) ||
+				s.PredecessorProofDigest != consensusClosureProofDigest(
+					s.ClusterID, s.PredecessorGeneration, s.PredecessorManifestDigest,
+					s.StorageGeneration, s.PredecessorTargetManifestIntentDigest, s.PredecessorPermitMaxMillis,
+					s.PredecessorProofCommitIndex,
+				) {
+				return errors.New("raftstore: invalid consensus predecessor proof")
+			}
+		} else if s.PredecessorProofCommitIndex != 0 || s.PredecessorTargetManifestIntentDigest != "" {
+			return errors.New("raftstore: external predecessor fence contains consensus fields")
+		}
 	} else if s.PredecessorGeneration != "" || s.PredecessorManifestDigest != "" ||
-		s.PredecessorProofKind != "" || s.PredecessorProofDigest != "" || s.PredecessorPermitMaxMillis != 0 ||
+		s.PredecessorProofKind != "" || s.PredecessorProofDigest != "" || s.PredecessorProofCommitIndex != 0 ||
+		s.PredecessorTargetManifestIntentDigest != "" || s.PredecessorPermitMaxMillis != 0 ||
 		!s.PredecessorDrainComplete {
 		return errors.New("raftstore: invalid first-generation predecessor state")
 	}
@@ -164,17 +215,41 @@ func (s SystemState) Validate() error {
 	}
 	if s.Closure != nil {
 		if s.Closure.TargetStorageGeneration == "" || s.Closure.TargetStorageGeneration == s.StorageGeneration ||
-			!isSHA256(s.Closure.TargetManifestDigest) || !isSHA256(s.Closure.ProofDigest) ||
-			s.Closure.Kind != RolloverConsensusClosure || s.Closure.CommitIndex != s.LastApplied {
+			!isSHA256(s.Closure.TargetManifestIntentDigest) || !isSHA256(s.Closure.ProofDigest) ||
+			s.Closure.Kind != RolloverConsensusClosure || s.Closure.CommitIndex == 0 ||
+			s.Closure.CommitIndex > s.LastApplied ||
+			s.Closure.ProofDigest != generationClosureProofDigest(s, *s.Closure) {
 			return errors.New("raftstore: invalid committed generation closure")
 		}
 	}
 	if s.Transition != nil {
-		if s.Recovery != nil || validateManifestTransitionState(*s.Transition, s.VirtualShardCount) != nil ||
-			s.Transition.Version != s.ActiveManifestVersion+1 ||
-			s.Transition.PreviousDigest != s.ActiveManifestDigest ||
-			s.Transition.NextSystemEpoch != s.SystemEpoch+1 {
+		transition := s.Transition
+		if s.Recovery != nil || validateManifestTransitionState(*transition, s.VirtualShardCount) != nil {
 			return errors.New("raftstore: invalid active manifest transition")
+		}
+		if !transition.Activated {
+			if transition.Version != s.ActiveManifestVersion+1 ||
+				transition.PreviousDigest != s.ActiveManifestDigest ||
+				transition.NextSystemEpoch != s.SystemEpoch+1 || transition.ActivationIndex != 0 ||
+				transition.PreviousPermitDrainComplete || transition.PreviousPermitDrainIndex != 0 ||
+				anyTransitionAtStage(transition.Shards, TransitionEpochRetired) {
+				return errors.New("raftstore: invalid pending manifest transition")
+			}
+		} else {
+			if transition.Version != s.ActiveManifestVersion || transition.Digest != s.ActiveManifestDigest ||
+				transition.NextSystemEpoch != s.SystemEpoch || transition.ActivationIndex == 0 ||
+				transition.ActivationIndex > s.LastApplied || !allTransitionsAtLeastComplete(transition.Shards) {
+				return errors.New("raftstore: invalid activated manifest transition")
+			}
+			if transition.PreviousPermitDrainComplete {
+				if transition.PreviousPermitDrainIndex < transition.ActivationIndex ||
+					transition.PreviousPermitDrainIndex > s.LastApplied {
+					return errors.New("raftstore: invalid previous manifest permit drain proof")
+				}
+			} else if transition.PreviousPermitDrainIndex != 0 ||
+				anyTransitionAtStage(transition.Shards, TransitionEpochRetired) {
+				return errors.New("raftstore: previous manifest epoch retired before permit drain")
+			}
 		}
 	}
 	if s.Recovery != nil {
@@ -200,16 +275,18 @@ func (s SystemState) Validate() error {
 type SystemCommandType string
 
 const (
-	SystemBootstrap          SystemCommandType = "BOOTSTRAP"
-	SystemRefreshPermit      SystemCommandType = "REFRESH_PERMIT"
-	SystemSetGates           SystemCommandType = "SET_GATES"
-	SystemBeginTransition    SystemCommandType = "BEGIN_MANIFEST_TRANSITION"
-	SystemAdvanceTransition  SystemCommandType = "ADVANCE_MANIFEST_TRANSITION"
-	SystemActivateTransition SystemCommandType = "ACTIVATE_MANIFEST_TRANSITION"
-	SystemCloseGeneration    SystemCommandType = "CLOSE_GENERATION"
-	SystemConfirmDrain       SystemCommandType = "CONFIRM_PREDECESSOR_PERMIT_DRAIN"
-	SystemBeginRecovery      SystemCommandType = "BEGIN_RECOVERY"
-	SystemAdvanceRecovery    SystemCommandType = "ADVANCE_RECOVERY"
+	SystemBootstrap              SystemCommandType = "BOOTSTRAP"
+	SystemRefreshPermit          SystemCommandType = "REFRESH_PERMIT"
+	SystemSetGates               SystemCommandType = "SET_GATES"
+	SystemBeginTransition        SystemCommandType = "BEGIN_MANIFEST_TRANSITION"
+	SystemAdvanceTransition      SystemCommandType = "ADVANCE_MANIFEST_TRANSITION"
+	SystemActivateTransition     SystemCommandType = "ACTIVATE_MANIFEST_TRANSITION"
+	SystemConfirmTransitionDrain SystemCommandType = "CONFIRM_MANIFEST_TRANSITION_PERMIT_DRAIN"
+	SystemFinalizeTransition     SystemCommandType = "FINALIZE_MANIFEST_TRANSITION"
+	SystemCloseGeneration        SystemCommandType = "CLOSE_GENERATION"
+	SystemConfirmDrain           SystemCommandType = "CONFIRM_PREDECESSOR_PERMIT_DRAIN"
+	SystemBeginRecovery          SystemCommandType = "BEGIN_RECOVERY"
+	SystemAdvanceRecovery        SystemCommandType = "ADVANCE_RECOVERY"
 )
 
 type GateUpdate struct {
@@ -235,17 +312,25 @@ type DrainConfirmation struct {
 	EvidenceDigest         string `json:"evidence_digest"`
 }
 
+type TransitionDrainConfirmation struct {
+	PreviousManifestDigest string `json:"previous_manifest_digest"`
+	PreviousSystemEpoch    uint64 `json:"previous_system_epoch"`
+	ActivationIndex        uint64 `json:"activation_index"`
+	WaitedMillis           uint64 `json:"waited_millis"`
+}
+
 type SystemCommand struct {
-	Type            SystemCommandType   `json:"type"`
-	Manifest        *Manifest           `json:"manifest,omitempty"`
-	Digest          string              `json:"digest,omitempty"`
-	Gates           *GateUpdate         `json:"gates,omitempty"`
-	Transition      *ManifestTransition `json:"transition,omitempty"`
-	Advance         *TransitionAdvance  `json:"advance,omitempty"`
-	Closure         *GenerationClosure  `json:"closure,omitempty"`
-	Drain           *DrainConfirmation  `json:"drain,omitempty"`
-	Recovery        *RecoveryEpoch      `json:"recovery,omitempty"`
-	RecoveryAdvance *RecoveryAdvance    `json:"recovery_advance,omitempty"`
+	Type            SystemCommandType            `json:"type"`
+	Manifest        *Manifest                    `json:"manifest,omitempty"`
+	Digest          string                       `json:"digest,omitempty"`
+	Gates           *GateUpdate                  `json:"gates,omitempty"`
+	Transition      *ManifestTransition          `json:"transition,omitempty"`
+	Advance         *TransitionAdvance           `json:"advance,omitempty"`
+	Closure         *GenerationClosure           `json:"closure,omitempty"`
+	Drain           *DrainConfirmation           `json:"drain,omitempty"`
+	TransitionDrain *TransitionDrainConfirmation `json:"transition_drain,omitempty"`
+	Recovery        *RecoveryEpoch               `json:"recovery,omitempty"`
+	RecoveryAdvance *RecoveryAdvance             `json:"recovery_advance,omitempty"`
 }
 
 type SystemApplyResult struct {
@@ -262,7 +347,8 @@ func ApplySystemCommand(state SystemState, index uint64, command SystemCommand) 
 	next := state
 	switch command.Type {
 	case SystemBootstrap:
-		if state.Initialized || command.Manifest == nil || !isSHA256(command.Digest) {
+		if state.Initialized || command.Manifest == nil || command.Manifest.ManifestVersion != 1 ||
+			!isSHA256(command.Digest) {
 			return state, systemConflict("System Group bootstrap is not authorized for non-empty state")
 		}
 		manifest := *command.Manifest
@@ -284,6 +370,8 @@ func ApplySystemCommand(state SystemState, index uint64, command SystemCommand) 
 			next.PredecessorManifestDigest = manifest.Predecessor.ManifestDigest
 			next.PredecessorProofKind = manifest.Predecessor.Kind
 			next.PredecessorProofDigest = manifest.Predecessor.ProofDigest
+			next.PredecessorProofCommitIndex = manifest.Predecessor.CommitIndex
+			next.PredecessorTargetManifestIntentDigest = manifest.Predecessor.TargetManifestIntentDigest
 			next.PredecessorPermitMaxMillis = manifest.Predecessor.ServePermitMaxMillis
 			next.PredecessorDrainComplete = manifest.Predecessor.Kind == RolloverExternalFence
 		}
@@ -319,7 +407,10 @@ func ApplySystemCommand(state SystemState, index uint64, command SystemCommand) 
 		}
 		position := transitionPosition(state.Transition.Shards, command.Advance.ShardID)
 		if position < 0 || state.Transition.Shards[position].Stage != command.Advance.From ||
-			!validTransitionAdvance(command.Advance.From, command.Advance.To) {
+			!validTransitionAdvance(command.Advance.From, command.Advance.To) ||
+			(command.Advance.To == TransitionEpochRetired &&
+				(!state.Transition.Activated || !state.Transition.PreviousPermitDrainComplete)) ||
+			(command.Advance.To != TransitionEpochRetired && state.Transition.Activated) {
 			return state, systemConflict("manifest transition stage conflict")
 		}
 		transition := *state.Transition
@@ -327,23 +418,49 @@ func ApplySystemCommand(state SystemState, index uint64, command SystemCommand) 
 		transition.Shards[position].Stage = command.Advance.To
 		next.Transition = &transition
 	case SystemActivateTransition:
-		if state.Transition == nil || !allTransitionsComplete(state.Transition.Shards) {
+		if state.Transition == nil || state.Transition.Activated || !allTransitionsComplete(state.Transition.Shards) {
 			return state, systemConflict("manifest transition is incomplete")
 		}
-		next.ActiveManifestVersion = state.Transition.Version
-		next.ActiveManifestDigest = state.Transition.Digest
-		next.SystemEpoch = state.Transition.NextSystemEpoch
+		transition := *state.Transition
+		transition.Shards = append([]ShardTransition(nil), state.Transition.Shards...)
+		transition.Activated = true
+		transition.ActivationIndex = index
+		next.ActiveManifestVersion = transition.Version
+		next.ActiveManifestDigest = transition.Digest
+		next.SystemEpoch = transition.NextSystemEpoch
+		next.Transition = &transition
+	case SystemConfirmTransitionDrain:
+		if state.Transition == nil || !state.Transition.Activated ||
+			state.Transition.PreviousPermitDrainComplete || command.TransitionDrain == nil ||
+			command.TransitionDrain.PreviousManifestDigest != state.Transition.PreviousDigest ||
+			command.TransitionDrain.PreviousSystemEpoch+1 != state.Transition.NextSystemEpoch ||
+			command.TransitionDrain.ActivationIndex != state.Transition.ActivationIndex ||
+			command.TransitionDrain.WaitedMillis < state.ServePermitMaxMillis {
+			return state, systemConflict("previous manifest permit drain confirmation is invalid")
+		}
+		transition := *state.Transition
+		transition.Shards = append([]ShardTransition(nil), state.Transition.Shards...)
+		transition.PreviousPermitDrainComplete = true
+		transition.PreviousPermitDrainIndex = index
+		next.Transition = &transition
+	case SystemFinalizeTransition:
+		if state.Transition == nil || !state.Transition.Activated ||
+			!state.Transition.PreviousPermitDrainComplete ||
+			!allTransitionsAtStage(state.Transition.Shards, TransitionEpochRetired) {
+			return state, systemConflict("manifest transition is not ready to finalize")
+		}
 		next.Transition = nil
 	case SystemCloseGeneration:
 		if !state.Initialized || state.Retired || state.Transition != nil || state.Recovery != nil ||
 			command.Closure == nil || command.Closure.CommitIndex != 0 ||
 			command.Closure.TargetStorageGeneration == "" || command.Closure.TargetStorageGeneration == state.StorageGeneration ||
-			!isSHA256(command.Closure.TargetManifestDigest) || !isSHA256(command.Closure.ProofDigest) ||
+			!isSHA256(command.Closure.TargetManifestIntentDigest) || command.Closure.ProofDigest != "" ||
 			command.Closure.Kind != RolloverConsensusClosure {
 			return state, systemConflict("invalid consensus generation closure")
 		}
 		closure := *command.Closure
 		closure.CommitIndex = index
+		closure.ProofDigest = generationClosureProofDigest(state, closure)
 		next.Closure = &closure
 		next.Retired = true
 		next.ServeGate, next.WriteGate, next.CutoverGate = false, false, false
@@ -401,6 +518,44 @@ func ApplySystemCommand(state SystemState, index uint64, command SystemCommand) 
 	return next, result
 }
 
+func generationClosureProofDigest(state SystemState, closure GenerationClosure) string {
+	return consensusClosureProofDigest(
+		state.ClusterID, state.StorageGeneration, state.ActiveManifestDigest,
+		closure.TargetStorageGeneration, closure.TargetManifestIntentDigest, state.ServePermitMaxMillis,
+		closure.CommitIndex,
+	)
+}
+
+func consensusClosureProofDigest(
+	clusterID string,
+	sourceStorageGeneration string,
+	sourceManifestDigest string,
+	targetStorageGeneration string,
+	targetManifestIntentDigest string,
+	servePermitMaxMillis uint64,
+	commitIndex uint64,
+) string {
+	var payload bytes.Buffer
+	payload.WriteString("kuasar-generation-closure-v1")
+	for _, field := range []string{
+		clusterID, sourceStorageGeneration, sourceManifestDigest,
+		targetStorageGeneration, targetManifestIntentDigest,
+	} {
+		var length [4]byte
+		binary.BigEndian.PutUint32(length[:], uint32(len(field)))
+		payload.Write(length[:])
+		payload.WriteString(field)
+	}
+	var permitLifetime [8]byte
+	binary.BigEndian.PutUint64(permitLifetime[:], servePermitMaxMillis)
+	payload.Write(permitLifetime[:])
+	var index [8]byte
+	binary.BigEndian.PutUint64(index[:], commitIndex)
+	payload.Write(index[:])
+	digest := sha256.Sum256(payload.Bytes())
+	return hex.EncodeToString(digest[:])
+}
+
 func systemConflict(reason string) SystemApplyResult {
 	return SystemApplyResult{Conflict: true, Reason: reason}
 }
@@ -423,16 +578,39 @@ func validTransitionAdvance(from, to TransitionStage) bool {
 	return from == TransitionPending && to == TransitionCatchingUp ||
 		from == TransitionCatchingUp && to == TransitionPromoted ||
 		from == TransitionPromoted && to == TransitionOldRemoved ||
-		from == TransitionOldRemoved && to == TransitionComplete
+		from == TransitionOldRemoved && to == TransitionComplete ||
+		from == TransitionComplete && to == TransitionEpochRetired
 }
 
 func allTransitionsComplete(shards []ShardTransition) bool {
+	return allTransitionsAtStage(shards, TransitionComplete)
+}
+
+func allTransitionsAtStage(shards []ShardTransition, stage TransitionStage) bool {
 	for _, shard := range shards {
-		if shard.Stage != TransitionComplete {
+		if shard.Stage != stage {
 			return false
 		}
 	}
 	return true
+}
+
+func allTransitionsAtLeastComplete(shards []ShardTransition) bool {
+	for _, shard := range shards {
+		if shard.Stage != TransitionComplete && shard.Stage != TransitionEpochRetired {
+			return false
+		}
+	}
+	return true
+}
+
+func anyTransitionAtStage(shards []ShardTransition, stage TransitionStage) bool {
+	for _, shard := range shards {
+		if shard.Stage == stage {
+			return true
+		}
+	}
+	return false
 }
 
 func validateManifestTransitionState(transition ManifestTransition, virtualShards uint32) error {
@@ -450,7 +628,8 @@ func validateManifestTransitionState(transition ManifestTransition, virtualShard
 			return errors.New("raftstore: transition shards are not complete and ordered")
 		}
 		switch shard.Stage {
-		case TransitionPending, TransitionCatchingUp, TransitionPromoted, TransitionOldRemoved, TransitionComplete:
+		case TransitionPending, TransitionCatchingUp, TransitionPromoted, TransitionOldRemoved,
+			TransitionComplete, TransitionEpochRetired:
 		default:
 			return errors.New("raftstore: invalid transition stage")
 		}

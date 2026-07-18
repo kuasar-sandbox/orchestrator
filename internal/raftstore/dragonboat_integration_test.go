@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -13,8 +14,63 @@ import (
 	dragonboat "github.com/lni/dragonboat/v4"
 	dbconfig "github.com/lni/dragonboat/v4/config"
 	"github.com/lni/dragonboat/v4/logger"
+	"github.com/lni/dragonboat/v4/raftio"
 	sm "github.com/lni/dragonboat/v4/statemachine"
 )
+
+type integrationSystemEvents struct {
+	mu                sync.Mutex
+	snapshotReceived  []raftio.SnapshotInfo
+	snapshotRecovered []raftio.SnapshotInfo
+}
+
+func (*integrationSystemEvents) NodeHostShuttingDown()                       {}
+func (*integrationSystemEvents) NodeUnloaded(raftio.NodeInfo)                {}
+func (*integrationSystemEvents) NodeDeleted(raftio.NodeInfo)                 {}
+func (*integrationSystemEvents) NodeReady(raftio.NodeInfo)                   {}
+func (*integrationSystemEvents) MembershipChanged(raftio.NodeInfo)           {}
+func (*integrationSystemEvents) ConnectionEstablished(raftio.ConnectionInfo) {}
+func (*integrationSystemEvents) ConnectionFailed(raftio.ConnectionInfo)      {}
+func (*integrationSystemEvents) SendSnapshotStarted(raftio.SnapshotInfo)     {}
+func (*integrationSystemEvents) SendSnapshotCompleted(raftio.SnapshotInfo)   {}
+func (*integrationSystemEvents) SendSnapshotAborted(raftio.SnapshotInfo)     {}
+func (*integrationSystemEvents) SnapshotCreated(raftio.SnapshotInfo)         {}
+func (*integrationSystemEvents) SnapshotCompacted(raftio.SnapshotInfo)       {}
+func (*integrationSystemEvents) LogCompacted(raftio.EntryInfo)               {}
+func (*integrationSystemEvents) LogDBCompacted(raftio.EntryInfo)             {}
+
+func (e *integrationSystemEvents) SnapshotReceived(info raftio.SnapshotInfo) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.snapshotReceived = append(e.snapshotReceived, info)
+}
+
+func (e *integrationSystemEvents) SnapshotRecovered(info raftio.SnapshotInfo) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.snapshotRecovered = append(e.snapshotRecovered, info)
+}
+
+func (e *integrationSystemEvents) installedSnapshot(shardID, replicaID, minimumIndex uint64) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	received := false
+	for _, info := range e.snapshotReceived {
+		if info.ShardID == shardID && info.ReplicaID == replicaID {
+			received = true
+			break
+		}
+	}
+	if !received {
+		return false
+	}
+	for _, info := range e.snapshotRecovered {
+		if info.ShardID == shardID && info.ReplicaID == replicaID && info.Index >= minimumIndex {
+			return true
+		}
+	}
+	return false
+}
 
 func TestDragonboatThreeReplicaRecoveryAndMembershipChange(t *testing.T) {
 	if testing.Short() {
@@ -30,13 +86,22 @@ func TestDragonboatThreeReplicaRecoveryAndMembershipChange(t *testing.T) {
 		addresses[index] = freeTCPAddress(t)
 	}
 	nodeHosts := make([]*dragonboat.NodeHost, 4)
+	stateEngines := make([]*PebbleStateEngine, 4)
+	events := make([]*integrationSystemEvents, 4)
 	for index, address := range addresses {
+		stateEngine, err := OpenPebbleStateEngine(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		stateEngines[index] = stateEngine
+		t.Cleanup(func() { _ = stateEngine.Close() })
 		expert := dbconfig.GetDefaultExpertConfig()
 		expert.LogDB = dbconfig.GetTinyMemLogDBConfig()
 		expert.Engine.SnapshotShards = 2
+		events[index] = &integrationSystemEvents{}
 		config := dbconfig.NodeHostConfig{
 			DeploymentID: 0x46, NodeHostDir: t.TempDir(), RTTMillisecond: 2,
-			RaftAddress: address, Expert: expert,
+			RaftAddress: address, Expert: expert, SystemEventListener: events[index],
 		}
 		nodeHost, err := dragonboat.NewNodeHost(config)
 		if err != nil {
@@ -55,7 +120,7 @@ func TestDragonboatThreeReplicaRecoveryAndMembershipChange(t *testing.T) {
 	}
 	initial := map[uint64]dragonboat.Target{1: addresses[0], 2: addresses[1], 3: addresses[2]}
 	for index := 0; index < 3; index++ {
-		if err := nodeHosts[index].StartReplica(initial, false, NewSystemStateMachine,
+		if err := nodeHosts[index].StartOnDiskReplica(initial, false, stateEngines[index].NewStateMachine,
 			integrationRaftConfig(SystemRaftShardID, uint64(index+1), false)); err != nil {
 			t.Fatal(err)
 		}
@@ -77,11 +142,22 @@ func TestDragonboatThreeReplicaRecoveryAndMembershipChange(t *testing.T) {
 			return state.Initialized && state.ActiveManifestDigest == digest
 		})
 	}
+	setGatesRaw, err := EncodeSystemCommand(SystemCommand{
+		Type: SystemSetGates, Gates: &GateUpdate{Serve: true, Write: true, Cutover: true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	setGatesResult := proposeEventually(t, nodeHosts[:3], SystemRaftShardID, setGatesRaw)
+	var gatesResult SystemApplyResult
+	if err := json.Unmarshal(setGatesResult.Data, &gatesResult); err != nil || !gatesResult.Applied {
+		t.Fatalf("System gate result = %+v, %v", gatesResult, err)
+	}
 
 	identity := routeShardIdentity(t, manifest, "/integration", "ready")
 	dataRaftShardID := DataRaftShardID(identity.ShardID)
 	for index := 0; index < 3; index++ {
-		if err := nodeHosts[index].StartReplica(initial, false, NewDataStateMachine,
+		if err := nodeHosts[index].StartOnDiskReplica(initial, false, stateEngines[index].NewStateMachine,
 			integrationRaftConfig(dataRaftShardID, uint64(index+1), false)); err != nil {
 			t.Fatal(err)
 		}
@@ -139,13 +215,13 @@ func TestDragonboatThreeReplicaRecoveryAndMembershipChange(t *testing.T) {
 		t.Fatal(err)
 	}
 	integrationEventually(t, func() error {
-		return nodeHosts[0].StartReplica(nil, false, NewDataStateMachine,
+		return nodeHosts[0].StartOnDiskReplica(nil, false, stateEngines[0].NewStateMachine,
 			integrationRaftConfig(dataRaftShardID, 1, false))
 	})
 	waitForDataLookup(t, nodeHosts[0], dataRaftShardID, query, routeapi.ReadReady)
 
 	membership := getMembershipEventually(t, nodeHosts[:3], SystemRaftShardID)
-	requester := nodeHosts[0]
+	requester := leaderNodeHostEventually(t, nodeHosts[:3], SystemRaftShardID)
 	changeContext, cancelChange := context.WithTimeout(context.Background(), 10*time.Second)
 	if err := requester.SyncRequestAddNonVoting(
 		changeContext, SystemRaftShardID, 4, addresses[3], membership.ConfigChangeID,
@@ -154,12 +230,50 @@ func TestDragonboatThreeReplicaRecoveryAndMembershipChange(t *testing.T) {
 		t.Fatal(err)
 	}
 	cancelChange()
-	if err := nodeHosts[3].StartReplica(nil, true, NewSystemStateMachine,
+	integrationEventually(t, func() error {
+		membership = getMembership(nodeHosts[:3], SystemRaftShardID)
+		if membership == nil {
+			return errors.New("membership unavailable")
+		}
+		if target, found := membership.NonVotings[4]; !found || target != addresses[3] {
+			return errors.New("replica 4 is not a committed non-voting member")
+		}
+		return nil
+	})
+
+	requester = leaderNodeHostEventually(t, nodeHosts[:3], SystemRaftShardID)
+	snapshotContext, cancelSystemSnapshot := context.WithTimeout(context.Background(), 10*time.Second)
+	snapshotIndex, err := requester.SyncRequestSnapshot(snapshotContext, SystemRaftShardID, dragonboat.SnapshotOption{
+		OverrideCompactionOverhead: true,
+	})
+	cancelSystemSnapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	integrationEventually(t, func() error {
+		reader, err := requester.GetLogReader(SystemRaftShardID)
+		if err != nil {
+			return err
+		}
+		first, _ := reader.GetRange()
+		if reader.Snapshot().Index < snapshotIndex || first <= 1 {
+			return fmt.Errorf("leader log has not compacted through snapshot %d: first=%d snapshot=%d",
+				snapshotIndex, first, reader.Snapshot().Index)
+		}
+		return nil
+	})
+	if err := nodeHosts[3].StartOnDiskReplica(nil, true, stateEngines[3].NewStateMachine,
 		integrationRaftConfig(SystemRaftShardID, 4, true)); err != nil {
 		t.Fatal(err)
 	}
+	integrationEventually(t, func() error {
+		if !events[3].installedSnapshot(SystemRaftShardID, 4, snapshotIndex) {
+			return errors.New("replica 4 has not received the compacted System snapshot")
+		}
+		return nil
+	})
 	waitForSystemState(t, nodeHosts[3], func(state SystemState) bool {
-		return state.Initialized && state.ActiveManifestDigest == digest
+		return state.Initialized && state.ActiveManifestDigest == digest && state.ServeGate && state.WriteGate
 	})
 	membership = getMembershipEventually(t, nodeHosts[:3], SystemRaftShardID)
 	changeContext, cancelChange = context.WithTimeout(context.Background(), 10*time.Second)
@@ -180,6 +294,25 @@ func TestDragonboatThreeReplicaRecoveryAndMembershipChange(t *testing.T) {
 		}
 		return nil
 	})
+	if err := nodeHosts[3].StopReplica(SystemRaftShardID, 4); err != nil {
+		t.Fatal(err)
+	}
+	integrationEventually(t, func() error {
+		return nodeHosts[3].StartOnDiskReplica(nil, false, stateEngines[3].NewStateMachine,
+			integrationRaftConfig(SystemRaftShardID, 4, true))
+	})
+	integrationEventually(t, func() error {
+		info := nodeHosts[3].GetNodeHostInfo(dragonboat.DefaultNodeHostInfoOption)
+		for _, shard := range info.ShardInfoList {
+			if shard.ShardID == SystemRaftShardID && shard.ReplicaID == 4 {
+				if shard.IsNonVoting {
+					return errors.New("promoted replica restarted with stale non-voting role")
+				}
+				return nil
+			}
+		}
+		return errors.New("restarted promoted replica is unavailable")
+	})
 	changeContext, cancelChange = context.WithTimeout(context.Background(), 10*time.Second)
 	if err := requester.SyncRequestDeleteReplica(
 		changeContext, SystemRaftShardID, 3, membership.ConfigChangeID,
@@ -198,6 +331,57 @@ func TestDragonboatThreeReplicaRecoveryAndMembershipChange(t *testing.T) {
 		}
 		return nil
 	})
+	err = nodeHosts[2].StartOnDiskReplica(nil, false, stateEngines[2].NewStateMachine,
+		integrationRaftConfig(SystemRaftShardID, 3, false))
+	if err != nil && !errors.Is(err, dragonboat.ErrReplicaRemoved) {
+		t.Fatal(err)
+	}
+	if err == nil {
+		integrationEventually(t, func() error {
+			info := nodeHosts[2].GetNodeHostInfo(dragonboat.DefaultNodeHostInfoOption)
+			for _, shard := range info.ShardInfoList {
+				if shard.ShardID == SystemRaftShardID && shard.ReplicaID == 3 {
+					return errors.New("removed replica has not self-unloaded")
+				}
+			}
+			membership = getMembership(nodeHosts, SystemRaftShardID)
+			if membership == nil {
+				return errors.New("membership unavailable")
+			}
+			if _, removed := membership.Removed[3]; !removed {
+				return errors.New("removed replica rejoined consensus")
+			}
+			return nil
+		})
+	}
+}
+
+func leaderNodeHostEventually(
+	t *testing.T,
+	nodeHosts []*dragonboat.NodeHost,
+	shardID uint64,
+) *dragonboat.NodeHost {
+	t.Helper()
+	var leader *dragonboat.NodeHost
+	integrationEventually(t, func() error {
+		for _, nodeHost := range nodeHosts {
+			leaderID, term, valid, err := nodeHost.GetLeaderID(shardID)
+			if err != nil || !valid || leaderID == 0 || term == 0 {
+				continue
+			}
+			for _, candidate := range nodeHosts {
+				info := candidate.GetNodeHostInfo(dragonboat.DefaultNodeHostInfoOption)
+				for _, shard := range info.ShardInfoList {
+					if shard.ShardID == shardID && shard.ReplicaID == leaderID {
+						leader = candidate
+						return nil
+					}
+				}
+			}
+		}
+		return errors.New("leader unavailable")
+	})
+	return leader
 }
 
 func integrationRaftConfig(shardID, replicaID uint64, nonVoting bool) dbconfig.Config {

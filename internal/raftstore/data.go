@@ -194,11 +194,6 @@ func (e RevisionExpectation) matches(found bool, revision uint64) bool {
 	return found && e.LogIndex != 0 && revision == e.LogIndex
 }
 
-type ReplicaAppliedProof struct {
-	ReplicaID    uint64 `json:"replica_id"`
-	AppliedIndex uint64 `json:"applied_index"`
-}
-
 type FenceCompactionAuthorization struct {
 	Group                      string                `json:"group"`
 	RouteKey                   string                `json:"route_key"`
@@ -336,7 +331,7 @@ func ApplyDataCommand(state *DataState, index uint64, command DataCommand) DataA
 		epoch := *command.Epoch
 		current := state.ServingEpochs[0]
 		if epoch.Validate() != nil || epoch.ClusterID != state.ClusterID || epoch.StorageGeneration != state.StorageGeneration ||
-			epoch.SystemEpoch != current.SystemEpoch+1 || epoch.ManifestDigest == current.ManifestDigest {
+			epoch.SystemEpoch != current.SystemEpoch+1 {
 			return conflict("invalid prepared serving epoch", 0)
 		}
 		state.ServingEpochs = append(append([]PermitIdentity(nil), state.ServingEpochs...), epoch)

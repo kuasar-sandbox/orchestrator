@@ -22,6 +22,8 @@ const (
 	SystemRaftShardID       = uint64(1)
 	firstDataRaftShardID    = uint64(2)
 	manifestSignatureDomain = "kuasar-registry-manifest-v1\x00"
+	rolloverIntentDomain    = "kuasar-storage-rollover-intent-v1\x00"
+	zeroSHA256              = "0000000000000000000000000000000000000000000000000000000000000000"
 )
 
 type RolloverProofKind string
@@ -32,20 +34,41 @@ const (
 )
 
 type PredecessorProof struct {
-	StorageGeneration    string            `json:"storage_generation"`
-	ManifestDigest       string            `json:"manifest_digest"`
-	ServePermitMaxMillis uint64            `json:"serve_permit_max_millis"`
-	Kind                 RolloverProofKind `json:"kind"`
-	ProofDigest          string            `json:"proof_digest"`
+	StorageGeneration          string            `json:"storage_generation"`
+	ManifestDigest             string            `json:"manifest_digest"`
+	ServePermitMaxMillis       uint64            `json:"serve_permit_max_millis"`
+	Kind                       RolloverProofKind `json:"kind"`
+	TargetManifestIntentDigest string            `json:"target_manifest_intent_digest"`
+	CommitIndex                uint64            `json:"commit_index"`
+	ProofDigest                string            `json:"proof_digest"`
 }
 
 func (p PredecessorProof) Validate() error {
+	return p.validate(true)
+}
+
+func (p PredecessorProof) validate(requireProof bool) error {
 	if p.StorageGeneration == "" || p.ServePermitMaxMillis == 0 ||
-		!isSHA256(p.ManifestDigest) || !isSHA256(p.ProofDigest) {
+		p.ServePermitMaxMillis > MaximumServePermitMillis ||
+		!isSHA256(p.ManifestDigest) {
 		return errors.New("raftstore: incomplete predecessor proof")
 	}
 	switch p.Kind {
-	case RolloverConsensusClosure, RolloverExternalFence:
+	case RolloverConsensusClosure:
+		if !requireProof {
+			return nil
+		}
+		if p.CommitIndex == 0 || !isSHA256(p.TargetManifestIntentDigest) || !isSHA256(p.ProofDigest) {
+			return errors.New("raftstore: incomplete consensus predecessor proof")
+		}
+		return nil
+	case RolloverExternalFence:
+		if !requireProof {
+			return nil
+		}
+		if p.CommitIndex != 0 || p.TargetManifestIntentDigest != "" || !isSHA256(p.ProofDigest) {
+			return errors.New("raftstore: invalid external predecessor fence")
+		}
 		return nil
 	default:
 		return errors.New("raftstore: unknown predecessor proof kind")
@@ -104,6 +127,10 @@ type Manifest struct {
 }
 
 func (m Manifest) Validate() error {
+	return m.validate(true)
+}
+
+func (m Manifest) validate(requireRolloverProof bool) error {
 	if m.FormatVersion != ManifestFormatV1 || m.ClusterID == "" || m.StorageGeneration == "" ||
 		m.ManifestVersion == 0 || m.SchemaVersion == 0 || m.ProtocolVersion == 0 {
 		return errors.New("raftstore: incomplete manifest identity")
@@ -113,7 +140,8 @@ func (m Manifest) Validate() error {
 		!isPowerOfTwo(m.BuildBucketCount) || m.ReplicationFactor != DefaultReplication {
 		return errors.New("raftstore: invalid fixed keyspace parameters")
 	}
-	if m.ServePermitMaxMillis == 0 || !isSHA256(m.BootstrapTokenDigest) {
+	if m.ServePermitMaxMillis == 0 || m.ServePermitMaxMillis > MaximumServePermitMillis ||
+		!isSHA256(m.BootstrapTokenDigest) {
 		return errors.New("raftstore: permit lifetime and bootstrap token digest are required")
 	}
 	if m.ManifestVersion == 1 && m.PreviousManifestDigest != "" {
@@ -123,11 +151,22 @@ func (m Manifest) Validate() error {
 		return errors.New("raftstore: manifest lineage digest is required")
 	}
 	if m.Predecessor != nil {
-		if err := m.Predecessor.Validate(); err != nil {
+		if err := m.Predecessor.validate(requireRolloverProof); err != nil {
 			return err
 		}
 		if m.Predecessor.StorageGeneration == m.StorageGeneration {
 			return errors.New("raftstore: predecessor generation did not change")
+		}
+		if requireRolloverProof && m.Predecessor.Kind == RolloverConsensusClosure {
+			intentDigest, err := m.RolloverIntentDigest()
+			if err != nil || intentDigest != m.Predecessor.TargetManifestIntentDigest ||
+				m.Predecessor.ProofDigest != consensusClosureProofDigest(
+					m.ClusterID, m.Predecessor.StorageGeneration, m.Predecessor.ManifestDigest,
+					m.StorageGeneration, intentDigest, m.Predecessor.ServePermitMaxMillis,
+					m.Predecessor.CommitIndex,
+				) {
+				return errors.New("raftstore: consensus predecessor proof does not commit this successor manifest")
+			}
 		}
 	}
 	if len(m.Members) < int(m.ReplicationFactor) || !sort.SliceIsSorted(m.Members, func(i, j int) bool {
@@ -170,6 +209,29 @@ func (m Manifest) Validate() error {
 		}
 	}
 	return nil
+}
+
+// RolloverIntentDigest commits every successor manifest field except the
+// consensus proof outputs that are only known after the predecessor closes.
+func (m Manifest) RolloverIntentDigest() (string, error) {
+	if m.Predecessor == nil || m.Predecessor.Kind != RolloverConsensusClosure {
+		return "", errors.New("raftstore: rollover intent requires a consensus predecessor")
+	}
+	if err := m.validate(false); err != nil {
+		return "", err
+	}
+	normalized := m
+	predecessor := *m.Predecessor
+	predecessor.TargetManifestIntentDigest = zeroSHA256
+	predecessor.CommitIndex = 0
+	predecessor.ProofDigest = zeroSHA256
+	normalized.Predecessor = &predecessor
+	raw, err := json.Marshal(normalized)
+	if err != nil {
+		return "", err
+	}
+	digest := sha256.Sum256(append([]byte(rolloverIntentDomain), raw...))
+	return hex.EncodeToString(digest[:]), nil
 }
 
 func (m Manifest) CanonicalBytes() ([]byte, error) {

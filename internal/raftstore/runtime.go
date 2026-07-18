@@ -36,12 +36,13 @@ const (
 )
 
 type RuntimeOpenOptions struct {
-	Mode            RuntimeOpenMode
-	BootstrapSecret []byte
+	Mode             RuntimeOpenMode
+	BootstrapSecret  []byte
+	TransitionClient ReplicaTransitionClient
 }
 
 type raftNodeHost interface {
-	StartReplica(map[uint64]dragonboat.Target, bool, sm.CreateStateMachineFunc, dbconfig.Config) error
+	StartOnDiskReplica(map[uint64]dragonboat.Target, bool, sm.CreateOnDiskStateMachineFunc, dbconfig.Config) error
 	HasNodeInfo(uint64, uint64) bool
 	SyncPropose(context.Context, *client.Session, []byte) (sm.Result, error)
 	SyncRead(context.Context, uint64, any) (any, error)
@@ -60,15 +61,19 @@ type raftNodeHost interface {
 type nodeHostFactory func(dbconfig.NodeHostConfig) (raftNodeHost, error)
 
 type Runtime struct {
-	mu              sync.Mutex
-	config          RuntimeConfig
-	manifest        Manifest
-	manifestDigest  string
-	member          RegistryMember
-	enrollment      LocalEnrollment
-	enrollmentStore EnrollmentStore
-	nodeHost        raftNodeHost
-	permitCache     *PermitCache
+	mu               sync.Mutex
+	transitionMu     sync.Mutex
+	config           RuntimeConfig
+	manifest         Manifest
+	manifestDigest   string
+	member           RegistryMember
+	enrollment       LocalEnrollment
+	enrollmentStore  EnrollmentStore
+	nodeHost         raftNodeHost
+	stateEngine      *PebbleStateEngine
+	permitCache      *PermitCache
+	transitionClient ReplicaTransitionClient
+	systemEvents     *runtimeSystemEvents
 }
 
 func OpenRuntime(
@@ -92,10 +97,50 @@ func openRuntime(
 	if len(manifestChain) == 0 || factory == nil {
 		return nil, errors.New("raftstore: a signed manifest chain and NodeHost factory are required")
 	}
-	currentSigned := manifestChain[len(manifestChain)-1]
-	currentDigest, err := currentSigned.Verify(keyring)
+	latestSigned := manifestChain[len(manifestChain)-1]
+	latestDigest, err := latestSigned.Verify(keyring)
 	if err != nil {
 		return nil, err
+	}
+	guard := ManifestGuard{Path: config.ManifestGuardPath}
+	accepted, err := guard.EvaluateSignedChain(manifestChain, keyring)
+	if err != nil {
+		return nil, err
+	}
+	if accepted.ManifestVersion != latestSigned.Manifest.ManifestVersion || accepted.ManifestDigest != latestDigest ||
+		accepted.StorageGeneration != latestSigned.Manifest.StorageGeneration {
+		return nil, errors.New("raftstore: supplied chain does not end at the accepted manifest")
+	}
+
+	store := EnrollmentStore{Path: config.EnrollmentPath}
+	loadedEnrollment, err := store.Load()
+	if err != nil {
+		return nil, err
+	}
+	currentSigned := latestSigned
+	currentDigest := latestDigest
+	if loadedEnrollment != nil && loadedEnrollment.StorageGeneration == latestSigned.Manifest.StorageGeneration {
+		if _, found := manifestMember(latestSigned.Manifest, config.MemberID); !found {
+			selected := false
+			for _, candidate := range manifestChain {
+				digest, verifyErr := candidate.Verify(keyring)
+				if verifyErr != nil {
+					return nil, verifyErr
+				}
+				if candidate.Manifest.StorageGeneration == loadedEnrollment.StorageGeneration &&
+					candidate.Manifest.ManifestVersion == loadedEnrollment.ManifestVersion &&
+					digest == loadedEnrollment.ManifestDigest {
+					if _, memberFound := manifestMember(candidate.Manifest, config.MemberID); !memberFound {
+						return nil, errors.New("raftstore: enrolled member is absent from its active signed manifest")
+					}
+					currentSigned, currentDigest, selected = candidate, digest, true
+					break
+				}
+			}
+			if !selected {
+				return nil, errors.New("raftstore: complete signed manifest chain is required to restart a removed member")
+			}
+		}
 	}
 	manifest := currentSigned.Manifest
 	member, found := manifestMember(manifest, config.MemberID)
@@ -106,22 +151,10 @@ func openRuntime(
 	if err != nil {
 		return nil, err
 	}
-	guard := ManifestGuard{Path: config.ManifestGuardPath}
-	accepted, err := guard.AcceptSignedChain(manifestChain, keyring)
-	if err != nil {
-		return nil, err
-	}
-	if accepted.ManifestVersion != manifest.ManifestVersion || accepted.ManifestDigest != currentDigest ||
-		accepted.StorageGeneration != manifest.StorageGeneration {
-		return nil, errors.New("raftstore: supplied chain does not end at the accepted manifest")
-	}
-
-	store := EnrollmentStore{Path: config.EnrollmentPath}
-	enrollment, err := store.Load()
-	if err != nil {
-		return nil, err
-	}
-	if enrollment == nil {
+	systemEvents := &runtimeSystemEvents{}
+	nodeHostConfig.SystemEventListener = systemEvents
+	var enrollment LocalEnrollment
+	if loadedEnrollment == nil {
 		if options.Mode != RuntimeBootstrap && options.Mode != RuntimeJoin {
 			return nil, ErrBootstrapUnauthorized
 		}
@@ -143,46 +176,78 @@ func openRuntime(
 		if createErr != nil {
 			return nil, createErr
 		}
-		if err := store.Store(created); err != nil {
+		enrollment = created
+	} else if loadedEnrollment.StorageGeneration != manifest.StorageGeneration {
+		if options.Mode != RuntimeBootstrap || manifest.ManifestVersion != 1 || manifest.Predecessor == nil ||
+			loadedEnrollment.ClusterID != manifest.ClusterID ||
+			manifest.Predecessor.StorageGeneration != loadedEnrollment.StorageGeneration ||
+			manifest.Predecessor.ManifestDigest != loadedEnrollment.ManifestDigest ||
+			!bootstrapSecretMatches(options.BootstrapSecret, manifest.BootstrapTokenDigest) {
+			return nil, ErrBootstrapUnauthorized
+		}
+		if err := requireEmptyRuntimeStorage(config); err != nil {
 			return nil, err
 		}
-		enrollment = &created
+		created, createErr := newLocalEnrollment(EnrollmentBootstrap, manifest, currentDigest, member, config)
+		if createErr != nil {
+			return nil, createErr
+		}
+		enrollment = created
 	} else {
 		if options.Mode != RuntimeRestart {
 			return nil, errors.New("raftstore: an enrolled member must restart; bootstrap/join cannot be replayed")
 		}
-		if err := enrollment.Matches(manifest, currentDigest, member, config); err != nil {
+		if err := loadedEnrollment.Matches(manifest, currentDigest, member, config); err != nil {
 			return nil, err
 		}
-		enrollment.ManifestVersion = manifest.ManifestVersion
-		enrollment.ManifestDigest = currentDigest
-		if err := store.Store(*enrollment); err != nil {
-			return nil, err
-		}
+		enrollment = *loadedEnrollment
 	}
 	if err := config.attestStorage(); err != nil {
 		return nil, err
 	}
+	if err := guard.store(accepted); err != nil {
+		return nil, err
+	}
+	if err := store.Store(enrollment); err != nil {
+		return nil, err
+	}
+	stateEngine, err := OpenPebbleStateEngine(config.StateEngineDir, config.Tuning.StateEngine)
+	if err != nil {
+		return nil, err
+	}
 	nodeHost, err := factory(nodeHostConfig)
 	if err != nil {
+		stateEngine.Close()
 		return nil, fmt.Errorf("raftstore: create Dragonboat NodeHost: %w", err)
 	}
-	return &Runtime{
+	runtime := &Runtime{
 		config: config, manifest: manifest, manifestDigest: currentDigest, member: member,
-		enrollment: *enrollment, enrollmentStore: store, nodeHost: nodeHost,
-		permitCache: NewPermitCache(time.Now),
-	}, nil
+		enrollment: enrollment, enrollmentStore: store, nodeHost: nodeHost, stateEngine: stateEngine,
+		permitCache: NewPermitCache(time.Now), transitionClient: options.TransitionClient,
+		systemEvents: systemEvents,
+	}
+	systemEvents.bind(runtime)
+	return runtime, nil
 }
 
 func (r *Runtime) Close() {
 	if r == nil || r.nodeHost == nil {
 		return
 	}
+	if r.systemEvents != nil {
+		r.systemEvents.unbind()
+	}
 	r.permitCache.Clear()
 	r.nodeHost.Close()
+	_ = r.stateEngine.Close()
 }
 
 func (r *Runtime) StartSystemReplica() error {
+	if r.systemEvents != nil {
+		if err := r.systemEvents.Err(); err != nil {
+			return err
+		}
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	position := r.replicaPosition(SystemRaftShardID)
@@ -193,21 +258,28 @@ func (r *Runtime) StartSystemReplica() error {
 }
 
 func (r *Runtime) StartDataReplicas(system SystemState) error {
+	if r.systemEvents != nil {
+		if err := r.systemEvents.Err(); err != nil {
+			return err
+		}
+	}
 	if err := r.authorizeManifestState(system); err != nil {
 		return err
 	}
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	for position := range r.enrollment.Replicas {
 		if r.enrollment.Replicas[position].ShardID == SystemRaftShardID ||
+			r.enrollment.Replicas[position].LocalState == ReplicaRemoving ||
 			r.enrollment.Replicas[position].LocalState == ReplicaRemoved {
 			continue
 		}
 		if err := r.startReplica(position); err != nil {
+			r.mu.Unlock()
 			return err
 		}
 	}
-	return nil
+	r.mu.Unlock()
+	return r.SyncLocalManifest(system)
 }
 
 func (r *Runtime) PlanManifestJoins(system SystemState) error {
@@ -253,7 +325,7 @@ func (r *Runtime) PlanManifestJoins(system SystemState) error {
 
 func (r *Runtime) startReplica(position int) error {
 	replica := r.enrollment.Replicas[position]
-	if replica.LocalState == ReplicaRemoved {
+	if replica.LocalState == ReplicaRemoving || replica.LocalState == ReplicaRemoved {
 		return ErrNoLocalReplica
 	}
 	hasHistory := r.nodeHost.HasNodeInfo(replica.ShardID, replica.ReplicaID)
@@ -301,11 +373,7 @@ func (r *Runtime) startReplica(position int) error {
 }
 
 func (r *Runtime) launchReplica(replica LocalReplicaEnrollment, initial map[uint64]dragonboat.Target, join bool) error {
-	factory := NewDataStateMachine
-	if replica.ShardID == SystemRaftShardID {
-		factory = NewSystemStateMachine
-	}
-	err := r.nodeHost.StartReplica(initial, join, factory,
+	err := r.nodeHost.StartOnDiskReplica(initial, join, r.stateEngine.NewStateMachine,
 		r.config.raftConfig(replica.ShardID, replica.ReplicaID, replica.NonVoting))
 	if errors.Is(err, dragonboat.ErrShardAlreadyExist) {
 		return nil
@@ -317,6 +385,52 @@ func (r *Runtime) setReplicaState(position int, state ReplicaLocalState) error {
 	next := r.enrollment
 	next.Replicas = append([]LocalReplicaEnrollment(nil), r.enrollment.Replicas...)
 	next.Replicas[position].LocalState = state
+	if err := r.enrollmentStore.Store(next); err != nil {
+		return err
+	}
+	r.enrollment = next
+	return nil
+}
+
+func (r *Runtime) markReplicaRemoving(shardID, replicaID uint64) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	position := r.replicaPosition(shardID)
+	if position < 0 || r.enrollment.Replicas[position].ReplicaID != replicaID {
+		return nil
+	}
+	switch r.enrollment.Replicas[position].LocalState {
+	case ReplicaRemoving, ReplicaRemoved:
+		return nil
+	default:
+		return r.setReplicaState(position, ReplicaRemoving)
+	}
+}
+
+// SyncLocalManifest advances the enrollment's active-manifest fence only
+// after the System Group has committed that exact signed manifest as active.
+func (r *Runtime) SyncLocalManifest(system SystemState) error {
+	if err := r.authorizeManifestState(system); err != nil {
+		return err
+	}
+	if system.ActiveManifestVersion != r.manifest.ManifestVersion ||
+		system.ActiveManifestDigest != r.manifestDigest {
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.enrollment.ManifestVersion > system.ActiveManifestVersion ||
+		r.enrollment.ManifestVersion == system.ActiveManifestVersion &&
+			r.enrollment.ManifestDigest != system.ActiveManifestDigest {
+		return errors.New("raftstore: local enrollment active-manifest fence conflicts with System consensus")
+	}
+	if r.enrollment.ManifestVersion == system.ActiveManifestVersion {
+		return nil
+	}
+	next := r.enrollment
+	next.Replicas = append([]LocalReplicaEnrollment(nil), r.enrollment.Replicas...)
+	next.ManifestVersion = system.ActiveManifestVersion
+	next.ManifestDigest = system.ActiveManifestDigest
 	if err := r.enrollmentStore.Store(next); err != nil {
 		return err
 	}
@@ -357,6 +471,9 @@ func (r *Runtime) AwaitSystemManifest(ctx context.Context) (SystemState, error) 
 			if err := r.authorizeManifestState(state); err != nil {
 				return SystemState{}, err
 			}
+			if err := r.SyncLocalManifest(state); err != nil {
+				return SystemState{}, err
+			}
 			return state, nil
 		}
 		select {
@@ -375,6 +492,9 @@ func (r *Runtime) BootstrapSystem(ctx context.Context) (SystemState, error) {
 		if err := r.authorizeManifestState(state); err != nil {
 			return SystemState{}, err
 		}
+		if err := r.SyncLocalManifest(state); err != nil {
+			return SystemState{}, err
+		}
 		return state, nil
 	}
 	_, err := r.proposeSystem(ctx, SystemCommand{
@@ -385,6 +505,9 @@ func (r *Runtime) BootstrapSystem(ctx context.Context) (SystemState, error) {
 		if readErr != nil || r.authorizeManifestState(state) != nil {
 			return SystemState{}, err
 		}
+		if syncErr := r.SyncLocalManifest(state); syncErr != nil {
+			return SystemState{}, syncErr
+		}
 		return state, nil
 	}
 	state, err := r.ReadSystemStrong(ctx)
@@ -392,6 +515,9 @@ func (r *Runtime) BootstrapSystem(ctx context.Context) (SystemState, error) {
 		return SystemState{}, err
 	}
 	if err := r.authorizeManifestState(state); err != nil {
+		return SystemState{}, err
+	}
+	if err := r.SyncLocalManifest(state); err != nil {
 		return SystemState{}, err
 	}
 	return state, nil
@@ -407,6 +533,9 @@ func (r *Runtime) InitializeDataShards(ctx context.Context, system SystemState, 
 	if system.ActiveManifestDigest != r.manifestDigest || system.SystemEpoch != 1 {
 		return errors.New("raftstore: data shards require the initial committed System manifest")
 	}
+	if err := r.SyncLocalManifest(system); err != nil {
+		return err
+	}
 	if workers <= 0 || workers > 256 {
 		return errors.New("raftstore: data-shard initialization concurrency must be between 1 and 256")
 	}
@@ -417,7 +546,8 @@ func (r *Runtime) InitializeDataShards(ctx context.Context, system SystemState, 
 	group.SetLimit(workers)
 	for _, replica := range replicas {
 		replica := replica
-		if replica.ShardID == SystemRaftShardID || replica.LocalState == ReplicaRemoved {
+		if replica.ShardID == SystemRaftShardID || replica.LocalState == ReplicaRemoving ||
+			replica.LocalState == ReplicaRemoved {
 			continue
 		}
 		if replica.LocalState != ReplicaActive {
@@ -484,6 +614,18 @@ func (r *Runtime) RefreshPermit(ctx context.Context) (PermitGrant, error) {
 }
 
 func (r *Runtime) ApplyData(ctx context.Context, command DataCommand) (DataApplyResult, error) {
+	switch command.Type {
+	case DataInitializeShard, DataPrepareEpoch, DataRetireEpoch:
+		return DataApplyResult{}, errors.New("raftstore: data-shard lifecycle commands require the dedicated runtime workflow")
+	case DataCompactFence:
+		return DataApplyResult{}, errors.New("raftstore: execution-fence compaction requires the dedicated proof workflow")
+	case DataPutRoute, DataPutBuild, DataPutFence:
+	default:
+		return DataApplyResult{}, errors.New("raftstore: unsupported data mutation command")
+	}
+	if err := r.authorizeLocalDataReplica(command.Identity); err != nil {
+		return DataApplyResult{}, err
+	}
 	if err := r.permitCache.Authorize(command.Identity.PermitIdentity, PermitRegistryWrite); err != nil {
 		return DataApplyResult{}, err
 	}
@@ -614,7 +756,7 @@ func bootstrapSecretMatches(secret []byte, digest string) bool {
 }
 
 func requireEmptyRuntimeStorage(config RuntimeConfig) error {
-	paths := []string{config.NodeHostDir}
+	paths := []string{config.NodeHostDir, config.StateEngineDir}
 	if config.WALDir != "" && config.WALDir != config.NodeHostDir {
 		paths = append(paths, config.WALDir)
 	}

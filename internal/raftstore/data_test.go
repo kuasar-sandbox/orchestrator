@@ -73,6 +73,70 @@ func TestDataCASConflictAdvancesAppliedIndexWithoutChangingRow(t *testing.T) {
 	}
 }
 
+func TestStartingCandidateRejectionAndSandboxRoundAdvance(t *testing.T) {
+	manifest := testManifest(4, "generation-1")
+	state, identity := initializedRouteShard(t, manifest, "/g", "rk")
+	selected := routeStarting(t, manifest, "/g", "rk", "sandbox-1", 1, true)
+	applyDataOK(t, &state, 2, DataCommand{
+		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{Absent: true}, Route: &selected,
+	})
+
+	rejectedFirst := cloneRouteRecord(state.Routes[routeMapKey("/g", "rk")])
+	rejectedFirst.Starting.SelectedCandidate = nil
+	rejectedFirst.Starting.Binding = nil
+	rejectedFirst.Starting.DefinitivelyRejected = []uint32{0}
+	applyDataOK(t, &state, 3, DataCommand{
+		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{LogIndex: 2}, Route: &rejectedFirst,
+	})
+
+	selectedSecond := cloneRouteRecord(state.Routes[routeMapKey("/g", "rk")])
+	second := uint32(1)
+	binding := testBinding(t, manifest, clusterstate.ExecutionKindSandbox, "sandbox-1", "/g", "rk", "node-2", selectedSecond.Starting.Intent)
+	selectedSecond.Starting.SelectedCandidate = &second
+	selectedSecond.Starting.Binding = &binding
+	applyDataOK(t, &state, 4, DataCommand{
+		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{LogIndex: 3}, Route: &selectedSecond,
+	})
+
+	exhausted := cloneRouteRecord(state.Routes[routeMapKey("/g", "rk")])
+	exhausted.Starting.SelectedCandidate = nil
+	exhausted.Starting.Binding = nil
+	exhausted.Starting.DefinitivelyRejected = []uint32{0, 1}
+	applyDataOK(t, &state, 5, DataCommand{
+		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{LogIndex: 4}, Route: &exhausted,
+	})
+
+	nextRound := routeStarting(t, manifest, "/g", "rk", "sandbox-2", 2, false)
+	applyDataOK(t, &state, 6, DataCommand{
+		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{LogIndex: 5}, Route: &nextRound,
+	})
+
+	skipped := cloneRouteRecord(state.Routes[routeMapKey("/g", "rk")])
+	skipped.Starting.DefinitivelyRejected = []uint32{0}
+	result := ApplyDataCommand(&state, 7, DataCommand{
+		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{LogIndex: 6}, Route: &skipped,
+	})
+	if !result.Conflict {
+		t.Fatal("unselected candidate was marked rejected without a dispatch result")
+	}
+}
+
+func TestBuildStartingCommitsDefinitiveCandidateRejection(t *testing.T) {
+	manifest := testManifest(4, "generation-1")
+	state, identity := initializedBuildShard(t, manifest, "/g", "build-reject")
+	selected := buildStarting(t, manifest, "/g", "build-reject", true)
+	applyDataOK(t, &state, 2, DataCommand{
+		Type: DataPutBuild, Identity: identity, Expect: RevisionExpectation{Absent: true}, Build: &selected,
+	})
+	rejected := cloneBuildRecord(state.Builds[buildMapKey("/g", "build-reject")])
+	rejected.Starting.SelectedCandidate = nil
+	rejected.Starting.Binding = nil
+	rejected.Starting.DefinitivelyRejected = []uint32{0}
+	applyDataOK(t, &state, 3, DataCommand{
+		Type: DataPutBuild, Identity: identity, Expect: RevisionExpectation{LogIndex: 2}, Build: &rejected,
+	})
+}
+
 func TestRouteAutoResumeReplacementAndFenceCompaction(t *testing.T) {
 	manifest := testManifest(4, "generation-1")
 	state, identity := initializedRouteShard(t, manifest, "/g", "rk")
@@ -222,6 +286,28 @@ func TestDataServingEpochTransitionPersistsBothReplicaSets(t *testing.T) {
 	}
 	if got := state.ReplicaIDs; len(got) != 3 || got[0] != 2 || got[2] != 4 {
 		t.Fatalf("active replicas after retirement = %+v", got)
+	}
+}
+
+func TestDataServingEpochCanAdvanceWithinOneManifestForRecovery(t *testing.T) {
+	manifest := testManifest(4, "generation-1")
+	state, identity := initializedRouteShard(t, manifest, "/g", "rk")
+	recovery := identity.PermitIdentity
+	recovery.SystemEpoch++
+	replicas := append([]uint64(nil), state.ReplicaIDs...)
+	applyDataOK(t, &state, 2, DataCommand{
+		Type: DataPrepareEpoch, Identity: identity, Epoch: &recovery, ReplicaIDs: replicas,
+	})
+	if len(state.ServingEpochs) != 2 || state.ServingEpochs[1].ManifestDigest != identity.ManifestDigest {
+		t.Fatalf("recovery epoch was not prepared under the active manifest: %+v", state.ServingEpochs)
+	}
+	recoveryIdentity := ShardRequestIdentity{PermitIdentity: recovery, ShardID: identity.ShardID}
+	previous := identity.PermitIdentity
+	applyDataOK(t, &state, 3, DataCommand{
+		Type: DataRetireEpoch, Identity: recoveryIdentity, Epoch: &previous,
+	})
+	if len(state.ServingEpochs) != 1 || state.ServingEpochs[0] != recovery {
+		t.Fatalf("pre-recovery epoch remained active: %+v", state.ServingEpochs)
 	}
 }
 

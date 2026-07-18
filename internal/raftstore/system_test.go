@@ -30,26 +30,49 @@ func TestSystemGroupBootstrapPermitAndPermanentClosure(t *testing.T) {
 	if err != nil || permit.Authorize(time.Now(), state.Identity(), PermitHolderDispatch) != nil {
 		t.Fatalf("authorized permit = %+v, %v", permit, err)
 	}
+	successor := testManifest(4, "generation-2")
+	successor.Predecessor = &PredecessorProof{
+		StorageGeneration: manifest.StorageGeneration, ManifestDigest: digest,
+		ServePermitMaxMillis: manifest.ServePermitMaxMillis, Kind: RolloverConsensusClosure,
+	}
+	intentDigest, err := successor.RolloverIntentDigest()
+	if err != nil {
+		t.Fatal(err)
+	}
 	closure := &GenerationClosure{
-		TargetStorageGeneration: "generation-2", TargetManifestDigest: digestFor("generation-2-manifest"),
-		Kind: RolloverConsensusClosure, ProofDigest: digestFor("closure"),
+		TargetStorageGeneration:    successor.StorageGeneration,
+		TargetManifestIntentDigest: intentDigest, Kind: RolloverConsensusClosure,
 	}
 	state, _ = applySystem(t, state, 4, SystemCommand{Type: SystemCloseGeneration, Closure: closure})
-	if !state.Retired || state.ServeGate || state.WriteGate || state.Closure == nil || state.Closure.CommitIndex != 4 {
+	if !state.Retired || state.ServeGate || state.WriteGate || state.Closure == nil || state.Closure.CommitIndex != 4 ||
+		!isSHA256(state.Closure.ProofDigest) || state.Closure.ProofDigest != generationClosureProofDigest(state, *state.Closure) {
 		t.Fatalf("closed generation = %+v", state)
+	}
+	proof, err := state.ConsensusPredecessorProof()
+	if err != nil {
+		t.Fatal(err)
+	}
+	successor.Predecessor = &proof
+	if err := successor.Validate(); err != nil {
+		t.Fatalf("successor did not accept committed closure: %v", err)
 	}
 	_, rejected := ApplySystemCommand(state, 5, SystemCommand{Type: SystemRefreshPermit})
 	if !rejected.Conflict {
 		t.Fatal("retired generation renewed a permit")
 	}
+	state.LastApplied = 5 // committed rejected entries still advance the state-machine applied index
+	if err := state.Validate(); err != nil {
+		t.Fatalf("late rejected entry invalidated permanent closure: %v", err)
+	}
+	if _, err := state.ConsensusPredecessorProof(); err != nil {
+		t.Fatalf("late rejected entry hid permanent closure proof: %v", err)
+	}
 }
 
 func TestSuccessorGenerationRequiresPermitDrainUnlessHardFenced(t *testing.T) {
-	manifest := testManifest(4, "generation-2")
-	manifest.Predecessor = &PredecessorProof{
-		StorageGeneration: "generation-1", ManifestDigest: digestFor("old-manifest"),
-		ServePermitMaxMillis: 5000, Kind: RolloverConsensusClosure, ProofDigest: digestFor("closure"),
-	}
+	predecessor := testManifest(4, "generation-1")
+	predecessorDigest, _ := predecessor.Digest()
+	manifest, _ := finalizeConsensusSuccessor(t, predecessor, predecessorDigest, testManifest(4, "generation-2"))
 	digest, _ := manifest.Digest()
 	state, _ := applySystem(t, SystemState{}, 1, SystemCommand{Type: SystemBootstrap, Manifest: &manifest, Digest: digest})
 	_, rejected := ApplySystemCommand(state, 2, SystemCommand{
@@ -88,6 +111,22 @@ func TestSuccessorGenerationRequiresPermitDrainUnlessHardFenced(t *testing.T) {
 	hardState, _ := applySystem(t, SystemState{}, 1, SystemCommand{Type: SystemBootstrap, Manifest: &hardFenced, Digest: hardDigest})
 	if !hardState.PredecessorDrainComplete {
 		t.Fatal("complete hard fence did not satisfy predecessor drain")
+	}
+}
+
+func TestSystemGroupRejectsNonInitialManifestBootstrap(t *testing.T) {
+	manifest := testManifest(2, "generation-1")
+	manifest.ManifestVersion = 2
+	manifest.PreviousManifestDigest = digestFor("manifest-1")
+	digest, err := manifest.Digest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, result := ApplySystemCommand(SystemState{}, 1, SystemCommand{
+		Type: SystemBootstrap, Manifest: &manifest, Digest: digest,
+	})
+	if !result.Conflict {
+		t.Fatal("System Group accepted a non-initial manifest as empty bootstrap")
 	}
 }
 
@@ -189,9 +228,44 @@ func TestManifestTransitionActivatesOnlyAfterEveryShardCompletes(t *testing.T) {
 		}
 	}
 	state, _ = applySystem(t, state, index, SystemCommand{Type: SystemActivateTransition})
+	activationIndex := index
+	if state.Transition == nil || !state.Transition.Activated ||
+		state.Transition.ActivationIndex != activationIndex || state.ActiveManifestVersion != 2 ||
+		state.SystemEpoch != 2 || state.ActiveManifestDigest != transition.Digest {
+		t.Fatalf("activated transition = %+v", state)
+	}
+	index++
+	_, rejected = ApplySystemCommand(state, index, SystemCommand{
+		Type: SystemAdvanceTransition,
+		Advance: &TransitionAdvance{
+			ShardID: ^uint32(0), From: TransitionComplete, To: TransitionEpochRetired,
+		},
+	})
+	if !rejected.Conflict {
+		t.Fatal("old epoch retired before its Serve Permits drained")
+	}
+	state, _ = applySystem(t, state, index, SystemCommand{
+		Type: SystemConfirmTransitionDrain,
+		TransitionDrain: &TransitionDrainConfirmation{
+			PreviousManifestDigest: transition.PreviousDigest,
+			PreviousSystemEpoch:    1, ActivationIndex: activationIndex,
+			WaitedMillis: manifest.ServePermitMaxMillis,
+		},
+	})
+	index++
+	for _, shardID := range []uint32{^uint32(0), 0, 1} {
+		state, _ = applySystem(t, state, index, SystemCommand{
+			Type: SystemAdvanceTransition,
+			Advance: &TransitionAdvance{
+				ShardID: shardID, From: TransitionComplete, To: TransitionEpochRetired,
+			},
+		})
+		index++
+	}
+	state, _ = applySystem(t, state, index, SystemCommand{Type: SystemFinalizeTransition})
 	if state.Transition != nil || state.ActiveManifestVersion != 2 || state.SystemEpoch != 2 ||
 		state.ActiveManifestDigest != transition.Digest {
-		t.Fatalf("activated transition = %+v", state)
+		t.Fatalf("finalized transition = %+v", state)
 	}
 }
 

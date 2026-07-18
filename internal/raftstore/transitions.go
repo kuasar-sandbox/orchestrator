@@ -91,24 +91,7 @@ func validateRouteTransition(
 func validateSameRouteState(current, next clusterstate.RouteWorkflowRecord) error {
 	switch current.State {
 	case clusterstate.WorkflowRouteStarting:
-		if current.Starting.SandboxID != next.Starting.SandboxID ||
-			current.Starting.PlacementRound != next.Starting.PlacementRound ||
-			!reflect.DeepEqual(current.Starting.CandidatePool, next.Starting.CandidatePool) ||
-			!reflect.DeepEqual(current.Starting.Intent, next.Starting.Intent) ||
-			!indexSetContains(next.Starting.DefinitivelyRejected, current.Starting.DefinitivelyRejected) {
-			return errors.New("raftstore: STARTING immutable intent changed or rejection proof regressed")
-		}
-		if current.Starting.SelectedCandidate != nil &&
-			(next.Starting.SelectedCandidate == nil || *current.Starting.SelectedCandidate != *next.Starting.SelectedCandidate) {
-			return errors.New("raftstore: STARTING selected candidate changed")
-		}
-		if current.Starting.Binding != nil && !reflect.DeepEqual(current.Starting.Binding, next.Starting.Binding) {
-			return errors.New("raftstore: STARTING committed Binding changed")
-		}
-		if current.Starting.LastEventSeq > next.Starting.LastEventSeq {
-			return errors.New("raftstore: STARTING event sequence regressed")
-		}
-		return nil
+		return validateRouteStartingUpdate(*current.Starting, *next.Starting)
 	case clusterstate.WorkflowRouteReady:
 		if !sameReadyExecution(*current.Ready, *next.Ready) ||
 			current.Ready.LastEventSeq > next.Ready.LastEventSeq {
@@ -192,19 +175,15 @@ func validateBuildTransition(current, next clusterstate.BuildRecord) error {
 	if current.State == next.State {
 		if current.State == clusterstate.BuildStarting {
 			if !reflect.DeepEqual(current.Starting.CandidatePool, next.Starting.CandidatePool) ||
-				!reflect.DeepEqual(current.Starting.Intent, next.Starting.Intent) ||
-				!indexSetContains(next.Starting.DefinitivelyRejected, current.Starting.DefinitivelyRejected) ||
-				current.Starting.LastEventSeq > next.Starting.LastEventSeq {
+				!reflect.DeepEqual(current.Starting.Intent, next.Starting.Intent) {
 				return errors.New("raftstore: BUILD_STARTING intent changed or proof regressed")
 			}
-			if current.Starting.SelectedCandidate != nil &&
-				(next.Starting.SelectedCandidate == nil || *current.Starting.SelectedCandidate != *next.Starting.SelectedCandidate) {
-				return errors.New("raftstore: BUILD_STARTING selected candidate changed")
-			}
-			if current.Starting.Binding != nil && !reflect.DeepEqual(current.Starting.Binding, next.Starting.Binding) {
-				return errors.New("raftstore: BUILD_STARTING committed Binding changed")
-			}
-			return nil
+			return validateStartingCandidateProgress(
+				current.Starting.SelectedCandidate, next.Starting.SelectedCandidate,
+				current.Starting.Binding, next.Starting.Binding,
+				current.Starting.DefinitivelyRejected, next.Starting.DefinitivelyRejected,
+				current.Starting.LastEventSeq, next.Starting.LastEventSeq,
+			)
 		}
 		if current.State == clusterstate.BuildError && current.Failure != nil {
 			if reflect.DeepEqual(current.Failure, next.Failure) {
@@ -259,6 +238,83 @@ func validateBuildTransition(current, next clusterstate.BuildRecord) error {
 		return errors.New("raftstore: Build tombstone identifies another execution")
 	}
 	return nil
+}
+
+func validateRouteStartingUpdate(current, next clusterstate.RouteStartingState) error {
+	if current.SandboxID == next.SandboxID {
+		if current.PlacementRound != next.PlacementRound ||
+			!reflect.DeepEqual(current.CandidatePool, next.CandidatePool) ||
+			!reflect.DeepEqual(current.Intent, next.Intent) {
+			return errors.New("raftstore: STARTING immutable intent changed")
+		}
+		return validateStartingCandidateProgress(
+			current.SelectedCandidate, next.SelectedCandidate,
+			current.Binding, next.Binding,
+			current.DefinitivelyRejected, next.DefinitivelyRejected,
+			current.LastEventSeq, next.LastEventSeq,
+		)
+	}
+	if current.SelectedCandidate != nil || current.Binding != nil ||
+		len(current.DefinitivelyRejected) != len(current.CandidatePool) || current.LastEventSeq != 0 ||
+		next.PlacementRound <= current.PlacementRound || next.PlacementRound != current.PlacementRound+1 ||
+		!reflect.DeepEqual(current.Intent, next.Intent) || next.SelectedCandidate != nil || next.Binding != nil ||
+		len(next.DefinitivelyRejected) != 0 || next.LastEventSeq != 0 {
+		return errors.New("raftstore: next placement round requires an exhausted no-side-effect pool and a new SID")
+	}
+	return nil
+}
+
+func validateStartingCandidateProgress(
+	currentSelected, nextSelected *uint32,
+	currentBinding, nextBinding *clusterstate.ExecutionBindingIntent,
+	currentRejected, nextRejected []uint32,
+	currentEventSeq, nextEventSeq uint64,
+) error {
+	switch {
+	case currentSelected == nil && nextSelected == nil:
+		if !sameRejectedCandidates(currentRejected, nextRejected) || currentEventSeq != nextEventSeq {
+			return errors.New("raftstore: unselected workflow changed without a candidate result")
+		}
+	case currentSelected == nil && nextSelected != nil:
+		if !sameRejectedCandidates(currentRejected, nextRejected) || currentEventSeq != nextEventSeq {
+			return errors.New("raftstore: candidate selection changed rejection or event progress")
+		}
+	case currentSelected != nil && nextSelected != nil:
+		if *currentSelected != *nextSelected || !reflect.DeepEqual(currentBinding, nextBinding) ||
+			!sameRejectedCandidates(currentRejected, nextRejected) || currentEventSeq > nextEventSeq {
+			return errors.New("raftstore: selected candidate identity changed or event progress regressed")
+		}
+	case currentSelected != nil && nextSelected == nil:
+		if !appendsRejectedCandidate(currentRejected, nextRejected, *currentSelected) ||
+			nextBinding != nil || currentEventSeq != nextEventSeq {
+			return errors.New("raftstore: selected candidate lacks an exact definitive no-side-effect rejection")
+		}
+	}
+	return nil
+}
+
+func sameRejectedCandidates(current, next []uint32) bool {
+	if len(current) != len(next) {
+		return false
+	}
+	for index := range current {
+		if current[index] != next[index] {
+			return false
+		}
+	}
+	return true
+}
+
+func appendsRejectedCandidate(current, next []uint32, candidate uint32) bool {
+	if len(next) != len(current)+1 || next[len(current)] != candidate {
+		return false
+	}
+	for index := range current {
+		if current[index] != next[index] {
+			return false
+		}
+	}
+	return true
 }
 
 func readyMatchesStarting(starting clusterstate.RouteStartingState, ready clusterstate.ReadyRoute) bool {
@@ -350,8 +406,8 @@ func validateFenceCompaction(
 		return errors.New("raftstore: fence compaction lacks every replica watermark")
 	}
 	for i, applied := range authorization.ReplicaApplied {
-		if applied.ReplicaID != replicaIDs[i] || applied.AppliedIndex <= fence.Revision.LogIndex {
-			return errors.New("raftstore: a replica has not applied beyond the fence revision")
+		if applied.ReplicaID != replicaIDs[i] || applied.AppliedIndex < fence.Revision.LogIndex {
+			return errors.New("raftstore: a replica has not applied the fence revision")
 		}
 	}
 	return nil

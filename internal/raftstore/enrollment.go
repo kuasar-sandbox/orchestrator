@@ -33,6 +33,7 @@ const (
 	ReplicaPlanned  ReplicaLocalState = "PLANNED"
 	ReplicaStarting ReplicaLocalState = "STARTING"
 	ReplicaActive   ReplicaLocalState = "ACTIVE"
+	ReplicaRemoving ReplicaLocalState = "REMOVING"
 	ReplicaRemoved  ReplicaLocalState = "REMOVED"
 )
 
@@ -53,6 +54,7 @@ type LocalEnrollment struct {
 	RaftAddress         string                   `json:"raft_address"`
 	NodeHostDir         string                   `json:"nodehost_dir"`
 	WALDir              string                   `json:"wal_dir"`
+	StateEngineDir      string                   `json:"state_engine_dir"`
 	RuntimeConfigDigest string                   `json:"runtime_config_digest"`
 	ManifestVersion     uint64                   `json:"manifest_version"`
 	ManifestDigest      string                   `json:"manifest_digest"`
@@ -63,7 +65,7 @@ type LocalEnrollment struct {
 func (e LocalEnrollment) Validate() error {
 	if e.Version != localEnrollmentVersion || e.ClusterID == "" || e.StorageGeneration == "" ||
 		e.MemberID == "" || e.DeploymentID == 0 || e.RaftAddress == "" ||
-		e.NodeHostDir == "" || !isSHA256(e.RuntimeConfigDigest) || e.ManifestVersion == 0 ||
+		e.NodeHostDir == "" || e.StateEngineDir == "" || !isSHA256(e.RuntimeConfigDigest) || e.ManifestVersion == 0 ||
 		!isSHA256(e.ManifestDigest) || len(e.Replicas) == 0 {
 		return errors.New("raftstore: incomplete local Registry enrollment")
 	}
@@ -82,7 +84,7 @@ func (e LocalEnrollment) Validate() error {
 			return errors.New("raftstore: local replica plan contradicts enrollment mode")
 		}
 		switch replica.LocalState {
-		case ReplicaPlanned, ReplicaStarting, ReplicaActive, ReplicaRemoved:
+		case ReplicaPlanned, ReplicaStarting, ReplicaActive, ReplicaRemoving, ReplicaRemoved:
 		default:
 			return errors.New("raftstore: invalid local replica state")
 		}
@@ -116,6 +118,7 @@ func newLocalEnrollment(
 		StorageGeneration: manifest.StorageGeneration, MemberID: member.MemberID,
 		DeploymentID: deploymentID(manifest.ClusterID, manifest.StorageGeneration),
 		RaftAddress:  member.RaftEndpoint, NodeHostDir: config.NodeHostDir, WALDir: config.WALDir,
+		StateEngineDir:      config.StateEngineDir,
 		RuntimeConfigDigest: configDigest, ManifestVersion: manifest.ManifestVersion,
 		ManifestDigest: digest, Mode: mode, Replicas: replicas,
 	}
@@ -137,6 +140,7 @@ func (e LocalEnrollment) Matches(manifest Manifest, digest string, member Regist
 		e.MemberID != member.MemberID ||
 		e.DeploymentID != deploymentID(manifest.ClusterID, manifest.StorageGeneration) ||
 		e.RaftAddress != member.RaftEndpoint || e.NodeHostDir != config.NodeHostDir || e.WALDir != config.WALDir ||
+		e.StateEngineDir != config.StateEngineDir ||
 		e.RuntimeConfigDigest != configDigest {
 		return errors.New("raftstore: runtime identity differs from durable local enrollment")
 	}
