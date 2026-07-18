@@ -1367,6 +1367,53 @@ func TestDeadReportDeletesRoute(t *testing.T) {
 	}
 }
 
+func TestFinalFencedReportDoesNotEnterLegacyConvergence(t *testing.T) {
+	ctx := context.Background()
+	reg := testReg(t)
+	current := &SandboxRecord{
+		Group: "/g", RouteKey: "rk", SID: "sb-rebound", State: StateReady, NodeID: "n1",
+		NodeEpoch: 8, StorageGeneration: "g2", BindingDigest: "current-binding",
+	}
+	if _, err := reg.stores.PutSandbox(ctx, current); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.stores.AddNodeSandboxRef(ctx, "n1", clusterstate.NodeSandboxRef{
+		SandboxID: current.SID, Group: current.Group, RouteKey: current.RouteKey,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	reg.applyRoute(ctx, "n1", &routesync.RouteEntry{
+		SandboxID: current.SID, State: routesync.StateDead, NodeID: "n1", NodeEpoch: 7,
+		StorageGeneration: "g1", BindingDigest: "old-binding", EventSeq: 12,
+	})
+
+	got, _, found, err := reg.stores.GetSandbox(ctx, current.Group, current.RouteKey)
+	if err != nil || !found || got.BindingDigest != current.BindingDigest {
+		t.Fatalf("route after final event on legacy path = %+v found=%v err=%v", got, found, err)
+	}
+	if _, found, err := reg.stores.GetNodeSandboxRef(ctx, "n1", current.SID); err != nil || !found {
+		t.Fatalf("legacy path removed current execution ref found=%v err=%v", found, err)
+	}
+}
+
+func TestNodeLinkRejectsUnversionedRegistration(t *testing.T) {
+	reg := testReg(t)
+	var body bytes.Buffer
+	if err := routesync.WriteMsg(&body, &routesync.Msg{
+		Type:    routesync.TypeNodeRegister,
+		NodeReg: &routesync.NodeRegister{NodeID: "n1"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPut, routesync.NodeLinkPath, &body)
+	recorder := httptest.NewRecorder()
+	reg.ServeNodeLink(recorder, req)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusBadRequest)
+	}
+}
+
 func TestLateDeadReportDoesNotDeleteReplacementRoute(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
@@ -2315,7 +2362,7 @@ func TestNodeLinkResumeTokenReturnedOnReconnect(t *testing.T) {
 		}
 		errc := make(chan error, 1)
 		go func() {
-			errc <- routesync.WriteMsg(pw, &routesync.Msg{Type: routesync.TypeNodeRegister, NodeReg: &routesync.NodeRegister{NodeID: "n1"}})
+			errc <- routesync.WriteMsg(pw, &routesync.Msg{Type: routesync.TypeNodeRegister, NodeReg: &routesync.NodeRegister{Version: routesync.Version, NodeID: "n1"}})
 		}()
 		resp, err := tr.RoundTrip(req)
 		if err != nil {

@@ -654,7 +654,13 @@ func (f ExecutionFence) Validate() error {
 	if err := f.Proof.Validate(); err != nil {
 		return err
 	}
-	return f.Revision.Validate()
+	if err := f.Revision.Validate(); err != nil {
+		return err
+	}
+	if f.Revision.StorageGeneration != f.StorageGeneration {
+		return errors.New("cluster: execution fence revision belongs to another storage generation")
+	}
+	return nil
 }
 
 type FenceCompactionProof struct {
@@ -666,8 +672,9 @@ type FenceCompactionProof struct {
 }
 
 func CanCompactExecutionFence(fence ExecutionFence, proof FenceCompactionProof) bool {
+	outboxCovered := proof.FinalOutboxWatermarkAcked && fence.FinalOutboxWatermark >= fence.LastEventSeq
 	return fence.Validate() == nil && proof.TerminalProofCommitted &&
-		(proof.FinalOutboxWatermarkAcked || proof.NodeEpochPermanentlyFenced) &&
+		(outboxCovered || proof.NodeEpochPermanentlyFenced) &&
 		proof.AllReplicasApplied && proof.MinimumRetentionElapsed
 }
 

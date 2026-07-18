@@ -774,9 +774,15 @@ func (r *Registry) applyRoute(ctx context.Context, nodeID string, e *routesync.R
 	if e == nil || e.SandboxID == "" {
 		return
 	}
-	managed := e.NodeID != "" || e.NodeEpoch != 0 || e.StorageGeneration != "" || e.BindingDigest != ""
+	managed := e.NodeID != "" || e.NodeEpoch != 0 || e.StorageGeneration != "" || e.BindingDigest != "" || e.EventSeq != 0
 	if managed && (e.NodeID != nodeID || e.NodeEpoch == 0 || e.StorageGeneration == "" || e.BindingDigest == "") {
 		r.log.Warn("registry: ignored incomplete execution fence", "node", nodeID, "sid", e.SandboxID)
+		return
+	}
+	if managed {
+		// Final fenced events converge only through the durable Phase 3 outbox.
+		// Applying them to the legacy route table would bypass Binding/EventSeq CAS.
+		r.log.Warn("registry: ignored final execution event on legacy route path", "node", nodeID, "sid", e.SandboxID)
 		return
 	}
 	ref, found, err := r.lookupNodeSandboxRef(ctx, nodeID, e.SandboxID)

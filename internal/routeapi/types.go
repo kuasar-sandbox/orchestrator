@@ -159,9 +159,17 @@ func (r ReadBuildResponse) ValidateFor(request ReadBuildRequest) error {
 		if err := r.Build.Validate(); err != nil {
 			return err
 		}
+		if r.LeaderHint != nil {
+			return errors.New("routeapi: positive Build read cannot carry a leader hint")
+		}
 		switch r.BuildState {
 		case clusterstate.BuildQueued, clusterstate.BuildRegistered, clusterstate.BuildBuilding,
-			clusterstate.BuildReady, clusterstate.BuildError:
+			clusterstate.BuildError:
+			return nil
+		case clusterstate.BuildReady:
+			if r.Build.ArtifactRef == "" {
+				return errors.New("routeapi: READY Build state requires an artifact")
+			}
 			return nil
 		default:
 			return errors.New("routeapi: local Build read returned an unbound workflow")
@@ -177,6 +185,9 @@ func (r ReadBuildResponse) ValidateFor(request ReadBuildRequest) error {
 	case ReadNotFound:
 		if !request.Strong {
 			return errors.New("routeapi: replica-local Build read returned final NOT_FOUND")
+		}
+		if r.Build != nil {
+			return errors.New("routeapi: NOT_FOUND Build read cannot carry a projection")
 		}
 		return nil
 	case ReadConflict, ReadUnavailable:

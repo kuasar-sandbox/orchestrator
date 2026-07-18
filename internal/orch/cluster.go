@@ -60,42 +60,10 @@ func (o *Orchestrator) HandleCommand(ctx context.Context, cmd *routesync.Command
 			}
 		}()
 		return accept(cmd)
-	case routesync.CmdSandboxResume:
-		if err := o.verifySandboxCommandBinding(ctx, cmd); err != nil {
-			return rejectBinding(cmd, err)
-		}
-		go func() {
-			if err := o.verifySandboxCommandBinding(o.asyncCtx(), cmd); err != nil {
-				o.log.Warn("cluster resume fenced before execution", "sid", cmd.SID, "err", err)
-				return
-			}
-			if err := o.connectCluster(o.asyncCtx(), cmd.SID); err != nil {
-				o.log.Error("cluster resume", "sid", cmd.SID, "err", err)
-			}
-		}()
-		return accept(cmd)
-	case routesync.CmdSandboxDelete:
-		if err := o.verifySandboxCommandBinding(ctx, cmd); err != nil {
-			return rejectBinding(cmd, err)
-		}
-		go func() {
-			if err := o.verifySandboxCommandBinding(o.asyncCtx(), cmd); err != nil {
-				o.log.Warn("cluster delete fenced before execution", "sid", cmd.SID, "err", err)
-				return
-			}
-			if err := o.deleteCluster(o.asyncCtx(), cmd.SID); err != nil {
-				o.log.Error("cluster delete", "sid", cmd.SID, "err", err)
-			}
-		}()
-		return accept(cmd)
-	case routesync.CmdRebindExecution:
-		if err := o.rebindClusterExecution(ctx, cmd); err != nil {
-			if errors.Is(err, errWrongExecutionBinding) {
-				return rejectBinding(cmd, err)
-			}
-			return reject(cmd, err)
-		}
-		return accept(cmd)
+	case routesync.CmdSandboxAdmitDispatch, routesync.CmdBuildAdmitDispatch,
+		routesync.CmdSandboxResume, routesync.CmdSandboxDelete,
+		routesync.CmdRebindExecution, routesync.CmdFinalizeWorkflow:
+		return reject(cmd, errors.New("final cluster workflow executor is dormant until atomic cutover"))
 	case routesync.CmdKeyPut:
 		// Key distribution (cluster.md): refresh the manifest-key allowlist
 		// lease so create/build can resolve it by fingerprint. The registry sends
@@ -198,7 +166,7 @@ func (o *Orchestrator) registerClusterBuild(ctx context.Context, cmd *routesync.
 	if err != nil {
 		return err
 	}
-	commandMeta, err := clusterCommandMetadata(cmd, clusterstate.ExecutionKindBuild, cmd.BuildID)
+	commandMeta, err := o.clusterCommandMetadata(ctx, cmd, clusterstate.ExecutionKindBuild, cmd.BuildID)
 	if err != nil {
 		return err
 	}
@@ -396,7 +364,7 @@ func (o *Orchestrator) CreateCluster(ctx context.Context, cmd *routesync.Command
 // whose failure is a rejected ack (rather than a slow create that fails only by
 // Reserve timeout).
 func (o *Orchestrator) precheckCluster(ctx context.Context, cmd *routesync.Command) (string, types.TemplateID, error) {
-	if _, err := clusterCommandMetadata(cmd, clusterstate.ExecutionKindSandbox, cmd.SID); err != nil {
+	if _, err := o.clusterCommandMetadata(ctx, cmd, clusterstate.ExecutionKindSandbox, cmd.SID); err != nil {
 		return "", types.TemplateID{}, err
 	}
 	manifestKey, err := o.resolveByFingerprint(ctx, cmd.KeyFingerprint)
@@ -419,7 +387,7 @@ func (o *Orchestrator) bootCluster(ctx context.Context, cmd *routesync.Command, 
 	}
 	trafTok, _ := keys.MintToken()
 
-	meta, err := clusterCommandMetadata(cmd, clusterstate.ExecutionKindSandbox, cmd.SID)
+	meta, err := o.clusterCommandMetadata(ctx, cmd, clusterstate.ExecutionKindSandbox, cmd.SID)
 	if err != nil {
 		return nil, err
 	}
@@ -449,7 +417,29 @@ func (o *Orchestrator) bootCluster(ctx context.Context, cmd *routesync.Command, 
 	return sb, nil
 }
 
-func clusterCommandMetadata(cmd *routesync.Command, kind clusterstate.ExecutionKind, objectID string) (map[string]string, error) {
+func (o *Orchestrator) clusterCommandMetadata(
+	ctx context.Context,
+	cmd *routesync.Command,
+	kind clusterstate.ExecutionKind,
+	objectID string,
+) (map[string]string, error) {
+	expectedNodeID := ""
+	if cmd != nil && cmd.Binding != "" {
+		identity, err := o.st.GetClusterIdentity(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("cluster command requires an enrolled local identity: %w", err)
+		}
+		expectedNodeID = identity.NodeID
+	}
+	return clusterCommandMetadata(cmd, kind, objectID, expectedNodeID)
+}
+
+func clusterCommandMetadata(
+	cmd *routesync.Command,
+	kind clusterstate.ExecutionKind,
+	objectID string,
+	expectedNodeID string,
+) (map[string]string, error) {
 	if cmd == nil {
 		return nil, fmt.Errorf("cluster command is required")
 	}
@@ -473,6 +463,9 @@ func clusterCommandMetadata(cmd *routesync.Command, kind clusterstate.ExecutionK
 	}
 	if binding.Kind != kind || binding.ObjectID != objectID {
 		return nil, fmt.Errorf("cluster command execution binding identifies a different object")
+	}
+	if expectedNodeID == "" || binding.NodeID != expectedNodeID {
+		return nil, fmt.Errorf("cluster command execution binding identifies a different node")
 	}
 	if binding.NodeEpoch != cmd.NodeEpoch || binding.StorageGeneration != cmd.StorageGeneration {
 		return nil, fmt.Errorf("cluster command execution binding generation mismatch")
@@ -533,7 +526,7 @@ func (o *Orchestrator) rebindClusterExecution(ctx context.Context, cmd *routesyn
 	default:
 		return fmt.Errorf("cluster rebind: exactly one sandbox_id or build_id is required")
 	}
-	if _, err := clusterCommandMetadata(cmd, kind, objectID); err != nil {
+	if _, err := o.clusterCommandMetadata(ctx, cmd, kind, objectID); err != nil {
 		return err
 	}
 	changed, err := o.st.CASExecutionBinding(ctx, kind, objectID, cmd.OldBindingDigest, cmd.Binding)

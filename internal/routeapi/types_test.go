@@ -150,6 +150,31 @@ func TestPositiveReadsRequireExactTableKeyIdentity(t *testing.T) {
 	}
 }
 
+func TestBuildReadResponseEnforcesOutcomeUnionAndReadyArtifact(t *testing.T) {
+	request := routeRequest(true)
+	buildRequest := ReadBuildRequest{RequestIdentity: request.RequestIdentity, Group: "/g", BuildID: "b1", Strong: true}
+	build := &clusterstate.BuildProjection{
+		BuildID: "b1", NodeID: "n1", NodeEpoch: 7, StorageGeneration: "g1",
+		BindingDigest: testReadyRoute().BindingDigest, LastEventSeq: 1,
+	}
+
+	missing := ReadBuildResponse{Outcome: ReadNotFound, Build: build}
+	if err := missing.ValidateFor(buildRequest); err == nil {
+		t.Fatal("NOT_FOUND response carrying a Build projection was accepted")
+	}
+	ready := ReadBuildResponse{
+		Outcome: ReadReady, Group: "/g", Build: build,
+		BuildState: clusterstate.BuildReady, BuildRevision: 1,
+	}
+	if err := ready.ValidateFor(buildRequest); err == nil {
+		t.Fatal("READY Build without an artifact was accepted")
+	}
+	ready.Build.ArtifactRef = "manifest://artifact"
+	if err := ready.ValidateFor(buildRequest); err != nil {
+		t.Fatalf("READY Build with artifact: %v", err)
+	}
+}
+
 func routeRequest(strong bool) ReadRouteRequest {
 	return ReadRouteRequest{
 		RequestIdentity: RequestIdentity{

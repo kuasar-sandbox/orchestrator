@@ -60,7 +60,7 @@ func TestClusterCommandInstallsOnlyValidatedBinding(t *testing.T) {
 		DispatchSpecDigest: hex.EncodeToString(dispatch[:]),
 		Config:             map[string]string{"user": "value", clusterstate.ObjectMetadataKey: "forged"},
 	}
-	metadata, err := clusterCommandMetadata(cmd, clusterstate.ExecutionKindSandbox, "s1")
+	metadata, err := clusterCommandMetadata(cmd, clusterstate.ExecutionKindSandbox, "s1", "n1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -68,18 +68,24 @@ func TestClusterCommandInstallsOnlyValidatedBinding(t *testing.T) {
 		t.Fatalf("metadata = %#v", metadata)
 	}
 	cmd.BindingDigest = "wrong"
-	if _, err := clusterCommandMetadata(cmd, clusterstate.ExecutionKindSandbox, "s1"); err == nil {
+	if _, err := clusterCommandMetadata(cmd, clusterstate.ExecutionKindSandbox, "s1", "n1"); err == nil {
 		t.Fatal("binding digest mismatch accepted")
 	}
 	cmd.BindingDigest = digest
-	if _, err := clusterCommandMetadata(cmd, clusterstate.ExecutionKindBuild, "s1"); err == nil {
+	if _, err := clusterCommandMetadata(cmd, clusterstate.ExecutionKindBuild, "s1", "n1"); err == nil {
 		t.Fatal("binding kind mismatch accepted")
+	}
+	if _, err := clusterCommandMetadata(cmd, clusterstate.ExecutionKindSandbox, "s1", "n2"); err == nil {
+		t.Fatal("binding for another node accepted")
 	}
 }
 
 func TestRebindClusterExecutionUsesDigestCAS(t *testing.T) {
 	o := testOrch(t)
 	ctx := context.Background()
+	if _, err := o.st.EnrollClusterIdentity(ctx, "n1", "boot-1", "10.0.0.1:8443"); err != nil {
+		t.Fatal(err)
+	}
 	demand := sha256.Sum256([]byte("demand"))
 	dispatch := sha256.Sum256([]byte("dispatch"))
 	makeBinding := func(generation string) string {

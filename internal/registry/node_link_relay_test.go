@@ -121,7 +121,7 @@ func TestNodeLinkIngressRedirectsToNodeOwner(t *testing.T) {
 		respCh <- resp
 	}()
 	if err := routesync.WriteMsg(pw, &routesync.Msg{Type: routesync.TypeNodeRegister, NodeReg: &routesync.NodeRegister{
-		NodeID: nodeID, DataEndpoint: "10.0.0.1:8443", AcceptRedirect: true,
+		Version: routesync.Version, NodeID: nodeID, DataEndpoint: "10.0.0.1:8443", AcceptRedirect: true,
 	}}); err != nil {
 		t.Fatal(err)
 	}
@@ -400,7 +400,7 @@ func startRelayNodeStub(t *testing.T, ctx context.Context, addr, nodeID string) 
 		respCh <- resp
 	}()
 	if err := routesync.WriteMsg(pw, &routesync.Msg{Type: routesync.TypeNodeRegister, NodeReg: &routesync.NodeRegister{
-		NodeID: nodeID, Capacity: 10, DataEndpoint: "10.0.0.1:8443",
+		Version: routesync.Version, NodeID: nodeID, Capacity: 10, DataEndpoint: "10.0.0.1:8443",
 	}}); err != nil {
 		t.Fatal(err)
 	}

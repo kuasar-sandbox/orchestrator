@@ -61,6 +61,10 @@ func (r *Registry) ServeNodeLink(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	nr := first.NodeReg
+	if nr.Version != routesync.Version {
+		http.Error(w, "node-link: incompatible protocol version", http.StatusBadRequest)
+		return
+	}
 
 	owners, err := r.stores.NodeOwnerCandidates(ctx, nr.NodeID)
 	if err != nil || len(owners) == 0 {

@@ -159,6 +159,7 @@ func (c *Client) Run(ctx context.Context) {
 // so it WRITES routes and READS commands (the inverse of a proxy subscriber).
 func (c *Client) session(ctx context.Context, endpoint string) error {
 	identity := c.identity
+	identity.Version = routesync.Version
 	if c.sequencer != nil {
 		tuple, err := c.sequencer.NextSession(ctx)
 		if err != nil {
@@ -204,6 +205,9 @@ func (c *Client) session(ctx context.Context, endpoint string) error {
 	if err != nil {
 		return err
 	}
+	if hello.Type != routesync.TypeHello || hello.Hello == nil || hello.Hello.Version != routesync.Version {
+		return fmt.Errorf("node-link: incompatible registry protocol version")
+	}
 	if redir := nodeLinkRedirectFromHello(hello); len(redir.targets) > 0 {
 		return redir
 	}
@@ -213,9 +217,7 @@ func (c *Client) session(ctx context.Context, endpoint string) error {
 	// reusing the shared authority loop. Subscribe(kind=registry) makes the loop
 	// stream routes; onUp dispatches commands.
 	reg := routesync.Register{Subscribe: &routesync.Subscribe{Kind: routesync.KindRegistry}}
-	if hello.Type == routesync.TypeHello && hello.Hello != nil {
-		reg.ResumeFrom = hello.Hello.ResumeFrom
-	}
+	reg.ResumeFrom = hello.Hello.ResumeFrom
 	outbox := make(chan *routesync.Msg)
 	highOut := make(chan *routesync.Msg, 32)
 	hbUpdate := make(chan struct{}, 1)

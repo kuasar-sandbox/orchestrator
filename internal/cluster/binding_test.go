@@ -85,3 +85,20 @@ func TestExecutionBindingRejectsMalformedValues(t *testing.T) {
 		t.Fatal("incomplete binding accepted")
 	}
 }
+
+func TestExecutionBindingRejectsUnprojectableIdentity(t *testing.T) {
+	base := ExecutionBinding{
+		StorageGeneration: "g1", Kind: ExecutionKindSandbox, ObjectID: "s1",
+		Group: "/g", RouteKey: "rk", NodeID: "n1", NodeEpoch: 1,
+	}
+	tooLongNode := base
+	tooLongNode.NodeID = strings.Repeat("n", MaxExecutionBindingNodeIDSize+1)
+	if _, err := EncodeExecutionBinding(tooLongNode); err == nil {
+		t.Fatal("unprojectable node ID was accepted")
+	}
+	tooLongGeneration := base
+	tooLongGeneration.StorageGeneration = strings.Repeat("g", MaxExecutionBindingGenerationIDSize+1)
+	if _, err := EncodeExecutionBinding(tooLongGeneration); err == nil {
+		t.Fatal("unprojectable storage generation was accepted")
+	}
+}

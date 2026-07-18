@@ -134,6 +134,7 @@ const (
 // so the registry can place sandboxes (and later builds) on it and forward the
 // data plane to it (cluster.md / §6.1).
 type NodeRegister struct {
+	Version          int               `json:"version"`
 	NodeID           string            `json:"node_id"`
 	NodeEpoch        uint64            `json:"node_epoch,omitempty"`
 	SessionSeq       uint64            `json:"session_seq,omitempty"`

@@ -252,11 +252,41 @@ func TestNodeLinkPersistsAndStampsTupleBeforeDial(t *testing.T) {
 	_ = client.session(ctx, "")
 	select {
 	case got := <-registered:
-		if got.NodeEpoch != 7 || got.SessionSeq != 12 {
-			t.Fatalf("registered tuple = (%d,%d)", got.NodeEpoch, got.SessionSeq)
+		if got.Version != routesync.Version || got.NodeEpoch != 7 || got.SessionSeq != 12 {
+			t.Fatalf("registered identity = %+v", got)
 		}
 	case <-ctx.Done():
 		t.Fatal("node registration not received")
+	}
+}
+
+func TestNodeLinkRejectsMismatchedHelloVersion(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc(routesync.NodeLinkPath, func(w http.ResponseWriter, req *http.Request) {
+		first, err := routesync.ReadMsg(req.Body)
+		if err != nil || first.NodeReg == nil || first.NodeReg.Version != routesync.Version {
+			http.Error(w, "bad register", http.StatusBadRequest)
+			return
+		}
+		_ = routesync.WriteMsg(w, &routesync.Msg{
+			Type:  routesync.TypeHello,
+			Hello: &routesync.Hello{Version: routesync.Version - 1},
+		})
+		w.(http.Flusher).Flush()
+	})
+	srv := httptest.NewServer(h2c.NewHandler(mux, &http2.Server{}))
+	defer srv.Close()
+	client := New(
+		func(ctx context.Context) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "tcp", srv.Listener.Addr().String())
+		},
+		routesync.NodeRegister{NodeID: "node-1"}, newFakeNode(), time.Second, nil,
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+	)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := client.session(ctx, ""); err == nil || err.Error() != "node-link: incompatible registry protocol version" {
+		t.Fatalf("session error = %v", err)
 	}
 }
 

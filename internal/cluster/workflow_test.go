@@ -157,6 +157,16 @@ func TestExecutionFenceCompactionRequiresEveryProof(t *testing.T) {
 	if !CanCompactExecutionFence(fence, all) {
 		t.Fatal("complete fence proof did not compact")
 	}
+	fence.FinalOutboxWatermark = fence.LastEventSeq - 1
+	if CanCompactExecutionFence(fence, all) {
+		t.Fatal("fence compacted before the acknowledged watermark covered the last event")
+	}
+	fence.FinalOutboxWatermark = fence.LastEventSeq
+	wrongGeneration := fence
+	wrongGeneration.Revision.StorageGeneration = "g2"
+	if CanCompactExecutionFence(wrongGeneration, all) {
+		t.Fatal("fence compacted using a revision from another storage generation")
+	}
 	all.AllReplicasApplied = false
 	if CanCompactExecutionFence(fence, all) {
 		t.Fatal("fence compacted before every replica applied")

@@ -446,7 +446,7 @@ func startNodeStub(t *testing.T, ctx context.Context, controlURL, dataEndpoint s
 	}()
 	stub := &nodeStub{t: t, ctx: nctx, cancel: cancel, pw: pw, cmdCh: make(chan *routesync.Command, 64)}
 	stub.write(t, &routesync.Msg{Type: routesync.TypeNodeRegister, NodeReg: &routesync.NodeRegister{
-		NodeID: "n1", Labels: map[string]string{"pool": "stub"}, Capacity: 10,
+		Version: routesync.Version, NodeID: "n1", Labels: map[string]string{"pool": "stub"}, Capacity: 10,
 		BuildCapacity: &routesync.BuildResources{CPU: 4000, Mem: 4 << 30},
 		DataEndpoint:  dataEndpoint,
 		RuntimeDigest: "runtime-stub",

@@ -14,9 +14,11 @@ import (
 )
 
 const (
-	ExecutionBindingVersion = 1
-	ExecutionBindingPrefix  = "keb1."
-	MaxExecutionBindingSize = 16 << 10
+	ExecutionBindingVersion             = 1
+	ExecutionBindingPrefix              = "keb1."
+	MaxExecutionBindingSize             = 16 << 10
+	MaxExecutionBindingNodeIDSize       = 128
+	MaxExecutionBindingGenerationIDSize = 128
 )
 
 const executionBindingMagic = "kuasar-execution-binding-v1"
@@ -179,6 +181,12 @@ func (b ExecutionBinding) validate() error {
 	}
 	if !utf8.ValidString(b.RouteKey) {
 		return errors.New("cluster: execution binding route key is not valid UTF-8")
+	}
+	if len(b.NodeID) > MaxExecutionBindingNodeIDSize {
+		return fmt.Errorf("cluster: execution binding node id exceeds %d bytes", MaxExecutionBindingNodeIDSize)
+	}
+	if len(b.StorageGeneration) > MaxExecutionBindingGenerationIDSize {
+		return fmt.Errorf("cluster: execution binding storage generation exceeds %d bytes", MaxExecutionBindingGenerationIDSize)
 	}
 	switch b.Kind {
 	case ExecutionKindSandbox:
