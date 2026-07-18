@@ -1,0 +1,475 @@
+package nodeexec
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"sync/atomic"
+
+	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
+	"github.com/kuasar-sandbox/orchestrator/internal/nodectl"
+	"github.com/kuasar-sandbox/orchestrator/internal/session"
+	"github.com/kuasar-sandbox/orchestrator/internal/types"
+)
+
+type IdentitySource func(context.Context) (LocalSessionIdentity, error)
+
+type BuildCapacitySource func(context.Context) (BuildCapacity, string, error)
+
+type SandboxDemandSource func(DispatchRecord) (nodectl.SandboxAdmissionDemand, error)
+
+type BuildObjectSource func(DispatchRecord) (*types.Build, error)
+
+type SandboxAdmissionController interface {
+	GetAdmission(string, string) (nodectl.PreparedAdmissionResult, error)
+	PrepareAdmission(string, string, nodectl.SandboxAdmissionDemand) (nodectl.PreparedAdmissionResult, error)
+	ClaimAdmission(string, string) (nodectl.PreparedAdmissionResult, error)
+	ReleaseAdmission(string, string, string) (nodectl.PreparedAdmissionResult, error)
+	FinalizeAdmission(string, string) error
+	PromoteQueued() ([]nodectl.PreparedAdmissionResult, error)
+	Wake() <-chan struct{}
+}
+
+// WorkflowJournal is implemented by the node-local SQLite store. Its methods
+// are deliberately keyed by the business sandbox/build IDs from the RFC.
+type WorkflowJournal interface {
+	GetNodeWorkflow(context.Context, clusterstate.ExecutionKind, string) (*WorkflowRecord, error)
+	ExecutionObjectExists(context.Context, clusterstate.ExecutionKind, string) (bool, error)
+	RecordSandboxWorkflow(context.Context, DispatchRecord, AdmissionDecision) (*WorkflowRecord, error)
+	AdmitQueuedSandbox(context.Context, string, string, string) (*WorkflowRecord, error)
+	ClaimSandboxWorkflow(context.Context, string, string, string) (*WorkflowRecord, error)
+	PrepareBuildWorkflow(context.Context, DispatchRecord, *types.Build, BuildCapacity, string) (*WorkflowRecord, error)
+	PromoteBuildQueue(context.Context, BuildCapacity, int) ([]*WorkflowRecord, error)
+	ClaimBuildWorkflow(context.Context, string, string) (*WorkflowRecord, error)
+	LaunchableNodeWorkflows(context.Context, clusterstate.ExecutionKind, string, uint64, string, int) ([]*WorkflowRecord, error)
+	SandboxWorkflowsForReconcile(context.Context, string, uint64, string, int) ([]*WorkflowRecord, error)
+	ReleaseSandboxWorkflow(context.Context, string, string, string) (*WorkflowRecord, error)
+	FailPendingNodeWorkflow(context.Context, clusterstate.ExecutionKind, string, string, string) (*WorkflowRecord, error)
+	FinalizeNodeWorkflow(context.Context, clusterstate.ExecutionKind, string, string) error
+}
+
+// Authority is the dormant final node-side Admission and command-dedupe
+// endpoint. A separate instance belongs to one node-link SessionSeq.
+type Authority struct {
+	journal        WorkflowJournal
+	sandbox        SandboxAdmissionController
+	identity       IdentitySource
+	buildCapacity  BuildCapacitySource
+	buildObject    BuildObjectSource
+	sandboxDemand  SandboxDemandSource
+	workWake       chan struct{}
+	sessionFenced  atomic.Bool
+	buildBatchSize int
+}
+
+func NewAuthority(
+	journal WorkflowJournal,
+	sandbox SandboxAdmissionController,
+	identity IdentitySource,
+	buildCapacity BuildCapacitySource,
+	buildObject BuildObjectSource,
+	sandboxDemand SandboxDemandSource,
+) (*Authority, error) {
+	if journal == nil || sandbox == nil || identity == nil || buildCapacity == nil || buildObject == nil || sandboxDemand == nil {
+		return nil, errors.New("nodeexec: authority requires journal, Admission, identity, capacity, and demand sources")
+	}
+	return &Authority{
+		journal: journal, sandbox: sandbox, identity: identity,
+		buildCapacity: buildCapacity, buildObject: buildObject, sandboxDemand: sandboxDemand,
+		workWake: make(chan struct{}, 1), buildBatchSize: 64,
+	}, nil
+}
+
+func (a *Authority) FenceStaleSession() { a.sessionFenced.Store(true) }
+
+func (a *Authority) WorkWake() <-chan struct{} { return a.workWake }
+
+func (a *Authority) SandboxAdmissionWake() <-chan struct{} { return a.sandbox.Wake() }
+
+func (a *Authority) notifyWork() {
+	select {
+	case a.workWake <- struct{}{}:
+	default:
+	}
+}
+
+func (a *Authority) AdmitAndDispatch(
+	ctx context.Context,
+	command session.DispatchCommand,
+) (session.DispatchReply, error) {
+	if err := ctx.Err(); err != nil {
+		return session.DispatchReply{}, err
+	}
+	if a.sessionFenced.Load() {
+		return session.DispatchReply{Outcome: clusterstate.DispatchSessionMoved, Reason: "node-link session is fenced"}, nil
+	}
+	identity, err := a.identity(ctx)
+	if err != nil {
+		return session.DispatchReply{}, err
+	}
+	if err := identity.Validate(); err != nil {
+		return session.DispatchReply{}, err
+	}
+	if identity.NodeID != command.NodeID || identity.NodeEpoch != command.NodeEpoch ||
+		identity.SessionSeq != command.SessionSeq || identity.DataEndpoint != command.DataEndpoint {
+		return session.DispatchReply{Outcome: clusterstate.DispatchSessionMoved, Reason: "node-link session tuple changed"}, nil
+	}
+	dispatch, err := DispatchRecordFromCommand(command)
+	if err != nil {
+		return session.DispatchReply{Outcome: clusterstate.DispatchWrongBinding, Reason: err.Error()}, nil
+	}
+	existing, err := a.journal.GetNodeWorkflow(ctx, dispatch.Kind, dispatch.ObjectID)
+	if err != nil {
+		return session.DispatchReply{}, err
+	}
+	if existing != nil {
+		if !existing.DispatchRecord.SameDispatch(dispatch) {
+			return session.DispatchReply{Outcome: clusterstate.DispatchConflict, Reason: "object ID is bound to another dispatch"}, nil
+		}
+		return session.DispatchReply{Outcome: existing.Result, Reason: existing.Reason}, nil
+	}
+	occupied, err := a.journal.ExecutionObjectExists(ctx, dispatch.Kind, dispatch.ObjectID)
+	if err != nil {
+		return session.DispatchReply{}, err
+	}
+	if occupied {
+		if dispatch.Kind == clusterstate.ExecutionKindSandbox {
+			prepared, getErr := a.sandbox.GetAdmission(dispatch.ObjectID, dispatch.DemandDigest)
+			switch {
+			case getErr == nil && prepared.State != nodectl.PreparedRejected && prepared.State != nodectl.PreparedReleased:
+				if _, releaseErr := a.sandbox.ReleaseAdmission(dispatch.ObjectID, dispatch.DemandDigest, "object_id_conflict"); releaseErr != nil {
+					return session.DispatchReply{}, releaseErr
+				}
+			case errors.Is(getErr, nodectl.ErrPreparedAdmissionConflict):
+				return session.DispatchReply{Outcome: clusterstate.DispatchConflict, Reason: getErr.Error()}, nil
+			case getErr != nil && !errors.Is(getErr, nodectl.ErrPreparedAdmissionMissing):
+				return session.DispatchReply{}, getErr
+			}
+		}
+		return session.DispatchReply{Outcome: clusterstate.DispatchConflict, Reason: "object ID already exists on node"}, nil
+	}
+
+	var record *WorkflowRecord
+	switch dispatch.Kind {
+	case clusterstate.ExecutionKindSandbox:
+		demand, err := a.sandboxDemand(dispatch)
+		if err != nil {
+			return session.DispatchReply{}, err
+		}
+		prepared, err := a.sandbox.PrepareAdmission(dispatch.ObjectID, dispatch.DemandDigest, demand)
+		if err != nil {
+			if errors.Is(err, nodectl.ErrPreparedAdmissionConflict) {
+				return session.DispatchReply{Outcome: clusterstate.DispatchConflict, Reason: err.Error()}, nil
+			}
+			return session.DispatchReply{}, err
+		}
+		decision, err := sandboxDecision(prepared)
+		if err != nil {
+			return session.DispatchReply{}, err
+		}
+		record, err = a.journal.RecordSandboxWorkflow(ctx, dispatch, decision)
+		if err != nil {
+			if errors.Is(err, ErrWorkflowConflict) {
+				if decision.ReservationToken != "" {
+					if _, releaseErr := a.sandbox.ReleaseAdmission(dispatch.ObjectID, dispatch.DemandDigest, "object_id_conflict"); releaseErr != nil {
+						return session.DispatchReply{}, errors.Join(err, releaseErr)
+					}
+				}
+				return session.DispatchReply{Outcome: clusterstate.DispatchConflict, Reason: err.Error()}, nil
+			}
+			return session.DispatchReply{}, err
+		}
+	case clusterstate.ExecutionKindBuild:
+		build, err := a.buildObject(dispatch)
+		if err != nil {
+			return session.DispatchReply{}, err
+		}
+		capacity, safetyReason, err := a.buildCapacity(ctx)
+		if err != nil {
+			return session.DispatchReply{}, err
+		}
+		record, err = a.journal.PrepareBuildWorkflow(ctx, dispatch, build, capacity, safetyReason)
+		if err != nil {
+			if errors.Is(err, ErrWorkflowConflict) {
+				return session.DispatchReply{Outcome: clusterstate.DispatchConflict, Reason: err.Error()}, nil
+			}
+			return session.DispatchReply{}, err
+		}
+	default:
+		return session.DispatchReply{}, errors.New("nodeexec: unsupported execution kind")
+	}
+	if record.AdmissionState == AdmissionAdmitted {
+		a.notifyWork()
+	}
+	return session.DispatchReply{Outcome: record.Result, Reason: record.Reason}, nil
+}
+
+func sandboxDecision(prepared nodectl.PreparedAdmissionResult) (AdmissionDecision, error) {
+	decision := AdmissionDecision{ReservationToken: prepared.ReservationToken, Reason: prepared.Reason}
+	switch prepared.State {
+	case nodectl.PreparedAdmitted, nodectl.PreparedClaimed:
+		decision.State = AdmissionAdmitted
+		decision.Result = clusterstate.DispatchAcceptedAdmitted
+		decision.Reason = ""
+	case nodectl.PreparedQueued:
+		decision.State = AdmissionQueued
+		decision.Result = clusterstate.DispatchAcceptedQueued
+		decision.Reason = ""
+	case nodectl.PreparedRejected, nodectl.PreparedReleased:
+		decision.State = AdmissionRejected
+		decision.Result = clusterstate.DispatchDefinitiveReject
+		decision.ReservationToken = ""
+		if decision.Reason == "" {
+			decision.Reason = "resource_admission_rejected"
+		}
+	default:
+		return AdmissionDecision{}, fmt.Errorf("nodeexec: unknown Sandbox Admission state %q", prepared.State)
+	}
+	if err := decision.Validate(); err != nil {
+		return AdmissionDecision{}, err
+	}
+	return decision, nil
+}
+
+// PromoteSandboxQueue reconciles durable resource-controller queue changes into
+// the command journal. An expired accepted queue entry becomes an ERROR fact,
+// never a second placement opportunity.
+func (a *Authority) PromoteSandboxQueue(ctx context.Context) error {
+	changed, err := a.sandbox.PromoteQueued()
+	if err != nil {
+		return err
+	}
+	var joined error
+	for _, result := range changed {
+		record, getErr := a.journal.GetNodeWorkflow(ctx, clusterstate.ExecutionKindSandbox, result.SandboxID)
+		if getErr != nil {
+			joined = errors.Join(joined, getErr)
+			continue
+		}
+		if record == nil || record.DemandDigest != result.DemandDigest {
+			joined = errors.Join(joined, fmt.Errorf("nodeexec: queued Sandbox %s has no matching journal", result.SandboxID))
+			continue
+		}
+		switch result.State {
+		case nodectl.PreparedAdmitted:
+			if _, err := a.journal.AdmitQueuedSandbox(ctx, result.SandboxID, result.DemandDigest, result.ReservationToken); err != nil {
+				joined = errors.Join(joined, err)
+				continue
+			}
+			a.notifyWork()
+		case nodectl.PreparedRejected:
+			reason := result.Reason
+			if reason == "" {
+				reason = "resource_admission_rejected"
+			}
+			if _, err := a.journal.FailPendingNodeWorkflow(ctx, clusterstate.ExecutionKindSandbox,
+				result.SandboxID, result.DemandDigest, reason); err != nil {
+				joined = errors.Join(joined, err)
+			}
+		}
+	}
+	return joined
+}
+
+// ReconcileSandboxAdmissions repairs every cross-file crash boundary without
+// creating a new Admission record. Missing controller state for active work is
+// an error and must fail cluster startup for the current NodeEpoch.
+func (a *Authority) ReconcileSandboxAdmissions(ctx context.Context, limit int) error {
+	identity, err := a.identity(ctx)
+	if err != nil {
+		return err
+	}
+	if err := identity.Validate(); err != nil {
+		return err
+	}
+	if limit <= 0 {
+		limit = 256
+	}
+	var joined error
+	afterObjectID := ""
+	for {
+		records, err := a.journal.SandboxWorkflowsForReconcile(
+			ctx, identity.NodeID, identity.NodeEpoch, afterObjectID, limit)
+		if err != nil {
+			return errors.Join(joined, err)
+		}
+		for _, record := range records {
+			if record.AdmissionState == AdmissionTerminal && !record.ResourceClaimed {
+				continue
+			}
+			prepared, getErr := a.sandbox.GetAdmission(record.ObjectID, record.DemandDigest)
+			if getErr != nil {
+				joined = errors.Join(joined, fmt.Errorf("nodeexec: reconcile Sandbox %s: %w", record.ObjectID, getErr))
+				continue
+			}
+			switch record.AdmissionState {
+			case AdmissionQueued:
+				switch prepared.State {
+				case nodectl.PreparedQueued:
+				case nodectl.PreparedAdmitted:
+					if _, err := a.journal.AdmitQueuedSandbox(ctx, record.ObjectID, record.DemandDigest, prepared.ReservationToken); err != nil {
+						joined = errors.Join(joined, err)
+					} else {
+						a.notifyWork()
+					}
+				case nodectl.PreparedRejected, nodectl.PreparedReleased:
+					joined = errors.Join(joined, a.reconcileSandboxFailure(ctx, record, prepared))
+				default:
+					joined = errors.Join(joined, fmt.Errorf("nodeexec: queued Sandbox %s has controller state %s", record.ObjectID, prepared.State))
+				}
+			case AdmissionAdmitted:
+				switch prepared.State {
+				case nodectl.PreparedAdmitted:
+					a.notifyWork()
+				case nodectl.PreparedClaimed:
+					if _, err := a.journal.ClaimSandboxWorkflow(ctx, record.ObjectID, record.DemandDigest, record.ReservationToken); err != nil {
+						joined = errors.Join(joined, err)
+					} else {
+						a.notifyWork()
+					}
+				case nodectl.PreparedRejected, nodectl.PreparedReleased:
+					joined = errors.Join(joined, a.reconcileSandboxFailure(ctx, record, prepared))
+				default:
+					joined = errors.Join(joined, fmt.Errorf("nodeexec: admitted Sandbox %s has controller state %s", record.ObjectID, prepared.State))
+				}
+			case AdmissionLaunching:
+				if prepared.State == nodectl.PreparedClaimed {
+					a.notifyWork()
+				} else {
+					joined = errors.Join(joined, fmt.Errorf("nodeexec: launching Sandbox %s has controller state %s", record.ObjectID, prepared.State))
+				}
+			case AdmissionRunning:
+				if prepared.State != nodectl.PreparedClaimed {
+					joined = errors.Join(joined, fmt.Errorf("nodeexec: running Sandbox %s has controller state %s", record.ObjectID, prepared.State))
+				}
+			case AdmissionTerminal:
+				if record.ResourceClaimed {
+					if prepared.State != nodectl.PreparedReleased {
+						reason := record.Reason
+						if record.LatestEvent != nil && record.LatestEvent.Reason != "" {
+							reason = record.LatestEvent.Reason
+						}
+						if _, err := a.sandbox.ReleaseAdmission(record.ObjectID, record.DemandDigest, reason); err != nil {
+							joined = errors.Join(joined, err)
+							continue
+						}
+					}
+					if _, err := a.journal.ReleaseSandboxWorkflow(ctx, record.ObjectID, record.DemandDigest, record.ReservationToken); err != nil {
+						joined = errors.Join(joined, err)
+					}
+				}
+			}
+		}
+		if len(records) < limit {
+			break
+		}
+		afterObjectID = records[len(records)-1].ObjectID
+	}
+	return joined
+}
+
+func (a *Authority) reconcileSandboxFailure(
+	ctx context.Context,
+	record *WorkflowRecord,
+	prepared nodectl.PreparedAdmissionResult,
+) error {
+	reason := prepared.Reason
+	if reason == "" {
+		reason = "resource_admission_released"
+	}
+	failed, err := a.journal.FailPendingNodeWorkflow(ctx, record.Kind, record.ObjectID, record.DemandDigest, reason)
+	if err != nil {
+		return err
+	}
+	if failed.ResourceClaimed {
+		_, err = a.journal.ReleaseSandboxWorkflow(ctx, failed.ObjectID, failed.DemandDigest, failed.ReservationToken)
+	}
+	return err
+}
+
+func (a *Authority) PromoteBuildQueue(ctx context.Context) ([]*WorkflowRecord, error) {
+	capacity, _, err := a.buildCapacity(ctx)
+	if err != nil {
+		return nil, err
+	}
+	promoted, err := a.journal.PromoteBuildQueue(ctx, capacity, a.buildBatchSize)
+	if err == nil && len(promoted) > 0 {
+		a.notifyWork()
+	}
+	return promoted, err
+}
+
+func (a *Authority) Launchable(
+	ctx context.Context,
+	kind clusterstate.ExecutionKind,
+	afterObjectID string,
+	limit int,
+) ([]*WorkflowRecord, error) {
+	identity, err := a.identity(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if err := identity.Validate(); err != nil {
+		return nil, err
+	}
+	return a.journal.LaunchableNodeWorkflows(ctx, kind, identity.NodeID, identity.NodeEpoch, afterObjectID, limit)
+}
+
+func (a *Authority) ClaimSandbox(ctx context.Context, record *WorkflowRecord) (*WorkflowRecord, error) {
+	if record == nil || record.Kind != clusterstate.ExecutionKindSandbox {
+		return nil, errors.New("nodeexec: Sandbox claim requires a Sandbox workflow")
+	}
+	claimed, err := a.sandbox.ClaimAdmission(record.ObjectID, record.DemandDigest)
+	if err != nil {
+		return nil, err
+	}
+	if claimed.State != nodectl.PreparedClaimed || claimed.ReservationToken != record.ReservationToken {
+		return nil, errors.New("nodeexec: resource controller did not claim the journaled reservation")
+	}
+	return a.journal.ClaimSandboxWorkflow(ctx, record.ObjectID, record.DemandDigest, record.ReservationToken)
+}
+
+func (a *Authority) ClaimBuild(ctx context.Context, record *WorkflowRecord) (*WorkflowRecord, error) {
+	if record == nil || record.Kind != clusterstate.ExecutionKindBuild {
+		return nil, errors.New("nodeexec: Build claim requires a Build workflow")
+	}
+	return a.journal.ClaimBuildWorkflow(ctx, record.ObjectID, record.DemandDigest)
+}
+
+func (a *Authority) FailSandbox(ctx context.Context, record *WorkflowRecord, reason string) error {
+	if record == nil || record.Kind != clusterstate.ExecutionKindSandbox || reason == "" {
+		return errors.New("nodeexec: Sandbox failure requires a workflow and reason")
+	}
+	if _, err := a.journal.FailPendingNodeWorkflow(ctx, record.Kind, record.ObjectID, record.DemandDigest, reason); err != nil {
+		return err
+	}
+	if _, err := a.sandbox.ReleaseAdmission(record.ObjectID, record.DemandDigest, reason); err != nil {
+		return err
+	}
+	_, err := a.journal.ReleaseSandboxWorkflow(ctx, record.ObjectID, record.DemandDigest, record.ReservationToken)
+	return err
+}
+
+func (a *Authority) FinalizeWorkflow(
+	ctx context.Context,
+	kind clusterstate.ExecutionKind,
+	objectID, demandDigest, bindingDigest string,
+) error {
+	if objectID == "" || demandDigest == "" || bindingDigest == "" {
+		return errors.New("nodeexec: finalization requires object identity and digests")
+	}
+	record, err := a.journal.GetNodeWorkflow(ctx, kind, objectID)
+	if err != nil {
+		return err
+	}
+	if record != nil && record.DemandDigest != demandDigest {
+		return ErrWorkflowConflict
+	}
+	if err := a.journal.FinalizeNodeWorkflow(ctx, kind, objectID, bindingDigest); err != nil {
+		return err
+	}
+	if kind == clusterstate.ExecutionKindSandbox {
+		return a.sandbox.FinalizeAdmission(objectID, demandDigest)
+	}
+	return nil
+}
