@@ -25,6 +25,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/apikey"
+	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/keys"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
@@ -124,7 +125,7 @@ func (o *Orchestrator) mintSandboxToken(sb *types.Sandbox, ref string) (string, 
 	rawMK, _ := hex.DecodeString(sb.ManifestKey)
 	b, err := json.Marshal(SandboxToken{
 		V: sandboxTokenVersion, TemplateID: sb.TemplateID, SnapshotRef: ref,
-		Profile: string(tmpl.Profile), Env: sb.Env, Metadata: sb.Metadata,
+		Profile: string(tmpl.Profile), Env: sb.Env, Metadata: clusterstate.WithoutSystemMetadata(sb.Metadata),
 		DeadlineUnix:  sb.DeadlineUnix,
 		MKFingerprint: hex.EncodeToString(apikey.Fingerprint(rawMK)), RuntimeDigest: dig,
 	})
@@ -202,7 +203,7 @@ func (o *Orchestrator) importSandboxWithKey(ctx context.Context, mk, token strin
 		RunDir: o.cfg.Paths.RunRoot + "/" + sid, BaseDir: o.cfg.Paths.BaseRoot + "/" + sid,
 		ManifestKey: mk, SnapshotRef: tok.SnapshotRef,
 		EnvdAccessToken: envdToken, TrafficAccessToken: trafficToken,
-		Metadata: tok.Metadata, Env: tok.Env,
+		Metadata: clusterstate.WithoutSystemMetadata(tok.Metadata), Env: tok.Env,
 	}
 	if types.Profile(tok.Profile) == types.ProfileE2B {
 		sb.EnvdUDS = sb.RunDir + "/envd.sock"

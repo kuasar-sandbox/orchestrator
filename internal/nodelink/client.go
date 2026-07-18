@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"net/url"
@@ -49,6 +50,13 @@ type nodeLinkObserver interface {
 	NodeLinkRedirect(target routesync.NodeLinkTarget)
 }
 
+// SessionSequencer durably advances SessionSeq before every connection attempt.
+// Implementations must fail closed rather than reuse a tuple after persistence
+// ambiguity.
+type SessionSequencer interface {
+	NextSession(ctx context.Context) (routesync.SessionTuple, error)
+}
+
 // Client is a node's node-link client: it dials the registry, registers the
 // node's identity, then streams its sandbox routes while executing registry
 // commands, reconnecting with capped backoff.
@@ -58,10 +66,17 @@ type Client struct {
 	endpoint      string
 	allowRedirect bool
 	identity      routesync.NodeRegister
+	sequencer     SessionSequencer
 	node          Node
 	heartbeat     time.Duration
 	tlsConfig     *tls.Config // non-nil = dial the registry over (m)TLS instead of h2c
 	log           *slog.Logger
+}
+
+// SetSessionSequencer installs the durable tuple source used by final cluster
+// mode. It must be configured before Run starts.
+func (c *Client) SetSessionSequencer(sequencer SessionSequencer) {
+	c.sequencer = sequencer
 }
 
 // New builds a Client. dial returns a fresh connection to the registry's
@@ -132,7 +147,7 @@ func (c *Client) Run(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(backoff):
+		case <-time.After(fullJitter(backoff)):
 		}
 		backoff = min(backoff*2, 5*time.Second)
 	}
@@ -143,6 +158,15 @@ func (c *Client) Run(ctx context.Context) {
 // body = Hello then commands), full-duplex over h2c. The node is the authority,
 // so it WRITES routes and READS commands (the inverse of a proxy subscriber).
 func (c *Client) session(ctx context.Context, endpoint string) error {
+	identity := c.identity
+	if c.sequencer != nil {
+		tuple, err := c.sequencer.NextSession(ctx)
+		if err != nil {
+			return fmt.Errorf("node-link: persist session tuple: %w", err)
+		}
+		identity.NodeEpoch = tuple.NodeEpoch
+		identity.SessionSeq = tuple.SessionSeq
+	}
 	sctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	tr, scheme, host, err := c.transport(endpoint)
@@ -162,7 +186,7 @@ func (c *Client) session(ctx context.Context, endpoint string) error {
 	// request body; it returns once the registry has read it and replied.
 	regErr := make(chan error, 1)
 	go func() {
-		regErr <- routesync.WriteMsg(pw, &routesync.Msg{Type: routesync.TypeNodeRegister, NodeReg: &c.identity})
+		regErr <- routesync.WriteMsg(pw, &routesync.Msg{Type: routesync.TypeNodeRegister, NodeReg: &identity})
 	}()
 
 	resp, err := tr.RoundTrip(req)
@@ -200,6 +224,16 @@ func (c *Client) session(ctx context.Context, endpoint string) error {
 	go runNodeLinkOutbox(sctx, outbox, highOut, hbUpdate, &hbMu, &latestHeartbeat)
 	onUp := func(uctx context.Context, m *routesync.Msg) {
 		if m.Type == routesync.TypeCommand && m.Cmd != nil {
+			if !commandMatchesSession(m.Cmd, identity) {
+				select {
+				case highOut <- &routesync.Msg{Type: routesync.TypeCmdAck, Ack: &routesync.CmdAck{
+					CmdID: m.Cmd.CmdID, Status: routesync.AckRejected,
+					Outcome: routesync.DispatchSessionMoved, Reason: "command session tuple is stale",
+				}}:
+				case <-uctx.Done():
+				}
+				return
+			}
 			if ack := c.node.HandleCommand(uctx, m.Cmd); ack != nil {
 				select {
 				case highOut <- &routesync.Msg{Type: routesync.TypeCmdAck, Ack: ack}:
@@ -257,6 +291,24 @@ func (c *Client) session(ctx context.Context, endpoint string) error {
 	}()
 	routesync.StreamAuthority(sctx, pw, func() {}, resp.Body, c.node, reg, onUp, outbox, c.log)
 	return sctx.Err()
+}
+
+func commandMatchesSession(cmd *routesync.Command, identity routesync.NodeRegister) bool {
+	if cmd == nil {
+		return false
+	}
+	if cmd.NodeEpoch == 0 && cmd.SessionSeq == 0 {
+		return true
+	}
+	return cmd.NodeEpoch != 0 && cmd.SessionSeq != 0 &&
+		cmd.NodeEpoch == identity.NodeEpoch && cmd.SessionSeq == identity.SessionSeq
+}
+
+func fullJitter(max time.Duration) time.Duration {
+	if max <= 0 {
+		return 0
+	}
+	return time.Duration(rand.Int64N(int64(max) + 1))
 }
 
 func runNodeLinkOutbox(

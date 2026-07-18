@@ -320,9 +320,9 @@ func (n *redirectNodeStub) Heartbeat() *routesync.Heartbeat {
 	return &routesync.Heartbeat{Counts: len(n.routes)}
 }
 
-func (n *redirectNodeStub) BuildEvents() <-chan *routesync.BuildEvent { return nil }
-func (n *redirectNodeStub) OnWake(ctx context.Context, sid string)    {}
-func (n *redirectNodeStub) Policy() routesync.Policy                  { return routesync.Policy{} }
+func (n *redirectNodeStub) BuildEvents() <-chan *routesync.BuildEvent            { return nil }
+func (n *redirectNodeStub) OnWake(ctx context.Context, wake routesync.RouteWake) {}
+func (n *redirectNodeStub) Policy() routesync.Policy                             { return routesync.Policy{} }
 
 func (n *redirectNodeStub) publish(route routesync.RouteEntry) {
 	n.mu.Lock()

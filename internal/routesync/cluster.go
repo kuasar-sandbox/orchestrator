@@ -13,11 +13,17 @@ const (
 	TypeHeartbeat    = "heartbeat"     // node -> registry (water level)
 	TypeCommand      = "command"       // registry -> node (lifecycle / key primitive)
 	TypeCmdAck       = "cmd_ack"       // node -> registry (command accepted / rejected)
+	TypeEventAck     = "event_ack"     // registry -> node (committed event watermark)
 )
 
 // NodeLinkPath is the HTTP path node-ctl conductor serve dials to open its node_link
 // channel to the registry.
 const NodeLinkPath = "/node-link/session"
+
+type SessionTuple struct {
+	NodeEpoch  uint64
+	SessionSeq uint64
+}
 
 // PlaceReq is a registry placement request to the placer.
 // TargetRuntimeDigest lets the placer require a matching guest runtime; empty
@@ -77,6 +83,13 @@ const (
 	CmdKeyPut        = "key_put"        // install / renew a manifest-key lease (heartbeat refresh; cluster.md)
 	CmdKeyDrop       = "key_drop"       // drop a key lease
 	CmdBuildRegister = "build_register" // pre-provision a build on the node (registry-assigned ids, §7.5)
+
+	CmdSandboxAdmitDispatch = "sandbox_admit_dispatch"
+	CmdBuildAdmitDispatch   = "build_admit_dispatch"
+	CmdSandboxResume        = "sandbox_resume"
+	CmdSandboxDelete        = "sandbox_delete"
+	CmdRebindExecution      = "rebind_execution"
+	CmdFinalizeWorkflow     = "finalize_workflow"
 )
 
 // TypeBuildEvent: node -> registry, a build's state transition (cluster.md);
@@ -87,29 +100,50 @@ const TypeBuildEvent = "build_event"
 // BuildEvent reports a build's state up the node-link (§5.1). The node-link
 // owner resolves cluster identity from its per-node build table.
 type BuildEvent struct {
-	BuildID    string `json:"build_id"`
-	State      string `json:"state"`
-	TemplateID string `json:"template_id,omitempty"`
-	Reason     string `json:"reason,omitempty"`
+	BuildID           string `json:"build_id"`
+	NodeEpoch         uint64 `json:"node_epoch,omitempty"`
+	EventSeq          uint64 `json:"event_seq,omitempty"`
+	StorageGeneration string `json:"storage_generation,omitempty"`
+	BindingDigest     string `json:"binding_digest,omitempty"`
+	State             string `json:"state"`
+	TemplateID        string `json:"template_id,omitempty"`
+	Reason            string `json:"reason,omitempty"`
+}
+
+type EventAck struct {
+	ObjectKind string `json:"object_kind"` // sandbox | build
+	ObjectID   string `json:"object_id"`
+	EventSeq   uint64 `json:"event_seq"`
 }
 
 // CmdAck statuses.
 const (
 	AckAccepted = "accepted"
 	AckRejected = "rejected"
+
+	DispatchAcceptedAdmitted = "ACCEPTED_ADMITTED"
+	DispatchAcceptedQueued   = "ACCEPTED_QUEUED"
+	DispatchDefinitiveReject = "DEFINITIVE_REJECT"
+	DispatchSessionMoved     = "SESSION_MOVED"
+	DispatchConflict         = "CONFLICT"
+	DispatchWrongBinding     = "WRONG_BINDING"
+	DispatchUnknown          = "UNKNOWN"
 )
 
 // NodeRegister is the node's first up-frame on node-link: its identity + capacity,
 // so the registry can place sandboxes (and later builds) on it and forward the
 // data plane to it (cluster.md / §6.1).
 type NodeRegister struct {
-	NodeID         string            `json:"node_id"`
-	Labels         map[string]string `json:"labels,omitempty"`          // zone / pool / slot / node (nodeSelectors)
-	Capacity       int               `json:"capacity,omitempty"`        // max sandboxes (headroom signal)
-	BuildCapacity  *BuildResources   `json:"build_capacity,omitempty"`  // CPU/mem/storage build pool (§7.5)
-	DataEndpoint   string            `json:"data_endpoint,omitempty"`   // host:port the router forwards data-plane to
-	RuntimeDigest  string            `json:"runtime_digest,omitempty"`  // guest runtime identity
-	AcceptRedirect bool              `json:"accept_redirect,omitempty"` // node can reconnect to owner endpoints from Hello.Redirect
+	NodeID           string            `json:"node_id"`
+	NodeEpoch        uint64            `json:"node_epoch,omitempty"`
+	SessionSeq       uint64            `json:"session_seq,omitempty"`
+	LoadModelVersion uint16            `json:"load_model_version,omitempty"`
+	Labels           map[string]string `json:"labels,omitempty"`          // zone / pool / slot / node (nodeSelectors)
+	Capacity         int               `json:"capacity,omitempty"`        // max sandboxes (headroom signal)
+	BuildCapacity    *BuildResources   `json:"build_capacity,omitempty"`  // CPU/mem/storage build pool (§7.5)
+	DataEndpoint     string            `json:"data_endpoint,omitempty"`   // host:port the router forwards data-plane to
+	RuntimeDigest    string            `json:"runtime_digest,omitempty"`  // guest runtime identity
+	AcceptRedirect   bool              `json:"accept_redirect,omitempty"` // node can reconnect to owner endpoints from Hello.Redirect
 }
 
 type NodeLinkRedirect struct {
@@ -145,9 +179,17 @@ type Heartbeat struct {
 // and reports the terminal sandbox state via the route stream; commands are
 // idempotent by SID. Fields are populated per Kind.
 type Command struct {
-	CmdID string `json:"cmd_id"`
-	Kind  string `json:"kind"` // CmdCreate | CmdConnect | CmdDelete | CmdKey* | CmdBuildRegister
-	SID   string `json:"sid,omitempty"`
+	CmdID              string `json:"cmd_id"`
+	Kind               string `json:"kind"` // CmdCreate | CmdConnect | CmdDelete | CmdKey* | CmdBuildRegister
+	SID                string `json:"sid,omitempty"`
+	NodeEpoch          uint64 `json:"node_epoch,omitempty"`
+	SessionSeq         uint64 `json:"session_seq,omitempty"`
+	StorageGeneration  string `json:"storage_generation,omitempty"`
+	Binding            string `json:"binding,omitempty"`
+	BindingDigest      string `json:"binding_digest,omitempty"`
+	OldBindingDigest   string `json:"old_binding_digest,omitempty"`
+	DemandDigest       string `json:"demand_digest,omitempty"`
+	DispatchSpecDigest string `json:"dispatch_spec_digest,omitempty"`
 	// create
 	TemplateRef    string            `json:"template_ref,omitempty"` // snapshot template ref (cold start = fast restore)
 	KeyFingerprint string            `json:"key_fp,omitempty"`       // manifest-key fingerprint the node must already hold
@@ -171,7 +213,8 @@ type Command struct {
 // CmdAck acknowledges a Command's receipt; the terminal outcome arrives via the
 // route stream, not here.
 type CmdAck struct {
-	CmdID  string `json:"cmd_id"`
-	Status string `json:"status"` // AckAccepted | AckRejected
-	Reason string `json:"reason,omitempty"`
+	CmdID   string `json:"cmd_id"`
+	Status  string `json:"status"` // AckAccepted | AckRejected
+	Outcome string `json:"outcome,omitempty"`
+	Reason  string `json:"reason,omitempty"`
 }

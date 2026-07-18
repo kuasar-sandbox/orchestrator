@@ -29,10 +29,13 @@ import (
 type Kind int
 
 const (
-	KindNotFound Kind = iota // unknown sandbox -> 404
-	KindDeny                 // e.g. bare data-plane port -> 501
-	KindUDS                  // dial unix socket (e2b control: --connect)
-	KindTCP                  // dial floatingip:port
+	KindNotFound       Kind = iota // unknown sandbox -> 404
+	KindDeny                       // e.g. bare data-plane port -> 501
+	KindUDS                        // dial unix socket (e2b control: --connect)
+	KindTCP                        // dial floatingip:port
+	KindWrongNodeEpoch             // expected node identity/epoch is stale
+	KindWrongBinding               // expected storage generation/Binding is stale
+	KindRouteInactive              // exact execution exists but cannot currently serve
 )
 
 type Route struct {
@@ -43,24 +46,74 @@ type Route struct {
 }
 
 const (
-	HeaderSandboxID   = "E2b-Sandbox-Id"
-	HeaderSandboxPort = "E2b-Sandbox-Port"
-	HeaderAccessToken = "X-Access-Token"
-	HeaderProxyError  = "X-Kuasar-Proxy-Error"
+	HeaderSandboxID         = "E2b-Sandbox-Id"
+	HeaderSandboxPort       = "E2b-Sandbox-Port"
+	HeaderAccessToken       = "X-Access-Token"
+	HeaderProxyError        = "X-Kuasar-Proxy-Error"
+	HeaderNodeID            = "X-Kuasar-Node-Id"
+	HeaderNodeEpoch         = "X-Kuasar-Node-Epoch"
+	HeaderStorageGeneration = "X-Kuasar-Storage-Generation"
+	HeaderBindingDigest     = "X-Kuasar-Binding-Digest"
 
-	ProxyErrorBadRequest    = "bad_request"
-	ProxyErrorRouteError    = "route_error"
-	ProxyErrorNotFound      = "not_found"
-	ProxyErrorDenied        = "denied"
-	ProxyErrorUnauthorized  = "unauthorized"
-	ProxyErrorUpstreamError = "upstream_error"
+	ProxyErrorBadRequest     = "bad_request"
+	ProxyErrorRouteError     = "route_error"
+	ProxyErrorNotFound       = "not_found"
+	ProxyErrorDenied         = "denied"
+	ProxyErrorUnauthorized   = "unauthorized"
+	ProxyErrorUpstreamError  = "upstream_error"
+	ProxyErrorWrongNodeEpoch = "wrong_node_epoch"
+	ProxyErrorWrongBinding   = "wrong_binding"
+	ProxyErrorRouteInactive  = "route_inactive"
 )
+
+type RouteRequest struct {
+	SandboxID                 string
+	Port                      int
+	ExpectedNodeID            string
+	ExpectedNodeEpoch         uint64
+	ExpectedStorageGeneration string
+	ExpectedBindingDigest     string
+}
+
+func (r RouteRequest) HasExecutionFence() bool {
+	return r.ExpectedNodeID != "" || r.ExpectedNodeEpoch != 0 ||
+		r.ExpectedStorageGeneration != "" || r.ExpectedBindingDigest != ""
+}
 
 // Router resolves a (sandboxID, port) to a Route. It may block to auto-resume a
 // paused sandbox (internal) or park awaiting a route push (external), returning
 // KindUDS/KindTCP once up, or KindNotFound if it never came up.
 type Router interface {
-	Route(ctx context.Context, sandboxID string, port int) (Route, error)
+	Route(ctx context.Context, request RouteRequest) (Route, error)
+}
+
+// RouteFenceFailure validates a Router's expected execution against the node's
+// protected current projection. managed reports whether the local object has a
+// system-owned ExecutionBinding. Validation happens before wake/resume/dial.
+func RouteFenceFailure(
+	request RouteRequest,
+	managed bool,
+	nodeID string,
+	nodeEpoch uint64,
+	storageGeneration, bindingDigest string,
+) (Kind, bool) {
+	if !managed {
+		if request.HasExecutionFence() {
+			return KindWrongBinding, true
+		}
+		return 0, false
+	}
+	if request.ExpectedNodeID == "" || request.ExpectedNodeEpoch == 0 ||
+		request.ExpectedStorageGeneration == "" || request.ExpectedBindingDigest == "" {
+		return KindWrongBinding, true
+	}
+	if request.ExpectedNodeID != nodeID || request.ExpectedNodeEpoch != nodeEpoch {
+		return KindWrongNodeEpoch, true
+	}
+	if request.ExpectedStorageGeneration != storageGeneration || request.ExpectedBindingDigest != bindingDigest {
+		return KindWrongBinding, true
+	}
+	return 0, false
 }
 
 // Counter is the narrow metrics surface the proxy needs.
@@ -133,7 +186,13 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeProxyError(w, http.StatusBadRequest, "bad sandbox host", ProxyErrorBadRequest)
 		return
 	}
-	route, err := p.router.Route(r.Context(), sid, port)
+	request, err := RouteRequestFromHTTP(r, sid, port)
+	if err != nil {
+		p.mx.Inc(`data_requests_total{result="badrequest"}`)
+		writeProxyError(w, http.StatusBadRequest, err.Error(), ProxyErrorBadRequest)
+		return
+	}
+	route, err := p.router.Route(r.Context(), request)
 	if err != nil {
 		p.mx.Inc(`data_requests_total{result="route_error"}`)
 		writeProxyError(w, http.StatusBadGateway, "routing error", ProxyErrorRouteError)
@@ -146,6 +205,15 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case KindDeny:
 		p.mx.Inc(`data_requests_total{result="denied"}`)
 		writeProxyError(w, http.StatusNotImplemented, "data plane not available on this sandbox", ProxyErrorDenied)
+	case KindWrongNodeEpoch:
+		p.mx.Inc(`data_requests_total{result="wrong_node_epoch"}`)
+		writeProxyError(w, http.StatusConflict, "wrong node epoch", ProxyErrorWrongNodeEpoch)
+	case KindWrongBinding:
+		p.mx.Inc(`data_requests_total{result="wrong_binding"}`)
+		writeProxyError(w, http.StatusConflict, "wrong execution binding", ProxyErrorWrongBinding)
+	case KindRouteInactive:
+		p.mx.Inc(`data_requests_total{result="route_inactive"}`)
+		writeProxyError(w, http.StatusConflict, "route inactive", ProxyErrorRouteInactive)
 	case KindUDS, KindTCP:
 		if !p.authorized(r, route, port) {
 			p.mx.Inc(`data_requests_total{result="unauthorized"}`)
@@ -172,6 +240,25 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		p.mx.Inc(`data_requests_total{result="route_error"}`)
 		writeProxyError(w, http.StatusBadGateway, "routing error", ProxyErrorRouteError)
 	}
+}
+
+func RouteRequestFromHTTP(r *http.Request, sid string, port int) (RouteRequest, error) {
+	request := RouteRequest{SandboxID: sid, Port: port}
+	request.ExpectedNodeID = strings.TrimSpace(r.Header.Get(HeaderNodeID))
+	request.ExpectedStorageGeneration = strings.TrimSpace(r.Header.Get(HeaderStorageGeneration))
+	request.ExpectedBindingDigest = strings.TrimSpace(r.Header.Get(HeaderBindingDigest))
+	if raw := strings.TrimSpace(r.Header.Get(HeaderNodeEpoch)); raw != "" {
+		epoch, err := strconv.ParseUint(raw, 10, 64)
+		if err != nil || epoch == 0 {
+			return RouteRequest{}, fmt.Errorf("bad node epoch")
+		}
+		request.ExpectedNodeEpoch = epoch
+	}
+	if request.HasExecutionFence() && (request.ExpectedNodeID == "" || request.ExpectedNodeEpoch == 0 ||
+		request.ExpectedStorageGeneration == "" || request.ExpectedBindingDigest == "") {
+		return RouteRequest{}, fmt.Errorf("incomplete execution fence")
+	}
+	return request, nil
 }
 
 // ParseSandbox extracts (sid, port) from the Host header <port>-<sid>.<domain>,

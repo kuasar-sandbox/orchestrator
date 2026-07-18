@@ -44,7 +44,13 @@ func (p *Proxy) serveConnect(w http.ResponseWriter, r *http.Request) {
 		writeProxyError(w, http.StatusBadRequest, "bad connect target", ProxyErrorBadRequest)
 		return
 	}
-	route, err := p.router.Route(r.Context(), sid, port)
+	request, err := RouteRequestFromHTTP(r, sid, port)
+	if err != nil {
+		p.mx.Inc(`data_requests_total{result="badrequest"}`)
+		writeProxyError(w, http.StatusBadRequest, err.Error(), ProxyErrorBadRequest)
+		return
+	}
+	route, err := p.router.Route(r.Context(), request)
 	if err != nil {
 		p.mx.Inc(`data_requests_total{result="route_error"}`)
 		writeProxyError(w, http.StatusBadGateway, "routing error", ProxyErrorRouteError)
@@ -58,6 +64,18 @@ func (p *Proxy) serveConnect(w http.ResponseWriter, r *http.Request) {
 	case KindDeny:
 		p.mx.Inc(`data_requests_total{result="denied"}`)
 		writeProxyError(w, http.StatusNotImplemented, "data plane not available on this sandbox", ProxyErrorDenied)
+		return
+	case KindWrongNodeEpoch:
+		p.mx.Inc(`data_requests_total{result="wrong_node_epoch"}`)
+		writeProxyError(w, http.StatusConflict, "wrong node epoch", ProxyErrorWrongNodeEpoch)
+		return
+	case KindWrongBinding:
+		p.mx.Inc(`data_requests_total{result="wrong_binding"}`)
+		writeProxyError(w, http.StatusConflict, "wrong execution binding", ProxyErrorWrongBinding)
+		return
+	case KindRouteInactive:
+		p.mx.Inc(`data_requests_total{result="route_inactive"}`)
+		writeProxyError(w, http.StatusConflict, "route inactive", ProxyErrorRouteInactive)
 		return
 	case KindUDS, KindTCP:
 	default:
@@ -119,16 +137,31 @@ func parseConnect(r *http.Request) (sid string, port int, ok bool) {
 // The CONNECT authority is deliberately generic: sandbox identity and port are
 // carried as explicit headers, so intermediates do not parse route-key or host
 // labels and the backend connection is bound to exactly one sandbox port.
-func WriteSandboxConnect(w io.Writer, sid string, port int, token string) error {
-	if sid == "" || port <= 0 {
+type SandboxConnectRequest struct {
+	RouteRequest
+	AccessToken string
+}
+
+func WriteSandboxConnect(w io.Writer, request SandboxConnectRequest) error {
+	if request.SandboxID == "" || request.Port <= 0 {
 		return fmt.Errorf("proxy: sandbox id and port are required for CONNECT")
 	}
-	target := fmt.Sprintf("sandbox:%d", port)
+	if request.HasExecutionFence() && (request.ExpectedNodeID == "" || request.ExpectedNodeEpoch == 0 ||
+		request.ExpectedStorageGeneration == "" || request.ExpectedBindingDigest == "") {
+		return fmt.Errorf("proxy: incomplete execution fence")
+	}
+	target := fmt.Sprintf("sandbox:%d", request.Port)
 	var b strings.Builder
 	fmt.Fprintf(&b, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n", target, target)
-	fmt.Fprintf(&b, "%s: %s\r\n%s: %d\r\n", HeaderSandboxID, sid, HeaderSandboxPort, port)
-	if token != "" {
-		fmt.Fprintf(&b, "%s: %s\r\n", HeaderAccessToken, token)
+	fmt.Fprintf(&b, "%s: %s\r\n%s: %d\r\n", HeaderSandboxID, request.SandboxID, HeaderSandboxPort, request.Port)
+	if request.AccessToken != "" {
+		fmt.Fprintf(&b, "%s: %s\r\n", HeaderAccessToken, request.AccessToken)
+	}
+	if request.HasExecutionFence() {
+		fmt.Fprintf(&b, "%s: %s\r\n", HeaderNodeID, request.ExpectedNodeID)
+		fmt.Fprintf(&b, "%s: %d\r\n", HeaderNodeEpoch, request.ExpectedNodeEpoch)
+		fmt.Fprintf(&b, "%s: %s\r\n", HeaderStorageGeneration, request.ExpectedStorageGeneration)
+		fmt.Fprintf(&b, "%s: %s\r\n", HeaderBindingDigest, request.ExpectedBindingDigest)
 	}
 	b.WriteString("\r\n")
 	_, err := io.WriteString(w, b.String())
@@ -137,12 +170,12 @@ func WriteSandboxConnect(w io.Writer, sid string, port int, token string) error 
 
 // DialSandboxConnect dials addr and performs WriteSandboxConnect. The caller owns
 // conn and must close it unless it passes the connection to Tunnel/TunnelBuffered.
-func DialSandboxConnect(ctx context.Context, network, addr, sid string, port int, token string) (net.Conn, *bufio.Reader, *http.Response, error) {
+func DialSandboxConnect(ctx context.Context, network, addr string, request SandboxConnectRequest) (net.Conn, *bufio.Reader, *http.Response, error) {
 	conn, err := (&net.Dialer{}).DialContext(ctx, network, addr)
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	if err := WriteSandboxConnect(conn, sid, port, token); err != nil {
+	if err := WriteSandboxConnect(conn, request); err != nil {
 		conn.Close()
 		return nil, nil, nil, err
 	}
@@ -197,6 +230,10 @@ func removeHopHeaders(h http.Header) {
 		"Trailer",
 		"Transfer-Encoding",
 		"Upgrade",
+		HeaderNodeID,
+		HeaderNodeEpoch,
+		HeaderStorageGeneration,
+		HeaderBindingDigest,
 	} {
 		h.Del(k)
 	}

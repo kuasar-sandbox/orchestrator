@@ -14,6 +14,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/apikey"
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/launcher"
+	"github.com/kuasar-sandbox/orchestrator/internal/proxy"
 	"github.com/kuasar-sandbox/orchestrator/internal/secretbox"
 	"github.com/kuasar-sandbox/orchestrator/internal/store"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
@@ -120,7 +121,7 @@ func TestResumeRace_ConnectAndRouteSingleLaunch(t *testing.T) {
 
 	launchG(func() { _, _ = o.Connect(ctx, sid, apiKey, "", 60) })
 	for i := 0; i < 8; i++ {
-		launchG(func() { _, _ = o.Route(ctx, sid, 49983) })
+		launchG(func() { _, _ = o.Route(ctx, proxy.RouteRequest{SandboxID: sid, Port: 49983}) })
 	}
 	for i := 0; i < 4; i++ {
 		launchG(func() { _, _ = o.ByFloatingIP("169.254.1.2"); _, _, _ = o.SandboxInfo(sid) })

@@ -29,6 +29,9 @@ type RouteResolve struct {
 	Group              string `json:"group"`
 	RouteKey           string `json:"route_key"`
 	NodeID             string `json:"node_id"`
+	NodeEpoch          uint64 `json:"node_epoch,omitempty"`
+	StorageGeneration  string `json:"storage_generation,omitempty"`
+	BindingDigest      string `json:"binding_digest,omitempty"`
 	DataEndpoint       string `json:"data_endpoint"`
 	AccessToken        string `json:"access_token"`
 	TrafficAccessToken string `json:"traffic_access_token,omitempty"`
@@ -192,6 +195,7 @@ func (r *Registry) ResolveSID(ctx context.Context, group, routeKey, sid string) 
 	}
 	return &RouteResolve{
 		SID: rec.SID, Group: rec.Group, RouteKey: rec.RouteKey, NodeID: rec.NodeID,
+		NodeEpoch: rec.NodeEpoch, StorageGeneration: rec.StorageGeneration, BindingDigest: rec.BindingDigest,
 		DataEndpoint: r.nodeDataEndpoint(ctx, rec.NodeID), AccessToken: rec.AccessToken,
 		TrafficAccessToken: rec.TrafficAccessToken, TargetPort: rec.TargetPort,
 		State: string(rec.State),

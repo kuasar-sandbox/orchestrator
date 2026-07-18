@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/buildcfg"
+	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
@@ -69,6 +70,25 @@ func TestMergeBuildConfigHeaders(t *testing.T) {
 	}
 	if got[sandboxcfg.NsNetwork] != `{"hostname":"build"}` {
 		t.Fatalf("sandbox build header not normalized: %+v", got)
+	}
+}
+
+func TestSandboxResponsesHideSystemMetadata(t *testing.T) {
+	a := &API{}
+	sb := &types.Sandbox{Metadata: map[string]string{
+		"user": "visible", clusterstate.ObjectMetadataKey: "opaque-binding",
+	}}
+	for name, response := range map[string]map[string]any{
+		"detail": a.sandboxDetail(sb),
+		"list":   a.listed(sb),
+	} {
+		metadata, ok := response["metadata"].(map[string]string)
+		if !ok || metadata["user"] != "visible" {
+			t.Fatalf("%s metadata = %#v", name, response["metadata"])
+		}
+		if _, found := metadata[clusterstate.ObjectMetadataKey]; found {
+			t.Fatalf("%s leaked system-owned metadata", name)
+		}
 	}
 }
 

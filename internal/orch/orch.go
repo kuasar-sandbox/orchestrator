@@ -21,6 +21,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
+	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/orchestrator/internal/filestore"
@@ -163,6 +164,7 @@ func (o *Orchestrator) Create(ctx context.Context, req api.CreateReq) (*types.Sa
 	if tb := o.templateBuild(ctx, req.APIKey, req.TemplateID); tb != nil && len(tb.Metadata) > 0 {
 		meta = sandboxcfg.MergeMetadata(tb.Metadata, req.Metadata)
 	}
+	meta = clusterstate.WithoutSystemMetadata(meta)
 
 	sb := &types.Sandbox{
 		ID:                 sid,
@@ -369,7 +371,11 @@ func (o *Orchestrator) Connect(ctx context.Context, id, apiKey, migrationToken s
 		// collapses to one resume+launch instead of double-allocating the port or
 		// starting the unit twice. resumeIfPaused re-checks "still paused?" inside
 		// the flight, so the losers are no-ops.
-		if err := o.sf.Do(id, func() error { return o.resumeIfPaused(ctx, id) }); err != nil {
+		resumeRequest, err := currentSandboxRouteRequest(sb, 0)
+		if err != nil {
+			return nil, err
+		}
+		if err := o.sf.Do(id, func() error { return o.resumeIfPaused(ctx, id, resumeRequest) }); err != nil {
 			return nil, err
 		}
 		// Re-read the now-running snapshot the flight published; never mutate the
@@ -442,30 +448,41 @@ func (o *Orchestrator) resume(ctx context.Context, sb *types.Sandbox) error {
 // auto-resumed on the spot (single-flight: concurrent data-plane requests collapse
 // to one resume). The forwarding decision is shared with the external route table
 // via proxy.RouteForTarget.
-func (o *Orchestrator) Route(ctx context.Context, sandboxID string, port int) (proxy.Route, error) {
-	sb := o.lookup(sandboxID)
+func (o *Orchestrator) Route(ctx context.Context, request proxy.RouteRequest) (proxy.Route, error) {
+	sb := o.lookup(request.SandboxID)
 	if sb == nil {
-		s, _ := o.st.Get(ctx, sandboxID)
+		s, _ := o.st.Get(ctx, request.SandboxID)
 		if s == nil {
 			return proxy.Route{Kind: proxy.KindNotFound}, nil
 		}
 		sb = s
 		o.cache(sb)
 	}
+	if kind, failed := validateSandboxRouteFence(sb, request); failed {
+		return proxy.Route{Kind: kind}, nil
+	}
 	if sb.State == types.StatePaused { // auto-resume on data-plane traffic
-		if err := o.sf.Do(sandboxID, func() error { return o.resumeIfPaused(ctx, sandboxID) }); err != nil {
+		if err := o.sf.Do(request.SandboxID, func() error {
+			return o.resumeIfPaused(ctx, request.SandboxID, request)
+		}); err != nil {
 			return proxy.Route{}, err
 		}
-		if sb = o.lookup(sandboxID); sb == nil {
+		if sb = o.lookup(request.SandboxID); sb == nil {
 			return proxy.Route{Kind: proxy.KindNotFound}, nil
 		}
+		if kind, failed := validateSandboxRouteFence(sb, request); failed {
+			return proxy.Route{Kind: kind}, nil
+		}
 	}
-	return proxy.RouteForTarget(string(sb.Profile()), sb.EnvdUDS, sb.CiUDS, sb.FloatingIP, sb.EnvdAccessToken, port), nil
+	if sb.State != types.StateRunning {
+		return proxy.Route{Kind: proxy.KindRouteInactive}, nil
+	}
+	return proxy.RouteForTarget(string(sb.Profile()), sb.EnvdUDS, sb.CiUDS, sb.FloatingIP, sb.EnvdAccessToken, request.Port), nil
 }
 
 // resumeIfPaused (run under the per-sid single-flight) resumes sid only if it is
 // still paused — a loser of the race finds it already running and returns.
-func (o *Orchestrator) resumeIfPaused(ctx context.Context, sid string) error {
+func (o *Orchestrator) resumeIfPaused(ctx context.Context, sid string, request proxy.RouteRequest) error {
 	sb := o.lookup(sid)
 	if sb == nil {
 		s, _ := o.st.Get(ctx, sid)
@@ -475,10 +492,61 @@ func (o *Orchestrator) resumeIfPaused(ctx context.Context, sid string) error {
 		o.cache(s)
 		sb = s
 	}
+	if _, failed := validateSandboxRouteFence(sb, request); failed {
+		return nil
+	}
 	if sb.State != types.StatePaused {
 		return nil
 	}
 	return o.resume(ctx, sb)
+}
+
+func validateSandboxRouteFence(sb *types.Sandbox, request proxy.RouteRequest) (proxy.Kind, bool) {
+	managed, nodeID, nodeEpoch, generation, digest, err := sandboxRouteFence(sb)
+	if err != nil {
+		return proxy.KindWrongBinding, true
+	}
+	return proxy.RouteFenceFailure(request, managed, nodeID, nodeEpoch, generation, digest)
+}
+
+func sandboxRouteFence(sb *types.Sandbox) (bool, string, uint64, string, string, error) {
+	if sb == nil {
+		return false, "", 0, "", "", nil
+	}
+	opaque := sb.Metadata[clusterstate.ObjectMetadataKey]
+	if opaque == "" || !strings.HasPrefix(opaque, clusterstate.ExecutionBindingPrefix) {
+		return false, "", 0, "", "", nil
+	}
+	binding, err := clusterstate.DecodeExecutionBinding(opaque)
+	if err != nil {
+		return true, "", 0, "", "", err
+	}
+	if binding.Kind != clusterstate.ExecutionKindSandbox || binding.ObjectID != sb.ID {
+		return true, "", 0, "", "", fmt.Errorf("cluster: execution binding does not identify sandbox %q", sb.ID)
+	}
+	digest, err := clusterstate.ExecutionBindingDigest(opaque)
+	if err != nil {
+		return true, "", 0, "", "", err
+	}
+	return true, binding.NodeID, binding.NodeEpoch, binding.StorageGeneration, digest, nil
+}
+
+func currentSandboxRouteRequest(sb *types.Sandbox, port int) (proxy.RouteRequest, error) {
+	request := proxy.RouteRequest{Port: port}
+	if sb != nil {
+		request.SandboxID = sb.ID
+	}
+	managed, nodeID, nodeEpoch, generation, digest, err := sandboxRouteFence(sb)
+	if err != nil {
+		return proxy.RouteRequest{}, err
+	}
+	if managed {
+		request.ExpectedNodeID = nodeID
+		request.ExpectedNodeEpoch = nodeEpoch
+		request.ExpectedStorageGeneration = generation
+		request.ExpectedBindingDigest = digest
+	}
+	return request, nil
 }
 
 // snapInfo is the config the orchestrator inherits from a restore snapshot: the

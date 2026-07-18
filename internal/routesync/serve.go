@@ -20,9 +20,9 @@ type Source interface {
 	// by the source if it falls behind (the subscriber then reconnects + re-syncs);
 	// cancel unregisters it.
 	Subscribe() (ch <-chan Event, cancel func())
-	// OnWake handles a subscriber's request to resume a sandbox (single-flight; the
-	// resulting Upsert is delivered via Subscribe).
-	OnWake(ctx context.Context, sid string)
+	// OnWake handles a subscriber's request to resume one exact execution. The
+	// source must reject a stale execution fence before any resume work.
+	OnWake(ctx context.Context, wake RouteWake)
 	// Policy is the operational policy pushed to subscribers at handshake.
 	Policy() Policy
 }
@@ -71,10 +71,10 @@ func ServeStream(ctx context.Context, w http.ResponseWriter, body io.Reader, src
 		return
 	}
 	onUp := func(uctx context.Context, m *Msg) {
-		if m.Type == TypeWake && m.SID != "" && reg.handlesWake() {
+		if m.Type == TypeWake && m.Wake != nil && m.Wake.SandboxID != "" && reg.handlesWake() {
 			// A wake's resume can be slow; handle it off the read loop
 			// (single-flight in the source dedupes duplicate sids).
-			go src.OnWake(uctx, m.SID)
+			go src.OnWake(uctx, *m.Wake)
 		}
 	}
 	ServeAuthority(ctx, w, flusher.Flush, body, src, reg, onUp, log)

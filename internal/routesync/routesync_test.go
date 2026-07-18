@@ -41,21 +41,21 @@ func (f *fakeSink) ApplyDelete(sid string)             { f.del <- sid }
 func (f *fakeSink) Bookmark()                          { f.book <- struct{}{} }
 func (f *fakeSink) SetPolicy(p routesync.Policy)       { f.pol <- p }
 
-type fakeWakes struct{ ch chan string }
+type fakeWakes struct{ ch chan routesync.RouteWake }
 
-func (f *fakeWakes) NextWake(ctx context.Context) (string, bool) {
+func (f *fakeWakes) NextWake(ctx context.Context) (routesync.RouteWake, bool) {
 	select {
 	case s := <-f.ch:
 		return s, true
 	case <-ctx.Done():
-		return "", false
+		return routesync.RouteWake{}, false
 	}
 }
 
 // fakeSource is the orchestrator side.
 type fakeSource struct {
 	sub    chan routesync.Event
-	woke   chan string
+	woke   chan routesync.RouteWake
 	pol    routesync.Policy
 	fp     string
 	replay []routesync.Event
@@ -64,10 +64,10 @@ type fakeSource struct {
 func (s *fakeSource) Range(ctx context.Context, fn func(routesync.RouteEntry) error) error {
 	return fn(routesync.RouteEntry{SandboxID: "s1", Profile: "e2b", State: routesync.StateRunning})
 }
-func (s *fakeSource) Subscribe() (<-chan routesync.Event, func()) { return s.sub, func() {} }
-func (s *fakeSource) OnWake(ctx context.Context, sid string)      { s.woke <- sid }
-func (s *fakeSource) Policy() routesync.Policy                    { return s.pol }
-func (s *fakeSource) SourceFingerprint() string                   { return s.fp }
+func (s *fakeSource) Subscribe() (<-chan routesync.Event, func())          { return s.sub, func() {} }
+func (s *fakeSource) OnWake(ctx context.Context, wake routesync.RouteWake) { s.woke <- wake }
+func (s *fakeSource) Policy() routesync.Policy                             { return s.pol }
+func (s *fakeSource) SourceFingerprint() string                            { return s.fp }
 func (s *fakeSource) Replay(ctx context.Context, afterSeq int64, fn func(routesync.Event) error) error {
 	if s.fp == "" {
 		return routesync.ErrResumeUnavailable
@@ -113,7 +113,7 @@ func TestRouteSyncRoundtrip(t *testing.T) {
 	// stream — the config-socket plugin plane, minus auth.
 	src := &fakeSource{
 		sub:  make(chan routesync.Event, 4),
-		woke: make(chan string, 4),
+		woke: make(chan routesync.RouteWake, 4),
 		pol:  routesync.Policy{Domain: "d", AuthMode: "enforce", ParkTimeoutMS: 1234},
 	}
 	httpSrv := &http.Server{Handler: h2c.NewHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -129,7 +129,7 @@ func TestRouteSyncRoundtrip(t *testing.T) {
 
 	// Subscriber side: dial the UDS and register as a proxy (route_wake).
 	sink := newFakeSink()
-	wakes := &fakeWakes{ch: make(chan string, 1)}
+	wakes := &fakeWakes{ch: make(chan routesync.RouteWake, 1)}
 	dial := func(ctx context.Context) (net.Conn, error) {
 		return (&net.Dialer{}).DialContext(ctx, "unix", sock)
 	}
@@ -164,9 +164,10 @@ func TestRouteSyncRoundtrip(t *testing.T) {
 	}
 
 	// A wake from the proxy reaches the source's OnWake.
-	wakes.ch <- "s9"
-	if got := recv(t, src.woke, "wake"); got != "s9" {
-		t.Fatalf("wake = %q", got)
+	wantWake := routesync.RouteWake{SandboxID: "s9", NodeID: "n1", NodeEpoch: 7, StorageGeneration: "g1", BindingDigest: "digest"}
+	wakes.ch <- wantWake
+	if got := recv(t, src.woke, "wake"); got != wantWake {
+		t.Fatalf("wake = %+v", got)
 	}
 }
 
@@ -181,7 +182,7 @@ func TestRouteSyncResumeReplay(t *testing.T) {
 
 	src := &fakeSource{
 		sub:  make(chan routesync.Event, 4),
-		woke: make(chan string, 4),
+		woke: make(chan routesync.RouteWake, 4),
 		fp:   "source-a",
 		replay: []routesync.Event{{
 			Kind:  routesync.TypeUpsert,
@@ -229,7 +230,7 @@ func TestRouteSyncResumeFingerprintMismatchFallsBack(t *testing.T) {
 
 	src := &fakeSource{
 		sub:  make(chan routesync.Event, 4),
-		woke: make(chan string, 4),
+		woke: make(chan routesync.RouteWake, 4),
 		fp:   "source-a",
 		replay: []routesync.Event{{
 			Kind:  routesync.TypeUpsert,

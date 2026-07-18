@@ -86,12 +86,23 @@ CREATE TABLE IF NOT EXISTS manifest_keys (
   registry_auth_enc TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_manifest_keys_hash ON manifest_keys(key_hash);
+
+CREATE TABLE IF NOT EXISTS cluster_identity (
+  singleton       INTEGER PRIMARY KEY CHECK (singleton = 1),
+  node_id         TEXT NOT NULL UNIQUE,
+  enrollment_id   TEXT NOT NULL UNIQUE,
+  node_epoch      BLOB NOT NULL CHECK (length(node_epoch) = 8),
+  session_seq     BLOB NOT NULL CHECK (length(session_seq) = 8),
+  boot_id         TEXT NOT NULL,
+  data_endpoint   TEXT NOT NULL,
+  updated_unix    INTEGER NOT NULL
+);
 `
 
 // Open opens (creating if needed) the sqlite store with the encryption box used
 // for manifest keys at rest. The file should be 0600.
 func Open(path string, box *secretbox.Box) (*Store, error) {
-	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)")
+	db, err := sql.Open("sqlite", "file:"+path+"?_txlock=immediate&_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(FULL)&_pragma=foreign_keys(ON)")
 	if err != nil {
 		return nil, fmt.Errorf("store: open %s: %w", path, err)
 	}

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -41,8 +42,40 @@ type fakeNode struct {
 	events chan routesync.Event
 }
 
+type fixedSessionSequencer struct {
+	called atomic.Bool
+	tuple  routesync.SessionTuple
+}
+
+func (s *fixedSessionSequencer) NextSession(context.Context) (routesync.SessionTuple, error) {
+	s.called.Store(true)
+	return s.tuple, nil
+}
+
 func newFakeNode() *fakeNode {
 	return &fakeNode{routes: map[string]routesync.RouteEntry{}, events: make(chan routesync.Event, 16)}
+}
+
+func TestCommandMatchesCurrentSession(t *testing.T) {
+	identity := routesync.NodeRegister{NodeEpoch: 7, SessionSeq: 11}
+	for _, tc := range []struct {
+		name string
+		cmd  *routesync.Command
+		want bool
+	}{
+		{name: "legacy dormant path", cmd: &routesync.Command{}, want: true},
+		{name: "exact", cmd: &routesync.Command{NodeEpoch: 7, SessionSeq: 11}, want: true},
+		{name: "old epoch", cmd: &routesync.Command{NodeEpoch: 6, SessionSeq: 11}},
+		{name: "old session", cmd: &routesync.Command{NodeEpoch: 7, SessionSeq: 10}},
+		{name: "partial", cmd: &routesync.Command{NodeEpoch: 7}},
+		{name: "nil", cmd: nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := commandMatchesSession(tc.cmd, identity); got != tc.want {
+				t.Fatalf("match = %v, want %v", got, tc.want)
+			}
+		})
+	}
 }
 
 func (n *fakeNode) Range(ctx context.Context, fn func(routesync.RouteEntry) error) error {
@@ -55,11 +88,11 @@ func (n *fakeNode) Range(ctx context.Context, fn func(routesync.RouteEntry) erro
 	}
 	return nil
 }
-func (n *fakeNode) Subscribe() (<-chan routesync.Event, func()) { return n.events, func() {} }
-func (n *fakeNode) OnWake(ctx context.Context, sid string)      {}
-func (n *fakeNode) Policy() routesync.Policy                    { return routesync.Policy{} }
-func (n *fakeNode) Heartbeat() *routesync.Heartbeat             { return &routesync.Heartbeat{} }
-func (n *fakeNode) BuildEvents() <-chan *routesync.BuildEvent   { return nil }
+func (n *fakeNode) Subscribe() (<-chan routesync.Event, func())          { return n.events, func() {} }
+func (n *fakeNode) OnWake(ctx context.Context, wake routesync.RouteWake) {}
+func (n *fakeNode) Policy() routesync.Policy                             { return routesync.Policy{} }
+func (n *fakeNode) Heartbeat() *routesync.Heartbeat                      { return &routesync.Heartbeat{} }
+func (n *fakeNode) BuildEvents() <-chan *routesync.BuildEvent            { return nil }
 
 func (n *fakeNode) HandleCommand(ctx context.Context, cmd *routesync.Command) *routesync.CmdAck {
 	ack := &routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted}
@@ -185,6 +218,58 @@ func TestNodeLinkClientFollowsRedirect(t *testing.T) {
 			t.Fatal("node never registered after redirect")
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestNodeLinkPersistsAndStampsTupleBeforeDial(t *testing.T) {
+	registered := make(chan routesync.NodeRegister, 1)
+	mux := http.NewServeMux()
+	mux.HandleFunc(routesync.NodeLinkPath, func(w http.ResponseWriter, req *http.Request) {
+		first, err := routesync.ReadMsg(req.Body)
+		if err != nil || first.NodeReg == nil {
+			http.Error(w, "bad register", http.StatusBadRequest)
+			return
+		}
+		registered <- *first.NodeReg
+		_ = routesync.WriteMsg(w, &routesync.Msg{Type: routesync.TypeHello, Hello: &routesync.Hello{Version: routesync.Version}})
+	})
+	srv := httptest.NewServer(h2c.NewHandler(mux, &http2.Server{}))
+	defer srv.Close()
+	sequencer := &fixedSessionSequencer{tuple: routesync.SessionTuple{NodeEpoch: 7, SessionSeq: 12}}
+	client := New(
+		func(ctx context.Context) (net.Conn, error) {
+			if !sequencer.called.Load() {
+				return nil, errors.New("dial occurred before durable session sequence")
+			}
+			return (&net.Dialer{}).DialContext(ctx, "tcp", srv.Listener.Addr().String())
+		},
+		routesync.NodeRegister{NodeID: "node-1", DataEndpoint: "10.0.0.1:8443"},
+		newFakeNode(), time.Second, nil, slog.New(slog.NewTextHandler(io.Discard, nil)),
+	)
+	client.SetSessionSequencer(sequencer)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_ = client.session(ctx, "")
+	select {
+	case got := <-registered:
+		if got.NodeEpoch != 7 || got.SessionSeq != 12 {
+			t.Fatalf("registered tuple = (%d,%d)", got.NodeEpoch, got.SessionSeq)
+		}
+	case <-ctx.Done():
+		t.Fatal("node registration not received")
+	}
+}
+
+func TestFullJitterIsBounded(t *testing.T) {
+	const max = 5 * time.Second
+	for range 1000 {
+		got := fullJitter(max)
+		if got < 0 || got > max {
+			t.Fatalf("fullJitter(%s) = %s", max, got)
+		}
+	}
+	if got := fullJitter(0); got != 0 {
+		t.Fatalf("fullJitter(0) = %s", got)
 	}
 }
 

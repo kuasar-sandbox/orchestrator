@@ -43,6 +43,9 @@ const (
 // reserveResult / routeResolve mirror registry route_link JSON.
 type reserveResult struct {
 	NodeID             string `json:"node_id"`
+	NodeEpoch          uint64 `json:"node_epoch,omitempty"`
+	StorageGeneration  string `json:"storage_generation,omitempty"`
+	BindingDigest      string `json:"binding_digest,omitempty"`
 	SID                string `json:"sid"`
 	AccessToken        string `json:"access_token"`
 	TrafficAccessToken string `json:"traffic_access_token,omitempty"`
@@ -54,6 +57,9 @@ type routeResolve struct {
 	Group              string `json:"group"`
 	RouteKey           string `json:"route_key"`
 	NodeID             string `json:"node_id"`
+	NodeEpoch          uint64 `json:"node_epoch,omitempty"`
+	StorageGeneration  string `json:"storage_generation,omitempty"`
+	BindingDigest      string `json:"binding_digest,omitempty"`
 	DataEndpoint       string `json:"data_endpoint"`
 	AccessToken        string `json:"access_token"`
 	TrafficAccessToken string `json:"traffic_access_token,omitempty"`
@@ -644,6 +650,7 @@ func (rt *Router) serveData(w http.ResponseWriter, r *http.Request, host string)
 		if res, err := rt.reserveByKey(r.Context(), rr.Group, rr.RouteKey); err == nil && res.DataEndpoint != "" {
 			rr = &routeResolve{
 				SID: res.SID, Group: rr.Group, RouteKey: rr.RouteKey, NodeID: res.NodeID,
+				NodeEpoch: res.NodeEpoch, StorageGeneration: res.StorageGeneration, BindingDigest: res.BindingDigest,
 				DataEndpoint: res.DataEndpoint, AccessToken: res.AccessToken,
 				TrafficAccessToken: res.TrafficAccessToken, TargetPort: res.TargetPort,
 				State: "ready",
@@ -691,7 +698,10 @@ func (rt *Router) forwardSandboxData(w http.ResponseWriter, r *http.Request, rr 
 	doneActive := rt.beginActiveRoute(rr)
 	defer doneActive()
 	rt.mx.Inc(`router_requests_total{plane="data"}`)
-	backend, br, resp, err := proxypkg.DialSandboxConnect(r.Context(), "tcp", rr.DataEndpoint, sid, port, rr.AccessToken)
+	backend, br, resp, err := proxypkg.DialSandboxConnect(r.Context(), "tcp", rr.DataEndpoint, proxypkg.SandboxConnectRequest{
+		RouteRequest: routeRequestForResolve(rr, sid, port),
+		AccessToken:  rr.AccessToken,
+	})
 	if err != nil {
 		rt.evictRoute(rr.Group, rr.RouteKey, sid)
 		rt.mx.Inc(`router_requests_total{plane="data",result="bad_gateway"}`)
@@ -703,6 +713,9 @@ func (rt *Router) forwardSandboxData(w http.ResponseWriter, r *http.Request, rr 
 		backend.Close()
 		if staleProxyError(resp.Header.Get(proxypkg.HeaderProxyError)) {
 			rt.evictRoute(rr.Group, rr.RouteKey, sid)
+		}
+		if kind := resp.Header.Get(proxypkg.HeaderProxyError); kind != "" {
+			w.Header().Set(proxypkg.HeaderProxyError, kind)
 		}
 		rt.mx.Inc(`router_requests_total{plane="data",result="connect_refused"}`)
 		http.Error(w, "connect refused by node", resp.StatusCode)
@@ -732,6 +745,17 @@ func (rt *Router) forwardSandboxData(w http.ResponseWriter, r *http.Request, rr 
 	proxypkg.WriteHTTPResponse(w, resp)
 }
 
+func routeRequestForResolve(rr *routeResolve, sid string, port int) proxypkg.RouteRequest {
+	request := proxypkg.RouteRequest{SandboxID: sid, Port: port}
+	if rr != nil && rr.NodeID != "" && rr.NodeEpoch != 0 && rr.StorageGeneration != "" && rr.BindingDigest != "" {
+		request.ExpectedNodeID = rr.NodeID
+		request.ExpectedNodeEpoch = rr.NodeEpoch
+		request.ExpectedStorageGeneration = rr.StorageGeneration
+		request.ExpectedBindingDigest = rr.BindingDigest
+	}
+	return request
+}
+
 // serveDataByKey handles by-(group,route-key) data-plane addressing (cluster-router.md):
 // business traffic with no prior create. The caller authenticates by api_key (the
 // per-sandbox token is router-injected, not caller-held); the router Reserves the
@@ -750,6 +774,7 @@ func (rt *Router) serveDataByKey(w http.ResponseWriter, r *http.Request, group, 
 		}
 		rr = &routeResolve{
 			SID: res.SID, Group: group, RouteKey: routeKey, NodeID: res.NodeID,
+			NodeEpoch: res.NodeEpoch, StorageGeneration: res.StorageGeneration, BindingDigest: res.BindingDigest,
 			DataEndpoint: res.DataEndpoint, AccessToken: res.AccessToken,
 			TrafficAccessToken: res.TrafficAccessToken, TargetPort: res.TargetPort,
 			State: "ready",
@@ -770,7 +795,9 @@ func (rt *Router) serveDataByKey(w http.ResponseWriter, r *http.Request, group, 
 }
 
 func staleProxyError(kind string) bool {
-	return kind == proxypkg.ProxyErrorNotFound || kind == proxypkg.ProxyErrorUnauthorized
+	return kind == proxypkg.ProxyErrorNotFound || kind == proxypkg.ProxyErrorUnauthorized ||
+		kind == proxypkg.ProxyErrorWrongNodeEpoch || kind == proxypkg.ProxyErrorWrongBinding ||
+		kind == proxypkg.ProxyErrorRouteInactive
 }
 
 func requestedDataPort(r *http.Request, hostPort int, hasHostPort bool) (int, bool, error) {
@@ -994,6 +1021,7 @@ func (rt *Router) reserveByKey(ctx context.Context, group, routeKey string) (*re
 	if f.err == nil && f.res != nil {
 		rt.rememberRoute(&routeResolve{
 			SID: f.res.SID, Group: group, RouteKey: routeKey, NodeID: f.res.NodeID,
+			NodeEpoch: f.res.NodeEpoch, StorageGeneration: f.res.StorageGeneration, BindingDigest: f.res.BindingDigest,
 			DataEndpoint: f.res.DataEndpoint, AccessToken: f.res.AccessToken,
 			TrafficAccessToken: f.res.TrafficAccessToken, TargetPort: f.res.TargetPort,
 			State: "ready",

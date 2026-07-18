@@ -2,7 +2,9 @@ package proxy_test
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -21,8 +23,14 @@ import (
 
 type stubRouter struct{ r proxy.Route }
 
-func (s stubRouter) Route(ctx context.Context, sid string, port int) (proxy.Route, error) {
+func (s stubRouter) Route(ctx context.Context, request proxy.RouteRequest) (proxy.Route, error) {
 	return s.r, nil
+}
+
+type routeFunc func(context.Context, proxy.RouteRequest) (proxy.Route, error)
+
+func (f routeFunc) Route(ctx context.Context, request proxy.RouteRequest) (proxy.Route, error) {
+	return f(ctx, request)
 }
 
 type countingListener struct {
@@ -77,6 +85,155 @@ func TestParseSandbox(t *testing.T) {
 	req.Host = "noport"
 	if _, _, ok := proxy.ParseSandbox(req); ok {
 		t.Fatal("expected parse failure for host without <port>-<sid>")
+	}
+}
+
+func TestRouteFenceFailure(t *testing.T) {
+	exact := proxy.RouteRequest{
+		SandboxID: "s1", Port: 49983, ExpectedNodeID: "n1", ExpectedNodeEpoch: 7,
+		ExpectedStorageGeneration: "g1", ExpectedBindingDigest: "d1",
+	}
+	tests := []struct {
+		name    string
+		request proxy.RouteRequest
+		managed bool
+		nodeID  string
+		epoch   uint64
+		gen     string
+		digest  string
+		kind    proxy.Kind
+		failed  bool
+	}{
+		{name: "unmanaged", request: proxy.RouteRequest{SandboxID: "s1"}},
+		{name: "fenced request to unmanaged object", request: exact, kind: proxy.KindWrongBinding, failed: true},
+		{name: "managed requires fence", request: proxy.RouteRequest{SandboxID: "s1"}, managed: true, nodeID: "n1", epoch: 7, gen: "g1", digest: "d1", kind: proxy.KindWrongBinding, failed: true},
+		{name: "wrong node", request: exact, managed: true, nodeID: "n2", epoch: 7, gen: "g1", digest: "d1", kind: proxy.KindWrongNodeEpoch, failed: true},
+		{name: "wrong epoch", request: exact, managed: true, nodeID: "n1", epoch: 8, gen: "g1", digest: "d1", kind: proxy.KindWrongNodeEpoch, failed: true},
+		{name: "wrong generation", request: exact, managed: true, nodeID: "n1", epoch: 7, gen: "g2", digest: "d1", kind: proxy.KindWrongBinding, failed: true},
+		{name: "wrong binding", request: exact, managed: true, nodeID: "n1", epoch: 7, gen: "g1", digest: "d2", kind: proxy.KindWrongBinding, failed: true},
+		{name: "exact", request: exact, managed: true, nodeID: "n1", epoch: 7, gen: "g1", digest: "d1"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			kind, failed := proxy.RouteFenceFailure(tc.request, tc.managed, tc.nodeID, tc.epoch, tc.gen, tc.digest)
+			if kind != tc.kind || failed != tc.failed {
+				t.Fatalf("failure = (%v,%v), want (%v,%v)", kind, failed, tc.kind, tc.failed)
+			}
+		})
+	}
+}
+
+func TestProxyFenceFailuresNeverDial(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	tests := []struct {
+		kind  proxy.Kind
+		error string
+	}{
+		{proxy.KindWrongNodeEpoch, proxy.ProxyErrorWrongNodeEpoch},
+		{proxy.KindWrongBinding, proxy.ProxyErrorWrongBinding},
+		{proxy.KindRouteInactive, proxy.ProxyErrorRouteInactive},
+	}
+	for _, tc := range tests {
+		t.Run(tc.error, func(t *testing.T) {
+			var dials atomic.Int32
+			px := proxy.NewWithDialer(stubRouter{proxy.Route{Kind: tc.kind}}, nil, log, nil,
+				func(context.Context, proxy.Route) (net.Conn, error) {
+					dials.Add(1)
+					return nil, errors.New("unexpected dial")
+				})
+			req := httptest.NewRequest(http.MethodGet, "http://x/", nil)
+			req.Header.Set(proxy.HeaderSandboxID, "s1")
+			req.Header.Set(proxy.HeaderSandboxPort, "49983")
+			w := httptest.NewRecorder()
+			px.ServeHTTP(w, req)
+			if w.Code != http.StatusConflict || w.Header().Get(proxy.HeaderProxyError) != tc.error {
+				t.Fatalf("response = %d %q", w.Code, w.Header().Get(proxy.HeaderProxyError))
+			}
+			if dials.Load() != 0 {
+				t.Fatal("fence failure dialed backend")
+			}
+		})
+	}
+}
+
+func TestProxyRejectsIncompleteFenceBeforeRouting(t *testing.T) {
+	var routes atomic.Int32
+	px := proxy.New(routeFunc(func(context.Context, proxy.RouteRequest) (proxy.Route, error) {
+		routes.Add(1)
+		return proxy.Route{Kind: proxy.KindTCP}, nil
+	}), nil, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	req := httptest.NewRequest(http.MethodGet, "http://x/", nil)
+	req.Header.Set(proxy.HeaderSandboxID, "s1")
+	req.Header.Set(proxy.HeaderSandboxPort, "49983")
+	req.Header.Set(proxy.HeaderNodeID, "n1")
+	w := httptest.NewRecorder()
+	px.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest || w.Header().Get(proxy.HeaderProxyError) != proxy.ProxyErrorBadRequest {
+		t.Fatalf("response = %d %q", w.Code, w.Header().Get(proxy.HeaderProxyError))
+	}
+	if routes.Load() != 0 {
+		t.Fatal("incomplete fence reached Router")
+	}
+}
+
+func TestSandboxConnectCarriesCompleteFence(t *testing.T) {
+	request := proxy.SandboxConnectRequest{
+		RouteRequest: proxy.RouteRequest{
+			SandboxID: "s1", Port: 49983, ExpectedNodeID: "n1", ExpectedNodeEpoch: 7,
+			ExpectedStorageGeneration: "g1", ExpectedBindingDigest: "d1",
+		},
+		AccessToken: "token",
+	}
+	var wire bytes.Buffer
+	if err := proxy.WriteSandboxConnect(&wire, request); err != nil {
+		t.Fatal(err)
+	}
+	req, err := http.ReadRequest(bufio.NewReader(&wire))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.Method != http.MethodConnect || req.Header.Get(proxy.HeaderNodeID) != "n1" ||
+		req.Header.Get(proxy.HeaderNodeEpoch) != "7" || req.Header.Get(proxy.HeaderStorageGeneration) != "g1" ||
+		req.Header.Get(proxy.HeaderBindingDigest) != "d1" || req.Header.Get(proxy.HeaderAccessToken) != "token" {
+		t.Fatalf("CONNECT request = %+v headers=%v", req, req.Header)
+	}
+	request.ExpectedBindingDigest = ""
+	if err := proxy.WriteSandboxConnect(io.Discard, request); err == nil {
+		t.Fatal("incomplete CONNECT fence accepted")
+	}
+}
+
+func TestForwardHTTPStripsExecutionFenceHeaders(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	seen := make(chan http.Header, 1)
+	go func() {
+		defer server.Close()
+		req, err := http.ReadRequest(bufio.NewReader(server))
+		if err != nil {
+			seen <- nil
+			return
+		}
+		seen <- req.Header.Clone()
+		_, _ = io.WriteString(server, "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+	}()
+	req := httptest.NewRequest(http.MethodGet, "http://sandbox/", nil)
+	for name, value := range map[string]string{
+		proxy.HeaderNodeID: "n1", proxy.HeaderNodeEpoch: "7",
+		proxy.HeaderStorageGeneration: "g1", proxy.HeaderBindingDigest: "d1",
+	} {
+		req.Header.Set(name, value)
+	}
+	resp, err := proxy.ForwardHTTPOnce(req, client, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	headers := <-seen
+	for _, name := range []string{proxy.HeaderNodeID, proxy.HeaderNodeEpoch, proxy.HeaderStorageGeneration, proxy.HeaderBindingDigest} {
+		if headers.Get(name) != "" {
+			t.Fatalf("internal header %s reached guest", name)
+		}
 	}
 }
 

@@ -31,6 +31,11 @@ func (pf *proxyForwarder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad sandbox host", http.StatusBadRequest)
 		return
 	}
+	routeRequest, err := proxy.RouteRequestFromHTTP(r, sid, port)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 	targets := pf.reg.ProxyTargets()
 	if len(targets) == 0 {
 		pf.mx.Inc(`proxy_forwarder_total{result="no_proxy"}`)
@@ -40,15 +45,18 @@ func (pf *proxyForwarder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h := fnv.New32a()
 	_, _ = h.Write([]byte(sid))
 	sock := targets[h.Sum32()%uint32(len(targets))]
-	pf.forward(w, r, sock, sid, port)
+	pf.forward(w, r, sock, routeRequest)
 }
 
 // forward sends a CONNECT to a proxy UDS as a chained
 // CONNECT: dial the worker, issue a CONNECT carrying the sandbox identity + access
 // token, and on 200 splice the client to the worker (which tunnels onward to the
 // sandbox). Ordinary HTTP is then written through the same one-shot tunnel.
-func (pf *proxyForwarder) forward(w http.ResponseWriter, r *http.Request, sock, sid string, port int) {
-	backend, br, resp, err := proxy.DialSandboxConnect(r.Context(), "unix", sock, sid, port, r.Header.Get(proxy.HeaderAccessToken))
+func (pf *proxyForwarder) forward(w http.ResponseWriter, r *http.Request, sock string, routeRequest proxy.RouteRequest) {
+	backend, br, resp, err := proxy.DialSandboxConnect(r.Context(), "unix", sock, proxy.SandboxConnectRequest{
+		RouteRequest: routeRequest,
+		AccessToken:  r.Header.Get(proxy.HeaderAccessToken),
+	})
 	if err != nil {
 		pf.mx.Inc(`proxy_forwarder_total{result="error"}`)
 		http.Error(w, "proxy unreachable", http.StatusBadGateway)
@@ -57,6 +65,9 @@ func (pf *proxyForwarder) forward(w http.ResponseWriter, r *http.Request, sock, 
 	if resp.StatusCode != http.StatusOK {
 		backend.Close()
 		pf.mx.Inc(`proxy_forwarder_total{result="error"}`)
+		if kind := resp.Header.Get(proxy.HeaderProxyError); kind != "" {
+			w.Header().Set(proxy.HeaderProxyError, kind)
+		}
 		http.Error(w, "connect refused by worker", resp.StatusCode)
 		return
 	}

@@ -16,6 +16,7 @@ import (
 	"github.com/kuasar-sandbox/accelerator/pkg/remote"
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	"github.com/kuasar-sandbox/orchestrator/internal/buildcfg"
+	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/orchestrator/internal/keys"
 	"github.com/kuasar-sandbox/orchestrator/internal/regcreds"
@@ -41,6 +42,7 @@ func (o *Orchestrator) newRegisteredBuild(ctx context.Context, apiKey string, sp
 	if err := o.validateBuildOptions(builderOpts, false); err != nil {
 		return nil, err
 	}
+	metadata = clusterstate.WithoutSystemMetadata(metadata)
 	manifestKey, err := o.resolveAllowed(ctx, apiKey)
 	if err != nil {
 		return nil, err
@@ -107,6 +109,7 @@ func (o *Orchestrator) TriggerBuild(ctx context.Context, apiKey, tid, bid string
 	if err != nil {
 		return fmt.Errorf("%w: %v", api.ErrBadRequest, err)
 	}
+	triggerMeta = clusterstate.WithoutSystemMetadata(triggerMeta)
 	// COPY steps need files_storage configured AND the referenced context
 	// already uploaded (client → files endpoint → bucket). Verify both up
 	// front so the build fails fast instead of mid-pipeline.

@@ -3,12 +3,14 @@ package orch
 import (
 	"context"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/apikey"
 	"github.com/kuasar-sandbox/orchestrator/internal/buildcfg"
+	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/keys"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
@@ -57,6 +59,42 @@ func (o *Orchestrator) HandleCommand(ctx context.Context, cmd *routesync.Command
 				o.log.Error("cluster delete", "sid", cmd.SID, "err", err)
 			}
 		}()
+		return accept(cmd)
+	case routesync.CmdSandboxResume:
+		if err := o.verifySandboxCommandBinding(ctx, cmd); err != nil {
+			return rejectBinding(cmd, err)
+		}
+		go func() {
+			if err := o.verifySandboxCommandBinding(o.asyncCtx(), cmd); err != nil {
+				o.log.Warn("cluster resume fenced before execution", "sid", cmd.SID, "err", err)
+				return
+			}
+			if err := o.connectCluster(o.asyncCtx(), cmd.SID); err != nil {
+				o.log.Error("cluster resume", "sid", cmd.SID, "err", err)
+			}
+		}()
+		return accept(cmd)
+	case routesync.CmdSandboxDelete:
+		if err := o.verifySandboxCommandBinding(ctx, cmd); err != nil {
+			return rejectBinding(cmd, err)
+		}
+		go func() {
+			if err := o.verifySandboxCommandBinding(o.asyncCtx(), cmd); err != nil {
+				o.log.Warn("cluster delete fenced before execution", "sid", cmd.SID, "err", err)
+				return
+			}
+			if err := o.deleteCluster(o.asyncCtx(), cmd.SID); err != nil {
+				o.log.Error("cluster delete", "sid", cmd.SID, "err", err)
+			}
+		}()
+		return accept(cmd)
+	case routesync.CmdRebindExecution:
+		if err := o.rebindClusterExecution(ctx, cmd); err != nil {
+			if errors.Is(err, errWrongExecutionBinding) {
+				return rejectBinding(cmd, err)
+			}
+			return reject(cmd, err)
+		}
 		return accept(cmd)
 	case routesync.CmdKeyPut:
 		// Key distribution (cluster.md): refresh the manifest-key allowlist
@@ -160,7 +198,11 @@ func (o *Orchestrator) registerClusterBuild(ctx context.Context, cmd *routesync.
 	if err != nil {
 		return err
 	}
-	meta, builderOpts, err := buildcfg.Extract(cmd.Config)
+	commandMeta, err := clusterCommandMetadata(cmd, clusterstate.ExecutionKindBuild, cmd.BuildID)
+	if err != nil {
+		return err
+	}
+	meta, builderOpts, err := buildcfg.Extract(commandMeta)
 	if err != nil {
 		return err
 	}
@@ -174,6 +216,9 @@ func (o *Orchestrator) registerClusterBuild(ctx context.Context, cmd *routesync.
 	if existing != nil {
 		if existing.TemplateID != cmd.TemplateRef || existing.Profile != profile || existing.ManifestKey != manifestKey {
 			return fmt.Errorf("build_register: build %s conflicts with existing identity", cmd.BuildID)
+		}
+		if cmd.Binding != "" && existing.Metadata[clusterstate.ObjectMetadataKey] != cmd.Binding {
+			return fmt.Errorf("build_register: build %s conflicts with existing execution binding", cmd.BuildID)
 		}
 		if existing.Status != types.BuildReady && existing.Status != types.BuildError {
 			o.clusterBuildMu.Lock()
@@ -328,6 +373,13 @@ func reject(cmd *routesync.Command, err error) *routesync.CmdAck {
 	return &routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckRejected, Reason: err.Error()}
 }
 
+func rejectBinding(cmd *routesync.Command, err error) *routesync.CmdAck {
+	return &routesync.CmdAck{
+		CmdID: cmd.CmdID, Status: routesync.AckRejected,
+		Outcome: routesync.DispatchWrongBinding, Reason: err.Error(),
+	}
+}
+
 // CreateCluster is the synchronous precheck + boot of a node-link create. The
 // async path (HandleCommand) splits it so the ack is prompt; callers/tests that
 // want the result synchronously use this.
@@ -344,6 +396,9 @@ func (o *Orchestrator) CreateCluster(ctx context.Context, cmd *routesync.Command
 // whose failure is a rejected ack (rather than a slow create that fails only by
 // Reserve timeout).
 func (o *Orchestrator) precheckCluster(ctx context.Context, cmd *routesync.Command) (string, types.TemplateID, error) {
+	if _, err := clusterCommandMetadata(cmd, clusterstate.ExecutionKindSandbox, cmd.SID); err != nil {
+		return "", types.TemplateID{}, err
+	}
 	manifestKey, err := o.resolveByFingerprint(ctx, cmd.KeyFingerprint)
 	if err != nil {
 		return "", types.TemplateID{}, err
@@ -364,9 +419,9 @@ func (o *Orchestrator) bootCluster(ctx context.Context, cmd *routesync.Command, 
 	}
 	trafTok, _ := keys.MintToken()
 
-	meta := make(map[string]string, len(cmd.Config))
-	for k, v := range cmd.Config {
-		meta[k] = v
+	meta, err := clusterCommandMetadata(cmd, clusterstate.ExecutionKindSandbox, cmd.SID)
+	if err != nil {
+		return nil, err
 	}
 
 	sb := &types.Sandbox{
@@ -392,6 +447,113 @@ func (o *Orchestrator) bootCluster(ctx context.Context, cmd *routesync.Command, 
 	}
 	o.publishUpsert(sb)
 	return sb, nil
+}
+
+func clusterCommandMetadata(cmd *routesync.Command, kind clusterstate.ExecutionKind, objectID string) (map[string]string, error) {
+	if cmd == nil {
+		return nil, fmt.Errorf("cluster command is required")
+	}
+	if cmd.Binding == "" {
+		if cmd.BindingDigest != "" || cmd.StorageGeneration != "" || cmd.DemandDigest != "" || cmd.DispatchSpecDigest != "" {
+			return nil, fmt.Errorf("cluster command has incomplete execution binding")
+		}
+		meta := make(map[string]string, len(cmd.Config))
+		for key, value := range cmd.Config {
+			meta[key] = value
+		}
+		return meta, nil
+	}
+	if cmd.NodeEpoch == 0 || cmd.SessionSeq == 0 || cmd.StorageGeneration == "" || cmd.BindingDigest == "" ||
+		cmd.DemandDigest == "" || cmd.DispatchSpecDigest == "" {
+		return nil, fmt.Errorf("cluster command has incomplete execution binding fence")
+	}
+	binding, err := clusterstate.DecodeExecutionBinding(cmd.Binding)
+	if err != nil {
+		return nil, err
+	}
+	if binding.Kind != kind || binding.ObjectID != objectID {
+		return nil, fmt.Errorf("cluster command execution binding identifies a different object")
+	}
+	if binding.NodeEpoch != cmd.NodeEpoch || binding.StorageGeneration != cmd.StorageGeneration {
+		return nil, fmt.Errorf("cluster command execution binding generation mismatch")
+	}
+	digest, err := clusterstate.ExecutionBindingDigest(cmd.Binding)
+	if err != nil {
+		return nil, err
+	}
+	if digest != cmd.BindingDigest {
+		return nil, fmt.Errorf("cluster command execution binding digest mismatch")
+	}
+	if hex.EncodeToString(binding.DemandDigest[:]) != cmd.DemandDigest ||
+		hex.EncodeToString(binding.DispatchSpecDigest[:]) != cmd.DispatchSpecDigest {
+		return nil, fmt.Errorf("cluster command demand or dispatch digest mismatch")
+	}
+	return clusterstate.WithExecutionBinding(clusterstate.WithoutSystemMetadata(cmd.Config), cmd.Binding)
+}
+
+var errWrongExecutionBinding = errors.New("cluster: wrong execution Binding")
+
+func (o *Orchestrator) verifySandboxCommandBinding(ctx context.Context, cmd *routesync.Command) error {
+	if cmd == nil || cmd.SID == "" || cmd.NodeEpoch == 0 || cmd.StorageGeneration == "" || cmd.BindingDigest == "" {
+		return fmt.Errorf("%w: incomplete sandbox command fence", errWrongExecutionBinding)
+	}
+	sb, err := o.st.Get(ctx, cmd.SID)
+	if err != nil {
+		return err
+	}
+	if sb == nil {
+		return fmt.Errorf("%w: sandbox %q is absent", errWrongExecutionBinding, cmd.SID)
+	}
+	binding, opaque, err := clusterstate.ExecutionBindingFromMetadata(sb.Metadata)
+	if err != nil {
+		return fmt.Errorf("%w: %v", errWrongExecutionBinding, err)
+	}
+	digest, err := clusterstate.ExecutionBindingDigest(opaque)
+	if err != nil {
+		return fmt.Errorf("%w: %v", errWrongExecutionBinding, err)
+	}
+	if binding.Kind != clusterstate.ExecutionKindSandbox || binding.ObjectID != cmd.SID ||
+		binding.NodeEpoch != cmd.NodeEpoch || binding.StorageGeneration != cmd.StorageGeneration || digest != cmd.BindingDigest {
+		return errWrongExecutionBinding
+	}
+	return nil
+}
+
+func (o *Orchestrator) rebindClusterExecution(ctx context.Context, cmd *routesync.Command) error {
+	if cmd == nil || cmd.OldBindingDigest == "" {
+		return fmt.Errorf("cluster rebind: old Binding digest is required")
+	}
+	var kind clusterstate.ExecutionKind
+	var objectID string
+	switch {
+	case cmd.SID != "" && cmd.BuildID == "":
+		kind, objectID = clusterstate.ExecutionKindSandbox, cmd.SID
+	case cmd.BuildID != "" && cmd.SID == "":
+		kind, objectID = clusterstate.ExecutionKindBuild, cmd.BuildID
+	default:
+		return fmt.Errorf("cluster rebind: exactly one sandbox_id or build_id is required")
+	}
+	if _, err := clusterCommandMetadata(cmd, kind, objectID); err != nil {
+		return err
+	}
+	changed, err := o.st.CASExecutionBinding(ctx, kind, objectID, cmd.OldBindingDigest, cmd.Binding)
+	if err != nil {
+		return err
+	}
+	if !changed {
+		return errWrongExecutionBinding
+	}
+	if kind == clusterstate.ExecutionKindSandbox {
+		sb, err := o.st.Get(ctx, objectID)
+		if err != nil {
+			return err
+		}
+		if sb == nil {
+			return errWrongExecutionBinding
+		}
+		o.cache(sb)
+	}
+	return nil
 }
 
 func (o *Orchestrator) resolveByFingerprint(ctx context.Context, fp string) (string, error) {

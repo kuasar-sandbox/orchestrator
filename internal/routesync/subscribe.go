@@ -26,11 +26,11 @@ type Sink interface {
 	SetPolicy(p Policy)
 }
 
-// WakeSource yields sandbox ids the subscriber wants the orchestrator to resume. It
-// blocks until a wake is available or ctx is done (ok=false on ctx done). A nil
-// WakeSource means the subscriber issues no wakes (a pure route observer).
+// WakeSource yields exact executions the subscriber wants the orchestrator to
+// resume. It blocks until a wake is available or ctx is done (ok=false on ctx
+// done). A nil WakeSource means the subscriber issues no wakes.
 type WakeSource interface {
-	NextWake(ctx context.Context) (sid string, ok bool)
+	NextWake(ctx context.Context) (wake RouteWake, ok bool)
 }
 
 // Subscriber is the subscriber side of the route stream (the proxy master's shared
@@ -124,11 +124,11 @@ func (s *Subscriber) writeUp(ctx context.Context, w io.Writer) error {
 		return ctx.Err()
 	}
 	for {
-		sid, ok := s.wakes.NextWake(ctx)
+		wake, ok := s.wakes.NextWake(ctx)
 		if !ok {
 			return ctx.Err()
 		}
-		if err := WriteMsg(w, &Msg{Type: TypeWake, SID: sid}); err != nil {
+		if err := WriteMsg(w, &Msg{Type: TypeWake, Wake: &wake}); err != nil {
 			return err
 		}
 	}

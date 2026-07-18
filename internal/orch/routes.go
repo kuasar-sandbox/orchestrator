@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/keys"
+	"github.com/kuasar-sandbox/orchestrator/internal/proxy"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
@@ -39,6 +40,17 @@ func (o *Orchestrator) routeEntry(sb *types.Sandbox) routesync.RouteEntry {
 		TrafficAccessToken: sb.TrafficAccessToken,
 		SnapshotLocation:   snapshotLocation(sb.SnapshotRef),
 		MmdsSecret:         hex.EncodeToString(keys.MmdsSecret(sb.ManifestKey, sb.ID)),
+	}
+	if managed, nodeID, nodeEpoch, generation, digest, err := sandboxRouteFence(sb); managed {
+		if err != nil {
+			// A malformed system-owned Binding must fail closed at every proxy.
+			e.BindingDigest = "invalid"
+		} else {
+			e.NodeID = nodeID
+			e.NodeEpoch = nodeEpoch
+			e.StorageGeneration = generation
+			e.BindingDigest = digest
+		}
 	}
 	return e
 }
@@ -97,7 +109,15 @@ func (o *Orchestrator) Subscribe() (<-chan routesync.Event, func()) {
 // OnWake handles a proxy's Wake: resume a paused sandbox (single-flight) so the
 // resulting Upsert unparks the proxy's held request; for an unknown/dead sandbox,
 // push a Delete so the proxy stops waiting and returns 404 instead of timing out.
-func (o *Orchestrator) OnWake(ctx context.Context, sid string) {
+func (o *Orchestrator) OnWake(ctx context.Context, wake routesync.RouteWake) {
+	sid := wake.SandboxID
+	request := proxy.RouteRequest{
+		SandboxID:                 sid,
+		ExpectedNodeID:            wake.NodeID,
+		ExpectedNodeEpoch:         wake.NodeEpoch,
+		ExpectedStorageGeneration: wake.StorageGeneration,
+		ExpectedBindingDigest:     wake.BindingDigest,
+	}
 	sb := o.lookup(sid)
 	if sb == nil {
 		sb, _ = o.st.Get(ctx, sid)
@@ -106,11 +126,15 @@ func (o *Orchestrator) OnWake(ctx context.Context, sid string) {
 		o.publishDelete(sid)
 		return
 	}
+	if _, failed := validateSandboxRouteFence(sb, request); failed {
+		o.publishUpsert(sb)
+		return
+	}
 	switch sb.State {
 	case types.StateRunning:
 		o.publishUpsert(sb) // already up; re-announce so the proxy unparks
 	case types.StatePaused:
-		if err := o.sf.Do(sid, func() error { return o.resumeIfPaused(ctx, sid) }); err != nil {
+		if err := o.sf.Do(sid, func() error { return o.resumeIfPaused(ctx, sid, request) }); err != nil {
 			o.log.Warn("wake resume failed", "sid", sid, "err", err)
 			// stays paused; the proxy's park times out -> 404.
 		}

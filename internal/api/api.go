@@ -14,6 +14,7 @@ import (
 
 	"github.com/kuasar-sandbox/orchestrator/internal/apikey"
 	"github.com/kuasar-sandbox/orchestrator/internal/buildcfg"
+	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
@@ -649,7 +650,7 @@ func (a *API) sandboxDetail(sb *types.Sandbox) map[string]any {
 	d["state"] = string(sb.State)
 	d["startedAt"] = sb.CreatedUnix
 	d["endAt"] = sb.DeadlineUnix
-	d["metadata"] = sb.Metadata
+	d["metadata"] = clusterstate.WithoutSystemMetadata(sb.Metadata)
 	return d
 }
 
@@ -674,7 +675,7 @@ func (a *API) listed(sb *types.Sandbox) map[string]any {
 		"envdVersion": a.envdVersion(sb),
 		"startedAt":   isoUnix(sb.CreatedUnix),
 		"endAt":       isoUnix(end),
-		"metadata":    sb.Metadata,
+		"metadata":    clusterstate.WithoutSystemMetadata(sb.Metadata),
 	}
 }
 

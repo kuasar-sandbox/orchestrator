@@ -23,7 +23,7 @@ import (
 
 const (
 	magic  uint64 = 0x6b75736172505831 // "kusarPX1"
-	schema uint32 = 1
+	schema uint32 = 2
 
 	statusEmpty   uint32 = 0
 	statusPresent uint32 = 1
@@ -32,6 +32,9 @@ const (
 	defaultCapacity = 65536
 
 	maxSandboxID   = 128
+	maxNodeID      = 128
+	maxGeneration  = 128
+	maxDigest      = 64
 	maxProfile     = 16
 	maxTemplateID  = 128
 	maxState       = 16
@@ -62,14 +65,19 @@ type mmapHeader struct {
 }
 
 type mmapRecord struct {
-	Seq     uint64
-	Hash    uint64
-	Status  uint32
-	_       uint32
-	SyncGen uint64
-	Rev     uint64
+	Seq       uint64
+	Hash      uint64
+	Status    uint32
+	_         uint32
+	SyncGen   uint64
+	Rev       uint64
+	NodeEpoch uint64
+	EventSeq  uint64
 
 	SandboxID          [maxSandboxID]byte
+	NodeID             [maxNodeID]byte
+	StorageGeneration  [maxGeneration]byte
+	BindingDigest      [maxDigest]byte
 	Profile            [maxProfile]byte
 	TemplateID         [maxTemplateID]byte
 	State              [maxState]byte
@@ -266,7 +274,12 @@ func (t *Table) Upsert(in routesync.RouteEntry) error {
 	rec.Status = statusPresent
 	rec.SyncGen = atomic.LoadUint64(&t.header.SyncGen)
 	rec.Rev = atomic.AddUint64(&t.header.GlobalRev, 1)
+	atomic.StoreUint64(&rec.NodeEpoch, in.NodeEpoch)
+	atomic.StoreUint64(&rec.EventSeq, in.EventSeq)
 	_ = putFixed(rec.SandboxID[:], in.SandboxID)
+	_ = putFixed(rec.NodeID[:], in.NodeID)
+	_ = putFixed(rec.StorageGeneration[:], in.StorageGeneration)
+	_ = putFixed(rec.BindingDigest[:], in.BindingDigest)
 	_ = putFixed(rec.Profile[:], in.Profile)
 	_ = putFixed(rec.TemplateID[:], in.TemplateID)
 	_ = putFixed(rec.State[:], in.State)
@@ -298,7 +311,12 @@ func (t *Table) deleteRecord(rec *mmapRecord) {
 	rec.Status = statusDeleted
 	rec.SyncGen = atomic.LoadUint64(&t.header.SyncGen)
 	rec.Rev = atomic.AddUint64(&t.header.GlobalRev, 1)
+	atomic.StoreUint64(&rec.NodeEpoch, 0)
+	atomic.StoreUint64(&rec.EventSeq, 0)
 	clearFixed(rec.SandboxID[:])
+	clearFixed(rec.NodeID[:])
+	clearFixed(rec.StorageGeneration[:])
+	clearFixed(rec.BindingDigest[:])
 	clearFixed(rec.Profile[:])
 	clearFixed(rec.TemplateID[:])
 	clearFixed(rec.State[:])
@@ -433,6 +451,11 @@ func readRecord(rec *mmapRecord) (routesync.RouteEntry, uint32, bool) {
 		st := atomic.LoadUint32(&rec.Status)
 		entry := routesync.RouteEntry{
 			SandboxID:          fixedString(rec.SandboxID[:]),
+			NodeID:             fixedString(rec.NodeID[:]),
+			NodeEpoch:          atomic.LoadUint64(&rec.NodeEpoch),
+			StorageGeneration:  fixedString(rec.StorageGeneration[:]),
+			BindingDigest:      fixedString(rec.BindingDigest[:]),
+			EventSeq:           atomic.LoadUint64(&rec.EventSeq),
 			Profile:            fixedString(rec.Profile[:]),
 			TemplateID:         fixedString(rec.TemplateID[:]),
 			State:              fixedString(rec.State[:]),
@@ -491,6 +514,9 @@ func validateRoute(r routesync.RouteEntry) error {
 		max  int
 	}{
 		{"sid", r.SandboxID, maxSandboxID},
+		{"node_id", r.NodeID, maxNodeID},
+		{"storage_generation", r.StorageGeneration, maxGeneration},
+		{"binding_digest", r.BindingDigest, maxDigest},
 		{"profile", r.Profile, maxProfile},
 		{"template_id", r.TemplateID, maxTemplateID},
 		{"state", r.State, maxState},

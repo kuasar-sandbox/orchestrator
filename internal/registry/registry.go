@@ -154,6 +154,9 @@ type reserveCall struct {
 // router injects AccessToken and forwards to the node's DataEndpoint.
 type ReserveResult struct {
 	NodeID             string `json:"node_id"`
+	NodeEpoch          uint64 `json:"node_epoch,omitempty"`
+	StorageGeneration  string `json:"storage_generation,omitempty"`
+	BindingDigest      string `json:"binding_digest,omitempty"`
 	SID                string `json:"sid"`
 	AccessToken        string `json:"access_token"`
 	TrafficAccessToken string `json:"traffic_access_token,omitempty"`
@@ -771,6 +774,11 @@ func (r *Registry) applyRoute(ctx context.Context, nodeID string, e *routesync.R
 	if e == nil || e.SandboxID == "" {
 		return
 	}
+	managed := e.NodeID != "" || e.NodeEpoch != 0 || e.StorageGeneration != "" || e.BindingDigest != ""
+	if managed && (e.NodeID != nodeID || e.NodeEpoch == 0 || e.StorageGeneration == "" || e.BindingDigest == "") {
+		r.log.Warn("registry: ignored incomplete execution fence", "node", nodeID, "sid", e.SandboxID)
+		return
+	}
 	ref, found, err := r.lookupNodeSandboxRef(ctx, nodeID, e.SandboxID)
 	if err != nil {
 		r.log.Warn("registry: lookup node sandbox", "node", nodeID, "sid", e.SandboxID, "err", err)
@@ -789,6 +797,7 @@ func (r *Registry) applyRoute(ctx context.Context, nodeID string, e *routesync.R
 	}
 	rec := &SandboxRecord{
 		Group: ref.Group, RouteKey: ref.RouteKey, SID: e.SandboxID, NodeID: nodeID,
+		NodeEpoch: e.NodeEpoch, StorageGeneration: e.StorageGeneration, BindingDigest: e.BindingDigest,
 		SnapLoc: e.SnapshotLocation, TemplateID: e.TemplateID, AccessToken: e.AccessToken,
 		TrafficAccessToken: e.TrafficAccessToken,
 		LastActive:         time.Now().Unix(),
@@ -857,6 +866,21 @@ func (r *Registry) tryApplyLiveRoute(ctx context.Context, nodeID string, e *rout
 		r.deleteOrphanSandbox(ctx, nodeID, e.SandboxID, rec.Group, rec.RouteKey)
 		return true
 	}
+	if cur.BindingDigest != "" && (rec.BindingDigest != cur.BindingDigest ||
+		rec.StorageGeneration != cur.StorageGeneration || rec.NodeEpoch != cur.NodeEpoch) {
+		r.log.Warn("registry: ignored stale execution report", "group", rec.Group, "route_key", rec.RouteKey,
+			"sid", e.SandboxID, "node", nodeID)
+		return true
+	}
+	if rec.NodeEpoch == 0 {
+		rec.NodeEpoch = cur.NodeEpoch
+	}
+	if rec.StorageGeneration == "" {
+		rec.StorageGeneration = cur.StorageGeneration
+	}
+	if rec.BindingDigest == "" {
+		rec.BindingDigest = cur.BindingDigest
+	}
 	if rec.TemplateID == "" {
 		rec.TemplateID = cur.TemplateID
 	}
@@ -882,6 +906,7 @@ func (r *Registry) tryApplyLiveRoute(ctx context.Context, nodeID string, e *rout
 	if rec.State == StateReady {
 		r.finish(flightKey(rec.Group, rec.RouteKey), &ReserveResult{
 			NodeID: nodeID, SID: e.SandboxID, AccessToken: rec.AccessToken,
+			NodeEpoch: rec.NodeEpoch, StorageGeneration: rec.StorageGeneration, BindingDigest: rec.BindingDigest,
 			TrafficAccessToken: rec.TrafficAccessToken, TargetPort: rec.TargetPort,
 			DataEndpoint: r.nodeDataEndpoint(ctx, nodeID),
 		}, nil)
@@ -1056,6 +1081,7 @@ func (r *Registry) readyResultFromRecord(ctx context.Context, rec *SandboxRecord
 	}
 	return &ReserveResult{
 		NodeID: rec.NodeID, SID: rec.SID, AccessToken: rec.AccessToken,
+		NodeEpoch: rec.NodeEpoch, StorageGeneration: rec.StorageGeneration, BindingDigest: rec.BindingDigest,
 		TrafficAccessToken: rec.TrafficAccessToken, TargetPort: rec.TargetPort,
 		DataEndpoint: node.DataEndpoint,
 	}, true, nil

@@ -153,7 +153,7 @@ func runProxyWorker(ctx context.Context, cfg *config.ProxyFileConfig, log *slog.
 	if wakes != nil {
 		defer wakes.Close()
 	}
-	var wakeFn func(string)
+	var wakeFn func(routesync.RouteWake)
 	if wakes != nil {
 		wakeFn = wakes.Wake
 	}

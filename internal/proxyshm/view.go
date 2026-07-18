@@ -3,11 +3,11 @@ package proxyshm
 import (
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
 	"os"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -75,12 +75,12 @@ func (v *MasterView) SetPolicy(p routesync.Policy) {
 	v.notify.Notify()
 }
 
-func (v *MasterView) NextWake(ctx context.Context) (string, bool) {
+func (v *MasterView) NextWake(ctx context.Context) (routesync.RouteWake, bool) {
 	return v.wakes.Next(ctx)
 }
 
-func (v *MasterView) Wake(sid string) {
-	v.wakes.Enqueue(sid)
+func (v *MasterView) Wake(wake routesync.RouteWake) {
+	v.wakes.Enqueue(wake)
 }
 
 func (v *MasterView) RegisterNotifyWriter(f *os.File) func() {
@@ -90,46 +90,46 @@ func (v *MasterView) RegisterNotifyWriter(f *os.File) func() {
 // WakeQueue deduplicates wake requests until routesync consumes them.
 type WakeQueue struct {
 	mu      sync.Mutex
-	ch      chan string
-	pending map[string]bool
+	ch      chan routesync.RouteWake
+	pending map[routesync.RouteWake]bool
 }
 
 func NewWakeQueue(size int) *WakeQueue {
 	if size <= 0 {
 		size = 1024
 	}
-	return &WakeQueue{ch: make(chan string, size), pending: map[string]bool{}}
+	return &WakeQueue{ch: make(chan routesync.RouteWake, size), pending: map[routesync.RouteWake]bool{}}
 }
 
-func (q *WakeQueue) Enqueue(sid string) {
-	if sid == "" {
+func (q *WakeQueue) Enqueue(wake routesync.RouteWake) {
+	if !validRouteWake(wake) {
 		return
 	}
 	q.mu.Lock()
-	if q.pending[sid] {
+	if q.pending[wake] {
 		q.mu.Unlock()
 		return
 	}
-	q.pending[sid] = true
+	q.pending[wake] = true
 	q.mu.Unlock()
 	select {
-	case q.ch <- sid:
+	case q.ch <- wake:
 	default:
 		q.mu.Lock()
-		delete(q.pending, sid)
+		delete(q.pending, wake)
 		q.mu.Unlock()
 	}
 }
 
-func (q *WakeQueue) Next(ctx context.Context) (string, bool) {
+func (q *WakeQueue) Next(ctx context.Context) (routesync.RouteWake, bool) {
 	select {
-	case sid := <-q.ch:
+	case wake := <-q.ch:
 		q.mu.Lock()
-		delete(q.pending, sid)
+		delete(q.pending, wake)
 		q.mu.Unlock()
-		return sid, true
+		return wake, true
 	case <-ctx.Done():
-		return "", false
+		return routesync.RouteWake{}, false
 	}
 }
 
@@ -181,36 +181,56 @@ func (b *Broadcaster) Notify() {
 type WorkerView struct {
 	table       *Table
 	updates     *Updates
-	wake        func(string)
+	wake        func(routesync.RouteWake)
 	defaultPark time.Duration
 }
 
-func NewWorkerView(table *Table, updates *Updates, wake func(string), defaultPark time.Duration) *WorkerView {
+func NewWorkerView(table *Table, updates *Updates, wake func(routesync.RouteWake), defaultPark time.Duration) *WorkerView {
 	if defaultPark <= 0 {
 		defaultPark = 30 * time.Second
 	}
 	return &WorkerView{table: table, updates: updates, wake: wake, defaultPark: defaultPark}
 }
 
-func (v *WorkerView) Route(ctx context.Context, sid string, port int) (proxy.Route, error) {
-	r, ok := v.Resolve(ctx, sid)
+func (v *WorkerView) Route(ctx context.Context, request proxy.RouteRequest) (proxy.Route, error) {
+	if !v.waitSynced(ctx) {
+		return proxy.Route{Kind: proxy.KindRouteInactive}, nil
+	}
+	r, ok := v.table.Lookup(request.SandboxID)
 	if !ok {
+		if request.HasExecutionFence() {
+			return proxy.Route{Kind: proxy.KindWrongBinding}, nil
+		}
 		return proxy.Route{Kind: proxy.KindNotFound}, nil
 	}
-	return proxy.RouteForTarget(r.Profile, r.EnvdUDS, r.CiUDS, r.FloatingIP, r.AccessToken, port), nil
-}
-
-func (v *WorkerView) Resolve(ctx context.Context, sid string) (routesync.RouteEntry, bool) {
-	if !v.waitSynced(ctx) {
-		return routesync.RouteEntry{}, false
+	if kind, failed := routeFenceFailure(request, r); failed {
+		return proxy.Route{Kind: kind}, nil
 	}
-	if r, ok := v.table.Lookup(sid); ok && r.State == routesync.StateRunning {
-		return r, true
+	if r.State == routesync.StateRunning {
+		return routeForEntry(r, request.Port), nil
+	}
+	if r.State != routesync.StatePaused {
+		return proxy.Route{Kind: proxy.KindRouteInactive}, nil
 	}
 	if v.wake != nil {
-		v.wake(sid)
+		v.wake(routesync.RouteWake{
+			SandboxID:         r.SandboxID,
+			NodeID:            r.NodeID,
+			NodeEpoch:         r.NodeEpoch,
+			StorageGeneration: r.StorageGeneration,
+			BindingDigest:     r.BindingDigest,
+		})
 	}
-	return v.waitRunning(ctx, sid)
+	return v.waitForRoute(ctx, request)
+}
+
+func routeForEntry(r routesync.RouteEntry, port int) proxy.Route {
+	return proxy.RouteForTarget(r.Profile, r.EnvdUDS, r.CiUDS, r.FloatingIP, r.AccessToken, port)
+}
+
+func routeFenceFailure(request proxy.RouteRequest, r routesync.RouteEntry) (proxy.Kind, bool) {
+	managed := r.NodeID != "" || r.NodeEpoch != 0 || r.StorageGeneration != "" || r.BindingDigest != ""
+	return proxy.RouteFenceFailure(request, managed, r.NodeID, r.NodeEpoch, r.StorageGeneration, r.BindingDigest)
 }
 
 func (v *WorkerView) ByFloatingIP(ip string) (string, bool) {
@@ -241,15 +261,28 @@ func (v *WorkerView) waitSynced(ctx context.Context) bool {
 	}
 }
 
-func (v *WorkerView) waitRunning(ctx context.Context, sid string) (routesync.RouteEntry, bool) {
+func (v *WorkerView) waitForRoute(ctx context.Context, request proxy.RouteRequest) (proxy.Route, error) {
 	deadline := time.Now().Add(v.parkTimeout())
 	for {
-		if r, ok := v.table.Lookup(sid); ok && r.State == routesync.StateRunning {
-			return r, true
+		rev := v.table.Rev()
+		r, ok := v.table.Lookup(request.SandboxID)
+		if !ok {
+			if request.HasExecutionFence() {
+				return proxy.Route{Kind: proxy.KindWrongBinding}, nil
+			}
+			return proxy.Route{Kind: proxy.KindNotFound}, nil
 		}
-		if !v.waitChange(ctx, deadline, v.table.Rev()) {
-			r, ok := v.table.Lookup(sid)
-			return r, ok && r.State == routesync.StateRunning
+		if kind, failed := routeFenceFailure(request, r); failed {
+			return proxy.Route{Kind: kind}, nil
+		}
+		if r.State == routesync.StateRunning {
+			return routeForEntry(r, request.Port), nil
+		}
+		if r.State != routesync.StatePaused {
+			return proxy.Route{Kind: proxy.KindRouteInactive}, nil
+		}
+		if !v.waitChange(ctx, deadline, rev) {
+			return proxy.Route{Kind: proxy.KindRouteInactive}, nil
 		}
 	}
 }
@@ -355,21 +388,24 @@ func (w *WakeWriter) Close() error {
 	return w.f.Close()
 }
 
-func (w *WakeWriter) Wake(sid string) {
-	if w == nil || w.f == nil || sid == "" || strings.ContainsAny(sid, "\r\n") {
+func (w *WakeWriter) Wake(wake routesync.RouteWake) {
+	if w == nil || w.f == nil || !validRouteWake(wake) {
+		return
+	}
+	b, err := json.Marshal(wake)
+	if err != nil || len(b) > maxWakeFrame {
 		return
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	var lenbuf [4]byte
-	b := []byte(sid)
 	binary.LittleEndian.PutUint32(lenbuf[:], uint32(len(b)))
 	_, _ = w.f.Write(lenbuf[:])
 	_, _ = w.f.Write(b)
 }
 
 // ReadWakeLoop drains a worker wake pipe and enqueues requests on master.
-func ReadWakeLoop(ctx context.Context, f *os.File, wake func(string)) {
+func ReadWakeLoop(ctx context.Context, f *os.File, wake func(routesync.RouteWake)) {
 	defer f.Close()
 	for ctx.Err() == nil {
 		var lenbuf [4]byte
@@ -377,15 +413,34 @@ func ReadWakeLoop(ctx context.Context, f *os.File, wake func(string)) {
 			return
 		}
 		n := binary.LittleEndian.Uint32(lenbuf[:])
-		if n == 0 || n > maxSandboxID {
+		if n == 0 || n > maxWakeFrame {
 			return
 		}
 		buf := make([]byte, n)
 		if _, err := io.ReadFull(f, buf); err != nil {
 			return
 		}
-		wake(string(buf))
+		var request routesync.RouteWake
+		if err := json.Unmarshal(buf, &request); err != nil || !validRouteWake(request) {
+			return
+		}
+		wake(request)
 	}
+}
+
+const maxWakeFrame = 4 << 10
+
+func validRouteWake(wake routesync.RouteWake) bool {
+	if wake.SandboxID == "" || len(wake.SandboxID) > maxSandboxID {
+		return false
+	}
+	hasFence := wake.NodeID != "" || wake.NodeEpoch != 0 || wake.StorageGeneration != "" || wake.BindingDigest != ""
+	if !hasFence {
+		return true
+	}
+	return wake.NodeID != "" && len(wake.NodeID) <= maxNodeID && wake.NodeEpoch != 0 &&
+		wake.StorageGeneration != "" && len(wake.StorageGeneration) <= maxGeneration &&
+		wake.BindingDigest != "" && len(wake.BindingDigest) <= maxDigest
 }
 
 func minDuration(a, b time.Duration) time.Duration {

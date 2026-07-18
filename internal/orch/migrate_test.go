@@ -14,6 +14,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/apikey"
+	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
@@ -46,7 +47,9 @@ func TestExportImportRoundTrip(t *testing.T) {
 		ID: sid, TemplateID: "e2b-snp-" + strings.Repeat("a", 64), State: types.StatePaused,
 		ManifestKey: mk, SnapshotRef: "manifest://" + strings.Repeat("b", 64),
 		RunDir: dir + "/run/" + sid, BaseDir: dir + "/lib/" + sid,
-		Env: map[string]string{"FOO": "bar"}, Metadata: map[string]string{"k": "v"},
+		Env: map[string]string{"FOO": "bar"}, Metadata: map[string]string{
+			"k": "v", clusterstate.ObjectMetadataKey: "source-binding",
+		},
 		CreatedUnix: 1, EnvdAccessToken: "source-envd-token", TrafficAccessToken: "source-traffic-token",
 	}
 	if err := o.st.Put(ctx, sb); err != nil {
@@ -79,6 +82,13 @@ func TestExportImportRoundTrip(t *testing.T) {
 			t.Fatalf("migration token retained identity field %q", field)
 		}
 	}
+	var decodedToken SandboxToken
+	if err := json.Unmarshal(rawToken, &decodedToken); err != nil {
+		t.Fatal(err)
+	}
+	if _, found := decodedToken.Metadata[clusterstate.ObjectMetadataKey]; found {
+		t.Fatal("migration token inherited system-owned cluster metadata")
+	}
 
 	// Import allocates a fresh UUIDv7 while preserving the portable snapshot state.
 	imported, err := o.ImportSandbox(ctx, apiKey, tok)
@@ -99,6 +109,9 @@ func TestExportImportRoundTrip(t *testing.T) {
 	}
 	if got.CreatedUnix == sb.CreatedUnix {
 		t.Fatalf("import preserved source creation identity: got %d", got.CreatedUnix)
+	}
+	if _, found := got.Metadata[clusterstate.ObjectMetadataKey]; found {
+		t.Fatal("migration import restored system-owned cluster metadata")
 	}
 
 	// Reusing a portable token creates another independently addressable sandbox;

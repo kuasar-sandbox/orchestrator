@@ -84,21 +84,30 @@ func TestWorkerResolveWakesAndWaitsForSharedUpdate(t *testing.T) {
 	updates := &Updates{ch: make(chan struct{})}
 	worker := NewWorkerView(tbl, updates, master.Wake, 500*time.Millisecond)
 	master.BeginSync()
+	fence := routesync.RouteEntry{
+		SandboxID: "s1", NodeID: "n1", NodeEpoch: 7, StorageGeneration: "g1", BindingDigest: "d1",
+		Profile: "e2b", State: routesync.StatePaused,
+	}
+	master.ApplyUpsert(fence)
 	master.Bookmark()
 
 	done := make(chan proxy.Route, 1)
 	go func() {
-		route, _ := worker.Route(context.Background(), "s1", 49983)
+		route, _ := worker.Route(context.Background(), proxy.RouteRequest{
+			SandboxID: "s1", Port: 49983, ExpectedNodeID: "n1", ExpectedNodeEpoch: 7,
+			ExpectedStorageGeneration: "g1", ExpectedBindingDigest: "d1",
+		})
 		done <- route
 	}()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	sid, ok := master.NextWake(ctx)
-	if !ok || sid != "s1" {
-		t.Fatalf("wake = %q ok=%v", sid, ok)
+	wake, ok := master.NextWake(ctx)
+	if !ok || wake != (routesync.RouteWake{SandboxID: "s1", NodeID: "n1", NodeEpoch: 7, StorageGeneration: "g1", BindingDigest: "d1"}) {
+		t.Fatalf("wake = %+v ok=%v", wake, ok)
 	}
 	master.ApplyUpsert(routesync.RouteEntry{
-		SandboxID: "s1", Profile: "e2b", State: routesync.StateRunning,
+		SandboxID: "s1", NodeID: "n1", NodeEpoch: 7, StorageGeneration: "g1", BindingDigest: "d1",
+		Profile: "e2b", State: routesync.StateRunning,
 		EnvdUDS: "/run/s1/envd.sock", AccessToken: "tok",
 	})
 	updates.bump()
@@ -109,6 +118,81 @@ func TestWorkerResolveWakesAndWaitsForSharedUpdate(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("worker did not unpark")
+	}
+}
+
+func TestWorkerRejectsStaleFenceWithoutWake(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "routes.shm")
+	tbl, err := Create(path, 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tbl.Close()
+	master := NewMasterView(tbl, time.Second, nil)
+	worker := NewWorkerView(tbl, nil, master.Wake, time.Second)
+	master.BeginSync()
+	master.ApplyUpsert(routesync.RouteEntry{
+		SandboxID: "s1", NodeID: "n1", NodeEpoch: 8, StorageGeneration: "g2", BindingDigest: "new",
+		Profile: "e2b", State: routesync.StatePaused,
+	})
+	master.Bookmark()
+
+	route, err := worker.Route(context.Background(), proxy.RouteRequest{
+		SandboxID: "s1", Port: 49983, ExpectedNodeID: "n1", ExpectedNodeEpoch: 7,
+		ExpectedStorageGeneration: "g1", ExpectedBindingDigest: "old",
+	})
+	if err != nil || route.Kind != proxy.KindWrongNodeEpoch {
+		t.Fatalf("route = %+v err=%v", route, err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if wake, ok := master.NextWake(ctx); ok {
+		t.Fatalf("stale route emitted wake %+v", wake)
+	}
+}
+
+func TestWorkerBindingChangeWhileParkedFailsClosed(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "routes.shm")
+	tbl, err := Create(path, 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tbl.Close()
+	master := NewMasterView(tbl, time.Second, nil)
+	updates := &Updates{ch: make(chan struct{})}
+	worker := NewWorkerView(tbl, updates, master.Wake, time.Second)
+	master.BeginSync()
+	master.ApplyUpsert(routesync.RouteEntry{
+		SandboxID: "s1", NodeID: "n1", NodeEpoch: 7, StorageGeneration: "g1", BindingDigest: "old",
+		Profile: "e2b", State: routesync.StatePaused,
+	})
+	master.Bookmark()
+
+	done := make(chan proxy.Route, 1)
+	go func() {
+		route, _ := worker.Route(context.Background(), proxy.RouteRequest{
+			SandboxID: "s1", Port: 49983, ExpectedNodeID: "n1", ExpectedNodeEpoch: 7,
+			ExpectedStorageGeneration: "g1", ExpectedBindingDigest: "old",
+		})
+		done <- route
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if _, ok := master.NextWake(ctx); !ok {
+		t.Fatal("parked route did not emit wake")
+	}
+	master.ApplyUpsert(routesync.RouteEntry{
+		SandboxID: "s1", NodeID: "n1", NodeEpoch: 7, StorageGeneration: "g1", BindingDigest: "new",
+		Profile: "e2b", State: routesync.StateRunning, EnvdUDS: "/run/s1/envd.sock",
+	})
+	updates.bump()
+	select {
+	case route := <-done:
+		if route.Kind != proxy.KindWrongBinding {
+			t.Fatalf("route after rebind = %+v", route)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("parked route did not fail after rebind")
 	}
 }
 

@@ -1,0 +1,186 @@
+// Package routeapi defines the trusted Router-to-Registry Route/Build API.
+// Caller credentials are intentionally absent: Router authenticates callers
+// before constructing these internal requests.
+package routeapi
+
+import (
+	"errors"
+	"fmt"
+
+	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
+)
+
+const (
+	ReadReady         = "READY"
+	ReadNeedLeader    = "NEED_LEADER"
+	ReadReplicaBehind = "REPLICA_BEHIND"
+	ReadNotFound      = "NOT_FOUND"
+	ReadConflict      = "CONFLICT"
+	ReadUnavailable   = "UNAVAILABLE"
+)
+
+type RequestIdentity struct {
+	ClusterID         string `json:"cluster_id"`
+	StorageGeneration string `json:"storage_generation"`
+	SystemEpoch       uint64 `json:"system_epoch"`
+	ManifestDigest    string `json:"manifest_digest"`
+	ShardID           uint32 `json:"shard_id"`
+}
+
+func (i RequestIdentity) Validate() error {
+	if i.ClusterID == "" || i.StorageGeneration == "" || i.SystemEpoch == 0 || i.ManifestDigest == "" {
+		return errors.New("routeapi: incomplete cluster/generation identity")
+	}
+	return nil
+}
+
+type LeaderHint struct {
+	MemberID string `json:"member_id"`
+	Endpoint string `json:"endpoint"`
+	Term     uint64 `json:"term"`
+}
+
+func (h LeaderHint) Validate() error {
+	if h.MemberID == "" || h.Endpoint == "" || h.Term == 0 {
+		return errors.New("routeapi: incomplete leader hint")
+	}
+	return nil
+}
+
+type ReadRouteRequest struct {
+	RequestIdentity
+	Group            string `json:"group"`
+	RouteKey         string `json:"route_key"`
+	SandboxID        string `json:"sandbox_id,omitempty"`
+	MinRouteRevision uint64 `json:"min_route_revision,omitempty"`
+	Strong           bool   `json:"strong,omitempty"`
+}
+
+func (r ReadRouteRequest) Validate() error {
+	if err := r.RequestIdentity.Validate(); err != nil {
+		return err
+	}
+	if r.Group == "" || r.RouteKey == "" {
+		return errors.New("routeapi: group and route key are required")
+	}
+	return nil
+}
+
+type ReadRouteResponse struct {
+	Outcome       string                   `json:"outcome"`
+	Route         *clusterstate.ReadyRoute `json:"route,omitempty"`
+	RouteRevision uint64                   `json:"route_revision,omitempty"`
+	LeaderHint    *LeaderHint              `json:"leader_hint,omitempty"`
+	Reason        string                   `json:"reason,omitempty"`
+}
+
+func (r ReadRouteResponse) ValidateFor(request ReadRouteRequest) error {
+	switch r.Outcome {
+	case ReadReady:
+		if r.Route == nil || r.RouteRevision == 0 {
+			return errors.New("routeapi: READY requires route and revision")
+		}
+		if err := r.Route.Validate(); err != nil {
+			return err
+		}
+		if r.Route.StorageGeneration != request.StorageGeneration ||
+			(request.SandboxID != "" && r.Route.SandboxID != request.SandboxID) ||
+			r.RouteRevision < request.MinRouteRevision {
+			return errors.New("routeapi: READY does not satisfy request fence")
+		}
+		if r.LeaderHint != nil {
+			return errors.New("routeapi: READY cannot carry a leader hint")
+		}
+		return nil
+	case ReadNeedLeader, ReadReplicaBehind:
+		if r.Route != nil {
+			return errors.New("routeapi: non-positive read cannot carry a Route")
+		}
+		if r.LeaderHint != nil {
+			return r.LeaderHint.Validate()
+		}
+		return nil
+	case ReadNotFound:
+		if !request.Strong {
+			return errors.New("routeapi: replica-local read returned final NOT_FOUND")
+		}
+		if r.Route != nil {
+			return errors.New("routeapi: NOT_FOUND cannot carry a Route")
+		}
+		return nil
+	case ReadConflict, ReadUnavailable:
+		if r.Route != nil {
+			return errors.New("routeapi: failed read cannot carry a Route")
+		}
+		return nil
+	default:
+		return fmt.Errorf("routeapi: unknown Route read outcome %q", r.Outcome)
+	}
+}
+
+type ReadBuildRequest struct {
+	RequestIdentity
+	Group            string `json:"group"`
+	BuildID          string `json:"build_id"`
+	MinBuildRevision uint64 `json:"min_build_revision,omitempty"`
+	Strong           bool   `json:"strong,omitempty"`
+}
+
+func (r ReadBuildRequest) Validate() error {
+	if err := r.RequestIdentity.Validate(); err != nil {
+		return err
+	}
+	if r.Group == "" || r.BuildID == "" {
+		return errors.New("routeapi: group and build ID are required")
+	}
+	return nil
+}
+
+type ReadBuildResponse struct {
+	Outcome       string                          `json:"outcome"`
+	Build         *clusterstate.BuildProjection   `json:"build,omitempty"`
+	BuildState    clusterstate.BuildWorkflowState `json:"build_state,omitempty"`
+	BuildRevision uint64                          `json:"build_revision,omitempty"`
+	LeaderHint    *LeaderHint                     `json:"leader_hint,omitempty"`
+	Reason        string                          `json:"reason,omitempty"`
+}
+
+func (r ReadBuildResponse) ValidateFor(request ReadBuildRequest) error {
+	switch r.Outcome {
+	case ReadReady:
+		if r.Build == nil || r.BuildRevision == 0 || r.Build.BuildID != request.BuildID ||
+			r.Build.StorageGeneration != request.StorageGeneration || r.BuildRevision < request.MinBuildRevision {
+			return errors.New("routeapi: positive Build read does not satisfy request fence")
+		}
+		if err := r.Build.Validate(); err != nil {
+			return err
+		}
+		switch r.BuildState {
+		case clusterstate.BuildQueued, clusterstate.BuildRegistered, clusterstate.BuildBuilding,
+			clusterstate.BuildReady, clusterstate.BuildError:
+			return nil
+		default:
+			return errors.New("routeapi: local Build read returned an unbound workflow")
+		}
+	case ReadNeedLeader, ReadReplicaBehind:
+		if r.Build != nil {
+			return errors.New("routeapi: non-positive Build read cannot carry a projection")
+		}
+		if r.LeaderHint != nil {
+			return r.LeaderHint.Validate()
+		}
+		return nil
+	case ReadNotFound:
+		if !request.Strong {
+			return errors.New("routeapi: replica-local Build read returned final NOT_FOUND")
+		}
+		return nil
+	case ReadConflict, ReadUnavailable:
+		if r.Build != nil {
+			return errors.New("routeapi: failed Build read cannot carry a projection")
+		}
+		return nil
+	default:
+		return fmt.Errorf("routeapi: unknown Build read outcome %q", r.Outcome)
+	}
+}

@@ -7,6 +7,7 @@
 //	                                                                    # in-unit launchers (not for humans)
 //	node-ctl config <conductor|proxy> [--template|--config <f>|--resolve]  # config diagnose / generate
 //	node-ctl manifest-key <add|list|remove> ...                 # tenant root-key whitelist (admin socket)
+//	node-ctl cluster-identity <init|status> ...                 # durable cluster node enrollment
 //	node-ctl export-sandbox|import-sandbox ...                  # paused-snapshot egress / ingress
 //	node-ctl resource <status|list|drain|grant|reclaim>        # node resource controller (hosted in serve via resource_listen)
 //	node-ctl version
@@ -67,6 +68,8 @@ func main() {
 		err = configCmd(os.Args[2:], log)
 	case "manifest-key":
 		err = manifestKeyCmd(os.Args[2:], log)
+	case "cluster-identity":
+		err = clusterIdentityCmd(os.Args[2:], log)
 	case "export-sandbox":
 		err = exportSandboxCmd(os.Args[2:], log)
 	case "import-sandbox":
@@ -85,7 +88,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: node-ctl {conductor|proxy|run-sandbox|run-builder|config|manifest-key|export-sandbox|import-sandbox|resource|version} [args]")
+	fmt.Fprintln(os.Stderr, "usage: node-ctl {conductor|proxy|run-sandbox|run-builder|config|manifest-key|cluster-identity|export-sandbox|import-sandbox|resource|version} [args]")
 	os.Exit(2)
 }
 

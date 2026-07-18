@@ -791,8 +791,8 @@ func (n *stubNode) Subscribe() (<-chan routesync.Event, func()) {
 	return ch, cancel
 }
 
-func (n *stubNode) OnWake(ctx context.Context, sid string) {}
-func (n *stubNode) Policy() routesync.Policy               { return routesync.Policy{} }
+func (n *stubNode) OnWake(ctx context.Context, wake routesync.RouteWake) {}
+func (n *stubNode) Policy() routesync.Policy                             { return routesync.Policy{} }
 
 func (n *stubNode) HandleCommand(ctx context.Context, cmd *routesync.Command) *routesync.CmdAck {
 	if cmd == nil {
