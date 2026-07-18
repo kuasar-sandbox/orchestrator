@@ -20,8 +20,13 @@ import (
 )
 
 type Store struct {
-	db  *sql.DB
-	box *secretbox.Box
+	db        *sql.DB
+	box       *secretbox.Box
+	eventWake chan struct{}
+}
+
+type sqlExecutor interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
 }
 
 const schema = `
@@ -97,6 +102,41 @@ CREATE TABLE IF NOT EXISTS cluster_identity (
   data_endpoint   TEXT NOT NULL,
   updated_unix    INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS node_workflows (
+  object_kind          INTEGER NOT NULL,
+  object_id            TEXT NOT NULL,
+  group_name           TEXT NOT NULL,
+  route_key            TEXT NOT NULL DEFAULT '',
+  node_id              TEXT NOT NULL,
+  node_epoch           BLOB NOT NULL CHECK (length(node_epoch) = 8),
+  data_endpoint        TEXT NOT NULL,
+  normalized_demand    BLOB NOT NULL,
+  demand_digest        TEXT NOT NULL,
+  dispatch_spec        BLOB NOT NULL,
+  dispatch_spec_digest TEXT NOT NULL,
+  opaque_binding       TEXT NOT NULL,
+  binding_digest       TEXT NOT NULL,
+  build_demand_json    TEXT NOT NULL DEFAULT '{}',
+  admission_state      TEXT NOT NULL,
+  result                TEXT NOT NULL,
+  reason                TEXT NOT NULL DEFAULT '',
+  reservation_token     TEXT NOT NULL DEFAULT '',
+  queue_sequence        BLOB NOT NULL CHECK (length(queue_sequence) = 8),
+  resource_claimed      INTEGER NOT NULL DEFAULT 0,
+  object_state          TEXT NOT NULL DEFAULT '',
+  event_seq             BLOB NOT NULL CHECK (length(event_seq) = 8),
+  acked_event_seq       BLOB NOT NULL CHECK (length(acked_event_seq) = 8),
+  latest_event_json     TEXT NOT NULL DEFAULT '',
+  workflow_finalized    INTEGER NOT NULL DEFAULT 0,
+  created_unix          INTEGER NOT NULL,
+  updated_unix          INTEGER NOT NULL,
+  PRIMARY KEY (object_kind, object_id)
+);
+CREATE INDEX IF NOT EXISTS idx_node_workflows_build_queue
+  ON node_workflows(object_kind, admission_state, queue_sequence);
+CREATE INDEX IF NOT EXISTS idx_node_workflows_outbox
+  ON node_workflows(node_id, node_epoch, event_seq, acked_event_seq);
 `
 
 // Open opens (creating if needed) the sqlite store with the encryption box used
@@ -123,7 +163,7 @@ func Open(path string, box *secretbox.Box) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("store: init schema: %w", err)
 	}
-	return &Store{db: db, box: box}, nil
+	return &Store{db: db, box: box, eventWake: make(chan struct{}, 1)}, nil
 }
 
 func (s *Store) Close() error { return s.db.Close() }
@@ -218,11 +258,15 @@ func ub(s string) types.BuildOptions {
 
 // Put upserts a sandbox record (manifest key encrypted + hashed).
 func (s *Store) Put(ctx context.Context, sb *types.Sandbox) error {
+	return s.putSandbox(ctx, s.db, sb)
+}
+
+func (s *Store) putSandbox(ctx context.Context, exec sqlExecutor, sb *types.Sandbox) error {
 	hash, enc, err := s.encField(sb.ManifestKey)
 	if err != nil {
 		return fmt.Errorf("store: put %s: %w", sb.ID, err)
 	}
-	_, err = s.db.ExecContext(ctx, `
+	_, err = exec.ExecContext(ctx, `
 INSERT INTO sandboxes (id,template_id,state,deadline_unix,run_dir,base_dir,run_id,envd_uds,ci_uds,
   floatingip,vswitch_port,inner_ip,port_mac,manifest_key_hash,manifest_key_enc,snapshot_ref,
   envd_access_token,traffic_access_token,metadata_json,env_json,created_unix)
@@ -419,6 +463,10 @@ func (s *Store) scanBuild(row interface{ Scan(...any) error }) (*types.Build, er
 
 // PutBuild upserts a build record (manifest key + registry auth encrypted at rest).
 func (s *Store) PutBuild(ctx context.Context, b *types.Build) error {
+	return s.putBuild(ctx, s.db, b)
+}
+
+func (s *Store) putBuild(ctx context.Context, exec sqlExecutor, b *types.Build) error {
 	hash, enc, err := s.encField(b.ManifestKey)
 	if err != nil {
 		return fmt.Errorf("store: put build %s: %w", b.BuildID, err)
@@ -437,7 +485,7 @@ func (s *Store) PutBuild(ctx context.Context, b *types.Build) error {
 		}
 		stepsJSON = string(sj)
 	}
-	_, err = s.db.ExecContext(ctx, `
+	_, err = exec.ExecContext(ctx, `
 	INSERT INTO builds (build_id,template_id,persist_id,manifest_key_hash,manifest_key_enc,profile,kind,
 	  from_image,from_template,start_cmd,ready_cmd,steps_json,status,reason,run_id,names_json,aliases_json,created_unix,registry_auth_enc,metadata_json,builder_json)
 	VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)

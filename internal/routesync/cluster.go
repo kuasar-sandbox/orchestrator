@@ -1,6 +1,11 @@
 package routesync
 
-import "github.com/kuasar-sandbox/orchestrator/internal/placementproto"
+import (
+	"encoding/hex"
+	"errors"
+
+	"github.com/kuasar-sandbox/orchestrator/internal/placementproto"
+)
 
 // Cluster node-link message types (node.md §10 / cluster.md). They extend the
 // Msg union for the node <-> registry channel: the node DIALS the registry and is
@@ -11,12 +16,13 @@ import "github.com/kuasar-sandbox/orchestrator/internal/placementproto"
 // only the handshake (NodeRegister vs Hello) and the uplink (Command vs Wake)
 // differ. Build events arrive with Phase 5.
 const (
-	TypeNodeRegister  = "node_register"  // node -> registry (node identity; first up-frame)
-	TypeHeartbeat     = "heartbeat"      // legacy node -> registry water level
-	TypePlacementLoad = "placement_load" // node -> Holder request-time placement snapshot
-	TypeCommand       = "command"        // registry -> node (lifecycle / key primitive)
-	TypeCmdAck        = "cmd_ack"        // node -> registry (command accepted / rejected)
-	TypeEventAck      = "event_ack"      // registry -> node (committed event watermark)
+	TypeNodeRegister   = "node_register"   // node -> registry (node identity; first up-frame)
+	TypeHeartbeat      = "heartbeat"       // legacy node -> registry water level
+	TypePlacementLoad  = "placement_load"  // node -> Holder request-time placement snapshot
+	TypeCommand        = "command"         // registry -> node (lifecycle / key primitive)
+	TypeCmdAck         = "cmd_ack"         // node -> registry (command accepted / rejected)
+	TypeExecutionEvent = "execution_event" // node -> registry durable Sandbox/Build fact
+	TypeEventAck       = "event_ack"       // registry -> node (committed event watermark)
 )
 
 type PlacementLoadSnapshot = placementproto.PlacementLoadSnapshot
@@ -121,6 +127,52 @@ type EventAck struct {
 	EventSeq   uint64 `json:"event_seq"`
 }
 
+// EventCursor is process-local replay pagination, not an execution identity or
+// authority token. An empty cursor starts at the beginning of the durable set.
+type EventCursor struct {
+	ObjectKind string
+	ObjectID   string
+}
+
+// ExecutionEvent is the bounded latest-event wire projection backed by the
+// node-local durable outbox. Fields irrelevant to the object kind/state remain
+// empty.
+type ExecutionEvent struct {
+	ObjectKind        string `json:"object_kind"`
+	ObjectID          string `json:"object_id"`
+	NodeID            string `json:"node_id"`
+	NodeEpoch         uint64 `json:"node_epoch"`
+	StorageGeneration string `json:"storage_generation"`
+	BindingDigest     string `json:"binding_digest"`
+	EventSeq          uint64 `json:"event_seq"`
+	State             string `json:"state"`
+
+	DataEndpoint       string `json:"data_endpoint,omitempty"`
+	AccessToken        string `json:"access_token,omitempty"`
+	TrafficAccessToken string `json:"traffic_access_token,omitempty"`
+	TemplateRef        string `json:"template_ref,omitempty"`
+	SnapshotLocation   string `json:"snapshot_location,omitempty"`
+	ArtifactRef        string `json:"artifact_ref,omitempty"`
+	Reason             string `json:"reason,omitempty"`
+}
+
+const MaxExecutionEventBytes = 256 << 10
+
+func (e ExecutionEvent) Validate() error {
+	if e.ObjectID == "" || e.NodeID == "" || e.NodeEpoch == 0 || e.StorageGeneration == "" ||
+		e.EventSeq == 0 || e.State == "" {
+		return errors.New("routesync: incomplete execution event")
+	}
+	if e.ObjectKind != "sandbox" && e.ObjectKind != "build" {
+		return errors.New("routesync: invalid execution event kind")
+	}
+	digest, err := hex.DecodeString(e.BindingDigest)
+	if err != nil || len(digest) != 32 {
+		return errors.New("routesync: execution event Binding digest must be SHA-256 hex")
+	}
+	return nil
+}
+
 // CmdAck statuses.
 const (
 	AckAccepted = "accepted"
@@ -197,6 +249,11 @@ type Command struct {
 	OldBindingDigest   string `json:"old_binding_digest,omitempty"`
 	DemandDigest       string `json:"demand_digest,omitempty"`
 	DispatchSpecDigest string `json:"dispatch_spec_digest,omitempty"`
+	Group              string `json:"group,omitempty"`
+	RouteKey           string `json:"route_key,omitempty"`
+	NormalizedDemand   []byte `json:"normalized_demand,omitempty"`
+	DispatchSpec       []byte `json:"dispatch_spec,omitempty"`
+	ProviderPolicy     string `json:"provider_policy_version,omitempty"`
 	// create
 	TemplateRef    string            `json:"template_ref,omitempty"` // snapshot template ref (cold start = fast restore)
 	KeyFingerprint string            `json:"key_fp,omitempty"`       // manifest-key fingerprint the node must already hold

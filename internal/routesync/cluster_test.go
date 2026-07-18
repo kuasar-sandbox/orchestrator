@@ -39,12 +39,16 @@ func TestNodeLinkCodecRoundTrip(t *testing.T) {
 	}
 
 	c := roundTrip(t, &Msg{Type: TypeCommand, Rev: 42, Cmd: &Command{
-		CmdID: "x1", Kind: CmdCreate, SID: "s1", Config: map[string]string{"kuasar-sandbox.cluster": `{"group":"/c/p/a/g1","route_key":"u1:sess1"}`},
+		CmdID: "x1", Kind: CmdSandboxAdmitDispatch, SID: "s1", Group: "/c/p/a/g1", RouteKey: "u1:sess1",
+		NormalizedDemand: []byte(`{"kind":"sandbox"}`), DispatchSpec: []byte(`{"template":"t1"}`),
+		DemandDigest: "demand-digest", DispatchSpecDigest: "spec-digest", ProviderPolicy: "provider-v1/policy-v1",
 		TemplateRef: "manifest://abc", KeyFingerprint: "e2b_deadbeef", NodeEpoch: 7, SessionSeq: 11,
 		StorageGeneration: "generation-1", Binding: "keb1.opaque", BindingDigest: "binding-digest",
 	}})
-	if c.Cmd == nil || c.Cmd.Kind != CmdCreate || c.Cmd.Config["kuasar-sandbox.cluster"] == "" || c.Rev != 42 ||
-		c.Cmd.NodeEpoch != 7 || c.Cmd.SessionSeq != 11 || c.Cmd.StorageGeneration != "generation-1" || c.Cmd.BindingDigest != "binding-digest" {
+	if c.Cmd == nil || c.Cmd.Kind != CmdSandboxAdmitDispatch || c.Cmd.Group != "/c/p/a/g1" || c.Cmd.RouteKey != "u1:sess1" || c.Rev != 42 ||
+		!bytes.Equal(c.Cmd.NormalizedDemand, []byte(`{"kind":"sandbox"}`)) || !bytes.Equal(c.Cmd.DispatchSpec, []byte(`{"template":"t1"}`)) ||
+		c.Cmd.ProviderPolicy != "provider-v1/policy-v1" || c.Cmd.NodeEpoch != 7 || c.Cmd.SessionSeq != 11 ||
+		c.Cmd.StorageGeneration != "generation-1" || c.Cmd.BindingDigest != "binding-digest" {
 		t.Fatalf("command round-trip: %+v rev=%d", c.Cmd, c.Rev)
 	}
 	k := roundTrip(t, &Msg{Type: TypeCommand, Cmd: &Command{
