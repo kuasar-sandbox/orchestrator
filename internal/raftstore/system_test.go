@@ -103,7 +103,7 @@ func TestRecoveryEpochClosesNormalServiceAndAdvancesSystemEpoch(t *testing.T) {
 		Type: SystemSetGates, Gates: &GateUpdate{Serve: true, Write: true, Cutover: true},
 	})
 	recovery := &RecoveryEpoch{
-		Epoch: 1, SourceClusterID: "cluster-1", SourceStorageGeneration: "generation-1",
+		Epoch: 2, SourceClusterID: "cluster-1", SourceStorageGeneration: "generation-1",
 		SourceManifestDigest: digestFor("source-manifest"), TargetStorageGeneration: "generation-2",
 		TargetManifestDigest: digest, Phase: RecoveryPreparing,
 	}
@@ -123,6 +123,36 @@ func TestRecoveryEpochClosesNormalServiceAndAdvancesSystemEpoch(t *testing.T) {
 	}
 	if state.Recovery != nil || state.SystemEpoch != 3 || state.ServeGate {
 		t.Fatalf("closed recovery state = %+v", state)
+	}
+}
+
+func TestRecoveryEpochMustNameTheCommittedPredecessor(t *testing.T) {
+	manifest := testManifest(2, "generation-2")
+	manifest.Predecessor = &PredecessorProof{
+		StorageGeneration: "generation-1", ManifestDigest: digestFor("source-manifest"),
+		ServePermitMaxMillis: 5000, Kind: RolloverExternalFence, ProofDigest: digestFor("hard-fence"),
+	}
+	digest, _ := manifest.Digest()
+	state, _ := applySystem(t, SystemState{}, 1, SystemCommand{Type: SystemBootstrap, Manifest: &manifest, Digest: digest})
+
+	for name, mutate := range map[string]func(*RecoveryEpoch){
+		"wrong epoch":      func(recovery *RecoveryEpoch) { recovery.Epoch++ },
+		"wrong cluster":    func(recovery *RecoveryEpoch) { recovery.SourceClusterID = "other-cluster" },
+		"wrong generation": func(recovery *RecoveryEpoch) { recovery.SourceStorageGeneration = "generation-0" },
+		"wrong manifest":   func(recovery *RecoveryEpoch) { recovery.SourceManifestDigest = digestFor("other-manifest") },
+	} {
+		t.Run(name, func(t *testing.T) {
+			recovery := RecoveryEpoch{
+				Epoch: 2, SourceClusterID: "cluster-1", SourceStorageGeneration: "generation-1",
+				SourceManifestDigest: digestFor("source-manifest"), TargetStorageGeneration: "generation-2",
+				TargetManifestDigest: digest, Phase: RecoveryPreparing,
+			}
+			mutate(&recovery)
+			_, result := ApplySystemCommand(state, 2, SystemCommand{Type: SystemBeginRecovery, Recovery: &recovery})
+			if !result.Conflict {
+				t.Fatal("recovery with uncommitted source identity was accepted")
+			}
+		})
 	}
 }
 

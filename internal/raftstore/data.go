@@ -22,25 +22,27 @@ func (i ShardRequestIdentity) Validate() error {
 }
 
 type DataState struct {
-	Initialized       bool                                        `json:"initialized"`
-	ClusterID         string                                      `json:"cluster_id"`
-	StorageGeneration string                                      `json:"storage_generation"`
-	ShardID           uint32                                      `json:"shard_id"`
-	RouteBucketCount  uint32                                      `json:"route_bucket_count"`
-	BuildBucketCount  uint32                                      `json:"build_bucket_count"`
-	VirtualShardCount uint32                                      `json:"virtual_shard_count"`
-	ReplicaIDs        []uint64                                    `json:"replica_ids"`
-	ServingEpochs     []PermitIdentity                            `json:"serving_epochs"`
-	Routes            map[string]clusterstate.RouteWorkflowRecord `json:"routes"`
-	Builds            map[string]clusterstate.BuildRecord         `json:"builds"`
-	Fences            map[string]clusterstate.ExecutionFence      `json:"fences"`
-	LastApplied       uint64                                      `json:"last_applied"`
+	Initialized        bool                                        `json:"initialized"`
+	ClusterID          string                                      `json:"cluster_id"`
+	StorageGeneration  string                                      `json:"storage_generation"`
+	ShardID            uint32                                      `json:"shard_id"`
+	RouteBucketCount   uint32                                      `json:"route_bucket_count"`
+	BuildBucketCount   uint32                                      `json:"build_bucket_count"`
+	VirtualShardCount  uint32                                      `json:"virtual_shard_count"`
+	ReplicaIDs         []uint64                                    `json:"replica_ids"`
+	PreparedReplicaIDs []uint64                                    `json:"prepared_replica_ids,omitempty"`
+	ServingEpochs      []PermitIdentity                            `json:"serving_epochs"`
+	Routes             map[string]clusterstate.RouteWorkflowRecord `json:"routes"`
+	Builds             map[string]clusterstate.BuildRecord         `json:"builds"`
+	Fences             map[string]clusterstate.ExecutionFence      `json:"fences"`
+	LastApplied        uint64                                      `json:"last_applied"`
 }
 
 func (s DataState) Validate() error {
 	if !s.Initialized {
 		if s.ClusterID != "" || s.StorageGeneration != "" || s.ShardID != 0 || s.RouteBucketCount != 0 ||
 			s.BuildBucketCount != 0 || s.VirtualShardCount != 0 || len(s.ReplicaIDs) != 0 ||
+			len(s.PreparedReplicaIDs) != 0 ||
 			s.LastApplied != 0 || len(s.Routes) != 0 || len(s.Builds) != 0 || len(s.Fences) != 0 ||
 			len(s.ServingEpochs) != 0 {
 			return errors.New("raftstore: uninitialized data shard contains state")
@@ -82,6 +84,14 @@ func validateDataStateIdentity(s DataState) error {
 	for i, replicaID := range s.ReplicaIDs {
 		if replicaID == 0 || i > 0 && replicaID == s.ReplicaIDs[i-1] {
 			return errors.New("raftstore: invalid data shard replica set")
+		}
+	}
+	if len(s.ServingEpochs) == 1 && len(s.PreparedReplicaIDs) != 0 {
+		return errors.New("raftstore: active data shard retains a prepared replica set")
+	}
+	if len(s.ServingEpochs) == 2 {
+		if err := validateReplicaIDs(s.PreparedReplicaIDs); err != nil {
+			return err
 		}
 	}
 	for i, epoch := range s.ServingEpochs {
@@ -258,7 +268,8 @@ func ApplyDataCommand(state *DataState, index uint64, command DataCommand) DataA
 			Builds:        make(map[string]clusterstate.BuildRecord), Fences: make(map[string]clusterstate.ExecutionFence),
 		}
 	case DataPrepareEpoch:
-		if !state.Accepts(command.Identity) || command.Epoch == nil || len(state.ServingEpochs) != 1 {
+		if !state.Accepts(command.Identity) || command.Epoch == nil || len(state.ServingEpochs) != 1 ||
+			validateReplicaIDs(command.ReplicaIDs) != nil {
 			return conflict("data shard cannot prepare another serving epoch", 0)
 		}
 		epoch := *command.Epoch
@@ -268,12 +279,15 @@ func ApplyDataCommand(state *DataState, index uint64, command DataCommand) DataA
 			return conflict("invalid prepared serving epoch", 0)
 		}
 		state.ServingEpochs = append(append([]PermitIdentity(nil), state.ServingEpochs...), epoch)
+		state.PreparedReplicaIDs = append([]uint64(nil), command.ReplicaIDs...)
 	case DataRetireEpoch:
 		if !state.Accepts(command.Identity) || command.Epoch == nil || len(state.ServingEpochs) != 2 ||
 			*command.Epoch != state.ServingEpochs[0] || command.Identity.PermitIdentity != state.ServingEpochs[1] {
 			return conflict("serving epoch retirement is not activated", 0)
 		}
 		state.ServingEpochs = []PermitIdentity{state.ServingEpochs[1]}
+		state.ReplicaIDs = append([]uint64(nil), state.PreparedReplicaIDs...)
+		state.PreparedReplicaIDs = nil
 	case DataPutRoute:
 		if !state.Accepts(command.Identity) || command.Route == nil {
 			return conflict("Route mutation identity is fenced", 0)
@@ -408,6 +422,19 @@ func replicaIDsForPlacement(placement ShardPlacement) []uint64 {
 	}
 	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
 	return ids
+}
+
+func validateReplicaIDs(replicaIDs []uint64) error {
+	if len(replicaIDs) != int(DefaultReplication) ||
+		!sort.SliceIsSorted(replicaIDs, func(i, j int) bool { return replicaIDs[i] < replicaIDs[j] }) {
+		return errors.New("raftstore: replica IDs must contain exactly three sorted values")
+	}
+	for index, replicaID := range replicaIDs {
+		if replicaID == 0 || index > 0 && replicaID == replicaIDs[index-1] {
+			return errors.New("raftstore: replica IDs must be non-zero and unique")
+		}
+	}
+	return nil
 }
 
 func routeMapKey(group, routeKey string) string { return lengthKey(group, routeKey) }

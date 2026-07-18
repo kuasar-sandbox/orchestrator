@@ -88,9 +88,10 @@ func TestManifestGuardRejectsRollbackEquivocationAndUnrelatedGeneration(t *testi
 		t.Fatal(err)
 	}
 	second := first
+	second.Members = append([]RegistryMember(nil), first.Members...)
 	second.ManifestVersion = 2
 	second.PreviousManifestDigest = firstDigest
-	second.BootstrapTokenDigest = digestFor("manifest-2")
+	second.Members[0].InternalEndpoint = "https://registry-a-next:9443"
 	secondDigest, _ := second.Digest()
 	accepted, err = accepted.Accept(second, secondDigest)
 	if err != nil {
@@ -100,7 +101,8 @@ func TestManifestGuardRejectsRollbackEquivocationAndUnrelatedGeneration(t *testi
 		t.Fatal("manifest rollback accepted")
 	}
 	equivocation := second
-	equivocation.BootstrapTokenDigest = digestFor("equivocation")
+	equivocation.Members = append([]RegistryMember(nil), second.Members...)
+	equivocation.Members[0].InternalEndpoint = "https://registry-a-equivocation:9443"
 	equivocationDigest, _ := equivocation.Digest()
 	if _, err := accepted.Accept(equivocation, equivocationDigest); err == nil {
 		t.Fatal("same-version manifest equivocation accepted")
@@ -120,6 +122,61 @@ func TestManifestGuardRejectsRollbackEquivocationAndUnrelatedGeneration(t *testi
 	unrelatedDigest, _ := successor.Digest()
 	if _, err := accepted.Accept(successor, unrelatedDigest); err == nil {
 		t.Fatal("unrelated generation accepted")
+	}
+}
+
+func TestManifestGuardFreezesGenerationParameters(t *testing.T) {
+	first := testManifest(4, "generation-1")
+	firstDigest, _ := first.Digest()
+	accepted, err := FirstAcceptedManifest(first, firstDigest)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tests := map[string]func(*Manifest){
+		"schema":          func(manifest *Manifest) { manifest.SchemaVersion++ },
+		"protocol":        func(manifest *Manifest) { manifest.ProtocolVersion++ },
+		"route buckets":   func(manifest *Manifest) { manifest.RouteBucketCount *= 2 },
+		"build buckets":   func(manifest *Manifest) { manifest.BuildBucketCount *= 2 },
+		"permit lifetime": func(manifest *Manifest) { manifest.ServePermitMaxMillis++ },
+		"bootstrap token": func(manifest *Manifest) { manifest.BootstrapTokenDigest = digestFor("replacement-token") },
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			next := first
+			next.ManifestVersion = 2
+			next.PreviousManifestDigest = firstDigest
+			mutate(&next)
+			digest, digestErr := next.Digest()
+			if digestErr != nil {
+				t.Fatal(digestErr)
+			}
+			if _, acceptErr := accepted.Accept(next, digest); acceptErr == nil {
+				t.Fatal("same-generation frozen parameter change accepted")
+			}
+		})
+	}
+}
+
+func TestManifestGuardBindsSuccessorToPredecessorPermitLifetime(t *testing.T) {
+	first := testManifest(4, "generation-1")
+	firstDigest, _ := first.Digest()
+	accepted, err := FirstAcceptedManifest(first, firstDigest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	successor := testManifest(4, "generation-2")
+	successor.Predecessor = &PredecessorProof{
+		StorageGeneration: first.StorageGeneration, ManifestDigest: firstDigest,
+		ServePermitMaxMillis: first.ServePermitMaxMillis - 1,
+		Kind:                 RolloverConsensusClosure, ProofDigest: digestFor("closure"),
+	}
+	digest, err := successor.Digest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := accepted.Accept(successor, digest); err == nil {
+		t.Fatal("successor with an understated predecessor permit lifetime was accepted")
 	}
 }
 

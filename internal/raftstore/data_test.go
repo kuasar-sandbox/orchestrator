@@ -195,6 +195,35 @@ func TestBuildStateProgressionRejectsSkippedAndRepeatedEvents(t *testing.T) {
 	}
 }
 
+func TestDataServingEpochTransitionPersistsBothReplicaSets(t *testing.T) {
+	manifest := testManifest(4, "generation-1")
+	state, identity := initializedRouteShard(t, manifest, "/g", "rk")
+	next := identity.PermitIdentity
+	next.SystemEpoch++
+	next.ManifestDigest = digestFor("manifest-next")
+	nextReplicas := []uint64{2, 3, 4}
+	applyDataOK(t, &state, 2, DataCommand{
+		Type: DataPrepareEpoch, Identity: identity, Epoch: &next, ReplicaIDs: nextReplicas,
+	})
+	nextIdentity := ShardRequestIdentity{PermitIdentity: next, ShardID: identity.ShardID}
+	if !state.Accepts(identity) || !state.Accepts(nextIdentity) {
+		t.Fatal("prepared transition did not accept both committed serving epochs")
+	}
+	if got := compactionReplicaIDs(state); len(got) != 4 || got[0] != 1 || got[3] != 4 {
+		t.Fatalf("transition compaction replicas = %+v", got)
+	}
+	old := identity.PermitIdentity
+	applyDataOK(t, &state, 3, DataCommand{
+		Type: DataRetireEpoch, Identity: nextIdentity, Epoch: &old,
+	})
+	if state.Accepts(identity) || !state.Accepts(nextIdentity) || len(state.PreparedReplicaIDs) != 0 {
+		t.Fatalf("retired epoch state = %+v", state)
+	}
+	if got := state.ReplicaIDs; len(got) != 3 || got[0] != 2 || got[2] != 4 {
+		t.Fatalf("active replicas after retirement = %+v", got)
+	}
+}
+
 func initializedRouteShard(t *testing.T, manifest Manifest, group, routeKey string) (DataState, ShardRequestIdentity) {
 	t.Helper()
 	identity := routeShardIdentity(t, manifest, group, routeKey)

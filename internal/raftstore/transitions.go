@@ -3,6 +3,7 @@ package raftstore
 import (
 	"errors"
 	"reflect"
+	"sort"
 
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 )
@@ -344,15 +345,32 @@ func validateFenceCompaction(
 	if !outboxCovered && !authorization.NodeEpochPermanentlyFenced {
 		return errors.New("raftstore: fence compaction lacks a final outbox or NodeEpoch proof")
 	}
-	if len(authorization.ReplicaApplied) != len(state.ReplicaIDs) {
+	replicaIDs := compactionReplicaIDs(state)
+	if len(authorization.ReplicaApplied) != len(replicaIDs) {
 		return errors.New("raftstore: fence compaction lacks every replica watermark")
 	}
 	for i, applied := range authorization.ReplicaApplied {
-		if applied.ReplicaID != state.ReplicaIDs[i] || applied.AppliedIndex <= fence.Revision.LogIndex {
+		if applied.ReplicaID != replicaIDs[i] || applied.AppliedIndex <= fence.Revision.LogIndex {
 			return errors.New("raftstore: a replica has not applied beyond the fence revision")
 		}
 	}
 	return nil
+}
+
+func compactionReplicaIDs(state DataState) []uint64 {
+	set := make(map[uint64]struct{}, len(state.ReplicaIDs)+len(state.PreparedReplicaIDs))
+	for _, replicaID := range state.ReplicaIDs {
+		set[replicaID] = struct{}{}
+	}
+	for _, replicaID := range state.PreparedReplicaIDs {
+		set[replicaID] = struct{}{}
+	}
+	replicaIDs := make([]uint64, 0, len(set))
+	for replicaID := range set {
+		replicaIDs = append(replicaIDs, replicaID)
+	}
+	sort.Slice(replicaIDs, func(i, j int) bool { return replicaIDs[i] < replicaIDs[j] })
+	return replicaIDs
 }
 
 func fenceMatchesRouteTombstone(fence clusterstate.ExecutionFence, route clusterstate.RouteWorkflowRecord) bool {

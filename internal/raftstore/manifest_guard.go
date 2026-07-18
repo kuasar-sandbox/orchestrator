@@ -10,17 +10,58 @@ import (
 )
 
 type AcceptedManifest struct {
-	ClusterID         string `json:"cluster_id"`
-	StorageGeneration string `json:"storage_generation"`
-	ManifestVersion   uint64 `json:"manifest_version"`
-	ManifestDigest    string `json:"manifest_digest"`
+	ClusterID            string `json:"cluster_id"`
+	StorageGeneration    string `json:"storage_generation"`
+	ManifestVersion      uint64 `json:"manifest_version"`
+	ManifestDigest       string `json:"manifest_digest"`
+	FormatVersion        uint32 `json:"format_version"`
+	SchemaVersion        uint32 `json:"schema_version"`
+	ProtocolVersion      uint32 `json:"protocol_version"`
+	HashVersion          string `json:"hash_version"`
+	VirtualShardCount    uint32 `json:"virtual_shard_count"`
+	RouteBucketCount     uint32 `json:"route_bucket_count"`
+	BuildBucketCount     uint32 `json:"build_bucket_count"`
+	ReplicationFactor    uint32 `json:"replication_factor"`
+	ServePermitMaxMillis uint64 `json:"serve_permit_max_millis"`
+	BootstrapTokenDigest string `json:"bootstrap_token_digest"`
 }
 
 func (a AcceptedManifest) Validate() error {
-	if a.ClusterID == "" || a.StorageGeneration == "" || a.ManifestVersion == 0 || !isSHA256(a.ManifestDigest) {
+	if a.ClusterID == "" || a.StorageGeneration == "" || a.ManifestVersion == 0 || !isSHA256(a.ManifestDigest) ||
+		a.FormatVersion != ManifestFormatV1 || a.SchemaVersion == 0 || a.ProtocolVersion == 0 ||
+		a.HashVersion != "ShardHashV1" || !isPowerOfTwo(a.VirtualShardCount) ||
+		!isPowerOfTwo(a.RouteBucketCount) || !isPowerOfTwo(a.BuildBucketCount) ||
+		a.ReplicationFactor != DefaultReplication || a.ServePermitMaxMillis == 0 ||
+		!isSHA256(a.BootstrapTokenDigest) {
 		return errors.New("raftstore: invalid accepted manifest state")
 	}
 	return nil
+}
+
+func (a AcceptedManifest) matchesFrozenParameters(next Manifest) bool {
+	return a.FormatVersion == next.FormatVersion &&
+		a.SchemaVersion == next.SchemaVersion &&
+		a.ProtocolVersion == next.ProtocolVersion &&
+		a.HashVersion == next.HashVersion &&
+		a.VirtualShardCount == next.VirtualShardCount &&
+		a.RouteBucketCount == next.RouteBucketCount &&
+		a.BuildBucketCount == next.BuildBucketCount &&
+		a.ReplicationFactor == next.ReplicationFactor &&
+		a.ServePermitMaxMillis == next.ServePermitMaxMillis &&
+		a.BootstrapTokenDigest == next.BootstrapTokenDigest
+}
+
+func acceptedManifest(manifest Manifest, digest string) AcceptedManifest {
+	return AcceptedManifest{
+		ClusterID: manifest.ClusterID, StorageGeneration: manifest.StorageGeneration,
+		ManifestVersion: manifest.ManifestVersion, ManifestDigest: digest,
+		FormatVersion: manifest.FormatVersion, SchemaVersion: manifest.SchemaVersion,
+		ProtocolVersion: manifest.ProtocolVersion, HashVersion: manifest.HashVersion,
+		VirtualShardCount: manifest.VirtualShardCount, RouteBucketCount: manifest.RouteBucketCount,
+		BuildBucketCount: manifest.BuildBucketCount, ReplicationFactor: manifest.ReplicationFactor,
+		ServePermitMaxMillis: manifest.ServePermitMaxMillis,
+		BootstrapTokenDigest: manifest.BootstrapTokenDigest,
+	}
 }
 
 func (a AcceptedManifest) Accept(next Manifest, digest string) (AcceptedManifest, error) {
@@ -34,6 +75,9 @@ func (a AcceptedManifest) Accept(next Manifest, digest string) (AcceptedManifest
 		return AcceptedManifest{}, errors.New("raftstore: unrelated manifest lineage")
 	}
 	if next.StorageGeneration == a.StorageGeneration {
+		if !a.matchesFrozenParameters(next) {
+			return AcceptedManifest{}, errors.New("raftstore: same-generation manifest changed frozen parameters")
+		}
 		switch {
 		case next.ManifestVersion < a.ManifestVersion:
 			return AcceptedManifest{}, errors.New("raftstore: manifest rollback rejected")
@@ -47,14 +91,12 @@ func (a AcceptedManifest) Accept(next Manifest, digest string) (AcceptedManifest
 		}
 	} else {
 		if next.Predecessor == nil || next.Predecessor.StorageGeneration != a.StorageGeneration ||
-			next.Predecessor.ManifestDigest != a.ManifestDigest || next.ManifestVersion != 1 {
+			next.Predecessor.ManifestDigest != a.ManifestDigest ||
+			next.Predecessor.ServePermitMaxMillis != a.ServePermitMaxMillis || next.ManifestVersion != 1 {
 			return AcceptedManifest{}, errors.New("raftstore: storage generation rollover is not linked to the accepted predecessor")
 		}
 	}
-	return AcceptedManifest{
-		ClusterID: next.ClusterID, StorageGeneration: next.StorageGeneration,
-		ManifestVersion: next.ManifestVersion, ManifestDigest: digest,
-	}, nil
+	return acceptedManifest(next, digest), nil
 }
 
 func FirstAcceptedManifest(manifest Manifest, digest string) (AcceptedManifest, error) {
@@ -64,10 +106,7 @@ func FirstAcceptedManifest(manifest Manifest, digest string) (AcceptedManifest, 
 	if manifest.ManifestVersion != 1 || !isSHA256(digest) {
 		return AcceptedManifest{}, errors.New("raftstore: first accepted manifest must start at version one")
 	}
-	return AcceptedManifest{
-		ClusterID: manifest.ClusterID, StorageGeneration: manifest.StorageGeneration,
-		ManifestVersion: manifest.ManifestVersion, ManifestDigest: digest,
-	}, nil
+	return acceptedManifest(manifest, digest), nil
 }
 
 type ManifestGuard struct{ Path string }

@@ -1,0 +1,180 @@
+package raftstore
+
+import (
+	"bytes"
+	"encoding/json"
+	"testing"
+
+	"github.com/kuasar-sandbox/orchestrator/internal/routeapi"
+	sm "github.com/lni/dragonboat/v4/statemachine"
+)
+
+func TestDataStateMachineAppliesConflictAndRestoresDeterministicSnapshot(t *testing.T) {
+	manifest := testManifest(4, "generation-1")
+	identity := routeShardIdentity(t, manifest, "/g", "rk")
+	replicas := replicaIDsForPlacement(manifest.DataShards[identity.ShardID])
+	machine := &DataStateMachine{raftShardID: DataRaftShardID(identity.ShardID), replicaID: replicas[0]}
+	updateDataMachine(t, machine, 1, DataCommand{
+		Type: DataInitializeShard, Identity: identity, Manifest: &manifest, ReplicaIDs: replicas,
+	}, true)
+	starting := routeStarting(t, manifest, "/g", "rk", "sandbox-1", 1, true)
+	updateDataMachine(t, machine, 2, DataCommand{
+		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{Absent: true}, Route: &starting,
+	}, true)
+	conflict := updateDataMachine(t, machine, 3, DataCommand{
+		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{LogIndex: 99}, Route: &starting,
+	}, false)
+	if !conflict.Conflict || machine.state.LastApplied != 3 ||
+		machine.state.Routes[routeMapKey("/g", "rk")].Revision.LogIndex != 2 {
+		t.Fatalf("committed conflict = %+v, state=%+v", conflict, machine.state)
+	}
+
+	var first, second bytes.Buffer
+	done := make(chan struct{})
+	if err := machine.SaveSnapshot(&first, nil, done); err != nil {
+		t.Fatal(err)
+	}
+	if err := machine.SaveSnapshot(&second, nil, done); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(first.Bytes(), second.Bytes()) {
+		t.Fatal("unchanged data state produced non-deterministic snapshots")
+	}
+
+	restored := &DataStateMachine{raftShardID: machine.raftShardID, replicaID: replicas[1]}
+	if err := restored.RecoverFromSnapshot(bytes.NewReader(first.Bytes()), nil, done); err != nil {
+		t.Fatal(err)
+	}
+	lookup, err := restored.Lookup(DataLookup{Route: &routeapi.ReadRouteRequest{
+		RequestIdentity: routeIdentity(identity), Group: "/g", RouteKey: "rk",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := lookup.(DataLookupResult)
+	if result.Route == nil || result.Route.Outcome != routeapi.ReadNeedLeader {
+		t.Fatalf("restored STARTING lookup = %+v", result)
+	}
+
+	corrupt := append([]byte(nil), first.Bytes()...)
+	corrupt[len(corrupt)-1] ^= 1
+	if err := restored.RecoverFromSnapshot(bytes.NewReader(corrupt), nil, done); err == nil {
+		t.Fatal("corrupt snapshot restored")
+	}
+}
+
+func TestSystemStateMachineReturnsQuorumPermitAndSnapshotsState(t *testing.T) {
+	manifest := testManifest(4, "generation-1")
+	digest, err := manifest.Digest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	machine := &SystemStateMachine{raftShardID: SystemRaftShardID, replicaID: 1}
+	updateSystemMachine(t, machine, 1, SystemCommand{
+		Type: SystemBootstrap, Manifest: &manifest, Digest: digest,
+	}, true)
+	updateSystemMachine(t, machine, 2, SystemCommand{
+		Type: SystemSetGates, Gates: &GateUpdate{Serve: true, Write: true, Cutover: true},
+	}, true)
+	permit := updateSystemMachine(t, machine, 3, SystemCommand{Type: SystemRefreshPermit}, true)
+	if permit.PermitGrant == nil || permit.PermitGrant.CommitIndex != 3 || !permit.PermitGrant.WriteGate {
+		t.Fatalf("permit result = %+v", permit)
+	}
+	conflict := updateSystemMachine(t, machine, 4, SystemCommand{
+		Type: SystemSetGates, Gates: &GateUpdate{Write: true},
+	}, false)
+	if !conflict.Conflict || machine.state.LastApplied != 4 {
+		t.Fatalf("System conflict = %+v, applied=%d", conflict, machine.state.LastApplied)
+	}
+
+	var snapshot bytes.Buffer
+	done := make(chan struct{})
+	if err := machine.SaveSnapshot(&snapshot, nil, done); err != nil {
+		t.Fatal(err)
+	}
+	restored := &SystemStateMachine{raftShardID: SystemRaftShardID, replicaID: 2}
+	if err := restored.RecoverFromSnapshot(bytes.NewReader(snapshot.Bytes()), nil, done); err != nil {
+		t.Fatal(err)
+	}
+	lookup, err := restored.Lookup(SystemStateLookup{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := lookup.(SystemState)
+	if state.ActiveManifestDigest != digest || state.LastApplied != 4 || !state.ServeGate {
+		t.Fatalf("restored System state = %+v", state)
+	}
+}
+
+func TestStateMachineRejectsWrongShardAndUnknownCommandFields(t *testing.T) {
+	manifest := testManifest(4, "generation-1")
+	identity := routeShardIdentity(t, manifest, "/g", "rk")
+	replicas := replicaIDsForPlacement(manifest.DataShards[identity.ShardID])
+	command, err := EncodeDataCommand(DataCommand{
+		Type: DataInitializeShard, Identity: identity, Manifest: &manifest, ReplicaIDs: replicas,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrong := &DataStateMachine{raftShardID: DataRaftShardID((identity.ShardID + 1) % manifest.VirtualShardCount), replicaID: replicas[0]}
+	if _, err := wrong.Update(sm.Entry{Index: 1, Cmd: command}); err == nil {
+		t.Fatal("command committed to another logical shard was accepted")
+	}
+	unknown := append(command[:len(command)-1], []byte(`,"unknown":true}`)...)
+	correct := &DataStateMachine{raftShardID: DataRaftShardID(identity.ShardID), replicaID: replicas[0]}
+	if _, err := correct.Update(sm.Entry{Index: 1, Cmd: unknown}); err == nil {
+		t.Fatal("committed command with unknown fields was accepted")
+	}
+}
+
+func updateDataMachine(
+	t *testing.T,
+	machine *DataStateMachine,
+	index uint64,
+	command DataCommand,
+	wantApplied bool,
+) DataApplyResult {
+	t.Helper()
+	raw, err := EncodeDataCommand(command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := machine.Update(sm.Entry{Index: index, Cmd: raw})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if (result.Value == 1) != wantApplied {
+		t.Fatalf("data command %s result = %+v", command.Type, result)
+	}
+	var decoded DataApplyResult
+	if err := json.Unmarshal(result.Data, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	return decoded
+}
+
+func updateSystemMachine(
+	t *testing.T,
+	machine *SystemStateMachine,
+	index uint64,
+	command SystemCommand,
+	wantApplied bool,
+) SystemApplyResult {
+	t.Helper()
+	raw, err := EncodeSystemCommand(command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := machine.Update(sm.Entry{Index: index, Cmd: raw})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if (result.Value == 1) != wantApplied {
+		t.Fatalf("System command %s result = %+v", command.Type, result)
+	}
+	var decoded SystemApplyResult
+	if err := json.Unmarshal(result.Data, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	return decoded
+}

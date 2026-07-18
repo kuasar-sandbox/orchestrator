@@ -101,6 +101,8 @@ type SystemState struct {
 	ActiveManifestDigest       string              `json:"active_manifest_digest"`
 	ServePermitMaxMillis       uint64              `json:"serve_permit_max_millis"`
 	HasPredecessor             bool                `json:"has_predecessor"`
+	PredecessorGeneration      string              `json:"predecessor_generation,omitempty"`
+	PredecessorManifestDigest  string              `json:"predecessor_manifest_digest,omitempty"`
 	PredecessorProofKind       RolloverProofKind   `json:"predecessor_proof_kind,omitempty"`
 	PredecessorProofDigest     string              `json:"predecessor_proof_digest,omitempty"`
 	PredecessorPermitMaxMillis uint64              `json:"predecessor_permit_max_millis,omitempty"`
@@ -137,20 +139,56 @@ func (s SystemState) Validate() error {
 		return errors.New("raftstore: incomplete System Group state")
 	}
 	if s.HasPredecessor {
-		if !isSHA256(s.PredecessorProofDigest) || s.PredecessorPermitMaxMillis == 0 ||
+		if s.PredecessorGeneration == "" || s.PredecessorGeneration == s.StorageGeneration ||
+			!isSHA256(s.PredecessorManifestDigest) || !isSHA256(s.PredecessorProofDigest) ||
+			s.PredecessorPermitMaxMillis == 0 ||
 			(s.PredecessorProofKind != RolloverConsensusClosure && s.PredecessorProofKind != RolloverExternalFence) {
 			return errors.New("raftstore: incomplete predecessor fencing state")
 		}
-	} else if s.PredecessorProofKind != "" || s.PredecessorProofDigest != "" || s.PredecessorPermitMaxMillis != 0 ||
+	} else if s.PredecessorGeneration != "" || s.PredecessorManifestDigest != "" ||
+		s.PredecessorProofKind != "" || s.PredecessorProofDigest != "" || s.PredecessorPermitMaxMillis != 0 ||
 		!s.PredecessorDrainComplete {
 		return errors.New("raftstore: invalid first-generation predecessor state")
+	}
+	if (s.WriteGate || s.CutoverGate) && !s.ServeGate {
+		return errors.New("raftstore: write/cutover gate requires serve gate")
+	}
+	if (s.ServeGate || s.WriteGate || s.CutoverGate) && !s.PredecessorDrainComplete {
+		return errors.New("raftstore: predecessor permits have not drained")
 	}
 	if s.Retired && (s.ServeGate || s.WriteGate || s.CutoverGate) {
 		return errors.New("raftstore: retired generation has an open gate")
 	}
+	if s.Retired != (s.Closure != nil) {
+		return errors.New("raftstore: generation closure and retired state disagree")
+	}
+	if s.Closure != nil {
+		if s.Closure.TargetStorageGeneration == "" || s.Closure.TargetStorageGeneration == s.StorageGeneration ||
+			!isSHA256(s.Closure.TargetManifestDigest) || !isSHA256(s.Closure.ProofDigest) ||
+			s.Closure.Kind != RolloverConsensusClosure || s.Closure.CommitIndex != s.LastApplied {
+			return errors.New("raftstore: invalid committed generation closure")
+		}
+	}
+	if s.Transition != nil {
+		if s.Recovery != nil || validateManifestTransitionState(*s.Transition, s.VirtualShardCount) != nil ||
+			s.Transition.Version != s.ActiveManifestVersion+1 ||
+			s.Transition.PreviousDigest != s.ActiveManifestDigest ||
+			s.Transition.NextSystemEpoch != s.SystemEpoch+1 {
+			return errors.New("raftstore: invalid active manifest transition")
+		}
+	}
 	if s.Recovery != nil {
 		if err := s.Recovery.Validate(); err != nil {
 			return err
+		}
+		if !s.HasPredecessor || !s.PredecessorDrainComplete ||
+			s.Recovery.Epoch != s.SystemEpoch ||
+			s.Recovery.SourceClusterID != s.ClusterID ||
+			s.Recovery.SourceStorageGeneration != s.PredecessorGeneration ||
+			s.Recovery.SourceManifestDigest != s.PredecessorManifestDigest ||
+			s.Recovery.TargetStorageGeneration != s.StorageGeneration ||
+			s.Recovery.TargetManifestDigest != s.ActiveManifestDigest {
+			return errors.New("raftstore: recovery epoch does not match its fenced source and target")
 		}
 		if s.ServeGate || s.WriteGate || s.CutoverGate {
 			return errors.New("raftstore: recovery epoch requires closed normal-operation gates")
@@ -242,6 +280,8 @@ func ApplySystemCommand(state SystemState, index uint64, command SystemCommand) 
 		if manifest.Predecessor == nil {
 			next.PredecessorDrainComplete = true
 		} else {
+			next.PredecessorGeneration = manifest.Predecessor.StorageGeneration
+			next.PredecessorManifestDigest = manifest.Predecessor.ManifestDigest
 			next.PredecessorProofKind = manifest.Predecessor.Kind
 			next.PredecessorProofDigest = manifest.Predecessor.ProofDigest
 			next.PredecessorPermitMaxMillis = manifest.Predecessor.ServePermitMaxMillis
@@ -295,7 +335,8 @@ func ApplySystemCommand(state SystemState, index uint64, command SystemCommand) 
 		next.SystemEpoch = state.Transition.NextSystemEpoch
 		next.Transition = nil
 	case SystemCloseGeneration:
-		if !state.Initialized || state.Retired || command.Closure == nil || command.Closure.CommitIndex != 0 ||
+		if !state.Initialized || state.Retired || state.Transition != nil || state.Recovery != nil ||
+			command.Closure == nil || command.Closure.CommitIndex != 0 ||
 			command.Closure.TargetStorageGeneration == "" || command.Closure.TargetStorageGeneration == state.StorageGeneration ||
 			!isSHA256(command.Closure.TargetManifestDigest) || !isSHA256(command.Closure.ProofDigest) ||
 			command.Closure.Kind != RolloverConsensusClosure {
@@ -314,14 +355,18 @@ func ApplySystemCommand(state SystemState, index uint64, command SystemCommand) 
 		}
 		next.PredecessorDrainComplete = true
 	case SystemBeginRecovery:
-		if !state.Initialized || state.Retired || state.Recovery != nil || command.Recovery == nil || command.Recovery.Validate() != nil ||
+		if !state.Initialized || state.Retired || !state.HasPredecessor || !state.PredecessorDrainComplete ||
+			state.Transition != nil || state.Recovery != nil || command.Recovery == nil || command.Recovery.Validate() != nil ||
+			command.Recovery.Epoch != state.SystemEpoch+1 || command.Recovery.SourceClusterID != state.ClusterID ||
+			command.Recovery.SourceStorageGeneration != state.PredecessorGeneration ||
+			command.Recovery.SourceManifestDigest != state.PredecessorManifestDigest ||
 			command.Recovery.TargetStorageGeneration != state.StorageGeneration ||
 			command.Recovery.TargetManifestDigest != state.ActiveManifestDigest || command.Recovery.Phase != RecoveryPreparing {
 			return state, systemConflict("invalid recovery epoch")
 		}
 		recovery := *command.Recovery
 		next.Recovery = &recovery
-		next.SystemEpoch++
+		next.SystemEpoch = recovery.Epoch
 		next.ServeGate, next.WriteGate, next.CutoverGate = false, false, false
 	case SystemAdvanceRecovery:
 		if state.Recovery == nil || command.RecoveryAdvance == nil ||
@@ -388,6 +433,29 @@ func allTransitionsComplete(shards []ShardTransition) bool {
 		}
 	}
 	return true
+}
+
+func validateManifestTransitionState(transition ManifestTransition, virtualShards uint32) error {
+	if transition.Version == 0 || !isSHA256(transition.Digest) || !isSHA256(transition.PreviousDigest) ||
+		transition.Digest == transition.PreviousDigest || transition.NextSystemEpoch == 0 ||
+		len(transition.Shards) != int(virtualShards)+1 {
+		return errors.New("raftstore: incomplete manifest transition")
+	}
+	for index, shard := range transition.Shards {
+		want := uint32(index - 1)
+		if index == 0 {
+			want = ^uint32(0)
+		}
+		if shard.ShardID != want {
+			return errors.New("raftstore: transition shards are not complete and ordered")
+		}
+		switch shard.Stage {
+		case TransitionPending, TransitionCatchingUp, TransitionPromoted, TransitionOldRemoved, TransitionComplete:
+		default:
+			return errors.New("raftstore: invalid transition stage")
+		}
+	}
+	return nil
 }
 
 func validRecoveryAdvance(from, to RecoveryPhase) bool {
