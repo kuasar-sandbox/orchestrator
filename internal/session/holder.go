@@ -2,6 +2,7 @@ package session
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"sync"
@@ -21,13 +22,15 @@ var (
 )
 
 type ServeIdentity struct {
-	ClusterID         string
-	StorageGeneration string
-	SystemEpoch       uint64
+	ClusterID         string `json:"cluster_id"`
+	StorageGeneration string `json:"storage_generation"`
+	SystemEpoch       uint64 `json:"system_epoch"`
+	ManifestDigest    string `json:"manifest_digest"`
 }
 
 func (i ServeIdentity) Validate() error {
-	if i.ClusterID == "" || i.StorageGeneration == "" || i.SystemEpoch == 0 {
+	digest, err := hex.DecodeString(i.ManifestDigest)
+	if i.ClusterID == "" || i.StorageGeneration == "" || i.SystemEpoch == 0 || err != nil || len(digest) != 32 {
 		return errors.New("session: incomplete serving identity")
 	}
 	return nil

@@ -140,5 +140,12 @@ func probeRequest(nodeID string) placement.PlacementProbeRequest {
 }
 
 func testServeIdentity() ServeIdentity {
-	return ServeIdentity{ClusterID: "c1", StorageGeneration: "g1", SystemEpoch: 1}
+	return testServeIdentityAt(1)
+}
+
+func testServeIdentityAt(epoch uint64) ServeIdentity {
+	return ServeIdentity{
+		ClusterID: "c1", StorageGeneration: "g1", SystemEpoch: epoch,
+		ManifestDigest: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+	}
 }

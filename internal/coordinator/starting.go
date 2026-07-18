@@ -62,7 +62,7 @@ type StartingCoordinator struct {
 }
 
 func NewStartingCoordinator(config Config, prober PairProber, dispatcher Dispatcher, routes RouteCommitter, builds BuildCommitter, rounds SandboxRoundSource) (*StartingCoordinator, error) {
-	if config.ServeIdentity.ClusterID == "" || config.ServeIdentity.StorageGeneration == "" || config.ServeIdentity.SystemEpoch == 0 {
+	if err := config.ServeIdentity.Validate(); err != nil {
 		return nil, errors.New("coordinator: complete serving identity is required")
 	}
 	if prober == nil || dispatcher == nil {

@@ -331,7 +331,7 @@ func TestProbeRPCLatencyExpiresOtherwiseUsableSamples(t *testing.T) {
 	}
 	dispatcher := &dispatcherStub{store: store, results: map[string][]session.DispatchReply{}}
 	coordinator, err := NewStartingCoordinator(Config{
-		ServeIdentity:       session.ServeIdentity{ClusterID: "c1", StorageGeneration: "g1", SystemEpoch: 1},
+		ServeIdentity:       coordinatorServeIdentity(),
 		PlacementRoundLimit: 2, Clock: func() time.Time { return now }, TieBreaker: fixedTie(false),
 	}, prober, dispatcher, store, store, nil)
 	if err != nil {
@@ -349,13 +349,20 @@ func TestProbeRPCLatencyExpiresOtherwiseUsableSamples(t *testing.T) {
 func newTestCoordinator(t *testing.T, store *workflowStoreStub, prober *pairProberStub, dispatcher *dispatcherStub, rounds SandboxRoundSource) *StartingCoordinator {
 	t.Helper()
 	coordinator, err := NewStartingCoordinator(Config{
-		ServeIdentity:       session.ServeIdentity{ClusterID: "c1", StorageGeneration: "g1", SystemEpoch: 1},
+		ServeIdentity:       coordinatorServeIdentity(),
 		PlacementRoundLimit: 2, Clock: time.Now, TieBreaker: fixedTie(false),
 	}, prober, dispatcher, store, store, rounds)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return coordinator
+}
+
+func coordinatorServeIdentity() session.ServeIdentity {
+	return session.ServeIdentity{
+		ClusterID: "c1", StorageGeneration: "g1", SystemEpoch: 1,
+		ManifestDigest: strings.Repeat("a", 64),
+	}
 }
 
 func routeStartingRecord(t *testing.T, sandboxID string, round uint64, candidates []cluster.PlacementCandidate, rejected []uint32) cluster.RouteWorkflowRecord {

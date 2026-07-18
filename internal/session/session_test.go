@@ -327,7 +327,7 @@ func TestHolderProbeUsesLocalObservationAndPermit(t *testing.T) {
 	}
 	now = now.Add(900 * time.Millisecond)
 	response, err := holder.Probe(context.Background(), ProbeCall{
-		ServeIdentity: ServeIdentity{ClusterID: "c1", StorageGeneration: "g1", SystemEpoch: 3},
+		ServeIdentity: testServeIdentityAt(3),
 		Request: placement.PlacementProbeRequest{
 			Kind: placement.ObjectSandbox, NodeID: registration.NodeID,
 			ExpectedNodeEpoch: registration.NodeEpoch, ExpectedSessionSeq: registration.SessionSeq,
@@ -340,7 +340,7 @@ func TestHolderProbeUsesLocalObservationAndPermit(t *testing.T) {
 	}
 	now = now.Add(101 * time.Millisecond)
 	response, err = holder.Probe(context.Background(), ProbeCall{
-		ServeIdentity: ServeIdentity{ClusterID: "c1", StorageGeneration: "g1", SystemEpoch: 3},
+		ServeIdentity: testServeIdentityAt(3),
 		Request: placement.PlacementProbeRequest{
 			Kind: placement.ObjectSandbox, NodeID: registration.NodeID,
 			ExpectedNodeEpoch: registration.NodeEpoch, ExpectedSessionSeq: registration.SessionSeq,
@@ -620,7 +620,7 @@ func testDispatchCommand(t *testing.T, registration Registration) DispatchComman
 		t.Fatal(err)
 	}
 	return DispatchCommand{
-		ServeIdentity: ServeIdentity{ClusterID: "c1", StorageGeneration: "g1", SystemEpoch: 1},
+		ServeIdentity: testServeIdentity(),
 		Kind:          cluster.ExecutionKindSandbox, Group: "/g", RouteKey: "rk", ObjectID: "s1",
 		NodeID: registration.NodeID, NodeEpoch: registration.NodeEpoch, DataEndpoint: registration.DataEndpoint,
 		Intent: intent, Binding: cluster.ExecutionBindingIntent{
