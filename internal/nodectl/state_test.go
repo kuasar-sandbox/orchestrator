@@ -6,7 +6,7 @@ import (
 )
 
 func makeState(physMem, hostMem uint64) *State {
-	return NewState(physMem, 8000, hostMem, 1500, Watermarks{
+	return NewState(physMem, 8000, hostMem, 1500, Resources{}, Watermarks{
 		OperationalMarginFactor: 0.10,
 		HighFactor:              0.85,
 		LowFactor:               0.70,
@@ -34,6 +34,27 @@ func TestNewState_DerivedPool(t *testing.T) {
 	wantPool := wantBudgetAfterHost - wantMargin
 	if s.AllocatablePool.MemoryBytes != wantPool {
 		t.Errorf("AllocatablePool = %d, want %d", s.AllocatablePool.MemoryBytes, wantPool)
+	}
+}
+
+func TestNewState_DeductsBuildReservationBeforeMargin(t *testing.T) {
+	s := NewState(100<<30, 8000, 16<<30, 1500, Resources{MemoryBytes: 8 << 30}, Watermarks{
+		OperationalMarginFactor: 0.10,
+		HighFactor:              0.85,
+		LowFactor:               0.70,
+		EmergencyFactor:         0.05,
+	})
+
+	base := uint64(76 << 30)
+	wantMargin := uint64(float64(base) * 0.10)
+	if s.BuildReserved.MemoryBytes != 8<<30 {
+		t.Fatalf("BuildReserved.MemoryBytes = %d, want %d", s.BuildReserved.MemoryBytes, uint64(8<<30))
+	}
+	if s.OperationalMargin.MemoryBytes != wantMargin {
+		t.Fatalf("OperationalMargin.MemoryBytes = %d, want %d", s.OperationalMargin.MemoryBytes, wantMargin)
+	}
+	if want := base - wantMargin; s.AllocatablePool.MemoryBytes != want {
+		t.Fatalf("AllocatablePool.MemoryBytes = %d, want %d", s.AllocatablePool.MemoryBytes, want)
 	}
 }
 

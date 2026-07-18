@@ -70,7 +70,7 @@ func renderConductorConfig(template, resolve bool, path string) ([]byte, error) 
 		return nil, err
 	}
 	if resolve && cfg.ResourceListen != nil && cfg.ResourceListen.Enabled {
-		r, rerr := nodectl.Resolve(cfg.ResourceListen)
+		r, rerr := nodectl.Resolve(cfg.ResourceListen, cfg.Builder)
 		if rerr != nil {
 			return nil, fmt.Errorf("resource_listen: %w", rerr)
 		}

@@ -16,7 +16,7 @@ func startTestServer(t *testing.T, physMem uint64) (*Server, *Client, func()) {
 	sock := filepath.Join(dir, "ctl.sock")
 	statePath := filepath.Join(dir, "state.json")
 
-	state := NewState(physMem, 8000, 1<<30, 1500, Watermarks{
+	state := NewState(physMem, 8000, 1<<30, 1500, Resources{}, Watermarks{
 		OperationalMarginFactor: 0.10,
 		HighFactor:              0.85,
 		LowFactor:               0.70,
@@ -212,7 +212,7 @@ func TestServer_PersistAcrossRestart(t *testing.T) {
 	statePath := filepath.Join(dir, "state.json")
 
 	build := func() (*Server, *Client, context.CancelFunc, chan struct{}) {
-		state := NewState(8<<30, 8000, 1<<30, 1500, Watermarks{
+		state := NewState(8<<30, 8000, 1<<30, 1500, Resources{}, Watermarks{
 			OperationalMarginFactor: 0.10,
 			HighFactor:              0.85,
 			LowFactor:               0.70,

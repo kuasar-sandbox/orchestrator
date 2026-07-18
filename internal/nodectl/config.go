@@ -24,6 +24,7 @@ type Resolved struct {
 	PhysicalMemory uint64
 	PhysicalCPU    uint64 // milli-cpu
 	HostReserved   Resources
+	BuildReserved  Resources
 
 	Watermarks Watermarks
 
@@ -44,7 +45,7 @@ type Resolved struct {
 // allocatable pool + grant rate, and parses durations. An empty Socket falls back
 // to the protocol default (DefaultSocket, shared with sandbox-ctl). Returns an
 // error if any field is malformed.
-func Resolve(c *config.ResourceListenConfig) (*Resolved, error) {
+func Resolve(c *config.ResourceListenConfig, builder config.BuilderConfig) (*Resolved, error) {
 	c.ApplyDefaults()
 
 	listen := c.Socket
@@ -92,6 +93,28 @@ func Resolve(c *config.ResourceListenConfig) (*Resolved, error) {
 		MemoryBytes: hostMem,
 		CPUMilli:    uint64(c.Resources.HostReserved.CPU * 1000),
 	}
+	buildMemory, err := util.ParseSize(builder.Memory)
+	if err != nil {
+		return nil, fmt.Errorf("builder.memory: %w", err)
+	}
+	if builder.MaxConcurrent < 0 || (builder.MaxConcurrent > 0 && buildMemory > ^uint64(0)/uint64(builder.MaxConcurrent)) {
+		return nil, fmt.Errorf("builder.max_concurrent and builder.memory overflow the build reservation")
+	}
+	buildReserved := buildMemory * uint64(builder.MaxConcurrent)
+	if builder.MemoryMax != "" {
+		memoryMax, err := util.ParseSize(builder.MemoryMax)
+		if err != nil {
+			return nil, fmt.Errorf("builder.memory_max: %w", err)
+		}
+		if memoryMax < buildReserved {
+			buildReserved = memoryMax
+		}
+	}
+	out.BuildReserved = Resources{MemoryBytes: buildReserved}
+	if out.HostReserved.MemoryBytes > out.PhysicalMemory ||
+		out.BuildReserved.MemoryBytes > out.PhysicalMemory-out.HostReserved.MemoryBytes {
+		return nil, fmt.Errorf("host_reserved.memory + build_reserved exceeds physical memory")
+	}
 
 	out.Watermarks = Watermarks{
 		OperationalMarginFactor: c.Watermarks.OperationalMarginFactor,
@@ -107,7 +130,7 @@ func Resolve(c *config.ResourceListenConfig) (*Resolved, error) {
 			out.Watermarks.StartupFactor, out.Watermarks.EmergencyFactor)
 	}
 
-	pool := uint64(float64(out.PhysicalMemory-out.HostReserved.MemoryBytes) *
+	pool := uint64(float64(out.PhysicalMemory-out.HostReserved.MemoryBytes-out.BuildReserved.MemoryBytes) *
 		(1 - out.Watermarks.OperationalMarginFactor))
 	out.MemoryGrantPerSecBytes = uint64(float64(pool) * c.RateLimits.MemoryGrantPerSecFactor)
 

@@ -32,8 +32,8 @@ var _ orch.ResourceProbe = resourceProbe{}
 // defaults). It returns once the listener is bound (the controller serves in a
 // background goroutine), or an error if setup fails. When resource_listen is
 // absent/disabled serve never calls this and sandboxes fall back to static cgroup.
-func startResourceController(ctx context.Context, rcfg *config.ResourceListenConfig, slogger *slog.Logger) (orch.ResourceProbe, error) {
-	resolved, err := nodectl.Resolve(rcfg)
+func startResourceController(ctx context.Context, rcfg *config.ResourceListenConfig, builder config.BuilderConfig, slogger *slog.Logger) (orch.ResourceProbe, error) {
+	resolved, err := nodectl.Resolve(rcfg, builder)
 	if err != nil {
 		return nil, err
 	}
@@ -41,6 +41,7 @@ func startResourceController(ctx context.Context, rcfg *config.ResourceListenCon
 	state := nodectl.NewState(
 		resolved.PhysicalMemory, resolved.PhysicalCPU,
 		resolved.HostReserved.MemoryBytes, resolved.HostReserved.CPUMilli,
+		resolved.BuildReserved,
 		resolved.Watermarks)
 
 	persister := &nodectl.Persister{Path: resolved.StatePath}
@@ -99,7 +100,8 @@ func startResourceController(ctx context.Context, rcfg *config.ResourceListenCon
 	go reclaimer.Run(ctx)
 
 	slogger.Info("resource controller listening (resource_listen)", "socket", resolved.Listen,
-		"pool_mib", state.AllocatablePool.MemoryBytes>>20, "host_reserved_mib", resolved.HostReserved.MemoryBytes>>20)
+		"pool_mib", state.AllocatablePool.MemoryBytes>>20, "host_reserved_mib", resolved.HostReserved.MemoryBytes>>20,
+		"build_reserved_mib", resolved.BuildReserved.MemoryBytes>>20)
 
 	go func() {
 		if err := srv.Serve(ctx); err != nil {

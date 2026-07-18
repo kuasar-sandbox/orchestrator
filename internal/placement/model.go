@@ -175,10 +175,10 @@ func projectSandbox(snapshot PlacementLoadSnapshot, demand SandboxDemand) (Probe
 
 	if snapshot.SandboxResourceController {
 		effectiveMemory := demand.EffectiveStartupMemory()
-		if effectiveMemory == 0 || snapshot.BuildReservedMemory >= snapshot.AllocatablePoolMemory {
+		if effectiveMemory == 0 || snapshot.AllocatablePoolMemory == 0 {
 			return ProbeReject, RateComponents{}, "sandbox memory capacity/demand is unknown"
 		}
-		allocatablePool := snapshot.AllocatablePoolMemory - snapshot.BuildReservedMemory
+		allocatablePool := snapshot.AllocatablePoolMemory
 		if snapshot.StartupPoolMemory == 0 || effectiveMemory > allocatablePool || effectiveMemory > snapshot.StartupPoolMemory {
 			return ProbeReject, RateComponents{}, "sandbox can never fit memory pools"
 		}

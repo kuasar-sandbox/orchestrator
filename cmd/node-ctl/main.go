@@ -153,7 +153,7 @@ func runConductor(args []string, log *slog.Logger) error {
 	// Optionally host the node resource controller in-process (resource_listen,
 	// node-resource.md). Disabled => sandboxes use static cgroup.
 	if cfg.ResourceListen != nil && cfg.ResourceListen.Enabled {
-		probe, err := startResourceController(ctx, cfg.ResourceListen, log)
+		probe, err := startResourceController(ctx, cfg.ResourceListen, cfg.Builder, log)
 		if err != nil {
 			return fmt.Errorf("resource_listen: %w", err)
 		}

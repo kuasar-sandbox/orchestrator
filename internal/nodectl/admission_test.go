@@ -10,7 +10,7 @@ import (
 // default factor values + a startup_factor of 0.5.
 func newTestState(t *testing.T, mem uint64) *State {
 	t.Helper()
-	return NewState(mem, 8000, 0, 0, Watermarks{
+	return NewState(mem, 8000, 0, 0, Resources{}, Watermarks{
 		OperationalMarginFactor: 0,
 		HighFactor:              0.85,
 		LowFactor:               0.70,

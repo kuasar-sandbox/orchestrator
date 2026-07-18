@@ -18,7 +18,7 @@ func TestRatioPPMRoundsUpAndSaturates(t *testing.T) {
 	}
 }
 
-func TestProjectedSandboxRateAndBuildReservation(t *testing.T) {
+func TestProjectedSandboxRateUsesNetAllocatablePool(t *testing.T) {
 	snapshot := baseSnapshot()
 	request := PlacementProbeRequest{
 		Kind: ObjectSandbox, NodeID: "n1", ExpectedNodeEpoch: 7, ExpectedSessionSeq: 11,
@@ -33,8 +33,8 @@ func TestProjectedSandboxRateAndBuildReservation(t *testing.T) {
 
 	snapshot.BuildReservedMemory = 7 << 30
 	response = ProbePlacement(snapshot, 100*time.Millisecond, request)
-	if response.Class != ProbeReject {
-		t.Fatalf("overlapping build reservation = %+v", response)
+	if response.Class != ProbeImmediate || response.RatePPM != 750_000 {
+		t.Fatalf("build reservation was deducted from an already-net pool: %+v", response)
 	}
 }
 

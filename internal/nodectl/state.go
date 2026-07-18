@@ -104,6 +104,7 @@ type State struct {
 
 	NodeBudget        Resources               `json:"node_budget"`
 	HostReserved      Resources               `json:"host_reserved"`
+	BuildReserved     Resources               `json:"build_reserved"`
 	OperationalMargin Resources               `json:"operational_margin"`
 	AllocatablePool   Resources               `json:"allocatable_pool"`
 	Wm                Watermarks              `json:"watermarks"`
@@ -115,10 +116,11 @@ type State struct {
 // NewState constructs a State with derived watermarks.
 func NewState(physicalMem uint64, physicalCPUMilli uint64,
 	hostReservedMem uint64, hostReservedCPUMilli uint64,
+	buildReserved Resources,
 	wm Watermarks) *State {
 	node := Resources{MemoryBytes: physicalMem, CPUMilli: physicalCPUMilli}
 	host := Resources{MemoryBytes: hostReservedMem, CPUMilli: hostReservedCPUMilli}
-	budget := node.Sub(host)
+	budget := node.Sub(host).Sub(buildReserved)
 	margin := Resources{
 		MemoryBytes: uint64(float64(budget.MemoryBytes) * wm.OperationalMarginFactor),
 		CPUMilli:    uint64(float64(budget.CPUMilli) * wm.OperationalMarginFactor),
@@ -128,6 +130,7 @@ func NewState(physicalMem uint64, physicalCPUMilli uint64,
 		Version:           1,
 		NodeBudget:        node,
 		HostReserved:      host,
+		BuildReserved:     buildReserved,
 		OperationalMargin: margin,
 		AllocatablePool:   pool,
 		Wm:                wm,
