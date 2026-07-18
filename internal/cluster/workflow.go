@@ -315,6 +315,7 @@ type RouteTombstoneState struct {
 	SandboxID        string                      `json:"sandbox_id,omitempty"`
 	NodeID           string                      `json:"node_id,omitempty"`
 	NodeEpoch        uint64                      `json:"node_epoch,omitempty"`
+	BindingDigest    string                      `json:"binding_digest,omitempty"`
 	LastEventSeq     uint64                      `json:"last_event_seq,omitempty"`
 	Proof            TerminalProof               `json:"proof,omitempty"`
 	TerminalReason   string                      `json:"terminal_reason,omitempty"`
@@ -325,12 +326,14 @@ type RouteTombstoneState struct {
 func (s RouteTombstoneState) Validate() error {
 	if s.PlacementFailure != nil {
 		if s.SandboxID != "" || s.NodeID != "" || s.NodeEpoch != 0 || s.LastEventSeq != 0 ||
-			s.TerminalReason != "" || s.Proof != (TerminalProof{}) || s.FailureRevision != (Revision{}) {
+			s.BindingDigest != "" || s.TerminalReason != "" || s.Proof != (TerminalProof{}) ||
+			s.FailureRevision != (Revision{}) {
 			return errors.New("cluster: placement-failure TOMBSTONE cannot contain an execution proof")
 		}
 		return s.PlacementFailure.Validate()
 	}
-	if s.SandboxID == "" || s.NodeID == "" || s.NodeEpoch == 0 || s.LastEventSeq == 0 || s.TerminalReason == "" {
+	if s.SandboxID == "" || s.NodeID == "" || s.NodeEpoch == 0 || !validDigest(s.BindingDigest) ||
+		s.LastEventSeq == 0 || s.TerminalReason == "" {
 		return errors.New("cluster: incomplete TOMBSTONE")
 	}
 	if s.Proof.FencedNodeID != s.NodeID || s.Proof.FencedNodeEpoch != s.NodeEpoch {
