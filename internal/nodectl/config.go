@@ -2,8 +2,11 @@ package nodectl
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"runtime"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
@@ -78,21 +81,22 @@ func Resolve(c *config.ResourceListenConfig, builder config.BuilderConfig) (*Res
 	if c.Resources.PhysicalCPU == "auto" || c.Resources.PhysicalCPU == "" {
 		out.PhysicalCPU = uint64(runtime.NumCPU()) * 1000
 	} else {
-		var cores int
-		if _, err := fmt.Sscanf(c.Resources.PhysicalCPU, "%d", &cores); err != nil {
-			return nil, fmt.Errorf("physical_cpu: %w", err)
+		cores, err := strconv.ParseUint(c.Resources.PhysicalCPU, 10, 64)
+		if err != nil || cores == 0 || cores > math.MaxUint64/1000 {
+			return nil, fmt.Errorf("physical_cpu: invalid core count %q", c.Resources.PhysicalCPU)
 		}
-		out.PhysicalCPU = uint64(cores) * 1000
+		out.PhysicalCPU = cores * 1000
 	}
 
 	hostMem, err := util.ParseSize(c.Resources.HostReserved.Memory)
 	if err != nil {
 		return nil, fmt.Errorf("host_reserved.memory: %w", err)
 	}
-	out.HostReserved = Resources{
-		MemoryBytes: hostMem,
-		CPUMilli:    uint64(c.Resources.HostReserved.CPU * 1000),
+	if c.Resources.HostReserved.CPU < 0 || math.IsNaN(c.Resources.HostReserved.CPU) ||
+		math.IsInf(c.Resources.HostReserved.CPU, 0) || c.Resources.HostReserved.CPU > float64(math.MaxUint64)/1000 {
+		return nil, fmt.Errorf("host_reserved.cpu: invalid CPU reservation")
 	}
+	out.HostReserved = Resources{MemoryBytes: hostMem, CPUMilli: uint64(math.Ceil(c.Resources.HostReserved.CPU * 1000))}
 	buildMemory, err := util.ParseSize(builder.Memory)
 	if err != nil {
 		return nil, fmt.Errorf("builder.memory: %w", err)
@@ -110,10 +114,18 @@ func Resolve(c *config.ResourceListenConfig, builder config.BuilderConfig) (*Res
 			buildReserved = memoryMax
 		}
 	}
-	out.BuildReserved = Resources{MemoryBytes: buildReserved}
+	buildCPU, err := builderCPUReservation(builder)
+	if err != nil {
+		return nil, err
+	}
+	out.BuildReserved = Resources{MemoryBytes: buildReserved, CPUMilli: buildCPU}
 	if out.HostReserved.MemoryBytes > out.PhysicalMemory ||
 		out.BuildReserved.MemoryBytes > out.PhysicalMemory-out.HostReserved.MemoryBytes {
 		return nil, fmt.Errorf("host_reserved.memory + build_reserved exceeds physical memory")
+	}
+	if out.HostReserved.CPUMilli > out.PhysicalCPU ||
+		out.BuildReserved.CPUMilli > out.PhysicalCPU-out.HostReserved.CPUMilli {
+		return nil, fmt.Errorf("host_reserved.cpu + build_reserved exceeds physical CPU")
 	}
 
 	out.Watermarks = Watermarks{
@@ -169,6 +181,48 @@ func Resolve(c *config.ResourceListenConfig, builder config.BuilderConfig) (*Res
 	}
 
 	return out, nil
+}
+
+func builderCPUReservation(builder config.BuilderConfig) (uint64, error) {
+	if builder.MaxConcurrent < 0 || builder.VCPU < 0 {
+		return 0, fmt.Errorf("builder.max_concurrent and builder.vcpu must be non-negative")
+	}
+	if builder.MaxConcurrent == 0 {
+		return 0, nil
+	}
+	vcpu := builder.VCPU
+	if vcpu == 0 {
+		vcpu = 2
+	}
+	concurrency := uint64(builder.MaxConcurrent)
+	if uint64(vcpu) > math.MaxUint64/1000/concurrency {
+		return 0, fmt.Errorf("builder.max_concurrent and builder.vcpu overflow the build CPU reservation")
+	}
+	reserved := uint64(vcpu) * concurrency * 1000
+	if builder.CPUQuota == "" {
+		return reserved, nil
+	}
+	quota, err := parseCPUQuotaMilli(builder.CPUQuota)
+	if err != nil {
+		return 0, err
+	}
+	if quota < reserved {
+		reserved = quota
+	}
+	return reserved, nil
+}
+
+func parseCPUQuotaMilli(raw string) (uint64, error) {
+	raw = strings.TrimSpace(raw)
+	if !strings.HasSuffix(raw, "%") {
+		return 0, fmt.Errorf("builder.cpu_quota: expected percentage")
+	}
+	percent, err := strconv.ParseFloat(strings.TrimSpace(strings.TrimSuffix(raw, "%")), 64)
+	if err != nil || percent <= 0 || math.IsNaN(percent) || math.IsInf(percent, 0) ||
+		percent > float64(math.MaxUint64)/10 {
+		return 0, fmt.Errorf("builder.cpu_quota: invalid percentage %q", raw)
+	}
+	return uint64(math.Ceil(percent * 10)), nil
 }
 
 func readMemTotalBytes() (uint64, error) {

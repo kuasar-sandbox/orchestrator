@@ -7,6 +7,7 @@ import (
 	"errors"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -150,21 +151,31 @@ func authorityCommand(
 
 func newAuthority(
 	t *testing.T,
-	st *store.Store,
-	sandbox *sandboxAdmissionFake,
+	journal nodeexec.WorkflowJournal,
+	sandbox nodeexec.SandboxAdmissionController,
+) *nodeexec.Authority {
+	t.Helper()
+	return newAuthorityWithCapacity(t, journal, sandbox, func(context.Context) (nodeexec.BuildCapacity, string, error) {
+		return nodeexec.BuildCapacity{Slots: 1, Memory: 2 << 30, QueueLimit: 4}, "", nil
+	})
+}
+
+func newAuthorityWithCapacity(
+	t *testing.T,
+	journal nodeexec.WorkflowJournal,
+	sandbox nodeexec.SandboxAdmissionController,
+	capacity nodeexec.BuildCapacitySource,
 ) *nodeexec.Authority {
 	t.Helper()
 	authority, err := nodeexec.NewAuthority(
-		st,
+		journal,
 		sandbox,
 		func(context.Context) (nodeexec.LocalSessionIdentity, error) {
 			return nodeexec.LocalSessionIdentity{
 				NodeID: "node-1", NodeEpoch: 7, SessionSeq: 11, DataEndpoint: "10.0.0.1:8443",
 			}, nil
 		},
-		func(context.Context) (nodeexec.BuildCapacity, string, error) {
-			return nodeexec.BuildCapacity{Slots: 1, Memory: 2 << 30, QueueLimit: 4}, "", nil
-		},
+		capacity,
 		func(record nodeexec.DispatchRecord) (*types.Build, error) {
 			return &types.Build{
 				BuildID: record.ObjectID, TemplateID: "transient-" + record.ObjectID,
@@ -183,6 +194,56 @@ func newAuthority(
 		t.Fatal(err)
 	}
 	return authority
+}
+
+type recordBarrierJournal struct {
+	*store.Store
+	mu      sync.Mutex
+	arrived int
+	ready   chan struct{}
+}
+
+func (j *recordBarrierJournal) RecordSandboxWorkflow(
+	ctx context.Context,
+	dispatch nodeexec.DispatchRecord,
+	decision nodeexec.AdmissionDecision,
+) (*nodeexec.WorkflowRecord, error) {
+	j.mu.Lock()
+	j.arrived++
+	if j.arrived == 2 {
+		close(j.ready)
+	}
+	j.mu.Unlock()
+	select {
+	case <-j.ready:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.Store.RecordSandboxWorkflow(ctx, dispatch, decision)
+}
+
+type concurrentSandboxAdmission struct {
+	*sandboxAdmissionFake
+	mu sync.Mutex
+}
+
+func (f *concurrentSandboxAdmission) PrepareAdmission(
+	id, digest string,
+	demand nodectl.SandboxAdmissionDemand,
+) (nodectl.PreparedAdmissionResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.sandboxAdmissionFake.PrepareAdmission(id, digest, demand)
+}
+
+func (f *concurrentSandboxAdmission) ReleaseAdmission(
+	id, digest, reason string,
+) (nodectl.PreparedAdmissionResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.sandboxAdmissionFake.ReleaseAdmission(id, digest, reason)
 }
 
 func TestAuthorityBuildDispatchIsDurableAndSessionFenced(t *testing.T) {
@@ -219,6 +280,151 @@ func TestAuthorityBuildDispatchIsDurableAndSessionFenced(t *testing.T) {
 	fenced, err := authority.AdmitAndDispatch(context.Background(), command)
 	if err != nil || fenced.Outcome != clusterstate.DispatchSessionMoved {
 		t.Fatalf("fenced session = %+v, %v", fenced, err)
+	}
+}
+
+func TestAuthorityFencesEverySessionOwnedWorkerEntry(t *testing.T) {
+	st := authorityStore(t)
+	sandbox := &sandboxAdmissionFake{prepared: map[string]nodectl.PreparedAdmissionResult{}, wake: make(chan struct{})}
+	authority := newAuthority(t, st, sandbox)
+	authority.FenceStaleSession()
+
+	if err := authority.PromoteSandboxQueue(context.Background()); !errors.Is(err, nodeexec.ErrSessionFenced) {
+		t.Fatalf("PromoteSandboxQueue error = %v", err)
+	}
+	if err := authority.ReconcileSandboxAdmissions(context.Background(), 1); !errors.Is(err, nodeexec.ErrSessionFenced) {
+		t.Fatalf("ReconcileSandboxAdmissions error = %v", err)
+	}
+	if _, err := authority.PromoteBuildQueue(context.Background()); !errors.Is(err, nodeexec.ErrSessionFenced) {
+		t.Fatalf("PromoteBuildQueue error = %v", err)
+	}
+	if _, err := authority.Launchable(context.Background(), clusterstate.ExecutionKindSandbox, "", 1); !errors.Is(err, nodeexec.ErrSessionFenced) {
+		t.Fatalf("Launchable error = %v", err)
+	}
+	if _, err := authority.ClaimSandbox(context.Background(), nil); !errors.Is(err, nodeexec.ErrSessionFenced) {
+		t.Fatalf("ClaimSandbox error = %v", err)
+	}
+	if _, err := authority.ClaimBuild(context.Background(), nil); !errors.Is(err, nodeexec.ErrSessionFenced) {
+		t.Fatalf("ClaimBuild error = %v", err)
+	}
+	if err := authority.FailSandbox(context.Background(), nil, "fenced"); !errors.Is(err, nodeexec.ErrSessionFenced) {
+		t.Fatalf("FailSandbox error = %v", err)
+	}
+	if err := authority.FinalizeWorkflow(context.Background(), clusterstate.ExecutionKindSandbox, "", "", ""); !errors.Is(err, nodeexec.ErrSessionFenced) {
+		t.Fatalf("FinalizeWorkflow error = %v", err)
+	}
+}
+
+func TestConcurrentConflictingSandboxDispatchKeepsWinningReservation(t *testing.T) {
+	st := authorityStore(t)
+	command := authorityCommand(t, clusterstate.ExecutionKindSandbox, "sandbox-race")
+	base := &sandboxAdmissionFake{
+		prepared: map[string]nodectl.PreparedAdmissionResult{
+			command.ObjectID: {
+				SandboxID: command.ObjectID, DemandDigest: command.Intent.DemandDigest,
+				State: nodectl.PreparedAdmitted, ReservationToken: "shared-token",
+			},
+		},
+		wake: make(chan struct{}),
+	}
+	sandbox := &concurrentSandboxAdmission{sandboxAdmissionFake: base}
+	journal := &recordBarrierJournal{Store: st, ready: make(chan struct{})}
+	authority := newAuthority(t, journal, sandbox)
+	conflicting := command
+	conflicting.Intent.ProviderPolicyVersion = "provider-v2/policy-v2"
+
+	var (
+		replies [2]session.DispatchReply
+		errs    [2]error
+		wait    sync.WaitGroup
+	)
+	wait.Add(2)
+	go func() {
+		defer wait.Done()
+		replies[0], errs[0] = authority.AdmitAndDispatch(context.Background(), command)
+	}()
+	go func() {
+		defer wait.Done()
+		replies[1], errs[1] = authority.AdmitAndDispatch(context.Background(), conflicting)
+	}()
+	wait.Wait()
+	accepted, conflicts := 0, 0
+	for index, reply := range replies {
+		if errs[index] != nil {
+			t.Fatalf("dispatch %d error = %v", index, errs[index])
+		}
+		switch reply.Outcome {
+		case clusterstate.DispatchAcceptedAdmitted:
+			accepted++
+		case clusterstate.DispatchConflict:
+			conflicts++
+		default:
+			t.Fatalf("dispatch %d reply = %+v", index, reply)
+		}
+	}
+	if accepted != 1 || conflicts != 1 {
+		t.Fatalf("accepted=%d conflicts=%d replies=%+v", accepted, conflicts, replies)
+	}
+	if len(base.released) != 0 {
+		t.Fatalf("loser released the winning reservation: %+v", base.released)
+	}
+	winner, err := st.GetNodeWorkflow(context.Background(), clusterstate.ExecutionKindSandbox, command.ObjectID)
+	if err != nil || winner == nil || winner.ReservationToken != "shared-token" {
+		t.Fatalf("winner = %+v, %v", winner, err)
+	}
+}
+
+func TestBuildSafetyFenceTerminatesExistingQueue(t *testing.T) {
+	st := authorityStore(t)
+	sandbox := &sandboxAdmissionFake{prepared: map[string]nodectl.PreparedAdmissionResult{}, wake: make(chan struct{})}
+	var (
+		capacityMu   sync.RWMutex
+		safetyReason string
+	)
+	authority := newAuthorityWithCapacity(t, st, sandbox, func(context.Context) (nodeexec.BuildCapacity, string, error) {
+		capacityMu.RLock()
+		defer capacityMu.RUnlock()
+		return nodeexec.BuildCapacity{Slots: 1, Memory: 2 << 30, QueueLimit: 4}, safetyReason, nil
+	})
+	first := authorityCommand(t, clusterstate.ExecutionKindBuild, "build-running")
+	second := authorityCommand(t, clusterstate.ExecutionKindBuild, "build-queued")
+	if reply, err := authority.AdmitAndDispatch(context.Background(), first); err != nil ||
+		reply.Outcome != clusterstate.DispatchAcceptedAdmitted {
+		t.Fatalf("first Build = %+v, %v", reply, err)
+	}
+	if reply, err := authority.AdmitAndDispatch(context.Background(), second); err != nil ||
+		reply.Outcome != clusterstate.DispatchAcceptedQueued {
+		t.Fatalf("queued Build = %+v, %v", reply, err)
+	}
+	capacityMu.Lock()
+	safetyReason = "node_safety_state_rejects_build"
+	capacityMu.Unlock()
+	failed, err := authority.PromoteBuildQueue(context.Background())
+	if err != nil || len(failed) != 1 || failed[0].ObjectID != second.ObjectID ||
+		failed[0].AdmissionState != nodeexec.AdmissionTerminal {
+		t.Fatalf("safety failure = %+v, %v", failed, err)
+	}
+	launchable, err := authority.Launchable(context.Background(), clusterstate.ExecutionKindBuild, "", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, record := range launchable {
+		if record.ObjectID == second.ObjectID {
+			t.Fatal("safety-rejected queued Build became launchable")
+		}
+	}
+	pending, _, err := st.PendingExecutionEvents(context.Background(), "node-1", 7, routesync.EventCursor{}, 10, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, event := range pending {
+		if event.ObjectID == second.ObjectID {
+			found = event.State == string(clusterstate.BuildError) && event.Reason == safetyReason
+		}
+	}
+	if !found {
+		t.Fatalf("queued Build safety event not found: %+v", pending)
 	}
 }
 

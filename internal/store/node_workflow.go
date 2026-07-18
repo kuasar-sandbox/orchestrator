@@ -433,6 +433,87 @@ WHERE object_kind=? AND admission_state=? ORDER BY queue_sequence, object_id LIM
 	return promoted, nil
 }
 
+// FailQueuedBuildWorkflows converts a bounded FIFO batch into durable terminal
+// facts while a node-global safety fence rejects new Build execution. Accepted
+// queue entries stay bound to this node/build_id and are never dispatched again.
+func (s *Store) FailQueuedBuildWorkflows(
+	ctx context.Context,
+	reason string,
+	maxCount int,
+) ([]*nodeexec.WorkflowRecord, error) {
+	if reason == "" {
+		return nil, errors.New("store: queued Build rejection requires a safety reason")
+	}
+	if maxCount <= 0 {
+		maxCount = 64
+	}
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	rows, err := tx.QueryContext(ctx, `SELECT object_id FROM node_workflows
+WHERE object_kind=? AND admission_state=? ORDER BY queue_sequence, object_id LIMIT ?`,
+		clusterstate.ExecutionKindBuild, nodeexec.AdmissionQueued, maxCount)
+	if err != nil {
+		return nil, err
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	failed := make([]*nodeexec.WorkflowRecord, 0, len(ids))
+	for _, id := range ids {
+		record, err := getNodeWorkflowTx(ctx, tx, clusterstate.ExecutionKindBuild, id)
+		if err != nil {
+			return nil, err
+		}
+		if record == nil || record.AdmissionState != nodeexec.AdmissionQueued {
+			continue
+		}
+		build, err := s.getBuildTx(ctx, tx, record.ObjectID)
+		if err != nil {
+			return nil, err
+		}
+		if build == nil {
+			return nil, errors.New("store: queued Build object is missing")
+		}
+		update := nodeexec.EventUpdate{State: string(clusterstate.BuildError), Reason: reason}
+		event, err := executionEventFor(record, update)
+		if err != nil {
+			return nil, err
+		}
+		applyBuildState(build, update)
+		if err := s.putBuild(ctx, tx, build); err != nil {
+			return nil, err
+		}
+		record.AdmissionState = nodeexec.AdmissionTerminal
+		record.ResourceClaimed = false
+		record.ObjectState = event.State
+		record.EventSeq = event.EventSeq
+		record.LatestEvent = event
+		if err := updateNodeWorkflowTx(ctx, tx, record); err != nil {
+			return nil, err
+		}
+		failed = append(failed, record)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	if len(failed) > 0 {
+		s.notifyEvent()
+	}
+	return failed, nil
+}
+
 // ClaimBuildWorkflow moves a durably admitted Build into launch ownership.
 func (s *Store) ClaimBuildWorkflow(ctx context.Context, buildID, demandDigest string) (*nodeexec.WorkflowRecord, error) {
 	if buildID == "" || demandDigest == "" {

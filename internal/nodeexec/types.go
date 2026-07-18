@@ -18,6 +18,7 @@ var (
 	ErrWorkflowConflict = errors.New("nodeexec: workflow conflicts with existing dispatch")
 	ErrWorkflowMissing  = errors.New("nodeexec: workflow is missing")
 	ErrWorkflowState    = errors.New("nodeexec: workflow state does not permit the operation")
+	ErrSessionFenced    = errors.New("nodeexec: node-link session is fenced")
 )
 
 type LocalSessionIdentity struct {

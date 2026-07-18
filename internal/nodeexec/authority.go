@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sync/atomic"
+	"sync"
 
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/nodectl"
@@ -40,6 +40,7 @@ type WorkflowJournal interface {
 	ClaimSandboxWorkflow(context.Context, string, string, string) (*WorkflowRecord, error)
 	PrepareBuildWorkflow(context.Context, DispatchRecord, *types.Build, BuildCapacity, string) (*WorkflowRecord, error)
 	PromoteBuildQueue(context.Context, BuildCapacity, int) ([]*WorkflowRecord, error)
+	FailQueuedBuildWorkflows(context.Context, string, int) ([]*WorkflowRecord, error)
 	ClaimBuildWorkflow(context.Context, string, string) (*WorkflowRecord, error)
 	LaunchableNodeWorkflows(context.Context, clusterstate.ExecutionKind, string, uint64, string, int) ([]*WorkflowRecord, error)
 	SandboxWorkflowsForReconcile(context.Context, string, uint64, string, int) ([]*WorkflowRecord, error)
@@ -58,7 +59,8 @@ type Authority struct {
 	buildObject    BuildObjectSource
 	sandboxDemand  SandboxDemandSource
 	workWake       chan struct{}
-	sessionFenced  atomic.Bool
+	sessionMu      sync.RWMutex
+	sessionFenced  bool
 	buildBatchSize int
 }
 
@@ -80,7 +82,22 @@ func NewAuthority(
 	}, nil
 }
 
-func (a *Authority) FenceStaleSession() { a.sessionFenced.Store(true) }
+// FenceStaleSession is a mutation barrier. Once it returns, every operation
+// admitted by this SessionSeq has completed and no later operation can start.
+func (a *Authority) FenceStaleSession() {
+	a.sessionMu.Lock()
+	a.sessionFenced = true
+	a.sessionMu.Unlock()
+}
+
+func (a *Authority) beginSessionWork() (func(), bool) {
+	a.sessionMu.RLock()
+	if a.sessionFenced {
+		a.sessionMu.RUnlock()
+		return nil, false
+	}
+	return a.sessionMu.RUnlock, true
+}
 
 func (a *Authority) WorkWake() <-chan struct{} { return a.workWake }
 
@@ -100,9 +117,11 @@ func (a *Authority) AdmitAndDispatch(
 	if err := ctx.Err(); err != nil {
 		return session.DispatchReply{}, err
 	}
-	if a.sessionFenced.Load() {
+	done, active := a.beginSessionWork()
+	if !active {
 		return session.DispatchReply{Outcome: clusterstate.DispatchSessionMoved, Reason: "node-link session is fenced"}, nil
 	}
+	defer done()
 	identity, err := a.identity(ctx)
 	if err != nil {
 		return session.DispatchReply{}, err
@@ -171,8 +190,14 @@ func (a *Authority) AdmitAndDispatch(
 		if err != nil {
 			if errors.Is(err, ErrWorkflowConflict) {
 				if decision.ReservationToken != "" {
-					if _, releaseErr := a.sandbox.ReleaseAdmission(dispatch.ObjectID, dispatch.DemandDigest, "object_id_conflict"); releaseErr != nil {
-						return session.DispatchReply{}, errors.Join(err, releaseErr)
+					owned, ownerErr := a.workflowOwnsSandboxReservation(ctx, dispatch, decision.ReservationToken)
+					if ownerErr != nil {
+						return session.DispatchReply{}, errors.Join(err, ownerErr)
+					}
+					if !owned {
+						if _, releaseErr := a.sandbox.ReleaseAdmission(dispatch.ObjectID, dispatch.DemandDigest, "object_id_conflict"); releaseErr != nil {
+							return session.DispatchReply{}, errors.Join(err, releaseErr)
+						}
 					}
 				}
 				return session.DispatchReply{Outcome: clusterstate.DispatchConflict, Reason: err.Error()}, nil
@@ -202,6 +227,19 @@ func (a *Authority) AdmitAndDispatch(
 		a.notifyWork()
 	}
 	return session.DispatchReply{Outcome: record.Result, Reason: record.Reason}, nil
+}
+
+func (a *Authority) workflowOwnsSandboxReservation(
+	ctx context.Context,
+	dispatch DispatchRecord,
+	reservationToken string,
+) (bool, error) {
+	winner, err := a.journal.GetNodeWorkflow(ctx, clusterstate.ExecutionKindSandbox, dispatch.ObjectID)
+	if err != nil {
+		return false, err
+	}
+	return winner != nil && winner.DemandDigest == dispatch.DemandDigest &&
+		winner.ReservationToken == reservationToken, nil
 }
 
 func sandboxDecision(prepared nodectl.PreparedAdmissionResult) (AdmissionDecision, error) {
@@ -235,6 +273,11 @@ func sandboxDecision(prepared nodectl.PreparedAdmissionResult) (AdmissionDecisio
 // the command journal. An expired accepted queue entry becomes an ERROR fact,
 // never a second placement opportunity.
 func (a *Authority) PromoteSandboxQueue(ctx context.Context) error {
+	done, active := a.beginSessionWork()
+	if !active {
+		return ErrSessionFenced
+	}
+	defer done()
 	changed, err := a.sandbox.PromoteQueued()
 	if err != nil {
 		return err
@@ -275,6 +318,11 @@ func (a *Authority) PromoteSandboxQueue(ctx context.Context) error {
 // creating a new Admission record. Missing controller state for active work is
 // an error and must fail cluster startup for the current NodeEpoch.
 func (a *Authority) ReconcileSandboxAdmissions(ctx context.Context, limit int) error {
+	done, active := a.beginSessionWork()
+	if !active {
+		return ErrSessionFenced
+	}
+	defer done()
 	identity, err := a.identity(ctx)
 	if err != nil {
 		return err
@@ -388,9 +436,17 @@ func (a *Authority) reconcileSandboxFailure(
 }
 
 func (a *Authority) PromoteBuildQueue(ctx context.Context) ([]*WorkflowRecord, error) {
-	capacity, _, err := a.buildCapacity(ctx)
+	done, active := a.beginSessionWork()
+	if !active {
+		return nil, ErrSessionFenced
+	}
+	defer done()
+	capacity, safetyReason, err := a.buildCapacity(ctx)
 	if err != nil {
 		return nil, err
+	}
+	if safetyReason != "" {
+		return a.journal.FailQueuedBuildWorkflows(ctx, safetyReason, a.buildBatchSize)
 	}
 	promoted, err := a.journal.PromoteBuildQueue(ctx, capacity, a.buildBatchSize)
 	if err == nil && len(promoted) > 0 {
@@ -405,6 +461,11 @@ func (a *Authority) Launchable(
 	afterObjectID string,
 	limit int,
 ) ([]*WorkflowRecord, error) {
+	done, active := a.beginSessionWork()
+	if !active {
+		return nil, ErrSessionFenced
+	}
+	defer done()
 	identity, err := a.identity(ctx)
 	if err != nil {
 		return nil, err
@@ -416,6 +477,11 @@ func (a *Authority) Launchable(
 }
 
 func (a *Authority) ClaimSandbox(ctx context.Context, record *WorkflowRecord) (*WorkflowRecord, error) {
+	done, active := a.beginSessionWork()
+	if !active {
+		return nil, ErrSessionFenced
+	}
+	defer done()
 	if record == nil || record.Kind != clusterstate.ExecutionKindSandbox {
 		return nil, errors.New("nodeexec: Sandbox claim requires a Sandbox workflow")
 	}
@@ -430,6 +496,11 @@ func (a *Authority) ClaimSandbox(ctx context.Context, record *WorkflowRecord) (*
 }
 
 func (a *Authority) ClaimBuild(ctx context.Context, record *WorkflowRecord) (*WorkflowRecord, error) {
+	done, active := a.beginSessionWork()
+	if !active {
+		return nil, ErrSessionFenced
+	}
+	defer done()
 	if record == nil || record.Kind != clusterstate.ExecutionKindBuild {
 		return nil, errors.New("nodeexec: Build claim requires a Build workflow")
 	}
@@ -437,6 +508,11 @@ func (a *Authority) ClaimBuild(ctx context.Context, record *WorkflowRecord) (*Wo
 }
 
 func (a *Authority) FailSandbox(ctx context.Context, record *WorkflowRecord, reason string) error {
+	done, active := a.beginSessionWork()
+	if !active {
+		return ErrSessionFenced
+	}
+	defer done()
 	if record == nil || record.Kind != clusterstate.ExecutionKindSandbox || reason == "" {
 		return errors.New("nodeexec: Sandbox failure requires a workflow and reason")
 	}
@@ -455,6 +531,11 @@ func (a *Authority) FinalizeWorkflow(
 	kind clusterstate.ExecutionKind,
 	objectID, demandDigest, bindingDigest string,
 ) error {
+	done, active := a.beginSessionWork()
+	if !active {
+		return ErrSessionFenced
+	}
+	defer done()
 	if objectID == "" || demandDigest == "" || bindingDigest == "" {
 		return errors.New("nodeexec: finalization requires object identity and digests")
 	}
