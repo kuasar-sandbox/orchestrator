@@ -278,4 +278,17 @@ func TestServer_PersistAcrossRestart(t *testing.T) {
 		t.Error("reservation lost across restart")
 	}
 	s2.State.Unlock()
+	if err := c2.OwnPreparedReservation(tok); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c2.Reattach(tok, "wrong-sandbox"); err == nil {
+		t.Fatal("reattach accepted a token bound to another sandbox")
+	}
+	grant, err := c2.Reattach(tok, "sb-p")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if grant != 64<<20 {
+		t.Fatalf("reattached grant = %d, want %d", grant, uint64(64<<20))
+	}
 }

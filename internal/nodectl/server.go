@@ -141,7 +141,8 @@ func (s *Server) serveConn(ctx context.Context, conn net.Conn) {
 		// be set when the next message arrives. Sync the local token from
 		// req.Token (which the client carries as its auth field on every
 		// non-Admit message) so handleConnDrop later finds the reservation.
-		if token == "" && req.Token != "" {
+		// Reattach is excluded until its sandbox identity has been verified.
+		if token == "" && req.Token != "" && req.Type != TypeReattach {
 			token = req.Token
 		}
 		resp := s.dispatch(conn, req, &token)
@@ -309,12 +310,18 @@ func (s *Server) buildAdmitOK(conn net.Conn, req *Message, token *string) (*Mess
 // handleReattach re-binds a connection to an existing reservation
 // (after sandbox-ctl reconnect or controller restart).
 func (s *Server) handleReattach(conn net.Conn, req *Message, token *string) *Message {
+	if req.SandboxID == "" {
+		return &Message{Type: TypeError, Msg: "reattach requires sandbox ID"}
+	}
 	s.State.Lock()
 	defer s.State.Unlock()
 
 	res := s.State.Lookup(req.Token)
 	if res == nil {
 		return &Message{Type: TypeError, Msg: "unknown token"}
+	}
+	if res.SandboxID != req.SandboxID {
+		return &Message{Type: TypeError, Msg: "reservation belongs to another sandbox"}
 	}
 	res.Conn = conn
 	*token = req.Token
