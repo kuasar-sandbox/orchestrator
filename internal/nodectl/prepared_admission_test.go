@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -122,6 +123,36 @@ func TestPreparedAdmissionQueueSurvivesRestartAndPromotesFIFO(t *testing.T) {
 	if changed[0].ReservationToken != first.ReservationToken || changed[1].ReservationToken != second.ReservationToken {
 		t.Fatalf("promotion changed durable tokens: before=(%s,%s) after=%+v",
 			first.ReservationToken, second.ReservationToken, changed)
+	}
+}
+
+func TestPreparedAdmissionNewWorkCannotBypassQueuedHead(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	state := preparedTestState()
+	state.Lock()
+	state.Reservations["blocker"] = &Reservation{
+		Token: "blocker", SandboxID: "running", AllocatableNowMem: 15 << 30,
+		Floor: Resources{MemoryBytes: 15 << 30}, Stage: StageSettled,
+	}
+	state.Unlock()
+	controller := preparedTestController(t, state, path, 4)
+	firstDigest := preparedDigest("fifo-head")
+	secondDigest := preparedDigest("fifo-tail")
+	first, err := controller.PrepareAdmission("sandbox-1", firstDigest, preparedTestDemand(512<<20))
+	if err != nil || first.State != PreparedQueued {
+		t.Fatalf("first prepare = %+v, %v", first, err)
+	}
+	state.Lock()
+	state.Remove("blocker")
+	state.Unlock()
+	second, err := controller.PrepareAdmission("sandbox-2", secondDigest, preparedTestDemand(512<<20))
+	if err != nil || second.State != PreparedQueued {
+		t.Fatalf("new work bypassed queued head: first=%+v second=%+v err=%v", first, second, err)
+	}
+	changed, err := controller.PromoteQueued()
+	if err != nil || len(changed) != 2 || changed[0].SandboxID != "sandbox-1" ||
+		changed[1].SandboxID != "sandbox-2" {
+		t.Fatalf("FIFO promotion = %+v, %v", changed, err)
 	}
 }
 
@@ -379,6 +410,71 @@ func TestIdleSweeperReleasesPreparedAdmissionWithReservation(t *testing.T) {
 	defer state.Unlock()
 	if state.Lookup(prepared.ReservationToken) != nil {
 		t.Fatal("swept reservation remains allocated")
+	}
+}
+
+func TestIdleSweeperWakesPreparedQueueAfterDurableRelease(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	state := preparedTestState()
+	controller := preparedTestController(t, state, path, 4)
+	first, err := controller.PrepareAdmission(
+		"sandbox-1", preparedDigest("sweep-owner"), preparedTestDemand(15<<30),
+	)
+	if err != nil || first.State != PreparedAdmitted {
+		t.Fatalf("first prepare = %+v, %v", first, err)
+	}
+	secondDigest := preparedDigest("sweep-waiter")
+	second, err := controller.PrepareAdmission("sandbox-2", secondDigest, preparedTestDemand(512<<20))
+	if err != nil || second.State != PreparedQueued {
+		t.Fatalf("second prepare = %+v, %v", second, err)
+	}
+	for {
+		select {
+		case <-controller.Wake():
+			continue
+		default:
+		}
+		break
+	}
+	state.Lock()
+	state.Reservations[first.ReservationToken].StageEnteredAt = time.Now().Add(-time.Minute)
+	state.Unlock()
+	sweeper := &IdleSweeper{
+		State: state, Admission: controller.admission, PreparedAdmission: controller,
+		Allocator: NewAllocator(AllocatorPolicy{}), Persister: &Persister{Path: path},
+		StartupTTL: time.Second, Logf: t.Logf,
+	}
+	sweeper.sweep()
+	select {
+	case <-controller.Wake():
+	case <-time.After(time.Second):
+		t.Fatal("prepared queue was not woken after swept capacity release")
+	}
+	changed, err := controller.PromoteQueued()
+	if err != nil || len(changed) != 1 || changed[0].SandboxID != "sandbox-2" ||
+		changed[0].State != PreparedAdmitted {
+		t.Fatalf("promotion after sweep = %+v, %v", changed, err)
+	}
+}
+
+func TestPreparedAdmissionKeepsPublishedStateOnDirectorySyncFailure(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	state := preparedTestState()
+	controller := preparedTestController(t, state, path, 4)
+	controller.persister.syncParent = func(*os.File) error { return errors.New("injected directory sync failure") }
+	digest := preparedDigest("published-prepare")
+	result, err := controller.PrepareAdmission("sandbox-1", digest, preparedTestDemand(1<<30))
+	if !FlushPublished(err) || result.State != PreparedAdmitted {
+		t.Fatalf("published prepare = %+v, %v", result, err)
+	}
+	current, getErr := controller.GetAdmission("sandbox-1", digest)
+	if getErr != nil || current != result {
+		t.Fatalf("in-memory published state = %+v, %v", current, getErr)
+	}
+	loaded, loadErr := (&Persister{Path: path}).Load()
+	if loadErr != nil || loaded.PreparedSandboxAdmissions["sandbox-1"] == nil ||
+		loaded.Reservations[result.ReservationToken] == nil {
+		t.Fatalf("visible published state = %+v, %v", loaded, loadErr)
 	}
 }
 

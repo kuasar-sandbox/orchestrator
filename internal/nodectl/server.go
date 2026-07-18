@@ -615,14 +615,15 @@ func filepathDir(p string) string {
 // expired creating-stage TTLs. It calls back into State / Admission to
 // release the reservation.
 type IdleSweeper struct {
-	State      *State
-	Admission  *AdmissionController
-	Allocator  *Allocator
-	Persister  *Persister
-	StartupTTL time.Duration
-	Heartbeat  time.Duration
-	Interval   time.Duration
-	Logf       func(string, ...any)
+	State             *State
+	Admission         *AdmissionController
+	PreparedAdmission *PreparedAdmissionController
+	Allocator         *Allocator
+	Persister         *Persister
+	StartupTTL        time.Duration
+	Heartbeat         time.Duration
+	Interval          time.Duration
+	Logf              func(string, ...any)
 }
 
 func (i *IdleSweeper) Run(ctx context.Context) {
@@ -647,7 +648,6 @@ func (i *IdleSweeper) Run(ctx context.Context) {
 func (i *IdleSweeper) sweep() {
 	now := time.Now()
 	i.State.Lock()
-	defer i.State.Unlock()
 
 	removed := make(map[string]*Reservation)
 	preparedBefore := make(map[string]PreparedSandboxAdmission)
@@ -676,25 +676,36 @@ func (i *IdleSweeper) sweep() {
 		}
 	}
 	if len(removed) == 0 {
+		i.State.Unlock()
 		return
 	}
 	if err := i.Persister.Flush(i.State); err != nil {
-		for token, reservation := range removed {
-			i.State.Reservations[token] = reservation
-		}
-		for sandboxID, before := range preparedBefore {
-			if record := i.State.PreparedSandboxAdmissions[sandboxID]; record != nil {
-				*record = before
+		if !FlushPublished(err) {
+			for token, reservation := range removed {
+				i.State.Reservations[token] = reservation
+			}
+			for sandboxID, before := range preparedBefore {
+				if record := i.State.PreparedSandboxAdmissions[sandboxID]; record != nil {
+					*record = before
+				}
 			}
 		}
+		i.State.Unlock()
 		log.Printf("[node-ctl] sweep persist: %v", err)
-		return
+		if !FlushPublished(err) {
+			return
+		}
+	} else {
+		i.State.Unlock()
 	}
 	for token := range removed {
 		i.Allocator.CleanupHistory(token)
 	}
 	// Durable release opens headroom for the admission worker.
 	i.Admission.PushWake()
+	if i.PreparedAdmission != nil {
+		i.PreparedAdmission.SignalCapacityChange()
+	}
 }
 
 func (i *IdleSweeper) rememberPreparedLocked(

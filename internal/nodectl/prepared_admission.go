@@ -125,6 +125,13 @@ func NewPreparedAdmissionController(
 
 func (c *PreparedAdmissionController) Wake() <-chan struct{} { return c.wakeCh }
 
+func (c *PreparedAdmissionController) SignalCapacityChange() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.scheduleQueueWakeLocked(BlockNone)
+	c.notify()
+}
+
 func validatePreparedInput(sandboxID, demandDigest string) error {
 	if sandboxID == "" {
 		return errors.New("nodectl: sandbox ID is required")
@@ -180,9 +187,18 @@ func (c *PreparedAdmissionController) PrepareAdmission(
 		}
 		return result, nil
 	}
+	hasQueued := preparedQueueDepthLocked(c.state) > 0
 	c.state.Unlock()
 
-	outcome := c.admission.AnalyzeAndConsume(demand.message(sandboxID))
+	var outcome Outcome
+	if hasQueued {
+		outcome = c.admission.AnalyzeRequest(demand.message(sandboxID))
+		if outcome.Status == OutcomeAdmitted {
+			outcome = Outcome{Status: OutcomeShortTermBlock, Block: BlockNone}
+		}
+	} else {
+		outcome = c.admission.AnalyzeAndConsume(demand.message(sandboxID))
+	}
 	now := c.clock()
 	record := &PreparedSandboxAdmission{
 		SandboxID: sandboxID, DemandDigest: demandDigest, Demand: demand,
@@ -224,13 +240,14 @@ func (c *PreparedAdmissionController) PrepareAdmission(
 		}
 	}
 	c.state.PreparedSandboxAdmissions[sandboxID] = record
-	if err := c.persister.Flush(c.state); err != nil {
+	flushErr := c.persister.Flush(c.state)
+	if flushErr != nil && !FlushPublished(flushErr) {
 		delete(c.state.PreparedSandboxAdmissions, sandboxID)
 		if record.State == PreparedAdmitted {
 			c.state.Remove(record.ReservationToken)
 		}
 		c.state.Unlock()
-		return PreparedAdmissionResult{}, err
+		return PreparedAdmissionResult{}, flushErr
 	}
 	c.state.Unlock()
 	result := preparedResult(record)
@@ -238,7 +255,7 @@ func (c *PreparedAdmissionController) PrepareAdmission(
 		c.scheduleQueueWakeLocked(outcome.Block)
 	}
 	c.notify()
-	return result, nil
+	return result, flushErr
 }
 
 func (c *PreparedAdmissionController) ClaimAdmission(sandboxID, demandDigest string) (PreparedAdmissionResult, error) {
@@ -268,29 +285,32 @@ func (c *PreparedAdmissionController) ClaimAdmission(sandboxID, demandDigest str
 		record.State = PreparedReleased
 		record.Reason = "reservation_missing"
 		record.UpdatedAt = c.clock()
-		if err := c.persister.Flush(c.state); err != nil {
+		flushErr := c.persister.Flush(c.state)
+		if flushErr != nil && !FlushPublished(flushErr) {
 			*record = previous
 			c.state.Unlock()
-			return PreparedAdmissionResult{}, err
+			return PreparedAdmissionResult{}, flushErr
 		}
 		result := preparedResult(record)
 		c.state.Unlock()
 		c.notify()
-		return result, nil
+		return result, flushErr
 	}
+	var flushErr error
 	if record.State == PreparedAdmitted {
 		previous := *record
 		record.State = PreparedClaimed
 		record.UpdatedAt = c.clock()
-		if err := c.persister.Flush(c.state); err != nil {
+		flushErr = c.persister.Flush(c.state)
+		if flushErr != nil && !FlushPublished(flushErr) {
 			*record = previous
 			c.state.Unlock()
-			return PreparedAdmissionResult{}, err
+			return PreparedAdmissionResult{}, flushErr
 		}
 	}
 	result := preparedResult(record)
 	c.state.Unlock()
-	return result, nil
+	return result, flushErr
 }
 
 func (c *PreparedAdmissionController) ReleaseAdmission(sandboxID, demandDigest, reason string) (PreparedAdmissionResult, error) {
@@ -320,20 +340,21 @@ func (c *PreparedAdmissionController) ReleaseAdmission(sandboxID, demandDigest, 
 	record.Reason = reason
 	record.UpdatedAt = c.clock()
 	c.state.Remove(record.ReservationToken)
-	if err := c.persister.Flush(c.state); err != nil {
+	flushErr := c.persister.Flush(c.state)
+	if flushErr != nil && !FlushPublished(flushErr) {
 		*record = previous
 		if reservation != nil {
 			c.state.Reservations[reservation.Token] = reservation
 		}
 		c.state.Unlock()
-		return PreparedAdmissionResult{}, err
+		return PreparedAdmissionResult{}, flushErr
 	}
 	result := preparedResult(record)
 	c.state.Unlock()
 	c.admission.PushWake()
 	c.scheduleQueueWakeLocked(BlockNone)
 	c.notify()
-	return result, nil
+	return result, flushErr
 }
 
 // FinalizeAdmission removes local SID/demand dedupe only after Registry proves
@@ -363,13 +384,14 @@ func (c *PreparedAdmissionController) FinalizeAdmission(sandboxID, demandDigest 
 		return ErrPreparedAdmissionState
 	}
 	delete(c.state.PreparedSandboxAdmissions, sandboxID)
-	if err := c.persister.Flush(c.state); err != nil {
+	flushErr := c.persister.Flush(c.state)
+	if flushErr != nil && !FlushPublished(flushErr) {
 		c.state.PreparedSandboxAdmissions[sandboxID] = record
 		c.state.Unlock()
-		return err
+		return flushErr
 	}
 	c.state.Unlock()
-	return nil
+	return flushErr
 }
 
 func (c *PreparedAdmissionController) PromoteQueued() ([]PreparedAdmissionResult, error) {
@@ -425,19 +447,23 @@ func (c *PreparedAdmissionController) PromoteQueued() ([]PreparedAdmissionResult
 			return changed, errors.New("nodectl: unknown queued admission outcome")
 		}
 		record.UpdatedAt = c.clock()
-		if err := c.persister.Flush(c.state); err != nil {
+		flushErr := c.persister.Flush(c.state)
+		if flushErr != nil && !FlushPublished(flushErr) {
 			if record.State == PreparedAdmitted {
 				c.state.Remove(record.ReservationToken)
 			}
 			*record = previous
 			c.state.Unlock()
-			return changed, err
+			return changed, flushErr
 		}
 		result := preparedResult(record)
 		c.state.Unlock()
 		blockedBy = BlockNone
 		changed = append(changed, result)
 		c.notify()
+		if flushErr != nil {
+			return changed, flushErr
+		}
 	}
 	return changed, nil
 }

@@ -369,6 +369,44 @@ func TestNodeLinkOutboxBoundsEventBurstBeforeHeartbeat(t *testing.T) {
 	}
 }
 
+func TestNodeLinkOutboxBoundsCommandACKBurstBeforeDurableEvent(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	outbox := make(chan *routesync.Msg, 64)
+	highOut := make(chan *routesync.Msg, 128)
+	eventOut := make(chan *routesync.Msg, 1)
+	hbUpdate := make(chan struct{}, 1)
+	var hbMu sync.Mutex
+	latestHeartbeat := &routesync.Msg{Type: routesync.TypeHeartbeat, Beat: &routesync.Heartbeat{Counts: 11}}
+	for index := 0; index < 100; index++ {
+		highOut <- &routesync.Msg{
+			Type: routesync.TypeCmdAck,
+			Ack:  &routesync.CmdAck{CmdID: fmt.Sprintf("cmd-%d", index), Status: routesync.AckAccepted},
+		}
+	}
+	eventOut <- &routesync.Msg{
+		Type:           routesync.TypeExecutionEvent,
+		ExecutionEvent: &routesync.ExecutionEvent{ObjectID: "sandbox-durable"},
+	}
+	hbUpdate <- struct{}{}
+	go runNodeLinkOutbox(ctx, outbox, highOut, eventOut, hbUpdate, &hbMu, &latestHeartbeat)
+
+	acksBeforeEvent := 0
+	for {
+		message := receiveOutboxMsg(t, outbox)
+		if message.Type == routesync.TypeExecutionEvent {
+			break
+		}
+		acksBeforeEvent++
+		if acksBeforeEvent > 32 {
+			t.Fatal("sustained command ACK backlog starved durable event")
+		}
+	}
+	if acksBeforeEvent == 0 {
+		t.Fatal("durable event bypassed command ACK priority")
+	}
+}
+
 type fakeDurableEventOutbox struct {
 	mu      sync.Mutex
 	events  []routesync.ExecutionEvent

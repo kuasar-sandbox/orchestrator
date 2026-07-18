@@ -1,6 +1,7 @@
 package nodectl
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -95,5 +96,22 @@ func TestPersisterAtomicWrite(t *testing.T) {
 	if loaded.NodeBudget.MemoryBytes != s2.NodeBudget.MemoryBytes {
 		t.Errorf("got = %d, want %d (latest)",
 			loaded.NodeBudget.MemoryBytes, s2.NodeBudget.MemoryBytes)
+	}
+}
+
+func TestPersisterMarksErrorsAfterRenameAsPublished(t *testing.T) {
+	dir := t.TempDir()
+	p := &Persister{
+		Path:       filepath.Join(dir, "state.json"),
+		syncParent: func(*os.File) error { return errors.New("injected directory sync failure") },
+	}
+	state := makeState(100<<30, 16<<30)
+	err := p.Flush(state)
+	if !FlushPublished(err) {
+		t.Fatalf("post-rename error = %v, want published marker", err)
+	}
+	loaded, loadErr := (&Persister{Path: p.Path}).Load()
+	if loadErr != nil || loaded == nil || loaded.NodeBudget.MemoryBytes != state.NodeBudget.MemoryBytes {
+		t.Fatalf("published snapshot = %+v, %v", loaded, loadErr)
 	}
 }
