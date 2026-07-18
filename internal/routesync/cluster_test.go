@@ -93,6 +93,15 @@ func TestNodeLinkCodecRoundTrip(t *testing.T) {
 	if h.Beat == nil || !h.Beat.Draining || h.Beat.Pool != 8<<30 {
 		t.Fatalf("heartbeat round-trip: %+v", h.Beat)
 	}
+	load := &PlacementLoadSnapshot{
+		NodeID: "n1", NodeEpoch: 7, SessionSeq: 11, DataEndpoint: "10.0.0.1:8443",
+		SampleSeq: 3, LoadModelVersion: 1, SandboxSlotCapacity: 10,
+		SandboxQueueLimit: 20, SandboxRateTokenAvailable: true,
+	}
+	l := roundTrip(t, &Msg{Type: TypePlacementLoad, Load: load})
+	if l.Load == nil || *l.Load != *load {
+		t.Fatalf("placement snapshot round-trip: %+v", l.Load)
+	}
 
 	reg := roundTrip(t, &Msg{Type: TypeRegister, Register: &Register{
 		Version: Version, Subscribe: &Subscribe{Kind: KindRegistry}, ResumeFrom: MakeRevToken("node-fp", 100),

@@ -132,15 +132,16 @@ type Msg struct {
 	SID      string      `json:"sid,omitempty"`      // delete | command target
 	// Cluster node-link variants (node.md §10): node_register / heartbeat / cmd_ack
 	// flow node -> registry; command flows registry -> node; rev stamps down events.
-	NodeReg  *NodeRegister `json:"node_register,omitempty"`
-	Beat     *Heartbeat    `json:"heartbeat,omitempty"`
-	Cmd      *Command      `json:"command,omitempty"`
-	Ack      *CmdAck       `json:"cmd_ack,omitempty"`
-	Rev      int64         `json:"rev,omitempty"` // per-shard monotonic revision for resume_from (§5.3)
-	RevToken string        `json:"rev_token,omitempty"`
-	FullSync bool          `json:"full_sync,omitempty"`   // bookmark follows a full snapshot, not an incremental replay
-	Build    *BuildEvent   `json:"build_event,omitempty"` // node -> registry build state (§5.1/§7.5)
-	EventAck *EventAck     `json:"event_ack,omitempty"`   // registry -> node durable event acknowledgement
+	NodeReg  *NodeRegister          `json:"node_register,omitempty"`
+	Beat     *Heartbeat             `json:"heartbeat,omitempty"`
+	Load     *PlacementLoadSnapshot `json:"placement_load,omitempty"`
+	Cmd      *Command               `json:"command,omitempty"`
+	Ack      *CmdAck                `json:"cmd_ack,omitempty"`
+	Rev      int64                  `json:"rev,omitempty"` // per-shard monotonic revision for resume_from (§5.3)
+	RevToken string                 `json:"rev_token,omitempty"`
+	FullSync bool                   `json:"full_sync,omitempty"`   // bookmark follows a full snapshot, not an incremental replay
+	Build    *BuildEvent            `json:"build_event,omitempty"` // node -> registry build state (§5.1/§7.5)
+	EventAck *EventAck              `json:"event_ack,omitempty"`   // registry -> node durable event acknowledgement
 }
 
 // Hello is the orchestrator's first down-frame; it carries the operational Policy.

@@ -1,5 +1,7 @@
 package routesync
 
+import "github.com/kuasar-sandbox/orchestrator/internal/placementproto"
+
 // Cluster node-link message types (node.md §10 / cluster.md). They extend the
 // Msg union for the node <-> registry channel: the node DIALS the registry and is
 // the execution-state authority (its sandbox routes flow as ID-only
@@ -9,12 +11,15 @@ package routesync
 // only the handshake (NodeRegister vs Hello) and the uplink (Command vs Wake)
 // differ. Build events arrive with Phase 5.
 const (
-	TypeNodeRegister = "node_register" // node -> registry (node identity; first up-frame)
-	TypeHeartbeat    = "heartbeat"     // node -> registry (water level)
-	TypeCommand      = "command"       // registry -> node (lifecycle / key primitive)
-	TypeCmdAck       = "cmd_ack"       // node -> registry (command accepted / rejected)
-	TypeEventAck     = "event_ack"     // registry -> node (committed event watermark)
+	TypeNodeRegister  = "node_register"  // node -> registry (node identity; first up-frame)
+	TypeHeartbeat     = "heartbeat"      // legacy node -> registry water level
+	TypePlacementLoad = "placement_load" // node -> Holder request-time placement snapshot
+	TypeCommand       = "command"        // registry -> node (lifecycle / key primitive)
+	TypeCmdAck        = "cmd_ack"        // node -> registry (command accepted / rejected)
+	TypeEventAck      = "event_ack"      // registry -> node (committed event watermark)
 )
+
+type PlacementLoadSnapshot = placementproto.PlacementLoadSnapshot
 
 // NodeLinkPath is the HTTP path node-ctl conductor serve dials to open its node_link
 // channel to the registry.
