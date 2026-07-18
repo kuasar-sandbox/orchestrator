@@ -889,10 +889,10 @@ func updateNodeWorkflowTx(ctx context.Context, tx *sql.Tx, record *nodeexec.Work
 		latestEventJSON = string(encoded)
 	}
 	result, err := tx.ExecContext(ctx, `UPDATE node_workflows SET
-admission_state=?,result=?,reason=?,reservation_token=?,queue_sequence=?,resource_claimed=?,
+opaque_binding=?,binding_digest=?,admission_state=?,result=?,reason=?,reservation_token=?,queue_sequence=?,resource_claimed=?,
 object_state=?,event_seq=?,acked_event_seq=?,latest_event_json=?,workflow_finalized=?,updated_unix=?
 WHERE object_kind=? AND object_id=?`,
-		record.AdmissionState, record.Result, record.Reason, record.ReservationToken,
+		record.OpaqueBinding, record.BindingDigest, record.AdmissionState, record.Result, record.Reason, record.ReservationToken,
 		encodeUint64(record.QueueSequence), boolInt(record.ResourceClaimed), record.ObjectState,
 		encodeUint64(record.EventSeq), encodeUint64(record.AckedEventSeq), latestEventJSON,
 		boolInt(record.WorkflowFinalized), time.Now().Unix(), record.Kind, record.ObjectID)

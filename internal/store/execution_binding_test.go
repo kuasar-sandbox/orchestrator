@@ -7,6 +7,9 @@ import (
 	"testing"
 
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
+	"github.com/kuasar-sandbox/orchestrator/internal/nodeexec"
+	"github.com/kuasar-sandbox/orchestrator/internal/placement"
+	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
@@ -46,6 +49,74 @@ func TestCASExecutionBinding(t *testing.T) {
 	newDigest, _ := clusterstate.ExecutionBindingDigest(newOpaque)
 	if _, err := st.CASExecutionBinding(ctx, clusterstate.ExecutionKindSandbox, "s1", newDigest, wrongEpoch); err == nil {
 		t.Fatal("CAS changed NodeEpoch")
+	}
+}
+
+func TestCASExecutionBindingAtomicallyRebindsWorkflowOutbox(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	dispatch := workflowDispatch(t, clusterstate.ExecutionKindSandbox, "sandbox-rebind", placement.BuildDemand{})
+	decision := nodeexec.AdmissionDecision{
+		State: nodeexec.AdmissionAdmitted, Result: clusterstate.DispatchAcceptedAdmitted,
+		ReservationToken: "reservation-rebind",
+	}
+	if _, err := st.RecordSandboxWorkflow(ctx, dispatch, decision); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.ClaimSandboxWorkflow(ctx, dispatch.ObjectID, dispatch.DemandDigest, decision.ReservationToken); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.CommitSandboxEvent(ctx, workflowSandbox(dispatch.ObjectID), nodeexec.EventUpdate{
+		State: string(clusterstate.WorkflowRouteReady),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-st.EventWake():
+	default:
+		t.Fatal("initial event did not wake replay")
+	}
+
+	rebound, err := clusterstate.DecodeExecutionBinding(dispatch.OpaqueBinding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rebound.StorageGeneration = "generation-2"
+	replacement, err := clusterstate.EncodeExecutionBinding(rebound)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replacementDigest, err := clusterstate.ExecutionBindingDigest(replacement)
+	if err != nil {
+		t.Fatal(err)
+	}
+	changed, err := st.CASExecutionBinding(ctx, clusterstate.ExecutionKindSandbox, dispatch.ObjectID, dispatch.BindingDigest, replacement)
+	if err != nil || !changed {
+		t.Fatalf("rebind changed=%v err=%v", changed, err)
+	}
+	select {
+	case <-st.EventWake():
+	default:
+		t.Fatal("rebound pending event did not wake replay")
+	}
+
+	workflow, err := st.GetNodeWorkflow(ctx, clusterstate.ExecutionKindSandbox, dispatch.ObjectID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if workflow.OpaqueBinding != replacement || workflow.BindingDigest != replacementDigest ||
+		workflow.LatestEvent == nil || workflow.LatestEvent.StorageGeneration != "generation-2" ||
+		workflow.LatestEvent.BindingDigest != replacementDigest {
+		t.Fatalf("rebound workflow = %+v", workflow)
+	}
+	pending, _, err := st.PendingExecutionEvents(ctx, "node-1", 7, routesync.EventCursor{}, 10, 1<<20)
+	if err != nil || len(pending) != 1 || pending[0].ObjectID != dispatch.ObjectID ||
+		pending[0].StorageGeneration != "generation-2" || pending[0].BindingDigest != replacementDigest {
+		t.Fatalf("rebound pending events = %+v, %v", pending, err)
+	}
+	stored, err := st.Get(ctx, dispatch.ObjectID)
+	if err != nil || stored.Metadata[clusterstate.ObjectMetadataKey] != replacement {
+		t.Fatalf("rebound Sandbox = %+v, %v", stored, err)
 	}
 }
 

@@ -86,14 +86,15 @@ func preparedResult(record *PreparedSandboxAdmission) PreparedAdmissionResult {
 // PreparedAdmissionController is the durable, asynchronous cluster Admission
 // path. It is independent of the legacy connection-bound Admit queue.
 type PreparedAdmissionController struct {
-	mu        sync.Mutex
-	state     *State
-	admission *AdmissionController
-	persister *Persister
-	queueMax  int
-	queueTTL  time.Duration
-	clock     func() time.Time
-	wakeCh    chan struct{}
+	mu         sync.Mutex
+	state      *State
+	admission  *AdmissionController
+	persister  *Persister
+	queueMax   int
+	queueTTL   time.Duration
+	clock      func() time.Time
+	wakeCh     chan struct{}
+	queueTimer *time.Timer
 }
 
 func NewPreparedAdmissionController(
@@ -105,11 +106,21 @@ func NewPreparedAdmissionController(
 	if state == nil || admission == nil || persister == nil || policy.QueueMaxDepth <= 0 {
 		return nil, errors.New("nodectl: prepared admission requires state, admission, persister, and positive queue limit")
 	}
-	return &PreparedAdmissionController{
+	controller := &PreparedAdmissionController{
 		state: state, admission: admission, persister: persister,
 		queueMax: policy.QueueMaxDepth, queueTTL: policy.QueueTTL, clock: time.Now,
 		wakeCh: make(chan struct{}, 1),
-	}, nil
+	}
+	controller.mu.Lock()
+	controller.scheduleQueueWakeLocked(BlockNone)
+	queued := controller.hasQueuedAdmissionLocked()
+	controller.mu.Unlock()
+	if queued {
+		// A restarted controller must immediately re-evaluate durable work. The
+		// pass also identifies token-bucket blocking and arms its refill wake.
+		controller.notify()
+	}
+	return controller, nil
 }
 
 func (c *PreparedAdmissionController) Wake() <-chan struct{} { return c.wakeCh }
@@ -223,6 +234,9 @@ func (c *PreparedAdmissionController) PrepareAdmission(
 	}
 	c.state.Unlock()
 	result := preparedResult(record)
+	if record.State == PreparedQueued {
+		c.scheduleQueueWakeLocked(outcome.Block)
+	}
 	c.notify()
 	return result, nil
 }
@@ -317,6 +331,7 @@ func (c *PreparedAdmissionController) ReleaseAdmission(sandboxID, demandDigest, 
 	result := preparedResult(record)
 	c.state.Unlock()
 	c.admission.PushWake()
+	c.scheduleQueueWakeLocked(BlockNone)
 	c.notify()
 	return result, nil
 }
@@ -360,6 +375,8 @@ func (c *PreparedAdmissionController) FinalizeAdmission(sandboxID, demandDigest 
 func (c *PreparedAdmissionController) PromoteQueued() ([]PreparedAdmissionResult, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	blockedBy := BlockNone
+	defer func() { c.scheduleQueueWakeLocked(blockedBy) }()
 	c.state.Lock()
 	queue := make([]*PreparedSandboxAdmission, 0)
 	for _, record := range c.state.PreparedSandboxAdmissions {
@@ -378,6 +395,7 @@ func (c *PreparedAdmissionController) PromoteQueued() ([]PreparedAdmissionResult
 		} else {
 			outcome = c.admission.AnalyzeAndConsume(queued.Demand.message(queued.SandboxID))
 			if outcome.Status == OutcomeShortTermBlock {
+				blockedBy = outcome.Block
 				break
 			}
 		}
@@ -390,6 +408,9 @@ func (c *PreparedAdmissionController) PromoteQueued() ([]PreparedAdmissionResult
 		previous := *record
 		switch outcome.Status {
 		case OutcomeAdmitted:
+			// AnalyzeAndConsume already charged one token. If persistence fails,
+			// retry after refill instead of leaving the durable head asleep.
+			blockedBy = BlockedByTokenBucket
 			record.State = PreparedAdmitted
 			if err := c.insertReservationLocked(record); err != nil {
 				c.state.Unlock()
@@ -414,6 +435,7 @@ func (c *PreparedAdmissionController) PromoteQueued() ([]PreparedAdmissionResult
 		}
 		result := preparedResult(record)
 		c.state.Unlock()
+		blockedBy = BlockNone
 		changed = append(changed, result)
 		c.notify()
 	}
@@ -441,6 +463,60 @@ func preparedQueueDepthLocked(state *State) int {
 		}
 	}
 	return depth
+}
+
+// scheduleQueueWakeLocked keeps the durable FIFO live without polling. Queue
+// expiry always has a timer; token-only blocking also wakes when the next token
+// is expected. Resource release paths issue an immediate coalesced wake.
+func (c *PreparedAdmissionController) scheduleQueueWakeLocked(block BlockReason) {
+	if c.queueTimer != nil {
+		c.queueTimer.Stop()
+		c.queueTimer = nil
+	}
+
+	c.state.Lock()
+	var head *PreparedSandboxAdmission
+	for _, record := range c.state.PreparedSandboxAdmissions {
+		if record.State == PreparedQueued && (head == nil || record.QueueSequence < head.QueueSequence) {
+			head = record
+		}
+	}
+	c.state.Unlock()
+	if head == nil {
+		return
+	}
+
+	var (
+		delay time.Duration
+		arm   bool
+	)
+	if c.queueTTL > 0 {
+		delay = head.QueuedAt.Add(c.queueTTL).Sub(c.clock())
+		arm = true
+	}
+	if block == BlockedByTokenBucket {
+		refill := c.admission.nextTokenETA()
+		if refill <= 0 {
+			refill = time.Millisecond
+		}
+		if !arm || refill < delay {
+			delay = refill
+			arm = true
+		}
+	}
+	if !arm {
+		return
+	}
+	if delay < 0 {
+		delay = 0
+	}
+	c.queueTimer = time.AfterFunc(delay, c.notify)
+}
+
+func (c *PreparedAdmissionController) hasQueuedAdmissionLocked() bool {
+	c.state.Lock()
+	defer c.state.Unlock()
+	return preparedQueueDepthLocked(c.state) > 0
 }
 
 func (c *PreparedAdmissionController) notify() {

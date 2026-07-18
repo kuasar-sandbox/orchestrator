@@ -125,6 +125,97 @@ func TestPreparedAdmissionQueueSurvivesRestartAndPromotesFIFO(t *testing.T) {
 	}
 }
 
+func TestPreparedAdmissionTokenBlockWakesAfterRefill(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	state := preparedTestState()
+	policy := AdmissionPolicy{
+		Rate: 20, Burst: 1, StartupTTL: time.Minute, QueueTTL: time.Minute, QueueMaxDepth: 4,
+	}
+	admission := NewAdmissionController(policy)
+	admission.state = state
+	controller, err := NewPreparedAdmissionController(state, admission, &Persister{Path: path}, policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first, err := controller.PrepareAdmission("sandbox-1", preparedDigest("token-1"), preparedTestDemand(1<<30)); err != nil || first.State != PreparedAdmitted {
+		t.Fatalf("first admission = %+v, %v", first, err)
+	}
+	digest := preparedDigest("token-2")
+	if queued, err := controller.PrepareAdmission("sandbox-2", digest, preparedTestDemand(1<<30)); err != nil || queued.State != PreparedQueued {
+		t.Fatalf("token-blocked admission = %+v, %v", queued, err)
+	}
+	for {
+		select {
+		case <-controller.Wake():
+		default:
+			goto drained
+		}
+	}
+
+drained:
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case <-controller.Wake():
+			changed, err := controller.PromoteQueued()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(changed) == 0 {
+				continue
+			}
+			if len(changed) != 1 || changed[0].SandboxID != "sandbox-2" || changed[0].State != PreparedAdmitted {
+				t.Fatalf("refill promotion = %+v", changed)
+			}
+			return
+		case <-deadline:
+			t.Fatal("token-blocked prepared admission was not woken after refill")
+		}
+	}
+}
+
+func TestPreparedAdmissionCapacityBlockWakesAtQueueTTL(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	state := preparedTestState()
+	state.Lock()
+	state.Reservations["blocker"] = &Reservation{
+		Token: "blocker", AllocatableNowMem: 15 << 30,
+		Floor: Resources{MemoryBytes: 15 << 30}, Stage: StageSettled,
+	}
+	state.Unlock()
+	policy := AdmissionPolicy{
+		Rate: 100, Burst: 100, StartupTTL: time.Minute, QueueTTL: 40 * time.Millisecond, QueueMaxDepth: 4,
+	}
+	admission := NewAdmissionController(policy)
+	admission.state = state
+	controller, err := NewPreparedAdmissionController(state, admission, &Persister{Path: path}, policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := preparedDigest("ttl-wake")
+	if queued, err := controller.PrepareAdmission("sandbox-1", digest, preparedTestDemand(1<<30)); err != nil || queued.State != PreparedQueued {
+		t.Fatalf("queued admission = %+v, %v", queued, err)
+	}
+	for {
+		select {
+		case <-controller.Wake():
+		default:
+			goto drained
+		}
+	}
+
+drained:
+	select {
+	case <-controller.Wake():
+		changed, err := controller.PromoteQueued()
+		if err != nil || len(changed) != 1 || changed[0].State != PreparedRejected || changed[0].Reason != "queue_expired" {
+			t.Fatalf("TTL promotion = %+v, %v", changed, err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("capacity-blocked prepared admission was not woken at queue TTL")
+	}
+}
+
 func TestPreparedAdmissionPersistsQueueFullRejection(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.json")
 	state := preparedTestState()

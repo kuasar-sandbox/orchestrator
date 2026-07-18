@@ -2,6 +2,7 @@ package routesync_test
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -95,6 +96,88 @@ func recv[T any](t *testing.T, ch <-chan T, what string) T {
 		t.Fatalf("timeout waiting for %s", what)
 		var zero T
 		return zero
+	}
+}
+
+func TestStreamAuthorityBoundsRouteBurstBeforeOutbox(t *testing.T) {
+	src := &fakeSource{
+		sub:  make(chan routesync.Event, 128),
+		woke: make(chan routesync.RouteWake, 1),
+	}
+	for i := 0; i < 100; i++ {
+		src.sub <- routesync.Event{
+			Kind: routesync.TypeUpsert,
+			Route: routesync.RouteEntry{
+				SandboxID: fmt.Sprintf("live-%03d", i), State: routesync.StateRunning,
+			},
+		}
+	}
+	outbox := make(chan *routesync.Msg, 1)
+	streamReader, streamWriter := io.Pipe()
+	bodyReader, bodyWriter := io.Pipe()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer streamWriter.Close()
+		routesync.StreamAuthority(ctx, streamWriter, func() {}, bodyReader, src, routesync.Register{
+			Subscribe: &routesync.Subscribe{Kind: routesync.KindRoute},
+		}, nil, outbox, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	}()
+	t.Cleanup(func() {
+		cancel()
+		_ = bodyWriter.Close()
+		_ = streamReader.Close()
+		<-done
+	})
+
+	frames := make(chan *routesync.Msg, 128)
+	readErr := make(chan error, 1)
+	go func() {
+		for {
+			msg, err := routesync.ReadMsg(streamReader)
+			if err != nil {
+				readErr <- err
+				return
+			}
+			frames <- msg
+		}
+	}()
+	next := func(what string) *routesync.Msg {
+		t.Helper()
+		select {
+		case msg := <-frames:
+			return msg
+		case err := <-readErr:
+			t.Fatalf("read %s: %v", what, err)
+		case <-time.After(3 * time.Second):
+			t.Fatalf("timeout waiting for %s", what)
+		}
+		return nil
+	}
+	if msg := next("initial route"); msg.Type != routesync.TypeUpsert || msg.Route.SandboxID != "s1" {
+		t.Fatalf("initial frame = %+v", msg)
+	}
+	if msg := next("bookmark"); msg.Type != routesync.TypeBookmark {
+		t.Fatalf("bookmark frame = %+v", msg)
+	}
+
+	outbox <- &routesync.Msg{Type: routesync.TypeCmdAck, Ack: &routesync.CmdAck{CmdID: "command-1", Status: routesync.AckAccepted}}
+	routesBeforeAck := 0
+	for {
+		msg := next("outbox ACK")
+		switch msg.Type {
+		case routesync.TypeUpsert:
+			routesBeforeAck++
+		case routesync.TypeCmdAck:
+			if msg.Ack == nil || msg.Ack.CmdID != "command-1" {
+				t.Fatalf("outbox frame = %+v", msg)
+			}
+			if routesBeforeAck > 32 {
+				t.Fatalf("outbox ACK followed %d continuously ready route frames; want at most 32", routesBeforeAck)
+			}
+			return
+		}
 	}
 }
 

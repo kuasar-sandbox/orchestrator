@@ -9,6 +9,8 @@ import (
 	"net/http"
 )
 
+const maxPriorityOutboxBurst = 32
+
 // Source is the route authority the stream distributes. internal/orch implements
 // it for the proxy plane; the cluster node-link (node.md §10) implements it for the
 // node's sandbox/build routes.
@@ -150,14 +152,42 @@ func StreamAuthority(ctx context.Context, w io.Writer, flush func(), body io.Rea
 	// and replayed as idempotent upserts.
 	ch, cancelSub := src.Subscribe()
 	defer cancelSub()
+	drainOutbox := func() error {
+		wrote := false
+		for i := 0; i < maxPriorityOutboxBurst; i++ {
+			select {
+			case m, ok := <-outbox:
+				if !ok || m == nil {
+					return io.EOF
+				}
+				if err := WriteMsg(w, m); err != nil {
+					return err
+				}
+				wrote = true
+			default:
+				if wrote {
+					flush()
+				}
+				return nil
+			}
+		}
+		if wrote {
+			flush()
+		}
+		return nil
+	}
+	writeRoute := func(ev Event) error {
+		if err := drainOutbox(); err != nil {
+			return err
+		}
+		return writeEvent(w, ev)
+	}
 
 	resumed := false
 	if reg.ResumeFrom != "" {
 		if rs, ok := src.(ResumableSource); ok {
 			if after, ok := CheckRevToken(reg.ResumeFrom, rs.SourceFingerprint()); ok {
-				err := rs.Replay(sctx, after, func(ev Event) error {
-					return writeEvent(w, ev)
-				})
+				err := rs.Replay(sctx, after, writeRoute)
 				switch {
 				case err == nil:
 					resumed = true
@@ -171,10 +201,16 @@ func StreamAuthority(ctx context.Context, w io.Writer, flush func(), body io.Rea
 	}
 	if !resumed {
 		if err := src.Range(sctx, func(r RouteEntry) error {
+			if err := drainOutbox(); err != nil {
+				return err
+			}
 			return WriteMsg(w, &Msg{Type: TypeUpsert, Route: &r})
 		}); err != nil {
 			return
 		}
+	}
+	if err := drainOutbox(); err != nil {
+		return
 	}
 	bookmark := &Msg{Type: TypeBookmark, FullSync: !resumed}
 	if rev, ok := src.(RevisionSource); ok {
@@ -186,6 +222,12 @@ func StreamAuthority(ctx context.Context, w io.Writer, flush func(), body io.Rea
 	flush()
 
 	for {
+		// Command ACKs and durable execution events have bounded priority, but
+		// each pass still writes one ready route delta. This gives both streams
+		// deterministic progress under sustained load through the single writer.
+		if err := drainOutbox(); err != nil {
+			return
+		}
 		select {
 		case ev, ok := <-ch:
 			if !ok {
