@@ -225,6 +225,13 @@ func (r *Registry) applyBuildEvent(ctx context.Context, nodeID string, e *routes
 	if e == nil || e.BuildID == "" {
 		return
 	}
+	if e.NodeEpoch != 0 || e.EventSeq != 0 || e.StorageGeneration != "" || e.BindingDigest != "" {
+		// The legacy BuildStore is not an authority for RFC 46 events. Accepting a
+		// tuple/fence-bearing event here would silently discard its correctness
+		// fence; the dormant final convergence path consumes these in Phase 3.
+		r.log.Warn("registry: fenced Build event rejected by legacy convergence path", "node", nodeID, "build", e.BuildID)
+		return
+	}
 	ref, found, err := r.lookupNodeBuildRef(ctx, nodeID, e.BuildID)
 	if err != nil || !found {
 		return

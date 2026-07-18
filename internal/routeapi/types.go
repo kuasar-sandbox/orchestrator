@@ -68,6 +68,8 @@ func (r ReadRouteRequest) Validate() error {
 
 type ReadRouteResponse struct {
 	Outcome       string                   `json:"outcome"`
+	Group         string                   `json:"group,omitempty"`
+	RouteKey      string                   `json:"route_key,omitempty"`
 	Route         *clusterstate.ReadyRoute `json:"route,omitempty"`
 	RouteRevision uint64                   `json:"route_revision,omitempty"`
 	LeaderHint    *LeaderHint              `json:"leader_hint,omitempty"`
@@ -83,7 +85,8 @@ func (r ReadRouteResponse) ValidateFor(request ReadRouteRequest) error {
 		if err := r.Route.Validate(); err != nil {
 			return err
 		}
-		if r.Route.StorageGeneration != request.StorageGeneration ||
+		if r.Group != request.Group || r.RouteKey != request.RouteKey ||
+			r.Route.StorageGeneration != request.StorageGeneration ||
 			(request.SandboxID != "" && r.Route.SandboxID != request.SandboxID) ||
 			r.RouteRevision < request.MinRouteRevision {
 			return errors.New("routeapi: READY does not satisfy request fence")
@@ -138,6 +141,7 @@ func (r ReadBuildRequest) Validate() error {
 
 type ReadBuildResponse struct {
 	Outcome       string                          `json:"outcome"`
+	Group         string                          `json:"group,omitempty"`
 	Build         *clusterstate.BuildProjection   `json:"build,omitempty"`
 	BuildState    clusterstate.BuildWorkflowState `json:"build_state,omitempty"`
 	BuildRevision uint64                          `json:"build_revision,omitempty"`
@@ -148,7 +152,7 @@ type ReadBuildResponse struct {
 func (r ReadBuildResponse) ValidateFor(request ReadBuildRequest) error {
 	switch r.Outcome {
 	case ReadReady:
-		if r.Build == nil || r.BuildRevision == 0 || r.Build.BuildID != request.BuildID ||
+		if r.Build == nil || r.BuildRevision == 0 || r.Group != request.Group || r.Build.BuildID != request.BuildID ||
 			r.Build.StorageGeneration != request.StorageGeneration || r.BuildRevision < request.MinBuildRevision {
 			return errors.New("routeapi: positive Build read does not satisfy request fence")
 		}

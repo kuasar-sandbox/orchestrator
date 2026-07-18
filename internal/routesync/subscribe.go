@@ -3,6 +3,7 @@ package routesync
 import (
 	"context"
 	"crypto/tls"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -49,6 +50,7 @@ type Subscriber struct {
 // NewSubscriber builds a Subscriber. dial returns a fresh connection to the
 // orchestrator's config-socket (e.g. a unix dial). wakes may be nil.
 func NewSubscriber(dial func(ctx context.Context) (net.Conn, error), id string, reg Register, sink Sink, wakes WakeSource, log *slog.Logger) *Subscriber {
+	reg.Version = Version
 	return &Subscriber{dial: dial, id: id, reg: reg, sink: sink, wakes: wakes, log: log}
 }
 
@@ -101,8 +103,22 @@ func (s *Subscriber) session(ctx context.Context, tr *http2.Transport) error {
 	}
 	defer resp.Body.Close()
 
-	// Reader: a fresh sync generation, then apply down frames until EOF/error.
+	// Validate the authority version before touching the current route-table sync
+	// generation. Mixed versions fail closed and reconnect only after both sides
+	// run the exact protocol.
+	hello, err := ReadMsg(resp.Body)
+	if err != nil {
+		return err
+	}
+	if hello.Type != TypeHello || hello.Hello == nil || hello.Hello.Version != Version {
+		got := 0
+		if hello.Hello != nil {
+			got = hello.Hello.Version
+		}
+		return fmt.Errorf("routesync: authority protocol version %d is incompatible with required version %d", got, Version)
+	}
 	s.sink.BeginSync()
+	s.sink.SetPolicy(hello.Hello.Policy)
 	for {
 		m, err := ReadMsg(resp.Body)
 		if err != nil {

@@ -552,6 +552,7 @@ func (o *Orchestrator) rebindClusterExecution(ctx context.Context, cmd *routesyn
 			return errWrongExecutionBinding
 		}
 		o.cache(sb)
+		o.publishUpsert(sb)
 	}
 	return nil
 }

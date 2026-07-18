@@ -108,8 +108,19 @@ func TestRebindClusterExecutionUsesDigestCAS(t *testing.T) {
 		Binding: newOpaque, BindingDigest: newDigest, OldBindingDigest: oldDigest,
 		DemandDigest: hex.EncodeToString(demand[:]), DispatchSpecDigest: hex.EncodeToString(dispatch[:]),
 	}
+	routeEvents, cancel := o.Subscribe()
+	defer cancel()
 	if err := o.rebindClusterExecution(ctx, cmd); err != nil {
 		t.Fatal(err)
+	}
+	select {
+	case event := <-routeEvents:
+		if event.Kind != routesync.TypeUpsert || event.Route.SandboxID != "s1" ||
+			event.Route.StorageGeneration != "g2" || event.Route.BindingDigest != newDigest {
+			t.Fatalf("rebind route event = %+v", event)
+		}
+	default:
+		t.Fatal("successful rebind did not publish the new route fence")
 	}
 	if err := o.rebindClusterExecution(ctx, cmd); err != nil {
 		t.Fatalf("idempotent rebind: %v", err)

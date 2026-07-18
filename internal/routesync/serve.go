@@ -3,6 +3,7 @@ package routesync
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -57,6 +58,9 @@ func ReadRegister(r io.Reader) (Register, error) {
 	}
 	if m.Type != TypeRegister || m.Register == nil {
 		return Register{}, errors.New("routesync: expected register frame")
+	}
+	if m.Register.Version != Version {
+		return Register{}, fmt.Errorf("routesync: protocol version %d is incompatible with required version %d", m.Register.Version, Version)
 	}
 	return *m.Register, nil
 }

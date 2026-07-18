@@ -647,6 +647,18 @@ func TestSelectorPatchCachesKeysInNodeLink(t *testing.T) {
 	}
 }
 
+func TestLegacyNodeLinkRejectsFinalSessionTuple(t *testing.T) {
+	reg := testReg(t)
+	if _, err := reg.updateNodeRegister(context.Background(), &routesync.NodeRegister{
+		NodeID: "n1", NodeEpoch: 7, SessionSeq: 11, DataEndpoint: "10.0.0.1:8443",
+	}); err == nil {
+		t.Fatal("legacy node-link accepted a tuple-bearing final Session registration")
+	}
+	if _, found, err := reg.stores.GetNode(context.Background(), "n1"); err != nil || found {
+		t.Fatalf("rejected registration changed node profile: found=%v err=%v", found, err)
+	}
+}
+
 func TestManifestKeyTTLExpiresNodeLinkCache(t *testing.T) {
 	ctx := context.Background()
 	reg := testRegWithBox(t)

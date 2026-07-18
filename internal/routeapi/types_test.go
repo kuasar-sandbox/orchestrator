@@ -39,7 +39,7 @@ func TestReplicaLocalRouteReadNeverReturnsFinalNegative(t *testing.T) {
 	}
 	request.Strong = false
 	request.MinRouteRevision = 12
-	if err := (ReadRouteResponse{Outcome: ReadReady, Route: testReadyRoute(), RouteRevision: 11}).ValidateFor(request); err == nil {
+	if err := (ReadRouteResponse{Outcome: ReadReady, Group: "/g", RouteKey: "rk", Route: testReadyRoute(), RouteRevision: 11}).ValidateFor(request); err == nil {
 		t.Fatal("READY below min_route_revision accepted")
 	}
 	response := ReadRouteResponse{
@@ -52,7 +52,7 @@ func TestReplicaLocalRouteReadNeverReturnsFinalNegative(t *testing.T) {
 }
 
 func TestTrustedHandlerRequiresInternalTransportIdentity(t *testing.T) {
-	service := fakeService{route: ReadRouteResponse{Outcome: ReadReady, Route: testReadyRoute(), RouteRevision: 12}}
+	service := fakeService{route: ReadRouteResponse{Outcome: ReadReady, Group: "/g", RouteKey: "rk", Route: testReadyRoute(), RouteRevision: 12}}
 	body, _ := json.Marshal(routeRequest(false))
 	untrusted := httptest.NewRequest(http.MethodPost, ReadRoutePath, bytes.NewReader(body))
 	w := httptest.NewRecorder()
@@ -97,7 +97,7 @@ func TestRouterStateCarriesMonotonicRevisionAndLeaderHint(t *testing.T) {
 		t.Fatalf("initial minimum = %d", request.MinRouteRevision)
 	}
 	if err := state.ObserveRoute(request, ReadRouteResponse{
-		Outcome: ReadReady, Route: testReadyRoute(), RouteRevision: 12,
+		Outcome: ReadReady, Group: "/g", RouteKey: "rk", Route: testReadyRoute(), RouteRevision: 12,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -115,6 +115,38 @@ func TestRouterStateCarriesMonotonicRevisionAndLeaderHint(t *testing.T) {
 	}
 	if got, ok := state.LeaderHint(7); !ok || got != hint {
 		t.Fatalf("leader hint = %+v ok=%v", got, ok)
+	}
+}
+
+func TestPositiveReadsRequireExactTableKeyIdentity(t *testing.T) {
+	request := routeRequest(false)
+	response := ReadRouteResponse{
+		Outcome: ReadReady, Group: request.Group, RouteKey: request.RouteKey,
+		Route: testReadyRoute(), RouteRevision: 1,
+	}
+	if err := response.ValidateFor(request); err != nil {
+		t.Fatal(err)
+	}
+	response.RouteKey = "another-route"
+	if err := response.ValidateFor(request); err == nil {
+		t.Fatal("READY projection for another Route key was accepted")
+	}
+
+	buildRequest := ReadBuildRequest{RequestIdentity: request.RequestIdentity, Group: "/g", BuildID: "b1"}
+	build := &clusterstate.BuildProjection{
+		BuildID: "b1", NodeID: "n1", NodeEpoch: 7, StorageGeneration: "g1",
+		BindingDigest: testReadyRoute().BindingDigest, LastEventSeq: 1,
+	}
+	buildResponse := ReadBuildResponse{
+		Outcome: ReadReady, Group: "/g", Build: build,
+		BuildState: clusterstate.BuildBuilding, BuildRevision: 1,
+	}
+	if err := buildResponse.ValidateFor(buildRequest); err != nil {
+		t.Fatal(err)
+	}
+	buildResponse.Group = "/another-group"
+	if err := buildResponse.ValidateFor(buildRequest); err == nil {
+		t.Fatal("positive Build projection for another Group was accepted")
 	}
 }
 

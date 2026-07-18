@@ -95,9 +95,21 @@ func TestNodeLinkCodecRoundTrip(t *testing.T) {
 	}
 
 	reg := roundTrip(t, &Msg{Type: TypeRegister, Register: &Register{
-		Subscribe: &Subscribe{Kind: KindRegistry}, ResumeFrom: MakeRevToken("node-fp", 100),
+		Version: Version, Subscribe: &Subscribe{Kind: KindRegistry}, ResumeFrom: MakeRevToken("node-fp", 100),
 	}})
-	if reg.Register == nil || reg.Register.Subscribe.Kind != KindRegistry || reg.Register.ResumeFrom != "node-fp:100" {
+	if reg.Register == nil || reg.Register.Version != Version || reg.Register.Subscribe.Kind != KindRegistry || reg.Register.ResumeFrom != "node-fp:100" {
 		t.Fatalf("registry register round-trip: %+v", reg.Register)
+	}
+}
+
+func TestReadRegisterRejectsProtocolVersionMismatch(t *testing.T) {
+	for _, version := range []int{0, Version - 1, Version + 1} {
+		var buffer bytes.Buffer
+		if err := WriteMsg(&buffer, &Msg{Type: TypeRegister, Register: &Register{Version: version}}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := ReadRegister(&buffer); err == nil {
+			t.Fatalf("protocol version %d was accepted", version)
+		}
 	}
 }

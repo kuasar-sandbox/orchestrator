@@ -66,6 +66,11 @@ func TestReadyRouteAndRevisionValidation(t *testing.T) {
 	if err := record.Validate(); err == nil {
 		t.Fatal("READY accepted without durable event watermark")
 	}
+	record.Ready.LastEventSeq = 3
+	record.Ready.StorageGeneration = "g2"
+	if err := record.Validate(); err == nil {
+		t.Fatal("READY from another storage generation was accepted")
+	}
 }
 
 func TestDispatchIntentRejectsMutationAndOversize(t *testing.T) {

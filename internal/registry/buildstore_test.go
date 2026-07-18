@@ -99,6 +99,31 @@ func TestReserveBuildUsesNodeOwnerBoundary(t *testing.T) {
 	}
 }
 
+func TestLegacyBuildConvergenceRejectsFencedFinalEvent(t *testing.T) {
+	ctx := context.Background()
+	reg := testReg(t)
+	owner := &recordingNodeOwner{allow: true}
+	reg.SetNodeOwner(owner)
+	build := &BuildRecord{Group: "/g", BuildID: "b1", NodeID: "n1", State: BuildRegistered}
+	if err := reg.stores.PutBuild(ctx, build); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.stores.AddNodeBuildRef(ctx, "n1", clusterstate.NodeBuildRef{Group: "/g", BuildID: "b1"}); err != nil {
+		t.Fatal(err)
+	}
+	reg.applyBuildEvent(ctx, "n1", &routesync.BuildEvent{
+		BuildID: "b1", State: string(BuildReady), NodeEpoch: 7, EventSeq: 1,
+		StorageGeneration: "g1", BindingDigest: "binding-digest",
+	})
+	got, found, err := reg.stores.GetBuildInGroup(ctx, "/g", "b1")
+	if err != nil || !found || got.State != BuildRegistered {
+		t.Fatalf("legacy path applied fenced event: build=%+v found=%v err=%v", got, found, err)
+	}
+	if len(owner.released) != 0 {
+		t.Fatalf("legacy path released Admission for rejected event: %v", owner.released)
+	}
+}
+
 func TestBuildAdmissionIsNodeScoped(t *testing.T) {
 	m := newBuildAdmissionManager()
 	cap := &routesync.BuildResources{CPU: 1000}

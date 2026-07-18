@@ -1164,6 +1164,12 @@ func (r *Registry) removeNode(c nodeConn) {
 // that deletes the profile between read and write makes the CAS retry from an
 // empty node view, so stale child refs cannot be replayed into the new session.
 func (r *Registry) updateNodeRegister(ctx context.Context, nr *routesync.NodeRegister) (*NodeRecord, error) {
+	if nr == nil || nr.NodeID == "" {
+		return nil, errors.New("registry: node registration requires node ID")
+	}
+	if nr.NodeEpoch != 0 || nr.SessionSeq != 0 {
+		return nil, errors.New("registry: final tuple-bearing registration requires the RFC 46 Session Holder path")
+	}
 	rec, _, err := r.updateNodeProfile(ctx, nr.NodeID, true, func(rec *NodeRecord) {
 		rec.Labels = nr.Labels
 		rec.Capacity = nr.Capacity

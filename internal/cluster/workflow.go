@@ -396,34 +396,55 @@ func (r RouteWorkflowRecord) Validate() error {
 			return err
 		}
 		if r.Starting.Binding != nil {
-			return r.Starting.Binding.ValidateWorkflow(ExecutionKindSandbox, r.Starting.SandboxID, r.Group, r.RouteKey, r.Starting.Intent)
+			if err := r.Starting.Binding.ValidateWorkflow(ExecutionKindSandbox, r.Starting.SandboxID, r.Group, r.RouteKey, r.Starting.Intent); err != nil {
+				return err
+			}
+			return validateProjectionGeneration(r.Revision, r.Starting.Binding.StorageGeneration)
 		}
 		return nil
 	case WorkflowRouteReady:
 		if r.Ready == nil {
 			return errors.New("cluster: missing READY state")
 		}
-		return r.Ready.Validate()
+		if err := r.Ready.Validate(); err != nil {
+			return err
+		}
+		return validateProjectionGeneration(r.Revision, r.Ready.StorageGeneration)
 	case WorkflowRoutePaused:
 		if r.Paused == nil {
 			return errors.New("cluster: missing PAUSED state")
 		}
-		return r.Paused.Validate()
+		if err := r.Paused.Validate(); err != nil {
+			return err
+		}
+		return validateProjectionGeneration(r.Revision, r.Paused.Execution.StorageGeneration)
 	case WorkflowRouteResuming:
 		if r.Resuming == nil {
 			return errors.New("cluster: missing RESUMING state")
 		}
-		return r.Resuming.Validate()
+		if err := r.Resuming.Validate(); err != nil {
+			return err
+		}
+		return validateProjectionGeneration(r.Revision, r.Resuming.Execution.StorageGeneration)
 	case WorkflowRouteDeleting:
 		if r.Deleting == nil {
 			return errors.New("cluster: missing DELETING state")
 		}
-		return r.Deleting.Validate()
+		if err := r.Deleting.Validate(); err != nil {
+			return err
+		}
+		return validateProjectionGeneration(r.Revision, r.Deleting.Execution.StorageGeneration)
 	case WorkflowRouteTombstone:
 		if r.Tombstone == nil {
 			return errors.New("cluster: missing TOMBSTONE state")
 		}
-		return r.Tombstone.Validate()
+		if err := r.Tombstone.Validate(); err != nil {
+			return err
+		}
+		if r.Tombstone.PlacementFailure == nil {
+			return validateFailureRevision(r.Revision, r.Tombstone.FailureRevision)
+		}
+		return nil
 	default:
 		return errors.New("cluster: invalid Route state")
 	}
@@ -542,7 +563,10 @@ func (r BuildRecord) Validate() error {
 			return err
 		}
 		if r.Starting.Binding != nil {
-			return r.Starting.Binding.ValidateWorkflow(ExecutionKindBuild, r.BuildID, r.Group, "", r.Starting.Intent)
+			if err := r.Starting.Binding.ValidateWorkflow(ExecutionKindBuild, r.BuildID, r.Group, "", r.Starting.Intent); err != nil {
+				return err
+			}
+			return validateProjectionGeneration(r.Revision, r.Starting.Binding.StorageGeneration)
 		}
 		return nil
 	case BuildQueued, BuildRegistered, BuildBuilding, BuildReady:
@@ -550,6 +574,9 @@ func (r BuildRecord) Validate() error {
 			return errors.New("cluster: missing or mismatched Build projection")
 		}
 		if err := r.Projection.Validate(); err != nil {
+			return err
+		}
+		if err := validateProjectionGeneration(r.Revision, r.Projection.StorageGeneration); err != nil {
 			return err
 		}
 		if r.State == BuildReady && r.Projection.ArtifactRef == "" {
@@ -569,6 +596,9 @@ func (r BuildRecord) Validate() error {
 		if err := r.Projection.Validate(); err != nil {
 			return err
 		}
+		if err := validateProjectionGeneration(r.Revision, r.Projection.StorageGeneration); err != nil {
+			return err
+		}
 		if r.Projection.Reason == "" {
 			return errors.New("cluster: BUILD_ERROR requires reason")
 		}
@@ -580,6 +610,9 @@ func (r BuildRecord) Validate() error {
 		if err := r.Tombstone.Projection.Validate(); err != nil {
 			return err
 		}
+		if err := validateProjectionGeneration(r.Revision, r.Tombstone.Projection.StorageGeneration); err != nil {
+			return err
+		}
 		if err := r.Tombstone.Proof.Validate(); err != nil {
 			return err
 		}
@@ -587,7 +620,10 @@ func (r BuildRecord) Validate() error {
 			r.Tombstone.Proof.FencedNodeEpoch != r.Tombstone.Projection.NodeEpoch {
 			return errors.New("cluster: BUILD_TOMBSTONE proof identifies another execution")
 		}
-		return r.Tombstone.FailureRevision.Validate()
+		if err := r.Tombstone.FailureRevision.Validate(); err != nil {
+			return err
+		}
+		return validateFailureRevision(r.Revision, r.Tombstone.FailureRevision)
 	default:
 		return errors.New("cluster: invalid Build state")
 	}
@@ -691,4 +727,18 @@ func countPresent(values ...bool) int {
 		}
 	}
 	return count
+}
+
+func validateProjectionGeneration(revision Revision, storageGeneration string) error {
+	if storageGeneration != revision.StorageGeneration {
+		return errors.New("cluster: workflow projection belongs to another storage generation")
+	}
+	return nil
+}
+
+func validateFailureRevision(current, failure Revision) error {
+	if current.StorageGeneration != failure.StorageGeneration || current.ShardID != failure.ShardID || current.LogIndex < failure.LogIndex {
+		return errors.New("cluster: workflow failure revision is outside the record history")
+	}
+	return nil
 }

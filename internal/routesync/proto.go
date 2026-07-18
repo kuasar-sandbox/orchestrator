@@ -156,6 +156,7 @@ type Hello struct {
 // enforce combinations (a proxy without subscribe, a subscribe without proxy, etc.
 // are all the subscriber's own call).
 type Register struct {
+	Version   int        `json:"version"`
 	Subscribe *Subscribe `json:"subscribe,omitempty"` // route stream; nil = lease only (no routes)
 	Proxy     *Proxy     `json:"proxy,omitempty"`     // accepts proxyForwarder data-plane requests
 	Mmds      bool       `json:"mmds,omitempty"`      // serves MMDS (the per-sandbox secret ships on every entry)
