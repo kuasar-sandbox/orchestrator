@@ -138,3 +138,24 @@ func TestPermitCacheRetiresExpiredIdentityWithoutReplayExtension(t *testing.T) {
 		t.Fatalf("retired identity authorization error = %v", err)
 	}
 }
+
+func TestPermitCacheIsScopedToOneStorageGeneration(t *testing.T) {
+	cache := NewPermitCache(time.Now)
+	grant := PermitGrant{
+		PermitIdentity: PermitIdentity{
+			ClusterID: "cluster-1", StorageGeneration: "generation-1", SystemEpoch: 1,
+			ManifestDigest: digestFor("manifest-1"),
+		},
+		CommitIndex: 1, MaxLifetimeMillis: 1000,
+		ServeGate: true, WriteGate: true, CutoverGate: true, RecoveryClosed: true,
+	}
+	if err := cache.Install(grant, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	nextGeneration := grant
+	nextGeneration.StorageGeneration = "generation-2"
+	nextGeneration.ManifestDigest = digestFor("manifest-2")
+	if err := cache.Install(nextGeneration, time.Now()); err == nil {
+		t.Fatal("one Permit cache accepted commit indexes from another storage generation")
+	}
+}

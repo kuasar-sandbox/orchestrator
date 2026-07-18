@@ -114,6 +114,8 @@ type PermitCache struct {
 	mu             sync.RWMutex
 	now            func() time.Time
 	permits        map[PermitIdentity]ServePermit
+	clusterID      string
+	generation     string
 	retiredThrough uint64
 }
 
@@ -131,6 +133,12 @@ func (c *PermitCache) Install(grant PermitGrant, proposalStarted time.Time) erro
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.clusterID == "" {
+		c.clusterID = grant.ClusterID
+		c.generation = grant.StorageGeneration
+	} else if c.clusterID != grant.ClusterID || c.generation != grant.StorageGeneration {
+		return errors.New("raftstore: Serve Permit cache belongs to another storage generation")
+	}
 	current, found := c.permits[grant.PermitIdentity]
 	if found && current.Grant.CommitIndex > grant.CommitIndex {
 		return errors.New("raftstore: older Serve Permit cannot replace a newer permit")
