@@ -75,11 +75,12 @@ func (r *Runtime) PromoteNonVoting(ctx context.Context, proof ReplicaCatchUpProo
 	if _, found := membership.Nodes[proof.ReplicaID]; found {
 		return nil
 	}
-	if _, found := membership.NonVotings[proof.ReplicaID]; !found {
+	target, found := membership.NonVotings[proof.ReplicaID]
+	if !found {
 		return errors.New("raftstore: target replica is not a non-voting member")
 	}
 	if err := r.nodeHost.SyncRequestAddReplica(
-		ctx, proof.ShardID, proof.ReplicaID, "", membership.ConfigChangeID,
+		ctx, proof.ShardID, proof.ReplicaID, target, membership.ConfigChangeID,
 	); err != nil {
 		return err
 	}

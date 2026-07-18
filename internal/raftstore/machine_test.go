@@ -3,6 +3,7 @@ package raftstore
 import (
 	"bytes"
 	"encoding/json"
+	"reflect"
 	"testing"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/routeapi"
@@ -126,6 +127,54 @@ func TestStateMachineRejectsWrongShardAndUnknownCommandFields(t *testing.T) {
 	correct := &DataStateMachine{raftShardID: DataRaftShardID(identity.ShardID), replicaID: replicas[0]}
 	if _, err := correct.Update(sm.Entry{Index: 1, Cmd: unknown}); err == nil {
 		t.Fatal("committed command with unknown fields was accepted")
+	}
+}
+
+func TestJoiningReplicaReplaysBootstrapDeterministically(t *testing.T) {
+	manifest := testManifest(4, "generation-1")
+	digest, _ := manifest.Digest()
+	systemCommand, err := EncodeSystemCommand(SystemCommand{
+		Type: SystemBootstrap, Manifest: &manifest, Digest: digest,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	initialSystem := &SystemStateMachine{raftShardID: SystemRaftShardID, replicaID: 1}
+	joiningSystem := &SystemStateMachine{raftShardID: SystemRaftShardID, replicaID: 99}
+	initialResult, err := initialSystem.Update(sm.Entry{Index: 1, Cmd: systemCommand})
+	if err != nil {
+		t.Fatal(err)
+	}
+	joiningResult, err := joiningSystem.Update(sm.Entry{Index: 1, Cmd: systemCommand})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(initialResult.Data, joiningResult.Data) || initialSystem.state != joiningSystem.state {
+		t.Fatal("System replicas applied the same committed history differently")
+	}
+
+	identity := manifestShardIdentity(t, manifest, 0)
+	bootstrap, _ := NewDataShardBootstrap(manifest, 0)
+	dataCommand, err := EncodeDataCommand(DataCommand{
+		Type: DataInitializeShard, Identity: identity, Bootstrap: &bootstrap,
+		ReplicaIDs: append([]uint64(nil), bootstrap.ReplicaIDs...),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	initialData := &DataStateMachine{raftShardID: DataRaftShardID(0), replicaID: 1}
+	joiningData := &DataStateMachine{raftShardID: DataRaftShardID(0), replicaID: 99}
+	initialResult, err = initialData.Update(sm.Entry{Index: 1, Cmd: dataCommand})
+	if err != nil {
+		t.Fatal(err)
+	}
+	joiningResult, err = joiningData.Update(sm.Entry{Index: 1, Cmd: dataCommand})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(initialResult.Data, joiningResult.Data) ||
+		!reflect.DeepEqual(initialData.state, joiningData.state) {
+		t.Fatal("data replicas applied the same committed history differently")
 	}
 }
 

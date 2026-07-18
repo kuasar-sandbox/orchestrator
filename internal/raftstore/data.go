@@ -236,6 +236,17 @@ func NewDataShardBootstrap(manifest Manifest, shardID uint32) (DataShardBootstra
 	if err != nil {
 		return DataShardBootstrap{}, err
 	}
+	return dataShardBootstrap(manifest, digest, shardID)
+}
+
+func dataShardBootstrap(manifest Manifest, digest string, shardID uint32) (DataShardBootstrap, error) {
+	if !isSHA256(digest) {
+		return DataShardBootstrap{}, errors.New("raftstore: data-shard bootstrap requires a verified manifest digest")
+	}
+	if shardID >= manifest.VirtualShardCount || int(shardID) >= len(manifest.DataShards) ||
+		manifest.DataShards[shardID].ShardID != shardID {
+		return DataShardBootstrap{}, errors.New("raftstore: data-shard bootstrap targets an unknown shard")
+	}
 	return DataShardBootstrap{
 		ClusterID: manifest.ClusterID, StorageGeneration: manifest.StorageGeneration,
 		ManifestDigest: digest, ShardID: shardID,

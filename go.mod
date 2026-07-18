@@ -15,7 +15,9 @@ require (
 	github.com/hashicorp/memberlist v0.5.4
 	github.com/kuasar-sandbox/accelerator v0.0.0
 	github.com/kuasar-sandbox/sandboxer v0.0.0
+	github.com/lni/dragonboat/v4 v4.0.0-20250723143628-076c7f6497dc
 	golang.org/x/net v0.49.0
+	golang.org/x/sync v0.19.0
 	golang.org/x/sys v0.40.0
 	gopkg.in/yaml.v3 v3.0.1
 	modernc.org/sqlite v1.30.0
@@ -73,7 +75,6 @@ require (
 	github.com/klauspost/compress v1.18.0 // indirect
 	github.com/kr/pretty v0.3.0 // indirect
 	github.com/kr/text v0.2.0 // indirect
-	github.com/lni/dragonboat/v4 v4.0.0-20250723143628-076c7f6497dc // indirect
 	github.com/lni/goutils v1.4.0 // indirect
 	github.com/lni/vfs v0.2.1-0.20220616104132-8852fd867376 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
@@ -93,7 +94,6 @@ require (
 	github.com/vbatts/tar-split v0.12.1 // indirect
 	golang.org/x/exp v0.0.0-20231108232855-2478ac86f678 // indirect
 	golang.org/x/mod v0.31.0 // indirect
-	golang.org/x/sync v0.19.0 // indirect
 	golang.org/x/text v0.33.0 // indirect
 	golang.org/x/tools v0.40.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260120221211-b8f7ae30c516 // indirect

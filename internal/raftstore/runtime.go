@@ -439,7 +439,7 @@ func (r *Runtime) initializeDataShard(ctx context.Context, replica LocalReplicaE
 			return r.validateDataState(state, shardID)
 		}
 	}
-	bootstrap, err := NewDataShardBootstrap(r.manifest, shardID)
+	bootstrap, err := dataShardBootstrap(r.manifest, r.manifestDigest, shardID)
 	if err != nil {
 		return err
 	}

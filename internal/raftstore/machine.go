@@ -47,9 +47,6 @@ func (m *SystemStateMachine) Update(entry sm.Entry) (sm.Result, error) {
 	if err != nil {
 		return sm.Result{}, fmt.Errorf("raftstore: decode committed System command: %w", err)
 	}
-	if command.Type == SystemBootstrap && !replicaPlacementContains(command.Manifest.SystemReplicas, m.replicaID) {
-		return sm.Result{}, errors.New("raftstore: local replica is absent from System bootstrap manifest")
-	}
 	next, result := ApplySystemCommand(m.state, entry.Index, command)
 	if result.Conflict && m.state.Initialized && entry.Index > m.state.LastApplied {
 		next = m.state
@@ -129,9 +126,6 @@ func (m *DataStateMachine) Update(entry sm.Entry) (sm.Result, error) {
 	}
 	if command.Identity.ShardID != logicalShardID {
 		return sm.Result{}, errors.New("raftstore: committed command targets another logical shard")
-	}
-	if command.Type == DataInitializeShard && !uint64SetContains(command.ReplicaIDs, m.replicaID) {
-		return sm.Result{}, errors.New("raftstore: local replica is absent from data-shard bootstrap manifest")
 	}
 	result := ApplyDataCommand(&m.state, entry.Index, command)
 	return encodeApplyResult(result.Applied, result)
@@ -214,24 +208,6 @@ func encodeApplyResult(applied bool, result any) (sm.Result, error) {
 		value = 1
 	}
 	return sm.Result{Value: value, Data: raw}, nil
-}
-
-func replicaPlacementContains(replicas []ReplicaPlacement, replicaID uint64) bool {
-	for _, replica := range replicas {
-		if replica.ReplicaID == replicaID {
-			return true
-		}
-	}
-	return false
-}
-
-func uint64SetContains(values []uint64, target uint64) bool {
-	for _, value := range values {
-		if value == target {
-			return true
-		}
-	}
-	return false
 }
 
 func snapshotStopped(done <-chan struct{}) bool {
