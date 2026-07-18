@@ -615,7 +615,9 @@ func (r *Runtime) RefreshPermit(ctx context.Context) (PermitGrant, error) {
 
 func (r *Runtime) ApplyData(ctx context.Context, command DataCommand) (DataApplyResult, error) {
 	switch command.Type {
-	case DataInitializeShard, DataPrepareEpoch, DataRetireEpoch:
+	case DataInitializeShard, DataPrepareEpoch, DataRetireEpoch,
+		DataBeginRecovery, DataStageRecovery, DataAckRecovery, DataActivateRecovery,
+		DataQuarantineRecovery, DataFinalizeRecovery:
 		return DataApplyResult{}, errors.New("raftstore: data-shard lifecycle commands require the dedicated runtime workflow")
 	case DataCompactFence:
 		return DataApplyResult{}, errors.New("raftstore: execution-fence compaction requires the dedicated proof workflow")

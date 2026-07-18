@@ -237,5 +237,17 @@ func cloneDataStateForLookup(state DataState) DataState {
 	for key, fence := range state.Fences {
 		clone.Fences[key] = fence
 	}
+	if state.Recovery != nil {
+		recovery := *state.Recovery
+		clone.Recovery = &recovery
+	}
+	clone.RecoveryRecords = make(map[string]RecoveryObjectRecord, len(state.RecoveryRecords))
+	for key, record := range state.RecoveryRecords {
+		clone.RecoveryRecords[key] = cloneRecoveryRecord(record)
+	}
+	clone.RecoveryClaims = make(map[string]string, len(state.RecoveryClaims))
+	for claim, key := range state.RecoveryClaims {
+		clone.RecoveryClaims[claim] = key
+	}
 	return clone
 }

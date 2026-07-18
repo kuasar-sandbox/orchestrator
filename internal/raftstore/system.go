@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"reflect"
 )
 
 type RecoveryPhase string
@@ -20,13 +21,74 @@ const (
 )
 
 type RecoveryEpoch struct {
-	Epoch                   uint64        `json:"epoch"`
-	SourceClusterID         string        `json:"source_cluster_id"`
-	SourceStorageGeneration string        `json:"source_storage_generation"`
-	SourceManifestDigest    string        `json:"source_manifest_digest"`
-	TargetStorageGeneration string        `json:"target_storage_generation"`
-	TargetManifestDigest    string        `json:"target_manifest_digest"`
-	Phase                   RecoveryPhase `json:"phase"`
+	Epoch                   uint64                          `json:"epoch"`
+	SourceClusterID         string                          `json:"source_cluster_id"`
+	SourceStorageGeneration string                          `json:"source_storage_generation"`
+	SourceManifestDigest    string                          `json:"source_manifest_digest"`
+	TargetStorageGeneration string                          `json:"target_storage_generation"`
+	TargetManifestDigest    string                          `json:"target_manifest_digest"`
+	Phase                   RecoveryPhase                   `json:"phase"`
+	Nodes                   map[string]RecoveryNodeProgress `json:"nodes,omitempty"`
+}
+
+type RecoveryNodeState string
+
+const (
+	RecoveryNodeExpected    RecoveryNodeState = "EXPECTED"
+	RecoveryNodeCollecting  RecoveryNodeState = "COLLECTING"
+	RecoveryNodeReported    RecoveryNodeState = "REPORTED"
+	RecoveryNodeMissing     RecoveryNodeState = "MISSING"
+	RecoveryNodeQuarantined RecoveryNodeState = "QUARANTINED"
+	RecoveryNodeReconciled  RecoveryNodeState = "RECONCILED"
+)
+
+type RecoveryNodeProgress struct {
+	NodeID           string            `json:"node_id"`
+	EnrollmentID     string            `json:"enrollment_id"`
+	NodeEpoch        uint64            `json:"node_epoch"`
+	SessionSeq       uint64            `json:"session_seq,omitempty"`
+	State            RecoveryNodeState `json:"state"`
+	ReportDigest     string            `json:"report_digest,omitempty"`
+	ReportedObjects  uint64            `json:"reported_objects,omitempty"`
+	ResolvedObjects  uint64            `json:"resolved_objects,omitempty"`
+	ConflictObjects  uint64            `json:"conflict_objects,omitempty"`
+	LastAppliedIndex uint64            `json:"last_applied_index"`
+}
+
+func (p RecoveryNodeProgress) Validate(lastApplied uint64) error {
+	if p.NodeID == "" || p.EnrollmentID == "" || p.NodeEpoch == 0 || p.LastAppliedIndex == 0 ||
+		p.LastAppliedIndex > lastApplied || p.ResolvedObjects > p.ReportedObjects ||
+		p.ConflictObjects > p.ReportedObjects-p.ResolvedObjects {
+		return errors.New("raftstore: incomplete recovery node progress")
+	}
+	switch p.State {
+	case RecoveryNodeExpected:
+		if p.SessionSeq != 0 || p.ReportDigest != "" || p.ReportedObjects != 0 ||
+			p.ResolvedObjects != 0 || p.ConflictObjects != 0 {
+			return errors.New("raftstore: expected recovery node contains report progress")
+		}
+	case RecoveryNodeCollecting:
+		if p.SessionSeq == 0 || p.ReportDigest != "" || p.ReportedObjects != 0 ||
+			p.ResolvedObjects != 0 || p.ConflictObjects != 0 {
+			return errors.New("raftstore: collecting recovery node progress is invalid")
+		}
+	case RecoveryNodeReported, RecoveryNodeQuarantined, RecoveryNodeReconciled:
+		if p.SessionSeq == 0 || !isSHA256(p.ReportDigest) {
+			return errors.New("raftstore: recovery report identity is incomplete")
+		}
+		if (p.State == RecoveryNodeReconciled || p.State == RecoveryNodeQuarantined) &&
+			p.ResolvedObjects+p.ConflictObjects != p.ReportedObjects {
+			return errors.New("raftstore: resolved recovery node has unresolved objects")
+		}
+	case RecoveryNodeMissing:
+		if p.SessionSeq != 0 || p.ReportDigest != "" || p.ReportedObjects != 0 ||
+			p.ResolvedObjects != 0 || p.ConflictObjects != 0 {
+			return errors.New("raftstore: missing recovery node contains report progress")
+		}
+	default:
+		return errors.New("raftstore: invalid recovery node state")
+	}
+	return nil
 }
 
 func (r RecoveryEpoch) Validate() error {
@@ -37,10 +99,71 @@ func (r RecoveryEpoch) Validate() error {
 	}
 	switch r.Phase {
 	case RecoveryPreparing, RecoveryCollecting, RecoveryReconciling, RecoveryFinalizing:
+		for nodeID, progress := range r.Nodes {
+			if nodeID != progress.NodeID {
+				return errors.New("raftstore: recovery node map identity mismatch")
+			}
+		}
 		return nil
 	default:
 		return errors.New("raftstore: invalid open recovery phase")
 	}
+}
+
+type NodeCatalogRecord struct {
+	RuntimeDigest         string            `json:"runtime_digest,omitempty"`
+	Labels                map[string]string `json:"labels,omitempty"`
+	FailureDomain         string            `json:"failure_domain,omitempty"`
+	LoadModelVersion      uint16            `json:"load_model_version"`
+	SandboxSlots          uint64            `json:"sandbox_slots"`
+	BuildSlots            uint64            `json:"build_slots,omitempty"`
+	BuildCPU              uint64            `json:"build_cpu,omitempty"`
+	BuildMemory           uint64            `json:"build_memory,omitempty"`
+	BuildStorage          uint64            `json:"build_storage,omitempty"`
+	Draining              bool              `json:"draining,omitempty"`
+	CatalogVersion        uint64            `json:"catalog_version"`
+	LastRegistrationIndex uint64            `json:"last_registration_index"`
+}
+
+func (c NodeCatalogRecord) Validate(lastApplied uint64) error {
+	if c.LoadModelVersion == 0 || c.SandboxSlots == 0 || c.CatalogVersion == 0 ||
+		c.LastRegistrationIndex == 0 || c.LastRegistrationIndex > lastApplied {
+		return errors.New("raftstore: incomplete node catalog record")
+	}
+	for key := range c.Labels {
+		if key == "" {
+			return errors.New("raftstore: node catalog contains an empty label key")
+		}
+	}
+	return nil
+}
+
+// NodeEnrollmentRecord is the durable cluster-side half of explicit node
+// identity enrollment. A normal node-link registration can only advance an
+// existing record; it can never create one.
+type NodeEnrollmentRecord struct {
+	NodeID           string             `json:"node_id"`
+	EnrollmentID     string             `json:"enrollment_id"`
+	MaxNodeEpoch     uint64             `json:"max_node_epoch"`
+	DataEndpoint     string             `json:"data_endpoint"`
+	Retired          bool               `json:"retired,omitempty"`
+	Catalog          *NodeCatalogRecord `json:"catalog,omitempty"`
+	EnrollmentIndex  uint64             `json:"enrollment_index"`
+	LastAppliedIndex uint64             `json:"last_applied_index"`
+}
+
+func (r NodeEnrollmentRecord) Validate(lastApplied uint64) error {
+	if r.NodeID == "" || r.EnrollmentID == "" || r.MaxNodeEpoch == 0 || r.DataEndpoint == "" ||
+		r.EnrollmentIndex == 0 || r.EnrollmentIndex > lastApplied ||
+		r.LastAppliedIndex < r.EnrollmentIndex || r.LastAppliedIndex > lastApplied {
+		return errors.New("raftstore: incomplete node enrollment record")
+	}
+	if r.Catalog != nil {
+		if err := r.Catalog.Validate(lastApplied); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 type TransitionStage string
@@ -100,33 +223,34 @@ type GenerationClosure struct {
 }
 
 type SystemState struct {
-	Initialized                           bool                `json:"initialized"`
-	ClusterID                             string              `json:"cluster_id"`
-	StorageGeneration                     string              `json:"storage_generation"`
-	SystemEpoch                           uint64              `json:"system_epoch"`
-	SchemaVersion                         uint32              `json:"schema_version"`
-	ProtocolVersion                       uint32              `json:"protocol_version"`
-	VirtualShardCount                     uint32              `json:"virtual_shard_count"`
-	ActiveManifestVersion                 uint64              `json:"active_manifest_version"`
-	ActiveManifestDigest                  string              `json:"active_manifest_digest"`
-	ServePermitMaxMillis                  uint64              `json:"serve_permit_max_millis"`
-	HasPredecessor                        bool                `json:"has_predecessor"`
-	PredecessorGeneration                 string              `json:"predecessor_generation,omitempty"`
-	PredecessorManifestDigest             string              `json:"predecessor_manifest_digest,omitempty"`
-	PredecessorProofKind                  RolloverProofKind   `json:"predecessor_proof_kind,omitempty"`
-	PredecessorProofDigest                string              `json:"predecessor_proof_digest,omitempty"`
-	PredecessorProofCommitIndex           uint64              `json:"predecessor_proof_commit_index,omitempty"`
-	PredecessorTargetManifestIntentDigest string              `json:"predecessor_target_manifest_intent_digest,omitempty"`
-	PredecessorPermitMaxMillis            uint64              `json:"predecessor_permit_max_millis,omitempty"`
-	ServeGate                             bool                `json:"serve_gate"`
-	WriteGate                             bool                `json:"write_gate"`
-	CutoverGate                           bool                `json:"cutover_gate"`
-	PredecessorDrainComplete              bool                `json:"predecessor_drain_complete"`
-	Retired                               bool                `json:"retired"`
-	Transition                            *ManifestTransition `json:"transition,omitempty"`
-	Recovery                              *RecoveryEpoch      `json:"recovery,omitempty"`
-	Closure                               *GenerationClosure  `json:"closure,omitempty"`
-	LastApplied                           uint64              `json:"last_applied"`
+	Initialized                           bool                            `json:"initialized"`
+	ClusterID                             string                          `json:"cluster_id"`
+	StorageGeneration                     string                          `json:"storage_generation"`
+	SystemEpoch                           uint64                          `json:"system_epoch"`
+	SchemaVersion                         uint32                          `json:"schema_version"`
+	ProtocolVersion                       uint32                          `json:"protocol_version"`
+	VirtualShardCount                     uint32                          `json:"virtual_shard_count"`
+	ActiveManifestVersion                 uint64                          `json:"active_manifest_version"`
+	ActiveManifestDigest                  string                          `json:"active_manifest_digest"`
+	ServePermitMaxMillis                  uint64                          `json:"serve_permit_max_millis"`
+	HasPredecessor                        bool                            `json:"has_predecessor"`
+	PredecessorGeneration                 string                          `json:"predecessor_generation,omitempty"`
+	PredecessorManifestDigest             string                          `json:"predecessor_manifest_digest,omitempty"`
+	PredecessorProofKind                  RolloverProofKind               `json:"predecessor_proof_kind,omitempty"`
+	PredecessorProofDigest                string                          `json:"predecessor_proof_digest,omitempty"`
+	PredecessorProofCommitIndex           uint64                          `json:"predecessor_proof_commit_index,omitempty"`
+	PredecessorTargetManifestIntentDigest string                          `json:"predecessor_target_manifest_intent_digest,omitempty"`
+	PredecessorPermitMaxMillis            uint64                          `json:"predecessor_permit_max_millis,omitempty"`
+	ServeGate                             bool                            `json:"serve_gate"`
+	WriteGate                             bool                            `json:"write_gate"`
+	CutoverGate                           bool                            `json:"cutover_gate"`
+	PredecessorDrainComplete              bool                            `json:"predecessor_drain_complete"`
+	Retired                               bool                            `json:"retired"`
+	Transition                            *ManifestTransition             `json:"transition,omitempty"`
+	Recovery                              *RecoveryEpoch                  `json:"recovery,omitempty"`
+	Closure                               *GenerationClosure              `json:"closure,omitempty"`
+	NodeEnrollments                       map[string]NodeEnrollmentRecord `json:"node_enrollments"`
+	LastApplied                           uint64                          `json:"last_applied"`
 }
 
 // ConsensusPredecessorProof exports the committed closure in the form a
@@ -163,7 +287,7 @@ func (s SystemState) Identity() PermitIdentity {
 
 func (s SystemState) Validate() error {
 	if !s.Initialized {
-		if s != (SystemState{}) {
+		if !reflect.DeepEqual(s, SystemState{}) {
 			return errors.New("raftstore: uninitialized System Group contains state")
 		}
 		return nil
@@ -173,8 +297,16 @@ func (s SystemState) Validate() error {
 	}
 	if s.SchemaVersion == 0 || s.ProtocolVersion == 0 || s.VirtualShardCount == 0 ||
 		s.ActiveManifestVersion == 0 || s.ServePermitMaxMillis == 0 ||
-		s.ServePermitMaxMillis > MaximumServePermitMillis || s.LastApplied == 0 {
+		s.ServePermitMaxMillis > MaximumServePermitMillis || s.NodeEnrollments == nil || s.LastApplied == 0 {
 		return errors.New("raftstore: incomplete System Group state")
+	}
+	for nodeID, enrollment := range s.NodeEnrollments {
+		if nodeID != enrollment.NodeID {
+			return errors.New("raftstore: node enrollment map identity mismatch")
+		}
+		if err := enrollment.Validate(s.LastApplied); err != nil {
+			return err
+		}
 	}
 	if s.HasPredecessor {
 		if s.PredecessorGeneration == "" || s.PredecessorGeneration == s.StorageGeneration ||
@@ -256,6 +388,16 @@ func (s SystemState) Validate() error {
 		if err := s.Recovery.Validate(); err != nil {
 			return err
 		}
+		for nodeID, progress := range s.Recovery.Nodes {
+			if err := progress.Validate(s.LastApplied); err != nil {
+				return err
+			}
+			enrollment, found := s.NodeEnrollments[nodeID]
+			if !found || enrollment.EnrollmentID != progress.EnrollmentID ||
+				enrollment.MaxNodeEpoch < progress.NodeEpoch {
+				return errors.New("raftstore: recovery node is not an active enrollment generation")
+			}
+		}
 		if !s.HasPredecessor || !s.PredecessorDrainComplete ||
 			s.Recovery.Epoch != s.SystemEpoch ||
 			s.Recovery.SourceClusterID != s.ClusterID ||
@@ -287,6 +429,10 @@ const (
 	SystemConfirmDrain           SystemCommandType = "CONFIRM_PREDECESSOR_PERMIT_DRAIN"
 	SystemBeginRecovery          SystemCommandType = "BEGIN_RECOVERY"
 	SystemAdvanceRecovery        SystemCommandType = "ADVANCE_RECOVERY"
+	SystemEnrollNode             SystemCommandType = "ENROLL_NODE"
+	SystemAcceptNodeRegistration SystemCommandType = "ACCEPT_NODE_REGISTRATION"
+	SystemRetireNode             SystemCommandType = "RETIRE_NODE"
+	SystemUpdateRecoveryNode     SystemCommandType = "UPDATE_RECOVERY_NODE"
 )
 
 type GateUpdate struct {
@@ -304,6 +450,49 @@ type TransitionAdvance struct {
 type RecoveryAdvance struct {
 	From RecoveryPhase `json:"from"`
 	To   RecoveryPhase `json:"to"`
+}
+
+type NodeEnrollmentCommand struct {
+	NodeID       string `json:"node_id"`
+	EnrollmentID string `json:"enrollment_id"`
+	NodeEpoch    uint64 `json:"node_epoch"`
+	DataEndpoint string `json:"data_endpoint"`
+}
+
+type NodeRegistrationCommand struct {
+	NodeID           string            `json:"node_id"`
+	EnrollmentID     string            `json:"enrollment_id"`
+	NodeEpoch        uint64            `json:"node_epoch"`
+	DataEndpoint     string            `json:"data_endpoint"`
+	RuntimeDigest    string            `json:"runtime_digest,omitempty"`
+	Labels           map[string]string `json:"labels,omitempty"`
+	FailureDomain    string            `json:"failure_domain,omitempty"`
+	LoadModelVersion uint16            `json:"load_model_version"`
+	SandboxSlots     uint64            `json:"sandbox_slots"`
+	BuildSlots       uint64            `json:"build_slots,omitempty"`
+	BuildCPU         uint64            `json:"build_cpu,omitempty"`
+	BuildMemory      uint64            `json:"build_memory,omitempty"`
+	BuildStorage     uint64            `json:"build_storage,omitempty"`
+	Draining         bool              `json:"draining,omitempty"`
+}
+
+type NodeRetirementCommand struct {
+	NodeID        string `json:"node_id"`
+	EnrollmentID  string `json:"enrollment_id"`
+	LastNodeEpoch uint64 `json:"last_node_epoch"`
+}
+
+type RecoveryNodeUpdate struct {
+	NodeID          string            `json:"node_id"`
+	EnrollmentID    string            `json:"enrollment_id"`
+	NodeEpoch       uint64            `json:"node_epoch"`
+	SessionSeq      uint64            `json:"session_seq,omitempty"`
+	From            RecoveryNodeState `json:"from,omitempty"`
+	To              RecoveryNodeState `json:"to"`
+	ReportDigest    string            `json:"report_digest,omitempty"`
+	ReportedObjects uint64            `json:"reported_objects,omitempty"`
+	ResolvedObjects uint64            `json:"resolved_objects,omitempty"`
+	ConflictObjects uint64            `json:"conflict_objects,omitempty"`
 }
 
 type DrainConfirmation struct {
@@ -331,6 +520,10 @@ type SystemCommand struct {
 	TransitionDrain *TransitionDrainConfirmation `json:"transition_drain,omitempty"`
 	Recovery        *RecoveryEpoch               `json:"recovery,omitempty"`
 	RecoveryAdvance *RecoveryAdvance             `json:"recovery_advance,omitempty"`
+	Enrollment      *NodeEnrollmentCommand       `json:"enrollment,omitempty"`
+	Registration    *NodeRegistrationCommand     `json:"registration,omitempty"`
+	Retirement      *NodeRetirementCommand       `json:"retirement,omitempty"`
+	RecoveryNode    *RecoveryNodeUpdate          `json:"recovery_node,omitempty"`
 }
 
 type SystemApplyResult struct {
@@ -361,7 +554,7 @@ func ApplySystemCommand(state SystemState, index uint64, command SystemCommand) 
 			SystemEpoch: 1, SchemaVersion: manifest.SchemaVersion, ProtocolVersion: manifest.ProtocolVersion,
 			VirtualShardCount: manifest.VirtualShardCount, ActiveManifestVersion: manifest.ManifestVersion,
 			ActiveManifestDigest: digest, ServePermitMaxMillis: manifest.ServePermitMaxMillis,
-			HasPredecessor: manifest.Predecessor != nil,
+			HasPredecessor: manifest.Predecessor != nil, NodeEnrollments: make(map[string]NodeEnrollmentRecord),
 		}
 		if manifest.Predecessor == nil {
 			next.PredecessorDrainComplete = true
@@ -482,13 +675,26 @@ func ApplySystemCommand(state SystemState, index uint64, command SystemCommand) 
 			return state, systemConflict("invalid recovery epoch")
 		}
 		recovery := *command.Recovery
+		recovery.Nodes = cloneRecoveryNodes(command.Recovery.Nodes)
+		for nodeID, progress := range recovery.Nodes {
+			enrollment, found := state.NodeEnrollments[nodeID]
+			if !found || enrollment.Retired || enrollment.EnrollmentID != progress.EnrollmentID ||
+				enrollment.MaxNodeEpoch != progress.NodeEpoch || progress.State != RecoveryNodeExpected ||
+				progress.SessionSeq != 0 || progress.ReportDigest != "" || progress.ReportedObjects != 0 ||
+				progress.ResolvedObjects != 0 || progress.ConflictObjects != 0 {
+				return state, systemConflict("recovery expected-node set is not an exact active enrollment snapshot")
+			}
+			progress.LastAppliedIndex = index
+			recovery.Nodes[nodeID] = progress
+		}
 		next.Recovery = &recovery
 		next.SystemEpoch = recovery.Epoch
 		next.ServeGate, next.WriteGate, next.CutoverGate = false, false, false
 	case SystemAdvanceRecovery:
 		if state.Recovery == nil || command.RecoveryAdvance == nil ||
 			state.Recovery.Phase != command.RecoveryAdvance.From ||
-			!validRecoveryAdvance(command.RecoveryAdvance.From, command.RecoveryAdvance.To) {
+			!validRecoveryAdvance(command.RecoveryAdvance.From, command.RecoveryAdvance.To) ||
+			!recoveryNodesPermitAdvance(state.Recovery.Nodes, command.RecoveryAdvance.From, command.RecoveryAdvance.To) {
 			return state, systemConflict("recovery phase conflict")
 		}
 		if command.RecoveryAdvance.To == RecoveryClosed {
@@ -496,9 +702,92 @@ func ApplySystemCommand(state SystemState, index uint64, command SystemCommand) 
 			next.SystemEpoch++
 		} else {
 			recovery := *state.Recovery
+			recovery.Nodes = cloneRecoveryNodes(state.Recovery.Nodes)
 			recovery.Phase = command.RecoveryAdvance.To
 			next.Recovery = &recovery
 		}
+	case SystemEnrollNode:
+		if !state.Initialized || state.Retired || command.Enrollment == nil ||
+			command.Enrollment.NodeID == "" || command.Enrollment.EnrollmentID == "" ||
+			command.Enrollment.NodeEpoch == 0 || command.Enrollment.DataEndpoint == "" {
+			return state, systemConflict("invalid explicit node enrollment")
+		}
+		if _, found := state.NodeEnrollments[command.Enrollment.NodeID]; found {
+			return state, systemConflict("node identity is already enrolled or retired")
+		}
+		next.NodeEnrollments = cloneNodeEnrollments(state.NodeEnrollments)
+		next.NodeEnrollments[command.Enrollment.NodeID] = NodeEnrollmentRecord{
+			NodeID: command.Enrollment.NodeID, EnrollmentID: command.Enrollment.EnrollmentID,
+			MaxNodeEpoch: command.Enrollment.NodeEpoch, DataEndpoint: command.Enrollment.DataEndpoint,
+			EnrollmentIndex: index, LastAppliedIndex: index,
+		}
+	case SystemAcceptNodeRegistration:
+		registration := command.Registration
+		if !state.Initialized || state.Retired || registration == nil ||
+			registration.NodeID == "" || registration.EnrollmentID == "" || registration.NodeEpoch == 0 ||
+			registration.DataEndpoint == "" || registration.LoadModelVersion == 0 || registration.SandboxSlots == 0 {
+			return state, systemConflict("invalid node registration")
+		}
+		current, found := state.NodeEnrollments[registration.NodeID]
+		if !found || current.Retired || current.EnrollmentID != registration.EnrollmentID ||
+			registration.NodeEpoch < current.MaxNodeEpoch ||
+			registration.NodeEpoch == current.MaxNodeEpoch && registration.DataEndpoint != current.DataEndpoint {
+			return state, systemConflict("node registration is not authorized by its durable enrollment")
+		}
+		next.NodeEnrollments = cloneNodeEnrollments(state.NodeEnrollments)
+		current.MaxNodeEpoch = registration.NodeEpoch
+		current.DataEndpoint = registration.DataEndpoint
+		catalogVersion := uint64(1)
+		if current.Catalog != nil {
+			catalogVersion = current.Catalog.CatalogVersion + 1
+		}
+		current.Catalog = &NodeCatalogRecord{
+			RuntimeDigest: registration.RuntimeDigest, Labels: cloneStringMap(registration.Labels),
+			FailureDomain: registration.FailureDomain, LoadModelVersion: registration.LoadModelVersion,
+			SandboxSlots: registration.SandboxSlots, BuildSlots: registration.BuildSlots,
+			BuildCPU: registration.BuildCPU, BuildMemory: registration.BuildMemory,
+			BuildStorage: registration.BuildStorage, Draining: registration.Draining,
+			CatalogVersion: catalogVersion, LastRegistrationIndex: index,
+		}
+		current.LastAppliedIndex = index
+		next.NodeEnrollments[registration.NodeID] = current
+	case SystemRetireNode:
+		retirement := command.Retirement
+		if !state.Initialized || retirement == nil || retirement.NodeID == "" ||
+			retirement.EnrollmentID == "" || retirement.LastNodeEpoch == 0 {
+			return state, systemConflict("invalid node identity retirement")
+		}
+		current, found := state.NodeEnrollments[retirement.NodeID]
+		if !found || current.Retired || current.EnrollmentID != retirement.EnrollmentID ||
+			current.MaxNodeEpoch != retirement.LastNodeEpoch {
+			return state, systemConflict("node retirement does not fence the exact enrolled generation")
+		}
+		next.NodeEnrollments = cloneNodeEnrollments(state.NodeEnrollments)
+		current.Retired = true
+		current.LastAppliedIndex = index
+		next.NodeEnrollments[retirement.NodeID] = current
+	case SystemUpdateRecoveryNode:
+		if state.Recovery == nil || command.RecoveryNode == nil {
+			return state, systemConflict("no matching recovery node progress")
+		}
+		update := command.RecoveryNode
+		current, found := state.Recovery.Nodes[update.NodeID]
+		if !found || current.EnrollmentID != update.EnrollmentID || current.NodeEpoch != update.NodeEpoch ||
+			current.State != update.From || !recoveryPhaseAllowsNodeUpdate(state.Recovery.Phase, update.To) ||
+			!validRecoveryNodeAdvance(current, *update) {
+			return state, systemConflict("recovery node progress conflict")
+		}
+		recovery := *state.Recovery
+		recovery.Nodes = cloneRecoveryNodes(state.Recovery.Nodes)
+		current.State = update.To
+		current.SessionSeq = update.SessionSeq
+		current.ReportDigest = update.ReportDigest
+		current.ReportedObjects = update.ReportedObjects
+		current.ResolvedObjects = update.ResolvedObjects
+		current.ConflictObjects = update.ConflictObjects
+		current.LastAppliedIndex = index
+		recovery.Nodes[update.NodeID] = current
+		next.Recovery = &recovery
 	default:
 		return state, systemConflict(fmt.Sprintf("unknown System Group command %q", command.Type))
 	}
@@ -642,4 +931,118 @@ func validRecoveryAdvance(from, to RecoveryPhase) bool {
 		from == RecoveryCollecting && to == RecoveryReconciling ||
 		from == RecoveryReconciling && to == RecoveryFinalizing ||
 		from == RecoveryFinalizing && to == RecoveryClosed
+}
+
+func recoveryNodesPermitAdvance(nodes map[string]RecoveryNodeProgress, from, to RecoveryPhase) bool {
+	for _, progress := range nodes {
+		switch {
+		case from == RecoveryPreparing && to == RecoveryCollecting:
+			if progress.State != RecoveryNodeExpected && progress.State != RecoveryNodeMissing {
+				return false
+			}
+		case from == RecoveryCollecting && to == RecoveryReconciling:
+			if progress.State != RecoveryNodeReported && progress.State != RecoveryNodeMissing &&
+				progress.State != RecoveryNodeQuarantined {
+				return false
+			}
+		case from == RecoveryReconciling && to == RecoveryFinalizing:
+			if progress.State != RecoveryNodeReconciled && progress.State != RecoveryNodeMissing &&
+				progress.State != RecoveryNodeQuarantined {
+				return false
+			}
+		case from == RecoveryFinalizing && to == RecoveryClosed:
+			if progress.State != RecoveryNodeReconciled && progress.State != RecoveryNodeMissing &&
+				progress.State != RecoveryNodeQuarantined {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func validRecoveryNodeAdvance(current RecoveryNodeProgress, update RecoveryNodeUpdate) bool {
+	if update.NodeID == "" || update.EnrollmentID == "" || update.NodeEpoch == 0 {
+		return false
+	}
+	allowed := current.State == RecoveryNodeExpected &&
+		(update.To == RecoveryNodeCollecting || update.To == RecoveryNodeMissing) ||
+		current.State == RecoveryNodeCollecting &&
+			(update.To == RecoveryNodeReported || update.To == RecoveryNodeMissing || update.To == RecoveryNodeQuarantined) ||
+		current.State == RecoveryNodeReported &&
+			(update.To == RecoveryNodeReported || update.To == RecoveryNodeReconciled || update.To == RecoveryNodeQuarantined) ||
+		current.State == RecoveryNodeQuarantined && update.To == RecoveryNodeQuarantined
+	if !allowed {
+		return false
+	}
+	if current.State == RecoveryNodeReported || current.State == RecoveryNodeQuarantined {
+		if update.SessionSeq != current.SessionSeq || update.ReportDigest != current.ReportDigest ||
+			update.ReportedObjects != current.ReportedObjects {
+			return false
+		}
+	}
+	candidate := current
+	candidate.State = update.To
+	candidate.SessionSeq = update.SessionSeq
+	candidate.ReportDigest = update.ReportDigest
+	candidate.ReportedObjects = update.ReportedObjects
+	candidate.ResolvedObjects = update.ResolvedObjects
+	candidate.ConflictObjects = update.ConflictObjects
+	candidate.LastAppliedIndex = 1
+	return candidate.Validate(1) == nil &&
+		update.ReportedObjects >= current.ReportedObjects &&
+		update.ResolvedObjects >= current.ResolvedObjects &&
+		update.ConflictObjects >= current.ConflictObjects
+}
+
+func recoveryPhaseAllowsNodeUpdate(phase RecoveryPhase, state RecoveryNodeState) bool {
+	switch phase {
+	case RecoveryPreparing:
+		return state == RecoveryNodeMissing
+	case RecoveryCollecting:
+		return state == RecoveryNodeCollecting || state == RecoveryNodeReported ||
+			state == RecoveryNodeMissing || state == RecoveryNodeQuarantined
+	case RecoveryReconciling:
+		return state == RecoveryNodeReported || state == RecoveryNodeReconciled ||
+			state == RecoveryNodeQuarantined
+	default:
+		return false
+	}
+}
+
+func cloneNodeEnrollments(source map[string]NodeEnrollmentRecord) map[string]NodeEnrollmentRecord {
+	if source == nil {
+		return nil
+	}
+	clone := make(map[string]NodeEnrollmentRecord, len(source))
+	for nodeID, enrollment := range source {
+		if enrollment.Catalog != nil {
+			catalog := *enrollment.Catalog
+			catalog.Labels = cloneStringMap(enrollment.Catalog.Labels)
+			enrollment.Catalog = &catalog
+		}
+		clone[nodeID] = enrollment
+	}
+	return clone
+}
+
+func cloneRecoveryNodes(source map[string]RecoveryNodeProgress) map[string]RecoveryNodeProgress {
+	if source == nil {
+		return nil
+	}
+	clone := make(map[string]RecoveryNodeProgress, len(source))
+	for nodeID, progress := range source {
+		clone[nodeID] = progress
+	}
+	return clone
+}
+
+func cloneStringMap(source map[string]string) map[string]string {
+	if source == nil {
+		return nil
+	}
+	clone := make(map[string]string, len(source))
+	for key, value := range source {
+		clone[key] = value
+	}
+	return clone
 }

@@ -50,6 +50,9 @@ type DataState struct {
 	Routes               map[string]clusterstate.RouteWorkflowRecord `json:"routes"`
 	Builds               map[string]clusterstate.BuildRecord         `json:"builds"`
 	Fences               map[string]clusterstate.ExecutionFence      `json:"fences"`
+	Recovery             *DataRecoveryState                          `json:"recovery,omitempty"`
+	RecoveryRecords      map[string]RecoveryObjectRecord             `json:"recovery_records"`
+	RecoveryClaims       map[string]string                           `json:"recovery_claims"`
 	LastApplied          uint64                                      `json:"last_applied"`
 }
 
@@ -60,7 +63,7 @@ func (s DataState) Validate() error {
 			s.BuildBucketCount != 0 || s.VirtualShardCount != 0 || len(s.ReplicaIDs) != 0 ||
 			len(s.PreparedReplicaIDs) != 0 || s.RouteChangefeedFloor != 0 || len(s.RouteChanges) != 0 ||
 			s.LastApplied != 0 || len(s.Routes) != 0 || len(s.Builds) != 0 || len(s.Fences) != 0 ||
-			len(s.ServingEpochs) != 0 {
+			len(s.ServingEpochs) != 0 || s.Recovery != nil || len(s.RecoveryRecords) != 0 || len(s.RecoveryClaims) != 0 {
 			return errors.New("raftstore: uninitialized data shard contains state")
 		}
 		return nil
@@ -82,6 +85,19 @@ func (s DataState) Validate() error {
 		if err := validateStoredFence(s, key, fence); err != nil {
 			return err
 		}
+	}
+	if s.Recovery != nil {
+		if err := s.Recovery.Validate(s); err != nil {
+			return err
+		}
+	}
+	for key, record := range s.RecoveryRecords {
+		if err := validateStoredRecoveryRecord(s, key, record); err != nil {
+			return err
+		}
+	}
+	if err := validateRecoveryClaims(s); err != nil {
+		return err
 	}
 	if s.RouteChangefeedFloor > s.LastApplied {
 		return errors.New("raftstore: Route changefeed floor exceeds applied state")
@@ -123,7 +139,8 @@ func validateDataStateIdentity(s DataState) error {
 		!isPowerOfTwo(s.RouteBucketCount) || !isPowerOfTwo(s.BuildBucketCount) ||
 		s.VirtualShardCount == 0 || !isPowerOfTwo(s.VirtualShardCount) || s.ShardID >= s.VirtualShardCount ||
 		len(s.ReplicaIDs) != int(DefaultReplication) || len(s.ServingEpochs) == 0 || len(s.ServingEpochs) > 2 ||
-		s.Routes == nil || s.Builds == nil || s.Fences == nil || s.LastApplied == 0 {
+		s.Routes == nil || s.Builds == nil || s.Fences == nil || s.RecoveryRecords == nil ||
+		s.RecoveryClaims == nil || s.LastApplied == 0 {
 		return errors.New("raftstore: incomplete data shard identity")
 	}
 	if !sort.SliceIsSorted(s.ReplicaIDs, func(i, j int) bool { return s.ReplicaIDs[i] < s.ReplicaIDs[j] }) {
@@ -216,13 +233,19 @@ func (s DataState) Accepts(identity ShardRequestIdentity) bool {
 type DataCommandType string
 
 const (
-	DataInitializeShard DataCommandType = "INITIALIZE_SHARD"
-	DataPrepareEpoch    DataCommandType = "PREPARE_EPOCH"
-	DataRetireEpoch     DataCommandType = "RETIRE_EPOCH"
-	DataPutRoute        DataCommandType = "PUT_ROUTE"
-	DataPutBuild        DataCommandType = "PUT_BUILD"
-	DataPutFence        DataCommandType = "PUT_FENCE"
-	DataCompactFence    DataCommandType = "COMPACT_FENCE"
+	DataInitializeShard    DataCommandType = "INITIALIZE_SHARD"
+	DataPrepareEpoch       DataCommandType = "PREPARE_EPOCH"
+	DataRetireEpoch        DataCommandType = "RETIRE_EPOCH"
+	DataPutRoute           DataCommandType = "PUT_ROUTE"
+	DataPutBuild           DataCommandType = "PUT_BUILD"
+	DataPutFence           DataCommandType = "PUT_FENCE"
+	DataCompactFence       DataCommandType = "COMPACT_FENCE"
+	DataBeginRecovery      DataCommandType = "BEGIN_RECOVERY"
+	DataStageRecovery      DataCommandType = "STAGE_RECOVERY_OBJECT"
+	DataAckRecovery        DataCommandType = "ACK_RECOVERY_REBIND"
+	DataActivateRecovery   DataCommandType = "ACTIVATE_RECOVERY_OBJECT"
+	DataQuarantineRecovery DataCommandType = "QUARANTINE_RECOVERY_OBJECT"
+	DataFinalizeRecovery   DataCommandType = "FINALIZE_RECOVERY"
 )
 
 type RevisionExpectation struct {
@@ -307,16 +330,20 @@ func (b DataShardBootstrap) Validate() error {
 }
 
 type DataCommand struct {
-	Type       DataCommandType                   `json:"type"`
-	Identity   ShardRequestIdentity              `json:"identity"`
-	Bootstrap  *DataShardBootstrap               `json:"bootstrap,omitempty"`
-	ReplicaIDs []uint64                          `json:"replica_ids,omitempty"`
-	Epoch      *PermitIdentity                   `json:"epoch,omitempty"`
-	Expect     RevisionExpectation               `json:"expect,omitempty"`
-	Route      *clusterstate.RouteWorkflowRecord `json:"route,omitempty"`
-	Build      *clusterstate.BuildRecord         `json:"build,omitempty"`
-	Fence      *clusterstate.ExecutionFence      `json:"fence,omitempty"`
-	Compaction *FenceCompactionAuthorization     `json:"compaction,omitempty"`
+	Type           DataCommandType                   `json:"type"`
+	Identity       ShardRequestIdentity              `json:"identity"`
+	Bootstrap      *DataShardBootstrap               `json:"bootstrap,omitempty"`
+	ReplicaIDs     []uint64                          `json:"replica_ids,omitempty"`
+	Epoch          *PermitIdentity                   `json:"epoch,omitempty"`
+	Expect         RevisionExpectation               `json:"expect,omitempty"`
+	Route          *clusterstate.RouteWorkflowRecord `json:"route,omitempty"`
+	Build          *clusterstate.BuildRecord         `json:"build,omitempty"`
+	Fence          *clusterstate.ExecutionFence      `json:"fence,omitempty"`
+	Compaction     *FenceCompactionAuthorization     `json:"compaction,omitempty"`
+	RecoveryStart  *DataRecoveryState                `json:"recovery_start,omitempty"`
+	RecoveryRecord *RecoveryObjectRecord             `json:"recovery_record,omitempty"`
+	RecoveryUpdate *RecoveryObjectUpdate             `json:"recovery_update,omitempty"`
+	RecoveryFinal  *RecoveryFinalization             `json:"recovery_final,omitempty"`
 }
 
 type DataApplyResult struct {
@@ -365,6 +392,8 @@ func ApplyDataCommand(state *DataState, index uint64, command DataCommand) DataA
 			ServingEpochs:     []PermitIdentity{command.Identity.PermitIdentity},
 			Routes:            make(map[string]clusterstate.RouteWorkflowRecord),
 			Builds:            make(map[string]clusterstate.BuildRecord), Fences: make(map[string]clusterstate.ExecutionFence),
+			RecoveryRecords: make(map[string]RecoveryObjectRecord),
+			RecoveryClaims:  make(map[string]string),
 		}
 	case DataPrepareEpoch:
 		if !state.Accepts(command.Identity) || command.Epoch == nil || len(state.ServingEpochs) != 1 ||
@@ -489,6 +518,48 @@ func ApplyDataCommand(state *DataState, index uint64, command DataCommand) DataA
 			return conflict(err.Error(), fence.Revision.LogIndex)
 		}
 		delete(state.Fences, key)
+	case DataBeginRecovery:
+		if command.RecoveryStart == nil {
+			return conflict("data recovery start is missing", 0)
+		}
+		if err := beginDataRecovery(state, command.Identity, *command.RecoveryStart); err != nil {
+			return conflict(err.Error(), 0)
+		}
+	case DataStageRecovery:
+		if command.RecoveryRecord == nil {
+			return conflict("recovery object report is missing", 0)
+		}
+		if err := stageRecoveryObject(state, index, command.Identity, *command.RecoveryRecord); err != nil {
+			return conflict(err.Error(), 0)
+		}
+	case DataAckRecovery:
+		if command.RecoveryUpdate == nil {
+			return conflict("recovery rebind acknowledgement is missing", 0)
+		}
+		if err := updateRecoveryObject(state, index, command.Identity, *command.RecoveryUpdate, RecoveryObjectRebound); err != nil {
+			return conflict(err.Error(), 0)
+		}
+	case DataActivateRecovery:
+		if command.RecoveryUpdate == nil {
+			return conflict("recovery activation is missing", 0)
+		}
+		if err := activateRecoveryObject(state, index, command.Identity, *command.RecoveryUpdate); err != nil {
+			return conflict(err.Error(), 0)
+		}
+	case DataQuarantineRecovery:
+		if command.RecoveryUpdate == nil {
+			return conflict("recovery quarantine is missing", 0)
+		}
+		if err := updateRecoveryObject(state, index, command.Identity, *command.RecoveryUpdate, RecoveryObjectQuarantined); err != nil {
+			return conflict(err.Error(), 0)
+		}
+	case DataFinalizeRecovery:
+		if command.RecoveryFinal == nil {
+			return conflict("data recovery finalization is missing", 0)
+		}
+		if err := finalizeDataRecovery(state, command.Identity, *command.RecoveryFinal); err != nil {
+			return conflict(err.Error(), 0)
+		}
 	default:
 		return conflict(fmt.Sprintf("unknown data command %q", command.Type), 0)
 	}

@@ -63,7 +63,7 @@ func finalizeConsensusSuccessor(
 		VirtualShardCount:     predecessor.VirtualShardCount,
 		ActiveManifestVersion: predecessor.ManifestVersion, ActiveManifestDigest: predecessorDigest,
 		ServePermitMaxMillis:     predecessor.ServePermitMaxMillis,
-		PredecessorDrainComplete: true, LastApplied: 1,
+		PredecessorDrainComplete: true, NodeEnrollments: map[string]NodeEnrollmentRecord{}, LastApplied: 1,
 	}
 	if predecessor.Predecessor != nil {
 		source.HasPredecessor = true

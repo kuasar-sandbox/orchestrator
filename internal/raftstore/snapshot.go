@@ -14,7 +14,7 @@ import (
 )
 
 const (
-	snapshotFormatVersion = uint32(1)
+	snapshotFormatVersion = uint32(2)
 	maxSnapshotBytes      = uint64(512 << 20)
 	snapshotKindSystem    = byte(1)
 	snapshotKindData      = byte(2)
@@ -42,25 +42,38 @@ type fenceSnapshotRow struct {
 	Record clusterstate.ExecutionFence `json:"record"`
 }
 
+type recoverySnapshotRow struct {
+	Key    string               `json:"key"`
+	Record RecoveryObjectRecord `json:"record"`
+}
+
+type recoveryClaimSnapshotRow struct {
+	Claim string `json:"claim"`
+	Key   string `json:"key"`
+}
+
 type dataSnapshot struct {
-	FormatVersion      uint32             `json:"format_version"`
-	Initialized        bool               `json:"initialized"`
-	ClusterID          string             `json:"cluster_id"`
-	StorageGeneration  string             `json:"storage_generation"`
-	ShardID            uint32             `json:"shard_id"`
-	SchemaVersion      uint32             `json:"schema_version"`
-	ProtocolVersion    uint32             `json:"protocol_version"`
-	HashVersion        string             `json:"hash_version"`
-	RouteBucketCount   uint32             `json:"route_bucket_count"`
-	BuildBucketCount   uint32             `json:"build_bucket_count"`
-	VirtualShardCount  uint32             `json:"virtual_shard_count"`
-	ReplicaIDs         []uint64           `json:"replica_ids"`
-	PreparedReplicaIDs []uint64           `json:"prepared_replica_ids,omitempty"`
-	ServingEpochs      []PermitIdentity   `json:"serving_epochs"`
-	Routes             []routeSnapshotRow `json:"routes"`
-	Builds             []buildSnapshotRow `json:"builds"`
-	Fences             []fenceSnapshotRow `json:"fences"`
-	LastApplied        uint64             `json:"last_applied"`
+	FormatVersion      uint32                     `json:"format_version"`
+	Initialized        bool                       `json:"initialized"`
+	ClusterID          string                     `json:"cluster_id"`
+	StorageGeneration  string                     `json:"storage_generation"`
+	ShardID            uint32                     `json:"shard_id"`
+	SchemaVersion      uint32                     `json:"schema_version"`
+	ProtocolVersion    uint32                     `json:"protocol_version"`
+	HashVersion        string                     `json:"hash_version"`
+	RouteBucketCount   uint32                     `json:"route_bucket_count"`
+	BuildBucketCount   uint32                     `json:"build_bucket_count"`
+	VirtualShardCount  uint32                     `json:"virtual_shard_count"`
+	ReplicaIDs         []uint64                   `json:"replica_ids"`
+	PreparedReplicaIDs []uint64                   `json:"prepared_replica_ids,omitempty"`
+	ServingEpochs      []PermitIdentity           `json:"serving_epochs"`
+	Routes             []routeSnapshotRow         `json:"routes"`
+	Builds             []buildSnapshotRow         `json:"builds"`
+	Fences             []fenceSnapshotRow         `json:"fences"`
+	Recovery           *DataRecoveryState         `json:"recovery,omitempty"`
+	RecoveryRecords    []recoverySnapshotRow      `json:"recovery_records,omitempty"`
+	RecoveryClaims     []recoveryClaimSnapshotRow `json:"recovery_claims,omitempty"`
+	LastApplied        uint64                     `json:"last_applied"`
 }
 
 func encodeSystemSnapshot(state SystemState) ([]byte, error) {
@@ -105,6 +118,10 @@ func encodeDataSnapshot(state DataState) ([]byte, error) {
 		PreparedReplicaIDs: append([]uint64(nil), state.PreparedReplicaIDs...),
 		ServingEpochs:      append([]PermitIdentity(nil), state.ServingEpochs...), LastApplied: state.LastApplied,
 	}
+	if state.Recovery != nil {
+		recovery := *state.Recovery
+		snapshot.Recovery = &recovery
+	}
 	for key, record := range state.Routes {
 		snapshot.Routes = append(snapshot.Routes, routeSnapshotRow{Key: key, Record: cloneRouteRecord(record)})
 	}
@@ -114,9 +131,17 @@ func encodeDataSnapshot(state DataState) ([]byte, error) {
 	for key, fence := range state.Fences {
 		snapshot.Fences = append(snapshot.Fences, fenceSnapshotRow{Key: key, Record: fence})
 	}
+	for key, record := range state.RecoveryRecords {
+		snapshot.RecoveryRecords = append(snapshot.RecoveryRecords, recoverySnapshotRow{Key: key, Record: cloneRecoveryRecord(record)})
+	}
+	for claim, key := range state.RecoveryClaims {
+		snapshot.RecoveryClaims = append(snapshot.RecoveryClaims, recoveryClaimSnapshotRow{Claim: claim, Key: key})
+	}
 	sort.Slice(snapshot.Routes, func(i, j int) bool { return snapshot.Routes[i].Key < snapshot.Routes[j].Key })
 	sort.Slice(snapshot.Builds, func(i, j int) bool { return snapshot.Builds[i].Key < snapshot.Builds[j].Key })
 	sort.Slice(snapshot.Fences, func(i, j int) bool { return snapshot.Fences[i].Key < snapshot.Fences[j].Key })
+	sort.Slice(snapshot.RecoveryRecords, func(i, j int) bool { return snapshot.RecoveryRecords[i].Key < snapshot.RecoveryRecords[j].Key })
+	sort.Slice(snapshot.RecoveryClaims, func(i, j int) bool { return snapshot.RecoveryClaims[i].Claim < snapshot.RecoveryClaims[j].Claim })
 	payload, err := json.Marshal(snapshot)
 	if err != nil {
 		return nil, err
@@ -147,12 +172,20 @@ func decodeDataSnapshot(raw []byte) (DataState, error) {
 		Routes:             make(map[string]clusterstate.RouteWorkflowRecord, len(snapshot.Routes)),
 		Builds:             make(map[string]clusterstate.BuildRecord, len(snapshot.Builds)),
 		Fences:             make(map[string]clusterstate.ExecutionFence, len(snapshot.Fences)), LastApplied: snapshot.LastApplied,
+		RecoveryRecords: make(map[string]RecoveryObjectRecord, len(snapshot.RecoveryRecords)),
+		RecoveryClaims:  make(map[string]string, len(snapshot.RecoveryClaims)),
+	}
+	if snapshot.Recovery != nil {
+		recovery := *snapshot.Recovery
+		state.Recovery = &recovery
 	}
 	if !state.Initialized {
-		if len(snapshot.Routes) != 0 || len(snapshot.Builds) != 0 || len(snapshot.Fences) != 0 {
+		if len(snapshot.Routes) != 0 || len(snapshot.Builds) != 0 || len(snapshot.Fences) != 0 ||
+			snapshot.Recovery != nil || len(snapshot.RecoveryRecords) != 0 || len(snapshot.RecoveryClaims) != 0 {
 			return DataState{}, errors.New("raftstore: uninitialized data snapshot contains rows")
 		}
 		state.Routes, state.Builds, state.Fences = nil, nil, nil
+		state.RecoveryRecords, state.RecoveryClaims = nil, nil
 	}
 	for _, row := range snapshot.Routes {
 		if _, duplicate := state.Routes[row.Key]; duplicate {
@@ -171,6 +204,21 @@ func decodeDataSnapshot(raw []byte) (DataState, error) {
 			return DataState{}, errors.New("raftstore: duplicate fence snapshot key")
 		}
 		state.Fences[row.Key] = row.Record
+	}
+	for _, row := range snapshot.RecoveryRecords {
+		if _, duplicate := state.RecoveryRecords[row.Key]; duplicate {
+			return DataState{}, errors.New("raftstore: duplicate recovery object snapshot key")
+		}
+		state.RecoveryRecords[row.Key] = cloneRecoveryRecord(row.Record)
+	}
+	for _, row := range snapshot.RecoveryClaims {
+		if row.Claim == "" || row.Key == "" {
+			return DataState{}, errors.New("raftstore: invalid recovery claim snapshot row")
+		}
+		if _, duplicate := state.RecoveryClaims[row.Claim]; duplicate {
+			return DataState{}, errors.New("raftstore: duplicate recovery claim snapshot key")
+		}
+		state.RecoveryClaims[row.Claim] = row.Key
 	}
 	if err := state.Validate(); err != nil {
 		return DataState{}, err
@@ -229,6 +277,7 @@ func readSnapshot(reader io.Reader) ([]byte, error) {
 
 func cloneSystemState(state SystemState) SystemState {
 	clone := state
+	clone.NodeEnrollments = cloneNodeEnrollments(state.NodeEnrollments)
 	if state.Transition != nil {
 		transition := *state.Transition
 		transition.Shards = append([]ShardTransition(nil), state.Transition.Shards...)
@@ -236,6 +285,7 @@ func cloneSystemState(state SystemState) SystemState {
 	}
 	if state.Recovery != nil {
 		recovery := *state.Recovery
+		recovery.Nodes = cloneRecoveryNodes(state.Recovery.Nodes)
 		clone.Recovery = &recovery
 	}
 	if state.Closure != nil {

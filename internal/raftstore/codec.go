@@ -51,6 +51,8 @@ func validateSystemCommandEnvelope(command SystemCommand) error {
 		command.Manifest != nil, command.Gates != nil, command.Transition != nil, command.Advance != nil,
 		command.Closure != nil, command.Drain != nil, command.TransitionDrain != nil,
 		command.Recovery != nil, command.RecoveryAdvance != nil,
+		command.Enrollment != nil, command.Registration != nil, command.Retirement != nil,
+		command.RecoveryNode != nil,
 	)
 	switch command.Type {
 	case SystemBootstrap:
@@ -93,6 +95,22 @@ func validateSystemCommandEnvelope(command SystemCommand) error {
 		if pointers != 1 || command.RecoveryAdvance == nil || command.Digest != "" {
 			return errors.New("raftstore: malformed recovery advance command")
 		}
+	case SystemEnrollNode:
+		if pointers != 1 || command.Enrollment == nil || command.Digest != "" {
+			return errors.New("raftstore: malformed node enrollment command")
+		}
+	case SystemAcceptNodeRegistration:
+		if pointers != 1 || command.Registration == nil || command.Digest != "" {
+			return errors.New("raftstore: malformed node registration command")
+		}
+	case SystemRetireNode:
+		if pointers != 1 || command.Retirement == nil || command.Digest != "" {
+			return errors.New("raftstore: malformed node retirement command")
+		}
+	case SystemUpdateRecoveryNode:
+		if pointers != 1 || command.RecoveryNode == nil || command.Digest != "" {
+			return errors.New("raftstore: malformed recovery node update command")
+		}
 	default:
 		return fmt.Errorf("raftstore: unknown System command %q", command.Type)
 	}
@@ -105,7 +123,8 @@ func validateDataCommandEnvelope(command DataCommand) error {
 	}
 	pointers := countPresent(
 		command.Bootstrap != nil, command.Epoch != nil, command.Route != nil, command.Build != nil,
-		command.Fence != nil, command.Compaction != nil,
+		command.Fence != nil, command.Compaction != nil, command.RecoveryStart != nil,
+		command.RecoveryRecord != nil, command.RecoveryUpdate != nil, command.RecoveryFinal != nil,
 	)
 	hasReplicas := len(command.ReplicaIDs) != 0
 	hasExpectation := command.Expect.Absent || command.Expect.LogIndex != 0
@@ -138,6 +157,22 @@ func validateDataCommandEnvelope(command DataCommand) error {
 	case DataCompactFence:
 		if pointers != 1 || command.Compaction == nil || hasReplicas || hasExpectation {
 			return errors.New("raftstore: malformed execution-fence compaction command")
+		}
+	case DataBeginRecovery:
+		if pointers != 1 || command.RecoveryStart == nil || hasReplicas || hasExpectation {
+			return errors.New("raftstore: malformed data recovery start command")
+		}
+	case DataStageRecovery:
+		if pointers != 1 || command.RecoveryRecord == nil || hasReplicas || hasExpectation {
+			return errors.New("raftstore: malformed recovery object report command")
+		}
+	case DataAckRecovery, DataActivateRecovery, DataQuarantineRecovery:
+		if pointers != 1 || command.RecoveryUpdate == nil || hasReplicas || hasExpectation {
+			return errors.New("raftstore: malformed recovery object update command")
+		}
+	case DataFinalizeRecovery:
+		if pointers != 1 || command.RecoveryFinal == nil || hasReplicas || hasExpectation {
+			return errors.New("raftstore: malformed data recovery finalization command")
 		}
 	default:
 		return fmt.Errorf("raftstore: unknown data command %q", command.Type)

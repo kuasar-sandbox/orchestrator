@@ -149,7 +149,7 @@ func TestJoiningReplicaReplaysBootstrapDeterministically(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(initialResult.Data, joiningResult.Data) || initialSystem.state != joiningSystem.state {
+	if !bytes.Equal(initialResult.Data, joiningResult.Data) || !reflect.DeepEqual(initialSystem.state, joiningSystem.state) {
 		t.Fatal("System replicas applied the same committed history differently")
 	}
 

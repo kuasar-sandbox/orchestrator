@@ -16,7 +16,7 @@ import (
 )
 
 var stateSnapshotMagic = [...]byte{
-	'K', 'U', 'A', 'S', 'A', 'R', '-', 'P', 'E', 'B', 'B', 'L', 'E', '-', 'S', 'N', 'A', 'P', 2,
+	'K', 'U', 'A', 'S', 'A', 'R', '-', 'P', 'E', 'B', 'B', 'L', 'E', '-', 'S', 'N', 'A', 'P', 3,
 }
 
 type diskStateMachine struct {
@@ -149,9 +149,11 @@ func (m *diskStateMachine) updateData(entries []sm.Entry) ([]sm.Entry, error) {
 	batch := m.engine.db.NewIndexedBatch()
 	defer batch.Close()
 	state := DataState{
-		Routes: make(map[string]clusterstate.RouteWorkflowRecord),
-		Builds: make(map[string]clusterstate.BuildRecord),
-		Fences: make(map[string]clusterstate.ExecutionFence),
+		Routes:          make(map[string]clusterstate.RouteWorkflowRecord),
+		Builds:          make(map[string]clusterstate.BuildRecord),
+		Fences:          make(map[string]clusterstate.ExecutionFence),
+		RecoveryRecords: make(map[string]RecoveryObjectRecord),
+		RecoveryClaims:  make(map[string]string),
 	}
 	if active == 0 {
 		if err := batch.DeleteRange(prefix, prefixUpperBound(prefix), nil); err != nil {
@@ -190,7 +192,7 @@ func (m *diskStateMachine) updateData(entries []sm.Entry) ([]sm.Entry, error) {
 			if err := persistDataCommandRow(batch, prefix, state, command); err != nil {
 				return nil, err
 			}
-			if command.Type == DataPutRoute {
+			if command.Type == DataPutRoute || command.Type == DataActivateRecovery && len(state.RouteChanges) != 0 {
 				change := state.RouteChanges[len(state.RouteChanges)-1]
 				if err := setStateJSON(batch, routeChangeRowKey(prefix, change.Revision), change); err != nil {
 					return nil, err
@@ -297,6 +299,176 @@ func loadDataCommandRows(reader pebble.Reader, prefix []byte, state *DataState, 
 		if found {
 			state.Fences[key] = fence
 		}
+	case DataBeginRecovery, DataFinalizeRecovery:
+		return loadAllRecoveryRows(reader, prefix, state)
+	case DataStageRecovery:
+		if command.RecoveryRecord == nil {
+			return nil
+		}
+		key := recoveryRecordKey(*command.RecoveryRecord)
+		if err := loadRecoveryRecord(reader, prefix, state, key); err != nil {
+			return err
+		}
+		claim := recoveryClaimKey(*command.RecoveryRecord)
+		ownerKey, found, err := loadRecoveryClaim(reader, prefix, state, claim)
+		if err != nil {
+			return err
+		}
+		if found && ownerKey != key {
+			if err := loadRecoveryRecord(reader, prefix, state, ownerKey); err != nil {
+				return err
+			}
+			if _, ownerFound := state.RecoveryRecords[ownerKey]; !ownerFound {
+				return errors.New("raftstore: recovery claim owner is missing")
+			}
+		}
+	case DataAckRecovery, DataQuarantineRecovery, DataActivateRecovery:
+		if command.RecoveryUpdate == nil {
+			return nil
+		}
+		key := recoveryUpdateKey(*command.RecoveryUpdate)
+		if err := loadRecoveryRecord(reader, prefix, state, key); err != nil {
+			return err
+		}
+		if command.Type == DataActivateRecovery {
+			return loadRecoveryProjectionConflict(reader, prefix, state, *command.RecoveryUpdate)
+		}
+	}
+	return nil
+}
+
+func loadRecoveryRecord(
+	reader pebble.Reader,
+	prefix []byte,
+	state *DataState,
+	key string,
+) error {
+	var record RecoveryObjectRecord
+	found, err := getStateJSON(reader, stateRowKey(prefix, stateRecoveryTable, key), &record)
+	if err != nil {
+		return err
+	}
+	if found {
+		state.RecoveryRecords[key] = record
+	}
+	return nil
+}
+
+func loadRecoveryClaim(
+	reader pebble.Reader,
+	prefix []byte,
+	state *DataState,
+	claim string,
+) (string, bool, error) {
+	var ownerKey string
+	found, err := getStateJSON(reader, stateRowKey(prefix, stateRecoveryClaimTable, claim), &ownerKey)
+	if err != nil || !found {
+		return "", found, err
+	}
+	if ownerKey == "" {
+		return "", false, errors.New("raftstore: empty recovery claim owner")
+	}
+	state.RecoveryClaims[claim] = ownerKey
+	return ownerKey, true, nil
+}
+
+func loadAllRecoveryRows(reader pebble.Reader, prefix []byte, state *DataState) error {
+	recordPrefix := stateTablePrefix(prefix, stateRecoveryTable)
+	records := reader.NewIter(&pebble.IterOptions{
+		LowerBound: recordPrefix,
+		UpperBound: prefixUpperBound(recordPrefix),
+	})
+	for valid := records.First(); valid; valid = records.Next() {
+		key := string(records.Key()[len(recordPrefix):])
+		var record RecoveryObjectRecord
+		if key == "" {
+			records.Close()
+			return errors.New("raftstore: empty recovery record key")
+		}
+		if err := decodeJSONValue(records.Value(), &record); err != nil {
+			records.Close()
+			return err
+		}
+		state.RecoveryRecords[key] = record
+	}
+	if err := records.Error(); err != nil {
+		records.Close()
+		return err
+	}
+	if err := records.Close(); err != nil {
+		return err
+	}
+
+	claimPrefix := stateTablePrefix(prefix, stateRecoveryClaimTable)
+	claims := reader.NewIter(&pebble.IterOptions{
+		LowerBound: claimPrefix,
+		UpperBound: prefixUpperBound(claimPrefix),
+	})
+	for valid := claims.First(); valid; valid = claims.Next() {
+		claim := string(claims.Key()[len(claimPrefix):])
+		var ownerKey string
+		if claim == "" {
+			claims.Close()
+			return errors.New("raftstore: empty recovery claim key")
+		}
+		if err := decodeJSONValue(claims.Value(), &ownerKey); err != nil {
+			claims.Close()
+			return err
+		}
+		if ownerKey == "" {
+			claims.Close()
+			return errors.New("raftstore: empty recovery claim owner")
+		}
+		state.RecoveryClaims[claim] = ownerKey
+	}
+	if err := claims.Error(); err != nil {
+		claims.Close()
+		return err
+	}
+	return claims.Close()
+}
+
+func loadRecoveryProjectionConflict(
+	reader pebble.Reader,
+	prefix []byte,
+	state *DataState,
+	update RecoveryObjectUpdate,
+) error {
+	switch update.Kind {
+	case clusterstate.ExecutionKindSandbox:
+		key := routeMapKey(update.Group, update.RouteKey)
+		var record clusterstate.RouteWorkflowRecord
+		found, err := getStateJSON(reader, stateRowKey(prefix, stateRouteTable, key), &record)
+		if err != nil {
+			return err
+		}
+		if found {
+			state.Routes[key] = record
+		}
+	case clusterstate.ExecutionKindBuild:
+		key := buildMapKey(update.Group, update.ObjectID)
+		var record clusterstate.BuildRecord
+		found, err := getStateJSON(reader, stateRowKey(prefix, stateBuildTable, key), &record)
+		if err != nil {
+			return err
+		}
+		if found {
+			state.Builds[key] = record
+		}
+	}
+	return nil
+}
+
+func persistRecoveryRows(batch *pebble.Batch, prefix []byte, state DataState) error {
+	for key, record := range state.RecoveryRecords {
+		if err := setStateJSON(batch, stateRowKey(prefix, stateRecoveryTable, key), record); err != nil {
+			return err
+		}
+	}
+	for claim, ownerKey := range state.RecoveryClaims {
+		if err := setStateJSON(batch, stateRowKey(prefix, stateRecoveryClaimTable, claim), ownerKey); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -315,6 +487,29 @@ func persistDataCommandRow(batch *pebble.Batch, prefix []byte, state DataState, 
 	case DataCompactFence:
 		key := fenceMapKey(command.Compaction.Group, command.Compaction.RouteKey, command.Compaction.SandboxID)
 		return batch.Delete(stateRowKey(prefix, stateFenceTable, key), nil)
+	case DataStageRecovery, DataAckRecovery, DataQuarantineRecovery:
+		return persistRecoveryRows(batch, prefix, state)
+	case DataActivateRecovery:
+		if err := persistRecoveryRows(batch, prefix, state); err != nil {
+			return err
+		}
+		if command.RecoveryUpdate.Kind == clusterstate.ExecutionKindSandbox {
+			key := routeMapKey(command.RecoveryUpdate.Group, command.RecoveryUpdate.RouteKey)
+			return setStateJSON(batch, stateRowKey(prefix, stateRouteTable, key), state.Routes[key])
+		}
+		key := buildMapKey(command.RecoveryUpdate.Group, command.RecoveryUpdate.ObjectID)
+		return setStateJSON(batch, stateRowKey(prefix, stateBuildTable, key), state.Builds[key])
+	case DataFinalizeRecovery:
+		if err := batch.DeleteRange(
+			stateTablePrefix(prefix, stateRecoveryTable),
+			prefixUpperBound(stateTablePrefix(prefix, stateRecoveryTable)), nil,
+		); err != nil {
+			return err
+		}
+		return batch.DeleteRange(
+			stateTablePrefix(prefix, stateRecoveryClaimTable),
+			prefixUpperBound(stateTablePrefix(prefix, stateRecoveryClaimTable)), nil,
+		)
 	default:
 		return nil
 	}
@@ -324,6 +519,8 @@ func clearDataRows(state *DataState) {
 	clear(state.Routes)
 	clear(state.Builds)
 	clear(state.Fences)
+	clear(state.RecoveryRecords)
+	clear(state.RecoveryClaims)
 	state.RouteChanges = nil
 }
 
@@ -856,6 +1053,11 @@ func (m *diskStateMachine) RecoverFromSnapshot(reader io.Reader, done <-chan str
 	if !metadataSeen {
 		return errors.New("raftstore: state snapshot has no metadata record")
 	}
+	if m.shardID != SystemRaftShardID {
+		if err := dataState.Validate(); err != nil {
+			return fmt.Errorf("raftstore: invalid recovered data snapshot: %w", err)
+		}
+	}
 	trailing, err := io.ReadAll(io.LimitReader(reader, 1))
 	if err != nil {
 		return err
@@ -962,6 +1164,38 @@ func (m *diskStateMachine) validateSnapshotRecord(
 			return errors.New("raftstore: Route change snapshot key differs from its revision")
 		}
 		return validateRouteChange(*dataState, change)
+	case stateRecoveryTable:
+		if mapKey == "" {
+			return errors.New("raftstore: empty recovery object snapshot key")
+		}
+		var record RecoveryObjectRecord
+		if err := decodeJSONValue(value, &record); err != nil {
+			return err
+		}
+		if _, duplicate := dataState.RecoveryRecords[mapKey]; duplicate {
+			return errors.New("raftstore: duplicate recovery object snapshot key")
+		}
+		if err := validateStoredRecoveryRecord(*dataState, mapKey, record); err != nil {
+			return err
+		}
+		dataState.RecoveryRecords[mapKey] = record
+		return nil
+	case stateRecoveryClaimTable:
+		if mapKey == "" {
+			return errors.New("raftstore: empty recovery claim snapshot key")
+		}
+		var ownerKey string
+		if err := decodeJSONValue(value, &ownerKey); err != nil {
+			return err
+		}
+		if ownerKey == "" {
+			return errors.New("raftstore: empty recovery claim snapshot owner")
+		}
+		if _, duplicate := dataState.RecoveryClaims[mapKey]; duplicate {
+			return errors.New("raftstore: duplicate recovery claim snapshot key")
+		}
+		dataState.RecoveryClaims[mapKey] = ownerKey
+		return nil
 	default:
 		return errors.New("raftstore: data snapshot contains an unknown table")
 	}

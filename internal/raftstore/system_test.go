@@ -195,6 +195,156 @@ func TestRecoveryEpochMustNameTheCommittedPredecessor(t *testing.T) {
 	}
 }
 
+func TestNodeRegistrationRequiresExplicitEnrollmentAndFencesEpochRollback(t *testing.T) {
+	manifest := testManifest(2, "generation-1")
+	digest, _ := manifest.Digest()
+	state, _ := applySystem(t, SystemState{}, 1, SystemCommand{
+		Type: SystemBootstrap, Manifest: &manifest, Digest: digest,
+	})
+	registration := &NodeRegistrationCommand{
+		NodeID: "node-1", EnrollmentID: "enrollment-1", NodeEpoch: 1,
+		DataEndpoint: "10.0.0.1:8443", RuntimeDigest: "runtime-v1",
+		Labels: map[string]string{"pool": "default"}, FailureDomain: "zone-a",
+		LoadModelVersion: 1, SandboxSlots: 64, BuildSlots: 2,
+		BuildCPU: 4000, BuildMemory: 8 << 30, BuildStorage: 100 << 30,
+	}
+	if _, result := ApplySystemCommand(state, 2, SystemCommand{
+		Type: SystemAcceptNodeRegistration, Registration: registration,
+	}); !result.Conflict {
+		t.Fatal("ordinary registration created an unknown enrollment")
+	}
+	state, _ = applySystem(t, state, 3, SystemCommand{Type: SystemEnrollNode, Enrollment: &NodeEnrollmentCommand{
+		NodeID: registration.NodeID, EnrollmentID: registration.EnrollmentID,
+		NodeEpoch: registration.NodeEpoch, DataEndpoint: registration.DataEndpoint,
+	}})
+	state, _ = applySystem(t, state, 4, SystemCommand{
+		Type: SystemAcceptNodeRegistration, Registration: registration,
+	})
+	record := state.NodeEnrollments[registration.NodeID]
+	if record.Catalog == nil || record.Catalog.SandboxSlots != 64 || record.MaxNodeEpoch != 1 {
+		t.Fatalf("accepted enrollment = %+v", record)
+	}
+
+	wrongEndpoint := *registration
+	wrongEndpoint.DataEndpoint = "10.0.0.2:8443"
+	if _, result := ApplySystemCommand(state, 5, SystemCommand{
+		Type: SystemAcceptNodeRegistration, Registration: &wrongEndpoint,
+	}); !result.Conflict {
+		t.Fatal("same NodeEpoch changed data endpoint")
+	}
+	newEpoch := wrongEndpoint
+	newEpoch.NodeEpoch = 2
+	state, _ = applySystem(t, state, 6, SystemCommand{
+		Type: SystemAcceptNodeRegistration, Registration: &newEpoch,
+	})
+	if state.NodeEnrollments[registration.NodeID].MaxNodeEpoch != 2 ||
+		state.NodeEnrollments[registration.NodeID].DataEndpoint != newEpoch.DataEndpoint {
+		t.Fatalf("new NodeEpoch was not committed: %+v", state.NodeEnrollments[registration.NodeID])
+	}
+	if _, result := ApplySystemCommand(state, 7, SystemCommand{
+		Type: SystemAcceptNodeRegistration, Registration: registration,
+	}); !result.Conflict {
+		t.Fatal("older NodeEpoch registered after a newer epoch")
+	}
+	state, _ = applySystem(t, state, 8, SystemCommand{Type: SystemRetireNode, Retirement: &NodeRetirementCommand{
+		NodeID: registration.NodeID, EnrollmentID: registration.EnrollmentID, LastNodeEpoch: 2,
+	}})
+	if !state.NodeEnrollments[registration.NodeID].Retired {
+		t.Fatal("node enrollment retirement was not permanent")
+	}
+	if _, result := ApplySystemCommand(state, 9, SystemCommand{Type: SystemEnrollNode, Enrollment: &NodeEnrollmentCommand{
+		NodeID: registration.NodeID, EnrollmentID: "replacement", NodeEpoch: 1, DataEndpoint: "10.0.0.3:8443",
+	}}); !result.Conflict {
+		t.Fatal("retired node ID was re-enrolled")
+	}
+}
+
+func TestRecoveryNodeProgressIsDurableAndPhaseBound(t *testing.T) {
+	manifest := testManifest(2, "generation-2")
+	manifest.Predecessor = &PredecessorProof{
+		StorageGeneration: "generation-1", ManifestDigest: digestFor("source-manifest"),
+		ServePermitMaxMillis: 5000, Kind: RolloverExternalFence, ProofDigest: digestFor("hard-fence"),
+	}
+	digest, _ := manifest.Digest()
+	state, _ := applySystem(t, SystemState{}, 1, SystemCommand{
+		Type: SystemBootstrap, Manifest: &manifest, Digest: digest,
+	})
+	state, _ = applySystem(t, state, 2, SystemCommand{Type: SystemEnrollNode, Enrollment: &NodeEnrollmentCommand{
+		NodeID: "node-1", EnrollmentID: "enrollment-1", NodeEpoch: 7, DataEndpoint: "10.0.0.1:8443",
+	}})
+	state, _ = applySystem(t, state, 3, SystemCommand{Type: SystemAcceptNodeRegistration, Registration: &NodeRegistrationCommand{
+		NodeID: "node-1", EnrollmentID: "enrollment-1", NodeEpoch: 7, DataEndpoint: "10.0.0.1:8443",
+		LoadModelVersion: 1, SandboxSlots: 64,
+	}})
+	recovery := &RecoveryEpoch{
+		Epoch: 2, SourceClusterID: "cluster-1", SourceStorageGeneration: "generation-1",
+		SourceManifestDigest: digestFor("source-manifest"), TargetStorageGeneration: "generation-2",
+		TargetManifestDigest: digest, Phase: RecoveryPreparing,
+		Nodes: map[string]RecoveryNodeProgress{"node-1": {
+			NodeID: "node-1", EnrollmentID: "enrollment-1", NodeEpoch: 7, State: RecoveryNodeExpected,
+		}},
+	}
+	state, _ = applySystem(t, state, 4, SystemCommand{Type: SystemBeginRecovery, Recovery: recovery})
+	state, _ = applySystem(t, state, 5, SystemCommand{Type: SystemAdvanceRecovery, RecoveryAdvance: &RecoveryAdvance{
+		From: RecoveryPreparing, To: RecoveryCollecting,
+	}})
+	if _, result := ApplySystemCommand(state, 6, SystemCommand{Type: SystemAdvanceRecovery, RecoveryAdvance: &RecoveryAdvance{
+		From: RecoveryCollecting, To: RecoveryReconciling,
+	}}); !result.Conflict {
+		t.Fatal("recovery advanced before the expected node reported")
+	}
+	state, _ = applySystem(t, state, 7, SystemCommand{Type: SystemUpdateRecoveryNode, RecoveryNode: &RecoveryNodeUpdate{
+		NodeID: "node-1", EnrollmentID: "enrollment-1", NodeEpoch: 7, SessionSeq: 11,
+		From: RecoveryNodeExpected, To: RecoveryNodeCollecting,
+	}})
+	state, _ = applySystem(t, state, 8, SystemCommand{Type: SystemUpdateRecoveryNode, RecoveryNode: &RecoveryNodeUpdate{
+		NodeID: "node-1", EnrollmentID: "enrollment-1", NodeEpoch: 7, SessionSeq: 11,
+		From: RecoveryNodeCollecting, To: RecoveryNodeReported,
+		ReportDigest: digestFor("report"), ReportedObjects: 3,
+	}})
+	state, _ = applySystem(t, state, 9, SystemCommand{Type: SystemAdvanceRecovery, RecoveryAdvance: &RecoveryAdvance{
+		From: RecoveryCollecting, To: RecoveryReconciling,
+	}})
+	state, _ = applySystem(t, state, 10, SystemCommand{Type: SystemUpdateRecoveryNode, RecoveryNode: &RecoveryNodeUpdate{
+		NodeID: "node-1", EnrollmentID: "enrollment-1", NodeEpoch: 7, SessionSeq: 11,
+		From: RecoveryNodeReported, To: RecoveryNodeReconciled,
+		ReportDigest: digestFor("report"), ReportedObjects: 3, ResolvedObjects: 2, ConflictObjects: 1,
+	}})
+	state, _ = applySystem(t, state, 11, SystemCommand{Type: SystemAdvanceRecovery, RecoveryAdvance: &RecoveryAdvance{
+		From: RecoveryReconciling, To: RecoveryFinalizing,
+	}})
+	state, _ = applySystem(t, state, 12, SystemCommand{Type: SystemAdvanceRecovery, RecoveryAdvance: &RecoveryAdvance{
+		From: RecoveryFinalizing, To: RecoveryClosed,
+	}})
+	if state.Recovery != nil || state.SystemEpoch != 3 {
+		t.Fatalf("recovery did not close after durable reconciliation: %+v", state)
+	}
+}
+
+func TestRecoveryNodeReportIdentityIsImmutable(t *testing.T) {
+	current := RecoveryNodeProgress{
+		NodeID: "node-1", EnrollmentID: "enrollment-1", NodeEpoch: 7, SessionSeq: 11,
+		State: RecoveryNodeReported, ReportDigest: digestFor("report-1"), ReportedObjects: 3,
+		LastAppliedIndex: 1,
+	}
+	changedReport := RecoveryNodeUpdate{
+		NodeID: current.NodeID, EnrollmentID: current.EnrollmentID, NodeEpoch: current.NodeEpoch,
+		SessionSeq: current.SessionSeq, To: RecoveryNodeReported,
+		ReportDigest: digestFor("report-2"), ReportedObjects: current.ReportedObjects,
+	}
+	if validRecoveryNodeAdvance(current, changedReport) {
+		t.Fatal("an accepted recovery report changed identity in place")
+	}
+	incompleteQuarantine := RecoveryNodeUpdate{
+		NodeID: current.NodeID, EnrollmentID: current.EnrollmentID, NodeEpoch: current.NodeEpoch,
+		SessionSeq: current.SessionSeq, To: RecoveryNodeQuarantined,
+		ReportDigest: current.ReportDigest, ReportedObjects: current.ReportedObjects, ConflictObjects: 1,
+	}
+	if validRecoveryNodeAdvance(current, incompleteQuarantine) {
+		t.Fatal("an unresolved report was treated as fully quarantined")
+	}
+}
+
 func TestManifestTransitionActivatesOnlyAfterEveryShardCompletes(t *testing.T) {
 	manifest := testManifest(2, "generation-1")
 	digest, _ := manifest.Digest()

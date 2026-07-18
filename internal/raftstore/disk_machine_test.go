@@ -138,6 +138,49 @@ func TestPebbleSystemStateMachinePersistsPermitState(t *testing.T) {
 	}
 }
 
+func TestPebbleSystemStateMachinePersistsExplicitNodeEnrollment(t *testing.T) {
+	engine, err := OpenPebbleStateEngine(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close()
+	machine := engine.NewStateMachine(SystemRaftShardID, 1)
+	if _, err := machine.Open(make(chan struct{})); err != nil {
+		t.Fatal(err)
+	}
+	manifest := testManifest(4, "generation-enrollment-disk")
+	digest, err := manifest.Digest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyDiskSystem(t, machine, 1, SystemCommand{Type: SystemBootstrap, Manifest: &manifest, Digest: digest})
+	applyDiskSystem(t, machine, 2, SystemCommand{Type: SystemEnrollNode, Enrollment: &NodeEnrollmentCommand{
+		NodeID: "node-1", EnrollmentID: "enrollment-1", NodeEpoch: 7, DataEndpoint: "10.0.0.1:8443",
+	}})
+	applyDiskSystem(t, machine, 3, SystemCommand{Type: SystemAcceptNodeRegistration, Registration: &NodeRegistrationCommand{
+		NodeID: "node-1", EnrollmentID: "enrollment-1", NodeEpoch: 7, DataEndpoint: "10.0.0.1:8443",
+		LoadModelVersion: 1, SandboxSlots: 64,
+	}})
+	if err := machine.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if err := machine.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened := engine.NewStateMachine(SystemRaftShardID, 1)
+	if index, err := reopened.Open(make(chan struct{})); err != nil || index != 3 {
+		t.Fatalf("reopen enrollment state = %d, %v", index, err)
+	}
+	value, err := reopened.Lookup(SystemStateLookup{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	enrollment := value.(SystemState).NodeEnrollments["node-1"]
+	if enrollment.Catalog == nil || enrollment.Catalog.SandboxSlots != 64 || enrollment.MaxNodeEpoch != 7 {
+		t.Fatalf("persisted node enrollment = %+v", enrollment)
+	}
+}
+
 func TestPebbleInitialBootstrapClearsUncommittedSnapshotSlot(t *testing.T) {
 	engine, err := OpenPebbleStateEngine(t.TempDir())
 	if err != nil {
