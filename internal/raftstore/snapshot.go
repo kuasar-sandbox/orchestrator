@@ -48,6 +48,9 @@ type dataSnapshot struct {
 	ClusterID          string             `json:"cluster_id"`
 	StorageGeneration  string             `json:"storage_generation"`
 	ShardID            uint32             `json:"shard_id"`
+	SchemaVersion      uint32             `json:"schema_version"`
+	ProtocolVersion    uint32             `json:"protocol_version"`
+	HashVersion        string             `json:"hash_version"`
 	RouteBucketCount   uint32             `json:"route_bucket_count"`
 	BuildBucketCount   uint32             `json:"build_bucket_count"`
 	VirtualShardCount  uint32             `json:"virtual_shard_count"`
@@ -96,6 +99,7 @@ func encodeDataSnapshot(state DataState) ([]byte, error) {
 	snapshot := dataSnapshot{
 		FormatVersion: snapshotFormatVersion, Initialized: state.Initialized, ClusterID: state.ClusterID,
 		StorageGeneration: state.StorageGeneration, ShardID: state.ShardID,
+		SchemaVersion: state.SchemaVersion, ProtocolVersion: state.ProtocolVersion, HashVersion: state.HashVersion,
 		RouteBucketCount: state.RouteBucketCount, BuildBucketCount: state.BuildBucketCount,
 		VirtualShardCount: state.VirtualShardCount, ReplicaIDs: append([]uint64(nil), state.ReplicaIDs...),
 		PreparedReplicaIDs: append([]uint64(nil), state.PreparedReplicaIDs...),
@@ -135,6 +139,7 @@ func decodeDataSnapshot(raw []byte) (DataState, error) {
 	state := DataState{
 		Initialized: snapshot.Initialized, ClusterID: snapshot.ClusterID,
 		StorageGeneration: snapshot.StorageGeneration, ShardID: snapshot.ShardID,
+		SchemaVersion: snapshot.SchemaVersion, ProtocolVersion: snapshot.ProtocolVersion, HashVersion: snapshot.HashVersion,
 		RouteBucketCount: snapshot.RouteBucketCount, BuildBucketCount: snapshot.BuildBucketCount,
 		VirtualShardCount: snapshot.VirtualShardCount, ReplicaIDs: append([]uint64(nil), snapshot.ReplicaIDs...),
 		PreparedReplicaIDs: append([]uint64(nil), snapshot.PreparedReplicaIDs...),

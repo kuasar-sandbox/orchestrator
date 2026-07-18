@@ -99,7 +99,7 @@ func validateDataCommandEnvelope(command DataCommand) error {
 		return err
 	}
 	pointers := countPresent(
-		command.Manifest != nil, command.Epoch != nil, command.Route != nil, command.Build != nil,
+		command.Bootstrap != nil, command.Epoch != nil, command.Route != nil, command.Build != nil,
 		command.Fence != nil, command.Compaction != nil,
 	)
 	hasReplicas := len(command.ReplicaIDs) != 0
@@ -107,7 +107,7 @@ func validateDataCommandEnvelope(command DataCommand) error {
 	validExpectation := command.Expect.Absent != (command.Expect.LogIndex != 0)
 	switch command.Type {
 	case DataInitializeShard:
-		if pointers != 1 || command.Manifest == nil || !hasReplicas || hasExpectation {
+		if pointers != 1 || command.Bootstrap == nil || !hasReplicas || hasExpectation {
 			return errors.New("raftstore: malformed data-shard bootstrap command")
 		}
 	case DataPrepareEpoch:

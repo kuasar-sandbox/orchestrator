@@ -17,9 +17,9 @@ func digestFor(value string) string {
 
 func testManifest(shards uint32, generation string) Manifest {
 	members := []RegistryMember{
-		{MemberID: "registry-a", ReplicaID: 1, InternalEndpoint: "https://registry-a:9443", RaftEndpoint: "registry-a:63001"},
-		{MemberID: "registry-b", ReplicaID: 2, InternalEndpoint: "https://registry-b:9443", RaftEndpoint: "registry-b:63001"},
-		{MemberID: "registry-c", ReplicaID: 3, InternalEndpoint: "https://registry-c:9443", RaftEndpoint: "registry-c:63001"},
+		{MemberID: "registry-a", InternalEndpoint: "https://registry-a:9443", RaftEndpoint: "registry-a:63001"},
+		{MemberID: "registry-b", InternalEndpoint: "https://registry-b:9443", RaftEndpoint: "registry-b:63001"},
+		{MemberID: "registry-c", InternalEndpoint: "https://registry-c:9443", RaftEndpoint: "registry-c:63001"},
 	}
 	replicas := []ReplicaPlacement{
 		{MemberID: "registry-a", ReplicaID: 1},
@@ -36,6 +36,19 @@ func testManifest(shards uint32, generation string) Manifest {
 		VirtualShardCount: shards, RouteBucketCount: 16, BuildBucketCount: 16,
 		ReplicationFactor: 3, ServePermitMaxMillis: 5000, BootstrapTokenDigest: digestFor("bootstrap-" + generation),
 		Members: members, SystemReplicas: replicas, DataShards: placements,
+	}
+}
+
+func TestManifestReplicaIdentityIsScopedToEachShard(t *testing.T) {
+	manifest := testManifest(2, "generation-1")
+	manifest.DataShards[0].Replicas[0].ReplicaID = 101
+	manifest.DataShards[1].Replicas[0].ReplicaID = 201
+	if err := manifest.Validate(); err != nil {
+		t.Fatalf("per-shard replica IDs rejected: %v", err)
+	}
+	manifest.DataShards[0].Replicas[1].ReplicaID = 101
+	if err := manifest.Validate(); err == nil {
+		t.Fatal("duplicate replica ID within one shard accepted")
 	}
 }
 

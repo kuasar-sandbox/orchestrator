@@ -11,19 +11,20 @@ func TestDataShardBootstrapRequiresExactManifestIdentity(t *testing.T) {
 	manifest := testManifest(4, "generation-1")
 	identity := routeShardIdentity(t, manifest, "/g", "rk")
 	replicas := replicaIDsForPlacement(manifest.DataShards[identity.ShardID])
+	bootstrap, _ := NewDataShardBootstrap(manifest, identity.ShardID)
 	state := DataState{}
 
 	wrong := identity
 	wrong.ManifestDigest = digestFor("another-manifest")
 	result := ApplyDataCommand(&state, 1, DataCommand{
-		Type: DataInitializeShard, Identity: wrong, Manifest: &manifest, ReplicaIDs: replicas,
+		Type: DataInitializeShard, Identity: wrong, Bootstrap: &bootstrap, ReplicaIDs: replicas,
 	})
 	if !result.Conflict || state.Initialized || state.LastApplied != 0 {
 		t.Fatalf("wrong manifest bootstrap = %+v, state=%+v", result, state)
 	}
 
 	result = ApplyDataCommand(&state, 2, DataCommand{
-		Type: DataInitializeShard, Identity: identity, Manifest: &manifest, ReplicaIDs: replicas,
+		Type: DataInitializeShard, Identity: identity, Bootstrap: &bootstrap, ReplicaIDs: replicas,
 	})
 	if !result.Applied || state.LastApplied != 2 || !state.Accepts(identity) {
 		t.Fatalf("exact bootstrap = %+v, state=%+v", result, state)
@@ -264,8 +265,12 @@ func manifestShardIdentity(t *testing.T, manifest Manifest, shardID uint32) Shar
 func initializeDataShard(t *testing.T, manifest Manifest, identity ShardRequestIdentity) DataState {
 	t.Helper()
 	state := DataState{}
+	bootstrap, err := NewDataShardBootstrap(manifest, identity.ShardID)
+	if err != nil {
+		t.Fatal(err)
+	}
 	applyDataOK(t, &state, 1, DataCommand{
-		Type: DataInitializeShard, Identity: identity, Manifest: &manifest,
+		Type: DataInitializeShard, Identity: identity, Bootstrap: &bootstrap,
 		ReplicaIDs: replicaIDsForPlacement(manifest.DataShards[identity.ShardID]),
 	})
 	return state

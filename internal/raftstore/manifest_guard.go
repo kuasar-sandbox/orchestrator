@@ -138,6 +138,42 @@ func (g ManifestGuard) AcceptSigned(
 	return next, nil
 }
 
+func (g ManifestGuard) AcceptSignedChain(
+	chain []SignedManifest,
+	keyring map[string]ed25519.PublicKey,
+) (AcceptedManifest, error) {
+	if len(chain) == 0 || len(chain) > 1024 {
+		return AcceptedManifest{}, errors.New("raftstore: manifest chain must be non-empty and bounded")
+	}
+	current, err := g.Load()
+	if err != nil {
+		return AcceptedManifest{}, err
+	}
+	for _, signed := range chain {
+		digest, verifyErr := signed.Verify(keyring)
+		if verifyErr != nil {
+			return AcceptedManifest{}, verifyErr
+		}
+		if current == nil {
+			accepted, acceptErr := FirstAcceptedManifest(signed.Manifest, digest)
+			if acceptErr != nil {
+				return AcceptedManifest{}, acceptErr
+			}
+			current = &accepted
+			continue
+		}
+		accepted, acceptErr := current.Accept(signed.Manifest, digest)
+		if acceptErr != nil {
+			return AcceptedManifest{}, acceptErr
+		}
+		current = &accepted
+	}
+	if err := g.store(*current); err != nil {
+		return AcceptedManifest{}, err
+	}
+	return *current, nil
+}
+
 func (g ManifestGuard) Load() (*AcceptedManifest, error) {
 	raw, err := os.ReadFile(g.Path)
 	if errors.Is(err, os.ErrNotExist) {

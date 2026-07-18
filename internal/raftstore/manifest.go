@@ -54,13 +54,12 @@ func (p PredecessorProof) Validate() error {
 
 type RegistryMember struct {
 	MemberID         string `json:"member_id"`
-	ReplicaID        uint64 `json:"replica_id"`
 	InternalEndpoint string `json:"internal_endpoint"`
 	RaftEndpoint     string `json:"raft_endpoint"`
 }
 
 func (m RegistryMember) Validate() error {
-	if m.MemberID == "" || m.ReplicaID == 0 {
+	if m.MemberID == "" {
 		return errors.New("raftstore: member identity is required")
 	}
 	u, err := url.Parse(m.InternalEndpoint)
@@ -137,7 +136,8 @@ func (m Manifest) Validate() error {
 		return errors.New("raftstore: members must be unique and sorted")
 	}
 	members := make(map[string]RegistryMember, len(m.Members))
-	replicaIDs := make(map[uint64]struct{}, len(m.Members))
+	internalEndpoints := make(map[string]struct{}, len(m.Members))
+	raftEndpoints := make(map[string]struct{}, len(m.Members))
 	for _, member := range m.Members {
 		if err := member.Validate(); err != nil {
 			return err
@@ -145,11 +145,15 @@ func (m Manifest) Validate() error {
 		if _, found := members[member.MemberID]; found {
 			return errors.New("raftstore: duplicate member ID")
 		}
-		if _, found := replicaIDs[member.ReplicaID]; found {
-			return errors.New("raftstore: duplicate member replica ID")
+		if _, found := internalEndpoints[member.InternalEndpoint]; found {
+			return errors.New("raftstore: duplicate member internal endpoint")
+		}
+		if _, found := raftEndpoints[member.RaftEndpoint]; found {
+			return errors.New("raftstore: duplicate member Raft endpoint")
 		}
 		members[member.MemberID] = member
-		replicaIDs[member.ReplicaID] = struct{}{}
+		internalEndpoints[member.InternalEndpoint] = struct{}{}
+		raftEndpoints[member.RaftEndpoint] = struct{}{}
 	}
 	if err := validateReplicaSet(m.SystemReplicas, members, m.ReplicationFactor); err != nil {
 		return fmt.Errorf("raftstore: System Group: %w", err)
@@ -236,15 +240,19 @@ func validateReplicaSet(set []ReplicaPlacement, members map[string]RegistryMembe
 		return errors.New("replica set must have exactly three sorted members")
 	}
 	seen := make(map[string]struct{}, len(set))
+	seenReplicaIDs := make(map[uint64]struct{}, len(set))
 	for _, replica := range set {
-		member, found := members[replica.MemberID]
-		if !found || member.ReplicaID != replica.ReplicaID {
+		if _, found := members[replica.MemberID]; !found || replica.ReplicaID == 0 {
 			return errors.New("replica does not match a manifest member")
 		}
 		if _, duplicate := seen[replica.MemberID]; duplicate {
 			return errors.New("duplicate replica member")
 		}
 		seen[replica.MemberID] = struct{}{}
+		if _, duplicate := seenReplicaIDs[replica.ReplicaID]; duplicate {
+			return errors.New("duplicate replica ID within a shard")
+		}
+		seenReplicaIDs[replica.ReplicaID] = struct{}{}
 	}
 	return nil
 }

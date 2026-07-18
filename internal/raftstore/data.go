@@ -3,7 +3,7 @@ package raftstore
 import (
 	"errors"
 	"fmt"
-	"reflect"
+	"slices"
 	"sort"
 
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
@@ -26,6 +26,9 @@ type DataState struct {
 	ClusterID          string                                      `json:"cluster_id"`
 	StorageGeneration  string                                      `json:"storage_generation"`
 	ShardID            uint32                                      `json:"shard_id"`
+	SchemaVersion      uint32                                      `json:"schema_version"`
+	ProtocolVersion    uint32                                      `json:"protocol_version"`
+	HashVersion        string                                      `json:"hash_version"`
 	RouteBucketCount   uint32                                      `json:"route_bucket_count"`
 	BuildBucketCount   uint32                                      `json:"build_bucket_count"`
 	VirtualShardCount  uint32                                      `json:"virtual_shard_count"`
@@ -40,7 +43,8 @@ type DataState struct {
 
 func (s DataState) Validate() error {
 	if !s.Initialized {
-		if s.ClusterID != "" || s.StorageGeneration != "" || s.ShardID != 0 || s.RouteBucketCount != 0 ||
+		if s.ClusterID != "" || s.StorageGeneration != "" || s.ShardID != 0 || s.SchemaVersion != 0 ||
+			s.ProtocolVersion != 0 || s.HashVersion != "" || s.RouteBucketCount != 0 ||
 			s.BuildBucketCount != 0 || s.VirtualShardCount != 0 || len(s.ReplicaIDs) != 0 ||
 			len(s.PreparedReplicaIDs) != 0 ||
 			s.LastApplied != 0 || len(s.Routes) != 0 || len(s.Builds) != 0 || len(s.Fences) != 0 ||
@@ -71,7 +75,8 @@ func (s DataState) Validate() error {
 }
 
 func validateDataStateIdentity(s DataState) error {
-	if s.ClusterID == "" || s.StorageGeneration == "" || s.RouteBucketCount == 0 || s.BuildBucketCount == 0 ||
+	if s.ClusterID == "" || s.StorageGeneration == "" || s.SchemaVersion == 0 || s.ProtocolVersion == 0 ||
+		s.HashVersion != "ShardHashV1" || s.RouteBucketCount == 0 || s.BuildBucketCount == 0 ||
 		!isPowerOfTwo(s.RouteBucketCount) || !isPowerOfTwo(s.BuildBucketCount) ||
 		s.VirtualShardCount == 0 || !isPowerOfTwo(s.VirtualShardCount) || s.ShardID >= s.VirtualShardCount ||
 		len(s.ReplicaIDs) != int(DefaultReplication) || len(s.ServingEpochs) == 0 || len(s.ServingEpochs) > 2 ||
@@ -206,10 +211,56 @@ type FenceCompactionAuthorization struct {
 	RetentionProofDigest       string                `json:"retention_proof_digest"`
 }
 
+type DataShardBootstrap struct {
+	ClusterID         string   `json:"cluster_id"`
+	StorageGeneration string   `json:"storage_generation"`
+	ManifestDigest    string   `json:"manifest_digest"`
+	ShardID           uint32   `json:"shard_id"`
+	ReplicaIDs        []uint64 `json:"replica_ids"`
+	SchemaVersion     uint32   `json:"schema_version"`
+	ProtocolVersion   uint32   `json:"protocol_version"`
+	HashVersion       string   `json:"hash_version"`
+	VirtualShardCount uint32   `json:"virtual_shard_count"`
+	RouteBucketCount  uint32   `json:"route_bucket_count"`
+	BuildBucketCount  uint32   `json:"build_bucket_count"`
+}
+
+func NewDataShardBootstrap(manifest Manifest, shardID uint32) (DataShardBootstrap, error) {
+	if err := manifest.Validate(); err != nil {
+		return DataShardBootstrap{}, err
+	}
+	if shardID >= manifest.VirtualShardCount {
+		return DataShardBootstrap{}, errors.New("raftstore: data-shard bootstrap targets an unknown shard")
+	}
+	digest, err := manifest.Digest()
+	if err != nil {
+		return DataShardBootstrap{}, err
+	}
+	return DataShardBootstrap{
+		ClusterID: manifest.ClusterID, StorageGeneration: manifest.StorageGeneration,
+		ManifestDigest: digest, ShardID: shardID,
+		ReplicaIDs:    append([]uint64(nil), replicaIDsForPlacement(manifest.DataShards[shardID])...),
+		SchemaVersion: manifest.SchemaVersion, ProtocolVersion: manifest.ProtocolVersion,
+		HashVersion: manifest.HashVersion, VirtualShardCount: manifest.VirtualShardCount,
+		RouteBucketCount: manifest.RouteBucketCount, BuildBucketCount: manifest.BuildBucketCount,
+	}, nil
+}
+
+func (b DataShardBootstrap) Validate() error {
+	if b.ClusterID == "" || b.StorageGeneration == "" || !isSHA256(b.ManifestDigest) ||
+		validateReplicaIDs(b.ReplicaIDs) != nil || b.SchemaVersion == 0 ||
+		b.ProtocolVersion == 0 || b.HashVersion != "ShardHashV1" ||
+		!isPowerOfTwo(b.VirtualShardCount) || !isPowerOfTwo(b.RouteBucketCount) ||
+		!isPowerOfTwo(b.BuildBucketCount) {
+		return errors.New("raftstore: invalid data-shard bootstrap parameters")
+	}
+	return nil
+}
+
 type DataCommand struct {
 	Type       DataCommandType                   `json:"type"`
 	Identity   ShardRequestIdentity              `json:"identity"`
-	Manifest   *Manifest                         `json:"manifest,omitempty"`
+	Bootstrap  *DataShardBootstrap               `json:"bootstrap,omitempty"`
 	ReplicaIDs []uint64                          `json:"replica_ids,omitempty"`
 	Epoch      *PermitIdentity                   `json:"epoch,omitempty"`
 	Expect     RevisionExpectation               `json:"expect,omitempty"`
@@ -242,30 +293,29 @@ func ApplyDataCommand(state *DataState, index uint64, command DataCommand) DataA
 	}
 	switch command.Type {
 	case DataInitializeShard:
-		if state.Initialized || command.Manifest == nil || command.Identity.Validate() != nil {
-			return conflict("data shard bootstrap requires empty state and a manifest", 0)
+		if state.Initialized || command.Bootstrap == nil || command.Identity.Validate() != nil {
+			return conflict("data shard bootstrap requires empty state and fixed parameters", 0)
 		}
-		manifest := command.Manifest
-		digest, err := manifest.Digest()
-		if err != nil || command.Identity.ClusterID != manifest.ClusterID ||
-			command.Identity.StorageGeneration != manifest.StorageGeneration ||
-			command.Identity.ManifestDigest != digest || command.Identity.SystemEpoch != 1 ||
-			command.Identity.ShardID >= manifest.VirtualShardCount || len(command.ReplicaIDs) != int(manifest.ReplicationFactor) {
+		bootstrap := command.Bootstrap
+		if bootstrap.Validate() != nil || command.Identity.SystemEpoch != 1 ||
+			command.Identity.ClusterID != bootstrap.ClusterID ||
+			command.Identity.StorageGeneration != bootstrap.StorageGeneration ||
+			command.Identity.ManifestDigest != bootstrap.ManifestDigest ||
+			command.Identity.ShardID != bootstrap.ShardID ||
+			command.Identity.ShardID >= bootstrap.VirtualShardCount ||
+			!slices.Equal(command.ReplicaIDs, bootstrap.ReplicaIDs) {
 			return conflict("invalid data shard bootstrap identity", 0)
 		}
-		placement := manifest.DataShards[command.Identity.ShardID]
-		wantReplicaIDs := replicaIDsForPlacement(placement)
-		if !reflect.DeepEqual(command.ReplicaIDs, wantReplicaIDs) {
-			return conflict("data shard bootstrap replica set differs from manifest", 0)
-		}
 		*state = DataState{
-			Initialized: true, ClusterID: manifest.ClusterID, StorageGeneration: manifest.StorageGeneration,
-			ShardID: command.Identity.ShardID, RouteBucketCount: manifest.RouteBucketCount,
-			BuildBucketCount: manifest.BuildBucketCount, VirtualShardCount: manifest.VirtualShardCount,
-			ReplicaIDs:    append([]uint64(nil), command.ReplicaIDs...),
-			ServingEpochs: []PermitIdentity{command.Identity.PermitIdentity},
-			Routes:        make(map[string]clusterstate.RouteWorkflowRecord),
-			Builds:        make(map[string]clusterstate.BuildRecord), Fences: make(map[string]clusterstate.ExecutionFence),
+			Initialized: true, ClusterID: command.Identity.ClusterID, StorageGeneration: command.Identity.StorageGeneration,
+			ShardID: command.Identity.ShardID, SchemaVersion: bootstrap.SchemaVersion,
+			ProtocolVersion: bootstrap.ProtocolVersion, HashVersion: bootstrap.HashVersion,
+			RouteBucketCount: bootstrap.RouteBucketCount, BuildBucketCount: bootstrap.BuildBucketCount,
+			VirtualShardCount: bootstrap.VirtualShardCount,
+			ReplicaIDs:        append([]uint64(nil), command.ReplicaIDs...),
+			ServingEpochs:     []PermitIdentity{command.Identity.PermitIdentity},
+			Routes:            make(map[string]clusterstate.RouteWorkflowRecord),
+			Builds:            make(map[string]clusterstate.BuildRecord), Fences: make(map[string]clusterstate.ExecutionFence),
 		}
 	case DataPrepareEpoch:
 		if !state.Accepts(command.Identity) || command.Epoch == nil || len(state.ServingEpochs) != 1 ||

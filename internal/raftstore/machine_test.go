@@ -13,9 +13,10 @@ func TestDataStateMachineAppliesConflictAndRestoresDeterministicSnapshot(t *test
 	manifest := testManifest(4, "generation-1")
 	identity := routeShardIdentity(t, manifest, "/g", "rk")
 	replicas := replicaIDsForPlacement(manifest.DataShards[identity.ShardID])
+	bootstrap, _ := NewDataShardBootstrap(manifest, identity.ShardID)
 	machine := &DataStateMachine{raftShardID: DataRaftShardID(identity.ShardID), replicaID: replicas[0]}
 	updateDataMachine(t, machine, 1, DataCommand{
-		Type: DataInitializeShard, Identity: identity, Manifest: &manifest, ReplicaIDs: replicas,
+		Type: DataInitializeShard, Identity: identity, Bootstrap: &bootstrap, ReplicaIDs: replicas,
 	}, true)
 	starting := routeStarting(t, manifest, "/g", "rk", "sandbox-1", 1, true)
 	updateDataMachine(t, machine, 2, DataCommand{
@@ -110,8 +111,9 @@ func TestStateMachineRejectsWrongShardAndUnknownCommandFields(t *testing.T) {
 	manifest := testManifest(4, "generation-1")
 	identity := routeShardIdentity(t, manifest, "/g", "rk")
 	replicas := replicaIDsForPlacement(manifest.DataShards[identity.ShardID])
+	bootstrap, _ := NewDataShardBootstrap(manifest, identity.ShardID)
 	command, err := EncodeDataCommand(DataCommand{
-		Type: DataInitializeShard, Identity: identity, Manifest: &manifest, ReplicaIDs: replicas,
+		Type: DataInitializeShard, Identity: identity, Bootstrap: &bootstrap, ReplicaIDs: replicas,
 	})
 	if err != nil {
 		t.Fatal(err)

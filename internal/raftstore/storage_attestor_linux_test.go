@@ -1,0 +1,34 @@
+//go:build linux
+
+package raftstore
+
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
+
+func TestDMCryptAttestorWalksBoundedBackingDeviceGraph(t *testing.T) {
+	root := t.TempDir()
+	crypt := filepath.Join(root, "dev", "block", "253:0", "dm")
+	if err := os.MkdirAll(crypt, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(crypt, "uuid"), []byte("CRYPT-LUKS2-deadbeef"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	parentSlave := filepath.Join(root, "dev", "block", "253:1", "slaves", "crypt-volume")
+	if err := os.MkdirAll(parentSlave, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(parentSlave, "dev"), []byte("253:0\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	encrypted, err := dmCryptInDeviceGraph(root, "253:1", make(map[string]struct{}))
+	if err != nil || !encrypted {
+		t.Fatalf("nested dm-crypt detection = %t, %v", encrypted, err)
+	}
+	if _, err := dmCryptInDeviceGraph(root, "../../etc", make(map[string]struct{})); err == nil {
+		t.Fatal("invalid device number entered the sysfs graph")
+	}
+}
