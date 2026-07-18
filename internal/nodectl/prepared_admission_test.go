@@ -1,0 +1,235 @@
+package nodectl
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"path/filepath"
+	"testing"
+	"time"
+)
+
+func preparedDigest(value string) string {
+	digest := sha256.Sum256([]byte(value))
+	return hex.EncodeToString(digest[:])
+}
+
+func preparedTestController(t *testing.T, state *State, path string, queueMax int) *PreparedAdmissionController {
+	t.Helper()
+	policy := AdmissionPolicy{
+		Rate: 100, Burst: 100, StartupTTL: time.Minute, QueueTTL: time.Minute, QueueMaxDepth: queueMax,
+	}
+	admission := NewAdmissionController(policy)
+	admission.state = state
+	controller, err := NewPreparedAdmissionController(state, admission, &Persister{Path: path}, policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return controller
+}
+
+func preparedTestState() *State {
+	return NewState(16<<30, 8000, 0, 0, Resources{}, Watermarks{
+		OperationalMarginFactor: 0,
+		HighFactor:              0.95,
+		LowFactor:               0.80,
+		EmergencyFactor:         0.05,
+		StartupFactor:           1,
+	})
+}
+
+func preparedTestDemand(memory uint64) SandboxAdmissionDemand {
+	return SandboxAdmissionDemand{
+		CapacityMemoryBytes: memory, CapacityCPU: 2,
+		FloorMemoryBytes: memory, FloorCPU: 1, StartupBudgetMemory: memory,
+		CgroupPath: "/sys/fs/cgroup/sandbox",
+	}
+}
+
+func TestPreparedAdmissionIsDurableIdempotentAndClaimable(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	state := preparedTestState()
+	controller := preparedTestController(t, state, path, 4)
+	digest := preparedDigest("demand-1")
+
+	first, err := controller.PrepareAdmission("sandbox-1", digest, preparedTestDemand(1<<30))
+	if err != nil || first.State != PreparedAdmitted || first.ReservationToken == "" {
+		t.Fatalf("first prepare = %+v, %v", first, err)
+	}
+	retry, err := controller.PrepareAdmission("sandbox-1", digest, preparedTestDemand(1<<30))
+	if err != nil || retry != first {
+		t.Fatalf("retry = %+v, %v; want %+v", retry, err, first)
+	}
+	if _, err := controller.PrepareAdmission("sandbox-1", preparedDigest("different"), preparedTestDemand(1<<30)); !errors.Is(err, ErrPreparedAdmissionConflict) {
+		t.Fatalf("conflicting prepare error = %v", err)
+	}
+	claimed, err := controller.ClaimAdmission("sandbox-1", digest)
+	if err != nil || claimed.State != PreparedClaimed || claimed.ReservationToken != first.ReservationToken {
+		t.Fatalf("claim = %+v, %v", claimed, err)
+	}
+
+	loaded, err := (&Persister{Path: path}).Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := loaded.PreparedSandboxAdmissions["sandbox-1"]
+	if record == nil || record.State != PreparedClaimed || record.ReservationToken != first.ReservationToken ||
+		loaded.Reservations[first.ReservationToken] == nil {
+		t.Fatalf("reloaded admission = %+v reservations=%+v", record, loaded.Reservations)
+	}
+}
+
+func TestPreparedAdmissionQueueSurvivesRestartAndPromotesFIFO(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	state := preparedTestState()
+	state.Lock()
+	state.Reservations["blocker"] = &Reservation{
+		Token: "blocker", SandboxID: "running", AllocatableNowMem: 15 << 30,
+		Floor: Resources{MemoryBytes: 15 << 30}, Stage: StageSettled,
+	}
+	state.Unlock()
+	controller := preparedTestController(t, state, path, 4)
+	firstDigest := preparedDigest("queued-1")
+	secondDigest := preparedDigest("queued-2")
+	first, err := controller.PrepareAdmission("sandbox-1", firstDigest, preparedTestDemand(512<<20))
+	if err != nil || first.State != PreparedQueued {
+		t.Fatalf("first queued = %+v, %v", first, err)
+	}
+	second, err := controller.PrepareAdmission("sandbox-2", secondDigest, preparedTestDemand(512<<20))
+	if err != nil || second.State != PreparedQueued {
+		t.Fatalf("second queued = %+v, %v", second, err)
+	}
+
+	loaded, err := (&Persister{Path: path}).Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	loaded.Lock()
+	loaded.Remove("blocker")
+	if err := (&Persister{Path: path}).Flush(loaded); err != nil {
+		t.Fatal(err)
+	}
+	loaded.Unlock()
+	restarted := preparedTestController(t, loaded, path, 4)
+	changed, err := restarted.PromoteQueued()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(changed) != 2 || changed[0].SandboxID != "sandbox-1" || changed[1].SandboxID != "sandbox-2" ||
+		changed[0].State != PreparedAdmitted || changed[1].State != PreparedAdmitted {
+		t.Fatalf("promoted = %+v", changed)
+	}
+	if changed[0].ReservationToken != first.ReservationToken || changed[1].ReservationToken != second.ReservationToken {
+		t.Fatalf("promotion changed durable tokens: before=(%s,%s) after=%+v",
+			first.ReservationToken, second.ReservationToken, changed)
+	}
+}
+
+func TestPreparedAdmissionPersistsQueueFullRejection(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	state := preparedTestState()
+	state.Lock()
+	state.Reservations["blocker"] = &Reservation{
+		Token: "blocker", AllocatableNowMem: 15 << 30,
+		Floor: Resources{MemoryBytes: 15 << 30}, Stage: StageSettled,
+	}
+	state.Unlock()
+	controller := preparedTestController(t, state, path, 1)
+	if first, err := controller.PrepareAdmission("sandbox-1", preparedDigest("one"), preparedTestDemand(1<<30)); err != nil || first.State != PreparedQueued {
+		t.Fatalf("first = %+v, %v", first, err)
+	}
+	digest := preparedDigest("two")
+	rejected, err := controller.PrepareAdmission("sandbox-2", digest, preparedTestDemand(1<<30))
+	if err != nil || rejected.State != PreparedRejected || rejected.Reason != "queue_full" || rejected.ReservationToken != "" {
+		t.Fatalf("rejected = %+v, %v", rejected, err)
+	}
+	retry, err := controller.PrepareAdmission("sandbox-2", digest, preparedTestDemand(1<<30))
+	if err != nil || retry != rejected {
+		t.Fatalf("rejected retry = %+v, %v", retry, err)
+	}
+}
+
+func TestPreparedAdmissionRollsBackOnPersistenceFailure(t *testing.T) {
+	state := preparedTestState()
+	controller := preparedTestController(t, state, "/dev/null/state.json", 4)
+	if _, err := controller.PrepareAdmission("sandbox-1", preparedDigest("demand"), preparedTestDemand(1<<30)); err == nil {
+		t.Fatal("prepare succeeded without durable state")
+	}
+	state.Lock()
+	defer state.Unlock()
+	if len(state.PreparedSandboxAdmissions) != 0 || len(state.Reservations) != 0 {
+		t.Fatalf("failed persistence left state: admissions=%+v reservations=%+v",
+			state.PreparedSandboxAdmissions, state.Reservations)
+	}
+}
+
+func TestPreparedAdmissionQueueExpiryIsDurableAndDefinitive(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	state := preparedTestState()
+	state.Lock()
+	state.Reservations["blocker"] = &Reservation{
+		Token: "blocker", AllocatableNowMem: 15 << 30,
+		Floor: Resources{MemoryBytes: 15 << 30}, Stage: StageSettled,
+	}
+	state.Unlock()
+	controller := preparedTestController(t, state, path, 4)
+	now := time.Unix(1000, 0)
+	controller.clock = func() time.Time { return now }
+	controller.queueTTL = time.Minute
+	digest := preparedDigest("expiring")
+	queued, err := controller.PrepareAdmission("sandbox-1", digest, preparedTestDemand(1<<30))
+	if err != nil || queued.State != PreparedQueued {
+		t.Fatalf("queued = %+v, %v", queued, err)
+	}
+	now = now.Add(time.Minute)
+	changed, err := controller.PromoteQueued()
+	if err != nil || len(changed) != 1 || changed[0].State != PreparedRejected || changed[0].Reason != "queue_expired" {
+		t.Fatalf("expired = %+v, %v", changed, err)
+	}
+	retry, err := controller.PrepareAdmission("sandbox-1", digest, preparedTestDemand(1<<30))
+	if err != nil || retry.State != PreparedRejected || retry.Reason != "queue_expired" || retry.ReservationToken != "" {
+		t.Fatalf("expired retry = %+v, %v", retry, err)
+	}
+	loaded, err := (&Persister{Path: path}).Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record := loaded.PreparedSandboxAdmissions["sandbox-1"]; record == nil ||
+		record.State != PreparedRejected || record.Reason != "queue_expired" {
+		t.Fatalf("durable expiry = %+v", record)
+	}
+}
+
+func TestPreparedAdmissionFinalizationRequiresReleasedResources(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	state := preparedTestState()
+	controller := preparedTestController(t, state, path, 4)
+	digest := preparedDigest("finalize")
+	prepared, err := controller.PrepareAdmission("sandbox-1", digest, preparedTestDemand(1<<30))
+	if err != nil || prepared.State != PreparedAdmitted {
+		t.Fatalf("prepared = %+v, %v", prepared, err)
+	}
+	if err := controller.FinalizeAdmission("sandbox-1", digest); !errors.Is(err, ErrPreparedAdmissionState) {
+		t.Fatalf("active finalization error = %v", err)
+	}
+	if _, err := controller.ReleaseAdmission("sandbox-1", digest, "terminal"); err != nil {
+		t.Fatal(err)
+	}
+	if err := controller.FinalizeAdmission("sandbox-1", digest); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := controller.GetAdmission("sandbox-1", digest); !errors.Is(err, ErrPreparedAdmissionMissing) {
+		t.Fatalf("finalized lookup error = %v", err)
+	}
+	if err := controller.FinalizeAdmission("sandbox-1", digest); err != nil {
+		t.Fatalf("idempotent finalization = %v", err)
+	}
+	loaded, err := (&Persister{Path: path}).Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.PreparedSandboxAdmissions["sandbox-1"] != nil || loaded.Reservations[prepared.ReservationToken] != nil {
+		t.Fatalf("finalized state survived: admissions=%+v reservations=%+v",
+			loaded.PreparedSandboxAdmissions, loaded.Reservations)
+	}
+}

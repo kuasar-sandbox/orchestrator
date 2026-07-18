@@ -102,13 +102,15 @@ type Watermarks struct {
 type State struct {
 	mu sync.Mutex
 
-	NodeBudget        Resources               `json:"node_budget"`
-	HostReserved      Resources               `json:"host_reserved"`
-	BuildReserved     Resources               `json:"build_reserved"`
-	OperationalMargin Resources               `json:"operational_margin"`
-	AllocatablePool   Resources               `json:"allocatable_pool"`
-	Wm                Watermarks              `json:"watermarks"`
-	Reservations      map[string]*Reservation `json:"reservations"`
+	NodeBudget                Resources                            `json:"node_budget"`
+	HostReserved              Resources                            `json:"host_reserved"`
+	BuildReserved             Resources                            `json:"build_reserved"`
+	OperationalMargin         Resources                            `json:"operational_margin"`
+	AllocatablePool           Resources                            `json:"allocatable_pool"`
+	Wm                        Watermarks                           `json:"watermarks"`
+	Reservations              map[string]*Reservation              `json:"reservations"`
+	PreparedSandboxAdmissions map[string]*PreparedSandboxAdmission `json:"prepared_sandbox_admissions,omitempty"`
+	NextPreparedQueueSeq      uint64                               `json:"next_prepared_queue_seq,omitempty"`
 
 	Version int `json:"version"`
 }
@@ -127,14 +129,15 @@ func NewState(physicalMem uint64, physicalCPUMilli uint64,
 	}
 	pool := budget.Sub(margin)
 	return &State{
-		Version:           1,
-		NodeBudget:        node,
-		HostReserved:      host,
-		BuildReserved:     buildReserved,
-		OperationalMargin: margin,
-		AllocatablePool:   pool,
-		Wm:                wm,
-		Reservations:      make(map[string]*Reservation),
+		Version:                   1,
+		NodeBudget:                node,
+		HostReserved:              host,
+		BuildReserved:             buildReserved,
+		OperationalMargin:         margin,
+		AllocatablePool:           pool,
+		Wm:                        wm,
+		Reservations:              make(map[string]*Reservation),
+		PreparedSandboxAdmissions: make(map[string]*PreparedSandboxAdmission),
 	}
 }
 

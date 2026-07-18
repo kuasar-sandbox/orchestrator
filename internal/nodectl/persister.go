@@ -32,9 +32,14 @@ func (p *Persister) Flush(s *State) error {
 		return fmt.Errorf("persister: marshal: %w", err)
 	}
 	tmp := p.Path + ".tmp"
-	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
 		return fmt.Errorf("persister: open tmp: %w", err)
+	}
+	if err := f.Chmod(0o600); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return fmt.Errorf("persister: chmod tmp: %w", err)
 	}
 	if _, err := f.Write(data); err != nil {
 		f.Close()
@@ -53,6 +58,17 @@ func (p *Persister) Flush(s *State) error {
 	if err := os.Rename(tmp, p.Path); err != nil {
 		os.Remove(tmp)
 		return fmt.Errorf("persister: rename: %w", err)
+	}
+	dir, err := os.Open(filepath.Dir(p.Path))
+	if err != nil {
+		return fmt.Errorf("persister: open parent: %w", err)
+	}
+	if err := dir.Sync(); err != nil {
+		dir.Close()
+		return fmt.Errorf("persister: fsync parent: %w", err)
+	}
+	if err := dir.Close(); err != nil {
+		return fmt.Errorf("persister: close parent: %w", err)
 	}
 	return nil
 }
@@ -76,6 +92,9 @@ func (p *Persister) Load() (*State, error) {
 	}
 	if s.Reservations == nil {
 		s.Reservations = make(map[string]*Reservation)
+	}
+	if s.PreparedSandboxAdmissions == nil {
+		s.PreparedSandboxAdmissions = make(map[string]*PreparedSandboxAdmission)
 	}
 	return &s, nil
 }

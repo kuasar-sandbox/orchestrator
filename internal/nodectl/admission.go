@@ -395,6 +395,18 @@ func (a *AdmissionController) AnalyzeRequest(req *Message) Outcome {
 	return a.analyzeRequest(req)
 }
 
+// AnalyzeAndConsume returns ADMITTED only when this caller actually consumed
+// one token. A race for the last token becomes a short-term queue condition;
+// re-running Analyze alone would be unsafe because it could observe a refilled
+// token without charging it.
+func (a *AdmissionController) AnalyzeAndConsume(req *Message) Outcome {
+	outcome := a.analyzeRequest(req)
+	if outcome.Status == OutcomeAdmitted && !a.consumeToken() {
+		return Outcome{Status: OutcomeShortTermBlock, Block: BlockedByTokenBucket}
+	}
+	return outcome
+}
+
 func (a *AdmissionController) analyzeRequest(req *Message) Outcome {
 	// 1. drain
 	a.drainMu.Lock()

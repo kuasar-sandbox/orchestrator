@@ -199,19 +199,11 @@ func (s *Server) dispatch(conn net.Conn, req *Message, token *string) *Message {
 // reply. The conn-EOF monitor cancels the queue entry if the client
 // disconnects while queued.
 func (s *Server) handleAdmit(conn net.Conn, req *Message, token *string) *Message {
-	oc := s.Admission.AnalyzeRequest(req)
-	switch oc.Status {
-	case OutcomeAdmitted:
-		if !s.Admission.ConsumeToken() {
-			// Race: another admit took the token. Re-evaluate (which may
-			// now be short-term-block → queue).
-			oc = s.Admission.AnalyzeRequest(req)
-		}
-	}
+	oc := s.Admission.AnalyzeAndConsume(req)
 
 	switch oc.Status {
 	case OutcomeAdmitted:
-		// Token already consumed above (or admit didn't need a token recheck).
+		// The Admission decision consumed the request token.
 		resp, err := s.buildAdmitOK(conn, req, token)
 		if err != nil {
 			return &Message{

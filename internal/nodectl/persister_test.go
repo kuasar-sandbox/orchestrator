@@ -1,6 +1,7 @@
 package nodectl
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -26,6 +27,13 @@ func TestPersisterRoundTrip(t *testing.T) {
 
 	if err := p.Flush(src); err != nil {
 		t.Fatal(err)
+	}
+	info, err := os.Stat(p.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("state mode = %o, want 600", info.Mode().Perm())
 	}
 	loaded, err := p.Load()
 	if err != nil {

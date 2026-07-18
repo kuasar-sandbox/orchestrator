@@ -49,6 +49,8 @@ func startResourceController(ctx context.Context, rcfg *config.ResourceListenCon
 	// reattaches by token over RPC.
 	if prev, err := persister.Load(); err == nil && prev != nil {
 		state.Reservations = prev.Reservations
+		state.PreparedSandboxAdmissions = prev.PreparedSandboxAdmissions
+		state.NextPreparedQueueSeq = prev.NextPreparedQueueSeq
 		log.Printf("[node-ctl resource] loaded %d reservations from %s", len(prev.Reservations), resolved.StatePath)
 	} else if err != nil {
 		log.Printf("[node-ctl resource] state load failed (continuing fresh): %v", err)
