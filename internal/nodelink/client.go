@@ -57,6 +57,14 @@ type SessionSequencer interface {
 	NextSession(ctx context.Context) (routesync.SessionTuple, error)
 }
 
+// DurableEventOutbox is the node-local latest-event journal. Implementations
+// must retain unacknowledged events across process restart within one NodeEpoch.
+type DurableEventOutbox interface {
+	PendingExecutionEvents(context.Context, string, uint64, routesync.EventCursor, int, int) ([]routesync.ExecutionEvent, routesync.EventCursor, error)
+	AckExecutionEvent(context.Context, string, uint64, routesync.EventAck) error
+	EventWake() <-chan struct{}
+}
+
 // Client is a node's node-link client: it dials the registry, registers the
 // node's identity, then streams its sandbox routes while executing registry
 // commands, reconnecting with capped backoff.
@@ -67,6 +75,10 @@ type Client struct {
 	allowRedirect bool
 	identity      routesync.NodeRegister
 	sequencer     SessionSequencer
+	eventOutbox   DurableEventOutbox
+	eventBatch    int
+	eventBytes    int
+	eventInterval time.Duration
 	node          Node
 	heartbeat     time.Duration
 	tlsConfig     *tls.Config // non-nil = dial the registry over (m)TLS instead of h2c
@@ -79,6 +91,25 @@ func (c *Client) SetSessionSequencer(sequencer SessionSequencer) {
 	c.sequencer = sequencer
 }
 
+// SetDurableEventOutbox enables the final node-authoritative execution-event
+// path. It remains dormant when no outbox is configured.
+func (c *Client) SetDurableEventOutbox(outbox DurableEventOutbox) {
+	c.eventOutbox = outbox
+}
+
+// SetEventReplayLimits configures one bounded replay batch per interval.
+func (c *Client) SetEventReplayLimits(batch, bytes int, interval time.Duration) {
+	if batch > 0 {
+		c.eventBatch = batch
+	}
+	if bytes > 0 {
+		c.eventBytes = bytes
+	}
+	if interval > 0 {
+		c.eventInterval = interval
+	}
+}
+
 // New builds a Client. dial returns a fresh connection to the registry's
 // node-link listener (a TCP or mTLS dial); heartbeat is the period between node
 // heartbeats (<=0 → 10s).
@@ -89,7 +120,10 @@ func New(dial func(ctx context.Context) (net.Conn, error), identity routesync.No
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Client{dial: dial, identity: identity, node: node, heartbeat: heartbeat, tlsConfig: tlsConfig, log: log}
+	return &Client{
+		dial: dial, identity: identity, node: node, heartbeat: heartbeat, tlsConfig: tlsConfig, log: log,
+		eventBatch: 64, eventBytes: 1 << 20, eventInterval: time.Second,
+	}
 }
 
 // NewWithEndpoint builds a Client that knows the registry endpoint it is dialing.
@@ -106,6 +140,7 @@ func NewWithEndpoint(endpoint string, dial func(ctx context.Context, endpoint st
 	return &Client{
 		dialEndpoint: dial, endpoint: endpoint, allowRedirect: allowRedirect,
 		identity: identity, node: node, heartbeat: heartbeat, tlsConfig: tlsConfig, log: log,
+		eventBatch: 64, eventBytes: 1 << 20, eventInterval: time.Second,
 	}
 }
 
@@ -220,11 +255,22 @@ func (c *Client) session(ctx context.Context, endpoint string) error {
 	reg.ResumeFrom = hello.Hello.ResumeFrom
 	outbox := make(chan *routesync.Msg)
 	highOut := make(chan *routesync.Msg, 32)
+	eventOut := make(chan *routesync.Msg, 64)
 	hbUpdate := make(chan struct{}, 1)
 	var hbMu sync.Mutex
 	var latestHeartbeat *routesync.Msg
-	go runNodeLinkOutbox(sctx, outbox, highOut, hbUpdate, &hbMu, &latestHeartbeat)
+	go runNodeLinkOutbox(sctx, outbox, highOut, eventOut, hbUpdate, &hbMu, &latestHeartbeat)
 	onUp := func(uctx context.Context, m *routesync.Msg) {
+		if m.Type == routesync.TypeEventAck && m.EventAck != nil {
+			if c.eventOutbox == nil {
+				return
+			}
+			if err := c.eventOutbox.AckExecutionEvent(uctx, identity.NodeID, identity.NodeEpoch, *m.EventAck); err != nil {
+				c.log.Warn("node-link: reject execution event acknowledgement", "node", identity.NodeID,
+					"kind", m.EventAck.ObjectKind, "object", m.EventAck.ObjectID, "event_seq", m.EventAck.EventSeq, "err", err)
+			}
+			return
+		}
 		if m.Type == routesync.TypeCommand && m.Cmd != nil {
 			if !commandMatchesSession(m.Cmd, identity) {
 				select {
@@ -243,6 +289,10 @@ func (c *Client) session(ctx context.Context, endpoint string) error {
 				}
 			}
 		}
+	}
+	if c.eventOutbox != nil {
+		go runDurableEventReplay(sctx, c.eventOutbox, identity.NodeID, identity.NodeEpoch,
+			c.eventBatch, c.eventBytes, c.eventInterval, eventOut, c.log)
 	}
 	// Periodic heartbeat (node -> registry): liveness for the dead-node sweep +
 	// water level for placement (cluster.md / §11), serialized via the outbox.
@@ -284,7 +334,7 @@ func (c *Client) session(ctx context.Context, endpoint string) error {
 					continue
 				}
 				select {
-				case highOut <- &routesync.Msg{Type: routesync.TypeBuildEvent, Build: ev}:
+				case eventOut <- &routesync.Msg{Type: routesync.TypeBuildEvent, Build: ev}:
 				case <-sctx.Done():
 					return
 				}
@@ -317,6 +367,7 @@ func runNodeLinkOutbox(
 	ctx context.Context,
 	outbox chan<- *routesync.Msg,
 	highOut <-chan *routesync.Msg,
+	eventOut <-chan *routesync.Msg,
 	hbUpdate <-chan struct{},
 	hbMu *sync.Mutex,
 	latestHeartbeat **routesync.Msg,
@@ -327,6 +378,16 @@ func runNodeLinkOutbox(
 		case <-ctx.Done():
 			return
 		case m := <-highOut:
+			if !sendNodeLinkOutbox(ctx, outbox, m) {
+				return
+			}
+			continue
+		default:
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case m := <-eventOut:
 			if !sendNodeLinkOutbox(ctx, outbox, m) {
 				return
 			}
@@ -352,8 +413,63 @@ func runNodeLinkOutbox(
 			if !sendNodeLinkOutbox(ctx, outbox, m) {
 				return
 			}
+		case m := <-eventOut:
+			if !sendNodeLinkOutbox(ctx, outbox, m) {
+				return
+			}
 		case <-hbUpdate:
 			heartbeatPending = true
+		}
+	}
+}
+
+func runDurableEventReplay(
+	ctx context.Context,
+	durable DurableEventOutbox,
+	nodeID string,
+	nodeEpoch uint64,
+	batch, bytes int,
+	interval time.Duration,
+	eventOut chan<- *routesync.Msg,
+	log *slog.Logger,
+) {
+	if batch <= 0 {
+		batch = 64
+	}
+	if bytes <= 0 {
+		bytes = 1 << 20
+	}
+	if interval <= 0 {
+		interval = time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	var cursor routesync.EventCursor
+	for {
+		events, next, err := durable.PendingExecutionEvents(ctx, nodeID, nodeEpoch, cursor, batch, bytes)
+		if err != nil && ctx.Err() == nil {
+			log.Warn("node-link: load durable execution events", "node", nodeID, "err", err)
+		}
+		if err == nil {
+			if len(events) == 0 && (cursor.ObjectKind != "" || cursor.ObjectID != "") {
+				cursor = routesync.EventCursor{}
+			} else {
+				cursor = next
+			}
+		}
+		for i := range events {
+			event := events[i]
+			select {
+			case eventOut <- &routesync.Msg{Type: routesync.TypeExecutionEvent, ExecutionEvent: &event}:
+			case <-ctx.Done():
+				return
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-durable.EventWake():
+		case <-ticker.C:
 		}
 	}
 }

@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -303,27 +304,106 @@ func TestFullJitterIsBounded(t *testing.T) {
 	}
 }
 
-func TestNodeLinkOutboxPrioritizesHighPriorityFramesBeforeHeartbeat(t *testing.T) {
+func TestNodeLinkOutboxPrioritizesCommandThenDurableEventBeforeHeartbeat(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	outbox := make(chan *routesync.Msg, 2)
 	highOut := make(chan *routesync.Msg, 1)
+	eventOut := make(chan *routesync.Msg, 1)
 	hbUpdate := make(chan struct{}, 1)
 	var hbMu sync.Mutex
 	heartbeat := &routesync.Msg{Type: routesync.TypeHeartbeat, Beat: &routesync.Heartbeat{Counts: 7}}
 	latestHeartbeat := heartbeat
 
 	highOut <- &routesync.Msg{Type: routesync.TypeCmdAck, Ack: &routesync.CmdAck{CmdID: "cmd-1", Status: routesync.AckAccepted}}
+	eventOut <- &routesync.Msg{Type: routesync.TypeExecutionEvent, ExecutionEvent: &routesync.ExecutionEvent{ObjectID: "sandbox-1"}}
 	hbUpdate <- struct{}{}
-	go runNodeLinkOutbox(ctx, outbox, highOut, hbUpdate, &hbMu, &latestHeartbeat)
+	go runNodeLinkOutbox(ctx, outbox, highOut, eventOut, hbUpdate, &hbMu, &latestHeartbeat)
 
 	first := receiveOutboxMsg(t, outbox)
 	if first.Type != routesync.TypeCmdAck || first.Ack == nil || first.Ack.CmdID != "cmd-1" {
 		t.Fatalf("first outbox msg=%+v, want cmd_ack before heartbeat", first)
 	}
 	second := receiveOutboxMsg(t, outbox)
-	if second.Type != routesync.TypeHeartbeat || second.Beat == nil || second.Beat.Counts != 7 {
-		t.Fatalf("second outbox msg=%+v, want latest heartbeat", second)
+	if second.Type != routesync.TypeExecutionEvent || second.ExecutionEvent == nil || second.ExecutionEvent.ObjectID != "sandbox-1" {
+		t.Fatalf("second outbox msg=%+v, want durable execution event", second)
+	}
+	third := receiveOutboxMsg(t, outbox)
+	if third.Type != routesync.TypeHeartbeat || third.Beat == nil || third.Beat.Counts != 7 {
+		t.Fatalf("third outbox msg=%+v, want latest heartbeat", third)
+	}
+}
+
+type fakeDurableEventOutbox struct {
+	mu      sync.Mutex
+	events  []routesync.ExecutionEvent
+	wake    chan struct{}
+	queries int
+}
+
+func (f *fakeDurableEventOutbox) PendingExecutionEvents(
+	_ context.Context,
+	_ string,
+	_ uint64,
+	_ routesync.EventCursor,
+	maxCount, _ int,
+) ([]routesync.ExecutionEvent, routesync.EventCursor, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.queries++
+	if maxCount > len(f.events) {
+		maxCount = len(f.events)
+	}
+	events := append([]routesync.ExecutionEvent(nil), f.events[:maxCount]...)
+	var next routesync.EventCursor
+	if len(events) > 0 {
+		last := events[len(events)-1]
+		next = routesync.EventCursor{ObjectKind: last.ObjectKind, ObjectID: last.ObjectID}
+	}
+	return events, next, nil
+}
+
+func (f *fakeDurableEventOutbox) AckExecutionEvent(
+	context.Context,
+	string,
+	uint64,
+	routesync.EventAck,
+) error {
+	return nil
+}
+
+func (f *fakeDurableEventOutbox) EventWake() <-chan struct{} { return f.wake }
+
+func TestDurableEventReplayStartsImmediatelyAndIsBatchBounded(t *testing.T) {
+	durable := &fakeDurableEventOutbox{
+		wake: make(chan struct{}, 1),
+		events: []routesync.ExecutionEvent{
+			{ObjectKind: "sandbox", ObjectID: "sandbox-1", NodeID: "node-1", NodeEpoch: 7,
+				StorageGeneration: "generation-1", BindingDigest: strings.Repeat("a", 64), EventSeq: 2, State: "READY"},
+			{ObjectKind: "build", ObjectID: "build-1", NodeID: "node-1", NodeEpoch: 7,
+				StorageGeneration: "generation-1", BindingDigest: strings.Repeat("b", 64), EventSeq: 3, State: "BUILDING"},
+		},
+	}
+	eventOut := make(chan *routesync.Msg, 2)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go runDurableEventReplay(ctx, durable, "node-1", 7, 1, 1<<20, time.Hour, eventOut,
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+	message := receiveOutboxMsg(t, eventOut)
+	if message.Type != routesync.TypeExecutionEvent || message.ExecutionEvent == nil ||
+		message.ExecutionEvent.ObjectID != "sandbox-1" {
+		t.Fatalf("replayed message = %+v", message)
+	}
+	select {
+	case extra := <-eventOut:
+		t.Fatalf("batch limit was ignored: %+v", extra)
+	case <-time.After(20 * time.Millisecond):
+	}
+	durable.mu.Lock()
+	queries := durable.queries
+	durable.mu.Unlock()
+	if queries != 1 {
+		t.Fatalf("queries = %d, want one bounded startup batch", queries)
 	}
 }
 
