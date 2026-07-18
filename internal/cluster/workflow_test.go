@@ -35,6 +35,16 @@ func TestRouteWorkflowTypesValidateFrozenIntent(t *testing.T) {
 	if err := starting.Validate(); err == nil {
 		t.Fatal("selected candidate was also definitively rejected")
 	}
+	starting.Starting.DefinitivelyRejected = nil
+	starting.Group = "/another-group"
+	if err := starting.Validate(); err == nil {
+		t.Fatal("Binding from another group was accepted")
+	}
+	starting.Group = "/g"
+	starting.Starting.Intent.DispatchSpec = []byte("mutated")
+	if err := starting.Validate(); err == nil {
+		t.Fatal("Binding for another immutable dispatch intent was accepted")
+	}
 }
 
 func TestReadyRouteAndRevisionValidation(t *testing.T) {
@@ -69,6 +79,56 @@ func TestDispatchIntentRejectsMutationAndOversize(t *testing.T) {
 	}
 	if _, err := NewDispatchIntent([]byte("demand"), []byte(strings.Repeat("x", MaxDispatchSpecBytes+1)), "v1"); err == nil {
 		t.Fatal("oversized dispatch spec accepted")
+	}
+}
+
+func TestPlacementFailuresDoNotInventExecutionProof(t *testing.T) {
+	intent, err := NewDispatchIntent([]byte("demand"), []byte("spec"), "v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidates := []PlacementCandidate{{NodeID: "n1"}, {NodeID: "n2"}}
+	rejected := []uint32{0, 1}
+	route := RouteWorkflowRecord{
+		Group: "/g", RouteKey: "rk", State: WorkflowRouteTombstone,
+		Revision: Revision{StorageGeneration: "g1", ShardID: 1, LogIndex: 10},
+		Tombstone: &RouteTombstoneState{PlacementFailure: &RoutePlacementFailureState{
+			SandboxID: "s1", PlacementRound: 2, CandidatePool: candidates,
+			DefinitivelyRejected: rejected, Intent: intent, Reason: "candidate rounds exhausted",
+		}},
+	}
+	if err := route.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	route.Tombstone.PlacementFailure.DefinitivelyRejected = []uint32{0}
+	if err := route.Validate(); err == nil {
+		t.Fatal("Route placement failure accepted a non-exhausted pool")
+	}
+
+	build := BuildRecord{
+		Group: "/g", BuildID: "b1", State: BuildError,
+		Revision: Revision{StorageGeneration: "g1", ShardID: 2, LogIndex: 20},
+		Failure: &BuildPlacementFailureState{
+			BuildID: "b1", CandidatePool: candidates, DefinitivelyRejected: rejected,
+			Intent: intent, Reason: "candidate pool exhausted",
+		},
+	}
+	if err := build.Validate(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDispatchOutcomeRejectsUnknownValue(t *testing.T) {
+	for _, outcome := range []DispatchOutcome{
+		DispatchAcceptedAdmitted, DispatchAcceptedQueued, DispatchDefinitiveReject,
+		DispatchSessionMoved, DispatchConflict, DispatchWrongBinding, DispatchUnknown,
+	} {
+		if err := outcome.Validate(); err != nil {
+			t.Fatalf("%s: %v", outcome, err)
+		}
+	}
+	if err := DispatchOutcome("TIMEOUT").Validate(); err == nil {
+		t.Fatal("unknown dispatch outcome was accepted")
 	}
 }
 
@@ -126,7 +186,8 @@ func workflowBinding(t *testing.T, kind ExecutionKind, objectID, routeKey string
 		t.Fatal(err)
 	}
 	return ExecutionBindingIntent{
-		NodeID: "n1", NodeEpoch: 7, StorageGeneration: "g1", OpaqueBinding: opaque, BindingDigest: digest,
+		NodeID: "n1", NodeEpoch: 7, DataEndpoint: "10.0.0.1:8443",
+		StorageGeneration: "g1", OpaqueBinding: opaque, BindingDigest: digest,
 	}
 }
 

@@ -49,6 +49,28 @@ const (
 	BuildTombstone  BuildWorkflowState = "BUILD_TOMBSTONE"
 )
 
+type DispatchOutcome string
+
+const (
+	DispatchAcceptedAdmitted DispatchOutcome = "ACCEPTED_ADMITTED"
+	DispatchAcceptedQueued   DispatchOutcome = "ACCEPTED_QUEUED"
+	DispatchDefinitiveReject DispatchOutcome = "DEFINITIVE_REJECT"
+	DispatchSessionMoved     DispatchOutcome = "SESSION_MOVED"
+	DispatchConflict         DispatchOutcome = "CONFLICT"
+	DispatchWrongBinding     DispatchOutcome = "WRONG_BINDING"
+	DispatchUnknown          DispatchOutcome = "UNKNOWN"
+)
+
+func (o DispatchOutcome) Validate() error {
+	switch o {
+	case DispatchAcceptedAdmitted, DispatchAcceptedQueued, DispatchDefinitiveReject,
+		DispatchSessionMoved, DispatchConflict, DispatchWrongBinding, DispatchUnknown:
+		return nil
+	default:
+		return errors.New("cluster: invalid dispatch outcome")
+	}
+}
+
 type PlacementCandidate struct {
 	NodeID        string `json:"node_id"`
 	FailureDomain string `json:"failure_domain,omitempty"`
@@ -92,13 +114,14 @@ func (i DispatchIntent) Validate() error {
 type ExecutionBindingIntent struct {
 	NodeID            string `json:"node_id"`
 	NodeEpoch         uint64 `json:"node_epoch"`
+	DataEndpoint      string `json:"data_endpoint"`
 	StorageGeneration string `json:"storage_generation"`
 	OpaqueBinding     string `json:"opaque_binding"`
 	BindingDigest     string `json:"binding_digest"`
 }
 
 func (i ExecutionBindingIntent) Validate(kind ExecutionKind, objectID string) error {
-	if i.NodeID == "" || i.NodeEpoch == 0 || i.StorageGeneration == "" || i.OpaqueBinding == "" || i.BindingDigest == "" {
+	if i.NodeID == "" || i.NodeEpoch == 0 || i.DataEndpoint == "" || i.StorageGeneration == "" || i.OpaqueBinding == "" || i.BindingDigest == "" {
 		return errors.New("cluster: incomplete execution Binding intent")
 	}
 	binding, err := DecodeExecutionBinding(i.OpaqueBinding)
@@ -115,6 +138,25 @@ func (i ExecutionBindingIntent) Validate(kind ExecutionKind, objectID string) er
 	}
 	if digest != i.BindingDigest {
 		return errors.New("cluster: execution Binding intent digest mismatch")
+	}
+	return nil
+}
+
+func (i ExecutionBindingIntent) ValidateWorkflow(kind ExecutionKind, objectID, group, routeKey string, intent DispatchIntent) error {
+	if err := i.Validate(kind, objectID); err != nil {
+		return err
+	}
+	if err := intent.Validate(); err != nil {
+		return err
+	}
+	binding, err := DecodeExecutionBinding(i.OpaqueBinding)
+	if err != nil {
+		return err
+	}
+	if binding.Group != group || binding.RouteKey != routeKey ||
+		hex.EncodeToString(binding.DemandDigest[:]) != intent.DemandDigest ||
+		hex.EncodeToString(binding.DispatchSpecDigest[:]) != intent.DispatchSpecDigest {
+		return errors.New("cluster: execution Binding does not cover the committed workflow intent")
 	}
 	return nil
 }
@@ -270,16 +312,24 @@ func (p TerminalProof) Validate() error {
 }
 
 type RouteTombstoneState struct {
-	SandboxID       string        `json:"sandbox_id"`
-	NodeID          string        `json:"node_id"`
-	NodeEpoch       uint64        `json:"node_epoch"`
-	LastEventSeq    uint64        `json:"last_event_seq"`
-	Proof           TerminalProof `json:"proof"`
-	TerminalReason  string        `json:"terminal_reason"`
-	FailureRevision Revision      `json:"failure_revision"`
+	SandboxID        string                      `json:"sandbox_id,omitempty"`
+	NodeID           string                      `json:"node_id,omitempty"`
+	NodeEpoch        uint64                      `json:"node_epoch,omitempty"`
+	LastEventSeq     uint64                      `json:"last_event_seq,omitempty"`
+	Proof            TerminalProof               `json:"proof,omitempty"`
+	TerminalReason   string                      `json:"terminal_reason,omitempty"`
+	FailureRevision  Revision                    `json:"failure_revision,omitempty"`
+	PlacementFailure *RoutePlacementFailureState `json:"placement_failure,omitempty"`
 }
 
 func (s RouteTombstoneState) Validate() error {
+	if s.PlacementFailure != nil {
+		if s.SandboxID != "" || s.NodeID != "" || s.NodeEpoch != 0 || s.LastEventSeq != 0 ||
+			s.TerminalReason != "" || s.Proof != (TerminalProof{}) || s.FailureRevision != (Revision{}) {
+			return errors.New("cluster: placement-failure TOMBSTONE cannot contain an execution proof")
+		}
+		return s.PlacementFailure.Validate()
+	}
 	if s.SandboxID == "" || s.NodeID == "" || s.NodeEpoch == 0 || s.LastEventSeq == 0 || s.TerminalReason == "" {
 		return errors.New("cluster: incomplete TOMBSTONE")
 	}
@@ -290,6 +340,28 @@ func (s RouteTombstoneState) Validate() error {
 		return err
 	}
 	return s.FailureRevision.Validate()
+}
+
+type RoutePlacementFailureState struct {
+	SandboxID            string               `json:"sandbox_id"`
+	PlacementRound       uint64               `json:"placement_round"`
+	CandidatePool        []PlacementCandidate `json:"candidate_pool"`
+	DefinitivelyRejected []uint32             `json:"definitively_rejected"`
+	Intent               DispatchIntent       `json:"intent"`
+	Reason               string               `json:"reason"`
+}
+
+func (s RoutePlacementFailureState) Validate() error {
+	if s.SandboxID == "" || s.PlacementRound == 0 || len(s.CandidatePool) == 0 || s.Reason == "" {
+		return errors.New("cluster: incomplete placement-failure TOMBSTONE")
+	}
+	if err := validateCandidates(s.CandidatePool, nil, s.DefinitivelyRejected); err != nil {
+		return err
+	}
+	if len(s.DefinitivelyRejected) != len(s.CandidatePool) {
+		return errors.New("cluster: placement-failure TOMBSTONE requires an exhausted candidate pool")
+	}
+	return s.Intent.Validate()
 }
 
 type RouteWorkflowRecord struct {
@@ -320,7 +392,13 @@ func (r RouteWorkflowRecord) Validate() error {
 		if r.Starting == nil {
 			return errors.New("cluster: missing STARTING state")
 		}
-		return r.Starting.Validate()
+		if err := r.Starting.Validate(); err != nil {
+			return err
+		}
+		if r.Starting.Binding != nil {
+			return r.Starting.Binding.ValidateWorkflow(ExecutionKindSandbox, r.Starting.SandboxID, r.Group, r.RouteKey, r.Starting.Intent)
+		}
+		return nil
 	case WorkflowRouteReady:
 		if r.Ready == nil {
 			return errors.New("cluster: missing READY state")
@@ -413,14 +491,36 @@ type BuildTombstoneState struct {
 	FailureRevision Revision        `json:"failure_revision"`
 }
 
+type BuildPlacementFailureState struct {
+	BuildID              string               `json:"build_id"`
+	CandidatePool        []PlacementCandidate `json:"candidate_pool"`
+	DefinitivelyRejected []uint32             `json:"definitively_rejected"`
+	Intent               DispatchIntent       `json:"intent"`
+	Reason               string               `json:"reason"`
+}
+
+func (s BuildPlacementFailureState) Validate() error {
+	if s.BuildID == "" || len(s.CandidatePool) == 0 || s.Reason == "" {
+		return errors.New("cluster: incomplete Build placement failure")
+	}
+	if err := validateCandidates(s.CandidatePool, nil, s.DefinitivelyRejected); err != nil {
+		return err
+	}
+	if len(s.DefinitivelyRejected) != len(s.CandidatePool) {
+		return errors.New("cluster: Build placement failure requires an exhausted candidate pool")
+	}
+	return s.Intent.Validate()
+}
+
 type BuildRecord struct {
-	Group      string               `json:"group"`
-	BuildID    string               `json:"build_id"`
-	State      BuildWorkflowState   `json:"state"`
-	Revision   Revision             `json:"revision"`
-	Starting   *BuildStartingState  `json:"starting,omitempty"`
-	Projection *BuildProjection     `json:"projection,omitempty"`
-	Tombstone  *BuildTombstoneState `json:"tombstone,omitempty"`
+	Group      string                      `json:"group"`
+	BuildID    string                      `json:"build_id"`
+	State      BuildWorkflowState          `json:"state"`
+	Revision   Revision                    `json:"revision"`
+	Starting   *BuildStartingState         `json:"starting,omitempty"`
+	Projection *BuildProjection            `json:"projection,omitempty"`
+	Tombstone  *BuildTombstoneState        `json:"tombstone,omitempty"`
+	Failure    *BuildPlacementFailureState `json:"failure,omitempty"`
 }
 
 func (r BuildRecord) Validate() error {
@@ -430,7 +530,7 @@ func (r BuildRecord) Validate() error {
 	if err := r.Revision.Validate(); err != nil {
 		return err
 	}
-	if countPresent(r.Starting != nil, r.Projection != nil, r.Tombstone != nil) != 1 {
+	if countPresent(r.Starting != nil, r.Projection != nil, r.Tombstone != nil, r.Failure != nil) != 1 {
 		return errors.New("cluster: Build state union must contain exactly one value")
 	}
 	switch r.State {
@@ -438,8 +538,14 @@ func (r BuildRecord) Validate() error {
 		if r.Starting == nil || r.Starting.BuildID != r.BuildID {
 			return errors.New("cluster: missing or mismatched BUILD_STARTING state")
 		}
-		return r.Starting.Validate()
-	case BuildQueued, BuildRegistered, BuildBuilding, BuildReady, BuildError:
+		if err := r.Starting.Validate(); err != nil {
+			return err
+		}
+		if r.Starting.Binding != nil {
+			return r.Starting.Binding.ValidateWorkflow(ExecutionKindBuild, r.BuildID, r.Group, "", r.Starting.Intent)
+		}
+		return nil
+	case BuildQueued, BuildRegistered, BuildBuilding, BuildReady:
 		if r.Projection == nil || r.Projection.BuildID != r.BuildID {
 			return errors.New("cluster: missing or mismatched Build projection")
 		}
@@ -449,7 +555,21 @@ func (r BuildRecord) Validate() error {
 		if r.State == BuildReady && r.Projection.ArtifactRef == "" {
 			return errors.New("cluster: BUILD_READY requires artifact reference")
 		}
-		if r.State == BuildError && r.Projection.Reason == "" {
+		return nil
+	case BuildError:
+		if r.Failure != nil {
+			if r.Failure.BuildID != r.BuildID {
+				return errors.New("cluster: mismatched Build placement failure")
+			}
+			return r.Failure.Validate()
+		}
+		if r.Projection == nil || r.Projection.BuildID != r.BuildID {
+			return errors.New("cluster: missing or mismatched BUILD_ERROR projection")
+		}
+		if err := r.Projection.Validate(); err != nil {
+			return err
+		}
+		if r.Projection.Reason == "" {
 			return errors.New("cluster: BUILD_ERROR requires reason")
 		}
 		return nil
