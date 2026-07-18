@@ -14,6 +14,16 @@ type ShardRequestIdentity struct {
 	ShardID uint32 `json:"shard_id"`
 }
 
+const RouteChangefeedRetentionRevisions uint64 = 10_000
+
+type RouteChange struct {
+	Revision uint64                          `json:"revision"`
+	Bucket   uint32                          `json:"bucket"`
+	Group    string                          `json:"group"`
+	RouteKey string                          `json:"route_key"`
+	State    clusterstate.RouteWorkflowState `json:"state"`
+}
+
 func (i ShardRequestIdentity) Validate() error {
 	if err := i.PermitIdentity.Validate(); err != nil {
 		return err
@@ -22,23 +32,25 @@ func (i ShardRequestIdentity) Validate() error {
 }
 
 type DataState struct {
-	Initialized        bool                                        `json:"initialized"`
-	ClusterID          string                                      `json:"cluster_id"`
-	StorageGeneration  string                                      `json:"storage_generation"`
-	ShardID            uint32                                      `json:"shard_id"`
-	SchemaVersion      uint32                                      `json:"schema_version"`
-	ProtocolVersion    uint32                                      `json:"protocol_version"`
-	HashVersion        string                                      `json:"hash_version"`
-	RouteBucketCount   uint32                                      `json:"route_bucket_count"`
-	BuildBucketCount   uint32                                      `json:"build_bucket_count"`
-	VirtualShardCount  uint32                                      `json:"virtual_shard_count"`
-	ReplicaIDs         []uint64                                    `json:"replica_ids"`
-	PreparedReplicaIDs []uint64                                    `json:"prepared_replica_ids,omitempty"`
-	ServingEpochs      []PermitIdentity                            `json:"serving_epochs"`
-	Routes             map[string]clusterstate.RouteWorkflowRecord `json:"routes"`
-	Builds             map[string]clusterstate.BuildRecord         `json:"builds"`
-	Fences             map[string]clusterstate.ExecutionFence      `json:"fences"`
-	LastApplied        uint64                                      `json:"last_applied"`
+	Initialized          bool                                        `json:"initialized"`
+	ClusterID            string                                      `json:"cluster_id"`
+	StorageGeneration    string                                      `json:"storage_generation"`
+	ShardID              uint32                                      `json:"shard_id"`
+	SchemaVersion        uint32                                      `json:"schema_version"`
+	ProtocolVersion      uint32                                      `json:"protocol_version"`
+	HashVersion          string                                      `json:"hash_version"`
+	RouteBucketCount     uint32                                      `json:"route_bucket_count"`
+	BuildBucketCount     uint32                                      `json:"build_bucket_count"`
+	VirtualShardCount    uint32                                      `json:"virtual_shard_count"`
+	ReplicaIDs           []uint64                                    `json:"replica_ids"`
+	PreparedReplicaIDs   []uint64                                    `json:"prepared_replica_ids,omitempty"`
+	ServingEpochs        []PermitIdentity                            `json:"serving_epochs"`
+	RouteChangefeedFloor uint64                                      `json:"route_changefeed_floor"`
+	RouteChanges         []RouteChange                               `json:"route_changes,omitempty"`
+	Routes               map[string]clusterstate.RouteWorkflowRecord `json:"routes"`
+	Builds               map[string]clusterstate.BuildRecord         `json:"builds"`
+	Fences               map[string]clusterstate.ExecutionFence      `json:"fences"`
+	LastApplied          uint64                                      `json:"last_applied"`
 }
 
 func (s DataState) Validate() error {
@@ -46,7 +58,7 @@ func (s DataState) Validate() error {
 		if s.ClusterID != "" || s.StorageGeneration != "" || s.ShardID != 0 || s.SchemaVersion != 0 ||
 			s.ProtocolVersion != 0 || s.HashVersion != "" || s.RouteBucketCount != 0 ||
 			s.BuildBucketCount != 0 || s.VirtualShardCount != 0 || len(s.ReplicaIDs) != 0 ||
-			len(s.PreparedReplicaIDs) != 0 ||
+			len(s.PreparedReplicaIDs) != 0 || s.RouteChangefeedFloor != 0 || len(s.RouteChanges) != 0 ||
 			s.LastApplied != 0 || len(s.Routes) != 0 || len(s.Builds) != 0 || len(s.Fences) != 0 ||
 			len(s.ServingEpochs) != 0 {
 			return errors.New("raftstore: uninitialized data shard contains state")
@@ -70,6 +82,37 @@ func (s DataState) Validate() error {
 		if err := validateStoredFence(s, key, fence); err != nil {
 			return err
 		}
+	}
+	if s.RouteChangefeedFloor > s.LastApplied {
+		return errors.New("raftstore: Route changefeed floor exceeds applied state")
+	}
+	for index, change := range s.RouteChanges {
+		if change.Revision <= s.RouteChangefeedFloor || change.Revision > s.LastApplied ||
+			index > 0 && change.Revision <= s.RouteChanges[index-1].Revision {
+			return errors.New("raftstore: Route changefeed revisions are invalid")
+		}
+		if err := validateRouteChange(s, change); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateRouteChange(state DataState, change RouteChange) error {
+	if change.Revision == 0 || change.Group == "" || change.RouteKey == "" {
+		return errors.New("raftstore: Route change identity is incomplete")
+	}
+	switch change.State {
+	case clusterstate.WorkflowRouteStarting, clusterstate.WorkflowRouteReady, clusterstate.WorkflowRoutePaused,
+		clusterstate.WorkflowRouteResuming, clusterstate.WorkflowRouteDeleting, clusterstate.WorkflowRouteTombstone:
+	default:
+		return errors.New("raftstore: Route change state is invalid")
+	}
+	bucket, shardID, err := clusterstate.RouteShardFor(
+		change.Group, change.RouteKey, state.RouteBucketCount, state.VirtualShardCount,
+	)
+	if err != nil || bucket != change.Bucket || shardID != state.ShardID {
+		return errors.New("raftstore: Route change belongs to another bucket or shard")
 	}
 	return nil
 }
@@ -293,7 +336,7 @@ func ApplyDataCommand(state *DataState, index uint64, command DataCommand) DataA
 	}
 	conflict := func(reason string, revision uint64) DataApplyResult {
 		if state.Initialized {
-			state.LastApplied = index
+			advanceDataApplied(state, index)
 		}
 		return dataConflict(reason, revision)
 	}
@@ -349,7 +392,9 @@ func ApplyDataCommand(state *DataState, index uint64, command DataCommand) DataA
 			return conflict("Route mutation identity is fenced", 0)
 		}
 		record := cloneRouteRecord(*command.Route)
-		_, shardID, err := clusterstate.RouteShardFor(record.Group, record.RouteKey, state.RouteBucketCount, state.VirtualShardCount)
+		bucket, shardID, err := clusterstate.RouteShardFor(
+			record.Group, record.RouteKey, state.RouteBucketCount, state.VirtualShardCount,
+		)
 		if err != nil || shardID != state.ShardID {
 			return conflict("Route key belongs to another shard", 0)
 		}
@@ -371,6 +416,9 @@ func ApplyDataCommand(state *DataState, index uint64, command DataCommand) DataA
 			return conflict("new Route must begin in STARTING", 0)
 		}
 		state.Routes[key] = record
+		state.RouteChanges = append(state.RouteChanges, RouteChange{
+			Revision: index, Bucket: bucket, Group: record.Group, RouteKey: record.RouteKey, State: record.State,
+		})
 	case DataPutBuild:
 		if !state.Accepts(command.Identity) || command.Build == nil {
 			return conflict("Build mutation identity is fenced", 0)
@@ -444,11 +492,31 @@ func ApplyDataCommand(state *DataState, index uint64, command DataCommand) DataA
 	default:
 		return conflict(fmt.Sprintf("unknown data command %q", command.Type), 0)
 	}
-	state.LastApplied = index
+	advanceDataApplied(state, index)
 	if err := validateDataStateIdentity(*state); err != nil {
 		return dataConflict(err.Error(), state.LastApplied)
 	}
 	return DataApplyResult{Applied: true, Revision: index}
+}
+
+func advanceDataApplied(state *DataState, index uint64) {
+	state.LastApplied = index
+	if index <= RouteChangefeedRetentionRevisions {
+		return
+	}
+	floor := index - RouteChangefeedRetentionRevisions
+	if floor <= state.RouteChangefeedFloor {
+		return
+	}
+	state.RouteChangefeedFloor = floor
+	firstRetained := sort.Search(len(state.RouteChanges), func(position int) bool {
+		return state.RouteChanges[position].Revision > floor
+	})
+	if firstRetained == 0 {
+		return
+	}
+	copy(state.RouteChanges, state.RouteChanges[firstRetained:])
+	state.RouteChanges = state.RouteChanges[:len(state.RouteChanges)-firstRetained]
 }
 
 func revisionFor(state DataState, index uint64) clusterstate.Revision {

@@ -38,6 +38,8 @@ The state engine uses:
 - two snapshot slots and one atomically switched control record per replica;
 - bounded 16 MiB synced snapshot-recovery batches;
 - one Pebble snapshot for metadata and row reads in each lookup;
+- per-bucket Route snapshots and a durable 10,000-revision compact Route
+  invalidation feed that returns an explicit reset after compaction;
 - explicit replica-range deletion only after committed membership removal.
 
 Dragonboat groups enable `CheckQuorum`, `PreVote`, ordered configuration
@@ -55,11 +57,12 @@ and the signed manifest, never by memberlist or leader visibility.
 | Quorum commit before success | synchronous Dragonboat proposals return only after apply; ambiguous outcomes are resolved by a strong read |
 | Replica-local positive reads | Dragonboat stale reads expose only locally applied READY/positive rows; local miss and non-ready rows return leader outcomes |
 | Strong reads | Dragonboat `SyncRead` supplies the leader/read-index path and applied barriers |
+| List and watch | each `(group, route_bucket)` range is read from one Pebble snapshot with its shard revision; durable change rows use committed indexes and a compacted cursor returns reset |
 | Snapshot and catch-up | on-disk snapshot stream plus learner catch-up proof from an exact target replica's linearizable read |
 | Safe membership change | signed next manifest, learner add, applied barrier, promotion confirmation, old-replica removal, epoch activation, old-Permit drain, and epoch retirement |
 | Generation fencing | signed anti-rollback manifest guard, explicit enrollment, System closure proof, and bounded Serve Permit identities |
 | Fence compaction | full monotonic retention wait, durable outbox ACK or permanent NodeEpoch fence, and exact-voter applied-index probes |
-| Encrypted storage | runtime startup requires a platform storage attestor for NodeHost, WAL, and Pebble paths |
+| Encrypted storage | runtime startup requires a platform storage attestor for NodeHost, WAL, Pebble, manifest guard, and enrollment paths |
 
 The runtime deliberately rejects generic submission of bootstrap, epoch-change,
 membership-progress, generation-closure, and fence-compaction commands. Those
@@ -87,6 +90,8 @@ Completed locally on a 4-vCPU, 3.6 GiB host:
 - real snapshot transfer to an empty learner after leader compaction;
 - learner promotion and old-voter removal;
 - shared-Pebble crash/reopen, snapshot slot switch, and replica cleanup tests;
+- Route bucket snapshot, changefeed pagination, retention reset, restart, and
+  snapshot-transfer tests;
 - five consecutive real snapshot/catch-up integration runs;
 - `GOWORK=off go test ./...`;
 - `GOWORK=off go vet ./...`.

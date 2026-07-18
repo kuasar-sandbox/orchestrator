@@ -18,15 +18,16 @@ import (
 )
 
 const (
-	stateEngineVersion  = uint32(1)
-	stateControlTable   = byte(0)
-	stateSlotTable      = byte(1)
-	stateMetadataTable  = byte(0)
-	stateRouteTable     = byte(1)
-	stateBuildTable     = byte(2)
-	stateFenceTable     = byte(3)
-	stateRecoveryBatch  = 16 << 20
-	stateMaximumKeySize = MaxRaftCommandBytes
+	stateEngineVersion    = uint32(2)
+	stateControlTable     = byte(0)
+	stateSlotTable        = byte(1)
+	stateMetadataTable    = byte(0)
+	stateRouteTable       = byte(1)
+	stateBuildTable       = byte(2)
+	stateFenceTable       = byte(3)
+	stateRouteChangeTable = byte(4)
+	stateRecoveryBatch    = 16 << 20
+	stateMaximumKeySize   = MaxRaftCommandBytes
 )
 
 var stateKeyMagic = [...]byte{'K', 'U', 'A', 'S', 'A', 'R', 'S', 'M', 1}
@@ -209,20 +210,21 @@ func decodeStateControl(raw []byte) (stateControl, error) {
 }
 
 type dataStateMetadata struct {
-	Initialized        bool             `json:"initialized"`
-	ClusterID          string           `json:"cluster_id"`
-	StorageGeneration  string           `json:"storage_generation"`
-	ShardID            uint32           `json:"shard_id"`
-	SchemaVersion      uint32           `json:"schema_version"`
-	ProtocolVersion    uint32           `json:"protocol_version"`
-	HashVersion        string           `json:"hash_version"`
-	RouteBucketCount   uint32           `json:"route_bucket_count"`
-	BuildBucketCount   uint32           `json:"build_bucket_count"`
-	VirtualShardCount  uint32           `json:"virtual_shard_count"`
-	ReplicaIDs         []uint64         `json:"replica_ids"`
-	PreparedReplicaIDs []uint64         `json:"prepared_replica_ids,omitempty"`
-	ServingEpochs      []PermitIdentity `json:"serving_epochs"`
-	LastApplied        uint64           `json:"last_applied"`
+	Initialized          bool             `json:"initialized"`
+	ClusterID            string           `json:"cluster_id"`
+	StorageGeneration    string           `json:"storage_generation"`
+	ShardID              uint32           `json:"shard_id"`
+	SchemaVersion        uint32           `json:"schema_version"`
+	ProtocolVersion      uint32           `json:"protocol_version"`
+	HashVersion          string           `json:"hash_version"`
+	RouteBucketCount     uint32           `json:"route_bucket_count"`
+	BuildBucketCount     uint32           `json:"build_bucket_count"`
+	VirtualShardCount    uint32           `json:"virtual_shard_count"`
+	ReplicaIDs           []uint64         `json:"replica_ids"`
+	PreparedReplicaIDs   []uint64         `json:"prepared_replica_ids,omitempty"`
+	ServingEpochs        []PermitIdentity `json:"serving_epochs"`
+	RouteChangefeedFloor uint64           `json:"route_changefeed_floor"`
+	LastApplied          uint64           `json:"last_applied"`
 }
 
 func metadataFromDataState(state DataState) dataStateMetadata {
@@ -232,9 +234,10 @@ func metadataFromDataState(state DataState) dataStateMetadata {
 		SchemaVersion: state.SchemaVersion, ProtocolVersion: state.ProtocolVersion,
 		HashVersion: state.HashVersion, RouteBucketCount: state.RouteBucketCount,
 		BuildBucketCount: state.BuildBucketCount, VirtualShardCount: state.VirtualShardCount,
-		ReplicaIDs:         append([]uint64(nil), state.ReplicaIDs...),
-		PreparedReplicaIDs: append([]uint64(nil), state.PreparedReplicaIDs...),
-		ServingEpochs:      append([]PermitIdentity(nil), state.ServingEpochs...), LastApplied: state.LastApplied,
+		ReplicaIDs:           append([]uint64(nil), state.ReplicaIDs...),
+		PreparedReplicaIDs:   append([]uint64(nil), state.PreparedReplicaIDs...),
+		ServingEpochs:        append([]PermitIdentity(nil), state.ServingEpochs...),
+		RouteChangefeedFloor: state.RouteChangefeedFloor, LastApplied: state.LastApplied,
 	}
 }
 
@@ -244,12 +247,13 @@ func (m dataStateMetadata) dataState() DataState {
 		ShardID: m.ShardID, SchemaVersion: m.SchemaVersion, ProtocolVersion: m.ProtocolVersion,
 		HashVersion: m.HashVersion, RouteBucketCount: m.RouteBucketCount,
 		BuildBucketCount: m.BuildBucketCount, VirtualShardCount: m.VirtualShardCount,
-		ReplicaIDs:         append([]uint64(nil), m.ReplicaIDs...),
-		PreparedReplicaIDs: append([]uint64(nil), m.PreparedReplicaIDs...),
-		ServingEpochs:      append([]PermitIdentity(nil), m.ServingEpochs...),
-		Routes:             make(map[string]clusterstate.RouteWorkflowRecord),
-		Builds:             make(map[string]clusterstate.BuildRecord),
-		Fences:             make(map[string]clusterstate.ExecutionFence), LastApplied: m.LastApplied,
+		ReplicaIDs:           append([]uint64(nil), m.ReplicaIDs...),
+		PreparedReplicaIDs:   append([]uint64(nil), m.PreparedReplicaIDs...),
+		ServingEpochs:        append([]PermitIdentity(nil), m.ServingEpochs...),
+		RouteChangefeedFloor: m.RouteChangefeedFloor,
+		Routes:               make(map[string]clusterstate.RouteWorkflowRecord),
+		Builds:               make(map[string]clusterstate.BuildRecord),
+		Fences:               make(map[string]clusterstate.ExecutionFence), LastApplied: m.LastApplied,
 	}
 }
 

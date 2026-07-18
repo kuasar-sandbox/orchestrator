@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sort"
 	"sync"
 	"sync/atomic"
 
@@ -15,7 +16,7 @@ import (
 )
 
 var stateSnapshotMagic = [...]byte{
-	'K', 'U', 'A', 'S', 'A', 'R', '-', 'P', 'E', 'B', 'B', 'L', 'E', '-', 'S', 'N', 'A', 'P', 1,
+	'K', 'U', 'A', 'S', 'A', 'R', '-', 'P', 'E', 'B', 'B', 'L', 'E', '-', 'S', 'N', 'A', 'P', 2,
 }
 
 type diskStateMachine struct {
@@ -178,6 +179,7 @@ func (m *diskStateMachine) updateData(entries []sm.Entry) ([]sm.Entry, error) {
 		if err := loadDataCommandRows(batch, prefix, &state, command); err != nil {
 			return nil, err
 		}
+		previousChangefeedFloor := state.RouteChangefeedFloor
 		result := ApplyDataCommand(&state, entries[index].Index, command)
 		encoded, err := encodeApplyResult(result.Applied, result)
 		if err != nil {
@@ -186,6 +188,20 @@ func (m *diskStateMachine) updateData(entries []sm.Entry) ([]sm.Entry, error) {
 		entries[index].Result = encoded
 		if result.Applied {
 			if err := persistDataCommandRow(batch, prefix, state, command); err != nil {
+				return nil, err
+			}
+			if command.Type == DataPutRoute {
+				change := state.RouteChanges[len(state.RouteChanges)-1]
+				if err := setStateJSON(batch, routeChangeRowKey(prefix, change.Revision), change); err != nil {
+					return nil, err
+				}
+			}
+		}
+		if state.RouteChangefeedFloor > previousChangefeedFloor {
+			if err := batch.DeleteRange(
+				stateTablePrefix(prefix, stateRouteChangeTable),
+				routeChangeRowKey(prefix, state.RouteChangefeedFloor+1), nil,
+			); err != nil {
 				return nil, err
 			}
 		}
@@ -308,6 +324,7 @@ func clearDataRows(state *DataState) {
 	clear(state.Routes)
 	clear(state.Builds)
 	clear(state.Fences)
+	state.RouteChanges = nil
 }
 
 func (m *diskStateMachine) Lookup(query any) (any, error) {
@@ -415,6 +432,18 @@ func (m *diskStateMachine) lookupData(
 		if found {
 			state.Builds[key] = record
 		}
+	case query.RouteBucket != nil:
+		bucket, err := lookupRouteBucketOnDisk(reader, prefix, state, *query.RouteBucket)
+		if err != nil {
+			return DataLookupResult{}, err
+		}
+		return DataLookupResult{RouteBucket: &bucket}, nil
+	case query.Changefeed != nil:
+		changefeed, err := lookupRouteChangefeedOnDisk(reader, prefix, state, *query.Changefeed)
+		if err != nil {
+			return DataLookupResult{}, err
+		}
+		return DataLookupResult{Changefeed: &changefeed}, nil
 	case query.Fence != nil:
 		key := fenceMapKey(query.Fence.Group, query.Fence.RouteKey, query.Fence.SandboxID)
 		var fence clusterstate.ExecutionFence
@@ -433,6 +462,137 @@ func (m *diskStateMachine) lookupData(
 		return DataLookupResult{Pending: &pending}, nil
 	}
 	return LookupData(state, query)
+}
+
+func lookupRouteBucketOnDisk(
+	reader pebble.Reader,
+	prefix []byte,
+	state DataState,
+	query RouteBucketLookup,
+) (RouteBucketResult, error) {
+	result := RouteBucketResult{Group: query.Group, Bucket: query.Bucket}
+	if !state.Initialized || !state.Accepts(query.Identity) {
+		result.Reason = "Route shard identity is not available"
+		return result, nil
+	}
+	if !routeBucketTargetsShard(state, query.Group, query.Bucket, query.Identity.ShardID) {
+		result.Reason = "Route bucket targets another shard"
+		return result, nil
+	}
+	result.Available = true
+	result.SnapshotRevision = state.LastApplied
+	result.Routes = make([]clusterstate.RouteWorkflowRecord, 0)
+	groupPrefix := stateRowKey(prefix, stateRouteTable, lengthKey(query.Group))
+	iterator := reader.NewIter(&pebble.IterOptions{
+		LowerBound: groupPrefix, UpperBound: prefixUpperBound(groupPrefix),
+	})
+	defer iterator.Close()
+	for valid := iterator.First(); valid; valid = iterator.Next() {
+		var record clusterstate.RouteWorkflowRecord
+		if err := decodeJSONValue(iterator.Value(), &record); err != nil {
+			return RouteBucketResult{}, err
+		}
+		mapKey := string(iterator.Key()[len(stateTablePrefix(prefix, stateRouteTable)):])
+		if err := validateStoredRoute(state, mapKey, record); err != nil {
+			return RouteBucketResult{}, err
+		}
+		bucket, _, err := clusterstate.RouteShardFor(
+			record.Group, record.RouteKey, state.RouteBucketCount, state.VirtualShardCount,
+		)
+		if err != nil {
+			return RouteBucketResult{}, err
+		}
+		if bucket == query.Bucket {
+			result.Routes = append(result.Routes, record)
+		}
+	}
+	if err := iterator.Error(); err != nil {
+		return RouteBucketResult{}, err
+	}
+	sort.Slice(result.Routes, func(left, right int) bool {
+		return result.Routes[left].RouteKey < result.Routes[right].RouteKey
+	})
+	return result, nil
+}
+
+func lookupRouteChangefeedOnDisk(
+	reader pebble.Reader,
+	prefix []byte,
+	state DataState,
+	query RouteChangefeedLookup,
+) (RouteChangefeedResult, error) {
+	result := RouteChangefeedResult{
+		FloorRevision: state.RouteChangefeedFloor, HeadRevision: state.LastApplied,
+		CursorRevision: query.AfterRevision, Changes: make([]RouteChange, 0),
+	}
+	if !state.Initialized || !state.Accepts(query.Identity) {
+		result.Reason = "Route shard identity is not available"
+		return result, nil
+	}
+	if !routeBucketTargetsShard(state, query.Group, query.Bucket, query.Identity.ShardID) {
+		result.Reason = "Route bucket targets another shard"
+		return result, nil
+	}
+	if query.AfterRevision > state.LastApplied {
+		result.Reason = "Route changefeed position is ahead of local applied state"
+		return result, nil
+	}
+	result.Available = true
+	if query.AfterRevision < state.RouteChangefeedFloor {
+		result.Reset = true
+		result.CursorRevision = state.LastApplied
+		return result, nil
+	}
+	if query.AfterRevision == ^uint64(0) {
+		return result, nil
+	}
+
+	scanLimit := int(query.Limit) * 16
+	if scanLimit < 256 {
+		scanLimit = 256
+	}
+	if scanLimit > 16_384 {
+		scanLimit = 16_384
+	}
+	tablePrefix := stateTablePrefix(prefix, stateRouteChangeTable)
+	iterator := reader.NewIter(&pebble.IterOptions{
+		LowerBound: routeChangeRowKey(prefix, query.AfterRevision+1),
+		UpperBound: prefixUpperBound(tablePrefix),
+	})
+	defer iterator.Close()
+	exhausted := true
+	scanned := 0
+	for valid := iterator.First(); valid; valid = iterator.Next() {
+		if scanned == scanLimit || len(result.Changes) == int(query.Limit) {
+			exhausted = false
+			break
+		}
+		var change RouteChange
+		if err := decodeJSONValue(iterator.Value(), &change); err != nil {
+			return RouteChangefeedResult{}, err
+		}
+		if err := validateRouteChange(state, change); err != nil {
+			return RouteChangefeedResult{}, err
+		}
+		scanned++
+		result.CursorRevision = change.Revision
+		if change.Bucket == query.Bucket && change.Group == query.Group {
+			result.Changes = append(result.Changes, change)
+		}
+	}
+	if err := iterator.Error(); err != nil {
+		return RouteChangefeedResult{}, err
+	}
+	if exhausted {
+		result.CursorRevision = state.LastApplied
+	}
+	return result, nil
+}
+
+func routeChangeRowKey(prefix []byte, revision uint64) []byte {
+	key := make([]byte, 8)
+	binary.BigEndian.PutUint64(key, revision)
+	return stateRowKey(prefix, stateRouteChangeTable, string(key))
 }
 
 func lookupPendingOnDisk(
@@ -789,6 +949,19 @@ func (m *diskStateMachine) validateSnapshotRecord(
 			return err
 		}
 		return validateStoredFence(*dataState, mapKey, fence)
+	case stateRouteChangeTable:
+		if len(mapKey) != 8 {
+			return errors.New("raftstore: malformed Route change snapshot key")
+		}
+		var change RouteChange
+		if err := decodeJSONValue(value, &change); err != nil {
+			return err
+		}
+		if change.Revision != binary.BigEndian.Uint64([]byte(mapKey)) ||
+			change.Revision <= dataState.RouteChangefeedFloor {
+			return errors.New("raftstore: Route change snapshot key differs from its revision")
+		}
+		return validateRouteChange(*dataState, change)
 	default:
 		return errors.New("raftstore: data snapshot contains an unknown table")
 	}

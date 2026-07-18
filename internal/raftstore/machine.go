@@ -224,6 +224,7 @@ func cloneDataStateForLookup(state DataState) DataState {
 	clone.ReplicaIDs = append([]uint64(nil), state.ReplicaIDs...)
 	clone.PreparedReplicaIDs = append([]uint64(nil), state.PreparedReplicaIDs...)
 	clone.ServingEpochs = append([]PermitIdentity(nil), state.ServingEpochs...)
+	clone.RouteChanges = append([]RouteChange(nil), state.RouteChanges...)
 	clone.Routes = make(map[string]clusterstate.RouteWorkflowRecord, len(state.Routes))
 	for key, record := range state.Routes {
 		clone.Routes[key] = cloneRouteRecord(record)

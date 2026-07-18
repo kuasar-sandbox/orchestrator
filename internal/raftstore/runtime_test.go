@@ -680,6 +680,20 @@ func TestRuntimePredecessorDrainUsesFullMonotonicWait(t *testing.T) {
 	}
 }
 
+func TestRuntimeRejectsUnprovenGenericSystemLifecycleCommands(t *testing.T) {
+	runtime := &Runtime{}
+	commands := []SystemCommand{
+		{Type: SystemSetGates, Gates: &GateUpdate{Serve: true, Write: true, Cutover: true}},
+		{Type: SystemBeginRecovery, Recovery: &RecoveryEpoch{}},
+		{Type: SystemAdvanceRecovery, RecoveryAdvance: &RecoveryAdvance{}},
+	}
+	for _, command := range commands {
+		if _, err := runtime.ApplySystem(context.Background(), command); err == nil {
+			t.Fatalf("generic System operation accepted %s", command.Type)
+		}
+	}
+}
+
 func TestRuntimeClosesGenerationOnlyForCompleteSuccessorIntent(t *testing.T) {
 	manifest := testManifest(2, "generation-1")
 	digest, err := manifest.Digest()

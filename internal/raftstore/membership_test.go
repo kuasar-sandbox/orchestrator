@@ -58,6 +58,7 @@ func TestLocalReplicaRemovalResumesAfterCleanupFailure(t *testing.T) {
 		t.Fatalf("failed cleanup state = %s", runtime.enrollment.Replicas[0].LocalState)
 	}
 	delete(host.memberships, shardID)
+	delete(host.history, [2]uint64{shardID, replica.ReplicaID})
 	host.stopErr = dragonboat.ErrShardNotFound
 	if err := runtime.RemoveLocalReplicaData(context.Background(), shardID); err != nil {
 		t.Fatal(err)
@@ -65,7 +66,7 @@ func TestLocalReplicaRemovalResumesAfterCleanupFailure(t *testing.T) {
 	if runtime.enrollment.Replicas[0].LocalState != ReplicaRemoved {
 		t.Fatalf("completed cleanup state = %s", runtime.enrollment.Replicas[0].LocalState)
 	}
-	if host.stopCalls != 2 || host.removeCalls != 2 {
+	if host.stopCalls != 1 || host.removeCalls != 2 {
 		t.Fatalf("cleanup calls: stop=%d remove=%d", host.stopCalls, host.removeCalls)
 	}
 	if err := runtime.startReplica(0); !errors.Is(err, ErrNoLocalReplica) {

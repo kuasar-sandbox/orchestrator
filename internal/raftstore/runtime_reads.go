@@ -12,8 +12,9 @@ func (r *Runtime) ApplySystem(ctx context.Context, command SystemCommand) (Syste
 	if command.Type == SystemBootstrap || command.Type == SystemRefreshPermit || command.Type == SystemConfirmDrain ||
 		command.Type == SystemAdvanceTransition || command.Type == SystemActivateTransition ||
 		command.Type == SystemConfirmTransitionDrain || command.Type == SystemFinalizeTransition ||
-		command.Type == SystemCloseGeneration {
-		return SystemApplyResult{}, errors.New("raftstore: use the dedicated bootstrap/permit operation")
+		command.Type == SystemCloseGeneration || command.Type == SystemSetGates ||
+		command.Type == SystemBeginRecovery || command.Type == SystemAdvanceRecovery {
+		return SystemApplyResult{}, errors.New("raftstore: System lifecycle command requires its dedicated workflow")
 	}
 	if command.Type == SystemBeginTransition {
 		if command.Transition == nil || command.Transition.Version != r.manifest.ManifestVersion ||
@@ -231,6 +232,10 @@ func lookupIdentity(query DataLookup) (ShardRequestIdentity, uint32, bool) {
 		return shardIdentityFromRoute(query.Route.RequestIdentity), query.Route.ShardID, query.Route.Strong
 	case query.Build != nil:
 		return shardIdentityFromRoute(query.Build.RequestIdentity), query.Build.ShardID, query.Build.Strong
+	case query.RouteBucket != nil:
+		return query.RouteBucket.Identity, query.RouteBucket.Identity.ShardID, query.RouteBucket.Strong
+	case query.Changefeed != nil:
+		return query.Changefeed.Identity, query.Changefeed.Identity.ShardID, query.Changefeed.Strong
 	case query.Fence != nil:
 		return query.Fence.Identity, query.Fence.Identity.ShardID, true
 	default:

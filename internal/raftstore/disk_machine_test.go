@@ -165,6 +165,56 @@ func TestPebbleInitialBootstrapClearsUncommittedSnapshotSlot(t *testing.T) {
 	}
 }
 
+func TestPebbleRouteChangefeedCompactionForcesReset(t *testing.T) {
+	engine, err := OpenPebbleStateEngine(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close()
+	manifest := testManifest(4, "generation-changefeed")
+	group, routeKey := "/changefeed", "route"
+	identity := routeShardIdentity(t, manifest, group, routeKey)
+	machine := engine.NewStateMachine(DataRaftShardID(identity.ShardID), 1)
+	if _, err := machine.Open(make(chan struct{})); err != nil {
+		t.Fatal(err)
+	}
+	bootstrap, _ := NewDataShardBootstrap(manifest, identity.ShardID)
+	applyDiskData(t, machine, 1, DataCommand{
+		Type: DataInitializeShard, Identity: identity, Bootstrap: &bootstrap,
+		ReplicaIDs: append([]uint64(nil), bootstrap.ReplicaIDs...),
+	})
+	starting := routeStarting(t, manifest, group, routeKey, "sandbox-changefeed", 1, true)
+	applyDiskData(t, machine, 2, DataCommand{
+		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{Absent: true}, Route: &starting,
+	})
+	raw, err := EncodeDataCommand(DataCommand{
+		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{LogIndex: 999}, Route: &starting,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries, err := machine.Update([]sm.Entry{{Index: RouteChangefeedRetentionRevisions + 2, Cmd: raw}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var conflict DataApplyResult
+	if err := json.Unmarshal(entries[0].Result.Data, &conflict); err != nil || !conflict.Conflict {
+		t.Fatalf("compaction-driving conflict = %+v, %v", conflict, err)
+	}
+	bucket, _, _ := clusterstate.RouteShardFor(group, routeKey, manifest.RouteBucketCount, manifest.VirtualShardCount)
+	value, err := machine.Lookup(DataLookup{Changefeed: &RouteChangefeedLookup{
+		Identity: identity, Group: group, Bucket: bucket, AfterRevision: 1, Limit: 10,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	changefeed := value.(DataLookupResult).Changefeed
+	if changefeed == nil || !changefeed.Available || !changefeed.Reset ||
+		changefeed.FloorRevision != 2 || changefeed.HeadRevision != RouteChangefeedRetentionRevisions+2 {
+		t.Fatalf("compacted on-disk Route changefeed = %+v", changefeed)
+	}
+}
+
 func TestPebbleStateMachineAppliesOneDragonboatBatchAtomically(t *testing.T) {
 	engine, err := OpenPebbleStateEngine(t.TempDir())
 	if err != nil {
@@ -369,5 +419,31 @@ func assertDiskReady(
 	result := value.(DataLookupResult)
 	if result.Route == nil || result.Route.Outcome != routeapi.ReadReady || result.Route.RouteRevision != 3 {
 		t.Fatalf("on-disk READY lookup = %+v", result.Route)
+	}
+	bucket, _, err := clusterstate.RouteShardFor(group, routeKey, 16, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	value, err = machine.Lookup(DataLookup{RouteBucket: &RouteBucketLookup{
+		Identity: identity, Group: group, Bucket: bucket,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bucketResult := value.(DataLookupResult).RouteBucket
+	if bucketResult == nil || !bucketResult.Available || bucketResult.SnapshotRevision != 3 ||
+		len(bucketResult.Routes) != 1 || bucketResult.Routes[0].RouteKey != routeKey {
+		t.Fatalf("on-disk Route bucket lookup = %+v", bucketResult)
+	}
+	value, err = machine.Lookup(DataLookup{Changefeed: &RouteChangefeedLookup{
+		Identity: identity, Group: group, Bucket: bucket, AfterRevision: 1, Limit: 10,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	changefeed := value.(DataLookupResult).Changefeed
+	if changefeed == nil || !changefeed.Available || changefeed.Reset || changefeed.CursorRevision != 3 ||
+		len(changefeed.Changes) != 2 || changefeed.Changes[0].Revision != 2 || changefeed.Changes[1].Revision != 3 {
+		t.Fatalf("on-disk Route changefeed = %+v", changefeed)
 	}
 }

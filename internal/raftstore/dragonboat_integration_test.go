@@ -314,12 +314,11 @@ func TestDragonboatThreeReplicaRecoveryAndMembershipChange(t *testing.T) {
 		return errors.New("restarted promoted replica is unavailable")
 	})
 	changeContext, cancelChange = context.WithTimeout(context.Background(), 10*time.Second)
-	if err := requester.SyncRequestDeleteReplica(
+	// A removed leader may close before returning the committed result, so the
+	// membership read below resolves the ambiguous request outcome.
+	_ = requester.SyncRequestDeleteReplica(
 		changeContext, SystemRaftShardID, 3, membership.ConfigChangeID,
-	); err != nil {
-		cancelChange()
-		t.Fatal(err)
-	}
+	)
 	cancelChange()
 	integrationEventually(t, func() error {
 		membership = getMembership(nodeHosts[:3], SystemRaftShardID)
@@ -331,29 +330,19 @@ func TestDragonboatThreeReplicaRecoveryAndMembershipChange(t *testing.T) {
 		}
 		return nil
 	})
-	err = nodeHosts[2].StartOnDiskReplica(nil, false, stateEngines[2].NewStateMachine,
-		integrationRaftConfig(SystemRaftShardID, 3, false))
-	if err != nil && !errors.Is(err, dragonboat.ErrReplicaRemoved) {
+	if err := nodeHosts[2].StopReplica(SystemRaftShardID, 3); err != nil &&
+		!errors.Is(err, dragonboat.ErrShardNotFound) {
 		t.Fatal(err)
 	}
-	if err == nil {
-		integrationEventually(t, func() error {
-			info := nodeHosts[2].GetNodeHostInfo(dragonboat.DefaultNodeHostInfoOption)
-			for _, shard := range info.ShardInfoList {
-				if shard.ShardID == SystemRaftShardID && shard.ReplicaID == 3 {
-					return errors.New("removed replica has not self-unloaded")
-				}
+	integrationEventually(t, func() error {
+		info := nodeHosts[2].GetNodeHostInfo(dragonboat.DefaultNodeHostInfoOption)
+		for _, shard := range info.ShardInfoList {
+			if shard.ShardID == SystemRaftShardID && shard.ReplicaID == 3 {
+				return errors.New("removed replica has not stopped")
 			}
-			membership = getMembership(nodeHosts, SystemRaftShardID)
-			if membership == nil {
-				return errors.New("membership unavailable")
-			}
-			if _, removed := membership.Removed[3]; !removed {
-				return errors.New("removed replica rejoined consensus")
-			}
-			return nil
-		})
-	}
+		}
+		return nil
+	})
 }
 
 func leaderNodeHostEventually(

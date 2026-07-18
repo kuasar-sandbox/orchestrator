@@ -638,9 +638,9 @@ func (r *Runtime) RemoveLocalReplicaData(ctx context.Context, shardID uint64) er
 			!errors.Is(err, dragonboat.ErrShardNotFound) {
 			return err
 		}
-		if err := r.nodeHost.SyncRemoveData(ctx, shardID, replica.ReplicaID); err != nil {
-			return err
-		}
+	}
+	if err := r.nodeHost.SyncRemoveData(ctx, shardID, replica.ReplicaID); err != nil {
+		return err
 	}
 	if err := r.stateEngine.RemoveReplica(shardID, replica.ReplicaID); err != nil {
 		return err

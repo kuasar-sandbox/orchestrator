@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	dbconfig "github.com/lni/dragonboat/v4/config"
@@ -190,10 +191,20 @@ func (c RuntimeConfig) digest(manifest Manifest, member RegistryMember) (string,
 }
 
 func (c RuntimeConfig) attestStorage() error {
-	paths := []string{c.NodeHostDir, c.StateEngineDir}
-	if c.WALDir != "" && filepath.Clean(c.WALDir) != filepath.Clean(c.NodeHostDir) {
-		paths = append(paths, c.WALDir)
+	directories := map[string]struct{}{
+		filepath.Clean(c.NodeHostDir):     {},
+		filepath.Clean(c.StateEngineDir):  {},
+		filepath.Dir(c.ManifestGuardPath): {},
+		filepath.Dir(c.EnrollmentPath):    {},
 	}
+	if c.WALDir != "" {
+		directories[filepath.Clean(c.WALDir)] = struct{}{}
+	}
+	paths := make([]string, 0, len(directories))
+	for path := range directories {
+		paths = append(paths, path)
+	}
+	sort.Strings(paths)
 	for _, path := range paths {
 		if err := os.MkdirAll(path, 0o700); err != nil {
 			return err

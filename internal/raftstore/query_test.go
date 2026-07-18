@@ -141,6 +141,74 @@ func TestPendingLookupRecoversCommittedWorkflowIntentOnly(t *testing.T) {
 	}
 }
 
+func TestRouteBucketSnapshotAndChangefeedUseShardRevisions(t *testing.T) {
+	manifest := testManifest(4, "generation-1")
+	group := "/g"
+	firstKey := "rk"
+	bucket, _, err := clusterstate.RouteShardFor(
+		group, firstKey, manifest.RouteBucketCount, manifest.VirtualShardCount,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := routeShardIdentity(t, manifest, group, firstKey)
+	state := initializeDataShard(t, manifest, identity)
+	first := routeStarting(t, manifest, group, firstKey, "sandbox-1", 1, true)
+	applyDataOK(t, &state, 2, DataCommand{
+		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{Absent: true}, Route: &first,
+	})
+	ready := readyRecord(first, 1)
+	applyDataOK(t, &state, 3, DataCommand{
+		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{LogIndex: 2}, Route: &ready,
+	})
+
+	secondKey := routeKeyForBucket(t, manifest, group, bucket, "second")
+	second := routeStarting(t, manifest, group, secondKey, "sandbox-2", 1, true)
+	applyDataOK(t, &state, 4, DataCommand{
+		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{Absent: true}, Route: &second,
+	})
+	otherGroup := "/other"
+	otherKey := routeKeyForShard(t, manifest, otherGroup, identity.ShardID, "other")
+	other := routeStarting(t, manifest, otherGroup, otherKey, "sandbox-3", 1, true)
+	applyDataOK(t, &state, 5, DataCommand{
+		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{Absent: true}, Route: &other,
+	})
+
+	list := lookupRouteBucket(state, RouteBucketLookup{Identity: identity, Group: group, Bucket: bucket})
+	if !list.Available || list.SnapshotRevision != 5 || len(list.Routes) != 2 ||
+		list.Routes[0].RouteKey != firstKey || list.Routes[1].RouteKey != secondKey {
+		t.Fatalf("Route bucket snapshot = %+v", list)
+	}
+	list.Routes[0].Ready.AccessToken = "mutated"
+	if state.Routes[routeMapKey(group, firstKey)].Ready.AccessToken == "mutated" {
+		t.Fatal("Route bucket snapshot aliases consensus state")
+	}
+
+	page := lookupRouteChangefeed(state, RouteChangefeedLookup{
+		Identity: identity, Group: group, Bucket: bucket, AfterRevision: 1, Limit: 2,
+	})
+	if !page.Available || page.Reset || len(page.Changes) != 2 || page.Changes[0].Revision != 2 ||
+		page.Changes[0].RouteKey != firstKey || page.Changes[0].State != clusterstate.WorkflowRouteStarting ||
+		page.Changes[1].Revision != 3 || page.Changes[1].State != clusterstate.WorkflowRouteReady ||
+		page.CursorRevision != 3 || page.HeadRevision != 5 {
+		t.Fatalf("first Route changefeed page = %+v", page)
+	}
+	page = lookupRouteChangefeed(state, RouteChangefeedLookup{
+		Identity: identity, Group: group, Bucket: bucket, AfterRevision: page.CursorRevision, Limit: 2,
+	})
+	if !page.Available || len(page.Changes) != 1 || page.Changes[0].Revision != 4 || page.CursorRevision != 5 {
+		t.Fatalf("second Route changefeed page = %+v", page)
+	}
+
+	advanceDataApplied(&state, RouteChangefeedRetentionRevisions+10)
+	reset := lookupRouteChangefeed(state, RouteChangefeedLookup{
+		Identity: identity, Group: group, Bucket: bucket, AfterRevision: 1, Limit: 1,
+	})
+	if !reset.Available || !reset.Reset || reset.FloorRevision != 10 || len(reset.Changes) != 0 {
+		t.Fatalf("compacted Route changefeed = %+v", reset)
+	}
+}
+
 func lookupRouteResult(t *testing.T, state DataState, request routeapi.ReadRouteRequest) routeapi.ReadRouteResponse {
 	t.Helper()
 	result, err := LookupData(state, DataLookup{Route: &request})
@@ -205,6 +273,22 @@ func routeKeyForShard(t *testing.T, manifest Manifest, group string, shardID uin
 		}
 	}
 	t.Fatal("no Route key mapped to test shard")
+	return ""
+}
+
+func routeKeyForBucket(t *testing.T, manifest Manifest, group string, bucket uint32, prefix string) string {
+	t.Helper()
+	for index := 0; index < 10000; index++ {
+		key := fmt.Sprintf("%s-%d", prefix, index)
+		got, _, err := clusterstate.RouteShardFor(group, key, manifest.RouteBucketCount, manifest.VirtualShardCount)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got == bucket {
+			return key
+		}
+	}
+	t.Fatal("no Route key mapped to test bucket")
 	return ""
 }
 
