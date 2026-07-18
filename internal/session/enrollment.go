@@ -32,12 +32,16 @@ func (r IdentityRetirement) Validate() error {
 	return nil
 }
 
-// EnrollmentAuthority checks registration against the explicitly enrolled node
-// identity. Implementations must reject unknown or retired identities and an
-// epoch whose data endpoint differs from enrollment. Permanent retirement must
-// close registration before it can be confirmed, so Holders can then discard
-// the corresponding tuple high watermark without allowing the identity back.
+// EnrollmentAuthority serializes registration installation and permanent
+// retirement for each explicitly enrolled node identity. Implementations must
+// reject unknown or retired identities and an epoch whose data endpoint differs
+// from enrollment. The callback must run at most once while that identity is
+// protected from the opposite operation; a completed retirement therefore
+// cannot race with a previously validated registration installation. Before a
+// callback starts, the authority may reject without calling it. Once started,
+// the method must return that callback's result and cannot report a later error
+// after the Holder has published the state change.
 type EnrollmentAuthority interface {
-	ValidateSessionRegistration(context.Context, NodeEnrollment) error
-	ValidateIdentityRetirement(context.Context, IdentityRetirement) error
+	RunSessionRegistration(context.Context, NodeEnrollment, func() error) error
+	RunIdentityRetirement(context.Context, IdentityRetirement, func() (bool, error)) (bool, error)
 }

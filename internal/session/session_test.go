@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -43,8 +44,51 @@ func (p *testPublisher) PublishSessionDelta(delta DirectoryDelta) {
 }
 
 type testEnrollmentAuthority struct {
+	mu      sync.Mutex
 	active  map[string]NodeEnrollment
 	retired map[string]IdentityRetirement
+}
+
+type serializedEnrollmentAuthority struct {
+	mu                   sync.Mutex
+	enrollment           NodeEnrollment
+	registrationEntered  chan struct{}
+	continueRegistration chan struct{}
+	retired              bool
+}
+
+func (a *serializedEnrollmentAuthority) RunSessionRegistration(
+	ctx context.Context,
+	enrollment NodeEnrollment,
+	install func() error,
+) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.retired || enrollment != a.enrollment {
+		return errors.New("identity is not enrolled")
+	}
+	close(a.registrationEntered)
+	select {
+	case <-a.continueRegistration:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	return install()
+}
+
+func (a *serializedEnrollmentAuthority) RunIdentityRetirement(
+	_ context.Context,
+	retirement IdentityRetirement,
+	remove func() (bool, error),
+) (bool, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if retirement.NodeID != a.enrollment.NodeID || retirement.EnrollmentID != a.enrollment.EnrollmentID ||
+		retirement.LastNodeEpoch < a.enrollment.NodeEpoch {
+		return false, errors.New("identity retirement is not committed")
+	}
+	a.retired = true
+	return remove()
 }
 
 func newTestEnrollmentAuthority(registrations ...Registration) *testEnrollmentAuthority {
@@ -58,6 +102,8 @@ func newTestEnrollmentAuthority(registrations ...Registration) *testEnrollmentAu
 }
 
 func (a *testEnrollmentAuthority) enroll(registration Registration) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	a.active[registration.NodeID] = NodeEnrollment{
 		NodeID: registration.NodeID, EnrollmentID: registration.EnrollmentID,
 		NodeEpoch: registration.NodeEpoch, DataEndpoint: registration.DataEndpoint,
@@ -65,11 +111,15 @@ func (a *testEnrollmentAuthority) enroll(registration Registration) {
 }
 
 func (a *testEnrollmentAuthority) retire(retirement IdentityRetirement) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	a.retired[retirement.NodeID] = retirement
 	delete(a.active, retirement.NodeID)
 }
 
-func (a *testEnrollmentAuthority) ValidateSessionRegistration(_ context.Context, enrollment NodeEnrollment) error {
+func (a *testEnrollmentAuthority) RunSessionRegistration(_ context.Context, enrollment NodeEnrollment, install func() error) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	current, found := a.active[enrollment.NodeID]
 	if !found {
 		return errors.New("identity is not enrolled")
@@ -83,15 +133,21 @@ func (a *testEnrollmentAuthority) ValidateSessionRegistration(_ context.Context,
 	if enrollment.DataEndpoint != current.DataEndpoint {
 		return ErrEndpointChanged
 	}
-	return nil
+	return install()
 }
 
-func (a *testEnrollmentAuthority) ValidateIdentityRetirement(_ context.Context, retirement IdentityRetirement) error {
+func (a *testEnrollmentAuthority) RunIdentityRetirement(
+	_ context.Context,
+	retirement IdentityRetirement,
+	remove func() (bool, error),
+) (bool, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	current, found := a.retired[retirement.NodeID]
 	if !found || current != retirement {
-		return errors.New("identity retirement is not committed")
+		return false, errors.New("identity retirement is not committed")
 	}
-	return nil
+	return remove()
 }
 
 func TestHolderAcceptsOnlyIncreasingTupleAndFencesOldStream(t *testing.T) {
@@ -126,6 +182,26 @@ func TestHolderAcceptsOnlyIncreasingTupleAndFencesOldStream(t *testing.T) {
 	}
 	if len(publisher.deltas) != 2 || !publisher.deltas[0].Up || !publisher.deltas[1].Up {
 		t.Fatalf("published deltas = %+v", publisher.deltas)
+	}
+}
+
+func TestHolderAcceptsBuildOnlyRegistration(t *testing.T) {
+	registration := testRegistration("build-node", 1, 1, "10.0.0.2:8443")
+	registration.SandboxSlots = 0
+	authority := newTestEnrollmentAuthority(registration)
+	holder, err := NewHolder("registry-a", 1, nil, testGate(true), nil, authority)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := holder.Register(context.Background(), registration, &testEndpoint{})
+	if err != nil {
+		t.Fatalf("build-only registration: %v", err)
+	}
+	lease.Close()
+
+	registration.BuildSlots = 0
+	if _, err := holder.Register(context.Background(), registration, &testEndpoint{}); err == nil {
+		t.Fatal("registration without sandbox or build capacity was accepted")
 	}
 }
 
@@ -194,6 +270,62 @@ func TestHolderDropsHighWatermarkOnlyAfterCommittedIdentityRetirement(t *testing
 	}
 	if _, err := holder.Register(context.Background(), registration, &testEndpoint{}); err == nil {
 		t.Fatal("retired identity registered again")
+	}
+}
+
+func TestHolderSerializesRegistrationInstallationWithRetirement(t *testing.T) {
+	registration := testRegistration("node-1", 7, 10, "10.0.0.1:8443")
+	authority := &serializedEnrollmentAuthority{
+		enrollment: NodeEnrollment{
+			NodeID: registration.NodeID, EnrollmentID: registration.EnrollmentID,
+			NodeEpoch: registration.NodeEpoch, DataEndpoint: registration.DataEndpoint,
+		},
+		registrationEntered:  make(chan struct{}),
+		continueRegistration: make(chan struct{}),
+	}
+	publisher := &testPublisher{}
+	holder, err := NewHolder("registry-a", 1, nil, testGate(true), publisher, authority)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registerResult := make(chan error, 1)
+	go func() {
+		_, err := holder.Register(context.Background(), registration, &testEndpoint{})
+		registerResult <- err
+	}()
+	<-authority.registrationEntered
+
+	retireResult := make(chan error, 1)
+	go func() {
+		removed, err := holder.RetireIdentity(context.Background(), IdentityRetirement{
+			NodeID: registration.NodeID, EnrollmentID: registration.EnrollmentID,
+			LastNodeEpoch: registration.NodeEpoch,
+		})
+		if err == nil && !removed {
+			err = errors.New("retirement did not remove installed registration")
+		}
+		retireResult <- err
+	}()
+	select {
+	case err := <-retireResult:
+		t.Fatalf("retirement bypassed in-flight installation: %v", err)
+	default:
+	}
+	close(authority.continueRegistration)
+	if err := <-registerResult; err != nil {
+		t.Fatalf("registration: %v", err)
+	}
+	if err := <-retireResult; err != nil {
+		t.Fatalf("retirement: %v", err)
+	}
+	if holder.Active() != 0 || holder.TrackedIdentities() != 0 {
+		t.Fatalf("retired identity remained installed: active=%d tracked=%d", holder.Active(), holder.TrackedIdentities())
+	}
+	if len(publisher.deltas) != 2 || !publisher.deltas[0].Up || publisher.deltas[1].Up {
+		t.Fatalf("registration/retirement publication order = %+v", publisher.deltas)
+	}
+	if _, err := holder.Register(context.Background(), registration, &testEndpoint{}); err == nil {
+		t.Fatal("registration installed after retirement completed")
 	}
 }
 
@@ -385,6 +517,52 @@ func TestDirectoryDigestAndFullMergeAreDeterministic(t *testing.T) {
 	}
 	if _, ok := directory.Lookup("b"); ok {
 		t.Fatal("conflicting record became available")
+	}
+}
+
+func TestDirectoryConflictCanonicalizesAcrossArrivalOrder(t *testing.T) {
+	a := DirectoryEntry{NodeID: "node-1", Tuple: Tuple{NodeEpoch: 3, SessionSeq: 7}, HolderMemberID: "registry-a"}
+	b := a
+	b.HolderMemberID = "registry-b"
+	left := NewDirectory()
+	right := NewDirectory()
+	left.Apply(DirectoryDelta{Entry: a, Up: true})
+	left.Apply(DirectoryDelta{Entry: b, Up: true})
+	right.Apply(DirectoryDelta{Entry: b, Up: true})
+	right.Apply(DirectoryDelta{Entry: a, Up: true})
+
+	leftSnapshot := left.Snapshot()
+	rightSnapshot := right.Snapshot()
+	if len(leftSnapshot) != 1 || len(rightSnapshot) != 1 ||
+		leftSnapshot[0].Entry.HolderMemberID != "registry-a" ||
+		rightSnapshot[0].Entry.HolderMemberID != "registry-a" ||
+		!leftSnapshot[0].Conflict || !rightSnapshot[0].Conflict {
+		t.Fatalf("canonical conflicts: left=%+v right=%+v", leftSnapshot, rightSnapshot)
+	}
+	if DirectoryDigest(leftSnapshot) != DirectoryDigest(rightSnapshot) {
+		t.Fatal("split-holder conflicts retained arrival-order-dependent digests")
+	}
+}
+
+func TestDirectoryFullMergeSkipsInvalidConflictRecords(t *testing.T) {
+	directory := NewDirectory()
+	healthy := DirectoryEntry{
+		NodeID: "node-1", Tuple: Tuple{NodeEpoch: 3, SessionSeq: 7}, HolderMemberID: "registry-a",
+	}
+	directory.Apply(DirectoryDelta{Entry: healthy, Up: true})
+	invalid := DirectoryRecord{
+		Entry:    DirectoryEntry{NodeID: healthy.NodeID, Tuple: healthy.Tuple},
+		Conflict: true,
+	}
+	zero := DirectoryRecord{Conflict: true}
+	if changed := directory.MergeFull([]DirectoryRecord{invalid, zero}); changed != 0 {
+		t.Fatalf("invalid merge changed %d records", changed)
+	}
+	if got, ok := directory.Lookup(healthy.NodeID); !ok || got != healthy {
+		t.Fatalf("healthy entry after malformed merge = %+v, %v", got, ok)
+	}
+	if len(directory.Snapshot()) != 1 {
+		t.Fatalf("malformed merge poisoned directory: %+v", directory.Snapshot())
 	}
 }
 

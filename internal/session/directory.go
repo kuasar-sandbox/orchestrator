@@ -59,9 +59,20 @@ func NewDirectory() *Directory {
 	return &Directory{records: make(map[string]DirectoryRecord)}
 }
 
+func validDirectoryEntry(entry DirectoryEntry) bool {
+	return entry.NodeID != "" && entry.Tuple.Valid() && entry.HolderMemberID != ""
+}
+
+func canonicalHolder(first, second string) string {
+	if second < first {
+		return second
+	}
+	return first
+}
+
 func (d *Directory) Apply(delta DirectoryDelta) bool {
 	entry := delta.Entry
-	if entry.NodeID == "" || !entry.Tuple.Valid() || entry.HolderMemberID == "" {
+	if !validDirectoryEntry(entry) {
 		return false
 	}
 	d.mu.Lock()
@@ -76,13 +87,13 @@ func (d *Directory) Apply(delta DirectoryDelta) bool {
 		return false
 	}
 	if entry.HolderMemberID != current.Entry.HolderMemberID {
-		if !current.Conflict || current.Available {
-			current.Conflict = true
-			current.Available = false
-			d.records[entry.NodeID] = current
-			return true
-		}
-		return false
+		canonical := canonicalHolder(current.Entry.HolderMemberID, entry.HolderMemberID)
+		changed := !current.Conflict || current.Available || current.Entry.HolderMemberID != canonical
+		current.Entry.HolderMemberID = canonical
+		current.Conflict = true
+		current.Available = false
+		d.records[entry.NodeID] = current
+		return changed
 	}
 	if !delta.Up && current.Available {
 		current.Available = false
@@ -131,17 +142,25 @@ func (d *Directory) Snapshot() []DirectoryRecord {
 func (d *Directory) MergeFull(records []DirectoryRecord) int {
 	changed := 0
 	for _, record := range records {
+		if !validDirectoryEntry(record.Entry) {
+			continue
+		}
 		if d.Apply(DirectoryDelta{Entry: record.Entry, Up: record.Available && !record.Conflict}) {
 			changed++
 		}
 		if record.Conflict {
 			d.mu.Lock()
-			current := d.records[record.Entry.NodeID]
-			if current.Entry.Tuple.Compare(record.Entry.Tuple) == 0 && !current.Conflict {
+			current, found := d.records[record.Entry.NodeID]
+			if found && current.Entry.Tuple.Compare(record.Entry.Tuple) == 0 {
+				canonical := canonicalHolder(current.Entry.HolderMemberID, record.Entry.HolderMemberID)
+				wasChanged := !current.Conflict || current.Available || current.Entry.HolderMemberID != canonical
+				current.Entry.HolderMemberID = canonical
 				current.Conflict = true
 				current.Available = false
 				d.records[record.Entry.NodeID] = current
-				changed++
+				if wasChanged {
+					changed++
+				}
 			}
 			d.mu.Unlock()
 		}
