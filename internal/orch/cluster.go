@@ -65,6 +65,9 @@ func (o *Orchestrator) HandleCommand(ctx context.Context, cmd *routesync.Command
 		routesync.CmdRebindExecution, routesync.CmdFinalizeWorkflow:
 		return reject(cmd, errors.New("final cluster workflow executor is dormant until atomic cutover"))
 	case routesync.CmdKeyPut:
+		if cmd.KeyLease != nil || cmd.KeyLeaseRef != nil {
+			return reject(cmd, errors.New("final key-lease executor is dormant until atomic cutover"))
+		}
 		// Key distribution (cluster.md): refresh the manifest-key allowlist
 		// lease so create/build can resolve it by fingerprint. The registry sends
 		// this from node_link heartbeat maintenance, not on the Place path.
@@ -84,6 +87,9 @@ func (o *Orchestrator) HandleCommand(ctx context.Context, cmd *routesync.Command
 		}
 		return accept(cmd)
 	case routesync.CmdKeyDrop:
+		if cmd.KeyLease != nil || cmd.KeyLeaseRef != nil {
+			return reject(cmd, errors.New("final key-lease executor is dormant until atomic cutover"))
+		}
 		if err := o.dropClusterKey(ctx, cmd.KeyFingerprint); err != nil {
 			return reject(cmd, err)
 		}

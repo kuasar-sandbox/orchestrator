@@ -61,7 +61,7 @@ func (r *Registry) ServeNodeLink(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	nr := first.NodeReg
-	if nr.Version != routesync.Version {
+	if !nodeLinkVersionSupported(nr) {
 		http.Error(w, "node-link: incompatible protocol version", http.StatusBadRequest)
 		return
 	}
@@ -267,6 +267,10 @@ func (r *Registry) ServeNodeLinkRelay(w http.ResponseWriter, req *http.Request) 
 		return
 	}
 	nr := first.NodeReg
+	if !nodeLinkVersionSupported(nr) {
+		http.Error(w, "node-link relay: incompatible protocol version", http.StatusBadRequest)
+		return
+	}
 	if !r.localOwnsNodeLink(req.Context(), nr.NodeID) {
 		http.Error(w, "node-link relay: local member is not a node owner", http.StatusConflict)
 		return
@@ -274,6 +278,10 @@ func (r *Registry) ServeNodeLinkRelay(w http.ResponseWriter, req *http.Request) 
 	if err := r.serveNodeLinkLocal(req.Context(), w, flusher.Flush, body, nr); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
+}
+
+func nodeLinkVersionSupported(nr *routesync.NodeRegister) bool {
+	return nr != nil && nr.Version == routesync.Version
 }
 
 func (r *Registry) serveNodeLinkLocal(ctx context.Context, w io.Writer, flush func(), body io.Reader, nr *routesync.NodeRegister) error {

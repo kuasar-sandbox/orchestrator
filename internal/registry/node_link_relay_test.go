@@ -1,6 +1,7 @@
 package registry
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"fmt"
@@ -20,6 +21,22 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/nodelink"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 )
+
+func TestNodeLinkRelayRejectsProtocolMismatch(t *testing.T) {
+	var body bytes.Buffer
+	if err := routesync.WriteMsg(&body, &routesync.Msg{
+		Type:    routesync.TypeNodeRegister,
+		NodeReg: &routesync.NodeRegister{Version: routesync.Version - 1, NodeID: "node-old"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPut, NodeLinkRelayPath, &body)
+	w := httptest.NewRecorder()
+	(&Registry{}).ServeNodeLinkRelay(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("relay protocol mismatch status = %d, want %d", w.Code, http.StatusBadRequest)
+	}
+}
 
 func commandLocation(t *testing.T, cmd *routesync.Command) clusterstate.ObjectLocation {
 	t.Helper()

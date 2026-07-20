@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -385,6 +386,9 @@ func (o *Orchestrator) Connect(ctx context.Context, id, apiKey, migrationToken s
 		} else if sb, err = o.st.Get(ctx, id); err != nil || sb == nil {
 			return nil, api.ErrNotFound
 		}
+		if sb.State != types.StateRunning {
+			return nil, fmt.Errorf("%w: sandbox state changed during resume", api.ErrConflict)
+		}
 	}
 	if timeoutSec > 0 {
 		dl := time.Now().Add(time.Duration(timeoutSec) * time.Second).Unix()
@@ -464,7 +468,7 @@ func (o *Orchestrator) Route(ctx context.Context, request proxy.RouteRequest) (p
 	if sb.State == types.StatePaused { // auto-resume on data-plane traffic
 		if err := o.sf.Do(request.SandboxID, func() error {
 			return o.resumeIfPaused(ctx, request.SandboxID, request)
-		}); err != nil {
+		}); err != nil && !errors.Is(err, errSandboxRouteFenceChanged) {
 			return proxy.Route{}, err
 		}
 		if sb = o.lookup(request.SandboxID); sb == nil {
@@ -493,13 +497,15 @@ func (o *Orchestrator) resumeIfPaused(ctx context.Context, sid string, request p
 		sb = s
 	}
 	if _, failed := validateSandboxRouteFence(sb, request); failed {
-		return nil
+		return errSandboxRouteFenceChanged
 	}
 	if sb.State != types.StatePaused {
 		return nil
 	}
 	return o.resume(ctx, sb)
 }
+
+var errSandboxRouteFenceChanged = fmt.Errorf("%w: execution Binding changed during resume", api.ErrConflict)
 
 func validateSandboxRouteFence(sb *types.Sandbox, request proxy.RouteRequest) (proxy.Kind, bool) {
 	managed, nodeID, nodeEpoch, registryGeneration, digest, err := sandboxRouteFence(sb)
@@ -514,7 +520,13 @@ func sandboxRouteFence(sb *types.Sandbox) (bool, string, uint64, string, string,
 		return false, "", 0, "", "", nil
 	}
 	opaque := sb.Metadata[clusterstate.ObjectMetadataKey]
-	if opaque == "" || !strings.HasPrefix(opaque, clusterstate.ExecutionBindingPrefix) {
+	if opaque == "" {
+		return false, "", 0, "", "", nil
+	}
+	if strings.HasPrefix(strings.TrimSpace(opaque), "{") {
+		if _, err := clusterstate.ObjectLocationFromMetadata(sb.Metadata); err != nil {
+			return true, "", 0, "", "", err
+		}
 		return false, "", 0, "", "", nil
 	}
 	binding, err := clusterstate.DecodeExecutionBinding(opaque)

@@ -71,7 +71,9 @@ func (s *Store) CASExecutionBinding(
 		return false, nil
 	}
 	if oldBinding.NodeID != newBinding.NodeID || oldBinding.NodeEpoch != newBinding.NodeEpoch ||
-		oldBinding.Group != newBinding.Group || oldBinding.RouteKey != newBinding.RouteKey {
+		oldBinding.Group != newBinding.Group || oldBinding.RouteKey != newBinding.RouteKey ||
+		oldBinding.DemandDigest != newBinding.DemandDigest ||
+		oldBinding.DispatchSpecDigest != newBinding.DispatchSpecDigest {
 		return false, errors.New("store: replacement Binding changes immutable execution identity")
 	}
 	metadata[clusterstate.ObjectMetadataKey] = replacement
