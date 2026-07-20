@@ -293,6 +293,10 @@ sandbox:
   boot:
     kernel: $BIN/vmlinux
     runtime: $BIN/sandbox-runtime.erofs
+builder:
+  max_concurrent: 1
+  vcpu: 1
+  memory: 1GiB
 paths:
   run_root: $WORK/run
   base_root: $WORK/lib
@@ -307,8 +311,8 @@ resource_listen:
   cgroup_scan_paths:
     - /sys/fs/cgroup/sandboxes
   resources:
-    physical_memory: 4GiB
-    physical_cpu: 4
+    physical_memory: 5GiB
+    physical_cpu: 5
     host_reserved:
       memory: 512MiB
       cpu: 1
@@ -342,6 +346,10 @@ sandbox:
   boot:
     kernel: $BIN/vmlinux
     runtime: $BIN/sandbox-runtime.erofs
+builder:
+  max_concurrent: 1
+  vcpu: 1
+  memory: 64MiB
 paths:
   run_root: $WORK/run
   base_root: $WORK/lib
@@ -356,7 +364,7 @@ resource_listen:
   cgroup_scan_paths:
     - /sys/fs/cgroup/sandboxes
   # Sized for DETERMINISTIC creation-rate backpressure (Phase C), independent of
-  # startup/settle timing: allocatable_pool = (400-80)MiB * (1-0.10) = 288MiB.
+  # startup/settle timing: allocatable_pool = (464-80-64)MiB * (1-0.10) = 288MiB.
   # Each sandbox commits its 64MiB floor to NodeAllocated at admit, so the 4th
   # leaves the node at 256MiB >= the red water mark (0.85*288 = 244.8MiB) — and
   # the 5th admit is HARD-rejected with "node in zone red" (the zone gate is
@@ -364,8 +372,8 @@ resource_listen:
   # startup_factor=1.0 makes the startup pool (= allocatable_pool) fit four
   # 64MiB startup budgets, so the first four are not startup-blocked.
   resources:
-    physical_memory: 400MiB
-    physical_cpu: 4
+    physical_memory: 464MiB
+    physical_cpu: 5
     host_reserved:
       memory: 80MiB
       cpu: 0.5
