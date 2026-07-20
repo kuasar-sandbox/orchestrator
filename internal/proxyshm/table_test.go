@@ -85,7 +85,7 @@ func TestWorkerResolveWakesAndWaitsForSharedUpdate(t *testing.T) {
 	worker := NewWorkerView(tbl, updates, master.Wake, 500*time.Millisecond)
 	master.BeginSync()
 	fence := routesync.RouteEntry{
-		SandboxID: "s1", NodeID: "n1", NodeEpoch: 7, StorageGeneration: "g1", BindingDigest: "d1",
+		SandboxID: "s1", NodeID: "n1", NodeEpoch: 7, RegistryGeneration: "g1", BindingDigest: "d1",
 		Profile: "e2b", State: routesync.StatePaused,
 	}
 	master.ApplyUpsert(fence)
@@ -95,18 +95,18 @@ func TestWorkerResolveWakesAndWaitsForSharedUpdate(t *testing.T) {
 	go func() {
 		route, _ := worker.Route(context.Background(), proxy.RouteRequest{
 			SandboxID: "s1", Port: 49983, ExpectedNodeID: "n1", ExpectedNodeEpoch: 7,
-			ExpectedStorageGeneration: "g1", ExpectedBindingDigest: "d1",
+			ExpectedRegistryGeneration: "g1", ExpectedBindingDigest: "d1",
 		})
 		done <- route
 	}()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	wake, ok := master.NextWake(ctx)
-	if !ok || wake != (routesync.RouteWake{SandboxID: "s1", NodeID: "n1", NodeEpoch: 7, StorageGeneration: "g1", BindingDigest: "d1"}) {
+	if !ok || wake != (routesync.RouteWake{SandboxID: "s1", NodeID: "n1", NodeEpoch: 7, RegistryGeneration: "g1", BindingDigest: "d1"}) {
 		t.Fatalf("wake = %+v ok=%v", wake, ok)
 	}
 	master.ApplyUpsert(routesync.RouteEntry{
-		SandboxID: "s1", NodeID: "n1", NodeEpoch: 7, StorageGeneration: "g1", BindingDigest: "d1",
+		SandboxID: "s1", NodeID: "n1", NodeEpoch: 7, RegistryGeneration: "g1", BindingDigest: "d1",
 		Profile: "e2b", State: routesync.StateRunning,
 		EnvdUDS: "/run/s1/envd.sock", AccessToken: "tok",
 	})
@@ -132,14 +132,14 @@ func TestWorkerRejectsStaleFenceWithoutWake(t *testing.T) {
 	worker := NewWorkerView(tbl, nil, master.Wake, time.Second)
 	master.BeginSync()
 	master.ApplyUpsert(routesync.RouteEntry{
-		SandboxID: "s1", NodeID: "n1", NodeEpoch: 8, StorageGeneration: "g2", BindingDigest: "new",
+		SandboxID: "s1", NodeID: "n1", NodeEpoch: 8, RegistryGeneration: "g2", BindingDigest: "new",
 		Profile: "e2b", State: routesync.StatePaused,
 	})
 	master.Bookmark()
 
 	route, err := worker.Route(context.Background(), proxy.RouteRequest{
 		SandboxID: "s1", Port: 49983, ExpectedNodeID: "n1", ExpectedNodeEpoch: 7,
-		ExpectedStorageGeneration: "g1", ExpectedBindingDigest: "old",
+		ExpectedRegistryGeneration: "g1", ExpectedBindingDigest: "old",
 	})
 	if err != nil || route.Kind != proxy.KindWrongNodeEpoch {
 		t.Fatalf("route = %+v err=%v", route, err)
@@ -163,7 +163,7 @@ func TestWorkerBindingChangeWhileParkedFailsClosed(t *testing.T) {
 	worker := NewWorkerView(tbl, updates, master.Wake, time.Second)
 	master.BeginSync()
 	master.ApplyUpsert(routesync.RouteEntry{
-		SandboxID: "s1", NodeID: "n1", NodeEpoch: 7, StorageGeneration: "g1", BindingDigest: "old",
+		SandboxID: "s1", NodeID: "n1", NodeEpoch: 7, RegistryGeneration: "g1", BindingDigest: "old",
 		Profile: "e2b", State: routesync.StatePaused,
 	})
 	master.Bookmark()
@@ -172,7 +172,7 @@ func TestWorkerBindingChangeWhileParkedFailsClosed(t *testing.T) {
 	go func() {
 		route, _ := worker.Route(context.Background(), proxy.RouteRequest{
 			SandboxID: "s1", Port: 49983, ExpectedNodeID: "n1", ExpectedNodeEpoch: 7,
-			ExpectedStorageGeneration: "g1", ExpectedBindingDigest: "old",
+			ExpectedRegistryGeneration: "g1", ExpectedBindingDigest: "old",
 		})
 		done <- route
 	}()
@@ -182,7 +182,7 @@ func TestWorkerBindingChangeWhileParkedFailsClosed(t *testing.T) {
 		t.Fatal("parked route did not emit wake")
 	}
 	master.ApplyUpsert(routesync.RouteEntry{
-		SandboxID: "s1", NodeID: "n1", NodeEpoch: 7, StorageGeneration: "g1", BindingDigest: "new",
+		SandboxID: "s1", NodeID: "n1", NodeEpoch: 7, RegistryGeneration: "g1", BindingDigest: "new",
 		Profile: "e2b", State: routesync.StateRunning, EnvdUDS: "/run/s1/envd.sock",
 	})
 	updates.bump()

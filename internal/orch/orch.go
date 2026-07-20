@@ -528,7 +528,7 @@ func sandboxRouteFence(sb *types.Sandbox) (bool, string, uint64, string, string,
 	if err != nil {
 		return true, "", 0, "", "", err
 	}
-	return true, binding.NodeID, binding.NodeEpoch, binding.StorageGeneration, digest, nil
+	return true, binding.NodeID, binding.NodeEpoch, binding.RegistryGeneration, digest, nil
 }
 
 func currentSandboxRouteRequest(sb *types.Sandbox, port int) (proxy.RouteRequest, error) {
@@ -543,7 +543,7 @@ func currentSandboxRouteRequest(sb *types.Sandbox, port int) (proxy.RouteRequest
 	if managed {
 		request.ExpectedNodeID = nodeID
 		request.ExpectedNodeEpoch = nodeEpoch
-		request.ExpectedStorageGeneration = generation
+		request.ExpectedRegistryGeneration = generation
 		request.ExpectedBindingDigest = digest
 	}
 	return request, nil

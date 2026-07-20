@@ -52,7 +52,7 @@ func TestCASExecutionBinding(t *testing.T) {
 func testOpaqueBinding(t *testing.T, generation, objectID, nodeID string, nodeEpoch uint64) string {
 	t.Helper()
 	opaque, err := clusterstate.EncodeExecutionBinding(clusterstate.ExecutionBinding{
-		StorageGeneration: generation, Kind: clusterstate.ExecutionKindSandbox,
+		RegistryGeneration: generation, Kind: clusterstate.ExecutionKindSandbox,
 		ObjectID: objectID, Group: "/g", RouteKey: "rk", NodeID: nodeID, NodeEpoch: nodeEpoch,
 		DemandDigest: sha256.Sum256([]byte("demand")), DispatchSpecDigest: sha256.Sum256([]byte("dispatch")),
 	})

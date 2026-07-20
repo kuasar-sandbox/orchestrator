@@ -100,14 +100,14 @@ const TypeBuildEvent = "build_event"
 // BuildEvent reports a build's state up the node-link (§5.1). The node-link
 // owner resolves cluster identity from its per-node build table.
 type BuildEvent struct {
-	BuildID           string `json:"build_id"`
-	NodeEpoch         uint64 `json:"node_epoch,omitempty"`
-	EventSeq          uint64 `json:"event_seq,omitempty"`
-	StorageGeneration string `json:"storage_generation,omitempty"`
-	BindingDigest     string `json:"binding_digest,omitempty"`
-	State             string `json:"state"`
-	TemplateID        string `json:"template_id,omitempty"`
-	Reason            string `json:"reason,omitempty"`
+	BuildID            string `json:"build_id"`
+	NodeEpoch          uint64 `json:"node_epoch,omitempty"`
+	EventSeq           uint64 `json:"event_seq,omitempty"`
+	RegistryGeneration string `json:"registry_generation,omitempty"`
+	BindingDigest      string `json:"binding_digest,omitempty"`
+	State              string `json:"state"`
+	TemplateID         string `json:"template_id,omitempty"`
+	Reason             string `json:"reason,omitempty"`
 }
 
 type EventAck struct {
@@ -185,7 +185,7 @@ type Command struct {
 	SID                string `json:"sid,omitempty"`
 	NodeEpoch          uint64 `json:"node_epoch,omitempty"`
 	SessionSeq         uint64 `json:"session_seq,omitempty"`
-	StorageGeneration  string `json:"storage_generation,omitempty"`
+	RegistryGeneration string `json:"registry_generation,omitempty"`
 	Binding            string `json:"binding,omitempty"`
 	BindingDigest      string `json:"binding_digest,omitempty"`
 	OldBindingDigest   string `json:"old_binding_digest,omitempty"`

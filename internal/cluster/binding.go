@@ -14,11 +14,11 @@ import (
 )
 
 const (
-	ExecutionBindingVersion             = 1
-	ExecutionBindingPrefix              = "keb1."
-	MaxExecutionBindingSize             = 16 << 10
-	MaxExecutionBindingNodeIDSize       = 128
-	MaxExecutionBindingGenerationIDSize = 128
+	ExecutionBindingVersion                     = 1
+	ExecutionBindingPrefix                      = "keb1."
+	MaxExecutionBindingSize                     = 16 << 10
+	MaxExecutionBindingNodeIDSize               = 128
+	MaxExecutionBindingRegistryGenerationIDSize = 128
 )
 
 const executionBindingMagic = "kuasar-execution-binding-v1"
@@ -31,7 +31,7 @@ const (
 )
 
 type ExecutionBinding struct {
-	StorageGeneration  string
+	RegistryGeneration string
 	Kind               ExecutionKind
 	ObjectID           string
 	Group              string
@@ -50,7 +50,7 @@ func EncodeExecutionBinding(binding ExecutionBinding) (string, error) {
 	payload.WriteString(executionBindingMagic)
 	payload.WriteByte(byte(binding.Kind))
 	for _, field := range []string{
-		binding.StorageGeneration,
+		binding.RegistryGeneration,
 		binding.ObjectID,
 		binding.Group,
 		binding.RouteKey,
@@ -91,7 +91,7 @@ func DecodeExecutionBinding(opaque string) (ExecutionBinding, error) {
 	}
 	binding := ExecutionBinding{Kind: ExecutionKind(kind)}
 	fields := []*string{
-		&binding.StorageGeneration,
+		&binding.RegistryGeneration,
 		&binding.ObjectID,
 		&binding.Group,
 		&binding.RouteKey,
@@ -167,10 +167,10 @@ func WithoutSystemMetadata(metadata map[string]string) map[string]string {
 
 func (b ExecutionBinding) validate() error {
 	for name, value := range map[string]string{
-		"storage generation": b.StorageGeneration,
-		"object id":          b.ObjectID,
-		"group":              b.Group,
-		"node id":            b.NodeID,
+		"Registry History Generation": b.RegistryGeneration,
+		"object id":                   b.ObjectID,
+		"group":                       b.Group,
+		"node id":                     b.NodeID,
 	} {
 		if value == "" {
 			return fmt.Errorf("cluster: execution binding %s is required", name)
@@ -185,8 +185,8 @@ func (b ExecutionBinding) validate() error {
 	if len(b.NodeID) > MaxExecutionBindingNodeIDSize {
 		return fmt.Errorf("cluster: execution binding node id exceeds %d bytes", MaxExecutionBindingNodeIDSize)
 	}
-	if len(b.StorageGeneration) > MaxExecutionBindingGenerationIDSize {
-		return fmt.Errorf("cluster: execution binding storage generation exceeds %d bytes", MaxExecutionBindingGenerationIDSize)
+	if len(b.RegistryGeneration) > MaxExecutionBindingRegistryGenerationIDSize {
+		return fmt.Errorf("cluster: execution binding Registry History Generation exceeds %d bytes", MaxExecutionBindingRegistryGenerationIDSize)
 	}
 	switch b.Kind {
 	case ExecutionKindSandbox:
