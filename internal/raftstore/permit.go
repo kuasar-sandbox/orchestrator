@@ -31,14 +31,14 @@ const (
 )
 
 type PermitIdentity struct {
-	ClusterID         string `json:"cluster_id"`
-	StorageGeneration string `json:"storage_generation"`
-	SystemEpoch       uint64 `json:"system_epoch"`
-	ManifestDigest    string `json:"manifest_digest"`
+	ClusterID            string `json:"cluster_id"`
+	RegistryGeneration   string `json:"registry_generation"`
+	SystemEpoch          uint64 `json:"system_epoch"`
+	RegistryLayoutDigest string `json:"registry_layout_digest"`
 }
 
 func (i PermitIdentity) Validate() error {
-	if i.ClusterID == "" || i.StorageGeneration == "" || i.SystemEpoch == 0 || !isSHA256(i.ManifestDigest) {
+	if i.ClusterID == "" || i.RegistryGeneration == "" || i.SystemEpoch == 0 || !isSHA256(i.RegistryLayoutDigest) {
 		return errors.New("raftstore: incomplete permit identity")
 	}
 	return nil
@@ -135,9 +135,9 @@ func (c *PermitCache) Install(grant PermitGrant, proposalStarted time.Time) erro
 	defer c.mu.Unlock()
 	if c.clusterID == "" {
 		c.clusterID = grant.ClusterID
-		c.generation = grant.StorageGeneration
-	} else if c.clusterID != grant.ClusterID || c.generation != grant.StorageGeneration {
-		return errors.New("raftstore: Serve Permit cache belongs to another storage generation")
+		c.generation = grant.RegistryGeneration
+	} else if c.clusterID != grant.ClusterID || c.generation != grant.RegistryGeneration {
+		return errors.New("raftstore: Serve Permit cache belongs to another Registry History Generation")
 	}
 	current, found := c.permits[grant.PermitIdentity]
 	if found && current.Grant.CommitIndex > grant.CommitIndex {

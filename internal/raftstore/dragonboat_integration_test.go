@@ -111,11 +111,11 @@ func TestDragonboatThreeReplicaRecoveryAndMembershipChange(t *testing.T) {
 		t.Cleanup(nodeHost.Close)
 	}
 
-	manifest := testManifest(2, "generation-integration")
+	registryLayout := testRegistryLayout(2, "generation-integration")
 	for index := 0; index < 3; index++ {
-		manifest.Members[index].RaftEndpoint = addresses[index]
+		registryLayout.Members[index].RaftEndpoint = addresses[index]
 	}
-	if err := manifest.Validate(); err != nil {
+	if err := registryLayout.Validate(); err != nil {
 		t.Fatal(err)
 	}
 	initial := map[uint64]dragonboat.Target{1: addresses[0], 2: addresses[1], 3: addresses[2]}
@@ -125,9 +125,9 @@ func TestDragonboatThreeReplicaRecoveryAndMembershipChange(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	digest, _ := manifest.Digest()
+	digest, _ := registryLayout.Digest()
 	bootstrapRaw, err := EncodeSystemCommand(SystemCommand{
-		Type: SystemBootstrap, Manifest: &manifest, Digest: digest,
+		Type: SystemBootstrap, RegistryLayout: &registryLayout, Digest: digest,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -139,7 +139,7 @@ func TestDragonboatThreeReplicaRecoveryAndMembershipChange(t *testing.T) {
 	}
 	for _, nodeHost := range nodeHosts[:3] {
 		waitForSystemState(t, nodeHost, func(state SystemState) bool {
-			return state.Initialized && state.ActiveManifestDigest == digest
+			return state.Initialized && state.ActiveRegistryLayoutDigest == digest
 		})
 	}
 	setGatesRaw, err := EncodeSystemCommand(SystemCommand{
@@ -154,7 +154,7 @@ func TestDragonboatThreeReplicaRecoveryAndMembershipChange(t *testing.T) {
 		t.Fatalf("System gate result = %+v, %v", gatesResult, err)
 	}
 
-	identity := routeShardIdentity(t, manifest, "/integration", "ready")
+	identity := routeShardIdentity(t, registryLayout, "/integration", "ready")
 	dataRaftShardID := DataRaftShardID(identity.ShardID)
 	for index := 0; index < 3; index++ {
 		if err := nodeHosts[index].StartOnDiskReplica(initial, false, stateEngines[index].NewStateMachine,
@@ -162,7 +162,7 @@ func TestDragonboatThreeReplicaRecoveryAndMembershipChange(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	bootstrap, err := NewDataShardBootstrap(manifest, identity.ShardID)
+	bootstrap, err := NewDataShardBootstrap(registryLayout, identity.ShardID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -178,7 +178,7 @@ func TestDragonboatThreeReplicaRecoveryAndMembershipChange(t *testing.T) {
 		t.Fatalf("data bootstrap result = %+v", dataResult)
 	}
 
-	starting := routeStarting(t, manifest, "/integration", "ready", "sandbox-integration", 1, true)
+	starting := routeStarting(t, registryLayout, "/integration", "ready", "sandbox-integration", 1, true)
 	putStarting, err := EncodeDataCommand(DataCommand{
 		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{Absent: true}, Route: &starting,
 	})
@@ -273,7 +273,7 @@ func TestDragonboatThreeReplicaRecoveryAndMembershipChange(t *testing.T) {
 		return nil
 	})
 	waitForSystemState(t, nodeHosts[3], func(state SystemState) bool {
-		return state.Initialized && state.ActiveManifestDigest == digest && state.ServeGate && state.WriteGate
+		return state.Initialized && state.ActiveRegistryLayoutDigest == digest && state.ServeGate && state.WriteGate
 	})
 	membership = getMembershipEventually(t, nodeHosts[:3], SystemRaftShardID)
 	changeContext, cancelChange = context.WithTimeout(context.Background(), 10*time.Second)

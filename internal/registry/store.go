@@ -65,7 +65,7 @@ type SandboxRecord struct {
 	State              SandboxState              `json:"state"`
 	NodeID             string                    `json:"node_id,omitempty"`
 	NodeEpoch          uint64                    `json:"node_epoch,omitempty"`
-	StorageGeneration  string                    `json:"storage_generation,omitempty"`
+	RegistryGeneration string                    `json:"registry_generation,omitempty"`
 	BindingDigest      string                    `json:"binding_digest,omitempty"`
 	SnapLoc            string                    `json:"snap_loc,omitempty"`
 	TemplateID         string                    `json:"template_id,omitempty"`

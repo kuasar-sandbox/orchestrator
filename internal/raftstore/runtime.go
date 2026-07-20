@@ -61,55 +61,55 @@ type raftNodeHost interface {
 type nodeHostFactory func(dbconfig.NodeHostConfig) (raftNodeHost, error)
 
 type Runtime struct {
-	mu               sync.Mutex
-	transitionMu     sync.Mutex
-	config           RuntimeConfig
-	manifest         Manifest
-	manifestDigest   string
-	member           RegistryMember
-	enrollment       LocalEnrollment
-	enrollmentStore  EnrollmentStore
-	nodeHost         raftNodeHost
-	stateEngine      *PebbleStateEngine
-	permitCache      *PermitCache
-	transitionClient ReplicaTransitionClient
-	systemEvents     *runtimeSystemEvents
+	mu                   sync.Mutex
+	transitionMu         sync.Mutex
+	config               RuntimeConfig
+	registryLayout       RegistryLayout
+	registryLayoutDigest string
+	member               RegistryMember
+	enrollment           LocalEnrollment
+	enrollmentStore      EnrollmentStore
+	nodeHost             raftNodeHost
+	stateEngine          *PebbleStateEngine
+	permitCache          *PermitCache
+	transitionClient     ReplicaTransitionClient
+	systemEvents         *runtimeSystemEvents
 }
 
 func OpenRuntime(
 	config RuntimeConfig,
-	manifestChain []SignedManifest,
+	registryLayoutChain []SignedRegistryLayout,
 	keyring map[string]ed25519.PublicKey,
 	options RuntimeOpenOptions,
 ) (*Runtime, error) {
-	return openRuntime(config, manifestChain, keyring, options, func(config dbconfig.NodeHostConfig) (raftNodeHost, error) {
+	return openRuntime(config, registryLayoutChain, keyring, options, func(config dbconfig.NodeHostConfig) (raftNodeHost, error) {
 		return dragonboat.NewNodeHost(config)
 	})
 }
 
 func openRuntime(
 	config RuntimeConfig,
-	manifestChain []SignedManifest,
+	registryLayoutChain []SignedRegistryLayout,
 	keyring map[string]ed25519.PublicKey,
 	options RuntimeOpenOptions,
 	factory nodeHostFactory,
 ) (*Runtime, error) {
-	if len(manifestChain) == 0 || factory == nil {
-		return nil, errors.New("raftstore: a signed manifest chain and NodeHost factory are required")
+	if len(registryLayoutChain) == 0 || factory == nil {
+		return nil, errors.New("raftstore: a signed registryLayout chain and NodeHost factory are required")
 	}
-	latestSigned := manifestChain[len(manifestChain)-1]
+	latestSigned := registryLayoutChain[len(registryLayoutChain)-1]
 	latestDigest, err := latestSigned.Verify(keyring)
 	if err != nil {
 		return nil, err
 	}
-	guard := ManifestGuard{Path: config.ManifestGuardPath}
-	accepted, err := guard.EvaluateSignedChain(manifestChain, keyring)
+	guard := RegistryLayoutGuard{Path: config.RegistryLayoutGuardPath}
+	accepted, err := guard.EvaluateSignedChain(registryLayoutChain, keyring)
 	if err != nil {
 		return nil, err
 	}
-	if accepted.ManifestVersion != latestSigned.Manifest.ManifestVersion || accepted.ManifestDigest != latestDigest ||
-		accepted.StorageGeneration != latestSigned.Manifest.StorageGeneration {
-		return nil, errors.New("raftstore: supplied chain does not end at the accepted manifest")
+	if accepted.RegistryLayoutVersion != latestSigned.RegistryLayout.RegistryLayoutVersion || accepted.RegistryLayoutDigest != latestDigest ||
+		accepted.RegistryGeneration != latestSigned.RegistryLayout.RegistryGeneration {
+		return nil, errors.New("raftstore: supplied chain does not end at the accepted registryLayout")
 	}
 
 	store := EnrollmentStore{Path: config.EnrollmentPath}
@@ -119,35 +119,35 @@ func openRuntime(
 	}
 	currentSigned := latestSigned
 	currentDigest := latestDigest
-	if loadedEnrollment != nil && loadedEnrollment.StorageGeneration == latestSigned.Manifest.StorageGeneration {
-		if _, found := manifestMember(latestSigned.Manifest, config.MemberID); !found {
+	if loadedEnrollment != nil && loadedEnrollment.RegistryGeneration == latestSigned.RegistryLayout.RegistryGeneration {
+		if _, found := registryLayoutMember(latestSigned.RegistryLayout, config.MemberID); !found {
 			selected := false
-			for _, candidate := range manifestChain {
+			for _, candidate := range registryLayoutChain {
 				digest, verifyErr := candidate.Verify(keyring)
 				if verifyErr != nil {
 					return nil, verifyErr
 				}
-				if candidate.Manifest.StorageGeneration == loadedEnrollment.StorageGeneration &&
-					candidate.Manifest.ManifestVersion == loadedEnrollment.ManifestVersion &&
-					digest == loadedEnrollment.ManifestDigest {
-					if _, memberFound := manifestMember(candidate.Manifest, config.MemberID); !memberFound {
-						return nil, errors.New("raftstore: enrolled member is absent from its active signed manifest")
+				if candidate.RegistryLayout.RegistryGeneration == loadedEnrollment.RegistryGeneration &&
+					candidate.RegistryLayout.RegistryLayoutVersion == loadedEnrollment.RegistryLayoutVersion &&
+					digest == loadedEnrollment.RegistryLayoutDigest {
+					if _, memberFound := registryLayoutMember(candidate.RegistryLayout, config.MemberID); !memberFound {
+						return nil, errors.New("raftstore: enrolled member is absent from its active signed registryLayout")
 					}
 					currentSigned, currentDigest, selected = candidate, digest, true
 					break
 				}
 			}
 			if !selected {
-				return nil, errors.New("raftstore: complete signed manifest chain is required to restart a removed member")
+				return nil, errors.New("raftstore: complete signed registryLayout chain is required to restart a removed member")
 			}
 		}
 	}
-	manifest := currentSigned.Manifest
-	member, found := manifestMember(manifest, config.MemberID)
+	registryLayout := currentSigned.RegistryLayout
+	member, found := registryLayoutMember(registryLayout, config.MemberID)
 	if !found {
-		return nil, errors.New("raftstore: local member is absent from the signed manifest")
+		return nil, errors.New("raftstore: local member is absent from the signed registryLayout")
 	}
-	nodeHostConfig, err := config.dragonboatConfig(manifest, member)
+	nodeHostConfig, err := config.dragonboatConfig(registryLayout, member)
 	if err != nil {
 		return nil, err
 	}
@@ -163,32 +163,32 @@ func openRuntime(
 		}
 		mode := EnrollmentBootstrap
 		if options.Mode == RuntimeBootstrap {
-			if manifest.ManifestVersion != 1 || !bootstrapSecretMatches(options.BootstrapSecret, manifest.BootstrapTokenDigest) {
+			if registryLayout.RegistryLayoutVersion != 1 || !bootstrapSecretMatches(options.BootstrapSecret, registryLayout.BootstrapTokenDigest) {
 				return nil, ErrBootstrapUnauthorized
 			}
 		} else {
-			if manifest.ManifestVersion == 1 {
-				return nil, errors.New("raftstore: a first manifest member must use explicit generation bootstrap")
+			if registryLayout.RegistryLayoutVersion == 1 {
+				return nil, errors.New("raftstore: a first registryLayout member must use explicit generation bootstrap")
 			}
 			mode = EnrollmentJoin
 		}
-		created, createErr := newLocalEnrollment(mode, manifest, currentDigest, member, config)
+		created, createErr := newLocalEnrollment(mode, registryLayout, currentDigest, member, config)
 		if createErr != nil {
 			return nil, createErr
 		}
 		enrollment = created
-	} else if loadedEnrollment.StorageGeneration != manifest.StorageGeneration {
-		if options.Mode != RuntimeBootstrap || manifest.ManifestVersion != 1 || manifest.Predecessor == nil ||
-			loadedEnrollment.ClusterID != manifest.ClusterID ||
-			manifest.Predecessor.StorageGeneration != loadedEnrollment.StorageGeneration ||
-			manifest.Predecessor.ManifestDigest != loadedEnrollment.ManifestDigest ||
-			!bootstrapSecretMatches(options.BootstrapSecret, manifest.BootstrapTokenDigest) {
+	} else if loadedEnrollment.RegistryGeneration != registryLayout.RegistryGeneration {
+		if options.Mode != RuntimeBootstrap || registryLayout.RegistryLayoutVersion != 1 || registryLayout.Predecessor == nil ||
+			loadedEnrollment.ClusterID != registryLayout.ClusterID ||
+			registryLayout.Predecessor.RegistryGeneration != loadedEnrollment.RegistryGeneration ||
+			registryLayout.Predecessor.RegistryLayoutDigest != loadedEnrollment.RegistryLayoutDigest ||
+			!bootstrapSecretMatches(options.BootstrapSecret, registryLayout.BootstrapTokenDigest) {
 			return nil, ErrBootstrapUnauthorized
 		}
 		if err := requireEmptyRuntimeStorage(config); err != nil {
 			return nil, err
 		}
-		created, createErr := newLocalEnrollment(EnrollmentBootstrap, manifest, currentDigest, member, config)
+		created, createErr := newLocalEnrollment(EnrollmentBootstrap, registryLayout, currentDigest, member, config)
 		if createErr != nil {
 			return nil, createErr
 		}
@@ -197,7 +197,7 @@ func openRuntime(
 		if options.Mode != RuntimeRestart {
 			return nil, errors.New("raftstore: an enrolled member must restart; bootstrap/join cannot be replayed")
 		}
-		if err := loadedEnrollment.Matches(manifest, currentDigest, member, config); err != nil {
+		if err := loadedEnrollment.Matches(registryLayout, currentDigest, member, config); err != nil {
 			return nil, err
 		}
 		enrollment = *loadedEnrollment
@@ -221,7 +221,7 @@ func openRuntime(
 		return nil, fmt.Errorf("raftstore: create Dragonboat NodeHost: %w", err)
 	}
 	runtime := &Runtime{
-		config: config, manifest: manifest, manifestDigest: currentDigest, member: member,
+		config: config, registryLayout: registryLayout, registryLayoutDigest: currentDigest, member: member,
 		enrollment: enrollment, enrollmentStore: store, nodeHost: nodeHost, stateEngine: stateEngine,
 		permitCache: NewPermitCache(time.Now), transitionClient: options.TransitionClient,
 		systemEvents: systemEvents,
@@ -263,7 +263,7 @@ func (r *Runtime) StartDataReplicas(system SystemState) error {
 			return err
 		}
 	}
-	if err := r.authorizeManifestState(system); err != nil {
+	if err := r.authorizeRegistryLayoutState(system); err != nil {
 		return err
 	}
 	r.mu.Lock()
@@ -279,19 +279,19 @@ func (r *Runtime) StartDataReplicas(system SystemState) error {
 		}
 	}
 	r.mu.Unlock()
-	return r.SyncLocalManifest(system)
+	return r.SyncLocalRegistryLayout(system)
 }
 
-func (r *Runtime) PlanManifestJoins(system SystemState) error {
-	if err := r.authorizeManifestState(system); err != nil {
+func (r *Runtime) PlanRegistryLayoutJoins(system SystemState) error {
+	if err := r.authorizeRegistryLayoutState(system); err != nil {
 		return err
 	}
-	if system.Transition == nil || system.Transition.Digest != r.manifestDigest {
-		return errors.New("raftstore: local joins require a committed manifest transition")
+	if system.Transition == nil || system.Transition.Digest != r.registryLayoutDigest {
+		return errors.New("raftstore: local joins require a committed registryLayout transition")
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	desired := localReplicas(r.manifest, r.member, ReplicaJoin, true)
+	desired := localReplicas(r.registryLayout, r.member, ReplicaJoin, true)
 	next := r.enrollment
 	next.Replicas = append([]LocalReplicaEnrollment(nil), r.enrollment.Replicas...)
 	for _, planned := range desired {
@@ -407,30 +407,30 @@ func (r *Runtime) markReplicaRemoving(shardID, replicaID uint64) error {
 	}
 }
 
-// SyncLocalManifest advances the enrollment's active-manifest fence only
-// after the System Group has committed that exact signed manifest as active.
-func (r *Runtime) SyncLocalManifest(system SystemState) error {
-	if err := r.authorizeManifestState(system); err != nil {
+// SyncLocalRegistryLayout advances the enrollment's active-registryLayout fence only
+// after the System Group has committed that exact signed registryLayout as active.
+func (r *Runtime) SyncLocalRegistryLayout(system SystemState) error {
+	if err := r.authorizeRegistryLayoutState(system); err != nil {
 		return err
 	}
-	if system.ActiveManifestVersion != r.manifest.ManifestVersion ||
-		system.ActiveManifestDigest != r.manifestDigest {
+	if system.ActiveRegistryLayoutVersion != r.registryLayout.RegistryLayoutVersion ||
+		system.ActiveRegistryLayoutDigest != r.registryLayoutDigest {
 		return nil
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.enrollment.ManifestVersion > system.ActiveManifestVersion ||
-		r.enrollment.ManifestVersion == system.ActiveManifestVersion &&
-			r.enrollment.ManifestDigest != system.ActiveManifestDigest {
-		return errors.New("raftstore: local enrollment active-manifest fence conflicts with System consensus")
+	if r.enrollment.RegistryLayoutVersion > system.ActiveRegistryLayoutVersion ||
+		r.enrollment.RegistryLayoutVersion == system.ActiveRegistryLayoutVersion &&
+			r.enrollment.RegistryLayoutDigest != system.ActiveRegistryLayoutDigest {
+		return errors.New("raftstore: local enrollment active-registryLayout fence conflicts with System consensus")
 	}
-	if r.enrollment.ManifestVersion == system.ActiveManifestVersion {
+	if r.enrollment.RegistryLayoutVersion == system.ActiveRegistryLayoutVersion {
 		return nil
 	}
 	next := r.enrollment
 	next.Replicas = append([]LocalReplicaEnrollment(nil), r.enrollment.Replicas...)
-	next.ManifestVersion = system.ActiveManifestVersion
-	next.ManifestDigest = system.ActiveManifestDigest
+	next.RegistryLayoutVersion = system.ActiveRegistryLayoutVersion
+	next.RegistryLayoutDigest = system.ActiveRegistryLayoutDigest
 	if err := r.enrollmentStore.Store(next); err != nil {
 		return err
 	}
@@ -462,16 +462,16 @@ func (r *Runtime) ReadSystemStrong(ctx context.Context) (SystemState, error) {
 	return state, nil
 }
 
-func (r *Runtime) AwaitSystemManifest(ctx context.Context) (SystemState, error) {
+func (r *Runtime) AwaitSystemRegistryLayout(ctx context.Context) (SystemState, error) {
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
 	for {
 		state, err := r.ReadSystemLocal()
 		if err == nil && state.Initialized {
-			if err := r.authorizeManifestState(state); err != nil {
+			if err := r.authorizeRegistryLayoutState(state); err != nil {
 				return SystemState{}, err
 			}
-			if err := r.SyncLocalManifest(state); err != nil {
+			if err := r.SyncLocalRegistryLayout(state); err != nil {
 				return SystemState{}, err
 			}
 			return state, nil
@@ -485,27 +485,27 @@ func (r *Runtime) AwaitSystemManifest(ctx context.Context) (SystemState, error) 
 }
 
 func (r *Runtime) BootstrapSystem(ctx context.Context) (SystemState, error) {
-	if r.enrollment.Mode != EnrollmentBootstrap || r.manifest.ManifestVersion != 1 {
+	if r.enrollment.Mode != EnrollmentBootstrap || r.registryLayout.RegistryLayoutVersion != 1 {
 		return SystemState{}, ErrBootstrapUnauthorized
 	}
 	if state, err := r.ReadSystemStrong(ctx); err == nil && state.Initialized {
-		if err := r.authorizeManifestState(state); err != nil {
+		if err := r.authorizeRegistryLayoutState(state); err != nil {
 			return SystemState{}, err
 		}
-		if err := r.SyncLocalManifest(state); err != nil {
+		if err := r.SyncLocalRegistryLayout(state); err != nil {
 			return SystemState{}, err
 		}
 		return state, nil
 	}
 	_, err := r.proposeSystem(ctx, SystemCommand{
-		Type: SystemBootstrap, Manifest: &r.manifest, Digest: r.manifestDigest,
+		Type: SystemBootstrap, RegistryLayout: &r.registryLayout, Digest: r.registryLayoutDigest,
 	})
 	if err != nil {
 		state, readErr := r.ReadSystemStrong(ctx)
-		if readErr != nil || r.authorizeManifestState(state) != nil {
+		if readErr != nil || r.authorizeRegistryLayoutState(state) != nil {
 			return SystemState{}, err
 		}
-		if syncErr := r.SyncLocalManifest(state); syncErr != nil {
+		if syncErr := r.SyncLocalRegistryLayout(state); syncErr != nil {
 			return SystemState{}, syncErr
 		}
 		return state, nil
@@ -514,26 +514,26 @@ func (r *Runtime) BootstrapSystem(ctx context.Context) (SystemState, error) {
 	if err != nil {
 		return SystemState{}, err
 	}
-	if err := r.authorizeManifestState(state); err != nil {
+	if err := r.authorizeRegistryLayoutState(state); err != nil {
 		return SystemState{}, err
 	}
-	if err := r.SyncLocalManifest(state); err != nil {
+	if err := r.SyncLocalRegistryLayout(state); err != nil {
 		return SystemState{}, err
 	}
 	return state, nil
 }
 
 func (r *Runtime) InitializeDataShards(ctx context.Context, system SystemState, workers int) error {
-	if r.enrollment.Mode != EnrollmentBootstrap || r.manifest.ManifestVersion != 1 {
+	if r.enrollment.Mode != EnrollmentBootstrap || r.registryLayout.RegistryLayoutVersion != 1 {
 		return ErrBootstrapUnauthorized
 	}
-	if err := r.authorizeManifestState(system); err != nil {
+	if err := r.authorizeRegistryLayoutState(system); err != nil {
 		return err
 	}
-	if system.ActiveManifestDigest != r.manifestDigest || system.SystemEpoch != 1 {
-		return errors.New("raftstore: data shards require the initial committed System manifest")
+	if system.ActiveRegistryLayoutDigest != r.registryLayoutDigest || system.SystemEpoch != 1 {
+		return errors.New("raftstore: data shards require the initial committed System registryLayout")
 	}
-	if err := r.SyncLocalManifest(system); err != nil {
+	if err := r.SyncLocalRegistryLayout(system); err != nil {
 		return err
 	}
 	if workers <= 0 || workers > 256 {
@@ -569,13 +569,13 @@ func (r *Runtime) initializeDataShard(ctx context.Context, replica LocalReplicaE
 			return r.validateDataState(state, shardID)
 		}
 	}
-	bootstrap, err := dataShardBootstrap(r.manifest, r.manifestDigest, shardID)
+	bootstrap, err := dataShardBootstrap(r.registryLayout, r.registryLayoutDigest, shardID)
 	if err != nil {
 		return err
 	}
 	identity := ShardRequestIdentity{PermitIdentity: PermitIdentity{
-		ClusterID: r.manifest.ClusterID, StorageGeneration: r.manifest.StorageGeneration,
-		SystemEpoch: 1, ManifestDigest: r.manifestDigest,
+		ClusterID: r.registryLayout.ClusterID, RegistryGeneration: r.registryLayout.RegistryGeneration,
+		SystemEpoch: 1, RegistryLayoutDigest: r.registryLayoutDigest,
 	}, ShardID: shardID}
 	result, err := r.proposeDataRaw(ctx, DataCommand{
 		Type: DataInitializeShard, Identity: identity, Bootstrap: &bootstrap,
@@ -665,35 +665,35 @@ func (r *Runtime) proposeDataRaw(ctx context.Context, command DataCommand) (Data
 	return applied, nil
 }
 
-func (r *Runtime) authorizeManifestState(system SystemState) error {
+func (r *Runtime) authorizeRegistryLayoutState(system SystemState) error {
 	if err := system.Validate(); err != nil {
 		return err
 	}
-	if system.ClusterID != r.manifest.ClusterID || system.StorageGeneration != r.manifest.StorageGeneration ||
-		system.SchemaVersion != r.manifest.SchemaVersion || system.ProtocolVersion != r.manifest.ProtocolVersion ||
-		system.VirtualShardCount != r.manifest.VirtualShardCount {
+	if system.ClusterID != r.registryLayout.ClusterID || system.RegistryGeneration != r.registryLayout.RegistryGeneration ||
+		system.SchemaVersion != r.registryLayout.SchemaVersion || system.ProtocolVersion != r.registryLayout.ProtocolVersion ||
+		system.VirtualShardCount != r.registryLayout.VirtualShardCount {
 		return errors.New("raftstore: System state differs from the signed generation")
 	}
-	if system.ActiveManifestDigest == r.manifestDigest && system.ActiveManifestVersion == r.manifest.ManifestVersion {
+	if system.ActiveRegistryLayoutDigest == r.registryLayoutDigest && system.ActiveRegistryLayoutVersion == r.registryLayout.RegistryLayoutVersion {
 		return nil
 	}
-	if system.Transition != nil && system.Transition.Digest == r.manifestDigest &&
-		system.Transition.Version == r.manifest.ManifestVersion {
+	if system.Transition != nil && system.Transition.Digest == r.registryLayoutDigest &&
+		system.Transition.Version == r.registryLayout.RegistryLayoutVersion {
 		return nil
 	}
-	return errors.New("raftstore: signed manifest is not committed active or next System state")
+	return errors.New("raftstore: signed registryLayout is not committed active or next System state")
 }
 
 func (r *Runtime) validateDataState(state DataState, shardID uint32) error {
 	if err := state.Validate(); err != nil {
 		return err
 	}
-	if state.ClusterID != r.manifest.ClusterID || state.StorageGeneration != r.manifest.StorageGeneration ||
-		state.ShardID != shardID || state.SchemaVersion != r.manifest.SchemaVersion ||
-		state.ProtocolVersion != r.manifest.ProtocolVersion || state.HashVersion != r.manifest.HashVersion ||
-		state.VirtualShardCount != r.manifest.VirtualShardCount ||
-		state.RouteBucketCount != r.manifest.RouteBucketCount || state.BuildBucketCount != r.manifest.BuildBucketCount {
-		return errors.New("raftstore: data state differs from its signed manifest")
+	if state.ClusterID != r.registryLayout.ClusterID || state.RegistryGeneration != r.registryLayout.RegistryGeneration ||
+		state.ShardID != shardID || state.SchemaVersion != r.registryLayout.SchemaVersion ||
+		state.ProtocolVersion != r.registryLayout.ProtocolVersion || state.HashVersion != r.registryLayout.HashVersion ||
+		state.VirtualShardCount != r.registryLayout.VirtualShardCount ||
+		state.RouteBucketCount != r.registryLayout.RouteBucketCount || state.BuildBucketCount != r.registryLayout.BuildBucketCount {
+		return errors.New("raftstore: data state differs from its signed registryLayout")
 	}
 	return nil
 }
@@ -705,7 +705,7 @@ func (r *Runtime) initialMembers(shardID uint64) (map[uint64]dragonboat.Target, 
 	}
 	members := make(map[uint64]dragonboat.Target, len(placements))
 	for _, placement := range placements {
-		member, found := manifestMember(r.manifest, placement.MemberID)
+		member, found := registryLayoutMember(r.registryLayout, placement.MemberID)
 		if !found {
 			return nil, errors.New("raftstore: replica placement names an unknown member")
 		}
@@ -716,13 +716,13 @@ func (r *Runtime) initialMembers(shardID uint64) (map[uint64]dragonboat.Target, 
 
 func (r *Runtime) placementForRaftShard(shardID uint64) ([]ReplicaPlacement, error) {
 	if shardID == SystemRaftShardID {
-		return r.manifest.SystemReplicas, nil
+		return r.registryLayout.SystemReplicas, nil
 	}
 	logical, ok := LogicalShardID(shardID)
-	if !ok || logical >= uint32(len(r.manifest.DataShards)) {
+	if !ok || logical >= uint32(len(r.registryLayout.DataShards)) {
 		return nil, errors.New("raftstore: unknown Raft shard")
 	}
-	return r.manifest.DataShards[logical].Replicas, nil
+	return r.registryLayout.DataShards[logical].Replicas, nil
 }
 
 func (r *Runtime) replicaPosition(shardID uint64) int {
@@ -734,8 +734,8 @@ func (r *Runtime) replicaPosition(shardID uint64) int {
 	return -1
 }
 
-func manifestMember(manifest Manifest, memberID string) (RegistryMember, bool) {
-	for _, member := range manifest.Members {
+func registryLayoutMember(registryLayout RegistryLayout, memberID string) (RegistryMember, bool) {
+	for _, member := range registryLayout.Members {
 		if member.MemberID == memberID {
 			return member, true
 		}

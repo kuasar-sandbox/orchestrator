@@ -225,7 +225,7 @@ func (r *Registry) applyBuildEvent(ctx context.Context, nodeID string, e *routes
 	if e == nil || e.BuildID == "" {
 		return
 	}
-	if e.NodeEpoch != 0 || e.EventSeq != 0 || e.StorageGeneration != "" || e.BindingDigest != "" {
+	if e.NodeEpoch != 0 || e.EventSeq != 0 || e.RegistryGeneration != "" || e.BindingDigest != "" {
 		// The legacy BuildStore is not an authority for RFC 46 events. Accepting a
 		// tuple/fence-bearing event here would silently discard its correctness
 		// fence; the dormant final convergence path consumes these in Phase 3.

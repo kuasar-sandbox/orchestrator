@@ -185,7 +185,7 @@ func cloneMembership(source *dragonboat.Membership) *dragonboat.Membership {
 
 type runtimeFixture struct {
 	config  RuntimeConfig
-	signed  SignedManifest
+	signed  SignedRegistryLayout
 	keyring map[string]ed25519.PublicKey
 	key     ed25519.PrivateKey
 	secret  []byte
@@ -195,24 +195,24 @@ func newRuntimeFixture(t *testing.T) runtimeFixture {
 	t.Helper()
 	root := t.TempDir()
 	secret := []byte("bootstrap-generation-1")
-	manifest := testManifest(2, "generation-1")
-	manifest.BootstrapTokenDigest = digestFor(string(secret))
+	registryLayout := testRegistryLayout(2, "generation-1")
+	registryLayout.BootstrapTokenDigest = digestFor(string(secret))
 	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatal(err)
 	}
-	signed, err := SignManifest(manifest, "root-1", privateKey)
+	signed, err := SignRegistryLayout(registryLayout, "root-1", privateKey)
 	if err != nil {
 		t.Fatal(err)
 	}
 	config := RuntimeConfig{
 		MemberID: "registry-a", NodeHostDir: filepath.Join(root, "nodehost"),
 		WALDir: filepath.Join(root, "wal"), StateEngineDir: filepath.Join(root, "state"),
-		ManifestGuardPath: filepath.Join(root, "identity", "manifest.json"),
-		EnrollmentPath:    filepath.Join(root, "identity", "enrollment.json"),
-		TLS:               RaftTLS{CAFile: "ca.pem", CertFile: "cert.pem", KeyFile: "key.pem"},
-		Tuning:            DefaultRuntimeTuning(),
-		StorageAttestor:   StorageAttestorFunc(func(...string) error { return nil }),
+		RegistryLayoutGuardPath: filepath.Join(root, "identity", "registryLayout.json"),
+		EnrollmentPath:          filepath.Join(root, "identity", "enrollment.json"),
+		TLS:                     RaftTLS{CAFile: "ca.pem", CertFile: "cert.pem", KeyFile: "key.pem"},
+		Tuning:                  DefaultRuntimeTuning(),
+		StorageAttestor:         StorageAttestorFunc(func(...string) error { return nil }),
 	}
 	return runtimeFixture{
 		config: config, signed: signed, keyring: map[string]ed25519.PublicKey{"root-1": publicKey},
@@ -222,7 +222,7 @@ func newRuntimeFixture(t *testing.T) runtimeFixture {
 
 func (f runtimeFixture) open(t *testing.T, host *fakeNodeHost, options RuntimeOpenOptions) (*Runtime, error) {
 	t.Helper()
-	return openRuntime(f.config, []SignedManifest{f.signed}, f.keyring, options,
+	return openRuntime(f.config, []SignedRegistryLayout{f.signed}, f.keyring, options,
 		func(dbconfig.NodeHostConfig) (raftNodeHost, error) { return host, nil })
 }
 
@@ -338,21 +338,21 @@ func TestCommittedNodeDeletedEventDurablyFencesLocalReplica(t *testing.T) {
 }
 
 func TestRuntimeKeepsEnrolledReplicaUntilLocalRemovalIsDurable(t *testing.T) {
-	manifest := transitionManifest(t)
-	digest, err := manifest.Digest()
+	registryLayout := transitionRegistryLayout(t)
+	digest, err := registryLayout.Digest()
 	if err != nil {
 		t.Fatal(err)
 	}
-	member, found := manifestMember(manifest, "registry-c")
+	member, found := registryLayoutMember(registryLayout, "registry-c")
 	if !found {
-		t.Fatal("removed replica member absent from manifest member catalog")
+		t.Fatal("removed replica member absent from registryLayout member catalog")
 	}
 	host := newFakeNodeHost()
 	host.history[[2]uint64{SystemRaftShardID, 3}] = true
 	host.history[[2]uint64{DataRaftShardID(0), 3}] = true
 	runtime := &Runtime{
-		manifest: manifest, manifestDigest: digest, member: member, nodeHost: host,
-		enrollment: LocalEnrollment{ManifestVersion: manifest.ManifestVersion, ManifestDigest: digest, Replicas: []LocalReplicaEnrollment{
+		registryLayout: registryLayout, registryLayoutDigest: digest, member: member, nodeHost: host,
+		enrollment: LocalEnrollment{RegistryLayoutVersion: registryLayout.RegistryLayoutVersion, RegistryLayoutDigest: digest, Replicas: []LocalReplicaEnrollment{
 			{ShardID: SystemRaftShardID, ReplicaID: 3, LocalState: ReplicaActive},
 			{ShardID: DataRaftShardID(0), ReplicaID: 3, LocalState: ReplicaActive},
 		}},
@@ -361,7 +361,7 @@ func TestRuntimeKeepsEnrolledReplicaUntilLocalRemovalIsDurable(t *testing.T) {
 		t.Fatal(err)
 	}
 	system, result := ApplySystemCommand(SystemState{}, 1, SystemCommand{
-		Type: SystemBootstrap, Manifest: &manifest, Digest: digest,
+		Type: SystemBootstrap, RegistryLayout: &registryLayout, Digest: digest,
 	})
 	if result.Conflict || !result.Applied {
 		t.Fatalf("System bootstrap = %+v", result)
@@ -396,15 +396,15 @@ func TestRuntimeExplicitlyRollsEnrollmentToLinkedSuccessorGeneration(t *testing.
 	}
 	first.Close()
 
-	firstDigest, err := fixture.signed.Manifest.Digest()
+	firstDigest, err := fixture.signed.RegistryLayout.Digest()
 	if err != nil {
 		t.Fatal(err)
 	}
 	successorSecret := []byte("bootstrap-generation-2")
-	successor := testManifest(2, "generation-2")
+	successor := testRegistryLayout(2, "generation-2")
 	successor.BootstrapTokenDigest = digestFor(string(successorSecret))
-	successor, _ = finalizeConsensusSuccessor(t, fixture.signed.Manifest, firstDigest, successor)
-	signedSuccessor, err := SignManifest(successor, "root-1", fixture.key)
+	successor, _ = finalizeConsensusSuccessor(t, fixture.signed.RegistryLayout, firstDigest, successor)
+	signedSuccessor, err := SignRegistryLayout(successor, "root-1", fixture.key)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -414,7 +414,7 @@ func TestRuntimeExplicitlyRollsEnrollmentToLinkedSuccessorGeneration(t *testing.
 	successorConfig.WALDir = filepath.Join(root, "wal-generation-2")
 	successorConfig.StateEngineDir = filepath.Join(root, "state-generation-2")
 	if _, err := openRuntime(
-		successorConfig, []SignedManifest{signedSuccessor}, fixture.keyring,
+		successorConfig, []SignedRegistryLayout{signedSuccessor}, fixture.keyring,
 		RuntimeOpenOptions{Mode: RuntimeBootstrap, BootstrapSecret: []byte("wrong-successor-secret")},
 		func(dbconfig.NodeHostConfig) (raftNodeHost, error) {
 			t.Fatal("unauthorized rollover created a NodeHost")
@@ -423,19 +423,19 @@ func TestRuntimeExplicitlyRollsEnrollmentToLinkedSuccessorGeneration(t *testing.
 	); !errors.Is(err, ErrBootstrapUnauthorized) {
 		t.Fatalf("unauthorized successor error = %v", err)
 	}
-	guarded, err := (ManifestGuard{Path: fixture.config.ManifestGuardPath}).Load()
-	if err != nil || guarded == nil || guarded.StorageGeneration != fixture.signed.Manifest.StorageGeneration ||
-		guarded.ManifestDigest != firstDigest {
-		t.Fatalf("failed successor advanced manifest guard = %+v, %v", guarded, err)
+	guarded, err := (RegistryLayoutGuard{Path: fixture.config.RegistryLayoutGuardPath}).Load()
+	if err != nil || guarded == nil || guarded.RegistryGeneration != fixture.signed.RegistryLayout.RegistryGeneration ||
+		guarded.RegistryLayoutDigest != firstDigest {
+		t.Fatalf("failed successor advanced registryLayout guard = %+v, %v", guarded, err)
 	}
 	persistedEnrollment, err := (EnrollmentStore{Path: fixture.config.EnrollmentPath}).Load()
 	if err != nil || persistedEnrollment == nil ||
-		persistedEnrollment.StorageGeneration != fixture.signed.Manifest.StorageGeneration {
+		persistedEnrollment.RegistryGeneration != fixture.signed.RegistryLayout.RegistryGeneration {
 		t.Fatalf("failed successor replaced source enrollment = %+v, %v", persistedEnrollment, err)
 	}
 
 	successorRuntime, err := openRuntime(
-		successorConfig, []SignedManifest{signedSuccessor}, fixture.keyring,
+		successorConfig, []SignedRegistryLayout{signedSuccessor}, fixture.keyring,
 		RuntimeOpenOptions{Mode: RuntimeBootstrap, BootstrapSecret: successorSecret},
 		func(dbconfig.NodeHostConfig) (raftNodeHost, error) { return newFakeNodeHost(), nil },
 	)
@@ -443,20 +443,20 @@ func TestRuntimeExplicitlyRollsEnrollmentToLinkedSuccessorGeneration(t *testing.
 		t.Fatal(err)
 	}
 	defer successorRuntime.Close()
-	if successorRuntime.enrollment.StorageGeneration != "generation-2" ||
+	if successorRuntime.enrollment.RegistryGeneration != "generation-2" ||
 		successorRuntime.enrollment.Mode != EnrollmentBootstrap {
 		t.Fatalf("successor enrollment = %+v", successorRuntime.enrollment)
 	}
 	if _, err := openRuntime(
-		fixture.config, []SignedManifest{fixture.signed}, fixture.keyring,
+		fixture.config, []SignedRegistryLayout{fixture.signed}, fixture.keyring,
 		RuntimeOpenOptions{Mode: RuntimeRestart},
 		func(dbconfig.NodeHostConfig) (raftNodeHost, error) { return newFakeNodeHost(), nil },
 	); err == nil {
-		t.Fatal("accepted manifest guard rolled back to the predecessor generation")
+		t.Fatal("accepted registryLayout guard rolled back to the predecessor generation")
 	}
 }
 
-func TestRuntimeAdvancesEnrollmentManifestOnlyAfterConsensusActivation(t *testing.T) {
+func TestRuntimeAdvancesEnrollmentRegistryLayoutOnlyAfterConsensusActivation(t *testing.T) {
 	fixture := newRuntimeFixture(t)
 	first, err := fixture.open(t, newFakeNodeHost(), RuntimeOpenOptions{
 		Mode: RuntimeBootstrap, BootstrapSecret: fixture.secret,
@@ -465,37 +465,38 @@ func TestRuntimeAdvancesEnrollmentManifestOnlyAfterConsensusActivation(t *testin
 		t.Fatal(err)
 	}
 	first.Close()
-	firstDigest, err := fixture.signed.Manifest.Digest()
+	firstDigest, err := fixture.signed.RegistryLayout.Digest()
 	if err != nil {
 		t.Fatal(err)
 	}
-	next := fixture.signed.Manifest
-	next.ManifestVersion = 2
-	next.PreviousManifestDigest = firstDigest
+	next := fixture.signed.RegistryLayout
+	next.RegistryLayoutVersion = 2
+	next.PreviousRegistryLayoutVersion = 1
+	next.PreviousRegistryLayoutDigest = firstDigest
 	next.Members = append([]RegistryMember(nil), next.Members...)
 	next.Members[1].InternalEndpoint = "https://registry-b-v2:9443"
-	signedNext, err := SignManifest(next, "root-1", fixture.key)
+	signedNext, err := SignRegistryLayout(next, "root-1", fixture.key)
 	if err != nil {
 		t.Fatal(err)
 	}
 	restarted, err := openRuntime(
-		fixture.config, []SignedManifest{fixture.signed, signedNext}, fixture.keyring,
+		fixture.config, []SignedRegistryLayout{fixture.signed, signedNext}, fixture.keyring,
 		RuntimeOpenOptions{Mode: RuntimeRestart},
 		func(dbconfig.NodeHostConfig) (raftNodeHost, error) { return newFakeNodeHost(), nil },
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if restarted.enrollment.ManifestVersion != fixture.signed.Manifest.ManifestVersion ||
-		restarted.enrollment.ManifestDigest != firstDigest {
-		t.Fatalf("published next manifest advanced enrollment before consensus: %+v", restarted.enrollment)
+	if restarted.enrollment.RegistryLayoutVersion != fixture.signed.RegistryLayout.RegistryLayoutVersion ||
+		restarted.enrollment.RegistryLayoutDigest != firstDigest {
+		t.Fatalf("published next registryLayout advanced enrollment before consensus: %+v", restarted.enrollment)
 	}
 	nextDigest, err := next.Digest()
 	if err != nil {
 		t.Fatal(err)
 	}
 	system, _ := applySystem(t, SystemState{}, 1, SystemCommand{
-		Type: SystemBootstrap, Manifest: &fixture.signed.Manifest, Digest: firstDigest,
+		Type: SystemBootstrap, RegistryLayout: &fixture.signed.RegistryLayout, Digest: firstDigest,
 	})
 	shards := []ShardTransition{{ShardID: ^uint32(0), Stage: TransitionPending}}
 	for shardID := uint32(0); shardID < next.VirtualShardCount; shardID++ {
@@ -503,8 +504,8 @@ func TestRuntimeAdvancesEnrollmentManifestOnlyAfterConsensusActivation(t *testin
 	}
 	system, _ = applySystem(t, system, 2, SystemCommand{
 		Type: SystemBeginTransition,
-		Transition: &ManifestTransition{
-			Version: next.ManifestVersion, Digest: nextDigest, PreviousDigest: firstDigest,
+		Transition: &RegistryLayoutTransition{
+			Version: next.RegistryLayoutVersion, Digest: nextDigest, PreviousDigest: firstDigest,
 			NextSystemEpoch: 2, Shards: shards,
 		},
 	})
@@ -524,20 +525,20 @@ func TestRuntimeAdvancesEnrollmentManifestOnlyAfterConsensusActivation(t *testin
 		}
 	}
 	system, _ = applySystem(t, system, index, SystemCommand{Type: SystemActivateTransition})
-	if err := restarted.SyncLocalManifest(system); err != nil {
+	if err := restarted.SyncLocalRegistryLayout(system); err != nil {
 		t.Fatal(err)
 	}
-	if restarted.enrollment.ManifestVersion != next.ManifestVersion ||
-		restarted.enrollment.ManifestDigest != nextDigest {
-		t.Fatalf("activated manifest was not persisted: %+v", restarted.enrollment)
+	if restarted.enrollment.RegistryLayoutVersion != next.RegistryLayoutVersion ||
+		restarted.enrollment.RegistryLayoutDigest != nextDigest {
+		t.Fatalf("activated registryLayout was not persisted: %+v", restarted.enrollment)
 	}
 	restarted.Close()
 	if _, err := openRuntime(
-		fixture.config, []SignedManifest{fixture.signed, signedNext}, fixture.keyring,
+		fixture.config, []SignedRegistryLayout{fixture.signed, signedNext}, fixture.keyring,
 		RuntimeOpenOptions{Mode: RuntimeRestart},
 		func(dbconfig.NodeHostConfig) (raftNodeHost, error) { return newFakeNodeHost(), nil },
 	); err != nil {
-		t.Fatalf("full manifest chain was not restart-idempotent: %v", err)
+		t.Fatalf("full registryLayout chain was not restart-idempotent: %v", err)
 	}
 }
 
@@ -551,15 +552,16 @@ func TestRemovedMemberRestartsFromActiveArtifactWithoutGuardRollback(t *testing.
 		t.Fatal(err)
 	}
 	first.Close()
-	firstDigest, err := fixture.signed.Manifest.Digest()
+	firstDigest, err := fixture.signed.RegistryLayout.Digest()
 	if err != nil {
 		t.Fatal(err)
 	}
-	next := fixture.signed.Manifest
-	next.ManifestVersion = 2
-	next.PreviousManifestDigest = firstDigest
+	next := fixture.signed.RegistryLayout
+	next.RegistryLayoutVersion = 2
+	next.PreviousRegistryLayoutVersion = 1
+	next.PreviousRegistryLayoutDigest = firstDigest
 	next.Members = []RegistryMember{
-		fixture.signed.Manifest.Members[0], fixture.signed.Manifest.Members[1],
+		fixture.signed.RegistryLayout.Members[0], fixture.signed.RegistryLayout.Members[1],
 		{MemberID: "registry-d", InternalEndpoint: "https://registry-d:9443", RaftEndpoint: "registry-d:63001"},
 	}
 	desired := []ReplicaPlacement{
@@ -568,16 +570,16 @@ func TestRemovedMemberRestartsFromActiveArtifactWithoutGuardRollback(t *testing.
 		{MemberID: "registry-d", ReplicaID: 4},
 	}
 	next.SystemReplicas = append([]ReplicaPlacement(nil), desired...)
-	next.DataShards = append([]ShardPlacement(nil), fixture.signed.Manifest.DataShards...)
+	next.DataShards = append([]ShardPlacement(nil), fixture.signed.RegistryLayout.DataShards...)
 	for index := range next.DataShards {
 		next.DataShards[index].Replicas = append([]ReplicaPlacement(nil), desired...)
 	}
-	signedNext, err := SignManifest(next, "root-1", fixture.key)
+	signedNext, err := SignRegistryLayout(next, "root-1", fixture.key)
 	if err != nil {
 		t.Fatal(err)
 	}
 	restarted, err := openRuntime(
-		fixture.config, []SignedManifest{fixture.signed, signedNext}, fixture.keyring,
+		fixture.config, []SignedRegistryLayout{fixture.signed, signedNext}, fixture.keyring,
 		RuntimeOpenOptions{Mode: RuntimeRestart},
 		func(dbconfig.NodeHostConfig) (raftNodeHost, error) { return newFakeNodeHost(), nil },
 	)
@@ -585,31 +587,31 @@ func TestRemovedMemberRestartsFromActiveArtifactWithoutGuardRollback(t *testing.
 		t.Fatal(err)
 	}
 	defer restarted.Close()
-	if restarted.manifestDigest != firstDigest || restarted.member.MemberID != "registry-c" {
-		t.Fatalf("removed member selected wrong runtime manifest: digest=%s member=%s",
-			restarted.manifestDigest, restarted.member.MemberID)
+	if restarted.registryLayoutDigest != firstDigest || restarted.member.MemberID != "registry-c" {
+		t.Fatalf("removed member selected wrong runtime registryLayout: digest=%s member=%s",
+			restarted.registryLayoutDigest, restarted.member.MemberID)
 	}
 	nextDigest, err := next.Digest()
 	if err != nil {
 		t.Fatal(err)
 	}
-	accepted, err := (ManifestGuard{Path: fixture.config.ManifestGuardPath}).Load()
-	if err != nil || accepted == nil || accepted.ManifestDigest != nextDigest {
+	accepted, err := (RegistryLayoutGuard{Path: fixture.config.RegistryLayoutGuardPath}).Load()
+	if err != nil || accepted == nil || accepted.RegistryLayoutDigest != nextDigest {
 		t.Fatalf("anti-rollback guard did not retain next artifact: %+v, %v", accepted, err)
 	}
 }
 
-func TestDataShardBootstrapCommandDoesNotEmbedWholeManifest(t *testing.T) {
-	manifest := testManifest(DefaultVirtualShards, "generation-1")
-	bootstrap, err := NewDataShardBootstrap(manifest, DefaultVirtualShards-1)
+func TestDataShardBootstrapCommandDoesNotEmbedWholeRegistryLayout(t *testing.T) {
+	registryLayout := testRegistryLayout(DefaultVirtualShards, "generation-1")
+	bootstrap, err := NewDataShardBootstrap(registryLayout, DefaultVirtualShards-1)
 	if err != nil {
 		t.Fatal(err)
 	}
 	command, err := EncodeDataCommand(DataCommand{
 		Type: DataInitializeShard,
 		Identity: ShardRequestIdentity{PermitIdentity: PermitIdentity{
-			ClusterID: manifest.ClusterID, StorageGeneration: manifest.StorageGeneration,
-			SystemEpoch: 1, ManifestDigest: bootstrap.ManifestDigest,
+			ClusterID: registryLayout.ClusterID, RegistryGeneration: registryLayout.RegistryGeneration,
+			SystemEpoch: 1, RegistryLayoutDigest: bootstrap.RegistryLayoutDigest,
 		}, ShardID: bootstrap.ShardID},
 		Bootstrap: &bootstrap, ReplicaIDs: append([]uint64(nil), bootstrap.ReplicaIDs...),
 	})
@@ -622,21 +624,21 @@ func TestDataShardBootstrapCommandDoesNotEmbedWholeManifest(t *testing.T) {
 }
 
 func TestRuntimePredecessorDrainUsesFullMonotonicWait(t *testing.T) {
-	predecessor := testManifest(2, "generation-1")
+	predecessor := testRegistryLayout(2, "generation-1")
 	predecessor.ServePermitMaxMillis = 25
 	predecessorDigest, err := predecessor.Digest()
 	if err != nil {
 		t.Fatal(err)
 	}
-	manifest := testManifest(2, "generation-2")
-	manifest.ServePermitMaxMillis = 50
-	manifest, _ = finalizeConsensusSuccessor(t, predecessor, predecessorDigest, manifest)
-	digest, err := manifest.Digest()
+	registryLayout := testRegistryLayout(2, "generation-2")
+	registryLayout.ServePermitMaxMillis = 50
+	registryLayout, _ = finalizeConsensusSuccessor(t, predecessor, predecessorDigest, registryLayout)
+	digest, err := registryLayout.Digest()
 	if err != nil {
 		t.Fatal(err)
 	}
 	state, result := ApplySystemCommand(SystemState{}, 1, SystemCommand{
-		Type: SystemBootstrap, Manifest: &manifest, Digest: digest,
+		Type: SystemBootstrap, RegistryLayout: &registryLayout, Digest: digest,
 	})
 	if !result.Applied {
 		t.Fatalf("successor bootstrap = %+v", result)
@@ -658,11 +660,11 @@ func TestRuntimePredecessorDrainUsesFullMonotonicWait(t *testing.T) {
 		encoded, err := json.Marshal(applied)
 		return sm.Result{Value: 1, Data: encoded}, err
 	}
-	runtime := &Runtime{manifest: manifest, manifestDigest: digest, nodeHost: host}
+	runtime := &Runtime{registryLayout: registryLayout, registryLayoutDigest: digest, nodeHost: host}
 	if _, err := runtime.ApplySystem(context.Background(), SystemCommand{
 		Type: SystemConfirmDrain, Drain: &DrainConfirmation{
-			PredecessorProofDigest: manifest.Predecessor.ProofDigest,
-			WaitedMillis:           manifest.Predecessor.ServePermitMaxMillis, EvidenceDigest: digestFor("evidence"),
+			PredecessorProofDigest: registryLayout.Predecessor.ProofDigest,
+			WaitedMillis:           registryLayout.Predecessor.ServePermitMaxMillis, EvidenceDigest: digestFor("evidence"),
 		},
 	}); err == nil {
 		t.Fatal("generic System operation bypassed the monotonic drain wait")
@@ -695,13 +697,13 @@ func TestRuntimeRejectsUnprovenGenericSystemLifecycleCommands(t *testing.T) {
 }
 
 func TestRuntimeClosesGenerationOnlyForCompleteSuccessorIntent(t *testing.T) {
-	manifest := testManifest(2, "generation-1")
-	digest, err := manifest.Digest()
+	registryLayout := testRegistryLayout(2, "generation-1")
+	digest, err := registryLayout.Digest()
 	if err != nil {
 		t.Fatal(err)
 	}
 	state, result := ApplySystemCommand(SystemState{}, 1, SystemCommand{
-		Type: SystemBootstrap, Manifest: &manifest, Digest: digest,
+		Type: SystemBootstrap, RegistryLayout: &registryLayout, Digest: digest,
 	})
 	if result.Conflict || !result.Applied {
 		t.Fatalf("bootstrap = %+v", result)
@@ -723,23 +725,23 @@ func TestRuntimeClosesGenerationOnlyForCompleteSuccessorIntent(t *testing.T) {
 		encoded, encodeErr := json.Marshal(applied)
 		return sm.Result{Value: 1, Data: encoded}, encodeErr
 	}
-	runtime := &Runtime{manifest: manifest, manifestDigest: digest, nodeHost: host}
+	runtime := &Runtime{registryLayout: registryLayout, registryLayoutDigest: digest, nodeHost: host}
 
-	successor := testManifest(2, "generation-2")
+	successor := testRegistryLayout(2, "generation-2")
 	successor.Predecessor = &PredecessorProof{
-		StorageGeneration: manifest.StorageGeneration, ManifestDigest: digest,
-		ServePermitMaxMillis: manifest.ServePermitMaxMillis, Kind: RolloverConsensusClosure,
+		RegistryGeneration: registryLayout.RegistryGeneration, RegistryLayoutDigest: digest,
+		ServePermitMaxMillis: registryLayout.ServePermitMaxMillis, Kind: RolloverConsensusClosure,
 	}
 	if _, err := runtime.ApplySystem(context.Background(), SystemCommand{
-		Type: SystemCloseGeneration,
-		Closure: &GenerationClosure{
-			TargetStorageGeneration:    successor.StorageGeneration,
-			TargetManifestIntentDigest: digestFor("unverified-intent"), Kind: RolloverConsensusClosure,
+		Type: SystemCloseRegistryGeneration,
+		Closure: &RegistryGenerationClosure{
+			TargetRegistryGeneration:         successor.RegistryGeneration,
+			TargetRegistryLayoutIntentDigest: digestFor("unverified-intent"), Kind: RolloverConsensusClosure,
 		},
 	}); err == nil {
-		t.Fatal("generic System operation bypassed successor-manifest validation")
+		t.Fatal("generic System operation bypassed successor-registryLayout validation")
 	}
-	closed, err := runtime.CloseStorageGeneration(context.Background(), successor)
+	closed, err := runtime.CloseRegistryGeneration(context.Background(), successor)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -749,9 +751,9 @@ func TestRuntimeClosesGenerationOnlyForCompleteSuccessorIntent(t *testing.T) {
 	}
 	successor.Predecessor = &proof
 	if err := successor.Validate(); err != nil {
-		t.Fatalf("final successor manifest = %v", err)
+		t.Fatalf("final successor registryLayout = %v", err)
 	}
-	if replayed, err := runtime.CloseStorageGeneration(context.Background(), successor); err != nil ||
+	if replayed, err := runtime.CloseRegistryGeneration(context.Background(), successor); err != nil ||
 		replayed.Closure == nil || replayed.Closure.ProofDigest != proof.ProofDigest {
 		t.Fatalf("idempotent close = %+v, %v", replayed, err)
 	}
@@ -759,7 +761,7 @@ func TestRuntimeClosesGenerationOnlyForCompleteSuccessorIntent(t *testing.T) {
 	different := successor
 	different.Members = append([]RegistryMember(nil), successor.Members...)
 	different.Members[0].InternalEndpoint = "https://registry-a-other:9443"
-	if _, err := runtime.CloseStorageGeneration(context.Background(), different); err == nil {
+	if _, err := runtime.CloseRegistryGeneration(context.Background(), different); err == nil {
 		t.Fatal("retired generation authorized a different successor intent")
 	}
 }

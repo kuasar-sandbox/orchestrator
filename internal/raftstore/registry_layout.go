@@ -14,16 +14,16 @@ import (
 )
 
 const (
-	ManifestFormatV1        = uint32(1)
-	DefaultVirtualShards    = uint32(4096)
-	DefaultRouteBuckets     = uint32(16)
-	DefaultBuildBuckets     = uint32(16)
-	DefaultReplication      = uint32(3)
-	SystemRaftShardID       = uint64(1)
-	firstDataRaftShardID    = uint64(2)
-	manifestSignatureDomain = "kuasar-registry-manifest-v1\x00"
-	rolloverIntentDomain    = "kuasar-storage-rollover-intent-v1\x00"
-	zeroSHA256              = "0000000000000000000000000000000000000000000000000000000000000000"
+	RegistryLayoutFormatV1        = uint32(1)
+	DefaultVirtualShards          = uint32(4096)
+	DefaultRouteBuckets           = uint32(16)
+	DefaultBuildBuckets           = uint32(16)
+	DefaultReplication            = uint32(3)
+	SystemRaftShardID             = uint64(1)
+	firstDataRaftShardID          = uint64(2)
+	registryLayoutSignatureDomain = "kuasar-registry-layout-v1\x00"
+	rolloverIntentDomain          = "kuasar-registry-history-rollover-intent-v1\x00"
+	zeroSHA256                    = "0000000000000000000000000000000000000000000000000000000000000000"
 )
 
 type RolloverProofKind string
@@ -34,13 +34,13 @@ const (
 )
 
 type PredecessorProof struct {
-	StorageGeneration          string            `json:"storage_generation"`
-	ManifestDigest             string            `json:"manifest_digest"`
-	ServePermitMaxMillis       uint64            `json:"serve_permit_max_millis"`
-	Kind                       RolloverProofKind `json:"kind"`
-	TargetManifestIntentDigest string            `json:"target_manifest_intent_digest"`
-	CommitIndex                uint64            `json:"commit_index"`
-	ProofDigest                string            `json:"proof_digest"`
+	RegistryGeneration               string            `json:"registry_generation"`
+	RegistryLayoutDigest             string            `json:"registry_layout_digest"`
+	ServePermitMaxMillis             uint64            `json:"serve_permit_max_millis"`
+	Kind                             RolloverProofKind `json:"kind"`
+	TargetRegistryLayoutIntentDigest string            `json:"target_registry_layout_intent_digest"`
+	CommitIndex                      uint64            `json:"commit_index"`
+	ProofDigest                      string            `json:"proof_digest"`
 }
 
 func (p PredecessorProof) Validate() error {
@@ -48,9 +48,9 @@ func (p PredecessorProof) Validate() error {
 }
 
 func (p PredecessorProof) validate(requireProof bool) error {
-	if p.StorageGeneration == "" || p.ServePermitMaxMillis == 0 ||
+	if p.RegistryGeneration == "" || p.ServePermitMaxMillis == 0 ||
 		p.ServePermitMaxMillis > MaximumServePermitMillis ||
-		!isSHA256(p.ManifestDigest) {
+		!isSHA256(p.RegistryLayoutDigest) {
 		return errors.New("raftstore: incomplete predecessor proof")
 	}
 	switch p.Kind {
@@ -58,7 +58,7 @@ func (p PredecessorProof) validate(requireProof bool) error {
 		if !requireProof {
 			return nil
 		}
-		if p.CommitIndex == 0 || !isSHA256(p.TargetManifestIntentDigest) || !isSHA256(p.ProofDigest) {
+		if p.CommitIndex == 0 || !isSHA256(p.TargetRegistryLayoutIntentDigest) || !isSHA256(p.ProofDigest) {
 			return errors.New("raftstore: incomplete consensus predecessor proof")
 		}
 		return nil
@@ -66,7 +66,7 @@ func (p PredecessorProof) validate(requireProof bool) error {
 		if !requireProof {
 			return nil
 		}
-		if p.CommitIndex != 0 || p.TargetManifestIntentDigest != "" || !isSHA256(p.ProofDigest) {
+		if p.CommitIndex != 0 || p.TargetRegistryLayoutIntentDigest != "" || !isSHA256(p.ProofDigest) {
 			return errors.New("raftstore: invalid external predecessor fence")
 		}
 		return nil
@@ -105,35 +105,36 @@ type ShardPlacement struct {
 	Replicas []ReplicaPlacement `json:"replicas"`
 }
 
-type Manifest struct {
-	FormatVersion          uint32             `json:"format_version"`
-	ClusterID              string             `json:"cluster_id"`
-	StorageGeneration      string             `json:"storage_generation"`
-	ManifestVersion        uint64             `json:"manifest_version"`
-	PreviousManifestDigest string             `json:"previous_manifest_digest,omitempty"`
-	Predecessor            *PredecessorProof  `json:"predecessor,omitempty"`
-	SchemaVersion          uint32             `json:"schema_version"`
-	ProtocolVersion        uint32             `json:"protocol_version"`
-	HashVersion            string             `json:"hash_version"`
-	VirtualShardCount      uint32             `json:"virtual_shard_count"`
-	RouteBucketCount       uint32             `json:"route_bucket_count"`
-	BuildBucketCount       uint32             `json:"build_bucket_count"`
-	ReplicationFactor      uint32             `json:"replication_factor"`
-	ServePermitMaxMillis   uint64             `json:"serve_permit_max_millis"`
-	BootstrapTokenDigest   string             `json:"bootstrap_token_digest"`
-	Members                []RegistryMember   `json:"members"`
-	SystemReplicas         []ReplicaPlacement `json:"system_replicas"`
-	DataShards             []ShardPlacement   `json:"data_shards"`
+type RegistryLayout struct {
+	FormatVersion                 uint32             `json:"format_version"`
+	ClusterID                     string             `json:"cluster_id"`
+	RegistryGeneration            string             `json:"registry_generation"`
+	RegistryLayoutVersion         uint64             `json:"registry_layout_version"`
+	PreviousRegistryLayoutVersion uint64             `json:"previous_registry_layout_version,omitempty"`
+	PreviousRegistryLayoutDigest  string             `json:"previous_registry_layout_digest,omitempty"`
+	Predecessor                   *PredecessorProof  `json:"predecessor,omitempty"`
+	SchemaVersion                 uint32             `json:"schema_version"`
+	ProtocolVersion               uint32             `json:"protocol_version"`
+	HashVersion                   string             `json:"hash_version"`
+	VirtualShardCount             uint32             `json:"virtual_shard_count"`
+	RouteBucketCount              uint32             `json:"route_bucket_count"`
+	BuildBucketCount              uint32             `json:"build_bucket_count"`
+	ReplicationFactor             uint32             `json:"replication_factor"`
+	ServePermitMaxMillis          uint64             `json:"serve_permit_max_millis"`
+	BootstrapTokenDigest          string             `json:"bootstrap_token_digest"`
+	Members                       []RegistryMember   `json:"members"`
+	SystemReplicas                []ReplicaPlacement `json:"system_replicas"`
+	DataShards                    []ShardPlacement   `json:"data_shards"`
 }
 
-func (m Manifest) Validate() error {
+func (m RegistryLayout) Validate() error {
 	return m.validate(true)
 }
 
-func (m Manifest) validate(requireRolloverProof bool) error {
-	if m.FormatVersion != ManifestFormatV1 || m.ClusterID == "" || m.StorageGeneration == "" ||
-		m.ManifestVersion == 0 || m.SchemaVersion == 0 || m.ProtocolVersion == 0 {
-		return errors.New("raftstore: incomplete manifest identity")
+func (m RegistryLayout) validate(requireRolloverProof bool) error {
+	if m.FormatVersion != RegistryLayoutFormatV1 || m.ClusterID == "" || m.RegistryGeneration == "" ||
+		m.RegistryLayoutVersion == 0 || m.SchemaVersion == 0 || m.ProtocolVersion == 0 {
+		return errors.New("raftstore: incomplete registryLayout identity")
 	}
 	if m.HashVersion != "ShardHashV1" || m.VirtualShardCount == 0 ||
 		!isPowerOfTwo(m.VirtualShardCount) || !isPowerOfTwo(m.RouteBucketCount) ||
@@ -144,28 +145,30 @@ func (m Manifest) validate(requireRolloverProof bool) error {
 		!isSHA256(m.BootstrapTokenDigest) {
 		return errors.New("raftstore: permit lifetime and bootstrap token digest are required")
 	}
-	if m.ManifestVersion == 1 && m.PreviousManifestDigest != "" {
-		return errors.New("raftstore: first manifest cannot name a previous manifest")
+	if m.RegistryLayoutVersion == 1 &&
+		(m.PreviousRegistryLayoutVersion != 0 || m.PreviousRegistryLayoutDigest != "") {
+		return errors.New("raftstore: first Registry Layout cannot name a previous Registry Layout")
 	}
-	if m.ManifestVersion > 1 && !isSHA256(m.PreviousManifestDigest) {
-		return errors.New("raftstore: manifest lineage digest is required")
+	if m.RegistryLayoutVersion > 1 &&
+		(m.PreviousRegistryLayoutVersion != m.RegistryLayoutVersion-1 || !isSHA256(m.PreviousRegistryLayoutDigest)) {
+		return errors.New("raftstore: exact previous Registry Layout version and digest are required")
 	}
 	if m.Predecessor != nil {
 		if err := m.Predecessor.validate(requireRolloverProof); err != nil {
 			return err
 		}
-		if m.Predecessor.StorageGeneration == m.StorageGeneration {
+		if m.Predecessor.RegistryGeneration == m.RegistryGeneration {
 			return errors.New("raftstore: predecessor generation did not change")
 		}
 		if requireRolloverProof && m.Predecessor.Kind == RolloverConsensusClosure {
 			intentDigest, err := m.RolloverIntentDigest()
-			if err != nil || intentDigest != m.Predecessor.TargetManifestIntentDigest ||
+			if err != nil || intentDigest != m.Predecessor.TargetRegistryLayoutIntentDigest ||
 				m.Predecessor.ProofDigest != consensusClosureProofDigest(
-					m.ClusterID, m.Predecessor.StorageGeneration, m.Predecessor.ManifestDigest,
-					m.StorageGeneration, intentDigest, m.Predecessor.ServePermitMaxMillis,
+					m.ClusterID, m.Predecessor.RegistryGeneration, m.Predecessor.RegistryLayoutDigest,
+					m.RegistryGeneration, intentDigest, m.Predecessor.ServePermitMaxMillis,
 					m.Predecessor.CommitIndex,
 				) {
-				return errors.New("raftstore: consensus predecessor proof does not commit this successor manifest")
+				return errors.New("raftstore: consensus predecessor proof does not commit this successor registryLayout")
 			}
 		}
 	}
@@ -198,7 +201,7 @@ func (m Manifest) validate(requireRolloverProof bool) error {
 		return fmt.Errorf("raftstore: System Group: %w", err)
 	}
 	if len(m.DataShards) != int(m.VirtualShardCount) {
-		return errors.New("raftstore: manifest does not place every virtual shard")
+		return errors.New("raftstore: registryLayout does not place every virtual shard")
 	}
 	for i, shard := range m.DataShards {
 		if shard.ShardID != uint32(i) {
@@ -211,9 +214,9 @@ func (m Manifest) validate(requireRolloverProof bool) error {
 	return nil
 }
 
-// RolloverIntentDigest commits every successor manifest field except the
+// RolloverIntentDigest commits every successor registryLayout field except the
 // consensus proof outputs that are only known after the predecessor closes.
-func (m Manifest) RolloverIntentDigest() (string, error) {
+func (m RegistryLayout) RolloverIntentDigest() (string, error) {
 	if m.Predecessor == nil || m.Predecessor.Kind != RolloverConsensusClosure {
 		return "", errors.New("raftstore: rollover intent requires a consensus predecessor")
 	}
@@ -222,7 +225,7 @@ func (m Manifest) RolloverIntentDigest() (string, error) {
 	}
 	normalized := m
 	predecessor := *m.Predecessor
-	predecessor.TargetManifestIntentDigest = zeroSHA256
+	predecessor.TargetRegistryLayoutIntentDigest = zeroSHA256
 	predecessor.CommitIndex = 0
 	predecessor.ProofDigest = zeroSHA256
 	normalized.Predecessor = &predecessor
@@ -234,14 +237,14 @@ func (m Manifest) RolloverIntentDigest() (string, error) {
 	return hex.EncodeToString(digest[:]), nil
 }
 
-func (m Manifest) CanonicalBytes() ([]byte, error) {
+func (m RegistryLayout) CanonicalBytes() ([]byte, error) {
 	if err := m.Validate(); err != nil {
 		return nil, err
 	}
 	return json.Marshal(m)
 }
 
-func (m Manifest) Digest() (string, error) {
+func (m RegistryLayout) Digest() (string, error) {
 	raw, err := m.CanonicalBytes()
 	if err != nil {
 		return "", err
@@ -250,37 +253,37 @@ func (m Manifest) Digest() (string, error) {
 	return hex.EncodeToString(digest[:]), nil
 }
 
-type SignedManifest struct {
-	Manifest  Manifest `json:"manifest"`
-	KeyID     string   `json:"key_id"`
-	Signature string   `json:"signature"`
+type SignedRegistryLayout struct {
+	RegistryLayout RegistryLayout `json:"registry_layout"`
+	KeyID          string         `json:"key_id"`
+	Signature      string         `json:"signature"`
 }
 
-func SignManifest(manifest Manifest, keyID string, key ed25519.PrivateKey) (SignedManifest, error) {
+func SignRegistryLayout(registryLayout RegistryLayout, keyID string, key ed25519.PrivateKey) (SignedRegistryLayout, error) {
 	if keyID == "" || len(key) != ed25519.PrivateKeySize {
-		return SignedManifest{}, errors.New("raftstore: valid manifest signing key is required")
+		return SignedRegistryLayout{}, errors.New("raftstore: valid registryLayout signing key is required")
 	}
-	raw, err := manifest.CanonicalBytes()
+	raw, err := registryLayout.CanonicalBytes()
 	if err != nil {
-		return SignedManifest{}, err
+		return SignedRegistryLayout{}, err
 	}
-	signature := ed25519.Sign(key, append([]byte(manifestSignatureDomain), raw...))
-	return SignedManifest{Manifest: manifest, KeyID: keyID, Signature: base64.RawStdEncoding.EncodeToString(signature)}, nil
+	signature := ed25519.Sign(key, append([]byte(registryLayoutSignatureDomain), raw...))
+	return SignedRegistryLayout{RegistryLayout: registryLayout, KeyID: keyID, Signature: base64.RawStdEncoding.EncodeToString(signature)}, nil
 }
 
-func (s SignedManifest) Verify(keyring map[string]ed25519.PublicKey) (string, error) {
+func (s SignedRegistryLayout) Verify(keyring map[string]ed25519.PublicKey) (string, error) {
 	key := keyring[s.KeyID]
 	if len(key) != ed25519.PublicKeySize {
-		return "", errors.New("raftstore: manifest signing key is not trusted")
+		return "", errors.New("raftstore: registryLayout signing key is not trusted")
 	}
-	raw, err := s.Manifest.CanonicalBytes()
+	raw, err := s.RegistryLayout.CanonicalBytes()
 	if err != nil {
 		return "", err
 	}
 	signature, err := base64.RawStdEncoding.DecodeString(s.Signature)
 	if err != nil || len(signature) != ed25519.SignatureSize ||
-		!ed25519.Verify(key, append([]byte(manifestSignatureDomain), raw...), signature) {
-		return "", errors.New("raftstore: invalid manifest signature")
+		!ed25519.Verify(key, append([]byte(registryLayoutSignatureDomain), raw...), signature) {
+		return "", errors.New("raftstore: invalid registryLayout signature")
 	}
 	digest := sha256.Sum256(raw)
 	return hex.EncodeToString(digest[:]), nil
@@ -305,7 +308,7 @@ func validateReplicaSet(set []ReplicaPlacement, members map[string]RegistryMembe
 	seenReplicaIDs := make(map[uint64]struct{}, len(set))
 	for _, replica := range set {
 		if _, found := members[replica.MemberID]; !found || replica.ReplicaID == 0 {
-			return errors.New("replica does not match a manifest member")
+			return errors.New("replica does not match a registryLayout member")
 		}
 		if _, duplicate := seen[replica.MemberID]; duplicate {
 			return errors.New("duplicate replica member")

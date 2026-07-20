@@ -229,7 +229,7 @@ func validateBuildTransition(current, next clusterstate.BuildRecord) error {
 	if current.Projection != nil && next.Projection != nil &&
 		(current.Projection.NodeID != next.Projection.NodeID || current.Projection.NodeEpoch != next.Projection.NodeEpoch ||
 			current.Projection.BindingDigest != next.Projection.BindingDigest ||
-			current.Projection.StorageGeneration != next.Projection.StorageGeneration ||
+			current.Projection.RegistryGeneration != next.Projection.RegistryGeneration ||
 			current.Projection.LastEventSeq >= next.Projection.LastEventSeq) {
 		return errors.New("raftstore: Build execution changed or event sequence regressed")
 	}
@@ -323,7 +323,7 @@ func readyMatchesStarting(starting clusterstate.RouteStartingState, ready cluste
 	}
 	return ready.SandboxID == starting.SandboxID && ready.NodeID == starting.Binding.NodeID &&
 		ready.NodeEpoch == starting.Binding.NodeEpoch && ready.DataEndpoint == starting.Binding.DataEndpoint &&
-		ready.StorageGeneration == starting.Binding.StorageGeneration &&
+		ready.RegistryGeneration == starting.Binding.RegistryGeneration &&
 		ready.BindingDigest == starting.Binding.BindingDigest && ready.LastEventSeq > starting.LastEventSeq
 }
 
@@ -364,7 +364,7 @@ func buildProjectionMatchesBinding(
 	lastEventSeq uint64,
 ) bool {
 	return projection.BuildID != "" && projection.NodeID == binding.NodeID && projection.NodeEpoch == binding.NodeEpoch &&
-		projection.StorageGeneration == binding.StorageGeneration && projection.BindingDigest == binding.BindingDigest &&
+		projection.RegistryGeneration == binding.RegistryGeneration && projection.BindingDigest == binding.BindingDigest &&
 		projection.LastEventSeq > lastEventSeq
 }
 
@@ -443,7 +443,7 @@ func validateFenceTransition(current, next clusterstate.ExecutionFence) error {
 	current.Revision, next.Revision = clusterstate.Revision{}, clusterstate.Revision{}
 	current.FinalOutboxWatermark, next.FinalOutboxWatermark = 0, 0
 	if !reflect.DeepEqual(current, next) || nextWatermark < currentWatermark ||
-		nextRevision.StorageGeneration != currentRevision.StorageGeneration || nextRevision.ShardID != currentRevision.ShardID {
+		nextRevision.RegistryGeneration != currentRevision.RegistryGeneration || nextRevision.ShardID != currentRevision.ShardID {
 		return errors.New("raftstore: execution fence identity or proof changed")
 	}
 	return nil

@@ -30,15 +30,15 @@ func TestFenceOutboxAckMustCoverExactFinalWatermark(t *testing.T) {
 }
 
 func TestRuntimeCompactsFenceOnlyAfterRetentionAndEveryReplicaProof(t *testing.T) {
-	manifest := testManifest(1, "generation-1")
-	manifest.ServePermitMaxMillis = 1_000
-	digest, err := manifest.Digest()
+	registryLayout := testRegistryLayout(1, "generation-1")
+	registryLayout.ServePermitMaxMillis = 1_000
+	digest, err := registryLayout.Digest()
 	if err != nil {
 		t.Fatal(err)
 	}
-	identity := routeShardIdentity(t, manifest, "/g", "rk")
-	data := initializeDataShard(t, manifest, identity)
-	starting := routeStarting(t, manifest, "/g", "rk", "sandbox-1", 1, true)
+	identity := routeShardIdentity(t, registryLayout, "/g", "rk")
+	data := initializeDataShard(t, registryLayout, identity)
+	starting := routeStarting(t, registryLayout, "/g", "rk", "sandbox-1", 1, true)
 	applyDataOK(t, &data, 2, DataCommand{
 		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{Absent: true}, Route: &starting,
 	})
@@ -59,7 +59,7 @@ func TestRuntimeCompactsFenceOnlyAfterRetentionAndEveryReplicaProof(t *testing.T
 	})
 
 	system, _ := applySystem(t, SystemState{}, 1, SystemCommand{
-		Type: SystemBootstrap, Manifest: &manifest, Digest: digest,
+		Type: SystemBootstrap, RegistryLayout: &registryLayout, Digest: digest,
 	})
 	system, _ = applySystem(t, system, 2, SystemCommand{
 		Type: SystemSetGates, Gates: &GateUpdate{Serve: true, Write: true, Cutover: true},
@@ -104,7 +104,7 @@ func TestRuntimeCompactsFenceOnlyAfterRetentionAndEveryReplicaProof(t *testing.T
 	permitCache := NewPermitCache(time.Now)
 	if err := permitCache.Install(PermitGrant{
 		PermitIdentity: system.Identity(), CommitIndex: system.LastApplied,
-		MaxLifetimeMillis: manifest.ServePermitMaxMillis,
+		MaxLifetimeMillis: registryLayout.ServePermitMaxMillis,
 		ServeGate:         true, WriteGate: true, CutoverGate: true, RecoveryClosed: true,
 	}, time.Now()); err != nil {
 		t.Fatal(err)
@@ -116,7 +116,7 @@ func TestRuntimeCompactsFenceOnlyAfterRetentionAndEveryReplicaProof(t *testing.T
 			tuning.FenceRetentionMillis = 1
 			return tuning
 		}()},
-		manifest: manifest, manifestDigest: digest, member: manifest.Members[0],
+		registryLayout: registryLayout, registryLayoutDigest: digest, member: registryLayout.Members[0],
 		nodeHost: host, permitCache: permitCache,
 		enrollment: LocalEnrollment{Replicas: []LocalReplicaEnrollment{{
 			ShardID: raftShardID, ReplicaID: 1, StartPlan: ReplicaInitial,
@@ -127,7 +127,7 @@ func TestRuntimeCompactsFenceOnlyAfterRetentionAndEveryReplicaProof(t *testing.T
 				remoteProofs.Add(1)
 				return ReplicaAppliedProof{
 					ShardID: request.ShardID, ReplicaID: request.ReplicaID, MemberID: request.MemberID,
-					ManifestDigest: request.ManifestDigest, AppliedIndex: data.LastApplied,
+					RegistryLayoutDigest: request.RegistryLayoutDigest, AppliedIndex: data.LastApplied,
 				}, nil
 			},
 		},

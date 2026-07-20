@@ -34,14 +34,14 @@ func TestPebbleMillionReadyRouteGate(t *testing.T) {
 		t.Skipf("set %s=1 to run the million-Route state-engine gate", stateScaleGateEnvironment)
 	}
 	startedAt := time.Now()
-	manifest := testManifest(DefaultVirtualShards, "generation-state-scale")
-	digest, err := manifest.Digest()
+	registryLayout := testRegistryLayout(DefaultVirtualShards, "generation-state-scale")
+	digest, err := registryLayout.Digest()
 	if err != nil {
 		t.Fatal(err)
 	}
 	identity := PermitIdentity{
-		ClusterID: manifest.ClusterID, StorageGeneration: manifest.StorageGeneration,
-		SystemEpoch: 1, ManifestDigest: digest,
+		ClusterID: registryLayout.ClusterID, RegistryGeneration: registryLayout.RegistryGeneration,
+		SystemEpoch: 1, RegistryLayoutDigest: digest,
 	}
 	const groupName = "/state-scale"
 	shardRoutes := make([][]uint32, DefaultVirtualShards)
@@ -49,7 +49,7 @@ func TestPebbleMillionReadyRouteGate(t *testing.T) {
 	for routeID := uint32(0); routeID < stateScaleRouteCount; routeID++ {
 		routeKey := stateScaleRouteKey(routeID)
 		_, shardID, err := clusterstate.RouteShardFor(
-			groupName, routeKey, manifest.RouteBucketCount, manifest.VirtualShardCount,
+			groupName, routeKey, registryLayout.RouteBucketCount, registryLayout.VirtualShardCount,
 		)
 		if err != nil {
 			t.Fatal(err)
@@ -79,7 +79,7 @@ func TestPebbleMillionReadyRouteGate(t *testing.T) {
 			if index, err := machine.Open(make(chan struct{})); err != nil || index != 0 {
 				return fmt.Errorf("open shard %d at %d: %w", shardID, index, err)
 			}
-			bootstrap, err := NewDataShardBootstrap(manifest, shardID)
+			bootstrap, err := NewDataShardBootstrap(registryLayout, shardID)
 			if err != nil {
 				return err
 			}
@@ -101,7 +101,7 @@ func TestPebbleMillionReadyRouteGate(t *testing.T) {
 
 			entries := make([]sm.Entry, 0, len(shardRoutes[shardID])*2)
 			for position, routeID := range shardRoutes[shardID] {
-				starting, ready, err := stateScaleReadyRoute(manifest, groupName, stateScaleRouteKey(routeID), routeID, intent)
+				starting, ready, err := stateScaleReadyRoute(registryLayout, groupName, stateScaleRouteKey(routeID), routeID, intent)
 				if err != nil {
 					return err
 				}
@@ -218,7 +218,7 @@ func TestPebbleMillionReadyRouteGate(t *testing.T) {
 func stateScaleRouteKey(routeID uint32) string { return fmt.Sprintf("route-%07d", routeID) }
 
 func stateScaleReadyRoute(
-	manifest Manifest,
+	registryLayout RegistryLayout,
 	group, routeKey string,
 	routeID uint32,
 	intent clusterstate.DispatchIntent,
@@ -228,7 +228,7 @@ func stateScaleReadyRoute(
 	demandDigest := sha256.Sum256(intent.NormalizedDemand)
 	specDigest := sha256.Sum256(intent.DispatchSpec)
 	opaque, err := clusterstate.EncodeExecutionBinding(clusterstate.ExecutionBinding{
-		StorageGeneration: manifest.StorageGeneration, Kind: clusterstate.ExecutionKindSandbox,
+		RegistryGeneration: registryLayout.RegistryGeneration, Kind: clusterstate.ExecutionKindSandbox,
 		ObjectID: sandboxID, Group: group, RouteKey: routeKey, NodeID: nodeID, NodeEpoch: 7,
 		DemandDigest: demandDigest, DispatchSpecDigest: specDigest,
 	})
@@ -242,7 +242,7 @@ func stateScaleReadyRoute(
 	selected := uint32(0)
 	binding := clusterstate.ExecutionBindingIntent{
 		NodeID: nodeID, NodeEpoch: 7, DataEndpoint: nodeID + ":8443",
-		StorageGeneration: manifest.StorageGeneration, OpaqueBinding: opaque, BindingDigest: bindingDigest,
+		RegistryGeneration: registryLayout.RegistryGeneration, OpaqueBinding: opaque, BindingDigest: bindingDigest,
 	}
 	starting := clusterstate.RouteWorkflowRecord{
 		Group: group, RouteKey: routeKey, State: clusterstate.WorkflowRouteStarting,
@@ -257,7 +257,7 @@ func stateScaleReadyRoute(
 		Ready: &clusterstate.ReadyRoute{
 			SandboxID: sandboxID, NodeID: nodeID, NodeEpoch: 7, DataEndpoint: nodeID + ":8443",
 			TargetPort: 8080, AccessToken: "access-token", TemplateRef: "template-1",
-			StorageGeneration: manifest.StorageGeneration, BindingDigest: bindingDigest, LastEventSeq: 1,
+			RegistryGeneration: registryLayout.RegistryGeneration, BindingDigest: bindingDigest, LastEventSeq: 1,
 		},
 	}
 	return starting, ready, nil
@@ -273,8 +273,8 @@ func stateScaleLookupReady(
 	shardID := routeShards[routeID]
 	request := routeapi.ReadRouteRequest{
 		RequestIdentity: routeapi.RequestIdentity{
-			ClusterID: identity.ClusterID, StorageGeneration: identity.StorageGeneration,
-			SystemEpoch: identity.SystemEpoch, ManifestDigest: identity.ManifestDigest, ShardID: shardID,
+			ClusterID: identity.ClusterID, RegistryGeneration: identity.RegistryGeneration,
+			SystemEpoch: identity.SystemEpoch, RegistryLayoutDigest: identity.RegistryLayoutDigest, ShardID: shardID,
 		},
 		Group: group, RouteKey: stateScaleRouteKey(routeID),
 	}

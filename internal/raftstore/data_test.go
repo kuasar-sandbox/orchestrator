@@ -7,20 +7,20 @@ import (
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 )
 
-func TestDataShardBootstrapRequiresExactManifestIdentity(t *testing.T) {
-	manifest := testManifest(4, "generation-1")
-	identity := routeShardIdentity(t, manifest, "/g", "rk")
-	replicas := replicaIDsForPlacement(manifest.DataShards[identity.ShardID])
-	bootstrap, _ := NewDataShardBootstrap(manifest, identity.ShardID)
+func TestDataShardBootstrapRequiresExactRegistryLayoutIdentity(t *testing.T) {
+	registryLayout := testRegistryLayout(4, "generation-1")
+	identity := routeShardIdentity(t, registryLayout, "/g", "rk")
+	replicas := replicaIDsForPlacement(registryLayout.DataShards[identity.ShardID])
+	bootstrap, _ := NewDataShardBootstrap(registryLayout, identity.ShardID)
 	state := DataState{}
 
 	wrong := identity
-	wrong.ManifestDigest = digestFor("another-manifest")
+	wrong.RegistryLayoutDigest = digestFor("another-registryLayout")
 	result := ApplyDataCommand(&state, 1, DataCommand{
 		Type: DataInitializeShard, Identity: wrong, Bootstrap: &bootstrap, ReplicaIDs: replicas,
 	})
 	if !result.Conflict || state.Initialized || state.LastApplied != 0 {
-		t.Fatalf("wrong manifest bootstrap = %+v, state=%+v", result, state)
+		t.Fatalf("wrong registryLayout bootstrap = %+v, state=%+v", result, state)
 	}
 
 	result = ApplyDataCommand(&state, 2, DataCommand{
@@ -34,7 +34,7 @@ func TestDataShardBootstrapRequiresExactManifestIdentity(t *testing.T) {
 	}
 
 	corrupt := state
-	corrupt.Routes = map[string]clusterstate.RouteWorkflowRecord{"wrong-key": routeStarting(t, manifest, "/g", "rk", "sandbox-1", 1, false)}
+	corrupt.Routes = map[string]clusterstate.RouteWorkflowRecord{"wrong-key": routeStarting(t, registryLayout, "/g", "rk", "sandbox-1", 1, false)}
 	corrupt.Routes["wrong-key"] = withRevision(corrupt.Routes["wrong-key"], corrupt, 2)
 	if err := corrupt.Validate(); err == nil {
 		t.Fatal("snapshot validation accepted a Route under the wrong map key")
@@ -42,9 +42,9 @@ func TestDataShardBootstrapRequiresExactManifestIdentity(t *testing.T) {
 }
 
 func TestDataCASConflictAdvancesAppliedIndexWithoutChangingRow(t *testing.T) {
-	manifest := testManifest(4, "generation-1")
-	state, identity := initializedRouteShard(t, manifest, "/g", "rk")
-	starting := routeStarting(t, manifest, "/g", "rk", "sandbox-1", 1, false)
+	registryLayout := testRegistryLayout(4, "generation-1")
+	state, identity := initializedRouteShard(t, registryLayout, "/g", "rk")
+	starting := routeStarting(t, registryLayout, "/g", "rk", "sandbox-1", 1, false)
 	applyDataOK(t, &state, 2, DataCommand{
 		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{Absent: true}, Route: &starting,
 	})
@@ -64,7 +64,7 @@ func TestDataCASConflictAdvancesAppliedIndexWithoutChangingRow(t *testing.T) {
 		t.Fatalf("stale CAS = %+v, applied=%d, row=%+v", result, state.LastApplied, stored.Revision)
 	}
 
-	selected := routeStarting(t, manifest, "/g", "rk", "sandbox-1", 1, true)
+	selected := routeStarting(t, registryLayout, "/g", "rk", "sandbox-1", 1, true)
 	applyDataOK(t, &state, 4, DataCommand{
 		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{LogIndex: 2}, Route: &selected,
 	})
@@ -74,9 +74,9 @@ func TestDataCASConflictAdvancesAppliedIndexWithoutChangingRow(t *testing.T) {
 }
 
 func TestStartingCandidateRejectionAndSandboxRoundAdvance(t *testing.T) {
-	manifest := testManifest(4, "generation-1")
-	state, identity := initializedRouteShard(t, manifest, "/g", "rk")
-	selected := routeStarting(t, manifest, "/g", "rk", "sandbox-1", 1, true)
+	registryLayout := testRegistryLayout(4, "generation-1")
+	state, identity := initializedRouteShard(t, registryLayout, "/g", "rk")
+	selected := routeStarting(t, registryLayout, "/g", "rk", "sandbox-1", 1, true)
 	applyDataOK(t, &state, 2, DataCommand{
 		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{Absent: true}, Route: &selected,
 	})
@@ -91,7 +91,7 @@ func TestStartingCandidateRejectionAndSandboxRoundAdvance(t *testing.T) {
 
 	selectedSecond := cloneRouteRecord(state.Routes[routeMapKey("/g", "rk")])
 	second := uint32(1)
-	binding := testBinding(t, manifest, clusterstate.ExecutionKindSandbox, "sandbox-1", "/g", "rk", "node-2", selectedSecond.Starting.Intent)
+	binding := testBinding(t, registryLayout, clusterstate.ExecutionKindSandbox, "sandbox-1", "/g", "rk", "node-2", selectedSecond.Starting.Intent)
 	selectedSecond.Starting.SelectedCandidate = &second
 	selectedSecond.Starting.Binding = &binding
 	applyDataOK(t, &state, 4, DataCommand{
@@ -106,7 +106,7 @@ func TestStartingCandidateRejectionAndSandboxRoundAdvance(t *testing.T) {
 		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{LogIndex: 4}, Route: &exhausted,
 	})
 
-	nextRound := routeStarting(t, manifest, "/g", "rk", "sandbox-2", 2, false)
+	nextRound := routeStarting(t, registryLayout, "/g", "rk", "sandbox-2", 2, false)
 	applyDataOK(t, &state, 6, DataCommand{
 		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{LogIndex: 5}, Route: &nextRound,
 	})
@@ -122,9 +122,9 @@ func TestStartingCandidateRejectionAndSandboxRoundAdvance(t *testing.T) {
 }
 
 func TestBuildStartingCommitsDefinitiveCandidateRejection(t *testing.T) {
-	manifest := testManifest(4, "generation-1")
-	state, identity := initializedBuildShard(t, manifest, "/g", "build-reject")
-	selected := buildStarting(t, manifest, "/g", "build-reject", true)
+	registryLayout := testRegistryLayout(4, "generation-1")
+	state, identity := initializedBuildShard(t, registryLayout, "/g", "build-reject")
+	selected := buildStarting(t, registryLayout, "/g", "build-reject", true)
 	applyDataOK(t, &state, 2, DataCommand{
 		Type: DataPutBuild, Identity: identity, Expect: RevisionExpectation{Absent: true}, Build: &selected,
 	})
@@ -138,9 +138,9 @@ func TestBuildStartingCommitsDefinitiveCandidateRejection(t *testing.T) {
 }
 
 func TestRouteAutoResumeReplacementAndFenceCompaction(t *testing.T) {
-	manifest := testManifest(4, "generation-1")
-	state, identity := initializedRouteShard(t, manifest, "/g", "rk")
-	starting := routeStarting(t, manifest, "/g", "rk", "sandbox-1", 1, true)
+	registryLayout := testRegistryLayout(4, "generation-1")
+	state, identity := initializedRouteShard(t, registryLayout, "/g", "rk")
+	starting := routeStarting(t, registryLayout, "/g", "rk", "sandbox-1", 1, true)
 	applyDataOK(t, &state, 2, DataCommand{
 		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{Absent: true}, Route: &starting,
 	})
@@ -176,7 +176,7 @@ func TestRouteAutoResumeReplacementAndFenceCompaction(t *testing.T) {
 		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{LogIndex: 7}, Route: &tombstone,
 	})
 
-	replacement := routeStarting(t, manifest, "/g", "rk", "sandbox-2", 2, false)
+	replacement := routeStarting(t, registryLayout, "/g", "rk", "sandbox-2", 2, false)
 	result = ApplyDataCommand(&state, 9, DataCommand{
 		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{LogIndex: 8}, Route: &replacement,
 	})
@@ -215,9 +215,9 @@ func TestRouteAutoResumeReplacementAndFenceCompaction(t *testing.T) {
 }
 
 func TestBuildStateProgressionRejectsSkippedAndRepeatedEvents(t *testing.T) {
-	manifest := testManifest(4, "generation-1")
-	state, identity := initializedBuildShard(t, manifest, "/g", "build-1")
-	starting := buildStarting(t, manifest, "/g", "build-1", true)
+	registryLayout := testRegistryLayout(4, "generation-1")
+	state, identity := initializedBuildShard(t, registryLayout, "/g", "build-1")
+	starting := buildStarting(t, registryLayout, "/g", "build-1", true)
 	applyDataOK(t, &state, 2, DataCommand{
 		Type: DataPutBuild, Identity: identity, Expect: RevisionExpectation{Absent: true}, Build: &starting,
 	})
@@ -261,11 +261,11 @@ func TestBuildStateProgressionRejectsSkippedAndRepeatedEvents(t *testing.T) {
 }
 
 func TestDataServingEpochTransitionPersistsBothReplicaSets(t *testing.T) {
-	manifest := testManifest(4, "generation-1")
-	state, identity := initializedRouteShard(t, manifest, "/g", "rk")
+	registryLayout := testRegistryLayout(4, "generation-1")
+	state, identity := initializedRouteShard(t, registryLayout, "/g", "rk")
 	next := identity.PermitIdentity
 	next.SystemEpoch++
-	next.ManifestDigest = digestFor("manifest-next")
+	next.RegistryLayoutDigest = digestFor("registryLayout-next")
 	nextReplicas := []uint64{2, 3, 4}
 	applyDataOK(t, &state, 2, DataCommand{
 		Type: DataPrepareEpoch, Identity: identity, Epoch: &next, ReplicaIDs: nextReplicas,
@@ -289,17 +289,17 @@ func TestDataServingEpochTransitionPersistsBothReplicaSets(t *testing.T) {
 	}
 }
 
-func TestDataServingEpochCanAdvanceWithinOneManifestForRecovery(t *testing.T) {
-	manifest := testManifest(4, "generation-1")
-	state, identity := initializedRouteShard(t, manifest, "/g", "rk")
+func TestDataServingEpochCanAdvanceWithinOneRegistryLayoutForRecovery(t *testing.T) {
+	registryLayout := testRegistryLayout(4, "generation-1")
+	state, identity := initializedRouteShard(t, registryLayout, "/g", "rk")
 	recovery := identity.PermitIdentity
 	recovery.SystemEpoch++
 	replicas := append([]uint64(nil), state.ReplicaIDs...)
 	applyDataOK(t, &state, 2, DataCommand{
 		Type: DataPrepareEpoch, Identity: identity, Epoch: &recovery, ReplicaIDs: replicas,
 	})
-	if len(state.ServingEpochs) != 2 || state.ServingEpochs[1].ManifestDigest != identity.ManifestDigest {
-		t.Fatalf("recovery epoch was not prepared under the active manifest: %+v", state.ServingEpochs)
+	if len(state.ServingEpochs) != 2 || state.ServingEpochs[1].RegistryLayoutDigest != identity.RegistryLayoutDigest {
+		t.Fatalf("recovery epoch was not prepared under the active registryLayout: %+v", state.ServingEpochs)
 	}
 	recoveryIdentity := ShardRequestIdentity{PermitIdentity: recovery, ShardID: identity.ShardID}
 	previous := identity.PermitIdentity
@@ -311,53 +311,53 @@ func TestDataServingEpochCanAdvanceWithinOneManifestForRecovery(t *testing.T) {
 	}
 }
 
-func initializedRouteShard(t *testing.T, manifest Manifest, group, routeKey string) (DataState, ShardRequestIdentity) {
+func initializedRouteShard(t *testing.T, registryLayout RegistryLayout, group, routeKey string) (DataState, ShardRequestIdentity) {
 	t.Helper()
-	identity := routeShardIdentity(t, manifest, group, routeKey)
-	return initializeDataShard(t, manifest, identity), identity
+	identity := routeShardIdentity(t, registryLayout, group, routeKey)
+	return initializeDataShard(t, registryLayout, identity), identity
 }
 
-func initializedBuildShard(t *testing.T, manifest Manifest, group, buildID string) (DataState, ShardRequestIdentity) {
+func initializedBuildShard(t *testing.T, registryLayout RegistryLayout, group, buildID string) (DataState, ShardRequestIdentity) {
 	t.Helper()
-	_, shardID, err := clusterstate.BuildShardFor(group, buildID, manifest.BuildBucketCount, manifest.VirtualShardCount)
+	_, shardID, err := clusterstate.BuildShardFor(group, buildID, registryLayout.BuildBucketCount, registryLayout.VirtualShardCount)
 	if err != nil {
 		t.Fatal(err)
 	}
-	identity := manifestShardIdentity(t, manifest, shardID)
-	return initializeDataShard(t, manifest, identity), identity
+	identity := registryLayoutShardIdentity(t, registryLayout, shardID)
+	return initializeDataShard(t, registryLayout, identity), identity
 }
 
-func routeShardIdentity(t *testing.T, manifest Manifest, group, routeKey string) ShardRequestIdentity {
+func routeShardIdentity(t *testing.T, registryLayout RegistryLayout, group, routeKey string) ShardRequestIdentity {
 	t.Helper()
-	_, shardID, err := clusterstate.RouteShardFor(group, routeKey, manifest.RouteBucketCount, manifest.VirtualShardCount)
+	_, shardID, err := clusterstate.RouteShardFor(group, routeKey, registryLayout.RouteBucketCount, registryLayout.VirtualShardCount)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return manifestShardIdentity(t, manifest, shardID)
+	return registryLayoutShardIdentity(t, registryLayout, shardID)
 }
 
-func manifestShardIdentity(t *testing.T, manifest Manifest, shardID uint32) ShardRequestIdentity {
+func registryLayoutShardIdentity(t *testing.T, registryLayout RegistryLayout, shardID uint32) ShardRequestIdentity {
 	t.Helper()
-	digest, err := manifest.Digest()
+	digest, err := registryLayout.Digest()
 	if err != nil {
 		t.Fatal(err)
 	}
 	return ShardRequestIdentity{PermitIdentity: PermitIdentity{
-		ClusterID: manifest.ClusterID, StorageGeneration: manifest.StorageGeneration,
-		SystemEpoch: 1, ManifestDigest: digest,
+		ClusterID: registryLayout.ClusterID, RegistryGeneration: registryLayout.RegistryGeneration,
+		SystemEpoch: 1, RegistryLayoutDigest: digest,
 	}, ShardID: shardID}
 }
 
-func initializeDataShard(t *testing.T, manifest Manifest, identity ShardRequestIdentity) DataState {
+func initializeDataShard(t *testing.T, registryLayout RegistryLayout, identity ShardRequestIdentity) DataState {
 	t.Helper()
 	state := DataState{}
-	bootstrap, err := NewDataShardBootstrap(manifest, identity.ShardID)
+	bootstrap, err := NewDataShardBootstrap(registryLayout, identity.ShardID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	applyDataOK(t, &state, 1, DataCommand{
 		Type: DataInitializeShard, Identity: identity, Bootstrap: &bootstrap,
-		ReplicaIDs: replicaIDsForPlacement(manifest.DataShards[identity.ShardID]),
+		ReplicaIDs: replicaIDsForPlacement(registryLayout.DataShards[identity.ShardID]),
 	})
 	return state
 }
@@ -370,7 +370,7 @@ func applyDataOK(t *testing.T, state *DataState, index uint64, command DataComma
 	}
 }
 
-func routeStarting(t *testing.T, manifest Manifest, group, routeKey, sandboxID string, round uint64, selected bool) clusterstate.RouteWorkflowRecord {
+func routeStarting(t *testing.T, registryLayout RegistryLayout, group, routeKey, sandboxID string, round uint64, selected bool) clusterstate.RouteWorkflowRecord {
 	t.Helper()
 	intent := testDispatchIntent(t)
 	candidates := []clusterstate.PlacementCandidate{{NodeID: "node-1"}, {NodeID: "node-2"}}
@@ -379,7 +379,7 @@ func routeStarting(t *testing.T, manifest Manifest, group, routeKey, sandboxID s
 	}
 	if selected {
 		index := uint32(0)
-		binding := testBinding(t, manifest, clusterstate.ExecutionKindSandbox, sandboxID, group, routeKey, "node-1", intent)
+		binding := testBinding(t, registryLayout, clusterstate.ExecutionKindSandbox, sandboxID, group, routeKey, "node-1", intent)
 		starting.SelectedCandidate, starting.Binding = &index, &binding
 	}
 	return clusterstate.RouteWorkflowRecord{Group: group, RouteKey: routeKey, State: clusterstate.WorkflowRouteStarting, Starting: starting}
@@ -397,7 +397,7 @@ func readyRecord(starting clusterstate.RouteWorkflowRecord, eventSeq uint64) clu
 		Ready: &clusterstate.ReadyRoute{
 			SandboxID: starting.Starting.SandboxID, NodeID: binding.NodeID, NodeEpoch: binding.NodeEpoch,
 			DataEndpoint: binding.DataEndpoint, TargetPort: 8080, AccessToken: "access-token",
-			TemplateRef: "template-1", StorageGeneration: binding.StorageGeneration,
+			TemplateRef: "template-1", RegistryGeneration: binding.RegistryGeneration,
 			BindingDigest: binding.BindingDigest, LastEventSeq: eventSeq,
 		},
 	}
@@ -440,7 +440,7 @@ func terminalRouteAndFence(deleting clusterstate.RouteWorkflowRecord, eventSeq u
 	}
 	fence := clusterstate.ExecutionFence{
 		Group: deleting.Group, RouteKey: deleting.RouteKey, SandboxID: execution.SandboxID,
-		NodeID: execution.NodeID, NodeEpoch: execution.NodeEpoch, StorageGeneration: execution.StorageGeneration,
+		NodeID: execution.NodeID, NodeEpoch: execution.NodeEpoch, RegistryGeneration: execution.RegistryGeneration,
 		BindingDigest: execution.BindingDigest, LastEventSeq: eventSeq, FinalOutboxWatermark: eventSeq, Proof: proof,
 	}
 	return tombstone, fence
@@ -458,7 +458,7 @@ func fenceCompaction(fence clusterstate.ExecutionFence, replicas []uint64) Fence
 	}
 }
 
-func buildStarting(t *testing.T, manifest Manifest, group, buildID string, selected bool) clusterstate.BuildRecord {
+func buildStarting(t *testing.T, registryLayout RegistryLayout, group, buildID string, selected bool) clusterstate.BuildRecord {
 	t.Helper()
 	intent := testDispatchIntent(t)
 	starting := &clusterstate.BuildStartingState{
@@ -466,7 +466,7 @@ func buildStarting(t *testing.T, manifest Manifest, group, buildID string, selec
 	}
 	if selected {
 		index := uint32(0)
-		binding := testBinding(t, manifest, clusterstate.ExecutionKindBuild, buildID, group, "", "node-1", intent)
+		binding := testBinding(t, registryLayout, clusterstate.ExecutionKindBuild, buildID, group, "", "node-1", intent)
 		starting.SelectedCandidate, starting.Binding = &index, &binding
 	}
 	return clusterstate.BuildRecord{Group: group, BuildID: buildID, State: clusterstate.BuildStarting, Starting: starting}
@@ -478,7 +478,7 @@ func buildProjectionRecord(starting clusterstate.BuildRecord, state clusterstate
 		Group: starting.Group, BuildID: starting.BuildID, State: state,
 		Projection: &clusterstate.BuildProjection{
 			BuildID: starting.BuildID, NodeID: binding.NodeID, NodeEpoch: binding.NodeEpoch,
-			StorageGeneration: binding.StorageGeneration, BindingDigest: binding.BindingDigest,
+			RegistryGeneration: binding.RegistryGeneration, BindingDigest: binding.BindingDigest,
 			TemplateRef: "template-1", LastEventSeq: eventSeq,
 		},
 	}
@@ -503,7 +503,7 @@ func testDispatchIntentNoFail() clusterstate.DispatchIntent {
 
 func testBinding(
 	t *testing.T,
-	manifest Manifest,
+	registryLayout RegistryLayout,
 	kind clusterstate.ExecutionKind,
 	objectID, group, routeKey, nodeID string,
 	intent clusterstate.DispatchIntent,
@@ -512,7 +512,7 @@ func testBinding(
 	demandDigest := sha256.Sum256(intent.NormalizedDemand)
 	specDigest := sha256.Sum256(intent.DispatchSpec)
 	opaque, err := clusterstate.EncodeExecutionBinding(clusterstate.ExecutionBinding{
-		StorageGeneration: manifest.StorageGeneration, Kind: kind, ObjectID: objectID, Group: group,
+		RegistryGeneration: registryLayout.RegistryGeneration, Kind: kind, ObjectID: objectID, Group: group,
 		RouteKey: routeKey, NodeID: nodeID, NodeEpoch: 7, DemandDigest: demandDigest, DispatchSpecDigest: specDigest,
 	})
 	if err != nil {
@@ -524,7 +524,7 @@ func testBinding(
 	}
 	return clusterstate.ExecutionBindingIntent{
 		NodeID: nodeID, NodeEpoch: 7, DataEndpoint: nodeID + ":8443",
-		StorageGeneration: manifest.StorageGeneration, OpaqueBinding: opaque, BindingDigest: digest,
+		RegistryGeneration: registryLayout.RegistryGeneration, OpaqueBinding: opaque, BindingDigest: digest,
 	}
 }
 

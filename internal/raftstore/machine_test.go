@@ -11,15 +11,15 @@ import (
 )
 
 func TestDataStateMachineAppliesConflictAndRestoresDeterministicSnapshot(t *testing.T) {
-	manifest := testManifest(4, "generation-1")
-	identity := routeShardIdentity(t, manifest, "/g", "rk")
-	replicas := replicaIDsForPlacement(manifest.DataShards[identity.ShardID])
-	bootstrap, _ := NewDataShardBootstrap(manifest, identity.ShardID)
+	registryLayout := testRegistryLayout(4, "generation-1")
+	identity := routeShardIdentity(t, registryLayout, "/g", "rk")
+	replicas := replicaIDsForPlacement(registryLayout.DataShards[identity.ShardID])
+	bootstrap, _ := NewDataShardBootstrap(registryLayout, identity.ShardID)
 	machine := &DataStateMachine{raftShardID: DataRaftShardID(identity.ShardID), replicaID: replicas[0]}
 	updateDataMachine(t, machine, 1, DataCommand{
 		Type: DataInitializeShard, Identity: identity, Bootstrap: &bootstrap, ReplicaIDs: replicas,
 	}, true)
-	starting := routeStarting(t, manifest, "/g", "rk", "sandbox-1", 1, true)
+	starting := routeStarting(t, registryLayout, "/g", "rk", "sandbox-1", 1, true)
 	updateDataMachine(t, machine, 2, DataCommand{
 		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{Absent: true}, Route: &starting,
 	}, true)
@@ -66,14 +66,14 @@ func TestDataStateMachineAppliesConflictAndRestoresDeterministicSnapshot(t *test
 }
 
 func TestSystemStateMachineReturnsQuorumPermitAndSnapshotsState(t *testing.T) {
-	manifest := testManifest(4, "generation-1")
-	digest, err := manifest.Digest()
+	registryLayout := testRegistryLayout(4, "generation-1")
+	digest, err := registryLayout.Digest()
 	if err != nil {
 		t.Fatal(err)
 	}
 	machine := &SystemStateMachine{raftShardID: SystemRaftShardID, replicaID: 1}
 	updateSystemMachine(t, machine, 1, SystemCommand{
-		Type: SystemBootstrap, Manifest: &manifest, Digest: digest,
+		Type: SystemBootstrap, RegistryLayout: &registryLayout, Digest: digest,
 	}, true)
 	updateSystemMachine(t, machine, 2, SystemCommand{
 		Type: SystemSetGates, Gates: &GateUpdate{Serve: true, Write: true, Cutover: true},
@@ -103,23 +103,23 @@ func TestSystemStateMachineReturnsQuorumPermitAndSnapshotsState(t *testing.T) {
 		t.Fatal(err)
 	}
 	state := lookup.(SystemState)
-	if state.ActiveManifestDigest != digest || state.LastApplied != 4 || !state.ServeGate {
+	if state.ActiveRegistryLayoutDigest != digest || state.LastApplied != 4 || !state.ServeGate {
 		t.Fatalf("restored System state = %+v", state)
 	}
 }
 
 func TestStateMachineRejectsWrongShardAndUnknownCommandFields(t *testing.T) {
-	manifest := testManifest(4, "generation-1")
-	identity := routeShardIdentity(t, manifest, "/g", "rk")
-	replicas := replicaIDsForPlacement(manifest.DataShards[identity.ShardID])
-	bootstrap, _ := NewDataShardBootstrap(manifest, identity.ShardID)
+	registryLayout := testRegistryLayout(4, "generation-1")
+	identity := routeShardIdentity(t, registryLayout, "/g", "rk")
+	replicas := replicaIDsForPlacement(registryLayout.DataShards[identity.ShardID])
+	bootstrap, _ := NewDataShardBootstrap(registryLayout, identity.ShardID)
 	command, err := EncodeDataCommand(DataCommand{
 		Type: DataInitializeShard, Identity: identity, Bootstrap: &bootstrap, ReplicaIDs: replicas,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	wrong := &DataStateMachine{raftShardID: DataRaftShardID((identity.ShardID + 1) % manifest.VirtualShardCount), replicaID: replicas[0]}
+	wrong := &DataStateMachine{raftShardID: DataRaftShardID((identity.ShardID + 1) % registryLayout.VirtualShardCount), replicaID: replicas[0]}
 	if _, err := wrong.Update(sm.Entry{Index: 1, Cmd: command}); err == nil {
 		t.Fatal("command committed to another logical shard was accepted")
 	}
@@ -131,10 +131,10 @@ func TestStateMachineRejectsWrongShardAndUnknownCommandFields(t *testing.T) {
 }
 
 func TestJoiningReplicaReplaysBootstrapDeterministically(t *testing.T) {
-	manifest := testManifest(4, "generation-1")
-	digest, _ := manifest.Digest()
+	registryLayout := testRegistryLayout(4, "generation-1")
+	digest, _ := registryLayout.Digest()
 	systemCommand, err := EncodeSystemCommand(SystemCommand{
-		Type: SystemBootstrap, Manifest: &manifest, Digest: digest,
+		Type: SystemBootstrap, RegistryLayout: &registryLayout, Digest: digest,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -153,8 +153,8 @@ func TestJoiningReplicaReplaysBootstrapDeterministically(t *testing.T) {
 		t.Fatal("System replicas applied the same committed history differently")
 	}
 
-	identity := manifestShardIdentity(t, manifest, 0)
-	bootstrap, _ := NewDataShardBootstrap(manifest, 0)
+	identity := registryLayoutShardIdentity(t, registryLayout, 0)
+	bootstrap, _ := NewDataShardBootstrap(registryLayout, 0)
 	dataCommand, err := EncodeDataCommand(DataCommand{
 		Type: DataInitializeShard, Identity: identity, Bootstrap: &bootstrap,
 		ReplicaIDs: append([]uint64(nil), bootstrap.ReplicaIDs...),

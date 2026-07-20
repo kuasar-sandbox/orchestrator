@@ -452,9 +452,9 @@ func TestDurableEventReplayStartsImmediatelyAndIsBatchBounded(t *testing.T) {
 		wake: make(chan struct{}, 1),
 		events: []routesync.ExecutionEvent{
 			{ObjectKind: "sandbox", ObjectID: "sandbox-1", NodeID: "node-1", NodeEpoch: 7,
-				StorageGeneration: "generation-1", BindingDigest: strings.Repeat("a", 64), EventSeq: 2, State: "READY"},
+				RegistryGeneration: "generation-1", BindingDigest: strings.Repeat("a", 64), EventSeq: 2, State: "READY"},
 			{ObjectKind: "build", ObjectID: "build-1", NodeID: "node-1", NodeEpoch: 7,
-				StorageGeneration: "generation-1", BindingDigest: strings.Repeat("b", 64), EventSeq: 3, State: "BUILDING"},
+				RegistryGeneration: "generation-1", BindingDigest: strings.Repeat("b", 64), EventSeq: 3, State: "BUILDING"},
 		},
 	}
 	eventOut := make(chan *routesync.Msg, 2)

@@ -61,7 +61,7 @@ func workflowDispatchSpec(
 	demandDigest, _ := hex.DecodeString(intent.DemandDigest)
 	specDigest, _ := hex.DecodeString(intent.DispatchSpecDigest)
 	binding := clusterstate.ExecutionBinding{
-		StorageGeneration: "generation-1", Kind: kind, ObjectID: objectID,
+		RegistryGeneration: "generation-1", Kind: kind, ObjectID: objectID,
 		Group: "group-1", RouteKey: routeKey, NodeID: "node-1", NodeEpoch: 7,
 	}
 	copy(binding.DemandDigest[:], demandDigest)
@@ -79,7 +79,7 @@ func workflowDispatchSpec(
 		NodeID: "node-1", NodeEpoch: 7, SessionSeq: 11, DataEndpoint: "10.0.0.1:8443",
 		Intent: intent,
 		Binding: clusterstate.ExecutionBindingIntent{
-			NodeID: "node-1", NodeEpoch: 7, DataEndpoint: "10.0.0.1:8443", StorageGeneration: "generation-1",
+			NodeID: "node-1", NodeEpoch: 7, DataEndpoint: "10.0.0.1:8443", RegistryGeneration: "generation-1",
 			OpaqueBinding: opaque, BindingDigest: bindingDigest,
 		},
 	})

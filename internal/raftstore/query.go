@@ -379,8 +379,8 @@ func positiveBuildState(state clusterstate.BuildWorkflowState) bool {
 
 func shardIdentityFromRoute(identity routeapi.RequestIdentity) ShardRequestIdentity {
 	return ShardRequestIdentity{PermitIdentity: PermitIdentity{
-		ClusterID: identity.ClusterID, StorageGeneration: identity.StorageGeneration,
-		SystemEpoch: identity.SystemEpoch, ManifestDigest: identity.ManifestDigest,
+		ClusterID: identity.ClusterID, RegistryGeneration: identity.RegistryGeneration,
+		SystemEpoch: identity.SystemEpoch, RegistryLayoutDigest: identity.RegistryLayoutDigest,
 	}, ShardID: identity.ShardID}
 }
 

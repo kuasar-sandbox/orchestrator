@@ -9,23 +9,23 @@ import (
 )
 
 type ReplicaCatchUpProof struct {
-	ShardID        uint64 `json:"shard_id"`
-	ReplicaID      uint64 `json:"replica_id"`
-	MemberID       string `json:"member_id"`
-	ManifestDigest string `json:"manifest_digest"`
-	AppliedIndex   uint64 `json:"applied_index"`
+	ShardID              uint64 `json:"shard_id"`
+	ReplicaID            uint64 `json:"replica_id"`
+	MemberID             string `json:"member_id"`
+	RegistryLayoutDigest string `json:"registry_layout_digest"`
+	AppliedIndex         uint64 `json:"applied_index"`
 }
 
 type ReplicaCatchUpRequest struct {
-	ShardID             uint64 `json:"shard_id"`
-	ReplicaID           uint64 `json:"replica_id"`
-	MemberID            string `json:"member_id"`
-	ManifestDigest      string `json:"manifest_digest"`
-	MinimumAppliedIndex uint64 `json:"minimum_applied_index"`
+	ShardID              uint64 `json:"shard_id"`
+	ReplicaID            uint64 `json:"replica_id"`
+	MemberID             string `json:"member_id"`
+	RegistryLayoutDigest string `json:"registry_layout_digest"`
+	MinimumAppliedIndex  uint64 `json:"minimum_applied_index"`
 }
 
 func (r ReplicaCatchUpRequest) Validate() error {
-	if r.ShardID == 0 || r.ReplicaID == 0 || r.MemberID == "" || !isSHA256(r.ManifestDigest) ||
+	if r.ShardID == 0 || r.ReplicaID == 0 || r.MemberID == "" || !isSHA256(r.RegistryLayoutDigest) ||
 		r.MinimumAppliedIndex == 0 {
 		return errors.New("raftstore: replica catch-up request is incomplete")
 	}
@@ -37,41 +37,41 @@ func (p ReplicaCatchUpProof) Validate(request ReplicaCatchUpRequest) error {
 		return err
 	}
 	if p.ShardID != request.ShardID || p.ReplicaID != request.ReplicaID || p.MemberID != request.MemberID ||
-		p.ManifestDigest != request.ManifestDigest || p.AppliedIndex < request.MinimumAppliedIndex {
+		p.RegistryLayoutDigest != request.RegistryLayoutDigest || p.AppliedIndex < request.MinimumAppliedIndex {
 		return errors.New("raftstore: replica catch-up proof is incomplete")
 	}
 	return nil
 }
 
 type ReplicaPromotionRequest struct {
-	ShardID        uint64 `json:"shard_id"`
-	ReplicaID      uint64 `json:"replica_id"`
-	MemberID       string `json:"member_id"`
-	ManifestDigest string `json:"manifest_digest"`
+	ShardID              uint64 `json:"shard_id"`
+	ReplicaID            uint64 `json:"replica_id"`
+	MemberID             string `json:"member_id"`
+	RegistryLayoutDigest string `json:"registry_layout_digest"`
 }
 
 type ReplicaAppliedRequest struct {
-	ShardID             uint64 `json:"shard_id"`
-	ReplicaID           uint64 `json:"replica_id"`
-	MemberID            string `json:"member_id"`
-	ManifestDigest      string `json:"manifest_digest"`
-	MinimumAppliedIndex uint64 `json:"minimum_applied_index"`
+	ShardID              uint64 `json:"shard_id"`
+	ReplicaID            uint64 `json:"replica_id"`
+	MemberID             string `json:"member_id"`
+	RegistryLayoutDigest string `json:"registry_layout_digest"`
+	MinimumAppliedIndex  uint64 `json:"minimum_applied_index"`
 }
 
 func (r ReplicaAppliedRequest) Validate() error {
 	if r.ShardID < firstDataRaftShardID || r.ReplicaID == 0 || r.MemberID == "" ||
-		!isSHA256(r.ManifestDigest) || r.MinimumAppliedIndex == 0 {
+		!isSHA256(r.RegistryLayoutDigest) || r.MinimumAppliedIndex == 0 {
 		return errors.New("raftstore: replica applied-index request is incomplete")
 	}
 	return nil
 }
 
 type ReplicaAppliedProof struct {
-	ShardID        uint64 `json:"shard_id"`
-	ReplicaID      uint64 `json:"replica_id"`
-	MemberID       string `json:"member_id"`
-	ManifestDigest string `json:"manifest_digest"`
-	AppliedIndex   uint64 `json:"applied_index"`
+	ShardID              uint64 `json:"shard_id"`
+	ReplicaID            uint64 `json:"replica_id"`
+	MemberID             string `json:"member_id"`
+	RegistryLayoutDigest string `json:"registry_layout_digest"`
+	AppliedIndex         uint64 `json:"applied_index"`
 }
 
 func (p ReplicaAppliedProof) Validate(request ReplicaAppliedRequest) error {
@@ -79,14 +79,14 @@ func (p ReplicaAppliedProof) Validate(request ReplicaAppliedRequest) error {
 		return err
 	}
 	if p.ShardID != request.ShardID || p.ReplicaID != request.ReplicaID || p.MemberID != request.MemberID ||
-		p.ManifestDigest != request.ManifestDigest || p.AppliedIndex < request.MinimumAppliedIndex {
+		p.RegistryLayoutDigest != request.RegistryLayoutDigest || p.AppliedIndex < request.MinimumAppliedIndex {
 		return errors.New("raftstore: replica applied-index proof is incomplete")
 	}
 	return nil
 }
 
 func (r ReplicaPromotionRequest) Validate() error {
-	if r.ShardID == 0 || r.ReplicaID == 0 || r.MemberID == "" || !isSHA256(r.ManifestDigest) {
+	if r.ShardID == 0 || r.ReplicaID == 0 || r.MemberID == "" || !isSHA256(r.RegistryLayoutDigest) {
 		return errors.New("raftstore: replica promotion request is incomplete")
 	}
 	return nil
@@ -147,8 +147,8 @@ func (r *Runtime) ProveLocalReplicaCaughtUp(
 	if err := request.Validate(); err != nil {
 		return ReplicaCatchUpProof{}, err
 	}
-	if request.ManifestDigest != r.manifestDigest || request.MemberID != r.member.MemberID {
-		return ReplicaCatchUpProof{}, errors.New("raftstore: catch-up request targets another manifest member")
+	if request.RegistryLayoutDigest != r.registryLayoutDigest || request.MemberID != r.member.MemberID {
+		return ReplicaCatchUpProof{}, errors.New("raftstore: catch-up request targets another registryLayout member")
 	}
 	placement, err := r.placementForRaftShard(request.ShardID)
 	if err != nil {
@@ -162,7 +162,7 @@ func (r *Runtime) ProveLocalReplicaCaughtUp(
 		}
 	}
 	if !placed {
-		return ReplicaCatchUpProof{}, errors.New("raftstore: local learner is absent from the desired manifest")
+		return ReplicaCatchUpProof{}, errors.New("raftstore: local learner is absent from the desired registryLayout")
 	}
 
 	r.mu.Lock()
@@ -190,7 +190,7 @@ func (r *Runtime) ProveLocalReplicaCaughtUp(
 		if err != nil {
 			return ReplicaCatchUpProof{}, err
 		}
-		if _, err := r.requireManifestTransition(state); err != nil {
+		if _, err := r.requireRegistryLayoutTransition(state); err != nil {
 			return ReplicaCatchUpProof{}, err
 		}
 		applied = state.LastApplied
@@ -208,19 +208,19 @@ func (r *Runtime) ProveLocalReplicaCaughtUp(
 		}
 		prepared := false
 		for _, epoch := range state.ServingEpochs {
-			if epoch.ManifestDigest == request.ManifestDigest {
+			if epoch.RegistryLayoutDigest == request.RegistryLayoutDigest {
 				prepared = true
 				break
 			}
 		}
 		if !prepared {
-			return ReplicaCatchUpProof{}, errors.New("raftstore: local learner has not applied the target manifest epoch")
+			return ReplicaCatchUpProof{}, errors.New("raftstore: local learner has not applied the target registryLayout epoch")
 		}
 		applied = state.LastApplied
 	}
 	proof := ReplicaCatchUpProof{
 		ShardID: request.ShardID, ReplicaID: request.ReplicaID, MemberID: request.MemberID,
-		ManifestDigest: request.ManifestDigest, AppliedIndex: applied,
+		RegistryLayoutDigest: request.RegistryLayoutDigest, AppliedIndex: applied,
 	}
 	if err := proof.Validate(request); err != nil {
 		return ReplicaCatchUpProof{}, err
@@ -237,14 +237,14 @@ func (r *Runtime) ProveLocalReplicaApplied(
 	if err := request.Validate(); err != nil {
 		return ReplicaAppliedProof{}, err
 	}
-	if request.ManifestDigest != r.manifestDigest || request.MemberID != r.member.MemberID {
-		return ReplicaAppliedProof{}, errors.New("raftstore: applied-index request targets another manifest member")
+	if request.RegistryLayoutDigest != r.registryLayoutDigest || request.MemberID != r.member.MemberID {
+		return ReplicaAppliedProof{}, errors.New("raftstore: applied-index request targets another registryLayout member")
 	}
 	logicalID, ok := LogicalShardID(request.ShardID)
-	if !ok || int(logicalID) >= len(r.manifest.DataShards) {
+	if !ok || int(logicalID) >= len(r.registryLayout.DataShards) {
 		return ReplicaAppliedProof{}, errors.New("raftstore: applied-index request targets an unknown data shard")
 	}
-	placement := r.manifest.DataShards[logicalID].Replicas
+	placement := r.registryLayout.DataShards[logicalID].Replicas
 	placed := false
 	for _, replica := range placement {
 		if replica.ReplicaID == request.ReplicaID && replica.MemberID == request.MemberID {
@@ -253,7 +253,7 @@ func (r *Runtime) ProveLocalReplicaApplied(
 		}
 	}
 	if !placed {
-		return ReplicaAppliedProof{}, errors.New("raftstore: local voter is absent from the active manifest")
+		return ReplicaAppliedProof{}, errors.New("raftstore: local voter is absent from the active registryLayout")
 	}
 	r.mu.Lock()
 	position := r.replicaPosition(request.ShardID)
@@ -280,12 +280,12 @@ func (r *Runtime) ProveLocalReplicaApplied(
 	if err := r.validateDataState(state, logicalID); err != nil {
 		return ReplicaAppliedProof{}, err
 	}
-	if len(state.ServingEpochs) != 1 || state.ServingEpochs[0].ManifestDigest != request.ManifestDigest {
-		return ReplicaAppliedProof{}, errors.New("raftstore: local voter does not serve the stable active manifest")
+	if len(state.ServingEpochs) != 1 || state.ServingEpochs[0].RegistryLayoutDigest != request.RegistryLayoutDigest {
+		return ReplicaAppliedProof{}, errors.New("raftstore: local voter does not serve the stable active registryLayout")
 	}
 	proof := ReplicaAppliedProof{
 		ShardID: request.ShardID, ReplicaID: request.ReplicaID, MemberID: request.MemberID,
-		ManifestDigest: request.ManifestDigest, AppliedIndex: state.LastApplied,
+		RegistryLayoutDigest: request.RegistryLayoutDigest, AppliedIndex: state.LastApplied,
 	}
 	if err := proof.Validate(request); err != nil {
 		return ReplicaAppliedProof{}, err
@@ -413,15 +413,15 @@ func (r *Runtime) promoteNonVoting(
 	if err := proof.Validate(request); err != nil {
 		return err
 	}
-	if proof.ManifestDigest != r.manifestDigest {
-		return errors.New("raftstore: catch-up proof belongs to another manifest")
+	if proof.RegistryLayoutDigest != r.registryLayoutDigest {
+		return errors.New("raftstore: catch-up proof belongs to another registryLayout")
 	}
 	placement, err := r.placementForRaftShard(proof.ShardID)
 	if err != nil {
 		return err
 	}
 	if !placementContainsReplica(placement, proof.ReplicaID) {
-		return errors.New("raftstore: promoted replica is absent from the desired manifest")
+		return errors.New("raftstore: promoted replica is absent from the desired registryLayout")
 	}
 	var expectedTarget string
 	for _, replica := range placement {
@@ -429,7 +429,7 @@ func (r *Runtime) promoteNonVoting(
 			continue
 		}
 		if replica.MemberID != proof.MemberID {
-			return errors.New("raftstore: catch-up proof names the wrong manifest member")
+			return errors.New("raftstore: catch-up proof names the wrong registryLayout member")
 		}
 		expectedTarget, err = r.desiredReplicaTarget(proof.ShardID, replica.ReplicaID, replica.MemberID)
 		if err != nil {
@@ -477,7 +477,7 @@ func (r *Runtime) RemoveOldReplica(ctx context.Context, shardID, replicaID uint6
 		return err
 	}
 	if placementContainsReplica(placement, replicaID) {
-		return errors.New("raftstore: desired manifest replica cannot be removed")
+		return errors.New("raftstore: desired registryLayout replica cannot be removed")
 	}
 	membership, err := r.nodeHost.SyncGetShardMembership(ctx, shardID)
 	if err != nil {
@@ -540,8 +540,8 @@ func (r *Runtime) ConfirmLocalReplicaPromoted(ctx context.Context, request Repli
 	if err := request.Validate(); err != nil {
 		return err
 	}
-	if request.ManifestDigest != r.manifestDigest || request.MemberID != r.member.MemberID {
-		return errors.New("raftstore: promotion confirmation targets another manifest member")
+	if request.RegistryLayoutDigest != r.registryLayoutDigest || request.MemberID != r.member.MemberID {
+		return errors.New("raftstore: promotion confirmation targets another registryLayout member")
 	}
 	placement, err := r.placementForRaftShard(request.ShardID)
 	if err != nil {
@@ -555,7 +555,7 @@ func (r *Runtime) ConfirmLocalReplicaPromoted(ctx context.Context, request Repli
 		}
 	}
 	if !placed {
-		return errors.New("raftstore: promoted local replica is absent from the desired manifest")
+		return errors.New("raftstore: promoted local replica is absent from the desired registryLayout")
 	}
 	r.mu.Lock()
 	position := r.replicaPosition(request.ShardID)
@@ -686,13 +686,13 @@ func (r *Runtime) desiredReplicaTarget(shardID, replicaID uint64, memberID strin
 		if replica.ReplicaID != replicaID || replica.MemberID != memberID {
 			continue
 		}
-		member, found := manifestMember(r.manifest, memberID)
+		member, found := registryLayoutMember(r.registryLayout, memberID)
 		if !found {
 			return "", errors.New("raftstore: desired replica member is unknown")
 		}
 		return member.RaftEndpoint, nil
 	}
-	return "", fmt.Errorf("raftstore: shard %d replica %d is absent from the desired manifest", shardID, replicaID)
+	return "", fmt.Errorf("raftstore: shard %d replica %d is absent from the desired registryLayout", shardID, replicaID)
 }
 
 func placementContainsReplica(placement []ReplicaPlacement, replicaID uint64) bool {

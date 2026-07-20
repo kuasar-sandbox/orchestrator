@@ -16,9 +16,9 @@ func applySystem(t *testing.T, state SystemState, index uint64, command SystemCo
 }
 
 func TestSystemGroupBootstrapPermitAndPermanentClosure(t *testing.T) {
-	manifest := testManifest(4, "generation-1")
-	digest, _ := manifest.Digest()
-	state, _ := applySystem(t, SystemState{}, 1, SystemCommand{Type: SystemBootstrap, Manifest: &manifest, Digest: digest})
+	registryLayout := testRegistryLayout(4, "generation-1")
+	digest, _ := registryLayout.Digest()
+	state, _ := applySystem(t, SystemState{}, 1, SystemCommand{Type: SystemBootstrap, RegistryLayout: &registryLayout, Digest: digest})
 	state, _ = applySystem(t, state, 2, SystemCommand{
 		Type: SystemSetGates, Gates: &GateUpdate{Serve: true, Write: true, Cutover: true},
 	})
@@ -30,22 +30,22 @@ func TestSystemGroupBootstrapPermitAndPermanentClosure(t *testing.T) {
 	if err != nil || permit.Authorize(time.Now(), state.Identity(), PermitHolderDispatch) != nil {
 		t.Fatalf("authorized permit = %+v, %v", permit, err)
 	}
-	successor := testManifest(4, "generation-2")
+	successor := testRegistryLayout(4, "generation-2")
 	successor.Predecessor = &PredecessorProof{
-		StorageGeneration: manifest.StorageGeneration, ManifestDigest: digest,
-		ServePermitMaxMillis: manifest.ServePermitMaxMillis, Kind: RolloverConsensusClosure,
+		RegistryGeneration: registryLayout.RegistryGeneration, RegistryLayoutDigest: digest,
+		ServePermitMaxMillis: registryLayout.ServePermitMaxMillis, Kind: RolloverConsensusClosure,
 	}
 	intentDigest, err := successor.RolloverIntentDigest()
 	if err != nil {
 		t.Fatal(err)
 	}
-	closure := &GenerationClosure{
-		TargetStorageGeneration:    successor.StorageGeneration,
-		TargetManifestIntentDigest: intentDigest, Kind: RolloverConsensusClosure,
+	closure := &RegistryGenerationClosure{
+		TargetRegistryGeneration:         successor.RegistryGeneration,
+		TargetRegistryLayoutIntentDigest: intentDigest, Kind: RolloverConsensusClosure,
 	}
-	state, _ = applySystem(t, state, 4, SystemCommand{Type: SystemCloseGeneration, Closure: closure})
+	state, _ = applySystem(t, state, 4, SystemCommand{Type: SystemCloseRegistryGeneration, Closure: closure})
 	if !state.Retired || state.ServeGate || state.WriteGate || state.Closure == nil || state.Closure.CommitIndex != 4 ||
-		!isSHA256(state.Closure.ProofDigest) || state.Closure.ProofDigest != generationClosureProofDigest(state, *state.Closure) {
+		!isSHA256(state.Closure.ProofDigest) || state.Closure.ProofDigest != registryGenerationClosureProofDigest(state, *state.Closure) {
 		t.Fatalf("closed generation = %+v", state)
 	}
 	proof, err := state.ConsensusPredecessorProof()
@@ -70,11 +70,11 @@ func TestSystemGroupBootstrapPermitAndPermanentClosure(t *testing.T) {
 }
 
 func TestSuccessorGenerationRequiresPermitDrainUnlessHardFenced(t *testing.T) {
-	predecessor := testManifest(4, "generation-1")
+	predecessor := testRegistryLayout(4, "generation-1")
 	predecessorDigest, _ := predecessor.Digest()
-	manifest, _ := finalizeConsensusSuccessor(t, predecessor, predecessorDigest, testManifest(4, "generation-2"))
-	digest, _ := manifest.Digest()
-	state, _ := applySystem(t, SystemState{}, 1, SystemCommand{Type: SystemBootstrap, Manifest: &manifest, Digest: digest})
+	registryLayout, _ := finalizeConsensusSuccessor(t, predecessor, predecessorDigest, testRegistryLayout(4, "generation-2"))
+	digest, _ := registryLayout.Digest()
+	state, _ := applySystem(t, SystemState{}, 1, SystemCommand{Type: SystemBootstrap, RegistryLayout: &registryLayout, Digest: digest})
 	_, rejected := ApplySystemCommand(state, 2, SystemCommand{
 		Type: SystemSetGates, Gates: &GateUpdate{Serve: true, Write: true, Cutover: true},
 	})
@@ -82,16 +82,16 @@ func TestSuccessorGenerationRequiresPermitDrainUnlessHardFenced(t *testing.T) {
 		t.Fatal("successor served before predecessor permit drain")
 	}
 	_, rejected = ApplySystemCommand(state, 3, SystemCommand{Type: SystemConfirmDrain, Drain: &DrainConfirmation{
-		PredecessorProofDigest: manifest.Predecessor.ProofDigest,
-		WaitedMillis:           manifest.Predecessor.ServePermitMaxMillis - 1,
+		PredecessorProofDigest: registryLayout.Predecessor.ProofDigest,
+		WaitedMillis:           registryLayout.Predecessor.ServePermitMaxMillis - 1,
 		EvidenceDigest:         digestFor("short-wait"),
 	}})
 	if !rejected.Conflict {
 		t.Fatal("short predecessor permit wait was accepted")
 	}
 	state, _ = applySystem(t, state, 4, SystemCommand{Type: SystemConfirmDrain, Drain: &DrainConfirmation{
-		PredecessorProofDigest: manifest.Predecessor.ProofDigest,
-		WaitedMillis:           manifest.Predecessor.ServePermitMaxMillis,
+		PredecessorProofDigest: registryLayout.Predecessor.ProofDigest,
+		WaitedMillis:           registryLayout.Predecessor.ServePermitMaxMillis,
 		EvidenceDigest:         digestFor("monotonic-wait"),
 	}})
 	state, _ = applySystem(t, state, 5, SystemCommand{
@@ -101,50 +101,51 @@ func TestSuccessorGenerationRequiresPermitDrainUnlessHardFenced(t *testing.T) {
 		t.Fatal("drained successor did not open")
 	}
 
-	hardFenced := testManifest(4, "generation-3")
+	hardFenced := testRegistryLayout(4, "generation-3")
 	hardFenced.Predecessor = &PredecessorProof{
-		StorageGeneration: "generation-2", ManifestDigest: digest, ServePermitMaxMillis: 5000,
+		RegistryGeneration: "generation-2", RegistryLayoutDigest: digest, ServePermitMaxMillis: 5000,
 		Kind:        RolloverExternalFence,
 		ProofDigest: digestFor("external-hard-fence"),
 	}
 	hardDigest, _ := hardFenced.Digest()
-	hardState, _ := applySystem(t, SystemState{}, 1, SystemCommand{Type: SystemBootstrap, Manifest: &hardFenced, Digest: hardDigest})
+	hardState, _ := applySystem(t, SystemState{}, 1, SystemCommand{Type: SystemBootstrap, RegistryLayout: &hardFenced, Digest: hardDigest})
 	if !hardState.PredecessorDrainComplete {
 		t.Fatal("complete hard fence did not satisfy predecessor drain")
 	}
 }
 
-func TestSystemGroupRejectsNonInitialManifestBootstrap(t *testing.T) {
-	manifest := testManifest(2, "generation-1")
-	manifest.ManifestVersion = 2
-	manifest.PreviousManifestDigest = digestFor("manifest-1")
-	digest, err := manifest.Digest()
+func TestSystemGroupRejectsNonInitialRegistryLayoutBootstrap(t *testing.T) {
+	registryLayout := testRegistryLayout(2, "generation-1")
+	registryLayout.RegistryLayoutVersion = 2
+	registryLayout.PreviousRegistryLayoutVersion = 1
+	registryLayout.PreviousRegistryLayoutDigest = digestFor("registryLayout-1")
+	digest, err := registryLayout.Digest()
 	if err != nil {
 		t.Fatal(err)
 	}
 	_, result := ApplySystemCommand(SystemState{}, 1, SystemCommand{
-		Type: SystemBootstrap, Manifest: &manifest, Digest: digest,
+		Type: SystemBootstrap, RegistryLayout: &registryLayout, Digest: digest,
 	})
 	if !result.Conflict {
-		t.Fatal("System Group accepted a non-initial manifest as empty bootstrap")
+		t.Fatal("System Group accepted a non-initial registryLayout as empty bootstrap")
 	}
 }
 
 func TestRecoveryEpochClosesNormalServiceAndAdvancesSystemEpoch(t *testing.T) {
-	manifest := testManifest(2, "generation-2")
-	manifest.Predecessor = &PredecessorProof{
-		StorageGeneration: "generation-1", ManifestDigest: digestFor("source-manifest"),
+	registryLayout := testRegistryLayout(2, "generation-2")
+	registryLayout.Predecessor = &PredecessorProof{
+		RegistryGeneration: "generation-1", RegistryLayoutDigest: digestFor("source-registryLayout"),
 		ServePermitMaxMillis: 5000, Kind: RolloverExternalFence, ProofDigest: digestFor("hard-fence"),
 	}
-	digest, _ := manifest.Digest()
-	state, _ := applySystem(t, SystemState{}, 1, SystemCommand{Type: SystemBootstrap, Manifest: &manifest, Digest: digest})
+	digest, _ := registryLayout.Digest()
+	state, _ := applySystem(t, SystemState{}, 1, SystemCommand{Type: SystemBootstrap, RegistryLayout: &registryLayout, Digest: digest})
 	state, _ = applySystem(t, state, 2, SystemCommand{
 		Type: SystemSetGates, Gates: &GateUpdate{Serve: true, Write: true, Cutover: true},
 	})
 	recovery := &RecoveryEpoch{
-		Epoch: 2, SourceClusterID: "cluster-1", SourceStorageGeneration: "generation-1",
-		SourceManifestDigest: digestFor("source-manifest"), TargetStorageGeneration: "generation-2",
-		TargetManifestDigest: digest, Phase: RecoveryPreparing,
+		Epoch: 2, SourceClusterID: "cluster-1", SourceRegistryGeneration: "generation-1",
+		SourceRegistryLayoutDigest: digestFor("source-registryLayout"), TargetRegistryGeneration: "generation-2",
+		TargetRegistryLayoutDigest: digest, Phase: RecoveryPreparing,
 	}
 	state, _ = applySystem(t, state, 3, SystemCommand{Type: SystemBeginRecovery, Recovery: recovery})
 	if state.Recovery == nil || state.ServeGate || state.SystemEpoch != 2 {
@@ -166,25 +167,25 @@ func TestRecoveryEpochClosesNormalServiceAndAdvancesSystemEpoch(t *testing.T) {
 }
 
 func TestRecoveryEpochMustNameTheCommittedPredecessor(t *testing.T) {
-	manifest := testManifest(2, "generation-2")
-	manifest.Predecessor = &PredecessorProof{
-		StorageGeneration: "generation-1", ManifestDigest: digestFor("source-manifest"),
+	registryLayout := testRegistryLayout(2, "generation-2")
+	registryLayout.Predecessor = &PredecessorProof{
+		RegistryGeneration: "generation-1", RegistryLayoutDigest: digestFor("source-registryLayout"),
 		ServePermitMaxMillis: 5000, Kind: RolloverExternalFence, ProofDigest: digestFor("hard-fence"),
 	}
-	digest, _ := manifest.Digest()
-	state, _ := applySystem(t, SystemState{}, 1, SystemCommand{Type: SystemBootstrap, Manifest: &manifest, Digest: digest})
+	digest, _ := registryLayout.Digest()
+	state, _ := applySystem(t, SystemState{}, 1, SystemCommand{Type: SystemBootstrap, RegistryLayout: &registryLayout, Digest: digest})
 
 	for name, mutate := range map[string]func(*RecoveryEpoch){
-		"wrong epoch":      func(recovery *RecoveryEpoch) { recovery.Epoch++ },
-		"wrong cluster":    func(recovery *RecoveryEpoch) { recovery.SourceClusterID = "other-cluster" },
-		"wrong generation": func(recovery *RecoveryEpoch) { recovery.SourceStorageGeneration = "generation-0" },
-		"wrong manifest":   func(recovery *RecoveryEpoch) { recovery.SourceManifestDigest = digestFor("other-manifest") },
+		"wrong epoch":          func(recovery *RecoveryEpoch) { recovery.Epoch++ },
+		"wrong cluster":        func(recovery *RecoveryEpoch) { recovery.SourceClusterID = "other-cluster" },
+		"wrong generation":     func(recovery *RecoveryEpoch) { recovery.SourceRegistryGeneration = "generation-0" },
+		"wrong registryLayout": func(recovery *RecoveryEpoch) { recovery.SourceRegistryLayoutDigest = digestFor("other-registryLayout") },
 	} {
 		t.Run(name, func(t *testing.T) {
 			recovery := RecoveryEpoch{
-				Epoch: 2, SourceClusterID: "cluster-1", SourceStorageGeneration: "generation-1",
-				SourceManifestDigest: digestFor("source-manifest"), TargetStorageGeneration: "generation-2",
-				TargetManifestDigest: digest, Phase: RecoveryPreparing,
+				Epoch: 2, SourceClusterID: "cluster-1", SourceRegistryGeneration: "generation-1",
+				SourceRegistryLayoutDigest: digestFor("source-registryLayout"), TargetRegistryGeneration: "generation-2",
+				TargetRegistryLayoutDigest: digest, Phase: RecoveryPreparing,
 			}
 			mutate(&recovery)
 			_, result := ApplySystemCommand(state, 2, SystemCommand{Type: SystemBeginRecovery, Recovery: &recovery})
@@ -195,12 +196,12 @@ func TestRecoveryEpochMustNameTheCommittedPredecessor(t *testing.T) {
 	}
 }
 
-func TestManifestTransitionActivatesOnlyAfterEveryShardCompletes(t *testing.T) {
-	manifest := testManifest(2, "generation-1")
-	digest, _ := manifest.Digest()
-	state, _ := applySystem(t, SystemState{}, 1, SystemCommand{Type: SystemBootstrap, Manifest: &manifest, Digest: digest})
-	transition := &ManifestTransition{
-		Version: 2, Digest: digestFor("manifest-2"), PreviousDigest: digest, NextSystemEpoch: 2,
+func TestRegistryLayoutTransitionActivatesOnlyAfterEveryShardCompletes(t *testing.T) {
+	registryLayout := testRegistryLayout(2, "generation-1")
+	digest, _ := registryLayout.Digest()
+	state, _ := applySystem(t, SystemState{}, 1, SystemCommand{Type: SystemBootstrap, RegistryLayout: &registryLayout, Digest: digest})
+	transition := &RegistryLayoutTransition{
+		Version: 2, Digest: digestFor("registryLayout-2"), PreviousDigest: digest, NextSystemEpoch: 2,
 		Shards: []ShardTransition{
 			{ShardID: ^uint32(0), Stage: TransitionPending},
 			{ShardID: 0, Stage: TransitionPending},
@@ -230,8 +231,8 @@ func TestManifestTransitionActivatesOnlyAfterEveryShardCompletes(t *testing.T) {
 	state, _ = applySystem(t, state, index, SystemCommand{Type: SystemActivateTransition})
 	activationIndex := index
 	if state.Transition == nil || !state.Transition.Activated ||
-		state.Transition.ActivationIndex != activationIndex || state.ActiveManifestVersion != 2 ||
-		state.SystemEpoch != 2 || state.ActiveManifestDigest != transition.Digest {
+		state.Transition.ActivationIndex != activationIndex || state.ActiveRegistryLayoutVersion != 2 ||
+		state.SystemEpoch != 2 || state.ActiveRegistryLayoutDigest != transition.Digest {
 		t.Fatalf("activated transition = %+v", state)
 	}
 	index++
@@ -247,9 +248,9 @@ func TestManifestTransitionActivatesOnlyAfterEveryShardCompletes(t *testing.T) {
 	state, _ = applySystem(t, state, index, SystemCommand{
 		Type: SystemConfirmTransitionDrain,
 		TransitionDrain: &TransitionDrainConfirmation{
-			PreviousManifestDigest: transition.PreviousDigest,
-			PreviousSystemEpoch:    1, ActivationIndex: activationIndex,
-			WaitedMillis: manifest.ServePermitMaxMillis,
+			PreviousRegistryLayoutDigest: transition.PreviousDigest,
+			PreviousSystemEpoch:          1, ActivationIndex: activationIndex,
+			WaitedMillis: registryLayout.ServePermitMaxMillis,
 		},
 	})
 	index++
@@ -263,23 +264,23 @@ func TestManifestTransitionActivatesOnlyAfterEveryShardCompletes(t *testing.T) {
 		index++
 	}
 	state, _ = applySystem(t, state, index, SystemCommand{Type: SystemFinalizeTransition})
-	if state.Transition != nil || state.ActiveManifestVersion != 2 || state.SystemEpoch != 2 ||
-		state.ActiveManifestDigest != transition.Digest {
+	if state.Transition != nil || state.ActiveRegistryLayoutVersion != 2 || state.SystemEpoch != 2 ||
+		state.ActiveRegistryLayoutDigest != transition.Digest {
 		t.Fatalf("finalized transition = %+v", state)
 	}
 }
 
 func TestPermitIdentityMismatchIsTyped(t *testing.T) {
 	identity := PermitIdentity{
-		ClusterID: "cluster-1", StorageGeneration: "generation-1", SystemEpoch: 1,
-		ManifestDigest: digestFor("manifest"),
+		ClusterID: "cluster-1", RegistryGeneration: "generation-1", SystemEpoch: 1,
+		RegistryLayoutDigest: digestFor("registryLayout"),
 	}
 	grant := PermitGrant{
 		PermitIdentity: identity, CommitIndex: 1, MaxLifetimeMillis: 100,
 		ServeGate: true, WriteGate: true, CutoverGate: true, RecoveryClosed: true,
 	}
 	permit, _ := NewServePermit(grant, time.Now())
-	identity.StorageGeneration = "generation-2"
+	identity.RegistryGeneration = "generation-2"
 	if err := permit.Authorize(time.Now(), identity, PermitRegistryRead); !errors.Is(err, ErrPermitMismatch) {
 		t.Fatalf("mismatch error = %v", err)
 	}

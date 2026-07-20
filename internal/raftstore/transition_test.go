@@ -10,17 +10,18 @@ import (
 	sm "github.com/lni/dragonboat/v4/statemachine"
 )
 
-func TestRuntimeReconcilesAndFinalizesManifestTransition(t *testing.T) {
-	oldManifest := testManifest(1, "generation-1")
-	oldManifest.ServePermitMaxMillis = 25
-	oldDigest, err := oldManifest.Digest()
+func TestRuntimeReconcilesAndFinalizesRegistryLayoutTransition(t *testing.T) {
+	oldRegistryLayout := testRegistryLayout(1, "generation-1")
+	oldRegistryLayout.ServePermitMaxMillis = 25
+	oldDigest, err := oldRegistryLayout.Digest()
 	if err != nil {
 		t.Fatal(err)
 	}
-	nextManifest := oldManifest
-	nextManifest.ManifestVersion = 2
-	nextManifest.PreviousManifestDigest = oldDigest
-	nextManifest.Members = append(append([]RegistryMember(nil), oldManifest.Members...), RegistryMember{
+	nextRegistryLayout := oldRegistryLayout
+	nextRegistryLayout.RegistryLayoutVersion = 2
+	nextRegistryLayout.PreviousRegistryLayoutVersion = 1
+	nextRegistryLayout.PreviousRegistryLayoutDigest = oldDigest
+	nextRegistryLayout.Members = append(append([]RegistryMember(nil), oldRegistryLayout.Members...), RegistryMember{
 		MemberID: "registry-d", InternalEndpoint: "https://registry-d:9443", RaftEndpoint: "registry-d:63001",
 	})
 	desired := []ReplicaPlacement{
@@ -28,20 +29,20 @@ func TestRuntimeReconcilesAndFinalizesManifestTransition(t *testing.T) {
 		{MemberID: "registry-b", ReplicaID: 2},
 		{MemberID: "registry-d", ReplicaID: 4},
 	}
-	nextManifest.SystemReplicas = append([]ReplicaPlacement(nil), desired...)
-	nextManifest.DataShards = []ShardPlacement{{ShardID: 0, Replicas: append([]ReplicaPlacement(nil), desired...)}}
-	if err := nextManifest.Validate(); err != nil {
+	nextRegistryLayout.SystemReplicas = append([]ReplicaPlacement(nil), desired...)
+	nextRegistryLayout.DataShards = []ShardPlacement{{ShardID: 0, Replicas: append([]ReplicaPlacement(nil), desired...)}}
+	if err := nextRegistryLayout.Validate(); err != nil {
 		t.Fatal(err)
 	}
-	nextDigest, err := nextManifest.Digest()
+	nextDigest, err := nextRegistryLayout.Digest()
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	system, _ := applySystem(t, SystemState{}, 1, SystemCommand{
-		Type: SystemBootstrap, Manifest: &oldManifest, Digest: oldDigest,
+		Type: SystemBootstrap, RegistryLayout: &oldRegistryLayout, Digest: oldDigest,
 	})
-	transition := &ManifestTransition{
+	transition := &RegistryLayoutTransition{
 		Version: 2, Digest: nextDigest, PreviousDigest: oldDigest, NextSystemEpoch: 2,
 		Shards: []ShardTransition{
 			{ShardID: ^uint32(0), Stage: TransitionPending},
@@ -51,8 +52,8 @@ func TestRuntimeReconcilesAndFinalizesManifestTransition(t *testing.T) {
 	system, _ = applySystem(t, system, 2, SystemCommand{
 		Type: SystemBeginTransition, Transition: transition,
 	})
-	dataIdentity := manifestShardIdentity(t, oldManifest, 0)
-	data := initializeDataShard(t, oldManifest, dataIdentity)
+	dataIdentity := registryLayoutShardIdentity(t, oldRegistryLayout, 0)
+	data := initializeDataShard(t, oldRegistryLayout, dataIdentity)
 	systemIndex, dataIndex := system.LastApplied, data.LastApplied
 
 	host := newFakeNodeHost()
@@ -91,7 +92,7 @@ func TestRuntimeReconcilesAndFinalizesManifestTransition(t *testing.T) {
 	permitCache := NewPermitCache(time.Now)
 	if err := permitCache.Install(PermitGrant{
 		PermitIdentity: system.Identity(), CommitIndex: system.LastApplied,
-		MaxLifetimeMillis: oldManifest.ServePermitMaxMillis,
+		MaxLifetimeMillis: oldRegistryLayout.ServePermitMaxMillis,
 		ServeGate:         true, WriteGate: true, CutoverGate: true, RecoveryClosed: true,
 	}, time.Now()); err != nil {
 		t.Fatal(err)
@@ -100,16 +101,16 @@ func TestRuntimeReconcilesAndFinalizesManifestTransition(t *testing.T) {
 		SystemRaftShardID: true, DataRaftShardID(0): true,
 	}
 	runtime := &Runtime{
-		manifest: nextManifest, manifestDigest: nextDigest, member: nextManifest.Members[0],
+		registryLayout: nextRegistryLayout, registryLayoutDigest: nextDigest, member: nextRegistryLayout.Members[0],
 		nodeHost: host, permitCache: permitCache,
 		enrollmentStore: EnrollmentStore{Path: t.TempDir() + "/enrollment.json"},
 		enrollment: LocalEnrollment{
-			Version: localEnrollmentVersion, ClusterID: nextManifest.ClusterID,
-			StorageGeneration: nextManifest.StorageGeneration, MemberID: nextManifest.Members[0].MemberID,
-			DeploymentID: 1, RaftAddress: nextManifest.Members[0].RaftEndpoint,
+			Version: localEnrollmentVersion, ClusterID: nextRegistryLayout.ClusterID,
+			RegistryGeneration: nextRegistryLayout.RegistryGeneration, MemberID: nextRegistryLayout.Members[0].MemberID,
+			DeploymentID: 1, RaftAddress: nextRegistryLayout.Members[0].RaftEndpoint,
 			NodeHostDir: "/nodehost", StateEngineDir: "/state",
-			RuntimeConfigDigest: digestFor("runtime"), ManifestVersion: oldManifest.ManifestVersion,
-			ManifestDigest: oldDigest, Mode: EnrollmentBootstrap,
+			RuntimeConfigDigest: digestFor("runtime"), RegistryLayoutVersion: oldRegistryLayout.RegistryLayoutVersion,
+			RegistryLayoutDigest: oldDigest, Mode: EnrollmentBootstrap,
 			Replicas: []LocalReplicaEnrollment{
 				{ShardID: SystemRaftShardID, ReplicaID: 1, StartPlan: ReplicaInitial, LocalState: ReplicaActive},
 				{ShardID: DataRaftShardID(0), ReplicaID: 1, StartPlan: ReplicaInitial, LocalState: ReplicaActive},
@@ -119,7 +120,7 @@ func TestRuntimeReconcilesAndFinalizesManifestTransition(t *testing.T) {
 			Probe: func(_ context.Context, request ReplicaCatchUpRequest) (ReplicaCatchUpProof, error) {
 				return ReplicaCatchUpProof{
 					ShardID: request.ShardID, ReplicaID: request.ReplicaID, MemberID: request.MemberID,
-					ManifestDigest: request.ManifestDigest, AppliedIndex: request.MinimumAppliedIndex,
+					RegistryLayoutDigest: request.RegistryLayoutDigest, AppliedIndex: request.MinimumAppliedIndex,
 				}, nil
 			},
 			Confirm: func(_ context.Context, request ReplicaPromotionRequest) error {
@@ -133,51 +134,51 @@ func TestRuntimeReconcilesAndFinalizesManifestTransition(t *testing.T) {
 	}
 	ctx := context.Background()
 	for _, shardID := range []uint64{SystemRaftShardID, DataRaftShardID(0)} {
-		state, err := runtime.ReconcileManifestTransitionShard(ctx, shardID)
+		state, err := runtime.ReconcileRegistryLayoutTransitionShard(ctx, shardID)
 		if err != nil || transitionStageForTest(t, state, shardID) != TransitionCatchingUp {
 			t.Fatalf("prepare shard %d = %v, %v", shardID, state, err)
 		}
-		state, err = runtime.ReconcileManifestTransitionShard(ctx, shardID)
+		state, err = runtime.ReconcileRegistryLayoutTransitionShard(ctx, shardID)
 		if err == nil || transitionStageForTest(t, system, shardID) != TransitionCatchingUp {
 			t.Fatalf("unconfirmed promotion shard %d = %v, %v", shardID, state, err)
 		}
-		state, err = runtime.ReconcileManifestTransitionShard(ctx, shardID)
+		state, err = runtime.ReconcileRegistryLayoutTransitionShard(ctx, shardID)
 		if err != nil || transitionStageForTest(t, state, shardID) != TransitionPromoted {
 			t.Fatalf("promote shard %d = %v, %v", shardID, state, err)
 		}
-		state, err = runtime.ReconcileManifestTransitionShard(ctx, shardID)
+		state, err = runtime.ReconcileRegistryLayoutTransitionShard(ctx, shardID)
 		if err != nil || transitionStageForTest(t, state, shardID) != TransitionOldRemoved {
 			t.Fatalf("remove shard %d = %v, %v", shardID, state, err)
 		}
-		state, err = runtime.ReconcileManifestTransitionShard(ctx, shardID)
+		state, err = runtime.ReconcileRegistryLayoutTransitionShard(ctx, shardID)
 		if err != nil || transitionStageForTest(t, state, shardID) != TransitionComplete {
 			t.Fatalf("complete shard %d = %v, %v", shardID, state, err)
 		}
 	}
 
-	activated, err := runtime.ActivateManifestTransition(ctx)
+	activated, err := runtime.ActivateRegistryLayoutTransition(ctx)
 	if err != nil || activated.Transition == nil || !activated.Transition.Activated {
 		t.Fatalf("activate = %+v, %v", activated, err)
 	}
-	drained, err := runtime.ConfirmManifestTransitionPermitDrain(ctx)
+	drained, err := runtime.ConfirmRegistryLayoutTransitionPermitDrain(ctx)
 	if err != nil || drained.Transition == nil || !drained.Transition.PreviousPermitDrainComplete {
 		t.Fatalf("drain = %+v, %v", drained, err)
 	}
 	if err := permitCache.Install(PermitGrant{
 		PermitIdentity: drained.Identity(), CommitIndex: drained.LastApplied,
-		MaxLifetimeMillis: nextManifest.ServePermitMaxMillis,
+		MaxLifetimeMillis: nextRegistryLayout.ServePermitMaxMillis,
 		ServeGate:         true, WriteGate: true, CutoverGate: true, RecoveryClosed: true,
 	}, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	for _, shardID := range []uint64{SystemRaftShardID, DataRaftShardID(0)} {
-		state, err := runtime.ReconcileManifestTransitionShard(ctx, shardID)
+		state, err := runtime.ReconcileRegistryLayoutTransitionShard(ctx, shardID)
 		if err != nil || transitionStageForTest(t, state, shardID) != TransitionEpochRetired {
 			t.Fatalf("retire shard %d = %v, %v", shardID, state, err)
 		}
 	}
-	finalized, err := runtime.FinalizeManifestTransition(ctx)
-	if err != nil || finalized.Transition != nil || finalized.ActiveManifestDigest != nextDigest {
+	finalized, err := runtime.FinalizeRegistryLayoutTransition(ctx)
+	if err != nil || finalized.Transition != nil || finalized.ActiveRegistryLayoutDigest != nextDigest {
 		t.Fatalf("finalize = %+v, %v", finalized, err)
 	}
 	if err := validateRetiredEpoch(data, activated.Identity(), []uint64{1, 2, 4}); err != nil {
@@ -193,7 +194,7 @@ func TestRuntimeReconcilesAndFinalizesManifestTransition(t *testing.T) {
 func transitionStageForTest(t *testing.T, state SystemState, raftShardID uint64) TransitionStage {
 	t.Helper()
 	if state.Transition == nil {
-		t.Fatal("manifest transition disappeared")
+		t.Fatal("registryLayout transition disappeared")
 	}
 	shardID, err := transitionProgressID(raftShardID)
 	if err != nil {
@@ -201,7 +202,7 @@ func transitionStageForTest(t *testing.T, state SystemState, raftShardID uint64)
 	}
 	position := transitionPosition(state.Transition.Shards, shardID)
 	if position < 0 {
-		t.Fatal("manifest transition does not track shard")
+		t.Fatal("registryLayout transition does not track shard")
 	}
 	return state.Transition.Shards[position].Stage
 }

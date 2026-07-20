@@ -16,7 +16,7 @@ func TestRouteWorkflowTypesValidateFrozenIntent(t *testing.T) {
 	selected := uint32(0)
 	starting := RouteWorkflowRecord{
 		Group: "/g", RouteKey: "rk", State: WorkflowRouteStarting,
-		Revision: Revision{StorageGeneration: "g1", ShardID: 7, LogIndex: 11},
+		Revision: Revision{RegistryGeneration: "g1", ShardID: 7, LogIndex: 11},
 		Starting: &RouteStartingState{
 			SandboxID: "s1", PlacementRound: 1,
 			CandidatePool:     []PlacementCandidate{{NodeID: "n1"}, {NodeID: "n2"}},
@@ -50,26 +50,26 @@ func TestRouteWorkflowTypesValidateFrozenIntent(t *testing.T) {
 func TestReadyRouteAndRevisionValidation(t *testing.T) {
 	record := RouteWorkflowRecord{
 		Group: "/g", RouteKey: "rk", State: WorkflowRouteReady,
-		Revision: Revision{StorageGeneration: "g1", ShardID: 9, LogIndex: 100},
+		Revision: Revision{RegistryGeneration: "g1", ShardID: 9, LogIndex: 100},
 		Ready:    readyRoute(),
 	}
 	if err := record.Validate(); err != nil {
 		t.Fatal(err)
 	}
-	if !record.Revision.AtLeast(Revision{StorageGeneration: "g1", ShardID: 9, LogIndex: 99}) {
+	if !record.Revision.AtLeast(Revision{RegistryGeneration: "g1", ShardID: 9, LogIndex: 99}) {
 		t.Fatal("newer revision did not satisfy minimum")
 	}
-	if record.Revision.AtLeast(Revision{StorageGeneration: "g2", ShardID: 9, LogIndex: 1}) {
-		t.Fatal("revision compared across storage generations")
+	if record.Revision.AtLeast(Revision{RegistryGeneration: "g2", ShardID: 9, LogIndex: 1}) {
+		t.Fatal("revision compared across Registry History Generations")
 	}
 	record.Ready.LastEventSeq = 0
 	if err := record.Validate(); err == nil {
 		t.Fatal("READY accepted without durable event watermark")
 	}
 	record.Ready.LastEventSeq = 3
-	record.Ready.StorageGeneration = "g2"
+	record.Ready.RegistryGeneration = "g2"
 	if err := record.Validate(); err == nil {
-		t.Fatal("READY from another storage generation was accepted")
+		t.Fatal("READY from another Registry History Generation was accepted")
 	}
 }
 
@@ -96,7 +96,7 @@ func TestPlacementFailuresDoNotInventExecutionProof(t *testing.T) {
 	rejected := []uint32{0, 1}
 	route := RouteWorkflowRecord{
 		Group: "/g", RouteKey: "rk", State: WorkflowRouteTombstone,
-		Revision: Revision{StorageGeneration: "g1", ShardID: 1, LogIndex: 10},
+		Revision: Revision{RegistryGeneration: "g1", ShardID: 1, LogIndex: 10},
 		Tombstone: &RouteTombstoneState{PlacementFailure: &RoutePlacementFailureState{
 			SandboxID: "s1", PlacementRound: 2, CandidatePool: candidates,
 			DefinitivelyRejected: rejected, Intent: intent, Reason: "candidate rounds exhausted",
@@ -112,7 +112,7 @@ func TestPlacementFailuresDoNotInventExecutionProof(t *testing.T) {
 
 	build := BuildRecord{
 		Group: "/g", BuildID: "b1", State: BuildError,
-		Revision: Revision{StorageGeneration: "g1", ShardID: 2, LogIndex: 20},
+		Revision: Revision{RegistryGeneration: "g1", ShardID: 2, LogIndex: 20},
 		Failure: &BuildPlacementFailureState{
 			BuildID: "b1", CandidatePool: candidates, DefinitivelyRejected: rejected,
 			Intent: intent, Reason: "candidate pool exhausted",
@@ -142,12 +142,12 @@ func TestExecutionFenceCompactionRequiresEveryProof(t *testing.T) {
 	bindingDigest := sha256.Sum256([]byte("binding"))
 	fence := ExecutionFence{
 		Group: "/g", RouteKey: "rk", SandboxID: "s1", NodeID: "n1", NodeEpoch: 7,
-		StorageGeneration: "g1", BindingDigest: strings.ToLower(strings.Repeat("0", 64)),
+		RegistryGeneration: "g1", BindingDigest: strings.ToLower(strings.Repeat("0", 64)),
 		LastEventSeq: 9, FinalOutboxWatermark: 9,
 		Proof: TerminalProof{
 			Kind: ProofNodeTerminal, ProofDigest: hexDigest(proofDigest), FencedNodeID: "n1", FencedNodeEpoch: 7,
 		},
-		Revision: Revision{StorageGeneration: "g1", ShardID: 1, LogIndex: 20},
+		Revision: Revision{RegistryGeneration: "g1", ShardID: 1, LogIndex: 20},
 	}
 	fence.BindingDigest = hexDigest(bindingDigest)
 	all := FenceCompactionProof{
@@ -163,9 +163,9 @@ func TestExecutionFenceCompactionRequiresEveryProof(t *testing.T) {
 	}
 	fence.FinalOutboxWatermark = fence.LastEventSeq
 	wrongGeneration := fence
-	wrongGeneration.Revision.StorageGeneration = "g2"
+	wrongGeneration.Revision.RegistryGeneration = "g2"
 	if CanCompactExecutionFence(wrongGeneration, all) {
-		t.Fatal("fence compacted using a revision from another storage generation")
+		t.Fatal("fence compacted using a revision from another Registry History Generation")
 	}
 	all.AllReplicasApplied = false
 	if CanCompactExecutionFence(fence, all) {
@@ -190,7 +190,7 @@ func workflowBinding(t *testing.T, kind ExecutionKind, objectID, routeKey string
 	copy(demand[:], demandBytes)
 	copy(dispatch[:], dispatchBytes)
 	opaque, err := EncodeExecutionBinding(ExecutionBinding{
-		StorageGeneration: "g1", Kind: kind, ObjectID: objectID, Group: "/g", RouteKey: routeKey,
+		RegistryGeneration: "g1", Kind: kind, ObjectID: objectID, Group: "/g", RouteKey: routeKey,
 		NodeID: "n1", NodeEpoch: 7, DemandDigest: demand, DispatchSpecDigest: dispatch,
 	})
 	if err != nil {
@@ -202,7 +202,7 @@ func workflowBinding(t *testing.T, kind ExecutionKind, objectID, routeKey string
 	}
 	return ExecutionBindingIntent{
 		NodeID: "n1", NodeEpoch: 7, DataEndpoint: "10.0.0.1:8443",
-		StorageGeneration: "g1", OpaqueBinding: opaque, BindingDigest: digest,
+		RegistryGeneration: "g1", OpaqueBinding: opaque, BindingDigest: digest,
 	}
 }
 
@@ -210,7 +210,7 @@ func readyRoute() *ReadyRoute {
 	binding := sha256.Sum256([]byte("binding"))
 	return &ReadyRoute{
 		SandboxID: "s1", NodeID: "n1", NodeEpoch: 7, DataEndpoint: "10.0.0.1:8443",
-		AccessToken: "token", TemplateRef: "e2b-snp-t1", StorageGeneration: "g1",
+		AccessToken: "token", TemplateRef: "e2b-snp-t1", RegistryGeneration: "g1",
 		BindingDigest: hexDigest(binding), LastEventSeq: 3,
 	}
 }

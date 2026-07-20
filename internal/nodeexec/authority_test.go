@@ -125,7 +125,7 @@ func authorityCommand(
 	demandDigest, _ := hex.DecodeString(intent.DemandDigest)
 	specDigest, _ := hex.DecodeString(intent.DispatchSpecDigest)
 	binding := clusterstate.ExecutionBinding{
-		StorageGeneration: "generation-1", Kind: kind, ObjectID: objectID,
+		RegistryGeneration: "generation-1", Kind: kind, ObjectID: objectID,
 		Group: "group-1", RouteKey: routeKey, NodeID: "node-1", NodeEpoch: 7,
 	}
 	copy(binding.DemandDigest[:], demandDigest)
@@ -144,7 +144,7 @@ func authorityCommand(
 		Intent: intent,
 		Binding: clusterstate.ExecutionBindingIntent{
 			NodeID: "node-1", NodeEpoch: 7, DataEndpoint: "10.0.0.1:8443",
-			StorageGeneration: "generation-1", OpaqueBinding: opaque, BindingDigest: digest,
+			RegistryGeneration: "generation-1", OpaqueBinding: opaque, BindingDigest: digest,
 		},
 	}
 }
@@ -615,8 +615,8 @@ func TestDispatchCommandFromWireUsesBusinessIDAndExactIntent(t *testing.T) {
 	wire := &routesync.Command{
 		Kind: routesync.CmdSandboxAdmitDispatch, SID: want.ObjectID,
 		NodeEpoch: want.NodeEpoch, SessionSeq: want.SessionSeq,
-		StorageGeneration: want.Binding.StorageGeneration,
-		Binding:           want.Binding.OpaqueBinding, BindingDigest: want.Binding.BindingDigest,
+		RegistryGeneration: want.Binding.RegistryGeneration,
+		Binding:            want.Binding.OpaqueBinding, BindingDigest: want.Binding.BindingDigest,
 		Group: want.Group, RouteKey: want.RouteKey,
 		NormalizedDemand: want.Intent.NormalizedDemand, DemandDigest: want.Intent.DemandDigest,
 		DispatchSpec: want.Intent.DispatchSpec, DispatchSpecDigest: want.Intent.DispatchSpecDigest,

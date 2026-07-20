@@ -15,7 +15,7 @@ func digestFor(value string) string {
 	return hex.EncodeToString(digest[:])
 }
 
-func testManifest(shards uint32, generation string) Manifest {
+func testRegistryLayout(shards uint32, generation string) RegistryLayout {
 	members := []RegistryMember{
 		{MemberID: "registry-a", InternalEndpoint: "https://registry-a:9443", RaftEndpoint: "registry-a:63001"},
 		{MemberID: "registry-b", InternalEndpoint: "https://registry-b:9443", RaftEndpoint: "registry-b:63001"},
@@ -30,9 +30,9 @@ func testManifest(shards uint32, generation string) Manifest {
 	for shardID := uint32(0); shardID < shards; shardID++ {
 		placements[shardID] = ShardPlacement{ShardID: shardID, Replicas: append([]ReplicaPlacement(nil), replicas...)}
 	}
-	return Manifest{
-		FormatVersion: ManifestFormatV1, ClusterID: "cluster-1", StorageGeneration: generation,
-		ManifestVersion: 1, SchemaVersion: 1, ProtocolVersion: 1, HashVersion: "ShardHashV1",
+	return RegistryLayout{
+		FormatVersion: RegistryLayoutFormatV1, ClusterID: "cluster-1", RegistryGeneration: generation,
+		RegistryLayoutVersion: 1, SchemaVersion: 1, ProtocolVersion: 1, HashVersion: "ShardHashV1",
 		VirtualShardCount: shards, RouteBucketCount: 16, BuildBucketCount: 16,
 		ReplicationFactor: 3, ServePermitMaxMillis: 5000, BootstrapTokenDigest: digestFor("bootstrap-" + generation),
 		Members: members, SystemReplicas: replicas, DataShards: placements,
@@ -41,14 +41,14 @@ func testManifest(shards uint32, generation string) Manifest {
 
 func finalizeConsensusSuccessor(
 	t *testing.T,
-	predecessor Manifest,
+	predecessor RegistryLayout,
 	predecessorDigest string,
-	successor Manifest,
-) (Manifest, SystemState) {
+	successor RegistryLayout,
+) (RegistryLayout, SystemState) {
 	t.Helper()
 	successor.Predecessor = &PredecessorProof{
-		StorageGeneration:    predecessor.StorageGeneration,
-		ManifestDigest:       predecessorDigest,
+		RegistryGeneration:   predecessor.RegistryGeneration,
+		RegistryLayoutDigest: predecessorDigest,
 		ServePermitMaxMillis: predecessor.ServePermitMaxMillis,
 		Kind:                 RolloverConsensusClosure,
 	}
@@ -58,32 +58,32 @@ func finalizeConsensusSuccessor(
 	}
 	source := SystemState{
 		Initialized: true, ClusterID: predecessor.ClusterID,
-		StorageGeneration: predecessor.StorageGeneration, SystemEpoch: 1,
+		RegistryGeneration: predecessor.RegistryGeneration, SystemEpoch: 1,
 		SchemaVersion: predecessor.SchemaVersion, ProtocolVersion: predecessor.ProtocolVersion,
-		VirtualShardCount:     predecessor.VirtualShardCount,
-		ActiveManifestVersion: predecessor.ManifestVersion, ActiveManifestDigest: predecessorDigest,
+		VirtualShardCount:           predecessor.VirtualShardCount,
+		ActiveRegistryLayoutVersion: predecessor.RegistryLayoutVersion, ActiveRegistryLayoutDigest: predecessorDigest,
 		ServePermitMaxMillis:     predecessor.ServePermitMaxMillis,
 		PredecessorDrainComplete: true, LastApplied: 1,
 	}
 	if predecessor.Predecessor != nil {
 		source.HasPredecessor = true
-		source.PredecessorGeneration = predecessor.Predecessor.StorageGeneration
-		source.PredecessorManifestDigest = predecessor.Predecessor.ManifestDigest
+		source.PredecessorRegistryGeneration = predecessor.Predecessor.RegistryGeneration
+		source.PredecessorRegistryLayoutDigest = predecessor.Predecessor.RegistryLayoutDigest
 		source.PredecessorProofKind = predecessor.Predecessor.Kind
 		source.PredecessorProofDigest = predecessor.Predecessor.ProofDigest
 		source.PredecessorProofCommitIndex = predecessor.Predecessor.CommitIndex
-		source.PredecessorTargetManifestIntentDigest = predecessor.Predecessor.TargetManifestIntentDigest
+		source.PredecessorTargetRegistryLayoutIntentDigest = predecessor.Predecessor.TargetRegistryLayoutIntentDigest
 		source.PredecessorPermitMaxMillis = predecessor.Predecessor.ServePermitMaxMillis
 	}
 	if err := source.Validate(); err != nil {
 		t.Fatal(err)
 	}
 	closed, result := ApplySystemCommand(source, 2, SystemCommand{
-		Type: SystemCloseGeneration,
-		Closure: &GenerationClosure{
-			TargetStorageGeneration:    successor.StorageGeneration,
-			TargetManifestIntentDigest: intentDigest,
-			Kind:                       RolloverConsensusClosure,
+		Type: SystemCloseRegistryGeneration,
+		Closure: &RegistryGenerationClosure{
+			TargetRegistryGeneration:         successor.RegistryGeneration,
+			TargetRegistryLayoutIntentDigest: intentDigest,
+			Kind:                             RolloverConsensusClosure,
 		},
 	})
 	if result.Conflict || !result.Applied {
@@ -100,26 +100,26 @@ func finalizeConsensusSuccessor(
 	return successor, closed
 }
 
-func TestManifestReplicaIdentityIsScopedToEachShard(t *testing.T) {
-	manifest := testManifest(2, "generation-1")
-	manifest.DataShards[0].Replicas[0].ReplicaID = 101
-	manifest.DataShards[1].Replicas[0].ReplicaID = 201
-	if err := manifest.Validate(); err != nil {
+func TestRegistryLayoutReplicaIdentityIsScopedToEachShard(t *testing.T) {
+	registryLayout := testRegistryLayout(2, "generation-1")
+	registryLayout.DataShards[0].Replicas[0].ReplicaID = 101
+	registryLayout.DataShards[1].Replicas[0].ReplicaID = 201
+	if err := registryLayout.Validate(); err != nil {
 		t.Fatalf("per-shard replica IDs rejected: %v", err)
 	}
-	manifest.DataShards[0].Replicas[1].ReplicaID = 101
-	if err := manifest.Validate(); err == nil {
+	registryLayout.DataShards[0].Replicas[1].ReplicaID = 101
+	if err := registryLayout.Validate(); err == nil {
 		t.Fatal("duplicate replica ID within one shard accepted")
 	}
 }
 
-func TestManifestSignatureAndFixedPlacement(t *testing.T) {
+func TestRegistryLayoutSignatureAndFixedPlacement(t *testing.T) {
 	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatal(err)
 	}
-	manifest := testManifest(4, "generation-1")
-	signed, err := SignManifest(manifest, "root-1", privateKey)
+	registryLayout := testRegistryLayout(4, "generation-1")
+	signed, err := SignRegistryLayout(registryLayout, "root-1", privateKey)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -127,44 +127,45 @@ func TestManifestSignatureAndFixedPlacement(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want, err := manifest.Digest()
+	want, err := registryLayout.Digest()
 	if err != nil || digest != want {
-		t.Fatalf("manifest digest = %q, %v; want %q", digest, err, want)
+		t.Fatalf("registryLayout digest = %q, %v; want %q", digest, err, want)
 	}
 
-	signed.Manifest.DataShards[0].Replicas[0].MemberID = "registry-z"
+	signed.RegistryLayout.DataShards[0].Replicas[0].MemberID = "registry-z"
 	if _, err := signed.Verify(map[string]ed25519.PublicKey{"root-1": publicKey}); err == nil {
-		t.Fatal("tampered manifest signature verified")
+		t.Fatal("tampered registryLayout signature verified")
 	}
 	if got, ok := LogicalShardID(DataRaftShardID(3)); !ok || got != 3 {
 		t.Fatalf("logical shard mapping = %d, %v", got, ok)
 	}
 }
 
-func TestManifestRejectsIncompleteOrUnstablePlacement(t *testing.T) {
-	manifest := testManifest(4, "generation-1")
-	manifest.Members[0], manifest.Members[1] = manifest.Members[1], manifest.Members[0]
-	if err := manifest.Validate(); err == nil {
+func TestRegistryLayoutRejectsIncompleteOrUnstablePlacement(t *testing.T) {
+	registryLayout := testRegistryLayout(4, "generation-1")
+	registryLayout.Members[0], registryLayout.Members[1] = registryLayout.Members[1], registryLayout.Members[0]
+	if err := registryLayout.Validate(); err == nil {
 		t.Fatal("unordered member set accepted")
 	}
-	manifest = testManifest(4, "generation-1")
-	manifest.DataShards = manifest.DataShards[:3]
-	if err := manifest.Validate(); err == nil {
+	registryLayout = testRegistryLayout(4, "generation-1")
+	registryLayout.DataShards = registryLayout.DataShards[:3]
+	if err := registryLayout.Validate(); err == nil {
 		t.Fatal("incomplete shard placement accepted")
 	}
 }
 
-func TestManifestGuardRejectsRollbackEquivocationAndUnrelatedGeneration(t *testing.T) {
-	first := testManifest(4, "generation-1")
+func TestRegistryLayoutGuardRejectsRollbackEquivocationAndUnrelatedGeneration(t *testing.T) {
+	first := testRegistryLayout(4, "generation-1")
 	firstDigest, _ := first.Digest()
-	accepted, err := FirstAcceptedManifest(first, firstDigest)
+	accepted, err := FirstAcceptedRegistryLayout(first, firstDigest)
 	if err != nil {
 		t.Fatal(err)
 	}
 	second := first
 	second.Members = append([]RegistryMember(nil), first.Members...)
-	second.ManifestVersion = 2
-	second.PreviousManifestDigest = firstDigest
+	second.RegistryLayoutVersion = 2
+	second.PreviousRegistryLayoutVersion = 1
+	second.PreviousRegistryLayoutDigest = firstDigest
 	second.Members[0].InternalEndpoint = "https://registry-a-next:9443"
 	secondDigest, _ := second.Digest()
 	accepted, err = accepted.Accept(second, secondDigest)
@@ -172,50 +173,53 @@ func TestManifestGuardRejectsRollbackEquivocationAndUnrelatedGeneration(t *testi
 		t.Fatal(err)
 	}
 	if _, err := accepted.Accept(first, firstDigest); err == nil {
-		t.Fatal("manifest rollback accepted")
+		t.Fatal("registryLayout rollback accepted")
 	}
 	equivocation := second
 	equivocation.Members = append([]RegistryMember(nil), second.Members...)
 	equivocation.Members[0].InternalEndpoint = "https://registry-a-equivocation:9443"
 	equivocationDigest, _ := equivocation.Digest()
 	if _, err := accepted.Accept(equivocation, equivocationDigest); err == nil {
-		t.Fatal("same-version manifest equivocation accepted")
+		t.Fatal("same-version registryLayout equivocation accepted")
 	}
 
-	successor, _ := finalizeConsensusSuccessor(t, second, secondDigest, testManifest(4, "generation-2"))
+	successor, _ := finalizeConsensusSuccessor(t, second, secondDigest, testRegistryLayout(4, "generation-2"))
 	successorDigest, _ := successor.Digest()
 	next, err := accepted.Accept(successor, successorDigest)
-	if err != nil || next.StorageGeneration != "generation-2" {
+	if err != nil || next.RegistryGeneration != "generation-2" {
 		t.Fatalf("linked successor = %+v, %v", next, err)
 	}
-	successor.Predecessor.StorageGeneration = "unrelated"
+	successor.Predecessor.RegistryGeneration = "unrelated"
 	unrelatedDigest, _ := successor.Digest()
 	if _, err := accepted.Accept(successor, unrelatedDigest); err == nil {
 		t.Fatal("unrelated generation accepted")
 	}
 }
 
-func TestManifestGuardFreezesGenerationParameters(t *testing.T) {
-	first := testManifest(4, "generation-1")
+func TestRegistryLayoutGuardFreezesGenerationParameters(t *testing.T) {
+	first := testRegistryLayout(4, "generation-1")
 	firstDigest, _ := first.Digest()
-	accepted, err := FirstAcceptedManifest(first, firstDigest)
+	accepted, err := FirstAcceptedRegistryLayout(first, firstDigest)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	tests := map[string]func(*Manifest){
-		"schema":          func(manifest *Manifest) { manifest.SchemaVersion++ },
-		"protocol":        func(manifest *Manifest) { manifest.ProtocolVersion++ },
-		"route buckets":   func(manifest *Manifest) { manifest.RouteBucketCount *= 2 },
-		"build buckets":   func(manifest *Manifest) { manifest.BuildBucketCount *= 2 },
-		"permit lifetime": func(manifest *Manifest) { manifest.ServePermitMaxMillis++ },
-		"bootstrap token": func(manifest *Manifest) { manifest.BootstrapTokenDigest = digestFor("replacement-token") },
+	tests := map[string]func(*RegistryLayout){
+		"schema":          func(registryLayout *RegistryLayout) { registryLayout.SchemaVersion++ },
+		"protocol":        func(registryLayout *RegistryLayout) { registryLayout.ProtocolVersion++ },
+		"route buckets":   func(registryLayout *RegistryLayout) { registryLayout.RouteBucketCount *= 2 },
+		"build buckets":   func(registryLayout *RegistryLayout) { registryLayout.BuildBucketCount *= 2 },
+		"permit lifetime": func(registryLayout *RegistryLayout) { registryLayout.ServePermitMaxMillis++ },
+		"bootstrap token": func(registryLayout *RegistryLayout) {
+			registryLayout.BootstrapTokenDigest = digestFor("replacement-token")
+		},
 	}
 	for name, mutate := range tests {
 		t.Run(name, func(t *testing.T) {
 			next := first
-			next.ManifestVersion = 2
-			next.PreviousManifestDigest = firstDigest
+			next.RegistryLayoutVersion = 2
+			next.PreviousRegistryLayoutVersion = 1
+			next.PreviousRegistryLayoutDigest = firstDigest
 			mutate(&next)
 			digest, digestErr := next.Digest()
 			if digestErr != nil {
@@ -228,16 +232,16 @@ func TestManifestGuardFreezesGenerationParameters(t *testing.T) {
 	}
 }
 
-func TestManifestGuardBindsSuccessorToPredecessorPermitLifetime(t *testing.T) {
-	first := testManifest(4, "generation-1")
+func TestRegistryLayoutGuardBindsSuccessorToPredecessorPermitLifetime(t *testing.T) {
+	first := testRegistryLayout(4, "generation-1")
 	firstDigest, _ := first.Digest()
-	accepted, err := FirstAcceptedManifest(first, firstDigest)
+	accepted, err := FirstAcceptedRegistryLayout(first, firstDigest)
 	if err != nil {
 		t.Fatal(err)
 	}
-	successor := testManifest(4, "generation-2")
+	successor := testRegistryLayout(4, "generation-2")
 	successor.Predecessor = &PredecessorProof{
-		StorageGeneration: first.StorageGeneration, ManifestDigest: firstDigest,
+		RegistryGeneration: first.RegistryGeneration, RegistryLayoutDigest: firstDigest,
 		ServePermitMaxMillis: first.ServePermitMaxMillis - 1,
 		Kind:                 RolloverExternalFence, ProofDigest: digestFor("external-hard-fence"),
 	}
@@ -250,40 +254,40 @@ func TestManifestGuardBindsSuccessorToPredecessorPermitLifetime(t *testing.T) {
 	}
 }
 
-func TestConsensusRolloverProofCommitsExactSuccessorManifest(t *testing.T) {
-	predecessor := testManifest(2, "generation-1")
+func TestConsensusRolloverProofCommitsExactSuccessorRegistryLayout(t *testing.T) {
+	predecessor := testRegistryLayout(2, "generation-1")
 	predecessorDigest, err := predecessor.Digest()
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	for name, mutate := range map[string]func(*Manifest){
-		"bootstrap token": func(manifest *Manifest) {
-			manifest.BootstrapTokenDigest = digestFor("different-bootstrap-token")
+	for name, mutate := range map[string]func(*RegistryLayout){
+		"bootstrap token": func(registryLayout *RegistryLayout) {
+			registryLayout.BootstrapTokenDigest = digestFor("different-bootstrap-token")
 		},
-		"member endpoint": func(manifest *Manifest) {
-			manifest.Members = append([]RegistryMember(nil), manifest.Members...)
-			manifest.Members[0].InternalEndpoint = "https://registry-a-new:9443"
+		"member endpoint": func(registryLayout *RegistryLayout) {
+			registryLayout.Members = append([]RegistryMember(nil), registryLayout.Members...)
+			registryLayout.Members[0].InternalEndpoint = "https://registry-a-new:9443"
 		},
-		"replica placement": func(manifest *Manifest) {
-			manifest.DataShards = append([]ShardPlacement(nil), manifest.DataShards...)
-			manifest.DataShards[0].Replicas = append([]ReplicaPlacement(nil), manifest.DataShards[0].Replicas...)
-			manifest.DataShards[0].Replicas[0].ReplicaID = 101
+		"replica placement": func(registryLayout *RegistryLayout) {
+			registryLayout.DataShards = append([]ShardPlacement(nil), registryLayout.DataShards...)
+			registryLayout.DataShards[0].Replicas = append([]ReplicaPlacement(nil), registryLayout.DataShards[0].Replicas...)
+			registryLayout.DataShards[0].Replicas[0].ReplicaID = 101
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			finalized, _ := finalizeConsensusSuccessor(
-				t, predecessor, predecessorDigest, testManifest(2, "generation-2"),
+				t, predecessor, predecessorDigest, testRegistryLayout(2, "generation-2"),
 			)
 			mutate(&finalized)
 			if err := finalized.Validate(); err == nil {
-				t.Fatal("manifest mutation retained a valid predecessor proof")
+				t.Fatal("registryLayout mutation retained a valid predecessor proof")
 			}
 		})
 	}
 
 	finalized, _ := finalizeConsensusSuccessor(
-		t, predecessor, predecessorDigest, testManifest(2, "generation-2"),
+		t, predecessor, predecessorDigest, testRegistryLayout(2, "generation-2"),
 	)
 	finalized.Predecessor.ProofDigest = digestFor("forged-closure")
 	if err := finalized.Validate(); err == nil {
@@ -291,18 +295,18 @@ func TestConsensusRolloverProofCommitsExactSuccessorManifest(t *testing.T) {
 	}
 }
 
-func TestManifestGuardPersistsWithRestrictedMode(t *testing.T) {
-	manifest := testManifest(4, "generation-1")
+func TestRegistryLayoutGuardPersistsWithRestrictedMode(t *testing.T) {
+	registryLayout := testRegistryLayout(4, "generation-1")
 	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatal(err)
 	}
-	signed, err := SignManifest(manifest, "root-1", privateKey)
+	signed, err := SignRegistryLayout(registryLayout, "root-1", privateKey)
 	if err != nil {
 		t.Fatal(err)
 	}
-	path := filepath.Join(t.TempDir(), "guard", "manifest.json")
-	guard := ManifestGuard{Path: path}
+	path := filepath.Join(t.TempDir(), "guard", "registryLayout.json")
+	guard := RegistryLayoutGuard{Path: path}
 	accepted, err := guard.AcceptSigned(signed, map[string]ed25519.PublicKey{"root-1": publicKey})
 	if err != nil {
 		t.Fatal(err)
@@ -317,20 +321,21 @@ func TestManifestGuardPersistsWithRestrictedMode(t *testing.T) {
 	}
 }
 
-func TestManifestGuardReplaysFullChainFromDurableAnchor(t *testing.T) {
+func TestRegistryLayoutGuardReplaysFullChainFromDurableAnchor(t *testing.T) {
 	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatal(err)
 	}
 	keyring := map[string]ed25519.PublicKey{"root-1": publicKey}
-	first := testManifest(4, "generation-1")
+	first := testRegistryLayout(4, "generation-1")
 	firstDigest, err := first.Digest()
 	if err != nil {
 		t.Fatal(err)
 	}
 	second := first
-	second.ManifestVersion = 2
-	second.PreviousManifestDigest = firstDigest
+	second.RegistryLayoutVersion = 2
+	second.PreviousRegistryLayoutVersion = 1
+	second.PreviousRegistryLayoutDigest = firstDigest
 	second.Members = append([]RegistryMember(nil), first.Members...)
 	second.Members[0].InternalEndpoint = "https://registry-a-v2:9443"
 	secondDigest, err := second.Digest()
@@ -338,19 +343,20 @@ func TestManifestGuardReplaysFullChainFromDurableAnchor(t *testing.T) {
 		t.Fatal(err)
 	}
 	third := second
-	third.ManifestVersion = 3
-	third.PreviousManifestDigest = secondDigest
+	third.RegistryLayoutVersion = 3
+	third.PreviousRegistryLayoutVersion = 2
+	third.PreviousRegistryLayoutDigest = secondDigest
 	third.Members = append([]RegistryMember(nil), second.Members...)
 	third.Members[0].InternalEndpoint = "https://registry-a-v3:9443"
-	signed := make([]SignedManifest, 0, 3)
-	for _, manifest := range []Manifest{first, second, third} {
-		value, signErr := SignManifest(manifest, "root-1", privateKey)
+	signed := make([]SignedRegistryLayout, 0, 3)
+	for _, registryLayout := range []RegistryLayout{first, second, third} {
+		value, signErr := SignRegistryLayout(registryLayout, "root-1", privateKey)
 		if signErr != nil {
 			t.Fatal(signErr)
 		}
 		signed = append(signed, value)
 	}
-	guard := ManifestGuard{Path: filepath.Join(t.TempDir(), "manifest.json")}
+	guard := RegistryLayoutGuard{Path: filepath.Join(t.TempDir(), "registryLayout.json")}
 	if _, err := guard.AcceptSignedChain(signed[:2], keyring); err != nil {
 		t.Fatal(err)
 	}
@@ -362,8 +368,8 @@ func TestManifestGuardReplaysFullChainFromDurableAnchor(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if accepted.ManifestVersion != third.ManifestVersion || accepted.ManifestDigest != thirdDigest {
-		t.Fatalf("replayed manifest = %+v", accepted)
+	if accepted.RegistryLayoutVersion != third.RegistryLayoutVersion || accepted.RegistryLayoutDigest != thirdDigest {
+		t.Fatalf("replayed registryLayout = %+v", accepted)
 	}
 	if _, err := guard.EvaluateSignedChain(signed[:2], keyring); err != nil {
 		t.Fatalf("idempotent full-chain replay failed: %v", err)

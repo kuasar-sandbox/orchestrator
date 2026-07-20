@@ -17,14 +17,14 @@ func TestPebbleStateMachinePersistsAndRestoresAcrossReplicaIDs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	manifest := testManifest(4, "generation-disk")
-	identity := routeShardIdentity(t, manifest, "/disk", "ready")
+	registryLayout := testRegistryLayout(4, "generation-disk")
+	identity := routeShardIdentity(t, registryLayout, "/disk", "ready")
 	shardID := DataRaftShardID(identity.ShardID)
 	machine := engine.NewStateMachine(shardID, 1)
 	if index, err := machine.Open(make(chan struct{})); err != nil || index != 0 {
 		t.Fatalf("initial Open = %d, %v", index, err)
 	}
-	bootstrap, err := NewDataShardBootstrap(manifest, identity.ShardID)
+	bootstrap, err := NewDataShardBootstrap(registryLayout, identity.ShardID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -32,7 +32,7 @@ func TestPebbleStateMachinePersistsAndRestoresAcrossReplicaIDs(t *testing.T) {
 		Type: DataInitializeShard, Identity: identity, Bootstrap: &bootstrap,
 		ReplicaIDs: append([]uint64(nil), bootstrap.ReplicaIDs...),
 	})
-	starting := routeStarting(t, manifest, "/disk", "ready", "sandbox-disk", 1, true)
+	starting := routeStarting(t, registryLayout, "/disk", "ready", "sandbox-disk", 1, true)
 	applyDiskData(t, machine, 2, DataCommand{
 		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{Absent: true}, Route: &starting,
 	})
@@ -96,9 +96,9 @@ func TestPebbleSystemStateMachinePersistsPermitState(t *testing.T) {
 	if index, err := machine.Open(make(chan struct{})); err != nil || index != 0 {
 		t.Fatalf("initial Open = %d, %v", index, err)
 	}
-	manifest := testManifest(4, "generation-system-disk")
-	digest, _ := manifest.Digest()
-	applyDiskSystem(t, machine, 1, SystemCommand{Type: SystemBootstrap, Manifest: &manifest, Digest: digest})
+	registryLayout := testRegistryLayout(4, "generation-system-disk")
+	digest, _ := registryLayout.Digest()
+	applyDiskSystem(t, machine, 1, SystemCommand{Type: SystemBootstrap, RegistryLayout: &registryLayout, Digest: digest})
 	applyDiskSystem(t, machine, 2, SystemCommand{
 		Type: SystemSetGates, Gates: &GateUpdate{Serve: true, Write: true, Cutover: true},
 	})
@@ -111,7 +111,7 @@ func TestPebbleSystemStateMachinePersistsPermitState(t *testing.T) {
 		t.Fatal(err)
 	}
 	state := value.(SystemState)
-	if state.LastApplied != 3 || state.ActiveManifestDigest != digest {
+	if state.LastApplied != 3 || state.ActiveRegistryLayoutDigest != digest {
 		t.Fatalf("persisted System state = %+v", state)
 	}
 	raw, err := EncodeSystemCommand(SystemCommand{Type: SystemSetGates, Gates: &GateUpdate{Write: true}})
@@ -144,8 +144,8 @@ func TestPebbleInitialBootstrapClearsUncommittedSnapshotSlot(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer engine.Close()
-	manifest := testManifest(4, "generation-clean-slot")
-	identity := routeShardIdentity(t, manifest, "/disk", "missing")
+	registryLayout := testRegistryLayout(4, "generation-clean-slot")
+	identity := routeShardIdentity(t, registryLayout, "/disk", "missing")
 	shardID := DataRaftShardID(identity.ShardID)
 	staleKey := stateRowKey(stateSlotPrefix(shardID, 1, 1), stateRouteTable, routeMapKey("/stale", "route"))
 	if err := engine.db.Set(staleKey, []byte(`{"partial":true}`), nil); err != nil {
@@ -155,7 +155,7 @@ func TestPebbleInitialBootstrapClearsUncommittedSnapshotSlot(t *testing.T) {
 	if index, err := machine.Open(make(chan struct{})); err != nil || index != 0 {
 		t.Fatalf("Open with inactive residue = %d, %v", index, err)
 	}
-	bootstrap, _ := NewDataShardBootstrap(manifest, identity.ShardID)
+	bootstrap, _ := NewDataShardBootstrap(registryLayout, identity.ShardID)
 	applyDiskData(t, machine, 1, DataCommand{
 		Type: DataInitializeShard, Identity: identity, Bootstrap: &bootstrap,
 		ReplicaIDs: append([]uint64(nil), bootstrap.ReplicaIDs...),
@@ -171,19 +171,19 @@ func TestPebbleRouteChangefeedCompactionForcesReset(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer engine.Close()
-	manifest := testManifest(4, "generation-changefeed")
+	registryLayout := testRegistryLayout(4, "generation-changefeed")
 	group, routeKey := "/changefeed", "route"
-	identity := routeShardIdentity(t, manifest, group, routeKey)
+	identity := routeShardIdentity(t, registryLayout, group, routeKey)
 	machine := engine.NewStateMachine(DataRaftShardID(identity.ShardID), 1)
 	if _, err := machine.Open(make(chan struct{})); err != nil {
 		t.Fatal(err)
 	}
-	bootstrap, _ := NewDataShardBootstrap(manifest, identity.ShardID)
+	bootstrap, _ := NewDataShardBootstrap(registryLayout, identity.ShardID)
 	applyDiskData(t, machine, 1, DataCommand{
 		Type: DataInitializeShard, Identity: identity, Bootstrap: &bootstrap,
 		ReplicaIDs: append([]uint64(nil), bootstrap.ReplicaIDs...),
 	})
-	starting := routeStarting(t, manifest, group, routeKey, "sandbox-changefeed", 1, true)
+	starting := routeStarting(t, registryLayout, group, routeKey, "sandbox-changefeed", 1, true)
 	applyDiskData(t, machine, 2, DataCommand{
 		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{Absent: true}, Route: &starting,
 	})
@@ -201,7 +201,7 @@ func TestPebbleRouteChangefeedCompactionForcesReset(t *testing.T) {
 	if err := json.Unmarshal(entries[0].Result.Data, &conflict); err != nil || !conflict.Conflict {
 		t.Fatalf("compaction-driving conflict = %+v, %v", conflict, err)
 	}
-	bucket, _, _ := clusterstate.RouteShardFor(group, routeKey, manifest.RouteBucketCount, manifest.VirtualShardCount)
+	bucket, _, _ := clusterstate.RouteShardFor(group, routeKey, registryLayout.RouteBucketCount, registryLayout.VirtualShardCount)
 	value, err := machine.Lookup(DataLookup{Changefeed: &RouteChangefeedLookup{
 		Identity: identity, Group: group, Bucket: bucket, AfterRevision: 1, Limit: 10,
 	}})
@@ -221,14 +221,14 @@ func TestPebbleStateMachineAppliesOneDragonboatBatchAtomically(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer engine.Close()
-	manifest := testManifest(4, "generation-batch")
-	identity := routeShardIdentity(t, manifest, "/batch", "ready")
+	registryLayout := testRegistryLayout(4, "generation-batch")
+	identity := routeShardIdentity(t, registryLayout, "/batch", "ready")
 	machine := engine.NewStateMachine(DataRaftShardID(identity.ShardID), 1)
 	if _, err := machine.Open(make(chan struct{})); err != nil {
 		t.Fatal(err)
 	}
-	bootstrap, _ := NewDataShardBootstrap(manifest, identity.ShardID)
-	starting := routeStarting(t, manifest, "/batch", "ready", "sandbox-batch", 1, true)
+	bootstrap, _ := NewDataShardBootstrap(registryLayout, identity.ShardID)
+	starting := routeStarting(t, registryLayout, "/batch", "ready", "sandbox-batch", 1, true)
 	ready := readyRecord(starting, 1)
 	commands := []DataCommand{
 		{Type: DataInitializeShard, Identity: identity, Bootstrap: &bootstrap, ReplicaIDs: bootstrap.ReplicaIDs},
@@ -262,15 +262,15 @@ func TestPebbleSnapshotRecoverySpansMultipleSyncedBatches(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer engine.Close()
-	manifest := testManifest(4, "generation-large-snapshot")
+	registryLayout := testRegistryLayout(4, "generation-large-snapshot")
 	group := "/large-snapshot"
-	identity := routeShardIdentity(t, manifest, group, "seed")
+	identity := routeShardIdentity(t, registryLayout, group, "seed")
 	shardID := DataRaftShardID(identity.ShardID)
 	machine := engine.NewStateMachine(shardID, 1)
 	if _, err := machine.Open(make(chan struct{})); err != nil {
 		t.Fatal(err)
 	}
-	bootstrap, _ := NewDataShardBootstrap(manifest, identity.ShardID)
+	bootstrap, _ := NewDataShardBootstrap(registryLayout, identity.ShardID)
 	applyDiskData(t, machine, 1, DataCommand{
 		Type: DataInitializeShard, Identity: identity, Bootstrap: &bootstrap,
 		ReplicaIDs: append([]uint64(nil), bootstrap.ReplicaIDs...),
@@ -290,7 +290,7 @@ func TestPebbleSnapshotRecoverySpansMultipleSyncedBatches(t *testing.T) {
 	for candidate := 0; len(entries) < routeCount; candidate++ {
 		routeKey := fmt.Sprintf("route-%06d", candidate)
 		_, candidateShard, err := clusterstate.RouteShardFor(
-			group, routeKey, manifest.RouteBucketCount, manifest.VirtualShardCount,
+			group, routeKey, registryLayout.RouteBucketCount, registryLayout.VirtualShardCount,
 		)
 		if err != nil {
 			t.Fatal(err)
@@ -298,11 +298,11 @@ func TestPebbleSnapshotRecoverySpansMultipleSyncedBatches(t *testing.T) {
 		if candidateShard != identity.ShardID {
 			continue
 		}
-		starting := routeStarting(t, manifest, group, routeKey, fmt.Sprintf("sandbox-%06d", candidate), 1, false)
+		starting := routeStarting(t, registryLayout, group, routeKey, fmt.Sprintf("sandbox-%06d", candidate), 1, false)
 		starting.Starting.Intent = intent
 		selected := uint32(0)
 		binding := testBinding(
-			t, manifest, clusterstate.ExecutionKindSandbox, starting.Starting.SandboxID,
+			t, registryLayout, clusterstate.ExecutionKindSandbox, starting.Starting.SandboxID,
 			group, routeKey, starting.Starting.CandidatePool[0].NodeID, intent,
 		)
 		starting.Starting.SelectedCandidate = &selected

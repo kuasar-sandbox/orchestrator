@@ -34,7 +34,7 @@ func (i ShardRequestIdentity) Validate() error {
 type DataState struct {
 	Initialized          bool                                        `json:"initialized"`
 	ClusterID            string                                      `json:"cluster_id"`
-	StorageGeneration    string                                      `json:"storage_generation"`
+	RegistryGeneration   string                                      `json:"registry_generation"`
 	ShardID              uint32                                      `json:"shard_id"`
 	SchemaVersion        uint32                                      `json:"schema_version"`
 	ProtocolVersion      uint32                                      `json:"protocol_version"`
@@ -55,7 +55,7 @@ type DataState struct {
 
 func (s DataState) Validate() error {
 	if !s.Initialized {
-		if s.ClusterID != "" || s.StorageGeneration != "" || s.ShardID != 0 || s.SchemaVersion != 0 ||
+		if s.ClusterID != "" || s.RegistryGeneration != "" || s.ShardID != 0 || s.SchemaVersion != 0 ||
 			s.ProtocolVersion != 0 || s.HashVersion != "" || s.RouteBucketCount != 0 ||
 			s.BuildBucketCount != 0 || s.VirtualShardCount != 0 || len(s.ReplicaIDs) != 0 ||
 			len(s.PreparedReplicaIDs) != 0 || s.RouteChangefeedFloor != 0 || len(s.RouteChanges) != 0 ||
@@ -118,7 +118,7 @@ func validateRouteChange(state DataState, change RouteChange) error {
 }
 
 func validateDataStateIdentity(s DataState) error {
-	if s.ClusterID == "" || s.StorageGeneration == "" || s.SchemaVersion == 0 || s.ProtocolVersion == 0 ||
+	if s.ClusterID == "" || s.RegistryGeneration == "" || s.SchemaVersion == 0 || s.ProtocolVersion == 0 ||
 		s.HashVersion != "ShardHashV1" || s.RouteBucketCount == 0 || s.BuildBucketCount == 0 ||
 		!isPowerOfTwo(s.RouteBucketCount) || !isPowerOfTwo(s.BuildBucketCount) ||
 		s.VirtualShardCount == 0 || !isPowerOfTwo(s.VirtualShardCount) || s.ShardID >= s.VirtualShardCount ||
@@ -143,7 +143,7 @@ func validateDataStateIdentity(s DataState) error {
 		}
 	}
 	for i, epoch := range s.ServingEpochs {
-		if err := epoch.Validate(); err != nil || epoch.ClusterID != s.ClusterID || epoch.StorageGeneration != s.StorageGeneration {
+		if err := epoch.Validate(); err != nil || epoch.ClusterID != s.ClusterID || epoch.RegistryGeneration != s.RegistryGeneration {
 			return errors.New("raftstore: serving epoch belongs to another data shard generation")
 		}
 		if i > 0 && epoch.SystemEpoch != s.ServingEpochs[i-1].SystemEpoch+1 {
@@ -196,12 +196,12 @@ func validateStoredFence(state DataState, key string, fence clusterstate.Executi
 }
 
 func revisionBelongsTo(state DataState, revision clusterstate.Revision) bool {
-	return revision.StorageGeneration == state.StorageGeneration && revision.ShardID == state.ShardID &&
+	return revision.RegistryGeneration == state.RegistryGeneration && revision.ShardID == state.ShardID &&
 		revision.LogIndex > 0 && revision.LogIndex <= state.LastApplied
 }
 
 func (s DataState) Accepts(identity ShardRequestIdentity) bool {
-	if !s.Initialized || identity.ClusterID != s.ClusterID || identity.StorageGeneration != s.StorageGeneration ||
+	if !s.Initialized || identity.ClusterID != s.ClusterID || identity.RegistryGeneration != s.RegistryGeneration ||
 		identity.ShardID != s.ShardID {
 		return false
 	}
@@ -250,53 +250,53 @@ type FenceCompactionAuthorization struct {
 }
 
 type DataShardBootstrap struct {
-	ClusterID         string   `json:"cluster_id"`
-	StorageGeneration string   `json:"storage_generation"`
-	ManifestDigest    string   `json:"manifest_digest"`
-	ShardID           uint32   `json:"shard_id"`
-	ReplicaIDs        []uint64 `json:"replica_ids"`
-	SchemaVersion     uint32   `json:"schema_version"`
-	ProtocolVersion   uint32   `json:"protocol_version"`
-	HashVersion       string   `json:"hash_version"`
-	VirtualShardCount uint32   `json:"virtual_shard_count"`
-	RouteBucketCount  uint32   `json:"route_bucket_count"`
-	BuildBucketCount  uint32   `json:"build_bucket_count"`
+	ClusterID            string   `json:"cluster_id"`
+	RegistryGeneration   string   `json:"registry_generation"`
+	RegistryLayoutDigest string   `json:"registry_layout_digest"`
+	ShardID              uint32   `json:"shard_id"`
+	ReplicaIDs           []uint64 `json:"replica_ids"`
+	SchemaVersion        uint32   `json:"schema_version"`
+	ProtocolVersion      uint32   `json:"protocol_version"`
+	HashVersion          string   `json:"hash_version"`
+	VirtualShardCount    uint32   `json:"virtual_shard_count"`
+	RouteBucketCount     uint32   `json:"route_bucket_count"`
+	BuildBucketCount     uint32   `json:"build_bucket_count"`
 }
 
-func NewDataShardBootstrap(manifest Manifest, shardID uint32) (DataShardBootstrap, error) {
-	if err := manifest.Validate(); err != nil {
+func NewDataShardBootstrap(registryLayout RegistryLayout, shardID uint32) (DataShardBootstrap, error) {
+	if err := registryLayout.Validate(); err != nil {
 		return DataShardBootstrap{}, err
 	}
-	if shardID >= manifest.VirtualShardCount {
+	if shardID >= registryLayout.VirtualShardCount {
 		return DataShardBootstrap{}, errors.New("raftstore: data-shard bootstrap targets an unknown shard")
 	}
-	digest, err := manifest.Digest()
+	digest, err := registryLayout.Digest()
 	if err != nil {
 		return DataShardBootstrap{}, err
 	}
-	return dataShardBootstrap(manifest, digest, shardID)
+	return dataShardBootstrap(registryLayout, digest, shardID)
 }
 
-func dataShardBootstrap(manifest Manifest, digest string, shardID uint32) (DataShardBootstrap, error) {
+func dataShardBootstrap(registryLayout RegistryLayout, digest string, shardID uint32) (DataShardBootstrap, error) {
 	if !isSHA256(digest) {
-		return DataShardBootstrap{}, errors.New("raftstore: data-shard bootstrap requires a verified manifest digest")
+		return DataShardBootstrap{}, errors.New("raftstore: data-shard bootstrap requires a verified registryLayout digest")
 	}
-	if shardID >= manifest.VirtualShardCount || int(shardID) >= len(manifest.DataShards) ||
-		manifest.DataShards[shardID].ShardID != shardID {
+	if shardID >= registryLayout.VirtualShardCount || int(shardID) >= len(registryLayout.DataShards) ||
+		registryLayout.DataShards[shardID].ShardID != shardID {
 		return DataShardBootstrap{}, errors.New("raftstore: data-shard bootstrap targets an unknown shard")
 	}
 	return DataShardBootstrap{
-		ClusterID: manifest.ClusterID, StorageGeneration: manifest.StorageGeneration,
-		ManifestDigest: digest, ShardID: shardID,
-		ReplicaIDs:    append([]uint64(nil), replicaIDsForPlacement(manifest.DataShards[shardID])...),
-		SchemaVersion: manifest.SchemaVersion, ProtocolVersion: manifest.ProtocolVersion,
-		HashVersion: manifest.HashVersion, VirtualShardCount: manifest.VirtualShardCount,
-		RouteBucketCount: manifest.RouteBucketCount, BuildBucketCount: manifest.BuildBucketCount,
+		ClusterID: registryLayout.ClusterID, RegistryGeneration: registryLayout.RegistryGeneration,
+		RegistryLayoutDigest: digest, ShardID: shardID,
+		ReplicaIDs:    append([]uint64(nil), replicaIDsForPlacement(registryLayout.DataShards[shardID])...),
+		SchemaVersion: registryLayout.SchemaVersion, ProtocolVersion: registryLayout.ProtocolVersion,
+		HashVersion: registryLayout.HashVersion, VirtualShardCount: registryLayout.VirtualShardCount,
+		RouteBucketCount: registryLayout.RouteBucketCount, BuildBucketCount: registryLayout.BuildBucketCount,
 	}, nil
 }
 
 func (b DataShardBootstrap) Validate() error {
-	if b.ClusterID == "" || b.StorageGeneration == "" || !isSHA256(b.ManifestDigest) ||
+	if b.ClusterID == "" || b.RegistryGeneration == "" || !isSHA256(b.RegistryLayoutDigest) ||
 		validateReplicaIDs(b.ReplicaIDs) != nil || b.SchemaVersion == 0 ||
 		b.ProtocolVersion == 0 || b.HashVersion != "ShardHashV1" ||
 		!isPowerOfTwo(b.VirtualShardCount) || !isPowerOfTwo(b.RouteBucketCount) ||
@@ -348,15 +348,15 @@ func ApplyDataCommand(state *DataState, index uint64, command DataCommand) DataA
 		bootstrap := command.Bootstrap
 		if bootstrap.Validate() != nil || command.Identity.SystemEpoch != 1 ||
 			command.Identity.ClusterID != bootstrap.ClusterID ||
-			command.Identity.StorageGeneration != bootstrap.StorageGeneration ||
-			command.Identity.ManifestDigest != bootstrap.ManifestDigest ||
+			command.Identity.RegistryGeneration != bootstrap.RegistryGeneration ||
+			command.Identity.RegistryLayoutDigest != bootstrap.RegistryLayoutDigest ||
 			command.Identity.ShardID != bootstrap.ShardID ||
 			command.Identity.ShardID >= bootstrap.VirtualShardCount ||
 			!slices.Equal(command.ReplicaIDs, bootstrap.ReplicaIDs) {
 			return conflict("invalid data shard bootstrap identity", 0)
 		}
 		*state = DataState{
-			Initialized: true, ClusterID: command.Identity.ClusterID, StorageGeneration: command.Identity.StorageGeneration,
+			Initialized: true, ClusterID: command.Identity.ClusterID, RegistryGeneration: command.Identity.RegistryGeneration,
 			ShardID: command.Identity.ShardID, SchemaVersion: bootstrap.SchemaVersion,
 			ProtocolVersion: bootstrap.ProtocolVersion, HashVersion: bootstrap.HashVersion,
 			RouteBucketCount: bootstrap.RouteBucketCount, BuildBucketCount: bootstrap.BuildBucketCount,
@@ -373,7 +373,7 @@ func ApplyDataCommand(state *DataState, index uint64, command DataCommand) DataA
 		}
 		epoch := *command.Epoch
 		current := state.ServingEpochs[0]
-		if epoch.Validate() != nil || epoch.ClusterID != state.ClusterID || epoch.StorageGeneration != state.StorageGeneration ||
+		if epoch.Validate() != nil || epoch.ClusterID != state.ClusterID || epoch.RegistryGeneration != state.RegistryGeneration ||
 			epoch.SystemEpoch != current.SystemEpoch+1 {
 			return conflict("invalid prepared serving epoch", 0)
 		}
@@ -520,7 +520,7 @@ func advanceDataApplied(state *DataState, index uint64) {
 }
 
 func revisionFor(state DataState, index uint64) clusterstate.Revision {
-	return clusterstate.Revision{StorageGeneration: state.StorageGeneration, ShardID: state.ShardID, LogIndex: index}
+	return clusterstate.Revision{RegistryGeneration: state.RegistryGeneration, ShardID: state.ShardID, LogIndex: index}
 }
 
 func normalizeRouteRevision(record *clusterstate.RouteWorkflowRecord) {

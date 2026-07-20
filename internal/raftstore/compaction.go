@@ -28,7 +28,7 @@ func (e FenceOutboxAckEvidence) validates(fence clusterstate.ExecutionFence) boo
 }
 
 // CompactExecutionFence waits the configured retention period from a fresh
-// strong read, proves every exact manifest voter has applied the fence, and
+// strong read, proves every exact registryLayout voter has applied the fence, and
 // then submits the only authorized compaction command path.
 func (r *Runtime) CompactExecutionFence(
 	ctx context.Context,
@@ -45,12 +45,12 @@ func (r *Runtime) CompactExecutionFence(
 		return errors.New("raftstore: execution-fence compaction identity is incomplete")
 	}
 	_, shardID, err := clusterstate.RouteShardFor(
-		group, routeKey, r.manifest.RouteBucketCount, r.manifest.VirtualShardCount,
+		group, routeKey, r.registryLayout.RouteBucketCount, r.registryLayout.VirtualShardCount,
 	)
 	if err != nil || shardID != identity.ShardID {
 		return errors.New("raftstore: execution-fence compaction targets another shard")
 	}
-	system, err := r.requireStableActiveManifest(ctx, identity.PermitIdentity)
+	system, err := r.requireStableActiveRegistryLayout(ctx, identity.PermitIdentity)
 	if err != nil {
 		return err
 	}
@@ -82,12 +82,12 @@ func (r *Runtime) CompactExecutionFence(
 	if grant.PermitIdentity != identity.PermitIdentity {
 		return errors.New("raftstore: active permit identity changed during fence retention")
 	}
-	currentSystem, err := r.requireStableActiveManifest(ctx, identity.PermitIdentity)
+	currentSystem, err := r.requireStableActiveRegistryLayout(ctx, identity.PermitIdentity)
 	if err != nil {
 		return err
 	}
 	if currentSystem.SystemEpoch != system.SystemEpoch ||
-		currentSystem.ActiveManifestDigest != system.ActiveManifestDigest {
+		currentSystem.ActiveRegistryLayoutDigest != system.ActiveRegistryLayoutDigest {
 		return errors.New("raftstore: System identity changed during fence retention")
 	}
 	currentFence, err := r.readFenceStrong(ctx, query)
@@ -104,12 +104,12 @@ func (r *Runtime) CompactExecutionFence(
 	if err != nil {
 		return err
 	}
-	finalSystem, err := r.requireStableActiveManifest(ctx, identity.PermitIdentity)
+	finalSystem, err := r.requireStableActiveRegistryLayout(ctx, identity.PermitIdentity)
 	if err != nil {
 		return err
 	}
 	if finalSystem.SystemEpoch != currentSystem.SystemEpoch ||
-		finalSystem.ActiveManifestDigest != currentSystem.ActiveManifestDigest {
+		finalSystem.ActiveRegistryLayoutDigest != currentSystem.ActiveRegistryLayoutDigest {
 		return errors.New("raftstore: System identity changed during fence proof collection")
 	}
 	retentionDigest, err := fenceRetentionProofDigest(
@@ -144,7 +144,7 @@ func (r *Runtime) CompactExecutionFence(
 	return errors.New("raftstore: compacted execution fence remains visible")
 }
 
-func (r *Runtime) requireStableActiveManifest(
+func (r *Runtime) requireStableActiveRegistryLayout(
 	ctx context.Context,
 	identity PermitIdentity,
 ) (SystemState, error) {
@@ -152,13 +152,13 @@ func (r *Runtime) requireStableActiveManifest(
 	if err != nil {
 		return SystemState{}, err
 	}
-	if err := r.authorizeManifestState(state); err != nil {
+	if err := r.authorizeRegistryLayoutState(state); err != nil {
 		return SystemState{}, err
 	}
 	if state.Retired || state.Recovery != nil || state.Transition != nil ||
-		state.ActiveManifestVersion != r.manifest.ManifestVersion ||
-		state.ActiveManifestDigest != r.manifestDigest || state.Identity() != identity {
-		return SystemState{}, errors.New("raftstore: execution fences compact only under a stable active manifest")
+		state.ActiveRegistryLayoutVersion != r.registryLayout.RegistryLayoutVersion ||
+		state.ActiveRegistryLayoutDigest != r.registryLayoutDigest || state.Identity() != identity {
+		return SystemState{}, errors.New("raftstore: execution fences compact only under a stable active registryLayout")
 	}
 	if err := r.permitCache.Authorize(identity, PermitRegistryWrite); err != nil {
 		return SystemState{}, err
@@ -187,12 +187,12 @@ func (r *Runtime) proveFenceAppliedEverywhere(
 	if err != nil {
 		return nil, err
 	}
-	desired := replicaIDsForPlacement(r.manifest.DataShards[identity.ShardID])
+	desired := replicaIDsForPlacement(r.registryLayout.DataShards[identity.ShardID])
 	if len(state.ServingEpochs) != 1 || state.ServingEpochs[0] != identity.PermitIdentity ||
 		!slices.Equal(state.ReplicaIDs, desired) || len(state.PreparedReplicaIDs) != 0 {
-		return nil, errors.New("raftstore: data shard is not on the exact stable manifest replica set")
+		return nil, errors.New("raftstore: data shard is not on the exact stable registryLayout replica set")
 	}
-	placements := r.manifest.DataShards[identity.ShardID].Replicas
+	placements := r.registryLayout.DataShards[identity.ShardID].Replicas
 	proofs := make([]ReplicaAppliedProof, len(placements))
 	group, groupCtx := errgroup.WithContext(ctx)
 	group.SetLimit(len(placements))
@@ -201,7 +201,7 @@ func (r *Runtime) proveFenceAppliedEverywhere(
 		group.Go(func() error {
 			request := ReplicaAppliedRequest{
 				ShardID: raftShardID, ReplicaID: placement.ReplicaID, MemberID: placement.MemberID,
-				ManifestDigest: r.manifestDigest, MinimumAppliedIndex: fence.Revision.LogIndex,
+				RegistryLayoutDigest: r.registryLayoutDigest, MinimumAppliedIndex: fence.Revision.LogIndex,
 			}
 			proof, err := r.probeReplicaApplied(groupCtx, request)
 			if err != nil {
@@ -224,14 +224,14 @@ func fenceRetentionProofDigest(
 	outboxAck FenceOutboxAckEvidence,
 ) (string, error) {
 	value := struct {
-		StorageGeneration string                 `json:"storage_generation"`
-		ShardID           uint32                 `json:"shard_id"`
-		FenceRevision     uint64                 `json:"fence_revision"`
-		TerminalDigest    string                 `json:"terminal_digest"`
-		RetentionMillis   uint64                 `json:"retention_millis"`
-		OutboxAck         FenceOutboxAckEvidence `json:"outbox_ack"`
+		RegistryGeneration string                 `json:"registry_generation"`
+		ShardID            uint32                 `json:"shard_id"`
+		FenceRevision      uint64                 `json:"fence_revision"`
+		TerminalDigest     string                 `json:"terminal_digest"`
+		RetentionMillis    uint64                 `json:"retention_millis"`
+		OutboxAck          FenceOutboxAckEvidence `json:"outbox_ack"`
 	}{
-		StorageGeneration: fence.StorageGeneration, ShardID: fence.Revision.ShardID,
+		RegistryGeneration: fence.RegistryGeneration, ShardID: fence.Revision.ShardID,
 		FenceRevision: fence.Revision.LogIndex, TerminalDigest: fence.Proof.ProofDigest,
 		RetentionMillis: retentionMillis, OutboxAck: outboxAck,
 	}
