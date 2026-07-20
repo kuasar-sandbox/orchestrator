@@ -374,6 +374,9 @@ func (c *StartingCoordinator) dispatch(ctx context.Context, kind cluster.Executi
 	}
 	dispatched, err := c.dispatcher.AdmitAndDispatch(ctx, request)
 	if err != nil {
+		if errors.Is(err, session.ErrDispatchNotSent) {
+			return RunResult{Status: RunRetrySelected, Reason: err.Error()}
+		}
 		return RunResult{Status: RunPinnedUnknown, Outcome: cluster.DispatchUnknown, Reason: err.Error()}
 	}
 	if err := dispatched.Outcome.Validate(); err != nil {

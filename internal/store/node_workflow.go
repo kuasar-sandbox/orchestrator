@@ -628,7 +628,7 @@ func (s *Store) CommitBuildEvent(
 	}
 	if record.LatestEvent != nil && record.ObjectState == update.State {
 		if eventUpdateMatches(record.LatestEvent, update) {
-			changed, mergeErr := mergeBuildLaunchFields(current, build)
+			changed, mergeErr := mergeBuildLaunchFields(current, build, update)
 			if mergeErr != nil {
 				return nil, mergeErr
 			}
@@ -649,7 +649,7 @@ func (s *Store) CommitBuildEvent(
 		return nil, err
 	}
 	stored := cloneBuild(current)
-	if _, err := mergeBuildLaunchFields(stored, build); err != nil {
+	if _, err := mergeBuildLaunchFields(stored, build, update); err != nil {
 		return nil, err
 	}
 	stored.Metadata, err = clusterstate.WithExecutionBinding(clusterstate.WithoutSystemMetadata(stored.Metadata), record.OpaqueBinding)
@@ -987,7 +987,7 @@ func cloneSandbox(source *types.Sandbox) *types.Sandbox {
 	return &out
 }
 
-func mergeBuildLaunchFields(stored, incoming *types.Build) (bool, error) {
+func mergeBuildLaunchFields(stored, incoming *types.Build, update nodeexec.EventUpdate) (bool, error) {
 	if stored == nil || incoming == nil {
 		return false, errors.New("store: Build launch field merge requires both objects")
 	}
@@ -1013,7 +1013,13 @@ func mergeBuildLaunchFields(stored, incoming *types.Build) (bool, error) {
 			continue
 		}
 		if len(*field.stored) != 0 && !slices.Equal(*field.stored, field.incoming) {
-			return false, fmt.Errorf("%w: Build %s changed", ErrNodeWorkflowConflict, field.name)
+			if update.State != string(clusterstate.BuildReady) || update.ArtifactRef == "" ||
+				!slices.Equal(appendUniqueString(*field.stored, update.ArtifactRef), field.incoming) {
+				return false, fmt.Errorf("%w: Build %s changed", ErrNodeWorkflowConflict, field.name)
+			}
+			*field.stored = append([]string(nil), field.incoming...)
+			changed = true
+			continue
 		}
 		if len(*field.stored) == 0 {
 			*field.stored = append([]string(nil), field.incoming...)
@@ -1021,6 +1027,14 @@ func mergeBuildLaunchFields(stored, incoming *types.Build) (bool, error) {
 		}
 	}
 	return changed, nil
+}
+
+func appendUniqueString(values []string, value string) []string {
+	result := append([]string(nil), values...)
+	if !slices.Contains(result, value) {
+		result = append(result, value)
+	}
+	return result
 }
 
 func cloneMetadata(source map[string]string) map[string]string {

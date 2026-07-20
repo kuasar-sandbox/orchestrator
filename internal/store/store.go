@@ -185,23 +185,6 @@ func Open(path string, box *secretbox.Box) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("store: init schema: %w", err)
 	}
-	for _, column := range []struct {
-		table string
-		name  string
-		spec  string
-	}{
-		{"sandboxes", "auth_key_hash", `TEXT NOT NULL DEFAULT ''`},
-		{"sandboxes", "auth_key_enc", `TEXT NOT NULL DEFAULT ''`},
-		{"builds", "auth_key_hash", `TEXT NOT NULL DEFAULT ''`},
-		{"builds", "auth_key_enc", `TEXT NOT NULL DEFAULT ''`},
-		{"builds", "cpu_count", `INTEGER NOT NULL DEFAULT 0`},
-		{"builds", "memory_mb", `INTEGER NOT NULL DEFAULT 0`},
-	} {
-		if err := ensureColumn(ctx, db, column.table, column.name, column.spec); err != nil {
-			db.Close()
-			return nil, fmt.Errorf("store: init schema: %w", err)
-		}
-	}
 	return &Store{db: db, box: box, eventWake: make(chan struct{}, 1)}, nil
 }
 

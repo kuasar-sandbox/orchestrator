@@ -496,6 +496,45 @@ func TestDuplicateBuildRegisteredEventPersistsLaunchIdentity(t *testing.T) {
 	}
 }
 
+func TestBuildReadyMayOnlyAppendItsArtifactAlias(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	dispatch := workflowDispatch(t, clusterstate.ExecutionKindBuild, "build-ready-alias", placement.BuildDemand{Slots: 1})
+	if _, err := st.PrepareBuildWorkflow(ctx, dispatch, workflowBuild(dispatch.ObjectID),
+		nodeexec.BuildCapacity{Slots: 1, QueueLimit: 4}, ""); err != nil {
+		t.Fatal(err)
+	}
+	registered := workflowBuild(dispatch.ObjectID)
+	registered.Names = []string{"build-name"}
+	registered.Aliases = []string{"build-alias"}
+	if _, err := st.CommitBuildEvent(ctx, registered, nodeexec.EventUpdate{State: string(clusterstate.BuildRegistered)}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.CommitBuildEvent(ctx, workflowBuild(dispatch.ObjectID), nodeexec.EventUpdate{State: string(clusterstate.BuildBuilding)}); err != nil {
+		t.Fatal(err)
+	}
+	forged := workflowBuild(dispatch.ObjectID)
+	forged.Names = []string{"build-name", "unrelated"}
+	forged.Aliases = []string{"build-alias", "artifact-1"}
+	if _, err := st.CommitBuildEvent(ctx, forged, nodeexec.EventUpdate{
+		State: string(clusterstate.BuildReady), ArtifactRef: "artifact-1",
+	}); !errors.Is(err, ErrNodeWorkflowConflict) {
+		t.Fatalf("unrelated READY alias error = %v", err)
+	}
+	ready := workflowBuild(dispatch.ObjectID)
+	ready.Names = []string{"build-name", "artifact-1"}
+	ready.Aliases = []string{"build-alias", "artifact-1"}
+	if _, err := st.CommitBuildEvent(ctx, ready, nodeexec.EventUpdate{
+		State: string(clusterstate.BuildReady), ArtifactRef: "artifact-1",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := st.GetBuild(ctx, dispatch.ObjectID)
+	if err != nil || !slices.Equal(stored.Names, ready.Names) || !slices.Equal(stored.Aliases, ready.Aliases) {
+		t.Fatalf("ready aliases = %+v, err=%v", stored, err)
+	}
+}
+
 func TestBuildAdmissionAndPromotionExcludePriorNodeEpoch(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()
