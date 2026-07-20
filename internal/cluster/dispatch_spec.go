@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
@@ -154,7 +155,7 @@ func validateKeyFingerprints(authFingerprint, manifestFingerprint string) error 
 
 func validKeyFingerprint(value string) bool {
 	decoded, err := hex.DecodeString(value)
-	return err == nil && len(decoded) == 12
+	return err == nil && len(decoded) == 12 && hex.EncodeToString(decoded) == value
 }
 
 func validateDispatchRequest(request NodeRequestEnvelopeV1, paths ...string) error {
@@ -175,7 +176,15 @@ func validateDispatchRequest(request NodeRequestEnvelopeV1, paths ...string) err
 	if err != nil {
 		return err
 	}
-	metadata := fields["metadata"]
+	var metadata json.RawMessage
+	for name, value := range fields {
+		if strings.EqualFold(name, "metadata") {
+			if name != "metadata" {
+				return errors.New("cluster: request metadata field must use canonical lowercase spelling")
+			}
+			metadata = value
+		}
+	}
 	if len(metadata) == 0 || bytes.Equal(metadata, []byte("null")) {
 		return nil
 	}
