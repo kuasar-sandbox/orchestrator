@@ -25,7 +25,7 @@ func (r *Runtime) ApplySystem(ctx context.Context, command SystemCommand) (Syste
 	return r.proposeSystem(ctx, command)
 }
 
-// CloseRegistryGeneration permanently retires this generation and commits the
+// CloseRegistryGeneration permanently retires this Registry History Generation and commits the
 // exact successor registryLayout intent. The successor's consensus proof outputs are
 // deliberately excluded from the intent because they are produced by this
 // commit; ConsensusPredecessorProof fills them afterwards.
@@ -44,7 +44,7 @@ func (r *Runtime) CloseRegistryGeneration(ctx context.Context, successor Registr
 		predecessor.RegistryGeneration != state.RegistryGeneration ||
 		predecessor.RegistryLayoutDigest != state.ActiveRegistryLayoutDigest ||
 		predecessor.ServePermitMaxMillis != state.ServePermitMaxMillis {
-		return SystemState{}, errors.New("raftstore: successor registryLayout is not linked to the active generation")
+		return SystemState{}, errors.New("raftstore: successor Registry Layout is not linked to the active Registry History Generation")
 	}
 	intentDigest, err := successor.RolloverIntentDigest()
 	if err != nil {
@@ -55,7 +55,7 @@ func (r *Runtime) CloseRegistryGeneration(ctx context.Context, successor Registr
 			state.Closure.TargetRegistryLayoutIntentDigest == intentDigest {
 			return state, nil
 		}
-		return SystemState{}, errors.New("raftstore: generation is retired for another successor registryLayout")
+		return SystemState{}, errors.New("raftstore: Registry History Generation is retired for another successor Registry Layout")
 	}
 
 	result, proposeErr := r.proposeSystem(ctx, SystemCommand{
@@ -81,7 +81,7 @@ func (r *Runtime) CloseRegistryGeneration(ctx context.Context, successor Registr
 	if readErr != nil {
 		return SystemState{}, readErr
 	}
-	return SystemState{}, errors.New("raftstore: committed generation closure was not visible")
+	return SystemState{}, errors.New("raftstore: committed Registry History Generation closure was not visible")
 }
 
 // ConfirmPredecessorPermitDrain waits a full predecessor permit lifetime from
@@ -99,7 +99,7 @@ func (r *Runtime) ConfirmPredecessorPermitDrain(ctx context.Context, evidenceDig
 		return SystemState{}, err
 	}
 	if !state.HasPredecessor {
-		return SystemState{}, errors.New("raftstore: first generation has no predecessor permit to drain")
+		return SystemState{}, errors.New("raftstore: first Registry History Generation has no predecessor Permit to drain")
 	}
 	if state.PredecessorDrainComplete {
 		return state, nil

@@ -75,7 +75,7 @@ func validateSystemCommandEnvelope(command SystemCommand) error {
 		}
 	case SystemCloseRegistryGeneration:
 		if pointers != 1 || command.Closure == nil || command.Digest != "" {
-			return errors.New("raftstore: malformed generation closure command")
+			return errors.New("raftstore: malformed Registry History Generation closure command")
 		}
 	case SystemConfirmDrain:
 		if pointers != 1 || command.Drain == nil || command.Digest != "" {

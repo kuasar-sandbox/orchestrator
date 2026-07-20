@@ -168,7 +168,7 @@ func openRuntime(
 			}
 		} else {
 			if registryLayout.RegistryLayoutVersion == 1 {
-				return nil, errors.New("raftstore: a first registryLayout member must use explicit generation bootstrap")
+				return nil, errors.New("raftstore: a first Registry Layout member must use explicit Registry History Generation bootstrap")
 			}
 			mode = EnrollmentJoin
 		}
@@ -672,7 +672,7 @@ func (r *Runtime) authorizeRegistryLayoutState(system SystemState) error {
 	if system.ClusterID != r.registryLayout.ClusterID || system.RegistryGeneration != r.registryLayout.RegistryGeneration ||
 		system.SchemaVersion != r.registryLayout.SchemaVersion || system.ProtocolVersion != r.registryLayout.ProtocolVersion ||
 		system.VirtualShardCount != r.registryLayout.VirtualShardCount {
-		return errors.New("raftstore: System state differs from the signed generation")
+		return errors.New("raftstore: System state differs from the signed Registry History Generation")
 	}
 	if system.ActiveRegistryLayoutDigest == r.registryLayoutDigest && system.ActiveRegistryLayoutVersion == r.registryLayout.RegistryLayoutVersion {
 		return nil
@@ -766,7 +766,7 @@ func requireEmptyRuntimeStorage(config RuntimeConfig) error {
 			return err
 		}
 		if !empty {
-			return errors.New("raftstore: bootstrap/join requires empty generation-specific Dragonboat storage")
+			return errors.New("raftstore: bootstrap/join requires empty Registry-History-Generation-specific Dragonboat storage")
 		}
 	}
 	return nil

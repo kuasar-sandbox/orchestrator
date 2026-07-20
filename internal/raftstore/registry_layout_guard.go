@@ -76,7 +76,7 @@ func (a AcceptedRegistryLayout) Accept(next RegistryLayout, digest string) (Acce
 	}
 	if next.RegistryGeneration == a.RegistryGeneration {
 		if !a.matchesFrozenParameters(next) {
-			return AcceptedRegistryLayout{}, errors.New("raftstore: same-generation registryLayout changed frozen parameters")
+			return AcceptedRegistryLayout{}, errors.New("raftstore: same Registry History Generation Registry Layout changed frozen parameters")
 		}
 		switch {
 		case next.RegistryLayoutVersion < a.RegistryLayoutVersion:

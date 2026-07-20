@@ -131,13 +131,13 @@ type SystemState struct {
 
 // ConsensusPredecessorProof exports the committed closure in the form a
 // successor registryLayout must carry. The closure is useful only after the source
-// generation has permanently retired.
+// Registry History Generation has permanently retired.
 func (s SystemState) ConsensusPredecessorProof() (PredecessorProof, error) {
 	if err := s.Validate(); err != nil {
 		return PredecessorProof{}, err
 	}
 	if !s.Retired || s.Closure == nil || s.Closure.Kind != RolloverConsensusClosure {
-		return PredecessorProof{}, errors.New("raftstore: generation has no committed consensus closure")
+		return PredecessorProof{}, errors.New("raftstore: Registry History Generation has no committed consensus closure")
 	}
 	proof := PredecessorProof{
 		RegistryGeneration:               s.RegistryGeneration,
@@ -199,7 +199,7 @@ func (s SystemState) Validate() error {
 		s.PredecessorProofKind != "" || s.PredecessorProofDigest != "" || s.PredecessorProofCommitIndex != 0 ||
 		s.PredecessorTargetRegistryLayoutIntentDigest != "" || s.PredecessorPermitMaxMillis != 0 ||
 		!s.PredecessorDrainComplete {
-		return errors.New("raftstore: invalid first-generation predecessor state")
+		return errors.New("raftstore: invalid first Registry History Generation predecessor state")
 	}
 	if (s.WriteGate || s.CutoverGate) && !s.ServeGate {
 		return errors.New("raftstore: write/cutover gate requires serve gate")
@@ -208,10 +208,10 @@ func (s SystemState) Validate() error {
 		return errors.New("raftstore: predecessor permits have not drained")
 	}
 	if s.Retired && (s.ServeGate || s.WriteGate || s.CutoverGate) {
-		return errors.New("raftstore: retired generation has an open gate")
+		return errors.New("raftstore: retired Registry History Generation has an open gate")
 	}
 	if s.Retired != (s.Closure != nil) {
-		return errors.New("raftstore: generation closure and retired state disagree")
+		return errors.New("raftstore: Registry History Generation closure and retired state disagree")
 	}
 	if s.Closure != nil {
 		if s.Closure.TargetRegistryGeneration == "" || s.Closure.TargetRegistryGeneration == s.RegistryGeneration ||
@@ -219,7 +219,7 @@ func (s SystemState) Validate() error {
 			s.Closure.Kind != RolloverConsensusClosure || s.Closure.CommitIndex == 0 ||
 			s.Closure.CommitIndex > s.LastApplied ||
 			s.Closure.ProofDigest != registryGenerationClosureProofDigest(s, *s.Closure) {
-			return errors.New("raftstore: invalid committed generation closure")
+			return errors.New("raftstore: invalid committed Registry History Generation closure")
 		}
 	}
 	if s.Transition != nil {
@@ -278,11 +278,11 @@ const (
 	SystemBootstrap               SystemCommandType = "BOOTSTRAP"
 	SystemRefreshPermit           SystemCommandType = "REFRESH_PERMIT"
 	SystemSetGates                SystemCommandType = "SET_GATES"
-	SystemBeginTransition         SystemCommandType = "BEGIN_MANIFEST_TRANSITION"
-	SystemAdvanceTransition       SystemCommandType = "ADVANCE_MANIFEST_TRANSITION"
-	SystemActivateTransition      SystemCommandType = "ACTIVATE_MANIFEST_TRANSITION"
-	SystemConfirmTransitionDrain  SystemCommandType = "CONFIRM_MANIFEST_TRANSITION_PERMIT_DRAIN"
-	SystemFinalizeTransition      SystemCommandType = "FINALIZE_MANIFEST_TRANSITION"
+	SystemBeginTransition         SystemCommandType = "BEGIN_REGISTRY_LAYOUT_TRANSITION"
+	SystemAdvanceTransition       SystemCommandType = "ADVANCE_REGISTRY_LAYOUT_TRANSITION"
+	SystemActivateTransition      SystemCommandType = "ACTIVATE_REGISTRY_LAYOUT_TRANSITION"
+	SystemConfirmTransitionDrain  SystemCommandType = "CONFIRM_REGISTRY_LAYOUT_TRANSITION_PERMIT_DRAIN"
+	SystemFinalizeTransition      SystemCommandType = "FINALIZE_REGISTRY_LAYOUT_TRANSITION"
 	SystemCloseRegistryGeneration SystemCommandType = "CLOSE_REGISTRY_GENERATION"
 	SystemConfirmDrain            SystemCommandType = "CONFIRM_PREDECESSOR_PERMIT_DRAIN"
 	SystemBeginRecovery           SystemCommandType = "BEGIN_RECOVERY"
@@ -354,7 +354,7 @@ func ApplySystemCommand(state SystemState, index uint64, command SystemCommand) 
 		registryLayout := *command.RegistryLayout
 		digest, err := registryLayout.Digest()
 		if err != nil || digest != command.Digest {
-			return state, systemConflict("invalid generation bootstrap registryLayout")
+			return state, systemConflict("invalid Registry History Generation bootstrap Registry Layout")
 		}
 		next = SystemState{
 			Initialized: true, ClusterID: registryLayout.ClusterID, RegistryGeneration: registryLayout.RegistryGeneration,
@@ -377,7 +377,7 @@ func ApplySystemCommand(state SystemState, index uint64, command SystemCommand) 
 		}
 	case SystemRefreshPermit:
 		if !state.Initialized || state.Retired {
-			return state, systemConflict("generation cannot grant a Serve Permit")
+			return state, systemConflict("Registry History Generation cannot grant a Serve Permit")
 		}
 	case SystemSetGates:
 		if !state.Initialized || state.Retired || state.Recovery != nil || command.Gates == nil ||
@@ -456,7 +456,7 @@ func ApplySystemCommand(state SystemState, index uint64, command SystemCommand) 
 			command.Closure.TargetRegistryGeneration == "" || command.Closure.TargetRegistryGeneration == state.RegistryGeneration ||
 			!isSHA256(command.Closure.TargetRegistryLayoutIntentDigest) || command.Closure.ProofDigest != "" ||
 			command.Closure.Kind != RolloverConsensusClosure {
-			return state, systemConflict("invalid consensus generation closure")
+			return state, systemConflict("invalid consensus Registry History Generation closure")
 		}
 		closure := *command.Closure
 		closure.CommitIndex = index
@@ -536,7 +536,7 @@ func consensusClosureProofDigest(
 	commitIndex uint64,
 ) string {
 	var payload bytes.Buffer
-	payload.WriteString("kuasar-generation-closure-v1")
+	payload.WriteString("kuasar-registry-generation-closure-v1")
 	for _, field := range []string{
 		clusterID, sourceRegistryGeneration, sourceRegistryLayoutDigest,
 		targetRegistryGeneration, targetRegistryLayoutIntentDigest,

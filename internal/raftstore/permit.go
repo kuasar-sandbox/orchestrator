@@ -111,12 +111,12 @@ func (p ServePermit) Authorize(now time.Time, identity PermitIdentity, operation
 }
 
 type PermitCache struct {
-	mu             sync.RWMutex
-	now            func() time.Time
-	permits        map[PermitIdentity]ServePermit
-	clusterID      string
-	generation     string
-	retiredThrough uint64
+	mu                 sync.RWMutex
+	now                func() time.Time
+	permits            map[PermitIdentity]ServePermit
+	clusterID          string
+	registryGeneration string
+	retiredThrough     uint64
 }
 
 func NewPermitCache(now func() time.Time) *PermitCache {
@@ -135,8 +135,8 @@ func (c *PermitCache) Install(grant PermitGrant, proposalStarted time.Time) erro
 	defer c.mu.Unlock()
 	if c.clusterID == "" {
 		c.clusterID = grant.ClusterID
-		c.generation = grant.RegistryGeneration
-	} else if c.clusterID != grant.ClusterID || c.generation != grant.RegistryGeneration {
+		c.registryGeneration = grant.RegistryGeneration
+	} else if c.clusterID != grant.ClusterID || c.registryGeneration != grant.RegistryGeneration {
 		return errors.New("raftstore: Serve Permit cache belongs to another Registry History Generation")
 	}
 	current, found := c.permits[grant.PermitIdentity]

@@ -144,7 +144,7 @@ func validateDataStateIdentity(s DataState) error {
 	}
 	for i, epoch := range s.ServingEpochs {
 		if err := epoch.Validate(); err != nil || epoch.ClusterID != s.ClusterID || epoch.RegistryGeneration != s.RegistryGeneration {
-			return errors.New("raftstore: serving epoch belongs to another data shard generation")
+			return errors.New("raftstore: serving epoch belongs to another Registry History Generation")
 		}
 		if i > 0 && epoch.SystemEpoch != s.ServingEpochs[i-1].SystemEpoch+1 {
 			return errors.New("raftstore: serving epochs are not consecutive")

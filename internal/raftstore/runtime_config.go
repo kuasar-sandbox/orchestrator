@@ -216,8 +216,8 @@ func (c RuntimeConfig) attestStorage() error {
 	return nil
 }
 
-func deploymentID(clusterID, generation string) uint64 {
-	digest := sha256.Sum256([]byte("kuasar-raft-deployment-v1\x00" + clusterID + "\x00" + generation))
+func deploymentID(clusterID, registryGeneration string) uint64 {
+	digest := sha256.Sum256([]byte("kuasar-raft-deployment-v1\x00" + clusterID + "\x00" + registryGeneration))
 	value := binary.BigEndian.Uint64(digest[:8])
 	if value == 0 {
 		return 1

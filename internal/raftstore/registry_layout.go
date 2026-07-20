@@ -158,7 +158,7 @@ func (m RegistryLayout) validate(requireRolloverProof bool) error {
 			return err
 		}
 		if m.Predecessor.RegistryGeneration == m.RegistryGeneration {
-			return errors.New("raftstore: predecessor generation did not change")
+			return errors.New("raftstore: predecessor Registry History Generation did not change")
 		}
 		if requireRolloverProof && m.Predecessor.Kind == RolloverConsensusClosure {
 			intentDigest, err := m.RolloverIntentDigest()

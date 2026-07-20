@@ -295,7 +295,7 @@ func lookupRoute(state DataState, request routeapi.ReadRouteRequest) routeapi.Re
 		return routeapi.ReadRouteResponse{Outcome: routeapi.ReadNeedLeader, Reason: "Route replica is not initialized"}
 	}
 	if !state.Accepts(shardIdentityFromRoute(request.RequestIdentity)) {
-		return routeapi.ReadRouteResponse{Outcome: routeapi.ReadUnavailable, Reason: "Route request generation or epoch is fenced"}
+		return routeapi.ReadRouteResponse{Outcome: routeapi.ReadUnavailable, Reason: "Route request Registry History Generation or system epoch is fenced"}
 	}
 	_, shardID, err := clusterstate.RouteShardFor(request.Group, request.RouteKey, state.RouteBucketCount, state.VirtualShardCount)
 	if err != nil || shardID != state.ShardID || request.ShardID != state.ShardID {
@@ -338,7 +338,7 @@ func lookupBuild(state DataState, request routeapi.ReadBuildRequest) routeapi.Re
 		return routeapi.ReadBuildResponse{Outcome: routeapi.ReadNeedLeader, Reason: "Build replica is not initialized"}
 	}
 	if !state.Accepts(shardIdentityFromRoute(request.RequestIdentity)) {
-		return routeapi.ReadBuildResponse{Outcome: routeapi.ReadUnavailable, Reason: "Build request generation or epoch is fenced"}
+		return routeapi.ReadBuildResponse{Outcome: routeapi.ReadUnavailable, Reason: "Build request Registry History Generation or system epoch is fenced"}
 	}
 	_, shardID, err := clusterstate.BuildShardFor(request.Group, request.BuildID, state.BuildBucketCount, state.VirtualShardCount)
 	if err != nil || shardID != state.ShardID || request.ShardID != state.ShardID {
