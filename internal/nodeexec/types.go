@@ -264,7 +264,7 @@ func (d AdmissionDecision) Validate() error {
 }
 
 // EventUpdate contains only the bounded projection supplied by node execution
-// code. Store code fills and fences identity, Binding, generation, and event_seq.
+// code. Store code fills and fences identity, Binding, Registry History Generation, and event_seq.
 type EventUpdate struct {
 	State              string
 	AccessToken        string
