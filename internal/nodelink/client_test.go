@@ -415,18 +415,20 @@ type fakeDurableEventOutbox struct {
 	events  []routesync.ExecutionEvent
 	wake    chan struct{}
 	queries int
+	cursors []routesync.EventCursor
 }
 
 func (f *fakeDurableEventOutbox) PendingExecutionEvents(
 	_ context.Context,
 	_ string,
 	_ uint64,
-	_ routesync.EventCursor,
+	cursor routesync.EventCursor,
 	maxCount, _ int,
 ) ([]routesync.ExecutionEvent, routesync.EventCursor, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.queries++
+	f.cursors = append(f.cursors, cursor)
 	if maxCount > len(f.events) {
 		maxCount = len(f.events)
 	}
@@ -480,6 +482,48 @@ func TestDurableEventReplayStartsImmediatelyAndIsBatchBounded(t *testing.T) {
 	durable.mu.Unlock()
 	if queries != 1 {
 		t.Fatalf("queries = %d, want one bounded startup batch", queries)
+	}
+}
+
+func TestDurableEventReplayForcesBoundedCursorWrap(t *testing.T) {
+	durable := &fakeDurableEventOutbox{
+		wake: make(chan struct{}, 1),
+		events: []routesync.ExecutionEvent{{
+			ObjectKind: "sandbox", ObjectID: "sandbox-tail", NodeID: "node-1", NodeEpoch: 7,
+			RegistryGeneration: "generation-1", BindingDigest: strings.Repeat("a", 64), EventSeq: 1, State: "READY",
+		}},
+	}
+	eventOut := make(chan *routesync.Msg, durableReplayBatchesBeforeWrap+4)
+	ctx, cancel := context.WithCancel(context.Background())
+	go runDurableEventReplay(ctx, durable, "node-1", 7, 1, 1<<20, time.Millisecond, eventOut,
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+	deadline := time.After(time.Second)
+	for {
+		durable.mu.Lock()
+		queries := durable.queries
+		durable.mu.Unlock()
+		if queries >= durableReplayBatchesBeforeWrap+1 {
+			break
+		}
+		select {
+		case <-eventOut:
+		case <-deadline:
+			cancel()
+			t.Fatal("timeout waiting for bounded replay wrap")
+		}
+	}
+	cancel()
+	durable.mu.Lock()
+	cursors := append([]routesync.EventCursor(nil), durable.cursors...)
+	durable.mu.Unlock()
+	zeroes := 0
+	for _, cursor := range cursors {
+		if cursor == (routesync.EventCursor{}) {
+			zeroes++
+		}
+	}
+	if zeroes < 2 {
+		t.Fatalf("replay cursor never wrapped: %+v", cursors)
 	}
 }
 

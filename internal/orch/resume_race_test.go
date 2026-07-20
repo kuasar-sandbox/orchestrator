@@ -137,3 +137,17 @@ func TestResumeRace_ConnectAndRouteSingleLaunch(t *testing.T) {
 		t.Fatalf("sandbox should be running after resume: %+v (err=%v)", got, err)
 	}
 }
+
+func TestCacheIfAbsentDoesNotPublishStaleStoreRead(t *testing.T) {
+	o := &Orchestrator{reg: make(map[string]*types.Sandbox)}
+	running := &types.Sandbox{ID: "sbx-race-1", State: types.StateRunning}
+	stale := &types.Sandbox{ID: running.ID, State: types.StatePaused}
+	o.cache(running)
+
+	if got := o.cacheIfAbsent(stale); got != running {
+		t.Fatalf("cacheIfAbsent returned stale store row: %+v", got)
+	}
+	if got := o.lookup(running.ID); got != running {
+		t.Fatalf("cache was overwritten by stale store row: %+v", got)
+	}
+}

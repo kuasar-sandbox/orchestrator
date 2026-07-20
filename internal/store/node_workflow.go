@@ -393,6 +393,7 @@ WHERE object_kind=? AND node_id=? AND node_epoch=? AND admission_state=? ORDER B
 		return nil, err
 	}
 	promoted := make([]*nodeexec.WorkflowRecord, 0, len(ids))
+	changed := false
 	for _, id := range ids {
 		record, err := getNodeWorkflowTx(ctx, tx, clusterstate.ExecutionKindBuild, id)
 		if err != nil {
@@ -401,15 +402,36 @@ WHERE object_kind=? AND node_id=? AND node_epoch=? AND admission_state=? ORDER B
 		if record == nil || record.AdmissionState != nodeexec.AdmissionQueued {
 			continue
 		}
-		if !usage.Fits(capacity, record.BuildDemand) {
-			break
-		}
 		build, err := s.getBuildTx(ctx, tx, record.ObjectID)
 		if err != nil {
 			return nil, err
 		}
 		if build == nil {
 			return nil, errors.New("store: queued Build object is missing")
+		}
+		if !capacity.CanEverFit(record.BuildDemand) {
+			update := nodeexec.EventUpdate{State: string(clusterstate.BuildError), Reason: "exceeds_build_capacity"}
+			event, err := executionEventFor(record, update)
+			if err != nil {
+				return nil, err
+			}
+			applyBuildState(build, update)
+			if err := s.putBuild(ctx, tx, build); err != nil {
+				return nil, err
+			}
+			record.AdmissionState = nodeexec.AdmissionTerminal
+			record.ResourceClaimed = false
+			record.ObjectState = event.State
+			record.EventSeq = event.EventSeq
+			record.LatestEvent = event
+			if err := updateNodeWorkflowTx(ctx, tx, record); err != nil {
+				return nil, err
+			}
+			changed = true
+			continue
+		}
+		if !usage.Fits(capacity, record.BuildDemand) {
+			break
 		}
 		event, err := executionEventFor(record, nodeexec.EventUpdate{State: string(clusterstate.BuildRegistered)})
 		if err != nil {
@@ -429,11 +451,12 @@ WHERE object_kind=? AND node_id=? AND node_epoch=? AND admission_state=? ORDER B
 		}
 		usage = usage.Add(record.BuildDemand)
 		promoted = append(promoted, record)
+		changed = true
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
-	if len(promoted) > 0 {
+	if changed {
 		s.notifyEvent()
 	}
 	return promoted, nil

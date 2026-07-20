@@ -213,6 +213,7 @@ func sandboxWithBinding(t *testing.T) (*types.Sandbox, proxy.RouteRequest) {
 	}
 	return &types.Sandbox{
 			ID: "s1", TemplateID: "e2b-snp-template", State: types.StatePaused,
+			AuthKey: strings.Repeat("a", 64), ManifestKey: strings.Repeat("b", 64),
 			Metadata: map[string]string{clusterstate.ObjectMetadataKey: opaque},
 		}, proxy.RouteRequest{
 			SandboxID: "s1", Port: 49983, ExpectedNodeID: "n1", ExpectedNodeEpoch: 7,

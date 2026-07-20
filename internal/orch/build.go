@@ -2,7 +2,6 @@ package orch
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -266,9 +265,9 @@ func (o *Orchestrator) effectiveImportReferer(b *types.Build) (configsock.BuildI
 	}, nil
 }
 
-// resolveBuildCreds picks the registry pull credentials for this build and returns
-// them as a regcreds.Creds JSON ("" = anonymous), to be stored encrypted on the build
-// row and injected as FLATTEN_REGISTRY_* at flatten time. Precedence: the per-build
+// resolveBuildCreds picks the registry pull credentials for this build and keeps
+// them in Docker auths form ("" = anonymous), encrypted on the Build row and
+// resolved for its image only when the launch spec is rendered. Precedence: the per-build
 // pull token (api_headers, opaque, manifest-key-sealed) > the SDK's fromImageRegistry
 // (cleartext username/password) > the default copied from the key lease > anonymous.
 func (o *Orchestrator) resolveBuildCreds(ctx context.Context, b *types.Build, pullToken, regUser, regPass string) (string, error) {
@@ -284,17 +283,25 @@ func (o *Orchestrator) resolveBuildCreds(ctx context.Context, b *types.Build, pu
 	case regUser != "":
 		creds = regcreds.Creds{Username: regUser, Password: regPass}
 	case isCluster:
-		// Cluster build: use the registry-delivered transient creds (cluster.md),
-		// not the node's stored registry_auth_enc.
-		creds = regcreds.CredsForImage(clusterAuth, b.FromImage)
+		if clusterAuth == "" {
+			return "", nil
+		}
+		if err := regcreds.ValidateDockerAuth(clusterAuth); err != nil {
+			return "", fmt.Errorf("build: cluster registry auth: %w", err)
+		}
+		return clusterAuth, nil
 	default:
-		creds = regcreds.CredsForImage(b.RegistryAuth, b.FromImage)
+		if b.RegistryAuth != "" {
+			if err := regcreds.ValidateDockerAuth(b.RegistryAuth); err != nil {
+				return "", fmt.Errorf("build: stored registry auth: %w", err)
+			}
+		}
+		return b.RegistryAuth, nil
 	}
 	if creds.Empty() {
 		return "", nil
 	}
-	js, err := json.Marshal(creds)
-	return string(js), err
+	return regcreds.AssembleDockerAuth(creds)
 }
 
 // BuildStatus handles GET /templates/{tid}/builds/{bid}/status.
@@ -608,13 +615,8 @@ func (o *Orchestrator) BuildSpecFor(ctx context.Context, configID string) (*conf
 	}
 
 	env := map[string]string{"MANIFEST_KEY": b.ManifestKey}
-	if b.RegistryAuth != "" {
-		var c regcreds.Creds
-		if json.Unmarshal([]byte(b.RegistryAuth), &c) == nil {
-			for k, v := range c.FlattenEnv() {
-				env[k] = v
-			}
-		}
+	for k, v := range regcreds.CredsForImage(b.RegistryAuth, b.FromImage).FlattenEnv() {
+		env[k] = v
 	}
 
 	// Presign each COPY context for the build's whole lifetime (it is signed
