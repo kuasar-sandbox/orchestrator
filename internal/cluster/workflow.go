@@ -218,7 +218,7 @@ type ReadyRoute struct {
 
 func (r ReadyRoute) Validate() error {
 	if r.SandboxID == "" || r.NodeID == "" || r.NodeEpoch == 0 || r.DataEndpoint == "" ||
-		r.TemplateRef == "" || r.RegistryGeneration == "" || r.LastEventSeq == 0 {
+		r.AccessToken == "" || r.TemplateRef == "" || r.RegistryGeneration == "" || r.LastEventSeq == 0 {
 		return errors.New("cluster: incomplete READY forwarding projection")
 	}
 	if !validDigest(r.BindingDigest) {

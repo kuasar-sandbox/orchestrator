@@ -85,3 +85,30 @@ func TestBuildDispatchSpecRequiresSeparateKeysAndResourceCeiling(t *testing.T) {
 		t.Fatal("non-canonical key fingerprint accepted")
 	}
 }
+
+func TestBuildDispatchSpecBindsReplayedResourceCeilings(t *testing.T) {
+	base := BuildDispatchSpecV1{
+		Version: DispatchSpecVersionV1, TemplateID: "transient-template",
+		AuthKeyFingerprint: strings.Repeat("a", 24), ManifestKeyFingerprint: strings.Repeat("b", 24),
+		Profile: types.ProfileE2B, CPUCount: 2, MemoryMB: 1024,
+	}
+	for name, body := range map[string]string{
+		"larger CPU":          `{"cpuCount":8,"memoryMB":1024}`,
+		"missing memory":      `{"cpuCount":2}`,
+		"conflicting aliases": `{"cpuCount":2,"cpu_count":4,"memoryMB":1024}`,
+		"case alias":          `{"CPUCount":2,"memoryMB":1024}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			spec := base
+			spec.Request = testNodeRequest(t, "/v3/templates", body)
+			if _, err := MarshalBuildDispatchSpec(spec); err == nil {
+				t.Fatal("unbound replay resource request was accepted")
+			}
+		})
+	}
+	valid := base
+	valid.Request = testNodeRequest(t, "/v3/templates", `{"cpu_count":2,"memory_mb":1024,"future":true}`)
+	if _, err := MarshalBuildDispatchSpec(valid); err != nil {
+		t.Fatalf("canonical snake-case ceilings: %v", err)
+	}
+}

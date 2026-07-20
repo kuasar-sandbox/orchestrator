@@ -12,6 +12,8 @@ import (
 	"reflect"
 	"strings"
 	"unicode/utf8"
+
+	"golang.org/x/net/http/httpguts"
 )
 
 const (
@@ -245,6 +247,9 @@ func canonicalNodeRequestHeaders(source http.Header) (map[string][]string, error
 	result := map[string][]string{}
 	total := 0
 	for name, values := range source {
+		if !httpguts.ValidHeaderFieldName(name) {
+			return nil, fmt.Errorf("cluster: invalid request header name %q", name)
+		}
 		canonicalName := textproto.CanonicalMIMEHeaderKey(name)
 		if canonicalName == "" {
 			return nil, fmt.Errorf("cluster: invalid request header name %q", name)

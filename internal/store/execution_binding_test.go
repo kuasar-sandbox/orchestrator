@@ -51,6 +51,19 @@ func TestCASExecutionBinding(t *testing.T) {
 	if _, err := st.CASExecutionBinding(ctx, clusterstate.ExecutionKindSandbox, "s1", newDigest, wrongEpoch); err == nil {
 		t.Fatal("CAS changed NodeEpoch")
 	}
+	changedIntent := testOpaqueBinding(t, "generation-3", "s1", "n1", 7)
+	decoded, err := clusterstate.DecodeExecutionBinding(changedIntent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded.DemandDigest = sha256.Sum256([]byte("different demand"))
+	changedIntent, err = clusterstate.EncodeExecutionBinding(decoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.CASExecutionBinding(ctx, clusterstate.ExecutionKindSandbox, "s1", newDigest, changedIntent); err == nil {
+		t.Fatal("CAS changed immutable workflow intent")
+	}
 }
 
 func TestCASExecutionBindingAtomicallyRebindsWorkflowOutbox(t *testing.T) {

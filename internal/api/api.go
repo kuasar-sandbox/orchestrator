@@ -104,6 +104,10 @@ var ErrFilesUnsupported = errors.New("COPY build contexts unsupported (builder.f
 // an unuploaded context) to 400.
 var ErrBadRequest = errors.New("bad request")
 
+// ErrConflict reports that a concurrent lifecycle mutation invalidated an
+// operation's execution fence.
+var ErrConflict = errors.New("conflict")
+
 // PullTokenHeader is the api_headers header carrying the opaque registry pull token.
 const PullTokenHeader = "X-Kuasar-Pull-Token"
 
@@ -735,6 +739,8 @@ func (a *API) fail(w http.ResponseWriter, err error) {
 		writeErr(w, 403, "manifest key not allowed")
 	case errors.Is(err, ErrBadRequest):
 		writeErr(w, 400, err.Error())
+	case errors.Is(err, ErrConflict):
+		writeErr(w, 409, err.Error())
 	default:
 		a.log.Warn("api error", "err", err)
 		writeErr(w, 500, "internal error")

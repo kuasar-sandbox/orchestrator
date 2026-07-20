@@ -148,18 +148,45 @@ func TestRebindClusterExecutionUsesDigestCAS(t *testing.T) {
 }
 
 func TestMalformedVersionedBindingFailsClosed(t *testing.T) {
-	sb := &types.Sandbox{
-		ID: "s1",
-		Metadata: map[string]string{
-			clusterstate.ObjectMetadataKey: clusterstate.ExecutionBindingPrefix + "malformed",
-		},
+	for _, opaque := range []string{
+		clusterstate.ExecutionBindingPrefix + "malformed",
+		"keb2.future-format",
+	} {
+		sb := &types.Sandbox{
+			ID:       "s1",
+			Metadata: map[string]string{clusterstate.ObjectMetadataKey: opaque},
+		}
+		if kind, failed := validateSandboxRouteFence(sb, proxy.RouteRequest{SandboxID: sb.ID}); !failed || kind != proxy.KindWrongBinding {
+			t.Fatalf("malformed binding %q failure = (%v,%v)", opaque, kind, failed)
+		}
+		route := (&Orchestrator{}).routeEntry(sb)
+		if route.BindingDigest != "invalid" {
+			t.Fatalf("malformed route projection = %+v", route)
+		}
 	}
-	if kind, failed := validateSandboxRouteFence(sb, proxy.RouteRequest{SandboxID: sb.ID}); !failed || kind != proxy.KindWrongBinding {
-		t.Fatalf("malformed binding failure = (%v,%v)", kind, failed)
+}
+
+func TestResumeIfPausedSurfacesConcurrentRebind(t *testing.T) {
+	o := testOrch(t)
+	ctx := context.Background()
+	old, staleRequest := sandboxWithBinding(t)
+	current := *old
+	currentBinding := clusterstate.ExecutionBinding{
+		RegistryGeneration: "generation-2", Kind: clusterstate.ExecutionKindSandbox,
+		ObjectID: current.ID, Group: "/g", RouteKey: "rk", NodeID: "n1", NodeEpoch: 7,
+		DemandDigest: sha256.Sum256([]byte("demand")), DispatchSpecDigest: sha256.Sum256([]byte("dispatch")),
 	}
-	route := (&Orchestrator{}).routeEntry(sb)
-	if route.BindingDigest != "invalid" {
-		t.Fatalf("malformed route projection = %+v", route)
+	opaque, err := clusterstate.EncodeExecutionBinding(currentBinding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	current.Metadata = map[string]string{clusterstate.ObjectMetadataKey: opaque}
+	if err := o.st.Put(ctx, &current); err != nil {
+		t.Fatal(err)
+	}
+	o.cache(&current)
+	if err := o.resumeIfPaused(ctx, current.ID, staleRequest); !errors.Is(err, errSandboxRouteFenceChanged) {
+		t.Fatalf("stale resume error = %v", err)
 	}
 }
 
