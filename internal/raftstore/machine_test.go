@@ -6,6 +6,7 @@ import (
 	"reflect"
 	"testing"
 
+	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/routeapi"
 	sm "github.com/lni/dragonboat/v4/statemachine"
 )
@@ -56,6 +57,35 @@ func TestDataStateMachineAppliesConflictAndRestoresDeterministicSnapshot(t *test
 	result := lookup.(DataLookupResult)
 	if result.Route == nil || result.Route.Outcome != routeapi.ReadNeedLeader {
 		t.Fatalf("restored STARTING lookup = %+v", result)
+	}
+	if restored.state.RouteChangefeedFloor != machine.state.RouteChangefeedFloor ||
+		!reflect.DeepEqual(restored.state.RouteChanges, machine.state.RouteChanges) {
+		t.Fatalf("restored Route changefeed = floor %d, changes %+v; want floor %d, changes %+v",
+			restored.state.RouteChangefeedFloor, restored.state.RouteChanges,
+			machine.state.RouteChangefeedFloor, machine.state.RouteChanges)
+	}
+
+	advanceDataApplied(&machine.state, RouteChangefeedRetentionRevisions+10)
+	var compactedSnapshot bytes.Buffer
+	if err := machine.SaveSnapshot(&compactedSnapshot, nil, done); err != nil {
+		t.Fatal(err)
+	}
+	compacted := &DataStateMachine{raftShardID: machine.raftShardID, replicaID: replicas[2]}
+	if err := compacted.RecoverFromSnapshot(bytes.NewReader(compactedSnapshot.Bytes()), nil, done); err != nil {
+		t.Fatal(err)
+	}
+	bucket, _, err := clusterstate.RouteShardFor(
+		"/g", "rk", registryLayout.RouteBucketCount, registryLayout.VirtualShardCount,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reset := lookupRouteChangefeed(compacted.state, RouteChangefeedLookup{
+		Identity: identity, Group: "/g", Bucket: bucket,
+		AfterRevision: 1, Limit: 1,
+	})
+	if !reset.Available || !reset.Reset || reset.FloorRevision != 10 {
+		t.Fatalf("restored compacted Route changefeed = %+v", reset)
 	}
 
 	corrupt := append([]byte(nil), first.Bytes()...)
