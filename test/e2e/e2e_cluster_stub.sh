@@ -1,638 +1,971 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 077
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-CLUSTER_CTL_EXPLICIT="${CLUSTER_CTL+x}"
-NODE_STUB_CTL_EXPLICIT="${NODE_STUB_CTL+x}"
-E2B_KEY_CTL_EXPLICIT="${E2B_KEY_CTL+x}"
-BIN_EXPLICIT="${BIN+x}"
-NODES_EXPLICIT="${NODES+x}"
-SCALERS_EXPLICIT="${SCALERS+x}"
 BIN="${BIN:-$ROOT/bin/$(uname -m)}"
 CLUSTER_CTL="${CLUSTER_CTL:-$BIN/cluster-ctl}"
 NODE_STUB_CTL="${NODE_STUB_CTL:-$BIN/node-stub-ctl}"
 E2B_KEY_CTL="${E2B_KEY_CTL:-$BIN/e2b-key-ctl}"
 DOMAIN="${DOMAIN:-cluster.stub.local}"
 GROUP="${GROUP:-/e2e/stub/group}"
-NODES="${NODES:-4}"
-SCALERS="${SCALERS:-1}"
+NODES="${NODES:-6}"
+VIRTUAL_SHARDS="${VIRTUAL_SHARDS:-8}"
+STARTED_AT="$(date +%s)"
 
-step() {
-    echo "==> $*" >&2
-}
+step() { echo "==> $*" >&2; }
 
-skip() {
-    echo "==> SKIP: $*" >&2
-    if [ "${REQUIRE_CLUSTER_STUB:-0}" = "1" ]; then
+for command in curl openssl python3 stat; do
+    command -v "$command" >/dev/null 2>&1 || {
+        echo "missing required command: $command" >&2
         exit 1
-    fi
-    exit 0
-}
-
-fail() {
-    echo "==> FAIL: $*" >&2
-    if [ -n "${WORK:-}" ] && [ -d "$WORK" ]; then
-        if [ -n "${ADMIN:-}" ]; then
-            curl -sS --noproxy '*' --max-time 2 "$ADMIN/v1/commands" >"$WORK/admin-commands.json" 2>/dev/null || true
-            curl -sS --noproxy '*' --max-time 2 "$ADMIN/v1/events" >"$WORK/admin-events.json" 2>/dev/null || true
-            curl -sS --noproxy '*' --max-time 2 "$ADMIN/v1/nodes" >"$WORK/admin-nodes.json" 2>/dev/null || true
-            curl -sS --noproxy '*' --max-time 2 "$ADMIN/v1/data-hits" >"$WORK/admin-data-hits.json" 2>/dev/null || true
-        fi
-        for f in "$WORK"/*.body "$WORK"/*.json; do
-            [ -f "$f" ] || continue
-            echo "---- $f ----" >&2
-            sed -n '1,220p' "$f" >&2 || true
-        done
-        for f in "$WORK"/*.log; do
-            [ -f "$f" ] || continue
-            echo "---- $f ----" >&2
-            sed -n '1,220p' "$f" >&2 || true
-        done
-    fi
+    }
+done
+for binary in "$CLUSTER_CTL" "$NODE_STUB_CTL" "$E2B_KEY_CTL"; do
+    [ -x "$binary" ] || {
+        echo "missing e2e binary: $binary (run make build)" >&2
+        exit 1
+    }
+done
+if [ "$(stat -f -c %T /dev/shm)" != "tmpfs" ]; then
+    echo "/dev/shm must be tmpfs for the explicit ephemeral Registry storage mode" >&2
     exit 1
-}
-
-build_cluster_stub_binaries() {
-    if [ "${CLUSTER_STUB_BUILD:-1}" = "0" ] || [ -n "${CLUSTER_STUB_BUILT:-}" ] ||
-        [ -n "$BIN_EXPLICIT" ] || [ -n "$CLUSTER_CTL_EXPLICIT" ] || [ -n "$NODE_STUB_CTL_EXPLICIT" ] || [ -n "$E2B_KEY_CTL_EXPLICIT" ]; then
-        return
-    fi
-    command -v make >/dev/null 2>&1 || skip "make not on PATH"
-    step "building cluster e2e binaries with make build"
-    make -C "$ROOT" build
-    export CLUSTER_STUB_BUILT=1
-}
-
-if [ -z "${CLUSTER_STUB_CASE:-}" ]; then
-    build_cluster_stub_binaries
-    for spec in registry-n1:1:1 registry-n3:3:1 registry-redirect:3:1 registry-placer-ha:3:2 registry-joint:4:1; do
-        CLUSTER_STUB_CASE="${spec%%:*}"
-        rest="${spec#*:}"
-        REGISTRIES="${rest%%:*}"
-        SCALERS="${rest##*:}"
-        step "running case $CLUSTER_STUB_CASE (registries=$REGISTRIES placers=$SCALERS)"
-        CLUSTER_STUB_BUILT="${CLUSTER_STUB_BUILT:-1}" CLUSTER_STUB_CASE="$CLUSTER_STUB_CASE" REGISTRIES="$REGISTRIES" SCALERS="$SCALERS" "$0"
-    done
-    exit 0
 fi
 
-command -v python3 >/dev/null 2>&1 || skip "python3 not on PATH"
-command -v curl >/dev/null 2>&1 || skip "curl not on PATH"
-build_cluster_stub_binaries
-[ -x "$CLUSTER_CTL" ] || skip "missing cluster-ctl at $CLUSTER_CTL (run make build)"
-[ -x "$NODE_STUB_CTL" ] || skip "missing node-stub-ctl at $NODE_STUB_CTL (run make build)"
-[ -x "$E2B_KEY_CTL" ] || skip "missing e2b-key-ctl at $E2B_KEY_CTL (run make build)"
-REGISTRIES="${REGISTRIES:-1}"
-SCALERS="${SCALERS:-1}"
-if [ "$CLUSTER_STUB_CASE" = "registry-redirect" ] && [ -z "$NODES_EXPLICIT" ]; then
-    NODES=10
-fi
-if [ "$CLUSTER_STUB_CASE" = "registry-placer-ha" ] && [ -z "$SCALERS_EXPLICIT" ]; then
-    SCALERS=2
-fi
-step "cluster stub e2e: case=$CLUSTER_STUB_CASE registries=$REGISTRIES placers=$SCALERS using BIN=$BIN"
-
-free_port() {
-    python3 <<'PY'
-import socket, sys
-try:
-    s = socket.socket()
-    s.bind(("127.0.0.1", 0))
-    print(s.getsockname()[1])
-    s.close()
-except PermissionError:
-    sys.exit(2)
-PY
-}
-
-ALLOCATED_PORTS=()
-
-alloc_port() {
-    local var="$1"
-    local name="$2"
-    local port
-    for _ in $(seq 1 100); do
-        if ! port="$(free_port)"; then
-            skip "cannot allocate local TCP port for $name (socket permission denied in this environment)"
-        fi
-        local used=0
-        for existing in "${ALLOCATED_PORTS[@]:-}"; do
-            if [ "$existing" = "$port" ]; then
-                used=1
-                break
-            fi
-        done
-        if [ "$used" = "0" ]; then
-            ALLOCATED_PORTS+=("$port")
-            printf -v "$var" '%s' "$port"
-            return
-        fi
-    done
-    fail "could not allocate a unique local TCP port for $name"
-}
-
-wait_tcp() {
-    local port="$1" name="$2"
-    for _ in $(seq 1 100); do
-        if python3 - "$port" <<'PY' >/dev/null 2>&1
-import socket,sys
-s=socket.socket()
-s.settimeout(0.2)
-s.connect(("127.0.0.1", int(sys.argv[1])))
-s.close()
-PY
-        then
-            return 0
-        fi
-        sleep 0.05
-    done
-    fail "$name did not open port $port"
-}
-
-wait_http() {
-    local url="$1" name="$2"
-    for _ in $(seq 1 100); do
-        if curl -fsS --noproxy '*' --max-time 1 -o /dev/null "$url" 2>/dev/null; then
-            return 0
-        fi
-        sleep 0.05
-    done
-    fail "$name did not become healthy at $url"
-}
-
-http_code() {
-    local out="$1"; shift
-    curl -sS --noproxy '*' --max-time 20 -o "$out" -w '%{http_code}' "$@"
-}
-
-retry_code() {
-    local want="$1" out="$2"; shift 2
-    local code="000"
-    for _ in $(seq 1 "${CLUSTER_STUB_RETRY_LIMIT:-120}"); do
-        code="$(http_code "$out" "$@" 2>/dev/null || echo 000)"
-        if [ "$code" = "$want" ]; then
-            echo "$code"
-            return 0
-        fi
-        sleep 0.1
-    done
-    echo "$code"
-    return 1
-}
-
-WORK="$(mktemp -d)"
-step "work dir: $WORK"
+WORK="$(mktemp -d /dev/shm/kuasar-e2e.XXXXXX)"
+ADMIN=""
 PIDS=()
+REGISTRY_PIDS=()
+
 cleanup() {
-    for ((i=${#PIDS[@]}-1; i>=0; i--)); do
-        pid="${PIDS[$i]}"
-        kill "$pid" 2>/dev/null || true
-        wait "$pid" 2>/dev/null || true
+    for ((index=${#PIDS[@]}-1; index>=0; index--)); do
+        kill "${PIDS[$index]}" 2>/dev/null || true
     done
-    if [ "${CLUSTER_STUB_KEEP_WORK:-0}" = "1" ]; then
-        step "keeping work dir: $WORK"
+    for ((index=${#PIDS[@]}-1; index>=0; index--)); do
+        wait "${PIDS[$index]}" 2>/dev/null || true
+    done
+    if [ "${E2E_KEEP_WORK:-0}" = "1" ]; then
+        step "keeping work directory $WORK"
     else
         rm -rf "$WORK"
     fi
 }
 trap cleanup EXIT
 
-CONTROL_PORTS=()
-for i in $(seq 1 "$REGISTRIES"); do
-    alloc_port REGISTRY_PORT "registry-$i"
-    CONTROL_PORTS+=("$REGISTRY_PORT")
+fail() {
+    echo "==> FAIL: $*" >&2
+    if [ -n "$ADMIN" ]; then
+        curl -fsS --noproxy '*' --max-time 2 "$ADMIN/v1/nodes" >"$WORK/failure-nodes.json" 2>/dev/null || true
+        curl -fsS --noproxy '*' --max-time 2 "$ADMIN/v1/commands" >"$WORK/failure-commands.json" 2>/dev/null || true
+        curl -fsS --noproxy '*' --max-time 2 "$ADMIN/v1/events" >"$WORK/failure-events.json" 2>/dev/null || true
+    fi
+    for file in "$WORK"/*.json "$WORK"/*.body "$WORK"/*.log; do
+        [ -f "$file" ] || continue
+        echo "---- $file ----" >&2
+        tail -n 240 "$file" >&2 || true
+    done
+    exit 1
+}
+
+USED_PORTS=()
+alloc_port() {
+    local target="$1" candidate used
+    for _ in $(seq 1 100); do
+        candidate="$(python3 - <<'PY'
+import socket
+s = socket.socket()
+s.bind(("127.0.0.1", 0))
+print(s.getsockname()[1])
+s.close()
+PY
+)"
+        used=0
+        for existing in "${USED_PORTS[@]:-}"; do
+            [ "$existing" = "$candidate" ] && used=1
+        done
+        if [ "$used" = 0 ]; then
+            USED_PORTS+=("$candidate")
+            printf -v "$target" '%s' "$candidate"
+            return
+        fi
+    done
+    fail "could not allocate a unique local port"
+}
+
+TLS_DIR="$WORK/tls"
+mkdir -p "$TLS_DIR"
+openssl ecparam -name prime256v1 -genkey -noout -out "$TLS_DIR/ca.key" 2>/dev/null
+openssl req -x509 -new -key "$TLS_DIR/ca.key" -sha256 -days 2 \
+    -subj '/CN=kuasar-e2e-ca' -out "$TLS_DIR/ca.crt" 2>/dev/null
+
+make_role_certificate() {
+    local role="$1"
+    openssl ecparam -name prime256v1 -genkey -noout -out "$TLS_DIR/$role.key" 2>/dev/null
+    openssl req -new -key "$TLS_DIR/$role.key" -subj "/CN=kuasar-e2e-$role" \
+        -out "$TLS_DIR/$role.csr" 2>/dev/null
+    cat >"$TLS_DIR/$role.ext" <<EOF
+basicConstraints=critical,CA:FALSE
+keyUsage=critical,digitalSignature
+extendedKeyUsage=serverAuth,clientAuth
+subjectAltName=IP:127.0.0.1,URI:spiffe://kuasar.internal/$role/e2e-$role
+EOF
+    openssl x509 -req -in "$TLS_DIR/$role.csr" -CA "$TLS_DIR/ca.crt" -CAkey "$TLS_DIR/ca.key" \
+        -CAcreateserial -days 2 -sha256 -extfile "$TLS_DIR/$role.ext" -out "$TLS_DIR/$role.crt" 2>/dev/null
+}
+
+for role in registry placer router node operator; do
+    make_role_certificate "$role"
 done
-CONTROL_PORT="${CONTROL_PORTS[0]}"
-SCALER_PORTS=()
-for i in $(seq 1 "$SCALERS"); do
-    alloc_port SCALER_PORT "placer-$i"
-    SCALER_PORTS+=("$SCALER_PORT")
+
+REGISTRY_PORTS=()
+RAFT_PORTS=()
+for _ in 1 2 3; do
+    alloc_port port
+    REGISTRY_PORTS+=("$port")
+    alloc_port port
+    RAFT_PORTS+=("$port")
 done
-alloc_port ROUTER_PORT router
-alloc_port ADMIN_PORT node-stub-admin
-alloc_port DATA_PORT node-stub-data
+alloc_port PLACER_PORT
+alloc_port ROUTER_PORT
+alloc_port ADMIN_PORT
+alloc_port DATA_PORT
+
+BOOTSTRAP_SECRET="$WORK/bootstrap.secret"
+printf '%s\n' 'kuasar-e2e-generation-1' >"$BOOTSTRAP_SECRET"
+openssl genpkey -algorithm ED25519 -out "$WORK/registry-layout-signing.pem" 2>/dev/null
+chmod 0600 "$WORK/registry-layout-signing.pem"
+
+python3 - "$WORK/members.json" \
+    "${REGISTRY_PORTS[0]}" "${RAFT_PORTS[0]}" \
+    "${REGISTRY_PORTS[1]}" "${RAFT_PORTS[1]}" \
+    "${REGISTRY_PORTS[2]}" "${RAFT_PORTS[2]}" <<'PY'
+import json, sys
+out = []
+for index in range(3):
+    control, raft = sys.argv[2 + index * 2:4 + index * 2]
+    out.append({
+        "member_id": f"registry-{index + 1}",
+        "internal_endpoint": f"https://127.0.0.1:{control}",
+        "raft_endpoint": f"127.0.0.1:{raft}",
+    })
+with open(sys.argv[1], "w") as f:
+    json.dump(out, f)
+PY
+
+"$CLUSTER_CTL" registry-layout bootstrap \
+    --members "$WORK/members.json" \
+    --cluster-id kuasar-e2e \
+    --registry-generation generation-e2e-1 \
+    --bootstrap-secret-file "$BOOTSTRAP_SECRET" \
+    --signing-key "$WORK/registry-layout-signing.pem" \
+    --key-id e2e-root \
+    --chain-out "$WORK/registry-layout-chain.json" \
+    --keyring-out "$WORK/registry-layout-keyring.json" \
+    --virtual-shards "$VIRTUAL_SHARDS" \
+    --serve-permit-max 3s
 
 AUTH_KEY="$("$E2B_KEY_CTL" gen-key)"
 MANIFEST_KEY="$("$E2B_KEY_CTL" gen-key)"
 API_KEY="$("$E2B_KEY_CTL" gen-apikey "$AUTH_KEY")"
-
-OWNER_COUNT="$REGISTRIES"
-ROUTE_OWNER_COUNT="$OWNER_COUNT"
-NODE_OWNER_COUNT="$OWNER_COUNT"
-SCALE_OWNER_COUNT="$OWNER_COUNT"
-NODE_LIST_OWNER_COUNT="$OWNER_COUNT"
-ACTIVE_IDS=()
-NEXT_IDS=()
-if [ "$CLUSTER_STUB_CASE" = "registry-joint" ]; then
-    OWNER_COUNT=3
-    ROUTE_OWNER_COUNT=3
-    NODE_OWNER_COUNT=3
-    SCALE_OWNER_COUNT=3
-    NODE_LIST_OWNER_COUNT=3
-    ACTIVE_IDS=(1 2 3)
-    NEXT_IDS=(2 3 4)
-else
-    for i in $(seq 1 "$REGISTRIES"); do
-        ACTIVE_IDS+=("$i")
-    done
-fi
-if [ "$CLUSTER_STUB_CASE" = "registry-redirect" ]; then
-    NODE_OWNER_COUNT=1
-fi
-
-ACTIVE_MEMBERS_YAML=""
-for i in "${ACTIVE_IDS[@]}"; do
-    port="${CONTROL_PORTS[$((i-1))]}"
-    ACTIVE_MEMBERS_YAML="$ACTIVE_MEMBERS_YAML        - { id: registry-$i, advertise: \"http://127.0.0.1:$port\", node_advertise: \"127.0.0.1:$port\" }
-"
-done
-NEXT_LINE=""
-NEXT_MEMBERS_BLOCK=""
-if [ "${#NEXT_IDS[@]}" -gt 0 ]; then
-    NEXT_LINE="  next: 2
-"
-    NEXT_MEMBERS_YAML=""
-    for i in "${NEXT_IDS[@]}"; do
-        port="${CONTROL_PORTS[$((i-1))]}"
-        NEXT_MEMBERS_YAML="$NEXT_MEMBERS_YAML        - { id: registry-$i, advertise: \"http://127.0.0.1:$port\", node_advertise: \"127.0.0.1:$port\" }
-"
-    done
-    NEXT_MEMBERS_BLOCK="    - version: 2
-      members:
-$NEXT_MEMBERS_YAML"
-fi
-
-for i in $(seq 1 "$REGISTRIES"); do
-    port="${CONTROL_PORTS[$((i-1))]}"
-    cat >"$WORK/registry-$i.yaml" <<EOF
-member:
-  id: registry-$i
-  listen: "127.0.0.1:$port"
-membership:
-  active: 1
-${NEXT_LINE}  versions:
-    - version: 1
-      members:
-$ACTIVE_MEMBERS_YAML$NEXT_MEMBERS_BLOCK
-  owners:
-    route_link: $ROUTE_OWNER_COUNT
-    node_link: $NODE_OWNER_COUNT
-    placer_link: $SCALE_OWNER_COUNT
-    node_list: $NODE_LIST_OWNER_COUNT
-node_link:
-  heartbeat_interval: "500ms"
-  node_dead_after: "3s"
-route_link:
-  park_timeout: "5s"
+mkdir -p "$WORK/groups"
+cat >"$WORK/groups/group.json" <<EOF
+{
+  "group": "$GROUP",
+  "manifest_key": "$MANIFEST_KEY",
+  "auth_key": "$AUTH_KEY",
+  "template_ref": "e2b-img-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "target_port": 49983,
+  "node_selectors": [{"pool": "stub"}],
+  "sandbox_config": {"stub.create_delay_ms": "15", "stub.http_status": "204"}
+}
 EOF
-done
+
+cat >"$WORK/placer.yaml" <<EOF
+placer:
+  id: placer-1
+  listen: "127.0.0.1:$PLACER_PORT"
+  tls: { cert: "$TLS_DIR/placer.crt", key: "$TLS_DIR/placer.key", ca: "$TLS_DIR/ca.crt" }
+group_sources:
+  - { source_id: e2e-file, source_type: file, path: "$WORK/groups" }
+placement:
+  candidates: 4
+EOF
 
 cat >"$WORK/router.yaml" <<EOF
 domain: "$DOMAIN"
-registry:
-  bootstrap: "127.0.0.1:$CONTROL_PORT"
+registry_layout:
+  chain: "$WORK/registry-layout-chain.json"
+  keys: "$WORK/registry-layout-keyring.json"
+  guard: "$WORK/router-registry-layout.guard"
+registry_tls: { cert: "$TLS_DIR/router.crt", key: "$TLS_DIR/router.key", ca: "$TLS_DIR/ca.crt" }
+node_tls: { cert: "$TLS_DIR/router.crt", key: "$TLS_DIR/router.key", ca: "$TLS_DIR/ca.crt" }
+providers:
+  endpoints:
+    - { name: placer-1, endpoint: "https://127.0.0.1:$PLACER_PORT" }
+  tls: { cert: "$TLS_DIR/router.crt", key: "$TLS_DIR/router.key", ca: "$TLS_DIR/ca.crt" }
 ingress:
   listen: "127.0.0.1:$ROUTER_PORT"
 auth:
-  api_key: "enforce"
-  data_plane: "off"
-  cache_ttl: "500ms"
+  api_key: enforce
+  data_plane: off
+  cache_ttl: 1s
+cache:
+  route_ttl: 30s
+  idle_timeout: 30s
 EOF
 
-for i in $(seq 1 "$SCALERS"); do
-    port="${SCALER_PORTS[$((i-1))]}"
-    cat >"$WORK/placer-$i.yaml" <<EOF
-placer:
-  id: placer-$i
-  listen: "127.0.0.1:$port"
-  advertise: "http://127.0.0.1:$port"
-  memberlist_label: "placer.default"
-registry:
-  bootstrap: "127.0.0.1:$CONTROL_PORT"
-import_groups:
-  - source_id: stub-file-source
-    source_type: file
-    path: "$WORK/groups"
-placement:
-  candidates: 2
-  zone_admit_max: "yellow"
-  selector_patch_refresh_interval: "2s"
+for index in 0 1 2; do
+    member=$((index + 1))
+    root="$WORK/registry-$member"
+    mkdir -p "$root"
+    cat >"$WORK/registry-$member.yaml" <<EOF
+member:
+  id: registry-$member
+  listen: "127.0.0.1:${REGISTRY_PORTS[$index]}"
+  tls: { cert: "$TLS_DIR/registry.crt", key: "$TLS_DIR/registry.key", ca: "$TLS_DIR/ca.crt" }
+registry_layout:
+  chain: "$WORK/registry-layout-chain.json"
+  keys: "$WORK/registry-layout-keyring.json"
+  guard: "$root/registry-layout.guard"
+storage:
+  nodehost_dir: "$root/nodehost"
+  wal_dir: "$root/wal"
+  state_engine_dir: "$root/state"
+  enrollment_path: "$root/enrollment.json"
+  raft_listen: "127.0.0.1:${RAFT_PORTS[$index]}"
+  open_mode: bootstrap
+  bootstrap_secret_file: "$BOOTSTRAP_SECRET"
+  storage_protection: ephemeral-tmpfs
+  initialize_workers: 4
+  transition_workers: 4
+  snapshot_workers: 2
+  operation_timeout: 5s
+  fence_retention: 100ms
+  tls: { cert: "$TLS_DIR/registry.crt", key: "$TLS_DIR/registry.key", ca: "$TLS_DIR/ca.crt" }
+placers:
+  endpoints:
+    - { name: placer-1, endpoint: "https://127.0.0.1:$PLACER_PORT" }
+  tls: { cert: "$TLS_DIR/registry.crt", key: "$TLS_DIR/registry.key", ca: "$TLS_DIR/ca.crt" }
+session:
+  max_nodes: 100
+  anti_entropy: 200ms
+  event_workers: 16
+  reconnect_per_second: 100
+workflow:
+  park_timeout: 10s
+  poll_interval: 10ms
+  permit_refresh: 200ms
+  recovery_scan_interval: 100ms
+  recovery_shards_per_scan: 8
+  recovery_workers: 2
+  recovery_per_node_workers: 1
+  compaction_workers: 2
+  pending_workflows_per_page: 64
+  recovery_page_objects: 32
+  recovery_page_bytes: 262144
+  recovery_max_report_bytes: 8388608
+  recovery_lookup_page: 64
 EOF
 done
 
-mkdir -p "$WORK/groups"
-cat >"$WORK/groups/group.json" <<EOF
-{"group":"$GROUP","manifest_key":"$MANIFEST_KEY","auth_key":"$AUTH_KEY","template_ref":"tmpl-stub","node_selectors":[{"pool":"stub"}],"sandbox_config":{"stub.create_delay_ms":"15","stub.http_status":"204"}}
-EOF
+operator_curl() {
+    curl -sS --noproxy '*' --cacert "$TLS_DIR/ca.crt" \
+        --cert "$TLS_DIR/operator.crt" --key "$TLS_DIR/operator.key" "$@"
+}
 
-for i in $(seq 1 "$REGISTRIES"); do
-    port="${CONTROL_PORTS[$((i-1))]}"
-    "$CLUSTER_CTL" registry --config "$WORK/registry-$i.yaml" > >(tee "$WORK/registry-$i.log" >&2) 2>&1 &
-    PIDS+=("$!")
-    step "starting registry-$i"
-    wait_tcp "$port" "registry-$i control"
-done
+wait_https() {
+    local url="$1" name="$2"
+    for _ in $(seq 1 900); do
+        if operator_curl --max-time 1 -o /dev/null -f "$url" 2>/dev/null; then
+            return
+        fi
+        sleep 0.1
+    done
+    fail "$name did not become healthy at $url"
+}
 
-step "checking registry membership endpoints"
-for port in "${CONTROL_PORTS[@]}"; do
-    python3 - "http://127.0.0.1:$port" "$REGISTRIES" <<'PY' || fail "membership endpoint failed on $port"
-import json, sys, urllib.request
-base = sys.argv[1]
-want = int(sys.argv[2])
-m = json.load(urllib.request.urlopen(base + "/cluster/membership", timeout=2))
-active = m.get("active", m.get("Active"))
-versions = m.get("versions", m.get("Versions", []))
-assert active, m
-active_versions = [v for v in versions if v.get("version", v.get("Version")) == active]
-assert len(active_versions) == 1, m
-assert active_versions[0].get("label", active_versions[0].get("Label")), m
-next_version = m.get("next", m.get("Next"))
-ids = set()
-for v in versions:
-    version = v.get("version", v.get("Version"))
-    if version not in (active, next_version):
-        continue
-    assert v.get("label", v.get("Label")), m
-    for member in v.get("members", v.get("Members", [])):
-        ids.add(member.get("id", member.get("ID")))
-assert len(ids) == want, m
-PY
-done
+wait_http() {
+    local url="$1" name="$2"
+    for _ in $(seq 1 300); do
+        if curl -fsS --noproxy '*' --max-time 1 -o /dev/null "$url" 2>/dev/null; then
+            return
+        fi
+        sleep 0.1
+    done
+    fail "$name did not become healthy at $url"
+}
 
-SCALER_PIDS=()
-for i in $(seq 1 "$SCALERS"); do
-    port="${SCALER_PORTS[$((i-1))]}"
-    step "starting placer-$i"
-    "$CLUSTER_CTL" placer --config "$WORK/placer-$i.yaml" > >(tee "$WORK/placer-$i.log" >&2) 2>&1 &
+step "starting final Placer"
+"$CLUSTER_CTL" placer --config "$WORK/placer.yaml" >"$WORK/placer.log" 2>&1 &
+PIDS+=("$!")
+wait_https "https://127.0.0.1:$PLACER_PORT/health" placer
+
+step "starting three-replica System Group and $VIRTUAL_SHARDS data shards"
+for index in 0 1 2; do
+    member=$((index + 1))
+    "$CLUSTER_CTL" registry --config "$WORK/registry-$member.yaml" >"$WORK/registry-$member.log" 2>&1 &
     pid="$!"
     PIDS+=("$pid")
-    SCALER_PIDS+=("$pid")
-    wait_tcp "$port" "placer-$i"
+    REGISTRY_PIDS[$index]="$pid"
+done
+for index in 0 1 2; do
+    wait_https "https://127.0.0.1:${REGISTRY_PORTS[$index]}/health" "registry-$((index + 1))"
 done
 
-step "starting node-stub-ctl with $NODES nodes"
+REGISTRY_BASE="https://127.0.0.1:${REGISTRY_PORTS[0]}"
+operator_curl -f "$REGISTRY_BASE/internal/operator/system/state" >"$WORK/system-before.json"
+python3 - "$WORK/system-before.json" "$WORK/generation.json" <<'PY'
+import json, sys
+state = json.load(open(sys.argv[1]))
+identity = {
+    "cluster_id": state["cluster_id"],
+    "registry_generation": state["registry_generation"],
+    "system_epoch": state["system_epoch"],
+    "registry_layout_digest": state["active_registry_layout_digest"],
+}
+json.dump(identity, open(sys.argv[2], "w"))
+PY
+
+post_operator() {
+    local path="$1" body="$2" output="$3" code
+    for _ in $(seq 1 100); do
+        code="$(operator_curl --max-time 3 -o "$output" -w '%{http_code}' \
+            -H 'Content-Type: application/json' --data-binary "@$body" "$REGISTRY_BASE$path" 2>/dev/null || true)"
+        if [ "$code" = 204 ]; then
+            return
+        fi
+        sleep 0.1
+    done
+    fail "operator POST $path returned ${code:-000}"
+}
+
+step "activating the empty Registry History Generation"
+post_operator /internal/operator/generation/activate "$WORK/generation.json" "$WORK/activate.body"
+
+for index in $(seq 1 "$NODES"); do
+    python3 - "$WORK/generation.json" "$WORK/enroll-$index.json" "$index" "$DATA_PORT" <<'PY'
+import json, sys
+request = json.load(open(sys.argv[1]))
+index = int(sys.argv[3])
+request.update({
+    "node_id": f"stub-{index}",
+    "enrollment_id": f"stub-enrollment-stub-{index}",
+    "node_epoch": 1,
+    "data_endpoint": f"127.0.0.1:{sys.argv[4]}",
+})
+json.dump(request, open(sys.argv[2], "w"))
+PY
+    post_operator /internal/operator/node/enroll "$WORK/enroll-$index.json" "$WORK/enroll-$index.body"
+done
+
+step "starting durable node-link stubs"
 "$NODE_STUB_CTL" serve \
-    --node-link "127.0.0.1:$CONTROL_PORT" \
+    --node-link "$REGISTRY_BASE" \
     --nodes "$NODES" \
     --node-prefix stub \
     --admin-listen "127.0.0.1:$ADMIN_PORT" \
     --data-listen "127.0.0.1:$DATA_PORT" \
+    --state-dir "$WORK/node-state" \
+    --tls-cert "$TLS_DIR/node.crt" \
+    --tls-key "$TLS_DIR/node.key" \
+    --tls-ca "$TLS_DIR/ca.crt" \
     --label pool=stub \
-    --heartbeat 500ms > >(tee "$WORK/node-stub.log" >&2) 2>&1 &
+    --heartbeat 100ms >"$WORK/node-stub.log" 2>&1 &
 PIDS+=("$!")
 ADMIN="http://127.0.0.1:$ADMIN_PORT"
-wait_http "$ADMIN/healthz" "node-stub admin"
+wait_http "$ADMIN/healthz" node-stub
 
-step "starting router"
-"$CLUSTER_CTL" router --config "$WORK/router.yaml" > >(tee "$WORK/router.log" >&2) 2>&1 &
-PIDS+=("$!")
-wait_tcp "$ROUTER_PORT" "router"
-
-step "waiting for node_link manifest-key cache"
-python3 - "$ADMIN" "$NODES" <<'PY' || fail "manifest keys were not distributed to all stub nodes"
+python3 - "$ADMIN" "$NODES" <<'PY' || fail "node-link sessions did not converge"
 import json, sys, time, urllib.request
-admin, want = sys.argv[1], int(sys.argv[2])
-for _ in range(300):
+admin, expected = sys.argv[1], int(sys.argv[2])
+for _ in range(400):
     try:
         nodes = json.load(urllib.request.urlopen(admin + "/v1/nodes", timeout=1))
-        if len(nodes) == want and all(len(n.get("keys", [])) >= 1 for n in nodes):
-            sys.exit(0)
+        if len(nodes) == expected and all(node.get("link_endpoint") for node in nodes):
+            raise SystemExit(0)
     except Exception:
         pass
     time.sleep(0.1)
-sys.exit(1)
+raise SystemExit(1)
 PY
 
-if [ "$CLUSTER_STUB_CASE" = "registry-redirect" ]; then
-    step "checking node_link redirect to node owners"
-    python3 - "$ADMIN" <<'PY' || fail "node_link redirect was not observed"
-import json, sys, time, urllib.request
-admin = sys.argv[1]
-last = []
-for _ in range(200):
-    nodes = json.load(urllib.request.urlopen(admin + "/v1/nodes", timeout=2))
-    redirected = [n for n in nodes if n.get("redirect_endpoint")]
-    if redirected and all(n.get("link_endpoint") == n.get("redirect_endpoint") for n in redirected):
-        sys.exit(0)
-    last = nodes
-    time.sleep(0.1)
-raise SystemExit("nodes=%r" % last)
+step "starting final Router"
+"$CLUSTER_CTL" router --config "$WORK/router.yaml" >"$WORK/router.log" 2>&1 &
+ROUTER_PID="$!"
+PIDS+=("$ROUTER_PID")
+for _ in $(seq 1 300); do
+    if curl -fsS --noproxy '*' --max-time 1 -o /dev/null -H "Host: api.$DOMAIN" \
+        "http://127.0.0.1:$ROUTER_PORT/health" 2>/dev/null; then
+        break
+    fi
+    sleep 0.1
+done
+
+request_data() {
+    local route_key="$1" output="$2" code
+    for _ in $(seq 1 300); do
+        code="$(curl -sS --noproxy '*' --max-time 5 -o "$output" -w '%{http_code}' \
+            -H "Host: data.$DOMAIN" \
+            -H "X-Kuasar-Sandbox-Group: $GROUP" \
+            -H "X-Kuasar-Route-Key: $route_key" \
+            -H "X-API-KEY: $API_KEY" \
+            -H 'E2b-Sandbox-Port: 49983' \
+            "http://127.0.0.1:$ROUTER_PORT/health" 2>/dev/null || true)"
+        if [ "$code" = 204 ]; then
+            return
+        fi
+        sleep 0.1
+    done
+    fail "data request for $route_key returned ${code:-000}"
+}
+
+command_count() {
+    python3 - "$ADMIN" "$1" <<'PY'
+import json, sys, urllib.request
+commands = json.load(urllib.request.urlopen(sys.argv[1] + "/v1/commands", timeout=2))
+print(sum(command.get("kind") == sys.argv[2] for command in commands))
 PY
-fi
+}
 
-step "checking Reserve -> READY -> data forward"
-code="$(retry_code 204 "$WORK/data1.body" \
-    -H "Host: data.$DOMAIN" \
-    -H "X-Kuasar-Sandbox-Group: $GROUP" \
-    -H "X-Kuasar-Route-Key: user1/session1" \
-    -H "X-API-KEY: $API_KEY" \
-    -H "E2b-Sandbox-Port: 49983" \
-    "http://127.0.0.1:$ROUTER_PORT/health" || true)"
-[ "$code" = "204" ] || fail "data by group/route_key returned $code"
+step "checking Reserve -> node Admission -> READY -> fenced data forwarding"
+request_data user1/session1 "$WORK/data-first.body"
+dispatch_before="$(command_count sandbox_admit_dispatch)"
+[ "$dispatch_before" -ge 1 ] || fail "Sandbox Admission command was not observed"
+request_data user1/session1 "$WORK/data-cached.body"
+dispatch_after="$(command_count sandbox_admit_dispatch)"
+[ "$dispatch_before" = "$dispatch_after" ] || fail "READY cache caused duplicate Sandbox Admission"
 
-python3 - "$ADMIN" "$GROUP" <<'PY' || fail "first data hit was not recorded with the expected group"
+read -r ROUTE_NODE ROUTE_SID < <(python3 - "$ADMIN" <<'PY'
 import json, sys, urllib.request
 hits = json.load(urllib.request.urlopen(sys.argv[1] + "/v1/data-hits", timeout=2))
-assert hits, "no data hits"
-last = hits[-1]
-location = json.loads(last["metadata"]["kuasar-sandbox.cluster"])
-assert location["group"] == sys.argv[2], last
-assert location["route_key"] == "user1/session1", last
-assert last.get("access_token", "").startswith("sat_"), last
+assert hits
+print(hits[-1]["node_id"], hits[-1]["sid"])
 PY
+)
 
-if [ "$CLUSTER_STUB_CASE" = "registry-placer-ha" ]; then
-    step "checking placer failover after one placer exits"
-    kill "${SCALER_PIDS[0]}" 2>/dev/null || true
-    wait "${SCALER_PIDS[0]}" 2>/dev/null || true
-    code="$(retry_code 204 "$WORK/data-placer-ha.body" \
-        -H "Host: data.$DOMAIN" \
-        -H "X-Kuasar-Sandbox-Group: $GROUP" \
-        -H "X-Kuasar-Route-Key: user1/session-placer-failover" \
-        -H "X-API-KEY: $API_KEY" \
-        -H "E2b-Sandbox-Port: 49983" \
-        "http://127.0.0.1:$ROUTER_PORT/health" || true)"
-    [ "$code" = "204" ] || fail "data after placer failure returned $code"
-fi
-
-if [ "$CLUSTER_STUB_CASE" = "registry-joint" ]; then
-    step "checking joint route visibility from next-only registry"
-    curl -sS --noproxy '*' --get --data-urlencode "group=$GROUP" \
-        "http://127.0.0.1:${CONTROL_PORTS[3]}/route-link/list" >"$WORK/joint-routes.json"
-    python3 - "$WORK/joint-routes.json" <<'PY' || fail "next-only registry did not expose the ready route"
-import json, sys
-routes = json.load(open(sys.argv[1]))
-assert any(r.get("sandboxID") and r.get("state") == "ready" for r in routes), routes
-PY
-
-    step "cutting registry membership over to version 2 with old_grace version 1"
-    for i in 1 2 3 4; do
-        port="${CONTROL_PORTS[$((i-1))]}"
-        cat >"$WORK/registry-$i.yaml" <<EOF
-member:
-  id: registry-$i
-  listen: "127.0.0.1:$port"
-membership:
-  active: 2
-  old_grace: 1
-  versions:
-    - version: 1
-      members:
-$ACTIVE_MEMBERS_YAML
-    - version: 2
-      members:
-$NEXT_MEMBERS_YAML  owners:
-    route_link: $ROUTE_OWNER_COUNT
-    node_link: $NODE_OWNER_COUNT
-    placer_link: $SCALE_OWNER_COUNT
-    node_list: $NODE_LIST_OWNER_COUNT
-node_link:
-  heartbeat_interval: "500ms"
-  node_dead_after: "3s"
-route_link:
-  park_timeout: "5s"
-EOF
-        code="$(http_code "$WORK/reload-$i.body" -X POST "http://127.0.0.1:$port/cluster/reload" || true)"
-        [ "$code" = "204" ] || fail "registry-$i cutover reload returned $code: $(cat "$WORK/reload-$i.body")"
-    done
-
-    step "checking registries report active membership version 2 with old_grace version 1"
-    for i in 1 2 3 4; do
-        port="${CONTROL_PORTS[$((i-1))]}"
-        python3 - "http://127.0.0.1:$port" <<'PY' || fail "registry cutover membership check failed on $port"
+step "checking Holder failure reconnect and two-replica quorum service"
+python3 - "$ADMIN" "${REGISTRY_PORTS[1]}" "${REGISTRY_PORTS[2]}" "$WORK/kill-holder.json" <<'PY'
 import json, sys, urllib.request
-m = json.load(urllib.request.urlopen(sys.argv[1] + "/cluster/membership", timeout=2))
-assert m.get("active", m.get("Active")) == 2, m
-assert not m.get("next", m.get("Next", 0)), m
-assert m.get("old_grace", m.get("OldGrace")) == 1, m
-PY
-    done
-
-    step "checking router/placer refresh through known members after cutover"
-    code="$(retry_code 204 "$WORK/data-cutover.body" \
-        -H "Host: data.$DOMAIN" \
-        -H "X-Kuasar-Sandbox-Group: $GROUP" \
-        -H "X-Kuasar-Route-Key: user1/session-cutover" \
-        -H "X-API-KEY: $API_KEY" \
-        -H "E2b-Sandbox-Port: 49983" \
-        "http://127.0.0.1:$ROUTER_PORT/health" || true)"
-    [ "$code" = "204" ] || fail "data after registry cutover returned $code"
-
-    python3 - "$ADMIN" "$GROUP" <<'PY' || fail "cutover data hit was not recorded with the expected route key"
-import json, sys, urllib.request
-hits = json.load(urllib.request.urlopen(sys.argv[1] + "/v1/data-hits", timeout=2))
-assert hits, "no data hits"
-last = hits[-1]
-location = json.loads(last["metadata"]["kuasar-sandbox.cluster"])
-assert location["group"] == sys.argv[2], last
-assert location["route_key"] == "user1/session-cutover", last
-PY
-fi
-
-create_count_before="$(python3 - "$ADMIN" <<'PY'
-import json, sys, urllib.request
-cmds = json.load(urllib.request.urlopen(sys.argv[1] + "/v1/commands", timeout=2))
-def route_key(c):
-    raw = c.get("metadata", {}).get("kuasar-sandbox.cluster")
-    return json.loads(raw).get("route_key") if raw else None
-print(sum(1 for c in cmds if c.get("kind") == "create" and route_key(c) == "user1/session1"))
-PY
-)"
-[ "$create_count_before" = "1" ] || fail "expected one create for user1/session1 before active-cache check, got $create_count_before"
-
-step "checking active route cache"
-code="$(retry_code 204 "$WORK/data2.body" \
-    -H "Host: data.$DOMAIN" \
-    -H "X-Kuasar-Sandbox-Group: $GROUP" \
-    -H "X-Kuasar-Route-Key: user1/session1" \
-    -H "X-API-KEY: $API_KEY" \
-    -H "E2b-Sandbox-Port: 49983" \
-    "http://127.0.0.1:$ROUTER_PORT/health" || true)"
-[ "$code" = "204" ] || fail "second data by group/route_key returned $code"
-
-create_count_after="$(python3 - "$ADMIN" <<'PY'
-import json, sys, urllib.request
-cmds = json.load(urllib.request.urlopen(sys.argv[1] + "/v1/commands", timeout=2))
-def route_key(c):
-    raw = c.get("metadata", {}).get("kuasar-sandbox.cluster")
-    return json.loads(raw).get("route_key") if raw else None
-print(sum(1 for c in cmds if c.get("kind") == "create" and route_key(c) == "user1/session1"))
-PY
-)"
-[ "$create_count_after" = "$create_count_before" ] || fail "active route cache caused another create ($create_count_before -> $create_count_after)"
-
-step "checking build_register"
-code="$(http_code "$WORK/build.body" -X POST \
-    -H "Host: api.$DOMAIN" \
-    -H "X-Kuasar-Sandbox-Group: $GROUP" \
-    -H "X-API-KEY: $API_KEY" \
-    -H "Content-Type: application/json" \
-    --data '{"name":"stub-template","cpuCount":1,"memoryMB":128}' \
-    "http://127.0.0.1:$ROUTER_PORT/v3/templates" || true)"
-[ "$code" = "202" ] || fail "build register returned $code: $(cat "$WORK/build.body")"
-
-python3 - "$ADMIN" <<'PY' || fail "build_register command with default e2b profile was not observed"
-import json, sys, urllib.request
-cmds = json.load(urllib.request.urlopen(sys.argv[1] + "/v1/commands", timeout=2))
-assert any(c.get("kind") == "build_register" and c.get("profile") == "e2b" for c in cmds), cmds
-PY
-
-step "checking unowned node-local route isolation"
-"$NODE_STUB_CTL" sandbox orphan --admin "$ADMIN" --node stub-1 --sid sb-orphan >"$WORK/orphan.out"
-python3 - "$ADMIN" <<'PY' || fail "unowned node-local route triggered a delete command"
-import json, sys, time, urllib.request
-admin = sys.argv[1]
-time.sleep(1)
-cmds = json.load(urllib.request.urlopen(admin + "/v1/nodes/stub-1/commands", timeout=2))
-assert not any(c.get("kind") == "delete" and c.get("sid") == "sb-orphan" for c in cmds), cmds
-PY
-
-step "checking reboot-empty cleanup"
-python3 - "$ADMIN" "$WORK/first_sandbox.env" <<'PY'
-import json, shlex, sys, urllib.request
 nodes = json.load(urllib.request.urlopen(sys.argv[1] + "/v1/nodes", timeout=2))
-for n in nodes:
-    for s in n.get("sandboxes", []):
-        raw = s.get("metadata", {}).get("kuasar-sandbox.cluster")
-        location = json.loads(raw) if raw else {}
-        if location.get("route_key") == "user1/session1":
-            open(sys.argv[2], "w").write("NODE=%s\nSID=%s\n" % (shlex.quote(n["node_id"]), shlex.quote(s["sid"])))
-            sys.exit(0)
-raise SystemExit("sandbox not found")
+endpoints = [f"https://127.0.0.1:{sys.argv[2]}", f"https://127.0.0.1:{sys.argv[3]}"]
+counts = [sum(node.get("link_endpoint") == endpoint for node in nodes) for endpoint in endpoints]
+index = 1 if counts[0] >= counts[1] else 2
+json.dump({"index": index, "endpoint": endpoints[index - 1], "affected": counts[index - 1]}, open(sys.argv[4], "w"))
 PY
-# shellcheck disable=SC1090
-source "$WORK/first_sandbox.env"
-"$NODE_STUB_CTL" node reboot-empty "$NODE" --admin "$ADMIN" >"$WORK/reboot.out"
+read -r KILL_INDEX KILLED_ENDPOINT AFFECTED < <(python3 - "$WORK/kill-holder.json" <<'PY'
+import json, sys
+value = json.load(open(sys.argv[1]))
+print(value["index"], value["endpoint"], value["affected"])
+PY
+)
+kill "${REGISTRY_PIDS[$KILL_INDEX]}"
+wait "${REGISTRY_PIDS[$KILL_INDEX]}" 2>/dev/null || true
 
-python3 - "$ADMIN" "$SID" <<'PY' || fail "reboot-empty did not clear the node-local sandbox"
+if [ "$AFFECTED" -gt 0 ]; then
+    python3 - "$ADMIN" "$KILLED_ENDPOINT" <<'PY' || fail "sessions assigned to the failed Holder did not reconnect"
 import json, sys, time, urllib.request
-admin, sid = sys.argv[1], sys.argv[2]
-for _ in range(100):
-    nodes = json.load(urllib.request.urlopen(admin + "/v1/nodes", timeout=2))
-    if all(s.get("sid") != sid for n in nodes for s in n.get("sandboxes", [])):
-        sys.exit(0)
+for _ in range(400):
+    nodes = json.load(urllib.request.urlopen(sys.argv[1] + "/v1/nodes", timeout=2))
+    if all(node.get("link_endpoint") and node.get("link_endpoint") != sys.argv[2] for node in nodes):
+        raise SystemExit(0)
     time.sleep(0.1)
-sys.exit(1)
+raise SystemExit(1)
 PY
-
-ROUTE_LIST_PORT="$CONTROL_PORT"
-if [ "$CLUSTER_STUB_CASE" = "registry-joint" ]; then
-    ROUTE_LIST_PORT="${CONTROL_PORTS[3]}"
 fi
-python3 - "$ROUTE_LIST_PORT" "$GROUP" "$SID" "$WORK/routes.json" <<'PY' || fail "route_link still contains rebooted sandbox"
-import json, sys, time, urllib.parse, urllib.request
-port, group, sid, out = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
-url = "http://127.0.0.1:%s/route-link/list?%s" % (port, urllib.parse.urlencode({"group": group}))
-last = None
-for _ in range(100):
-    with urllib.request.urlopen(url, timeout=2) as resp:
-        last = json.load(resp)
-    with open(out, "w") as f:
-        json.dump(last, f)
-    if all(r.get("sandboxID") != sid for r in last):
-        sys.exit(0)
-    time.sleep(0.1)
-raise SystemExit("routes=%r" % (last,))
+request_data user1/session1 "$WORK/data-after-registry-failure.body"
+request_data user1/session-after-registry-failure "$WORK/data-new-after-registry-failure.body"
+
+step "checking newer NodeEpoch proof replaces, rather than revives, the old execution"
+"$NODE_STUB_CTL" node reboot-empty "$ROUTE_NODE" --admin "$ADMIN" >"$WORK/reboot.json"
+request_data user1/session1 "$WORK/data-after-node-epoch.body"
+NEW_SID="$(python3 - "$ADMIN" <<'PY'
+import json, sys, urllib.request
+hits = json.load(urllib.request.urlopen(sys.argv[1] + "/v1/data-hits", timeout=2))
+print(hits[-1]["sid"])
+PY
+)"
+[ "$NEW_SID" != "$ROUTE_SID" ] || fail "new NodeEpoch reused the fenced Sandbox execution"
+
+step "checking bound-node Build trigger, idempotency, and local lifecycle"
+for _ in $(seq 1 200); do
+    build_code="$(curl -sS --noproxy '*' --max-time 5 -o "$WORK/build.body" -w '%{http_code}' \
+        -X POST -H "Host: api.$DOMAIN" -H "X-Kuasar-Sandbox-Group: $GROUP" \
+        -H "X-API-KEY: $API_KEY" -H 'Content-Type: application/json' \
+        --data '{"name":"e2e-template","cpuCount":1,"memoryMB":128}' \
+        "http://127.0.0.1:$ROUTER_PORT/v3/templates" 2>/dev/null || true)"
+    [ "$build_code" = 202 ] && break
+    sleep 0.1
+done
+[ "${build_code:-000}" = 202 ] || fail "Build registration returned ${build_code:-000}"
+read -r BUILD_ID BUILD_TEMPLATE < <(python3 - "$WORK/build.body" <<'PY'
+import json, sys
+value = json.load(open(sys.argv[1]))
+print(value["buildID"], value["templateID"])
+PY
+)
+BUILD_DISPATCHES="$(command_count build_admit_dispatch)"
+[ "$BUILD_DISPATCHES" -ge 1 ] || fail "Build Admission command was not observed"
+BUILD_TRIGGER='{"fromImage":"registry.stub/base:latest"}'
+for attempt in first retry; do
+    trigger_code="$(curl -sS --noproxy '*' --max-time 5 -o "$WORK/build-trigger-$attempt.body" -w '%{http_code}' \
+        -X POST -H "Host: api.$DOMAIN" -H "X-Kuasar-Sandbox-Group: $GROUP" \
+        -H "X-API-KEY: $API_KEY" -H 'Content-Type: application/json' --data "$BUILD_TRIGGER" \
+        "http://127.0.0.1:$ROUTER_PORT/v2/templates/$BUILD_TEMPLATE/builds/$BUILD_ID" 2>/dev/null || true)"
+    [ "$trigger_code" = 202 ] || fail "Build trigger $attempt returned ${trigger_code:-000}"
+done
+conflict_code="$(curl -sS --noproxy '*' --max-time 5 -o "$WORK/build-trigger-conflict.body" -w '%{http_code}' \
+    -X POST -H "Host: api.$DOMAIN" -H "X-Kuasar-Sandbox-Group: $GROUP" \
+    -H "X-API-KEY: $API_KEY" -H 'Content-Type: application/json' \
+    --data '{"fromImage":"registry.stub/other:latest"}' \
+    "http://127.0.0.1:$ROUTER_PORT/v2/templates/$BUILD_TEMPLATE/builds/$BUILD_ID" 2>/dev/null || true)"
+[ "$conflict_code" = 409 ] || fail "conflicting Build trigger returned ${conflict_code:-000}"
+[ "$(command_count build_admit_dispatch)" = "$BUILD_DISPATCHES" ] || fail "Build trigger caused another placement"
+
+build_ready=0
+for _ in $(seq 1 300); do
+    status_code="$(curl -sS --noproxy '*' --max-time 5 -o "$WORK/build-status.body" -w '%{http_code}' \
+        -H "Host: api.$DOMAIN" -H "X-Kuasar-Sandbox-Group: $GROUP" -H "X-API-KEY: $API_KEY" \
+        "http://127.0.0.1:$ROUTER_PORT/templates/$BUILD_TEMPLATE/builds/$BUILD_ID/status" 2>/dev/null || true)"
+    if [ "$status_code" = 200 ] && python3 - "$WORK/build-status.body" <<'PY'
+import json, sys
+raise SystemExit(0 if json.load(open(sys.argv[1])).get("status") == "ready" else 1)
+PY
+    then
+        build_ready=1
+        break
+    fi
+    sleep 0.1
+done
+[ "$build_ready" = 1 ] || fail "node-local Build did not become ready"
+
+python3 - "$ADMIN" <<'PY' || fail "removed node-link command kinds were emitted"
+import json, sys, urllib.request
+forbidden = {"create", "connect", "delete", "key_put", "key_drop", "build_register"}
+commands = json.load(urllib.request.urlopen(sys.argv[1] + "/v1/commands", timeout=2))
+bad = [command for command in commands if command.get("kind") in forbidden]
+assert not bad, bad
 PY
 
-echo "==> PASS: orchestrator cluster stub e2e"
+step "capturing the node-authoritative execution before Registry History Generation rollover"
+RECOVERY_SID="$NEW_SID"
+RECOVERY_DISPATCHES="$(command_count sandbox_admit_dispatch)"
+python3 - "$ADMIN" "$RECOVERY_SID" "$WORK/source-execution.json" "$WORK/source-node-sessions.json" <<'PY' \
+    || fail "current execution Binding was not observable before rollover"
+import json, sys, urllib.request
+nodes = json.load(urllib.request.urlopen(sys.argv[1] + "/v1/nodes", timeout=2))
+sid = sys.argv[2]
+matches = [
+    (node, sandbox)
+    for node in nodes
+    for sandbox in node.get("sandboxes", [])
+    if sandbox.get("sid") == sid
+]
+assert len(matches) == 1, matches
+node, sandbox = matches[0]
+assert sandbox.get("registry_generation") == "generation-e2e-1", sandbox
+assert len(sandbox.get("binding_digest", "")) == 64, sandbox
+assert sandbox.get("access_token"), sandbox
+json.dump({
+    "node_id": node["node_id"],
+    "node_epoch": node["node_epoch"],
+    "data_endpoint": node["data_endpoint"],
+    "sid": sid,
+    "registry_generation": sandbox["registry_generation"],
+    "binding_digest": sandbox["binding_digest"],
+    "access_token": sandbox["access_token"],
+}, open(sys.argv[3], "w"))
+json.dump({node["node_id"]: node["session_seq"] for node in nodes}, open(sys.argv[4], "w"))
+PY
+
+TARGET_BOOTSTRAP_SECRET="$WORK/bootstrap-v2.secret"
+printf '%s\n' 'kuasar-e2e-generation-2' >"$TARGET_BOOTSTRAP_SECRET"
+python3 - "$WORK/registry-layout-chain.json" "$WORK/generation.json" "$TARGET_BOOTSTRAP_SECRET" \
+    "$WORK/successor-intent.json" "$WORK/close-generation.json" <<'PY'
+import hashlib, json, sys
+chain = json.load(open(sys.argv[1]))
+source = json.load(open(sys.argv[2]))
+successor = dict(chain[-1]["registry_layout"])
+successor.update({
+    "registry_generation": "generation-e2e-2",
+    "registry_layout_version": 1,
+    "bootstrap_token_digest": hashlib.sha256(open(sys.argv[3], "rb").read().strip()).hexdigest(),
+    "predecessor": {
+        "registry_generation": source["registry_generation"],
+        "registry_layout_digest": source["registry_layout_digest"],
+        "serve_permit_max_millis": successor["serve_permit_max_millis"],
+        "kind": "CONSENSUS_CLOSURE",
+    },
+})
+successor.pop("previous_registry_layout_version", None)
+successor.pop("previous_registry_layout_digest", None)
+json.dump(successor, open(sys.argv[4], "w"))
+request = dict(source)
+request["successor"] = successor
+json.dump(request, open(sys.argv[5], "w"))
+PY
+
+step "permanently closing generation-e2e-1 for the exact successor intent"
+close_code=""
+for _ in $(seq 1 100); do
+    close_code="$(operator_curl --max-time 5 -o "$WORK/close-generation.body" -w '%{http_code}' \
+        -H 'Content-Type: application/json' --data-binary @"$WORK/close-generation.json" \
+        "$REGISTRY_BASE/internal/operator/generation/close" 2>/dev/null || true)"
+    [ "$close_code" = 200 ] && break
+    sleep 0.1
+done
+[ "$close_code" = 200 ] || fail "generation closure returned ${close_code:-000}"
+
+python3 - "$WORK/successor-intent.json" "$WORK/close-generation.body" "$WORK/successor.json" <<'PY' \
+    || fail "generation closure returned an invalid predecessor proof"
+import json, sys
+successor = json.load(open(sys.argv[1]))
+response = json.load(open(sys.argv[2]))
+proof = response["predecessor_proof"]
+assert proof["registry_generation"] == "generation-e2e-1", proof
+assert proof["kind"] == "CONSENSUS_CLOSURE", proof
+assert proof["commit_index"] > 0, proof
+assert len(proof["proof_digest"]) == 64, proof
+successor["predecessor"] = proof
+json.dump(successor, open(sys.argv[3], "w"))
+PY
+
+step "signing the generation-e2e-2 immutable Registry Layout artifact"
+"$CLUSTER_CTL" registry-layout append \
+    --chain-in "$WORK/registry-layout-chain.json" \
+    --keys "$WORK/registry-layout-keyring.json" \
+    --registry-layout "$WORK/successor.json" \
+    --signing-key "$WORK/registry-layout-signing.pem" \
+    --key-id e2e-root \
+    --chain-out "$WORK/registry-layout-chain-v2.json"
+
+step "stopping every generation-e2e-1 Router and Registry endpoint"
+kill "$ROUTER_PID" 2>/dev/null || true
+wait "$ROUTER_PID" 2>/dev/null || true
+for pid in "${REGISTRY_PIDS[@]}"; do
+    kill "$pid" 2>/dev/null || true
+done
+for pid in "${REGISTRY_PIDS[@]}"; do
+    wait "$pid" 2>/dev/null || true
+done
+for member in 1 2 3; do
+    rm -rf "$WORK/registry-$member"
+done
+
+cat >"$WORK/router-v2.yaml" <<EOF
+domain: "$DOMAIN"
+registry_layout:
+  chain: "$WORK/registry-layout-chain-v2.json"
+  keys: "$WORK/registry-layout-keyring.json"
+  guard: "$WORK/router-v2-registry-layout.guard"
+registry_tls: { cert: "$TLS_DIR/router.crt", key: "$TLS_DIR/router.key", ca: "$TLS_DIR/ca.crt" }
+node_tls: { cert: "$TLS_DIR/router.crt", key: "$TLS_DIR/router.key", ca: "$TLS_DIR/ca.crt" }
+providers:
+  endpoints:
+    - { name: placer-1, endpoint: "https://127.0.0.1:$PLACER_PORT" }
+  tls: { cert: "$TLS_DIR/router.crt", key: "$TLS_DIR/router.key", ca: "$TLS_DIR/ca.crt" }
+ingress:
+  listen: "127.0.0.1:$ROUTER_PORT"
+auth:
+  api_key: enforce
+  data_plane: off
+  cache_ttl: 1s
+cache:
+  route_ttl: 30s
+  idle_timeout: 30s
+EOF
+
+write_target_registry_config() {
+    local index="$1"
+    local mode="$2"
+    local recovery_scan="$3"
+    local config_path="$4"
+    local member=$((index + 1))
+    local root="$WORK/registry-v2-$member"
+    local bootstrap_secret=""
+    if [ "$mode" = bootstrap ]; then
+        bootstrap_secret="  bootstrap_secret_file: \"$TARGET_BOOTSTRAP_SECRET\""
+    fi
+    cat >"$config_path" <<EOF
+member:
+  id: registry-$member
+  listen: "127.0.0.1:${REGISTRY_PORTS[$index]}"
+  tls: { cert: "$TLS_DIR/registry.crt", key: "$TLS_DIR/registry.key", ca: "$TLS_DIR/ca.crt" }
+registry_layout:
+  chain: "$WORK/registry-layout-chain-v2.json"
+  keys: "$WORK/registry-layout-keyring.json"
+  guard: "$root/registry-layout.guard"
+storage:
+  nodehost_dir: "$root/nodehost"
+  wal_dir: "$root/wal"
+  state_engine_dir: "$root/state"
+  enrollment_path: "$root/enrollment.json"
+  raft_listen: "127.0.0.1:${RAFT_PORTS[$index]}"
+  open_mode: $mode
+$bootstrap_secret
+  storage_protection: ephemeral-tmpfs
+  initialize_workers: 4
+  transition_workers: 4
+  snapshot_workers: 2
+  operation_timeout: 5s
+  fence_retention: 100ms
+  tls: { cert: "$TLS_DIR/registry.crt", key: "$TLS_DIR/registry.key", ca: "$TLS_DIR/ca.crt" }
+placers:
+  endpoints:
+    - { name: placer-1, endpoint: "https://127.0.0.1:$PLACER_PORT" }
+  tls: { cert: "$TLS_DIR/registry.crt", key: "$TLS_DIR/registry.key", ca: "$TLS_DIR/ca.crt" }
+session:
+  max_nodes: 100
+  anti_entropy: 200ms
+  event_workers: 16
+  reconnect_per_second: 100
+workflow:
+  park_timeout: 10s
+  poll_interval: 10ms
+  permit_refresh: 200ms
+  recovery_scan_interval: $recovery_scan
+  recovery_shards_per_scan: 8
+  recovery_workers: 2
+  recovery_per_node_workers: 1
+  compaction_workers: 2
+  pending_workflows_per_page: 64
+  recovery_page_objects: 32
+  recovery_page_bytes: 262144
+  recovery_max_report_bytes: 8388608
+  recovery_lookup_page: 64
+EOF
+}
+
+for index in 0 1 2; do
+    member=$((index + 1))
+    mkdir -p "$WORK/registry-v2-$member"
+    write_target_registry_config "$index" bootstrap 30s "$WORK/registry-v2-$member.yaml"
+    write_target_registry_config "$index" restart 100ms "$WORK/registry-v2-restart-$member.yaml"
+done
+
+step "bootstrapping the empty three-replica generation-e2e-2"
+REGISTRY_PIDS=()
+for index in 0 1 2; do
+    member=$((index + 1))
+    "$CLUSTER_CTL" registry --config "$WORK/registry-v2-$member.yaml" >"$WORK/registry-v2-$member.log" 2>&1 &
+    pid="$!"
+    PIDS+=("$pid")
+    REGISTRY_PIDS[$index]="$pid"
+done
+for index in 0 1 2; do
+    wait_https "https://127.0.0.1:${REGISTRY_PORTS[$index]}/health" "registry-v2-$((index + 1))"
+done
+
+operator_curl -f "$REGISTRY_BASE/internal/operator/system/state" >"$WORK/system-v2-before.json"
+python3 - "$WORK/system-v2-before.json" "$WORK/generation-v2.json" <<'PY' \
+    || fail "successor System Group did not start with closed cutover gates"
+import json, sys
+state = json.load(open(sys.argv[1]))
+assert state["registry_generation"] == "generation-e2e-2", state
+assert state["has_predecessor"] and not state["predecessor_drain_complete"], state
+assert not state["serve_gate"] and not state["write_gate"] and not state["cutover_gate"], state
+json.dump({
+    "cluster_id": state["cluster_id"],
+    "registry_generation": state["registry_generation"],
+    "system_epoch": state["system_epoch"],
+    "registry_layout_digest": state["active_registry_layout_digest"],
+}, open(sys.argv[2], "w"))
+PY
+
+step "enrolling the exact durable NodeEpoch set in generation-e2e-2"
+for index in $(seq 1 "$NODES"); do
+    python3 - "$WORK/generation-v2.json" "$ADMIN" "$index" "$WORK/enroll-v2-$index.json" <<'PY'
+import json, sys, urllib.request
+identity = json.load(open(sys.argv[1]))
+node_id = f"stub-{sys.argv[3]}"
+nodes = json.load(urllib.request.urlopen(sys.argv[2] + "/v1/nodes", timeout=2))
+node = next(value for value in nodes if value["node_id"] == node_id)
+identity.update({
+    "node_id": node_id,
+    "enrollment_id": "stub-enrollment-" + node_id,
+    "node_epoch": node["node_epoch"],
+    "data_endpoint": node["data_endpoint"],
+})
+json.dump(identity, open(sys.argv[4], "w"))
+PY
+    post_operator /internal/operator/node/enroll "$WORK/enroll-v2-$index.json" "$WORK/enroll-v2-$index.body"
+done
+
+python3 - "$ADMIN" "$REGISTRY_BASE" "$WORK/source-node-sessions.json" "$NODES" <<'PY' \
+    || fail "nodes did not establish new-generation sessions"
+import json, ssl, sys, time, urllib.request
+admin, expected_endpoint = sys.argv[1], sys.argv[2]
+before = json.load(open(sys.argv[3]))
+expected = int(sys.argv[4])
+for _ in range(600):
+    try:
+        nodes = json.load(urllib.request.urlopen(admin + "/v1/nodes", timeout=2))
+        if len(nodes) == expected and all(
+            node.get("link_endpoint") and
+            node.get("session_seq", 0) > before[node["node_id"]]
+            for node in nodes
+        ):
+            raise SystemExit(0)
+    except Exception:
+        pass
+    time.sleep(0.1)
+raise SystemExit(1)
+PY
+
+step "waiting the full predecessor Serve Permit lifetime"
+python3 - "$WORK/generation-v2.json" "$WORK/confirm-drain.json" <<'PY'
+import hashlib, json, sys
+request = json.load(open(sys.argv[1]))
+request["evidence_digest"] = hashlib.sha256(b"e2e-all-old-endpoints-and-processes-fenced").hexdigest()
+json.dump(request, open(sys.argv[2], "w"))
+PY
+drain_code="$(operator_curl --max-time 15 -o "$WORK/confirm-drain.body" -w '%{http_code}' \
+    -H 'Content-Type: application/json' --data-binary @"$WORK/confirm-drain.json" \
+    "$REGISTRY_BASE/internal/operator/generation/confirm-predecessor-drain" 2>/dev/null || true)"
+[ "$drain_code" = 204 ] || fail "predecessor Permit drain returned ${drain_code:-000}"
+
+step "running #34 node-authoritative recovery and digest-CAS rebind"
+post_operator /internal/operator/recovery/begin "$WORK/generation-v2.json" "$WORK/recovery-begin.body"
+operator_curl -f "$REGISTRY_BASE/internal/operator/system/state" >"$WORK/system-v2-open-recovery.json"
+python3 - "$WORK/system-v2-open-recovery.json" "$ADMIN" "$WORK/recovery-restart-sessions.json" <<'PY' \
+    || fail "target recovery epoch was not durably opened before Registry restart"
+import json, sys, urllib.request
+state = json.load(open(sys.argv[1]))
+recovery = state.get("recovery")
+assert recovery and recovery["source_registry_generation"] == "generation-e2e-1", state
+assert recovery["target_registry_generation"] == "generation-e2e-2", state
+nodes = json.load(urllib.request.urlopen(sys.argv[2] + "/v1/nodes", timeout=2))
+json.dump({node["node_id"]: node["session_seq"] for node in nodes}, open(sys.argv[3], "w"))
+PY
+
+step "restarting every target Registry during the open recovery epoch"
+for pid in "${REGISTRY_PIDS[@]}"; do
+    kill "$pid" 2>/dev/null || true
+done
+for pid in "${REGISTRY_PIDS[@]}"; do
+    wait "$pid" 2>/dev/null || true
+done
+REGISTRY_PIDS=()
+for index in 0 1 2; do
+    member=$((index + 1))
+    "$CLUSTER_CTL" registry --config "$WORK/registry-v2-restart-$member.yaml" \
+        >"$WORK/registry-v2-restart-$member.log" 2>&1 &
+    pid="$!"
+    PIDS+=("$pid")
+    REGISTRY_PIDS[$index]="$pid"
+done
+for index in 0 1 2; do
+    wait_https "https://127.0.0.1:${REGISTRY_PORTS[$index]}/health" "registry-v2-restart-$((index + 1))"
+done
+python3 - "$ADMIN" "$WORK/recovery-restart-sessions.json" "$NODES" <<'PY' \
+    || fail "nodes did not rebuild current-generation sessions after Registry restart"
+import json, sys, time, urllib.request
+admin = sys.argv[1]
+before = json.load(open(sys.argv[2]))
+expected = int(sys.argv[3])
+for _ in range(600):
+    try:
+        nodes = json.load(urllib.request.urlopen(admin + "/v1/nodes", timeout=2))
+        if len(nodes) == expected and all(
+            node.get("link_endpoint") and node.get("session_seq", 0) > before[node["node_id"]]
+            for node in nodes
+        ):
+            raise SystemExit(0)
+    except Exception:
+        pass
+    time.sleep(0.1)
+raise SystemExit(1)
+PY
+
+recovery_complete=0
+for _ in $(seq 1 900); do
+    if operator_curl --max-time 2 -f "$REGISTRY_BASE/internal/operator/system/state" \
+        >"$WORK/system-v2-recovery.json" 2>/dev/null && \
+        python3 - "$WORK/system-v2-recovery.json" <<'PY'
+import json, sys
+state = json.load(open(sys.argv[1]))
+raise SystemExit(0 if state.get("recovery") is None and state.get("recovery_completion") else 1)
+PY
+    then
+        recovery_complete=1
+        break
+    fi
+    sleep 0.1
+done
+[ "$recovery_complete" = 1 ] || fail "#34 recovery did not reach durable completion"
+[ "$(command_count rebind_execution)" -ge 1 ] || fail "recovery did not issue a Binding digest-CAS rebind"
+[ "$(command_count ack_recovery_event)" -ge 1 ] || fail "recovery exposed state without node event ACK"
+
+python3 - "$WORK/system-v2-recovery.json" "$WORK/activate-v2.json" <<'PY'
+import json, sys
+state = json.load(open(sys.argv[1]))
+json.dump({
+    "cluster_id": state["cluster_id"],
+    "registry_generation": state["registry_generation"],
+    "system_epoch": state["system_epoch"],
+    "registry_layout_digest": state["active_registry_layout_digest"],
+}, open(sys.argv[2], "w"))
+PY
+step "atomically activating generation-e2e-2 after recovery completion"
+post_operator /internal/operator/generation/activate "$WORK/activate-v2.json" "$WORK/activate-v2.body"
+
+"$CLUSTER_CTL" router --config "$WORK/router-v2.yaml" >"$WORK/router-v2.log" 2>&1 &
+ROUTER_V2_PID="$!"
+PIDS+=("$ROUTER_V2_PID")
+for _ in $(seq 1 300); do
+    if curl -fsS --noproxy '*' --max-time 1 -o /dev/null -H "Host: api.$DOMAIN" \
+        "http://127.0.0.1:$ROUTER_PORT/health" 2>/dev/null; then
+        break
+    fi
+    sleep 0.1
+done
+
+step "verifying recovered Route continuity without a second execution"
+request_data user1/session1 "$WORK/data-after-rollover.body"
+RECOVERED_SID="$(python3 - "$ADMIN" <<'PY'
+import json, sys, urllib.request
+hits = json.load(urllib.request.urlopen(sys.argv[1] + "/v1/data-hits", timeout=2))
+print(hits[-1]["sid"])
+PY
+)"
+[ "$RECOVERED_SID" = "$RECOVERY_SID" ] || fail "recovery replaced the node-authoritative Sandbox execution"
+[ "$(command_count sandbox_admit_dispatch)" = "$RECOVERY_DISPATCHES" ] || \
+    fail "recovered Route caused a second Sandbox Admission"
+
+step "verifying recovered Build registration still reaches node-local terminal state"
+recovered_build_code="$(curl -sS --noproxy '*' --max-time 5 -o "$WORK/build-status-after-rollover.body" -w '%{http_code}' \
+    -H "Host: api.$DOMAIN" -H "X-Kuasar-Sandbox-Group: $GROUP" -H "X-API-KEY: $API_KEY" \
+    "http://127.0.0.1:$ROUTER_PORT/templates/$BUILD_TEMPLATE/builds/$BUILD_ID/status" 2>/dev/null || true)"
+[ "$recovered_build_code" = 200 ] || fail "recovered Build status returned ${recovered_build_code:-000}"
+python3 - "$WORK/build-status-after-rollover.body" <<'PY' || fail "recovery changed node-local Build terminal state"
+import json, sys
+value = json.load(open(sys.argv[1]))
+assert value.get("status") == "ready", value
+assert value.get("templateID", "").startswith("e2b-img-"), value
+PY
+[ "$(command_count build_admit_dispatch)" = "$BUILD_DISPATCHES" ] || \
+    fail "Build recovery caused another Admission or placement"
+
+read -r SOURCE_NODE SOURCE_EPOCH SOURCE_DATA SOURCE_GENERATION SOURCE_DIGEST SOURCE_TOKEN < <(
+    python3 - "$WORK/source-execution.json" <<'PY'
+import json, sys
+value = json.load(open(sys.argv[1]))
+print(value["node_id"], value["node_epoch"], value["data_endpoint"], value["registry_generation"], value["binding_digest"], value["access_token"])
+PY
+)
+old_binding_code="$(curl -sS --noproxy '*' --max-time 3 -o "$WORK/old-binding.body" \
+    -D "$WORK/old-binding.headers" -w '%{http_code}' -X CONNECT \
+    --cacert "$TLS_DIR/ca.crt" --cert "$TLS_DIR/router.crt" --key "$TLS_DIR/router.key" \
+    -H "E2b-Sandbox-Id: $RECOVERY_SID" \
+    -H 'E2b-Sandbox-Port: 49983' \
+    -H "X-Kuasar-Node-Id: $SOURCE_NODE" \
+    -H "X-Kuasar-Node-Epoch: $SOURCE_EPOCH" \
+    -H "X-Kuasar-Storage-Generation: $SOURCE_GENERATION" \
+    -H "X-Kuasar-Binding-Digest: $SOURCE_DIGEST" \
+    -H "X-Access-Token: $SOURCE_TOKEN" \
+    "https://$SOURCE_DATA/" 2>/dev/null || true)"
+[ "$old_binding_code" = 409 ] || fail "old-generation Binding returned ${old_binding_code:-000}, expected 409"
+grep -qi '^X-Kuasar-Proxy-Error: wrong_binding' "$WORK/old-binding.headers" || \
+    fail "node proxy did not return the typed WRONG_BINDING fence"
+
+elapsed=$(($(date +%s) - STARTED_AT))
+step "PASS: final three-replica cluster rollover and recovery e2e (${elapsed}s)"

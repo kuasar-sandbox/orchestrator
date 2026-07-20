@@ -88,6 +88,9 @@ type Build struct {
 	// this template.
 	Metadata map[string]string
 	Builder  BuildOptions
+	// TriggerDigest fences the first accepted trigger payload. It is empty until
+	// POST .../builds/{build_id} succeeds and immutable afterwards.
+	TriggerDigest string
 
 	CreatedUnix int64
 }

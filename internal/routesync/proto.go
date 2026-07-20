@@ -16,7 +16,7 @@
 // The initial route set is streamed one Upsert per sandbox, then a Bookmark marks
 // "initial sync complete" — no materialized all-routes frame (bounded send-side
 // memory at high sandbox density). The subscriber applies the stream against a sync
-// generation and, on the Bookmark, drops entries it did not see this stream (which
+// epoch and, on the Bookmark, drops entries it did not see this stream (which
 // recovers deletions that happened while it was disconnected.
 //
 // On a Wake the orchestrator resumes the sandbox (single-flight) and the resulting
@@ -50,7 +50,6 @@ func PluginRegisterPath(id string) string { return pluginPathPrefix + id + "/reg
 const (
 	KindRoute     = "route"      // route stream only (observer)
 	KindRouteWake = "route_wake" // route stream + this subscriber issues Wakes (a proxy)
-	KindRegistry  = "registry"   // cluster registry subscribing to a node's routes (node.md §10)
 )
 
 // RouteEntry.State values (mirror internal/types.State string values).
@@ -74,19 +73,19 @@ const (
 // so a proxy can serve the data plane on its own (no per-request callback). State
 // "paused"/missing makes the proxy send a Wake; "running" lets it forward.
 type RouteEntry struct {
-	SandboxID         string `json:"sid"`
-	NodeID            string `json:"node_id,omitempty"`
-	NodeEpoch         uint64 `json:"node_epoch,omitempty"`
-	StorageGeneration string `json:"storage_generation,omitempty"`
-	BindingDigest     string `json:"binding_digest,omitempty"`
-	EventSeq          uint64 `json:"event_seq,omitempty"`
-	Profile           string `json:"profile"`                // "e2b" | "bare"
-	TemplateID        string `json:"template_id,omitempty"`  // for MMDS envID (proxy-served metadata)
-	State             string `json:"state"`                  // "running" | "paused" | "dead"
-	EnvdUDS           string `json:"envd_uds,omitempty"`     // e2b control port 49983
-	CiUDS             string `json:"ci_uds,omitempty"`       // e2b code-interpreter port 49999
-	FloatingIP        string `json:"floatingip,omitempty"`   // host-reachable addr for user ports
-	AccessToken       string `json:"access_token,omitempty"` // envdAccessToken; X-Access-Token must match
+	SandboxID          string `json:"sid"`
+	NodeID             string `json:"node_id,omitempty"`
+	NodeEpoch          uint64 `json:"node_epoch,omitempty"`
+	RegistryGeneration string `json:"registry_generation,omitempty"`
+	BindingDigest      string `json:"binding_digest,omitempty"`
+	EventSeq           uint64 `json:"event_seq,omitempty"`
+	Profile            string `json:"profile"`                // "e2b" | "bare"
+	TemplateID         string `json:"template_id,omitempty"`  // for MMDS envID (proxy-served metadata)
+	State              string `json:"state"`                  // "running" | "paused" | "dead"
+	EnvdUDS            string `json:"envd_uds,omitempty"`     // e2b control port 49983
+	CiUDS              string `json:"ci_uds,omitempty"`       // e2b code-interpreter port 49999
+	FloatingIP         string `json:"floatingip,omitempty"`   // host-reachable addr for user ports
+	AccessToken        string `json:"access_token,omitempty"` // envdAccessToken; X-Access-Token must match
 	// TrafficAccessToken is the SDK compatibility token returned by create. It is
 	// reported by the node route authority and preserved by route_link, but is not
 	// used as the data-plane X-Access-Token.
@@ -104,13 +103,13 @@ type RouteEntry struct {
 
 // RouteWake identifies the exact paused execution a proxy observed. A wake is
 // only a hint to resume that execution; it must never authorize a resume after
-// the node epoch, storage generation, or system-owned Binding has changed.
+// the node epoch, Registry History Generation, or system-owned Binding has changed.
 type RouteWake struct {
-	SandboxID         string `json:"sid"`
-	NodeID            string `json:"node_id,omitempty"`
-	NodeEpoch         uint64 `json:"node_epoch,omitempty"`
-	StorageGeneration string `json:"storage_generation,omitempty"`
-	BindingDigest     string `json:"binding_digest,omitempty"`
+	SandboxID          string `json:"sid"`
+	NodeID             string `json:"node_id,omitempty"`
+	NodeEpoch          uint64 `json:"node_epoch,omitempty"`
+	RegistryGeneration string `json:"registry_generation,omitempty"`
+	BindingDigest      string `json:"binding_digest,omitempty"`
 }
 
 // Policy is the operational policy the orchestrator pushes to a proxy at handshake
@@ -130,18 +129,15 @@ type Msg struct {
 	Route    *RouteEntry `json:"route,omitempty"`    // upsert
 	Wake     *RouteWake  `json:"wake,omitempty"`     // wake
 	SID      string      `json:"sid,omitempty"`      // delete | command target
-	// Cluster node-link variants (node.md §10): node_register / heartbeat / cmd_ack
-	// flow node -> registry; command flows registry -> node; rev stamps down events.
+	// Final cluster node-link variants. Node registration, load and durable facts
+	// flow to the Holder; fenced commands and acknowledgements flow both ways.
 	NodeReg        *NodeRegister          `json:"node_register,omitempty"`
-	Beat           *Heartbeat             `json:"heartbeat,omitempty"`
 	Load           *PlacementLoadSnapshot `json:"placement_load,omitempty"`
 	Cmd            *Command               `json:"command,omitempty"`
 	Ack            *CmdAck                `json:"cmd_ack,omitempty"`
-	Rev            int64                  `json:"rev,omitempty"` // per-shard monotonic revision for resume_from (§5.3)
 	RevToken       string                 `json:"rev_token,omitempty"`
 	FullSync       bool                   `json:"full_sync,omitempty"`       // bookmark follows a full snapshot, not an incremental replay
-	Build          *BuildEvent            `json:"build_event,omitempty"`     // legacy node -> registry Build state
-	ExecutionEvent *ExecutionEvent        `json:"execution_event,omitempty"` // durable final Sandbox/Build event
+	ExecutionEvent *ExecutionEvent        `json:"execution_event,omitempty"` // durable Sandbox event
 	EventAck       *EventAck              `json:"event_ack,omitempty"`       // registry -> node durable event acknowledgement
 }
 

@@ -1,0 +1,600 @@
+package controlplane
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/kuasar-sandbox/orchestrator/internal/placement"
+	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
+	"github.com/kuasar-sandbox/orchestrator/internal/session"
+)
+
+const (
+	sessionDeltaPath    = "/internal/session-directory/delta"
+	sessionSnapshotPath = "/internal/session-directory/snapshot"
+	sessionProbePath    = "/internal/session-holder/probe"
+	sessionDispatchPath = "/internal/session-holder/dispatch"
+	sessionCommandPath  = "/internal/session-holder/command"
+	sessionRecoveryPath = "/internal/session-holder/recovery-command"
+	maximumSessionRPC   = 1 << 20
+)
+
+type SessionPeer struct {
+	MemberID string
+	Endpoint string
+	Client   *http.Client
+}
+
+type SessionMesh struct {
+	self      string
+	directory *session.Directory
+	peers     map[string]SessionPeer
+	log       *slog.Logger
+
+	holderMu sync.RWMutex
+	holder   *session.Holder
+	deltas   chan session.DirectoryDelta
+
+	healthMu  sync.RWMutex
+	healthSeq atomic.Uint64
+	health    map[string]peerHealth
+}
+
+type peerHealth struct {
+	attempt   uint64
+	available bool
+}
+
+func NewSessionMesh(self string, directory *session.Directory, peers []SessionPeer, log *slog.Logger) (*SessionMesh, error) {
+	if self == "" || directory == nil {
+		return nil, errors.New("controlplane: Session mesh requires local member and Directory")
+	}
+	if log == nil {
+		log = slog.Default()
+	}
+	byID := make(map[string]SessionPeer, len(peers))
+	for _, peer := range peers {
+		peer.Endpoint = strings.TrimRight(peer.Endpoint, "/")
+		if peer.MemberID == "" || peer.MemberID == self || peer.Endpoint == "" || peer.Client == nil {
+			return nil, errors.New("controlplane: Session mesh peer is incomplete or local")
+		}
+		if _, duplicate := byID[peer.MemberID]; duplicate {
+			return nil, errors.New("controlplane: duplicate Session mesh peer")
+		}
+		byID[peer.MemberID] = peer
+	}
+	health := make(map[string]peerHealth, len(byID))
+	for memberID := range byID {
+		health[memberID] = peerHealth{available: true}
+	}
+	return &SessionMesh{
+		self: self, directory: directory, peers: byID, log: log,
+		deltas: make(chan session.DirectoryDelta, 4096), health: health,
+	}, nil
+}
+
+// MemberAvailable is a fail-fast hint for assigning a new or reconnecting
+// node-link session. It never moves a live session or changes consensus state.
+func (m *SessionMesh) MemberAvailable(memberID string) bool {
+	if memberID == m.self {
+		return true
+	}
+	m.healthMu.RLock()
+	health, found := m.health[memberID]
+	m.healthMu.RUnlock()
+	return found && health.available
+}
+
+func (m *SessionMesh) recordPeerHealth(memberID string, attempt uint64, available bool) {
+	m.healthMu.Lock()
+	current, found := m.health[memberID]
+	if found && attempt >= current.attempt {
+		m.health[memberID] = peerHealth{attempt: attempt, available: available}
+	}
+	m.healthMu.Unlock()
+}
+
+func (m *SessionMesh) SetHolder(holder *session.Holder) {
+	m.holderMu.Lock()
+	m.holder = holder
+	m.holderMu.Unlock()
+}
+
+func (m *SessionMesh) localHolder() (*session.Holder, error) {
+	m.holderMu.RLock()
+	holder := m.holder
+	m.holderMu.RUnlock()
+	if holder == nil {
+		return nil, errors.New("controlplane: local Session Holder is unavailable")
+	}
+	return holder, nil
+}
+
+func (m *SessionMesh) PublishSessionDelta(delta session.DirectoryDelta) {
+	m.directory.Apply(delta)
+	select {
+	case m.deltas <- delta:
+	default:
+		// Periodic full anti-entropy repairs a dropped hint.
+	}
+}
+
+func (m *SessionMesh) Run(ctx context.Context, antiEntropyInterval time.Duration) {
+	if antiEntropyInterval <= 0 {
+		antiEntropyInterval = 2 * time.Second
+	}
+	ticker := time.NewTicker(antiEntropyInterval)
+	defer ticker.Stop()
+	m.pullSnapshots(ctx)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case delta := <-m.deltas:
+			m.broadcastDelta(ctx, delta)
+		case <-ticker.C:
+			m.pullSnapshots(ctx)
+		}
+	}
+}
+
+func (m *SessionMesh) Mount(mux *http.ServeMux) {
+	mux.HandleFunc(sessionDeltaPath, m.serveDelta)
+	mux.HandleFunc(sessionSnapshotPath, m.serveSnapshot)
+	mux.HandleFunc(sessionProbePath, m.serveProbe)
+	mux.HandleFunc(sessionDispatchPath, m.serveDispatch)
+	mux.HandleFunc(sessionCommandPath, m.serveCommand)
+	mux.HandleFunc(sessionRecoveryPath, m.serveRecoveryCommand)
+}
+
+func (m *SessionMesh) ProbePlacementBatch(
+	ctx context.Context,
+	holderID string,
+	identity session.ServeIdentity,
+	requests []placement.PlacementProbeRequest,
+) ([]placement.PlacementProbeResponse, error) {
+	if holderID == m.self {
+		holder, err := m.localHolder()
+		if err != nil {
+			return nil, err
+		}
+		calls := make([]session.ProbeCall, len(requests))
+		for index := range requests {
+			calls[index] = session.ProbeCall{ServeIdentity: identity, Request: requests[index]}
+		}
+		return holder.ProbeBatch(ctx, calls), nil
+	}
+	peer, ok := m.peers[holderID]
+	if !ok {
+		return nil, session.ErrSessionUnavailable
+	}
+	var response probeRPCResponse
+	err := postSessionJSON(ctx, peer, sessionProbePath, probeRPCRequest{Identity: identity, Requests: requests}, &response)
+	if err != nil {
+		return nil, err
+	}
+	if response.Error != "" {
+		return nil, decodeSessionRPCError(response.Code, response.Error)
+	}
+	return response.Responses, nil
+}
+
+func (m *SessionMesh) AdmitAndDispatchAt(
+	ctx context.Context,
+	holderID string,
+	command session.DispatchCommand,
+) (session.DispatchReply, error) {
+	if holderID == m.self {
+		holder, err := m.localHolder()
+		if err != nil {
+			return session.DispatchReply{}, err
+		}
+		return holder.AdmitAndDispatch(ctx, command)
+	}
+	peer, ok := m.peers[holderID]
+	if !ok {
+		return session.DispatchReply{}, session.ErrSessionUnavailable
+	}
+	var response dispatchRPCResponse
+	err := postSessionJSON(ctx, peer, sessionDispatchPath, dispatchRPCRequest{Command: command}, &response)
+	if err != nil {
+		return session.DispatchReply{}, err
+	}
+	if response.Error != "" {
+		return session.DispatchReply{}, decodeSessionRPCError(response.Code, response.Error)
+	}
+	return response.Reply, nil
+}
+
+func (m *SessionMesh) SendNodeCommandAt(
+	ctx context.Context,
+	holderID string,
+	identity session.ServeIdentity,
+	nodeID string,
+	nodeEpoch uint64,
+	dataEndpoint string,
+	command *routesync.Command,
+) (routesync.CmdAck, bool, error) {
+	request := commandRPCRequest{
+		Identity: identity, NodeID: nodeID, NodeEpoch: nodeEpoch,
+		DataEndpoint: dataEndpoint, Command: command,
+	}
+	if holderID == m.self {
+		holder, err := m.localHolder()
+		if err != nil {
+			return routesync.CmdAck{}, false, err
+		}
+		return holder.SendNodeCommand(ctx, identity, nodeID, nodeEpoch, dataEndpoint, command)
+	}
+	peer, ok := m.peers[holderID]
+	if !ok {
+		return routesync.CmdAck{}, false, session.ErrSessionUnavailable
+	}
+	var response commandRPCResponse
+	err := postSessionJSON(ctx, peer, sessionCommandPath, request, &response)
+	if err != nil {
+		return routesync.CmdAck{}, true, err
+	}
+	if response.Error != "" {
+		return response.Ack, response.Sent, decodeSessionRPCError(response.Code, response.Error)
+	}
+	return response.Ack, response.Sent, nil
+}
+
+func (m *SessionMesh) SendNodeCommand(
+	ctx context.Context,
+	identity session.ServeIdentity,
+	nodeID string,
+	nodeEpoch uint64,
+	dataEndpoint string,
+	command *routesync.Command,
+) (routesync.CmdAck, bool, error) {
+	entry, found := m.directory.Lookup(nodeID)
+	if !found {
+		return routesync.CmdAck{}, false, session.ErrSessionUnavailable
+	}
+	if entry.NodeEpoch > nodeEpoch {
+		return routesync.CmdAck{}, false, session.ErrStaleSession
+	}
+	if entry.NodeEpoch < nodeEpoch {
+		return routesync.CmdAck{}, false, session.ErrSessionUnavailable
+	}
+	return m.SendNodeCommandAt(ctx, entry.HolderMemberID, identity, nodeID, nodeEpoch, dataEndpoint, command)
+}
+
+func (m *SessionMesh) SendRecoveryCommandAt(
+	ctx context.Context,
+	holderID string,
+	identity session.ServeIdentity,
+	nodeID string,
+	nodeEpoch uint64,
+	dataEndpoint string,
+	command *routesync.Command,
+) (routesync.CmdAck, bool, error) {
+	request := commandRPCRequest{
+		Identity: identity, NodeID: nodeID, NodeEpoch: nodeEpoch,
+		DataEndpoint: dataEndpoint, Command: command,
+	}
+	if holderID == m.self {
+		holder, err := m.localHolder()
+		if err != nil {
+			return routesync.CmdAck{}, false, err
+		}
+		return holder.SendRecoveryCommand(ctx, identity, nodeID, nodeEpoch, dataEndpoint, command)
+	}
+	peer, ok := m.peers[holderID]
+	if !ok {
+		return routesync.CmdAck{}, false, session.ErrSessionUnavailable
+	}
+	var response commandRPCResponse
+	err := postSessionJSON(ctx, peer, sessionRecoveryPath, request, &response)
+	if err != nil {
+		return routesync.CmdAck{}, true, err
+	}
+	if response.Error != "" {
+		return response.Ack, response.Sent, decodeSessionRPCError(response.Code, response.Error)
+	}
+	return response.Ack, response.Sent, nil
+}
+
+func (m *SessionMesh) SendRecoveryCommand(
+	ctx context.Context,
+	identity session.ServeIdentity,
+	nodeID string,
+	nodeEpoch uint64,
+	dataEndpoint string,
+	command *routesync.Command,
+) (routesync.CmdAck, bool, error) {
+	entry, found := m.directory.Lookup(nodeID)
+	if !found {
+		return routesync.CmdAck{}, false, session.ErrSessionUnavailable
+	}
+	if entry.NodeEpoch > nodeEpoch {
+		return routesync.CmdAck{}, false, session.ErrStaleSession
+	}
+	if entry.NodeEpoch < nodeEpoch {
+		return routesync.CmdAck{}, false, session.ErrSessionUnavailable
+	}
+	return m.SendRecoveryCommandAt(ctx, entry.HolderMemberID, identity, nodeID, nodeEpoch, dataEndpoint, command)
+}
+
+func (m *SessionMesh) serveDelta(w http.ResponseWriter, request *http.Request) {
+	if request.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var delta session.DirectoryDelta
+	if err := decodeSessionJSON(request.Body, &delta); err != nil || !m.directory.Apply(delta) {
+		if err != nil {
+			http.Error(w, "invalid Session Directory delta", http.StatusBadRequest)
+			return
+		}
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (m *SessionMesh) serveSnapshot(w http.ResponseWriter, request *http.Request) {
+	if request.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	writeSessionJSON(w, http.StatusOK, m.directory.Snapshot())
+}
+
+func (m *SessionMesh) serveProbe(w http.ResponseWriter, request *http.Request) {
+	if request.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var input probeRPCRequest
+	if err := decodeSessionJSON(request.Body, &input); err != nil || len(input.Requests) == 0 || len(input.Requests) > 2 {
+		writeSessionJSON(w, http.StatusBadRequest, probeRPCResponse{Error: "invalid Probe request", Code: "INVALID"})
+		return
+	}
+	holder, err := m.localHolder()
+	if err != nil {
+		writeSessionJSON(w, http.StatusServiceUnavailable, probeRPCResponse{Error: err.Error(), Code: sessionErrorCode(err)})
+		return
+	}
+	calls := make([]session.ProbeCall, len(input.Requests))
+	for index := range input.Requests {
+		calls[index] = session.ProbeCall{ServeIdentity: input.Identity, Request: input.Requests[index]}
+	}
+	writeSessionJSON(w, http.StatusOK, probeRPCResponse{Responses: holder.ProbeBatch(request.Context(), calls)})
+}
+
+func (m *SessionMesh) serveDispatch(w http.ResponseWriter, request *http.Request) {
+	if request.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var input dispatchRPCRequest
+	if err := decodeSessionJSON(request.Body, &input); err != nil {
+		writeSessionJSON(w, http.StatusBadRequest, dispatchRPCResponse{Error: "invalid dispatch request", Code: "INVALID"})
+		return
+	}
+	holder, err := m.localHolder()
+	if err == nil {
+		var reply session.DispatchReply
+		reply, err = holder.AdmitAndDispatch(request.Context(), input.Command)
+		if err == nil {
+			writeSessionJSON(w, http.StatusOK, dispatchRPCResponse{Reply: reply})
+			return
+		}
+	}
+	writeSessionJSON(w, http.StatusConflict, dispatchRPCResponse{Error: err.Error(), Code: sessionErrorCode(err)})
+}
+
+func (m *SessionMesh) serveCommand(w http.ResponseWriter, request *http.Request) {
+	if request.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var input commandRPCRequest
+	if err := decodeSessionJSON(request.Body, &input); err != nil || input.Command == nil {
+		writeSessionJSON(w, http.StatusBadRequest, commandRPCResponse{Error: "invalid node command", Code: "INVALID"})
+		return
+	}
+	holder, err := m.localHolder()
+	if err != nil {
+		writeSessionJSON(w, http.StatusServiceUnavailable, commandRPCResponse{Error: err.Error(), Code: sessionErrorCode(err)})
+		return
+	}
+	ack, sent, err := holder.SendNodeCommand(
+		request.Context(), input.Identity, input.NodeID, input.NodeEpoch, input.DataEndpoint, input.Command,
+	)
+	response := commandRPCResponse{Ack: ack, Sent: sent}
+	if err != nil {
+		response.Error, response.Code = err.Error(), sessionErrorCode(err)
+	}
+	writeSessionJSON(w, http.StatusOK, response)
+}
+
+func (m *SessionMesh) serveRecoveryCommand(w http.ResponseWriter, request *http.Request) {
+	if request.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var input commandRPCRequest
+	if err := decodeSessionJSON(request.Body, &input); err != nil || input.Command == nil {
+		writeSessionJSON(w, http.StatusBadRequest, commandRPCResponse{Error: "invalid recovery command", Code: "INVALID"})
+		return
+	}
+	holder, err := m.localHolder()
+	if err != nil {
+		writeSessionJSON(w, http.StatusServiceUnavailable, commandRPCResponse{Error: err.Error(), Code: sessionErrorCode(err)})
+		return
+	}
+	ack, sent, err := holder.SendRecoveryCommand(
+		request.Context(), input.Identity, input.NodeID, input.NodeEpoch, input.DataEndpoint, input.Command,
+	)
+	response := commandRPCResponse{Ack: ack, Sent: sent}
+	if err != nil {
+		response.Error, response.Code = err.Error(), sessionErrorCode(err)
+	}
+	writeSessionJSON(w, http.StatusOK, response)
+}
+
+func (m *SessionMesh) broadcastDelta(ctx context.Context, delta session.DirectoryDelta) {
+	for _, peer := range m.peers {
+		peer := peer
+		go func() {
+			timeout, cancel := context.WithTimeout(ctx, time.Second)
+			defer cancel()
+			if err := postSessionJSON(timeout, peer, sessionDeltaPath, delta, nil); err != nil && ctx.Err() == nil {
+				m.log.Debug("Session Directory delta delivery failed", "member", peer.MemberID, "err", err)
+			}
+		}()
+	}
+}
+
+func (m *SessionMesh) pullSnapshots(ctx context.Context) {
+	for _, peer := range m.peers {
+		peer := peer
+		attempt := m.healthSeq.Add(1)
+		go func() {
+			timeout, cancel := context.WithTimeout(ctx, time.Second)
+			defer cancel()
+			request, err := http.NewRequestWithContext(timeout, http.MethodGet, peer.Endpoint+sessionSnapshotPath, nil)
+			if err != nil {
+				m.recordPeerHealth(peer.MemberID, attempt, false)
+				return
+			}
+			response, err := peer.Client.Do(request)
+			if err != nil {
+				m.recordPeerHealth(peer.MemberID, attempt, false)
+				m.directory.MarkMemberUnavailable(peer.MemberID)
+				return
+			}
+			defer response.Body.Close()
+			if response.StatusCode != http.StatusOK {
+				m.recordPeerHealth(peer.MemberID, attempt, false)
+				m.directory.MarkMemberUnavailable(peer.MemberID)
+				return
+			}
+			var records []session.DirectoryRecord
+			if err := decodeSessionJSON(response.Body, &records); err != nil {
+				m.recordPeerHealth(peer.MemberID, attempt, false)
+				m.directory.MarkMemberUnavailable(peer.MemberID)
+				return
+			}
+			m.directory.MergeFull(records)
+			m.recordPeerHealth(peer.MemberID, attempt, true)
+		}()
+	}
+}
+
+type probeRPCRequest struct {
+	Identity session.ServeIdentity             `json:"identity"`
+	Requests []placement.PlacementProbeRequest `json:"requests"`
+}
+
+type probeRPCResponse struct {
+	Responses []placement.PlacementProbeResponse `json:"responses,omitempty"`
+	Code      string                             `json:"code,omitempty"`
+	Error     string                             `json:"error,omitempty"`
+}
+
+type dispatchRPCRequest struct {
+	Command session.DispatchCommand `json:"command"`
+}
+
+type dispatchRPCResponse struct {
+	Reply session.DispatchReply `json:"reply"`
+	Code  string                `json:"code,omitempty"`
+	Error string                `json:"error,omitempty"`
+}
+
+type commandRPCRequest struct {
+	Identity     session.ServeIdentity `json:"identity"`
+	NodeID       string                `json:"node_id"`
+	NodeEpoch    uint64                `json:"node_epoch"`
+	DataEndpoint string                `json:"data_endpoint"`
+	Command      *routesync.Command    `json:"command"`
+}
+
+type commandRPCResponse struct {
+	Ack   routesync.CmdAck `json:"ack"`
+	Sent  bool             `json:"sent"`
+	Code  string           `json:"code,omitempty"`
+	Error string           `json:"error,omitempty"`
+}
+
+func postSessionJSON(ctx context.Context, peer SessionPeer, path string, input, output any) error {
+	raw, err := json.Marshal(input)
+	if err != nil {
+		return err
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, peer.Endpoint+path, bytes.NewReader(raw))
+	if err != nil {
+		return err
+	}
+	request.Header.Set("Content-Type", "application/json")
+	response, err := peer.Client.Do(request)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return fmt.Errorf("controlplane: Session RPC returned %s", response.Status)
+	}
+	if output == nil || response.StatusCode == http.StatusNoContent {
+		return nil
+	}
+	return decodeSessionJSON(response.Body, output)
+}
+
+func decodeSessionJSON(reader io.Reader, target any) error {
+	decoder := json.NewDecoder(io.LimitReader(reader, maximumSessionRPC+1))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
+		return err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return errors.New("controlplane: Session RPC has trailing JSON")
+	}
+	return nil
+}
+
+func writeSessionJSON(w http.ResponseWriter, status int, value any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(value)
+}
+
+func sessionErrorCode(err error) string {
+	switch {
+	case errors.Is(err, session.ErrStaleSession):
+		return "STALE_SESSION"
+	case errors.Is(err, session.ErrSessionUnavailable):
+		return "SESSION_UNAVAILABLE"
+	case errors.Is(err, session.ErrPermitUnavailable):
+		return "PERMIT_UNAVAILABLE"
+	default:
+		return "FAILED"
+	}
+}
+
+func decodeSessionRPCError(code, message string) error {
+	switch code {
+	case "STALE_SESSION":
+		return fmt.Errorf("%w: %s", session.ErrStaleSession, message)
+	case "SESSION_UNAVAILABLE":
+		return fmt.Errorf("%w: %s", session.ErrSessionUnavailable, message)
+	case "PERMIT_UNAVAILABLE":
+		return fmt.Errorf("%w: %s", session.ErrPermitUnavailable, message)
+	default:
+		return errors.New(message)
+	}
+}

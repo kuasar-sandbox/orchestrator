@@ -28,17 +28,18 @@ const (
 	PermitHolderEvent
 	PermitHolderEventAck
 	PermitRouterCacheForward
+	PermitHolderRecovery
 )
 
 type PermitIdentity struct {
-	ClusterID         string `json:"cluster_id"`
-	StorageGeneration string `json:"storage_generation"`
-	SystemEpoch       uint64 `json:"system_epoch"`
-	ManifestDigest    string `json:"manifest_digest"`
+	ClusterID            string `json:"cluster_id"`
+	RegistryGeneration   string `json:"registry_generation"`
+	SystemEpoch          uint64 `json:"system_epoch"`
+	RegistryLayoutDigest string `json:"registry_layout_digest"`
 }
 
 func (i PermitIdentity) Validate() error {
-	if i.ClusterID == "" || i.StorageGeneration == "" || i.SystemEpoch == 0 || !isSHA256(i.ManifestDigest) {
+	if i.ClusterID == "" || i.RegistryGeneration == "" || i.SystemEpoch == 0 || !isSHA256(i.RegistryLayoutDigest) {
 		return errors.New("raftstore: incomplete permit identity")
 	}
 	return nil
@@ -94,14 +95,19 @@ func (p ServePermit) Authorize(now time.Time, identity PermitIdentity, operation
 	if p.Grant.PermitIdentity != identity {
 		return ErrPermitMismatch
 	}
-	if !p.Grant.ServeGate || !p.Grant.CutoverGate || !p.Grant.RecoveryClosed {
-		return ErrPermitDenied
-	}
 	switch operation {
-	case PermitRegistryRead, PermitHolderProbe, PermitRouterCacheForward:
+	case PermitHolderRecovery:
+		if p.Grant.RecoveryClosed || p.Grant.ServeGate || p.Grant.WriteGate || p.Grant.CutoverGate {
+			return ErrPermitDenied
+		}
 		return nil
+	case PermitRegistryRead, PermitHolderProbe, PermitRouterCacheForward:
+		if p.Grant.ServeGate && p.Grant.CutoverGate && p.Grant.RecoveryClosed {
+			return nil
+		}
+		return ErrPermitDenied
 	case PermitRegistryWrite, PermitHolderDispatch, PermitHolderEvent, PermitHolderEventAck:
-		if !p.Grant.WriteGate {
+		if !p.Grant.ServeGate || !p.Grant.WriteGate || !p.Grant.CutoverGate || !p.Grant.RecoveryClosed {
 			return ErrPermitDenied
 		}
 		return nil
@@ -111,12 +117,12 @@ func (p ServePermit) Authorize(now time.Time, identity PermitIdentity, operation
 }
 
 type PermitCache struct {
-	mu             sync.RWMutex
-	now            func() time.Time
-	permits        map[PermitIdentity]ServePermit
-	clusterID      string
-	generation     string
-	retiredThrough uint64
+	mu                 sync.RWMutex
+	now                func() time.Time
+	permits            map[PermitIdentity]ServePermit
+	clusterID          string
+	registryGeneration string
+	retiredThrough     uint64
 }
 
 func NewPermitCache(now func() time.Time) *PermitCache {
@@ -135,9 +141,9 @@ func (c *PermitCache) Install(grant PermitGrant, proposalStarted time.Time) erro
 	defer c.mu.Unlock()
 	if c.clusterID == "" {
 		c.clusterID = grant.ClusterID
-		c.generation = grant.StorageGeneration
-	} else if c.clusterID != grant.ClusterID || c.generation != grant.StorageGeneration {
-		return errors.New("raftstore: Serve Permit cache belongs to another storage generation")
+		c.registryGeneration = grant.RegistryGeneration
+	} else if c.clusterID != grant.ClusterID || c.registryGeneration != grant.RegistryGeneration {
+		return errors.New("raftstore: Serve Permit cache belongs to another Registry History Generation")
 	}
 	current, found := c.permits[grant.PermitIdentity]
 	if found && current.Grant.CommitIndex > grant.CommitIndex {
@@ -161,7 +167,7 @@ func (c *PermitCache) Install(grant PermitGrant, proposalStarted time.Time) erro
 	if !found && len(c.permits) == maximumCachedServePermits {
 		now := c.now()
 		for identity, installed := range c.permits {
-			if !now.Before(installed.expiresAt) {
+			if !now.Before(installed.expiresAt) || permitGrantHasNoAuthority(installed.Grant) {
 				if installed.Grant.CommitIndex > c.retiredThrough {
 					c.retiredThrough = installed.Grant.CommitIndex
 				}
@@ -177,6 +183,10 @@ func (c *PermitCache) Install(grant PermitGrant, proposalStarted time.Time) erro
 	}
 	c.permits[grant.PermitIdentity] = permit
 	return nil
+}
+
+func permitGrantHasNoAuthority(grant PermitGrant) bool {
+	return !grant.ServeGate && !grant.WriteGate && !grant.CutoverGate && grant.RecoveryClosed
 }
 
 func (c *PermitCache) Authorize(identity PermitIdentity, operation PermitOperation) error {

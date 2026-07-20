@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"reflect"
 	"slices"
 	"sort"
 	"time"
@@ -14,7 +15,10 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-const fenceRetentionProofDomain = "kuasar-fence-retention-proof-v1\x00"
+const (
+	fenceRetentionProofDomain = "kuasar-fence-retention-proof-v1\x00"
+	nodeEpochFenceProofDomain = "kuasar-node-epoch-fence-proof-v1\x00"
+)
 
 type FenceOutboxAckEvidence struct {
 	AckedWatermark uint64 `json:"acked_watermark"`
@@ -28,7 +32,7 @@ func (e FenceOutboxAckEvidence) validates(fence clusterstate.ExecutionFence) boo
 }
 
 // CompactExecutionFence waits the configured retention period from a fresh
-// strong read, proves every exact manifest voter has applied the fence, and
+// strong read, proves every exact registryLayout voter has applied the fence, and
 // then submits the only authorized compaction command path.
 func (r *Runtime) CompactExecutionFence(
 	ctx context.Context,
@@ -45,12 +49,12 @@ func (r *Runtime) CompactExecutionFence(
 		return errors.New("raftstore: execution-fence compaction identity is incomplete")
 	}
 	_, shardID, err := clusterstate.RouteShardFor(
-		group, routeKey, r.manifest.RouteBucketCount, r.manifest.VirtualShardCount,
+		group, routeKey, r.registryLayout.RouteBucketCount, r.registryLayout.VirtualShardCount,
 	)
 	if err != nil || shardID != identity.ShardID {
 		return errors.New("raftstore: execution-fence compaction targets another shard")
 	}
-	system, err := r.requireStableActiveManifest(ctx, identity.PermitIdentity)
+	system, err := r.requireStableActiveRegistryLayout(ctx, identity.PermitIdentity)
 	if err != nil {
 		return err
 	}
@@ -64,10 +68,18 @@ func (r *Runtime) CompactExecutionFence(
 	if fence == nil {
 		return errors.New("raftstore: execution fence is missing")
 	}
-	permanentlyFenced := fence.Proof.Kind == clusterstate.ProofNewerNodeEpoch ||
+	if err := r.requireFenceDetached(ctx, identity, *fence); err != nil {
+		return err
+	}
+	placementFailure := fence.PlacementFailure != nil
+	proofPermanentlyFenced := fence.Proof.Kind == clusterstate.ProofNewerNodeEpoch ||
 		fence.Proof.Kind == clusterstate.ProofExternalFence
-	if !permanentlyFenced && !outboxAck.validates(*fence) {
-		return errors.New("raftstore: execution fence lacks a durable final outbox ACK")
+	nodeEpochFence, err := nodeEpochFenceEvidence(system, identity.PermitIdentity, *fence)
+	if err != nil {
+		return err
+	}
+	if !placementFailure && !proofPermanentlyFenced && !outboxAck.validates(*fence) && nodeEpochFence == nil {
+		return errors.New("raftstore: execution fence lacks a durable final outbox ACK or newer NodeEpoch proof")
 	}
 
 	wait := time.Duration(r.config.Tuning.FenceRetentionMillis) * time.Millisecond
@@ -82,13 +94,20 @@ func (r *Runtime) CompactExecutionFence(
 	if grant.PermitIdentity != identity.PermitIdentity {
 		return errors.New("raftstore: active permit identity changed during fence retention")
 	}
-	currentSystem, err := r.requireStableActiveManifest(ctx, identity.PermitIdentity)
+	currentSystem, err := r.requireStableActiveRegistryLayout(ctx, identity.PermitIdentity)
 	if err != nil {
 		return err
 	}
 	if currentSystem.SystemEpoch != system.SystemEpoch ||
-		currentSystem.ActiveManifestDigest != system.ActiveManifestDigest {
+		currentSystem.ActiveRegistryLayoutDigest != system.ActiveRegistryLayoutDigest {
 		return errors.New("raftstore: System identity changed during fence retention")
+	}
+	nodeEpochFence, err = nodeEpochFenceEvidence(currentSystem, identity.PermitIdentity, *fence)
+	if err != nil {
+		return err
+	}
+	if !placementFailure && !proofPermanentlyFenced && !outboxAck.validates(*fence) && nodeEpochFence == nil {
+		return errors.New("raftstore: newer NodeEpoch proof disappeared during fence retention")
 	}
 	currentFence, err := r.readFenceStrong(ctx, query)
 	if err != nil {
@@ -97,33 +116,44 @@ func (r *Runtime) CompactExecutionFence(
 	if currentFence == nil {
 		return nil
 	}
-	if *currentFence != *fence {
+	if !reflect.DeepEqual(*currentFence, *fence) {
 		return errors.New("raftstore: execution fence changed during retention")
+	}
+	if err := r.requireFenceDetached(ctx, identity, *currentFence); err != nil {
+		return err
 	}
 	proofs, err := r.proveFenceAppliedEverywhere(ctx, identity, *fence)
 	if err != nil {
 		return err
 	}
-	finalSystem, err := r.requireStableActiveManifest(ctx, identity.PermitIdentity)
+	finalSystem, err := r.requireStableActiveRegistryLayout(ctx, identity.PermitIdentity)
 	if err != nil {
 		return err
 	}
 	if finalSystem.SystemEpoch != currentSystem.SystemEpoch ||
-		finalSystem.ActiveManifestDigest != currentSystem.ActiveManifestDigest {
+		finalSystem.ActiveRegistryLayoutDigest != currentSystem.ActiveRegistryLayoutDigest {
 		return errors.New("raftstore: System identity changed during fence proof collection")
 	}
+	nodeEpochFence, err = nodeEpochFenceEvidence(finalSystem, identity.PermitIdentity, *fence)
+	if err != nil {
+		return err
+	}
+	if !placementFailure && !proofPermanentlyFenced && !outboxAck.validates(*fence) && nodeEpochFence == nil {
+		return errors.New("raftstore: newer NodeEpoch proof disappeared during fence proof collection")
+	}
 	retentionDigest, err := fenceRetentionProofDigest(
-		*fence, r.config.Tuning.FenceRetentionMillis, outboxAck,
+		*fence, r.config.Tuning.FenceRetentionMillis, outboxAck, nodeEpochFence,
 	)
 	if err != nil {
 		return err
 	}
 	authorization := FenceCompactionAuthorization{
 		Group: group, RouteKey: routeKey, SandboxID: sandboxID,
-		FenceRevision: fence.Revision.LogIndex, TerminalProofDigest: fence.Proof.ProofDigest,
-		FinalOutboxWatermarkAcked:  !permanentlyFenced,
-		NodeEpochPermanentlyFenced: permanentlyFenced,
-		ReplicaApplied:             proofs, RetentionProofDigest: retentionDigest,
+		FenceRevision: fence.Revision.LogIndex, TerminalProofDigest: fence.ProofDigest(),
+		FinalOutboxWatermarkAcked: placementFailure ||
+			!proofPermanentlyFenced && nodeEpochFence == nil && outboxAck.validates(*fence),
+		NodeEpochFence: nodeEpochFence,
+		ReplicaApplied: proofs, RetentionProofDigest: retentionDigest,
 	}
 	result, proposeErr := r.proposeDataRaw(ctx, DataCommand{
 		Type: DataCompactFence, Identity: identity, Compaction: &authorization,
@@ -144,7 +174,27 @@ func (r *Runtime) CompactExecutionFence(
 	return errors.New("raftstore: compacted execution fence remains visible")
 }
 
-func (r *Runtime) requireStableActiveManifest(
+func (r *Runtime) requireFenceDetached(
+	ctx context.Context,
+	identity ShardRequestIdentity,
+	fence clusterstate.ExecutionFence,
+) error {
+	result, err := r.ReadData(ctx, DataLookup{Workflow: &WorkflowLookup{
+		Identity: identity, Group: fence.Group, RouteKey: fence.RouteKey,
+	}})
+	if err != nil {
+		return err
+	}
+	if result.Workflow == nil || !result.Workflow.Available {
+		return errors.New("raftstore: execution-fence Route lookup is unavailable")
+	}
+	if result.Workflow.Route != nil && fenceMatchesRouteTombstone(fence, *result.Workflow.Route) {
+		return errors.New("raftstore: current Route still depends on the execution fence")
+	}
+	return nil
+}
+
+func (r *Runtime) requireStableActiveRegistryLayout(
 	ctx context.Context,
 	identity PermitIdentity,
 ) (SystemState, error) {
@@ -152,13 +202,13 @@ func (r *Runtime) requireStableActiveManifest(
 	if err != nil {
 		return SystemState{}, err
 	}
-	if err := r.authorizeManifestState(state); err != nil {
+	if err := r.authorizeRegistryLayoutState(state); err != nil {
 		return SystemState{}, err
 	}
 	if state.Retired || state.Recovery != nil || state.Transition != nil ||
-		state.ActiveManifestVersion != r.manifest.ManifestVersion ||
-		state.ActiveManifestDigest != r.manifestDigest || state.Identity() != identity {
-		return SystemState{}, errors.New("raftstore: execution fences compact only under a stable active manifest")
+		state.ActiveRegistryLayoutVersion != r.registryLayout.RegistryLayoutVersion ||
+		state.ActiveRegistryLayoutDigest != r.registryLayoutDigest || state.Identity() != identity {
+		return SystemState{}, errors.New("raftstore: execution fences compact only under a stable active registryLayout")
 	}
 	if err := r.permitCache.Authorize(identity, PermitRegistryWrite); err != nil {
 		return SystemState{}, err
@@ -187,12 +237,12 @@ func (r *Runtime) proveFenceAppliedEverywhere(
 	if err != nil {
 		return nil, err
 	}
-	desired := replicaIDsForPlacement(r.manifest.DataShards[identity.ShardID])
+	desired := replicaIDsForPlacement(r.registryLayout.DataShards[identity.ShardID])
 	if len(state.ServingEpochs) != 1 || state.ServingEpochs[0] != identity.PermitIdentity ||
 		!slices.Equal(state.ReplicaIDs, desired) || len(state.PreparedReplicaIDs) != 0 {
-		return nil, errors.New("raftstore: data shard is not on the exact stable manifest replica set")
+		return nil, errors.New("raftstore: data shard is not on the exact stable registryLayout replica set")
 	}
-	placements := r.manifest.DataShards[identity.ShardID].Replicas
+	placements := r.registryLayout.DataShards[identity.ShardID].Replicas
 	proofs := make([]ReplicaAppliedProof, len(placements))
 	group, groupCtx := errgroup.WithContext(ctx)
 	group.SetLimit(len(placements))
@@ -201,7 +251,7 @@ func (r *Runtime) proveFenceAppliedEverywhere(
 		group.Go(func() error {
 			request := ReplicaAppliedRequest{
 				ShardID: raftShardID, ReplicaID: placement.ReplicaID, MemberID: placement.MemberID,
-				ManifestDigest: r.manifestDigest, MinimumAppliedIndex: fence.Revision.LogIndex,
+				RegistryLayoutDigest: r.registryLayoutDigest, MinimumAppliedIndex: fence.Revision.LogIndex,
 			}
 			proof, err := r.probeReplicaApplied(groupCtx, request)
 			if err != nil {
@@ -222,23 +272,72 @@ func fenceRetentionProofDigest(
 	fence clusterstate.ExecutionFence,
 	retentionMillis uint64,
 	outboxAck FenceOutboxAckEvidence,
+	nodeEpochFence *NodeEpochFenceEvidence,
 ) (string, error) {
 	value := struct {
-		StorageGeneration string                 `json:"storage_generation"`
-		ShardID           uint32                 `json:"shard_id"`
-		FenceRevision     uint64                 `json:"fence_revision"`
-		TerminalDigest    string                 `json:"terminal_digest"`
-		RetentionMillis   uint64                 `json:"retention_millis"`
-		OutboxAck         FenceOutboxAckEvidence `json:"outbox_ack"`
+		RegistryGeneration string                  `json:"registry_generation"`
+		ShardID            uint32                  `json:"shard_id"`
+		FenceRevision      uint64                  `json:"fence_revision"`
+		TerminalDigest     string                  `json:"terminal_digest"`
+		RetentionMillis    uint64                  `json:"retention_millis"`
+		OutboxAck          FenceOutboxAckEvidence  `json:"outbox_ack"`
+		NodeEpochFence     *NodeEpochFenceEvidence `json:"node_epoch_fence,omitempty"`
 	}{
-		StorageGeneration: fence.StorageGeneration, ShardID: fence.Revision.ShardID,
-		FenceRevision: fence.Revision.LogIndex, TerminalDigest: fence.Proof.ProofDigest,
-		RetentionMillis: retentionMillis, OutboxAck: outboxAck,
+		RegistryGeneration: fence.RegistryGeneration, ShardID: fence.Revision.ShardID,
+		FenceRevision: fence.Revision.LogIndex, TerminalDigest: fence.ProofDigest(),
+		RetentionMillis: retentionMillis, OutboxAck: outboxAck, NodeEpochFence: nodeEpochFence,
 	}
 	raw, err := json.Marshal(value)
 	if err != nil {
 		return "", err
 	}
 	digest := sha256.Sum256(append([]byte(fenceRetentionProofDomain), raw...))
+	return hex.EncodeToString(digest[:]), nil
+}
+
+func nodeEpochFenceEvidence(
+	state SystemState,
+	identity PermitIdentity,
+	fence clusterstate.ExecutionFence,
+) (*NodeEpochFenceEvidence, error) {
+	if state.Identity() != identity || state.LastApplied == 0 {
+		return nil, errors.New("raftstore: NodeEpoch proof belongs to another System identity")
+	}
+	enrollment, found := state.NodeEnrollments[fence.NodeID]
+	if !found || enrollment.MaxNodeEpoch <= fence.NodeEpoch {
+		return nil, nil
+	}
+	evidence := NodeEpochFenceEvidence{
+		PermitIdentity: identity, SystemCommitIndex: state.LastApplied,
+		EnrollmentID: enrollment.EnrollmentID, EnrollmentCommitIndex: enrollment.LastAppliedIndex,
+		NodeID: fence.NodeID, FencedNodeEpoch: fence.NodeEpoch,
+		ObservedNodeEpoch: enrollment.MaxNodeEpoch, ObservedDataEndpoint: enrollment.DataEndpoint,
+	}
+	digest, err := nodeEpochFenceEvidenceDigest(evidence)
+	if err != nil {
+		return nil, err
+	}
+	evidence.ProofDigest = digest
+	return &evidence, nil
+}
+
+func (e NodeEpochFenceEvidence) validates(identity PermitIdentity, fence clusterstate.ExecutionFence) bool {
+	if e.PermitIdentity != identity || e.SystemCommitIndex == 0 || e.EnrollmentID == "" ||
+		e.EnrollmentCommitIndex == 0 || e.EnrollmentCommitIndex > e.SystemCommitIndex ||
+		e.NodeID != fence.NodeID || e.FencedNodeEpoch != fence.NodeEpoch ||
+		e.ObservedNodeEpoch <= e.FencedNodeEpoch || e.ObservedDataEndpoint == "" || !isSHA256(e.ProofDigest) {
+		return false
+	}
+	digest, err := nodeEpochFenceEvidenceDigest(e)
+	return err == nil && digest == e.ProofDigest
+}
+
+func nodeEpochFenceEvidenceDigest(evidence NodeEpochFenceEvidence) (string, error) {
+	evidence.ProofDigest = ""
+	raw, err := json.Marshal(evidence)
+	if err != nil {
+		return "", err
+	}
+	digest := sha256.Sum256(append([]byte(nodeEpochFenceProofDomain), raw...))
 	return hex.EncodeToString(digest[:]), nil
 }

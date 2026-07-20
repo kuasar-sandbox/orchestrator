@@ -1,5 +1,5 @@
 // Package orch is the orchestrator core. It ties together the store, systemd
-// launcher, vswitch and config generation, and implements api.Core (control
+// launcher, vswitch and config rendering, and implements api.Core (control
 // plane), proxy.Router (data plane) and configsock.Provider (dynamic config).
 package orch
 
@@ -27,6 +27,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/filestore"
 	"github.com/kuasar-sandbox/orchestrator/internal/keys"
 	"github.com/kuasar-sandbox/orchestrator/internal/launcher"
+	"github.com/kuasar-sandbox/orchestrator/internal/nodeexec"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxy"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
@@ -51,9 +52,8 @@ type Orchestrator struct {
 	vs  vsClient
 	log *slog.Logger
 
-	mu             sync.Mutex
-	reg            map[string]*types.Sandbox // in-memory cache (hot path: Route/LaunchSpecFor)
-	clusterCreates map[string]struct{}       // cluster creates claimed before async launch
+	mu  sync.Mutex
+	reg map[string]*types.Sandbox // in-memory cache (hot path: Route/LaunchSpecFor)
 
 	sf flightGroup // per-sid single-flight for resume (dedup concurrent data-plane wakeups)
 
@@ -75,30 +75,13 @@ type Orchestrator struct {
 	files *filestore.Store // COPY build-context object store; nil = unconfigured (COPY → 501)
 
 	clusterCtx context.Context // node-link async work lifetime (set by serve); nil = background
-	probe      ResourceProbe   // node water level for cluster heartbeat (set by serve when resource_listen on); nil = none
-
-	clusterBuildMu sync.Mutex
-	clusterBuilds  map[string]*clusterBuild   // build_id -> transient cluster image-pull creds (§7.5)
-	buildEvents    chan *routesync.BuildEvent // node -> registry build state, drained by the node-link client
-}
-
-// clusterBuild is a registry-driven build's transient image-pull context. Cluster
-// identity remains opaque in Build.Metadata and is never interpreted here.
-type clusterBuild struct {
-	imageRepo    string
-	registryAuth string
 }
 
 func New(cfg *config.Config, st *store.Store, lc launcher.Launcher, vs vsClient, log *slog.Logger) *Orchestrator {
 	o := &Orchestrator{
 		cfg: cfg, st: st, lc: lc, vs: vs, log: log,
-		reg:            map[string]*types.Sandbox{},
-		clusterCreates: map[string]struct{}{},
-		subs:           map[int]chan routesync.Event{},
-		routeFP:        uuid.NewString(),
-		pend:           map[string]*pendingBuild{},
-		clusterBuilds:  map[string]*clusterBuild{},
-		buildEvents:    make(chan *routesync.BuildEvent, 64),
+		reg: map[string]*types.Sandbox{}, subs: map[int]chan routesync.Event{},
+		routeFP: uuid.NewString(), pend: map[string]*pendingBuild{},
 	}
 	wait := cfg.Units.PoolWaitDuration()
 	o.runnerPool = newRunPool(runKindSandbox, cfg.Units.RunnerPoolSize, wait, cfg.Paths.RunRoot, lc, o.runnerUnit, log.With("pool", "runner"))
@@ -323,6 +306,11 @@ func (o *Orchestrator) Pause(ctx context.Context, id, apiKey string) error {
 // and the reaper's auto-suspend (no api key: the caller has already authorized).
 func (o *Orchestrator) pauseSandbox(ctx context.Context, sb *types.Sandbox) error {
 	if sb.State == types.StatePaused {
+		if managed, err := o.commitManagedSandboxState(ctx, sb, string(clusterstate.WorkflowRoutePaused), ""); err != nil {
+			return err
+		} else if managed {
+			return nil
+		}
 		return api.ErrAlreadyPaused
 	}
 	ref, err := o.snapshot(ctx, sb)
@@ -339,6 +327,9 @@ func (o *Orchestrator) pauseSandbox(ctx context.Context, sb *types.Sandbox) erro
 		_ = o.lc.ResetFailed(ctx, o.runnerUnit(sb.RunID))
 	}
 	_ = o.vs.Detach(ctx, sb.VswitchPort)
+	if _, err := o.commitManagedSandboxState(ctx, sb, string(clusterstate.WorkflowRoutePaused), ""); err != nil {
+		return err
+	}
 	o.publishUpsert(sb) // proxies keep the (now paused) route so traffic triggers a Wake
 	return nil
 }
@@ -438,8 +429,29 @@ func (o *Orchestrator) resume(ctx context.Context, sb *types.Sandbox) error {
 	if o.cfg.Sandbox.TimeoutSec > 0 {
 		_ = o.st.SetDeadline(ctx, nb.ID, nb.DeadlineUnix)
 	}
+	if _, err := o.commitManagedSandboxState(ctx, &nb, string(clusterstate.WorkflowRouteReady), ""); err != nil {
+		return err
+	}
 	o.publishUpsert(&nb) // unparks any proxy holding a request for this sandbox
 	return nil
+}
+
+func (o *Orchestrator) commitManagedSandboxState(ctx context.Context, sandbox *types.Sandbox, state, reason string) (bool, error) {
+	if sandbox == nil || sandbox.ID == "" {
+		return false, nil
+	}
+	workflow, err := o.st.GetNodeWorkflow(ctx, clusterstate.ExecutionKindSandbox, sandbox.ID)
+	if err != nil || workflow == nil {
+		return false, err
+	}
+	spec, err := clusterstate.ParseSandboxDispatchSpec(workflow.DispatchSpec)
+	if err != nil {
+		return true, err
+	}
+	_, err = o.st.CommitSandboxEvent(ctx, sandbox, nodeexec.EventUpdate{
+		State: state, TargetPort: spec.TargetPort, Reason: reason,
+	})
+	return true, err
 }
 
 // --- proxy.Router (internal mode) ---
@@ -502,11 +514,11 @@ func (o *Orchestrator) resumeIfPaused(ctx context.Context, sid string, request p
 }
 
 func validateSandboxRouteFence(sb *types.Sandbox, request proxy.RouteRequest) (proxy.Kind, bool) {
-	managed, nodeID, nodeEpoch, generation, digest, err := sandboxRouteFence(sb)
+	managed, nodeID, nodeEpoch, registryGeneration, digest, err := sandboxRouteFence(sb)
 	if err != nil {
 		return proxy.KindWrongBinding, true
 	}
-	return proxy.RouteFenceFailure(request, managed, nodeID, nodeEpoch, generation, digest)
+	return proxy.RouteFenceFailure(request, managed, nodeID, nodeEpoch, registryGeneration, digest)
 }
 
 func sandboxRouteFence(sb *types.Sandbox) (bool, string, uint64, string, string, error) {
@@ -528,7 +540,7 @@ func sandboxRouteFence(sb *types.Sandbox) (bool, string, uint64, string, string,
 	if err != nil {
 		return true, "", 0, "", "", err
 	}
-	return true, binding.NodeID, binding.NodeEpoch, binding.StorageGeneration, digest, nil
+	return true, binding.NodeID, binding.NodeEpoch, binding.RegistryGeneration, digest, nil
 }
 
 func currentSandboxRouteRequest(sb *types.Sandbox, port int) (proxy.RouteRequest, error) {
@@ -536,14 +548,14 @@ func currentSandboxRouteRequest(sb *types.Sandbox, port int) (proxy.RouteRequest
 	if sb != nil {
 		request.SandboxID = sb.ID
 	}
-	managed, nodeID, nodeEpoch, generation, digest, err := sandboxRouteFence(sb)
+	managed, nodeID, nodeEpoch, registryGeneration, digest, err := sandboxRouteFence(sb)
 	if err != nil {
 		return proxy.RouteRequest{}, err
 	}
 	if managed {
 		request.ExpectedNodeID = nodeID
 		request.ExpectedNodeEpoch = nodeEpoch
-		request.ExpectedStorageGeneration = generation
+		request.ExpectedRegistryGeneration = registryGeneration
 		request.ExpectedBindingDigest = digest
 	}
 	return request, nil
@@ -722,6 +734,15 @@ func (o *Orchestrator) sandboxLaunchSpec(ctx context.Context, sid string) (*conf
 			"KUASAR_SANDBOX_ID": sb.ID,
 		},
 	}
+	if o.cfg.Sandbox.Resources.ControlSocket != "" {
+		workflow, err := o.st.GetNodeWorkflow(ctx, clusterstate.ExecutionKindSandbox, sid)
+		if err != nil {
+			return nil, "", false, err
+		}
+		if workflow != nil && workflow.ReservationToken != "" {
+			spec.Env["KUASAR_RESOURCE_RESERVATION_TOKEN"] = workflow.ReservationToken
+		}
+	}
 	return spec, sb.PidFile(), true, nil
 }
 
@@ -764,6 +785,34 @@ func (o *Orchestrator) Reaper(ctx context.Context, interval time.Duration) {
 // Reconcile adopts/cleans sandboxes after an orchestrator restart, using the
 // systemd unit set as the liveness authority.
 func (o *Orchestrator) Reconcile(ctx context.Context) error {
+	builders, err := o.lc.List(ctx, o.builderPattern())
+	if err != nil {
+		return err
+	}
+	for _, unit := range builders {
+		if !strings.HasPrefix(unit.Name, strings.TrimSuffix(o.cfg.Units.Builder, ".service")) {
+			continue
+		}
+		if unit.ActiveState == "active" || unit.ActiveState == "activating" || unit.ActiveState == "failed" {
+			o.log.Info("reconcile: orphan builder", "unit", unit.Name)
+			_ = o.lc.Stop(ctx, unit.Name)
+			_ = o.lc.ResetFailed(ctx, unit.Name)
+		}
+	}
+	building, err := o.st.BuildsByStatus(ctx, types.BuildBuilding)
+	if err != nil {
+		return err
+	}
+	for _, build := range building {
+		workflow, err := o.st.GetNodeWorkflow(ctx, clusterstate.ExecutionKindBuild, build.BuildID)
+		if err != nil {
+			return err
+		}
+		if workflow == nil {
+			_, _ = o.st.CASBuildStatus(ctx, build.BuildID, types.BuildBuilding, types.BuildWaiting)
+		}
+	}
+
 	units, err := o.lc.List(ctx, o.runnerPattern())
 	if err != nil {
 		return err

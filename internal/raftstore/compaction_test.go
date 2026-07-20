@@ -3,6 +3,7 @@ package raftstore
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -29,16 +30,63 @@ func TestFenceOutboxAckMustCoverExactFinalWatermark(t *testing.T) {
 	}
 }
 
+func TestNodeEpochFenceEvidenceIsBoundToCommittedSystemIdentity(t *testing.T) {
+	identity := PermitIdentity{
+		ClusterID: "cluster-1", RegistryGeneration: "generation-1", SystemEpoch: 3,
+		RegistryLayoutDigest: strings.Repeat("a", 64),
+	}
+	fence := clusterstate.ExecutionFence{NodeID: "node-1", NodeEpoch: 7}
+	state := SystemState{
+		ClusterID: identity.ClusterID, RegistryGeneration: identity.RegistryGeneration,
+		SystemEpoch: identity.SystemEpoch, ActiveRegistryLayoutDigest: identity.RegistryLayoutDigest,
+		LastApplied: 20,
+		NodeEnrollments: map[string]NodeEnrollmentRecord{"node-1": {
+			NodeID: "node-1", EnrollmentID: "enrollment-1", MaxNodeEpoch: 8,
+			DataEndpoint: "10.0.0.1:8443", EnrollmentIndex: 10, LastAppliedIndex: 18,
+		}},
+	}
+	evidence, err := nodeEpochFenceEvidence(state, identity, fence)
+	if err != nil || evidence == nil || !evidence.validates(identity, fence) {
+		t.Fatalf("newer NodeEpoch evidence = %+v, %v", evidence, err)
+	}
+
+	for name, mutate := range map[string]func(*NodeEpochFenceEvidence){
+		"generation": func(value *NodeEpochFenceEvidence) { value.RegistryGeneration = "generation-2" },
+		"commit":     func(value *NodeEpochFenceEvidence) { value.EnrollmentCommitIndex = value.SystemCommitIndex + 1 },
+		"node":       func(value *NodeEpochFenceEvidence) { value.NodeID = "node-2" },
+		"epoch":      func(value *NodeEpochFenceEvidence) { value.ObservedNodeEpoch = value.FencedNodeEpoch },
+		"endpoint":   func(value *NodeEpochFenceEvidence) { value.ObservedDataEndpoint = "" },
+		"digest":     func(value *NodeEpochFenceEvidence) { value.ProofDigest = strings.Repeat("b", 64) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			forged := *evidence
+			mutate(&forged)
+			if forged.validates(identity, fence) {
+				t.Fatalf("forged evidence accepted: %+v", forged)
+			}
+		})
+	}
+
+	state.NodeEnrollments["node-1"] = NodeEnrollmentRecord{
+		NodeID: "node-1", EnrollmentID: "enrollment-1", MaxNodeEpoch: fence.NodeEpoch,
+		DataEndpoint: "10.0.0.1:8443", EnrollmentIndex: 10, LastAppliedIndex: 19,
+	}
+	evidence, err = nodeEpochFenceEvidence(state, identity, fence)
+	if err != nil || evidence != nil {
+		t.Fatalf("same NodeEpoch produced permanent fence = %+v, %v", evidence, err)
+	}
+}
+
 func TestRuntimeCompactsFenceOnlyAfterRetentionAndEveryReplicaProof(t *testing.T) {
-	manifest := testManifest(1, "generation-1")
-	manifest.ServePermitMaxMillis = 1_000
-	digest, err := manifest.Digest()
+	registryLayout := testRegistryLayout(1, "generation-1")
+	registryLayout.ServePermitMaxMillis = 1_000
+	digest, err := registryLayout.Digest()
 	if err != nil {
 		t.Fatal(err)
 	}
-	identity := routeShardIdentity(t, manifest, "/g", "rk")
-	data := initializeDataShard(t, manifest, identity)
-	starting := routeStarting(t, manifest, "/g", "rk", "sandbox-1", 1, true)
+	identity := routeShardIdentity(t, registryLayout, "/g", "rk")
+	data := initializeDataShard(t, registryLayout, identity)
+	starting := routeStarting(t, registryLayout, "/g", "rk", "sandbox-1", 1, true)
 	applyDataOK(t, &data, 2, DataCommand{
 		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{Absent: true}, Route: &starting,
 	})
@@ -59,7 +107,7 @@ func TestRuntimeCompactsFenceOnlyAfterRetentionAndEveryReplicaProof(t *testing.T
 	})
 
 	system, _ := applySystem(t, SystemState{}, 1, SystemCommand{
-		Type: SystemBootstrap, Manifest: &manifest, Digest: digest,
+		Type: SystemBootstrap, RegistryLayout: &registryLayout, Digest: digest,
 	})
 	system, _ = applySystem(t, system, 2, SystemCommand{
 		Type: SystemSetGates, Gates: &GateUpdate{Serve: true, Write: true, Cutover: true},
@@ -104,7 +152,7 @@ func TestRuntimeCompactsFenceOnlyAfterRetentionAndEveryReplicaProof(t *testing.T
 	permitCache := NewPermitCache(time.Now)
 	if err := permitCache.Install(PermitGrant{
 		PermitIdentity: system.Identity(), CommitIndex: system.LastApplied,
-		MaxLifetimeMillis: manifest.ServePermitMaxMillis,
+		MaxLifetimeMillis: registryLayout.ServePermitMaxMillis,
 		ServeGate:         true, WriteGate: true, CutoverGate: true, RecoveryClosed: true,
 	}, time.Now()); err != nil {
 		t.Fatal(err)
@@ -116,22 +164,35 @@ func TestRuntimeCompactsFenceOnlyAfterRetentionAndEveryReplicaProof(t *testing.T
 			tuning.FenceRetentionMillis = 1
 			return tuning
 		}()},
-		manifest: manifest, manifestDigest: digest, member: manifest.Members[0],
+		registryLayout: registryLayout, registryLayoutDigest: digest, member: registryLayout.Members[0],
 		nodeHost: host, permitCache: permitCache,
-		enrollment: LocalEnrollment{Replicas: []LocalReplicaEnrollment{{
-			ShardID: raftShardID, ReplicaID: 1, StartPlan: ReplicaInitial,
-			LocalState: ReplicaActive,
-		}}},
+		enrollment: LocalEnrollment{Replicas: []LocalReplicaEnrollment{
+			{ShardID: SystemRaftShardID, ReplicaID: 1, StartPlan: ReplicaInitial, LocalState: ReplicaActive},
+			{ShardID: raftShardID, ReplicaID: 1, StartPlan: ReplicaInitial, LocalState: ReplicaActive},
+		}},
 		transitionClient: ReplicaTransitionClientFuncs{
 			Applied: func(_ context.Context, request ReplicaAppliedRequest) (ReplicaAppliedProof, error) {
 				remoteProofs.Add(1)
 				return ReplicaAppliedProof{
 					ShardID: request.ShardID, ReplicaID: request.ReplicaID, MemberID: request.MemberID,
-					ManifestDigest: request.ManifestDigest, AppliedIndex: data.LastApplied,
+					RegistryLayoutDigest: request.RegistryLayoutDigest, AppliedIndex: data.LastApplied,
 				}, nil
 			},
 		},
 	}
+	if err := runtime.CompactExecutionFence(
+		context.Background(), identity, "/g", "rk", "sandbox-1",
+		FenceOutboxAckEvidence{AckedWatermark: 2, ProofDigest: digestFor("outbox-ack")},
+	); err == nil {
+		t.Fatal("current Route tombstone did not retain its execution fence")
+	}
+	if remoteProofs.Load() != 0 {
+		t.Fatal("replica proofs were requested before the fence detached from its Route")
+	}
+	replacement := routeStarting(t, registryLayout, "/g", "rk", "sandbox-2", 2, false)
+	applyDataOK(t, &data, 7, DataCommand{
+		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{LogIndex: 5}, Route: &replacement,
+	})
 	if err := runtime.CompactExecutionFence(
 		context.Background(), identity, "/g", "rk", "sandbox-1",
 		FenceOutboxAckEvidence{AckedWatermark: 2, ProofDigest: digestFor("outbox-ack")},

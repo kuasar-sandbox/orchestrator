@@ -76,7 +76,7 @@ type mmapRecord struct {
 
 	SandboxID          [maxSandboxID]byte
 	NodeID             [maxNodeID]byte
-	StorageGeneration  [maxGeneration]byte
+	RegistryGeneration [maxGeneration]byte
 	BindingDigest      [maxDigest]byte
 	Profile            [maxProfile]byte
 	TemplateID         [maxTemplateID]byte
@@ -278,7 +278,7 @@ func (t *Table) Upsert(in routesync.RouteEntry) error {
 	atomic.StoreUint64(&rec.EventSeq, in.EventSeq)
 	_ = putFixed(rec.SandboxID[:], in.SandboxID)
 	_ = putFixed(rec.NodeID[:], in.NodeID)
-	_ = putFixed(rec.StorageGeneration[:], in.StorageGeneration)
+	_ = putFixed(rec.RegistryGeneration[:], in.RegistryGeneration)
 	_ = putFixed(rec.BindingDigest[:], in.BindingDigest)
 	_ = putFixed(rec.Profile[:], in.Profile)
 	_ = putFixed(rec.TemplateID[:], in.TemplateID)
@@ -315,7 +315,7 @@ func (t *Table) deleteRecord(rec *mmapRecord) {
 	atomic.StoreUint64(&rec.EventSeq, 0)
 	clearFixed(rec.SandboxID[:])
 	clearFixed(rec.NodeID[:])
-	clearFixed(rec.StorageGeneration[:])
+	clearFixed(rec.RegistryGeneration[:])
 	clearFixed(rec.BindingDigest[:])
 	clearFixed(rec.Profile[:])
 	clearFixed(rec.TemplateID[:])
@@ -453,7 +453,7 @@ func readRecord(rec *mmapRecord) (routesync.RouteEntry, uint32, bool) {
 			SandboxID:          fixedString(rec.SandboxID[:]),
 			NodeID:             fixedString(rec.NodeID[:]),
 			NodeEpoch:          atomic.LoadUint64(&rec.NodeEpoch),
-			StorageGeneration:  fixedString(rec.StorageGeneration[:]),
+			RegistryGeneration: fixedString(rec.RegistryGeneration[:]),
 			BindingDigest:      fixedString(rec.BindingDigest[:]),
 			EventSeq:           atomic.LoadUint64(&rec.EventSeq),
 			Profile:            fixedString(rec.Profile[:]),
@@ -515,7 +515,7 @@ func validateRoute(r routesync.RouteEntry) error {
 	}{
 		{"sid", r.SandboxID, maxSandboxID},
 		{"node_id", r.NodeID, maxNodeID},
-		{"storage_generation", r.StorageGeneration, maxGeneration},
+		{"registry_generation", r.RegistryGeneration, maxGeneration},
 		{"binding_digest", r.BindingDigest, maxDigest},
 		{"profile", r.Profile, maxProfile},
 		{"template_id", r.TemplateID, maxTemplateID},

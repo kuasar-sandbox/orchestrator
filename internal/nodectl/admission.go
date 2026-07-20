@@ -335,6 +335,13 @@ func (a *AdmissionController) nextTokenETA() time.Duration {
 	return time.Duration(need / rate * float64(time.Second))
 }
 
+func (a *AdmissionController) TokenAvailable() bool {
+	a.tokenMu.Lock()
+	defer a.tokenMu.Unlock()
+	a.refillLocked()
+	return a.tokens >= 1
+}
+
 // drainQueueOnStop replies Rejected to every pending entry as the worker
 // shuts down (typically daemon stop).
 func (a *AdmissionController) drainQueueOnStop() {

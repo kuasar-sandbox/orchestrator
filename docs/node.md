@@ -122,15 +122,16 @@ create 流程:建 `<run_root>/<sid>/`(tmpfs)+ `<base_root>/<sid>/`(disk)→
 WaitAssignment 取得 sid,再取 LaunchSpec(密钥经 env)后 `execve` 成 `sandbox-ctl run`
 → 起 microVM → (e2b)等 envd `/health` 就绪(60s 上限)→ `POST /init` 置 env/默认用户
 → 起 TTL。集群下,该
-create 由 node-link 的 `create` 命令触发,group / route-key 经 metadata 注入并随事件回报
+create 由 node-link 的 `sandbox_admit_dispatch` 命令触发,group / route-key 经受保护的 opaque metadata 注入并随 Sandbox 事件回报
 registry(§10、§4.6)。
 
 数据面按 `Host`(`<port>-<sid>.<domain>`)或 `E2b-Sandbox-Id`/`E2b-Sandbox-Port` 头解析
 `(sid, port)`,校验 `X-Access-Token` 后转发:e2b profile 的 49983/49999 拨 sandbox-ctl
 `--connect` 暴露的 host UDS 直达 envd;其余任意端口拨 `floatingip:port`。对 paused
 沙箱的请求触发自动 resume(单飞合并,§8)。部署形态(internal/external/off)见 §9.1,
-转发层设计见 [node-proxy.md](node-proxy.md)。集群下,数据面由 cluster-ctl router 经
-注入 `E2b-Sandbox-Id` + `X-Access-Token` 转发进本节点 proxy,节点侧零改动(cluster-router.md)。
+转发层设计见 [node-proxy.md](node-proxy.md)。集群下,数据面由 cluster-ctl router 使用 Router-role mTLS，
+并注入 concrete `E2b-Sandbox-Id`、NodeEpoch、Registry History Generation、Binding digest 与 `X-Access-Token` 后转发
+进本节点 proxy；任一 fence 不匹配都在接触 guest 前拒绝(cluster-router.md)。
 
 ## 2. 命令行接口
 
@@ -362,9 +363,10 @@ node-ctl 同目录 → PATH"自动发现。
 | `checkpoint.local_dir` | `/var/lib/sandbox-saved` | 本机快照目录(`mode=local`) |
 | `mmds.enabled` | `false` | envd 鉴权姿态开关(§9.2、node-proxy.md §8):false = `-isnotfc` + proxy 单闸门;true = FC 模式 + MMDS re-key |
 | `mmds.listen` | `127.0.0.1:19254` | MMDS 监听地址(vswitch `--mgmt-service` 的转换目标) |
+| `api.tls.client_ca` | 空 | cluster mode 必填；验证 Router-role mTLS 后才允许远程 control/data request。独立模式可省略 |
 | `cluster.node_link.endpoint` | 空 | registry 的 node_link 地址(§10);空 = 独立模式,不接入集群 |
 | `cluster.node_link.tls` | 空 | node_link mTLS 证书 / key / CA(`{cert,key,ca}`;生产必配,§10 / cluster.md) |
-| `cluster.node_id` | (接入集群必填) | 本节点唯一标识(node-link 注册,cluster.md) |
+| `cluster.node_id` | 空 | 可选的 enrolled identity 断言；权威 node ID 来自持久 `cluster-identity init` 状态 |
 | `cluster.labels` | 空 | 节点标签 `{zone,pool,slot,node}`(placer nodeSelectors 匹配,cluster-placer.md) |
 | `cluster.data_endpoint` | 空 | 本节点数据面端点(供 router 转发);缺省由 `api.domain` + `proxy`/`api` 监听推导 |
 | `resource_listen` | 缺省(不内置) | 内置资源控制器整块(调参内联,无独立文件):`enabled` 开关、`socket`(控制器 UDS,**唯一权威**;空 = `pkg/resource` 默认,与 sandbox-ctl 一致),其余 `state_path`/`audit_path`/`cgroup_scan_paths`/`resources`/`watermarks`/`rate_limits`/`admission`/`dampening` 均有默认(语义见 node-resource.md §3.2);整块省略或 `enabled: false` = 不内置(沙箱用静态 cgroup) |
@@ -808,8 +810,9 @@ internal 直接在进程内挂转发层;external 下 serve 不绑数据口,改�
 接受 proxy master 注册并向其广播路由(§9.2),数据面字节流不经 serve。两模式共用同一转发判定
 函数;部署拓扑、共享内存路由视图与确定性 MMDS 密钥(多 worker 对等)等细节见 node-proxy.md §5,
 转发判定与即时刷流见 node-proxy.md §4。集群下,cluster-ctl router 把数据面转发进本节点的
-数据端点(internal 的 `api.listen`/`data_listen` 或 external proxy master 的数据口),节点侧
-按 `E2b-Sandbox-Id` 寻址照常处理(cluster-router.md),无须区分来源。
+数据端点(internal 的 `api.listen`/`data_listen` 或 external proxy master 的数据口)。cluster endpoint 必须
+配置 `client_ca`，只接受 Router-role mTLS；节点再按 concrete `E2b-Sandbox-Id` 和完整 Binding fence 寻址
+(cluster-router.md)。
 
 ### 9.2 路由权威与广播
 
@@ -838,108 +841,116 @@ node-proxy.md §9。
 
 ## 10. 集群接入(node-link)
 
-配 `cluster.node_link.endpoint`(§3)时,`node-ctl conductor serve` 拨 registry 把本节点接入集群,交由
-`cluster-ctl registry/router/placer` 编排。node-link 复用 routesync 的帧化 JSON over h2c 引擎
-(node-proxy.md §6),但角色相反:node 是本节点路由 / 构建权威,registry 是订阅者和命令下发方。
-
-本节只讲 node 侧行为。registry 的 owner 选择、redirect/relay、shardkv 复制和 membership 变更由
-[cluster.md](cluster.md) 定义。
+配 `cluster.node_link.endpoint`(§3)时,`node-ctl conductor serve` 作为 dialer 接入 Registry Session
+Holder。node 是本机 execution、Admission、资源占用和 command dedupe 的权威；Sandbox 另维护 durable
+event outbox，Build 注册后的完整 lifecycle 只保存在 node。Registry 保存 Route workflow 与 Build
+registration binding，并下发 Binding-fenced command。完整边界见
+[cluster.md](cluster.md)。
 
 ```text
 node-ctl conductor serve
   │ dial registry node_link endpoint
-  │ register node profile
-  │ stream heartbeat + sandbox/build events
-  │ receive create/connect/delete/key/build commands
+  │ fsync SessionSeq, register enrolled node identity
+  │ stream PlacementLoadSnapshot + durable Sandbox events
+  │ receive Admission/lifecycle/recovery commands
   ▼
-registry node_link owner or relay holder
+current Registry Session Holder
 ```
 
-集群下两条到节点的路径:
-
-- **node-link**:注册、心跳、sandbox/build 事件、命令、manifest key 租约。
-- **router 转发到本节点 e2b 控制面 / 数据面**:pause/kill/timeout、build status/files 转发本机 e2b
-  控制面;数据面经 router 注入 `E2b-Sandbox-Id` + `X-Access-Token` 后进入本机 proxy(node-proxy.md)。
+node-link 承载注册、Placement snapshot、durable Sandbox event/ACK 和 command。Build 注册后，Router 的
+trigger/files/status/logs 直接访问 exact bound `data_endpoint`；Sandbox 数据面同样直连。node 在任何读取或
+副作用前校验对象 ID、NodeEpoch、Registry History Generation 与 Binding digest。
 
 ### 10.1 注册与 redirect
 
-节点拨 registry 的 node_link endpoint 后,首帧发送:
+节点必须先由 operator 显式 enrollment。NodeEpoch 是持久单调 64 位值；host reboot、本地 execution state
+reset 或 `data_endpoint` 变化时,必须在 `node-ctl` 启动前递增并 fsync。durable NodeEpoch 丢失时必须使用
+新 `node_id`。每次建连尝试前递增并 fsync `session_seq`,节点只接受当前 tuple 的 command。
+
+首帧发送:
 
 ```text
-register{
-  node_id,
-  labels,
-  capacity,
-  build_capacity,
-  data_endpoint,
-  runtime_digest,
-  accept_redirect
+node_register{
+  node_id, enrollment_id, node_epoch, session_seq,
+  labels, capabilities, failure_domain,
+  capacity, build_capacity, data_endpoint,
+  runtime_digest, load_model_version, draining
 }
 ```
 
-若接入成员不是该 node 的 node_link owner,且节点支持 redirect,registry 可返回 owner `node_advertise`
-列表。node 会按返回顺序重连 owner;失败时尝试下一个目标。若没有 redirect 目标或未启用 redirect,接入成员
-可以 relay 到首个可用 owner。
+Registry 按 verified manifest 做 reconnect rendezvous。接入成员不是目标 Holder 时返回有序 redirect targets；
+node 按顺序重连,不 relay 已建立 session。静态 enrollment/catalog 完全相同时,SessionSeq 重连只做 System
+strong read,不追加 System log。
 
-### 10.2 心跳与低频目录
+### 10.2 PlacementLoadSnapshot
 
-节点周期发送:
-
-```text
-heartbeat{zone, allocated, pool, build_alloc, counts, draining}
-```
-
-沙箱水位取自资源控制器(node-resource.md),`build_alloc` 为本机在跑 / 预留构建占用,`draining` 由节点侧
-资源 drain 或维护策略置位。普通 heartbeat 只更新 node_link profile 中的 liveness 和本地水位，不更新
-node_list；首次注册和 draining 变化驱动低频目录投影。registry node owner 持有的当前连接是 placement
-提交时唯一的存活判断。
-
-### 10.3 sandbox/build 事件
-
-节点作为权威上报本机执行态:
+节点以不超过 500ms 的周期发送,并在 Admission、launch、completion、draining 等重要变化时主动唤醒:
 
 ```text
-sandbox{sid, state, snap_loc, access_token, template_id}
-build{build_id, state, template_id?, reason?}
-delete{sid}
-bookmark{full_sync}
+placement_load{
+  node_epoch, session_seq, sample_seq, load_model_version,
+  sandbox/build capacity and usage,
+  water_zone, queue state, rate-token availability, draining
+}
 ```
 
-node 不解释 sandbox/build metadata 中的 cluster 字段。nodelink owner 在任务下发前已维护
-本节点完整的 sandbox/build 归属表,收到事件后以 `(node_id,sid)` 或
-`(node_id,build_id)` 查表取得 group/route_key。生产 ID 由 UUIDv7 或等价随机机制保证
-全局唯一,但事件处理不依赖该假设,也不存在 cluster 全局 ID 索引。
+该 snapshot 只供当前 Holder 做 request-time Probe,不是 execution authority。丢包、过期、断链或
+memberlist dead 都不能证明 command 无副作用,也不能触发 replacement。
 
-全量 Range 结束的 bookmark 带 `full_sync=true`。nodelink owner 仅将本轮出现的 sid 与
-订阅建立前捕获的本节点归属表基线比较;清理前再次确认当前表项仍与基线一致,避免删除
-同步期间新下发或重新绑定的任务。增量 replay 的 bookmark 只推进 resume token。
+### 10.3 Durable workflow 与 Sandbox event outbox
+
+Sandbox 以 SID、Build 以 `build_id` 作为唯一 Admission 幂等键。node 在 crash-consistent transaction 中
+保存 immutable demand/spec digest、protected Binding metadata、Admission decision、资源 claim 和 command
+result。Sandbox 另外保存 latest event；Build 保存 trigger digest、当前本地状态、artifact/error。
+
+```text
+same ID + same digest -> return durable prior result
+same ID + different digest -> CONFLICT
+command sent without ACK -> UNKNOWN
+```
+
+每个 Sandbox execution 保存 strictly increasing `event_seq`、latest payload 和 `acked_event_seq`。连接建立后
+立即重放未 ACK 事件,随后按 `event_replay_batch/bytes/interval` 限流。Registry 只在对应 Route mutation
+committed 后 ACK；ACK(N) 不会丢弃 pending N+1。Sandbox terminal resource release、terminal event 与
+outbox 更新必须原子提交。Build 不产生该事件流；其状态和资源释放在本地事务中原子提交。
+
+cluster 信息通过系统自动插入的 opaque ExecutionBinding metadata 保存,不改变 Sandbox/Build 模型。caller
+或 Provider 不能设置保留 key。command 与 node proxy 校验 SID/BuildID、NodeEpoch、generation 和 Binding
+digest；Registry 不能从普通 metadata 反推执行权威。
 
 ### 10.4 命令受理
 
-registry 上行下发命令。serve 复用既有 e2b 生命周期原语(§8 / §8.1)执行,以 sid / build_id 幂等,
-受理即回 `cmd_ack`,终态经 sandbox/build 事件上报:
+Registry 下发 tuple- 和 Binding-fenced command。受理结果由 durable dedupe 决定,终态经 event outbox
+上报:
 
-  | 命令 | 节点动作 |
+  | command | 节点动作 |
   |---|---|
-  | `create{cmd_id, sid, template_ref, key_fp, config}` | 冷启 `template_ref` + 保存/合并 `config`(§8;snp 模板 = 快照恢复快启);`key_fp` 选本机租约 manifest_key;cluster 身份已由 registry 放在 `config` metadata 中,node 不解析 |
-  | `connect{cmd_id, sid}` | 恢复本机 PAUSED 沙箱(§8 auto-resume) |
-  | `delete{cmd_id, sid}` | 销毁沙箱(§5 kill) |
-  | `key_put` / `key_drop{fingerprint, manifest_key?, expires_unix}` | `key_put` 写 / 重发续租 `manifest_keys` 租约项;`key_drop` best-effort 清理,正确性依赖 TTL 淘汰(§7);registry 的密钥分发见 cluster.md |
-  | `build_register{build_id, template_id, profile, resources, image_repo, registry_auth, key_fp, config}` | 预配 registry 分配的构建(§12;`profile` 必填且只接受 e2b/bare;按指纹解析 key、建 build 记录、瞬态用镜像凭据);`config` metadata 原样保存,构建态经 `build_event` 上报 |
+  | `sandbox_admit_dispatch` | durable Admission/dedupe 后排队或启动 exact SID |
+  | `build_admit_dispatch` | durable Build registration Admission/dedupe，创建 exact build ID 的本地 `registered` 对象；不触发构建 |
+  | `sandbox_resume` | Registry 主动恢复同 SID、NodeEpoch、Binding 的 PAUSED execution |
+  | `sandbox_delete` | 删除 exact bound execution |
+  | `rebind_execution` | recovery-only protected Binding digest CAS,返回 target durable object snapshot |
+  | `ack_recovery_event` | 仅 Sandbox recovery：fsync target-generation event ACK；Build 禁止该命令 |
+  | `finalize_workflow` | Sandbox final outbox ACK 后，或未接受候选 definitive reject 后完成 fencing marker finalization；不清理 accepted Build lifecycle |
+  | `collect_recovery_report` | recovery-only 分页读取 durable workflows |
 
-无 `drain` 命令。节点排空 / 维护由节点侧发起(node-resource.md §2.5 资源 drain 或本机维护策略),
-集群侧只停止向其分配。
+Build trigger/files/status/logs 不是 node-link command：Router 通过 mTLS 直连注册 node，node 先检查完整 Binding
+fence，再执行本地 trigger idempotency 和 lifecycle。node-local auto-resume 保留,但只允许同 SID、同
+NodeEpoch、同 Binding,并先提交资源状态和 durable event。
+节点排空由本地 resource drain 发起,集群只停止新 placement。
 
 ### 10.5 断线与安全
 
-断线后节点指数退避重连并重注册,带 `resume_from=<rev>` 请求增量重放。registry/node 留存窗口内只补增量,
-否则逐条全量 + bookmark。registry 重启亦然。
+断线后节点使用有界 full-jitter backoff 和新 SessionSeq 重连。断线不停止已运行数据面,也不放弃
+queued/admitted work；Holder 变化不产生第二 execution。
 
-node-link 生产走 mTLS(`cluster.node_link.tls`)。下行 `manifest_key` 只进入加密存储和运行期内存;上行
-`access_token` 属沙箱级敏感,在 mTLS 内传输。
+generation recovery 只报告 durable workflow 与 protected object Binding。Sandbox Binding CAS 后
+source-generation event ACK 被清零,target Route 必须重新获得 Registry durable ACK 才可激活。Build snapshot
+的 event_seq 固定为 0，rebind ACK 后只重建 registration binding；本地 lifecycle 原样保留。普通用户
+metadata、孤立 Sandbox 或 operator import 不进入恢复报告。
 
-接入集群与本机 plugin 平面使用同一 routesync 引擎和线格式,仅订阅者 kind 不同。router 不订阅节点
-plugin 平面,机群路由经 registry 聚合。
+node-link 生产使用 mTLS(`cluster.node_link.tls`)。execution capability、dispatch spec 和 recovery report
+只在可信通道传输,日志不得输出 payload。
 
 ## 11. guest profile:envd 与工具链
 
@@ -1140,7 +1151,7 @@ external worker 的 `data_listen`,proxy.yaml),证书同一张。dev:`E2B_API_URL
 |---|---|---|
 | `sandbox-ctl`(runtime) | 经 run-sandbox(单元)`execve`:`run --config <sid>.yaml --manifest-config … --run-root … --cgroup-adopt [--restore] [--connect]`;run-builder 以直接子进程 `run` 阶段沙箱,经 `exec --env/--stdin-from/--stdout-to` 做平台接力(flatten-ctl 调用、配置注入、工件流、探针),收尾 `snapshot --output` / `upload-snapshot` / `info --json`;serve 调 `snapshot --upload`(pause) | 非密配置文件 + 密钥 env;资源准入在其内部;e2b 语义命令不走它(走 envd,§12) |
 | 资源控制器(node-resource.md) | serve 内置(`resource_listen`,调参内联);沙箱经 `sandbox.resources.control_socket` 拨号(`pkg/resource` 协议) | 单元 cgroup 即沙箱 cgroup,控制器原地仲裁;不配 control_socket = 静态 cgroup(`--cgroup-adopt`),配了才进 SANDBOX_CONFIG `resources.control.controller` |
-| registry(cluster-ctl) | node-link:serve 拨 registry、反向注册为路由权威,上报 register/heartbeat/sandbox/build_event 事件、受理 create/connect/delete/key_put/key_drop/build_register 命令(§10、cluster.md) | mTLS;cluster kill 走 node-link delete 命令;空 `cluster.node_link.endpoint` = 独立模式不接入 |
+| registry(cluster-ctl) | node-link:serve 拨 Registry Session Holder，上报 registration/Placement snapshot/Sandbox event，受理 Admission、resume/delete、recovery 和 workflow-finalization command(§10、cluster.md) | mTLS；Build 注册后的 HTTP lifecycle 由 Router 直连 node，不走 node-link；空 `cluster.node_link.endpoint` = 独立模式 |
 | `connector-ctl vswitch`(vswitch) | 不配 `tapfd_socket` 时经 CLI:`attach <switch> --inner-ip [--transit-*]` / `detach --port`;配 `tapfd_socket` 时经常驻 `TAPFD/1 PREPARE` / `OPEN` / `RELEASE`;sandbox 配置仍渲染为 `network.tapfd.socket/request` | 交换机预先起好(`connector-ctl vswitch start/serve`,内核态数据面);port 对外、slot 内部;一个构建复用一个槽 |
 | `flatten-ctl`(builder) | **guest 内**(guest runtime 自带,经 sandbox-ctl exec 驱动):`export --output -`(import 拉取 / steps 导出)、`mountpoint`;宿主侧:`info --json`(读镜像运行时配置,本地工件或 manifest://) | 租户 `FLATTEN_*` 仅经 exec env 入 guest;tarstream 镜像工件经 exec stdio 接力 |
 | `manifest-ctl`(accelerator) | `store <image.img>`(img-only 构建的收尾上传) | manifest key 经 stdout 回收;`MANIFEST_KEY` 经 env |

@@ -12,64 +12,76 @@ func (r *Runtime) ApplySystem(ctx context.Context, command SystemCommand) (Syste
 	if command.Type == SystemBootstrap || command.Type == SystemRefreshPermit || command.Type == SystemConfirmDrain ||
 		command.Type == SystemAdvanceTransition || command.Type == SystemActivateTransition ||
 		command.Type == SystemConfirmTransitionDrain || command.Type == SystemFinalizeTransition ||
-		command.Type == SystemCloseGeneration || command.Type == SystemSetGates ||
+		command.Type == SystemCloseRegistryGeneration || command.Type == SystemSetGates ||
 		command.Type == SystemBeginRecovery || command.Type == SystemAdvanceRecovery {
 		return SystemApplyResult{}, errors.New("raftstore: System lifecycle command requires its dedicated workflow")
 	}
 	if command.Type == SystemBeginTransition {
-		if command.Transition == nil || command.Transition.Version != r.manifest.ManifestVersion ||
-			command.Transition.Digest != r.manifestDigest {
-			return SystemApplyResult{}, errors.New("raftstore: transition does not name the verified next manifest")
+		if command.Transition == nil || command.Transition.Version != r.registryLayout.RegistryLayoutVersion ||
+			command.Transition.Digest != r.registryLayoutDigest {
+			return SystemApplyResult{}, errors.New("raftstore: transition does not name the verified next registryLayout")
 		}
 	}
 	return r.proposeSystem(ctx, command)
 }
 
-// CloseStorageGeneration permanently retires this generation and commits the
-// exact successor manifest intent. The successor's consensus proof outputs are
+// CloseRegistryGeneration permanently retires this Registry History Generation and commits the
+// exact successor registryLayout intent. The successor's consensus proof outputs are
 // deliberately excluded from the intent because they are produced by this
 // commit; ConsensusPredecessorProof fills them afterwards.
-func (r *Runtime) CloseStorageGeneration(ctx context.Context, successor Manifest) (SystemState, error) {
+func (r *Runtime) CloseRegistryGeneration(ctx context.Context, successor RegistryLayout) (SystemState, error) {
+	if !r.HasLocalSystemReplica() {
+		if r.systemClient == nil {
+			return SystemState{}, errors.New("raftstore: remote System Group client is unavailable")
+		}
+		operation, cancel := r.operationContext(ctx)
+		defer cancel()
+		state, err := r.systemClient.CloseRegistryGeneration(operation, successor)
+		if err == nil {
+			err = r.acceptRemoteSystemState(state)
+		}
+		return state, err
+	}
 	state, err := r.ReadSystemStrong(ctx)
 	if err != nil {
 		return SystemState{}, err
 	}
-	if err := r.authorizeManifestState(state); err != nil {
+	if err := r.authorizeRegistryLayoutState(state); err != nil {
 		return SystemState{}, err
 	}
 	predecessor := successor.Predecessor
-	if successor.ClusterID != state.ClusterID || successor.StorageGeneration == state.StorageGeneration ||
-		successor.ManifestVersion != 1 || predecessor == nil ||
+	if successor.ClusterID != state.ClusterID || successor.RegistryGeneration == state.RegistryGeneration ||
+		successor.RegistryLayoutVersion != 1 || predecessor == nil ||
 		predecessor.Kind != RolloverConsensusClosure ||
-		predecessor.StorageGeneration != state.StorageGeneration ||
-		predecessor.ManifestDigest != state.ActiveManifestDigest ||
+		predecessor.RegistryGeneration != state.RegistryGeneration ||
+		predecessor.RegistryLayoutDigest != state.ActiveRegistryLayoutDigest ||
 		predecessor.ServePermitMaxMillis != state.ServePermitMaxMillis {
-		return SystemState{}, errors.New("raftstore: successor manifest is not linked to the active generation")
+		return SystemState{}, errors.New("raftstore: successor Registry Layout is not linked to the active Registry History Generation")
 	}
 	intentDigest, err := successor.RolloverIntentDigest()
 	if err != nil {
 		return SystemState{}, err
 	}
 	if state.Retired {
-		if state.Closure != nil && state.Closure.TargetStorageGeneration == successor.StorageGeneration &&
-			state.Closure.TargetManifestIntentDigest == intentDigest {
+		if state.Closure != nil && state.Closure.TargetRegistryGeneration == successor.RegistryGeneration &&
+			state.Closure.TargetRegistryLayoutIntentDigest == intentDigest {
 			return state, nil
 		}
-		return SystemState{}, errors.New("raftstore: generation is retired for another successor manifest")
+		return SystemState{}, errors.New("raftstore: Registry History Generation is retired for another successor Registry Layout")
 	}
 
 	result, proposeErr := r.proposeSystem(ctx, SystemCommand{
-		Type: SystemCloseGeneration,
-		Closure: &GenerationClosure{
-			TargetStorageGeneration:    successor.StorageGeneration,
-			TargetManifestIntentDigest: intentDigest,
-			Kind:                       RolloverConsensusClosure,
+		Type: SystemCloseRegistryGeneration,
+		Closure: &RegistryGenerationClosure{
+			TargetRegistryGeneration:         successor.RegistryGeneration,
+			TargetRegistryLayoutIntentDigest: intentDigest,
+			Kind:                             RolloverConsensusClosure,
 		},
 	})
 	current, readErr := r.ReadSystemStrong(ctx)
 	if readErr == nil && current.Retired && current.Closure != nil &&
-		current.Closure.TargetStorageGeneration == successor.StorageGeneration &&
-		current.Closure.TargetManifestIntentDigest == intentDigest {
+		current.Closure.TargetRegistryGeneration == successor.RegistryGeneration &&
+		current.Closure.TargetRegistryLayoutIntentDigest == intentDigest {
 		return current, nil
 	}
 	if proposeErr != nil {
@@ -81,13 +93,26 @@ func (r *Runtime) CloseStorageGeneration(ctx context.Context, successor Manifest
 	if readErr != nil {
 		return SystemState{}, readErr
 	}
-	return SystemState{}, errors.New("raftstore: committed generation closure was not visible")
+	return SystemState{}, errors.New("raftstore: committed Registry History Generation closure was not visible")
 }
 
 // ConfirmPredecessorPermitDrain waits a full predecessor permit lifetime from
 // a quorum-confirmed successor-state read before recording drain completion.
 // Restarting the caller restarts the full monotonic wait, which is conservative.
 func (r *Runtime) ConfirmPredecessorPermitDrain(ctx context.Context, evidenceDigest string) (SystemState, error) {
+	if !r.HasLocalSystemReplica() {
+		if r.systemClient == nil {
+			return SystemState{}, errors.New("raftstore: remote System Group client is unavailable")
+		}
+		timeout := time.Duration(MaximumServePermitMillis+r.config.Tuning.OperationTimeoutMillis) * time.Millisecond
+		operation, cancel := context.WithTimeout(ctx, timeout)
+		defer cancel()
+		state, err := r.systemClient.ConfirmPredecessorPermitDrain(operation, evidenceDigest)
+		if err == nil {
+			err = r.acceptRemoteSystemState(state)
+		}
+		return state, err
+	}
 	if !isSHA256(evidenceDigest) {
 		return SystemState{}, errors.New("raftstore: predecessor drain evidence digest is required")
 	}
@@ -95,11 +120,11 @@ func (r *Runtime) ConfirmPredecessorPermitDrain(ctx context.Context, evidenceDig
 	if err != nil {
 		return SystemState{}, err
 	}
-	if err := r.authorizeManifestState(state); err != nil {
+	if err := r.authorizeRegistryLayoutState(state); err != nil {
 		return SystemState{}, err
 	}
 	if !state.HasPredecessor {
-		return SystemState{}, errors.New("raftstore: first generation has no predecessor permit to drain")
+		return SystemState{}, errors.New("raftstore: first Registry History Generation has no predecessor Permit to drain")
 	}
 	if state.PredecessorDrainComplete {
 		return state, nil
@@ -130,8 +155,8 @@ func (r *Runtime) ConfirmPredecessorPermitDrain(ctx context.Context, evidenceDig
 	if err != nil {
 		return SystemState{}, err
 	}
-	if current.StorageGeneration != state.StorageGeneration || current.SystemEpoch != state.SystemEpoch ||
-		current.PredecessorGeneration != state.PredecessorGeneration ||
+	if current.RegistryGeneration != state.RegistryGeneration || current.SystemEpoch != state.SystemEpoch ||
+		current.PredecessorRegistryGeneration != state.PredecessorRegistryGeneration ||
 		current.PredecessorProofDigest != state.PredecessorProofDigest ||
 		current.PredecessorPermitMaxMillis != state.PredecessorPermitMaxMillis {
 		return SystemState{}, errors.New("raftstore: predecessor drain identity changed during the wait")
@@ -176,7 +201,7 @@ func (r *Runtime) ReadData(ctx context.Context, query DataLookup) (DataLookupRes
 		err   error
 	)
 	if strong {
-		value, err = r.nodeHost.SyncRead(ctx, DataRaftShardID(logicalShardID), query)
+		value, err = r.syncRead(ctx, DataRaftShardID(logicalShardID), query)
 	} else {
 		value, err = r.nodeHost.StaleRead(DataRaftShardID(logicalShardID), query)
 	}
@@ -205,17 +230,17 @@ func (r *Runtime) authorizeLocalDataReplica(identity ShardRequestIdentity) error
 	if local.LocalState != ReplicaActive || local.NonVoting {
 		return ErrNoLocalReplica
 	}
-	if identity.ManifestDigest != r.manifestDigest {
+	if identity.RegistryLayoutDigest != r.registryLayoutDigest {
 		// A removed replica may serve only the preceding epoch while its
 		// already-issued Permit drains. DataState.Accepts performs the exact
-		// old-epoch check and the new manifest never routes new-epoch reads here.
+		// old-epoch check and the new registryLayout never routes new-epoch reads here.
 		return nil
 	}
-	if int(identity.ShardID) >= len(r.manifest.DataShards) {
+	if int(identity.ShardID) >= len(r.registryLayout.DataShards) {
 		return ErrNoLocalReplica
 	}
 	placement, found := replicaPlacementForMember(
-		r.manifest.DataShards[identity.ShardID].Replicas, r.member.MemberID,
+		r.registryLayout.DataShards[identity.ShardID].Replicas, r.member.MemberID,
 	)
 	if !found {
 		return ErrNoLocalReplica
@@ -232,6 +257,8 @@ func lookupIdentity(query DataLookup) (ShardRequestIdentity, uint32, bool) {
 		return shardIdentityFromRoute(query.Route.RequestIdentity), query.Route.ShardID, query.Route.Strong
 	case query.Build != nil:
 		return shardIdentityFromRoute(query.Build.RequestIdentity), query.Build.ShardID, query.Build.Strong
+	case query.Workflow != nil:
+		return query.Workflow.Identity, query.Workflow.Identity.ShardID, true
 	case query.RouteBucket != nil:
 		return query.RouteBucket.Identity, query.RouteBucket.Identity.ShardID, query.RouteBucket.Strong
 	case query.Changefeed != nil:
@@ -258,12 +285,12 @@ func (r *Runtime) attachLeaderHint(shardID uint32, result *DataLookupResult) {
 	if err != nil || !valid || term == 0 {
 		return
 	}
-	placement := r.manifest.DataShards[shardID]
+	placement := r.registryLayout.DataShards[shardID]
 	for _, replica := range placement.Replicas {
 		if replica.ReplicaID != leaderID {
 			continue
 		}
-		member, found := manifestMember(r.manifest, replica.MemberID)
+		member, found := registryLayoutMember(r.registryLayout, replica.MemberID)
 		if !found {
 			return
 		}

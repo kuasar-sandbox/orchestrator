@@ -35,7 +35,25 @@ func (e *testEndpoint) AdmitAndDispatch(_ context.Context, command DispatchComma
 
 type testGate bool
 
-func (g testGate) AllowSessionWork(ServeIdentity) bool { return bool(g) }
+func (g testGate) AllowSessionWork(ServeIdentity, PermitOperation) bool { return bool(g) }
+
+func (g testGate) AuthorizeNodeSession(ServeIdentity, Registration) error {
+	if !g {
+		return ErrPermitUnavailable
+	}
+	return nil
+}
+
+type revocableTestGate struct{ retired bool }
+
+func (*revocableTestGate) AllowSessionWork(ServeIdentity, PermitOperation) bool { return true }
+
+func (g *revocableTestGate) AuthorizeNodeSession(ServeIdentity, Registration) error {
+	if g.retired {
+		return ErrStaleSession
+	}
+	return nil
+}
 
 type testPublisher struct{ deltas []DirectoryDelta }
 
@@ -59,11 +77,15 @@ type serializedEnrollmentAuthority struct {
 
 func (a *serializedEnrollmentAuthority) RunSessionRegistration(
 	ctx context.Context,
-	enrollment NodeEnrollment,
+	registration Registration,
 	install func() error,
 ) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	enrollment := NodeEnrollment{
+		NodeID: registration.NodeID, EnrollmentID: registration.EnrollmentID,
+		NodeEpoch: registration.NodeEpoch, DataEndpoint: registration.DataEndpoint,
+	}
 	if a.retired || enrollment != a.enrollment {
 		return errors.New("identity is not enrolled")
 	}
@@ -117,9 +139,13 @@ func (a *testEnrollmentAuthority) retire(retirement IdentityRetirement) {
 	delete(a.active, retirement.NodeID)
 }
 
-func (a *testEnrollmentAuthority) RunSessionRegistration(_ context.Context, enrollment NodeEnrollment, install func() error) error {
+func (a *testEnrollmentAuthority) RunSessionRegistration(_ context.Context, registration Registration, install func() error) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	enrollment := NodeEnrollment{
+		NodeID: registration.NodeID, EnrollmentID: registration.EnrollmentID,
+		NodeEpoch: registration.NodeEpoch, DataEndpoint: registration.DataEndpoint,
+	}
 	current, found := a.active[enrollment.NodeID]
 	if !found {
 		return errors.New("identity is not enrolled")
@@ -250,6 +276,42 @@ func TestHolderDropsHighWatermarkOnlyAfterCommittedIdentityRetirement(t *testing
 	}
 	if _, err := holder.Register(context.Background(), registration, &testEndpoint{}); err == nil {
 		t.Fatal("retired identity registered again")
+	}
+}
+
+func TestHolderRetirementSucceedsWhenAnotherMemberHoldsTheSession(t *testing.T) {
+	registration := testRegistration("node-1", 7, 10, "10.0.0.1:8443")
+	authority := newTestEnrollmentAuthority(registration)
+	retirement := IdentityRetirement{
+		NodeID: registration.NodeID, EnrollmentID: registration.EnrollmentID, LastNodeEpoch: registration.NodeEpoch,
+	}
+	authority.retire(retirement)
+	holder, err := NewHolder("registry-a", 1, nil, testGate(true), nil, authority)
+	if err != nil {
+		t.Fatal(err)
+	}
+	retired, err := holder.RetireIdentity(context.Background(), retirement)
+	if err != nil || !retired {
+		t.Fatalf("remote identity retirement retired=%v err=%v", retired, err)
+	}
+}
+
+func TestHolderRejectsWorkAfterConsensusRetiresActiveEnrollment(t *testing.T) {
+	registration := testRegistration("node-1", 7, 10, "10.0.0.1:8443")
+	authority := newTestEnrollmentAuthority(registration)
+	gate := &revocableTestGate{}
+	holder, err := NewHolder("registry-a", 1, nil, gate, nil, authority)
+	if err != nil {
+		t.Fatal(err)
+	}
+	endpoint := &testEndpoint{}
+	if _, err := holder.Register(context.Background(), registration, endpoint); err != nil {
+		t.Fatal(err)
+	}
+	gate.retired = true
+	_, err = holder.AdmitAndDispatch(context.Background(), testDispatchCommand(t, registration))
+	if !errors.Is(err, ErrStaleSession) || len(endpoint.commands) != 0 {
+		t.Fatalf("retired session dispatch err=%v commands=%d", err, len(endpoint.commands))
 	}
 }
 
@@ -608,7 +670,7 @@ func testDispatchCommand(t *testing.T, registration Registration) DispatchComman
 	decoded, _ = hex.DecodeString(intent.DispatchSpecDigest)
 	copy(specDigest[:], decoded)
 	opaque, err := cluster.EncodeExecutionBinding(cluster.ExecutionBinding{
-		StorageGeneration: "g1", Kind: cluster.ExecutionKindSandbox, ObjectID: "s1",
+		RegistryGeneration: "g1", Kind: cluster.ExecutionKindSandbox, ObjectID: "s1",
 		Group: "/g", RouteKey: "rk", NodeID: registration.NodeID, NodeEpoch: registration.NodeEpoch,
 		DemandDigest: demandDigest, DispatchSpecDigest: specDigest,
 	})
@@ -625,7 +687,7 @@ func testDispatchCommand(t *testing.T, registration Registration) DispatchComman
 		NodeID: registration.NodeID, NodeEpoch: registration.NodeEpoch, DataEndpoint: registration.DataEndpoint,
 		Intent: intent, Binding: cluster.ExecutionBindingIntent{
 			NodeID: registration.NodeID, NodeEpoch: registration.NodeEpoch, DataEndpoint: registration.DataEndpoint,
-			StorageGeneration: "g1", OpaqueBinding: opaque, BindingDigest: digest,
+			RegistryGeneration: "g1", OpaqueBinding: opaque, BindingDigest: digest,
 		},
 	}
 }

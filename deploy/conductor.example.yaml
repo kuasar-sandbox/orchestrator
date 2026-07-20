@@ -16,6 +16,9 @@ api:
   tls:
     cert: /etc/node-ctl/tls/fullchain.pem   # wildcard *.<domain> AND api.<domain>
     key: /etc/node-ctl/tls/privkey.pem
+    # Required in cluster mode: verifies the Router role certificate before
+    # any direct object read, mutation, or data-plane CONNECT.
+    client_ca: /etc/node-ctl/tls/cluster-ca.pem
 
 # Data-plane policy. mode selects how sandbox traffic (<port>-<sid>.<domain>) is served:
 #   internal (default) — in-process proxy (single binary, no extra moving parts).
@@ -168,7 +171,14 @@ checkpoint:
 #   node_link:                                    # how to reach registry node_link
 #     endpoint: registry.cluster.example.com:7700 # "" = standalone single-node
 #     tls: { cert: "", key: "", ca: "" }          # node_link client mTLS; empty = plain h2c
-#   node_id: ""                                   # "" = hostname
+#   node_id: ""                                   # optional assertion against enrolled durable identity
 #   labels: { zone: z1, pool: default }
-#   data_endpoint: ""                             # host:port the router forwards data to; "" = api.listen
-#   heartbeat_interval: 10s
+#   data_endpoint: node-1.cluster.example.com:443 # immutable within one NodeEpoch
+#   heartbeat_interval: 500ms                    # must be in (0,500ms]
+#   event_replay_batch: 64
+#   event_replay_bytes: 1048576
+#   event_replay_interval: 1s
+#   sandbox_queue_limit: 256
+#   build_queue_limit: 256
+#   sandbox_workers: 8
+#   build_workers: 2

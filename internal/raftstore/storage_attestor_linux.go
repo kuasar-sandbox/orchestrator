@@ -17,6 +17,27 @@ type LinuxDMStorageAttestor struct {
 	SysfsRoot string
 }
 
+// LinuxEphemeralStorageAttestor is restricted to explicitly ephemeral test/dev
+// generations. tmpfs has no persistent at-rest bytes and therefore cannot
+// leave unencrypted Registry state behind after the mount is destroyed.
+type LinuxEphemeralStorageAttestor struct{}
+
+func (LinuxEphemeralStorageAttestor) VerifyEncrypted(paths ...string) error {
+	if len(paths) == 0 {
+		return errors.New("no storage path supplied")
+	}
+	for _, path := range paths {
+		var stat unix.Statfs_t
+		if err := unix.Statfs(path, &stat); err != nil {
+			return err
+		}
+		if stat.Type != unix.TMPFS_MAGIC {
+			return fmt.Errorf("%s is not on ephemeral tmpfs", path)
+		}
+	}
+	return nil
+}
+
 func (a LinuxDMStorageAttestor) VerifyEncrypted(paths ...string) error {
 	if len(paths) == 0 {
 		return errors.New("no storage path supplied")

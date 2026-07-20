@@ -10,26 +10,26 @@ import (
 )
 
 func TestLocalReplicaRemovalResumesAfterCleanupFailure(t *testing.T) {
-	manifest := transitionManifest(t)
-	digest, err := manifest.Digest()
+	registryLayout := transitionRegistryLayout(t)
+	digest, err := registryLayout.Digest()
 	if err != nil {
 		t.Fatal(err)
 	}
-	member, found := manifestMember(manifest, "registry-c")
+	member, found := registryLayoutMember(registryLayout, "registry-c")
 	if !found {
-		t.Fatal("removed member absent from manifest member catalog")
+		t.Fatal("removed member absent from registryLayout member catalog")
 	}
 	shardID := DataRaftShardID(0)
 	replica := LocalReplicaEnrollment{
 		ShardID: shardID, ReplicaID: 3, StartPlan: ReplicaInitial, LocalState: ReplicaActive,
 	}
 	enrollment := LocalEnrollment{
-		Version: localEnrollmentVersion, ClusterID: manifest.ClusterID,
-		StorageGeneration: manifest.StorageGeneration, MemberID: member.MemberID,
+		Version: localEnrollmentVersion, ClusterID: registryLayout.ClusterID,
+		RegistryGeneration: registryLayout.RegistryGeneration, MemberID: member.MemberID,
 		DeploymentID: 1, RaftAddress: member.RaftEndpoint,
 		NodeHostDir: "/nodehost", StateEngineDir: "/state",
-		RuntimeConfigDigest: digestFor("runtime-config"), ManifestVersion: manifest.ManifestVersion,
-		ManifestDigest: digest, Mode: EnrollmentBootstrap, Replicas: []LocalReplicaEnrollment{replica},
+		RuntimeConfigDigest: digestFor("runtime-config"), RegistryLayoutVersion: registryLayout.RegistryLayoutVersion,
+		RegistryLayoutDigest: digest, Mode: EnrollmentBootstrap, Replicas: []LocalReplicaEnrollment{replica},
 	}
 	store := EnrollmentStore{Path: filepath.Join(t.TempDir(), "enrollment.json")}
 	if err := store.Store(enrollment); err != nil {
@@ -48,7 +48,7 @@ func TestLocalReplicaRemovalResumesAfterCleanupFailure(t *testing.T) {
 	}
 	host.removeDataErr = errors.New("injected cleanup failure")
 	runtime := &Runtime{
-		manifest: manifest, manifestDigest: digest, member: member, nodeHost: host,
+		registryLayout: registryLayout, registryLayoutDigest: digest, member: member, nodeHost: host,
 		enrollment: enrollment, enrollmentStore: store, stateEngine: engine,
 	}
 	if err := runtime.RemoveLocalReplicaData(context.Background(), shardID); err == nil {
@@ -74,10 +74,10 @@ func TestLocalReplicaRemovalResumesAfterCleanupFailure(t *testing.T) {
 	}
 }
 
-func transitionManifest(t *testing.T) Manifest {
+func transitionRegistryLayout(t *testing.T) RegistryLayout {
 	t.Helper()
-	manifest := testManifest(2, "generation-1")
-	manifest.Members = append(manifest.Members, RegistryMember{
+	registryLayout := testRegistryLayout(2, "generation-1")
+	registryLayout.Members = append(registryLayout.Members, RegistryMember{
 		MemberID: "registry-d", InternalEndpoint: "https://registry-d:9443", RaftEndpoint: "registry-d:63001",
 	})
 	desired := []ReplicaPlacement{
@@ -85,19 +85,19 @@ func transitionManifest(t *testing.T) Manifest {
 		{MemberID: "registry-b", ReplicaID: 2},
 		{MemberID: "registry-d", ReplicaID: 4},
 	}
-	manifest.SystemReplicas = append([]ReplicaPlacement(nil), desired...)
-	for index := range manifest.DataShards {
-		manifest.DataShards[index].Replicas = append([]ReplicaPlacement(nil), desired...)
+	registryLayout.SystemReplicas = append([]ReplicaPlacement(nil), desired...)
+	for index := range registryLayout.DataShards {
+		registryLayout.DataShards[index].Replicas = append([]ReplicaPlacement(nil), desired...)
 	}
-	if err := manifest.Validate(); err != nil {
+	if err := registryLayout.Validate(); err != nil {
 		t.Fatal(err)
 	}
-	return manifest
+	return registryLayout
 }
 
 func TestOrderedMembershipChangeRequiresCatchUpBeforeOldReplicaRemoval(t *testing.T) {
-	manifest := transitionManifest(t)
-	digest, _ := manifest.Digest()
+	registryLayout := transitionRegistryLayout(t)
+	digest, _ := registryLayout.Digest()
 	host := newFakeNodeHost()
 	shardID := DataRaftShardID(0)
 	host.memberships[shardID] = &dragonboat.Membership{
@@ -107,7 +107,7 @@ func TestOrderedMembershipChangeRequiresCatchUpBeforeOldReplicaRemoval(t *testin
 		},
 		NonVotings: map[uint64]string{}, Witnesses: map[uint64]string{}, Removed: map[uint64]struct{}{},
 	}
-	runtime := &Runtime{manifest: manifest, manifestDigest: digest, nodeHost: host}
+	runtime := &Runtime{registryLayout: registryLayout, registryLayoutDigest: digest, nodeHost: host}
 	ctx := context.Background()
 
 	if err := runtime.AddNonVoting(ctx, shardID, 4, "registry-d"); err != nil {
@@ -118,17 +118,17 @@ func TestOrderedMembershipChangeRequiresCatchUpBeforeOldReplicaRemoval(t *testin
 	}
 	request := ReplicaCatchUpRequest{
 		ShardID: shardID, ReplicaID: 4, MemberID: "registry-d",
-		ManifestDigest: digest, MinimumAppliedIndex: 100,
+		RegistryLayoutDigest: digest, MinimumAppliedIndex: 100,
 	}
 	if err := runtime.promoteNonVoting(ctx, request, ReplicaCatchUpProof{
 		ShardID: shardID, ReplicaID: 4, MemberID: "registry-d",
-		ManifestDigest: digest, AppliedIndex: 99,
+		RegistryLayoutDigest: digest, AppliedIndex: 99,
 	}); err == nil {
 		t.Fatal("lagging non-voting replica was promoted")
 	}
 	if err := runtime.promoteNonVoting(ctx, request, ReplicaCatchUpProof{
 		ShardID: shardID, ReplicaID: 4, MemberID: "registry-d",
-		ManifestDigest: digest, AppliedIndex: 100,
+		RegistryLayoutDigest: digest, AppliedIndex: 100,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -145,15 +145,15 @@ func TestOrderedMembershipChangeRequiresCatchUpBeforeOldReplicaRemoval(t *testin
 }
 
 func TestLocalLearnerCatchUpProofIsBoundToEnrollmentAndLinearizedState(t *testing.T) {
-	manifest := transitionManifest(t)
-	digest, err := manifest.Digest()
+	registryLayout := transitionRegistryLayout(t)
+	digest, err := registryLayout.Digest()
 	if err != nil {
 		t.Fatal(err)
 	}
-	identity := manifestShardIdentity(t, manifest, 0)
-	data := initializeDataShard(t, manifest, identity)
+	identity := registryLayoutShardIdentity(t, registryLayout, 0)
+	data := initializeDataShard(t, registryLayout, identity)
 	shardID := DataRaftShardID(0)
-	member, found := manifestMember(manifest, "registry-d")
+	member, found := registryLayoutMember(registryLayout, "registry-d")
 	if !found {
 		t.Fatal("target member absent")
 	}
@@ -169,15 +169,15 @@ func TestLocalLearnerCatchUpProofIsBoundToEnrollmentAndLinearizedState(t *testin
 		return data, nil
 	}
 	runtime := &Runtime{
-		manifest: manifest, manifestDigest: digest, member: member, nodeHost: host,
+		registryLayout: registryLayout, registryLayoutDigest: digest, member: member, nodeHost: host,
 		enrollmentStore: EnrollmentStore{Path: t.TempDir() + "/enrollment.json"},
 		enrollment: LocalEnrollment{
-			Version: localEnrollmentVersion, ClusterID: manifest.ClusterID,
-			StorageGeneration: manifest.StorageGeneration, MemberID: member.MemberID,
+			Version: localEnrollmentVersion, ClusterID: registryLayout.ClusterID,
+			RegistryGeneration: registryLayout.RegistryGeneration, MemberID: member.MemberID,
 			DeploymentID: 1, RaftAddress: member.RaftEndpoint,
 			NodeHostDir: "/nodehost", StateEngineDir: "/state",
-			RuntimeConfigDigest: digestFor("runtime-config"), ManifestVersion: manifest.ManifestVersion,
-			ManifestDigest: digest, Mode: EnrollmentJoin,
+			RuntimeConfigDigest: digestFor("runtime-config"), RegistryLayoutVersion: registryLayout.RegistryLayoutVersion,
+			RegistryLayoutDigest: digest, Mode: EnrollmentJoin,
 			Replicas: []LocalReplicaEnrollment{{
 				ShardID: shardID, ReplicaID: 4, StartPlan: ReplicaJoin,
 				NonVoting: true, LocalState: ReplicaActive,
@@ -186,7 +186,7 @@ func TestLocalLearnerCatchUpProofIsBoundToEnrollmentAndLinearizedState(t *testin
 	}
 	request := ReplicaCatchUpRequest{
 		ShardID: shardID, ReplicaID: 4, MemberID: member.MemberID,
-		ManifestDigest: digest, MinimumAppliedIndex: data.LastApplied,
+		RegistryLayoutDigest: digest, MinimumAppliedIndex: data.LastApplied,
 	}
 	proof, err := runtime.ProveLocalReplicaCaughtUp(context.Background(), request)
 	if err != nil || proof.AppliedIndex != data.LastApplied {
@@ -199,7 +199,7 @@ func TestLocalLearnerCatchUpProofIsBoundToEnrollmentAndLinearizedState(t *testin
 	host.memberships[shardID].Nodes[4] = member.RaftEndpoint
 	delete(host.memberships[shardID].NonVotings, 4)
 	if err := runtime.ConfirmLocalReplicaPromoted(context.Background(), ReplicaPromotionRequest{
-		ShardID: shardID, ReplicaID: 4, MemberID: member.MemberID, ManifestDigest: digest,
+		ShardID: shardID, ReplicaID: 4, MemberID: member.MemberID, RegistryLayoutDigest: digest,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -211,7 +211,7 @@ func TestLocalLearnerCatchUpProofIsBoundToEnrollmentAndLinearizedState(t *testin
 func TestRemoteCatchUpProbeCannotReturnProofForAnotherTarget(t *testing.T) {
 	request := ReplicaCatchUpRequest{
 		ShardID: DataRaftShardID(0), ReplicaID: 4, MemberID: "registry-d",
-		ManifestDigest: digestFor("manifest"), MinimumAppliedIndex: 100,
+		RegistryLayoutDigest: digestFor("registryLayout"), MinimumAppliedIndex: 100,
 	}
 	runtime := &Runtime{
 		member: RegistryMember{MemberID: "registry-a"},
@@ -219,7 +219,7 @@ func TestRemoteCatchUpProbeCannotReturnProofForAnotherTarget(t *testing.T) {
 			Probe: func(context.Context, ReplicaCatchUpRequest) (ReplicaCatchUpProof, error) {
 				return ReplicaCatchUpProof{
 					ShardID: request.ShardID, ReplicaID: request.ReplicaID, MemberID: "registry-e",
-					ManifestDigest: request.ManifestDigest, AppliedIndex: request.MinimumAppliedIndex,
+					RegistryLayoutDigest: request.RegistryLayoutDigest, AppliedIndex: request.MinimumAppliedIndex,
 				}, nil
 			},
 			Confirm: func(context.Context, ReplicaPromotionRequest) error { return nil },
@@ -231,8 +231,8 @@ func TestRemoteCatchUpProbeCannotReturnProofForAnotherTarget(t *testing.T) {
 }
 
 func TestMembershipChangeRejectsSecondReplicaOnOneNodeHost(t *testing.T) {
-	manifest := transitionManifest(t)
-	digest, err := manifest.Digest()
+	registryLayout := transitionRegistryLayout(t)
+	digest, err := registryLayout.Digest()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -246,7 +246,7 @@ func TestMembershipChangeRejectsSecondReplicaOnOneNodeHost(t *testing.T) {
 		},
 		NonVotings: map[uint64]string{}, Witnesses: map[uint64]string{}, Removed: map[uint64]struct{}{},
 	}
-	runtime := &Runtime{manifest: manifest, manifestDigest: digest, nodeHost: host}
+	runtime := &Runtime{registryLayout: registryLayout, registryLayoutDigest: digest, nodeHost: host}
 	if err := runtime.AddNonVoting(context.Background(), shardID, 4, "registry-d"); err == nil {
 		t.Fatal("second replica ID was added to an already occupied NodeHost target")
 	}

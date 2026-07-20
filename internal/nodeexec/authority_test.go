@@ -125,7 +125,7 @@ func authorityCommand(
 	demandDigest, _ := hex.DecodeString(intent.DemandDigest)
 	specDigest, _ := hex.DecodeString(intent.DispatchSpecDigest)
 	binding := clusterstate.ExecutionBinding{
-		StorageGeneration: "generation-1", Kind: kind, ObjectID: objectID,
+		RegistryGeneration: "generation-1", Kind: kind, ObjectID: objectID,
 		Group: "group-1", RouteKey: routeKey, NodeID: "node-1", NodeEpoch: 7,
 	}
 	copy(binding.DemandDigest[:], demandDigest)
@@ -144,7 +144,7 @@ func authorityCommand(
 		Intent: intent,
 		Binding: clusterstate.ExecutionBindingIntent{
 			NodeID: "node-1", NodeEpoch: 7, DataEndpoint: "10.0.0.1:8443",
-			StorageGeneration: "generation-1", OpaqueBinding: opaque, BindingDigest: digest,
+			RegistryGeneration: "generation-1", OpaqueBinding: opaque, BindingDigest: digest,
 		},
 	}
 }
@@ -155,7 +155,21 @@ func newAuthority(
 	sandbox nodeexec.SandboxAdmissionController,
 ) *nodeexec.Authority {
 	t.Helper()
-	return newAuthorityWithCapacity(t, journal, sandbox, func(context.Context) (nodeexec.BuildCapacity, string, error) {
+	return newAuthorityAtSession(t, journal, sandbox, 11)
+}
+
+func newAuthorityAtSession(
+	t *testing.T,
+	journal nodeexec.WorkflowJournal,
+	sandbox nodeexec.SandboxAdmissionController,
+	sessionSeq uint64,
+) *nodeexec.Authority {
+	t.Helper()
+	return newAuthorityWithIdentityAndCapacity(t, journal, sandbox, func(context.Context) (nodeexec.LocalSessionIdentity, error) {
+		return nodeexec.LocalSessionIdentity{
+			NodeID: "node-1", NodeEpoch: 7, SessionSeq: sessionSeq, DataEndpoint: "10.0.0.1:8443",
+		}, nil
+	}, func(context.Context) (nodeexec.BuildCapacity, string, error) {
 		return nodeexec.BuildCapacity{Slots: 1, Memory: 2 << 30, QueueLimit: 4}, "", nil
 	})
 }
@@ -167,16 +181,27 @@ func newAuthorityWithCapacity(
 	capacity nodeexec.BuildCapacitySource,
 ) *nodeexec.Authority {
 	t.Helper()
+	return newAuthorityWithIdentityAndCapacity(t, journal, sandbox, func(context.Context) (nodeexec.LocalSessionIdentity, error) {
+		return nodeexec.LocalSessionIdentity{
+			NodeID: "node-1", NodeEpoch: 7, SessionSeq: 11, DataEndpoint: "10.0.0.1:8443",
+		}, nil
+	}, capacity)
+}
+
+func newAuthorityWithIdentityAndCapacity(
+	t *testing.T,
+	journal nodeexec.WorkflowJournal,
+	sandbox nodeexec.SandboxAdmissionController,
+	identity nodeexec.IdentitySource,
+	capacity nodeexec.BuildCapacitySource,
+) *nodeexec.Authority {
+	t.Helper()
 	authority, err := nodeexec.NewAuthority(
 		journal,
 		sandbox,
-		func(context.Context) (nodeexec.LocalSessionIdentity, error) {
-			return nodeexec.LocalSessionIdentity{
-				NodeID: "node-1", NodeEpoch: 7, SessionSeq: 11, DataEndpoint: "10.0.0.1:8443",
-			}, nil
-		},
+		identity,
 		capacity,
-		func(record nodeexec.DispatchRecord) (*types.Build, error) {
+		func(_ context.Context, record nodeexec.DispatchRecord) (*types.Build, error) {
 			return &types.Build{
 				BuildID: record.ObjectID, TemplateID: "transient-" + record.ObjectID,
 				ManifestKey: strings.Repeat("4", 64), Profile: types.ProfileE2B,
@@ -185,6 +210,7 @@ func newAuthorityWithCapacity(
 		},
 		func(nodeexec.DispatchRecord) (nodectl.SandboxAdmissionDemand, error) {
 			return nodectl.SandboxAdmissionDemand{
+				SlotUnits:           1,
 				CapacityMemoryBytes: 1 << 30, CapacityCPU: 2, FloorMemoryBytes: 512 << 20,
 				FloorCPU: 1, StartupBudgetMemory: 1 << 30,
 			}, nil
@@ -270,6 +296,13 @@ func TestAuthorityBuildDispatchIsDurableAndSessionFenced(t *testing.T) {
 	if err != nil || stored.ProviderPolicyVersion != command.Intent.ProviderPolicyVersion {
 		t.Fatalf("durable policy version = %+v, %v", stored, err)
 	}
+	newSessionCommand := command
+	newSessionCommand.SessionSeq = 12
+	newSessionAuthority := newAuthorityAtSession(t, st, sandbox, 12)
+	newSessionRetry, err := newSessionAuthority.AdmitAndDispatch(context.Background(), newSessionCommand)
+	if err != nil || newSessionRetry != reply {
+		t.Fatalf("new Holder/session retry = %+v, %v; want %+v", newSessionRetry, err, reply)
+	}
 	command.SessionSeq = 10
 	stale, err := authority.AdmitAndDispatch(context.Background(), command)
 	if err != nil || stale.Outcome != clusterstate.DispatchSessionMoved {
@@ -310,7 +343,7 @@ func TestAuthorityFencesEverySessionOwnedWorkerEntry(t *testing.T) {
 	if err := authority.FailSandbox(context.Background(), nil, "fenced"); !errors.Is(err, nodeexec.ErrSessionFenced) {
 		t.Fatalf("FailSandbox error = %v", err)
 	}
-	if err := authority.FinalizeWorkflow(context.Background(), clusterstate.ExecutionKindSandbox, "", "", ""); !errors.Is(err, nodeexec.ErrSessionFenced) {
+	if err := authority.FinalizeWorkflow(context.Background(), clusterstate.ExecutionKindSandbox, "", ""); !errors.Is(err, nodeexec.ErrSessionFenced) {
 		t.Fatalf("FinalizeWorkflow error = %v", err)
 	}
 }
@@ -413,18 +446,21 @@ func TestBuildSafetyFenceTerminatesExistingQueue(t *testing.T) {
 			t.Fatal("safety-rejected queued Build became launchable")
 		}
 	}
+	build, err := st.GetBuild(context.Background(), second.ObjectID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if build == nil || build.Status != types.BuildError || build.Reason != safetyReason {
+		t.Fatalf("queued Build local terminal state = %+v", build)
+	}
 	pending, _, err := st.PendingExecutionEvents(context.Background(), "node-1", 7, routesync.EventCursor{}, 10, 1<<20)
 	if err != nil {
 		t.Fatal(err)
 	}
-	found := false
 	for _, event := range pending {
 		if event.ObjectID == second.ObjectID {
-			found = event.State == string(clusterstate.BuildError) && event.Reason == safetyReason
+			t.Fatalf("node-local Build lifecycle leaked into cluster outbox: %+v", event)
 		}
-	}
-	if !found {
-		t.Fatalf("queued Build safety event not found: %+v", pending)
 	}
 }
 
@@ -558,7 +594,7 @@ func TestAuthorityReconcilesSandboxPromotionClaimAndReleaseCrashWindows(t *testi
 		t.Fatalf("terminal before release = %+v, %v", record, err)
 	}
 	if err := authority.FinalizeWorkflow(context.Background(), clusterstate.ExecutionKindSandbox,
-		record.ObjectID, record.DemandDigest, record.BindingDigest); !errors.Is(err, store.ErrNodeWorkflowState) {
+		record.ObjectID, record.BindingDigest); !errors.Is(err, store.ErrNodeWorkflowState) {
 		t.Fatalf("finalize before resource release error = %v", err)
 	}
 	if err := authority.ReconcileSandboxAdmissions(context.Background(), 10); err != nil {
@@ -572,8 +608,8 @@ func TestAuthorityReconcilesSandboxPromotionClaimAndReleaseCrashWindows(t *testi
 		t.Fatalf("controller release = %+v", sandbox.released)
 	}
 	if err := authority.FinalizeWorkflow(context.Background(), clusterstate.ExecutionKindSandbox,
-		record.ObjectID, record.DemandDigest, record.BindingDigest); err != nil {
-		t.Fatal(err)
+		record.ObjectID, record.BindingDigest); !errors.Is(err, nodeexec.ErrFinalOutboxPending) {
+		t.Fatalf("finalize before outbox ACK error = %v", err)
 	}
 	if len(sandbox.finalized) != 1 || !strings.HasPrefix(sandbox.finalized[0], "sandbox-reconcile:") {
 		t.Fatalf("controller finalization = %+v", sandbox.finalized)
@@ -581,6 +617,15 @@ func TestAuthorityReconcilesSandboxPromotionClaimAndReleaseCrashWindows(t *testi
 	record, err = st.GetNodeWorkflow(context.Background(), clusterstate.ExecutionKindSandbox, "sandbox-reconcile")
 	if err != nil || record == nil || !record.WorkflowFinalized {
 		t.Fatalf("journal finalization = %+v, %v", record, err)
+	}
+	if err := st.AckExecutionEvent(context.Background(), "node-1", 7, routesync.EventAck{
+		ObjectKind: "sandbox", ObjectID: record.ObjectID, EventSeq: record.EventSeq,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := authority.FinalizeWorkflow(context.Background(), clusterstate.ExecutionKindSandbox,
+		record.ObjectID, record.BindingDigest); err != nil {
+		t.Fatalf("finalize after durable outbox ACK = %v", err)
 	}
 }
 
@@ -615,8 +660,8 @@ func TestDispatchCommandFromWireUsesBusinessIDAndExactIntent(t *testing.T) {
 	wire := &routesync.Command{
 		Kind: routesync.CmdSandboxAdmitDispatch, SID: want.ObjectID,
 		NodeEpoch: want.NodeEpoch, SessionSeq: want.SessionSeq,
-		StorageGeneration: want.Binding.StorageGeneration,
-		Binding:           want.Binding.OpaqueBinding, BindingDigest: want.Binding.BindingDigest,
+		RegistryGeneration: want.Binding.RegistryGeneration,
+		Binding:            want.Binding.OpaqueBinding, BindingDigest: want.Binding.BindingDigest,
 		Group: want.Group, RouteKey: want.RouteKey,
 		NormalizedDemand: want.Intent.NormalizedDemand, DemandDigest: want.Intent.DemandDigest,
 		DispatchSpec: want.Intent.DispatchSpec, DispatchSpecDigest: want.Intent.DispatchSpecDigest,

@@ -1,8 +1,13 @@
 package routesync
 
 import (
+	"bytes"
+	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"slices"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/placementproto"
 )
@@ -14,14 +19,14 @@ import (
 // its per-node ownership table and sends Commands the other way. The frame codec and
 // the ServeAuthority loop are the same routesync engine the proxy plane uses;
 // only the handshake (NodeRegister vs Hello) and the uplink (Command vs Wake)
-// differ. Build events arrive with Phase 5.
+// differ. Only Sandbox lifecycle facts use the ordinary event stream; Build
+// lifecycle remains node-local and appears only in explicit recovery reports.
 const (
 	TypeNodeRegister   = "node_register"   // node -> registry (node identity; first up-frame)
-	TypeHeartbeat      = "heartbeat"       // legacy node -> registry water level
 	TypePlacementLoad  = "placement_load"  // node -> Holder request-time placement snapshot
-	TypeCommand        = "command"         // registry -> node (lifecycle / key primitive)
+	TypeCommand        = "command"         // Holder -> node fenced workflow command
 	TypeCmdAck         = "cmd_ack"         // node -> registry (command accepted / rejected)
-	TypeExecutionEvent = "execution_event" // node -> registry durable Sandbox/Build fact
+	TypeExecutionEvent = "execution_event" // node -> registry durable Sandbox fact
 	TypeEventAck       = "event_ack"       // registry -> node (committed event watermark)
 )
 
@@ -36,93 +41,219 @@ type SessionTuple struct {
 	SessionSeq uint64
 }
 
-// PlaceReq is a registry placement request to the placer.
-// TargetRuntimeDigest lets the placer require a matching guest runtime; empty
-// means no runtime constraint.
-type PlaceReq struct {
-	ReqID               string            `json:"req_id"`
-	Group               string            `json:"group"`
-	RouteKey            string            `json:"route_key"`
-	SandboxID           string            `json:"sandbox_id,omitempty"`
-	Config              map[string]string `json:"config,omitempty"`
-	Build               bool              `json:"build,omitempty"` // a build placement (resource-aware, §4.5)
-	TargetRuntimeDigest string            `json:"target_runtime,omitempty"`
-	ExcludeNodeIDs      []string          `json:"exclude_node_ids,omitempty"`
-}
-
-// PlaceResult is the placer's answer (NodeID set, or NoNode when nothing eligible).
-type PlaceResult struct {
-	ReqID          string            `json:"req_id"`
-	NodeID         string            `json:"node_id,omitempty"`
-	NoNode         bool              `json:"no_node,omitempty"`
-	Error          string            `json:"error,omitempty"`
-	TemplateRef    string            `json:"template_ref,omitempty"`
-	TargetPort     int               `json:"target_port,omitempty"`
-	Config         map[string]string `json:"config,omitempty"`
-	KeyFingerprint string            `json:"key_fp,omitempty"`
-	AccessToken    string            `json:"access_token,omitempty"`
-	ImageRepo      string            `json:"image_repo,omitempty"`
-	RegistryAuth   string            `json:"registry_auth,omitempty"`
-}
-
-// SelectorPatch is the placer's placement projection for a group. NodeIDs is the
-// explicit node set that should hold the group's manifest key; Selectors carries
-// the shuffle-effective selector projection.
-type SelectorPatch struct {
-	Group           string              `json:"group"`
-	Selectors       []map[string]string `json:"selectors"`
-	NodeIDs         []string            `json:"node_ids,omitempty"`
-	KeyFingerprint  string              `json:"key_fp,omitempty"`
-	ManifestKeyType string              `json:"manifest_key_type,omitempty"`
-	ManifestKey     string              `json:"manifest_key,omitempty"`
-	ManifestKeyRef  string              `json:"manifest_key_ref,omitempty"`
-	ImportSourceID  string              `json:"import_source_id,omitempty"`
-	ImportOwnerID   string              `json:"import_owner_id,omitempty"`
-	ImportRunID     string              `json:"import_run_id,omitempty"`
-	ImportTerm      uint64              `json:"import_term,omitempty"`
-}
-
 // Command kinds (Command.Kind) — the lifecycle + key primitives the registry
 // drives the node with. The node executes via its existing e2b lifecycle (the
 // command just carries the intent) and reports the terminal state on the route
 // stream. Command callers wait for ack acceptance; Reserve completion waits on
 // the route event.
 const (
-	CmdCreate        = "create"         // boot a sandbox from a template
-	CmdConnect       = "connect"        // resume a node-local PAUSED sandbox
-	CmdDelete        = "delete"         // destroy a sandbox
-	CmdKeyPut        = "key_put"        // install / renew a manifest-key lease (heartbeat refresh; cluster.md)
-	CmdKeyDrop       = "key_drop"       // drop a key lease
-	CmdBuildRegister = "build_register" // pre-provision a build on the node (registry-assigned ids, §7.5)
-
 	CmdSandboxAdmitDispatch = "sandbox_admit_dispatch"
 	CmdBuildAdmitDispatch   = "build_admit_dispatch"
 	CmdSandboxResume        = "sandbox_resume"
 	CmdSandboxDelete        = "sandbox_delete"
 	CmdRebindExecution      = "rebind_execution"
+	CmdAckRecoveryEvent     = "ack_recovery_event"
 	CmdFinalizeWorkflow     = "finalize_workflow"
+	CmdCollectRecovery      = "collect_recovery_report"
 )
 
-// TypeBuildEvent: node -> registry, a build's state transition (cluster.md);
-// the registry converges the BuildStore (§6.1) + releases the build's reserved
-// resources on a terminal state.
-const TypeBuildEvent = "build_event"
+const (
+	MaxRecoveryPageObjects = uint32(256)
+	MaxRecoveryPageBytes   = uint32(768 << 10)
+)
 
-// BuildEvent reports a build's state up the node-link (§5.1). The node-link
-// owner resolves cluster identity from its per-node build table.
-type BuildEvent struct {
-	BuildID           string `json:"build_id"`
-	NodeEpoch         uint64 `json:"node_epoch,omitempty"`
-	EventSeq          uint64 `json:"event_seq,omitempty"`
-	StorageGeneration string `json:"storage_generation,omitempty"`
-	BindingDigest     string `json:"binding_digest,omitempty"`
-	State             string `json:"state"`
-	TemplateID        string `json:"template_id,omitempty"`
-	Reason            string `json:"reason,omitempty"`
+// RecoveryReportRequest asks the current fenced node-link session for one page
+// of a source Registry History Generation execution report. The report itself is derived only
+// from durable node-local workflows and protected object Bindings.
+type RecoveryReportRequest struct {
+	RecoveryEpoch              uint64 `json:"recovery_epoch"`
+	SourceClusterID            string `json:"source_cluster_id"`
+	SourceRegistryGeneration   string `json:"source_registry_generation"`
+	SourceRegistryLayoutDigest string `json:"source_registry_layout_digest"`
+	TargetRegistryGeneration   string `json:"target_registry_generation"`
+	TargetRegistryLayoutDigest string `json:"target_registry_layout_digest"`
+	Offset                     uint64 `json:"offset,omitempty"`
+	Limit                      uint32 `json:"limit"`
+	MaxBytes                   uint32 `json:"max_bytes"`
+	ExpectedReportDigest       string `json:"expected_report_digest,omitempty"`
+}
+
+func (r RecoveryReportRequest) Validate() error {
+	if r.RecoveryEpoch == 0 || r.SourceClusterID == "" || r.SourceRegistryGeneration == "" ||
+		r.TargetRegistryGeneration == "" || r.SourceRegistryGeneration == r.TargetRegistryGeneration ||
+		!validSHA256(r.SourceRegistryLayoutDigest) || !validSHA256(r.TargetRegistryLayoutDigest) ||
+		r.Limit == 0 || r.Limit > MaxRecoveryPageObjects || r.MaxBytes == 0 || r.MaxBytes > MaxRecoveryPageBytes ||
+		(r.ExpectedReportDigest != "" && !validSHA256(r.ExpectedReportDigest)) {
+		return errors.New("routesync: invalid recovery report request")
+	}
+	return nil
+}
+
+// RecoveryExecutionFact is one node-authoritative object snapshot. It carries
+// no new execution identity: Object.ObjectID is the SandboxID or BuildID and the
+// protected opaque Binding supplies the frozen logical identity.
+type RecoveryExecutionFact struct {
+	Object                RecoveryObjectSnapshot `json:"object"`
+	NormalizedDemand      []byte                 `json:"normalized_demand"`
+	DemandDigest          string                 `json:"demand_digest"`
+	DispatchSpec          []byte                 `json:"dispatch_spec"`
+	DispatchSpecDigest    string                 `json:"dispatch_spec_digest"`
+	ProviderPolicyVersion string                 `json:"provider_policy_version"`
+	AdmissionState        string                 `json:"admission_state"`
+	ResourceClaimed       bool                   `json:"resource_claimed,omitempty"`
+}
+
+func (f RecoveryExecutionFact) Validate() error {
+	if err := f.Object.Validate(); err != nil {
+		return err
+	}
+	if len(f.NormalizedDemand) == 0 || len(f.DispatchSpec) == 0 || f.ProviderPolicyVersion == "" ||
+		f.AdmissionState == "" || !digestBytes(f.DemandDigest, f.NormalizedDemand) ||
+		!digestBytes(f.DispatchSpecDigest, f.DispatchSpec) {
+		return errors.New("routesync: invalid recovery execution fact")
+	}
+	return nil
+}
+
+type RecoveryObjectSnapshot struct {
+	ObjectKind         string `json:"object_kind"`
+	ObjectID           string `json:"object_id"`
+	NodeID             string `json:"node_id"`
+	NodeEpoch          uint64 `json:"node_epoch"`
+	RegistryGeneration string `json:"registry_generation"`
+	Binding            string `json:"binding"`
+	BindingDigest      string `json:"binding_digest"`
+	EventSeq           uint64 `json:"event_seq,omitempty"`
+	State              string `json:"state"`
+
+	DataEndpoint       string `json:"data_endpoint,omitempty"`
+	TargetPort         int    `json:"target_port,omitempty"`
+	AccessToken        string `json:"access_token,omitempty"`
+	TrafficAccessToken string `json:"traffic_access_token,omitempty"`
+	TemplateRef        string `json:"template_ref,omitempty"`
+	SnapshotRef        string `json:"snapshot_ref,omitempty"`
+	SnapshotLocation   string `json:"snapshot_location,omitempty"`
+	ArtifactRef        string `json:"artifact_ref,omitempty"`
+	Reason             string `json:"reason,omitempty"`
+}
+
+func (s RecoveryObjectSnapshot) Validate() error {
+	if s.ObjectID == "" || s.NodeID == "" || s.NodeEpoch == 0 || s.RegistryGeneration == "" || s.State == "" {
+		return errors.New("routesync: incomplete recovery object snapshot")
+	}
+	if s.ObjectKind != "sandbox" && s.ObjectKind != "build" {
+		return errors.New("routesync: invalid recovery object kind")
+	}
+	if s.ObjectKind == "sandbox" && s.EventSeq == 0 || s.ObjectKind == "build" && s.EventSeq != 0 {
+		return errors.New("routesync: recovery event sequence is valid only for Sandbox snapshots")
+	}
+	digest, err := hex.DecodeString(s.BindingDigest)
+	if err != nil || len(digest) != sha256.Size || s.Binding == "" {
+		return errors.New("routesync: recovery Binding digest must be SHA-256 hex")
+	}
+	want := sha256.Sum256([]byte(s.Binding))
+	if hex.EncodeToString(want[:]) != s.BindingDigest {
+		return errors.New("routesync: recovery Binding digest mismatch")
+	}
+	return nil
+}
+
+// RecoveryReportPage is returned in the CmdAck for CmdCollectRecovery. Every
+// page repeats the whole-report digest so a coordinator never combines pages
+// from different node snapshots.
+type RecoveryReportPage struct {
+	RecoveryEpoch              uint64                  `json:"recovery_epoch"`
+	SourceClusterID            string                  `json:"source_cluster_id"`
+	SourceRegistryGeneration   string                  `json:"source_registry_generation"`
+	SourceRegistryLayoutDigest string                  `json:"source_registry_layout_digest"`
+	TargetRegistryGeneration   string                  `json:"target_registry_generation"`
+	TargetRegistryLayoutDigest string                  `json:"target_registry_layout_digest"`
+	NodeID                     string                  `json:"node_id"`
+	NodeEpoch                  uint64                  `json:"node_epoch"`
+	SessionSeq                 uint64                  `json:"session_seq"`
+	ReportDigest               string                  `json:"report_digest"`
+	TotalObjects               uint64                  `json:"total_objects"`
+	Offset                     uint64                  `json:"offset"`
+	NextOffset                 uint64                  `json:"next_offset"`
+	Complete                   bool                    `json:"complete"`
+	Objects                    []RecoveryExecutionFact `json:"objects"`
+}
+
+func (p RecoveryReportPage) ValidateFor(request RecoveryReportRequest, nodeID string, nodeEpoch, sessionSeq uint64) error {
+	if err := request.Validate(); err != nil {
+		return err
+	}
+	if p.RecoveryEpoch != request.RecoveryEpoch || p.SourceClusterID != request.SourceClusterID ||
+		p.SourceRegistryGeneration != request.SourceRegistryGeneration ||
+		p.SourceRegistryLayoutDigest != request.SourceRegistryLayoutDigest ||
+		p.TargetRegistryGeneration != request.TargetRegistryGeneration ||
+		p.TargetRegistryLayoutDigest != request.TargetRegistryLayoutDigest || p.NodeID != nodeID ||
+		p.NodeEpoch != nodeEpoch || p.SessionSeq != sessionSeq || p.Offset != request.Offset ||
+		!validSHA256(p.ReportDigest) || p.Offset > p.TotalObjects || p.NextOffset < p.Offset ||
+		p.NextOffset > p.TotalObjects || uint64(len(p.Objects)) != p.NextOffset-p.Offset ||
+		uint32(len(p.Objects)) > request.Limit || p.NextOffset > p.Offset+uint64(request.Limit) ||
+		p.Complete != (p.NextOffset == p.TotalObjects) ||
+		(request.ExpectedReportDigest != "" && p.ReportDigest != request.ExpectedReportDigest) {
+		return errors.New("routesync: recovery report page identity mismatch")
+	}
+	encoded, err := json.Marshal(p.Objects)
+	if err != nil || uint32(len(encoded)) > request.MaxBytes {
+		return errors.New("routesync: recovery report page exceeds its byte limit")
+	}
+	for index := range p.Objects {
+		if err := p.Objects[index].Validate(); err != nil {
+			return err
+		}
+		if p.Objects[index].Object.NodeID != nodeID || p.Objects[index].Object.NodeEpoch != nodeEpoch ||
+			p.Objects[index].Object.RegistryGeneration != request.SourceRegistryGeneration {
+			return errors.New("routesync: recovery report object belongs to another NodeEpoch")
+		}
+		if index > 0 && compareRecoveryFacts(p.Objects[index-1], p.Objects[index]) >= 0 {
+			return errors.New("routesync: recovery report page is not strictly ordered")
+		}
+	}
+	return nil
+}
+
+func CanonicalRecoveryReportDigest(objects []RecoveryExecutionFact) (string, error) {
+	if !slices.IsSortedFunc(objects, compareRecoveryFacts) {
+		return "", errors.New("routesync: recovery report is not ordered")
+	}
+	for index := range objects {
+		if err := objects[index].Validate(); err != nil {
+			return "", fmt.Errorf("routesync: recovery report object %d: %w", index, err)
+		}
+		if index > 0 && compareRecoveryFacts(objects[index-1], objects[index]) == 0 {
+			return "", errors.New("routesync: duplicate recovery report object")
+		}
+	}
+	encoded, err := json.Marshal(objects)
+	if err != nil {
+		return "", err
+	}
+	digest := sha256.Sum256(encoded)
+	return hex.EncodeToString(digest[:]), nil
+}
+
+func compareRecoveryFacts(left, right RecoveryExecutionFact) int {
+	if compared := bytes.Compare([]byte(left.Object.ObjectKind), []byte(right.Object.ObjectKind)); compared != 0 {
+		return compared
+	}
+	return bytes.Compare([]byte(left.Object.ObjectID), []byte(right.Object.ObjectID))
+}
+
+func validSHA256(value string) bool {
+	decoded, err := hex.DecodeString(value)
+	return err == nil && len(decoded) == sha256.Size
+}
+
+func digestBytes(value string, payload []byte) bool {
+	digest := sha256.Sum256(payload)
+	return value == hex.EncodeToString(digest[:])
 }
 
 type EventAck struct {
-	ObjectKind string `json:"object_kind"` // sandbox | build
+	ObjectKind string `json:"object_kind"` // sandbox
 	ObjectID   string `json:"object_id"`
 	EventSeq   uint64 `json:"event_seq"`
 }
@@ -138,19 +269,22 @@ type EventCursor struct {
 // node-local durable outbox. Fields irrelevant to the object kind/state remain
 // empty.
 type ExecutionEvent struct {
-	ObjectKind        string `json:"object_kind"`
-	ObjectID          string `json:"object_id"`
-	NodeID            string `json:"node_id"`
-	NodeEpoch         uint64 `json:"node_epoch"`
-	StorageGeneration string `json:"storage_generation"`
-	BindingDigest     string `json:"binding_digest"`
-	EventSeq          uint64 `json:"event_seq"`
-	State             string `json:"state"`
+	ObjectKind         string `json:"object_kind"`
+	ObjectID           string `json:"object_id"`
+	NodeID             string `json:"node_id"`
+	NodeEpoch          uint64 `json:"node_epoch"`
+	RegistryGeneration string `json:"registry_generation"`
+	Binding            string `json:"binding"`
+	BindingDigest      string `json:"binding_digest"`
+	EventSeq           uint64 `json:"event_seq"`
+	State              string `json:"state"`
 
 	DataEndpoint       string `json:"data_endpoint,omitempty"`
+	TargetPort         int    `json:"target_port,omitempty"`
 	AccessToken        string `json:"access_token,omitempty"`
 	TrafficAccessToken string `json:"traffic_access_token,omitempty"`
 	TemplateRef        string `json:"template_ref,omitempty"`
+	SnapshotRef        string `json:"snapshot_ref,omitempty"`
 	SnapshotLocation   string `json:"snapshot_location,omitempty"`
 	ArtifactRef        string `json:"artifact_ref,omitempty"`
 	Reason             string `json:"reason,omitempty"`
@@ -159,16 +293,20 @@ type ExecutionEvent struct {
 const MaxExecutionEventBytes = 256 << 10
 
 func (e ExecutionEvent) Validate() error {
-	if e.ObjectID == "" || e.NodeID == "" || e.NodeEpoch == 0 || e.StorageGeneration == "" ||
+	if e.ObjectID == "" || e.NodeID == "" || e.NodeEpoch == 0 || e.RegistryGeneration == "" ||
 		e.EventSeq == 0 || e.State == "" {
 		return errors.New("routesync: incomplete execution event")
 	}
-	if e.ObjectKind != "sandbox" && e.ObjectKind != "build" {
-		return errors.New("routesync: invalid execution event kind")
+	if e.ObjectKind != "sandbox" {
+		return errors.New("routesync: only Sandbox execution events are valid")
 	}
 	digest, err := hex.DecodeString(e.BindingDigest)
-	if err != nil || len(digest) != 32 {
+	if err != nil || len(digest) != 32 || e.Binding == "" {
 		return errors.New("routesync: execution event Binding digest must be SHA-256 hex")
+	}
+	wantDigest := sha256.Sum256([]byte(e.Binding))
+	if hex.EncodeToString(wantDigest[:]) != e.BindingDigest {
+		return errors.New("routesync: execution event Binding digest mismatch")
 	}
 	return nil
 }
@@ -197,12 +335,14 @@ type NodeRegister struct {
 	NodeEpoch        uint64            `json:"node_epoch,omitempty"`
 	SessionSeq       uint64            `json:"session_seq,omitempty"`
 	LoadModelVersion uint16            `json:"load_model_version,omitempty"`
-	Labels           map[string]string `json:"labels,omitempty"`          // zone / pool / slot / node (nodeSelectors)
-	Capacity         int               `json:"capacity,omitempty"`        // max sandboxes (headroom signal)
-	BuildCapacity    *BuildResources   `json:"build_capacity,omitempty"`  // CPU/mem/storage build pool (§7.5)
-	DataEndpoint     string            `json:"data_endpoint,omitempty"`   // host:port the router forwards data-plane to
-	RuntimeDigest    string            `json:"runtime_digest,omitempty"`  // guest runtime identity
-	AcceptRedirect   bool              `json:"accept_redirect,omitempty"` // node can reconnect to owner endpoints from Hello.Redirect
+	Labels           map[string]string `json:"labels,omitempty"` // zone / pool / slot / node (nodeSelectors)
+	Capabilities     map[string]bool   `json:"capabilities,omitempty"`
+	Draining         bool              `json:"draining,omitempty"`
+	Capacity         int               `json:"capacity,omitempty"`       // max sandboxes (headroom signal)
+	BuildCapacity    *BuildResources   `json:"build_capacity,omitempty"` // CPU/mem/storage build pool (§7.5)
+	DataEndpoint     string            `json:"data_endpoint,omitempty"`  // host:port the router forwards data-plane to
+	RuntimeDigest    string            `json:"runtime_digest,omitempty"` // guest runtime identity
+	FailureDomain    string            `json:"failure_domain,omitempty"`
 }
 
 type NodeLinkRedirect struct {
@@ -217,68 +357,46 @@ type NodeLinkTarget struct {
 // BuildResources is a node's build resource pool (or a build's request), kept
 // independent of sandbox memory because builds run in their own slice (§7.5).
 type BuildResources struct {
+	Slots   int   `json:"slots,omitempty"`
 	CPU     int   `json:"cpu,omitempty"`     // milli-cores
 	Mem     int64 `json:"mem,omitempty"`     // bytes
 	Storage int64 `json:"storage,omitempty"` // bytes
 }
 
-// Heartbeat is the node's periodic water-level report (cluster.md). Draining
-// is set by node-side drain (node-resource.md §2.5) so placement excludes the node.
-type Heartbeat struct {
-	Zone       string          `json:"zone,omitempty"`
-	Allocated  int64           `json:"allocated,omitempty"`   // memory allocated (bytes)
-	Pool       int64           `json:"pool,omitempty"`        // allocatable pool (bytes)
-	BuildAlloc *BuildResources `json:"build_alloc,omitempty"` // in-flight + reserved build usage
-	Counts     int             `json:"counts,omitempty"`      // live sandbox count (headroom signal)
-	Draining   bool            `json:"draining,omitempty"`
-}
-
-// Command is a lifecycle / key primitive the registry sends the node (cluster.md
-// §5.1). The node replies with a CmdAck(cmd_id) immediately (accepted/rejected)
-// and reports the terminal sandbox state via the route stream; commands are
-// idempotent by SID. Fields are populated per Kind.
+// Command is a tuple- and Binding-fenced workflow operation. Admission is
+// idempotent by SID or BuildID plus the immutable intent digests. Terminal
+// results are emitted through the durable execution-event outbox.
 type Command struct {
-	CmdID              string `json:"cmd_id"`
-	Kind               string `json:"kind"` // CmdCreate | CmdConnect | CmdDelete | CmdKey* | CmdBuildRegister
-	SID                string `json:"sid,omitempty"`
-	NodeEpoch          uint64 `json:"node_epoch,omitempty"`
-	SessionSeq         uint64 `json:"session_seq,omitempty"`
-	StorageGeneration  string `json:"storage_generation,omitempty"`
-	Binding            string `json:"binding,omitempty"`
-	BindingDigest      string `json:"binding_digest,omitempty"`
-	OldBindingDigest   string `json:"old_binding_digest,omitempty"`
-	DemandDigest       string `json:"demand_digest,omitempty"`
-	DispatchSpecDigest string `json:"dispatch_spec_digest,omitempty"`
-	Group              string `json:"group,omitempty"`
-	RouteKey           string `json:"route_key,omitempty"`
-	NormalizedDemand   []byte `json:"normalized_demand,omitempty"`
-	DispatchSpec       []byte `json:"dispatch_spec,omitempty"`
-	ProviderPolicy     string `json:"provider_policy_version,omitempty"`
-	// create
-	TemplateRef    string            `json:"template_ref,omitempty"` // snapshot template ref (cold start = fast restore)
-	KeyFingerprint string            `json:"key_fp,omitempty"`       // manifest-key fingerprint the node must already hold
-	Config         map[string]string `json:"config,omitempty"`       // merged sandbox config (node default ⊕ group ⊕ create)
-	AccessToken    string            `json:"access_token,omitempty"` // MAC(auth_key,sid), supplied by registry
-	// key_put / key_drop
-	ManifestKeyType string `json:"manifest_key_type,omitempty"` // inline | ref
-	ManifestKey     string `json:"manifest_key,omitempty"`      // hex; only on inline key_put
-	ManifestKeyRef  string `json:"manifest_key_ref,omitempty"`  // provider ref; resolved out-of-band by node owner
-	ExpiresUnix     int64  `json:"expires_unix,omitempty"`      // lease expiry (key_put)
-	// build_register (§7.5): pre-provision a build with registry-assigned ids +
-	// reserved resources. ImageRepo/RegistryAuth are the group's image-pull creds,
-	// delivered WITH the build task and used transiently (never persisted on the node).
-	BuildID        string          `json:"build_id,omitempty"`
-	Profile        string          `json:"profile,omitempty"`
-	BuildResources *BuildResources `json:"build_resources,omitempty"`
-	ImageRepo      string          `json:"image_repo,omitempty"`
-	RegistryAuth   string          `json:"registry_auth,omitempty"` // docker config.json; transient
+	CmdID              string                 `json:"cmd_id"`
+	Kind               string                 `json:"kind"`
+	SID                string                 `json:"sid,omitempty"`
+	BuildID            string                 `json:"build_id,omitempty"`
+	NodeEpoch          uint64                 `json:"node_epoch,omitempty"`
+	SessionSeq         uint64                 `json:"session_seq,omitempty"`
+	RegistryGeneration string                 `json:"registry_generation,omitempty"`
+	Binding            string                 `json:"binding,omitempty"`
+	BindingDigest      string                 `json:"binding_digest,omitempty"`
+	OldBindingDigest   string                 `json:"old_binding_digest,omitempty"`
+	DemandDigest       string                 `json:"demand_digest,omitempty"`
+	DispatchSpecDigest string                 `json:"dispatch_spec_digest,omitempty"`
+	Group              string                 `json:"group,omitempty"`
+	RouteKey           string                 `json:"route_key,omitempty"`
+	NormalizedDemand   []byte                 `json:"normalized_demand,omitempty"`
+	DispatchSpec       []byte                 `json:"dispatch_spec,omitempty"`
+	ProviderPolicy     string                 `json:"provider_policy_version,omitempty"`
+	Recovery           *RecoveryReportRequest `json:"recovery,omitempty"`
+	EventAck           *EventAck              `json:"event_ack,omitempty"`
 }
 
 // CmdAck acknowledges a Command's receipt; the terminal outcome arrives via the
 // route stream, not here.
 type CmdAck struct {
-	CmdID   string `json:"cmd_id"`
-	Status  string `json:"status"` // AckAccepted | AckRejected
-	Outcome string `json:"outcome,omitempty"`
-	Reason  string `json:"reason,omitempty"`
+	CmdID                 string                  `json:"cmd_id"`
+	Status                string                  `json:"status"` // AckAccepted | AckRejected
+	Outcome               string                  `json:"outcome,omitempty"`
+	Reason                string                  `json:"reason,omitempty"`
+	Recovery              *RecoveryReportPage     `json:"recovery,omitempty"`
+	RebindObject          *RecoveryObjectSnapshot `json:"rebind_object,omitempty"`
+	RebindAdmissionState  string                  `json:"rebind_admission_state,omitempty"`
+	RebindResourceClaimed bool                    `json:"rebind_resource_claimed,omitempty"`
 }

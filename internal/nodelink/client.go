@@ -26,23 +26,15 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 )
 
-// Node is what the node-link client needs from the node's orchestrator: a route
-// source for the node's sandboxes and execution of registry commands.
+// Node is the final node-link surface. Lifecycle facts are emitted exclusively
+// through DurableEventOutbox; PlacementLoad is Holder-local soft state.
 type Node interface {
-	routesync.Source
-	// HandleCommand executes a registry lifecycle / key command (create / connect
-	// / delete / key_*) and returns a receipt ack (accepted, or rejected on a
-	// precondition failure). Slow work (a boot/resume) runs asynchronously and the
-	// terminal sandbox state is reported on the route stream; the ack only confirms
-	// receipt + that synchronous preconditions (key installed, template valid) held.
 	HandleCommand(ctx context.Context, cmd *routesync.Command) *routesync.CmdAck
-	// Heartbeat is the node's current water level (live sandbox count, drain),
-	// sent periodically so the registry tracks liveness (the dead-node sweep) and
-	// placement headroom (cluster.md / §11).
-	Heartbeat() *routesync.Heartbeat
-	// BuildEvents streams the node's build state transitions (registered/building/
-	// ready/error) up to the registry, which converges the BuildStore (§5.1/§7.5).
-	BuildEvents() <-chan *routesync.BuildEvent
+	PlacementLoad(context.Context) (*routesync.PlacementLoadSnapshot, error)
+}
+
+type placementWakeSource interface {
+	PlacementWake() <-chan struct{}
 }
 
 type nodeLinkObserver interface {
@@ -69,10 +61,8 @@ type DurableEventOutbox interface {
 // node's identity, then streams its sandbox routes while executing registry
 // commands, reconnecting with capped backoff.
 type Client struct {
-	dial          func(ctx context.Context) (net.Conn, error)
 	dialEndpoint  func(ctx context.Context, endpoint string) (net.Conn, error)
 	endpoint      string
-	allowRedirect bool
 	identity      routesync.NodeRegister
 	sequencer     SessionSequencer
 	eventOutbox   DurableEventOutbox
@@ -80,21 +70,9 @@ type Client struct {
 	eventBytes    int
 	eventInterval time.Duration
 	node          Node
-	heartbeat     time.Duration
+	placement     time.Duration
 	tlsConfig     *tls.Config // non-nil = dial the registry over (m)TLS instead of h2c
 	log           *slog.Logger
-}
-
-// SetSessionSequencer installs the durable tuple source used by final cluster
-// mode. It must be configured before Run starts.
-func (c *Client) SetSessionSequencer(sequencer SessionSequencer) {
-	c.sequencer = sequencer
-}
-
-// SetDurableEventOutbox enables the final node-authoritative execution-event
-// path. It remains dormant when no outbox is configured.
-func (c *Client) SetDurableEventOutbox(outbox DurableEventOutbox) {
-	c.eventOutbox = outbox
 }
 
 // SetEventReplayLimits configures one bounded replay batch per interval.
@@ -110,36 +88,29 @@ func (c *Client) SetEventReplayLimits(batch, bytes int, interval time.Duration) 
 	}
 }
 
-// New builds a Client. dial returns a fresh connection to the registry's
-// node-link listener (a TCP or mTLS dial); heartbeat is the period between node
-// heartbeats (<=0 → 10s).
-func New(dial func(ctx context.Context) (net.Conn, error), identity routesync.NodeRegister, node Node, heartbeat time.Duration, tlsConfig *tls.Config, log *slog.Logger) *Client {
-	if heartbeat <= 0 {
-		heartbeat = 10 * time.Second
+// New builds the final node-link client. Session sequencing, durable event
+// replay and Holder redirects are mandatory protocol behavior.
+func New(
+	endpoint string,
+	dialEndpoint func(ctx context.Context, endpoint string) (net.Conn, error),
+	identity routesync.NodeRegister,
+	node Node,
+	sequencer SessionSequencer,
+	eventOutbox DurableEventOutbox,
+	interval time.Duration,
+	tlsConfig *tls.Config,
+	log *slog.Logger,
+) *Client {
+	if interval <= 0 {
+		interval = 500 * time.Millisecond
 	}
 	if log == nil {
 		log = slog.Default()
 	}
 	return &Client{
-		dial: dial, identity: identity, node: node, heartbeat: heartbeat, tlsConfig: tlsConfig, log: log,
-		eventBatch: 64, eventBytes: 1 << 20, eventInterval: time.Second,
-	}
-}
-
-// NewWithEndpoint builds a Client that knows the registry endpoint it is dialing.
-// When allowRedirect is true the node advertises redirect support and will
-// reconnect to owner endpoints returned by the registry.
-func NewWithEndpoint(endpoint string, dial func(ctx context.Context, endpoint string) (net.Conn, error), identity routesync.NodeRegister, node Node, heartbeat time.Duration, tlsConfig *tls.Config, log *slog.Logger, allowRedirect bool) *Client {
-	if heartbeat <= 0 {
-		heartbeat = 10 * time.Second
-	}
-	if log == nil {
-		log = slog.Default()
-	}
-	identity.AcceptRedirect = allowRedirect
-	return &Client{
-		dialEndpoint: dial, endpoint: endpoint, allowRedirect: allowRedirect,
-		identity: identity, node: node, heartbeat: heartbeat, tlsConfig: tlsConfig, log: log,
+		dialEndpoint: dialEndpoint, endpoint: endpoint, identity: identity, node: node,
+		sequencer: sequencer, eventOutbox: eventOutbox,
+		placement: interval, tlsConfig: tlsConfig, log: log,
 		eventBatch: 64, eventBytes: 1 << 20, eventInterval: time.Second,
 	}
 }
@@ -157,7 +128,7 @@ func (c *Client) Run(ctx context.Context) {
 			return
 		}
 		var redir nodeLinkRedirect
-		if errors.As(err, &redir) && c.allowRedirect && c.dialEndpoint != nil {
+		if errors.As(err, &redir) {
 			redirectTargets = redir.targets
 			redirectIndex = 0
 			endpoint = redirectTargets[0].Endpoint
@@ -166,14 +137,14 @@ func (c *Client) Run(ctx context.Context) {
 			backoff = 200 * time.Millisecond
 			continue
 		}
-		if c.allowRedirect && len(redirectTargets) > 0 && redirectIndex+1 < len(redirectTargets) {
+		if len(redirectTargets) > 0 && redirectIndex+1 < len(redirectTargets) {
 			redirectIndex++
 			endpoint = redirectTargets[redirectIndex].Endpoint
 			c.notifyRedirect(redirectTargets[redirectIndex])
 			c.log.Warn("node-link: trying next redirected owner", "node", c.identity.NodeID, "member", redirectTargets[redirectIndex].MemberID, "endpoint", endpoint, "err", err)
 			continue
 		}
-		if c.allowRedirect && endpoint != c.endpoint {
+		if endpoint != c.endpoint {
 			redirectTargets = nil
 			redirectIndex = 0
 			endpoint = c.endpoint
@@ -195,14 +166,15 @@ func (c *Client) Run(ctx context.Context) {
 func (c *Client) session(ctx context.Context, endpoint string) error {
 	identity := c.identity
 	identity.Version = routesync.Version
-	if c.sequencer != nil {
-		tuple, err := c.sequencer.NextSession(ctx)
-		if err != nil {
-			return fmt.Errorf("node-link: persist session tuple: %w", err)
-		}
-		identity.NodeEpoch = tuple.NodeEpoch
-		identity.SessionSeq = tuple.SessionSeq
+	if c.sequencer == nil || c.eventOutbox == nil || c.dialEndpoint == nil || c.node == nil || endpoint == "" {
+		return errors.New("node-link: incomplete final client dependencies")
 	}
+	tuple, err := c.sequencer.NextSession(ctx)
+	if err != nil {
+		return fmt.Errorf("node-link: persist session tuple: %w", err)
+	}
+	identity.NodeEpoch = tuple.NodeEpoch
+	identity.SessionSeq = tuple.SessionSeq
 	sctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	tr, scheme, host, err := c.transport(endpoint)
@@ -233,9 +205,6 @@ func (c *Client) session(ctx context.Context, endpoint string) error {
 	if err := <-regErr; err != nil {
 		return err
 	}
-	// Registry's Hello ack may carry the node owner's resume token. Empty means
-	// full resync; a fingerprint mismatch inside StreamAuthority also falls back
-	// to full resync.
 	hello, err := routesync.ReadMsg(resp.Body)
 	if err != nil {
 		return err
@@ -248,109 +217,170 @@ func (c *Client) session(ctx context.Context, endpoint string) error {
 	}
 	c.notifySession(endpoint)
 
-	// Stream the node's routes (to pw) while executing commands (from resp.Body),
-	// reusing the shared authority loop. Subscribe(kind=registry) makes the loop
-	// stream routes; onUp dispatches commands.
-	reg := routesync.Register{Subscribe: &routesync.Subscribe{Kind: routesync.KindRegistry}}
-	reg.ResumeFrom = hello.Hello.ResumeFrom
-	outbox := make(chan *routesync.Msg)
+	wireOut := make(chan *routesync.Msg)
 	highOut := make(chan *routesync.Msg, 32)
 	eventOut := make(chan *routesync.Msg, 64)
-	hbUpdate := make(chan struct{}, 1)
-	var hbMu sync.Mutex
-	var latestHeartbeat *routesync.Msg
-	go runNodeLinkOutbox(sctx, outbox, highOut, eventOut, hbUpdate, &hbMu, &latestHeartbeat)
-	onUp := func(uctx context.Context, m *routesync.Msg) {
-		if m.Type == routesync.TypeEventAck && m.EventAck != nil {
-			if c.eventOutbox == nil {
-				return
-			}
-			if err := c.eventOutbox.AckExecutionEvent(uctx, identity.NodeID, identity.NodeEpoch, *m.EventAck); err != nil {
-				c.log.Warn("node-link: reject execution event acknowledgement", "node", identity.NodeID,
-					"kind", m.EventAck.ObjectKind, "object", m.EventAck.ObjectID, "event_seq", m.EventAck.EventSeq, "err", err)
-			}
-			return
-		}
-		if m.Type == routesync.TypeCommand && m.Cmd != nil {
-			if !commandMatchesSession(m.Cmd, identity) {
-				select {
-				case highOut <- &routesync.Msg{Type: routesync.TypeCmdAck, Ack: &routesync.CmdAck{
-					CmdID: m.Cmd.CmdID, Status: routesync.AckRejected,
-					Outcome: routesync.DispatchSessionMoved, Reason: "command session tuple is stale",
-				}}:
-				case <-uctx.Done():
-				}
-				return
-			}
-			if ack := c.node.HandleCommand(uctx, m.Cmd); ack != nil {
-				select {
-				case highOut <- &routesync.Msg{Type: routesync.TypeCmdAck, Ack: ack}:
-				case <-uctx.Done():
-				}
-			}
-		}
-	}
-	if c.eventOutbox != nil {
-		go runDurableEventReplay(sctx, c.eventOutbox, identity.NodeID, identity.NodeEpoch,
-			c.eventBatch, c.eventBytes, c.eventInterval, eventOut, c.log)
-	}
-	// Periodic heartbeat (node -> registry): liveness for the dead-node sweep +
-	// water level for placement (cluster.md / §11), serialized via the outbox.
+	loadUpdate := make(chan struct{}, 1)
+	var loadMu sync.Mutex
+	var latestLoad *routesync.Msg
+	go runNodeLinkOutbox(sctx, wireOut, highOut, eventOut, loadUpdate, &loadMu, &latestLoad)
+	writerDone := make(chan error, 1)
 	go func() {
-		t := time.NewTicker(c.heartbeat)
-		defer t.Stop()
 		for {
 			select {
 			case <-sctx.Done():
+				writerDone <- sctx.Err()
 				return
-			case <-t.C:
-				hb := c.node.Heartbeat()
-				if hb == nil {
-					continue
-				}
-				hbMu.Lock()
-				latestHeartbeat = &routesync.Msg{Type: routesync.TypeHeartbeat, Beat: hb}
-				hbMu.Unlock()
-				select {
-				case hbUpdate <- struct{}{}:
-				default:
-				}
-			}
-		}
-	}()
-	// Build events (node -> registry): the BuildStore converges from these + releases
-	// reserved resources on a terminal state (cluster.md / §7.5).
-	go func() {
-		evs := c.node.BuildEvents()
-		if evs == nil {
-			return
-		}
-		for {
-			select {
-			case <-sctx.Done():
-				return
-			case ev := <-evs:
-				if ev == nil {
-					continue
-				}
-				select {
-				case eventOut <- &routesync.Msg{Type: routesync.TypeBuildEvent, Build: ev}:
-				case <-sctx.Done():
+			case message := <-wireOut:
+				if err := routesync.WriteMsg(pw, message); err != nil {
+					writerDone <- err
 					return
 				}
 			}
 		}
 	}()
-	routesync.StreamAuthority(sctx, pw, func() {}, resp.Body, c.node, reg, onUp, outbox, c.log)
-	return sctx.Err()
+	go runDurableEventReplay(sctx, c.eventOutbox, identity.NodeID, identity.NodeEpoch,
+		c.eventBatch, c.eventBytes, c.eventInterval, eventOut, c.log)
+	go c.runPlacementSnapshots(sctx, identity, loadUpdate, &loadMu, &latestLoad)
+
+	readerDone := make(chan error, 1)
+	go func() { readerDone <- c.readDownlink(sctx, resp.Body, identity, highOut) }()
+	select {
+	case err := <-readerDone:
+		return err
+	case err := <-writerDone:
+		return err
+	case <-sctx.Done():
+		return sctx.Err()
+	}
+}
+
+func (c *Client) readDownlink(
+	ctx context.Context,
+	reader io.Reader,
+	identity routesync.NodeRegister,
+	highOut chan<- *routesync.Msg,
+) error {
+	for {
+		message, err := routesync.ReadMsg(reader)
+		if err != nil {
+			return err
+		}
+		switch message.Type {
+		case routesync.TypeEventAck:
+			if message.EventAck == nil {
+				continue
+			}
+			if err := c.eventOutbox.AckExecutionEvent(ctx, identity.NodeID, identity.NodeEpoch, *message.EventAck); err != nil {
+				c.log.Warn("node-link: reject execution event acknowledgement", "node", identity.NodeID,
+					"kind", message.EventAck.ObjectKind, "object", message.EventAck.ObjectID,
+					"event_seq", message.EventAck.EventSeq, "err", err)
+			}
+		case routesync.TypeCommand:
+			if message.Cmd == nil {
+				return errors.New("node-link: empty command frame")
+			}
+			var ack *routesync.CmdAck
+			if !commandMatchesSession(message.Cmd, identity) {
+				ack = &routesync.CmdAck{
+					CmdID: message.Cmd.CmdID, Status: routesync.AckRejected,
+					Outcome: routesync.DispatchSessionMoved, Reason: "command session tuple is stale",
+				}
+			} else {
+				ack = c.node.HandleCommand(ctx, message.Cmd)
+			}
+			if ack == nil {
+				return errors.New("node-link: command handler returned no acknowledgement")
+			}
+			select {
+			case highOut <- &routesync.Msg{Type: routesync.TypeCmdAck, Ack: ack}:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		default:
+			return fmt.Errorf("node-link: forbidden downlink message type %q", message.Type)
+		}
+	}
+}
+
+func (c *Client) runPlacementSnapshots(
+	ctx context.Context,
+	identity routesync.NodeRegister,
+	update chan<- struct{},
+	mu *sync.Mutex,
+	latest **routesync.Msg,
+) {
+	interval := c.placement
+	if interval <= 0 {
+		interval = 500 * time.Millisecond
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	var wake <-chan struct{}
+	if source, ok := c.node.(placementWakeSource); ok {
+		wake = source.PlacementWake()
+	}
+	var sampleSeq uint64
+	publish := func() {
+		snapshot, err := c.node.PlacementLoad(ctx)
+		if err != nil {
+			if ctx.Err() == nil {
+				c.log.Warn("node-link: sample PlacementLoadSnapshot", "node", identity.NodeID, "err", err)
+			}
+			return
+		}
+		if snapshot == nil {
+			return
+		}
+		sampleSeq++
+		fillPlacementIdentity(snapshot, identity, sampleSeq)
+		mu.Lock()
+		*latest = &routesync.Msg{Type: routesync.TypePlacementLoad, Load: snapshot}
+		mu.Unlock()
+		select {
+		case update <- struct{}{}:
+		default:
+		}
+	}
+	publish()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			publish()
+		case <-wake:
+			publish()
+		}
+	}
+}
+
+func fillPlacementIdentity(snapshot *routesync.PlacementLoadSnapshot, identity routesync.NodeRegister, sampleSeq uint64) {
+	snapshot.NodeID = identity.NodeID
+	snapshot.NodeEpoch = identity.NodeEpoch
+	snapshot.SessionSeq = identity.SessionSeq
+	snapshot.DataEndpoint = identity.DataEndpoint
+	snapshot.SampleSeq = sampleSeq
+	snapshot.LoadModelVersion = identity.LoadModelVersion
+	snapshot.RuntimeDigest = identity.RuntimeDigest
+	snapshot.SandboxSlotCapacity = uint64(max(identity.Capacity, 0))
+	if snapshot.SandboxSlotHardLimit == 0 {
+		snapshot.SandboxSlotHardLimit = snapshot.SandboxSlotCapacity
+	}
+	if build := identity.BuildCapacity; build != nil {
+		snapshot.BuildSlotCapacity = uint64(max(build.Slots, 0))
+		snapshot.BuildCPUCapacity = uint64(max(build.CPU, 0))
+		snapshot.BuildMemoryCapacity = uint64(max(build.Mem, 0))
+		snapshot.BuildStorageCapacity = uint64(max(build.Storage, 0))
+		if snapshot.BuildSlotHardLimit == 0 {
+			snapshot.BuildSlotHardLimit = snapshot.BuildSlotCapacity
+		}
+	}
 }
 
 func commandMatchesSession(cmd *routesync.Command, identity routesync.NodeRegister) bool {
 	if cmd == nil {
 		return false
-	}
-	if cmd.NodeEpoch == 0 && cmd.SessionSeq == 0 {
-		return true
 	}
 	return cmd.NodeEpoch != 0 && cmd.SessionSeq != 0 &&
 		cmd.NodeEpoch == identity.NodeEpoch && cmd.SessionSeq == identity.SessionSeq
@@ -368,21 +398,21 @@ func runNodeLinkOutbox(
 	outbox chan<- *routesync.Msg,
 	highOut <-chan *routesync.Msg,
 	eventOut <-chan *routesync.Msg,
-	hbUpdate <-chan struct{},
-	hbMu *sync.Mutex,
-	latestHeartbeat **routesync.Msg,
+	loadUpdate <-chan struct{},
+	loadMu *sync.Mutex,
+	latestLoad **routesync.Msg,
 ) {
 	const (
-		maxPriorityBurst     = 32
-		maxNonHeartbeatBurst = 32
+		maxPriorityBurst = 32
+		maxNonLoadBurst  = 32
 	)
-	heartbeatPending := false
+	loadPending := false
 	priorityBurst := 0
-	nonHeartbeatBurst := 0
+	nonLoadBurst := 0
 	for {
 		select {
-		case <-hbUpdate:
-			heartbeatPending = true
+		case <-loadUpdate:
+			loadPending = true
 		default:
 		}
 		if priorityBurst >= maxPriorityBurst {
@@ -394,24 +424,24 @@ func runNodeLinkOutbox(
 					return
 				}
 				priorityBurst = 0
-				nonHeartbeatBurst++
+				nonLoadBurst++
 				continue
 			default:
 			}
 		}
-		if heartbeatPending && nonHeartbeatBurst >= maxNonHeartbeatBurst {
-			msg := takeLatestHeartbeat(hbMu, latestHeartbeat)
+		if loadPending && nonLoadBurst >= maxNonLoadBurst {
+			msg := takeLatestLoad(loadMu, latestLoad)
 			if msg == nil {
-				heartbeatPending = false
-				nonHeartbeatBurst = 0
+				loadPending = false
+				nonLoadBurst = 0
 				continue
 			}
 			if !sendNodeLinkOutbox(ctx, outbox, msg) {
 				return
 			}
-			heartbeatPending = false
+			loadPending = false
 			priorityBurst = 0
-			nonHeartbeatBurst = 0
+			nonLoadBurst = 0
 			continue
 		}
 		select {
@@ -422,7 +452,7 @@ func runNodeLinkOutbox(
 				return
 			}
 			priorityBurst++
-			nonHeartbeatBurst++
+			nonLoadBurst++
 			continue
 		default:
 		}
@@ -434,22 +464,22 @@ func runNodeLinkOutbox(
 				return
 			}
 			priorityBurst = 0
-			nonHeartbeatBurst++
+			nonLoadBurst++
 			continue
 		default:
 		}
-		if heartbeatPending {
-			msg := takeLatestHeartbeat(hbMu, latestHeartbeat)
+		if loadPending {
+			msg := takeLatestLoad(loadMu, latestLoad)
 			if msg == nil {
-				heartbeatPending = false
+				loadPending = false
 				continue
 			}
 			if !sendNodeLinkOutbox(ctx, outbox, msg) {
 				return
 			}
-			heartbeatPending = false
+			loadPending = false
 			priorityBurst = 0
-			nonHeartbeatBurst = 0
+			nonLoadBurst = 0
 			continue
 		}
 		select {
@@ -460,15 +490,15 @@ func runNodeLinkOutbox(
 				return
 			}
 			priorityBurst++
-			nonHeartbeatBurst++
+			nonLoadBurst++
 		case m := <-eventOut:
 			if !sendNodeLinkOutbox(ctx, outbox, m) {
 				return
 			}
 			priorityBurst = 0
-			nonHeartbeatBurst++
-		case <-hbUpdate:
-			heartbeatPending = true
+			nonLoadBurst++
+		case <-loadUpdate:
+			loadPending = true
 		}
 	}
 }
@@ -536,7 +566,7 @@ func sendNodeLinkOutbox(ctx context.Context, outbox chan<- *routesync.Msg, msg *
 	}
 }
 
-func takeLatestHeartbeat(mu *sync.Mutex, latest **routesync.Msg) *routesync.Msg {
+func takeLatestLoad(mu *sync.Mutex, latest **routesync.Msg) *routesync.Msg {
 	mu.Lock()
 	defer mu.Unlock()
 	msg := *latest
@@ -563,13 +593,7 @@ func (c *Client) transport(endpoint string) (*http2.Transport, string, string, e
 	}
 	tr := &http2.Transport{}
 	dial := func(ctx context.Context) (net.Conn, error) {
-		if c.dialEndpoint != nil {
-			return c.dialEndpoint(ctx, dialEndpoint)
-		}
-		if c.dial != nil {
-			return c.dial(ctx)
-		}
-		return nil, fmt.Errorf("node-link: no dialer configured")
+		return c.dialEndpoint(ctx, dialEndpoint)
 	}
 	if scheme == "https" {
 		tr.DialTLSContext = func(ctx context.Context, _, _ string, _ *tls.Config) (net.Conn, error) {

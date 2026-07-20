@@ -214,7 +214,7 @@ func decodeStateControl(raw []byte) (stateControl, error) {
 type dataStateMetadata struct {
 	Initialized          bool               `json:"initialized"`
 	ClusterID            string             `json:"cluster_id"`
-	StorageGeneration    string             `json:"storage_generation"`
+	RegistryGeneration   string             `json:"registry_generation"`
 	ShardID              uint32             `json:"shard_id"`
 	SchemaVersion        uint32             `json:"schema_version"`
 	ProtocolVersion      uint32             `json:"protocol_version"`
@@ -233,7 +233,7 @@ type dataStateMetadata struct {
 func metadataFromDataState(state DataState) dataStateMetadata {
 	metadata := dataStateMetadata{
 		Initialized: state.Initialized, ClusterID: state.ClusterID,
-		StorageGeneration: state.StorageGeneration, ShardID: state.ShardID,
+		RegistryGeneration: state.RegistryGeneration, ShardID: state.ShardID,
 		SchemaVersion: state.SchemaVersion, ProtocolVersion: state.ProtocolVersion,
 		HashVersion: state.HashVersion, RouteBucketCount: state.RouteBucketCount,
 		BuildBucketCount: state.BuildBucketCount, VirtualShardCount: state.VirtualShardCount,
@@ -251,7 +251,7 @@ func metadataFromDataState(state DataState) dataStateMetadata {
 
 func (m dataStateMetadata) dataState() DataState {
 	state := DataState{
-		Initialized: m.Initialized, ClusterID: m.ClusterID, StorageGeneration: m.StorageGeneration,
+		Initialized: m.Initialized, ClusterID: m.ClusterID, RegistryGeneration: m.RegistryGeneration,
 		ShardID: m.ShardID, SchemaVersion: m.SchemaVersion, ProtocolVersion: m.ProtocolVersion,
 		HashVersion: m.HashVersion, RouteBucketCount: m.RouteBucketCount,
 		BuildBucketCount: m.BuildBucketCount, VirtualShardCount: m.VirtualShardCount,

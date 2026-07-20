@@ -28,6 +28,8 @@ workers: 2
 tls:
   cert: /etc/node-ctl/tls/fullchain.pem
   key: /etc/node-ctl/tls/privkey.pem
+  # Required when this listener is the cluster.data_endpoint.
+  client_ca: /etc/node-ctl/tls/cluster-ca.pem
 
 # Bootstrap fallbacks, used only until serve pushes its authoritative policy over the
 # registration handshake: auth = X-Access-Token check (off|log|enforce), park_timeout

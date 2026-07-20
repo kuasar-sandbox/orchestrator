@@ -2,6 +2,7 @@ package raftstore
 
 import (
 	"bytes"
+	"fmt"
 	"testing"
 
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
@@ -9,8 +10,8 @@ import (
 )
 
 func TestDataRecoveryRequiresRebindBeforeProjectionActivation(t *testing.T) {
-	source := testManifest(4, "generation-source")
-	target := testManifest(4, "generation-target")
+	source := testRegistryLayout(4, "generation-source")
+	target := testRegistryLayout(4, "generation-target")
 	group, routeKey := "/recovery", "route"
 	state, initial := initializedRouteShard(t, target, group, routeKey)
 	recovery, recoveryIdentity, finalIdentity := beginRecoveryFixture(t, &state, initial, source, target, 2)
@@ -49,8 +50,8 @@ func TestDataRecoveryRequiresRebindBeforeProjectionActivation(t *testing.T) {
 	}
 
 	final := RecoveryFinalization{
-		RecoveryEpoch: recovery.RecoveryEpoch, SourceStorageGeneration: recovery.SourceStorageGeneration,
-		SourceManifestDigest: recovery.SourceManifestDigest,
+		RecoveryEpoch: recovery.RecoveryEpoch, SourceRegistryGeneration: recovery.SourceRegistryGeneration,
+		SourceRegistryLayoutDigest: recovery.SourceRegistryLayoutDigest,
 	}
 	applyDataOK(t, &state, 8, DataCommand{
 		Type: DataFinalizeRecovery, Identity: finalIdentity, RecoveryFinal: &final,
@@ -65,8 +66,8 @@ func TestDataRecoveryRequiresRebindBeforeProjectionActivation(t *testing.T) {
 }
 
 func TestDataRecoveryQuarantinesConflictingLogicalClaims(t *testing.T) {
-	source := testManifest(4, "generation-source-conflict")
-	target := testManifest(4, "generation-target-conflict")
+	source := testRegistryLayout(4, "generation-source-conflict")
+	target := testRegistryLayout(4, "generation-target-conflict")
 	group, routeKey := "/recovery", "conflict"
 	state, initial := initializedRouteShard(t, target, group, routeKey)
 	recovery, identity, _ := beginRecoveryFixture(t, &state, initial, source, target, 2)
@@ -92,14 +93,50 @@ func TestDataRecoveryQuarantinesConflictingLogicalClaims(t *testing.T) {
 	}
 }
 
+func TestDataRecoveryRebindProjectionRetryIsExactlyIdempotent(t *testing.T) {
+	source := testRegistryLayout(4, "generation-source-retry")
+	target := testRegistryLayout(4, "generation-target-retry")
+	group, routeKey := "/recovery", "retry"
+	state, initial := initializedRouteShard(t, target, group, routeKey)
+	recovery, identity, _ := beginRecoveryFixture(t, &state, initial, source, target, 2)
+	record := recoveryRouteRecord(t, source, target, recovery, group, routeKey, "sandbox-retry", "report-retry")
+	applyDataOK(t, &state, 3, DataCommand{Type: DataStageRecovery, Identity: identity, RecoveryRecord: &record})
+
+	update := recoveryUpdate(record)
+	projection := cloneRouteRecord(*record.Route)
+	update.Route = &projection
+	applyDataOK(t, &state, 4, DataCommand{Type: DataAckRecovery, Identity: identity, RecoveryUpdate: &update})
+	applyDataOK(t, &state, 5, DataCommand{Type: DataAckRecovery, Identity: identity, RecoveryUpdate: &update})
+
+	newer := cloneRouteRecord(projection)
+	newer.Ready.LastEventSeq++
+	update.Route = &newer
+	applyDataOK(t, &state, 6, DataCommand{Type: DataAckRecovery, Identity: identity, RecoveryUpdate: &update})
+
+	changed := cloneRouteRecord(newer)
+	changed.Ready.TrafficAccessToken = "changed-without-new-event"
+	update.Route = &changed
+	result := ApplyDataCommand(&state, 7, DataCommand{
+		Type: DataAckRecovery, Identity: identity, RecoveryUpdate: &update,
+	})
+	if !result.Conflict {
+		t.Fatal("rebind retry changed its committed projection without a newer event")
+	}
+	stored := state.RecoveryRecords[recoveryRecordKey(record)]
+	if stored.State != RecoveryObjectRebound || stored.Route.Ready.LastEventSeq != newer.Ready.LastEventSeq ||
+		stored.Route.Ready.TrafficAccessToken != newer.Ready.TrafficAccessToken {
+		t.Fatalf("committed rebind projection changed after conflicting retry: %+v", stored)
+	}
+}
+
 func TestPebbleRecoveryProgressSurvivesRestartAndSnapshot(t *testing.T) {
 	engine, err := OpenPebbleStateEngine(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer engine.Close()
-	source := testManifest(4, "generation-source-disk")
-	target := testManifest(4, "generation-target-disk")
+	source := testRegistryLayout(4, "generation-source-disk")
+	target := testRegistryLayout(4, "generation-target-disk")
 	group, routeKey := "/recovery", "disk"
 	initial := routeShardIdentity(t, target, group, routeKey)
 	shardID := DataRaftShardID(initial.ShardID)
@@ -157,8 +194,8 @@ func TestPebbleRecoveryProgressSurvivesRestartAndSnapshot(t *testing.T) {
 		Type: DataActivateRecovery, Identity: recoveryIdentity, RecoveryUpdate: &update,
 	})
 	final := RecoveryFinalization{
-		RecoveryEpoch: recovery.RecoveryEpoch, SourceStorageGeneration: recovery.SourceStorageGeneration,
-		SourceManifestDigest: recovery.SourceManifestDigest,
+		RecoveryEpoch: recovery.RecoveryEpoch, SourceRegistryGeneration: recovery.SourceRegistryGeneration,
+		SourceRegistryLayoutDigest: recovery.SourceRegistryLayoutDigest,
 	}
 	applyDiskData(t, targetReplica, 6, DataCommand{
 		Type: DataFinalizeRecovery, Identity: finalIdentity, RecoveryFinal: &final,
@@ -176,12 +213,72 @@ func TestPebbleRecoveryProgressSurvivesRestartAndSnapshot(t *testing.T) {
 	}
 }
 
+func TestPebbleRecoveryLookupIsBoundedAndPaged(t *testing.T) {
+	engine, err := OpenPebbleStateEngine(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close()
+	source := testRegistryLayout(4, "generation-source-lookup")
+	target := testRegistryLayout(4, "generation-target-lookup")
+	group := "/recovery/lookup"
+	firstRouteKey := routeKeyForShard(t, target, group, 0, "route")
+	initial := routeShardIdentity(t, target, group, firstRouteKey)
+	machine := engine.NewStateMachine(DataRaftShardID(initial.ShardID), 1)
+	if _, err := machine.Open(make(chan struct{})); err != nil {
+		t.Fatal(err)
+	}
+	bootstrap, err := NewDataShardBootstrap(target, initial.ShardID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyDiskData(t, machine, 1, DataCommand{
+		Type: DataInitializeShard, Identity: initial, Bootstrap: &bootstrap, ReplicaIDs: bootstrap.ReplicaIDs,
+	})
+	recovery, recoveryIdentity, _ := recoveryFixture(t, initial, source, target, 2)
+	applyDiskData(t, machine, 2, DataCommand{
+		Type: DataBeginRecovery, Identity: recoveryIdentity, RecoveryStart: &recovery,
+	})
+	for index := 0; index < 3; index++ {
+		routeKey := routeKeyForShard(t, target, group, initial.ShardID, fmt.Sprintf("route-%d", index))
+		record := recoveryRouteRecord(
+			t, source, target, recovery, group, routeKey,
+			fmt.Sprintf("sandbox-%d", index), fmt.Sprintf("report-%d", index),
+		)
+		applyDiskData(t, machine, uint64(index+3), DataCommand{
+			Type: DataStageRecovery, Identity: recoveryIdentity, RecoveryRecord: &record,
+		})
+	}
+	lookup := func(after string) RecoveryLookupResult {
+		t.Helper()
+		value, err := machine.Lookup(DataLookup{Recovery: &RecoveryLookup{
+			Identity: recoveryIdentity, AfterKey: after, Limit: 2,
+		}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		result := value.(DataLookupResult).Recovery
+		if result == nil {
+			t.Fatal("on-disk recovery lookup returned no result")
+		}
+		return *result
+	}
+	first := lookup("")
+	if !first.Available || len(first.Records) != 2 || first.NextKey == "" {
+		t.Fatalf("first on-disk recovery page = %+v", first)
+	}
+	second := lookup(first.NextKey)
+	if !second.Available || len(second.Records) != 1 || second.NextKey != "" {
+		t.Fatalf("second on-disk recovery page = %+v", second)
+	}
+}
+
 func beginRecoveryFixture(
 	t *testing.T,
 	state *DataState,
 	initial ShardRequestIdentity,
-	source Manifest,
-	target Manifest,
+	source RegistryLayout,
+	target RegistryLayout,
 	index uint64,
 ) (DataRecoveryState, ShardRequestIdentity, ShardRequestIdentity) {
 	t.Helper()
@@ -195,8 +292,8 @@ func beginRecoveryFixture(
 func recoveryFixture(
 	t *testing.T,
 	initial ShardRequestIdentity,
-	source Manifest,
-	target Manifest,
+	source RegistryLayout,
+	target RegistryLayout,
 	recoveryEpoch uint64,
 ) (DataRecoveryState, ShardRequestIdentity, ShardRequestIdentity) {
 	t.Helper()
@@ -209,12 +306,12 @@ func recoveryFixture(
 		t.Fatal(err)
 	}
 	targetPermit := PermitIdentity{
-		ClusterID: target.ClusterID, StorageGeneration: target.StorageGeneration,
-		SystemEpoch: recoveryEpoch, ManifestDigest: targetDigest,
+		ClusterID: target.ClusterID, RegistryGeneration: target.RegistryGeneration,
+		SystemEpoch: recoveryEpoch, RegistryLayoutDigest: targetDigest,
 	}
 	recovery := DataRecoveryState{
 		RecoveryEpoch: recoveryEpoch, SourceClusterID: source.ClusterID,
-		SourceStorageGeneration: source.StorageGeneration, SourceManifestDigest: sourceDigest,
+		SourceRegistryGeneration: source.RegistryGeneration, SourceRegistryLayoutDigest: sourceDigest,
 		Target: targetPermit,
 	}
 	recoveryIdentity := ShardRequestIdentity{PermitIdentity: targetPermit, ShardID: initial.ShardID}
@@ -226,8 +323,8 @@ func recoveryFixture(
 
 func recoveryRouteRecord(
 	t *testing.T,
-	source Manifest,
-	target Manifest,
+	source RegistryLayout,
+	target RegistryLayout,
 	recovery DataRecoveryState,
 	group string,
 	routeKey string,
@@ -242,21 +339,26 @@ func recoveryRouteRecord(
 	targetBinding := testBinding(
 		t, target, clusterstate.ExecutionKindSandbox, sandboxID, group, routeKey, "node-1", intent,
 	)
+	spec, err := clusterstate.ParseSandboxDispatchSpec(intent.DispatchSpec)
+	if err != nil {
+		t.Fatal(err)
+	}
 	route := clusterstate.RouteWorkflowRecord{
 		Group: group, RouteKey: routeKey, State: clusterstate.WorkflowRouteReady,
 		Ready: &clusterstate.ReadyRoute{
 			SandboxID: sandboxID, NodeID: targetBinding.NodeID, NodeEpoch: targetBinding.NodeEpoch,
-			DataEndpoint: targetBinding.DataEndpoint, TargetPort: 8080, AccessToken: "access-token",
-			TemplateRef: "template-recovered", StorageGeneration: targetBinding.StorageGeneration,
-			BindingDigest: targetBinding.BindingDigest, LastEventSeq: 9,
+			DataEndpoint: targetBinding.DataEndpoint, TargetPort: spec.TargetPort, AccessToken: spec.AccessToken,
+			TrafficAccessToken: "traffic-token", TemplateRef: spec.TemplateRef,
+			RegistryGeneration: targetBinding.RegistryGeneration,
+			BindingDigest:      targetBinding.BindingDigest, LastEventSeq: 9, Intent: intent,
 		},
 	}
 	return RecoveryObjectRecord{
 		RecoveryEpoch: recovery.RecoveryEpoch, Kind: clusterstate.ExecutionKindSandbox,
 		Group: group, RouteKey: routeKey, ObjectID: sandboxID,
 		NodeID: targetBinding.NodeID, NodeEpoch: targetBinding.NodeEpoch, SessionSeq: 11, EventSeq: 9,
-		ReportDigest: digestFor(report), SourceStorageGeneration: source.StorageGeneration,
-		SourceManifestDigest: recovery.SourceManifestDigest, SourceOpaqueBinding: sourceBinding.OpaqueBinding,
+		ReportDigest: digestFor(report), SourceRegistryGeneration: source.RegistryGeneration,
+		SourceRegistryLayoutDigest: recovery.SourceRegistryLayoutDigest, SourceOpaqueBinding: sourceBinding.OpaqueBinding,
 		SourceBindingDigest: sourceBinding.BindingDigest, TargetBinding: targetBinding,
 		Route: &route, State: RecoveryObjectStaged,
 	}

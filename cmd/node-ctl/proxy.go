@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -24,6 +25,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/proxy"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxyshm"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
+	"github.com/kuasar-sandbox/orchestrator/internal/transportauth"
 )
 
 const (
@@ -175,12 +177,16 @@ func runProxyWorker(ctx context.Context, cfg *config.ProxyFileConfig, log *slog.
 	if forwardLn == nil {
 		return fmt.Errorf("proxy worker: missing forward listener fd")
 	}
-	go func() { errCh <- serveListener(ctx, forwardLn, px, "", "", log) }()
+	go func() { errCh <- serveListener(ctx, forwardLn, px, "", "", "", log) }()
 
 	if dataLn, err := listenerFromFD(fdEnv(envProxyDataFD), "proxy-data"); err != nil {
 		return err
 	} else if dataLn != nil {
-		go func() { errCh <- serveListener(ctx, dataLn, px, cfg.TLS.Cert, cfg.TLS.Key, log) }()
+		handler := http.Handler(px)
+		if cfg.TLS.ClientCA != "" {
+			handler = transportauth.Middleware(transportauth.RoleRouter, handler)
+		}
+		go func() { errCh <- serveListener(ctx, dataLn, handler, cfg.TLS.Cert, cfg.TLS.Key, cfg.TLS.ClientCA, log) }()
 	}
 
 	if mmdsLn, err := listenerFromFD(fdEnv(envProxyMMDSFD), "proxy-mmds"); err != nil {

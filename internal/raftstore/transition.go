@@ -9,23 +9,85 @@ import (
 	"time"
 )
 
-// ReconcileManifestTransitionShard advances one durable transition edge after
+// AwaitOrBeginRegistryLayoutTransition makes the published next artifact visible in
+// the sole System Group before any member starts target replicas. Replays are
+// idempotent; a different active transition fails closed.
+func (r *Runtime) AwaitOrBeginRegistryLayoutTransition(ctx context.Context) (SystemState, error) {
+	if r.registryLayout.RegistryLayoutVersion <= 1 || r.registryLayout.PreviousRegistryLayoutDigest == "" {
+		return r.AwaitSystemRegistryLayout(ctx)
+	}
+	ticker := time.NewTicker(startupRetryInterval)
+	defer ticker.Stop()
+	for {
+		state, err := r.ReadSystemStrong(ctx)
+		if err == nil {
+			if err := state.Validate(); err != nil {
+				return SystemState{}, err
+			}
+			switch {
+			case state.ActiveRegistryLayoutVersion == r.registryLayout.RegistryLayoutVersion &&
+				state.ActiveRegistryLayoutDigest == r.registryLayoutDigest:
+				if err := r.SyncLocalRegistryLayout(state); err != nil {
+					return SystemState{}, err
+				}
+				return state, nil
+			case state.Transition != nil && state.Transition.Version == r.registryLayout.RegistryLayoutVersion &&
+				state.Transition.Digest == r.registryLayoutDigest &&
+				state.Transition.PreviousDigest == r.registryLayout.PreviousRegistryLayoutDigest:
+				return state, nil
+			case state.Transition != nil:
+				return SystemState{}, errors.New("raftstore: another registryLayout transition is already committed")
+			case state.ClusterID != r.registryLayout.ClusterID || state.RegistryGeneration != r.registryLayout.RegistryGeneration ||
+				state.Retired || state.Recovery != nil || state.ActiveRegistryLayoutVersion+1 != r.registryLayout.RegistryLayoutVersion ||
+				state.ActiveRegistryLayoutDigest != r.registryLayout.PreviousRegistryLayoutDigest:
+				return SystemState{}, errors.New("raftstore: published registryLayout does not follow the active System artifact")
+			default:
+				shards := make([]ShardTransition, 0, int(r.registryLayout.VirtualShardCount)+1)
+				shards = append(shards, ShardTransition{ShardID: ^uint32(0), Stage: TransitionPending})
+				for shardID := uint32(0); shardID < r.registryLayout.VirtualShardCount; shardID++ {
+					shards = append(shards, ShardTransition{ShardID: shardID, Stage: TransitionPending})
+				}
+				result, proposeErr := r.proposeSystem(ctx, SystemCommand{
+					Type: SystemBeginTransition,
+					Transition: &RegistryLayoutTransition{
+						Version: r.registryLayout.RegistryLayoutVersion, Digest: r.registryLayoutDigest,
+						PreviousDigest:  r.registryLayout.PreviousRegistryLayoutDigest,
+						NextSystemEpoch: state.SystemEpoch + 1, Shards: shards,
+					},
+				})
+				if proposeErr == nil && result.Conflict {
+					proposeErr = errors.New(result.Reason)
+				}
+				if proposeErr == nil {
+					continue
+				}
+			}
+		}
+		select {
+		case <-ctx.Done():
+			if err != nil {
+				return SystemState{}, errors.Join(ctx.Err(), err)
+			}
+			return SystemState{}, ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
+// ReconcileRegistryLayoutTransitionShard advances one durable transition edge after
 // proving the corresponding data or Raft membership state.
-func (r *Runtime) ReconcileManifestTransitionShard(
+func (r *Runtime) ReconcileRegistryLayoutTransitionShard(
 	ctx context.Context,
 	raftShardID uint64,
 ) (SystemState, error) {
-	r.transitionMu.Lock()
-	defer r.transitionMu.Unlock()
-
-	system, transition, progress, err := r.readManifestTransition(ctx, raftShardID)
+	system, transition, progress, err := r.readRegistryLayoutTransition(ctx, raftShardID)
 	if err != nil {
 		return SystemState{}, err
 	}
 	switch progress.Stage {
 	case TransitionPending:
 		if transition.Activated {
-			return SystemState{}, errors.New("raftstore: pending shard remains after manifest activation")
+			return SystemState{}, errors.New("raftstore: pending shard remains after registryLayout activation")
 		}
 		if err := r.prepareDataEpoch(ctx, system, raftShardID); err != nil {
 			return SystemState{}, err
@@ -36,7 +98,7 @@ func (r *Runtime) ReconcileManifestTransitionShard(
 		return r.commitTransitionAdvance(ctx, progress.ShardID, TransitionPending, TransitionCatchingUp)
 	case TransitionCatchingUp:
 		if transition.Activated {
-			return SystemState{}, errors.New("raftstore: incomplete catch-up remains after manifest activation")
+			return SystemState{}, errors.New("raftstore: incomplete catch-up remains after registryLayout activation")
 		}
 		if err := r.promoteDesiredReplicas(ctx, raftShardID); err != nil {
 			return SystemState{}, err
@@ -44,7 +106,7 @@ func (r *Runtime) ReconcileManifestTransitionShard(
 		return r.commitTransitionAdvance(ctx, progress.ShardID, TransitionCatchingUp, TransitionPromoted)
 	case TransitionPromoted:
 		if transition.Activated {
-			return SystemState{}, errors.New("raftstore: old membership remains after manifest activation")
+			return SystemState{}, errors.New("raftstore: old membership remains after registryLayout activation")
 		}
 		if err := r.removeUndesiredReplicas(ctx, raftShardID); err != nil {
 			return SystemState{}, err
@@ -52,7 +114,7 @@ func (r *Runtime) ReconcileManifestTransitionShard(
 		return r.commitTransitionAdvance(ctx, progress.ShardID, TransitionPromoted, TransitionOldRemoved)
 	case TransitionOldRemoved:
 		if transition.Activated {
-			return SystemState{}, errors.New("raftstore: unverified membership remains after manifest activation")
+			return SystemState{}, errors.New("raftstore: unverified membership remains after registryLayout activation")
 		}
 		if err := r.verifyDesiredMembership(ctx, raftShardID); err != nil {
 			return SystemState{}, err
@@ -66,7 +128,7 @@ func (r *Runtime) ReconcileManifestTransitionShard(
 			return system, nil
 		}
 		if !transition.PreviousPermitDrainComplete {
-			return SystemState{}, errors.New("raftstore: previous manifest Serve Permits have not drained")
+			return SystemState{}, errors.New("raftstore: previous registryLayout Serve Permits have not drained")
 		}
 		if err := r.retireDataEpoch(ctx, system, raftShardID); err != nil {
 			return SystemState{}, err
@@ -78,11 +140,11 @@ func (r *Runtime) ReconcileManifestTransitionShard(
 	case TransitionEpochRetired:
 		return system, nil
 	default:
-		return SystemState{}, fmt.Errorf("raftstore: unknown manifest transition stage %q", progress.Stage)
+		return SystemState{}, fmt.Errorf("raftstore: unknown registryLayout transition stage %q", progress.Stage)
 	}
 }
 
-func (r *Runtime) ActivateManifestTransition(ctx context.Context) (SystemState, error) {
+func (r *Runtime) ActivateRegistryLayoutTransition(ctx context.Context) (SystemState, error) {
 	r.transitionMu.Lock()
 	defer r.transitionMu.Unlock()
 
@@ -90,7 +152,7 @@ func (r *Runtime) ActivateManifestTransition(ctx context.Context) (SystemState, 
 	if err != nil {
 		return SystemState{}, err
 	}
-	transition, err := r.requireManifestTransition(state)
+	transition, err := r.requireRegistryLayoutTransition(state)
 	if err != nil {
 		return SystemState{}, err
 	}
@@ -98,14 +160,14 @@ func (r *Runtime) ActivateManifestTransition(ctx context.Context) (SystemState, 
 		return state, nil
 	}
 	if !allTransitionsComplete(transition.Shards) {
-		return SystemState{}, errors.New("raftstore: manifest transition has incomplete shards")
+		return SystemState{}, errors.New("raftstore: registryLayout transition has incomplete shards")
 	}
 	result, proposeErr := r.proposeSystem(ctx, SystemCommand{Type: SystemActivateTransition})
 	current, readErr := r.ReadSystemStrong(ctx)
 	if readErr == nil {
 		if current.Transition != nil && current.Transition.Activated &&
-			current.ActiveManifestDigest == r.manifestDigest {
-			if err := r.SyncLocalManifest(current); err != nil {
+			current.ActiveRegistryLayoutDigest == r.registryLayoutDigest {
+			if err := r.SyncLocalRegistryLayout(current); err != nil {
 				return SystemState{}, err
 			}
 			return current, nil
@@ -120,12 +182,12 @@ func (r *Runtime) ActivateManifestTransition(ctx context.Context) (SystemState, 
 	if readErr != nil {
 		return SystemState{}, readErr
 	}
-	return SystemState{}, errors.New("raftstore: manifest activation was not visible after commit")
+	return SystemState{}, errors.New("raftstore: registryLayout activation was not visible after commit")
 }
 
-// ConfirmManifestTransitionPermitDrain starts a fresh monotonic wait from a
+// ConfirmRegistryLayoutTransitionPermitDrain starts a fresh monotonic wait from a
 // quorum-confirmed activation read. A restart conservatively restarts the wait.
-func (r *Runtime) ConfirmManifestTransitionPermitDrain(ctx context.Context) (SystemState, error) {
+func (r *Runtime) ConfirmRegistryLayoutTransitionPermitDrain(ctx context.Context) (SystemState, error) {
 	r.transitionMu.Lock()
 	defer r.transitionMu.Unlock()
 
@@ -133,12 +195,12 @@ func (r *Runtime) ConfirmManifestTransitionPermitDrain(ctx context.Context) (Sys
 	if err != nil {
 		return SystemState{}, err
 	}
-	transition, err := r.requireManifestTransition(state)
+	transition, err := r.requireRegistryLayoutTransition(state)
 	if err != nil {
 		return SystemState{}, err
 	}
 	if !transition.Activated {
-		return SystemState{}, errors.New("raftstore: manifest transition is not activated")
+		return SystemState{}, errors.New("raftstore: registryLayout transition is not activated")
 	}
 	if transition.PreviousPermitDrainComplete {
 		return state, nil
@@ -153,7 +215,7 @@ func (r *Runtime) ConfirmManifestTransitionPermitDrain(ctx context.Context) (Sys
 	if err != nil {
 		return SystemState{}, err
 	}
-	currentTransition, err := r.requireManifestTransition(current)
+	currentTransition, err := r.requireRegistryLayoutTransition(current)
 	if err != nil {
 		return SystemState{}, err
 	}
@@ -163,15 +225,15 @@ func (r *Runtime) ConfirmManifestTransitionPermitDrain(ctx context.Context) (Sys
 	if !currentTransition.Activated || currentTransition.ActivationIndex != transition.ActivationIndex ||
 		currentTransition.PreviousDigest != transition.PreviousDigest ||
 		currentTransition.NextSystemEpoch != transition.NextSystemEpoch {
-		return SystemState{}, errors.New("raftstore: manifest activation identity changed during permit drain")
+		return SystemState{}, errors.New("raftstore: registryLayout activation identity changed during permit drain")
 	}
 	result, proposeErr := r.proposeSystem(ctx, SystemCommand{
 		Type: SystemConfirmTransitionDrain,
 		TransitionDrain: &TransitionDrainConfirmation{
-			PreviousManifestDigest: transition.PreviousDigest,
-			PreviousSystemEpoch:    transition.NextSystemEpoch - 1,
-			ActivationIndex:        transition.ActivationIndex,
-			WaitedMillis:           uint64(time.Since(started) / time.Millisecond),
+			PreviousRegistryLayoutDigest: transition.PreviousDigest,
+			PreviousSystemEpoch:          transition.NextSystemEpoch - 1,
+			ActivationIndex:              transition.ActivationIndex,
+			WaitedMillis:                 uint64(time.Since(started) / time.Millisecond),
 		},
 	})
 	confirmed, readErr := r.ReadSystemStrong(ctx)
@@ -187,10 +249,10 @@ func (r *Runtime) ConfirmManifestTransitionPermitDrain(ctx context.Context) (Sys
 	if readErr != nil {
 		return SystemState{}, readErr
 	}
-	return SystemState{}, errors.New("raftstore: manifest permit drain was not visible after commit")
+	return SystemState{}, errors.New("raftstore: registryLayout permit drain was not visible after commit")
 }
 
-func (r *Runtime) FinalizeManifestTransition(ctx context.Context) (SystemState, error) {
+func (r *Runtime) FinalizeRegistryLayoutTransition(ctx context.Context) (SystemState, error) {
 	r.transitionMu.Lock()
 	defer r.transitionMu.Unlock()
 
@@ -198,18 +260,18 @@ func (r *Runtime) FinalizeManifestTransition(ctx context.Context) (SystemState, 
 	if err != nil {
 		return SystemState{}, err
 	}
-	transition, err := r.requireManifestTransition(state)
+	transition, err := r.requireRegistryLayoutTransition(state)
 	if err != nil {
 		return SystemState{}, err
 	}
 	if !transition.Activated || !transition.PreviousPermitDrainComplete ||
 		!allTransitionsAtStage(transition.Shards, TransitionEpochRetired) {
-		return SystemState{}, errors.New("raftstore: manifest transition is not ready to finalize")
+		return SystemState{}, errors.New("raftstore: registryLayout transition is not ready to finalize")
 	}
 	result, proposeErr := r.proposeSystem(ctx, SystemCommand{Type: SystemFinalizeTransition})
 	current, readErr := r.ReadSystemStrong(ctx)
-	if readErr == nil && current.Transition == nil && current.ActiveManifestDigest == r.manifestDigest {
-		if err := r.SyncLocalManifest(current); err != nil {
+	if readErr == nil && current.Transition == nil && current.ActiveRegistryLayoutDigest == r.registryLayoutDigest {
+		if err := r.SyncLocalRegistryLayout(current); err != nil {
 			return SystemState{}, err
 		}
 		return current, nil
@@ -223,18 +285,18 @@ func (r *Runtime) FinalizeManifestTransition(ctx context.Context) (SystemState, 
 	if readErr != nil {
 		return SystemState{}, readErr
 	}
-	return SystemState{}, errors.New("raftstore: finalized manifest transition remains active")
+	return SystemState{}, errors.New("raftstore: finalized registryLayout transition remains active")
 }
 
-func (r *Runtime) readManifestTransition(
+func (r *Runtime) readRegistryLayoutTransition(
 	ctx context.Context,
 	raftShardID uint64,
-) (SystemState, *ManifestTransition, ShardTransition, error) {
+) (SystemState, *RegistryLayoutTransition, ShardTransition, error) {
 	state, err := r.ReadSystemStrong(ctx)
 	if err != nil {
 		return SystemState{}, nil, ShardTransition{}, err
 	}
-	transition, err := r.requireManifestTransition(state)
+	transition, err := r.requireRegistryLayoutTransition(state)
 	if err != nil {
 		return SystemState{}, nil, ShardTransition{}, err
 	}
@@ -249,14 +311,14 @@ func (r *Runtime) readManifestTransition(
 	return state, transition, transition.Shards[position], nil
 }
 
-func (r *Runtime) requireManifestTransition(state SystemState) (*ManifestTransition, error) {
-	if err := r.authorizeManifestState(state); err != nil {
+func (r *Runtime) requireRegistryLayoutTransition(state SystemState) (*RegistryLayoutTransition, error) {
+	if err := r.authorizeRegistryLayoutState(state); err != nil {
 		return nil, err
 	}
-	if state.Transition == nil || state.Transition.Digest != r.manifestDigest ||
-		state.Transition.Version != r.manifest.ManifestVersion ||
-		state.Transition.PreviousDigest != r.manifest.PreviousManifestDigest {
-		return nil, errors.New("raftstore: no committed transition for the verified next manifest")
+	if state.Transition == nil || state.Transition.Digest != r.registryLayoutDigest ||
+		state.Transition.Version != r.registryLayout.RegistryLayoutVersion ||
+		state.Transition.PreviousDigest != r.registryLayout.PreviousRegistryLayoutDigest {
+		return nil, errors.New("raftstore: no committed transition for the verified next registryLayout")
 	}
 	return state.Transition, nil
 }
@@ -303,7 +365,7 @@ func (r *Runtime) prepareDataEpoch(ctx context.Context, system SystemState, raft
 		return err
 	}
 	previous, next := transitionEpochs(system)
-	desired := replicaIDsForPlacement(r.manifest.DataShards[logicalID])
+	desired := replicaIDsForPlacement(r.registryLayout.DataShards[logicalID])
 	if len(state.ServingEpochs) == 1 {
 		if state.ServingEpochs[0] != previous {
 			return errors.New("raftstore: data shard does not serve the active pre-transition epoch")
@@ -350,7 +412,7 @@ func (r *Runtime) verifyPreparedDataEpoch(ctx context.Context, system SystemStat
 		return err
 	}
 	previous, next := transitionEpochs(system)
-	return validatePreparedEpoch(state, previous, next, replicaIDsForPlacement(r.manifest.DataShards[logicalID]))
+	return validatePreparedEpoch(state, previous, next, replicaIDsForPlacement(r.registryLayout.DataShards[logicalID]))
 }
 
 func (r *Runtime) retireDataEpoch(ctx context.Context, system SystemState, raftShardID uint64) error {
@@ -366,7 +428,7 @@ func (r *Runtime) retireDataEpoch(ctx context.Context, system SystemState, raftS
 		return err
 	}
 	previous, next := transitionEpochs(system)
-	desired := replicaIDsForPlacement(r.manifest.DataShards[logicalID])
+	desired := replicaIDsForPlacement(r.registryLayout.DataShards[logicalID])
 	if len(state.ServingEpochs) == 2 {
 		if err := validatePreparedEpoch(state, previous, next, desired); err != nil {
 			return err
@@ -401,7 +463,7 @@ func (r *Runtime) retireDataEpoch(ctx context.Context, system SystemState, raftS
 }
 
 func (r *Runtime) readDataStateStrong(ctx context.Context, raftShardID uint64) (DataState, error) {
-	value, err := r.nodeHost.SyncRead(ctx, raftShardID, DataStateLookup{})
+	value, err := r.syncRead(ctx, raftShardID, DataStateLookup{})
 	if err != nil {
 		return DataState{}, err
 	}
@@ -421,7 +483,7 @@ func (r *Runtime) addDesiredNonVoters(ctx context.Context, raftShardID uint64) e
 		return err
 	}
 	for _, replica := range placements {
-		membership, err := r.nodeHost.SyncGetShardMembership(ctx, raftShardID)
+		membership, err := r.syncGetShardMembership(ctx, raftShardID)
 		if err != nil {
 			return err
 		}
@@ -464,13 +526,13 @@ func (r *Runtime) promoteDesiredReplicas(
 		return err
 	}
 	for _, replica := range placements {
-		membership, err := r.nodeHost.SyncGetShardMembership(ctx, raftShardID)
+		membership, err := r.syncGetShardMembership(ctx, raftShardID)
 		if err != nil {
 			return err
 		}
 		promotion := ReplicaPromotionRequest{
 			ShardID: raftShardID, ReplicaID: replica.ReplicaID, MemberID: replica.MemberID,
-			ManifestDigest: r.manifestDigest,
+			RegistryLayoutDigest: r.registryLayoutDigest,
 		}
 		if _, voting := membership.Nodes[replica.ReplicaID]; voting {
 			if err := r.confirmReplicaPromoted(ctx, promotion); err != nil {
@@ -483,7 +545,7 @@ func (r *Runtime) promoteDesiredReplicas(
 		}
 		request := ReplicaCatchUpRequest{
 			ShardID: raftShardID, ReplicaID: replica.ReplicaID, MemberID: replica.MemberID,
-			ManifestDigest: r.manifestDigest, MinimumAppliedIndex: minimumApplied,
+			RegistryLayoutDigest: r.registryLayoutDigest, MinimumAppliedIndex: minimumApplied,
 		}
 		proof, err := r.probeReplicaCatchUp(ctx, request)
 		if err != nil {
@@ -505,7 +567,7 @@ func (r *Runtime) readShardAppliedBarrier(ctx context.Context, raftShardID uint6
 		if err != nil {
 			return 0, err
 		}
-		if _, err := r.requireManifestTransition(state); err != nil {
+		if _, err := r.requireRegistryLayoutTransition(state); err != nil {
 			return 0, err
 		}
 		return state.LastApplied, nil
@@ -522,11 +584,11 @@ func (r *Runtime) readShardAppliedBarrier(ctx context.Context, raftShardID uint6
 		return 0, err
 	}
 	for _, epoch := range state.ServingEpochs {
-		if epoch.ManifestDigest == r.manifestDigest {
+		if epoch.RegistryLayoutDigest == r.registryLayoutDigest {
 			return state.LastApplied, nil
 		}
 	}
-	return 0, errors.New("raftstore: data shard has not committed the target manifest epoch")
+	return 0, errors.New("raftstore: data shard has not committed the target registryLayout epoch")
 }
 
 func (r *Runtime) removeUndesiredReplicas(ctx context.Context, raftShardID uint64) error {
@@ -538,7 +600,7 @@ func (r *Runtime) removeUndesiredReplicas(ctx context.Context, raftShardID uint6
 	for _, replica := range placements {
 		desired[replica.ReplicaID] = struct{}{}
 	}
-	membership, err := r.nodeHost.SyncGetShardMembership(ctx, raftShardID)
+	membership, err := r.syncGetShardMembership(ctx, raftShardID)
 	if err != nil {
 		return err
 	}
@@ -554,7 +616,7 @@ func (r *Runtime) removeUndesiredReplicas(ctx context.Context, raftShardID uint6
 			return err
 		}
 	}
-	membership, err = r.nodeHost.SyncGetShardMembership(ctx, raftShardID)
+	membership, err = r.syncGetShardMembership(ctx, raftShardID)
 	if err != nil {
 		return err
 	}
@@ -578,7 +640,7 @@ func (r *Runtime) verifyDesiredVoters(ctx context.Context, raftShardID uint64) e
 	if err != nil {
 		return err
 	}
-	membership, err := r.nodeHost.SyncGetShardMembership(ctx, raftShardID)
+	membership, err := r.syncGetShardMembership(ctx, raftShardID)
 	if err != nil {
 		return err
 	}
@@ -599,7 +661,7 @@ func (r *Runtime) verifyDesiredMembership(ctx context.Context, raftShardID uint6
 	if err != nil {
 		return err
 	}
-	membership, err := r.nodeHost.SyncGetShardMembership(ctx, raftShardID)
+	membership, err := r.syncGetShardMembership(ctx, raftShardID)
 	if err != nil {
 		return err
 	}
@@ -623,12 +685,12 @@ func transitionProgressID(raftShardID uint64) (uint32, error) {
 func transitionEpochs(system SystemState) (PermitIdentity, PermitIdentity) {
 	transition := system.Transition
 	previous := PermitIdentity{
-		ClusterID: system.ClusterID, StorageGeneration: system.StorageGeneration,
-		SystemEpoch: transition.NextSystemEpoch - 1, ManifestDigest: transition.PreviousDigest,
+		ClusterID: system.ClusterID, RegistryGeneration: system.RegistryGeneration,
+		SystemEpoch: transition.NextSystemEpoch - 1, RegistryLayoutDigest: transition.PreviousDigest,
 	}
 	next := PermitIdentity{
-		ClusterID: system.ClusterID, StorageGeneration: system.StorageGeneration,
-		SystemEpoch: transition.NextSystemEpoch, ManifestDigest: transition.Digest,
+		ClusterID: system.ClusterID, RegistryGeneration: system.RegistryGeneration,
+		SystemEpoch: transition.NextSystemEpoch, RegistryLayoutDigest: transition.Digest,
 	}
 	return previous, next
 }

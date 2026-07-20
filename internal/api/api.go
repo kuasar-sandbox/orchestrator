@@ -89,6 +89,10 @@ var ErrFilesUnsupported = errors.New("COPY build contexts unsupported (builder.f
 // an unuploaded context) to 400.
 var ErrBadRequest = errors.New("bad request")
 
+// ErrConflict reports an idempotency-key reuse with a different immutable
+// request. Callers must allocate a new resource ID instead of overwriting it.
+var ErrConflict = errors.New("conflict")
+
 // PullTokenHeader is the api_headers header carrying the opaque registry pull token.
 const PullTokenHeader = "X-Kuasar-Pull-Token"
 
@@ -478,6 +482,8 @@ func (a *API) triggerBuild(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, 501, err.Error())
 		case errors.Is(err, ErrBadRequest):
 			writeErr(w, 400, err.Error())
+		case errors.Is(err, ErrConflict):
+			writeErr(w, http.StatusConflict, err.Error())
 		default:
 			a.fail(w, err)
 		}

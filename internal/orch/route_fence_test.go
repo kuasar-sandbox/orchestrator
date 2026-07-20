@@ -22,7 +22,7 @@ func TestSandboxRouteFenceProjectsOpaqueBinding(t *testing.T) {
 	o := &Orchestrator{}
 	route := o.routeEntry(sb)
 	if route.NodeID != request.ExpectedNodeID || route.NodeEpoch != request.ExpectedNodeEpoch ||
-		route.StorageGeneration != request.ExpectedStorageGeneration || route.BindingDigest != request.ExpectedBindingDigest {
+		route.RegistryGeneration != request.ExpectedRegistryGeneration || route.BindingDigest != request.ExpectedBindingDigest {
 		t.Fatalf("route projection = %+v, request = %+v", route, request)
 	}
 
@@ -38,11 +38,11 @@ func TestSandboxRouteFenceProjectsOpaqueBinding(t *testing.T) {
 	}
 }
 
-func TestClusterCommandInstallsOnlyValidatedBinding(t *testing.T) {
+func TestClusterCommandValidatesOpaqueBinding(t *testing.T) {
 	demand := sha256.Sum256([]byte("demand"))
 	dispatch := sha256.Sum256([]byte("dispatch"))
 	binding := clusterstate.ExecutionBinding{
-		StorageGeneration: "generation-1", Kind: clusterstate.ExecutionKindSandbox,
+		RegistryGeneration: "generation-1", Kind: clusterstate.ExecutionKindSandbox,
 		ObjectID: "s1", Group: "/g", RouteKey: "rk", NodeID: "n1", NodeEpoch: 7,
 		DemandDigest: demand, DispatchSpecDigest: dispatch,
 	}
@@ -55,27 +55,22 @@ func TestClusterCommandInstallsOnlyValidatedBinding(t *testing.T) {
 		t.Fatal(err)
 	}
 	cmd := &routesync.Command{
-		SID: "s1", NodeEpoch: 7, SessionSeq: 3, StorageGeneration: "generation-1",
+		SID: "s1", NodeEpoch: 7, SessionSeq: 3, RegistryGeneration: "generation-1",
 		Binding: opaque, BindingDigest: digest, DemandDigest: hex.EncodeToString(demand[:]),
 		DispatchSpecDigest: hex.EncodeToString(dispatch[:]),
-		Config:             map[string]string{"user": "value", clusterstate.ObjectMetadataKey: "forged"},
 	}
-	metadata, err := clusterCommandMetadata(cmd, clusterstate.ExecutionKindSandbox, "s1", "n1")
-	if err != nil {
+	if err := validateClusterCommandBinding(cmd, clusterstate.ExecutionKindSandbox, "s1", "n1"); err != nil {
 		t.Fatal(err)
 	}
-	if metadata[clusterstate.ObjectMetadataKey] != opaque || metadata["user"] != "value" {
-		t.Fatalf("metadata = %#v", metadata)
-	}
 	cmd.BindingDigest = "wrong"
-	if _, err := clusterCommandMetadata(cmd, clusterstate.ExecutionKindSandbox, "s1", "n1"); err == nil {
+	if err := validateClusterCommandBinding(cmd, clusterstate.ExecutionKindSandbox, "s1", "n1"); err == nil {
 		t.Fatal("binding digest mismatch accepted")
 	}
 	cmd.BindingDigest = digest
-	if _, err := clusterCommandMetadata(cmd, clusterstate.ExecutionKindBuild, "s1", "n1"); err == nil {
+	if err := validateClusterCommandBinding(cmd, clusterstate.ExecutionKindBuild, "s1", "n1"); err == nil {
 		t.Fatal("binding kind mismatch accepted")
 	}
-	if _, err := clusterCommandMetadata(cmd, clusterstate.ExecutionKindSandbox, "s1", "n2"); err == nil {
+	if err := validateClusterCommandBinding(cmd, clusterstate.ExecutionKindSandbox, "s1", "n2"); err == nil {
 		t.Fatal("binding for another node accepted")
 	}
 }
@@ -90,7 +85,7 @@ func TestRebindClusterExecutionUsesDigestCAS(t *testing.T) {
 	dispatch := sha256.Sum256([]byte("dispatch"))
 	makeBinding := func(generation string) string {
 		opaque, err := clusterstate.EncodeExecutionBinding(clusterstate.ExecutionBinding{
-			StorageGeneration: generation, Kind: clusterstate.ExecutionKindSandbox,
+			RegistryGeneration: generation, Kind: clusterstate.ExecutionKindSandbox,
 			ObjectID: "s1", Group: "/g", RouteKey: "rk", NodeID: "n1", NodeEpoch: 7,
 			DemandDigest: demand, DispatchSpecDigest: dispatch,
 		})
@@ -110,7 +105,7 @@ func TestRebindClusterExecutionUsesDigestCAS(t *testing.T) {
 		t.Fatal(err)
 	}
 	cmd := &routesync.Command{
-		SID: "s1", NodeEpoch: 7, SessionSeq: 3, StorageGeneration: "g2",
+		SID: "s1", NodeEpoch: 7, SessionSeq: 3, RegistryGeneration: "g2",
 		Binding: newOpaque, BindingDigest: newDigest, OldBindingDigest: oldDigest,
 		DemandDigest: hex.EncodeToString(demand[:]), DispatchSpecDigest: hex.EncodeToString(dispatch[:]),
 	}
@@ -122,7 +117,7 @@ func TestRebindClusterExecutionUsesDigestCAS(t *testing.T) {
 	select {
 	case event := <-routeEvents:
 		if event.Kind != routesync.TypeUpsert || event.Route.SandboxID != "s1" ||
-			event.Route.StorageGeneration != "g2" || event.Route.BindingDigest != newDigest {
+			event.Route.RegistryGeneration != "g2" || event.Route.BindingDigest != newDigest {
 			t.Fatalf("rebind route event = %+v", event)
 		}
 	default:
@@ -135,12 +130,12 @@ func TestRebindClusterExecutionUsesDigestCAS(t *testing.T) {
 		t.Fatalf("cached sandbox after rebind = %+v", sb)
 	}
 	if err := o.verifySandboxCommandBinding(ctx, &routesync.Command{
-		SID: "s1", NodeEpoch: 7, StorageGeneration: "g1", BindingDigest: oldDigest,
+		SID: "s1", NodeEpoch: 7, RegistryGeneration: "g1", BindingDigest: oldDigest,
 	}); !errors.Is(err, errWrongExecutionBinding) {
 		t.Fatalf("old command fence error = %v", err)
 	}
 	if err := o.verifySandboxCommandBinding(ctx, &routesync.Command{
-		SID: "s1", NodeEpoch: 7, StorageGeneration: "g2", BindingDigest: newDigest,
+		SID: "s1", NodeEpoch: 7, RegistryGeneration: "g2", BindingDigest: newDigest,
 	}); err != nil {
 		t.Fatalf("new command fence: %v", err)
 	}
@@ -165,7 +160,7 @@ func TestMalformedVersionedBindingFailsClosed(t *testing.T) {
 func sandboxWithBinding(t *testing.T) (*types.Sandbox, proxy.RouteRequest) {
 	t.Helper()
 	binding := clusterstate.ExecutionBinding{
-		StorageGeneration:  "generation-1",
+		RegistryGeneration: "generation-1",
 		Kind:               clusterstate.ExecutionKindSandbox,
 		ObjectID:           "s1",
 		Group:              "/g",
@@ -188,6 +183,6 @@ func sandboxWithBinding(t *testing.T) (*types.Sandbox, proxy.RouteRequest) {
 			Metadata: map[string]string{clusterstate.ObjectMetadataKey: opaque},
 		}, proxy.RouteRequest{
 			SandboxID: "s1", Port: 49983, ExpectedNodeID: "n1", ExpectedNodeEpoch: 7,
-			ExpectedStorageGeneration: "generation-1", ExpectedBindingDigest: digest,
+			ExpectedRegistryGeneration: "generation-1", ExpectedBindingDigest: digest,
 		}
 }

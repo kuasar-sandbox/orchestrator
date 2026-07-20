@@ -9,6 +9,7 @@ package config
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -217,11 +218,18 @@ func (r *ResourceListenConfig) ApplyDefaults() {
 // ClusterConfig connects this node to a cluster-ctl registry over node_link
 // (node.md §10). Empty NodeLink.Endpoint = standalone single-node (no cluster).
 type ClusterConfig struct {
-	NodeLink          ClusterNodeLink   `yaml:"node_link"`          // how to reach registry node_link
-	NodeID            string            `yaml:"node_id"`            // this node's id; "" = hostname
-	Labels            map[string]string `yaml:"labels"`             // zone / pool / slot / node (nodeSelectors)
-	DataEndpoint      string            `yaml:"data_endpoint"`      // host:port the router forwards the data plane to
-	HeartbeatInterval string            `yaml:"heartbeat_interval"` // node-link heartbeat period; "" = 10s
+	NodeLink            ClusterNodeLink   `yaml:"node_link"`          // how to reach registry node_link
+	NodeID              string            `yaml:"node_id"`            // optional assertion against the enrolled durable node ID
+	Labels              map[string]string `yaml:"labels"`             // zone / pool / slot / node (nodeSelectors)
+	DataEndpoint        string            `yaml:"data_endpoint"`      // host:port the router forwards the data plane to
+	HeartbeatInterval   string            `yaml:"heartbeat_interval"` // placement snapshot period; at most 500ms
+	EventReplayBatch    int               `yaml:"event_replay_batch"`
+	EventReplayBytes    int               `yaml:"event_replay_bytes"`
+	EventReplayInterval string            `yaml:"event_replay_interval"`
+	SandboxQueueLimit   int               `yaml:"sandbox_queue_limit"`
+	BuildQueueLimit     int               `yaml:"build_queue_limit"`
+	SandboxWorkers      int               `yaml:"sandbox_workers"`
+	BuildWorkers        int               `yaml:"build_workers"`
 }
 
 // ClusterNodeLink is how the node dials the registry's node_link listener.
@@ -246,8 +254,9 @@ type APIConfig struct {
 
 // TLSConfig is the wildcard TLS material.
 type TLSConfig struct {
-	Cert string `yaml:"cert"`
-	Key  string `yaml:"key"`
+	Cert     string `yaml:"cert"`
+	Key      string `yaml:"key"`
+	ClientCA string `yaml:"client_ca,omitempty"`
 }
 
 // ProxyConfig is the data-plane proxy. mode ∈ {internal,external,off}. In external
@@ -579,6 +588,30 @@ func (c *Config) applyDefaults() {
 	if c.ResourceListen != nil {
 		c.ResourceListen.ApplyDefaults()
 	}
+	if c.Cluster.SandboxQueueLimit <= 0 {
+		c.Cluster.SandboxQueueLimit = 256
+	}
+	if c.Cluster.BuildQueueLimit <= 0 {
+		c.Cluster.BuildQueueLimit = 256
+	}
+	if c.Cluster.HeartbeatInterval == "" {
+		c.Cluster.HeartbeatInterval = "500ms"
+	}
+	if c.Cluster.EventReplayBatch <= 0 {
+		c.Cluster.EventReplayBatch = 64
+	}
+	if c.Cluster.EventReplayBytes <= 0 {
+		c.Cluster.EventReplayBytes = 1 << 20
+	}
+	if c.Cluster.EventReplayInterval == "" {
+		c.Cluster.EventReplayInterval = "1s"
+	}
+	if c.Cluster.SandboxWorkers <= 0 {
+		c.Cluster.SandboxWorkers = 8
+	}
+	if c.Cluster.BuildWorkers <= 0 {
+		c.Cluster.BuildWorkers = c.Builder.MaxConcurrent
+	}
 	if exe, err := os.Executable(); err == nil {
 		c.execDir = filepath.Dir(exe)
 	}
@@ -661,6 +694,37 @@ func (c *Config) validate() error {
 	}
 	if c.Units.BuilderPoolSize < 0 {
 		return fmt.Errorf("config: units.builder_pool_size must be >= 0")
+	}
+	if c.Cluster.NodeLink.Endpoint != "" {
+		if c.Cluster.DataEndpoint == "" {
+			return fmt.Errorf("config: cluster.data_endpoint is required in cluster mode")
+		}
+		if c.API.TLS.Cert == "" || c.API.TLS.Key == "" || c.API.TLS.ClientCA == "" {
+			return errors.New("config: cluster mode requires api.tls cert, key, and client_ca for Router mTLS")
+		}
+		if c.Sandbox.Capacity <= 0 {
+			return fmt.Errorf("config: sandbox.capacity must be positive in cluster mode")
+		}
+		heartbeat, err := time.ParseDuration(c.Cluster.HeartbeatInterval)
+		if err != nil {
+			return fmt.Errorf("config: cluster.heartbeat_interval: %w", err)
+		}
+		if heartbeat <= 0 || heartbeat > 500*time.Millisecond {
+			return errors.New("config: cluster.heartbeat_interval must be in (0,500ms]")
+		}
+		replayInterval, err := time.ParseDuration(c.Cluster.EventReplayInterval)
+		if err != nil {
+			return fmt.Errorf("config: cluster.event_replay_interval: %w", err)
+		}
+		if replayInterval <= 0 || replayInterval > time.Minute {
+			return errors.New("config: cluster.event_replay_interval must be in (0,1m]")
+		}
+		if c.Cluster.EventReplayBatch <= 0 || c.Cluster.EventReplayBatch > 4096 ||
+			c.Cluster.EventReplayBytes < 64<<10 || c.Cluster.EventReplayBytes > 16<<20 ||
+			c.Cluster.SandboxWorkers <= 0 || c.Cluster.SandboxWorkers > 256 ||
+			c.Cluster.BuildWorkers <= 0 || c.Cluster.BuildWorkers > 256 {
+			return errors.New("config: cluster replay and execution worker bounds are invalid")
+		}
 	}
 	poolWait, err := time.ParseDuration(c.Units.PoolWaitTimeout)
 	if err != nil {

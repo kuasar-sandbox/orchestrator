@@ -65,14 +65,14 @@ func TestDragonboat4097GroupScaleGate(t *testing.T) {
 		t.Cleanup(nodeHost.Close)
 	}
 
-	manifest := testManifest(DefaultVirtualShards, "generation-scale-gate")
-	for index := range manifest.Members {
-		manifest.Members[index].RaftEndpoint = addresses[index]
+	registryLayout := testRegistryLayout(DefaultVirtualShards, "generation-scale-gate")
+	for index := range registryLayout.Members {
+		registryLayout.Members[index].RaftEndpoint = addresses[index]
 	}
-	if err := manifest.Validate(); err != nil {
+	if err := registryLayout.Validate(); err != nil {
 		t.Fatal(err)
 	}
-	digest, err := manifest.Digest()
+	digest, err := registryLayout.Digest()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -81,7 +81,7 @@ func TestDragonboat4097GroupScaleGate(t *testing.T) {
 		2: addresses[1],
 		3: addresses[2],
 	}
-	routeKeys := scaleGateRouteKeys(t, manifest)
+	routeKeys := scaleGateRouteKeys(t, registryLayout)
 	intent := testDispatchIntentNoFail()
 
 	startedAt := time.Now()
@@ -104,7 +104,7 @@ func TestDragonboat4097GroupScaleGate(t *testing.T) {
 	ctx, cancel := context.WithDeadline(context.Background(), deadline)
 	defer cancel()
 	bootstrapRaw, err := EncodeSystemCommand(SystemCommand{
-		Type: SystemBootstrap, Manifest: &manifest, Digest: digest,
+		Type: SystemBootstrap, RegistryLayout: &registryLayout, Digest: digest,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -123,13 +123,13 @@ func TestDragonboat4097GroupScaleGate(t *testing.T) {
 	for logicalShardID := uint32(0); logicalShardID < DefaultVirtualShards; logicalShardID++ {
 		logicalShardID := logicalShardID
 		group.Go(func() error {
-			bootstrap, err := dataShardBootstrap(manifest, digest, logicalShardID)
+			bootstrap, err := dataShardBootstrap(registryLayout, digest, logicalShardID)
 			if err != nil {
 				return err
 			}
 			identity := ShardRequestIdentity{PermitIdentity: PermitIdentity{
-				ClusterID: manifest.ClusterID, StorageGeneration: manifest.StorageGeneration,
-				SystemEpoch: 1, ManifestDigest: digest,
+				ClusterID: registryLayout.ClusterID, RegistryGeneration: registryLayout.RegistryGeneration,
+				SystemEpoch: 1, RegistryLayoutDigest: digest,
 			}, ShardID: logicalShardID}
 			command, err := EncodeDataCommand(DataCommand{
 				Type: DataInitializeShard, Identity: identity, Bootstrap: &bootstrap,
@@ -150,7 +150,7 @@ func TestDragonboat4097GroupScaleGate(t *testing.T) {
 				return fmt.Errorf("initialize data shard %d: %s", logicalShardID, applied.Reason)
 			}
 			starting, ready, err := stateScaleReadyRoute(
-				manifest, "/dragonboat-scale", routeKeys[logicalShardID], logicalShardID, intent,
+				registryLayout, "/dragonboat-scale", routeKeys[logicalShardID], logicalShardID, intent,
 			)
 			if err != nil {
 				return err
@@ -196,7 +196,7 @@ func TestDragonboat4097GroupScaleGate(t *testing.T) {
 
 	queries := make([]DataLookup, DefaultVirtualShards)
 	for logicalShardID := uint32(0); logicalShardID < DefaultVirtualShards; logicalShardID++ {
-		queries[logicalShardID] = scaleGateReadyQuery(manifest, digest, logicalShardID, routeKeys[logicalShardID])
+		queries[logicalShardID] = scaleGateReadyQuery(registryLayout, digest, logicalShardID, routeKeys[logicalShardID])
 		if err := awaitScaleGateReady(ctx, nodeHosts[0], logicalShardID, queries[logicalShardID]); err != nil {
 			t.Fatal(err)
 		}
@@ -240,14 +240,14 @@ func TestDragonboat4097GroupScaleGate(t *testing.T) {
 	)
 }
 
-func scaleGateRouteKeys(t *testing.T, manifest Manifest) []string {
+func scaleGateRouteKeys(t *testing.T, registryLayout RegistryLayout) []string {
 	t.Helper()
-	keys := make([]string, manifest.VirtualShardCount)
-	remaining := manifest.VirtualShardCount
+	keys := make([]string, registryLayout.VirtualShardCount)
+	remaining := registryLayout.VirtualShardCount
 	for candidate := uint32(0); remaining > 0; candidate++ {
 		key := fmt.Sprintf("route-%08d", candidate)
 		_, shardID, err := clusterstate.RouteShardFor(
-			"/dragonboat-scale", key, manifest.RouteBucketCount, manifest.VirtualShardCount,
+			"/dragonboat-scale", key, registryLayout.RouteBucketCount, registryLayout.VirtualShardCount,
 		)
 		if err != nil {
 			t.Fatal(err)
@@ -260,11 +260,11 @@ func scaleGateRouteKeys(t *testing.T, manifest Manifest) []string {
 	return keys
 }
 
-func scaleGateReadyQuery(manifest Manifest, digest string, shardID uint32, routeKey string) DataLookup {
+func scaleGateReadyQuery(registryLayout RegistryLayout, digest string, shardID uint32, routeKey string) DataLookup {
 	request := routeapi.ReadRouteRequest{
 		RequestIdentity: routeapi.RequestIdentity{
-			ClusterID: manifest.ClusterID, StorageGeneration: manifest.StorageGeneration,
-			SystemEpoch: 1, ManifestDigest: digest, ShardID: shardID,
+			ClusterID: registryLayout.ClusterID, RegistryGeneration: registryLayout.RegistryGeneration,
+			SystemEpoch: 1, RegistryLayoutDigest: digest, ShardID: shardID,
 		},
 		Group: "/dragonboat-scale", RouteKey: routeKey,
 	}

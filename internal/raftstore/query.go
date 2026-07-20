@@ -11,10 +11,12 @@ import (
 type DataLookup struct {
 	Route       *routeapi.ReadRouteRequest `json:"route,omitempty"`
 	Build       *routeapi.ReadBuildRequest `json:"build,omitempty"`
+	Workflow    *WorkflowLookup            `json:"workflow,omitempty"`
 	RouteBucket *RouteBucketLookup         `json:"route_bucket,omitempty"`
 	Changefeed  *RouteChangefeedLookup     `json:"changefeed,omitempty"`
 	Pending     *PendingLookup             `json:"pending,omitempty"`
 	Fence       *FenceLookup               `json:"fence,omitempty"`
+	Recovery    *RecoveryLookup            `json:"recovery,omitempty"`
 }
 
 func (q DataLookup) Validate() error {
@@ -28,6 +30,12 @@ func (q DataLookup) Validate() error {
 	if q.Build != nil {
 		present++
 		if err := q.Build.Validate(); err != nil {
+			return err
+		}
+	}
+	if q.Workflow != nil {
+		present++
+		if err := q.Workflow.Validate(); err != nil {
 			return err
 		}
 	}
@@ -55,6 +63,12 @@ func (q DataLookup) Validate() error {
 			return err
 		}
 	}
+	if q.Recovery != nil {
+		present++
+		if err := q.Recovery.Validate(); err != nil {
+			return err
+		}
+	}
 	if present != 1 {
 		return errors.New("raftstore: data lookup must contain exactly one query")
 	}
@@ -64,10 +78,12 @@ func (q DataLookup) Validate() error {
 type DataLookupResult struct {
 	Route       *routeapi.ReadRouteResponse `json:"route,omitempty"`
 	Build       *routeapi.ReadBuildResponse `json:"build,omitempty"`
+	Workflow    *WorkflowLookupResult       `json:"workflow,omitempty"`
 	RouteBucket *RouteBucketResult          `json:"route_bucket,omitempty"`
 	Changefeed  *RouteChangefeedResult      `json:"changefeed,omitempty"`
 	Pending     *PendingLookupResult        `json:"pending,omitempty"`
 	Fence       *FenceLookupResult          `json:"fence,omitempty"`
+	Recovery    *RecoveryLookupResult       `json:"recovery,omitempty"`
 }
 
 func LookupData(state DataState, query DataLookup) (DataLookupResult, error) {
@@ -81,6 +97,9 @@ func LookupData(state DataState, query DataLookup) (DataLookupResult, error) {
 	case query.Build != nil:
 		response := lookupBuild(state, *query.Build)
 		return DataLookupResult{Build: &response}, nil
+	case query.Workflow != nil:
+		response := lookupWorkflow(state, *query.Workflow)
+		return DataLookupResult{Workflow: &response}, nil
 	case query.RouteBucket != nil:
 		response := lookupRouteBucket(state, *query.RouteBucket)
 		return DataLookupResult{RouteBucket: &response}, nil
@@ -90,10 +109,121 @@ func LookupData(state DataState, query DataLookup) (DataLookupResult, error) {
 	case query.Fence != nil:
 		response := lookupFence(state, *query.Fence)
 		return DataLookupResult{Fence: &response}, nil
+	case query.Recovery != nil:
+		response := lookupRecovery(state, *query.Recovery)
+		return DataLookupResult{Recovery: &response}, nil
 	default:
 		response := lookupPending(state, *query.Pending)
 		return DataLookupResult{Pending: &response}, nil
 	}
+}
+
+type RecoveryLookup struct {
+	Identity ShardRequestIdentity `json:"identity"`
+	NodeID   string               `json:"node_id,omitempty"`
+	AfterKey string               `json:"after_key,omitempty"`
+	Limit    uint32               `json:"limit"`
+}
+
+func (q RecoveryLookup) Validate() error {
+	if err := q.Identity.Validate(); err != nil {
+		return err
+	}
+	if q.Limit == 0 || q.Limit > 4096 {
+		return errors.New("raftstore: recovery lookup limit must be between 1 and 4096")
+	}
+	return nil
+}
+
+type RecoveryLookupResult struct {
+	Available bool                   `json:"available"`
+	Reason    string                 `json:"reason,omitempty"`
+	Records   []RecoveryObjectRecord `json:"records"`
+	NextKey   string                 `json:"next_key,omitempty"`
+}
+
+func lookupRecovery(state DataState, query RecoveryLookup) RecoveryLookupResult {
+	result := RecoveryLookupResult{Records: make([]RecoveryObjectRecord, 0)}
+	if state.Recovery == nil || query.Identity.ShardID != state.ShardID ||
+		query.Identity.PermitIdentity != state.Recovery.Target {
+		result.Reason = "data shard has no matching open recovery epoch"
+		return result
+	}
+	keys := make([]string, 0, len(state.RecoveryRecords))
+	for key, record := range state.RecoveryRecords {
+		if key > query.AfterKey && (query.NodeID == "" || record.NodeID == query.NodeID) {
+			keys = append(keys, key)
+		}
+	}
+	sort.Strings(keys)
+	result.Available = true
+	if len(keys) > int(query.Limit) {
+		keys = keys[:query.Limit]
+		result.NextKey = keys[len(keys)-1]
+	}
+	for _, key := range keys {
+		result.Records = append(result.Records, cloneRecoveryRecord(state.RecoveryRecords[key]))
+	}
+	return result
+}
+
+// WorkflowLookup is the leader/coordinator view of one full workflow record.
+// It is deliberately separate from Router reads, which expose only safe
+// positive forwarding projections.
+type WorkflowLookup struct {
+	Identity ShardRequestIdentity `json:"identity"`
+	Group    string               `json:"group"`
+	RouteKey string               `json:"route_key,omitempty"`
+	BuildID  string               `json:"build_id,omitempty"`
+}
+
+func (q WorkflowLookup) Validate() error {
+	if err := q.Identity.Validate(); err != nil {
+		return err
+	}
+	if q.Group == "" || (q.RouteKey == "") == (q.BuildID == "") {
+		return errors.New("raftstore: workflow lookup requires a group and exactly one Route or Build key")
+	}
+	return nil
+}
+
+type WorkflowLookupResult struct {
+	Available bool                              `json:"available"`
+	Reason    string                            `json:"reason,omitempty"`
+	Route     *clusterstate.RouteWorkflowRecord `json:"route,omitempty"`
+	Build     *clusterstate.BuildRecord         `json:"build,omitempty"`
+}
+
+func lookupWorkflow(state DataState, query WorkflowLookup) WorkflowLookupResult {
+	if !state.Initialized || !state.Accepts(query.Identity) {
+		return WorkflowLookupResult{Reason: "workflow shard identity is not available"}
+	}
+	if query.RouteKey != "" {
+		_, shardID, err := clusterstate.RouteShardFor(
+			query.Group, query.RouteKey, state.RouteBucketCount, state.VirtualShardCount,
+		)
+		if err != nil || shardID != state.ShardID {
+			return WorkflowLookupResult{Reason: "Route workflow targets another shard"}
+		}
+		record, found := state.Routes[routeMapKey(query.Group, query.RouteKey)]
+		if !found {
+			return WorkflowLookupResult{Available: true}
+		}
+		copy := cloneRouteRecord(record)
+		return WorkflowLookupResult{Available: true, Route: &copy}
+	}
+	_, shardID, err := clusterstate.BuildShardFor(
+		query.Group, query.BuildID, state.BuildBucketCount, state.VirtualShardCount,
+	)
+	if err != nil || shardID != state.ShardID {
+		return WorkflowLookupResult{Reason: "Build workflow targets another shard"}
+	}
+	record, found := state.Builds[buildMapKey(query.Group, query.BuildID)]
+	if !found {
+		return WorkflowLookupResult{Available: true}
+	}
+	copy := cloneBuildRecord(record)
+	return WorkflowLookupResult{Available: true, Build: &copy}
 }
 
 type RouteBucketLookup struct {
@@ -295,7 +425,7 @@ func lookupRoute(state DataState, request routeapi.ReadRouteRequest) routeapi.Re
 		return routeapi.ReadRouteResponse{Outcome: routeapi.ReadNeedLeader, Reason: "Route replica is not initialized"}
 	}
 	if !state.Accepts(shardIdentityFromRoute(request.RequestIdentity)) {
-		return routeapi.ReadRouteResponse{Outcome: routeapi.ReadUnavailable, Reason: "Route request generation or epoch is fenced"}
+		return routeapi.ReadRouteResponse{Outcome: routeapi.ReadUnavailable, Reason: "Route request Registry History Generation or system epoch is fenced"}
 	}
 	_, shardID, err := clusterstate.RouteShardFor(request.Group, request.RouteKey, state.RouteBucketCount, state.VirtualShardCount)
 	if err != nil || shardID != state.ShardID || request.ShardID != state.ShardID {
@@ -317,12 +447,6 @@ func lookupRoute(state DataState, request routeapi.ReadRouteRequest) routeapi.Re
 		}
 		return routeapi.ReadRouteResponse{Outcome: routeapi.ReadNeedLeader, Reason: string(record.State)}
 	}
-	if request.SandboxID != "" && request.SandboxID != record.Ready.SandboxID {
-		if request.Strong {
-			return routeapi.ReadRouteResponse{Outcome: routeapi.ReadConflict, Reason: "Route is bound to another sandbox ID"}
-		}
-		return routeapi.ReadRouteResponse{Outcome: routeapi.ReadNeedLeader, Reason: "local Route sandbox ID mismatch"}
-	}
 	ready := *record.Ready
 	return routeapi.ReadRouteResponse{
 		Outcome: routeapi.ReadReady, Group: record.Group, RouteKey: record.RouteKey,
@@ -338,7 +462,7 @@ func lookupBuild(state DataState, request routeapi.ReadBuildRequest) routeapi.Re
 		return routeapi.ReadBuildResponse{Outcome: routeapi.ReadNeedLeader, Reason: "Build replica is not initialized"}
 	}
 	if !state.Accepts(shardIdentityFromRoute(request.RequestIdentity)) {
-		return routeapi.ReadBuildResponse{Outcome: routeapi.ReadUnavailable, Reason: "Build request generation or epoch is fenced"}
+		return routeapi.ReadBuildResponse{Outcome: routeapi.ReadUnavailable, Reason: "Build request Registry History Generation or system epoch is fenced"}
 	}
 	_, shardID, err := clusterstate.BuildShardFor(request.Group, request.BuildID, state.BuildBucketCount, state.VirtualShardCount)
 	if err != nil || shardID != state.ShardID || request.ShardID != state.ShardID {
@@ -354,33 +478,23 @@ func lookupBuild(state DataState, request routeapi.ReadBuildRequest) routeapi.Re
 	if record.Revision.LogIndex < request.MinBuildRevision {
 		return routeapi.ReadBuildResponse{Outcome: routeapi.ReadReplicaBehind, Reason: "Build revision is below the requested minimum"}
 	}
-	if !positiveBuildState(record.State) || record.Projection == nil {
+	if record.State != clusterstate.BuildRegistered || record.Projection == nil {
 		if request.Strong {
 			return routeapi.ReadBuildResponse{Outcome: routeapi.ReadConflict, Reason: string(record.State)}
 		}
 		return routeapi.ReadBuildResponse{Outcome: routeapi.ReadNeedLeader, Reason: string(record.State)}
 	}
-	projection := *record.Projection
+	copy := *record.Projection
 	return routeapi.ReadBuildResponse{
-		Outcome: routeapi.ReadReady, Group: record.Group, Build: &projection,
-		BuildState: record.State, BuildRevision: record.Revision.LogIndex,
-	}
-}
-
-func positiveBuildState(state clusterstate.BuildWorkflowState) bool {
-	switch state {
-	case clusterstate.BuildQueued, clusterstate.BuildRegistered, clusterstate.BuildBuilding,
-		clusterstate.BuildReady, clusterstate.BuildError:
-		return true
-	default:
-		return false
+		Outcome: routeapi.ReadReady, Group: record.Group, Build: &copy,
+		BuildState: clusterstate.BuildRegistered, BuildRevision: record.Revision.LogIndex,
 	}
 }
 
 func shardIdentityFromRoute(identity routeapi.RequestIdentity) ShardRequestIdentity {
 	return ShardRequestIdentity{PermitIdentity: PermitIdentity{
-		ClusterID: identity.ClusterID, StorageGeneration: identity.StorageGeneration,
-		SystemEpoch: identity.SystemEpoch, ManifestDigest: identity.ManifestDigest,
+		ClusterID: identity.ClusterID, RegistryGeneration: identity.RegistryGeneration,
+		SystemEpoch: identity.SystemEpoch, RegistryLayoutDigest: identity.RegistryLayoutDigest,
 	}, ShardID: identity.ShardID}
 }
 
@@ -404,6 +518,7 @@ type PendingWorkflow struct {
 	Key   string                            `json:"key"`
 	Route *clusterstate.RouteWorkflowRecord `json:"route,omitempty"`
 	Build *clusterstate.BuildRecord         `json:"build,omitempty"`
+	Fence *clusterstate.ExecutionFence      `json:"fence,omitempty"`
 }
 
 type PendingLookupResult struct {
@@ -418,16 +533,23 @@ func lookupPending(state DataState, query PendingLookup) PendingLookupResult {
 	workflows := make([]PendingWorkflow, 0)
 	for key, record := range state.Routes {
 		qualified := "r" + key
-		if qualified > query.AfterKey && routeNeedsCoordinator(record.State) {
+		if qualified > query.AfterKey && routeNeedsCoordinator(record) {
 			copy := cloneRouteRecord(record)
 			workflows = append(workflows, PendingWorkflow{Key: qualified, Route: &copy})
 		}
 	}
 	for key, record := range state.Builds {
 		qualified := "b" + key
-		if qualified > query.AfterKey && buildNeedsCoordinator(record.State) {
+		if qualified > query.AfterKey && buildNeedsCoordinator(record) {
 			copy := cloneBuildRecord(record)
 			workflows = append(workflows, PendingWorkflow{Key: qualified, Build: &copy})
+		}
+	}
+	for key, fence := range state.Fences {
+		qualified := "f" + key
+		if qualified > query.AfterKey {
+			copy := cloneExecutionFence(fence)
+			workflows = append(workflows, PendingWorkflow{Key: qualified, Fence: &copy})
 		}
 	}
 	sort.Slice(workflows, func(i, j int) bool { return workflows[i].Key < workflows[j].Key })
@@ -442,12 +564,12 @@ func lookupPending(state DataState, query PendingLookup) PendingLookupResult {
 	return result
 }
 
-func routeNeedsCoordinator(state clusterstate.RouteWorkflowState) bool {
-	return state == clusterstate.WorkflowRouteStarting || state == clusterstate.WorkflowRouteResuming ||
-		state == clusterstate.WorkflowRouteDeleting
+func routeNeedsCoordinator(record clusterstate.RouteWorkflowRecord) bool {
+	return record.State == clusterstate.WorkflowRouteStarting || record.State == clusterstate.WorkflowRouteResuming ||
+		record.State == clusterstate.WorkflowRouteDeleting || record.State == clusterstate.WorkflowRouteTombstone ||
+		len(record.Finalizations) != 0
 }
 
-func buildNeedsCoordinator(state clusterstate.BuildWorkflowState) bool {
-	return state == clusterstate.BuildStarting || state == clusterstate.BuildQueued ||
-		state == clusterstate.BuildRegistered || state == clusterstate.BuildBuilding
+func buildNeedsCoordinator(record clusterstate.BuildRecord) bool {
+	return record.State == clusterstate.BuildStarting || len(record.Finalizations) != 0
 }

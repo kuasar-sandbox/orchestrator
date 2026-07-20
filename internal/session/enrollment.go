@@ -42,6 +42,6 @@ func (r IdentityRetirement) Validate() error {
 // the method must return that callback's result and cannot report a later error
 // after the Holder has published the state change.
 type EnrollmentAuthority interface {
-	RunSessionRegistration(context.Context, NodeEnrollment, func() error) error
+	RunSessionRegistration(context.Context, Registration, func() error) error
 	RunIdentityRetirement(context.Context, IdentityRetirement, func() (bool, error)) (bool, error)
 }

@@ -10,23 +10,23 @@ import (
 )
 
 type DataRecoveryState struct {
-	RecoveryEpoch           uint64         `json:"recovery_epoch"`
-	SourceClusterID         string         `json:"source_cluster_id"`
-	SourceStorageGeneration string         `json:"source_storage_generation"`
-	SourceManifestDigest    string         `json:"source_manifest_digest"`
-	Target                  PermitIdentity `json:"target"`
+	RecoveryEpoch              uint64         `json:"recovery_epoch"`
+	SourceClusterID            string         `json:"source_cluster_id"`
+	SourceRegistryGeneration   string         `json:"source_registry_generation"`
+	SourceRegistryLayoutDigest string         `json:"source_registry_layout_digest"`
+	Target                     PermitIdentity `json:"target"`
 }
 
 func (r DataRecoveryState) Validate(state DataState) error {
-	if r.RecoveryEpoch == 0 || r.SourceClusterID != state.ClusterID || r.SourceStorageGeneration == "" ||
-		r.SourceStorageGeneration == state.StorageGeneration || !isSHA256(r.SourceManifestDigest) ||
+	if r.RecoveryEpoch == 0 || r.SourceClusterID != state.ClusterID || r.SourceRegistryGeneration == "" ||
+		r.SourceRegistryGeneration == state.RegistryGeneration || !isSHA256(r.SourceRegistryLayoutDigest) ||
 		r.Target.Validate() != nil || r.Target.ClusterID != state.ClusterID ||
-		r.Target.StorageGeneration != state.StorageGeneration || r.Target.SystemEpoch != r.RecoveryEpoch {
+		r.Target.RegistryGeneration != state.RegistryGeneration || r.Target.SystemEpoch != r.RecoveryEpoch {
 		return errors.New("raftstore: invalid data-shard recovery identity")
 	}
 	if len(state.ServingEpochs) != 1 || r.RecoveryEpoch != state.ServingEpochs[0].SystemEpoch+1 ||
-		r.Target.ManifestDigest != state.ServingEpochs[0].ManifestDigest {
-		return errors.New("raftstore: data-shard recovery does not follow its initialized target generation")
+		r.Target.RegistryLayoutDigest != state.ServingEpochs[0].RegistryLayoutDigest {
+		return errors.New("raftstore: data-shard recovery does not follow its initialized target Registry History Generation")
 	}
 	return nil
 }
@@ -54,11 +54,11 @@ type RecoveryObjectRecord struct {
 	EventSeq     uint64 `json:"event_seq"`
 	ReportDigest string `json:"report_digest"`
 
-	SourceStorageGeneration string                              `json:"source_storage_generation"`
-	SourceManifestDigest    string                              `json:"source_manifest_digest"`
-	SourceOpaqueBinding     string                              `json:"source_opaque_binding"`
-	SourceBindingDigest     string                              `json:"source_binding_digest"`
-	TargetBinding           clusterstate.ExecutionBindingIntent `json:"target_binding"`
+	SourceRegistryGeneration   string                              `json:"source_registry_generation"`
+	SourceRegistryLayoutDigest string                              `json:"source_registry_layout_digest"`
+	SourceOpaqueBinding        string                              `json:"source_opaque_binding"`
+	SourceBindingDigest        string                              `json:"source_binding_digest"`
+	TargetBinding              clusterstate.ExecutionBindingIntent `json:"target_binding"`
 
 	Route *clusterstate.RouteWorkflowRecord `json:"route,omitempty"`
 	Build *clusterstate.BuildRecord         `json:"build,omitempty"`
@@ -71,12 +71,18 @@ type RecoveryObjectRecord struct {
 
 func (r RecoveryObjectRecord) Validate(recovery DataRecoveryState) error {
 	if r.RecoveryEpoch != recovery.RecoveryEpoch || r.Group == "" || r.ObjectID == "" ||
-		r.NodeID == "" || r.NodeEpoch == 0 || r.SessionSeq == 0 || r.EventSeq == 0 ||
-		!isSHA256(r.ReportDigest) || r.SourceStorageGeneration != recovery.SourceStorageGeneration ||
-		r.SourceManifestDigest != recovery.SourceManifestDigest || r.SourceOpaqueBinding == "" ||
-		!isSHA256(r.SourceBindingDigest) || r.Revision.StorageGeneration != recovery.Target.StorageGeneration ||
+		r.NodeID == "" || r.NodeEpoch == 0 || r.SessionSeq == 0 ||
+		!isSHA256(r.ReportDigest) || r.SourceRegistryGeneration != recovery.SourceRegistryGeneration ||
+		r.SourceRegistryLayoutDigest != recovery.SourceRegistryLayoutDigest || r.SourceOpaqueBinding == "" ||
+		!isSHA256(r.SourceBindingDigest) || r.Revision.RegistryGeneration != recovery.Target.RegistryGeneration ||
 		r.Revision.LogIndex == 0 {
 		return errors.New("raftstore: incomplete recovery object record")
+	}
+	if r.Kind == clusterstate.ExecutionKindSandbox && r.EventSeq == 0 {
+		return errors.New("raftstore: Sandbox recovery record requires an event sequence")
+	}
+	if r.Kind == clusterstate.ExecutionKindBuild && r.EventSeq != 0 {
+		return errors.New("raftstore: Build registration recovery does not carry a lifecycle event sequence")
 	}
 	source, err := clusterstate.DecodeExecutionBinding(r.SourceOpaqueBinding)
 	if err != nil {
@@ -84,7 +90,7 @@ func (r RecoveryObjectRecord) Validate(recovery DataRecoveryState) error {
 	}
 	sourceDigest, err := clusterstate.ExecutionBindingDigest(r.SourceOpaqueBinding)
 	if err != nil || sourceDigest != r.SourceBindingDigest ||
-		source.StorageGeneration != recovery.SourceStorageGeneration || source.Kind != r.Kind ||
+		source.RegistryGeneration != recovery.SourceRegistryGeneration || source.Kind != r.Kind ||
 		source.ObjectID != r.ObjectID || source.Group != r.Group || source.RouteKey != r.RouteKey ||
 		source.NodeID != r.NodeID || source.NodeEpoch != r.NodeEpoch {
 		return errors.New("raftstore: recovery source Binding does not match the report")
@@ -93,14 +99,14 @@ func (r RecoveryObjectRecord) Validate(recovery DataRecoveryState) error {
 		return err
 	}
 	target, err := clusterstate.DecodeExecutionBinding(r.TargetBinding.OpaqueBinding)
-	if err != nil || target.StorageGeneration != recovery.Target.StorageGeneration ||
+	if err != nil || target.RegistryGeneration != recovery.Target.RegistryGeneration ||
 		target.Kind != source.Kind || target.ObjectID != source.ObjectID || target.Group != source.Group ||
 		target.RouteKey != source.RouteKey || target.NodeID != source.NodeID || target.NodeEpoch != source.NodeEpoch ||
 		target.DemandDigest != source.DemandDigest || target.DispatchSpecDigest != source.DispatchSpecDigest {
 		return errors.New("raftstore: recovery target Binding changes immutable execution identity")
 	}
 	if r.TargetBinding.NodeID != r.NodeID || r.TargetBinding.NodeEpoch != r.NodeEpoch ||
-		r.TargetBinding.StorageGeneration != recovery.Target.StorageGeneration {
+		r.TargetBinding.RegistryGeneration != recovery.Target.RegistryGeneration {
 		return errors.New("raftstore: recovery target Binding identifies another target")
 	}
 	if err := validateRecoveryProjection(r); err != nil {
@@ -112,7 +118,7 @@ func (r RecoveryObjectRecord) Validate(recovery DataRecoveryState) error {
 	} else {
 		projectionRevision = r.Build.Revision
 	}
-	if projectionRevision.StorageGeneration != r.Revision.StorageGeneration ||
+	if projectionRevision.RegistryGeneration != r.Revision.RegistryGeneration ||
 		projectionRevision.ShardID != r.Revision.ShardID || projectionRevision.LogIndex > r.Revision.LogIndex {
 		return errors.New("raftstore: recovery projection revision is outside its recovery record history")
 	}
@@ -158,29 +164,26 @@ func validateRecoveryProjection(record RecoveryObjectRecord) error {
 			execution = record.Route.Paused.Execution
 		}
 		if execution.SandboxID != record.ObjectID || execution.NodeID != record.NodeID ||
-			execution.NodeEpoch != record.NodeEpoch || execution.StorageGeneration != record.TargetBinding.StorageGeneration ||
+			execution.NodeEpoch != record.NodeEpoch || execution.RegistryGeneration != record.TargetBinding.RegistryGeneration ||
 			execution.BindingDigest != record.TargetBinding.BindingDigest || execution.LastEventSeq != record.EventSeq {
 			return errors.New("raftstore: recovered Route projection differs from the target Binding report")
 		}
 	case clusterstate.ExecutionKindBuild:
 		if record.Build == nil || record.Route != nil || record.RouteKey != "" || record.Build.Group != record.Group ||
 			record.Build.BuildID != record.ObjectID || record.Build.Projection == nil {
-			return errors.New("raftstore: Build recovery requires one matching Build projection")
+			return errors.New("raftstore: Build recovery requires one matching registration projection")
 		}
-		switch record.Build.State {
-		case clusterstate.BuildQueued, clusterstate.BuildRegistered, clusterstate.BuildBuilding,
-			clusterstate.BuildReady, clusterstate.BuildError:
-		default:
-			return errors.New("raftstore: recovered Build state is not a bound projection")
+		if record.Build.State != clusterstate.BuildRegistered {
+			return errors.New("raftstore: recovered Build is not a registered binding")
 		}
 		if err := record.Build.Validate(); err != nil {
 			return err
 		}
 		projection := record.Build.Projection
 		if projection.NodeID != record.NodeID || projection.NodeEpoch != record.NodeEpoch ||
-			projection.StorageGeneration != record.TargetBinding.StorageGeneration ||
-			projection.BindingDigest != record.TargetBinding.BindingDigest || projection.LastEventSeq != record.EventSeq {
-			return errors.New("raftstore: recovered Build projection differs from the target Binding report")
+			projection.RegistryGeneration != record.TargetBinding.RegistryGeneration ||
+			projection.BindingDigest != record.TargetBinding.BindingDigest {
+			return errors.New("raftstore: recovered Build registration differs from the target Binding report")
 		}
 	default:
 		return errors.New("raftstore: unsupported recovery object kind")
@@ -189,24 +192,30 @@ func validateRecoveryProjection(record RecoveryObjectRecord) error {
 }
 
 type RecoveryObjectUpdate struct {
-	Kind                clusterstate.ExecutionKind `json:"kind"`
-	Group               string                     `json:"group"`
-	RouteKey            string                     `json:"route_key,omitempty"`
-	ObjectID            string                     `json:"object_id"`
-	RecoveryEpoch       uint64                     `json:"recovery_epoch"`
-	ReportDigest        string                     `json:"report_digest"`
-	SourceBindingDigest string                     `json:"source_binding_digest"`
-	TargetBindingDigest string                     `json:"target_binding_digest"`
-	Reason              string                     `json:"reason,omitempty"`
+	Kind                clusterstate.ExecutionKind        `json:"kind"`
+	Group               string                            `json:"group"`
+	RouteKey            string                            `json:"route_key,omitempty"`
+	ObjectID            string                            `json:"object_id"`
+	RecoveryEpoch       uint64                            `json:"recovery_epoch"`
+	ReportDigest        string                            `json:"report_digest"`
+	SourceBindingDigest string                            `json:"source_binding_digest"`
+	TargetBindingDigest string                            `json:"target_binding_digest"`
+	Reason              string                            `json:"reason,omitempty"`
+	Route               *clusterstate.RouteWorkflowRecord `json:"route,omitempty"`
+	Build               *clusterstate.BuildRecord         `json:"build,omitempty"`
 }
 
 type RecoveryFinalization struct {
-	RecoveryEpoch           uint64 `json:"recovery_epoch"`
-	SourceStorageGeneration string `json:"source_storage_generation"`
-	SourceManifestDigest    string `json:"source_manifest_digest"`
+	RecoveryEpoch              uint64 `json:"recovery_epoch"`
+	SourceRegistryGeneration   string `json:"source_registry_generation"`
+	SourceRegistryLayoutDigest string `json:"source_registry_layout_digest"`
 }
 
 func beginDataRecovery(state *DataState, identity ShardRequestIdentity, recovery DataRecoveryState) error {
+	if state != nil && state.Recovery != nil && *state.Recovery == recovery && identity.ShardID == state.ShardID &&
+		identity.PermitIdentity == recovery.Target {
+		return nil
+	}
 	if state == nil || !state.Initialized || state.Recovery != nil || len(state.RecoveryRecords) != 0 ||
 		len(state.RecoveryClaims) != 0 || identity.ShardID != state.ShardID || identity.PermitIdentity != recovery.Target {
 		return errors.New("raftstore: data shard cannot begin recovery")
@@ -304,11 +313,20 @@ func updateRecoveryObject(
 			return errors.New("raftstore: recovery rebind acknowledgement is out of order")
 		}
 		if record.State == RecoveryObjectRebound {
-			return nil
+			if update.Route == nil && update.Build == nil || sameRecoveryRebindProjection(record, update) {
+				return nil
+			}
+			if err := applyRecoveryRebindProjection(state, index, &record, update); err != nil {
+				return err
+			}
+		} else if update.Route != nil || update.Build != nil {
+			if err := applyRecoveryRebindProjection(state, index, &record, update); err != nil {
+				return err
+			}
 		}
 		record.State = RecoveryObjectRebound
 	case RecoveryObjectQuarantined:
-		if update.Reason == "" || record.State == RecoveryObjectActivated {
+		if update.Reason == "" || record.State == RecoveryObjectActivated || update.Route != nil || update.Build != nil {
 			return errors.New("raftstore: recovery quarantine is invalid")
 		}
 		record.State = RecoveryObjectQuarantined
@@ -322,12 +340,86 @@ func updateRecoveryObject(
 	return nil
 }
 
+func sameRecoveryRebindProjection(record RecoveryObjectRecord, update RecoveryObjectUpdate) bool {
+	if update.Route != nil {
+		if record.Route == nil || update.Build != nil {
+			return false
+		}
+		committed := cloneRouteRecord(*record.Route)
+		retry := cloneRouteRecord(*update.Route)
+		committed.Revision = clusterstate.Revision{}
+		retry.Revision = clusterstate.Revision{}
+		return reflect.DeepEqual(committed, retry)
+	}
+	if update.Build != nil {
+		if record.Build == nil {
+			return false
+		}
+		committed := cloneBuildRecord(*record.Build)
+		retry := cloneBuildRecord(*update.Build)
+		committed.Revision = clusterstate.Revision{}
+		retry.Revision = clusterstate.Revision{}
+		return reflect.DeepEqual(committed, retry)
+	}
+	return false
+}
+
+func applyRecoveryRebindProjection(
+	state *DataState,
+	index uint64,
+	record *RecoveryObjectRecord,
+	update RecoveryObjectUpdate,
+) error {
+	if record == nil || (update.Route == nil) == (update.Build == nil) {
+		return errors.New("raftstore: rebind acknowledgement requires exactly one refreshed projection")
+	}
+	if update.Route != nil && update.Route.Revision != (clusterstate.Revision{}) ||
+		update.Build != nil && update.Build.Revision != (clusterstate.Revision{}) {
+		return errors.New("raftstore: refreshed recovery projection carries an uncommitted revision")
+	}
+	copy := cloneRecoveryRecord(*record)
+	copy.Route, copy.Build = nil, nil
+	copy.Revision = revisionFor(*state, index)
+	if update.Route != nil {
+		route := cloneRouteRecord(*update.Route)
+		route.Revision = copy.Revision
+		normalizeRouteRevision(&route)
+		copy.Route = &route
+		if route.Ready != nil {
+			copy.EventSeq = route.Ready.LastEventSeq
+		} else if route.Paused != nil {
+			copy.EventSeq = route.Paused.Execution.LastEventSeq
+		}
+	} else {
+		build := cloneBuildRecord(*update.Build)
+		build.Revision = copy.Revision
+		normalizeBuildRevision(&build)
+		copy.Build = &build
+	}
+	if copy.EventSeq < record.EventSeq {
+		return errors.New("raftstore: refreshed recovery projection regresses event sequence")
+	}
+	if record.Kind == clusterstate.ExecutionKindSandbox && record.State == RecoveryObjectRebound && copy.EventSeq == record.EventSeq {
+		return errors.New("raftstore: changed rebound projection requires a newer durable event")
+	}
+	if err := copy.Validate(*state.Recovery); err != nil {
+		return err
+	}
+	record.Route, record.Build, record.EventSeq = copy.Route, copy.Build, copy.EventSeq
+	return nil
+}
+
 func activateRecoveryObject(state *DataState, index uint64, identity ShardRequestIdentity, update RecoveryObjectUpdate) error {
 	if !dataRecoveryAccepts(state, identity) || update.Reason != "" {
 		return errors.New("raftstore: invalid recovery activation")
 	}
 	key := recoveryUpdateKey(update)
 	record, found := state.RecoveryRecords[key]
+	if found && record.State == RecoveryObjectActivated && record.ReportDigest == update.ReportDigest &&
+		record.SourceBindingDigest == update.SourceBindingDigest &&
+		record.TargetBinding.BindingDigest == update.TargetBindingDigest {
+		return nil
+	}
 	if !found || record.State != RecoveryObjectRebound || record.ReportDigest != update.ReportDigest ||
 		record.SourceBindingDigest != update.SourceBindingDigest ||
 		record.TargetBinding.BindingDigest != update.TargetBindingDigest {
@@ -361,13 +453,18 @@ func activateRecoveryObject(state *DataState, index uint64, identity ShardReques
 }
 
 func finalizeDataRecovery(state *DataState, identity ShardRequestIdentity, final RecoveryFinalization) error {
+	if state != nil && state.Recovery == nil && state.Initialized && identity.ShardID == state.ShardID &&
+		state.Accepts(identity) && len(state.RecoveryRecords) == 0 && len(state.RecoveryClaims) == 0 &&
+		final.RecoveryEpoch+1 == identity.SystemEpoch {
+		return nil
+	}
 	if state == nil || state.Recovery == nil || identity.ShardID != state.ShardID ||
-		identity.ClusterID != state.ClusterID || identity.StorageGeneration != state.StorageGeneration ||
-		identity.ManifestDigest != state.Recovery.Target.ManifestDigest ||
+		identity.ClusterID != state.ClusterID || identity.RegistryGeneration != state.RegistryGeneration ||
+		identity.RegistryLayoutDigest != state.Recovery.Target.RegistryLayoutDigest ||
 		identity.SystemEpoch != state.Recovery.RecoveryEpoch+1 ||
 		final.RecoveryEpoch != state.Recovery.RecoveryEpoch ||
-		final.SourceStorageGeneration != state.Recovery.SourceStorageGeneration ||
-		final.SourceManifestDigest != state.Recovery.SourceManifestDigest {
+		final.SourceRegistryGeneration != state.Recovery.SourceRegistryGeneration ||
+		final.SourceRegistryLayoutDigest != state.Recovery.SourceRegistryLayoutDigest {
 		return errors.New("raftstore: invalid data recovery finalization identity")
 	}
 	for _, record := range state.RecoveryRecords {

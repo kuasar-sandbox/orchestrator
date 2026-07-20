@@ -15,10 +15,11 @@ import (
 )
 
 var (
-	ErrWorkflowConflict = errors.New("nodeexec: workflow conflicts with existing dispatch")
-	ErrWorkflowMissing  = errors.New("nodeexec: workflow is missing")
-	ErrWorkflowState    = errors.New("nodeexec: workflow state does not permit the operation")
-	ErrSessionFenced    = errors.New("nodeexec: node-link session is fenced")
+	ErrWorkflowConflict   = errors.New("nodeexec: workflow conflicts with existing dispatch")
+	ErrWorkflowMissing    = errors.New("nodeexec: workflow is missing")
+	ErrWorkflowState      = errors.New("nodeexec: workflow state does not permit the operation")
+	ErrSessionFenced      = errors.New("nodeexec: node-link session is fenced")
+	ErrFinalOutboxPending = errors.New("nodeexec: final outbox watermark is not acknowledged")
 )
 
 type LocalSessionIdentity struct {
@@ -53,6 +54,7 @@ type DispatchRecord struct {
 	RouteKey              string
 	NodeID                string
 	NodeEpoch             uint64
+	SessionSeq            uint64
 	DataEndpoint          string
 	NormalizedDemand      []byte
 	DemandDigest          string
@@ -67,7 +69,8 @@ type DispatchRecord struct {
 func DispatchRecordFromCommand(command session.DispatchCommand) (DispatchRecord, error) {
 	record := DispatchRecord{
 		Kind: command.Kind, ObjectID: command.ObjectID, Group: command.Group, RouteKey: command.RouteKey,
-		NodeID: command.NodeID, NodeEpoch: command.NodeEpoch, DataEndpoint: command.DataEndpoint,
+		NodeID: command.NodeID, NodeEpoch: command.NodeEpoch, SessionSeq: command.SessionSeq,
+		DataEndpoint:          command.DataEndpoint,
 		NormalizedDemand:      append([]byte(nil), command.Intent.NormalizedDemand...),
 		DemandDigest:          command.Intent.DemandDigest,
 		DispatchSpec:          append([]byte(nil), command.Intent.DispatchSpec...),
@@ -126,8 +129,8 @@ func DispatchCommandFromWire(wire *routesync.Command, local LocalSessionIdentity
 		},
 		Binding: clusterstate.ExecutionBindingIntent{
 			NodeID: local.NodeID, NodeEpoch: wire.NodeEpoch, DataEndpoint: local.DataEndpoint,
-			StorageGeneration: wire.StorageGeneration,
-			OpaqueBinding:     wire.Binding, BindingDigest: wire.BindingDigest,
+			RegistryGeneration: wire.RegistryGeneration,
+			OpaqueBinding:      wire.Binding, BindingDigest: wire.BindingDigest,
 		},
 	}
 	switch wire.Kind {
@@ -147,7 +150,7 @@ func DispatchCommandFromWire(wire *routesync.Command, local LocalSessionIdentity
 }
 
 func (r DispatchRecord) Validate() error {
-	if r.ObjectID == "" || r.Group == "" || r.NodeID == "" || r.NodeEpoch == 0 || r.DataEndpoint == "" ||
+	if r.ObjectID == "" || r.Group == "" || r.NodeID == "" || r.NodeEpoch == 0 || r.SessionSeq == 0 || r.DataEndpoint == "" ||
 		len(r.NormalizedDemand) == 0 || len(r.DispatchSpec) == 0 || r.ProviderPolicyVersion == "" || r.OpaqueBinding == "" {
 		return errors.New("nodeexec: incomplete dispatch record")
 	}
@@ -264,12 +267,14 @@ func (d AdmissionDecision) Validate() error {
 }
 
 // EventUpdate contains only the bounded projection supplied by node execution
-// code. Store code fills and fences identity, Binding, generation, and event_seq.
+// code. Store code fills and fences identity, Binding, Registry History Generation, and event_seq.
 type EventUpdate struct {
 	State              string
+	TargetPort         int
 	AccessToken        string
 	TrafficAccessToken string
 	TemplateRef        string
+	SnapshotRef        string
 	SnapshotLocation   string
 	ArtifactRef        string
 	Reason             string

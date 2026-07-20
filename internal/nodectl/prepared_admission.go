@@ -24,6 +24,7 @@ var (
 )
 
 type SandboxAdmissionDemand struct {
+	SlotUnits             uint64  `json:"slot_units"`
 	CapacityMemoryBytes   uint64  `json:"capacity_memory_bytes"`
 	CapacityCPU           int     `json:"capacity_cpu"`
 	FloorMemoryBytes      uint64  `json:"floor_memory_bytes"`
@@ -44,6 +45,9 @@ func (d SandboxAdmissionDemand) message(sandboxID string) *Message {
 }
 
 func (d SandboxAdmissionDemand) Validate() error {
+	if d.SlotUnits == 0 {
+		return errors.New("nodectl: sandbox slot demand is required")
+	}
 	if d.CapacityCPU < 0 || d.FloorCPU < 0 || math.IsNaN(d.FloorCPU) || math.IsInf(d.FloorCPU, 0) {
 		return errors.New("nodectl: sandbox CPU demand is invalid")
 	}
@@ -76,6 +80,12 @@ type PreparedAdmissionResult struct {
 	Reason           string
 }
 
+type PreparedAdmissionUsage struct {
+	SlotUsed      uint64
+	AdmittedSlots uint64
+	QueueDepth    uint64
+}
+
 func preparedResult(record *PreparedSandboxAdmission) PreparedAdmissionResult {
 	return PreparedAdmissionResult{
 		SandboxID: record.SandboxID, DemandDigest: record.DemandDigest,
@@ -84,17 +94,19 @@ func preparedResult(record *PreparedSandboxAdmission) PreparedAdmissionResult {
 }
 
 // PreparedAdmissionController is the durable, asynchronous cluster Admission
-// path. It is independent of the legacy connection-bound Admit queue.
+// path. The sandbox runtime controller's synchronous Admit call is not cluster
+// Admission authority.
 type PreparedAdmissionController struct {
-	mu         sync.Mutex
-	state      *State
-	admission  *AdmissionController
-	persister  *Persister
-	queueMax   int
-	queueTTL   time.Duration
-	clock      func() time.Time
-	wakeCh     chan struct{}
-	queueTimer *time.Timer
+	mu           sync.Mutex
+	state        *State
+	admission    *AdmissionController
+	persister    *Persister
+	queueMax     int
+	slotCapacity uint64
+	queueTTL     time.Duration
+	clock        func() time.Time
+	wakeCh       chan struct{}
+	queueTimer   *time.Timer
 }
 
 func NewPreparedAdmissionController(
@@ -102,13 +114,15 @@ func NewPreparedAdmissionController(
 	admission *AdmissionController,
 	persister *Persister,
 	policy AdmissionPolicy,
+	slotCapacity uint64,
 ) (*PreparedAdmissionController, error) {
-	if state == nil || admission == nil || persister == nil || policy.QueueMaxDepth <= 0 {
-		return nil, errors.New("nodectl: prepared admission requires state, admission, persister, and positive queue limit")
+	if state == nil || admission == nil || persister == nil || policy.QueueMaxDepth <= 0 || slotCapacity == 0 {
+		return nil, errors.New("nodectl: prepared admission requires state, admission, persister, and positive slot/queue limits")
 	}
 	controller := &PreparedAdmissionController{
 		state: state, admission: admission, persister: persister,
-		queueMax: policy.QueueMaxDepth, queueTTL: policy.QueueTTL, clock: time.Now,
+		queueMax: policy.QueueMaxDepth, slotCapacity: slotCapacity,
+		queueTTL: policy.QueueTTL, clock: time.Now,
 		wakeCh: make(chan struct{}, 1),
 	}
 	controller.mu.Lock()
@@ -124,6 +138,12 @@ func NewPreparedAdmissionController(
 }
 
 func (c *PreparedAdmissionController) Wake() <-chan struct{} { return c.wakeCh }
+
+func (c *PreparedAdmissionController) Usage() PreparedAdmissionUsage {
+	c.state.Lock()
+	defer c.state.Unlock()
+	return preparedUsageLocked(c.state)
+}
 
 func (c *PreparedAdmissionController) SignalCapacityChange() {
 	c.mu.Lock()
@@ -188,15 +208,19 @@ func (c *PreparedAdmissionController) PrepareAdmission(
 		return result, nil
 	}
 	hasQueued := preparedQueueDepthLocked(c.state) > 0
+	usage := preparedUsageLocked(c.state)
 	c.state.Unlock()
 
 	var outcome Outcome
-	if hasQueued {
+	switch {
+	case demand.SlotUnits > c.slotCapacity:
+		outcome = Outcome{Status: OutcomePreCheckReject, RejectCode: "exceeds_slot_capacity"}
+	case hasQueued || usage.AdmittedSlots > c.slotCapacity-demand.SlotUnits:
 		outcome = c.admission.AnalyzeRequest(demand.message(sandboxID))
-		if outcome.Status == OutcomeAdmitted {
+		if outcome.Status == OutcomeAdmitted && demand.SlotUnits <= c.slotCapacity {
 			outcome = Outcome{Status: OutcomeShortTermBlock, Block: BlockNone}
 		}
-	} else {
+	default:
 		outcome = c.admission.AnalyzeAndConsume(demand.message(sandboxID))
 	}
 	now := c.clock()
@@ -412,8 +436,16 @@ func (c *PreparedAdmissionController) PromoteQueued() ([]PreparedAdmissionResult
 	changed := make([]PreparedAdmissionResult, 0)
 	for _, queued := range queue {
 		var outcome Outcome
-		if c.queueTTL > 0 && c.clock().Sub(queued.QueuedAt) >= c.queueTTL {
+		c.state.Lock()
+		usage := preparedUsageLocked(c.state)
+		c.state.Unlock()
+		if queued.Demand.SlotUnits > c.slotCapacity {
+			outcome = Outcome{Status: OutcomeLongTermReject, RejectCode: "exceeds_slot_capacity"}
+		} else if c.queueTTL > 0 && c.clock().Sub(queued.QueuedAt) >= c.queueTTL {
 			outcome = Outcome{Status: OutcomeLongTermReject, RejectCode: "queue_expired"}
+		} else if usage.AdmittedSlots > c.slotCapacity-queued.Demand.SlotUnits {
+			blockedBy = BlockNone
+			break
 		} else {
 			outcome = c.admission.AnalyzeAndConsume(queued.Demand.message(queued.SandboxID))
 			if outcome.Status == OutcomeShortTermBlock {
@@ -489,6 +521,21 @@ func preparedQueueDepthLocked(state *State) int {
 		}
 	}
 	return depth
+}
+
+func preparedUsageLocked(state *State) PreparedAdmissionUsage {
+	var usage PreparedAdmissionUsage
+	for _, record := range state.PreparedSandboxAdmissions {
+		switch record.State {
+		case PreparedQueued:
+			usage.QueueDepth++
+			usage.SlotUsed += record.Demand.SlotUnits
+		case PreparedAdmitted, PreparedClaimed:
+			usage.SlotUsed += record.Demand.SlotUnits
+			usage.AdmittedSlots += record.Demand.SlotUnits
+		}
+	}
+	return usage
 }
 
 // scheduleQueueWakeLocked keeps the durable FIFO live without polling. Queue

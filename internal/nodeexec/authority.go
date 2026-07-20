@@ -18,7 +18,7 @@ type BuildCapacitySource func(context.Context) (BuildCapacity, string, error)
 
 type SandboxDemandSource func(DispatchRecord) (nodectl.SandboxAdmissionDemand, error)
 
-type BuildObjectSource func(DispatchRecord) (*types.Build, error)
+type BuildObjectSource func(context.Context, DispatchRecord) (*types.Build, error)
 
 type SandboxAdmissionController interface {
 	GetAdmission(string, string) (nodectl.PreparedAdmissionResult, error)
@@ -49,8 +49,8 @@ type WorkflowJournal interface {
 	FinalizeNodeWorkflow(context.Context, clusterstate.ExecutionKind, string, string) error
 }
 
-// Authority is the dormant final node-side Admission and command-dedupe
-// endpoint. A separate instance belongs to one node-link SessionSeq.
+// Authority is the node-side Admission and command-dedupe endpoint. A separate
+// instance belongs to one node-link SessionSeq.
 type Authority struct {
 	journal        WorkflowJournal
 	sandbox        SandboxAdmissionController
@@ -205,7 +205,7 @@ func (a *Authority) AdmitAndDispatch(
 			return session.DispatchReply{}, err
 		}
 	case clusterstate.ExecutionKindBuild:
-		build, err := a.buildObject(dispatch)
+		build, err := a.buildObject(ctx, dispatch)
 		if err != nil {
 			return session.DispatchReply{}, err
 		}
@@ -535,31 +535,55 @@ func (a *Authority) FailSandbox(ctx context.Context, record *WorkflowRecord, rea
 	return err
 }
 
+// ReleaseSandboxResources completes the local terminal resource handoff after
+// the object state and terminal outbox event have been committed atomically.
+func (a *Authority) ReleaseSandboxResources(ctx context.Context, record *WorkflowRecord, reason string) error {
+	done, active := a.beginSessionWork()
+	if !active {
+		return ErrSessionFenced
+	}
+	defer done()
+	if record == nil || record.Kind != clusterstate.ExecutionKindSandbox {
+		return errors.New("nodeexec: Sandbox resource release requires a workflow")
+	}
+	if _, err := a.sandbox.ReleaseAdmission(record.ObjectID, record.DemandDigest, reason); err != nil {
+		return err
+	}
+	_, err := a.journal.ReleaseSandboxWorkflow(ctx, record.ObjectID, record.DemandDigest, record.ReservationToken)
+	return err
+}
+
 func (a *Authority) FinalizeWorkflow(
 	ctx context.Context,
 	kind clusterstate.ExecutionKind,
-	objectID, demandDigest, bindingDigest string,
+	objectID, bindingDigest string,
 ) error {
 	done, active := a.beginSessionWork()
 	if !active {
 		return ErrSessionFenced
 	}
 	defer done()
-	if objectID == "" || demandDigest == "" || bindingDigest == "" {
-		return errors.New("nodeexec: finalization requires object identity and digests")
+	if objectID == "" || bindingDigest == "" {
+		return errors.New("nodeexec: finalization requires object identity and Binding digest")
 	}
 	record, err := a.journal.GetNodeWorkflow(ctx, kind, objectID)
 	if err != nil {
 		return err
 	}
-	if record != nil && record.DemandDigest != demandDigest {
+	if record == nil {
+		return a.journal.FinalizeNodeWorkflow(ctx, kind, objectID, bindingDigest)
+	}
+	if record.BindingDigest != bindingDigest {
 		return ErrWorkflowConflict
 	}
-	if err := a.journal.FinalizeNodeWorkflow(ctx, kind, objectID, bindingDigest); err != nil {
-		return err
+	finalizeErr := a.journal.FinalizeNodeWorkflow(ctx, kind, objectID, bindingDigest)
+	if finalizeErr != nil && !errors.Is(finalizeErr, ErrFinalOutboxPending) {
+		return finalizeErr
 	}
 	if kind == clusterstate.ExecutionKindSandbox {
-		return a.sandbox.FinalizeAdmission(objectID, demandDigest)
+		if err := a.sandbox.FinalizeAdmission(objectID, record.DemandDigest); err != nil {
+			return err
+		}
 	}
-	return nil
+	return finalizeErr
 }

@@ -3,6 +3,8 @@ package proxy
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -147,7 +149,7 @@ func WriteSandboxConnect(w io.Writer, request SandboxConnectRequest) error {
 		return fmt.Errorf("proxy: sandbox id and port are required for CONNECT")
 	}
 	if request.HasExecutionFence() && (request.ExpectedNodeID == "" || request.ExpectedNodeEpoch == 0 ||
-		request.ExpectedStorageGeneration == "" || request.ExpectedBindingDigest == "") {
+		request.ExpectedRegistryGeneration == "" || request.ExpectedBindingDigest == "") {
 		return fmt.Errorf("proxy: incomplete execution fence")
 	}
 	target := fmt.Sprintf("sandbox:%d", request.Port)
@@ -160,7 +162,7 @@ func WriteSandboxConnect(w io.Writer, request SandboxConnectRequest) error {
 	if request.HasExecutionFence() {
 		fmt.Fprintf(&b, "%s: %s\r\n", HeaderNodeID, request.ExpectedNodeID)
 		fmt.Fprintf(&b, "%s: %d\r\n", HeaderNodeEpoch, request.ExpectedNodeEpoch)
-		fmt.Fprintf(&b, "%s: %s\r\n", HeaderStorageGeneration, request.ExpectedStorageGeneration)
+		fmt.Fprintf(&b, "%s: %s\r\n", HeaderRegistryGeneration, request.ExpectedRegistryGeneration)
 		fmt.Fprintf(&b, "%s: %s\r\n", HeaderBindingDigest, request.ExpectedBindingDigest)
 	}
 	b.WriteString("\r\n")
@@ -175,6 +177,41 @@ func DialSandboxConnect(ctx context.Context, network, addr string, request Sandb
 	if err != nil {
 		return nil, nil, nil, err
 	}
+	return sandboxConnect(conn, request)
+}
+
+func DialSandboxConnectTLS(
+	ctx context.Context,
+	addr string,
+	request SandboxConnectRequest,
+	config *tls.Config,
+) (net.Conn, *bufio.Reader, *http.Response, error) {
+	if config == nil {
+		return nil, nil, nil, errors.New("proxy: node TLS config is required")
+	}
+	raw, err := (&net.Dialer{}).DialContext(ctx, "tcp", addr)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	clientConfig := config.Clone()
+	clientConfig.NextProtos = []string{"http/1.1"}
+	if clientConfig.ServerName == "" {
+		host, _, splitErr := net.SplitHostPort(addr)
+		if splitErr != nil {
+			raw.Close()
+			return nil, nil, nil, splitErr
+		}
+		clientConfig.ServerName = host
+	}
+	conn := tls.Client(raw, clientConfig)
+	if err := conn.HandshakeContext(ctx); err != nil {
+		conn.Close()
+		return nil, nil, nil, err
+	}
+	return sandboxConnect(conn, request)
+}
+
+func sandboxConnect(conn net.Conn, request SandboxConnectRequest) (net.Conn, *bufio.Reader, *http.Response, error) {
 	if err := WriteSandboxConnect(conn, request); err != nil {
 		conn.Close()
 		return nil, nil, nil, err
@@ -232,7 +269,7 @@ func removeHopHeaders(h http.Header) {
 		"Upgrade",
 		HeaderNodeID,
 		HeaderNodeEpoch,
-		HeaderStorageGeneration,
+		HeaderRegistryGeneration,
 		HeaderBindingDigest,
 	} {
 		h.Del(k)

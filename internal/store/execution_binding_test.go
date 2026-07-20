@@ -76,12 +76,17 @@ func TestCASExecutionBindingAtomicallyRebindsWorkflowOutbox(t *testing.T) {
 	default:
 		t.Fatal("initial event did not wake replay")
 	}
+	if err := st.AckExecutionEvent(ctx, "node-1", 7, routesync.EventAck{
+		ObjectKind: "sandbox", ObjectID: dispatch.ObjectID, EventSeq: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	rebound, err := clusterstate.DecodeExecutionBinding(dispatch.OpaqueBinding)
 	if err != nil {
 		t.Fatal(err)
 	}
-	rebound.StorageGeneration = "generation-2"
+	rebound.RegistryGeneration = "generation-2"
 	replacement, err := clusterstate.EncodeExecutionBinding(rebound)
 	if err != nil {
 		t.Fatal(err)
@@ -105,13 +110,13 @@ func TestCASExecutionBindingAtomicallyRebindsWorkflowOutbox(t *testing.T) {
 		t.Fatal(err)
 	}
 	if workflow.OpaqueBinding != replacement || workflow.BindingDigest != replacementDigest ||
-		workflow.LatestEvent == nil || workflow.LatestEvent.StorageGeneration != "generation-2" ||
-		workflow.LatestEvent.BindingDigest != replacementDigest {
+		workflow.LatestEvent == nil || workflow.LatestEvent.RegistryGeneration != "generation-2" ||
+		workflow.LatestEvent.BindingDigest != replacementDigest || workflow.AckedEventSeq != 0 {
 		t.Fatalf("rebound workflow = %+v", workflow)
 	}
 	pending, _, err := st.PendingExecutionEvents(ctx, "node-1", 7, routesync.EventCursor{}, 10, 1<<20)
 	if err != nil || len(pending) != 1 || pending[0].ObjectID != dispatch.ObjectID ||
-		pending[0].StorageGeneration != "generation-2" || pending[0].BindingDigest != replacementDigest {
+		pending[0].RegistryGeneration != "generation-2" || pending[0].BindingDigest != replacementDigest {
 		t.Fatalf("rebound pending events = %+v, %v", pending, err)
 	}
 	stored, err := st.Get(ctx, dispatch.ObjectID)
@@ -123,7 +128,7 @@ func TestCASExecutionBindingAtomicallyRebindsWorkflowOutbox(t *testing.T) {
 func testOpaqueBinding(t *testing.T, generation, objectID, nodeID string, nodeEpoch uint64) string {
 	t.Helper()
 	opaque, err := clusterstate.EncodeExecutionBinding(clusterstate.ExecutionBinding{
-		StorageGeneration: generation, Kind: clusterstate.ExecutionKindSandbox,
+		RegistryGeneration: generation, Kind: clusterstate.ExecutionKindSandbox,
 		ObjectID: objectID, Group: "/g", RouteKey: "rk", NodeID: nodeID, NodeEpoch: nodeEpoch,
 		DemandDigest: sha256.Sum256([]byte("demand")), DispatchSpecDigest: sha256.Sum256([]byte("dispatch")),
 	})

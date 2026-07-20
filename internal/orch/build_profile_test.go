@@ -10,7 +10,6 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	"github.com/kuasar-sandbox/orchestrator/internal/apikey"
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
-	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
@@ -101,39 +100,5 @@ func TestBuildSpecCarriesBareProfileNetwork(t *testing.T) {
 	}
 	if spec.MMDSEnabled || spec.EnvdToken != "" {
 		t.Fatalf("bare BuildSpec exposed e2b template controls: mmds=%t envd_token=%q", spec.MMDSEnabled, spec.EnvdToken)
-	}
-}
-
-func TestRegisterClusterBuildRequiresAndPersistsProfile(t *testing.T) {
-	o := testOrch(t)
-	ctx := context.Background()
-	_, _, fingerprint := allowlistedBuildIdentity(t, o)
-
-	missing := &routesync.Command{BuildID: "missing-profile", TemplateRef: "transient-missing", KeyFingerprint: fingerprint}
-	if err := o.registerClusterBuild(ctx, missing); err == nil {
-		t.Fatal("build_register without profile was accepted")
-	}
-	cmd := &routesync.Command{
-		BuildID: "bare-cluster-build", TemplateRef: "transient-bare",
-		Profile: string(types.ProfileBare), KeyFingerprint: fingerprint,
-	}
-	if err := o.registerClusterBuild(ctx, cmd); err != nil {
-		t.Fatalf("registerClusterBuild: %v", err)
-	}
-	stored, err := o.st.GetBuild(ctx, cmd.BuildID)
-	if err != nil || stored == nil || stored.Profile != types.ProfileBare {
-		t.Fatalf("cluster build = %+v, err=%v", stored, err)
-	}
-	if err := o.registerClusterBuild(ctx, cmd); err != nil {
-		t.Fatalf("idempotent build_register replay: %v", err)
-	}
-	conflict := *cmd
-	conflict.Profile = string(types.ProfileE2B)
-	if err := o.registerClusterBuild(ctx, &conflict); err == nil {
-		t.Fatal("build_register changed an existing build profile")
-	}
-	stored, err = o.st.GetBuild(ctx, cmd.BuildID)
-	if err != nil || stored == nil || stored.Profile != types.ProfileBare || stored.Status != types.BuildRegistered {
-		t.Fatalf("conflicting replay changed build = %+v, err=%v", stored, err)
 	}
 }

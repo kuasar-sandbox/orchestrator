@@ -46,27 +46,27 @@ type LocalReplicaEnrollment struct {
 }
 
 type LocalEnrollment struct {
-	Version             uint32                   `json:"version"`
-	ClusterID           string                   `json:"cluster_id"`
-	StorageGeneration   string                   `json:"storage_generation"`
-	MemberID            string                   `json:"member_id"`
-	DeploymentID        uint64                   `json:"deployment_id"`
-	RaftAddress         string                   `json:"raft_address"`
-	NodeHostDir         string                   `json:"nodehost_dir"`
-	WALDir              string                   `json:"wal_dir"`
-	StateEngineDir      string                   `json:"state_engine_dir"`
-	RuntimeConfigDigest string                   `json:"runtime_config_digest"`
-	ManifestVersion     uint64                   `json:"manifest_version"`
-	ManifestDigest      string                   `json:"manifest_digest"`
-	Mode                EnrollmentMode           `json:"mode"`
-	Replicas            []LocalReplicaEnrollment `json:"replicas"`
+	Version               uint32                   `json:"version"`
+	ClusterID             string                   `json:"cluster_id"`
+	RegistryGeneration    string                   `json:"registry_generation"`
+	MemberID              string                   `json:"member_id"`
+	DeploymentID          uint64                   `json:"deployment_id"`
+	RaftAddress           string                   `json:"raft_address"`
+	NodeHostDir           string                   `json:"nodehost_dir"`
+	WALDir                string                   `json:"wal_dir"`
+	StateEngineDir        string                   `json:"state_engine_dir"`
+	RuntimeConfigDigest   string                   `json:"runtime_config_digest"`
+	RegistryLayoutVersion uint64                   `json:"registry_layout_version"`
+	RegistryLayoutDigest  string                   `json:"registry_layout_digest"`
+	Mode                  EnrollmentMode           `json:"mode"`
+	Replicas              []LocalReplicaEnrollment `json:"replicas"`
 }
 
 func (e LocalEnrollment) Validate() error {
-	if e.Version != localEnrollmentVersion || e.ClusterID == "" || e.StorageGeneration == "" ||
+	if e.Version != localEnrollmentVersion || e.ClusterID == "" || e.RegistryGeneration == "" ||
 		e.MemberID == "" || e.DeploymentID == 0 || e.RaftAddress == "" ||
-		e.NodeHostDir == "" || e.StateEngineDir == "" || !isSHA256(e.RuntimeConfigDigest) || e.ManifestVersion == 0 ||
-		!isSHA256(e.ManifestDigest) || len(e.Replicas) == 0 {
+		e.NodeHostDir == "" || e.StateEngineDir == "" || !isSHA256(e.RuntimeConfigDigest) || e.RegistryLayoutVersion == 0 ||
+		!isSHA256(e.RegistryLayoutDigest) || len(e.Replicas) == 0 {
 		return errors.New("raftstore: incomplete local Registry enrollment")
 	}
 	if e.Mode != EnrollmentBootstrap && e.Mode != EnrollmentJoin {
@@ -94,15 +94,15 @@ func (e LocalEnrollment) Validate() error {
 
 func newLocalEnrollment(
 	mode EnrollmentMode,
-	manifest Manifest,
+	registryLayout RegistryLayout,
 	digest string,
 	member RegistryMember,
 	config RuntimeConfig,
 ) (LocalEnrollment, error) {
-	if err := manifest.Validate(); err != nil {
+	if err := registryLayout.Validate(); err != nil {
 		return LocalEnrollment{}, err
 	}
-	configDigest, err := config.digest(manifest, member)
+	configDigest, err := config.digest(registryLayout, member)
 	if err != nil {
 		return LocalEnrollment{}, err
 	}
@@ -112,15 +112,15 @@ func newLocalEnrollment(
 		startPlan = ReplicaJoin
 		nonVoting = true
 	}
-	replicas := localReplicas(manifest, member, startPlan, nonVoting)
+	replicas := localReplicas(registryLayout, member, startPlan, nonVoting)
 	enrollment := LocalEnrollment{
-		Version: localEnrollmentVersion, ClusterID: manifest.ClusterID,
-		StorageGeneration: manifest.StorageGeneration, MemberID: member.MemberID,
-		DeploymentID: deploymentID(manifest.ClusterID, manifest.StorageGeneration),
+		Version: localEnrollmentVersion, ClusterID: registryLayout.ClusterID,
+		RegistryGeneration: registryLayout.RegistryGeneration, MemberID: member.MemberID,
+		DeploymentID: deploymentID(registryLayout.ClusterID, registryLayout.RegistryGeneration),
 		RaftAddress:  member.RaftEndpoint, NodeHostDir: config.NodeHostDir, WALDir: config.WALDir,
 		StateEngineDir:      config.StateEngineDir,
-		RuntimeConfigDigest: configDigest, ManifestVersion: manifest.ManifestVersion,
-		ManifestDigest: digest, Mode: mode, Replicas: replicas,
+		RuntimeConfigDigest: configDigest, RegistryLayoutVersion: registryLayout.RegistryLayoutVersion,
+		RegistryLayoutDigest: digest, Mode: mode, Replicas: replicas,
 	}
 	if err := enrollment.Validate(); err != nil {
 		return LocalEnrollment{}, err
@@ -128,37 +128,37 @@ func newLocalEnrollment(
 	return enrollment, nil
 }
 
-func (e LocalEnrollment) Matches(manifest Manifest, digest string, member RegistryMember, config RuntimeConfig) error {
+func (e LocalEnrollment) Matches(registryLayout RegistryLayout, digest string, member RegistryMember, config RuntimeConfig) error {
 	if err := e.Validate(); err != nil {
 		return err
 	}
-	configDigest, err := config.digest(manifest, member)
+	configDigest, err := config.digest(registryLayout, member)
 	if err != nil {
 		return err
 	}
-	if e.ClusterID != manifest.ClusterID || e.StorageGeneration != manifest.StorageGeneration ||
+	if e.ClusterID != registryLayout.ClusterID || e.RegistryGeneration != registryLayout.RegistryGeneration ||
 		e.MemberID != member.MemberID ||
-		e.DeploymentID != deploymentID(manifest.ClusterID, manifest.StorageGeneration) ||
+		e.DeploymentID != deploymentID(registryLayout.ClusterID, registryLayout.RegistryGeneration) ||
 		e.RaftAddress != member.RaftEndpoint || e.NodeHostDir != config.NodeHostDir || e.WALDir != config.WALDir ||
 		e.StateEngineDir != config.StateEngineDir ||
 		e.RuntimeConfigDigest != configDigest {
 		return errors.New("raftstore: runtime identity differs from durable local enrollment")
 	}
-	if manifest.ManifestVersion < e.ManifestVersion || manifest.ManifestVersion == e.ManifestVersion && digest != e.ManifestDigest {
-		return errors.New("raftstore: local enrollment rejected manifest rollback or equivocation")
+	if registryLayout.RegistryLayoutVersion < e.RegistryLayoutVersion || registryLayout.RegistryLayoutVersion == e.RegistryLayoutVersion && digest != e.RegistryLayoutDigest {
+		return errors.New("raftstore: local enrollment rejected registryLayout rollback or equivocation")
 	}
 	return nil
 }
 
-func localReplicas(manifest Manifest, member RegistryMember, plan ReplicaStartPlan, nonVoting bool) []LocalReplicaEnrollment {
+func localReplicas(registryLayout RegistryLayout, member RegistryMember, plan ReplicaStartPlan, nonVoting bool) []LocalReplicaEnrollment {
 	replicas := make([]LocalReplicaEnrollment, 0)
-	if placement, found := replicaPlacementForMember(manifest.SystemReplicas, member.MemberID); found {
+	if placement, found := replicaPlacementForMember(registryLayout.SystemReplicas, member.MemberID); found {
 		replicas = append(replicas, LocalReplicaEnrollment{
 			ShardID: SystemRaftShardID, ReplicaID: placement.ReplicaID,
 			StartPlan: plan, NonVoting: nonVoting, LocalState: ReplicaPlanned,
 		})
 	}
-	for _, shard := range manifest.DataShards {
+	for _, shard := range registryLayout.DataShards {
 		if placement, found := replicaPlacementForMember(shard.Replicas, member.MemberID); found {
 			replicas = append(replicas, LocalReplicaEnrollment{
 				ShardID: DataRaftShardID(shard.ShardID), ReplicaID: placement.ReplicaID,

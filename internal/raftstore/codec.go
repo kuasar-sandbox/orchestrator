@@ -48,7 +48,7 @@ func DecodeDataCommand(raw []byte) (DataCommand, error) {
 
 func validateSystemCommandEnvelope(command SystemCommand) error {
 	pointers := countPresent(
-		command.Manifest != nil, command.Gates != nil, command.Transition != nil, command.Advance != nil,
+		command.RegistryLayout != nil, command.Gates != nil, command.Transition != nil, command.Advance != nil,
 		command.Closure != nil, command.Drain != nil, command.TransitionDrain != nil,
 		command.Recovery != nil, command.RecoveryAdvance != nil,
 		command.Enrollment != nil, command.Registration != nil, command.Retirement != nil,
@@ -56,7 +56,7 @@ func validateSystemCommandEnvelope(command SystemCommand) error {
 	)
 	switch command.Type {
 	case SystemBootstrap:
-		if pointers != 1 || command.Manifest == nil || !isSHA256(command.Digest) {
+		if pointers != 1 || command.RegistryLayout == nil || !isSHA256(command.Digest) {
 			return errors.New("raftstore: malformed System bootstrap command")
 		}
 	case SystemRefreshPermit, SystemActivateTransition, SystemFinalizeTransition:
@@ -69,15 +69,15 @@ func validateSystemCommandEnvelope(command SystemCommand) error {
 		}
 	case SystemBeginTransition:
 		if pointers != 1 || command.Transition == nil || command.Digest != "" {
-			return errors.New("raftstore: malformed manifest transition command")
+			return errors.New("raftstore: malformed registryLayout transition command")
 		}
 	case SystemAdvanceTransition:
 		if pointers != 1 || command.Advance == nil || command.Digest != "" {
 			return errors.New("raftstore: malformed transition advance command")
 		}
-	case SystemCloseGeneration:
+	case SystemCloseRegistryGeneration:
 		if pointers != 1 || command.Closure == nil || command.Digest != "" {
-			return errors.New("raftstore: malformed generation closure command")
+			return errors.New("raftstore: malformed Registry History Generation closure command")
 		}
 	case SystemConfirmDrain:
 		if pointers != 1 || command.Drain == nil || command.Digest != "" {
@@ -85,7 +85,7 @@ func validateSystemCommandEnvelope(command SystemCommand) error {
 		}
 	case SystemConfirmTransitionDrain:
 		if pointers != 1 || command.TransitionDrain == nil || command.Digest != "" {
-			return errors.New("raftstore: malformed manifest transition drain command")
+			return errors.New("raftstore: malformed registryLayout transition drain command")
 		}
 	case SystemBeginRecovery:
 		if pointers != 1 || command.Recovery == nil || command.Digest != "" {

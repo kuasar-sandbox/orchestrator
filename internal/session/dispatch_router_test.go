@@ -41,7 +41,7 @@ func TestDirectoryDispatcherRoutesCurrentTuple(t *testing.T) {
 	}
 }
 
-func TestDirectoryDispatcherClassifiesOnlyProvenNoSideEffect(t *testing.T) {
+func TestDirectoryDispatcherNeverTreatsDirectoryAsNoSideEffectProof(t *testing.T) {
 	directory := NewDirectory()
 	applyDirectoryUp(t, directory, "node-1", "registry-b", 8, 1)
 	rpc := &holderDispatchRPCStub{}
@@ -50,7 +50,7 @@ func TestDirectoryDispatcherClassifiesOnlyProvenNoSideEffect(t *testing.T) {
 		t.Fatal(err)
 	}
 	reply, err := dispatcher.AdmitAndDispatch(context.Background(), DispatchCommand{NodeID: "node-1", NodeEpoch: 7})
-	if err != nil || reply.Outcome != cluster.DispatchDefinitiveReject || rpc.calls != 0 {
+	if err != nil || reply.Outcome != cluster.DispatchSessionMoved || rpc.calls != 0 {
 		t.Fatalf("newer epoch dispatch = %+v, %v, calls=%d", reply, err, rpc.calls)
 	}
 	reply, err = dispatcher.AdmitAndDispatch(context.Background(), DispatchCommand{NodeID: "missing", NodeEpoch: 7})

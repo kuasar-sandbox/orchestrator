@@ -40,13 +40,13 @@ func configCmd(args []string) error {
 	switch role {
 	case "registry":
 		skeleton = registryConfigSkeleton
-		load = func(p string) (any, error) { return clustercfg.LoadRegistry(p) }
+		load = func(p string) (any, error) { return clustercfg.LoadConsensusRegistry(p) }
 	case "router":
 		skeleton = routerConfigSkeleton
-		load = func(p string) (any, error) { return clustercfg.LoadRouter(p) }
+		load = func(p string) (any, error) { return clustercfg.LoadConsensusRouter(p) }
 	case "placer":
 		skeleton = placerConfigSkeleton
-		load = func(p string) (any, error) { return clustercfg.LoadPlacer(p) }
+		load = func(p string) (any, error) { return clustercfg.LoadFinalPlacer(p) }
 	default:
 		return fmt.Errorf("config: unknown role %q (registry|router|placer)", role)
 	}
@@ -75,83 +75,88 @@ func configCmd(args []string) error {
 	return err
 }
 
-const registryConfigSkeleton = `# cluster-ctl registry config — cluster-ctl registry --config <this> (docs/cluster.md).
-member:                              # unified HTTP control plane
+const registryConfigSkeleton = `# cluster-ctl registry --config <this>
+member:
   id: registry-1
   listen: ":7700"
-  # tls: { cert: ..., key: ..., ca: ... }   # server mTLS
-membership:
-  active: 1
-  # next: 2                         # joint owner set target during membership change
-  # old_grace: 1                    # previous version kept as peer/node_link ingress after cutover
-  reload_ready_timeout: 10s          # wait for active/next members before applying reload
-  versions:
-    - version: 1
-      members:
-        - { id: registry-1, advertise: "https://registry-1.example:7700", node_advertise: "registry-1.example:7700" }
-  owners:
-    route_link: 1
-    node_link: 1
-    placer_link: 1
-    node_list: 1
-node_link:
-  # listen: ""                       # optional split listener for node streams; empty = member.listen
-  heartbeat_interval: 10s
-  node_dead_after: 30s
-route_link:
+  tls: { cert: /etc/kuasar/tls/registry.crt, key: /etc/kuasar/tls/registry.key, ca: /etc/kuasar/tls/ca.crt }
+registry_layout:
+  chain: /etc/kuasar/registry-layout/chain.json
+  keys: /etc/kuasar/registry-layout/keyring.json
+  guard: /var/lib/kuasar/registry-layout.guard
+storage:
+  nodehost_dir: /var/lib/kuasar/raft/nodehost
+  wal_dir: /var/lib/kuasar/raft/wal
+  state_engine_dir: /var/lib/kuasar/raft/state
+  enrollment_path: /var/lib/kuasar/raft/enrollment.json
+  raft_listen: 127.0.0.1:63001
+  open_mode: bootstrap              # bootstrap | join | restart
+  bootstrap_secret_file: /etc/kuasar/bootstrap.secret
+  storage_protection: dm-crypt      # dm-crypt | ephemeral-tmpfs
+  initialize_workers: 16
+  transition_workers: 16
+  snapshot_workers: 4
+  operation_timeout: 5s
+  fence_retention: 1h
+  tls: { cert: /etc/kuasar/tls/registry.crt, key: /etc/kuasar/tls/registry.key, ca: /etc/kuasar/tls/ca.crt }
+placers:
+  endpoints:
+    - { name: placer-1, endpoint: "https://placer-1.example:7800" }
+  tls: { cert: /etc/kuasar/tls/registry.crt, key: /etc/kuasar/tls/registry.key, ca: /etc/kuasar/tls/ca.crt }
+session:
+  max_nodes: 5000
+  anti_entropy: 2s
+  event_workers: 32
+  reconnect_per_second: 200
+workflow:
   park_timeout: 30s
-node_list:
-  watch_retention: 10000
-placer_link:
-  placer_label: placer.default          # placer memberlist label; not a configured placer list
-  placer_replica_count: 3
-  min_ready_placers: 1
-  place_timeout: 2s
+  poll_interval: 20ms
+  permit_refresh: 1s
+  recovery_scan_interval: 250ms
+  recovery_shards_per_scan: 64
+  recovery_workers: 8
+  recovery_per_node_workers: 1
+  compaction_workers: 4
+  pending_workflows_per_page: 256
+  recovery_page_objects: 64
+  recovery_page_bytes: 524288
+  recovery_max_report_bytes: 67108864
+  recovery_lookup_page: 256
 `
 
-const routerConfigSkeleton = `# cluster-ctl router config — cluster-ctl router --config <this> (docs/cluster-router.md).
-# e2b-compatible unified ingress. Required: domain.
+const routerConfigSkeleton = `# cluster-ctl router --config <this>
 domain: sandboxes.example.com
-registry:                            # bootstrap endpoint for registry membership
-  bootstrap: registry-1.example:7700
-  # tls: { cert: ..., key: ..., ca: ... }   # client mTLS to registry control plane
-ingress:                             # downstream: e2b client ingress
+registry_layout:
+  chain: /etc/kuasar/registry-layout/chain.json
+  keys: /etc/kuasar/registry-layout/keyring.json
+  guard: /var/lib/kuasar/router-registry-layout.guard
+registry_tls: { cert: /etc/kuasar/tls/router.crt, key: /etc/kuasar/tls/router.key, ca: /etc/kuasar/tls/ca.crt }
+providers:
+  endpoints:
+    - { name: provider-1, endpoint: "https://provider-1.example:7900" }
+  tls: { cert: /etc/kuasar/tls/router.crt, key: /etc/kuasar/tls/router.key, ca: /etc/kuasar/tls/ca.crt }
+ingress:
   listen: ":443"
-  # tls: { cert: ..., key: ... }     # wildcard *.<domain> + api.<domain>
+  tls: { cert: /etc/kuasar/tls/ingress.crt, key: /etc/kuasar/tls/ingress.key }
 auth:
-  api_key: enforce                   # caller api_key auth: off | log | enforce
-  data_plane: enforce                # data-plane access-token check: off | log | enforce
-  cache_ttl: 60s                     # api_key↔group verification cache
+  api_key: enforce
+  data_plane: enforce
+  cache_ttl: 60s
 cache:
   route_ttl: 5m
   idle_timeout: 2m
-# metrics_listen: ":9910"            # optional Prometheus text endpoint
+# metrics_listen: ":9910"
 `
 
-const placerConfigSkeleton = `# cluster-ctl placer config — cluster-ctl placer --config <this> (docs/cluster-placer.md).
-# Standalone placement scheduler; starts from registry membership, joins the
-# placer memberlist label, consumes node_list, and provides placement.
+const placerConfigSkeleton = `# cluster-ctl placer --config <this>
 placer:
   id: placer-1
   listen: ":7800"
-  advertise: "https://placer-1.example:7800"
-  memberlist_label: placer.default
-  # tls: { cert: ..., key: ..., ca: ... }   # server mTLS for placer Place API
-registry:
-  bootstrap: registry-1.example:7700
-  # tls: { cert: ..., key: ..., ca: ... }   # client mTLS to registry control plane
-import_groups:                         # standalone placer requires at least one source
+  tls: { cert: /etc/kuasar/tls/placer.crt, key: /etc/kuasar/tls/placer.key, ca: /etc/kuasar/tls/ca.crt }
+group_sources:
   - source_id: example-file-source
     source_type: file
     path: /var/lib/kuasar/groups
 placement:
-  candidates: 2                      # P2C sample size
-  zone_admit_max: yellow             # exclude nodes hotter than this (green|yellow|red)
-  import_source_owner_count: 3       # candidates that may race for each source lease
-  import_source_lease_ttl: 15s       # registry-side source lease TTL
-  selector_patch_refresh_interval: 1m # refresh unchanged selector patches before node key TTL
-  # shuffle_sharding:                # empty = static nodeSelectors only
-  #   - selector: { pool: gpu }
-  #     shard_by: zone
-  #     n: 2
+  candidates: 4
 `

@@ -7,7 +7,7 @@ type routeIdentity struct {
 	routeKey string
 }
 
-// RouterState carries the generation-fenced request identity, monotonic
+// RouterState carries the Registry-History-Generation-fenced request identity, monotonic
 // per-Route minimum revisions, and cached shard leader hints. It is not a Route
 // authority and stores no workflow state.
 type RouterState struct {
@@ -28,7 +28,7 @@ func NewRouterState(identity RequestIdentity) (*RouterState, error) {
 	}, nil
 }
 
-func (s *RouterState) RouteRequest(group, routeKey, sandboxID string, shardID uint32, strong bool) ReadRouteRequest {
+func (s *RouterState) RouteRequest(group, routeKey string, shardID uint32, strong bool) ReadRouteRequest {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	identity := s.identity
@@ -37,7 +37,6 @@ func (s *RouterState) RouteRequest(group, routeKey, sandboxID string, shardID ui
 		RequestIdentity:  identity,
 		Group:            group,
 		RouteKey:         routeKey,
-		SandboxID:        sandboxID,
 		MinRouteRevision: s.minimum[routeIdentity{group: group, routeKey: routeKey}],
 		Strong:           strong,
 	}
@@ -49,8 +48,8 @@ func (s *RouterState) ObserveRoute(request ReadRouteRequest, response ReadRouteR
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if request.ClusterID != s.identity.ClusterID || request.StorageGeneration != s.identity.StorageGeneration ||
-		request.SystemEpoch != s.identity.SystemEpoch || request.ManifestDigest != s.identity.ManifestDigest {
+	if request.ClusterID != s.identity.ClusterID || request.RegistryGeneration != s.identity.RegistryGeneration ||
+		request.SystemEpoch != s.identity.SystemEpoch || request.RegistryLayoutDigest != s.identity.RegistryLayoutDigest {
 		return nil
 	}
 	if response.Outcome == ReadReady {

@@ -7,8 +7,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
-	"strconv"
 	"strings"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/apikey"
@@ -16,16 +14,8 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/clustercfg"
 )
 
-const defaultGroupPageLimit = 1024
-
-type ImportSource struct {
-	SourceID string
-	Importer clusterstate.SandboxGroupImporter
-}
-
 type ConfiguredGroupInputs struct {
 	Provider clusterstate.SandboxGroupProvider
-	Sources  []ImportSource
 }
 
 func NewConfiguredGroupInputs(sources []clustercfg.GroupSourceConfig) (ConfiguredGroupInputs, error) {
@@ -33,7 +23,6 @@ func NewConfiguredGroupInputs(sources []clustercfg.GroupSourceConfig) (Configure
 		return ConfiguredGroupInputs{Provider: emptyGroupProvider{}}, nil
 	}
 	out := make([]*fileGroupSource, 0, len(sources))
-	imports := make([]ImportSource, 0, len(sources))
 	for _, cfg := range sources {
 		switch cfg.SourceType {
 		case "file":
@@ -42,12 +31,11 @@ func NewConfiguredGroupInputs(sources []clustercfg.GroupSourceConfig) (Configure
 				return ConfiguredGroupInputs{}, err
 			}
 			out = append(out, src)
-			imports = append(imports, ImportSource{SourceID: cfg.SourceID, Importer: src})
 		default:
 			return ConfiguredGroupInputs{}, fmt.Errorf("placer: unsupported group source type %q", cfg.SourceType)
 		}
 	}
-	return ConfiguredGroupInputs{Provider: multiGroupProvider{sources: out}, Sources: imports}, nil
+	return ConfiguredGroupInputs{Provider: multiGroupProvider{sources: out}}, nil
 }
 
 func NewFileGroupSource(sourceID, dir string) (*fileGroupSource, error) {
@@ -210,37 +198,6 @@ func (s *fileGroupSource) GetAuthKey(ctx context.Context, group string) (cluster
 	return rec.AuthKey, true, nil
 }
 
-func (s *fileGroupSource) Range(ctx context.Context, cursor string, limit int) (clusterstate.GroupPage, error) {
-	if limit <= 0 {
-		limit = defaultGroupPageLimit
-	}
-	records, err := s.records(ctx)
-	if err != nil {
-		return clusterstate.GroupPage{}, err
-	}
-	groups := make([]string, 0, len(records))
-	for _, rec := range records {
-		groups = append(groups, rec.Group)
-	}
-	sort.Strings(groups)
-	start, err := parseGroupCursor(cursor)
-	if err != nil {
-		return clusterstate.GroupPage{}, err
-	}
-	if start >= len(groups) {
-		return clusterstate.GroupPage{}, nil
-	}
-	end := start + limit
-	if end > len(groups) {
-		end = len(groups)
-	}
-	next := ""
-	if end < len(groups) {
-		next = strconv.Itoa(end)
-	}
-	return clusterstate.GroupPage{Groups: groups[start:end], NextCursor: next}, nil
-}
-
 func (s *fileGroupSource) find(ctx context.Context, group string) (clusterstate.SandboxGroupRecord, bool, error) {
 	if group == "" {
 		return clusterstate.SandboxGroupRecord{}, false, nil
@@ -307,17 +264,6 @@ func readGroupRecord(path string) (clusterstate.SandboxGroupRecord, error) {
 
 func groupRecordActive(rec clusterstate.SandboxGroupRecord) bool {
 	return rec.Group != ""
-}
-
-func parseGroupCursor(cursor string) (int, error) {
-	if cursor == "" {
-		return 0, nil
-	}
-	start, err := strconv.Atoi(cursor)
-	if err != nil || start < 0 {
-		return 0, fmt.Errorf("placer: invalid group cursor %q", cursor)
-	}
-	return start, nil
 }
 
 func groupRecordToGroup(rec clusterstate.SandboxGroupRecord) clusterstate.SandboxGroup {

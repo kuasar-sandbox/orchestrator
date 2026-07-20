@@ -10,6 +10,7 @@ import (
 
 	"github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/placement"
+	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 )
 
 var (
@@ -22,27 +23,40 @@ var (
 )
 
 type ServeIdentity struct {
-	ClusterID         string `json:"cluster_id"`
-	StorageGeneration string `json:"storage_generation"`
-	SystemEpoch       uint64 `json:"system_epoch"`
-	ManifestDigest    string `json:"manifest_digest"`
+	ClusterID            string `json:"cluster_id"`
+	RegistryGeneration   string `json:"registry_generation"`
+	SystemEpoch          uint64 `json:"system_epoch"`
+	RegistryLayoutDigest string `json:"registry_layout_digest"`
 }
 
 func (i ServeIdentity) Validate() error {
-	digest, err := hex.DecodeString(i.ManifestDigest)
-	if i.ClusterID == "" || i.StorageGeneration == "" || i.SystemEpoch == 0 || err != nil || len(digest) != 32 {
+	digest, err := hex.DecodeString(i.RegistryLayoutDigest)
+	if i.ClusterID == "" || i.RegistryGeneration == "" || i.SystemEpoch == 0 || err != nil || len(digest) != 32 {
 		return errors.New("session: incomplete serving identity")
 	}
 	return nil
 }
 
 type PermitGate interface {
-	AllowSessionWork(ServeIdentity) bool
+	AllowSessionWork(ServeIdentity, PermitOperation) bool
+	AuthorizeNodeSession(ServeIdentity, Registration) error
 }
+
+type PermitOperation uint8
+
+const (
+	PermitProbe PermitOperation = iota + 1
+	PermitDispatch
+	PermitRecovery
+)
 
 type SessionEndpoint interface {
 	FenceStaleSession()
 	AdmitAndDispatch(context.Context, DispatchCommand) (DispatchReply, error)
+}
+
+type commandEndpoint interface {
+	SendNodeCommand(context.Context, *routesync.Command) (routesync.CmdAck, bool, error)
 }
 
 type DispatchCommand struct {
@@ -70,6 +84,8 @@ type Registration struct {
 	Tuple
 	DataEndpoint     string
 	RuntimeDigest    string
+	Labels           map[string]string
+	Capabilities     map[string]bool
 	LoadModelVersion uint16
 	SandboxSlots     uint64
 	BuildSlots       uint64
@@ -77,6 +93,7 @@ type Registration struct {
 	BuildMemory      uint64
 	BuildStorage     uint64
 	FailureDomain    string
+	Draining         bool
 }
 
 func (r Registration) Validate() error {
@@ -144,12 +161,8 @@ func (h *Holder) Register(ctx context.Context, registration Registration, endpoi
 	if endpoint == nil {
 		return nil, errors.New("session: node-link endpoint is required")
 	}
-	enrollment := NodeEnrollment{
-		NodeID: registration.NodeID, EnrollmentID: registration.EnrollmentID,
-		NodeEpoch: registration.NodeEpoch, DataEndpoint: registration.DataEndpoint,
-	}
 	var old SessionEndpoint
-	err := h.enroll.RunSessionRegistration(ctx, enrollment, func() error {
+	err := h.enroll.RunSessionRegistration(ctx, registration, func() error {
 		h.mu.Lock()
 		previous, seen := h.high[registration.NodeID]
 		if seen {
@@ -201,7 +214,7 @@ func (h *Holder) RetireIdentity(ctx context.Context, retirement IdentityRetireme
 		previous, seen := h.high[retirement.NodeID]
 		if !seen || previous.EnrollmentID != retirement.EnrollmentID || previous.NodeEpoch > retirement.LastNodeEpoch {
 			h.mu.Unlock()
-			return false, nil
+			return true, nil
 		}
 		delete(h.high, retirement.NodeID)
 		if held := h.active[retirement.NodeID]; held != nil &&
@@ -256,7 +269,7 @@ func (h *Holder) Probe(ctx context.Context, call ProbeCall) (placement.Placement
 	if err := ctx.Err(); err != nil {
 		return placement.PlacementProbeResponse{}, err
 	}
-	if h.gate == nil || !h.gate.AllowSessionWork(call.ServeIdentity) {
+	if h.gate == nil || !h.gate.AllowSessionWork(call.ServeIdentity, PermitProbe) {
 		return placement.PlacementProbeResponse{}, ErrPermitUnavailable
 	}
 	h.mu.RLock()
@@ -268,16 +281,20 @@ func (h *Holder) Probe(ctx context.Context, call ProbeCall) (placement.Placement
 	}
 	snapshot := session.snapshot
 	observedAt := session.observedAt
+	registration := session.registration
 	h.mu.RUnlock()
+	if err := h.authorizeNodeSession(call.ServeIdentity, registration); err != nil {
+		return placement.PlacementProbeResponse{}, err
+	}
 	age := h.clock().Sub(observedAt)
 	return placement.ProbePlacement(snapshot, age, call.Request), nil
 }
 
-func (h *Holder) CheckServe(identity ServeIdentity) error {
+func (h *Holder) CheckServe(identity ServeIdentity, operation PermitOperation) error {
 	if err := identity.Validate(); err != nil {
 		return err
 	}
-	if h.gate == nil || !h.gate.AllowSessionWork(identity) {
+	if h.gate == nil || !h.gate.AllowSessionWork(identity, operation) {
 		return ErrPermitUnavailable
 	}
 	return nil
@@ -287,10 +304,10 @@ func (h *Holder) AdmitAndDispatch(ctx context.Context, command DispatchCommand) 
 	if err := ctx.Err(); err != nil {
 		return DispatchReply{}, err
 	}
-	if err := h.CheckServe(command.ServeIdentity); err != nil {
+	if err := h.CheckServe(command.ServeIdentity, PermitDispatch); err != nil {
 		return DispatchReply{}, err
 	}
-	if command.ServeIdentity.StorageGeneration == "" || command.ServeIdentity.StorageGeneration != command.Binding.StorageGeneration ||
+	if command.ServeIdentity.RegistryGeneration == "" || command.ServeIdentity.RegistryGeneration != command.Binding.RegistryGeneration ||
 		command.NodeID == "" || command.NodeID != command.Binding.NodeID || command.NodeEpoch == 0 ||
 		command.NodeEpoch != command.Binding.NodeEpoch || command.DataEndpoint == "" || command.DataEndpoint != command.Binding.DataEndpoint {
 		return DispatchReply{}, errors.New("session: dispatch target does not match committed Binding intent")
@@ -310,7 +327,11 @@ func (h *Holder) AdmitAndDispatch(ctx context.Context, command DispatchCommand) 
 	}
 	endpoint := held.endpoint
 	command.SessionSeq = held.registration.SessionSeq
+	registration := held.registration
 	h.mu.RUnlock()
+	if err := h.authorizeNodeSession(command.ServeIdentity, registration); err != nil {
+		return DispatchReply{}, err
+	}
 
 	reply, err := endpoint.AdmitAndDispatch(ctx, command)
 	if err != nil {
@@ -320,6 +341,95 @@ func (h *Holder) AdmitAndDispatch(ctx context.Context, command DispatchCommand) 
 		return DispatchReply{}, err
 	}
 	return reply, nil
+}
+
+// SendNodeCommand routes a fenced lifecycle/recovery command through the exact
+// live Holder tuple. sent=true means delivery may have occurred and callers
+// must treat an error as UNKNOWN rather than selecting another execution.
+func (h *Holder) SendNodeCommand(
+	ctx context.Context,
+	identity ServeIdentity,
+	nodeID string,
+	nodeEpoch uint64,
+	dataEndpoint string,
+	command *routesync.Command,
+) (routesync.CmdAck, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return routesync.CmdAck{}, false, err
+	}
+	if command == nil || nodeID == "" || nodeEpoch == 0 || dataEndpoint == "" {
+		return routesync.CmdAck{}, false, errors.New("session: complete node command target is required")
+	}
+	if command.Kind == routesync.CmdCollectRecovery || command.Kind == routesync.CmdRebindExecution {
+		return routesync.CmdAck{}, false, errors.New("session: recovery command requires the dedicated recovery channel")
+	}
+	if err := h.CheckServe(identity, PermitDispatch); err != nil {
+		return routesync.CmdAck{}, false, err
+	}
+	h.mu.RLock()
+	held := h.active[nodeID]
+	if held == nil || held.registration.NodeEpoch != nodeEpoch || held.registration.DataEndpoint != dataEndpoint {
+		h.mu.RUnlock()
+		return routesync.CmdAck{}, false, ErrSessionUnavailable
+	}
+	endpoint, ok := held.endpoint.(commandEndpoint)
+	command.NodeEpoch = nodeEpoch
+	command.SessionSeq = held.registration.SessionSeq
+	registration := held.registration
+	h.mu.RUnlock()
+	if !ok {
+		return routesync.CmdAck{}, false, errors.New("session: Holder endpoint does not support final node commands")
+	}
+	if err := h.authorizeNodeSession(identity, registration); err != nil {
+		return routesync.CmdAck{}, false, err
+	}
+	return endpoint.SendNodeCommand(ctx, command)
+}
+
+func (h *Holder) SendRecoveryCommand(
+	ctx context.Context,
+	identity ServeIdentity,
+	nodeID string,
+	nodeEpoch uint64,
+	dataEndpoint string,
+	command *routesync.Command,
+) (routesync.CmdAck, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return routesync.CmdAck{}, false, err
+	}
+	if command == nil || nodeID == "" || nodeEpoch == 0 || dataEndpoint == "" ||
+		(command.Kind != routesync.CmdCollectRecovery && command.Kind != routesync.CmdRebindExecution &&
+			command.Kind != routesync.CmdAckRecoveryEvent) {
+		return routesync.CmdAck{}, false, errors.New("session: invalid dedicated recovery command")
+	}
+	if err := h.CheckServe(identity, PermitRecovery); err != nil {
+		return routesync.CmdAck{}, false, err
+	}
+	h.mu.RLock()
+	held := h.active[nodeID]
+	if held == nil || held.registration.NodeEpoch != nodeEpoch || held.registration.DataEndpoint != dataEndpoint {
+		h.mu.RUnlock()
+		return routesync.CmdAck{}, false, ErrSessionUnavailable
+	}
+	endpoint, ok := held.endpoint.(commandEndpoint)
+	command.NodeEpoch = nodeEpoch
+	command.SessionSeq = held.registration.SessionSeq
+	registration := held.registration
+	h.mu.RUnlock()
+	if !ok {
+		return routesync.CmdAck{}, false, errors.New("session: Holder endpoint does not support recovery commands")
+	}
+	if err := h.authorizeNodeSession(identity, registration); err != nil {
+		return routesync.CmdAck{}, false, err
+	}
+	return endpoint.SendNodeCommand(ctx, command)
+}
+
+func (h *Holder) authorizeNodeSession(identity ServeIdentity, registration Registration) error {
+	if h.gate == nil {
+		return ErrPermitUnavailable
+	}
+	return h.gate.AuthorizeNodeSession(identity, registration)
 }
 
 func (h *Holder) ProbeBatch(ctx context.Context, calls []ProbeCall) []placement.PlacementProbeResponse {

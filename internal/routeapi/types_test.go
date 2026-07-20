@@ -9,9 +9,11 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
+	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
 type fakeService struct {
@@ -92,7 +94,7 @@ func TestRouterStateCarriesMonotonicRevisionAndLeaderHint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	request := state.RouteRequest("/g", "rk", "s1", 7, false)
+	request := state.RouteRequest("/g", "rk", 7, false)
 	if request.MinRouteRevision != 0 {
 		t.Fatalf("initial minimum = %d", request.MinRouteRevision)
 	}
@@ -101,7 +103,7 @@ func TestRouterStateCarriesMonotonicRevisionAndLeaderHint(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	request = state.RouteRequest("/g", "rk", "s1", 7, false)
+	request = state.RouteRequest("/g", "rk", 7, false)
 	if request.MinRouteRevision != 12 {
 		t.Fatalf("minimum = %d", request.MinRouteRevision)
 	}
@@ -133,13 +135,10 @@ func TestPositiveReadsRequireExactTableKeyIdentity(t *testing.T) {
 	}
 
 	buildRequest := ReadBuildRequest{RequestIdentity: request.RequestIdentity, Group: "/g", BuildID: "b1"}
-	build := &clusterstate.BuildProjection{
-		BuildID: "b1", NodeID: "n1", NodeEpoch: 7, StorageGeneration: "g1",
-		BindingDigest: testReadyRoute().BindingDigest, LastEventSeq: 1,
-	}
+	build := testBuildProjection()
 	buildResponse := ReadBuildResponse{
 		Outcome: ReadReady, Group: "/g", Build: build,
-		BuildState: clusterstate.BuildBuilding, BuildRevision: 1,
+		BuildState: clusterstate.BuildRegistered, BuildRevision: 1,
 	}
 	if err := buildResponse.ValidateFor(buildRequest); err != nil {
 		t.Fatal(err)
@@ -150,46 +149,100 @@ func TestPositiveReadsRequireExactTableKeyIdentity(t *testing.T) {
 	}
 }
 
-func TestBuildReadResponseEnforcesOutcomeUnionAndReadyArtifact(t *testing.T) {
+func TestBuildReadResponseOnlyExposesRegistrationBinding(t *testing.T) {
 	request := routeRequest(true)
 	buildRequest := ReadBuildRequest{RequestIdentity: request.RequestIdentity, Group: "/g", BuildID: "b1", Strong: true}
-	build := &clusterstate.BuildProjection{
-		BuildID: "b1", NodeID: "n1", NodeEpoch: 7, StorageGeneration: "g1",
-		BindingDigest: testReadyRoute().BindingDigest, LastEventSeq: 1,
-	}
+	build := testBuildProjection()
 
 	missing := ReadBuildResponse{Outcome: ReadNotFound, Build: build}
 	if err := missing.ValidateFor(buildRequest); err == nil {
 		t.Fatal("NOT_FOUND response carrying a Build projection was accepted")
 	}
-	ready := ReadBuildResponse{
+	registered := ReadBuildResponse{
 		Outcome: ReadReady, Group: "/g", Build: build,
-		BuildState: clusterstate.BuildReady, BuildRevision: 1,
+		BuildState: clusterstate.BuildRegistered, BuildRevision: 1,
 	}
-	if err := ready.ValidateFor(buildRequest); err == nil {
-		t.Fatal("READY Build without an artifact was accepted")
+	if err := registered.ValidateFor(buildRequest); err != nil {
+		t.Fatalf("registered Build binding: %v", err)
 	}
-	ready.Build.ArtifactRef = "manifest://artifact"
-	if err := ready.ValidateFor(buildRequest); err != nil {
-		t.Fatalf("READY Build with artifact: %v", err)
+	registered.BuildState = clusterstate.BuildStarting
+	if err := registered.ValidateFor(buildRequest); err == nil {
+		t.Fatal("unbound BUILD_STARTING projection was exposed as a positive read")
+	}
+}
+
+func TestRouteListAndWatchCarryIndependentBucketRevisions(t *testing.T) {
+	identity := routeRequest(false).RequestIdentity
+	listRequest := ListRoutesRequest{RequestIdentity: identity, Group: "/g", Bucket: 3}
+	if err := (ListRoutesResponse{Bucket: 3}).ValidateFor(listRequest); err == nil {
+		t.Fatal("available Route list without a snapshot revision was accepted")
+	}
+	if err := (ListRoutesResponse{Bucket: 3, SnapshotRevision: 17}).ValidateFor(listRequest); err != nil {
+		t.Fatal(err)
+	}
+
+	watchRequest := WatchRoutesRequest{
+		RequestIdentity: identity, Group: "/g", Bucket: 3, AfterRevision: 17, Limit: 32,
+	}
+	response := WatchRoutesResponse{
+		Available: true, Bucket: 3, FloorRevision: 10, HeadRevision: 20, CursorRevision: 20,
+		Changes: []RouteChange{{
+			Revision: 19, Bucket: 3, Group: "/g", RouteKey: "route-1",
+			State: clusterstate.WorkflowRouteReady,
+		}},
+	}
+	if err := response.ValidateFor(watchRequest); err != nil {
+		t.Fatal(err)
+	}
+	response.Changes[0].Revision = 17
+	if err := response.ValidateFor(watchRequest); err == nil {
+		t.Fatal("Route watch accepted a non-advancing change")
+	}
+	reset := WatchRoutesResponse{
+		Available: true, Reset: true, Bucket: 3, FloorRevision: 18,
+		HeadRevision: 20, CursorRevision: 20,
+	}
+	if err := reset.ValidateFor(watchRequest); err != nil {
+		t.Fatal(err)
 	}
 }
 
 func routeRequest(strong bool) ReadRouteRequest {
 	return ReadRouteRequest{
 		RequestIdentity: RequestIdentity{
-			ClusterID: "cluster-1", StorageGeneration: "g1", SystemEpoch: 2,
-			ManifestDigest: "manifest-digest", ShardID: 7,
+			ClusterID: "cluster-1", RegistryGeneration: "g1", SystemEpoch: 2,
+			RegistryLayoutDigest: "registry-layout-digest", ShardID: 7,
 		},
-		Group: "/g", RouteKey: "rk", SandboxID: "s1", Strong: strong,
+		Group: "/g", RouteKey: "rk", Strong: strong,
 	}
 }
 
 func testReadyRoute() *clusterstate.ReadyRoute {
 	digest := sha256.Sum256([]byte("binding"))
+	templateRef := "e2b-img-" + strings.Repeat("c", 64)
+	spec, _ := clusterstate.MarshalSandboxDispatchSpec(clusterstate.SandboxDispatchSpecV1{
+		Version: clusterstate.DispatchSpecVersionV1, TemplateRef: templateRef,
+		KeyFingerprint: strings.Repeat("a", 24), AccessToken: "token", TargetPort: 3000,
+	})
+	intent, _ := clusterstate.NewDispatchIntent([]byte("demand"), spec, "provider-v1")
 	return &clusterstate.ReadyRoute{
 		SandboxID: "s1", NodeID: "n1", NodeEpoch: 7, DataEndpoint: "10.0.0.1:8443",
-		AccessToken: "token", TemplateRef: "e2b-snp-t1", StorageGeneration: "g1",
-		BindingDigest: hex.EncodeToString(digest[:]), LastEventSeq: 3,
+		TargetPort: 3000, AccessToken: "token", TrafficAccessToken: "traffic-token",
+		TemplateRef: templateRef, RegistryGeneration: "g1",
+		BindingDigest: hex.EncodeToString(digest[:]), LastEventSeq: 3, Intent: intent,
+	}
+}
+
+func testBuildProjection() *clusterstate.BuildProjection {
+	digest := sha256.Sum256([]byte("build-binding"))
+	spec, _ := clusterstate.MarshalBuildDispatchSpec(clusterstate.BuildDispatchSpecV1{
+		Version: clusterstate.DispatchSpecVersionV1, TemplateID: "template-1",
+		KeyFingerprint: strings.Repeat("b", 24), Profile: types.ProfileBare,
+	})
+	intent, _ := clusterstate.NewDispatchIntent([]byte("demand"), spec, "provider-v1")
+	return &clusterstate.BuildProjection{
+		BuildID: "b1", NodeID: "n1", NodeEpoch: 7, DataEndpoint: "10.0.0.1:8443",
+		RegistryGeneration: "g1", BindingDigest: hex.EncodeToString(digest[:]),
+		Intent: intent, TemplateRef: "template-1",
 	}
 }

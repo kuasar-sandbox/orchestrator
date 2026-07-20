@@ -22,7 +22,7 @@ func preparedTestController(t *testing.T, state *State, path string, queueMax in
 	}
 	admission := NewAdmissionController(policy)
 	admission.state = state
-	controller, err := NewPreparedAdmissionController(state, admission, &Persister{Path: path}, policy)
+	controller, err := NewPreparedAdmissionController(state, admission, &Persister{Path: path}, policy, 16)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -41,6 +41,7 @@ func preparedTestState() *State {
 
 func preparedTestDemand(memory uint64) SandboxAdmissionDemand {
 	return SandboxAdmissionDemand{
+		SlotUnits:           1,
 		CapacityMemoryBytes: memory, CapacityCPU: 2,
 		FloorMemoryBytes: memory, FloorCPU: 1, StartupBudgetMemory: memory,
 		CgroupPath: "/sys/fs/cgroup/sandbox",
@@ -164,7 +165,7 @@ func TestPreparedAdmissionTokenBlockWakesAfterRefill(t *testing.T) {
 	}
 	admission := NewAdmissionController(policy)
 	admission.state = state
-	controller, err := NewPreparedAdmissionController(state, admission, &Persister{Path: path}, policy)
+	controller, err := NewPreparedAdmissionController(state, admission, &Persister{Path: path}, policy, 16)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -219,7 +220,7 @@ func TestPreparedAdmissionCapacityBlockWakesAtQueueTTL(t *testing.T) {
 	}
 	admission := NewAdmissionController(policy)
 	admission.state = state
-	controller, err := NewPreparedAdmissionController(state, admission, &Persister{Path: path}, policy)
+	controller, err := NewPreparedAdmissionController(state, admission, &Persister{Path: path}, policy, 16)
 	if err != nil {
 		t.Fatal(err)
 	}

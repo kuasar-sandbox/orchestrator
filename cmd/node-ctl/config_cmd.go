@@ -107,7 +107,10 @@ const conductorConfigSkeleton = `# node-ctl conductor serve config — node-ctl 
 api:
   domain: sandboxes.example.com
   listen: ":443"                                 # dev: ":3000" (plain http/h2c)
-  tls: { cert: /etc/node-ctl/tls/fullchain.pem, key: /etc/node-ctl/tls/privkey.pem }
+  tls:
+    cert: /etc/node-ctl/tls/fullchain.pem
+    key: /etc/node-ctl/tls/privkey.pem
+    # client_ca: /etc/node-ctl/tls/cluster-ca.pem  # required in cluster mode (Router-role mTLS)
 proxy:                                           # data-plane policy (<port>-<sid>.<domain>)
   mode: internal                                 # internal | external | off
   auth: enforce                                  # off | log | enforce: validate X-Access-Token
@@ -216,10 +219,17 @@ checkpoint:                                        # paused-state tiering
 #     endpoint: registry.cluster.example.com:7700 # "" = standalone single-node
 #     # node supports registry owner redirect; registry returns member node_advertise targets when available
 #     tls: { cert: "", key: "", ca: "" }          # node_link client mTLS; empty = plain h2c
-#   node_id: ""                                   # "" = hostname
+#   node_id: ""                                   # optional assertion; identity is enrolled with cluster-identity init
 #   labels: { zone: z1, pool: default }
-#   data_endpoint: ""                             # host:port the router forwards data to; "" = api.listen
-#   heartbeat_interval: 10s
+#   data_endpoint: node-1.cluster.example.com:443 # required, immutable within NodeEpoch
+#   heartbeat_interval: 500ms                    # Holder-local placement snapshot period
+#   event_replay_batch: 64                       # bounded durable outbox replay
+#   event_replay_bytes: 1048576
+#   event_replay_interval: 1s
+#   sandbox_queue_limit: 256
+#   build_queue_limit: 256
+#   sandbox_workers: 8
+#   build_workers: 2
 `
 
 // proxyConfigSkeleton is the commented authoring template for proxy.yaml

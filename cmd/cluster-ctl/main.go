@@ -3,6 +3,8 @@
 //	cluster-ctl registry  --config <registry.yaml>   # state cluster + node_link hub
 //	cluster-ctl router    --config <router.yaml>     # e2b-compatible unified ingress
 //	cluster-ctl placer    --config <placer.yaml>     # placement scheduler
+//	cluster-ctl registry-layout bootstrap [flags]    # create signed initial generation artifact
+//	cluster-ctl registry-layout append [flags]       # verify and sign the exact next artifact
 //	cluster-ctl config <registry|router|placer> [--template|--config <f>|--resolve]  # config diagnose / generate
 //	cluster-ctl version
 //
@@ -30,6 +32,8 @@ func main() {
 		err = runRouter(os.Args[2:], log)
 	case "placer":
 		err = runPlacer(os.Args[2:], log)
+	case "registry-layout":
+		err = registryLayoutCmd(os.Args[2:])
 	case "config":
 		err = configCmd(os.Args[2:])
 	case "version", "-v", "--version":
@@ -44,6 +48,6 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: cluster-ctl {registry|router|placer|config|version} [flags]")
+	fmt.Fprintln(os.Stderr, "usage: cluster-ctl {registry|router|placer|registry-layout|config|version} [flags]")
 	os.Exit(2)
 }

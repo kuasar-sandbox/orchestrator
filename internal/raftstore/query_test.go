@@ -9,14 +9,14 @@ import (
 )
 
 func TestRouteLookupSeparatesLocalPositiveAndStrongNegativeReads(t *testing.T) {
-	manifest := testManifest(4, "generation-1")
-	state, identity := initializedRouteShard(t, manifest, "/g", "rk")
-	starting := routeStarting(t, manifest, "/g", "rk", "sandbox-1", 1, true)
+	registryLayout := testRegistryLayout(4, "generation-1")
+	state, identity := initializedRouteShard(t, registryLayout, "/g", "rk")
+	starting := routeStarting(t, registryLayout, "/g", "rk", "sandbox-1", 1, true)
 	applyDataOK(t, &state, 2, DataCommand{
 		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{Absent: true}, Route: &starting,
 	})
 
-	request := routeLookupRequest(identity, "/g", "rk", "sandbox-1", false)
+	request := routeLookupRequest(identity, "/g", "rk", false)
 	response := lookupRouteResult(t, state, request)
 	if response.Outcome != routeapi.ReadNeedLeader {
 		t.Fatalf("local STARTING outcome = %s", response.Outcome)
@@ -44,14 +44,8 @@ func TestRouteLookupSeparatesLocalPositiveAndStrongNegativeReads(t *testing.T) {
 	if got := lookupRouteResult(t, state, request).Outcome; got != routeapi.ReadReplicaBehind {
 		t.Fatalf("minimum-revision outcome = %s", got)
 	}
-	request.MinRouteRevision = 0
-	request.SandboxID = "sandbox-old"
-	if got := lookupRouteResult(t, state, request).Outcome; got != routeapi.ReadNeedLeader {
-		t.Fatalf("local SID mismatch outcome = %s", got)
-	}
-
-	missingKey := routeKeyForShard(t, manifest, "/g", identity.ShardID, "missing")
-	missing := routeLookupRequest(identity, "/g", missingKey, "", false)
+	missingKey := routeKeyForShard(t, registryLayout, "/g", identity.ShardID, "missing")
+	missing := routeLookupRequest(identity, "/g", missingKey, false)
 	if got := lookupRouteResult(t, state, missing).Outcome; got != routeapi.ReadNeedLeader {
 		t.Fatalf("local miss outcome = %s", got)
 	}
@@ -61,17 +55,17 @@ func TestRouteLookupSeparatesLocalPositiveAndStrongNegativeReads(t *testing.T) {
 		t.Fatalf("strong miss response = %+v", missingResponse)
 	}
 
-	fenced := routeLookupRequest(identity, "/g", "rk", "", false)
-	fenced.ManifestDigest = digestFor("old-manifest")
+	fenced := routeLookupRequest(identity, "/g", "rk", false)
+	fenced.RegistryLayoutDigest = digestFor("old-registryLayout")
 	if got := lookupRouteResult(t, state, fenced).Outcome; got != routeapi.ReadUnavailable {
 		t.Fatalf("fenced identity outcome = %s", got)
 	}
 }
 
 func TestBuildLookupReturnsOnlyBoundPositiveProjection(t *testing.T) {
-	manifest := testManifest(4, "generation-1")
-	state, identity := initializedBuildShard(t, manifest, "/g", "build-1")
-	starting := buildStarting(t, manifest, "/g", "build-1", true)
+	registryLayout := testRegistryLayout(4, "generation-1")
+	state, identity := initializedBuildShard(t, registryLayout, "/g", "build-1")
+	starting := buildStarting(t, registryLayout, "/g", "build-1", true)
 	applyDataOK(t, &state, 2, DataCommand{
 		Type: DataPutBuild, Identity: identity, Expect: RevisionExpectation{Absent: true}, Build: &starting,
 	})
@@ -80,13 +74,13 @@ func TestBuildLookupReturnsOnlyBoundPositiveProjection(t *testing.T) {
 		t.Fatalf("unprojected Build outcome = %s", got)
 	}
 
-	queued := buildProjectionRecord(starting, clusterstate.BuildQueued, 1)
+	registered := buildRegistrationRecord(starting)
 	applyDataOK(t, &state, 3, DataCommand{
-		Type: DataPutBuild, Identity: identity, Expect: RevisionExpectation{LogIndex: 2}, Build: &queued,
+		Type: DataPutBuild, Identity: identity, Expect: RevisionExpectation{LogIndex: 2}, Build: &registered,
 	})
 	response := lookupBuildResult(t, state, request)
-	if response.Outcome != routeapi.ReadReady || response.BuildState != clusterstate.BuildQueued || response.BuildRevision != 3 {
-		t.Fatalf("queued Build response = %+v", response)
+	if response.Outcome != routeapi.ReadReady || response.BuildState != clusterstate.BuildRegistered || response.BuildRevision != 3 {
+		t.Fatalf("registered Build response = %+v", response)
 	}
 	if err := response.ValidateFor(request); err != nil {
 		t.Fatal(err)
@@ -98,13 +92,13 @@ func TestBuildLookupReturnsOnlyBoundPositiveProjection(t *testing.T) {
 }
 
 func TestPendingLookupRecoversCommittedWorkflowIntentOnly(t *testing.T) {
-	manifest := testManifest(4, "generation-1")
+	registryLayout := testRegistryLayout(4, "generation-1")
 	routeKey := "rk"
-	identity := routeShardIdentity(t, manifest, "/g", routeKey)
-	buildID := buildIDForShard(t, manifest, "/g", identity.ShardID)
-	state := initializeDataShard(t, manifest, identity)
-	route := routeStarting(t, manifest, "/g", routeKey, "sandbox-1", 1, true)
-	build := buildStarting(t, manifest, "/g", buildID, true)
+	identity := routeShardIdentity(t, registryLayout, "/g", routeKey)
+	buildID := buildIDForShard(t, registryLayout, "/g", identity.ShardID)
+	state := initializeDataShard(t, registryLayout, identity)
+	route := routeStarting(t, registryLayout, "/g", routeKey, "sandbox-1", 1, true)
+	build := buildStarting(t, registryLayout, "/g", buildID, true)
 	applyDataOK(t, &state, 2, DataCommand{
 		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{Absent: true}, Route: &route,
 	})
@@ -142,18 +136,18 @@ func TestPendingLookupRecoversCommittedWorkflowIntentOnly(t *testing.T) {
 }
 
 func TestRouteBucketSnapshotAndChangefeedUseShardRevisions(t *testing.T) {
-	manifest := testManifest(4, "generation-1")
+	registryLayout := testRegistryLayout(4, "generation-1")
 	group := "/g"
 	firstKey := "rk"
 	bucket, _, err := clusterstate.RouteShardFor(
-		group, firstKey, manifest.RouteBucketCount, manifest.VirtualShardCount,
+		group, firstKey, registryLayout.RouteBucketCount, registryLayout.VirtualShardCount,
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	identity := routeShardIdentity(t, manifest, group, firstKey)
-	state := initializeDataShard(t, manifest, identity)
-	first := routeStarting(t, manifest, group, firstKey, "sandbox-1", 1, true)
+	identity := routeShardIdentity(t, registryLayout, group, firstKey)
+	state := initializeDataShard(t, registryLayout, identity)
+	first := routeStarting(t, registryLayout, group, firstKey, "sandbox-1", 1, true)
 	applyDataOK(t, &state, 2, DataCommand{
 		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{Absent: true}, Route: &first,
 	})
@@ -162,14 +156,14 @@ func TestRouteBucketSnapshotAndChangefeedUseShardRevisions(t *testing.T) {
 		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{LogIndex: 2}, Route: &ready,
 	})
 
-	secondKey := routeKeyForBucket(t, manifest, group, bucket, "second")
-	second := routeStarting(t, manifest, group, secondKey, "sandbox-2", 1, true)
+	secondKey := routeKeyForBucket(t, registryLayout, group, bucket, "second")
+	second := routeStarting(t, registryLayout, group, secondKey, "sandbox-2", 1, true)
 	applyDataOK(t, &state, 4, DataCommand{
 		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{Absent: true}, Route: &second,
 	})
 	otherGroup := "/other"
-	otherKey := routeKeyForShard(t, manifest, otherGroup, identity.ShardID, "other")
-	other := routeStarting(t, manifest, otherGroup, otherKey, "sandbox-3", 1, true)
+	otherKey := routeKeyForShard(t, registryLayout, otherGroup, identity.ShardID, "other")
+	other := routeStarting(t, registryLayout, otherGroup, otherKey, "sandbox-3", 1, true)
 	applyDataOK(t, &state, 5, DataCommand{
 		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{Absent: true}, Route: &other,
 	})
@@ -238,12 +232,12 @@ func pendingResult(t *testing.T, state DataState, query PendingLookup) PendingLo
 
 func routeLookupRequest(
 	identity ShardRequestIdentity,
-	group, routeKey, sandboxID string,
+	group, routeKey string,
 	strong bool,
 ) routeapi.ReadRouteRequest {
 	return routeapi.ReadRouteRequest{
 		RequestIdentity: routeIdentity(identity), Group: group, RouteKey: routeKey,
-		SandboxID: sandboxID, Strong: strong,
+		Strong: strong,
 	}
 }
 
@@ -255,16 +249,16 @@ func buildLookupRequest(identity ShardRequestIdentity, group, buildID string, st
 
 func routeIdentity(identity ShardRequestIdentity) routeapi.RequestIdentity {
 	return routeapi.RequestIdentity{
-		ClusterID: identity.ClusterID, StorageGeneration: identity.StorageGeneration,
-		SystemEpoch: identity.SystemEpoch, ManifestDigest: identity.ManifestDigest, ShardID: identity.ShardID,
+		ClusterID: identity.ClusterID, RegistryGeneration: identity.RegistryGeneration,
+		SystemEpoch: identity.SystemEpoch, RegistryLayoutDigest: identity.RegistryLayoutDigest, ShardID: identity.ShardID,
 	}
 }
 
-func routeKeyForShard(t *testing.T, manifest Manifest, group string, shardID uint32, prefix string) string {
+func routeKeyForShard(t *testing.T, registryLayout RegistryLayout, group string, shardID uint32, prefix string) string {
 	t.Helper()
 	for index := 0; index < 10000; index++ {
 		key := fmt.Sprintf("%s-%d", prefix, index)
-		_, got, err := clusterstate.RouteShardFor(group, key, manifest.RouteBucketCount, manifest.VirtualShardCount)
+		_, got, err := clusterstate.RouteShardFor(group, key, registryLayout.RouteBucketCount, registryLayout.VirtualShardCount)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -276,11 +270,11 @@ func routeKeyForShard(t *testing.T, manifest Manifest, group string, shardID uin
 	return ""
 }
 
-func routeKeyForBucket(t *testing.T, manifest Manifest, group string, bucket uint32, prefix string) string {
+func routeKeyForBucket(t *testing.T, registryLayout RegistryLayout, group string, bucket uint32, prefix string) string {
 	t.Helper()
 	for index := 0; index < 10000; index++ {
 		key := fmt.Sprintf("%s-%d", prefix, index)
-		got, _, err := clusterstate.RouteShardFor(group, key, manifest.RouteBucketCount, manifest.VirtualShardCount)
+		got, _, err := clusterstate.RouteShardFor(group, key, registryLayout.RouteBucketCount, registryLayout.VirtualShardCount)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -292,11 +286,11 @@ func routeKeyForBucket(t *testing.T, manifest Manifest, group string, bucket uin
 	return ""
 }
 
-func buildIDForShard(t *testing.T, manifest Manifest, group string, shardID uint32) string {
+func buildIDForShard(t *testing.T, registryLayout RegistryLayout, group string, shardID uint32) string {
 	t.Helper()
 	for index := 0; index < 10000; index++ {
 		buildID := fmt.Sprintf("build-%d", index)
-		_, got, err := clusterstate.BuildShardFor(group, buildID, manifest.BuildBucketCount, manifest.VirtualShardCount)
+		_, got, err := clusterstate.BuildShardFor(group, buildID, registryLayout.BuildBucketCount, registryLayout.VirtualShardCount)
 		if err != nil {
 			t.Fatal(err)
 		}

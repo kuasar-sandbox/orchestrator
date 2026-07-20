@@ -2,7 +2,10 @@ package orch
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -21,6 +24,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/keys"
 	"github.com/kuasar-sandbox/orchestrator/internal/regcreds"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
+	"github.com/kuasar-sandbox/orchestrator/internal/store"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 	"github.com/kuasar-sandbox/orchestrator/internal/vswitch"
 )
@@ -95,6 +99,16 @@ func (o *Orchestrator) TriggerBuild(ctx context.Context, apiKey, tid, bid string
 	}
 	if !ownsBuild(b, apiKey) || b.TemplateID != tid {
 		return api.ErrNotFound
+	}
+	triggerDigest, err := buildTriggerDigest(spec, auth)
+	if err != nil {
+		return err
+	}
+	if b.TriggerDigest != "" {
+		if b.TriggerDigest == triggerDigest {
+			return nil
+		}
+		return fmt.Errorf("%w: Build ID already has a different trigger", api.ErrConflict)
 	}
 	if !b.Profile.Valid() {
 		return fmt.Errorf("%w: build has unknown profile %q", api.ErrBadRequest, b.Profile)
@@ -178,7 +192,23 @@ func (o *Orchestrator) TriggerBuild(ctx context.Context, apiKey, tid, bid string
 		return err
 	}
 	b.Status = types.BuildWaiting
-	return o.st.PutBuild(ctx, b)
+	_, err = o.st.CommitBuildTrigger(ctx, b, triggerDigest)
+	if errors.Is(err, store.ErrBuildTriggerConflict) {
+		return fmt.Errorf("%w: Build ID already has a different trigger", api.ErrConflict)
+	}
+	return err
+}
+
+func buildTriggerDigest(spec api.TriggerSpec, auth api.BuildAuth) (string, error) {
+	payload, err := json.Marshal(struct {
+		Spec api.TriggerSpec `json:"spec"`
+		Auth api.BuildAuth   `json:"auth"`
+	}{Spec: spec, Auth: auth})
+	if err != nil {
+		return "", err
+	}
+	digest := sha256.Sum256(append([]byte("kuasar-build-trigger-v1\x00"), payload...))
+	return hex.EncodeToString(digest[:]), nil
 }
 
 func (o *Orchestrator) validateBuildOptions(opts types.BuildOptions, fromTemplate bool) error {
@@ -251,7 +281,6 @@ func (o *Orchestrator) effectiveImportReferer(b *types.Build) (configsock.BuildI
 // pull token (api_headers, opaque, manifest-key-sealed) > the SDK's fromImageRegistry
 // (cleartext username/password) > the tenant default (manifest_keys) > anonymous.
 func (o *Orchestrator) resolveBuildCreds(ctx context.Context, b *types.Build, pullToken, regUser, regPass string) (string, error) {
-	clusterAuth, isCluster := o.clusterBuildCreds(b.BuildID)
 	var creds regcreds.Creds
 	switch {
 	case pullToken != "":
@@ -262,10 +291,10 @@ func (o *Orchestrator) resolveBuildCreds(ctx context.Context, b *types.Build, pu
 		creds = c
 	case regUser != "":
 		creds = regcreds.Creds{Username: regUser, Password: regPass}
-	case isCluster:
-		// Cluster build: use the registry-delivered transient creds (cluster.md),
-		// not the node's stored registry_auth_enc.
-		creds = regcreds.CredsForImage(clusterAuth, b.FromImage)
+	case b.RegistryAuth != "":
+		if err := json.Unmarshal([]byte(b.RegistryAuth), &creds); err != nil {
+			return "", fmt.Errorf("build: stored registry credentials: %w", err)
+		}
 	default:
 		authJSON, err := o.st.RegistryAuthForKey(ctx, b.ManifestKey)
 		if err != nil {
@@ -355,6 +384,15 @@ func (o *Orchestrator) BuildPool(ctx context.Context, interval time.Duration) {
 			waiting, _ := o.st.BuildsByStatus(ctx, types.BuildWaiting)
 		admit:
 			for _, b := range waiting {
+				workflow, workflowErr := o.st.GetNodeWorkflow(ctx, clusterstate.ExecutionKindBuild, b.BuildID)
+				if workflowErr != nil {
+					o.log.Warn("cluster build lookup", "bid", b.BuildID, "err", workflowErr)
+					continue
+				}
+				if workflow != nil {
+					// FinalClusterNode exclusively owns admitted cluster Build execution.
+					continue
+				}
 				select {
 				case sem <- struct{}{}:
 				default:
@@ -370,7 +408,6 @@ func (o *Orchestrator) BuildPool(ctx context.Context, interval time.Duration) {
 					<-sem
 					continue
 				}
-				o.publishBuildState(b.BuildID, "building", "", "")
 				go func(b *types.Build) {
 					defer func() { <-sem }()
 					o.executeBuild(ctx, b)
@@ -432,8 +469,7 @@ func (o *Orchestrator) executeBuild(ctx context.Context, b *types.Build) {
 		// build), which the SDK is streaming — so reason.message stays generic
 		// and the detail lives in the log, not a duplicated BuildException tail.
 		b.Status, b.Reason = types.BuildError, "build failed; see build logs"
-		_ = o.st.PutBuild(ctx, b)
-		o.publishBuildState(b.BuildID, "error", "", b.Reason)
+		_ = o.persistBuildState(ctx, b)
 		o.log.Warn("build failed", "bid", b.BuildID, "err", res.Error)
 		return
 	case err != nil:
@@ -441,15 +477,13 @@ func (o *Orchestrator) executeBuild(ctx context.Context, b *types.Build) {
 		// result), so there is NO build log for it — surface the orchestrator-
 		// side error directly, it is the only signal.
 		b.Status, b.Reason = types.BuildError, err.Error()
-		_ = o.st.PutBuild(ctx, b)
-		o.publishBuildState(b.BuildID, "error", "", b.Reason)
+		_ = o.persistBuildState(ctx, b)
 		o.log.Warn("build failed", "bid", b.BuildID, "err", err)
 		return
 	}
 	if b.Profile == types.ProfileBare && (res.SnapshotKey != "" || res.StartCmd != "" || res.ReadyCmd != "") {
 		b.Status, b.Reason = types.BuildError, "bare build produced non-image output"
-		_ = o.st.PutBuild(ctx, b)
-		o.publishBuildState(b.BuildID, "error", "", b.Reason)
+		_ = o.persistBuildState(ctx, b)
 		return
 	}
 	switch {
@@ -461,16 +495,14 @@ func (o *Orchestrator) executeBuild(ctx context.Context, b *types.Build) {
 		b.PersistID = types.TemplateID{Profile: b.Profile, Kind: types.KindImg, Key: res.ImageKey}.String()
 	default:
 		b.Status, b.Reason = types.BuildError, "build produced no artifact"
-		_ = o.st.PutBuild(ctx, b)
-		o.publishBuildState(b.BuildID, "error", "", b.Reason)
+		_ = o.persistBuildState(ctx, b)
 		return
 	}
 	b.StartCmd, b.ReadyCmd = res.StartCmd, res.ReadyCmd
 	b.Status = types.BuildReady
 	b.Names = appendUnique(b.Names, b.PersistID)
 	b.Aliases = appendUnique(b.Aliases, b.PersistID)
-	_ = o.st.PutBuild(ctx, b)
-	o.publishBuildState(b.BuildID, "ready", b.PersistID, "")
+	_ = o.persistBuildState(ctx, b)
 	o.log.Info("build ready", "bid", b.BuildID, "template", b.PersistID)
 }
 

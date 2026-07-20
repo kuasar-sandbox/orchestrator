@@ -25,7 +25,7 @@ func TestClusterIdentityLifecycle(t *testing.T) {
 		t.Fatalf("duplicate enrollment error = %v", err)
 	}
 
-	same, err := st.PrepareClusterStart(ctx, "node-1", "boot-1", "10.0.0.1:8443", false)
+	same, err := st.PrepareClusterStart(ctx, "node-1", "boot-1", "10.0.0.1:8443")
 	if err != nil || same.EpochAdvanced || same.NodeEpoch != 1 {
 		t.Fatalf("same start = %+v err=%v", same, err)
 	}
@@ -38,7 +38,7 @@ func TestClusterIdentityLifecycle(t *testing.T) {
 		t.Fatalf("second session = %+v err=%v", secondSession, err)
 	}
 
-	rebooted, err := st.PrepareClusterStart(ctx, "node-1", "boot-2", "10.0.0.1:8443", false)
+	rebooted, err := st.PrepareClusterStart(ctx, "node-1", "boot-2", "10.0.0.1:8443")
 	if err != nil || !rebooted.EpochAdvanced || rebooted.NodeEpoch != 2 || rebooted.SessionSeq != 0 || rebooted.AdvanceReason != "host_reboot" {
 		t.Fatalf("rebooted identity = %+v err=%v", rebooted, err)
 	}
@@ -47,22 +47,18 @@ func TestClusterIdentityLifecycle(t *testing.T) {
 	}
 }
 
-func TestClusterIdentityEndpointChangeRequiresFence(t *testing.T) {
+func TestClusterIdentityEndpointChangeAdvancesBehindResetGate(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()
 	if _, err := st.EnrollClusterIdentity(ctx, "node-1", "boot-1", "10.0.0.1:8443"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.PrepareClusterStart(ctx, "node-1", "boot-1", "10.0.0.2:8443", false); !errors.Is(err, ErrPriorNodeEpochNotFenced) {
-		t.Fatalf("unfenced endpoint change error = %v", err)
+	changed, err := st.PrepareClusterStart(ctx, "node-1", "boot-1", "10.0.0.2:8443")
+	if err != nil || changed.NodeEpoch != 2 || changed.AdvanceReason != "data_endpoint_change" || !changed.ResetRequired {
+		t.Fatalf("endpoint change = %+v err=%v", changed, err)
 	}
-	identity, err := st.GetClusterIdentity(ctx)
-	if err != nil || identity.NodeEpoch != 1 || identity.DataEndpoint != "10.0.0.1:8443" {
-		t.Fatalf("failed change mutated identity = %+v err=%v", identity, err)
-	}
-	changed, err := st.PrepareClusterStart(ctx, "node-1", "boot-1", "10.0.0.2:8443", true)
-	if err != nil || changed.NodeEpoch != 2 || changed.AdvanceReason != "data_endpoint_change" {
-		t.Fatalf("fenced endpoint change = %+v err=%v", changed, err)
+	if _, err := st.NextClusterSession(ctx, changed.NodeEpoch); err == nil {
+		t.Fatal("new endpoint established a session before prior execution reset")
 	}
 }
 
@@ -72,7 +68,7 @@ func TestClusterIdentityConfiguredIDCannotChange(t *testing.T) {
 	if _, err := st.EnrollClusterIdentity(ctx, "node-1", "boot-1", "10.0.0.1:8443"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.PrepareClusterStart(ctx, "node-2", "boot-1", "10.0.0.1:8443", false); err == nil {
+	if _, err := st.PrepareClusterStart(ctx, "node-2", "boot-1", "10.0.0.1:8443"); err == nil {
 		t.Fatal("configured node ID changed enrolled identity")
 	}
 }

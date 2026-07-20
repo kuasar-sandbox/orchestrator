@@ -20,16 +20,16 @@ const (
 )
 
 type RequestIdentity struct {
-	ClusterID         string `json:"cluster_id"`
-	StorageGeneration string `json:"storage_generation"`
-	SystemEpoch       uint64 `json:"system_epoch"`
-	ManifestDigest    string `json:"manifest_digest"`
-	ShardID           uint32 `json:"shard_id"`
+	ClusterID            string `json:"cluster_id"`
+	RegistryGeneration   string `json:"registry_generation"`
+	SystemEpoch          uint64 `json:"system_epoch"`
+	RegistryLayoutDigest string `json:"registry_layout_digest"`
+	ShardID              uint32 `json:"shard_id"`
 }
 
 func (i RequestIdentity) Validate() error {
-	if i.ClusterID == "" || i.StorageGeneration == "" || i.SystemEpoch == 0 || i.ManifestDigest == "" {
-		return errors.New("routeapi: incomplete cluster/generation identity")
+	if i.ClusterID == "" || i.RegistryGeneration == "" || i.SystemEpoch == 0 || i.RegistryLayoutDigest == "" {
+		return errors.New("routeapi: incomplete cluster/Registry History Generation identity")
 	}
 	return nil
 }
@@ -51,7 +51,6 @@ type ReadRouteRequest struct {
 	RequestIdentity
 	Group            string `json:"group"`
 	RouteKey         string `json:"route_key"`
-	SandboxID        string `json:"sandbox_id,omitempty"`
 	MinRouteRevision uint64 `json:"min_route_revision,omitempty"`
 	Strong           bool   `json:"strong,omitempty"`
 }
@@ -86,8 +85,7 @@ func (r ReadRouteResponse) ValidateFor(request ReadRouteRequest) error {
 			return err
 		}
 		if r.Group != request.Group || r.RouteKey != request.RouteKey ||
-			r.Route.StorageGeneration != request.StorageGeneration ||
-			(request.SandboxID != "" && r.Route.SandboxID != request.SandboxID) ||
+			r.Route.RegistryGeneration != request.RegistryGeneration ||
 			r.RouteRevision < request.MinRouteRevision {
 			return errors.New("routeapi: READY does not satisfy request fence")
 		}
@@ -153,7 +151,7 @@ func (r ReadBuildResponse) ValidateFor(request ReadBuildRequest) error {
 	switch r.Outcome {
 	case ReadReady:
 		if r.Build == nil || r.BuildRevision == 0 || r.Group != request.Group || r.Build.BuildID != request.BuildID ||
-			r.Build.StorageGeneration != request.StorageGeneration || r.BuildRevision < request.MinBuildRevision {
+			r.Build.RegistryGeneration != request.RegistryGeneration || r.BuildRevision < request.MinBuildRevision {
 			return errors.New("routeapi: positive Build read does not satisfy request fence")
 		}
 		if err := r.Build.Validate(); err != nil {
@@ -162,18 +160,10 @@ func (r ReadBuildResponse) ValidateFor(request ReadBuildRequest) error {
 		if r.LeaderHint != nil {
 			return errors.New("routeapi: positive Build read cannot carry a leader hint")
 		}
-		switch r.BuildState {
-		case clusterstate.BuildQueued, clusterstate.BuildRegistered, clusterstate.BuildBuilding,
-			clusterstate.BuildError:
-			return nil
-		case clusterstate.BuildReady:
-			if r.Build.ArtifactRef == "" {
-				return errors.New("routeapi: READY Build state requires an artifact")
-			}
-			return nil
-		default:
-			return errors.New("routeapi: local Build read returned an unbound workflow")
+		if r.BuildState != clusterstate.BuildRegistered {
+			return errors.New("routeapi: local Build read returned an unbound registration")
 		}
+		return nil
 	case ReadNeedLeader, ReadReplicaBehind:
 		if r.Build != nil {
 			return errors.New("routeapi: non-positive Build read cannot carry a projection")

@@ -1,33 +1,19 @@
-# cluster-ctl placer config — cluster-ctl placer --config /etc/cluster-ctl/placer.yaml.
-# Standalone placement scheduler (docs/cluster-placer.md): it starts from registry
-# membership, joins the placer memberlist label, consumes node_list, and provides
-# placement for registry callers.
-# Validate with `cluster-ctl config placer --config placer.yaml`.
-
+# cluster-ctl placer --config /etc/cluster-ctl/placer.yaml
 placer:
   id: placer-1
   listen: ":7800"
-  advertise: "https://placer-1.example:7800"
-  memberlist_label: placer.default
-  # tls: { cert: ..., key: ..., ca: ... }   # server mTLS for placer Place API
+  tls:
+    cert: /etc/kuasar/tls/placer-1.crt
+    key: /etc/kuasar/tls/placer-1.key
+    ca: /etc/kuasar/tls/ca.crt
 
-registry:
-  bootstrap: registry-1.example:7700
-  # tls: { cert: ..., key: ..., ca: ... }   # client mTLS to registry control plane
-
-import_groups:
-  - source_id: example-file-source
+group_sources:
+  - source_id: groups-primary
     source_type: file
     path: /var/lib/kuasar/groups
 
 placement:
-  candidates: 2                       # P2C sample size
-  zone_admit_max: yellow              # exclude nodes hotter than this (green|yellow|red)
-  import_source_owner_count: 3        # candidates that may race for each source lease
-  import_source_lease_ttl: 15s        # registry-side source lease TTL
-  selector_patch_refresh_interval: 1m # refresh unchanged selector patches before node key TTL
-  # shuffle_sharding: pin matching groups to n deterministic shards of the node set,
-  # bucketed by a node label. Empty = static nodeSelectors only.
+  candidates: 4
   # shuffle_sharding:
   #   - selector: { pool: gpu }
   #     shard_by: zone

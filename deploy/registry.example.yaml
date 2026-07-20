@@ -1,39 +1,68 @@
-# cluster-ctl registry config — cluster-ctl registry --config /etc/cluster-ctl/registry.yaml.
-# Validate with `cluster-ctl config registry --config registry.yaml`.
-
+# cluster-ctl registry --config /etc/cluster-ctl/registry.yaml
 member:
   id: registry-1
   listen: ":7700"
-  # tls: { cert: ..., key: ..., ca: ... }   # server mTLS
+  tls:
+    cert: /etc/kuasar/tls/registry-1.crt
+    key: /etc/kuasar/tls/registry-1.key
+    ca: /etc/kuasar/tls/ca.crt
 
-membership:
-  active: 1
-  # next: 2                         # joint owner set target during membership change
-  # old_grace: 1                    # previous version kept as peer/node_link ingress after cutover
-  reload_ready_timeout: 10s
-  versions:
-    - version: 1
-      members:
-        - { id: registry-1, advertise: "https://registry-1.example:7700", node_advertise: "registry-1.example:7700" }
-  owners:
-    route_link: 1
-    node_link: 1
-    placer_link: 1
-    node_list: 1
+registry_layout:
+  chain: /etc/kuasar/registry-layout-chain.json
+  keys: /etc/kuasar/registry-layout-keyring.json
+  guard: /var/lib/kuasar/registry/registry-layout-guard.json
 
-node_link:
-  # listen: ""                         # optional split listener for node streams; empty = member.listen
-  heartbeat_interval: 10s
-  node_dead_after: 30s
+storage:
+  nodehost_dir: /var/lib/kuasar/registry/nodehost
+  wal_dir: /var/lib/kuasar/registry/wal
+  state_engine_dir: /var/lib/kuasar/registry/pebble
+  enrollment_path: /var/lib/kuasar/registry/enrollment.json
+  raft_listen: 0.0.0.0:63001
+  open_mode: restart                 # bootstrap | join | restart
+  # bootstrap_secret_file: /etc/kuasar/bootstrap-secret # bootstrap only
+  storage_protection: dm-crypt       # dm-crypt | ephemeral-tmpfs
+  initialize_workers: 16
+  transition_workers: 16
+  snapshot_workers: 4
+  operation_timeout: 5s
+  fence_retention: 1h
+  tls:
+    cert: /etc/kuasar/tls/registry-1.crt
+    key: /etc/kuasar/tls/registry-1.key
+    ca: /etc/kuasar/tls/ca.crt
 
-route_link:
+placers:
+  endpoints:
+    - { name: placer-1, endpoint: "https://placer-1.example:7800" }
+    - { name: placer-2, endpoint: "https://placer-2.example:7800" }
+    - { name: placer-3, endpoint: "https://placer-3.example:7800" }
+  tls:
+    cert: /etc/kuasar/tls/registry-1.crt
+    key: /etc/kuasar/tls/registry-1.key
+    ca: /etc/kuasar/tls/ca.crt
+
+session:
+  max_nodes: 5000
+  anti_entropy: 2s
+  event_workers: 32
+  reconnect_per_second: 200
+
+workflow:
   park_timeout: 30s
-
-node_list:
-  watch_retention: 10000
-
-placer_link:
-  placer_label: placer.default
-  placer_replica_count: 3
-  min_ready_placers: 1
-  place_timeout: 2s
+  poll_interval: 20ms
+  permit_refresh: 1s
+  recovery_scan_interval: 250ms
+  recovery_shards_per_scan: 64
+  recovery_workers: 8
+  recovery_per_node_workers: 1
+  compaction_workers: 4
+  pending_workflows_per_page: 256
+  recovery_page_objects: 64
+  recovery_page_bytes: 524288
+  recovery_max_report_bytes: 67108864
+  recovery_bytes_per_second: 16777216
+  recovery_lookup_page: 256
+  sandbox_launch_per_second: 500    # aggregate across Registry Layout members
+  sandbox_launch_burst: 500
+  build_launch_per_second: 100
+  build_launch_burst: 100

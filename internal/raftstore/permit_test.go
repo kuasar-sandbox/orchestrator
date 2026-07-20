@@ -8,8 +8,8 @@ import (
 
 func TestServePermitUsesMonotonicBoundAndOperationGates(t *testing.T) {
 	identity := PermitIdentity{
-		ClusterID: "cluster-1", StorageGeneration: "generation-1", SystemEpoch: 7,
-		ManifestDigest: digestFor("manifest"),
+		ClusterID: "cluster-1", RegistryGeneration: "generation-1", SystemEpoch: 7,
+		RegistryLayoutDigest: digestFor("registryLayout"),
 	}
 	grant := PermitGrant{
 		PermitIdentity: identity, CommitIndex: 42, MaxLifetimeMillis: 5000,
@@ -41,8 +41,8 @@ func TestPermitCacheRejectsOlderRefresh(t *testing.T) {
 	clock := now
 	cache := NewPermitCache(func() time.Time { return clock })
 	identity := PermitIdentity{
-		ClusterID: "cluster-1", StorageGeneration: "generation-1", SystemEpoch: 1,
-		ManifestDigest: digestFor("manifest"),
+		ClusterID: "cluster-1", RegistryGeneration: "generation-1", SystemEpoch: 1,
+		RegistryLayoutDigest: digestFor("registryLayout"),
 	}
 	grant := PermitGrant{
 		PermitIdentity: identity, CommitIndex: 10, MaxLifetimeMillis: 1000,
@@ -70,17 +70,17 @@ func TestPermitCacheRejectsOlderRefresh(t *testing.T) {
 	}
 }
 
-func TestPermitCacheKeepsPreviousAndActiveManifestPermits(t *testing.T) {
+func TestPermitCacheKeepsPreviousAndActiveRegistryLayoutPermits(t *testing.T) {
 	now := time.Now()
 	clock := now
 	cache := NewPermitCache(func() time.Time { return clock })
 	previous := PermitIdentity{
-		ClusterID: "cluster-1", StorageGeneration: "generation-1", SystemEpoch: 1,
-		ManifestDigest: digestFor("manifest-1"),
+		ClusterID: "cluster-1", RegistryGeneration: "generation-1", SystemEpoch: 1,
+		RegistryLayoutDigest: digestFor("registryLayout-1"),
 	}
 	active := previous
 	active.SystemEpoch = 2
-	active.ManifestDigest = digestFor("manifest-2")
+	active.RegistryLayoutDigest = digestFor("registryLayout-2")
 	for index, identity := range []PermitIdentity{previous, active} {
 		if err := cache.Install(PermitGrant{
 			PermitIdentity: identity, CommitIndex: uint64(index + 10), MaxLifetimeMillis: 1000,
@@ -97,7 +97,7 @@ func TestPermitCacheKeepsPreviousAndActiveManifestPermits(t *testing.T) {
 
 	third := active
 	third.SystemEpoch++
-	third.ManifestDigest = digestFor("manifest-3")
+	third.RegistryLayoutDigest = digestFor("registryLayout-3")
 	if err := cache.Install(PermitGrant{
 		PermitIdentity: third, CommitIndex: 12, MaxLifetimeMillis: 1000,
 		ServeGate: true, WriteGate: true, CutoverGate: true, RecoveryClosed: true,
@@ -113,8 +113,8 @@ func TestPermitCacheRetiresExpiredIdentityWithoutReplayExtension(t *testing.T) {
 	grantFor := func(epoch, index uint64) PermitGrant {
 		return PermitGrant{
 			PermitIdentity: PermitIdentity{
-				ClusterID: "cluster-1", StorageGeneration: "generation-1", SystemEpoch: epoch,
-				ManifestDigest: digestFor(string(rune('0' + epoch))),
+				ClusterID: "cluster-1", RegistryGeneration: "generation-1", SystemEpoch: epoch,
+				RegistryLayoutDigest: digestFor(string(rune('0' + epoch))),
 			},
 			CommitIndex: index, MaxLifetimeMillis: 1000,
 			ServeGate: true, WriteGate: true, CutoverGate: true, RecoveryClosed: true,
@@ -139,12 +139,12 @@ func TestPermitCacheRetiresExpiredIdentityWithoutReplayExtension(t *testing.T) {
 	}
 }
 
-func TestPermitCacheIsScopedToOneStorageGeneration(t *testing.T) {
+func TestPermitCacheIsScopedToOneRegistryGeneration(t *testing.T) {
 	cache := NewPermitCache(time.Now)
 	grant := PermitGrant{
 		PermitIdentity: PermitIdentity{
-			ClusterID: "cluster-1", StorageGeneration: "generation-1", SystemEpoch: 1,
-			ManifestDigest: digestFor("manifest-1"),
+			ClusterID: "cluster-1", RegistryGeneration: "generation-1", SystemEpoch: 1,
+			RegistryLayoutDigest: digestFor("registryLayout-1"),
 		},
 		CommitIndex: 1, MaxLifetimeMillis: 1000,
 		ServeGate: true, WriteGate: true, CutoverGate: true, RecoveryClosed: true,
@@ -153,9 +153,46 @@ func TestPermitCacheIsScopedToOneStorageGeneration(t *testing.T) {
 		t.Fatal(err)
 	}
 	nextGeneration := grant
-	nextGeneration.StorageGeneration = "generation-2"
-	nextGeneration.ManifestDigest = digestFor("manifest-2")
+	nextGeneration.RegistryGeneration = "generation-2"
+	nextGeneration.RegistryLayoutDigest = digestFor("registryLayout-2")
 	if err := cache.Install(nextGeneration, time.Now()); err == nil {
-		t.Fatal("one Permit cache accepted commit indexes from another storage generation")
+		t.Fatal("one Permit cache accepted commit indexes from another Registry History Generation")
+	}
+}
+
+func TestPermitCacheRetiresClosedGateGrantAcrossRecoveryEpochs(t *testing.T) {
+	now := time.Now()
+	cache := NewPermitCache(func() time.Time { return now })
+	initial := PermitGrant{
+		PermitIdentity: PermitIdentity{
+			ClusterID: "cluster-1", RegistryGeneration: "generation-2", SystemEpoch: 1,
+			RegistryLayoutDigest: digestFor("registryLayout-2"),
+		},
+		CommitIndex: 1, MaxLifetimeMillis: 5000, RecoveryClosed: true,
+	}
+	recovery := initial
+	recovery.SystemEpoch = 2
+	recovery.CommitIndex = 2
+	recovery.RecoveryClosed = false
+	final := recovery
+	final.SystemEpoch = 3
+	final.CommitIndex = 3
+	final.ServeGate = true
+	final.WriteGate = true
+	final.CutoverGate = true
+	final.RecoveryClosed = true
+	for _, grant := range []PermitGrant{initial, recovery, final} {
+		if err := cache.Install(grant, now); err != nil {
+			t.Fatalf("install epoch %d: %v", grant.SystemEpoch, err)
+		}
+	}
+	if err := cache.Authorize(initial.PermitIdentity, PermitRegistryRead); !errors.Is(err, ErrPermitMismatch) {
+		t.Fatalf("retired closed-gate identity error = %v", err)
+	}
+	if err := cache.Authorize(recovery.PermitIdentity, PermitHolderRecovery); err != nil {
+		t.Fatalf("recovery identity was not retained: %v", err)
+	}
+	if err := cache.Authorize(final.PermitIdentity, PermitRegistryWrite); err != nil {
+		t.Fatalf("final identity was not installed: %v", err)
 	}
 }

@@ -140,6 +140,10 @@ func (o *Orchestrator) runnerPattern() string {
 	return strings.TrimSuffix(o.cfg.Units.Runner, ".service") + "*.service"
 }
 
+func (o *Orchestrator) builderPattern() string {
+	return strings.TrimSuffix(o.cfg.Units.Builder, ".service") + "*.service"
+}
+
 // unitToRunID extracts the run-id from a template instance unit name.
 func (o *Orchestrator) unitToRunID(name string) string {
 	name = strings.TrimPrefix(name, strings.TrimSuffix(o.cfg.Units.Runner, ".service"))

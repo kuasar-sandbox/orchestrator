@@ -1,0 +1,725 @@
+package routeclient
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/cespare/xxhash/v2"
+	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
+	"github.com/kuasar-sandbox/orchestrator/internal/raftstore"
+	"github.com/kuasar-sandbox/orchestrator/internal/routeapi"
+)
+
+var ErrPermitUnavailable = errors.New("routeclient: matching Serve Permit is unavailable")
+
+const maximumResponseBytes = 4 << 20
+
+type Endpoint struct {
+	MemberID string
+	BaseURL  string
+	Client   *http.Client
+}
+
+type cachedPermit struct {
+	response routeapi.PermitResponse
+	expires  time.Time
+}
+
+type Client struct {
+	registryLayout raftstore.RegistryLayout
+	digest         string
+	endpoints      map[string]Endpoint
+	now            func() time.Time
+
+	mu      sync.RWMutex
+	permit  *cachedPermit
+	leaders map[uint32]routeapi.LeaderHint
+}
+
+type RouteMutationResult struct {
+	Response      routeapi.RouteMutationResponse
+	ServeIdentity routeapi.RegistryServeIdentity
+}
+
+type RouteReadResult struct {
+	Response      routeapi.ReadRouteResponse
+	ServeIdentity routeapi.RegistryServeIdentity
+}
+
+type BuildMutationResult struct {
+	Response      routeapi.BuildMutationResponse
+	ServeIdentity routeapi.RegistryServeIdentity
+}
+
+type BuildReadResult struct {
+	Response      routeapi.ReadBuildResponse
+	ServeIdentity routeapi.RegistryServeIdentity
+}
+
+type RouteListResult struct {
+	Routes          []routeapi.ListedRoute
+	BucketRevisions []uint64
+	ServeIdentity   routeapi.RegistryServeIdentity
+}
+
+type RouteWatchResult struct {
+	Response      routeapi.WatchRoutesResponse
+	ServeIdentity routeapi.RegistryServeIdentity
+}
+
+func New(registryLayout raftstore.RegistryLayout, digest string, endpoints []Endpoint) (*Client, error) {
+	if err := registryLayout.Validate(); err != nil {
+		return nil, err
+	}
+	wantDigest, err := registryLayout.Digest()
+	if err != nil || digest != wantDigest {
+		return nil, errors.New("routeclient: verified registryLayout digest mismatch")
+	}
+	byID := make(map[string]Endpoint, len(endpoints))
+	for _, endpoint := range endpoints {
+		member, found := registryLayoutMember(registryLayout, endpoint.MemberID)
+		endpoint.BaseURL = strings.TrimRight(endpoint.BaseURL, "/")
+		if !found || endpoint.BaseURL != member.InternalEndpoint || endpoint.Client == nil {
+			return nil, errors.New("routeclient: endpoint is not an exact registryLayout member")
+		}
+		if _, duplicate := byID[endpoint.MemberID]; duplicate {
+			return nil, errors.New("routeclient: duplicate endpoint member")
+		}
+		byID[endpoint.MemberID] = endpoint
+	}
+	if len(byID) != len(registryLayout.Members) {
+		return nil, errors.New("routeclient: every registryLayout member requires an authenticated client")
+	}
+	return &Client{
+		registryLayout: raftstore.CloneRegistryLayout(registryLayout), digest: digest, endpoints: byID,
+		now: time.Now, leaders: make(map[uint32]routeapi.LeaderHint),
+	}, nil
+}
+
+func (c *Client) RegistryLayout() raftstore.RegistryLayout {
+	return raftstore.CloneRegistryLayout(c.registryLayout)
+}
+
+func (c *Client) RefreshPermit(ctx context.Context) (routeapi.RegistryServeIdentity, error) {
+	request := routeapi.PermitRequest{
+		ClusterID: c.registryLayout.ClusterID, RegistryGeneration: c.registryLayout.RegistryGeneration,
+		RegistryLayoutDigest: c.digest,
+	}
+	started := c.now()
+	var lastErr error
+	for _, endpoint := range c.systemEndpoints() {
+		var response routeapi.PermitResponse
+		if err := postJSON(ctx, endpoint, routeapi.PermitPath, request, &response); err != nil {
+			lastErr = err
+			continue
+		}
+		if err := response.ValidateFor(request); err != nil {
+			lastErr = err
+			continue
+		}
+		permit := &cachedPermit{
+			response: response,
+			expires:  started.Add(time.Duration(response.MaxLifetimeMillis) * time.Millisecond),
+		}
+		c.mu.Lock()
+		c.permit = permit
+		c.mu.Unlock()
+		return serveIdentity(response), nil
+	}
+	if lastErr == nil {
+		lastErr = ErrPermitUnavailable
+	}
+	return routeapi.RegistryServeIdentity{}, lastErr
+}
+
+func (c *Client) Run(ctx context.Context) error {
+	if _, err := c.RefreshPermit(ctx); err != nil {
+		return err
+	}
+	for {
+		remaining := c.permitRemaining()
+		wait := remaining / 3
+		if wait < 50*time.Millisecond {
+			wait = 50 * time.Millisecond
+		}
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil
+		case <-timer.C:
+			_, _ = c.RefreshPermit(ctx)
+		}
+	}
+}
+
+func (c *Client) CurrentServeIdentity(write bool) (routeapi.RegistryServeIdentity, error) {
+	permit, err := c.currentPermit()
+	if err != nil || !permitAuthorizesServeIdentity(permit) || write && !permit.WriteGate {
+		return routeapi.RegistryServeIdentity{}, ErrPermitUnavailable
+	}
+	return serveIdentity(permit), nil
+}
+
+func (c *Client) CacheAuthorized(identity routeapi.RegistryServeIdentity) bool {
+	permit, err := c.currentPermit()
+	return err == nil && permitAuthorizesServeIdentity(permit) && serveIdentity(permit) == identity
+}
+
+func (c *Client) ReserveSandbox(
+	ctx context.Context,
+	group, routeKey string,
+	minRevision uint64,
+	input routeapi.SandboxInput,
+) (RouteMutationResult, error) {
+	identity, err := c.routeIdentity(group, routeKey, true)
+	if err != nil {
+		return RouteMutationResult{}, err
+	}
+	request := routeapi.ReserveSandboxRequest{
+		RequestIdentity: identity, Group: group, RouteKey: routeKey,
+		MinRouteRevision: minRevision, Input: input,
+	}
+	response, err := c.routeMutation(ctx, identity.ShardID, routeapi.ReserveRoutePath, request, func(response routeapi.RouteMutationResponse) error {
+		return response.ValidateFor(identity, group, routeKey)
+	})
+	return RouteMutationResult{Response: response, ServeIdentity: serveIdentityFromRequest(identity)}, err
+}
+
+func (c *Client) ResumeSandbox(
+	ctx context.Context,
+	group, routeKey string,
+	minRevision uint64,
+) (RouteMutationResult, error) {
+	identity, err := c.routeIdentity(group, routeKey, true)
+	if err != nil {
+		return RouteMutationResult{}, err
+	}
+	request := routeapi.ResumeSandboxRequest{
+		RequestIdentity: identity, Group: group, RouteKey: routeKey,
+		MinRouteRevision: minRevision,
+	}
+	response, err := c.routeMutation(ctx, identity.ShardID, routeapi.ResumeRoutePath, request, func(response routeapi.RouteMutationResponse) error {
+		return response.ValidateFor(identity, group, routeKey)
+	})
+	return RouteMutationResult{Response: response, ServeIdentity: serveIdentityFromRequest(identity)}, err
+}
+
+func (c *Client) DeleteSandbox(
+	ctx context.Context,
+	group, routeKey string,
+	minRevision uint64,
+) (RouteMutationResult, error) {
+	identity, err := c.routeIdentity(group, routeKey, true)
+	if err != nil {
+		return RouteMutationResult{}, err
+	}
+	request := routeapi.DeleteSandboxRequest{
+		RequestIdentity: identity, Group: group, RouteKey: routeKey,
+		MinRouteRevision: minRevision,
+	}
+	response, err := c.routeMutation(ctx, identity.ShardID, routeapi.DeleteRoutePath, request, func(response routeapi.RouteMutationResponse) error {
+		return response.ValidateFor(identity, group, routeKey)
+	})
+	return RouteMutationResult{Response: response, ServeIdentity: serveIdentityFromRequest(identity)}, err
+}
+
+func (c *Client) ReadRoute(
+	ctx context.Context,
+	group, routeKey string,
+	minRevision uint64,
+) (RouteReadResult, error) {
+	identity, err := c.routeIdentity(group, routeKey, false)
+	if err != nil {
+		return RouteReadResult{}, err
+	}
+	request := routeapi.ReadRouteRequest{
+		RequestIdentity: identity, Group: group, RouteKey: routeKey,
+		MinRouteRevision: minRevision,
+	}
+	for _, endpoint := range c.localReadEndpoints(identity.ShardID, group+"\x00"+routeKey) {
+		var response routeapi.ReadRouteResponse
+		if err := postJSON(ctx, endpoint, routeapi.ReadRoutePath, request, &response); err != nil {
+			continue
+		}
+		if err := response.ValidateFor(request); err != nil {
+			continue
+		}
+		if response.Outcome == routeapi.ReadReady || response.Outcome == routeapi.ReadConflict {
+			return RouteReadResult{Response: response, ServeIdentity: serveIdentityFromRequest(identity)}, nil
+		}
+		c.observeLeader(identity.ShardID, response.LeaderHint)
+	}
+	request.Strong = true
+	response, err := c.readRouteStrong(ctx, request)
+	return RouteReadResult{Response: response, ServeIdentity: serveIdentityFromRequest(identity)}, err
+}
+
+func (c *Client) RegisterBuild(
+	ctx context.Context,
+	group, buildID string,
+	minRevision uint64,
+	input routeapi.BuildInput,
+) (BuildMutationResult, error) {
+	identity, err := c.buildIdentity(group, buildID, true)
+	if err != nil {
+		return BuildMutationResult{}, err
+	}
+	request := routeapi.RegisterBuildRequest{
+		RequestIdentity: identity, Group: group, BuildID: buildID,
+		MinBuildRevision: minRevision, Input: input,
+	}
+	response, err := c.buildMutation(ctx, identity.ShardID, routeapi.RegisterBuildPath, request)
+	return BuildMutationResult{Response: response, ServeIdentity: serveIdentityFromRequest(identity)}, err
+}
+
+func (c *Client) ReadBuild(
+	ctx context.Context,
+	group, buildID string,
+	minRevision uint64,
+) (BuildReadResult, error) {
+	identity, err := c.buildIdentity(group, buildID, false)
+	if err != nil {
+		return BuildReadResult{}, err
+	}
+	request := routeapi.ReadBuildRequest{
+		RequestIdentity: identity, Group: group, BuildID: buildID,
+		MinBuildRevision: minRevision,
+	}
+	for _, endpoint := range c.localReadEndpoints(identity.ShardID, group+"\x00"+buildID) {
+		var response routeapi.ReadBuildResponse
+		if err := postJSON(ctx, endpoint, routeapi.ReadBuildPath, request, &response); err != nil {
+			continue
+		}
+		if err := response.ValidateFor(request); err != nil {
+			continue
+		}
+		if response.Outcome == routeapi.ReadReady || response.Outcome == routeapi.ReadConflict {
+			return BuildReadResult{Response: response, ServeIdentity: serveIdentityFromRequest(identity)}, nil
+		}
+		c.observeLeader(identity.ShardID, response.LeaderHint)
+	}
+	request.Strong = true
+	for _, endpoint := range c.shardEndpoints(identity.ShardID) {
+		var response routeapi.ReadBuildResponse
+		if err := postJSON(ctx, endpoint, routeapi.ReadBuildPath, request, &response); err != nil {
+			continue
+		}
+		if err := response.ValidateFor(request); err == nil {
+			c.observeLeader(identity.ShardID, response.LeaderHint)
+			return BuildReadResult{Response: response, ServeIdentity: serveIdentityFromRequest(identity)}, nil
+		}
+	}
+	return BuildReadResult{}, errors.New("routeclient: Build shard is unavailable")
+}
+
+func (c *Client) ListRoutes(ctx context.Context, group string) (RouteListResult, error) {
+	serveIdentity, err := c.CurrentServeIdentity(false)
+	if err != nil {
+		return RouteListResult{}, err
+	}
+	routes := make([]routeapi.ListedRoute, 0)
+	bucketRevisions := make([]uint64, c.registryLayout.RouteBucketCount)
+	for bucket := uint32(0); bucket < c.registryLayout.RouteBucketCount; bucket++ {
+		if !c.CacheAuthorized(serveIdentity) {
+			return RouteListResult{}, ErrPermitUnavailable
+		}
+		identity, err := c.routeBucketIdentity(serveIdentity, group, bucket)
+		if err != nil {
+			return RouteListResult{}, err
+		}
+		request := routeapi.ListRoutesRequest{RequestIdentity: identity, Group: group, Bucket: bucket}
+		var lastErr error
+		found := false
+		readKey := group + "\x00" + strconv.FormatUint(uint64(bucket), 10)
+		for pass := 0; pass < 2 && !found; pass++ {
+			request.Strong = pass == 1
+			endpoints := c.localReadEndpoints(identity.ShardID, readKey)
+			if request.Strong {
+				endpoints = c.shardEndpoints(identity.ShardID)
+			}
+			for _, endpoint := range endpoints {
+				var response routeapi.ListRoutesResponse
+				if err := postJSON(ctx, endpoint, routeapi.ListRoutesPath, request, &response); err != nil {
+					lastErr = err
+					continue
+				}
+				if err := response.ValidateFor(request); err != nil {
+					lastErr = err
+					continue
+				}
+				if response.Reason != "" {
+					lastErr = fmt.Errorf("routeclient: Route bucket is unavailable: %s", response.Reason)
+					continue
+				}
+				if !c.CacheAuthorized(serveIdentity) {
+					return RouteListResult{}, ErrPermitUnavailable
+				}
+				routes = append(routes, response.Routes...)
+				bucketRevisions[bucket] = response.SnapshotRevision
+				found = true
+				break
+			}
+		}
+		if !found {
+			if lastErr == nil {
+				lastErr = errors.New("routeclient: Route bucket has no serving replica")
+			}
+			return RouteListResult{}, lastErr
+		}
+	}
+	if !c.CacheAuthorized(serveIdentity) {
+		return RouteListResult{}, ErrPermitUnavailable
+	}
+	sort.Slice(routes, func(i, j int) bool { return routes[i].RouteKey < routes[j].RouteKey })
+	return RouteListResult{Routes: routes, BucketRevisions: bucketRevisions, ServeIdentity: serveIdentity}, nil
+}
+
+func (c *Client) WatchRoutes(
+	ctx context.Context,
+	group string,
+	bucket uint32,
+	afterRevision uint64,
+	limit uint32,
+) (RouteWatchResult, error) {
+	serveIdentity, err := c.CurrentServeIdentity(false)
+	if err != nil {
+		return RouteWatchResult{}, err
+	}
+	identity, err := c.routeBucketIdentity(serveIdentity, group, bucket)
+	if err != nil {
+		return RouteWatchResult{}, err
+	}
+	request := routeapi.WatchRoutesRequest{
+		RequestIdentity: identity, Group: group, Bucket: bucket,
+		AfterRevision: afterRevision, Limit: limit,
+	}
+	readKey := group + "\x00" + strconv.FormatUint(uint64(bucket), 10)
+	var lastErr error
+	for pass := 0; pass < 2; pass++ {
+		request.Strong = pass == 1
+		endpoints := c.localReadEndpoints(identity.ShardID, readKey)
+		if request.Strong {
+			endpoints = c.shardEndpoints(identity.ShardID)
+		}
+		for _, endpoint := range endpoints {
+			if !c.CacheAuthorized(serveIdentity) {
+				return RouteWatchResult{}, ErrPermitUnavailable
+			}
+			var response routeapi.WatchRoutesResponse
+			if err := postJSON(ctx, endpoint, routeapi.WatchRoutesPath, request, &response); err != nil {
+				lastErr = err
+				continue
+			}
+			if err := response.ValidateFor(request); err != nil {
+				lastErr = err
+				continue
+			}
+			if !response.Available {
+				c.observeLeader(identity.ShardID, response.LeaderHint)
+				lastErr = fmt.Errorf("routeclient: Route changefeed is unavailable: %s", response.Reason)
+				continue
+			}
+			if !c.CacheAuthorized(serveIdentity) {
+				return RouteWatchResult{}, ErrPermitUnavailable
+			}
+			return RouteWatchResult{Response: response, ServeIdentity: serveIdentity}, nil
+		}
+	}
+	if lastErr == nil {
+		lastErr = errors.New("routeclient: Route changefeed has no serving replica")
+	}
+	return RouteWatchResult{}, lastErr
+}
+
+func (c *Client) routeMutation(
+	ctx context.Context,
+	shardID uint32,
+	path string,
+	request any,
+	validate func(routeapi.RouteMutationResponse) error,
+) (routeapi.RouteMutationResponse, error) {
+	for attempt := 0; attempt < 2; attempt++ {
+		for _, endpoint := range c.shardEndpoints(shardID) {
+			var response routeapi.RouteMutationResponse
+			if err := postJSON(ctx, endpoint, path, request, &response); err != nil {
+				continue
+			}
+			if err := validate(response); err != nil {
+				continue
+			}
+			if response.Outcome == routeapi.MutationNeedLeader {
+				c.observeLeader(shardID, response.LeaderHint)
+				continue
+			}
+			return response, nil
+		}
+	}
+	return routeapi.RouteMutationResponse{}, errors.New("routeclient: Route shard leader is unavailable")
+}
+
+func (c *Client) buildMutation(
+	ctx context.Context,
+	shardID uint32,
+	path string,
+	request routeapi.RegisterBuildRequest,
+) (routeapi.BuildMutationResponse, error) {
+	for attempt := 0; attempt < 2; attempt++ {
+		for _, endpoint := range c.shardEndpoints(shardID) {
+			var response routeapi.BuildMutationResponse
+			if err := postJSON(ctx, endpoint, path, request, &response); err != nil {
+				continue
+			}
+			if err := response.ValidateFor(request); err != nil {
+				continue
+			}
+			if response.Outcome == routeapi.MutationNeedLeader {
+				c.observeLeader(shardID, response.LeaderHint)
+				continue
+			}
+			return response, nil
+		}
+	}
+	return routeapi.BuildMutationResponse{}, errors.New("routeclient: Build shard leader is unavailable")
+}
+
+func (c *Client) readRouteStrong(ctx context.Context, request routeapi.ReadRouteRequest) (routeapi.ReadRouteResponse, error) {
+	for _, endpoint := range c.shardEndpoints(request.ShardID) {
+		var response routeapi.ReadRouteResponse
+		if err := postJSON(ctx, endpoint, routeapi.ReadRoutePath, request, &response); err != nil {
+			continue
+		}
+		if err := response.ValidateFor(request); err == nil {
+			c.observeLeader(request.ShardID, response.LeaderHint)
+			return response, nil
+		}
+	}
+	return routeapi.ReadRouteResponse{}, errors.New("routeclient: Route shard is unavailable")
+}
+
+func (c *Client) routeIdentity(group, routeKey string, write bool) (routeapi.RequestIdentity, error) {
+	serveIdentity, err := c.CurrentServeIdentity(write)
+	if err != nil {
+		return routeapi.RequestIdentity{}, err
+	}
+	_, shardID, err := clusterstate.RouteShardFor(group, routeKey, c.registryLayout.RouteBucketCount, c.registryLayout.VirtualShardCount)
+	if err != nil {
+		return routeapi.RequestIdentity{}, err
+	}
+	return requestIdentity(serveIdentity, shardID), nil
+}
+
+func (c *Client) buildIdentity(group, buildID string, write bool) (routeapi.RequestIdentity, error) {
+	serveIdentity, err := c.CurrentServeIdentity(write)
+	if err != nil {
+		return routeapi.RequestIdentity{}, err
+	}
+	_, shardID, err := clusterstate.BuildShardFor(group, buildID, c.registryLayout.BuildBucketCount, c.registryLayout.VirtualShardCount)
+	if err != nil {
+		return routeapi.RequestIdentity{}, err
+	}
+	return requestIdentity(serveIdentity, shardID), nil
+}
+
+func (c *Client) routeBucketIdentity(serveIdentity routeapi.RegistryServeIdentity, group string, bucket uint32) (routeapi.RequestIdentity, error) {
+	if err := serveIdentity.Validate(); err != nil {
+		return routeapi.RequestIdentity{}, err
+	}
+	if group == "" || bucket >= c.registryLayout.RouteBucketCount {
+		return routeapi.RequestIdentity{}, errors.New("routeclient: invalid Route bucket")
+	}
+	hash, err := clusterstate.RouteShardHash(group, bucket)
+	if err != nil {
+		return routeapi.RequestIdentity{}, err
+	}
+	return requestIdentity(serveIdentity, uint32(hash%uint64(c.registryLayout.VirtualShardCount))), nil
+}
+
+func requestIdentity(serveIdentity routeapi.RegistryServeIdentity, shardID uint32) routeapi.RequestIdentity {
+	return routeapi.RequestIdentity{
+		ClusterID: serveIdentity.ClusterID, RegistryGeneration: serveIdentity.RegistryGeneration,
+		SystemEpoch: serveIdentity.SystemEpoch, RegistryLayoutDigest: serveIdentity.RegistryLayoutDigest, ShardID: shardID,
+	}
+}
+
+func serveIdentityFromRequest(identity routeapi.RequestIdentity) routeapi.RegistryServeIdentity {
+	return routeapi.RegistryServeIdentity{
+		ClusterID: identity.ClusterID, RegistryGeneration: identity.RegistryGeneration,
+		SystemEpoch: identity.SystemEpoch, RegistryLayoutDigest: identity.RegistryLayoutDigest,
+	}
+}
+
+func serveIdentity(permit routeapi.PermitResponse) routeapi.RegistryServeIdentity {
+	return routeapi.RegistryServeIdentity{
+		ClusterID: permit.ClusterID, RegistryGeneration: permit.RegistryGeneration,
+		SystemEpoch: permit.SystemEpoch, RegistryLayoutDigest: permit.RegistryLayoutDigest,
+	}
+}
+
+func (c *Client) currentPermit() (routeapi.PermitResponse, error) {
+	now := c.now()
+	c.mu.RLock()
+	permit := c.permit
+	if permit != nil {
+		copy := *permit
+		permit = &copy
+	}
+	c.mu.RUnlock()
+	if permit == nil || !now.Before(permit.expires) {
+		return routeapi.PermitResponse{}, ErrPermitUnavailable
+	}
+	return permit.response, nil
+}
+
+func (c *Client) permitRemaining() time.Duration {
+	c.mu.RLock()
+	permit := c.permit
+	c.mu.RUnlock()
+	if permit == nil {
+		return 0
+	}
+	remaining := permit.expires.Sub(c.now())
+	if remaining < 0 {
+		return 0
+	}
+	return remaining
+}
+
+func (c *Client) observeLeader(shardID uint32, hint *routeapi.LeaderHint) {
+	if hint == nil || !c.memberServesShard(hint.MemberID, shardID) {
+		return
+	}
+	member, found := registryLayoutMember(c.registryLayout, hint.MemberID)
+	if !found || member.InternalEndpoint != hint.Endpoint {
+		return
+	}
+	c.mu.Lock()
+	current := c.leaders[shardID]
+	if hint.Term >= current.Term {
+		c.leaders[shardID] = *hint
+	}
+	c.mu.Unlock()
+}
+
+func (c *Client) shardEndpoints(shardID uint32) []Endpoint {
+	if shardID >= uint32(len(c.registryLayout.DataShards)) {
+		return nil
+	}
+	c.mu.RLock()
+	hint := c.leaders[shardID]
+	c.mu.RUnlock()
+	placements := c.registryLayout.DataShards[shardID].Replicas
+	result := make([]Endpoint, 0, len(placements))
+	if hint.MemberID != "" {
+		result = append(result, c.endpoints[hint.MemberID])
+	}
+	for _, placement := range placements {
+		if placement.MemberID != hint.MemberID {
+			result = append(result, c.endpoints[placement.MemberID])
+		}
+	}
+	return result
+}
+
+func (c *Client) localReadEndpoints(shardID uint32, key string) []Endpoint {
+	if shardID >= uint32(len(c.registryLayout.DataShards)) {
+		return nil
+	}
+	type rankedEndpoint struct {
+		endpoint Endpoint
+		score    uint64
+	}
+	placements := c.registryLayout.DataShards[shardID].Replicas
+	ranked := make([]rankedEndpoint, 0, len(placements))
+	for _, placement := range placements {
+		memberID := placement.MemberID
+		hashInput := "kuasar-route-local-read-v1\x00" + c.registryLayout.RegistryGeneration + "\x00" +
+			strconv.FormatUint(uint64(shardID), 10) + "\x00" + key + "\x00" + memberID
+		ranked = append(ranked, rankedEndpoint{endpoint: c.endpoints[memberID], score: xxhash.Sum64String(hashInput)})
+	}
+	sort.Slice(ranked, func(left, right int) bool {
+		if ranked[left].score == ranked[right].score {
+			return ranked[left].endpoint.MemberID < ranked[right].endpoint.MemberID
+		}
+		return ranked[left].score > ranked[right].score
+	})
+	result := make([]Endpoint, len(ranked))
+	for index := range ranked {
+		result[index] = ranked[index].endpoint
+	}
+	return result
+}
+
+func permitAuthorizesServeIdentity(permit routeapi.PermitResponse) bool {
+	return permit.ServeGate && permit.CutoverGate && permit.RecoveryClosed
+}
+
+func (c *Client) systemEndpoints() []Endpoint {
+	result := make([]Endpoint, 0, len(c.registryLayout.SystemReplicas))
+	for _, placement := range c.registryLayout.SystemReplicas {
+		result = append(result, c.endpoints[placement.MemberID])
+	}
+	return result
+}
+
+func (c *Client) memberServesShard(memberID string, shardID uint32) bool {
+	if shardID >= uint32(len(c.registryLayout.DataShards)) {
+		return false
+	}
+	for _, placement := range c.registryLayout.DataShards[shardID].Replicas {
+		if placement.MemberID == memberID {
+			return true
+		}
+	}
+	return false
+}
+
+func registryLayoutMember(registryLayout raftstore.RegistryLayout, memberID string) (raftstore.RegistryMember, bool) {
+	index := sort.Search(len(registryLayout.Members), func(index int) bool {
+		return registryLayout.Members[index].MemberID >= memberID
+	})
+	if index >= len(registryLayout.Members) || registryLayout.Members[index].MemberID != memberID {
+		return raftstore.RegistryMember{}, false
+	}
+	return registryLayout.Members[index], true
+}
+
+func postJSON(ctx context.Context, endpoint Endpoint, path string, input, output any) error {
+	raw, err := json.Marshal(input)
+	if err != nil {
+		return err
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint.BaseURL+path, bytes.NewReader(raw))
+	if err != nil {
+		return err
+	}
+	request.Header.Set("Content-Type", "application/json")
+	response, err := endpoint.Client.Do(request)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 4096))
+		return fmt.Errorf("routeclient: member %s returned %s", endpoint.MemberID, response.Status)
+	}
+	decoder := json.NewDecoder(io.LimitReader(response.Body, maximumResponseBytes+1))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(output); err != nil {
+		return err
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return errors.New("routeclient: response contains trailing data")
+	}
+	return nil
+}

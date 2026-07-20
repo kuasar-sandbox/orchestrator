@@ -19,6 +19,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -38,12 +39,16 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/metrics"
 	"github.com/kuasar-sandbox/orchestrator/internal/mmds"
 	"github.com/kuasar-sandbox/orchestrator/internal/netns"
+	"github.com/kuasar-sandbox/orchestrator/internal/nodectl"
+	"github.com/kuasar-sandbox/orchestrator/internal/nodeexec"
 	"github.com/kuasar-sandbox/orchestrator/internal/nodelink"
 	"github.com/kuasar-sandbox/orchestrator/internal/orch"
+	"github.com/kuasar-sandbox/orchestrator/internal/placement"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxy"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/secretbox"
 	"github.com/kuasar-sandbox/orchestrator/internal/store"
+	"github.com/kuasar-sandbox/orchestrator/internal/transportauth"
 	"github.com/kuasar-sandbox/orchestrator/internal/vswitch"
 )
 
@@ -130,6 +135,18 @@ func runConductor(args []string, log *slog.Logger) error {
 	if err := os.Chmod(cfg.Paths.DBPath, 0o600); err != nil {
 		log.Warn("chmod db", "err", err)
 	}
+	clusterMode := cfg.Cluster.NodeLink.Endpoint != ""
+	var clusterStart store.ClusterStartIdentity
+	if clusterMode {
+		bootID, err := readBootID(linuxBootIDPath)
+		if err != nil {
+			return err
+		}
+		clusterStart, err = st.PrepareClusterStart(ctx, cfg.Cluster.NodeID, bootID, cfg.Cluster.DataEndpoint)
+		if err != nil {
+			return fmt.Errorf("prepare durable cluster identity: %w", err)
+		}
+	}
 
 	lc, err := launcher.NewSystemd(ctx)
 	if err != nil {
@@ -145,70 +162,41 @@ func runConductor(args []string, log *slog.Logger) error {
 	if err := core.InstallUnits(ctx); err != nil {
 		return err
 	}
+	if clusterMode && clusterStart.ResetRequired {
+		if err := core.FencePriorClusterEpoch(ctx, clusterStart); err != nil {
+			return fmt.Errorf("fence prior cluster NodeEpoch: %w", err)
+		}
+	}
 	if err := core.Reconcile(ctx); err != nil {
+		if clusterMode && clusterStart.ResetRequired {
+			return fmt.Errorf("reconcile fenced cluster NodeEpoch: %w", err)
+		}
 		log.Warn("reconcile", "err", err)
 	}
 	go core.Reaper(ctx, 5*time.Second)
 
 	// Optionally host the node resource controller in-process (resource_listen,
 	// node-resource.md). Disabled => sandboxes use static cgroup.
+	var clusterResource *resourceRuntime
 	if cfg.ResourceListen != nil && cfg.ResourceListen.Enabled {
-		probe, err := startResourceController(ctx, cfg.ResourceListen, cfg.Builder, log)
+		probe, err := startResourceController(
+			ctx, cfg.ResourceListen, cfg.Builder, uint64(max(cfg.Sandbox.Capacity, 0)),
+			clusterMode && clusterStart.ResetRequired, log,
+		)
 		if err != nil {
 			return fmt.Errorf("resource_listen: %w", err)
 		}
-		core.SetResourceProbe(probe) // cluster heartbeat reports this node's water level + drain
+		clusterResource = probe
+		if cfg.Sandbox.Resources.ControlSocket != "" && cfg.Sandbox.Resources.ControlSocket != probe.socket {
+			return fmt.Errorf("resource_listen socket %q differs from sandbox.resources.control_socket %q", probe.socket, cfg.Sandbox.Resources.ControlSocket)
+		}
+		cfg.Sandbox.Resources.ControlSocket = probe.socket
 	}
-
-	// Connect to the cluster registry over node-link (node.md §10) if configured:
-	// the node streams its sandbox routes up + executes the registry's commands.
-	if cfg.Cluster.NodeLink.Endpoint != "" {
-		nodeID := cfg.Cluster.NodeID
-		if nodeID == "" {
-			nodeID, _ = os.Hostname()
+	if clusterMode && clusterStart.ResetRequired {
+		if err := st.CompleteClusterEpochReset(ctx, clusterStart.NodeEpoch); err != nil {
+			return err
 		}
-		dataEndpoint := cfg.Cluster.DataEndpoint
-		if dataEndpoint == "" {
-			dataEndpoint = cfg.API.Listen
-		}
-		regAddr := cfg.Cluster.NodeLink.Endpoint
-		hbInterval := 10 * time.Second
-		if cfg.Cluster.HeartbeatInterval != "" {
-			if d, err := time.ParseDuration(cfg.Cluster.HeartbeatInterval); err == nil {
-				hbInterval = d
-			}
-		}
-		var clientTLS *tls.Config
-		if cfg.Cluster.NodeLink.TLS.Cert != "" {
-			ct, terr := clustercfg.TLS{Cert: cfg.Cluster.NodeLink.TLS.Cert, Key: cfg.Cluster.NodeLink.TLS.Key, CA: cfg.Cluster.NodeLink.TLS.CA}.ClientConfig("")
-			if terr != nil {
-				return fmt.Errorf("cluster node-link tls: %w", terr)
-			}
-			clientTLS = ct
-		}
-		core.SetClusterContext(ctx) // node-link async work (boots) cancels on serve shutdown
-		capacity, buildCap, runtimeDigest := core.ClusterNodeInfo()
-		nl := nodelink.NewWithEndpoint(
-			regAddr,
-			func(dctx context.Context, endpoint string) (net.Conn, error) {
-				if strings.HasPrefix(endpoint, "http://") || strings.HasPrefix(endpoint, "https://") {
-					if req, err := http.NewRequest(http.MethodGet, endpoint, nil); err == nil && req.URL.Host != "" {
-						endpoint = req.URL.Host
-					}
-				}
-				if strings.HasPrefix(endpoint, "/") {
-					return (&net.Dialer{}).DialContext(dctx, "unix", endpoint)
-				}
-				return (&net.Dialer{}).DialContext(dctx, "tcp", endpoint)
-			},
-			routesync.NodeRegister{
-				NodeID: nodeID, Labels: cfg.Cluster.Labels, DataEndpoint: dataEndpoint,
-				Capacity: capacity, BuildCapacity: buildCap, RuntimeDigest: runtimeDigest,
-			},
-			core, hbInterval, clientTLS, log, true,
-		)
-		go nl.Run(ctx)
-		log.Info("node-ctl conductor: node-link to cluster registry", "registry", regAddr, "node_id", nodeID)
+		clusterStart.ResetRequired = false
 	}
 
 	// North api handler (e2b control plane + export/import). Built once and shared by
@@ -261,6 +249,103 @@ func runConductor(args []string, log *slog.Logger) error {
 	if err := core.StartRunPools(ctx); err != nil {
 		return err
 	}
+	if clusterMode {
+		var sandboxAdmission nodeexec.SandboxAdmissionController
+		var sandboxUsage func(context.Context) (nodectl.PreparedAdmissionUsage, error)
+		var resourceLoad func() orch.ClusterResourceLoad
+		if clusterResource != nil {
+			if clusterResource.prepared == nil {
+				return errors.New("cluster resource controller has no durable prepared Admission path")
+			}
+			sandboxAdmission = clusterResource.prepared
+			sandboxUsage = func(context.Context) (nodectl.PreparedAdmissionUsage, error) {
+				return clusterResource.prepared.Usage(), nil
+			}
+			resourceLoad = clusterResource.clusterLoad
+		} else {
+			if err := st.ConfigureSandboxSlotAdmission(uint64(cfg.Sandbox.Capacity), cfg.Cluster.SandboxQueueLimit); err != nil {
+				return err
+			}
+			sandboxAdmission = st
+			sandboxUsage = st.SandboxSlotAdmissionUsage
+		}
+
+		capacity, buildResources, runtimeDigest := core.ClusterNodeInfo()
+		if buildResources == nil || buildResources.Slots <= 0 {
+			return errors.New("cluster Build capacity is incomplete")
+		}
+		buildCapacity := nodeexec.BuildCapacity{
+			Slots: uint64(buildResources.Slots), CPU: uint64(buildResources.CPU),
+			Memory: uint64(buildResources.Mem), Storage: uint64(buildResources.Storage),
+			QueueLimit: cfg.Cluster.BuildQueueLimit,
+		}
+		sessionRuntime, err := orch.NewClusterSession(st, clusterStart)
+		if err != nil {
+			return err
+		}
+		finalNode, err := orch.NewFinalClusterNode(core, st, orch.ClusterNodeOptions{
+			Session: sessionRuntime, SandboxAdmission: sandboxAdmission,
+			SandboxUsage: sandboxUsage, ResourceLoad: resourceLoad,
+			SandboxSlotCapacity: uint64(capacity), SandboxQueueLimit: uint64(cfg.Cluster.SandboxQueueLimit),
+			BuildCapacity: buildCapacity, SandboxWorkers: cfg.Cluster.SandboxWorkers,
+			BuildWorkers: cfg.Cluster.BuildWorkers,
+		}, log)
+		if err != nil {
+			return err
+		}
+		apiH = finalNode.ClusterAPIHandler(apiH)
+		placementInterval, err := time.ParseDuration(cfg.Cluster.HeartbeatInterval)
+		if err != nil || placementInterval <= 0 || placementInterval > 500*time.Millisecond {
+			return fmt.Errorf("cluster placement snapshot interval: %w", err)
+		}
+		eventReplayInterval, err := time.ParseDuration(cfg.Cluster.EventReplayInterval)
+		if err != nil || eventReplayInterval <= 0 {
+			return fmt.Errorf("cluster event replay interval: %w", err)
+		}
+		var clientTLS *tls.Config
+		if cfg.Cluster.NodeLink.TLS.Cert != "" {
+			clientTLS, err = (clustercfg.TLS{
+				Cert: cfg.Cluster.NodeLink.TLS.Cert, Key: cfg.Cluster.NodeLink.TLS.Key, CA: cfg.Cluster.NodeLink.TLS.CA,
+			}).ClientConfig("")
+			if err != nil {
+				return fmt.Errorf("cluster node-link tls: %w", err)
+			}
+		}
+		load := orch.ClusterResourceLoad{WaterZone: "green", AdmissionTokenAvailable: true}
+		if resourceLoad != nil {
+			load = resourceLoad()
+		}
+		buildResources.Slots = cfg.Builder.MaxConcurrent
+		registration := routesync.NodeRegister{
+			NodeID: clusterStart.NodeID, EnrollmentID: clusterStart.EnrollmentID,
+			LoadModelVersion: placement.LoadModelVersion,
+			Labels:           cfg.Cluster.Labels, Capabilities: map[string]bool{"sandbox": true, "build": true},
+			Draining: load.Draining, Capacity: capacity, BuildCapacity: buildResources,
+			DataEndpoint: clusterStart.DataEndpoint, RuntimeDigest: runtimeDigest,
+			FailureDomain: cfg.Cluster.Labels["zone"],
+		}
+		nl := nodelink.New(
+			cfg.Cluster.NodeLink.Endpoint,
+			func(dctx context.Context, endpoint string) (net.Conn, error) {
+				if strings.HasPrefix(endpoint, "http://") || strings.HasPrefix(endpoint, "https://") {
+					if req, err := http.NewRequest(http.MethodGet, endpoint, nil); err == nil && req.URL.Host != "" {
+						endpoint = req.URL.Host
+					}
+				}
+				if strings.HasPrefix(endpoint, "/") {
+					return (&net.Dialer{}).DialContext(dctx, "unix", endpoint)
+				}
+				return (&net.Dialer{}).DialContext(dctx, "tcp", endpoint)
+			},
+			registration, finalNode, sessionRuntime, st, placementInterval, clientTLS, log,
+		)
+		nl.SetEventReplayLimits(cfg.Cluster.EventReplayBatch, cfg.Cluster.EventReplayBytes, eventReplayInterval)
+		core.SetClusterContext(ctx)
+		go finalNode.Run(ctx)
+		go nl.Run(ctx)
+		log.Info("node-ctl conductor: final node-link active", "registry", cfg.Cluster.NodeLink.Endpoint,
+			"node_id", clusterStart.NodeID, "node_epoch", clusterStart.NodeEpoch)
+	}
 	go core.BuildPool(ctx, 2*time.Second)
 
 	// Data-plane handler depends on proxy_mode: in-process proxy (internal),
@@ -277,6 +362,9 @@ func runConductor(args []string, log *slog.Logger) error {
 		log.Info("node-ctl internal proxy forwarding netns", "proxy_netns", cfg.Proxy.ProxyNetNS)
 	}
 	dataH := buildDataPlane(cfg, core, plugins, mx, log, proxyNS)
+	if clusterMode {
+		dataH = transportauth.Middleware(transportauth.RoleRouter, dataH)
+	}
 
 	// North handler: api.<domain> -> control plane; <port>-<sid>.<domain> -> data plane.
 	mux := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -303,7 +391,7 @@ func runConductor(args []string, log *slog.Logger) error {
 		}
 		log.Info("node-ctl data-plane listener", "data_listen", cfg.Proxy.DataListen)
 		go func() {
-			if err := serveListener(ctx, ln, dataH, cfg.API.TLS.Cert, cfg.API.TLS.Key, log); err != nil {
+			if err := serveListener(ctx, ln, dataH, cfg.API.TLS.Cert, cfg.API.TLS.Key, cfg.API.TLS.ClientCA, log); err != nil {
 				log.Error("data-plane listener", "err", err)
 			}
 		}()
@@ -335,7 +423,7 @@ func runConductor(args []string, log *slog.Logger) error {
 		return fmt.Errorf("listen %s: %w", cfg.API.Listen, err)
 	}
 	log.Info("node-ctl serving", "listen", cfg.API.Listen, "domain", cfg.API.Domain, "proxy_mode", cfg.Proxy.Mode)
-	return serveListener(ctx, ln, mux, cfg.API.TLS.Cert, cfg.API.TLS.Key, log)
+	return serveListener(ctx, ln, mux, cfg.API.TLS.Cert, cfg.API.TLS.Key, cfg.API.TLS.ClientCA, log)
 }
 
 // buildDataPlane wires the data-plane handler for the configured proxy_mode.

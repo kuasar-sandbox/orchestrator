@@ -1,6 +1,6 @@
 # ADR 0001: Dragonboat and Pebble for Registry Multi-Raft
 
-- Status: Accepted for dormant implementation; cutover gated by the benchmarks below
+- Status: Accepted; final cutover gated by the benchmarks below
 - Date: 2026-07-18
 - RFC: [orchestrator#46](https://github.com/kuasar-sandbox/orchestrator/issues/46)
 
@@ -46,7 +46,7 @@ Dragonboat groups enable `CheckQuorum`, `PreVote`, ordered configuration
 changes, bounded in-memory logs, Snappy snapshots, and configured snapshot,
 send-queue, receive-queue, and worker limits. Initial bootstrap, join, restart,
 promotion, removal, and local data deletion are driven by durable enrollment
-and the signed manifest, never by memberlist or leader visibility.
+and the signed Registry Layout, never by memberlist or leader visibility.
 
 ## Correctness Mapping
 
@@ -59,33 +59,37 @@ and the signed manifest, never by memberlist or leader visibility.
 | Strong reads | Dragonboat `SyncRead` supplies the leader/read-index path and applied barriers |
 | List and watch | each `(group, route_bucket)` range is read from one Pebble snapshot with its shard revision; durable change rows use committed indexes and a compacted cursor returns reset |
 | Snapshot and catch-up | on-disk snapshot stream plus learner catch-up proof from an exact target replica's linearizable read |
-| Safe membership change | signed next manifest, learner add, applied barrier, promotion confirmation, old-replica removal, epoch activation, old-Permit drain, and epoch retirement |
-| Generation fencing | signed anti-rollback manifest guard, explicit enrollment, System closure proof, and bounded Serve Permit identities |
+| Safe membership change | signed next Registry Layout, learner add, applied barrier, promotion confirmation, old-replica removal, epoch activation, old-Permit drain, and epoch retirement |
+| Registry History Generation fencing | signed anti-rollback Registry Layout guard, explicit enrollment, System closure proof, and bounded Serve Permit identities |
 | Fence compaction | full monotonic retention wait, durable outbox ACK or permanent NodeEpoch fence, and exact-voter applied-index probes |
-| Encrypted storage | runtime startup requires a platform storage attestor for NodeHost, WAL, Pebble, manifest guard, and enrollment paths |
+| Encrypted storage | runtime startup requires a platform storage attestor for NodeHost, WAL, Pebble, Registry Layout guard, and enrollment paths |
 
 The runtime deliberately rejects generic submission of bootstrap, epoch-change,
-membership-progress, generation-closure, and fence-compaction commands. Those
+membership-progress, Registry-History-Generation-closure, and fence-compaction commands. Those
 commands are reachable only through their proof-collecting workflows.
 
 ## Operational Constraints
 
 - A Raft endpoint hosts at most one replica ID of a given shard.
-- A retained member keeps its replica ID and Raft endpoint during one manifest
+- A retained member keeps its replica ID and Raft endpoint during one Registry Layout
   transition. Replacing either uses a new member/replica target.
-- A member removed from `manifest_next` may restart from the signed active
-  artifact while the durable anti-rollback guard remains at `manifest_next`.
+- A member removed from `next_registry_layout` may restart from the signed active
+  artifact while the durable anti-rollback guard remains at `next_registry_layout`.
 - Old replicas may serve only the draining old epoch. They cannot serve the new
-  epoch unless the new manifest places and promotes that exact local replica.
-- Phase 1-4 code remains dormant. No old-store migration, dual write, or
-  intermediate release is authorized by this ADR.
+  epoch unless the new Registry Layout places and promotes that exact local replica.
+- Phases 1-4 are review order only and are never deployed separately. The
+  final delivery has no old-store migration, dual write, or intermediate
+  production path.
 
 ## Validation
 
 Completed locally on a 4-vCPU, 3.6 GiB host:
 
 - deterministic System/data state-machine and snapshot tests;
-- restart, anti-rollback, generation rollover, and Permit fencing tests;
+- restart, anti-rollback, Registry History Generation rollover, and Permit fencing tests;
+- real three-member Registry History Generation rollover and #34 recovery, including an open
+  recovery-epoch restart of all Registry replicas, node SessionSeq renewal,
+  digest-CAS Binding rebind, durable event ACK, and old-Binding proxy fence;
 - real three-node Dragonboat proposal and local-read integration;
 - real snapshot transfer to an empty learner after leader compaction;
 - learner promotion and old-voter removal;
@@ -97,7 +101,7 @@ Completed locally on a 4-vCPU, 3.6 GiB host:
 - `GOWORK=off go vet ./...`.
 
 The local host is intentionally too small for the acceptance-scale gates. Run
-these exact gates on `bms.tmp` before the Phase 4 PR can be approved:
+these exact gates on `bms.tmp` before the final cutover PR can be approved:
 
 ```bash
 GOWORK=off KUASAR_RAFT_SCALE_GATE=1 go test ./internal/raftstore -run '^TestDragonboat4097GroupScaleGate$' -count=1 -v
@@ -135,5 +139,5 @@ Dragonboat supplies the mature Raft lifecycle and shared process runtime, while
 the application retains explicit control of the Registry state model and read
 contract. Pebble avoids one database per group and permits atomic row updates,
 but makes compaction, snapshot concurrency, memory budgets, and disk latency
-operationally significant. Those limits remain manifest/runtime tuning, must be
+operationally significant. Those limits remain Registry Layout/runtime tuning, must be
 observable, and must pass the stated BMS gates before cutover.

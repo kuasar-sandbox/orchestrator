@@ -10,18 +10,18 @@ import (
 )
 
 func TestRuntimeLocalReadRequiresPermitAndReturnsLeaderHintNotFinalMiss(t *testing.T) {
-	manifest := testManifest(4, "generation-1")
-	identity := routeShardIdentity(t, manifest, "/g", "missing")
-	state := initializeDataShard(t, manifest, identity)
+	registryLayout := testRegistryLayout(4, "generation-1")
+	identity := routeShardIdentity(t, registryLayout, "/g", "missing")
+	state := initializeDataShard(t, registryLayout, identity)
 	host := newFakeNodeHost()
 	host.leaderID, host.leaderTerm = 2, 7
 	host.read = func(shardID uint64, query any) (any, error) {
 		return LookupData(state, query.(DataLookup))
 	}
 	runtime := &Runtime{
-		manifest: manifest, manifestDigest: identity.ManifestDigest,
+		registryLayout: registryLayout, registryLayoutDigest: identity.RegistryLayoutDigest,
 		nodeHost: host, permitCache: NewPermitCache(time.Now),
-		member: manifest.Members[0], enrollment: LocalEnrollment{Replicas: []LocalReplicaEnrollment{{
+		member: registryLayout.Members[0], enrollment: LocalEnrollment{Replicas: []LocalReplicaEnrollment{{
 			ShardID: DataRaftShardID(identity.ShardID), ReplicaID: 1,
 			StartPlan: ReplicaInitial, LocalState: ReplicaActive,
 		}}},
@@ -71,39 +71,40 @@ func TestRuntimeRejectsRawDataLifecycleCommands(t *testing.T) {
 	}
 }
 
-func TestRemovedReplicaCanOnlyServeTheDrainingManifestEpoch(t *testing.T) {
-	oldManifest := testManifest(2, "generation-1")
-	oldDigest, err := oldManifest.Digest()
+func TestRemovedReplicaCanOnlyServeTheDrainingRegistryLayoutEpoch(t *testing.T) {
+	oldRegistryLayout := testRegistryLayout(2, "generation-1")
+	oldDigest, err := oldRegistryLayout.Digest()
 	if err != nil {
 		t.Fatal(err)
 	}
-	nextManifest := transitionManifest(t)
-	nextManifest.ManifestVersion = 2
-	nextManifest.PreviousManifestDigest = oldDigest
-	nextDigest, err := nextManifest.Digest()
+	nextRegistryLayout := transitionRegistryLayout(t)
+	nextRegistryLayout.RegistryLayoutVersion = 2
+	nextRegistryLayout.PreviousRegistryLayoutVersion = 1
+	nextRegistryLayout.PreviousRegistryLayoutDigest = oldDigest
+	nextDigest, err := nextRegistryLayout.Digest()
 	if err != nil {
 		t.Fatal(err)
 	}
-	member, found := manifestMember(nextManifest, "registry-c")
+	member, found := registryLayoutMember(nextRegistryLayout, "registry-c")
 	if !found {
 		t.Fatal("old replica member is absent from the transition catalog")
 	}
 	runtime := &Runtime{
-		manifest: nextManifest, manifestDigest: nextDigest, member: member,
+		registryLayout: nextRegistryLayout, registryLayoutDigest: nextDigest, member: member,
 		enrollment: LocalEnrollment{Replicas: []LocalReplicaEnrollment{{
 			ShardID: DataRaftShardID(0), ReplicaID: 3,
 			StartPlan: ReplicaInitial, LocalState: ReplicaActive,
 		}}},
 	}
 	identity := ShardRequestIdentity{PermitIdentity: PermitIdentity{
-		ClusterID: oldManifest.ClusterID, StorageGeneration: oldManifest.StorageGeneration,
-		SystemEpoch: 2, ManifestDigest: nextDigest,
+		ClusterID: oldRegistryLayout.ClusterID, RegistryGeneration: oldRegistryLayout.RegistryGeneration,
+		SystemEpoch: 2, RegistryLayoutDigest: nextDigest,
 	}, ShardID: 0}
 	if err := runtime.authorizeLocalDataReplica(identity); !errors.Is(err, ErrNoLocalReplica) {
 		t.Fatalf("removed replica next-epoch authorization = %v", err)
 	}
 	identity.SystemEpoch = 1
-	identity.ManifestDigest = oldDigest
+	identity.RegistryLayoutDigest = oldDigest
 	if err := runtime.authorizeLocalDataReplica(identity); err != nil {
 		t.Fatalf("draining old epoch was rejected before Permit/DataState checks: %v", err)
 	}

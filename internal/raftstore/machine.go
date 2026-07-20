@@ -235,7 +235,7 @@ func cloneDataStateForLookup(state DataState) DataState {
 	}
 	clone.Fences = make(map[string]clusterstate.ExecutionFence, len(state.Fences))
 	for key, fence := range state.Fences {
-		clone.Fences[key] = fence
+		clone.Fences[key] = cloneExecutionFence(fence)
 	}
 	if state.Recovery != nil {
 		recovery := *state.Recovery

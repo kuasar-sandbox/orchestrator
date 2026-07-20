@@ -104,7 +104,7 @@ func (s *Subscriber) session(ctx context.Context, tr *http2.Transport) error {
 	defer resp.Body.Close()
 
 	// Validate the authority version before touching the current route-table sync
-	// generation. Mixed versions fail closed and reconnect only after both sides
+	// epoch. Mixed versions fail closed and reconnect only after both sides
 	// run the exact protocol.
 	hello, err := ReadMsg(resp.Body)
 	if err != nil {

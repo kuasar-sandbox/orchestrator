@@ -34,18 +34,19 @@ type RaftTLS struct {
 }
 
 type RuntimeTuning struct {
-	RTTMillis            uint64
-	HeartbeatRTT         uint64
-	ElectionRTT          uint64
-	SnapshotEntries      uint64
-	CompactionOverhead   uint64
-	MaxInMemLogBytes     uint64
-	MaxSendQueueBytes    uint64
-	MaxRecvQueueBytes    uint64
-	SnapshotWorkers      uint64
-	LogDBMemory          string
-	FenceRetentionMillis uint64
-	StateEngine          StateEngineTuning
+	RTTMillis              uint64
+	HeartbeatRTT           uint64
+	ElectionRTT            uint64
+	SnapshotEntries        uint64
+	CompactionOverhead     uint64
+	MaxInMemLogBytes       uint64
+	MaxSendQueueBytes      uint64
+	MaxRecvQueueBytes      uint64
+	SnapshotWorkers        uint64
+	LogDBMemory            string
+	OperationTimeoutMillis uint64
+	FenceRetentionMillis   uint64
+	StateEngine            StateEngineTuning
 }
 
 func DefaultRuntimeTuning() RuntimeTuning {
@@ -54,8 +55,9 @@ func DefaultRuntimeTuning() RuntimeTuning {
 		SnapshotEntries: 100_000, CompactionOverhead: 10_000,
 		MaxInMemLogBytes: 128 << 20, MaxSendQueueBytes: 256 << 20,
 		MaxRecvQueueBytes: 256 << 20, SnapshotWorkers: 4, LogDBMemory: "medium",
-		FenceRetentionMillis: 60 * 60 * 1000,
-		StateEngine:          DefaultStateEngineTuning(),
+		OperationTimeoutMillis: 5000,
+		FenceRetentionMillis:   60 * 60 * 1000,
+		StateEngine:            DefaultStateEngineTuning(),
 	}
 }
 
@@ -65,6 +67,9 @@ func (t RuntimeTuning) Validate() error {
 		t.MaxInMemLogBytes < 2*MaxRaftCommandBytes || t.MaxSendQueueBytes == 0 ||
 		t.MaxRecvQueueBytes == 0 || t.SnapshotWorkers == 0 {
 		return errors.New("raftstore: invalid bounded Raft tuning")
+	}
+	if t.OperationTimeoutMillis < 100 || t.OperationTimeoutMillis > 60_000 {
+		return errors.New("raftstore: operation timeout must be between 100 milliseconds and 60 seconds")
 	}
 	if t.FenceRetentionMillis == 0 || t.FenceRetentionMillis > maximumFenceRetentionMillis {
 		return errors.New("raftstore: execution-fence retention must be between one millisecond and 30 days")
@@ -81,26 +86,26 @@ func (t RuntimeTuning) Validate() error {
 }
 
 type RuntimeConfig struct {
-	MemberID          string
-	NodeHostDir       string
-	WALDir            string
-	StateEngineDir    string
-	ListenAddress     string
-	ManifestGuardPath string
-	EnrollmentPath    string
-	TLS               RaftTLS
-	Tuning            RuntimeTuning
-	StorageAttestor   StorageAttestor
+	MemberID                string
+	NodeHostDir             string
+	WALDir                  string
+	StateEngineDir          string
+	ListenAddress           string
+	RegistryLayoutGuardPath string
+	EnrollmentPath          string
+	TLS                     RaftTLS
+	Tuning                  RuntimeTuning
+	StorageAttestor         StorageAttestor
 }
 
 func (c RuntimeConfig) validate(member RegistryMember) error {
 	if c.MemberID == "" || c.MemberID != member.MemberID || c.NodeHostDir == "" || c.StateEngineDir == "" ||
-		c.ManifestGuardPath == "" || c.EnrollmentPath == "" {
+		c.RegistryLayoutGuardPath == "" || c.EnrollmentPath == "" {
 		return errors.New("raftstore: incomplete local Registry member configuration")
 	}
 	if !filepath.IsAbs(c.NodeHostDir) || c.WALDir != "" && !filepath.IsAbs(c.WALDir) ||
 		!filepath.IsAbs(c.StateEngineDir) ||
-		!filepath.IsAbs(c.ManifestGuardPath) || !filepath.IsAbs(c.EnrollmentPath) {
+		!filepath.IsAbs(c.RegistryLayoutGuardPath) || !filepath.IsAbs(c.EnrollmentPath) {
 		return errors.New("raftstore: Raft storage and identity paths must be absolute")
 	}
 	if c.TLS.CAFile == "" || c.TLS.CertFile == "" || c.TLS.KeyFile == "" {
@@ -112,10 +117,10 @@ func (c RuntimeConfig) validate(member RegistryMember) error {
 	if err := c.Tuning.Validate(); err != nil {
 		return err
 	}
-	for _, identityPath := range []string{c.ManifestGuardPath, c.EnrollmentPath} {
+	for _, identityPath := range []string{c.RegistryLayoutGuardPath, c.EnrollmentPath} {
 		if pathWithin(c.NodeHostDir, identityPath) || c.WALDir != "" && pathWithin(c.WALDir, identityPath) ||
 			pathWithin(c.StateEngineDir, identityPath) {
-			return errors.New("raftstore: manifest/enrollment state must be outside Dragonboat data directories")
+			return errors.New("raftstore: registryLayout/enrollment state must be outside Dragonboat data directories")
 		}
 	}
 	if pathWithin(c.NodeHostDir, c.StateEngineDir) || pathWithin(c.StateEngineDir, c.NodeHostDir) ||
@@ -125,7 +130,7 @@ func (c RuntimeConfig) validate(member RegistryMember) error {
 	return nil
 }
 
-func (c RuntimeConfig) dragonboatConfig(manifest Manifest, member RegistryMember) (dbconfig.NodeHostConfig, error) {
+func (c RuntimeConfig) dragonboatConfig(registryLayout RegistryLayout, member RegistryMember) (dbconfig.NodeHostConfig, error) {
 	if err := c.validate(member); err != nil {
 		return dbconfig.NodeHostConfig{}, err
 	}
@@ -142,7 +147,7 @@ func (c RuntimeConfig) dragonboatConfig(manifest Manifest, member RegistryMember
 		expert.LogDB = dbconfig.GetLargeMemLogDBConfig()
 	}
 	config := dbconfig.NodeHostConfig{
-		DeploymentID: deploymentID(manifest.ClusterID, manifest.StorageGeneration),
+		DeploymentID: deploymentID(registryLayout.ClusterID, registryLayout.RegistryGeneration),
 		NodeHostDir:  c.NodeHostDir, WALDir: c.WALDir, RTTMillisecond: c.Tuning.RTTMillis,
 		RaftAddress: member.RaftEndpoint, ListenAddress: c.ListenAddress,
 		MutualTLS: true, CAFile: c.TLS.CAFile, CertFile: c.TLS.CertFile, KeyFile: c.TLS.KeyFile,
@@ -165,7 +170,7 @@ func (c RuntimeConfig) raftConfig(shardID, replicaID uint64, nonVoting bool) dbc
 	}
 }
 
-func (c RuntimeConfig) digest(manifest Manifest, member RegistryMember) (string, error) {
+func (c RuntimeConfig) digest(registryLayout RegistryLayout, member RegistryMember) (string, error) {
 	value := struct {
 		Version        uint32        `json:"version"`
 		DeploymentID   uint64        `json:"deployment_id"`
@@ -177,7 +182,7 @@ func (c RuntimeConfig) digest(manifest Manifest, member RegistryMember) (string,
 		MutualTLS      bool          `json:"mutual_tls"`
 		StaticRegistry bool          `json:"static_registry"`
 	}{
-		Version: runtimeConfigVersion, DeploymentID: deploymentID(manifest.ClusterID, manifest.StorageGeneration),
+		Version: runtimeConfigVersion, DeploymentID: deploymentID(registryLayout.ClusterID, registryLayout.RegistryGeneration),
 		RaftAddress: member.RaftEndpoint, NodeHostDir: c.NodeHostDir, WALDir: c.WALDir,
 		StateEngineDir: c.StateEngineDir,
 		RuntimeTuning:  c.Tuning, MutualTLS: true, StaticRegistry: true,
@@ -192,10 +197,10 @@ func (c RuntimeConfig) digest(manifest Manifest, member RegistryMember) (string,
 
 func (c RuntimeConfig) attestStorage() error {
 	directories := map[string]struct{}{
-		filepath.Clean(c.NodeHostDir):     {},
-		filepath.Clean(c.StateEngineDir):  {},
-		filepath.Dir(c.ManifestGuardPath): {},
-		filepath.Dir(c.EnrollmentPath):    {},
+		filepath.Clean(c.NodeHostDir):           {},
+		filepath.Clean(c.StateEngineDir):        {},
+		filepath.Dir(c.RegistryLayoutGuardPath): {},
+		filepath.Dir(c.EnrollmentPath):          {},
 	}
 	if c.WALDir != "" {
 		directories[filepath.Clean(c.WALDir)] = struct{}{}
@@ -216,8 +221,8 @@ func (c RuntimeConfig) attestStorage() error {
 	return nil
 }
 
-func deploymentID(clusterID, generation string) uint64 {
-	digest := sha256.Sum256([]byte("kuasar-raft-deployment-v1\x00" + clusterID + "\x00" + generation))
+func deploymentID(clusterID, registryGeneration string) uint64 {
+	digest := sha256.Sum256([]byte("kuasar-raft-deployment-v1\x00" + clusterID + "\x00" + registryGeneration))
 	value := binary.BigEndian.Uint64(digest[:8])
 	if value == 0 {
 		return 1

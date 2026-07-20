@@ -29,7 +29,9 @@ func (d *DirectoryDispatcher) AdmitAndDispatch(ctx context.Context, command Disp
 		return DispatchReply{Outcome: cluster.DispatchSessionMoved, Reason: "node has no current Session Holder"}, nil
 	}
 	if entry.NodeEpoch > command.NodeEpoch {
-		return DispatchReply{Outcome: cluster.DispatchDefinitiveReject, Reason: "selected NodeEpoch is permanently fenced"}, nil
+		// The Directory is only a routing hint. The committed System state must
+		// fence the selected execution before its identity can be abandoned.
+		return DispatchReply{Outcome: cluster.DispatchSessionMoved, Reason: "selected NodeEpoch is no longer current"}, nil
 	}
 	if entry.NodeEpoch < command.NodeEpoch {
 		return DispatchReply{Outcome: cluster.DispatchSessionMoved, Reason: "Session Directory is behind selected NodeEpoch"}, nil

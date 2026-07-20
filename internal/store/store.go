@@ -11,6 +11,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/apikey"
@@ -20,9 +21,14 @@ import (
 )
 
 type Store struct {
-	db        *sql.DB
-	box       *secretbox.Box
-	eventWake chan struct{}
+	db             *sql.DB
+	box            *secretbox.Box
+	eventWake      chan struct{}
+	slotWake       chan struct{}
+	workflowWake   chan struct{}
+	slotMu         sync.RWMutex
+	slotCapacity   uint64
+	slotQueueLimit int
 }
 
 type sqlExecutor interface {
@@ -73,11 +79,12 @@ CREATE TABLE IF NOT EXISTS builds (
   reason            TEXT NOT NULL DEFAULT '',
   run_id            TEXT NOT NULL DEFAULT '',
   names_json        TEXT NOT NULL DEFAULT '[]',
-  aliases_json      TEXT NOT NULL DEFAULT '[]',
-	  created_unix      INTEGER NOT NULL,
-	  registry_auth_enc TEXT NOT NULL DEFAULT '',
-	  metadata_json     TEXT NOT NULL DEFAULT '{}',
-	  builder_json      TEXT NOT NULL DEFAULT '{}'
+	  aliases_json      TEXT NOT NULL DEFAULT '[]',
+		  created_unix      INTEGER NOT NULL,
+		  registry_auth_enc TEXT NOT NULL DEFAULT '',
+		  metadata_json     TEXT NOT NULL DEFAULT '{}',
+		  builder_json      TEXT NOT NULL DEFAULT '{}',
+		  trigger_digest    TEXT NOT NULL DEFAULT ''
 	);
 CREATE INDEX IF NOT EXISTS idx_builds_status ON builds(status);
 CREATE INDEX IF NOT EXISTS idx_builds_mkhash ON builds(manifest_key_hash);
@@ -100,6 +107,7 @@ CREATE TABLE IF NOT EXISTS cluster_identity (
   session_seq     BLOB NOT NULL CHECK (length(session_seq) = 8),
   boot_id         TEXT NOT NULL,
   data_endpoint   TEXT NOT NULL,
+  reset_required  INTEGER NOT NULL DEFAULT 0,
   updated_unix    INTEGER NOT NULL
 );
 
@@ -110,6 +118,7 @@ CREATE TABLE IF NOT EXISTS node_workflows (
   route_key            TEXT NOT NULL DEFAULT '',
   node_id              TEXT NOT NULL,
   node_epoch           BLOB NOT NULL CHECK (length(node_epoch) = 8),
+  session_seq          BLOB NOT NULL CHECK (length(session_seq) = 8),
   data_endpoint        TEXT NOT NULL,
   normalized_demand    BLOB NOT NULL,
   demand_digest        TEXT NOT NULL,
@@ -138,6 +147,19 @@ CREATE INDEX IF NOT EXISTS idx_node_workflows_build_queue
   ON node_workflows(object_kind, admission_state, queue_sequence);
 CREATE INDEX IF NOT EXISTS idx_node_workflows_outbox
   ON node_workflows(node_id, node_epoch, event_seq, acked_event_seq);
+
+CREATE TABLE IF NOT EXISTS sandbox_slot_admissions (
+  sandbox_id       TEXT PRIMARY KEY,
+  demand_digest    TEXT NOT NULL,
+  slot_units       BLOB NOT NULL CHECK (length(slot_units) = 8),
+  state            TEXT NOT NULL,
+  reservation_token TEXT NOT NULL DEFAULT '',
+  queue_sequence   BLOB NOT NULL CHECK (length(queue_sequence) = 8),
+  reason           TEXT NOT NULL DEFAULT '',
+  updated_unix     INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sandbox_slot_queue
+  ON sandbox_slot_admissions(state, queue_sequence);
 `
 
 // Open opens (creating if needed) the sqlite store with the encryption box used
@@ -164,7 +186,18 @@ func Open(path string, box *secretbox.Box) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("store: init schema: %w", err)
 	}
-	return &Store{db: db, box: box, eventWake: make(chan struct{}, 1)}, nil
+	if err := ensureColumn(ctx, db, "builds", "trigger_digest", `TEXT NOT NULL DEFAULT ''`); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("store: init schema: %w", err)
+	}
+	if err := ensureColumn(ctx, db, "cluster_identity", "reset_required", `INTEGER NOT NULL DEFAULT 0`); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("store: init schema: %w", err)
+	}
+	return &Store{
+		db: db, box: box, eventWake: make(chan struct{}, 1),
+		slotWake: make(chan struct{}, 1), workflowWake: make(chan struct{}, 1),
+	}, nil
 }
 
 func (s *Store) Close() error { return s.db.Close() }
@@ -431,13 +464,13 @@ func (s *Store) Delete(ctx context.Context, id string) error {
 // --- builds (also the template registry) ---
 
 var buildCols = `build_id,template_id,persist_id,manifest_key_hash,manifest_key_enc,profile,kind,
-  from_image,from_template,start_cmd,ready_cmd,steps_json,status,reason,run_id,names_json,aliases_json,created_unix,registry_auth_enc,metadata_json,builder_json`
+	  from_image,from_template,start_cmd,ready_cmd,steps_json,status,reason,run_id,names_json,aliases_json,created_unix,registry_auth_enc,metadata_json,builder_json,trigger_digest`
 
 func (s *Store) scanBuild(row interface{ Scan(...any) error }) (*types.Build, error) {
 	var b types.Build
 	var profile, kind, status, names, aliases, mkHash, mkEnc, raEnc, steps, meta, builder string
 	if err := row.Scan(&b.BuildID, &b.TemplateID, &b.PersistID, &mkHash, &mkEnc, &profile, &kind,
-		&b.FromImage, &b.FromTemplate, &b.StartCmd, &b.ReadyCmd, &steps, &status, &b.Reason, &b.RunID, &names, &aliases, &b.CreatedUnix, &raEnc, &meta, &builder); err != nil {
+		&b.FromImage, &b.FromTemplate, &b.StartCmd, &b.ReadyCmd, &steps, &status, &b.Reason, &b.RunID, &names, &aliases, &b.CreatedUnix, &raEnc, &meta, &builder, &b.TriggerDigest); err != nil {
 		return nil, err
 	}
 	b.Metadata = uj(meta)
@@ -487,9 +520,9 @@ func (s *Store) putBuild(ctx context.Context, exec sqlExecutor, b *types.Build) 
 		stepsJSON = string(sj)
 	}
 	_, err = exec.ExecContext(ctx, `
-	INSERT INTO builds (build_id,template_id,persist_id,manifest_key_hash,manifest_key_enc,profile,kind,
-	  from_image,from_template,start_cmd,ready_cmd,steps_json,status,reason,run_id,names_json,aliases_json,created_unix,registry_auth_enc,metadata_json,builder_json)
-	VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+		INSERT INTO builds (build_id,template_id,persist_id,manifest_key_hash,manifest_key_enc,profile,kind,
+		  from_image,from_template,start_cmd,ready_cmd,steps_json,status,reason,run_id,names_json,aliases_json,created_unix,registry_auth_enc,metadata_json,builder_json,trigger_digest)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 	ON CONFLICT(build_id) DO UPDATE SET
 	  template_id=excluded.template_id, persist_id=excluded.persist_id,
 	  manifest_key_hash=excluded.manifest_key_hash, manifest_key_enc=excluded.manifest_key_enc,
@@ -498,10 +531,10 @@ func (s *Store) putBuild(ctx context.Context, exec sqlExecutor, b *types.Build) 
 	  ready_cmd=excluded.ready_cmd, steps_json=excluded.steps_json,
 	  status=excluded.status, reason=excluded.reason, run_id=excluded.run_id,
 	  names_json=excluded.names_json, aliases_json=excluded.aliases_json,
-	  registry_auth_enc=excluded.registry_auth_enc, metadata_json=excluded.metadata_json,
-	  builder_json=excluded.builder_json`,
+		  registry_auth_enc=excluded.registry_auth_enc, metadata_json=excluded.metadata_json,
+		  builder_json=excluded.builder_json, trigger_digest=excluded.trigger_digest`,
 		b.BuildID, b.TemplateID, b.PersistID, hash, enc, string(b.Profile), string(b.Kind),
-		b.FromImage, b.FromTemplate, b.StartCmd, b.ReadyCmd, stepsJSON, string(b.Status), b.Reason, b.RunID, mjs(b.Names), mjs(b.Aliases), b.CreatedUnix, raEnc, mj(b.Metadata), mb(b.Builder))
+		b.FromImage, b.FromTemplate, b.StartCmd, b.ReadyCmd, stepsJSON, string(b.Status), b.Reason, b.RunID, mjs(b.Names), mjs(b.Aliases), b.CreatedUnix, raEnc, mj(b.Metadata), mb(b.Builder), b.TriggerDigest)
 	if err != nil {
 		return fmt.Errorf("store: put build %s: %w", b.BuildID, err)
 	}

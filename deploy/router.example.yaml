@@ -1,27 +1,44 @@
-# cluster-ctl router config — cluster-ctl router --config /etc/cluster-ctl/router.yaml.
-# e2b-compatible unified ingress (docs/cluster-router.md). Required: domain.
-# Validate with `cluster-ctl config router --config router.yaml`.
-
+# cluster-ctl router --config /etc/cluster-ctl/router.yaml
 domain: sandboxes.example.com
 
-# Upstream: registry bootstrap endpoint. Router fetches membership, then routes
-# each group operation to the route_link owner set.
-registry:
-  bootstrap: registry-1.example:7700
-  # tls: { cert: ..., key: ..., ca: ... }   # client mTLS to registry control plane
+registry_layout:
+  chain: /etc/kuasar/registry-layout-chain.json
+  keys: /etc/kuasar/registry-layout-keyring.json
+  guard: /var/lib/kuasar/router/registry-layout-guard.json
 
-# Downstream: the client-facing e2b ingress (SO_REUSEPORT across replicas).
+registry_tls:
+  cert: /etc/kuasar/tls/router.crt
+  key: /etc/kuasar/tls/router.key
+  ca: /etc/kuasar/tls/ca.crt
+
+# Router presents this role certificate to each bound node for direct Sandbox
+# control, Build lifecycle, and CONNECT forwarding. Nodes require the same CA.
+node_tls:
+  cert: /etc/kuasar/tls/router.crt
+  key: /etc/kuasar/tls/router.key
+  ca: /etc/kuasar/tls/ca.crt
+
+providers:
+  endpoints:
+    - { name: provider-1, endpoint: "https://provider-1.example:7900" }
+  tls:
+    cert: /etc/kuasar/tls/router.crt
+    key: /etc/kuasar/tls/router.key
+    ca: /etc/kuasar/tls/ca.crt
+
 ingress:
   listen: ":443"
-  # tls: { cert: /etc/cluster-ctl/tls/fullchain.pem, key: /etc/cluster-ctl/tls/privkey.pem }  # wildcard *.<domain> + api.<domain>
+  tls:
+    cert: /etc/kuasar/tls/wildcard.crt
+    key: /etc/kuasar/tls/wildcard.key
 
 auth:
-  api_key: enforce                    # caller api_key auth: off | log | enforce
-  data_plane: enforce                 # data-plane access-token check: off | log | enforce
-  cache_ttl: 60s                      # api_key↔group verification cache
+  api_key: enforce
+  data_plane: enforce
+  cache_ttl: 60s
 
 cache:
-  route_ttl: 5m                       # local route resolution max age
-  idle_timeout: 2m                    # active/route cache idle age
+  route_ttl: 5m
+  idle_timeout: 2m
 
-# metrics_listen: ":9910"             # optional Prometheus text endpoint
+# metrics_listen: ":9910"

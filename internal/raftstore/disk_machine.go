@@ -629,6 +629,28 @@ func (m *diskStateMachine) lookupData(
 		if found {
 			state.Builds[key] = record
 		}
+	case query.Workflow != nil:
+		if query.Workflow.RouteKey != "" {
+			key := routeMapKey(query.Workflow.Group, query.Workflow.RouteKey)
+			var record clusterstate.RouteWorkflowRecord
+			found, err := getStateJSON(reader, stateRowKey(prefix, stateRouteTable, key), &record)
+			if err != nil {
+				return DataLookupResult{}, err
+			}
+			if found {
+				state.Routes[key] = record
+			}
+		} else {
+			key := buildMapKey(query.Workflow.Group, query.Workflow.BuildID)
+			var record clusterstate.BuildRecord
+			found, err := getStateJSON(reader, stateRowKey(prefix, stateBuildTable, key), &record)
+			if err != nil {
+				return DataLookupResult{}, err
+			}
+			if found {
+				state.Builds[key] = record
+			}
+		}
 	case query.RouteBucket != nil:
 		bucket, err := lookupRouteBucketOnDisk(reader, prefix, state, *query.RouteBucket)
 		if err != nil {
@@ -657,8 +679,67 @@ func (m *diskStateMachine) lookupData(
 			return DataLookupResult{}, err
 		}
 		return DataLookupResult{Pending: &pending}, nil
+	case query.Recovery != nil:
+		recovery, err := lookupRecoveryOnDisk(reader, prefix, state, *query.Recovery)
+		if err != nil {
+			return DataLookupResult{}, err
+		}
+		return DataLookupResult{Recovery: &recovery}, nil
 	}
 	return LookupData(state, query)
+}
+
+func lookupRecoveryOnDisk(
+	reader pebble.Reader,
+	prefix []byte,
+	state DataState,
+	query RecoveryLookup,
+) (RecoveryLookupResult, error) {
+	result := RecoveryLookupResult{Records: make([]RecoveryObjectRecord, 0)}
+	if state.Recovery == nil || query.Identity.ShardID != state.ShardID ||
+		query.Identity.PermitIdentity != state.Recovery.Target {
+		result.Reason = "data shard has no matching open recovery epoch"
+		return result, nil
+	}
+	tablePrefix := stateTablePrefix(prefix, stateRecoveryTable)
+	lowerBound := tablePrefix
+	if query.AfterKey != "" {
+		lowerBound = stateRowKey(prefix, stateRecoveryTable, query.AfterKey)
+	}
+	iterator := reader.NewIter(&pebble.IterOptions{
+		LowerBound: lowerBound,
+		UpperBound: prefixUpperBound(tablePrefix),
+	})
+	result.Available = true
+	lastKey := ""
+	for valid := iterator.First(); valid; valid = iterator.Next() {
+		key := string(iterator.Key()[len(tablePrefix):])
+		if key <= query.AfterKey {
+			continue
+		}
+		var record RecoveryObjectRecord
+		if err := decodeJSONValue(iterator.Value(), &record); err != nil {
+			iterator.Close()
+			return RecoveryLookupResult{}, err
+		}
+		if query.NodeID != "" && record.NodeID != query.NodeID {
+			continue
+		}
+		if len(result.Records) == int(query.Limit) {
+			result.NextKey = lastKey
+			break
+		}
+		result.Records = append(result.Records, record)
+		lastKey = key
+	}
+	if err := iterator.Error(); err != nil {
+		iterator.Close()
+		return RecoveryLookupResult{}, err
+	}
+	if err := iterator.Close(); err != nil {
+		return RecoveryLookupResult{}, err
+	}
+	return result, nil
 }
 
 func lookupRouteBucketOnDisk(
@@ -807,6 +888,7 @@ func lookupPendingOnDisk(
 		qualified byte
 	}{
 		{stateBuildTable, 'b'},
+		{stateFenceTable, 'f'},
 		{stateRouteTable, 'r'},
 	}
 	for _, table := range tables {
@@ -831,7 +913,7 @@ func lookupPendingOnDisk(
 					iterator.Close()
 					return PendingLookupResult{}, err
 				}
-				if buildNeedsCoordinator(record.State) {
+				if buildNeedsCoordinator(record) {
 					workflows = append(workflows, PendingWorkflow{Key: qualified, Build: &record})
 				}
 			case stateRouteTable:
@@ -844,9 +926,20 @@ func lookupPendingOnDisk(
 					iterator.Close()
 					return PendingLookupResult{}, err
 				}
-				if routeNeedsCoordinator(record.State) {
+				if routeNeedsCoordinator(record) {
 					workflows = append(workflows, PendingWorkflow{Key: qualified, Route: &record})
 				}
+			case stateFenceTable:
+				var fence clusterstate.ExecutionFence
+				if err := decodeJSONValue(iterator.Value(), &fence); err != nil {
+					iterator.Close()
+					return PendingLookupResult{}, err
+				}
+				if err := validateStoredFence(state, mapKey, fence); err != nil {
+					iterator.Close()
+					return PendingLookupResult{}, err
+				}
+				workflows = append(workflows, PendingWorkflow{Key: qualified, Fence: &fence})
 			}
 			if len(workflows) > int(query.Limit) {
 				break

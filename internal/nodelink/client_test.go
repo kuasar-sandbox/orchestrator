@@ -18,30 +18,11 @@ import (
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
 
-	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
-	"github.com/kuasar-sandbox/orchestrator/internal/registry"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 )
 
-const testAuthKey = "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100"
-
-type testPlacer struct{}
-
-func (testPlacer) Place(ctx context.Context, req registry.PlaceRequest) (*registry.Placement, error) {
-	tok, err := clusterstate.DeriveAccessToken(testAuthKey, req.SandboxID)
-	if err != nil {
-		return nil, err
-	}
-	return &registry.Placement{NodeID: "n1", AccessToken: tok}, nil
-}
-
-// fakeNode implements Node: it streams its routes and, on a create command,
-// "boots" the sandbox by adding a running route + emitting an upsert event — the
-// same path a real node takes (the registry's Reserve waits on that route).
 type fakeNode struct {
-	mu     sync.Mutex
-	routes map[string]routesync.RouteEntry
-	events chan routesync.Event
+	commands chan routesync.Command
 }
 
 type fixedSessionSequencer struct {
@@ -55,7 +36,7 @@ func (s *fixedSessionSequencer) NextSession(context.Context) (routesync.SessionT
 }
 
 func newFakeNode() *fakeNode {
-	return &fakeNode{routes: map[string]routesync.RouteEntry{}, events: make(chan routesync.Event, 16)}
+	return &fakeNode{commands: make(chan routesync.Command, 16)}
 }
 
 func TestCommandMatchesCurrentSession(t *testing.T) {
@@ -65,7 +46,7 @@ func TestCommandMatchesCurrentSession(t *testing.T) {
 		cmd  *routesync.Command
 		want bool
 	}{
-		{name: "legacy dormant path", cmd: &routesync.Command{}, want: true},
+		{name: "zero tuple", cmd: &routesync.Command{}},
 		{name: "exact", cmd: &routesync.Command{NodeEpoch: 7, SessionSeq: 11}, want: true},
 		{name: "old epoch", cmd: &routesync.Command{NodeEpoch: 6, SessionSeq: 11}},
 		{name: "old session", cmd: &routesync.Command{NodeEpoch: 7, SessionSeq: 10}},
@@ -80,88 +61,85 @@ func TestCommandMatchesCurrentSession(t *testing.T) {
 	}
 }
 
-func (n *fakeNode) Range(ctx context.Context, fn func(routesync.RouteEntry) error) error {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	for _, e := range n.routes {
-		if err := fn(e); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-func (n *fakeNode) Subscribe() (<-chan routesync.Event, func())          { return n.events, func() {} }
-func (n *fakeNode) OnWake(ctx context.Context, wake routesync.RouteWake) {}
-func (n *fakeNode) Policy() routesync.Policy                             { return routesync.Policy{} }
-func (n *fakeNode) Heartbeat() *routesync.Heartbeat                      { return &routesync.Heartbeat{} }
-func (n *fakeNode) BuildEvents() <-chan *routesync.BuildEvent            { return nil }
-
 func (n *fakeNode) HandleCommand(ctx context.Context, cmd *routesync.Command) *routesync.CmdAck {
-	ack := &routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted}
-	if cmd.Kind != routesync.CmdCreate {
-		return ack
+	select {
+	case n.commands <- *cmd:
+	case <-ctx.Done():
+		return &routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckRejected, Outcome: routesync.DispatchUnknown}
 	}
-	e := routesync.RouteEntry{
-		SandboxID: cmd.SID,
-		State:     routesync.StateRunning, AccessToken: cmd.AccessToken,
-	}
-	n.mu.Lock()
-	n.routes[cmd.SID] = e
-	n.mu.Unlock()
-	n.events <- routesync.Event{Kind: routesync.TypeUpsert, Route: e}
-	return ack
+	return &routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted, Outcome: routesync.DispatchAcceptedAdmitted}
 }
 
-func TestNodeLinkReserveRoundTrip(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	reg := registry.New(registry.NewStores(), testPlacer{}, 5*time.Second, log)
+func (n *fakeNode) PlacementLoad(context.Context) (*routesync.PlacementLoadSnapshot, error) {
+	return &routesync.PlacementLoadSnapshot{
+		WaterZone: "green", SandboxSlotUsed: 2, SandboxRateTokenAvailable: true,
+	}, nil
+}
 
+func TestNodeLinkPublishesPlacementAndHandlesCurrentSessionCommand(t *testing.T) {
+	receivedLoad := make(chan routesync.PlacementLoadSnapshot, 1)
+	receivedAck := make(chan routesync.CmdAck, 1)
 	mux := http.NewServeMux()
-	mux.HandleFunc(routesync.NodeLinkPath, reg.ServeNodeLink)
+	mux.HandleFunc(routesync.NodeLinkPath, func(w http.ResponseWriter, req *http.Request) {
+		first, err := routesync.ReadMsg(req.Body)
+		if err != nil || first.NodeReg == nil {
+			http.Error(w, "bad register", http.StatusBadRequest)
+			return
+		}
+		identity := *first.NodeReg
+		_ = routesync.WriteMsg(w, &routesync.Msg{Type: routesync.TypeHello, Hello: &routesync.Hello{Version: routesync.Version}})
+		w.(http.Flusher).Flush()
+		load, err := routesync.ReadMsg(req.Body)
+		if err != nil || load.Type != routesync.TypePlacementLoad || load.Load == nil {
+			return
+		}
+		receivedLoad <- *load.Load
+		_ = routesync.WriteMsg(w, &routesync.Msg{Type: routesync.TypeCommand, Cmd: &routesync.Command{
+			CmdID: "cmd-1", Kind: routesync.CmdSandboxResume,
+			NodeEpoch: identity.NodeEpoch, SessionSeq: identity.SessionSeq,
+		}})
+		w.(http.Flusher).Flush()
+		ack, err := routesync.ReadMsg(req.Body)
+		if err == nil && ack.Type == routesync.TypeCmdAck && ack.Ack != nil {
+			receivedAck <- *ack.Ack
+		}
+	})
 	srv := httptest.NewServer(h2c.NewHandler(mux, &http2.Server{}))
 	defer srv.Close()
-	addr := srv.Listener.Addr().String()
 
 	node := newFakeNode()
 	client := New(
-		func(ctx context.Context) (net.Conn, error) { return net.Dial("tcp", addr) },
-		routesync.NodeRegister{NodeID: "n1", DataEndpoint: "10.0.0.1:8443"},
-		node, 50*time.Millisecond, nil, log,
+		srv.URL,
+		func(ctx context.Context, endpoint string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "tcp", endpoint)
+		},
+		routesync.NodeRegister{
+			NodeID: "n1", NodeEpoch: 7, SessionSeq: 11, DataEndpoint: "10.0.0.1:8443",
+			Capacity: 8, LoadModelVersion: 1, RuntimeDigest: "runtime-v1",
+		},
+		node, &fixedSessionSequencer{tuple: routesync.SessionTuple{NodeEpoch: 7, SessionSeq: 11}},
+		newFakeDurableEventOutbox(), time.Hour, nil, slog.New(slog.NewTextHandler(io.Discard, nil)),
 	)
-	go client.Run(ctx)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	go func() { _ = client.session(ctx, srv.URL) }()
 
-	// Wait for the node to register over the channel.
-	deadline := time.Now().Add(3 * time.Second)
-	for {
-		if _, found, _ := reg.Stores().GetNode(ctx, "n1"); found {
-			break
+	select {
+	case load := <-receivedLoad:
+		if load.NodeID != "n1" || load.NodeEpoch != 7 || load.SessionSeq != 11 ||
+			load.SampleSeq != 1 || load.SandboxSlotCapacity != 8 || load.SandboxSlotUsed != 2 {
+			t.Fatalf("placement snapshot = %+v", load)
 		}
-		if time.Now().After(deadline) {
-			t.Fatal("node never registered over node-link")
-		}
-		time.Sleep(10 * time.Millisecond)
+	case <-ctx.Done():
+		t.Fatal("placement snapshot not received")
 	}
-
-	var res *registry.ReserveResult
-	var err error
-	for {
-		res, err = reg.ReserveSandbox(ctx, "/cell/proj/app/g1", "u1:sess1", nil)
-		if err == nil {
-			break
+	select {
+	case ack := <-receivedAck:
+		if ack.CmdID != "cmd-1" || ack.Status != routesync.AckAccepted || ack.Outcome != routesync.DispatchAcceptedAdmitted {
+			t.Fatalf("command acknowledgement = %+v", ack)
 		}
-		if !errors.Is(err, registry.ErrNodeGone) || time.Now().After(deadline) {
-			t.Fatalf("reserve over node-link: %v", err)
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	want, err := clusterstate.DeriveAccessToken(testAuthKey, res.SID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if res.NodeID != "n1" || res.SID == "" || res.AccessToken != want {
-		t.Fatalf("reserve result: %+v", res)
+	case <-ctx.Done():
+		t.Fatal("command acknowledgement not received")
 	}
 }
 
@@ -169,10 +147,19 @@ func TestNodeLinkClientFollowsRedirect(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	reg := registry.New(registry.NewStores(), testPlacer{}, 5*time.Second, log)
-
+	registered := make(chan routesync.NodeRegister, 1)
 	ownerMux := http.NewServeMux()
-	ownerMux.HandleFunc(routesync.NodeLinkPath, reg.ServeNodeLink)
+	ownerMux.HandleFunc(routesync.NodeLinkPath, func(w http.ResponseWriter, req *http.Request) {
+		first, err := routesync.ReadMsg(req.Body)
+		if err != nil || first.NodeReg == nil {
+			http.Error(w, "bad register", http.StatusBadRequest)
+			return
+		}
+		registered <- *first.NodeReg
+		_ = routesync.WriteMsg(w, &routesync.Msg{Type: routesync.TypeHello, Hello: &routesync.Hello{Version: routesync.Version}})
+		w.(http.Flusher).Flush()
+		<-req.Context().Done()
+	})
 	ownerSrv := httptest.NewServer(h2c.NewHandler(ownerMux, &http2.Server{}))
 	defer ownerSrv.Close()
 
@@ -181,10 +168,6 @@ func TestNodeLinkClientFollowsRedirect(t *testing.T) {
 		first, err := routesync.ReadMsg(req.Body)
 		if err != nil || first.Type != routesync.TypeNodeRegister || first.NodeReg == nil {
 			http.Error(w, "bad register", http.StatusBadRequest)
-			return
-		}
-		if !first.NodeReg.AcceptRedirect {
-			http.Error(w, "redirect not accepted", http.StatusConflict)
 			return
 		}
 		if err := routesync.WriteMsg(w, &routesync.Msg{Type: routesync.TypeHello, Hello: &routesync.Hello{
@@ -201,25 +184,27 @@ func TestNodeLinkClientFollowsRedirect(t *testing.T) {
 	defer ingressSrv.Close()
 
 	node := newFakeNode()
-	client := NewWithEndpoint(
+	client := New(
 		ingressSrv.URL,
 		func(ctx context.Context, endpoint string) (net.Conn, error) {
 			return (&net.Dialer{}).DialContext(ctx, "tcp", endpoint)
 		},
-		routesync.NodeRegister{NodeID: "n1", DataEndpoint: "10.0.0.1:8443"},
-		node, 50*time.Millisecond, nil, log, true,
+		routesync.NodeRegister{
+			NodeID: "n1", NodeEpoch: 7, SessionSeq: 11, DataEndpoint: "10.0.0.1:8443",
+			Capacity: 8, LoadModelVersion: 1,
+		},
+		node, &fixedSessionSequencer{tuple: routesync.SessionTuple{NodeEpoch: 7, SessionSeq: 11}},
+		newFakeDurableEventOutbox(), 50*time.Millisecond, nil, log,
 	)
 	go client.Run(ctx)
 
-	deadline := time.Now().Add(3 * time.Second)
-	for {
-		if got, found, _ := reg.Stores().GetNode(ctx, "n1"); found && got.DataEndpoint == "10.0.0.1:8443" {
-			break
+	select {
+	case got := <-registered:
+		if got.NodeID != "n1" || got.DataEndpoint != "10.0.0.1:8443" {
+			t.Fatalf("redirected registration = %+v", got)
 		}
-		if time.Now().After(deadline) {
-			t.Fatal("node never registered after redirect")
-		}
-		time.Sleep(10 * time.Millisecond)
+	case <-time.After(3 * time.Second):
+		t.Fatal("node never registered after redirect")
 	}
 }
 
@@ -239,19 +224,20 @@ func TestNodeLinkPersistsAndStampsTupleBeforeDial(t *testing.T) {
 	defer srv.Close()
 	sequencer := &fixedSessionSequencer{tuple: routesync.SessionTuple{NodeEpoch: 7, SessionSeq: 12}}
 	client := New(
-		func(ctx context.Context) (net.Conn, error) {
+		srv.URL,
+		func(ctx context.Context, endpoint string) (net.Conn, error) {
 			if !sequencer.called.Load() {
 				return nil, errors.New("dial occurred before durable session sequence")
 			}
-			return (&net.Dialer{}).DialContext(ctx, "tcp", srv.Listener.Addr().String())
+			return (&net.Dialer{}).DialContext(ctx, "tcp", endpoint)
 		},
 		routesync.NodeRegister{NodeID: "node-1", DataEndpoint: "10.0.0.1:8443"},
-		newFakeNode(), time.Second, nil, slog.New(slog.NewTextHandler(io.Discard, nil)),
+		newFakeNode(), sequencer, newFakeDurableEventOutbox(), time.Second, nil,
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
 	)
-	client.SetSessionSequencer(sequencer)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	_ = client.session(ctx, "")
+	_ = client.session(ctx, srv.URL)
 	select {
 	case got := <-registered:
 		if got.Version != routesync.Version || got.NodeEpoch != 7 || got.SessionSeq != 12 {
@@ -279,15 +265,18 @@ func TestNodeLinkRejectsMismatchedHelloVersion(t *testing.T) {
 	srv := httptest.NewServer(h2c.NewHandler(mux, &http2.Server{}))
 	defer srv.Close()
 	client := New(
-		func(ctx context.Context) (net.Conn, error) {
-			return (&net.Dialer{}).DialContext(ctx, "tcp", srv.Listener.Addr().String())
+		srv.URL,
+		func(ctx context.Context, endpoint string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "tcp", endpoint)
 		},
-		routesync.NodeRegister{NodeID: "node-1"}, newFakeNode(), time.Second, nil,
+		routesync.NodeRegister{NodeID: "node-1"}, newFakeNode(),
+		&fixedSessionSequencer{tuple: routesync.SessionTuple{NodeEpoch: 7, SessionSeq: 11}},
+		newFakeDurableEventOutbox(), time.Second, nil,
 		slog.New(slog.NewTextHandler(io.Discard, nil)),
 	)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	if err := client.session(ctx, ""); err == nil || err.Error() != "node-link: incompatible registry protocol version" {
+	if err := client.session(ctx, srv.URL); err == nil || err.Error() != "node-link: incompatible registry protocol version" {
 		t.Fatalf("session error = %v", err)
 	}
 }
@@ -305,67 +294,67 @@ func TestFullJitterIsBounded(t *testing.T) {
 	}
 }
 
-func TestNodeLinkOutboxPrioritizesCommandThenDurableEventBeforeHeartbeat(t *testing.T) {
+func TestNodeLinkOutboxPrioritizesCommandThenDurableEventBeforePlacementLoad(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	outbox := make(chan *routesync.Msg, 2)
 	highOut := make(chan *routesync.Msg, 1)
 	eventOut := make(chan *routesync.Msg, 1)
-	hbUpdate := make(chan struct{}, 1)
-	var hbMu sync.Mutex
-	heartbeat := &routesync.Msg{Type: routesync.TypeHeartbeat, Beat: &routesync.Heartbeat{Counts: 7}}
-	latestHeartbeat := heartbeat
+	loadUpdate := make(chan struct{}, 1)
+	var loadMu sync.Mutex
+	placementLoad := &routesync.Msg{Type: routesync.TypePlacementLoad, Load: &routesync.PlacementLoadSnapshot{SandboxSlotUsed: 7}}
+	latestLoad := placementLoad
 
 	highOut <- &routesync.Msg{Type: routesync.TypeCmdAck, Ack: &routesync.CmdAck{CmdID: "cmd-1", Status: routesync.AckAccepted}}
 	eventOut <- &routesync.Msg{Type: routesync.TypeExecutionEvent, ExecutionEvent: &routesync.ExecutionEvent{ObjectID: "sandbox-1"}}
-	hbUpdate <- struct{}{}
-	go runNodeLinkOutbox(ctx, outbox, highOut, eventOut, hbUpdate, &hbMu, &latestHeartbeat)
+	loadUpdate <- struct{}{}
+	go runNodeLinkOutbox(ctx, outbox, highOut, eventOut, loadUpdate, &loadMu, &latestLoad)
 
 	first := receiveOutboxMsg(t, outbox)
 	if first.Type != routesync.TypeCmdAck || first.Ack == nil || first.Ack.CmdID != "cmd-1" {
-		t.Fatalf("first outbox msg=%+v, want cmd_ack before heartbeat", first)
+		t.Fatalf("first outbox msg=%+v, want cmd_ack before placement load", first)
 	}
 	second := receiveOutboxMsg(t, outbox)
 	if second.Type != routesync.TypeExecutionEvent || second.ExecutionEvent == nil || second.ExecutionEvent.ObjectID != "sandbox-1" {
 		t.Fatalf("second outbox msg=%+v, want durable execution event", second)
 	}
 	third := receiveOutboxMsg(t, outbox)
-	if third.Type != routesync.TypeHeartbeat || third.Beat == nil || third.Beat.Counts != 7 {
-		t.Fatalf("third outbox msg=%+v, want latest heartbeat", third)
+	if third.Type != routesync.TypePlacementLoad || third.Load == nil || third.Load.SandboxSlotUsed != 7 {
+		t.Fatalf("third outbox msg=%+v, want latest placement load", third)
 	}
 }
 
-func TestNodeLinkOutboxBoundsEventBurstBeforeHeartbeat(t *testing.T) {
+func TestNodeLinkOutboxBoundsEventBurstBeforePlacementLoad(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	outbox := make(chan *routesync.Msg, 64)
 	highOut := make(chan *routesync.Msg)
 	eventOut := make(chan *routesync.Msg, 128)
-	hbUpdate := make(chan struct{}, 1)
-	var hbMu sync.Mutex
-	latestHeartbeat := &routesync.Msg{Type: routesync.TypeHeartbeat, Beat: &routesync.Heartbeat{Counts: 9}}
+	loadUpdate := make(chan struct{}, 1)
+	var loadMu sync.Mutex
+	latestLoad := &routesync.Msg{Type: routesync.TypePlacementLoad, Load: &routesync.PlacementLoadSnapshot{SandboxSlotUsed: 9}}
 	for index := 0; index < 100; index++ {
 		eventOut <- &routesync.Msg{
 			Type:           routesync.TypeExecutionEvent,
 			ExecutionEvent: &routesync.ExecutionEvent{ObjectID: fmt.Sprintf("sandbox-%d", index)},
 		}
 	}
-	hbUpdate <- struct{}{}
-	go runNodeLinkOutbox(ctx, outbox, highOut, eventOut, hbUpdate, &hbMu, &latestHeartbeat)
+	loadUpdate <- struct{}{}
+	go runNodeLinkOutbox(ctx, outbox, highOut, eventOut, loadUpdate, &loadMu, &latestLoad)
 
-	eventsBeforeHeartbeat := 0
+	eventsBeforeLoad := 0
 	for {
 		message := receiveOutboxMsg(t, outbox)
-		if message.Type == routesync.TypeHeartbeat {
+		if message.Type == routesync.TypePlacementLoad {
 			break
 		}
-		eventsBeforeHeartbeat++
-		if eventsBeforeHeartbeat > 32 {
-			t.Fatal("sustained event backlog starved heartbeat")
+		eventsBeforeLoad++
+		if eventsBeforeLoad > 32 {
+			t.Fatal("sustained event backlog starved placement load")
 		}
 	}
-	if eventsBeforeHeartbeat == 0 {
-		t.Fatal("heartbeat bypassed the configured event-priority burst")
+	if eventsBeforeLoad == 0 {
+		t.Fatal("placement load bypassed the configured event-priority burst")
 	}
 }
 
@@ -375,9 +364,9 @@ func TestNodeLinkOutboxBoundsCommandACKBurstBeforeDurableEvent(t *testing.T) {
 	outbox := make(chan *routesync.Msg, 64)
 	highOut := make(chan *routesync.Msg, 128)
 	eventOut := make(chan *routesync.Msg, 1)
-	hbUpdate := make(chan struct{}, 1)
-	var hbMu sync.Mutex
-	latestHeartbeat := &routesync.Msg{Type: routesync.TypeHeartbeat, Beat: &routesync.Heartbeat{Counts: 11}}
+	loadUpdate := make(chan struct{}, 1)
+	var loadMu sync.Mutex
+	latestLoad := &routesync.Msg{Type: routesync.TypePlacementLoad, Load: &routesync.PlacementLoadSnapshot{SandboxSlotUsed: 11}}
 	for index := 0; index < 100; index++ {
 		highOut <- &routesync.Msg{
 			Type: routesync.TypeCmdAck,
@@ -388,8 +377,8 @@ func TestNodeLinkOutboxBoundsCommandACKBurstBeforeDurableEvent(t *testing.T) {
 		Type:           routesync.TypeExecutionEvent,
 		ExecutionEvent: &routesync.ExecutionEvent{ObjectID: "sandbox-durable"},
 	}
-	hbUpdate <- struct{}{}
-	go runNodeLinkOutbox(ctx, outbox, highOut, eventOut, hbUpdate, &hbMu, &latestHeartbeat)
+	loadUpdate <- struct{}{}
+	go runNodeLinkOutbox(ctx, outbox, highOut, eventOut, loadUpdate, &loadMu, &latestLoad)
 
 	acksBeforeEvent := 0
 	for {
@@ -412,6 +401,10 @@ type fakeDurableEventOutbox struct {
 	events  []routesync.ExecutionEvent
 	wake    chan struct{}
 	queries int
+}
+
+func newFakeDurableEventOutbox() *fakeDurableEventOutbox {
+	return &fakeDurableEventOutbox{wake: make(chan struct{}, 1)}
 }
 
 func (f *fakeDurableEventOutbox) PendingExecutionEvents(
@@ -452,9 +445,9 @@ func TestDurableEventReplayStartsImmediatelyAndIsBatchBounded(t *testing.T) {
 		wake: make(chan struct{}, 1),
 		events: []routesync.ExecutionEvent{
 			{ObjectKind: "sandbox", ObjectID: "sandbox-1", NodeID: "node-1", NodeEpoch: 7,
-				StorageGeneration: "generation-1", BindingDigest: strings.Repeat("a", 64), EventSeq: 2, State: "READY"},
+				RegistryGeneration: "generation-1", BindingDigest: strings.Repeat("a", 64), EventSeq: 2, State: "READY"},
 			{ObjectKind: "build", ObjectID: "build-1", NodeID: "node-1", NodeEpoch: 7,
-				StorageGeneration: "generation-1", BindingDigest: strings.Repeat("b", 64), EventSeq: 3, State: "BUILDING"},
+				RegistryGeneration: "generation-1", BindingDigest: strings.Repeat("b", 64), EventSeq: 3, State: "BUILDING"},
 		},
 	}
 	eventOut := make(chan *routesync.Msg, 2)

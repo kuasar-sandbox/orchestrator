@@ -41,14 +41,14 @@ func (o *Orchestrator) routeEntry(sb *types.Sandbox) routesync.RouteEntry {
 		SnapshotLocation:   snapshotLocation(sb.SnapshotRef),
 		MmdsSecret:         hex.EncodeToString(keys.MmdsSecret(sb.ManifestKey, sb.ID)),
 	}
-	if managed, nodeID, nodeEpoch, generation, digest, err := sandboxRouteFence(sb); managed {
+	if managed, nodeID, nodeEpoch, registryGeneration, digest, err := sandboxRouteFence(sb); managed {
 		if err != nil {
 			// A malformed system-owned Binding must fail closed at every proxy.
 			e.BindingDigest = "invalid"
 		} else {
 			e.NodeID = nodeID
 			e.NodeEpoch = nodeEpoch
-			e.StorageGeneration = generation
+			e.RegistryGeneration = registryGeneration
 			e.BindingDigest = digest
 		}
 	}
@@ -112,11 +112,11 @@ func (o *Orchestrator) Subscribe() (<-chan routesync.Event, func()) {
 func (o *Orchestrator) OnWake(ctx context.Context, wake routesync.RouteWake) {
 	sid := wake.SandboxID
 	request := proxy.RouteRequest{
-		SandboxID:                 sid,
-		ExpectedNodeID:            wake.NodeID,
-		ExpectedNodeEpoch:         wake.NodeEpoch,
-		ExpectedStorageGeneration: wake.StorageGeneration,
-		ExpectedBindingDigest:     wake.BindingDigest,
+		SandboxID:                  sid,
+		ExpectedNodeID:             wake.NodeID,
+		ExpectedNodeEpoch:          wake.NodeEpoch,
+		ExpectedRegistryGeneration: wake.RegistryGeneration,
+		ExpectedBindingDigest:      wake.BindingDigest,
 	}
 	sb := o.lookup(sid)
 	if sb == nil {
