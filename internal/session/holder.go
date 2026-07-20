@@ -22,15 +22,15 @@ var (
 )
 
 type ServeIdentity struct {
-	ClusterID         string `json:"cluster_id"`
-	StorageGeneration string `json:"storage_generation"`
-	SystemEpoch       uint64 `json:"system_epoch"`
-	ManifestDigest    string `json:"manifest_digest"`
+	ClusterID            string `json:"cluster_id"`
+	RegistryGeneration   string `json:"registry_generation"`
+	SystemEpoch          uint64 `json:"system_epoch"`
+	RegistryLayoutDigest string `json:"registry_layout_digest"`
 }
 
 func (i ServeIdentity) Validate() error {
-	digest, err := hex.DecodeString(i.ManifestDigest)
-	if i.ClusterID == "" || i.StorageGeneration == "" || i.SystemEpoch == 0 || err != nil || len(digest) != 32 {
+	digest, err := hex.DecodeString(i.RegistryLayoutDigest)
+	if i.ClusterID == "" || i.RegistryGeneration == "" || i.SystemEpoch == 0 || err != nil || len(digest) != 32 {
 		return errors.New("session: incomplete serving identity")
 	}
 	return nil
@@ -290,7 +290,7 @@ func (h *Holder) AdmitAndDispatch(ctx context.Context, command DispatchCommand) 
 	if err := h.CheckServe(command.ServeIdentity); err != nil {
 		return DispatchReply{}, err
 	}
-	if command.ServeIdentity.StorageGeneration == "" || command.ServeIdentity.StorageGeneration != command.Binding.StorageGeneration ||
+	if command.ServeIdentity.RegistryGeneration == "" || command.ServeIdentity.RegistryGeneration != command.Binding.RegistryGeneration ||
 		command.NodeID == "" || command.NodeID != command.Binding.NodeID || command.NodeEpoch == 0 ||
 		command.NodeEpoch != command.Binding.NodeEpoch || command.DataEndpoint == "" || command.DataEndpoint != command.Binding.DataEndpoint {
 		return DispatchReply{}, errors.New("session: dispatch target does not match committed Binding intent")

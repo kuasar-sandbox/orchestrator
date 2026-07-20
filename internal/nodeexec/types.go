@@ -126,8 +126,8 @@ func DispatchCommandFromWire(wire *routesync.Command, local LocalSessionIdentity
 		},
 		Binding: clusterstate.ExecutionBindingIntent{
 			NodeID: local.NodeID, NodeEpoch: wire.NodeEpoch, DataEndpoint: local.DataEndpoint,
-			StorageGeneration: wire.StorageGeneration,
-			OpaqueBinding:     wire.Binding, BindingDigest: wire.BindingDigest,
+			RegistryGeneration: wire.RegistryGeneration,
+			OpaqueBinding:      wire.Binding, BindingDigest: wire.BindingDigest,
 		},
 	}
 	switch wire.Kind {

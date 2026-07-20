@@ -214,11 +214,11 @@ func (v *WorkerView) Route(ctx context.Context, request proxy.RouteRequest) (pro
 	}
 	if v.wake != nil {
 		v.wake(routesync.RouteWake{
-			SandboxID:         r.SandboxID,
-			NodeID:            r.NodeID,
-			NodeEpoch:         r.NodeEpoch,
-			StorageGeneration: r.StorageGeneration,
-			BindingDigest:     r.BindingDigest,
+			SandboxID:          r.SandboxID,
+			NodeID:             r.NodeID,
+			NodeEpoch:          r.NodeEpoch,
+			RegistryGeneration: r.RegistryGeneration,
+			BindingDigest:      r.BindingDigest,
 		})
 	}
 	return v.waitForRoute(ctx, request)
@@ -229,8 +229,8 @@ func routeForEntry(r routesync.RouteEntry, port int) proxy.Route {
 }
 
 func routeFenceFailure(request proxy.RouteRequest, r routesync.RouteEntry) (proxy.Kind, bool) {
-	managed := r.NodeID != "" || r.NodeEpoch != 0 || r.StorageGeneration != "" || r.BindingDigest != ""
-	return proxy.RouteFenceFailure(request, managed, r.NodeID, r.NodeEpoch, r.StorageGeneration, r.BindingDigest)
+	managed := r.NodeID != "" || r.NodeEpoch != 0 || r.RegistryGeneration != "" || r.BindingDigest != ""
+	return proxy.RouteFenceFailure(request, managed, r.NodeID, r.NodeEpoch, r.RegistryGeneration, r.BindingDigest)
 }
 
 func (v *WorkerView) ByFloatingIP(ip string) (string, bool) {
@@ -434,12 +434,12 @@ func validRouteWake(wake routesync.RouteWake) bool {
 	if wake.SandboxID == "" || len(wake.SandboxID) > maxSandboxID {
 		return false
 	}
-	hasFence := wake.NodeID != "" || wake.NodeEpoch != 0 || wake.StorageGeneration != "" || wake.BindingDigest != ""
+	hasFence := wake.NodeID != "" || wake.NodeEpoch != 0 || wake.RegistryGeneration != "" || wake.BindingDigest != ""
 	if !hasFence {
 		return true
 	}
 	return wake.NodeID != "" && len(wake.NodeID) <= maxNodeID && wake.NodeEpoch != 0 &&
-		wake.StorageGeneration != "" && len(wake.StorageGeneration) <= maxGeneration &&
+		wake.RegistryGeneration != "" && len(wake.RegistryGeneration) <= maxGeneration &&
 		wake.BindingDigest != "" && len(wake.BindingDigest) <= maxDigest
 }
 

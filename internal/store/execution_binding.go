@@ -13,7 +13,7 @@ import (
 
 // CASExecutionBinding atomically replaces one protected opaque Binding by its
 // current digest. A retry that observes the exact replacement is idempotently
-// successful. Recovery rebind may change storage generation and Binding
+// successful. Recovery rebind may change Registry History Generation and Binding
 // contents, but never the concrete object or its node identity/epoch.
 func (s *Store) CASExecutionBinding(
 	ctx context.Context,
@@ -67,7 +67,7 @@ func (s *Store) CASExecutionBinding(
 		return false, err
 	}
 	if oldOpaque == replacement {
-		if err := validateWorkflowBinding(workflow, replacement, newDigest, newBinding.StorageGeneration); err != nil {
+		if err := validateWorkflowBinding(workflow, replacement, newDigest, newBinding.RegistryGeneration); err != nil {
 			return false, err
 		}
 		if err := tx.Commit(); err != nil {
@@ -87,7 +87,7 @@ func (s *Store) CASExecutionBinding(
 		oldBinding.DemandDigest != newBinding.DemandDigest || oldBinding.DispatchSpecDigest != newBinding.DispatchSpecDigest {
 		return false, errors.New("store: replacement Binding changes immutable execution identity")
 	}
-	if err := validateWorkflowBinding(workflow, oldOpaque, oldDigest, oldBinding.StorageGeneration); err != nil {
+	if err := validateWorkflowBinding(workflow, oldOpaque, oldDigest, oldBinding.RegistryGeneration); err != nil {
 		return false, err
 	}
 	metadata[clusterstate.ObjectMetadataKey] = replacement
@@ -113,7 +113,7 @@ func (s *Store) CASExecutionBinding(
 		workflow.BindingDigest = newDigest
 		if workflow.LatestEvent != nil {
 			event := *workflow.LatestEvent
-			event.StorageGeneration = newBinding.StorageGeneration
+			event.RegistryGeneration = newBinding.RegistryGeneration
 			event.BindingDigest = newDigest
 			if err := event.Validate(); err != nil {
 				return false, fmt.Errorf("store: rebind latest execution event: %w", err)
@@ -162,7 +162,7 @@ func validateWorkflowBinding(
 	}
 	if event.ObjectKind != executionKindName(workflow.Kind) || event.ObjectID != workflow.ObjectID ||
 		event.NodeID != workflow.NodeID || event.NodeEpoch != workflow.NodeEpoch ||
-		event.StorageGeneration != generation || event.BindingDigest != digest || event.EventSeq != workflow.EventSeq {
+		event.RegistryGeneration != generation || event.BindingDigest != digest || event.EventSeq != workflow.EventSeq {
 		return fmt.Errorf("%w: node workflow event and Binding disagree", ErrNodeWorkflowConflict)
 	}
 	return nil

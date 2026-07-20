@@ -49,8 +49,8 @@ func (s *RouterState) ObserveRoute(request ReadRouteRequest, response ReadRouteR
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if request.ClusterID != s.identity.ClusterID || request.StorageGeneration != s.identity.StorageGeneration ||
-		request.SystemEpoch != s.identity.SystemEpoch || request.ManifestDigest != s.identity.ManifestDigest {
+	if request.ClusterID != s.identity.ClusterID || request.RegistryGeneration != s.identity.RegistryGeneration ||
+		request.SystemEpoch != s.identity.SystemEpoch || request.RegistryLayoutDigest != s.identity.RegistryLayoutDigest {
 		return nil
 	}
 	if response.Outcome == ReadReady {

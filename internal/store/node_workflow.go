@@ -1525,7 +1525,7 @@ func executionEventFor(
 	event := &routesync.ExecutionEvent{
 		ObjectKind: executionKindName(record.Kind), ObjectID: record.ObjectID,
 		NodeID: record.NodeID, NodeEpoch: record.NodeEpoch,
-		StorageGeneration: binding.StorageGeneration, BindingDigest: record.BindingDigest,
+		RegistryGeneration: binding.RegistryGeneration, BindingDigest: record.BindingDigest,
 		EventSeq: record.EventSeq + 1, State: update.State, DataEndpoint: record.DataEndpoint,
 		AccessToken: update.AccessToken, TrafficAccessToken: update.TrafficAccessToken,
 		TemplateRef: update.TemplateRef, SnapshotLocation: update.SnapshotLocation,

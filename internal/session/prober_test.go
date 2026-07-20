@@ -145,7 +145,7 @@ func testServeIdentity() ServeIdentity {
 
 func testServeIdentityAt(epoch uint64) ServeIdentity {
 	return ServeIdentity{
-		ClusterID: "c1", StorageGeneration: "g1", SystemEpoch: epoch,
-		ManifestDigest: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		ClusterID: "c1", RegistryGeneration: "g1", SystemEpoch: epoch,
+		RegistryLayoutDigest: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 	}
 }

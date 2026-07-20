@@ -247,7 +247,7 @@ func TestRouteSyncRoundtrip(t *testing.T) {
 	}
 
 	// A wake from the proxy reaches the source's OnWake.
-	wantWake := routesync.RouteWake{SandboxID: "s9", NodeID: "n1", NodeEpoch: 7, StorageGeneration: "g1", BindingDigest: "digest"}
+	wantWake := routesync.RouteWake{SandboxID: "s9", NodeID: "n1", NodeEpoch: 7, RegistryGeneration: "g1", BindingDigest: "digest"}
 	wakes.ch <- wantWake
 	if got := recv(t, src.woke, "wake"); got != wantWake {
 		t.Fatalf("wake = %+v", got)

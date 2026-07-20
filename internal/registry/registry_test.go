@@ -1372,7 +1372,7 @@ func TestFinalFencedReportDoesNotEnterLegacyConvergence(t *testing.T) {
 	reg := testReg(t)
 	current := &SandboxRecord{
 		Group: "/g", RouteKey: "rk", SID: "sb-rebound", State: StateReady, NodeID: "n1",
-		NodeEpoch: 8, StorageGeneration: "g2", BindingDigest: "current-binding",
+		NodeEpoch: 8, RegistryGeneration: "g2", BindingDigest: "current-binding",
 	}
 	if _, err := reg.stores.PutSandbox(ctx, current); err != nil {
 		t.Fatal(err)
@@ -1385,7 +1385,7 @@ func TestFinalFencedReportDoesNotEnterLegacyConvergence(t *testing.T) {
 
 	reg.applyRoute(ctx, "n1", &routesync.RouteEntry{
 		SandboxID: current.SID, State: routesync.StateDead, NodeID: "n1", NodeEpoch: 7,
-		StorageGeneration: "g1", BindingDigest: "old-binding", EventSeq: 12,
+		RegistryGeneration: "g1", BindingDigest: "old-binding", EventSeq: 12,
 	})
 
 	got, _, found, err := reg.stores.GetSandbox(ctx, current.Group, current.RouteKey)

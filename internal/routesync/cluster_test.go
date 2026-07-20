@@ -43,12 +43,12 @@ func TestNodeLinkCodecRoundTrip(t *testing.T) {
 		NormalizedDemand: []byte(`{"kind":"sandbox"}`), DispatchSpec: []byte(`{"template":"t1"}`),
 		DemandDigest: "demand-digest", DispatchSpecDigest: "spec-digest", ProviderPolicy: "provider-v1/policy-v1",
 		TemplateRef: "manifest://abc", KeyFingerprint: "e2b_deadbeef", NodeEpoch: 7, SessionSeq: 11,
-		StorageGeneration: "generation-1", Binding: "keb1.opaque", BindingDigest: "binding-digest",
+		RegistryGeneration: "generation-1", Binding: "keb1.opaque", BindingDigest: "binding-digest",
 	}})
 	if c.Cmd == nil || c.Cmd.Kind != CmdSandboxAdmitDispatch || c.Cmd.Group != "/c/p/a/g1" || c.Cmd.RouteKey != "u1:sess1" || c.Rev != 42 ||
 		!bytes.Equal(c.Cmd.NormalizedDemand, []byte(`{"kind":"sandbox"}`)) || !bytes.Equal(c.Cmd.DispatchSpec, []byte(`{"template":"t1"}`)) ||
 		c.Cmd.ProviderPolicy != "provider-v1/policy-v1" || c.Cmd.NodeEpoch != 7 || c.Cmd.SessionSeq != 11 ||
-		c.Cmd.StorageGeneration != "generation-1" || c.Cmd.BindingDigest != "binding-digest" {
+		c.Cmd.RegistryGeneration != "generation-1" || c.Cmd.BindingDigest != "binding-digest" {
 		t.Fatalf("command round-trip: %+v rev=%d", c.Cmd, c.Rev)
 	}
 	k := roundTrip(t, &Msg{Type: TypeCommand, Cmd: &Command{
@@ -68,7 +68,7 @@ func TestNodeLinkCodecRoundTrip(t *testing.T) {
 	r := roundTrip(t, &Msg{Type: TypeUpsert, Route: &RouteEntry{
 		SandboxID: "s1", State: StateRunning,
 		FloatingIP: "100.100.96.5", AccessToken: "tok", NodeID: "n1", NodeEpoch: 7,
-		StorageGeneration: "generation-1", BindingDigest: "binding-digest", EventSeq: 3,
+		RegistryGeneration: "generation-1", BindingDigest: "binding-digest", EventSeq: 3,
 	}})
 	if r.Route == nil || r.Route.SandboxID != "s1" || r.Route.State != StateRunning ||
 		r.Route.NodeEpoch != 7 || r.Route.BindingDigest != "binding-digest" || r.Route.EventSeq != 3 {
@@ -81,7 +81,7 @@ func TestNodeLinkCodecRoundTrip(t *testing.T) {
 	}
 
 	event := roundTrip(t, &Msg{Type: TypeBuildEvent, Build: &BuildEvent{
-		BuildID: "build-1", NodeEpoch: 7, EventSeq: 4, StorageGeneration: "generation-1",
+		BuildID: "build-1", NodeEpoch: 7, EventSeq: 4, RegistryGeneration: "generation-1",
 		BindingDigest: "binding-digest", State: "ready",
 	}})
 	if event.Build == nil || event.Build.EventSeq != 4 || event.Build.BindingDigest != "binding-digest" {
