@@ -1,12 +1,11 @@
 // Command e2b-key-ctl is a pure-derivation tool for e2b credentials. It mints e2b
-// API keys from a tenant manifest key (the 64-hex root secret), generates new
-// manifest keys, and prints fingerprints — no DB, config, or orchestrator state.
-// The minted api key is what the e2b SDK uses (E2B_API_KEY); the manifest key
-// stays with the operator and is registered via `node-ctl manifest-key add`.
+// API keys from an AuthKey, generates random 32-byte keys, and prints
+// fingerprints — no DB, config, or orchestrator state. ManifestKey is an
+// independent content-encryption root and is used only for pull-token sealing.
 //
-//	e2b-key-ctl gen-apikey  [<MANIFEST_KEY>]   # derive an e2b API key (or MANIFEST_KEY env)
-//	e2b-key-ctl gen-key                         # random 32-byte manifest key (64-hex)
-//	e2b-key-ctl fingerprint [<MANIFEST_KEY>]   # 24-hex fingerprint (matches the allowlist)
+//	e2b-key-ctl gen-apikey  [<AUTH_KEY>]       # derive an e2b API key (or AUTH_KEY env)
+//	e2b-key-ctl gen-key                         # random 32-byte key (64-hex)
+//	e2b-key-ctl fingerprint [<KEY>]            # 24-hex fingerprint
 //	e2b-key-ctl seal-pull-token [<MANIFEST_KEY>] --registry-username/-password | -token
 //	                                            # opaque registry pull token for api_headers
 //	e2b-key-ctl version
@@ -32,7 +31,7 @@ func main() {
 	}
 	switch os.Args[1] {
 	case "gen-apikey":
-		ak, err := apikey.Mint(manifestKeyArg(os.Args[2:]))
+		ak, err := apikey.Mint(keyArg(os.Args[2:], "AUTH_KEY", "AuthKey"))
 		check(err)
 		fmt.Println(ak)
 	case "gen-key":
@@ -41,7 +40,7 @@ func main() {
 		check(err)
 		fmt.Println(hex.EncodeToString(raw))
 	case "fingerprint":
-		fmt.Println(hex.EncodeToString(apikey.Fingerprint(manifestKeyArg(os.Args[2:]))))
+		fmt.Println(hex.EncodeToString(apikey.Fingerprint(keyArg(os.Args[2:], "AUTH_KEY", "key"))))
 	case "seal-pull-token":
 		check(sealPullToken(os.Args[2:]))
 	case "version", "-v", "--version":
@@ -53,9 +52,9 @@ func main() {
 
 func usage() {
 	fmt.Fprintln(os.Stderr, `usage:
-  e2b-key-ctl gen-apikey  [<MANIFEST_KEY>]   # derive an e2b API key (or MANIFEST_KEY env)
-  e2b-key-ctl gen-key                         # generate a random 32-byte manifest key (64-hex)
-  e2b-key-ctl fingerprint [<MANIFEST_KEY>]   # print the 24-hex fingerprint
+  e2b-key-ctl gen-apikey  [<AUTH_KEY>]       # derive an e2b API key (or AUTH_KEY env)
+  e2b-key-ctl gen-key                         # generate a random 32-byte key (64-hex)
+  e2b-key-ctl fingerprint [<KEY>]            # print the 24-hex fingerprint (or AUTH_KEY env)
   e2b-key-ctl seal-pull-token [<MANIFEST_KEY>] {--registry-username U --registry-password P | --registry-token T}
                                               # opaque pull token for the SDK's api_headers (X-Kuasar-Pull-Token)
   e2b-key-ctl version`)
@@ -88,19 +87,19 @@ func sealPullToken(args []string) error {
 	return nil
 }
 
-// manifestKeyArg reads the 64-hex manifest key from the first arg or MANIFEST_KEY env.
-func manifestKeyArg(args []string) []byte {
-	hexKey := os.Getenv("MANIFEST_KEY")
+// keyArg reads one canonical 32-byte hexadecimal key from an argument or env.
+func keyArg(args []string, envName, displayName string) []byte {
+	hexKey := os.Getenv(envName)
 	if len(args) > 0 {
 		hexKey = args[0]
 	}
 	if hexKey == "" {
-		fmt.Fprintln(os.Stderr, "e2b-key-ctl: provide MANIFEST_KEY as an argument or env")
+		fmt.Fprintf(os.Stderr, "e2b-key-ctl: provide %s as an argument or %s env\n", displayName, envName)
 		os.Exit(2)
 	}
 	raw, err := hex.DecodeString(hexKey)
 	if err != nil || len(raw) != 32 {
-		fmt.Fprintln(os.Stderr, "e2b-key-ctl: MANIFEST_KEY must be 64 hex chars (32 bytes)")
+		fmt.Fprintf(os.Stderr, "e2b-key-ctl: %s must be 64 hex chars (32 bytes)\n", displayName)
 		os.Exit(2)
 	}
 	return raw

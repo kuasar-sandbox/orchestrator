@@ -483,7 +483,7 @@ func (s *Service) groupForPlace(ctx context.Context, group string) (groupView, b
 	if err != nil {
 		return groupView{}, false, err
 	}
-	manifestKey, _, err := s.provider.GetKey(ctx, group)
+	manifestKey, _, err := s.provider.GetManifestKey(ctx, group)
 	if err != nil {
 		return groupView{}, false, err
 	}
@@ -682,7 +682,7 @@ func (s *Service) selectorPatchGroupsForImportPage(ctx context.Context, groups [
 		if !found {
 			continue
 		}
-		key, _, err := s.provider.GetKey(ctx, group)
+		key, _, err := s.provider.GetManifestKey(ctx, group)
 		if err != nil {
 			return nil, err
 		}

@@ -747,7 +747,7 @@ func (s *pagedFailingGroupSource) GetPlacementHint(context.Context, string) (clu
 	return clusterstate.PlacementHint{NodeSelectors: []map[string]string{{"pool": "p"}}}, true, nil
 }
 
-func (s *pagedFailingGroupSource) GetKey(context.Context, string) (clusterstate.Secret, bool, error) {
+func (s *pagedFailingGroupSource) GetManifestKey(context.Context, string) (clusterstate.Secret, bool, error) {
 	return clusterstate.Secret{Type: clusterstate.SecretInline, Value: testManifestKey}, true, nil
 }
 
@@ -775,7 +775,7 @@ func (s *countingGroupSource) GetPlacementHint(context.Context, string) (cluster
 	return clusterstate.PlacementHint{NodeSelectors: []map[string]string{{"pool": "p"}}}, true, nil
 }
 
-func (s *countingGroupSource) GetKey(context.Context, string) (clusterstate.Secret, bool, error) {
+func (s *countingGroupSource) GetManifestKey(context.Context, string) (clusterstate.Secret, bool, error) {
 	return clusterstate.Secret{Type: clusterstate.SecretInline, Value: testManifestKey}, true, nil
 }
 

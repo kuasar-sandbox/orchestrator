@@ -1,7 +1,7 @@
 package main
 
 // Shared client plumbing for the CLIs that talk to a running `node-ctl
-// serve` daemon over its local control socket (manifest-key, export-sandbox,
+// serve` daemon over its local control socket (key-lease, export-sandbox,
 // import-sandbox). These commands never read the orchestrator config file — the
 // daemon owns the store + keys; they only need the socket path.
 

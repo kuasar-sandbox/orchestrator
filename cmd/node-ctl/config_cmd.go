@@ -124,7 +124,7 @@ manifest_config: /opt/sandbox/manifest.yaml
 paths:
   run_root: /run/sandbox
   base_root: /var/lib/sandbox
-  config_socket: /run/sandbox/node-ctl.socket  # local control socket: run + task + manifest-key admin + plugin + api plane (h2c)
+  config_socket: /run/sandbox/node-ctl.socket  # local control socket: run + task + key-lease admin + plugin + api plane (h2c)
   # db_path: /var/lib/sandbox/node-ctl.db    # default = <base_root>/node-ctl.db
   # admin_pidfile: /run/sandbox/node-ctl-admin.pids  # PID allowlist for the admin plane; unset = socket 0600 perms
   # plugin_pidfile: /run/sandbox/node-ctl-plugin.pids # PID allowlist for the plugin plane (proxy/agent registration)

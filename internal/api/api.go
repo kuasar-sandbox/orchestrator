@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -35,12 +36,26 @@ var configHeaderNs = []struct{ header, metaKey string }{
 
 const builderHeader = "X-Kuasar-Sandbox-Builder"
 
-// pickInt returns a if non-zero, else b (camelCase vs snake_case e2b field aliases).
-func pickInt(a, b int) int {
-	if a != 0 {
-		return a
+// positiveAlias resolves camelCase/snake_case resource aliases. If both are
+// present they must agree; a present value must always be positive.
+func positiveAlias(name string, camel, snake *int, required bool) (int, error) {
+	if camel != nil && snake != nil && *camel != *snake {
+		return 0, fmt.Errorf("%s aliases conflict", name)
 	}
-	return b
+	value := camel
+	if value == nil {
+		value = snake
+	}
+	if value == nil {
+		if required {
+			return 0, fmt.Errorf("%s is required", name)
+		}
+		return 0, nil
+	}
+	if *value <= 0 {
+		return 0, fmt.Errorf("%s must be positive", name)
+	}
+	return *value, nil
 }
 
 // mergeConfigHeaders folds the X-Kuasar-Sandbox-<Ns> headers into meta, the header
@@ -77,9 +92,9 @@ var ErrAlreadyPaused = errors.New("already paused")
 // ErrNotFound is returned by Core methods when the sandbox id is unknown.
 var ErrNotFound = errors.New("sandbox not found")
 
-// ErrNotAllowed is returned by Create/RegisterBuild when the api key's manifest
-// key is not in the manifest_keys allowlist (=> 403).
-var ErrNotAllowed = errors.New("manifest key not allowed to create")
+// ErrNotAllowed is returned by Create/RegisterBuild when the API key does not
+// resolve to an active node key lease (=> 403).
+var ErrNotAllowed = errors.New("API key is not covered by an active node key lease")
 
 // ErrFilesUnsupported is returned by FilesUpload / TriggerBuild when a COPY
 // step is used but builder.files_storage is unconfigured (=> 501).
@@ -100,7 +115,8 @@ const MigrationTokenHeader = "X-Kuasar-Migration-Token"
 // supply: PullToken is the opaque, manifest-key-sealed token from the api_headers
 // X-Kuasar-Pull-Token (preferred); RegistryUsername/Password are the SDK's cleartext
 // from_image(username, password) (fromImageRegistry). Both empty => the tenant
-// default (manifest_keys) or anonymous applies. Resolved in Core.TriggerBuild.
+// default copied from the build's key lease or anonymous applies. Resolved in
+// Core.TriggerBuild.
 type BuildAuth struct {
 	PullToken        string
 	RegistryUsername string
@@ -114,6 +130,8 @@ type RegisterSpec struct {
 	Name     string
 	Tags     []string
 	Profile  types.Profile
+	CPUCount int
+	MemoryMB int
 	Metadata map[string]string
 }
 
@@ -124,6 +142,8 @@ type TriggerSpec struct {
 	Steps        []types.TemplateStep
 	StartCmd     string
 	ReadyCmd     string
+	CPUCount     int
+	MemoryMB     int
 	// Metadata is the trigger-time template config (kuasar-sandbox.<ns> keys from
 	// cpu/memory + X-Kuasar-Sandbox-* headers); it overrides the register-time config.
 	Metadata map[string]string
@@ -148,9 +168,9 @@ type CreateReq struct {
 }
 
 // Core is the orchestrator behaviour the API needs. Every per-resource method
-// takes the raw api key; Core resolves it to the tenant manifest key (verifying
-// the MAC against the stored, encrypted key) and treats a mismatch as not-found.
-// Create/RegisterBuild additionally require the manifest key to be allowlisted.
+// takes the raw API key; Core verifies it against the resource's encrypted
+// AuthKey and treats a mismatch as not-found. Create/RegisterBuild additionally
+// require an active node key lease.
 type Core interface {
 	Create(ctx context.Context, req CreateReq) (*types.Sandbox, error) // req.APIKey carries the key
 	Get(ctx context.Context, id, apiKey string) (*types.Sandbox, error)
@@ -374,23 +394,36 @@ func (a *API) registerTemplate(w http.ResponseWriter, r *http.Request) {
 		Name       string   `json:"name"`
 		Tags       []string `json:"tags"`
 		Profile    string   `json:"profile"`
-		CPUCount   int      `json:"cpuCount"`
-		CPUCountSn int      `json:"cpu_count"`
-		MemoryMB   int      `json:"memoryMB"`
-		MemoryMBSn int      `json:"memory_mb"`
+		CPUCount   *int     `json:"cpuCount"`
+		CPUCountSn *int     `json:"cpu_count"`
+		MemoryMB   *int     `json:"memoryMB"`
+		MemoryMBSn *int     `json:"memory_mb"`
 	}
-	_ = json.NewDecoder(r.Body).Decode(&body)
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, "bad body")
+		return
+	}
 	profile, err := requestedBuildProfile(body.Profile)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	// Template config: X-Kuasar-Sandbox-* headers, with the e2b cpu/memory folded
-	// into the resource namespace (cpu/memory win over a resource header).
+	cpu, err := positiveAlias("cpuCount", body.CPUCount, body.CPUCountSn, true)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	memory, err := positiveAlias("memoryMB", body.MemoryMB, body.MemoryMBSn, true)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	// Core overwrites the resource namespace with the immutable registration
+	// ceiling, after preserving every other node configuration header.
 	meta := mergeBuildConfigHeaders(nil, r.Header)
-	meta = sandboxcfg.SetCapacity(meta, pickInt(body.CPUCount, body.CPUCountSn), pickInt(body.MemoryMB, body.MemoryMBSn))
 	b, err := a.core.RegisterBuild(r.Context(), apiKeyFrom(r.Context()), RegisterSpec{
-		Name: body.Name, Tags: body.Tags, Profile: profile, Metadata: meta,
+		Name: body.Name, Tags: body.Tags, Profile: profile,
+		CPUCount: cpu, MemoryMB: memory, Metadata: meta,
 	})
 	if err != nil {
 		a.fail(w, err)
@@ -435,13 +468,23 @@ func (a *API) triggerBuild(w http.ResponseWriter, r *http.Request) {
 		ReadyCmdE2B  string               `json:"ready_cmd"`
 		Dockerfile   string               `json:"dockerfile"`
 		TemplateName string               `json:"template_name"`
-		CPUCount     int                  `json:"cpuCount"`
-		CPUCountSn   int                  `json:"cpu_count"`
-		MemoryMB     int                  `json:"memoryMB"`
-		MemoryMBSn   int                  `json:"memory_mb"`
+		CPUCount     *int                 `json:"cpuCount"`
+		CPUCountSn   *int                 `json:"cpu_count"`
+		MemoryMB     *int                 `json:"memoryMB"`
+		MemoryMBSn   *int                 `json:"memory_mb"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeErr(w, 400, "bad body")
+		return
+	}
+	cpu, err := positiveAlias("cpuCount", body.CPUCount, body.CPUCountSn, false)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	memory, err := positiveAlias("memoryMB", body.MemoryMB, body.MemoryMBSn, false)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	startCmd := body.StartCmd
@@ -460,16 +503,18 @@ func (a *API) triggerBuild(w http.ResponseWriter, r *http.Request) {
 		RegistryUsername: body.FromImageRegistry.Username,
 		RegistryPassword: body.FromImageRegistry.Password,
 	}
-	// Trigger-time template config overrides register: headers + e2b cpu/memory.
+	// Trigger-time node configuration is preserved. Core overwrites only the
+	// resource namespace after enforcing the registration ceiling.
 	meta := mergeBuildConfigHeaders(nil, r.Header)
-	meta = sandboxcfg.SetCapacity(meta, pickInt(body.CPUCount, body.CPUCountSn), pickInt(body.MemoryMB, body.MemoryMBSn))
-	err := a.core.TriggerBuild(r.Context(), apiKeyFrom(r.Context()),
+	err = a.core.TriggerBuild(r.Context(), apiKeyFrom(r.Context()),
 		r.PathValue("tid"), r.PathValue("bid"), TriggerSpec{
 			FromImage:    body.FromImage,
 			FromTemplate: body.FromTemplate,
 			Steps:        body.Steps,
 			StartCmd:     startCmd,
 			ReadyCmd:     readyCmd,
+			CPUCount:     cpu,
+			MemoryMB:     memory,
 			Metadata:     meta,
 		}, auth)
 	if err != nil {

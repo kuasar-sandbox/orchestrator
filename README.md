@@ -26,7 +26,7 @@ e2b 兼容沙箱平台的**节点主机**与**集群控制面**,两个生产二�
 
 | 路径 | 角色 |
 | --- | --- |
-| `cmd/node-ctl` | 节点主二进制:`serve`(daemon:控制面 + 数据面 + 可选 `resource_listen` 资源控制器 + node-link 客户端)/ `proxy`(外置数据面 worker)/ `run-sandbox`·`run-builder`(单元内启动器)/ `resource {status,list,drain,grant,reclaim}` / `config` / `manifest-key` / `export-sandbox`·`import-sandbox` / `version` |
+| `cmd/node-ctl` | 节点主二进制:`serve`(daemon:控制面 + 数据面 + 可选 `resource_listen` 资源控制器 + node-link 客户端)/ `proxy`(外置数据面 worker)/ `run-sandbox`·`run-builder`(单元内启动器)/ `resource {status,list,drain,grant,reclaim}` / `config` / `key-lease` / `export-sandbox`·`import-sandbox` / `version` |
 | `cmd/cluster-ctl` | 集群主二进制(三角色均独立进程):`registry`(shardkv 执行态 + node_link / route_link / node_list / placer_link)/ `router`(e2b 入口)/ `placer`(provider/importer + WATCH_LIST + Place)/ `config` / `version` |
 | `cmd/node-stub-ctl` | 集群 e2e 辅助二进制:一个进程模拟多个 node-link 节点,提供 admin/data API 控制重启、清空、沙箱/build 状态和故障注入,不启动 microVM |
 | `cmd/e2b-key-ctl` | 纯派生凭据工具(无 DB/config):`gen-key` / `gen-apikey` / `fingerprint` / `seal-pull-token` |
@@ -36,9 +36,9 @@ e2b 兼容沙箱平台的**节点主机**与**集群控制面**,两个生产二�
 | `internal/{registry,router,placer}` | 集群三角色:registry shardkv namespace + Reserve/Build 状态机 + node_link key cache / e2b 数据面入口与 active cache / provider/importer、WATCH_LIST、P2C 放置 |
 | `internal/api` | e2b 控制面 REST(X-API-KEY 鉴权、export/import 扩展) |
 | `internal/proxy` `internal/proxyshm` `internal/routesync` | 数据面 L7 反代(含 CONNECT 隧道)、proxy master/worker 共享路由视图(park/wake、世代清扫)、路由同步协议(注册 + bookmark) |
-| `internal/configsock` | 本机控制 socket:task(LaunchSpec/BuildSpec)/ admin(manifest-key)/ plugin(proxy 注册 + 路由流)/ api 四平面,SO_PEERCRED 鉴权 |
-| `internal/{apikey,secretbox,keys,regcreds}` | api_key 派生 MAC、manifest_key 落盘 AES-GCM、数据面 token、镜像拉取凭据 |
-| `internal/{config,clustercfg,sandboxcfg,store}` | 节点 / 集群配置加载、SANDBOX_CONFIG 渲染、节点本地 sqlite 状态(sandboxes/builds/manifest_keys) |
+| `internal/configsock` | 本机控制 socket:task(LaunchSpec/BuildSpec)/ admin(key-lease)/ plugin(proxy 注册 + 路由流)/ api 四平面,SO_PEERCRED 鉴权 |
+| `internal/{apikey,secretbox,keys,regcreds}` | AuthKey 派生 API MAC、ManifestKey 内容加密、秘密落盘 AES-GCM、数据面 token、镜像拉取凭据 |
+| `internal/{config,clustercfg,sandboxcfg,store}` | 节点 / 集群配置加载、SANDBOX_CONFIG 渲染、节点本地 sqlite 状态(sandboxes/builds/key_leases) |
 | `internal/{mmds,metrics,launcher,vswitch,util}` | MMDS 元数据(envd re-key)、Prometheus 文本、systemd D-Bus、connector-ctl vswitch 封装、内联工具 |
 | `deploy/` | 每角色配置样例(`{conductor,proxy}.example.yaml`、`{registry,router,placer}.example.yaml`)与 systemd 单元(`node-ctl.service`、`node-proxy.service`、`cluster-{registry,router,placer}.service`) |
 
@@ -57,10 +57,11 @@ make test-e2e                   # 启动真实 registry/router/placer + node-stu
 ## 快速开始
 
 ```bash
-# 租户凭据:根密钥入白名单,api key 给 SDK(独立模式;集群下密钥由 registry 租约预分发)
+# 租户凭据:AuthKey 只用于 API 鉴权,ManifestKey 只用于内容加密
+AK=$(e2b-key-ctl gen-key)
 MK=$(e2b-key-ctl gen-key)
-node-ctl manifest-key add "$MK" --label tenant-a
-export E2B_API_KEY=$(e2b-key-ctl gen-apikey "$MK")
+node-ctl key-lease put --group tenant-a --auth-key "$AK" --manifest-key "$MK" --label tenant-a
+export E2B_API_KEY=$(e2b-key-ctl gen-apikey "$AK")
 
 # 启动节点 daemon(必填仅 api.domain + encryption_key;骨架: node-ctl config conductor --template)
 # conductor.yaml 内联 resource_listen 即内置资源控制器;配 cluster.node_link 即接入集群

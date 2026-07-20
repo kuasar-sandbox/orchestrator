@@ -35,6 +35,10 @@ func (o *Orchestrator) newRegisteredBuild(ctx context.Context, apiKey string, sp
 	if !spec.Profile.Valid() {
 		return nil, fmt.Errorf("%w: unknown build profile %q", api.ErrBadRequest, spec.Profile)
 	}
+	if spec.CPUCount <= 0 || spec.MemoryMB <= 0 {
+		return nil, fmt.Errorf("%w: positive cpuCount and memoryMB are required at build registration", api.ErrBadRequest)
+	}
+	spec.Metadata = sandboxcfg.SetCapacity(spec.Metadata, spec.CPUCount, spec.MemoryMB)
 	metadata, builderOpts, err := buildcfg.Extract(spec.Metadata)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
@@ -43,11 +47,11 @@ func (o *Orchestrator) newRegisteredBuild(ctx context.Context, apiKey string, sp
 		return nil, err
 	}
 	metadata = clusterstate.WithoutSystemMetadata(metadata)
-	manifestKey, err := o.resolveAllowed(ctx, apiKey)
+	lease, err := o.resolveAllowed(ctx, apiKey)
 	if err != nil {
 		return nil, err
 	}
-	if manifestKey == "" {
+	if lease.AuthKey == "" {
 		return nil, api.ErrNotAllowed
 	}
 	bid, err := uuid.NewV7()
@@ -60,18 +64,22 @@ func (o *Orchestrator) newRegisteredBuild(ctx context.Context, apiKey string, sp
 	}
 	templateID := types.TransientPrefix + tid.String()
 	b := &types.Build{
-		BuildID:     bid.String(),
-		TemplateID:  templateID,
-		ManifestKey: manifestKey,
-		Profile:     spec.Profile,
-		Kind:        types.KindImg,
-		Status:      types.BuildRegistered,
-		FromImage:   o.imageURIFromMask(templateID, bid.String()),
-		Names:       nonEmpty(spec.Name),
-		Aliases:     append([]string{}, spec.Tags...),
-		Metadata:    metadata,
-		Builder:     builderOpts,
-		CreatedUnix: time.Now().Unix(),
+		BuildID:      bid.String(),
+		TemplateID:   templateID,
+		AuthKey:      lease.AuthKey,
+		ManifestKey:  lease.ManifestKey,
+		CPUCount:     spec.CPUCount,
+		MemoryMB:     spec.MemoryMB,
+		Profile:      spec.Profile,
+		Kind:         types.KindImg,
+		Status:       types.BuildRegistered,
+		FromImage:    o.imageURIFromMask(templateID, bid.String()),
+		Names:        nonEmpty(spec.Name),
+		Aliases:      append([]string{}, spec.Tags...),
+		Metadata:     metadata,
+		Builder:      builderOpts,
+		RegistryAuth: lease.RegistryAuth,
+		CreatedUnix:  time.Now().Unix(),
 	}
 	if err := o.st.PutBuild(ctx, b); err != nil {
 		return nil, err
@@ -99,6 +107,19 @@ func (o *Orchestrator) TriggerBuild(ctx context.Context, apiKey, tid, bid string
 	if !b.Profile.Valid() {
 		return fmt.Errorf("%w: build has unknown profile %q", api.ErrBadRequest, b.Profile)
 	}
+	if spec.CPUCount > b.CPUCount || spec.MemoryMB > b.MemoryMB {
+		return fmt.Errorf("%w: build trigger resources exceed the registered ceiling", api.ErrBadRequest)
+	}
+	effectiveCPU, effectiveMemory := b.CPUCount, b.MemoryMB
+	if spec.CPUCount > 0 {
+		effectiveCPU = spec.CPUCount
+	}
+	if spec.MemoryMB > 0 {
+		effectiveMemory = spec.MemoryMB
+	}
+	// The resource namespace is caller input. Overwrite it with bounded values
+	// while preserving every unrelated node configuration field.
+	spec.Metadata = sandboxcfg.SetCapacity(spec.Metadata, effectiveCPU, effectiveMemory)
 	if b.Profile == types.ProfileBare && (spec.StartCmd != "" || spec.ReadyCmd != "") {
 		return fmt.Errorf("%w: bare profile builds do not support startCmd or readyCmd", api.ErrBadRequest)
 	}
@@ -249,7 +270,7 @@ func (o *Orchestrator) effectiveImportReferer(b *types.Build) (configsock.BuildI
 // them as a regcreds.Creds JSON ("" = anonymous), to be stored encrypted on the build
 // row and injected as FLATTEN_REGISTRY_* at flatten time. Precedence: the per-build
 // pull token (api_headers, opaque, manifest-key-sealed) > the SDK's fromImageRegistry
-// (cleartext username/password) > the tenant default (manifest_keys) > anonymous.
+// (cleartext username/password) > the default copied from the key lease > anonymous.
 func (o *Orchestrator) resolveBuildCreds(ctx context.Context, b *types.Build, pullToken, regUser, regPass string) (string, error) {
 	clusterAuth, isCluster := o.clusterBuildCreds(b.BuildID)
 	var creds regcreds.Creds
@@ -267,11 +288,7 @@ func (o *Orchestrator) resolveBuildCreds(ctx context.Context, b *types.Build, pu
 		// not the node's stored registry_auth_enc.
 		creds = regcreds.CredsForImage(clusterAuth, b.FromImage)
 	default:
-		authJSON, err := o.st.RegistryAuthForKey(ctx, b.ManifestKey)
-		if err != nil {
-			return "", err
-		}
-		creds = regcreds.CredsForImage(authJSON, b.FromImage)
+		creds = regcreds.CredsForImage(b.RegistryAuth, b.FromImage)
 	}
 	if creds.Empty() {
 		return "", nil
@@ -300,7 +317,7 @@ func (o *Orchestrator) ListTemplates(ctx context.Context, apiKey string) ([]*typ
 	}
 	out := all[:0]
 	for _, b := range all {
-		if verifyKey(apiKey, b.ManifestKey) {
+		if verifyKey(apiKey, b.AuthKey) {
 			out = append(out, b)
 		}
 	}

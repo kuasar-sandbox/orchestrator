@@ -127,7 +127,10 @@ func TestBuildOptionsRoundTrip(t *testing.T) {
 	b := &types.Build{
 		BuildID:     "b1",
 		TemplateID:  "transient-t1",
+		AuthKey:     strings.Repeat("4", 64),
 		ManifestKey: strings.Repeat("3", 64),
+		CPUCount:    2,
+		MemoryMB:    2048,
 		Profile:     types.ProfileE2B,
 		Kind:        types.KindImg,
 		Status:      types.BuildRegistered,

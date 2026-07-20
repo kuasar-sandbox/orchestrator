@@ -1,71 +1,102 @@
 package orch
 
-// Admin plane: thin manifest-key allowlist wrappers the local control socket's
-// admin plane (internal/configsock) calls. They validate the key, compute its
-// fingerprint, and delegate to the store — so the daemon is the sole writer of the
-// manifest_keys table (the manifest-key CLI is now a socket client, not a second
-// process opening the DB).
+// The local admin plane manages complete node key leases. The daemon remains
+// the sole writer of encrypted key material; socket clients receive only
+// fingerprints.
 
 import (
 	"context"
 	"encoding/hex"
 	"fmt"
+	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/apikey"
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
+	"github.com/kuasar-sandbox/orchestrator/internal/store"
 )
 
-// AddManifestKey adds key (64-hex) to the allowlist, or refreshes it if it already
-// exists (added=false). ttlSec>0 expires it after ttlSec; <=0 = never. registryAuth
-// (a docker config.json; "" = leave) is the tenant's default registry pull creds.
-// Returns the key's 24-hex fingerprint.
-func (o *Orchestrator) AddManifestKey(ctx context.Context, key, label string, ttlSec int64, registryAuth string) (bool, string, error) {
-	fp, err := fingerprintHex(key)
+func (o *Orchestrator) PutKeyLease(
+	ctx context.Context,
+	group, authKey, manifestKey, label string,
+	ttlSec int64,
+	registryAuth string,
+) (bool, string, string, error) {
+	authFP, manifestFP, err := keyFingerprints(authKey, manifestKey)
 	if err != nil {
-		return false, "", err
+		return false, "", "", err
 	}
-	added, err := o.st.AddManifestKey(ctx, key, label, ttlSec, registryAuth)
-	return added, fp, err
+	if ttlSec < 0 {
+		return false, "", "", fmt.Errorf("key-lease: ttl must not be negative")
+	}
+	expires := int64(0)
+	if ttlSec > 0 {
+		now := time.Now().Unix()
+		if ttlSec > int64(^uint64(0)>>1)-now {
+			return false, "", "", fmt.Errorf("key-lease: ttl overflows unix time")
+		}
+		expires = now + ttlSec
+	}
+	added, err := o.st.PutKeyLease(ctx, store.KeyLease{
+		Group: group, AuthKey: authKey, ManifestKey: manifestKey,
+		RegistryAuth: registryAuth, Label: label, ExpiresUnix: expires,
+	})
+	return added, authFP, manifestFP, err
 }
 
-// RemoveManifestKey removes key from the allowlist; removed=false means it was absent.
-func (o *Orchestrator) RemoveManifestKey(ctx context.Context, key string) (bool, string, error) {
-	fp, err := fingerprintHex(key)
+func (o *Orchestrator) DropKeyLease(ctx context.Context, group, authKey, manifestKey string) (bool, string, string, error) {
+	authFP, manifestFP, err := keyFingerprints(authKey, manifestKey)
 	if err != nil {
-		return false, "", err
+		return false, "", "", err
 	}
-	n, err := o.st.RemoveManifestKey(ctx, key)
-	return n > 0, fp, err
+	removed, err := o.st.RemoveKeyLease(ctx, group, authKey, manifestKey)
+	return removed, authFP, manifestFP, err
 }
 
-// HasManifestKey reports whether key is in the allowlist.
-func (o *Orchestrator) HasManifestKey(ctx context.Context, key string) (bool, string, error) {
-	fp, err := fingerprintHex(key)
+func (o *Orchestrator) HasKeyLease(ctx context.Context, group, authKey, manifestKey string) (bool, string, string, error) {
+	authFP, manifestFP, err := keyFingerprints(authKey, manifestKey)
 	if err != nil {
-		return false, "", err
+		return false, "", "", err
 	}
-	ok, err := o.st.HasManifestKey(ctx, key)
-	return ok, fp, err
+	present, err := o.st.HasKeyLease(ctx, group, authKey, manifestKey)
+	return present, authFP, manifestFP, err
 }
 
-// ListManifestKeys returns the allowlist as fingerprint-only entries.
-func (o *Orchestrator) ListManifestKeys(ctx context.Context) ([]configsock.AdminKeyInfo, error) {
-	infos, err := o.st.ListManifestKeys(ctx)
+func (o *Orchestrator) ListKeyLeases(ctx context.Context) ([]configsock.AdminKeyLeaseInfo, error) {
+	infos, err := o.st.ListKeyLeases(ctx)
 	if err != nil {
 		return nil, err
 	}
-	out := make([]configsock.AdminKeyInfo, 0, len(infos))
-	for _, mi := range infos {
-		out = append(out, configsock.AdminKeyInfo{Fingerprint: mi.Hash, Label: mi.Label, CreatedUnix: mi.CreatedUnix, ExpiresUnix: mi.ExpiresUnix})
+	out := make([]configsock.AdminKeyLeaseInfo, 0, len(infos))
+	for _, info := range infos {
+		out = append(out, configsock.AdminKeyLeaseInfo{
+			Group:                  info.Group,
+			AuthKeyFingerprint:     info.AuthKeyFingerprint,
+			ManifestKeyFingerprint: info.ManifestKeyFingerprint,
+			Label:                  info.Label, CreatedUnix: info.CreatedUnix, ExpiresUnix: info.ExpiresUnix,
+		})
 	}
 	return out, nil
 }
 
-// fingerprintHex validates a 64-hex manifest key and returns its 24-hex fingerprint.
-func fingerprintHex(manifestKeyHex string) (string, error) {
-	raw, err := hex.DecodeString(manifestKeyHex)
-	if err != nil || len(raw) != 32 {
-		return "", fmt.Errorf("manifest-key: %q is not a 64-hex (32-byte) key", manifestKeyHex)
+func keyFingerprints(authKey, manifestKey string) (string, string, error) {
+	authFP, err := keyFingerprint("AuthKey", authKey)
+	if err != nil {
+		return "", "", err
+	}
+	manifestFP, err := keyFingerprint("ManifestKey", manifestKey)
+	if err != nil {
+		return "", "", err
+	}
+	if authKey == manifestKey {
+		return "", "", fmt.Errorf("key-lease: AuthKey and ManifestKey must be different")
+	}
+	return authFP, manifestFP, nil
+}
+
+func keyFingerprint(name, keyHex string) (string, error) {
+	raw, err := hex.DecodeString(keyHex)
+	if err != nil || len(raw) != 32 || hex.EncodeToString(raw) != keyHex {
+		return "", fmt.Errorf("key-lease: %s must be canonical 64-character lowercase hex", name)
 	}
 	return hex.EncodeToString(apikey.Fingerprint(raw)), nil
 }

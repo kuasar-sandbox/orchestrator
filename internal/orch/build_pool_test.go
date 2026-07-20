@@ -14,7 +14,10 @@ func TestClaimWaitingBuildSurvivesRunIDPersistence(t *testing.T) {
 	b := &types.Build{
 		BuildID:     "build-admission-test",
 		TemplateID:  "transient-build-admission-test",
+		AuthKey:     strings.Repeat("b", 64),
 		ManifestKey: strings.Repeat("a", 64),
+		CPUCount:    2,
+		MemoryMB:    2048,
 		Profile:     types.ProfileE2B,
 		Kind:        types.KindImg,
 		Status:      types.BuildWaiting,

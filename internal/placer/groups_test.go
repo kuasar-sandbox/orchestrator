@@ -21,9 +21,10 @@ const testManifestKey = "00112233445566778899aabbccddeeff00112233445566778899aab
 func TestFileGroupSourceProviderMethods(t *testing.T) {
 	src := testGroupSource(t, clusterstate.SandboxGroupRecord{
 		Group: "/g", ManifestKey: clusterstate.Secret{Type: clusterstate.SecretInline, Value: testManifestKey},
-		AuthKey:       clusterstate.Secret{Type: clusterstate.SecretInline, Value: testAuthKey},
-		TemplateRef:   "tmpl",
-		NodeSelectors: []map[string]string{{"pool": "p"}},
+		AuthKey:               clusterstate.Secret{Type: clusterstate.SecretInline, Value: testAuthKey},
+		TemplateRef:           "tmpl",
+		AllowTemplateOverride: true,
+		NodeSelectors:         []map[string]string{{"pool": "p"}},
 	})
 
 	ctx := context.Background()
@@ -31,14 +32,14 @@ func TestFileGroupSourceProviderMethods(t *testing.T) {
 	if err != nil || !found {
 		t.Fatalf("Get found=%v err=%v", found, err)
 	}
-	if g.TemplateRef != "tmpl" {
+	if g.TemplateRef != "tmpl" || !g.AllowTemplateOverride {
 		t.Fatalf("group=%+v", g)
 	}
 	hint, found, err := src.GetPlacementHint(ctx, "/g")
 	if err != nil || !found || len(hint.NodeSelectors) != 1 || hint.NodeSelectors[0]["pool"] != "p" {
 		t.Fatalf("hint=%+v found=%v err=%v", hint, found, err)
 	}
-	key, found, err := src.GetKey(ctx, "/g")
+	key, found, err := src.GetManifestKey(ctx, "/g")
 	if err != nil || !found || key.Value != testManifestKey {
 		t.Fatalf("key=%+v found=%v err=%v", key, found, err)
 	}
@@ -62,7 +63,7 @@ func TestFileGroupSourceAcceptsSecretShorthand(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	key, found, err := src.GetKey(context.Background(), "/g")
+	key, found, err := src.GetManifestKey(context.Background(), "/g")
 	if err != nil || !found || key.Type != clusterstate.SecretInline || key.Value != testManifestKey {
 		t.Fatalf("key shorthand=%+v found=%v err=%v", key, found, err)
 	}

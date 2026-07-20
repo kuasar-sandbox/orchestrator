@@ -61,6 +61,7 @@ func TestReconcileCleansOrphanPoolRunners(t *testing.T) {
 		State: types.StateRunning, RunID: knownRun,
 		RunDir:      filepath.Join(cfg.Paths.RunRoot, "sandbox-1"),
 		BaseDir:     filepath.Join(cfg.Paths.BaseRoot, "sandbox-1"),
+		AuthKey:     strings.Repeat("c", 64),
 		ManifestKey: strings.Repeat("a", 64), CreatedUnix: 1,
 	}
 	if err := st.Put(context.Background(), sb); err != nil {

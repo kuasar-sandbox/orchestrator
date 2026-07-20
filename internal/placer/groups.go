@@ -77,7 +77,7 @@ func (emptyGroupProvider) GetPlacementHint(context.Context, string) (clusterstat
 	return clusterstate.PlacementHint{}, false, nil
 }
 
-func (emptyGroupProvider) GetKey(context.Context, string) (clusterstate.Secret, bool, error) {
+func (emptyGroupProvider) GetManifestKey(context.Context, string) (clusterstate.Secret, bool, error) {
 	return clusterstate.Secret{}, false, nil
 }
 
@@ -129,11 +129,11 @@ func (m multiGroupProvider) GetPlacementHint(ctx context.Context, group string) 
 	return out, foundOne != "", nil
 }
 
-func (m multiGroupProvider) GetKey(ctx context.Context, group string) (clusterstate.Secret, bool, error) {
+func (m multiGroupProvider) GetManifestKey(ctx context.Context, group string) (clusterstate.Secret, bool, error) {
 	var out clusterstate.Secret
 	foundOne := ""
 	for _, source := range m.sources {
-		key, found, err := source.GetKey(ctx, group)
+		key, found, err := source.GetManifestKey(ctx, group)
 		if err != nil {
 			return clusterstate.Secret{}, false, err
 		}
@@ -194,7 +194,7 @@ func (s *fileGroupSource) GetPlacementHint(ctx context.Context, group string) (c
 	return clusterstate.PlacementHint{NodeSelectors: cloneSelectors(rec.NodeSelectors), ShuffleLabels: cloneStringMap(rec.ShuffleLabels)}, true, nil
 }
 
-func (s *fileGroupSource) GetKey(ctx context.Context, group string) (clusterstate.Secret, bool, error) {
+func (s *fileGroupSource) GetManifestKey(ctx context.Context, group string) (clusterstate.Secret, bool, error) {
 	rec, found, err := s.find(ctx, group)
 	if err != nil || !found {
 		return clusterstate.Secret{}, false, err
@@ -322,13 +322,14 @@ func parseGroupCursor(cursor string) (int, error) {
 
 func groupRecordToGroup(rec clusterstate.SandboxGroupRecord) clusterstate.SandboxGroup {
 	return clusterstate.SandboxGroup{
-		Group:        rec.Group,
-		Config:       cloneStringMap(rec.Config),
-		ImageRepo:    rec.ImageRepo,
-		RegistryAuth: rec.RegistryAuth,
-		TemplateRef:  rec.TemplateRef,
-		TargetPort:   rec.TargetPort,
-		Metadata:     cloneStringMap(rec.Metadata),
+		Group:                 rec.Group,
+		Config:                cloneStringMap(rec.Config),
+		ImageRepo:             rec.ImageRepo,
+		RegistryAuth:          rec.RegistryAuth,
+		TemplateRef:           rec.TemplateRef,
+		AllowTemplateOverride: rec.AllowTemplateOverride,
+		TargetPort:            rec.TargetPort,
+		Metadata:              cloneStringMap(rec.Metadata),
 	}
 }
 

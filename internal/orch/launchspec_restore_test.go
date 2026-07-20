@@ -26,6 +26,7 @@ func TestSandboxLaunchSpecRestoreFileRefsTrust(t *testing.T) {
 		State:       types.StateRunning,
 		RunDir:      "/tmp/run/" + sid,
 		BaseDir:     "/tmp/base/" + sid,
+		AuthKey:     strings.Repeat("c", 64),
 		ManifestKey: strings.Repeat("a", 64),
 	}
 	if err := o.st.Put(context.Background(), sb); err != nil {
@@ -60,6 +61,7 @@ func TestSandboxLaunchSpecRestoreFileRefsTrustDoesNotAffectColdBoot(t *testing.T
 		State:       types.StateRunning,
 		RunDir:      "/tmp/run/" + sid,
 		BaseDir:     "/tmp/base/" + sid,
+		AuthKey:     strings.Repeat("c", 64),
 		ManifestKey: strings.Repeat("a", 64),
 	}
 	if err := o.st.Put(context.Background(), sb); err != nil {

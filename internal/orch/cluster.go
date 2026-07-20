@@ -13,8 +13,20 @@ import (
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/keys"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
+	"github.com/kuasar-sandbox/orchestrator/internal/store"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
+
+// NodeKeyMaterialResolver resolves provider references on the node side of the
+// authenticated node-link. Inline delivery does not use this interface.
+type NodeKeyMaterialResolver interface {
+	ResolveKey(ctx context.Context, ref string) (string, error)
+	ResolveRegistryAuth(ctx context.Context, ref string) (string, error)
+}
+
+func (o *Orchestrator) SetNodeKeyMaterialResolver(resolver NodeKeyMaterialResolver) {
+	o.keyResolver = resolver
+}
 
 // This file makes the orchestrator the node side of the cluster node-link
 // (nodelink.Node): it executes the registry's lifecycle commands and reports the
@@ -65,9 +77,16 @@ func (o *Orchestrator) HandleCommand(ctx context.Context, cmd *routesync.Command
 		routesync.CmdRebindExecution, routesync.CmdFinalizeWorkflow:
 		return reject(cmd, errors.New("final cluster workflow executor is dormant until atomic cutover"))
 	case routesync.CmdKeyPut:
-		// Key distribution (cluster.md): refresh the manifest-key allowlist
-		// lease so create/build can resolve it by fingerprint. The registry sends
-		// this from node_link heartbeat maintenance, not on the Place path.
+		if cmd.KeyLease != nil {
+			ref, err := o.putClusterKeyLease(ctx, *cmd.KeyLease)
+			if err != nil {
+				return reject(cmd, err)
+			}
+			ack := accept(cmd)
+			ack.KeyLeaseRef = &ref
+			return ack
+		}
+		// Pre-cutover manifest-only transport. Phase 5 deletes this branch.
 		if cmd.ManifestKeyType == "ref" || cmd.ManifestKeyRef != "" {
 			return reject(cmd, fmt.Errorf("manifest_key ref delivery is not configured"))
 		}
@@ -84,6 +103,19 @@ func (o *Orchestrator) HandleCommand(ctx context.Context, cmd *routesync.Command
 		}
 		return accept(cmd)
 	case routesync.CmdKeyDrop:
+		if cmd.KeyLeaseRef != nil {
+			if err := cmd.KeyLeaseRef.Validate(); err != nil {
+				return reject(cmd, err)
+			}
+			if _, err := o.st.DropKeyLeaseRef(ctx, cmd.KeyLeaseRef.Group, cmd.KeyLeaseRef.AuthKeyFingerprint, cmd.KeyLeaseRef.ManifestKeyFingerprint); err != nil {
+				return reject(cmd, err)
+			}
+			ack := accept(cmd)
+			ref := *cmd.KeyLeaseRef
+			ack.KeyLeaseRef = &ref
+			return ack
+		}
+		// Pre-cutover manifest-only transport. Phase 5 deletes this branch.
 		if err := o.dropClusterKey(ctx, cmd.KeyFingerprint); err != nil {
 			return reject(cmd, err)
 		}
@@ -198,7 +230,10 @@ func (o *Orchestrator) registerClusterBuild(ctx context.Context, cmd *routesync.
 	b := &types.Build{
 		BuildID:     cmd.BuildID,
 		TemplateID:  cmd.TemplateRef,
+		AuthKey:     manifestKey, // pre-cutover path used one root for both domains
 		ManifestKey: manifestKey,
+		CPUCount:    max(1, o.cfg.Builder.VCPU),
+		MemoryMB:    max(1, o.cfg.Builder.MemoryMiB()),
 		Profile:     profile,
 		Kind:        types.KindImg,
 		Status:      types.BuildRegistered,
@@ -337,6 +372,80 @@ func accept(cmd *routesync.Command) *routesync.CmdAck {
 	return &routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted}
 }
 
+func (o *Orchestrator) putClusterKeyLease(ctx context.Context, wire routesync.NodeKeyLeaseV1) (routesync.NodeKeyLeaseRefV1, error) {
+	if err := wire.Validate(); err != nil {
+		return routesync.NodeKeyLeaseRefV1{}, err
+	}
+	if wire.ExpiresUnix <= time.Now().Unix() {
+		return routesync.NodeKeyLeaseRefV1{}, errors.New("cluster: key lease is already expired")
+	}
+	authKey, err := o.resolveNodeKeyMaterial(ctx, wire.AuthKey)
+	if err != nil {
+		return routesync.NodeKeyLeaseRefV1{}, fmt.Errorf("cluster: resolve AuthKey: %w", err)
+	}
+	manifestKey, err := o.resolveNodeKeyMaterial(ctx, wire.ManifestKey)
+	if err != nil {
+		return routesync.NodeKeyLeaseRefV1{}, fmt.Errorf("cluster: resolve ManifestKey: %w", err)
+	}
+	registryAuth, err := o.resolveNodeRegistryAuth(ctx, wire.RegistryAuth)
+	if err != nil {
+		return routesync.NodeKeyLeaseRefV1{}, fmt.Errorf("cluster: resolve registry auth: %w", err)
+	}
+	if _, err := o.st.PutKeyLease(ctx, store.KeyLease{
+		Group: wire.Group, AuthKey: authKey, ManifestKey: manifestKey,
+		RegistryAuth: registryAuth, Label: "cluster", ExpiresUnix: wire.ExpiresUnix,
+	}); err != nil {
+		return routesync.NodeKeyLeaseRefV1{}, err
+	}
+	ref := routesync.NodeKeyLeaseRefV1{
+		Version: routesync.NodeKeyLeaseVersionV1, Group: wire.Group,
+		AuthKeyFingerprint:     wire.AuthKey.Fingerprint,
+		ManifestKeyFingerprint: wire.ManifestKey.Fingerprint,
+	}
+	return ref, ref.Validate()
+}
+
+func (o *Orchestrator) resolveNodeKeyMaterial(ctx context.Context, material routesync.NodeKeyMaterialV1) (string, error) {
+	switch material.Type {
+	case routesync.KeyMaterialInline:
+		return material.Value, nil
+	case routesync.KeyMaterialRef:
+		if o.keyResolver == nil {
+			return "", errors.New("provider key reference resolver is not configured")
+		}
+		value, err := o.keyResolver.ResolveKey(ctx, material.Ref)
+		if err != nil {
+			return "", err
+		}
+		fingerprint, err := keyFingerprint("resolved key", value)
+		if err != nil {
+			return "", err
+		}
+		if fingerprint != material.Fingerprint {
+			return "", errors.New("resolved key fingerprint mismatch")
+		}
+		return value, nil
+	default:
+		return "", errors.New("unsupported key material type")
+	}
+}
+
+func (o *Orchestrator) resolveNodeRegistryAuth(ctx context.Context, auth routesync.NodeRegistryAuthV1) (string, error) {
+	switch auth.Type {
+	case "":
+		return "", nil
+	case routesync.KeyMaterialInline:
+		return auth.Value, nil
+	case routesync.KeyMaterialRef:
+		if o.keyResolver == nil {
+			return "", errors.New("provider registry auth resolver is not configured")
+		}
+		return o.keyResolver.ResolveRegistryAuth(ctx, auth.Ref)
+	default:
+		return "", errors.New("unsupported registry auth material type")
+	}
+}
+
 func reject(cmd *routesync.Command, err error) *routesync.CmdAck {
 	return &routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckRejected, Reason: err.Error()}
 }
@@ -398,6 +507,7 @@ func (o *Orchestrator) bootCluster(ctx context.Context, cmd *routesync.Command, 
 		State:              types.StateRunning,
 		RunDir:             o.cfg.Paths.RunRoot + "/" + cmd.SID,
 		BaseDir:            o.cfg.Paths.BaseRoot + "/" + cmd.SID,
+		AuthKey:            manifestKey, // pre-cutover path used one root for both domains
 		ManifestKey:        manifestKey,
 		EnvdAccessToken:    envdTok,
 		TrafficAccessToken: trafTok,
@@ -564,8 +674,22 @@ func (o *Orchestrator) resolveByFingerprint(ctx context.Context, fp string) (str
 	return candidates[0], nil
 }
 
+func (o *Orchestrator) resolveByFingerprints(ctx context.Context, group, authFP, manifestFP string) (store.KeyLease, error) {
+	if group == "" || authFP == "" || manifestFP == "" {
+		return store.KeyLease{}, errors.New("cluster: group and both key fingerprints are required")
+	}
+	lease, found, err := o.st.KeyLeaseByFingerprints(ctx, group, authFP, manifestFP)
+	if err != nil {
+		return store.KeyLease{}, err
+	}
+	if !found {
+		return store.KeyLease{}, fmt.Errorf("cluster: exact node key lease is absent or expired for group %q", group)
+	}
+	return lease, nil
+}
+
 // connectCluster resumes a node-local PAUSED sandbox by sid, reusing the
-// api-key-gated Connect with a key derived from the sandbox's own manifest key.
+// API-key-gated Connect with a key derived from the sandbox's own AuthKey.
 func (o *Orchestrator) connectCluster(ctx context.Context, sid string) error {
 	apiKey, err := o.deriveSandboxAPIKey(ctx, sid)
 	if err != nil {
@@ -585,7 +709,7 @@ func (o *Orchestrator) deleteCluster(ctx context.Context, sid string) error {
 	return err
 }
 
-// deriveSandboxAPIKey mints the api key for a sandbox's own manifest key so the
+// deriveSandboxAPIKey mints the API key for a sandbox's own AuthKey so the
 // cluster command can reuse the api-key-gated Connect/Kill (the node already
 // trusts the registry's command; this just satisfies the local auth path).
 func (o *Orchestrator) deriveSandboxAPIKey(ctx context.Context, sid string) (string, error) {
@@ -596,7 +720,7 @@ func (o *Orchestrator) deriveSandboxAPIKey(ctx context.Context, sid string) (str
 	if sb == nil {
 		return "", fmt.Errorf("cluster: sandbox %s not found", sid)
 	}
-	raw, err := hex.DecodeString(sb.ManifestKey)
+	raw, err := hex.DecodeString(sb.AuthKey)
 	if err != nil {
 		return "", err
 	}

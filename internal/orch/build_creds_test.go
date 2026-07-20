@@ -38,7 +38,7 @@ func testOrchCfgAt(t *testing.T, cfg *config.Config, dbPath string) *Orchestrato
 }
 
 // TestResolveBuildCreds verifies the precedence: pull token > fromImageRegistry
-// (cleartext) > tenant default (manifest_keys) > anonymous.
+// (cleartext) > default copied from the key lease > anonymous.
 func TestResolveBuildCreds(t *testing.T) {
 	o := testOrch(t)
 	ctx := context.Background()
@@ -59,11 +59,9 @@ func TestResolveBuildCreds(t *testing.T) {
 	if js, err := o.resolveBuildCreds(ctx, b, "", "fu", "fp"); err != nil || user(js) != "fu" {
 		t.Fatalf("fromImageRegistry: %q %v", js, err)
 	}
-	// tenant default (stored on the manifest key) when nothing per-build is given.
+	// Key-lease default copied onto the Build when nothing per-build is given.
 	auth, _ := regcreds.AssembleDockerAuth(regcreds.Creds{Username: "tu", Password: "tp"})
-	if _, err := o.st.AddManifestKey(ctx, mk, "", 0, auth); err != nil {
-		t.Fatal(err)
-	}
+	b.RegistryAuth = auth
 	if js, err := o.resolveBuildCreds(ctx, b, "", "", ""); err != nil || user(js) != "tu" {
 		t.Fatalf("tenant default: %q %v", js, err)
 	}
