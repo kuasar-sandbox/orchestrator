@@ -53,6 +53,7 @@ func dmCryptInDeviceGraph(root, device string, visited map[string]struct{}) (boo
 		return false, errors.New("backing-device graph exceeds safety bound")
 	}
 	visited[device] = struct{}{}
+	defer delete(visited, device)
 	devicePath := filepath.Join(root, "dev", "block", device)
 	if raw, err := os.ReadFile(filepath.Join(devicePath, "dm", "uuid")); err == nil {
 		if strings.HasPrefix(strings.ToUpper(strings.TrimSpace(string(raw))), "CRYPT-") {
@@ -68,6 +69,9 @@ func dmCryptInDeviceGraph(root, device string, visited map[string]struct{}) (boo
 	if err != nil {
 		return false, err
 	}
+	if len(slaves) == 0 {
+		return false, nil
+	}
 	for _, slave := range slaves {
 		raw, err := os.ReadFile(filepath.Join(devicePath, "slaves", slave.Name(), "dev"))
 		if err != nil {
@@ -77,11 +81,11 @@ func dmCryptInDeviceGraph(root, device string, visited map[string]struct{}) (boo
 		if err != nil {
 			return false, err
 		}
-		if encrypted {
-			return true, nil
+		if !encrypted {
+			return false, nil
 		}
 	}
-	return false, nil
+	return true, nil
 }
 
 func validateDeviceNumber(value string) error {

@@ -493,7 +493,6 @@ func ApplySystemCommand(state SystemState, index uint64, command SystemCommand) 
 		}
 		if command.RecoveryAdvance.To == RecoveryClosed {
 			next.Recovery = nil
-			next.SystemEpoch++
 		} else {
 			recovery := *state.Recovery
 			recovery.Phase = command.RecoveryAdvance.To

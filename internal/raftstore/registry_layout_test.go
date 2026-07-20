@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 )
 
@@ -232,6 +233,30 @@ func TestRegistryLayoutGuardFreezesGenerationParameters(t *testing.T) {
 	}
 }
 
+func TestRegistryLayoutGuardRejectsRetainedReplicaEndpointChange(t *testing.T) {
+	first := testRegistryLayout(2, "generation-1")
+	firstDigest, err := first.Digest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	accepted, err := FirstAcceptedRegistryLayout(first, firstDigest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	next := cloneRegistryLayout(first)
+	next.RegistryLayoutVersion = 2
+	next.PreviousRegistryLayoutVersion = 1
+	next.PreviousRegistryLayoutDigest = firstDigest
+	next.Members[0].RaftEndpoint = "registry-a-new:63001"
+	nextDigest, err := next.Digest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := accepted.Accept(next, nextDigest); err == nil {
+		t.Fatal("retained Raft replica changed endpoint")
+	}
+}
+
 func TestRegistryLayoutGuardBindsSuccessorToPredecessorPermitLifetime(t *testing.T) {
 	first := testRegistryLayout(4, "generation-1")
 	firstDigest, _ := first.Digest()
@@ -312,7 +337,7 @@ func TestRegistryLayoutGuardPersistsWithRestrictedMode(t *testing.T) {
 		t.Fatal(err)
 	}
 	loaded, err := guard.Load()
-	if err != nil || loaded == nil || *loaded != accepted {
+	if err != nil || loaded == nil || !reflect.DeepEqual(*loaded, accepted) {
 		t.Fatalf("loaded guard = %+v, %v", loaded, err)
 	}
 	info, err := os.Stat(path)

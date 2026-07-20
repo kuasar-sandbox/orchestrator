@@ -317,6 +317,7 @@ type RouteTombstoneState struct {
 	NodeEpoch          uint64                      `json:"node_epoch,omitempty"`
 	RegistryGeneration string                      `json:"registry_generation,omitempty"`
 	BindingDigest      string                      `json:"binding_digest,omitempty"`
+	FenceCompacted     bool                        `json:"fence_compacted,omitempty"`
 	LastEventSeq       uint64                      `json:"last_event_seq,omitempty"`
 	Proof              TerminalProof               `json:"proof,omitempty"`
 	TerminalReason     string                      `json:"terminal_reason,omitempty"`
@@ -327,7 +328,7 @@ type RouteTombstoneState struct {
 func (s RouteTombstoneState) Validate() error {
 	if s.PlacementFailure != nil {
 		if s.SandboxID != "" || s.NodeID != "" || s.NodeEpoch != 0 || s.LastEventSeq != 0 ||
-			s.RegistryGeneration != "" || s.BindingDigest != "" || s.TerminalReason != "" ||
+			s.RegistryGeneration != "" || s.BindingDigest != "" || s.FenceCompacted || s.TerminalReason != "" ||
 			s.Proof != (TerminalProof{}) || s.FailureRevision != (Revision{}) {
 			return errors.New("cluster: placement-failure TOMBSTONE cannot contain an execution proof")
 		}

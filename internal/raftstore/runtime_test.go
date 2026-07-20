@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"errors"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -337,6 +338,95 @@ func TestCommittedNodeDeletedEventDurablyFencesLocalReplica(t *testing.T) {
 	}
 }
 
+func TestRemovalPersistenceFailureImmediatelyFailsClosed(t *testing.T) {
+	fixture := newRuntimeFixture(t)
+	runtime, err := fixture.open(t, newFakeNodeHost(), RuntimeOpenOptions{
+		Mode: RuntimeBootstrap, BootstrapSecret: fixture.secret,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.Close()
+	blockedParent := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(blockedParent, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runtime.enrollmentStore.Path = filepath.Join(blockedParent, "enrollment.json")
+	runtime.systemEvents.NodeDeleted(raftio.NodeInfo{ShardID: SystemRaftShardID, ReplicaID: 1})
+	if _, err := runtime.ReadSystemLocal(); err == nil {
+		t.Fatal("runtime served after failing to persist its removal fence")
+	}
+	if _, err := runtime.proposeSystem(context.Background(), SystemCommand{Type: SystemRefreshPermit}); err == nil {
+		t.Fatal("runtime mutated after failing to persist its removal fence")
+	}
+}
+
+func TestRuntimeRejectsSharedGuardAndEnrollmentFile(t *testing.T) {
+	fixture := newRuntimeFixture(t)
+	fixture.config.EnrollmentPath = fixture.config.RegistryLayoutGuardPath
+	if _, err := fixture.open(t, newFakeNodeHost(), RuntimeOpenOptions{
+		Mode: RuntimeBootstrap, BootstrapSecret: fixture.secret,
+	}); err == nil {
+		t.Fatal("shared registryLayout guard and enrollment path was accepted")
+	}
+}
+
+func TestRemovedMemberRetainsTargetLayoutToCoordinateFullReplacement(t *testing.T) {
+	fixture := newRuntimeFixture(t)
+	host := newFakeNodeHost()
+	runtime, err := fixture.open(t, host, RuntimeOpenOptions{
+		Mode: RuntimeBootstrap, BootstrapSecret: fixture.secret,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.StartSystemReplica(); err != nil {
+		t.Fatal(err)
+	}
+	runtime.Close()
+
+	previous := fixture.signed.RegistryLayout
+	previousDigest, _ := previous.Digest()
+	next := cloneRegistryLayout(previous)
+	next.RegistryLayoutVersion = 2
+	next.PreviousRegistryLayoutVersion = 1
+	next.PreviousRegistryLayoutDigest = previousDigest
+	next.Members = []RegistryMember{
+		{MemberID: "registry-d", InternalEndpoint: "https://registry-d:9443", RaftEndpoint: "registry-d:63001"},
+		{MemberID: "registry-e", InternalEndpoint: "https://registry-e:9443", RaftEndpoint: "registry-e:63001"},
+		{MemberID: "registry-f", InternalEndpoint: "https://registry-f:9443", RaftEndpoint: "registry-f:63001"},
+	}
+	next.SystemReplicas = []ReplicaPlacement{{MemberID: "registry-d", ReplicaID: 11}, {MemberID: "registry-e", ReplicaID: 12}, {MemberID: "registry-f", ReplicaID: 13}}
+	for index := range next.DataShards {
+		next.DataShards[index].Replicas = append([]ReplicaPlacement(nil), next.SystemReplicas...)
+	}
+	signedNext, err := SignRegistryLayout(next, "root-1", fixture.key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := openRuntime(
+		fixture.config, []SignedRegistryLayout{fixture.signed, signedNext}, fixture.keyring,
+		RuntimeOpenOptions{Mode: RuntimeRestart},
+		func(dbconfig.NodeHostConfig) (raftNodeHost, error) { return host, nil },
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restarted.Close()
+	nextDigest, _ := next.Digest()
+	if restarted.registryLayoutDigest != nextDigest || restarted.member.MemberID != "registry-a" ||
+		restarted.startupRegistryLayout.RegistryLayoutVersion != 1 {
+		t.Fatalf("target-aware removed-member runtime = target %s member %s startup %d",
+			restarted.registryLayoutDigest, restarted.member.MemberID, restarted.startupRegistryLayout.RegistryLayoutVersion)
+	}
+	active, _ := applySystem(t, SystemState{}, 1, SystemCommand{
+		Type: SystemBootstrap, RegistryLayout: &previous, Digest: previousDigest,
+	})
+	if err := restarted.authorizeRegistryLayoutState(active); err != nil {
+		t.Fatalf("removed member cannot coordinate the verified target transition: %v", err)
+	}
+}
+
 func TestRuntimeKeepsEnrolledReplicaUntilLocalRemovalIsDurable(t *testing.T) {
 	registryLayout := transitionRegistryLayout(t)
 	digest, err := registryLayout.Digest()
@@ -587,13 +677,14 @@ func TestRemovedMemberRestartsFromActiveArtifactWithoutGuardRollback(t *testing.
 		t.Fatal(err)
 	}
 	defer restarted.Close()
-	if restarted.registryLayoutDigest != firstDigest || restarted.member.MemberID != "registry-c" {
-		t.Fatalf("removed member selected wrong runtime registryLayout: digest=%s member=%s",
-			restarted.registryLayoutDigest, restarted.member.MemberID)
-	}
 	nextDigest, err := next.Digest()
 	if err != nil {
 		t.Fatal(err)
+	}
+	if restarted.registryLayoutDigest != nextDigest || restarted.member.MemberID != "registry-c" ||
+		restarted.startupRegistryLayout.RegistryLayoutVersion != 1 {
+		t.Fatalf("removed member selected wrong runtime registryLayout: digest=%s member=%s",
+			restarted.registryLayoutDigest, restarted.member.MemberID)
 	}
 	accepted, err := (RegistryLayoutGuard{Path: fixture.config.RegistryLayoutGuardPath}).Load()
 	if err != nil || accepted == nil || accepted.RegistryLayoutDigest != nextDigest {

@@ -122,6 +122,12 @@ func TestRuntimeCompactsFenceOnlyAfterRetentionAndEveryReplicaProof(t *testing.T
 			ShardID: raftShardID, ReplicaID: 1, StartPlan: ReplicaInitial,
 			LocalState: ReplicaActive,
 		}}},
+		outboxAckVerifier: FenceOutboxAckVerifierFunc(func(_ context.Context, request FenceOutboxAckRequest) (FenceOutboxAckEvidence, error) {
+			if request.SandboxID != "sandbox-1" || request.FinalOutboxWatermark != 2 {
+				t.Fatalf("outbox ACK request = %+v", request)
+			}
+			return FenceOutboxAckEvidence{AckedWatermark: 2, ProofDigest: digestFor("outbox-ack")}, nil
+		}),
 		transitionClient: ReplicaTransitionClientFuncs{
 			Applied: func(_ context.Context, request ReplicaAppliedRequest) (ReplicaAppliedProof, error) {
 				remoteProofs.Add(1)
@@ -134,7 +140,6 @@ func TestRuntimeCompactsFenceOnlyAfterRetentionAndEveryReplicaProof(t *testing.T
 	}
 	if err := runtime.CompactExecutionFence(
 		context.Background(), identity, "/g", "rk", "sandbox-1",
-		FenceOutboxAckEvidence{AckedWatermark: 2, ProofDigest: digestFor("outbox-ack")},
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -144,4 +149,19 @@ func TestRuntimeCompactsFenceOnlyAfterRetentionAndEveryReplicaProof(t *testing.T
 	if _, found := data.Fences[fenceMapKey("/g", "rk", "sandbox-1")]; found {
 		t.Fatal("execution fence remained after complete compaction proof")
 	}
+	compactedRoute := data.Routes[routeMapKey("/g", "rk")]
+	if compactedRoute.Tombstone == nil || !compactedRoute.Tombstone.FenceCompacted {
+		t.Fatal("Route tombstone did not retain the fence-compaction marker")
+	}
+	replayed := ApplyDataCommand(&data, data.LastApplied+1, DataCommand{
+		Type: DataPutFence, Identity: identity, Expect: RevisionExpectation{Absent: true}, Fence: &fence,
+	})
+	if !replayed.Conflict {
+		t.Fatal("compacted execution fence was replayed")
+	}
+	replacement := routeStarting(t, registryLayout, "/g", "rk", "sandbox-2", 2, false)
+	applyDataOK(t, &data, data.LastApplied+1, DataCommand{
+		Type: DataPutRoute, Identity: identity,
+		Expect: RevisionExpectation{LogIndex: compactedRoute.Revision.LogIndex}, Route: &replacement,
+	})
 }

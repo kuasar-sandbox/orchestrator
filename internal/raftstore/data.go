@@ -488,6 +488,12 @@ func ApplyDataCommand(state *DataState, index uint64, command DataCommand) DataA
 		if err := validateFenceCompaction(*state, fence, *authorization); err != nil {
 			return conflict(err.Error(), fence.Revision.LogIndex)
 		}
+		routeKey := routeMapKey(fence.Group, fence.RouteKey)
+		if route, routeFound := state.Routes[routeKey]; routeFound && fenceMatchesRouteTombstone(fence, route) {
+			route = cloneRouteRecord(route)
+			route.Tombstone.FenceCompacted = true
+			state.Routes[routeKey] = route
+		}
 		delete(state.Fences, key)
 	default:
 		return conflict(fmt.Sprintf("unknown data command %q", command.Type), 0)

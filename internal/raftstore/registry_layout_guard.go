@@ -10,20 +10,21 @@ import (
 )
 
 type AcceptedRegistryLayout struct {
-	ClusterID             string `json:"cluster_id"`
-	RegistryGeneration    string `json:"registry_generation"`
-	RegistryLayoutVersion uint64 `json:"registry_layout_version"`
-	RegistryLayoutDigest  string `json:"registry_layout_digest"`
-	FormatVersion         uint32 `json:"format_version"`
-	SchemaVersion         uint32 `json:"schema_version"`
-	ProtocolVersion       uint32 `json:"protocol_version"`
-	HashVersion           string `json:"hash_version"`
-	VirtualShardCount     uint32 `json:"virtual_shard_count"`
-	RouteBucketCount      uint32 `json:"route_bucket_count"`
-	BuildBucketCount      uint32 `json:"build_bucket_count"`
-	ReplicationFactor     uint32 `json:"replication_factor"`
-	ServePermitMaxMillis  uint64 `json:"serve_permit_max_millis"`
-	BootstrapTokenDigest  string `json:"bootstrap_token_digest"`
+	ClusterID             string         `json:"cluster_id"`
+	RegistryGeneration    string         `json:"registry_generation"`
+	RegistryLayoutVersion uint64         `json:"registry_layout_version"`
+	RegistryLayoutDigest  string         `json:"registry_layout_digest"`
+	FormatVersion         uint32         `json:"format_version"`
+	SchemaVersion         uint32         `json:"schema_version"`
+	ProtocolVersion       uint32         `json:"protocol_version"`
+	HashVersion           string         `json:"hash_version"`
+	VirtualShardCount     uint32         `json:"virtual_shard_count"`
+	RouteBucketCount      uint32         `json:"route_bucket_count"`
+	BuildBucketCount      uint32         `json:"build_bucket_count"`
+	ReplicationFactor     uint32         `json:"replication_factor"`
+	ServePermitMaxMillis  uint64         `json:"serve_permit_max_millis"`
+	BootstrapTokenDigest  string         `json:"bootstrap_token_digest"`
+	RegistryLayout        RegistryLayout `json:"registry_layout"`
 }
 
 func (a AcceptedRegistryLayout) Validate() error {
@@ -34,6 +35,15 @@ func (a AcceptedRegistryLayout) Validate() error {
 		a.ReplicationFactor != DefaultReplication || a.ServePermitMaxMillis == 0 ||
 		!isSHA256(a.BootstrapTokenDigest) {
 		return errors.New("raftstore: invalid accepted registryLayout state")
+	}
+	if err := a.RegistryLayout.Validate(); err != nil {
+		return errors.New("raftstore: accepted state lacks its exact registryLayout artifact")
+	}
+	digest, err := a.RegistryLayout.Digest()
+	if err != nil || digest != a.RegistryLayoutDigest || a.RegistryLayout.ClusterID != a.ClusterID ||
+		a.RegistryLayout.RegistryGeneration != a.RegistryGeneration ||
+		a.RegistryLayout.RegistryLayoutVersion != a.RegistryLayoutVersion {
+		return errors.New("raftstore: accepted registryLayout artifact differs from its guard identity")
 	}
 	return nil
 }
@@ -61,6 +71,7 @@ func acceptedRegistryLayout(registryLayout RegistryLayout, digest string) Accept
 		BuildBucketCount: registryLayout.BuildBucketCount, ReplicationFactor: registryLayout.ReplicationFactor,
 		ServePermitMaxMillis: registryLayout.ServePermitMaxMillis,
 		BootstrapTokenDigest: registryLayout.BootstrapTokenDigest,
+		RegistryLayout:       cloneRegistryLayout(registryLayout),
 	}
 }
 
@@ -91,6 +102,9 @@ func (a AcceptedRegistryLayout) Accept(next RegistryLayout, digest string) (Acce
 			next.PreviousRegistryLayoutDigest != a.RegistryLayoutDigest:
 			return AcceptedRegistryLayout{}, errors.New("raftstore: registryLayout lineage gap")
 		}
+		if err := validateRetainedReplicaTargets(a.RegistryLayout, next); err != nil {
+			return AcceptedRegistryLayout{}, err
+		}
 	} else {
 		if next.Predecessor == nil || next.Predecessor.RegistryGeneration != a.RegistryGeneration ||
 			next.Predecessor.RegistryLayoutDigest != a.RegistryLayoutDigest ||
@@ -99,6 +113,68 @@ func (a AcceptedRegistryLayout) Accept(next RegistryLayout, digest string) (Acce
 		}
 	}
 	return acceptedRegistryLayout(next, digest), nil
+}
+
+func validateRetainedReplicaTargets(previous, next RegistryLayout) error {
+	type replicaKey struct {
+		ShardID   uint64
+		ReplicaID uint64
+	}
+	type target struct {
+		MemberID string
+		Endpoint string
+	}
+	targets := make(map[replicaKey]target)
+	add := func(layout RegistryLayout, shardID uint64, replicas []ReplicaPlacement, output map[replicaKey]target) {
+		for _, replica := range replicas {
+			member, _ := registryLayoutMember(layout, replica.MemberID)
+			output[replicaKey{ShardID: shardID, ReplicaID: replica.ReplicaID}] = target{
+				MemberID: replica.MemberID, Endpoint: member.RaftEndpoint,
+			}
+		}
+	}
+	add(previous, SystemRaftShardID, previous.SystemReplicas, targets)
+	for _, shard := range previous.DataShards {
+		add(previous, DataRaftShardID(shard.ShardID), shard.Replicas, targets)
+	}
+	check := func(shardID uint64, replicas []ReplicaPlacement) error {
+		for _, replica := range replicas {
+			prior, retained := targets[replicaKey{ShardID: shardID, ReplicaID: replica.ReplicaID}]
+			if !retained {
+				continue
+			}
+			member, _ := registryLayoutMember(next, replica.MemberID)
+			if prior.MemberID != replica.MemberID || prior.Endpoint != member.RaftEndpoint {
+				return errors.New("raftstore: retained Raft replica changed member or endpoint")
+			}
+		}
+		return nil
+	}
+	if err := check(SystemRaftShardID, next.SystemReplicas); err != nil {
+		return err
+	}
+	for _, shard := range next.DataShards {
+		if err := check(DataRaftShardID(shard.ShardID), shard.Replicas); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func cloneRegistryLayout(source RegistryLayout) RegistryLayout {
+	clone := source
+	clone.Members = append([]RegistryMember(nil), source.Members...)
+	clone.SystemReplicas = append([]ReplicaPlacement(nil), source.SystemReplicas...)
+	clone.DataShards = make([]ShardPlacement, len(source.DataShards))
+	for index, shard := range source.DataShards {
+		clone.DataShards[index] = shard
+		clone.DataShards[index].Replicas = append([]ReplicaPlacement(nil), shard.Replicas...)
+	}
+	if source.Predecessor != nil {
+		predecessor := *source.Predecessor
+		clone.Predecessor = &predecessor
+	}
+	return clone
 }
 
 func FirstAcceptedRegistryLayout(registryLayout RegistryLayout, digest string) (AcceptedRegistryLayout, error) {

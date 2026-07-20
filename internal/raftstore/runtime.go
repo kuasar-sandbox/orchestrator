@@ -36,9 +36,10 @@ const (
 )
 
 type RuntimeOpenOptions struct {
-	Mode             RuntimeOpenMode
-	BootstrapSecret  []byte
-	TransitionClient ReplicaTransitionClient
+	Mode              RuntimeOpenMode
+	BootstrapSecret   []byte
+	TransitionClient  ReplicaTransitionClient
+	OutboxAckVerifier FenceOutboxAckVerifier
 }
 
 type raftNodeHost interface {
@@ -61,19 +62,21 @@ type raftNodeHost interface {
 type nodeHostFactory func(dbconfig.NodeHostConfig) (raftNodeHost, error)
 
 type Runtime struct {
-	mu                   sync.Mutex
-	transitionMu         sync.Mutex
-	config               RuntimeConfig
-	registryLayout       RegistryLayout
-	registryLayoutDigest string
-	member               RegistryMember
-	enrollment           LocalEnrollment
-	enrollmentStore      EnrollmentStore
-	nodeHost             raftNodeHost
-	stateEngine          *PebbleStateEngine
-	permitCache          *PermitCache
-	transitionClient     ReplicaTransitionClient
-	systemEvents         *runtimeSystemEvents
+	mu                    sync.Mutex
+	transitionMu          sync.Mutex
+	config                RuntimeConfig
+	registryLayout        RegistryLayout
+	registryLayoutDigest  string
+	startupRegistryLayout RegistryLayout
+	member                RegistryMember
+	enrollment            LocalEnrollment
+	enrollmentStore       EnrollmentStore
+	nodeHost              raftNodeHost
+	stateEngine           *PebbleStateEngine
+	permitCache           *PermitCache
+	transitionClient      ReplicaTransitionClient
+	outboxAckVerifier     FenceOutboxAckVerifier
+	systemEvents          *runtimeSystemEvents
 }
 
 func OpenRuntime(
@@ -117,35 +120,32 @@ func openRuntime(
 	if err != nil {
 		return nil, err
 	}
-	currentSigned := latestSigned
-	currentDigest := latestDigest
+	startupSigned := latestSigned
 	if loadedEnrollment != nil && loadedEnrollment.RegistryGeneration == latestSigned.RegistryLayout.RegistryGeneration {
-		if _, found := registryLayoutMember(latestSigned.RegistryLayout, config.MemberID); !found {
-			selected := false
-			for _, candidate := range registryLayoutChain {
-				digest, verifyErr := candidate.Verify(keyring)
-				if verifyErr != nil {
-					return nil, verifyErr
-				}
-				if candidate.RegistryLayout.RegistryGeneration == loadedEnrollment.RegistryGeneration &&
-					candidate.RegistryLayout.RegistryLayoutVersion == loadedEnrollment.RegistryLayoutVersion &&
-					digest == loadedEnrollment.RegistryLayoutDigest {
-					if _, memberFound := registryLayoutMember(candidate.RegistryLayout, config.MemberID); !memberFound {
-						return nil, errors.New("raftstore: enrolled member is absent from its active signed registryLayout")
-					}
-					currentSigned, currentDigest, selected = candidate, digest, true
-					break
-				}
+		selected := false
+		for _, candidate := range registryLayoutChain {
+			digest, verifyErr := candidate.Verify(keyring)
+			if verifyErr != nil {
+				return nil, verifyErr
 			}
-			if !selected {
-				return nil, errors.New("raftstore: complete signed registryLayout chain is required to restart a removed member")
+			if candidate.RegistryLayout.RegistryGeneration == loadedEnrollment.RegistryGeneration &&
+				candidate.RegistryLayout.RegistryLayoutVersion == loadedEnrollment.RegistryLayoutVersion &&
+				digest == loadedEnrollment.RegistryLayoutDigest {
+				if _, memberFound := registryLayoutMember(candidate.RegistryLayout, config.MemberID); !memberFound {
+					return nil, errors.New("raftstore: enrolled member is absent from its active signed registryLayout")
+				}
+				startupSigned, selected = candidate, true
+				break
 			}
 		}
+		if !selected {
+			return nil, errors.New("raftstore: complete signed registryLayout chain is required to restart an enrolled member")
+		}
 	}
-	registryLayout := currentSigned.RegistryLayout
-	member, found := registryLayoutMember(registryLayout, config.MemberID)
+	registryLayout := latestSigned.RegistryLayout
+	member, found := registryLayoutMember(startupSigned.RegistryLayout, config.MemberID)
 	if !found {
-		return nil, errors.New("raftstore: local member is absent from the signed registryLayout")
+		return nil, errors.New("raftstore: local member is absent from its startup registryLayout")
 	}
 	nodeHostConfig, err := config.dragonboatConfig(registryLayout, member)
 	if err != nil {
@@ -172,7 +172,7 @@ func openRuntime(
 			}
 			mode = EnrollmentJoin
 		}
-		created, createErr := newLocalEnrollment(mode, registryLayout, currentDigest, member, config)
+		created, createErr := newLocalEnrollment(mode, registryLayout, latestDigest, member, config)
 		if createErr != nil {
 			return nil, createErr
 		}
@@ -188,7 +188,7 @@ func openRuntime(
 		if err := requireEmptyRuntimeStorage(config); err != nil {
 			return nil, err
 		}
-		created, createErr := newLocalEnrollment(EnrollmentBootstrap, registryLayout, currentDigest, member, config)
+		created, createErr := newLocalEnrollment(EnrollmentBootstrap, registryLayout, latestDigest, member, config)
 		if createErr != nil {
 			return nil, createErr
 		}
@@ -197,7 +197,7 @@ func openRuntime(
 		if options.Mode != RuntimeRestart {
 			return nil, errors.New("raftstore: an enrolled member must restart; bootstrap/join cannot be replayed")
 		}
-		if err := loadedEnrollment.Matches(registryLayout, currentDigest, member, config); err != nil {
+		if err := loadedEnrollment.Matches(registryLayout, latestDigest, member, config); err != nil {
 			return nil, err
 		}
 		enrollment = *loadedEnrollment
@@ -221,10 +221,11 @@ func openRuntime(
 		return nil, fmt.Errorf("raftstore: create Dragonboat NodeHost: %w", err)
 	}
 	runtime := &Runtime{
-		config: config, registryLayout: registryLayout, registryLayoutDigest: currentDigest, member: member,
+		config: config, registryLayout: registryLayout, registryLayoutDigest: latestDigest,
+		startupRegistryLayout: startupSigned.RegistryLayout, member: member,
 		enrollment: enrollment, enrollmentStore: store, nodeHost: nodeHost, stateEngine: stateEngine,
 		permitCache: NewPermitCache(time.Now), transitionClient: options.TransitionClient,
-		systemEvents: systemEvents,
+		outboxAckVerifier: options.OutboxAckVerifier, systemEvents: systemEvents,
 	}
 	systemEvents.bind(runtime)
 	return runtime, nil
@@ -439,6 +440,9 @@ func (r *Runtime) SyncLocalRegistryLayout(system SystemState) error {
 }
 
 func (r *Runtime) ReadSystemLocal() (SystemState, error) {
+	if err := r.removalFenceError(); err != nil {
+		return SystemState{}, err
+	}
 	value, err := r.nodeHost.StaleRead(SystemRaftShardID, SystemStateLookup{})
 	if err != nil {
 		return SystemState{}, err
@@ -451,6 +455,9 @@ func (r *Runtime) ReadSystemLocal() (SystemState, error) {
 }
 
 func (r *Runtime) ReadSystemStrong(ctx context.Context) (SystemState, error) {
+	if err := r.removalFenceError(); err != nil {
+		return SystemState{}, err
+	}
 	value, err := r.nodeHost.SyncRead(ctx, SystemRaftShardID, SystemStateLookup{})
 	if err != nil {
 		return SystemState{}, err
@@ -629,10 +636,38 @@ func (r *Runtime) ApplyData(ctx context.Context, command DataCommand) (DataApply
 	if err := r.permitCache.Authorize(command.Identity.PermitIdentity, PermitRegistryWrite); err != nil {
 		return DataApplyResult{}, err
 	}
-	return r.proposeDataRaw(ctx, command)
+	result, err := r.proposeDataRaw(ctx, command)
+	if err == nil {
+		return result, nil
+	}
+	resolved, readErr := r.resolveDataMutation(ctx, command)
+	if readErr == nil && resolved.Committed {
+		return DataApplyResult{Applied: true, Revision: resolved.Revision}, nil
+	}
+	if readErr != nil {
+		return DataApplyResult{}, errors.Join(err, fmt.Errorf("raftstore: resolve ambiguous data mutation: %w", readErr))
+	}
+	return DataApplyResult{}, err
+}
+
+func (r *Runtime) resolveDataMutation(ctx context.Context, command DataCommand) (DataMutationStatus, error) {
+	value, err := r.nodeHost.SyncRead(
+		ctx, DataRaftShardID(command.Identity.ShardID), DataMutationLookup{Command: command},
+	)
+	if err != nil {
+		return DataMutationStatus{}, err
+	}
+	status, ok := value.(DataMutationStatus)
+	if !ok {
+		return DataMutationStatus{}, errors.New("raftstore: Dragonboat returned an invalid mutation status")
+	}
+	return status, nil
 }
 
 func (r *Runtime) proposeSystem(ctx context.Context, command SystemCommand) (SystemApplyResult, error) {
+	if err := r.removalFenceError(); err != nil {
+		return SystemApplyResult{}, err
+	}
 	raw, err := EncodeSystemCommand(command)
 	if err != nil {
 		return SystemApplyResult{}, err
@@ -649,6 +684,9 @@ func (r *Runtime) proposeSystem(ctx context.Context, command SystemCommand) (Sys
 }
 
 func (r *Runtime) proposeDataRaw(ctx context.Context, command DataCommand) (DataApplyResult, error) {
+	if err := r.removalFenceError(); err != nil {
+		return DataApplyResult{}, err
+	}
 	raw, err := EncodeDataCommand(command)
 	if err != nil {
 		return DataApplyResult{}, err
@@ -665,6 +703,15 @@ func (r *Runtime) proposeDataRaw(ctx context.Context, command DataCommand) (Data
 	return applied, nil
 }
 
+func (r *Runtime) removalFenceError() error {
+	if r != nil && r.systemEvents != nil {
+		if err := r.systemEvents.Err(); err != nil {
+			return fmt.Errorf("raftstore: local replica removal fence is not durable: %w", err)
+		}
+	}
+	return nil
+}
+
 func (r *Runtime) authorizeRegistryLayoutState(system SystemState) error {
 	if err := system.Validate(); err != nil {
 		return err
@@ -679,6 +726,11 @@ func (r *Runtime) authorizeRegistryLayoutState(system SystemState) error {
 	}
 	if system.Transition != nil && system.Transition.Digest == r.registryLayoutDigest &&
 		system.Transition.Version == r.registryLayout.RegistryLayoutVersion {
+		return nil
+	}
+	if system.Transition == nil && r.registryLayout.RegistryLayoutVersion > 1 &&
+		system.ActiveRegistryLayoutVersion == r.registryLayout.PreviousRegistryLayoutVersion &&
+		system.ActiveRegistryLayoutDigest == r.registryLayout.PreviousRegistryLayoutDigest {
 		return nil
 	}
 	return errors.New("raftstore: signed registryLayout is not committed active or next System state")
@@ -699,13 +751,17 @@ func (r *Runtime) validateDataState(state DataState, shardID uint32) error {
 }
 
 func (r *Runtime) initialMembers(shardID uint64) (map[uint64]dragonboat.Target, error) {
-	placements, err := r.placementForRaftShard(shardID)
+	layout := r.startupRegistryLayout
+	if layout.ClusterID == "" {
+		layout = r.registryLayout
+	}
+	placements, err := placementForRaftShard(layout, shardID)
 	if err != nil {
 		return nil, err
 	}
 	members := make(map[uint64]dragonboat.Target, len(placements))
 	for _, placement := range placements {
-		member, found := registryLayoutMember(r.registryLayout, placement.MemberID)
+		member, found := registryLayoutMember(layout, placement.MemberID)
 		if !found {
 			return nil, errors.New("raftstore: replica placement names an unknown member")
 		}
@@ -714,15 +770,19 @@ func (r *Runtime) initialMembers(shardID uint64) (map[uint64]dragonboat.Target, 
 	return members, nil
 }
 
-func (r *Runtime) placementForRaftShard(shardID uint64) ([]ReplicaPlacement, error) {
+func placementForRaftShard(layout RegistryLayout, shardID uint64) ([]ReplicaPlacement, error) {
 	if shardID == SystemRaftShardID {
-		return r.registryLayout.SystemReplicas, nil
+		return layout.SystemReplicas, nil
 	}
 	logical, ok := LogicalShardID(shardID)
-	if !ok || logical >= uint32(len(r.registryLayout.DataShards)) {
+	if !ok || logical >= uint32(len(layout.DataShards)) {
 		return nil, errors.New("raftstore: unknown Raft shard")
 	}
-	return r.registryLayout.DataShards[logical].Replicas, nil
+	return layout.DataShards[logical].Replicas, nil
+}
+
+func (r *Runtime) placementForRaftShard(shardID uint64) ([]ReplicaPlacement, error) {
+	return placementForRaftShard(r.registryLayout, shardID)
 }
 
 func (r *Runtime) replicaPosition(shardID uint64) int {

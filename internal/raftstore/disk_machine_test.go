@@ -2,6 +2,7 @@ package raftstore
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"testing"
@@ -10,6 +11,33 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/routeapi"
 	sm "github.com/lni/dragonboat/v4/statemachine"
 )
+
+func TestSnapshotRejectsRouteChangeBeyondLastApplied(t *testing.T) {
+	registryLayout := testRegistryLayout(4, "generation-future-change")
+	identity := routeShardIdentity(t, registryLayout, "/future", "route")
+	state := initializeDataShard(t, registryLayout, identity)
+	state.LastApplied = 5
+	bucket, _, err := clusterstate.RouteShardFor(
+		"/future", "route", registryLayout.RouteBucketCount, registryLayout.VirtualShardCount,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	change := RouteChange{Revision: 6, Bucket: bucket, Group: "/future", RouteKey: "route", State: clusterstate.WorkflowRouteStarting}
+	value, err := json.Marshal(change)
+	if err != nil {
+		t.Fatal(err)
+	}
+	revision := make([]byte, 8)
+	binary.BigEndian.PutUint64(revision, change.Revision)
+	machine := &diskStateMachine{shardID: DataRaftShardID(identity.ShardID)}
+	metadataSeen := true
+	if err := machine.validateSnapshotRecord(
+		append([]byte{stateRouteChangeTable}, revision...), value, state.LastApplied, &metadataSeen, &state,
+	); err == nil {
+		t.Fatal("snapshot accepted a Route change beyond LastApplied")
+	}
+}
 
 func TestPebbleStateMachinePersistsAndRestoresAcrossReplicaIDs(t *testing.T) {
 	root := t.TempDir()

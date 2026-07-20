@@ -25,6 +25,38 @@ func (r *Runtime) ApplySystem(ctx context.Context, command SystemCommand) (Syste
 	return r.proposeSystem(ctx, command)
 }
 
+// ConfigureServiceGates is the only public workflow for changing normal
+// serving gates. It resolves ambiguous proposals by a quorum read and never
+// exposes the raw SystemSetGates command through ApplySystem.
+func (r *Runtime) ConfigureServiceGates(ctx context.Context, gates GateUpdate) (SystemState, error) {
+	state, err := r.ReadSystemStrong(ctx)
+	if err != nil {
+		return SystemState{}, err
+	}
+	if err := r.authorizeRegistryLayoutState(state); err != nil {
+		return SystemState{}, err
+	}
+	if state.ServeGate == gates.Serve && state.WriteGate == gates.Write && state.CutoverGate == gates.Cutover {
+		return state, nil
+	}
+	result, proposeErr := r.proposeSystem(ctx, SystemCommand{Type: SystemSetGates, Gates: &gates})
+	current, readErr := r.ReadSystemStrong(ctx)
+	if readErr == nil && current.ServeGate == gates.Serve && current.WriteGate == gates.Write &&
+		current.CutoverGate == gates.Cutover {
+		return current, nil
+	}
+	if proposeErr != nil {
+		return SystemState{}, proposeErr
+	}
+	if result.Conflict || !result.Applied {
+		return SystemState{}, errors.New(result.Reason)
+	}
+	if readErr != nil {
+		return SystemState{}, readErr
+	}
+	return SystemState{}, errors.New("raftstore: committed service gates were not visible")
+}
+
 // CloseRegistryGeneration permanently retires this Registry History Generation and commits the
 // exact successor registryLayout intent. The successor's consensus proof outputs are
 // deliberately excluded from the intent because they are produced by this
@@ -161,6 +193,9 @@ func (r *Runtime) ConfirmPredecessorPermitDrain(ctx context.Context, evidenceDig
 }
 
 func (r *Runtime) ReadData(ctx context.Context, query DataLookup) (DataLookupResult, error) {
+	if err := r.removalFenceError(); err != nil {
+		return DataLookupResult{}, err
+	}
 	if err := query.Validate(); err != nil {
 		return DataLookupResult{}, err
 	}
@@ -202,14 +237,17 @@ func (r *Runtime) authorizeLocalDataReplica(identity ShardRequestIdentity) error
 	}
 	local := r.enrollment.Replicas[position]
 	r.mu.Unlock()
-	if local.LocalState != ReplicaActive || local.NonVoting {
-		return ErrNoLocalReplica
-	}
 	if identity.RegistryLayoutDigest != r.registryLayoutDigest {
 		// A removed replica may serve only the preceding epoch while its
 		// already-issued Permit drains. DataState.Accepts performs the exact
 		// old-epoch check and the new registryLayout never routes new-epoch reads here.
-		return nil
+		if (local.LocalState == ReplicaActive || local.LocalState == ReplicaRemoving) && !local.NonVoting {
+			return nil
+		}
+		return ErrNoLocalReplica
+	}
+	if local.LocalState != ReplicaActive || local.NonVoting {
+		return ErrNoLocalReplica
 	}
 	if int(identity.ShardID) >= len(r.registryLayout.DataShards) {
 		return ErrNoLocalReplica

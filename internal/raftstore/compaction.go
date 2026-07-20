@@ -21,6 +21,30 @@ type FenceOutboxAckEvidence struct {
 	ProofDigest    string `json:"proof_digest"`
 }
 
+type FenceOutboxAckRequest struct {
+	Group                string
+	RouteKey             string
+	SandboxID            string
+	NodeID               string
+	NodeEpoch            uint64
+	RegistryGeneration   string
+	BindingDigest        string
+	FinalOutboxWatermark uint64
+}
+
+type FenceOutboxAckVerifier interface {
+	VerifyFenceOutboxAck(context.Context, FenceOutboxAckRequest) (FenceOutboxAckEvidence, error)
+}
+
+type FenceOutboxAckVerifierFunc func(context.Context, FenceOutboxAckRequest) (FenceOutboxAckEvidence, error)
+
+func (f FenceOutboxAckVerifierFunc) VerifyFenceOutboxAck(
+	ctx context.Context,
+	request FenceOutboxAckRequest,
+) (FenceOutboxAckEvidence, error) {
+	return f(ctx, request)
+}
+
 func (e FenceOutboxAckEvidence) validates(fence clusterstate.ExecutionFence) bool {
 	return fence.FinalOutboxWatermark >= fence.LastEventSeq &&
 		e.AckedWatermark == fence.FinalOutboxWatermark &&
@@ -36,7 +60,6 @@ func (r *Runtime) CompactExecutionFence(
 	group string,
 	routeKey string,
 	sandboxID string,
-	outboxAck FenceOutboxAckEvidence,
 ) error {
 	if err := identity.Validate(); err != nil {
 		return err
@@ -66,8 +89,22 @@ func (r *Runtime) CompactExecutionFence(
 	}
 	permanentlyFenced := fence.Proof.Kind == clusterstate.ProofNewerNodeEpoch ||
 		fence.Proof.Kind == clusterstate.ProofExternalFence
-	if !permanentlyFenced && !outboxAck.validates(*fence) {
-		return errors.New("raftstore: execution fence lacks a durable final outbox ACK")
+	var outboxAck FenceOutboxAckEvidence
+	if !permanentlyFenced {
+		if r.outboxAckVerifier == nil {
+			return errors.New("raftstore: trusted final outbox ACK verifier is unavailable")
+		}
+		outboxAck, err = r.outboxAckVerifier.VerifyFenceOutboxAck(ctx, FenceOutboxAckRequest{
+			Group: fence.Group, RouteKey: fence.RouteKey, SandboxID: fence.SandboxID,
+			NodeID: fence.NodeID, NodeEpoch: fence.NodeEpoch, RegistryGeneration: fence.RegistryGeneration,
+			BindingDigest: fence.BindingDigest, FinalOutboxWatermark: fence.FinalOutboxWatermark,
+		})
+		if err != nil {
+			return err
+		}
+		if !outboxAck.validates(*fence) {
+			return errors.New("raftstore: trusted verifier did not prove the exact final outbox ACK")
+		}
 	}
 
 	wait := time.Duration(r.config.Tuning.FenceRetentionMillis) * time.Millisecond
