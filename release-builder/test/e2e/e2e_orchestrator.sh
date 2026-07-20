@@ -27,7 +27,7 @@ BIN="${BIN:-$REPO_ROOT/bin}"
 SWITCH="${SWITCH:-sw0}"
 DOMAIN="${DOMAIN:-sandboxes.e2e.local}"
 PORT="${PORT:-3000}"
-# Tenant credentials are derived from manifest keys via e2b-key-ctl, below.
+# Tenant credentials are derived from AuthKeys via e2b-key-ctl, below.
 
 skip() {
     echo
@@ -62,13 +62,12 @@ trap cleanup EXIT
 
 fail() { echo "==> FAIL: $*" >&2; exit 1; }
 
-# Derive tenant credentials. MK is the allowlisted tenant (its api key AK may
-# create/build); MK_OTHER is a valid but NOT-allowlisted other tenant. ENC is the
-# orchestrator's at-rest encryption key.
+# Derive separate API-auth and content keys. AUTH_OTHER has no active lease.
+AUTH_KEY="$("$BIN/e2b-key-ctl" gen-key)"
 MK="$("$BIN/e2b-key-ctl" gen-key)"
-AK="$("$BIN/e2b-key-ctl" gen-apikey "$MK")"
-MK_OTHER="$("$BIN/e2b-key-ctl" gen-key)"
-AK_OTHER="$("$BIN/e2b-key-ctl" gen-apikey "$MK_OTHER")"
+AK="$("$BIN/e2b-key-ctl" gen-apikey "$AUTH_KEY")"
+AUTH_OTHER="$("$BIN/e2b-key-ctl" gen-key)"
+AK_OTHER="$("$BIN/e2b-key-ctl" gen-apikey "$AUTH_OTHER")"
 ENC="$("$BIN/e2b-key-ctl" gen-key)"
 
 # curl helper: $1=method $2=path $3=api-key $4=body(optional). Prints "<code>\n<body>".
@@ -116,9 +115,9 @@ for i in $(seq 1 30); do
     sleep 0.5
 done
 
-# Allowlist MK so it may create/build — now via serve's admin plane on the control
-# socket (the daemon owns the manifest_keys table), so it runs AFTER serve is up.
-"$BIN/node-ctl" manifest-key add --socket "$WORK/node-ctl.socket" "$MK" >/dev/null || fail "manifest-key add failed"
+# Install the exact dual-key lease after the daemon owns its admin socket.
+"$BIN/node-ctl" key-lease put --socket "$WORK/node-ctl.socket" --group /e2e/orchestrator \
+    --auth-key "$AUTH_KEY" --manifest-key "$MK" >/dev/null || fail "key-lease put failed"
 
 # ---- 1. assert unit auto-install ------------------------------------------
 for u in sandbox-runner@.service sandbox-builder@.service sandbox-runner.slice sandbox-builder.slice; do
@@ -140,14 +139,14 @@ code=$(req POST /sandboxes "e2b_deadbeef_not_a_real_token" '{"templateID":"x"}')
 [ "$code" = "401" ] || fail "POST /sandboxes with malformed key = $code (want 401)"
 echo "==> PASS: control plane up; auth rejects missing/malformed keys (401)"
 
-# A valid api key whose manifest key is NOT allowlisted: passes the format check
-# (not 401) but create/register is refused with 403.
-code=$(req POST /v3/templates "$AK_OTHER" '{"name":"denied"}')
-[ "$code" = "403" ] || fail "register with non-allowlisted key = $code (want 403)"
-echo "==> PASS: non-allowlisted manifest key refused (403)"
+# A valid API key whose AuthKey has no active lease passes format validation but
+# cannot create/register a new object.
+code=$(req POST /v3/templates "$AK_OTHER" '{"name":"denied","cpuCount":2,"memoryMB":4096}')
+[ "$code" = "403" ] || fail "register without a key lease = $code (want 403)"
+echo "==> PASS: AuthKey without an active lease refused (403)"
 
 # ---- 3. build API (e2b v3) + ownership ------------------------------------
-code=$(req POST /v3/templates "$AK" '{"name":"e2e-tmpl","tags":["e2e"]}')
+code=$(req POST /v3/templates "$AK" '{"name":"e2e-tmpl","tags":["e2e"],"cpuCount":2,"memoryMB":4096}')
 [ "$code" = "202" ] || { cat "$WORK/resp.body"; fail "register = $code (want 202)"; }
 TID=$(json_field "$WORK/resp.body" templateID)
 BID=$(json_field "$WORK/resp.body" buildID)

@@ -257,7 +257,8 @@ chunker: { mode: cdc, cdc: { min: 128KiB, avg: 512KiB, max: 1MiB } }
 crypto: { chunk: aes, manifest: aes }
 EOF
 
-MK="$("$BIN/e2b-key-ctl" gen-key)"; AK="$("$BIN/e2b-key-ctl" gen-apikey "$MK")"; ENC="$("$BIN/e2b-key-ctl" gen-key)"
+AUTH_KEY="$("$BIN/e2b-key-ctl" gen-key)"; MK="$("$BIN/e2b-key-ctl" gen-key)"
+AK="$("$BIN/e2b-key-ctl" gen-apikey "$AUTH_KEY")"; ENC="$("$BIN/e2b-key-ctl" gen-key)"
 
 # Cold boot needs a pre-formatted empty ext4 to seed the writable overlay upper.
 MKFS_EXT4="$(command -v mkfs.ext4 || echo /sbin/mkfs.ext4)"
@@ -300,7 +301,8 @@ for _ in $(seq 1 30); do
     kill -0 "${PIDS[-1]}" 2>/dev/null || { dump_logs; skip "orchestrator exited"; }
     sleep 0.5
 done
-"$BIN/node-ctl" manifest-key add --socket "$WORK/node-ctl.socket" "$MK" >/dev/null || fail "manifest-key add"
+"$BIN/node-ctl" key-lease put --socket "$WORK/node-ctl.socket" --group /e2e/proxy \
+    --auth-key "$AUTH_KEY" --manifest-key "$MK" >/dev/null || fail "key-lease put"
 
 echo "==> node-ctl proxy master (single plugin registration, data-plane :$PROXY_PORT, workers=2)"
 # The master reads policy/endpoints from proxy.yaml, registers once, then supervises
@@ -330,7 +332,7 @@ echo "==> control plane up; proxy master registered on the config-socket plugin 
 echo "==> PASS: external proxy workers and mmds_listen are in proxy_netns=$PROXY_NETNS"
 
 # ---- build a ready e2b template (native v3) --------------------------------
-code=$(req POST /v3/templates "$AK" '{"name":"proxy-tmpl"}')
+code=$(req POST /v3/templates "$AK" '{"name":"proxy-tmpl","cpuCount":2,"memoryMB":4096}')
 [ "$code" = "202" ] || { cat "$WORK/resp.body"; fail "register=$code"; }
 TID=$(json_field "$WORK/resp.body" templateID)
 BID=$(json_field "$WORK/resp.body" buildID)

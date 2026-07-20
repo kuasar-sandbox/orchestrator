@@ -233,8 +233,9 @@ else
 fi
 
 # ---- tenant credentials + orchestrator --------------------------------------
+AUTH_KEY="$("$BIN/e2b-key-ctl" gen-key)"
 MK="$("$BIN/e2b-key-ctl" gen-key)"
-AK="$("$BIN/e2b-key-ctl" gen-apikey "$MK")"
+AK="$("$BIN/e2b-key-ctl" gen-apikey "$AUTH_KEY")"
 ENC="$("$BIN/e2b-key-ctl" gen-key)"
 PORT="$(free_port)"
 
@@ -272,8 +273,9 @@ for _ in $(seq 1 30); do
     kill -0 "${PIDS[-1]}" 2>/dev/null || { sed 's/^/    /' "$WORK/orch.log"; fail "orchestrator serve exited"; }
     sleep 0.5
 done
-"$BIN/node-ctl" manifest-key add --socket "$WORK/node-ctl.socket" "$MK" >/dev/null || fail "manifest-key add"
-echo "==> orchestrator up (dev http :$PORT); tenant allowlisted"
+"$BIN/node-ctl" key-lease put --socket "$WORK/node-ctl.socket" --group /e2e/builder \
+    --auth-key "$AUTH_KEY" --manifest-key "$MK" >/dev/null || fail "key-lease put"
+echo "==> orchestrator up (dev http :$PORT); tenant key lease installed"
 
 req() { # method path key [body]
     local method="$1" path="$2" key="$3" body="${4:-}"
@@ -288,8 +290,8 @@ json_field() {
 register() { # name [profile] → sets TID/BID
     local code body expected_profile got_profile
     expected_profile="${2:-e2b}"
-    body="{\"name\":\"$1\"}"
-    [ -z "${2:-}" ] || body="{\"name\":\"$1\",\"profile\":\"$2\"}"
+    body="{\"name\":\"$1\",\"cpuCount\":2,\"memoryMB\":4096}"
+    [ -z "${2:-}" ] || body="{\"name\":\"$1\",\"profile\":\"$2\",\"cpuCount\":2,\"memoryMB\":4096}"
     code=$(req POST /v3/templates "$AK" "$body")
     [ "$code" = "202" ] || { cat "$WORK/resp.body"; fail "register $1 = $code (want 202)"; }
     TID=$(json_field "$WORK/resp.body" templateID)

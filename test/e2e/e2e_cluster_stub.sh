@@ -388,8 +388,8 @@ step "starting router"
 PIDS+=("$!")
 wait_tcp "$ROUTER_PORT" "router"
 
-step "waiting for node_link manifest-key cache"
-python3 - "$ADMIN" "$NODES" <<'PY' || fail "manifest keys were not distributed to all stub nodes"
+step "waiting for node_link key-lease cache"
+python3 - "$ADMIN" "$NODES" <<'PY' || fail "key leases were not distributed to all stub nodes"
 import json, sys, time, urllib.request
 admin, want = sys.argv[1], int(sys.argv[2])
 for _ in range(300):
