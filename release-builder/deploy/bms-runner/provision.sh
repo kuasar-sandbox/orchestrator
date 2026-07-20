@@ -11,8 +11,8 @@ MACHINE_ROOT=/var/lib/machines
 BRIDGE=${KUASAR_CI_BRIDGE:-kuasar-ci0}
 SUBNET=${KUASAR_CI_SUBNET:-10.203.0.0/24}
 BRIDGE_ADDRESS=${KUASAR_CI_BRIDGE_ADDRESS:-10.203.0.1/24}
-MEMORY_MAX=${KUASAR_SLOT_MEMORY_MAX:-176G}
-MEMORY_HIGH=${KUASAR_SLOT_MEMORY_HIGH:-168G}
+MEMORY_MAX=${KUASAR_SLOT_MEMORY_MAX:-56G}
+MEMORY_HIGH=${KUASAR_SLOT_MEMORY_HIGH:-52G}
 SOURCE_CACHE=${KUASAR_SOURCE_CACHE:-/var/cache/kuasar/sources}
 TOOL_ROOT=/var/lib/kuasar-ci/tools
 ZOT_TOOL_SHA256=523e5bf29a013db09115f780c3152af98fc5b65fc408a0d3e6c293643dc9bde7
@@ -32,12 +32,25 @@ SLOT_OWNER_ID=kuasar-ci-bms-runner-v1
 RUNNER_REGISTRATION_MARKER=.kuasar-ci-registration-complete
 PROVISION_LOCK=/run/lock/kuasar-ci-runner-provision.lock
 
-SLOT1_CPUS=${KUASAR_SLOT1_CPUS:-0-21,44-65}
-SLOT2_CPUS=${KUASAR_SLOT2_CPUS:-22-43,66-87}
+SLOTS=(1 2 3 4 5 6)
+SLOT1_CPUS=${KUASAR_SLOT1_CPUS:-0-6,44-50}
+SLOT2_CPUS=${KUASAR_SLOT2_CPUS:-7-13,51-57}
+SLOT3_CPUS=${KUASAR_SLOT3_CPUS:-14-20,58-64}
+SLOT4_CPUS=${KUASAR_SLOT4_CPUS:-22-28,66-72}
+SLOT5_CPUS=${KUASAR_SLOT5_CPUS:-29-35,73-79}
+SLOT6_CPUS=${KUASAR_SLOT6_CPUS:-36-42,80-86}
 SLOT1_NUMA=${KUASAR_SLOT1_NUMA:-0}
-SLOT2_NUMA=${KUASAR_SLOT2_NUMA:-1}
+SLOT2_NUMA=${KUASAR_SLOT2_NUMA:-0}
+SLOT3_NUMA=${KUASAR_SLOT3_NUMA:-0}
+SLOT4_NUMA=${KUASAR_SLOT4_NUMA:-1}
+SLOT5_NUMA=${KUASAR_SLOT5_NUMA:-1}
+SLOT6_NUMA=${KUASAR_SLOT6_NUMA:-1}
 SLOT1_IP=${KUASAR_SLOT1_IP:-10.203.0.11/24}
 SLOT2_IP=${KUASAR_SLOT2_IP:-10.203.0.12/24}
+SLOT3_IP=${KUASAR_SLOT3_IP:-10.203.0.13/24}
+SLOT4_IP=${KUASAR_SLOT4_IP:-10.203.0.14/24}
+SLOT5_IP=${KUASAR_SLOT5_IP:-10.203.0.15/24}
+SLOT6_IP=${KUASAR_SLOT6_IP:-10.203.0.16/24}
 
 PACKAGES=(
     openEuler-release systemd systemd-networkd dbus dnf passwd shadow sudo
@@ -82,6 +95,14 @@ machine_name() {
     printf 'kuasar-ci-%s' "$1"
 }
 
+slot_is_valid() {
+    local expected
+    for expected in "${SLOTS[@]}"; do
+        [ "$1" = "$expected" ] && return 0
+    done
+    return 1
+}
+
 slot_root() {
     printf '%s/%s' "$MACHINE_ROOT" "$(machine_name "$1")"
 }
@@ -110,8 +131,8 @@ runner_registration_complete() {
 
 cleanup_stale_slot_staging() {
     local slot machine staging stale=()
-    [ -d "$MACHINE_ROOT" ] || return
-    for slot in 1 2; do
+    [ -d "$MACHINE_ROOT" ] || return 0
+    for slot in "${SLOTS[@]}"; do
         machine="$(machine_name "$slot")"
         shopt -s nullglob
         stale=("$MACHINE_ROOT/.${machine}.install."*)
@@ -126,12 +147,15 @@ cleanup_stale_slot_staging() {
 }
 
 assert_distinct_slot_machine_ids() {
-    local id1 id2
-    id1="$(cat "$(slot_root 1)/etc/machine-id" 2>/dev/null || true)"
-    id2="$(cat "$(slot_root 2)/etc/machine-id" 2>/dev/null || true)"
-    [[ "$id1" =~ ^[0-9a-f]{32}$ ]] || die "slot 1 has an invalid machine ID"
-    [[ "$id2" =~ ^[0-9a-f]{32}$ ]] || die "slot 2 has an invalid machine ID"
-    [ "$id1" != "$id2" ] || die "slots share a machine ID"
+    local slot id
+    local -A owners=()
+    for slot in "${SLOTS[@]}"; do
+        id="$(cat "$(slot_root "$slot")/etc/machine-id" 2>/dev/null || true)"
+        [[ "$id" =~ ^[0-9a-f]{32}$ ]] || die "slot $slot has an invalid machine ID"
+        [ -z "${owners[$id]:-}" ] \
+            || die "slots ${owners[$id]} and $slot share a machine ID"
+        owners[$id]=$slot
+    done
 }
 
 slot_value() {
@@ -178,7 +202,7 @@ assert_china_repositories() {
 runner_worker_in_managed_slot() {
     local proc=$1 slot
     [ -r "$proc/cgroup" ] || return 1
-    for slot in 1 2; do
+    for slot in "${SLOTS[@]}"; do
         grep -Fq "/systemd-nspawn@$(machine_name "$slot").service" "$proc/cgroup" \
             && return 0
     done
@@ -203,7 +227,7 @@ assert_host_runner_idle() {
 
 assert_slots_stopped() {
     local slot machine
-    for slot in 1 2; do
+    for slot in "${SLOTS[@]}"; do
         machine="$(machine_name "$slot")"
         if systemctl is-active --quiet "systemd-nspawn@$machine.service"; then
             die "$machine must be stopped before installation"
@@ -291,10 +315,10 @@ assert_install_space() {
     template_device="$(stat -c %d "$template_path")"
     machine_device="$(stat -c %d "$machine_path")"
     if [ "$template_device" = "$machine_device" ]; then
-        require_free_space "$template_path" 15 "template and machine root"
+        require_free_space "$template_path" 30 "template and machine root"
     else
         require_free_space "$template_path" 5 "template root"
-        require_free_space "$machine_path" 10 "machine root"
+        require_free_space "$machine_path" 25 "machine root"
     fi
 }
 
@@ -418,6 +442,9 @@ EOF
     load_required_modules
     assert_required_devices
     systemctl enable --now kuasar-ci-network.service kuasar-ci-bpf.service
+    # RemainAfterExit keeps an already active oneshot from rerunning after its
+    # executable is updated. Restart it so newly added slot bpffs roots exist.
+    systemctl restart kuasar-ci-bpf.service
 }
 
 copy_runner_distribution() {
@@ -677,8 +704,10 @@ install_slots() {
     assert_install_space
     install_host_support
     build_template_root
-    prepare_slot 1
-    prepare_slot 2
+    local slot
+    for slot in "${SLOTS[@]}"; do
+        prepare_slot "$slot"
+    done
     assert_distinct_slot_machine_ids
     systemctl daemon-reload
     log "slots installed but not started; register each slot next"
@@ -688,7 +717,7 @@ register_slot() {
     require_root
     acquire_provision_lock
     local slot=${1:-} token machine root runner
-    case "$slot" in 1|2) ;; *) die "register requires slot 1 or 2" ;; esac
+    slot_is_valid "$slot" || die "register requires slot 1 through 6"
     IFS= read -r token
     [ -n "$token" ] || die "registration token must be provided on stdin"
     machine="$(machine_name "$slot")"
@@ -737,7 +766,7 @@ start_slots() {
     assert_host_runner_idle
     local slot machine root unit was_active was_enabled
     local -a startup_records=()
-    for slot in 1 2; do
+    for slot in "${SLOTS[@]}"; do
         machine="$(machine_name "$slot")"
         root="$(slot_root "$slot")"
         assert_slot_root_owned "$slot"
@@ -746,7 +775,7 @@ start_slots() {
     assert_distinct_slot_machine_ids
 
     systemctl start kuasar-ci-network.service
-    for slot in 1 2; do
+    for slot in "${SLOTS[@]}"; do
         machine="$(machine_name "$slot")"
         unit="systemd-nspawn@$machine.service"
         was_active=no
@@ -763,7 +792,7 @@ start_slots() {
             die "failed to start $machine"
         fi
     done
-    for slot in 1 2; do
+    for slot in "${SLOTS[@]}"; do
         if ! wait_slot_ready "$slot"; then
             rollback_slot_startup "${startup_records[@]}"
             die "$(machine_name "$slot") did not become network, Docker, and runner ready within 60s"
@@ -788,10 +817,10 @@ stop_slots() {
     require_root
     acquire_provision_lock
     local slot machine unit
-    for slot in 1 2; do
+    for slot in "${SLOTS[@]}"; do
         assert_slot_root_owned "$slot"
     done
-    for slot in 1 2; do
+    for slot in "${SLOTS[@]}"; do
         machine="$(machine_name "$slot")"
         unit="systemd-nspawn@$machine.service"
         if systemctl is-active --quiet "$unit" || systemctl is-enabled --quiet "$unit"; then
@@ -836,7 +865,7 @@ wait_slot_ready() {
 verify_slots() {
     require_root
     local slot machine
-    for slot in 1 2; do
+    for slot in "${SLOTS[@]}"; do
         machine="$(machine_name "$slot")"
         assert_slot_root_owned "$slot"
         runner_registration_complete "$(slot_root "$slot")" \
@@ -877,34 +906,46 @@ verify_slots() {
 
     assert_distinct_slot_machine_ids
 
-    run_in_slot 1 /usr/bin/touch /run/kuasar-slot-isolation-probe
-    if run_in_slot 2 /usr/bin/test -e /run/kuasar-slot-isolation-probe; then
-        die "slot 2 can see slot 1 private /run"
-    fi
-    run_in_slot 1 /usr/bin/rm -f /run/kuasar-slot-isolation-probe
+    local left right leader i j probe
+    local -a mount_namespaces=() network_namespaces=() cgroups=() bpf_roots=()
+    for slot in "${SLOTS[@]}"; do
+        probe="/run/kuasar-slot-$slot-isolation-probe"
+        run_in_slot "$slot" /usr/bin/touch "$probe"
+        for right in "${SLOTS[@]}"; do
+            [ "$right" = "$slot" ] && continue
+            if run_in_slot "$right" /usr/bin/test -e "$probe"; then
+                die "slot $right can see slot $slot private /run"
+            fi
+        done
+        run_in_slot "$slot" /usr/bin/rm -f "$probe"
 
-    local leader1 leader2 mnt1 mnt2 net1 net2 cgroup1 cgroup2 bpfroot1 bpfroot2
-    leader1="$(machinectl show kuasar-ci-1 -p Leader --value)"
-    leader2="$(machinectl show kuasar-ci-2 -p Leader --value)"
-    mnt1="$(readlink "/proc/$leader1/ns/mnt")"
-    mnt2="$(readlink "/proc/$leader2/ns/mnt")"
-    net1="$(readlink "/proc/$leader1/ns/net")"
-    net2="$(readlink "/proc/$leader2/ns/net")"
-    cgroup1="$(cat "/proc/$leader1/cgroup")"
-    cgroup2="$(cat "/proc/$leader2/cgroup")"
-    bpfroot1="$(run_in_slot 1 /usr/bin/findmnt -n -o FSROOT --target /sys/fs/bpf)"
-    bpfroot2="$(run_in_slot 2 /usr/bin/findmnt -n -o FSROOT --target /sys/fs/bpf)"
-    [ "$mnt1" != "$mnt2" ] || die "slots share a mount namespace"
-    [ "$net1" != "$net2" ] || die "slots share a network namespace"
-    [ "$cgroup1" != "$cgroup2" ] || die "slots share a host cgroup"
-    [ "$bpfroot1" != "$bpfroot2" ] || die "slots share a bpffs root"
+        leader="$(machinectl show "$(machine_name "$slot")" -p Leader --value)"
+        mount_namespaces[$slot]="$(readlink "/proc/$leader/ns/mnt")"
+        network_namespaces[$slot]="$(readlink "/proc/$leader/ns/net")"
+        cgroups[$slot]="$(cat "/proc/$leader/cgroup")"
+        bpf_roots[$slot]="$(run_in_slot "$slot" /usr/bin/findmnt -n -o FSROOT --target /sys/fs/bpf)"
+    done
+    for ((i = 0; i < ${#SLOTS[@]}; i++)); do
+        left=${SLOTS[$i]}
+        for ((j = i + 1; j < ${#SLOTS[@]}; j++)); do
+            right=${SLOTS[$j]}
+            [ "${mount_namespaces[$left]}" != "${mount_namespaces[$right]}" ] \
+                || die "slots $left and $right share a mount namespace"
+            [ "${network_namespaces[$left]}" != "${network_namespaces[$right]}" ] \
+                || die "slots $left and $right share a network namespace"
+            [ "${cgroups[$left]}" != "${cgroups[$right]}" ] \
+                || die "slots $left and $right share a host cgroup"
+            [ "${bpf_roots[$left]}" != "${bpf_roots[$right]}" ] \
+                || die "slots $left and $right share a bpffs root"
+        done
+    done
     log "slot isolation checks passed"
 }
 
 status_slots() {
     local slot machine
     systemctl --no-pager --full status kuasar-ci-network.service || true
-    for slot in 1 2; do
+    for slot in "${SLOTS[@]}"; do
         machine="$(machine_name "$slot")"
         systemctl --no-pager --full status "systemd-nspawn@$machine.service" || true
         machinectl status "$machine" || true
@@ -915,7 +956,7 @@ usage() {
     cat <<'EOF'
 usage: provision.sh install
        provision.sh check
-       provision.sh register 1|2   # registration token on stdin
+       provision.sh register 1..6  # registration token on stdin
        provision.sh start
        provision.sh stop
        provision.sh verify

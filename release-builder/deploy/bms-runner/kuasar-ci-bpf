@@ -12,6 +12,6 @@ fi
     echo "$BPF_ROOT is not a bpffs mount" >&2
     exit 1
 }
-for machine in kuasar-ci-1 kuasar-ci-2; do
+for machine in kuasar-ci-{1..6}; do
     install -d -m 0700 "$BPF_ROOT/$machine"
 done
