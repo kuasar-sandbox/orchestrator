@@ -63,7 +63,7 @@ func TestCommandMatchesCurrentSession(t *testing.T) {
 		cmd  *routesync.Command
 		want bool
 	}{
-		{name: "legacy dormant path", cmd: &routesync.Command{}, want: true},
+		{name: "unfenced final command", cmd: &routesync.Command{}},
 		{name: "exact", cmd: &routesync.Command{NodeEpoch: 7, SessionSeq: 11}, want: true},
 		{name: "old epoch", cmd: &routesync.Command{NodeEpoch: 6, SessionSeq: 11}},
 		{name: "old session", cmd: &routesync.Command{NodeEpoch: 7, SessionSeq: 10}},
@@ -75,6 +75,9 @@ func TestCommandMatchesCurrentSession(t *testing.T) {
 				t.Fatalf("match = %v, want %v", got, tc.want)
 			}
 		})
+	}
+	if !commandMatchesSession(&routesync.Command{}, routesync.NodeRegister{}) {
+		t.Fatal("legacy command did not match a legacy zero-tuple session")
 	}
 }
 

@@ -312,25 +312,29 @@ func (p TerminalProof) Validate() error {
 }
 
 type RouteTombstoneState struct {
-	SandboxID        string                      `json:"sandbox_id,omitempty"`
-	NodeID           string                      `json:"node_id,omitempty"`
-	NodeEpoch        uint64                      `json:"node_epoch,omitempty"`
-	LastEventSeq     uint64                      `json:"last_event_seq,omitempty"`
-	Proof            TerminalProof               `json:"proof,omitempty"`
-	TerminalReason   string                      `json:"terminal_reason,omitempty"`
-	FailureRevision  Revision                    `json:"failure_revision,omitempty"`
-	PlacementFailure *RoutePlacementFailureState `json:"placement_failure,omitempty"`
+	SandboxID          string                      `json:"sandbox_id,omitempty"`
+	NodeID             string                      `json:"node_id,omitempty"`
+	NodeEpoch          uint64                      `json:"node_epoch,omitempty"`
+	RegistryGeneration string                      `json:"registry_generation,omitempty"`
+	BindingDigest      string                      `json:"binding_digest,omitempty"`
+	LastEventSeq       uint64                      `json:"last_event_seq,omitempty"`
+	Proof              TerminalProof               `json:"proof,omitempty"`
+	TerminalReason     string                      `json:"terminal_reason,omitempty"`
+	FailureRevision    Revision                    `json:"failure_revision,omitempty"`
+	PlacementFailure   *RoutePlacementFailureState `json:"placement_failure,omitempty"`
 }
 
 func (s RouteTombstoneState) Validate() error {
 	if s.PlacementFailure != nil {
 		if s.SandboxID != "" || s.NodeID != "" || s.NodeEpoch != 0 || s.LastEventSeq != 0 ||
-			s.TerminalReason != "" || s.Proof != (TerminalProof{}) || s.FailureRevision != (Revision{}) {
+			s.RegistryGeneration != "" || s.BindingDigest != "" || s.TerminalReason != "" ||
+			s.Proof != (TerminalProof{}) || s.FailureRevision != (Revision{}) {
 			return errors.New("cluster: placement-failure TOMBSTONE cannot contain an execution proof")
 		}
 		return s.PlacementFailure.Validate()
 	}
-	if s.SandboxID == "" || s.NodeID == "" || s.NodeEpoch == 0 || s.LastEventSeq == 0 || s.TerminalReason == "" {
+	if s.SandboxID == "" || s.NodeID == "" || s.NodeEpoch == 0 || s.RegistryGeneration == "" ||
+		!validDigest(s.BindingDigest) || s.LastEventSeq == 0 || s.TerminalReason == "" {
 		return errors.New("cluster: incomplete TOMBSTONE")
 	}
 	if s.Proof.FencedNodeID != s.NodeID || s.Proof.FencedNodeEpoch != s.NodeEpoch {
@@ -442,6 +446,9 @@ func (r RouteWorkflowRecord) Validate() error {
 			return err
 		}
 		if r.Tombstone.PlacementFailure == nil {
+			if err := validateProjectionRegistryGeneration(r.Revision, r.Tombstone.RegistryGeneration); err != nil {
+				return err
+			}
 			return validateFailureRevision(r.Revision, r.Tombstone.FailureRevision)
 		}
 		return nil
