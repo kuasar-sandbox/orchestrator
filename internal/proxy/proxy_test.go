@@ -201,6 +201,20 @@ func TestSandboxConnectCarriesCompleteFence(t *testing.T) {
 	if err := proxy.WriteSandboxConnect(io.Discard, request); err == nil {
 		t.Fatal("incomplete CONNECT fence accepted")
 	}
+	for name, mutate := range map[string]func(*proxy.SandboxConnectRequest){
+		"sandbox newline": func(r *proxy.SandboxConnectRequest) { r.SandboxID = "s1\r\nX-Forged: yes" },
+		"token newline":   func(r *proxy.SandboxConnectRequest) { r.AccessToken = "token\nforged" },
+		"node whitespace": func(r *proxy.SandboxConnectRequest) { r.ExpectedNodeID = " n1" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			candidate := request
+			candidate.ExpectedBindingDigest = "d1"
+			mutate(&candidate)
+			if err := proxy.WriteSandboxConnect(io.Discard, candidate); err == nil {
+				t.Fatal("unsafe CONNECT header value accepted")
+			}
+		})
+	}
 }
 
 func TestForwardHTTPStripsExecutionFenceHeaders(t *testing.T) {

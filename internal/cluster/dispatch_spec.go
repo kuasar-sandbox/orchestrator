@@ -84,6 +84,9 @@ func (s BuildDispatchSpecV1) Validate() error {
 	if err := validateDispatchRequest(s.Request, "/templates", "/v3/templates"); err != nil {
 		return fmt.Errorf("cluster: Build dispatch request: %w", err)
 	}
+	if err := validateBuildResourceCeilings(s.Request.Body, s.CPUCount, s.MemoryMB); err != nil {
+		return fmt.Errorf("cluster: Build dispatch request: %w", err)
+	}
 	return nil
 }
 
@@ -196,4 +199,54 @@ func validateDispatchRequest(request NodeRequestEnvelopeV1, paths ...string) err
 		return errors.New("cluster: request cannot supply system-owned metadata")
 	}
 	return nil
+}
+
+func validateBuildResourceCeilings(body []byte, cpuCount, memoryMB int) error {
+	fields, err := DecodeJSONObject(body)
+	if err != nil {
+		return err
+	}
+	for name := range fields {
+		for _, canonical := range []string{"cpuCount", "cpu_count", "memoryMB", "memory_mb"} {
+			if strings.EqualFold(name, canonical) && name != canonical {
+				return fmt.Errorf("resource field %q must use canonical spelling", name)
+			}
+		}
+	}
+	bodyCPU, err := aliasedPositiveInt(fields, "cpuCount", "cpu_count")
+	if err != nil {
+		return fmt.Errorf("CPU ceiling: %w", err)
+	}
+	bodyMemory, err := aliasedPositiveInt(fields, "memoryMB", "memory_mb")
+	if err != nil {
+		return fmt.Errorf("memory ceiling: %w", err)
+	}
+	if bodyCPU != cpuCount || bodyMemory != memoryMB {
+		return errors.New("replayed CPU or memory ceiling differs from normalized Build resources")
+	}
+	return nil
+}
+
+func aliasedPositiveInt(fields map[string]json.RawMessage, names ...string) (int, error) {
+	value := 0
+	found := false
+	for _, name := range names {
+		raw, ok := fields[name]
+		if !ok {
+			continue
+		}
+		var current int
+		if err := json.Unmarshal(raw, &current); err != nil || current <= 0 {
+			return 0, fmt.Errorf("%s must be a positive integer", name)
+		}
+		if found && current != value {
+			return 0, fmt.Errorf("conflicting %s aliases", names[0])
+		}
+		value = current
+		found = true
+	}
+	if !found {
+		return 0, fmt.Errorf("one of %s is required", strings.Join(names, "/"))
+	}
+	return value, nil
 }

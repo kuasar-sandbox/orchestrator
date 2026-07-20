@@ -110,10 +110,16 @@ func (r ReadRouteResponse) ValidateFor(request ReadRouteRequest) error {
 		if r.Route != nil {
 			return errors.New("routeapi: NOT_FOUND cannot carry a Route")
 		}
+		if r.LeaderHint != nil {
+			return errors.New("routeapi: NOT_FOUND cannot carry a leader hint")
+		}
 		return nil
 	case ReadConflict, ReadUnavailable:
 		if r.Route != nil {
 			return errors.New("routeapi: failed read cannot carry a Route")
+		}
+		if r.LeaderHint != nil {
+			return errors.New("routeapi: failed read cannot carry a leader hint")
 		}
 		return nil
 	default:
@@ -163,8 +169,12 @@ func (r ReadBuildResponse) ValidateFor(request ReadBuildRequest) error {
 			return errors.New("routeapi: positive Build read cannot carry a leader hint")
 		}
 		switch r.BuildState {
-		case clusterstate.BuildQueued, clusterstate.BuildRegistered, clusterstate.BuildBuilding,
-			clusterstate.BuildError:
+		case clusterstate.BuildQueued, clusterstate.BuildRegistered, clusterstate.BuildBuilding:
+			return nil
+		case clusterstate.BuildError:
+			if r.Build.Reason == "" {
+				return errors.New("routeapi: BUILD_ERROR requires a reason")
+			}
 			return nil
 		case clusterstate.BuildReady:
 			if r.Build.ArtifactRef == "" {
@@ -189,10 +199,16 @@ func (r ReadBuildResponse) ValidateFor(request ReadBuildRequest) error {
 		if r.Build != nil {
 			return errors.New("routeapi: NOT_FOUND Build read cannot carry a projection")
 		}
+		if r.LeaderHint != nil {
+			return errors.New("routeapi: NOT_FOUND Build read cannot carry a leader hint")
+		}
 		return nil
 	case ReadConflict, ReadUnavailable:
 		if r.Build != nil {
 			return errors.New("routeapi: failed Build read cannot carry a projection")
+		}
+		if r.LeaderHint != nil {
+			return errors.New("routeapi: failed Build read cannot carry a leader hint")
 		}
 		return nil
 	default:
