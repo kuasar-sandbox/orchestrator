@@ -173,6 +173,32 @@ func TestBuildReadResponseEnforcesOutcomeUnionAndReadyArtifact(t *testing.T) {
 	if err := ready.ValidateFor(buildRequest); err != nil {
 		t.Fatalf("READY Build with artifact: %v", err)
 	}
+	errorResponse := ReadBuildResponse{
+		Outcome: ReadReady, Group: "/g", Build: build,
+		BuildState: clusterstate.BuildError, BuildRevision: 1,
+	}
+	errorResponse.Build.ArtifactRef = ""
+	if err := errorResponse.ValidateFor(buildRequest); err == nil {
+		t.Fatal("BUILD_ERROR without a reason was accepted")
+	}
+	errorResponse.Build.Reason = "builder failed"
+	if err := errorResponse.ValidateFor(buildRequest); err != nil {
+		t.Fatalf("BUILD_ERROR with reason: %v", err)
+	}
+}
+
+func TestFinalNegativeReadsRejectLeaderHints(t *testing.T) {
+	hint := &LeaderHint{MemberID: "r1", Endpoint: "https://r1.internal", Term: 1}
+	routeRequest := routeRequest(true)
+	for _, outcome := range []string{ReadNotFound, ReadConflict, ReadUnavailable} {
+		if err := (ReadRouteResponse{Outcome: outcome, LeaderHint: hint}).ValidateFor(routeRequest); err == nil {
+			t.Fatalf("Route outcome %s accepted a leader hint", outcome)
+		}
+		buildRequest := ReadBuildRequest{RequestIdentity: routeRequest.RequestIdentity, Group: "/g", BuildID: "b1", Strong: true}
+		if err := (ReadBuildResponse{Outcome: outcome, LeaderHint: hint}).ValidateFor(buildRequest); err == nil {
+			t.Fatalf("Build outcome %s accepted a leader hint", outcome)
+		}
+	}
 }
 
 func routeRequest(strong bool) ReadRouteRequest {

@@ -10,6 +10,8 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+
+	"golang.org/x/net/http/httpguts"
 )
 
 // This file adds CONNECT tunneling to the data plane: a client opens a raw TCP
@@ -149,6 +151,17 @@ func WriteSandboxConnect(w io.Writer, request SandboxConnectRequest) error {
 	if request.HasExecutionFence() && (request.ExpectedNodeID == "" || request.ExpectedNodeEpoch == 0 ||
 		request.ExpectedRegistryGeneration == "" || request.ExpectedBindingDigest == "") {
 		return fmt.Errorf("proxy: incomplete execution fence")
+	}
+	for name, value := range map[string]string{
+		HeaderSandboxID:          request.SandboxID,
+		HeaderAccessToken:        request.AccessToken,
+		HeaderNodeID:             request.ExpectedNodeID,
+		HeaderRegistryGeneration: request.ExpectedRegistryGeneration,
+		HeaderBindingDigest:      request.ExpectedBindingDigest,
+	} {
+		if value != "" && (!httpguts.ValidHeaderFieldValue(value) || strings.TrimSpace(value) != value) {
+			return fmt.Errorf("proxy: invalid %s header value", name)
+		}
 	}
 	target := fmt.Sprintf("sandbox:%d", request.Port)
 	var b strings.Builder

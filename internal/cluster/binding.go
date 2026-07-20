@@ -185,8 +185,19 @@ func (b ExecutionBinding) validate() error {
 	if len(b.NodeID) > MaxExecutionBindingNodeIDSize {
 		return fmt.Errorf("cluster: execution binding node id exceeds %d bytes", MaxExecutionBindingNodeIDSize)
 	}
+	if err := ValidateExecutionBindingNodeID(b.NodeID); err != nil {
+		return err
+	}
 	if len(b.RegistryGeneration) > MaxExecutionBindingRegistryGenerationIDSize {
 		return fmt.Errorf("cluster: execution binding Registry History Generation exceeds %d bytes", MaxExecutionBindingRegistryGenerationIDSize)
+	}
+	for name, value := range map[string]string{
+		"object id":                   b.ObjectID,
+		"Registry History Generation": b.RegistryGeneration,
+	} {
+		if !validBindingHeaderValue(value) {
+			return fmt.Errorf("cluster: execution binding %s is not a canonical HTTP header value", name)
+		}
 	}
 	switch b.Kind {
 	case ExecutionKindSandbox:
@@ -204,6 +215,37 @@ func (b ExecutionBinding) validate() error {
 		return errors.New("cluster: execution binding node epoch is required")
 	}
 	return nil
+}
+
+// ValidateExecutionBindingNodeID applies every constraint required when a
+// durable node identity is later embedded in an execution Binding and CONNECT
+// fence. Enrollment calls this before making the node ID permanent.
+func ValidateExecutionBindingNodeID(nodeID string) error {
+	if nodeID == "" {
+		return errors.New("cluster: execution binding node id is required")
+	}
+	if len(nodeID) > MaxExecutionBindingNodeIDSize {
+		return fmt.Errorf("cluster: execution binding node id exceeds %d bytes", MaxExecutionBindingNodeIDSize)
+	}
+	if !utf8.ValidString(nodeID) {
+		return errors.New("cluster: execution binding node id is not valid UTF-8")
+	}
+	if !validBindingHeaderValue(nodeID) {
+		return errors.New("cluster: execution binding node id is not a canonical HTTP header value")
+	}
+	return nil
+}
+
+func validBindingHeaderValue(value string) bool {
+	if strings.TrimSpace(value) != value {
+		return false
+	}
+	for _, b := range []byte(value) {
+		if b < 0x20 || b == 0x7f {
+			return false
+		}
+	}
+	return true
 }
 
 func writeBindingString(w *bytes.Buffer, value string) {
