@@ -20,6 +20,7 @@ var (
 	ErrSessionUnavailable  = errors.New("session: current node-link session is unavailable")
 	ErrPermitUnavailable   = errors.New("session: matching Serve Permit is unavailable")
 	ErrKeyLeaseUnavailable = errors.New("session: exact node key lease is not durably acknowledged")
+	ErrDispatchNotSent     = errors.New("session: dispatch was not sent")
 )
 
 type ServeIdentity struct {
@@ -319,7 +320,7 @@ func (h *Holder) AdmitAndDispatch(ctx context.Context, command DispatchCommand) 
 	}
 	if held.keyLeases[keyLeaseRefID(keyLeaseRef)] <= h.clock().Unix() {
 		h.mu.RUnlock()
-		return DispatchReply{}, ErrKeyLeaseUnavailable
+		return DispatchReply{}, errors.Join(ErrDispatchNotSent, ErrKeyLeaseUnavailable)
 	}
 	endpoint := held.endpoint
 	command.SessionSeq = held.registration.SessionSeq

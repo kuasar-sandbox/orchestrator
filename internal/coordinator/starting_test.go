@@ -217,6 +217,27 @@ func TestAmbiguousDispatchPinsSelectedExecution(t *testing.T) {
 	}
 }
 
+func TestProvenPreSendFailureRetriesSelectedExecution(t *testing.T) {
+	record := routeStartingRecord(t, "s1", 1, candidatePool("n1", "n2"), nil)
+	store := &workflowStoreStub{route: record}
+	prober := &pairProberStub{responses: map[string]placement.PlacementProbeResponse{
+		"n1": probeResponse("n1", placement.ProbeImmediate, 100),
+		"n2": probeResponse("n2", placement.ProbeWouldQueue, 50),
+	}}
+	dispatcher := &dispatcherStub{store: store, results: map[string][]session.DispatchReply{}, errors: map[string]error{
+		"n1": errors.Join(session.ErrDispatchNotSent, session.ErrKeyLeaseUnavailable),
+	}}
+	coordinator := newTestCoordinator(t, store, prober, dispatcher, nil)
+	result, err := coordinator.RunRoute(context.Background(), record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != RunRetrySelected || result.Outcome != "" || result.Route == nil ||
+		*result.Route.Starting.SelectedCandidate != 0 || len(dispatcher.requests) != 1 {
+		t.Fatalf("result = %+v, requests=%+v", result, dispatcher.requests)
+	}
+}
+
 func TestLeaderRecoveryRetriesPersistedSelectionBeforeProbe(t *testing.T) {
 	record := routeStartingRecord(t, "s1", 1, candidatePool("n1", "n2"), nil)
 	probe := probeResponse("n2", placement.ProbeImmediate, 1)
