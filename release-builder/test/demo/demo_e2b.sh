@@ -128,7 +128,7 @@ chunker: { mode: cdc, cdc: { min: 128KiB, avg: 512KiB, max: 1MiB } }
 crypto: { chunk: aes, manifest: aes }
 EOF
 INSECURE=false; [ -n "${REGISTRY_INSECURE:-}" ] && INSECURE=true
-MK="$("$BIN/e2b-key-ctl" gen-key)"; ENC="$("$BIN/e2b-key-ctl" gen-key)"
+AUTH_KEY="$("$BIN/e2b-key-ctl" gen-key)"; MK="$("$BIN/e2b-key-ctl" gen-key)"; ENC="$("$BIN/e2b-key-ctl" gen-key)"
 # DEMO_MMDS=1: envd runs in FC mode + the orchestrator re-keys it via the metadata
 # service (envd-enforced, defense-in-depth). Unset: envd runs non-secure, the proxy is
 # the sole data-plane gate. Both modes make snapshot forks SDK-usable.
@@ -209,13 +209,14 @@ ok "orchestrator serving https://api.$DOMAIN"
 pause
 
 # ===========================================================================
-banner "Onboard a tenant (manifest key → allowlist + registry creds → e2b API key)"
+banner "Onboard a tenant (AuthKey + ManifestKey lease → e2b API key)"
 # ---------------------------------------------------------------------------
 REG_FLAGS=(); [ -n "${REGISTRY_USER:-}" ] && REG_FLAGS=(--registry-username "$REGISTRY_USER" --registry-password "${REGISTRY_PASS:-}")
-say "allowlist the tenant manifest key + its default registry pull creds (so the node can pull $REGISTRY):"
-echo "${c_cmd}  \$ node-ctl manifest-key add ${REG_FLAGS:+--registry-username … } \$MANIFEST_KEY${c_off}"
-"$BIN/node-ctl" manifest-key add --socket "$WORK/node-ctl.socket" "${REG_FLAGS[@]}" "$MK" >/dev/null || die "manifest-key add"
-AK="$("$BIN/e2b-key-ctl" gen-apikey "$MK")"
+say "install the tenant dual-key lease + default registry pull creds (so the node can pull $REGISTRY):"
+echo "${c_cmd}  \$ node-ctl key-lease put --group /demo --auth-key \$AUTH_KEY --manifest-key \$MANIFEST_KEY${c_off}"
+"$BIN/node-ctl" key-lease put --socket "$WORK/node-ctl.socket" --group /demo \
+    --auth-key "$AUTH_KEY" --manifest-key "$MK" "${REG_FLAGS[@]}" >/dev/null || die "key-lease put"
+AK="$("$BIN/e2b-key-ctl" gen-apikey "$AUTH_KEY")"
 ok "tenant ready — e2b API key ${AK:0:16}…  (format e2b_<hex>)"
 # world-readable env for another terminal to drive the Python SDK against this node
 cat > "$CLI_ENV_FILE" <<EOF
