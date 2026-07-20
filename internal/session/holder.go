@@ -16,6 +16,7 @@ var (
 	ErrHolderLimit         = errors.New("session: Holder registration limit reached")
 	ErrStaleSession        = errors.New("session: stale node-link session")
 	ErrEndpointChanged     = errors.New("session: data endpoint changed within NodeEpoch")
+	ErrRegistrationChanged = errors.New("session: stable registration data changed within NodeEpoch")
 	ErrEnrollmentChanged   = errors.New("session: node enrollment identity changed")
 	ErrSessionUnavailable  = errors.New("session: current node-link session is unavailable")
 	ErrPermitUnavailable   = errors.New("session: matching Serve Permit is unavailable")
@@ -82,7 +83,8 @@ type Registration struct {
 }
 
 func (r Registration) Validate() error {
-	if r.NodeID == "" || r.EnrollmentID == "" || !r.Tuple.Valid() || r.DataEndpoint == "" || r.LoadModelVersion == 0 || r.SandboxSlots == 0 {
+	if r.NodeID == "" || r.EnrollmentID == "" || !r.Tuple.Valid() || r.DataEndpoint == "" ||
+		r.LoadModelVersion == 0 || (r.SandboxSlots == 0 && r.BuildSlots == 0) {
 		return errors.New("session: incomplete node registration")
 	}
 	return nil
@@ -125,6 +127,7 @@ type Holder struct {
 	enroll   EnrollmentAuthority
 	active   map[string]*heldSession
 	high     map[string]Registration
+	keyOps   [64]sync.Mutex
 }
 
 func NewHolder(memberID string, limit int, clock func() time.Time, gate PermitGate, publisher DeltaPublisher, enrollment EnrollmentAuthority) (*Holder, error) {
@@ -163,6 +166,10 @@ func (h *Holder) Register(ctx context.Context, registration Registration, endpoi
 			if registration.NodeEpoch == previous.NodeEpoch && registration.DataEndpoint != previous.DataEndpoint {
 				h.mu.Unlock()
 				return ErrEndpointChanged
+			}
+			if registration.NodeEpoch == previous.NodeEpoch && !registrationStableWithinEpoch(registration, previous) {
+				h.mu.Unlock()
+				return ErrRegistrationChanged
 			}
 			if registration.Tuple.Compare(previous.Tuple) <= 0 {
 				h.mu.Unlock()
@@ -208,10 +215,10 @@ func (h *Holder) RetireIdentity(ctx context.Context, retirement IdentityRetireme
 			h.mu.Unlock()
 			return false, nil
 		}
+		registration = previous
 		delete(h.high, retirement.NodeID)
 		if held := h.active[retirement.NodeID]; held != nil &&
 			held.registration.EnrollmentID == retirement.EnrollmentID && held.registration.NodeEpoch <= retirement.LastNodeEpoch {
-			registration = held.registration
 			endpoint = held.endpoint
 			delete(h.active, retirement.NodeID)
 		}
@@ -219,8 +226,8 @@ func (h *Holder) RetireIdentity(ctx context.Context, retirement IdentityRetireme
 
 		if endpoint != nil {
 			endpoint.FenceStaleSession()
-			h.publish(DirectoryDelta{Entry: h.directoryEntry(registration), Up: false})
 		}
+		h.publish(DirectoryDelta{Entry: h.directoryEntry(registration), Retired: true})
 		return true, nil
 	})
 }
@@ -261,8 +268,8 @@ func (h *Holder) Probe(ctx context.Context, call ProbeCall) (placement.Placement
 	if err := ctx.Err(); err != nil {
 		return placement.PlacementProbeResponse{}, err
 	}
-	if h.gate == nil || !h.gate.AllowSessionWork(call.ServeIdentity) {
-		return placement.PlacementProbeResponse{}, ErrPermitUnavailable
+	if err := h.CheckServe(call.ServeIdentity); err != nil {
+		return placement.PlacementProbeResponse{}, err
 	}
 	h.mu.RLock()
 	session := h.active[call.Request.NodeID]
@@ -366,7 +373,18 @@ func (h *Holder) remove(nodeID string, tuple Tuple) {
 }
 
 func (h *Holder) directoryEntry(registration Registration) DirectoryEntry {
-	return DirectoryEntry{NodeID: registration.NodeID, Tuple: registration.Tuple, HolderMemberID: h.memberID}
+	return DirectoryEntry{
+		NodeID: registration.NodeID, EnrollmentID: registration.EnrollmentID,
+		Tuple: registration.Tuple, HolderMemberID: h.memberID,
+	}
+}
+
+func registrationStableWithinEpoch(left, right Registration) bool {
+	return left.EnrollmentID == right.EnrollmentID && left.DataEndpoint == right.DataEndpoint &&
+		left.RuntimeDigest == right.RuntimeDigest && left.LoadModelVersion == right.LoadModelVersion &&
+		left.SandboxSlots == right.SandboxSlots && left.BuildSlots == right.BuildSlots &&
+		left.BuildCPU == right.BuildCPU && left.BuildMemory == right.BuildMemory &&
+		left.BuildStorage == right.BuildStorage && left.FailureDomain == right.FailureDomain
 }
 
 func (h *Holder) publish(delta DirectoryDelta) {

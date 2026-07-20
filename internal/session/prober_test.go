@@ -54,7 +54,7 @@ func (s *probeRPCStub) snapshotCalls() []probeBatchCall {
 }
 
 func TestDirectoryProberBatchesCandidatesOnSameHolder(t *testing.T) {
-	directory := NewDirectory()
+	directory := newTestDirectory()
 	applyDirectoryUp(t, directory, "n1", "r1", 7, 10)
 	applyDirectoryUp(t, directory, "n2", "r1", 8, 20)
 	rpc := &probeRPCStub{}
@@ -75,7 +75,7 @@ func TestDirectoryProberBatchesCandidatesOnSameHolder(t *testing.T) {
 }
 
 func TestDirectoryProberCallsDifferentHoldersInParallel(t *testing.T) {
-	directory := NewDirectory()
+	directory := newTestDirectory()
 	applyDirectoryUp(t, directory, "n1", "r1", 7, 10)
 	applyDirectoryUp(t, directory, "n2", "r2", 8, 20)
 	started := make(chan string, 2)
@@ -108,7 +108,7 @@ func TestDirectoryProberCallsDifferentHoldersInParallel(t *testing.T) {
 }
 
 func TestDirectoryProberFailsClosedForMissingOrBadHolder(t *testing.T) {
-	directory := NewDirectory()
+	directory := newTestDirectory()
 	applyDirectoryUp(t, directory, "n1", "r1", 7, 10)
 	rpc := &probeRPCStub{err: errors.New("permit expired")}
 	prober, err := NewDirectoryProber(directory, rpc)
@@ -126,7 +126,8 @@ func TestDirectoryProberFailsClosedForMissingOrBadHolder(t *testing.T) {
 func applyDirectoryUp(t *testing.T, directory *Directory, nodeID, holderID string, epoch, seq uint64) {
 	t.Helper()
 	if !directory.Apply(DirectoryDelta{Up: true, Entry: DirectoryEntry{
-		NodeID: nodeID, HolderMemberID: holderID, Tuple: Tuple{NodeEpoch: epoch, SessionSeq: seq},
+		NodeID: nodeID, EnrollmentID: "enrollment-" + nodeID, HolderMemberID: holderID,
+		Tuple: Tuple{NodeEpoch: epoch, SessionSeq: seq},
 	}}) {
 		t.Fatal("directory update was ignored")
 	}
