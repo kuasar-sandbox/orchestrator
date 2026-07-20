@@ -921,11 +921,11 @@ registry 上行下发命令。serve 复用既有 e2b 生命周期原语(§8 / §
 
   | 命令 | 节点动作 |
   |---|---|
-  | `create{cmd_id, sid, template_ref, key_fp, config}` | 冷启 `template_ref` + 保存/合并 `config`(§8;snp 模板 = 快照恢复快启);`key_fp` 选本机租约 manifest_key;cluster 身份已由 registry 放在 `config` metadata 中,node 不解析 |
+  | `create{cmd_id, sid, template_ref, auth_key_fingerprint, manifest_key_fingerprint, dispatch_spec}` | 仅在完整双密钥租约已持久 ACK 后创建；AuthKey 用于 API auth，ManifestKey 仅用于内容加密；cluster Binding 由系统命令注入保留 opaque metadata |
   | `connect{cmd_id, sid}` | 恢复本机 PAUSED 沙箱(§8 auto-resume) |
   | `delete{cmd_id, sid}` | 销毁沙箱(§5 kill) |
-  | `key_put` / `key_drop{fingerprint, manifest_key?, expires_unix}` | `key_put` 写 / 重发续租 `manifest_keys` 租约项;`key_drop` best-effort 清理,正确性依赖 TTL 淘汰(§7);registry 的密钥分发见 cluster.md |
-  | `build_register{build_id, template_id, profile, resources, image_repo, registry_auth, key_fp, config}` | 预配 registry 分配的构建(§12;`profile` 必填且只接受 e2b/bare;按指纹解析 key、建 build 记录、瞬态用镜像凭据);`config` metadata 原样保存,构建态经 `build_event` 上报 |
+  | `key_put{group, auth_key, manifest_key, registry_auth, expires_unix}` / `key_drop{group, auth_key_fingerprint, manifest_key_fingerprint}` | `key_put` 加密落盘完整租约并回显 exact lease ref；`key_drop` best-effort，正确性依赖 TTL 淘汰 |
+  | `build_register{build_id, template_id, profile, cpu, memory, auth_key_fingerprint, manifest_key_fingerprint, dispatch_spec}` | 持久注册节点本地 Build 与不可放大的 CPU/memory ceiling；后续 Trigger/状态/日志只在该节点处理 |
 
 无 `drain` 命令。节点排空 / 维护由节点侧发起(node-resource.md §2.5 资源 drain 或本机维护策略),
 集群侧只停止向其分配。

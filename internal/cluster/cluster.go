@@ -58,7 +58,7 @@ func (v MemberView) Owners(key string, n int) ([]string, error) {
 type Secret struct {
 	Type        string `json:"type"`                  // inline | ref
 	Value       string `json:"value,omitempty"`       // inline secret or provider reference
-	Fingerprint string `json:"fingerprint,omitempty"` // required for ref manifest_key key_put/precheck
+	Fingerprint string `json:"fingerprint,omitempty"` // required for referenced AuthKey/ManifestKey material
 }
 
 func (s *Secret) UnmarshalJSON(raw []byte) error {
@@ -97,31 +97,33 @@ const (
 
 // SandboxGroup is the group-level configuration consumed by route_link/placer.
 type SandboxGroup struct {
-	Group        string            `json:"group"`
-	Config       map[string]string `json:"sandbox_config,omitempty"`
-	ImageRepo    string            `json:"image_repo,omitempty"`
-	RegistryAuth Secret            `json:"registry_auth,omitempty"`
-	TemplateRef  string            `json:"template_ref,omitempty"`
-	TargetPort   int               `json:"target_port,omitempty"`
-	Metadata     map[string]string `json:"metadata,omitempty"`
+	Group                 string            `json:"group"`
+	Config                map[string]string `json:"sandbox_config,omitempty"`
+	ImageRepo             string            `json:"image_repo,omitempty"`
+	RegistryAuth          Secret            `json:"registry_auth,omitempty"`
+	TemplateRef           string            `json:"template_ref,omitempty"`
+	AllowTemplateOverride bool              `json:"allow_template_override,omitempty"`
+	TargetPort            int               `json:"target_port,omitempty"`
+	Metadata              map[string]string `json:"metadata,omitempty"`
 }
 
 // SandboxGroupRecord is the importer record owned by placer/provider side. It is
 // intentionally richer than SandboxGroup: placer needs placement selectors and
-// secret material to answer Place and refresh node_link manifest-key cache.
+// secret material to answer Place and refresh complete node key leases.
 type SandboxGroupRecord struct {
-	Group         string              `json:"group"`
-	ProjectID     string              `json:"project_id,omitempty"`
-	ManifestKey   Secret              `json:"manifest_key,omitempty"`
-	AuthKey       Secret              `json:"auth_key,omitempty"`
-	RegistryAuth  Secret              `json:"registry_auth,omitempty"`
-	Config        map[string]string   `json:"sandbox_config,omitempty"`
-	ImageRepo     string              `json:"image_repo,omitempty"`
-	TemplateRef   string              `json:"template_ref,omitempty"`
-	TargetPort    int                 `json:"target_port,omitempty"`
-	Metadata      map[string]string   `json:"metadata,omitempty"`
-	NodeSelectors []map[string]string `json:"node_selectors,omitempty"`
-	ShuffleLabels map[string]string   `json:"shuffle_labels,omitempty"`
+	Group                 string              `json:"group"`
+	ProjectID             string              `json:"project_id,omitempty"`
+	ManifestKey           Secret              `json:"manifest_key,omitempty"`
+	AuthKey               Secret              `json:"auth_key,omitempty"`
+	RegistryAuth          Secret              `json:"registry_auth,omitempty"`
+	Config                map[string]string   `json:"sandbox_config,omitempty"`
+	ImageRepo             string              `json:"image_repo,omitempty"`
+	TemplateRef           string              `json:"template_ref,omitempty"`
+	AllowTemplateOverride bool                `json:"allow_template_override,omitempty"`
+	TargetPort            int                 `json:"target_port,omitempty"`
+	Metadata              map[string]string   `json:"metadata,omitempty"`
+	NodeSelectors         []map[string]string `json:"node_selectors,omitempty"`
+	ShuffleLabels         map[string]string   `json:"shuffle_labels,omitempty"`
 }
 
 // PlacementHint is the raw placement input. Placer folds shuffle-sharding into
@@ -141,8 +143,8 @@ type GroupPage struct {
 type SandboxGroupProvider interface {
 	Get(ctx context.Context, group string) (SandboxGroup, bool, error)
 	GetPlacementHint(ctx context.Context, group string) (PlacementHint, bool, error)
-	GetKey(ctx context.Context, group string) (Secret, bool, error)     // manifest-key, node-facing
-	GetAuthKey(ctx context.Context, group string) (Secret, bool, error) // auth-key, router/node-facing
+	GetManifestKey(ctx context.Context, group string) (Secret, bool, error) // content key, node-facing
+	GetAuthKey(ctx context.Context, group string) (Secret, bool, error)     // API auth key, router/node-facing
 }
 
 type SandboxGroupImporter interface {
