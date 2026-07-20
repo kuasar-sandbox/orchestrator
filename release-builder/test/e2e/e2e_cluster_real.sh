@@ -526,6 +526,7 @@ for idx in range(1, 80):
     msg = {
         "type": "node_register",
         "node_register": {
+            "version": 3,
             "node_id": node_id,
             "labels": {"pool": "probe"},
             "data_endpoint": "127.0.0.1:1",
