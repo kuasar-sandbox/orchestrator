@@ -43,7 +43,9 @@ func TestDirectBuildRequestUsesProtectedObjectBinding(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := st.PutBuild(context.Background(), &types.Build{
-		BuildID: "build-1", TemplateID: "transient-build-1", ManifestKey: strings.Repeat("1", 64),
+		BuildID: "build-1", TemplateID: "transient-build-1",
+		AuthKey: strings.Repeat("2", 64), ManifestKey: strings.Repeat("1", 64),
+		CPUCount: 1, MemoryMB: 512,
 		Profile: types.ProfileBare, Kind: types.KindImg, Status: types.BuildRegistered,
 		Metadata: metadata, CreatedUnix: 1,
 	}); err != nil {

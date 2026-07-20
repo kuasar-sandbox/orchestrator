@@ -53,27 +53,29 @@ type recoveryClaimSnapshotRow struct {
 }
 
 type dataSnapshot struct {
-	FormatVersion      uint32                     `json:"format_version"`
-	Initialized        bool                       `json:"initialized"`
-	ClusterID          string                     `json:"cluster_id"`
-	RegistryGeneration string                     `json:"registry_generation"`
-	ShardID            uint32                     `json:"shard_id"`
-	SchemaVersion      uint32                     `json:"schema_version"`
-	ProtocolVersion    uint32                     `json:"protocol_version"`
-	HashVersion        string                     `json:"hash_version"`
-	RouteBucketCount   uint32                     `json:"route_bucket_count"`
-	BuildBucketCount   uint32                     `json:"build_bucket_count"`
-	VirtualShardCount  uint32                     `json:"virtual_shard_count"`
-	ReplicaIDs         []uint64                   `json:"replica_ids"`
-	PreparedReplicaIDs []uint64                   `json:"prepared_replica_ids,omitempty"`
-	ServingEpochs      []PermitIdentity           `json:"serving_epochs"`
-	Routes             []routeSnapshotRow         `json:"routes"`
-	Builds             []buildSnapshotRow         `json:"builds"`
-	Fences             []fenceSnapshotRow         `json:"fences"`
-	Recovery           *DataRecoveryState         `json:"recovery,omitempty"`
-	RecoveryRecords    []recoverySnapshotRow      `json:"recovery_records,omitempty"`
-	RecoveryClaims     []recoveryClaimSnapshotRow `json:"recovery_claims,omitempty"`
-	LastApplied        uint64                     `json:"last_applied"`
+	FormatVersion        uint32                     `json:"format_version"`
+	Initialized          bool                       `json:"initialized"`
+	ClusterID            string                     `json:"cluster_id"`
+	RegistryGeneration   string                     `json:"registry_generation"`
+	ShardID              uint32                     `json:"shard_id"`
+	SchemaVersion        uint32                     `json:"schema_version"`
+	ProtocolVersion      uint32                     `json:"protocol_version"`
+	HashVersion          string                     `json:"hash_version"`
+	RouteBucketCount     uint32                     `json:"route_bucket_count"`
+	BuildBucketCount     uint32                     `json:"build_bucket_count"`
+	VirtualShardCount    uint32                     `json:"virtual_shard_count"`
+	ReplicaIDs           []uint64                   `json:"replica_ids"`
+	PreparedReplicaIDs   []uint64                   `json:"prepared_replica_ids,omitempty"`
+	ServingEpochs        []PermitIdentity           `json:"serving_epochs"`
+	RouteChangefeedFloor uint64                     `json:"route_changefeed_floor"`
+	RouteChanges         []RouteChange              `json:"route_changes,omitempty"`
+	Routes               []routeSnapshotRow         `json:"routes"`
+	Builds               []buildSnapshotRow         `json:"builds"`
+	Fences               []fenceSnapshotRow         `json:"fences"`
+	Recovery             *DataRecoveryState         `json:"recovery,omitempty"`
+	RecoveryRecords      []recoverySnapshotRow      `json:"recovery_records,omitempty"`
+	RecoveryClaims       []recoveryClaimSnapshotRow `json:"recovery_claims,omitempty"`
+	LastApplied          uint64                     `json:"last_applied"`
 }
 
 func encodeSystemSnapshot(state SystemState) ([]byte, error) {
@@ -115,8 +117,11 @@ func encodeDataSnapshot(state DataState) ([]byte, error) {
 		SchemaVersion: state.SchemaVersion, ProtocolVersion: state.ProtocolVersion, HashVersion: state.HashVersion,
 		RouteBucketCount: state.RouteBucketCount, BuildBucketCount: state.BuildBucketCount,
 		VirtualShardCount: state.VirtualShardCount, ReplicaIDs: append([]uint64(nil), state.ReplicaIDs...),
-		PreparedReplicaIDs: append([]uint64(nil), state.PreparedReplicaIDs...),
-		ServingEpochs:      append([]PermitIdentity(nil), state.ServingEpochs...), LastApplied: state.LastApplied,
+		PreparedReplicaIDs:   append([]uint64(nil), state.PreparedReplicaIDs...),
+		ServingEpochs:        append([]PermitIdentity(nil), state.ServingEpochs...),
+		RouteChangefeedFloor: state.RouteChangefeedFloor,
+		RouteChanges:         append([]RouteChange(nil), state.RouteChanges...),
+		LastApplied:          state.LastApplied,
 	}
 	if state.Recovery != nil {
 		recovery := *state.Recovery
@@ -167,20 +172,24 @@ func decodeDataSnapshot(raw []byte) (DataState, error) {
 		SchemaVersion: snapshot.SchemaVersion, ProtocolVersion: snapshot.ProtocolVersion, HashVersion: snapshot.HashVersion,
 		RouteBucketCount: snapshot.RouteBucketCount, BuildBucketCount: snapshot.BuildBucketCount,
 		VirtualShardCount: snapshot.VirtualShardCount, ReplicaIDs: append([]uint64(nil), snapshot.ReplicaIDs...),
-		PreparedReplicaIDs: append([]uint64(nil), snapshot.PreparedReplicaIDs...),
-		ServingEpochs:      append([]PermitIdentity(nil), snapshot.ServingEpochs...),
-		Routes:             make(map[string]clusterstate.RouteWorkflowRecord, len(snapshot.Routes)),
-		Builds:             make(map[string]clusterstate.BuildRecord, len(snapshot.Builds)),
-		Fences:             make(map[string]clusterstate.ExecutionFence, len(snapshot.Fences)), LastApplied: snapshot.LastApplied,
-		RecoveryRecords: make(map[string]RecoveryObjectRecord, len(snapshot.RecoveryRecords)),
-		RecoveryClaims:  make(map[string]string, len(snapshot.RecoveryClaims)),
+		PreparedReplicaIDs:   append([]uint64(nil), snapshot.PreparedReplicaIDs...),
+		ServingEpochs:        append([]PermitIdentity(nil), snapshot.ServingEpochs...),
+		RouteChangefeedFloor: snapshot.RouteChangefeedFloor,
+		RouteChanges:         append([]RouteChange(nil), snapshot.RouteChanges...),
+		Routes:               make(map[string]clusterstate.RouteWorkflowRecord, len(snapshot.Routes)),
+		Builds:               make(map[string]clusterstate.BuildRecord, len(snapshot.Builds)),
+		Fences:               make(map[string]clusterstate.ExecutionFence, len(snapshot.Fences)),
+		LastApplied:          snapshot.LastApplied,
+		RecoveryRecords:      make(map[string]RecoveryObjectRecord, len(snapshot.RecoveryRecords)),
+		RecoveryClaims:       make(map[string]string, len(snapshot.RecoveryClaims)),
 	}
 	if snapshot.Recovery != nil {
 		recovery := *snapshot.Recovery
 		state.Recovery = &recovery
 	}
 	if !state.Initialized {
-		if len(snapshot.Routes) != 0 || len(snapshot.Builds) != 0 || len(snapshot.Fences) != 0 ||
+		if snapshot.RouteChangefeedFloor != 0 || len(snapshot.RouteChanges) != 0 ||
+			len(snapshot.Routes) != 0 || len(snapshot.Builds) != 0 || len(snapshot.Fences) != 0 ||
 			snapshot.Recovery != nil || len(snapshot.RecoveryRecords) != 0 || len(snapshot.RecoveryClaims) != 0 {
 			return DataState{}, errors.New("raftstore: uninitialized data snapshot contains rows")
 		}

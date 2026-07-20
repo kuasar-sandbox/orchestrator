@@ -179,17 +179,3 @@ func (o *Orchestrator) rebindClusterExecution(ctx context.Context, command *rout
 	}
 	return nil
 }
-
-func (o *Orchestrator) resolveByFingerprint(ctx context.Context, fingerprint string) (string, error) {
-	if fingerprint == "" {
-		return "", errors.New("cluster: empty manifest-key fingerprint")
-	}
-	candidates, err := o.st.AllowedManifestKeysByHash(ctx, fingerprint)
-	if err != nil {
-		return "", err
-	}
-	if len(candidates) == 0 {
-		return "", fmt.Errorf("cluster: no allowlisted manifest key for fingerprint %s", fingerprint)
-	}
-	return candidates[0], nil
-}

@@ -2,12 +2,16 @@ package controlplane
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"net/http"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/placement"
 	"github.com/kuasar-sandbox/orchestrator/internal/placer"
@@ -155,33 +159,66 @@ func (p *servicePlanner) Plan(_ context.Context, request placer.PlanRequest) (pl
 	}
 	switch request.Kind {
 	case placer.PlanSandbox:
+		lease := serviceKeyLease(request.Group)
 		demand, err := placement.NormalizeSandboxDemand(request.Sandbox.Demand)
+		if err != nil {
+			return placer.PlanResponse{}, err
+		}
+		nodeRequest, err := api.RewriteSandboxCreateEnvelope(
+			request.Sandbox.Request, "e2b-img-"+strings.Repeat("c", 64),
+			request.Sandbox.TimeoutSeconds, clusterstate.WithoutSystemMetadata(request.Sandbox.Config),
+		)
 		if err != nil {
 			return placer.PlanResponse{}, err
 		}
 		spec, err := clusterstate.MarshalSandboxDispatchSpec(clusterstate.SandboxDispatchSpecV1{
 			Version: clusterstate.DispatchSpecVersionV1, TemplateRef: "e2b-img-" + strings.Repeat("c", 64),
-			KeyFingerprint: strings.Repeat("a", 24), TargetRuntimeDigest: request.TargetRuntimeDigest,
-			RequestedConfig: clusterstate.WithoutSystemMetadata(request.Sandbox.Config),
-			Config:          clusterstate.WithoutSystemMetadata(request.Sandbox.Config),
-			AccessToken:     "access", TargetPort: 3000, TimeoutSeconds: request.Sandbox.TimeoutSeconds,
+			AuthKeyFingerprint: lease.AuthKey.Fingerprint, ManifestKeyFingerprint: lease.ManifestKey.Fingerprint,
+			TargetRuntimeDigest: request.TargetRuntimeDigest,
+			RequestedConfig:     clusterstate.WithoutSystemMetadata(request.Sandbox.Config),
+			Config:              clusterstate.WithoutSystemMetadata(request.Sandbox.Config),
+			AccessToken:         "access", TargetPort: 3000, TimeoutSeconds: request.Sandbox.TimeoutSeconds,
+			Request: nodeRequest,
 		})
 		return placer.PlanResponse{Candidates: candidates, NormalizedDemand: demand, DispatchSpec: spec, ProviderPolicyVersion: "policy-v1"}, err
 	case placer.PlanBuild:
+		lease := serviceKeyLease(request.Group)
 		demand, err := placement.NormalizeBuildDemand(request.Build.Demand)
+		if err != nil {
+			return placer.PlanResponse{}, err
+		}
+		nodeRequest, err := api.RewriteBuildRegisterEnvelope(request.Build.Request, api.RegisterSpec{
+			Name: request.Build.Names[0], Tags: request.Build.Aliases, Profile: request.Build.Profile,
+			CPUCount: request.Build.CPUCount, MemoryMB: request.Build.MemoryMB,
+			Metadata: clusterstate.WithoutSystemMetadata(request.Build.Metadata),
+		})
 		if err != nil {
 			return placer.PlanResponse{}, err
 		}
 		spec, err := clusterstate.MarshalBuildDispatchSpec(clusterstate.BuildDispatchSpecV1{
 			Version: clusterstate.DispatchSpecVersionV1, TemplateID: request.Build.TemplateID,
-			KeyFingerprint: strings.Repeat("b", 24), TargetRuntimeDigest: request.TargetRuntimeDigest,
-			Profile: request.Build.Profile, Names: request.Build.Names, Aliases: request.Build.Aliases,
-			Metadata: clusterstate.WithoutSystemMetadata(request.Build.Metadata), Builder: request.Build.Builder,
+			AuthKeyFingerprint: lease.AuthKey.Fingerprint, ManifestKeyFingerprint: lease.ManifestKey.Fingerprint,
+			TargetRuntimeDigest: request.TargetRuntimeDigest,
+			Profile:             request.Build.Profile, Names: request.Build.Names, Aliases: request.Build.Aliases,
+			Metadata: clusterstate.WithoutSystemMetadata(request.Build.Metadata),
+			CPUCount: request.Build.CPUCount, MemoryMB: request.Build.MemoryMB, Request: nodeRequest,
 		})
 		return placer.PlanResponse{Candidates: candidates, NormalizedDemand: demand, DispatchSpec: spec, ProviderPolicyVersion: "policy-v1"}, err
 	default:
 		return placer.PlanResponse{}, fmt.Errorf("unexpected plan kind %q", request.Kind)
 	}
+}
+
+func (p *servicePlanner) ResolveKeyLease(
+	_ context.Context,
+	request placer.KeyLeaseRequest,
+) (routesync.NodeKeyLeaseV1, error) {
+	lease := serviceKeyLease(request.Group)
+	if request.AuthKeyFingerprint != lease.AuthKey.Fingerprint ||
+		request.ManifestKeyFingerprint != lease.ManifestKey.Fingerprint {
+		return routesync.NodeKeyLeaseV1{}, fmt.Errorf("unexpected key lease request: %+v", request)
+	}
+	return lease, nil
 }
 
 func (p *servicePlanner) callCount() int {
@@ -229,6 +266,20 @@ func (serviceCommandSender) SendNodeCommand(
 	context.Context, session.ServeIdentity, string, uint64, string, *routesync.Command,
 ) (routesync.CmdAck, bool, error) {
 	return routesync.CmdAck{}, false, nil
+}
+
+func (serviceCommandSender) InstallKeyLease(
+	_ context.Context,
+	_ session.ServeIdentity,
+	_ string,
+	_ uint64,
+	_ string,
+	lease routesync.NodeKeyLeaseV1,
+) (routesync.NodeKeyLeaseRefV1, bool, error) {
+	return routesync.NodeKeyLeaseRefV1{
+		Version: routesync.NodeKeyLeaseVersionV1, Group: lease.Group,
+		AuthKeyFingerprint: lease.AuthKey.Fingerprint, ManifestKeyFingerprint: lease.ManifestKey.Fingerprint,
+	}, true, nil
 }
 
 func newRegistryServiceFixture(
@@ -279,12 +330,20 @@ func sandboxMutationRequest(t *testing.T, store *RaftStore) routeapi.ReserveSand
 	if err != nil {
 		t.Fatal(err)
 	}
+	nodeRequest, err := clusterstate.NewNodeRequestEnvelopeV1(
+		http.MethodPost, "/sandboxes", "feature=1", map[string][]string{"X-Node-Extension": {"keep"}},
+		[]byte(`{"templateID":"caller-template","metadata":{"request":"value"},"extension":{"keep":true}}`),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
 	return routeapi.ReserveSandboxRequest{
 		RequestIdentity: identity, Group: "/group", RouteKey: "route-1",
 		Input: routeapi.SandboxInput{
 			Config: map[string]string{"request": "value"}, TimeoutSeconds: 30,
 			Demand:              placement.SandboxDemand{SlotUnits: 1, StartupBudgetMemory: 1024},
 			TargetRuntimeDigest: "runtime-v1",
+			Request:             nodeRequest,
 		},
 	}
 }
@@ -295,14 +354,38 @@ func buildMutationRequest(t *testing.T, store *RaftStore) routeapi.RegisterBuild
 	if err != nil {
 		t.Fatal(err)
 	}
+	nodeRequest, err := clusterstate.NewNodeRequestEnvelopeV1(
+		http.MethodPost, "/v3/templates", "feature=1", map[string][]string{"X-Node-Extension": {"keep"}},
+		[]byte(`{"name":"name","tags":["alias"],"profile":"bare","cpu_count":100,"memory_mb":1024,"metadata":{"request":"value"},"extension":{"keep":true}}`),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
 	return routeapi.RegisterBuildRequest{
 		RequestIdentity: identity, Group: "/group", BuildID: "build-1",
 		Input: routeapi.BuildInput{
 			TemplateID: "transient-template", Profile: types.ProfileBare,
 			Names: []string{"name"}, Aliases: []string{"alias"},
+			CPUCount: 100, MemoryMB: 1024,
 			Metadata:            map[string]string{"request": "value"},
 			Demand:              placement.BuildDemand{Slots: 1, CPU: 100, Memory: 1024, Storage: 4096},
 			TargetRuntimeDigest: "runtime-v1",
+			Request:             nodeRequest,
 		},
+	}
+}
+
+func serviceKeyLease(group string) routesync.NodeKeyLeaseV1 {
+	material := func(value string) routesync.NodeKeyMaterialV1 {
+		raw, _ := hex.DecodeString(value)
+		digest := sha256.Sum256(raw)
+		return routesync.NodeKeyMaterialV1{
+			Type: routesync.KeyMaterialInline, Value: value, Fingerprint: hex.EncodeToString(digest[:12]),
+		}
+	}
+	return routesync.NodeKeyLeaseV1{
+		Version: routesync.NodeKeyLeaseVersionV1, Group: group,
+		AuthKey: material(strings.Repeat("a", 64)), ManifestKey: material(strings.Repeat("b", 64)),
+		ExpiresUnix: time.Now().Add(time.Hour).Unix(),
 	}
 }

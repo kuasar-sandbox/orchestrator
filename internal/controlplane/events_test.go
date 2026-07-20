@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"net/http"
 	"strings"
 	"testing"
 
@@ -234,17 +235,29 @@ func newEventFixture(
 		templateRef = "e2b-img-" + strings.Repeat("c", 64)
 		normalizedDemand, err = placement.NormalizeSandboxDemand(placement.SandboxDemand{SlotUnits: 1})
 		if err == nil {
+			var request clusterstate.NodeRequestEnvelopeV1
+			request, err = clusterstate.NewNodeRequestEnvelopeV1(http.MethodPost, "/sandboxes", "", nil, []byte(`{}`))
+			if err != nil {
+				t.Fatal(err)
+			}
 			dispatchSpec, err = clusterstate.MarshalSandboxDispatchSpec(clusterstate.SandboxDispatchSpecV1{
 				Version: clusterstate.DispatchSpecVersionV1, TemplateRef: templateRef,
-				KeyFingerprint: strings.Repeat("a", 24), AccessToken: "access-token", TargetPort: 3000,
+				AuthKeyFingerprint: strings.Repeat("a", 24), ManifestKeyFingerprint: strings.Repeat("b", 24),
+				AccessToken: "access-token", TargetPort: 3000, Request: request,
 			})
 		}
 	} else {
 		normalizedDemand, err = placement.NormalizeBuildDemand(placement.BuildDemand{Slots: 1})
 		if err == nil {
+			var request clusterstate.NodeRequestEnvelopeV1
+			request, err = clusterstate.NewNodeRequestEnvelopeV1(http.MethodPost, "/v3/templates", "", nil, []byte(`{}`))
+			if err != nil {
+				t.Fatal(err)
+			}
 			dispatchSpec, err = clusterstate.MarshalBuildDispatchSpec(clusterstate.BuildDispatchSpecV1{
 				Version: clusterstate.DispatchSpecVersionV1, TemplateID: templateRef,
-				KeyFingerprint: strings.Repeat("b", 24), Profile: types.ProfileBare,
+				AuthKeyFingerprint: strings.Repeat("b", 24), ManifestKeyFingerprint: strings.Repeat("c", 24),
+				Profile: types.ProfileBare, CPUCount: 1, MemoryMB: 512, Request: request,
 			})
 		}
 	}

@@ -6,8 +6,8 @@ package orch
 // node. Both ride existing sandbox-ctl primitives (snapshot --upload /
 // upload-snapshot / run --restore) + the e2b CLI (create / resume); nothing about
 // the e2b API/CLI changes. The token carries the sandbox row minus system
-// secrets: the tenant manifest_key appears only as a fingerprint — the target
-// resolves the real key from its own whitelist (= the create/build precondition).
+// secrets: the ManifestKey appears only as a fingerprint. The target resolves
+// both independent keys from an active node key lease.
 
 import (
 	"context"
@@ -135,31 +135,29 @@ func (o *Orchestrator) mintSandboxToken(sb *types.Sandbox, ref string) (string, 
 	return base64.StdEncoding.EncodeToString(b), nil
 }
 
-// ImportSandbox decodes a migration token, requires the tenant manifest_key to be
-// whitelisted here (= the create precondition), checks the token fingerprint + that
+// ImportSandbox decodes a migration token, requires an active node key lease,
+// checks the token's ManifestKey fingerprint and that
 // this node's guest runtime matches the snapshot's, then inserts the paused row.
 // `e2b sandbox resume <id>` then restores it on this node.
 func (o *Orchestrator) ImportSandbox(ctx context.Context, apiKey, token string) (string, error) {
 	if apiKey == "" {
 		return "", fmt.Errorf("import-sandbox: E2B_API_KEY is required")
 	}
-	// The tenant key must be on this node (manifest-key add) — same precondition as
-	// create — and the api key must resolve to it.
-	mk, err := o.resolveAllowed(ctx, apiKey)
+	lease, err := o.resolveAllowed(ctx, apiKey)
 	if err != nil {
 		return "", err
 	}
-	if mk == "" {
-		return "", fmt.Errorf("import-sandbox: tenant key not on this node — add it first: node-ctl manifest-key add <key>")
+	if lease.AuthKey == "" {
+		return "", fmt.Errorf("import-sandbox: no active node key lease for this API key")
 	}
-	return o.importSandboxWithKey(ctx, mk, token)
+	return o.importSandboxWithKeys(ctx, lease.AuthKey, lease.ManifestKey, token)
 }
 
-// importSandboxWithKey decodes a migration token, checks its fingerprint against
-// the resolved tenant key mk + that this node's guest runtime matches the
+// importSandboxWithKeys decodes a migration token, checks its fingerprint against
+// the resolved ManifestKey and that this node's guest runtime matches the
 // snapshot's, then inserts the paused row (the caller resumes). The cluster create
-// path supplies mk from the predistributed key; the SDK path from the api key.
-func (o *Orchestrator) importSandboxWithKey(ctx context.Context, mk, token string) (string, error) {
+// path supplies both keys from the predistributed lease; the SDK path resolves it.
+func (o *Orchestrator) importSandboxWithKeys(ctx context.Context, authKey, manifestKey, token string) (string, error) {
 	raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(token))
 	if err != nil {
 		return "", fmt.Errorf("import-sandbox: bad token: %w", err)
@@ -168,7 +166,7 @@ func (o *Orchestrator) importSandboxWithKey(ctx context.Context, mk, token strin
 	if err := json.Unmarshal(raw, &tok); err != nil || tok.TemplateID == "" || tok.SnapshotRef == "" || tok.Profile == "" {
 		return "", fmt.Errorf("import-sandbox: bad token (template_id/snapshot_ref/profile missing)")
 	}
-	rawMK, _ := hex.DecodeString(mk)
+	rawMK, _ := hex.DecodeString(manifestKey)
 	if hex.EncodeToString(apikey.Fingerprint(rawMK)) != tok.MKFingerprint {
 		return "", fmt.Errorf("import-sandbox: token is for a different tenant")
 	}
@@ -201,7 +199,7 @@ func (o *Orchestrator) importSandboxWithKey(ctx context.Context, mk, token strin
 		ID: sid, TemplateID: tok.TemplateID, State: types.StatePaused,
 		DeadlineUnix: tok.DeadlineUnix, CreatedUnix: time.Now().Unix(),
 		RunDir: o.cfg.Paths.RunRoot + "/" + sid, BaseDir: o.cfg.Paths.BaseRoot + "/" + sid,
-		ManifestKey: mk, SnapshotRef: tok.SnapshotRef,
+		AuthKey: authKey, ManifestKey: manifestKey, SnapshotRef: tok.SnapshotRef,
 		EnvdAccessToken: envdToken, TrafficAccessToken: trafficToken,
 		Metadata: clusterstate.WithoutSystemMetadata(tok.Metadata), Env: tok.Env,
 	}

@@ -10,34 +10,39 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	"github.com/kuasar-sandbox/orchestrator/internal/apikey"
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
+	"github.com/kuasar-sandbox/orchestrator/internal/store"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
-func allowlistedBuildIdentity(t *testing.T, o *Orchestrator) (apiKey, manifestKey, fingerprint string) {
+func allowlistedBuildIdentity(t *testing.T, o *Orchestrator) string {
 	t.Helper()
-	manifestKey = strings.Repeat("5a", 32)
-	raw, err := hex.DecodeString(manifestKey)
+	authKey := strings.Repeat("4a", 32)
+	manifestKey := strings.Repeat("5a", 32)
+	raw, err := hex.DecodeString(authKey)
 	if err != nil {
 		t.Fatal(err)
 	}
-	apiKey, err = apikey.Mint(raw)
+	apiKey, err := apikey.Mint(raw)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, fingerprint, err = o.AddManifestKey(context.Background(), manifestKey, "test", 0, "")
+	_, err = o.st.PutKeyLease(context.Background(), store.KeyLease{
+		Group: "test", AuthKey: authKey, ManifestKey: manifestKey, Label: "test",
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	return apiKey, manifestKey, fingerprint
+	return apiKey
 }
 
 func TestRegisterBuildPersistsBareProfile(t *testing.T) {
 	o := testOrch(t)
 	ctx := context.Background()
-	apiKey, _, _ := allowlistedBuildIdentity(t, o)
+	apiKey := allowlistedBuildIdentity(t, o)
 
 	b, err := o.RegisterBuild(ctx, apiKey, api.RegisterSpec{
 		Name: "bare-template", Tags: []string{"bare-tag"}, Profile: types.ProfileBare,
+		CPUCount: 1, MemoryMB: 512,
 	})
 	if err != nil {
 		t.Fatalf("RegisterBuild: %v", err)
@@ -54,8 +59,10 @@ func TestRegisterBuildPersistsBareProfile(t *testing.T) {
 func TestTriggerBareBuildRejectsCommandsAndQueuesImage(t *testing.T) {
 	o := testOrch(t)
 	ctx := context.Background()
-	apiKey, _, _ := allowlistedBuildIdentity(t, o)
-	b, err := o.RegisterBuild(ctx, apiKey, api.RegisterSpec{Profile: types.ProfileBare})
+	apiKey := allowlistedBuildIdentity(t, o)
+	b, err := o.RegisterBuild(ctx, apiKey, api.RegisterSpec{
+		Profile: types.ProfileBare, CPUCount: 1, MemoryMB: 512,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}

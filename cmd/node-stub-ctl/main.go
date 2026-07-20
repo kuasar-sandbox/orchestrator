@@ -21,6 +21,8 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"reflect"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -28,6 +30,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/clustercfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/nodectl"
@@ -849,7 +852,7 @@ func newStubNode(opts stubNodeOptions, svc *service) (*stubNode, error) {
 		active:          map[string]struct{}{},
 	}
 	authority, err := nodeexec.NewAuthority(
-		st, st, node.currentIdentity, node.buildCapacity, node.buildObject, node.sandboxDemand,
+		st, st, node.currentIdentity, node.buildCapacity, node.buildObject, node.sandboxObject, node.sandboxDemand,
 	)
 	if err != nil {
 		st.Close()
@@ -989,22 +992,76 @@ func (n *stubNode) buildCapacity(context.Context) (nodeexec.BuildCapacity, strin
 	}, "", nil
 }
 
-func (n *stubNode) buildObject(_ context.Context, record nodeexec.DispatchRecord) (*types.Build, error) {
+func (n *stubNode) buildObject(ctx context.Context, record nodeexec.DispatchRecord) (*types.Build, error) {
 	spec, err := clusterstate.ParseBuildDispatchSpec(record.DispatchSpec)
 	if err != nil {
 		return nil, err
 	}
+	lease, found, err := n.store.KeyLeaseByFingerprints(
+		ctx, record.Group, spec.AuthKeyFingerprint, spec.ManifestKeyFingerprint,
+	)
+	if err != nil || !found {
+		return nil, errors.Join(err, errors.New("exact node key lease is unavailable"))
+	}
+	register, err := api.ParseBuildRegisterEnvelope(spec.Request)
+	if err != nil || register.Profile != spec.Profile || register.CPUCount != spec.CPUCount ||
+		register.MemoryMB != spec.MemoryMB || !slices.Equal(stubNonEmpty(register.Name), spec.Names) ||
+		!slices.Equal(register.Tags, spec.Aliases) || !reflect.DeepEqual(register.Metadata, spec.Metadata) {
+		return nil, errors.Join(err, errors.New("Build request envelope does not match dispatch spec"))
+	}
 	return &types.Build{
-		BuildID: record.ObjectID, TemplateID: spec.TemplateID, ManifestKey: strings.Repeat("0", 64),
-		Profile: spec.Profile, Kind: types.KindImg, FromImage: spec.FromImage, FromTemplate: spec.FromTemplate,
-		StartCmd: spec.StartCmd, ReadyCmd: spec.ReadyCmd, Steps: append([]types.TemplateStep(nil), spec.Steps...),
+		BuildID: record.ObjectID, TemplateID: spec.TemplateID,
+		AuthKey: lease.AuthKey, ManifestKey: lease.ManifestKey,
+		Profile: spec.Profile, CPUCount: spec.CPUCount, MemoryMB: spec.MemoryMB,
+		Kind:  types.KindImg,
 		Names: append([]string(nil), spec.Names...), Aliases: append([]string(nil), spec.Aliases...),
-		Metadata: clusterstate.WithoutSystemMetadata(spec.Metadata), Builder: spec.Builder,
+		Metadata: clusterstate.WithoutSystemMetadata(spec.Metadata), RegistryAuth: lease.RegistryAuth,
 		Status: types.BuildRegistered, CreatedUnix: time.Now().Unix(),
 	}, nil
 }
 
-func (n *stubNode) sandboxDemand(record nodeexec.DispatchRecord) (nodectl.SandboxAdmissionDemand, error) {
+func stubNonEmpty(value string) []string {
+	if value == "" {
+		return nil
+	}
+	return []string{value}
+}
+
+func (n *stubNode) sandboxObject(ctx context.Context, record nodeexec.DispatchRecord) (*types.Sandbox, error) {
+	spec, err := clusterstate.ParseSandboxDispatchSpec(record.DispatchSpec)
+	if err != nil {
+		return nil, err
+	}
+	lease, found, err := n.store.KeyLeaseByFingerprints(
+		ctx, record.Group, spec.AuthKeyFingerprint, spec.ManifestKeyFingerprint,
+	)
+	if err != nil || !found {
+		return nil, errors.Join(err, errors.New("exact node key lease is unavailable"))
+	}
+	create, err := api.ParseSandboxCreateEnvelope(spec.Request)
+	if err != nil || create.TemplateID != spec.TemplateRef || create.TimeoutSec != spec.TimeoutSeconds ||
+		!reflect.DeepEqual(create.Metadata, spec.Config) {
+		return nil, errors.Join(err, errors.New("Sandbox request envelope does not match dispatch spec"))
+	}
+	return &types.Sandbox{
+		ID: record.ObjectID, TemplateID: spec.TemplateRef, State: types.StateStarting,
+		AuthKey: lease.AuthKey, ManifestKey: lease.ManifestKey,
+		EnvdAccessToken: spec.AccessToken, TrafficAccessToken: "traffic-" + record.ObjectID,
+		Metadata: clusterstate.WithoutSystemMetadata(create.Metadata), Env: create.EnvVars,
+		CreatedUnix: time.Now().Unix(),
+	}, nil
+}
+
+func (n *stubNode) sandboxDemand(ctx context.Context, record nodeexec.DispatchRecord) (nodectl.SandboxAdmissionDemand, error) {
+	spec, err := clusterstate.ParseSandboxDispatchSpec(record.DispatchSpec)
+	if err != nil {
+		return nodectl.SandboxAdmissionDemand{}, err
+	}
+	if _, found, err := n.store.KeyLeaseByFingerprints(
+		ctx, record.Group, spec.AuthKeyFingerprint, spec.ManifestKeyFingerprint,
+	); err != nil || !found {
+		return nodectl.SandboxAdmissionDemand{}, errors.Join(err, errors.New("exact node key lease is unavailable"))
+	}
 	normalized, err := placement.ParseNormalizedDemand(record.NormalizedDemand)
 	if err != nil || normalized.Sandbox == nil {
 		return nodectl.SandboxAdmissionDemand{}, errors.Join(err, errors.New("Sandbox normalized demand is missing"))
@@ -1103,12 +1160,11 @@ func (n *stubNode) executeSandbox(ctx context.Context, record *nodeexec.Workflow
 	if !sleepContext(ctx, behavior.CreateDelay) {
 		return ctx.Err()
 	}
-	sandbox := &types.Sandbox{
-		ID: claimed.ObjectID, TemplateID: spec.TemplateRef, State: types.StateRunning,
-		ManifestKey: strings.Repeat("0", 64), EnvdAccessToken: spec.AccessToken,
-		TrafficAccessToken: "traffic-" + claimed.ObjectID,
-		Metadata:           clusterstate.WithoutSystemMetadata(spec.Config), CreatedUnix: time.Now().Unix(),
+	sandbox, err := n.store.Get(ctx, claimed.ObjectID)
+	if err != nil || sandbox == nil {
+		return errors.Join(err, errors.New("accepted Sandbox object is missing"))
 	}
+	sandbox.State = types.StateRunning
 	if behavior.CreateResult == "reject" {
 		terminal, commitErr := n.store.CommitSandboxEvent(ctx, sandbox, nodeexec.EventUpdate{State: "ERROR", Reason: "stub create rejected"})
 		if commitErr != nil {
@@ -1233,6 +1289,53 @@ func (n *stubNode) HandleCommand(ctx context.Context, cmd *routesync.Command) *r
 	}
 	n.recordCommand(cmd)
 	switch cmd.Kind {
+	case routesync.CmdKeyPut:
+		local, err := n.currentIdentity(ctx)
+		if err != nil || cmd.NodeEpoch != local.NodeEpoch || cmd.SessionSeq != local.SessionSeq {
+			return finalStubReject(cmd, routesync.DispatchSessionMoved, errors.Join(err, errors.New("stale node-link tuple")))
+		}
+		if cmd.KeyLease == nil || cmd.KeyLease.Validate() != nil ||
+			cmd.KeyLease.AuthKey.Type != routesync.KeyMaterialInline ||
+			cmd.KeyLease.ManifestKey.Type != routesync.KeyMaterialInline ||
+			cmd.KeyLease.ExpiresUnix <= time.Now().Unix() ||
+			cmd.AuthKeyFingerprint != cmd.KeyLease.AuthKey.Fingerprint ||
+			cmd.ManifestKeyFingerprint != cmd.KeyLease.ManifestKey.Fingerprint {
+			return finalStubReject(cmd, routesync.DispatchConflict, errors.New("invalid inline key lease"))
+		}
+		registryAuth := ""
+		switch cmd.KeyLease.RegistryAuth.Type {
+		case "":
+		case routesync.KeyMaterialInline:
+			registryAuth = cmd.KeyLease.RegistryAuth.Value
+		default:
+			return finalStubReject(cmd, routesync.DispatchConflict, errors.New("stub cannot resolve registry auth reference"))
+		}
+		if _, err := n.store.PutKeyLease(ctx, store.KeyLease{
+			Group: cmd.KeyLease.Group, AuthKey: cmd.KeyLease.AuthKey.Value,
+			ManifestKey: cmd.KeyLease.ManifestKey.Value, RegistryAuth: registryAuth,
+			Label: "cluster", ExpiresUnix: cmd.KeyLease.ExpiresUnix,
+		}); err != nil {
+			return finalStubReject(cmd, routesync.DispatchConflict, err)
+		}
+		ref := routesync.NodeKeyLeaseRefV1{
+			Version: routesync.NodeKeyLeaseVersionV1, Group: cmd.KeyLease.Group,
+			AuthKeyFingerprint:     cmd.KeyLease.AuthKey.Fingerprint,
+			ManifestKeyFingerprint: cmd.KeyLease.ManifestKey.Fingerprint,
+		}
+		return &routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted, KeyLeaseRef: &ref}
+	case routesync.CmdKeyDrop:
+		local, err := n.currentIdentity(ctx)
+		if err != nil || cmd.NodeEpoch != local.NodeEpoch || cmd.SessionSeq != local.SessionSeq {
+			return finalStubReject(cmd, routesync.DispatchSessionMoved, errors.Join(err, errors.New("stale node-link tuple")))
+		}
+		if cmd.KeyLeaseRef == nil || cmd.KeyLeaseRef.Validate() != nil {
+			return finalStubReject(cmd, routesync.DispatchConflict, errors.New("invalid key lease reference"))
+		}
+		ref := *cmd.KeyLeaseRef
+		if _, err := n.store.DropKeyLeaseRef(ctx, ref.Group, ref.AuthKeyFingerprint, ref.ManifestKeyFingerprint); err != nil {
+			return finalStubReject(cmd, routesync.DispatchConflict, err)
+		}
+		return &routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted, KeyLeaseRef: &ref}
 	case routesync.CmdSandboxAdmitDispatch, routesync.CmdBuildAdmitDispatch:
 		local, err := n.currentIdentity(ctx)
 		if err != nil {

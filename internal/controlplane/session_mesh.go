@@ -24,6 +24,7 @@ const (
 	sessionSnapshotPath = "/internal/session-directory/snapshot"
 	sessionProbePath    = "/internal/session-holder/probe"
 	sessionDispatchPath = "/internal/session-holder/dispatch"
+	sessionKeyLeasePath = "/internal/session-holder/key-lease"
 	sessionCommandPath  = "/internal/session-holder/command"
 	sessionRecoveryPath = "/internal/session-holder/recovery-command"
 	maximumSessionRPC   = 1 << 20
@@ -153,8 +154,67 @@ func (m *SessionMesh) Mount(mux *http.ServeMux) {
 	mux.HandleFunc(sessionSnapshotPath, m.serveSnapshot)
 	mux.HandleFunc(sessionProbePath, m.serveProbe)
 	mux.HandleFunc(sessionDispatchPath, m.serveDispatch)
+	mux.HandleFunc(sessionKeyLeasePath, m.serveKeyLease)
 	mux.HandleFunc(sessionCommandPath, m.serveCommand)
 	mux.HandleFunc(sessionRecoveryPath, m.serveRecoveryCommand)
+}
+
+func (m *SessionMesh) InstallKeyLeaseAt(
+	ctx context.Context,
+	holderID string,
+	identity session.ServeIdentity,
+	nodeID string,
+	nodeEpoch uint64,
+	dataEndpoint string,
+	lease routesync.NodeKeyLeaseV1,
+) (routesync.NodeKeyLeaseRefV1, bool, error) {
+	if holderID == m.self {
+		holder, err := m.localHolder()
+		if err != nil {
+			return routesync.NodeKeyLeaseRefV1{}, false, err
+		}
+		return holder.InstallKeyLease(ctx, identity, nodeID, nodeEpoch, dataEndpoint, lease)
+	}
+	peer, ok := m.peers[holderID]
+	if !ok {
+		return routesync.NodeKeyLeaseRefV1{}, false, session.ErrSessionUnavailable
+	}
+	input := keyLeaseRPCRequest{
+		Identity: identity, NodeID: nodeID, NodeEpoch: nodeEpoch,
+		DataEndpoint: dataEndpoint, Lease: lease,
+	}
+	var response keyLeaseRPCResponse
+	err := postSessionJSON(ctx, peer, sessionKeyLeasePath, input, &response)
+	if err != nil {
+		return response.Ref, true, err
+	}
+	if response.Error != "" {
+		return response.Ref, response.Sent, decodeSessionRPCError(response.Code, response.Error)
+	}
+	return response.Ref, response.Sent, nil
+}
+
+func (m *SessionMesh) InstallKeyLease(
+	ctx context.Context,
+	identity session.ServeIdentity,
+	nodeID string,
+	nodeEpoch uint64,
+	dataEndpoint string,
+	lease routesync.NodeKeyLeaseV1,
+) (routesync.NodeKeyLeaseRefV1, bool, error) {
+	entry, found := m.directory.Lookup(nodeID)
+	if !found {
+		return routesync.NodeKeyLeaseRefV1{}, false, session.ErrSessionUnavailable
+	}
+	if entry.NodeEpoch > nodeEpoch {
+		return routesync.NodeKeyLeaseRefV1{}, false, session.ErrStaleSession
+	}
+	if entry.NodeEpoch < nodeEpoch {
+		return routesync.NodeKeyLeaseRefV1{}, false, session.ErrSessionUnavailable
+	}
+	return m.InstallKeyLeaseAt(
+		ctx, entry.HolderMemberID, identity, nodeID, nodeEpoch, dataEndpoint, lease,
+	)
 }
 
 func (m *SessionMesh) ProbePlacementBatch(
@@ -395,6 +455,31 @@ func (m *SessionMesh) serveDispatch(w http.ResponseWriter, request *http.Request
 	writeSessionJSON(w, http.StatusConflict, dispatchRPCResponse{Error: err.Error(), Code: sessionErrorCode(err)})
 }
 
+func (m *SessionMesh) serveKeyLease(w http.ResponseWriter, request *http.Request) {
+	if request.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var input keyLeaseRPCRequest
+	if err := decodeSessionJSON(request.Body, &input); err != nil {
+		writeSessionJSON(w, http.StatusBadRequest, keyLeaseRPCResponse{Error: "invalid key lease request", Code: "INVALID"})
+		return
+	}
+	holder, err := m.localHolder()
+	if err != nil {
+		writeSessionJSON(w, http.StatusServiceUnavailable, keyLeaseRPCResponse{Error: err.Error(), Code: sessionErrorCode(err)})
+		return
+	}
+	ref, sent, err := holder.InstallKeyLease(
+		request.Context(), input.Identity, input.NodeID, input.NodeEpoch, input.DataEndpoint, input.Lease,
+	)
+	response := keyLeaseRPCResponse{Ref: ref, Sent: sent}
+	if err != nil {
+		response.Error, response.Code = err.Error(), sessionErrorCode(err)
+	}
+	writeSessionJSON(w, http.StatusOK, response)
+}
+
 func (m *SessionMesh) serveCommand(w http.ResponseWriter, request *http.Request) {
 	if request.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -513,6 +598,21 @@ type dispatchRPCResponse struct {
 	Reply session.DispatchReply `json:"reply"`
 	Code  string                `json:"code,omitempty"`
 	Error string                `json:"error,omitempty"`
+}
+
+type keyLeaseRPCRequest struct {
+	Identity     session.ServeIdentity    `json:"identity"`
+	NodeID       string                   `json:"node_id"`
+	NodeEpoch    uint64                   `json:"node_epoch"`
+	DataEndpoint string                   `json:"data_endpoint"`
+	Lease        routesync.NodeKeyLeaseV1 `json:"lease"`
+}
+
+type keyLeaseRPCResponse struct {
+	Ref   routesync.NodeKeyLeaseRefV1 `json:"ref"`
+	Sent  bool                        `json:"sent"`
+	Code  string                      `json:"code,omitempty"`
+	Error string                      `json:"error,omitempty"`
 }
 
 type commandRPCRequest struct {

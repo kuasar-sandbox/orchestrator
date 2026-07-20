@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"io"
@@ -36,6 +37,7 @@ func TestFinalBuildDispatchReplayPreservesDurableDecision(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	installStubKeyLease(t, node, tuple, "group-1")
 	first := finalBuildCommand(t, tuple, "build-1", "template-1")
 	ack := node.HandleCommand(context.Background(), first)
 	if ack.Status != routesync.AckAccepted || ack.Outcome != routesync.DispatchAcceptedAdmitted {
@@ -71,6 +73,7 @@ func TestFinalBuildTriggerAndLifecycleStayOnBoundNode(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	installStubKeyLease(t, node, tuple, "group-1")
 	command := finalBuildCommand(t, tuple, "build-1", "template-1")
 	ack := node.HandleCommand(context.Background(), command)
 	if ack.Status != routesync.AckAccepted || ack.Outcome != routesync.DispatchAcceptedAdmitted {
@@ -163,6 +166,7 @@ func TestFinalSandboxDispatchDrivesDurableEventRecoveryAndProxyFence(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
+	installStubKeyLease(t, node, tuple, "group-1")
 	command := finalSandboxCommand(t, tuple, "sandbox-1")
 	ack := node.HandleCommand(context.Background(), command)
 	if ack.Status != routesync.AckAccepted || ack.Outcome != routesync.DispatchAcceptedAdmitted {
@@ -273,9 +277,18 @@ func finalBuildCommand(
 	if err != nil {
 		t.Fatal(err)
 	}
+	lease := stubTestKeyLease("group-1")
+	request, err := clusterstate.NewNodeRequestEnvelopeV1(
+		http.MethodPost, "/v3/templates", "", nil,
+		[]byte(`{"name":"","tags":null,"profile":"bare","cpuCount":1,"memoryMB":64,"metadata":null}`),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
 	spec, err := clusterstate.MarshalBuildDispatchSpec(clusterstate.BuildDispatchSpecV1{
 		Version: clusterstate.DispatchSpecVersionV1, TemplateID: templateID,
-		KeyFingerprint: "000000000000000000000000", Profile: types.ProfileBare,
+		AuthKeyFingerprint: lease.AuthKey.Fingerprint, ManifestKeyFingerprint: lease.ManifestKey.Fingerprint,
+		Profile: types.ProfileBare, CPUCount: 1, MemoryMB: 64, Request: request,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -317,11 +330,20 @@ func finalSandboxCommand(t *testing.T, tuple routesync.SessionTuple, sandboxID s
 	if err != nil {
 		t.Fatal(err)
 	}
+	lease := stubTestKeyLease("group-1")
+	templateRef := "e2b-img-" + strings.Repeat("1", 64)
+	request, err := clusterstate.NewNodeRequestEnvelopeV1(
+		http.MethodPost, "/sandboxes", "", nil,
+		[]byte(`{"templateID":"`+templateRef+`","timeout":0,"metadata":{"stub.http_status":"204"}}`),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
 	spec, err := clusterstate.MarshalSandboxDispatchSpec(clusterstate.SandboxDispatchSpecV1{
-		Version:        clusterstate.DispatchSpecVersionV1,
-		TemplateRef:    "e2b-img-" + strings.Repeat("1", 64),
-		KeyFingerprint: "000000000000000000000000", AccessToken: "access-1", TargetPort: 8080,
-		Config: map[string]string{"stub.http_status": "204"},
+		Version: clusterstate.DispatchSpecVersionV1, TemplateRef: templateRef,
+		AuthKeyFingerprint: lease.AuthKey.Fingerprint, ManifestKeyFingerprint: lease.ManifestKey.Fingerprint,
+		AccessToken: "access-1", TargetPort: 8080,
+		Config: map[string]string{"stub.http_status": "204"}, Request: request,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -352,5 +374,40 @@ func finalSandboxCommand(t *testing.T, tuple routesync.SessionTuple, sandboxID s
 		Binding: opaque, BindingDigest: bindingDigest, Group: binding.Group, RouteKey: binding.RouteKey,
 		NormalizedDemand: demand, DemandDigest: intent.DemandDigest,
 		DispatchSpec: spec, DispatchSpecDigest: intent.DispatchSpecDigest, ProviderPolicy: intent.ProviderPolicyVersion,
+	}
+}
+
+func installStubKeyLease(
+	t *testing.T,
+	node *stubNode,
+	tuple routesync.SessionTuple,
+	group string,
+) {
+	t.Helper()
+	lease := stubTestKeyLease(group)
+	ack := node.HandleCommand(context.Background(), &routesync.Command{
+		CmdID: "key-put-" + group, Kind: routesync.CmdKeyPut,
+		NodeEpoch: tuple.NodeEpoch, SessionSeq: tuple.SessionSeq,
+		RegistryGeneration: "generation-1",
+		AuthKeyFingerprint: lease.AuthKey.Fingerprint, ManifestKeyFingerprint: lease.ManifestKey.Fingerprint,
+		KeyLease: &lease,
+	})
+	if ack.Status != routesync.AckAccepted || ack.KeyLeaseRef == nil {
+		t.Fatalf("key_put = %+v", ack)
+	}
+}
+
+func stubTestKeyLease(group string) routesync.NodeKeyLeaseV1 {
+	material := func(value string) routesync.NodeKeyMaterialV1 {
+		raw, _ := hex.DecodeString(value)
+		digest := sha256.Sum256(raw)
+		return routesync.NodeKeyMaterialV1{
+			Type: routesync.KeyMaterialInline, Value: value, Fingerprint: hex.EncodeToString(digest[:12]),
+		}
+	}
+	return routesync.NodeKeyLeaseV1{
+		Version: routesync.NodeKeyLeaseVersionV1, Group: group,
+		AuthKey: material(strings.Repeat("a", 64)), ManifestKey: material(strings.Repeat("b", 64)),
+		ExpiresUnix: time.Now().Add(time.Hour).Unix(),
 	}
 }

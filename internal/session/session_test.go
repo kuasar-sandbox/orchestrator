@@ -5,12 +5,15 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"net/http"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/placement"
+	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 )
 
 type testEndpoint struct {
@@ -18,6 +21,27 @@ type testEndpoint struct {
 	commands []DispatchCommand
 	reply    DispatchReply
 	err      error
+	keyAck   *routesync.NodeKeyLeaseRefV1
+	wire     []*routesync.Command
+}
+
+func (e *testEndpoint) SendNodeCommand(_ context.Context, command *routesync.Command) (routesync.CmdAck, bool, error) {
+	e.wire = append(e.wire, command)
+	if command == nil {
+		return routesync.CmdAck{}, false, errors.New("missing command")
+	}
+	var ref *routesync.NodeKeyLeaseRefV1
+	if e.keyAck != nil {
+		copyRef := *e.keyAck
+		ref = &copyRef
+	} else if command.KeyLease != nil {
+		copyRef := keyLeaseRef(*command.KeyLease)
+		ref = &copyRef
+	} else if command.KeyLeaseRef != nil {
+		copyRef := *command.KeyLeaseRef
+		ref = &copyRef
+	}
+	return routesync.CmdAck{CmdID: command.CmdID, Status: routesync.AckAccepted, KeyLeaseRef: ref}, true, nil
 }
 
 func (e *testEndpoint) FenceStaleSession() { e.fenced++ }
@@ -308,6 +332,12 @@ func TestHolderRejectsWorkAfterConsensusRetiresActiveEnrollment(t *testing.T) {
 	if _, err := holder.Register(context.Background(), registration, endpoint); err != nil {
 		t.Fatal(err)
 	}
+	if _, sent, err := holder.InstallKeyLease(
+		context.Background(), testServeIdentity(), registration.NodeID, registration.NodeEpoch,
+		registration.DataEndpoint, testKeyLease(),
+	); err != nil || !sent {
+		t.Fatalf("install key lease sent=%v err=%v", sent, err)
+	}
 	gate.retired = true
 	_, err = holder.AdmitAndDispatch(context.Background(), testDispatchCommand(t, registration))
 	if !errors.Is(err, ErrStaleSession) || len(endpoint.commands) != 0 {
@@ -464,6 +494,15 @@ func TestHolderDispatchUsesCurrentTupleAndCommittedTarget(t *testing.T) {
 		t.Fatal(err)
 	}
 	command := testDispatchCommand(t, registration)
+	if _, err := holder.AdmitAndDispatch(context.Background(), command); !errors.Is(err, ErrKeyLeaseUnavailable) {
+		t.Fatalf("dispatch without key lease error = %v", err)
+	}
+	lease := testKeyLease()
+	if _, sent, err := holder.InstallKeyLease(
+		context.Background(), testServeIdentity(), registration.NodeID, registration.NodeEpoch, registration.DataEndpoint, lease,
+	); err != nil || !sent {
+		t.Fatalf("key lease install sent=%v err=%v", sent, err)
+	}
 	reply, err := holder.AdmitAndDispatch(context.Background(), command)
 	if err != nil || reply.Outcome != cluster.DispatchAcceptedAdmitted {
 		t.Fatalf("dispatch = %+v, %v", reply, err)
@@ -482,6 +521,39 @@ func TestHolderDispatchUsesCurrentTupleAndCommittedTarget(t *testing.T) {
 	}
 	if len(endpoint.commands) != 1 {
 		t.Fatal("stale dispatch reached the node stream")
+	}
+}
+
+func TestHolderRequiresExactKeyLeaseAcknowledgement(t *testing.T) {
+	registration := testRegistration("node-1", 7, 10, "10.0.0.1:8443")
+	authority := newTestEnrollmentAuthority(registration)
+	holder, err := NewHolder("registry-a", 1, nil, testGate(true), nil, authority)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrong := keyLeaseRef(testKeyLease())
+	wrong.ManifestKeyFingerprint = strings.Repeat("c", 24)
+	endpoint := &testEndpoint{keyAck: &wrong}
+	if _, err := holder.Register(context.Background(), registration, endpoint); err != nil {
+		t.Fatal(err)
+	}
+	lease := testKeyLease()
+	ref, sent, err := holder.InstallKeyLease(
+		context.Background(), testServeIdentity(), registration.NodeID, registration.NodeEpoch, registration.DataEndpoint, lease,
+	)
+	if err == nil || !sent || holder.HasKeyLease(registration.NodeID, registration.NodeEpoch, ref) {
+		t.Fatalf("mismatched ACK ref=%+v sent=%v err=%v", ref, sent, err)
+	}
+	endpoint.keyAck = nil
+	if _, sent, err := holder.InstallKeyLease(
+		context.Background(), testServeIdentity(), registration.NodeID, registration.NodeEpoch, registration.DataEndpoint, lease,
+	); err != nil || !sent || !holder.HasKeyLease(registration.NodeID, registration.NodeEpoch, ref) {
+		t.Fatalf("exact ACK sent=%v err=%v", sent, err)
+	}
+	if sent, err := holder.DropKeyLease(
+		context.Background(), testServeIdentity(), registration.NodeID, registration.NodeEpoch, registration.DataEndpoint, ref,
+	); err != nil || !sent || holder.HasKeyLease(registration.NodeID, registration.NodeEpoch, ref) {
+		t.Fatalf("key drop sent=%v err=%v", sent, err)
 	}
 }
 
@@ -660,7 +732,20 @@ func testDispatchCommand(t *testing.T, registration Registration) DispatchComman
 	if err != nil {
 		t.Fatal(err)
 	}
-	intent, err := cluster.NewDispatchIntent(demand, []byte("dispatch-spec"), "v1")
+	lease := testKeyLease()
+	request, err := cluster.NewNodeRequestEnvelopeV1(http.MethodPost, "/sandboxes", "", nil, []byte(`{"templateID":"e2b-img-`+strings.Repeat("c", 64)+`"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec, err := cluster.MarshalSandboxDispatchSpec(cluster.SandboxDispatchSpecV1{
+		Version: cluster.DispatchSpecVersionV1, TemplateRef: "e2b-img-" + strings.Repeat("c", 64),
+		AuthKeyFingerprint: lease.AuthKey.Fingerprint, ManifestKeyFingerprint: lease.ManifestKey.Fingerprint,
+		AccessToken: "access", Request: request,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	intent, err := cluster.NewDispatchIntent(demand, spec, "v1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -689,5 +774,22 @@ func testDispatchCommand(t *testing.T, registration Registration) DispatchComman
 			NodeID: registration.NodeID, NodeEpoch: registration.NodeEpoch, DataEndpoint: registration.DataEndpoint,
 			RegistryGeneration: "g1", OpaqueBinding: opaque, BindingDigest: digest,
 		},
+	}
+}
+
+func testKeyLease() routesync.NodeKeyLeaseV1 {
+	auth := testKeyMaterial(strings.Repeat("a", 64))
+	manifest := testKeyMaterial(strings.Repeat("b", 64))
+	return routesync.NodeKeyLeaseV1{
+		Version: routesync.NodeKeyLeaseVersionV1, Group: "/g", AuthKey: auth, ManifestKey: manifest,
+		ExpiresUnix: time.Now().Add(time.Hour).Unix(),
+	}
+}
+
+func testKeyMaterial(value string) routesync.NodeKeyMaterialV1 {
+	raw, _ := hex.DecodeString(value)
+	digest := sha256.Sum256(raw)
+	return routesync.NodeKeyMaterialV1{
+		Type: routesync.KeyMaterialInline, Value: value, Fingerprint: hex.EncodeToString(digest[:12]),
 	}
 }

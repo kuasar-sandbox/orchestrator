@@ -55,7 +55,7 @@ func exportSandboxCmd(args []string, _ *slog.Logger) error {
 // importSandboxCmd implements `node-ctl import-sandbox <token>` as a client of
 // the daemon's api plane (POST /sandboxes/import): recreate a paused sandbox from a
 // migration token on this node (which must share the remote store and have the tenant
-// manifest-key added). Auth: E2B_API_KEY env.
+// matching node key lease installed). Auth: E2B_API_KEY env.
 func importSandboxCmd(args []string, _ *slog.Logger) error {
 	tok, rest := leadingPositional(args)
 	fs := flag.NewFlagSet("import-sandbox", flag.ContinueOnError)

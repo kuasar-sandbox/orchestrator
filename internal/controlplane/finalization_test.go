@@ -30,6 +30,20 @@ func (s *acceptingCommandSender) SendNodeCommand(
 	return routesync.CmdAck{CmdID: command.CmdID, Status: routesync.AckAccepted}, true, nil
 }
 
+func (s *acceptingCommandSender) InstallKeyLease(
+	_ context.Context,
+	_ session.ServeIdentity,
+	_ string,
+	_ uint64,
+	_ string,
+	lease routesync.NodeKeyLeaseV1,
+) (routesync.NodeKeyLeaseRefV1, bool, error) {
+	return routesync.NodeKeyLeaseRefV1{
+		Version: routesync.NodeKeyLeaseVersionV1, Group: lease.Group,
+		AuthKeyFingerprint: lease.AuthKey.Fingerprint, ManifestKeyFingerprint: lease.ManifestKey.Fingerprint,
+	}, true, nil
+}
+
 func (s *acceptingCommandSender) snapshot() []routesync.Command {
 	s.mu.Lock()
 	defer s.mu.Unlock()

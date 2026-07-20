@@ -35,17 +35,18 @@ func TestExportImportRoundTrip(t *testing.T) {
 	o := testOrchCfg(t, cfg)
 	ctx := context.Background()
 
+	authKey := strings.Repeat("5", 64)
 	mk := strings.Repeat("6", 64)
-	raw, _ := hex.DecodeString(mk)
+	raw, _ := hex.DecodeString(authKey)
 	apiKey, _ := apikey.Mint(raw)
-	if _, err := o.st.AddManifestKey(ctx, mk, "", 0, ""); err != nil { // import precondition: key allowlisted
+	if _, _, _, err := o.PutKeyLease(ctx, "/test", authKey, mk, "", 0, ""); err != nil {
 		t.Fatal(err)
 	}
 
 	sid := "sbx-mig-1"
 	sb := &types.Sandbox{
 		ID: sid, TemplateID: "e2b-snp-" + strings.Repeat("a", 64), State: types.StatePaused,
-		ManifestKey: mk, SnapshotRef: "manifest://" + strings.Repeat("b", 64),
+		AuthKey: authKey, ManifestKey: mk, SnapshotRef: "manifest://" + strings.Repeat("b", 64),
 		RunDir: dir + "/run/" + sid, BaseDir: dir + "/lib/" + sid,
 		Env: map[string]string{"FOO": "bar"}, Metadata: map[string]string{
 			"k": "v", clusterstate.ObjectMetadataKey: "source-binding",
@@ -256,7 +257,7 @@ func TestExportMoveDeleteFailurePreservesSource(t *testing.T) {
 func migrationSandbox(dir, sid, mk, ref string) *types.Sandbox {
 	return &types.Sandbox{
 		ID: sid, TemplateID: "e2b-snp-" + strings.Repeat("a", 64), State: types.StatePaused,
-		ManifestKey: mk, SnapshotRef: ref, RunDir: filepath.Join(dir, "run", sid),
+		AuthKey: mk, ManifestKey: mk, SnapshotRef: ref, RunDir: filepath.Join(dir, "run", sid),
 		BaseDir: filepath.Join(dir, "lib", sid), CreatedUnix: 1,
 	}
 }

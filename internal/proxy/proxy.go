@@ -52,7 +52,7 @@ const (
 	HeaderProxyError         = "X-Kuasar-Proxy-Error"
 	HeaderNodeID             = "X-Kuasar-Node-Id"
 	HeaderNodeEpoch          = "X-Kuasar-Node-Epoch"
-	HeaderRegistryGeneration = "X-Kuasar-Storage-Generation"
+	HeaderRegistryGeneration = "X-Kuasar-Registry-Generation"
 	HeaderBindingDigest      = "X-Kuasar-Binding-Digest"
 
 	ProxyErrorBadRequest     = "bad_request"

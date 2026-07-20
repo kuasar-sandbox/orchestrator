@@ -7,17 +7,20 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"reflect"
 	"slices"
 	"sync"
 	"time"
 
+	"github.com/kuasar-sandbox/orchestrator/internal/api"
+	"github.com/kuasar-sandbox/orchestrator/internal/buildcfg"
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/keys"
 	"github.com/kuasar-sandbox/orchestrator/internal/nodectl"
 	"github.com/kuasar-sandbox/orchestrator/internal/nodeexec"
 	"github.com/kuasar-sandbox/orchestrator/internal/placement"
-	"github.com/kuasar-sandbox/orchestrator/internal/regcreds"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
+	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/store"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
@@ -198,7 +201,7 @@ func NewFinalClusterNode(core *Orchestrator, st *store.Store, options ClusterNod
 	}
 	authority, err := nodeexec.NewAuthority(
 		st, options.SandboxAdmission, options.Session.Current,
-		node.buildCapacity, node.buildObject, node.sandboxDemand,
+		node.buildCapacity, node.buildObject, node.sandboxObject, node.sandboxDemand,
 	)
 	if err != nil {
 		return nil, err
@@ -331,6 +334,34 @@ func (n *FinalClusterNode) HandleCommand(ctx context.Context, wire *routesync.Co
 	}
 	defer n.signalPlacement()
 	switch wire.Kind {
+	case routesync.CmdKeyPut:
+		if wire.KeyLease == nil || wire.KeyLeaseRef != nil {
+			return finalReject(wire, routesync.DispatchConflict, errors.New("key_put requires exactly one complete key lease"))
+		}
+		if wire.AuthKeyFingerprint != wire.KeyLease.AuthKey.Fingerprint ||
+			wire.ManifestKeyFingerprint != wire.KeyLease.ManifestKey.Fingerprint {
+			return finalReject(wire, routesync.DispatchConflict, errors.New("key_put command fingerprints do not match its lease"))
+		}
+		ref, err := n.core.putClusterKeyLease(ctx, *wire.KeyLease)
+		if err != nil {
+			return finalReject(wire, routesync.DispatchConflict, err)
+		}
+		return &routesync.CmdAck{CmdID: wire.CmdID, Status: routesync.AckAccepted, KeyLeaseRef: &ref}
+	case routesync.CmdKeyDrop:
+		if wire.KeyLeaseRef == nil || wire.KeyLease != nil {
+			return finalReject(wire, routesync.DispatchConflict, errors.New("key_drop requires exactly one key lease reference"))
+		}
+		ref := *wire.KeyLeaseRef
+		if err := ref.Validate(); err != nil || wire.AuthKeyFingerprint != ref.AuthKeyFingerprint ||
+			wire.ManifestKeyFingerprint != ref.ManifestKeyFingerprint {
+			return finalReject(wire, routesync.DispatchConflict, errors.Join(err, errors.New("invalid key_drop reference")))
+		}
+		if _, err := n.store.DropKeyLeaseRef(
+			ctx, ref.Group, ref.AuthKeyFingerprint, ref.ManifestKeyFingerprint,
+		); err != nil {
+			return finalReject(wire, routesync.DispatchConflict, err)
+		}
+		return &routesync.CmdAck{CmdID: wire.CmdID, Status: routesync.AckAccepted, KeyLeaseRef: &ref}
 	case routesync.CmdSandboxAdmitDispatch, routesync.CmdBuildAdmitDispatch:
 		local, err := n.session.Current(ctx)
 		if err != nil {
@@ -589,40 +620,21 @@ func (n *FinalClusterNode) executeSandbox(ctx context.Context, record *nodeexec.
 	if err != nil {
 		return err
 	}
+	if existing == nil {
+		return n.failSandbox(ctx, claimed, nil, errors.New("accepted Sandbox object is missing"))
+	}
 	if existing != nil && existing.State == types.StateRunning && existing.RunID != "" && n.core.unitActive(ctx, n.core.runnerUnit(existing.RunID)) {
 		_, err = n.store.CommitSandboxEvent(ctx, existing, nodeexec.EventUpdate{
 			State: string(clusterstate.WorkflowRouteReady), TargetPort: spec.TargetPort,
 		})
 		return err
 	}
-	manifestKey, err := n.core.resolveByFingerprint(ctx, spec.KeyFingerprint)
+	template, err := types.ParseTemplateID(existing.TemplateID)
 	if err != nil {
 		return n.failSandbox(ctx, claimed, existing, err)
 	}
-	template, err := types.ParseTemplateID(spec.TemplateRef)
-	if err != nil {
-		return n.failSandbox(ctx, claimed, existing, err)
-	}
-	trafficToken, err := keysMintToken()
-	if err != nil {
-		return n.failSandbox(ctx, claimed, existing, err)
-	}
-	timeout := spec.TimeoutSeconds
-	if timeout <= 0 {
-		timeout = n.core.cfg.Sandbox.TimeoutSec
-	}
-	sandbox := &types.Sandbox{
-		ID: claimed.ObjectID, TemplateID: spec.TemplateRef, State: types.StateRunning,
-		RunDir:      n.core.cfg.Paths.RunRoot + "/" + claimed.ObjectID,
-		BaseDir:     n.core.cfg.Paths.BaseRoot + "/" + claimed.ObjectID,
-		ManifestKey: manifestKey, EnvdAccessToken: spec.AccessToken,
-		TrafficAccessToken: trafficToken, Metadata: clusterstate.WithoutSystemMetadata(spec.Config),
-		CreatedUnix: time.Now().Unix(), DeadlineUnix: time.Now().Add(time.Duration(timeout) * time.Second).Unix(),
-	}
-	if template.Profile == types.ProfileE2B {
-		sandbox.EnvdUDS = sandbox.RunDir + "/envd.sock"
-		sandbox.CiUDS = sandbox.RunDir + "/ci.sock"
-	}
+	sandbox := existing
+	sandbox.State = types.StateRunning
 	if err := n.core.launch(ctx, sandbox, template); err != nil {
 		n.core.teardown(context.Background(), sandbox)
 		return n.failSandbox(ctx, claimed, sandbox, err)
@@ -634,6 +646,54 @@ func (n *FinalClusterNode) executeSandbox(ctx context.Context, record *nodeexec.
 	}
 	n.core.publishUpsert(sandbox)
 	return nil
+}
+
+func (n *FinalClusterNode) sandboxObject(
+	ctx context.Context,
+	record nodeexec.DispatchRecord,
+) (*types.Sandbox, error) {
+	spec, err := clusterstate.ParseSandboxDispatchSpec(record.DispatchSpec)
+	if err != nil {
+		return nil, err
+	}
+	lease, err := n.core.resolveByFingerprints(
+		ctx, record.Group, spec.AuthKeyFingerprint, spec.ManifestKeyFingerprint,
+	)
+	if err != nil {
+		return nil, err
+	}
+	create, err := api.ParseSandboxCreateEnvelope(spec.Request)
+	if err != nil || create.TemplateID != spec.TemplateRef || create.TimeoutSec != spec.TimeoutSeconds ||
+		!reflect.DeepEqual(create.Metadata, spec.Config) {
+		return nil, errors.Join(err, errors.New("Sandbox request envelope does not match dispatch spec"))
+	}
+	template, err := types.ParseTemplateID(spec.TemplateRef)
+	if err != nil {
+		return nil, err
+	}
+	trafficToken, err := keysMintToken()
+	if err != nil {
+		return nil, err
+	}
+	timeout := spec.TimeoutSeconds
+	if timeout <= 0 {
+		timeout = n.core.cfg.Sandbox.TimeoutSec
+	}
+	sandbox := &types.Sandbox{
+		ID: record.ObjectID, TemplateID: spec.TemplateRef, State: types.StateStarting,
+		RunDir:  n.core.cfg.Paths.RunRoot + "/" + record.ObjectID,
+		BaseDir: n.core.cfg.Paths.BaseRoot + "/" + record.ObjectID,
+		AuthKey: lease.AuthKey, ManifestKey: lease.ManifestKey,
+		EnvdAccessToken: spec.AccessToken, TrafficAccessToken: trafficToken,
+		Metadata: clusterstate.WithoutSystemMetadata(create.Metadata), Env: create.EnvVars,
+		CreatedUnix:  time.Now().Unix(),
+		DeadlineUnix: time.Now().Add(time.Duration(timeout) * time.Second).Unix(),
+	}
+	if template.Profile == types.ProfileE2B {
+		sandbox.EnvdUDS = sandbox.RunDir + "/envd.sock"
+		sandbox.CiUDS = sandbox.RunDir + "/ci.sock"
+	}
+	return sandbox, nil
 }
 
 func (n *FinalClusterNode) failSandbox(ctx context.Context, record *nodeexec.WorkflowRecord, sandbox *types.Sandbox, cause error) error {
@@ -744,7 +804,16 @@ func (n *FinalClusterNode) deleteSandboxSync(ctx context.Context, command *route
 	return n.authority.ReleaseSandboxResources(ctx, terminal, "deleted")
 }
 
-func (n *FinalClusterNode) sandboxDemand(record nodeexec.DispatchRecord) (nodectl.SandboxAdmissionDemand, error) {
+func (n *FinalClusterNode) sandboxDemand(ctx context.Context, record nodeexec.DispatchRecord) (nodectl.SandboxAdmissionDemand, error) {
+	spec, err := clusterstate.ParseSandboxDispatchSpec(record.DispatchSpec)
+	if err != nil {
+		return nodectl.SandboxAdmissionDemand{}, err
+	}
+	if _, err := n.core.resolveByFingerprints(
+		ctx, record.Group, spec.AuthKeyFingerprint, spec.ManifestKeyFingerprint,
+	); err != nil {
+		return nodectl.SandboxAdmissionDemand{}, err
+	}
 	normalized, err := placement.ParseNormalizedDemand(record.NormalizedDemand)
 	if err != nil || normalized.Sandbox == nil {
 		return nodectl.SandboxAdmissionDemand{}, errors.Join(err, errors.New("Sandbox normalized demand is missing"))
@@ -765,43 +834,34 @@ func (n *FinalClusterNode) buildObject(ctx context.Context, record nodeexec.Disp
 	if err != nil {
 		return nil, err
 	}
-	manifestKey, err := n.core.resolveByFingerprint(ctx, spec.KeyFingerprint)
+	lease, err := n.core.resolveByFingerprints(
+		ctx, record.Group, spec.AuthKeyFingerprint, spec.ManifestKeyFingerprint,
+	)
 	if err != nil {
 		return nil, err
 	}
-	if err := n.core.validateBuildOptions(spec.Builder, spec.FromTemplate != ""); err != nil {
+	register, err := api.ParseBuildRegisterEnvelope(spec.Request)
+	if err != nil || register.Profile != spec.Profile || register.CPUCount != spec.CPUCount ||
+		register.MemoryMB != spec.MemoryMB || !slices.Equal(nonEmpty(register.Name), spec.Names) ||
+		!slices.Equal(register.Tags, spec.Aliases) || !reflect.DeepEqual(register.Metadata, spec.Metadata) {
+		return nil, errors.Join(err, errors.New("Build request envelope does not match dispatch spec"))
+	}
+	metadata := sandboxcfg.SetCapacity(register.Metadata, register.CPUCount, register.MemoryMB)
+	metadata, builder, err := buildcfg.Extract(metadata)
+	if err != nil {
+		return nil, err
+	}
+	if err := n.core.validateBuildOptions(builder, false); err != nil {
 		return nil, err
 	}
 	build := &types.Build{
-		BuildID: record.ObjectID, TemplateID: spec.TemplateID, ManifestKey: manifestKey,
-		Profile: spec.Profile, Kind: types.KindImg, FromImage: spec.FromImage,
-		FromTemplate: spec.FromTemplate, StartCmd: spec.StartCmd, ReadyCmd: spec.ReadyCmd,
-		Steps: append([]types.TemplateStep(nil), spec.Steps...), Names: append([]string(nil), spec.Names...),
-		Aliases: append([]string(nil), spec.Aliases...), Metadata: clusterstate.WithoutSystemMetadata(spec.Metadata),
-		Builder: spec.Builder, Status: types.BuildRegistered, CreatedUnix: time.Now().Unix(),
-	}
-	if spec.Profile == types.ProfileE2B && (spec.StartCmd != "" || spec.FromTemplate != "") {
-		build.Kind = types.KindSnp
-	}
-	var credentials regcreds.Creds
-	if spec.PullCapability != "" {
-		credentials, err = regcreds.Open(manifestKey, spec.PullCapability)
-	} else {
-		var registryAuth string
-		registryAuth, err = n.store.RegistryAuthForKey(ctx, manifestKey)
-		if err == nil {
-			credentials = regcreds.CredsForImage(registryAuth, spec.FromImage)
-		}
-	}
-	if err != nil {
-		return nil, err
-	}
-	if !credentials.Empty() {
-		encoded, err := json.Marshal(credentials)
-		if err != nil {
-			return nil, err
-		}
-		build.RegistryAuth = string(encoded)
+		BuildID: record.ObjectID, TemplateID: spec.TemplateID,
+		AuthKey: lease.AuthKey, ManifestKey: lease.ManifestKey,
+		Profile: spec.Profile, CPUCount: spec.CPUCount, MemoryMB: spec.MemoryMB,
+		Kind: types.KindImg, Names: append([]string(nil), spec.Names...),
+		Aliases: append([]string(nil), spec.Aliases...), Metadata: clusterstate.WithoutSystemMetadata(metadata),
+		Builder: builder, RegistryAuth: lease.RegistryAuth,
+		Status: types.BuildRegistered, CreatedUnix: time.Now().Unix(),
 	}
 	return build, nil
 }

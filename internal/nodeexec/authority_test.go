@@ -204,11 +204,19 @@ func newAuthorityWithIdentityAndCapacity(
 		func(_ context.Context, record nodeexec.DispatchRecord) (*types.Build, error) {
 			return &types.Build{
 				BuildID: record.ObjectID, TemplateID: "transient-" + record.ObjectID,
-				ManifestKey: strings.Repeat("4", 64), Profile: types.ProfileE2B,
+				AuthKey: strings.Repeat("3", 64), ManifestKey: strings.Repeat("4", 64),
+				CPUCount: 2, MemoryMB: 2048, Profile: types.ProfileE2B,
 				Kind: types.KindImg, CreatedUnix: time.Now().Unix(),
 			}, nil
 		},
-		func(nodeexec.DispatchRecord) (nodectl.SandboxAdmissionDemand, error) {
+		func(_ context.Context, record nodeexec.DispatchRecord) (*types.Sandbox, error) {
+			return &types.Sandbox{
+				ID: record.ObjectID, TemplateID: "bare-img-" + strings.Repeat("5", 64),
+				State: types.StateStarting, AuthKey: strings.Repeat("3", 64),
+				ManifestKey: strings.Repeat("4", 64), CreatedUnix: time.Now().Unix(),
+			}, nil
+		},
+		func(context.Context, nodeexec.DispatchRecord) (nodectl.SandboxAdmissionDemand, error) {
 			return nodectl.SandboxAdmissionDemand{
 				SlotUnits:           1,
 				CapacityMemoryBytes: 1 << 30, CapacityCPU: 2, FloorMemoryBytes: 512 << 20,
@@ -233,6 +241,7 @@ func (j *recordBarrierJournal) RecordSandboxWorkflow(
 	ctx context.Context,
 	dispatch nodeexec.DispatchRecord,
 	decision nodeexec.AdmissionDecision,
+	sandbox *types.Sandbox,
 ) (*nodeexec.WorkflowRecord, error) {
 	j.mu.Lock()
 	j.arrived++
@@ -247,7 +256,7 @@ func (j *recordBarrierJournal) RecordSandboxWorkflow(
 	}
 	j.mu.Lock()
 	defer j.mu.Unlock()
-	return j.Store.RecordSandboxWorkflow(ctx, dispatch, decision)
+	return j.Store.RecordSandboxWorkflow(ctx, dispatch, decision, sandbox)
 }
 
 type concurrentSandboxAdmission struct {
@@ -689,7 +698,7 @@ func TestAuthorityRejectsExistingLocalObjectBeforeAdmissionSideEffects(t *testin
 	command := authorityCommand(t, clusterstate.ExecutionKindSandbox, "sandbox-existing")
 	if err := st.Put(context.Background(), &types.Sandbox{
 		ID: command.ObjectID, TemplateID: "e2b-img-" + strings.Repeat("5", 64),
-		ManifestKey: strings.Repeat("6", 64), State: types.StateRunning,
+		AuthKey: strings.Repeat("7", 64), ManifestKey: strings.Repeat("6", 64), State: types.StateRunning,
 	}); err != nil {
 		t.Fatal(err)
 	}

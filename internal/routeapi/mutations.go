@@ -69,15 +69,20 @@ func (r PermitResponse) ValidateFor(request PermitRequest) error {
 }
 
 type SandboxInput struct {
-	Config              map[string]string       `json:"config,omitempty"`
-	TimeoutSeconds      int                     `json:"timeout_seconds,omitempty"`
-	Demand              placement.SandboxDemand `json:"demand"`
-	TargetRuntimeDigest string                  `json:"target_runtime_digest,omitempty"`
+	Config              map[string]string                  `json:"config,omitempty"`
+	TemplateRef         string                             `json:"template_ref,omitempty"`
+	TimeoutSeconds      int                                `json:"timeout_seconds,omitempty"`
+	Demand              placement.SandboxDemand            `json:"demand"`
+	TargetRuntimeDigest string                             `json:"target_runtime_digest,omitempty"`
+	Request             clusterstate.NodeRequestEnvelopeV1 `json:"request"`
 }
 
 func (i SandboxInput) Validate() error {
 	if i.TimeoutSeconds < 0 {
 		return errors.New("routeapi: Sandbox timeout cannot be negative")
+	}
+	if err := i.Request.Validate(); err != nil {
+		return fmt.Errorf("routeapi: invalid Sandbox node request: %w", err)
 	}
 	_, err := placement.NormalizeSandboxDemand(i.Demand)
 	return err
@@ -166,22 +171,27 @@ func (r ResumeSandboxRequest) Validate() error {
 type DeleteSandboxRequest = ResumeSandboxRequest
 
 type BuildInput struct {
-	TemplateID          string                `json:"template_id"`
-	Profile             types.Profile         `json:"profile"`
-	Names               []string              `json:"names,omitempty"`
-	Aliases             []string              `json:"aliases,omitempty"`
-	Metadata            map[string]string     `json:"metadata,omitempty"`
-	Builder             types.BuildOptions    `json:"builder,omitempty"`
-	Demand              placement.BuildDemand `json:"demand"`
-	TargetRuntimeDigest string                `json:"target_runtime_digest,omitempty"`
+	TemplateID          string                             `json:"template_id"`
+	Profile             types.Profile                      `json:"profile"`
+	Names               []string                           `json:"names,omitempty"`
+	Aliases             []string                           `json:"aliases,omitempty"`
+	Metadata            map[string]string                  `json:"metadata,omitempty"`
+	CPUCount            int                                `json:"cpu_count"`
+	MemoryMB            int                                `json:"memory_mb"`
+	Demand              placement.BuildDemand              `json:"demand"`
+	TargetRuntimeDigest string                             `json:"target_runtime_digest,omitempty"`
+	Request             clusterstate.NodeRequestEnvelopeV1 `json:"request"`
 }
 
 func (i BuildInput) Validate() error {
-	if i.TemplateID == "" || !i.Profile.Valid() {
-		return errors.New("routeapi: Build template ID and profile are required")
+	if i.TemplateID == "" || !i.Profile.Valid() || i.CPUCount <= 0 || i.MemoryMB <= 0 {
+		return errors.New("routeapi: Build template ID, profile, and positive CPU/memory ceiling are required")
 	}
 	if !slices.IsSorted(i.Names) || !slices.IsSorted(i.Aliases) {
 		return errors.New("routeapi: Build names and aliases must be canonical sorted lists")
+	}
+	if err := i.Request.Validate(); err != nil {
+		return fmt.Errorf("routeapi: invalid Build node request: %w", err)
 	}
 	_, err := placement.NormalizeBuildDemand(i.Demand)
 	return err

@@ -241,7 +241,9 @@ func workflowSandboxIntent(t *testing.T) DispatchIntent {
 	t.Helper()
 	spec, err := MarshalSandboxDispatchSpec(SandboxDispatchSpecV1{
 		Version: DispatchSpecVersionV1, TemplateRef: "e2b-img-" + strings.Repeat("c", 64),
-		KeyFingerprint: strings.Repeat("a", 24), AccessToken: "token", TargetPort: 3000,
+		AuthKeyFingerprint: strings.Repeat("a", 24), ManifestKeyFingerprint: strings.Repeat("b", 24),
+		AccessToken: "token", TargetPort: 3000,
+		Request: NodeRequestEnvelopeV1{Version: NodeRequestEnvelopeVersionV1, Method: "POST", Path: "/sandboxes", Body: []byte("{}")},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -257,7 +259,9 @@ func workflowBuildIntent(t *testing.T) DispatchIntent {
 	t.Helper()
 	spec, err := MarshalBuildDispatchSpec(BuildDispatchSpecV1{
 		Version: DispatchSpecVersionV1, TemplateID: "template-1",
-		KeyFingerprint: strings.Repeat("b", 24), Profile: types.ProfileBare,
+		AuthKeyFingerprint: strings.Repeat("b", 24), ManifestKeyFingerprint: strings.Repeat("c", 24),
+		Profile: types.ProfileBare, CPUCount: 1, MemoryMB: 512,
+		Request: NodeRequestEnvelopeV1{Version: NodeRequestEnvelopeVersionV1, Method: "POST", Path: "/v3/templates", Body: []byte("{}")},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -274,7 +278,9 @@ func readyRoute() *ReadyRoute {
 	templateRef := "e2b-img-" + strings.Repeat("c", 64)
 	spec, _ := MarshalSandboxDispatchSpec(SandboxDispatchSpecV1{
 		Version: DispatchSpecVersionV1, TemplateRef: templateRef,
-		KeyFingerprint: strings.Repeat("a", 24), AccessToken: "token", TargetPort: 3000,
+		AuthKeyFingerprint: strings.Repeat("a", 24), ManifestKeyFingerprint: strings.Repeat("b", 24),
+		AccessToken: "token", TargetPort: 3000,
+		Request: NodeRequestEnvelopeV1{Version: NodeRequestEnvelopeVersionV1, Method: "POST", Path: "/sandboxes", Body: []byte("{}")},
 	})
 	intent, _ := NewDispatchIntent([]byte("demand"), spec, "provider-v1")
 	return &ReadyRoute{

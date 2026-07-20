@@ -103,7 +103,7 @@ func TestResumeRace_ConnectAndRouteSingleLaunch(t *testing.T) {
 	sid := "sbx-race-1"
 	sb := &types.Sandbox{
 		ID: sid, TemplateID: "bare-img-" + strings.Repeat("b", 64), State: types.StatePaused,
-		ManifestKey: mk,
+		AuthKey: mk, ManifestKey: mk,
 		RunDir:      cfg.Paths.RunRoot + "/" + sid,
 		BaseDir:     cfg.Paths.BaseRoot + "/" + sid,
 		CreatedUnix: 1,

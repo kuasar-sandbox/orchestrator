@@ -222,7 +222,9 @@ func testReadyRoute() *clusterstate.ReadyRoute {
 	templateRef := "e2b-img-" + strings.Repeat("c", 64)
 	spec, _ := clusterstate.MarshalSandboxDispatchSpec(clusterstate.SandboxDispatchSpecV1{
 		Version: clusterstate.DispatchSpecVersionV1, TemplateRef: templateRef,
-		KeyFingerprint: strings.Repeat("a", 24), AccessToken: "token", TargetPort: 3000,
+		AuthKeyFingerprint: strings.Repeat("a", 24), ManifestKeyFingerprint: strings.Repeat("b", 24),
+		AccessToken: "token", TargetPort: 3000,
+		Request: clusterstate.NodeRequestEnvelopeV1{Version: clusterstate.NodeRequestEnvelopeVersionV1, Method: "POST", Path: "/sandboxes", Body: []byte("{}")},
 	})
 	intent, _ := clusterstate.NewDispatchIntent([]byte("demand"), spec, "provider-v1")
 	return &clusterstate.ReadyRoute{
@@ -237,7 +239,9 @@ func testBuildProjection() *clusterstate.BuildProjection {
 	digest := sha256.Sum256([]byte("build-binding"))
 	spec, _ := clusterstate.MarshalBuildDispatchSpec(clusterstate.BuildDispatchSpecV1{
 		Version: clusterstate.DispatchSpecVersionV1, TemplateID: "template-1",
-		KeyFingerprint: strings.Repeat("b", 24), Profile: types.ProfileBare,
+		AuthKeyFingerprint: strings.Repeat("b", 24), ManifestKeyFingerprint: strings.Repeat("c", 24),
+		Profile: types.ProfileBare, CPUCount: 1, MemoryMB: 512,
+		Request: clusterstate.NodeRequestEnvelopeV1{Version: clusterstate.NodeRequestEnvelopeVersionV1, Method: "POST", Path: "/v3/templates", Body: []byte("{}")},
 	})
 	intent, _ := clusterstate.NewDispatchIntent([]byte("demand"), spec, "provider-v1")
 	return &clusterstate.BuildProjection{

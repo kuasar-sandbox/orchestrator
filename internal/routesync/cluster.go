@@ -51,6 +51,8 @@ const (
 	CmdBuildAdmitDispatch   = "build_admit_dispatch"
 	CmdSandboxResume        = "sandbox_resume"
 	CmdSandboxDelete        = "sandbox_delete"
+	CmdKeyPut               = "key_put"
+	CmdKeyDrop              = "key_drop"
 	CmdRebindExecution      = "rebind_execution"
 	CmdAckRecoveryEvent     = "ack_recovery_event"
 	CmdFinalizeWorkflow     = "finalize_workflow"
@@ -367,25 +369,29 @@ type BuildResources struct {
 // idempotent by SID or BuildID plus the immutable intent digests. Terminal
 // results are emitted through the durable execution-event outbox.
 type Command struct {
-	CmdID              string                 `json:"cmd_id"`
-	Kind               string                 `json:"kind"`
-	SID                string                 `json:"sid,omitempty"`
-	BuildID            string                 `json:"build_id,omitempty"`
-	NodeEpoch          uint64                 `json:"node_epoch,omitempty"`
-	SessionSeq         uint64                 `json:"session_seq,omitempty"`
-	RegistryGeneration string                 `json:"registry_generation,omitempty"`
-	Binding            string                 `json:"binding,omitempty"`
-	BindingDigest      string                 `json:"binding_digest,omitempty"`
-	OldBindingDigest   string                 `json:"old_binding_digest,omitempty"`
-	DemandDigest       string                 `json:"demand_digest,omitempty"`
-	DispatchSpecDigest string                 `json:"dispatch_spec_digest,omitempty"`
-	Group              string                 `json:"group,omitempty"`
-	RouteKey           string                 `json:"route_key,omitempty"`
-	NormalizedDemand   []byte                 `json:"normalized_demand,omitempty"`
-	DispatchSpec       []byte                 `json:"dispatch_spec,omitempty"`
-	ProviderPolicy     string                 `json:"provider_policy_version,omitempty"`
-	Recovery           *RecoveryReportRequest `json:"recovery,omitempty"`
-	EventAck           *EventAck              `json:"event_ack,omitempty"`
+	CmdID                  string                 `json:"cmd_id"`
+	Kind                   string                 `json:"kind"`
+	SID                    string                 `json:"sid,omitempty"`
+	BuildID                string                 `json:"build_id,omitempty"`
+	NodeEpoch              uint64                 `json:"node_epoch,omitempty"`
+	SessionSeq             uint64                 `json:"session_seq,omitempty"`
+	RegistryGeneration     string                 `json:"registry_generation,omitempty"`
+	Binding                string                 `json:"binding,omitempty"`
+	BindingDigest          string                 `json:"binding_digest,omitempty"`
+	OldBindingDigest       string                 `json:"old_binding_digest,omitempty"`
+	DemandDigest           string                 `json:"demand_digest,omitempty"`
+	DispatchSpecDigest     string                 `json:"dispatch_spec_digest,omitempty"`
+	AuthKeyFingerprint     string                 `json:"auth_key_fingerprint,omitempty"`
+	ManifestKeyFingerprint string                 `json:"manifest_key_fingerprint,omitempty"`
+	Group                  string                 `json:"group,omitempty"`
+	RouteKey               string                 `json:"route_key,omitempty"`
+	NormalizedDemand       []byte                 `json:"normalized_demand,omitempty"`
+	DispatchSpec           []byte                 `json:"dispatch_spec,omitempty"`
+	ProviderPolicy         string                 `json:"provider_policy_version,omitempty"`
+	KeyLease               *NodeKeyLeaseV1        `json:"key_lease,omitempty"`
+	KeyLeaseRef            *NodeKeyLeaseRefV1     `json:"key_lease_ref,omitempty"`
+	Recovery               *RecoveryReportRequest `json:"recovery,omitempty"`
+	EventAck               *EventAck              `json:"event_ack,omitempty"`
 }
 
 // CmdAck acknowledges a Command's receipt; the terminal outcome arrives via the
@@ -395,6 +401,7 @@ type CmdAck struct {
 	Status                string                  `json:"status"` // AckAccepted | AckRejected
 	Outcome               string                  `json:"outcome,omitempty"`
 	Reason                string                  `json:"reason,omitempty"`
+	KeyLeaseRef           *NodeKeyLeaseRefV1      `json:"key_lease_ref,omitempty"`
 	Recovery              *RecoveryReportPage     `json:"recovery,omitempty"`
 	RebindObject          *RecoveryObjectSnapshot `json:"rebind_object,omitempty"`
 	RebindAdmissionState  string                  `json:"rebind_admission_state,omitempty"`

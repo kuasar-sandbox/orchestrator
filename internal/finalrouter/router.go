@@ -22,6 +22,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/envdsign"
 	"github.com/kuasar-sandbox/orchestrator/internal/metrics"
@@ -206,6 +207,61 @@ func sandboxVerb(path string) bool {
 	return strings.HasPrefix(path, "/sandboxes/") || strings.HasPrefix(path, "/v2/sandboxes/")
 }
 
+func nodeRequestEnvelope(request *http.Request) (clusterstate.NodeRequestEnvelopeV1, error) {
+	raw, err := io.ReadAll(io.LimitReader(request.Body, clusterstate.MaxNodeRequestBodyBytes+1))
+	if err != nil {
+		return clusterstate.NodeRequestEnvelopeV1{}, err
+	}
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return clusterstate.NodeRequestEnvelopeV1{}, errors.New("request body must be a JSON object")
+	}
+	return clusterstate.NewNodeRequestEnvelopeV1(
+		request.Method, request.URL.Path, request.URL.RawQuery, request.Header, raw,
+	)
+}
+
+func sandboxCreateInput(request *http.Request) (routeapi.SandboxInput, error) {
+	envelope, err := nodeRequestEnvelope(request)
+	if err != nil {
+		return routeapi.SandboxInput{}, err
+	}
+	create, err := api.ParseSandboxCreateEnvelope(envelope)
+	if err != nil {
+		return routeapi.SandboxInput{}, err
+	}
+	envelope, err = api.RewriteSandboxCreateEnvelope(
+		envelope, create.TemplateID, create.TimeoutSec, create.Metadata,
+	)
+	if err != nil {
+		return routeapi.SandboxInput{}, err
+	}
+	input := routeapi.SandboxInput{
+		TemplateRef: create.TemplateID, Config: create.Metadata, TimeoutSeconds: create.TimeoutSec,
+		Demand: placement.SandboxDemand{SlotUnits: 1}, Request: envelope,
+	}
+	return input, input.Validate()
+}
+
+func defaultSandboxInput() (routeapi.SandboxInput, error) {
+	envelope, err := clusterstate.NewNodeRequestEnvelopeV1(
+		http.MethodPost, "/sandboxes", "", nil, []byte("{}"),
+	)
+	if err != nil {
+		return routeapi.SandboxInput{}, err
+	}
+	input := routeapi.SandboxInput{
+		Demand: placement.SandboxDemand{SlotUnits: 1}, Request: envelope,
+	}
+	return input, input.Validate()
+}
+
+func firstOrEmpty(values []string) string {
+	if len(values) == 0 {
+		return ""
+	}
+	return values[0]
+}
+
 func (r *Router) createSandbox(w http.ResponseWriter, request *http.Request) {
 	group, ok := r.authorizedGroup(w, request)
 	if !ok {
@@ -215,7 +271,12 @@ func (r *Router) createSandbox(w http.ResponseWriter, request *http.Request) {
 	if routeKey == "" {
 		routeKey = "rk-" + randomID()
 	}
-	entry, err := r.reserve(request.Context(), group, routeKey)
+	input, err := sandboxCreateInput(request)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	entry, err := r.reserve(request.Context(), group, routeKey, input)
 	if err != nil {
 		r.log.Warn("router reserve", "group", group, "route_key", routeKey, "err", err)
 		http.Error(w, "sandbox is not ready", http.StatusServiceUnavailable)
@@ -232,10 +293,7 @@ func (r *Router) createSandbox(w http.ResponseWriter, request *http.Request) {
 	})
 }
 
-func (r *Router) reserve(ctx context.Context, group, routeKey string) (*routeEntry, error) {
-	if cached := r.cachedRoute(group, routeKey); cached != nil {
-		return cached, nil
-	}
+func (r *Router) reserve(ctx context.Context, group, routeKey string, input routeapi.SandboxInput) (*routeEntry, error) {
 	key := routeKeyID(group, routeKey)
 	r.reserveMu.Lock()
 	if flight := r.flights[key]; flight != nil {
@@ -251,9 +309,7 @@ func (r *Router) reserve(ctx context.Context, group, routeKey string) (*routeEnt
 	r.flights[key] = flight
 	r.reserveMu.Unlock()
 
-	result, err := r.control.ReserveSandbox(ctx, group, routeKey, r.minimumRouteRevision(group, routeKey), routeapi.SandboxInput{
-		Demand: placement.SandboxDemand{SlotUnits: 1},
-	})
+	result, err := r.control.ReserveSandbox(ctx, group, routeKey, r.minimumRouteRevision(group, routeKey), input)
 	if err == nil {
 		response := result.Response
 		if response.Outcome != routeapi.MutationReady || response.Route == nil {
@@ -360,35 +416,33 @@ func (r *Router) registerBuild(w http.ResponseWriter, request *http.Request) {
 	if !ok {
 		return
 	}
-	var body struct {
-		Name     string   `json:"name"`
-		Tags     []string `json:"tags"`
-		Profile  string   `json:"profile"`
-		CPUCount int      `json:"cpuCount"`
-		MemoryMB int      `json:"memoryMB"`
-	}
-	if err := json.NewDecoder(io.LimitReader(request.Body, 1<<20)).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
-		http.Error(w, "invalid Build registration", http.StatusBadRequest)
+	envelope, err := nodeRequestEnvelope(request)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	profile := types.ProfileE2B
-	if body.Profile != "" {
-		var err error
-		profile, err = types.ParseProfile(body.Profile)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
+	register, err := api.ParseBuildRegisterEnvelope(envelope)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
 	}
 	buildID := "bld-" + randomID()
 	templateID := types.TransientPrefix + buildID
-	names := nonEmpty(body.Name)
-	aliases := canonicalStrings(body.Tags)
+	names := nonEmpty(register.Name)
+	aliases := canonicalStrings(register.Tags)
+	register.Name, register.Tags = firstOrEmpty(names), append([]string(nil), aliases...)
+	envelope, err = api.RewriteBuildRegisterEnvelope(envelope, register)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 	input := routeapi.BuildInput{
-		TemplateID: templateID, Profile: profile, Names: names, Aliases: aliases,
+		TemplateID: templateID, Profile: register.Profile, Names: names, Aliases: aliases,
+		Metadata: register.Metadata, CPUCount: register.CPUCount, MemoryMB: register.MemoryMB,
+		Request: envelope,
 		Demand: placement.BuildDemand{
-			Slots: 1, CPU: uint64(max(body.CPUCount, 0) * 1000),
-			Memory: uint64(max(body.MemoryMB, 0)) << 20,
+			Slots: 1, CPU: uint64(register.CPUCount * 1000),
+			Memory: uint64(register.MemoryMB) << 20,
 		},
 	}
 	result, err := r.control.RegisterBuild(request.Context(), group, buildID, 0, input)
@@ -409,7 +463,7 @@ func (r *Router) registerBuild(w http.ResponseWriter, request *http.Request) {
 	w.WriteHeader(http.StatusAccepted)
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"templateID": templateID, "buildID": buildID, "public": false,
-		"names": names, "tags": aliases, "aliases": aliases, "profile": profile,
+		"names": names, "tags": aliases, "aliases": aliases, "profile": register.Profile,
 	})
 }
 
@@ -613,7 +667,12 @@ func (r *Router) serveData(w http.ResponseWriter, request *http.Request, host st
 		// Data traffic is also the lazy create/resume entry for the stable
 		// (group, route_key). Reserve is consensus-idempotent and single-flight;
 		// uncertainty never authorizes a different logical Route.
-		entry, err = r.reserve(request.Context(), group, routeKey)
+		input, inputErr := defaultSandboxInput()
+		if inputErr != nil {
+			err = inputErr
+		} else {
+			entry, err = r.reserve(request.Context(), group, routeKey, input)
+		}
 	}
 	if err != nil || entry == nil || !r.control.CacheAuthorized(entry.ServeIdentity) {
 		http.Error(w, "sandbox route unavailable", http.StatusServiceUnavailable)

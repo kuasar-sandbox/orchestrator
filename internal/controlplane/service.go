@@ -16,6 +16,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/coordinator"
 	"github.com/kuasar-sandbox/orchestrator/internal/placement"
@@ -28,6 +29,7 @@ import (
 
 type NodeCommandSender interface {
 	SendNodeCommand(context.Context, session.ServeIdentity, string, uint64, string, *routesync.Command) (routesync.CmdAck, bool, error)
+	InstallKeyLease(context.Context, session.ServeIdentity, string, uint64, string, routesync.NodeKeyLeaseV1) (routesync.NodeKeyLeaseRefV1, bool, error)
 }
 
 type RegistryServiceConfig struct {
@@ -132,11 +134,12 @@ func NewRegistryService(
 		config.NewObjectID = defaults.NewObjectID
 	}
 	compactionCtx, stopCompaction := context.WithCancel(context.Background())
-	dispatcher = rateLimitedDispatcher{
+	limitedDispatcher := rateLimitedDispatcher{
 		next:    dispatcher,
 		sandbox: newLaunchRateLimiter(config.SandboxLaunchPerSecond, config.SandboxLaunchBurst, len(registryLayout.Members)),
 		build:   newLaunchRateLimiter(config.BuildLaunchPerSecond, config.BuildLaunchBurst, len(registryLayout.Members)),
 	}
+	dispatcher = keyLeaseDispatcher{planner: planner, installer: commands, next: limitedDispatcher}
 	return &RegistryService{
 		store: store, planner: planner, prober: prober, dispatcher: dispatcher,
 		commands: commands, config: config, compactionCtx: compactionCtx, stopCompaction: stopCompaction,
@@ -615,8 +618,9 @@ func (s *RegistryService) planSandbox(
 		Kind: placer.PlanSandbox, Group: group, RouteKey: routeKey, Nodes: nodes,
 		TargetRuntimeDigest: input.TargetRuntimeDigest,
 		Sandbox: &placer.SandboxPlanInput{
-			SandboxID: sandboxID, Config: cloneStringMap(input.Config),
+			SandboxID: sandboxID, TemplateRef: input.TemplateRef, Config: cloneStringMap(input.Config),
 			TimeoutSeconds: input.TimeoutSeconds, Demand: input.Demand,
+			Request: input.Request,
 		},
 	})
 	if err != nil {
@@ -654,7 +658,8 @@ func (s *RegistryService) planBuild(
 		Build: &placer.BuildPlanInput{
 			BuildID: buildID, TemplateID: input.TemplateID, Profile: input.Profile,
 			Names: append([]string(nil), input.Names...), Aliases: append([]string(nil), input.Aliases...),
-			Metadata: cloneStringMap(input.Metadata), Builder: input.Builder, Demand: input.Demand,
+			Metadata: cloneStringMap(input.Metadata), CPUCount: input.CPUCount, MemoryMB: input.MemoryMB,
+			Demand: input.Demand, Request: input.Request,
 		},
 	})
 	if err != nil {
@@ -705,7 +710,8 @@ func (r sandboxRoundSource) NextSandboxRound(
 		return coordinator.SandboxRound{}, err
 	}
 	return r.service.planSandbox(ctx, group, routeKey, sandboxID, routeapi.SandboxInput{
-		Config: spec.Config, TimeoutSeconds: spec.TimeoutSeconds, Demand: *demand.Sandbox,
+		TemplateRef: spec.TemplateRef, Config: spec.RequestedConfig,
+		TimeoutSeconds: spec.TimeoutSeconds, Demand: *demand.Sandbox, Request: spec.Request,
 	})
 }
 
@@ -873,7 +879,11 @@ func sandboxInputMatchesIntent(input routeapi.SandboxInput, intent clusterstate.
 		spec.TargetRuntimeDigest != input.TargetRuntimeDigest {
 		return false
 	}
-	return reflect.DeepEqual(spec.RequestedConfig, clusterstate.WithoutSystemMetadata(input.Config))
+	normalizedRequest, err := api.RewriteSandboxCreateEnvelope(
+		input.Request, spec.TemplateRef, spec.TimeoutSeconds, spec.Config,
+	)
+	return err == nil && reflect.DeepEqual(spec.RequestedConfig, clusterstate.WithoutSystemMetadata(input.Config)) &&
+		reflect.DeepEqual(spec.Request, normalizedRequest)
 }
 
 func routeIntent(record clusterstate.RouteWorkflowRecord) (clusterstate.DispatchIntent, bool) {
@@ -921,10 +931,23 @@ func buildInputMatchesIntent(input routeapi.BuildInput, intent clusterstate.Disp
 		return false
 	}
 	return spec.TemplateID == input.TemplateID && spec.Profile == input.Profile &&
+		spec.CPUCount == input.CPUCount && spec.MemoryMB == input.MemoryMB &&
 		spec.TargetRuntimeDigest == input.TargetRuntimeDigest &&
 		slices.Equal(spec.Names, input.Names) && slices.Equal(spec.Aliases, input.Aliases) &&
 		reflect.DeepEqual(spec.Metadata, clusterstate.WithoutSystemMetadata(input.Metadata)) &&
-		reflect.DeepEqual(spec.Builder, input.Builder)
+		buildRequestMatches(input.Request, spec)
+}
+
+func buildRequestMatches(request clusterstate.NodeRequestEnvelopeV1, spec clusterstate.BuildDispatchSpecV1) bool {
+	name := ""
+	if len(spec.Names) > 0 {
+		name = spec.Names[0]
+	}
+	normalized, err := api.RewriteBuildRegisterEnvelope(request, api.RegisterSpec{
+		Name: name, Tags: append([]string(nil), spec.Aliases...), Profile: spec.Profile,
+		CPUCount: spec.CPUCount, MemoryMB: spec.MemoryMB, Metadata: cloneStringMap(spec.Metadata),
+	})
+	return err == nil && reflect.DeepEqual(normalized, spec.Request)
 }
 
 func routeExecution(record clusterstate.RouteWorkflowRecord) (clusterstate.ReadyRoute, bool) {

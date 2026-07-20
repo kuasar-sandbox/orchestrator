@@ -42,7 +42,9 @@ func (s *Store) CommitBuildTrigger(ctx context.Context, candidate *types.Build, 
 		return false, nil
 	}
 	if current.Status != types.BuildRegistered || current.TemplateID != candidate.TemplateID ||
-		current.ManifestKey != candidate.ManifestKey || current.Profile != candidate.Profile ||
+		current.AuthKey != candidate.AuthKey || current.ManifestKey != candidate.ManifestKey ||
+		current.Profile != candidate.Profile || current.CPUCount != candidate.CPUCount ||
+		current.MemoryMB != candidate.MemoryMB ||
 		current.CreatedUnix != candidate.CreatedUnix {
 		return false, ErrBuildTriggerConflict
 	}

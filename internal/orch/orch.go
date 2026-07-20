@@ -74,7 +74,8 @@ type Orchestrator struct {
 
 	files *filestore.Store // COPY build-context object store; nil = unconfigured (COPY → 501)
 
-	clusterCtx context.Context // node-link async work lifetime (set by serve); nil = background
+	clusterCtx  context.Context         // node-link async work lifetime (set by serve); nil = background
+	keyResolver NodeKeyMaterialResolver // optional resolver for Provider-backed key references
 }
 
 func New(cfg *config.Config, st *store.Store, lc launcher.Launcher, vs vsClient, log *slog.Logger) *Orchestrator {
@@ -113,11 +114,11 @@ func (o *Orchestrator) Create(ctx context.Context, req api.CreateReq) (*types.Sa
 	if req.TimeoutSec <= 0 {
 		req.TimeoutSec = o.cfg.Sandbox.TimeoutSec // default TTL (sandbox.timeout_sec)
 	}
-	manifestKey, err := o.resolveAllowed(ctx, req.APIKey)
+	lease, err := o.resolveAllowed(ctx, req.APIKey)
 	if err != nil {
 		return nil, err
 	}
-	if manifestKey == "" {
+	if lease.AuthKey == "" {
 		return nil, api.ErrNotAllowed
 	}
 	tmpl, err := types.ParseTemplateID(req.TemplateID)
@@ -155,7 +156,8 @@ func (o *Orchestrator) Create(ctx context.Context, req api.CreateReq) (*types.Sa
 		State:              types.StateRunning,
 		RunDir:             o.cfg.Paths.RunRoot + "/" + sid,
 		BaseDir:            o.cfg.Paths.BaseRoot + "/" + sid,
-		ManifestKey:        manifestKey,
+		AuthKey:            lease.AuthKey,
+		ManifestKey:        lease.ManifestKey,
 		EnvdAccessToken:    envdTok,
 		TrafficAccessToken: trafTok,
 		Metadata:           meta,
@@ -773,10 +775,10 @@ func (o *Orchestrator) Reaper(ctx context.Context, interval time.Duration) {
 					o.log.Warn("reaper pause", "sid", sb.ID, "err", err)
 				}
 			}
-			if n, err := o.st.PruneExpiredManifestKeys(ctx); err != nil {
-				o.log.Warn("reaper prune manifest keys", "err", err)
+			if n, err := o.st.PruneExpiredKeyLeases(ctx); err != nil {
+				o.log.Warn("reaper prune key leases", "err", err)
 			} else if n > 0 {
-				o.log.Info("reaper pruned expired manifest keys", "n", n)
+				o.log.Info("reaper pruned expired key leases", "n", n)
 			}
 		}
 	}

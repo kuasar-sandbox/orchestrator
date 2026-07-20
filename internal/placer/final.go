@@ -10,17 +10,21 @@ import (
 	"io"
 	"net/http"
 	"sort"
+	"time"
 
 	"github.com/kuasar-sandbox/accelerator/pkg/maglev"
+	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/clustercfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/placement"
+	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
 const (
 	FinalPlanPath      = "/internal/placement/plan"
 	FinalVerifyKeyPath = "/internal/provider/verify-key"
+	FinalKeyLeasePath  = "/internal/provider/key-lease"
 )
 
 type VerifyKeyRequest struct {
@@ -32,6 +36,17 @@ type VerifyKeyResponse struct {
 	Authorized bool `json:"authorized"`
 }
 
+type KeyLeaseRequest struct {
+	Group                  string `json:"group"`
+	AuthKeyFingerprint     string `json:"auth_key_fingerprint"`
+	ManifestKeyFingerprint string `json:"manifest_key_fingerprint"`
+}
+
+type KeyLeaseResponse struct {
+	Lease *routesync.NodeKeyLeaseV1 `json:"lease,omitempty"`
+	Error string                    `json:"error,omitempty"`
+}
+
 type PlanKind string
 
 const (
@@ -40,21 +55,25 @@ const (
 )
 
 type SandboxPlanInput struct {
-	SandboxID      string                  `json:"sandbox_id"`
-	Config         map[string]string       `json:"config,omitempty"`
-	TimeoutSeconds int                     `json:"timeout_seconds,omitempty"`
-	Demand         placement.SandboxDemand `json:"demand"`
+	SandboxID      string                             `json:"sandbox_id"`
+	TemplateRef    string                             `json:"template_ref,omitempty"`
+	Config         map[string]string                  `json:"config,omitempty"`
+	TimeoutSeconds int                                `json:"timeout_seconds,omitempty"`
+	Demand         placement.SandboxDemand            `json:"demand"`
+	Request        clusterstate.NodeRequestEnvelopeV1 `json:"request"`
 }
 
 type BuildPlanInput struct {
-	BuildID    string                `json:"build_id"`
-	TemplateID string                `json:"template_id"`
-	Profile    types.Profile         `json:"profile"`
-	Names      []string              `json:"names,omitempty"`
-	Aliases    []string              `json:"aliases,omitempty"`
-	Metadata   map[string]string     `json:"metadata,omitempty"`
-	Builder    types.BuildOptions    `json:"builder,omitempty"`
-	Demand     placement.BuildDemand `json:"demand"`
+	BuildID    string                             `json:"build_id"`
+	TemplateID string                             `json:"template_id"`
+	Profile    types.Profile                      `json:"profile"`
+	Names      []string                           `json:"names,omitempty"`
+	Aliases    []string                           `json:"aliases,omitempty"`
+	Metadata   map[string]string                  `json:"metadata,omitempty"`
+	CPUCount   int                                `json:"cpu_count"`
+	MemoryMB   int                                `json:"memory_mb"`
+	Demand     placement.BuildDemand              `json:"demand"`
+	Request    clusterstate.NodeRequestEnvelopeV1 `json:"request"`
 }
 
 type PlanRequest struct {
@@ -103,6 +122,10 @@ func (s *FinalService) ServeHTTP(w http.ResponseWriter, request *http.Request) {
 		s.serveVerifyKey(w, request)
 		return
 	}
+	if request.URL.Path == FinalKeyLeasePath {
+		s.serveKeyLease(w, request)
+		return
+	}
 	if request.URL.Path != FinalPlanPath {
 		http.NotFound(w, request)
 		return
@@ -115,6 +138,30 @@ func (s *FinalService) ServeHTTP(w http.ResponseWriter, request *http.Request) {
 	response, err := s.Plan(request.Context(), input)
 	if err != nil {
 		response.Error = err.Error()
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(response)
+}
+
+func (s *FinalService) serveKeyLease(w http.ResponseWriter, request *http.Request) {
+	var input KeyLeaseRequest
+	if err := decodeFinalRequest(request, 1<<20, &input); err != nil ||
+		input.Group == "" || input.AuthKeyFingerprint == "" || input.ManifestKeyFingerprint == "" {
+		http.Error(w, "invalid Provider key lease request", http.StatusBadRequest)
+		return
+	}
+	lease, err := ResolveNodeKeyLease(
+		request.Context(), s.provider, input.Group, time.Now().Add(DefaultNodeKeyLeaseTTL).Unix(),
+	)
+	if err == nil && (lease.AuthKey.Fingerprint != input.AuthKeyFingerprint ||
+		lease.ManifestKey.Fingerprint != input.ManifestKeyFingerprint) {
+		err = errors.New("placer: requested key lease fingerprints are no longer active")
+	}
+	response := KeyLeaseResponse{}
+	if err != nil {
+		response.Error = err.Error()
+	} else {
+		response.Lease = &lease
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(response)
@@ -171,16 +218,9 @@ func (s *FinalService) Plan(ctx context.Context, request PlanRequest) (PlanRespo
 	if err != nil {
 		return PlanResponse{}, err
 	}
-	manifestKey, found, err := s.provider.GetKey(ctx, request.Group)
+	keyLease, err := ResolveNodeKeyLease(ctx, s.provider, request.Group, time.Now().Add(DefaultNodeKeyLeaseTTL).Unix())
 	if err != nil {
 		return PlanResponse{}, err
-	}
-	if !found {
-		return PlanResponse{}, errors.New("placer: group has no manifest key")
-	}
-	fingerprint, _, _, _, err := manifestKeyPatch(request.Group, manifestKey)
-	if err != nil || fingerprint == "" {
-		return PlanResponse{}, errors.Join(err, errors.New("placer: group manifest key fingerprint is unavailable"))
 	}
 	policy := placement.StaticPolicy{
 		Selectors: hint.NodeSelectors, ExcludedNodeIDs: stringSet(request.ExcludedNodeIDs),
@@ -189,7 +229,9 @@ func (s *FinalService) Plan(ctx context.Context, request PlanRequest) (PlanRespo
 	if selectors, ok := effectiveCatalogSelectors(request.Group, request.Nodes, hint.NodeSelectors, s.config.ShuffleSharding); ok {
 		policy.Selectors = selectors
 	}
-	version, err := providerPolicyDigest(group, hint, fingerprint, s.config)
+	version, err := providerPolicyDigest(
+		group, hint, keyLease.AuthKey.Fingerprint, keyLease.ManifestKey.Fingerprint, s.config,
+	)
 	if err != nil {
 		return PlanResponse{}, err
 	}
@@ -209,27 +251,34 @@ func (s *FinalService) Plan(ctx context.Context, request PlanRequest) (PlanRespo
 		if err != nil {
 			return PlanResponse{}, err
 		}
-		authSecret, found, err := s.provider.GetAuthKey(ctx, request.Group)
+		if keyLease.AuthKey.Type != routesync.KeyMaterialInline {
+			return PlanResponse{}, errors.New("placer: referenced AuthKey requires Provider access-token derivation support")
+		}
+		templateRef, err := clusterstate.ResolveTemplateRef(group, request.Sandbox.TemplateRef)
 		if err != nil {
 			return PlanResponse{}, err
 		}
-		if !found {
-			return PlanResponse{}, errors.New("placer: Sandbox group has no execution auth key")
-		}
-		authKey, err := inlineSecret("auth_key", authSecret)
+		requestedConfig := clusterstate.WithoutSystemMetadata(request.Sandbox.Config)
+		effectiveConfig := clusterstate.WithoutSystemMetadata(mergeConfig(group.Config, requestedConfig))
+		nodeRequest, err := api.RewriteSandboxCreateEnvelope(
+			request.Sandbox.Request, templateRef, request.Sandbox.TimeoutSeconds, effectiveConfig,
+		)
 		if err != nil {
 			return PlanResponse{}, err
 		}
-		accessToken, err := clusterstate.DeriveAccessToken(authKey, request.Sandbox.SandboxID)
+		accessToken, err := clusterstate.DeriveAccessToken(keyLease.AuthKey.Value, request.Sandbox.SandboxID)
 		if err != nil {
 			return PlanResponse{}, err
 		}
 		spec, err := clusterstate.MarshalSandboxDispatchSpec(clusterstate.SandboxDispatchSpecV1{
-			Version: clusterstate.DispatchSpecVersionV1, TemplateRef: group.TemplateRef,
-			KeyFingerprint: fingerprint, TargetRuntimeDigest: request.TargetRuntimeDigest,
-			RequestedConfig: clusterstate.WithoutSystemMetadata(request.Sandbox.Config),
-			Config:          clusterstate.WithoutSystemMetadata(mergeConfig(group.Config, request.Sandbox.Config)),
-			AccessToken:     accessToken, TargetPort: group.TargetPort, TimeoutSeconds: request.Sandbox.TimeoutSeconds,
+			Version: clusterstate.DispatchSpecVersionV1, TemplateRef: templateRef,
+			AuthKeyFingerprint:     keyLease.AuthKey.Fingerprint,
+			ManifestKeyFingerprint: keyLease.ManifestKey.Fingerprint,
+			TargetRuntimeDigest:    request.TargetRuntimeDigest,
+			RequestedConfig:        requestedConfig,
+			Config:                 effectiveConfig,
+			AccessToken:            accessToken, TargetPort: group.TargetPort, TimeoutSeconds: request.Sandbox.TimeoutSeconds,
+			Request: nodeRequest,
 		})
 		if err != nil {
 			return PlanResponse{}, err
@@ -237,7 +286,8 @@ func (s *FinalService) Plan(ctx context.Context, request PlanRequest) (PlanRespo
 		return PlanResponse{Candidates: candidates, NormalizedDemand: demand, DispatchSpec: spec, ProviderPolicyVersion: version}, nil
 
 	case PlanBuild:
-		if request.Build == nil || request.Sandbox != nil || request.Build.BuildID == "" || request.Build.TemplateID == "" {
+		if request.Build == nil || request.Sandbox != nil || request.Build.BuildID == "" || request.Build.TemplateID == "" ||
+			request.Build.CPUCount <= 0 || request.Build.MemoryMB <= 0 {
 			return PlanResponse{}, errors.New("placer: incomplete Build plan request")
 		}
 		demand, err := placement.NormalizeBuildDemand(request.Build.Demand)
@@ -248,12 +298,23 @@ func (s *FinalService) Plan(ctx context.Context, request PlanRequest) (PlanRespo
 		if err != nil {
 			return PlanResponse{}, err
 		}
+		nodeRequest, err := api.RewriteBuildRegisterEnvelope(request.Build.Request, api.RegisterSpec{
+			Name: firstString(request.Build.Names), Tags: append([]string(nil), request.Build.Aliases...),
+			Profile: request.Build.Profile, CPUCount: request.Build.CPUCount, MemoryMB: request.Build.MemoryMB,
+			Metadata: clusterstate.WithoutSystemMetadata(request.Build.Metadata),
+		})
+		if err != nil {
+			return PlanResponse{}, err
+		}
 		spec, err := clusterstate.MarshalBuildDispatchSpec(clusterstate.BuildDispatchSpecV1{
 			Version: clusterstate.DispatchSpecVersionV1, TemplateID: request.Build.TemplateID,
-			KeyFingerprint: fingerprint, TargetRuntimeDigest: request.TargetRuntimeDigest,
-			Profile: request.Build.Profile,
-			Names:   append([]string(nil), request.Build.Names...), Aliases: append([]string(nil), request.Build.Aliases...),
-			Metadata: clusterstate.WithoutSystemMetadata(request.Build.Metadata), Builder: request.Build.Builder,
+			AuthKeyFingerprint:     keyLease.AuthKey.Fingerprint,
+			ManifestKeyFingerprint: keyLease.ManifestKey.Fingerprint,
+			TargetRuntimeDigest:    request.TargetRuntimeDigest,
+			Profile:                request.Build.Profile,
+			CPUCount:               request.Build.CPUCount, MemoryMB: request.Build.MemoryMB,
+			Names: append([]string(nil), request.Build.Names...), Aliases: append([]string(nil), request.Build.Aliases...),
+			Metadata: clusterstate.WithoutSystemMetadata(request.Build.Metadata), Request: nodeRequest,
 		})
 		if err != nil {
 			return PlanResponse{}, err
@@ -264,16 +325,24 @@ func (s *FinalService) Plan(ctx context.Context, request PlanRequest) (PlanRespo
 	}
 }
 
-func providerPolicyDigest(group clusterstate.SandboxGroup, hint clusterstate.PlacementHint, fingerprint string, config clustercfg.PlacementConfig) (string, error) {
+func providerPolicyDigest(
+	group clusterstate.SandboxGroup,
+	hint clusterstate.PlacementHint,
+	authFingerprint string,
+	manifestFingerprint string,
+	config clustercfg.PlacementConfig,
+) (string, error) {
 	value := struct {
-		Version     uint16                     `json:"version"`
-		Group       clusterstate.SandboxGroup  `json:"group"`
-		Hint        clusterstate.PlacementHint `json:"hint"`
-		Fingerprint string                     `json:"manifest_key_fingerprint"`
-		Candidates  int                        `json:"candidates"`
-		Shuffle     []clustercfg.ShuffleRule   `json:"shuffle_sharding,omitempty"`
+		Version             uint16                     `json:"version"`
+		Group               clusterstate.SandboxGroup  `json:"group"`
+		Hint                clusterstate.PlacementHint `json:"hint"`
+		AuthFingerprint     string                     `json:"auth_key_fingerprint"`
+		ManifestFingerprint string                     `json:"manifest_key_fingerprint"`
+		Candidates          int                        `json:"candidates"`
+		Shuffle             []clustercfg.ShuffleRule   `json:"shuffle_sharding,omitempty"`
 	}{
-		Version: 1, Group: group, Hint: hint, Fingerprint: fingerprint,
+		Version: 1, Group: group, Hint: hint,
+		AuthFingerprint: authFingerprint, ManifestFingerprint: manifestFingerprint,
 		Candidates: config.Candidates, Shuffle: config.ShuffleSharding,
 	}
 	raw, err := json.Marshal(value)
@@ -282,6 +351,13 @@ func providerPolicyDigest(group clusterstate.SandboxGroup, hint clusterstate.Pla
 	}
 	digest := sha256.Sum256(raw)
 	return "provider-policy-v1:" + hex.EncodeToString(digest[:]), nil
+}
+
+func firstString(values []string) string {
+	if len(values) == 0 {
+		return ""
+	}
+	return values[0]
 }
 
 func stringSet(values []string) map[string]struct{} {

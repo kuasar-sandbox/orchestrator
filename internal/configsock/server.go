@@ -9,7 +9,7 @@
 //   - task   (POST /internal/task/launchspec, /internal/task/buildspec):
 //     assigned tasks fetch their LaunchSpec or BuildSpec by business id. Authed by
 //     SO_PEERCRED peer pid == the task pidfile (/run/sandbox/<id>/<id>.pid).
-//   - admin  (/internal/admin/manifest-keys): manifest-key allowlist management.
+//   - admin  (/internal/admin/key-leases): exact AuthKey/ManifestKey lease management.
 //     Authed by SO_PEERCRED peer pid ∈ admin_pidfile (or, when that is unset, by the
 //     socket's 0600 permissions alone = same uid / root).
 //   - plugin (PUT /internal/plugin/{id}/register): a subscriber (an external proxy
@@ -49,11 +49,11 @@ import (
 // Plane paths. The task/admin planes live under /internal/ (a prefix the e2b SDK
 // never uses); every other path falls through to the api handler.
 const (
-	PathTaskLaunchSpec   = "/internal/task/launchspec"
-	PathTaskBuildSpec    = "/internal/task/buildspec"
-	PathRunAssignment    = "/internal/run/assignment"
-	PathRunBuildResult   = "/internal/run/build-result"
-	PathAdminManifestKey = "/internal/admin/manifest-keys"
+	PathTaskLaunchSpec = "/internal/task/launchspec"
+	PathTaskBuildSpec  = "/internal/task/buildspec"
+	PathRunAssignment  = "/internal/run/assignment"
+	PathRunBuildResult = "/internal/run/build-result"
+	PathAdminKeyLease  = "/internal/admin/key-leases"
 )
 
 // journald SYSLOG_IDENTIFIER tags the sandbox stack writes under (shared so the
@@ -222,44 +222,49 @@ type BuildTimeouts struct {
 	TotalSec int `json:"total_sec"`
 }
 
-// AdminKeyInfo is one manifest-key allowlist entry (fingerprint only — never the key).
-type AdminKeyInfo struct {
-	Fingerprint string `json:"fingerprint"`
-	Label       string `json:"label"`
-	CreatedUnix int64  `json:"created_unix"`
-	ExpiresUnix int64  `json:"expires_unix"` // 0 = never expires
+// AdminKeyLeaseInfo is one node key lease projection. Only fingerprints are
+// returned; the local admin plane never echoes either key.
+type AdminKeyLeaseInfo struct {
+	Group                  string `json:"group"`
+	AuthKeyFingerprint     string `json:"auth_key_fingerprint"`
+	ManifestKeyFingerprint string `json:"manifest_key_fingerprint"`
+	Label                  string `json:"label"`
+	CreatedUnix            int64  `json:"created_unix"`
+	ExpiresUnix            int64  `json:"expires_unix"` // 0 = explicit local lease without expiry
 }
 
-// Admin is the manifest-key allowlist management the admin plane exposes. Every
-// method returns the key's fingerprint (24-hex) so the daemon never echoes key
-// material back to the client.
+// Admin manages exact dual-key node leases. Fingerprints identify the lease in
+// responses without exposing either root key.
 type Admin interface {
-	AddManifestKey(ctx context.Context, key, label string, ttlSec int64, registryAuth string) (added bool, fp string, err error)
-	RemoveManifestKey(ctx context.Context, key string) (removed bool, fp string, err error)
-	HasManifestKey(ctx context.Context, key string) (present bool, fp string, err error)
-	ListManifestKeys(ctx context.Context) ([]AdminKeyInfo, error)
+	PutKeyLease(ctx context.Context, group, authKey, manifestKey, label string, ttlSec int64, registryAuth string) (added bool, authFP, manifestFP string, err error)
+	DropKeyLease(ctx context.Context, group, authKey, manifestKey string) (removed bool, authFP, manifestFP string, err error)
+	HasKeyLease(ctx context.Context, group, authKey, manifestKey string) (present bool, authFP, manifestFP string, err error)
+	ListKeyLeases(ctx context.Context) ([]AdminKeyLeaseInfo, error)
 }
 
-// AdminKeyRequest / AdminKeyResponse are the admin-plane add/remove/check messages.
-type AdminKeyRequest struct {
-	Op           string `json:"op"` // add | remove | check
-	Key          string `json:"key"`
+// AdminKeyLeaseRequest / AdminKeyLeaseResponse are the put/drop/check messages.
+type AdminKeyLeaseRequest struct {
+	Op           string `json:"op"` // put | drop | check
+	Group        string `json:"group"`
+	AuthKey      string `json:"auth_key"`
+	ManifestKey  string `json:"manifest_key"`
 	Label        string `json:"label,omitempty"`
-	TTLSeconds   int64  `json:"ttl_seconds,omitempty"`   // add: 0 = never expires
-	RegistryAuth string `json:"registry_auth,omitempty"` // add: tenant-default docker config.json
+	TTLSeconds   int64  `json:"ttl_seconds,omitempty"`   // put: 0 = explicit local lease without expiry
+	RegistryAuth string `json:"registry_auth,omitempty"` // put: default docker config.json
 }
 
-type AdminKeyResponse struct {
-	Op          string `json:"op"`
-	Fingerprint string `json:"fingerprint"`
-	Status      string `json:"status"` // added | exists | removed | absent | present
-	Error       string `json:"error,omitempty"`
+type AdminKeyLeaseResponse struct {
+	Op                     string `json:"op"`
+	AuthKeyFingerprint     string `json:"auth_key_fingerprint,omitempty"`
+	ManifestKeyFingerprint string `json:"manifest_key_fingerprint,omitempty"`
+	Status                 string `json:"status"` // added | refreshed | removed | absent | present
+	Error                  string `json:"error,omitempty"`
 }
 
 // Deps wires the planes for New.
 type Deps struct {
 	Provider      Provider         // task plane (LaunchSpec by config-id)
-	Admin         Admin            // admin plane (manifest-key allowlist)
+	Admin         Admin            // admin plane (node key leases)
 	API           http.Handler     // api plane (e2b control plane + export/import); the fallback
 	AdminPidfile  string           // optional PID allowlist gating the admin plane ("" => socket perms only)
 	RouteSource   routesync.Source // plugin plane: route authority a subscriber streams from (nil => plane off)
@@ -335,7 +340,7 @@ func (s *Server) router() http.Handler {
 	mux.HandleFunc("POST "+PathTaskBuildSpec, s.handleBuildTask)
 	mux.HandleFunc("POST "+PathRunAssignment, s.handleRunAssignment)
 	mux.HandleFunc("POST "+PathRunBuildResult, s.handleBuildResult)
-	mux.HandleFunc(PathAdminManifestKey, s.handleAdminKeys) // GET=list, POST=add/remove/check
+	mux.HandleFunc(PathAdminKeyLease, s.handleAdminKeyLeases) // GET=list, POST=put/drop/check
 	if s.deps.RouteSource != nil && s.deps.Plugins != nil {
 		mux.HandleFunc(routesync.PluginRegisterPattern, s.handlePluginRegister) // plugin plane: register + route stream
 	}
@@ -485,25 +490,25 @@ func (s *Server) taskAuthed(id, pidFile string, peer int) bool {
 
 // --- admin plane ---
 
-func (s *Server) handleAdminKeys(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleAdminKeyLeases(w http.ResponseWriter, r *http.Request) {
 	peer, ok := peerFrom(r.Context())
 	if !ok || !s.adminAuthed(peer) {
-		writeJSON(w, http.StatusForbidden, &AdminKeyResponse{Error: "not authorized (admin)"})
+		writeJSON(w, http.StatusForbidden, &AdminKeyLeaseResponse{Error: "not authorized (admin)"})
 		return
 	}
 	switch r.Method {
 	case http.MethodGet:
-		infos, err := s.deps.Admin.ListManifestKeys(r.Context())
+		infos, err := s.deps.Admin.ListKeyLeases(r.Context())
 		if err != nil {
 			s.log.Warn("configsock admin list", "err", err)
-			writeJSON(w, http.StatusInternalServerError, &AdminKeyResponse{Error: "internal error"})
+			writeJSON(w, http.StatusInternalServerError, &AdminKeyLeaseResponse{Error: "internal error"})
 			return
 		}
 		writeJSON(w, http.StatusOK, infos)
 	case http.MethodPost:
-		var req AdminKeyRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Key == "" {
-			writeJSON(w, http.StatusBadRequest, &AdminKeyResponse{Op: req.Op, Error: "key required"})
+		var req AdminKeyLeaseRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Group == "" || req.AuthKey == "" || req.ManifestKey == "" {
+			writeJSON(w, http.StatusBadRequest, &AdminKeyLeaseResponse{Op: req.Op, Error: "group, auth_key and manifest_key are required"})
 			return
 		}
 		resp := s.adminOp(r.Context(), req)
@@ -513,36 +518,39 @@ func (s *Server) handleAdminKeys(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, code, resp)
 	default:
-		writeJSON(w, http.StatusMethodNotAllowed, &AdminKeyResponse{Error: "method not allowed"})
+		writeJSON(w, http.StatusMethodNotAllowed, &AdminKeyLeaseResponse{Error: "method not allowed"})
 	}
 }
 
-func (s *Server) adminOp(ctx context.Context, req AdminKeyRequest) *AdminKeyResponse {
-	out := &AdminKeyResponse{Op: req.Op}
+func (s *Server) adminOp(ctx context.Context, req AdminKeyLeaseRequest) *AdminKeyLeaseResponse {
+	out := &AdminKeyLeaseResponse{Op: req.Op}
 	switch req.Op {
-	case "add":
-		added, fp, err := s.deps.Admin.AddManifestKey(ctx, req.Key, req.Label, req.TTLSeconds, req.RegistryAuth)
+	case "put":
+		added, authFP, manifestFP, err := s.deps.Admin.PutKeyLease(ctx, req.Group, req.AuthKey, req.ManifestKey, req.Label, req.TTLSeconds, req.RegistryAuth)
 		if err != nil {
 			out.Error = err.Error()
 			return out
 		}
-		out.Fingerprint, out.Status = fp, statusWord(added, "added", "refreshed")
-	case "remove":
-		removed, fp, err := s.deps.Admin.RemoveManifestKey(ctx, req.Key)
+		out.AuthKeyFingerprint, out.ManifestKeyFingerprint = authFP, manifestFP
+		out.Status = statusWord(added, "added", "refreshed")
+	case "drop":
+		removed, authFP, manifestFP, err := s.deps.Admin.DropKeyLease(ctx, req.Group, req.AuthKey, req.ManifestKey)
 		if err != nil {
 			out.Error = err.Error()
 			return out
 		}
-		out.Fingerprint, out.Status = fp, statusWord(removed, "removed", "absent")
+		out.AuthKeyFingerprint, out.ManifestKeyFingerprint = authFP, manifestFP
+		out.Status = statusWord(removed, "removed", "absent")
 	case "check":
-		present, fp, err := s.deps.Admin.HasManifestKey(ctx, req.Key)
+		present, authFP, manifestFP, err := s.deps.Admin.HasKeyLease(ctx, req.Group, req.AuthKey, req.ManifestKey)
 		if err != nil {
 			out.Error = err.Error()
 			return out
 		}
-		out.Fingerprint, out.Status = fp, statusWord(present, "present", "absent")
+		out.AuthKeyFingerprint, out.ManifestKeyFingerprint = authFP, manifestFP
+		out.Status = statusWord(present, "present", "absent")
 	default:
-		out.Error = "unknown op (want add|remove|check)"
+		out.Error = "unknown op (want put|drop|check)"
 	}
 	return out
 }

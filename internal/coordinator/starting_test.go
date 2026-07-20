@@ -420,7 +420,9 @@ func routeStartingRecord(t *testing.T, sandboxID string, round uint64, candidate
 	}
 	spec, err := cluster.MarshalSandboxDispatchSpec(cluster.SandboxDispatchSpecV1{
 		Version: cluster.DispatchSpecVersionV1, TemplateRef: "e2b-img-" + strings.Repeat("c", 64),
-		KeyFingerprint: strings.Repeat("a", 24), AccessToken: "access-token", TargetPort: 3000,
+		AuthKeyFingerprint: strings.Repeat("a", 24), ManifestKeyFingerprint: strings.Repeat("b", 24),
+		AccessToken: "access-token", TargetPort: 3000,
+		Request: cluster.NodeRequestEnvelopeV1{Version: cluster.NodeRequestEnvelopeVersionV1, Method: "POST", Path: "/sandboxes", Body: []byte("{}")},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -451,7 +453,9 @@ func buildStartingRecord(t *testing.T, buildID string, candidates []cluster.Plac
 	}
 	spec, err := cluster.MarshalBuildDispatchSpec(cluster.BuildDispatchSpecV1{
 		Version: cluster.DispatchSpecVersionV1, TemplateID: "template-1",
-		KeyFingerprint: strings.Repeat("b", 24), Profile: types.ProfileBare,
+		AuthKeyFingerprint: strings.Repeat("b", 24), ManifestKeyFingerprint: strings.Repeat("c", 24),
+		Profile: types.ProfileBare, CPUCount: 1, MemoryMB: 512,
+		Request: cluster.NodeRequestEnvelopeV1{Version: cluster.NodeRequestEnvelopeVersionV1, Method: "POST", Path: "/v3/templates", Body: []byte("{}")},
 	})
 	if err != nil {
 		t.Fatal(err)

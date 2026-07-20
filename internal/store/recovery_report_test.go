@@ -19,7 +19,7 @@ func TestRecoveryExecutionReportRejectsForgedUserMetadataAsAuthority(t *testing.
 		State: nodeexec.AdmissionAdmitted, Result: clusterstate.DispatchAcceptedAdmitted,
 		ReservationToken: "reservation-managed",
 	}
-	if _, err := store.RecordSandboxWorkflow(ctx, managed, decision); err != nil {
+	if _, err := store.RecordSandboxWorkflow(ctx, managed, decision, workflowSandbox(managed.ObjectID)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.ClaimSandboxWorkflow(ctx, managed.ObjectID, managed.DemandDigest, decision.ReservationToken); err != nil {
