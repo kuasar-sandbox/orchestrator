@@ -197,7 +197,7 @@ func (c *StartingCoordinator) RunRoute(ctx context.Context, record cluster.Route
 		if !found {
 			return RunResult{Status: RunNoUsableProbe, Reason: "no candidate pair has a current usable Probe", Route: &record}, nil
 		}
-		binding, bindErr := makeBinding(c.identity.StorageGeneration, cluster.ExecutionKindSandbox, record.Group, record.RouteKey, starting.SandboxID, starting.Intent, probe.Response)
+		binding, bindErr := makeBinding(c.identity.RegistryGeneration, cluster.ExecutionKindSandbox, record.Group, record.RouteKey, starting.SandboxID, starting.Intent, probe.Response)
 		if bindErr != nil {
 			return RunResult{}, bindErr
 		}
@@ -273,7 +273,7 @@ func (c *StartingCoordinator) RunBuild(ctx context.Context, record cluster.Build
 		if !found {
 			return RunResult{Status: RunNoUsableProbe, Reason: "no candidate pair has a current usable Probe", Build: &record}, nil
 		}
-		binding, bindErr := makeBinding(c.identity.StorageGeneration, cluster.ExecutionKindBuild, record.Group, "", starting.BuildID, starting.Intent, probe.Response)
+		binding, bindErr := makeBinding(c.identity.RegistryGeneration, cluster.ExecutionKindBuild, record.Group, "", starting.BuildID, starting.Intent, probe.Response)
 		if bindErr != nil {
 			return RunResult{}, bindErr
 		}
@@ -439,7 +439,7 @@ func (c *StartingCoordinator) commitBuild(ctx context.Context, expected cluster.
 	return committed, nil
 }
 
-func makeBinding(storageGeneration string, kind cluster.ExecutionKind, group, routeKey, objectID string, intent cluster.DispatchIntent, probe placement.PlacementProbeResponse) (cluster.ExecutionBindingIntent, error) {
+func makeBinding(registryGeneration string, kind cluster.ExecutionKind, group, routeKey, objectID string, intent cluster.DispatchIntent, probe placement.PlacementProbeResponse) (cluster.ExecutionBindingIntent, error) {
 	if probe.NodeID == "" || probe.NodeEpoch == 0 || probe.DataEndpoint == "" {
 		return cluster.ExecutionBindingIntent{}, errors.New("coordinator: selected Probe lacks a stable execution target")
 	}
@@ -452,7 +452,7 @@ func makeBinding(storageGeneration string, kind cluster.ExecutionKind, group, ro
 		return cluster.ExecutionBindingIntent{}, err
 	}
 	opaque, err := cluster.EncodeExecutionBinding(cluster.ExecutionBinding{
-		StorageGeneration: storageGeneration, Kind: kind, ObjectID: objectID,
+		RegistryGeneration: registryGeneration, Kind: kind, ObjectID: objectID,
 		Group: group, RouteKey: routeKey, NodeID: probe.NodeID, NodeEpoch: probe.NodeEpoch,
 		DemandDigest: demandDigest, DispatchSpecDigest: specDigest,
 	})
@@ -465,7 +465,7 @@ func makeBinding(storageGeneration string, kind cluster.ExecutionKind, group, ro
 	}
 	return cluster.ExecutionBindingIntent{
 		NodeID: probe.NodeID, NodeEpoch: probe.NodeEpoch, DataEndpoint: probe.DataEndpoint,
-		StorageGeneration: storageGeneration, OpaqueBinding: opaque, BindingDigest: digest,
+		RegistryGeneration: registryGeneration, OpaqueBinding: opaque, BindingDigest: digest,
 	}, nil
 }
 
@@ -503,7 +503,7 @@ func accountProbeTransit(result session.ProbeResult, elapsed time.Duration) sess
 }
 
 func revisionAdvanced(previous, next cluster.Revision) bool {
-	return previous.StorageGeneration == next.StorageGeneration && previous.ShardID == next.ShardID && next.LogIndex > previous.LogIndex
+	return previous.RegistryGeneration == next.RegistryGeneration && previous.ShardID == next.ShardID && next.LogIndex > previous.LogIndex
 }
 
 func allRejected(candidateCount int, rejected []uint32) bool {

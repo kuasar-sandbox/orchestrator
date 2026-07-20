@@ -147,7 +147,7 @@ func WriteSandboxConnect(w io.Writer, request SandboxConnectRequest) error {
 		return fmt.Errorf("proxy: sandbox id and port are required for CONNECT")
 	}
 	if request.HasExecutionFence() && (request.ExpectedNodeID == "" || request.ExpectedNodeEpoch == 0 ||
-		request.ExpectedStorageGeneration == "" || request.ExpectedBindingDigest == "") {
+		request.ExpectedRegistryGeneration == "" || request.ExpectedBindingDigest == "") {
 		return fmt.Errorf("proxy: incomplete execution fence")
 	}
 	target := fmt.Sprintf("sandbox:%d", request.Port)
@@ -160,7 +160,7 @@ func WriteSandboxConnect(w io.Writer, request SandboxConnectRequest) error {
 	if request.HasExecutionFence() {
 		fmt.Fprintf(&b, "%s: %s\r\n", HeaderNodeID, request.ExpectedNodeID)
 		fmt.Fprintf(&b, "%s: %d\r\n", HeaderNodeEpoch, request.ExpectedNodeEpoch)
-		fmt.Fprintf(&b, "%s: %s\r\n", HeaderStorageGeneration, request.ExpectedStorageGeneration)
+		fmt.Fprintf(&b, "%s: %s\r\n", HeaderRegistryGeneration, request.ExpectedRegistryGeneration)
 		fmt.Fprintf(&b, "%s: %s\r\n", HeaderBindingDigest, request.ExpectedBindingDigest)
 	}
 	b.WriteString("\r\n")
@@ -232,7 +232,7 @@ func removeHopHeaders(h http.Header) {
 		"Upgrade",
 		HeaderNodeID,
 		HeaderNodeEpoch,
-		HeaderStorageGeneration,
+		HeaderRegistryGeneration,
 		HeaderBindingDigest,
 	} {
 		h.Del(k)

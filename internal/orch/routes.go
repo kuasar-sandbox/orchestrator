@@ -48,7 +48,7 @@ func (o *Orchestrator) routeEntry(sb *types.Sandbox) routesync.RouteEntry {
 		} else {
 			e.NodeID = nodeID
 			e.NodeEpoch = nodeEpoch
-			e.StorageGeneration = generation
+			e.RegistryGeneration = generation
 			e.BindingDigest = digest
 		}
 	}
@@ -112,11 +112,11 @@ func (o *Orchestrator) Subscribe() (<-chan routesync.Event, func()) {
 func (o *Orchestrator) OnWake(ctx context.Context, wake routesync.RouteWake) {
 	sid := wake.SandboxID
 	request := proxy.RouteRequest{
-		SandboxID:                 sid,
-		ExpectedNodeID:            wake.NodeID,
-		ExpectedNodeEpoch:         wake.NodeEpoch,
-		ExpectedStorageGeneration: wake.StorageGeneration,
-		ExpectedBindingDigest:     wake.BindingDigest,
+		SandboxID:                  sid,
+		ExpectedNodeID:             wake.NodeID,
+		ExpectedNodeEpoch:          wake.NodeEpoch,
+		ExpectedRegistryGeneration: wake.RegistryGeneration,
+		ExpectedBindingDigest:      wake.BindingDigest,
 	}
 	sb := o.lookup(sid)
 	if sb == nil {

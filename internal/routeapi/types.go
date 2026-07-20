@@ -20,15 +20,15 @@ const (
 )
 
 type RequestIdentity struct {
-	ClusterID         string `json:"cluster_id"`
-	StorageGeneration string `json:"storage_generation"`
-	SystemEpoch       uint64 `json:"system_epoch"`
-	ManifestDigest    string `json:"manifest_digest"`
-	ShardID           uint32 `json:"shard_id"`
+	ClusterID            string `json:"cluster_id"`
+	RegistryGeneration   string `json:"registry_generation"`
+	SystemEpoch          uint64 `json:"system_epoch"`
+	RegistryLayoutDigest string `json:"registry_layout_digest"`
+	ShardID              uint32 `json:"shard_id"`
 }
 
 func (i RequestIdentity) Validate() error {
-	if i.ClusterID == "" || i.StorageGeneration == "" || i.SystemEpoch == 0 || i.ManifestDigest == "" {
+	if i.ClusterID == "" || i.RegistryGeneration == "" || i.SystemEpoch == 0 || i.RegistryLayoutDigest == "" {
 		return errors.New("routeapi: incomplete cluster/generation identity")
 	}
 	return nil
@@ -86,7 +86,7 @@ func (r ReadRouteResponse) ValidateFor(request ReadRouteRequest) error {
 			return err
 		}
 		if r.Group != request.Group || r.RouteKey != request.RouteKey ||
-			r.Route.StorageGeneration != request.StorageGeneration ||
+			r.Route.RegistryGeneration != request.RegistryGeneration ||
 			(request.SandboxID != "" && r.Route.SandboxID != request.SandboxID) ||
 			r.RouteRevision < request.MinRouteRevision {
 			return errors.New("routeapi: READY does not satisfy request fence")
@@ -153,7 +153,7 @@ func (r ReadBuildResponse) ValidateFor(request ReadBuildRequest) error {
 	switch r.Outcome {
 	case ReadReady:
 		if r.Build == nil || r.BuildRevision == 0 || r.Group != request.Group || r.Build.BuildID != request.BuildID ||
-			r.Build.StorageGeneration != request.StorageGeneration || r.BuildRevision < request.MinBuildRevision {
+			r.Build.RegistryGeneration != request.RegistryGeneration || r.BuildRevision < request.MinBuildRevision {
 			return errors.New("routeapi: positive Build read does not satisfy request fence")
 		}
 		if err := r.Build.Validate(); err != nil {

@@ -608,7 +608,7 @@ func testDispatchCommand(t *testing.T, registration Registration) DispatchComman
 	decoded, _ = hex.DecodeString(intent.DispatchSpecDigest)
 	copy(specDigest[:], decoded)
 	opaque, err := cluster.EncodeExecutionBinding(cluster.ExecutionBinding{
-		StorageGeneration: "g1", Kind: cluster.ExecutionKindSandbox, ObjectID: "s1",
+		RegistryGeneration: "g1", Kind: cluster.ExecutionKindSandbox, ObjectID: "s1",
 		Group: "/g", RouteKey: "rk", NodeID: registration.NodeID, NodeEpoch: registration.NodeEpoch,
 		DemandDigest: demandDigest, DispatchSpecDigest: specDigest,
 	})
@@ -625,7 +625,7 @@ func testDispatchCommand(t *testing.T, registration Registration) DispatchComman
 		NodeID: registration.NodeID, NodeEpoch: registration.NodeEpoch, DataEndpoint: registration.DataEndpoint,
 		Intent: intent, Binding: cluster.ExecutionBindingIntent{
 			NodeID: registration.NodeID, NodeEpoch: registration.NodeEpoch, DataEndpoint: registration.DataEndpoint,
-			StorageGeneration: "g1", OpaqueBinding: opaque, BindingDigest: digest,
+			RegistryGeneration: "g1", OpaqueBinding: opaque, BindingDigest: digest,
 		},
 	}
 }

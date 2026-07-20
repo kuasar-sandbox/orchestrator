@@ -91,7 +91,7 @@ func TestParseSandbox(t *testing.T) {
 func TestRouteFenceFailure(t *testing.T) {
 	exact := proxy.RouteRequest{
 		SandboxID: "s1", Port: 49983, ExpectedNodeID: "n1", ExpectedNodeEpoch: 7,
-		ExpectedStorageGeneration: "g1", ExpectedBindingDigest: "d1",
+		ExpectedRegistryGeneration: "g1", ExpectedBindingDigest: "d1",
 	}
 	tests := []struct {
 		name    string
@@ -180,7 +180,7 @@ func TestSandboxConnectCarriesCompleteFence(t *testing.T) {
 	request := proxy.SandboxConnectRequest{
 		RouteRequest: proxy.RouteRequest{
 			SandboxID: "s1", Port: 49983, ExpectedNodeID: "n1", ExpectedNodeEpoch: 7,
-			ExpectedStorageGeneration: "g1", ExpectedBindingDigest: "d1",
+			ExpectedRegistryGeneration: "g1", ExpectedBindingDigest: "d1",
 		},
 		AccessToken: "token",
 	}
@@ -193,7 +193,7 @@ func TestSandboxConnectCarriesCompleteFence(t *testing.T) {
 		t.Fatal(err)
 	}
 	if req.Method != http.MethodConnect || req.Header.Get(proxy.HeaderNodeID) != "n1" ||
-		req.Header.Get(proxy.HeaderNodeEpoch) != "7" || req.Header.Get(proxy.HeaderStorageGeneration) != "g1" ||
+		req.Header.Get(proxy.HeaderNodeEpoch) != "7" || req.Header.Get(proxy.HeaderRegistryGeneration) != "g1" ||
 		req.Header.Get(proxy.HeaderBindingDigest) != "d1" || req.Header.Get(proxy.HeaderAccessToken) != "token" {
 		t.Fatalf("CONNECT request = %+v headers=%v", req, req.Header)
 	}
@@ -220,7 +220,7 @@ func TestForwardHTTPStripsExecutionFenceHeaders(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "http://sandbox/", nil)
 	for name, value := range map[string]string{
 		proxy.HeaderNodeID: "n1", proxy.HeaderNodeEpoch: "7",
-		proxy.HeaderStorageGeneration: "g1", proxy.HeaderBindingDigest: "d1",
+		proxy.HeaderRegistryGeneration: "g1", proxy.HeaderBindingDigest: "d1",
 	} {
 		req.Header.Set(name, value)
 	}
@@ -230,7 +230,7 @@ func TestForwardHTTPStripsExecutionFenceHeaders(t *testing.T) {
 	}
 	resp.Body.Close()
 	headers := <-seen
-	for _, name := range []string{proxy.HeaderNodeID, proxy.HeaderNodeEpoch, proxy.HeaderStorageGeneration, proxy.HeaderBindingDigest} {
+	for _, name := range []string{proxy.HeaderNodeID, proxy.HeaderNodeEpoch, proxy.HeaderRegistryGeneration, proxy.HeaderBindingDigest} {
 		if headers.Get(name) != "" {
 			t.Fatalf("internal header %s reached guest", name)
 		}

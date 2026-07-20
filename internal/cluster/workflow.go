@@ -10,20 +10,20 @@ import (
 const MaxDispatchSpecBytes = 64 << 10
 
 type Revision struct {
-	StorageGeneration string `json:"storage_generation"`
-	ShardID           uint32 `json:"shard_id"`
-	LogIndex          uint64 `json:"log_index"`
+	RegistryGeneration string `json:"registry_generation"`
+	ShardID            uint32 `json:"shard_id"`
+	LogIndex           uint64 `json:"log_index"`
 }
 
 func (r Revision) Validate() error {
-	if r.StorageGeneration == "" || r.LogIndex == 0 {
-		return errors.New("cluster: revision requires storage generation and committed log index")
+	if r.RegistryGeneration == "" || r.LogIndex == 0 {
+		return errors.New("cluster: revision requires Registry History Generation and committed log index")
 	}
 	return nil
 }
 
 func (r Revision) AtLeast(min Revision) bool {
-	return r.StorageGeneration == min.StorageGeneration && r.ShardID == min.ShardID && r.LogIndex >= min.LogIndex
+	return r.RegistryGeneration == min.RegistryGeneration && r.ShardID == min.ShardID && r.LogIndex >= min.LogIndex
 }
 
 type RouteWorkflowState string
@@ -112,16 +112,16 @@ func (i DispatchIntent) Validate() error {
 }
 
 type ExecutionBindingIntent struct {
-	NodeID            string `json:"node_id"`
-	NodeEpoch         uint64 `json:"node_epoch"`
-	DataEndpoint      string `json:"data_endpoint"`
-	StorageGeneration string `json:"storage_generation"`
-	OpaqueBinding     string `json:"opaque_binding"`
-	BindingDigest     string `json:"binding_digest"`
+	NodeID             string `json:"node_id"`
+	NodeEpoch          uint64 `json:"node_epoch"`
+	DataEndpoint       string `json:"data_endpoint"`
+	RegistryGeneration string `json:"registry_generation"`
+	OpaqueBinding      string `json:"opaque_binding"`
+	BindingDigest      string `json:"binding_digest"`
 }
 
 func (i ExecutionBindingIntent) Validate(kind ExecutionKind, objectID string) error {
-	if i.NodeID == "" || i.NodeEpoch == 0 || i.DataEndpoint == "" || i.StorageGeneration == "" || i.OpaqueBinding == "" || i.BindingDigest == "" {
+	if i.NodeID == "" || i.NodeEpoch == 0 || i.DataEndpoint == "" || i.RegistryGeneration == "" || i.OpaqueBinding == "" || i.BindingDigest == "" {
 		return errors.New("cluster: incomplete execution Binding intent")
 	}
 	binding, err := DecodeExecutionBinding(i.OpaqueBinding)
@@ -129,7 +129,7 @@ func (i ExecutionBindingIntent) Validate(kind ExecutionKind, objectID string) er
 		return err
 	}
 	if binding.Kind != kind || binding.ObjectID != objectID || binding.NodeID != i.NodeID ||
-		binding.NodeEpoch != i.NodeEpoch || binding.StorageGeneration != i.StorageGeneration {
+		binding.NodeEpoch != i.NodeEpoch || binding.RegistryGeneration != i.RegistryGeneration {
 		return errors.New("cluster: execution Binding intent identity mismatch")
 	}
 	digest, err := ExecutionBindingDigest(i.OpaqueBinding)
@@ -209,16 +209,16 @@ type ReadyRoute struct {
 	AccessToken        string `json:"access_token"`
 	TrafficAccessToken string `json:"traffic_access_token,omitempty"`
 
-	TemplateRef       string `json:"template_ref"`
-	SnapshotRef       string `json:"snapshot_ref,omitempty"`
-	StorageGeneration string `json:"storage_generation"`
-	BindingDigest     string `json:"binding_digest"`
-	LastEventSeq      uint64 `json:"last_event_seq"`
+	TemplateRef        string `json:"template_ref"`
+	SnapshotRef        string `json:"snapshot_ref,omitempty"`
+	RegistryGeneration string `json:"registry_generation"`
+	BindingDigest      string `json:"binding_digest"`
+	LastEventSeq       uint64 `json:"last_event_seq"`
 }
 
 func (r ReadyRoute) Validate() error {
 	if r.SandboxID == "" || r.NodeID == "" || r.NodeEpoch == 0 || r.DataEndpoint == "" ||
-		r.TemplateRef == "" || r.StorageGeneration == "" || r.LastEventSeq == 0 {
+		r.TemplateRef == "" || r.RegistryGeneration == "" || r.LastEventSeq == 0 {
 		return errors.New("cluster: incomplete READY forwarding projection")
 	}
 	if !validDigest(r.BindingDigest) {
@@ -399,7 +399,7 @@ func (r RouteWorkflowRecord) Validate() error {
 			if err := r.Starting.Binding.ValidateWorkflow(ExecutionKindSandbox, r.Starting.SandboxID, r.Group, r.RouteKey, r.Starting.Intent); err != nil {
 				return err
 			}
-			return validateProjectionGeneration(r.Revision, r.Starting.Binding.StorageGeneration)
+			return validateProjectionRegistryGeneration(r.Revision, r.Starting.Binding.RegistryGeneration)
 		}
 		return nil
 	case WorkflowRouteReady:
@@ -409,7 +409,7 @@ func (r RouteWorkflowRecord) Validate() error {
 		if err := r.Ready.Validate(); err != nil {
 			return err
 		}
-		return validateProjectionGeneration(r.Revision, r.Ready.StorageGeneration)
+		return validateProjectionRegistryGeneration(r.Revision, r.Ready.RegistryGeneration)
 	case WorkflowRoutePaused:
 		if r.Paused == nil {
 			return errors.New("cluster: missing PAUSED state")
@@ -417,7 +417,7 @@ func (r RouteWorkflowRecord) Validate() error {
 		if err := r.Paused.Validate(); err != nil {
 			return err
 		}
-		return validateProjectionGeneration(r.Revision, r.Paused.Execution.StorageGeneration)
+		return validateProjectionRegistryGeneration(r.Revision, r.Paused.Execution.RegistryGeneration)
 	case WorkflowRouteResuming:
 		if r.Resuming == nil {
 			return errors.New("cluster: missing RESUMING state")
@@ -425,7 +425,7 @@ func (r RouteWorkflowRecord) Validate() error {
 		if err := r.Resuming.Validate(); err != nil {
 			return err
 		}
-		return validateProjectionGeneration(r.Revision, r.Resuming.Execution.StorageGeneration)
+		return validateProjectionRegistryGeneration(r.Revision, r.Resuming.Execution.RegistryGeneration)
 	case WorkflowRouteDeleting:
 		if r.Deleting == nil {
 			return errors.New("cluster: missing DELETING state")
@@ -433,7 +433,7 @@ func (r RouteWorkflowRecord) Validate() error {
 		if err := r.Deleting.Validate(); err != nil {
 			return err
 		}
-		return validateProjectionGeneration(r.Revision, r.Deleting.Execution.StorageGeneration)
+		return validateProjectionRegistryGeneration(r.Revision, r.Deleting.Execution.RegistryGeneration)
 	case WorkflowRouteTombstone:
 		if r.Tombstone == nil {
 			return errors.New("cluster: missing TOMBSTONE state")
@@ -487,19 +487,19 @@ func (s BuildStartingState) Validate() error {
 }
 
 type BuildProjection struct {
-	BuildID           string `json:"build_id"`
-	NodeID            string `json:"node_id"`
-	NodeEpoch         uint64 `json:"node_epoch"`
-	StorageGeneration string `json:"storage_generation"`
-	BindingDigest     string `json:"binding_digest"`
-	TemplateRef       string `json:"template_ref,omitempty"`
-	ArtifactRef       string `json:"artifact_ref,omitempty"`
-	Reason            string `json:"reason,omitempty"`
-	LastEventSeq      uint64 `json:"last_event_seq"`
+	BuildID            string `json:"build_id"`
+	NodeID             string `json:"node_id"`
+	NodeEpoch          uint64 `json:"node_epoch"`
+	RegistryGeneration string `json:"registry_generation"`
+	BindingDigest      string `json:"binding_digest"`
+	TemplateRef        string `json:"template_ref,omitempty"`
+	ArtifactRef        string `json:"artifact_ref,omitempty"`
+	Reason             string `json:"reason,omitempty"`
+	LastEventSeq       uint64 `json:"last_event_seq"`
 }
 
 func (p BuildProjection) Validate() error {
-	if p.BuildID == "" || p.NodeID == "" || p.NodeEpoch == 0 || p.StorageGeneration == "" ||
+	if p.BuildID == "" || p.NodeID == "" || p.NodeEpoch == 0 || p.RegistryGeneration == "" ||
 		!validDigest(p.BindingDigest) || p.LastEventSeq == 0 {
 		return errors.New("cluster: incomplete Build projection")
 	}
@@ -566,7 +566,7 @@ func (r BuildRecord) Validate() error {
 			if err := r.Starting.Binding.ValidateWorkflow(ExecutionKindBuild, r.BuildID, r.Group, "", r.Starting.Intent); err != nil {
 				return err
 			}
-			return validateProjectionGeneration(r.Revision, r.Starting.Binding.StorageGeneration)
+			return validateProjectionRegistryGeneration(r.Revision, r.Starting.Binding.RegistryGeneration)
 		}
 		return nil
 	case BuildQueued, BuildRegistered, BuildBuilding, BuildReady:
@@ -576,7 +576,7 @@ func (r BuildRecord) Validate() error {
 		if err := r.Projection.Validate(); err != nil {
 			return err
 		}
-		if err := validateProjectionGeneration(r.Revision, r.Projection.StorageGeneration); err != nil {
+		if err := validateProjectionRegistryGeneration(r.Revision, r.Projection.RegistryGeneration); err != nil {
 			return err
 		}
 		if r.State == BuildReady && r.Projection.ArtifactRef == "" {
@@ -596,7 +596,7 @@ func (r BuildRecord) Validate() error {
 		if err := r.Projection.Validate(); err != nil {
 			return err
 		}
-		if err := validateProjectionGeneration(r.Revision, r.Projection.StorageGeneration); err != nil {
+		if err := validateProjectionRegistryGeneration(r.Revision, r.Projection.RegistryGeneration); err != nil {
 			return err
 		}
 		if r.Projection.Reason == "" {
@@ -610,7 +610,7 @@ func (r BuildRecord) Validate() error {
 		if err := r.Tombstone.Projection.Validate(); err != nil {
 			return err
 		}
-		if err := validateProjectionGeneration(r.Revision, r.Tombstone.Projection.StorageGeneration); err != nil {
+		if err := validateProjectionRegistryGeneration(r.Revision, r.Tombstone.Projection.RegistryGeneration); err != nil {
 			return err
 		}
 		if err := r.Tombstone.Proof.Validate(); err != nil {
@@ -635,7 +635,7 @@ type ExecutionFence struct {
 	SandboxID            string        `json:"sandbox_id"`
 	NodeID               string        `json:"node_id"`
 	NodeEpoch            uint64        `json:"node_epoch"`
-	StorageGeneration    string        `json:"storage_generation"`
+	RegistryGeneration   string        `json:"registry_generation"`
 	BindingDigest        string        `json:"binding_digest"`
 	LastEventSeq         uint64        `json:"last_event_seq"`
 	FinalOutboxWatermark uint64        `json:"final_outbox_watermark"`
@@ -645,7 +645,7 @@ type ExecutionFence struct {
 
 func (f ExecutionFence) Validate() error {
 	if f.Group == "" || f.RouteKey == "" || f.SandboxID == "" || f.NodeID == "" || f.NodeEpoch == 0 ||
-		f.StorageGeneration == "" || !validDigest(f.BindingDigest) || f.LastEventSeq == 0 {
+		f.RegistryGeneration == "" || !validDigest(f.BindingDigest) || f.LastEventSeq == 0 {
 		return errors.New("cluster: incomplete execution fence")
 	}
 	if f.Proof.FencedNodeID != f.NodeID || f.Proof.FencedNodeEpoch != f.NodeEpoch {
@@ -657,8 +657,8 @@ func (f ExecutionFence) Validate() error {
 	if err := f.Revision.Validate(); err != nil {
 		return err
 	}
-	if f.Revision.StorageGeneration != f.StorageGeneration {
-		return errors.New("cluster: execution fence revision belongs to another storage generation")
+	if f.Revision.RegistryGeneration != f.RegistryGeneration {
+		return errors.New("cluster: execution fence revision belongs to another Registry History Generation")
 	}
 	return nil
 }
@@ -736,15 +736,15 @@ func countPresent(values ...bool) int {
 	return count
 }
 
-func validateProjectionGeneration(revision Revision, storageGeneration string) error {
-	if storageGeneration != revision.StorageGeneration {
-		return errors.New("cluster: workflow projection belongs to another storage generation")
+func validateProjectionRegistryGeneration(revision Revision, registryGeneration string) error {
+	if registryGeneration != revision.RegistryGeneration {
+		return errors.New("cluster: workflow projection belongs to another Registry History Generation")
 	}
 	return nil
 }
 
 func validateFailureRevision(current, failure Revision) error {
-	if current.StorageGeneration != failure.StorageGeneration || current.ShardID != failure.ShardID || current.LogIndex < failure.LogIndex {
+	if current.RegistryGeneration != failure.RegistryGeneration || current.ShardID != failure.ShardID || current.LogIndex < failure.LogIndex {
 		return errors.New("cluster: workflow failure revision is outside the record history")
 	}
 	return nil

@@ -44,7 +44,7 @@ const (
 type reserveResult struct {
 	NodeID             string `json:"node_id"`
 	NodeEpoch          uint64 `json:"node_epoch,omitempty"`
-	StorageGeneration  string `json:"storage_generation,omitempty"`
+	RegistryGeneration string `json:"registry_generation,omitempty"`
 	BindingDigest      string `json:"binding_digest,omitempty"`
 	SID                string `json:"sid"`
 	AccessToken        string `json:"access_token"`
@@ -58,7 +58,7 @@ type routeResolve struct {
 	RouteKey           string `json:"route_key"`
 	NodeID             string `json:"node_id"`
 	NodeEpoch          uint64 `json:"node_epoch,omitempty"`
-	StorageGeneration  string `json:"storage_generation,omitempty"`
+	RegistryGeneration string `json:"registry_generation,omitempty"`
 	BindingDigest      string `json:"binding_digest,omitempty"`
 	DataEndpoint       string `json:"data_endpoint"`
 	AccessToken        string `json:"access_token"`
@@ -650,7 +650,7 @@ func (rt *Router) serveData(w http.ResponseWriter, r *http.Request, host string)
 		if res, err := rt.reserveByKey(r.Context(), rr.Group, rr.RouteKey); err == nil && res.DataEndpoint != "" {
 			rr = &routeResolve{
 				SID: res.SID, Group: rr.Group, RouteKey: rr.RouteKey, NodeID: res.NodeID,
-				NodeEpoch: res.NodeEpoch, StorageGeneration: res.StorageGeneration, BindingDigest: res.BindingDigest,
+				NodeEpoch: res.NodeEpoch, RegistryGeneration: res.RegistryGeneration, BindingDigest: res.BindingDigest,
 				DataEndpoint: res.DataEndpoint, AccessToken: res.AccessToken,
 				TrafficAccessToken: res.TrafficAccessToken, TargetPort: res.TargetPort,
 				State: "ready",
@@ -747,10 +747,10 @@ func (rt *Router) forwardSandboxData(w http.ResponseWriter, r *http.Request, rr 
 
 func routeRequestForResolve(rr *routeResolve, sid string, port int) proxypkg.RouteRequest {
 	request := proxypkg.RouteRequest{SandboxID: sid, Port: port}
-	if rr != nil && rr.NodeID != "" && rr.NodeEpoch != 0 && rr.StorageGeneration != "" && rr.BindingDigest != "" {
+	if rr != nil && rr.NodeID != "" && rr.NodeEpoch != 0 && rr.RegistryGeneration != "" && rr.BindingDigest != "" {
 		request.ExpectedNodeID = rr.NodeID
 		request.ExpectedNodeEpoch = rr.NodeEpoch
-		request.ExpectedStorageGeneration = rr.StorageGeneration
+		request.ExpectedRegistryGeneration = rr.RegistryGeneration
 		request.ExpectedBindingDigest = rr.BindingDigest
 	}
 	return request
@@ -774,7 +774,7 @@ func (rt *Router) serveDataByKey(w http.ResponseWriter, r *http.Request, group, 
 		}
 		rr = &routeResolve{
 			SID: res.SID, Group: group, RouteKey: routeKey, NodeID: res.NodeID,
-			NodeEpoch: res.NodeEpoch, StorageGeneration: res.StorageGeneration, BindingDigest: res.BindingDigest,
+			NodeEpoch: res.NodeEpoch, RegistryGeneration: res.RegistryGeneration, BindingDigest: res.BindingDigest,
 			DataEndpoint: res.DataEndpoint, AccessToken: res.AccessToken,
 			TrafficAccessToken: res.TrafficAccessToken, TargetPort: res.TargetPort,
 			State: "ready",
@@ -1021,7 +1021,7 @@ func (rt *Router) reserveByKey(ctx context.Context, group, routeKey string) (*re
 	if f.err == nil && f.res != nil {
 		rt.rememberRoute(&routeResolve{
 			SID: f.res.SID, Group: group, RouteKey: routeKey, NodeID: f.res.NodeID,
-			NodeEpoch: f.res.NodeEpoch, StorageGeneration: f.res.StorageGeneration, BindingDigest: f.res.BindingDigest,
+			NodeEpoch: f.res.NodeEpoch, RegistryGeneration: f.res.RegistryGeneration, BindingDigest: f.res.BindingDigest,
 			DataEndpoint: f.res.DataEndpoint, AccessToken: f.res.AccessToken,
 			TrafficAccessToken: f.res.TrafficAccessToken, TargetPort: f.res.TargetPort,
 			State: "ready",

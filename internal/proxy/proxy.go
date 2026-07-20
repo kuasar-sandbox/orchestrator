@@ -34,7 +34,7 @@ const (
 	KindUDS                        // dial unix socket (e2b control: --connect)
 	KindTCP                        // dial floatingip:port
 	KindWrongNodeEpoch             // expected node identity/epoch is stale
-	KindWrongBinding               // expected storage generation/Binding is stale
+	KindWrongBinding               // expected Registry History Generation/Binding is stale
 	KindRouteInactive              // exact execution exists but cannot currently serve
 )
 
@@ -46,14 +46,14 @@ type Route struct {
 }
 
 const (
-	HeaderSandboxID         = "E2b-Sandbox-Id"
-	HeaderSandboxPort       = "E2b-Sandbox-Port"
-	HeaderAccessToken       = "X-Access-Token"
-	HeaderProxyError        = "X-Kuasar-Proxy-Error"
-	HeaderNodeID            = "X-Kuasar-Node-Id"
-	HeaderNodeEpoch         = "X-Kuasar-Node-Epoch"
-	HeaderStorageGeneration = "X-Kuasar-Storage-Generation"
-	HeaderBindingDigest     = "X-Kuasar-Binding-Digest"
+	HeaderSandboxID          = "E2b-Sandbox-Id"
+	HeaderSandboxPort        = "E2b-Sandbox-Port"
+	HeaderAccessToken        = "X-Access-Token"
+	HeaderProxyError         = "X-Kuasar-Proxy-Error"
+	HeaderNodeID             = "X-Kuasar-Node-Id"
+	HeaderNodeEpoch          = "X-Kuasar-Node-Epoch"
+	HeaderRegistryGeneration = "X-Kuasar-Storage-Generation"
+	HeaderBindingDigest      = "X-Kuasar-Binding-Digest"
 
 	ProxyErrorBadRequest     = "bad_request"
 	ProxyErrorRouteError     = "route_error"
@@ -67,17 +67,17 @@ const (
 )
 
 type RouteRequest struct {
-	SandboxID                 string
-	Port                      int
-	ExpectedNodeID            string
-	ExpectedNodeEpoch         uint64
-	ExpectedStorageGeneration string
-	ExpectedBindingDigest     string
+	SandboxID                  string
+	Port                       int
+	ExpectedNodeID             string
+	ExpectedNodeEpoch          uint64
+	ExpectedRegistryGeneration string
+	ExpectedBindingDigest      string
 }
 
 func (r RouteRequest) HasExecutionFence() bool {
 	return r.ExpectedNodeID != "" || r.ExpectedNodeEpoch != 0 ||
-		r.ExpectedStorageGeneration != "" || r.ExpectedBindingDigest != ""
+		r.ExpectedRegistryGeneration != "" || r.ExpectedBindingDigest != ""
 }
 
 // Router resolves a (sandboxID, port) to a Route. It may block to auto-resume a
@@ -95,7 +95,7 @@ func RouteFenceFailure(
 	managed bool,
 	nodeID string,
 	nodeEpoch uint64,
-	storageGeneration, bindingDigest string,
+	registryGeneration, bindingDigest string,
 ) (Kind, bool) {
 	if !managed {
 		if request.HasExecutionFence() {
@@ -104,13 +104,13 @@ func RouteFenceFailure(
 		return 0, false
 	}
 	if request.ExpectedNodeID == "" || request.ExpectedNodeEpoch == 0 ||
-		request.ExpectedStorageGeneration == "" || request.ExpectedBindingDigest == "" {
+		request.ExpectedRegistryGeneration == "" || request.ExpectedBindingDigest == "" {
 		return KindWrongBinding, true
 	}
 	if request.ExpectedNodeID != nodeID || request.ExpectedNodeEpoch != nodeEpoch {
 		return KindWrongNodeEpoch, true
 	}
-	if request.ExpectedStorageGeneration != storageGeneration || request.ExpectedBindingDigest != bindingDigest {
+	if request.ExpectedRegistryGeneration != registryGeneration || request.ExpectedBindingDigest != bindingDigest {
 		return KindWrongBinding, true
 	}
 	return 0, false
@@ -245,7 +245,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func RouteRequestFromHTTP(r *http.Request, sid string, port int) (RouteRequest, error) {
 	request := RouteRequest{SandboxID: sid, Port: port}
 	request.ExpectedNodeID = strings.TrimSpace(r.Header.Get(HeaderNodeID))
-	request.ExpectedStorageGeneration = strings.TrimSpace(r.Header.Get(HeaderStorageGeneration))
+	request.ExpectedRegistryGeneration = strings.TrimSpace(r.Header.Get(HeaderRegistryGeneration))
 	request.ExpectedBindingDigest = strings.TrimSpace(r.Header.Get(HeaderBindingDigest))
 	if raw := strings.TrimSpace(r.Header.Get(HeaderNodeEpoch)); raw != "" {
 		epoch, err := strconv.ParseUint(raw, 10, 64)
@@ -255,7 +255,7 @@ func RouteRequestFromHTTP(r *http.Request, sid string, port int) (RouteRequest, 
 		request.ExpectedNodeEpoch = epoch
 	}
 	if request.HasExecutionFence() && (request.ExpectedNodeID == "" || request.ExpectedNodeEpoch == 0 ||
-		request.ExpectedStorageGeneration == "" || request.ExpectedBindingDigest == "") {
+		request.ExpectedRegistryGeneration == "" || request.ExpectedBindingDigest == "") {
 		return RouteRequest{}, fmt.Errorf("incomplete execution fence")
 	}
 	return request, nil

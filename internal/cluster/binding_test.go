@@ -8,7 +8,7 @@ import (
 
 func TestExecutionBindingRoundTripAndDigest(t *testing.T) {
 	binding := ExecutionBinding{
-		StorageGeneration:  "generation-1",
+		RegistryGeneration: "generation-1",
 		Kind:               ExecutionKindSandbox,
 		ObjectID:           "sandbox-1",
 		Group:              "/acme/dev",
@@ -41,7 +41,7 @@ func TestExecutionBindingRoundTripAndDigest(t *testing.T) {
 
 func TestExecutionBindingMetadataIsSystemOwned(t *testing.T) {
 	binding := ExecutionBinding{
-		StorageGeneration:  "generation-1",
+		RegistryGeneration: "generation-1",
 		Kind:               ExecutionKindBuild,
 		ObjectID:           "build-1",
 		Group:              "/acme/dev",
@@ -88,7 +88,7 @@ func TestExecutionBindingRejectsMalformedValues(t *testing.T) {
 
 func TestExecutionBindingRejectsUnprojectableIdentity(t *testing.T) {
 	base := ExecutionBinding{
-		StorageGeneration: "g1", Kind: ExecutionKindSandbox, ObjectID: "s1",
+		RegistryGeneration: "g1", Kind: ExecutionKindSandbox, ObjectID: "s1",
 		Group: "/g", RouteKey: "rk", NodeID: "n1", NodeEpoch: 1,
 	}
 	tooLongNode := base
@@ -96,9 +96,9 @@ func TestExecutionBindingRejectsUnprojectableIdentity(t *testing.T) {
 	if _, err := EncodeExecutionBinding(tooLongNode); err == nil {
 		t.Fatal("unprojectable node ID was accepted")
 	}
-	tooLongGeneration := base
-	tooLongGeneration.StorageGeneration = strings.Repeat("g", MaxExecutionBindingGenerationIDSize+1)
-	if _, err := EncodeExecutionBinding(tooLongGeneration); err == nil {
-		t.Fatal("unprojectable storage generation was accepted")
+	tooLongRegistryGeneration := base
+	tooLongRegistryGeneration.RegistryGeneration = strings.Repeat("g", MaxExecutionBindingRegistryGenerationIDSize+1)
+	if _, err := EncodeExecutionBinding(tooLongRegistryGeneration); err == nil {
+		t.Fatal("unprojectable Registry History Generation was accepted")
 	}
 }

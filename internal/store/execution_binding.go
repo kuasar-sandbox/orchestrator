@@ -12,7 +12,7 @@ import (
 
 // CASExecutionBinding atomically replaces one protected opaque Binding by its
 // current digest. A retry that observes the exact replacement is idempotently
-// successful. Recovery rebind may change storage generation and Binding
+// successful. Recovery rebind may change Registry History Generation and Binding
 // contents, but never the concrete object or its node identity/epoch.
 func (s *Store) CASExecutionBinding(
 	ctx context.Context,

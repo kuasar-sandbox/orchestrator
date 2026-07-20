@@ -113,7 +113,7 @@ func TestLegacyBuildConvergenceRejectsFencedFinalEvent(t *testing.T) {
 	}
 	reg.applyBuildEvent(ctx, "n1", &routesync.BuildEvent{
 		BuildID: "b1", State: string(BuildReady), NodeEpoch: 7, EventSeq: 1,
-		StorageGeneration: "g1", BindingDigest: "binding-digest",
+		RegistryGeneration: "g1", BindingDigest: "binding-digest",
 	})
 	got, found, err := reg.stores.GetBuildInGroup(ctx, "/g", "b1")
 	if err != nil || !found || got.State != BuildRegistered {

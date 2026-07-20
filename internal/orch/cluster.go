@@ -444,7 +444,7 @@ func clusterCommandMetadata(
 		return nil, fmt.Errorf("cluster command is required")
 	}
 	if cmd.Binding == "" {
-		if cmd.BindingDigest != "" || cmd.StorageGeneration != "" || cmd.DemandDigest != "" || cmd.DispatchSpecDigest != "" {
+		if cmd.BindingDigest != "" || cmd.RegistryGeneration != "" || cmd.DemandDigest != "" || cmd.DispatchSpecDigest != "" {
 			return nil, fmt.Errorf("cluster command has incomplete execution binding")
 		}
 		meta := make(map[string]string, len(cmd.Config))
@@ -453,7 +453,7 @@ func clusterCommandMetadata(
 		}
 		return meta, nil
 	}
-	if cmd.NodeEpoch == 0 || cmd.SessionSeq == 0 || cmd.StorageGeneration == "" || cmd.BindingDigest == "" ||
+	if cmd.NodeEpoch == 0 || cmd.SessionSeq == 0 || cmd.RegistryGeneration == "" || cmd.BindingDigest == "" ||
 		cmd.DemandDigest == "" || cmd.DispatchSpecDigest == "" {
 		return nil, fmt.Errorf("cluster command has incomplete execution binding fence")
 	}
@@ -467,7 +467,7 @@ func clusterCommandMetadata(
 	if expectedNodeID == "" || binding.NodeID != expectedNodeID {
 		return nil, fmt.Errorf("cluster command execution binding identifies a different node")
 	}
-	if binding.NodeEpoch != cmd.NodeEpoch || binding.StorageGeneration != cmd.StorageGeneration {
+	if binding.NodeEpoch != cmd.NodeEpoch || binding.RegistryGeneration != cmd.RegistryGeneration {
 		return nil, fmt.Errorf("cluster command execution binding generation mismatch")
 	}
 	digest, err := clusterstate.ExecutionBindingDigest(cmd.Binding)
@@ -487,7 +487,7 @@ func clusterCommandMetadata(
 var errWrongExecutionBinding = errors.New("cluster: wrong execution Binding")
 
 func (o *Orchestrator) verifySandboxCommandBinding(ctx context.Context, cmd *routesync.Command) error {
-	if cmd == nil || cmd.SID == "" || cmd.NodeEpoch == 0 || cmd.StorageGeneration == "" || cmd.BindingDigest == "" {
+	if cmd == nil || cmd.SID == "" || cmd.NodeEpoch == 0 || cmd.RegistryGeneration == "" || cmd.BindingDigest == "" {
 		return fmt.Errorf("%w: incomplete sandbox command fence", errWrongExecutionBinding)
 	}
 	sb, err := o.st.Get(ctx, cmd.SID)
@@ -506,7 +506,7 @@ func (o *Orchestrator) verifySandboxCommandBinding(ctx context.Context, cmd *rou
 		return fmt.Errorf("%w: %v", errWrongExecutionBinding, err)
 	}
 	if binding.Kind != clusterstate.ExecutionKindSandbox || binding.ObjectID != cmd.SID ||
-		binding.NodeEpoch != cmd.NodeEpoch || binding.StorageGeneration != cmd.StorageGeneration || digest != cmd.BindingDigest {
+		binding.NodeEpoch != cmd.NodeEpoch || binding.RegistryGeneration != cmd.RegistryGeneration || digest != cmd.BindingDigest {
 		return errWrongExecutionBinding
 	}
 	return nil

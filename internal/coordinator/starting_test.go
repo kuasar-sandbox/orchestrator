@@ -360,8 +360,8 @@ func newTestCoordinator(t *testing.T, store *workflowStoreStub, prober *pairProb
 
 func coordinatorServeIdentity() session.ServeIdentity {
 	return session.ServeIdentity{
-		ClusterID: "c1", StorageGeneration: "g1", SystemEpoch: 1,
-		ManifestDigest: strings.Repeat("a", 64),
+		ClusterID: "c1", RegistryGeneration: "g1", SystemEpoch: 1,
+		RegistryLayoutDigest: strings.Repeat("a", 64),
 	}
 }
 
@@ -377,7 +377,7 @@ func routeStartingRecord(t *testing.T, sandboxID string, round uint64, candidate
 	}
 	record := cluster.RouteWorkflowRecord{
 		Group: "/g", RouteKey: "rk", State: cluster.WorkflowRouteStarting,
-		Revision: cluster.Revision{StorageGeneration: "g1", ShardID: 7, LogIndex: 10},
+		Revision: cluster.Revision{RegistryGeneration: "g1", ShardID: 7, LogIndex: 10},
 		Starting: &cluster.RouteStartingState{
 			SandboxID: sandboxID, PlacementRound: round, CandidatePool: candidates,
 			DefinitivelyRejected: rejected, Intent: intent,
@@ -401,7 +401,7 @@ func buildStartingRecord(t *testing.T, buildID string, candidates []cluster.Plac
 	}
 	record := cluster.BuildRecord{
 		Group: "/g", BuildID: buildID, State: cluster.BuildStarting,
-		Revision: cluster.Revision{StorageGeneration: "g1", ShardID: 8, LogIndex: 20},
+		Revision: cluster.Revision{RegistryGeneration: "g1", ShardID: 8, LogIndex: 20},
 		Starting: &cluster.BuildStartingState{
 			BuildID: buildID, CandidatePool: candidates, DefinitivelyRejected: rejected, Intent: intent,
 		},

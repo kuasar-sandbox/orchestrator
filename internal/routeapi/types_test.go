@@ -134,7 +134,7 @@ func TestPositiveReadsRequireExactTableKeyIdentity(t *testing.T) {
 
 	buildRequest := ReadBuildRequest{RequestIdentity: request.RequestIdentity, Group: "/g", BuildID: "b1"}
 	build := &clusterstate.BuildProjection{
-		BuildID: "b1", NodeID: "n1", NodeEpoch: 7, StorageGeneration: "g1",
+		BuildID: "b1", NodeID: "n1", NodeEpoch: 7, RegistryGeneration: "g1",
 		BindingDigest: testReadyRoute().BindingDigest, LastEventSeq: 1,
 	}
 	buildResponse := ReadBuildResponse{
@@ -154,7 +154,7 @@ func TestBuildReadResponseEnforcesOutcomeUnionAndReadyArtifact(t *testing.T) {
 	request := routeRequest(true)
 	buildRequest := ReadBuildRequest{RequestIdentity: request.RequestIdentity, Group: "/g", BuildID: "b1", Strong: true}
 	build := &clusterstate.BuildProjection{
-		BuildID: "b1", NodeID: "n1", NodeEpoch: 7, StorageGeneration: "g1",
+		BuildID: "b1", NodeID: "n1", NodeEpoch: 7, RegistryGeneration: "g1",
 		BindingDigest: testReadyRoute().BindingDigest, LastEventSeq: 1,
 	}
 
@@ -178,8 +178,8 @@ func TestBuildReadResponseEnforcesOutcomeUnionAndReadyArtifact(t *testing.T) {
 func routeRequest(strong bool) ReadRouteRequest {
 	return ReadRouteRequest{
 		RequestIdentity: RequestIdentity{
-			ClusterID: "cluster-1", StorageGeneration: "g1", SystemEpoch: 2,
-			ManifestDigest: "manifest-digest", ShardID: 7,
+			ClusterID: "cluster-1", RegistryGeneration: "g1", SystemEpoch: 2,
+			RegistryLayoutDigest: "manifest-digest", ShardID: 7,
 		},
 		Group: "/g", RouteKey: "rk", SandboxID: "s1", Strong: strong,
 	}
@@ -189,7 +189,7 @@ func testReadyRoute() *clusterstate.ReadyRoute {
 	digest := sha256.Sum256([]byte("binding"))
 	return &clusterstate.ReadyRoute{
 		SandboxID: "s1", NodeID: "n1", NodeEpoch: 7, DataEndpoint: "10.0.0.1:8443",
-		AccessToken: "token", TemplateRef: "e2b-snp-t1", StorageGeneration: "g1",
+		AccessToken: "token", TemplateRef: "e2b-snp-t1", RegistryGeneration: "g1",
 		BindingDigest: hex.EncodeToString(digest[:]), LastEventSeq: 3,
 	}
 }
