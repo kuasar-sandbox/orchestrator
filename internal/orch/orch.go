@@ -1,5 +1,5 @@
 // Package orch is the orchestrator core. It ties together the store, systemd
-// launcher, vswitch and config generation, and implements api.Core (control
+// launcher, vswitch and config rendering, and implements api.Core (control
 // plane), proxy.Router (data plane) and configsock.Provider (dynamic config).
 package orch
 
@@ -502,11 +502,11 @@ func (o *Orchestrator) resumeIfPaused(ctx context.Context, sid string, request p
 }
 
 func validateSandboxRouteFence(sb *types.Sandbox, request proxy.RouteRequest) (proxy.Kind, bool) {
-	managed, nodeID, nodeEpoch, generation, digest, err := sandboxRouteFence(sb)
+	managed, nodeID, nodeEpoch, registryGeneration, digest, err := sandboxRouteFence(sb)
 	if err != nil {
 		return proxy.KindWrongBinding, true
 	}
-	return proxy.RouteFenceFailure(request, managed, nodeID, nodeEpoch, generation, digest)
+	return proxy.RouteFenceFailure(request, managed, nodeID, nodeEpoch, registryGeneration, digest)
 }
 
 func sandboxRouteFence(sb *types.Sandbox) (bool, string, uint64, string, string, error) {
@@ -536,14 +536,14 @@ func currentSandboxRouteRequest(sb *types.Sandbox, port int) (proxy.RouteRequest
 	if sb != nil {
 		request.SandboxID = sb.ID
 	}
-	managed, nodeID, nodeEpoch, generation, digest, err := sandboxRouteFence(sb)
+	managed, nodeID, nodeEpoch, registryGeneration, digest, err := sandboxRouteFence(sb)
 	if err != nil {
 		return proxy.RouteRequest{}, err
 	}
 	if managed {
 		request.ExpectedNodeID = nodeID
 		request.ExpectedNodeEpoch = nodeEpoch
-		request.ExpectedRegistryGeneration = generation
+		request.ExpectedRegistryGeneration = registryGeneration
 		request.ExpectedBindingDigest = digest
 	}
 	return request, nil
