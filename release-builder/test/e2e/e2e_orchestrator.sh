@@ -27,7 +27,7 @@ BIN="${BIN:-$REPO_ROOT/bin}"
 SWITCH="${SWITCH:-sw0}"
 DOMAIN="${DOMAIN:-sandboxes.e2e.local}"
 PORT="${PORT:-3000}"
-# Tenant credentials are derived from manifest keys via e2b-key-ctl, below.
+# Tenant credentials are derived from AuthKeys via e2b-key-ctl, below.
 
 skip() {
     echo
