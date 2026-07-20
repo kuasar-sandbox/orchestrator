@@ -226,11 +226,10 @@ UPDATE cluster_identity SET session_seq=?,updated_unix=? WHERE singleton=1`,
 }
 
 func validateClusterIdentityInput(nodeID, bootID, dataEndpoint string) error {
+	if err := clusterstate.ValidateExecutionBindingNodeID(nodeID); err != nil {
+		return fmt.Errorf("store: invalid node ID: %w", err)
+	}
 	switch {
-	case nodeID == "":
-		return errors.New("store: node ID is required")
-	case len(nodeID) > clusterstate.MaxExecutionBindingNodeIDSize:
-		return fmt.Errorf("store: node ID exceeds %d bytes", clusterstate.MaxExecutionBindingNodeIDSize)
 	case bootID == "":
 		return errors.New("store: boot ID is required")
 	case dataEndpoint == "":

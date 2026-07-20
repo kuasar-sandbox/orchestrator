@@ -50,10 +50,18 @@ func TestClusterIdentityLifecycle(t *testing.T) {
 
 func TestClusterIdentityRejectsNodeIDThatCannotFormBinding(t *testing.T) {
 	st := testStore(t)
-	if _, err := st.EnrollClusterIdentity(
-		context.Background(), strings.Repeat("n", 129), "boot-1", "10.0.0.1:8443",
-	); err == nil {
-		t.Fatal("oversized node ID was durably enrolled")
+	for name, nodeID := range map[string]string{
+		"oversized":    strings.Repeat("n", 129),
+		"invalid UTF8": string([]byte{'n', 0xff}),
+		"NUL":          "node\x00alias",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := st.EnrollClusterIdentity(
+				context.Background(), nodeID, "boot-1", "10.0.0.1:8443",
+			); err == nil {
+				t.Fatal("unusable node ID was durably enrolled")
+			}
+		})
 	}
 }
 

@@ -84,7 +84,8 @@ func (s *Store) CASExecutionBinding(
 	}
 	if oldBinding.NodeID != newBinding.NodeID || oldBinding.NodeEpoch != newBinding.NodeEpoch ||
 		oldBinding.Group != newBinding.Group || oldBinding.RouteKey != newBinding.RouteKey ||
-		oldBinding.DemandDigest != newBinding.DemandDigest || oldBinding.DispatchSpecDigest != newBinding.DispatchSpecDigest {
+		oldBinding.DemandDigest != newBinding.DemandDigest ||
+		oldBinding.DispatchSpecDigest != newBinding.DispatchSpecDigest {
 		return false, errors.New("store: replacement Binding changes immutable execution identity")
 	}
 	if err := validateWorkflowBinding(workflow, oldOpaque, oldDigest, oldBinding.RegistryGeneration); err != nil {

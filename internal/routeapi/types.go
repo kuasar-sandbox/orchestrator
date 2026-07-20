@@ -108,10 +108,16 @@ func (r ReadRouteResponse) ValidateFor(request ReadRouteRequest) error {
 		if r.Route != nil {
 			return errors.New("routeapi: NOT_FOUND cannot carry a Route")
 		}
+		if r.LeaderHint != nil {
+			return errors.New("routeapi: NOT_FOUND cannot carry a leader hint")
+		}
 		return nil
 	case ReadConflict, ReadUnavailable:
 		if r.Route != nil {
 			return errors.New("routeapi: failed read cannot carry a Route")
+		}
+		if r.LeaderHint != nil {
+			return errors.New("routeapi: failed read cannot carry a leader hint")
 		}
 		return nil
 	default:
@@ -179,10 +185,16 @@ func (r ReadBuildResponse) ValidateFor(request ReadBuildRequest) error {
 		if r.Build != nil {
 			return errors.New("routeapi: NOT_FOUND Build read cannot carry a projection")
 		}
+		if r.LeaderHint != nil {
+			return errors.New("routeapi: NOT_FOUND Build read cannot carry a leader hint")
+		}
 		return nil
 	case ReadConflict, ReadUnavailable:
 		if r.Build != nil {
 			return errors.New("routeapi: failed Build read cannot carry a projection")
+		}
+		if r.LeaderHint != nil {
+			return errors.New("routeapi: failed Build read cannot carry a leader hint")
 		}
 		return nil
 	default:

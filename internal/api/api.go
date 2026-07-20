@@ -104,8 +104,8 @@ var ErrFilesUnsupported = errors.New("COPY build contexts unsupported (builder.f
 // an unuploaded context) to 400.
 var ErrBadRequest = errors.New("bad request")
 
-// ErrConflict reports an idempotency-key reuse with a different immutable
-// request. Callers must allocate a new resource ID instead of overwriting it.
+// ErrConflict reports an immutable ID reuse or a concurrent lifecycle change
+// that invalidates the operation's execution fence.
 var ErrConflict = errors.New("conflict")
 
 // PullTokenHeader is the api_headers header carrying the opaque registry pull token.
@@ -741,6 +741,8 @@ func (a *API) fail(w http.ResponseWriter, err error) {
 		writeErr(w, 403, "AuthKey is not allowed")
 	case errors.Is(err, ErrBadRequest):
 		writeErr(w, 400, err.Error())
+	case errors.Is(err, ErrConflict):
+		writeErr(w, 409, err.Error())
 	default:
 		a.log.Warn("api error", "err", err)
 		writeErr(w, 500, "internal error")

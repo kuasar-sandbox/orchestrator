@@ -169,6 +169,11 @@ func TestBuildReadResponseOnlyExposesRegistrationBinding(t *testing.T) {
 	if err := registered.ValidateFor(buildRequest); err == nil {
 		t.Fatal("unbound BUILD_STARTING projection was exposed as a positive read")
 	}
+	registered.BuildState = clusterstate.BuildError
+	registered.Build.Reason = "builder failed"
+	if err := registered.ValidateFor(buildRequest); err == nil {
+		t.Fatal("node-local BUILD_ERROR was exposed through the cluster read API")
+	}
 }
 
 func TestRouteListAndWatchCarryIndependentBucketRevisions(t *testing.T) {
@@ -204,6 +209,20 @@ func TestRouteListAndWatchCarryIndependentBucketRevisions(t *testing.T) {
 	}
 	if err := reset.ValidateFor(watchRequest); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestFinalNegativeReadsRejectLeaderHints(t *testing.T) {
+	hint := &LeaderHint{MemberID: "r1", Endpoint: "https://r1.internal", Term: 1}
+	routeRequest := routeRequest(true)
+	for _, outcome := range []string{ReadNotFound, ReadConflict, ReadUnavailable} {
+		if err := (ReadRouteResponse{Outcome: outcome, LeaderHint: hint}).ValidateFor(routeRequest); err == nil {
+			t.Fatalf("Route outcome %s accepted a leader hint", outcome)
+		}
+		buildRequest := ReadBuildRequest{RequestIdentity: routeRequest.RequestIdentity, Group: "/g", BuildID: "b1", Strong: true}
+		if err := (ReadBuildResponse{Outcome: outcome, LeaderHint: hint}).ValidateFor(buildRequest); err == nil {
+			t.Fatalf("Build outcome %s accepted a leader hint", outcome)
+		}
 	}
 }
 

@@ -313,6 +313,14 @@ func readyRoute() *ReadyRoute {
 	}
 }
 
+func TestReadyRouteRequiresDataPlaneCapability(t *testing.T) {
+	route := readyRoute()
+	route.AccessToken = ""
+	if err := route.Validate(); err == nil {
+		t.Fatal("READY route without an access token was accepted")
+	}
+}
+
 func hexDigest(value [sha256.Size]byte) string {
 	return hex.EncodeToString(value[:])
 }

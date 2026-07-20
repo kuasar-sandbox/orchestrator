@@ -81,4 +81,9 @@ func TestNodeRequestEnvelopeRejectsNonCanonicalOrOversizedInput(t *testing.T) {
 	if _, err := CanonicalJSONObject([]byte(`{"data":"` + strings.Repeat("x", MaxNodeRequestBodyBytes) + `"}`)); err == nil {
 		t.Fatal("oversized request accepted")
 	}
+	if _, err := NewNodeRequestEnvelopeV1(http.MethodPost, "/sandboxes", "", http.Header{
+		"Bad Header": {"value"},
+	}, []byte(`{}`)); err == nil {
+		t.Fatal("invalid HTTP header name accepted")
+	}
 }

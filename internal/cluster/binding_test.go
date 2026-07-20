@@ -101,4 +101,18 @@ func TestExecutionBindingRejectsUnprojectableIdentity(t *testing.T) {
 	if _, err := EncodeExecutionBinding(tooLongRegistryGeneration); err == nil {
 		t.Fatal("unprojectable Registry History Generation was accepted")
 	}
+	for name, mutate := range map[string]func(*ExecutionBinding){
+		"node NUL":       func(b *ExecutionBinding) { b.NodeID = "node\x00alias" },
+		"generation NUL": func(b *ExecutionBinding) { b.RegistryGeneration = "g1\x00old" },
+		"object newline": func(b *ExecutionBinding) { b.ObjectID = "s1\r\nX-Forged: yes" },
+		"trimmed node":   func(b *ExecutionBinding) { b.NodeID = " node" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			candidate := base
+			mutate(&candidate)
+			if _, err := EncodeExecutionBinding(candidate); err == nil {
+				t.Fatal("unsafe Binding identity was accepted")
+			}
+		})
+	}
 }
