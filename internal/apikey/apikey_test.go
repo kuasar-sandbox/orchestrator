@@ -18,8 +18,8 @@ func randKey(t *testing.T) []byte {
 }
 
 func TestMintVerifyRoundtrip(t *testing.T) {
-	mk := randKey(t)
-	ak, err := Mint(mk)
+	authKey := randKey(t)
+	ak, err := Mint(authKey)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -37,20 +37,20 @@ func TestMintVerifyRoundtrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !Verify(p, mk) {
+	if !Verify(p, authKey) {
 		t.Fatal("Verify rejected a genuine api key")
 	}
-	if !hmac.Equal(p.FP, Fingerprint(mk)) {
-		t.Fatal("embedded fp != Fingerprint(manifestKey)")
+	if !hmac.Equal(p.FP, Fingerprint(authKey)) {
+		t.Fatal("embedded fp != Fingerprint(AuthKey)")
 	}
 }
 
 func TestVerifyRejectsWrongKey(t *testing.T) {
-	mk := randKey(t)
-	ak, _ := Mint(mk)
+	authKey := randKey(t)
+	ak, _ := Mint(authKey)
 	p, _ := Parse(ak)
 	if Verify(p, randKey(t)) {
-		t.Fatal("Verify accepted a different manifest key")
+		t.Fatal("Verify accepted a different AuthKey")
 	}
 }
 

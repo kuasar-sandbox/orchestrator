@@ -1,0 +1,11 @@
+{
+  "InMemEntrySliceSize": 128,
+  "MinEntrySliceFreeSize": 32,
+  "PendingProposalShards": 4,
+  "IncomingReadIndexQueueLength": 128,
+  "IncomingProposalQueueLength": 128,
+  "ReceiveQueueLength": 128,
+  "TaskQueueInitialCap": 16,
+  "TaskQueueTargetLength": 64,
+  "TaskBatchSize": 128
+}

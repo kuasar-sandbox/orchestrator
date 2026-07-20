@@ -2,12 +2,97 @@ package raftstore
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/routeapi"
+	sm "github.com/lni/dragonboat/v4/statemachine"
 )
+
+func TestRuntimeSetServingGatesUsesDedicatedWorkflow(t *testing.T) {
+	registryLayout := testRegistryLayout(1, "generation-gates")
+	digest, _ := registryLayout.Digest()
+	state, _ := applySystem(t, SystemState{}, 1, SystemCommand{
+		Type: SystemBootstrap, RegistryLayout: &registryLayout, Digest: digest,
+	})
+	host := newFakeNodeHost()
+	host.read = func(_ uint64, _ any) (any, error) { return state, nil }
+	host.propose = func(raw []byte) (sm.Result, error) {
+		command, err := DecodeSystemCommand(raw)
+		if err != nil {
+			return sm.Result{}, err
+		}
+		if command.Type != SystemSetGates {
+			t.Fatalf("command type = %s", command.Type)
+		}
+		var result SystemApplyResult
+		state, result = ApplySystemCommand(state, state.LastApplied+1, command)
+		encoded, _ := json.Marshal(result)
+		return sm.Result{Data: encoded}, nil
+	}
+	runtime := &Runtime{
+		config:         RuntimeConfig{Tuning: DefaultRuntimeTuning()},
+		registryLayout: registryLayout, registryLayoutDigest: digest, nodeHost: host,
+		permitCache: NewPermitCache(time.Now),
+		enrollment: LocalEnrollment{Replicas: []LocalReplicaEnrollment{{
+			ShardID: SystemRaftShardID, ReplicaID: 1, StartPlan: ReplicaInitial, LocalState: ReplicaActive,
+		}}},
+	}
+	opened, err := runtime.SetServingGates(context.Background(), GateUpdate{Serve: true, Write: true, Cutover: true})
+	if err != nil || !opened.ServeGate || !opened.WriteGate || !opened.CutoverGate {
+		t.Fatalf("configured gates = %+v, %v", opened, err)
+	}
+	if _, err := runtime.ApplySystem(context.Background(), SystemCommand{
+		Type: SystemSetGates, Gates: &GateUpdate{Serve: false},
+	}); err == nil {
+		t.Fatal("raw SystemSetGates command was accepted")
+	}
+}
+
+func TestRuntimeResolvesAmbiguousDataMutationByExactStrongRead(t *testing.T) {
+	registryLayout := testRegistryLayout(1, "generation-ambiguous")
+	identity := routeShardIdentity(t, registryLayout, "/g", "rk")
+	state := initializeDataShard(t, registryLayout, identity)
+	starting := routeStarting(t, registryLayout, "/g", "rk", "sandbox-1", 1, false)
+	command := DataCommand{
+		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{Absent: true}, Route: &starting,
+	}
+	host := newFakeNodeHost()
+	host.propose = func(raw []byte) (sm.Result, error) {
+		committed, err := DecodeDataCommand(raw)
+		if err != nil {
+			return sm.Result{}, err
+		}
+		result := ApplyDataCommand(&state, 2, committed)
+		if !result.Applied {
+			t.Fatalf("ambiguous mutation did not commit: %+v", result)
+		}
+		return sm.Result{}, context.DeadlineExceeded
+	}
+	host.read = func(_ uint64, query any) (any, error) {
+		return LookupDataMutation(state, query.(DataMutationLookup))
+	}
+	digest, _ := registryLayout.Digest()
+	runtime := &Runtime{
+		registryLayout: registryLayout, registryLayoutDigest: digest, nodeHost: host,
+		permitCache: NewPermitCache(time.Now), member: registryLayout.Members[0],
+		enrollment: LocalEnrollment{Replicas: []LocalReplicaEnrollment{{
+			ShardID: DataRaftShardID(identity.ShardID), ReplicaID: 1, StartPlan: ReplicaInitial, LocalState: ReplicaActive,
+		}}},
+	}
+	if err := runtime.permitCache.Install(PermitGrant{
+		PermitIdentity: identity.PermitIdentity, CommitIndex: 1, MaxLifetimeMillis: 1_000,
+		ServeGate: true, WriteGate: true, CutoverGate: true, RecoveryClosed: true,
+	}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	result, err := runtime.ApplyData(context.Background(), command)
+	if err != nil || !result.Applied || result.Revision != 2 {
+		t.Fatalf("resolved mutation = %+v, %v", result, err)
+	}
+}
 
 func TestRuntimeLocalReadRequiresPermitAndReturnsLeaderHintNotFinalMiss(t *testing.T) {
 	registryLayout := testRegistryLayout(4, "generation-1")
@@ -105,6 +190,7 @@ func TestRemovedReplicaCanOnlyServeTheDrainingRegistryLayoutEpoch(t *testing.T) 
 	}
 	identity.SystemEpoch = 1
 	identity.RegistryLayoutDigest = oldDigest
+	runtime.enrollment.Replicas[0].LocalState = ReplicaRemoving
 	if err := runtime.authorizeLocalDataReplica(identity); err != nil {
 		t.Fatalf("draining old epoch was rejected before Permit/DataState checks: %v", err)
 	}

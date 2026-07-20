@@ -9,6 +9,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+WorkingDirectory=/etc/cluster-ctl
 ExecStart=/usr/bin/cluster-ctl registry --config /etc/cluster-ctl/registry.yaml
 Restart=on-failure
 RestartSec=2

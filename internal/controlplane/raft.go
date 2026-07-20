@@ -29,7 +29,7 @@ type consensusRuntime interface {
 	ApplySystem(context.Context, raftstore.SystemCommand) (raftstore.SystemApplyResult, error)
 	ApplyData(context.Context, raftstore.DataCommand) (raftstore.DataApplyResult, error)
 	ReadData(context.Context, raftstore.DataLookup) (raftstore.DataLookupResult, error)
-	CompactExecutionFence(context.Context, raftstore.ShardRequestIdentity, string, string, string, raftstore.FenceOutboxAckEvidence) error
+	CompactExecutionFence(context.Context, raftstore.ShardRequestIdentity, string, string, string) error
 }
 
 // RaftStore is the sole final adapter from Registry workflows to Multi-Raft.
@@ -582,7 +582,6 @@ func (s *RaftStore) PendingWorkflows(ctx context.Context, shardID uint32, after 
 func (s *RaftStore) CompactExecutionFence(
 	ctx context.Context,
 	fence clusterstate.ExecutionFence,
-	evidence raftstore.FenceOutboxAckEvidence,
 ) error {
 	identity, err := s.routeIdentity(fence.Group, fence.RouteKey)
 	if err != nil {
@@ -592,7 +591,7 @@ func (s *RaftStore) CompactExecutionFence(
 		return errors.New("controlplane: execution fence belongs to another signed Registry History Generation or shard")
 	}
 	return s.runtime.CompactExecutionFence(
-		ctx, identity, fence.Group, fence.RouteKey, fence.SandboxID, evidence,
+		ctx, identity, fence.Group, fence.RouteKey, fence.SandboxID,
 	)
 }
 

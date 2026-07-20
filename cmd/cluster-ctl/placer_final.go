@@ -36,10 +36,7 @@ func runPlacer(args []string, log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	mux := http.NewServeMux()
-	mux.Handle(placer.FinalPlanPath, transportauth.Middleware(transportauth.RoleRegistry, service))
-	mux.Handle(placer.FinalVerifyKeyPath, transportauth.Middleware(transportauth.RoleRouter, service))
-	mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })
+	mux := finalPlacerHandler(service)
 	server, err := newClusterHTTPServer("placer", config.Placer.Listen, config.Placer.TLS, mux)
 	if err != nil {
 		return err
@@ -49,4 +46,14 @@ func runPlacer(args []string, log *slog.Logger) error {
 	log.Info("cluster-ctl placer", "id", config.Placer.ID, "listen", config.Placer.Listen,
 		"group_sources", len(config.GroupSources), "candidates", config.Placement.Candidates)
 	return server.Serve(ctx, log)
+}
+
+func finalPlacerHandler(service http.Handler) http.Handler {
+	mux := http.NewServeMux()
+	registry := transportauth.Middleware(transportauth.RoleRegistry, service)
+	mux.Handle(placer.FinalPlanPath, registry)
+	mux.Handle(placer.FinalKeyLeasePath, registry)
+	mux.Handle(placer.FinalVerifyKeyPath, transportauth.Middleware(transportauth.RoleRouter, service))
+	mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })
+	return mux
 }

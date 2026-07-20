@@ -37,6 +37,25 @@ Router 只从 Registry 读取 immutable registration binding；trigger/files/sta
 Router 到 node 的控制面和数据面均使用 Router-role mTLS，并在任何读取或副作用前校验 NodeID、NodeEpoch、
 Registry History Generation、Binding digest 和对象 ID。
 
+### Node key authority
+
+`AuthKey` 是 node API 鉴权根，`ManifestKey` 是 Content Manifest、快照、MMDS 与 pull token
+的内容加密根；两者必须使用不同材料。Router/Provider 用 AuthKey 验证 caller，节点对直接转发请求再次用
+对象自身的 AuthKey 验证。ManifestKey 不能用于 API 鉴权；READY Route 的 AccessToken 也不能替代 AuthKey。
+
+Provider/Placer 生成完整、带 TTL 的双密钥 lease。Registry 不把秘密写入 Raft，只经当前认证 Session Holder
+发送 `key_put`；节点加密持久化并 ACK 准确的 AuthKey/ManifestKey fingerprints 后才允许 Admission/dispatch。
+`key_put` 重试刷新 TTL；`key_drop` 仅是 best-effort 提前清理，TTL 到期是权威老化机制。Lease 到期阻止新对象，
+但对象生命周期内保存的 AuthKey/ManifestKey 不被改写，已有对象仍由其创建时 AuthKey 鉴权。
+
+### Node request preservation
+
+Sandbox Create 与 Build Register 进入 Registry 前先形成有界、可重放的 node request envelope。Router 拒绝
+重复 JSON key、冲突 alias、伪造 internal/fencing header 和保留 system metadata；覆盖 group/route identity、
+node-local object identity、effective template、Build resource ceiling 与 protected Binding 等 cluster-owned 字段。
+其余 JSON 字段、query、content type 和普通 end-to-end header 原样保留在 immutable dispatch spec 中。
+Leader 恢复只能重放该 envelope，不能重新调用 Provider 或把请求重新编码为较窄结构。
+
 正常运行期间不提供 execution import。灾难恢复只从 node durable workflow 和受保护 Binding 投影；持久
 Route 导入必须使用独立 migration-token 协议。现有 Sandbox/Build 不能由 operator 元数据提升为权威状态。
 
@@ -160,7 +179,7 @@ STARTING placement failure -> TOMBSTONE -> new round with a new SID
 `STARTING` 持久化足以在 Leader 切换后继续相同 workflow 的全部信息：
 
 ```text
-sandbox_id and globally monotonic placement_round
+sandbox_id and monotonically increasing placement_round within the Route workflow
 complete candidate pool
 selected candidate/index
 definitively rejected candidates
@@ -327,6 +346,12 @@ node Sandbox/Build launch workers and durable queue depth
 
 Registry aggregate launch rate按 Registry Layout member 数量等分，因此所有成员同时工作时总速率不超过配置值；
 成员故障只降低吞吐，不放宽安全上限。
+
+Dragonboat 的 per-replica queue 必须使用仓库中的
+`deploy/dragonboat-soft-settings.json`。该依赖只在进程初始化时从当前工作目录读取固定文件名，因此 Registry
+配置、该文件和进程工作目录必须是同一目录；标准部署为 `/etc/cluster-ctl`，对应 systemd unit 已固定
+`WorkingDirectory=/etc/cluster-ctl`。Registry 会在创建 NodeHost 前校验文件内容、权限和工作目录并 fail closed，
+避免静默使用在 4097-group 门槛中超过 8 GiB RSS 的上游默认队列。
 
 ## 13. Required verification
 

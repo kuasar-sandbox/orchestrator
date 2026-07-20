@@ -2,10 +2,12 @@ package controlplane
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"testing"
 
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
+	"github.com/kuasar-sandbox/orchestrator/internal/raftstore"
 	"github.com/kuasar-sandbox/orchestrator/internal/routeapi"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/session"
@@ -14,6 +16,43 @@ import (
 type acceptingCommandSender struct {
 	mu    sync.Mutex
 	calls []routesync.Command
+}
+
+func TestRegistryServiceProvesExactFinalOutboxAck(t *testing.T) {
+	service, store, _, _ := newRegistryServiceFixture(t, clusterstate.DispatchUnknown)
+	consensus := store.runtime.(*serviceConsensus)
+	consensus.system.NodeEnrollments["node-1"] = raftstore.NodeEnrollmentRecord{
+		NodeID: "node-1", EnrollmentID: "enrollment-1", MaxNodeEpoch: 7,
+		DataEndpoint: "node-1:8443", EnrollmentIndex: 1, LastAppliedIndex: 1,
+	}
+	sender := &acceptingCommandSender{}
+	service.commands = sender
+	request := raftstore.FenceOutboxAckRequest{
+		Group: "/group", RouteKey: "route-1", SandboxID: "sandbox-1",
+		NodeID: "node-1", NodeEpoch: 7,
+		RegistryGeneration: consensus.system.RegistryGeneration,
+		BindingDigest:      strings.Repeat("a", 64), FinalOutboxWatermark: 9,
+	}
+	evidence, err := service.VerifyFenceOutboxAck(context.Background(), request)
+	if err != nil || evidence.AckedWatermark != request.FinalOutboxWatermark ||
+		evidence.ProofDigest != finalOutboxAckProof(request) {
+		t.Fatalf("final outbox evidence = %+v, %v", evidence, err)
+	}
+	calls := sender.snapshot()
+	if len(calls) != 1 || calls[0].Kind != routesync.CmdFinalizeWorkflow ||
+		calls[0].SID != request.SandboxID || calls[0].RegistryGeneration != request.RegistryGeneration ||
+		calls[0].BindingDigest != request.BindingDigest {
+		t.Fatalf("final outbox command = %+v", calls)
+	}
+
+	wrong := request
+	wrong.RegistryGeneration = "another-generation"
+	if _, err := service.VerifyFenceOutboxAck(context.Background(), wrong); err == nil {
+		t.Fatal("another Registry History Generation received final outbox evidence")
+	}
+	if len(sender.snapshot()) != 1 {
+		t.Fatal("invalid final outbox request reached the node")
+	}
 }
 
 func (s *acceptingCommandSender) SendNodeCommand(

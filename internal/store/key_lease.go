@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"time"
@@ -50,29 +51,53 @@ func (s *Store) PutKeyLease(ctx context.Context, lease KeyLease) (bool, error) {
 			return false, fmt.Errorf("store: encrypt registry auth: %w", err)
 		}
 	}
-	rowID, found, err := s.findKeyLeaseRow(ctx, lease.Group, authHash, manifestHash, lease.AuthKey, lease.ManifestKey)
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
+	if err != nil {
+		return false, fmt.Errorf("store: begin key lease update: %w", err)
+	}
+	defer tx.Rollback()
+	rowID, found, err := s.findKeyLeaseRowWith(ctx, tx, lease.Group, authHash, manifestHash, lease.AuthKey, lease.ManifestKey)
 	if err != nil {
 		return false, err
 	}
 	if found {
-		_, err = s.db.ExecContext(ctx, `
+		result, updateErr := tx.ExecContext(ctx, `
 UPDATE key_leases
-SET auth_key_enc=?, manifest_key_enc=?, registry_auth_enc=?, expires_unix=?,
+SET auth_key_enc=?, manifest_key_enc=?,
+    registry_auth_enc=CASE WHEN ?='' THEN registry_auth_enc ELSE ? END,
+    expires_unix=?,
     label=CASE WHEN ?='' THEN label ELSE ? END
-WHERE rowid=?`, authEnc, manifestEnc, registryAuthEnc, lease.ExpiresUnix, lease.Label, lease.Label, rowID)
-		return false, err
+WHERE rowid=?`, authEnc, manifestEnc, registryAuthEnc, registryAuthEnc,
+			lease.ExpiresUnix, lease.Label, lease.Label, rowID)
+		if updateErr != nil {
+			return false, updateErr
+		}
+		changed, updateErr := result.RowsAffected()
+		if updateErr != nil {
+			return false, updateErr
+		}
+		if changed != 1 {
+			return false, errors.New("store: key lease disappeared during refresh")
+		}
+		if err := tx.Commit(); err != nil {
+			return false, fmt.Errorf("store: commit key lease refresh: %w", err)
+		}
+		return false, nil
 	}
 	created := lease.CreatedUnix
 	if created == 0 {
 		created = time.Now().Unix()
 	}
-	_, err = s.db.ExecContext(ctx, `
+	_, err = tx.ExecContext(ctx, `
 INSERT INTO key_leases
   (group_name,auth_key_hash,auth_key_enc,manifest_key_hash,manifest_key_enc,label,created_unix,expires_unix,registry_auth_enc)
 VALUES (?,?,?,?,?,?,?,?,?)`,
 		lease.Group, authHash, authEnc, manifestHash, manifestEnc, lease.Label, created, lease.ExpiresUnix, registryAuthEnc)
 	if err != nil {
 		return false, fmt.Errorf("store: put key lease: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("store: commit key lease insert: %w", err)
 	}
 	return true, nil
 }
@@ -214,7 +239,19 @@ func (s *Store) findKeyLeaseRow(
 	ctx context.Context,
 	group, authHash, manifestHash, authKey, manifestKey string,
 ) (int64, bool, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	return s.findKeyLeaseRowWith(ctx, s.db, group, authHash, manifestHash, authKey, manifestKey)
+}
+
+type keyLeaseQueryer interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}
+
+func (s *Store) findKeyLeaseRowWith(
+	ctx context.Context,
+	queryer keyLeaseQueryer,
+	group, authHash, manifestHash, authKey, manifestKey string,
+) (int64, bool, error) {
+	rows, err := queryer.QueryContext(ctx, `
 SELECT rowid,auth_key_enc,manifest_key_enc
 FROM key_leases WHERE group_name=? AND auth_key_hash=? AND manifest_key_hash=?`,
 		group, authHash, manifestHash)

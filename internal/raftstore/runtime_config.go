@@ -111,6 +111,9 @@ func (c RuntimeConfig) validate(member RegistryMember) error {
 	if c.TLS.CAFile == "" || c.TLS.CertFile == "" || c.TLS.KeyFile == "" {
 		return errors.New("raftstore: Raft mutual TLS material is required")
 	}
+	if filepath.Clean(c.RegistryLayoutGuardPath) == filepath.Clean(c.EnrollmentPath) {
+		return errors.New("raftstore: registryLayout guard and enrollment must use distinct files")
+	}
 	if c.StorageAttestor == nil {
 		return errors.New("raftstore: encrypted storage attestation is required")
 	}

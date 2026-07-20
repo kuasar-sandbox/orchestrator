@@ -625,6 +625,9 @@ func (s *Store) CommitClusterBuildState(
 		return nil, errors.New("store: accepted Build object is missing")
 	}
 	if record.ObjectState == update.State {
+		if !duplicateBuildUpdateMatches(current, update) {
+			return nil, ErrNodeWorkflowConflict
+		}
 		changed, mergeErr := mergeBuildRuntimeFields(current, build, update)
 		if mergeErr != nil {
 			return nil, mergeErr
@@ -1004,13 +1007,11 @@ func mergeBuildRuntimeFields(stored, incoming *types.Build, update nodeexec.Even
 		{name: "names", stored: &stored.Names, incoming: incoming.Names},
 		{name: "aliases", stored: &stored.Aliases, incoming: incoming.Aliases},
 	} {
-		if len(field.incoming) == 0 {
+		if len(field.incoming) == 0 || slices.Equal(*field.stored, field.incoming) {
 			continue
 		}
-		if slices.Equal(*field.stored, field.incoming) {
-			continue
-		}
-		if update.State == string(types.BuildReady) && slices.Equal(field.incoming, append(append([]string(nil), *field.stored...), update.ArtifactRef)) {
+		if len(*field.stored) != 0 && update.State == string(types.BuildReady) &&
+			update.ArtifactRef != "" && slices.Equal(appendUniqueString(*field.stored, update.ArtifactRef), field.incoming) {
 			*field.stored = append([]string(nil), field.incoming...)
 			changed = true
 			continue
@@ -1032,6 +1033,25 @@ func mergeBuildRuntimeFields(stored, incoming *types.Build, update nodeexec.Even
 		}
 	}
 	return changed, nil
+}
+
+func duplicateBuildUpdateMatches(stored *types.Build, update nodeexec.EventUpdate) bool {
+	switch update.State {
+	case string(types.BuildReady):
+		return update.ArtifactRef != "" && stored.PersistID == update.ArtifactRef
+	case string(types.BuildError):
+		return update.Reason != "" && stored.Reason == update.Reason
+	default:
+		return true
+	}
+}
+
+func appendUniqueString(values []string, value string) []string {
+	result := append([]string(nil), values...)
+	if !slices.Contains(result, value) {
+		result = append(result, value)
+	}
+	return result
 }
 
 func cloneMetadata(source map[string]string) map[string]string {

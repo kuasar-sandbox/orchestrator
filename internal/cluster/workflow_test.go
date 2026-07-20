@@ -72,6 +72,27 @@ func TestReadyRouteAndRevisionValidation(t *testing.T) {
 	}
 }
 
+func TestRouteTombstoneCarriesExactExecutionFence(t *testing.T) {
+	binding := sha256.Sum256([]byte("binding"))
+	record := RouteWorkflowRecord{
+		Group: "/g", RouteKey: "rk", State: WorkflowRouteTombstone,
+		Revision: Revision{RegistryGeneration: "g1", ShardID: 9, LogIndex: 101},
+		Tombstone: &RouteTombstoneState{
+			SandboxID: "s1", NodeID: "n1", NodeEpoch: 7, RegistryGeneration: "g1",
+			BindingDigest: hexDigest(binding), LastEventSeq: 4, TerminalReason: "deleted",
+			Proof:           TerminalProof{Kind: ProofNodeTerminal, ProofDigest: hexDigest(sha256.Sum256([]byte("proof"))), FencedNodeID: "n1", FencedNodeEpoch: 7},
+			FailureRevision: Revision{RegistryGeneration: "g1", ShardID: 9, LogIndex: 100},
+		},
+	}
+	if err := record.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	record.Tombstone.RegistryGeneration = "g2"
+	if err := record.Validate(); err == nil {
+		t.Fatal("Route tombstone from another Registry History Generation was accepted")
+	}
+}
+
 func TestDispatchIntentRejectsMutationAndOversize(t *testing.T) {
 	intent, err := NewDispatchIntent([]byte("demand"), []byte("spec"), "v1")
 	if err != nil {
@@ -199,7 +220,8 @@ func TestNewerNodeEpochProofIsBoundToExactExecutionState(t *testing.T) {
 		Revision: Revision{RegistryGeneration: "g1", ShardID: 7, LogIndex: 40},
 		Tombstone: &RouteTombstoneState{
 			SandboxID: ready.SandboxID, NodeID: ready.NodeID, NodeEpoch: ready.NodeEpoch,
-			BindingDigest: ready.BindingDigest, LastEventSeq: ready.LastEventSeq,
+			RegistryGeneration: ready.RegistryGeneration,
+			BindingDigest:      ready.BindingDigest, LastEventSeq: ready.LastEventSeq,
 			Proof: proof, TerminalReason: "node epoch advanced",
 			FailureRevision: Revision{RegistryGeneration: "g1", ShardID: 7, LogIndex: 40},
 		},

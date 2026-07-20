@@ -47,7 +47,7 @@ func routeBoundExecution(record clusterstate.RouteWorkflowRecord) (boundRouteExe
 		}
 		return boundRouteExecution{
 			SandboxID: record.Tombstone.SandboxID, NodeID: record.Tombstone.NodeID,
-			NodeEpoch: record.Tombstone.NodeEpoch, RegistryGeneration: record.Revision.RegistryGeneration,
+			NodeEpoch: record.Tombstone.NodeEpoch, RegistryGeneration: record.Tombstone.RegistryGeneration,
 			BindingDigest: record.Tombstone.BindingDigest, LastEventSeq: record.Tombstone.LastEventSeq,
 		}, true
 	default:
@@ -84,7 +84,8 @@ func (s *RaftStore) FenceRouteExecution(
 	}
 	tombstone := clusterstate.RouteTombstoneState{
 		SandboxID: execution.SandboxID, NodeID: execution.NodeID, NodeEpoch: execution.NodeEpoch,
-		BindingDigest: execution.BindingDigest, LastEventSeq: execution.LastEventSeq,
+		RegistryGeneration: execution.RegistryGeneration,
+		BindingDigest:      execution.BindingDigest, LastEventSeq: execution.LastEventSeq,
 		Proof: proof, TerminalReason: reason,
 	}
 	fence := clusterstate.ExecutionFence{
@@ -97,6 +98,7 @@ func (s *RaftStore) FenceRouteExecution(
 		current := record.Tombstone
 		if current == nil || current.PlacementFailure != nil || current.SandboxID != tombstone.SandboxID ||
 			current.NodeID != tombstone.NodeID || current.NodeEpoch != tombstone.NodeEpoch ||
+			current.RegistryGeneration != tombstone.RegistryGeneration ||
 			current.BindingDigest != tombstone.BindingDigest || current.LastEventSeq != tombstone.LastEventSeq ||
 			current.Proof != tombstone.Proof || current.TerminalReason != tombstone.TerminalReason {
 			return clusterstate.RouteWorkflowRecord{}, errors.New("controlplane: Route is already fenced by another proof")

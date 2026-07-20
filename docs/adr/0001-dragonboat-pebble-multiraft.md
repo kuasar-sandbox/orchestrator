@@ -48,6 +48,23 @@ send-queue, receive-queue, and worker limits. Initial bootstrap, join, restart,
 promotion, removal, and local data deletion are driven by durable enrollment
 and the signed Registry Layout, never by memberlist or leader visibility.
 
+Every Registry process must start with `deploy/dragonboat-soft-settings.json`
+in the Registry config directory as its current working directory. The profile
+bounds per-replica queues as follows:
+
+```text
+InMemEntrySliceSize=128          MinEntrySliceFreeSize=32
+PendingProposalShards=4         IncomingReadIndexQueueLength=128
+IncomingProposalQueueLength=128 ReceiveQueueLength=128
+TaskQueueInitialCap=16          TaskQueueTargetLength=64
+TaskBatchSize=128
+```
+
+Dragonboat reads this fixed file name only during package initialization.
+`cluster-ctl registry` therefore validates the exact profile, launch directory,
+regular-file type, and non-group-writable permissions before creating a
+`NodeHost`; the systemd unit fixes `WorkingDirectory=/etc/cluster-ctl`.
+
 ## Correctness Mapping
 
 | RFC requirement | Implementation evidence |
@@ -100,23 +117,40 @@ Completed locally on a 4-vCPU, 3.6 GiB host:
 - `GOWORK=off go test ./...`;
 - `GOWORK=off go vet ./...`.
 
-The local host is intentionally too small for the acceptance-scale gates. Run
-these exact gates on `bms.tmp` before the final cutover PR can be approved:
+The local host is intentionally too small for the acceptance-scale gates. The
+following commands run the gates on a qualified persistent filesystem; the
+Dragonboat test binary starts from `deploy/` so the production soft-settings
+profile is loaded during process initialization:
 
 ```bash
-GOWORK=off KUASAR_RAFT_SCALE_GATE=1 go test ./internal/raftstore -run '^TestDragonboat4097GroupScaleGate$' -count=1 -v
-GOWORK=off KUASAR_RAFT_STATE_GATE=1 go test ./internal/raftstore -run '^TestPebbleMillionReadyRouteGate$' -count=1 -v
+GATE_ROOT=/mnt/kuasar-raft-gates/kuasar-gates
+GOWORK=off go test -c -o /tmp/kuasar-raftstore-gates ./internal/raftstore
+env -C deploy KUASAR_RAFT_SCALE_GATE=1 KUASAR_RAFT_GATE_ROOT="$GATE_ROOT" \
+  /tmp/kuasar-raftstore-gates -test.run='^TestDragonboat4097GroupScaleGate$' -test.count=1 -test.v
+GOWORK=off KUASAR_RAFT_STATE_GATE=1 KUASAR_RAFT_GATE_ROOT="$GATE_ROOT" \
+  go test ./internal/raftstore -run '^TestPebbleMillionReadyRouteGate$' -count=1 -v
 ```
 
 The Dragonboat gate starts 4,097 live groups, performs 20,000 reads, requires
 read p99 at or below 5 ms, starts within two minutes, and limits RSS to 8 GiB.
 The state-engine gate loads 1,000,000 READY rows within five minutes, performs
 50,000 reads, requires read p99 at or below 5 ms, and limits RSS to 16 GiB.
-Record CPU, memory, storage, filesystem, kernel, and elapsed results in the PR.
+The gates passed on `bms.tmp` with 88 logical CPUs (Intel Xeon Gold 6266C),
+375.9 GiB RAM, openEuler 24.03 LTS-SP4, kernel
+`6.6.0-159.4.6.157.20260713.a4e2472763b2.oe2403sp4.x86_64`, and the dedicated
+`/dev/sdb1` ext4 VBS volume:
 
-The BMS gates are currently pending because the existing reverse SSH endpoint
-at `localhost:52222` refuses connections. This is an infrastructure blocker,
-not a passed benchmark and not dependency-download work.
+| Gate | Result |
+| --- | --- |
+| 4,097 groups / 12,291 replicas | startup 60.816 s; total 69.98 s; READY read p50 58.9 us, p99 108.0 us, p99.9 233.8 us; max RSS 4.70 GiB |
+| 1,000,000 READY rows / 4,096 shards | 191..302 rows/shard; load 37.023 s; total 40.75 s; read p50 54.0 us, p99 72.7 us, p99.9 181.6 us; max RSS 0.57 GiB |
+
+The upstream Dragonboat defaults were also measured and rejected: the live
+group gate consumed 25.54 GiB RSS. The bounded profile reduced the same tmpfs
+cross-check to 4.53 GiB RSS with 10.333 s startup. The system `/dev/sda2` ext4
+VBS volume missed the two-minute startup limit at 127.34 s, while the dedicated
+volume passed; Registry storage therefore requires the same pre-cutover gate
+and cannot be placed on an unqualified system volume.
 
 ## Fallback Gate
 

@@ -186,6 +186,9 @@ func (r *Runtime) ConfirmPredecessorPermitDrain(ctx context.Context, evidenceDig
 }
 
 func (r *Runtime) ReadData(ctx context.Context, query DataLookup) (DataLookupResult, error) {
+	if err := r.removalFenceError(); err != nil {
+		return DataLookupResult{}, err
+	}
 	if err := query.Validate(); err != nil {
 		return DataLookupResult{}, err
 	}
@@ -227,14 +230,17 @@ func (r *Runtime) authorizeLocalDataReplica(identity ShardRequestIdentity) error
 	}
 	local := r.enrollment.Replicas[position]
 	r.mu.Unlock()
-	if local.LocalState != ReplicaActive || local.NonVoting {
-		return ErrNoLocalReplica
-	}
 	if identity.RegistryLayoutDigest != r.registryLayoutDigest {
 		// A removed replica may serve only the preceding epoch while its
 		// already-issued Permit drains. DataState.Accepts performs the exact
 		// old-epoch check and the new registryLayout never routes new-epoch reads here.
-		return nil
+		if (local.LocalState == ReplicaActive || local.LocalState == ReplicaRemoving) && !local.NonVoting {
+			return nil
+		}
+		return ErrNoLocalReplica
+	}
+	if local.LocalState != ReplicaActive || local.NonVoting {
+		return ErrNoLocalReplica
 	}
 	if int(identity.ShardID) >= len(r.registryLayout.DataShards) {
 		return ErrNoLocalReplica

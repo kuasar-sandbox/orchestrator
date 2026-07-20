@@ -23,10 +23,15 @@ type testEndpoint struct {
 	err      error
 	keyAck   *routesync.NodeKeyLeaseRefV1
 	wire     []*routesync.Command
+	sendErr  error
+	sent     bool
 }
 
 func (e *testEndpoint) SendNodeCommand(_ context.Context, command *routesync.Command) (routesync.CmdAck, bool, error) {
 	e.wire = append(e.wire, command)
+	if e.sendErr != nil {
+		return routesync.CmdAck{}, e.sent, e.sendErr
+	}
 	if command == nil {
 		return routesync.CmdAck{}, false, errors.New("missing command")
 	}
@@ -554,6 +559,35 @@ func TestHolderRequiresExactKeyLeaseAcknowledgement(t *testing.T) {
 		context.Background(), testServeIdentity(), registration.NodeID, registration.NodeEpoch, registration.DataEndpoint, ref,
 	); err != nil || !sent || holder.HasKeyLease(registration.NodeID, registration.NodeEpoch, ref) {
 		t.Fatalf("key drop sent=%v err=%v", sent, err)
+	}
+}
+
+func TestAmbiguousKeyDropInvalidatesLocalAcknowledgement(t *testing.T) {
+	registration := testRegistration("node-1", 7, 10, "10.0.0.1:8443")
+	authority := newTestEnrollmentAuthority(registration)
+	holder, err := NewHolder("registry-a", 1, nil, testGate(true), nil, authority)
+	if err != nil {
+		t.Fatal(err)
+	}
+	endpoint := &testEndpoint{}
+	if _, err := holder.Register(context.Background(), registration, endpoint); err != nil {
+		t.Fatal(err)
+	}
+	lease := testKeyLease()
+	ref, _, err := holder.InstallKeyLease(
+		context.Background(), testServeIdentity(), registration.NodeID, registration.NodeEpoch, registration.DataEndpoint, lease,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	endpoint.sendErr, endpoint.sent = errors.New("drop ACK lost"), true
+	if sent, err := holder.DropKeyLease(
+		context.Background(), testServeIdentity(), registration.NodeID, registration.NodeEpoch, registration.DataEndpoint, ref,
+	); err == nil || !sent {
+		t.Fatalf("ambiguous drop sent=%v err=%v", sent, err)
+	}
+	if holder.HasKeyLease(registration.NodeID, registration.NodeEpoch, ref) {
+		t.Fatal("ambiguous key drop left the local lease ACK usable")
 	}
 }
 

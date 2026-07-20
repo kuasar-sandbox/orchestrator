@@ -24,10 +24,14 @@ func NewDirectoryDispatcher(directory *Directory, client HolderDispatchRPC) (*Di
 }
 
 func (d *DirectoryDispatcher) AdmitAndDispatch(ctx context.Context, command DispatchCommand) (DispatchReply, error) {
-	entry, found := d.directory.Lookup(command.NodeID)
-	if !found {
+	record, found := d.directory.LookupRecord(command.NodeID)
+	if found && record.Entry.NodeEpoch > command.NodeEpoch {
+		return DispatchReply{Outcome: cluster.DispatchDefinitiveReject, Reason: "selected NodeEpoch is permanently fenced"}, nil
+	}
+	if !found || !record.Available || record.Conflict {
 		return DispatchReply{Outcome: cluster.DispatchSessionMoved, Reason: "node has no current Session Holder"}, nil
 	}
+	entry := record.Entry
 	if entry.NodeEpoch > command.NodeEpoch {
 		// The Directory is only a routing hint. The committed System state must
 		// fence the selected execution before its identity can be abandoned.

@@ -115,10 +115,10 @@ Warm Pool),共享同一套基础设施:内容定义分块、收敛加密、内�
                                                 ▼
   ┌── Cluster control plane ───────────────────────────────────────────────────────────┐
   │  cluster-ctl router ── reserve/query ──► cluster-ctl registry                     │
-  │       data ingress                 shardkv state cluster                           │
-  │                                    ▲                                               │
-  │                                    └── place/import ── cluster-ctl placer          │
-  │                                                    WATCH_LIST + provider/importer  │
+  │       data ingress                 Multi-Raft Route/Build registration             │
+  │                                    ▲ + Session Holders                           │
+  │                                    └── RandomN plan ── cluster-ctl placer           │
+  │                                                    Provider / Policy               │
   └──────────────────────────────────────────────┬────────────────────────────────────┘
       node_link / route target / key refresh      │
                                                   ▼

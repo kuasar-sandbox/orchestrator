@@ -738,7 +738,7 @@ func (a *API) fail(w http.ResponseWriter, err error) {
 	case errors.Is(err, ErrNotFound):
 		writeErr(w, 404, "not found")
 	case errors.Is(err, ErrNotAllowed):
-		writeErr(w, 403, "manifest key not allowed")
+		writeErr(w, 403, "AuthKey is not allowed")
 	case errors.Is(err, ErrBadRequest):
 		writeErr(w, 400, err.Error())
 	default:

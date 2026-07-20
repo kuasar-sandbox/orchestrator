@@ -142,6 +142,13 @@ func (m *DataStateMachine) Lookup(query any) (any, error) {
 		return LookupData(m.state, *value)
 	case DataStateLookup, *DataStateLookup:
 		return cloneDataStateForLookup(m.state), nil
+	case DataMutationLookup:
+		return LookupDataMutation(m.state, value)
+	case *DataMutationLookup:
+		if value == nil {
+			return nil, errors.New("raftstore: nil data mutation lookup")
+		}
+		return LookupDataMutation(m.state, *value)
 	default:
 		return nil, errors.New("raftstore: unsupported data-shard lookup")
 	}

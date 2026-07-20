@@ -93,7 +93,6 @@ func (m *memoryConsensus) CompactExecutionFence(
 	string,
 	string,
 	string,
-	raftstore.FenceOutboxAckEvidence,
 ) error {
 	return errors.New("memory consensus: fence compaction is not configured")
 }

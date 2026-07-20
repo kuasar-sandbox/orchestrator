@@ -108,6 +108,12 @@ if ! command -v mkfs.erofs >/dev/null 2>&1; then
 fi
 
 WORK="$(mktemp -d /tmp/e2e-cr-XXXXXX)"
+DRAGONBOAT_PROFILE="$REPO_ROOT/deploy/dragonboat-soft-settings.json"
+if [ ! -f "$DRAGONBOAT_PROFILE" ]; then
+    DRAGONBOAT_PROFILE="$REPO_ROOT/../deploy/dragonboat-soft-settings.json"
+fi
+[ -f "$DRAGONBOAT_PROFILE" ] || fail "missing deploy/dragonboat-soft-settings.json"
+cp "$DRAGONBOAT_PROFILE" "$WORK/dragonboat-soft-settings.json"
 UNIT_DIR="/run/systemd/system"
 UNIT_NAMES=(sandbox-runner@.service sandbox-builder@.service sandbox-runner.slice sandbox-builder.slice)
 declare -a OURS=()
@@ -219,9 +225,9 @@ retry_data_by_key() {
             echo "$code"
             return 0
         fi
-        if grep -qiE 'no allowlisted manifest key|key not distributed' "$WORK/data-health.body" 2>/dev/null; then
+        if grep -qiE 'AuthKey is not allowed|key lease|key not distributed' "$WORK/data-health.body" 2>/dev/null; then
             cat "$WORK/data-health.body" >&2
-            fail "data-plane hit node before manifest-key cache was ready"
+            fail "data-plane hit node before the exact key lease was ready"
         fi
         step "data-plane attempt $i returned $code; retrying while sandbox boot converges"
         sleep 2
@@ -345,10 +351,12 @@ EOF
     local build_pid="$!"
     PIDS+=("$build_pid")
     wait_api_health "$BUILD_PORT" "temporary node-ctl"
-    "$BIN/node-ctl" manifest-key add --socket "$WORK/bn.sock" "$MANIFEST_KEY" >/dev/null || fail "temporary manifest-key add"
+    "$BIN/node-ctl" key-lease put --socket "$WORK/bn.sock" --group "$GROUP" \
+        --auth-key "$AUTH_KEY" --manifest-key "$MANIFEST_KEY" >/dev/null || fail "temporary key-lease put"
 
     local code tid bid status
-    code="$(node_req "$BUILD_PORT" POST /v3/templates "$BUILD_API_KEY" '{"name":"cluster-real-tmpl"}')"
+    code="$(node_req "$BUILD_PORT" POST /v3/templates "$BUILD_API_KEY" \
+        '{"name":"cluster-real-tmpl","cpuCount":2,"memoryMB":4096}')"
     [ "$code" = "202" ] || { cat "$WORK/node-resp.body"; fail "template register returned $code"; }
     tid="$(json_field "$WORK/node-resp.body" templateID)"
     bid="$(json_field "$WORK/node-resp.body" buildID)"
@@ -485,7 +493,10 @@ start_cluster_control_plane() {
     for i in $(seq 1 "$registries"); do
         local port="${CONTROL_PORTS[$((i-1))]}"
         step "starting registry-$i (:${port})"
-        "$BIN/cluster-ctl" registry --config "$WORK/registry-$i.yaml" > >(tee "$WORK/registry-$i.log" >&2) 2>&1 &
+        (
+            cd "$WORK"
+            exec "$BIN/cluster-ctl" registry --config "$WORK/registry-$i.yaml"
+        ) > >(tee "$WORK/registry-$i.log" >&2) 2>&1 &
         PIDS+=("$!")
         wait_port "$port" "registry-$i"
     done
@@ -578,7 +589,7 @@ cluster:
   heartbeat_interval: "500ms"
   labels: { pool: "real" }
 EOF
-    step "starting cluster node-ctl node_id=$node_id (:${NODE_PORT}, no manual manifest-key add)"
+    step "starting cluster node-ctl node_id=$node_id (:${NODE_PORT}, no manual key-lease put)"
     "$BIN/node-ctl" conductor serve --config "$WORK/cluster-node.yaml" > >(tee "$WORK/cluster-node.log" >&2) 2>&1 &
     PIDS+=("$!")
     wait_api_health "$NODE_PORT" "cluster node-ctl"
@@ -595,18 +606,18 @@ EOF
 }
 
 wait_cluster_node_manifest_key() {
-    step "waiting for node_link manifest-key cache on $NODE_ID"
+    step "waiting for node_link key lease on $NODE_ID"
     for _ in $(seq 1 120); do
-        if "$BIN/node-ctl" manifest-key list --socket "$WORK/cn.sock" >"$WORK/cluster-node-keys.out" 2>&1; then
-            if grep -q "^$MANIFEST_FP[[:space:]]" "$WORK/cluster-node-keys.out"; then
-                step "node manifest-key cache ready: $MANIFEST_FP"
+        if "$BIN/node-ctl" key-lease list --socket "$WORK/cn.sock" >"$WORK/cluster-node-keys.out" 2>&1; then
+            if grep -q "manifest=$MANIFEST_FP" "$WORK/cluster-node-keys.out"; then
+                step "node key lease ready: $MANIFEST_FP"
                 return 0
             fi
         fi
         sleep 0.5
     done
     cat "$WORK/cluster-node-keys.out" >&2 || true
-    fail "node manifest-key cache did not receive $MANIFEST_FP"
+    fail "node key lease did not receive $MANIFEST_FP"
 }
 
 run_cluster_flow() {
@@ -657,7 +668,7 @@ step "cluster real e2e case=$CLUSTER_REAL_CASE work=$WORK using BIN=$BIN"
 MANIFEST_KEY="$("$BIN/e2b-key-ctl" gen-key)"
 MANIFEST_FP="$("$BIN/e2b-key-ctl" fingerprint "$MANIFEST_KEY")"
 AUTH_KEY="$("$BIN/e2b-key-ctl" gen-key)"
-BUILD_API_KEY="$("$BIN/e2b-key-ctl" gen-apikey "$MANIFEST_KEY")"
+BUILD_API_KEY="$("$BIN/e2b-key-ctl" gen-apikey "$AUTH_KEY")"
 CLUSTER_API_KEY="$("$BIN/e2b-key-ctl" gen-apikey "$AUTH_KEY")"
 ENC_KEY="$("$BIN/e2b-key-ctl" gen-key)"
 GROUP="/e2e/cluster/real/$CLUSTER_REAL_CASE"

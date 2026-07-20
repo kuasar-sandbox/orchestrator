@@ -299,6 +299,15 @@ func loadDataCommandRows(reader pebble.Reader, prefix []byte, state *DataState, 
 		if found {
 			state.Fences[key] = fence
 		}
+		routeKey := routeMapKey(command.Compaction.Group, command.Compaction.RouteKey)
+		var route clusterstate.RouteWorkflowRecord
+		routeFound, err := getStateJSON(reader, stateRowKey(prefix, stateRouteTable, routeKey), &route)
+		if err != nil {
+			return err
+		}
+		if routeFound {
+			state.Routes[routeKey] = route
+		}
 	case DataBeginRecovery, DataFinalizeRecovery:
 		return loadAllRecoveryRows(reader, prefix, state)
 	case DataStageRecovery:
@@ -486,7 +495,14 @@ func persistDataCommandRow(batch *pebble.Batch, prefix []byte, state DataState, 
 		return setStateJSON(batch, stateRowKey(prefix, stateFenceTable, key), state.Fences[key])
 	case DataCompactFence:
 		key := fenceMapKey(command.Compaction.Group, command.Compaction.RouteKey, command.Compaction.SandboxID)
-		return batch.Delete(stateRowKey(prefix, stateFenceTable, key), nil)
+		if err := batch.Delete(stateRowKey(prefix, stateFenceTable, key), nil); err != nil {
+			return err
+		}
+		routeKey := routeMapKey(command.Compaction.Group, command.Compaction.RouteKey)
+		if route, found := state.Routes[routeKey]; found && route.Tombstone != nil && route.Tombstone.FenceCompacted {
+			return setStateJSON(batch, stateRowKey(prefix, stateRouteTable, routeKey), route)
+		}
+		return nil
 	case DataStageRecovery, DataAckRecovery, DataQuarantineRecovery:
 		return persistRecoveryRows(batch, prefix, state)
 	case DataActivateRecovery:
@@ -569,6 +585,13 @@ func (m *diskStateMachine) Lookup(query any) (any, error) {
 		return m.lookupData(snapshot, prefix, state, *value)
 	case DataStateLookup, *DataStateLookup:
 		return cloneDataStateForLookup(state), nil
+	case DataMutationLookup:
+		return m.lookupDataMutation(snapshot, prefix, state, value)
+	case *DataMutationLookup:
+		if value == nil {
+			return nil, errors.New("raftstore: nil data mutation lookup")
+		}
+		return m.lookupDataMutation(snapshot, prefix, state, *value)
 	default:
 		return nil, errors.New("raftstore: unsupported data-shard lookup")
 	}
@@ -594,9 +617,61 @@ func (m *diskStateMachine) lookupEmpty(query any) (any, error) {
 		return LookupData(state, *value)
 	case DataStateLookup, *DataStateLookup:
 		return state, nil
+	case DataMutationLookup:
+		return LookupDataMutation(state, value)
+	case *DataMutationLookup:
+		if value == nil {
+			return nil, errors.New("raftstore: nil data mutation lookup")
+		}
+		return LookupDataMutation(state, *value)
 	default:
 		return nil, errors.New("raftstore: unsupported data-shard lookup")
 	}
+}
+
+func (m *diskStateMachine) lookupDataMutation(
+	reader pebble.Reader,
+	prefix []byte,
+	state DataState,
+	query DataMutationLookup,
+) (DataMutationStatus, error) {
+	if err := query.Validate(); err != nil {
+		return DataMutationStatus{}, err
+	}
+	command := query.Command
+	switch command.Type {
+	case DataPutRoute:
+		key := routeMapKey(command.Route.Group, command.Route.RouteKey)
+		var record clusterstate.RouteWorkflowRecord
+		found, err := getStateJSON(reader, stateRowKey(prefix, stateRouteTable, key), &record)
+		if err != nil {
+			return DataMutationStatus{}, err
+		}
+		if found {
+			state.Routes[key] = record
+		}
+	case DataPutBuild:
+		key := buildMapKey(command.Build.Group, command.Build.BuildID)
+		var record clusterstate.BuildRecord
+		found, err := getStateJSON(reader, stateRowKey(prefix, stateBuildTable, key), &record)
+		if err != nil {
+			return DataMutationStatus{}, err
+		}
+		if found {
+			state.Builds[key] = record
+		}
+	case DataPutFence:
+		key := fenceMapKey(command.Fence.Group, command.Fence.RouteKey, command.Fence.SandboxID)
+		var fence clusterstate.ExecutionFence
+		found, err := getStateJSON(reader, stateRowKey(prefix, stateFenceTable, key), &fence)
+		if err != nil {
+			return DataMutationStatus{}, err
+		}
+		if found {
+			state.Fences[key] = fence
+		}
+	}
+	return LookupDataMutation(state, query)
 }
 
 func (m *diskStateMachine) lookupData(
@@ -1253,7 +1328,7 @@ func (m *diskStateMachine) validateSnapshotRecord(
 			return err
 		}
 		if change.Revision != binary.BigEndian.Uint64([]byte(mapKey)) ||
-			change.Revision <= dataState.RouteChangefeedFloor {
+			change.Revision <= dataState.RouteChangefeedFloor || change.Revision > lastApplied {
 			return errors.New("raftstore: Route change snapshot key differs from its revision")
 		}
 		return validateRouteChange(*dataState, change)

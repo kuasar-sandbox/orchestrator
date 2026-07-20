@@ -50,12 +50,20 @@ func TestDirectoryDispatcherNeverTreatsDirectoryAsNoSideEffectProof(t *testing.T
 		t.Fatal(err)
 	}
 	reply, err := dispatcher.AdmitAndDispatch(context.Background(), DispatchCommand{NodeID: "node-1", NodeEpoch: 7})
-	if err != nil || reply.Outcome != cluster.DispatchSessionMoved || rpc.calls != 0 {
+	if err != nil || reply.Outcome != cluster.DispatchDefinitiveReject || rpc.calls != 0 {
 		t.Fatalf("newer epoch dispatch = %+v, %v, calls=%d", reply, err, rpc.calls)
 	}
 	reply, err = dispatcher.AdmitAndDispatch(context.Background(), DispatchCommand{NodeID: "missing", NodeEpoch: 7})
 	if err != nil || reply.Outcome != cluster.DispatchSessionMoved || rpc.calls != 0 {
 		t.Fatalf("missing session dispatch = %+v, %v, calls=%d", reply, err, rpc.calls)
+	}
+	applyDirectoryUp(t, directory, "node-2", "registry-b", 8, 1)
+	directory.Apply(DirectoryDelta{Entry: DirectoryEntry{
+		NodeID: "node-2", Tuple: Tuple{NodeEpoch: 8, SessionSeq: 1}, HolderMemberID: "registry-b",
+	}, Up: false})
+	reply, err = dispatcher.AdmitAndDispatch(context.Background(), DispatchCommand{NodeID: "node-2", NodeEpoch: 7})
+	if err != nil || reply.Outcome != cluster.DispatchDefinitiveReject || rpc.calls != 0 {
+		t.Fatalf("down newer epoch dispatch = %+v, %v, calls=%d", reply, err, rpc.calls)
 	}
 }
 

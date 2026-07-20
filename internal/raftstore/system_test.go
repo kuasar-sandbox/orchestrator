@@ -136,7 +136,7 @@ func TestSystemGroupRejectsNonInitialRegistryLayoutBootstrap(t *testing.T) {
 	}
 }
 
-func TestRecoveryEpochClosesNormalServiceAndAdvancesSystemEpoch(t *testing.T) {
+func TestRecoveryEpochClosesNormalServiceOnThePreparedSystemEpoch(t *testing.T) {
 	registryLayout := testRegistryLayout(2, "generation-2")
 	registryLayout.Predecessor = &PredecessorProof{
 		RegistryGeneration: "generation-1", RegistryLayoutDigest: digestFor("source-registryLayout"),

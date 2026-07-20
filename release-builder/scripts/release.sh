@@ -188,6 +188,7 @@ package_component "orchestrator" "orchestrator-$VERSION-linux-$ARCH.tar.gz" \
     "orchestrator/docs/cluster.md:cluster.md" \
     "orchestrator/docs/cluster-router.md:cluster-router.md" \
     "orchestrator/docs/cluster-placer.md:cluster-placer.md" \
+    "orchestrator/docs/adr/0001-dragonboat-pebble-multiraft.md:adr/0001-dragonboat-pebble-multiraft.md" \
     "orchestrator/release-builder/README.md:release-builder.md" \
     "orchestrator/release-builder/docs/kuasar-sandbox.md:kuasar-sandbox.md" \
     "orchestrator/release-builder/docs/deployment.md:deployment.md" \
@@ -236,6 +237,7 @@ package_component "orchestrator" "orchestrator-$VERSION-linux-$ARCH.tar.gz" \
     "orchestrator/deploy/registry.example.yaml" \
     "orchestrator/deploy/router.example.yaml" \
     "orchestrator/deploy/placer.example.yaml" \
+    "orchestrator/deploy/dragonboat-soft-settings.json" \
     "orchestrator/deploy/cluster-registry.service" \
     "orchestrator/deploy/cluster-router.service" \
     "orchestrator/deploy/cluster-placer.service"

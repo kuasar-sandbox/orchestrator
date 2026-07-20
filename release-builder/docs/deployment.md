@@ -133,8 +133,8 @@ per-沙箱 `MANIFEST_KEY` env;经 `run-sandbox`(单元)以 flag 传入 sandbox-c
 
 - **per-sandbox 密钥**:每沙箱用各自租户的客户密钥;node-ctl 经**共享**
   `MANIFEST_CONFIG`(`manifest.key` 留空)+ per-沙箱 `MANIFEST_KEY` env 注入(e2b 路径下
-  `MANIFEST_KEY` 为该租户 manifest 根密钥——node-ctl 从加密存储解出;**api_key 由它
-  派生**,见 `orchestrator/docs/node.md` §7)。外部管理面若选择直接对接单机
+  `MANIFEST_KEY` 为该租户 Content Manifest 根密钥——node-ctl 从加密 key lease 解出;
+  API key 只由独立 AuthKey 派生,见 `orchestrator/docs/node.md` §7)。外部管理面若选择直接对接单机
   `node-ctl`,也必须按同一 per-sandbox 生命周期落地 manifest 配置
 - **共享格式**:`manifest-ctl` 与 `sandbox-ctl` 用**同一**配置格式;两者都
   **只**连本机 store-ctl(`127.0.0.1:7100`)+ 本机 cache-ctl(`127.0.0.1:7070`),
@@ -250,9 +250,9 @@ node-ctl 解析,见 node.md §12。构建池上限由 `sandbox-builder.slice` �
 ## 6. Cluster Control Plane (cluster-ctl)
 
 大规模(多 compute 节点)部署时,机群之上由 **cluster-ctl** 三角色控制面聚合:**registry**
-(shardkv 状态集群 + 节点通道枢纽)、**router**(e2b 兼容统一入口:控制面 + 数据面,
-按 sandbox-group + route-key 会话亲和路由)、**placer**(group provider/importer、WATCH_LIST 消费方与
-放置调度器)。详见 `orchestrator/docs/cluster.md`。单 compute 节点独立部署(直供 e2b SDK)
+(Dragonboat/Pebble Multi-Raft Route/Build registration + Session Holder)、**router**(e2b 兼容统一入口,
+按 group + route-key 路由)、**placer**(Provider/Policy、RandomN 候选)。详见
+`orchestrator/docs/cluster.md`。单 compute 节点独立部署(直供 e2b SDK)
 时**不需要** cluster 层。
 
 ```text
@@ -264,7 +264,7 @@ cluster-ctl router
     ▼
 cluster-ctl registry  ◄──── node_link ────► node-ctl conductor serve × N
     ▲
-    │ placer_link Place / verify-key
+    │ PlaceSandboxN / PlaceBuildN + key-lease resolution
     ▼
 cluster-ctl placer
 ```
@@ -273,9 +273,9 @@ cluster-ctl placer
 
 | 进程 | 角色 | 数量 | 启停 | 归属 |
 |---|---|---|---|---|
-| `cluster-ctl registry` | registry 自聚簇成员;复制 `route_link` / `node_link` / `node_list` / `placer_link` 执行态,承载 node 长连接和 route/node owner RPC | 1 或 N 副本;每个 group/node 由 LocateN 选 owner set | systemd | 平台内,`cluster.md` |
+| `cluster-ctl registry` | System Group + fixed Data Raft shards;Route workflow/Build binding 共识、Session Holder、Probe/P2C 协调 | 生产至少 3 成员,每 shard 精确 3 副本 | systemd | 平台内,`cluster.md` |
 | `cluster-ctl router` | e2b 兼容统一入口(`api.<domain>` 控制面 + 数据面),持活动连接 cache 和近期路由 cache,miss 时经 Reserve 路由 / 拉起沙箱 | N 副本(LB 后,无状态)| systemd | 平台内,`cluster-router.md` |
-| `cluster-ctl placer` | group provider/importer、WATCH_LIST 消费方与放置调度器;向 registry 提供 PlaceSandbox / PlaceBuild / verify-key | N 副本;按 placer memberlist ready 视图和 group 确定性 failover | systemd | 平台内,`cluster-placer.md` |
+| `cluster-ctl placer` | group Provider/Policy、request normalization、key lease resolution、RandomN 候选 | N 副本,由 Registry 显式 mTLS endpoint 调用 | systemd | 平台内,`cluster-placer.md` |
 
 小规模可三角色同机共置;大规模按 registry 成员表、router 入口副本和 placer 副本分别扩展。
 
@@ -479,7 +479,7 @@ Cluster Control Plane:  registry 自聚簇(N 副本,按 group/node 逻辑分片)
 | `cache-ctl tiered` | `--config <path>` | `listen: 127.0.0.1:7070`(节点本机);`tiers[].cluster.peers` 写本 AZ L2 全集群 | 源仓 `accelerator/docs/cache.md` §3.4;发布包 `docs/cache.md` |
 | `cache-ctl shard` | `--config <path>` | `listen: 0.0.0.0:7070`(对外服务)| 源仓 `accelerator/docs/cache.md` §3.3;发布包 `docs/cache.md` |
 | `node-ctl conductor serve(resource_listen)` | `/etc/node-ctl/conductor.yaml` 的内联 `resource_listen` 块 | `socket: /run/sandbox-resource.sock` | 源仓 `orchestrator/docs/node-resource.md` §3;发布包 `docs/node-resource.md` |
-| `cluster-ctl registry` | `--config /etc/cluster-ctl/registry.yaml` | `member.id/listen`;`membership.active/versions[].members[].advertise/node_advertise/owners`;`node_link`、`route_link`、`node_list`、`placer_link` | 源仓 `orchestrator/docs/cluster.md`;发布包 `docs/cluster.md` |
+| `cluster-ctl registry` | `--config /etc/cluster-ctl/registry.yaml` | 配置与 `dragonboat-soft-settings.json` 同置 `/etc/cluster-ctl`，进程工作目录也必须是该目录；使用发布包 `cluster-registry.service` | 源仓 `orchestrator/docs/cluster.md`;发布包 `docs/cluster.md` |
 | `cluster-ctl router` | `--config /etc/cluster-ctl/router.yaml` | `registry.bootstrap` 指向 registry 控制面;router `:443`(LB 后 N 副本);请求必须带 `X-Kuasar-Sandbox-Group` | 源仓 `orchestrator/docs/cluster-router.md`;发布包 `docs/cluster-router.md` |
 | `cluster-ctl placer` | `--config /etc/cluster-ctl/placer.yaml` | `placer.id/listen/advertise/memberlist_label`;`registry.bootstrap`;`import_groups[]`;`placement` | 源仓 `orchestrator/docs/cluster-placer.md`;发布包 `docs/cluster-placer.md` |
 | `sandbox-ctl run` | `--config <path>`(`SANDBOX_CONFIG`)+ `--manifest-config <path>`(`MANIFEST_CONFIG`)| **per-sandbox**,由 `node-ctl` 生成,落在 `/run/sandbox/<sid>/` | 源仓 `sandboxer/docs/sandbox.md` §3;发布包 `docs/sandbox.md` |

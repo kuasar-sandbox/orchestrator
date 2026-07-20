@@ -25,6 +25,49 @@ type FenceOutboxAckEvidence struct {
 	ProofDigest    string `json:"proof_digest"`
 }
 
+type FenceOutboxAckRequest struct {
+	Group                string
+	RouteKey             string
+	SandboxID            string
+	NodeID               string
+	NodeEpoch            uint64
+	RegistryGeneration   string
+	BindingDigest        string
+	FinalOutboxWatermark uint64
+}
+
+type FenceOutboxAckVerifier interface {
+	VerifyFenceOutboxAck(context.Context, FenceOutboxAckRequest) (FenceOutboxAckEvidence, error)
+}
+
+type FenceOutboxAckVerifierFunc func(context.Context, FenceOutboxAckRequest) (FenceOutboxAckEvidence, error)
+
+func (f FenceOutboxAckVerifierFunc) VerifyFenceOutboxAck(
+	ctx context.Context,
+	request FenceOutboxAckRequest,
+) (FenceOutboxAckEvidence, error) {
+	return f(ctx, request)
+}
+
+func (r *Runtime) SetOutboxAckVerifier(verifier FenceOutboxAckVerifier) error {
+	if r == nil || verifier == nil {
+		return errors.New("raftstore: trusted final outbox ACK verifier is required")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.outboxAckVerifier != nil {
+		return errors.New("raftstore: trusted final outbox ACK verifier is already configured")
+	}
+	r.outboxAckVerifier = verifier
+	return nil
+}
+
+func (r *Runtime) trustedOutboxAckVerifier() FenceOutboxAckVerifier {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.outboxAckVerifier
+}
+
 func (e FenceOutboxAckEvidence) validates(fence clusterstate.ExecutionFence) bool {
 	return fence.FinalOutboxWatermark >= fence.LastEventSeq &&
 		e.AckedWatermark == fence.FinalOutboxWatermark &&
@@ -40,7 +83,6 @@ func (r *Runtime) CompactExecutionFence(
 	group string,
 	routeKey string,
 	sandboxID string,
-	outboxAck FenceOutboxAckEvidence,
 ) error {
 	if err := identity.Validate(); err != nil {
 		return err
@@ -68,9 +110,6 @@ func (r *Runtime) CompactExecutionFence(
 	if fence == nil {
 		return errors.New("raftstore: execution fence is missing")
 	}
-	if err := r.requireFenceDetached(ctx, identity, *fence); err != nil {
-		return err
-	}
 	placementFailure := fence.PlacementFailure != nil
 	proofPermanentlyFenced := fence.Proof.Kind == clusterstate.ProofNewerNodeEpoch ||
 		fence.Proof.Kind == clusterstate.ProofExternalFence
@@ -78,8 +117,23 @@ func (r *Runtime) CompactExecutionFence(
 	if err != nil {
 		return err
 	}
-	if !placementFailure && !proofPermanentlyFenced && !outboxAck.validates(*fence) && nodeEpochFence == nil {
-		return errors.New("raftstore: execution fence lacks a durable final outbox ACK or newer NodeEpoch proof")
+	var outboxAck FenceOutboxAckEvidence
+	if !placementFailure && !proofPermanentlyFenced && nodeEpochFence == nil {
+		verifier := r.trustedOutboxAckVerifier()
+		if verifier == nil {
+			return errors.New("raftstore: trusted final outbox ACK verifier is unavailable")
+		}
+		outboxAck, err = verifier.VerifyFenceOutboxAck(ctx, FenceOutboxAckRequest{
+			Group: fence.Group, RouteKey: fence.RouteKey, SandboxID: fence.SandboxID,
+			NodeID: fence.NodeID, NodeEpoch: fence.NodeEpoch, RegistryGeneration: fence.RegistryGeneration,
+			BindingDigest: fence.BindingDigest, FinalOutboxWatermark: fence.FinalOutboxWatermark,
+		})
+		if err != nil {
+			return err
+		}
+		if !outboxAck.validates(*fence) {
+			return errors.New("raftstore: trusted verifier did not prove the exact final outbox ACK")
+		}
 	}
 
 	wait := time.Duration(r.config.Tuning.FenceRetentionMillis) * time.Millisecond
@@ -118,9 +172,6 @@ func (r *Runtime) CompactExecutionFence(
 	}
 	if !reflect.DeepEqual(*currentFence, *fence) {
 		return errors.New("raftstore: execution fence changed during retention")
-	}
-	if err := r.requireFenceDetached(ctx, identity, *currentFence); err != nil {
-		return err
 	}
 	proofs, err := r.proveFenceAppliedEverywhere(ctx, identity, *fence)
 	if err != nil {
@@ -172,26 +223,6 @@ func (r *Runtime) CompactExecutionFence(
 		return readErr
 	}
 	return errors.New("raftstore: compacted execution fence remains visible")
-}
-
-func (r *Runtime) requireFenceDetached(
-	ctx context.Context,
-	identity ShardRequestIdentity,
-	fence clusterstate.ExecutionFence,
-) error {
-	result, err := r.ReadData(ctx, DataLookup{Workflow: &WorkflowLookup{
-		Identity: identity, Group: fence.Group, RouteKey: fence.RouteKey,
-	}})
-	if err != nil {
-		return err
-	}
-	if result.Workflow == nil || !result.Workflow.Available {
-		return errors.New("raftstore: execution-fence Route lookup is unavailable")
-	}
-	if result.Workflow.Route != nil && fenceMatchesRouteTombstone(fence, *result.Workflow.Route) {
-		return errors.New("raftstore: current Route still depends on the execution fence")
-	}
-	return nil
 }
 
 func (r *Runtime) requireStableActiveRegistryLayout(

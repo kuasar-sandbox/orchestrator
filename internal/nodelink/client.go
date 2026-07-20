@@ -382,6 +382,9 @@ func commandMatchesSession(cmd *routesync.Command, identity routesync.NodeRegist
 	if cmd == nil {
 		return false
 	}
+	if identity.NodeEpoch == 0 && identity.SessionSeq == 0 {
+		return cmd.NodeEpoch == 0 && cmd.SessionSeq == 0
+	}
 	return cmd.NodeEpoch != 0 && cmd.SessionSeq != 0 &&
 		cmd.NodeEpoch == identity.NodeEpoch && cmd.SessionSeq == identity.SessionSeq
 }

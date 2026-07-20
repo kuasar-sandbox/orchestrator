@@ -34,6 +34,9 @@ func runRegistry(args []string, log *slog.Logger) error {
 	if flags.NArg() != 0 {
 		return fmt.Errorf("registry: unexpected arguments: %s", strings.Join(flags.Args(), " "))
 	}
+	if err := validateDragonboatSoftSettings(*configPath); err != nil {
+		return fmt.Errorf("registry: Dragonboat runtime profile: %w", err)
+	}
 	config, err := clustercfg.LoadConsensusRegistry(*configPath)
 	if err != nil {
 		return err
@@ -172,6 +175,9 @@ func runRegistry(args []string, log *slog.Logger) error {
 	serviceConfig.BuildLaunchBurst = config.Workflow.BuildLaunchBurst
 	service, err := controlplane.NewRegistryService(store, planner, prober, dispatcher, mesh, serviceConfig)
 	if err != nil {
+		return err
+	}
+	if err := runtime.SetOutboxAckVerifier(service); err != nil {
 		return err
 	}
 	operator, err := controlplane.NewOperatorService(store, holder)

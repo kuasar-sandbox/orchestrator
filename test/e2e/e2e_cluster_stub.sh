@@ -33,6 +33,7 @@ if [ "$(stat -f -c %T /dev/shm)" != "tmpfs" ]; then
 fi
 
 WORK="$(mktemp -d /dev/shm/kuasar-e2e.XXXXXX)"
+cp "$ROOT/deploy/dragonboat-soft-settings.json" "$WORK/dragonboat-soft-settings.json"
 ADMIN=""
 PIDS=()
 REGISTRY_PIDS=()
@@ -303,7 +304,10 @@ wait_https "https://127.0.0.1:$PLACER_PORT/health" placer
 step "starting three-replica System Group and $VIRTUAL_SHARDS data shards"
 for index in 0 1 2; do
     member=$((index + 1))
-    "$CLUSTER_CTL" registry --config "$WORK/registry-$member.yaml" >"$WORK/registry-$member.log" 2>&1 &
+    (
+        cd "$WORK"
+        exec "$CLUSTER_CTL" registry --config "$WORK/registry-$member.yaml"
+    ) >"$WORK/registry-$member.log" 2>&1 &
     pid="$!"
     PIDS+=("$pid")
     REGISTRY_PIDS[$index]="$pid"
@@ -340,7 +344,7 @@ post_operator() {
 }
 
 step "activating the empty Registry History Generation"
-post_operator /internal/operator/generation/activate "$WORK/generation.json" "$WORK/activate.body"
+post_operator /internal/operator/registry-generation/activate "$WORK/generation.json" "$WORK/activate.body"
 
 for index in $(seq 1 "$NODES"); do
     python3 - "$WORK/generation.json" "$WORK/enroll-$index.json" "$index" "$DATA_PORT" <<'PY'
@@ -402,9 +406,10 @@ for _ in $(seq 1 300); do
 done
 
 request_data() {
-    local route_key="$1" output="$2" code
-    for _ in $(seq 1 300); do
-        code="$(curl -sS --noproxy '*' --max-time 5 -o "$output" -w '%{http_code}' \
+    local route_key="$1" output="$2" code deadline
+    deadline=$((SECONDS + 90))
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        code="$(curl -sS --noproxy '*' --max-time 15 -o "$output" -w '%{http_code}' \
             -H "Host: data.$DOMAIN" \
             -H "X-Kuasar-Sandbox-Group: $GROUP" \
             -H "X-Kuasar-Route-Key: $route_key" \
@@ -505,6 +510,7 @@ PY
 )
 BUILD_DISPATCHES="$(command_count build_admit_dispatch)"
 [ "$BUILD_DISPATCHES" -ge 1 ] || fail "Build Admission command was not observed"
+[ "$(command_count key_put)" -ge 2 ] || fail "exact dual-key leases were not installed before dispatch"
 BUILD_TRIGGER='{"fromImage":"registry.stub/base:latest"}'
 for attempt in first retry; do
     trigger_code="$(curl -sS --noproxy '*' --max-time 5 -o "$WORK/build-trigger-$attempt.body" -w '%{http_code}' \
@@ -540,7 +546,7 @@ done
 
 python3 - "$ADMIN" <<'PY' || fail "removed node-link command kinds were emitted"
 import json, sys, urllib.request
-forbidden = {"create", "connect", "delete", "key_put", "key_drop", "build_register"}
+forbidden = {"create", "connect", "delete", "build_register"}
 commands = json.load(urllib.request.urlopen(sys.argv[1] + "/v1/commands", timeout=2))
 bad = [command for command in commands if command.get("kind") in forbidden]
 assert not bad, bad
@@ -609,7 +615,7 @@ close_code=""
 for _ in $(seq 1 100); do
     close_code="$(operator_curl --max-time 5 -o "$WORK/close-generation.body" -w '%{http_code}' \
         -H 'Content-Type: application/json' --data-binary @"$WORK/close-generation.json" \
-        "$REGISTRY_BASE/internal/operator/generation/close" 2>/dev/null || true)"
+        "$REGISTRY_BASE/internal/operator/registry-generation/close" 2>/dev/null || true)"
     [ "$close_code" = 200 ] && break
     sleep 0.1
 done
@@ -746,7 +752,10 @@ step "bootstrapping the empty three-replica generation-e2e-2"
 REGISTRY_PIDS=()
 for index in 0 1 2; do
     member=$((index + 1))
-    "$CLUSTER_CTL" registry --config "$WORK/registry-v2-$member.yaml" >"$WORK/registry-v2-$member.log" 2>&1 &
+    (
+        cd "$WORK"
+        exec "$CLUSTER_CTL" registry --config "$WORK/registry-v2-$member.yaml"
+    ) >"$WORK/registry-v2-$member.log" 2>&1 &
     pid="$!"
     PIDS+=("$pid")
     REGISTRY_PIDS[$index]="$pid"
@@ -820,7 +829,7 @@ json.dump(request, open(sys.argv[2], "w"))
 PY
 drain_code="$(operator_curl --max-time 15 -o "$WORK/confirm-drain.body" -w '%{http_code}' \
     -H 'Content-Type: application/json' --data-binary @"$WORK/confirm-drain.json" \
-    "$REGISTRY_BASE/internal/operator/generation/confirm-predecessor-drain" 2>/dev/null || true)"
+    "$REGISTRY_BASE/internal/operator/registry-generation/confirm-predecessor-drain" 2>/dev/null || true)"
 [ "$drain_code" = 204 ] || fail "predecessor Permit drain returned ${drain_code:-000}"
 
 step "running #34 node-authoritative recovery and digest-CAS rebind"
@@ -847,8 +856,10 @@ done
 REGISTRY_PIDS=()
 for index in 0 1 2; do
     member=$((index + 1))
-    "$CLUSTER_CTL" registry --config "$WORK/registry-v2-restart-$member.yaml" \
-        >"$WORK/registry-v2-restart-$member.log" 2>&1 &
+    (
+        cd "$WORK"
+        exec "$CLUSTER_CTL" registry --config "$WORK/registry-v2-restart-$member.yaml"
+    ) >"$WORK/registry-v2-restart-$member.log" 2>&1 &
     pid="$!"
     PIDS+=("$pid")
     REGISTRY_PIDS[$index]="$pid"
@@ -906,7 +917,7 @@ json.dump({
 }, open(sys.argv[2], "w"))
 PY
 step "atomically activating generation-e2e-2 after recovery completion"
-post_operator /internal/operator/generation/activate "$WORK/activate-v2.json" "$WORK/activate-v2.body"
+post_operator /internal/operator/registry-generation/activate "$WORK/activate-v2.json" "$WORK/activate-v2.body"
 
 "$CLUSTER_CTL" router --config "$WORK/router-v2.yaml" >"$WORK/router-v2.log" 2>&1 &
 ROUTER_V2_PID="$!"

@@ -7,7 +7,7 @@ import (
 )
 
 func TestMmdsSecretDeterministicAndIsolated(t *testing.T) {
-	// Two uniformly-random 32-byte manifest keys (hex), as produced by SHA256(api_key).
+	// Two uniformly-random 32-byte ManifestKeys (hex).
 	mkA := hex.EncodeToString(bytes.Repeat([]byte{0xa1}, 32))
 	mkB := hex.EncodeToString(bytes.Repeat([]byte{0xb2}, 32))
 

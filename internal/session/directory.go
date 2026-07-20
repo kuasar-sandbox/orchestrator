@@ -128,6 +128,16 @@ func (d *Directory) Lookup(nodeID string) (DirectoryEntry, bool) {
 	return record.Entry, found && record.Available && !record.Conflict
 }
 
+// LookupRecord returns the retained tuple high-watermark even when its Holder
+// is unavailable. Dispatch uses it to distinguish movement from a permanently
+// fenced older NodeEpoch.
+func (d *Directory) LookupRecord(nodeID string) (DirectoryRecord, bool) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	record, found := d.records[nodeID]
+	return record, found
+}
+
 func (d *Directory) Snapshot() []DirectoryRecord {
 	d.mu.RLock()
 	defer d.mu.RUnlock()

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 )
@@ -34,6 +35,11 @@ func RewriteSandboxCreateEnvelope(
 ) (clusterstate.NodeRequestEnvelopeV1, error) {
 	fields, err := clusterstate.DecodeJSONObject(envelope.Body)
 	if err != nil {
+		return clusterstate.NodeRequestEnvelopeV1{}, err
+	}
+	if err := validateEnvelopeFieldSpellings(fields,
+		[]string{"templateID"}, []string{"timeout"}, []string{"metadata"},
+	); err != nil {
 		return clusterstate.NodeRequestEnvelopeV1{}, err
 	}
 	metadata = clusterstate.WithoutSystemMetadata(metadata)
@@ -105,6 +111,12 @@ func RewriteBuildRegisterEnvelope(
 	if err != nil {
 		return clusterstate.NodeRequestEnvelopeV1{}, err
 	}
+	if err := validateEnvelopeFieldSpellings(fields,
+		[]string{"name"}, []string{"tags"}, []string{"profile"},
+		[]string{"cpuCount", "cpu_count"}, []string{"memoryMB", "memory_mb"}, []string{"metadata"},
+	); err != nil {
+		return clusterstate.NodeRequestEnvelopeV1{}, err
+	}
 	delete(fields, "cpu_count")
 	delete(fields, "memory_mb")
 	values := []struct {
@@ -136,5 +148,22 @@ func setEnvelopeField(fields map[string]json.RawMessage, name string, value any)
 		return fmt.Errorf("api: encode request field %q: %w", name, err)
 	}
 	fields[name] = encoded
+	return nil
+}
+
+func validateEnvelopeFieldSpellings(fields map[string]json.RawMessage, groups ...[]string) error {
+	for name := range fields {
+		for _, group := range groups {
+			matched := false
+			exact := false
+			for _, allowed := range group {
+				matched = matched || strings.EqualFold(name, allowed)
+				exact = exact || name == allowed
+			}
+			if matched && !exact {
+				return fmt.Errorf("api: request field %q uses a non-canonical spelling", name)
+			}
+		}
+	}
 	return nil
 }

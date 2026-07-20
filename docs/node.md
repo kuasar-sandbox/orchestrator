@@ -15,8 +15,9 @@ node-ctl 既可**独立运行**(直供 e2b SDK / CLI,单机即可用),也可经 
 
 沙箱本体由 `sandbox-ctl` 运行(microVM,cloud-hypervisor);e2b profile 的 guest 内
 跑原版 envd(由单一 `sandbox-runtime.erofs` 内置,§11),serve 经 UDS
-反代其单端口协议(49983/Connect-RPC)。密钥模型以租户 **manifest_key** 为根:api_key
-由它派生(MAC 令牌),库内只存 AES-GCM 密文,密钥永不落明文盘(§7)。
+反代其单端口协议(49983/Connect-RPC)。节点密钥模型分为两个独立域:**AuthKey** 是 API
+鉴权根,**ManifestKey** 是 Content Manifest/快照加密根。两者以同一条 key lease
+绑定 group 并加密落盘,ManifestKey 永不被接受为 API 鉴权根(§7)。
 
 产物两个二进制:**`node-ctl`**(daemon + 启动器 + 资源控制器 + 管理 CLI,§2)与
 **`e2b-key-ctl`**(纯派生凭据工具,无 DB/config/编排状态,§2.8)。
@@ -146,7 +147,7 @@ registry(§10、§4.6)。
 | `run-sandbox` / `run-builder` | systemd 单元内启动器,非给人用(§2.4、§6) |
 | `resource` | `status`/`list`/`drain`/`grant`/`reclaim`:资源控制器只读巡检与运维(node-resource.md §2) |
 | `config` | 配置规范化/校验,或输出带注释骨架 |
-| `manifest-key` | `add`/`remove`/`check`/`list`:create/build 白名单管理(§7;集群下另由 registry 租约写入,§10) |
+| `key-lease` | `put`/`drop`/`check`/`list`:完整 AuthKey/ManifestKey 租约管理(§7;集群下由 Registry 预下发,§10) |
 | `export-sandbox` / `import-sandbox` | 暂停沙箱转模板 / 跨机迁移(§8.1) |
 | `version` | 版本 |
 
@@ -154,27 +155,29 @@ registry(§10、§4.6)。
 
 | 子命令 | 用途 |
 |---|---|
-| `gen-key` | 生成随机 32B manifest key(64-hex) |
-| `gen-apikey [<MANIFEST_KEY>]` | 从 manifest key 派生 e2b api key(`e2b_` + hex,§7) |
-| `fingerprint [<MANIFEST_KEY>]` | 打印 24-hex 指纹(与白名单/库内索引一致) |
+| `gen-key` | 生成随机 32B key(64-hex) |
+| `gen-apikey [<AUTH_KEY>]` | 从 AuthKey 派生 e2b api key(`e2b_` + hex,§7) |
+| `fingerprint [<KEY>]` | 打印 24-hex 指纹 |
 | `seal-pull-token [<MANIFEST_KEY>] …` | 封装不透明镜像拉取令牌(`kpt_`,§12) |
 | `version` | 版本 |
 
 接住一个新节点(独立模式)的典型顺序:
 
 ```bash
-# 1) 生成租户根密钥,登记白名单,派生 SDK 用的 api key
-MK=$(e2b-key-ctl gen-key)
-node-ctl manifest-key add "$MK" --label tenant-a
-export E2B_API_KEY=$(e2b-key-ctl gen-apikey "$MK")
+# 1) 生成独立的鉴权/内容密钥,安装完整 lease,派生 SDK API key
+AUTH_KEY=$(e2b-key-ctl gen-key)
+MANIFEST_KEY=$(e2b-key-ctl gen-key)
+node-ctl key-lease put --group /tenant-a --auth-key "$AUTH_KEY" \
+  --manifest-key "$MANIFEST_KEY" --label tenant-a
+export E2B_API_KEY=$(e2b-key-ctl gen-apikey "$AUTH_KEY")
 
 # 2) e2b SDK/CLI 直接指向本机
 export E2B_DOMAIN=sandboxes.example.com        # 生产(TLS, §13)
 # dev: E2B_API_URL=http://host:3000  E2B_SANDBOX_URL=http://host:3000
 ```
 
-集群模式下密钥由 registry 经 node-link 租约下发(§10、cluster.md),无须手动
-`manifest-key add`。
+集群模式下完整 lease 由 Registry 经 node-link 在 Admission 前下发,无须手动
+`key-lease put`。
 
 ### 2.2 `node-ctl conductor serve`
 
@@ -249,26 +252,28 @@ node-ctl config <serve|proxy> --config <file> --resolve   # 再展开 auto/派�
 (node-proxy.md §2)。`--resolve` 对 `serve` 额外展开 `resource_listen` 的 `auto` 内存/CPU
 (并深校验水位),其余角色与 `--config` 等价。骨架与 `deploy/{serve,proxy}.example.yaml` 对应。
 
-### 2.6 `node-ctl manifest-key`
+### 2.6 `node-ctl key-lease`
 
-create/build 白名单(`manifest_keys` 表)管理,是 serve daemon **admin 平面**的瘦
-客户端(经本机控制 socket,§6)——daemon 是该表唯一写者,CLI 不开 DB、不读 config,
-只需 `--socket`(或 `NODE_CTL_SOCKET` env,默认 `/run/sandbox/node-ctl.socket`)。
-key 取自位置参数或 `MANIFEST_KEY` env;输出只含指纹,绝不回显 key。集群下该表另由
-registry 经 node-link 以租约项写入(§10、cluster.md),与手动项共存。
+`key_leases` 表管理完整的 `(group, AuthKey, ManifestKey)` 租约,是 serve daemon
+**admin 平面**的瘦客户端(经本机控制 socket,§6)。daemon 是加密密钥材料的
+唯一写者;CLI 不开 DB、不读 config,只需 `--socket`(或 `NODE_CTL_SOCKET` env,
+默认 `/run/sandbox/node-ctl.socket`)。除 `list` 外,三个身份字段必须同时提供;输出只含两个
+指纹,绝不回显 key。
 
 ```
-node-ctl manifest-key add    [--label L] [--ttl 24h]
-                             [--registry-auth <docker.json> |
-                              --registry-username U --registry-password P |
-                              --registry-token T]      [--socket S] <KEY>…
-node-ctl manifest-key remove [--socket S] <KEY>…
-node-ctl manifest-key check  [--socket S] <KEY>…
-node-ctl manifest-key list   [--socket S]
+node-ctl key-lease put --group G --auth-key AK --manifest-key MK
+                       [--label L] [--ttl 24h]
+                       [--registry-auth <docker.json> |
+                        --registry-username U --registry-password P |
+                        --registry-token T] [--socket S]
+node-ctl key-lease drop  --group G --auth-key AK --manifest-key MK [--socket S]
+node-ctl key-lease check --group G --auth-key AK --manifest-key MK [--socket S]
+node-ctl key-lease list  [--socket S]
 ```
 
-- `--ttl`:失效时长(`0`/缺省 = 永不);**重复 add 刷新失效时间**。过期 key 视同不在
-  白名单,由 reaper 惰性清理;`list` 显示 `expires`。
+- `--ttl`:失效时长(`0`/缺省 = 显式本地永不);**重复 put 刷新失效时间**。过期 lease
+  在查询前即视为不存在,并由 reaper 清理;`list` 显示 `expires`。集群 `key_put`
+  使用有界 TTL 并在需要时重发,`key_drop` 只是提前清理提示。
 - `--registry-auth`/`--registry-*`:租户默认镜像拉取凭据,加密存白名单行
   (`registry_auth_enc`),构建拉取时按 fromImage 的 host 匹配取用(§12)。
 - 鉴权:`SO_PEERCRED`——配置了 `paths.admin_pidfile` 则 peer pid 须在其中;未配则仅靠
@@ -330,7 +335,7 @@ node-ctl 同目录 → PATH"自动发现。
 | `paths.run_root` | `/run/sandbox` | tmpfs 运行态:`<sid>/` 运行目录、UDS、pidfile |
 | `paths.base_root` | `/var/lib/sandbox` | 持久态根 |
 | `paths.db_path` | `<base_root>/node-ctl.db` | sqlite 路径(§15) |
-| `paths.config_socket` | `/run/sandbox/node-ctl.socket` | 本机控制 socket(run assignment/result + task/admin/plugin/api,§6);manifest-key/export/import CLI 与 external proxy / 平台 agent 的连接点 |
+| `paths.config_socket` | `/run/sandbox/node-ctl.socket` | 本机控制 socket(run assignment/result + task/admin/plugin/api,§6);key-lease/export/import CLI 与 external proxy / 平台 agent 的连接点 |
 | `paths.admin_pidfile` | 空 | admin 平面的多行 PID 白名单(`#` 注释);未配则仅靠 socket 0600 |
 | `paths.plugin_pidfile` | 空 | plugin 平面(proxy/agent 注册)的多行 PID 白名单;未配则仅靠 socket 0600 |
 | `units.dir` | `/etc/systemd/system` | 模板单元安装目录 |
@@ -381,12 +386,12 @@ proxy 组件)。`proxy.proxy_netns` 仅在 internal 模式有效;external 模式
 ## 4. e2b API 契约
 
 基址 `https://api.<domain>`;鉴权 **`X-API-KEY`**(SDK)或 **`Authorization: Bearer`**
-(e2b CLI 构建面,两者同样解析)。api_key 由 manifest_key 派生(`e2b-key-ctl
-gen-apikey`),serve 经 MAC 校验解析出租户——无静态 api_keys 表(§7)。
+(e2b CLI 构建面,两者同样解析)。api_key 只由 AuthKey 派生(`e2b-key-ctl
+gen-apikey`),serve 经 MAC 校验解析归属——无静态 api_keys 表(§7)。
 
-**归属校验**:按 id 的控制操作用 api_key 的 MAC 对该资源行的(解密)manifest_key
-校验,不符回 **404**(不泄露他租户存在性);create / build / import 另需 manifest_key
-在白名单,否则 **403**。
+**归属校验**:按 id 的控制操作用 api_key 的 MAC 对该资源行的已解密 AuthKey
+校验,不符回 **404**(不泄露他租户存在性);create / build / import 另需完整、
+未过期且指纹精确匹配的 key lease,否则 **403**。
 
 ### 4.1 控制面:沙箱生命周期
 
@@ -651,11 +656,12 @@ serve 在 UDS `paths.config_socket`(默认 `/run/sandbox/node-ctl.socket`,**0600
 - 设计意图:**非密配置走文件**(`<sid>.yaml`;构建的阶段 yaml 由 run-builder 写进
   workdir)、**密钥走 spec env**——秘密只在内存与 env 中,不落盘。
 
-**② admin 平面** — `/internal/admin/manifest-keys`(`GET` = list,`POST
-{op: add|remove|check, key, label, ttl_seconds, registry_auth}`):manifest-key 白名单
-管理(§7)。鉴权:配 `paths.admin_pidfile` 则 peer pid 须在其中;未配则仅靠 socket
-0600。`node-ctl manifest-key` 即此平面客户端;集群下 node-link 心跳维系收到的 `key_put` 写 / 重发续租
-租约项;未续租 key 按 TTL 淘汰,`key_drop` 只作为 best-effort 清理命令(§10)。
+**② admin 平面** — `/internal/admin/key-leases`(`GET` = list,`POST
+{op: put|drop|check, group, auth_key, manifest_key, label, ttl_seconds, registry_auth}`):
+完整双密钥 lease 管理(§7)。鉴权:配 `paths.admin_pidfile` 则 peer pid 须在其中;未配则
+仅靠 socket 0600。`node-ctl key-lease` 即此平面客户端;集群下 node-link 的
+`key_put` 在 Admission 前持久化完整 lease 并回 ACK,到期项按 TTL 淘汰,`key_drop` 只作为
+best-effort 提前清理命令(§10)。
 
 **③ plugin 平面** — `PUT /internal/plugin/{id}/register`:一个订阅者(external proxy
 master,或路由观察者如平台 agent)注册其能力并**持挂该 h2c 连接**——连接本身即它的
@@ -673,41 +679,42 @@ id 二次注册自动反注册(并断链)前者。鉴权:配 `paths.plugin_pidfi
 
 **信任模型**:host root / daemon uid 可信;租户代码在 guest 内,够不到 host UDS。
 
-## 7. 密钥与归属模型(manifest_key 根密钥,加密存 sqlite)
+## 7. 密钥与归属模型(AuthKey/ManifestKey 分域,加密存 sqlite)
 
-- **manifest_key 是每租户根密钥**(32B / 64-hex),同时就是 manifest 内容键
-  (`MANIFEST_KEY` env / `manifest.key`)。**api_key 由它派生**(`e2b-key-ctl
-  gen-apikey`):
+- **AuthKey 是 caller API 鉴权根**(32B / 64-hex),**api_key 只由它派生**
+  (`e2b-key-ctl gen-apikey`):
 
   ```
   api_key = "e2b_" + hex( fp(12) ‖ ts(4) ‖ nonce(4) ‖ mac(16) )      # 76 字符
-  fp  = SHA256(manifest_key)[:12]                                    # O(1) 库内匹配
-  mac = HMAC-SHA256(manifest_key, fp‖ts‖nonce)[:16]                  # 无 key 不可伪造
+  fp  = SHA256(AuthKey)[:12]                                         # 候选行索引
+  mac = HMAC-SHA256(AuthKey, fp‖ts‖nonce)[:16]                       # 无 AuthKey 不可伪造
   ```
 
   e2b SDK 以 `/^e2b_[0-9a-f]+$/` 校验 api_key 格式(故用 hex 编码);serve 另
-  自校验 MAC(`internal/apikey`)。manifest_key 本身永不发给 SDK。
-- **加密落盘**:`manifest_keys` / `sandboxes` / `builds` 三表的 manifest_key 字段
-  AES-256-GCM 加密(`internal/secretbox`:记录 = `keytag(4)‖nonce(12)‖ct+tag`,
-  keytag 选解密钥),另存 `manifest_key_hash = hex(fp)` 非唯一索引(快速匹配/排除)。
+  校验完整 MAC(`internal/apikey`)。
+- **ManifestKey 只是内容加密根**:`MANIFEST_KEY` env / `manifest.key`、Content Manifest、
+  快照、MMDS 和 pull token 使用它;API 鉴权绝不接受它。AuthKey 与 ManifestKey 必须不同。
+- **加密落盘**:`key_leases` / `sandboxes` / `builds` 保存独立的
+  `auth_key_hash/auth_key_enc` 与 `manifest_key_hash/manifest_key_enc`;`*_enc` 均用
+  AES-256-GCM 加密(`internal/secretbox`:记录 = `keytag(4)‖nonce(12)‖ct+tag`)。
   加密密钥经 `encryption_key` / `NODE_CONFIG_ENCRYPTION_KEY`(`:` 分隔多键,[0]
   活动、其余备用解旧记录,支持轮换)。
-- **鉴权解析**(短 hash 匹配 + 完整 MAC 校验):api_key → 按 `fp` 命中行/白名单 →
-  解密 manifest_key → 重算 HMAC 比对:
-  - **create / build / import**:manifest_key 须在 `manifest_keys` 白名单
-    (`node-ctl manifest-key`,§2.6;daemon 是该表唯一写者;集群下 registry 经
-    node-link 租约写入,§10),否则 **403**。
-  - **其他按 id / list 操作**:只对资源行自身的 manifest_key 校验,不查白名单——即
-    清空白名单,存量 sandbox/build 仍可正常操作直至生命周期结束。
+- **鉴权解析**(短 hash 候选 + 完整 MAC 校验):api_key → 按 AuthKey `fp` 命中候选行
+  → 解密 AuthKey → 重算 HMAC 比对:
+  - **create / build / import**:必须命中同 group 且未过期的完整 `key_leases` 行
+    (`node-ctl key-lease`,§2.6;集群下 Registry 经 node-link 在 Admission 前下发,§10),
+    否则 **403**。
+  - **其他按 id / list 操作**:只对资源行自身的 AuthKey 校验,不查当前 lease。
+    因此 lease 过期/`key_drop` 只阻止新对象,不改写或使存量 sandbox/build 失效。
   - list 的 hash 预筛非唯一,逐行再验 MAC,杜绝 hash 碰撞串租户。
 - **与收敛加密的关系**:manifest_key 只封 manifest 的密钥表;chunk 加密密钥派生自
   `SHA256(salt‖明文)`、与租户 key 无关 ⇒ chunk 去重仍跨租户;租户之间不共享 key 与
   模板。
 - **key 不落明文**:sqlite 内加密;运行期只在 serve 内存、LaunchSpec env 帧、
   子进程 env(`MANIFEST_KEY`)中;`<sid>.yaml` 非密不含 key。auto-resume 从加密存储
-  解出 key 解封快照(数据面唤醒无 api_key 可用)。集群下经 node-link 下行的 manifest_key
-  同样仅入加密存储 + 运行期内存(§10)。
-- 数据面另有 token 与会话密钥,皆系于此根:`envdAccessToken`/`trafficAccessToken`
+  解出 ManifestKey 解封快照(数据面唤醒无 api_key 可用)。集群下经 node-link 下行的
+  完整 lease 同样仅入加密存储 + 运行期内存(§10)。
+- 数据面另有每 execution 随机 capability:`envdAccessToken`/`trafficAccessToken`
   (create 时铸造的随机 token、随行存库,数据面鉴权语义见 node-proxy.md §7);`MmdsSecret =
   HMAC-SHA256(manifest_key, "kuasar-mmds-v1:"+sid)`(每沙箱确定性派生的 MMDS 会话签名
   密钥,`mmds.enabled` 时随路由分发给 proxy 校验 envd 身份,见 node-proxy.md §8)。
@@ -773,7 +780,7 @@ e2b API/CLI 零改动。
 - **迁移(新 sid 跨机)**:`export-sandbox <sid>` 确保远程后导出**单行 base64 token**
   = 沙箱行(env/metadata/deadline/数据面 token + runtime erofs 摘要;manifest_key
   仅指纹、不含密钥);默认回收源行(move,`--keep-source` = copy)。目标机
-  `import-sandbox <token>`:api_key → 白名单解析租户 key(须先 `manifest-key add`,
+  `import-sandbox <token>`:api_key → key lease 解析 AuthKey/ManifestKey(须先 `key-lease put`,
   与 create 同前置)、校验 token 指纹与本机 runtime 摘要一致,分配新 UUIDv7 并插入
   paused 行;随后对新 sid 执行 `connect`。源 sid 不在目标机复用。目标机须共享同一
   `manifest_config`(远程 store)。
@@ -1124,8 +1131,8 @@ vswitch mgmt VIP 寻址;第三方 registry 经 NAT 出网)。两者皆缺则 tri
    `e2b-key-ctl seal-pull-token` 用租户 manifest_key 派生密钥封装的 `kpt_` 令牌,
    serve 以该租户存量 key 解封;
 2. **SDK 明文**:trigger body `fromImageRegistry{username, password}`;
-3. **租户默认**:`manifest_keys.registry_auth_enc`(docker config.json;
-   `manifest-key add --registry-auth` 或 `--registry-username/--password/--token`
+3. **租户默认**:`key_leases.registry_auth_enc`(docker config.json;
+   `key-lease put --registry-auth` 或 `--registry-username/--password/--token`
    自动组装 catch-all `*` 条目;按 fromImage host → `*` 匹配取条)。
 
 解析结果加密存 `builds.registry_auth_enc`,构建时解出注入
@@ -1171,19 +1178,22 @@ external worker 的 `data_listen`,proxy.yaml),证书同一张。dev:`E2B_API_URL
 ```
 sandboxes      id(uuidv7) PK, template_id, state(running|paused|dead), deadline_unix,
                run_dir, base_dir, envd_uds, ci_uds, floatingip, vswitch_port,
-               inner_ip, port_mac, manifest_key_hash, manifest_key_enc, snapshot_ref,
+               inner_ip, port_mac, auth_key_hash, auth_key_enc,
+               manifest_key_hash, manifest_key_enc, snapshot_ref,
                envd_access_token, traffic_access_token, metadata_json, env_json,
                created_unix
 builds         build_id PK, template_id(transient-…), persist_id(<profile>-<kind>-<key>),
-               manifest_key_hash, manifest_key_enc, profile, kind, from_image,
+               auth_key_hash, auth_key_enc, manifest_key_hash, manifest_key_enc,
+               profile, kind, from_image,
                start_cmd, status(registered|waiting|building|ready|error), reason,
                names_json, aliases_json, registry_auth_enc, created_unix
-manifest_keys  key_hash(索引), key_enc, label, created_unix, expires_unix,
+key_leases     group_name + auth_key_hash + manifest_key_hash PK,
+               auth_key_enc, manifest_key_enc, label, created_unix, expires_unix,
                registry_auth_enc
 ```
 
 `builds` 兼任模板登记(§4.4);`*_key_enc` 均 AES-256-GCM、`*_hash` 为
-`SHA256(mk)[:12]` 非唯一索引(§7)。
+各自密钥的 `SHA256(key)[:12]` 非唯一索引(§7)。
 
 ### 15.2 重启对账
 

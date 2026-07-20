@@ -600,44 +600,34 @@ cache-ctl 预算(典型 1–2 GiB),否则 cache 增长会挤掉沙箱内存。
 
 ### 3.8 cluster 控制面冷路径
 
-cluster 性能口径应区分热路径与冷路径。热路径是 router 已有活动连接缓存后的
-数据转发,不应进入 registry Reserve;冷路径是首次连接、沙箱创建、build 创建、
-node 状态变化、group 导入与成员切换。这些路径进入 registry/placer,目标是
-保证可靠性和扩展线性,而不是把所有 QPS 都压到 registry 上。
+cluster 性能口径应区分 READY 解析/转发热路径与创建、Admission、恢复冷路径。
+Router cache hit 可直接转发;cache miss 从任一安全本地 Data Shard replica 读 READY 正投影,
+仍只需一次 Router-to-Registry RTT。只有 local miss/behind、mutation 和强读需要 Leader。
 
 ```
 hot path:
 
-client ── data stream ──► router active connection cache ──► node/proxy/envd
-          no Reserve while same route connection is alive
+client ── data stream ──► router READY cache ──► exact fenced node/proxy/envd
+cache miss ──► replica-local READY positive read ──► cache + forward
 
 cold path:
 
-router ── Reserve(group,sandbox) ──► registry route_link ── Place ──► placer
-node   ── state/heartbeat/events ──► registry node_link/node_list
-placer ── group import / key selector ──► registry route_link/node_link
+router ── Reserve(group,route_key) ──► Registry shard leader ── RandomN ──► Placer
+Registry ── Holder Probe/P2C + key_put + Admission ──► selected node
+node ── durable Sandbox events ──► Registry Route convergence
 ```
 
 性能回归应覆盖:
 
-- registry N=1 与 N>1 两种模式:单成员必须退化为无网络复制路径;多成员验证
-  shardkv CAS、WATCH 与成员健康变化。
-- `membership_version` 变更:配置 reload 后不同 label 的成员集群并存,旧版本
-  grace 期间继续服务已有分片;新版本 READY 后新写进入新逻辑分片。业务无损的
-  目标是避免把所有记录全局扫描迁移,由节点心跳、group import 与分片内复制
-  自然补齐活动数据。
-- node_link 重定向/转发:任意 registry 接入 node 时,若自身不是 node owner,
-  应逐个尝试 owner;节点支持 redirect 时可重连到 owner,否则在 relay 链路上
-  订阅并复制状态。
-- router cache:同一 route 的活动连接存在时,新连接不走 Reserve;活动连接过期
-  或路由失效后才回到冷路径。
-- placer import:同一个 `source_id` 的导入任务由 placer_link 中的 lease 串行
-  执行;文件源只用于开发/e2e,生产源通过 provider/importer 接口实现。
+- 4,097 live Raft groups、1,000,000 READY rows、replica-local positive read p99。
+- 单 Registry 成员故障后的 safe local reads、Leader 恢复和 Holder reconnect/replay 限流。
+- stale READY 必须在 node Binding fence 处 fail-fast,且 Router 不向 replacement 重放原请求。
+- Admission ACK 丢失、Holder 变化、node 断链不得产生第二 execution。
+- whole-Registry-History-Generation rollover 与 node-authoritative recovery 的有界重放。
 
-`orchestrator` 的 cluster stub e2e 应作为当前主要回归入口:由
-`make build` 产生真实 `cluster-ctl`/`node-stub-ctl` 二进制,启动 registry、
-router、placer 和指定数量 stub node,覆盖 N=1、多成员、成员变更、node
-重启、sandbox/build 创建删除、route 查询与 WATCH_LIST。
+`orchestrator` 的 canonical `make test-e2e` 启动真实三成员 Registry/Router/Placer 与
+durable node stubs,覆盖创建、Build 绑定、Holder/Leader 故障、NodeEpoch fence、Registry History
+Generation rollover/recovery 和 Permit fail-closed。它不依赖仓库外 wrapper。
 
 ## 4. 已知测量局限
 

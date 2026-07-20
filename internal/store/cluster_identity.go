@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 )
 
 var (
@@ -228,6 +229,8 @@ func validateClusterIdentityInput(nodeID, bootID, dataEndpoint string) error {
 	switch {
 	case nodeID == "":
 		return errors.New("store: node ID is required")
+	case len(nodeID) > clusterstate.MaxExecutionBindingNodeIDSize:
+		return fmt.Errorf("store: node ID exceeds %d bytes", clusterstate.MaxExecutionBindingNodeIDSize)
 	case bootID == "":
 		return errors.New("store: boot ID is required")
 	case dataEndpoint == "":

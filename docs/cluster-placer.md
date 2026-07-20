@@ -64,10 +64,12 @@ provider/policy version
 
 ## 3. Typed dispatch specs
 
-Sandbox spec 固定 template reference、manifest-key fingerprint、resolved config、access capability、target port、
-timeout 和 runtime digest。Build registration spec 只固定 template handle、profile、names/aliases、注册 metadata、
-builder defaults 和 runtime digest。trigger steps、base image/template 与 pull credential 在注册后经 Router 直接
-送到 bound node，不进入 Registry/Placer intent。
+Sandbox spec 固定 effective template reference、AuthKey/ManifestKey fingerprints、resolved config、随机
+execution access capability、target port、timeout、runtime digest 与完整 node request envelope。Build registration
+spec 固定 template handle、AuthKey/ManifestKey fingerprints、profile、names/aliases、注册 metadata、正的
+CPU/memory ceiling、builder defaults、runtime digest 与完整 envelope。trigger steps、base image/template 与 pull
+credential 在注册后经 Router 直接送到 bound node，不进入 Registry/Placer intent；node 拒绝 Trigger 放大注册
+时 CPU/memory ceiling。
 
 两类 spec 使用严格 JSON 解码、版本字段和大小上限。system-owned ExecutionBinding metadata key 不允许由
 Provider、caller 或配置输入提供。Registry 共识状态再次解析 typed spec；仅 digest 自洽但类型错误的 intent
@@ -144,9 +146,9 @@ group_sources:
     path: /var/lib/kuasar/groups
 ```
 
-每个 source ID 唯一，path 必须为绝对路径。Provider 负责 caller/GROUP authentication 所需的 policy
-material；Registry 不复制 AuthCatalog。正常运行没有 Registry source lease、execution importer 或
-WATCH_LIST 权威路径。
+每个 source ID 唯一，path 必须为绝对路径。Group 记录提供独立 AuthKey/ManifestKey、`template_ref` 默认值与
+`allow_template_override` 策略。Provider 负责 caller/GROUP authentication 与期望 key lease；Registry 不复制
+AuthCatalog 或秘密材料。正常运行没有 Registry execution importer 或 WATCH_LIST 权威路径。
 
 ## 8. Failure behavior
 

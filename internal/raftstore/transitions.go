@@ -225,6 +225,9 @@ func validateRouteReplacement(
 	if next.Starting.SandboxID == current.Tombstone.SandboxID {
 		return errors.New("raftstore: replacement reused the fenced SID")
 	}
+	if current.Tombstone.FenceCompacted {
+		return nil
+	}
 	key := fenceMapKey(current.Group, current.RouteKey, current.Tombstone.SandboxID)
 	fence, found := fences[key]
 	if !found || fence.Proof.ProofDigest != current.Tombstone.Proof.ProofDigest ||
@@ -588,6 +591,8 @@ func fenceMatchesRouteTombstone(fence clusterstate.ExecutionFence, route cluster
 	}
 	return fence.PlacementFailure == nil && route.Tombstone.SandboxID == fence.SandboxID &&
 		route.Tombstone.NodeID == fence.NodeID && route.Tombstone.NodeEpoch == fence.NodeEpoch &&
+		!route.Tombstone.FenceCompacted &&
+		route.Tombstone.RegistryGeneration == fence.RegistryGeneration &&
 		route.Tombstone.LastEventSeq == fence.LastEventSeq &&
 		route.Tombstone.BindingDigest == fence.BindingDigest && route.Tombstone.Proof == fence.Proof
 }

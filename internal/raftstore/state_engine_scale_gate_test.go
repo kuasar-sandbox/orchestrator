@@ -43,13 +43,12 @@ func TestPebbleMillionReadyRouteGate(t *testing.T) {
 		ClusterID: registryLayout.ClusterID, RegistryGeneration: registryLayout.RegistryGeneration,
 		SystemEpoch: 1, RegistryLayoutDigest: digest,
 	}
-	const groupName = "/state-scale"
 	shardRoutes := make([][]uint32, DefaultVirtualShards)
 	routeShards := make([]uint32, stateScaleRouteCount)
 	for routeID := uint32(0); routeID < stateScaleRouteCount; routeID++ {
-		routeKey := stateScaleRouteKey(routeID)
+		groupName := stateScaleGroup(routeID)
 		_, shardID, err := clusterstate.RouteShardFor(
-			groupName, routeKey, registryLayout.RouteBucketCount, registryLayout.VirtualShardCount,
+			groupName, stateScaleRouteKey, registryLayout.RouteBucketCount, registryLayout.VirtualShardCount,
 		)
 		if err != nil {
 			t.Fatal(err)
@@ -57,8 +56,16 @@ func TestPebbleMillionReadyRouteGate(t *testing.T) {
 		shardRoutes[shardID] = append(shardRoutes[shardID], routeID)
 		routeShards[routeID] = shardID
 	}
+	minimumRoutesPerShard, maximumRoutesPerShard := stateScaleRouteCount, 0
+	for shardID, routes := range shardRoutes {
+		if len(routes) == 0 {
+			t.Fatalf("state-scale workload left shard %d empty", shardID)
+		}
+		minimumRoutesPerShard = min(minimumRoutesPerShard, len(routes))
+		maximumRoutesPerShard = max(maximumRoutesPerShard, len(routes))
+	}
 
-	root := t.TempDir()
+	root := scaleGateTempDir(t)
 	engine, err := OpenPebbleStateEngine(root)
 	if err != nil {
 		t.Fatal(err)
@@ -101,7 +108,9 @@ func TestPebbleMillionReadyRouteGate(t *testing.T) {
 
 			entries := make([]sm.Entry, 0, len(shardRoutes[shardID])*2)
 			for position, routeID := range shardRoutes[shardID] {
-				starting, ready, err := stateScaleReadyRoute(registryLayout, groupName, stateScaleRouteKey(routeID), routeID, intent)
+				starting, ready, err := stateScaleReadyRoute(
+					registryLayout, stateScaleGroup(routeID), stateScaleRouteKey, routeID, intent,
+				)
 				if err != nil {
 					return err
 				}
@@ -175,7 +184,7 @@ func TestPebbleMillionReadyRouteGate(t *testing.T) {
 
 	for index := 0; index < 10_000; index++ {
 		routeID := uint32((uint64(index) * 7919) % stateScaleRouteCount)
-		if err := stateScaleLookupReady(machines, identity, routeShards, groupName, routeID); err != nil {
+		if err := stateScaleLookupReady(machines, identity, routeShards, routeID); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -183,7 +192,7 @@ func TestPebbleMillionReadyRouteGate(t *testing.T) {
 	for index := range latencies {
 		routeID := uint32((uint64(index+10_000) * 7919) % stateScaleRouteCount)
 		started := time.Now()
-		err := stateScaleLookupReady(machines, identity, routeShards, groupName, routeID)
+		err := stateScaleLookupReady(machines, identity, routeShards, routeID)
 		latencies[index] = time.Since(started)
 		if err != nil {
 			t.Fatal(err)
@@ -209,13 +218,16 @@ func TestPebbleMillionReadyRouteGate(t *testing.T) {
 	var memory runtime.MemStats
 	runtime.ReadMemStats(&memory)
 	t.Logf(
-		"routes=%d shards=%d load=%s ready_read_p50=%s ready_read_p99=%s ready_read_p99.9=%s max_rss=%.2fGiB heap_sys=%.2fGiB",
-		stateScaleRouteCount, DefaultVirtualShards, loadDuration, p50, p99, p999,
+		"routes=%d shards=%d routes_per_shard=%d..%d load=%s ready_read_p50=%s ready_read_p99=%s ready_read_p99.9=%s max_rss=%.2fGiB heap_sys=%.2fGiB",
+		stateScaleRouteCount, DefaultVirtualShards, minimumRoutesPerShard, maximumRoutesPerShard,
+		loadDuration, p50, p99, p999,
 		float64(rssBytes)/(1<<30), float64(memory.HeapSys)/(1<<30),
 	)
 }
 
-func stateScaleRouteKey(routeID uint32) string { return fmt.Sprintf("route-%07d", routeID) }
+const stateScaleRouteKey = "route"
+
+func stateScaleGroup(routeID uint32) string { return fmt.Sprintf("/state-scale/%07d", routeID) }
 
 func stateScaleReadyRoute(
 	registryLayout RegistryLayout,
@@ -272,7 +284,6 @@ func stateScaleLookupReady(
 	machines []sm.IOnDiskStateMachine,
 	identity PermitIdentity,
 	routeShards []uint32,
-	group string,
 	routeID uint32,
 ) error {
 	shardID := routeShards[routeID]
@@ -281,7 +292,7 @@ func stateScaleLookupReady(
 			ClusterID: identity.ClusterID, RegistryGeneration: identity.RegistryGeneration,
 			SystemEpoch: identity.SystemEpoch, RegistryLayoutDigest: identity.RegistryLayoutDigest, ShardID: shardID,
 		},
-		Group: group, RouteKey: stateScaleRouteKey(routeID),
+		Group: stateScaleGroup(routeID), RouteKey: stateScaleRouteKey,
 	}
 	value, err := machines[shardID].Lookup(DataLookup{Route: &request})
 	if err != nil {

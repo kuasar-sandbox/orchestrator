@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -44,6 +45,15 @@ func TestClusterIdentityLifecycle(t *testing.T) {
 	}
 	if _, err := st.NextClusterSession(ctx, 1); err == nil {
 		t.Fatal("stale process advanced a newer node epoch")
+	}
+}
+
+func TestClusterIdentityRejectsNodeIDThatCannotFormBinding(t *testing.T) {
+	st := testStore(t)
+	if _, err := st.EnrollClusterIdentity(
+		context.Background(), strings.Repeat("n", 129), "boot-1", "10.0.0.1:8443",
+	); err == nil {
+		t.Fatal("oversized node ID was durably enrolled")
 	}
 }
 

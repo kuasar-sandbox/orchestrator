@@ -1,6 +1,5 @@
-// Package keys mints sandbox access tokens. (Tenant identity is the manifest key
-// — see internal/apikey for api-key derivation/verification and internal/secretbox
-// for at-rest encryption.)
+// Package keys mints sandbox access tokens. AuthKey is the caller identity root;
+// ManifestKey remains limited to content cryptography.
 package keys
 
 import (

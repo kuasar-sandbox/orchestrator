@@ -94,3 +94,9 @@ type SandboxGroupProvider interface {
 	GetManifestKey(ctx context.Context, group string) (Secret, bool, error) // content key, node-facing
 	GetAuthKey(ctx context.Context, group string) (Secret, bool, error)     // API auth key, router/node-facing
 }
+
+// SandboxGroupAuthorizer lets a Provider verify caller credentials without
+// exposing referenced AuthKey material to Router or Registry.
+type SandboxGroupAuthorizer interface {
+	VerifyAPIKey(ctx context.Context, group, apiKey string) (bool, error)
+}

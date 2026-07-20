@@ -483,7 +483,8 @@ func terminalRouteAndFence(deleting clusterstate.RouteWorkflowRecord, eventSeq u
 		Group: deleting.Group, RouteKey: deleting.RouteKey, State: clusterstate.WorkflowRouteTombstone,
 		Tombstone: &clusterstate.RouteTombstoneState{
 			SandboxID: execution.SandboxID, NodeID: execution.NodeID, NodeEpoch: execution.NodeEpoch,
-			BindingDigest: execution.BindingDigest, LastEventSeq: eventSeq, Proof: proof, TerminalReason: "deleted",
+			RegistryGeneration: execution.RegistryGeneration, BindingDigest: execution.BindingDigest,
+			LastEventSeq: eventSeq, Proof: proof, TerminalReason: "deleted",
 		},
 	}
 	fence := clusterstate.ExecutionFence{

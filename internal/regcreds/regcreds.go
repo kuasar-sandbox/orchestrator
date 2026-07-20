@@ -63,7 +63,7 @@ type dockerAuthEntry struct {
 }
 
 // AssembleDockerAuth builds a one-entry auths object (catch-all "*") from simple
-// creds — the `manifest-key add --registry-username/--password/--token` convenience.
+// creds — the `key-lease put --registry-username/--password/--token` convenience.
 func AssembleDockerAuth(c Creds) (string, error) {
 	b, err := json.Marshal(dockerAuth{Auths: map[string]dockerAuthEntry{
 		"*": {Username: c.Username, Password: c.Password, Token: c.Token},

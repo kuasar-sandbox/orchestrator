@@ -68,6 +68,13 @@ Resume/Delete 只携带 `(group, route_key)` 和最低 revision；Registry 从�
 Build 注册以 `(group, build_id)` 为键，Registry 只返回 `BUILD_REGISTERED` 的 immutable node binding，或
 pre-accept placement tombstone。
 
+Sandbox Create 和 Build Register 不是由 Router 重建的窄 DTO。Router 读取一个有界 JSON object，拒绝重复
+key、冲突 alias 和非规范 cluster-owned 字段，移除 caller credential、hop-by-hop/internal header 与保留的
+system metadata，然后只覆盖策略强制字段。未知 body 字段、query、content type 和普通 extension header
+进入 immutable node request envelope 并随 dispatch/retry 保留。Group `template_ref` 是缺省值；只有
+`allow_template_override=true` 时 caller 才可改写。Build Register 必须声明正 CPU/memory，Trigger 只可省略
+或缩小该 ceiling，不能放大。
+
 ## Data-plane forwarding
 
 READY Route 至少包含：
@@ -136,7 +143,7 @@ Build cache同样绑定 generation 和 build revision，但不参与 Sandbox dat
 domain: sandboxes.example.com
 registry_layout:
   chain: /etc/kuasar/registry-layout-chain.json
-  keys: /etc/kuasar/Registry Layout-keys.json
+  keys: /etc/kuasar/registry-layout-keys.json
   guard: /var/lib/kuasar/router-registry-layout-guard.json
 registry_tls:
   cert: /etc/kuasar/tls/router.crt

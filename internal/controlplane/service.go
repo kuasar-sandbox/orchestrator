@@ -1173,7 +1173,7 @@ func (s *RegistryService) recoverShard(ctx context.Context, shardID uint32) erro
 }
 
 func (s *RegistryService) scheduleFenceCompaction(ctx context.Context, fence clusterstate.ExecutionFence) {
-	if ctx.Err() != nil || fence.Revision.LogIndex == 0 || s.routeStillDependsOnFence(ctx, fence) {
+	if ctx.Err() != nil || fence.Revision.LogIndex == 0 {
 		return
 	}
 	key := fence.Group + "\x00" + fence.RouteKey + "\x00" + fence.SandboxID
@@ -1201,69 +1201,64 @@ func (s *RegistryService) scheduleFenceCompaction(ctx context.Context, fence clu
 	}()
 }
 
-func (s *RegistryService) routeStillDependsOnFence(ctx context.Context, fence clusterstate.ExecutionFence) bool {
-	record, err := s.store.ReadRouteWorkflow(ctx, fence.Group, fence.RouteKey)
-	if err != nil {
-		return true
-	}
-	if record == nil || record.State != clusterstate.WorkflowRouteTombstone || record.Tombstone == nil {
-		return false
-	}
-	if fence.PlacementFailure != nil {
-		return record.Tombstone.PlacementFailure != nil &&
-			record.Tombstone.PlacementFailure.SandboxID == fence.SandboxID
-	}
-	return record.Tombstone.PlacementFailure == nil && record.Tombstone.SandboxID == fence.SandboxID &&
-		record.Tombstone.BindingDigest == fence.BindingDigest
-}
-
 func (s *RegistryService) finalizeAndCompactFence(
 	ctx context.Context,
 	fence clusterstate.ExecutionFence,
 ) error {
-	evidence := raftstore.FenceOutboxAckEvidence{}
-	if fence.PlacementFailure == nil && fence.Proof.Kind == clusterstate.ProofNodeTerminal {
-		state, err := s.store.ReadSystem(ctx)
-		if err != nil {
-			return err
-		}
-		enrollment, found := state.NodeEnrollments[fence.NodeID]
-		if found && enrollment.MaxNodeEpoch > fence.NodeEpoch {
-			return s.store.CompactExecutionFence(ctx, fence, evidence)
-		}
-		if !found || enrollment.Retired || enrollment.MaxNodeEpoch != fence.NodeEpoch || enrollment.DataEndpoint == "" {
-			return session.ErrSessionUnavailable
-		}
-		identity, err := s.store.ServeIdentity()
-		if err != nil {
-			return err
-		}
-		command := &routesync.Command{
-			CmdID: newCommandID(), Kind: routesync.CmdFinalizeWorkflow, SID: fence.SandboxID,
-			RegistryGeneration: fence.RegistryGeneration, BindingDigest: fence.BindingDigest,
-		}
-		ack, _, err := s.commands.SendNodeCommand(
-			ctx, identity, fence.NodeID, fence.NodeEpoch, enrollment.DataEndpoint, command,
-		)
-		if err != nil {
-			return err
-		}
-		if ack.Status != routesync.AckAccepted {
-			return fmt.Errorf("controlplane: node has not confirmed final outbox watermark: %s", ack.Reason)
-		}
-		evidence = raftstore.FenceOutboxAckEvidence{
-			AckedWatermark: fence.FinalOutboxWatermark,
-			ProofDigest:    finalOutboxAckProof(fence),
-		}
-	}
-	return s.store.CompactExecutionFence(ctx, fence, evidence)
+	return s.store.CompactExecutionFence(ctx, fence)
 }
 
-func finalOutboxAckProof(fence clusterstate.ExecutionFence) string {
+func (s *RegistryService) VerifyFenceOutboxAck(
+	ctx context.Context,
+	request raftstore.FenceOutboxAckRequest,
+) (raftstore.FenceOutboxAckEvidence, error) {
+	bindingDigest, digestErr := hex.DecodeString(request.BindingDigest)
+	if request.Group == "" || request.RouteKey == "" || request.SandboxID == "" ||
+		request.NodeID == "" || request.NodeEpoch == 0 || request.RegistryGeneration == "" ||
+		digestErr != nil || len(bindingDigest) != sha256.Size || request.FinalOutboxWatermark == 0 {
+		return raftstore.FenceOutboxAckEvidence{}, errors.New("controlplane: incomplete final outbox ACK request")
+	}
+	state, err := s.store.ReadSystem(ctx)
+	if err != nil {
+		return raftstore.FenceOutboxAckEvidence{}, err
+	}
+	enrollment, found := state.NodeEnrollments[request.NodeID]
+	if !found || enrollment.Retired || enrollment.MaxNodeEpoch != request.NodeEpoch || enrollment.DataEndpoint == "" {
+		return raftstore.FenceOutboxAckEvidence{}, session.ErrSessionUnavailable
+	}
+	identity, err := s.store.ServeIdentity()
+	if err != nil {
+		return raftstore.FenceOutboxAckEvidence{}, err
+	}
+	if identity.RegistryGeneration != request.RegistryGeneration {
+		return raftstore.FenceOutboxAckEvidence{}, errors.New("controlplane: final outbox ACK belongs to another Registry History Generation")
+	}
+	command := &routesync.Command{
+		CmdID: newCommandID(), Kind: routesync.CmdFinalizeWorkflow, SID: request.SandboxID,
+		RegistryGeneration: request.RegistryGeneration, BindingDigest: request.BindingDigest,
+	}
+	ack, sent, err := s.commands.SendNodeCommand(
+		ctx, identity, request.NodeID, request.NodeEpoch, enrollment.DataEndpoint, command,
+	)
+	if err != nil {
+		return raftstore.FenceOutboxAckEvidence{}, err
+	}
+	if !sent || ack.Status != routesync.AckAccepted {
+		return raftstore.FenceOutboxAckEvidence{}, fmt.Errorf(
+			"controlplane: node has not confirmed final outbox watermark: %s", ack.Reason,
+		)
+	}
+	return raftstore.FenceOutboxAckEvidence{
+		AckedWatermark: request.FinalOutboxWatermark,
+		ProofDigest:    finalOutboxAckProof(request),
+	}, nil
+}
+
+func finalOutboxAckProof(request raftstore.FenceOutboxAckRequest) string {
 	digest := sha256.Sum256([]byte(fmt.Sprintf(
-		"kuasar-final-outbox-ack-v1\x00%s\x00%s\x00%s\x00%s\x00%d\x00%d",
-		fence.RegistryGeneration, fence.Group, fence.RouteKey, fence.SandboxID,
-		fence.NodeEpoch, fence.FinalOutboxWatermark,
+		"kuasar-final-outbox-ack-v1\x00%s\x00%s\x00%s\x00%s\x00%s\x00%d\x00%s\x00%d",
+		request.RegistryGeneration, request.Group, request.RouteKey, request.SandboxID,
+		request.NodeID, request.NodeEpoch, request.BindingDigest, request.FinalOutboxWatermark,
 	)))
 	return hex.EncodeToString(digest[:])
 }

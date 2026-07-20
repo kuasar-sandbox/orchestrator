@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"runtime"
 	"slices"
 	"testing"
@@ -23,6 +24,7 @@ import (
 
 const (
 	scaleGateEnvironment = "KUASAR_RAFT_SCALE_GATE"
+	scaleGateRootEnv     = "KUASAR_RAFT_GATE_ROOT"
 	scaleGateStartupMax  = 2 * time.Minute
 	scaleGateReadCount   = 20_000
 	scaleGateRSSMax      = uint64(8 << 30)
@@ -45,7 +47,7 @@ func TestDragonboat4097GroupScaleGate(t *testing.T) {
 		addresses[index] = freeTCPAddress(t)
 	}
 	for index, address := range addresses {
-		stateEngine, err := OpenPebbleStateEngine(t.TempDir())
+		stateEngine, err := OpenPebbleStateEngine(scaleGateTempDir(t))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -55,7 +57,7 @@ func TestDragonboat4097GroupScaleGate(t *testing.T) {
 		expert.LogDB = dbconfig.GetTinyMemLogDBConfig()
 		expert.Engine.SnapshotShards = 4
 		nodeHost, err := dragonboat.NewNodeHost(dbconfig.NodeHostConfig{
-			DeploymentID: 0x46_4097, NodeHostDir: t.TempDir(), RTTMillisecond: 2,
+			DeploymentID: 0x46_4097, NodeHostDir: scaleGateTempDir(t), RTTMillisecond: 2,
 			RaftAddress: address, Expert: expert,
 		})
 		if err != nil {
@@ -81,7 +83,7 @@ func TestDragonboat4097GroupScaleGate(t *testing.T) {
 		2: addresses[1],
 		3: addresses[2],
 	}
-	routeKeys := scaleGateRouteKeys(t, registryLayout)
+	routeTargets := scaleGateRouteTargets(t, registryLayout)
 	intent := testDispatchIntentNoFail()
 
 	startedAt := time.Now()
@@ -150,7 +152,8 @@ func TestDragonboat4097GroupScaleGate(t *testing.T) {
 				return fmt.Errorf("initialize data shard %d: %s", logicalShardID, applied.Reason)
 			}
 			starting, ready, err := stateScaleReadyRoute(
-				registryLayout, "/dragonboat-scale", routeKeys[logicalShardID], logicalShardID, intent,
+				registryLayout, routeTargets[logicalShardID].Group,
+				routeTargets[logicalShardID].RouteKey, logicalShardID, intent,
 			)
 			if err != nil {
 				return err
@@ -196,7 +199,7 @@ func TestDragonboat4097GroupScaleGate(t *testing.T) {
 
 	queries := make([]DataLookup, DefaultVirtualShards)
 	for logicalShardID := uint32(0); logicalShardID < DefaultVirtualShards; logicalShardID++ {
-		queries[logicalShardID] = scaleGateReadyQuery(registryLayout, digest, logicalShardID, routeKeys[logicalShardID])
+		queries[logicalShardID] = scaleGateReadyQuery(registryLayout, digest, logicalShardID, routeTargets[logicalShardID])
 		if err := awaitScaleGateReady(ctx, nodeHosts[0], logicalShardID, queries[logicalShardID]); err != nil {
 			t.Fatal(err)
 		}
@@ -240,35 +243,58 @@ func TestDragonboat4097GroupScaleGate(t *testing.T) {
 	)
 }
 
-func scaleGateRouteKeys(t *testing.T, registryLayout RegistryLayout) []string {
+type scaleGateRouteTarget struct {
+	Group    string
+	RouteKey string
+}
+
+func scaleGateRouteTargets(t *testing.T, registryLayout RegistryLayout) []scaleGateRouteTarget {
 	t.Helper()
-	keys := make([]string, registryLayout.VirtualShardCount)
+	targets := make([]scaleGateRouteTarget, registryLayout.VirtualShardCount)
 	remaining := registryLayout.VirtualShardCount
-	for candidate := uint32(0); remaining > 0; candidate++ {
-		key := fmt.Sprintf("route-%08d", candidate)
+	for candidate := uint64(0); remaining > 0; candidate++ {
+		group := fmt.Sprintf("/dragonboat-scale/%016x", candidate)
+		key := "route"
 		_, shardID, err := clusterstate.RouteShardFor(
-			"/dragonboat-scale", key, registryLayout.RouteBucketCount, registryLayout.VirtualShardCount,
+			group, key, registryLayout.RouteBucketCount, registryLayout.VirtualShardCount,
 		)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if keys[shardID] == "" {
-			keys[shardID] = key
+		if targets[shardID].Group == "" {
+			targets[shardID] = scaleGateRouteTarget{Group: group, RouteKey: key}
 			remaining--
 		}
 	}
-	return keys
+	return targets
 }
 
-func scaleGateReadyQuery(registryLayout RegistryLayout, digest string, shardID uint32, routeKey string) DataLookup {
+func scaleGateReadyQuery(registryLayout RegistryLayout, digest string, shardID uint32, target scaleGateRouteTarget) DataLookup {
 	request := routeapi.ReadRouteRequest{
 		RequestIdentity: routeapi.RequestIdentity{
 			ClusterID: registryLayout.ClusterID, RegistryGeneration: registryLayout.RegistryGeneration,
 			SystemEpoch: 1, RegistryLayoutDigest: digest, ShardID: shardID,
 		},
-		Group: "/dragonboat-scale", RouteKey: routeKey,
+		Group: target.Group, RouteKey: target.RouteKey,
 	}
 	return DataLookup{Route: &request}
+}
+
+func TestScaleGateRouteTargetsCoverEveryShard(t *testing.T) {
+	registryLayout := testRegistryLayout(DefaultVirtualShards, "generation-scale-targets")
+	targets := scaleGateRouteTargets(t, registryLayout)
+	if len(targets) != int(registryLayout.VirtualShardCount) {
+		t.Fatalf("targets = %d, want %d", len(targets), registryLayout.VirtualShardCount)
+	}
+	for wantShard, target := range targets {
+		_, gotShard, err := clusterstate.RouteShardFor(
+			target.Group, target.RouteKey,
+			registryLayout.RouteBucketCount, registryLayout.VirtualShardCount,
+		)
+		if err != nil || gotShard != uint32(wantShard) {
+			t.Fatalf("target %d = %+v, mapped shard %d, err %v", wantShard, target, gotShard, err)
+		}
+	}
 }
 
 func awaitScaleGateReady(
@@ -334,4 +360,24 @@ func proposeScaleGate(
 func percentileDuration(sorted []time.Duration, percentile float64) time.Duration {
 	index := int(float64(len(sorted)-1) * percentile / 100)
 	return sorted[index]
+}
+
+func scaleGateTempDir(t *testing.T) string {
+	t.Helper()
+	root := os.Getenv(scaleGateRootEnv)
+	if root == "" {
+		return t.TempDir()
+	}
+	if !filepath.IsAbs(root) {
+		t.Fatalf("%s must be an absolute path", scaleGateRootEnv)
+	}
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	dir, err := os.MkdirTemp(root, "kuasar-raft-gate-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return dir
 }

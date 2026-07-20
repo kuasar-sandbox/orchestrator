@@ -271,7 +271,7 @@ func (o *Orchestrator) List(ctx context.Context, apiKey, state string, limit int
 	// hash-collision rows belonging to another tenant).
 	out := rows[:0]
 	for _, sb := range rows {
-		if verifyKey(apiKey, sb.ManifestKey) {
+		if verifyKey(apiKey, sb.AuthKey) {
 			out = append(out, sb)
 		}
 	}

@@ -16,6 +16,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/clustercfg"
+	"github.com/kuasar-sandbox/orchestrator/internal/keys"
 	"github.com/kuasar-sandbox/orchestrator/internal/placement"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
@@ -173,21 +174,33 @@ func (s *FinalService) serveVerifyKey(w http.ResponseWriter, request *http.Reque
 		http.Error(w, "invalid Provider authorization request", http.StatusBadRequest)
 		return
 	}
-	secret, found, err := s.provider.GetAuthKey(request.Context(), input.Group)
-	if err != nil {
-		http.Error(w, "Provider unavailable", http.StatusServiceUnavailable)
-		return
-	}
-	authKey := ""
-	if found {
-		authKey, err = inlineSecret("auth_key", secret)
-	}
+	authorized, err := verifyProviderAPIKey(request.Context(), s.provider, input.Group, input.APIKey)
 	if err != nil {
 		http.Error(w, "Provider unavailable", http.StatusServiceUnavailable)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(VerifyKeyResponse{Authorized: found && verifyAPIKey(authKey, input.APIKey)})
+	_ = json.NewEncoder(w).Encode(VerifyKeyResponse{Authorized: authorized})
+}
+
+func verifyProviderAPIKey(
+	ctx context.Context,
+	provider clusterstate.SandboxGroupProvider,
+	group string,
+	apiKey string,
+) (bool, error) {
+	if authorizer, ok := provider.(clusterstate.SandboxGroupAuthorizer); ok {
+		return authorizer.VerifyAPIKey(ctx, group, apiKey)
+	}
+	secret, found, err := provider.GetAuthKey(ctx, group)
+	if err != nil || !found {
+		return false, err
+	}
+	authKey, err := inlineSecret("auth_key", secret)
+	if err != nil {
+		return false, errors.New("placer: referenced AuthKey Provider must implement SandboxGroupAuthorizer")
+	}
+	return verifyAPIKey(authKey, apiKey), nil
 }
 
 func decodeFinalRequest(request *http.Request, limit int64, target any) error {
@@ -251,9 +264,6 @@ func (s *FinalService) Plan(ctx context.Context, request PlanRequest) (PlanRespo
 		if err != nil {
 			return PlanResponse{}, err
 		}
-		if keyLease.AuthKey.Type != routesync.KeyMaterialInline {
-			return PlanResponse{}, errors.New("placer: referenced AuthKey requires Provider access-token derivation support")
-		}
 		templateRef, err := clusterstate.ResolveTemplateRef(group, request.Sandbox.TemplateRef)
 		if err != nil {
 			return PlanResponse{}, err
@@ -266,7 +276,7 @@ func (s *FinalService) Plan(ctx context.Context, request PlanRequest) (PlanRespo
 		if err != nil {
 			return PlanResponse{}, err
 		}
-		accessToken, err := clusterstate.DeriveAccessToken(keyLease.AuthKey.Value, request.Sandbox.SandboxID)
+		accessToken, err := keys.MintToken()
 		if err != nil {
 			return PlanResponse{}, err
 		}

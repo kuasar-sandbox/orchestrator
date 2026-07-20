@@ -369,7 +369,8 @@ func tombstoneFromEvent(
 	}
 	tombstone := &clusterstate.RouteTombstoneState{
 		SandboxID: event.ObjectID, NodeID: event.NodeID, NodeEpoch: event.NodeEpoch,
-		BindingDigest: event.BindingDigest, LastEventSeq: event.EventSeq,
+		RegistryGeneration: event.RegistryGeneration,
+		BindingDigest:      event.BindingDigest, LastEventSeq: event.EventSeq,
 		Proof: proof, TerminalReason: reason,
 	}
 	next := clusterstate.RouteWorkflowRecord{
@@ -390,7 +391,7 @@ func fenceFromTombstone(record clusterstate.RouteWorkflowRecord) clusterstate.Ex
 	return clusterstate.ExecutionFence{
 		Group: record.Group, RouteKey: record.RouteKey, SandboxID: tombstone.SandboxID,
 		NodeID: tombstone.NodeID, NodeEpoch: tombstone.NodeEpoch,
-		RegistryGeneration: record.Revision.RegistryGeneration, BindingDigest: tombstone.BindingDigest,
+		RegistryGeneration: tombstone.RegistryGeneration, BindingDigest: tombstone.BindingDigest,
 		LastEventSeq: tombstone.LastEventSeq, FinalOutboxWatermark: tombstone.LastEventSeq,
 		Proof: tombstone.Proof,
 	}
