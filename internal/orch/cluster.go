@@ -468,7 +468,7 @@ func clusterCommandMetadata(
 		return nil, fmt.Errorf("cluster command execution binding identifies a different node")
 	}
 	if binding.NodeEpoch != cmd.NodeEpoch || binding.RegistryGeneration != cmd.RegistryGeneration {
-		return nil, fmt.Errorf("cluster command execution binding generation mismatch")
+		return nil, fmt.Errorf("cluster command execution binding Registry History Generation mismatch")
 	}
 	digest, err := clusterstate.ExecutionBindingDigest(cmd.Binding)
 	if err != nil {

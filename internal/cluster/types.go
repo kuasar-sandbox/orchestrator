@@ -47,7 +47,7 @@ const (
 )
 
 // RouteRecord is the group-sharded route_link value. AccessToken is the
-// placer-derived data-plane token for the current SandboxID generation; registry
+// placer-derived data-plane token for the current concrete Sandbox execution; registry
 // route owners return it without consulting sandbox-group providers.
 type RouteRecord struct {
 	Meta           RecordMeta                `json:"meta"`
