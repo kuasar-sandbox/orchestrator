@@ -275,6 +275,39 @@ func TestBuildAdmissionDoesNotOverwriteExistingLocalBuild(t *testing.T) {
 	}
 }
 
+func TestBuildQueueTerminalizesImpossibleHeadAfterCapacityShrink(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	initial := nodeexec.BuildCapacity{Slots: 2, QueueLimit: 4}
+	running := workflowDispatch(t, clusterstate.ExecutionKindBuild, "build-running", placement.BuildDemand{Slots: 2})
+	impossible := workflowDispatch(t, clusterstate.ExecutionKindBuild, "build-impossible", placement.BuildDemand{Slots: 2})
+	following := workflowDispatch(t, clusterstate.ExecutionKindBuild, "build-following", placement.BuildDemand{Slots: 1})
+	for _, dispatch := range []nodeexec.DispatchRecord{running, impossible, following} {
+		if _, err := st.PrepareBuildWorkflow(ctx, dispatch, workflowBuild(dispatch.ObjectID), initial, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := st.FailPendingNodeWorkflow(ctx, clusterstate.ExecutionKindBuild,
+		running.ObjectID, running.DemandDigest, "running_build_finished"); err != nil {
+		t.Fatal(err)
+	}
+
+	promoted, err := st.PromoteBuildQueue(ctx, "node-1", 7, nodeexec.BuildCapacity{Slots: 1, QueueLimit: 4}, 4)
+	if err != nil || len(promoted) != 1 || promoted[0].ObjectID != following.ObjectID {
+		t.Fatalf("promotion after capacity shrink = %+v, %v", promoted, err)
+	}
+	record, err := st.GetNodeWorkflow(ctx, clusterstate.ExecutionKindBuild, impossible.ObjectID)
+	if err != nil || record == nil || record.AdmissionState != nodeexec.AdmissionTerminal ||
+		record.LatestEvent == nil || record.LatestEvent.State != string(clusterstate.BuildError) ||
+		record.LatestEvent.Reason != "exceeds_build_capacity" {
+		t.Fatalf("impossible queue head = %+v, %v", record, err)
+	}
+	build, err := st.GetBuild(ctx, impossible.ObjectID)
+	if err != nil || build == nil || build.Status != types.BuildError || build.Reason != "exceeds_build_capacity" {
+		t.Fatalf("impossible Build = %+v, %v", build, err)
+	}
+}
+
 func TestBuildTerminalEventReleasesCapacityAndAckCannotDropNewerEvent(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()
@@ -579,7 +612,7 @@ func TestBuildQueuePromotionIsStrictFIFO(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()
 	initial := nodeexec.BuildCapacity{Slots: 2, QueueLimit: 4}
-	blocker := workflowDispatch(t, clusterstate.ExecutionKindBuild, "blocker", placement.BuildDemand{Slots: 2})
+	blocker := workflowDispatch(t, clusterstate.ExecutionKindBuild, "blocker", placement.BuildDemand{Slots: 1})
 	large := workflowDispatch(t, clusterstate.ExecutionKindBuild, "large", placement.BuildDemand{Slots: 2})
 	small := workflowDispatch(t, clusterstate.ExecutionKindBuild, "small", placement.BuildDemand{Slots: 1})
 	for _, dispatch := range []nodeexec.DispatchRecord{blocker, large, small} {
@@ -587,15 +620,7 @@ func TestBuildQueuePromotionIsStrictFIFO(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if _, err := st.ClaimBuildWorkflow(ctx, blocker.ObjectID, blocker.DemandDigest); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := st.CommitBuildEvent(ctx, workflowBuild(blocker.ObjectID), nodeexec.EventUpdate{
-		State: string(clusterstate.BuildError), Reason: "failed",
-	}); err != nil {
-		t.Fatal(err)
-	}
-	promoted, err := st.PromoteBuildQueue(ctx, "node-1", 7, nodeexec.BuildCapacity{Slots: 1, QueueLimit: 4}, 4)
+	promoted, err := st.PromoteBuildQueue(ctx, "node-1", 7, initial, 4)
 	if err != nil || len(promoted) != 0 {
 		t.Fatalf("strict FIFO promotion = %+v, %v", promoted, err)
 	}

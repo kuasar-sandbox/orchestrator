@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/nodeexec"
@@ -113,9 +114,14 @@ func (s *Store) CASExecutionBinding(
 		workflow.OpaqueBinding = replacement
 		workflow.BindingDigest = newDigest
 		if workflow.LatestEvent != nil {
+			if workflow.EventSeq == math.MaxUint64 {
+				return false, errors.New("store: execution event sequence exhausted during rebind")
+			}
 			event := *workflow.LatestEvent
 			event.RegistryGeneration = newBinding.RegistryGeneration
 			event.BindingDigest = newDigest
+			workflow.EventSeq++
+			event.EventSeq = workflow.EventSeq
 			if err := event.Validate(); err != nil {
 				return false, fmt.Errorf("store: rebind latest execution event: %w", err)
 			}

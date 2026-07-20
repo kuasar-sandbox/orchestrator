@@ -175,12 +175,12 @@ func (a *Authority) AdmitAndDispatch(
 		if err != nil {
 			return session.DispatchReply{}, err
 		}
-		prepared, err := a.sandbox.PrepareAdmission(dispatch.ObjectID, dispatch.DemandDigest, demand)
-		if err != nil {
-			if errors.Is(err, nodectl.ErrPreparedAdmissionConflict) {
-				return session.DispatchReply{Outcome: clusterstate.DispatchConflict, Reason: err.Error()}, nil
+		prepared, prepareErr := a.sandbox.PrepareAdmission(dispatch.ObjectID, dispatch.DemandDigest, demand)
+		if prepareErr != nil && !nodectl.FlushPublished(prepareErr) {
+			if errors.Is(prepareErr, nodectl.ErrPreparedAdmissionConflict) {
+				return session.DispatchReply{Outcome: clusterstate.DispatchConflict, Reason: prepareErr.Error()}, nil
 			}
-			return session.DispatchReply{}, err
+			return session.DispatchReply{}, prepareErr
 		}
 		decision, err := sandboxDecision(prepared)
 		if err != nil {
@@ -192,17 +192,28 @@ func (a *Authority) AdmitAndDispatch(
 				if decision.ReservationToken != "" {
 					owned, ownerErr := a.workflowOwnsSandboxReservation(ctx, dispatch, decision.ReservationToken)
 					if ownerErr != nil {
-						return session.DispatchReply{}, errors.Join(err, ownerErr)
+						return session.DispatchReply{}, errors.Join(prepareErr, err, ownerErr)
 					}
 					if !owned {
 						if _, releaseErr := a.sandbox.ReleaseAdmission(dispatch.ObjectID, dispatch.DemandDigest, "object_id_conflict"); releaseErr != nil {
-							return session.DispatchReply{}, errors.Join(err, releaseErr)
+							return session.DispatchReply{}, errors.Join(prepareErr, err, releaseErr)
 						}
 					}
 				}
+				if prepareErr != nil {
+					return session.DispatchReply{}, errors.Join(prepareErr, err)
+				}
 				return session.DispatchReply{Outcome: clusterstate.DispatchConflict, Reason: err.Error()}, nil
 			}
-			return session.DispatchReply{}, err
+			return session.DispatchReply{}, errors.Join(prepareErr, err)
+		}
+		if prepareErr != nil {
+			// The state-file rename published this Admission, so the journal must
+			// describe it before the durability error is returned without an ACK.
+			if record.AdmissionState == AdmissionAdmitted {
+				a.notifyWork()
+			}
+			return session.DispatchReply{}, prepareErr
 		}
 	case clusterstate.ExecutionKindBuild:
 		build, err := a.buildObject(dispatch)
@@ -278,11 +289,8 @@ func (a *Authority) PromoteSandboxQueue(ctx context.Context) error {
 		return ErrSessionFenced
 	}
 	defer done()
-	changed, err := a.sandbox.PromoteQueued()
-	if err != nil {
-		return err
-	}
-	var joined error
+	changed, promoteErr := a.sandbox.PromoteQueued()
+	joined := promoteErr
 	for _, result := range changed {
 		record, getErr := a.journal.GetNodeWorkflow(ctx, clusterstate.ExecutionKindSandbox, result.SandboxID)
 		if getErr != nil {
@@ -381,9 +389,12 @@ func (a *Authority) ReconcileSandboxAdmissions(ctx context.Context, limit int) e
 					joined = errors.Join(joined, fmt.Errorf("nodeexec: admitted Sandbox %s has controller state %s", record.ObjectID, prepared.State))
 				}
 			case AdmissionLaunching:
-				if prepared.State == nodectl.PreparedClaimed {
+				switch prepared.State {
+				case nodectl.PreparedClaimed:
 					a.notifyWork()
-				} else {
+				case nodectl.PreparedRejected, nodectl.PreparedReleased:
+					joined = errors.Join(joined, a.reconcileSandboxFailure(ctx, record, prepared))
+				default:
 					joined = errors.Join(joined, fmt.Errorf("nodeexec: launching Sandbox %s has controller state %s", record.ObjectID, prepared.State))
 				}
 			case AdmissionRunning:

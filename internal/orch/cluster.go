@@ -12,6 +12,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/buildcfg"
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/keys"
+	"github.com/kuasar-sandbox/orchestrator/internal/regcreds"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/store"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
@@ -431,19 +432,28 @@ func (o *Orchestrator) resolveNodeKeyMaterial(ctx context.Context, material rout
 }
 
 func (o *Orchestrator) resolveNodeRegistryAuth(ctx context.Context, auth routesync.NodeRegistryAuthV1) (string, error) {
+	var value string
 	switch auth.Type {
 	case "":
 		return "", nil
 	case routesync.KeyMaterialInline:
-		return auth.Value, nil
+		value = auth.Value
 	case routesync.KeyMaterialRef:
 		if o.keyResolver == nil {
 			return "", errors.New("provider registry auth resolver is not configured")
 		}
-		return o.keyResolver.ResolveRegistryAuth(ctx, auth.Ref)
+		resolved, err := o.keyResolver.ResolveRegistryAuth(ctx, auth.Ref)
+		if err != nil {
+			return "", err
+		}
+		value = resolved
 	default:
 		return "", errors.New("unsupported registry auth material type")
 	}
+	if err := regcreds.ValidateDockerAuth(value); err != nil {
+		return "", fmt.Errorf("invalid registry auth: %w", err)
+	}
+	return value, nil
 }
 
 func reject(cmd *routesync.Command, err error) *routesync.CmdAck {
