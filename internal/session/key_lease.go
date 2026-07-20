@@ -93,15 +93,16 @@ func (h *Holder) DropKeyLease(
 	if err := h.CheckServe(identity); err != nil {
 		return false, err
 	}
-	h.mu.RLock()
+	h.mu.Lock()
 	held := h.active[nodeID]
 	if held == nil || held.registration.NodeEpoch != nodeEpoch || held.registration.DataEndpoint != dataEndpoint {
-		h.mu.RUnlock()
+		h.mu.Unlock()
 		return false, ErrSessionUnavailable
 	}
 	endpoint, ok := held.endpoint.(commandEndpoint)
 	tuple := held.registration.Tuple
-	h.mu.RUnlock()
+	delete(held.keyLeases, keyLeaseRefID(ref))
+	h.mu.Unlock()
 	if !ok {
 		return false, errors.New("session: node-link endpoint cannot drop key leases")
 	}
@@ -117,12 +118,6 @@ func (h *Holder) DropKeyLease(
 	if ack.Status != routesync.AckAccepted || ack.KeyLeaseRef == nil || *ack.KeyLeaseRef != ref {
 		return true, errors.New("session: node did not acknowledge the exact dropped key lease")
 	}
-	h.mu.Lock()
-	current := h.active[nodeID]
-	if current != nil && current.registration.Tuple.Compare(tuple) == 0 {
-		delete(current.keyLeases, keyLeaseRefID(ref))
-	}
-	h.mu.Unlock()
 	return true, nil
 }
 

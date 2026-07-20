@@ -51,6 +51,10 @@ func TestDispatchSpecRejectsReservedRequestMetadata(t *testing.T) {
 	if _, err := MarshalSandboxDispatchSpec(spec); err == nil {
 		t.Fatal("system-owned request metadata accepted")
 	}
+	spec.Request = testNodeRequest(t, "/sandboxes", `{"Metadata":{"tenant":"value"}}`)
+	if _, err := MarshalSandboxDispatchSpec(spec); err == nil {
+		t.Fatal("non-canonical metadata field accepted")
+	}
 }
 
 func TestBuildDispatchSpecRequiresSeparateKeysAndResourceCeiling(t *testing.T) {
@@ -75,5 +79,9 @@ func TestBuildDispatchSpecRequiresSeparateKeysAndResourceCeiling(t *testing.T) {
 	spec.ManifestKeyFingerprint = spec.AuthKeyFingerprint
 	if _, err := MarshalBuildDispatchSpec(spec); err == nil {
 		t.Fatal("shared AuthKey/ManifestKey material accepted")
+	}
+	spec.ManifestKeyFingerprint = strings.Repeat("B", 24)
+	if _, err := MarshalBuildDispatchSpec(spec); err == nil {
+		t.Fatal("non-canonical key fingerprint accepted")
 	}
 }

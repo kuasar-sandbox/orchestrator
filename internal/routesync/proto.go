@@ -34,7 +34,7 @@ import (
 )
 
 // Version is the protocol version exchanged in Hello/Register.
-const Version = 2
+const Version = 3
 
 // PluginRegisterPattern is the config-socket route pattern (Go 1.22 method+wildcard)
 // a subscriber registers + opens its route stream on. PluginRegisterPath builds the
