@@ -461,8 +461,7 @@ func (o *Orchestrator) Route(ctx context.Context, request proxy.RouteRequest) (p
 		if s == nil {
 			return proxy.Route{Kind: proxy.KindNotFound}, nil
 		}
-		sb = s
-		o.cache(sb)
+		sb = o.cacheIfAbsent(s)
 	}
 	if kind, failed := validateSandboxRouteFence(sb, request); failed {
 		return proxy.Route{Kind: kind}, nil
@@ -495,8 +494,7 @@ func (o *Orchestrator) resumeIfPaused(ctx context.Context, sid string, request p
 		if s == nil {
 			return nil
 		}
-		o.cache(s)
-		sb = s
+		sb = o.cacheIfAbsent(s)
 	}
 	if _, failed := validateSandboxRouteFence(sb, request); failed {
 		return errSandboxRouteFenceChanged
@@ -849,6 +847,19 @@ func (o *Orchestrator) cache(sb *types.Sandbox) {
 	o.mu.Lock()
 	o.reg[sb.ID] = sb
 	o.mu.Unlock()
+}
+
+// cacheIfAbsent publishes a store read only while no newer in-memory snapshot
+// exists. A delayed reader must not replace a running snapshot with the paused
+// row it loaded before a concurrent resume committed.
+func (o *Orchestrator) cacheIfAbsent(sb *types.Sandbox) *types.Sandbox {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if current := o.reg[sb.ID]; current != nil {
+		return current
+	}
+	o.reg[sb.ID] = sb
+	return sb
 }
 func (o *Orchestrator) uncache(id string) {
 	o.mu.Lock()

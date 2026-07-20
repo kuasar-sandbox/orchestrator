@@ -113,6 +113,9 @@ func filterCatalog(nodes []CatalogNode, policy StaticPolicy, capacity func(Catal
 			continue
 		}
 		seen[node.NodeID] = struct{}{}
+		if policy.TargetRuntimeDigest == "" {
+			node.RuntimeDigest = ""
+		}
 		eligible = append(eligible, node)
 	}
 	return eligible
@@ -163,7 +166,8 @@ func matchesSelectors(labels map[string]string, selectors []map[string]string) b
 		}
 		sort.Strings(keys)
 		for _, key := range keys {
-			if labels[key] != selector[key] {
+			value, present := labels[key]
+			if !present || value != selector[key] {
 				matches = false
 				break
 			}
