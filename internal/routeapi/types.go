@@ -29,7 +29,7 @@ type RequestIdentity struct {
 
 func (i RequestIdentity) Validate() error {
 	if i.ClusterID == "" || i.RegistryGeneration == "" || i.SystemEpoch == 0 || i.RegistryLayoutDigest == "" {
-		return errors.New("routeapi: incomplete cluster/generation identity")
+		return errors.New("routeapi: incomplete cluster/Registry History Generation identity")
 	}
 	return nil
 }

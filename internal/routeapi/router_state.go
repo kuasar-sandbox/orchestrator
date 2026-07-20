@@ -7,7 +7,7 @@ type routeIdentity struct {
 	routeKey string
 }
 
-// RouterState carries the generation-fenced request identity, monotonic
+// RouterState carries the Registry-History-Generation-fenced request identity, monotonic
 // per-Route minimum revisions, and cached shard leader hints. It is not a Route
 // authority and stores no workflow state.
 type RouterState struct {
