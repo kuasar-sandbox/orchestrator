@@ -13,7 +13,7 @@ import (
 
 // HTTPClient returns an http.Client whose transport dials the given UDS for every
 // request (the host in the URL is ignored — use http://localhost/<path>). Shared by
-// the run-sandbox / run-builder launchers (task plane) and the manifest-key /
+// the run-sandbox / run-builder launchers (task plane) and the key-lease /
 // export-sandbox / import-sandbox CLIs.
 func HTTPClient(socket string) *http.Client {
 	return HTTPClientWithTimeout(socket, 30*time.Second)

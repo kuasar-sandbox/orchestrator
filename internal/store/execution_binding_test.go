@@ -19,7 +19,8 @@ func TestCASExecutionBinding(t *testing.T) {
 	oldOpaque := testOpaqueBinding(t, "generation-1", "s1", "n1", 7)
 	newOpaque := testOpaqueBinding(t, "generation-2", "s1", "n1", 7)
 	if err := st.Put(ctx, &types.Sandbox{
-		ID: "s1", State: types.StatePaused, ManifestKey: strings.Repeat("1", 64),
+		ID: "s1", State: types.StatePaused,
+		AuthKey: strings.Repeat("2", 64), ManifestKey: strings.Repeat("1", 64),
 		Metadata: map[string]string{"user": "value", clusterstate.ObjectMetadataKey: oldOpaque},
 	}); err != nil {
 		t.Fatal(err)

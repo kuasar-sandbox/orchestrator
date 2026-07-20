@@ -61,31 +61,39 @@ func (s stubProvider) PostBuildResult(_ context.Context, runID, buildID string, 
 
 type stubAdmin struct{ keys map[string]string }
 
-func (a *stubAdmin) AddManifestKey(_ context.Context, key, label string, _ int64, _ string) (bool, string, error) {
+func adminLeaseKey(group, authKey, manifestKey string) string {
+	return group + "/" + authKey + "/" + manifestKey
+}
+
+func (a *stubAdmin) PutKeyLease(_ context.Context, group, authKey, manifestKey, label string, _ int64, _ string) (bool, string, string, error) {
+	key := adminLeaseKey(group, authKey, manifestKey)
 	if _, ok := a.keys[key]; ok {
-		return false, "fp-" + key, nil
+		return false, "fp-" + authKey, "fp-" + manifestKey, nil
 	}
 	a.keys[key] = label
-	return true, "fp-" + key, nil
+	return true, "fp-" + authKey, "fp-" + manifestKey, nil
 }
 
-func (a *stubAdmin) RemoveManifestKey(_ context.Context, key string) (bool, string, error) {
+func (a *stubAdmin) DropKeyLease(_ context.Context, group, authKey, manifestKey string) (bool, string, string, error) {
+	key := adminLeaseKey(group, authKey, manifestKey)
 	if _, ok := a.keys[key]; ok {
 		delete(a.keys, key)
-		return true, "fp-" + key, nil
+		return true, "fp-" + authKey, "fp-" + manifestKey, nil
 	}
-	return false, "fp-" + key, nil
+	return false, "fp-" + authKey, "fp-" + manifestKey, nil
 }
 
-func (a *stubAdmin) HasManifestKey(_ context.Context, key string) (bool, string, error) {
-	_, ok := a.keys[key]
-	return ok, "fp-" + key, nil
+func (a *stubAdmin) HasKeyLease(_ context.Context, group, authKey, manifestKey string) (bool, string, string, error) {
+	_, ok := a.keys[adminLeaseKey(group, authKey, manifestKey)]
+	return ok, "fp-" + authKey, "fp-" + manifestKey, nil
 }
 
-func (a *stubAdmin) ListManifestKeys(_ context.Context) ([]AdminKeyInfo, error) {
-	out := make([]AdminKeyInfo, 0, len(a.keys))
-	for k, label := range a.keys {
-		out = append(out, AdminKeyInfo{Fingerprint: "fp-" + k, Label: label})
+func (a *stubAdmin) ListKeyLeases(_ context.Context) ([]AdminKeyLeaseInfo, error) {
+	out := make([]AdminKeyLeaseInfo, 0, len(a.keys))
+	for _, label := range a.keys {
+		out = append(out, AdminKeyLeaseInfo{
+			Group: "g", AuthKeyFingerprint: "fp-a", ManifestKeyFingerprint: "fp-m", Label: label,
+		})
 	}
 	return out, nil
 }
@@ -129,10 +137,10 @@ func rawPost(t *testing.T, client *http.Client, path string, body any) (int, []b
 	return resp.StatusCode, rb
 }
 
-func adminPost(t *testing.T, client *http.Client, req AdminKeyRequest) AdminKeyResponse {
+func adminPost(t *testing.T, client *http.Client, req AdminKeyLeaseRequest) AdminKeyLeaseResponse {
 	t.Helper()
-	_, body := rawPost(t, client, PathAdminManifestKey, req)
-	var r AdminKeyResponse
+	_, body := rawPost(t, client, PathAdminKeyLease, req)
+	var r AdminKeyLeaseResponse
 	if err := json.Unmarshal(body, &r); err != nil {
 		t.Fatalf("decode admin resp: %v (%s)", err, body)
 	}
@@ -187,27 +195,32 @@ func TestRunPlane(t *testing.T) {
 }
 
 // TestAdminPlane: with admin_pidfile unset, the admin plane is reachable (socket
-// perms gate) and add/check/list/remove round-trip.
+// perms gate) and put/check/list/drop round-trip.
 func TestAdminPlane(t *testing.T) {
 	adm := &stubAdmin{keys: map[string]string{}}
 	_, client := startTestServer(t, Deps{Admin: adm})
 
-	if r := adminPost(t, client, AdminKeyRequest{Op: "add", Key: "k1", Label: "L"}); r.Status != "added" || r.Fingerprint != "fp-k1" {
-		t.Fatalf("add: %+v", r)
+	req := AdminKeyLeaseRequest{Group: "g", AuthKey: "a", ManifestKey: "m"}
+	req.Op, req.Label = "put", "L"
+	if r := adminPost(t, client, req); r.Status != "added" || r.AuthKeyFingerprint != "fp-a" || r.ManifestKeyFingerprint != "fp-m" {
+		t.Fatalf("put: %+v", r)
 	}
-	if r := adminPost(t, client, AdminKeyRequest{Op: "add", Key: "k1"}); r.Status != "refreshed" {
-		t.Fatalf("re-add: %+v", r)
+	req.Op, req.Label = "put", ""
+	if r := adminPost(t, client, req); r.Status != "refreshed" {
+		t.Fatalf("refresh: %+v", r)
 	}
-	if r := adminPost(t, client, AdminKeyRequest{Op: "check", Key: "k1"}); r.Status != "present" {
+	req.Op = "check"
+	if r := adminPost(t, client, req); r.Status != "present" {
 		t.Fatalf("check: %+v", r)
 	}
-	_, body := rawGet(t, client, PathAdminManifestKey)
-	var infos []AdminKeyInfo
-	if err := json.Unmarshal(body, &infos); err != nil || len(infos) != 1 || infos[0].Fingerprint != "fp-k1" {
+	_, body := rawGet(t, client, PathAdminKeyLease)
+	var infos []AdminKeyLeaseInfo
+	if err := json.Unmarshal(body, &infos); err != nil || len(infos) != 1 || infos[0].AuthKeyFingerprint != "fp-a" {
 		t.Fatalf("list: %s (err %v)", body, err)
 	}
-	if r := adminPost(t, client, AdminKeyRequest{Op: "remove", Key: "k1"}); r.Status != "removed" {
-		t.Fatalf("remove: %+v", r)
+	req.Op = "drop"
+	if r := adminPost(t, client, req); r.Status != "removed" {
+		t.Fatalf("drop: %+v", r)
 	}
 }
 
@@ -219,12 +232,13 @@ func TestAdminPidfileGate(t *testing.T) {
 	adm := &stubAdmin{keys: map[string]string{}}
 	_, client := startTestServer(t, Deps{Admin: adm, AdminPidfile: pf})
 
-	if code, _ := rawPost(t, client, PathAdminManifestKey, AdminKeyRequest{Op: "add", Key: "k1"}); code != http.StatusForbidden {
+	req := AdminKeyLeaseRequest{Op: "put", Group: "g", AuthKey: "a", ManifestKey: "m"}
+	if code, _ := rawPost(t, client, PathAdminKeyLease, req); code != http.StatusForbidden {
 		t.Fatalf("excluded pid should be 403, got %d", code)
 	}
 	mustWrite(t, pf, strconv.Itoa(os.Getpid())+"\n")
-	if r := adminPost(t, client, AdminKeyRequest{Op: "add", Key: "k1"}); r.Status != "added" {
-		t.Fatalf("allowlisted pid should add: %+v", r)
+	if r := adminPost(t, client, req); r.Status != "added" {
+		t.Fatalf("allowlisted pid should put: %+v", r)
 	}
 }
 

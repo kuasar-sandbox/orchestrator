@@ -2,6 +2,7 @@ package orch
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
@@ -26,7 +27,10 @@ func TestClaimClusterCreateRejectsInflightAndStoredSandboxIDs(t *testing.T) {
 	}
 	o.releaseClusterCreate("inflight")
 
-	if err := o.st.Put(ctx, &types.Sandbox{ID: "stored", State: types.StateRunning}); err != nil {
+	if err := o.st.Put(ctx, &types.Sandbox{
+		ID: "stored", State: types.StateRunning,
+		AuthKey: strings.Repeat("1", 64), ManifestKey: strings.Repeat("2", 64),
+	}); err != nil {
 		t.Fatal(err)
 	}
 	if err := o.claimClusterCreate(ctx, "stored"); err == nil {

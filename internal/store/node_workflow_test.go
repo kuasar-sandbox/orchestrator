@@ -91,7 +91,8 @@ func workflowDispatchSpec(
 
 func workflowBuild(id string) *types.Build {
 	return &types.Build{
-		BuildID: id, TemplateID: "transient-" + id, ManifestKey: strings.Repeat("1", 64),
+		BuildID: id, TemplateID: "transient-" + id,
+		AuthKey: strings.Repeat("4", 64), ManifestKey: strings.Repeat("1", 64), CPUCount: 2, MemoryMB: 2048,
 		Profile: types.ProfileE2B, Kind: types.KindImg, CreatedUnix: time.Now().Unix(),
 		Metadata: map[string]string{"user": "kept", clusterstate.ObjectMetadataKey: "forged"},
 	}
@@ -128,7 +129,8 @@ func workflowDispatchEpoch(
 
 func workflowSandbox(id string) *types.Sandbox {
 	return &types.Sandbox{
-		ID: id, TemplateID: "e2b-img-" + strings.Repeat("2", 64), ManifestKey: strings.Repeat("3", 64),
+		ID: id, TemplateID: "e2b-img-" + strings.Repeat("2", 64),
+		AuthKey: strings.Repeat("4", 64), ManifestKey: strings.Repeat("3", 64),
 		EnvdAccessToken: "access", TrafficAccessToken: "traffic", CreatedUnix: time.Now().Unix(),
 		Metadata: map[string]string{"user": "kept", clusterstate.ObjectMetadataKey: "forged"},
 	}

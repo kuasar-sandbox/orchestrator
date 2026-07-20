@@ -3,7 +3,7 @@ package main
 // In-process integration of the local control socket's admin + api planes with a
 // real store-backed orchestrator (no launcher/vswitch — those planes don't touch
 // them), driving the actual CLI entry-points. Proves the full client path:
-// manifestKeyCmd/exportSandboxCmd → udsDo → UDS → configsock → orch.Admin/api.Core →
+// keyLeaseCmd/exportSandboxCmd → udsDo → UDS → configsock → orch.Admin/api.Core →
 // store. (The systemd-dependent `serve` path is covered by the root e2e instead.)
 
 import (
@@ -88,47 +88,53 @@ func captureStdout(t *testing.T, fn func() error) (string, error) {
 	return string(b), err
 }
 
-// TestManifestKeyCmdAdminPlane drives the real manifest-key CLI against a real
+// TestKeyLeaseCmdAdminPlane drives the real key-lease CLI against a real
 // store-backed admin plane over the control socket.
-func TestManifestKeyCmdAdminPlane(t *testing.T) {
+func TestKeyLeaseCmdAdminPlane(t *testing.T) {
 	sock := startCtlSocket(t)
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	const auth = "2222222222222222222222222222222222222222222222222222222222222222"
 	const mk = "1111111111111111111111111111111111111111111111111111111111111111"
+	args := func(sub string) []string {
+		return []string{sub, "--group", "/test", "--auth-key", auth, "--manifest-key", mk, "--socket", sock}
+	}
 
 	out, err := captureStdout(t, func() error {
-		return manifestKeyCmd([]string{"add", "--label", "dev", "--socket", sock, mk}, log)
+		return keyLeaseCmd(append(args("put"), "--label", "dev"), log)
 	})
 	if err != nil || !strings.HasPrefix(out, "added ") {
-		t.Fatalf("add: out=%q err=%v", out, err)
+		t.Fatalf("put: out=%q err=%v", out, err)
 	}
 	fp := strings.TrimSpace(strings.TrimPrefix(out, "added "))
 
 	out, err = captureStdout(t, func() error {
-		return manifestKeyCmd([]string{"add", "--socket", sock, mk}, log)
+		return keyLeaseCmd(args("put"), log)
 	})
 	if err != nil || !strings.HasPrefix(out, "refreshed ") {
 		t.Fatalf("re-add: out=%q err=%v", out, err)
 	}
 
 	out, err = captureStdout(t, func() error {
-		return manifestKeyCmd([]string{"check", "--socket", sock, mk}, log)
+		return keyLeaseCmd(args("check"), log)
 	})
 	if err != nil || !strings.HasPrefix(out, "present ") {
 		t.Fatalf("check: out=%q err=%v", out, err)
 	}
 
 	out, err = captureStdout(t, func() error {
-		return manifestKeyCmd([]string{"list", "--socket", sock}, log)
+		return keyLeaseCmd([]string{"list", "--socket", sock}, log)
 	})
 	if err != nil || !strings.Contains(out, fp) {
 		t.Fatalf("list: out=%q err=%v (want fp %s)", out, err, fp)
 	}
 
-	// Bad key is validated daemon-side (the CLI never sees key material logic).
+	// Bad key is validated daemon-side.
 	if _, err := captureStdout(t, func() error {
-		return manifestKeyCmd([]string{"add", "--socket", sock, "nothex"}, log)
+		bad := args("put")
+		bad[4] = "nothex"
+		return keyLeaseCmd(bad, log)
 	}); err == nil {
-		t.Fatal("add of a non-hex key should error")
+		t.Fatal("put of a non-hex key should error")
 	}
 }
 

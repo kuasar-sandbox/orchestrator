@@ -24,7 +24,8 @@ func TestResolveTemplateAlias(t *testing.T) {
 	persist := "e2b-img-" + strings.Repeat("a", 64)
 	b := &types.Build{
 		BuildID: "b1", TemplateID: "transient-xyz", PersistID: persist,
-		ManifestKey: mk, Profile: types.ProfileE2B, Kind: types.KindImg,
+		AuthKey: mk, ManifestKey: strings.Repeat("5", 64), CPUCount: 2, MemoryMB: 2048,
+		Profile: types.ProfileE2B, Kind: types.KindImg,
 		Status: types.BuildReady, Names: []string{"my-app", persist}, Aliases: []string{persist},
 		CreatedUnix: 1,
 	}

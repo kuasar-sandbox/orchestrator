@@ -179,7 +179,8 @@ func newAuthorityWithCapacity(
 		func(record nodeexec.DispatchRecord) (*types.Build, error) {
 			return &types.Build{
 				BuildID: record.ObjectID, TemplateID: "transient-" + record.ObjectID,
-				ManifestKey: strings.Repeat("4", 64), Profile: types.ProfileE2B,
+				AuthKey: strings.Repeat("3", 64), ManifestKey: strings.Repeat("4", 64),
+				CPUCount: 2, MemoryMB: 2048, Profile: types.ProfileE2B,
 				Kind: types.KindImg, CreatedUnix: time.Now().Unix(),
 			}, nil
 		},
@@ -644,7 +645,7 @@ func TestAuthorityRejectsExistingLocalObjectBeforeAdmissionSideEffects(t *testin
 	command := authorityCommand(t, clusterstate.ExecutionKindSandbox, "sandbox-existing")
 	if err := st.Put(context.Background(), &types.Sandbox{
 		ID: command.ObjectID, TemplateID: "e2b-img-" + strings.Repeat("5", 64),
-		ManifestKey: strings.Repeat("6", 64), State: types.StateRunning,
+		AuthKey: strings.Repeat("7", 64), ManifestKey: strings.Repeat("6", 64), State: types.StateRunning,
 	}); err != nil {
 		t.Fatal(err)
 	}

@@ -31,6 +31,25 @@ func TestRequestedBuildProfile(t *testing.T) {
 	}
 }
 
+func TestPositiveAlias(t *testing.T) {
+	one, two, zero := 1, 2, 0
+	if got, err := positiveAlias("cpuCount", &one, &one, true); err != nil || got != 1 {
+		t.Fatalf("matching aliases = %d, %v", got, err)
+	}
+	if _, err := positiveAlias("cpuCount", &one, &two, true); err == nil {
+		t.Fatal("conflicting aliases were accepted")
+	}
+	if _, err := positiveAlias("cpuCount", &zero, nil, false); err == nil {
+		t.Fatal("explicit zero was accepted")
+	}
+	if got, err := positiveAlias("cpuCount", nil, nil, false); err != nil || got != 0 {
+		t.Fatalf("omitted optional alias = %d, %v", got, err)
+	}
+	if _, err := positiveAlias("cpuCount", nil, nil, true); err == nil {
+		t.Fatal("omitted required alias was accepted")
+	}
+}
+
 func TestMergeConfigHeaders(t *testing.T) {
 	// No headers => no allocation.
 	if m := mergeConfigHeaders(nil, http.Header{}); m != nil {

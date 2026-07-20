@@ -95,7 +95,8 @@ type Sandbox struct {
 	VswitchPort        string // vswitch port handle (1-based; slot is vswitch-internal)
 	InnerIP            string // guest inner IP (CIDR), passed to vswitch attach + Network.IP
 	PortMAC            string // per-port MAC from attach -> Network.MAC
-	ManifestKey        string // SHA256(api_key), hex; never written to env/yaml
+	AuthKey            string // caller API authentication root; encrypted at rest
+	ManifestKey        string // content cryptography root; never accepted for API authentication
 	SnapshotRef        string // latest snapshot manifest key (for resume); empty if never paused
 	EnvdAccessToken    string
 	TrafficAccessToken string

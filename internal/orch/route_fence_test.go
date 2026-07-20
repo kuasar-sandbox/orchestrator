@@ -104,7 +104,8 @@ func TestRebindClusterExecutionUsesDigestCAS(t *testing.T) {
 	oldDigest, _ := clusterstate.ExecutionBindingDigest(oldOpaque)
 	newDigest, _ := clusterstate.ExecutionBindingDigest(newOpaque)
 	if err := o.st.Put(ctx, &types.Sandbox{
-		ID: "s1", State: types.StatePaused, ManifestKey: strings.Repeat("1", 64),
+		ID: "s1", State: types.StatePaused,
+		AuthKey: strings.Repeat("2", 64), ManifestKey: strings.Repeat("1", 64),
 		Metadata: map[string]string{clusterstate.ObjectMetadataKey: oldOpaque},
 	}); err != nil {
 		t.Fatal(err)

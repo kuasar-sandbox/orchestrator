@@ -11,13 +11,15 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/apikey"
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
+	"github.com/kuasar-sandbox/orchestrator/internal/store"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
 func allowlistedBuildIdentity(t *testing.T, o *Orchestrator) (apiKey, manifestKey, fingerprint string) {
 	t.Helper()
+	authKey := strings.Repeat("4b", 32)
 	manifestKey = strings.Repeat("5a", 32)
-	raw, err := hex.DecodeString(manifestKey)
+	raw, err := hex.DecodeString(authKey)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -25,7 +27,14 @@ func allowlistedBuildIdentity(t *testing.T, o *Orchestrator) (apiKey, manifestKe
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, fingerprint, err = o.AddManifestKey(context.Background(), manifestKey, "test", 0, "")
+	_, _, _, err = o.PutKeyLease(context.Background(), "/test", authKey, manifestKey, "test", 0, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = o.st.AddManifestKey(context.Background(), manifestKey, "pre-cutover", 0, ""); err != nil {
+		t.Fatal(err)
+	}
+	fingerprint, err = store.ManifestKeyHash(manifestKey)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -38,7 +47,7 @@ func TestRegisterBuildPersistsBareProfile(t *testing.T) {
 	apiKey, _, _ := allowlistedBuildIdentity(t, o)
 
 	b, err := o.RegisterBuild(ctx, apiKey, api.RegisterSpec{
-		Name: "bare-template", Tags: []string{"bare-tag"}, Profile: types.ProfileBare,
+		Name: "bare-template", Tags: []string{"bare-tag"}, Profile: types.ProfileBare, CPUCount: 2, MemoryMB: 2048,
 	})
 	if err != nil {
 		t.Fatalf("RegisterBuild: %v", err)
@@ -56,7 +65,7 @@ func TestTriggerBareBuildRejectsCommandsAndQueuesImage(t *testing.T) {
 	o := testOrch(t)
 	ctx := context.Background()
 	apiKey, _, _ := allowlistedBuildIdentity(t, o)
-	b, err := o.RegisterBuild(ctx, apiKey, api.RegisterSpec{Profile: types.ProfileBare})
+	b, err := o.RegisterBuild(ctx, apiKey, api.RegisterSpec{Profile: types.ProfileBare, CPUCount: 2, MemoryMB: 2048})
 	if err != nil {
 		t.Fatal(err)
 	}

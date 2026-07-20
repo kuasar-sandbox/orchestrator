@@ -67,8 +67,11 @@ type Build struct {
 	BuildID      string  // e2b build id (uuidv7)
 	TemplateID   string  // transient-<uuidv7>, the register-time handle
 	PersistID    string  // <profile>-<kind>-<key>, set when ready
-	ManifestKey  string  // per-tenant manifest key (hex); ownership + crypto root
+	AuthKey      string  // caller API authentication root (hex)
+	ManifestKey  string  // content cryptography root (hex)
 	Profile      Profile // immutable output profile selected at registration
+	CPUCount     int     // immutable registration ceiling in vCPUs
+	MemoryMB     int     // immutable registration ceiling in MiB
 	Kind         Kind    // img (flatten only) | snp (boot+snapshot)
 	FromImage    string  // OCI base image (the Dockerfile FROM); mutually exclusive with FromTemplate
 	FromTemplate string  // base template ref (its snapshot cfg supplies the base image + start/ready defaults)
