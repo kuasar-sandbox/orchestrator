@@ -1095,7 +1095,7 @@ func (r *Registry) readyResultFromRecord(ctx context.Context, rec *SandboxRecord
 
 // DeleteSandboxRoute sends the authoritative delete command for an exact
 // group-scoped route. The caller must provide group + route_key + current sid so
-// a stale client cannot delete a replacement sandbox generation.
+// a stale client cannot delete a replacement Sandbox execution.
 func (r *Registry) DeleteSandboxRoute(ctx context.Context, group, routeKey, sid string) (bool, error) {
 	if group == "" || routeKey == "" || sid == "" {
 		return false, nil

@@ -16,7 +16,7 @@
 // The initial route set is streamed one Upsert per sandbox, then a Bookmark marks
 // "initial sync complete" — no materialized all-routes frame (bounded send-side
 // memory at high sandbox density). The subscriber applies the stream against a sync
-// generation and, on the Bookmark, drops entries it did not see this stream (which
+// epoch and, on the Bookmark, drops entries it did not see this stream (which
 // recovers deletions that happened while it was disconnected.
 //
 // On a Wake the orchestrator resumes the sandbox (single-flight) and the resulting

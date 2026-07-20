@@ -139,7 +139,7 @@ func (s *Store) CASExecutionBinding(
 
 func validateWorkflowBinding(
 	workflow *nodeexec.WorkflowRecord,
-	opaque, digest, generation string,
+	opaque, digest, registryGeneration string,
 ) error {
 	if workflow == nil {
 		return nil
@@ -162,7 +162,7 @@ func validateWorkflowBinding(
 	}
 	if event.ObjectKind != executionKindName(workflow.Kind) || event.ObjectID != workflow.ObjectID ||
 		event.NodeID != workflow.NodeID || event.NodeEpoch != workflow.NodeEpoch ||
-		event.RegistryGeneration != generation || event.BindingDigest != digest || event.EventSeq != workflow.EventSeq {
+		event.RegistryGeneration != registryGeneration || event.BindingDigest != digest || event.EventSeq != workflow.EventSeq {
 		return fmt.Errorf("%w: node workflow event and Binding disagree", ErrNodeWorkflowConflict)
 	}
 	return nil

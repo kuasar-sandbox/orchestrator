@@ -1264,7 +1264,7 @@ func (s *Store) notifyEvent() {
 }
 
 // PendingExecutionEvents returns the latest unacknowledged fact per object for
-// the exact durable node generation. It never materializes an unbounded replay.
+// the exact durable NodeEpoch. It never materializes an unbounded replay.
 func (s *Store) PendingExecutionEvents(
 	ctx context.Context,
 	nodeID string,

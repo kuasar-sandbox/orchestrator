@@ -41,14 +41,14 @@ func (o *Orchestrator) routeEntry(sb *types.Sandbox) routesync.RouteEntry {
 		SnapshotLocation:   snapshotLocation(sb.SnapshotRef),
 		MmdsSecret:         hex.EncodeToString(keys.MmdsSecret(sb.ManifestKey, sb.ID)),
 	}
-	if managed, nodeID, nodeEpoch, generation, digest, err := sandboxRouteFence(sb); managed {
+	if managed, nodeID, nodeEpoch, registryGeneration, digest, err := sandboxRouteFence(sb); managed {
 		if err != nil {
 			// A malformed system-owned Binding must fail closed at every proxy.
 			e.BindingDigest = "invalid"
 		} else {
 			e.NodeID = nodeID
 			e.NodeEpoch = nodeEpoch
-			e.RegistryGeneration = generation
+			e.RegistryGeneration = registryGeneration
 			e.BindingDigest = digest
 		}
 	}
