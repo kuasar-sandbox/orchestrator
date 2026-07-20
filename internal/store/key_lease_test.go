@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -27,6 +28,15 @@ func TestKeyLeaseExactIdentityExpiryAndRotation(t *testing.T) {
 	lease, found, err := st.KeyLeaseByFingerprints(ctx, "/g", authFP, manifestOneFP)
 	if err != nil || !found || lease.AuthKey != authKey || lease.ManifestKey != manifestOne || lease.RegistryAuth == "" {
 		t.Fatalf("resolved lease = %+v, %t, %v", lease, found, err)
+	}
+	if _, err := st.PutKeyLease(ctx, KeyLease{
+		Group: "/g", AuthKey: authKey, ManifestKey: manifestOne, ExpiresUnix: expires,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	lease, found, err = st.KeyLeaseByFingerprints(ctx, "/g", authFP, manifestOneFP)
+	if err != nil || !found || lease.RegistryAuth == "" {
+		t.Fatalf("refresh erased registry auth: %+v, %t, %v", lease, found, err)
 	}
 
 	if _, err := st.PutKeyLease(ctx, KeyLease{
@@ -53,6 +63,45 @@ func TestKeyLeaseExactIdentityExpiryAndRotation(t *testing.T) {
 	}
 	if count, err := st.PruneExpiredKeyLeases(ctx); err != nil || count != 1 {
 		t.Fatalf("PruneExpiredKeyLeases = %d, %v", count, err)
+	}
+}
+
+func TestKeyLeaseRefreshIsAtomicWithExpiryPruning(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	authKey := strings.Repeat("e", 64)
+	manifestKey := strings.Repeat("f", 64)
+	if _, err := st.PutKeyLease(ctx, KeyLease{
+		Group: "/race", AuthKey: authKey, ManifestKey: manifestKey, ExpiresUnix: time.Now().Unix() - 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	errCh := make(chan error, 2)
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		_, err := st.PutKeyLease(ctx, KeyLease{
+			Group: "/race", AuthKey: authKey, ManifestKey: manifestKey, ExpiresUnix: time.Now().Add(time.Hour).Unix(),
+		})
+		errCh <- err
+	}()
+	go func() {
+		defer wg.Done()
+		_, err := st.PruneExpiredKeyLeases(ctx)
+		errCh <- err
+	}()
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	authFP, _ := AuthKeyHash(authKey)
+	manifestFP, _ := ManifestKeyHash(manifestKey)
+	if _, found, err := st.KeyLeaseByFingerprints(ctx, "/race", authFP, manifestFP); err != nil || !found {
+		t.Fatalf("atomic refresh lost the lease: found=%v err=%v", found, err)
 	}
 }
 
