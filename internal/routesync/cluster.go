@@ -85,8 +85,8 @@ const (
 	CmdCreate        = "create"         // boot a sandbox from a template
 	CmdConnect       = "connect"        // resume a node-local PAUSED sandbox
 	CmdDelete        = "delete"         // destroy a sandbox
-	CmdKeyPut        = "key_put"        // install / renew a manifest-key lease (heartbeat refresh; cluster.md)
-	CmdKeyDrop       = "key_drop"       // drop a key lease
+	CmdKeyPut        = "key_put"        // durably install / renew a complete group key lease
+	CmdKeyDrop       = "key_drop"       // drop one exact group key lease; TTL remains authoritative
 	CmdBuildRegister = "build_register" // pre-provision a build on the node (registry-assigned ids, §7.5)
 
 	CmdSandboxAdmitDispatch = "sandbox_admit_dispatch"
@@ -186,23 +186,29 @@ type Heartbeat struct {
 // and reports the terminal sandbox state via the route stream; commands are
 // idempotent by SID. Fields are populated per Kind.
 type Command struct {
-	CmdID              string `json:"cmd_id"`
-	Kind               string `json:"kind"` // CmdCreate | CmdConnect | CmdDelete | CmdKey* | CmdBuildRegister
-	SID                string `json:"sid,omitempty"`
-	NodeEpoch          uint64 `json:"node_epoch,omitempty"`
-	SessionSeq         uint64 `json:"session_seq,omitempty"`
-	RegistryGeneration string `json:"registry_generation,omitempty"`
-	Binding            string `json:"binding,omitempty"`
-	BindingDigest      string `json:"binding_digest,omitempty"`
-	OldBindingDigest   string `json:"old_binding_digest,omitempty"`
-	DemandDigest       string `json:"demand_digest,omitempty"`
-	DispatchSpecDigest string `json:"dispatch_spec_digest,omitempty"`
+	CmdID                  string `json:"cmd_id"`
+	Kind                   string `json:"kind"` // CmdCreate | CmdConnect | CmdDelete | CmdKey* | CmdBuildRegister
+	SID                    string `json:"sid,omitempty"`
+	NodeEpoch              uint64 `json:"node_epoch,omitempty"`
+	SessionSeq             uint64 `json:"session_seq,omitempty"`
+	RegistryGeneration     string `json:"registry_generation,omitempty"`
+	Binding                string `json:"binding,omitempty"`
+	BindingDigest          string `json:"binding_digest,omitempty"`
+	OldBindingDigest       string `json:"old_binding_digest,omitempty"`
+	DemandDigest           string `json:"demand_digest,omitempty"`
+	DispatchSpecDigest     string `json:"dispatch_spec_digest,omitempty"`
+	AuthKeyFingerprint     string `json:"auth_key_fingerprint,omitempty"`
+	ManifestKeyFingerprint string `json:"manifest_key_fingerprint,omitempty"`
 	// create
 	TemplateRef    string            `json:"template_ref,omitempty"` // snapshot template ref (cold start = fast restore)
 	KeyFingerprint string            `json:"key_fp,omitempty"`       // manifest-key fingerprint the node must already hold
 	Config         map[string]string `json:"config,omitempty"`       // merged sandbox config (node default ⊕ group ⊕ create)
 	AccessToken    string            `json:"access_token,omitempty"` // MAC(auth_key,sid), supplied by registry
 	// key_put / key_drop
+	KeyLease    *NodeKeyLeaseV1    `json:"key_lease,omitempty"`
+	KeyLeaseRef *NodeKeyLeaseRefV1 `json:"key_lease_ref,omitempty"`
+	// The old manifest-only fields remain consumed by the pre-cutover runtime.
+	// The atomic final cutover removes that path; new dispatch uses KeyLease.
 	ManifestKeyType string `json:"manifest_key_type,omitempty"` // inline | ref
 	ManifestKey     string `json:"manifest_key,omitempty"`      // hex; only on inline key_put
 	ManifestKeyRef  string `json:"manifest_key_ref,omitempty"`  // provider ref; resolved out-of-band by node owner
