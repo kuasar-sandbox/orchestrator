@@ -220,8 +220,9 @@ type Command struct {
 // CmdAck acknowledges a Command's receipt; the terminal outcome arrives via the
 // route stream, not here.
 type CmdAck struct {
-	CmdID   string `json:"cmd_id"`
-	Status  string `json:"status"` // AckAccepted | AckRejected
-	Outcome string `json:"outcome,omitempty"`
-	Reason  string `json:"reason,omitempty"`
+	CmdID       string             `json:"cmd_id"`
+	Status      string             `json:"status"` // AckAccepted | AckRejected
+	Outcome     string             `json:"outcome,omitempty"`
+	Reason      string             `json:"reason,omitempty"`
+	KeyLeaseRef *NodeKeyLeaseRefV1 `json:"key_lease_ref,omitempty"`
 }
