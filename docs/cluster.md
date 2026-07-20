@@ -764,11 +764,11 @@ candidates race CAS lease:
 
 lease winner
   │ Range(cursor, limit)
-  │ GetPlacementHint/GetKey/GetAuthKey(group)
+  │ GetPlacementHint/GetManifestKey/GetAuthKey(group)
   │ selector patch with lease fencing
   │ cursor checkpoint after page success
   ▼
-node_link manifest_key cache refreshed
+node AuthKey/ManifestKey lease refreshed
 ```
 
 `source_id` 是 importer 的唯一执行单元。多个 placer 配置相同 `source_id` 时,它们竞争同一条
@@ -778,10 +778,10 @@ source 合并成一个视图。
 ### 9.3 group provider 边界
 
 registry 不实现 `SandboxGroupProvider` / `SandboxGroupImporter`。group 配置、placement hint、auth_key、
-manifest_key 属于 placer/provider。registry 只保存执行态和 node key cache。
+manifest_key 属于 placer/provider。registry 只保存执行态和非敏感 key delivery/ACK metadata。
 
-group 从 provider 消失后,新的 Place/verify-key 按 group 不存在处理。已经进入 node_link 的 manifest key
-cache 不主动删除,由 registry/node 侧 TTL 淘汰。
+group 从 provider 消失后,新的 Place/verify-key 按 group 不存在处理。已经进入 node 的 key lease
+由 best-effort `key_drop` 与节点 TTL 淘汰。
 
 ## 10. router
 

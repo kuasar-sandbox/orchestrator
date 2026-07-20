@@ -25,7 +25,7 @@ placer 负责:
 
 - group provider/importer 接入。
 - `node_list` WATCH_LIST 消费。
-- selector patch 与 manifest key cache refresh。
+- selector patch 与 AuthKey/ManifestKey lease refresh。
 - shuffle-sharding、静态 selector、runtime match、P2C。
 - `PlaceSandbox` / `PlaceBuild` 建议。
 - API key verify 的 provider 侧校验。
@@ -33,7 +33,7 @@ placer 负责:
 placer 不负责:
 
 - 连接 node。
-- 下发 `key_put` / create / delete / build 命令。
+- 持有 node-link；placer 只声明 desired lease，Session Holder 负责传输 `key_put` / `key_drop`。
 - 维护 route/build 执行态。
 - 保存 registry 的 group/route 记录。
 
@@ -110,7 +110,7 @@ placer 使用统一接口:
 SandboxGroupProvider:
   Get(group)
   GetPlacementHint(group)
-  GetKey(group)       # typed manifest_key
+  GetManifestKey(group) # typed tenant_manifest_key
   GetAuthKey(group)   # auth_key or verification material
 
 SandboxGroupImporter:
@@ -127,7 +127,7 @@ import_groups:
 ```
 
 该 source 枚举目录下的 `*.json` 文件。每个文件是一个 `SandboxGroupRecord` JSON。文件数量预期较小,
-`Get/GetPlacementHint/GetKey/GetAuthKey` 可直接扫描目录解析。生产环境应通过接口接入实际 group 源。
+`Get/GetPlacementHint/GetManifestKey/GetAuthKey` 可直接扫描目录解析。生产环境应通过接口接入实际 group 源。
 
 示例:
 
@@ -151,8 +151,8 @@ import_groups:
 - Importer Range 按 `source_id` 独立执行,不把多个 source 合并成一个 Range 视图。
 - 每个 `source_id` 的 cursor/lease 独立维护。
 
-group 从 provider 消失后,新的 Place/verify-key 返回不可用。已经写入 node_link 的 manifest key cache
-不主动删除,由 registry/node 侧 TTL 淘汰。
+group 从 provider 消失后,新的 Place/verify-key 返回不可用。已经写入 node 的 AuthKey/ManifestKey lease
+不主动作为正确性依赖删除,由节点 TTL 淘汰。
 
 ## 5. node_list WATCH_LIST
 
@@ -254,13 +254,13 @@ lease winner
 groups in page
   │ for each group:
   │   GetPlacementHint
-  │   GetKey / GetAuthKey
+  │   GetManifestKey / GetAuthKey
   │   calculate effective selectors
   ▼
 selector patch with fencing
   │
   ▼
-registry refreshes node_link manifest key cache
+Session Holder refreshes node AuthKey/ManifestKey lease
   │
   ▼
 cursor checkpoint after whole page succeeds
@@ -274,8 +274,8 @@ owner 从上次成功 cursor 继续或重放同一页。
 
 ### 7.3 selector patch refresh
 
-placer 按 `placement.selector_patch_refresh_interval` 续推 unchanged selector patch,用于维持 node_link
-manifest key cache。group 从 provider 消失时不主动删除 node_link key cache;TTL 到期后自动淘汰。
+placer 按 `placement.selector_patch_refresh_interval` 续推 unchanged selector patch,用于维持 node
+AuthKey/ManifestKey lease。group 从 provider 消失时只 best-effort `key_drop`;TTL 到期后自动淘汰。
 
 ## 8. Placement
 
@@ -343,18 +343,17 @@ Build placement 与 sandbox 类似,但候选需要 build headroom。最终预算
 
 ## 9. Key Distribution
 
-placer 主管 selector patch 和 manifest key cache refresh:
+placer 主管 selector patch 和完整 node key lease refresh:
 
 1. 获取 group 的 typed `manifest_key` 和 `auth_key`。
 2. 根据 placement selectors 和 shuffle 结果得到目标 node set。
 3. 将目标 node set 与 key material/ref 作为 selector patch 推给 registry。
-4. registry/node owner 把每个 node 的 desired key list 写入 node_link `manifest_key` recordSet,并在 owner set
-   内 CAS 复制。
-5. node_link heartbeat 只对未获 `AckAccepted` 或已进入续租窗口的条目执行 `key_put`；只有匹配当前
-   desired lease 的 ACK 才推进已交付状态。
+4. Registry 不保存 secret；当前 Session Holder 只传输完整的 `key_put` bundle。
+5. 只有节点持久化并回显匹配 `group + auth_key_fingerprint + manifest_key_fingerprint` 的 ACK 后，
+   该节点才可接受这个 group 的 Admission；断线或不明确结果重试同一 desired lease。
 6. 未续租 key 由节点 TTL 淘汰,`key_drop` 不作为正确性依赖。
 
-密钥是 create/build 前置条件。key cache 删除、key_drop 或租约过期不影响已经运行的 sandbox。
+密钥是 create/build 前置条件。key_drop 或租约过期不影响已经创建并复制自身 AuthKey/ManifestKey 的对象。
 
 ## 10. 可靠性
 

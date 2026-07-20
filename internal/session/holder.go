@@ -13,12 +13,13 @@ import (
 )
 
 var (
-	ErrHolderLimit        = errors.New("session: Holder registration limit reached")
-	ErrStaleSession       = errors.New("session: stale node-link session")
-	ErrEndpointChanged    = errors.New("session: data endpoint changed within NodeEpoch")
-	ErrEnrollmentChanged  = errors.New("session: node enrollment identity changed")
-	ErrSessionUnavailable = errors.New("session: current node-link session is unavailable")
-	ErrPermitUnavailable  = errors.New("session: matching Serve Permit is unavailable")
+	ErrHolderLimit         = errors.New("session: Holder registration limit reached")
+	ErrStaleSession        = errors.New("session: stale node-link session")
+	ErrEndpointChanged     = errors.New("session: data endpoint changed within NodeEpoch")
+	ErrEnrollmentChanged   = errors.New("session: node enrollment identity changed")
+	ErrSessionUnavailable  = errors.New("session: current node-link session is unavailable")
+	ErrPermitUnavailable   = errors.New("session: matching Serve Permit is unavailable")
+	ErrKeyLeaseUnavailable = errors.New("session: exact node key lease is not durably acknowledged")
 )
 
 type ServeIdentity struct {
@@ -92,6 +93,7 @@ type heldSession struct {
 	snapshot     placement.PlacementLoadSnapshot
 	observedAt   time.Time
 	hasSnapshot  bool
+	keyLeases    map[string]int64
 }
 
 type Lease struct {
@@ -173,7 +175,9 @@ func (h *Holder) Register(ctx context.Context, registration Registration, endpoi
 			old = current.endpoint
 		}
 		h.high[registration.NodeID] = registration
-		h.active[registration.NodeID] = &heldSession{registration: registration, endpoint: endpoint}
+		h.active[registration.NodeID] = &heldSession{
+			registration: registration, endpoint: endpoint, keyLeases: make(map[string]int64),
+		}
 		h.mu.Unlock()
 
 		if old != nil {
@@ -307,6 +311,15 @@ func (h *Holder) AdmitAndDispatch(ctx context.Context, command DispatchCommand) 
 	if held == nil || held.registration.NodeEpoch != command.NodeEpoch || held.registration.DataEndpoint != command.DataEndpoint {
 		h.mu.RUnlock()
 		return DispatchReply{}, ErrSessionUnavailable
+	}
+	keyLeaseRef, err := dispatchKeyLeaseRef(command)
+	if err != nil {
+		h.mu.RUnlock()
+		return DispatchReply{}, err
+	}
+	if held.keyLeases[keyLeaseRefID(keyLeaseRef)] <= h.clock().Unix() {
+		h.mu.RUnlock()
+		return DispatchReply{}, ErrKeyLeaseUnavailable
 	}
 	endpoint := held.endpoint
 	command.SessionSeq = held.registration.SessionSeq
