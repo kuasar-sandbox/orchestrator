@@ -65,6 +65,7 @@
 #
 #   node-ctl controller [advanced]
 #     PHYS_MEM, HOST_RES_MEM, PHYS_CPU, HOST_RES_CPU,
+#     BUILD_MAX_CONCURRENT, BUILD_MEMORY, BUILD_VCPU,
 #     HIGH_FACTOR, LOW_FACTOR, EMERG_FACTOR, STARTUP_FACTOR,
 #     GRANT_PER_SEC_FACTOR, RECOVER_DUR,
 #     ADM_RATE, ADM_BURST   # admission token bucket; node.md defaults 4/16
@@ -134,6 +135,9 @@ PHYS_MEM="${PHYS_MEM:-$PHYS_MEM_DEFAULT}"
 HOST_RES_MEM="${HOST_RES_MEM:-1GiB}"
 PHYS_CPU="${PHYS_CPU:-$(nproc)}"
 HOST_RES_CPU="${HOST_RES_CPU:-1}"
+BUILD_MAX_CONCURRENT="${BUILD_MAX_CONCURRENT:-2}"
+BUILD_MEMORY="${BUILD_MEMORY:-4GiB}"
+BUILD_VCPU="${BUILD_VCPU:-2}"
 HIGH_FACTOR="${HIGH_FACTOR:-0.85}"
 STARTUP_FACTOR="${STARTUP_FACTOR:-0.50}"
 ADM_RATE="${ADM_RATE:-4}"
@@ -323,6 +327,10 @@ sandbox:
   boot:
     kernel: $BIN/vmlinux
     runtime: $BIN/sandbox-runtime.erofs
+builder:
+  max_concurrent: $BUILD_MAX_CONCURRENT
+  vcpu: $BUILD_VCPU
+  memory: $BUILD_MEMORY
 paths:
   run_root: $WORK/run
   base_root: $WORK/lib

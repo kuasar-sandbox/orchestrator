@@ -93,6 +93,10 @@ sandbox:
   boot:
     kernel: $VMLINUX
     runtime: $BIN/sandbox-runtime.erofs
+builder:
+  max_concurrent: 1
+  vcpu: 1
+  memory: 1GiB
 paths:
   run_root: $WORK/node-run
   base_root: $WORK/node-lib
@@ -107,8 +111,8 @@ resource_listen:
   cgroup_scan_paths:
     - $CGROUP_ROOT
   resources:
-    physical_memory: 4GiB
-    physical_cpu: 4
+    physical_memory: 5GiB
+    physical_cpu: 5
     host_reserved:
       memory: 512MiB
       cpu: 1
