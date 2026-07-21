@@ -523,6 +523,7 @@ registry_layout:
   keys: "$WORK/registry-layout-keyring.json"
   guard: "$WORK/router-registry-layout.guard"
 registry_tls: { cert: "$TLS_DIR/router.crt", key: "$TLS_DIR/router.key", ca: "$TLS_DIR/ca.crt" }
+registry_response_timeout: 185s
 node_tls: { cert: "$TLS_DIR/router.crt", key: "$TLS_DIR/router.key", ca: "$TLS_DIR/ca.crt" }
 providers:
   endpoints:

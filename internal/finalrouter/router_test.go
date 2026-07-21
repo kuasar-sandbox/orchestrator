@@ -29,7 +29,10 @@ type revisionControl struct {
 	reserveStarted chan struct{}
 	reserveRelease chan struct{}
 	reserveCalls   int
+	reserveErr     error
+	resumeCalls    int
 	register       func(string, string, routeapi.BuildInput) (routeclient.BuildMutationResult, error)
+	readBuild      func(context.Context, string, string, uint64) (routeclient.BuildReadResult, error)
 }
 
 func (c *revisionControl) CurrentServeIdentity(bool) (routeapi.RegistryServeIdentity, error) {
@@ -45,19 +48,31 @@ func (c *revisionControl) ReserveSandbox(_ context.Context, group, routeKey stri
 		close(c.reserveStarted)
 		<-c.reserveRelease
 	}
+	if c.reserveErr != nil {
+		return routeclient.RouteMutationResult{}, c.reserveErr
+	}
 	return routeclient.RouteMutationResult{ServeIdentity: c.serveIdentity, Response: routeapi.RouteMutationResponse{
 		Outcome: routeapi.MutationReady, Group: group, RouteKey: routeKey,
 		State: clusterstate.WorkflowRouteReady, Route: &c.route, RouteRevision: c.revision,
 	}}, nil
 }
-func (*revisionControl) ResumeSandbox(context.Context, string, string, uint64) (routeclient.RouteMutationResult, error) {
-	return routeclient.RouteMutationResult{}, errors.New("unexpected ResumeSandbox")
+func (c *revisionControl) ResumeSandbox(_ context.Context, group, routeKey string, _ uint64) (routeclient.RouteMutationResult, error) {
+	c.resumeCalls++
+	return routeclient.RouteMutationResult{ServeIdentity: c.serveIdentity, Response: routeapi.RouteMutationResponse{
+		Outcome: routeapi.MutationReady, Group: group, RouteKey: routeKey,
+		State: clusterstate.WorkflowRouteReady, Route: &c.route, RouteRevision: c.revision,
+	}}, nil
 }
 func (*revisionControl) DeleteSandbox(context.Context, string, string, uint64) (routeclient.RouteMutationResult, error) {
 	return routeclient.RouteMutationResult{}, errors.New("unexpected DeleteSandbox")
 }
 func (c *revisionControl) ReadRoute(_ context.Context, group, routeKey string, minimum uint64) (routeclient.RouteReadResult, error) {
 	c.readMins = append(c.readMins, minimum)
+	if c.routeState == clusterstate.WorkflowRoutePaused {
+		return routeclient.RouteReadResult{ServeIdentity: c.serveIdentity, Response: routeapi.ReadRouteResponse{
+			Outcome: routeapi.ReadConflict, Reason: string(clusterstate.WorkflowRoutePaused),
+		}}, nil
+	}
 	return routeclient.RouteReadResult{ServeIdentity: c.serveIdentity, Response: routeapi.ReadRouteResponse{
 		Outcome: routeapi.ReadReady, Group: group, RouteKey: routeKey,
 		State: clusterstate.WorkflowRouteReady, Route: &c.route, RouteRevision: c.revision,
@@ -80,8 +95,11 @@ func (c *revisionControl) RegisterBuild(_ context.Context, group, buildID string
 	}
 	return c.register(group, buildID, input)
 }
-func (*revisionControl) ReadBuild(context.Context, string, string, uint64) (routeclient.BuildReadResult, error) {
-	return routeclient.BuildReadResult{}, errors.New("unexpected ReadBuild")
+func (c *revisionControl) ReadBuild(ctx context.Context, group, buildID string, revision uint64) (routeclient.BuildReadResult, error) {
+	if c.readBuild == nil {
+		return routeclient.BuildReadResult{}, errors.New("unexpected ReadBuild")
+	}
+	return c.readBuild(ctx, group, buildID, revision)
 }
 func (*revisionControl) ListRoutes(context.Context, string) (routeclient.RouteListResult, error) {
 	return routeclient.RouteListResult{}, errors.New("unexpected ListRoutes")
@@ -254,7 +272,7 @@ func TestBuildRegistrationPendingReturnsGeneratedStableIDs(t *testing.T) {
 		err    error
 	}{
 		{name: "committed pending", result: routeclient.BuildMutationResult{Response: routeapi.BuildMutationResponse{Outcome: routeapi.MutationPending}}},
-		{name: "ambiguous response", err: errors.New("response lost")},
+		{name: "ambiguous response", err: errors.Join(routeclient.ErrMutationOutcomeUnknown, errors.New("response lost"))},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			var capturedBuildID, capturedTemplateID string
@@ -281,6 +299,145 @@ func TestBuildRegistrationPendingReturnsGeneratedStableIDs(t *testing.T) {
 				t.Fatalf("pending identity = %+v, captured=(%q,%q)", body, capturedBuildID, capturedTemplateID)
 			}
 		})
+	}
+}
+
+func TestBuildRegistrationDefinitiveDeliveryFailureDoesNotPublishIDs(t *testing.T) {
+	control := &revisionControl{}
+	control.register = func(_ string, _ string, _ routeapi.BuildInput) (routeclient.BuildMutationResult, error) {
+		return routeclient.BuildMutationResult{}, errors.New("all Registry dials failed")
+	}
+	router, err := New(control, allowCaller{}, "example.test", time.Minute, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "http://api.example.test/v3/templates",
+		bytes.NewBufferString(`{"cpuCount":1,"memoryMB":512}`))
+	request.Host = "api.example.test"
+	request.Header.Set(HeaderGroup, "/group")
+	response := httptest.NewRecorder()
+	router.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusServiceUnavailable || strings.Contains(response.Body.String(), "buildID") {
+		t.Fatalf("definitive registration failure = %d %s", response.Code, response.Body.String())
+	}
+}
+
+func TestUnknownRouteMutationPublishesStableRouteKey(t *testing.T) {
+	control := &revisionControl{reserveErr: errors.Join(routeclient.ErrMutationOutcomeUnknown, errors.New("response lost"))}
+	router, err := New(control, allowCaller{}, "example.test", time.Minute, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "http://api.example.test/sandboxes", bytes.NewBufferString(`{}`))
+	request.Host = "api.example.test"
+	request.Header.Set(HeaderGroup, "/group")
+	response := httptest.NewRecorder()
+	router.Handler().ServeHTTP(response, request)
+	var body map[string]any
+	if response.Code != http.StatusAccepted || json.Unmarshal(response.Body.Bytes(), &body) != nil || body["routeKey"] == "" {
+		t.Fatalf("unknown Route mutation = %d %s", response.Code, response.Body.String())
+	}
+}
+
+func TestPendingBuildStatusUsesCommittedStartingProjection(t *testing.T) {
+	serveIdentity := routeapi.RegistryServeIdentity{
+		ClusterID: "cluster-1", RegistryGeneration: "generation-1", SystemEpoch: 1,
+		RegistryLayoutDigest: "registry-layout-1",
+	}
+	control := &revisionControl{serveIdentity: serveIdentity}
+	control.readBuild = func(_ context.Context, group, buildID string, _ uint64) (routeclient.BuildReadResult, error) {
+		return routeclient.BuildReadResult{ServeIdentity: serveIdentity, Response: routeapi.ReadBuildResponse{
+			Outcome: routeapi.ReadConflict, Group: group, BuildState: clusterstate.BuildStarting, BuildRevision: 7,
+			Pending: &routeapi.PendingBuildProjection{BuildID: buildID, TemplateRef: "transient-" + buildID, Profile: "e2b"},
+		}}, nil
+	}
+	router, err := New(control, allowCaller{}, "example.test", time.Minute, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodGet,
+		"http://api.example.test/templates/transient-build-1/builds/build-1/status", nil)
+	request.Host = "api.example.test"
+	request.Header.Set(HeaderGroup, "/group")
+	response := httptest.NewRecorder()
+	router.Handler().ServeHTTP(response, request)
+	var body map[string]any
+	if response.Code != http.StatusOK || json.Unmarshal(response.Body.Bytes(), &body) != nil ||
+		body["status"] != "building" || body["buildID"] != "build-1" || body["templateID"] != "transient-build-1" {
+		t.Fatalf("pending Build status = %d %s", response.Code, response.Body.String())
+	}
+}
+
+func TestPendingBuildTriggerWaitsForRegistrationBinding(t *testing.T) {
+	serveIdentity := routeapi.RegistryServeIdentity{
+		ClusterID: "cluster-1", RegistryGeneration: "generation-1", SystemEpoch: 1,
+		RegistryLayoutDigest: "registry-layout-1",
+	}
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.Header.Get(clusterstate.DirectHeaderObjectID) != "build-1" {
+			t.Errorf("forwarded Build ID = %q", request.Header.Get(clusterstate.DirectHeaderObjectID))
+		}
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer backend.Close()
+	control := &revisionControl{serveIdentity: serveIdentity}
+	reads := 0
+	control.readBuild = func(_ context.Context, group, buildID string, _ uint64) (routeclient.BuildReadResult, error) {
+		reads++
+		response := routeapi.ReadBuildResponse{
+			Outcome: routeapi.ReadConflict, Group: group, BuildState: clusterstate.BuildStarting, BuildRevision: 7,
+			Pending: &routeapi.PendingBuildProjection{BuildID: buildID, TemplateRef: "transient-" + buildID, Profile: "e2b"},
+		}
+		if reads > 1 {
+			response = routeapi.ReadBuildResponse{
+				Outcome: routeapi.ReadReady, Group: group, BuildState: clusterstate.BuildRegistered, BuildRevision: 8,
+				Build: &clusterstate.BuildProjection{
+					BuildID: buildID, NodeID: "node-1", NodeEpoch: 1,
+					DataEndpoint: strings.TrimPrefix(backend.URL, "http://"), RegistryGeneration: "generation-1",
+					BindingDigest: "binding-1", TemplateRef: "transient-" + buildID,
+				},
+			}
+		}
+		return routeclient.BuildReadResult{ServeIdentity: serveIdentity, Response: response}, nil
+	}
+	router, err := New(control, allowCaller{}, "example.test", time.Minute, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPost,
+		"http://api.example.test/v2/templates/transient-build-1/builds/build-1", bytes.NewBufferString(`{"fromImage":"base"}`))
+	request.Host = "api.example.test"
+	request.Header.Set(HeaderGroup, "/group")
+	response := httptest.NewRecorder()
+	router.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusAccepted || reads < 2 {
+		t.Fatalf("pending Build trigger = %d reads=%d body=%s", response.Code, reads, response.Body.String())
+	}
+}
+
+func TestPausedDataRouteAuthenticatesBeforeResume(t *testing.T) {
+	serveIdentity := routeapi.RegistryServeIdentity{
+		ClusterID: "cluster-1", RegistryGeneration: "generation-1", SystemEpoch: 1,
+		RegistryLayoutDigest: "registry-layout-1",
+	}
+	control := &revisionControl{
+		serveIdentity: serveIdentity, routeState: clusterstate.WorkflowRoutePaused, revision: 8,
+		route: clusterstate.ReadyRoute{
+			SandboxID: "sandbox-1", NodeID: "node-1", NodeEpoch: 1, DataEndpoint: "127.0.0.1:1",
+			RegistryGeneration: "generation-1", BindingDigest: "binding-1", AccessToken: "secret", TargetPort: 49983,
+		},
+	}
+	router, err := New(control, allowCaller{}, "example.test", time.Minute, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodGet, "http://49983-route-1.example.test/", nil)
+	request.Host = "49983-route-1.example.test"
+	request.Header.Set(HeaderGroup, "/group")
+	response := httptest.NewRecorder()
+	router.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusUnauthorized || control.resumeCalls != 0 {
+		t.Fatalf("unauthorized paused route = %d resumes=%d body=%s", response.Code, control.resumeCalls, response.Body.String())
 	}
 }
 

@@ -4,8 +4,13 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httptrace"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -13,6 +18,12 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/raftstore"
 	"github.com/kuasar-sandbox/orchestrator/internal/routeapi"
 )
+
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripperFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return f(request)
+}
 
 func TestGenerationAuthorizationRequiresEveryFinalServeGate(t *testing.T) {
 	client := testClient(t)
@@ -85,6 +96,76 @@ func TestPostJSONPreservesBoundedMemberFailureDetail(t *testing.T) {
 	}, "/mutation", struct{}{}, &struct{}{})
 	if err == nil || !strings.Contains(err.Error(), "registry-a returned 503 Service Unavailable: data shard proposal timed out") {
 		t.Fatalf("member failure = %v", err)
+	}
+}
+
+func TestMutationErrorsDistinguishDefinitiveAndUnknownDelivery(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		wrote   bool
+		unknown bool
+	}{
+		{name: "dial failure is definitive"},
+		{name: "written request is unknown", wrote: true, unknown: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			client := testClient(t)
+			transport := roundTripperFunc(func(request *http.Request) (*http.Response, error) {
+				if test.wrote {
+					trace := httptrace.ContextClientTrace(request.Context())
+					trace.WroteRequest(httptrace.WroteRequestInfo{})
+				}
+				return nil, errors.New("transport failed")
+			})
+			for memberID, endpoint := range client.endpoints {
+				endpoint.Client = &http.Client{Transport: transport}
+				client.endpoints[memberID] = endpoint
+			}
+			_, err := client.buildMutation(context.Background(), 0, routeapi.RegisterBuildPath, routeapi.RegisterBuildRequest{})
+			if err == nil || errors.Is(err, ErrMutationOutcomeUnknown) != test.unknown {
+				t.Fatalf("mutation error = %v, unknown=%v", err, test.unknown)
+			}
+		})
+	}
+}
+
+func TestAddressableStrongReadImmediatelyFollowsVerifiedLeaderHint(t *testing.T) {
+	client := testClient(t)
+	client.permit = &cachedPermit{response: routeapi.PermitResponse{
+		ClusterID: client.registryLayout.ClusterID, RegistryGeneration: client.registryLayout.RegistryGeneration,
+		SystemEpoch: 1, RegistryLayoutDigest: client.digest, CommitIndex: 1, MaxLifetimeMillis: 5000,
+		ServeGate: true, WriteGate: true, CutoverGate: true, RecoveryClosed: true,
+	}, expires: time.Now().Add(time.Minute)}
+	var calls []string
+	transport := roundTripperFunc(func(request *http.Request) (*http.Response, error) {
+		calls = append(calls, request.URL.Hostname())
+		var response routeapi.ReadRouteResponse
+		switch request.URL.Hostname() {
+		case "registry-a.test":
+			response = routeapi.ReadRouteResponse{Outcome: routeapi.ReadNeedLeader, LeaderHint: &routeapi.LeaderHint{
+				MemberID: "registry-c", Endpoint: "https://registry-c.test:9443", Term: 2,
+			}}
+		case "registry-c.test":
+			response = routeapi.ReadRouteResponse{Outcome: routeapi.ReadNotFound}
+		default:
+			return nil, errors.New("unhinted replica was contacted")
+		}
+		body, _ := json.Marshal(response)
+		return &http.Response{
+			StatusCode: http.StatusOK, Status: "200 OK", Header: make(http.Header),
+			Body: io.NopCloser(strings.NewReader(string(body))), Request: request,
+		}, nil
+	})
+	for memberID, endpoint := range client.endpoints {
+		endpoint.Client = &http.Client{Transport: transport}
+		client.endpoints[memberID] = endpoint
+	}
+	result, err := client.ReadAddressableRoute(context.Background(), "/g", "route-1", 0)
+	if err != nil || result.Response.Outcome != routeapi.ReadNotFound {
+		t.Fatalf("addressable read = %+v, %v", result, err)
+	}
+	if !reflect.DeepEqual(calls, []string{"registry-a.test", "registry-c.test"}) {
+		t.Fatalf("strong read calls = %v", calls)
 	}
 }
 

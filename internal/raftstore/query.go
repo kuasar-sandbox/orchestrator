@@ -689,6 +689,20 @@ func lookupBuild(state DataState, request routeapi.ReadBuildRequest) routeapi.Re
 	}
 	if record.State != clusterstate.BuildRegistered || record.Projection == nil {
 		if request.Strong {
+			if record.State == clusterstate.BuildStarting && record.Starting != nil {
+				spec, err := clusterstate.ParseBuildDispatchSpec(record.Starting.Intent.DispatchSpec)
+				if err != nil {
+					return routeapi.ReadBuildResponse{Outcome: routeapi.ReadUnavailable, Reason: "BUILD_STARTING dispatch intent is invalid"}
+				}
+				return routeapi.ReadBuildResponse{
+					Outcome: routeapi.ReadConflict, Group: record.Group,
+					Pending: &routeapi.PendingBuildProjection{
+						BuildID: record.BuildID, TemplateRef: spec.TemplateID, Profile: spec.Profile,
+					},
+					BuildState: clusterstate.BuildStarting, BuildRevision: record.Revision.LogIndex,
+					Reason: string(record.State),
+				}
+			}
 			return routeapi.ReadBuildResponse{Outcome: routeapi.ReadConflict, Reason: string(record.State)}
 		}
 		return routeapi.ReadBuildResponse{Outcome: routeapi.ReadNeedLeader, Reason: string(record.State)}

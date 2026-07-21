@@ -32,6 +32,10 @@ ServeGate && CutoverGate && RecoveryClosed
 
 mutation 额外要求 `WriteGate`。Permit 失效后 Router 立即 fail closed，已有 cache 也不能继续转发。
 
+Router 的 `registry_response_timeout` 默认 `35s`，必须大于 Registry 的 `workflow.park_timeout`
+（默认 `30s`）。TCP dial 和 TLS handshake 仍分别限制为 `1s`/`2s`；响应预算覆盖 Registry 合法的
+workflow parking，避免已提交 mutation 因客户端先超时而丢失北向 identity。
+
 ## Route resolution
 
 Route key 映射由 `ShardHashV1` 和 Registry Layout 固定参数确定。本地正读使用按 `(group, route_key)` 的 replica
@@ -66,7 +70,10 @@ UNAVAILABLE / NEED_LEADER
 
 Resume/Delete 只携带 `(group, route_key)` 和最低 revision；Registry 从当前 Route 内部取得 concrete SID。
 Build 注册以 `(group, build_id)` 为键，Registry 只返回 `BUILD_REGISTERED` 的 immutable node binding，或
-pre-accept placement tombstone。
+pre-accept placement tombstone。尚处于现有 `BUILD_STARTING` 的 strong read 只投影 immutable
+`build_id/template_ref/profile`，不暴露未 ACK 的 Binding，也不增加 lifecycle 状态。Router 可据此返回
+SDK-compatible `building` status；trigger/files 请求有界等待 `BUILD_REGISTERED` 后再直达 node，既不在
+Router 内存排队，也不把 post-register lifecycle 写入 Registry。
 
 Sandbox Create 和 Build Register 不是由 Router 重建的窄 DTO。Router 读取一个有界 JSON object，拒绝重复
 key、冲突 alias 和非规范 cluster-owned 字段，移除 caller credential、hop-by-hop/internal header 与保留的
@@ -108,6 +115,9 @@ Router 删除该 cache entry，把 `min_revision` 提高到旧 revision + 1，�
 被拒绝。
 
 `UNAUTHORIZED` 只清 cache，不证明存在更新 revision。普通 upstream transport error 也不能触发 replacement。
+
+PAUSED Route 的数据请求先通过 strong addressable read 取得当前 execution capability，完成端口与 token/signature
+校验后才允许调用 `ResumeSandbox`；未认证请求不能仅凭 `(group, route_key)` 唤醒 execution。
 
 ## Authentication
 

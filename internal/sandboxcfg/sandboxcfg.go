@@ -58,6 +58,7 @@ type NetworkSpec struct {
 type ResourceSpec struct {
 	Capacity    *rtconfig.CapacityConfig    `json:"capacity,omitempty" yaml:"capacity,omitempty"`
 	Allocatable *rtconfig.AllocatableConfig `json:"allocatable,omitempty" yaml:"allocatable,omitempty"`
+	Startup     *rtconfig.StartupConfig     `json:"startup,omitempty" yaml:"startup,omitempty"`
 }
 
 // ResolvedResources is the resource declaration shared by cluster placement
@@ -76,13 +77,23 @@ type ResolvedResources struct {
 // and the startup budget defaults to the allocatable floor, matching the
 // sandbox runtime defaults.
 func ResolveResources(meta map[string]string) (ResolvedResources, error) {
+	return ResolveResourcesWithDefaults(meta, 0, 0)
+}
+
+// ResolveResourcesWithDefaults applies node-local capacity defaults one
+// dimension at a time before deriving allocatable and startup defaults. The
+// cluster passes zero defaults so omitted fields remain unknown; the selected
+// node passes its configured VM capacity before local Admission.
+func ResolveResourcesWithDefaults(meta map[string]string, defaultCPU int, defaultMemoryBytes uint64) (ResolvedResources, error) {
 	spec, err := ParseSpec(meta)
 	if err != nil {
 		return ResolvedResources{}, err
 	}
-	var out ResolvedResources
+	out := ResolvedResources{CapacityCPU: defaultCPU, CapacityMemoryBytes: defaultMemoryBytes}
 	if capacity := spec.Resource.Capacity; capacity != nil {
-		out.CapacityCPU = capacity.CPU
+		if capacity.CPU > 0 {
+			out.CapacityCPU = capacity.CPU
+		}
 		if capacity.Memory != "" {
 			out.CapacityMemoryBytes, err = util.ParseSize(capacity.Memory)
 			if err != nil {
@@ -110,6 +121,18 @@ func ResolveResources(meta map[string]string) (ResolvedResources, error) {
 		return ResolvedResources{}, errors.New("sandboxcfg: allocatable CPU exceeds capacity")
 	}
 	out.StartupMemoryBytes = out.FloorMemoryBytes
+	if startup := spec.Resource.Startup; startup != nil && startup.Memory != "" {
+		out.StartupMemoryBytes, err = util.ParseSize(startup.Memory)
+		if err != nil {
+			return ResolvedResources{}, fmt.Errorf("sandboxcfg: resource startup memory: %w", err)
+		}
+	}
+	if out.StartupMemoryBytes < out.FloorMemoryBytes {
+		return ResolvedResources{}, errors.New("sandboxcfg: startup memory is below allocatable memory")
+	}
+	if out.CapacityMemoryBytes > 0 && out.StartupMemoryBytes > out.CapacityMemoryBytes {
+		return ResolvedResources{}, errors.New("sandboxcfg: startup memory exceeds capacity")
+	}
 	return out, nil
 }
 
@@ -319,6 +342,10 @@ func (p Params) build() (*rtconfig.SandboxConfig, error) {
 		if a.Memory != "" {
 			c.Resources.Allocatable.Memory = a.Memory
 		}
+	}
+	if startup := p.Spec.Resource.Startup; startup != nil {
+		copy := *startup
+		c.Resources.Startup = &copy
 	}
 	if p.ControllerSocket != "" {
 		// cgroup_path + adopt are resolved by sandbox-ctl --cgroup-adopt at runtime.

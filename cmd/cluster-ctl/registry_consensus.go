@@ -387,7 +387,7 @@ func registrySessionPeers(
 		if member.MemberID == config.Member.ID {
 			continue
 		}
-		client, err := authenticatedHTTPClient(config.Member.TLS, member.InternalEndpoint)
+		client, err := authenticatedHTTPClient(config.Member.TLS, member.InternalEndpoint, defaultInternalResponseTimeout)
 		if err != nil {
 			return nil, err
 		}
@@ -401,7 +401,7 @@ func registrySessionPeers(
 func registryRegistryLayoutPeers(material clustercfg.TLS, registryLayout raftstore.RegistryLayout) ([]controlplane.SessionPeer, error) {
 	peers := make([]controlplane.SessionPeer, 0, len(registryLayout.Members))
 	for _, member := range registryLayout.Members {
-		client, err := authenticatedHTTPClient(material, member.InternalEndpoint)
+		client, err := authenticatedHTTPClient(material, member.InternalEndpoint, defaultInternalResponseTimeout)
 		if err != nil {
 			return nil, err
 		}
@@ -434,7 +434,7 @@ func registrySystemPeers(
 func registryPlacementPlanner(set clustercfg.EndpointSet) (*controlplane.HTTPPlacementPlanner, error) {
 	endpoints := make([]controlplane.PlannerEndpoint, 0, len(set.Endpoints))
 	for _, configured := range set.Endpoints {
-		client, err := authenticatedHTTPClient(set.TLS, configured.Endpoint)
+		client, err := authenticatedHTTPClient(set.TLS, configured.Endpoint, defaultInternalResponseTimeout)
 		if err != nil {
 			return nil, err
 		}
@@ -445,7 +445,9 @@ func registryPlacementPlanner(set clustercfg.EndpointSet) (*controlplane.HTTPPla
 	return controlplane.NewHTTPPlacementPlanner(endpoints)
 }
 
-func authenticatedHTTPClient(material clustercfg.TLS, endpoint string) (*http.Client, error) {
+const defaultInternalResponseTimeout = 5 * time.Second
+
+func authenticatedHTTPClient(material clustercfg.TLS, endpoint string, responseTimeout time.Duration) (*http.Client, error) {
 	parsed, err := url.Parse(endpoint)
 	if err != nil || parsed.Scheme != "https" || parsed.Hostname() == "" {
 		return nil, errors.New("cluster-ctl: authenticated endpoint must be an HTTPS URL")
@@ -454,18 +456,21 @@ func authenticatedHTTPClient(material clustercfg.TLS, endpoint string) (*http.Cl
 	if err != nil {
 		return nil, err
 	}
-	return boundedAuthenticatedHTTPClient(tlsConfig), nil
+	return boundedAuthenticatedHTTPClient(tlsConfig, responseTimeout), nil
 }
 
-func boundedAuthenticatedHTTPClient(tlsConfig *tls.Config) *http.Client {
+func boundedAuthenticatedHTTPClient(tlsConfig *tls.Config, responseTimeout time.Duration) *http.Client {
+	if responseTimeout <= 0 {
+		responseTimeout = defaultInternalResponseTimeout
+	}
 	dialer := &net.Dialer{Timeout: time.Second, KeepAlive: 30 * time.Second}
 	return &http.Client{
-		Timeout: 6 * time.Second,
+		Timeout: responseTimeout + time.Second,
 		Transport: &http.Transport{
 			DialContext:           dialer.DialContext,
 			TLSClientConfig:       tlsConfig,
 			TLSHandshakeTimeout:   2 * time.Second,
-			ResponseHeaderTimeout: 5 * time.Second,
+			ResponseHeaderTimeout: responseTimeout,
 			ExpectContinueTimeout: time.Second,
 			IdleConnTimeout:       90 * time.Second,
 			MaxIdleConns:          256,

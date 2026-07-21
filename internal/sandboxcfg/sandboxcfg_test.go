@@ -146,14 +146,14 @@ func TestSetCapacityRoundTrip(t *testing.T) {
 
 func TestResolveResourcesMatchesRuntimeDefaults(t *testing.T) {
 	resolved, err := ResolveResources(map[string]string{
-		NsResource: `{"capacity":{"cpu":4,"memory":"8GiB"},"allocatable":{"cpu":1.5,"memory":"2GiB"}}`,
+		NsResource: `{"capacity":{"cpu":4,"memory":"8GiB"},"allocatable":{"cpu":1.5,"memory":"2GiB"},"startup":{"memory":"3GiB"}}`,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if resolved.CapacityCPU != 4 || resolved.CapacityMemoryBytes != 8<<30 ||
 		resolved.FloorCPU != 1.5 || resolved.FloorMemoryBytes != 2<<30 ||
-		resolved.StartupMemoryBytes != 2<<30 {
+		resolved.StartupMemoryBytes != 3<<30 {
 		t.Fatalf("resolved resources = %+v", resolved)
 	}
 	defaults, err := ResolveResources(map[string]string{
@@ -169,6 +169,30 @@ func TestResolveResourcesMatchesRuntimeDefaults(t *testing.T) {
 		NsResource: `{"capacity":{"memory":"1GiB"},"allocatable":{"memory":"2GiB"}}`,
 	}); err == nil {
 		t.Fatal("allocatable memory above capacity was accepted")
+	}
+	partial, err := ResolveResourcesWithDefaults(map[string]string{
+		NsResource: `{"capacity":{"memory":"8GiB"},"allocatable":{"memory":"2GiB"}}`,
+	}, 2, 4<<30)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if partial.CapacityCPU != 2 || partial.FloorCPU != 2 || partial.CapacityMemoryBytes != 8<<30 ||
+		partial.FloorMemoryBytes != 2<<30 || partial.StartupMemoryBytes != 2<<30 {
+		t.Fatalf("dimension-wise node defaults = %+v", partial)
+	}
+	partial, err = ResolveResourcesWithDefaults(map[string]string{
+		NsResource: `{"capacity":{"memory":"8GiB"},"allocatable":{"cpu":0.5}}`,
+	}, 2, 4<<30)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if partial.FloorCPU != 0.5 || partial.FloorMemoryBytes != 8<<30 {
+		t.Fatalf("partial allocatable override = %+v", partial)
+	}
+	if _, err := ResolveResourcesWithDefaults(map[string]string{
+		NsResource: `{"startup":{"memory":"1GiB"}}`,
+	}, 2, 2<<30); err == nil {
+		t.Fatal("startup below the effective allocatable floor was accepted")
 	}
 }
 
@@ -197,11 +221,14 @@ func TestMergeMetadataOverWins(t *testing.T) {
 func TestBuildImgCapacityOverride(t *testing.T) {
 	p := baseParams(types.ProfileBare)
 	p.Spec.Resource.Capacity = &rtconfig.CapacityConfig{CPU: 8, Memory: "16GiB"}
+	p.Spec.Resource.Startup = &rtconfig.StartupConfig{Memory: "4GiB"}
+	p.ControllerSocket = "/run/node-resource.sock"
 	b, err := p.BuildYAML()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(b), "cpu: 8") || !strings.Contains(string(b), "16GiB") {
+	if !strings.Contains(string(b), "cpu: 8") || !strings.Contains(string(b), "16GiB") ||
+		!strings.Contains(string(b), "startup:") || !strings.Contains(string(b), "4GiB") {
 		t.Fatalf("img capacity override not applied:\n%s", b)
 	}
 }

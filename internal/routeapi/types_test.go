@@ -212,6 +212,17 @@ func TestBuildReadResponseOnlyExposesRegistrationBinding(t *testing.T) {
 	if err := registered.ValidateFor(buildRequest); err == nil {
 		t.Fatal("unbound BUILD_STARTING projection was exposed as a positive read")
 	}
+	pending := ReadBuildResponse{
+		Outcome: ReadConflict, Group: "/g", BuildState: clusterstate.BuildStarting, BuildRevision: 2,
+		Pending: &PendingBuildProjection{BuildID: "b1", TemplateRef: "transient-b1", Profile: types.ProfileE2B},
+	}
+	if err := pending.ValidateFor(buildRequest); err != nil {
+		t.Fatalf("strong pending Build projection: %v", err)
+	}
+	buildRequest.Strong = false
+	if err := pending.ValidateFor(buildRequest); err == nil {
+		t.Fatal("replica-local read accepted a pending Build projection")
+	}
 }
 
 func TestRouteListAndWatchCarryIndependentBucketRevisions(t *testing.T) {

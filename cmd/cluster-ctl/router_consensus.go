@@ -57,7 +57,9 @@ func runRouter(args []string, log *slog.Logger) error {
 	}
 	registryEndpoints := make([]routeclient.Endpoint, 0, len(latest.RegistryLayout.Members))
 	for _, member := range latest.RegistryLayout.Members {
-		client, clientErr := authenticatedHTTPClient(config.RegistryTLS, member.InternalEndpoint)
+		client, clientErr := authenticatedHTTPClient(
+			config.RegistryTLS, member.InternalEndpoint, config.RegistryResponseTimeoutDuration(),
+		)
 		if clientErr != nil {
 			return clientErr
 		}
@@ -71,7 +73,7 @@ func runRouter(args []string, log *slog.Logger) error {
 	}
 	providerEndpoints := make([]providerclient.Endpoint, 0, len(config.Providers.Endpoints))
 	for _, endpoint := range config.Providers.Endpoints {
-		client, clientErr := authenticatedHTTPClient(config.Providers.TLS, endpoint.Endpoint)
+		client, clientErr := authenticatedHTTPClient(config.Providers.TLS, endpoint.Endpoint, defaultInternalResponseTimeout)
 		if clientErr != nil {
 			return clientErr
 		}

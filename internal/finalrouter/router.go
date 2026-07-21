@@ -39,6 +39,9 @@ const (
 	HeaderRouteKey  = "X-Kuasar-Route-Key"
 	HeaderAPIKey    = "X-API-KEY"
 	HeaderAccessTok = "X-Access-Token"
+
+	pendingBuildPollInterval = 50 * time.Millisecond
+	pendingBuildForwardWait  = 30 * time.Second
 )
 
 type ControlPlane interface {
@@ -60,6 +63,7 @@ type CallerAuthorizer interface {
 
 type routeEntry struct {
 	Route         clusterstate.ReadyRoute
+	State         clusterstate.RouteWorkflowState
 	Group         string
 	RouteKey      string
 	Revision      uint64
@@ -86,6 +90,7 @@ type reserveFlight struct {
 var (
 	errRoutePending       = errors.New("finalrouter: Route mutation is pending")
 	errRouteInputConflict = errors.New("finalrouter: Route is reserved with different immutable input")
+	errBuildRejected      = errors.New("finalrouter: Build registration was rejected")
 )
 
 type Router struct {
@@ -339,6 +344,9 @@ func (r *Router) reserve(ctx context.Context, group, routeKey string, input rout
 	r.reserveMu.Unlock()
 
 	result, err := r.control.ReserveSandbox(ctx, group, routeKey, r.minimumRouteRevision(group, routeKey), input)
+	if errors.Is(err, routeclient.ErrMutationOutcomeUnknown) {
+		err = errors.Join(errRoutePending, err)
+	}
 	if err == nil {
 		response := result.Response
 		if response.Outcome == routeapi.MutationPending {
@@ -347,7 +355,7 @@ func (r *Router) reserve(ctx context.Context, group, routeKey string, input rout
 			err = fmt.Errorf("Route mutation ended as %s: %s", response.Outcome, response.Reason)
 		} else {
 			flight.route = &routeEntry{
-				Route: *response.Route, Group: group, RouteKey: routeKey,
+				Route: *response.Route, State: clusterstate.WorkflowRouteReady, Group: group, RouteKey: routeKey,
 				Revision: response.RouteRevision, ServeIdentity: result.ServeIdentity,
 			}
 			if !r.control.CacheAuthorized(result.ServeIdentity) {
@@ -437,7 +445,7 @@ func (r *Router) sandboxControl(w http.ResponseWriter, request *http.Request) {
 		result, resumeErr := r.control.ResumeSandbox(request.Context(), group, routeKey, minimum)
 		if resumeErr == nil && result.Response.Outcome == routeapi.MutationReady && result.Response.Route != nil {
 			entry = &routeEntry{Route: *result.Response.Route, Group: group, RouteKey: routeKey,
-				Revision: result.Response.RouteRevision, ServeIdentity: result.ServeIdentity}
+				State: clusterstate.WorkflowRouteReady, Revision: result.Response.RouteRevision, ServeIdentity: result.ServeIdentity}
 			r.rememberRoute(entry)
 		} else {
 			err = errors.Join(resumeErr, errors.New("Route resume did not become READY"))
@@ -492,7 +500,11 @@ func (r *Router) registerBuild(w http.ResponseWriter, request *http.Request) {
 		return
 	}
 	if err != nil {
-		r.log.Warn("Build registration outcome is ambiguous", "group", group, "build_id", buildID, "err", err)
+		if !errors.Is(err, routeclient.ErrMutationOutcomeUnknown) {
+			http.Error(w, "Build registration unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		r.log.Warn("Build registration outcome is unknown after request delivery", "group", group, "build_id", buildID, "err", err)
 	}
 	if err != nil || result.Response.Outcome == routeapi.MutationPending {
 		w.Header().Set("Content-Type", "application/json")
@@ -545,21 +557,96 @@ func (r *Router) forwardBuild(w http.ResponseWriter, request *http.Request) {
 	entry := r.cachedBuild(group, buildID)
 	if entry == nil {
 		result, err := r.control.ReadBuild(request.Context(), group, buildID, 0)
-		if err != nil || result.Response.Outcome != routeapi.ReadReady || result.Response.Build == nil {
+		if err != nil {
 			http.Error(w, "unknown build", http.StatusNotFound)
 			return
 		}
-		entry = &buildEntry{
-			Build: *result.Response.Build, Group: group, Revision: result.Response.BuildRevision,
-			ServeIdentity: result.ServeIdentity,
+		if result.Response.Outcome == routeapi.ReadConflict && result.Response.Pending != nil {
+			pending := result.Response.Pending
+			templateID := pathObjectID(request.URL.Path, "/templates/")
+			if templateID == "" || templateID != pending.TemplateRef {
+				http.Error(w, "Build template does not match registration", http.StatusConflict)
+				return
+			}
+			if !r.control.CacheAuthorized(result.ServeIdentity) {
+				http.Error(w, "Router Serve Permit expired", http.StatusServiceUnavailable)
+				return
+			}
+			if request.Method == http.MethodGet && strings.HasSuffix(strings.TrimSuffix(request.URL.Path, "/"), "/status") {
+				writePendingBuildStatus(w, *pending)
+				return
+			}
+			entry, err = r.awaitBuildRegistration(request.Context(), group, buildID)
+			if err != nil {
+				if errors.Is(err, errBuildRejected) {
+					http.Error(w, "Build registration was rejected", http.StatusConflict)
+					return
+				}
+				w.Header().Set("Retry-After", "1")
+				http.Error(w, "Build registration is pending", http.StatusServiceUnavailable)
+				return
+			}
+		} else if result.Response.Outcome == routeapi.ReadReady && result.Response.Build != nil {
+			entry = &buildEntry{
+				Build: *result.Response.Build, Group: group, Revision: result.Response.BuildRevision,
+				ServeIdentity: result.ServeIdentity,
+			}
+			r.rememberBuild(entry)
+		} else {
+			http.Error(w, "unknown build", http.StatusNotFound)
+			return
 		}
-		r.rememberBuild(entry)
 	}
 	if templateID := pathObjectID(request.URL.Path, "/templates/"); templateID == "" || templateID != entry.Build.TemplateRef {
 		http.Error(w, "Build template does not match registration", http.StatusConflict)
 		return
 	}
 	r.forwardNodeControl(w, request, nil, entry)
+}
+
+func writePendingBuildStatus(w http.ResponseWriter, pending routeapi.PendingBuildProjection) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"templateID": pending.TemplateRef,
+		"buildID":    pending.BuildID,
+		"profile":    pending.Profile,
+		"status":     "building",
+		"logs":       []string{},
+		"logEntries": []any{},
+	})
+}
+
+func (r *Router) awaitBuildRegistration(ctx context.Context, group, buildID string) (*buildEntry, error) {
+	waitCtx, cancel := context.WithTimeout(ctx, pendingBuildForwardWait)
+	defer cancel()
+	ticker := time.NewTicker(pendingBuildPollInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-waitCtx.Done():
+			return nil, waitCtx.Err()
+		case <-ticker.C:
+			result, err := r.control.ReadBuild(waitCtx, group, buildID, 0)
+			if err != nil {
+				continue
+			}
+			if result.Response.Outcome == routeapi.ReadConflict && result.Response.Pending != nil {
+				continue
+			}
+			if result.Response.Outcome != routeapi.ReadReady || result.Response.Build == nil {
+				return nil, errBuildRejected
+			}
+			entry := &buildEntry{
+				Build: *result.Response.Build, Group: group, Revision: result.Response.BuildRevision,
+				ServeIdentity: result.ServeIdentity,
+			}
+			if !r.control.CacheAuthorized(entry.ServeIdentity) {
+				return nil, routeclient.ErrPermitUnavailable
+			}
+			r.rememberBuild(entry)
+			return entry, nil
+		}
+	}
 }
 
 func (r *Router) forwardNodeControl(w http.ResponseWriter, request *http.Request, route *routeEntry, build *buildEntry) {
@@ -717,10 +804,25 @@ func (r *Router) serveData(w http.ResponseWriter, request *http.Request, host st
 		http.Error(w, "Sandbox route key is required", http.StatusBadRequest)
 		return
 	}
+	var (
+		port          int
+		injectToken   bool
+		authenticated bool
+	)
 	entry, err := r.resolveRoute(request.Context(), group, routeKey)
 	if err != nil {
-		entry, err = r.resumeRoute(request.Context(), group, routeKey)
-		if err != nil {
+		addressable, addressErr := r.resolveControlRoute(request.Context(), group, routeKey)
+		if addressErr == nil && addressable != nil && addressable.State == clusterstate.WorkflowRoutePaused {
+			var ok bool
+			port, injectToken, ok = r.authorizeDataRequest(w, request, addressable.Route, hostPort, hasHostPort)
+			if !ok {
+				return
+			}
+			authenticated = true
+			entry, err = r.resumeRoute(request.Context(), group, routeKey)
+		} else if addressErr == nil && addressable != nil && addressable.State == clusterstate.WorkflowRouteReady {
+			entry, err = addressable, nil
+		} else {
 			// Only creation by logical key uses caller authorization. Existing
 			// data traffic is authenticated below by the execution capability.
 			if !r.authorize(w, request.Context(), group, apiKey(request)) {
@@ -746,24 +848,40 @@ func (r *Router) serveData(w http.ResponseWriter, request *http.Request, host st
 		http.Error(w, "sandbox route unavailable", http.StatusServiceUnavailable)
 		return
 	}
-	route := entry.Route
+	if !authenticated {
+		var ok bool
+		port, injectToken, ok = r.authorizeDataRequest(w, request, entry.Route, hostPort, hasHostPort)
+		if !ok {
+			return
+		}
+	}
+	r.forwardData(w, request, entry, port, injectToken)
+}
+
+func (r *Router) authorizeDataRequest(
+	w http.ResponseWriter,
+	request *http.Request,
+	route clusterstate.ReadyRoute,
+	hostPort int,
+	hasHostPort bool,
+) (int, bool, bool) {
 	port, err := requestedPort(request, hostPort, hasHostPort, route.TargetPort)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
+		return 0, false, false
 	}
 	injectToken := true
 	if r.dataPlaneAuth == "enforce" || r.dataPlaneAuth == "log" {
 		auth := envdsign.CheckDataPlaneAuth(request, port, route.AccessToken, time.Now())
 		if !auth.OK && r.dataPlaneAuth == "enforce" {
 			http.Error(w, "invalid access token", http.StatusUnauthorized)
-			return
+			return 0, false, false
 		}
 		if auth.OK {
 			injectToken = !auth.Signed
 		}
 	}
-	r.forwardData(w, request, entry, port, injectToken)
+	return port, injectToken, true
 }
 
 func (r *Router) resumeRoute(ctx context.Context, group, routeKey string) (*routeEntry, error) {
@@ -772,7 +890,7 @@ func (r *Router) resumeRoute(ctx context.Context, group, routeKey string) (*rout
 		return nil, errors.Join(err, errors.New("Route resume did not become READY"))
 	}
 	entry := &routeEntry{
-		Route: *result.Response.Route, Group: group, RouteKey: routeKey,
+		Route: *result.Response.Route, State: clusterstate.WorkflowRouteReady, Group: group, RouteKey: routeKey,
 		Revision: result.Response.RouteRevision, ServeIdentity: result.ServeIdentity,
 	}
 	if !r.control.CacheAuthorized(result.ServeIdentity) {
@@ -886,7 +1004,7 @@ func (r *Router) resolveRoute(ctx context.Context, group, routeKey string) (*rou
 		return nil, errors.New("Route is not READY")
 	}
 	entry := &routeEntry{
-		Route: *result.Response.Route, Group: group, RouteKey: routeKey,
+		Route: *result.Response.Route, State: clusterstate.WorkflowRouteReady, Group: group, RouteKey: routeKey,
 		Revision: result.Response.RouteRevision, ServeIdentity: result.ServeIdentity,
 	}
 	if !r.control.CacheAuthorized(entry.ServeIdentity) {
@@ -905,7 +1023,7 @@ func (r *Router) resolveControlRoute(ctx context.Context, group, routeKey string
 		return nil, errors.New("Route has no addressable execution")
 	}
 	entry := &routeEntry{
-		Route: *result.Response.Route, Group: group, RouteKey: routeKey,
+		Route: *result.Response.Route, State: result.Response.State, Group: group, RouteKey: routeKey,
 		Revision: result.Response.RouteRevision, ServeIdentity: result.ServeIdentity,
 	}
 	if !r.control.CacheAuthorized(entry.ServeIdentity) {
@@ -922,6 +1040,12 @@ func (r *Router) rememberRoute(entry *routeEntry) {
 		return
 	}
 	copy := *entry
+	if copy.State == "" {
+		copy.State = clusterstate.WorkflowRouteReady
+	}
+	if copy.State != clusterstate.WorkflowRouteReady {
+		return
+	}
 	copy.CachedAt, copy.LastUsed = time.Now(), time.Now()
 	key := routeKeyID(copy.Group, copy.RouteKey)
 	r.cacheMu.Lock()

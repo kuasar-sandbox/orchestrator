@@ -11,6 +11,9 @@ registry_tls:
   key: /etc/kuasar/tls/router.key
   ca: /etc/kuasar/tls/ca.crt
 
+# Must exceed registry workflow.park_timeout (30s by default).
+registry_response_timeout: 35s
+
 # Router presents this role certificate to each bound node for direct Sandbox
 # control, Build lifecycle, and CONNECT forwarding. Nodes require the same CA.
 node_tls:

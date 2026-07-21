@@ -8,6 +8,7 @@ import (
 	"fmt"
 
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
+	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
 const (
@@ -156,16 +157,33 @@ type ReadBuildResponse struct {
 	Outcome       string                          `json:"outcome"`
 	Group         string                          `json:"group,omitempty"`
 	Build         *clusterstate.BuildProjection   `json:"build,omitempty"`
+	Pending       *PendingBuildProjection         `json:"pending,omitempty"`
 	BuildState    clusterstate.BuildWorkflowState `json:"build_state,omitempty"`
 	BuildRevision uint64                          `json:"build_revision,omitempty"`
 	LeaderHint    *LeaderHint                     `json:"leader_hint,omitempty"`
 	Reason        string                          `json:"reason,omitempty"`
 }
 
+// PendingBuildProjection identifies an existing BUILD_STARTING registration
+// without exposing a node Binding that has not yet been acknowledged. It is a
+// read projection of the existing workflow state, not another lifecycle state.
+type PendingBuildProjection struct {
+	BuildID     string        `json:"build_id"`
+	TemplateRef string        `json:"template_ref"`
+	Profile     types.Profile `json:"profile"`
+}
+
+func (p PendingBuildProjection) Validate() error {
+	if p.BuildID == "" || p.TemplateRef == "" || !p.Profile.Valid() {
+		return errors.New("routeapi: incomplete pending Build projection")
+	}
+	return nil
+}
+
 func (r ReadBuildResponse) ValidateFor(request ReadBuildRequest) error {
 	switch r.Outcome {
 	case ReadReady:
-		if r.Build == nil || r.BuildRevision == 0 || r.Group != request.Group || r.Build.BuildID != request.BuildID ||
+		if r.Build == nil || r.Pending != nil || r.BuildRevision == 0 || r.Group != request.Group || r.Build.BuildID != request.BuildID ||
 			r.Build.RegistryGeneration != request.RegistryGeneration || r.BuildRevision < request.MinBuildRevision {
 			return errors.New("routeapi: positive Build read does not satisfy request fence")
 		}
@@ -180,7 +198,7 @@ func (r ReadBuildResponse) ValidateFor(request ReadBuildRequest) error {
 		}
 		return nil
 	case ReadNeedLeader, ReadReplicaBehind:
-		if r.Build != nil {
+		if r.Build != nil || r.Pending != nil {
 			return errors.New("routeapi: non-positive Build read cannot carry a projection")
 		}
 		if r.LeaderHint != nil {
@@ -191,19 +209,34 @@ func (r ReadBuildResponse) ValidateFor(request ReadBuildRequest) error {
 		if !request.Strong {
 			return errors.New("routeapi: replica-local Build read returned final NOT_FOUND")
 		}
-		if r.Build != nil {
+		if r.Build != nil || r.Pending != nil {
 			return errors.New("routeapi: NOT_FOUND Build read cannot carry a projection")
 		}
 		if r.LeaderHint != nil {
 			return errors.New("routeapi: NOT_FOUND Build read cannot carry a leader hint")
 		}
 		return nil
-	case ReadConflict, ReadUnavailable:
+	case ReadConflict:
 		if r.Build != nil {
 			return errors.New("routeapi: failed Build read cannot carry a projection")
 		}
 		if r.LeaderHint != nil {
 			return errors.New("routeapi: failed Build read cannot carry a leader hint")
+		}
+		if r.Pending == nil {
+			return nil
+		}
+		if !request.Strong || r.Group != request.Group || r.Pending.BuildID != request.BuildID ||
+			r.BuildState != clusterstate.BuildStarting || r.BuildRevision == 0 || r.BuildRevision < request.MinBuildRevision {
+			return errors.New("routeapi: pending Build read does not satisfy request fence")
+		}
+		return r.Pending.Validate()
+	case ReadUnavailable:
+		if r.Build != nil || r.Pending != nil {
+			return errors.New("routeapi: unavailable Build read cannot carry a projection")
+		}
+		if r.LeaderHint != nil {
+			return errors.New("routeapi: unavailable Build read cannot carry a leader hint")
 		}
 		return nil
 	default:

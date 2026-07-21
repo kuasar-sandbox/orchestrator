@@ -257,22 +257,24 @@ func (c ConsensusRegistryConfig) WorkflowDurations() (park, poll, permit, recove
 }
 
 type ConsensusRouterConfig struct {
-	Domain         string                  `yaml:"domain"`
-	RegistryLayout RegistryLayoutArtifacts `yaml:"registry_layout"`
-	RegistryTLS    TLS                     `yaml:"registry_tls"`
-	NodeTLS        TLS                     `yaml:"node_tls"`
-	Providers      EndpointSet             `yaml:"providers"`
-	Ingress        IngressConfig           `yaml:"ingress"`
-	Auth           RouterAuth              `yaml:"auth"`
-	Cache          RouterCache             `yaml:"cache"`
-	MetricsListen  string                  `yaml:"metrics_listen,omitempty"`
+	Domain                  string                  `yaml:"domain"`
+	RegistryLayout          RegistryLayoutArtifacts `yaml:"registry_layout"`
+	RegistryTLS             TLS                     `yaml:"registry_tls"`
+	RegistryResponseTimeout string                  `yaml:"registry_response_timeout"`
+	NodeTLS                 TLS                     `yaml:"node_tls"`
+	Providers               EndpointSet             `yaml:"providers"`
+	Ingress                 IngressConfig           `yaml:"ingress"`
+	Auth                    RouterAuth              `yaml:"auth"`
+	Cache                   RouterCache             `yaml:"cache"`
+	MetricsListen           string                  `yaml:"metrics_listen,omitempty"`
 }
 
 func LoadConsensusRouter(path string) (*ConsensusRouterConfig, error) {
 	config := ConsensusRouterConfig{
-		Ingress: IngressConfig{Listen: ":443"},
-		Auth:    RouterAuth{APIKey: "enforce", DataPlane: "enforce", CacheTTL: "60s"},
-		Cache:   RouterCache{RouteTTL: "5m", IdleTimeout: "2m"},
+		RegistryResponseTimeout: "35s",
+		Ingress:                 IngressConfig{Listen: ":443"},
+		Auth:                    RouterAuth{APIKey: "enforce", DataPlane: "enforce", CacheTTL: "60s"},
+		Cache:                   RouterCache{RouteTTL: "5m", IdleTimeout: "2m"},
 	}
 	if err := loadStrictYAML(path, &config); err != nil {
 		return nil, err
@@ -309,11 +311,24 @@ func (c ConsensusRouterConfig) Validate() error {
 	default:
 		return errors.New("clustercfg: auth.data_plane must be off, log, or enforce")
 	}
-	return validateDurations(map[string]string{
-		"auth.cache_ttl":     c.Auth.CacheTTL,
-		"cache.route_ttl":    c.Cache.RouteTTL,
-		"cache.idle_timeout": c.Cache.IdleTimeout,
-	})
+	if err := validateDurations(map[string]string{
+		"registry_response_timeout": c.RegistryResponseTimeout,
+		"auth.cache_ttl":            c.Auth.CacheTTL,
+		"cache.route_ttl":           c.Cache.RouteTTL,
+		"cache.idle_timeout":        c.Cache.IdleTimeout,
+	}); err != nil {
+		return err
+	}
+	responseTimeout, _ := time.ParseDuration(c.RegistryResponseTimeout)
+	if responseTimeout > 5*time.Minute {
+		return errors.New("clustercfg: registry_response_timeout must not exceed 5m")
+	}
+	return nil
+}
+
+func (c ConsensusRouterConfig) RegistryResponseTimeoutDuration() time.Duration {
+	value, _ := time.ParseDuration(c.RegistryResponseTimeout)
+	return value
 }
 
 func (c ConsensusRouterConfig) AuthCacheDuration() time.Duration {

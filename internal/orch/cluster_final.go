@@ -23,6 +23,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/store"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
+	"github.com/kuasar-sandbox/orchestrator/internal/util"
 )
 
 type ClusterSession struct {
@@ -819,29 +820,33 @@ func (n *FinalClusterNode) sandboxDemand(ctx context.Context, record nodeexec.Di
 		return nodectl.SandboxAdmissionDemand{}, errors.Join(err, errors.New("Sandbox normalized demand is missing"))
 	}
 	demand := normalized.Sandbox
-	resources, err := sandboxcfg.ResolveResources(spec.Config)
+	defaultMemory, err := util.ParseSize(n.core.cfg.Sandbox.Resources.Memory)
+	if err != nil {
+		return nodectl.SandboxAdmissionDemand{}, fmt.Errorf("Sandbox default memory: %w", err)
+	}
+	resources, err := sandboxcfg.ResolveResourcesWithDefaults(
+		spec.Config, n.core.cfg.Sandbox.Resources.VCPU, defaultMemory,
+	)
 	if err != nil {
 		return nodectl.SandboxAdmissionDemand{}, err
 	}
-	if resources.FloorMemoryBytes > 0 && resources.FloorMemoryBytes != demand.FloorMemory ||
-		resources.StartupMemoryBytes > 0 && resources.StartupMemoryBytes != demand.StartupBudgetMemory {
+	if demand.FloorMemory > 0 && resources.FloorMemoryBytes != demand.FloorMemory ||
+		demand.StartupBudgetMemory > 0 && resources.StartupMemoryBytes != demand.StartupBudgetMemory {
 		return nodectl.SandboxAdmissionDemand{}, errors.New("Sandbox normalized demand does not match effective resource config")
 	}
-	capacityMemory := uint64(max(n.core.cfg.Sandbox.Resources.MemoryMiB(), 0)) << 20
-	capacityCPU := n.core.cfg.Sandbox.Resources.VCPU
-	if resources.CapacityMemoryBytes > 0 {
-		capacityMemory = resources.CapacityMemoryBytes
-	}
-	if resources.CapacityCPU > 0 {
-		capacityCPU = resources.CapacityCPU
+	if n.options.ResourceLoad != nil {
+		load := n.options.ResourceLoad()
+		if load.Controller && (demand.FloorMemory == 0 || demand.StartupBudgetMemory == 0) {
+			return nodectl.SandboxAdmissionDemand{}, errors.New("Sandbox resource-controller demand is incomplete")
+		}
 	}
 	return nodectl.SandboxAdmissionDemand{
 		SlotUnits:             demand.SlotUnits,
-		CapacityMemoryBytes:   capacityMemory,
-		CapacityCPU:           capacityCPU,
-		FloorMemoryBytes:      demand.FloorMemory,
+		CapacityMemoryBytes:   resources.CapacityMemoryBytes,
+		CapacityCPU:           resources.CapacityCPU,
+		FloorMemoryBytes:      resources.FloorMemoryBytes,
 		FloorCPU:              resources.FloorCPU,
-		StartupBudgetMemory:   demand.StartupBudgetMemory,
+		StartupBudgetMemory:   resources.StartupMemoryBytes,
 		AllocatableAtSnapshot: demand.AllocatableAtSnapshot,
 	}, nil
 }

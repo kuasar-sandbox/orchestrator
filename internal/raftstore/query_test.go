@@ -96,11 +96,22 @@ func TestBuildLookupReturnsOnlyBoundPositiveProjection(t *testing.T) {
 	if got := lookupBuildResult(t, state, request).Outcome; got != routeapi.ReadNeedLeader {
 		t.Fatalf("unprojected Build outcome = %s", got)
 	}
+	request.Strong = true
+	pending := lookupBuildResult(t, state, request)
+	if pending.Outcome != routeapi.ReadConflict || pending.BuildState != clusterstate.BuildStarting ||
+		pending.BuildRevision != 2 || pending.Pending == nil || pending.Pending.BuildID != "build-1" ||
+		pending.Pending.TemplateRef != "template-1" {
+		t.Fatalf("strong BUILD_STARTING projection = %+v", pending)
+	}
+	if err := pending.ValidateFor(request); err != nil {
+		t.Fatal(err)
+	}
 
 	registered := buildRegistrationRecord(starting)
 	applyDataOK(t, &state, 3, DataCommand{
 		Type: DataPutBuild, Identity: identity, Expect: RevisionExpectation{LogIndex: 2}, Build: &registered,
 	})
+	request.Strong = false
 	response := lookupBuildResult(t, state, request)
 	if response.Outcome != routeapi.ReadReady || response.BuildState != clusterstate.BuildRegistered || response.BuildRevision != 3 {
 		t.Fatalf("registered Build response = %+v", response)

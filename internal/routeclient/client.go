@@ -8,10 +8,12 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptrace"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cespare/xxhash/v2"
@@ -20,9 +22,15 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/routeapi"
 )
 
-var ErrPermitUnavailable = errors.New("routeclient: matching Serve Permit is unavailable")
+var (
+	ErrPermitUnavailable      = errors.New("routeclient: matching Serve Permit is unavailable")
+	ErrMutationOutcomeUnknown = errors.New("routeclient: mutation outcome is unknown")
+)
 
-const maximumResponseBytes = 4 << 20
+const (
+	maximumResponseBytes      = 4 << 20
+	nonMutationAttemptTimeout = 6 * time.Second
+)
 
 type Endpoint struct {
 	MemberID string
@@ -33,6 +41,19 @@ type Endpoint struct {
 type cachedPermit struct {
 	response routeapi.PermitResponse
 	expires  time.Time
+}
+
+type requestDeliveryError struct {
+	err            error
+	mayHaveReached bool
+}
+
+func (e *requestDeliveryError) Error() string { return e.err.Error() }
+func (e *requestDeliveryError) Unwrap() error { return e.err }
+
+func requestMayHaveReached(err error) bool {
+	var delivery *requestDeliveryError
+	return errors.As(err, &delivery) && delivery.mayHaveReached
 }
 
 type Client struct {
@@ -119,7 +140,7 @@ func (c *Client) RefreshPermit(ctx context.Context) (routeapi.RegistryServeIdent
 	var lastErr error
 	for _, endpoint := range c.systemEndpoints() {
 		var response routeapi.PermitResponse
-		if err := postJSON(ctx, endpoint, routeapi.PermitPath, request, &response); err != nil {
+		if err := postJSONBounded(ctx, endpoint, routeapi.PermitPath, request, &response); err != nil {
 			lastErr = err
 			continue
 		}
@@ -249,7 +270,7 @@ func (c *Client) ReadRoute(
 	}
 	for _, endpoint := range c.localReadEndpoints(identity.ShardID, group+"\x00"+routeKey) {
 		var response routeapi.ReadRouteResponse
-		if err := postJSON(ctx, endpoint, routeapi.ReadRoutePath, request, &response); err != nil {
+		if err := postJSONBounded(ctx, endpoint, routeapi.ReadRoutePath, request, &response); err != nil {
 			continue
 		}
 		if err := response.ValidateFor(request); err != nil {
@@ -319,7 +340,7 @@ func (c *Client) ReadBuild(
 	}
 	for _, endpoint := range c.localReadEndpoints(identity.ShardID, group+"\x00"+buildID) {
 		var response routeapi.ReadBuildResponse
-		if err := postJSON(ctx, endpoint, routeapi.ReadBuildPath, request, &response); err != nil {
+		if err := postJSONBounded(ctx, endpoint, routeapi.ReadBuildPath, request, &response); err != nil {
 			continue
 		}
 		if err := response.ValidateFor(request); err != nil {
@@ -331,17 +352,8 @@ func (c *Client) ReadBuild(
 		c.observeLeader(identity.ShardID, response.LeaderHint)
 	}
 	request.Strong = true
-	for _, endpoint := range c.shardEndpoints(identity.ShardID) {
-		var response routeapi.ReadBuildResponse
-		if err := postJSON(ctx, endpoint, routeapi.ReadBuildPath, request, &response); err != nil {
-			continue
-		}
-		if err := response.ValidateFor(request); err == nil {
-			c.observeLeader(identity.ShardID, response.LeaderHint)
-			return BuildReadResult{Response: response, ServeIdentity: serveIdentityFromRequest(identity)}, nil
-		}
-	}
-	return BuildReadResult{}, errors.New("routeclient: Build shard is unavailable")
+	response, err := c.readBuildStrong(ctx, request)
+	return BuildReadResult{Response: response, ServeIdentity: serveIdentityFromRequest(identity)}, err
 }
 
 func (c *Client) ListRoutes(ctx context.Context, group string) (RouteListResult, error) {
@@ -379,7 +391,7 @@ func (c *Client) ListRoutes(ctx context.Context, group string) (RouteListResult,
 				}
 				for _, endpoint := range endpoints {
 					response = routeapi.ListRoutesResponse{}
-					if err := postJSON(ctx, endpoint, routeapi.ListRoutesPath, request, &response); err != nil {
+					if err := postJSONBounded(ctx, endpoint, routeapi.ListRoutesPath, request, &response); err != nil {
 						lastErr = err
 						continue
 					}
@@ -453,7 +465,7 @@ func (c *Client) WatchRoutes(
 				return RouteWatchResult{}, ErrPermitUnavailable
 			}
 			var response routeapi.WatchRoutesResponse
-			if err := postJSON(ctx, endpoint, routeapi.WatchRoutesPath, request, &response); err != nil {
+			if err := postJSONBounded(ctx, endpoint, routeapi.WatchRoutesPath, request, &response); err != nil {
 				lastErr = err
 				continue
 			}
@@ -485,15 +497,20 @@ func (c *Client) routeMutation(
 	request any,
 	validate func(routeapi.RouteMutationResponse) error,
 ) (routeapi.RouteMutationResponse, error) {
-	var attemptErrors []error
+	var (
+		attemptErrors  []error
+		outcomeUnknown bool
+	)
 	for attempt := 0; attempt < 2; attempt++ {
 		for _, endpoint := range c.shardEndpoints(shardID) {
 			var response routeapi.RouteMutationResponse
 			if err := postJSON(ctx, endpoint, path, request, &response); err != nil {
+				outcomeUnknown = outcomeUnknown || requestMayHaveReached(err)
 				attemptErrors = append(attemptErrors, fmt.Errorf("member %s: %w", endpoint.MemberID, err))
 				continue
 			}
 			if err := validate(response); err != nil {
+				outcomeUnknown = true
 				attemptErrors = append(attemptErrors, fmt.Errorf("member %s returned an invalid response: %w", endpoint.MemberID, err))
 				continue
 			}
@@ -508,7 +525,11 @@ func (c *Client) routeMutation(
 	if len(attemptErrors) == 0 {
 		attemptErrors = append(attemptErrors, errors.New("no Registry Layout member serves the Route shard"))
 	}
-	return routeapi.RouteMutationResponse{}, fmt.Errorf("routeclient: Route shard leader is unavailable: %w", errors.Join(attemptErrors...))
+	err := fmt.Errorf("routeclient: Route shard leader is unavailable: %w", errors.Join(attemptErrors...))
+	if outcomeUnknown {
+		err = errors.Join(ErrMutationOutcomeUnknown, err)
+	}
+	return routeapi.RouteMutationResponse{}, err
 }
 
 func (c *Client) buildMutation(
@@ -517,15 +538,20 @@ func (c *Client) buildMutation(
 	path string,
 	request routeapi.RegisterBuildRequest,
 ) (routeapi.BuildMutationResponse, error) {
-	var attemptErrors []error
+	var (
+		attemptErrors  []error
+		outcomeUnknown bool
+	)
 	for attempt := 0; attempt < 2; attempt++ {
 		for _, endpoint := range c.shardEndpoints(shardID) {
 			var response routeapi.BuildMutationResponse
 			if err := postJSON(ctx, endpoint, path, request, &response); err != nil {
+				outcomeUnknown = outcomeUnknown || requestMayHaveReached(err)
 				attemptErrors = append(attemptErrors, fmt.Errorf("member %s: %w", endpoint.MemberID, err))
 				continue
 			}
 			if err := response.ValidateFor(request); err != nil {
+				outcomeUnknown = true
 				attemptErrors = append(attemptErrors, fmt.Errorf("member %s returned an invalid response: %w", endpoint.MemberID, err))
 				continue
 			}
@@ -540,21 +566,57 @@ func (c *Client) buildMutation(
 	if len(attemptErrors) == 0 {
 		attemptErrors = append(attemptErrors, errors.New("no Registry Layout member serves the Build shard"))
 	}
-	return routeapi.BuildMutationResponse{}, fmt.Errorf("routeclient: Build shard leader is unavailable: %w", errors.Join(attemptErrors...))
+	err := fmt.Errorf("routeclient: Build shard leader is unavailable: %w", errors.Join(attemptErrors...))
+	if outcomeUnknown {
+		err = errors.Join(ErrMutationOutcomeUnknown, err)
+	}
+	return routeapi.BuildMutationResponse{}, err
 }
 
 func (c *Client) readRouteStrong(ctx context.Context, request routeapi.ReadRouteRequest) (routeapi.ReadRouteResponse, error) {
-	for _, endpoint := range c.shardEndpoints(request.ShardID) {
-		var response routeapi.ReadRouteResponse
-		if err := postJSON(ctx, endpoint, routeapi.ReadRoutePath, request, &response); err != nil {
-			continue
-		}
-		if err := response.ValidateFor(request); err == nil {
-			c.observeLeader(request.ShardID, response.LeaderHint)
+	maxPasses := len(c.shardEndpoints(request.ShardID)) + 1
+	for pass := 0; pass < maxPasses; pass++ {
+		for _, endpoint := range c.shardEndpoints(request.ShardID) {
+			var response routeapi.ReadRouteResponse
+			if err := postJSONBounded(ctx, endpoint, routeapi.ReadRoutePath, request, &response); err != nil {
+				continue
+			}
+			if err := response.ValidateFor(request); err != nil {
+				continue
+			}
+			if response.Outcome == routeapi.ReadNeedLeader || response.Outcome == routeapi.ReadReplicaBehind {
+				if c.observeLeader(request.ShardID, response.LeaderHint) {
+					break
+				}
+				continue
+			}
 			return response, nil
 		}
 	}
 	return routeapi.ReadRouteResponse{}, errors.New("routeclient: Route shard is unavailable")
+}
+
+func (c *Client) readBuildStrong(ctx context.Context, request routeapi.ReadBuildRequest) (routeapi.ReadBuildResponse, error) {
+	maxPasses := len(c.shardEndpoints(request.ShardID)) + 1
+	for pass := 0; pass < maxPasses; pass++ {
+		for _, endpoint := range c.shardEndpoints(request.ShardID) {
+			var response routeapi.ReadBuildResponse
+			if err := postJSONBounded(ctx, endpoint, routeapi.ReadBuildPath, request, &response); err != nil {
+				continue
+			}
+			if err := response.ValidateFor(request); err != nil {
+				continue
+			}
+			if response.Outcome == routeapi.ReadNeedLeader || response.Outcome == routeapi.ReadReplicaBehind {
+				if c.observeLeader(request.ShardID, response.LeaderHint) {
+					break
+				}
+				continue
+			}
+			return response, nil
+		}
+	}
+	return routeapi.ReadBuildResponse{}, errors.New("routeclient: Build shard is unavailable")
 }
 
 func (c *Client) routeIdentity(group, routeKey string, write bool) (routeapi.RequestIdentity, error) {
@@ -645,20 +707,23 @@ func (c *Client) permitRemaining() time.Duration {
 	return remaining
 }
 
-func (c *Client) observeLeader(shardID uint32, hint *routeapi.LeaderHint) {
+func (c *Client) observeLeader(shardID uint32, hint *routeapi.LeaderHint) bool {
 	if hint == nil || !c.memberServesShard(hint.MemberID, shardID) {
-		return
+		return false
 	}
 	member, found := registryLayoutMember(c.registryLayout, hint.MemberID)
 	if !found || member.InternalEndpoint != hint.Endpoint {
-		return
+		return false
 	}
 	c.mu.Lock()
 	current := c.leaders[shardID]
+	accepted := false
 	if hint.Term >= current.Term {
 		c.leaders[shardID] = *hint
+		accepted = true
 	}
 	c.mu.Unlock()
+	return accepted
 }
 
 func (c *Client) shardEndpoints(shardID uint32) []Endpoint {
@@ -753,27 +818,37 @@ func postJSON(ctx context.Context, endpoint Endpoint, path string, input, output
 	if err != nil {
 		return err
 	}
+	var wroteRequest atomic.Bool
+	request = request.WithContext(httptrace.WithClientTrace(request.Context(), &httptrace.ClientTrace{
+		WroteRequest: func(httptrace.WroteRequestInfo) { wroteRequest.Store(true) },
+	}))
 	request.Header.Set("Content-Type", "application/json")
 	response, err := endpoint.Client.Do(request)
 	if err != nil {
-		return err
+		return &requestDeliveryError{err: err, mayHaveReached: wroteRequest.Load()}
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
 		detail, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
 		message := strings.TrimSpace(string(detail))
 		if message == "" {
-			return fmt.Errorf("routeclient: member %s returned %s", endpoint.MemberID, response.Status)
+			return &requestDeliveryError{err: fmt.Errorf("routeclient: member %s returned %s", endpoint.MemberID, response.Status), mayHaveReached: true}
 		}
-		return fmt.Errorf("routeclient: member %s returned %s: %s", endpoint.MemberID, response.Status, message)
+		return &requestDeliveryError{err: fmt.Errorf("routeclient: member %s returned %s: %s", endpoint.MemberID, response.Status, message), mayHaveReached: true}
 	}
 	decoder := json.NewDecoder(io.LimitReader(response.Body, maximumResponseBytes+1))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(output); err != nil {
-		return err
+		return &requestDeliveryError{err: err, mayHaveReached: true}
 	}
 	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		return errors.New("routeclient: response contains trailing data")
+		return &requestDeliveryError{err: errors.New("routeclient: response contains trailing data"), mayHaveReached: true}
 	}
 	return nil
+}
+
+func postJSONBounded(ctx context.Context, endpoint Endpoint, path string, input, output any) error {
+	attemptCtx, cancel := context.WithTimeout(ctx, nonMutationAttemptTimeout)
+	defer cancel()
+	return postJSON(attemptCtx, endpoint, path, input, output)
 }
