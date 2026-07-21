@@ -47,6 +47,7 @@ func validateRouteTransition(
 		}
 		if next.State == clusterstate.WorkflowRouteResuming &&
 			sameReadyExecution(current.Paused.Execution, next.Resuming.Execution) &&
+			reflect.DeepEqual(current.Paused.ResumeIntent, next.Resuming.Intent) &&
 			next.Resuming.Execution.LastEventSeq >= current.Paused.Execution.LastEventSeq {
 			return nil
 		}
@@ -73,6 +74,7 @@ func validateRouteTransition(
 		}
 	case clusterstate.WorkflowRouteDeleting:
 		if next.State == clusterstate.WorkflowRouteTombstone && next.Tombstone != nil &&
+			!next.Tombstone.FenceCompacted &&
 			next.Tombstone.SandboxID == current.Deleting.Execution.SandboxID &&
 			next.Tombstone.NodeID == current.Deleting.Execution.NodeID &&
 			next.Tombstone.NodeEpoch == current.Deleting.Execution.NodeEpoch &&
@@ -333,15 +335,17 @@ func readyMatchesStarting(starting clusterstate.RouteStartingState, ready cluste
 func validateStartingTombstone(starting clusterstate.RouteStartingState, tombstone clusterstate.RouteTombstoneState) error {
 	if tombstone.PlacementFailure != nil {
 		failure := tombstone.PlacementFailure
-		if failure.SandboxID != starting.SandboxID || failure.PlacementRound != starting.PlacementRound ||
+		if starting.SelectedCandidate != nil || starting.Binding != nil ||
+			len(starting.DefinitivelyRejected) != len(starting.CandidatePool) ||
+			failure.SandboxID != starting.SandboxID || failure.PlacementRound != starting.PlacementRound ||
 			!reflect.DeepEqual(failure.CandidatePool, starting.CandidatePool) ||
 			!reflect.DeepEqual(failure.Intent, starting.Intent) ||
-			!indexSetContains(failure.DefinitivelyRejected, starting.DefinitivelyRejected) {
+			!sameRejectedCandidates(failure.DefinitivelyRejected, starting.DefinitivelyRejected) {
 			return errors.New("raftstore: placement failure differs from committed STARTING intent")
 		}
 		return nil
 	}
-	if starting.Binding == nil || tombstone.SandboxID != starting.SandboxID ||
+	if tombstone.FenceCompacted || starting.Binding == nil || tombstone.SandboxID != starting.SandboxID ||
 		tombstone.NodeID != starting.Binding.NodeID || tombstone.NodeEpoch != starting.Binding.NodeEpoch ||
 		tombstone.BindingDigest != starting.Binding.BindingDigest ||
 		tombstone.LastEventSeq <= starting.LastEventSeq {
@@ -356,9 +360,11 @@ func sameReadyExecution(left, right clusterstate.ReadyRoute) bool {
 }
 
 func buildFailureMatchesStarting(starting clusterstate.BuildStartingState, failure clusterstate.BuildPlacementFailureState) bool {
-	return failure.BuildID == starting.BuildID && reflect.DeepEqual(failure.CandidatePool, starting.CandidatePool) &&
+	return starting.SelectedCandidate == nil && starting.Binding == nil &&
+		len(starting.DefinitivelyRejected) == len(starting.CandidatePool) &&
+		failure.BuildID == starting.BuildID && reflect.DeepEqual(failure.CandidatePool, starting.CandidatePool) &&
 		reflect.DeepEqual(failure.Intent, starting.Intent) &&
-		indexSetContains(failure.DefinitivelyRejected, starting.DefinitivelyRejected)
+		sameRejectedCandidates(failure.DefinitivelyRejected, starting.DefinitivelyRejected)
 }
 
 func buildProjectionMatchesBinding(
@@ -374,19 +380,6 @@ func buildProjectionMatchesBinding(
 func sameBuildProjection(left, right clusterstate.BuildProjection) bool {
 	left.LastEventSeq, right.LastEventSeq = 0, 0
 	return reflect.DeepEqual(left, right)
-}
-
-func indexSetContains(superset, subset []uint32) bool {
-	values := make(map[uint32]struct{}, len(superset))
-	for _, value := range superset {
-		values[value] = struct{}{}
-	}
-	for _, value := range subset {
-		if _, found := values[value]; !found {
-			return false
-		}
-	}
-	return true
 }
 
 func validateFenceCompaction(

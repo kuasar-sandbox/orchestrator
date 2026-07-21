@@ -101,7 +101,9 @@ func (r *Runtime) ActivateRegistryLayoutTransition(ctx context.Context) (SystemS
 		return SystemState{}, errors.New("raftstore: registryLayout transition has incomplete shards")
 	}
 	result, proposeErr := r.proposeSystem(ctx, SystemCommand{Type: SystemActivateTransition})
-	current, readErr := r.ReadSystemStrong(ctx)
+	resolveContext, cancelResolve := ambiguityResolutionContext(ctx)
+	defer cancelResolve()
+	current, readErr := r.ReadSystemStrong(resolveContext)
 	if readErr == nil {
 		if current.Transition != nil && current.Transition.Activated &&
 			current.ActiveRegistryLayoutDigest == r.registryLayoutDigest {
@@ -174,7 +176,9 @@ func (r *Runtime) ConfirmRegistryLayoutTransitionPermitDrain(ctx context.Context
 			WaitedMillis:                 uint64(time.Since(started) / time.Millisecond),
 		},
 	})
-	confirmed, readErr := r.ReadSystemStrong(ctx)
+	resolveContext, cancelResolve := ambiguityResolutionContext(ctx)
+	defer cancelResolve()
+	confirmed, readErr := r.ReadSystemStrong(resolveContext)
 	if readErr == nil && confirmed.Transition != nil && confirmed.Transition.PreviousPermitDrainComplete {
 		return confirmed, nil
 	}
@@ -207,7 +211,9 @@ func (r *Runtime) FinalizeRegistryLayoutTransition(ctx context.Context) (SystemS
 		return SystemState{}, errors.New("raftstore: registryLayout transition is not ready to finalize")
 	}
 	result, proposeErr := r.proposeSystem(ctx, SystemCommand{Type: SystemFinalizeTransition})
-	current, readErr := r.ReadSystemStrong(ctx)
+	resolveContext, cancelResolve := ambiguityResolutionContext(ctx)
+	defer cancelResolve()
+	current, readErr := r.ReadSystemStrong(resolveContext)
 	if readErr == nil && current.Transition == nil && current.ActiveRegistryLayoutDigest == r.registryLayoutDigest {
 		if err := r.SyncLocalRegistryLayout(current); err != nil {
 			return SystemState{}, err
@@ -271,7 +277,9 @@ func (r *Runtime) commitTransitionAdvance(
 		Type:    SystemAdvanceTransition,
 		Advance: &TransitionAdvance{ShardID: shardID, From: from, To: to},
 	})
-	current, readErr := r.ReadSystemStrong(ctx)
+	resolveContext, cancelResolve := ambiguityResolutionContext(ctx)
+	defer cancelResolve()
+	current, readErr := r.ReadSystemStrong(resolveContext)
 	if readErr == nil && current.Transition != nil {
 		position := transitionPosition(current.Transition.Shards, shardID)
 		if position >= 0 && current.Transition.Shards[position].Stage == to {
@@ -319,7 +327,9 @@ func (r *Runtime) prepareDataEpoch(ctx context.Context, system SystemState, raft
 		if proposeErr == nil && result.Conflict {
 			proposeErr = errors.New(result.Reason)
 		}
-		state, err = r.readDataStateStrong(ctx, raftShardID)
+		resolveContext, cancelResolve := ambiguityResolutionContext(ctx)
+		defer cancelResolve()
+		state, err = r.readDataStateStrong(resolveContext, raftShardID)
 		if err != nil {
 			if proposeErr != nil {
 				return proposeErr
@@ -382,7 +392,9 @@ func (r *Runtime) retireDataEpoch(ctx context.Context, system SystemState, raftS
 		if proposeErr == nil && result.Conflict {
 			proposeErr = errors.New(result.Reason)
 		}
-		state, err = r.readDataStateStrong(ctx, raftShardID)
+		resolveContext, cancelResolve := ambiguityResolutionContext(ctx)
+		defer cancelResolve()
+		state, err = r.readDataStateStrong(resolveContext, raftShardID)
 		if err != nil {
 			if proposeErr != nil {
 				return proposeErr

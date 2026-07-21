@@ -13,7 +13,8 @@ func (r *Runtime) ApplySystem(ctx context.Context, command SystemCommand) (Syste
 		command.Type == SystemAdvanceTransition || command.Type == SystemActivateTransition ||
 		command.Type == SystemConfirmTransitionDrain || command.Type == SystemFinalizeTransition ||
 		command.Type == SystemCloseRegistryGeneration || command.Type == SystemSetGates ||
-		command.Type == SystemBeginRecovery || command.Type == SystemAdvanceRecovery {
+		command.Type == SystemBeginRecovery || command.Type == SystemConfirmRecoveryDrain ||
+		command.Type == SystemAdvanceRecovery {
 		return SystemApplyResult{}, errors.New("raftstore: System lifecycle command requires its dedicated workflow")
 	}
 	if command.Type == SystemBeginTransition {
@@ -40,7 +41,9 @@ func (r *Runtime) ConfigureServiceGates(ctx context.Context, gates GateUpdate) (
 		return state, nil
 	}
 	result, proposeErr := r.proposeSystem(ctx, SystemCommand{Type: SystemSetGates, Gates: &gates})
-	current, readErr := r.ReadSystemStrong(ctx)
+	resolveContext, cancelResolve := ambiguityResolutionContext(ctx)
+	defer cancelResolve()
+	current, readErr := r.ReadSystemStrong(resolveContext)
 	if readErr == nil && current.ServeGate == gates.Serve && current.WriteGate == gates.Write &&
 		current.CutoverGate == gates.Cutover {
 		return current, nil
@@ -98,7 +101,9 @@ func (r *Runtime) CloseRegistryGeneration(ctx context.Context, successor Registr
 			Kind:                             RolloverConsensusClosure,
 		},
 	})
-	current, readErr := r.ReadSystemStrong(ctx)
+	resolveContext, cancelResolve := ambiguityResolutionContext(ctx)
+	defer cancelResolve()
+	current, readErr := r.ReadSystemStrong(resolveContext)
 	if readErr == nil && current.Retired && current.Closure != nil &&
 		current.Closure.TargetRegistryGeneration == successor.RegistryGeneration &&
 		current.Closure.TargetRegistryLayoutIntentDigest == intentDigest {
@@ -176,20 +181,23 @@ func (r *Runtime) ConfirmPredecessorPermitDrain(ctx context.Context, evidenceDig
 		PredecessorProofDigest: state.PredecessorProofDigest,
 		WaitedMillis:           elapsedMillis, EvidenceDigest: evidenceDigest,
 	}})
+	resolveContext, cancelResolve := ambiguityResolutionContext(ctx)
+	defer cancelResolve()
+	confirmed, readErr := r.ReadSystemStrong(resolveContext)
+	if readErr == nil && confirmed.PredecessorDrainComplete &&
+		confirmed.PredecessorProofDigest == state.PredecessorProofDigest {
+		return confirmed, nil
+	}
 	if err != nil {
 		return SystemState{}, err
 	}
 	if result.Conflict || !result.Applied {
 		return SystemState{}, errors.New(result.Reason)
 	}
-	confirmed, err := r.ReadSystemStrong(ctx)
-	if err != nil {
-		return SystemState{}, err
+	if readErr != nil {
+		return SystemState{}, readErr
 	}
-	if !confirmed.PredecessorDrainComplete {
-		return SystemState{}, errors.New("raftstore: predecessor drain was not committed")
-	}
-	return confirmed, nil
+	return SystemState{}, errors.New("raftstore: predecessor drain was not committed")
 }
 
 func (r *Runtime) ReadData(ctx context.Context, query DataLookup) (DataLookupResult, error) {
@@ -270,6 +278,8 @@ func lookupIdentity(query DataLookup) (ShardRequestIdentity, uint32, bool) {
 		return shardIdentityFromRoute(query.Route.RequestIdentity), query.Route.ShardID, query.Route.Strong
 	case query.Build != nil:
 		return shardIdentityFromRoute(query.Build.RequestIdentity), query.Build.ShardID, query.Build.Strong
+	case query.Workflow != nil:
+		return query.Workflow.Identity, query.Workflow.Identity.ShardID, true
 	case query.RouteBucket != nil:
 		return query.RouteBucket.Identity, query.RouteBucket.Identity.ShardID, query.RouteBucket.Strong
 	case query.Changefeed != nil:

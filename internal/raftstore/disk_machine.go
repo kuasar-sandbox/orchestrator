@@ -507,6 +507,28 @@ func (m *diskStateMachine) lookupData(
 		if found {
 			state.Builds[key] = record
 		}
+	case query.Workflow != nil:
+		if query.Workflow.RouteKey != "" {
+			key := routeMapKey(query.Workflow.Group, query.Workflow.RouteKey)
+			var record clusterstate.RouteWorkflowRecord
+			found, err := getStateJSON(reader, stateRowKey(prefix, stateRouteTable, key), &record)
+			if err != nil {
+				return DataLookupResult{}, err
+			}
+			if found {
+				state.Routes[key] = record
+			}
+		} else {
+			key := buildMapKey(query.Workflow.Group, query.Workflow.BuildID)
+			var record clusterstate.BuildRecord
+			found, err := getStateJSON(reader, stateRowKey(prefix, stateBuildTable, key), &record)
+			if err != nil {
+				return DataLookupResult{}, err
+			}
+			if found {
+				state.Builds[key] = record
+			}
+		}
 	case query.RouteBucket != nil:
 		bucket, err := lookupRouteBucketOnDisk(reader, prefix, state, *query.RouteBucket)
 		if err != nil {
@@ -689,8 +711,12 @@ func lookupPendingOnDisk(
 	}
 	for _, table := range tables {
 		tablePrefix := stateTablePrefix(prefix, table.table)
+		lowerBound, scan := pendingTableLowerBound(prefix, tablePrefix, table.table, table.qualified, query.AfterKey)
+		if !scan {
+			continue
+		}
 		iterator := reader.NewIter(&pebble.IterOptions{
-			LowerBound: tablePrefix, UpperBound: prefixUpperBound(tablePrefix),
+			LowerBound: lowerBound, UpperBound: prefixUpperBound(tablePrefix),
 		})
 		for valid := iterator.First(); valid; valid = iterator.Next() {
 			mapKey := string(iterator.Key()[len(tablePrefix):])
@@ -751,6 +777,16 @@ func lookupPendingOnDisk(
 		result.NextKey = workflows[len(workflows)-1].Key
 	}
 	return result, nil
+}
+
+func pendingTableLowerBound(prefix, tablePrefix []byte, table, qualified byte, afterKey string) ([]byte, bool) {
+	if afterKey == "" || qualified > afterKey[0] {
+		return tablePrefix, true
+	}
+	if qualified < afterKey[0] {
+		return nil, false
+	}
+	return stateRowKey(prefix, table, afterKey[1:]), true
 }
 
 func (m *diskStateMachine) Sync() error {

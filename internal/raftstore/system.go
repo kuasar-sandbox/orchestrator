@@ -27,6 +27,8 @@ type RecoveryEpoch struct {
 	TargetRegistryGeneration   string        `json:"target_registry_generation"`
 	TargetRegistryLayoutDigest string        `json:"target_registry_layout_digest"`
 	Phase                      RecoveryPhase `json:"phase"`
+	PermitDrainComplete        bool          `json:"permit_drain_complete"`
+	PermitDrainIndex           uint64        `json:"permit_drain_index,omitempty"`
 }
 
 func (r RecoveryEpoch) Validate() error {
@@ -37,6 +39,12 @@ func (r RecoveryEpoch) Validate() error {
 	}
 	switch r.Phase {
 	case RecoveryPreparing, RecoveryCollecting, RecoveryReconciling, RecoveryFinalizing:
+		if r.PermitDrainComplete != (r.PermitDrainIndex != 0) {
+			return errors.New("raftstore: recovery permit drain state is inconsistent")
+		}
+		if r.Phase != RecoveryPreparing && !r.PermitDrainComplete {
+			return errors.New("raftstore: recovery advanced before old permits drained")
+		}
 		return nil
 	default:
 		return errors.New("raftstore: invalid open recovery phase")
@@ -265,6 +273,9 @@ func (s SystemState) Validate() error {
 			s.Recovery.TargetRegistryLayoutDigest != s.ActiveRegistryLayoutDigest {
 			return errors.New("raftstore: recovery epoch does not match its fenced source and target")
 		}
+		if s.Recovery.PermitDrainIndex > s.LastApplied {
+			return errors.New("raftstore: recovery permit drain proof is ahead of System consensus")
+		}
 		if s.ServeGate || s.WriteGate || s.CutoverGate {
 			return errors.New("raftstore: recovery epoch requires closed normal-operation gates")
 		}
@@ -286,6 +297,7 @@ const (
 	SystemCloseRegistryGeneration SystemCommandType = "CLOSE_REGISTRY_GENERATION"
 	SystemConfirmDrain            SystemCommandType = "CONFIRM_PREDECESSOR_PERMIT_DRAIN"
 	SystemBeginRecovery           SystemCommandType = "BEGIN_RECOVERY"
+	SystemConfirmRecoveryDrain    SystemCommandType = "CONFIRM_RECOVERY_PERMIT_DRAIN"
 	SystemAdvanceRecovery         SystemCommandType = "ADVANCE_RECOVERY"
 )
 
@@ -304,6 +316,13 @@ type TransitionAdvance struct {
 type RecoveryAdvance struct {
 	From RecoveryPhase `json:"from"`
 	To   RecoveryPhase `json:"to"`
+}
+
+type RecoveryDrainConfirmation struct {
+	RecoveryEpoch              uint64 `json:"recovery_epoch"`
+	TargetRegistryGeneration   string `json:"target_registry_generation"`
+	TargetRegistryLayoutDigest string `json:"target_registry_layout_digest"`
+	WaitedMillis               uint64 `json:"waited_millis"`
 }
 
 type DrainConfirmation struct {
@@ -330,6 +349,7 @@ type SystemCommand struct {
 	Drain           *DrainConfirmation           `json:"drain,omitempty"`
 	TransitionDrain *TransitionDrainConfirmation `json:"transition_drain,omitempty"`
 	Recovery        *RecoveryEpoch               `json:"recovery,omitempty"`
+	RecoveryDrain   *RecoveryDrainConfirmation   `json:"recovery_drain,omitempty"`
 	RecoveryAdvance *RecoveryAdvance             `json:"recovery_advance,omitempty"`
 }
 
@@ -478,16 +498,32 @@ func ApplySystemCommand(state SystemState, index uint64, command SystemCommand) 
 			command.Recovery.SourceRegistryGeneration != state.PredecessorRegistryGeneration ||
 			command.Recovery.SourceRegistryLayoutDigest != state.PredecessorRegistryLayoutDigest ||
 			command.Recovery.TargetRegistryGeneration != state.RegistryGeneration ||
-			command.Recovery.TargetRegistryLayoutDigest != state.ActiveRegistryLayoutDigest || command.Recovery.Phase != RecoveryPreparing {
+			command.Recovery.TargetRegistryLayoutDigest != state.ActiveRegistryLayoutDigest ||
+			command.Recovery.Phase != RecoveryPreparing || command.Recovery.PermitDrainComplete ||
+			command.Recovery.PermitDrainIndex != 0 {
 			return state, systemConflict("invalid recovery epoch")
 		}
 		recovery := *command.Recovery
 		next.Recovery = &recovery
 		next.SystemEpoch = recovery.Epoch
 		next.ServeGate, next.WriteGate, next.CutoverGate = false, false, false
+	case SystemConfirmRecoveryDrain:
+		if state.Recovery == nil || state.Recovery.Phase != RecoveryPreparing ||
+			state.Recovery.PermitDrainComplete || command.RecoveryDrain == nil ||
+			command.RecoveryDrain.RecoveryEpoch != state.Recovery.Epoch ||
+			command.RecoveryDrain.TargetRegistryGeneration != state.Recovery.TargetRegistryGeneration ||
+			command.RecoveryDrain.TargetRegistryLayoutDigest != state.Recovery.TargetRegistryLayoutDigest ||
+			command.RecoveryDrain.WaitedMillis < state.ServePermitMaxMillis {
+			return state, systemConflict("recovery permit drain confirmation is invalid")
+		}
+		recovery := *state.Recovery
+		recovery.PermitDrainComplete = true
+		recovery.PermitDrainIndex = index
+		next.Recovery = &recovery
 	case SystemAdvanceRecovery:
 		if state.Recovery == nil || command.RecoveryAdvance == nil ||
 			state.Recovery.Phase != command.RecoveryAdvance.From ||
+			!state.Recovery.PermitDrainComplete ||
 			!validRecoveryAdvance(command.RecoveryAdvance.From, command.RecoveryAdvance.To) {
 			return state, systemConflict("recovery phase conflict")
 		}

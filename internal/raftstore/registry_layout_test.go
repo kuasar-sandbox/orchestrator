@@ -153,6 +153,17 @@ func TestRegistryLayoutRejectsIncompleteOrUnstablePlacement(t *testing.T) {
 	if err := registryLayout.Validate(); err == nil {
 		t.Fatal("incomplete shard placement accepted")
 	}
+	for name, endpoint := range map[string]string{
+		"empty host": ":63001", "named port": "registry-a:raft", "zero port": "registry-a:0",
+	} {
+		t.Run(name, func(t *testing.T) {
+			candidate := testRegistryLayout(4, "generation-1")
+			candidate.Members[0].RaftEndpoint = endpoint
+			if err := candidate.Validate(); err == nil {
+				t.Fatalf("invalid Raft endpoint %q accepted", endpoint)
+			}
+		})
+	}
 }
 
 func TestRegistryLayoutGuardRejectsRollbackEquivocationAndUnrelatedGeneration(t *testing.T) {
@@ -233,6 +244,36 @@ func TestRegistryLayoutGuardFreezesGenerationParameters(t *testing.T) {
 	}
 }
 
+func TestAcceptedRegistryLayoutBindsEveryMirroredFrozenField(t *testing.T) {
+	registryLayout := testRegistryLayout(4, "generation-1")
+	digest, _ := registryLayout.Digest()
+	accepted, err := FirstAcceptedRegistryLayout(registryLayout, digest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mutations := map[string]func(*AcceptedRegistryLayout){
+		"format":        func(value *AcceptedRegistryLayout) { value.FormatVersion++ },
+		"schema":        func(value *AcceptedRegistryLayout) { value.SchemaVersion++ },
+		"protocol":      func(value *AcceptedRegistryLayout) { value.ProtocolVersion++ },
+		"hash":          func(value *AcceptedRegistryLayout) { value.HashVersion = "other" },
+		"shards":        func(value *AcceptedRegistryLayout) { value.VirtualShardCount *= 2 },
+		"route buckets": func(value *AcceptedRegistryLayout) { value.RouteBucketCount *= 2 },
+		"build buckets": func(value *AcceptedRegistryLayout) { value.BuildBucketCount *= 2 },
+		"replication":   func(value *AcceptedRegistryLayout) { value.ReplicationFactor-- },
+		"permit":        func(value *AcceptedRegistryLayout) { value.ServePermitMaxMillis++ },
+		"bootstrap":     func(value *AcceptedRegistryLayout) { value.BootstrapTokenDigest = digestFor("other") },
+	}
+	for name, mutate := range mutations {
+		t.Run(name, func(t *testing.T) {
+			corrupt := accepted
+			mutate(&corrupt)
+			if err := corrupt.Validate(); err == nil {
+				t.Fatal("guard mirror diverged from embedded signed artifact")
+			}
+		})
+	}
+}
+
 func TestRegistryLayoutGuardRejectsRetainedReplicaEndpointChange(t *testing.T) {
 	first := testRegistryLayout(2, "generation-1")
 	firstDigest, err := first.Digest()
@@ -254,6 +295,34 @@ func TestRegistryLayoutGuardRejectsRetainedReplicaEndpointChange(t *testing.T) {
 	}
 	if _, err := accepted.Accept(next, nextDigest); err == nil {
 		t.Fatal("retained Raft replica changed endpoint")
+	}
+}
+
+func TestRegistryLayoutGuardRejectsNewReplicaIDOnOccupiedTarget(t *testing.T) {
+	first := testRegistryLayout(2, "generation-1")
+	firstDigest, _ := first.Digest()
+	accepted, err := FirstAcceptedRegistryLayout(first, firstDigest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, mutate := range map[string]func(*RegistryLayout){
+		"system": func(next *RegistryLayout) { next.SystemReplicas[0].ReplicaID = 101 },
+		"data":   func(next *RegistryLayout) { next.DataShards[0].Replicas[0].ReplicaID = 101 },
+	} {
+		t.Run(name, func(t *testing.T) {
+			next := cloneRegistryLayout(first)
+			next.RegistryLayoutVersion = 2
+			next.PreviousRegistryLayoutVersion = 1
+			next.PreviousRegistryLayoutDigest = firstDigest
+			mutate(&next)
+			digest, digestErr := next.Digest()
+			if digestErr != nil {
+				t.Fatal(digestErr)
+			}
+			if _, err := accepted.Accept(next, digest); err == nil {
+				t.Fatal("replacement replica reused a target occupied by another replica ID")
+			}
+		})
 	}
 }
 

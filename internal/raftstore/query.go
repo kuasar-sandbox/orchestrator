@@ -11,6 +11,7 @@ import (
 type DataLookup struct {
 	Route       *routeapi.ReadRouteRequest `json:"route,omitempty"`
 	Build       *routeapi.ReadBuildRequest `json:"build,omitempty"`
+	Workflow    *WorkflowLookup            `json:"workflow,omitempty"`
 	RouteBucket *RouteBucketLookup         `json:"route_bucket,omitempty"`
 	Changefeed  *RouteChangefeedLookup     `json:"changefeed,omitempty"`
 	Pending     *PendingLookup             `json:"pending,omitempty"`
@@ -28,6 +29,12 @@ func (q DataLookup) Validate() error {
 	if q.Build != nil {
 		present++
 		if err := q.Build.Validate(); err != nil {
+			return err
+		}
+	}
+	if q.Workflow != nil {
+		present++
+		if err := q.Workflow.Validate(); err != nil {
 			return err
 		}
 	}
@@ -64,6 +71,7 @@ func (q DataLookup) Validate() error {
 type DataLookupResult struct {
 	Route       *routeapi.ReadRouteResponse `json:"route,omitempty"`
 	Build       *routeapi.ReadBuildResponse `json:"build,omitempty"`
+	Workflow    *WorkflowLookupResult       `json:"workflow,omitempty"`
 	RouteBucket *RouteBucketResult          `json:"route_bucket,omitempty"`
 	Changefeed  *RouteChangefeedResult      `json:"changefeed,omitempty"`
 	Pending     *PendingLookupResult        `json:"pending,omitempty"`
@@ -81,6 +89,9 @@ func LookupData(state DataState, query DataLookup) (DataLookupResult, error) {
 	case query.Build != nil:
 		response := lookupBuild(state, *query.Build)
 		return DataLookupResult{Build: &response}, nil
+	case query.Workflow != nil:
+		response := lookupWorkflow(state, *query.Workflow)
+		return DataLookupResult{Workflow: &response}, nil
 	case query.RouteBucket != nil:
 		response := lookupRouteBucket(state, *query.RouteBucket)
 		return DataLookupResult{RouteBucket: &response}, nil
@@ -94,6 +105,64 @@ func LookupData(state DataState, query DataLookup) (DataLookupResult, error) {
 		response := lookupPending(state, *query.Pending)
 		return DataLookupResult{Pending: &response}, nil
 	}
+}
+
+// WorkflowLookup is the leader/coordinator view of one complete workflow.
+// Router reads remain a separate API that exposes only safe projections.
+type WorkflowLookup struct {
+	Identity ShardRequestIdentity `json:"identity"`
+	Group    string               `json:"group"`
+	RouteKey string               `json:"route_key,omitempty"`
+	BuildID  string               `json:"build_id,omitempty"`
+}
+
+func (q WorkflowLookup) Validate() error {
+	if err := q.Identity.Validate(); err != nil {
+		return err
+	}
+	if q.Group == "" || (q.RouteKey == "") == (q.BuildID == "") {
+		return errors.New("raftstore: workflow lookup requires a group and exactly one Route or Build key")
+	}
+	return nil
+}
+
+type WorkflowLookupResult struct {
+	Available bool                              `json:"available"`
+	Reason    string                            `json:"reason,omitempty"`
+	Route     *clusterstate.RouteWorkflowRecord `json:"route,omitempty"`
+	Build     *clusterstate.BuildRecord         `json:"build,omitempty"`
+}
+
+func lookupWorkflow(state DataState, query WorkflowLookup) WorkflowLookupResult {
+	if !state.Initialized || !state.Accepts(query.Identity) {
+		return WorkflowLookupResult{Reason: "workflow shard identity is not available"}
+	}
+	if query.RouteKey != "" {
+		_, shardID, err := clusterstate.RouteShardFor(
+			query.Group, query.RouteKey, state.RouteBucketCount, state.VirtualShardCount,
+		)
+		if err != nil || shardID != state.ShardID {
+			return WorkflowLookupResult{Reason: "Route workflow targets another shard"}
+		}
+		record, found := state.Routes[routeMapKey(query.Group, query.RouteKey)]
+		if !found {
+			return WorkflowLookupResult{Available: true}
+		}
+		copy := cloneRouteRecord(record)
+		return WorkflowLookupResult{Available: true, Route: &copy}
+	}
+	_, shardID, err := clusterstate.BuildShardFor(
+		query.Group, query.BuildID, state.BuildBucketCount, state.VirtualShardCount,
+	)
+	if err != nil || shardID != state.ShardID {
+		return WorkflowLookupResult{Reason: "Build workflow targets another shard"}
+	}
+	record, found := state.Builds[buildMapKey(query.Group, query.BuildID)]
+	if !found {
+		return WorkflowLookupResult{Available: true}
+	}
+	copy := cloneBuildRecord(record)
+	return WorkflowLookupResult{Available: true, Build: &copy}
 }
 
 type RouteBucketLookup struct {

@@ -39,6 +39,30 @@ func TestSnapshotRejectsRouteChangeBeyondLastApplied(t *testing.T) {
 	}
 }
 
+func TestPendingDiskScanSeeksFromQualifiedCursor(t *testing.T) {
+	prefix := []byte("slot/")
+	buildPrefix := stateTablePrefix(prefix, stateBuildTable)
+	routePrefix := stateTablePrefix(prefix, stateRouteTable)
+
+	lower, scan := pendingTableLowerBound(prefix, buildPrefix, stateBuildTable, 'b', "bbuild-key")
+	want := stateRowKey(prefix, stateBuildTable, "build-key")
+	if !scan || !bytes.Equal(lower, want) {
+		t.Fatalf("Build lower bound = %q scan=%t, want %q", lower, scan, want)
+	}
+	if _, scan := pendingTableLowerBound(prefix, buildPrefix, stateBuildTable, 'b', "rroute-key"); scan {
+		t.Fatal("Build table was rescanned after the cursor entered the Route table")
+	}
+	lower, scan = pendingTableLowerBound(prefix, routePrefix, stateRouteTable, 'r', "bbuild-key")
+	if !scan || !bytes.Equal(lower, routePrefix) {
+		t.Fatalf("Route lower bound after Build cursor = %q scan=%t", lower, scan)
+	}
+	lower, scan = pendingTableLowerBound(prefix, routePrefix, stateRouteTable, 'r', "rroute-key")
+	want = stateRowKey(prefix, stateRouteTable, "route-key")
+	if !scan || !bytes.Equal(lower, want) {
+		t.Fatalf("Route lower bound = %q scan=%t, want %q", lower, scan, want)
+	}
+}
+
 func TestPebbleStateMachinePersistsAndRestoresAcrossReplicaIDs(t *testing.T) {
 	root := t.TempDir()
 	engine, err := OpenPebbleStateEngine(root)
@@ -447,6 +471,17 @@ func assertDiskReady(
 	result := value.(DataLookupResult)
 	if result.Route == nil || result.Route.Outcome != routeapi.ReadReady || result.Route.RouteRevision != 3 {
 		t.Fatalf("on-disk READY lookup = %+v", result.Route)
+	}
+	value, err = machine.Lookup(DataLookup{Workflow: &WorkflowLookup{
+		Identity: identity, Group: group, RouteKey: routeKey,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	workflow := value.(DataLookupResult).Workflow
+	if workflow == nil || !workflow.Available || workflow.Route == nil ||
+		workflow.Route.State != clusterstate.WorkflowRouteReady || workflow.Route.Revision.LogIndex != 3 {
+		t.Fatalf("on-disk workflow lookup = %+v", workflow)
 	}
 	bucket, _, err := clusterstate.RouteShardFor(group, routeKey, 16, 4)
 	if err != nil {

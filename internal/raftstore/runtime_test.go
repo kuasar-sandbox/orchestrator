@@ -31,10 +31,12 @@ type fakeNodeHost struct {
 	createOnStart bool
 	startErr      error
 	read          func(uint64, any) (any, error)
+	readCtx       func(context.Context, uint64, any) (any, error)
 	memberships   map[uint64]*dragonboat.Membership
 	leaderID      uint64
 	leaderTerm    uint64
 	propose       func([]byte) (sm.Result, error)
+	proposeCtx    func(context.Context, []byte) (sm.Result, error)
 	stopErr       error
 	removeDataErr error
 	stopCalls     int
@@ -67,14 +69,20 @@ func (f *fakeNodeHost) HasNodeInfo(shardID, replicaID uint64) bool {
 	return f.history[[2]uint64{shardID, replicaID}]
 }
 
-func (f *fakeNodeHost) SyncPropose(_ context.Context, _ *client.Session, command []byte) (sm.Result, error) {
+func (f *fakeNodeHost) SyncPropose(ctx context.Context, _ *client.Session, command []byte) (sm.Result, error) {
+	if f.proposeCtx != nil {
+		return f.proposeCtx(ctx, command)
+	}
 	if f.propose != nil {
 		return f.propose(command)
 	}
 	return sm.Result{}, errors.New("not implemented")
 }
 
-func (f *fakeNodeHost) SyncRead(_ context.Context, shardID uint64, query any) (any, error) {
+func (f *fakeNodeHost) SyncRead(ctx context.Context, shardID uint64, query any) (any, error) {
+	if f.readCtx != nil {
+		return f.readCtx(ctx, shardID, query)
+	}
 	if f.read == nil {
 		return nil, errors.New("not implemented")
 	}
@@ -778,6 +786,7 @@ func TestRuntimeRejectsUnprovenGenericSystemLifecycleCommands(t *testing.T) {
 	commands := []SystemCommand{
 		{Type: SystemSetGates, Gates: &GateUpdate{Serve: true, Write: true, Cutover: true}},
 		{Type: SystemBeginRecovery, Recovery: &RecoveryEpoch{}},
+		{Type: SystemConfirmRecoveryDrain, RecoveryDrain: &RecoveryDrainConfirmation{}},
 		{Type: SystemAdvanceRecovery, RecoveryAdvance: &RecoveryAdvance{}},
 	}
 	for _, command := range commands {

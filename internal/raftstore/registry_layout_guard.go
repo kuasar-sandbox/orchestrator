@@ -42,7 +42,17 @@ func (a AcceptedRegistryLayout) Validate() error {
 	digest, err := a.RegistryLayout.Digest()
 	if err != nil || digest != a.RegistryLayoutDigest || a.RegistryLayout.ClusterID != a.ClusterID ||
 		a.RegistryLayout.RegistryGeneration != a.RegistryGeneration ||
-		a.RegistryLayout.RegistryLayoutVersion != a.RegistryLayoutVersion {
+		a.RegistryLayout.RegistryLayoutVersion != a.RegistryLayoutVersion ||
+		a.RegistryLayout.FormatVersion != a.FormatVersion ||
+		a.RegistryLayout.SchemaVersion != a.SchemaVersion ||
+		a.RegistryLayout.ProtocolVersion != a.ProtocolVersion ||
+		a.RegistryLayout.HashVersion != a.HashVersion ||
+		a.RegistryLayout.VirtualShardCount != a.VirtualShardCount ||
+		a.RegistryLayout.RouteBucketCount != a.RouteBucketCount ||
+		a.RegistryLayout.BuildBucketCount != a.BuildBucketCount ||
+		a.RegistryLayout.ReplicationFactor != a.ReplicationFactor ||
+		a.RegistryLayout.ServePermitMaxMillis != a.ServePermitMaxMillis ||
+		a.RegistryLayout.BootstrapTokenDigest != a.BootstrapTokenDigest {
 		return errors.New("raftstore: accepted registryLayout artifact differs from its guard identity")
 	}
 	return nil
@@ -124,13 +134,21 @@ func validateRetainedReplicaTargets(previous, next RegistryLayout) error {
 		MemberID string
 		Endpoint string
 	}
+	type occupiedTarget struct {
+		ShardID uint64
+		Target  string
+	}
 	targets := make(map[replicaKey]target)
+	occupiedMembers := make(map[occupiedTarget]uint64)
+	occupiedEndpoints := make(map[occupiedTarget]uint64)
 	add := func(layout RegistryLayout, shardID uint64, replicas []ReplicaPlacement, output map[replicaKey]target) {
 		for _, replica := range replicas {
 			member, _ := registryLayoutMember(layout, replica.MemberID)
 			output[replicaKey{ShardID: shardID, ReplicaID: replica.ReplicaID}] = target{
 				MemberID: replica.MemberID, Endpoint: member.RaftEndpoint,
 			}
+			occupiedMembers[occupiedTarget{ShardID: shardID, Target: replica.MemberID}] = replica.ReplicaID
+			occupiedEndpoints[occupiedTarget{ShardID: shardID, Target: member.RaftEndpoint}] = replica.ReplicaID
 		}
 	}
 	add(previous, SystemRaftShardID, previous.SystemReplicas, targets)
@@ -139,11 +157,19 @@ func validateRetainedReplicaTargets(previous, next RegistryLayout) error {
 	}
 	check := func(shardID uint64, replicas []ReplicaPlacement) error {
 		for _, replica := range replicas {
+			member, _ := registryLayoutMember(next, replica.MemberID)
+			if priorID, occupied := occupiedMembers[occupiedTarget{ShardID: shardID, Target: replica.MemberID}]; occupied &&
+				priorID != replica.ReplicaID {
+				return errors.New("raftstore: replacement replica reuses an occupied member target")
+			}
+			if priorID, occupied := occupiedEndpoints[occupiedTarget{ShardID: shardID, Target: member.RaftEndpoint}]; occupied &&
+				priorID != replica.ReplicaID {
+				return errors.New("raftstore: replacement replica reuses an occupied Raft endpoint")
+			}
 			prior, retained := targets[replicaKey{ShardID: shardID, ReplicaID: replica.ReplicaID}]
 			if !retained {
 				continue
 			}
-			member, _ := registryLayoutMember(next, replica.MemberID)
 			if prior.MemberID != replica.MemberID || prior.Endpoint != member.RaftEndpoint {
 				return errors.New("raftstore: retained Raft replica changed member or endpoint")
 			}

@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/url"
 	"sort"
+	"strconv"
 )
 
 const (
@@ -89,8 +90,13 @@ func (m RegistryMember) Validate() error {
 	if err != nil || u.Scheme != "https" || u.Host == "" {
 		return errors.New("raftstore: member internal endpoint must be an HTTPS URL")
 	}
-	if _, _, err := net.SplitHostPort(m.RaftEndpoint); err != nil {
+	host, port, err := net.SplitHostPort(m.RaftEndpoint)
+	if err != nil {
 		return fmt.Errorf("raftstore: invalid member Raft endpoint: %w", err)
+	}
+	value, err := strconv.ParseUint(port, 10, 16)
+	if host == "" || err != nil || value == 0 {
+		return errors.New("raftstore: member Raft endpoint requires a host and numeric nonzero port")
 	}
 	return nil
 }
