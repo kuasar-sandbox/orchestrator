@@ -67,6 +67,8 @@ selected workflow ref must be `main`; the reviewed integration commit is passed
 separately as `candidate_sha`. The workflow rejects a dispatch unless:
 
 - the selected workflow SHA equals the recorded current `main`/base SHA;
+- the supplied PR number, candidate, base, and head still match the current
+  upstream pull request and its GitHub-generated merge commit;
 - the candidate is a full commit SHA in the upstream repository;
 - the candidate has exactly two parents, in order: the recorded base SHA and
   reviewed head SHA; and
@@ -97,6 +99,7 @@ gh workflow run bms-e2e.yml \
   --repo "$repo" \
   --ref main \
   -f confirm=run-full-e2e \
+  -f pull_request_number="$pr" \
   -f candidate_sha="$integration_sha" \
   -f base_sha="$base_sha" \
   -f head_sha="$head_sha"
