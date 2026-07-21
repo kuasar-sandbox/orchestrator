@@ -161,12 +161,12 @@ func TestBuildAdmissionIsIdempotentConflictSafeAndBounded(t *testing.T) {
 
 	second := workflowDispatch(t, clusterstate.ExecutionKindBuild, "build-2", placement.BuildDemand{Slots: 1})
 	queued, err := st.PrepareBuildWorkflow(ctx, second, workflowBuild(second.ObjectID), capacity, "")
-	if err != nil || queued.Result != clusterstate.DispatchAcceptedQueued || queued.EventSeq != 1 ||
-		queued.LatestEvent == nil || queued.LatestEvent.State != string(clusterstate.BuildQueued) {
+	if err != nil || queued.Result != clusterstate.DispatchAcceptedQueued || queued.EventSeq != 0 ||
+		queued.LatestEvent != nil || queued.ObjectState != string(types.BuildRegistered) {
 		t.Fatalf("queued = %+v, %v", queued, err)
 	}
 	storedSecond, err := st.GetBuild(ctx, second.ObjectID)
-	if err != nil || storedSecond.Status != types.BuildWaiting ||
+	if err != nil || storedSecond.Status != types.BuildRegistered ||
 		storedSecond.Metadata[clusterstate.ObjectMetadataKey] != second.OpaqueBinding {
 		t.Fatalf("atomic queued Build = %+v, %v", storedSecond, err)
 	}
@@ -182,8 +182,15 @@ func TestBuildAdmissionIsIdempotentConflictSafeAndBounded(t *testing.T) {
 	if err := st.FinalizeNodeWorkflow(ctx, clusterstate.ExecutionKindBuild, third.ObjectID, third.BindingDigest); err != nil {
 		t.Fatal(err)
 	}
+	if got, err := st.GetNodeWorkflow(ctx, clusterstate.ExecutionKindBuild, third.ObjectID); err != nil ||
+		got == nil || !got.WorkflowFinalized {
+		t.Fatalf("finalized rejection marker = %+v, %v", got, err)
+	}
+	if err := st.CompactFinalizedNodeWorkflows(ctx, third.NodeID, third.NodeEpoch, third.SessionSeq+1); err != nil {
+		t.Fatal(err)
+	}
 	if got, err := st.GetNodeWorkflow(ctx, clusterstate.ExecutionKindBuild, third.ObjectID); err != nil || got != nil {
-		t.Fatalf("finalized rejection = %+v, %v", got, err)
+		t.Fatalf("new-session compacted rejection = %+v, %v", got, err)
 	}
 }
 
@@ -287,8 +294,9 @@ func TestBuildQueueTerminalizesImpossibleHeadAfterCapacityShrink(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if _, err := st.FailPendingNodeWorkflow(ctx, clusterstate.ExecutionKindBuild,
-		running.ObjectID, running.DemandDigest, "running_build_finished"); err != nil {
+	if _, err := st.CommitClusterBuildState(ctx, workflowBuild(running.ObjectID), nodeexec.EventUpdate{
+		State: string(types.BuildError), Reason: "running_build_finished",
+	}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -298,8 +306,7 @@ func TestBuildQueueTerminalizesImpossibleHeadAfterCapacityShrink(t *testing.T) {
 	}
 	record, err := st.GetNodeWorkflow(ctx, clusterstate.ExecutionKindBuild, impossible.ObjectID)
 	if err != nil || record == nil || record.AdmissionState != nodeexec.AdmissionTerminal ||
-		record.LatestEvent == nil || record.LatestEvent.State != string(clusterstate.BuildError) ||
-		record.LatestEvent.Reason != "exceeds_build_capacity" {
+		record.ObjectState != string(types.BuildError) || record.EventSeq != 0 || record.LatestEvent != nil {
 		t.Fatalf("impossible queue head = %+v, %v", record, err)
 	}
 	build, err := st.GetBuild(ctx, impossible.ObjectID)
@@ -308,7 +315,7 @@ func TestBuildQueueTerminalizesImpossibleHeadAfterCapacityShrink(t *testing.T) {
 	}
 }
 
-func TestBuildTerminalEventReleasesCapacityAndAckCannotDropNewerEvent(t *testing.T) {
+func TestBuildLifecycleIsNodeLocalAndTerminalStateReleasesCapacity(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()
 	capacity := nodeexec.BuildCapacity{Slots: 1, QueueLimit: 4}
@@ -326,14 +333,17 @@ func TestBuildTerminalEventReleasesCapacityAndAckCannotDropNewerEvent(t *testing
 	build := workflowBuild(first.ObjectID)
 	build.TemplateID = "stale-callback-must-not-rewrite-identity"
 	build.Metadata["user"] = "stale"
-	for _, update := range []nodeexec.EventUpdate{
-		{State: string(clusterstate.BuildRegistered)},
-		{State: string(clusterstate.BuildBuilding)},
-		{State: string(clusterstate.BuildReady), ArtifactRef: "e2b-img-artifact"},
-	} {
-		if _, err := st.CommitBuildEvent(ctx, build, update); err != nil {
-			t.Fatal(err)
-		}
+	if _, err := st.CommitClusterBuildState(ctx, build, nodeexec.EventUpdate{State: string(types.BuildRegistered)}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.CommitClusterBuildState(ctx, build, nodeexec.EventUpdate{State: string(types.BuildBuilding)}); err != nil {
+		t.Fatal(err)
+	}
+	build.PersistID = "e2b-img-artifact"
+	if _, err := st.CommitClusterBuildState(ctx, build, nodeexec.EventUpdate{
+		State: string(types.BuildReady), ArtifactRef: build.PersistID,
+	}); err != nil {
+		t.Fatal(err)
 	}
 	stored, err := st.GetBuild(ctx, first.ObjectID)
 	if err != nil || stored.Status != types.BuildReady || stored.PersistID != "e2b-img-artifact" ||
@@ -350,52 +360,16 @@ func TestBuildTerminalEventReleasesCapacityAndAckCannotDropNewerEvent(t *testing
 		promoted[0].Result != clusterstate.DispatchAcceptedQueued || !promoted[0].ResourceClaimed {
 		t.Fatalf("promoted = %+v, %v", promoted, err)
 	}
-	firstBatch, cursor, err := st.PendingExecutionEvents(ctx, "node-1", 7, routesync.EventCursor{}, 1, 1<<20)
-	if err != nil || len(firstBatch) != 1 {
-		t.Fatalf("first replay batch = %+v cursor=%+v err=%v", firstBatch, cursor, err)
-	}
-	secondBatch, _, err := st.PendingExecutionEvents(ctx, "node-1", 7, cursor, 1, 1<<20)
-	if err != nil || len(secondBatch) != 1 || secondBatch[0].ObjectID == firstBatch[0].ObjectID {
-		t.Fatalf("cursor replay batch = %+v after %+v err=%v", secondBatch, firstBatch, err)
-	}
-
 	pending, _, err := st.PendingExecutionEvents(ctx, "node-1", 7, routesync.EventCursor{}, 10, 1<<20)
-	if err != nil {
-		t.Fatal(err)
+	if err != nil || len(pending) != 0 {
+		t.Fatalf("node-local Builds leaked into execution outbox = %+v, %v", pending, err)
 	}
-	events := map[string]routesync.ExecutionEvent{}
-	for _, event := range pending {
-		events[event.ObjectID] = event
+	if err := st.FinalizeNodeWorkflow(ctx, clusterstate.ExecutionKindBuild, first.ObjectID, first.BindingDigest); !errors.Is(err, ErrNodeWorkflowState) {
+		t.Fatalf("Registry finalized accepted Build lifecycle: %v", err)
 	}
-	if events[first.ObjectID].EventSeq != 3 || events[second.ObjectID].EventSeq != 2 ||
-		events[second.ObjectID].State != string(clusterstate.BuildRegistered) {
-		t.Fatalf("pending events = %+v", events)
-	}
-	firstEvent := events[first.ObjectID]
-	if err := st.AckExecutionEvent(ctx, "node-1", 7, routesync.EventAck{
-		ObjectKind: "build", ObjectID: first.ObjectID, RegistryGeneration: firstEvent.RegistryGeneration,
-		BindingDigest: firstEvent.BindingDigest, EventSeq: 2,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	pending, _, err = st.PendingExecutionEvents(ctx, "node-1", 7, routesync.EventCursor{}, 10, 1<<20)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if findEventSeq(pending, first.ObjectID) != 3 {
-		t.Fatalf("ACK(2) discarded event 3: %+v", pending)
-	}
-	if err := st.FinalizeNodeWorkflow(ctx, clusterstate.ExecutionKindBuild, first.ObjectID, first.BindingDigest); err != nil {
-		t.Fatal(err)
-	}
-	if err := st.AckExecutionEvent(ctx, "node-1", 7, routesync.EventAck{
-		ObjectKind: "build", ObjectID: first.ObjectID, RegistryGeneration: firstEvent.RegistryGeneration,
-		BindingDigest: firstEvent.BindingDigest, EventSeq: 3,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if got, err := st.GetNodeWorkflow(ctx, clusterstate.ExecutionKindBuild, first.ObjectID); err != nil || got != nil {
-		t.Fatalf("finalized+acked workflow = %+v, %v", got, err)
+	if got, err := st.GetNodeWorkflow(ctx, clusterstate.ExecutionKindBuild, first.ObjectID); err != nil ||
+		got == nil || got.WorkflowFinalized || got.EventSeq != 0 || got.LatestEvent != nil {
+		t.Fatalf("accepted Build lifecycle marker = %+v, %v", got, err)
 	}
 }
 
@@ -493,7 +467,7 @@ func TestSandboxEventPreservesNewerBusinessObjectFields(t *testing.T) {
 	}
 }
 
-func TestDuplicateBuildRegisteredEventPersistsLaunchIdentity(t *testing.T) {
+func TestDuplicateBuildStatePersistsLaunchIdentity(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()
 	dispatch := workflowDispatch(t, clusterstate.ExecutionKindBuild, "build-launch-fields", placement.BuildDemand{Slots: 1})
@@ -505,8 +479,8 @@ func TestDuplicateBuildRegisteredEventPersistsLaunchIdentity(t *testing.T) {
 	callback.RunID = "runner-1"
 	callback.Names = []string{"build-name"}
 	callback.Aliases = []string{"build-alias"}
-	if _, err := st.CommitBuildEvent(ctx, callback, nodeexec.EventUpdate{
-		State: string(clusterstate.BuildRegistered),
+	if _, err := st.CommitClusterBuildState(ctx, callback, nodeexec.EventUpdate{
+		State: string(types.BuildRegistered),
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -518,15 +492,15 @@ func TestDuplicateBuildRegisteredEventPersistsLaunchIdentity(t *testing.T) {
 		!slices.Equal(stored.Aliases, callback.Aliases) {
 		t.Fatalf("duplicate registered event lost launch identity: %+v", stored)
 	}
-	if _, err := st.CommitBuildEvent(ctx, workflowBuild(dispatch.ObjectID), nodeexec.EventUpdate{
-		State: string(clusterstate.BuildRegistered),
+	if _, err := st.CommitClusterBuildState(ctx, workflowBuild(dispatch.ObjectID), nodeexec.EventUpdate{
+		State: string(types.BuildRegistered),
 	}); err != nil {
 		t.Fatalf("empty duplicate erased launch identity: %v", err)
 	}
 	conflict := workflowBuild(dispatch.ObjectID)
 	conflict.RunID = "runner-2"
-	if _, err := st.CommitBuildEvent(ctx, conflict, nodeexec.EventUpdate{
-		State: string(clusterstate.BuildRegistered),
+	if _, err := st.CommitClusterBuildState(ctx, conflict, nodeexec.EventUpdate{
+		State: string(types.BuildRegistered),
 	}); !errors.Is(err, ErrNodeWorkflowConflict) {
 		t.Fatalf("conflicting runner identity error = %v", err)
 	}
@@ -543,25 +517,27 @@ func TestBuildReadyMayOnlyAppendItsArtifactAlias(t *testing.T) {
 	registered := workflowBuild(dispatch.ObjectID)
 	registered.Names = []string{"build-name"}
 	registered.Aliases = []string{"build-alias"}
-	if _, err := st.CommitBuildEvent(ctx, registered, nodeexec.EventUpdate{State: string(clusterstate.BuildRegistered)}); err != nil {
+	if _, err := st.CommitClusterBuildState(ctx, registered, nodeexec.EventUpdate{State: string(types.BuildRegistered)}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.CommitBuildEvent(ctx, workflowBuild(dispatch.ObjectID), nodeexec.EventUpdate{State: string(clusterstate.BuildBuilding)}); err != nil {
+	if _, err := st.CommitClusterBuildState(ctx, workflowBuild(dispatch.ObjectID), nodeexec.EventUpdate{State: string(types.BuildBuilding)}); err != nil {
 		t.Fatal(err)
 	}
 	forged := workflowBuild(dispatch.ObjectID)
 	forged.Names = []string{"build-name", "unrelated"}
 	forged.Aliases = []string{"build-alias", "artifact-1"}
-	if _, err := st.CommitBuildEvent(ctx, forged, nodeexec.EventUpdate{
-		State: string(clusterstate.BuildReady), ArtifactRef: "artifact-1",
+	forged.PersistID = "artifact-1"
+	if _, err := st.CommitClusterBuildState(ctx, forged, nodeexec.EventUpdate{
+		State: string(types.BuildReady), ArtifactRef: "artifact-1",
 	}); !errors.Is(err, ErrNodeWorkflowConflict) {
 		t.Fatalf("unrelated READY alias error = %v", err)
 	}
 	ready := workflowBuild(dispatch.ObjectID)
 	ready.Names = []string{"build-name", "artifact-1"}
 	ready.Aliases = []string{"build-alias", "artifact-1"}
-	if _, err := st.CommitBuildEvent(ctx, ready, nodeexec.EventUpdate{
-		State: string(clusterstate.BuildReady), ArtifactRef: "artifact-1",
+	ready.PersistID = "artifact-1"
+	if _, err := st.CommitClusterBuildState(ctx, ready, nodeexec.EventUpdate{
+		State: string(types.BuildReady), ArtifactRef: "artifact-1",
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -596,8 +572,8 @@ func TestBuildAdmissionAndPromotionExcludePriorNodeEpoch(t *testing.T) {
 	if _, err := st.ClaimBuildWorkflow(ctx, currentRunning.ObjectID, currentRunning.DemandDigest); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.CommitBuildEvent(ctx, workflowBuild(currentRunning.ObjectID), nodeexec.EventUpdate{
-		State: string(clusterstate.BuildError), Reason: "done",
+	if _, err := st.CommitClusterBuildState(ctx, workflowBuild(currentRunning.ObjectID), nodeexec.EventUpdate{
+		State: string(types.BuildError), Reason: "done",
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -633,7 +609,7 @@ func TestBuildQueuePromotionIsStrictFIFO(t *testing.T) {
 	}
 }
 
-func TestNodeWorkflowQueueAndOutboxSurviveStoreRestart(t *testing.T) {
+func TestNodeWorkflowBuildQueueSurvivesStoreRestartWithoutOutbox(t *testing.T) {
 	ctx := context.Background()
 	box, err := secretbox.NewFromColonHex(strings.Repeat("0", 64))
 	if err != nil {
@@ -651,7 +627,7 @@ func TestNodeWorkflowQueueAndOutboxSurviveStoreRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	before, err := st.PrepareBuildWorkflow(ctx, queued, workflowBuild(queued.ObjectID), capacity, "")
-	if err != nil || before.AdmissionState != nodeexec.AdmissionQueued || before.EventSeq != 1 {
+	if err != nil || before.AdmissionState != nodeexec.AdmissionQueued || before.EventSeq != 0 || before.LatestEvent != nil {
 		t.Fatalf("before restart = %+v, %v", before, err)
 	}
 	if err := st.Close(); err != nil {
@@ -664,20 +640,11 @@ func TestNodeWorkflowQueueAndOutboxSurviveStoreRestart(t *testing.T) {
 	t.Cleanup(func() { _ = restarted.Close() })
 	after, err := restarted.GetNodeWorkflow(ctx, clusterstate.ExecutionKindBuild, queued.ObjectID)
 	if err != nil || after.AdmissionState != nodeexec.AdmissionQueued || after.Result != clusterstate.DispatchAcceptedQueued ||
-		after.EventSeq != 1 || after.LatestEvent == nil {
+		after.EventSeq != 0 || after.LatestEvent != nil || after.ObjectState != string(types.BuildRegistered) {
 		t.Fatalf("after restart = %+v, %v", after, err)
 	}
 	pending, _, err := restarted.PendingExecutionEvents(ctx, "node-1", 7, routesync.EventCursor{}, 10, 1<<20)
-	if err != nil || findEventSeq(pending, queued.ObjectID) != 1 {
+	if err != nil || len(pending) != 0 {
 		t.Fatalf("restarted outbox = %+v, %v", pending, err)
 	}
-}
-
-func findEventSeq(events []routesync.ExecutionEvent, objectID string) uint64 {
-	for _, event := range events {
-		if event.ObjectID == objectID {
-			return event.EventSeq
-		}
-	}
-	return 0
 }

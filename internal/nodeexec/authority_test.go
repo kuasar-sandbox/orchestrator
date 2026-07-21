@@ -313,7 +313,7 @@ func TestAuthorityFencesEverySessionOwnedWorkerEntry(t *testing.T) {
 	if err := authority.FailSandbox(context.Background(), nil, "fenced"); !errors.Is(err, nodeexec.ErrSessionFenced) {
 		t.Fatalf("FailSandbox error = %v", err)
 	}
-	if err := authority.FinalizeWorkflow(context.Background(), clusterstate.ExecutionKindSandbox, "", "", ""); !errors.Is(err, nodeexec.ErrSessionFenced) {
+	if err := authority.FinalizeWorkflow(context.Background(), clusterstate.ExecutionKindSandbox, "", ""); !errors.Is(err, nodeexec.ErrSessionFenced) {
 		t.Fatalf("FinalizeWorkflow error = %v", err)
 	}
 }
@@ -420,14 +420,17 @@ func TestBuildSafetyFenceTerminatesExistingQueue(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	found := false
 	for _, event := range pending {
 		if event.ObjectID == second.ObjectID {
-			found = event.State == string(clusterstate.BuildError) && event.Reason == safetyReason
+			t.Fatalf("node-local Build lifecycle leaked into cluster outbox: %+v", event)
 		}
 	}
-	if !found {
-		t.Fatalf("queued Build safety event not found: %+v", pending)
+	build, err := st.GetBuild(context.Background(), second.ObjectID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if build == nil || build.Status != types.BuildError || build.Reason != safetyReason {
+		t.Fatalf("queued Build local terminal state = %+v", build)
 	}
 }
 
@@ -662,7 +665,7 @@ func TestAuthorityReconcilesSandboxPromotionClaimAndReleaseCrashWindows(t *testi
 		t.Fatalf("terminal before release = %+v, %v", record, err)
 	}
 	if err := authority.FinalizeWorkflow(context.Background(), clusterstate.ExecutionKindSandbox,
-		record.ObjectID, record.DemandDigest, record.BindingDigest); !errors.Is(err, store.ErrNodeWorkflowState) {
+		record.ObjectID, record.BindingDigest); !errors.Is(err, store.ErrNodeWorkflowState) {
 		t.Fatalf("finalize before resource release error = %v", err)
 	}
 	if err := authority.ReconcileSandboxAdmissions(context.Background(), 10); err != nil {
@@ -676,8 +679,8 @@ func TestAuthorityReconcilesSandboxPromotionClaimAndReleaseCrashWindows(t *testi
 		t.Fatalf("controller release = %+v", sandbox.released)
 	}
 	if err := authority.FinalizeWorkflow(context.Background(), clusterstate.ExecutionKindSandbox,
-		record.ObjectID, record.DemandDigest, record.BindingDigest); err != nil {
-		t.Fatal(err)
+		record.ObjectID, record.BindingDigest); !errors.Is(err, nodeexec.ErrFinalOutboxPending) {
+		t.Fatalf("finalize before outbox ACK error = %v", err)
 	}
 	if len(sandbox.finalized) != 1 || !strings.HasPrefix(sandbox.finalized[0], "sandbox-reconcile:") {
 		t.Fatalf("controller finalization = %+v", sandbox.finalized)
@@ -685,6 +688,17 @@ func TestAuthorityReconcilesSandboxPromotionClaimAndReleaseCrashWindows(t *testi
 	record, err = st.GetNodeWorkflow(context.Background(), clusterstate.ExecutionKindSandbox, "sandbox-reconcile")
 	if err != nil || record == nil || !record.WorkflowFinalized {
 		t.Fatalf("journal finalization = %+v, %v", record, err)
+	}
+	if err := st.AckExecutionEvent(context.Background(), "node-1", 7, routesync.EventAck{
+		ObjectKind: "sandbox", ObjectID: record.ObjectID,
+		RegistryGeneration: record.LatestEvent.RegistryGeneration,
+		BindingDigest:      record.BindingDigest, EventSeq: record.EventSeq,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := authority.FinalizeWorkflow(context.Background(), clusterstate.ExecutionKindSandbox,
+		record.ObjectID, record.BindingDigest); err != nil {
+		t.Fatalf("finalize after durable outbox ACK = %v", err)
 	}
 }
 
