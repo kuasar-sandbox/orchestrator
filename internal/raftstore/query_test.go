@@ -85,6 +85,12 @@ func TestBuildLookupReturnsOnlyBoundPositiveProjection(t *testing.T) {
 	if err := response.ValidateFor(request); err != nil {
 		t.Fatal(err)
 	}
+	leases, err := lookupLeaseBindings(state, LeaseBindingLookup{Identity: identity, Limit: 10})
+	if err != nil || len(leases.Bindings) != 1 || leases.Bindings[0].Group != "/g" ||
+		leases.Bindings[0].NodeID != registered.Projection.NodeID ||
+		leases.Bindings[0].AuthKeyFingerprint == "" || leases.Bindings[0].ManifestKeyFingerprint == "" {
+		t.Fatalf("registered Build lease Binding = %+v, %v", leases, err)
+	}
 	request.MinBuildRevision = 4
 	if got := lookupBuildResult(t, state, request).Outcome; got != routeapi.ReadReplicaBehind {
 		t.Fatalf("Build minimum-revision outcome = %s", got)
@@ -161,37 +167,75 @@ func TestRouteBucketSnapshotAndChangefeedUseShardRevisions(t *testing.T) {
 	applyDataOK(t, &state, 4, DataCommand{
 		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{Absent: true}, Route: &second,
 	})
+	secondReady := readyRecord(second, 1)
+	applyDataOK(t, &state, 5, DataCommand{
+		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{LogIndex: 4}, Route: &secondReady,
+	})
+	secondPaused := pausedRecord(secondReady, 2)
+	applyDataOK(t, &state, 6, DataCommand{
+		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{LogIndex: 5}, Route: &secondPaused,
+	})
 	otherGroup := "/other"
 	otherKey := routeKeyForShard(t, registryLayout, otherGroup, identity.ShardID, "other")
 	other := routeStarting(t, registryLayout, otherGroup, otherKey, "sandbox-3", 1, true)
-	applyDataOK(t, &state, 5, DataCommand{
+	applyDataOK(t, &state, 7, DataCommand{
 		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{Absent: true}, Route: &other,
 	})
 
-	list := lookupRouteBucket(state, RouteBucketLookup{Identity: identity, Group: group, Bucket: bucket})
-	if !list.Available || list.SnapshotRevision != 5 || len(list.Routes) != 2 ||
-		list.Routes[0].RouteKey != firstKey || list.Routes[1].RouteKey != secondKey {
+	list := lookupRouteBucket(state, RouteBucketLookup{
+		Identity: identity, Group: group, Bucket: bucket, Limit: 10,
+	})
+	if !list.Available || list.SnapshotRevision != 7 || len(list.Routes) != 2 ||
+		list.Routes[0].RouteKey != firstKey || list.Routes[1].RouteKey != secondKey ||
+		list.Routes[1].State != clusterstate.WorkflowRoutePaused {
 		t.Fatalf("Route bucket snapshot = %+v", list)
 	}
-	list.Routes[0].Ready.AccessToken = "mutated"
-	if state.Routes[routeMapKey(group, firstKey)].Ready.AccessToken == "mutated" {
-		t.Fatal("Route bucket snapshot aliases consensus state")
+	page := lookupRouteBucket(state, RouteBucketLookup{
+		Identity: identity, Group: group, Bucket: bucket, Limit: 1,
+	})
+	if len(page.Routes) != 1 || page.NextRouteKey != firstKey {
+		t.Fatalf("first Route bucket page = %+v", page)
+	}
+	page = lookupRouteBucket(state, RouteBucketLookup{
+		Identity: identity, Group: group, Bucket: bucket, AfterRouteKey: page.NextRouteKey, Limit: 1,
+	})
+	if len(page.Routes) != 1 || page.Routes[0].RouteKey != secondKey || page.NextRouteKey != "" {
+		t.Fatalf("second Route bucket page = %+v", page)
+	}
+	leasePage, err := lookupLeaseBindings(state, LeaseBindingLookup{Identity: identity, Limit: 2})
+	if err != nil || len(leasePage.Bindings) != 2 || leasePage.NextKey == "" {
+		t.Fatalf("first lease Binding page = %+v, %v", leasePage, err)
+	}
+	leasePage, err = lookupLeaseBindings(state, LeaseBindingLookup{
+		Identity: identity, AfterKey: leasePage.NextKey, Limit: 2,
+	})
+	if err != nil || len(leasePage.Bindings) != 1 || leasePage.NextKey != "" {
+		t.Fatalf("second lease Binding page = %+v, %v", leasePage, err)
 	}
 
-	page := lookupRouteChangefeed(state, RouteChangefeedLookup{
+	changePage := lookupRouteChangefeed(state, RouteChangefeedLookup{
 		Identity: identity, Group: group, Bucket: bucket, AfterRevision: 1, Limit: 2,
 	})
-	if !page.Available || page.Reset || len(page.Changes) != 2 || page.Changes[0].Revision != 2 ||
-		page.Changes[0].RouteKey != firstKey || page.Changes[0].State != clusterstate.WorkflowRouteStarting ||
-		page.Changes[1].Revision != 3 || page.Changes[1].State != clusterstate.WorkflowRouteReady ||
-		page.CursorRevision != 3 || page.HeadRevision != 5 {
-		t.Fatalf("first Route changefeed page = %+v", page)
+	if !changePage.Available || changePage.Reset || len(changePage.Changes) != 2 || changePage.Changes[0].Revision != 2 ||
+		changePage.Changes[0].RouteKey != firstKey || changePage.Changes[0].State != clusterstate.WorkflowRouteStarting ||
+		changePage.Changes[1].Revision != 3 || changePage.Changes[1].State != clusterstate.WorkflowRouteReady ||
+		changePage.CursorRevision != 3 || changePage.HeadRevision != 7 {
+		t.Fatalf("first Route changefeed page = %+v", changePage)
 	}
-	page = lookupRouteChangefeed(state, RouteChangefeedLookup{
-		Identity: identity, Group: group, Bucket: bucket, AfterRevision: page.CursorRevision, Limit: 2,
+	changePage = lookupRouteChangefeed(state, RouteChangefeedLookup{
+		Identity: identity, Group: group, Bucket: bucket, AfterRevision: changePage.CursorRevision, Limit: 2,
 	})
-	if !page.Available || len(page.Changes) != 1 || page.Changes[0].Revision != 4 || page.CursorRevision != 5 {
-		t.Fatalf("second Route changefeed page = %+v", page)
+	if !changePage.Available || len(changePage.Changes) != 2 || changePage.Changes[0].Revision != 4 ||
+		changePage.Changes[1].Revision != 5 || changePage.Changes[1].State != clusterstate.WorkflowRouteReady ||
+		changePage.CursorRevision != 5 {
+		t.Fatalf("second Route changefeed page = %+v", changePage)
+	}
+	changePage = lookupRouteChangefeed(state, RouteChangefeedLookup{
+		Identity: identity, Group: group, Bucket: bucket, AfterRevision: changePage.CursorRevision, Limit: 2,
+	})
+	if !changePage.Available || len(changePage.Changes) != 1 || changePage.Changes[0].Revision != 6 ||
+		changePage.Changes[0].State != clusterstate.WorkflowRoutePaused || changePage.CursorRevision != 7 {
+		t.Fatalf("third Route changefeed page = %+v", changePage)
 	}
 
 	advanceDataApplied(&state, RouteChangefeedRetentionRevisions+10)

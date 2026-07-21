@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 )
 
 // BeginRecovery opens the sole recovery epoch for a successor Registry History Generation and
@@ -51,7 +52,9 @@ func (r *Runtime) BeginRecovery(ctx context.Context) (SystemState, error) {
 		Phase:                      RecoveryPreparing, Nodes: nodes,
 	}
 	result, proposeErr := r.proposeSystem(ctx, SystemCommand{Type: SystemBeginRecovery, Recovery: recovery})
-	current, readErr := r.ReadSystemStrong(ctx)
+	resolveContext, cancelResolve := ambiguityResolutionContext(ctx)
+	defer cancelResolve()
+	current, readErr := r.ReadSystemStrong(resolveContext)
 	if readErr == nil && current.Recovery != nil && sameRecoveryIdentity(*current.Recovery, *recovery) {
 		return current, nil
 	}
@@ -65,6 +68,82 @@ func (r *Runtime) BeginRecovery(ctx context.Context) (SystemState, error) {
 		return SystemState{}, readErr
 	}
 	return SystemState{}, errors.New("raftstore: opened recovery epoch was not visible")
+}
+
+// ConfirmRecoveryPermitDrain waits a full Serve Permit lifetime after a
+// quorum read of the closed RecoveryEpoch. A restart conservatively restarts
+// the monotonic wait.
+func (r *Runtime) ConfirmRecoveryPermitDrain(ctx context.Context) (SystemState, error) {
+	if !r.HasLocalSystemReplica() {
+		if r.systemClient == nil {
+			return SystemState{}, errors.New("raftstore: remote System Group client is unavailable")
+		}
+		timeout := time.Duration(MaximumServePermitMillis+r.config.Tuning.OperationTimeoutMillis) * time.Millisecond
+		operation, cancel := context.WithTimeout(ctx, timeout)
+		defer cancel()
+		state, err := r.systemClient.ConfirmRecoveryPermitDrain(operation)
+		if err == nil {
+			err = r.acceptRemoteSystemState(state)
+		}
+		return state, err
+	}
+	state, err := r.ReadSystemStrong(ctx)
+	if err != nil {
+		return SystemState{}, err
+	}
+	if err := r.authorizeRegistryLayoutState(state); err != nil {
+		return SystemState{}, err
+	}
+	if state.Recovery == nil || state.Recovery.Phase != RecoveryPreparing {
+		return SystemState{}, errors.New("raftstore: recovery permit drain requires PREPARING")
+	}
+	if state.Recovery.PermitDrainComplete {
+		return state, nil
+	}
+	wait := time.Duration(state.ServePermitMaxMillis) * time.Millisecond
+	started := time.Now()
+	if err := waitMonotonic(ctx, started, wait); err != nil {
+		return SystemState{}, err
+	}
+	current, err := r.ReadSystemStrong(ctx)
+	if err != nil {
+		return SystemState{}, err
+	}
+	if err := r.authorizeRegistryLayoutState(current); err != nil {
+		return SystemState{}, err
+	}
+	if current.Recovery == nil || current.Recovery.Phase != RecoveryPreparing ||
+		!sameRecoveryIdentity(*current.Recovery, *state.Recovery) {
+		return SystemState{}, errors.New("raftstore: recovery identity changed during permit drain")
+	}
+	if current.Recovery.PermitDrainComplete {
+		return current, nil
+	}
+	result, proposeErr := r.proposeSystem(ctx, SystemCommand{
+		Type: SystemConfirmRecoveryDrain,
+		RecoveryDrain: &RecoveryDrainConfirmation{
+			RecoveryEpoch: current.Recovery.Epoch, TargetRegistryGeneration: current.Recovery.TargetRegistryGeneration,
+			TargetRegistryLayoutDigest: current.Recovery.TargetRegistryLayoutDigest,
+			WaitedMillis:               uint64(time.Since(started) / time.Millisecond),
+		},
+	})
+	resolveContext, cancelResolve := ambiguityResolutionContext(ctx)
+	defer cancelResolve()
+	confirmed, readErr := r.ReadSystemStrong(resolveContext)
+	if readErr == nil && confirmed.Recovery != nil &&
+		sameRecoveryIdentity(*confirmed.Recovery, *current.Recovery) && confirmed.Recovery.PermitDrainComplete {
+		return confirmed, nil
+	}
+	if proposeErr != nil {
+		return SystemState{}, proposeErr
+	}
+	if result.Conflict || !result.Applied {
+		return SystemState{}, errors.New(result.Reason)
+	}
+	if readErr != nil {
+		return SystemState{}, readErr
+	}
+	return SystemState{}, errors.New("raftstore: recovery permit drain was not committed")
 }
 
 func (r *Runtime) AdvanceRecovery(ctx context.Context, from, to RecoveryPhase) (SystemState, error) {
@@ -99,7 +178,9 @@ func (r *Runtime) AdvanceRecovery(ctx context.Context, from, to RecoveryPhase) (
 	result, proposeErr := r.proposeSystem(ctx, SystemCommand{
 		Type: SystemAdvanceRecovery, RecoveryAdvance: &RecoveryAdvance{From: from, To: to},
 	})
-	current, readErr := r.ReadSystemStrong(ctx)
+	resolveContext, cancelResolve := ambiguityResolutionContext(ctx)
+	defer cancelResolve()
+	current, readErr := r.ReadSystemStrong(resolveContext)
 	if readErr == nil && (to == RecoveryClosed && current.Recovery == nil ||
 		current.Recovery != nil && current.Recovery.Phase == to) {
 		return current, nil
@@ -143,7 +224,9 @@ func (r *Runtime) SetServingGates(ctx context.Context, gates GateUpdate) (System
 		return state, nil
 	}
 	result, proposeErr := r.proposeSystem(ctx, SystemCommand{Type: SystemSetGates, Gates: &gates})
-	current, readErr := r.ReadSystemStrong(ctx)
+	resolveContext, cancelResolve := ambiguityResolutionContext(ctx)
+	defer cancelResolve()
+	current, readErr := r.ReadSystemStrong(resolveContext)
 	if readErr == nil && current.ServeGate == gates.Serve && current.WriteGate == gates.Write &&
 		current.CutoverGate == gates.Cutover {
 		return current, nil
@@ -185,7 +268,8 @@ func (r *Runtime) ReadRecoveryData(ctx context.Context, query RecoveryLookup) (R
 	if err != nil {
 		return RecoveryLookupResult{}, err
 	}
-	if state.Recovery == nil || query.Identity.PermitIdentity != recoveryTarget(*state.Recovery) {
+	if state.Recovery == nil || !state.Recovery.PermitDrainComplete ||
+		query.Identity.PermitIdentity != recoveryTarget(*state.Recovery) {
 		return RecoveryLookupResult{}, errors.New("raftstore: recovery read does not match the open System epoch")
 	}
 	if err := r.authorizeLocalDataReplica(query.Identity); err != nil {
@@ -207,6 +291,10 @@ func validateRecoveryDataCommand(state SystemState, command DataCommand) error {
 		return errors.New("raftstore: data recovery requires an open System recovery epoch")
 	}
 	recovery := *state.Recovery
+	if !recovery.PermitDrainComplete || recovery.PermitDrainIndex == 0 ||
+		recovery.PermitDrainIndex > state.LastApplied {
+		return errors.New("raftstore: recovery data operation requires committed Permit drain")
+	}
 	target := recoveryTarget(recovery)
 	want := ShardRequestIdentity{PermitIdentity: target, ShardID: command.Identity.ShardID}
 	final := want

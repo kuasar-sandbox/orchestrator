@@ -24,7 +24,7 @@ func (s *holderDispatchRPCStub) AdmitAndDispatchAt(_ context.Context, holderID s
 }
 
 func TestDirectoryDispatcherRoutesCurrentTuple(t *testing.T) {
-	directory := NewDirectory()
+	directory := newTestDirectory()
 	applyDirectoryUp(t, directory, "node-1", "registry-b", 7, 12)
 	rpc := &holderDispatchRPCStub{reply: DispatchReply{Outcome: cluster.DispatchAcceptedAdmitted}}
 	dispatcher, err := NewDirectoryDispatcher(directory, rpc)
@@ -42,7 +42,7 @@ func TestDirectoryDispatcherRoutesCurrentTuple(t *testing.T) {
 }
 
 func TestDirectoryDispatcherNeverTreatsDirectoryAsNoSideEffectProof(t *testing.T) {
-	directory := NewDirectory()
+	directory := newTestDirectory()
 	applyDirectoryUp(t, directory, "node-1", "registry-b", 8, 1)
 	rpc := &holderDispatchRPCStub{}
 	dispatcher, err := NewDirectoryDispatcher(directory, rpc)
@@ -59,7 +59,8 @@ func TestDirectoryDispatcherNeverTreatsDirectoryAsNoSideEffectProof(t *testing.T
 	}
 	applyDirectoryUp(t, directory, "node-2", "registry-b", 8, 1)
 	directory.Apply(DirectoryDelta{Entry: DirectoryEntry{
-		NodeID: "node-2", Tuple: Tuple{NodeEpoch: 8, SessionSeq: 1}, HolderMemberID: "registry-b",
+		NodeID: "node-2", EnrollmentID: "enrollment-node-2",
+		Tuple: Tuple{NodeEpoch: 8, SessionSeq: 1}, HolderMemberID: "registry-b",
 	}, Up: false})
 	reply, err = dispatcher.AdmitAndDispatch(context.Background(), DispatchCommand{NodeID: "node-2", NodeEpoch: 7})
 	if err != nil || reply.Outcome != cluster.DispatchDefinitiveReject || rpc.calls != 0 {
@@ -68,7 +69,7 @@ func TestDirectoryDispatcherNeverTreatsDirectoryAsNoSideEffectProof(t *testing.T
 }
 
 func TestDirectoryDispatcherPreservesAmbiguousTransportFailure(t *testing.T) {
-	directory := NewDirectory()
+	directory := newTestDirectory()
 	applyDirectoryUp(t, directory, "node-1", "registry-b", 7, 12)
 	rpc := &holderDispatchRPCStub{err: errors.New("ACK lost")}
 	dispatcher, err := NewDirectoryDispatcher(directory, rpc)

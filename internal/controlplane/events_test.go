@@ -250,7 +250,7 @@ func newEventFixture(
 		normalizedDemand, err = placement.NormalizeBuildDemand(placement.BuildDemand{Slots: 1})
 		if err == nil {
 			var request clusterstate.NodeRequestEnvelopeV1
-			request, err = clusterstate.NewNodeRequestEnvelopeV1(http.MethodPost, "/v3/templates", "", nil, []byte(`{}`))
+			request, err = clusterstate.NewNodeRequestEnvelopeV1(http.MethodPost, "/v3/templates", "", nil, []byte(`{"cpuCount":1,"memoryMB":512}`))
 			if err != nil {
 				t.Fatal(err)
 			}

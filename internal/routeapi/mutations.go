@@ -255,30 +255,35 @@ func (r BuildMutationResponse) ValidateFor(request RegisterBuildRequest) error {
 
 type ListRoutesRequest struct {
 	RequestIdentity
-	Group  string `json:"group"`
-	Bucket uint32 `json:"bucket"`
-	Strong bool   `json:"strong,omitempty"`
+	Group         string `json:"group"`
+	Bucket        uint32 `json:"bucket"`
+	AfterRouteKey string `json:"after_route_key,omitempty"`
+	Limit         uint32 `json:"limit"`
+	Strong        bool   `json:"strong,omitempty"`
 }
 
 func (r ListRoutesRequest) Validate() error {
 	if err := r.RequestIdentity.Validate(); err != nil {
 		return err
 	}
-	if r.Group == "" {
-		return errors.New("routeapi: Route list requires group")
+	if r.Group == "" || r.Limit == 0 || r.Limit > 4096 {
+		return errors.New("routeapi: Route list requires group and a limit between 1 and 4096")
 	}
 	return nil
 }
 
 type ListedRoute struct {
-	RouteKey string                  `json:"route_key"`
-	Route    clusterstate.ReadyRoute `json:"route"`
+	RouteKey    string                          `json:"route_key"`
+	State       clusterstate.RouteWorkflowState `json:"state"`
+	NodeID      string                          `json:"node_id"`
+	TemplateRef string                          `json:"template_ref"`
 }
 
 type ListRoutesResponse struct {
 	Routes           []ListedRoute `json:"routes"`
 	Bucket           uint32        `json:"bucket"`
 	SnapshotRevision uint64        `json:"snapshot_revision,omitempty"`
+	NextRouteKey     string        `json:"next_route_key,omitempty"`
 	Reason           string        `json:"reason,omitempty"`
 }
 
@@ -287,7 +292,7 @@ func (r ListRoutesResponse) ValidateFor(request ListRoutesRequest) error {
 		return errors.New("routeapi: Route list response bucket mismatch")
 	}
 	if r.Reason != "" {
-		if len(r.Routes) != 0 || r.SnapshotRevision != 0 {
+		if len(r.Routes) != 0 || r.SnapshotRevision != 0 || r.NextRouteKey != "" {
 			return errors.New("routeapi: unavailable Route list carries forwarding projections")
 		}
 		return nil
@@ -295,16 +300,17 @@ func (r ListRoutesResponse) ValidateFor(request ListRoutesRequest) error {
 	if r.SnapshotRevision == 0 {
 		return errors.New("routeapi: available Route list requires a bucket snapshot revision")
 	}
+	previous := request.AfterRouteKey
 	for index := range r.Routes {
-		if r.Routes[index].RouteKey == "" {
-			return errors.New("routeapi: Route list entry has no route key")
+		entry := r.Routes[index]
+		if entry.RouteKey <= previous || entry.NodeID == "" || entry.TemplateRef == "" ||
+			(entry.State != clusterstate.WorkflowRouteReady && entry.State != clusterstate.WorkflowRoutePaused) {
+			return errors.New("routeapi: invalid or unsorted Route list projection")
 		}
-		if err := r.Routes[index].Route.Validate(); err != nil {
-			return fmt.Errorf("routeapi: invalid Route list projection: %w", err)
-		}
-		if r.Routes[index].Route.RegistryGeneration != request.RegistryGeneration {
-			return errors.New("routeapi: Route list projection belongs to another Registry History Generation")
-		}
+		previous = entry.RouteKey
+	}
+	if r.NextRouteKey != "" && (len(r.Routes) == 0 || r.NextRouteKey != r.Routes[len(r.Routes)-1].RouteKey) {
+		return errors.New("routeapi: Route list continuation does not match the final entry")
 	}
 	return nil
 }

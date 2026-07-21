@@ -11,6 +11,7 @@ import (
 	"reflect"
 	"slices"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -69,8 +70,13 @@ type RegistryService struct {
 	commands   NodeCommandSender
 	config     RegistryServiceConfig
 
-	scanMu    sync.Mutex
-	nextShard uint32
+	scanMu           sync.Mutex
+	nextShard        uint32
+	leaseMu          sync.Mutex
+	leaseCursors     map[uint32]string
+	leaseExpiries    map[string]int64
+	leaseRenewing    map[string]struct{}
+	lastLeasePruneAt int64
 
 	compactionCtx    context.Context
 	stopCompaction   context.CancelFunc
@@ -130,6 +136,9 @@ func NewRegistryService(
 		config.BuildLaunchPerSecond, config.BuildLaunchBurst =
 			defaults.BuildLaunchPerSecond, defaults.BuildLaunchBurst
 	}
+	if config.SandboxLaunchBurst < len(registryLayout.Members) || config.BuildLaunchBurst < len(registryLayout.Members) {
+		return nil, errors.New("controlplane: aggregate launch bursts must be at least the Registry member count")
+	}
 	if config.NewObjectID == nil {
 		config.NewObjectID = defaults.NewObjectID
 	}
@@ -144,6 +153,8 @@ func NewRegistryService(
 		store: store, planner: planner, prober: prober, dispatcher: dispatcher,
 		commands: commands, config: config, compactionCtx: compactionCtx, stopCompaction: stopCompaction,
 		compactionSlots: make(chan struct{}, config.CompactionWorkers), activeCompaction: make(map[string]struct{}),
+		leaseCursors: make(map[uint32]string), leaseExpiries: make(map[string]int64),
+		leaseRenewing: make(map[string]struct{}),
 	}, nil
 }
 
@@ -314,7 +325,7 @@ func (s *RegistryService) createRoute(
 	if err != nil {
 		return nil, err
 	}
-	round, err := s.planSandbox(ctx, request.Group, request.RouteKey, sandboxID, request.Input)
+	round, err := s.planSandbox(ctx, request.Group, request.RouteKey, sandboxID, request.Input, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -338,7 +349,11 @@ func (s *RegistryService) restartTerminalRoute(
 	if err != nil {
 		return clusterstate.RouteWorkflowRecord{}, err
 	}
-	round, err := s.planSandbox(ctx, request.Group, request.RouteKey, sandboxID, request.Input)
+	var excluded []string
+	if record.Tombstone != nil && record.Tombstone.PlacementFailure != nil {
+		excluded = placementCandidateNodeIDs(record.Tombstone.PlacementFailure.CandidatePool)
+	}
+	round, err := s.planSandbox(ctx, request.Group, request.RouteKey, sandboxID, request.Input, excluded)
 	if err != nil {
 		return clusterstate.RouteWorkflowRecord{}, err
 	}
@@ -468,7 +483,9 @@ func (s *RegistryService) ListRoutes(ctx context.Context, request routeapi.ListR
 		return routeapi.ListRoutesResponse{Bucket: request.Bucket, Reason: "signed Registry History Generation or Route bucket identity mismatch"}, nil
 	}
 	routes := make([]routeapi.ListedRoute, 0)
-	result, err := s.store.ReadRouteBucket(ctx, request.Group, request.Bucket, request.Strong)
+	result, err := s.store.ReadRouteBucket(
+		ctx, request.Group, request.Bucket, request.AfterRouteKey, request.Limit, request.Strong,
+	)
 	if err != nil {
 		return routeapi.ListRoutesResponse{}, err
 	}
@@ -476,13 +493,14 @@ func (s *RegistryService) ListRoutes(ctx context.Context, request routeapi.ListR
 		return routeapi.ListRoutesResponse{Bucket: request.Bucket, Reason: result.Reason}, nil
 	}
 	for _, record := range result.Routes {
-		if record.State == clusterstate.WorkflowRouteReady && record.Ready != nil {
-			routes = append(routes, routeapi.ListedRoute{RouteKey: record.RouteKey, Route: *record.Ready})
-		}
+		routes = append(routes, routeapi.ListedRoute{
+			RouteKey: record.RouteKey, State: record.State, NodeID: record.NodeID, TemplateRef: record.TemplateRef,
+		})
 	}
 	sort.Slice(routes, func(i, j int) bool { return routes[i].RouteKey < routes[j].RouteKey })
 	return routeapi.ListRoutesResponse{
 		Routes: routes, Bucket: request.Bucket, SnapshotRevision: result.SnapshotRevision,
+		NextRouteKey: result.NextRouteKey,
 	}, nil
 }
 
@@ -609,6 +627,7 @@ func (s *RegistryService) planSandbox(
 	routeKey string,
 	sandboxID string,
 	input routeapi.SandboxInput,
+	excludedNodeIDs []string,
 ) (coordinator.SandboxRound, error) {
 	nodes, err := s.store.Catalog(ctx)
 	if err != nil {
@@ -616,7 +635,7 @@ func (s *RegistryService) planSandbox(
 	}
 	response, err := s.planner.Plan(ctx, placer.PlanRequest{
 		Kind: placer.PlanSandbox, Group: group, RouteKey: routeKey, Nodes: nodes,
-		TargetRuntimeDigest: input.TargetRuntimeDigest,
+		ExcludedNodeIDs: excludedNodeIDs, TargetRuntimeDigest: input.TargetRuntimeDigest,
 		Sandbox: &placer.SandboxPlanInput{
 			SandboxID: sandboxID, TemplateRef: input.TemplateRef, Config: cloneStringMap(input.Config),
 			TimeoutSeconds: input.TimeoutSeconds, Demand: input.Demand,
@@ -696,6 +715,7 @@ func (r sandboxRoundSource) NextSandboxRound(
 	routeKey string,
 	_ uint64,
 	previous clusterstate.DispatchIntent,
+	excludedNodeIDs []string,
 ) (coordinator.SandboxRound, error) {
 	sandboxID, err := r.service.config.NewObjectID()
 	if err != nil {
@@ -712,7 +732,17 @@ func (r sandboxRoundSource) NextSandboxRound(
 	return r.service.planSandbox(ctx, group, routeKey, sandboxID, routeapi.SandboxInput{
 		TemplateRef: spec.TemplateRef, Config: spec.RequestedConfig,
 		TimeoutSeconds: spec.TimeoutSeconds, Demand: *demand.Sandbox, Request: spec.Request,
-	})
+	}, excludedNodeIDs)
+}
+
+func placementCandidateNodeIDs(candidates []clusterstate.PlacementCandidate) []string {
+	result := make([]string, 0, len(candidates))
+	for _, candidate := range candidates {
+		if candidate.NodeID != "" {
+			result = append(result, candidate.NodeID)
+		}
+	}
+	return result
 }
 
 func (s *RegistryService) waitRoute(ctx context.Context, group, routeKey string) (routeapi.RouteMutationResponse, error) {
@@ -1166,10 +1196,119 @@ func (s *RegistryService) recoverShard(ctx context.Context, shardID uint32) erro
 			}
 		}
 		if pending.NextKey == "" {
-			return nil
+			break
 		}
 		after = pending.NextKey
 	}
+	return s.renewShardKeyLeases(ctx, shardID)
+}
+
+func (s *RegistryService) renewShardKeyLeases(ctx context.Context, shardID uint32) error {
+	s.leaseMu.Lock()
+	after := s.leaseCursors[shardID]
+	s.leaseMu.Unlock()
+	page, err := s.store.LeaseBindings(ctx, shardID, after, s.config.PendingWorkflowsPerPage)
+	if err != nil {
+		return err
+	}
+	identity, err := s.store.ServeIdentity()
+	if err != nil {
+		return err
+	}
+	var renewalErrors []error
+	for _, binding := range page.Bindings {
+		if err := s.renewKeyLease(ctx, identity, binding); err != nil {
+			renewalErrors = append(renewalErrors, err)
+		}
+	}
+	s.leaseMu.Lock()
+	s.leaseCursors[shardID] = page.NextKey
+	s.leaseMu.Unlock()
+	return errors.Join(renewalErrors...)
+}
+
+func (s *RegistryService) renewKeyLease(
+	ctx context.Context,
+	identity session.ServeIdentity,
+	binding raftstore.LeaseBinding,
+) error {
+	if binding.RegistryGeneration != identity.RegistryGeneration {
+		return errors.New("controlplane: lease Binding belongs to another Registry History Generation")
+	}
+	cacheKey := leaseBindingCacheKey(binding)
+	now := time.Now().Unix()
+	if !s.claimLeaseRenewal(cacheKey, now) {
+		return nil
+	}
+	succeeded := false
+	defer func() {
+		s.leaseMu.Lock()
+		delete(s.leaseRenewing, cacheKey)
+		if !succeeded {
+			delete(s.leaseExpiries, cacheKey)
+		}
+		s.leaseMu.Unlock()
+	}()
+	lease, err := s.planner.ResolveKeyLease(ctx, placer.KeyLeaseRequest{
+		Group: binding.Group, AuthKeyFingerprint: binding.AuthKeyFingerprint,
+		ManifestKeyFingerprint: binding.ManifestKeyFingerprint,
+	})
+	if err != nil {
+		return err
+	}
+	if err := lease.Validate(); err != nil || lease.Group != binding.Group ||
+		lease.AuthKey.Fingerprint != binding.AuthKeyFingerprint ||
+		lease.ManifestKey.Fingerprint != binding.ManifestKeyFingerprint {
+		return errors.New("controlplane: Provider returned a mismatched key lease")
+	}
+	if lease.ExpiresUnix <= now+int64(placer.NodeKeyLeaseRenewBefore/time.Second) {
+		return errors.New("controlplane: Provider returned a key lease inside the renewal window")
+	}
+	want := routesync.NodeKeyLeaseRefV1{
+		Version: routesync.NodeKeyLeaseVersionV1, Group: binding.Group,
+		AuthKeyFingerprint:     binding.AuthKeyFingerprint,
+		ManifestKeyFingerprint: binding.ManifestKeyFingerprint,
+	}
+	ack, sent, err := s.commands.InstallKeyLease(
+		ctx, identity, binding.NodeID, binding.NodeEpoch, binding.DataEndpoint, lease,
+	)
+	if err != nil {
+		return err
+	}
+	if !sent || ack != want {
+		return errors.New("controlplane: node did not durably acknowledge the renewed key lease")
+	}
+	s.leaseMu.Lock()
+	s.leaseExpiries[cacheKey] = lease.ExpiresUnix
+	s.leaseMu.Unlock()
+	succeeded = true
+	return nil
+}
+
+func (s *RegistryService) claimLeaseRenewal(cacheKey string, now int64) bool {
+	s.leaseMu.Lock()
+	defer s.leaseMu.Unlock()
+	if s.lastLeasePruneAt == 0 || now-s.lastLeasePruneAt >= int64(time.Hour/time.Second) {
+		for key, expires := range s.leaseExpiries {
+			if expires <= now {
+				delete(s.leaseExpiries, key)
+			}
+		}
+		s.lastLeasePruneAt = now
+	}
+	if _, active := s.leaseRenewing[cacheKey]; active ||
+		s.leaseExpiries[cacheKey] > now+int64(placer.NodeKeyLeaseRenewBefore/time.Second) {
+		return false
+	}
+	s.leaseRenewing[cacheKey] = struct{}{}
+	return true
+}
+
+func leaseBindingCacheKey(binding raftstore.LeaseBinding) string {
+	return strings.Join([]string{
+		binding.RegistryGeneration, binding.NodeID, fmt.Sprint(binding.NodeEpoch), binding.DataEndpoint,
+		binding.Group, binding.AuthKeyFingerprint, binding.ManifestKeyFingerprint,
+	}, "\x00")
 }
 
 func (s *RegistryService) scheduleFenceCompaction(ctx context.Context, fence clusterstate.ExecutionFence) {

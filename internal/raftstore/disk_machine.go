@@ -738,6 +738,12 @@ func (m *diskStateMachine) lookupData(
 			return DataLookupResult{}, err
 		}
 		return DataLookupResult{Changefeed: &changefeed}, nil
+	case query.LeaseBindings != nil:
+		bindings, err := lookupLeaseBindingsOnDisk(reader, prefix, state, *query.LeaseBindings)
+		if err != nil {
+			return DataLookupResult{}, err
+		}
+		return DataLookupResult{LeaseBindings: &bindings}, nil
 	case query.Fence != nil:
 		key := fenceMapKey(query.Fence.Group, query.Fence.RouteKey, query.Fence.SandboxID)
 		var fence clusterstate.ExecutionFence
@@ -762,6 +768,96 @@ func (m *diskStateMachine) lookupData(
 		return DataLookupResult{Recovery: &recovery}, nil
 	}
 	return LookupData(state, query)
+}
+
+func lookupLeaseBindingsOnDisk(
+	reader pebble.Reader,
+	prefix []byte,
+	state DataState,
+	query LeaseBindingLookup,
+) (LeaseBindingLookupResult, error) {
+	if !state.Accepts(query.Identity) {
+		return LeaseBindingLookupResult{}, nil
+	}
+	bindings := make([]LeaseBinding, 0, query.Limit+1)
+	tables := []struct {
+		table     byte
+		qualified byte
+	}{
+		{stateBuildTable, 'b'},
+		{stateRouteTable, 'r'},
+	}
+	for _, table := range tables {
+		tablePrefix := stateTablePrefix(prefix, table.table)
+		lowerBound, scan := pendingTableLowerBound(prefix, tablePrefix, table.table, table.qualified, query.AfterKey)
+		if !scan {
+			continue
+		}
+		iterator := reader.NewIter(&pebble.IterOptions{
+			LowerBound: lowerBound, UpperBound: prefixUpperBound(tablePrefix),
+		})
+		for valid := iterator.First(); valid; valid = iterator.Next() {
+			mapKey := string(iterator.Key()[len(tablePrefix):])
+			qualified := string(append([]byte{table.qualified}, []byte(mapKey)...))
+			if qualified <= query.AfterKey {
+				continue
+			}
+			var (
+				binding LeaseBinding
+				active  bool
+				err     error
+			)
+			switch table.table {
+			case stateBuildTable:
+				var record clusterstate.BuildRecord
+				if err = decodeJSONValue(iterator.Value(), &record); err == nil {
+					err = validateStoredBuild(state, mapKey, record)
+				}
+				if err == nil {
+					binding, active, err = buildLeaseBinding(record)
+				}
+			case stateRouteTable:
+				var record clusterstate.RouteWorkflowRecord
+				if err = decodeJSONValue(iterator.Value(), &record); err == nil {
+					err = validateStoredRoute(state, mapKey, record)
+				}
+				if err == nil {
+					binding, active, err = routeLeaseBinding(record)
+				}
+			}
+			if err != nil {
+				iterator.Close()
+				return LeaseBindingLookupResult{}, err
+			}
+			if active {
+				binding.Key = qualified
+				bindings = append(bindings, binding)
+			}
+			if len(bindings) > int(query.Limit) {
+				break
+			}
+		}
+		err := iterator.Error()
+		closeErr := iterator.Close()
+		if err != nil {
+			return LeaseBindingLookupResult{}, err
+		}
+		if closeErr != nil {
+			return LeaseBindingLookupResult{}, closeErr
+		}
+		if len(bindings) > int(query.Limit) {
+			break
+		}
+	}
+	hasMore := len(bindings) > int(query.Limit)
+	if hasMore {
+		bindings = bindings[:query.Limit]
+	}
+	result := LeaseBindingLookupResult{Bindings: bindings}
+	if hasMore {
+		result.NextKey = bindings[len(bindings)-1].Key
+	}
+	return result, nil
 }
 
 func lookupRecoveryOnDisk(
@@ -834,7 +930,7 @@ func lookupRouteBucketOnDisk(
 	}
 	result.Available = true
 	result.SnapshotRevision = state.LastApplied
-	result.Routes = make([]clusterstate.RouteWorkflowRecord, 0)
+	result.Routes = make([]RouteBucketEntry, 0)
 	groupPrefix := stateRowKey(prefix, stateRouteTable, lengthKey(query.Group))
 	iterator := reader.NewIter(&pebble.IterOptions{
 		LowerBound: groupPrefix, UpperBound: prefixUpperBound(groupPrefix),
@@ -855,8 +951,10 @@ func lookupRouteBucketOnDisk(
 		if err != nil {
 			return RouteBucketResult{}, err
 		}
-		if bucket == query.Bucket {
-			result.Routes = append(result.Routes, record)
+		if bucket == query.Bucket && record.RouteKey > query.AfterRouteKey {
+			if entry, listed := routeBucketEntry(record); listed {
+				result.Routes = append(result.Routes, entry)
+			}
 		}
 	}
 	if err := iterator.Error(); err != nil {
@@ -865,6 +963,10 @@ func lookupRouteBucketOnDisk(
 	sort.Slice(result.Routes, func(left, right int) bool {
 		return result.Routes[left].RouteKey < result.Routes[right].RouteKey
 	})
+	if len(result.Routes) > int(query.Limit) {
+		result.Routes = result.Routes[:query.Limit]
+		result.NextRouteKey = result.Routes[len(result.Routes)-1].RouteKey
+	}
 	return result, nil
 }
 
@@ -968,8 +1070,12 @@ func lookupPendingOnDisk(
 	}
 	for _, table := range tables {
 		tablePrefix := stateTablePrefix(prefix, table.table)
+		lowerBound, scan := pendingTableLowerBound(prefix, tablePrefix, table.table, table.qualified, query.AfterKey)
+		if !scan {
+			continue
+		}
 		iterator := reader.NewIter(&pebble.IterOptions{
-			LowerBound: tablePrefix, UpperBound: prefixUpperBound(tablePrefix),
+			LowerBound: lowerBound, UpperBound: prefixUpperBound(tablePrefix),
 		})
 		for valid := iterator.First(); valid; valid = iterator.Next() {
 			mapKey := string(iterator.Key()[len(tablePrefix):])
@@ -1041,6 +1147,16 @@ func lookupPendingOnDisk(
 		result.NextKey = workflows[len(workflows)-1].Key
 	}
 	return result, nil
+}
+
+func pendingTableLowerBound(prefix, tablePrefix []byte, table, qualified byte, afterKey string) ([]byte, bool) {
+	if afterKey == "" || qualified > afterKey[0] {
+		return tablePrefix, true
+	}
+	if qualified < afterKey[0] {
+		return nil, false
+	}
+	return stateRowKey(prefix, table, afterKey[1:]), true
 }
 
 func (m *diskStateMachine) Sync() error {

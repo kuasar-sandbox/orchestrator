@@ -558,19 +558,16 @@ func (m *SessionMesh) pullSnapshots(ctx context.Context) {
 			response, err := peer.Client.Do(request)
 			if err != nil {
 				m.recordPeerHealth(peer.MemberID, attempt, false)
-				m.directory.MarkMemberUnavailable(peer.MemberID)
 				return
 			}
 			defer response.Body.Close()
 			if response.StatusCode != http.StatusOK {
 				m.recordPeerHealth(peer.MemberID, attempt, false)
-				m.directory.MarkMemberUnavailable(peer.MemberID)
 				return
 			}
 			var records []session.DirectoryRecord
 			if err := decodeSessionJSON(response.Body, &records); err != nil {
 				m.recordPeerHealth(peer.MemberID, attempt, false)
-				m.directory.MarkMemberUnavailable(peer.MemberID)
 				return
 			}
 			m.directory.MergeFull(records)

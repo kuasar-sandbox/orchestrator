@@ -56,6 +56,20 @@ func TestFinalBuildDispatchReplayPreservesDurableDecision(t *testing.T) {
 	}
 }
 
+func TestStubCapabilitiesFollowAdvertisedCapacity(t *testing.T) {
+	build := &routesync.BuildResources{Slots: 2}
+	capabilities := stubCapabilities(4, build)
+	if !capabilities["sandbox"] || !capabilities["build"] {
+		t.Fatalf("full capabilities = %v", capabilities)
+	}
+	if capabilities := stubCapabilities(0, build); capabilities["sandbox"] || !capabilities["build"] {
+		t.Fatalf("Build-only capabilities = %v", capabilities)
+	}
+	if capabilities := stubCapabilities(4, nil); !capabilities["sandbox"] || capabilities["build"] {
+		t.Fatalf("Sandbox-only capabilities = %v", capabilities)
+	}
+}
+
 func TestFinalBuildTriggerAndLifecycleStayOnBoundNode(t *testing.T) {
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	svc := newService("", log)

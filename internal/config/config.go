@@ -696,6 +696,15 @@ func (c *Config) validate() error {
 		return fmt.Errorf("config: units.builder_pool_size must be >= 0")
 	}
 	if c.Cluster.NodeLink.Endpoint != "" {
+		tls := c.Cluster.NodeLink.TLS
+		tlsAny := tls.Cert != "" || tls.Key != "" || tls.CA != ""
+		tlsComplete := tls.Cert != "" && tls.Key != "" && tls.CA != ""
+		if tlsAny && !tlsComplete {
+			return errors.New("config: cluster.node_link.tls requires cert, key, and ca together")
+		}
+		if !strings.HasPrefix(c.Cluster.NodeLink.Endpoint, "/") && !tlsComplete {
+			return errors.New("config: TCP cluster.node_link requires complete mTLS")
+		}
 		if c.Cluster.DataEndpoint == "" {
 			return fmt.Errorf("config: cluster.data_endpoint is required in cluster mode")
 		}

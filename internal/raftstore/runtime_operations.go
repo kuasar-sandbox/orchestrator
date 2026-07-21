@@ -16,7 +16,11 @@ func (r *Runtime) operationContext(ctx context.Context) (context.Context, contex
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	timeout := time.Duration(r.config.Tuning.OperationTimeoutMillis) * time.Millisecond
+	timeoutMillis := r.config.Tuning.OperationTimeoutMillis
+	if timeoutMillis == 0 {
+		timeoutMillis = DefaultRuntimeTuning().OperationTimeoutMillis
+	}
+	timeout := time.Duration(timeoutMillis) * time.Millisecond
 	return context.WithTimeout(ctx, timeout)
 }
 

@@ -89,6 +89,28 @@ func TestTrustedHandlerPreservesUnavailableOutcome(t *testing.T) {
 	}
 }
 
+func TestTrustedMutationHandlerReturnsInternalFailureDetail(t *testing.T) {
+	type request struct{}
+	type response struct{}
+	mux := http.NewServeMux()
+	handleMutation(
+		mux,
+		"/test/mutation",
+		func(*http.Request) error { return nil },
+		func(context.Context, request) (response, error) {
+			return response{}, errors.New("data shard proposal timed out")
+		},
+		func(request) error { return nil },
+		func(request, response) error { return nil },
+	)
+	recorder := httptest.NewRecorder()
+	mux.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/test/mutation", strings.NewReader("{}")))
+	if recorder.Code != http.StatusServiceUnavailable ||
+		!strings.Contains(recorder.Body.String(), "data shard proposal timed out") {
+		t.Fatalf("mutation failure = %d %q", recorder.Code, recorder.Body.String())
+	}
+}
+
 func TestRouterStateCarriesMonotonicRevisionAndLeaderHint(t *testing.T) {
 	state, err := NewRouterState(routeRequest(false).RequestIdentity)
 	if err != nil {
@@ -169,16 +191,11 @@ func TestBuildReadResponseOnlyExposesRegistrationBinding(t *testing.T) {
 	if err := registered.ValidateFor(buildRequest); err == nil {
 		t.Fatal("unbound BUILD_STARTING projection was exposed as a positive read")
 	}
-	registered.BuildState = clusterstate.BuildError
-	registered.Build.Reason = "builder failed"
-	if err := registered.ValidateFor(buildRequest); err == nil {
-		t.Fatal("node-local BUILD_ERROR was exposed through the cluster read API")
-	}
 }
 
 func TestRouteListAndWatchCarryIndependentBucketRevisions(t *testing.T) {
 	identity := routeRequest(false).RequestIdentity
-	listRequest := ListRoutesRequest{RequestIdentity: identity, Group: "/g", Bucket: 3}
+	listRequest := ListRoutesRequest{RequestIdentity: identity, Group: "/g", Bucket: 3, Limit: 10}
 	if err := (ListRoutesResponse{Bucket: 3}).ValidateFor(listRequest); err == nil {
 		t.Fatal("available Route list without a snapshot revision was accepted")
 	}
@@ -260,7 +277,7 @@ func testBuildProjection() *clusterstate.BuildProjection {
 		Version: clusterstate.DispatchSpecVersionV1, TemplateID: "template-1",
 		AuthKeyFingerprint: strings.Repeat("b", 24), ManifestKeyFingerprint: strings.Repeat("c", 24),
 		Profile: types.ProfileBare, CPUCount: 1, MemoryMB: 512,
-		Request: clusterstate.NodeRequestEnvelopeV1{Version: clusterstate.NodeRequestEnvelopeVersionV1, Method: "POST", Path: "/v3/templates", Body: []byte("{}")},
+		Request: clusterstate.NodeRequestEnvelopeV1{Version: clusterstate.NodeRequestEnvelopeVersionV1, Method: "POST", Path: "/v3/templates", Body: []byte(`{"cpuCount":1,"memoryMB":512}`)},
 	})
 	intent, _ := clusterstate.NewDispatchIntent([]byte("demand"), spec, "provider-v1")
 	return &clusterstate.BuildProjection{

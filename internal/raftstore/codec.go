@@ -50,7 +50,7 @@ func validateSystemCommandEnvelope(command SystemCommand) error {
 	pointers := countPresent(
 		command.RegistryLayout != nil, command.Gates != nil, command.Transition != nil, command.Advance != nil,
 		command.Closure != nil, command.Drain != nil, command.TransitionDrain != nil,
-		command.Recovery != nil, command.RecoveryAdvance != nil,
+		command.Recovery != nil, command.RecoveryDrain != nil, command.RecoveryAdvance != nil,
 		command.Enrollment != nil, command.Registration != nil, command.Retirement != nil,
 		command.RecoveryNode != nil,
 	)
@@ -90,6 +90,10 @@ func validateSystemCommandEnvelope(command SystemCommand) error {
 	case SystemBeginRecovery:
 		if pointers != 1 || command.Recovery == nil || command.Digest != "" {
 			return errors.New("raftstore: malformed recovery command")
+		}
+	case SystemConfirmRecoveryDrain:
+		if pointers != 1 || command.RecoveryDrain == nil || command.Digest != "" {
+			return errors.New("raftstore: malformed recovery permit drain command")
 		}
 	case SystemAdvanceRecovery:
 		if pointers != 1 || command.RecoveryAdvance == nil || command.Digest != "" {

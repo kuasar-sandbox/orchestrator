@@ -158,9 +158,23 @@ func TestRecoveryEpochClosesNormalServiceOnThePreparedSystemEpoch(t *testing.T) 
 	if state.Recovery == nil || state.ServeGate || state.SystemEpoch != 2 {
 		t.Fatalf("open recovery state = %+v", state)
 	}
+	_, result := ApplySystemCommand(state, 4, SystemCommand{
+		Type:            SystemAdvanceRecovery,
+		RecoveryAdvance: &RecoveryAdvance{From: RecoveryPreparing, To: RecoveryCollecting},
+	})
+	if !result.Conflict {
+		t.Fatal("recovery advanced while a previously issued Permit could remain valid")
+	}
+	state, _ = applySystem(t, state, 5, SystemCommand{
+		Type: SystemConfirmRecoveryDrain,
+		RecoveryDrain: &RecoveryDrainConfirmation{
+			RecoveryEpoch: 2, TargetRegistryGeneration: "generation-2",
+			TargetRegistryLayoutDigest: digest, WaitedMillis: registryLayout.ServePermitMaxMillis,
+		},
+	})
 	phases := []RecoveryPhase{RecoveryCollecting, RecoveryReconciling, RecoveryFinalizing, RecoveryClosed}
 	from := RecoveryPreparing
-	index := uint64(4)
+	index := uint64(6)
 	for _, to := range phases {
 		state, _ = applySystem(t, state, index, SystemCommand{
 			Type: SystemAdvanceRecovery, RecoveryAdvance: &RecoveryAdvance{From: from, To: to},
@@ -169,10 +183,10 @@ func TestRecoveryEpochClosesNormalServiceOnThePreparedSystemEpoch(t *testing.T) 
 		index++
 	}
 	if state.Recovery != nil || state.RecoveryCompletion == nil || state.SystemEpoch != 3 || state.ServeGate ||
-		state.RecoveryCompletion.Epoch != 2 || state.RecoveryCompletion.FinalizedIndex != 7 {
+		state.RecoveryCompletion.Epoch != 2 || state.RecoveryCompletion.FinalizedIndex != 9 {
 		t.Fatalf("closed recovery state = %+v", state)
 	}
-	state, _ = applySystem(t, state, 8, SystemCommand{
+	state, _ = applySystem(t, state, 10, SystemCommand{
 		Type: SystemSetGates, Gates: &GateUpdate{Serve: true, Write: true, Cutover: true},
 	})
 	if !state.ServeGate || !state.WriteGate || !state.CutoverGate {
@@ -311,10 +325,14 @@ func TestRecoveryNodeProgressIsDurableAndPhaseBound(t *testing.T) {
 	}}); !result.Conflict {
 		t.Fatal("node retirement changed the frozen recovery enrollment set")
 	}
-	state, _ = applySystem(t, state, 5, SystemCommand{Type: SystemAdvanceRecovery, RecoveryAdvance: &RecoveryAdvance{
+	state, _ = applySystem(t, state, 5, SystemCommand{Type: SystemConfirmRecoveryDrain, RecoveryDrain: &RecoveryDrainConfirmation{
+		RecoveryEpoch: 2, TargetRegistryGeneration: "generation-2",
+		TargetRegistryLayoutDigest: digest, WaitedMillis: registryLayout.ServePermitMaxMillis,
+	}})
+	state, _ = applySystem(t, state, 6, SystemCommand{Type: SystemAdvanceRecovery, RecoveryAdvance: &RecoveryAdvance{
 		From: RecoveryPreparing, To: RecoveryCollecting,
 	}})
-	if _, result := ApplySystemCommand(state, 6, SystemCommand{Type: SystemAdvanceRecovery, RecoveryAdvance: &RecoveryAdvance{
+	if _, result := ApplySystemCommand(state, 7, SystemCommand{Type: SystemAdvanceRecovery, RecoveryAdvance: &RecoveryAdvance{
 		From: RecoveryCollecting, To: RecoveryReconciling,
 	}}); !result.Conflict {
 		t.Fatal("recovery advanced before the expected node reported")

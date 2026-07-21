@@ -20,6 +20,20 @@ type registrationConsensus struct {
 	applies int
 }
 
+type directoryPermitConsensus struct {
+	*localSystemConsensus
+}
+
+func (c *directoryPermitConsensus) AuthorizeServe(
+	identity raftstore.PermitIdentity,
+	_ raftstore.PermitOperation,
+) error {
+	if identity != c.identity {
+		return raftstore.ErrPermitMismatch
+	}
+	return raftstore.ErrPermitDenied
+}
+
 func (c *registrationConsensus) ReadSystemStrong(context.Context) (raftstore.SystemState, error) {
 	return c.state, nil
 }
@@ -75,6 +89,53 @@ func TestRaftStoreFencesRetiredNodeSessionAtPermitCommit(t *testing.T) {
 	consensus.state.LastApplied = 2
 	if err := store.AuthorizeNodeSession(identity, registration); !errors.Is(err, session.ErrStaleSession) {
 		t.Fatalf("retired enrollment error = %v", err)
+	}
+}
+
+func TestDirectoryRetainsCurrentSessionAcrossClosedServeGates(t *testing.T) {
+	registryLayout := testControlRegistryLayout()
+	runtime, err := newMemoryConsensus(registryLayout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest, err := registryLayout.Digest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := session.DirectoryEntry{
+		NodeID: "node-1", EnrollmentID: "enrollment-1",
+		Tuple: session.Tuple{NodeEpoch: 7, SessionSeq: 3}, HolderMemberID: "registry-a",
+	}
+	state := raftstore.SystemState{
+		Initialized: true, ClusterID: registryLayout.ClusterID, RegistryGeneration: registryLayout.RegistryGeneration,
+		SystemEpoch: 1, ActiveRegistryLayoutDigest: digest, LastApplied: 1,
+		NodeEnrollments: map[string]raftstore.NodeEnrollmentRecord{"node-1": {
+			NodeID: entry.NodeID, EnrollmentID: entry.EnrollmentID, MaxNodeEpoch: entry.NodeEpoch,
+			EnrollmentIndex: 1, LastAppliedIndex: 1,
+		}},
+	}
+	consensus := &directoryPermitConsensus{
+		localSystemConsensus: &localSystemConsensus{memoryConsensus: runtime, state: state},
+	}
+	store, err := NewRaftStore(consensus, registryLayout, digest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.RefreshPermit(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	directory := session.NewDirectory(store)
+	if !directory.Apply(session.DirectoryDelta{Entry: entry, Up: true}) {
+		t.Fatal("current Directory entry was rejected while serving operations were closed")
+	}
+	if got, found := directory.Lookup(entry.NodeID); !found || got != entry {
+		t.Fatalf("current Directory entry = %+v, found=%v", got, found)
+	}
+	enrollment := consensus.state.NodeEnrollments[entry.NodeID]
+	enrollment.Retired = true
+	consensus.state.NodeEnrollments[entry.NodeID] = enrollment
+	if _, found := directory.Lookup(entry.NodeID); found {
+		t.Fatal("retired enrollment remained available in the Directory")
 	}
 }
 

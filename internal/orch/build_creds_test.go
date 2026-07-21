@@ -2,7 +2,6 @@ package orch
 
 import (
 	"context"
-	"encoding/json"
 	"io"
 	"log/slog"
 	"path/filepath"
@@ -46,9 +45,7 @@ func TestResolveBuildCreds(t *testing.T) {
 	b := &types.Build{ManifestKey: mk, FromImage: "reg.example.com/app:tag"}
 
 	user := func(js string) string {
-		var c regcreds.Creds
-		_ = json.Unmarshal([]byte(js), &c)
-		return c.Username
+		return regcreds.CredsForImage(js, b.FromImage).Username
 	}
 
 	// anonymous: nothing configured.
@@ -64,6 +61,16 @@ func TestResolveBuildCreds(t *testing.T) {
 	b.RegistryAuth = auth
 	if js, err := o.resolveBuildCreds(ctx, b, "", "", ""); err != nil || user(js) != "tu" {
 		t.Fatalf("tenant default: %q %v", js, err)
+	}
+	// Trigger retries receive the same persisted Docker auths document and must
+	// not reinterpret it as the already-resolved credential shape or erase it.
+	first, err := o.resolveBuildCreds(ctx, b, "", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b.RegistryAuth = first
+	if retry, err := o.resolveBuildCreds(ctx, b, "", "", ""); err != nil || retry != first || user(retry) != "tu" {
+		t.Fatalf("tenant default retry: first=%q retry=%q err=%v", first, retry, err)
 	}
 	// pull token wins over fromImageRegistry and the tenant default.
 	tok, _ := regcreds.Seal(mk, regcreds.Creds{Username: "ku", Password: "kp"})

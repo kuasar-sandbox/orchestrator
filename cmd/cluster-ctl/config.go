@@ -131,6 +131,7 @@ registry_layout:
   keys: /etc/kuasar/registry-layout/keyring.json
   guard: /var/lib/kuasar/router-registry-layout.guard
 registry_tls: { cert: /etc/kuasar/tls/router.crt, key: /etc/kuasar/tls/router.key, ca: /etc/kuasar/tls/ca.crt }
+node_tls: { cert: /etc/kuasar/tls/router.crt, key: /etc/kuasar/tls/router.key, ca: /etc/kuasar/tls/ca.crt }
 providers:
   endpoints:
     - { name: provider-1, endpoint: "https://provider-1.example:7900" }

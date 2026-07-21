@@ -81,6 +81,37 @@ func TestPlaceNHonorsShuffleAndFailureDomainFilters(t *testing.T) {
 	}
 }
 
+func TestPlaceNRequiresSelectorKeyPresence(t *testing.T) {
+	nodes := []CatalogNode{
+		{NodeID: "missing", Labels: map[string]string{}, SandboxSlotCapacity: 1},
+		{NodeID: "present", Labels: map[string]string{"dedicated": ""}, SandboxSlotCapacity: 1},
+	}
+	got, err := PlaceSandboxN(nodes, SandboxDemand{SlotUnits: 1}, StaticPolicy{
+		Selectors: []map[string]string{{"dedicated": ""}},
+	}, DefaultCandidateCount, &sequenceSource{values: []int{0}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ids := candidateIDs(got); !reflect.DeepEqual(ids, []string{"present"}) {
+		t.Fatalf("candidates = %v", ids)
+	}
+}
+
+func TestPlaceNPreservesUnconstrainedRuntimePolicy(t *testing.T) {
+	nodes := []CatalogNode{{NodeID: "n1", RuntimeDigest: "sampled-runtime", SandboxSlotCapacity: 1}}
+	got, err := PlaceSandboxN(nodes, SandboxDemand{SlotUnits: 1}, StaticPolicy{}, 1, &sequenceSource{values: []int{0}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].RuntimeDigest != "" {
+		t.Fatalf("unconstrained candidate = %+v", got)
+	}
+	got, err = PlaceSandboxN(nodes, SandboxDemand{SlotUnits: 1}, StaticPolicy{TargetRuntimeDigest: "sampled-runtime"}, 1, &sequenceSource{values: []int{0}})
+	if err != nil || len(got) != 1 || got[0].RuntimeDigest != "sampled-runtime" {
+		t.Fatalf("constrained candidate = %+v, %v", got, err)
+	}
+}
+
 func TestPlaceNRejectsInvalidRandomSource(t *testing.T) {
 	nodes := []CatalogNode{{NodeID: "n1", SandboxSlotCapacity: 1}}
 	if _, err := PlaceSandboxN(nodes, SandboxDemand{SlotUnits: 1}, StaticPolicy{}, 1, &sequenceSource{values: []int{1}}); err == nil {

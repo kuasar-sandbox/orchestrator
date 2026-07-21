@@ -36,7 +36,7 @@ func TestRecoveryCoordinatorBoundsPerNodeWorkers(t *testing.T) {
 			coordinator, err := NewRecoveryCoordinator(
 				&RaftStore{},
 				&RecoveryMesh{},
-				session.NewDirectory(),
+				session.NewDirectory(allowTestDirectoryEntries{}),
 				recoveryConfigSender{},
 				RecoveryCoordinatorConfig{Workers: 4, PerNodeWorkers: test.workers},
 				nil,

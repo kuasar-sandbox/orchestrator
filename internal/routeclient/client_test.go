@@ -1,9 +1,12 @@
 package routeclient
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -69,6 +72,19 @@ func TestLocalReadsUseReplicaSpreadRendezvousWithoutLeaderBias(t *testing.T) {
 	writeOrder := client.shardEndpoints(0)
 	if len(writeOrder) != 3 || writeOrder[0].MemberID != "registry-a" {
 		t.Fatalf("leader hint was not retained for strong/write paths: %+v", writeOrder)
+	}
+}
+
+func TestPostJSONPreservesBoundedMemberFailureDetail(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "data shard proposal timed out", http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+	err := postJSON(context.Background(), Endpoint{
+		MemberID: "registry-a", BaseURL: server.URL, Client: server.Client(),
+	}, "/mutation", struct{}{}, &struct{}{})
+	if err == nil || !strings.Contains(err.Error(), "registry-a returned 503 Service Unavailable: data shard proposal timed out") {
+		t.Fatalf("member failure = %v", err)
 	}
 }
 

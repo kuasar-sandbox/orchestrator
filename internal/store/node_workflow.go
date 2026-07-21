@@ -403,15 +403,29 @@ WHERE object_kind=? AND node_id=? AND node_epoch=? AND admission_state=? ORDER B
 		if record == nil || record.AdmissionState != nodeexec.AdmissionQueued {
 			continue
 		}
-		if !usage.Fits(capacity, record.BuildDemand) {
-			break
-		}
 		build, err := s.getBuildTx(ctx, tx, record.ObjectID)
 		if err != nil {
 			return nil, err
 		}
 		if build == nil {
 			return nil, errors.New("store: queued Build object is missing")
+		}
+		if !capacity.CanEverFit(record.BuildDemand) {
+			update := nodeexec.EventUpdate{State: string(types.BuildError), Reason: "exceeds_build_capacity"}
+			applyBuildState(build, update)
+			if err := s.putBuild(ctx, tx, build); err != nil {
+				return nil, err
+			}
+			record.AdmissionState = nodeexec.AdmissionTerminal
+			record.ResourceClaimed = false
+			record.ObjectState = update.State
+			if err := updateNodeWorkflowTx(ctx, tx, record); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		if !usage.Fits(capacity, record.BuildDemand) {
+			break
 		}
 		record.AdmissionState = nodeexec.AdmissionAdmitted
 		record.ResourceClaimed = true

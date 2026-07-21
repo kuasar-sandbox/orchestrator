@@ -80,6 +80,8 @@ type reserveFlight struct {
 	err   error
 }
 
+var errRoutePending = errors.New("finalrouter: Route mutation is pending")
+
 type Router struct {
 	control    ControlPlane
 	authorizer CallerAuthorizer
@@ -278,6 +280,14 @@ func (r *Router) createSandbox(w http.ResponseWriter, request *http.Request) {
 	}
 	entry, err := r.reserve(request.Context(), group, routeKey, input)
 	if err != nil {
+		if errors.Is(err, errRoutePending) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"sandboxID": routeKey, "routeKey": routeKey, "state": "pending",
+			})
+			return
+		}
 		r.log.Warn("router reserve", "group", group, "route_key", routeKey, "err", err)
 		http.Error(w, "sandbox is not ready", http.StatusServiceUnavailable)
 		return
@@ -312,7 +322,9 @@ func (r *Router) reserve(ctx context.Context, group, routeKey string, input rout
 	result, err := r.control.ReserveSandbox(ctx, group, routeKey, r.minimumRouteRevision(group, routeKey), input)
 	if err == nil {
 		response := result.Response
-		if response.Outcome != routeapi.MutationReady || response.Route == nil {
+		if response.Outcome == routeapi.MutationPending {
+			err = errRoutePending
+		} else if response.Outcome != routeapi.MutationReady || response.Route == nil {
 			err = fmt.Errorf("Route mutation ended as %s: %s", response.Outcome, response.Reason)
 		} else {
 			flight.route = &routeEntry{
@@ -347,9 +359,13 @@ func (r *Router) listSandboxes(w http.ResponseWriter, request *http.Request) {
 	}
 	items := make([]map[string]any, 0, len(result.Routes))
 	for _, route := range result.Routes {
+		state := "running"
+		if route.State == clusterstate.WorkflowRoutePaused {
+			state = "paused"
+		}
 		items = append(items, map[string]any{
-			"sandboxID": route.RouteKey, "clientID": route.Route.NodeID,
-			"templateID": route.Route.TemplateRef, "state": "running",
+			"sandboxID": route.RouteKey, "clientID": route.NodeID,
+			"templateID": route.TemplateRef, "state": state,
 		})
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -381,12 +397,18 @@ func (r *Router) sandboxControl(w http.ResponseWriter, request *http.Request) {
 			http.Error(w, "delete unavailable", http.StatusServiceUnavailable)
 			return
 		}
-		r.evictRoute(group, routeKey)
-		if result.Response.Outcome == routeapi.MutationTerminal {
+		switch result.Response.Outcome {
+		case routeapi.MutationTerminal:
+			r.evictRoute(group, routeKey)
 			w.WriteHeader(http.StatusNoContent)
-			return
+		case routeapi.MutationPending:
+			r.evictRoute(group, routeKey)
+			w.WriteHeader(http.StatusAccepted)
+		case routeapi.MutationConflict:
+			http.Error(w, result.Response.Reason, http.StatusConflict)
+		default:
+			http.Error(w, "delete unavailable", http.StatusServiceUnavailable)
 		}
-		w.WriteHeader(http.StatusAccepted)
 		return
 	}
 	var entry *routeEntry
@@ -641,9 +663,6 @@ func (r *Router) serveData(w http.ResponseWriter, request *http.Request, host st
 		http.Error(w, HeaderGroup+" is required", http.StatusBadRequest)
 		return
 	}
-	if !r.authorize(w, request.Context(), group, apiKey(request)) {
-		return
-	}
 	routeKey, hostPort, hasHostPort, err := parseDataHost(
 		host, r.domain, request.Header.Get(proxypkg.HeaderSandboxID),
 	)
@@ -664,17 +683,30 @@ func (r *Router) serveData(w http.ResponseWriter, request *http.Request, host st
 	}
 	entry, err := r.resolveRoute(request.Context(), group, routeKey)
 	if err != nil {
-		// Data traffic is also the lazy create/resume entry for the stable
-		// (group, route_key). Reserve is consensus-idempotent and single-flight;
-		// uncertainty never authorizes a different logical Route.
-		input, inputErr := defaultSandboxInput()
-		if inputErr != nil {
-			err = inputErr
-		} else {
-			entry, err = r.reserve(request.Context(), group, routeKey, input)
+		entry, err = r.resumeRoute(request.Context(), group, routeKey)
+		if err != nil {
+			// Only creation by logical key uses caller authorization. Existing
+			// data traffic is authenticated below by the execution capability.
+			if !r.authorize(w, request.Context(), group, apiKey(request)) {
+				return
+			}
+			input, inputErr := defaultSandboxInput()
+			if inputErr != nil {
+				err = inputErr
+			} else {
+				entry, err = r.reserve(request.Context(), group, routeKey, input)
+			}
 		}
 	}
 	if err != nil || entry == nil || !r.control.CacheAuthorized(entry.ServeIdentity) {
+		if err == nil {
+			if entry == nil {
+				err = errors.New("Route resolution returned no entry")
+			} else {
+				err = routeclient.ErrPermitUnavailable
+			}
+		}
+		r.log.Warn("router data route", "group", group, "route_key", routeKey, "err", err)
 		http.Error(w, "sandbox route unavailable", http.StatusServiceUnavailable)
 		return
 	}
@@ -696,6 +728,22 @@ func (r *Router) serveData(w http.ResponseWriter, request *http.Request, host st
 		}
 	}
 	r.forwardData(w, request, entry, port, injectToken)
+}
+
+func (r *Router) resumeRoute(ctx context.Context, group, routeKey string) (*routeEntry, error) {
+	result, err := r.control.ResumeSandbox(ctx, group, routeKey, r.minimumRouteRevision(group, routeKey))
+	if err != nil || result.Response.Outcome != routeapi.MutationReady || result.Response.Route == nil {
+		return nil, errors.Join(err, errors.New("Route resume did not become READY"))
+	}
+	entry := &routeEntry{
+		Route: *result.Response.Route, Group: group, RouteKey: routeKey,
+		Revision: result.Response.RouteRevision, ServeIdentity: result.ServeIdentity,
+	}
+	if !r.control.CacheAuthorized(result.ServeIdentity) {
+		return nil, errors.New("Router Serve Permit changed before resumed Route cache install")
+	}
+	r.rememberRoute(entry)
+	return entry, nil
 }
 
 func parseDataHost(host, domain, explicitRouteKey string) (string, int, bool, error) {
@@ -747,6 +795,9 @@ func (r *Router) forwardData(w http.ResponseWriter, request *http.Request, entry
 	if response.StatusCode != http.StatusOK {
 		backend.Close()
 		kind := response.Header.Get(proxypkg.HeaderProxyError)
+		if kind != "" {
+			w.Header().Set(proxypkg.HeaderProxyError, kind)
+		}
 		if proxyErrorRequiresNewerRoute(kind) {
 			r.rejectStaleRoute(entry)
 			// Refresh the Route key under the new revision fence, but never replay

@@ -75,7 +75,7 @@ type Build struct {
 	Kind         Kind    // img (flatten only) | snp (boot+snapshot)
 	FromImage    string  // OCI base image (the Dockerfile FROM); mutually exclusive with FromTemplate
 	FromTemplate string  // base template ref (its snapshot cfg supplies the base image + start/ready defaults)
-	RegistryAuth string  // resolved registry pull creds (regcreds.Creds JSON; "" = anonymous), stored encrypted
+	RegistryAuth string  // Docker auths document ("" = anonymous), stored encrypted and resolved for FromImage at launch
 	StartCmd     string  // e2b only; non-empty => snapshot build (kind=snp)
 	ReadyCmd     string  // e2b only; readiness probe run after StartCmd (poll until exit 0)
 	Steps        []TemplateStep

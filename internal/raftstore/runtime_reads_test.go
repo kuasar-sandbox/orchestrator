@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/routeapi"
 	sm "github.com/lni/dragonboat/v4/statemachine"
 )
@@ -51,6 +52,30 @@ func TestRuntimeSetServingGatesUsesDedicatedWorkflow(t *testing.T) {
 	}
 }
 
+func TestLookupIdentityCoversLeaseAndRecoveryQueries(t *testing.T) {
+	identity := ShardRequestIdentity{
+		PermitIdentity: PermitIdentity{
+			ClusterID: "cluster", RegistryGeneration: "generation",
+			SystemEpoch: 2, RegistryLayoutDigest: "digest",
+		},
+		ShardID: 7,
+	}
+	for name, query := range map[string]DataLookup{
+		"lease bindings": {LeaseBindings: &LeaseBindingLookup{Identity: identity}},
+		"recovery":       {Recovery: &RecoveryLookup{Identity: identity}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			got, shardID, strong, err := lookupIdentity(query)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != identity || shardID != identity.ShardID || !strong {
+				t.Fatalf("lookup identity = %+v, shard=%d strong=%v", got, shardID, strong)
+			}
+		})
+	}
+}
+
 func TestRuntimeResolvesAmbiguousDataMutationByExactStrongRead(t *testing.T) {
 	registryLayout := testRegistryLayout(1, "generation-ambiguous")
 	identity := routeShardIdentity(t, registryLayout, "/g", "rk")
@@ -92,6 +117,224 @@ func TestRuntimeResolvesAmbiguousDataMutationByExactStrongRead(t *testing.T) {
 	if err != nil || !result.Applied || result.Revision != 2 {
 		t.Fatalf("resolved mutation = %+v, %v", result, err)
 	}
+}
+
+func TestRuntimeResolvesCommittedDataMutationAfterCallerCancellation(t *testing.T) {
+	registryLayout := testRegistryLayout(1, "generation-canceled-mutation")
+	identity := routeShardIdentity(t, registryLayout, "/g", "rk-canceled")
+	state := initializeDataShard(t, registryLayout, identity)
+	starting := routeStarting(t, registryLayout, "/g", "rk-canceled", "sandbox-canceled", 1, false)
+	command := DataCommand{
+		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{Absent: true}, Route: &starting,
+	}
+	caller, cancelCaller := context.WithCancel(context.Background())
+	host := newFakeNodeHost()
+	host.proposeCtx = func(_ context.Context, raw []byte) (sm.Result, error) {
+		committed, err := DecodeDataCommand(raw)
+		if err != nil {
+			return sm.Result{}, err
+		}
+		result := ApplyDataCommand(&state, 2, committed)
+		if !result.Applied {
+			t.Fatalf("mutation did not commit before cancellation: %+v", result)
+		}
+		cancelCaller()
+		return sm.Result{}, context.Canceled
+	}
+	host.readCtx = func(ctx context.Context, _ uint64, query any) (any, error) {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		return LookupDataMutation(state, query.(DataMutationLookup))
+	}
+	digest, _ := registryLayout.Digest()
+	runtime := &Runtime{
+		registryLayout: registryLayout, registryLayoutDigest: digest, nodeHost: host,
+		permitCache: NewPermitCache(time.Now), member: registryLayout.Members[0],
+		enrollment: LocalEnrollment{Replicas: []LocalReplicaEnrollment{{
+			ShardID: DataRaftShardID(identity.ShardID), ReplicaID: 1,
+			StartPlan: ReplicaInitial, LocalState: ReplicaActive,
+		}}},
+	}
+	if err := runtime.permitCache.Install(PermitGrant{
+		PermitIdentity: identity.PermitIdentity, CommitIndex: 1, MaxLifetimeMillis: 1_000,
+		ServeGate: true, WriteGate: true, CutoverGate: true, RecoveryClosed: true,
+	}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	result, err := runtime.ApplyData(caller, command)
+	if err != nil || !result.Applied || result.Revision != 2 {
+		t.Fatalf("canceled caller ambiguity resolution = %+v, %v", result, err)
+	}
+}
+
+func TestRuntimeResolvesCommittedGateUpdateAfterCallerCancellation(t *testing.T) {
+	registryLayout := testRegistryLayout(1, "generation-canceled-gates")
+	digest, _ := registryLayout.Digest()
+	state, _ := applySystem(t, SystemState{}, 1, SystemCommand{
+		Type: SystemBootstrap, RegistryLayout: &registryLayout, Digest: digest,
+	})
+	caller, cancelCaller := context.WithCancel(context.Background())
+	host := newFakeNodeHost()
+	host.proposeCtx = func(_ context.Context, raw []byte) (sm.Result, error) {
+		command, err := DecodeSystemCommand(raw)
+		if err != nil {
+			return sm.Result{}, err
+		}
+		var result SystemApplyResult
+		state, result = ApplySystemCommand(state, state.LastApplied+1, command)
+		if !result.Applied {
+			t.Fatalf("gate update did not commit: %+v", result)
+		}
+		cancelCaller()
+		return sm.Result{}, context.Canceled
+	}
+	host.readCtx = func(ctx context.Context, _ uint64, _ any) (any, error) {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		return state, nil
+	}
+	runtime := &Runtime{
+		registryLayout: registryLayout, registryLayoutDigest: digest, nodeHost: host,
+		permitCache: NewPermitCache(time.Now),
+		enrollment: LocalEnrollment{Replicas: []LocalReplicaEnrollment{{
+			ShardID: SystemRaftShardID, ReplicaID: 1, StartPlan: ReplicaInitial, LocalState: ReplicaActive,
+		}}},
+	}
+	opened, err := runtime.ConfigureServiceGates(caller, GateUpdate{Serve: true, Write: true, Cutover: true})
+	if err != nil || !opened.ServeGate || !opened.WriteGate || !opened.CutoverGate {
+		t.Fatalf("canceled gate ambiguity resolution = %+v, %v", opened, err)
+	}
+}
+
+func TestRuntimeRequiresTrustedProofWorkflowForExecutionTombstoneAndFence(t *testing.T) {
+	registryLayout := testRegistryLayout(1, "generation-terminal-proof")
+	identity := routeShardIdentity(t, registryLayout, "/g", "rk-terminal-proof")
+	state := initializeDataShard(t, registryLayout, identity)
+	starting := routeStarting(t, registryLayout, "/g", "rk-terminal-proof", "sandbox-terminal", 1, true)
+	applyDataOK(t, &state, 2, DataCommand{
+		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{Absent: true}, Route: &starting,
+	})
+	ready := readyRecord(starting, 1)
+	applyDataOK(t, &state, 3, DataCommand{
+		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{LogIndex: 2}, Route: &ready,
+	})
+	deleting := deletingRecord(ready)
+	applyDataOK(t, &state, 4, DataCommand{
+		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{LogIndex: 3}, Route: &deleting,
+	})
+	tombstone, fence := terminalRouteAndFence(deleting, 2)
+	runtime := runtimeWithDataState(t, registryLayout, identity, &state)
+	tombstoneCommand := DataCommand{
+		Type: DataPutRoute, Identity: identity,
+		Expect: RevisionExpectation{LogIndex: 4}, Route: &tombstone,
+	}
+	if _, err := runtime.ApplyData(context.Background(), tombstoneCommand); err == nil {
+		t.Fatal("generic Route mutation accepted an unverified execution tombstone")
+	}
+	if _, err := runtime.ApplyProvenExecutionMutation(context.Background(), tombstoneCommand); err == nil {
+		t.Fatal("dedicated tombstone workflow accepted no trusted verifier")
+	}
+	verified := 0
+	runtime.terminalVerifier = TerminalProofVerifierFunc(func(_ context.Context, request TerminalProofRequest) error {
+		verified++
+		if request.Tombstone.Proof.Kind != clusterstate.ProofNodeTerminal ||
+			request.CurrentRoute.Revision.LogIndex == 0 {
+			return errors.New("wrong proof source")
+		}
+		return nil
+	})
+	result, err := runtime.ApplyProvenExecutionMutation(context.Background(), tombstoneCommand)
+	if err != nil || !result.Applied || state.Routes[routeMapKey("/g", "rk-terminal-proof")].Tombstone == nil {
+		t.Fatalf("proven tombstone = %+v, %v", result, err)
+	}
+	fenceCommand := DataCommand{
+		Type: DataPutFence, Identity: identity,
+		Expect: RevisionExpectation{Absent: true}, Fence: &fence,
+	}
+	if _, err := runtime.ApplyData(context.Background(), fenceCommand); err == nil {
+		t.Fatal("generic data mutation accepted an execution fence")
+	}
+	result, err = runtime.ApplyProvenExecutionMutation(context.Background(), fenceCommand)
+	if err != nil || !result.Applied || len(state.Fences) != 1 || verified != 2 {
+		t.Fatalf("proven fence = %+v, verifier calls=%d, %v", result, verified, err)
+	}
+}
+
+func TestRuntimeRejectsTerminalMutationWhenTrustedSourceDisagrees(t *testing.T) {
+	registryLayout := testRegistryLayout(1, "generation-forged-terminal")
+	identity := routeShardIdentity(t, registryLayout, "/g", "rk-forged-terminal")
+	state := initializeDataShard(t, registryLayout, identity)
+	starting := routeStarting(t, registryLayout, "/g", "rk-forged-terminal", "sandbox-forged", 1, true)
+	applyDataOK(t, &state, 2, DataCommand{
+		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{Absent: true}, Route: &starting,
+	})
+	ready := readyRecord(starting, 1)
+	applyDataOK(t, &state, 3, DataCommand{
+		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{LogIndex: 2}, Route: &ready,
+	})
+	deleting := deletingRecord(ready)
+	applyDataOK(t, &state, 4, DataCommand{
+		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{LogIndex: 3}, Route: &deleting,
+	})
+	tombstone, _ := terminalRouteAndFence(deleting, 2)
+	runtime := runtimeWithDataState(t, registryLayout, identity, &state)
+	runtime.terminalVerifier = TerminalProofVerifierFunc(func(context.Context, TerminalProofRequest) error {
+		return errors.New("durable node event is absent")
+	})
+	_, err := runtime.ApplyProvenExecutionMutation(context.Background(), DataCommand{
+		Type: DataPutRoute, Identity: identity,
+		Expect: RevisionExpectation{LogIndex: 4}, Route: &tombstone,
+	})
+	if err == nil || state.Routes[routeMapKey("/g", "rk-forged-terminal")].State != clusterstate.WorkflowRouteDeleting {
+		t.Fatalf("forged terminal proof mutation error = %v", err)
+	}
+}
+
+func runtimeWithDataState(
+	t *testing.T,
+	registryLayout RegistryLayout,
+	identity ShardRequestIdentity,
+	state *DataState,
+) *Runtime {
+	t.Helper()
+	host := newFakeNodeHost()
+	host.read = func(_ uint64, query any) (any, error) {
+		switch value := query.(type) {
+		case DataLookup:
+			return LookupData(*state, value)
+		case DataMutationLookup:
+			return LookupDataMutation(*state, value)
+		default:
+			return nil, errors.New("unexpected data lookup")
+		}
+	}
+	host.propose = func(raw []byte) (sm.Result, error) {
+		command, err := DecodeDataCommand(raw)
+		if err != nil {
+			return sm.Result{}, err
+		}
+		result := ApplyDataCommand(state, state.LastApplied+1, command)
+		encoded, _ := json.Marshal(result)
+		return sm.Result{Data: encoded}, nil
+	}
+	digest, _ := registryLayout.Digest()
+	runtime := &Runtime{
+		registryLayout: registryLayout, registryLayoutDigest: digest, nodeHost: host,
+		permitCache: NewPermitCache(time.Now), member: registryLayout.Members[0],
+		enrollment: LocalEnrollment{Replicas: []LocalReplicaEnrollment{{
+			ShardID: DataRaftShardID(identity.ShardID), ReplicaID: registryLayout.DataShards[identity.ShardID].Replicas[0].ReplicaID,
+			StartPlan: ReplicaInitial, LocalState: ReplicaActive,
+		}}},
+	}
+	if err := runtime.permitCache.Install(PermitGrant{
+		PermitIdentity: identity.PermitIdentity, CommitIndex: 1, MaxLifetimeMillis: 1_000,
+		ServeGate: true, WriteGate: true, CutoverGate: true, RecoveryClosed: true,
+	}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	return runtime
 }
 
 func TestRuntimeLocalReadRequiresPermitAndReturnsLeaderHintNotFinalMiss(t *testing.T) {

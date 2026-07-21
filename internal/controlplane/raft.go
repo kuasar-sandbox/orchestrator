@@ -167,6 +167,40 @@ func (s *RaftStore) AuthorizeNodeSession(identity session.ServeIdentity, registr
 	return nil
 }
 
+func (s *RaftStore) AllowDirectoryEntry(entry session.DirectoryEntry) bool {
+	s.permitMu.RLock()
+	grant := s.permit
+	if grant != nil {
+		copy := *grant
+		grant = &copy
+	}
+	s.permitMu.RUnlock()
+	if grant == nil {
+		return false
+	}
+	reader, ok := s.runtime.(interface {
+		ReadSystemLocal() (raftstore.SystemState, error)
+	})
+	if !ok {
+		return false
+	}
+	state, err := reader.ReadSystemLocal()
+	if err != nil || state.LastApplied < grant.CommitIndex || state.Identity() != grant.PermitIdentity {
+		return false
+	}
+	enrollment, found := state.NodeEnrollments[entry.NodeID]
+	if !found || enrollment.Retired || enrollment.EnrollmentID != entry.EnrollmentID ||
+		enrollment.MaxNodeEpoch != entry.NodeEpoch {
+		return false
+	}
+	for _, member := range s.registryLayout.Members {
+		if member.MemberID == entry.HolderMemberID {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *RaftStore) AuthorizeEvent(identity session.ServeIdentity, acknowledge bool) error {
 	operation := raftstore.PermitHolderEvent
 	if acknowledge {
@@ -363,7 +397,7 @@ func (s *RaftStore) putRoute(
 	expect raftstore.RevisionExpectation,
 	next clusterstate.RouteWorkflowRecord,
 ) (clusterstate.RouteWorkflowRecord, error) {
-	result, err := s.runtime.ApplyData(ctx, raftstore.DataCommand{
+	result, err := s.applyDataCommand(ctx, raftstore.DataCommand{
 		Type: raftstore.DataPutRoute, Identity: identity, Expect: expect, Route: &next,
 	})
 	if err != nil {
@@ -475,7 +509,7 @@ func (s *RaftStore) EnsureExecutionFence(ctx context.Context, fence clusterstate
 	if err != nil {
 		return err
 	}
-	result, err := s.runtime.ApplyData(ctx, raftstore.DataCommand{
+	result, err := s.applyDataCommand(ctx, raftstore.DataCommand{
 		Type: raftstore.DataPutFence, Identity: identity,
 		Expect: raftstore.RevisionExpectation{Absent: true}, Fence: &fence,
 	})
@@ -579,6 +613,28 @@ func (s *RaftStore) PendingWorkflows(ctx context.Context, shardID uint32, after 
 	return *result.Pending, nil
 }
 
+func (s *RaftStore) LeaseBindings(
+	ctx context.Context,
+	shardID uint32,
+	after string,
+	limit uint32,
+) (raftstore.LeaseBindingLookupResult, error) {
+	identity, err := s.shardIdentity(shardID)
+	if err != nil {
+		return raftstore.LeaseBindingLookupResult{}, err
+	}
+	result, err := s.runtime.ReadData(ctx, raftstore.DataLookup{LeaseBindings: &raftstore.LeaseBindingLookup{
+		Identity: identity, AfterKey: after, Limit: limit,
+	}})
+	if err != nil {
+		return raftstore.LeaseBindingLookupResult{}, err
+	}
+	if result.LeaseBindings == nil {
+		return raftstore.LeaseBindingLookupResult{}, errors.New("controlplane: missing lease-Binding result")
+	}
+	return *result.LeaseBindings, nil
+}
+
 func (s *RaftStore) CompactExecutionFence(
 	ctx context.Context,
 	fence clusterstate.ExecutionFence,
@@ -631,6 +687,16 @@ func (s *RaftStore) AdvanceRecovery(ctx context.Context, from, to raftstore.Reco
 		return raftstore.SystemState{}, errors.New("controlplane: consensus runtime has no recovery workflow")
 	}
 	return runtime.AdvanceRecovery(ctx, from, to)
+}
+
+func (s *RaftStore) ConfirmRecoveryPermitDrain(ctx context.Context) (raftstore.SystemState, error) {
+	runtime, ok := s.runtime.(interface {
+		ConfirmRecoveryPermitDrain(context.Context) (raftstore.SystemState, error)
+	})
+	if !ok {
+		return raftstore.SystemState{}, errors.New("controlplane: consensus runtime has no recovery-drain workflow")
+	}
+	return runtime.ConfirmRecoveryPermitDrain(ctx)
 }
 
 func (s *RaftStore) SetServingGates(ctx context.Context, gates raftstore.GateUpdate) (raftstore.SystemState, error) {
@@ -717,6 +783,8 @@ func (s *RaftStore) ReadRouteBucket(
 	ctx context.Context,
 	group string,
 	bucket uint32,
+	afterRouteKey string,
+	limit uint32,
 	strong bool,
 ) (raftstore.RouteBucketResult, error) {
 	if bucket >= s.registryLayout.RouteBucketCount {
@@ -731,7 +799,8 @@ func (s *RaftStore) ReadRouteBucket(
 		return raftstore.RouteBucketResult{}, err
 	}
 	result, err := s.runtime.ReadData(ctx, raftstore.DataLookup{RouteBucket: &raftstore.RouteBucketLookup{
-		Identity: identity, Group: group, Bucket: bucket, Strong: strong,
+		Identity: identity, Group: group, Bucket: bucket,
+		AfterRouteKey: afterRouteKey, Limit: limit, Strong: strong,
 	}})
 	if err != nil {
 		return raftstore.RouteBucketResult{}, err

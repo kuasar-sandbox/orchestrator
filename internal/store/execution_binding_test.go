@@ -90,8 +90,12 @@ func TestCASExecutionBindingAtomicallyRebindsWorkflowOutbox(t *testing.T) {
 	default:
 		t.Fatal("initial event did not wake replay")
 	}
+	before, err := st.GetNodeWorkflow(ctx, clusterstate.ExecutionKindSandbox, dispatch.ObjectID)
+	if err != nil || before == nil || before.EventSeq == 0 {
+		t.Fatalf("workflow before rebind = %+v, %v", before, err)
+	}
 	if err := st.AckExecutionEvent(ctx, "node-1", 7, routesync.EventAck{
-		ObjectKind: "sandbox", ObjectID: dispatch.ObjectID, EventSeq: 1,
+		ObjectKind: "sandbox", ObjectID: dispatch.ObjectID, EventSeq: before.EventSeq,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -125,8 +129,15 @@ func TestCASExecutionBindingAtomicallyRebindsWorkflowOutbox(t *testing.T) {
 	}
 	if workflow.OpaqueBinding != replacement || workflow.BindingDigest != replacementDigest ||
 		workflow.LatestEvent == nil || workflow.LatestEvent.RegistryGeneration != "generation-2" ||
-		workflow.LatestEvent.BindingDigest != replacementDigest || workflow.AckedEventSeq != 0 {
+		workflow.LatestEvent.BindingDigest != replacementDigest || workflow.EventSeq != before.EventSeq+1 ||
+		workflow.LatestEvent.EventSeq != workflow.EventSeq || workflow.AckedEventSeq != before.EventSeq {
 		t.Fatalf("rebound workflow = %+v", workflow)
+	}
+	// A delayed ACK for the pre-rebind payload cannot acknowledge the rebound fact.
+	if err := st.AckExecutionEvent(ctx, "node-1", 7, routesync.EventAck{
+		ObjectKind: "sandbox", ObjectID: dispatch.ObjectID, EventSeq: before.EventSeq,
+	}); err != nil {
+		t.Fatal(err)
 	}
 	pending, _, err := st.PendingExecutionEvents(ctx, "node-1", 7, routesync.EventCursor{}, 10, 1<<20)
 	if err != nil || len(pending) != 1 || pending[0].ObjectID != dispatch.ObjectID ||

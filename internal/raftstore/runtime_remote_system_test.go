@@ -41,6 +41,10 @@ func (c *testRemoteSystemClient) BeginRecovery(context.Context) (SystemState, er
 	return SystemState{}, errors.New("unused")
 }
 
+func (c *testRemoteSystemClient) ConfirmRecoveryPermitDrain(context.Context) (SystemState, error) {
+	return SystemState{}, errors.New("unused")
+}
+
 func (c *testRemoteSystemClient) AdvanceRecovery(context.Context, RecoveryPhase, RecoveryPhase) (SystemState, error) {
 	return SystemState{}, errors.New("unused")
 }

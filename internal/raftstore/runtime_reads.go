@@ -13,7 +13,8 @@ func (r *Runtime) ApplySystem(ctx context.Context, command SystemCommand) (Syste
 		command.Type == SystemAdvanceTransition || command.Type == SystemActivateTransition ||
 		command.Type == SystemConfirmTransitionDrain || command.Type == SystemFinalizeTransition ||
 		command.Type == SystemCloseRegistryGeneration || command.Type == SystemSetGates ||
-		command.Type == SystemBeginRecovery || command.Type == SystemAdvanceRecovery {
+		command.Type == SystemBeginRecovery || command.Type == SystemConfirmRecoveryDrain ||
+		command.Type == SystemAdvanceRecovery {
 		return SystemApplyResult{}, errors.New("raftstore: System lifecycle command requires its dedicated workflow")
 	}
 	if command.Type == SystemBeginTransition {
@@ -23,6 +24,13 @@ func (r *Runtime) ApplySystem(ctx context.Context, command SystemCommand) (Syste
 		}
 	}
 	return r.proposeSystem(ctx, command)
+}
+
+// ConfigureServiceGates is the only public workflow for changing normal
+// serving gates. It resolves ambiguous proposals by a quorum read and never
+// exposes the raw SystemSetGates command through ApplySystem.
+func (r *Runtime) ConfigureServiceGates(ctx context.Context, gates GateUpdate) (SystemState, error) {
+	return r.SetServingGates(ctx, gates)
 }
 
 // CloseRegistryGeneration permanently retires this Registry History Generation and commits the
@@ -78,7 +86,9 @@ func (r *Runtime) CloseRegistryGeneration(ctx context.Context, successor Registr
 			Kind:                             RolloverConsensusClosure,
 		},
 	})
-	current, readErr := r.ReadSystemStrong(ctx)
+	resolveContext, cancelResolve := ambiguityResolutionContext(ctx)
+	defer cancelResolve()
+	current, readErr := r.ReadSystemStrong(resolveContext)
 	if readErr == nil && current.Retired && current.Closure != nil &&
 		current.Closure.TargetRegistryGeneration == successor.RegistryGeneration &&
 		current.Closure.TargetRegistryLayoutIntentDigest == intentDigest {
@@ -169,20 +179,23 @@ func (r *Runtime) ConfirmPredecessorPermitDrain(ctx context.Context, evidenceDig
 		PredecessorProofDigest: state.PredecessorProofDigest,
 		WaitedMillis:           elapsedMillis, EvidenceDigest: evidenceDigest,
 	}})
+	resolveContext, cancelResolve := ambiguityResolutionContext(ctx)
+	defer cancelResolve()
+	confirmed, readErr := r.ReadSystemStrong(resolveContext)
+	if readErr == nil && confirmed.PredecessorDrainComplete &&
+		confirmed.PredecessorProofDigest == state.PredecessorProofDigest {
+		return confirmed, nil
+	}
 	if err != nil {
 		return SystemState{}, err
 	}
 	if result.Conflict || !result.Applied {
 		return SystemState{}, errors.New(result.Reason)
 	}
-	confirmed, err := r.ReadSystemStrong(ctx)
-	if err != nil {
-		return SystemState{}, err
+	if readErr != nil {
+		return SystemState{}, readErr
 	}
-	if !confirmed.PredecessorDrainComplete {
-		return SystemState{}, errors.New("raftstore: predecessor drain was not committed")
-	}
-	return confirmed, nil
+	return SystemState{}, errors.New("raftstore: predecessor drain was not committed")
 }
 
 func (r *Runtime) ReadData(ctx context.Context, query DataLookup) (DataLookupResult, error) {
@@ -192,17 +205,17 @@ func (r *Runtime) ReadData(ctx context.Context, query DataLookup) (DataLookupRes
 	if err := query.Validate(); err != nil {
 		return DataLookupResult{}, err
 	}
-	identity, logicalShardID, strong := lookupIdentity(query)
+	identity, logicalShardID, strong, err := lookupIdentity(query)
+	if err != nil {
+		return DataLookupResult{}, err
+	}
 	if err := r.authorizeLocalDataReplica(identity); err != nil {
 		return DataLookupResult{}, err
 	}
 	if err := r.permitCache.Authorize(identity.PermitIdentity, PermitRegistryRead); err != nil {
 		return DataLookupResult{}, err
 	}
-	var (
-		value any
-		err   error
-	)
+	var value any
 	if strong {
 		value, err = r.syncRead(ctx, DataRaftShardID(logicalShardID), query)
 	} else {
@@ -257,22 +270,28 @@ func (r *Runtime) authorizeLocalDataReplica(identity ShardRequestIdentity) error
 	return nil
 }
 
-func lookupIdentity(query DataLookup) (ShardRequestIdentity, uint32, bool) {
+func lookupIdentity(query DataLookup) (ShardRequestIdentity, uint32, bool, error) {
 	switch {
 	case query.Route != nil:
-		return shardIdentityFromRoute(query.Route.RequestIdentity), query.Route.ShardID, query.Route.Strong
+		return shardIdentityFromRoute(query.Route.RequestIdentity), query.Route.ShardID, query.Route.Strong, nil
 	case query.Build != nil:
-		return shardIdentityFromRoute(query.Build.RequestIdentity), query.Build.ShardID, query.Build.Strong
+		return shardIdentityFromRoute(query.Build.RequestIdentity), query.Build.ShardID, query.Build.Strong, nil
 	case query.Workflow != nil:
-		return query.Workflow.Identity, query.Workflow.Identity.ShardID, true
+		return query.Workflow.Identity, query.Workflow.Identity.ShardID, true, nil
 	case query.RouteBucket != nil:
-		return query.RouteBucket.Identity, query.RouteBucket.Identity.ShardID, query.RouteBucket.Strong
+		return query.RouteBucket.Identity, query.RouteBucket.Identity.ShardID, query.RouteBucket.Strong, nil
 	case query.Changefeed != nil:
-		return query.Changefeed.Identity, query.Changefeed.Identity.ShardID, query.Changefeed.Strong
+		return query.Changefeed.Identity, query.Changefeed.Identity.ShardID, query.Changefeed.Strong, nil
+	case query.Pending != nil:
+		return query.Pending.Identity, query.Pending.Identity.ShardID, true, nil
+	case query.LeaseBindings != nil:
+		return query.LeaseBindings.Identity, query.LeaseBindings.Identity.ShardID, true, nil
 	case query.Fence != nil:
-		return query.Fence.Identity, query.Fence.Identity.ShardID, true
+		return query.Fence.Identity, query.Fence.Identity.ShardID, true, nil
+	case query.Recovery != nil:
+		return query.Recovery.Identity, query.Recovery.Identity.ShardID, true, nil
 	default:
-		return query.Pending.Identity, query.Pending.Identity.ShardID, true
+		return ShardRequestIdentity{}, 0, false, errors.New("raftstore: data lookup identity is unavailable")
 	}
 }
 

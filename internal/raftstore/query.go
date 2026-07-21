@@ -9,14 +9,15 @@ import (
 )
 
 type DataLookup struct {
-	Route       *routeapi.ReadRouteRequest `json:"route,omitempty"`
-	Build       *routeapi.ReadBuildRequest `json:"build,omitempty"`
-	Workflow    *WorkflowLookup            `json:"workflow,omitempty"`
-	RouteBucket *RouteBucketLookup         `json:"route_bucket,omitempty"`
-	Changefeed  *RouteChangefeedLookup     `json:"changefeed,omitempty"`
-	Pending     *PendingLookup             `json:"pending,omitempty"`
-	Fence       *FenceLookup               `json:"fence,omitempty"`
-	Recovery    *RecoveryLookup            `json:"recovery,omitempty"`
+	Route         *routeapi.ReadRouteRequest `json:"route,omitempty"`
+	Build         *routeapi.ReadBuildRequest `json:"build,omitempty"`
+	Workflow      *WorkflowLookup            `json:"workflow,omitempty"`
+	RouteBucket   *RouteBucketLookup         `json:"route_bucket,omitempty"`
+	Changefeed    *RouteChangefeedLookup     `json:"changefeed,omitempty"`
+	Pending       *PendingLookup             `json:"pending,omitempty"`
+	LeaseBindings *LeaseBindingLookup        `json:"lease_bindings,omitempty"`
+	Fence         *FenceLookup               `json:"fence,omitempty"`
+	Recovery      *RecoveryLookup            `json:"recovery,omitempty"`
 }
 
 func (q DataLookup) Validate() error {
@@ -57,6 +58,12 @@ func (q DataLookup) Validate() error {
 			return err
 		}
 	}
+	if q.LeaseBindings != nil {
+		present++
+		if err := q.LeaseBindings.Validate(); err != nil {
+			return err
+		}
+	}
 	if q.Fence != nil {
 		present++
 		if err := q.Fence.Validate(); err != nil {
@@ -76,14 +83,15 @@ func (q DataLookup) Validate() error {
 }
 
 type DataLookupResult struct {
-	Route       *routeapi.ReadRouteResponse `json:"route,omitempty"`
-	Build       *routeapi.ReadBuildResponse `json:"build,omitempty"`
-	Workflow    *WorkflowLookupResult       `json:"workflow,omitempty"`
-	RouteBucket *RouteBucketResult          `json:"route_bucket,omitempty"`
-	Changefeed  *RouteChangefeedResult      `json:"changefeed,omitempty"`
-	Pending     *PendingLookupResult        `json:"pending,omitempty"`
-	Fence       *FenceLookupResult          `json:"fence,omitempty"`
-	Recovery    *RecoveryLookupResult       `json:"recovery,omitempty"`
+	Route         *routeapi.ReadRouteResponse `json:"route,omitempty"`
+	Build         *routeapi.ReadBuildResponse `json:"build,omitempty"`
+	Workflow      *WorkflowLookupResult       `json:"workflow,omitempty"`
+	RouteBucket   *RouteBucketResult          `json:"route_bucket,omitempty"`
+	Changefeed    *RouteChangefeedResult      `json:"changefeed,omitempty"`
+	Pending       *PendingLookupResult        `json:"pending,omitempty"`
+	LeaseBindings *LeaseBindingLookupResult   `json:"lease_bindings,omitempty"`
+	Fence         *FenceLookupResult          `json:"fence,omitempty"`
+	Recovery      *RecoveryLookupResult       `json:"recovery,omitempty"`
 }
 
 func LookupData(state DataState, query DataLookup) (DataLookupResult, error) {
@@ -112,9 +120,12 @@ func LookupData(state DataState, query DataLookup) (DataLookupResult, error) {
 	case query.Recovery != nil:
 		response := lookupRecovery(state, *query.Recovery)
 		return DataLookupResult{Recovery: &response}, nil
-	default:
+	case query.Pending != nil:
 		response := lookupPending(state, *query.Pending)
 		return DataLookupResult{Pending: &response}, nil
+	default:
+		response, err := lookupLeaseBindings(state, *query.LeaseBindings)
+		return DataLookupResult{LeaseBindings: &response}, err
 	}
 }
 
@@ -167,9 +178,8 @@ func lookupRecovery(state DataState, query RecoveryLookup) RecoveryLookupResult 
 	return result
 }
 
-// WorkflowLookup is the leader/coordinator view of one full workflow record.
-// It is deliberately separate from Router reads, which expose only safe
-// positive forwarding projections.
+// WorkflowLookup is the leader/coordinator view of one complete workflow.
+// Router reads remain a separate API that exposes only safe projections.
 type WorkflowLookup struct {
 	Identity ShardRequestIdentity `json:"identity"`
 	Group    string               `json:"group"`
@@ -226,30 +236,194 @@ func lookupWorkflow(state DataState, query WorkflowLookup) WorkflowLookupResult 
 	return WorkflowLookupResult{Available: true, Build: &copy}
 }
 
-type RouteBucketLookup struct {
+type LeaseBindingLookup struct {
 	Identity ShardRequestIdentity `json:"identity"`
-	Group    string               `json:"group"`
-	Bucket   uint32               `json:"bucket"`
-	Strong   bool                 `json:"strong,omitempty"`
+	AfterKey string               `json:"after_key,omitempty"`
+	Limit    uint32               `json:"limit"`
+}
+
+func (q LeaseBindingLookup) Validate() error {
+	if err := q.Identity.Validate(); err != nil {
+		return err
+	}
+	if q.Limit == 0 || q.Limit > 4096 {
+		return errors.New("raftstore: lease Binding lookup limit must be between 1 and 4096")
+	}
+	return nil
+}
+
+// LeaseBinding is the non-secret projection needed to refresh a node-local
+// key lease. Provider-owned key material never enters consensus state.
+type LeaseBinding struct {
+	Key                    string `json:"key"`
+	Group                  string `json:"group"`
+	NodeID                 string `json:"node_id"`
+	NodeEpoch              uint64 `json:"node_epoch"`
+	DataEndpoint           string `json:"data_endpoint"`
+	RegistryGeneration     string `json:"registry_generation"`
+	AuthKeyFingerprint     string `json:"auth_key_fingerprint"`
+	ManifestKeyFingerprint string `json:"manifest_key_fingerprint"`
+}
+
+type LeaseBindingLookupResult struct {
+	Bindings []LeaseBinding `json:"bindings"`
+	NextKey  string         `json:"next_key,omitempty"`
+}
+
+func lookupLeaseBindings(state DataState, query LeaseBindingLookup) (LeaseBindingLookupResult, error) {
+	if !state.Accepts(query.Identity) {
+		return LeaseBindingLookupResult{}, nil
+	}
+	bindings := make([]LeaseBinding, 0)
+	for key, record := range state.Builds {
+		qualified := "b" + key
+		if qualified <= query.AfterKey {
+			continue
+		}
+		binding, active, err := buildLeaseBinding(record)
+		if err != nil {
+			return LeaseBindingLookupResult{}, err
+		}
+		if active {
+			binding.Key = qualified
+			bindings = append(bindings, binding)
+		}
+	}
+	for key, record := range state.Routes {
+		qualified := "r" + key
+		if qualified <= query.AfterKey {
+			continue
+		}
+		binding, active, err := routeLeaseBinding(record)
+		if err != nil {
+			return LeaseBindingLookupResult{}, err
+		}
+		if active {
+			binding.Key = qualified
+			bindings = append(bindings, binding)
+		}
+	}
+	sort.Slice(bindings, func(i, j int) bool { return bindings[i].Key < bindings[j].Key })
+	hasMore := len(bindings) > int(query.Limit)
+	if hasMore {
+		bindings = bindings[:query.Limit]
+	}
+	result := LeaseBindingLookupResult{Bindings: bindings}
+	if hasMore {
+		result.NextKey = bindings[len(bindings)-1].Key
+	}
+	return result, nil
+}
+
+func routeLeaseBinding(record clusterstate.RouteWorkflowRecord) (LeaseBinding, bool, error) {
+	var (
+		nodeID, dataEndpoint, registryGeneration string
+		nodeEpoch                                uint64
+		intent                                   clusterstate.DispatchIntent
+	)
+	switch record.State {
+	case clusterstate.WorkflowRouteStarting:
+		if record.Starting == nil || record.Starting.Binding == nil {
+			return LeaseBinding{}, false, nil
+		}
+		binding := record.Starting.Binding
+		nodeID, nodeEpoch, dataEndpoint = binding.NodeID, binding.NodeEpoch, binding.DataEndpoint
+		registryGeneration, intent = binding.RegistryGeneration, record.Starting.Intent
+	case clusterstate.WorkflowRouteReady:
+		nodeID, nodeEpoch, dataEndpoint = record.Ready.NodeID, record.Ready.NodeEpoch, record.Ready.DataEndpoint
+		registryGeneration, intent = record.Ready.RegistryGeneration, record.Ready.Intent
+	case clusterstate.WorkflowRoutePaused:
+		execution := record.Paused.Execution
+		nodeID, nodeEpoch, dataEndpoint = execution.NodeID, execution.NodeEpoch, execution.DataEndpoint
+		registryGeneration, intent = execution.RegistryGeneration, execution.Intent
+	case clusterstate.WorkflowRouteResuming:
+		execution := record.Resuming.Execution
+		nodeID, nodeEpoch, dataEndpoint = execution.NodeID, execution.NodeEpoch, execution.DataEndpoint
+		registryGeneration, intent = execution.RegistryGeneration, execution.Intent
+	case clusterstate.WorkflowRouteDeleting:
+		execution := record.Deleting.Execution
+		nodeID, nodeEpoch, dataEndpoint = execution.NodeID, execution.NodeEpoch, execution.DataEndpoint
+		registryGeneration, intent = execution.RegistryGeneration, execution.Intent
+	default:
+		return LeaseBinding{}, false, nil
+	}
+	spec, err := clusterstate.ParseSandboxDispatchSpec(intent.DispatchSpec)
+	if err != nil {
+		return LeaseBinding{}, false, err
+	}
+	return LeaseBinding{
+		Group: record.Group, NodeID: nodeID, NodeEpoch: nodeEpoch, DataEndpoint: dataEndpoint,
+		RegistryGeneration: registryGeneration, AuthKeyFingerprint: spec.AuthKeyFingerprint,
+		ManifestKeyFingerprint: spec.ManifestKeyFingerprint,
+	}, true, nil
+}
+
+func buildLeaseBinding(record clusterstate.BuildRecord) (LeaseBinding, bool, error) {
+	var (
+		nodeID, dataEndpoint, registryGeneration string
+		nodeEpoch                                uint64
+		intent                                   clusterstate.DispatchIntent
+	)
+	switch record.State {
+	case clusterstate.BuildStarting:
+		if record.Starting == nil || record.Starting.Binding == nil {
+			return LeaseBinding{}, false, nil
+		}
+		binding := record.Starting.Binding
+		nodeID, nodeEpoch, dataEndpoint = binding.NodeID, binding.NodeEpoch, binding.DataEndpoint
+		registryGeneration, intent = binding.RegistryGeneration, record.Starting.Intent
+	case clusterstate.BuildRegistered:
+		projection := record.Projection
+		nodeID, nodeEpoch, dataEndpoint = projection.NodeID, projection.NodeEpoch, projection.DataEndpoint
+		registryGeneration, intent = projection.RegistryGeneration, projection.Intent
+	default:
+		return LeaseBinding{}, false, nil
+	}
+	spec, err := clusterstate.ParseBuildDispatchSpec(intent.DispatchSpec)
+	if err != nil {
+		return LeaseBinding{}, false, err
+	}
+	return LeaseBinding{
+		Group: record.Group, NodeID: nodeID, NodeEpoch: nodeEpoch, DataEndpoint: dataEndpoint,
+		RegistryGeneration: registryGeneration, AuthKeyFingerprint: spec.AuthKeyFingerprint,
+		ManifestKeyFingerprint: spec.ManifestKeyFingerprint,
+	}, true, nil
+}
+
+type RouteBucketLookup struct {
+	Identity      ShardRequestIdentity `json:"identity"`
+	Group         string               `json:"group"`
+	Bucket        uint32               `json:"bucket"`
+	AfterRouteKey string               `json:"after_route_key,omitempty"`
+	Limit         uint32               `json:"limit"`
+	Strong        bool                 `json:"strong,omitempty"`
 }
 
 func (q RouteBucketLookup) Validate() error {
 	if err := q.Identity.Validate(); err != nil {
 		return err
 	}
-	if q.Group == "" {
-		return errors.New("raftstore: Route bucket lookup requires a group")
+	if q.Group == "" || q.Limit == 0 || q.Limit > 4096 {
+		return errors.New("raftstore: Route bucket lookup requires a group and a limit between 1 and 4096")
 	}
 	return nil
 }
 
+type RouteBucketEntry struct {
+	RouteKey    string                          `json:"route_key"`
+	State       clusterstate.RouteWorkflowState `json:"state"`
+	NodeID      string                          `json:"node_id"`
+	TemplateRef string                          `json:"template_ref"`
+}
+
 type RouteBucketResult struct {
-	Available        bool                               `json:"available"`
-	Reason           string                             `json:"reason,omitempty"`
-	Group            string                             `json:"group"`
-	Bucket           uint32                             `json:"bucket"`
-	SnapshotRevision uint64                             `json:"snapshot_revision"`
-	Routes           []clusterstate.RouteWorkflowRecord `json:"routes"`
+	Available        bool               `json:"available"`
+	Reason           string             `json:"reason,omitempty"`
+	Group            string             `json:"group"`
+	Bucket           uint32             `json:"bucket"`
+	SnapshotRevision uint64             `json:"snapshot_revision"`
+	Routes           []RouteBucketEntry `json:"routes"`
+	NextRouteKey     string             `json:"next_route_key,omitempty"`
 }
 
 func lookupRouteBucket(state DataState, query RouteBucketLookup) RouteBucketResult {
@@ -264,22 +438,49 @@ func lookupRouteBucket(state DataState, query RouteBucketLookup) RouteBucketResu
 	}
 	result.Available = true
 	result.SnapshotRevision = state.LastApplied
-	result.Routes = make([]clusterstate.RouteWorkflowRecord, 0)
+	result.Routes = make([]RouteBucketEntry, 0)
 	for _, record := range state.Routes {
-		if record.Group != query.Group {
+		if record.Group != query.Group || record.RouteKey <= query.AfterRouteKey {
 			continue
 		}
 		bucket, _, err := clusterstate.RouteShardFor(
 			record.Group, record.RouteKey, state.RouteBucketCount, state.VirtualShardCount,
 		)
 		if err == nil && bucket == query.Bucket {
-			result.Routes = append(result.Routes, cloneRouteRecord(record))
+			if entry, listed := routeBucketEntry(record); listed {
+				result.Routes = append(result.Routes, entry)
+			}
 		}
 	}
 	sort.Slice(result.Routes, func(left, right int) bool {
 		return result.Routes[left].RouteKey < result.Routes[right].RouteKey
 	})
+	if len(result.Routes) > int(query.Limit) {
+		result.Routes = result.Routes[:query.Limit]
+		result.NextRouteKey = result.Routes[len(result.Routes)-1].RouteKey
+	}
 	return result
+}
+
+func routeBucketEntry(record clusterstate.RouteWorkflowRecord) (RouteBucketEntry, bool) {
+	var execution *clusterstate.ReadyRoute
+	switch record.State {
+	case clusterstate.WorkflowRouteReady:
+		execution = record.Ready
+	case clusterstate.WorkflowRoutePaused:
+		if record.Paused != nil {
+			execution = &record.Paused.Execution
+		}
+	default:
+		return RouteBucketEntry{}, false
+	}
+	if execution == nil {
+		return RouteBucketEntry{}, false
+	}
+	return RouteBucketEntry{
+		RouteKey: record.RouteKey, State: record.State,
+		NodeID: execution.NodeID, TemplateRef: execution.TemplateRef,
+	}, true
 }
 
 type RouteChangefeedLookup struct {

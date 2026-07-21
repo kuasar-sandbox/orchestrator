@@ -73,6 +73,13 @@ func (m *memoryConsensus) ApplyData(_ context.Context, command raftstore.DataCom
 	return raftstore.ApplyDataCommand(state, index, command), nil
 }
 
+func (m *memoryConsensus) ApplyProvenExecutionMutation(
+	ctx context.Context,
+	command raftstore.DataCommand,
+) (raftstore.DataApplyResult, error) {
+	return m.ApplyData(ctx, command)
+}
+
 func (m *memoryConsensus) ReadData(_ context.Context, query raftstore.DataLookup) (raftstore.DataLookupResult, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -139,6 +146,8 @@ func lookupIdentity(query raftstore.DataLookup) (raftstore.ShardRequestIdentity,
 		return query.Fence.Identity, nil
 	case query.Pending != nil:
 		return query.Pending.Identity, nil
+	case query.LeaseBindings != nil:
+		return query.LeaseBindings.Identity, nil
 	case query.RouteBucket != nil:
 		return query.RouteBucket.Identity, nil
 	case query.Changefeed != nil:
@@ -155,6 +164,8 @@ func lookupIdentity(query raftstore.DataLookup) (raftstore.ShardRequestIdentity,
 			ClusterID: identity.ClusterID, RegistryGeneration: identity.RegistryGeneration,
 			SystemEpoch: identity.SystemEpoch, RegistryLayoutDigest: identity.RegistryLayoutDigest,
 		}, ShardID: identity.ShardID}, nil
+	case query.Recovery != nil:
+		return query.Recovery.Identity, nil
 	default:
 		return raftstore.ShardRequestIdentity{}, errors.New("memory consensus: unsupported lookup")
 	}

@@ -12,13 +12,11 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 )
 
-func TestFinalPlanSupportsReferencedAuthKeyAndMintsIndependentCapability(t *testing.T) {
+func TestFinalPlanMintsIndependentCapabilityAndPreservesRequest(t *testing.T) {
 	templateRef := "e2b-img-" + strings.Repeat("c", 64)
 	provider := keyLeaseProvider{
-		group: clusterstate.SandboxGroup{Group: "/group", TemplateRef: templateRef},
-		auth: clusterstate.Secret{
-			Type: clusterstate.SecretRef, Value: "provider://auth/group", Fingerprint: strings.Repeat("a", 24),
-		},
+		group:    clusterstate.SandboxGroup{Group: "/group", TemplateRef: templateRef},
+		auth:     clusterstate.Secret{Type: clusterstate.SecretInline, Value: strings.Repeat("a", 64)},
 		manifest: clusterstate.Secret{Type: clusterstate.SecretInline, Value: strings.Repeat("b", 64)},
 	}
 	service, err := NewFinalService(provider, clustercfg.PlacementConfig{})
@@ -34,7 +32,9 @@ func TestFinalPlanSupportsReferencedAuthKeyAndMintsIndependentCapability(t *test
 	}
 	request := PlanRequest{
 		Kind: PlanSandbox, Group: "/group", RouteKey: "route-1",
-		Nodes: []placement.CatalogNode{{NodeID: "node-1", SandboxSlotCapacity: 1}},
+		Nodes: []placement.CatalogNode{{
+			NodeID: "node-1", SandboxSlotCapacity: 1, Capabilities: map[string]bool{"sandbox": true},
+		}},
 		Sandbox: &SandboxPlanInput{
 			SandboxID: "sandbox-1", Demand: placement.SandboxDemand{SlotUnits: 1}, Request: envelope,
 		},
@@ -55,17 +55,20 @@ func TestFinalPlanSupportsReferencedAuthKeyAndMintsIndependentCapability(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	if firstSpec.AuthKeyFingerprint != provider.auth.Fingerprint || len(firstSpec.AccessToken) != 64 ||
+	lease, err := ResolveNodeKeyLease(context.Background(), provider, "/group", 1234)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstSpec.AuthKeyFingerprint != lease.AuthKey.Fingerprint || len(firstSpec.AccessToken) != 64 ||
 		firstSpec.AccessToken == secondSpec.AccessToken || firstSpec.Request.RawQuery != envelope.RawQuery ||
 		firstSpec.Request.Header["X-Future"][0] != "kept" {
-		t.Fatalf("referenced-key plan = %+v; second capability = %q", firstSpec, secondSpec.AccessToken)
+		t.Fatalf("plan = %+v; second capability = %q", firstSpec, secondSpec.AccessToken)
 	}
 	if firstSpec.AccessToken == provider.auth.Value || firstSpec.AccessToken == provider.manifest.Value {
 		t.Fatal("data-plane capability reused key material")
 	}
-	if lease, err := ResolveNodeKeyLease(context.Background(), provider, "/group", 1234); err != nil ||
-		lease.AuthKey.Type != routesync.KeyMaterialRef {
-		t.Fatalf("referenced node lease = %+v, %v", lease, err)
+	if lease.AuthKey.Type != routesync.KeyMaterialInline {
+		t.Fatalf("node lease = %+v", lease)
 	}
 }
 

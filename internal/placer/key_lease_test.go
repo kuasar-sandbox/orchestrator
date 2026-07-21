@@ -34,7 +34,7 @@ func (p keyLeaseProvider) GetAuthKey(context.Context, string) (clusterstate.Secr
 func TestResolveNodeKeyLeaseBuildsCompleteSeparateBundle(t *testing.T) {
 	provider := keyLeaseProvider{
 		group: clusterstate.SandboxGroup{
-			Group: "/group", RegistryAuth: clusterstate.Secret{Type: clusterstate.SecretRef, Value: "provider://registry/group"},
+			Group: "/group", RegistryAuth: clusterstate.Secret{Type: clusterstate.SecretInline, Value: "registry-json"},
 		},
 		auth:     clusterstate.Secret{Type: clusterstate.SecretInline, Value: strings.Repeat("a", 64)},
 		manifest: clusterstate.Secret{Type: clusterstate.SecretInline, Value: strings.Repeat("b", 64)},
@@ -43,11 +43,30 @@ func TestResolveNodeKeyLeaseBuildsCompleteSeparateBundle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if lease.AuthKey.Fingerprint == lease.ManifestKey.Fingerprint || lease.RegistryAuth.Ref == "" || lease.ExpiresUnix != 1234 {
+	if lease.AuthKey.Fingerprint == lease.ManifestKey.Fingerprint || lease.RegistryAuth.Value != "registry-json" ||
+		lease.RegistryAuth.Type != routesync.KeyMaterialInline || lease.ExpiresUnix != 1234 {
 		t.Fatalf("incomplete key lease: %+v", lease)
 	}
 	if lease.AuthKey.Type != routesync.KeyMaterialInline || lease.ManifestKey.Type != routesync.KeyMaterialInline {
 		t.Fatalf("unexpected key material: %+v", lease)
+	}
+}
+
+func TestResolveNodeKeyLeaseRejectsUnmaterializedReferences(t *testing.T) {
+	provider := keyLeaseProvider{
+		group: clusterstate.SandboxGroup{Group: "/group"},
+		auth: clusterstate.Secret{
+			Type: clusterstate.SecretRef, Value: "provider://auth/group", Fingerprint: strings.Repeat("a", 24),
+		},
+		manifest: clusterstate.Secret{Type: clusterstate.SecretInline, Value: strings.Repeat("b", 64)},
+	}
+	if _, err := ResolveNodeKeyLease(context.Background(), provider, "/group", 1234); err == nil {
+		t.Fatal("unmaterialized AuthKey reference accepted")
+	}
+	provider.auth = clusterstate.Secret{Type: clusterstate.SecretInline, Value: strings.Repeat("a", 64)}
+	provider.group.RegistryAuth = clusterstate.Secret{Type: clusterstate.SecretRef, Value: "provider://registry/group"}
+	if _, err := ResolveNodeKeyLease(context.Background(), provider, "/group", 1234); err == nil {
+		t.Fatal("unmaterialized registry credential reference accepted")
 	}
 }
 

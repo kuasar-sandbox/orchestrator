@@ -33,6 +33,11 @@ func (d keyLeaseDispatcher) AdmitAndDispatch(
 	if err != nil {
 		return session.DispatchReply{}, err
 	}
+	if err := lease.Validate(); err != nil || lease.Group != ref.Group ||
+		lease.AuthKey.Fingerprint != ref.AuthKeyFingerprint ||
+		lease.ManifestKey.Fingerprint != ref.ManifestKeyFingerprint {
+		return session.DispatchReply{}, errors.New("controlplane: Provider returned a mismatched key lease")
+	}
 	if lease.ExpiresUnix <= time.Now().Unix() {
 		return session.DispatchReply{}, errors.New("controlplane: Provider returned an expired key lease")
 	}

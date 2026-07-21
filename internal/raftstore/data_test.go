@@ -171,6 +171,91 @@ func TestBuildStartingCommitsDefinitiveCandidateRejection(t *testing.T) {
 	})
 }
 
+func TestBoundStartingExecutionCannotBecomePlacementFailureWithoutRejections(t *testing.T) {
+	registryLayout := testRegistryLayout(4, "generation-1")
+	state, identity := initializedRouteShard(t, registryLayout, "/g", "rk-bound")
+	bound := routeStarting(t, registryLayout, "/g", "rk-bound", "sandbox-bound", 1, true)
+	applyDataOK(t, &state, 2, DataCommand{
+		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{Absent: true}, Route: &bound,
+	})
+
+	failure := clusterstate.RouteWorkflowRecord{
+		Group: bound.Group, RouteKey: bound.RouteKey, State: clusterstate.WorkflowRouteTombstone,
+		Tombstone: &clusterstate.RouteTombstoneState{PlacementFailure: &clusterstate.RoutePlacementFailureState{
+			SandboxID: bound.Starting.SandboxID, PlacementRound: bound.Starting.PlacementRound,
+			CandidatePool: bound.Starting.CandidatePool, DefinitivelyRejected: []uint32{0, 1},
+			Intent: bound.Starting.Intent, Reason: "placement exhausted",
+		}},
+	}
+	result := ApplyDataCommand(&state, 3, DataCommand{
+		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{LogIndex: 2}, Route: &failure,
+	})
+	if !result.Conflict {
+		t.Fatal("bound execution was converted to a placement-failure tombstone")
+	}
+}
+
+func TestRegistryResumeUsesCommittedPausedIntent(t *testing.T) {
+	registryLayout := testRegistryLayout(4, "generation-1")
+	state, identity := initializedRouteShard(t, registryLayout, "/g", "rk-resume")
+	starting := routeStarting(t, registryLayout, "/g", "rk-resume", "sandbox-resume", 1, true)
+	applyDataOK(t, &state, 2, DataCommand{
+		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{Absent: true}, Route: &starting,
+	})
+	ready := readyRecord(starting, 1)
+	applyDataOK(t, &state, 3, DataCommand{
+		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{LogIndex: 2}, Route: &ready,
+	})
+	paused := pausedRecord(ready, 2)
+	applyDataOK(t, &state, 4, DataCommand{
+		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{LogIndex: 3}, Route: &paused,
+	})
+
+	resuming := clusterstate.RouteWorkflowRecord{
+		Group: paused.Group, RouteKey: paused.RouteKey, State: clusterstate.WorkflowRouteResuming,
+		Resuming: &clusterstate.ResumingRouteState{
+			Execution: paused.Paused.Execution,
+			Intent:    paused.Paused.ResumeIntent,
+		},
+	}
+	resuming.Resuming.Intent.ProviderPolicyVersion = "substituted-policy"
+	result := ApplyDataCommand(&state, 5, DataCommand{
+		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{LogIndex: 4}, Route: &resuming,
+	})
+	if !result.Conflict {
+		t.Fatal("PAUSED resume intent was replaced during RESUMING transition")
+	}
+	resuming.Resuming.Intent = paused.Paused.ResumeIntent
+	applyDataOK(t, &state, 6, DataCommand{
+		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{LogIndex: 4}, Route: &resuming,
+	})
+}
+
+func TestCallerCannotPrecompactExecutionTombstone(t *testing.T) {
+	registryLayout := testRegistryLayout(4, "generation-1")
+	state, identity := initializedRouteShard(t, registryLayout, "/g", "rk-precompact")
+	starting := routeStarting(t, registryLayout, "/g", "rk-precompact", "sandbox-precompact", 1, true)
+	applyDataOK(t, &state, 2, DataCommand{
+		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{Absent: true}, Route: &starting,
+	})
+	ready := readyRecord(starting, 1)
+	applyDataOK(t, &state, 3, DataCommand{
+		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{LogIndex: 2}, Route: &ready,
+	})
+	deleting := deletingRecord(ready)
+	applyDataOK(t, &state, 4, DataCommand{
+		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{LogIndex: 3}, Route: &deleting,
+	})
+	tombstone, _ := terminalRouteAndFence(deleting, 2)
+	tombstone.Tombstone.FenceCompacted = true
+	result := ApplyDataCommand(&state, 5, DataCommand{
+		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{LogIndex: 4}, Route: &tombstone,
+	})
+	if !result.Conflict {
+		t.Fatal("caller-created execution tombstone bypassed fence compaction")
+	}
+}
+
 func TestRouteAutoResumeReplacementAndFenceCompaction(t *testing.T) {
 	registryLayout := testRegistryLayout(4, "generation-1")
 	state, identity := initializedRouteShard(t, registryLayout, "/g", "rk")
@@ -615,7 +700,7 @@ func testBuildDispatchIntent(t *testing.T) clusterstate.DispatchIntent {
 		Version: clusterstate.DispatchSpecVersionV1, TemplateID: "template-1",
 		AuthKeyFingerprint: strings.Repeat("b", 24), ManifestKeyFingerprint: strings.Repeat("c", 24),
 		Profile: types.ProfileBare, CPUCount: 1, MemoryMB: 512,
-		Request: clusterstate.NodeRequestEnvelopeV1{Version: clusterstate.NodeRequestEnvelopeVersionV1, Method: "POST", Path: "/v3/templates", Body: []byte("{}")},
+		Request: clusterstate.NodeRequestEnvelopeV1{Version: clusterstate.NodeRequestEnvelopeVersionV1, Method: "POST", Path: "/v3/templates", Body: []byte(`{"cpuCount":1,"memoryMB":512}`)},
 	})
 	if err != nil {
 		t.Fatal(err)

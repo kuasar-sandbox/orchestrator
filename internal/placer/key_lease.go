@@ -90,12 +90,9 @@ func nodeKeyMaterial(name string, secret clusterstate.Secret) (routesync.NodeKey
 			Type: routesync.KeyMaterialInline, Value: secret.Value, Fingerprint: fingerprint,
 		}, nil
 	case clusterstate.SecretRef:
-		if secret.Value == "" || !validSecretFingerprint(secret.Fingerprint) {
-			return routesync.NodeKeyMaterialV1{}, fmt.Errorf("placer: referenced %s requires a value and 24-character fingerprint", name)
-		}
-		return routesync.NodeKeyMaterialV1{
-			Type: routesync.KeyMaterialRef, Ref: secret.Value, Fingerprint: secret.Fingerprint,
-		}, nil
+		return routesync.NodeKeyMaterialV1{}, fmt.Errorf(
+			"placer: referenced %s is not supported without a configured Provider materializer", name,
+		)
 	default:
 		return routesync.NodeKeyMaterialV1{}, fmt.Errorf("placer: unsupported %s secret type %q", name, keyType)
 	}
@@ -116,16 +113,10 @@ func nodeRegistryAuth(secret clusterstate.Secret) (routesync.NodeRegistryAuthV1,
 		}
 		return routesync.NodeRegistryAuthV1{Type: routesync.KeyMaterialInline, Value: secret.Value}, nil
 	case clusterstate.SecretRef:
-		if secret.Value == "" {
-			return routesync.NodeRegistryAuthV1{}, errors.New("placer: registry auth reference is empty")
-		}
-		return routesync.NodeRegistryAuthV1{Type: routesync.KeyMaterialRef, Ref: secret.Value}, nil
+		return routesync.NodeRegistryAuthV1{}, errors.New(
+			"placer: referenced registry auth is not supported without a configured Provider materializer",
+		)
 	default:
 		return routesync.NodeRegistryAuthV1{}, fmt.Errorf("placer: unsupported registry auth type %q", keyType)
 	}
-}
-
-func validSecretFingerprint(value string) bool {
-	raw, err := hex.DecodeString(value)
-	return err == nil && len(raw) == 12 && hex.EncodeToString(raw) == value
 }

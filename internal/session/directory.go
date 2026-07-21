@@ -32,14 +32,16 @@ func (t Tuple) Compare(other Tuple) int {
 }
 
 type DirectoryEntry struct {
-	NodeID string `json:"node_id"`
+	NodeID       string `json:"node_id"`
+	EnrollmentID string `json:"enrollment_id"`
 	Tuple
 	HolderMemberID string `json:"holder_member_id"`
 }
 
 type DirectoryDelta struct {
-	Entry DirectoryEntry `json:"entry"`
-	Up    bool           `json:"up"`
+	Entry   DirectoryEntry `json:"entry"`
+	Up      bool           `json:"up"`
+	Retired bool           `json:"retired,omitempty"`
 }
 
 type DirectoryRecord struct {
@@ -51,16 +53,24 @@ type DirectoryRecord struct {
 // Directory stores only node-to-Holder routing hints and tuple high watermarks.
 // It deliberately has no capacity, liveness, or placement-load fields.
 type Directory struct {
-	mu      sync.RWMutex
-	records map[string]DirectoryRecord
+	mu        sync.RWMutex
+	records   map[string]DirectoryRecord
+	authority DirectoryIdentityAuthority
 }
 
-func NewDirectory() *Directory {
-	return &Directory{records: make(map[string]DirectoryRecord)}
+// DirectoryIdentityAuthority is the permanent System Group enrollment fence.
+// Directory hints can be collected after retirement because every later delta
+// is checked against this authority before it can be installed again.
+type DirectoryIdentityAuthority interface {
+	AllowDirectoryEntry(DirectoryEntry) bool
+}
+
+func NewDirectory(authority DirectoryIdentityAuthority) *Directory {
+	return &Directory{records: make(map[string]DirectoryRecord), authority: authority}
 }
 
 func validDirectoryEntry(entry DirectoryEntry) bool {
-	return entry.NodeID != "" && entry.Tuple.Valid() && entry.HolderMemberID != ""
+	return entry.NodeID != "" && entry.EnrollmentID != "" && entry.Tuple.Valid() && entry.HolderMemberID != ""
 }
 
 func canonicalHolder(first, second string) string {
@@ -75,9 +85,26 @@ func (d *Directory) Apply(delta DirectoryDelta) bool {
 	if !validDirectoryEntry(entry) {
 		return false
 	}
+	if delta.Up && delta.Retired {
+		return false
+	}
+	allowed := !delta.Retired && d.authority != nil && d.authority.AllowDirectoryEntry(entry)
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	current, found := d.records[entry.NodeID]
+	if delta.Retired {
+		if !found || current.Entry.EnrollmentID != entry.EnrollmentID || current.Entry.NodeEpoch > entry.NodeEpoch {
+			return false
+		}
+		delete(d.records, entry.NodeID)
+		return true
+	}
+	if !allowed {
+		if found && current.Entry.EnrollmentID == entry.EnrollmentID && current.Entry.NodeEpoch <= entry.NodeEpoch {
+			delete(d.records, entry.NodeID)
+		}
+		return false
+	}
 	if !found || entry.Tuple.Compare(current.Entry.Tuple) > 0 {
 		d.records[entry.NodeID] = DirectoryRecord{Entry: entry, Available: delta.Up}
 		return true
@@ -86,10 +113,11 @@ func (d *Directory) Apply(delta DirectoryDelta) bool {
 	if comparison < 0 {
 		return false
 	}
-	if entry.HolderMemberID != current.Entry.HolderMemberID {
+	if entry.EnrollmentID != current.Entry.EnrollmentID || entry.HolderMemberID != current.Entry.HolderMemberID {
 		canonical := canonicalHolder(current.Entry.HolderMemberID, entry.HolderMemberID)
 		changed := !current.Conflict || current.Available || current.Entry.HolderMemberID != canonical
 		current.Entry.HolderMemberID = canonical
+		current.Entry.EnrollmentID = canonicalHolder(current.Entry.EnrollmentID, entry.EnrollmentID)
 		current.Conflict = true
 		current.Available = false
 		d.records[entry.NodeID] = current
@@ -104,27 +132,8 @@ func (d *Directory) Apply(delta DirectoryDelta) bool {
 	return false
 }
 
-func (d *Directory) MarkMemberUnavailable(memberID string) int {
-	if memberID == "" {
-		return 0
-	}
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	changed := 0
-	for nodeID, record := range d.records {
-		if record.Entry.HolderMemberID == memberID && record.Available {
-			record.Available = false
-			d.records[nodeID] = record
-			changed++
-		}
-	}
-	return changed
-}
-
 func (d *Directory) Lookup(nodeID string) (DirectoryEntry, bool) {
-	d.mu.RLock()
-	defer d.mu.RUnlock()
-	record, found := d.records[nodeID]
+	record, found := d.lookupRecord(nodeID)
 	return record.Entry, found && record.Available && !record.Conflict
 }
 
@@ -132,18 +141,21 @@ func (d *Directory) Lookup(nodeID string) (DirectoryEntry, bool) {
 // is unavailable. Dispatch uses it to distinguish movement from a permanently
 // fenced older NodeEpoch.
 func (d *Directory) LookupRecord(nodeID string) (DirectoryRecord, bool) {
-	d.mu.RLock()
-	defer d.mu.RUnlock()
-	record, found := d.records[nodeID]
-	return record, found
+	return d.lookupRecord(nodeID)
 }
 
 func (d *Directory) Snapshot() []DirectoryRecord {
 	d.mu.RLock()
-	defer d.mu.RUnlock()
-	out := make([]DirectoryRecord, 0, len(d.records))
-	for _, record := range d.records {
-		out = append(out, record)
+	nodeIDs := make([]string, 0, len(d.records))
+	for nodeID := range d.records {
+		nodeIDs = append(nodeIDs, nodeID)
+	}
+	d.mu.RUnlock()
+	out := make([]DirectoryRecord, 0, len(nodeIDs))
+	for _, nodeID := range nodeIDs {
+		if record, found := d.lookupRecord(nodeID); found {
+			out = append(out, record)
+		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Entry.NodeID < out[j].Entry.NodeID })
 	return out
@@ -163,8 +175,11 @@ func (d *Directory) MergeFull(records []DirectoryRecord) int {
 			current, found := d.records[record.Entry.NodeID]
 			if found && current.Entry.Tuple.Compare(record.Entry.Tuple) == 0 {
 				canonical := canonicalHolder(current.Entry.HolderMemberID, record.Entry.HolderMemberID)
-				wasChanged := !current.Conflict || current.Available || current.Entry.HolderMemberID != canonical
+				canonicalEnrollment := canonicalHolder(current.Entry.EnrollmentID, record.Entry.EnrollmentID)
+				wasChanged := !current.Conflict || current.Available ||
+					current.Entry.HolderMemberID != canonical || current.Entry.EnrollmentID != canonicalEnrollment
 				current.Entry.HolderMemberID = canonical
+				current.Entry.EnrollmentID = canonicalEnrollment
 				current.Conflict = true
 				current.Available = false
 				d.records[record.Entry.NodeID] = current
@@ -182,9 +197,10 @@ func DirectoryDigest(records []DirectoryRecord) [sha256.Size]byte {
 	records = append([]DirectoryRecord(nil), records...)
 	sort.Slice(records, func(i, j int) bool { return records[i].Entry.NodeID < records[j].Entry.NodeID })
 	var input bytes.Buffer
-	input.WriteString("kuasar-session-directory-v1")
+	input.WriteString("kuasar-session-directory-v2")
 	for _, record := range records {
 		writeDirectoryString(&input, record.Entry.NodeID)
+		writeDirectoryString(&input, record.Entry.EnrollmentID)
 		var number [8]byte
 		binary.BigEndian.PutUint64(number[:], record.Entry.NodeEpoch)
 		input.Write(number[:])
@@ -203,6 +219,24 @@ func DirectoryDigest(records []DirectoryRecord) [sha256.Size]byte {
 		}
 	}
 	return sha256.Sum256(input.Bytes())
+}
+
+func (d *Directory) lookupRecord(nodeID string) (DirectoryRecord, bool) {
+	d.mu.RLock()
+	record, found := d.records[nodeID]
+	d.mu.RUnlock()
+	if !found {
+		return DirectoryRecord{}, false
+	}
+	if d.authority != nil && d.authority.AllowDirectoryEntry(record.Entry) {
+		return record, true
+	}
+	d.mu.Lock()
+	if current, ok := d.records[nodeID]; ok && current.Entry == record.Entry {
+		delete(d.records, nodeID)
+	}
+	d.mu.Unlock()
+	return DirectoryRecord{}, false
 }
 
 func writeDirectoryString(buffer *bytes.Buffer, value string) {

@@ -239,6 +239,12 @@ func (s *FinalService) Plan(ctx context.Context, request PlanRequest) (PlanRespo
 		Selectors: hint.NodeSelectors, ExcludedNodeIDs: stringSet(request.ExcludedNodeIDs),
 		TargetRuntimeDigest: request.TargetRuntimeDigest,
 	}
+	switch request.Kind {
+	case PlanSandbox:
+		policy.RequiredCapabilities = []string{"sandbox"}
+	case PlanBuild:
+		policy.RequiredCapabilities = []string{"build"}
+	}
 	if selectors, ok := effectiveCatalogSelectors(request.Group, request.Nodes, hint.NodeSelectors, s.config.ShuffleSharding); ok {
 		policy.Selectors = selectors
 	}
@@ -389,53 +395,76 @@ func effectiveCatalogSelectors(
 	selectors []map[string]string,
 	rules []clustercfg.ShuffleRule,
 ) ([]map[string]string, bool) {
+	base := selectors
+	if len(base) == 0 {
+		base = []map[string]string{{}}
+	}
 	for _, rule := range rules {
 		if rule.ShardBy == "" || rule.N <= 0 {
 			continue
 		}
-		seen := make(map[string]struct{})
-		values := make([]string, 0)
-		for _, node := range nodes {
-			if !catalogLabelsContain(node.Labels, rule.Selector) {
+		result := make([]map[string]string, 0)
+		for baseIndex, selector := range base {
+			predicate, compatible := mergeCatalogSelector(selector, rule.Selector)
+			if !compatible {
 				continue
 			}
-			value := node.Labels[rule.ShardBy]
-			if value == "" {
-				continue
-			}
-			if _, exists := seen[value]; exists {
-				continue
-			}
-			seen[value] = struct{}{}
-			values = append(values, value)
-		}
-		if len(values) == 0 {
-			continue
-		}
-		sort.Strings(values)
-		count := min(rule.N, len(values))
-		slots, err := maglev.LocateN([]byte(group), values, count)
-		if err != nil {
-			continue
-		}
-		base := selectors
-		if len(base) == 0 {
-			base = []map[string]string{{}}
-		}
-		result := make([]map[string]string, 0, len(slots)*len(base))
-		for _, slot := range slots {
-			for _, selector := range base {
-				combined := make(map[string]string, len(selector)+1)
-				for key, value := range selector {
-					combined[key] = value
+			seen := make(map[string]struct{})
+			values := make([]string, 0)
+			for _, node := range nodes {
+				if !catalogLabelsContain(node.Labels, predicate) {
+					continue
 				}
+				value := node.Labels[rule.ShardBy]
+				if value == "" {
+					continue
+				}
+				if _, exists := seen[value]; exists {
+					continue
+				}
+				seen[value] = struct{}{}
+				values = append(values, value)
+			}
+			if len(values) == 0 {
+				continue
+			}
+			sort.Strings(values)
+			count := min(rule.N, len(values))
+			key := []byte(fmt.Sprintf("%s\x00%d", group, baseIndex))
+			slots, err := maglev.LocateN(key, values, count)
+			if err != nil {
+				continue
+			}
+			for _, slot := range slots {
+				combined := cloneSelector(predicate)
 				combined[rule.ShardBy] = slot
 				result = append(result, combined)
 			}
 		}
-		return result, true
+		if len(result) != 0 {
+			return result, true
+		}
 	}
 	return nil, false
+}
+
+func mergeCatalogSelector(left, right map[string]string) (map[string]string, bool) {
+	merged := cloneSelector(left)
+	for key, value := range right {
+		if current, found := merged[key]; found && current != value {
+			return nil, false
+		}
+		merged[key] = value
+	}
+	return merged, true
+}
+
+func cloneSelector(source map[string]string) map[string]string {
+	result := make(map[string]string, len(source)+1)
+	for key, value := range source {
+		result[key] = value
+	}
+	return result
 }
 
 func catalogLabelsContain(labels, wanted map[string]string) bool {

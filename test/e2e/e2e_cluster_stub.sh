@@ -970,7 +970,7 @@ old_binding_code="$(curl -sS --noproxy '*' --max-time 3 -o "$WORK/old-binding.bo
     -H 'E2b-Sandbox-Port: 49983' \
     -H "X-Kuasar-Node-Id: $SOURCE_NODE" \
     -H "X-Kuasar-Node-Epoch: $SOURCE_EPOCH" \
-    -H "X-Kuasar-Storage-Generation: $SOURCE_GENERATION" \
+    -H "X-Kuasar-Registry-Generation: $SOURCE_GENERATION" \
     -H "X-Kuasar-Binding-Digest: $SOURCE_DIGEST" \
     -H "X-Access-Token: $SOURCE_TOKEN" \
     "https://$SOURCE_DATA/" 2>/dev/null || true)"

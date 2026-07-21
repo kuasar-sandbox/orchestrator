@@ -36,7 +36,7 @@ type Dispatcher interface {
 }
 
 type SandboxRoundSource interface {
-	NextSandboxRound(context.Context, string, string, uint64, cluster.DispatchIntent) (SandboxRound, error)
+	NextSandboxRound(context.Context, string, string, uint64, cluster.DispatchIntent, []string) (SandboxRound, error)
 }
 
 type SandboxRound struct {
@@ -199,6 +199,17 @@ func (c *StartingCoordinator) RunRoute(ctx context.Context, record cluster.Route
 			return RunResult{}, selectErr
 		}
 		if !found {
+			rejected, changed := appendProbeRejections(starting.DefinitivelyRejected, starting.CandidatePool, cache)
+			if changed {
+				next := record
+				next.Starting = cloneRouteStarting(starting)
+				next.Starting.DefinitivelyRejected = rejected
+				record, err = c.commitRoute(ctx, record.Revision, next)
+				if err != nil {
+					return RunResult{}, err
+				}
+				continue
+			}
 			return RunResult{Status: RunNoUsableProbe, Reason: "no candidate pair has a current usable Probe", Route: &record}, nil
 		}
 		binding, bindErr := makeBinding(c.identity.RegistryGeneration, cluster.ExecutionKindSandbox, record.Group, record.RouteKey, starting.SandboxID, starting.Intent, probe.Response)
@@ -238,7 +249,7 @@ func (c *StartingCoordinator) StartRouteAfterPlacementFailure(
 	failure := record.Tombstone.PlacementFailure
 	nextRound := failure.PlacementRound + 1
 	round, err := c.rounds.NextSandboxRound(
-		ctx, record.Group, record.RouteKey, nextRound, cloneIntent(failure.Intent),
+		ctx, record.Group, record.RouteKey, nextRound, cloneIntent(failure.Intent), candidateNodeIDs(failure.CandidatePool),
 	)
 	if err != nil {
 		return cluster.RouteWorkflowRecord{}, err
@@ -260,6 +271,16 @@ func (c *StartingCoordinator) StartRouteAfterPlacementFailure(
 		},
 	}
 	return c.commitRoute(ctx, record.Revision, next)
+}
+
+func candidateNodeIDs(candidates []cluster.PlacementCandidate) []string {
+	result := make([]string, 0, len(candidates))
+	for _, candidate := range candidates {
+		if candidate.NodeID != "" {
+			result = append(result, candidate.NodeID)
+		}
+	}
+	return result
 }
 
 func (c *StartingCoordinator) ensurePlacementFence(ctx context.Context, record cluster.RouteWorkflowRecord) error {
@@ -360,6 +381,17 @@ func (c *StartingCoordinator) RunBuild(ctx context.Context, record cluster.Build
 			return RunResult{}, selectErr
 		}
 		if !found {
+			rejected, changed := appendProbeRejections(starting.DefinitivelyRejected, starting.CandidatePool, cache)
+			if changed {
+				next := record
+				next.Starting = cloneBuildStarting(starting)
+				next.Starting.DefinitivelyRejected = rejected
+				record, err = c.commitBuild(ctx, record.Revision, next)
+				if err != nil {
+					return RunResult{}, err
+				}
+				continue
+			}
 			return RunResult{Status: RunNoUsableProbe, Reason: "no candidate pair has a current usable Probe", Build: &record}, nil
 		}
 		binding, bindErr := makeBinding(c.identity.RegistryGeneration, cluster.ExecutionKindBuild, record.Group, "", starting.BuildID, starting.Intent, probe.Response)
@@ -642,6 +674,27 @@ func appendRejected(rejected []uint32, index uint32) []uint32 {
 	}
 	out := append([]uint32(nil), rejected...)
 	return append(out, index)
+}
+
+func appendProbeRejections(
+	rejected []uint32,
+	candidates []cluster.PlacementCandidate,
+	cache map[uint32]cachedProbe,
+) ([]uint32, bool) {
+	result := append([]uint32(nil), rejected...)
+	changed := false
+	for index := range candidates {
+		cached, found := cache[uint32(index)]
+		if !found || cached.result.Response.Class != placement.ProbeReject {
+			continue
+		}
+		next := appendRejected(result, uint32(index))
+		if len(next) != len(result) {
+			changed = true
+		}
+		result = next
+	}
+	return result, changed
 }
 
 func cloneRouteStarting(source *cluster.RouteStartingState) *cluster.RouteStartingState {

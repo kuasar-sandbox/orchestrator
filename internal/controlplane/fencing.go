@@ -112,6 +112,9 @@ func (s *RaftStore) FenceRouteExecution(
 		Group: record.Group, RouteKey: record.RouteKey, State: clusterstate.WorkflowRouteTombstone,
 		Tombstone: &tombstone,
 	}
+	if proof.Kind == clusterstate.ProofExternalFence {
+		ctx = withTerminalProofAuthorization(ctx, record.Revision, next)
+	}
 	committed, err := s.CommitRouteWorkflow(ctx, record.Revision, next)
 	if err != nil {
 		return clusterstate.RouteWorkflowRecord{}, err

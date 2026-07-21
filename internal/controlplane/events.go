@@ -164,7 +164,7 @@ func (c *EventConverger) convergeSandbox(
 			if err != nil {
 				return err
 			}
-			committed, err := c.store.CommitRouteWorkflow(ctx, record.Revision, next)
+			committed, err := c.store.CommitNodeTerminalRoute(ctx, record.Revision, next, event)
 			if err != nil {
 				if errors.Is(err, ErrRevisionConflict) {
 					continue

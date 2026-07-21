@@ -24,9 +24,6 @@ func newLaunchRateLimiter(totalRate, totalBurst, members int) *launchRateLimiter
 		members = 1
 	}
 	burst := float64(totalBurst) / float64(members)
-	if burst < 1 {
-		burst = 1
-	}
 	now := time.Now
 	return &launchRateLimiter{
 		rate: float64(totalRate) / float64(members), burst: burst, tokens: burst, last: now(), now: now,

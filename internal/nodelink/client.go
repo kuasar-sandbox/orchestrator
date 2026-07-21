@@ -506,6 +506,8 @@ func runNodeLinkOutbox(
 	}
 }
 
+const durableReplayBatchesBeforeWrap = 16
+
 func runDurableEventReplay(
 	ctx context.Context,
 	durable DurableEventOutbox,
@@ -528,6 +530,7 @@ func runDurableEventReplay(
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	var cursor routesync.EventCursor
+	batchesSinceWrap := 0
 	for {
 		events, next, err := durable.PendingExecutionEvents(ctx, nodeID, nodeEpoch, cursor, batch, bytes)
 		if err != nil && ctx.Err() == nil {
@@ -536,8 +539,16 @@ func runDurableEventReplay(
 		if err == nil {
 			if len(events) == 0 && (cursor.ObjectKind != "" || cursor.ObjectID != "") {
 				cursor = routesync.EventCursor{}
+				batchesSinceWrap = 0
 			} else {
 				cursor = next
+				if len(events) > 0 {
+					batchesSinceWrap++
+					if batchesSinceWrap >= durableReplayBatchesBeforeWrap {
+						cursor = routesync.EventCursor{}
+						batchesSinceWrap = 0
+					}
+				}
 			}
 		}
 		for i := range events {

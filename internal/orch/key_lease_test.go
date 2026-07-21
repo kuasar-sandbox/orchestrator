@@ -73,6 +73,33 @@ func TestClusterKeyLeaseRejectsExpiredInput(t *testing.T) {
 	}
 }
 
+func TestClusterKeyLeaseRejectsMalformedRegistryAuth(t *testing.T) {
+	o := testOrch(t)
+	node := keyLeaseTestNode(o)
+	authKey := strings.Repeat("a", 64)
+	manifestKey := strings.Repeat("b", 64)
+	authFP, _ := store.AuthKeyHash(authKey)
+	manifestFP, _ := store.ManifestKeyHash(manifestKey)
+	lease := routesync.NodeKeyLeaseV1{
+		Version: routesync.NodeKeyLeaseVersionV1, Group: "/g",
+		AuthKey:     routesync.NodeKeyMaterialV1{Type: routesync.KeyMaterialInline, Value: authKey, Fingerprint: authFP},
+		ManifestKey: routesync.NodeKeyMaterialV1{Type: routesync.KeyMaterialInline, Value: manifestKey, Fingerprint: manifestFP},
+		RegistryAuth: routesync.NodeRegistryAuthV1{
+			Type: routesync.KeyMaterialInline, Value: `{"not_auths":true}`,
+		},
+		ExpiresUnix: time.Now().Add(time.Hour).Unix(),
+	}
+	ack := node.HandleCommand(context.Background(), &routesync.Command{
+		CmdID: "bad-auth", Kind: routesync.CmdKeyPut, NodeEpoch: 7, SessionSeq: 1, KeyLease: &lease,
+	})
+	if ack.Status != routesync.AckRejected {
+		t.Fatalf("malformed registry auth ack = %+v", ack)
+	}
+	if _, found, err := o.st.KeyLeaseByFingerprints(context.Background(), "/g", authFP, manifestFP); err != nil || found {
+		t.Fatalf("malformed registry auth lease found=%t err=%v", found, err)
+	}
+}
+
 func keyLeaseTestNode(o *Orchestrator) *FinalClusterNode {
 	ready := make(chan struct{})
 	close(ready)

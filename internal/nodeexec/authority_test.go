@@ -23,12 +23,14 @@ import (
 )
 
 type sandboxAdmissionFake struct {
-	prepared  map[string]nodectl.PreparedAdmissionResult
-	promoted  []nodectl.PreparedAdmissionResult
-	released  []string
-	finalized []string
-	prepares  int
-	wake      chan struct{}
+	prepared   map[string]nodectl.PreparedAdmissionResult
+	promoted   []nodectl.PreparedAdmissionResult
+	released   []string
+	finalized  []string
+	prepares   int
+	prepareErr error
+	promoteErr error
+	wake       chan struct{}
 }
 
 func (f *sandboxAdmissionFake) GetAdmission(id, _ string) (nodectl.PreparedAdmissionResult, error) {
@@ -48,7 +50,7 @@ func (f *sandboxAdmissionFake) PrepareAdmission(
 	if !ok {
 		return nodectl.PreparedAdmissionResult{}, errors.New("unexpected Sandbox Admission")
 	}
-	return result, nil
+	return result, f.prepareErr
 }
 
 func (f *sandboxAdmissionFake) ClaimAdmission(id, _ string) (nodectl.PreparedAdmissionResult, error) {
@@ -77,7 +79,7 @@ func (f *sandboxAdmissionFake) PromoteQueued() ([]nodectl.PreparedAdmissionResul
 	for _, result := range f.promoted {
 		f.prepared[result.SandboxID] = result
 	}
-	return append([]nodectl.PreparedAdmissionResult(nil), f.promoted...), nil
+	return append([]nodectl.PreparedAdmissionResult(nil), f.promoted...), f.promoteErr
 }
 
 func (f *sandboxAdmissionFake) Wake() <-chan struct{} { return f.wake }
@@ -519,6 +521,107 @@ func TestAuthoritySandboxQueuePromotionClaimFailureAndOriginalRetry(t *testing.T
 	pending, _, err := st.PendingExecutionEvents(context.Background(), "node-1", 7, routesync.EventCursor{}, 10, 1<<20)
 	if err != nil || len(pending) != 1 || pending[0].State != "ERROR" || pending[0].Reason != "launch_failed" {
 		t.Fatalf("pending failure = %+v, %v", pending, err)
+	}
+}
+
+func TestAuthorityJournalsPublishedAdmissionAndPromotionBeforeReturningFlushError(t *testing.T) {
+	ctx := context.Background()
+	published := &nodectl.PublishedFlushError{Err: errors.New("injected parent fsync failure")}
+
+	t.Run("prepare", func(t *testing.T) {
+		st := authorityStore(t)
+		command := authorityCommand(t, clusterstate.ExecutionKindSandbox, "sandbox-published-prepare")
+		sandbox := &sandboxAdmissionFake{
+			prepared: map[string]nodectl.PreparedAdmissionResult{
+				command.ObjectID: {
+					SandboxID: command.ObjectID, DemandDigest: command.Intent.DemandDigest,
+					State: nodectl.PreparedAdmitted, ReservationToken: "token-published",
+				},
+			},
+			prepareErr: published,
+			wake:       make(chan struct{}),
+		}
+		authority := newAuthority(t, st, sandbox)
+		if _, err := authority.AdmitAndDispatch(ctx, command); !nodectl.FlushPublished(err) {
+			t.Fatalf("published prepare error = %v", err)
+		}
+		record, err := st.GetNodeWorkflow(ctx, clusterstate.ExecutionKindSandbox, command.ObjectID)
+		if err != nil || record == nil || record.AdmissionState != nodeexec.AdmissionAdmitted {
+			t.Fatalf("journal after published prepare = %+v, %v", record, err)
+		}
+		sandbox.prepareErr = nil
+		reply, err := authority.AdmitAndDispatch(ctx, command)
+		if err != nil || reply.Outcome != clusterstate.DispatchAcceptedAdmitted || sandbox.prepares != 1 {
+			t.Fatalf("retry = %+v, %v prepares=%d", reply, err, sandbox.prepares)
+		}
+	})
+
+	t.Run("promotion", func(t *testing.T) {
+		st := authorityStore(t)
+		command := authorityCommand(t, clusterstate.ExecutionKindSandbox, "sandbox-published-promotion")
+		sandbox := &sandboxAdmissionFake{
+			prepared: map[string]nodectl.PreparedAdmissionResult{
+				command.ObjectID: {
+					SandboxID: command.ObjectID, DemandDigest: command.Intent.DemandDigest,
+					State: nodectl.PreparedQueued, ReservationToken: "token-published",
+				},
+			},
+			wake: make(chan struct{}),
+		}
+		authority := newAuthority(t, st, sandbox)
+		if reply, err := authority.AdmitAndDispatch(ctx, command); err != nil || reply.Outcome != clusterstate.DispatchAcceptedQueued {
+			t.Fatalf("queued dispatch = %+v, %v", reply, err)
+		}
+		sandbox.promoted = []nodectl.PreparedAdmissionResult{{
+			SandboxID: command.ObjectID, DemandDigest: command.Intent.DemandDigest,
+			State: nodectl.PreparedAdmitted, ReservationToken: "token-published",
+		}}
+		sandbox.promoteErr = published
+		if err := authority.PromoteSandboxQueue(ctx); !nodectl.FlushPublished(err) {
+			t.Fatalf("published promotion error = %v", err)
+		}
+		record, err := st.GetNodeWorkflow(ctx, clusterstate.ExecutionKindSandbox, command.ObjectID)
+		if err != nil || record == nil || record.AdmissionState != nodeexec.AdmissionAdmitted || !record.ResourceClaimed {
+			t.Fatalf("journal after published promotion = %+v, %v", record, err)
+		}
+	})
+}
+
+func TestAuthorityTerminalizesLaunchingSandboxAfterReservationSweep(t *testing.T) {
+	ctx := context.Background()
+	st := authorityStore(t)
+	command := authorityCommand(t, clusterstate.ExecutionKindSandbox, "sandbox-swept-launch")
+	sandbox := &sandboxAdmissionFake{
+		prepared: map[string]nodectl.PreparedAdmissionResult{
+			command.ObjectID: {
+				SandboxID: command.ObjectID, DemandDigest: command.Intent.DemandDigest,
+				State: nodectl.PreparedAdmitted, ReservationToken: "token-swept",
+			},
+		},
+		wake: make(chan struct{}),
+	}
+	authority := newAuthority(t, st, sandbox)
+	if _, err := authority.AdmitAndDispatch(ctx, command); err != nil {
+		t.Fatal(err)
+	}
+	record, err := st.GetNodeWorkflow(ctx, clusterstate.ExecutionKindSandbox, command.ObjectID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record, err = authority.ClaimSandbox(ctx, record); err != nil || record.AdmissionState != nodeexec.AdmissionLaunching {
+		t.Fatalf("claimed workflow = %+v, %v", record, err)
+	}
+	prepared := sandbox.prepared[command.ObjectID]
+	prepared.State = nodectl.PreparedReleased
+	prepared.Reason = "reservation_idle_timeout"
+	sandbox.prepared[command.ObjectID] = prepared
+	if err := authority.ReconcileSandboxAdmissions(ctx, 10); err != nil {
+		t.Fatal(err)
+	}
+	record, err = st.GetNodeWorkflow(ctx, clusterstate.ExecutionKindSandbox, command.ObjectID)
+	if err != nil || record == nil || record.AdmissionState != nodeexec.AdmissionTerminal || record.ResourceClaimed ||
+		record.LatestEvent == nil || record.LatestEvent.State != "ERROR" || record.LatestEvent.Reason != prepared.Reason {
+		t.Fatalf("terminal workflow after sweep = %+v, %v", record, err)
 	}
 }
 

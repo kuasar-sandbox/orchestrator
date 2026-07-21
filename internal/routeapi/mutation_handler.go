@@ -75,7 +75,7 @@ func handleMutation[Request any, Response any](
 		}
 		response, err := call(request.Context(), input)
 		if err != nil {
-			http.Error(w, "control plane unavailable", http.StatusServiceUnavailable)
+			http.Error(w, err.Error(), http.StatusServiceUnavailable)
 			return
 		}
 		if err := validateResponse(input, response); err != nil {

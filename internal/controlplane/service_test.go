@@ -282,6 +282,75 @@ func (serviceCommandSender) InstallKeyLease(
 	}, true, nil
 }
 
+type recordingKeyLeaseSender struct {
+	mu    sync.Mutex
+	calls int
+}
+
+func (*recordingKeyLeaseSender) SendNodeCommand(
+	context.Context, session.ServeIdentity, string, uint64, string, *routesync.Command,
+) (routesync.CmdAck, bool, error) {
+	return routesync.CmdAck{}, false, nil
+}
+
+func (s *recordingKeyLeaseSender) InstallKeyLease(
+	_ context.Context,
+	_ session.ServeIdentity,
+	_ string,
+	_ uint64,
+	_ string,
+	lease routesync.NodeKeyLeaseV1,
+) (routesync.NodeKeyLeaseRefV1, bool, error) {
+	s.mu.Lock()
+	s.calls++
+	s.mu.Unlock()
+	return routesync.NodeKeyLeaseRefV1{
+		Version: routesync.NodeKeyLeaseVersionV1, Group: lease.Group,
+		AuthKeyFingerprint: lease.AuthKey.Fingerprint, ManifestKeyFingerprint: lease.ManifestKey.Fingerprint,
+	}, true, nil
+}
+
+func (s *recordingKeyLeaseSender) callCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.calls
+}
+
+func TestRegistryServiceRenewsActiveBindingKeyLeaseBeforeExpiry(t *testing.T) {
+	service, store, _, _ := newRegistryServiceFixture(t, clusterstate.DispatchAcceptedAdmitted)
+	sender := &recordingKeyLeaseSender{}
+	service.commands = sender
+	identity, err := store.ServeIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease := serviceKeyLease("/group")
+	binding := raftstore.LeaseBinding{
+		Group: "/group", NodeID: "node-1", NodeEpoch: 7, DataEndpoint: "node-1:8443",
+		RegistryGeneration: identity.RegistryGeneration,
+		AuthKeyFingerprint: lease.AuthKey.Fingerprint, ManifestKeyFingerprint: lease.ManifestKey.Fingerprint,
+	}
+	if err := service.renewKeyLease(context.Background(), identity, binding); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.renewKeyLease(context.Background(), identity, binding); err != nil {
+		t.Fatal(err)
+	}
+	if sender.callCount() != 1 {
+		t.Fatalf("key_put calls before renewal window = %d", sender.callCount())
+	}
+	cacheKey := leaseBindingCacheKey(binding)
+	service.leaseMu.Lock()
+	service.leaseExpiries[cacheKey] = time.Now().Add(placer.NodeKeyLeaseRenewBefore / 2).Unix()
+	service.leaseMu.Unlock()
+	if err := service.renewKeyLease(context.Background(), identity, binding); err != nil {
+		t.Fatal(err)
+	}
+	if sender.callCount() != 2 {
+		t.Fatalf("key_put calls after entering renewal window = %d", sender.callCount())
+	}
+}
+
 func newRegistryServiceFixture(
 	t *testing.T,
 	outcome clusterstate.DispatchOutcome,
@@ -386,6 +455,6 @@ func serviceKeyLease(group string) routesync.NodeKeyLeaseV1 {
 	return routesync.NodeKeyLeaseV1{
 		Version: routesync.NodeKeyLeaseVersionV1, Group: group,
 		AuthKey: material(strings.Repeat("a", 64)), ManifestKey: material(strings.Repeat("b", 64)),
-		ExpiresUnix: time.Now().Add(time.Hour).Unix(),
+		ExpiresUnix: time.Now().Add(placer.DefaultNodeKeyLeaseTTL).Unix(),
 	}
 }

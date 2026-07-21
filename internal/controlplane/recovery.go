@@ -134,6 +134,10 @@ func (c *RecoveryCoordinator) Step(ctx context.Context) error {
 }
 
 func (c *RecoveryCoordinator) prepare(ctx context.Context, recovery raftstore.RecoveryEpoch) error {
+	if !recovery.PermitDrainComplete {
+		_, err := c.store.ConfirmRecoveryPermitDrain(ctx)
+		return err
+	}
 	target := recoveryPermitIdentity(recovery)
 	start := raftstore.DataRecoveryState{
 		RecoveryEpoch: recovery.Epoch, SourceClusterID: recovery.SourceClusterID,
@@ -215,6 +219,15 @@ func (c *RecoveryCoordinator) collectNode(
 		}); err != nil {
 			return err
 		}
+	} else if progress.State == raftstore.RecoveryNodeCollecting && progress.SessionSeq != entry.SessionSeq {
+		if err := c.store.UpdateRecoveryNode(ctx, raftstore.RecoveryNodeUpdate{
+			NodeID: progress.NodeID, EnrollmentID: progress.EnrollmentID, NodeEpoch: progress.NodeEpoch,
+			From: raftstore.RecoveryNodeCollecting, To: raftstore.RecoveryNodeCollecting,
+			SessionSeq: entry.SessionSeq,
+		}); err != nil {
+			return err
+		}
+		return nil
 	}
 	pageRequest := routesync.RecoveryReportRequest{
 		RecoveryEpoch: recovery.Epoch, SourceClusterID: recovery.SourceClusterID,
@@ -243,7 +256,7 @@ func (c *RecoveryCoordinator) collectNode(
 			return fmt.Errorf("node rejected recovery report: %s", ack.Reason)
 		}
 		page := *ack.Recovery
-		if err := page.ValidateFor(pageRequest, progress.NodeID, progress.NodeEpoch, page.SessionSeq); err != nil {
+		if err := page.ValidateFor(pageRequest, progress.NodeID, progress.NodeEpoch, entry.SessionSeq); err != nil {
 			return err
 		}
 		encodedPage, err := json.Marshal(page)
@@ -256,7 +269,7 @@ func (c *RecoveryCoordinator) collectNode(
 		}
 		if reportDigest == "" {
 			reportDigest = page.ReportDigest
-			reportSession = page.SessionSeq
+			reportSession = entry.SessionSeq
 			pageRequest.ExpectedReportDigest = reportDigest
 		} else if page.ReportDigest != reportDigest {
 			return errors.New("node report digest changed during collection")

@@ -108,11 +108,14 @@ func runRegistry(args []string, log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	if err := runtime.SetTerminalProofVerifier(store); err != nil {
+		return err
+	}
 	if _, err := store.RefreshPermit(ctx); err != nil {
 		return fmt.Errorf("registry: initial Serve Permit: %w", err)
 	}
 
-	directory := session.NewDirectory()
+	directory := session.NewDirectory(store)
 	peers, err := registrySessionPeers(config, registryLayout)
 	if err != nil {
 		return err

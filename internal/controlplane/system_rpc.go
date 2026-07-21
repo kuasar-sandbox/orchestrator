@@ -27,6 +27,7 @@ const (
 	systemClose        systemOperation = "CLOSE_GENERATION"
 	systemDrain        systemOperation = "CONFIRM_PREDECESSOR_DRAIN"
 	systemBeginRecover systemOperation = "BEGIN_RECOVERY"
+	systemRecoverDrain systemOperation = "CONFIRM_RECOVERY_DRAIN"
 	systemAdvance      systemOperation = "ADVANCE_RECOVERY"
 	systemGates        systemOperation = "SET_GATES"
 )
@@ -55,6 +56,7 @@ type systemReplicaRuntime interface {
 	CloseRegistryGeneration(context.Context, raftstore.RegistryLayout) (raftstore.SystemState, error)
 	ConfirmPredecessorPermitDrain(context.Context, string) (raftstore.SystemState, error)
 	BeginRecovery(context.Context) (raftstore.SystemState, error)
+	ConfirmRecoveryPermitDrain(context.Context) (raftstore.SystemState, error)
 	AdvanceRecovery(context.Context, raftstore.RecoveryPhase, raftstore.RecoveryPhase) (raftstore.SystemState, error)
 	SetServingGates(context.Context, raftstore.GateUpdate) (raftstore.SystemState, error)
 }
@@ -106,6 +108,8 @@ func executeSystemOperation(ctx context.Context, runtime systemReplicaRuntime, r
 		state, err = runtime.ConfirmPredecessorPermitDrain(ctx, request.EvidenceDigest)
 	case systemBeginRecover:
 		state, err = runtime.BeginRecovery(ctx)
+	case systemRecoverDrain:
+		state, err = runtime.ConfirmRecoveryPermitDrain(ctx)
 	case systemAdvance:
 		state, err = runtime.AdvanceRecovery(ctx, request.RecoveryFrom, request.RecoveryTo)
 	case systemGates:
@@ -190,6 +194,10 @@ func (c *RemoteSystemClient) ConfirmPredecessorPermitDrain(ctx context.Context, 
 
 func (c *RemoteSystemClient) BeginRecovery(ctx context.Context) (raftstore.SystemState, error) {
 	return c.stateCall(ctx, systemRPCRequest{Operation: systemBeginRecover})
+}
+
+func (c *RemoteSystemClient) ConfirmRecoveryPermitDrain(ctx context.Context) (raftstore.SystemState, error) {
+	return c.stateCall(ctx, systemRPCRequest{Operation: systemRecoverDrain})
 }
 
 func (c *RemoteSystemClient) AdvanceRecovery(ctx context.Context, from, to raftstore.RecoveryPhase) (raftstore.SystemState, error) {

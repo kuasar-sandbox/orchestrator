@@ -9,6 +9,10 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/session"
 )
 
+type allowTestDirectoryEntries struct{}
+
+func (allowTestDirectoryEntries) AllowDirectoryEntry(session.DirectoryEntry) bool { return true }
+
 func TestReconnectRouterExcludesUnavailableRendezvousWinner(t *testing.T) {
 	registryLayout := reconnectTestRegistryLayout()
 	available := map[string]bool{"registry-a": true, "registry-b": true, "registry-c": true}
@@ -47,7 +51,7 @@ func TestReconnectRouterExcludesUnavailableRendezvousWinner(t *testing.T) {
 }
 
 func TestSessionMeshPeerHealthRejectsOlderProbeResult(t *testing.T) {
-	mesh, err := NewSessionMesh("registry-a", session.NewDirectory(), []SessionPeer{
+	mesh, err := NewSessionMesh("registry-a", session.NewDirectory(allowTestDirectoryEntries{}), []SessionPeer{
 		{MemberID: "registry-b", Endpoint: "https://registry-b:7700", Client: &http.Client{}},
 	}, nil)
 	if err != nil {

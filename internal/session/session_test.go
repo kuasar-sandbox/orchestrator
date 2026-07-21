@@ -84,6 +84,29 @@ func (g *revocableTestGate) AuthorizeNodeSession(ServeIdentity, Registration) er
 	return nil
 }
 
+type allowDirectoryEntries struct{}
+
+func (allowDirectoryEntries) AllowDirectoryEntry(DirectoryEntry) bool { return true }
+
+func newTestDirectory() *Directory { return NewDirectory(allowDirectoryEntries{}) }
+
+type directoryEnrollmentAuthority struct {
+	mu     sync.RWMutex
+	active map[string]string
+}
+
+func (a *directoryEnrollmentAuthority) AllowDirectoryEntry(entry DirectoryEntry) bool {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.active[entry.NodeID] == entry.EnrollmentID
+}
+
+func (a *directoryEnrollmentAuthority) retire(nodeID string) {
+	a.mu.Lock()
+	delete(a.active, nodeID)
+	a.mu.Unlock()
+}
+
 type testPublisher struct{ deltas []DirectoryDelta }
 
 func (p *testPublisher) PublishSessionDelta(delta DirectoryDelta) {
@@ -257,6 +280,46 @@ func TestHolderRejectsEndpointChangeWithinNodeEpoch(t *testing.T) {
 	authority.enroll(newEpoch)
 	if _, err := holder.Register(context.Background(), newEpoch, &testEndpoint{}); err != nil {
 		t.Fatalf("new epoch endpoint change: %v", err)
+	}
+}
+
+func TestHolderRejectsStableRegistrationChangesWithinNodeEpoch(t *testing.T) {
+	first := testRegistration("node-1", 7, 10, "10.0.0.1:8443")
+	authority := newTestEnrollmentAuthority(first)
+	holder, err := NewHolder("registry-a", 1, nil, testGate(true), nil, authority)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := holder.Register(context.Background(), first, &testEndpoint{}); err != nil {
+		t.Fatal(err)
+	}
+	for name, mutate := range map[string]func(*Registration){
+		"runtime":    func(r *Registration) { r.RuntimeDigest = "runtime-v2" },
+		"load model": func(r *Registration) { r.LoadModelVersion++ },
+		"sandbox":    func(r *Registration) { r.SandboxSlots++ },
+		"build":      func(r *Registration) { r.BuildMemory++ },
+		"domain":     func(r *Registration) { r.FailureDomain = "zone-b" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			next := first
+			next.SessionSeq++
+			mutate(&next)
+			if _, err := holder.Register(context.Background(), next, &testEndpoint{}); !errors.Is(err, ErrRegistrationChanged) {
+				t.Fatalf("changed registration error = %v", err)
+			}
+		})
+	}
+}
+
+func TestRegistrationAllowsBuildOnlyNode(t *testing.T) {
+	registration := testRegistration("builder-1", 1, 1, "10.0.0.2:8443")
+	registration.SandboxSlots = 0
+	if err := registration.Validate(); err != nil {
+		t.Fatalf("build-only registration: %v", err)
+	}
+	registration.BuildSlots = 0
+	if err := registration.Validate(); err == nil {
+		t.Fatal("registration without sandbox or build capacity was accepted")
 	}
 }
 
@@ -462,6 +525,16 @@ func TestHolderProbeUsesLocalObservationAndPermit(t *testing.T) {
 	if _, err := denied.Probe(context.Background(), ProbeCall{ServeIdentity: testServeIdentity()}); !errors.Is(err, ErrPermitUnavailable) {
 		t.Fatalf("expired permit error = %v", err)
 	}
+	if _, err := holder.Probe(context.Background(), ProbeCall{
+		ServeIdentity: ServeIdentity{ClusterID: "cluster-1"},
+		Request: placement.PlacementProbeRequest{
+			Kind: placement.ObjectSandbox, NodeID: registration.NodeID,
+			ExpectedNodeEpoch: registration.NodeEpoch, ExpectedSessionSeq: registration.SessionSeq,
+			LoadModelVersion: placement.LoadModelVersion, Sandbox: &placement.SandboxDemand{SlotUnits: 1},
+		},
+	}); err == nil {
+		t.Fatal("Probe accepted an incomplete serving identity")
+	}
 }
 
 func TestHolderLimitAndStaleSnapshot(t *testing.T) {
@@ -591,6 +664,85 @@ func TestAmbiguousKeyDropInvalidatesLocalAcknowledgement(t *testing.T) {
 	}
 }
 
+type orderedKeyEndpoint struct {
+	putStarted chan struct{}
+	releasePut chan struct{}
+	calls      chan string
+}
+
+func (e *orderedKeyEndpoint) FenceStaleSession() {}
+
+func (e *orderedKeyEndpoint) AdmitAndDispatch(context.Context, DispatchCommand) (DispatchReply, error) {
+	return DispatchReply{Outcome: cluster.DispatchAcceptedAdmitted}, nil
+}
+
+func (e *orderedKeyEndpoint) SendNodeCommand(_ context.Context, command *routesync.Command) (routesync.CmdAck, bool, error) {
+	e.calls <- command.Kind
+	if command.Kind == routesync.CmdKeyPut {
+		close(e.putStarted)
+		<-e.releasePut
+	}
+	var ref routesync.NodeKeyLeaseRefV1
+	if command.KeyLease != nil {
+		ref = keyLeaseRef(*command.KeyLease)
+	} else {
+		ref = *command.KeyLeaseRef
+	}
+	return routesync.CmdAck{Status: routesync.AckAccepted, KeyLeaseRef: &ref}, true, nil
+}
+
+func TestKeyLeasePutAndDropAreSerializedPerReference(t *testing.T) {
+	registration := testRegistration("node-1", 7, 10, "10.0.0.1:8443")
+	holder, err := NewHolder("registry-a", 1, nil, testGate(true), nil, newTestEnrollmentAuthority(registration))
+	if err != nil {
+		t.Fatal(err)
+	}
+	endpoint := &orderedKeyEndpoint{
+		putStarted: make(chan struct{}), releasePut: make(chan struct{}), calls: make(chan string, 2),
+	}
+	if _, err := holder.Register(context.Background(), registration, endpoint); err != nil {
+		t.Fatal(err)
+	}
+	lease := testKeyLease()
+	ref := keyLeaseRef(lease)
+	installDone := make(chan error, 1)
+	go func() {
+		_, _, err := holder.InstallKeyLease(
+			context.Background(), testServeIdentity(), registration.NodeID, registration.NodeEpoch, registration.DataEndpoint, lease,
+		)
+		installDone <- err
+	}()
+	<-endpoint.putStarted
+	if kind := <-endpoint.calls; kind != routesync.CmdKeyPut {
+		t.Fatalf("first command = %s", kind)
+	}
+	dropDone := make(chan error, 1)
+	go func() {
+		_, err := holder.DropKeyLease(
+			context.Background(), testServeIdentity(), registration.NodeID, registration.NodeEpoch, registration.DataEndpoint, ref,
+		)
+		dropDone <- err
+	}()
+	select {
+	case kind := <-endpoint.calls:
+		t.Fatalf("overlapping command reached node before put ACK: %s", kind)
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(endpoint.releasePut)
+	if err := <-installDone; err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	if kind := <-endpoint.calls; kind != routesync.CmdKeyDrop {
+		t.Fatalf("second command = %s", kind)
+	}
+	if err := <-dropDone; err != nil {
+		t.Fatalf("drop: %v", err)
+	}
+	if holder.HasKeyLease(registration.NodeID, registration.NodeEpoch, ref) {
+		t.Fatal("serialized drop left the installed lease usable")
+	}
+}
+
 func TestHolderDispatchFailsClosedWithoutPermit(t *testing.T) {
 	registration := testRegistration("node-1", 7, 10, "10.0.0.1:8443")
 	authority := newTestEnrollmentAuthority(registration)
@@ -611,8 +763,8 @@ func TestHolderDispatchFailsClosedWithoutPermit(t *testing.T) {
 }
 
 func TestDirectoryHighestTupleDownAndConflictAreFailClosed(t *testing.T) {
-	directory := NewDirectory()
-	e1 := DirectoryEntry{NodeID: "node-1", Tuple: Tuple{NodeEpoch: 7, SessionSeq: 10}, HolderMemberID: "registry-a"}
+	directory := newTestDirectory()
+	e1 := DirectoryEntry{NodeID: "node-1", EnrollmentID: "enrollment-node-1", Tuple: Tuple{NodeEpoch: 7, SessionSeq: 10}, HolderMemberID: "registry-a"}
 	if !directory.Apply(DirectoryDelta{Entry: e1, Up: true}) {
 		t.Fatal("initial up was ignored")
 	}
@@ -650,13 +802,35 @@ func TestDirectoryHighestTupleDownAndConflictAreFailClosed(t *testing.T) {
 	}
 }
 
+func TestDirectoryRetirementCollectsHintAndRejectsStaleDelta(t *testing.T) {
+	authority := &directoryEnrollmentAuthority{active: map[string]string{"node-1": "enrollment-node-1"}}
+	directory := NewDirectory(authority)
+	entry := DirectoryEntry{
+		NodeID: "node-1", EnrollmentID: "enrollment-node-1",
+		Tuple: Tuple{NodeEpoch: 7, SessionSeq: 10}, HolderMemberID: "registry-a",
+	}
+	if !directory.Apply(DirectoryDelta{Entry: entry, Up: true}) {
+		t.Fatal("active enrollment was not installed")
+	}
+	authority.retire(entry.NodeID)
+	if !directory.Apply(DirectoryDelta{Entry: entry, Retired: true}) {
+		t.Fatal("retirement did not collect the Directory hint")
+	}
+	if directory.Apply(DirectoryDelta{Entry: entry, Up: true}) {
+		t.Fatal("stale delta resurrected a retired enrollment")
+	}
+	if records := directory.Snapshot(); len(records) != 0 {
+		t.Fatalf("retired Directory records = %+v", records)
+	}
+}
+
 func TestDirectoryDigestAndFullMergeAreDeterministic(t *testing.T) {
-	a := DirectoryRecord{Entry: DirectoryEntry{NodeID: "a", Tuple: Tuple{NodeEpoch: 1, SessionSeq: 2}, HolderMemberID: "r1"}, Available: true}
-	b := DirectoryRecord{Entry: DirectoryEntry{NodeID: "b", Tuple: Tuple{NodeEpoch: 3, SessionSeq: 4}, HolderMemberID: "r2"}, Conflict: true}
+	a := DirectoryRecord{Entry: DirectoryEntry{NodeID: "a", EnrollmentID: "enrollment-a", Tuple: Tuple{NodeEpoch: 1, SessionSeq: 2}, HolderMemberID: "r1"}, Available: true}
+	b := DirectoryRecord{Entry: DirectoryEntry{NodeID: "b", EnrollmentID: "enrollment-b", Tuple: Tuple{NodeEpoch: 3, SessionSeq: 4}, HolderMemberID: "r2"}, Conflict: true}
 	if DirectoryDigest([]DirectoryRecord{a, b}) != DirectoryDigest([]DirectoryRecord{b, a}) {
 		t.Fatal("directory digest depends on input order")
 	}
-	directory := NewDirectory()
+	directory := newTestDirectory()
 	if changed := directory.MergeFull([]DirectoryRecord{b, a}); changed != 3 {
 		t.Fatalf("merge changed %d records", changed)
 	}
@@ -669,11 +843,11 @@ func TestDirectoryDigestAndFullMergeAreDeterministic(t *testing.T) {
 }
 
 func TestDirectoryConflictCanonicalizesAcrossArrivalOrder(t *testing.T) {
-	a := DirectoryEntry{NodeID: "node-1", Tuple: Tuple{NodeEpoch: 3, SessionSeq: 7}, HolderMemberID: "registry-a"}
+	a := DirectoryEntry{NodeID: "node-1", EnrollmentID: "enrollment-node-1", Tuple: Tuple{NodeEpoch: 3, SessionSeq: 7}, HolderMemberID: "registry-a"}
 	b := a
 	b.HolderMemberID = "registry-b"
-	left := NewDirectory()
-	right := NewDirectory()
+	left := newTestDirectory()
+	right := newTestDirectory()
 	left.Apply(DirectoryDelta{Entry: a, Up: true})
 	left.Apply(DirectoryDelta{Entry: b, Up: true})
 	right.Apply(DirectoryDelta{Entry: b, Up: true})
@@ -693,9 +867,9 @@ func TestDirectoryConflictCanonicalizesAcrossArrivalOrder(t *testing.T) {
 }
 
 func TestDirectoryFullMergeSkipsInvalidConflictRecords(t *testing.T) {
-	directory := NewDirectory()
+	directory := newTestDirectory()
 	healthy := DirectoryEntry{
-		NodeID: "node-1", Tuple: Tuple{NodeEpoch: 3, SessionSeq: 7}, HolderMemberID: "registry-a",
+		NodeID: "node-1", EnrollmentID: "enrollment-node-1", Tuple: Tuple{NodeEpoch: 3, SessionSeq: 7}, HolderMemberID: "registry-a",
 	}
 	directory.Apply(DirectoryDelta{Entry: healthy, Up: true})
 	invalid := DirectoryRecord{

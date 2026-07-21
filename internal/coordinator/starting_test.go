@@ -156,7 +156,7 @@ type roundSourceStub struct {
 	calls      int
 }
 
-func (s *roundSourceStub) NextSandboxRound(_ context.Context, _, _ string, _ uint64, previous cluster.DispatchIntent) (SandboxRound, error) {
+func (s *roundSourceStub) NextSandboxRound(_ context.Context, _, _ string, _ uint64, previous cluster.DispatchIntent, _ []string) (SandboxRound, error) {
 	s.calls++
 	intent := previous
 	if s.intent != nil {
@@ -476,7 +476,7 @@ func buildStartingRecord(t *testing.T, buildID string, candidates []cluster.Plac
 		Version: cluster.DispatchSpecVersionV1, TemplateID: "template-1",
 		AuthKeyFingerprint: strings.Repeat("b", 24), ManifestKeyFingerprint: strings.Repeat("c", 24),
 		Profile: types.ProfileBare, CPUCount: 1, MemoryMB: 512,
-		Request: cluster.NodeRequestEnvelopeV1{Version: cluster.NodeRequestEnvelopeVersionV1, Method: "POST", Path: "/v3/templates", Body: []byte("{}")},
+		Request: cluster.NodeRequestEnvelopeV1{Version: cluster.NodeRequestEnvelopeVersionV1, Method: "POST", Path: "/v3/templates", Body: []byte(`{"cpuCount":1,"memoryMB":512}`)},
 	})
 	if err != nil {
 		t.Fatal(err)

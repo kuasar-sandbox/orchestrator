@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	dragonboat "github.com/lni/dragonboat/v4"
 	"github.com/lni/dragonboat/v4/client"
 	dbconfig "github.com/lni/dragonboat/v4/config"
@@ -27,6 +28,8 @@ var (
 	ErrNoLocalReplica        = errors.New("raftstore: no local replica is enrolled for the shard")
 )
 
+const ambiguityResolutionTimeout = 10 * time.Second
+
 type RuntimeOpenMode string
 
 const (
@@ -36,10 +39,12 @@ const (
 )
 
 type RuntimeOpenOptions struct {
-	Mode             RuntimeOpenMode
-	BootstrapSecret  []byte
-	TransitionClient ReplicaTransitionClient
-	SystemClient     RemoteSystemClient
+	Mode              RuntimeOpenMode
+	BootstrapSecret   []byte
+	TransitionClient  ReplicaTransitionClient
+	SystemClient      RemoteSystemClient
+	OutboxAckVerifier FenceOutboxAckVerifier
+	TerminalVerifier  TerminalProofVerifier
 }
 
 // RemoteSystemClient is the trusted internal path used by Registry members
@@ -53,6 +58,7 @@ type RemoteSystemClient interface {
 	CloseRegistryGeneration(context.Context, RegistryLayout) (SystemState, error)
 	ConfirmPredecessorPermitDrain(context.Context, string) (SystemState, error)
 	BeginRecovery(context.Context) (SystemState, error)
+	ConfirmRecoveryPermitDrain(context.Context) (SystemState, error)
 	AdvanceRecovery(context.Context, RecoveryPhase, RecoveryPhase) (SystemState, error)
 	SetServingGates(context.Context, GateUpdate) (SystemState, error)
 }
@@ -94,6 +100,7 @@ type Runtime struct {
 	systemClient          RemoteSystemClient
 	systemCache           *SystemState
 	outboxAckVerifier     FenceOutboxAckVerifier
+	terminalVerifier      TerminalProofVerifier
 	systemEvents          *runtimeSystemEvents
 }
 
@@ -243,7 +250,8 @@ func openRuntime(
 		startupRegistryLayout: startupSigned.RegistryLayout, member: member,
 		enrollment: enrollment, enrollmentStore: store, nodeHost: nodeHost, stateEngine: stateEngine,
 		permitCache: NewPermitCache(time.Now), transitionClient: options.TransitionClient,
-		systemClient: options.SystemClient,
+		systemClient:      options.SystemClient,
+		outboxAckVerifier: options.OutboxAckVerifier, terminalVerifier: options.TerminalVerifier,
 		systemEvents: systemEvents,
 	}
 	systemEvents.bind(runtime)
@@ -788,7 +796,14 @@ func (r *Runtime) ApplyData(ctx context.Context, command DataCommand) (DataApply
 		return DataApplyResult{}, errors.New("raftstore: data-shard lifecycle commands require the dedicated runtime workflow")
 	case DataCompactFence:
 		return DataApplyResult{}, errors.New("raftstore: execution-fence compaction requires the dedicated proof workflow")
-	case DataPutRoute, DataPutBuild, DataPutFence:
+	case DataPutRoute:
+		if command.Route != nil && command.Route.State == clusterstate.WorkflowRouteTombstone &&
+			command.Route.Tombstone != nil && command.Route.Tombstone.PlacementFailure == nil {
+			return DataApplyResult{}, errors.New("raftstore: execution tombstone requires the dedicated proof workflow")
+		}
+	case DataPutBuild:
+	case DataPutFence:
+		return DataApplyResult{}, errors.New("raftstore: execution fence requires the dedicated proof workflow")
 	default:
 		return DataApplyResult{}, errors.New("raftstore: unsupported data mutation command")
 	}
@@ -798,11 +813,17 @@ func (r *Runtime) ApplyData(ctx context.Context, command DataCommand) (DataApply
 	if err := r.permitCache.Authorize(command.Identity.PermitIdentity, PermitRegistryWrite); err != nil {
 		return DataApplyResult{}, err
 	}
+	return r.applyDataMutation(ctx, command)
+}
+
+func (r *Runtime) applyDataMutation(ctx context.Context, command DataCommand) (DataApplyResult, error) {
 	result, err := r.proposeDataRaw(ctx, command)
 	if err == nil {
 		return result, nil
 	}
-	resolved, readErr := r.resolveDataMutation(ctx, command)
+	resolveContext, cancelResolve := ambiguityResolutionContext(ctx)
+	defer cancelResolve()
+	resolved, readErr := r.resolveDataMutation(resolveContext, command)
 	if readErr == nil && resolved.Committed {
 		return DataApplyResult{Applied: true, Revision: resolved.Revision}, nil
 	}
@@ -810,6 +831,10 @@ func (r *Runtime) ApplyData(ctx context.Context, command DataCommand) (DataApply
 		return DataApplyResult{}, errors.Join(err, fmt.Errorf("raftstore: resolve ambiguous data mutation: %w", readErr))
 	}
 	return DataApplyResult{}, err
+}
+
+func ambiguityResolutionContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), ambiguityResolutionTimeout)
 }
 
 func (r *Runtime) resolveDataMutation(ctx context.Context, command DataCommand) (DataMutationStatus, error) {

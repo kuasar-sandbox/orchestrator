@@ -884,7 +884,8 @@ func (n *stubNode) start(parent context.Context) {
 	identity := routesync.NodeRegister{
 		NodeID: n.ID, EnrollmentID: "stub-enrollment-" + n.ID,
 		LoadModelVersion: placement.LoadModelVersion,
-		Labels:           cloneStringMap(n.Labels), Capacity: n.Capacity,
+		Labels:           cloneStringMap(n.Labels), Capabilities: stubCapabilities(n.Capacity, n.BuildCapacity),
+		Capacity:      n.Capacity,
 		BuildCapacity: cloneBuildResources(n.BuildCapacity), DataEndpoint: n.DataEndpoint, RuntimeDigest: n.RuntimeDigest,
 	}
 	n.mu.Unlock()
@@ -905,6 +906,17 @@ func (n *stubNode) start(parent context.Context) {
 	go client.Run(ctx)
 	go n.runWorkflows(ctx)
 	n.svc.logEvent(n.ID, "node_start", map[string]any{"session": n.session})
+}
+
+func stubCapabilities(sandboxCapacity int, buildCapacity *routesync.BuildResources) map[string]bool {
+	capabilities := make(map[string]bool, 2)
+	if sandboxCapacity > 0 {
+		capabilities["sandbox"] = true
+	}
+	if buildCapacity != nil && buildCapacity.Slots > 0 {
+		capabilities["build"] = true
+	}
+	return capabilities
 }
 
 func (n *stubNode) crash() {
