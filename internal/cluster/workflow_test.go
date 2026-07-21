@@ -5,13 +5,12 @@ import (
 	"encoding/hex"
 	"strings"
 	"testing"
+
+	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
 func TestRouteWorkflowTypesValidateFrozenIntent(t *testing.T) {
-	intent, err := NewDispatchIntent([]byte(`{"memory":268435456}`), []byte(`{"template":"e2b-snp-t1"}`), "provider-v1/policy-v2")
-	if err != nil {
-		t.Fatal(err)
-	}
+	intent := workflowSandboxIntent(t)
 	binding := workflowBinding(t, ExecutionKindSandbox, "s1", "rk", intent)
 	selected := uint32(0)
 	starting := RouteWorkflowRecord{
@@ -112,10 +111,7 @@ func TestDispatchIntentRejectsMutationAndOversize(t *testing.T) {
 }
 
 func TestPlacementFailuresDoNotInventExecutionProof(t *testing.T) {
-	intent, err := NewDispatchIntent([]byte("demand"), []byte("spec"), "v1")
-	if err != nil {
-		t.Fatal(err)
-	}
+	intent := workflowSandboxIntent(t)
 	candidates := []PlacementCandidate{{NodeID: "n1"}, {NodeID: "n2"}}
 	rejected := []uint32{0, 1}
 	route := RouteWorkflowRecord{
@@ -135,15 +131,49 @@ func TestPlacementFailuresDoNotInventExecutionProof(t *testing.T) {
 	}
 
 	build := BuildRecord{
-		Group: "/g", BuildID: "b1", State: BuildError,
+		Group: "/g", BuildID: "b1", State: BuildTombstone,
 		Revision: Revision{RegistryGeneration: "g1", ShardID: 2, LogIndex: 20},
-		Failure: &BuildPlacementFailureState{
+		Tombstone: &BuildTombstoneState{PlacementFailure: BuildPlacementFailureState{
 			BuildID: "b1", CandidatePool: candidates, DefinitivelyRejected: rejected,
-			Intent: intent, Reason: "candidate pool exhausted",
-		},
+			Intent: workflowBuildIntent(t), Reason: "candidate pool exhausted",
+		}},
 	}
 	if err := build.Validate(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestNewerNodeEpochProofIsBoundToExactExecutionState(t *testing.T) {
+	ready := readyRoute()
+	proof := TerminalProof{
+		Kind: ProofNewerNodeEpoch, FencedNodeID: ready.NodeID, FencedNodeEpoch: ready.NodeEpoch,
+		ObservedNodeEpoch: ready.NodeEpoch + 1, SystemEpoch: 4, SystemCommitIndex: 30,
+		EnrollmentID: "enrollment-2", EnrollmentCommitIndex: 29,
+	}
+	var err error
+	proof.ProofDigest, err = NewerNodeEpochProofDigest(
+		proof, ready.RegistryGeneration, ready.SandboxID, ready.BindingDigest, ready.LastEventSeq,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := RouteWorkflowRecord{
+		Group: "/g", RouteKey: "rk", State: WorkflowRouteTombstone,
+		Revision: Revision{RegistryGeneration: "g1", ShardID: 7, LogIndex: 40},
+		Tombstone: &RouteTombstoneState{
+			SandboxID: ready.SandboxID, NodeID: ready.NodeID, NodeEpoch: ready.NodeEpoch,
+			RegistryGeneration: ready.RegistryGeneration,
+			BindingDigest:      ready.BindingDigest, LastEventSeq: ready.LastEventSeq,
+			Proof: proof, TerminalReason: "node epoch advanced",
+			FailureRevision: Revision{RegistryGeneration: "g1", ShardID: 7, LogIndex: 40},
+		},
+	}
+	if err := record.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	record.Tombstone.LastEventSeq++
+	if err := record.Validate(); err == nil {
+		t.Fatal("newer-NodeEpoch proof was reused for another execution watermark")
 	}
 }
 
@@ -185,12 +215,67 @@ func workflowBinding(t *testing.T, kind ExecutionKind, objectID, routeKey string
 	}
 }
 
+func workflowSandboxIntent(t *testing.T) DispatchIntent {
+	t.Helper()
+	templateRef := "e2b-img-" + strings.Repeat("c", 64)
+	spec, err := MarshalSandboxDispatchSpec(SandboxDispatchSpecV1{
+		Version: DispatchSpecVersionV1, TemplateRef: templateRef,
+		AuthKeyFingerprint: strings.Repeat("a", 24), ManifestKeyFingerprint: strings.Repeat("b", 24),
+		AccessToken: "token", TargetPort: 3000,
+		Request: NodeRequestEnvelopeV1{
+			Version: NodeRequestEnvelopeVersionV1, Method: "POST", Path: "/sandboxes",
+			Body: []byte(`{"templateID":"` + templateRef + `"}`),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	intent, err := NewDispatchIntent([]byte("demand"), spec, "provider-v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return intent
+}
+
+func workflowBuildIntent(t *testing.T) DispatchIntent {
+	t.Helper()
+	spec, err := MarshalBuildDispatchSpec(BuildDispatchSpecV1{
+		Version: DispatchSpecVersionV1, TemplateID: "template-1",
+		AuthKeyFingerprint: strings.Repeat("b", 24), ManifestKeyFingerprint: strings.Repeat("c", 24),
+		Profile: types.ProfileBare, CPUCount: 1, MemoryMB: 512,
+		Request: NodeRequestEnvelopeV1{
+			Version: NodeRequestEnvelopeVersionV1, Method: "POST", Path: "/v3/templates",
+			Body: []byte(`{"cpuCount":1,"memoryMB":512}`),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	intent, err := NewDispatchIntent([]byte("demand"), spec, "provider-v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return intent
+}
+
 func readyRoute() *ReadyRoute {
 	binding := sha256.Sum256([]byte("binding"))
+	templateRef := "e2b-img-" + strings.Repeat("c", 64)
+	spec, _ := MarshalSandboxDispatchSpec(SandboxDispatchSpecV1{
+		Version: DispatchSpecVersionV1, TemplateRef: templateRef,
+		AuthKeyFingerprint: strings.Repeat("a", 24), ManifestKeyFingerprint: strings.Repeat("b", 24),
+		AccessToken: "token", TargetPort: 3000,
+		Request: NodeRequestEnvelopeV1{
+			Version: NodeRequestEnvelopeVersionV1, Method: "POST", Path: "/sandboxes",
+			Body: []byte(`{"templateID":"` + templateRef + `"}`),
+		},
+	})
+	intent, _ := NewDispatchIntent([]byte("demand"), spec, "provider-v1")
 	return &ReadyRoute{
 		SandboxID: "s1", NodeID: "n1", NodeEpoch: 7, DataEndpoint: "10.0.0.1:8443",
-		AccessToken: "token", TemplateRef: "e2b-snp-t1", RegistryGeneration: "g1",
-		BindingDigest: hexDigest(binding), LastEventSeq: 3,
+		TargetPort: 3000, AccessToken: "token", TrafficAccessToken: "traffic-token",
+		TemplateRef: templateRef, RegistryGeneration: "g1",
+		BindingDigest: hexDigest(binding), LastEventSeq: 3, Intent: intent,
 	}
 }
 

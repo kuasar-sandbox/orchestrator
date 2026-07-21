@@ -131,6 +131,7 @@ CREATE TABLE IF NOT EXISTS node_workflows (
   route_key            TEXT NOT NULL DEFAULT '',
   node_id              TEXT NOT NULL,
   node_epoch           BLOB NOT NULL CHECK (length(node_epoch) = 8),
+  session_seq          BLOB NOT NULL CHECK (length(session_seq) = 8),
   data_endpoint        TEXT NOT NULL,
   normalized_demand    BLOB NOT NULL,
   demand_digest        TEXT NOT NULL,

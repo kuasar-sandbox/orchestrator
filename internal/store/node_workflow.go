@@ -18,12 +18,13 @@ import (
 )
 
 var (
-	ErrNodeWorkflowConflict = nodeexec.ErrWorkflowConflict
-	ErrNodeWorkflowMissing  = nodeexec.ErrWorkflowMissing
-	ErrNodeWorkflowState    = nodeexec.ErrWorkflowState
+	ErrNodeWorkflowConflict      = nodeexec.ErrWorkflowConflict
+	ErrNodeWorkflowMissing       = nodeexec.ErrWorkflowMissing
+	ErrNodeWorkflowState         = nodeexec.ErrWorkflowState
+	ErrNodeWorkflowOutboxPending = nodeexec.ErrFinalOutboxPending
 )
 
-const workflowColumns = `object_kind,object_id,group_name,route_key,node_id,node_epoch,data_endpoint,
+const workflowColumns = `object_kind,object_id,group_name,route_key,node_id,node_epoch,session_seq,data_endpoint,
   normalized_demand,demand_digest,dispatch_spec,dispatch_spec_digest,provider_policy_version,opaque_binding,binding_digest,
   build_demand_json,admission_state,result,reason,reservation_token,queue_sequence,resource_claimed,
   object_state,event_seq,acked_event_seq,latest_event_json,workflow_finalized`
@@ -31,11 +32,11 @@ const workflowColumns = `object_kind,object_id,group_name,route_key,node_id,node
 func scanNodeWorkflow(row interface{ Scan(...any) error }) (*nodeexec.WorkflowRecord, error) {
 	var record nodeexec.WorkflowRecord
 	var kind int
-	var nodeEpoch, queueSequence, eventSeq, ackedEventSeq []byte
+	var nodeEpoch, sessionSeq, queueSequence, eventSeq, ackedEventSeq []byte
 	var buildDemandJSON, admissionState, result, latestEventJSON string
 	var resourceClaimed, finalized int
 	if err := row.Scan(
-		&kind, &record.ObjectID, &record.Group, &record.RouteKey, &record.NodeID, &nodeEpoch, &record.DataEndpoint,
+		&kind, &record.ObjectID, &record.Group, &record.RouteKey, &record.NodeID, &nodeEpoch, &sessionSeq, &record.DataEndpoint,
 		&record.NormalizedDemand, &record.DemandDigest, &record.DispatchSpec, &record.DispatchSpecDigest,
 		&record.ProviderPolicyVersion, &record.OpaqueBinding, &record.BindingDigest, &buildDemandJSON, &admissionState, &result,
 		&record.Reason, &record.ReservationToken, &queueSequence, &resourceClaimed,
@@ -46,6 +47,9 @@ func scanNodeWorkflow(row interface{ Scan(...any) error }) (*nodeexec.WorkflowRe
 	record.Kind = clusterstate.ExecutionKind(kind)
 	var err error
 	if record.NodeEpoch, err = decodeUint64(nodeEpoch); err != nil {
+		return nil, err
+	}
+	if record.SessionSeq, err = decodeUint64(sessionSeq); err != nil {
 		return nil, err
 	}
 	if record.QueueSequence, err = decodeUint64(queueSequence); err != nil {
@@ -95,7 +99,7 @@ func sameDispatch(existing *nodeexec.WorkflowRecord, dispatch nodeexec.DispatchR
 }
 
 // PrepareBuildWorkflow atomically records Build Admission, command dedupe,
-// resource accounting, Binding, and the initial queued outbox event.
+// resource accounting, protected Binding, and the node-local Build object.
 func (s *Store) PrepareBuildWorkflow(
 	ctx context.Context,
 	dispatch nodeexec.DispatchRecord,
@@ -165,13 +169,7 @@ func (s *Store) PrepareBuildWorkflow(
 			record.AdmissionState = nodeexec.AdmissionAdmitted
 			record.Result = clusterstate.DispatchAcceptedAdmitted
 			record.ResourceClaimed = true
-			event, err := executionEventFor(record, nodeexec.EventUpdate{State: string(clusterstate.BuildRegistered)})
-			if err != nil {
-				return nil, err
-			}
-			record.EventSeq = event.EventSeq
-			record.ObjectState = event.State
-			record.LatestEvent = event
+			record.ObjectState = string(types.BuildRegistered)
 		} else if queueDepth < capacity.QueueLimit {
 			record.AdmissionState = nodeexec.AdmissionQueued
 			record.Result = clusterstate.DispatchAcceptedQueued
@@ -179,13 +177,7 @@ func (s *Store) PrepareBuildWorkflow(
 			if err != nil {
 				return nil, err
 			}
-			event, err := executionEventFor(record, nodeexec.EventUpdate{State: string(clusterstate.BuildQueued)})
-			if err != nil {
-				return nil, err
-			}
-			record.EventSeq = event.EventSeq
-			record.ObjectState = event.State
-			record.LatestEvent = event
+			record.ObjectState = string(types.BuildRegistered)
 		} else {
 			record.AdmissionState = nodeexec.AdmissionRejected
 			record.Result = clusterstate.DispatchDefinitiveReject
@@ -201,11 +193,7 @@ func (s *Store) PrepareBuildWorkflow(
 		if err != nil {
 			return nil, err
 		}
-		if record.AdmissionState == nodeexec.AdmissionQueued {
-			stored.Status = types.BuildWaiting
-		} else {
-			stored.Status = types.BuildRegistered
-		}
+		stored.Status = types.BuildRegistered
 		if err := s.putBuild(ctx, tx, stored); err != nil {
 			return nil, err
 		}
@@ -215,9 +203,6 @@ func (s *Store) PrepareBuildWorkflow(
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, err
-	}
-	if record.LatestEvent != nil {
-		s.notifyEvent()
 	}
 	return record, nil
 }
@@ -393,7 +378,6 @@ WHERE object_kind=? AND node_id=? AND node_epoch=? AND admission_state=? ORDER B
 		return nil, err
 	}
 	promoted := make([]*nodeexec.WorkflowRecord, 0, len(ids))
-	changed := false
 	for _, id := range ids {
 		record, err := getNodeWorkflowTx(ctx, tx, clusterstate.ExecutionKindBuild, id)
 		if err != nil {
@@ -410,54 +394,32 @@ WHERE object_kind=? AND node_id=? AND node_epoch=? AND admission_state=? ORDER B
 			return nil, errors.New("store: queued Build object is missing")
 		}
 		if !capacity.CanEverFit(record.BuildDemand) {
-			update := nodeexec.EventUpdate{State: string(clusterstate.BuildError), Reason: "exceeds_build_capacity"}
-			event, err := executionEventFor(record, update)
-			if err != nil {
-				return nil, err
-			}
+			update := nodeexec.EventUpdate{State: string(types.BuildError), Reason: "exceeds_build_capacity"}
 			applyBuildState(build, update)
 			if err := s.putBuild(ctx, tx, build); err != nil {
 				return nil, err
 			}
 			record.AdmissionState = nodeexec.AdmissionTerminal
 			record.ResourceClaimed = false
-			record.ObjectState = event.State
-			record.EventSeq = event.EventSeq
-			record.LatestEvent = event
+			record.ObjectState = update.State
 			if err := updateNodeWorkflowTx(ctx, tx, record); err != nil {
 				return nil, err
 			}
-			changed = true
 			continue
 		}
 		if !usage.Fits(capacity, record.BuildDemand) {
 			break
 		}
-		event, err := executionEventFor(record, nodeexec.EventUpdate{State: string(clusterstate.BuildRegistered)})
-		if err != nil {
-			return nil, err
-		}
-		build.Status = types.BuildRegistered
-		if err := s.putBuild(ctx, tx, build); err != nil {
-			return nil, err
-		}
 		record.AdmissionState = nodeexec.AdmissionAdmitted
 		record.ResourceClaimed = true
-		record.ObjectState = event.State
-		record.EventSeq = event.EventSeq
-		record.LatestEvent = event
 		if err := updateNodeWorkflowTx(ctx, tx, record); err != nil {
 			return nil, err
 		}
 		usage = usage.Add(record.BuildDemand)
 		promoted = append(promoted, record)
-		changed = true
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, err
-	}
-	if changed {
-		s.notifyEvent()
 	}
 	return promoted, nil
 }
@@ -520,20 +482,14 @@ WHERE object_kind=? AND node_id=? AND node_epoch=? AND admission_state=? ORDER B
 		if build == nil {
 			return nil, errors.New("store: queued Build object is missing")
 		}
-		update := nodeexec.EventUpdate{State: string(clusterstate.BuildError), Reason: reason}
-		event, err := executionEventFor(record, update)
-		if err != nil {
-			return nil, err
-		}
+		update := nodeexec.EventUpdate{State: string(types.BuildError), Reason: reason}
 		applyBuildState(build, update)
 		if err := s.putBuild(ctx, tx, build); err != nil {
 			return nil, err
 		}
 		record.AdmissionState = nodeexec.AdmissionTerminal
 		record.ResourceClaimed = false
-		record.ObjectState = event.State
-		record.EventSeq = event.EventSeq
-		record.LatestEvent = event
+		record.ObjectState = update.State
 		if err := updateNodeWorkflowTx(ctx, tx, record); err != nil {
 			return nil, err
 		}
@@ -541,9 +497,6 @@ WHERE object_kind=? AND node_id=? AND node_epoch=? AND admission_state=? ORDER B
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, err
-	}
-	if len(failed) > 0 {
-		s.notifyEvent()
 	}
 	return failed, nil
 }
@@ -617,15 +570,15 @@ func (s *Store) BuildAdmissionUsage(
 	return queuedAndClaimed, claimed, nil
 }
 
-// CommitBuildEvent atomically updates the existing Build object, protected
-// Binding metadata, resource ownership, and latest durable event.
-func (s *Store) CommitBuildEvent(
+// CommitClusterBuildState atomically updates a cluster Build object, protected
+// Binding metadata, and node-local Admission/resource ownership.
+func (s *Store) CommitClusterBuildState(
 	ctx context.Context,
 	build *types.Build,
 	update nodeexec.EventUpdate,
 ) (*nodeexec.WorkflowRecord, error) {
 	if build == nil || build.BuildID == "" {
-		return nil, errors.New("store: Build event requires a Build object")
+		return nil, errors.New("store: Build state update requires a Build object")
 	}
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
 	if err != nil {
@@ -639,7 +592,7 @@ func (s *Store) CommitBuildEvent(
 	if record == nil {
 		return nil, ErrNodeWorkflowMissing
 	}
-	if err := validateBuildEventTransition(record, update); err != nil {
+	if err := validateBuildStateTransition(record, update); err != nil {
 		return nil, err
 	}
 	current, err := s.getBuildTx(ctx, tx, build.BuildID)
@@ -649,30 +602,26 @@ func (s *Store) CommitBuildEvent(
 	if current == nil {
 		return nil, errors.New("store: accepted Build object is missing")
 	}
-	if record.LatestEvent != nil && record.ObjectState == update.State {
-		if eventUpdateMatches(record.LatestEvent, update) {
-			changed, mergeErr := mergeBuildLaunchFields(current, build, update)
-			if mergeErr != nil {
-				return nil, mergeErr
-			}
-			if changed {
-				if err := s.putBuild(ctx, tx, current); err != nil {
-					return nil, err
-				}
-			}
-			if err := tx.Commit(); err != nil {
+	if record.ObjectState == update.State {
+		if !duplicateBuildUpdateMatches(current, update) {
+			return nil, ErrNodeWorkflowConflict
+		}
+		changed, mergeErr := mergeBuildRuntimeFields(current, build, update)
+		if mergeErr != nil {
+			return nil, mergeErr
+		}
+		if changed {
+			if err := s.putBuild(ctx, tx, current); err != nil {
 				return nil, err
 			}
-			return record, nil
 		}
-		return nil, ErrNodeWorkflowConflict
-	}
-	event, err := executionEventFor(record, update)
-	if err != nil {
-		return nil, err
+		if err := tx.Commit(); err != nil {
+			return nil, err
+		}
+		return record, nil
 	}
 	stored := cloneBuild(current)
-	if _, err := mergeBuildLaunchFields(stored, build, update); err != nil {
+	if _, err := mergeBuildRuntimeFields(stored, build, update); err != nil {
 		return nil, err
 	}
 	stored.Metadata, err = clusterstate.WithExecutionBinding(clusterstate.WithoutSystemMetadata(stored.Metadata), record.OpaqueBinding)
@@ -684,12 +633,10 @@ func (s *Store) CommitBuildEvent(
 		return nil, err
 	}
 	record.ObjectState = update.State
-	record.EventSeq = event.EventSeq
-	record.LatestEvent = event
 	switch update.State {
-	case string(clusterstate.BuildBuilding):
+	case string(types.BuildBuilding):
 		record.AdmissionState = nodeexec.AdmissionRunning
-	case string(clusterstate.BuildReady), string(clusterstate.BuildError):
+	case string(types.BuildReady), string(types.BuildError):
 		record.AdmissionState = nodeexec.AdmissionTerminal
 		record.ResourceClaimed = false
 	}
@@ -699,7 +646,6 @@ func (s *Store) CommitBuildEvent(
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
-	s.notifyEvent()
 	return record, nil
 }
 
@@ -807,13 +753,13 @@ func insertNodeWorkflowTx(ctx context.Context, tx *sql.Tx, record *nodeexec.Work
 	now := time.Now().Unix()
 	_, err = tx.ExecContext(ctx, `
 	INSERT INTO node_workflows (
-	  object_kind,object_id,group_name,route_key,node_id,node_epoch,data_endpoint,normalized_demand,demand_digest,
+	  object_kind,object_id,group_name,route_key,node_id,node_epoch,session_seq,data_endpoint,normalized_demand,demand_digest,
 	  dispatch_spec,dispatch_spec_digest,provider_policy_version,opaque_binding,binding_digest,build_demand_json,
 	  admission_state,result,reason,reservation_token,queue_sequence,resource_claimed,object_state,
 	  event_seq,acked_event_seq,latest_event_json,workflow_finalized,created_unix,updated_unix)
-	VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+	VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		record.Kind, record.ObjectID, record.Group, record.RouteKey, record.NodeID, encodeUint64(record.NodeEpoch),
-		record.DataEndpoint, record.NormalizedDemand, record.DemandDigest, record.DispatchSpec, record.DispatchSpecDigest,
+		encodeUint64(record.SessionSeq), record.DataEndpoint, record.NormalizedDemand, record.DemandDigest, record.DispatchSpec, record.DispatchSpecDigest,
 		record.ProviderPolicyVersion, record.OpaqueBinding, record.BindingDigest, string(buildDemandJSON), record.AdmissionState, record.Result,
 		record.Reason, record.ReservationToken, encodeUint64(record.QueueSequence), boolInt(record.ResourceClaimed),
 		record.ObjectState, encodeUint64(record.EventSeq), encodeUint64(record.AckedEventSeq), latestEventJSON,
@@ -932,12 +878,12 @@ WHERE object_kind=? AND object_id=?`,
 	return nil
 }
 
-func validateBuildEventTransition(record *nodeexec.WorkflowRecord, update nodeexec.EventUpdate) error {
-	if update.State == string(clusterstate.BuildReady) && update.ArtifactRef == "" {
-		return errors.New("store: BUILD_READY event requires an artifact reference")
+func validateBuildStateTransition(record *nodeexec.WorkflowRecord, update nodeexec.EventUpdate) error {
+	if update.State == string(types.BuildReady) && update.ArtifactRef == "" {
+		return errors.New("store: ready Build requires an artifact reference")
 	}
-	if update.State == string(clusterstate.BuildError) && update.Reason == "" {
-		return errors.New("store: BUILD_ERROR event requires a reason")
+	if update.State == string(types.BuildError) && update.Reason == "" {
+		return errors.New("store: failed Build requires a reason")
 	}
 	if record.AdmissionState == nodeexec.AdmissionRejected || record.AdmissionState == nodeexec.AdmissionQueued ||
 		record.WorkflowFinalized {
@@ -948,12 +894,14 @@ func validateBuildEventTransition(record *nodeexec.WorkflowRecord, update nodeex
 	}
 	allowed := false
 	switch record.ObjectState {
-	case "", string(clusterstate.BuildQueued):
-		allowed = update.State == string(clusterstate.BuildRegistered) || update.State == string(clusterstate.BuildError)
-	case string(clusterstate.BuildRegistered):
-		allowed = update.State == string(clusterstate.BuildBuilding) || update.State == string(clusterstate.BuildError)
-	case string(clusterstate.BuildBuilding):
-		allowed = update.State == string(clusterstate.BuildReady) || update.State == string(clusterstate.BuildError)
+	case "", string(types.BuildWaiting):
+		allowed = update.State == string(types.BuildRegistered) || update.State == string(types.BuildBuilding) ||
+			update.State == string(types.BuildError)
+	case string(types.BuildRegistered):
+		allowed = update.State == string(types.BuildWaiting) || update.State == string(types.BuildBuilding) ||
+			update.State == string(types.BuildError)
+	case string(types.BuildBuilding):
+		allowed = update.State == string(types.BuildReady) || update.State == string(types.BuildError)
 	}
 	if !allowed {
 		return ErrNodeWorkflowState
@@ -1010,7 +958,7 @@ func cloneSandbox(source *types.Sandbox) *types.Sandbox {
 	return &out
 }
 
-func mergeBuildLaunchFields(stored, incoming *types.Build, update nodeexec.EventUpdate) (bool, error) {
+func mergeBuildRuntimeFields(stored, incoming *types.Build, update nodeexec.EventUpdate) (bool, error) {
 	if stored == nil || incoming == nil {
 		return false, errors.New("store: Build launch field merge requires both objects")
 	}
@@ -1032,14 +980,11 @@ func mergeBuildLaunchFields(stored, incoming *types.Build, update nodeexec.Event
 		{name: "names", stored: &stored.Names, incoming: incoming.Names},
 		{name: "aliases", stored: &stored.Aliases, incoming: incoming.Aliases},
 	} {
-		if len(field.incoming) == 0 {
+		if len(field.incoming) == 0 || slices.Equal(*field.stored, field.incoming) {
 			continue
 		}
-		if len(*field.stored) != 0 && !slices.Equal(*field.stored, field.incoming) {
-			if update.State != string(clusterstate.BuildReady) || update.ArtifactRef == "" ||
-				!slices.Equal(appendUniqueString(*field.stored, update.ArtifactRef), field.incoming) {
-				return false, fmt.Errorf("%w: Build %s changed", ErrNodeWorkflowConflict, field.name)
-			}
+		if len(*field.stored) != 0 && update.State == string(types.BuildReady) &&
+			update.ArtifactRef != "" && slices.Equal(appendUniqueString(*field.stored, update.ArtifactRef), field.incoming) {
 			*field.stored = append([]string(nil), field.incoming...)
 			changed = true
 			continue
@@ -1047,9 +992,31 @@ func mergeBuildLaunchFields(stored, incoming *types.Build, update nodeexec.Event
 		if len(*field.stored) == 0 {
 			*field.stored = append([]string(nil), field.incoming...)
 			changed = true
+			continue
+		}
+		return false, fmt.Errorf("%w: Build %s changed", ErrNodeWorkflowConflict, field.name)
+	}
+	if update.State == string(types.BuildReady) {
+		if incoming.PersistID != update.ArtifactRef || incoming.PersistID == "" {
+			return false, ErrNodeWorkflowConflict
+		}
+		if stored.Kind != incoming.Kind || stored.StartCmd != incoming.StartCmd || stored.ReadyCmd != incoming.ReadyCmd {
+			stored.Kind, stored.StartCmd, stored.ReadyCmd = incoming.Kind, incoming.StartCmd, incoming.ReadyCmd
+			changed = true
 		}
 	}
 	return changed, nil
+}
+
+func duplicateBuildUpdateMatches(stored *types.Build, update nodeexec.EventUpdate) bool {
+	switch update.State {
+	case string(types.BuildReady):
+		return update.ArtifactRef != "" && stored.PersistID == update.ArtifactRef
+	case string(types.BuildError):
+		return update.Reason != "" && stored.Reason == update.Reason
+	default:
+		return true
+	}
 }
 
 func appendUniqueString(values []string, value string) []string {
@@ -1073,14 +1040,16 @@ func cloneMetadata(source map[string]string) map[string]string {
 
 func applyBuildState(build *types.Build, update nodeexec.EventUpdate) {
 	switch update.State {
-	case string(clusterstate.BuildRegistered):
+	case string(types.BuildRegistered):
 		build.Status = types.BuildRegistered
-	case string(clusterstate.BuildBuilding):
+	case string(types.BuildWaiting):
+		build.Status = types.BuildWaiting
+	case string(types.BuildBuilding):
 		build.Status = types.BuildBuilding
-	case string(clusterstate.BuildReady):
+	case string(types.BuildReady):
 		build.Status = types.BuildReady
 		build.PersistID = update.ArtifactRef
-	case string(clusterstate.BuildError):
+	case string(types.BuildError):
 		build.Status = types.BuildError
 		build.Reason = update.Reason
 	}
@@ -1125,11 +1094,24 @@ func (s *Store) LaunchableNodeWorkflows(
 	if limit <= 0 {
 		limit = 64
 	}
+	states := []nodeexec.AdmissionState{nodeexec.AdmissionAdmitted, nodeexec.AdmissionLaunching}
+	if kind == clusterstate.ExecutionKindBuild {
+		states = append(states, nodeexec.AdmissionRunning)
+	}
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(states)), ",")
+	args := []any{kind, nodeID, encodeUint64(nodeEpoch), afterObjectID}
+	for _, state := range states {
+		args = append(args, state)
+	}
+	stateFilter := ""
+	if kind == clusterstate.ExecutionKindBuild {
+		stateFilter = " AND object_state IN (?,?)"
+		args = append(args, types.BuildWaiting, types.BuildBuilding)
+	}
+	args = append(args, limit)
 	rows, err := s.db.QueryContext(ctx, `SELECT `+workflowColumns+` FROM node_workflows
-WHERE object_kind=? AND node_id=? AND node_epoch=? AND object_id>? AND admission_state IN (?,?)
-ORDER BY object_id LIMIT ?`,
-		kind, nodeID, encodeUint64(nodeEpoch), afterObjectID,
-		nodeexec.AdmissionAdmitted, nodeexec.AdmissionLaunching, limit)
+WHERE object_kind=? AND node_id=? AND node_epoch=? AND object_id>? AND admission_state IN (`+placeholders+`)
+`+stateFilter+` ORDER BY object_id LIMIT ?`, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -1224,9 +1206,9 @@ func (s *Store) ReleaseSandboxWorkflow(
 	return record, nil
 }
 
-// FailPendingNodeWorkflow durably terminates work that never created a business
-// object, such as an expired Sandbox queue entry. The Binding and error fact are
-// still replayed and fenced through the normal outbox.
+// FailPendingNodeWorkflow durably terminates Sandbox work that never created a
+// business object. The Binding and error fact are committed together and
+// replayed through the normal outbox.
 func (s *Store) FailPendingNodeWorkflow(
 	ctx context.Context,
 	kind clusterstate.ExecutionKind,
@@ -1234,6 +1216,9 @@ func (s *Store) FailPendingNodeWorkflow(
 ) (*nodeexec.WorkflowRecord, error) {
 	if objectID == "" || demandDigest == "" || reason == "" {
 		return nil, errors.New("store: failed workflow requires identity, demand digest, and reason")
+	}
+	if kind != clusterstate.ExecutionKindSandbox {
+		return nil, errors.New("store: only pending Sandbox workflows publish terminal events")
 	}
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
 	if err != nil {
@@ -1250,11 +1235,7 @@ func (s *Store) FailPendingNodeWorkflow(
 	if record.DemandDigest != demandDigest {
 		return nil, ErrNodeWorkflowConflict
 	}
-	state := "ERROR"
-	if kind == clusterstate.ExecutionKindBuild {
-		state = string(clusterstate.BuildError)
-	}
-	update := nodeexec.EventUpdate{State: state, Reason: reason}
+	update := nodeexec.EventUpdate{State: "ERROR", Reason: reason}
 	if record.AdmissionState == nodeexec.AdmissionTerminal {
 		if record.LatestEvent != nil && eventUpdateMatches(record.LatestEvent, update) {
 			if err := tx.Commit(); err != nil {
@@ -1272,10 +1253,7 @@ func (s *Store) FailPendingNodeWorkflow(
 		return nil, err
 	}
 	record.AdmissionState = nodeexec.AdmissionTerminal
-	if kind == clusterstate.ExecutionKindBuild {
-		record.ResourceClaimed = false
-	}
-	record.ObjectState = state
+	record.ObjectState = event.State
 	record.EventSeq = event.EventSeq
 	record.LatestEvent = event
 	if err := updateNodeWorkflowTx(ctx, tx, record); err != nil {
@@ -1323,10 +1301,10 @@ func (s *Store) PendingExecutionEvents(
 		maxBytes = 1 << 20
 	}
 	rows, err := s.db.QueryContext(ctx, `SELECT latest_event_json FROM node_workflows
-WHERE node_id=? AND node_epoch=? AND event_seq>acked_event_seq AND latest_event_json<>''
+	WHERE object_kind=? AND node_id=? AND node_epoch=? AND event_seq>acked_event_seq AND latest_event_json<>''
   AND (object_kind>? OR (object_kind=? AND object_id>?))
 ORDER BY object_kind,object_id LIMIT ?`,
-		nodeID, encodeUint64(nodeEpoch), afterKind, afterKind, after.ObjectID, maxCount)
+		clusterstate.ExecutionKindSandbox, nodeID, encodeUint64(nodeEpoch), afterKind, afterKind, after.ObjectID, maxCount)
 	if err != nil {
 		return nil, routesync.EventCursor{}, fmt.Errorf("store: query pending execution events: %w", err)
 	}
@@ -1390,6 +1368,9 @@ func (s *Store) AckExecutionEvent(
 	if err != nil {
 		return err
 	}
+	if kind != clusterstate.ExecutionKindSandbox {
+		return errors.New("store: only Sandbox execution events can be acknowledged")
+	}
 	if nodeID == "" || nodeEpoch == 0 {
 		return errors.New("store: incomplete execution event ACK")
 	}
@@ -1419,11 +1400,7 @@ func (s *Store) AckExecutionEvent(
 	if ack.EventSeq > record.AckedEventSeq {
 		record.AckedEventSeq = ack.EventSeq
 	}
-	if record.WorkflowFinalized && record.AckedEventSeq == record.EventSeq {
-		if _, err := tx.ExecContext(ctx, `DELETE FROM node_workflows WHERE object_kind=? AND object_id=?`, kind, ack.ObjectID); err != nil {
-			return err
-		}
-	} else if err := updateNodeWorkflowTx(ctx, tx, record); err != nil {
+	if err := updateNodeWorkflowTx(ctx, tx, record); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -1457,20 +1434,40 @@ func (s *Store) FinalizeNodeWorkflow(
 	if record.AdmissionState != nodeexec.AdmissionRejected && record.AdmissionState != nodeexec.AdmissionTerminal {
 		return ErrNodeWorkflowState
 	}
+	if kind == clusterstate.ExecutionKindBuild && record.Result != clusterstate.DispatchDefinitiveReject {
+		return fmt.Errorf("%w: accepted Build lifecycle is node-local", ErrNodeWorkflowState)
+	}
 	if record.ResourceClaimed {
 		return fmt.Errorf("%w: workflow cannot finalize before resource release", ErrNodeWorkflowState)
 	}
-	if record.EventSeq == record.AckedEventSeq {
-		if _, err := tx.ExecContext(ctx, `DELETE FROM node_workflows WHERE object_kind=? AND object_id=?`, kind, objectID); err != nil {
-			return err
-		}
-	} else {
-		record.WorkflowFinalized = true
-		if err := updateNodeWorkflowTx(ctx, tx, record); err != nil {
-			return err
-		}
+	record.WorkflowFinalized = true
+	if err := updateNodeWorkflowTx(ctx, tx, record); err != nil {
+		return err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	if record.EventSeq != record.AckedEventSeq {
+		return ErrNodeWorkflowOutboxPending
+	}
+	return nil
+}
+
+// CompactFinalizedNodeWorkflows removes only markers fenced by a strictly
+// newer durable SessionSeq. Commands from the old session tuple can no longer
+// pass node-link validation at that point.
+func (s *Store) CompactFinalizedNodeWorkflows(
+	ctx context.Context,
+	nodeID string,
+	nodeEpoch, currentSessionSeq uint64,
+) error {
+	if nodeID == "" || nodeEpoch == 0 || currentSessionSeq == 0 {
+		return errors.New("store: current node session identity is required for workflow compaction")
+	}
+	_, err := s.db.ExecContext(ctx, `DELETE FROM node_workflows
+WHERE node_id=? AND node_epoch=? AND session_seq<? AND workflow_finalized=1 AND event_seq=acked_event_seq`,
+		nodeID, encodeUint64(nodeEpoch), encodeUint64(currentSessionSeq))
+	return err
 }
 
 func parseExecutionKind(value string) (clusterstate.ExecutionKind, error) {
@@ -1563,6 +1560,9 @@ func executionEventFor(
 	record *nodeexec.WorkflowRecord,
 	update nodeexec.EventUpdate,
 ) (*routesync.ExecutionEvent, error) {
+	if record == nil || record.Kind != clusterstate.ExecutionKindSandbox {
+		return nil, errors.New("store: only Sandbox workflows publish execution events")
+	}
 	binding, err := clusterstate.DecodeExecutionBinding(record.OpaqueBinding)
 	if err != nil {
 		return nil, err

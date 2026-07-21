@@ -12,6 +12,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/placement"
 	"github.com/kuasar-sandbox/orchestrator/internal/session"
+	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
 type fixedTie bool
@@ -21,8 +22,26 @@ func (t fixedTie) ChooseSecond() (bool, error) { return bool(t), nil }
 type workflowStoreStub struct {
 	route  cluster.RouteWorkflowRecord
 	build  cluster.BuildRecord
+	fences map[string]cluster.ExecutionFence
 	events []string
 	fail   error
+}
+
+func (s *workflowStoreStub) EnsureExecutionFence(_ context.Context, fence cluster.ExecutionFence) error {
+	if s.fail != nil {
+		return s.fail
+	}
+	if s.route.State != cluster.WorkflowRouteTombstone || s.route.Tombstone.PlacementFailure == nil {
+		return errors.New("placement fence was not preceded by a tombstone")
+	}
+	if s.fences == nil {
+		s.fences = make(map[string]cluster.ExecutionFence)
+	}
+	fence.Revision = s.route.Revision
+	fence.Revision.LogIndex++
+	s.fences[fence.SandboxID] = fence
+	s.events = append(s.events, "commit:placement-fence:"+fence.SandboxID)
+	return nil
 }
 
 func (s *workflowStoreStub) CommitRouteWorkflow(_ context.Context, expected cluster.Revision, next cluster.RouteWorkflowRecord) (cluster.RouteWorkflowRecord, error) {
@@ -62,8 +81,11 @@ func describeRouteCommit(record cluster.RouteWorkflowRecord) string {
 }
 
 func describeBuildCommit(record cluster.BuildRecord) string {
-	if record.State == cluster.BuildError {
+	if record.State == cluster.BuildTombstone {
 		return "commit:build-terminal"
+	}
+	if record.State == cluster.BuildRegistered {
+		return "commit:build-registered"
 	}
 	if record.Starting.SelectedCandidate != nil {
 		return "commit:select:" + record.Starting.CandidatePool[*record.Starting.SelectedCandidate].NodeID
@@ -133,12 +155,20 @@ func (d *dispatcherStub) AdmitAndDispatch(_ context.Context, request session.Dis
 type roundSourceStub struct {
 	sandboxID  string
 	candidates []cluster.PlacementCandidate
+	intent     *cluster.DispatchIntent
 	calls      int
 }
 
-func (s *roundSourceStub) NextSandboxRound(_ context.Context, _, _ string, _ uint64, _ cluster.DispatchIntent) (string, []cluster.PlacementCandidate, error) {
+func (s *roundSourceStub) NextSandboxRound(_ context.Context, _, _ string, _ uint64, previous cluster.DispatchIntent, _ []string) (SandboxRound, error) {
 	s.calls++
-	return s.sandboxID, append([]cluster.PlacementCandidate(nil), s.candidates...), nil
+	intent := previous
+	if s.intent != nil {
+		intent = *s.intent
+	}
+	return SandboxRound{
+		SandboxID: s.sandboxID, Candidates: append([]cluster.PlacementCandidate(nil), s.candidates...),
+		Intent: cloneIntent(intent),
+	}, nil
 }
 
 func TestRouteCoordinatorCommitsSelectionBeforeDispatch(t *testing.T) {
@@ -297,13 +327,52 @@ func TestSandboxRoundLimitAndBuildPoolExhaustionCommitTerminalState(t *testing.T
 	build := buildStartingRecord(t, "b1", candidatePool("n1", "n2"), rejected)
 	store.build = build
 	result, err = coordinator.RunBuild(context.Background(), build)
-	if err != nil || result.Status != RunTerminal || result.Build == nil || result.Build.State != cluster.BuildError || result.Build.Failure == nil {
+	if err != nil || result.Status != RunTerminal || result.Build == nil || result.Build.State != cluster.BuildTombstone ||
+		result.Build.Tombstone == nil {
 		t.Fatalf("Build result = %+v, %v", result, err)
+	}
+}
+
+func TestBuildAdmissionAckCommitsRegistrationAndCompletesWorkflow(t *testing.T) {
+	record := buildStartingRecord(t, "b1", candidatePool("n1", "n2"), nil)
+	store := &workflowStoreStub{build: record}
+	prober := &pairProberStub{responses: map[string]placement.PlacementProbeResponse{
+		"n1": probeResponse("n1", placement.ProbeImmediate, 1),
+		"n2": probeResponse("n2", placement.ProbeWouldQueue, 2),
+	}}
+	dispatcher := &dispatcherStub{store: store, results: map[string][]session.DispatchReply{
+		"n1": {{Outcome: cluster.DispatchAcceptedQueued}},
+	}}
+	coordinator := newTestCoordinator(t, store, prober, dispatcher, nil)
+	result, err := coordinator.RunBuild(context.Background(), record)
+	if err != nil || result.Status != RunComplete || result.Build == nil ||
+		result.Build.State != cluster.BuildRegistered || result.Build.Projection == nil {
+		t.Fatalf("Build registration result = %+v, %v", result, err)
+	}
+	projection := result.Build.Projection
+	if projection.BuildID != "b1" || projection.NodeID != "n1" || projection.DataEndpoint != "n1:8443" ||
+		projection.TemplateRef != "template-1" {
+		t.Fatalf("Build registration projection = %+v", projection)
+	}
+	if !reflect.DeepEqual(store.events, []string{"commit:select:n1", "dispatch:n1", "commit:build-registered"}) {
+		t.Fatalf("Build registration events = %v", store.events)
 	}
 }
 
 func TestExhaustedSandboxRoundCommitsNewIDBeforeNewPlacement(t *testing.T) {
 	record := routeStartingRecord(t, "s1", 1, candidatePool("n1", "n2"), []uint32{0, 1})
+	priorBinding, err := makeBinding(
+		"g1", cluster.ExecutionKindSandbox, record.Group, record.RouteKey, "prior-sandbox",
+		record.Starting.Intent, probeResponse("prior-node", placement.ProbeImmediate, 1),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	priorFinalization, err := cluster.NewWorkflowFinalizationIntent("prior-sandbox", priorBinding, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record.Finalizations = []cluster.WorkflowFinalizationIntent{priorFinalization}
 	store := &workflowStoreStub{route: record}
 	rounds := &roundSourceStub{sandboxID: "s2", candidates: candidatePool("n3", "n4")}
 	prober := &pairProberStub{responses: map[string]placement.PlacementProbeResponse{
@@ -319,6 +388,13 @@ func TestExhaustedSandboxRoundCommitsNewIDBeforeNewPlacement(t *testing.T) {
 	}
 	if len(dispatcher.requests) != 1 || dispatcher.requests[0].ObjectID != "s2" {
 		t.Fatalf("dispatches = %+v", dispatcher.requests)
+	}
+	if len(result.Route.Finalizations) != 1 || result.Route.Finalizations[0].BindingDigest != priorFinalization.BindingDigest {
+		t.Fatalf("prior finalization was lost across placement rounds: %+v", result.Route.Finalizations)
+	}
+	wantPrefix := []string{"commit:route-terminal", "commit:placement-fence:s1"}
+	if len(store.events) < len(wantPrefix) || !reflect.DeepEqual(store.events[:len(wantPrefix)], wantPrefix) {
+		t.Fatalf("round handoff events = %v", store.events)
 	}
 }
 
@@ -392,7 +468,20 @@ func routeStartingRecord(t *testing.T, sandboxID string, round uint64, candidate
 	if err != nil {
 		t.Fatal(err)
 	}
-	intent, err := cluster.NewDispatchIntent(demand, []byte(`{"template":"t1"}`), "provider-v1/policy-v1")
+	templateRef := "e2b-img-" + strings.Repeat("c", 64)
+	spec, err := cluster.MarshalSandboxDispatchSpec(cluster.SandboxDispatchSpecV1{
+		Version: cluster.DispatchSpecVersionV1, TemplateRef: templateRef,
+		AuthKeyFingerprint: strings.Repeat("a", 24), ManifestKeyFingerprint: strings.Repeat("b", 24),
+		AccessToken: "access-token", TargetPort: 3000,
+		Request: cluster.NodeRequestEnvelopeV1{
+			Version: cluster.NodeRequestEnvelopeVersionV1, Method: "POST", Path: "/sandboxes",
+			Body: []byte(`{"templateID":"` + templateRef + `"}`),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	intent, err := cluster.NewDispatchIntent(demand, spec, "provider-v1/policy-v1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -416,7 +505,19 @@ func buildStartingRecord(t *testing.T, buildID string, candidates []cluster.Plac
 	if err != nil {
 		t.Fatal(err)
 	}
-	intent, err := cluster.NewDispatchIntent(demand, []byte(`{"build":"spec"}`), "provider-v1/policy-v1")
+	spec, err := cluster.MarshalBuildDispatchSpec(cluster.BuildDispatchSpecV1{
+		Version: cluster.DispatchSpecVersionV1, TemplateID: "template-1",
+		AuthKeyFingerprint: strings.Repeat("b", 24), ManifestKeyFingerprint: strings.Repeat("c", 24),
+		Profile: types.ProfileBare, CPUCount: 1, MemoryMB: 512,
+		Request: cluster.NodeRequestEnvelopeV1{
+			Version: cluster.NodeRequestEnvelopeVersionV1, Method: "POST", Path: "/v3/templates",
+			Body: []byte(`{"cpuCount":1,"memoryMB":512}`),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	intent, err := cluster.NewDispatchIntent(demand, spec, "provider-v1/policy-v1")
 	if err != nil {
 		t.Fatal(err)
 	}

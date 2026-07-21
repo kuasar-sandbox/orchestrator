@@ -9,9 +9,11 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
+	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
 type fakeService struct {
@@ -39,7 +41,7 @@ func TestReplicaLocalRouteReadNeverReturnsFinalNegative(t *testing.T) {
 	}
 	request.Strong = false
 	request.MinRouteRevision = 12
-	if err := (ReadRouteResponse{Outcome: ReadReady, Group: "/g", RouteKey: "rk", Route: testReadyRoute(), RouteRevision: 11}).ValidateFor(request); err == nil {
+	if err := (ReadRouteResponse{Outcome: ReadReady, Group: "/g", RouteKey: "rk", State: clusterstate.WorkflowRouteReady, Route: testReadyRoute(), RouteRevision: 11}).ValidateFor(request); err == nil {
 		t.Fatal("READY below min_route_revision accepted")
 	}
 	response := ReadRouteResponse{
@@ -52,7 +54,7 @@ func TestReplicaLocalRouteReadNeverReturnsFinalNegative(t *testing.T) {
 }
 
 func TestTrustedHandlerRequiresInternalTransportIdentity(t *testing.T) {
-	service := fakeService{route: ReadRouteResponse{Outcome: ReadReady, Group: "/g", RouteKey: "rk", Route: testReadyRoute(), RouteRevision: 12}}
+	service := fakeService{route: ReadRouteResponse{Outcome: ReadReady, Group: "/g", RouteKey: "rk", State: clusterstate.WorkflowRouteReady, Route: testReadyRoute(), RouteRevision: 12}}
 	body, _ := json.Marshal(routeRequest(false))
 	untrusted := httptest.NewRequest(http.MethodPost, ReadRoutePath, bytes.NewReader(body))
 	w := httptest.NewRecorder()
@@ -91,7 +93,7 @@ func TestPositiveReadsRequireExactTableKeyIdentity(t *testing.T) {
 	request := routeRequest(false)
 	response := ReadRouteResponse{
 		Outcome: ReadReady, Group: request.Group, RouteKey: request.RouteKey,
-		Route: testReadyRoute(), RouteRevision: 1,
+		State: clusterstate.WorkflowRouteReady, Route: testReadyRoute(), RouteRevision: 1,
 	}
 	if err := response.ValidateFor(request); err != nil {
 		t.Fatal(err)
@@ -102,13 +104,10 @@ func TestPositiveReadsRequireExactTableKeyIdentity(t *testing.T) {
 	}
 
 	buildRequest := ReadBuildRequest{RequestIdentity: request.RequestIdentity, Group: "/g", BuildID: "b1"}
-	build := &clusterstate.BuildProjection{
-		BuildID: "b1", NodeID: "n1", NodeEpoch: 7, RegistryGeneration: "g1",
-		BindingDigest: testReadyRoute().BindingDigest, LastEventSeq: 1,
-	}
+	build := testBuildProjection()
 	buildResponse := ReadBuildResponse{
 		Outcome: ReadReady, Group: "/g", Build: build,
-		BuildState: clusterstate.BuildBuilding, BuildRevision: 1,
+		BuildState: clusterstate.BuildRegistered, BuildRevision: 1,
 	}
 	if err := buildResponse.ValidateFor(buildRequest); err != nil {
 		t.Fatal(err)
@@ -119,40 +118,56 @@ func TestPositiveReadsRequireExactTableKeyIdentity(t *testing.T) {
 	}
 }
 
-func TestBuildReadResponseEnforcesOutcomeUnionAndReadyArtifact(t *testing.T) {
+func TestBuildReadResponseOnlyExposesRegistrationBinding(t *testing.T) {
 	request := routeRequest(true)
 	buildRequest := ReadBuildRequest{RequestIdentity: request.RequestIdentity, Group: "/g", BuildID: "b1", Strong: true}
-	build := &clusterstate.BuildProjection{
-		BuildID: "b1", NodeID: "n1", NodeEpoch: 7, RegistryGeneration: "g1",
-		BindingDigest: testReadyRoute().BindingDigest, LastEventSeq: 1,
-	}
+	build := testBuildProjection()
 
 	missing := ReadBuildResponse{Outcome: ReadNotFound, Build: build}
 	if err := missing.ValidateFor(buildRequest); err == nil {
 		t.Fatal("NOT_FOUND response carrying a Build projection was accepted")
 	}
-	ready := ReadBuildResponse{
+	registered := ReadBuildResponse{
 		Outcome: ReadReady, Group: "/g", Build: build,
-		BuildState: clusterstate.BuildReady, BuildRevision: 1,
+		BuildState: clusterstate.BuildRegistered, BuildRevision: 1,
 	}
-	if err := ready.ValidateFor(buildRequest); err == nil {
-		t.Fatal("READY Build without an artifact was accepted")
+	if err := registered.ValidateFor(buildRequest); err != nil {
+		t.Fatalf("registered Build binding: %v", err)
 	}
-	ready.Build.ArtifactRef = "manifest://artifact"
-	if err := ready.ValidateFor(buildRequest); err != nil {
-		t.Fatalf("READY Build with artifact: %v", err)
+	registered.BuildState = clusterstate.BuildStarting
+	if err := registered.ValidateFor(buildRequest); err == nil {
+		t.Fatal("unbound BUILD_STARTING projection was exposed as a positive read")
 	}
-	errorResponse := ReadBuildResponse{
-		Outcome: ReadReady, Group: "/g", Build: build,
-		BuildState: clusterstate.BuildError, BuildRevision: 1,
+	pending := ReadBuildResponse{
+		Outcome: ReadConflict, Group: "/g", BuildState: clusterstate.BuildStarting, BuildRevision: 2,
+		Pending: &PendingBuildProjection{BuildID: "b1", TemplateRef: "transient-b1", Profile: types.ProfileE2B},
 	}
-	errorResponse.Build.ArtifactRef = ""
-	if err := errorResponse.ValidateFor(buildRequest); err == nil {
-		t.Fatal("BUILD_ERROR without a reason was accepted")
+	if err := pending.ValidateFor(buildRequest); err != nil {
+		t.Fatalf("strong pending Build projection: %v", err)
 	}
-	errorResponse.Build.Reason = "builder failed"
-	if err := errorResponse.ValidateFor(buildRequest); err != nil {
-		t.Fatalf("BUILD_ERROR with reason: %v", err)
+	buildRequest.Strong = false
+	if err := pending.ValidateFor(buildRequest); err == nil {
+		t.Fatal("replica-local read accepted a pending Build projection")
+	}
+}
+
+func TestPausedProjectionRequiresExplicitStrongAddressableRead(t *testing.T) {
+	request := routeRequest(false)
+	request.Addressable = true
+	if err := request.Validate(); err == nil {
+		t.Fatal("replica-local addressable projection request was accepted")
+	}
+	request.Strong = true
+	response := ReadRouteResponse{
+		Outcome: ReadReady, Group: request.Group, RouteKey: request.RouteKey,
+		State: clusterstate.WorkflowRoutePaused, Route: testReadyRoute(), RouteRevision: 12,
+	}
+	if err := response.ValidateFor(request); err != nil {
+		t.Fatalf("strong addressable PAUSED projection: %v", err)
+	}
+	request.Addressable = false
+	if err := response.ValidateFor(request); err == nil {
+		t.Fatal("ordinary strong read accepted a PAUSED projection")
 	}
 }
 
@@ -176,15 +191,46 @@ func routeRequest(strong bool) ReadRouteRequest {
 			ClusterID: "cluster-1", RegistryGeneration: "g1", SystemEpoch: 2,
 			RegistryLayoutDigest: "manifest-digest", ShardID: 7,
 		},
-		Group: "/g", RouteKey: "rk", SandboxID: "s1", Strong: strong,
+		Group: "/g", RouteKey: "rk", Strong: strong,
 	}
 }
 
 func testReadyRoute() *clusterstate.ReadyRoute {
 	digest := sha256.Sum256([]byte("binding"))
+	templateRef := "e2b-img-" + strings.Repeat("c", 64)
+	spec, _ := clusterstate.MarshalSandboxDispatchSpec(clusterstate.SandboxDispatchSpecV1{
+		Version: clusterstate.DispatchSpecVersionV1, TemplateRef: templateRef,
+		AuthKeyFingerprint: strings.Repeat("a", 24), ManifestKeyFingerprint: strings.Repeat("b", 24),
+		AccessToken: "token", TargetPort: 3000,
+		Request: clusterstate.NodeRequestEnvelopeV1{
+			Version: clusterstate.NodeRequestEnvelopeVersionV1, Method: "POST", Path: "/sandboxes",
+			Body: []byte(`{"templateID":"` + templateRef + `"}`),
+		},
+	})
+	intent, _ := clusterstate.NewDispatchIntent([]byte("demand"), spec, "provider-v1")
 	return &clusterstate.ReadyRoute{
 		SandboxID: "s1", NodeID: "n1", NodeEpoch: 7, DataEndpoint: "10.0.0.1:8443",
-		AccessToken: "token", TemplateRef: "e2b-snp-t1", RegistryGeneration: "g1",
-		BindingDigest: hex.EncodeToString(digest[:]), LastEventSeq: 3,
+		TargetPort: 3000, AccessToken: "token", TrafficAccessToken: "traffic-token",
+		TemplateRef: templateRef, RegistryGeneration: "g1",
+		BindingDigest: hex.EncodeToString(digest[:]), LastEventSeq: 3, Intent: intent,
+	}
+}
+
+func testBuildProjection() *clusterstate.BuildProjection {
+	digest := sha256.Sum256([]byte("build-binding"))
+	spec, _ := clusterstate.MarshalBuildDispatchSpec(clusterstate.BuildDispatchSpecV1{
+		Version: clusterstate.DispatchSpecVersionV1, TemplateID: "template-1",
+		AuthKeyFingerprint: strings.Repeat("b", 24), ManifestKeyFingerprint: strings.Repeat("c", 24),
+		Profile: types.ProfileBare, CPUCount: 1, MemoryMB: 512,
+		Request: clusterstate.NodeRequestEnvelopeV1{
+			Version: clusterstate.NodeRequestEnvelopeVersionV1, Method: "POST", Path: "/v3/templates",
+			Body: []byte(`{"cpuCount":1,"memoryMB":512}`),
+		},
+	})
+	intent, _ := clusterstate.NewDispatchIntent([]byte("demand"), spec, "provider-v1")
+	return &clusterstate.BuildProjection{
+		BuildID: "b1", NodeID: "n1", NodeEpoch: 7, DataEndpoint: "10.0.0.1:8443",
+		RegistryGeneration: "g1", BindingDigest: hex.EncodeToString(digest[:]),
+		Intent: intent, TemplateRef: "template-1",
 	}
 }

@@ -549,28 +549,34 @@ func (a *Authority) FailSandbox(ctx context.Context, record *WorkflowRecord, rea
 func (a *Authority) FinalizeWorkflow(
 	ctx context.Context,
 	kind clusterstate.ExecutionKind,
-	objectID, demandDigest, bindingDigest string,
+	objectID, bindingDigest string,
 ) error {
 	done, active := a.beginSessionWork()
 	if !active {
 		return ErrSessionFenced
 	}
 	defer done()
-	if objectID == "" || demandDigest == "" || bindingDigest == "" {
-		return errors.New("nodeexec: finalization requires object identity and digests")
+	if objectID == "" || bindingDigest == "" {
+		return errors.New("nodeexec: finalization requires object identity and Binding digest")
 	}
 	record, err := a.journal.GetNodeWorkflow(ctx, kind, objectID)
 	if err != nil {
 		return err
 	}
-	if record != nil && record.DemandDigest != demandDigest {
+	if record == nil {
+		return a.journal.FinalizeNodeWorkflow(ctx, kind, objectID, bindingDigest)
+	}
+	if record.BindingDigest != bindingDigest {
 		return ErrWorkflowConflict
 	}
-	if err := a.journal.FinalizeNodeWorkflow(ctx, kind, objectID, bindingDigest); err != nil {
-		return err
+	finalizeErr := a.journal.FinalizeNodeWorkflow(ctx, kind, objectID, bindingDigest)
+	if finalizeErr != nil && !errors.Is(finalizeErr, ErrFinalOutboxPending) {
+		return finalizeErr
 	}
 	if kind == clusterstate.ExecutionKindSandbox {
-		return a.sandbox.FinalizeAdmission(objectID, demandDigest)
+		if err := a.sandbox.FinalizeAdmission(objectID, record.DemandDigest); err != nil {
+			return err
+		}
 	}
-	return nil
+	return finalizeErr
 }
