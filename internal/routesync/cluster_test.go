@@ -97,7 +97,8 @@ func TestNodeLinkCodecRoundTrip(t *testing.T) {
 	load := &PlacementLoadSnapshot{
 		NodeID: "n1", NodeEpoch: 7, SessionSeq: 11, DataEndpoint: "10.0.0.1:8443",
 		SampleSeq: 3, LoadModelVersion: 1, SandboxSlotCapacity: 10,
-		SandboxQueueLimit: 20, SandboxRateTokenAvailable: true,
+		EmergencyReservedMemory: 512 << 20,
+		SandboxQueueLimit:       20, SandboxRateTokenAvailable: true,
 	}
 	l := roundTrip(t, &Msg{Type: TypePlacementLoad, Load: load})
 	if l.Load == nil || *l.Load != *load {

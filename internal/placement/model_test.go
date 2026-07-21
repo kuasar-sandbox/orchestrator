@@ -31,10 +31,23 @@ func TestProjectedSandboxRateAndBuildReservation(t *testing.T) {
 		t.Fatalf("probe = %+v", response)
 	}
 
+	// The producer's allocatable pool already excludes the Build reservation;
+	// carrying it for observability must not subtract it a second time.
 	snapshot.BuildReservedMemory = 7 << 30
 	response = ProbePlacement(snapshot, 100*time.Millisecond, request)
+	if response.Class != ProbeImmediate || response.Components.MemoryPPM != 750_000 {
+		t.Fatalf("double-counted build reservation = %+v", response)
+	}
+
+	snapshot.EmergencyReservedMemory = 3 << 30
+	response = ProbePlacement(snapshot, 100*time.Millisecond, request)
+	if response.Class != ProbeWouldQueue || response.Components.MemoryPPM != 1_200_000 {
+		t.Fatalf("emergency-reserved headroom = %+v", response)
+	}
+	snapshot.EmergencyReservedMemory = 7 << 30
+	response = ProbePlacement(snapshot, 100*time.Millisecond, request)
 	if response.Class != ProbeReject {
-		t.Fatalf("overlapping build reservation = %+v", response)
+		t.Fatalf("insufficient ordinary memory pool = %+v", response)
 	}
 }
 
@@ -54,6 +67,11 @@ func TestProbeFreshnessAndUnknownCapacityFailClosed(t *testing.T) {
 	request.LoadModelVersion++
 	if got := ProbePlacement(baseSnapshot(), 0, request); got.Class != ProbeStale {
 		t.Fatalf("model mismatch probe = %+v", got)
+	}
+	snapshot = baseSnapshot()
+	snapshot.LoadModelVersion++
+	if err := ValidateSnapshot(snapshot); err == nil {
+		t.Fatal("unsupported load-model snapshot was accepted")
 	}
 }
 
