@@ -184,7 +184,7 @@ func (d *Directory) MergeFull(records []DirectoryRecord) int {
 		if d.Apply(DirectoryDelta{Entry: record.Entry, Up: record.Available && !record.Conflict}) {
 			changed++
 		}
-		if record.Conflict {
+		if record.Conflict && d.authority != nil && d.authority.AllowDirectoryEntry(record.Entry) {
 			d.mu.Lock()
 			current, found := d.records[record.Entry.NodeID]
 			if found && current.Entry.Tuple.Compare(record.Entry.Tuple) == 0 {
