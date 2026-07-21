@@ -27,18 +27,38 @@ Commands and results:
 
 - [ ] The change has completed code review.
 - [ ] Review conversations are resolved.
-- [ ] The exact pull request head SHA has been recorded.
-- [ ] `BMS E2E / e2e` succeeded for that exact SHA on a trusted runner path.
-- [ ] The pull request head has not changed since the successful check.
+- [ ] The current base SHA and reviewed pull request head SHA have been recorded.
+- [ ] The tested integration commit has exactly those base/head SHAs as its two parents.
+- [ ] The workflow was dispatched with `--ref main`, whose SHA matched the recorded base.
+- [ ] `BMS E2E / e2e` succeeded for that integration SHA.
+- [ ] Neither the pull request base nor head has changed since the successful check.
 - [ ] The pull request will be squash merged manually; auto-merge is not used.
 
-PR head SHA:
+Base SHA:
 
 ```text
 
 ```
 
-BMS E2E run:
+Reviewed head SHA:
+
+```text
+
+```
+
+Integration SHA:
+
+```text
+
+```
+
+Trusted workflow SHA:
+
+```text
+
+```
+
+BMS E2E run URL:
 
 ```text
 
