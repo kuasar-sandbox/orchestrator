@@ -325,7 +325,7 @@ func (n *redirectNodeStub) HandleCommand(ctx context.Context, cmd *routesync.Com
 		}
 		n.mu.Unlock()
 		if sid != "" {
-			n.publishEvent(routesync.Event{Kind: routesync.TypeDelete, SID: sid})
+			n.publishEvent(routesync.Event{Kind: routesync.TypeDelete, Delete: routesync.RouteDelete{SandboxID: sid}})
 		}
 	}
 	return &routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted}

@@ -20,7 +20,7 @@ func TestRouteReplayUsesFingerprintToken(t *testing.T) {
 	if token != "fp-test:1" {
 		t.Fatalf("token=%q, want fp-test:1", token)
 	}
-	o.publish(routesync.Event{Kind: routesync.TypeDelete, SID: "s1"})
+	o.publish(routesync.Event{Kind: routesync.TypeDelete, Delete: routesync.RouteDelete{SandboxID: "s1"}})
 
 	var got []routesync.Event
 	if err := o.Replay(context.Background(), 1, func(ev routesync.Event) error {
@@ -29,7 +29,7 @@ func TestRouteReplayUsesFingerprintToken(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 1 || got[0].Kind != routesync.TypeDelete || got[0].SID != "s1" {
+	if len(got) != 1 || got[0].Kind != routesync.TypeDelete || got[0].Delete.SandboxID != "s1" {
 		t.Fatalf("replay=%+v, want delete s1", got)
 	}
 	if fp := o.SourceFingerprint(); fp != "fp-test" {

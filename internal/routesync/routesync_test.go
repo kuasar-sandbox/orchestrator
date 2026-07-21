@@ -20,7 +20,7 @@ import (
 type fakeSink struct {
 	begin chan struct{}
 	up    chan routesync.RouteEntry
-	del   chan string
+	del   chan routesync.RouteDelete
 	book  chan struct{}
 	pol   chan routesync.Policy
 }
@@ -29,17 +29,17 @@ func newFakeSink() *fakeSink {
 	return &fakeSink{
 		begin: make(chan struct{}, 4),
 		up:    make(chan routesync.RouteEntry, 4),
-		del:   make(chan string, 4),
+		del:   make(chan routesync.RouteDelete, 4),
 		book:  make(chan struct{}, 4),
 		pol:   make(chan routesync.Policy, 4),
 	}
 }
 
-func (f *fakeSink) BeginSync()                         { f.begin <- struct{}{} }
-func (f *fakeSink) ApplyUpsert(r routesync.RouteEntry) { f.up <- r }
-func (f *fakeSink) ApplyDelete(sid string)             { f.del <- sid }
-func (f *fakeSink) Bookmark()                          { f.book <- struct{}{} }
-func (f *fakeSink) SetPolicy(p routesync.Policy)       { f.pol <- p }
+func (f *fakeSink) BeginSync()                               { f.begin <- struct{}{} }
+func (f *fakeSink) ApplyUpsert(r routesync.RouteEntry)       { f.up <- r }
+func (f *fakeSink) ApplyDelete(delete routesync.RouteDelete) { f.del <- delete }
+func (f *fakeSink) Bookmark()                                { f.book <- struct{}{} }
+func (f *fakeSink) SetPolicy(p routesync.Policy)             { f.pol <- p }
 
 type fakeWakes struct{ ch chan routesync.RouteWake }
 
@@ -158,8 +158,8 @@ func TestRouteSyncRoundtrip(t *testing.T) {
 	}
 
 	// A delete too.
-	src.sub <- routesync.Event{Kind: routesync.TypeDelete, SID: "s1"}
-	if del := recv(t, sink.del, "delete"); del != "s1" {
+	src.sub <- routesync.Event{Kind: routesync.TypeDelete, Delete: routesync.RouteDelete{SandboxID: "s1"}}
+	if del := recv(t, sink.del, "delete"); del.SandboxID != "s1" {
 		t.Fatalf("delete = %q", del)
 	}
 

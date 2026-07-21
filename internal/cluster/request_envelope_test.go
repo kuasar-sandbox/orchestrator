@@ -15,6 +15,7 @@ func TestNodeRequestEnvelopePreservesOrdinaryRequestData(t *testing.T) {
 		"X-Kuasar-Sandbox-Network": {`{"hostname":"worker"}`},
 		"Authorization":            {"Bearer caller-secret"},
 		"X-API-KEY":                {"caller-secret"},
+		"X-Kuasar-Migration-Token": {"caller-secret"},
 		"X-Kuasar-Node-Epoch":      {"forged"},
 		"Connection":               {"X-Hop"},
 		"X-Hop":                    {"drop"},
@@ -31,7 +32,7 @@ func TestNodeRequestEnvelopePreservesOrdinaryRequestData(t *testing.T) {
 		envelope.Header["X-Kuasar-Sandbox-Network"] == nil {
 		t.Fatalf("ordinary headers were not preserved: %#v", envelope.Header)
 	}
-	for _, protected := range []string{"Authorization", "X-Api-Key", "X-Kuasar-Node-Epoch", "Connection", "X-Hop"} {
+	for _, protected := range []string{"Authorization", "X-Api-Key", "X-Kuasar-Migration-Token", "X-Kuasar-Node-Epoch", "Connection", "X-Hop"} {
 		if _, exists := envelope.Header[protected]; exists {
 			t.Fatalf("protected header %q was persisted", protected)
 		}
@@ -85,5 +86,18 @@ func TestNodeRequestEnvelopeRejectsNonCanonicalOrOversizedInput(t *testing.T) {
 		"Bad Header": {"value"},
 	}, []byte(`{}`)); err == nil {
 		t.Fatal("invalid HTTP header name accepted")
+	}
+	for name, value := range map[string]string{
+		"invalid UTF-8": string([]byte{'x', 0xff}),
+		"control":       "before\x01after",
+		"delete":        "before\x7fafter",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := NewNodeRequestEnvelopeV1(http.MethodPost, "/sandboxes", "", http.Header{
+				"X-Extension": {value},
+			}, []byte(`{}`)); err == nil {
+				t.Fatal("invalid HTTP header value accepted")
+			}
+		})
 	}
 }

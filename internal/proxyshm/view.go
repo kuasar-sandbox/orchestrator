@@ -55,9 +55,10 @@ func (v *MasterView) ApplyUpsert(r routesync.RouteEntry) {
 	v.notify.Notify()
 }
 
-func (v *MasterView) ApplyDelete(sid string) {
-	v.table.Delete(sid)
-	v.notify.Notify()
+func (v *MasterView) ApplyDelete(delete routesync.RouteDelete) {
+	if v.table.DeleteRoute(delete) {
+		v.notify.Notify()
+	}
 }
 
 func (v *MasterView) Bookmark() {
@@ -282,6 +283,21 @@ func (v *WorkerView) waitForRoute(ctx context.Context, request proxy.RouteReques
 			return proxy.Route{Kind: proxy.KindRouteInactive}, nil
 		}
 		if !v.waitChange(ctx, deadline, rev) {
+			// The deadline and an Upsert notification can become ready together.
+			// Re-read once so a committed resume is not reported as inactive.
+			latest, found := v.table.Lookup(request.SandboxID)
+			if !found {
+				if request.HasExecutionFence() {
+					return proxy.Route{Kind: proxy.KindWrongBinding}, nil
+				}
+				return proxy.Route{Kind: proxy.KindNotFound}, nil
+			}
+			if kind, failed := routeFenceFailure(request, latest); failed {
+				return proxy.Route{Kind: kind}, nil
+			}
+			if latest.State == routesync.StateRunning {
+				return routeForEntry(latest, request.Port), nil
+			}
 			return proxy.Route{Kind: proxy.KindRouteInactive}, nil
 		}
 	}
