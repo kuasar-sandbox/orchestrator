@@ -122,9 +122,23 @@ type BuildEvent struct {
 }
 
 type EventAck struct {
-	ObjectKind string `json:"object_kind"` // sandbox | build
-	ObjectID   string `json:"object_id"`
-	EventSeq   uint64 `json:"event_seq"`
+	ObjectKind         string `json:"object_kind"` // sandbox | build
+	ObjectID           string `json:"object_id"`
+	RegistryGeneration string `json:"registry_generation"`
+	BindingDigest      string `json:"binding_digest"`
+	EventSeq           uint64 `json:"event_seq"`
+}
+
+func (a EventAck) Validate() error {
+	if (a.ObjectKind != "sandbox" && a.ObjectKind != "build") || a.ObjectID == "" ||
+		a.RegistryGeneration == "" || a.EventSeq == 0 {
+		return errors.New("routesync: incomplete execution event ACK")
+	}
+	digest, err := hex.DecodeString(a.BindingDigest)
+	if err != nil || len(digest) != 32 {
+		return errors.New("routesync: execution event ACK Binding digest must be SHA-256 hex")
+	}
+	return nil
 }
 
 // EventCursor is process-local replay pagination, not an execution identity or

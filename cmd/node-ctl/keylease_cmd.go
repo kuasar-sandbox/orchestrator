@@ -15,6 +15,9 @@ import (
 )
 
 func buildRegistryAuth(file, user, pass, token string) (string, error) {
+	if pass != "" && user == "" {
+		return "", errors.New("key-lease: --registry-password requires --registry-username")
+	}
 	if file != "" {
 		b, err := os.ReadFile(file)
 		if err != nil {

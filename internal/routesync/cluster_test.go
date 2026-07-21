@@ -2,6 +2,7 @@ package routesync
 
 import (
 	"bytes"
+	"strings"
 	"testing"
 )
 
@@ -88,9 +89,11 @@ func TestNodeLinkCodecRoundTrip(t *testing.T) {
 		t.Fatalf("build event round-trip: %+v", event.Build)
 	}
 	eventAck := roundTrip(t, &Msg{Type: TypeEventAck, EventAck: &EventAck{
-		ObjectKind: "build", ObjectID: "build-1", EventSeq: 4,
+		ObjectKind: "build", ObjectID: "build-1", RegistryGeneration: "generation-1",
+		BindingDigest: strings.Repeat("a", 64), EventSeq: 4,
 	}})
-	if eventAck.EventAck == nil || eventAck.EventAck.ObjectID != "build-1" || eventAck.EventAck.EventSeq != 4 {
+	if eventAck.EventAck == nil || eventAck.EventAck.ObjectID != "build-1" ||
+		eventAck.EventAck.RegistryGeneration != "generation-1" || eventAck.EventAck.EventSeq != 4 {
 		t.Fatalf("event ack round-trip: %+v", eventAck.EventAck)
 	}
 

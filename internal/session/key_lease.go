@@ -37,18 +37,21 @@ func (h *Holder) InstallKeyLease(
 	if err := h.CheckServe(identity); err != nil {
 		return ref, false, err
 	}
-	held, endpoint, tuple, operation, err := h.lockKeyLeaseOperation(nodeID, nodeEpoch, dataEndpoint, ref)
+	operation, err := h.beginKeyLeaseMutation(nodeID, nodeEpoch, dataEndpoint, ref)
 	if err != nil {
 		return ref, false, err
 	}
-	defer operation.Unlock()
+	defer operation.unlock()
+	if !operation.current() {
+		return ref, false, errors.Join(ErrDispatchNotSent, ErrKeyLeaseSuperseded)
+	}
 	command := &routesync.Command{
-		Kind: routesync.CmdKeyPut, NodeEpoch: nodeEpoch, SessionSeq: tuple.SessionSeq,
+		Kind: routesync.CmdKeyPut, NodeEpoch: nodeEpoch, SessionSeq: operation.tuple.SessionSeq,
 		RegistryGeneration: identity.RegistryGeneration,
 		AuthKeyFingerprint: lease.AuthKey.Fingerprint, ManifestKeyFingerprint: lease.ManifestKey.Fingerprint,
 		KeyLease: &lease,
 	}
-	ack, sent, err := endpoint.SendNodeCommand(ctx, command)
+	ack, sent, err := operation.endpoint.SendNodeCommand(ctx, command)
 	if err != nil {
 		return ref, sent, err
 	}
@@ -61,14 +64,13 @@ func (h *Holder) InstallKeyLease(
 	if ack.KeyLeaseRef == nil || ack.KeyLeaseRef.Validate() != nil || *ack.KeyLeaseRef != ref {
 		return ref, true, errors.New("session: node ACK did not prove the exact key lease")
 	}
-	h.mu.Lock()
-	current := h.active[nodeID]
-	if current != held || current.registration.Tuple.Compare(tuple) != 0 || current.registration.DataEndpoint != dataEndpoint {
-		h.mu.Unlock()
-		return ref, true, ErrSessionUnavailable
+	operation.held.leaseMu.Lock()
+	if operation.held.keyLeaseSeq[operation.key] != operation.sequence {
+		operation.held.leaseMu.Unlock()
+		return ref, true, ErrKeyLeaseSuperseded
 	}
-	current.keyLeases[keyLeaseRefID(ref)] = lease.ExpiresUnix
-	h.mu.Unlock()
+	operation.held.keyLeases[operation.key] = lease.ExpiresUnix
+	operation.held.leaseMu.Unlock()
 	return ref, true, nil
 }
 
@@ -88,29 +90,32 @@ func (h *Holder) DropKeyLease(
 	if err := h.CheckServe(identity); err != nil {
 		return false, err
 	}
-	held, endpoint, tuple, operation, err := h.lockKeyLeaseOperation(nodeID, nodeEpoch, dataEndpoint, ref)
+	operation, err := h.beginKeyLeaseMutation(nodeID, nodeEpoch, dataEndpoint, ref)
 	if err != nil {
 		return false, err
 	}
-	defer operation.Unlock()
-	h.mu.Lock()
-	if h.active[nodeID] != held || held.registration.Tuple.Compare(tuple) != 0 {
-		h.mu.Unlock()
-		return false, ErrSessionUnavailable
+	defer operation.unlock()
+	operation.held.leaseMu.Lock()
+	if operation.held.keyLeaseSeq[operation.key] != operation.sequence {
+		operation.held.leaseMu.Unlock()
+		return false, ErrKeyLeaseSuperseded
 	}
-	delete(held.keyLeases, keyLeaseRefID(ref))
-	h.mu.Unlock()
+	delete(operation.held.keyLeases, operation.key)
+	operation.held.leaseMu.Unlock()
 	command := &routesync.Command{
-		Kind: routesync.CmdKeyDrop, NodeEpoch: nodeEpoch, SessionSeq: tuple.SessionSeq,
+		Kind: routesync.CmdKeyDrop, NodeEpoch: nodeEpoch, SessionSeq: operation.tuple.SessionSeq,
 		RegistryGeneration: identity.RegistryGeneration, KeyLeaseRef: &ref,
 		AuthKeyFingerprint: ref.AuthKeyFingerprint, ManifestKeyFingerprint: ref.ManifestKeyFingerprint,
 	}
-	ack, sent, err := endpoint.SendNodeCommand(ctx, command)
+	ack, sent, err := operation.endpoint.SendNodeCommand(ctx, command)
 	if err != nil || !sent {
 		return sent, err
 	}
 	if ack.Status != routesync.AckAccepted || ack.KeyLeaseRef == nil || *ack.KeyLeaseRef != ref {
 		return true, errors.New("session: node did not acknowledge the exact dropped key lease")
+	}
+	if !operation.current() {
+		return true, ErrKeyLeaseSuperseded
 	}
 	return true, nil
 }
@@ -120,10 +125,16 @@ func (h *Holder) HasKeyLease(nodeID string, nodeEpoch uint64, ref routesync.Node
 		return false
 	}
 	h.mu.RLock()
-	defer h.mu.RUnlock()
 	held := h.active[nodeID]
-	return held != nil && held.registration.NodeEpoch == nodeEpoch &&
-		held.keyLeases[keyLeaseRefID(ref)] > h.clock().Unix()
+	if held == nil || held.registration.NodeEpoch != nodeEpoch {
+		h.mu.RUnlock()
+		return false
+	}
+	held.leaseMu.RLock()
+	h.mu.RUnlock()
+	available := held.keyLeases[keyLeaseRefID(ref)] > h.clock().Unix()
+	held.leaseMu.RUnlock()
+	return available
 }
 
 func dispatchKeyLeaseRef(command DispatchCommand) (routesync.NodeKeyLeaseRefV1, error) {
@@ -160,30 +171,61 @@ func keyLeaseRefID(ref routesync.NodeKeyLeaseRefV1) string {
 	return ref.Group + "\x00" + ref.AuthKeyFingerprint + "\x00" + ref.ManifestKeyFingerprint
 }
 
-func (h *Holder) lockKeyLeaseOperation(
+type keyLeaseMutation struct {
+	held      *heldSession
+	endpoint  commandEndpoint
+	tuple     Tuple
+	key       string
+	sequence  uint64
+	operation *sync.Mutex
+}
+
+func (m *keyLeaseMutation) current() bool {
+	m.held.leaseMu.RLock()
+	defer m.held.leaseMu.RUnlock()
+	return m.held.keyLeaseSeq[m.key] == m.sequence
+}
+
+func (m *keyLeaseMutation) unlock() {
+	m.held.commandMu.Unlock()
+	m.operation.Unlock()
+}
+
+func (h *Holder) beginKeyLeaseMutation(
 	nodeID string,
 	nodeEpoch uint64,
 	dataEndpoint string,
 	ref routesync.NodeKeyLeaseRefV1,
-) (*heldSession, commandEndpoint, Tuple, *sync.Mutex, error) {
-	operation := h.keyLeaseOperation(nodeID, ref)
-	operation.Lock()
+) (*keyLeaseMutation, error) {
 	h.mu.RLock()
 	held := h.active[nodeID]
 	if held == nil || held.registration.NodeEpoch != nodeEpoch || held.registration.DataEndpoint != dataEndpoint {
 		h.mu.RUnlock()
-		operation.Unlock()
-		return nil, nil, Tuple{}, nil, ErrSessionUnavailable
+		return nil, ErrSessionUnavailable
 	}
 	endpoint, ok := held.endpoint.(commandEndpoint)
 	if !ok {
 		h.mu.RUnlock()
-		operation.Unlock()
-		return nil, nil, Tuple{}, nil, errors.New("session: node-link endpoint cannot mutate key leases")
+		return nil, errors.New("session: node-link endpoint cannot mutate key leases")
 	}
 	tuple := held.registration.Tuple
+	key := keyLeaseRefID(ref)
+	held.leaseMu.Lock()
+	held.keyLeaseSeq[key]++
+	sequence := held.keyLeaseSeq[key]
+	held.leaseMu.Unlock()
 	h.mu.RUnlock()
-	return held, endpoint, tuple, operation, nil
+
+	operation := h.keyLeaseOperation(nodeID, ref)
+	operation.Lock()
+	current, err := h.lockCommandSession(nodeID, nodeEpoch, dataEndpoint, held)
+	if err != nil {
+		operation.Unlock()
+		return nil, err
+	}
+	return &keyLeaseMutation{
+		held: current, endpoint: endpoint, tuple: tuple, key: key, sequence: sequence, operation: operation,
+	}, nil
 }
 
 func (h *Holder) keyLeaseOperation(nodeID string, ref routesync.NodeKeyLeaseRefV1) *sync.Mutex {

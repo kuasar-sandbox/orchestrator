@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"strings"
 	"testing"
 
@@ -95,7 +96,8 @@ func TestCASExecutionBindingAtomicallyRebindsWorkflowOutbox(t *testing.T) {
 		t.Fatalf("workflow before rebind = %+v, %v", before, err)
 	}
 	if err := st.AckExecutionEvent(ctx, "node-1", 7, routesync.EventAck{
-		ObjectKind: "sandbox", ObjectID: dispatch.ObjectID, EventSeq: before.EventSeq,
+		ObjectKind: "sandbox", ObjectID: dispatch.ObjectID, RegistryGeneration: before.LatestEvent.RegistryGeneration,
+		BindingDigest: before.BindingDigest, EventSeq: before.EventSeq,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -135,9 +137,10 @@ func TestCASExecutionBindingAtomicallyRebindsWorkflowOutbox(t *testing.T) {
 	}
 	// A delayed ACK for the pre-rebind payload cannot acknowledge the rebound fact.
 	if err := st.AckExecutionEvent(ctx, "node-1", 7, routesync.EventAck{
-		ObjectKind: "sandbox", ObjectID: dispatch.ObjectID, EventSeq: before.EventSeq,
-	}); err != nil {
-		t.Fatal(err)
+		ObjectKind: "sandbox", ObjectID: dispatch.ObjectID, RegistryGeneration: before.LatestEvent.RegistryGeneration,
+		BindingDigest: before.BindingDigest, EventSeq: before.EventSeq,
+	}); !errors.Is(err, ErrNodeWorkflowConflict) {
+		t.Fatalf("stale Binding ACK error = %v", err)
 	}
 	pending, _, err := st.PendingExecutionEvents(ctx, "node-1", 7, routesync.EventCursor{}, 10, 1<<20)
 	if err != nil || len(pending) != 1 || pending[0].ObjectID != dispatch.ObjectID ||

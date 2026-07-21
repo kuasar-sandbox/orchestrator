@@ -285,15 +285,11 @@ func TestHolderRejectsStableRegistrationChangesWithinNodeEpoch(t *testing.T) {
 	}
 }
 
-func TestRegistrationAllowsBuildOnlyNode(t *testing.T) {
+func TestRegistrationRequiresSandboxCapacity(t *testing.T) {
 	registration := testRegistration("builder-1", 1, 1, "10.0.0.2:8443")
 	registration.SandboxSlots = 0
-	if err := registration.Validate(); err != nil {
-		t.Fatalf("build-only registration: %v", err)
-	}
-	registration.BuildSlots = 0
 	if err := registration.Validate(); err == nil {
-		t.Fatal("registration without sandbox or build capacity was accepted")
+		t.Fatal("registration without sandbox capacity was accepted")
 	}
 }
 
@@ -534,6 +530,80 @@ func TestHolderDispatchUsesCurrentTupleAndCommittedTarget(t *testing.T) {
 	}
 }
 
+type blockingDispatchEndpoint struct {
+	dispatchStarted chan struct{}
+	releaseDispatch chan struct{}
+	fenced          chan struct{}
+	fenceOnce       sync.Once
+}
+
+func (e *blockingDispatchEndpoint) FenceStaleSession() {
+	e.fenceOnce.Do(func() { close(e.fenced) })
+}
+
+func (e *blockingDispatchEndpoint) AdmitAndDispatch(context.Context, DispatchCommand) (DispatchReply, error) {
+	close(e.dispatchStarted)
+	<-e.releaseDispatch
+	return DispatchReply{Outcome: cluster.DispatchAcceptedAdmitted}, nil
+}
+
+func (e *blockingDispatchEndpoint) SendNodeCommand(_ context.Context, command *routesync.Command) (routesync.CmdAck, bool, error) {
+	ref := keyLeaseRef(*command.KeyLease)
+	return routesync.CmdAck{Status: routesync.AckAccepted, KeyLeaseRef: &ref}, true, nil
+}
+
+func TestHolderSerializesDispatchWithSessionReplacement(t *testing.T) {
+	registration := testRegistration("node-1", 7, 10, "10.0.0.1:8443")
+	holder, err := NewHolder("registry-a", 1, nil, testGate(true), nil, newTestEnrollmentAuthority(registration))
+	if err != nil {
+		t.Fatal(err)
+	}
+	endpoint := &blockingDispatchEndpoint{
+		dispatchStarted: make(chan struct{}), releaseDispatch: make(chan struct{}), fenced: make(chan struct{}),
+	}
+	if _, err := holder.Register(context.Background(), registration, endpoint); err != nil {
+		t.Fatal(err)
+	}
+	if _, sent, err := holder.InstallKeyLease(
+		context.Background(), testServeIdentity(), registration.NodeID, registration.NodeEpoch, registration.DataEndpoint, testKeyLease(),
+	); err != nil || !sent {
+		t.Fatalf("install key lease sent=%v err=%v", sent, err)
+	}
+	dispatchDone := make(chan error, 1)
+	go func() {
+		_, err := holder.AdmitAndDispatch(context.Background(), testDispatchCommand(t, registration))
+		dispatchDone <- err
+	}()
+	<-endpoint.dispatchStarted
+
+	replacement := registration
+	replacement.SessionSeq++
+	registerDone := make(chan error, 1)
+	go func() {
+		_, err := holder.Register(context.Background(), replacement, &testEndpoint{})
+		registerDone <- err
+	}()
+	select {
+	case err := <-registerDone:
+		t.Fatalf("session replacement completed during dispatch: %v", err)
+	case <-endpoint.fenced:
+		t.Fatal("old session was fenced during dispatch")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(endpoint.releaseDispatch)
+	if err := <-dispatchDone; err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	if err := <-registerDone; err != nil {
+		t.Fatalf("replacement: %v", err)
+	}
+	select {
+	case <-endpoint.fenced:
+	case <-time.After(time.Second):
+		t.Fatal("replaced session was not fenced")
+	}
+}
+
 func TestHolderRequiresExactKeyLeaseAcknowledgement(t *testing.T) {
 	registration := testRegistration("node-1", 7, 10, "10.0.0.1:8443")
 	authority := newTestEnrollmentAuthority(registration)
@@ -661,8 +731,8 @@ func TestKeyLeasePutAndDropAreSerializedPerReference(t *testing.T) {
 	case <-time.After(20 * time.Millisecond):
 	}
 	close(endpoint.releasePut)
-	if err := <-installDone; err != nil {
-		t.Fatalf("install: %v", err)
+	if err := <-installDone; !errors.Is(err, ErrKeyLeaseSuperseded) {
+		t.Fatalf("superseded install error = %v", err)
 	}
 	if kind := <-endpoint.calls; kind != routesync.CmdKeyDrop {
 		t.Fatalf("second command = %s", kind)
@@ -673,6 +743,89 @@ func TestKeyLeasePutAndDropAreSerializedPerReference(t *testing.T) {
 	if holder.HasKeyLease(registration.NodeID, registration.NodeEpoch, ref) {
 		t.Fatal("serialized drop left the installed lease usable")
 	}
+}
+
+func TestNewerKeyRefreshSupersedesWaitingDrop(t *testing.T) {
+	registration := testRegistration("node-1", 7, 10, "10.0.0.1:8443")
+	holder, err := NewHolder("registry-a", 1, nil, testGate(true), nil, newTestEnrollmentAuthority(registration))
+	if err != nil {
+		t.Fatal(err)
+	}
+	endpoint := &testEndpoint{}
+	if _, err := holder.Register(context.Background(), registration, endpoint); err != nil {
+		t.Fatal(err)
+	}
+	lease := testKeyLease()
+	ref, sent, err := holder.InstallKeyLease(
+		context.Background(), testServeIdentity(), registration.NodeID, registration.NodeEpoch, registration.DataEndpoint, lease,
+	)
+	if err != nil || !sent {
+		t.Fatalf("initial install sent=%v err=%v", sent, err)
+	}
+
+	operation := holder.keyLeaseOperation(registration.NodeID, ref)
+	operation.Lock()
+	dropDone := make(chan struct {
+		sent bool
+		err  error
+	}, 1)
+	go func() {
+		sent, err := holder.DropKeyLease(
+			context.Background(), testServeIdentity(), registration.NodeID, registration.NodeEpoch, registration.DataEndpoint, ref,
+		)
+		dropDone <- struct {
+			sent bool
+			err  error
+		}{sent: sent, err: err}
+	}()
+	waitForKeyLeaseSequence(t, holder, registration.NodeID, ref, 2)
+
+	lease.ExpiresUnix++
+	refreshDone := make(chan error, 1)
+	go func() {
+		_, _, err := holder.InstallKeyLease(
+			context.Background(), testServeIdentity(), registration.NodeID, registration.NodeEpoch, registration.DataEndpoint, lease,
+		)
+		refreshDone <- err
+	}()
+	waitForKeyLeaseSequence(t, holder, registration.NodeID, ref, 3)
+	operation.Unlock()
+
+	drop := <-dropDone
+	if drop.sent || !errors.Is(drop.err, ErrKeyLeaseSuperseded) {
+		t.Fatalf("stale drop sent=%v err=%v", drop.sent, drop.err)
+	}
+	if err := <-refreshDone; err != nil {
+		t.Fatalf("newer refresh: %v", err)
+	}
+	if !holder.HasKeyLease(registration.NodeID, registration.NodeEpoch, ref) {
+		t.Fatal("newer refresh was overwritten by stale drop")
+	}
+	if len(endpoint.wire) != 2 || endpoint.wire[1].Kind != routesync.CmdKeyPut || endpoint.wire[1].KeyLease.ExpiresUnix != lease.ExpiresUnix {
+		t.Fatalf("wire commands = %+v", endpoint.wire)
+	}
+}
+
+func waitForKeyLeaseSequence(t *testing.T, holder *Holder, nodeID string, ref routesync.NodeKeyLeaseRefV1, want uint64) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		holder.mu.RLock()
+		held := holder.active[nodeID]
+		if held != nil {
+			held.leaseMu.RLock()
+			sequence := held.keyLeaseSeq[keyLeaseRefID(ref)]
+			held.leaseMu.RUnlock()
+			holder.mu.RUnlock()
+			if sequence >= want {
+				return
+			}
+		} else {
+			holder.mu.RUnlock()
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("key lease sequence did not reach %d", want)
 }
 
 func TestHolderDispatchFailsClosedWithoutPermit(t *testing.T) {
@@ -812,6 +965,26 @@ func TestDirectoryFullMergeSkipsInvalidConflictRecords(t *testing.T) {
 	}
 	if len(directory.Snapshot()) != 1 {
 		t.Fatalf("malformed merge poisoned directory: %+v", directory.Snapshot())
+	}
+}
+
+func TestDirectoryFullMergeRejectsUnauthorizedConflict(t *testing.T) {
+	authority := &directoryEnrollmentAuthority{active: map[string]string{"node-1": "enrollment-good"}}
+	directory := NewDirectory(authority)
+	healthy := DirectoryEntry{
+		NodeID: "node-1", EnrollmentID: "enrollment-good", Tuple: Tuple{NodeEpoch: 3, SessionSeq: 7}, HolderMemberID: "registry-a",
+	}
+	if !directory.Apply(DirectoryDelta{Entry: healthy, Up: true}) {
+		t.Fatal("healthy entry was not installed")
+	}
+	poison := DirectoryRecord{Entry: healthy, Conflict: true}
+	poison.Entry.EnrollmentID = "enrollment-unauthorized"
+	poison.Entry.HolderMemberID = "registry-b"
+	if changed := directory.MergeFull([]DirectoryRecord{poison}); changed != 0 {
+		t.Fatalf("unauthorized conflict changed %d records", changed)
+	}
+	if got, ok := directory.Lookup(healthy.NodeID); !ok || got != healthy {
+		t.Fatalf("healthy entry after unauthorized conflict = %+v, %v", got, ok)
 	}
 }
 

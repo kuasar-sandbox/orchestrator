@@ -371,8 +371,10 @@ func TestBuildTerminalEventReleasesCapacityAndAckCannotDropNewerEvent(t *testing
 		events[second.ObjectID].State != string(clusterstate.BuildRegistered) {
 		t.Fatalf("pending events = %+v", events)
 	}
+	firstEvent := events[first.ObjectID]
 	if err := st.AckExecutionEvent(ctx, "node-1", 7, routesync.EventAck{
-		ObjectKind: "build", ObjectID: first.ObjectID, EventSeq: 2,
+		ObjectKind: "build", ObjectID: first.ObjectID, RegistryGeneration: firstEvent.RegistryGeneration,
+		BindingDigest: firstEvent.BindingDigest, EventSeq: 2,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -387,7 +389,8 @@ func TestBuildTerminalEventReleasesCapacityAndAckCannotDropNewerEvent(t *testing
 		t.Fatal(err)
 	}
 	if err := st.AckExecutionEvent(ctx, "node-1", 7, routesync.EventAck{
-		ObjectKind: "build", ObjectID: first.ObjectID, EventSeq: 3,
+		ObjectKind: "build", ObjectID: first.ObjectID, RegistryGeneration: firstEvent.RegistryGeneration,
+		BindingDigest: firstEvent.BindingDigest, EventSeq: 3,
 	}); err != nil {
 		t.Fatal(err)
 	}
