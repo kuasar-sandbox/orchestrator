@@ -20,6 +20,7 @@ const DefaultPlacementRoundLimit uint64 = 2
 
 type RouteCommitter interface {
 	CommitRouteWorkflow(context.Context, cluster.Revision, cluster.RouteWorkflowRecord) (cluster.RouteWorkflowRecord, error)
+	EnsureExecutionFence(context.Context, cluster.ExecutionFence) error
 }
 
 type BuildCommitter interface {
@@ -35,7 +36,13 @@ type Dispatcher interface {
 }
 
 type SandboxRoundSource interface {
-	NextSandboxRound(context.Context, string, string, uint64, cluster.DispatchIntent) (string, []cluster.PlacementCandidate, error)
+	NextSandboxRound(context.Context, string, string, uint64, cluster.DispatchIntent, []string) (SandboxRound, error)
+}
+
+type SandboxRound struct {
+	SandboxID  string
+	Candidates []cluster.PlacementCandidate
+	Intent     cluster.DispatchIntent
 }
 
 type TieBreaker interface {
@@ -95,6 +102,7 @@ const (
 	RunRetrySelected   RunStatus = "RETRY_SELECTED"
 	RunNoUsableProbe   RunStatus = "NO_USABLE_PROBE"
 	RunConflict        RunStatus = "CONFLICT"
+	RunComplete        RunStatus = "COMPLETE"
 	RunTerminal        RunStatus = "TERMINAL"
 )
 
@@ -137,7 +145,16 @@ func (c *StartingCoordinator) RunRoute(ctx context.Context, record cluster.Route
 				result.Route = &record
 				return result, nil
 			}
+			finalization, finalizationErr := cluster.NewWorkflowFinalizationIntent(
+				starting.SandboxID, *starting.Binding, nil,
+			)
+			if finalizationErr != nil {
+				return RunResult{}, finalizationErr
+			}
 			next := record
+			next.Finalizations = append(
+				append([]cluster.WorkflowFinalizationIntent(nil), record.Finalizations...), finalization,
+			)
 			next.Starting = cloneRouteStarting(starting)
 			index := *starting.SelectedCandidate
 			next.Starting.SelectedCandidate = nil
@@ -150,39 +167,26 @@ func (c *StartingCoordinator) RunRoute(ctx context.Context, record cluster.Route
 			continue
 		}
 		if allRejected(len(starting.CandidatePool), starting.DefinitivelyRejected) {
-			if starting.PlacementRound >= c.roundLimit {
-				next := record
-				next.State = cluster.WorkflowRouteTombstone
-				next.Starting = nil
-				next.Tombstone = &cluster.RouteTombstoneState{PlacementFailure: &cluster.RoutePlacementFailureState{
-					SandboxID: starting.SandboxID, PlacementRound: starting.PlacementRound,
-					CandidatePool:        append([]cluster.PlacementCandidate(nil), starting.CandidatePool...),
-					DefinitivelyRejected: append([]uint32(nil), starting.DefinitivelyRejected...),
-					Intent:               cloneIntent(starting.Intent), Reason: "placement round limit exhausted",
-				}}
-				record, err = c.commitRoute(ctx, record.Revision, next)
-				if err != nil {
-					return RunResult{}, err
-				}
+			next := record
+			next.State = cluster.WorkflowRouteTombstone
+			next.Starting = nil
+			next.Tombstone = &cluster.RouteTombstoneState{PlacementFailure: &cluster.RoutePlacementFailureState{
+				SandboxID: starting.SandboxID, PlacementRound: starting.PlacementRound,
+				CandidatePool:        append([]cluster.PlacementCandidate(nil), starting.CandidatePool...),
+				DefinitivelyRejected: append([]uint32(nil), starting.DefinitivelyRejected...),
+				Intent:               cloneIntent(starting.Intent), Reason: "placement candidate pool exhausted",
+			}}
+			record, err = c.commitRoute(ctx, record.Revision, next)
+			if err != nil {
+				return RunResult{}, err
+			}
+			if err := c.ensurePlacementFence(ctx, record); err != nil {
+				return RunResult{}, err
+			}
+			if placementWindowComplete(starting.PlacementRound, c.roundLimit) {
 				return RunResult{Status: RunTerminal, Reason: "placement round limit exhausted", Route: &record}, nil
 			}
-			if c.rounds == nil {
-				return RunResult{}, errors.New("coordinator: Sandbox round source is unavailable")
-			}
-			nextRound := starting.PlacementRound + 1
-			sandboxID, candidates, roundErr := c.rounds.NextSandboxRound(ctx, record.Group, record.RouteKey, nextRound, cloneIntent(starting.Intent))
-			if roundErr != nil {
-				return RunResult{}, roundErr
-			}
-			if sandboxID == "" || sandboxID == starting.SandboxID {
-				return RunResult{}, errors.New("coordinator: next placement round requires a new Sandbox ID")
-			}
-			next := record
-			next.Starting = &cluster.RouteStartingState{
-				SandboxID: sandboxID, PlacementRound: nextRound,
-				CandidatePool: append([]cluster.PlacementCandidate(nil), candidates...), Intent: cloneIntent(starting.Intent),
-			}
-			record, err = c.commitRoute(ctx, record.Revision, next)
+			record, err = c.StartRouteAfterPlacementFailure(ctx, record)
 			if err != nil {
 				return RunResult{}, err
 			}
@@ -195,6 +199,17 @@ func (c *StartingCoordinator) RunRoute(ctx context.Context, record cluster.Route
 			return RunResult{}, selectErr
 		}
 		if !found {
+			rejected, changed := appendProbeRejections(starting.DefinitivelyRejected, starting.CandidatePool, cache)
+			if changed {
+				next := record
+				next.Starting = cloneRouteStarting(starting)
+				next.Starting.DefinitivelyRejected = rejected
+				record, err = c.commitRoute(ctx, record.Revision, next)
+				if err != nil {
+					return RunResult{}, err
+				}
+				continue
+			}
 			return RunResult{Status: RunNoUsableProbe, Reason: "no candidate pair has a current usable Probe", Route: &record}, nil
 		}
 		binding, bindErr := makeBinding(c.identity.RegistryGeneration, cluster.ExecutionKindSandbox, record.Group, record.RouteKey, starting.SandboxID, starting.Intent, probe.Response)
@@ -210,6 +225,73 @@ func (c *StartingCoordinator) RunRoute(ctx context.Context, record cluster.Route
 			return RunResult{}, err
 		}
 	}
+}
+
+// StartRouteAfterPlacementFailure begins the next globally monotonic round.
+// It is used inside the current placement window and by a later Reserve after
+// a terminal placement-failure workflow.
+func (c *StartingCoordinator) StartRouteAfterPlacementFailure(
+	ctx context.Context,
+	record cluster.RouteWorkflowRecord,
+) (cluster.RouteWorkflowRecord, error) {
+	if c.routes == nil || c.rounds == nil {
+		return cluster.RouteWorkflowRecord{}, errors.New("coordinator: Route committer and Sandbox round source are required")
+	}
+	if err := record.Validate(); err != nil {
+		return cluster.RouteWorkflowRecord{}, err
+	}
+	if record.State != cluster.WorkflowRouteTombstone || record.Tombstone == nil || record.Tombstone.PlacementFailure == nil {
+		return cluster.RouteWorkflowRecord{}, errors.New("coordinator: Route is not a placement-failure TOMBSTONE")
+	}
+	if err := c.ensurePlacementFence(ctx, record); err != nil {
+		return cluster.RouteWorkflowRecord{}, err
+	}
+	failure := record.Tombstone.PlacementFailure
+	nextRound := failure.PlacementRound + 1
+	round, err := c.rounds.NextSandboxRound(
+		ctx, record.Group, record.RouteKey, nextRound, cloneIntent(failure.Intent), candidateNodeIDs(failure.CandidatePool),
+	)
+	if err != nil {
+		return cluster.RouteWorkflowRecord{}, err
+	}
+	if round.SandboxID == "" || round.SandboxID == failure.SandboxID || len(round.Candidates) == 0 {
+		return cluster.RouteWorkflowRecord{}, errors.New("coordinator: next placement round requires a new Sandbox ID and candidate pool")
+	}
+	if err := round.Intent.Validate(); err != nil {
+		return cluster.RouteWorkflowRecord{}, err
+	}
+	next := cluster.RouteWorkflowRecord{
+		Group: record.Group, RouteKey: record.RouteKey, State: cluster.WorkflowRouteStarting,
+		Revision:      record.Revision,
+		Finalizations: append([]cluster.WorkflowFinalizationIntent(nil), record.Finalizations...),
+		Starting: &cluster.RouteStartingState{
+			SandboxID: round.SandboxID, PlacementRound: nextRound,
+			CandidatePool: append([]cluster.PlacementCandidate(nil), round.Candidates...),
+			Intent:        cloneIntent(round.Intent),
+		},
+	}
+	return c.commitRoute(ctx, record.Revision, next)
+}
+
+func candidateNodeIDs(candidates []cluster.PlacementCandidate) []string {
+	result := make([]string, 0, len(candidates))
+	for _, candidate := range candidates {
+		if candidate.NodeID != "" {
+			result = append(result, candidate.NodeID)
+		}
+	}
+	return result
+}
+
+func (c *StartingCoordinator) ensurePlacementFence(ctx context.Context, record cluster.RouteWorkflowRecord) error {
+	failure := record.Tombstone.PlacementFailure
+	fence, err := cluster.NewPlacementFailureFence(
+		record.Group, record.RouteKey, record.Revision.RegistryGeneration, *failure,
+	)
+	if err != nil {
+		return err
+	}
+	return c.routes.EnsureExecutionFence(ctx, fence)
 }
 
 func (c *StartingCoordinator) RunBuild(ctx context.Context, record cluster.BuildRecord) (RunResult, error) {
@@ -234,11 +316,37 @@ func (c *StartingCoordinator) RunBuild(ctx context.Context, record cluster.Build
 		starting := record.Starting
 		if starting.SelectedCandidate != nil {
 			result := c.dispatch(ctx, cluster.ExecutionKindBuild, record.Group, "", starting.BuildID, starting.Intent, *starting.Binding)
+			if result.Outcome == cluster.DispatchAcceptedAdmitted || result.Outcome == cluster.DispatchAcceptedQueued {
+				projection, projectionErr := buildRegistrationProjection(record)
+				if projectionErr != nil {
+					return RunResult{}, projectionErr
+				}
+				next := cluster.BuildRecord{
+					Group: record.Group, BuildID: record.BuildID, State: cluster.BuildRegistered,
+					Revision: record.Revision, Projection: &projection,
+					Finalizations: append([]cluster.WorkflowFinalizationIntent(nil), record.Finalizations...),
+				}
+				record, err = c.commitBuild(ctx, record.Revision, next)
+				if err != nil {
+					return RunResult{}, err
+				}
+				result.Status, result.Build = RunComplete, &record
+				return result, nil
+			}
 			if result.Outcome != cluster.DispatchDefinitiveReject {
 				result.Build = &record
 				return result, nil
 			}
+			finalization, finalizationErr := cluster.NewWorkflowFinalizationIntent(
+				starting.BuildID, *starting.Binding, nil,
+			)
+			if finalizationErr != nil {
+				return RunResult{}, finalizationErr
+			}
 			next := record
+			next.Finalizations = append(
+				append([]cluster.WorkflowFinalizationIntent(nil), record.Finalizations...), finalization,
+			)
 			next.Starting = cloneBuildStarting(starting)
 			index := *starting.SelectedCandidate
 			next.Starting.SelectedCandidate = nil
@@ -251,14 +359,16 @@ func (c *StartingCoordinator) RunBuild(ctx context.Context, record cluster.Build
 			continue
 		}
 		if allRejected(len(starting.CandidatePool), starting.DefinitivelyRejected) {
-			next := record
-			next.State = cluster.BuildError
-			next.Starting = nil
-			next.Failure = &cluster.BuildPlacementFailureState{
+			next := cluster.BuildRecord{
+				Group: record.Group, BuildID: record.BuildID, State: cluster.BuildTombstone,
+				Revision:      record.Revision,
+				Finalizations: append([]cluster.WorkflowFinalizationIntent(nil), record.Finalizations...),
+			}
+			next.Tombstone = &cluster.BuildTombstoneState{PlacementFailure: cluster.BuildPlacementFailureState{
 				BuildID: starting.BuildID, CandidatePool: append([]cluster.PlacementCandidate(nil), starting.CandidatePool...),
 				DefinitivelyRejected: append([]uint32(nil), starting.DefinitivelyRejected...),
 				Intent:               cloneIntent(starting.Intent), Reason: "Build candidate pool exhausted",
-			}
+			}}
 			record, err = c.commitBuild(ctx, record.Revision, next)
 			if err != nil {
 				return RunResult{}, err
@@ -271,6 +381,17 @@ func (c *StartingCoordinator) RunBuild(ctx context.Context, record cluster.Build
 			return RunResult{}, selectErr
 		}
 		if !found {
+			rejected, changed := appendProbeRejections(starting.DefinitivelyRejected, starting.CandidatePool, cache)
+			if changed {
+				next := record
+				next.Starting = cloneBuildStarting(starting)
+				next.Starting.DefinitivelyRejected = rejected
+				record, err = c.commitBuild(ctx, record.Revision, next)
+				if err != nil {
+					return RunResult{}, err
+				}
+				continue
+			}
 			return RunResult{Status: RunNoUsableProbe, Reason: "no candidate pair has a current usable Probe", Build: &record}, nil
 		}
 		binding, bindErr := makeBinding(c.identity.RegistryGeneration, cluster.ExecutionKindBuild, record.Group, "", starting.BuildID, starting.Intent, probe.Response)
@@ -286,6 +407,24 @@ func (c *StartingCoordinator) RunBuild(ctx context.Context, record cluster.Build
 			return RunResult{}, err
 		}
 	}
+}
+
+func buildRegistrationProjection(record cluster.BuildRecord) (cluster.BuildProjection, error) {
+	if record.Starting == nil || record.Starting.Binding == nil {
+		return cluster.BuildProjection{}, errors.New("coordinator: accepted Build registration has no committed Binding")
+	}
+	spec, err := cluster.ParseBuildDispatchSpec(record.Starting.Intent.DispatchSpec)
+	if err != nil {
+		return cluster.BuildProjection{}, err
+	}
+	binding := record.Starting.Binding
+	projection := cluster.BuildProjection{
+		BuildID: record.BuildID, NodeID: binding.NodeID, NodeEpoch: binding.NodeEpoch,
+		DataEndpoint: binding.DataEndpoint, RegistryGeneration: binding.RegistryGeneration,
+		BindingDigest: binding.BindingDigest, Intent: cloneIntent(record.Starting.Intent),
+		TemplateRef: spec.TemplateID,
+	}
+	return projection, projection.Validate()
 }
 
 func (c *StartingCoordinator) selectCandidate(ctx context.Context, demand placement.NormalizedDemand, candidates []cluster.PlacementCandidate, rejected []uint32, cache map[uint32]cachedProbe) (uint32, session.ProbeResult, bool, error) {
@@ -523,6 +662,10 @@ func allRejected(candidateCount int, rejected []uint32) bool {
 	return len(seen) == candidateCount
 }
 
+func placementWindowComplete(round, limit uint64) bool {
+	return limit == 0 || round%limit == 0
+}
+
 func appendRejected(rejected []uint32, index uint32) []uint32 {
 	for _, current := range rejected {
 		if current == index {
@@ -531,6 +674,27 @@ func appendRejected(rejected []uint32, index uint32) []uint32 {
 	}
 	out := append([]uint32(nil), rejected...)
 	return append(out, index)
+}
+
+func appendProbeRejections(
+	rejected []uint32,
+	candidates []cluster.PlacementCandidate,
+	cache map[uint32]cachedProbe,
+) ([]uint32, bool) {
+	result := append([]uint32(nil), rejected...)
+	changed := false
+	for index := range candidates {
+		cached, found := cache[uint32(index)]
+		if !found || cached.result.Response.Class != placement.ProbeReject {
+			continue
+		}
+		next := appendRejected(result, uint32(index))
+		if len(next) != len(result) {
+			changed = true
+		}
+		result = next
+	}
+	return result, changed
 }
 
 func cloneRouteStarting(source *cluster.RouteStartingState) *cluster.RouteStartingState {
