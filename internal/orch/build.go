@@ -427,7 +427,9 @@ func (o *Orchestrator) BuildPool(ctx context.Context, interval time.Duration) {
 				}
 				go func(b *types.Build) {
 					defer func() { <-sem }()
-					o.executeBuild(ctx, b)
+					if err := o.executeBuild(ctx, b); err != nil && ctx.Err() == nil {
+						o.log.Error("persist terminal Build state", "bid", b.BuildID, "err", err)
+					}
 				}(b)
 			}
 		}
@@ -477,7 +479,7 @@ func buildTapFD(t vswitch.TapFD) configsock.TapFDConfig {
 // workdir, one vswitch slot the phases reuse sequentially, and — for the template
 // phase under mmds.enabled — a synthetic route entry so the build sandbox's
 // FC-mode envd can resolve itself.
-func (o *Orchestrator) executeBuild(ctx context.Context, b *types.Build) {
+func (o *Orchestrator) executeBuild(ctx context.Context, b *types.Build) error {
 	res, err := o.runBuildUnit(ctx, b)
 	switch {
 	case err == nil && res.Error != "":
@@ -486,22 +488,21 @@ func (o *Orchestrator) executeBuild(ctx context.Context, b *types.Build) {
 		// build), which the SDK is streaming — so reason.message stays generic
 		// and the detail lives in the log, not a duplicated BuildException tail.
 		b.Status, b.Reason = types.BuildError, "build failed; see build logs"
-		_ = o.persistBuildState(ctx, b)
+		persistErr := o.persistTerminalBuildState(ctx, b)
 		o.log.Warn("build failed", "bid", b.BuildID, "err", res.Error)
-		return
+		return persistErr
 	case err != nil:
 		// Infrastructure failure: the pipeline never ran (or produced no
 		// result), so there is NO build log for it — surface the orchestrator-
 		// side error directly, it is the only signal.
 		b.Status, b.Reason = types.BuildError, err.Error()
-		_ = o.persistBuildState(ctx, b)
+		persistErr := o.persistTerminalBuildState(ctx, b)
 		o.log.Warn("build failed", "bid", b.BuildID, "err", err)
-		return
+		return persistErr
 	}
 	if b.Profile == types.ProfileBare && (res.SnapshotKey != "" || res.StartCmd != "" || res.ReadyCmd != "") {
 		b.Status, b.Reason = types.BuildError, "bare build produced non-image output"
-		_ = o.persistBuildState(ctx, b)
-		return
+		return o.persistTerminalBuildState(ctx, b)
 	}
 	switch {
 	case res.SnapshotKey != "":
@@ -512,15 +513,58 @@ func (o *Orchestrator) executeBuild(ctx context.Context, b *types.Build) {
 		b.PersistID = types.TemplateID{Profile: b.Profile, Kind: types.KindImg, Key: res.ImageKey}.String()
 	default:
 		b.Status, b.Reason = types.BuildError, "build produced no artifact"
-		_ = o.persistBuildState(ctx, b)
-		return
+		return o.persistTerminalBuildState(ctx, b)
 	}
 	b.StartCmd, b.ReadyCmd = res.StartCmd, res.ReadyCmd
 	b.Status = types.BuildReady
 	b.Names = appendUnique(b.Names, b.PersistID)
 	b.Aliases = appendUnique(b.Aliases, b.PersistID)
-	_ = o.persistBuildState(ctx, b)
+	if err := o.persistTerminalBuildState(ctx, b); err != nil {
+		return err
+	}
 	o.log.Info("build ready", "bid", b.BuildID, "template", b.PersistID)
+	return nil
+}
+
+func (o *Orchestrator) persistTerminalBuildState(ctx context.Context, build *types.Build) error {
+	return retryBuildTerminalCommit(ctx, func() error {
+		err := o.persistBuildState(ctx, build)
+		if err != nil && ctx.Err() == nil {
+			o.log.Warn("retrying terminal Build state commit", "bid", build.BuildID, "state", build.Status, "err", err)
+		}
+		return err
+	})
+}
+
+func retryBuildTerminalCommit(ctx context.Context, persist func() error) error {
+	const (
+		initialDelay = 10 * time.Millisecond
+		maximumDelay = time.Second
+	)
+	delay := initialDelay
+	for {
+		err := persist()
+		if err == nil {
+			return nil
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return errors.Join(ctx.Err(), err)
+		case <-timer.C:
+		}
+		if delay < maximumDelay/2 {
+			delay *= 2
+		} else {
+			delay = maximumDelay
+		}
+	}
 }
 
 func (o *Orchestrator) runBuildUnit(ctx context.Context, b *types.Build) (*buildResult, error) {

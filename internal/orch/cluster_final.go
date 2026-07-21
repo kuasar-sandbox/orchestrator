@@ -733,18 +733,19 @@ func (n *FinalClusterNode) executeBuild(ctx context.Context, record *nodeexec.Wo
 			return err
 		}
 		build.Status = types.BuildBuilding
-		n.core.executeBuild(ctx, build)
-		return nil
+		return n.core.executeBuild(ctx, build)
 	case types.BuildBuilding:
-		n.core.executeBuild(ctx, build)
-		return nil
+		return n.core.executeBuild(ctx, build)
 	default:
 		return fmt.Errorf("cluster Build worker received non-launchable status %q", build.Status)
 	}
 }
 
 func (n *FinalClusterNode) resumeSandbox(ctx context.Context, command *routesync.Command) {
-	if err := n.resumeSandboxSync(ctx, command); err != nil && ctx.Err() == nil {
+	err := n.core.sf.Do(command.SID, func() error {
+		return n.resumeSandboxSync(ctx, command)
+	})
+	if err != nil && ctx.Err() == nil {
 		n.log.Error("cluster Sandbox resume", "sandbox", command.SID, "err", err)
 	}
 }

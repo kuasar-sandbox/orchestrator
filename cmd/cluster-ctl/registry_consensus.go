@@ -86,6 +86,7 @@ func runRegistry(args []string, log *slog.Logger) error {
 		return err
 	}
 	serverErr := make(chan error, 1)
+	backgroundErr := make(chan error, 2)
 	go func() {
 		serveErr := server.Serve(ctx, log)
 		serverErr <- serveErr
@@ -242,17 +243,23 @@ func runRegistry(args []string, log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	go func() {
-		if runErr := recovery.Run(ctx); runErr != nil && ctx.Err() == nil {
-			log.Error("registry recovery coordinator stopped", "err", runErr)
-			stop()
+	reportBackgroundError := func(component string, runErr error) {
+		if ctx.Err() != nil {
+			return
 		}
+		if runErr == nil {
+			runErr = errors.New("stopped before Registry shutdown")
+		}
+		fatal := fmt.Errorf("registry %s stopped: %w", component, runErr)
+		log.Error("registry background service stopped", "component", component, "err", runErr)
+		backgroundErr <- fatal
+		stop()
+	}
+	go func() {
+		reportBackgroundError("recovery coordinator", recovery.Run(ctx))
 	}()
 	go func() {
-		if runErr := service.Run(ctx); runErr != nil && ctx.Err() == nil {
-			log.Error("registry workflow service stopped", "err", runErr)
-			stop()
-		}
+		reportBackgroundError("workflow service", service.Run(ctx))
 	}()
 	ready.Store(true)
 	log.Info("cluster-ctl registry",
@@ -260,7 +267,26 @@ func runRegistry(args []string, log *slog.Logger) error {
 		"cluster", registryLayout.ClusterID, "registry_generation", registryLayout.RegistryGeneration,
 		"registry_layout_version", registryLayout.RegistryLayoutVersion, "virtual_shards", registryLayout.VirtualShardCount,
 	)
-	return <-serverErr
+	return waitRegistryExit(stop, serverErr, backgroundErr)
+}
+
+func waitRegistryExit(stop context.CancelFunc, serverErr, backgroundErr <-chan error) error {
+	select {
+	case fatal := <-backgroundErr:
+		stop()
+		return errors.Join(fatal, <-serverErr)
+	case serveErr := <-serverErr:
+		if serveErr != nil {
+			return serveErr
+		}
+		select {
+		case fatal := <-backgroundErr:
+			stop()
+			return fatal
+		default:
+			return nil
+		}
+	}
 }
 
 func openConsensusRuntime(

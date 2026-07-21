@@ -142,8 +142,15 @@ func TestStaleProxyFailureRequiresNewerRouteRevision(t *testing.T) {
 	if len(control.readMins) != 1 || control.readMins[0] != 8 {
 		t.Fatalf("ReadRoute minimums = %v", control.readMins)
 	}
-	if minimum := router.minimumRouteRevision(old.Group, old.RouteKey); minimum != 0 {
-		t.Fatalf("satisfied minimum Route revision remained at %d", minimum)
+	if minimum := router.minimumRouteRevision(old.Group, old.RouteKey); minimum != 8 {
+		t.Fatalf("satisfied minimum Route revision = %d, want persistent floor 8", minimum)
+	}
+	router.evictRoute(old.Group, old.RouteKey)
+	if _, err := router.resolveRoute(context.Background(), old.Group, old.RouteKey); err != nil {
+		t.Fatalf("resolve Route after cache eviction: %v", err)
+	}
+	if len(control.readMins) != 2 || control.readMins[1] != 8 {
+		t.Fatalf("ReadRoute minimums after cache eviction = %v", control.readMins)
 	}
 }
 

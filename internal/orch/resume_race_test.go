@@ -2,6 +2,7 @@ package orch
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/hex"
 	"io"
 	"log/slog"
@@ -10,11 +11,16 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/apikey"
+	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/launcher"
+	"github.com/kuasar-sandbox/orchestrator/internal/nodeexec"
+	"github.com/kuasar-sandbox/orchestrator/internal/placement"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxy"
+	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/secretbox"
 	"github.com/kuasar-sandbox/orchestrator/internal/store"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
@@ -23,8 +29,11 @@ import (
 
 // countingLauncher records how many times a unit was started — the launch count.
 type countingLauncher struct {
-	starts atomic.Int64
-	orch   *Orchestrator
+	starts       atomic.Int64
+	orch         *Orchestrator
+	startEntered chan struct{}
+	startRelease <-chan struct{}
+	startOnce    sync.Once
 }
 
 func (l *countingLauncher) Start(ctx context.Context, unit string) error {
@@ -36,6 +45,16 @@ func (l *countingLauncher) Start(ctx context.Context, unit string) error {
 			// The systemd StartUnit call context only bounds the D-Bus job. The
 			// launched process has its own lifetime and keeps waiting afterward.
 			go func() { _, _, _ = l.orch.WaitAssignment(context.Background(), runKindSandbox, runID) }()
+		}
+	}
+	if l.startEntered != nil {
+		l.startOnce.Do(func() { close(l.startEntered) })
+	}
+	if l.startRelease != nil {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-l.startRelease:
 		}
 	}
 	return nil
@@ -135,6 +154,132 @@ func TestResumeRace_ConnectAndRouteSingleLaunch(t *testing.T) {
 	got, err := st.Get(ctx, sid)
 	if err != nil || got == nil || got.State != types.StateRunning {
 		t.Fatalf("sandbox should be running after resume: %+v (err=%v)", got, err)
+	}
+}
+
+func TestResumeRace_RegistryRetriesShareDataPlaneSingleFlight(t *testing.T) {
+	box, err := secretbox.NewFromColonHex(strings.Repeat("0", 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.Open(filepath.Join(t.TempDir(), "t.db"), box)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	cfg := &config.Config{}
+	cfg.Paths.RunRoot = filepath.Join(t.TempDir(), "run")
+	cfg.Paths.BaseRoot = filepath.Join(t.TempDir(), "lib")
+	cfg.Sandbox.Network.Bare.InnerIP = "169.254.1.1/31"
+	startEntered := make(chan struct{})
+	startRelease := make(chan struct{})
+	lc := &countingLauncher{startEntered: startEntered, startRelease: startRelease}
+	o := New(cfg, st, lc, stubVS{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	lc.orch = o
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	if err := o.StartRunPools(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	sid := "sbx-cluster-resume-race"
+	templateRef := "bare-img-" + strings.Repeat("b", 64)
+	dispatch := clusterResumeDispatch(t, sid, templateRef)
+	sandbox := &types.Sandbox{
+		ID: sid, TemplateID: templateRef, State: types.StatePaused,
+		AuthKey: strings.Repeat("a", 64), ManifestKey: strings.Repeat("b", 64),
+		RunDir: cfg.Paths.RunRoot + "/" + sid, BaseDir: cfg.Paths.BaseRoot + "/" + sid,
+		CreatedUnix: 1,
+	}
+	if _, err := st.RecordSandboxWorkflow(ctx, dispatch, nodeexec.AdmissionDecision{
+		State: nodeexec.AdmissionAdmitted, Result: clusterstate.DispatchAcceptedAdmitted,
+		ReservationToken: "reservation-1",
+	}, sandbox); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := st.Get(ctx, sid)
+	if err != nil || stored == nil {
+		t.Fatalf("stored cluster sandbox = %+v, %v", stored, err)
+	}
+	if _, err := st.CommitSandboxEvent(ctx, stored, nodeexec.EventUpdate{
+		State: string(clusterstate.WorkflowRouteReady), TargetPort: 49983,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	stored, _ = st.Get(ctx, sid)
+	if _, err := st.CommitSandboxEvent(ctx, stored, nodeexec.EventUpdate{
+		State: string(clusterstate.WorkflowRoutePaused), TargetPort: 49983,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	stored, _ = st.Get(ctx, sid)
+	o.cache(stored)
+
+	node := &FinalClusterNode{core: o, store: st, log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	command := &routesync.Command{SID: sid}
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() { defer wg.Done(); node.resumeSandbox(ctx, command) }()
+	select {
+	case <-startEntered:
+	case <-time.After(time.Second):
+		t.Fatal("first cluster resume did not reach launcher")
+	}
+	wg.Add(1)
+	go func() { defer wg.Done(); node.resumeSandbox(ctx, command) }()
+	time.Sleep(25 * time.Millisecond)
+	close(startRelease)
+	wg.Wait()
+
+	if got := lc.starts.Load(); got != 1 {
+		t.Fatalf("Registry resume retries launched %d sandbox units, want 1", got)
+	}
+	stored, err = st.Get(ctx, sid)
+	if err != nil || stored == nil || stored.State != types.StateRunning {
+		t.Fatalf("sandbox after deduplicated cluster resume = %+v, %v", stored, err)
+	}
+}
+
+func clusterResumeDispatch(t *testing.T, sid, templateRef string) nodeexec.DispatchRecord {
+	t.Helper()
+	normalized, err := placement.NormalizeSandboxDemand(placement.SandboxDemand{
+		SlotUnits: 1, FloorMemory: 512 << 20, StartupBudgetMemory: 512 << 20,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec, err := clusterstate.MarshalSandboxDispatchSpec(clusterstate.SandboxDispatchSpecV1{
+		Version: clusterstate.DispatchSpecVersionV1, TemplateRef: templateRef,
+		AuthKeyFingerprint: strings.Repeat("a", 24), ManifestKeyFingerprint: strings.Repeat("b", 24),
+		AccessToken: "access-token", TargetPort: 49983,
+		Request: clusterstate.NodeRequestEnvelopeV1{
+			Version: clusterstate.NodeRequestEnvelopeVersionV1, Method: "POST", Path: "/sandboxes", Body: []byte("{}"),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	demandDigest := sha256.Sum256(normalized)
+	specDigest := sha256.Sum256(spec)
+	binding, err := clusterstate.EncodeExecutionBinding(clusterstate.ExecutionBinding{
+		RegistryGeneration: "generation-1", Kind: clusterstate.ExecutionKindSandbox,
+		ObjectID: sid, Group: "/group", RouteKey: "route-1", NodeID: "node-1", NodeEpoch: 7,
+		DemandDigest: demandDigest, DispatchSpecDigest: specDigest,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bindingDigest, err := clusterstate.ExecutionBindingDigest(binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return nodeexec.DispatchRecord{
+		Kind: clusterstate.ExecutionKindSandbox, ObjectID: sid, Group: "/group", RouteKey: "route-1",
+		NodeID: "node-1", NodeEpoch: 7, SessionSeq: 1, DataEndpoint: "node-1:8443",
+		NormalizedDemand: normalized, DemandDigest: hex.EncodeToString(demandDigest[:]),
+		DispatchSpec: spec, DispatchSpecDigest: hex.EncodeToString(specDigest[:]),
+		ProviderPolicyVersion: "provider-v1", OpaqueBinding: binding, BindingDigest: bindingDigest,
 	}
 }
 

@@ -1050,8 +1050,8 @@ func (r *Router) rememberRoute(entry *routeEntry) {
 	key := routeKeyID(copy.Group, copy.RouteKey)
 	r.cacheMu.Lock()
 	r.routes[key] = &copy
-	if copy.Revision >= r.minimumRevisions[key] {
-		delete(r.minimumRevisions, key)
+	if copy.Revision > r.minimumRevisions[key] {
+		r.minimumRevisions[key] = copy.Revision
 	}
 	r.cacheMu.Unlock()
 }
