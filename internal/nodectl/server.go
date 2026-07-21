@@ -356,11 +356,13 @@ func preparedReservationMatches(record *PreparedSandboxAdmission, reservation *R
 	}
 	demand := record.Demand
 	budget := computeEffectiveStartupBudget(demand.message(record.SandboxID))
+	currentAllocation := reservation.AllocatableNowMem
 	return reservation.Capacity == (Resources{
 		MemoryBytes: demand.CapacityMemoryBytes, CPUMilli: uint64(demand.CapacityCPU) * 1000,
 	}) && reservation.Floor == (Resources{
 		MemoryBytes: demand.FloorMemoryBytes, CPUMilli: uint64(demand.FloorCPU * 1000),
-	}) && reservation.AllocatableNowMem == budget && reservation.EffectiveStartupBudget == budget
+	}) && currentAllocation >= reservation.Floor.MemoryBytes &&
+		currentAllocation <= reservation.Capacity.MemoryBytes && reservation.EffectiveStartupBudget == budget
 }
 
 // BuildAdmitOKFromQueue is the adapter the admission worker calls when

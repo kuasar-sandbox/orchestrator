@@ -21,11 +21,12 @@ func testNodeRequest(t *testing.T, path, body string) NodeRequestEnvelopeV1 {
 }
 
 func TestSandboxDispatchSpecRoundTripAndRejectsSystemMetadata(t *testing.T) {
+	templateRef := "e2b-img-" + strings.Repeat("c", 64)
 	spec := SandboxDispatchSpecV1{
-		Version: DispatchSpecVersionV1, TemplateRef: "e2b-img-" + strings.Repeat("c", 64),
+		Version: DispatchSpecVersionV1, TemplateRef: templateRef,
 		AuthKeyFingerprint: strings.Repeat("a", 24), ManifestKeyFingerprint: strings.Repeat("b", 24),
 		AccessToken: "capability", Config: map[string]string{"tenant": "value"},
-		Request: testNodeRequest(t, "/sandboxes", `{"envVars":{"FUTURE":"kept"},"metadata":{"tenant":"value"}}`),
+		Request: testNodeRequest(t, "/sandboxes", `{"templateID":"`+templateRef+`","envVars":{"FUTURE":"kept"},"metadata":{"tenant":"value"}}`),
 	}
 	encoded, err := MarshalSandboxDispatchSpec(spec)
 	if err != nil {
@@ -42,18 +43,46 @@ func TestSandboxDispatchSpecRoundTripAndRejectsSystemMetadata(t *testing.T) {
 }
 
 func TestDispatchSpecRejectsReservedRequestMetadata(t *testing.T) {
+	templateRef := "e2b-img-" + strings.Repeat("c", 64)
 	spec := SandboxDispatchSpecV1{
-		Version: DispatchSpecVersionV1, TemplateRef: "e2b-img-" + strings.Repeat("c", 64),
+		Version: DispatchSpecVersionV1, TemplateRef: templateRef,
 		AuthKeyFingerprint: strings.Repeat("a", 24), ManifestKeyFingerprint: strings.Repeat("b", 24),
 		AccessToken: "capability",
-		Request:     testNodeRequest(t, "/sandboxes", `{"metadata":{"kuasar-sandbox.cluster":"forged"}}`),
+		Request:     testNodeRequest(t, "/sandboxes", `{"templateID":"`+templateRef+`","metadata":{"kuasar-sandbox.cluster":"forged"}}`),
 	}
 	if _, err := MarshalSandboxDispatchSpec(spec); err == nil {
 		t.Fatal("system-owned request metadata accepted")
 	}
-	spec.Request = testNodeRequest(t, "/sandboxes", `{"Metadata":{"tenant":"value"}}`)
+	spec.Request = testNodeRequest(t, "/sandboxes", `{"templateID":"`+templateRef+`","Metadata":{"tenant":"value"}}`)
 	if _, err := MarshalSandboxDispatchSpec(spec); err == nil {
 		t.Fatal("non-canonical metadata field accepted")
+	}
+}
+
+func TestSandboxDispatchSpecBindsReplayedTemplate(t *testing.T) {
+	templateRef := "e2b-img-" + strings.Repeat("c", 64)
+	base := SandboxDispatchSpecV1{
+		Version: DispatchSpecVersionV1, TemplateRef: templateRef,
+		AuthKeyFingerprint: strings.Repeat("a", 24), ManifestKeyFingerprint: strings.Repeat("b", 24),
+		AccessToken: "capability",
+	}
+	for name, body := range map[string]string{
+		"missing":    `{}`,
+		"mismatch":   `{"templateID":"another-template"}`,
+		"case alias": `{"TemplateID":"` + templateRef + `"}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			spec := base
+			spec.Request = testNodeRequest(t, "/sandboxes", body)
+			if _, err := MarshalSandboxDispatchSpec(spec); err == nil {
+				t.Fatal("unbound replay template was accepted")
+			}
+		})
+	}
+	valid := base
+	valid.Request = testNodeRequest(t, "/sandboxes", `{"templateID":"`+templateRef+`","future":true}`)
+	if _, err := MarshalSandboxDispatchSpec(valid); err != nil {
+		t.Fatalf("bound replay template: %v", err)
 	}
 }
 

@@ -66,10 +66,10 @@ func TestPublishToSubscriber(t *testing.T) {
 	o := &Orchestrator{subs: map[int]chan routesync.Event{}}
 	ch, cancel := o.Subscribe()
 	defer cancel()
-	o.publish(routesync.Event{Kind: routesync.TypeDelete, SID: "x"})
+	o.publish(routesync.Event{Kind: routesync.TypeDelete, Delete: routesync.RouteDelete{SandboxID: "x"}})
 	select {
 	case ev := <-ch:
-		if ev.SID != "x" {
+		if ev.Delete.SandboxID != "x" {
 			t.Fatalf("event = %+v", ev)
 		}
 	case <-time.After(time.Second):

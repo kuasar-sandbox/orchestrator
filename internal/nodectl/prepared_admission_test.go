@@ -160,6 +160,43 @@ func TestPreparedAdmissionOrdinaryAdmitAttachesClaimedReservation(t *testing.T) 
 	}
 }
 
+func TestPreparedAdmissionAttachAcceptsAdjustedAllocation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	state := preparedTestState()
+	controller := preparedTestController(t, state, path, 4)
+	demand := preparedTestDemand(2 << 30)
+	demand.FloorMemoryBytes = 512 << 20
+	demand.StartupBudgetMemory = 1 << 30
+	digest := preparedDigest("adjusted-allocation")
+	prepared, err := controller.PrepareAdmission("sandbox-adjusted", digest, demand)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := controller.ClaimAdmission("sandbox-adjusted", digest); err != nil {
+		t.Fatal(err)
+	}
+	server := &Server{
+		State: state, Admission: controller.admission, PreparedAdmission: controller,
+		Allocator: NewAllocator(AllocatorPolicy{}), Persister: controller.persister, Logf: t.Logf,
+		peerCgroup: func(net.Conn) (string, error) { return demand.CgroupPath, nil },
+	}
+	grant := server.handleAdminGrant(&Message{SandboxID: "sandbox-adjusted", RequestedDelta: 256 << 20})
+	if grant.Type != TypeAck || grant.NewAllocatable != 1280<<20 {
+		t.Fatalf("admin grant = %+v", grant)
+	}
+
+	serverConn, clientConn := net.Pipe()
+	defer serverConn.Close()
+	defer clientConn.Close()
+	request := demand.message("sandbox-adjusted")
+	var token string
+	response, handled := server.handlePreparedAdmit(serverConn, request, &token)
+	if !handled || response.Status != StatusAdmitted || token != prepared.ReservationToken ||
+		response.GrantedInitialAlloc != 1280<<20 {
+		t.Fatalf("adjusted attach response=%+v handled=%v token=%q", response, handled, token)
+	}
+}
+
 func TestPreparedAdmissionOrdinaryReleaseRollsBackOnPersistenceFailure(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.json")
 	state := preparedTestState()

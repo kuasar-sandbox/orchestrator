@@ -106,6 +106,9 @@ func TestDispatchIntentRejectsMutationAndOversize(t *testing.T) {
 	if _, err := NewDispatchIntent([]byte("demand"), []byte(strings.Repeat("x", MaxDispatchSpecBytes+1)), "v1"); err == nil {
 		t.Fatal("oversized dispatch spec accepted")
 	}
+	if _, err := NewDispatchIntent([]byte(strings.Repeat("x", MaxNormalizedDemandBytes+1)), []byte("spec"), "v1"); err == nil {
+		t.Fatal("oversized normalized demand accepted")
+	}
 }
 
 func TestPlacementFailuresDoNotInventExecutionProof(t *testing.T) {
