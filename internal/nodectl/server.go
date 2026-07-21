@@ -16,15 +16,18 @@ import (
 // connections from sandbox-ctl, dispatches messages to admission /
 // allocator / state, and persists state on every change.
 type Server struct {
-	Path      string
-	State     *State
-	Admission *AdmissionController
-	Allocator *Allocator
-	Persister *Persister
-	Auditor   *Auditor // optional
-	Logf      func(string, ...any)
+	Path              string
+	State             *State
+	Admission         *AdmissionController
+	PreparedAdmission *PreparedAdmissionController
+	Allocator         *Allocator
+	Persister         *Persister
+	Auditor           *Auditor // optional
+	Logf              func(string, ...any)
 
 	listener net.Listener
+	// Tests replace this resolver because net.Pipe has no kernel peer identity.
+	peerCgroup func(net.Conn) (string, error)
 
 	mu      sync.Mutex
 	stopped bool
@@ -200,6 +203,9 @@ func (s *Server) dispatch(conn net.Conn, req *Message, token *string) *Message {
 // reply. The conn-EOF monitor cancels the queue entry if the client
 // disconnects while queued.
 func (s *Server) handleAdmit(conn net.Conn, req *Message, token *string) *Message {
+	if response, handled := s.handlePreparedAdmit(conn, req, token); handled {
+		return response
+	}
 	oc := s.Admission.AnalyzeAndConsume(req)
 
 	switch oc.Status {
@@ -249,6 +255,110 @@ func (s *Server) handleAdmit(conn net.Conn, req *Message, token *string) *Messag
 
 	// Defensive (unreachable).
 	return &Message{Type: TypeAdmitResponse, Status: StatusRejected, Msg: "unknown admission outcome"}
+}
+
+// handlePreparedAdmit transparently binds sandbox-ctl's ordinary Admit request
+// to the reservation already claimed by the cluster command journal. It never
+// makes a second Admission decision. A SID present in the prepared ledger is
+// handled here even on mismatch so it cannot fall through to standalone Admit.
+func (s *Server) handlePreparedAdmit(conn net.Conn, req *Message, token *string) (*Message, bool) {
+	prepared := s.PreparedAdmission
+	if prepared == nil {
+		return nil, false
+	}
+	reject := func(reason, message string) (*Message, bool) {
+		return &Message{Type: TypeAdmitResponse, Status: StatusRejected, Reason: reason, Msg: message}, true
+	}
+
+	prepared.mu.Lock()
+	defer prepared.mu.Unlock()
+	if prepared.state != s.State || prepared.persister != s.Persister {
+		return reject("prepared_controller_mismatch", "prepared Admission is not bound to this resource server")
+	}
+	prepared.state.Lock()
+	defer prepared.state.Unlock()
+	record := prepared.state.PreparedSandboxAdmissions[req.SandboxID]
+	if record == nil {
+		return nil, false
+	}
+	if record.State != PreparedClaimed {
+		return reject("prepared_admission_not_claimed", "cluster Admission has not claimed this sandbox")
+	}
+	if !preparedDemandMatchesAdmit(record.Demand, req) {
+		return reject("prepared_admission_mismatch", "sandbox resource demand differs from the claimed Admission")
+	}
+	reservation := prepared.state.Lookup(record.ReservationToken)
+	if !preparedReservationMatches(record, reservation) {
+		return reject("prepared_reservation_invalid", "claimed sandbox reservation is missing or inconsistent")
+	}
+	if reservation.Conn != nil {
+		return reject("prepared_reservation_in_use", "claimed sandbox reservation already has a runtime connection")
+	}
+
+	peerCgroup := s.peerCgroup
+	if peerCgroup == nil {
+		peerCgroup = peerUnifiedCgroup
+	}
+	actualCgroup, err := peerCgroup(conn)
+	if err != nil || req.CgroupPath == "" || req.CgroupPath != actualCgroup {
+		return reject("prepared_cgroup_unverified", "sandbox cgroup does not match the authenticated runtime process")
+	}
+	if record.Demand.CgroupPath != "" && record.Demand.CgroupPath != req.CgroupPath ||
+		reservation.CgroupPath != "" && reservation.CgroupPath != req.CgroupPath {
+		return reject("prepared_admission_mismatch", "sandbox cgroup differs from the claimed Admission")
+	}
+
+	if record.Demand.CgroupPath == "" || reservation.CgroupPath == "" {
+		previousDemandPath := record.Demand.CgroupPath
+		previousReservationPath := reservation.CgroupPath
+		previousUpdatedAt := record.UpdatedAt
+		record.Demand.CgroupPath = req.CgroupPath
+		reservation.CgroupPath = req.CgroupPath
+		record.UpdatedAt = prepared.clock()
+		if flushErr := prepared.persister.Flush(prepared.state); flushErr != nil {
+			if !FlushPublished(flushErr) {
+				record.Demand.CgroupPath = previousDemandPath
+				reservation.CgroupPath = previousReservationPath
+				record.UpdatedAt = previousUpdatedAt
+				return reject("prepared_attach_persist_failed", "sandbox cgroup binding could not be persisted")
+			}
+			s.Logf("persist published prepared cgroup binding with durability error: %v", flushErr)
+		}
+	}
+
+	reservation.Conn = conn
+	*token = reservation.Token
+	s.Logf("attach prepared %s sid=%s initial_alloc=%d", reservation.Token[:8], req.SandboxID, reservation.AllocatableNowMem)
+	if s.Auditor != nil {
+		s.Auditor.Logf("attach_prepared token=%s sid=%s initial_alloc=%d",
+			reservation.Token[:8], req.SandboxID, reservation.AllocatableNowMem)
+	}
+	return &Message{
+		Type: TypeAdmitResponse, Token: reservation.Token, Status: StatusAdmitted,
+		GrantedInitialAlloc: reservation.AllocatableNowMem,
+	}, true
+}
+
+func preparedDemandMatchesAdmit(demand SandboxAdmissionDemand, req *Message) bool {
+	return req != nil && demand.CapacityMemoryBytes == req.CapacityMemoryBytes &&
+		demand.CapacityCPU == req.CapacityCPU && demand.FloorMemoryBytes == req.FloorMemoryBytes &&
+		demand.FloorCPU == req.FloorCPU && demand.StartupBudgetMemory == req.StartupBudgetMemory &&
+		demand.AllocatableAtSnapshot == req.AllocatableAtSnapshot
+}
+
+func preparedReservationMatches(record *PreparedSandboxAdmission, reservation *Reservation) bool {
+	if record == nil || reservation == nil || record.ReservationToken == "" ||
+		reservation.Token != record.ReservationToken || reservation.SandboxID != record.SandboxID ||
+		reservation.Stage != StageAdmitted {
+		return false
+	}
+	demand := record.Demand
+	budget := computeEffectiveStartupBudget(demand.message(record.SandboxID))
+	return reservation.Capacity == (Resources{
+		MemoryBytes: demand.CapacityMemoryBytes, CPUMilli: uint64(demand.CapacityCPU) * 1000,
+	}) && reservation.Floor == (Resources{
+		MemoryBytes: demand.FloorMemoryBytes, CPUMilli: uint64(demand.FloorCPU * 1000),
+	}) && reservation.AllocatableNowMem == budget && reservation.EffectiveStartupBudget == budget
 }
 
 // BuildAdmitOKFromQueue is the adapter the admission worker calls when
@@ -310,18 +420,12 @@ func (s *Server) buildAdmitOK(conn net.Conn, req *Message, token *string) (*Mess
 // handleReattach re-binds a connection to an existing reservation
 // (after sandbox-ctl reconnect or controller restart).
 func (s *Server) handleReattach(conn net.Conn, req *Message, token *string) *Message {
-	if req.SandboxID == "" {
-		return &Message{Type: TypeError, Msg: "reattach requires sandbox ID"}
-	}
 	s.State.Lock()
 	defer s.State.Unlock()
 
 	res := s.State.Lookup(req.Token)
 	if res == nil {
 		return &Message{Type: TypeError, Msg: "unknown token"}
-	}
-	if res.SandboxID != req.SandboxID {
-		return &Message{Type: TypeError, Msg: "reservation belongs to another sandbox"}
 	}
 	res.Conn = conn
 	*token = req.Token

@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/hex"
 	"errors"
-	"fmt"
 	"sync"
 	"time"
 
@@ -523,12 +522,4 @@ func (h *Holder) Registration(nodeID string) (Registration, bool) {
 		return Registration{}, false
 	}
 	return session.registration, true
-}
-
-func SessionMovedError(nodeID string, current DirectoryEntry, found bool) error {
-	if !found {
-		return fmt.Errorf("%w: node %s has no current Holder", ErrSessionUnavailable, nodeID)
-	}
-	return fmt.Errorf("%w: node %s is held by %s at (%d,%d)", ErrStaleSession, nodeID,
-		current.HolderMemberID, current.NodeEpoch, current.SessionSeq)
 }

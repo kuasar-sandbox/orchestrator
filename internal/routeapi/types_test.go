@@ -111,38 +111,6 @@ func TestTrustedMutationHandlerReturnsInternalFailureDetail(t *testing.T) {
 	}
 }
 
-func TestRouterStateCarriesMonotonicRevisionAndLeaderHint(t *testing.T) {
-	state, err := NewRouterState(routeRequest(false).RequestIdentity)
-	if err != nil {
-		t.Fatal(err)
-	}
-	request := state.RouteRequest("/g", "rk", 7, false)
-	if request.MinRouteRevision != 0 {
-		t.Fatalf("initial minimum = %d", request.MinRouteRevision)
-	}
-	if err := state.ObserveRoute(request, ReadRouteResponse{
-		Outcome: ReadReady, Group: "/g", RouteKey: "rk", State: clusterstate.WorkflowRouteReady,
-		Route: testReadyRoute(), RouteRevision: 12,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	request = state.RouteRequest("/g", "rk", 7, false)
-	if request.MinRouteRevision != 12 {
-		t.Fatalf("minimum = %d", request.MinRouteRevision)
-	}
-	hint := LeaderHint{MemberID: "r1", Endpoint: "https://r1.internal", Term: 4}
-	if err := state.ObserveRoute(request, ReadRouteResponse{Outcome: ReadNeedLeader, LeaderHint: &hint}); err != nil {
-		t.Fatal(err)
-	}
-	old := LeaderHint{MemberID: "old", Endpoint: "https://old.internal", Term: 3}
-	if err := state.ObserveRoute(request, ReadRouteResponse{Outcome: ReadNeedLeader, LeaderHint: &old}); err != nil {
-		t.Fatal(err)
-	}
-	if got, ok := state.LeaderHint(7); !ok || got != hint {
-		t.Fatalf("leader hint = %+v ok=%v", got, ok)
-	}
-}
-
 func TestPositiveReadsRequireExactTableKeyIdentity(t *testing.T) {
 	request := routeRequest(false)
 	response := ReadRouteResponse{

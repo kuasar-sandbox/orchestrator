@@ -215,37 +215,6 @@ func FirstAcceptedRegistryLayout(registryLayout RegistryLayout, digest string) (
 
 type RegistryLayoutGuard struct{ Path string }
 
-func (g RegistryLayoutGuard) AcceptSigned(
-	signed SignedRegistryLayout,
-	keyring map[string]ed25519.PublicKey,
-) (AcceptedRegistryLayout, error) {
-	digest, err := signed.Verify(keyring)
-	if err != nil {
-		return AcceptedRegistryLayout{}, err
-	}
-	current, err := g.Load()
-	if err != nil {
-		return AcceptedRegistryLayout{}, err
-	}
-	if current != nil && (signed.RegistryLayout.RegistryGeneration != current.RegistryGeneration ||
-		signed.RegistryLayout.RegistryLayoutVersion != current.RegistryLayoutVersion || digest != current.RegistryLayoutDigest) {
-		return AcceptedRegistryLayout{}, errors.New("raftstore: advancing a registryLayout guard requires the complete signed chain")
-	}
-	var next AcceptedRegistryLayout
-	if current == nil {
-		next, err = FirstAcceptedRegistryLayout(signed.RegistryLayout, digest)
-	} else {
-		next, err = current.Accept(signed.RegistryLayout, digest)
-	}
-	if err != nil {
-		return AcceptedRegistryLayout{}, err
-	}
-	if err := g.store(next); err != nil {
-		return AcceptedRegistryLayout{}, err
-	}
-	return next, nil
-}
-
 func (g RegistryLayoutGuard) AcceptSignedChain(
 	chain []SignedRegistryLayout,
 	keyring map[string]ed25519.PublicKey,

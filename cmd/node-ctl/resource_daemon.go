@@ -138,6 +138,7 @@ func startResourceController(
 			return nil, err
 		}
 	}
+	srv.PreparedAdmission = prepared
 	admission.Run()
 
 	sweeper := &nodectl.IdleSweeper{

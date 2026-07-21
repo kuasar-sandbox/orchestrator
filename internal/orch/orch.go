@@ -740,16 +740,6 @@ func (o *Orchestrator) sandboxLaunchSpec(ctx context.Context, sid string) (*conf
 			"KUASAR_SANDBOX_ID": sb.ID,
 		},
 	}
-	if o.cfg.Sandbox.Resources.ControlSocket != "" {
-		workflow, err := o.st.GetNodeWorkflow(ctx, clusterstate.ExecutionKindSandbox, sid)
-		if err != nil {
-			return nil, "", false, err
-		}
-		if workflow != nil && workflow.ReservationToken != "" {
-			spec.Env["KUASAR_RESOURCE_RESERVATION_TOKEN"] = workflow.ReservationToken
-			spec.Env["KUASAR_RESOURCE_CONTROLLER_SOCKET"] = o.cfg.Sandbox.Resources.ControlSocket
-		}
-	}
 	return spec, sb.PidFile(), true, nil
 }
 

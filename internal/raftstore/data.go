@@ -490,7 +490,6 @@ func ApplyDataCommand(state *DataState, index uint64, command DataCommand) DataA
 			record.Finalizations = cloneWorkflowFinalizations(current.Finalizations)
 		}
 		record.Revision = revisionFor(*state, index)
-		normalizeBuildRevision(&record)
 		if err := record.Validate(); err != nil {
 			return conflict(err.Error(), current.Revision.LogIndex)
 		}
@@ -631,9 +630,6 @@ func normalizeRouteRevision(record *clusterstate.RouteWorkflowRecord) {
 	if record.Tombstone != nil && record.Tombstone.PlacementFailure == nil && record.Tombstone.FailureRevision == (clusterstate.Revision{}) {
 		record.Tombstone.FailureRevision = record.Revision
 	}
-}
-
-func normalizeBuildRevision(record *clusterstate.BuildRecord) {
 }
 
 func dataConflict(reason string, revision uint64) DataApplyResult {

@@ -289,39 +289,6 @@ func inlineSecret(kind string, s clusterstate.Secret) (string, error) {
 	return s.Value, nil
 }
 
-func manifestKeyPatch(group string, key clusterstate.Secret) (fp, keyType, keyValue, keyRef string, err error) {
-	if key.Value == "" {
-		return "", "", "", "", nil
-	}
-	keyType = key.Type
-	if keyType == "" {
-		keyType = clusterstate.SecretInline
-	}
-	switch keyType {
-	case clusterstate.SecretInline:
-		fp = manifestKeyFingerprint(key.Value)
-		if fp == "" {
-			return "", "", "", "", fmt.Errorf("placer: invalid manifest_key for group %q", group)
-		}
-		return fp, keyType, key.Value, "", nil
-	case clusterstate.SecretRef:
-		if key.Fingerprint == "" {
-			return "", "", "", "", fmt.Errorf("placer: manifest_key ref for group %q missing fingerprint", group)
-		}
-		return key.Fingerprint, keyType, "", key.Value, nil
-	default:
-		return "", "", "", "", fmt.Errorf("placer: unknown manifest_key type %q", keyType)
-	}
-}
-
-func manifestKeyFingerprint(manifestKeyHex string) string {
-	raw, err := hex.DecodeString(manifestKeyHex)
-	if err != nil {
-		return ""
-	}
-	return hex.EncodeToString(apikey.Fingerprint(raw))
-}
-
 func verifyAPIKey(authKeyHex, encoded string) bool {
 	p, err := apikey.Parse(encoded)
 	if err != nil {

@@ -65,7 +65,6 @@ func LookupDataMutation(state DataState, query DataMutationLookup) (DataMutation
 		}
 		wanted := cloneBuildRecord(*command.Build)
 		wanted.Revision = current.Revision
-		normalizeBuildRevision(&wanted)
 		return DataMutationStatus{Committed: reflect.DeepEqual(current, wanted), Revision: current.Revision.LogIndex}, nil
 	default:
 		current, found := state.Fences[fenceMapKey(command.Fence.Group, command.Fence.RouteKey, command.Fence.SandboxID)]

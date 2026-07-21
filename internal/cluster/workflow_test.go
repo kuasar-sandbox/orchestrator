@@ -156,51 +156,6 @@ func TestDispatchOutcomeRejectsUnknownValue(t *testing.T) {
 	}
 }
 
-func TestExecutionFenceCompactionRequiresEveryProof(t *testing.T) {
-	proofDigest := sha256.Sum256([]byte("terminal proof"))
-	bindingDigest := sha256.Sum256([]byte("binding"))
-	fence := ExecutionFence{
-		Group: "/g", RouteKey: "rk", SandboxID: "s1", NodeID: "n1", NodeEpoch: 7,
-		RegistryGeneration: "g1", BindingDigest: strings.ToLower(strings.Repeat("0", 64)),
-		LastEventSeq: 9, FinalOutboxWatermark: 9,
-		Proof: TerminalProof{
-			Kind: ProofNodeTerminal, ProofDigest: hexDigest(proofDigest), FencedNodeID: "n1", FencedNodeEpoch: 7,
-		},
-		Revision: Revision{RegistryGeneration: "g1", ShardID: 1, LogIndex: 20},
-	}
-	fence.BindingDigest = hexDigest(bindingDigest)
-	all := FenceCompactionProof{
-		TerminalProofCommitted: true, FinalOutboxWatermarkAcked: true,
-		AllReplicasApplied: true, MinimumRetentionElapsed: true,
-	}
-	if !CanCompactExecutionFence(fence, all) {
-		t.Fatal("complete fence proof did not compact")
-	}
-	fence.FinalOutboxWatermark = fence.LastEventSeq - 1
-	if CanCompactExecutionFence(fence, all) {
-		t.Fatal("fence compacted before the acknowledged watermark covered the last event")
-	}
-	fence.FinalOutboxWatermark = fence.LastEventSeq
-	wrongGeneration := fence
-	wrongGeneration.Revision.RegistryGeneration = "g2"
-	if CanCompactExecutionFence(wrongGeneration, all) {
-		t.Fatal("fence compacted using a revision from another Registry History Generation")
-	}
-	all.AllReplicasApplied = false
-	if CanCompactExecutionFence(fence, all) {
-		t.Fatal("fence compacted before every replica applied")
-	}
-	all.AllReplicasApplied = true
-	all.FinalOutboxWatermarkAcked = false
-	if CanCompactExecutionFence(fence, all) {
-		t.Fatal("fence compacted without outbox ACK or epoch fence")
-	}
-	all.NodeEpochPermanentlyFenced = true
-	if !CanCompactExecutionFence(fence, all) {
-		t.Fatal("permanent NodeEpoch fence did not replace final outbox ACK")
-	}
-}
-
 func TestNewerNodeEpochProofIsBoundToExactExecutionState(t *testing.T) {
 	ready := readyRoute()
 	proof := TerminalProof{

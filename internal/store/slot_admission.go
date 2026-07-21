@@ -6,7 +6,6 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"errors"
-	"fmt"
 	"math"
 	"time"
 
@@ -395,7 +394,3 @@ var _ interface {
 	PromoteQueued() ([]nodectl.PreparedAdmissionResult, error)
 	Wake() <-chan struct{}
 } = (*Store)(nil)
-
-func (r slotAdmissionRecord) String() string {
-	return fmt.Sprintf("%s/%s", r.result.SandboxID, r.result.State)
-}

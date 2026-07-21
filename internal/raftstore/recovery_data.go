@@ -242,7 +242,6 @@ func stageRecoveryObject(state *DataState, index uint64, identity ShardRequestId
 	}
 	if record.Build != nil {
 		record.Build.Revision = record.Revision
-		normalizeBuildRevision(record.Build)
 	}
 	if err := record.Validate(*state.Recovery); err != nil {
 		return err
@@ -393,7 +392,6 @@ func applyRecoveryRebindProjection(
 	} else {
 		build := cloneBuildRecord(*update.Build)
 		build.Revision = copy.Revision
-		normalizeBuildRevision(&build)
 		copy.Build = &build
 	}
 	if copy.EventSeq < record.EventSeq {

@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"net"
 	"os"
 	"path/filepath"
 	"testing"
@@ -78,6 +79,136 @@ func TestPreparedAdmissionIsDurableIdempotentAndClaimable(t *testing.T) {
 	if record == nil || record.State != PreparedClaimed || record.ReservationToken != first.ReservationToken ||
 		loaded.Reservations[first.ReservationToken] == nil {
 		t.Fatalf("reloaded admission = %+v reservations=%+v", record, loaded.Reservations)
+	}
+}
+
+func TestPreparedAdmissionOrdinaryAdmitAttachesClaimedReservation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	state := preparedTestState()
+	controller := preparedTestController(t, state, path, 4)
+	demand := preparedTestDemand(1 << 30)
+	// The runner cgroup does not exist until systemd starts sandbox-ctl. The
+	// authenticated ordinary Admit fixes the kernel-observed path exactly once.
+	demand.CgroupPath = ""
+	digest := preparedDigest("transparent-attach")
+	prepared, err := controller.PrepareAdmission("sandbox-attach", digest, demand)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := controller.ClaimAdmission("sandbox-attach", digest); err != nil {
+		t.Fatal(err)
+	}
+
+	serverConn, clientConn := net.Pipe()
+	defer serverConn.Close()
+	defer clientConn.Close()
+	const cgroup = "/sys/fs/cgroup/sandbox-runner.slice/runner.service"
+	server := &Server{
+		State: state, Admission: controller.admission, PreparedAdmission: controller,
+		Persister: controller.persister, Logf: t.Logf,
+		peerCgroup: func(net.Conn) (string, error) { return cgroup, nil },
+	}
+	request := demand.message("sandbox-attach")
+	request.CgroupPath = cgroup
+	var token string
+	response, handled := server.handlePreparedAdmit(serverConn, request, &token)
+	if !handled || response.Status != StatusAdmitted || token != prepared.ReservationToken ||
+		response.Token != prepared.ReservationToken || response.GrantedInitialAlloc != 1<<30 {
+		t.Fatalf("attach response=%+v handled=%v token=%q", response, handled, token)
+	}
+
+	state.Lock()
+	record := state.PreparedSandboxAdmissions["sandbox-attach"]
+	reservation := state.Reservations[prepared.ReservationToken]
+	if len(state.Reservations) != 1 || record.Demand.CgroupPath != cgroup ||
+		reservation.CgroupPath != cgroup || reservation.Conn != serverConn {
+		state.Unlock()
+		t.Fatalf("attached record=%+v reservation=%+v", record, reservation)
+	}
+	state.Unlock()
+	loaded, err := controller.persister.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.PreparedSandboxAdmissions["sandbox-attach"].Demand.CgroupPath != cgroup ||
+		loaded.Reservations[prepared.ReservationToken].CgroupPath != cgroup {
+		t.Fatalf("persisted attach=%+v", loaded.PreparedSandboxAdmissions["sandbox-attach"])
+	}
+}
+
+func TestPreparedAdmissionOrdinaryAdmitFailsClosed(t *testing.T) {
+	tests := []struct {
+		name      string
+		claim     bool
+		mutate    func(*Message)
+		peerGroup string
+		reason    string
+	}{
+		{name: "not claimed", reason: "prepared_admission_not_claimed"},
+		{name: "resource mismatch", claim: true, mutate: func(request *Message) { request.FloorMemoryBytes-- }, reason: "prepared_admission_mismatch"},
+		{name: "cgroup not owned by peer", claim: true, peerGroup: "/sys/fs/cgroup/another.service", reason: "prepared_cgroup_unverified"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "state.json")
+			state := preparedTestState()
+			controller := preparedTestController(t, state, path, 4)
+			demand := preparedTestDemand(1 << 30)
+			demand.CgroupPath = ""
+			digest := preparedDigest(test.name)
+			prepared, err := controller.PrepareAdmission("sandbox-fenced", digest, demand)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if test.claim {
+				if _, err := controller.ClaimAdmission("sandbox-fenced", digest); err != nil {
+					t.Fatal(err)
+				}
+			}
+			serverConn, clientConn := net.Pipe()
+			defer serverConn.Close()
+			defer clientConn.Close()
+			const requestedCgroup = "/sys/fs/cgroup/sandbox-runner.slice/runner.service"
+			peerGroup := test.peerGroup
+			if peerGroup == "" {
+				peerGroup = requestedCgroup
+			}
+			server := &Server{
+				State: state, Admission: controller.admission, PreparedAdmission: controller,
+				Persister: controller.persister, Logf: t.Logf,
+				peerCgroup: func(net.Conn) (string, error) { return peerGroup, nil },
+			}
+			request := demand.message("sandbox-fenced")
+			request.CgroupPath = requestedCgroup
+			if test.mutate != nil {
+				test.mutate(request)
+			}
+			var token string
+			response, handled := server.handlePreparedAdmit(serverConn, request, &token)
+			if !handled || response.Status != StatusRejected || response.Reason != test.reason || token != "" {
+				t.Fatalf("response=%+v handled=%v token=%q", response, handled, token)
+			}
+			state.Lock()
+			reservation := state.Reservations[prepared.ReservationToken]
+			if len(state.Reservations) != 1 || reservation == nil || reservation.Conn != nil {
+				state.Unlock()
+				t.Fatalf("rejected attach changed reservations: %+v", state.Reservations)
+			}
+			state.Unlock()
+		})
+	}
+}
+
+func TestPreparedAdmissionOrdinaryAdmitFallsThroughOnlyForUnknownSID(t *testing.T) {
+	state := preparedTestState()
+	controller := preparedTestController(t, state, filepath.Join(t.TempDir(), "state.json"), 4)
+	serverConn, clientConn := net.Pipe()
+	defer serverConn.Close()
+	defer clientConn.Close()
+	server := &Server{State: state, Admission: controller.admission, PreparedAdmission: controller, Persister: controller.persister, Logf: t.Logf}
+	response, handled := server.handlePreparedAdmit(serverConn, preparedTestDemand(1<<30).message("standalone"), new(string))
+	if handled || response != nil {
+		t.Fatalf("unknown SID was captured by cluster Admission: response=%+v handled=%v", response, handled)
 	}
 }
 

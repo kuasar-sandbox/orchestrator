@@ -15,16 +15,6 @@ type Member struct {
 	Available bool
 }
 
-// SelectReconnectTarget uses weighted rendezvous only for a new/reconnecting
-// session. Callers never invoke it to migrate an already live Holder session.
-func SelectReconnectTarget(nodeID string, members []Member) (string, error) {
-	ranked, err := RankReconnectTargets(nodeID, members)
-	if err != nil {
-		return "", err
-	}
-	return ranked[0], nil
-}
-
 // RankReconnectTargets returns the weighted-rendezvous winner first and the
 // remaining eligible members in the same deterministic order. A reconnecting
 // node may try the tail after a target fails; this never migrates a live session.

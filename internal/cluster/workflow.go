@@ -743,15 +743,6 @@ func (r BuildRecord) Validate() error {
 	}
 }
 
-func hasTerminalWorkflowFinalization(intents []WorkflowFinalizationIntent) bool {
-	for _, intent := range intents {
-		if intent.TerminalProof != nil {
-			return true
-		}
-	}
-	return false
-}
-
 type ExecutionFence struct {
 	Group                  string                      `json:"group"`
 	RouteKey               string                      `json:"route_key"`
@@ -895,22 +886,6 @@ func (f ExecutionFence) ProofDigest() string {
 		return f.PlacementFailureDigest
 	}
 	return f.Proof.ProofDigest
-}
-
-type FenceCompactionProof struct {
-	TerminalProofCommitted     bool
-	FinalOutboxWatermarkAcked  bool
-	NodeEpochPermanentlyFenced bool
-	AllReplicasApplied         bool
-	MinimumRetentionElapsed    bool
-}
-
-func CanCompactExecutionFence(fence ExecutionFence, proof FenceCompactionProof) bool {
-	outboxCovered := fence.PlacementFailure != nil ||
-		proof.FinalOutboxWatermarkAcked && fence.FinalOutboxWatermark >= fence.LastEventSeq
-	return fence.Validate() == nil && proof.TerminalProofCommitted &&
-		(outboxCovered || proof.NodeEpochPermanentlyFenced) &&
-		proof.AllReplicasApplied && proof.MinimumRetentionElapsed
 }
 
 func validateCandidates(candidates []PlacementCandidate, selected *uint32, rejected []uint32) error {

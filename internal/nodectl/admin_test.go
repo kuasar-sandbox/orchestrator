@@ -1,9 +1,6 @@
 package nodectl
 
-import (
-	"context"
-	"testing"
-)
+import "testing"
 
 func TestAdmin_DrainBlocksAdmit(t *testing.T) {
 	srv, c, cleanup := startTestServer(t, 8<<30)
@@ -18,7 +15,7 @@ func TestAdmin_DrainBlocksAdmit(t *testing.T) {
 	}
 
 	// New Admit must be rejected.
-	res, err := c.Admit(context.Background(), AdmitParams{
+	res, err := c.Admit(AdmitParams{
 		SandboxID:           "blocked",
 		CapacityMemoryBytes: 256 << 20,
 		FloorMemoryBytes:    32 << 20,
@@ -40,7 +37,7 @@ func TestAdmin_DrainBlocksAdmit(t *testing.T) {
 	}
 
 	// Now admit succeeds.
-	res, err = c.Admit(context.Background(), AdmitParams{
+	res, err = c.Admit(AdmitParams{
 		SandboxID:           "ok",
 		CapacityMemoryBytes: 256 << 20,
 		FloorMemoryBytes:    32 << 20,
@@ -66,7 +63,7 @@ func TestAdmin_GrantOverridesPool(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer c2.Close()
-	if _, err := c2.Admit(context.Background(), AdmitParams{
+	if _, err := c2.Admit(AdmitParams{
 		SandboxID:           "sb-grant",
 		CapacityMemoryBytes: 1 << 30,
 		FloorMemoryBytes:    64 << 20,
@@ -101,7 +98,7 @@ func TestAdmin_ReclaimShrinksReservation(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer c2.Close()
-	if _, err := c2.Admit(context.Background(), AdmitParams{
+	if _, err := c2.Admit(AdmitParams{
 		SandboxID:           "sb-rec",
 		CapacityMemoryBytes: 1 << 30,
 		FloorMemoryBytes:    64 << 20,
@@ -156,7 +153,7 @@ func TestHeartbeat_ReturnsAllocatable(t *testing.T) {
 	srv, c, cleanup := startTestServer(t, 8<<30)
 	defer cleanup()
 
-	if _, err := c.Admit(context.Background(), AdmitParams{
+	if _, err := c.Admit(AdmitParams{
 		SandboxID:           "sb-hb",
 		CapacityMemoryBytes: 1 << 30,
 		FloorMemoryBytes:    64 << 20,

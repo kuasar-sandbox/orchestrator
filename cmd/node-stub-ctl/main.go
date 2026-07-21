@@ -1764,18 +1764,6 @@ func (n *stubNode) getSandbox(sid string) *stubSandbox {
 	return nil
 }
 
-func (n *stubNode) getBuild(buildID string) *stubBuild {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	if b := n.builds[buildID]; b != nil {
-		cp := *b
-		cp.Metadata = cloneStringMap(b.Metadata)
-		cp.Resources = cloneBuildResources(b.Resources)
-		return &cp
-	}
-	return nil
-}
-
 func (n *stubNode) snapshot() nodeSnapshot {
 	n.mu.Lock()
 	defer n.mu.Unlock()

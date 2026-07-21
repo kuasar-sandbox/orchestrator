@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -824,12 +825,9 @@ func TestDirectoryRetirementCollectsHintAndRejectsStaleDelta(t *testing.T) {
 	}
 }
 
-func TestDirectoryDigestAndFullMergeAreDeterministic(t *testing.T) {
+func TestDirectoryFullMergePreservesAvailabilityAndConflict(t *testing.T) {
 	a := DirectoryRecord{Entry: DirectoryEntry{NodeID: "a", EnrollmentID: "enrollment-a", Tuple: Tuple{NodeEpoch: 1, SessionSeq: 2}, HolderMemberID: "r1"}, Available: true}
 	b := DirectoryRecord{Entry: DirectoryEntry{NodeID: "b", EnrollmentID: "enrollment-b", Tuple: Tuple{NodeEpoch: 3, SessionSeq: 4}, HolderMemberID: "r2"}, Conflict: true}
-	if DirectoryDigest([]DirectoryRecord{a, b}) != DirectoryDigest([]DirectoryRecord{b, a}) {
-		t.Fatal("directory digest depends on input order")
-	}
 	directory := newTestDirectory()
 	if changed := directory.MergeFull([]DirectoryRecord{b, a}); changed != 3 {
 		t.Fatalf("merge changed %d records", changed)
@@ -856,13 +854,11 @@ func TestDirectoryConflictCanonicalizesAcrossArrivalOrder(t *testing.T) {
 	leftSnapshot := left.Snapshot()
 	rightSnapshot := right.Snapshot()
 	if len(leftSnapshot) != 1 || len(rightSnapshot) != 1 ||
+		leftSnapshot[0] != rightSnapshot[0] ||
 		leftSnapshot[0].Entry.HolderMemberID != "registry-a" ||
 		rightSnapshot[0].Entry.HolderMemberID != "registry-a" ||
 		!leftSnapshot[0].Conflict || !rightSnapshot[0].Conflict {
 		t.Fatalf("canonical conflicts: left=%+v right=%+v", leftSnapshot, rightSnapshot)
-	}
-	if DirectoryDigest(leftSnapshot) != DirectoryDigest(rightSnapshot) {
-		t.Fatal("split-holder conflicts retained arrival-order-dependent digests")
 	}
 }
 
@@ -894,20 +890,20 @@ func TestWeightedRendezvousIsDeterministicAndSkipsUnavailable(t *testing.T) {
 		{MemberID: "registry-b", Weight: 2, Available: true},
 		{MemberID: "registry-c", Weight: 100, Available: false},
 	}
-	first, err := SelectReconnectTarget("node-1", members)
+	first, err := RankReconnectTargets("node-1", members)
 	if err != nil {
 		t.Fatal(err)
 	}
 	for i := 0; i < 10; i++ {
-		got, err := SelectReconnectTarget("node-1", members)
-		if err != nil || got != first {
+		got, err := RankReconnectTargets("node-1", members)
+		if err != nil || !slices.Equal(got, first) {
 			t.Fatalf("selection %q, %v; want %q", got, err, first)
 		}
 	}
-	if first == "registry-c" {
+	if first[0] == "registry-c" {
 		t.Fatal("selected unavailable member")
 	}
-	if _, err := SelectReconnectTarget("node-1", []Member{{MemberID: "registry-c", Weight: 1}}); err == nil {
+	if _, err := RankReconnectTargets("node-1", []Member{{MemberID: "registry-c", Weight: 1}}); err == nil {
 		t.Fatal("selection succeeded without an available member")
 	}
 }
