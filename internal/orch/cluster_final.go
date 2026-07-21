@@ -211,15 +211,22 @@ func NewFinalClusterNode(core *Orchestrator, st *store.Store, options ClusterNod
 	return node, nil
 }
 
-func (n *FinalClusterNode) Run(ctx context.Context) {
+// Start establishes the durable local execution authority before the node is
+// allowed to serve cluster traffic. The node-link may reconnect independently,
+// but an inconsistent Admission ledger is a process-fatal startup error.
+func (n *FinalClusterNode) Start(ctx context.Context) error {
 	if err := n.session.WaitReady(ctx); err != nil {
-		return
+		return err
 	}
 	if err := n.authority.ReconcileSandboxAdmissions(ctx, 256); err != nil {
-		n.log.Error("cluster Sandbox Admission reconciliation failed", "err", err)
-		return
+		return fmt.Errorf("reconcile cluster Sandbox Admission: %w", err)
 	}
 	n.readyOnce.Do(func() { close(n.executionReady) })
+	go n.run(ctx)
+	return nil
+}
+
+func (n *FinalClusterNode) run(ctx context.Context) {
 	ticker := time.NewTicker(250 * time.Millisecond)
 	defer ticker.Stop()
 	for {

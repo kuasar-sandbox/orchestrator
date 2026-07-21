@@ -18,7 +18,7 @@ api:
     key: /etc/node-ctl/tls/privkey.pem
     # Required in cluster mode: verifies the Router role certificate before
     # any direct object read, mutation, or data-plane CONNECT.
-    client_ca: /etc/node-ctl/tls/cluster-ca.pem
+    # client_ca: /etc/node-ctl/tls/cluster-ca.pem
 
 # Data-plane policy. mode selects how sandbox traffic (<port>-<sid>.<domain>) is served:
 #   internal (default) — in-process proxy (single binary, no extra moving parts).

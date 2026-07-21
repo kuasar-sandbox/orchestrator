@@ -341,8 +341,13 @@ func runConductor(args []string, log *slog.Logger) error {
 		)
 		nl.SetEventReplayLimits(cfg.Cluster.EventReplayBatch, cfg.Cluster.EventReplayBytes, eventReplayInterval)
 		core.SetClusterContext(ctx)
-		go finalNode.Run(ctx)
 		go nl.Run(ctx)
+		if err := finalNode.Start(ctx); err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			return fmt.Errorf("start cluster execution authority: %w", err)
+		}
 		log.Info("node-ctl conductor: final node-link active", "registry", cfg.Cluster.NodeLink.Endpoint,
 			"node_id", clusterStart.NodeID, "node_epoch", clusterStart.NodeEpoch)
 	}

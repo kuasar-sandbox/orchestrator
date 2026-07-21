@@ -76,7 +76,7 @@ func TestServer_AdmitSettledRelease(t *testing.T) {
 	_, c, cleanup := startTestServer(t, 8<<30)
 	defer cleanup()
 
-	res, err := c.Admit(AdmitParams{
+	res, err := c.Admit(context.Background(), AdmitParams{
 		SandboxID:           "sb-1",
 		CapacityMemoryBytes: 1 << 30,
 		CapacityCPU:         1,
@@ -115,7 +115,7 @@ func TestServer_BurstGrantAndRecover(t *testing.T) {
 	srv, c, cleanup := startTestServer(t, 8<<30)
 	defer cleanup()
 
-	res, err := c.Admit(AdmitParams{
+	res, err := c.Admit(context.Background(), AdmitParams{
 		SandboxID:           "sb-2",
 		CapacityMemoryBytes: 1 << 30,
 		FloorMemoryBytes:    128 << 20,
@@ -164,7 +164,7 @@ func TestServer_RejectInRedZone(t *testing.T) {
 	}
 	srv.State.Unlock()
 
-	res, err := c.Admit(AdmitParams{
+	res, err := c.Admit(context.Background(), AdmitParams{
 		SandboxID:           "sb-r",
 		CapacityMemoryBytes: 100 << 20,
 		FloorMemoryBytes:    50 << 20,
@@ -182,7 +182,7 @@ func TestServer_OOMReportAndHeartbeat(t *testing.T) {
 	srv, c, cleanup := startTestServer(t, 8<<30)
 	defer cleanup()
 
-	res, _ := c.Admit(AdmitParams{
+	res, _ := c.Admit(context.Background(), AdmitParams{
 		SandboxID:           "sb-h",
 		CapacityMemoryBytes: 256 << 20,
 		FloorMemoryBytes:    64 << 20,
@@ -251,7 +251,7 @@ func TestServer_PersistAcrossRestart(t *testing.T) {
 	}
 
 	s1, c1, cancel1, done1 := build()
-	res, _ := c1.Admit(AdmitParams{
+	res, _ := c1.Admit(context.Background(), AdmitParams{
 		SandboxID:           "sb-p",
 		CapacityMemoryBytes: 256 << 20,
 		FloorMemoryBytes:    64 << 20,
@@ -281,10 +281,10 @@ func TestServer_PersistAcrossRestart(t *testing.T) {
 	if err := c2.OwnPreparedReservation(tok); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := c2.Reattach(tok, "wrong-sandbox"); err == nil {
+	if _, err := c2.Reattach(context.Background(), tok, "wrong-sandbox"); err == nil {
 		t.Fatal("reattach accepted a token bound to another sandbox")
 	}
-	grant, err := c2.Reattach(tok, "sb-p")
+	grant, err := c2.Reattach(context.Background(), tok, "sb-p")
 	if err != nil {
 		t.Fatal(err)
 	}
