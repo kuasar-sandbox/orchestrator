@@ -3,6 +3,7 @@ package cluster
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -141,6 +142,44 @@ func TestPlacementFailuresDoNotInventExecutionProof(t *testing.T) {
 		},
 	}
 	if err := build.Validate(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPlacementCandidatePoolIsBoundedBeforePersistence(t *testing.T) {
+	candidates := make([]PlacementCandidate, MaxPlacementCandidates+1)
+	for index := range candidates {
+		candidates[index].NodeID = fmt.Sprintf("node-%d", index)
+	}
+	if err := validateCandidates(candidates, nil, nil); err == nil {
+		t.Fatal("oversized candidate pool was accepted")
+	}
+	if err := validateCandidates([]PlacementCandidate{{NodeID: "node-1"}}, nil, make([]uint32, 2)); err == nil {
+		t.Fatal("oversized rejected-candidate set was accepted")
+	}
+	if err := validateCandidates([]PlacementCandidate{{
+		NodeID: "node-1", FailureDomain: strings.Repeat("z", MaxPlacementCandidateMetadataBytes+1),
+	}}, nil, nil); err == nil {
+		t.Fatal("oversized candidate metadata was accepted")
+	}
+}
+
+func TestExecutionFenceRequiresFinalOutboxCoverage(t *testing.T) {
+	proof := TerminalProof{
+		Kind: ProofNodeTerminal, ProofDigest: hexDigest(sha256.Sum256([]byte("proof"))),
+		FencedNodeID: "node-1", FencedNodeEpoch: 7,
+	}
+	fence := ExecutionFence{
+		Group: "/g", RouteKey: "rk", SandboxID: "sandbox-1", NodeID: "node-1", NodeEpoch: 7,
+		RegistryGeneration: "g1", BindingDigest: hexDigest(sha256.Sum256([]byte("binding"))),
+		LastEventSeq: 4, FinalOutboxWatermark: 3, Proof: proof,
+		Revision: Revision{RegistryGeneration: "g1", ShardID: 1, LogIndex: 9},
+	}
+	if err := fence.Validate(); err == nil {
+		t.Fatal("execution fence accepted an outbox watermark below its last event")
+	}
+	fence.FinalOutboxWatermark = fence.LastEventSeq
+	if err := fence.Validate(); err != nil {
 		t.Fatal(err)
 	}
 }

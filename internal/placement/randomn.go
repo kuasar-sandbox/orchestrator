@@ -10,7 +10,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/cluster"
 )
 
-const DefaultCandidateCount = 4
+const DefaultCandidateCount = cluster.MaxPlacementCandidates
 
 type CatalogNode struct {
 	NodeID        string

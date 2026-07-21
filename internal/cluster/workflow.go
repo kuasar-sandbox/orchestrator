@@ -6,11 +6,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"unicode/utf8"
 )
 
 const (
-	MaxDispatchSpecBytes     = 64 << 10
-	MaxNormalizedDemandBytes = 64 << 10
+	MaxDispatchSpecBytes               = 64 << 10
+	MaxNormalizedDemandBytes           = 64 << 10
+	MaxPlacementCandidates             = 4
+	MaxPlacementCandidateMetadataBytes = 256
 )
 
 type Revision struct {
@@ -800,6 +803,9 @@ func (f ExecutionFence) Validate() error {
 	if f.Proof.FencedNodeID != f.NodeID || f.Proof.FencedNodeEpoch != f.NodeEpoch {
 		return errors.New("cluster: execution fence proof identifies another execution")
 	}
+	if f.FinalOutboxWatermark < f.LastEventSeq {
+		return errors.New("cluster: execution fence final outbox watermark does not cover the last event")
+	}
 	if err := f.Proof.Validate(); err != nil {
 		return err
 	}
@@ -898,10 +904,24 @@ func (f ExecutionFence) ProofDigest() string {
 }
 
 func validateCandidates(candidates []PlacementCandidate, selected *uint32, rejected []uint32) error {
+	if len(candidates) == 0 || len(candidates) > MaxPlacementCandidates {
+		return fmt.Errorf("cluster: placement candidate count must be between 1 and %d", MaxPlacementCandidates)
+	}
+	if len(rejected) > len(candidates) {
+		return errors.New("cluster: rejected candidate count exceeds the candidate pool")
+	}
 	seenNodes := make(map[string]struct{}, len(candidates))
 	for _, candidate := range candidates {
-		if candidate.NodeID == "" {
-			return errors.New("cluster: candidate node ID is required")
+		if err := ValidateExecutionBindingNodeID(candidate.NodeID); err != nil {
+			return fmt.Errorf("cluster: invalid placement candidate node ID: %w", err)
+		}
+		for name, value := range map[string]string{
+			"failure domain": candidate.FailureDomain,
+			"runtime digest": candidate.RuntimeDigest,
+		} {
+			if !utf8.ValidString(value) || len(value) > MaxPlacementCandidateMetadataBytes {
+				return fmt.Errorf("cluster: placement candidate %s is invalid or exceeds %d bytes", name, MaxPlacementCandidateMetadataBytes)
+			}
 		}
 		if _, exists := seenNodes[candidate.NodeID]; exists {
 			return errors.New("cluster: duplicate placement candidate")

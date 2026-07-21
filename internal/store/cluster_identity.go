@@ -7,7 +7,11 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"net"
+	"strconv"
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
@@ -97,8 +101,11 @@ func (s *Store) PrepareClusterStart(
 	ctx context.Context,
 	expectedNodeID, bootID, dataEndpoint string,
 ) (ClusterStartIdentity, error) {
-	if bootID == "" || dataEndpoint == "" {
-		return ClusterStartIdentity{}, errors.New("store: boot ID and data endpoint are required")
+	if bootID == "" {
+		return ClusterStartIdentity{}, errors.New("store: boot ID is required")
+	}
+	if err := validateClusterDataEndpoint(dataEndpoint); err != nil {
+		return ClusterStartIdentity{}, err
 	}
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
 	if err != nil {
@@ -232,11 +239,31 @@ func validateClusterIdentityInput(nodeID, bootID, dataEndpoint string) error {
 	switch {
 	case bootID == "":
 		return errors.New("store: boot ID is required")
-	case dataEndpoint == "":
-		return errors.New("store: data endpoint is required")
-	default:
-		return nil
 	}
+	return validateClusterDataEndpoint(dataEndpoint)
+}
+
+func validateClusterDataEndpoint(dataEndpoint string) error {
+	if dataEndpoint == "" {
+		return errors.New("store: data endpoint is required")
+	}
+	if !utf8.ValidString(dataEndpoint) || strings.TrimSpace(dataEndpoint) != dataEndpoint {
+		return errors.New("store: data endpoint must be a canonical TCP host:port")
+	}
+	host, portText, err := net.SplitHostPort(dataEndpoint)
+	if err != nil || host == "" || strings.ContainsAny(host, "/?#") {
+		return errors.New("store: data endpoint must be a canonical TCP host:port")
+	}
+	for _, b := range []byte(host) {
+		if b < 0x21 || b == 0x7f {
+			return errors.New("store: data endpoint must be a canonical TCP host:port")
+		}
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil || port <= 0 || port > 65535 || net.JoinHostPort(host, strconv.Itoa(port)) != dataEndpoint {
+		return errors.New("store: data endpoint must be a canonical TCP host:port")
+	}
+	return nil
 }
 
 type rowScanner interface {
