@@ -401,7 +401,7 @@ func TestRegistryLayoutGuardPersistsWithRestrictedMode(t *testing.T) {
 	}
 	path := filepath.Join(t.TempDir(), "guard", "registryLayout.json")
 	guard := RegistryLayoutGuard{Path: path}
-	accepted, err := guard.AcceptSigned(signed, map[string]ed25519.PublicKey{"root-1": publicKey})
+	accepted, err := guard.AcceptSignedChain([]SignedRegistryLayout{signed}, map[string]ed25519.PublicKey{"root-1": publicKey})
 	if err != nil {
 		t.Fatal(err)
 	}
