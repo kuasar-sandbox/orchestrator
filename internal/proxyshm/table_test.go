@@ -73,6 +73,76 @@ func TestBookmarkSweepsMissingRoutes(t *testing.T) {
 	}
 }
 
+func TestFullSyncDoesNotRegressCurrentExecutionEvent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "routes.shm")
+	tbl, err := Create(path, 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tbl.Close()
+	current := routesync.RouteEntry{
+		SandboxID: "s1", NodeID: "n1", NodeEpoch: 7, RegistryGeneration: "g1", BindingDigest: "binding",
+		EventSeq: 2, Profile: "e2b", State: routesync.StateRunning, AccessToken: "current",
+	}
+	tbl.BeginSync()
+	if err := tbl.Upsert(current); err != nil {
+		t.Fatal(err)
+	}
+	tbl.Bookmark()
+
+	tbl.BeginSync()
+	stale := current
+	stale.EventSeq = 1
+	stale.State = routesync.StatePaused
+	stale.AccessToken = "stale"
+	if err := tbl.Upsert(stale); err != nil {
+		t.Fatal(err)
+	}
+	tbl.Bookmark()
+	got, ok := tbl.Lookup("s1")
+	if !ok || got.EventSeq != 2 || got.State != routesync.StateRunning || got.AccessToken != "current" {
+		t.Fatalf("route regressed during full sync: %+v ok=%v", got, ok)
+	}
+}
+
+func TestManagedDeleteRequiresCurrentExecutionFence(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "routes.shm")
+	tbl, err := Create(path, 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tbl.Close()
+	current := routesync.RouteEntry{
+		SandboxID: "s1", NodeID: "n1", NodeEpoch: 7, RegistryGeneration: "g1", BindingDigest: "current",
+		EventSeq: 5, Profile: "e2b", State: routesync.StateRunning,
+	}
+	if err := tbl.Upsert(current); err != nil {
+		t.Fatal(err)
+	}
+	for name, delete := range map[string]routesync.RouteDelete{
+		"unfenced":    {SandboxID: "s1"},
+		"old binding": {SandboxID: "s1", NodeID: "n1", NodeEpoch: 7, RegistryGeneration: "g1", BindingDigest: "old", EventSeq: 6},
+		"old event":   {SandboxID: "s1", NodeID: "n1", NodeEpoch: 7, RegistryGeneration: "g1", BindingDigest: "current", EventSeq: 4},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if tbl.DeleteRoute(delete) {
+				t.Fatal("stale delete removed current execution")
+			}
+			if _, ok := tbl.Lookup("s1"); !ok {
+				t.Fatal("current execution disappeared")
+			}
+		})
+	}
+	if !tbl.DeleteRoute(routesync.RouteDelete{
+		SandboxID: "s1", NodeID: "n1", NodeEpoch: 7, RegistryGeneration: "g1", BindingDigest: "current", EventSeq: 6,
+	}) {
+		t.Fatal("current execution delete was not applied")
+	}
+	if _, ok := tbl.Lookup("s1"); ok {
+		t.Fatal("deleted execution remains visible")
+	}
+}
+
 func TestWorkerResolveWakesAndWaitsForSharedUpdate(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "routes.shm")
 	tbl, err := Create(path, 16)
@@ -193,6 +263,54 @@ func TestWorkerBindingChangeWhileParkedFailsClosed(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("parked route did not fail after rebind")
+	}
+}
+
+func TestWorkerRechecksRouteAtParkDeadline(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "routes.shm")
+	tbl, err := Create(path, 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tbl.Close()
+	master := NewMasterView(tbl, 30*time.Millisecond, nil)
+	updates := &Updates{ch: make(chan struct{})}
+	woke := make(chan struct{}, 1)
+	worker := NewWorkerView(tbl, updates, func(routesync.RouteWake) { woke <- struct{}{} }, 30*time.Millisecond)
+	master.BeginSync()
+	entry := routesync.RouteEntry{
+		SandboxID: "s1", NodeID: "n1", NodeEpoch: 7, RegistryGeneration: "g1", BindingDigest: "binding",
+		EventSeq: 1, Profile: "e2b", State: routesync.StatePaused,
+	}
+	master.ApplyUpsert(entry)
+	master.Bookmark()
+
+	done := make(chan proxy.Route, 1)
+	go func() {
+		route, _ := worker.Route(context.Background(), proxy.RouteRequest{
+			SandboxID: "s1", Port: 49983, ExpectedNodeID: "n1", ExpectedNodeEpoch: 7,
+			ExpectedRegistryGeneration: "g1", ExpectedBindingDigest: "binding",
+		})
+		done <- route
+	}()
+	select {
+	case <-woke:
+	case <-time.After(time.Second):
+		t.Fatal("worker did not park")
+	}
+	entry.EventSeq = 2
+	entry.State = routesync.StateRunning
+	entry.EnvdUDS = "/run/s1/envd.sock"
+	master.ApplyUpsert(entry)
+	// Deliberately omit updates.bump: the deadline path must still observe the
+	// committed shared-table update in its final read.
+	select {
+	case route := <-done:
+		if route.Kind != proxy.KindUDS || route.UDS == "" {
+			t.Fatalf("route at park deadline = %+v", route)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("worker did not finish at park deadline")
 	}
 }
 

@@ -50,6 +50,9 @@ func (s SandboxDispatchSpecV1) Validate() error {
 	if err := validateDispatchRequest(s.Request, "/sandboxes", "/v2/sandboxes"); err != nil {
 		return fmt.Errorf("cluster: Sandbox dispatch request: %w", err)
 	}
+	if err := validateSandboxTemplateRef(s.Request.Body, s.TemplateRef); err != nil {
+		return fmt.Errorf("cluster: Sandbox dispatch request: %w", err)
+	}
 	return nil
 }
 
@@ -223,6 +226,30 @@ func validateBuildResourceCeilings(body []byte, cpuCount, memoryMB int) error {
 	}
 	if bodyCPU != cpuCount || bodyMemory != memoryMB {
 		return errors.New("replayed CPU or memory ceiling differs from normalized Build resources")
+	}
+	return nil
+}
+
+func validateSandboxTemplateRef(body []byte, templateRef string) error {
+	fields, err := DecodeJSONObject(body)
+	if err != nil {
+		return err
+	}
+	for name := range fields {
+		if strings.EqualFold(name, "templateID") && name != "templateID" {
+			return fmt.Errorf("template field %q must use canonical spelling", name)
+		}
+	}
+	raw, ok := fields["templateID"]
+	if !ok {
+		return errors.New("replayed Sandbox request is missing templateID")
+	}
+	var bodyTemplate string
+	if err := json.Unmarshal(raw, &bodyTemplate); err != nil || bodyTemplate == "" {
+		return errors.New("replayed Sandbox templateID must be a non-empty string")
+	}
+	if bodyTemplate != templateRef {
+		return errors.New("replayed Sandbox templateID differs from TemplateRef")
 	}
 	return nil
 }

@@ -205,7 +205,7 @@ func (o *Orchestrator) publishUpsert(sb *types.Sandbox) {
 }
 
 func (o *Orchestrator) publishDelete(sid string) {
-	o.publish(routesync.Event{Kind: routesync.TypeDelete, SID: sid})
+	o.publish(routesync.Event{Kind: routesync.TypeDelete, Delete: routesync.RouteDelete{SandboxID: sid}})
 }
 
 // publish fans an event out to every subscriber. A full subscriber is dropped +

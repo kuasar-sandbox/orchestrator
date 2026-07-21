@@ -262,7 +262,7 @@ func canonicalNodeRequestHeaders(source http.Header) (map[string][]string, error
 			continue
 		}
 		for _, value := range values {
-			if strings.ContainsAny(value, "\r\n\x00") {
+			if !utf8.ValidString(value) || !httpguts.ValidHeaderFieldValue(value) {
 				return nil, fmt.Errorf("cluster: invalid value for request header %q", canonicalName)
 			}
 			total += len(canonicalName) + len(value)
@@ -287,7 +287,8 @@ func protectedNodeRequestHeader(lowerName string) bool {
 		"x-kuasar-node-epoch", "x-kuasar-storage-generation",
 		"x-kuasar-registry-generation", "x-kuasar-binding-digest",
 		"x-kuasar-execution-kind", "x-kuasar-execution-object-id",
-		"x-kuasar-sandbox-group", "x-kuasar-route-key", "x-kuasar-pull-token":
+		"x-kuasar-sandbox-group", "x-kuasar-route-key", "x-kuasar-pull-token",
+		"x-kuasar-migration-token":
 		return true
 	default:
 		return false
