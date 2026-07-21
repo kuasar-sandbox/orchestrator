@@ -10,7 +10,7 @@ Type=simple
 User=root
 WorkingDirectory=/opt/actions-runner
 Environment=RUNNER_ALLOW_RUNASROOT=1
-ExecStart=/opt/actions-runner/runsvc.sh
+ExecStart=/opt/actions-runner/bin/runsvc.sh
 Restart=always
 RestartSec=5s
 KillMode=process

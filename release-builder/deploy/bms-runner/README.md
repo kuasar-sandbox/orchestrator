@@ -1,6 +1,6 @@
 # BMS runner slots
 
-This directory provisions two privileged `systemd-nspawn` system containers on
+This directory provisions six privileged `systemd-nspawn` system containers on
 the openEuler 24.03 BMS host. Each container owns its systemd, journald, PID,
 mount, network, cgroup, Docker daemon, runner credentials, and Actions work
 directory. The containers share only:
@@ -23,7 +23,7 @@ large release artifacts during a job:
 
 Transfer these verified files from the operator host before running `check`.
 The provisioner rejects missing or mismatched tools and mounts the directory
-read-only into both slots.
+read-only into all slots.
 
 The shared Go toolchain is pinned to `go1.26.5` for `linux/amd64`. If the
 validated `/usr/local/go` toolchain is absent, installation fetches
@@ -41,8 +41,17 @@ connector datapath.
 
 | Slot | Runner name | CPU/NUMA | Memory | Address |
 | --- | --- | --- | --- | --- |
-| 1 | `bms-tmp-kuasar-e2e-1` | NUMA0: `0-21,44-65` | high 168 GiB, max 176 GiB | `10.203.0.11/24` |
-| 2 | `bms-tmp-kuasar-e2e-2` | NUMA1: `22-43,66-87` | high 168 GiB, max 176 GiB | `10.203.0.12/24` |
+| 1 | `bms-tmp-kuasar-e2e-1` | NUMA0: `0-6,44-50` | high 52 GiB, max 56 GiB | `10.203.0.11/24` |
+| 2 | `bms-tmp-kuasar-e2e-2` | NUMA0: `7-13,51-57` | high 52 GiB, max 56 GiB | `10.203.0.12/24` |
+| 3 | `bms-tmp-kuasar-e2e-3` | NUMA0: `14-20,58-64` | high 52 GiB, max 56 GiB | `10.203.0.13/24` |
+| 4 | `bms-tmp-kuasar-e2e-4` | NUMA1: `22-28,66-72` | high 52 GiB, max 56 GiB | `10.203.0.14/24` |
+| 5 | `bms-tmp-kuasar-e2e-5` | NUMA1: `29-35,73-79` | high 52 GiB, max 56 GiB | `10.203.0.15/24` |
+| 6 | `bms-tmp-kuasar-e2e-6` | NUMA1: `36-42,80-86` | high 52 GiB, max 56 GiB | `10.203.0.16/24` |
+
+The layout reserves one physical core per NUMA node (`21,65` and `43,87`) and
+about 39 GiB of host memory when every slot reaches `MemoryMax`. It targets
+functional E2E concurrency; performance or density baselines that require the
+former 176 GiB-per-slot layout must use a separate profile.
 
 The host bridge is `kuasar-ci0` at `10.203.0.1/24`. Exact iptables rules NAT
 that subnet through the current default uplink. The network service records its
@@ -63,7 +72,7 @@ Run from this directory on the BMS host as root:
 ```
 
 The install root is built once from the already configured Huawei Cloud
-openEuler mirror and copied into `/var/lib/machines/kuasar-ci-{1,2}`. Because
+openEuler mirror and copied into `/var/lib/machines/kuasar-ci-{1..6}`. Because
 openEuler does not package the static `libuuid.a` required by the guest
 `mkfs.erofs`, the provisioner builds it inside the install root from the pinned
 openEuler `util-linux` source RPM. Both the source RPM and its upstream tarball
@@ -83,8 +92,8 @@ file name and is included in the static-library build identity.
 The host install also writes `/etc/modules-load.d/kuasar-ci.conf` for bridge,
 overlay, TUN, and vhost devices. Enabled slots therefore retain their required
 bind devices after a host reboot. Space checks follow the filesystems that hold
-the template and `/var/lib/machines`; a shared filesystem requires 15 GiB free,
-while separate filesystems require 5 GiB and 10 GiB respectively.
+the template and `/var/lib/machines`; a shared filesystem requires 35 GiB free,
+while separate filesystems require 5 GiB and 30 GiB respectively.
 The provisioner makes a slot root visible only after writing a separate owner
 marker into a staging root. An incomplete owned root is rebuilt automatically
 on retry; a markerless or mismatched root is never modified or deleted.
@@ -113,7 +122,7 @@ Each installroot transaction replaces the openEuler release package's default
 metalink configuration with the host repository files both before and after the
 package operation. This prevents an `openEuler-release` update from restoring
 international metalinks. Keep `/etc/yum.repos.d/*.repo` on the host pointed at a
-direct China mirror; the same configuration is propagated to both slots.
+direct China mirror; the same configuration is propagated to all slots.
 
 Generate short-lived organization registration tokens with an authenticated
 `gh` client and stream them over SSH. The provisioner forwards the token over
@@ -126,6 +135,8 @@ gh api --method POST /orgs/kuasar-sandbox/actions/runners/registration-token \
 
 gh api --method POST /orgs/kuasar-sandbox/actions/runners/registration-token \
   --jq .token | ssh bms.tmp '/usr/local/sbin/kuasar-ci-runner-provision register 2'
+
+# Repeat with a fresh token for slots 3 through 6.
 ```
 
 A registration completion marker is written only after runner configuration,
@@ -133,7 +144,7 @@ the fixed PATH, and service enablement all succeed. Supplying a fresh token
 retries any markerless partial registration through the runner's `--replace`
 flow; a completed registration is left unchanged.
 
-Both runners join the existing `kuasar-e2e` organization group with labels
+All runners join the existing `kuasar-e2e` organization group with labels
 `kuasar-e2e,kvm,cgroup-v2` plus a slot label. The group must remain
 organization-wide (`visibility=all`) with no selected-repository or workflow
 restriction.
@@ -145,12 +156,12 @@ ssh bms.tmp '/usr/local/sbin/kuasar-ci-runner-provision start'
 ssh bms.tmp '/usr/local/sbin/kuasar-ci-runner-provision verify'
 ```
 
-`start` rechecks that the retained legacy host runner is stopped. If either
+`start` rechecks that the retained legacy host runner is stopped. If any
 container fails to start or become ready, it stops every slot started by that
 command and restores each unit's previous enabled state; slots that were already
 active are left active.
 
-For rollback, stop both container slots without deleting their state. A failed
+For rollback, stop all container slots without deleting their state. A failed
 container stop makes the command fail instead of leaving a slot running:
 
 ```bash
@@ -166,7 +177,7 @@ private bpffs/netns, the static `libuuid` build dependency, outbound access
 through the China-side proxy path, and active runner services. It is not an E2E
 wrapper. Repository workflows still execute `make test-e2e` directly.
 
-Do not stop or unregister the existing host runner until both slots have passed
+Do not stop or unregister the existing host runner until all slots have passed
 the full five-repository E2E concurrently three times and cancellation cleanup
 has been verified. During migration it may be stopped but retained as a quick
 rollback path.

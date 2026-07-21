@@ -2,7 +2,7 @@
 Description=Private network for kuasar BMS CI containers
 After=network-online.target docker.service
 Wants=network-online.target
-Before=systemd-nspawn@kuasar-ci-1.service systemd-nspawn@kuasar-ci-2.service
+Before=systemd-nspawn@kuasar-ci-1.service systemd-nspawn@kuasar-ci-2.service systemd-nspawn@kuasar-ci-3.service systemd-nspawn@kuasar-ci-4.service systemd-nspawn@kuasar-ci-5.service systemd-nspawn@kuasar-ci-6.service
 
 [Service]
 Type=oneshot
