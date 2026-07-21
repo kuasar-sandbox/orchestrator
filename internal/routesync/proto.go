@@ -102,6 +102,33 @@ type RouteEntry struct {
 	MmdsSecret string `json:"mmds_secret,omitempty"`
 }
 
+// RouteDelete removes only the execution named by its fence. Standalone routes
+// have no execution fence and use SandboxID alone; cluster-managed routes must
+// carry the complete identity and event watermark.
+type RouteDelete struct {
+	SandboxID          string `json:"sid"`
+	NodeID             string `json:"node_id,omitempty"`
+	NodeEpoch          uint64 `json:"node_epoch,omitempty"`
+	RegistryGeneration string `json:"registry_generation,omitempty"`
+	BindingDigest      string `json:"binding_digest,omitempty"`
+	EventSeq           uint64 `json:"event_seq,omitempty"`
+}
+
+func (d RouteDelete) HasExecutionFence() bool {
+	return d.NodeID != "" || d.NodeEpoch != 0 || d.RegistryGeneration != "" || d.BindingDigest != "" || d.EventSeq != 0
+}
+
+func (d RouteDelete) Validate() error {
+	if d.SandboxID == "" {
+		return errors.New("routesync: route delete requires a sandbox ID")
+	}
+	if d.HasExecutionFence() && (d.NodeID == "" || d.NodeEpoch == 0 || d.RegistryGeneration == "" ||
+		d.BindingDigest == "" || d.EventSeq == 0) {
+		return errors.New("routesync: managed route delete requires a complete execution fence")
+	}
+	return nil
+}
+
 // RouteWake identifies the exact paused execution a proxy observed. A wake is
 // only a hint to resume that execution; it must never authorize a resume after
 // the node epoch, Registry History Generation, or system-owned Binding has changed.
@@ -124,12 +151,13 @@ type Policy struct {
 // Msg is one wire message — a tagged union; exactly one payload field is set for a
 // given Type.
 type Msg struct {
-	Type     string      `json:"type"`
-	Hello    *Hello      `json:"hello,omitempty"`    // hello (orchestrator -> subscriber)
-	Register *Register   `json:"register,omitempty"` // register (subscriber -> orchestrator, first up-frame)
-	Route    *RouteEntry `json:"route,omitempty"`    // upsert
-	Wake     *RouteWake  `json:"wake,omitempty"`     // wake
-	SID      string      `json:"sid,omitempty"`      // delete | command target
+	Type     string       `json:"type"`
+	Hello    *Hello       `json:"hello,omitempty"`    // hello (orchestrator -> subscriber)
+	Register *Register    `json:"register,omitempty"` // register (subscriber -> orchestrator, first up-frame)
+	Route    *RouteEntry  `json:"route,omitempty"`    // upsert
+	Delete   *RouteDelete `json:"delete,omitempty"`   // delete
+	Wake     *RouteWake   `json:"wake,omitempty"`     // wake
+	SID      string       `json:"sid,omitempty"`      // command target
 	// Cluster node-link variants (node.md §10): node_register / heartbeat / cmd_ack
 	// flow node -> registry; command flows registry -> node; rev stamps down events.
 	NodeReg        *NodeRegister          `json:"node_register,omitempty"`
@@ -202,9 +230,9 @@ func (r Register) SubscribeKind() string {
 // Event is a route change the orchestrator publishes to the route-sync client,
 // which fans it out to every connected proxy as an Upsert/Delete.
 type Event struct {
-	Kind  string     // TypeUpsert | TypeDelete
-	Route RouteEntry // Upsert
-	SID   string     // Delete
+	Kind   string      // TypeUpsert | TypeDelete
+	Route  RouteEntry  // Upsert
+	Delete RouteDelete // Delete
 }
 
 const maxFrame = 1 << 20 // 1 MiB — generous bound for a single route/wake frame (no all-routes frame)

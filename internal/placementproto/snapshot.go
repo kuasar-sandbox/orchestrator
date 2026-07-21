@@ -25,6 +25,7 @@ type PlacementLoadSnapshot struct {
 	NodeAllocatedMemory       uint64 `json:"node_allocated_memory"`
 	AllocatablePoolMemory     uint64 `json:"allocatable_pool_memory"`
 	BuildReservedMemory       uint64 `json:"build_reserved_memory"`
+	EmergencyReservedMemory   uint64 `json:"emergency_reserved_memory"`
 	StartupAllocatedMemory    uint64 `json:"startup_allocated_memory"`
 	StartupPoolMemory         uint64 `json:"startup_pool_memory"`
 

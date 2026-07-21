@@ -175,10 +175,12 @@ func projectSandbox(snapshot PlacementLoadSnapshot, demand SandboxDemand) (Probe
 
 	if snapshot.SandboxResourceController {
 		effectiveMemory := demand.EffectiveStartupMemory()
-		if effectiveMemory == 0 || snapshot.AllocatablePoolMemory == 0 {
+		if effectiveMemory == 0 || snapshot.EmergencyReservedMemory >= snapshot.AllocatablePoolMemory {
 			return ProbeReject, RateComponents{}, "sandbox memory capacity/demand is unknown"
 		}
-		allocatablePool := snapshot.AllocatablePoolMemory
+		// AllocatablePoolMemory is already the Sandbox pool after the Build
+		// reservation. Ordinary placement cannot consume the emergency reserve.
+		allocatablePool := snapshot.AllocatablePoolMemory - snapshot.EmergencyReservedMemory
 		if snapshot.StartupPoolMemory == 0 || effectiveMemory > allocatablePool || effectiveMemory > snapshot.StartupPoolMemory {
 			return ProbeReject, RateComponents{}, "sandbox can never fit memory pools"
 		}
@@ -294,6 +296,9 @@ func ValidateSnapshot(snapshot PlacementLoadSnapshot) error {
 	if snapshot.NodeID == "" || snapshot.NodeEpoch == 0 || snapshot.SessionSeq == 0 || snapshot.DataEndpoint == "" ||
 		snapshot.SampleSeq == 0 || snapshot.LoadModelVersion == 0 {
 		return errors.New("placement: incomplete load snapshot")
+	}
+	if snapshot.LoadModelVersion != LoadModelVersion {
+		return errors.New("placement: unsupported load model version")
 	}
 	return nil
 }

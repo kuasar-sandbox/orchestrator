@@ -270,7 +270,11 @@ func writeEvent(w io.Writer, ev Event) error {
 		r := ev.Route
 		m.Route = &r
 	case TypeDelete:
-		m.SID = ev.SID
+		if err := ev.Delete.Validate(); err != nil {
+			return err
+		}
+		d := ev.Delete
+		m.Delete = &d
 	default:
 		return nil
 	}

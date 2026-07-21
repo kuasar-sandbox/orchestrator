@@ -268,11 +268,10 @@ func TestHolderRejectsStableRegistrationChangesWithinNodeEpoch(t *testing.T) {
 		t.Fatal(err)
 	}
 	for name, mutate := range map[string]func(*Registration){
-		"runtime":    func(r *Registration) { r.RuntimeDigest = "runtime-v2" },
-		"load model": func(r *Registration) { r.LoadModelVersion++ },
-		"sandbox":    func(r *Registration) { r.SandboxSlots++ },
-		"build":      func(r *Registration) { r.BuildMemory++ },
-		"domain":     func(r *Registration) { r.FailureDomain = "zone-b" },
+		"runtime": func(r *Registration) { r.RuntimeDigest = "runtime-v2" },
+		"sandbox": func(r *Registration) { r.SandboxSlots++ },
+		"build":   func(r *Registration) { r.BuildMemory++ },
+		"domain":  func(r *Registration) { r.FailureDomain = "zone-b" },
 	} {
 		t.Run(name, func(t *testing.T) {
 			next := first
@@ -290,6 +289,14 @@ func TestRegistrationRequiresSandboxCapacity(t *testing.T) {
 	registration.SandboxSlots = 0
 	if err := registration.Validate(); err == nil {
 		t.Fatal("registration without sandbox capacity was accepted")
+	}
+}
+
+func TestRegistrationRequiresSupportedLoadModel(t *testing.T) {
+	registration := testRegistration("node-1", 1, 1, "10.0.0.1:8443")
+	registration.LoadModelVersion++
+	if err := registration.Validate(); err == nil {
+		t.Fatal("registration with an unsupported load model was accepted")
 	}
 }
 
@@ -601,6 +608,83 @@ func TestHolderSerializesDispatchWithSessionReplacement(t *testing.T) {
 	case <-endpoint.fenced:
 	case <-time.After(time.Second):
 		t.Fatal("replaced session was not fenced")
+	}
+}
+
+func TestBlockedSessionReplacementDoesNotBlockOtherNodeProbe(t *testing.T) {
+	first := testRegistration("node-1", 7, 10, "10.0.0.1:8443")
+	second := testRegistration("node-2", 8, 20, "10.0.0.2:8443")
+	holder, err := NewHolder("registry-a", 2, nil, testGate(true), nil, newTestEnrollmentAuthority(first, second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	blocking := &blockingDispatchEndpoint{
+		dispatchStarted: make(chan struct{}), releaseDispatch: make(chan struct{}), fenced: make(chan struct{}),
+	}
+	if _, err := holder.Register(context.Background(), first, blocking); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := holder.Register(context.Background(), second, &testEndpoint{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := holder.UpdateSnapshot(second.Tuple, testSnapshot(second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, sent, err := holder.InstallKeyLease(
+		context.Background(), testServeIdentity(), first.NodeID, first.NodeEpoch, first.DataEndpoint, testKeyLease(),
+	); err != nil || !sent {
+		t.Fatalf("install key lease sent=%v err=%v", sent, err)
+	}
+	dispatchDone := make(chan error, 1)
+	go func() {
+		_, err := holder.AdmitAndDispatch(context.Background(), testDispatchCommand(t, first))
+		dispatchDone <- err
+	}()
+	<-blocking.dispatchStarted
+
+	replacement := first
+	replacement.SessionSeq++
+	registerDone := make(chan error, 1)
+	go func() {
+		_, err := holder.Register(context.Background(), replacement, &testEndpoint{})
+		registerDone <- err
+	}()
+	// Give replacement time to reach node-1's command fence. It must not hold
+	// the Holder-wide lock while that command remains in flight.
+	time.Sleep(20 * time.Millisecond)
+	type probeResult struct {
+		response placement.PlacementProbeResponse
+		err      error
+	}
+	probeDone := make(chan probeResult, 1)
+	go func() {
+		response, err := holder.Probe(context.Background(), ProbeCall{
+			ServeIdentity: testServeIdentity(),
+			Request: placement.PlacementProbeRequest{
+				Kind: placement.ObjectSandbox, NodeID: second.NodeID,
+				ExpectedNodeEpoch: second.NodeEpoch, ExpectedSessionSeq: second.SessionSeq,
+				LoadModelVersion: placement.LoadModelVersion, Sandbox: &placement.SandboxDemand{SlotUnits: 1},
+			},
+		})
+		probeDone <- probeResult{response: response, err: err}
+	}()
+	select {
+	case result := <-probeDone:
+		if result.err != nil || result.response.Class != placement.ProbeImmediate {
+			t.Fatalf("unrelated probe = %+v, %v", result.response, result.err)
+		}
+	case <-time.After(200 * time.Millisecond):
+		close(blocking.releaseDispatch)
+		<-dispatchDone
+		<-registerDone
+		t.Fatal("node-1 replacement blocked node-2 probe")
+	}
+	close(blocking.releaseDispatch)
+	if err := <-dispatchDone; err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	if err := <-registerDone; err != nil {
+		t.Fatalf("replacement: %v", err)
 	}
 }
 

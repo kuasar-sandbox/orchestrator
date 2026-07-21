@@ -958,7 +958,7 @@ func (n *stubNode) publishRoute(entry routesync.RouteEntry) {
 }
 
 func (n *stubNode) publishDelete(sid string) {
-	n.publish(routesync.Event{Kind: routesync.TypeDelete, SID: sid})
+	n.publish(routesync.Event{Kind: routesync.TypeDelete, Delete: routesync.RouteDelete{SandboxID: sid}})
 	n.svc.logEvent(n.ID, "route_delete", map[string]string{"sid": sid})
 }
 

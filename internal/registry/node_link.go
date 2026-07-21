@@ -331,7 +331,18 @@ func (r *Registry) serveNodeLinkLocal(ctx context.Context, w io.Writer, flush fu
 				r.applyRoute(ctx, nr.NodeID, m.Route)
 			}
 		case routesync.TypeDelete:
-			r.applyDeleteBySID(ctx, nr.NodeID, m.SID)
+			if m.Delete == nil || m.Delete.Validate() != nil {
+				r.log.Warn("node-link: ignored invalid route delete", "node", nr.NodeID)
+				continue
+			}
+			if m.Delete.HasExecutionFence() {
+				// Final fenced events converge only through the durable Phase 3
+				// outbox, as do fenced upserts in applyRoute.
+				r.log.Warn("registry: ignored final execution delete on legacy route path",
+					"node", nr.NodeID, "sid", m.Delete.SandboxID)
+				continue
+			}
+			r.applyDeleteBySID(ctx, nr.NodeID, m.Delete.SandboxID)
 		case routesync.TypeHeartbeat:
 			if m.Beat != nil {
 				queueLatestHeartbeat(heartbeatCh, m.Beat)
