@@ -1383,11 +1383,14 @@ func (s *Store) AckExecutionEvent(
 	nodeEpoch uint64,
 	ack routesync.EventAck,
 ) error {
+	if err := ack.Validate(); err != nil {
+		return err
+	}
 	kind, err := parseExecutionKind(ack.ObjectKind)
 	if err != nil {
 		return err
 	}
-	if nodeID == "" || nodeEpoch == 0 || ack.ObjectID == "" || ack.EventSeq == 0 {
+	if nodeID == "" || nodeEpoch == 0 {
 		return errors.New("store: incomplete execution event ACK")
 	}
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
@@ -1402,7 +1405,12 @@ func (s *Store) AckExecutionEvent(
 	if record == nil {
 		return tx.Commit()
 	}
-	if record.NodeID != nodeID || record.NodeEpoch != nodeEpoch {
+	binding, err := clusterstate.DecodeExecutionBinding(record.OpaqueBinding)
+	if err != nil {
+		return err
+	}
+	if record.NodeID != nodeID || record.NodeEpoch != nodeEpoch ||
+		binding.RegistryGeneration != ack.RegistryGeneration || record.BindingDigest != ack.BindingDigest {
 		return ErrNodeWorkflowConflict
 	}
 	if ack.EventSeq > record.EventSeq {
