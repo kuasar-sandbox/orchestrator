@@ -84,3 +84,25 @@ func TestClusterKeyLeaseRejectsMalformedRegistryAuth(t *testing.T) {
 		t.Fatalf("malformed registry auth lease found=%t err=%v", found, err)
 	}
 }
+
+func TestListKeyLeasesProjectsPreCutoverManifestRows(t *testing.T) {
+	o := testOrch(t)
+	ctx := context.Background()
+	manifestKey := strings.Repeat("b", 64)
+	manifestFP, err := store.ManifestKeyHash(manifestKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := o.st.AddManifestKey(ctx, manifestKey, "cluster", 60, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	infos, err := o.ListKeyLeases(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(infos) != 1 || infos[0].Group != "" || infos[0].AuthKeyFingerprint != "" ||
+		infos[0].ManifestKeyFingerprint != manifestFP {
+		t.Fatalf("pre-cutover key projection = %+v", infos)
+	}
+}

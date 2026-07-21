@@ -66,12 +66,25 @@ func (o *Orchestrator) ListKeyLeases(ctx context.Context) ([]configsock.AdminKey
 	if err != nil {
 		return nil, err
 	}
-	out := make([]configsock.AdminKeyLeaseInfo, 0, len(infos))
+	legacyInfos, err := o.st.ListManifestKeys(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]configsock.AdminKeyLeaseInfo, 0, len(infos)+len(legacyInfos))
 	for _, info := range infos {
 		out = append(out, configsock.AdminKeyLeaseInfo{
 			Group:                  info.Group,
 			AuthKeyFingerprint:     info.AuthKeyFingerprint,
 			ManifestKeyFingerprint: info.ManifestKeyFingerprint,
+			Label:                  info.Label, CreatedUnix: info.CreatedUnix, ExpiresUnix: info.ExpiresUnix,
+		})
+	}
+	// Before the atomic Phase 5 cutover, the active Registry still installs
+	// manifest-only leases through legacy key_put. Keep those active rows
+	// observable while the final dual-key authority remains dormant.
+	for _, info := range legacyInfos {
+		out = append(out, configsock.AdminKeyLeaseInfo{
+			ManifestKeyFingerprint: info.Hash,
 			Label:                  info.Label, CreatedUnix: info.CreatedUnix, ExpiresUnix: info.ExpiresUnix,
 		})
 	}
