@@ -3,6 +3,7 @@ package cluster
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 )
@@ -44,11 +45,7 @@ type BuildWorkflowState string
 
 const (
 	BuildStarting   BuildWorkflowState = "BUILD_STARTING"
-	BuildQueued     BuildWorkflowState = "BUILD_QUEUED"
 	BuildRegistered BuildWorkflowState = "BUILD_REGISTERED"
-	BuildBuilding   BuildWorkflowState = "BUILDING"
-	BuildReady      BuildWorkflowState = "BUILD_READY"
-	BuildError      BuildWorkflowState = "BUILD_ERROR"
 	BuildTombstone  BuildWorkflowState = "BUILD_TOMBSTONE"
 )
 
@@ -188,7 +185,7 @@ func (s RouteStartingState) Validate() error {
 	if err := validateCandidates(s.CandidatePool, s.SelectedCandidate, s.DefinitivelyRejected); err != nil {
 		return err
 	}
-	if err := s.Intent.Validate(); err != nil {
+	if err := validateSandboxDispatchIntent(s.Intent); err != nil {
 		return err
 	}
 	if s.SelectedCandidate != nil {
@@ -218,20 +215,32 @@ type ReadyRoute struct {
 	AccessToken        string `json:"access_token"`
 	TrafficAccessToken string `json:"traffic_access_token,omitempty"`
 
-	TemplateRef        string `json:"template_ref"`
-	SnapshotRef        string `json:"snapshot_ref,omitempty"`
-	RegistryGeneration string `json:"registry_generation"`
-	BindingDigest      string `json:"binding_digest"`
-	LastEventSeq       uint64 `json:"last_event_seq"`
+	TemplateRef        string         `json:"template_ref"`
+	SnapshotRef        string         `json:"snapshot_ref,omitempty"`
+	RegistryGeneration string         `json:"registry_generation"`
+	BindingDigest      string         `json:"binding_digest"`
+	LastEventSeq       uint64         `json:"last_event_seq"`
+	Intent             DispatchIntent `json:"intent"`
 }
 
 func (r ReadyRoute) Validate() error {
 	if r.SandboxID == "" || r.NodeID == "" || r.NodeEpoch == 0 || r.DataEndpoint == "" ||
-		r.AccessToken == "" || r.TemplateRef == "" || r.RegistryGeneration == "" || r.LastEventSeq == 0 {
+		r.AccessToken == "" || r.TrafficAccessToken == "" || r.TemplateRef == "" ||
+		r.RegistryGeneration == "" || r.LastEventSeq == 0 {
 		return errors.New("cluster: incomplete READY forwarding projection")
 	}
 	if !validDigest(r.BindingDigest) {
 		return errors.New("cluster: invalid READY Binding digest")
+	}
+	if err := validateSandboxDispatchIntent(r.Intent); err != nil {
+		return fmt.Errorf("cluster: READY dispatch intent: %w", err)
+	}
+	spec, err := ParseSandboxDispatchSpec(r.Intent.DispatchSpec)
+	if err != nil {
+		return fmt.Errorf("cluster: READY Sandbox dispatch spec: %w", err)
+	}
+	if r.TemplateRef != spec.TemplateRef || r.AccessToken != spec.AccessToken || r.TargetPort != spec.TargetPort {
+		return errors.New("cluster: READY projection does not match immutable Sandbox dispatch spec")
 	}
 	if r.TargetPort < 0 || r.TargetPort > 65535 {
 		return errors.New("cluster: invalid READY target port")
@@ -252,7 +261,7 @@ func (s PausedRouteState) Validate() error {
 	if s.SnapshotRef == "" {
 		return errors.New("cluster: PAUSED requires an authoritative snapshot reference")
 	}
-	return s.ResumeIntent.Validate()
+	return validateSandboxDispatchIntent(s.ResumeIntent)
 }
 
 type ResumingRouteState struct {
@@ -264,7 +273,7 @@ func (s ResumingRouteState) Validate() error {
 	if err := s.Execution.Validate(); err != nil {
 		return err
 	}
-	return s.Intent.Validate()
+	return validateSandboxDispatchIntent(s.Intent)
 }
 
 type DeletingRouteState struct {
@@ -290,17 +299,22 @@ func (s DeletingRouteState) Validate() error {
 type TerminalProofKind string
 
 const (
-	ProofNodeTerminal   TerminalProofKind = "NODE_TERMINAL"
-	ProofNewerNodeEpoch TerminalProofKind = "NEWER_NODE_EPOCH"
-	ProofExternalFence  TerminalProofKind = "EXTERNAL_FENCE"
+	ProofNodeTerminal        TerminalProofKind = "NODE_TERMINAL"
+	ProofNewerNodeEpoch      TerminalProofKind = "NEWER_NODE_EPOCH"
+	ProofExternalFence       TerminalProofKind = "EXTERNAL_FENCE"
+	MaxWorkflowFinalizations                   = 256
 )
 
 type TerminalProof struct {
-	Kind              TerminalProofKind `json:"kind"`
-	ProofDigest       string            `json:"proof_digest"`
-	FencedNodeID      string            `json:"fenced_node_id"`
-	FencedNodeEpoch   uint64            `json:"fenced_node_epoch"`
-	ObservedNodeEpoch uint64            `json:"observed_node_epoch,omitempty"`
+	Kind                  TerminalProofKind `json:"kind"`
+	ProofDigest           string            `json:"proof_digest"`
+	FencedNodeID          string            `json:"fenced_node_id"`
+	FencedNodeEpoch       uint64            `json:"fenced_node_epoch"`
+	ObservedNodeEpoch     uint64            `json:"observed_node_epoch,omitempty"`
+	SystemEpoch           uint64            `json:"system_epoch,omitempty"`
+	SystemCommitIndex     uint64            `json:"system_commit_index,omitempty"`
+	EnrollmentID          string            `json:"enrollment_id,omitempty"`
+	EnrollmentCommitIndex uint64            `json:"enrollment_commit_index,omitempty"`
 }
 
 func (p TerminalProof) Validate() error {
@@ -309,15 +323,87 @@ func (p TerminalProof) Validate() error {
 	}
 	switch p.Kind {
 	case ProofNodeTerminal, ProofExternalFence:
+		if p.ObservedNodeEpoch != 0 || p.SystemEpoch != 0 || p.SystemCommitIndex != 0 ||
+			p.EnrollmentID != "" || p.EnrollmentCommitIndex != 0 {
+			return errors.New("cluster: terminal/external proof cannot carry an observed NodeEpoch")
+		}
 		return nil
 	case ProofNewerNodeEpoch:
-		if p.ObservedNodeEpoch <= p.FencedNodeEpoch {
+		if p.ObservedNodeEpoch <= p.FencedNodeEpoch || p.SystemEpoch == 0 || p.SystemCommitIndex == 0 ||
+			p.EnrollmentID == "" || p.EnrollmentCommitIndex == 0 || p.EnrollmentCommitIndex > p.SystemCommitIndex {
 			return errors.New("cluster: newer-epoch proof does not advance NodeEpoch")
 		}
 		return nil
 	default:
 		return errors.New("cluster: invalid terminal/fencing proof kind")
 	}
+}
+
+// WorkflowFinalizationIntent is the durable Registry retry intent for one
+// exact node-local Admission/dedupe record. ObjectID remains the business ID.
+type WorkflowFinalizationIntent struct {
+	ObjectID           string         `json:"object_id"`
+	NodeID             string         `json:"node_id"`
+	NodeEpoch          uint64         `json:"node_epoch"`
+	DataEndpoint       string         `json:"data_endpoint"`
+	RegistryGeneration string         `json:"registry_generation"`
+	BindingDigest      string         `json:"binding_digest"`
+	TerminalProof      *TerminalProof `json:"terminal_proof,omitempty"`
+}
+
+func (i WorkflowFinalizationIntent) Validate() error {
+	if i.ObjectID == "" || i.NodeID == "" || i.NodeEpoch == 0 || i.DataEndpoint == "" ||
+		i.RegistryGeneration == "" || !validDigest(i.BindingDigest) {
+		return errors.New("cluster: incomplete workflow finalization intent")
+	}
+	if i.TerminalProof != nil {
+		if i.TerminalProof.Kind != ProofNodeTerminal || i.TerminalProof.FencedNodeID != i.NodeID ||
+			i.TerminalProof.FencedNodeEpoch != i.NodeEpoch {
+			return errors.New("cluster: workflow finalization proof identifies another execution")
+		}
+		return i.TerminalProof.Validate()
+	}
+	return nil
+}
+
+func NewWorkflowFinalizationIntent(
+	objectID string,
+	binding ExecutionBindingIntent,
+	proof *TerminalProof,
+) (WorkflowFinalizationIntent, error) {
+	intent := WorkflowFinalizationIntent{
+		ObjectID: objectID, NodeID: binding.NodeID, NodeEpoch: binding.NodeEpoch,
+		DataEndpoint: binding.DataEndpoint, RegistryGeneration: binding.RegistryGeneration,
+		BindingDigest: binding.BindingDigest,
+	}
+	if proof != nil {
+		copy := *proof
+		intent.TerminalProof = &copy
+	}
+	return intent, intent.Validate()
+}
+
+func (i WorkflowFinalizationIntent) MatchesBuild(projection BuildProjection) bool {
+	return i.ObjectID == projection.BuildID && i.NodeID == projection.NodeID &&
+		i.NodeEpoch == projection.NodeEpoch && i.DataEndpoint == projection.DataEndpoint &&
+		i.RegistryGeneration == projection.RegistryGeneration && i.BindingDigest == projection.BindingDigest
+}
+
+func validateWorkflowFinalizations(intents []WorkflowFinalizationIntent) error {
+	if len(intents) > MaxWorkflowFinalizations {
+		return errors.New("cluster: too many pending workflow finalizations")
+	}
+	seen := make(map[string]struct{}, len(intents))
+	for _, intent := range intents {
+		if err := intent.Validate(); err != nil {
+			return err
+		}
+		if _, duplicate := seen[intent.BindingDigest]; duplicate {
+			return errors.New("cluster: duplicate workflow finalization Binding")
+		}
+		seen[intent.BindingDigest] = struct{}{}
+	}
+	return nil
 }
 
 type RouteTombstoneState struct {
@@ -343,7 +429,8 @@ func (s RouteTombstoneState) Validate() error {
 		return s.PlacementFailure.Validate()
 	}
 	if s.SandboxID == "" || s.NodeID == "" || s.NodeEpoch == 0 || s.RegistryGeneration == "" ||
-		!validDigest(s.BindingDigest) || s.LastEventSeq == 0 || s.TerminalReason == "" {
+		!validDigest(s.BindingDigest) || s.TerminalReason == "" ||
+		s.LastEventSeq == 0 && s.Proof.Kind == ProofNodeTerminal {
 		return errors.New("cluster: incomplete TOMBSTONE")
 	}
 	if s.Proof.FencedNodeID != s.NodeID || s.Proof.FencedNodeEpoch != s.NodeEpoch {
@@ -351,6 +438,14 @@ func (s RouteTombstoneState) Validate() error {
 	}
 	if err := s.Proof.Validate(); err != nil {
 		return err
+	}
+	if s.Proof.Kind == ProofNewerNodeEpoch {
+		digest, err := NewerNodeEpochProofDigest(
+			s.Proof, s.FailureRevision.RegistryGeneration, s.SandboxID, s.BindingDigest, s.LastEventSeq,
+		)
+		if err != nil || digest != s.Proof.ProofDigest {
+			return errors.New("cluster: TOMBSTONE newer-NodeEpoch proof digest mismatch")
+		}
 	}
 	return s.FailureRevision.Validate()
 }
@@ -374,20 +469,21 @@ func (s RoutePlacementFailureState) Validate() error {
 	if len(s.DefinitivelyRejected) != len(s.CandidatePool) {
 		return errors.New("cluster: placement-failure TOMBSTONE requires an exhausted candidate pool")
 	}
-	return s.Intent.Validate()
+	return validateSandboxDispatchIntent(s.Intent)
 }
 
 type RouteWorkflowRecord struct {
-	Group     string               `json:"group"`
-	RouteKey  string               `json:"route_key"`
-	State     RouteWorkflowState   `json:"state"`
-	Revision  Revision             `json:"revision"`
-	Starting  *RouteStartingState  `json:"starting,omitempty"`
-	Ready     *ReadyRoute          `json:"ready,omitempty"`
-	Paused    *PausedRouteState    `json:"paused,omitempty"`
-	Resuming  *ResumingRouteState  `json:"resuming,omitempty"`
-	Deleting  *DeletingRouteState  `json:"deleting,omitempty"`
-	Tombstone *RouteTombstoneState `json:"tombstone,omitempty"`
+	Group         string                       `json:"group"`
+	RouteKey      string                       `json:"route_key"`
+	State         RouteWorkflowState           `json:"state"`
+	Revision      Revision                     `json:"revision"`
+	Starting      *RouteStartingState          `json:"starting,omitempty"`
+	Ready         *ReadyRoute                  `json:"ready,omitempty"`
+	Paused        *PausedRouteState            `json:"paused,omitempty"`
+	Resuming      *ResumingRouteState          `json:"resuming,omitempty"`
+	Deleting      *DeletingRouteState          `json:"deleting,omitempty"`
+	Tombstone     *RouteTombstoneState         `json:"tombstone,omitempty"`
+	Finalizations []WorkflowFinalizationIntent `json:"pending_finalizations"`
 }
 
 func (r RouteWorkflowRecord) Validate() error {
@@ -396,6 +492,14 @@ func (r RouteWorkflowRecord) Validate() error {
 	}
 	if err := r.Revision.Validate(); err != nil {
 		return err
+	}
+	if err := validateWorkflowFinalizations(r.Finalizations); err != nil {
+		return err
+	}
+	for _, intent := range r.Finalizations {
+		if intent.RegistryGeneration != r.Revision.RegistryGeneration || intent.TerminalProof != nil {
+			return errors.New("cluster: invalid Route workflow finalization intent")
+		}
 	}
 	if countPresent(r.Starting != nil, r.Ready != nil, r.Paused != nil, r.Resuming != nil, r.Deleting != nil, r.Tombstone != nil) != 1 {
 		return errors.New("cluster: Route state union must contain exactly one value")
@@ -473,7 +577,6 @@ type BuildStartingState struct {
 	DefinitivelyRejected []uint32                `json:"definitively_rejected,omitempty"`
 	Intent               DispatchIntent          `json:"intent"`
 	Binding              *ExecutionBindingIntent `json:"binding,omitempty"`
-	LastEventSeq         uint64                  `json:"last_event_seq,omitempty"`
 }
 
 func (s BuildStartingState) Validate() error {
@@ -483,7 +586,7 @@ func (s BuildStartingState) Validate() error {
 	if err := validateCandidates(s.CandidatePool, s.SelectedCandidate, s.DefinitivelyRejected); err != nil {
 		return err
 	}
-	if err := s.Intent.Validate(); err != nil {
+	if err := validateBuildDispatchIntent(s.Intent); err != nil {
 		return err
 	}
 	if s.SelectedCandidate != nil {
@@ -503,29 +606,40 @@ func (s BuildStartingState) Validate() error {
 }
 
 type BuildProjection struct {
-	BuildID            string `json:"build_id"`
-	NodeID             string `json:"node_id"`
-	NodeEpoch          uint64 `json:"node_epoch"`
-	RegistryGeneration string `json:"registry_generation"`
-	BindingDigest      string `json:"binding_digest"`
-	TemplateRef        string `json:"template_ref,omitempty"`
-	ArtifactRef        string `json:"artifact_ref,omitempty"`
-	Reason             string `json:"reason,omitempty"`
-	LastEventSeq       uint64 `json:"last_event_seq"`
+	BuildID            string         `json:"build_id"`
+	NodeID             string         `json:"node_id"`
+	NodeEpoch          uint64         `json:"node_epoch"`
+	DataEndpoint       string         `json:"data_endpoint"`
+	RegistryGeneration string         `json:"registry_generation"`
+	BindingDigest      string         `json:"binding_digest"`
+	Intent             DispatchIntent `json:"intent"`
+	TemplateRef        string         `json:"template_ref,omitempty"`
 }
 
 func (p BuildProjection) Validate() error {
-	if p.BuildID == "" || p.NodeID == "" || p.NodeEpoch == 0 || p.RegistryGeneration == "" ||
-		!validDigest(p.BindingDigest) || p.LastEventSeq == 0 {
-		return errors.New("cluster: incomplete Build projection")
+	if p.BuildID == "" || p.NodeID == "" || p.NodeEpoch == 0 || p.DataEndpoint == "" || p.RegistryGeneration == "" ||
+		p.TemplateRef == "" || !validDigest(p.BindingDigest) {
+		return errors.New("cluster: incomplete Build registration projection")
+	}
+	if err := validateBuildDispatchIntent(p.Intent); err != nil {
+		return err
+	}
+	spec, err := ParseBuildDispatchSpec(p.Intent.DispatchSpec)
+	if err != nil {
+		return fmt.Errorf("cluster: Build dispatch spec: %w", err)
+	}
+	if p.TemplateRef != spec.TemplateID {
+		return errors.New("cluster: Build registration does not match immutable dispatch spec")
 	}
 	return nil
 }
 
 type BuildTombstoneState struct {
-	Projection      BuildProjection `json:"projection"`
-	Proof           TerminalProof   `json:"proof"`
-	FailureRevision Revision        `json:"failure_revision"`
+	PlacementFailure BuildPlacementFailureState `json:"placement_failure"`
+}
+
+func (s BuildTombstoneState) Validate() error {
+	return s.PlacementFailure.Validate()
 }
 
 type BuildPlacementFailureState struct {
@@ -546,18 +660,34 @@ func (s BuildPlacementFailureState) Validate() error {
 	if len(s.DefinitivelyRejected) != len(s.CandidatePool) {
 		return errors.New("cluster: Build placement failure requires an exhausted candidate pool")
 	}
-	return s.Intent.Validate()
+	return validateBuildDispatchIntent(s.Intent)
+}
+
+func validateSandboxDispatchIntent(intent DispatchIntent) error {
+	if err := intent.Validate(); err != nil {
+		return err
+	}
+	_, err := ParseSandboxDispatchSpec(intent.DispatchSpec)
+	return err
+}
+
+func validateBuildDispatchIntent(intent DispatchIntent) error {
+	if err := intent.Validate(); err != nil {
+		return err
+	}
+	_, err := ParseBuildDispatchSpec(intent.DispatchSpec)
+	return err
 }
 
 type BuildRecord struct {
-	Group      string                      `json:"group"`
-	BuildID    string                      `json:"build_id"`
-	State      BuildWorkflowState          `json:"state"`
-	Revision   Revision                    `json:"revision"`
-	Starting   *BuildStartingState         `json:"starting,omitempty"`
-	Projection *BuildProjection            `json:"projection,omitempty"`
-	Tombstone  *BuildTombstoneState        `json:"tombstone,omitempty"`
-	Failure    *BuildPlacementFailureState `json:"failure,omitempty"`
+	Group         string                       `json:"group"`
+	BuildID       string                       `json:"build_id"`
+	State         BuildWorkflowState           `json:"state"`
+	Revision      Revision                     `json:"revision"`
+	Starting      *BuildStartingState          `json:"starting,omitempty"`
+	Projection    *BuildProjection             `json:"projection,omitempty"`
+	Tombstone     *BuildTombstoneState         `json:"tombstone,omitempty"`
+	Finalizations []WorkflowFinalizationIntent `json:"pending_finalizations"`
 }
 
 func (r BuildRecord) Validate() error {
@@ -567,8 +697,16 @@ func (r BuildRecord) Validate() error {
 	if err := r.Revision.Validate(); err != nil {
 		return err
 	}
-	if countPresent(r.Starting != nil, r.Projection != nil, r.Tombstone != nil, r.Failure != nil) != 1 {
-		return errors.New("cluster: Build state union must contain exactly one value")
+	if err := validateWorkflowFinalizations(r.Finalizations); err != nil {
+		return err
+	}
+	for _, intent := range r.Finalizations {
+		if intent.RegistryGeneration != r.Revision.RegistryGeneration || intent.TerminalProof != nil {
+			return errors.New("cluster: invalid Build registration finalization")
+		}
+	}
+	if countPresent(r.Starting != nil, r.Projection != nil, r.Tombstone != nil) != 1 {
+		return errors.New("cluster: Build registration state union must contain exactly one value")
 	}
 	switch r.State {
 	case BuildStarting:
@@ -585,83 +723,76 @@ func (r BuildRecord) Validate() error {
 			return validateProjectionRegistryGeneration(r.Revision, r.Starting.Binding.RegistryGeneration)
 		}
 		return nil
-	case BuildQueued, BuildRegistered, BuildBuilding, BuildReady:
+	case BuildRegistered:
 		if r.Projection == nil || r.Projection.BuildID != r.BuildID {
-			return errors.New("cluster: missing or mismatched Build projection")
+			return errors.New("cluster: missing or mismatched Build registration projection")
 		}
 		if err := r.Projection.Validate(); err != nil {
 			return err
 		}
 		if err := validateProjectionRegistryGeneration(r.Revision, r.Projection.RegistryGeneration); err != nil {
 			return err
-		}
-		if r.State == BuildReady && r.Projection.ArtifactRef == "" {
-			return errors.New("cluster: BUILD_READY requires artifact reference")
-		}
-		return nil
-	case BuildError:
-		if r.Failure != nil {
-			if r.Failure.BuildID != r.BuildID {
-				return errors.New("cluster: mismatched Build placement failure")
-			}
-			return r.Failure.Validate()
-		}
-		if r.Projection == nil || r.Projection.BuildID != r.BuildID {
-			return errors.New("cluster: missing or mismatched BUILD_ERROR projection")
-		}
-		if err := r.Projection.Validate(); err != nil {
-			return err
-		}
-		if err := validateProjectionRegistryGeneration(r.Revision, r.Projection.RegistryGeneration); err != nil {
-			return err
-		}
-		if r.Projection.Reason == "" {
-			return errors.New("cluster: BUILD_ERROR requires reason")
 		}
 		return nil
 	case BuildTombstone:
-		if r.Tombstone == nil || r.Tombstone.Projection.BuildID != r.BuildID {
+		if r.Tombstone == nil {
 			return errors.New("cluster: missing or mismatched BUILD_TOMBSTONE state")
 		}
-		if err := r.Tombstone.Projection.Validate(); err != nil {
+		if err := r.Tombstone.Validate(); err != nil {
 			return err
 		}
-		if err := validateProjectionRegistryGeneration(r.Revision, r.Tombstone.Projection.RegistryGeneration); err != nil {
-			return err
+		if r.Tombstone.PlacementFailure.BuildID != r.BuildID {
+			return errors.New("cluster: mismatched BUILD_TOMBSTONE placement failure")
 		}
-		if err := r.Tombstone.Proof.Validate(); err != nil {
-			return err
-		}
-		if r.Tombstone.Proof.FencedNodeID != r.Tombstone.Projection.NodeID ||
-			r.Tombstone.Proof.FencedNodeEpoch != r.Tombstone.Projection.NodeEpoch {
-			return errors.New("cluster: BUILD_TOMBSTONE proof identifies another execution")
-		}
-		if err := r.Tombstone.FailureRevision.Validate(); err != nil {
-			return err
-		}
-		return validateFailureRevision(r.Revision, r.Tombstone.FailureRevision)
+		return nil
 	default:
 		return errors.New("cluster: invalid Build state")
 	}
 }
 
 type ExecutionFence struct {
-	Group                string        `json:"group"`
-	RouteKey             string        `json:"route_key"`
-	SandboxID            string        `json:"sandbox_id"`
-	NodeID               string        `json:"node_id"`
-	NodeEpoch            uint64        `json:"node_epoch"`
-	RegistryGeneration   string        `json:"registry_generation"`
-	BindingDigest        string        `json:"binding_digest"`
-	LastEventSeq         uint64        `json:"last_event_seq"`
-	FinalOutboxWatermark uint64        `json:"final_outbox_watermark"`
-	Proof                TerminalProof `json:"proof"`
-	Revision             Revision      `json:"revision"`
+	Group                  string                      `json:"group"`
+	RouteKey               string                      `json:"route_key"`
+	SandboxID              string                      `json:"sandbox_id"`
+	NodeID                 string                      `json:"node_id,omitempty"`
+	NodeEpoch              uint64                      `json:"node_epoch,omitempty"`
+	RegistryGeneration     string                      `json:"registry_generation"`
+	BindingDigest          string                      `json:"binding_digest,omitempty"`
+	LastEventSeq           uint64                      `json:"last_event_seq,omitempty"`
+	FinalOutboxWatermark   uint64                      `json:"final_outbox_watermark,omitempty"`
+	Proof                  TerminalProof               `json:"proof,omitempty"`
+	PlacementFailure       *RoutePlacementFailureState `json:"placement_failure,omitempty"`
+	PlacementFailureDigest string                      `json:"placement_failure_digest,omitempty"`
+	Revision               Revision                    `json:"revision"`
 }
 
 func (f ExecutionFence) Validate() error {
-	if f.Group == "" || f.RouteKey == "" || f.SandboxID == "" || f.NodeID == "" || f.NodeEpoch == 0 ||
-		f.RegistryGeneration == "" || !validDigest(f.BindingDigest) || f.LastEventSeq == 0 {
+	if f.Group == "" || f.RouteKey == "" || f.SandboxID == "" || f.RegistryGeneration == "" {
+		return errors.New("cluster: incomplete execution fence")
+	}
+	if err := f.Revision.Validate(); err != nil {
+		return err
+	}
+	if f.Revision.RegistryGeneration != f.RegistryGeneration {
+		return errors.New("cluster: execution fence revision belongs to another Registry History Generation")
+	}
+	if f.PlacementFailure != nil {
+		if f.NodeID != "" || f.NodeEpoch != 0 || f.BindingDigest != "" || f.LastEventSeq != 0 ||
+			f.FinalOutboxWatermark != 0 || f.Proof != (TerminalProof{}) ||
+			f.PlacementFailure.SandboxID != f.SandboxID {
+			return errors.New("cluster: placement fence contains execution identity")
+		}
+		if err := f.PlacementFailure.Validate(); err != nil {
+			return err
+		}
+		digest, err := PlacementFailureProofDigest(*f.PlacementFailure)
+		if err != nil || digest != f.PlacementFailureDigest {
+			return errors.New("cluster: placement-failure fence proof digest mismatch")
+		}
+		return nil
+	}
+	if f.PlacementFailureDigest != "" || f.NodeID == "" || f.NodeEpoch == 0 ||
+		!validDigest(f.BindingDigest) || f.LastEventSeq == 0 && f.Proof.Kind == ProofNodeTerminal {
 		return errors.New("cluster: incomplete execution fence")
 	}
 	if f.Proof.FencedNodeID != f.NodeID || f.Proof.FencedNodeEpoch != f.NodeEpoch {
@@ -670,13 +801,98 @@ func (f ExecutionFence) Validate() error {
 	if err := f.Proof.Validate(); err != nil {
 		return err
 	}
-	if err := f.Revision.Validate(); err != nil {
-		return err
-	}
-	if f.Revision.RegistryGeneration != f.RegistryGeneration {
-		return errors.New("cluster: execution fence revision belongs to another Registry History Generation")
+	if f.Proof.Kind == ProofNewerNodeEpoch {
+		digest, err := NewerNodeEpochProofDigest(
+			f.Proof, f.RegistryGeneration, f.SandboxID, f.BindingDigest, f.LastEventSeq,
+		)
+		if err != nil || digest != f.Proof.ProofDigest {
+			return errors.New("cluster: execution-fence newer-NodeEpoch proof digest mismatch")
+		}
 	}
 	return nil
+}
+
+func NewerNodeEpochProofDigest(
+	proof TerminalProof,
+	registryGeneration string,
+	sandboxID string,
+	bindingDigest string,
+	lastEventSeq uint64,
+) (string, error) {
+	if proof.Kind != ProofNewerNodeEpoch || proof.FencedNodeID == "" || proof.FencedNodeEpoch == 0 ||
+		proof.ObservedNodeEpoch <= proof.FencedNodeEpoch || proof.SystemEpoch == 0 || proof.SystemCommitIndex == 0 ||
+		proof.EnrollmentID == "" || proof.EnrollmentCommitIndex == 0 ||
+		proof.EnrollmentCommitIndex > proof.SystemCommitIndex || registryGeneration == "" || sandboxID == "" ||
+		!validDigest(bindingDigest) {
+		return "", errors.New("cluster: incomplete newer-NodeEpoch proof evidence")
+	}
+	value := struct {
+		RegistryGeneration    string `json:"registry_generation"`
+		SandboxID             string `json:"sandbox_id"`
+		BindingDigest         string `json:"binding_digest"`
+		LastEventSeq          uint64 `json:"last_event_seq"`
+		FencedNodeID          string `json:"fenced_node_id"`
+		FencedNodeEpoch       uint64 `json:"fenced_node_epoch"`
+		ObservedNodeEpoch     uint64 `json:"observed_node_epoch"`
+		SystemEpoch           uint64 `json:"system_epoch"`
+		SystemCommitIndex     uint64 `json:"system_commit_index"`
+		EnrollmentID          string `json:"enrollment_id"`
+		EnrollmentCommitIndex uint64 `json:"enrollment_commit_index"`
+	}{
+		RegistryGeneration: registryGeneration, SandboxID: sandboxID, BindingDigest: bindingDigest,
+		LastEventSeq: lastEventSeq, FencedNodeID: proof.FencedNodeID,
+		FencedNodeEpoch: proof.FencedNodeEpoch, ObservedNodeEpoch: proof.ObservedNodeEpoch,
+		SystemEpoch: proof.SystemEpoch, SystemCommitIndex: proof.SystemCommitIndex,
+		EnrollmentID: proof.EnrollmentID, EnrollmentCommitIndex: proof.EnrollmentCommitIndex,
+	}
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return "", err
+	}
+	digest := sha256.Sum256(append([]byte("kuasar-newer-node-epoch-proof-v1\x00"), raw...))
+	return hex.EncodeToString(digest[:]), nil
+}
+
+func NewPlacementFailureFence(group, routeKey, registryGeneration string, failure RoutePlacementFailureState) (ExecutionFence, error) {
+	if group == "" || routeKey == "" || registryGeneration == "" {
+		return ExecutionFence{}, errors.New("cluster: incomplete placement-failure fence identity")
+	}
+	if err := failure.Validate(); err != nil {
+		return ExecutionFence{}, err
+	}
+	digest, err := PlacementFailureProofDigest(failure)
+	if err != nil {
+		return ExecutionFence{}, err
+	}
+	copyFailure := failure
+	copyFailure.CandidatePool = append([]PlacementCandidate(nil), failure.CandidatePool...)
+	copyFailure.DefinitivelyRejected = append([]uint32(nil), failure.DefinitivelyRejected...)
+	copyFailure.Intent.NormalizedDemand = append([]byte(nil), failure.Intent.NormalizedDemand...)
+	copyFailure.Intent.DispatchSpec = append([]byte(nil), failure.Intent.DispatchSpec...)
+	return ExecutionFence{
+		Group: group, RouteKey: routeKey, SandboxID: failure.SandboxID,
+		RegistryGeneration: registryGeneration, PlacementFailure: &copyFailure,
+		PlacementFailureDigest: digest,
+	}, nil
+}
+
+func PlacementFailureProofDigest(failure RoutePlacementFailureState) (string, error) {
+	if err := failure.Validate(); err != nil {
+		return "", err
+	}
+	raw, err := json.Marshal(failure)
+	if err != nil {
+		return "", err
+	}
+	digest := sha256.Sum256(append([]byte("kuasar-placement-failure-proof-v1\x00"), raw...))
+	return hex.EncodeToString(digest[:]), nil
+}
+
+func (f ExecutionFence) ProofDigest() string {
+	if f.PlacementFailure != nil {
+		return f.PlacementFailureDigest
+	}
+	return f.Proof.ProofDigest
 }
 
 func validateCandidates(candidates []PlacementCandidate, selected *uint32, rejected []uint32) error {
