@@ -670,21 +670,6 @@ func (f ExecutionFence) Validate() error {
 	return nil
 }
 
-type FenceCompactionProof struct {
-	TerminalProofCommitted     bool
-	FinalOutboxWatermarkAcked  bool
-	NodeEpochPermanentlyFenced bool
-	AllReplicasApplied         bool
-	MinimumRetentionElapsed    bool
-}
-
-func CanCompactExecutionFence(fence ExecutionFence, proof FenceCompactionProof) bool {
-	outboxCovered := proof.FinalOutboxWatermarkAcked && fence.FinalOutboxWatermark >= fence.LastEventSeq
-	return fence.Validate() == nil && proof.TerminalProofCommitted &&
-		(outboxCovered || proof.NodeEpochPermanentlyFenced) &&
-		proof.AllReplicasApplied && proof.MinimumRetentionElapsed
-}
-
 func validateCandidates(candidates []PlacementCandidate, selected *uint32, rejected []uint32) error {
 	seenNodes := make(map[string]struct{}, len(candidates))
 	for _, candidate := range candidates {
