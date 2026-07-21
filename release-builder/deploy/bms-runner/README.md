@@ -92,8 +92,8 @@ file name and is included in the static-library build identity.
 The host install also writes `/etc/modules-load.d/kuasar-ci.conf` for bridge,
 overlay, TUN, and vhost devices. Enabled slots therefore retain their required
 bind devices after a host reboot. Space checks follow the filesystems that hold
-the template and `/var/lib/machines`; a shared filesystem requires 30 GiB free,
-while separate filesystems require 5 GiB and 25 GiB respectively.
+the template and `/var/lib/machines`; a shared filesystem requires 35 GiB free,
+while separate filesystems require 5 GiB and 30 GiB respectively.
 The provisioner makes a slot root visible only after writing a separate owner
 marker into a staging root. An incomplete owned root is rebuilt automatically
 on retry; a markerless or mismatched root is never modified or deleted.

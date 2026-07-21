@@ -315,10 +315,10 @@ assert_install_space() {
     template_device="$(stat -c %d "$template_path")"
     machine_device="$(stat -c %d "$machine_path")"
     if [ "$template_device" = "$machine_device" ]; then
-        require_free_space "$template_path" 30 "template and machine root"
+        require_free_space "$template_path" 35 "template and machine root"
     else
         require_free_space "$template_path" 5 "template root"
-        require_free_space "$machine_path" 25 "machine root"
+        require_free_space "$machine_path" 30 "machine root"
     fi
 }
 
