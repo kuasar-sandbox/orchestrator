@@ -1,7 +1,9 @@
 package cluster
 
 import (
+	"bytes"
 	"crypto/sha256"
+	"encoding/base64"
 	"strings"
 	"testing"
 )
@@ -84,6 +86,43 @@ func TestExecutionBindingRejectsMalformedValues(t *testing.T) {
 	if _, err := EncodeExecutionBinding(ExecutionBinding{Kind: ExecutionKindSandbox}); err == nil {
 		t.Fatal("incomplete binding accepted")
 	}
+}
+
+func TestExecutionBindingRejectsBase64Alias(t *testing.T) {
+	binding := ExecutionBinding{
+		RegistryGeneration: "g1", Kind: ExecutionKindSandbox, ObjectID: "s1",
+		Group: "/g", RouteKey: "rk", NodeID: "n1", NodeEpoch: 1,
+	}
+	var opaque string
+	for suffix := 0; suffix < 3; suffix++ {
+		binding.ObjectID = "s" + strings.Repeat("x", suffix)
+		var err error
+		opaque, err = EncodeExecutionBinding(binding)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(strings.TrimPrefix(opaque, ExecutionBindingPrefix))%4 != 0 {
+			break
+		}
+	}
+	segment := strings.TrimPrefix(opaque, ExecutionBindingPrefix)
+	payload, err := base64.RawURLEncoding.DecodeString(segment)
+	if err != nil {
+		t.Fatal(err)
+	}
+	alphabet := "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+	for _, replacement := range alphabet {
+		alias := segment[:len(segment)-1] + string(replacement)
+		decoded, decodeErr := base64.RawURLEncoding.DecodeString(alias)
+		if alias == segment || decodeErr != nil || !bytes.Equal(decoded, payload) {
+			continue
+		}
+		if _, err := DecodeExecutionBinding(ExecutionBindingPrefix + alias); err == nil {
+			t.Fatal("non-canonical base64 alias was accepted")
+		}
+		return
+	}
+	t.Fatal("test could not construct a base64 alias")
 }
 
 func TestExecutionBindingRejectsUnprojectableIdentity(t *testing.T) {

@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/raftstore"
 	"github.com/kuasar-sandbox/orchestrator/internal/routeapi"
 )
@@ -192,6 +193,66 @@ func TestAddressableStrongReadImmediatelyFollowsVerifiedLeaderHint(t *testing.T)
 	}
 	if !reflect.DeepEqual(calls, []string{"registry-a.test", "registry-c.test"}) {
 		t.Fatalf("strong read calls = %v", calls)
+	}
+}
+
+func TestListRoutesRestartsBucketWhenSnapshotChangesBetweenPages(t *testing.T) {
+	client := testClient(t)
+	client.permit = &cachedPermit{response: routeapi.PermitResponse{
+		ClusterID: client.registryLayout.ClusterID, RegistryGeneration: client.registryLayout.RegistryGeneration,
+		SystemEpoch: 1, RegistryLayoutDigest: client.digest, CommitIndex: 1, MaxLifetimeMillis: 5000,
+		ServeGate: true, WriteGate: true, CutoverGate: true, RecoveryClosed: true,
+	}, expires: time.Now().Add(time.Minute)}
+	var firstBucketCursors []string
+	transport := roundTripperFunc(func(request *http.Request) (*http.Response, error) {
+		var input routeapi.ListRoutesRequest
+		if err := json.NewDecoder(request.Body).Decode(&input); err != nil {
+			return nil, err
+		}
+		response := routeapi.ListRoutesResponse{Bucket: input.Bucket, SnapshotRevision: 11}
+		if input.Bucket == 0 {
+			firstBucketCursors = append(firstBucketCursors, input.AfterRouteKey)
+			entry := func(key string) routeapi.ListedRoute {
+				return routeapi.ListedRoute{
+					RouteKey: key, State: clusterstate.WorkflowRouteReady,
+					NodeID: "node-1", TemplateRef: "template-1",
+				}
+			}
+			switch len(firstBucketCursors) {
+			case 1:
+				response.SnapshotRevision = 10
+				response.Routes = []routeapi.ListedRoute{entry("route-a")}
+				response.NextRouteKey = "route-a"
+			case 2:
+				response.Routes = []routeapi.ListedRoute{entry("route-b")}
+			case 3:
+				response.Routes = []routeapi.ListedRoute{entry("route-a")}
+				response.NextRouteKey = "route-a"
+			default:
+				response.Routes = []routeapi.ListedRoute{entry("route-b")}
+			}
+		}
+		body, _ := json.Marshal(response)
+		return &http.Response{
+			StatusCode: http.StatusOK, Status: "200 OK", Header: make(http.Header),
+			Body: io.NopCloser(strings.NewReader(string(body))), Request: request,
+		}, nil
+	})
+	for memberID, endpoint := range client.endpoints {
+		endpoint.Client = &http.Client{Transport: transport}
+		client.endpoints[memberID] = endpoint
+	}
+	result, err := client.ListRoutes(context.Background(), "/group")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Routes) != 2 || result.Routes[0].RouteKey != "route-a" || result.Routes[1].RouteKey != "route-b" ||
+		result.BucketRevisions[0] != 11 {
+		t.Fatalf("stable Route list = %+v", result)
+	}
+	wantCursors := []string{"", "route-a", "", "route-a"}
+	if !reflect.DeepEqual(firstBucketCursors, wantCursors) {
+		t.Fatalf("bucket cursors = %v, want %v", firstBucketCursors, wantCursors)
 	}
 }
 

@@ -16,7 +16,7 @@ import (
 )
 
 var stateSnapshotMagic = [...]byte{
-	'K', 'U', 'A', 'S', 'A', 'R', '-', 'P', 'E', 'B', 'B', 'L', 'E', '-', 'S', 'N', 'A', 'P', 3,
+	'K', 'U', 'A', 'S', 'A', 'R', '-', 'P', 'E', 'B', 'B', 'L', 'E', '-', 'S', 'N', 'A', 'P', 4,
 }
 
 type diskStateMachine struct {
@@ -932,11 +932,19 @@ func lookupRouteBucketOnDisk(
 	result.SnapshotRevision = state.LastApplied
 	result.Routes = make([]RouteBucketEntry, 0, int(query.Limit)+1)
 	groupPrefix := stateRowKey(prefix, stateRouteTable, lengthKey(query.Group))
+	lowerBound := groupPrefix
+	if query.AfterRouteKey != "" {
+		lowerBound = stateRowKey(prefix, stateRouteTable, routeMapKey(query.Group, query.AfterRouteKey))
+	}
 	iterator := reader.NewIter(&pebble.IterOptions{
-		LowerBound: groupPrefix, UpperBound: prefixUpperBound(groupPrefix),
+		LowerBound: lowerBound, UpperBound: prefixUpperBound(groupPrefix),
 	})
 	defer iterator.Close()
 	for valid := iterator.First(); valid; valid = iterator.Next() {
+		routeKey := string(iterator.Key()[len(groupPrefix):])
+		if routeKey <= query.AfterRouteKey {
+			continue
+		}
 		var record clusterstate.RouteWorkflowRecord
 		if err := decodeJSONValue(iterator.Value(), &record); err != nil {
 			return RouteBucketResult{}, err
@@ -951,9 +959,12 @@ func lookupRouteBucketOnDisk(
 		if err != nil {
 			return RouteBucketResult{}, err
 		}
-		if bucket == query.Bucket && record.RouteKey > query.AfterRouteKey {
+		if bucket == query.Bucket {
 			if entry, listed := routeBucketEntry(record); listed {
 				addBoundedRouteBucketEntry(&result.Routes, entry, int(query.Limit)+1)
+				if len(result.Routes) == int(query.Limit)+1 {
+					break
+				}
 			}
 		}
 	}

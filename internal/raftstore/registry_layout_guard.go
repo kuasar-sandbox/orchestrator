@@ -126,6 +126,15 @@ func (a AcceptedRegistryLayout) Accept(next RegistryLayout, digest string) (Acce
 }
 
 func validateRetainedReplicaTargets(previous, next RegistryLayout) error {
+	previousMembers := make(map[string]RegistryMember, len(previous.Members))
+	for _, member := range previous.Members {
+		previousMembers[member.MemberID] = member
+	}
+	for _, member := range next.Members {
+		if prior, retained := previousMembers[member.MemberID]; retained && prior.RaftEndpoint != member.RaftEndpoint {
+			return errors.New("raftstore: retained Registry member changed its process-wide Raft endpoint")
+		}
+	}
 	type replicaKey struct {
 		ShardID   uint64
 		ReplicaID uint64

@@ -76,6 +76,41 @@ func TestDataCASConflictAdvancesAppliedIndexWithoutChangingRow(t *testing.T) {
 	}
 }
 
+func TestMutationLookupInheritsCommittedWorkflowFinalizations(t *testing.T) {
+	registryLayout := testRegistryLayout(4, "generation-mutation-finalizations")
+	state, identity := initializedRouteShard(t, registryLayout, "/g", "rk")
+	current := routeStarting(t, registryLayout, "/g", "rk", "sandbox-1", 1, false)
+	current.Finalizations = []clusterstate.WorkflowFinalizationIntent{{
+		ObjectID: "sandbox-old", NodeID: "node-1", NodeEpoch: 1, DataEndpoint: "node-1:8443",
+		RegistryGeneration: registryLayout.RegistryGeneration, BindingDigest: digestFor("binding-old"),
+	}}
+	current = withRevision(current, state, 3)
+	state.Routes[routeMapKey(current.Group, current.RouteKey)] = current
+	commandRecord := cloneRouteRecord(current)
+	commandRecord.Revision = clusterstate.Revision{}
+	commandRecord.Finalizations = nil
+	status, err := LookupDataMutation(state, DataMutationLookup{Command: DataCommand{
+		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{LogIndex: 2}, Route: &commandRecord,
+	}})
+	if err != nil || !status.Committed || status.Revision != 3 {
+		t.Fatalf("Route mutation status = %+v, %v", status, err)
+	}
+
+	build := buildStarting(t, registryLayout, "/g", "build-1", false)
+	build.Finalizations = cloneWorkflowFinalizations(current.Finalizations)
+	build.Revision = revisionFor(state, 4)
+	state.Builds[buildMapKey(build.Group, build.BuildID)] = build
+	commandBuild := cloneBuildRecord(build)
+	commandBuild.Revision = clusterstate.Revision{}
+	commandBuild.Finalizations = nil
+	status, err = LookupDataMutation(state, DataMutationLookup{Command: DataCommand{
+		Type: DataPutBuild, Identity: identity, Expect: RevisionExpectation{LogIndex: 3}, Build: &commandBuild,
+	}})
+	if err != nil || !status.Committed || status.Revision != 4 {
+		t.Fatalf("Build mutation status = %+v, %v", status, err)
+	}
+}
+
 func TestStartingCandidateRejectionAndSandboxRoundAdvance(t *testing.T) {
 	registryLayout := testRegistryLayout(4, "generation-1")
 	state, identity := initializedRouteShard(t, registryLayout, "/g", "rk")
@@ -658,7 +693,7 @@ func testDispatchIntent(t *testing.T) clusterstate.DispatchIntent {
 		Version: clusterstate.DispatchSpecVersionV1, TemplateRef: templateRef,
 		AuthKeyFingerprint: strings.Repeat("a", 24), ManifestKeyFingerprint: strings.Repeat("b", 24),
 		AccessToken: "access-token", TargetPort: 8080,
-		Request: clusterstate.NodeRequestEnvelopeV1{Version: clusterstate.NodeRequestEnvelopeVersionV1, Method: "POST", Path: "/sandboxes", Body: []byte(`{"templateID":"` + templateRef + `"}`)},
+		Request: clusterstate.NodeRequestEnvelopeV1{Version: clusterstate.NodeRequestEnvelopeVersionV1, Method: "POST", Path: "/sandboxes", Body: []byte(`{"metadata":null,"templateID":"` + templateRef + `","timeout":0}`)},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -680,7 +715,7 @@ func testDispatchIntentNoFail() clusterstate.DispatchIntent {
 		Version: clusterstate.DispatchSpecVersionV1, TemplateRef: templateRef,
 		AuthKeyFingerprint: strings.Repeat("a", 24), ManifestKeyFingerprint: strings.Repeat("b", 24),
 		AccessToken: "access-token", TargetPort: 8080,
-		Request: clusterstate.NodeRequestEnvelopeV1{Version: clusterstate.NodeRequestEnvelopeVersionV1, Method: "POST", Path: "/sandboxes", Body: []byte(`{"templateID":"` + templateRef + `"}`)},
+		Request: clusterstate.NodeRequestEnvelopeV1{Version: clusterstate.NodeRequestEnvelopeVersionV1, Method: "POST", Path: "/sandboxes", Body: []byte(`{"metadata":null,"templateID":"` + templateRef + `","timeout":0}`)},
 	})
 	if err != nil {
 		panic(err)
@@ -702,7 +737,7 @@ func testBuildDispatchIntent(t *testing.T) clusterstate.DispatchIntent {
 		Version: clusterstate.DispatchSpecVersionV1, TemplateID: "template-1",
 		AuthKeyFingerprint: strings.Repeat("b", 24), ManifestKeyFingerprint: strings.Repeat("c", 24),
 		Profile: types.ProfileBare, CPUCount: 1, MemoryMB: 512,
-		Request: clusterstate.NodeRequestEnvelopeV1{Version: clusterstate.NodeRequestEnvelopeVersionV1, Method: "POST", Path: "/v3/templates", Body: []byte(`{"cpuCount":1,"memoryMB":512}`)},
+		Request: clusterstate.NodeRequestEnvelopeV1{Version: clusterstate.NodeRequestEnvelopeVersionV1, Method: "POST", Path: "/v3/templates", Body: []byte(`{"cpuCount":1,"memoryMB":512,"metadata":null,"name":"","profile":"bare","tags":null}`)},
 	})
 	if err != nil {
 		t.Fatal(err)

@@ -655,6 +655,12 @@ func (s *RegistryService) planSandbox(
 	if len(response.Candidates) == 0 || len(response.Candidates) > placement.DefaultCandidateCount {
 		return coordinator.SandboxRound{}, fmt.Errorf("controlplane: Placer returned %d Sandbox candidates, want 1..%d", len(response.Candidates), placement.DefaultCandidateCount)
 	}
+	if !sandboxInputMatchesIntent(input, intent) {
+		return coordinator.SandboxRound{}, errors.New("controlplane: Placer Sandbox intent does not match the requested immutable inputs")
+	}
+	if err := validatePlanCandidates(response.Candidates, input.TargetRuntimeDigest); err != nil {
+		return coordinator.SandboxRound{}, err
+	}
 	return coordinator.SandboxRound{
 		SandboxID: sandboxID, Candidates: append([]clusterstate.PlacementCandidate(nil), response.Candidates...),
 		Intent: intent,
@@ -694,7 +700,33 @@ func (s *RegistryService) planBuild(
 	if len(response.Candidates) == 0 || len(response.Candidates) > placement.DefaultCandidateCount {
 		return coordinator.SandboxRound{}, fmt.Errorf("controlplane: Placer returned %d Build candidates, want 1..%d", len(response.Candidates), placement.DefaultCandidateCount)
 	}
+	if !buildInputMatchesIntent(input, intent) {
+		return coordinator.SandboxRound{}, errors.New("controlplane: Placer Build intent does not match the requested immutable inputs")
+	}
+	if err := validatePlanCandidates(response.Candidates, input.TargetRuntimeDigest); err != nil {
+		return coordinator.SandboxRound{}, err
+	}
 	return coordinator.SandboxRound{Candidates: append([]clusterstate.PlacementCandidate(nil), response.Candidates...), Intent: intent}, nil
+}
+
+func validatePlanCandidates(
+	candidates []clusterstate.PlacementCandidate,
+	targetRuntimeDigest string,
+) error {
+	seen := make(map[string]struct{}, len(candidates))
+	for _, candidate := range candidates {
+		if candidate.NodeID == "" {
+			return errors.New("controlplane: Placer returned an empty node ID")
+		}
+		if _, duplicate := seen[candidate.NodeID]; duplicate {
+			return fmt.Errorf("controlplane: Placer returned duplicate node %q", candidate.NodeID)
+		}
+		seen[candidate.NodeID] = struct{}{}
+		if candidate.RuntimeDigest != targetRuntimeDigest {
+			return fmt.Errorf("controlplane: Placer returned node %q with the wrong target runtime", candidate.NodeID)
+		}
+	}
+	return nil
 }
 
 func (s *RegistryService) startingCoordinator() (*coordinator.StartingCoordinator, error) {

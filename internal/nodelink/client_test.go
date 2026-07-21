@@ -25,6 +25,13 @@ type fakeNode struct {
 	commands chan routesync.Command
 }
 
+func TestNormalizeEndpointCanonicalizesSchemeCase(t *testing.T) {
+	scheme, host, endpoint, err := normalizeEndpoint("HTTPS://registry.example.test:9443", true)
+	if err != nil || scheme != "https" || host != "registry.example.test:9443" || endpoint != host {
+		t.Fatalf("normalized endpoint = %q %q %q, %v", scheme, host, endpoint, err)
+	}
+}
+
 type fixedSessionSequencer struct {
 	called atomic.Bool
 	tuple  routesync.SessionTuple

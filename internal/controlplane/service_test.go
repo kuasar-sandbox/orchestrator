@@ -158,8 +158,9 @@ func (s *serviceConsensus) ReadSystemStrong(context.Context) (raftstore.SystemSt
 }
 
 type servicePlanner struct {
-	mu    sync.Mutex
-	calls []placer.PlanRequest
+	mu     sync.Mutex
+	calls  []placer.PlanRequest
+	mutate func(placer.PlanRequest, *placer.PlanResponse)
 }
 
 func (p *servicePlanner) Plan(_ context.Context, request placer.PlanRequest) (placer.PlanResponse, error) {
@@ -195,7 +196,11 @@ func (p *servicePlanner) Plan(_ context.Context, request placer.PlanRequest) (pl
 			AccessToken:         "access", TargetPort: 3000, TimeoutSeconds: request.Sandbox.TimeoutSeconds,
 			Request: nodeRequest,
 		})
-		return placer.PlanResponse{Candidates: candidates, NormalizedDemand: demand, DispatchSpec: spec, ProviderPolicyVersion: "policy-v1"}, err
+		response := placer.PlanResponse{Candidates: candidates, NormalizedDemand: demand, DispatchSpec: spec, ProviderPolicyVersion: "policy-v1"}
+		if p.mutate != nil {
+			p.mutate(request, &response)
+		}
+		return response, err
 	case placer.PlanBuild:
 		lease := serviceKeyLease(request.Group)
 		demand, err := placement.NormalizeBuildDemand(request.Build.Demand)
@@ -218,10 +223,37 @@ func (p *servicePlanner) Plan(_ context.Context, request placer.PlanRequest) (pl
 			Metadata: clusterstate.WithoutSystemMetadata(request.Build.Metadata),
 			CPUCount: request.Build.CPUCount, MemoryMB: request.Build.MemoryMB, Request: nodeRequest,
 		})
-		return placer.PlanResponse{Candidates: candidates, NormalizedDemand: demand, DispatchSpec: spec, ProviderPolicyVersion: "policy-v1"}, err
+		response := placer.PlanResponse{Candidates: candidates, NormalizedDemand: demand, DispatchSpec: spec, ProviderPolicyVersion: "policy-v1"}
+		if p.mutate != nil {
+			p.mutate(request, &response)
+		}
+		return response, err
 	default:
 		return placer.PlanResponse{}, fmt.Errorf("unexpected plan kind %q", request.Kind)
 	}
+}
+
+func TestRegistryRejectsPlacerRuntimeAndDemandDrift(t *testing.T) {
+	t.Run("candidate runtime", func(t *testing.T) {
+		service, store, planner, _ := newRegistryServiceFixture(t, clusterstate.DispatchUnknown)
+		planner.mutate = func(_ placer.PlanRequest, response *placer.PlanResponse) {
+			response.Candidates[0].RuntimeDigest = "wrong-runtime"
+		}
+		if _, err := service.ReserveSandbox(context.Background(), sandboxMutationRequest(t, store)); err == nil {
+			t.Fatal("Placer candidate with a mismatched runtime fence was accepted")
+		}
+	})
+	t.Run("normalized Build demand", func(t *testing.T) {
+		service, store, planner, _ := newRegistryServiceFixture(t, clusterstate.DispatchUnknown)
+		planner.mutate = func(request placer.PlanRequest, response *placer.PlanResponse) {
+			demand := request.Build.Demand
+			demand.Storage++
+			response.NormalizedDemand, _ = placement.NormalizeBuildDemand(demand)
+		}
+		if _, err := service.RegisterBuild(context.Background(), buildMutationRequest(t, store)); err == nil {
+			t.Fatal("Placer Build demand that differs from the immutable request was accepted")
+		}
+	})
 }
 
 func (p *servicePlanner) ResolveKeyLease(
@@ -452,7 +484,7 @@ func buildMutationRequest(t *testing.T, store *RaftStore) routeapi.RegisterBuild
 			Names: []string{"name"}, Aliases: []string{"alias"},
 			CPUCount: 100, MemoryMB: 1024,
 			Metadata:            map[string]string{"request": "value"},
-			Demand:              placement.BuildDemand{Slots: 1, CPU: 100, Memory: 1024, Storage: 4096},
+			Demand:              placement.BuildDemand{Slots: 1, CPU: 100_000, Memory: 1024 << 20, Storage: 4096},
 			TargetRuntimeDigest: "runtime-v1",
 			Request:             nodeRequest,
 		},

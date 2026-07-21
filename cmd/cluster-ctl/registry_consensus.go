@@ -306,7 +306,9 @@ func openConsensusRuntime(
 	if err != nil {
 		return nil, raftstore.RegistryLayout{}, "", raftstore.SystemState{}, err
 	}
-	allPeers, err := registryRegistryLayoutPeers(config.Member.TLS, latest.RegistryLayout)
+	allPeers, err := registryRegistryLayoutPeers(
+		config.Member.TLS, latest.RegistryLayout, registryPeerResponseTimeout(config.Storage),
+	)
 	if err != nil {
 		return nil, raftstore.RegistryLayout{}, "", raftstore.SystemState{}, err
 	}
@@ -424,10 +426,14 @@ func registrySessionPeers(
 	return peers, nil
 }
 
-func registryRegistryLayoutPeers(material clustercfg.TLS, registryLayout raftstore.RegistryLayout) ([]controlplane.SessionPeer, error) {
+func registryRegistryLayoutPeers(
+	material clustercfg.TLS,
+	registryLayout raftstore.RegistryLayout,
+	responseTimeout time.Duration,
+) ([]controlplane.SessionPeer, error) {
 	peers := make([]controlplane.SessionPeer, 0, len(registryLayout.Members))
 	for _, member := range registryLayout.Members {
-		client, err := authenticatedHTTPClient(material, member.InternalEndpoint, defaultInternalResponseTimeout)
+		client, err := authenticatedHTTPClient(material, member.InternalEndpoint, responseTimeout)
 		if err != nil {
 			return nil, err
 		}
@@ -436,6 +442,10 @@ func registryRegistryLayoutPeers(material clustercfg.TLS, registryLayout raftsto
 		})
 	}
 	return peers, nil
+}
+
+func registryPeerResponseTimeout(storage clustercfg.ConsensusStorage) time.Duration {
+	return time.Duration(raftstore.MaximumServePermitMillis)*time.Millisecond + storage.OperationTimeoutDuration()
 }
 
 func registrySystemPeers(

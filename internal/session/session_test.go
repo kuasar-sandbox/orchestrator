@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"net/http"
 	"slices"
 	"strings"
@@ -26,6 +27,7 @@ type testEndpoint struct {
 	wire     []*routesync.Command
 	sendErr  error
 	sent     bool
+	noSend   bool
 }
 
 func (e *testEndpoint) SendNodeCommand(_ context.Context, command *routesync.Command) (routesync.CmdAck, bool, error) {
@@ -35,6 +37,9 @@ func (e *testEndpoint) SendNodeCommand(_ context.Context, command *routesync.Com
 	}
 	if command == nil {
 		return routesync.CmdAck{}, false, errors.New("missing command")
+	}
+	if e.noSend {
+		return routesync.CmdAck{}, false, nil
 	}
 	var ref *routesync.NodeKeyLeaseRefV1
 	if e.keyAck != nil {
@@ -888,6 +893,34 @@ func TestAmbiguousKeyDropInvalidatesLocalAcknowledgement(t *testing.T) {
 	}
 }
 
+func TestUnsentKeyDropReturnsSessionUnavailable(t *testing.T) {
+	registration := testRegistration("node-1", 7, 10, "10.0.0.1:8443")
+	holder, err := NewHolder("registry-a", 1, nil, testGate(true), nil, newTestEnrollmentAuthority(registration))
+	if err != nil {
+		t.Fatal(err)
+	}
+	endpoint := &testEndpoint{}
+	if _, err := holder.Register(context.Background(), registration, endpoint); err != nil {
+		t.Fatal(err)
+	}
+	lease := testKeyLease()
+	ref, _, err := holder.InstallKeyLease(
+		context.Background(), testServeIdentity(), registration.NodeID, registration.NodeEpoch, registration.DataEndpoint, lease,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	endpoint.noSend = true
+	if sent, err := holder.DropKeyLease(
+		context.Background(), testServeIdentity(), registration.NodeID, registration.NodeEpoch, registration.DataEndpoint, ref,
+	); sent || !errors.Is(err, ErrSessionUnavailable) {
+		t.Fatalf("unsent drop sent=%v err=%v", sent, err)
+	}
+	if holder.HasKeyLease(registration.NodeID, registration.NodeEpoch, ref) {
+		t.Fatal("unsent drop left the local lease ACK usable")
+	}
+}
+
 type orderedKeyEndpoint struct {
 	putStarted chan struct{}
 	releasePut chan struct{}
@@ -1028,6 +1061,75 @@ func TestNewerKeyRefreshSupersedesWaitingDrop(t *testing.T) {
 	}
 }
 
+func TestKeyLeaseRefreshCannotShortenAcknowledgedExpiry(t *testing.T) {
+	registration := testRegistration("node-1", 7, 10, "10.0.0.1:8443")
+	holder, err := NewHolder("registry-a", 1, nil, testGate(true), nil, newTestEnrollmentAuthority(registration))
+	if err != nil {
+		t.Fatal(err)
+	}
+	endpoint := &testEndpoint{}
+	if _, err := holder.Register(context.Background(), registration, endpoint); err != nil {
+		t.Fatal(err)
+	}
+	lease := testKeyLease()
+	if _, sent, err := holder.InstallKeyLease(
+		context.Background(), testServeIdentity(), registration.NodeID, registration.NodeEpoch, registration.DataEndpoint, lease,
+	); err != nil || !sent {
+		t.Fatalf("initial install sent=%v err=%v", sent, err)
+	}
+	lease.ExpiresUnix--
+	if _, sent, err := holder.InstallKeyLease(
+		context.Background(), testServeIdentity(), registration.NodeID, registration.NodeEpoch, registration.DataEndpoint, lease,
+	); sent || !errors.Is(err, ErrKeyLeaseSuperseded) || !errors.Is(err, ErrDispatchNotSent) {
+		t.Fatalf("shortening refresh sent=%v err=%v", sent, err)
+	}
+	if len(endpoint.wire) != 1 {
+		t.Fatalf("shortening refresh reached node: %+v", endpoint.wire)
+	}
+}
+
+func TestKeyLeaseRefreshCannotSupersedeInFlightLongerExpiry(t *testing.T) {
+	registration := testRegistration("node-1", 7, 10, "10.0.0.1:8443")
+	holder, err := NewHolder("registry-a", 1, nil, testGate(true), nil, newTestEnrollmentAuthority(registration))
+	if err != nil {
+		t.Fatal(err)
+	}
+	endpoint := &testEndpoint{}
+	if _, err := holder.Register(context.Background(), registration, endpoint); err != nil {
+		t.Fatal(err)
+	}
+	lease := testKeyLease()
+	ref := keyLeaseRef(lease)
+	operation := holder.keyLeaseOperation(registration.NodeID, ref)
+	operation.Lock()
+
+	longer := lease
+	longer.ExpiresUnix += 60
+	longerDone := make(chan error, 1)
+	go func() {
+		_, _, err := holder.InstallKeyLease(
+			context.Background(), testServeIdentity(), registration.NodeID, registration.NodeEpoch,
+			registration.DataEndpoint, longer,
+		)
+		longerDone <- err
+	}()
+	waitForKeyLeaseSequence(t, holder, registration.NodeID, ref, 1)
+
+	if _, sent, err := holder.InstallKeyLease(
+		context.Background(), testServeIdentity(), registration.NodeID, registration.NodeEpoch,
+		registration.DataEndpoint, lease,
+	); sent || !errors.Is(err, ErrKeyLeaseSuperseded) || !errors.Is(err, ErrDispatchNotSent) {
+		t.Fatalf("shorter overlapping refresh sent=%v err=%v", sent, err)
+	}
+	operation.Unlock()
+	if err := <-longerDone; err != nil {
+		t.Fatalf("longer refresh: %v", err)
+	}
+	if len(endpoint.wire) != 1 || endpoint.wire[0].KeyLease.ExpiresUnix != longer.ExpiresUnix {
+		t.Fatalf("wire commands = %+v", endpoint.wire)
+	}
+}
+
 func waitForKeyLeaseSequence(t *testing.T, holder *Holder, nodeID string, ref routesync.NodeKeyLeaseRefV1, want uint64) {
 	t.Helper()
 	deadline := time.Now().Add(time.Second)
@@ -1143,6 +1245,43 @@ func TestDirectoryFullMergePreservesAvailabilityAndConflict(t *testing.T) {
 	}
 	if _, ok := directory.Lookup("b"); ok {
 		t.Fatal("conflicting record became available")
+	}
+}
+
+func TestDirectorySnapshotPagesAreBoundedAndOrdered(t *testing.T) {
+	directory := newTestDirectory()
+	for index := 299; index >= 0; index-- {
+		entry := DirectoryEntry{
+			NodeID: fmt.Sprintf("node-%04d", index), EnrollmentID: fmt.Sprintf("enrollment-%04d", index),
+			Tuple: Tuple{NodeEpoch: 1, SessionSeq: 1}, HolderMemberID: "registry-a",
+		}
+		if !directory.Apply(DirectoryDelta{Entry: entry, Up: true}) {
+			t.Fatalf("entry %d was not installed", index)
+		}
+	}
+	var records []DirectoryRecord
+	after := ""
+	for {
+		page, next := directory.SnapshotPage(after, 37)
+		if len(page) == 0 || len(page) > 37 {
+			t.Fatalf("page after %q has %d records", after, len(page))
+		}
+		records = append(records, page...)
+		if next == "" {
+			break
+		}
+		if next <= after || next != page[len(page)-1].Entry.NodeID {
+			t.Fatalf("page cursor %q after %q", next, after)
+		}
+		after = next
+	}
+	if len(records) != 300 {
+		t.Fatalf("paged records = %d", len(records))
+	}
+	for index, record := range records {
+		if want := fmt.Sprintf("node-%04d", index); record.Entry.NodeID != want {
+			t.Fatalf("record %d = %q, want %q", index, record.Entry.NodeID, want)
+		}
 	}
 }
 
@@ -1263,7 +1402,7 @@ func testDispatchCommand(t *testing.T, registration Registration) DispatchComman
 		t.Fatal(err)
 	}
 	lease := testKeyLease()
-	request, err := cluster.NewNodeRequestEnvelopeV1(http.MethodPost, "/sandboxes", "", nil, []byte(`{"templateID":"e2b-img-`+strings.Repeat("c", 64)+`"}`))
+	request, err := cluster.NewNodeRequestEnvelopeV1(http.MethodPost, "/sandboxes", "", nil, []byte(`{"metadata":null,"templateID":"e2b-img-`+strings.Repeat("c", 64)+`","timeout":0}`))
 	if err != nil {
 		t.Fatal(err)
 	}

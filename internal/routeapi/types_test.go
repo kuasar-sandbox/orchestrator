@@ -9,12 +9,53 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
+	"github.com/kuasar-sandbox/orchestrator/internal/placement"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
+
+func TestBuildInputDemandMatchesImmutableResourceCeilings(t *testing.T) {
+	request, err := clusterstate.NewNodeRequestEnvelopeV1(
+		http.MethodPost, "/v3/templates", "", nil,
+		[]byte(`{"cpuCount":2,"memoryMB":512,"metadata":null,"name":"","profile":"bare","tags":null}`),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := BuildInput{
+		TemplateID: "template-1", Profile: types.ProfileBare, CPUCount: 2, MemoryMB: 512,
+		Demand: placement.BuildDemand{Slots: 1, CPU: 2000, Memory: 512 << 20}, Request: request,
+	}
+	if err := input.Validate(); err != nil {
+		t.Fatalf("matching demand: %v", err)
+	}
+	input.Demand.CPU++
+	if err := input.Validate(); err == nil {
+		t.Fatal("Build demand that exceeds its registered CPU ceiling was accepted")
+	}
+}
+
+func TestSandboxInputRejectsTimeoutDurationOverflow(t *testing.T) {
+	if strconv.IntSize < 64 {
+		t.Skip("int cannot represent a time.Duration-overflowing second count")
+	}
+	request, err := clusterstate.NewNodeRequestEnvelopeV1(http.MethodPost, "/sandboxes", "", nil, []byte(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	overflow := clusterstate.MaxSandboxTimeoutSeconds + 1
+	input := SandboxInput{
+		TimeoutSeconds: int(overflow),
+		Demand:         placement.SandboxDemand{SlotUnits: 1}, Request: request,
+	}
+	if err := input.Validate(); err == nil {
+		t.Fatal("Sandbox timeout that overflows time.Duration was accepted")
+	}
+}
 
 type fakeService struct {
 	route ReadRouteResponse
@@ -262,7 +303,7 @@ func testReadyRoute() *clusterstate.ReadyRoute {
 		AccessToken: "token", TargetPort: 3000,
 		Request: clusterstate.NodeRequestEnvelopeV1{
 			Version: clusterstate.NodeRequestEnvelopeVersionV1, Method: "POST", Path: "/sandboxes",
-			Body: []byte(`{"templateID":"` + templateRef + `"}`),
+			Body: []byte(`{"metadata":null,"templateID":"` + templateRef + `","timeout":0}`),
 		},
 	})
 	intent, _ := clusterstate.NewDispatchIntent([]byte("demand"), spec, "provider-v1")
@@ -280,7 +321,7 @@ func testBuildProjection() *clusterstate.BuildProjection {
 		Version: clusterstate.DispatchSpecVersionV1, TemplateID: "template-1",
 		AuthKeyFingerprint: strings.Repeat("b", 24), ManifestKeyFingerprint: strings.Repeat("c", 24),
 		Profile: types.ProfileBare, CPUCount: 1, MemoryMB: 512,
-		Request: clusterstate.NodeRequestEnvelopeV1{Version: clusterstate.NodeRequestEnvelopeVersionV1, Method: "POST", Path: "/v3/templates", Body: []byte(`{"cpuCount":1,"memoryMB":512}`)},
+		Request: clusterstate.NodeRequestEnvelopeV1{Version: clusterstate.NodeRequestEnvelopeVersionV1, Method: "POST", Path: "/v3/templates", Body: []byte(`{"cpuCount":1,"memoryMB":512,"metadata":null,"name":"","profile":"bare","tags":null}`)},
 	})
 	intent, _ := clusterstate.NewDispatchIntent([]byte("demand"), spec, "provider-v1")
 	return &clusterstate.BuildProjection{

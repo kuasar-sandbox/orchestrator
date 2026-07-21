@@ -1,6 +1,7 @@
 package session
 
 import (
+	"container/heap"
 	"sort"
 	"sync"
 )
@@ -156,6 +157,60 @@ func (d *Directory) Snapshot() []DirectoryRecord {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Entry.NodeID < out[j].Entry.NodeID })
 	return out
+}
+
+// SnapshotPage returns a bounded, NodeID-ordered anti-entropy page. The
+// extra candidate retained by the heap proves whether another page exists
+// without materializing the full cluster Directory.
+func (d *Directory) SnapshotPage(afterNodeID string, limit int) ([]DirectoryRecord, string) {
+	if limit <= 0 {
+		return nil, ""
+	}
+	candidates := make(directoryRecordMaxHeap, 0, limit+1)
+	d.mu.RLock()
+	for nodeID, record := range d.records {
+		if nodeID <= afterNodeID || d.authority == nil || !d.authority.AllowDirectoryEntry(record.Entry) {
+			continue
+		}
+		if len(candidates) < limit+1 {
+			heap.Push(&candidates, record)
+			continue
+		}
+		if nodeID < candidates[0].Entry.NodeID {
+			heap.Pop(&candidates)
+			heap.Push(&candidates, record)
+		}
+	}
+	d.mu.RUnlock()
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].Entry.NodeID < candidates[j].Entry.NodeID
+	})
+	hasMore := len(candidates) > limit
+	if hasMore {
+		candidates = candidates[:limit]
+	}
+	next := ""
+	if hasMore {
+		next = candidates[len(candidates)-1].Entry.NodeID
+	}
+	return []DirectoryRecord(candidates), next
+}
+
+type directoryRecordMaxHeap []DirectoryRecord
+
+func (h directoryRecordMaxHeap) Len() int { return len(h) }
+func (h directoryRecordMaxHeap) Less(i, j int) bool {
+	return h[i].Entry.NodeID > h[j].Entry.NodeID
+}
+func (h directoryRecordMaxHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
+func (h *directoryRecordMaxHeap) Push(value any) {
+	*h = append(*h, value.(DirectoryRecord))
+}
+func (h *directoryRecordMaxHeap) Pop() any {
+	old := *h
+	last := old[len(old)-1]
+	*h = old[:len(old)-1]
+	return last
 }
 
 func (d *Directory) MergeFull(records []DirectoryRecord) int {

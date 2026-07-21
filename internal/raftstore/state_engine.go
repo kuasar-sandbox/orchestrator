@@ -18,7 +18,7 @@ import (
 )
 
 const (
-	stateEngineVersion      = uint32(3)
+	stateEngineVersion      = uint32(4)
 	stateControlTable       = byte(0)
 	stateSlotTable          = byte(1)
 	stateMetadataTable      = byte(0)

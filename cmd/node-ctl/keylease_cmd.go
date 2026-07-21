@@ -62,8 +62,8 @@ func keyLeaseCmd(args []string, _ *slog.Logger) error {
 	if *group == "" || *authKey == "" || *manifestKey == "" {
 		return fmt.Errorf("key-lease %s: --group, --auth-key and --manifest-key are required", sub)
 	}
-	if *ttl > 0 && *ttl < time.Second {
-		return errors.New("key-lease put: positive TTL must be at least one second")
+	if *ttl < 0 || (*ttl > 0 && *ttl < time.Second) {
+		return errors.New("key-lease put: TTL must be zero or at least one second")
 	}
 	registryAuth, err := buildRegistryAuth(*regAuthFile, *regUser, *regPass, *regToken)
 	if err != nil {

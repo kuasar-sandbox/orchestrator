@@ -15,6 +15,35 @@ type keyLeaseProvider struct {
 	manifest clusterstate.Secret
 }
 
+type recordOnlyKeyLeaseProvider struct {
+	record clusterstate.SandboxGroupRecord
+}
+
+func (p recordOnlyKeyLeaseProvider) GetRecord(context.Context, string) (clusterstate.SandboxGroupRecord, bool, error) {
+	return p.record, true, nil
+}
+func (recordOnlyKeyLeaseProvider) Get(context.Context, string) (clusterstate.SandboxGroup, bool, error) {
+	panic("non-atomic group read")
+}
+func (recordOnlyKeyLeaseProvider) GetPlacementHint(context.Context, string) (clusterstate.PlacementHint, bool, error) {
+	panic("non-atomic placement read")
+}
+func (recordOnlyKeyLeaseProvider) GetManifestKey(context.Context, string) (clusterstate.Secret, bool, error) {
+	panic("non-atomic ManifestKey read")
+}
+func (recordOnlyKeyLeaseProvider) GetAuthKey(context.Context, string) (clusterstate.Secret, bool, error) {
+	panic("non-atomic AuthKey read")
+}
+
+func (p keyLeaseProvider) GetRecord(context.Context, string) (clusterstate.SandboxGroupRecord, bool, error) {
+	return clusterstate.SandboxGroupRecord{
+		Group: p.group.Group, AuthKey: p.auth, ManifestKey: p.manifest,
+		RegistryAuth: p.group.RegistryAuth, Config: p.group.Config, ImageRepo: p.group.ImageRepo,
+		TemplateRef: p.group.TemplateRef, AllowTemplateOverride: p.group.AllowTemplateOverride,
+		TargetPort: p.group.TargetPort, Metadata: p.group.Metadata,
+	}, true, nil
+}
+
 func (p keyLeaseProvider) Get(context.Context, string) (clusterstate.SandboxGroup, bool, error) {
 	return p.group, true, nil
 }
@@ -49,6 +78,18 @@ func TestResolveNodeKeyLeaseBuildsCompleteSeparateBundle(t *testing.T) {
 	}
 	if lease.AuthKey.Type != routesync.KeyMaterialInline || lease.ManifestKey.Type != routesync.KeyMaterialInline {
 		t.Fatalf("unexpected key material: %+v", lease)
+	}
+}
+
+func TestResolveNodeKeyLeaseUsesOneGroupRecordSnapshot(t *testing.T) {
+	provider := recordOnlyKeyLeaseProvider{record: clusterstate.SandboxGroupRecord{
+		Group:       "/group",
+		AuthKey:     clusterstate.Secret{Type: clusterstate.SecretInline, Value: strings.Repeat("a", 64)},
+		ManifestKey: clusterstate.Secret{Type: clusterstate.SecretInline, Value: strings.Repeat("b", 64)},
+	}}
+	lease, err := ResolveNodeKeyLease(context.Background(), provider, "/group", 1234)
+	if err != nil || lease.Group != "/group" || lease.ExpiresUnix != 1234 {
+		t.Fatalf("atomic record lease = %+v, %v", lease, err)
 	}
 }
 

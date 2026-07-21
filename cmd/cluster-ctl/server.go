@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -24,12 +25,15 @@ type clusterHTTPServer struct {
 }
 
 func newClusterHTTPServer(name, addr string, tlsMaterial clustercfg.TLS, handler http.Handler) (*clusterHTTPServer, error) {
+	if strings.HasPrefix(addr, "/") && tlsMaterial.Enabled() {
+		return nil, fmt.Errorf("cluster: %s certificate-authenticated listener requires TCP", name)
+	}
 	listener, err := listenClusterEndpoint(addr)
 	if err != nil {
 		return nil, fmt.Errorf("cluster: %s listen %s: %w", name, addr, err)
 	}
 	server := &http.Server{Handler: h2c.NewHandler(handler, &http2.Server{})}
-	useTLS := tlsMaterial.Enabled() && !strings.HasPrefix(addr, "/")
+	useTLS := tlsMaterial.Enabled()
 	if useTLS {
 		tlsConfig, err := tlsMaterial.ServerConfig()
 		if err != nil {
@@ -65,7 +69,17 @@ func listenClusterEndpoint(addr string) (net.Listener, error) {
 	if !strings.HasPrefix(addr, "/") {
 		return net.Listen("tcp", addr)
 	}
-	_ = os.Remove(addr)
+	info, err := os.Lstat(addr)
+	if err == nil {
+		if info.Mode()&os.ModeSocket == 0 {
+			return nil, fmt.Errorf("cluster: Unix listener path exists and is not a socket")
+		}
+		if err := os.Remove(addr); err != nil {
+			return nil, err
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
 	if directory := addr[:strings.LastIndexByte(addr, '/')]; directory != "" {
 		if err := os.MkdirAll(directory, 0o755); err != nil {
 			return nil, err
@@ -77,6 +91,7 @@ func listenClusterEndpoint(addr string) (net.Listener, error) {
 	}
 	if err := os.Chmod(addr, 0o600); err != nil {
 		_ = listener.Close()
+		_ = os.Remove(addr)
 		return nil, err
 	}
 	return listener, nil

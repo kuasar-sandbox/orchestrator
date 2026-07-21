@@ -111,6 +111,42 @@ func TestServer_AdmitSettledRelease(t *testing.T) {
 	}
 }
 
+func TestServerSettledDurablySignalsPreparedAdmission(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	state := preparedTestState()
+	prepared := preparedTestController(t, state, path, 4)
+	digest := preparedDigest("settled-capacity")
+	result, err := prepared.PrepareAdmission("sandbox-settled", digest, preparedTestDemand(1<<30))
+	if err != nil || result.State != PreparedAdmitted {
+		t.Fatalf("prepare = %+v, %v", result, err)
+	}
+	select {
+	case <-prepared.Wake():
+	default:
+	}
+	server := &Server{
+		State: state, Admission: prepared.admission, PreparedAdmission: prepared,
+		Persister: prepared.persister, Logf: func(string, ...any) {},
+	}
+	response := server.handleSettled(&Message{CurrentRSS: 512 << 20}, result.ReservationToken)
+	if response.Type != TypeAck {
+		t.Fatalf("settled response = %+v", response)
+	}
+	select {
+	case <-prepared.Wake():
+	default:
+		t.Fatal("durable settlement did not wake prepared Admission")
+	}
+	loaded, err := prepared.persister.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	reservation := loaded.Reservations[result.ReservationToken]
+	if reservation == nil || reservation.Stage != StageSettled {
+		t.Fatalf("persisted reservation = %+v", reservation)
+	}
+}
+
 func TestServer_BurstGrantAndRecover(t *testing.T) {
 	srv, c, cleanup := startTestServer(t, 8<<30)
 	defer cleanup()

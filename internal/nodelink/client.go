@@ -642,18 +642,20 @@ func normalizeEndpoint(endpoint string, tlsEnabled bool) (scheme, host, dialEndp
 	if endpoint == "" {
 		return scheme, host, dialEndpoint, nil
 	}
-	if strings.HasPrefix(endpoint, "http://") || strings.HasPrefix(endpoint, "https://") {
+	lowerEndpoint := strings.ToLower(endpoint)
+	if strings.HasPrefix(lowerEndpoint, "http://") || strings.HasPrefix(lowerEndpoint, "https://") {
 		u, err := url.Parse(endpoint)
 		if err != nil {
 			return "", "", "", err
 		}
-		if u.Scheme != "http" && u.Scheme != "https" {
+		normalizedScheme := strings.ToLower(u.Scheme)
+		if normalizedScheme != "http" && normalizedScheme != "https" {
 			return "", "", "", fmt.Errorf("node-link: unsupported endpoint scheme %q", u.Scheme)
 		}
 		if u.Host == "" {
 			return "", "", "", fmt.Errorf("node-link: endpoint host is required")
 		}
-		return u.Scheme, u.Host, u.Host, nil
+		return normalizedScheme, u.Host, u.Host, nil
 	}
 	if strings.HasPrefix(endpoint, "/") {
 		return "http", "registry", endpoint, nil

@@ -2,12 +2,30 @@ package orch
 
 import (
 	"context"
+	"strconv"
 	"testing"
+	"time"
 
+	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/nodectl"
 	"github.com/kuasar-sandbox/orchestrator/internal/nodeexec"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 )
+
+func TestSandboxDeadlineRejectsDurationOverflow(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	deadline, err := sandboxDeadline(now, 300)
+	if err != nil || deadline != now.Add(300*time.Second).Unix() {
+		t.Fatalf("deadline = %d, %v", deadline, err)
+	}
+	if strconv.IntSize < 64 {
+		return
+	}
+	overflow := clusterstate.MaxSandboxTimeoutSeconds + 1
+	if _, err := sandboxDeadline(now, int(overflow)); err == nil {
+		t.Fatal("overflowing Sandbox timeout was accepted")
+	}
+}
 
 func TestFinalClusterNodeFencesEveryCommandByCurrentSessionTuple(t *testing.T) {
 	session := &ClusterSession{}

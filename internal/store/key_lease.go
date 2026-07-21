@@ -8,6 +8,8 @@ import (
 	"time"
 )
 
+var ErrKeyLeaseExpiryRegression = errors.New("store: key lease refresh cannot shorten its expiry")
+
 // KeyLease is the node-local, encrypted-at-rest bundle required before a new
 // Sandbox or Build can copy its independent AuthKey and ManifestKey roots.
 type KeyLease struct {
@@ -67,8 +69,9 @@ SET auth_key_enc=?, manifest_key_enc=?,
     registry_auth_enc=CASE WHEN ?='' THEN registry_auth_enc ELSE ? END,
     expires_unix=?,
     label=CASE WHEN ?='' THEN label ELSE ? END
-WHERE rowid=?`, authEnc, manifestEnc, registryAuthEnc, registryAuthEnc,
-			lease.ExpiresUnix, lease.Label, lease.Label, rowID)
+WHERE rowid=? AND (?=0 OR (expires_unix<>0 AND expires_unix<=?))`,
+			authEnc, manifestEnc, registryAuthEnc, registryAuthEnc,
+			lease.ExpiresUnix, lease.Label, lease.Label, rowID, lease.ExpiresUnix, lease.ExpiresUnix)
 		if updateErr != nil {
 			return false, updateErr
 		}
@@ -77,7 +80,7 @@ WHERE rowid=?`, authEnc, manifestEnc, registryAuthEnc, registryAuthEnc,
 			return false, updateErr
 		}
 		if changed != 1 {
-			return false, errors.New("store: key lease disappeared during refresh")
+			return false, ErrKeyLeaseExpiryRegression
 		}
 		if err := tx.Commit(); err != nil {
 			return false, fmt.Errorf("store: commit key lease refresh: %w", err)

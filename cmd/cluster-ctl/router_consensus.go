@@ -107,9 +107,11 @@ func runRouter(args []string, log *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	go router.RunCleanup(ctx)
+	backgroundErr := make(chan error, 1)
 	go func() {
 		if runErr := control.Run(ctx); runErr != nil && ctx.Err() == nil {
 			log.Error("router Permit refresh stopped", "err", runErr)
+			backgroundErr <- fmt.Errorf("router: Permit refresh: %w", runErr)
 			stop()
 		}
 	}()
@@ -141,7 +143,7 @@ func runRouter(args []string, log *slog.Logger) error {
 	}}
 	listener, err := listenConfig.Listen(ctx, "tcp", config.Ingress.Listen)
 	if err != nil {
-		return err
+		return routerBackgroundError(backgroundErr, err)
 	}
 	server := &http.Server{}
 	if config.Ingress.TLS.Enabled() {
@@ -169,5 +171,14 @@ func runRouter(args []string, log *slog.Logger) error {
 	if serveErr != nil && serveErr != http.ErrServerClosed {
 		return serveErr
 	}
-	return nil
+	return routerBackgroundError(backgroundErr, nil)
+}
+
+func routerBackgroundError(background <-chan error, fallback error) error {
+	select {
+	case err := <-background:
+		return err
+	default:
+		return fallback
+	}
 }

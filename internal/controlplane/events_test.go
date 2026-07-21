@@ -238,7 +238,7 @@ func newEventFixture(
 			var request clusterstate.NodeRequestEnvelopeV1
 			request, err = clusterstate.NewNodeRequestEnvelopeV1(
 				http.MethodPost, "/sandboxes", "", nil,
-				[]byte(`{"templateID":"`+templateRef+`"}`),
+				[]byte(`{"metadata":null,"templateID":"`+templateRef+`","timeout":0}`),
 			)
 			if err != nil {
 				t.Fatal(err)
@@ -253,7 +253,7 @@ func newEventFixture(
 		normalizedDemand, err = placement.NormalizeBuildDemand(placement.BuildDemand{Slots: 1})
 		if err == nil {
 			var request clusterstate.NodeRequestEnvelopeV1
-			request, err = clusterstate.NewNodeRequestEnvelopeV1(http.MethodPost, "/v3/templates", "", nil, []byte(`{"cpuCount":1,"memoryMB":512}`))
+			request, err = clusterstate.NewNodeRequestEnvelopeV1(http.MethodPost, "/v3/templates", "", nil, []byte(`{"cpuCount":1,"memoryMB":512,"metadata":null,"name":"","profile":"bare","tags":null}`))
 			if err != nil {
 				t.Fatal(err)
 			}

@@ -8,6 +8,7 @@ import (
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/nodeexec"
 	"github.com/kuasar-sandbox/orchestrator/internal/placement"
+	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
@@ -45,6 +46,19 @@ func TestRecoveryExecutionReportRejectsForgedUserMetadataAsAuthority(t *testing.
 	if len(report) != 1 || report[0].Object.ObjectID != managed.ObjectID ||
 		report[0].Object.Binding != managed.OpaqueBinding {
 		t.Fatalf("protected recovery report = %+v", report)
+	}
+	build := workflowDispatch(t, clusterstate.ExecutionKindBuild, "build-managed", placement.BuildDemand{Slots: 1})
+	if _, err := store.PrepareBuildWorkflow(ctx, build, workflowBuild(build.ObjectID),
+		nodeexec.BuildCapacity{Slots: 1, QueueLimit: 1}, ""); err != nil {
+		t.Fatal(err)
+	}
+	mixed, err := store.RecoveryExecutionReportPage(ctx, managed.NodeID, managed.NodeEpoch, "generation-1", 0, 2, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mixed.TotalObjects != 2 || len(mixed.Objects) != 2 ||
+		mixed.Objects[0].Object.ObjectKind != "build" || mixed.Objects[1].Object.ObjectKind != "sandbox" {
+		t.Fatalf("mixed canonical recovery order = %+v", mixed)
 	}
 }
 
@@ -97,6 +111,30 @@ func TestRecoveryExecutionReportAcceptsEveryDurableBuildRegistrationWindow(t *te
 		admitted.ObjectID: types.BuildBuilding,
 		queued.ObjectID:   types.BuildWaiting,
 	})
+	full, err := store.RecoveryExecutionReport(ctx, "node-1", 7, "generation-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantDigest, err := routesync.CanonicalRecoveryReportDigest(full)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := store.RecoveryExecutionReportPage(ctx, "node-1", 7, "generation-1", 0, 1, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := store.RecoveryExecutionReportPage(ctx, "node-1", 7, "generation-1", first.NextOffset, 1, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.ReportDigest != wantDigest || second.ReportDigest != wantDigest || first.TotalObjects != 2 ||
+		first.NextOffset != 1 || second.NextOffset != 2 || len(first.Objects) != 1 || len(second.Objects) != 1 ||
+		first.Objects[0].Object.ObjectID >= second.Objects[0].Object.ObjectID {
+		t.Fatalf("paged recovery report = first %+v, second %+v", first, second)
+	}
+	if _, err := store.RecoveryExecutionReportPage(ctx, "node-1", 7, "generation-1", 0, 1, 2); err == nil {
+		t.Fatal("recovery page accepted an object larger than its byte bound")
+	}
 }
 
 func assertBuildRecoveryStates(t *testing.T, store *Store, want map[string]types.BuildState) {

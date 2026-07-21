@@ -205,6 +205,9 @@ func (c ConsensusRegistryConfig) Validate() error {
 	if c.Member.ID == "" || c.Member.Listen == "" || !c.Member.TLS.Enabled() || c.Member.TLS.CA == "" {
 		return errors.New("clustercfg: Registry member ID, listen address, and mTLS are required")
 	}
+	if filepath.IsAbs(c.Member.Listen) {
+		return errors.New("clustercfg: certificate-authenticated Registry listener must use TCP")
+	}
 	if err := c.RegistryLayout.Validate(); err != nil {
 		return err
 	}
@@ -371,6 +374,9 @@ func LoadFinalPlacer(path string) (*FinalPlacerConfig, error) {
 func (c FinalPlacerConfig) Validate() error {
 	if c.Placer.ID == "" || c.Placer.Listen == "" || !c.Placer.TLS.Enabled() || c.Placer.TLS.CA == "" {
 		return errors.New("clustercfg: Placer ID, listen address, and mTLS are required")
+	}
+	if filepath.IsAbs(c.Placer.Listen) {
+		return errors.New("clustercfg: certificate-authenticated Placer listener must use TCP")
 	}
 	if len(c.GroupSources) == 0 {
 		return errors.New("clustercfg: Placer requires at least one group source")

@@ -407,6 +407,44 @@ func TestRegistryLayoutGuardRejectsRetainedReplicaEndpointChange(t *testing.T) {
 	}
 }
 
+func TestRegistryLayoutGuardRejectsEndpointChangeForReusedMemberWithoutReplicas(t *testing.T) {
+	first := testRegistryLayout(2, "generation-reused-member")
+	firstDigest, err := first.Digest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	accepted, err := FirstAcceptedRegistryLayout(first, firstDigest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	next := cloneRegistryLayout(first)
+	next.RegistryLayoutVersion = 2
+	next.PreviousRegistryLayoutVersion = 1
+	next.PreviousRegistryLayoutDigest = firstDigest
+	next.Members = append(next.Members, RegistryMember{
+		MemberID: "registry-d", InternalEndpoint: "https://registry-d:9443", RaftEndpoint: "registry-d:63001",
+	})
+	next.Members[2].RaftEndpoint = "registry-c-moved:63001"
+	replace := func(replicas []ReplicaPlacement) {
+		for index := range replicas {
+			if replicas[index].MemberID == "registry-c" {
+				replicas[index] = ReplicaPlacement{MemberID: "registry-d", ReplicaID: 4}
+			}
+		}
+	}
+	replace(next.SystemReplicas)
+	for index := range next.DataShards {
+		replace(next.DataShards[index].Replicas)
+	}
+	nextDigest, err := next.Digest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := accepted.Accept(next, nextDigest); err == nil {
+		t.Fatal("reused member changed its process-wide Raft endpoint after moving all replicas")
+	}
+}
+
 func TestRegistryLayoutGuardRejectsNewReplicaIDOnOccupiedTarget(t *testing.T) {
 	first := testRegistryLayout(2, "generation-1")
 	firstDigest, _ := first.Digest()

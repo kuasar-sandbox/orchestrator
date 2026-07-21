@@ -292,6 +292,44 @@ func TestRuntimeRejectsTerminalMutationWhenTrustedSourceDisagrees(t *testing.T) 
 	}
 }
 
+func TestRuntimeAllowsOnlyPlacementFailureFenceThroughGenericMutation(t *testing.T) {
+	registryLayout := testRegistryLayout(1, "generation-placement-fence")
+	identity := routeShardIdentity(t, registryLayout, "/g", "rk-placement-fence")
+	state := initializeDataShard(t, registryLayout, identity)
+	starting := routeStarting(t, registryLayout, "/g", "rk-placement-fence", "sandbox-abandoned", 1, false)
+	failure := clusterstate.RoutePlacementFailureState{
+		SandboxID: starting.Starting.SandboxID, PlacementRound: starting.Starting.PlacementRound,
+		CandidatePool:        append([]clusterstate.PlacementCandidate(nil), starting.Starting.CandidatePool...),
+		DefinitivelyRejected: []uint32{0, 1}, Intent: starting.Starting.Intent,
+		Reason: "placement candidate pool exhausted",
+	}
+	tombstone := withRevision(clusterstate.RouteWorkflowRecord{
+		Group: starting.Group, RouteKey: starting.RouteKey, State: clusterstate.WorkflowRouteTombstone,
+		Tombstone: &clusterstate.RouteTombstoneState{PlacementFailure: &failure},
+	}, state, 2)
+	state.Routes[routeMapKey(tombstone.Group, tombstone.RouteKey)] = tombstone
+	state.LastApplied = 2
+	fence, err := clusterstate.NewPlacementFailureFence(
+		tombstone.Group, tombstone.RouteKey, registryLayout.RegistryGeneration, failure,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := runtimeWithDataState(t, registryLayout, identity, &state)
+	result, err := runtime.ApplyData(context.Background(), DataCommand{
+		Type: DataPutFence, Identity: identity, Expect: RevisionExpectation{Absent: true}, Fence: &fence,
+	})
+	if err != nil || !result.Applied || len(state.Fences) != 1 {
+		t.Fatalf("placement-failure fence = %+v, %v", result, err)
+	}
+	fence.PlacementFailure = nil
+	if _, err := runtime.ApplyData(context.Background(), DataCommand{
+		Type: DataPutFence, Identity: identity, Expect: RevisionExpectation{Absent: true}, Fence: &fence,
+	}); err == nil {
+		t.Fatal("execution-backed fence bypassed the dedicated proof workflow")
+	}
+}
+
 func runtimeWithDataState(
 	t *testing.T,
 	registryLayout RegistryLayout,

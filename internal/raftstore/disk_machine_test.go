@@ -5,9 +5,11 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"testing"
 
+	"github.com/cockroachdb/pebble"
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/routeapi"
 	sm "github.com/lni/dragonboat/v4/statemachine"
@@ -61,6 +63,69 @@ func TestPendingDiskScanSeeksFromQualifiedCursor(t *testing.T) {
 	want = stateRowKey(prefix, stateRouteTable, "route-key")
 	if !scan || !bytes.Equal(lower, want) {
 		t.Fatalf("Route lower bound = %q scan=%t, want %q", lower, scan, want)
+	}
+}
+
+func TestRouteBucketDiskPageDoesNotDecodeRowsBeforeCursor(t *testing.T) {
+	engine, err := OpenPebbleStateEngine(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close()
+	registryLayout := testRegistryLayout(4, "generation-route-page-seek")
+	group := "/group"
+	firstKey := routeKeyForBucket(t, registryLayout, group, 0, "first")
+	secondKey := routeKeyForBucket(t, registryLayout, group, 0, "second")
+	thirdKey := routeKeyForBucket(t, registryLayout, group, 0, "third")
+	fourthKey := routeKeyForBucket(t, registryLayout, group, 0, "fourth")
+	keys := []string{firstKey, secondKey, thirdKey, fourthKey}
+	sort.Strings(keys)
+	identity := routeShardIdentity(t, registryLayout, group, keys[0])
+	shardID := DataRaftShardID(identity.ShardID)
+	machine := engine.NewStateMachine(shardID, 1)
+	if _, err := machine.Open(make(chan struct{})); err != nil {
+		t.Fatal(err)
+	}
+	defer machine.Close()
+	bootstrap, err := NewDataShardBootstrap(registryLayout, identity.ShardID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyDiskData(t, machine, 1, DataCommand{
+		Type: DataInitializeShard, Identity: identity, Bootstrap: &bootstrap, ReplicaIDs: bootstrap.ReplicaIDs,
+	})
+	index := uint64(2)
+	for position, routeKey := range keys {
+		starting := routeStarting(t, registryLayout, group, routeKey, fmt.Sprintf("sandbox-%d", position), 1, true)
+		applyDiskData(t, machine, index, DataCommand{
+			Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{Absent: true}, Route: &starting,
+		})
+		ready := readyRecord(starting, 1)
+		applyDiskData(t, machine, index+1, DataCommand{
+			Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{LogIndex: index}, Route: &ready,
+		})
+		index += 2
+	}
+	prefix := stateSlotPrefix(shardID, 1, 1)
+	if err := engine.db.Set(
+		stateRowKey(prefix, stateRouteTable, routeMapKey(group, keys[0])), []byte("{"), pebble.Sync,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := engine.db.Set(
+		stateRowKey(prefix, stateRouteTable, routeMapKey(group, keys[3])), []byte("{"), pebble.Sync,
+	); err != nil {
+		t.Fatal(err)
+	}
+	value, err := machine.Lookup(DataLookup{RouteBucket: &RouteBucketLookup{
+		Identity: identity, Group: group, Bucket: 0, AfterRouteKey: keys[0], Limit: 1,
+	}})
+	if err != nil {
+		t.Fatalf("page decoded a row outside the bounded cursor window: %v", err)
+	}
+	page := value.(DataLookupResult).RouteBucket
+	if page == nil || len(page.Routes) != 1 || page.Routes[0].RouteKey != keys[1] {
+		t.Fatalf("second Route page = %+v", page)
 	}
 }
 
@@ -376,7 +441,7 @@ func TestPebbleSnapshotRecoverySpansMultipleSyncedBatches(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	largeSpec.Config = map[string]string{"padding": strings.Repeat("x", clusterstate.MaxDispatchSpecBytes-1024)}
+	largeSpec.RequestedConfig = map[string]string{"padding": strings.Repeat("x", clusterstate.MaxDispatchSpecBytes-1024)}
 	encodedSpec, err := clusterstate.MarshalSandboxDispatchSpec(largeSpec)
 	if err != nil {
 		t.Fatal(err)

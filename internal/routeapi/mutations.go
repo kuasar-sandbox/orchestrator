@@ -78,8 +78,8 @@ type SandboxInput struct {
 }
 
 func (i SandboxInput) Validate() error {
-	if i.TimeoutSeconds < 0 {
-		return errors.New("routeapi: Sandbox timeout cannot be negative")
+	if i.TimeoutSeconds < 0 || int64(i.TimeoutSeconds) > clusterstate.MaxSandboxTimeoutSeconds {
+		return errors.New("routeapi: Sandbox timeout is outside the supported duration range")
 	}
 	if err := i.Request.Validate(); err != nil {
 		return fmt.Errorf("routeapi: invalid Sandbox node request: %w", err)
@@ -192,6 +192,12 @@ func (i BuildInput) Validate() error {
 	}
 	if err := i.Request.Validate(); err != nil {
 		return fmt.Errorf("routeapi: invalid Build node request: %w", err)
+	}
+	maximum := ^uint64(0)
+	if uint64(i.CPUCount) > maximum/1000 || uint64(i.MemoryMB) > maximum/(1<<20) ||
+		i.Demand.Slots != 1 || i.Demand.CPU != uint64(i.CPUCount)*1000 ||
+		i.Demand.Memory != uint64(i.MemoryMB)*(1<<20) {
+		return errors.New("routeapi: Build admission demand does not match its immutable CPU/memory ceilings")
 	}
 	_, err := placement.NormalizeBuildDemand(i.Demand)
 	return err

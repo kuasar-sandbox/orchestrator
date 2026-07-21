@@ -395,6 +395,7 @@ WHERE object_kind=? AND node_id=? AND node_epoch=? AND admission_state=? ORDER B
 		return nil, err
 	}
 	promoted := make([]*nodeexec.WorkflowRecord, 0, len(ids))
+	terminalized := false
 	for _, id := range ids {
 		record, err := getNodeWorkflowTx(ctx, tx, clusterstate.ExecutionKindBuild, id)
 		if err != nil {
@@ -419,6 +420,7 @@ WHERE object_kind=? AND node_id=? AND node_epoch=? AND admission_state=? ORDER B
 			record.AdmissionState = nodeexec.AdmissionTerminal
 			record.ResourceClaimed = false
 			record.ObjectState = update.State
+			terminalized = true
 			if err := updateNodeWorkflowTx(ctx, tx, record); err != nil {
 				return nil, err
 			}
@@ -437,6 +439,9 @@ WHERE object_kind=? AND node_id=? AND node_epoch=? AND admission_state=? ORDER B
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, err
+	}
+	if terminalized {
+		s.notifyWorkflow()
 	}
 	return promoted, nil
 }
@@ -514,6 +519,9 @@ WHERE object_kind=? AND node_id=? AND node_epoch=? AND admission_state=? ORDER B
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, err
+	}
+	if len(failed) > 0 {
+		s.notifyWorkflow()
 	}
 	return failed, nil
 }

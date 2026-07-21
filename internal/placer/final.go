@@ -221,18 +221,18 @@ func (s *FinalService) Plan(ctx context.Context, request PlanRequest) (PlanRespo
 	if request.Group == "" || len(request.Nodes) == 0 {
 		return PlanResponse{}, errors.New("placer: group and Node Catalog are required")
 	}
-	group, found, err := s.provider.Get(ctx, request.Group)
+	record, found, err := s.provider.GetRecord(ctx, request.Group)
 	if err != nil {
 		return PlanResponse{}, err
 	}
-	if !found {
+	if !found || record.Group != request.Group {
 		return PlanResponse{}, errors.New("placer: group is not present in Provider")
 	}
-	hint, _, err := s.provider.GetPlacementHint(ctx, request.Group)
-	if err != nil {
-		return PlanResponse{}, err
+	group := groupRecordToGroup(record)
+	hint := clusterstate.PlacementHint{
+		NodeSelectors: cloneSelectors(record.NodeSelectors), ShuffleLabels: cloneStringMap(record.ShuffleLabels),
 	}
-	keyLease, err := ResolveNodeKeyLease(ctx, s.provider, request.Group, time.Now().Add(DefaultNodeKeyLeaseTTL).Unix())
+	keyLease, err := nodeKeyLeaseFromRecord(record, time.Now().Add(DefaultNodeKeyLeaseTTL).Unix())
 	if err != nil {
 		return PlanResponse{}, err
 	}
@@ -247,6 +247,9 @@ func (s *FinalService) Plan(ctx context.Context, request PlanRequest) (PlanRespo
 		policy.RequiredCapabilities = []string{"build"}
 	}
 	if selectors, ok := effectiveCatalogSelectors(request.Group, request.Nodes, hint.NodeSelectors, s.config.ShuffleSharding); ok {
+		if len(selectors) == 0 {
+			return PlanResponse{}, errors.New("placer: applicable shuffle-sharding rule has no eligible shard values")
+		}
 		policy.Selectors = selectors
 	}
 	version, err := providerPolicyDigest(
@@ -432,11 +435,13 @@ func effectiveCatalogSelectors(
 			continue
 		}
 		result := make([]map[string]string, 0)
+		applicable := false
 		for baseIndex, selector := range base {
 			predicate, compatible := mergeCatalogSelector(selector, rule.Selector)
 			if !compatible {
 				continue
 			}
+			applicable = true
 			seen := make(map[string]struct{})
 			values := make([]string, 0)
 			for _, node := range nodes {
@@ -471,6 +476,9 @@ func effectiveCatalogSelectors(
 		}
 		if len(result) != 0 {
 			return result, true
+		}
+		if applicable {
+			return nil, true
 		}
 	}
 	return nil, false

@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -28,12 +29,18 @@ const (
 	sessionCommandPath  = "/internal/session-holder/command"
 	sessionRecoveryPath = "/internal/session-holder/recovery-command"
 	maximumSessionRPC   = 1 << 20
+	sessionSnapshotPage = 256
 )
 
 type SessionPeer struct {
 	MemberID string
 	Endpoint string
 	Client   *http.Client
+}
+
+type sessionSnapshotResponse struct {
+	Records    []session.DirectoryRecord `json:"records"`
+	NextNodeID string                    `json:"next_node_id,omitempty"`
 }
 
 type SessionMesh struct {
@@ -408,7 +415,13 @@ func (m *SessionMesh) serveSnapshot(w http.ResponseWriter, request *http.Request
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	writeSessionJSON(w, http.StatusOK, m.directory.Snapshot())
+	records, next := m.directory.SnapshotPage(request.URL.Query().Get("after_node_id"), sessionSnapshotPage)
+	response, err := boundedSessionSnapshotResponse(records, next)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeSessionJSON(w, http.StatusOK, response)
 }
 
 func (m *SessionMesh) serveProbe(w http.ResponseWriter, request *http.Request) {
@@ -548,32 +561,101 @@ func (m *SessionMesh) pullSnapshots(ctx context.Context) {
 		peer := peer
 		attempt := m.healthSeq.Add(1)
 		go func() {
-			timeout, cancel := context.WithTimeout(ctx, time.Second)
-			defer cancel()
-			request, err := http.NewRequestWithContext(timeout, http.MethodGet, peer.Endpoint+sessionSnapshotPath, nil)
-			if err != nil {
-				m.recordPeerHealth(peer.MemberID, attempt, false)
-				return
+			afterNodeID := ""
+			for {
+				timeout, cancel := context.WithTimeout(ctx, time.Second)
+				endpoint := peer.Endpoint + sessionSnapshotPath
+				if afterNodeID != "" {
+					endpoint += "?after_node_id=" + url.QueryEscape(afterNodeID)
+				}
+				request, err := http.NewRequestWithContext(timeout, http.MethodGet, endpoint, nil)
+				if err != nil {
+					cancel()
+					m.recordPeerHealth(peer.MemberID, attempt, false)
+					return
+				}
+				response, err := peer.Client.Do(request)
+				if err != nil {
+					cancel()
+					m.recordPeerHealth(peer.MemberID, attempt, false)
+					return
+				}
+				var page sessionSnapshotResponse
+				if response.StatusCode == http.StatusOK {
+					err = decodeSessionJSON(response.Body, &page)
+				} else {
+					err = fmt.Errorf("Session snapshot returned %s", response.Status)
+				}
+				response.Body.Close()
+				cancel()
+				if err != nil || !validSessionSnapshotPage(page, afterNodeID) {
+					m.recordPeerHealth(peer.MemberID, attempt, false)
+					return
+				}
+				m.directory.MergeFull(page.Records)
+				if page.NextNodeID == "" {
+					break
+				}
+				afterNodeID = page.NextNodeID
 			}
-			response, err := peer.Client.Do(request)
-			if err != nil {
-				m.recordPeerHealth(peer.MemberID, attempt, false)
-				return
-			}
-			defer response.Body.Close()
-			if response.StatusCode != http.StatusOK {
-				m.recordPeerHealth(peer.MemberID, attempt, false)
-				return
-			}
-			var records []session.DirectoryRecord
-			if err := decodeSessionJSON(response.Body, &records); err != nil {
-				m.recordPeerHealth(peer.MemberID, attempt, false)
-				return
-			}
-			m.directory.MergeFull(records)
 			m.recordPeerHealth(peer.MemberID, attempt, true)
 		}()
 	}
+}
+
+func validSessionSnapshotPage(page sessionSnapshotResponse, afterNodeID string) bool {
+	if len(page.Records) > sessionSnapshotPage || page.NextNodeID != "" && len(page.Records) == 0 {
+		return false
+	}
+	previous := afterNodeID
+	for _, record := range page.Records {
+		if record.Entry.NodeID <= previous {
+			return false
+		}
+		previous = record.Entry.NodeID
+	}
+	if page.NextNodeID != "" && (len(page.Records) == 0 || page.NextNodeID != previous) {
+		return false
+	}
+	return true
+}
+
+func boundedSessionSnapshotResponse(
+	records []session.DirectoryRecord,
+	nextNodeID string,
+) (sessionSnapshotResponse, error) {
+	response := sessionSnapshotResponse{Records: records, NextNodeID: nextNodeID}
+	fits := func(candidate sessionSnapshotResponse) (bool, error) {
+		encoded, err := json.Marshal(candidate)
+		return len(encoded) <= maximumSessionRPC, err
+	}
+	if ok, err := fits(response); err != nil || ok {
+		return response, err
+	}
+
+	best := 0
+	for low, high := 1, len(records); low <= high; {
+		middle := low + (high-low)/2
+		candidate := sessionSnapshotResponse{
+			Records: records[:middle], NextNodeID: records[middle-1].Entry.NodeID,
+		}
+		ok, err := fits(candidate)
+		if err != nil {
+			return sessionSnapshotResponse{}, err
+		}
+		if ok {
+			best = middle
+			low = middle + 1
+		} else {
+			high = middle - 1
+		}
+	}
+	if best == 0 {
+		return sessionSnapshotResponse{}, errors.New("controlplane: one Session Directory record exceeds the RPC size limit")
+	}
+	return sessionSnapshotResponse{
+		Records: records[:best], NextNodeID: records[best-1].Entry.NodeID,
+	}, nil
 }
 
 type probeRPCRequest struct {

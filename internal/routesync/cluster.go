@@ -7,7 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"slices"
+	"hash"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/placementproto"
 )
@@ -218,23 +218,68 @@ func (p RecoveryReportPage) ValidateFor(request RecoveryReportRequest, nodeID st
 }
 
 func CanonicalRecoveryReportDigest(objects []RecoveryExecutionFact) (string, error) {
-	if !slices.IsSortedFunc(objects, compareRecoveryFacts) {
-		return "", errors.New("routesync: recovery report is not ordered")
-	}
+	digester := NewRecoveryReportDigester()
 	for index := range objects {
-		if err := objects[index].Validate(); err != nil {
+		if _, err := digester.Add(objects[index]); err != nil {
 			return "", fmt.Errorf("routesync: recovery report object %d: %w", index, err)
 		}
-		if index > 0 && compareRecoveryFacts(objects[index-1], objects[index]) == 0 {
-			return "", errors.New("routesync: duplicate recovery report object")
+	}
+	digest, _, err := digester.Finish()
+	return digest, err
+}
+
+// RecoveryReportDigester hashes the canonical JSON array incrementally so a
+// node can prove one transactionally consistent report without retaining every
+// dispatch specification in memory.
+type RecoveryReportDigester struct {
+	hash         hash.Hash
+	count        uint64
+	previousKind string
+	previousID   string
+	finished     bool
+}
+
+func NewRecoveryReportDigester() *RecoveryReportDigester {
+	d := &RecoveryReportDigester{hash: sha256.New()}
+	_, _ = d.hash.Write([]byte{'['})
+	return d
+}
+
+func (d *RecoveryReportDigester) Add(object RecoveryExecutionFact) ([]byte, error) {
+	if d == nil || d.hash == nil || d.finished {
+		return nil, errors.New("routesync: recovery report digester is closed")
+	}
+	if err := object.Validate(); err != nil {
+		return nil, err
+	}
+	if d.count != 0 {
+		previous := RecoveryExecutionFact{Object: RecoveryObjectSnapshot{
+			ObjectKind: d.previousKind, ObjectID: d.previousID,
+		}}
+		if compareRecoveryFacts(previous, object) >= 0 {
+			return nil, errors.New("routesync: recovery report is not strictly ordered")
 		}
 	}
-	encoded, err := json.Marshal(objects)
+	encoded, err := json.Marshal(object)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	digest := sha256.Sum256(encoded)
-	return hex.EncodeToString(digest[:]), nil
+	if d.count != 0 {
+		_, _ = d.hash.Write([]byte{','})
+	}
+	_, _ = d.hash.Write(encoded)
+	d.previousKind, d.previousID = object.Object.ObjectKind, object.Object.ObjectID
+	d.count++
+	return encoded, nil
+}
+
+func (d *RecoveryReportDigester) Finish() (string, uint64, error) {
+	if d == nil || d.hash == nil || d.finished {
+		return "", 0, errors.New("routesync: recovery report digester is closed")
+	}
+	_, _ = d.hash.Write([]byte{']'})
+	d.finished = true
+	return hex.EncodeToString(d.hash.Sum(nil)), d.count, nil
 }
 
 func compareRecoveryFacts(left, right RecoveryExecutionFact) int {

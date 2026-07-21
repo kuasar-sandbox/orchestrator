@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"sort"
 
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/nodeexec"
@@ -23,50 +22,137 @@ func (s *Store) RecoveryExecutionReport(
 	nodeEpoch uint64,
 	sourceGeneration string,
 ) ([]routesync.RecoveryExecutionFact, error) {
-	if nodeID == "" || nodeEpoch == 0 || sourceGeneration == "" {
-		return nil, errors.New("store: complete recovery report identity is required")
-	}
-	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true, Isolation: sql.LevelSerializable})
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback()
-	rows, err := tx.QueryContext(ctx, `SELECT `+workflowColumns+` FROM node_workflows
-WHERE node_id=? AND node_epoch=? ORDER BY object_kind,object_id`, nodeID, encodeUint64(nodeEpoch))
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
 	facts := make([]routesync.RecoveryExecutionFact, 0)
-	for rows.Next() {
-		record, err := scanNodeWorkflow(rows)
-		if err != nil {
-			return nil, err
-		}
-		fact, eligible, err := s.recoveryFactTx(ctx, tx, record, sourceGeneration)
-		if err != nil {
-			return nil, fmt.Errorf("store: recovery report %s/%s: %w", executionKindName(record.Kind), record.ObjectID, err)
-		}
-		if eligible {
+	err := s.scanRecoveryExecutionReport(ctx, nodeID, nodeEpoch, sourceGeneration,
+		func(fact routesync.RecoveryExecutionFact) error {
 			facts = append(facts, fact)
-		}
-	}
-	if err := rows.Err(); err != nil {
+			return nil
+		})
+	if err != nil {
 		return nil, err
 	}
-	if err := tx.Commit(); err != nil {
-		return nil, err
-	}
-	sort.Slice(facts, func(i, j int) bool {
-		if facts[i].Object.ObjectKind != facts[j].Object.ObjectKind {
-			return facts[i].Object.ObjectKind < facts[j].Object.ObjectKind
-		}
-		return facts[i].Object.ObjectID < facts[j].Object.ObjectID
-	})
 	if _, err := routesync.CanonicalRecoveryReportDigest(facts); err != nil {
 		return nil, err
 	}
 	return facts, nil
+}
+
+type RecoveryExecutionPage struct {
+	Objects      []routesync.RecoveryExecutionFact
+	ReportDigest string
+	TotalObjects uint64
+	NextOffset   uint64
+}
+
+// RecoveryExecutionReportPage scans one serializable snapshot, hashes the
+// complete canonical report incrementally, and retains only the requested
+// bounded page.
+func (s *Store) RecoveryExecutionReportPage(
+	ctx context.Context,
+	nodeID string,
+	nodeEpoch uint64,
+	sourceGeneration string,
+	offset uint64,
+	limit uint32,
+	maxBytes uint32,
+) (RecoveryExecutionPage, error) {
+	if limit == 0 || maxBytes < 2 {
+		return RecoveryExecutionPage{}, errors.New("store: recovery report page bounds are invalid")
+	}
+	page := RecoveryExecutionPage{Objects: make([]routesync.RecoveryExecutionFact, 0, limit)}
+	digester := routesync.NewRecoveryReportDigester()
+	pageBytes := uint64(2)
+	seen := uint64(0)
+	pageFull := false
+	objectTooLarge := false
+	err := s.scanRecoveryExecutionReport(ctx, nodeID, nodeEpoch, sourceGeneration,
+		func(fact routesync.RecoveryExecutionFact) error {
+			encoded, err := digester.Add(fact)
+			if err != nil {
+				return err
+			}
+			index := seen
+			seen++
+			if index < offset || pageFull || uint32(len(page.Objects)) == limit {
+				return nil
+			}
+			additional := uint64(len(encoded))
+			if len(page.Objects) != 0 {
+				additional++
+			}
+			if pageBytes+additional > uint64(maxBytes) {
+				pageFull = true
+				objectTooLarge = len(page.Objects) == 0
+				return nil
+			}
+			page.Objects = append(page.Objects, fact)
+			pageBytes += additional
+			return nil
+		})
+	if err != nil {
+		return RecoveryExecutionPage{}, err
+	}
+	digest, total, err := digester.Finish()
+	if err != nil {
+		return RecoveryExecutionPage{}, err
+	}
+	if total != seen {
+		return RecoveryExecutionPage{}, errors.New("store: recovery report digest count mismatch")
+	}
+	if offset > total {
+		return RecoveryExecutionPage{}, errors.New("store: recovery report offset is beyond the snapshot")
+	}
+	if objectTooLarge && offset < total {
+		return RecoveryExecutionPage{}, errors.New("store: one recovery report object exceeds the requested page byte limit")
+	}
+	page.ReportDigest = digest
+	page.TotalObjects = total
+	page.NextOffset = offset + uint64(len(page.Objects))
+	return page, nil
+}
+
+func (s *Store) scanRecoveryExecutionReport(
+	ctx context.Context,
+	nodeID string,
+	nodeEpoch uint64,
+	sourceGeneration string,
+	visit func(routesync.RecoveryExecutionFact) error,
+) error {
+	if nodeID == "" || nodeEpoch == 0 || sourceGeneration == "" || visit == nil {
+		return errors.New("store: complete recovery report identity and visitor are required")
+	}
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true, Isolation: sql.LevelSerializable})
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	rows, err := tx.QueryContext(ctx, `SELECT `+workflowColumns+` FROM node_workflows
+WHERE node_id=? AND node_epoch=?
+ORDER BY CASE object_kind WHEN ? THEN 0 WHEN ? THEN 1 ELSE 2 END,object_id`,
+		nodeID, encodeUint64(nodeEpoch), clusterstate.ExecutionKindBuild, clusterstate.ExecutionKindSandbox)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		record, err := scanNodeWorkflow(rows)
+		if err != nil {
+			return err
+		}
+		fact, eligible, err := s.recoveryFactTx(ctx, tx, record, sourceGeneration)
+		if err != nil {
+			return fmt.Errorf("store: recovery report %s/%s: %w", executionKindName(record.Kind), record.ObjectID, err)
+		}
+		if eligible {
+			if err := visit(fact); err != nil {
+				return err
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *Store) RecoveryExecutionFact(

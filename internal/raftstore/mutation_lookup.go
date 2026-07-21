@@ -55,6 +55,9 @@ func LookupDataMutation(state DataState, query DataMutationLookup) (DataMutation
 			return DataMutationStatus{}, nil
 		}
 		wanted := cloneRouteRecord(*command.Route)
+		if wanted.Finalizations == nil {
+			wanted.Finalizations = cloneWorkflowFinalizations(current.Finalizations)
+		}
 		wanted.Revision = current.Revision
 		normalizeRouteRevision(&wanted)
 		return DataMutationStatus{Committed: reflect.DeepEqual(current, wanted), Revision: current.Revision.LogIndex}, nil
@@ -64,6 +67,9 @@ func LookupDataMutation(state DataState, query DataMutationLookup) (DataMutation
 			return DataMutationStatus{}, nil
 		}
 		wanted := cloneBuildRecord(*command.Build)
+		if wanted.Finalizations == nil {
+			wanted.Finalizations = cloneWorkflowFinalizations(current.Finalizations)
+		}
 		wanted.Revision = current.Revision
 		return DataMutationStatus{Committed: reflect.DeepEqual(current, wanted), Revision: current.Revision.LogIndex}, nil
 	default:

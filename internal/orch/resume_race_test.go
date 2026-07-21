@@ -17,6 +17,7 @@ import (
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/launcher"
+	"github.com/kuasar-sandbox/orchestrator/internal/nodectl"
 	"github.com/kuasar-sandbox/orchestrator/internal/nodeexec"
 	"github.com/kuasar-sandbox/orchestrator/internal/placement"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxy"
@@ -29,15 +30,28 @@ import (
 
 // countingLauncher records how many times a unit was started — the launch count.
 type countingLauncher struct {
-	starts       atomic.Int64
-	orch         *Orchestrator
-	startEntered chan struct{}
-	startRelease <-chan struct{}
-	startOnce    sync.Once
+	starts                atomic.Int64
+	orch                  *Orchestrator
+	startEntered          chan struct{}
+	startRelease          <-chan struct{}
+	startOnce             sync.Once
+	blockBeforeAssignment bool
 }
 
 func (l *countingLauncher) Start(ctx context.Context, unit string) error {
 	l.starts.Add(1)
+	if l.blockBeforeAssignment {
+		if l.startEntered != nil {
+			l.startOnce.Do(func() { close(l.startEntered) })
+		}
+		if l.startRelease != nil {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-l.startRelease:
+			}
+		}
+	}
 	if l.orch != nil {
 		prefix := strings.TrimSuffix(l.orch.cfg.Units.Runner, ".service")
 		if strings.HasPrefix(unit, prefix) {
@@ -47,10 +61,10 @@ func (l *countingLauncher) Start(ctx context.Context, unit string) error {
 			go func() { _, _, _ = l.orch.WaitAssignment(context.Background(), runKindSandbox, runID) }()
 		}
 	}
-	if l.startEntered != nil {
+	if l.startEntered != nil && !l.blockBeforeAssignment {
 		l.startOnce.Do(func() { close(l.startEntered) })
 	}
-	if l.startRelease != nil {
+	if l.startRelease != nil && !l.blockBeforeAssignment {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -75,6 +89,28 @@ func (stubVS) Attach(context.Context, vswitch.AttachReq) (*vswitch.Port, error) 
 }
 func (stubVS) Detach(context.Context, string) error { return nil }
 func (stubVS) TapFD(port string) vswitch.TapFD      { return vswitch.TapFD{Exec: []string{"true", port}} }
+
+type releaseAdmissionFake struct{ wake chan struct{} }
+
+func (f *releaseAdmissionFake) GetAdmission(id, digest string) (nodectl.PreparedAdmissionResult, error) {
+	return nodectl.PreparedAdmissionResult{SandboxID: id, DemandDigest: digest, State: nodectl.PreparedClaimed}, nil
+}
+func (f *releaseAdmissionFake) PrepareAdmission(id, digest string, _ nodectl.SandboxAdmissionDemand) (nodectl.PreparedAdmissionResult, error) {
+	return f.GetAdmission(id, digest)
+}
+func (f *releaseAdmissionFake) ClaimAdmission(id, digest string) (nodectl.PreparedAdmissionResult, error) {
+	return f.GetAdmission(id, digest)
+}
+func (*releaseAdmissionFake) ReleaseAdmission(id, digest, reason string) (nodectl.PreparedAdmissionResult, error) {
+	return nodectl.PreparedAdmissionResult{
+		SandboxID: id, DemandDigest: digest, State: nodectl.PreparedReleased, Reason: reason,
+	}, nil
+}
+func (*releaseAdmissionFake) FinalizeAdmission(string, string) error { return nil }
+func (*releaseAdmissionFake) PromoteQueued() ([]nodectl.PreparedAdmissionResult, error) {
+	return nil, nil
+}
+func (f *releaseAdmissionFake) Wake() <-chan struct{} { return f.wake }
 
 // TestResumeRace_ConnectAndRouteSingleLaunch is the regression guard for the
 // control-plane resume race: a paused sandbox hit concurrently by /connect
@@ -174,7 +210,7 @@ func TestResumeRace_RegistryRetriesShareDataPlaneSingleFlight(t *testing.T) {
 	cfg.Sandbox.Network.Bare.InnerIP = "169.254.1.1/31"
 	startEntered := make(chan struct{})
 	startRelease := make(chan struct{})
-	lc := &countingLauncher{startEntered: startEntered, startRelease: startRelease}
+	lc := &countingLauncher{startEntered: startEntered, startRelease: startRelease, blockBeforeAssignment: true}
 	o := New(cfg, st, lc, stubVS{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	lc.orch = o
 	ctx, cancel := context.WithCancel(context.Background())
@@ -241,6 +277,110 @@ func TestResumeRace_RegistryRetriesShareDataPlaneSingleFlight(t *testing.T) {
 	}
 }
 
+func TestResumeRace_RegistryDeleteWaitsForInFlightResume(t *testing.T) {
+	box, err := secretbox.NewFromColonHex(strings.Repeat("0", 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.Open(filepath.Join(t.TempDir(), "t.db"), box)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	cfg := &config.Config{}
+	cfg.Paths.RunRoot = filepath.Join(t.TempDir(), "run")
+	cfg.Paths.BaseRoot = filepath.Join(t.TempDir(), "lib")
+	cfg.Sandbox.Network.Bare.InnerIP = "169.254.1.1/31"
+	startEntered := make(chan struct{})
+	startRelease := make(chan struct{})
+	lc := &countingLauncher{startEntered: startEntered, startRelease: startRelease, blockBeforeAssignment: true}
+	o := New(cfg, st, lc, stubVS{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	lc.orch = o
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	if err := o.StartRunPools(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	sid := "sbx-cluster-delete-race"
+	templateRef := "bare-img-" + strings.Repeat("b", 64)
+	dispatch := clusterResumeDispatch(t, sid, templateRef)
+	sandbox := &types.Sandbox{
+		ID: sid, TemplateID: templateRef, State: types.StatePaused,
+		AuthKey: strings.Repeat("a", 64), ManifestKey: strings.Repeat("b", 64),
+		RunDir: cfg.Paths.RunRoot + "/" + sid, BaseDir: cfg.Paths.BaseRoot + "/" + sid,
+		CreatedUnix: 1,
+	}
+	if _, err := st.RecordSandboxWorkflow(ctx, dispatch, nodeexec.AdmissionDecision{
+		State: nodeexec.AdmissionAdmitted, Result: clusterstate.DispatchAcceptedAdmitted,
+		ReservationToken: "reservation-1",
+	}, sandbox); err != nil {
+		t.Fatal(err)
+	}
+	stored, _ := st.Get(ctx, sid)
+	if _, err := st.CommitSandboxEvent(ctx, stored, nodeexec.EventUpdate{
+		State: string(clusterstate.WorkflowRouteReady), TargetPort: 49983,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	stored, _ = st.Get(ctx, sid)
+	if _, err := st.CommitSandboxEvent(ctx, stored, nodeexec.EventUpdate{
+		State: string(clusterstate.WorkflowRoutePaused), TargetPort: 49983,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	authority, err := nodeexec.NewAuthority(
+		st, &releaseAdmissionFake{wake: make(chan struct{})},
+		func(context.Context) (nodeexec.LocalSessionIdentity, error) {
+			return nodeexec.LocalSessionIdentity{NodeID: "node-1", NodeEpoch: 7, SessionSeq: 1, DataEndpoint: "node-1:8443"}, nil
+		},
+		func(context.Context) (nodeexec.BuildCapacity, string, error) {
+			return nodeexec.BuildCapacity{Slots: 1, QueueLimit: 1}, "", nil
+		},
+		func(context.Context, nodeexec.DispatchRecord) (*types.Build, error) { return nil, nil },
+		func(context.Context, nodeexec.DispatchRecord) (*types.Sandbox, error) { return nil, nil },
+		func(context.Context, nodeexec.DispatchRecord) (nodectl.SandboxAdmissionDemand, error) {
+			return nodectl.SandboxAdmissionDemand{}, nil
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	node := &FinalClusterNode{
+		core: o, store: st, authority: authority,
+		log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	command := &routesync.Command{SID: sid}
+	resumeDone := make(chan struct{})
+	go func() { node.resumeSandbox(ctx, command); close(resumeDone) }()
+	select {
+	case <-startEntered:
+	case <-time.After(time.Second):
+		t.Fatal("resume did not reach launcher")
+	}
+	deleteDone := make(chan struct{})
+	go func() { node.deleteSandbox(ctx, command); close(deleteDone) }()
+	select {
+	case <-deleteDone:
+		t.Fatal("delete bypassed the in-flight resume lifecycle lock")
+	case <-time.After(25 * time.Millisecond):
+	}
+	close(startRelease)
+	<-resumeDone
+	<-deleteDone
+
+	stored, err = st.Get(ctx, sid)
+	if err != nil || stored == nil || stored.State != types.StateDead {
+		t.Fatalf("sandbox after serialized delete = %+v, %v", stored, err)
+	}
+	record, err := st.GetNodeWorkflow(ctx, clusterstate.ExecutionKindSandbox, sid)
+	if err != nil || record == nil || record.ObjectState != "DELETED" {
+		t.Fatalf("workflow after serialized delete = %+v, %v", record, err)
+	}
+}
+
 func clusterResumeDispatch(t *testing.T, sid, templateRef string) nodeexec.DispatchRecord {
 	t.Helper()
 	normalized, err := placement.NormalizeSandboxDemand(placement.SandboxDemand{
@@ -255,7 +395,7 @@ func clusterResumeDispatch(t *testing.T, sid, templateRef string) nodeexec.Dispa
 		AccessToken: "access-token", TargetPort: 49983,
 		Request: clusterstate.NodeRequestEnvelopeV1{
 			Version: clusterstate.NodeRequestEnvelopeVersionV1, Method: "POST", Path: "/sandboxes",
-			Body: []byte(`{"templateID":"` + templateRef + `"}`),
+			Body: []byte(`{"metadata":null,"templateID":"` + templateRef + `","timeout":0}`),
 		},
 	})
 	if err != nil {

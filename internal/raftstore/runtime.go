@@ -830,7 +830,9 @@ func (r *Runtime) ApplyData(ctx context.Context, command DataCommand) (DataApply
 		}
 	case DataPutBuild:
 	case DataPutFence:
-		return DataApplyResult{}, errors.New("raftstore: execution fence requires the dedicated proof workflow")
+		if command.Fence == nil || command.Fence.PlacementFailure == nil {
+			return DataApplyResult{}, errors.New("raftstore: execution fence requires the dedicated proof workflow")
+		}
 	default:
 		return DataApplyResult{}, errors.New("raftstore: unsupported data mutation command")
 	}

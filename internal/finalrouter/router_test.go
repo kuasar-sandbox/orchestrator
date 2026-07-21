@@ -231,6 +231,71 @@ func TestCreateExposesRouteKeyInsteadOfConcreteSandboxID(t *testing.T) {
 	}
 }
 
+func TestCreatePreservesEscapableRouteKeys(t *testing.T) {
+	for _, routeKey := range []string{"nested/route", "escaped%2Froute", "route key", "路由"} {
+		t.Run(routeKey, func(t *testing.T) {
+			control := &revisionControl{serveIdentity: routeapi.RegistryServeIdentity{
+				ClusterID: "cluster-1", RegistryGeneration: "generation-1", SystemEpoch: 1,
+				RegistryLayoutDigest: "registry-layout-1",
+			}, route: clusterstate.ReadyRoute{SandboxID: "sandbox-1", RegistryGeneration: "generation-1"}}
+			router, err := New(control, allowCaller{}, "example.test", time.Minute, slog.Default())
+			if err != nil {
+				t.Fatal(err)
+			}
+			request := httptest.NewRequest(http.MethodPost, "http://api.example.test/sandboxes", bytes.NewBufferString(`{}`))
+			request.Host = "api.example.test"
+			request.Header.Set(HeaderGroup, "/group")
+			request.Header.Set(HeaderRouteKey, routeKey)
+			response := httptest.NewRecorder()
+			router.Handler().ServeHTTP(response, request)
+			if response.Code != http.StatusCreated || control.reserveCalls != 1 {
+				t.Fatalf("create = %d calls=%d body=%s", response.Code, control.reserveCalls, response.Body.String())
+			}
+			var body map[string]any
+			if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil || body["routeKey"] != routeKey {
+				t.Fatalf("Route key changed: body=%+v err=%v", body, err)
+			}
+		})
+	}
+}
+
+func TestCreateRejectsUnaddressableRouteKeys(t *testing.T) {
+	for _, routeKey := range []string{".", "..", "bad\x00key", "bad\x7fkey", string([]byte{0xff})} {
+		t.Run(routeKey, func(t *testing.T) {
+			control := &revisionControl{serveIdentity: routeapi.RegistryServeIdentity{
+				ClusterID: "cluster-1", RegistryGeneration: "generation-1", SystemEpoch: 1,
+				RegistryLayoutDigest: "registry-layout-1",
+			}}
+			router, err := New(control, allowCaller{}, "example.test", time.Minute, slog.Default())
+			if err != nil {
+				t.Fatal(err)
+			}
+			request := httptest.NewRequest(http.MethodPost, "http://api.example.test/sandboxes", bytes.NewBufferString(`{}`))
+			request.Host = "api.example.test"
+			request.Header.Set(HeaderGroup, "/group")
+			request.Header[HeaderRouteKey] = []string{routeKey}
+			response := httptest.NewRecorder()
+			router.Handler().ServeHTTP(response, request)
+			if response.Code != http.StatusBadRequest || control.reserveCalls != 0 {
+				t.Fatalf("create = %d calls=%d body=%s", response.Code, control.reserveCalls, response.Body.String())
+			}
+		})
+	}
+}
+
+func TestEscapedRouteKeyPathRoundTrip(t *testing.T) {
+	routeKey, ok := escapedPathObjectID("/v2/sandboxes/user1%2Fsession1/connect", "/sandboxes/")
+	if !ok || routeKey != "user1/session1" {
+		t.Fatalf("decoded Route key = %q, %v", routeKey, ok)
+	}
+	escaped := rewritePathObjectID(
+		"/v2/sandboxes/user1%2Fsession1/connect", "/sandboxes/", "node-local-sandbox",
+	)
+	if escaped != "/v2/sandboxes/node-local-sandbox/connect" {
+		t.Fatalf("rewritten path = %q", escaped)
+	}
+}
+
 func TestConcurrentReserveRejectsDifferentImmutableInput(t *testing.T) {
 	serveIdentity := routeapi.RegistryServeIdentity{
 		ClusterID: "cluster-1", RegistryGeneration: "generation-1", SystemEpoch: 1,
@@ -372,6 +437,45 @@ func TestPendingBuildStatusUsesCommittedStartingProjection(t *testing.T) {
 	if response.Code != http.StatusOK || json.Unmarshal(response.Body.Bytes(), &body) != nil ||
 		body["status"] != "building" || body["buildID"] != "build-1" || body["templateID"] != "transient-build-1" {
 		t.Fatalf("pending Build status = %d %s", response.Code, response.Body.String())
+	}
+}
+
+func TestBuildLookupFailureReturnsUnavailable(t *testing.T) {
+	control := &revisionControl{serveIdentity: routeapi.RegistryServeIdentity{
+		ClusterID: "cluster-1", RegistryGeneration: "generation-1", SystemEpoch: 1,
+		RegistryLayoutDigest: "registry-layout-1",
+	}}
+	control.readBuild = func(context.Context, string, string, uint64) (routeclient.BuildReadResult, error) {
+		return routeclient.BuildReadResult{}, errors.New("Registry unavailable")
+	}
+	router, err := New(control, allowCaller{}, "example.test", time.Minute, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodGet,
+		"http://api.example.test/templates/transient-build-1/builds/build-1/status", nil)
+	request.Host = "api.example.test"
+	request.Header.Set(HeaderGroup, "/group")
+	response := httptest.NewRecorder()
+	router.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("Build lookup failure status = %d, body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestCheckedBuildDemandRejectsOverflow(t *testing.T) {
+	maximum := ^uint64(0)
+	maxCPU := int(maximum / 1000)
+	maxMemory := int(maximum / (1 << 20))
+	if demand, err := checkedBuildDemand(maxCPU, maxMemory); err != nil ||
+		demand.CPU != uint64(maxCPU)*1000 || demand.Memory != uint64(maxMemory)*(1<<20) {
+		t.Fatalf("maximum Build demand = %+v, %v", demand, err)
+	}
+	if _, err := checkedBuildDemand(maxCPU+1, 1); err == nil {
+		t.Fatal("overflowing CPU ceiling was accepted")
+	}
+	if _, err := checkedBuildDemand(1, maxMemory+1); err == nil {
+		t.Fatal("overflowing memory ceiling was accepted")
 	}
 }
 

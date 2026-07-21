@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync"
 	"testing"
@@ -63,6 +64,38 @@ func TestKeyLeaseExactIdentityExpiryAndRotation(t *testing.T) {
 	}
 	if count, err := st.PruneExpiredKeyLeases(ctx); err != nil || count != 1 {
 		t.Fatalf("PruneExpiredKeyLeases = %d, %v", count, err)
+	}
+}
+
+func TestKeyLeaseRefreshCannotShortenDurableExpiry(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	authKey := strings.Repeat("a", 64)
+	manifestKey := strings.Repeat("b", 64)
+	longer := time.Now().Add(2 * time.Hour).Unix()
+	lease := KeyLease{
+		Group: "/g", AuthKey: authKey, ManifestKey: manifestKey, ExpiresUnix: longer,
+	}
+	if _, err := st.PutKeyLease(ctx, lease); err != nil {
+		t.Fatal(err)
+	}
+	lease.ExpiresUnix = longer - int64(time.Hour/time.Second)
+	if _, err := st.PutKeyLease(ctx, lease); !errors.Is(err, ErrKeyLeaseExpiryRegression) {
+		t.Fatalf("shortening refresh error = %v", err)
+	}
+	authFP, _ := AuthKeyHash(authKey)
+	manifestFP, _ := ManifestKeyHash(manifestKey)
+	stored, found, err := st.KeyLeaseByFingerprints(ctx, "/g", authFP, manifestFP)
+	if err != nil || !found || stored.ExpiresUnix != longer {
+		t.Fatalf("durable lease = %+v found=%v err=%v", stored, found, err)
+	}
+	lease.ExpiresUnix = 0
+	if _, err := st.PutKeyLease(ctx, lease); err != nil {
+		t.Fatalf("permanent refresh: %v", err)
+	}
+	lease.ExpiresUnix = longer + int64(time.Hour/time.Second)
+	if _, err := st.PutKeyLease(ctx, lease); !errors.Is(err, ErrKeyLeaseExpiryRegression) {
+		t.Fatalf("permanent lease was shortened: %v", err)
 	}
 }
 

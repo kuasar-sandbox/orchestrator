@@ -658,7 +658,7 @@ func validateReplicaIDs(replicaIDs []uint64) error {
 	return nil
 }
 
-func routeMapKey(group, routeKey string) string { return lengthKey(group, routeKey) }
+func routeMapKey(group, routeKey string) string { return lengthKey(group) + routeKey }
 func buildMapKey(group, buildID string) string  { return lengthKey(group, buildID) }
 func fenceMapKey(group, routeKey, sandboxID string) string {
 	return lengthKey(group, routeKey, sandboxID)

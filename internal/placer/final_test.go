@@ -114,6 +114,17 @@ func TestFinalPlanDerivesSandboxDemandFromEffectiveGroupConfig(t *testing.T) {
 	}
 }
 
+func TestShuffleShardingFailsClosedWhenApplicableShardLabelIsAbsent(t *testing.T) {
+	selectors, applicable := effectiveCatalogSelectors("/group", []placement.CatalogNode{{
+		NodeID: "node-1", Labels: map[string]string{"pool": "gpu"},
+	}}, nil, []clustercfg.ShuffleRule{{
+		Selector: map[string]string{"pool": "gpu"}, ShardBy: "zone", N: 1,
+	}})
+	if !applicable || len(selectors) != 0 {
+		t.Fatalf("empty applicable shard = selectors=%v applicable=%v", selectors, applicable)
+	}
+}
+
 type testGroupAuthorizer struct {
 	keyLeaseProvider
 	called bool

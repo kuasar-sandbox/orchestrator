@@ -118,7 +118,7 @@ func TestDirectoryProberFailsClosedForMissingOrBadHolder(t *testing.T) {
 	results := prober.ProbePair(context.Background(), testServeIdentity(), []placement.PlacementProbeRequest{
 		probeRequest("n1"), probeRequest("missing"),
 	})
-	if results[0].Response.Class != placement.ProbeStale || results[1].Response.Class != placement.ProbeReject {
+	if results[0].Response.Class != placement.ProbeStale || results[1].Response.Class != placement.ProbeStale {
 		t.Fatalf("Probe results = %+v", results)
 	}
 }

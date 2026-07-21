@@ -2,7 +2,6 @@ package orch
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -514,43 +513,23 @@ func (n *FinalClusterNode) collectRecoveryReport(ctx context.Context, command *r
 	if command.NodeEpoch != local.NodeEpoch || command.SessionSeq != local.SessionSeq {
 		return nil, errors.New("recovery report command carries a stale node-link tuple")
 	}
-	objects, err := n.store.RecoveryExecutionReport(ctx, local.NodeID, local.NodeEpoch, request.SourceRegistryGeneration)
+	report, err := n.store.RecoveryExecutionReportPage(
+		ctx, local.NodeID, local.NodeEpoch, request.SourceRegistryGeneration,
+		request.Offset, request.Limit, request.MaxBytes,
+	)
 	if err != nil {
 		return nil, err
 	}
-	digest, err := routesync.CanonicalRecoveryReportDigest(objects)
-	if err != nil {
-		return nil, err
-	}
-	if request.ExpectedReportDigest != "" && request.ExpectedReportDigest != digest {
+	if request.ExpectedReportDigest != "" && request.ExpectedReportDigest != report.ReportDigest {
 		return nil, errors.New("durable recovery report changed between pages")
-	}
-	if request.Offset > uint64(len(objects)) {
-		return nil, errors.New("recovery report offset is beyond the snapshot")
-	}
-	end := min(request.Offset+uint64(request.Limit), uint64(len(objects)))
-	pageObjects := slices.Clone(objects[request.Offset:end])
-	for len(pageObjects) > 0 {
-		encoded, encodeErr := json.Marshal(pageObjects)
-		if encodeErr != nil {
-			return nil, encodeErr
-		}
-		if uint32(len(encoded)) <= request.MaxBytes {
-			break
-		}
-		pageObjects = pageObjects[:len(pageObjects)-1]
-		end--
-	}
-	if request.Offset < uint64(len(objects)) && len(pageObjects) == 0 {
-		return nil, errors.New("one recovery report object exceeds the requested page byte limit")
 	}
 	page := &routesync.RecoveryReportPage{
 		RecoveryEpoch: request.RecoveryEpoch, SourceClusterID: request.SourceClusterID,
 		SourceRegistryGeneration: request.SourceRegistryGeneration, SourceRegistryLayoutDigest: request.SourceRegistryLayoutDigest,
 		TargetRegistryGeneration: request.TargetRegistryGeneration, TargetRegistryLayoutDigest: request.TargetRegistryLayoutDigest,
 		NodeID: local.NodeID, NodeEpoch: local.NodeEpoch, SessionSeq: local.SessionSeq,
-		ReportDigest: digest, TotalObjects: uint64(len(objects)), Offset: request.Offset,
-		NextOffset: end, Complete: end == uint64(len(objects)), Objects: pageObjects,
+		ReportDigest: report.ReportDigest, TotalObjects: report.TotalObjects, Offset: request.Offset,
+		NextOffset: report.NextOffset, Complete: report.NextOffset == report.TotalObjects, Objects: report.Objects,
 	}
 	if err := page.ValidateFor(request, local.NodeID, local.NodeEpoch, local.SessionSeq); err != nil {
 		return nil, err
@@ -694,6 +673,11 @@ func (n *FinalClusterNode) sandboxObject(
 	if timeout <= 0 {
 		timeout = n.core.cfg.Sandbox.TimeoutSec
 	}
+	now := time.Now()
+	deadline, err := sandboxDeadline(now, timeout)
+	if err != nil {
+		return nil, err
+	}
 	sandbox := &types.Sandbox{
 		ID: record.ObjectID, TemplateID: spec.TemplateRef, State: types.StateStarting,
 		RunDir:  n.core.cfg.Paths.RunRoot + "/" + record.ObjectID,
@@ -701,14 +685,21 @@ func (n *FinalClusterNode) sandboxObject(
 		AuthKey: lease.AuthKey, ManifestKey: lease.ManifestKey,
 		EnvdAccessToken: spec.AccessToken, TrafficAccessToken: trafficToken,
 		Metadata: clusterstate.WithoutSystemMetadata(create.Metadata), Env: create.EnvVars,
-		CreatedUnix:  time.Now().Unix(),
-		DeadlineUnix: time.Now().Add(time.Duration(timeout) * time.Second).Unix(),
+		CreatedUnix:  now.Unix(),
+		DeadlineUnix: deadline,
 	}
 	if template.Profile == types.ProfileE2B {
 		sandbox.EnvdUDS = sandbox.RunDir + "/envd.sock"
 		sandbox.CiUDS = sandbox.RunDir + "/ci.sock"
 	}
 	return sandbox, nil
+}
+
+func sandboxDeadline(now time.Time, timeoutSeconds int) (int64, error) {
+	if timeoutSeconds <= 0 || int64(timeoutSeconds) > clusterstate.MaxSandboxTimeoutSeconds {
+		return 0, errors.New("Sandbox timeout is outside the supported duration range")
+	}
+	return now.Add(time.Duration(timeoutSeconds) * time.Second).Unix(), nil
 }
 
 func (n *FinalClusterNode) failSandbox(ctx context.Context, record *nodeexec.WorkflowRecord, sandbox *types.Sandbox, cause error) error {
@@ -759,7 +750,9 @@ func (n *FinalClusterNode) executeBuild(ctx context.Context, record *nodeexec.Wo
 
 func (n *FinalClusterNode) resumeSandbox(ctx context.Context, command *routesync.Command) {
 	err := n.core.sf.Do(command.SID, func() error {
-		return n.resumeSandboxSync(ctx, command)
+		return n.core.lifecycle.Do(command.SID, func() error {
+			return n.resumeSandboxSync(ctx, command)
+		})
 	})
 	if err != nil && ctx.Err() == nil {
 		n.log.Error("cluster Sandbox resume", "sandbox", command.SID, "err", err)
@@ -795,7 +788,10 @@ func (n *FinalClusterNode) resumeSandboxSync(ctx context.Context, command *route
 }
 
 func (n *FinalClusterNode) deleteSandbox(ctx context.Context, command *routesync.Command) {
-	if err := n.deleteSandboxSync(ctx, command); err != nil && ctx.Err() == nil {
+	err := n.core.lifecycle.Do(command.SID, func() error {
+		return n.deleteSandboxSync(ctx, command)
+	})
+	if err != nil && ctx.Err() == nil {
 		n.log.Error("cluster Sandbox delete", "sandbox", command.SID, "err", err)
 	}
 }

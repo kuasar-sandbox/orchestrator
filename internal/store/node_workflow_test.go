@@ -311,6 +311,11 @@ func TestBuildQueueTerminalizesImpossibleHeadAfterCapacityShrink(t *testing.T) {
 	if err != nil || len(promoted) != 1 || promoted[0].ObjectID != following.ObjectID {
 		t.Fatalf("promotion after capacity shrink = %+v, %v", promoted, err)
 	}
+	select {
+	case <-st.WorkflowWake():
+	default:
+		t.Fatal("terminalized queue head did not schedule immediate reconciliation")
+	}
 	record, err := st.GetNodeWorkflow(ctx, clusterstate.ExecutionKindBuild, impossible.ObjectID)
 	if err != nil || record == nil || record.AdmissionState != nodeexec.AdmissionTerminal ||
 		record.ObjectState != string(types.BuildError) || record.EventSeq != 0 || record.LatestEvent != nil {

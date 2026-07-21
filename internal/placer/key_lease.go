@@ -29,41 +29,40 @@ func ResolveNodeKeyLease(
 	if provider == nil || group == "" || expiresUnix <= 0 {
 		return routesync.NodeKeyLeaseV1{}, errors.New("placer: Provider, group, and key lease expiry are required")
 	}
-	groupConfig, found, err := provider.Get(ctx, group)
+	record, found, err := provider.GetRecord(ctx, group)
 	if err != nil {
 		return routesync.NodeKeyLeaseV1{}, err
 	}
-	if !found || groupConfig.Group != group {
+	if !found || record.Group != group {
 		return routesync.NodeKeyLeaseV1{}, errors.New("placer: group is not present in Provider")
 	}
-	authSecret, found, err := provider.GetAuthKey(ctx, group)
-	if err != nil {
-		return routesync.NodeKeyLeaseV1{}, err
+	return nodeKeyLeaseFromRecord(record, expiresUnix)
+}
+
+func nodeKeyLeaseFromRecord(record clusterstate.SandboxGroupRecord, expiresUnix int64) (routesync.NodeKeyLeaseV1, error) {
+	if record.Group == "" || expiresUnix <= 0 {
+		return routesync.NodeKeyLeaseV1{}, errors.New("placer: group record and key lease expiry are required")
 	}
-	if !found {
+	if record.AuthKey.Value == "" {
 		return routesync.NodeKeyLeaseV1{}, errors.New("placer: group has no AuthKey")
 	}
-	manifestSecret, found, err := provider.GetManifestKey(ctx, group)
-	if err != nil {
-		return routesync.NodeKeyLeaseV1{}, err
-	}
-	if !found {
+	if record.ManifestKey.Value == "" {
 		return routesync.NodeKeyLeaseV1{}, errors.New("placer: group has no ManifestKey")
 	}
-	authKey, err := nodeKeyMaterial("AuthKey", authSecret)
+	authKey, err := nodeKeyMaterial("AuthKey", record.AuthKey)
 	if err != nil {
 		return routesync.NodeKeyLeaseV1{}, err
 	}
-	manifestKey, err := nodeKeyMaterial("ManifestKey", manifestSecret)
+	manifestKey, err := nodeKeyMaterial("ManifestKey", record.ManifestKey)
 	if err != nil {
 		return routesync.NodeKeyLeaseV1{}, err
 	}
-	registryAuth, err := nodeRegistryAuth(groupConfig.RegistryAuth)
+	registryAuth, err := nodeRegistryAuth(record.RegistryAuth)
 	if err != nil {
 		return routesync.NodeKeyLeaseV1{}, err
 	}
 	lease := routesync.NodeKeyLeaseV1{
-		Version: routesync.NodeKeyLeaseVersionV1, Group: group,
+		Version: routesync.NodeKeyLeaseVersionV1, Group: record.Group,
 		AuthKey: authKey, ManifestKey: manifestKey, RegistryAuth: registryAuth,
 		ExpiresUnix: expiresUnix,
 	}

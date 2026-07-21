@@ -22,6 +22,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
@@ -283,6 +284,9 @@ func (r *Router) createSandbox(w http.ResponseWriter, request *http.Request) {
 	routeKey := request.Header.Get(HeaderRouteKey)
 	if routeKey == "" {
 		routeKey = "rk-" + randomID()
+	} else if !validRouteKey(routeKey) {
+		http.Error(w, "invalid Sandbox route key", http.StatusBadRequest)
+		return
 	}
 	input, err := sandboxCreateInput(request)
 	if err != nil {
@@ -408,9 +412,13 @@ func (r *Router) sandboxControl(w http.ResponseWriter, request *http.Request) {
 		http.Error(w, "import/export is reserved for explicit serveIdentity recovery", http.StatusNotImplemented)
 		return
 	}
-	routeKey := pathObjectID(request.URL.Path, "/sandboxes/")
-	if routeKey == "" {
+	routeKey, decoded := escapedPathObjectID(request.URL.EscapedPath(), "/sandboxes/")
+	if !decoded || routeKey == "" {
 		http.Error(w, "Sandbox route key is required", http.StatusBadRequest)
+		return
+	}
+	if !validRouteKey(routeKey) {
+		http.Error(w, "invalid Sandbox route key", http.StatusBadRequest)
 		return
 	}
 	if header := request.Header.Get(HeaderRouteKey); header != "" && header != routeKey {
@@ -485,14 +493,15 @@ func (r *Router) registerBuild(w http.ResponseWriter, request *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	demand, err := checkedBuildDemand(register.CPUCount, register.MemoryMB)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 	input := routeapi.BuildInput{
 		TemplateID: templateID, Profile: register.Profile, Names: names, Aliases: aliases,
 		Metadata: register.Metadata, CPUCount: register.CPUCount, MemoryMB: register.MemoryMB,
-		Request: envelope,
-		Demand: placement.BuildDemand{
-			Slots: 1, CPU: uint64(register.CPUCount * 1000),
-			Memory: uint64(register.MemoryMB) << 20,
-		},
+		Request: envelope, Demand: demand,
 	}
 	result, err := r.control.RegisterBuild(request.Context(), group, buildID, 0, input)
 	if errors.Is(err, routeclient.ErrPermitUnavailable) {
@@ -558,7 +567,7 @@ func (r *Router) forwardBuild(w http.ResponseWriter, request *http.Request) {
 	if entry == nil {
 		result, err := r.control.ReadBuild(request.Context(), group, buildID, 0)
 		if err != nil {
-			http.Error(w, "unknown build", http.StatusNotFound)
+			http.Error(w, "Build lookup unavailable", http.StatusServiceUnavailable)
 			return
 		}
 		if result.Response.Outcome == routeapi.ReadConflict && result.Response.Pending != nil {
@@ -602,6 +611,19 @@ func (r *Router) forwardBuild(w http.ResponseWriter, request *http.Request) {
 		return
 	}
 	r.forwardNodeControl(w, request, nil, entry)
+}
+
+func checkedBuildDemand(cpuCount, memoryMB int) (placement.BuildDemand, error) {
+	if cpuCount <= 0 || memoryMB <= 0 {
+		return placement.BuildDemand{}, errors.New("Build CPU and memory ceilings must be positive")
+	}
+	const bytesPerMiB = uint64(1 << 20)
+	maximum := ^uint64(0)
+	cpu, memory := uint64(cpuCount), uint64(memoryMB)
+	if cpu > maximum/1000 || memory > maximum/bytesPerMiB {
+		return placement.BuildDemand{}, errors.New("Build CPU or memory ceiling exceeds admission limits")
+	}
+	return placement.BuildDemand{Slots: 1, CPU: cpu * 1000, Memory: memory * bytesPerMiB}, nil
 }
 
 func writePendingBuildStatus(w http.ResponseWriter, pending routeapi.PendingBuildProjection) {
@@ -685,7 +707,10 @@ func (r *Router) forwardNodeControl(w http.ResponseWriter, request *http.Request
 		next.URL.Host = endpoint
 		next.Host = "api." + r.domain
 		if route != nil {
-			next.URL.Path = rewritePathObjectID(next.URL.Path, "/sandboxes/", objectID)
+			escaped := rewritePathObjectID(next.URL.EscapedPath(), "/sandboxes/", objectID)
+			if decoded, err := url.PathUnescape(escaped); err == nil {
+				next.URL.Path, next.URL.RawPath = decoded, escaped
+			}
 		}
 		next.Header.Del(HeaderAccessTok)
 		clearDirectFence(next.Header)
@@ -799,6 +824,10 @@ func (r *Router) serveData(w http.ResponseWriter, request *http.Request, host st
 	}
 	if routeKey == "" {
 		http.Error(w, "Sandbox route key is required", http.StatusBadRequest)
+		return
+	}
+	if !validRouteKey(routeKey) {
+		http.Error(w, "invalid Sandbox route key", http.StatusBadRequest)
 		return
 	}
 	var (
@@ -1273,6 +1302,30 @@ func pathObjectID(path, marker string) string {
 	return value
 }
 
+func escapedPathObjectID(path, marker string) (string, bool) {
+	encoded := pathObjectID(path, marker)
+	if encoded == "" {
+		return "", false
+	}
+	decoded, err := url.PathUnescape(encoded)
+	if err != nil || url.PathEscape(decoded) != encoded {
+		return "", false
+	}
+	return decoded, true
+}
+
+func validRouteKey(routeKey string) bool {
+	if routeKey == "" || routeKey == "." || routeKey == ".." || !utf8.ValidString(routeKey) {
+		return false
+	}
+	for _, value := range routeKey {
+		if value < 0x20 || value == 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
 func rewritePathObjectID(path, marker, objectID string) string {
 	index := strings.Index(path, marker)
 	if index < 0 {
@@ -1283,7 +1336,7 @@ func rewritePathObjectID(path, marker, objectID string) string {
 	if slash := strings.IndexByte(path[start:], '/'); slash >= 0 {
 		end = start + slash
 	}
-	return path[:start] + objectID + path[end:]
+	return path[:start] + url.PathEscape(objectID) + path[end:]
 }
 
 func canonicalStrings(values []string) []string {

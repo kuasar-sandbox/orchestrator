@@ -475,7 +475,7 @@ func routeStartingRecord(t *testing.T, sandboxID string, round uint64, candidate
 		AccessToken: "access-token", TargetPort: 3000,
 		Request: cluster.NodeRequestEnvelopeV1{
 			Version: cluster.NodeRequestEnvelopeVersionV1, Method: "POST", Path: "/sandboxes",
-			Body: []byte(`{"templateID":"` + templateRef + `"}`),
+			Body: []byte(`{"metadata":null,"templateID":"` + templateRef + `","timeout":0}`),
 		},
 	})
 	if err != nil {
@@ -509,7 +509,7 @@ func buildStartingRecord(t *testing.T, buildID string, candidates []cluster.Plac
 		Version: cluster.DispatchSpecVersionV1, TemplateID: "template-1",
 		AuthKeyFingerprint: strings.Repeat("b", 24), ManifestKeyFingerprint: strings.Repeat("c", 24),
 		Profile: types.ProfileBare, CPUCount: 1, MemoryMB: 512,
-		Request: cluster.NodeRequestEnvelopeV1{Version: cluster.NodeRequestEnvelopeVersionV1, Method: "POST", Path: "/v3/templates", Body: []byte(`{"cpuCount":1,"memoryMB":512}`)},
+		Request: cluster.NodeRequestEnvelopeV1{Version: cluster.NodeRequestEnvelopeVersionV1, Method: "POST", Path: "/v3/templates", Body: []byte(`{"cpuCount":1,"memoryMB":512,"metadata":null,"name":"","profile":"bare","tags":null}`)},
 	})
 	if err != nil {
 		t.Fatal(err)

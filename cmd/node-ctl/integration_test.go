@@ -139,6 +139,9 @@ func TestKeyLeaseCmdAdminPlane(t *testing.T) {
 	if err := keyLeaseCmd(append(args("put"), "--ttl", "500ms"), log); err == nil {
 		t.Fatal("sub-second positive TTL should error")
 	}
+	if err := keyLeaseCmd(append(args("put"), "--ttl", "-1s"), log); err == nil {
+		t.Fatal("negative TTL should error")
+	}
 }
 
 // TestExportImportCmdAPIPlane proves the export/import CLIs reach the api plane over

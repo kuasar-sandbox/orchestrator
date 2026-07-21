@@ -453,6 +453,10 @@ func (s *Server) handleSettled(req *Message, token string) *Message {
 	if newAlloc < floor {
 		newAlloc = floor
 	}
+	previousAlloc := res.AllocatableNowMem
+	previousStage := res.Stage
+	previousStageEnteredAt := res.StageEnteredAt
+	previousHeartbeatAt := res.LastHeartbeatAt
 	res.AllocatableNowMem = newAlloc
 
 	// 2. startup-pool release: the stage transition itself (admitted →
@@ -461,14 +465,24 @@ func (s *Server) handleSettled(req *Message, token string) *Message {
 	res.Stage = StageSettled
 	res.StageEnteredAt = time.Now()
 	res.LastHeartbeatAt = time.Now()
+	flushErr := s.Persister.Flush(s.State)
+	if flushErr != nil && !FlushPublished(flushErr) {
+		res.AllocatableNowMem = previousAlloc
+		res.Stage = previousStage
+		res.StageEnteredAt = previousStageEnteredAt
+		res.LastHeartbeatAt = previousHeartbeatAt
+		s.State.Unlock()
+		return &Message{Type: TypeError, Msg: "settled state could not be persisted"}
+	}
 	s.State.Unlock()
+	if flushErr != nil {
+		s.Logf("persist published settled state with durability error: %v", flushErr)
+	}
 
-	// Wake the admission worker — main + startup pool both just got
-	// headroom back, queued admits may now fit.
+	// Durable settlement returns both main- and startup-pool headroom.
 	s.Admission.PushWake()
-
-	if err := s.Persister.Flush(s.State); err != nil {
-		s.Logf("persister flush: %v", err)
+	if s.PreparedAdmission != nil {
+		s.PreparedAdmission.SignalCapacityChange()
 	}
 	s.Logf("settled %s sid=%s rss=%d alloc=%d", token[:8], res.SandboxID, req.CurrentRSS, newAlloc)
 	return &Message{Type: TypeAck}
