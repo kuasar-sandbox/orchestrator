@@ -127,6 +127,11 @@ func openRuntime(
 	if err != nil {
 		return nil, err
 	}
+	if loadedEnrollment != nil && loadedEnrollment.RegistryGeneration == latestSigned.RegistryLayout.RegistryGeneration &&
+		latestSigned.RegistryLayout.RegistryLayoutVersion > loadedEnrollment.RegistryLayoutVersion &&
+		latestSigned.RegistryLayout.RegistryLayoutVersion-loadedEnrollment.RegistryLayoutVersion > 1 {
+		return nil, errors.New("raftstore: enrolled member cannot skip an unactivated registryLayout")
+	}
 	startupSigned := latestSigned
 	if loadedEnrollment != nil && loadedEnrollment.RegistryGeneration == latestSigned.RegistryLayout.RegistryGeneration {
 		selected := false
@@ -595,7 +600,9 @@ func (r *Runtime) initializeDataShard(ctx context.Context, replica LocalReplicaE
 		ReplicaIDs: append([]uint64(nil), bootstrap.ReplicaIDs...),
 	})
 	if err != nil || result.Conflict {
-		value, readErr := r.nodeHost.SyncRead(ctx, replica.ShardID, DataStateLookup{})
+		resolveContext, cancelResolve := ambiguityResolutionContext(ctx)
+		defer cancelResolve()
+		value, readErr := r.nodeHost.SyncRead(resolveContext, replica.ShardID, DataStateLookup{})
 		if readErr != nil {
 			if err != nil {
 				return err
