@@ -1,9 +1,6 @@
 package session
 
 import (
-	"bytes"
-	"crypto/sha256"
-	"encoding/binary"
 	"sort"
 	"sync"
 )
@@ -210,34 +207,6 @@ func (d *Directory) MergeFull(records []DirectoryRecord) int {
 	return changed
 }
 
-func DirectoryDigest(records []DirectoryRecord) [sha256.Size]byte {
-	records = append([]DirectoryRecord(nil), records...)
-	sort.Slice(records, func(i, j int) bool { return records[i].Entry.NodeID < records[j].Entry.NodeID })
-	var input bytes.Buffer
-	input.WriteString("kuasar-session-directory-v2")
-	for _, record := range records {
-		writeDirectoryString(&input, record.Entry.NodeID)
-		writeDirectoryString(&input, record.Entry.EnrollmentID)
-		var number [8]byte
-		binary.BigEndian.PutUint64(number[:], record.Entry.NodeEpoch)
-		input.Write(number[:])
-		binary.BigEndian.PutUint64(number[:], record.Entry.SessionSeq)
-		input.Write(number[:])
-		writeDirectoryString(&input, record.Entry.HolderMemberID)
-		if record.Available {
-			input.WriteByte(1)
-		} else {
-			input.WriteByte(0)
-		}
-		if record.Conflict {
-			input.WriteByte(1)
-		} else {
-			input.WriteByte(0)
-		}
-	}
-	return sha256.Sum256(input.Bytes())
-}
-
 func (d *Directory) lookupRecord(nodeID string) (DirectoryRecord, bool) {
 	d.mu.RLock()
 	record, found := d.records[nodeID]
@@ -254,11 +223,4 @@ func (d *Directory) lookupRecord(nodeID string) (DirectoryRecord, bool) {
 	}
 	d.mu.Unlock()
 	return DirectoryRecord{}, false
-}
-
-func writeDirectoryString(buffer *bytes.Buffer, value string) {
-	var length [4]byte
-	binary.BigEndian.PutUint32(length[:], uint32(len(value)))
-	buffer.Write(length[:])
-	buffer.WriteString(value)
 }

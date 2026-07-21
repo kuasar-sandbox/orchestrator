@@ -756,12 +756,9 @@ func TestDirectoryRetirementCollectsHintAndRejectsStaleDelta(t *testing.T) {
 	}
 }
 
-func TestDirectoryDigestAndFullMergeAreDeterministic(t *testing.T) {
+func TestDirectoryFullMergePreservesAvailabilityAndConflict(t *testing.T) {
 	a := DirectoryRecord{Entry: DirectoryEntry{NodeID: "a", EnrollmentID: "enrollment-a", Tuple: Tuple{NodeEpoch: 1, SessionSeq: 2}, HolderMemberID: "r1"}, Available: true}
 	b := DirectoryRecord{Entry: DirectoryEntry{NodeID: "b", EnrollmentID: "enrollment-b", Tuple: Tuple{NodeEpoch: 3, SessionSeq: 4}, HolderMemberID: "r2"}, Conflict: true}
-	if DirectoryDigest([]DirectoryRecord{a, b}) != DirectoryDigest([]DirectoryRecord{b, a}) {
-		t.Fatal("directory digest depends on input order")
-	}
 	directory := newTestDirectory()
 	if changed := directory.MergeFull([]DirectoryRecord{b, a}); changed != 3 {
 		t.Fatalf("merge changed %d records", changed)
@@ -788,13 +785,11 @@ func TestDirectoryConflictCanonicalizesAcrossArrivalOrder(t *testing.T) {
 	leftSnapshot := left.Snapshot()
 	rightSnapshot := right.Snapshot()
 	if len(leftSnapshot) != 1 || len(rightSnapshot) != 1 ||
+		leftSnapshot[0] != rightSnapshot[0] ||
 		leftSnapshot[0].Entry.HolderMemberID != "registry-a" ||
 		rightSnapshot[0].Entry.HolderMemberID != "registry-a" ||
 		!leftSnapshot[0].Conflict || !rightSnapshot[0].Conflict {
 		t.Fatalf("canonical conflicts: left=%+v right=%+v", leftSnapshot, rightSnapshot)
-	}
-	if DirectoryDigest(leftSnapshot) != DirectoryDigest(rightSnapshot) {
-		t.Fatal("split-holder conflicts retained arrival-order-dependent digests")
 	}
 }
 
