@@ -255,9 +255,21 @@ func digestBytes(value string, payload []byte) bool {
 }
 
 type EventAck struct {
-	ObjectKind string `json:"object_kind"` // sandbox
-	ObjectID   string `json:"object_id"`
-	EventSeq   uint64 `json:"event_seq"`
+	ObjectKind         string `json:"object_kind"` // sandbox
+	ObjectID           string `json:"object_id"`
+	RegistryGeneration string `json:"registry_generation"`
+	BindingDigest      string `json:"binding_digest"`
+	EventSeq           uint64 `json:"event_seq"`
+}
+
+func (a EventAck) Validate() error {
+	if a.ObjectKind != "sandbox" || a.ObjectID == "" || a.RegistryGeneration == "" || a.EventSeq == 0 {
+		return errors.New("routesync: incomplete execution event ACK")
+	}
+	if !validSHA256(a.BindingDigest) {
+		return errors.New("routesync: execution event ACK Binding digest must be SHA-256 hex")
+	}
+	return nil
 }
 
 // EventCursor is process-local replay pagination, not an execution identity or

@@ -463,12 +463,16 @@ func (n *FinalClusterNode) ackRecoveryEvent(ctx context.Context, command *routes
 		return nil, errors.New("recovery event ACK command is incomplete")
 	}
 	ack := *command.EventAck
+	if err := ack.Validate(); err != nil {
+		return nil, err
+	}
 	if command.SID == "" || command.BuildID != "" {
 		return nil, errors.New("recovery event ACK is valid only for one Sandbox")
 	}
 	const objectKind = "sandbox"
 	objectID := command.SID
-	if ack.ObjectKind != objectKind || ack.ObjectID != objectID || ack.EventSeq == 0 {
+	if ack.ObjectKind != objectKind || ack.ObjectID != objectID ||
+		ack.RegistryGeneration != command.RegistryGeneration || ack.BindingDigest != command.BindingDigest {
 		return nil, errors.New("recovery event ACK identifies another execution")
 	}
 	if err := n.verifyCurrentCommand(ctx, command, clusterstate.ExecutionKindSandbox, objectID); err != nil {

@@ -105,7 +105,7 @@ func TestPreparedAdmissionOrdinaryAdmitAttachesClaimedReservation(t *testing.T) 
 	const cgroup = "/sys/fs/cgroup/sandbox-runner.slice/runner.service"
 	server := &Server{
 		State: state, Admission: controller.admission, PreparedAdmission: controller,
-		Persister: controller.persister, Logf: t.Logf,
+		Allocator: NewAllocator(AllocatorPolicy{}), Persister: controller.persister, Logf: t.Logf,
 		peerCgroup: func(net.Conn) (string, error) { return cgroup, nil },
 	}
 	request := demand.message("sandbox-attach")
@@ -133,6 +133,72 @@ func TestPreparedAdmissionOrdinaryAdmitAttachesClaimedReservation(t *testing.T) 
 	if loaded.PreparedSandboxAdmissions["sandbox-attach"].Demand.CgroupPath != cgroup ||
 		loaded.Reservations[prepared.ReservationToken].CgroupPath != cgroup {
 		t.Fatalf("persisted attach=%+v", loaded.PreparedSandboxAdmissions["sandbox-attach"])
+	}
+
+	drainPreparedWake(controller)
+	release := &Message{Type: TypeRelease, Reason: "sandbox_exit"}
+	response = server.dispatch(serverConn, release, &token)
+	if response == nil || response.Type != TypeAck || token != "" {
+		t.Fatalf("release response=%+v token=%q", response, token)
+	}
+	select {
+	case <-controller.Wake():
+	case <-time.After(time.Second):
+		t.Fatal("ordinary release did not wake the prepared queue")
+	}
+	state.Lock()
+	record = state.PreparedSandboxAdmissions["sandbox-attach"]
+	reservation = state.Reservations[prepared.ReservationToken]
+	state.Unlock()
+	if record == nil || record.State != PreparedReleased || record.Reason != "sandbox_exit" || reservation != nil {
+		t.Fatalf("released record=%+v reservation=%+v", record, reservation)
+	}
+	loaded, err = controller.persister.Load()
+	if err != nil || loaded.PreparedSandboxAdmissions["sandbox-attach"].State != PreparedReleased ||
+		loaded.Reservations[prepared.ReservationToken] != nil {
+		t.Fatalf("persisted release=%+v reservations=%+v err=%v",
+			loaded.PreparedSandboxAdmissions["sandbox-attach"], loaded.Reservations, err)
+	}
+}
+
+func TestPreparedAdmissionOrdinaryReleaseRollsBackOnPersistenceFailure(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	state := preparedTestState()
+	controller := preparedTestController(t, state, path, 4)
+	digest := preparedDigest("release-rollback")
+	prepared, err := controller.PrepareAdmission("sandbox-release", digest, preparedTestDemand(1<<30))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := controller.ClaimAdmission("sandbox-release", digest); err != nil {
+		t.Fatal(err)
+	}
+	controller.persister.Path = "/dev/null/state.json"
+	server := &Server{
+		State: state, Admission: controller.admission, PreparedAdmission: controller,
+		Allocator: NewAllocator(AllocatorPolicy{}), Persister: controller.persister, Logf: t.Logf,
+	}
+	token := prepared.ReservationToken
+	response := server.dispatch(nil, &Message{Type: TypeRelease, Reason: "sandbox_exit"}, &token)
+	if response == nil || response.Type != TypeError || token != prepared.ReservationToken {
+		t.Fatalf("failed release response=%+v token=%q", response, token)
+	}
+	state.Lock()
+	record := state.PreparedSandboxAdmissions["sandbox-release"]
+	reservation := state.Reservations[prepared.ReservationToken]
+	state.Unlock()
+	if record == nil || record.State != PreparedClaimed || reservation == nil {
+		t.Fatalf("failed release record=%+v reservation=%+v", record, reservation)
+	}
+}
+
+func drainPreparedWake(controller *PreparedAdmissionController) {
+	for {
+		select {
+		case <-controller.Wake():
+		default:
+			return
+		}
 	}
 }
 

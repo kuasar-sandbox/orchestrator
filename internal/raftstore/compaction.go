@@ -209,7 +209,9 @@ func (r *Runtime) CompactExecutionFence(
 	result, proposeErr := r.proposeDataRaw(ctx, DataCommand{
 		Type: DataCompactFence, Identity: identity, Compaction: &authorization,
 	})
-	remaining, readErr := r.readFenceStrong(ctx, query)
+	resolveContext, cancelResolve := ambiguityResolutionContext(ctx)
+	defer cancelResolve()
+	remaining, readErr := r.readFenceStrong(resolveContext, query)
 	if readErr == nil && remaining == nil {
 		return nil
 	}

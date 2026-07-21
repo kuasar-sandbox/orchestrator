@@ -271,7 +271,8 @@ func (s *NodeLinkServer) convergeEvent(ctx context.Context, endpoint *wireEndpoi
 		return
 	}
 	endpoint.enqueue(&routesync.Msg{Type: routesync.TypeEventAck, EventAck: &routesync.EventAck{
-		ObjectKind: event.ObjectKind, ObjectID: event.ObjectID, EventSeq: event.EventSeq,
+		ObjectKind: event.ObjectKind, ObjectID: event.ObjectID, RegistryGeneration: event.RegistryGeneration,
+		BindingDigest: event.BindingDigest, EventSeq: event.EventSeq,
 	}})
 }
 

@@ -755,10 +755,13 @@ func recoveryEventAckCommand(record raftstore.RecoveryObjectRecord) (*routesync.
 		CmdID: newCommandID(), Kind: routesync.CmdAckRecoveryEvent,
 		RegistryGeneration: record.TargetBinding.RegistryGeneration,
 		BindingDigest:      record.TargetBinding.BindingDigest,
-		EventAck:           &routesync.EventAck{ObjectID: record.ObjectID, EventSeq: record.EventSeq},
+		EventAck: &routesync.EventAck{
+			ObjectKind: "sandbox", ObjectID: record.ObjectID,
+			RegistryGeneration: record.TargetBinding.RegistryGeneration,
+			BindingDigest:      record.TargetBinding.BindingDigest, EventSeq: record.EventSeq,
+		},
 	}
 	command.SID = record.ObjectID
-	command.EventAck.ObjectKind = "sandbox"
 	return command, nil
 }
 

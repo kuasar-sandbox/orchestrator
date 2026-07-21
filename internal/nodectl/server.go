@@ -177,7 +177,9 @@ func (s *Server) dispatch(conn net.Conn, req *Message, token *string) *Message {
 	case TypeHeartbeat:
 		return s.handleHeartbeat(req, *token)
 	case TypeRelease:
-		s.handleRelease(req, *token)
+		if err := s.handleRelease(req, *token); err != nil {
+			return &Message{Type: TypeError, Msg: err.Error()}
+		}
 		// Signal the connection loop to drop association.
 		*token = ""
 		return &Message{Type: TypeAck}
@@ -580,27 +582,48 @@ func (s *Server) handleHeartbeat(req *Message, token string) *Message {
 	return &Message{Type: TypeAck, NewAllocatable: res.AllocatableNowMem}
 }
 
-func (s *Server) handleRelease(req *Message, token string) {
+func (s *Server) handleRelease(req *Message, token string) error {
+	if s.PreparedAdmission != nil {
+		if s.PreparedAdmission.state != s.State || s.PreparedAdmission.persister != s.Persister {
+			return errors.New("prepared Admission is not bound to this resource server")
+		}
+		res, handled, err := s.PreparedAdmission.releaseReservation(token, req.Reason)
+		if handled {
+			if res != nil {
+				s.finishRelease(req, token, res)
+			}
+			return err
+		}
+	}
+
 	s.State.Lock()
 	res := s.State.Lookup(token)
 	if res == nil {
 		s.State.Unlock()
-		return
+		return nil
 	}
 	// Both main-pool and startup-pool accounting are derived from
 	// reservations + their Stage; removing the reservation here implicitly
 	// releases both. Wake admission so any short-term-blocked queued
 	// admit can re-evaluate against the freshly returned headroom.
-	wasPreSettled := IsPreSettled(res.Stage)
-	s.Allocator.CleanupHistory(token)
+	released := *res
 	s.State.Remove(token)
+	flushErr := s.Persister.Flush(s.State)
+	if flushErr != nil && !FlushPublished(flushErr) {
+		s.State.Reservations[token] = res
+		s.State.Unlock()
+		return flushErr
+	}
 	s.State.Unlock()
 
 	s.Admission.PushWake()
+	s.finishRelease(req, token, &released)
+	return flushErr
+}
 
-	if err := s.Persister.Flush(s.State); err != nil {
-		s.Logf("persister flush: %v", err)
-	}
+func (s *Server) finishRelease(req *Message, token string, res *Reservation) {
+	wasPreSettled := IsPreSettled(res.Stage)
+	s.Allocator.CleanupHistory(token)
 	s.Logf("release %s sid=%s reason=%s pre_settled=%v",
 		token[:8], res.SandboxID, req.Reason, wasPreSettled)
 	if s.Auditor != nil {

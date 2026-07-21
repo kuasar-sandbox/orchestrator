@@ -131,7 +131,9 @@ func TestStreamAuthorityBoundsRouteBurstBeforeOutbox(t *testing.T) {
 		<-done
 	})
 
-	frames := make(chan *routesync.Msg, 128)
+	// Keep the reader synchronized with the assertion. A buffered channel can
+	// prefetch every route before the ACK is enqueued and cannot test fairness.
+	frames := make(chan *routesync.Msg)
 	readErr := make(chan error, 1)
 	go func() {
 		for {

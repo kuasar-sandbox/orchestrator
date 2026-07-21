@@ -149,6 +149,22 @@ func TestRuntimeCompactsFenceOnlyAfterRetentionAndEveryReplicaProof(t *testing.T
 		encoded, marshalErr := json.Marshal(result)
 		return sm.Result{Data: encoded}, marshalErr
 	}
+	compactContext, cancelCompact := context.WithCancel(context.Background())
+	defer cancelCompact()
+	host.readCtx = func(ctx context.Context, shardID uint64, query any) (any, error) {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		return host.read(shardID, query)
+	}
+	host.proposeCtx = func(ctx context.Context, raw []byte) (sm.Result, error) {
+		result, err := host.propose(raw)
+		if command, decodeErr := DecodeDataCommand(raw); decodeErr == nil && command.Type == DataCompactFence {
+			cancelCompact()
+			return sm.Result{}, ctx.Err()
+		}
+		return result, err
+	}
 	permitCache := NewPermitCache(time.Now)
 	if err := permitCache.Install(PermitGrant{
 		PermitIdentity: system.Identity(), CommitIndex: system.LastApplied,
@@ -187,7 +203,7 @@ func TestRuntimeCompactsFenceOnlyAfterRetentionAndEveryReplicaProof(t *testing.T
 		},
 	}
 	if err := runtime.CompactExecutionFence(
-		context.Background(), identity, "/g", "rk", "sandbox-1",
+		compactContext, identity, "/g", "rk", "sandbox-1",
 	); err != nil {
 		t.Fatal(err)
 	}

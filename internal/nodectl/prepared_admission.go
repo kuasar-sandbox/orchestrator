@@ -381,6 +381,52 @@ func (c *PreparedAdmissionController) ReleaseAdmission(sandboxID, demandDigest, 
 	return result, flushErr
 }
 
+// releaseReservation applies an ordinary sandbox-ctl Release to the exact
+// prepared reservation it was attached to. The durable dedupe state and the
+// resource reservation change in one persisted State snapshot.
+func (c *PreparedAdmissionController) releaseReservation(token, reason string) (*Reservation, bool, error) {
+	if token == "" {
+		return nil, false, nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.state.Lock()
+	reservation := c.state.Lookup(token)
+	if reservation == nil {
+		c.state.Unlock()
+		return nil, false, nil
+	}
+	record := c.state.PreparedSandboxAdmissions[reservation.SandboxID]
+	if record == nil || record.ReservationToken != token {
+		c.state.Unlock()
+		return nil, false, nil
+	}
+	if record.State != PreparedAdmitted && record.State != PreparedClaimed {
+		c.state.Unlock()
+		return nil, true, ErrPreparedAdmissionState
+	}
+
+	previous := *record
+	released := *reservation
+	record.State = PreparedReleased
+	record.Reason = reason
+	record.UpdatedAt = c.clock()
+	c.state.Remove(token)
+	flushErr := c.persister.Flush(c.state)
+	if flushErr != nil && !FlushPublished(flushErr) {
+		*record = previous
+		c.state.Reservations[token] = reservation
+		c.state.Unlock()
+		return nil, true, flushErr
+	}
+	c.state.Unlock()
+
+	c.admission.PushWake()
+	c.scheduleQueueWakeLocked(BlockNone)
+	c.notify()
+	return &released, true, flushErr
+}
+
 // FinalizeAdmission removes local SID/demand dedupe only after Registry proves
 // delayed-command fencing is no longer required and local resources are gone.
 func (c *PreparedAdmissionController) FinalizeAdmission(sandboxID, demandDigest string) error {

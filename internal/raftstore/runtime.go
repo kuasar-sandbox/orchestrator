@@ -145,6 +145,11 @@ func openRuntime(
 	if err != nil {
 		return nil, err
 	}
+	if loadedEnrollment != nil && loadedEnrollment.RegistryGeneration == latestSigned.RegistryLayout.RegistryGeneration &&
+		latestSigned.RegistryLayout.RegistryLayoutVersion > loadedEnrollment.RegistryLayoutVersion &&
+		latestSigned.RegistryLayout.RegistryLayoutVersion-loadedEnrollment.RegistryLayoutVersion > 1 {
+		return nil, errors.New("raftstore: enrolled member cannot skip an unactivated registryLayout")
+	}
 	startupSigned := latestSigned
 	if loadedEnrollment != nil && loadedEnrollment.RegistryGeneration == latestSigned.RegistryLayout.RegistryGeneration {
 		selected := false
@@ -634,15 +639,22 @@ func (r *Runtime) BootstrapSystem(ctx context.Context) (SystemState, error) {
 		result, proposeErr := r.proposeSystem(operation, SystemCommand{
 			Type: SystemBootstrap, RegistryLayout: &r.registryLayout, Digest: r.registryLayoutDigest,
 		})
+		resolveContext, cancelResolve := ambiguityResolutionContext(operation)
+		state, readErr = r.ReadSystemStrong(resolveContext)
+		cancelResolve()
+		if readErr != nil && !dragonboat.IsTempError(readErr) {
+			return false, readErr
+		}
+		if readErr == nil {
+			if done, err := accept(state); done || err != nil {
+				return done, err
+			}
+		}
 		if proposeErr != nil {
 			return false, proposeErr
 		}
-		state, readErr = r.ReadSystemStrong(operation)
 		if readErr != nil {
 			return false, readErr
-		}
-		if done, err := accept(state); done || err != nil {
-			return done, err
 		}
 		if result.Conflict {
 			return false, errors.New(result.Reason)
@@ -723,15 +735,22 @@ func (r *Runtime) initializeDataShard(ctx context.Context, replica LocalReplicaE
 			Type: DataInitializeShard, Identity: identity, Bootstrap: &bootstrap,
 			ReplicaIDs: append([]uint64(nil), bootstrap.ReplicaIDs...),
 		})
+		resolveContext, cancelResolve := ambiguityResolutionContext(operation)
+		value, readErr = r.syncRead(resolveContext, replica.ShardID, DataStateLookup{})
+		cancelResolve()
+		if readErr != nil && !dragonboat.IsTempError(readErr) {
+			return false, readErr
+		}
+		if readErr == nil {
+			if done, err := accept(value); done || err != nil {
+				return done, err
+			}
+		}
 		if proposeErr != nil {
 			return false, proposeErr
 		}
-		value, readErr = r.syncRead(operation, replica.ShardID, DataStateLookup{})
 		if readErr != nil {
 			return false, readErr
-		}
-		if done, err := accept(value); done || err != nil {
-			return done, err
 		}
 		if result.Conflict {
 			return false, errors.New(result.Reason)

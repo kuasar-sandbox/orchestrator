@@ -786,6 +786,99 @@ func TestRuntimeCommitsPublishedRegistryLayoutBeforeStartingTargetReplicas(t *te
 	}
 }
 
+func TestRuntimeRejectsRegistryLayoutJumpPastEnrollment(t *testing.T) {
+	fixture := newRuntimeFixture(t)
+	first, err := fixture.open(t, newFakeNodeHost(), RuntimeOpenOptions{
+		Mode: RuntimeBootstrap, BootstrapSecret: fixture.secret,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first.Close()
+	firstDigest, err := fixture.signed.RegistryLayout.Digest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	second := fixture.signed.RegistryLayout
+	second.RegistryLayoutVersion = 2
+	second.PreviousRegistryLayoutVersion = 1
+	second.PreviousRegistryLayoutDigest = firstDigest
+	second.Members = append([]RegistryMember(nil), second.Members...)
+	second.Members[0].InternalEndpoint = "https://registry-a-v2:9443"
+	secondDigest, err := second.Digest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	third := second
+	third.RegistryLayoutVersion = 3
+	third.PreviousRegistryLayoutVersion = 2
+	third.PreviousRegistryLayoutDigest = secondDigest
+	third.Members = append([]RegistryMember(nil), third.Members...)
+	third.Members[0].InternalEndpoint = "https://registry-a-v3:9443"
+	signedSecond, err := SignRegistryLayout(second, "root-1", fixture.key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signedThird, err := SignRegistryLayout(third, "root-1", fixture.key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := openRuntime(
+		fixture.config, []SignedRegistryLayout{fixture.signed, signedSecond, signedThird}, fixture.keyring,
+		RuntimeOpenOptions{Mode: RuntimeRestart},
+		func(dbconfig.NodeHostConfig) (raftNodeHost, error) {
+			t.Fatal("registryLayout jump created a NodeHost")
+			return nil, nil
+		},
+	); err == nil {
+		t.Fatal("enrolled v1 member accepted a v3 runtime target")
+	}
+	guarded, err := (RegistryLayoutGuard{Path: fixture.config.RegistryLayoutGuardPath}).Load()
+	if err != nil || guarded == nil || guarded.RegistryLayoutVersion != 1 || guarded.RegistryLayoutDigest != firstDigest {
+		t.Fatalf("rejected jump advanced registryLayout guard = %+v, %v", guarded, err)
+	}
+}
+
+func TestDataShardBootstrapResolvesCommittedProposalAfterCallerCancellation(t *testing.T) {
+	registryLayout := testRegistryLayout(1, "generation-1")
+	digest, err := registryLayout.Digest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	data := DataState{}
+	host := newFakeNodeHost()
+	ctx, cancel := context.WithCancel(context.Background())
+	host.readCtx = func(ctx context.Context, shardID uint64, query any) (any, error) {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if shardID != DataRaftShardID(0) {
+			return nil, ErrNoLocalReplica
+		}
+		if _, ok := query.(DataStateLookup); !ok {
+			return nil, errors.New("unexpected data lookup")
+		}
+		return cloneDataStateForLookup(data), nil
+	}
+	host.proposeCtx = func(ctx context.Context, raw []byte) (sm.Result, error) {
+		command, err := DecodeDataCommand(raw)
+		if err != nil {
+			return sm.Result{}, err
+		}
+		result := ApplyDataCommand(&data, 1, command)
+		if !result.Applied || result.Conflict {
+			t.Fatalf("bootstrap apply = %+v", result)
+		}
+		cancel()
+		return sm.Result{}, ctx.Err()
+	}
+	runtime := &Runtime{registryLayout: registryLayout, registryLayoutDigest: digest, nodeHost: host}
+	replica := LocalReplicaEnrollment{ShardID: DataRaftShardID(0), ReplicaID: 1, LocalState: ReplicaActive}
+	if err := runtime.initializeDataShard(ctx, replica); err != nil {
+		t.Fatalf("resolve committed bootstrap: %v", err)
+	}
+}
+
 func TestRemovedMemberRestartsFromActiveArtifactWithoutGuardRollback(t *testing.T) {
 	fixture := newRuntimeFixture(t)
 	fixture.config.MemberID = "registry-c"

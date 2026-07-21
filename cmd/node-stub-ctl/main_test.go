@@ -265,7 +265,8 @@ func TestFinalSandboxDispatchDrivesDurableEventRecoveryAndProxyFence(t *testing.
 		NodeEpoch: tuple.NodeEpoch, SessionSeq: tuple.SessionSeq,
 		RegistryGeneration: target.RegistryGeneration, BindingDigest: targetDigest,
 		EventAck: &routesync.EventAck{
-			ObjectKind: "sandbox", ObjectID: command.SID, EventSeq: rebindObject.EventSeq,
+			ObjectKind: "sandbox", ObjectID: command.SID, RegistryGeneration: target.RegistryGeneration,
+			BindingDigest: targetDigest, EventSeq: rebindObject.EventSeq,
 		},
 	}
 	ack = node.HandleCommand(context.Background(), eventAck)

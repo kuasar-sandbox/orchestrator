@@ -731,7 +731,9 @@ func TestAuthorityReconcilesSandboxPromotionClaimAndReleaseCrashWindows(t *testi
 		t.Fatalf("journal finalization = %+v, %v", record, err)
 	}
 	if err := st.AckExecutionEvent(context.Background(), "node-1", 7, routesync.EventAck{
-		ObjectKind: "sandbox", ObjectID: record.ObjectID, EventSeq: record.EventSeq,
+		ObjectKind: "sandbox", ObjectID: record.ObjectID,
+		RegistryGeneration: record.LatestEvent.RegistryGeneration,
+		BindingDigest:      record.BindingDigest, EventSeq: record.EventSeq,
 	}); err != nil {
 		t.Fatal(err)
 	}

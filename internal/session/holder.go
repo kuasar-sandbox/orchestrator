@@ -21,6 +21,7 @@ var (
 	ErrSessionUnavailable  = errors.New("session: current node-link session is unavailable")
 	ErrPermitUnavailable   = errors.New("session: matching Serve Permit is unavailable")
 	ErrKeyLeaseUnavailable = errors.New("session: exact node key lease is not durably acknowledged")
+	ErrKeyLeaseSuperseded  = errors.New("session: key lease operation was superseded by a newer operation")
 	ErrDispatchNotSent     = errors.New("session: dispatch was not sent")
 )
 
@@ -100,7 +101,7 @@ type Registration struct {
 
 func (r Registration) Validate() error {
 	if r.NodeID == "" || r.EnrollmentID == "" || !r.Tuple.Valid() || r.DataEndpoint == "" ||
-		r.LoadModelVersion == 0 || (r.SandboxSlots == 0 && r.BuildSlots == 0) {
+		r.LoadModelVersion == 0 || r.SandboxSlots == 0 {
 		return errors.New("session: incomplete node registration")
 	}
 	return nil
@@ -109,10 +110,13 @@ func (r Registration) Validate() error {
 type heldSession struct {
 	registration Registration
 	endpoint     SessionEndpoint
+	commandMu    sync.Mutex
+	leaseMu      sync.RWMutex
 	snapshot     placement.PlacementLoadSnapshot
 	observedAt   time.Time
 	hasSnapshot  bool
 	keyLeases    map[string]int64
+	keyLeaseSeq  map[string]uint64
 }
 
 type Lease struct {
@@ -166,7 +170,7 @@ func (h *Holder) Register(ctx context.Context, registration Registration, endpoi
 	if endpoint == nil {
 		return nil, errors.New("session: node-link endpoint is required")
 	}
-	var old SessionEndpoint
+	var old *heldSession
 	err := h.enroll.RunSessionRegistration(ctx, registration, func() error {
 		h.mu.Lock()
 		previous, seen := h.high[registration.NodeID]
@@ -192,16 +196,19 @@ func (h *Holder) Register(ctx context.Context, registration Registration, endpoi
 			h.mu.Unlock()
 			return ErrHolderLimit
 		} else if current != nil {
-			old = current.endpoint
+			current.commandMu.Lock()
+			old = current
 		}
 		h.high[registration.NodeID] = registration
 		h.active[registration.NodeID] = &heldSession{
-			registration: registration, endpoint: endpoint, keyLeases: make(map[string]int64),
+			registration: registration, endpoint: endpoint,
+			keyLeases: make(map[string]int64), keyLeaseSeq: make(map[string]uint64),
 		}
 		h.mu.Unlock()
 
 		if old != nil {
-			old.FenceStaleSession()
+			old.endpoint.FenceStaleSession()
+			old.commandMu.Unlock()
 		}
 		h.publish(DirectoryDelta{Entry: h.directoryEntry(registration), Up: true})
 		return nil
@@ -219,7 +226,7 @@ func (h *Holder) RetireIdentity(ctx context.Context, retirement IdentityRetireme
 		return false, err
 	}
 	return h.enroll.RunIdentityRetirement(ctx, retirement, func() (bool, error) {
-		var endpoint SessionEndpoint
+		var held *heldSession
 		var registration Registration
 		h.mu.Lock()
 		previous, seen := h.high[retirement.NodeID]
@@ -229,15 +236,17 @@ func (h *Holder) RetireIdentity(ctx context.Context, retirement IdentityRetireme
 		}
 		registration = previous
 		delete(h.high, retirement.NodeID)
-		if held := h.active[retirement.NodeID]; held != nil &&
-			held.registration.EnrollmentID == retirement.EnrollmentID && held.registration.NodeEpoch <= retirement.LastNodeEpoch {
-			endpoint = held.endpoint
+		if current := h.active[retirement.NodeID]; current != nil &&
+			current.registration.EnrollmentID == retirement.EnrollmentID && current.registration.NodeEpoch <= retirement.LastNodeEpoch {
+			current.commandMu.Lock()
+			held = current
 			delete(h.active, retirement.NodeID)
 		}
 		h.mu.Unlock()
 
-		if endpoint != nil {
-			endpoint.FenceStaleSession()
+		if held != nil {
+			held.endpoint.FenceStaleSession()
+			held.commandMu.Unlock()
 		}
 		h.publish(DirectoryDelta{Entry: h.directoryEntry(registration), Retired: true})
 		return true, nil
@@ -330,25 +339,24 @@ func (h *Holder) AdmitAndDispatch(ctx context.Context, command DispatchCommand) 
 		return DispatchReply{}, err
 	}
 
-	h.mu.RLock()
-	held := h.active[command.NodeID]
-	if held == nil || held.registration.NodeEpoch != command.NodeEpoch || held.registration.DataEndpoint != command.DataEndpoint {
-		h.mu.RUnlock()
+	held, err := h.lockCommandSession(command.NodeID, command.NodeEpoch, command.DataEndpoint, nil)
+	if err != nil {
 		return DispatchReply{}, ErrSessionUnavailable
 	}
+	defer held.commandMu.Unlock()
 	keyLeaseRef, err := dispatchKeyLeaseRef(command)
 	if err != nil {
-		h.mu.RUnlock()
 		return DispatchReply{}, err
 	}
-	if held.keyLeases[keyLeaseRefID(keyLeaseRef)] <= h.clock().Unix() {
-		h.mu.RUnlock()
+	held.leaseMu.RLock()
+	leaseExpires := held.keyLeases[keyLeaseRefID(keyLeaseRef)]
+	held.leaseMu.RUnlock()
+	if leaseExpires <= h.clock().Unix() {
 		return DispatchReply{}, errors.Join(ErrDispatchNotSent, ErrKeyLeaseUnavailable)
 	}
 	endpoint := held.endpoint
 	command.SessionSeq = held.registration.SessionSeq
 	registration := held.registration
-	h.mu.RUnlock()
 	if err := h.authorizeNodeSession(command.ServeIdentity, registration); err != nil {
 		return DispatchReply{}, err
 	}
@@ -386,17 +394,15 @@ func (h *Holder) SendNodeCommand(
 	if err := h.CheckServe(identity, PermitDispatch); err != nil {
 		return routesync.CmdAck{}, false, err
 	}
-	h.mu.RLock()
-	held := h.active[nodeID]
-	if held == nil || held.registration.NodeEpoch != nodeEpoch || held.registration.DataEndpoint != dataEndpoint {
-		h.mu.RUnlock()
+	held, err := h.lockCommandSession(nodeID, nodeEpoch, dataEndpoint, nil)
+	if err != nil {
 		return routesync.CmdAck{}, false, ErrSessionUnavailable
 	}
+	defer held.commandMu.Unlock()
 	endpoint, ok := held.endpoint.(commandEndpoint)
 	command.NodeEpoch = nodeEpoch
 	command.SessionSeq = held.registration.SessionSeq
 	registration := held.registration
-	h.mu.RUnlock()
 	if !ok {
 		return routesync.CmdAck{}, false, errors.New("session: Holder endpoint does not support final node commands")
 	}
@@ -425,17 +431,15 @@ func (h *Holder) SendRecoveryCommand(
 	if err := h.CheckServe(identity, PermitRecovery); err != nil {
 		return routesync.CmdAck{}, false, err
 	}
-	h.mu.RLock()
-	held := h.active[nodeID]
-	if held == nil || held.registration.NodeEpoch != nodeEpoch || held.registration.DataEndpoint != dataEndpoint {
-		h.mu.RUnlock()
+	held, err := h.lockCommandSession(nodeID, nodeEpoch, dataEndpoint, nil)
+	if err != nil {
 		return routesync.CmdAck{}, false, ErrSessionUnavailable
 	}
+	defer held.commandMu.Unlock()
 	endpoint, ok := held.endpoint.(commandEndpoint)
 	command.NodeEpoch = nodeEpoch
 	command.SessionSeq = held.registration.SessionSeq
 	registration := held.registration
-	h.mu.RUnlock()
 	if !ok {
 		return routesync.CmdAck{}, false, errors.New("session: Holder endpoint does not support recovery commands")
 	}
@@ -475,10 +479,33 @@ func (h *Holder) remove(nodeID string, tuple Tuple) {
 		h.mu.Unlock()
 		return
 	}
+	session.commandMu.Lock()
 	registration := session.registration
 	delete(h.active, nodeID)
 	h.mu.Unlock()
+	session.commandMu.Unlock()
 	h.publish(DirectoryDelta{Entry: h.directoryEntry(registration), Up: false})
+}
+
+// lockCommandSession prevents a SessionSeq/NodeEpoch replacement from racing
+// a command that has already selected the current endpoint. Callers must unlock
+// commandMu without reacquiring Holder.mu.
+func (h *Holder) lockCommandSession(
+	nodeID string,
+	nodeEpoch uint64,
+	dataEndpoint string,
+	expected *heldSession,
+) (*heldSession, error) {
+	h.mu.RLock()
+	held := h.active[nodeID]
+	if held == nil || expected != nil && held != expected || held.registration.NodeEpoch != nodeEpoch ||
+		held.registration.DataEndpoint != dataEndpoint {
+		h.mu.RUnlock()
+		return nil, ErrSessionUnavailable
+	}
+	held.commandMu.Lock()
+	h.mu.RUnlock()
+	return held, nil
 }
 
 func (h *Holder) directoryEntry(registration Registration) DirectoryEntry {
