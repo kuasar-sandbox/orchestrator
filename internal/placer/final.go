@@ -19,6 +19,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/keys"
 	"github.com/kuasar-sandbox/orchestrator/internal/placement"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
+	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
@@ -260,22 +261,30 @@ func (s *FinalService) Plan(ctx context.Context, request PlanRequest) (PlanRespo
 		if request.Sandbox == nil || request.Build != nil || request.RouteKey == "" || request.Sandbox.SandboxID == "" {
 			return PlanResponse{}, errors.New("placer: incomplete Sandbox plan request")
 		}
-		demand, err := placement.NormalizeSandboxDemand(request.Sandbox.Demand)
-		if err != nil {
-			return PlanResponse{}, err
-		}
-		candidates, err := placement.PlaceSandboxN(
-			request.Nodes, request.Sandbox.Demand, policy, s.config.Candidates, nil,
-		)
-		if err != nil {
-			return PlanResponse{}, err
-		}
 		templateRef, err := clusterstate.ResolveTemplateRef(group, request.Sandbox.TemplateRef)
 		if err != nil {
 			return PlanResponse{}, err
 		}
 		requestedConfig := clusterstate.WithoutSystemMetadata(request.Sandbox.Config)
 		effectiveConfig := clusterstate.WithoutSystemMetadata(mergeConfig(group.Config, requestedConfig))
+		resources, err := sandboxcfg.ResolveResources(effectiveConfig)
+		if err != nil {
+			return PlanResponse{}, err
+		}
+		sandboxDemand, err := mergeSandboxDemand(request.Sandbox.Demand, resources)
+		if err != nil {
+			return PlanResponse{}, err
+		}
+		demand, err := placement.NormalizeSandboxDemand(sandboxDemand)
+		if err != nil {
+			return PlanResponse{}, err
+		}
+		candidates, err := placement.PlaceSandboxN(
+			request.Nodes, sandboxDemand, policy, s.config.Candidates, nil,
+		)
+		if err != nil {
+			return PlanResponse{}, err
+		}
 		nodeRequest, err := api.RewriteSandboxCreateEnvelope(
 			request.Sandbox.Request, templateRef, request.Sandbox.TimeoutSeconds, effectiveConfig,
 		)
@@ -339,6 +348,25 @@ func (s *FinalService) Plan(ctx context.Context, request PlanRequest) (PlanRespo
 	default:
 		return PlanResponse{}, errors.New("placer: unsupported plan kind")
 	}
+}
+
+func mergeSandboxDemand(
+	demand placement.SandboxDemand,
+	resources sandboxcfg.ResolvedResources,
+) (placement.SandboxDemand, error) {
+	if resources.FloorMemoryBytes > 0 {
+		if demand.FloorMemory > 0 && demand.FloorMemory != resources.FloorMemoryBytes {
+			return placement.SandboxDemand{}, errors.New("placer: Sandbox floor memory conflicts with effective config")
+		}
+		demand.FloorMemory = resources.FloorMemoryBytes
+	}
+	if resources.StartupMemoryBytes > 0 {
+		if demand.StartupBudgetMemory > 0 && demand.StartupBudgetMemory != resources.StartupMemoryBytes {
+			return placement.SandboxDemand{}, errors.New("placer: Sandbox startup memory conflicts with effective config")
+		}
+		demand.StartupBudgetMemory = resources.StartupMemoryBytes
+	}
+	return demand, nil
 }
 
 func providerPolicyDigest(

@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
@@ -47,6 +48,7 @@ type ControlPlane interface {
 	ResumeSandbox(context.Context, string, string, uint64) (routeclient.RouteMutationResult, error)
 	DeleteSandbox(context.Context, string, string, uint64) (routeclient.RouteMutationResult, error)
 	ReadRoute(context.Context, string, string, uint64) (routeclient.RouteReadResult, error)
+	ReadAddressableRoute(context.Context, string, string, uint64) (routeclient.RouteReadResult, error)
 	RegisterBuild(context.Context, string, string, uint64, routeapi.BuildInput) (routeclient.BuildMutationResult, error)
 	ReadBuild(context.Context, string, string, uint64) (routeclient.BuildReadResult, error)
 	ListRoutes(context.Context, string) (routeclient.RouteListResult, error)
@@ -75,12 +77,16 @@ type buildEntry struct {
 }
 
 type reserveFlight struct {
-	done  chan struct{}
-	route *routeEntry
-	err   error
+	done        chan struct{}
+	inputDigest [sha256.Size]byte
+	route       *routeEntry
+	err         error
 }
 
-var errRoutePending = errors.New("finalrouter: Route mutation is pending")
+var (
+	errRoutePending       = errors.New("finalrouter: Route mutation is pending")
+	errRouteInputConflict = errors.New("finalrouter: Route is reserved with different immutable input")
+)
 
 type Router struct {
 	control    ControlPlane
@@ -288,6 +294,10 @@ func (r *Router) createSandbox(w http.ResponseWriter, request *http.Request) {
 			})
 			return
 		}
+		if errors.Is(err, errRouteInputConflict) {
+			http.Error(w, "route key is reserved with different input", http.StatusConflict)
+			return
+		}
 		r.log.Warn("router reserve", "group", group, "route_key", routeKey, "err", err)
 		http.Error(w, "sandbox is not ready", http.StatusServiceUnavailable)
 		return
@@ -305,8 +315,17 @@ func (r *Router) createSandbox(w http.ResponseWriter, request *http.Request) {
 
 func (r *Router) reserve(ctx context.Context, group, routeKey string, input routeapi.SandboxInput) (*routeEntry, error) {
 	key := routeKeyID(group, routeKey)
+	rawInput, err := json.Marshal(input)
+	if err != nil {
+		return nil, err
+	}
+	inputDigest := sha256.Sum256(rawInput)
 	r.reserveMu.Lock()
 	if flight := r.flights[key]; flight != nil {
+		if flight.inputDigest != inputDigest {
+			r.reserveMu.Unlock()
+			return nil, errRouteInputConflict
+		}
 		r.reserveMu.Unlock()
 		select {
 		case <-flight.done:
@@ -315,7 +334,7 @@ func (r *Router) reserve(ctx context.Context, group, routeKey string, input rout
 			return nil, ctx.Err()
 		}
 	}
-	flight := &reserveFlight{done: make(chan struct{})}
+	flight := &reserveFlight{done: make(chan struct{}), inputDigest: inputDigest}
 	r.flights[key] = flight
 	r.reserveMu.Unlock()
 
@@ -424,7 +443,7 @@ func (r *Router) sandboxControl(w http.ResponseWriter, request *http.Request) {
 			err = errors.Join(resumeErr, errors.New("Route resume did not become READY"))
 		}
 	} else {
-		entry, err = r.resolveRoute(request.Context(), group, routeKey)
+		entry, err = r.resolveControlRoute(request.Context(), group, routeKey)
 	}
 	if err != nil || entry == nil {
 		http.Error(w, "sandbox not found", http.StatusNotFound)
@@ -468,7 +487,24 @@ func (r *Router) registerBuild(w http.ResponseWriter, request *http.Request) {
 		},
 	}
 	result, err := r.control.RegisterBuild(request.Context(), group, buildID, 0, input)
-	if err != nil || result.Response.Outcome != routeapi.MutationReady || result.Response.Build == nil {
+	if errors.Is(err, routeclient.ErrPermitUnavailable) {
+		http.Error(w, "Build registration unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	if err != nil {
+		r.log.Warn("Build registration outcome is ambiguous", "group", group, "build_id", buildID, "err", err)
+	}
+	if err != nil || result.Response.Outcome == routeapi.MutationPending {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"templateID": templateID, "buildID": buildID, "public": false,
+			"names": names, "tags": aliases, "aliases": aliases, "profile": register.Profile,
+			"state": "pending",
+		})
+		return
+	}
+	if result.Response.Outcome != routeapi.MutationReady || result.Response.Build == nil {
 		http.Error(w, "Build registration unavailable", http.StatusServiceUnavailable)
 		return
 	}
@@ -857,6 +893,27 @@ func (r *Router) resolveRoute(ctx context.Context, group, routeKey string) (*rou
 		return nil, errors.New("Route serveIdentity is no longer permitted")
 	}
 	r.rememberRoute(entry)
+	return entry, nil
+}
+
+func (r *Router) resolveControlRoute(ctx context.Context, group, routeKey string) (*routeEntry, error) {
+	if cached := r.cachedRoute(group, routeKey); cached != nil {
+		return cached, nil
+	}
+	result, err := r.control.ReadAddressableRoute(ctx, group, routeKey, r.minimumRouteRevision(group, routeKey))
+	if err != nil || result.Response.Outcome != routeapi.ReadReady || result.Response.Route == nil {
+		return nil, errors.New("Route has no addressable execution")
+	}
+	entry := &routeEntry{
+		Route: *result.Response.Route, Group: group, RouteKey: routeKey,
+		Revision: result.Response.RouteRevision, ServeIdentity: result.ServeIdentity,
+	}
+	if !r.control.CacheAuthorized(entry.ServeIdentity) {
+		return nil, errors.New("Route serveIdentity is no longer permitted")
+	}
+	if result.Response.State == clusterstate.WorkflowRouteReady {
+		r.rememberRoute(entry)
+	}
 	return entry, nil
 }
 

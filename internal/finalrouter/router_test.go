@@ -13,17 +13,23 @@ import (
 	"time"
 
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
+	"github.com/kuasar-sandbox/orchestrator/internal/placement"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxy"
 	"github.com/kuasar-sandbox/orchestrator/internal/routeapi"
 	"github.com/kuasar-sandbox/orchestrator/internal/routeclient"
 )
 
 type revisionControl struct {
-	serveIdentity routeapi.RegistryServeIdentity
-	route         clusterstate.ReadyRoute
-	revision      uint64
-	reserveMins   []uint64
-	readMins      []uint64
+	serveIdentity  routeapi.RegistryServeIdentity
+	route          clusterstate.ReadyRoute
+	routeState     clusterstate.RouteWorkflowState
+	revision       uint64
+	reserveMins    []uint64
+	readMins       []uint64
+	reserveStarted chan struct{}
+	reserveRelease chan struct{}
+	reserveCalls   int
+	register       func(string, string, routeapi.BuildInput) (routeclient.BuildMutationResult, error)
 }
 
 func (c *revisionControl) CurrentServeIdentity(bool) (routeapi.RegistryServeIdentity, error) {
@@ -34,6 +40,11 @@ func (c *revisionControl) CacheAuthorized(identity routeapi.RegistryServeIdentit
 }
 func (c *revisionControl) ReserveSandbox(_ context.Context, group, routeKey string, minimum uint64, _ routeapi.SandboxInput) (routeclient.RouteMutationResult, error) {
 	c.reserveMins = append(c.reserveMins, minimum)
+	c.reserveCalls++
+	if c.reserveStarted != nil {
+		close(c.reserveStarted)
+		<-c.reserveRelease
+	}
 	return routeclient.RouteMutationResult{ServeIdentity: c.serveIdentity, Response: routeapi.RouteMutationResponse{
 		Outcome: routeapi.MutationReady, Group: group, RouteKey: routeKey,
 		State: clusterstate.WorkflowRouteReady, Route: &c.route, RouteRevision: c.revision,
@@ -49,11 +60,25 @@ func (c *revisionControl) ReadRoute(_ context.Context, group, routeKey string, m
 	c.readMins = append(c.readMins, minimum)
 	return routeclient.RouteReadResult{ServeIdentity: c.serveIdentity, Response: routeapi.ReadRouteResponse{
 		Outcome: routeapi.ReadReady, Group: group, RouteKey: routeKey,
-		Route: &c.route, RouteRevision: c.revision,
+		State: clusterstate.WorkflowRouteReady, Route: &c.route, RouteRevision: c.revision,
 	}}, nil
 }
-func (*revisionControl) RegisterBuild(context.Context, string, string, uint64, routeapi.BuildInput) (routeclient.BuildMutationResult, error) {
-	return routeclient.BuildMutationResult{}, errors.New("unexpected RegisterBuild")
+func (c *revisionControl) ReadAddressableRoute(_ context.Context, group, routeKey string, minimum uint64) (routeclient.RouteReadResult, error) {
+	c.readMins = append(c.readMins, minimum)
+	state := c.routeState
+	if state == "" {
+		state = clusterstate.WorkflowRouteReady
+	}
+	return routeclient.RouteReadResult{ServeIdentity: c.serveIdentity, Response: routeapi.ReadRouteResponse{
+		Outcome: routeapi.ReadReady, Group: group, RouteKey: routeKey,
+		State: state, Route: &c.route, RouteRevision: c.revision,
+	}}, nil
+}
+func (c *revisionControl) RegisterBuild(_ context.Context, group, buildID string, _ uint64, input routeapi.BuildInput) (routeclient.BuildMutationResult, error) {
+	if c.register == nil {
+		return routeclient.BuildMutationResult{}, errors.New("unexpected RegisterBuild")
+	}
+	return c.register(group, buildID, input)
 }
 func (*revisionControl) ReadBuild(context.Context, string, string, uint64) (routeclient.BuildReadResult, error) {
 	return routeclient.BuildReadResult{}, errors.New("unexpected ReadBuild")
@@ -181,7 +206,108 @@ func TestCreateExposesRouteKeyInsteadOfConcreteSandboxID(t *testing.T) {
 	}
 }
 
-func TestSandboxControlRewritesRouteKeyToBoundSIDAndBack(t *testing.T) {
+func TestConcurrentReserveRejectsDifferentImmutableInput(t *testing.T) {
+	serveIdentity := routeapi.RegistryServeIdentity{
+		ClusterID: "cluster-1", RegistryGeneration: "generation-1", SystemEpoch: 1,
+		RegistryLayoutDigest: "registry-layout-1",
+	}
+	control := &revisionControl{
+		serveIdentity: serveIdentity, revision: 8,
+		route:          clusterstate.ReadyRoute{SandboxID: "sandbox-1", RegistryGeneration: "generation-1"},
+		reserveStarted: make(chan struct{}), reserveRelease: make(chan struct{}),
+	}
+	router, err := New(control, allowCaller{}, "example.test", time.Minute, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstDone := make(chan error, 1)
+	go func() {
+		_, reserveErr := router.reserve(context.Background(), "/group", "route-1", routeapi.SandboxInput{
+			Demand: placement.SandboxDemand{SlotUnits: 1}, Config: map[string]string{"mode": "first"},
+		})
+		firstDone <- reserveErr
+	}()
+	<-control.reserveStarted
+	_, conflict := router.reserve(context.Background(), "/group", "route-1", routeapi.SandboxInput{
+		Demand: placement.SandboxDemand{SlotUnits: 1}, Config: map[string]string{"mode": "second"},
+	})
+	if !errors.Is(conflict, errRouteInputConflict) {
+		t.Fatalf("conflicting in-flight reserve = %v", conflict)
+	}
+	close(control.reserveRelease)
+	if err := <-firstDone; err != nil {
+		t.Fatal(err)
+	}
+	if control.reserveCalls != 1 {
+		t.Fatalf("Registry reserve calls = %d, want 1", control.reserveCalls)
+	}
+}
+
+func TestBuildRegistrationPendingReturnsGeneratedStableIDs(t *testing.T) {
+	serveIdentity := routeapi.RegistryServeIdentity{
+		ClusterID: "cluster-1", RegistryGeneration: "generation-1", SystemEpoch: 1,
+		RegistryLayoutDigest: "registry-layout-1",
+	}
+	for _, test := range []struct {
+		name   string
+		result routeclient.BuildMutationResult
+		err    error
+	}{
+		{name: "committed pending", result: routeclient.BuildMutationResult{Response: routeapi.BuildMutationResponse{Outcome: routeapi.MutationPending}}},
+		{name: "ambiguous response", err: errors.New("response lost")},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var capturedBuildID, capturedTemplateID string
+			control := &revisionControl{serveIdentity: serveIdentity}
+			control.register = func(_ string, buildID string, input routeapi.BuildInput) (routeclient.BuildMutationResult, error) {
+				capturedBuildID, capturedTemplateID = buildID, input.TemplateID
+				return test.result, test.err
+			}
+			router, err := New(control, allowCaller{}, "example.test", time.Minute, slog.Default())
+			if err != nil {
+				t.Fatal(err)
+			}
+			request := httptest.NewRequest(http.MethodPost, "http://api.example.test/v3/templates",
+				bytes.NewBufferString(`{"cpuCount":1,"memoryMB":512}`))
+			request.Host = "api.example.test"
+			request.Header.Set(HeaderGroup, "/group")
+			response := httptest.NewRecorder()
+			router.Handler().ServeHTTP(response, request)
+			var body map[string]any
+			if response.Code != http.StatusAccepted || json.Unmarshal(response.Body.Bytes(), &body) != nil {
+				t.Fatalf("registration = %d %s", response.Code, response.Body.String())
+			}
+			if body["buildID"] != capturedBuildID || body["templateID"] != capturedTemplateID || body["state"] != "pending" {
+				t.Fatalf("pending identity = %+v, captured=(%q,%q)", body, capturedBuildID, capturedTemplateID)
+			}
+		})
+	}
+}
+
+func TestBuildRegistrationWithoutServePermitFailsBeforePublishingIDs(t *testing.T) {
+	control := &revisionControl{}
+	control.register = func(_ string, _ string, _ routeapi.BuildInput) (routeclient.BuildMutationResult, error) {
+		return routeclient.BuildMutationResult{}, routeclient.ErrPermitUnavailable
+	}
+	router, err := New(control, allowCaller{}, "example.test", time.Minute, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "http://api.example.test/v3/templates",
+		bytes.NewBufferString(`{"cpuCount":1,"memoryMB":512}`))
+	request.Host = "api.example.test"
+	request.Header.Set(HeaderGroup, "/group")
+	response := httptest.NewRecorder()
+	router.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("registration = %d %s", response.Code, response.Body.String())
+	}
+	if strings.Contains(response.Body.String(), "buildID") {
+		t.Fatalf("definitive preflight failure published a Build ID: %s", response.Body.String())
+	}
+}
+
+func TestPausedSandboxControlResolvesBoundSIDAfterCacheMiss(t *testing.T) {
 	serveIdentity := routeapi.RegistryServeIdentity{
 		ClusterID: "cluster-1", RegistryGeneration: "serveIdentity-1", SystemEpoch: 1,
 		RegistryLayoutDigest: "registry-layout-1",
@@ -204,7 +330,7 @@ func TestSandboxControlRewritesRouteKeyToBoundSIDAndBack(t *testing.T) {
 		})
 	}))
 	defer backend.Close()
-	control := &revisionControl{serveIdentity: serveIdentity, revision: 8, route: clusterstate.ReadyRoute{
+	control := &revisionControl{serveIdentity: serveIdentity, revision: 8, routeState: clusterstate.WorkflowRoutePaused, route: clusterstate.ReadyRoute{
 		SandboxID: "node-local-sandbox", NodeID: "node-1", NodeEpoch: 7,
 		DataEndpoint: strings.TrimPrefix(backend.URL, "http://"), RegistryGeneration: serveIdentity.RegistryGeneration,
 		BindingDigest: "binding-1", TemplateRef: "template-1",

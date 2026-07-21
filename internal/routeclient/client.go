@@ -265,6 +265,27 @@ func (c *Client) ReadRoute(
 	return RouteReadResult{Response: response, ServeIdentity: serveIdentityFromRequest(identity)}, err
 }
 
+// ReadAddressableRoute resolves an execution for direct control forwarding.
+// It is deliberately leader-only: replica-local positive reads remain limited
+// to READY Routes, while the strong path may also expose a committed PAUSED
+// execution without making it eligible for data-plane routing.
+func (c *Client) ReadAddressableRoute(
+	ctx context.Context,
+	group, routeKey string,
+	minRevision uint64,
+) (RouteReadResult, error) {
+	identity, err := c.routeIdentity(group, routeKey, false)
+	if err != nil {
+		return RouteReadResult{}, err
+	}
+	request := routeapi.ReadRouteRequest{
+		RequestIdentity: identity, Group: group, RouteKey: routeKey,
+		MinRouteRevision: minRevision, Strong: true, Addressable: true,
+	}
+	response, err := c.readRouteStrong(ctx, request)
+	return RouteReadResult{Response: response, ServeIdentity: serveIdentityFromRequest(identity)}, err
+}
+
 func (c *Client) RegisterBuild(
 	ctx context.Context,
 	group, buildID string,

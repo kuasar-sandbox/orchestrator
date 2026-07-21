@@ -53,6 +53,7 @@ type ReadRouteRequest struct {
 	RouteKey         string `json:"route_key"`
 	MinRouteRevision uint64 `json:"min_route_revision,omitempty"`
 	Strong           bool   `json:"strong,omitempty"`
+	Addressable      bool   `json:"addressable,omitempty"`
 }
 
 func (r ReadRouteRequest) Validate() error {
@@ -62,17 +63,21 @@ func (r ReadRouteRequest) Validate() error {
 	if r.Group == "" || r.RouteKey == "" {
 		return errors.New("routeapi: group and route key are required")
 	}
+	if r.Addressable && !r.Strong {
+		return errors.New("routeapi: addressable Route projection requires a strong read")
+	}
 	return nil
 }
 
 type ReadRouteResponse struct {
-	Outcome       string                   `json:"outcome"`
-	Group         string                   `json:"group,omitempty"`
-	RouteKey      string                   `json:"route_key,omitempty"`
-	Route         *clusterstate.ReadyRoute `json:"route,omitempty"`
-	RouteRevision uint64                   `json:"route_revision,omitempty"`
-	LeaderHint    *LeaderHint              `json:"leader_hint,omitempty"`
-	Reason        string                   `json:"reason,omitempty"`
+	Outcome       string                          `json:"outcome"`
+	Group         string                          `json:"group,omitempty"`
+	RouteKey      string                          `json:"route_key,omitempty"`
+	Route         *clusterstate.ReadyRoute        `json:"route,omitempty"`
+	State         clusterstate.RouteWorkflowState `json:"state,omitempty"`
+	RouteRevision uint64                          `json:"route_revision,omitempty"`
+	LeaderHint    *LeaderHint                     `json:"leader_hint,omitempty"`
+	Reason        string                          `json:"reason,omitempty"`
 }
 
 func (r ReadRouteResponse) ValidateFor(request ReadRouteRequest) error {
@@ -91,6 +96,10 @@ func (r ReadRouteResponse) ValidateFor(request ReadRouteRequest) error {
 		}
 		if r.LeaderHint != nil {
 			return errors.New("routeapi: READY cannot carry a leader hint")
+		}
+		if r.State != clusterstate.WorkflowRouteReady &&
+			!(request.Strong && request.Addressable && r.State == clusterstate.WorkflowRoutePaused) {
+			return errors.New("routeapi: READY projection carries a non-addressable Route state")
 		}
 		return nil
 	case ReadNeedLeader, ReadReplicaBehind:

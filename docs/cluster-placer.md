@@ -101,6 +101,11 @@ Placer 依次应用：
 
 动态可用资源不在 Placer 里缓存为权威；它由当前 Holder 的 request-time Probe 判断。
 
+Sandbox 内存 demand 不是 Router 猜测值。Placer 先合并 group `sandbox_config` 与 caller override，再从有效
+`kuasar-sandbox.resource` 派生 floor/startup；allocatable 缺省为 capacity，startup 缺省为 allocatable。
+未声明的内存保持 unknown，启用 resource controller 的节点会拒绝该 Probe。派生后的 canonical demand
+随 dispatch intent 持久化，并由 node-local Admission 原样校验和使用。
+
 ## 5. RandomN, Probe and P2C
 
 Placer 使用稳定随机源从过滤结果中返回四个不同候选。Registry 对 fresh pair 发起 Probe，Probe 必须验证：

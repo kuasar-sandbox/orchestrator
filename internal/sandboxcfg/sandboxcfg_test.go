@@ -144,6 +144,34 @@ func TestSetCapacityRoundTrip(t *testing.T) {
 	}
 }
 
+func TestResolveResourcesMatchesRuntimeDefaults(t *testing.T) {
+	resolved, err := ResolveResources(map[string]string{
+		NsResource: `{"capacity":{"cpu":4,"memory":"8GiB"},"allocatable":{"cpu":1.5,"memory":"2GiB"}}`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved.CapacityCPU != 4 || resolved.CapacityMemoryBytes != 8<<30 ||
+		resolved.FloorCPU != 1.5 || resolved.FloorMemoryBytes != 2<<30 ||
+		resolved.StartupMemoryBytes != 2<<30 {
+		t.Fatalf("resolved resources = %+v", resolved)
+	}
+	defaults, err := ResolveResources(map[string]string{
+		NsResource: `{"capacity":{"cpu":2,"memory":"3GiB"}}`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if defaults.FloorCPU != 2 || defaults.FloorMemoryBytes != 3<<30 || defaults.StartupMemoryBytes != 3<<30 {
+		t.Fatalf("capacity defaults = %+v", defaults)
+	}
+	if _, err := ResolveResources(map[string]string{
+		NsResource: `{"capacity":{"memory":"1GiB"},"allocatable":{"memory":"2GiB"}}`,
+	}); err == nil {
+		t.Fatal("allocatable memory above capacity was accepted")
+	}
+}
+
 func TestMergeNetworkExplicitWins(t *testing.T) {
 	// snapshot-inherited network; create explicitly sets only hostname.
 	snap := NetworkSpec{Hostname: "snap-host", Nexthop: "10.0.0.4", TransitGeneveVNI: 100, DNS: []string{"9.9.9.9"}}

@@ -900,8 +900,8 @@ func sandboxInputMatchesRecord(input routeapi.SandboxInput, record clusterstate.
 }
 
 func sandboxInputMatchesIntent(input routeapi.SandboxInput, intent clusterstate.DispatchIntent) bool {
-	demand, err := placement.NormalizeSandboxDemand(input.Demand)
-	if err != nil || !bytes.Equal(demand, intent.NormalizedDemand) {
+	demand, err := placement.ParseNormalizedDemand(intent.NormalizedDemand)
+	if err != nil || demand.Sandbox == nil || !sandboxDemandMatches(input.Demand, *demand.Sandbox) {
 		return false
 	}
 	spec, err := clusterstate.ParseSandboxDispatchSpec(intent.DispatchSpec)
@@ -914,6 +914,15 @@ func sandboxInputMatchesIntent(input routeapi.SandboxInput, intent clusterstate.
 	)
 	return err == nil && reflect.DeepEqual(spec.RequestedConfig, clusterstate.WithoutSystemMetadata(input.Config)) &&
 		reflect.DeepEqual(spec.Request, normalizedRequest)
+}
+
+func sandboxDemandMatches(input, persisted placement.SandboxDemand) bool {
+	if input.SlotUnits != persisted.SlotUnits {
+		return false
+	}
+	return (input.StartupBudgetMemory == 0 || input.StartupBudgetMemory == persisted.StartupBudgetMemory) &&
+		(input.FloorMemory == 0 || input.FloorMemory == persisted.FloorMemory) &&
+		(input.AllocatableAtSnapshot == 0 || input.AllocatableAtSnapshot == persisted.AllocatableAtSnapshot)
 }
 
 func routeIntent(record clusterstate.RouteWorkflowRecord) (clusterstate.DispatchIntent, bool) {

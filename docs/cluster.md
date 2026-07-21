@@ -155,9 +155,10 @@ state engine，并以 `(raft_shard_id, replica_id)` 隔离 keyspace。具体选�
 
 | 路径 | 语义 |
 | --- | --- |
-| local positive read | replica-local；只返回满足 identity、READY/positive state 和 `min_revision` 的投影 |
+| local positive read | replica-local；只返回满足 identity、`READY` state 和 `min_revision` 的投影 |
 | local miss / behind | 返回 `NEED_LEADER` 或 `REPLICA_BEHIND`，绝不返回最终 `NOT_FOUND` |
 | strong read | Leader/read-index 路径，可返回最终 `NOT_FOUND` |
+| addressable control read | 仅 Router 使用的 strong read；可返回 `READY` 或 `PAUSED` 的 exact execution，`PAUSED` 投影不得进入 READY/data cache |
 | ListRoutes | 每个 `(group, route_bucket)` 使用单个 Pebble snapshot，并返回该 bucket 的 shard revision |
 | WatchRoutes | durable compact changefeed；返回 floor/head/cursor，cursor 落后时明确 `reset` |
 
@@ -241,6 +242,11 @@ System committed Node Catalog
 
 候选不足四个时允许返回 1..4 个，不制造不可用节点。PlacementLoadSnapshot 周期不得超过 500ms，并在
 Admission、launch 和 completion 等重要变化时立即唤醒；memberlist 只可提供故障提示。
+
+Sandbox 的 `floor_memory` 与 `startup_budget_memory` 在 Placer 内从 group 缺省配置和 caller override 合并后的
+`kuasar-sandbox.resource` 派生，再进行 RandomN/Probe。`allocatable` 缺省为 `capacity`，startup 缺省为
+allocatable floor；没有声明的内存保持 unknown，不能按零需求绕过启用 resource controller 的节点检查。
+同一 normalized demand 同时进入 consensus intent 和 node-local Admission。
 
 ## 8. Node-local execution authority
 

@@ -64,6 +64,21 @@ func TestRegistryReserveKeepsCommittedStartingIntentAndBinding(t *testing.T) {
 	}
 }
 
+func TestSandboxRetryAcceptsPlacementDerivedDemandOnly(t *testing.T) {
+	persisted := placement.SandboxDemand{
+		SlotUnits: 1, StartupBudgetMemory: 2 << 30, FloorMemory: 2 << 30,
+	}
+	if !sandboxDemandMatches(placement.SandboxDemand{SlotUnits: 1}, persisted) {
+		t.Fatal("Router retry without internal memory fields did not match persisted derived demand")
+	}
+	if sandboxDemandMatches(placement.SandboxDemand{SlotUnits: 1, FloorMemory: 1 << 30}, persisted) {
+		t.Fatal("explicit conflicting memory demand matched persisted intent")
+	}
+	if sandboxDemandMatches(placement.SandboxDemand{SlotUnits: 2}, persisted) {
+		t.Fatal("different slot demand matched persisted intent")
+	}
+}
+
 func TestRegistryReadyPositiveReadStillChecksImmutableSandboxRequest(t *testing.T) {
 	service, store, planner, dispatcher := newRegistryServiceFixture(t, clusterstate.DispatchAcceptedAdmitted)
 	request := sandboxMutationRequest(t, store)

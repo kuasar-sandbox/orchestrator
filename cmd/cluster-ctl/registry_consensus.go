@@ -3,10 +3,12 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -452,7 +454,23 @@ func authenticatedHTTPClient(material clustercfg.TLS, endpoint string) (*http.Cl
 	if err != nil {
 		return nil, err
 	}
-	return &http.Client{Transport: &http.Transport{
-		TLSClientConfig: tlsConfig, ForceAttemptHTTP2: true,
-	}}, nil
+	return boundedAuthenticatedHTTPClient(tlsConfig), nil
+}
+
+func boundedAuthenticatedHTTPClient(tlsConfig *tls.Config) *http.Client {
+	dialer := &net.Dialer{Timeout: time.Second, KeepAlive: 30 * time.Second}
+	return &http.Client{
+		Timeout: 6 * time.Second,
+		Transport: &http.Transport{
+			DialContext:           dialer.DialContext,
+			TLSClientConfig:       tlsConfig,
+			TLSHandshakeTimeout:   2 * time.Second,
+			ResponseHeaderTimeout: 5 * time.Second,
+			ExpectContinueTimeout: time.Second,
+			IdleConnTimeout:       90 * time.Second,
+			MaxIdleConns:          256,
+			MaxIdleConnsPerHost:   32,
+			ForceAttemptHTTP2:     true,
+		},
+	}
 }

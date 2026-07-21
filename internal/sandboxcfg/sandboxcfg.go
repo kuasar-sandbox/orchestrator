@@ -14,12 +14,14 @@ package sandboxcfg
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
 	"strings"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
+	"github.com/kuasar-sandbox/orchestrator/internal/util"
 	rtconfig "github.com/kuasar-sandbox/sandboxer/pkg/config"
 	"gopkg.in/yaml.v3"
 )
@@ -56,6 +58,59 @@ type NetworkSpec struct {
 type ResourceSpec struct {
 	Capacity    *rtconfig.CapacityConfig    `json:"capacity,omitempty" yaml:"capacity,omitempty"`
 	Allocatable *rtconfig.AllocatableConfig `json:"allocatable,omitempty" yaml:"allocatable,omitempty"`
+}
+
+// ResolvedResources is the resource declaration shared by cluster placement
+// and node-local Admission. Zero fields remain unknown and must not be guessed
+// by the cluster.
+type ResolvedResources struct {
+	CapacityMemoryBytes uint64
+	CapacityCPU         int
+	FloorMemoryBytes    uint64
+	FloorCPU            float64
+	StartupMemoryBytes  uint64
+}
+
+// ResolveResources derives the cold-start resource declaration from the
+// effective kuasar-sandbox.resource metadata. Allocatable defaults to capacity,
+// and the startup budget defaults to the allocatable floor, matching the
+// sandbox runtime defaults.
+func ResolveResources(meta map[string]string) (ResolvedResources, error) {
+	spec, err := ParseSpec(meta)
+	if err != nil {
+		return ResolvedResources{}, err
+	}
+	var out ResolvedResources
+	if capacity := spec.Resource.Capacity; capacity != nil {
+		out.CapacityCPU = capacity.CPU
+		if capacity.Memory != "" {
+			out.CapacityMemoryBytes, err = util.ParseSize(capacity.Memory)
+			if err != nil {
+				return ResolvedResources{}, fmt.Errorf("sandboxcfg: resource capacity memory: %w", err)
+			}
+		}
+	}
+	out.FloorCPU = float64(out.CapacityCPU)
+	out.FloorMemoryBytes = out.CapacityMemoryBytes
+	if allocatable := spec.Resource.Allocatable; allocatable != nil {
+		if allocatable.CPU > 0 {
+			out.FloorCPU = allocatable.CPU
+		}
+		if allocatable.Memory != "" {
+			out.FloorMemoryBytes, err = util.ParseSize(allocatable.Memory)
+			if err != nil {
+				return ResolvedResources{}, fmt.Errorf("sandboxcfg: resource allocatable memory: %w", err)
+			}
+		}
+	}
+	if out.CapacityMemoryBytes > 0 && out.FloorMemoryBytes > out.CapacityMemoryBytes {
+		return ResolvedResources{}, errors.New("sandboxcfg: allocatable memory exceeds capacity")
+	}
+	if out.CapacityCPU > 0 && out.FloorCPU > float64(out.CapacityCPU) {
+		return ResolvedResources{}, errors.New("sandboxcfg: allocatable CPU exceeds capacity")
+	}
+	out.StartupMemoryBytes = out.FloorMemoryBytes
+	return out, nil
 }
 
 // TapFD is the node-managed tapfd transport rendered into runtime config.

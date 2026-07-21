@@ -819,11 +819,28 @@ func (n *FinalClusterNode) sandboxDemand(ctx context.Context, record nodeexec.Di
 		return nodectl.SandboxAdmissionDemand{}, errors.Join(err, errors.New("Sandbox normalized demand is missing"))
 	}
 	demand := normalized.Sandbox
+	resources, err := sandboxcfg.ResolveResources(spec.Config)
+	if err != nil {
+		return nodectl.SandboxAdmissionDemand{}, err
+	}
+	if resources.FloorMemoryBytes > 0 && resources.FloorMemoryBytes != demand.FloorMemory ||
+		resources.StartupMemoryBytes > 0 && resources.StartupMemoryBytes != demand.StartupBudgetMemory {
+		return nodectl.SandboxAdmissionDemand{}, errors.New("Sandbox normalized demand does not match effective resource config")
+	}
+	capacityMemory := uint64(max(n.core.cfg.Sandbox.Resources.MemoryMiB(), 0)) << 20
+	capacityCPU := n.core.cfg.Sandbox.Resources.VCPU
+	if resources.CapacityMemoryBytes > 0 {
+		capacityMemory = resources.CapacityMemoryBytes
+	}
+	if resources.CapacityCPU > 0 {
+		capacityCPU = resources.CapacityCPU
+	}
 	return nodectl.SandboxAdmissionDemand{
 		SlotUnits:             demand.SlotUnits,
-		CapacityMemoryBytes:   uint64(max(n.core.cfg.Sandbox.Resources.MemoryMiB(), 0)) << 20,
-		CapacityCPU:           n.core.cfg.Sandbox.Resources.VCPU,
+		CapacityMemoryBytes:   capacityMemory,
+		CapacityCPU:           capacityCPU,
 		FloorMemoryBytes:      demand.FloorMemory,
+		FloorCPU:              resources.FloorCPU,
 		StartupBudgetMemory:   demand.StartupBudgetMemory,
 		AllocatableAtSnapshot: demand.AllocatableAtSnapshot,
 	}, nil

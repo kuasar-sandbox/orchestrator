@@ -41,7 +41,7 @@ func TestReplicaLocalRouteReadNeverReturnsFinalNegative(t *testing.T) {
 	}
 	request.Strong = false
 	request.MinRouteRevision = 12
-	if err := (ReadRouteResponse{Outcome: ReadReady, Group: "/g", RouteKey: "rk", Route: testReadyRoute(), RouteRevision: 11}).ValidateFor(request); err == nil {
+	if err := (ReadRouteResponse{Outcome: ReadReady, Group: "/g", RouteKey: "rk", State: clusterstate.WorkflowRouteReady, Route: testReadyRoute(), RouteRevision: 11}).ValidateFor(request); err == nil {
 		t.Fatal("READY below min_route_revision accepted")
 	}
 	response := ReadRouteResponse{
@@ -54,7 +54,7 @@ func TestReplicaLocalRouteReadNeverReturnsFinalNegative(t *testing.T) {
 }
 
 func TestTrustedHandlerRequiresInternalTransportIdentity(t *testing.T) {
-	service := fakeService{route: ReadRouteResponse{Outcome: ReadReady, Group: "/g", RouteKey: "rk", Route: testReadyRoute(), RouteRevision: 12}}
+	service := fakeService{route: ReadRouteResponse{Outcome: ReadReady, Group: "/g", RouteKey: "rk", State: clusterstate.WorkflowRouteReady, Route: testReadyRoute(), RouteRevision: 12}}
 	body, _ := json.Marshal(routeRequest(false))
 	untrusted := httptest.NewRequest(http.MethodPost, ReadRoutePath, bytes.NewReader(body))
 	w := httptest.NewRecorder()
@@ -121,7 +121,8 @@ func TestRouterStateCarriesMonotonicRevisionAndLeaderHint(t *testing.T) {
 		t.Fatalf("initial minimum = %d", request.MinRouteRevision)
 	}
 	if err := state.ObserveRoute(request, ReadRouteResponse{
-		Outcome: ReadReady, Group: "/g", RouteKey: "rk", Route: testReadyRoute(), RouteRevision: 12,
+		Outcome: ReadReady, Group: "/g", RouteKey: "rk", State: clusterstate.WorkflowRouteReady,
+		Route: testReadyRoute(), RouteRevision: 12,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -146,7 +147,7 @@ func TestPositiveReadsRequireExactTableKeyIdentity(t *testing.T) {
 	request := routeRequest(false)
 	response := ReadRouteResponse{
 		Outcome: ReadReady, Group: request.Group, RouteKey: request.RouteKey,
-		Route: testReadyRoute(), RouteRevision: 1,
+		State: clusterstate.WorkflowRouteReady, Route: testReadyRoute(), RouteRevision: 1,
 	}
 	if err := response.ValidateFor(request); err != nil {
 		t.Fatal(err)
@@ -168,6 +169,26 @@ func TestPositiveReadsRequireExactTableKeyIdentity(t *testing.T) {
 	buildResponse.Group = "/another-group"
 	if err := buildResponse.ValidateFor(buildRequest); err == nil {
 		t.Fatal("positive Build projection for another Group was accepted")
+	}
+}
+
+func TestPausedProjectionRequiresExplicitStrongAddressableRead(t *testing.T) {
+	request := routeRequest(false)
+	request.Addressable = true
+	if err := request.Validate(); err == nil {
+		t.Fatal("replica-local addressable projection request was accepted")
+	}
+	request.Strong = true
+	response := ReadRouteResponse{
+		Outcome: ReadReady, Group: request.Group, RouteKey: request.RouteKey,
+		State: clusterstate.WorkflowRoutePaused, Route: testReadyRoute(), RouteRevision: 12,
+	}
+	if err := response.ValidateFor(request); err != nil {
+		t.Fatalf("strong addressable PAUSED projection: %v", err)
+	}
+	request.Addressable = false
+	if err := response.ValidateFor(request); err == nil {
+		t.Fatal("ordinary strong read accepted a PAUSED projection")
 	}
 }
 

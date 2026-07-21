@@ -642,6 +642,14 @@ func lookupRoute(state DataState, request routeapi.ReadRouteRequest) routeapi.Re
 	if record.Revision.LogIndex < request.MinRouteRevision {
 		return routeapi.ReadRouteResponse{Outcome: routeapi.ReadReplicaBehind, Reason: "Route revision is below the requested minimum"}
 	}
+	if record.State == clusterstate.WorkflowRoutePaused && record.Paused != nil && request.Strong && request.Addressable {
+		paused := record.Paused.Execution
+		return routeapi.ReadRouteResponse{
+			Outcome: routeapi.ReadReady, Group: record.Group, RouteKey: record.RouteKey,
+			State: clusterstate.WorkflowRoutePaused,
+			Route: &paused, RouteRevision: record.Revision.LogIndex,
+		}
+	}
 	if record.State != clusterstate.WorkflowRouteReady || record.Ready == nil {
 		if request.Strong {
 			return routeapi.ReadRouteResponse{Outcome: routeapi.ReadConflict, Reason: string(record.State)}
@@ -651,7 +659,7 @@ func lookupRoute(state DataState, request routeapi.ReadRouteRequest) routeapi.Re
 	ready := *record.Ready
 	return routeapi.ReadRouteResponse{
 		Outcome: routeapi.ReadReady, Group: record.Group, RouteKey: record.RouteKey,
-		Route: &ready, RouteRevision: record.Revision.LogIndex,
+		State: clusterstate.WorkflowRouteReady, Route: &ready, RouteRevision: record.Revision.LogIndex,
 	}
 }
 

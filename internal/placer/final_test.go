@@ -72,6 +72,48 @@ func TestFinalPlanMintsIndependentCapabilityAndPreservesRequest(t *testing.T) {
 	}
 }
 
+func TestFinalPlanDerivesSandboxDemandFromEffectiveGroupConfig(t *testing.T) {
+	templateRef := "e2b-img-" + strings.Repeat("c", 64)
+	provider := keyLeaseProvider{
+		group: clusterstate.SandboxGroup{
+			Group: "/group", TemplateRef: templateRef,
+			Config: map[string]string{
+				"kuasar-sandbox.resource": `{"capacity":{"cpu":4,"memory":"8GiB"},"allocatable":{"cpu":1,"memory":"2GiB"}}`,
+			},
+		},
+		auth:     clusterstate.Secret{Type: clusterstate.SecretInline, Value: strings.Repeat("a", 64)},
+		manifest: clusterstate.Secret{Type: clusterstate.SecretInline, Value: strings.Repeat("b", 64)},
+	}
+	service, err := NewFinalService(provider, clustercfg.PlacementConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	envelope, err := clusterstate.NewNodeRequestEnvelopeV1(http.MethodPost, "/sandboxes", "", nil, []byte(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := service.Plan(context.Background(), PlanRequest{
+		Kind: PlanSandbox, Group: "/group", RouteKey: "route-1",
+		Nodes: []placement.CatalogNode{{
+			NodeID: "node-1", SandboxSlotCapacity: 4, Capabilities: map[string]bool{"sandbox": true},
+		}},
+		Sandbox: &SandboxPlanInput{
+			SandboxID: "sandbox-1", Demand: placement.SandboxDemand{SlotUnits: 1}, Request: envelope,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	demand, err := placement.ParseNormalizedDemand(response.NormalizedDemand)
+	if err != nil || demand.Sandbox == nil {
+		t.Fatalf("normalized demand = %+v, %v", demand, err)
+	}
+	if demand.Sandbox.FloorMemory != 2<<30 || demand.Sandbox.StartupBudgetMemory != 2<<30 ||
+		demand.Sandbox.AllocatableAtSnapshot != 0 {
+		t.Fatalf("derived Sandbox demand = %+v", demand.Sandbox)
+	}
+}
+
 type testGroupAuthorizer struct {
 	keyLeaseProvider
 	called bool

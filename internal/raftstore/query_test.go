@@ -40,7 +40,30 @@ func TestRouteLookupSeparatesLocalPositiveAndStrongNegativeReads(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	request.MinRouteRevision = 4
+	paused := pausedRecord(ready, 2)
+	applyDataOK(t, &state, 4, DataCommand{
+		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{LogIndex: 3}, Route: &paused,
+	})
+	request.MinRouteRevision = 0
+	if got := lookupRouteResult(t, state, request).Outcome; got != routeapi.ReadNeedLeader {
+		t.Fatalf("local PAUSED outcome = %s", got)
+	}
+	request.Strong = true
+	if got := lookupRouteResult(t, state, request).Outcome; got != routeapi.ReadConflict {
+		t.Fatalf("ordinary strong PAUSED outcome = %s", got)
+	}
+	request.Addressable = true
+	response = lookupRouteResult(t, state, request)
+	if response.Outcome != routeapi.ReadReady || response.State != clusterstate.WorkflowRoutePaused ||
+		response.RouteRevision != 4 || response.Route.SandboxID != "sandbox-1" {
+		t.Fatalf("addressable PAUSED response = %+v", response)
+	}
+	if err := response.ValidateFor(request); err != nil {
+		t.Fatal(err)
+	}
+	request.Strong, request.Addressable = false, false
+
+	request.MinRouteRevision = 5
 	if got := lookupRouteResult(t, state, request).Outcome; got != routeapi.ReadReplicaBehind {
 		t.Fatalf("minimum-revision outcome = %s", got)
 	}
