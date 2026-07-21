@@ -16,7 +16,7 @@ func TestRouteLookupSeparatesLocalPositiveAndStrongNegativeReads(t *testing.T) {
 		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{Absent: true}, Route: &starting,
 	})
 
-	request := routeLookupRequest(identity, "/g", "rk", "sandbox-1", false)
+	request := routeLookupRequest(identity, "/g", "rk", false)
 	response := lookupRouteResult(t, state, request)
 	if response.Outcome != routeapi.ReadNeedLeader {
 		t.Fatalf("local STARTING outcome = %s", response.Outcome)
@@ -40,18 +40,36 @@ func TestRouteLookupSeparatesLocalPositiveAndStrongNegativeReads(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	request.MinRouteRevision = 4
+	paused := pausedRecord(ready, 2)
+	applyDataOK(t, &state, 4, DataCommand{
+		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{LogIndex: 3}, Route: &paused,
+	})
+	request.MinRouteRevision = 0
+	if got := lookupRouteResult(t, state, request).Outcome; got != routeapi.ReadNeedLeader {
+		t.Fatalf("local PAUSED outcome = %s", got)
+	}
+	request.Strong = true
+	if got := lookupRouteResult(t, state, request).Outcome; got != routeapi.ReadConflict {
+		t.Fatalf("ordinary strong PAUSED outcome = %s", got)
+	}
+	request.Addressable = true
+	response = lookupRouteResult(t, state, request)
+	if response.Outcome != routeapi.ReadReady || response.State != clusterstate.WorkflowRoutePaused ||
+		response.RouteRevision != 4 || response.Route.SandboxID != "sandbox-1" {
+		t.Fatalf("addressable PAUSED response = %+v", response)
+	}
+	if err := response.ValidateFor(request); err != nil {
+		t.Fatal(err)
+	}
+	request.Strong, request.Addressable = false, false
+
+	request.MinRouteRevision = 5
 	if got := lookupRouteResult(t, state, request).Outcome; got != routeapi.ReadReplicaBehind {
 		t.Fatalf("minimum-revision outcome = %s", got)
 	}
-	request.MinRouteRevision = 0
-	request.SandboxID = "sandbox-old"
-	if got := lookupRouteResult(t, state, request).Outcome; got != routeapi.ReadNeedLeader {
-		t.Fatalf("local SID mismatch outcome = %s", got)
-	}
 
 	missingKey := routeKeyForShard(t, registryLayout, "/g", identity.ShardID, "missing")
-	missing := routeLookupRequest(identity, "/g", missingKey, "", false)
+	missing := routeLookupRequest(identity, "/g", missingKey, false)
 	if got := lookupRouteResult(t, state, missing).Outcome; got != routeapi.ReadNeedLeader {
 		t.Fatalf("local miss outcome = %s", got)
 	}
@@ -61,7 +79,7 @@ func TestRouteLookupSeparatesLocalPositiveAndStrongNegativeReads(t *testing.T) {
 		t.Fatalf("strong miss response = %+v", missingResponse)
 	}
 
-	fenced := routeLookupRequest(identity, "/g", "rk", "", false)
+	fenced := routeLookupRequest(identity, "/g", "rk", false)
 	fenced.RegistryLayoutDigest = digestFor("old-registryLayout")
 	if got := lookupRouteResult(t, state, fenced).Outcome; got != routeapi.ReadUnavailable {
 		t.Fatalf("fenced identity outcome = %s", got)
@@ -79,14 +97,25 @@ func TestBuildLookupReturnsOnlyBoundPositiveProjection(t *testing.T) {
 	if got := lookupBuildResult(t, state, request).Outcome; got != routeapi.ReadNeedLeader {
 		t.Fatalf("unprojected Build outcome = %s", got)
 	}
+	request.Strong = true
+	pending := lookupBuildResult(t, state, request)
+	if pending.Outcome != routeapi.ReadConflict || pending.BuildState != clusterstate.BuildStarting ||
+		pending.BuildRevision != 2 || pending.Pending == nil || pending.Pending.BuildID != "build-1" ||
+		pending.Pending.TemplateRef != "template-1" {
+		t.Fatalf("strong BUILD_STARTING projection = %+v", pending)
+	}
+	if err := pending.ValidateFor(request); err != nil {
+		t.Fatal(err)
+	}
 
-	queued := buildProjectionRecord(starting, clusterstate.BuildQueued, 1)
+	registered := buildRegistrationRecord(starting)
 	applyDataOK(t, &state, 3, DataCommand{
-		Type: DataPutBuild, Identity: identity, Expect: RevisionExpectation{LogIndex: 2}, Build: &queued,
+		Type: DataPutBuild, Identity: identity, Expect: RevisionExpectation{LogIndex: 2}, Build: &registered,
 	})
+	request.Strong = false
 	response := lookupBuildResult(t, state, request)
-	if response.Outcome != routeapi.ReadReady || response.BuildState != clusterstate.BuildQueued || response.BuildRevision != 3 {
-		t.Fatalf("queued Build response = %+v", response)
+	if response.Outcome != routeapi.ReadReady || response.BuildState != clusterstate.BuildRegistered || response.BuildRevision != 3 {
+		t.Fatalf("registered Build response = %+v", response)
 	}
 	if err := response.ValidateFor(request); err != nil {
 		t.Fatal(err)
@@ -167,21 +196,40 @@ func TestRouteBucketSnapshotAndChangefeedUseShardRevisions(t *testing.T) {
 	applyDataOK(t, &state, 4, DataCommand{
 		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{Absent: true}, Route: &second,
 	})
+	secondReady := readyRecord(second, 1)
+	applyDataOK(t, &state, 5, DataCommand{
+		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{LogIndex: 4}, Route: &secondReady,
+	})
+	secondPaused := pausedRecord(secondReady, 2)
+	applyDataOK(t, &state, 6, DataCommand{
+		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{LogIndex: 5}, Route: &secondPaused,
+	})
 	otherGroup := "/other"
 	otherKey := routeKeyForShard(t, registryLayout, otherGroup, identity.ShardID, "other")
 	other := routeStarting(t, registryLayout, otherGroup, otherKey, "sandbox-3", 1, true)
-	applyDataOK(t, &state, 5, DataCommand{
+	applyDataOK(t, &state, 7, DataCommand{
 		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{Absent: true}, Route: &other,
 	})
 
-	list := lookupRouteBucket(state, RouteBucketLookup{Identity: identity, Group: group, Bucket: bucket})
-	if !list.Available || list.SnapshotRevision != 5 || len(list.Routes) != 2 ||
-		list.Routes[0].RouteKey != firstKey || list.Routes[1].RouteKey != secondKey {
+	list := lookupRouteBucket(state, RouteBucketLookup{
+		Identity: identity, Group: group, Bucket: bucket, Limit: 10,
+	})
+	if !list.Available || list.SnapshotRevision != 7 || len(list.Routes) != 2 ||
+		list.Routes[0].RouteKey != firstKey || list.Routes[1].RouteKey != secondKey ||
+		list.Routes[1].State != clusterstate.WorkflowRoutePaused {
 		t.Fatalf("Route bucket snapshot = %+v", list)
 	}
-	list.Routes[0].Ready.AccessToken = "mutated"
-	if state.Routes[routeMapKey(group, firstKey)].Ready.AccessToken == "mutated" {
-		t.Fatal("Route bucket snapshot aliases consensus state")
+	listPage := lookupRouteBucket(state, RouteBucketLookup{
+		Identity: identity, Group: group, Bucket: bucket, Limit: 1,
+	})
+	if len(listPage.Routes) != 1 || listPage.NextRouteKey != firstKey {
+		t.Fatalf("first Route bucket page = %+v", listPage)
+	}
+	listPage = lookupRouteBucket(state, RouteBucketLookup{
+		Identity: identity, Group: group, Bucket: bucket, AfterRouteKey: listPage.NextRouteKey, Limit: 1,
+	})
+	if len(listPage.Routes) != 1 || listPage.Routes[0].RouteKey != secondKey || listPage.NextRouteKey != "" {
+		t.Fatalf("second Route bucket page = %+v", listPage)
 	}
 
 	page := lookupRouteChangefeed(state, RouteChangefeedLookup{
@@ -190,14 +238,23 @@ func TestRouteBucketSnapshotAndChangefeedUseShardRevisions(t *testing.T) {
 	if !page.Available || page.Reset || len(page.Changes) != 2 || page.Changes[0].Revision != 2 ||
 		page.Changes[0].RouteKey != firstKey || page.Changes[0].State != clusterstate.WorkflowRouteStarting ||
 		page.Changes[1].Revision != 3 || page.Changes[1].State != clusterstate.WorkflowRouteReady ||
-		page.CursorRevision != 3 || page.HeadRevision != 5 {
+		page.CursorRevision != 3 || page.HeadRevision != 7 {
 		t.Fatalf("first Route changefeed page = %+v", page)
 	}
 	page = lookupRouteChangefeed(state, RouteChangefeedLookup{
 		Identity: identity, Group: group, Bucket: bucket, AfterRevision: page.CursorRevision, Limit: 2,
 	})
-	if !page.Available || len(page.Changes) != 1 || page.Changes[0].Revision != 4 || page.CursorRevision != 5 {
+	if !page.Available || len(page.Changes) != 2 || page.Changes[0].Revision != 4 ||
+		page.Changes[1].Revision != 5 || page.Changes[1].State != clusterstate.WorkflowRouteReady ||
+		page.CursorRevision != 5 {
 		t.Fatalf("second Route changefeed page = %+v", page)
+	}
+	page = lookupRouteChangefeed(state, RouteChangefeedLookup{
+		Identity: identity, Group: group, Bucket: bucket, AfterRevision: page.CursorRevision, Limit: 2,
+	})
+	if !page.Available || len(page.Changes) != 1 || page.Changes[0].Revision != 6 ||
+		page.Changes[0].State != clusterstate.WorkflowRoutePaused || page.CursorRevision != 7 {
+		t.Fatalf("third Route changefeed page = %+v", page)
 	}
 
 	advanceDataApplied(&state, RouteChangefeedRetentionRevisions+10)
@@ -238,12 +295,12 @@ func pendingResult(t *testing.T, state DataState, query PendingLookup) PendingLo
 
 func routeLookupRequest(
 	identity ShardRequestIdentity,
-	group, routeKey, sandboxID string,
+	group, routeKey string,
 	strong bool,
 ) routeapi.ReadRouteRequest {
 	return routeapi.ReadRouteRequest{
 		RequestIdentity: routeIdentity(identity), Group: group, RouteKey: routeKey,
-		SandboxID: sandboxID, Strong: strong,
+		Strong: strong,
 	}
 }
 

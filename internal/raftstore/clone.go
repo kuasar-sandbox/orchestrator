@@ -4,6 +4,7 @@ import clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 
 func cloneRouteRecord(source clusterstate.RouteWorkflowRecord) clusterstate.RouteWorkflowRecord {
 	clone := source
+	clone.Finalizations = cloneWorkflowFinalizations(source.Finalizations)
 	if source.Starting != nil {
 		starting := *source.Starting
 		cloneStartingFields(&starting)
@@ -62,14 +63,28 @@ func cloneBuildRecord(source clusterstate.BuildRecord) clusterstate.BuildRecord 
 	}
 	if source.Tombstone != nil {
 		tombstone := *source.Tombstone
+		failure := source.Tombstone.PlacementFailure
+		failure.CandidatePool = append([]clusterstate.PlacementCandidate(nil), failure.CandidatePool...)
+		failure.DefinitivelyRejected = append([]uint32(nil), failure.DefinitivelyRejected...)
+		failure.Intent = cloneDispatchIntent(failure.Intent)
+		tombstone.PlacementFailure = failure
 		clone.Tombstone = &tombstone
 	}
-	if source.Failure != nil {
-		failure := *source.Failure
-		failure.CandidatePool = append([]clusterstate.PlacementCandidate(nil), source.Failure.CandidatePool...)
-		failure.DefinitivelyRejected = append([]uint32(nil), source.Failure.DefinitivelyRejected...)
-		failure.Intent = cloneDispatchIntent(source.Failure.Intent)
-		clone.Failure = &failure
+	clone.Finalizations = cloneWorkflowFinalizations(source.Finalizations)
+	return clone
+}
+
+func cloneWorkflowFinalizations(source []clusterstate.WorkflowFinalizationIntent) []clusterstate.WorkflowFinalizationIntent {
+	if source == nil {
+		return nil
+	}
+	clone := make([]clusterstate.WorkflowFinalizationIntent, len(source))
+	copy(clone, source)
+	for index := range source {
+		if source[index].TerminalProof != nil {
+			proof := *source[index].TerminalProof
+			clone[index].TerminalProof = &proof
+		}
 	}
 	return clone
 }
@@ -98,4 +113,16 @@ func cloneUint32(source *uint32) *uint32 {
 	}
 	clone := *source
 	return &clone
+}
+
+func cloneExecutionFence(source clusterstate.ExecutionFence) clusterstate.ExecutionFence {
+	clone := source
+	if source.PlacementFailure != nil {
+		failure := *source.PlacementFailure
+		failure.CandidatePool = append([]clusterstate.PlacementCandidate(nil), source.PlacementFailure.CandidatePool...)
+		failure.DefinitivelyRejected = append([]uint32(nil), source.PlacementFailure.DefinitivelyRejected...)
+		failure.Intent = cloneDispatchIntent(source.PlacementFailure.Intent)
+		clone.PlacementFailure = &failure
+	}
+	return clone
 }

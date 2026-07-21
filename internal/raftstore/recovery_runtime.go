@@ -379,6 +379,9 @@ func (r *Runtime) ReconcileLocalRecoveryShard(
 	if request.MemberID != r.member.MemberID {
 		return RecoveryShardProof{}, errors.New("raftstore: recovery request targets another Registry member")
 	}
+	if err := r.authorizeLiveRecoveryShardRequest(ctx, request.Authorization); err != nil {
+		return RecoveryShardProof{}, err
+	}
 	target := recoveryTargetIdentity(request.Authorization.Recovery)
 	if err := r.authorizeLocalDataReplica(ShardRequestIdentity{PermitIdentity: target, ShardID: request.ShardID}); err != nil {
 		return RecoveryShardProof{}, err
@@ -411,6 +414,25 @@ func (r *Runtime) ReconcileLocalRecoveryShard(
 		RegistryLayoutDigest: r.registryLayoutDigest, RecoveryEpoch: request.Authorization.Recovery.Epoch,
 		AppliedIndex: state.LastApplied,
 	}, nil
+}
+
+func (r *Runtime) authorizeLiveRecoveryShardRequest(
+	ctx context.Context,
+	authorization RecoveryShardAuthorization,
+) error {
+	state, err := r.ReadSystemStrong(ctx)
+	if err != nil {
+		return fmt.Errorf("raftstore: read live System recovery authorization: %w", err)
+	}
+	if err := r.requireExactActiveRegistryLayout(state); err != nil {
+		return err
+	}
+	if state.LastApplied < authorization.SystemCommitIndex ||
+		state.ActiveRegistryLayoutVersion != authorization.ActiveRegistryLayoutVersion ||
+		state.Recovery == nil || *state.Recovery != authorization.Recovery {
+		return errors.New("raftstore: recovery shard authorization is stale or no longer committed")
+	}
+	return nil
 }
 
 func (r *Runtime) prepareRecoveryDataShardLocal(

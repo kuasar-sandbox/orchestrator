@@ -60,6 +60,9 @@ func TestRuntimeWaitsForRecoveryPermitDrain(t *testing.T) {
 	runtime := &Runtime{
 		registryLayout: registryLayout, registryLayoutDigest: digest,
 		nodeHost: host, member: registryLayout.Members[0],
+		enrollment: LocalEnrollment{Replicas: []LocalReplicaEnrollment{{
+			ShardID: SystemRaftShardID, ReplicaID: 1, StartPlan: ReplicaInitial, LocalState: ReplicaActive,
+		}}},
 	}
 	recovery := newRecoveryEpoch(registryLayout, digest)
 	opened, err := runtime.BeginRecovery(context.Background(), recovery)
@@ -140,6 +143,7 @@ func TestRecoveryCannotLeavePreparingBeforeEveryShardIsPrepared(t *testing.T) {
 	runtime := &Runtime{
 		registryLayout: registryLayout, registryLayoutDigest: digest,
 		member: registryLayout.Members[3], nodeHost: host,
+		systemClient: &testRemoteSystemClient{state: state},
 		recoveryClient: RecoveryShardClientFunc(func(_ context.Context, request RecoveryShardRequest) (RecoveryShardProof, error) {
 			return RecoveryShardProof{}, errors.New("shard is not prepared")
 		}),
@@ -149,6 +153,45 @@ func TestRecoveryCannotLeavePreparingBeforeEveryShardIsPrepared(t *testing.T) {
 	}
 	if proposals != 0 {
 		t.Fatalf("recovery phase proposal count = %d, want 0", proposals)
+	}
+}
+
+func TestRecoveryShardAuthorizationMustMatchLiveSystemPhase(t *testing.T) {
+	registryLayout := recoveryTestRegistryLayout(t, 1)
+	digest, _ := registryLayout.Digest()
+	state := recoverySystemForTest(t, registryLayout, digest, RecoveryPreparing)
+	authorization, err := (&Runtime{
+		registryLayout: registryLayout, registryLayoutDigest: digest,
+	}).recoveryShardAuthorization(state, RecoveryPreparing)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	host := newFakeNodeHost()
+	host.read = func(shardID uint64, _ any) (any, error) {
+		if shardID != SystemRaftShardID {
+			return nil, errors.New("unexpected data-shard read")
+		}
+		return cloneSystemState(state), nil
+	}
+	runtime := &Runtime{
+		registryLayout: registryLayout, registryLayoutDigest: digest,
+		member: registryLayout.Members[0], nodeHost: host,
+		enrollment: LocalEnrollment{Replicas: []LocalReplicaEnrollment{{
+			ShardID: SystemRaftShardID, ReplicaID: 1, StartPlan: ReplicaInitial, LocalState: ReplicaActive,
+		}}},
+	}
+	if err := runtime.authorizeLiveRecoveryShardRequest(context.Background(), authorization); err != nil {
+		t.Fatal(err)
+	}
+
+	state = recoverySystemForTest(t, registryLayout, digest, RecoveryCollecting)
+	if err := runtime.authorizeLiveRecoveryShardRequest(context.Background(), authorization); err == nil {
+		t.Fatal("stale PREPARING authorization remained valid after System advanced to COLLECTING")
+	}
+	state.Recovery = nil
+	if err := runtime.authorizeLiveRecoveryShardRequest(context.Background(), authorization); err == nil {
+		t.Fatal("authorization remained valid after the System recovery epoch closed")
 	}
 }
 

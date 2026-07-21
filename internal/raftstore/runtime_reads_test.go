@@ -33,6 +33,9 @@ func TestRuntimeConfigureServiceGatesUsesDedicatedWorkflow(t *testing.T) {
 	runtime := &Runtime{
 		registryLayout: registryLayout, registryLayoutDigest: digest, nodeHost: host,
 		permitCache: NewPermitCache(time.Now),
+		enrollment: LocalEnrollment{Replicas: []LocalReplicaEnrollment{{
+			ShardID: SystemRaftShardID, ReplicaID: 1, StartPlan: ReplicaInitial, LocalState: ReplicaActive,
+		}}},
 	}
 	opened, err := runtime.ConfigureServiceGates(context.Background(), GateUpdate{Serve: true, Write: true, Cutover: true})
 	if err != nil || !opened.ServeGate || !opened.WriteGate || !opened.CutoverGate {
@@ -162,6 +165,9 @@ func TestRuntimeResolvesCommittedGateUpdateAfterCallerCancellation(t *testing.T)
 	runtime := &Runtime{
 		registryLayout: registryLayout, registryLayoutDigest: digest, nodeHost: host,
 		permitCache: NewPermitCache(time.Now),
+		enrollment: LocalEnrollment{Replicas: []LocalReplicaEnrollment{{
+			ShardID: SystemRaftShardID, ReplicaID: 1, StartPlan: ReplicaInitial, LocalState: ReplicaActive,
+		}}},
 	}
 	opened, err := runtime.ConfigureServiceGates(caller, GateUpdate{Serve: true, Write: true, Cutover: true})
 	if err != nil || !opened.ServeGate || !opened.WriteGate || !opened.CutoverGate {

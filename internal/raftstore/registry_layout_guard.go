@@ -265,6 +265,11 @@ func (g RegistryLayoutGuard) EvaluateSignedChain(
 		if anchor >= 0 {
 			for index := 1; index <= anchor; index++ {
 				previous := acceptedRegistryLayout(chain[index-1].RegistryLayout, digests[index-1])
+				if chain[index].RegistryLayout.RegistryGeneration == chain[index-1].RegistryLayout.RegistryGeneration {
+					if transitionErr := ValidateRegistryLayoutTransition(chain[index-1].RegistryLayout, chain[index].RegistryLayout); transitionErr != nil {
+						return AcceptedRegistryLayout{}, fmt.Errorf("raftstore: invalid signed registryLayout transition: %w", transitionErr)
+					}
+				}
 				if _, linkErr := previous.Accept(chain[index].RegistryLayout, digests[index]); linkErr != nil {
 					return AcceptedRegistryLayout{}, fmt.Errorf("raftstore: invalid signed registryLayout chain link: %w", linkErr)
 				}
@@ -282,6 +287,11 @@ func (g RegistryLayoutGuard) EvaluateSignedChain(
 			}
 			current = &accepted
 			continue
+		}
+		if index > 0 && signed.RegistryLayout.RegistryGeneration == chain[index-1].RegistryLayout.RegistryGeneration {
+			if transitionErr := ValidateRegistryLayoutTransition(chain[index-1].RegistryLayout, signed.RegistryLayout); transitionErr != nil {
+				return AcceptedRegistryLayout{}, fmt.Errorf("raftstore: invalid signed registryLayout transition: %w", transitionErr)
+			}
 		}
 		accepted, acceptErr := current.Accept(signed.RegistryLayout, digest)
 		if acceptErr != nil {

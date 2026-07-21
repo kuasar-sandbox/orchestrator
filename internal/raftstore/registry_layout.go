@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"reflect"
 	"sort"
 	"strconv"
 )
@@ -257,6 +258,81 @@ func (m RegistryLayout) Digest() (string, error) {
 	}
 	digest := sha256.Sum256(raw)
 	return hex.EncodeToString(digest[:]), nil
+}
+
+// ValidateRegistryLayoutTransition checks identities that are meaningful only
+// across two signed Registry Layout artifacts in one History Generation.
+func ValidateRegistryLayoutTransition(previous, next RegistryLayout) error {
+	if err := previous.Validate(); err != nil {
+		return err
+	}
+	if err := next.Validate(); err != nil {
+		return err
+	}
+	previousDigest, err := previous.Digest()
+	if err != nil {
+		return err
+	}
+	if next.ClusterID != previous.ClusterID || next.RegistryGeneration != previous.RegistryGeneration ||
+		next.RegistryLayoutVersion != previous.RegistryLayoutVersion+1 ||
+		next.PreviousRegistryLayoutVersion != previous.RegistryLayoutVersion ||
+		next.PreviousRegistryLayoutDigest != previousDigest {
+		return errors.New("raftstore: registryLayout transition is not the exact next artifact")
+	}
+	if !acceptedRegistryLayout(previous, previousDigest).matchesFrozenParameters(next) ||
+		!reflect.DeepEqual(previous.Predecessor, next.Predecessor) {
+		return errors.New("raftstore: Registry Layout transition changed Registry-History-Generation-frozen identity")
+	}
+
+	previousMembers := make(map[string]RegistryMember, len(previous.Members))
+	previousInternalEndpoints := make(map[string]string, len(previous.Members))
+	previousRaftEndpoints := make(map[string]string, len(previous.Members))
+	for _, member := range previous.Members {
+		previousMembers[member.MemberID] = member
+		previousInternalEndpoints[member.InternalEndpoint] = member.MemberID
+		previousRaftEndpoints[member.RaftEndpoint] = member.MemberID
+	}
+	for _, member := range next.Members {
+		if retained, found := previousMembers[member.MemberID]; found {
+			if retained != member {
+				return errors.New("raftstore: retained Registry member changed an endpoint")
+			}
+			continue
+		}
+		if previousInternalEndpoints[member.InternalEndpoint] != "" || previousRaftEndpoints[member.RaftEndpoint] != "" {
+			return errors.New("raftstore: replacement Registry member reused a predecessor endpoint")
+		}
+	}
+	if err := validateReplicaTransition(previous.SystemReplicas, next.SystemReplicas); err != nil {
+		return fmt.Errorf("raftstore: System Group transition: %w", err)
+	}
+	if len(previous.DataShards) != len(next.DataShards) {
+		return errors.New("raftstore: registryLayout transition changed the fixed data-shard count")
+	}
+	for index := range previous.DataShards {
+		if err := validateReplicaTransition(previous.DataShards[index].Replicas, next.DataShards[index].Replicas); err != nil {
+			return fmt.Errorf("raftstore: shard %d transition: %w", index, err)
+		}
+	}
+	return nil
+}
+
+func validateReplicaTransition(previous, next []ReplicaPlacement) error {
+	previousByMember := make(map[string]uint64, len(previous))
+	previousByReplica := make(map[uint64]string, len(previous))
+	for _, replica := range previous {
+		previousByMember[replica.MemberID] = replica.ReplicaID
+		previousByReplica[replica.ReplicaID] = replica.MemberID
+	}
+	for _, replica := range next {
+		if previousID, retained := previousByMember[replica.MemberID]; retained && previousID != replica.ReplicaID {
+			return errors.New("retained member changed its replica ID")
+		}
+		if previousMember, reused := previousByReplica[replica.ReplicaID]; reused && previousMember != replica.MemberID {
+			return errors.New("replacement member reused a predecessor replica ID")
+		}
+	}
+	return nil
 }
 
 type SignedRegistryLayout struct {

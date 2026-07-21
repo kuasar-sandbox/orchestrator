@@ -1,6 +1,7 @@
 package raftstore
 
 import (
+	"container/heap"
 	"errors"
 	"sort"
 
@@ -166,29 +167,39 @@ func lookupWorkflow(state DataState, query WorkflowLookup) WorkflowLookupResult 
 }
 
 type RouteBucketLookup struct {
-	Identity ShardRequestIdentity `json:"identity"`
-	Group    string               `json:"group"`
-	Bucket   uint32               `json:"bucket"`
-	Strong   bool                 `json:"strong,omitempty"`
+	Identity      ShardRequestIdentity `json:"identity"`
+	Group         string               `json:"group"`
+	Bucket        uint32               `json:"bucket"`
+	AfterRouteKey string               `json:"after_route_key,omitempty"`
+	Limit         uint32               `json:"limit"`
+	Strong        bool                 `json:"strong,omitempty"`
 }
 
 func (q RouteBucketLookup) Validate() error {
 	if err := q.Identity.Validate(); err != nil {
 		return err
 	}
-	if q.Group == "" {
-		return errors.New("raftstore: Route bucket lookup requires a group")
+	if q.Group == "" || q.Limit == 0 || q.Limit > 4096 {
+		return errors.New("raftstore: Route bucket lookup requires a group and a limit between 1 and 4096")
 	}
 	return nil
 }
 
+type RouteBucketEntry struct {
+	RouteKey    string                          `json:"route_key"`
+	State       clusterstate.RouteWorkflowState `json:"state"`
+	NodeID      string                          `json:"node_id"`
+	TemplateRef string                          `json:"template_ref"`
+}
+
 type RouteBucketResult struct {
-	Available        bool                               `json:"available"`
-	Reason           string                             `json:"reason,omitempty"`
-	Group            string                             `json:"group"`
-	Bucket           uint32                             `json:"bucket"`
-	SnapshotRevision uint64                             `json:"snapshot_revision"`
-	Routes           []clusterstate.RouteWorkflowRecord `json:"routes"`
+	Available        bool               `json:"available"`
+	Reason           string             `json:"reason,omitempty"`
+	Group            string             `json:"group"`
+	Bucket           uint32             `json:"bucket"`
+	SnapshotRevision uint64             `json:"snapshot_revision"`
+	Routes           []RouteBucketEntry `json:"routes"`
+	NextRouteKey     string             `json:"next_route_key,omitempty"`
 }
 
 func lookupRouteBucket(state DataState, query RouteBucketLookup) RouteBucketResult {
@@ -203,22 +214,75 @@ func lookupRouteBucket(state DataState, query RouteBucketLookup) RouteBucketResu
 	}
 	result.Available = true
 	result.SnapshotRevision = state.LastApplied
-	result.Routes = make([]clusterstate.RouteWorkflowRecord, 0)
+	result.Routes = make([]RouteBucketEntry, 0, min(int(query.Limit)+1, len(state.Routes)))
 	for _, record := range state.Routes {
-		if record.Group != query.Group {
+		if record.Group != query.Group || record.RouteKey <= query.AfterRouteKey {
 			continue
 		}
 		bucket, _, err := clusterstate.RouteShardFor(
 			record.Group, record.RouteKey, state.RouteBucketCount, state.VirtualShardCount,
 		)
 		if err == nil && bucket == query.Bucket {
-			result.Routes = append(result.Routes, cloneRouteRecord(record))
+			if entry, listed := routeBucketEntry(record); listed {
+				addBoundedRouteBucketEntry(&result.Routes, entry, int(query.Limit)+1)
+			}
 		}
 	}
 	sort.Slice(result.Routes, func(left, right int) bool {
 		return result.Routes[left].RouteKey < result.Routes[right].RouteKey
 	})
+	if len(result.Routes) > int(query.Limit) {
+		result.Routes = result.Routes[:query.Limit]
+		result.NextRouteKey = result.Routes[len(result.Routes)-1].RouteKey
+	}
 	return result
+}
+
+type routeBucketEntryHeap []RouteBucketEntry
+
+func (h routeBucketEntryHeap) Len() int           { return len(h) }
+func (h routeBucketEntryHeap) Less(i, j int) bool { return h[i].RouteKey > h[j].RouteKey }
+func (h routeBucketEntryHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+func (h *routeBucketEntryHeap) Push(value any)    { *h = append(*h, value.(RouteBucketEntry)) }
+func (h *routeBucketEntryHeap) Pop() any {
+	old := *h
+	last := len(old) - 1
+	value := old[last]
+	*h = old[:last]
+	return value
+}
+
+func addBoundedRouteBucketEntry(entries *[]RouteBucketEntry, entry RouteBucketEntry, bound int) {
+	if len(*entries) < bound {
+		heap.Push((*routeBucketEntryHeap)(entries), entry)
+		return
+	}
+	if bound == 0 || entry.RouteKey >= (*entries)[0].RouteKey {
+		return
+	}
+	(*entries)[0] = entry
+	heap.Fix((*routeBucketEntryHeap)(entries), 0)
+}
+
+func routeBucketEntry(record clusterstate.RouteWorkflowRecord) (RouteBucketEntry, bool) {
+	var execution *clusterstate.ReadyRoute
+	switch record.State {
+	case clusterstate.WorkflowRouteReady:
+		execution = record.Ready
+	case clusterstate.WorkflowRoutePaused:
+		if record.Paused != nil {
+			execution = &record.Paused.Execution
+		}
+	default:
+		return RouteBucketEntry{}, false
+	}
+	if execution == nil {
+		return RouteBucketEntry{}, false
+	}
+	return RouteBucketEntry{
+		RouteKey: record.RouteKey, State: record.State,
+		NodeID: execution.NodeID, TemplateRef: execution.TemplateRef,
+	}, true
 }
 
 type RouteChangefeedLookup struct {
@@ -380,22 +444,24 @@ func lookupRoute(state DataState, request routeapi.ReadRouteRequest) routeapi.Re
 	if record.Revision.LogIndex < request.MinRouteRevision {
 		return routeapi.ReadRouteResponse{Outcome: routeapi.ReadReplicaBehind, Reason: "Route revision is below the requested minimum"}
 	}
+	if record.State == clusterstate.WorkflowRoutePaused && record.Paused != nil && request.Strong && request.Addressable {
+		paused := record.Paused.Execution
+		return routeapi.ReadRouteResponse{
+			Outcome: routeapi.ReadReady, Group: record.Group, RouteKey: record.RouteKey,
+			State: clusterstate.WorkflowRoutePaused,
+			Route: &paused, RouteRevision: record.Revision.LogIndex,
+		}
+	}
 	if record.State != clusterstate.WorkflowRouteReady || record.Ready == nil {
 		if request.Strong {
 			return routeapi.ReadRouteResponse{Outcome: routeapi.ReadConflict, Reason: string(record.State)}
 		}
 		return routeapi.ReadRouteResponse{Outcome: routeapi.ReadNeedLeader, Reason: string(record.State)}
 	}
-	if request.SandboxID != "" && request.SandboxID != record.Ready.SandboxID {
-		if request.Strong {
-			return routeapi.ReadRouteResponse{Outcome: routeapi.ReadConflict, Reason: "Route is bound to another sandbox ID"}
-		}
-		return routeapi.ReadRouteResponse{Outcome: routeapi.ReadNeedLeader, Reason: "local Route sandbox ID mismatch"}
-	}
 	ready := *record.Ready
 	return routeapi.ReadRouteResponse{
 		Outcome: routeapi.ReadReady, Group: record.Group, RouteKey: record.RouteKey,
-		Route: &ready, RouteRevision: record.Revision.LogIndex,
+		State: clusterstate.WorkflowRouteReady, Route: &ready, RouteRevision: record.Revision.LogIndex,
 	}
 }
 
@@ -423,8 +489,22 @@ func lookupBuild(state DataState, request routeapi.ReadBuildRequest) routeapi.Re
 	if record.Revision.LogIndex < request.MinBuildRevision {
 		return routeapi.ReadBuildResponse{Outcome: routeapi.ReadReplicaBehind, Reason: "Build revision is below the requested minimum"}
 	}
-	if !positiveBuildState(record.State) || record.Projection == nil {
+	if record.State != clusterstate.BuildRegistered || record.Projection == nil {
 		if request.Strong {
+			if record.State == clusterstate.BuildStarting && record.Starting != nil {
+				spec, err := clusterstate.ParseBuildDispatchSpec(record.Starting.Intent.DispatchSpec)
+				if err != nil {
+					return routeapi.ReadBuildResponse{Outcome: routeapi.ReadUnavailable, Reason: "BUILD_STARTING dispatch intent is invalid"}
+				}
+				return routeapi.ReadBuildResponse{
+					Outcome: routeapi.ReadConflict, Group: record.Group,
+					Pending: &routeapi.PendingBuildProjection{
+						BuildID: record.BuildID, TemplateRef: spec.TemplateID, Profile: spec.Profile,
+					},
+					BuildState: clusterstate.BuildStarting, BuildRevision: record.Revision.LogIndex,
+					Reason: string(record.State),
+				}
+			}
 			return routeapi.ReadBuildResponse{Outcome: routeapi.ReadConflict, Reason: string(record.State)}
 		}
 		return routeapi.ReadBuildResponse{Outcome: routeapi.ReadNeedLeader, Reason: string(record.State)}
@@ -432,17 +512,7 @@ func lookupBuild(state DataState, request routeapi.ReadBuildRequest) routeapi.Re
 	projection := *record.Projection
 	return routeapi.ReadBuildResponse{
 		Outcome: routeapi.ReadReady, Group: record.Group, Build: &projection,
-		BuildState: record.State, BuildRevision: record.Revision.LogIndex,
-	}
-}
-
-func positiveBuildState(state clusterstate.BuildWorkflowState) bool {
-	switch state {
-	case clusterstate.BuildQueued, clusterstate.BuildRegistered, clusterstate.BuildBuilding,
-		clusterstate.BuildReady, clusterstate.BuildError:
-		return true
-	default:
-		return false
+		BuildState: clusterstate.BuildRegistered, BuildRevision: record.Revision.LogIndex,
 	}
 }
 
@@ -487,14 +557,14 @@ func lookupPending(state DataState, query PendingLookup) PendingLookupResult {
 	workflows := make([]PendingWorkflow, 0)
 	for key, record := range state.Routes {
 		qualified := "r" + key
-		if qualified > query.AfterKey && routeNeedsCoordinator(record.State) {
+		if qualified > query.AfterKey && routeNeedsCoordinator(record) {
 			copy := cloneRouteRecord(record)
 			workflows = append(workflows, PendingWorkflow{Key: qualified, Route: &copy})
 		}
 	}
 	for key, record := range state.Builds {
 		qualified := "b" + key
-		if qualified > query.AfterKey && buildNeedsCoordinator(record.State) {
+		if qualified > query.AfterKey && buildNeedsCoordinator(record) {
 			copy := cloneBuildRecord(record)
 			workflows = append(workflows, PendingWorkflow{Key: qualified, Build: &copy})
 		}
@@ -511,12 +581,12 @@ func lookupPending(state DataState, query PendingLookup) PendingLookupResult {
 	return result
 }
 
-func routeNeedsCoordinator(state clusterstate.RouteWorkflowState) bool {
-	return state == clusterstate.WorkflowRouteStarting || state == clusterstate.WorkflowRouteResuming ||
-		state == clusterstate.WorkflowRouteDeleting
+func routeNeedsCoordinator(record clusterstate.RouteWorkflowRecord) bool {
+	return record.State == clusterstate.WorkflowRouteStarting || record.State == clusterstate.WorkflowRouteResuming ||
+		record.State == clusterstate.WorkflowRouteDeleting || record.State == clusterstate.WorkflowRouteTombstone ||
+		len(record.Finalizations) != 0
 }
 
-func buildNeedsCoordinator(state clusterstate.BuildWorkflowState) bool {
-	return state == clusterstate.BuildStarting || state == clusterstate.BuildQueued ||
-		state == clusterstate.BuildRegistered || state == clusterstate.BuildBuilding
+func buildNeedsCoordinator(record clusterstate.BuildRecord) bool {
+	return record.State == clusterstate.BuildStarting || len(record.Finalizations) != 0
 }

@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"testing"
 
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
@@ -328,9 +329,17 @@ func TestPebbleSnapshotRecoverySpansMultipleSyncedBatches(t *testing.T) {
 		ReplicaIDs: append([]uint64(nil), bootstrap.ReplicaIDs...),
 	})
 	baseIntent := testDispatchIntent(t)
+	dispatchSpec, err := clusterstate.ParseSandboxDispatchSpec(baseIntent.DispatchSpec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dispatchSpec.Config = map[string]string{"snapshot-padding": strings.Repeat("x", 60<<10)}
+	encodedSpec, err := clusterstate.MarshalSandboxDispatchSpec(dispatchSpec)
+	if err != nil {
+		t.Fatal(err)
+	}
 	intent, err := clusterstate.NewDispatchIntent(
-		baseIntent.NormalizedDemand, bytes.Repeat([]byte{'x'}, clusterstate.MaxDispatchSpecBytes),
-		baseIntent.ProviderPolicyVersion,
+		baseIntent.NormalizedDemand, encodedSpec, baseIntent.ProviderPolicyVersion,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -488,7 +497,7 @@ func assertDiskReady(
 		t.Fatal(err)
 	}
 	value, err = machine.Lookup(DataLookup{RouteBucket: &RouteBucketLookup{
-		Identity: identity, Group: group, Bucket: bucket,
+		Identity: identity, Group: group, Bucket: bucket, Limit: 10,
 	}})
 	if err != nil {
 		t.Fatal(err)

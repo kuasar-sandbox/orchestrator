@@ -16,8 +16,15 @@ func validateRouteTransition(
 	if current.Group != next.Group || current.RouteKey != next.RouteKey {
 		return errors.New("raftstore: Route identity changed")
 	}
+	finalizations, err := classifyFinalizationChange(current.Finalizations, next.Finalizations)
+	if err != nil {
+		return err
+	}
 	if current.State == next.State {
-		return validateSameRouteState(current, next)
+		return validateSameRouteState(current, next, finalizations)
+	}
+	if finalizations.kind != finalizationsUnchanged {
+		return errors.New("raftstore: Route state transition changed pending finalizations")
 	}
 	switch current.State {
 	case clusterstate.WorkflowRouteStarting:
@@ -31,6 +38,9 @@ func validateRouteTransition(
 			return validateStartingTombstone(*current.Starting, *next.Tombstone)
 		}
 	case clusterstate.WorkflowRouteReady:
+		if next.State == clusterstate.WorkflowRouteTombstone {
+			return validateProvenRouteTombstone(*current.Ready, *next.Tombstone)
+		}
 		if next.State == clusterstate.WorkflowRoutePaused &&
 			sameReadyExecution(*current.Ready, next.Paused.Execution) &&
 			next.Paused.Execution.LastEventSeq > current.Ready.LastEventSeq {
@@ -42,6 +52,9 @@ func validateRouteTransition(
 			return nil
 		}
 	case clusterstate.WorkflowRoutePaused:
+		if next.State == clusterstate.WorkflowRouteTombstone {
+			return validateProvenRouteTombstone(current.Paused.Execution, *next.Tombstone)
+		}
 		if next.State == clusterstate.WorkflowRouteReady {
 			return validateAutoResume(current.Paused.Execution, *next.Ready)
 		}
@@ -57,6 +70,9 @@ func validateRouteTransition(
 			return nil
 		}
 	case clusterstate.WorkflowRouteResuming:
+		if next.State == clusterstate.WorkflowRouteTombstone {
+			return validateProvenRouteTombstone(current.Resuming.Execution, *next.Tombstone)
+		}
 		if next.State == clusterstate.WorkflowRouteReady &&
 			sameReadyExecution(current.Resuming.Execution, *next.Ready) &&
 			next.Ready.LastEventSeq > current.Resuming.Execution.LastEventSeq {
@@ -80,6 +96,13 @@ func validateRouteTransition(
 			next.Tombstone.NodeEpoch == current.Deleting.Execution.NodeEpoch &&
 			next.Tombstone.BindingDigest == current.Deleting.Execution.BindingDigest &&
 			next.Tombstone.LastEventSeq >= current.Deleting.LastEventSeq {
+			if isPermanentExecutionProof(next.Tombstone.Proof) {
+				if next.Tombstone.LastEventSeq != max(current.Deleting.Execution.LastEventSeq, current.Deleting.LastEventSeq) {
+					return errors.New("raftstore: fencing proof changed the Route event watermark")
+				}
+			} else if next.Tombstone.Proof.Kind != clusterstate.ProofNodeTerminal {
+				return errors.New("raftstore: Route tombstone lacks a recognized execution proof")
+			}
 			return nil
 		}
 	case clusterstate.WorkflowRouteTombstone:
@@ -90,17 +113,45 @@ func validateRouteTransition(
 	return errors.New("raftstore: illegal Route state transition")
 }
 
-func validateSameRouteState(current, next clusterstate.RouteWorkflowRecord) error {
+func validateSameRouteState(
+	current, next clusterstate.RouteWorkflowRecord,
+	finalizations finalizationChange,
+) error {
+	if finalizations.kind == finalizationsRemoved {
+		if sameRouteBusinessState(current, next) {
+			return nil
+		}
+		return errors.New("raftstore: Route finalization completion changed workflow state")
+	}
 	switch current.State {
 	case clusterstate.WorkflowRouteStarting:
-		return validateRouteStartingUpdate(*current.Starting, *next.Starting)
+		if err := validateRouteStartingUpdate(*current.Starting, *next.Starting); err != nil {
+			return err
+		}
+		if current.Starting.SelectedCandidate != nil && next.Starting.SelectedCandidate == nil {
+			if finalizations.kind != finalizationsAppended ||
+				!finalizationMatchesBinding(finalizations.intent, current.Starting.SandboxID, *current.Starting.Binding, false) {
+				return errors.New("raftstore: definitive Route rejection lacks exact finalization intent")
+			}
+			return nil
+		}
+		if finalizations.kind != finalizationsUnchanged {
+			return errors.New("raftstore: Route STARTING changed finalizations without rejection")
+		}
+		return nil
 	case clusterstate.WorkflowRouteReady:
+		if finalizations.kind != finalizationsUnchanged {
+			return errors.New("raftstore: READY appended a workflow finalization")
+		}
 		if !sameReadyExecution(*current.Ready, *next.Ready) ||
 			current.Ready.LastEventSeq > next.Ready.LastEventSeq {
 			return errors.New("raftstore: READY execution changed or event sequence regressed")
 		}
 		return nil
 	case clusterstate.WorkflowRoutePaused:
+		if finalizations.kind != finalizationsUnchanged {
+			return errors.New("raftstore: PAUSED appended a workflow finalization")
+		}
 		currentCopy, nextCopy := *current.Paused, *next.Paused
 		currentCopy.Execution.LastEventSeq, nextCopy.Execution.LastEventSeq = 0, 0
 		if !reflect.DeepEqual(currentCopy, nextCopy) ||
@@ -109,6 +160,9 @@ func validateSameRouteState(current, next clusterstate.RouteWorkflowRecord) erro
 		}
 		return nil
 	case clusterstate.WorkflowRouteResuming:
+		if finalizations.kind != finalizationsUnchanged {
+			return errors.New("raftstore: RESUMING appended a workflow finalization")
+		}
 		currentCopy, nextCopy := *current.Resuming, *next.Resuming
 		currentCopy.Execution.LastEventSeq, nextCopy.Execution.LastEventSeq = 0, 0
 		if !reflect.DeepEqual(currentCopy, nextCopy) ||
@@ -117,6 +171,9 @@ func validateSameRouteState(current, next clusterstate.RouteWorkflowRecord) erro
 		}
 		return nil
 	case clusterstate.WorkflowRouteDeleting:
+		if finalizations.kind != finalizationsUnchanged {
+			return errors.New("raftstore: DELETING appended a workflow finalization")
+		}
 		currentCopy, nextCopy := *current.Deleting, *next.Deleting
 		currentCopy.Execution.LastEventSeq, nextCopy.Execution.LastEventSeq = 0, 0
 		currentCopy.LastEventSeq, nextCopy.LastEventSeq = 0, 0
@@ -127,6 +184,9 @@ func validateSameRouteState(current, next clusterstate.RouteWorkflowRecord) erro
 		}
 		return nil
 	case clusterstate.WorkflowRouteTombstone:
+		if finalizations.kind != finalizationsUnchanged {
+			return errors.New("raftstore: TOMBSTONE appended a workflow finalization")
+		}
 		if !reflect.DeepEqual(current.Tombstone, next.Tombstone) {
 			return errors.New("raftstore: TOMBSTONE is immutable")
 		}
@@ -150,10 +210,17 @@ func validateRouteReplacement(
 	fences map[string]clusterstate.ExecutionFence,
 ) error {
 	if current.Tombstone.PlacementFailure != nil {
-		if next.Starting.SandboxID == current.Tombstone.PlacementFailure.SandboxID ||
-			next.Starting.PlacementRound <= current.Tombstone.PlacementFailure.PlacementRound ||
-			!reflect.DeepEqual(next.Starting.Intent, current.Tombstone.PlacementFailure.Intent) {
-			return errors.New("raftstore: placement retry requires a new SID and placement round")
+		failure := current.Tombstone.PlacementFailure
+		key := fenceMapKey(current.Group, current.RouteKey, failure.SandboxID)
+		fence, found := fences[key]
+		if !found || !placementFenceMatchesFailure(fence, current.Group, current.RouteKey, *failure) {
+			return errors.New("raftstore: placement retry has no committed abandoned-SID fence")
+		}
+		if next.Starting.SandboxID == failure.SandboxID ||
+			next.Starting.PlacementRound != failure.PlacementRound+1 ||
+			next.Starting.SelectedCandidate != nil || next.Starting.Binding != nil ||
+			len(next.Starting.DefinitivelyRejected) != 0 || next.Starting.LastEventSeq != 0 {
+			return errors.New("raftstore: placement retry requires a clean next round and a new SID")
 		}
 		return nil
 	}
@@ -177,70 +244,64 @@ func validateBuildTransition(current, next clusterstate.BuildRecord) error {
 	if current.Group != next.Group || current.BuildID != next.BuildID {
 		return errors.New("raftstore: Build identity changed")
 	}
+	finalizations, err := classifyFinalizationChange(current.Finalizations, next.Finalizations)
+	if err != nil {
+		return err
+	}
 	if current.State == next.State {
+		if finalizations.kind == finalizationsRemoved {
+			if sameBuildBusinessState(current, next) {
+				return nil
+			}
+			return errors.New("raftstore: Build finalization completion changed workflow state")
+		}
 		if current.State == clusterstate.BuildStarting {
 			if !reflect.DeepEqual(current.Starting.CandidatePool, next.Starting.CandidatePool) ||
 				!reflect.DeepEqual(current.Starting.Intent, next.Starting.Intent) {
 				return errors.New("raftstore: BUILD_STARTING intent changed or proof regressed")
 			}
-			return validateStartingCandidateProgress(
+			if err := validateStartingCandidateProgress(
 				current.Starting.SelectedCandidate, next.Starting.SelectedCandidate,
 				current.Starting.Binding, next.Starting.Binding,
 				current.Starting.DefinitivelyRejected, next.Starting.DefinitivelyRejected,
-				current.Starting.LastEventSeq, next.Starting.LastEventSeq,
-			)
-		}
-		if current.State == clusterstate.BuildError && current.Failure != nil {
-			if reflect.DeepEqual(current.Failure, next.Failure) {
+				0, 0,
+			); err != nil {
+				return err
+			}
+			if current.Starting.SelectedCandidate != nil && next.Starting.SelectedCandidate == nil {
+				if finalizations.kind != finalizationsAppended ||
+					!finalizationMatchesBinding(finalizations.intent, current.BuildID, *current.Starting.Binding, false) {
+					return errors.New("raftstore: definitive Build rejection lacks exact finalization intent")
+				}
 				return nil
 			}
-			return errors.New("raftstore: Build placement failure is immutable")
-		}
-		if current.State == clusterstate.BuildTombstone {
-			if reflect.DeepEqual(current.Tombstone, next.Tombstone) {
-				return nil
+			if finalizations.kind != finalizationsUnchanged {
+				return errors.New("raftstore: BUILD_STARTING changed finalizations without rejection")
 			}
-			return errors.New("raftstore: BUILD_TOMBSTONE is immutable")
-		}
-		if current.Projection != nil && next.Projection != nil &&
-			sameBuildProjection(*current.Projection, *next.Projection) &&
-			current.Projection.LastEventSeq <= next.Projection.LastEventSeq {
 			return nil
 		}
-		return errors.New("raftstore: Build execution changed or event sequence regressed")
+		if finalizations.kind == finalizationsUnchanged && sameBuildBusinessState(current, next) {
+			return nil
+		}
+		return errors.New("raftstore: committed Build registration state is immutable")
 	}
-	allowed := current.State == clusterstate.BuildStarting &&
-		(next.State == clusterstate.BuildQueued || next.State == clusterstate.BuildRegistered || next.State == clusterstate.BuildError) ||
-		current.State == clusterstate.BuildQueued && (next.State == clusterstate.BuildRegistered || next.State == clusterstate.BuildError) ||
-		current.State == clusterstate.BuildRegistered && (next.State == clusterstate.BuildBuilding || next.State == clusterstate.BuildError) ||
-		current.State == clusterstate.BuildBuilding && (next.State == clusterstate.BuildReady || next.State == clusterstate.BuildError) ||
-		(current.State == clusterstate.BuildReady || current.State == clusterstate.BuildError && current.Projection != nil) &&
-			next.State == clusterstate.BuildTombstone
-	if !allowed {
+	if current.State != clusterstate.BuildStarting ||
+		(next.State != clusterstate.BuildRegistered && next.State != clusterstate.BuildTombstone) {
 		return errors.New("raftstore: illegal Build state transition")
 	}
-	if current.Starting != nil {
-		if next.Failure != nil {
-			if !buildFailureMatchesStarting(*current.Starting, *next.Failure) {
-				return errors.New("raftstore: Build placement failure differs from committed STARTING intent")
-			}
-			return nil
-		}
-		if next.Projection == nil || current.Starting.Binding == nil ||
-			!buildProjectionMatchesBinding(*next.Projection, *current.Starting.Binding, current.Starting.LastEventSeq) {
-			return errors.New("raftstore: Build projection does not match committed Binding")
-		}
+	if finalizations.kind != finalizationsUnchanged {
+		return errors.New("raftstore: Build registration transition changed pending finalizations")
 	}
-	if current.Projection != nil && next.Projection != nil &&
-		(current.Projection.NodeID != next.Projection.NodeID || current.Projection.NodeEpoch != next.Projection.NodeEpoch ||
-			current.Projection.BindingDigest != next.Projection.BindingDigest ||
-			current.Projection.RegistryGeneration != next.Projection.RegistryGeneration ||
-			current.Projection.LastEventSeq >= next.Projection.LastEventSeq) {
-		return errors.New("raftstore: Build execution changed or event sequence regressed")
+	if next.State == clusterstate.BuildTombstone {
+		if next.Tombstone == nil ||
+			!buildFailureMatchesStarting(*current.Starting, next.Tombstone.PlacementFailure) {
+			return errors.New("raftstore: Build placement tombstone differs from committed STARTING intent")
+		}
+		return nil
 	}
-	if next.Tombstone != nil && current.Projection != nil &&
-		!reflect.DeepEqual(*current.Projection, next.Tombstone.Projection) {
-		return errors.New("raftstore: Build tombstone identifies another execution")
+	if next.Projection == nil || current.Starting.Binding == nil ||
+		!buildProjectionMatchesBinding(*next.Projection, *current.Starting.Binding, current.Starting.Intent) {
+		return errors.New("raftstore: Build registration does not match committed Binding")
 	}
 	return nil
 }
@@ -259,14 +320,7 @@ func validateRouteStartingUpdate(current, next clusterstate.RouteStartingState) 
 			current.LastEventSeq, next.LastEventSeq,
 		)
 	}
-	if current.SelectedCandidate != nil || current.Binding != nil ||
-		len(current.DefinitivelyRejected) != len(current.CandidatePool) || current.LastEventSeq != 0 ||
-		next.PlacementRound <= current.PlacementRound || next.PlacementRound != current.PlacementRound+1 ||
-		!reflect.DeepEqual(current.Intent, next.Intent) || next.SelectedCandidate != nil || next.Binding != nil ||
-		len(next.DefinitivelyRejected) != 0 || next.LastEventSeq != 0 {
-		return errors.New("raftstore: next placement round requires an exhausted no-side-effect pool and a new SID")
-	}
-	return nil
+	return errors.New("raftstore: a new SID must pass through a placement-failure tombstone and fence")
 }
 
 func validateStartingCandidateProgress(
@@ -329,7 +383,8 @@ func readyMatchesStarting(starting clusterstate.RouteStartingState, ready cluste
 	return ready.SandboxID == starting.SandboxID && ready.NodeID == starting.Binding.NodeID &&
 		ready.NodeEpoch == starting.Binding.NodeEpoch && ready.DataEndpoint == starting.Binding.DataEndpoint &&
 		ready.RegistryGeneration == starting.Binding.RegistryGeneration &&
-		ready.BindingDigest == starting.Binding.BindingDigest && ready.LastEventSeq > starting.LastEventSeq
+		ready.BindingDigest == starting.Binding.BindingDigest && reflect.DeepEqual(ready.Intent, starting.Intent) &&
+		ready.LastEventSeq > starting.LastEventSeq
 }
 
 func validateStartingTombstone(starting clusterstate.RouteStartingState, tombstone clusterstate.RouteTombstoneState) error {
@@ -347,11 +402,30 @@ func validateStartingTombstone(starting clusterstate.RouteStartingState, tombsto
 	}
 	if tombstone.FenceCompacted || starting.Binding == nil || tombstone.SandboxID != starting.SandboxID ||
 		tombstone.NodeID != starting.Binding.NodeID || tombstone.NodeEpoch != starting.Binding.NodeEpoch ||
-		tombstone.BindingDigest != starting.Binding.BindingDigest ||
-		tombstone.LastEventSeq <= starting.LastEventSeq {
+		tombstone.BindingDigest != starting.Binding.BindingDigest {
 		return errors.New("raftstore: execution tombstone differs from committed STARTING Binding")
 	}
+	if isPermanentExecutionProof(tombstone.Proof) {
+		if tombstone.LastEventSeq != starting.LastEventSeq {
+			return errors.New("raftstore: fencing proof changed the STARTING event watermark")
+		}
+	} else if tombstone.Proof.Kind != clusterstate.ProofNodeTerminal || tombstone.LastEventSeq <= starting.LastEventSeq {
+		return errors.New("raftstore: STARTING tombstone lacks a newer terminal event or permanent fence")
+	}
 	return nil
+}
+
+func validateProvenRouteTombstone(execution clusterstate.ReadyRoute, tombstone clusterstate.RouteTombstoneState) error {
+	if !isPermanentExecutionProof(tombstone.Proof) || tombstone.SandboxID != execution.SandboxID ||
+		tombstone.NodeID != execution.NodeID || tombstone.NodeEpoch != execution.NodeEpoch ||
+		tombstone.BindingDigest != execution.BindingDigest || tombstone.LastEventSeq != execution.LastEventSeq {
+		return errors.New("raftstore: Route fencing proof differs from the committed execution")
+	}
+	return nil
+}
+
+func isPermanentExecutionProof(proof clusterstate.TerminalProof) bool {
+	return proof.Kind == clusterstate.ProofNewerNodeEpoch || proof.Kind == clusterstate.ProofExternalFence
 }
 
 func sameReadyExecution(left, right clusterstate.ReadyRoute) bool {
@@ -370,15 +444,80 @@ func buildFailureMatchesStarting(starting clusterstate.BuildStartingState, failu
 func buildProjectionMatchesBinding(
 	projection clusterstate.BuildProjection,
 	binding clusterstate.ExecutionBindingIntent,
-	lastEventSeq uint64,
+	intent clusterstate.DispatchIntent,
 ) bool {
 	return projection.BuildID != "" && projection.NodeID == binding.NodeID && projection.NodeEpoch == binding.NodeEpoch &&
+		projection.DataEndpoint == binding.DataEndpoint &&
 		projection.RegistryGeneration == binding.RegistryGeneration && projection.BindingDigest == binding.BindingDigest &&
-		projection.LastEventSeq > lastEventSeq
+		reflect.DeepEqual(projection.Intent, intent)
 }
 
-func sameBuildProjection(left, right clusterstate.BuildProjection) bool {
-	left.LastEventSeq, right.LastEventSeq = 0, 0
+type finalizationChangeKind uint8
+
+const (
+	finalizationsUnchanged finalizationChangeKind = iota
+	finalizationsAppended
+	finalizationsRemoved
+)
+
+type finalizationChange struct {
+	kind   finalizationChangeKind
+	intent clusterstate.WorkflowFinalizationIntent
+}
+
+func classifyFinalizationChange(
+	current, next []clusterstate.WorkflowFinalizationIntent,
+) (finalizationChange, error) {
+	if sameFinalizations(current, next) {
+		return finalizationChange{kind: finalizationsUnchanged}, nil
+	}
+	if len(next) == len(current)+1 && sameFinalizations(current, next[:len(current)]) {
+		return finalizationChange{kind: finalizationsAppended, intent: next[len(next)-1]}, nil
+	}
+	if len(current) == len(next)+1 {
+		for removed := range current {
+			candidate := append([]clusterstate.WorkflowFinalizationIntent(nil), current[:removed]...)
+			candidate = append(candidate, current[removed+1:]...)
+			if sameFinalizations(candidate, next) {
+				return finalizationChange{kind: finalizationsRemoved, intent: current[removed]}, nil
+			}
+		}
+	}
+	return finalizationChange{}, errors.New("raftstore: pending workflow finalizations changed non-monotonically")
+}
+
+func sameFinalizations(left, right []clusterstate.WorkflowFinalizationIntent) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if !reflect.DeepEqual(left[index], right[index]) {
+			return false
+		}
+	}
+	return true
+}
+
+func finalizationMatchesBinding(
+	intent clusterstate.WorkflowFinalizationIntent,
+	objectID string,
+	binding clusterstate.ExecutionBindingIntent,
+	terminal bool,
+) bool {
+	return intent.ObjectID == objectID && intent.NodeID == binding.NodeID && intent.NodeEpoch == binding.NodeEpoch &&
+		intent.DataEndpoint == binding.DataEndpoint && intent.RegistryGeneration == binding.RegistryGeneration &&
+		intent.BindingDigest == binding.BindingDigest && (intent.TerminalProof != nil) == terminal
+}
+
+func sameRouteBusinessState(left, right clusterstate.RouteWorkflowRecord) bool {
+	left.Revision, right.Revision = clusterstate.Revision{}, clusterstate.Revision{}
+	left.Finalizations, right.Finalizations = nil, nil
+	return reflect.DeepEqual(left, right)
+}
+
+func sameBuildBusinessState(left, right clusterstate.BuildRecord) bool {
+	left.Revision, right.Revision = clusterstate.Revision{}, clusterstate.Revision{}
+	left.Finalizations, right.Finalizations = nil, nil
 	return reflect.DeepEqual(left, right)
 }
 
@@ -386,15 +525,23 @@ func validateFenceCompaction(
 	state DataState,
 	fence clusterstate.ExecutionFence,
 	authorization FenceCompactionAuthorization,
+	identity ShardRequestIdentity,
 ) error {
 	if authorization.FenceRevision != fence.Revision.LogIndex ||
-		authorization.TerminalProofDigest != fence.Proof.ProofDigest ||
+		authorization.TerminalProofDigest != fence.ProofDigest() ||
 		!isSHA256(authorization.RetentionProofDigest) {
 		return errors.New("raftstore: fence compaction proof does not match the committed fence")
 	}
-	outboxCovered := authorization.FinalOutboxWatermarkAcked &&
+	outboxCovered := fence.PlacementFailure != nil || authorization.FinalOutboxWatermarkAcked &&
 		fence.FinalOutboxWatermark >= fence.LastEventSeq
-	if !outboxCovered && !authorization.NodeEpochPermanentlyFenced {
+	proofPermanentlyFenced := fence.PlacementFailure == nil &&
+		(fence.Proof.Kind == clusterstate.ProofNewerNodeEpoch || fence.Proof.Kind == clusterstate.ProofExternalFence)
+	nodeEpochPermanentlyFenced := authorization.NodeEpochFence != nil &&
+		authorization.NodeEpochFence.validates(identity.PermitIdentity, fence)
+	if authorization.NodeEpochFence != nil && !nodeEpochPermanentlyFenced {
+		return errors.New("raftstore: fence compaction carries an invalid NodeEpoch proof")
+	}
+	if !outboxCovered && !proofPermanentlyFenced && !nodeEpochPermanentlyFenced {
 		return errors.New("raftstore: fence compaction lacks a final outbox or NodeEpoch proof")
 	}
 	replicaIDs := compactionReplicaIDs(state)
@@ -426,13 +573,35 @@ func compactionReplicaIDs(state DataState) []uint64 {
 }
 
 func fenceMatchesRouteTombstone(fence clusterstate.ExecutionFence, route clusterstate.RouteWorkflowRecord) bool {
-	return route.State == clusterstate.WorkflowRouteTombstone && route.Tombstone != nil &&
-		route.Tombstone.PlacementFailure == nil && route.Group == fence.Group && route.RouteKey == fence.RouteKey &&
-		route.Tombstone.SandboxID == fence.SandboxID && route.Tombstone.NodeID == fence.NodeID &&
-		!route.Tombstone.FenceCompacted && route.Tombstone.NodeEpoch == fence.NodeEpoch &&
+	if route.State != clusterstate.WorkflowRouteTombstone || route.Tombstone == nil ||
+		route.Group != fence.Group || route.RouteKey != fence.RouteKey {
+		return false
+	}
+	if route.Tombstone.PlacementFailure != nil {
+		return placementFenceMatchesFailure(
+			fence, route.Group, route.RouteKey, *route.Tombstone.PlacementFailure,
+		)
+	}
+	return fence.PlacementFailure == nil && route.Tombstone.SandboxID == fence.SandboxID &&
+		route.Tombstone.NodeID == fence.NodeID && route.Tombstone.NodeEpoch == fence.NodeEpoch &&
+		!route.Tombstone.FenceCompacted &&
 		route.Tombstone.RegistryGeneration == fence.RegistryGeneration &&
 		route.Tombstone.LastEventSeq == fence.LastEventSeq &&
 		route.Tombstone.BindingDigest == fence.BindingDigest && route.Tombstone.Proof == fence.Proof
+}
+
+func placementFenceMatchesFailure(
+	fence clusterstate.ExecutionFence,
+	group string,
+	routeKey string,
+	failure clusterstate.RoutePlacementFailureState,
+) bool {
+	if fence.Group != group || fence.RouteKey != routeKey || fence.SandboxID != failure.SandboxID ||
+		fence.PlacementFailure == nil || !reflect.DeepEqual(*fence.PlacementFailure, failure) {
+		return false
+	}
+	digest, err := clusterstate.PlacementFailureProofDigest(failure)
+	return err == nil && digest == fence.PlacementFailureDigest
 }
 
 func validateFenceTransition(current, next clusterstate.ExecutionFence) error {

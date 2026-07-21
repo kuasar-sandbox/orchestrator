@@ -1,6 +1,7 @@
 package raftstore
 
 import (
+	"os"
 	"path/filepath"
 	"slices"
 	"testing"
@@ -28,5 +29,54 @@ func TestRuntimeStorageAttestationCoversIdentityAndRaftState(t *testing.T) {
 	slices.Sort(want)
 	if !slices.Equal(attested, want) {
 		t.Fatalf("attested paths = %v, want %v", attested, want)
+	}
+}
+
+func TestRuntimeStorageSeparationResolvesSymlinkedAncestors(t *testing.T) {
+	root := t.TempDir()
+	real := filepath.Join(root, "real")
+	if err := os.MkdirAll(real, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(root, "alias")
+	if err := os.Symlink(real, alias); err != nil {
+		t.Fatal(err)
+	}
+
+	config := RuntimeConfig{
+		NodeHostDir:             filepath.Join(real, "nodehost"),
+		StateEngineDir:          filepath.Join(alias, "nodehost", "state"),
+		RegistryLayoutGuardPath: filepath.Join(real, "identity", "registryLayout.json"),
+		EnrollmentPath:          filepath.Join(real, "identity", "enrollment.json"),
+	}
+	if err := config.validateStoragePathSeparation(); err == nil {
+		t.Fatal("StateEngine directory hidden under a symlinked NodeHost directory was accepted")
+	}
+
+	config.StateEngineDir = filepath.Join(real, "state")
+	config.RegistryLayoutGuardPath = filepath.Join(alias, "nodehost", "registryLayout.json")
+	if err := config.validateStoragePathSeparation(); err == nil {
+		t.Fatal("identity file hidden under a symlinked NodeHost directory was accepted")
+	}
+}
+
+func TestRuntimeStoragePathsCanonicalizeNonexistentChildren(t *testing.T) {
+	root := t.TempDir()
+	real := filepath.Join(root, "real")
+	if err := os.MkdirAll(real, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(root, "alias")
+	if err := os.Symlink(real, alias); err != nil {
+		t.Fatal(err)
+	}
+	config := RuntimeConfig{NodeHostDir: filepath.Join(alias, "new", "nodehost")}
+	resolved, err := config.resolvedStoragePaths()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(real, "new", "nodehost")
+	if resolved.NodeHostDir != want {
+		t.Fatalf("resolved NodeHost path = %q, want %q", resolved.NodeHostDir, want)
 	}
 }

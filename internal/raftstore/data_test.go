@@ -2,9 +2,12 @@ package raftstore
 
 import (
 	"crypto/sha256"
+	"strings"
 	"testing"
 
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
+	"github.com/kuasar-sandbox/orchestrator/internal/placement"
+	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
 func TestDataShardBootstrapRequiresExactRegistryLayoutIdentity(t *testing.T) {
@@ -82,9 +85,13 @@ func TestStartingCandidateRejectionAndSandboxRoundAdvance(t *testing.T) {
 	})
 
 	rejectedFirst := cloneRouteRecord(state.Routes[routeMapKey("/g", "rk")])
+	firstBinding := *rejectedFirst.Starting.Binding
 	rejectedFirst.Starting.SelectedCandidate = nil
 	rejectedFirst.Starting.Binding = nil
 	rejectedFirst.Starting.DefinitivelyRejected = []uint32{0}
+	rejectedFirst.Finalizations = []clusterstate.WorkflowFinalizationIntent{
+		workflowFinalization(t, rejectedFirst.Starting.SandboxID, firstBinding, nil),
+	}
 	applyDataOK(t, &state, 3, DataCommand{
 		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{LogIndex: 2}, Route: &rejectedFirst,
 	})
@@ -99,22 +106,45 @@ func TestStartingCandidateRejectionAndSandboxRoundAdvance(t *testing.T) {
 	})
 
 	exhausted := cloneRouteRecord(state.Routes[routeMapKey("/g", "rk")])
+	secondBinding := *exhausted.Starting.Binding
 	exhausted.Starting.SelectedCandidate = nil
 	exhausted.Starting.Binding = nil
 	exhausted.Starting.DefinitivelyRejected = []uint32{0, 1}
+	exhausted.Finalizations = append(exhausted.Finalizations,
+		workflowFinalization(t, exhausted.Starting.SandboxID, secondBinding, nil))
 	applyDataOK(t, &state, 5, DataCommand{
 		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{LogIndex: 4}, Route: &exhausted,
 	})
 
-	nextRound := routeStarting(t, registryLayout, "/g", "rk", "sandbox-2", 2, false)
+	failure := clusterstate.RoutePlacementFailureState{
+		SandboxID: "sandbox-1", PlacementRound: 1,
+		CandidatePool:        append([]clusterstate.PlacementCandidate(nil), exhausted.Starting.CandidatePool...),
+		DefinitivelyRejected: append([]uint32(nil), exhausted.Starting.DefinitivelyRejected...),
+		Intent:               exhausted.Starting.Intent, Reason: "placement candidate pool exhausted",
+	}
+	tombstone := clusterstate.RouteWorkflowRecord{
+		Group: "/g", RouteKey: "rk", State: clusterstate.WorkflowRouteTombstone,
+		Tombstone: &clusterstate.RouteTombstoneState{PlacementFailure: &failure},
+	}
 	applyDataOK(t, &state, 6, DataCommand{
-		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{LogIndex: 5}, Route: &nextRound,
+		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{LogIndex: 5}, Route: &tombstone,
+	})
+	fence, err := clusterstate.NewPlacementFailureFence("/g", "rk", registryLayout.RegistryGeneration, failure)
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyDataOK(t, &state, 7, DataCommand{
+		Type: DataPutFence, Identity: identity, Expect: RevisionExpectation{Absent: true}, Fence: &fence,
+	})
+	nextRound := routeStarting(t, registryLayout, "/g", "rk", "sandbox-2", 2, false)
+	applyDataOK(t, &state, 8, DataCommand{
+		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{LogIndex: 6}, Route: &nextRound,
 	})
 
 	skipped := cloneRouteRecord(state.Routes[routeMapKey("/g", "rk")])
 	skipped.Starting.DefinitivelyRejected = []uint32{0}
-	result := ApplyDataCommand(&state, 7, DataCommand{
-		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{LogIndex: 6}, Route: &skipped,
+	result := ApplyDataCommand(&state, 9, DataCommand{
+		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{LogIndex: 8}, Route: &skipped,
 	})
 	if !result.Conflict {
 		t.Fatal("unselected candidate was marked rejected without a dispatch result")
@@ -129,9 +159,13 @@ func TestBuildStartingCommitsDefinitiveCandidateRejection(t *testing.T) {
 		Type: DataPutBuild, Identity: identity, Expect: RevisionExpectation{Absent: true}, Build: &selected,
 	})
 	rejected := cloneBuildRecord(state.Builds[buildMapKey("/g", "build-reject")])
+	binding := *rejected.Starting.Binding
 	rejected.Starting.SelectedCandidate = nil
 	rejected.Starting.Binding = nil
 	rejected.Starting.DefinitivelyRejected = []uint32{0}
+	rejected.Finalizations = []clusterstate.WorkflowFinalizationIntent{
+		workflowFinalization(t, rejected.BuildID, binding, nil),
+	}
 	applyDataOK(t, &state, 3, DataCommand{
 		Type: DataPutBuild, Identity: identity, Expect: RevisionExpectation{LogIndex: 2}, Build: &rejected,
 	})
@@ -299,46 +333,40 @@ func TestRouteAutoResumeReplacementAndFenceCompaction(t *testing.T) {
 	}
 }
 
-func TestBuildStateProgressionRejectsSkippedAndRepeatedEvents(t *testing.T) {
+func TestBuildRegistrationBindingIsImmutable(t *testing.T) {
 	registryLayout := testRegistryLayout(4, "generation-1")
 	state, identity := initializedBuildShard(t, registryLayout, "/g", "build-1")
 	starting := buildStarting(t, registryLayout, "/g", "build-1", true)
 	applyDataOK(t, &state, 2, DataCommand{
 		Type: DataPutBuild, Identity: identity, Expect: RevisionExpectation{Absent: true}, Build: &starting,
 	})
-	queued := buildProjectionRecord(starting, clusterstate.BuildQueued, 1)
+	registered := buildRegistrationRecord(starting)
 	applyDataOK(t, &state, 3, DataCommand{
-		Type: DataPutBuild, Identity: identity, Expect: RevisionExpectation{LogIndex: 2}, Build: &queued,
+		Type: DataPutBuild, Identity: identity, Expect: RevisionExpectation{LogIndex: 2}, Build: &registered,
 	})
 
-	ready := buildProjectionRecord(starting, clusterstate.BuildReady, 2)
-	ready.Projection.ArtifactRef = "artifact://build-1"
+	moved := registered
+	moved.Projection = cloneBuildProjection(registered.Projection)
+	moved.Projection.NodeID = "node-2"
 	result := ApplyDataCommand(&state, 4, DataCommand{
-		Type: DataPutBuild, Identity: identity, Expect: RevisionExpectation{LogIndex: 3}, Build: &ready,
+		Type: DataPutBuild, Identity: identity, Expect: RevisionExpectation{LogIndex: 3}, Build: &moved,
 	})
 	if !result.Conflict {
-		t.Fatal("BUILD_QUEUED skipped directly to BUILD_READY")
+		t.Fatal("committed Build registration moved to another node")
 	}
 
-	registered := buildProjectionRecord(starting, clusterstate.BuildRegistered, 2)
-	applyDataOK(t, &state, 5, DataCommand{
-		Type: DataPutBuild, Identity: identity, Expect: RevisionExpectation{LogIndex: 3}, Build: &registered,
-	})
-	building := buildProjectionRecord(starting, clusterstate.BuildBuilding, 2)
-	result = ApplyDataCommand(&state, 6, DataCommand{
-		Type: DataPutBuild, Identity: identity, Expect: RevisionExpectation{LogIndex: 5}, Build: &building,
+	changedTemplate := registered
+	changedTemplate.Projection = cloneBuildProjection(registered.Projection)
+	changedTemplate.Projection.TemplateRef = "another-template"
+	result = ApplyDataCommand(&state, 5, DataCommand{
+		Type: DataPutBuild, Identity: identity, Expect: RevisionExpectation{LogIndex: 3}, Build: &changedTemplate,
 	})
 	if !result.Conflict {
-		t.Fatal("a repeated event sequence advanced the Build state")
+		t.Fatal("committed Build registration changed immutable template reference")
 	}
-	building.Projection.LastEventSeq = 3
-	applyDataOK(t, &state, 7, DataCommand{
-		Type: DataPutBuild, Identity: identity, Expect: RevisionExpectation{LogIndex: 5}, Build: &building,
-	})
-	ready = buildProjectionRecord(starting, clusterstate.BuildReady, 4)
-	ready.Projection.ArtifactRef = "artifact://build-1"
-	applyDataOK(t, &state, 8, DataCommand{
-		Type: DataPutBuild, Identity: identity, Expect: RevisionExpectation{LogIndex: 7}, Build: &ready,
+
+	applyDataOK(t, &state, 6, DataCommand{
+		Type: DataPutBuild, Identity: identity, Expect: RevisionExpectation{LogIndex: 3}, Build: &registered,
 	})
 	if err := state.Validate(); err != nil {
 		t.Fatal(err)
@@ -477,13 +505,17 @@ func withRevision(record clusterstate.RouteWorkflowRecord, state DataState, inde
 
 func readyRecord(starting clusterstate.RouteWorkflowRecord, eventSeq uint64) clusterstate.RouteWorkflowRecord {
 	binding := starting.Starting.Binding
+	spec, err := clusterstate.ParseSandboxDispatchSpec(starting.Starting.Intent.DispatchSpec)
+	if err != nil {
+		panic(err)
+	}
 	return clusterstate.RouteWorkflowRecord{
 		Group: starting.Group, RouteKey: starting.RouteKey, State: clusterstate.WorkflowRouteReady,
 		Ready: &clusterstate.ReadyRoute{
 			SandboxID: starting.Starting.SandboxID, NodeID: binding.NodeID, NodeEpoch: binding.NodeEpoch,
-			DataEndpoint: binding.DataEndpoint, TargetPort: 8080, AccessToken: "access-token",
-			TemplateRef: "template-1", RegistryGeneration: binding.RegistryGeneration,
-			BindingDigest: binding.BindingDigest, LastEventSeq: eventSeq,
+			DataEndpoint: binding.DataEndpoint, TargetPort: spec.TargetPort, AccessToken: spec.AccessToken,
+			TrafficAccessToken: "traffic-token", TemplateRef: spec.TemplateRef, RegistryGeneration: binding.RegistryGeneration,
+			BindingDigest: binding.BindingDigest, LastEventSeq: eventSeq, Intent: starting.Starting.Intent,
 		},
 	}
 }
@@ -539,14 +571,14 @@ func fenceCompaction(fence clusterstate.ExecutionFence, replicas []uint64) Fence
 	}
 	return FenceCompactionAuthorization{
 		Group: fence.Group, RouteKey: fence.RouteKey, SandboxID: fence.SandboxID,
-		FenceRevision: fence.Revision.LogIndex, TerminalProofDigest: fence.Proof.ProofDigest,
+		FenceRevision: fence.Revision.LogIndex, TerminalProofDigest: fence.ProofDigest(),
 		FinalOutboxWatermarkAcked: true, ReplicaApplied: proofs, RetentionProofDigest: digestFor("retention-window"),
 	}
 }
 
 func buildStarting(t *testing.T, registryLayout RegistryLayout, group, buildID string, selected bool) clusterstate.BuildRecord {
 	t.Helper()
-	intent := testDispatchIntent(t)
+	intent := testBuildDispatchIntent(t)
 	starting := &clusterstate.BuildStartingState{
 		BuildID: buildID, CandidatePool: []clusterstate.PlacementCandidate{{NodeID: "node-1"}, {NodeID: "node-2"}}, Intent: intent,
 	}
@@ -558,21 +590,63 @@ func buildStarting(t *testing.T, registryLayout RegistryLayout, group, buildID s
 	return clusterstate.BuildRecord{Group: group, BuildID: buildID, State: clusterstate.BuildStarting, Starting: starting}
 }
 
-func buildProjectionRecord(starting clusterstate.BuildRecord, state clusterstate.BuildWorkflowState, eventSeq uint64) clusterstate.BuildRecord {
+func buildRegistrationRecord(starting clusterstate.BuildRecord) clusterstate.BuildRecord {
 	binding := starting.Starting.Binding
+	spec, err := clusterstate.ParseBuildDispatchSpec(starting.Starting.Intent.DispatchSpec)
+	if err != nil {
+		panic(err)
+	}
 	return clusterstate.BuildRecord{
-		Group: starting.Group, BuildID: starting.BuildID, State: state,
+		Group: starting.Group, BuildID: starting.BuildID, State: clusterstate.BuildRegistered,
 		Projection: &clusterstate.BuildProjection{
-			BuildID: starting.BuildID, NodeID: binding.NodeID, NodeEpoch: binding.NodeEpoch,
+			BuildID: starting.BuildID, NodeID: binding.NodeID, NodeEpoch: binding.NodeEpoch, DataEndpoint: binding.DataEndpoint,
 			RegistryGeneration: binding.RegistryGeneration, BindingDigest: binding.BindingDigest,
-			TemplateRef: "template-1", LastEventSeq: eventSeq,
+			Intent: starting.Starting.Intent, TemplateRef: spec.TemplateID,
 		},
 	}
 }
 
+func cloneBuildProjection(projection *clusterstate.BuildProjection) *clusterstate.BuildProjection {
+	cloned := *projection
+	return &cloned
+}
+
+func workflowFinalization(
+	t *testing.T,
+	objectID string,
+	binding clusterstate.ExecutionBindingIntent,
+	proof *clusterstate.TerminalProof,
+) clusterstate.WorkflowFinalizationIntent {
+	if t != nil {
+		t.Helper()
+	}
+	intent, err := clusterstate.NewWorkflowFinalizationIntent(objectID, binding, proof)
+	if err != nil {
+		if t == nil {
+			panic(err)
+		}
+		t.Fatal(err)
+	}
+	return intent
+}
+
 func testDispatchIntent(t *testing.T) clusterstate.DispatchIntent {
 	t.Helper()
-	intent, err := clusterstate.NewDispatchIntent([]byte(`{"slot_units":1}`), []byte(`{"template":"template-1"}`), "provider-v1/policy-v1")
+	demand, err := placement.NormalizeSandboxDemand(placement.SandboxDemand{SlotUnits: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	templateRef := "e2b-img-" + strings.Repeat("c", 64)
+	spec, err := clusterstate.MarshalSandboxDispatchSpec(clusterstate.SandboxDispatchSpecV1{
+		Version: clusterstate.DispatchSpecVersionV1, TemplateRef: templateRef,
+		AuthKeyFingerprint: strings.Repeat("a", 24), ManifestKeyFingerprint: strings.Repeat("b", 24),
+		AccessToken: "access-token", TargetPort: 8080,
+		Request: clusterstate.NodeRequestEnvelopeV1{Version: clusterstate.NodeRequestEnvelopeVersionV1, Method: "POST", Path: "/sandboxes", Body: []byte(`{"templateID":"` + templateRef + `"}`)},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	intent, err := clusterstate.NewDispatchIntent(demand, spec, "provider-v1/policy-v1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -580,9 +654,45 @@ func testDispatchIntent(t *testing.T) clusterstate.DispatchIntent {
 }
 
 func testDispatchIntentNoFail() clusterstate.DispatchIntent {
-	intent, err := clusterstate.NewDispatchIntent([]byte(`{"slot_units":1}`), []byte(`{"template":"template-1"}`), "provider-v1/policy-v1")
+	demand, err := placement.NormalizeSandboxDemand(placement.SandboxDemand{SlotUnits: 1})
 	if err != nil {
 		panic(err)
+	}
+	templateRef := "e2b-img-" + strings.Repeat("c", 64)
+	spec, err := clusterstate.MarshalSandboxDispatchSpec(clusterstate.SandboxDispatchSpecV1{
+		Version: clusterstate.DispatchSpecVersionV1, TemplateRef: templateRef,
+		AuthKeyFingerprint: strings.Repeat("a", 24), ManifestKeyFingerprint: strings.Repeat("b", 24),
+		AccessToken: "access-token", TargetPort: 8080,
+		Request: clusterstate.NodeRequestEnvelopeV1{Version: clusterstate.NodeRequestEnvelopeVersionV1, Method: "POST", Path: "/sandboxes", Body: []byte(`{"templateID":"` + templateRef + `"}`)},
+	})
+	if err != nil {
+		panic(err)
+	}
+	intent, err := clusterstate.NewDispatchIntent(demand, spec, "provider-v1/policy-v1")
+	if err != nil {
+		panic(err)
+	}
+	return intent
+}
+
+func testBuildDispatchIntent(t *testing.T) clusterstate.DispatchIntent {
+	t.Helper()
+	demand, err := placement.NormalizeBuildDemand(placement.BuildDemand{Slots: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec, err := clusterstate.MarshalBuildDispatchSpec(clusterstate.BuildDispatchSpecV1{
+		Version: clusterstate.DispatchSpecVersionV1, TemplateID: "template-1",
+		AuthKeyFingerprint: strings.Repeat("b", 24), ManifestKeyFingerprint: strings.Repeat("c", 24),
+		Profile: types.ProfileBare, CPUCount: 1, MemoryMB: 512,
+		Request: clusterstate.NodeRequestEnvelopeV1{Version: clusterstate.NodeRequestEnvelopeVersionV1, Method: "POST", Path: "/v3/templates", Body: []byte(`{"cpuCount":1,"memoryMB":512}`)},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	intent, err := clusterstate.NewDispatchIntent(demand, spec, "provider-v1/policy-v1")
+	if err != nil {
+		t.Fatal(err)
 	}
 	return intent
 }

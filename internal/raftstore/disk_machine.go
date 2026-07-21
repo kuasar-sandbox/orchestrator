@@ -578,7 +578,7 @@ func lookupRouteBucketOnDisk(
 	}
 	result.Available = true
 	result.SnapshotRevision = state.LastApplied
-	result.Routes = make([]clusterstate.RouteWorkflowRecord, 0)
+	result.Routes = make([]RouteBucketEntry, 0, int(query.Limit)+1)
 	groupPrefix := stateRowKey(prefix, stateRouteTable, lengthKey(query.Group))
 	iterator := reader.NewIter(&pebble.IterOptions{
 		LowerBound: groupPrefix, UpperBound: prefixUpperBound(groupPrefix),
@@ -599,8 +599,10 @@ func lookupRouteBucketOnDisk(
 		if err != nil {
 			return RouteBucketResult{}, err
 		}
-		if bucket == query.Bucket {
-			result.Routes = append(result.Routes, record)
+		if bucket == query.Bucket && record.RouteKey > query.AfterRouteKey {
+			if entry, listed := routeBucketEntry(record); listed {
+				addBoundedRouteBucketEntry(&result.Routes, entry, int(query.Limit)+1)
+			}
 		}
 	}
 	if err := iterator.Error(); err != nil {
@@ -609,6 +611,10 @@ func lookupRouteBucketOnDisk(
 	sort.Slice(result.Routes, func(left, right int) bool {
 		return result.Routes[left].RouteKey < result.Routes[right].RouteKey
 	})
+	if len(result.Routes) > int(query.Limit) {
+		result.Routes = result.Routes[:query.Limit]
+		result.NextRouteKey = result.Routes[len(result.Routes)-1].RouteKey
+	}
 	return result, nil
 }
 
@@ -735,7 +741,7 @@ func lookupPendingOnDisk(
 					iterator.Close()
 					return PendingLookupResult{}, err
 				}
-				if buildNeedsCoordinator(record.State) {
+				if buildNeedsCoordinator(record) {
 					workflows = append(workflows, PendingWorkflow{Key: qualified, Build: &record})
 				}
 			case stateRouteTable:
@@ -748,7 +754,7 @@ func lookupPendingOnDisk(
 					iterator.Close()
 					return PendingLookupResult{}, err
 				}
-				if routeNeedsCoordinator(record.State) {
+				if routeNeedsCoordinator(record) {
 					workflows = append(workflows, PendingWorkflow{Key: qualified, Route: &record})
 				}
 			}

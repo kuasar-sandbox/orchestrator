@@ -134,10 +134,10 @@ func TestRuntimeCompactsFenceOnlyAfterRetentionAndEveryReplicaProof(t *testing.T
 		}()},
 		registryLayout: registryLayout, registryLayoutDigest: digest, member: registryLayout.Members[0],
 		nodeHost: host, permitCache: permitCache,
-		enrollment: LocalEnrollment{Replicas: []LocalReplicaEnrollment{{
-			ShardID: raftShardID, ReplicaID: 1, StartPlan: ReplicaInitial,
-			LocalState: ReplicaActive,
-		}}},
+		enrollment: LocalEnrollment{Replicas: []LocalReplicaEnrollment{
+			{ShardID: SystemRaftShardID, ReplicaID: 1, StartPlan: ReplicaInitial, LocalState: ReplicaActive},
+			{ShardID: raftShardID, ReplicaID: 1, StartPlan: ReplicaInitial, LocalState: ReplicaActive},
+		}},
 		outboxAckVerifier: FenceOutboxAckVerifierFunc(func(_ context.Context, request FenceOutboxAckRequest) (FenceOutboxAckEvidence, error) {
 			if request.SandboxID != "sandbox-1" || request.FinalOutboxWatermark != 2 {
 				t.Fatalf("outbox ACK request = %+v", request)

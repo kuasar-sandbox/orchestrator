@@ -43,8 +43,18 @@ type RuntimeOpenOptions struct {
 	BootstrapSecret   []byte
 	TransitionClient  ReplicaTransitionClient
 	RecoveryClient    RecoveryShardClient
+	SystemClient      RemoteSystemClient
 	OutboxAckVerifier FenceOutboxAckVerifier
 	TerminalVerifier  TerminalProofVerifier
+}
+
+// RemoteSystemClient reaches the sole System Group from Registry members that
+// do not host one of its three replicas. It is transport only and creates no
+// local or secondary System authority.
+type RemoteSystemClient interface {
+	ReadSystemStrong(context.Context) (SystemState, error)
+	ApplySystem(context.Context, SystemCommand) (SystemApplyResult, error)
+	RefreshPermit(context.Context) (PermitGrant, error)
 }
 
 type raftNodeHost interface {
@@ -69,6 +79,7 @@ type nodeHostFactory func(dbconfig.NodeHostConfig) (raftNodeHost, error)
 type Runtime struct {
 	mu                    sync.Mutex
 	transitionMu          sync.Mutex
+	systemCacheMu         sync.RWMutex
 	config                RuntimeConfig
 	registryLayout        RegistryLayout
 	registryLayoutDigest  string
@@ -81,6 +92,8 @@ type Runtime struct {
 	permitCache           *PermitCache
 	transitionClient      ReplicaTransitionClient
 	recoveryClient        RecoveryShardClient
+	systemClient          RemoteSystemClient
+	systemCache           *SystemState
 	outboxAckVerifier     FenceOutboxAckVerifier
 	terminalVerifier      TerminalProofVerifier
 	systemEvents          *runtimeSystemEvents
@@ -107,6 +120,11 @@ func openRuntime(
 	if len(registryLayoutChain) == 0 || factory == nil {
 		return nil, errors.New("raftstore: a signed registryLayout chain and NodeHost factory are required")
 	}
+	resolvedConfig, err := config.resolvedStoragePaths()
+	if err != nil {
+		return nil, err
+	}
+	config = resolvedConfig
 	latestSigned := registryLayoutChain[len(registryLayoutChain)-1]
 	latestDigest, err := latestSigned.Verify(keyring)
 	if err != nil {
@@ -237,8 +255,9 @@ func openRuntime(
 		startupRegistryLayout: startupSigned.RegistryLayout, member: member,
 		enrollment: enrollment, enrollmentStore: store, nodeHost: nodeHost, stateEngine: stateEngine,
 		permitCache: NewPermitCache(time.Now), transitionClient: options.TransitionClient,
-		recoveryClient: options.RecoveryClient, outboxAckVerifier: options.OutboxAckVerifier,
-		terminalVerifier: options.TerminalVerifier, systemEvents: systemEvents,
+		recoveryClient: options.RecoveryClient, systemClient: options.SystemClient,
+		outboxAckVerifier: options.OutboxAckVerifier,
+		terminalVerifier:  options.TerminalVerifier, systemEvents: systemEvents,
 	}
 	systemEvents.bind(runtime)
 	return runtime, nil
@@ -269,6 +288,24 @@ func (r *Runtime) StartSystemReplica() error {
 		return ErrNoLocalReplica
 	}
 	return r.startReplica(position)
+}
+
+func (r *Runtime) HasLocalSystemReplica() bool {
+	if r == nil {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	position := r.replicaPosition(SystemRaftShardID)
+	if position < 0 {
+		return false
+	}
+	switch r.enrollment.Replicas[position].LocalState {
+	case ReplicaPlanned, ReplicaStarting, ReplicaActive:
+		return true
+	default:
+		return false
+	}
 }
 
 func (r *Runtime) StartDataReplicas(system SystemState) error {
@@ -456,6 +493,19 @@ func (r *Runtime) ReadSystemLocal() (SystemState, error) {
 	if err := r.removalFenceError(); err != nil {
 		return SystemState{}, err
 	}
+	if !r.HasLocalSystemReplica() {
+		r.systemCacheMu.RLock()
+		cached := r.systemCache
+		if cached != nil {
+			copy := cloneSystemState(*cached)
+			cached = &copy
+		}
+		r.systemCacheMu.RUnlock()
+		if cached == nil {
+			return SystemState{}, ErrNoLocalReplica
+		}
+		return *cached, nil
+	}
 	value, err := r.nodeHost.StaleRead(SystemRaftShardID, SystemStateLookup{})
 	if err != nil {
 		return SystemState{}, err
@@ -471,6 +521,20 @@ func (r *Runtime) ReadSystemStrong(ctx context.Context) (SystemState, error) {
 	if err := r.removalFenceError(); err != nil {
 		return SystemState{}, err
 	}
+	if !r.HasLocalSystemReplica() {
+		if r.systemClient == nil {
+			return SystemState{}, errors.New("raftstore: remote System Group client is unavailable")
+		}
+		state, err := r.systemClient.ReadSystemStrong(ctx)
+		if err != nil {
+			return SystemState{}, err
+		}
+		if err := r.authorizeRegistryLayoutState(state); err != nil {
+			return SystemState{}, err
+		}
+		r.cacheRemoteSystem(state)
+		return cloneSystemState(state), nil
+	}
 	value, err := r.nodeHost.SyncRead(ctx, SystemRaftShardID, SystemStateLookup{})
 	if err != nil {
 		return SystemState{}, err
@@ -482,11 +546,23 @@ func (r *Runtime) ReadSystemStrong(ctx context.Context) (SystemState, error) {
 	return state, nil
 }
 
+func (r *Runtime) cacheRemoteSystem(state SystemState) {
+	copy := cloneSystemState(state)
+	r.systemCacheMu.Lock()
+	if r.systemCache == nil || copy.LastApplied >= r.systemCache.LastApplied {
+		r.systemCache = &copy
+	}
+	r.systemCacheMu.Unlock()
+}
+
 func (r *Runtime) AwaitSystemRegistryLayout(ctx context.Context) (SystemState, error) {
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
 	for {
 		state, err := r.ReadSystemLocal()
+		if !r.HasLocalSystemReplica() {
+			state, err = r.ReadSystemStrong(ctx)
+		}
 		if err == nil && state.Initialized {
 			if err := r.authorizeRegistryLayoutState(state); err != nil {
 				return SystemState{}, err
@@ -619,6 +695,31 @@ func (r *Runtime) initializeDataShard(ctx context.Context, replica LocalReplicaE
 }
 
 func (r *Runtime) RefreshPermit(ctx context.Context) (PermitGrant, error) {
+	if !r.HasLocalSystemReplica() {
+		if r.systemClient == nil {
+			return PermitGrant{}, errors.New("raftstore: remote System Group client is unavailable")
+		}
+		started := time.Now()
+		grant, err := r.systemClient.RefreshPermit(ctx)
+		if err != nil {
+			return PermitGrant{}, err
+		}
+		state, err := r.systemClient.ReadSystemStrong(ctx)
+		if err != nil {
+			return PermitGrant{}, err
+		}
+		if err := r.authorizeRegistryLayoutState(state); err != nil {
+			return PermitGrant{}, err
+		}
+		if state.LastApplied < grant.CommitIndex || state.Identity() != grant.PermitIdentity {
+			return PermitGrant{}, errors.New("raftstore: remote Permit is not covered by the fetched System state")
+		}
+		if err := r.permitCache.Install(grant, started); err != nil {
+			return PermitGrant{}, err
+		}
+		r.cacheRemoteSystem(state)
+		return grant, nil
+	}
 	started := time.Now()
 	result, err := r.proposeSystem(ctx, SystemCommand{Type: SystemRefreshPermit})
 	if err != nil {
@@ -697,6 +798,20 @@ func (r *Runtime) resolveDataMutation(ctx context.Context, command DataCommand) 
 func (r *Runtime) proposeSystem(ctx context.Context, command SystemCommand) (SystemApplyResult, error) {
 	if err := r.removalFenceError(); err != nil {
 		return SystemApplyResult{}, err
+	}
+	if !r.HasLocalSystemReplica() {
+		if r.systemClient == nil {
+			return SystemApplyResult{}, errors.New("raftstore: remote System Group client is unavailable")
+		}
+		state, err := r.systemClient.ReadSystemStrong(ctx)
+		if err != nil {
+			return SystemApplyResult{}, err
+		}
+		if err := r.authorizeRegistryLayoutState(state); err != nil {
+			return SystemApplyResult{}, err
+		}
+		r.cacheRemoteSystem(state)
+		return r.systemClient.ApplySystem(ctx, command)
 	}
 	raw, err := EncodeSystemCommand(command)
 	if err != nil {

@@ -571,8 +571,6 @@ func TestRuntimeAdvancesEnrollmentRegistryLayoutOnlyAfterConsensusActivation(t *
 	next.RegistryLayoutVersion = 2
 	next.PreviousRegistryLayoutVersion = 1
 	next.PreviousRegistryLayoutDigest = firstDigest
-	next.Members = append([]RegistryMember(nil), next.Members...)
-	next.Members[1].InternalEndpoint = "https://registry-b-v2:9443"
 	signedNext, err := SignRegistryLayout(next, "root-1", fixture.key)
 	if err != nil {
 		t.Fatal(err)
@@ -726,7 +724,12 @@ func TestDataShardBootstrapResolvesCommittedProposalAfterCallerCancellation(t *t
 		cancel()
 		return sm.Result{}, ctx.Err()
 	}
-	runtime := &Runtime{registryLayout: registryLayout, registryLayoutDigest: digest, nodeHost: host}
+	runtime := &Runtime{
+		registryLayout: registryLayout, registryLayoutDigest: digest, nodeHost: host,
+		enrollment: LocalEnrollment{Replicas: []LocalReplicaEnrollment{{
+			ShardID: SystemRaftShardID, ReplicaID: 1, StartPlan: ReplicaInitial, LocalState: ReplicaActive,
+		}}},
+	}
 	replica := LocalReplicaEnrollment{ShardID: DataRaftShardID(0), ReplicaID: 1, LocalState: ReplicaActive}
 	if err := runtime.initializeDataShard(ctx, replica); err != nil {
 		t.Fatalf("resolve committed bootstrap: %v", err)
@@ -852,7 +855,12 @@ func TestRuntimePredecessorDrainUsesFullMonotonicWait(t *testing.T) {
 		encoded, err := json.Marshal(applied)
 		return sm.Result{Value: 1, Data: encoded}, err
 	}
-	runtime := &Runtime{registryLayout: registryLayout, registryLayoutDigest: digest, nodeHost: host}
+	runtime := &Runtime{
+		registryLayout: registryLayout, registryLayoutDigest: digest, nodeHost: host,
+		enrollment: LocalEnrollment{Replicas: []LocalReplicaEnrollment{{
+			ShardID: SystemRaftShardID, ReplicaID: 1, StartPlan: ReplicaInitial, LocalState: ReplicaActive,
+		}}},
+	}
 	if _, err := runtime.ApplySystem(context.Background(), SystemCommand{
 		Type: SystemConfirmDrain, Drain: &DrainConfirmation{
 			PredecessorProofDigest: registryLayout.Predecessor.ProofDigest,
@@ -918,7 +926,12 @@ func TestRuntimeClosesGenerationOnlyForCompleteSuccessorIntent(t *testing.T) {
 		encoded, encodeErr := json.Marshal(applied)
 		return sm.Result{Value: 1, Data: encoded}, encodeErr
 	}
-	runtime := &Runtime{registryLayout: registryLayout, registryLayoutDigest: digest, nodeHost: host}
+	runtime := &Runtime{
+		registryLayout: registryLayout, registryLayoutDigest: digest, nodeHost: host,
+		enrollment: LocalEnrollment{Replicas: []LocalReplicaEnrollment{{
+			ShardID: SystemRaftShardID, ReplicaID: 1, StartPlan: ReplicaInitial, LocalState: ReplicaActive,
+		}}},
+	}
 
 	successor := testRegistryLayout(2, "generation-2")
 	successor.Predecessor = &PredecessorProof{

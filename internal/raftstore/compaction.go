@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"reflect"
 	"slices"
 	"sort"
 	"time"
@@ -14,7 +15,10 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-const fenceRetentionProofDomain = "kuasar-fence-retention-proof-v1\x00"
+const (
+	fenceRetentionProofDomain = "kuasar-fence-retention-proof-v1\x00"
+	nodeEpochFenceProofDomain = "kuasar-node-epoch-fence-proof-v1\x00"
+)
 
 type FenceOutboxAckEvidence struct {
 	AckedWatermark uint64 `json:"acked_watermark"`
@@ -43,6 +47,25 @@ func (f FenceOutboxAckVerifierFunc) VerifyFenceOutboxAck(
 	request FenceOutboxAckRequest,
 ) (FenceOutboxAckEvidence, error) {
 	return f(ctx, request)
+}
+
+func (r *Runtime) SetOutboxAckVerifier(verifier FenceOutboxAckVerifier) error {
+	if r == nil || verifier == nil {
+		return errors.New("raftstore: trusted final outbox ACK verifier is required")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.outboxAckVerifier != nil {
+		return errors.New("raftstore: trusted final outbox ACK verifier is already configured")
+	}
+	r.outboxAckVerifier = verifier
+	return nil
+}
+
+func (r *Runtime) trustedOutboxAckVerifier() FenceOutboxAckVerifier {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.outboxAckVerifier
 }
 
 func (e FenceOutboxAckEvidence) validates(fence clusterstate.ExecutionFence) bool {
@@ -87,14 +110,16 @@ func (r *Runtime) CompactExecutionFence(
 	if fence == nil {
 		return errors.New("raftstore: execution fence is missing")
 	}
-	permanentlyFenced := fence.Proof.Kind == clusterstate.ProofNewerNodeEpoch ||
+	placementFailure := fence.PlacementFailure != nil
+	proofPermanentlyFenced := fence.Proof.Kind == clusterstate.ProofNewerNodeEpoch ||
 		fence.Proof.Kind == clusterstate.ProofExternalFence
 	var outboxAck FenceOutboxAckEvidence
-	if !permanentlyFenced {
-		if r.outboxAckVerifier == nil {
+	if !placementFailure && !proofPermanentlyFenced {
+		verifier := r.trustedOutboxAckVerifier()
+		if verifier == nil {
 			return errors.New("raftstore: trusted final outbox ACK verifier is unavailable")
 		}
-		outboxAck, err = r.outboxAckVerifier.VerifyFenceOutboxAck(ctx, FenceOutboxAckRequest{
+		outboxAck, err = verifier.VerifyFenceOutboxAck(ctx, FenceOutboxAckRequest{
 			Group: fence.Group, RouteKey: fence.RouteKey, SandboxID: fence.SandboxID,
 			NodeID: fence.NodeID, NodeEpoch: fence.NodeEpoch, RegistryGeneration: fence.RegistryGeneration,
 			BindingDigest: fence.BindingDigest, FinalOutboxWatermark: fence.FinalOutboxWatermark,
@@ -134,7 +159,7 @@ func (r *Runtime) CompactExecutionFence(
 	if currentFence == nil {
 		return nil
 	}
-	if *currentFence != *fence {
+	if !reflect.DeepEqual(*currentFence, *fence) {
 		return errors.New("raftstore: execution fence changed during retention")
 	}
 	proofs, err := r.proveFenceAppliedEverywhere(ctx, identity, *fence)
@@ -150,17 +175,17 @@ func (r *Runtime) CompactExecutionFence(
 		return errors.New("raftstore: System identity changed during fence proof collection")
 	}
 	retentionDigest, err := fenceRetentionProofDigest(
-		*fence, r.config.Tuning.FenceRetentionMillis, outboxAck,
+		*fence, r.config.Tuning.FenceRetentionMillis, outboxAck, nil,
 	)
 	if err != nil {
 		return err
 	}
 	authorization := FenceCompactionAuthorization{
 		Group: group, RouteKey: routeKey, SandboxID: sandboxID,
-		FenceRevision: fence.Revision.LogIndex, TerminalProofDigest: fence.Proof.ProofDigest,
-		FinalOutboxWatermarkAcked:  !permanentlyFenced,
-		NodeEpochPermanentlyFenced: permanentlyFenced,
-		ReplicaApplied:             proofs, RetentionProofDigest: retentionDigest,
+		FenceRevision: fence.Revision.LogIndex, TerminalProofDigest: fence.ProofDigest(),
+		FinalOutboxWatermarkAcked: placementFailure ||
+			!proofPermanentlyFenced && outboxAck.validates(*fence),
+		ReplicaApplied: proofs, RetentionProofDigest: retentionDigest,
 	}
 	result, proposeErr := r.proposeDataRaw(ctx, DataCommand{
 		Type: DataCompactFence, Identity: identity, Compaction: &authorization,
@@ -261,23 +286,46 @@ func fenceRetentionProofDigest(
 	fence clusterstate.ExecutionFence,
 	retentionMillis uint64,
 	outboxAck FenceOutboxAckEvidence,
+	nodeEpochFence *NodeEpochFenceEvidence,
 ) (string, error) {
 	value := struct {
-		RegistryGeneration string                 `json:"registry_generation"`
-		ShardID            uint32                 `json:"shard_id"`
-		FenceRevision      uint64                 `json:"fence_revision"`
-		TerminalDigest     string                 `json:"terminal_digest"`
-		RetentionMillis    uint64                 `json:"retention_millis"`
-		OutboxAck          FenceOutboxAckEvidence `json:"outbox_ack"`
+		RegistryGeneration string                  `json:"registry_generation"`
+		ShardID            uint32                  `json:"shard_id"`
+		FenceRevision      uint64                  `json:"fence_revision"`
+		TerminalDigest     string                  `json:"terminal_digest"`
+		RetentionMillis    uint64                  `json:"retention_millis"`
+		OutboxAck          FenceOutboxAckEvidence  `json:"outbox_ack"`
+		NodeEpochFence     *NodeEpochFenceEvidence `json:"node_epoch_fence,omitempty"`
 	}{
 		RegistryGeneration: fence.RegistryGeneration, ShardID: fence.Revision.ShardID,
-		FenceRevision: fence.Revision.LogIndex, TerminalDigest: fence.Proof.ProofDigest,
-		RetentionMillis: retentionMillis, OutboxAck: outboxAck,
+		FenceRevision: fence.Revision.LogIndex, TerminalDigest: fence.ProofDigest(),
+		RetentionMillis: retentionMillis, OutboxAck: outboxAck, NodeEpochFence: nodeEpochFence,
 	}
 	raw, err := json.Marshal(value)
 	if err != nil {
 		return "", err
 	}
 	digest := sha256.Sum256(append([]byte(fenceRetentionProofDomain), raw...))
+	return hex.EncodeToString(digest[:]), nil
+}
+
+func (e NodeEpochFenceEvidence) validates(identity PermitIdentity, fence clusterstate.ExecutionFence) bool {
+	if e.PermitIdentity != identity || e.SystemCommitIndex == 0 || e.EnrollmentID == "" ||
+		e.EnrollmentCommitIndex == 0 || e.EnrollmentCommitIndex > e.SystemCommitIndex ||
+		e.NodeID != fence.NodeID || e.FencedNodeEpoch != fence.NodeEpoch ||
+		e.ObservedNodeEpoch <= e.FencedNodeEpoch || e.ObservedDataEndpoint == "" || !isSHA256(e.ProofDigest) {
+		return false
+	}
+	digest, err := nodeEpochFenceEvidenceDigest(e)
+	return err == nil && digest == e.ProofDigest
+}
+
+func nodeEpochFenceEvidenceDigest(evidence NodeEpochFenceEvidence) (string, error) {
+	evidence.ProofDigest = ""
+	raw, err := json.Marshal(evidence)
+	if err != nil {
+		return "", err
+	}
+	digest := sha256.Sum256(append([]byte(nodeEpochFenceProofDomain), raw...))
 	return hex.EncodeToString(digest[:]), nil
 }

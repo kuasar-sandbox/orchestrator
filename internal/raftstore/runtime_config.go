@@ -106,26 +106,84 @@ func (c RuntimeConfig) validate(member RegistryMember) error {
 	if c.TLS.CAFile == "" || c.TLS.CertFile == "" || c.TLS.KeyFile == "" {
 		return errors.New("raftstore: Raft mutual TLS material is required")
 	}
-	if filepath.Clean(c.RegistryLayoutGuardPath) == filepath.Clean(c.EnrollmentPath) {
-		return errors.New("raftstore: registryLayout guard and enrollment must use distinct files")
-	}
 	if c.StorageAttestor == nil {
 		return errors.New("raftstore: encrypted storage attestation is required")
 	}
 	if err := c.Tuning.Validate(); err != nil {
 		return err
 	}
-	for _, identityPath := range []string{c.RegistryLayoutGuardPath, c.EnrollmentPath} {
-		if pathWithin(c.NodeHostDir, identityPath) || c.WALDir != "" && pathWithin(c.WALDir, identityPath) ||
-			pathWithin(c.StateEngineDir, identityPath) {
+	return c.validateStoragePathSeparation()
+}
+
+func (c RuntimeConfig) resolvedStoragePaths() (RuntimeConfig, error) {
+	resolved := c
+	paths := []*string{
+		&resolved.NodeHostDir, &resolved.WALDir, &resolved.StateEngineDir,
+		&resolved.RegistryLayoutGuardPath, &resolved.EnrollmentPath,
+	}
+	for _, path := range paths {
+		if *path == "" {
+			continue
+		}
+		value, err := resolvePathThroughExistingSymlinks(*path)
+		if err != nil {
+			return RuntimeConfig{}, fmt.Errorf("raftstore: resolve storage path %q: %w", *path, err)
+		}
+		*path = value
+	}
+	return resolved, nil
+}
+
+func (c RuntimeConfig) validateStoragePathSeparation() error {
+	resolved, err := c.resolvedStoragePaths()
+	if err != nil {
+		return err
+	}
+	if resolved.RegistryLayoutGuardPath == resolved.EnrollmentPath {
+		return errors.New("raftstore: registryLayout guard and enrollment must use distinct files")
+	}
+	for _, identityPath := range []string{resolved.RegistryLayoutGuardPath, resolved.EnrollmentPath} {
+		if pathWithin(resolved.NodeHostDir, identityPath) ||
+			resolved.WALDir != "" && pathWithin(resolved.WALDir, identityPath) ||
+			pathWithin(resolved.StateEngineDir, identityPath) {
 			return errors.New("raftstore: registryLayout/enrollment state must be outside Dragonboat data directories")
 		}
 	}
-	if pathWithin(c.NodeHostDir, c.StateEngineDir) || pathWithin(c.StateEngineDir, c.NodeHostDir) ||
-		c.WALDir != "" && (pathWithin(c.WALDir, c.StateEngineDir) || pathWithin(c.StateEngineDir, c.WALDir)) {
+	if pathWithin(resolved.NodeHostDir, resolved.StateEngineDir) ||
+		pathWithin(resolved.StateEngineDir, resolved.NodeHostDir) ||
+		resolved.WALDir != "" && (pathWithin(resolved.WALDir, resolved.StateEngineDir) ||
+			pathWithin(resolved.StateEngineDir, resolved.WALDir)) {
 		return errors.New("raftstore: Pebble state engine and Dragonboat storage must use distinct directories")
 	}
 	return nil
+}
+
+func resolvePathThroughExistingSymlinks(path string) (string, error) {
+	path = filepath.Clean(path)
+	current := path
+	suffix := make([]string, 0)
+	for {
+		_, err := os.Lstat(current)
+		switch {
+		case err == nil:
+			resolved, err := filepath.EvalSymlinks(current)
+			if err != nil {
+				return "", err
+			}
+			for index := len(suffix) - 1; index >= 0; index-- {
+				resolved = filepath.Join(resolved, suffix[index])
+			}
+			return filepath.Clean(resolved), nil
+		case !errors.Is(err, os.ErrNotExist):
+			return "", err
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return "", errors.New("no existing storage path ancestor")
+		}
+		suffix = append(suffix, filepath.Base(current))
+		current = parent
+	}
 }
 
 func (c RuntimeConfig) dragonboatConfig(registryLayout RegistryLayout, member RegistryMember) (dbconfig.NodeHostConfig, error) {
@@ -194,14 +252,18 @@ func (c RuntimeConfig) digest(registryLayout RegistryLayout, member RegistryMemb
 }
 
 func (c RuntimeConfig) attestStorage() error {
-	directories := map[string]struct{}{
-		filepath.Clean(c.NodeHostDir):           {},
-		filepath.Clean(c.StateEngineDir):        {},
-		filepath.Dir(c.RegistryLayoutGuardPath): {},
-		filepath.Dir(c.EnrollmentPath):          {},
+	resolved, err := c.resolvedStoragePaths()
+	if err != nil {
+		return err
 	}
-	if c.WALDir != "" {
-		directories[filepath.Clean(c.WALDir)] = struct{}{}
+	directories := map[string]struct{}{
+		resolved.NodeHostDir:                           {},
+		resolved.StateEngineDir:                        {},
+		filepath.Dir(resolved.RegistryLayoutGuardPath): {},
+		filepath.Dir(resolved.EnrollmentPath):          {},
+	}
+	if resolved.WALDir != "" {
+		directories[resolved.WALDir] = struct{}{}
 	}
 	paths := make([]string, 0, len(directories))
 	for path := range directories {
@@ -212,6 +274,9 @@ func (c RuntimeConfig) attestStorage() error {
 		if err := os.MkdirAll(path, 0o700); err != nil {
 			return err
 		}
+	}
+	if err := resolved.validateStoragePathSeparation(); err != nil {
+		return err
 	}
 	if err := c.StorageAttestor.VerifyEncrypted(paths...); err != nil {
 		return fmt.Errorf("raftstore: encrypted storage attestation failed: %w", err)

@@ -238,15 +238,29 @@ func (e RevisionExpectation) matches(found bool, revision uint64) bool {
 }
 
 type FenceCompactionAuthorization struct {
-	Group                      string                `json:"group"`
-	RouteKey                   string                `json:"route_key"`
-	SandboxID                  string                `json:"sandbox_id"`
-	FenceRevision              uint64                `json:"fence_revision"`
-	TerminalProofDigest        string                `json:"terminal_proof_digest"`
-	FinalOutboxWatermarkAcked  bool                  `json:"final_outbox_watermark_acked"`
-	NodeEpochPermanentlyFenced bool                  `json:"node_epoch_permanently_fenced"`
-	ReplicaApplied             []ReplicaAppliedProof `json:"replica_applied"`
-	RetentionProofDigest       string                `json:"retention_proof_digest"`
+	Group                     string                  `json:"group"`
+	RouteKey                  string                  `json:"route_key"`
+	SandboxID                 string                  `json:"sandbox_id"`
+	FenceRevision             uint64                  `json:"fence_revision"`
+	TerminalProofDigest       string                  `json:"terminal_proof_digest"`
+	FinalOutboxWatermarkAcked bool                    `json:"final_outbox_watermark_acked"`
+	NodeEpochFence            *NodeEpochFenceEvidence `json:"node_epoch_fence,omitempty"`
+	ReplicaApplied            []ReplicaAppliedProof   `json:"replica_applied"`
+	RetentionProofDigest      string                  `json:"retention_proof_digest"`
+}
+
+// NodeEpochFenceEvidence binds compaction to committed System state that
+// accepted a strictly newer NodeEpoch for the same enrolled node.
+type NodeEpochFenceEvidence struct {
+	PermitIdentity
+	SystemCommitIndex     uint64 `json:"system_commit_index"`
+	EnrollmentID          string `json:"enrollment_id"`
+	EnrollmentCommitIndex uint64 `json:"enrollment_commit_index"`
+	NodeID                string `json:"node_id"`
+	FencedNodeEpoch       uint64 `json:"fenced_node_epoch"`
+	ObservedNodeEpoch     uint64 `json:"observed_node_epoch"`
+	ObservedDataEndpoint  string `json:"observed_data_endpoint"`
+	ProofDigest           string `json:"proof_digest"`
 }
 
 type DataShardBootstrap struct {
@@ -403,6 +417,9 @@ func ApplyDataCommand(state *DataState, index uint64, command DataCommand) DataA
 		if !command.Expect.matches(found, current.Revision.LogIndex) {
 			return conflict("Route revision conflict", current.Revision.LogIndex)
 		}
+		if found && record.Finalizations == nil {
+			record.Finalizations = cloneWorkflowFinalizations(current.Finalizations)
+		}
 		record.Revision = revisionFor(*state, index)
 		normalizeRouteRevision(&record)
 		if err := record.Validate(); err != nil {
@@ -433,8 +450,10 @@ func ApplyDataCommand(state *DataState, index uint64, command DataCommand) DataA
 		if !command.Expect.matches(found, current.Revision.LogIndex) {
 			return conflict("Build revision conflict", current.Revision.LogIndex)
 		}
+		if found && record.Finalizations == nil {
+			record.Finalizations = cloneWorkflowFinalizations(current.Finalizations)
+		}
 		record.Revision = revisionFor(*state, index)
-		normalizeBuildRevision(&record)
 		if err := record.Validate(); err != nil {
 			return conflict(err.Error(), current.Revision.LogIndex)
 		}
@@ -450,7 +469,7 @@ func ApplyDataCommand(state *DataState, index uint64, command DataCommand) DataA
 		if !state.Accepts(command.Identity) || command.Fence == nil {
 			return conflict("execution fence mutation identity is fenced", 0)
 		}
-		fence := *command.Fence
+		fence := cloneExecutionFence(*command.Fence)
 		_, shardID, err := clusterstate.RouteShardFor(fence.Group, fence.RouteKey, state.RouteBucketCount, state.VirtualShardCount)
 		if err != nil || shardID != state.ShardID {
 			return conflict("execution fence belongs to another shard", 0)
@@ -485,7 +504,7 @@ func ApplyDataCommand(state *DataState, index uint64, command DataCommand) DataA
 		if !found {
 			return conflict("execution fence is missing", 0)
 		}
-		if err := validateFenceCompaction(*state, fence, *authorization); err != nil {
+		if err := validateFenceCompaction(*state, fence, *authorization, command.Identity); err != nil {
 			return conflict(err.Error(), fence.Revision.LogIndex)
 		}
 		routeKey := routeMapKey(fence.Group, fence.RouteKey)
@@ -531,12 +550,6 @@ func revisionFor(state DataState, index uint64) clusterstate.Revision {
 
 func normalizeRouteRevision(record *clusterstate.RouteWorkflowRecord) {
 	if record.Tombstone != nil && record.Tombstone.PlacementFailure == nil && record.Tombstone.FailureRevision == (clusterstate.Revision{}) {
-		record.Tombstone.FailureRevision = record.Revision
-	}
-}
-
-func normalizeBuildRevision(record *clusterstate.BuildRecord) {
-	if record.Tombstone != nil && record.Tombstone.FailureRevision == (clusterstate.Revision{}) {
 		record.Tombstone.FailureRevision = record.Revision
 	}
 }
