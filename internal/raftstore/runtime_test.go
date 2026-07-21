@@ -872,7 +872,12 @@ func TestDataShardBootstrapResolvesCommittedProposalAfterCallerCancellation(t *t
 		cancel()
 		return sm.Result{}, ctx.Err()
 	}
-	runtime := &Runtime{registryLayout: registryLayout, registryLayoutDigest: digest, nodeHost: host}
+	runtime := &Runtime{
+		registryLayout: registryLayout, registryLayoutDigest: digest, nodeHost: host,
+		enrollment: LocalEnrollment{Replicas: []LocalReplicaEnrollment{{
+			ShardID: SystemRaftShardID, ReplicaID: 1, StartPlan: ReplicaInitial, LocalState: ReplicaActive,
+		}}},
+	}
 	replica := LocalReplicaEnrollment{ShardID: DataRaftShardID(0), ReplicaID: 1, LocalState: ReplicaActive}
 	if err := runtime.initializeDataShard(ctx, replica); err != nil {
 		t.Fatalf("resolve committed bootstrap: %v", err)

@@ -1,6 +1,7 @@
 package raftstore
 
 import (
+	"container/heap"
 	"errors"
 	"sort"
 
@@ -438,7 +439,7 @@ func lookupRouteBucket(state DataState, query RouteBucketLookup) RouteBucketResu
 	}
 	result.Available = true
 	result.SnapshotRevision = state.LastApplied
-	result.Routes = make([]RouteBucketEntry, 0)
+	result.Routes = make([]RouteBucketEntry, 0, min(int(query.Limit)+1, len(state.Routes)))
 	for _, record := range state.Routes {
 		if record.Group != query.Group || record.RouteKey <= query.AfterRouteKey {
 			continue
@@ -448,7 +449,7 @@ func lookupRouteBucket(state DataState, query RouteBucketLookup) RouteBucketResu
 		)
 		if err == nil && bucket == query.Bucket {
 			if entry, listed := routeBucketEntry(record); listed {
-				result.Routes = append(result.Routes, entry)
+				addBoundedRouteBucketEntry(&result.Routes, entry, int(query.Limit)+1)
 			}
 		}
 	}
@@ -460,6 +461,32 @@ func lookupRouteBucket(state DataState, query RouteBucketLookup) RouteBucketResu
 		result.NextRouteKey = result.Routes[len(result.Routes)-1].RouteKey
 	}
 	return result
+}
+
+type routeBucketEntryHeap []RouteBucketEntry
+
+func (h routeBucketEntryHeap) Len() int           { return len(h) }
+func (h routeBucketEntryHeap) Less(i, j int) bool { return h[i].RouteKey > h[j].RouteKey }
+func (h routeBucketEntryHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+func (h *routeBucketEntryHeap) Push(value any)    { *h = append(*h, value.(RouteBucketEntry)) }
+func (h *routeBucketEntryHeap) Pop() any {
+	old := *h
+	last := len(old) - 1
+	value := old[last]
+	*h = old[:last]
+	return value
+}
+
+func addBoundedRouteBucketEntry(entries *[]RouteBucketEntry, entry RouteBucketEntry, bound int) {
+	if len(*entries) < bound {
+		heap.Push((*routeBucketEntryHeap)(entries), entry)
+		return
+	}
+	if bound == 0 || entry.RouteKey >= (*entries)[0].RouteKey {
+		return
+	}
+	(*entries)[0] = entry
+	heap.Fix((*routeBucketEntryHeap)(entries), 0)
 }
 
 func routeBucketEntry(record clusterstate.RouteWorkflowRecord) (RouteBucketEntry, bool) {

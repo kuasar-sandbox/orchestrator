@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
+	"github.com/kuasar-sandbox/orchestrator/internal/nodeexec"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxy"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
@@ -35,6 +36,68 @@ func TestSandboxRouteFenceProjectsOpaqueBinding(t *testing.T) {
 	stale.ExpectedNodeEpoch--
 	if kind, failed := validateSandboxRouteFence(sb, stale); !failed || kind != proxy.KindWrongNodeEpoch {
 		t.Fatalf("stale epoch failure = (%v,%v)", kind, failed)
+	}
+}
+
+func TestManagedRouteSyncUsesDurableEventFence(t *testing.T) {
+	o := testOrch(t)
+	ctx := context.Background()
+	sid := "managed-route"
+	templateRef := "e2b-img-" + strings.Repeat("c", 64)
+	dispatch := clusterResumeDispatch(t, sid, templateRef)
+	sandbox := &types.Sandbox{
+		ID: sid, TemplateID: templateRef, State: types.StatePaused,
+		AuthKey: strings.Repeat("a", 64), ManifestKey: strings.Repeat("b", 64),
+		EnvdAccessToken: "access-token", TrafficAccessToken: "traffic-token",
+	}
+	if _, err := o.st.RecordSandboxWorkflow(ctx, dispatch, nodeexec.AdmissionDecision{
+		State: nodeexec.AdmissionAdmitted, Result: clusterstate.DispatchAcceptedAdmitted,
+		ReservationToken: "reservation-1",
+	}, sandbox); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := o.st.Get(ctx, sid)
+	if err != nil || stored == nil {
+		t.Fatalf("stored Sandbox = %+v, %v", stored, err)
+	}
+	record, err := o.st.CommitSandboxEvent(ctx, stored, nodeexec.EventUpdate{
+		State: string(clusterstate.WorkflowRouteReady), TargetPort: 49983,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored, _ = o.st.Get(ctx, sid)
+	entry, err := o.routeEntryForSync(ctx, stored)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entry.EventSeq != record.EventSeq || entry.EventSeq == 0 ||
+		entry.BindingDigest != record.BindingDigest || entry.State != routesync.StateRunning {
+		t.Fatalf("managed route entry = %+v, workflow = %+v", entry, record)
+	}
+	var ranged []routesync.RouteEntry
+	if err := o.Range(ctx, func(route routesync.RouteEntry) error {
+		ranged = append(ranged, route)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(ranged) != 1 || ranged[0].SandboxID != sid || ranged[0].EventSeq != record.EventSeq {
+		t.Fatalf("managed route range = %+v", ranged)
+	}
+
+	record, err = o.st.CommitSandboxEvent(ctx, stored, nodeexec.EventUpdate{State: "DELETED"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	delete, err := o.routeDeleteForSync(ctx, sid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if delete.EventSeq != record.EventSeq || delete.EventSeq <= entry.EventSeq ||
+		delete.NodeID != record.NodeID || delete.NodeEpoch != record.NodeEpoch ||
+		delete.BindingDigest != record.BindingDigest {
+		t.Fatalf("managed route delete = %+v, workflow = %+v", delete, record)
 	}
 }
 
@@ -78,37 +141,47 @@ func TestClusterCommandValidatesOpaqueBinding(t *testing.T) {
 func TestRebindClusterExecutionUsesDigestCAS(t *testing.T) {
 	o := testOrch(t)
 	ctx := context.Background()
-	if _, err := o.st.EnrollClusterIdentity(ctx, "n1", "boot-1", "10.0.0.1:8443"); err != nil {
+	if _, err := o.st.EnrollClusterIdentity(ctx, "node-1", "boot-1", "10.0.0.1:8443"); err != nil {
 		t.Fatal(err)
 	}
-	demand := sha256.Sum256([]byte("demand"))
-	dispatch := sha256.Sum256([]byte("dispatch"))
-	makeBinding := func(generation string) string {
-		opaque, err := clusterstate.EncodeExecutionBinding(clusterstate.ExecutionBinding{
-			RegistryGeneration: generation, Kind: clusterstate.ExecutionKindSandbox,
-			ObjectID: "s1", Group: "/g", RouteKey: "rk", NodeID: "n1", NodeEpoch: 7,
-			DemandDigest: demand, DispatchSpecDigest: dispatch,
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		return opaque
+	templateRef := "e2b-img-" + strings.Repeat("c", 64)
+	dispatch := clusterResumeDispatch(t, "s1", templateRef)
+	oldOpaque := dispatch.OpaqueBinding
+	rebound, err := clusterstate.DecodeExecutionBinding(oldOpaque)
+	if err != nil {
+		t.Fatal(err)
 	}
-	oldOpaque := makeBinding("g1")
-	newOpaque := makeBinding("g2")
+	rebound.RegistryGeneration = "generation-2"
+	newOpaque, err := clusterstate.EncodeExecutionBinding(rebound)
+	if err != nil {
+		t.Fatal(err)
+	}
 	oldDigest, _ := clusterstate.ExecutionBindingDigest(oldOpaque)
 	newDigest, _ := clusterstate.ExecutionBindingDigest(newOpaque)
-	if err := o.st.Put(ctx, &types.Sandbox{
-		ID: "s1", State: types.StatePaused,
+	sandbox := &types.Sandbox{
+		ID: "s1", TemplateID: templateRef, State: types.StatePaused,
 		AuthKey: strings.Repeat("2", 64), ManifestKey: strings.Repeat("1", 64),
-		Metadata: map[string]string{clusterstate.ObjectMetadataKey: oldOpaque},
+		EnvdAccessToken: "access-token", TrafficAccessToken: "traffic-token",
+	}
+	if _, err := o.st.RecordSandboxWorkflow(ctx, dispatch, nodeexec.AdmissionDecision{
+		State: nodeexec.AdmissionAdmitted, Result: clusterstate.DispatchAcceptedAdmitted,
+		ReservationToken: "reservation-1",
+	}, sandbox); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := o.st.Get(ctx, "s1")
+	if err != nil || stored == nil {
+		t.Fatalf("stored Sandbox = %+v, %v", stored, err)
+	}
+	if _, err := o.st.CommitSandboxEvent(ctx, stored, nodeexec.EventUpdate{
+		State: string(clusterstate.WorkflowRouteReady), TargetPort: 49983,
 	}); err != nil {
 		t.Fatal(err)
 	}
 	cmd := &routesync.Command{
-		SID: "s1", NodeEpoch: 7, SessionSeq: 3, RegistryGeneration: "g2",
+		SID: "s1", NodeEpoch: 7, SessionSeq: 3, RegistryGeneration: "generation-2",
 		Binding: newOpaque, BindingDigest: newDigest, OldBindingDigest: oldDigest,
-		DemandDigest: hex.EncodeToString(demand[:]), DispatchSpecDigest: hex.EncodeToString(dispatch[:]),
+		DemandDigest: dispatch.DemandDigest, DispatchSpecDigest: dispatch.DispatchSpecDigest,
 	}
 	routeEvents, cancel := o.Subscribe()
 	defer cancel()
@@ -118,7 +191,8 @@ func TestRebindClusterExecutionUsesDigestCAS(t *testing.T) {
 	select {
 	case event := <-routeEvents:
 		if event.Kind != routesync.TypeUpsert || event.Route.SandboxID != "s1" ||
-			event.Route.RegistryGeneration != "g2" || event.Route.BindingDigest != newDigest {
+			event.Route.RegistryGeneration != "generation-2" || event.Route.BindingDigest != newDigest ||
+			event.Route.EventSeq == 0 {
 			t.Fatalf("rebind route event = %+v", event)
 		}
 	default:
@@ -131,12 +205,12 @@ func TestRebindClusterExecutionUsesDigestCAS(t *testing.T) {
 		t.Fatalf("cached sandbox after rebind = %+v", sb)
 	}
 	if err := o.verifySandboxCommandBinding(ctx, &routesync.Command{
-		SID: "s1", NodeEpoch: 7, RegistryGeneration: "g1", BindingDigest: oldDigest,
+		SID: "s1", NodeEpoch: 7, RegistryGeneration: "generation-1", BindingDigest: oldDigest,
 	}); !errors.Is(err, errWrongExecutionBinding) {
 		t.Fatalf("old command fence error = %v", err)
 	}
 	if err := o.verifySandboxCommandBinding(ctx, &routesync.Command{
-		SID: "s1", NodeEpoch: 7, RegistryGeneration: "g2", BindingDigest: newDigest,
+		SID: "s1", NodeEpoch: 7, RegistryGeneration: "generation-2", BindingDigest: newDigest,
 	}); err != nil {
 		t.Fatalf("new command fence: %v", err)
 	}

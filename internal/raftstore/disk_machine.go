@@ -930,7 +930,7 @@ func lookupRouteBucketOnDisk(
 	}
 	result.Available = true
 	result.SnapshotRevision = state.LastApplied
-	result.Routes = make([]RouteBucketEntry, 0)
+	result.Routes = make([]RouteBucketEntry, 0, int(query.Limit)+1)
 	groupPrefix := stateRowKey(prefix, stateRouteTable, lengthKey(query.Group))
 	iterator := reader.NewIter(&pebble.IterOptions{
 		LowerBound: groupPrefix, UpperBound: prefixUpperBound(groupPrefix),
@@ -953,7 +953,7 @@ func lookupRouteBucketOnDisk(
 		}
 		if bucket == query.Bucket && record.RouteKey > query.AfterRouteKey {
 			if entry, listed := routeBucketEntry(record); listed {
-				result.Routes = append(result.Routes, entry)
+				addBoundedRouteBucketEntry(&result.Routes, entry, int(query.Limit)+1)
 			}
 		}
 	}

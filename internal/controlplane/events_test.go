@@ -236,7 +236,10 @@ func newEventFixture(
 		normalizedDemand, err = placement.NormalizeSandboxDemand(placement.SandboxDemand{SlotUnits: 1})
 		if err == nil {
 			var request clusterstate.NodeRequestEnvelopeV1
-			request, err = clusterstate.NewNodeRequestEnvelopeV1(http.MethodPost, "/sandboxes", "", nil, []byte(`{}`))
+			request, err = clusterstate.NewNodeRequestEnvelopeV1(
+				http.MethodPost, "/sandboxes", "", nil,
+				[]byte(`{"templateID":"`+templateRef+`"}`),
+			)
 			if err != nil {
 				t.Fatal(err)
 			}

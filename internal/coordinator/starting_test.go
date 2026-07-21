@@ -27,6 +27,23 @@ type workflowStoreStub struct {
 	fail   error
 }
 
+func (s *workflowStoreStub) EnsureExecutionFence(_ context.Context, fence cluster.ExecutionFence) error {
+	if s.fail != nil {
+		return s.fail
+	}
+	if s.route.State != cluster.WorkflowRouteTombstone || s.route.Tombstone.PlacementFailure == nil {
+		return errors.New("placement fence was not preceded by a tombstone")
+	}
+	if s.fences == nil {
+		s.fences = make(map[string]cluster.ExecutionFence)
+	}
+	fence.Revision = s.route.Revision
+	fence.Revision.LogIndex++
+	s.fences[fence.SandboxID] = fence
+	s.events = append(s.events, "commit:placement-fence:"+fence.SandboxID)
+	return nil
+}
+
 func (s *workflowStoreStub) CommitRouteWorkflow(_ context.Context, expected cluster.Revision, next cluster.RouteWorkflowRecord) (cluster.RouteWorkflowRecord, error) {
 	if s.fail != nil {
 		return cluster.RouteWorkflowRecord{}, s.fail
@@ -53,23 +70,6 @@ func (s *workflowStoreStub) CommitBuildWorkflow(_ context.Context, expected clus
 	return next, nil
 }
 
-func (s *workflowStoreStub) EnsureExecutionFence(_ context.Context, fence cluster.ExecutionFence) error {
-	if s.fail != nil {
-		return s.fail
-	}
-	if s.route.State != cluster.WorkflowRouteTombstone || s.route.Tombstone.PlacementFailure == nil {
-		return errors.New("placement fence was not preceded by a tombstone")
-	}
-	if s.fences == nil {
-		s.fences = make(map[string]cluster.ExecutionFence)
-	}
-	fence.Revision = s.route.Revision
-	fence.Revision.LogIndex++
-	s.fences[fence.SandboxID] = fence
-	s.events = append(s.events, "commit:placement-fence:"+fence.SandboxID)
-	return nil
-}
-
 func describeRouteCommit(record cluster.RouteWorkflowRecord) string {
 	if record.State == cluster.WorkflowRouteTombstone {
 		return "commit:route-terminal"
@@ -83,6 +83,9 @@ func describeRouteCommit(record cluster.RouteWorkflowRecord) string {
 func describeBuildCommit(record cluster.BuildRecord) string {
 	if record.State == cluster.BuildTombstone {
 		return "commit:build-terminal"
+	}
+	if record.State == cluster.BuildRegistered {
+		return "commit:build-registered"
 	}
 	if record.Starting.SelectedCandidate != nil {
 		return "commit:select:" + record.Starting.CandidatePool[*record.Starting.SelectedCandidate].NodeID
@@ -330,6 +333,32 @@ func TestSandboxRoundLimitAndBuildPoolExhaustionCommitTerminalState(t *testing.T
 	}
 }
 
+func TestBuildAdmissionAckCommitsRegistrationAndCompletesWorkflow(t *testing.T) {
+	record := buildStartingRecord(t, "b1", candidatePool("n1", "n2"), nil)
+	store := &workflowStoreStub{build: record}
+	prober := &pairProberStub{responses: map[string]placement.PlacementProbeResponse{
+		"n1": probeResponse("n1", placement.ProbeImmediate, 1),
+		"n2": probeResponse("n2", placement.ProbeWouldQueue, 2),
+	}}
+	dispatcher := &dispatcherStub{store: store, results: map[string][]session.DispatchReply{
+		"n1": {{Outcome: cluster.DispatchAcceptedQueued}},
+	}}
+	coordinator := newTestCoordinator(t, store, prober, dispatcher, nil)
+	result, err := coordinator.RunBuild(context.Background(), record)
+	if err != nil || result.Status != RunComplete || result.Build == nil ||
+		result.Build.State != cluster.BuildRegistered || result.Build.Projection == nil {
+		t.Fatalf("Build registration result = %+v, %v", result, err)
+	}
+	projection := result.Build.Projection
+	if projection.BuildID != "b1" || projection.NodeID != "n1" || projection.DataEndpoint != "n1:8443" ||
+		projection.TemplateRef != "template-1" {
+		t.Fatalf("Build registration projection = %+v", projection)
+	}
+	if !reflect.DeepEqual(store.events, []string{"commit:select:n1", "dispatch:n1", "commit:build-registered"}) {
+		t.Fatalf("Build registration events = %v", store.events)
+	}
+}
+
 func TestExhaustedSandboxRoundCommitsNewIDBeforeNewPlacement(t *testing.T) {
 	record := routeStartingRecord(t, "s1", 1, candidatePool("n1", "n2"), []uint32{0, 1})
 	priorBinding, err := makeBinding(
@@ -439,11 +468,15 @@ func routeStartingRecord(t *testing.T, sandboxID string, round uint64, candidate
 	if err != nil {
 		t.Fatal(err)
 	}
+	templateRef := "e2b-img-" + strings.Repeat("c", 64)
 	spec, err := cluster.MarshalSandboxDispatchSpec(cluster.SandboxDispatchSpecV1{
-		Version: cluster.DispatchSpecVersionV1, TemplateRef: "e2b-img-" + strings.Repeat("c", 64),
+		Version: cluster.DispatchSpecVersionV1, TemplateRef: templateRef,
 		AuthKeyFingerprint: strings.Repeat("a", 24), ManifestKeyFingerprint: strings.Repeat("b", 24),
 		AccessToken: "access-token", TargetPort: 3000,
-		Request: cluster.NodeRequestEnvelopeV1{Version: cluster.NodeRequestEnvelopeVersionV1, Method: "POST", Path: "/sandboxes", Body: []byte("{}")},
+		Request: cluster.NodeRequestEnvelopeV1{
+			Version: cluster.NodeRequestEnvelopeVersionV1, Method: "POST", Path: "/sandboxes",
+			Body: []byte(`{"templateID":"` + templateRef + `"}`),
+		},
 	})
 	if err != nil {
 		t.Fatal(err)

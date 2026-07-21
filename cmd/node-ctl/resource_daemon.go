@@ -26,6 +26,7 @@ func (r *resourceRuntime) clusterLoad() orch.ClusterResourceLoad {
 	allocated := r.state.NodeAllocated().MemoryBytes
 	startup := r.state.StartupInFlightLocked()
 	pool := r.state.AllocatablePool.MemoryBytes
+	emergencyReserved := uint64(float64(pool) * r.state.Wm.EmergencyFactor)
 	startupPool := r.state.StartupPoolBytes()
 	buildReserved := r.state.BuildReserved.MemoryBytes
 	zone := string(r.state.MemoryZone())
@@ -41,7 +42,8 @@ func (r *resourceRuntime) clusterLoad() orch.ClusterResourceLoad {
 	return orch.ClusterResourceLoad{
 		Controller: true, WaterZone: zone, Draining: draining,
 		NodeAllocatedMemory: allocated, AllocatablePoolMemory: pool,
-		BuildReservedMemory: buildReserved, StartupAllocatedMemory: startup,
+		BuildReservedMemory: buildReserved, EmergencyReservedMemory: emergencyReserved,
+		StartupAllocatedMemory:  startup,
 		StartupPoolMemory:       startupPool,
 		AdmissionTokenAvailable: r.admission.TokenAvailable(), SafetyRejectReason: reason,
 	}

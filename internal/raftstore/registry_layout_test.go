@@ -332,6 +332,57 @@ func TestAcceptedRegistryLayoutBindsEveryMirroredFrozenField(t *testing.T) {
 	}
 }
 
+func TestRegistryLayoutTransitionFreezesMemberAndReplicaIdentity(t *testing.T) {
+	previous := testRegistryLayout(2, "generation-1")
+	previousDigest, err := previous.Digest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	next := cloneRegistryLayout(previous)
+	next.RegistryLayoutVersion = 2
+	next.PreviousRegistryLayoutVersion = 1
+	next.PreviousRegistryLayoutDigest = previousDigest
+	next.Members = append(next.Members, RegistryMember{
+		MemberID: "registry-d", InternalEndpoint: "https://registry-d:9443", RaftEndpoint: "registry-d:63001",
+	})
+	replacement := []ReplicaPlacement{
+		{MemberID: "registry-a", ReplicaID: 1},
+		{MemberID: "registry-b", ReplicaID: 2},
+		{MemberID: "registry-d", ReplicaID: 4},
+	}
+	next.SystemReplicas = append([]ReplicaPlacement(nil), replacement...)
+	for index := range next.DataShards {
+		next.DataShards[index].Replicas = append([]ReplicaPlacement(nil), replacement...)
+	}
+	if err := ValidateRegistryLayoutTransition(previous, next); err != nil {
+		t.Fatal(err)
+	}
+
+	for name, mutate := range map[string]func(*RegistryLayout){
+		"retained member endpoint": func(layout *RegistryLayout) {
+			layout.Members[2].InternalEndpoint = "https://registry-c-next:9443"
+		},
+		"replacement reuses endpoint": func(layout *RegistryLayout) {
+			layout.Members[3].RaftEndpoint = previous.Members[2].RaftEndpoint
+			layout.Members[2].RaftEndpoint = "registry-c-retired:63001"
+		},
+		"retained member replica changed": func(layout *RegistryLayout) {
+			layout.DataShards[0].Replicas[0].ReplicaID = 5
+		},
+		"predecessor replica reused": func(layout *RegistryLayout) {
+			layout.DataShards[0].Replicas[2].ReplicaID = 3
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			candidate := cloneRegistryLayout(next)
+			mutate(&candidate)
+			if err := ValidateRegistryLayoutTransition(previous, candidate); err == nil {
+				t.Fatal("unsafe transition identity was accepted")
+			}
+		})
+	}
+}
+
 func TestRegistryLayoutGuardRejectsRetainedReplicaEndpointChange(t *testing.T) {
 	first := testRegistryLayout(2, "generation-1")
 	firstDigest, err := first.Digest()

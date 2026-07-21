@@ -142,6 +142,7 @@ type ClusterResourceLoad struct {
 	NodeAllocatedMemory     uint64
 	AllocatablePoolMemory   uint64
 	BuildReservedMemory     uint64
+	EmergencyReservedMemory uint64
 	StartupAllocatedMemory  uint64
 	StartupPoolMemory       uint64
 	AdmissionTokenAvailable bool
@@ -639,6 +640,9 @@ func (n *FinalClusterNode) executeSandbox(ctx context.Context, record *nodeexec.
 		_, err = n.store.CommitSandboxEvent(ctx, existing, nodeexec.EventUpdate{
 			State: string(clusterstate.WorkflowRouteReady), TargetPort: spec.TargetPort,
 		})
+		if err == nil {
+			err = n.core.publishUpsertContext(ctx, existing)
+		}
 		return err
 	}
 	template, err := types.ParseTemplateID(existing.TemplateID)
@@ -656,8 +660,7 @@ func (n *FinalClusterNode) executeSandbox(ctx context.Context, record *nodeexec.
 	}); err != nil {
 		return err
 	}
-	n.core.publishUpsert(sandbox)
-	return nil
+	return n.core.publishUpsertContext(ctx, sandbox)
 }
 
 func (n *FinalClusterNode) sandboxObject(
@@ -720,10 +723,12 @@ func (n *FinalClusterNode) failSandbox(ctx context.Context, record *nodeexec.Wor
 	if err != nil {
 		return errors.Join(cause, err)
 	}
+	n.core.uncache(sandbox.ID)
+	projectionErr := n.core.publishDeleteContext(ctx, sandbox.ID)
 	if err := n.authority.ReleaseSandboxResources(ctx, terminal, reason); err != nil {
-		return errors.Join(cause, err)
+		return errors.Join(cause, projectionErr, err)
 	}
-	return cause
+	return errors.Join(cause, projectionErr)
 }
 
 func (n *FinalClusterNode) executeBuild(ctx context.Context, record *nodeexec.WorkflowRecord) error {
@@ -801,7 +806,9 @@ func (n *FinalClusterNode) deleteSandboxSync(ctx context.Context, command *route
 		return errors.Join(err, nodeexec.ErrWorkflowMissing)
 	}
 	if record.ObjectState == "DELETED" {
-		return nil
+		projectionErr := n.core.publishDeleteContext(ctx, command.SID)
+		releaseErr := n.authority.ReleaseSandboxResources(ctx, record, "deleted")
+		return errors.Join(projectionErr, releaseErr)
 	}
 	sandbox, err := n.store.Get(ctx, command.SID)
 	if err != nil || sandbox == nil {
@@ -813,8 +820,9 @@ func (n *FinalClusterNode) deleteSandboxSync(ctx context.Context, command *route
 		return err
 	}
 	n.core.uncache(command.SID)
-	n.core.publishDelete(command.SID)
-	return n.authority.ReleaseSandboxResources(ctx, terminal, "deleted")
+	projectionErr := n.core.publishDeleteContext(ctx, command.SID)
+	releaseErr := n.authority.ReleaseSandboxResources(ctx, terminal, "deleted")
+	return errors.Join(projectionErr, releaseErr)
 }
 
 func (n *FinalClusterNode) sandboxDemand(ctx context.Context, record nodeexec.DispatchRecord) (nodectl.SandboxAdmissionDemand, error) {
@@ -951,6 +959,7 @@ func (n *FinalClusterNode) PlacementLoad(ctx context.Context) (*routesync.Placem
 		snapshot.NodeAllocatedMemory = load.NodeAllocatedMemory
 		snapshot.AllocatablePoolMemory = load.AllocatablePoolMemory
 		snapshot.BuildReservedMemory = load.BuildReservedMemory
+		snapshot.EmergencyReservedMemory = load.EmergencyReservedMemory
 		snapshot.StartupAllocatedMemory = load.StartupAllocatedMemory
 		snapshot.StartupPoolMemory = load.StartupPoolMemory
 		snapshot.SandboxRateTokenAvailable = load.AdmissionTokenAvailable

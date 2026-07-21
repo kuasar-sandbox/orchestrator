@@ -653,11 +653,12 @@ func testDispatchIntent(t *testing.T) clusterstate.DispatchIntent {
 	if err != nil {
 		t.Fatal(err)
 	}
+	templateRef := "e2b-img-" + strings.Repeat("c", 64)
 	spec, err := clusterstate.MarshalSandboxDispatchSpec(clusterstate.SandboxDispatchSpecV1{
-		Version: clusterstate.DispatchSpecVersionV1, TemplateRef: "e2b-img-" + strings.Repeat("c", 64),
+		Version: clusterstate.DispatchSpecVersionV1, TemplateRef: templateRef,
 		AuthKeyFingerprint: strings.Repeat("a", 24), ManifestKeyFingerprint: strings.Repeat("b", 24),
 		AccessToken: "access-token", TargetPort: 8080,
-		Request: clusterstate.NodeRequestEnvelopeV1{Version: clusterstate.NodeRequestEnvelopeVersionV1, Method: "POST", Path: "/sandboxes", Body: []byte("{}")},
+		Request: clusterstate.NodeRequestEnvelopeV1{Version: clusterstate.NodeRequestEnvelopeVersionV1, Method: "POST", Path: "/sandboxes", Body: []byte(`{"templateID":"` + templateRef + `"}`)},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -674,11 +675,12 @@ func testDispatchIntentNoFail() clusterstate.DispatchIntent {
 	if err != nil {
 		panic(err)
 	}
+	templateRef := "e2b-img-" + strings.Repeat("c", 64)
 	spec, err := clusterstate.MarshalSandboxDispatchSpec(clusterstate.SandboxDispatchSpecV1{
-		Version: clusterstate.DispatchSpecVersionV1, TemplateRef: "e2b-img-" + strings.Repeat("c", 64),
+		Version: clusterstate.DispatchSpecVersionV1, TemplateRef: templateRef,
 		AuthKeyFingerprint: strings.Repeat("a", 24), ManifestKeyFingerprint: strings.Repeat("b", 24),
 		AccessToken: "access-token", TargetPort: 8080,
-		Request: clusterstate.NodeRequestEnvelopeV1{Version: clusterstate.NodeRequestEnvelopeVersionV1, Method: "POST", Path: "/sandboxes", Body: []byte("{}")},
+		Request: clusterstate.NodeRequestEnvelopeV1{Version: clusterstate.NodeRequestEnvelopeVersionV1, Method: "POST", Path: "/sandboxes", Body: []byte(`{"templateID":"` + templateRef + `"}`)},
 	})
 	if err != nil {
 		panic(err)

@@ -125,6 +125,11 @@ func openRuntime(
 	if len(registryLayoutChain) == 0 || factory == nil {
 		return nil, errors.New("raftstore: a signed registryLayout chain and NodeHost factory are required")
 	}
+	resolvedConfig, err := config.resolvedStoragePaths()
+	if err != nil {
+		return nil, err
+	}
+	config = resolvedConfig
 	latestSigned := registryLayoutChain[len(registryLayoutChain)-1]
 	latestDigest, err := latestSigned.Verify(keyring)
 	if err != nil {
@@ -777,6 +782,9 @@ func (r *Runtime) RefreshPermit(ctx context.Context) (PermitGrant, error) {
 		}
 		if err := state.Validate(); err != nil || state.LastApplied < grant.CommitIndex || state.Identity() != grant.PermitIdentity {
 			return PermitGrant{}, errors.Join(err, errors.New("raftstore: remote Permit is not covered by the fetched System state"))
+		}
+		if err := r.authorizeRemoteSystemState(state); err != nil {
+			return PermitGrant{}, err
 		}
 		if err := r.permitCache.Install(grant, started); err != nil {
 			return PermitGrant{}, err

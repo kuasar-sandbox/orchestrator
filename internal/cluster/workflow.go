@@ -8,7 +8,10 @@ import (
 	"fmt"
 )
 
-const MaxDispatchSpecBytes = 64 << 10
+const (
+	MaxDispatchSpecBytes     = 64 << 10
+	MaxNormalizedDemandBytes = 64 << 10
+)
 
 type Revision struct {
 	RegistryGeneration string `json:"registry_generation"`
@@ -83,6 +86,9 @@ type DispatchIntent struct {
 }
 
 func NewDispatchIntent(demand, spec []byte, providerPolicyVersion string) (DispatchIntent, error) {
+	if len(demand) > MaxNormalizedDemandBytes {
+		return DispatchIntent{}, fmt.Errorf("cluster: normalized demand exceeds %d bytes", MaxNormalizedDemandBytes)
+	}
 	intent := DispatchIntent{
 		NormalizedDemand:      append([]byte(nil), demand...),
 		DispatchSpec:          append([]byte(nil), spec...),
@@ -98,6 +104,9 @@ func NewDispatchIntent(demand, spec []byte, providerPolicyVersion string) (Dispa
 func (i DispatchIntent) Validate() error {
 	if len(i.NormalizedDemand) == 0 || len(i.DispatchSpec) == 0 || i.ProviderPolicyVersion == "" {
 		return errors.New("cluster: normalized demand, dispatch spec, and provider/policy version are required")
+	}
+	if len(i.NormalizedDemand) > MaxNormalizedDemandBytes {
+		return fmt.Errorf("cluster: normalized demand exceeds %d bytes", MaxNormalizedDemandBytes)
 	}
 	if len(i.DispatchSpec) > MaxDispatchSpecBytes {
 		return fmt.Errorf("cluster: dispatch spec exceeds %d bytes", MaxDispatchSpecBytes)

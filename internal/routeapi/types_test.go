@@ -260,7 +260,10 @@ func testReadyRoute() *clusterstate.ReadyRoute {
 		Version: clusterstate.DispatchSpecVersionV1, TemplateRef: templateRef,
 		AuthKeyFingerprint: strings.Repeat("a", 24), ManifestKeyFingerprint: strings.Repeat("b", 24),
 		AccessToken: "token", TargetPort: 3000,
-		Request: clusterstate.NodeRequestEnvelopeV1{Version: clusterstate.NodeRequestEnvelopeVersionV1, Method: "POST", Path: "/sandboxes", Body: []byte("{}")},
+		Request: clusterstate.NodeRequestEnvelopeV1{
+			Version: clusterstate.NodeRequestEnvelopeVersionV1, Method: "POST", Path: "/sandboxes",
+			Body: []byte(`{"templateID":"` + templateRef + `"}`),
+		},
 	})
 	intent, _ := clusterstate.NewDispatchIntent([]byte("demand"), spec, "provider-v1")
 	return &clusterstate.ReadyRoute{

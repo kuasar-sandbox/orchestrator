@@ -3,9 +3,11 @@ package orch
 import (
 	"context"
 	"encoding/hex"
+	"fmt"
 	"strings"
 	"time"
 
+	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/keys"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxy"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
@@ -55,6 +57,110 @@ func (o *Orchestrator) routeEntry(sb *types.Sandbox) routesync.RouteEntry {
 	return e
 }
 
+// routeEntryForSync attaches the durable event watermark to a cluster-managed
+// route. The object supplies node-local forwarding details, while the workflow
+// event supplies the state and capabilities that were persisted atomically with
+// event_seq. Standalone routes have no workflow and keep their original shape.
+func (o *Orchestrator) routeEntryForSync(ctx context.Context, sb *types.Sandbox) (routesync.RouteEntry, error) {
+	entry := o.routeEntry(sb)
+	managed, _, _, _, _, bindingErr := sandboxRouteFence(sb)
+	if bindingErr != nil {
+		return routesync.RouteEntry{}, bindingErr
+	}
+	if !managed {
+		return entry, nil
+	}
+	if o.st == nil {
+		return routesync.RouteEntry{}, fmt.Errorf("orch: managed route %q has no durable store", sb.ID)
+	}
+	current, err := o.st.Get(ctx, sb.ID)
+	if err != nil {
+		return routesync.RouteEntry{}, err
+	}
+	if current == nil {
+		return routesync.RouteEntry{}, fmt.Errorf("orch: managed route %q has no Sandbox object", sb.ID)
+	}
+	entry = o.routeEntry(current)
+	workflow, err := o.st.GetNodeWorkflow(ctx, clusterstate.ExecutionKindSandbox, sb.ID)
+	if err != nil {
+		return routesync.RouteEntry{}, err
+	}
+	if workflow == nil || workflow.LatestEvent == nil || workflow.EventSeq == 0 {
+		return routesync.RouteEntry{}, fmt.Errorf("orch: managed route %q has no durable execution event", sb.ID)
+	}
+	event := workflow.LatestEvent
+	if err := event.Validate(); err != nil {
+		return routesync.RouteEntry{}, err
+	}
+	if workflow.Kind != clusterstate.ExecutionKindSandbox || workflow.ObjectID != sb.ID ||
+		workflow.EventSeq != event.EventSeq || workflow.BindingDigest != entry.BindingDigest ||
+		event.ObjectID != sb.ID || event.NodeID != entry.NodeID || event.NodeEpoch != entry.NodeEpoch ||
+		event.RegistryGeneration != entry.RegistryGeneration || event.Binding != workflow.OpaqueBinding ||
+		event.BindingDigest != entry.BindingDigest {
+		return routesync.RouteEntry{}, fmt.Errorf("orch: managed route %q disagrees with its durable execution event", sb.ID)
+	}
+	state, err := routeStateFromExecutionEvent(event.State)
+	if err != nil {
+		return routesync.RouteEntry{}, err
+	}
+	if string(current.State) != state || event.TemplateRef != current.TemplateID ||
+		event.AccessToken != current.EnvdAccessToken || event.TrafficAccessToken != current.TrafficAccessToken {
+		return routesync.RouteEntry{}, fmt.Errorf("orch: managed route %q object projection is not event-atomic", sb.ID)
+	}
+	entry.EventSeq = event.EventSeq
+	entry.State = state
+	entry.TemplateID = event.TemplateRef
+	entry.AccessToken = event.AccessToken
+	entry.TrafficAccessToken = event.TrafficAccessToken
+	entry.SnapshotLocation = event.SnapshotLocation
+	return entry, nil
+}
+
+func routeStateFromExecutionEvent(state string) (string, error) {
+	switch state {
+	case string(clusterstate.WorkflowRouteReady):
+		return routesync.StateRunning, nil
+	case string(clusterstate.WorkflowRoutePaused):
+		return routesync.StatePaused, nil
+	default:
+		return "", fmt.Errorf("orch: terminal execution state %q cannot be projected as a route", state)
+	}
+}
+
+func (o *Orchestrator) routeDeleteForSync(ctx context.Context, sid string) (routesync.RouteDelete, error) {
+	delete := routesync.RouteDelete{SandboxID: sid}
+	if o.st == nil {
+		return delete, nil
+	}
+	workflow, err := o.st.GetNodeWorkflow(ctx, clusterstate.ExecutionKindSandbox, sid)
+	if err != nil {
+		return routesync.RouteDelete{}, err
+	}
+	if workflow == nil {
+		return delete, nil
+	}
+	if workflow.LatestEvent == nil || workflow.EventSeq == 0 {
+		return routesync.RouteDelete{}, fmt.Errorf("orch: managed route %q has no durable terminal event", sid)
+	}
+	event := workflow.LatestEvent
+	if err := event.Validate(); err != nil {
+		return routesync.RouteDelete{}, err
+	}
+	if event.State != "ERROR" && event.State != "DELETED" {
+		return routesync.RouteDelete{}, fmt.Errorf("orch: managed route %q is not terminal", sid)
+	}
+	if workflow.ObjectID != sid || workflow.EventSeq != event.EventSeq ||
+		workflow.BindingDigest != event.BindingDigest || workflow.OpaqueBinding != event.Binding {
+		return routesync.RouteDelete{}, fmt.Errorf("orch: managed route %q terminal event is inconsistent", sid)
+	}
+	delete.NodeID = event.NodeID
+	delete.NodeEpoch = event.NodeEpoch
+	delete.RegistryGeneration = event.RegistryGeneration
+	delete.BindingDigest = event.BindingDigest
+	delete.EventSeq = event.EventSeq
+	return delete, delete.Validate()
+}
+
 // snapshotLocation classifies a sandbox's persisted state so a subscriber can
 // decide migration: "" when never paused (running/dead), "remote" for an uploaded
 // (portable) manifest:// ref, else "local" (a node-bound checkpoint bundle).
@@ -77,7 +183,11 @@ func snapshotLocation(ref string) string {
 func (o *Orchestrator) Range(ctx context.Context, fn func(routesync.RouteEntry) error) error {
 	for _, st := range []types.State{types.StateRunning, types.StatePaused} {
 		if err := o.st.RangeByState(ctx, st, func(sb *types.Sandbox) error {
-			return fn(o.routeEntry(sb))
+			entry, err := o.routeEntryForSync(ctx, sb)
+			if err != nil {
+				return err
+			}
+			return fn(entry)
 		}); err != nil {
 			return err
 		}
@@ -201,11 +311,33 @@ func (o *Orchestrator) Replay(ctx context.Context, afterSeq int64, fn func(route
 // --- publish ---
 
 func (o *Orchestrator) publishUpsert(sb *types.Sandbox) {
-	o.publish(routesync.Event{Kind: routesync.TypeUpsert, Route: o.routeEntry(sb)})
+	if err := o.publishUpsertContext(context.Background(), sb); err != nil && o.log != nil {
+		o.log.Error("route projection rejected", "sandbox", sb.ID, "err", err)
+	}
+}
+
+func (o *Orchestrator) publishUpsertContext(ctx context.Context, sb *types.Sandbox) error {
+	entry, err := o.routeEntryForSync(ctx, sb)
+	if err != nil {
+		return err
+	}
+	o.publish(routesync.Event{Kind: routesync.TypeUpsert, Route: entry})
+	return nil
 }
 
 func (o *Orchestrator) publishDelete(sid string) {
-	o.publish(routesync.Event{Kind: routesync.TypeDelete, SID: sid})
+	if err := o.publishDeleteContext(context.Background(), sid); err != nil && o.log != nil {
+		o.log.Error("route delete projection rejected", "sandbox", sid, "err", err)
+	}
+}
+
+func (o *Orchestrator) publishDeleteContext(ctx context.Context, sid string) error {
+	delete, err := o.routeDeleteForSync(ctx, sid)
+	if err != nil {
+		return err
+	}
+	o.publish(routesync.Event{Kind: routesync.TypeDelete, Delete: delete})
+	return nil
 }
 
 // publish fans an event out to every subscriber. A full subscriber is dropped +

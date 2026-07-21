@@ -19,7 +19,7 @@ type Sink interface {
 	// are tentatively stale until re-applied via ApplyUpsert before the Bookmark.
 	BeginSync()
 	ApplyUpsert(r RouteEntry)
-	ApplyDelete(sid string)
+	ApplyDelete(RouteDelete)
 	// Bookmark marks the initial route stream complete: the table is synced, and
 	// entries not seen since the matching BeginSync are dropped (deleted while
 	// disconnected).
@@ -157,11 +157,17 @@ func (s *Subscriber) apply(m *Msg) {
 			s.sink.SetPolicy(m.Hello.Policy)
 		}
 	case TypeUpsert:
-		if m.Route != nil {
-			s.sink.ApplyUpsert(*m.Route)
+		if m.Route == nil || m.Route.ValidateExecutionFence() != nil {
+			s.log.Warn("routesync: invalid route upsert")
+			return
 		}
+		s.sink.ApplyUpsert(*m.Route)
 	case TypeDelete:
-		s.sink.ApplyDelete(m.SID)
+		if m.Delete == nil || m.Delete.Validate() != nil {
+			s.log.Warn("routesync: invalid route delete")
+			return
+		}
+		s.sink.ApplyDelete(*m.Delete)
 	case TypeBookmark:
 		s.sink.Bookmark()
 	default:

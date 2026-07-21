@@ -254,7 +254,8 @@ func clusterResumeDispatch(t *testing.T, sid, templateRef string) nodeexec.Dispa
 		AuthKeyFingerprint: strings.Repeat("a", 24), ManifestKeyFingerprint: strings.Repeat("b", 24),
 		AccessToken: "access-token", TargetPort: 49983,
 		Request: clusterstate.NodeRequestEnvelopeV1{
-			Version: clusterstate.NodeRequestEnvelopeVersionV1, Method: "POST", Path: "/sandboxes", Body: []byte("{}"),
+			Version: clusterstate.NodeRequestEnvelopeVersionV1, Method: "POST", Path: "/sandboxes",
+			Body: []byte(`{"templateID":"` + templateRef + `"}`),
 		},
 	})
 	if err != nil {

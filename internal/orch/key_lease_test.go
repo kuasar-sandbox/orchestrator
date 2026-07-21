@@ -2,10 +2,12 @@ package orch
 
 import (
 	"context"
+	"encoding/hex"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/kuasar-sandbox/orchestrator/internal/apikey"
 	"github.com/kuasar-sandbox/orchestrator/internal/nodeexec"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/store"
@@ -97,6 +99,54 @@ func TestClusterKeyLeaseRejectsMalformedRegistryAuth(t *testing.T) {
 	}
 	if _, found, err := o.st.KeyLeaseByFingerprints(context.Background(), "/g", authFP, manifestFP); err != nil || found {
 		t.Fatalf("malformed registry auth lease found=%t err=%v", found, err)
+	}
+}
+
+func TestResolveAllowedAcceptsIdenticalCredentialsAcrossGroups(t *testing.T) {
+	o := testOrch(t)
+	ctx := context.Background()
+	authKey := strings.Repeat("a", 64)
+	manifestKey := strings.Repeat("b", 64)
+	registryAuth := `{"auths":{"*":{"token":"shared"}}}`
+	for _, group := range []string{"/tenant/a", "/tenant/b"} {
+		if _, err := o.st.PutKeyLease(ctx, store.KeyLease{
+			Group: group, AuthKey: authKey, ManifestKey: manifestKey,
+			RegistryAuth: registryAuth, ExpiresUnix: time.Now().Add(time.Hour).Unix(),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rawAuth, _ := hex.DecodeString(authKey)
+	apiKey, err := apikey.Mint(rawAuth)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := o.resolveAllowed(ctx, apiKey)
+	if err != nil || resolved.AuthKey != authKey || resolved.ManifestKey != manifestKey ||
+		resolved.RegistryAuth != registryAuth {
+		t.Fatalf("resolved shared credentials = %+v, %v", resolved, err)
+	}
+}
+
+func TestResolveAllowedRejectsDifferentCredentialsAcrossGroups(t *testing.T) {
+	o := testOrch(t)
+	ctx := context.Background()
+	authKey := strings.Repeat("a", 64)
+	for index, manifestKey := range []string{strings.Repeat("b", 64), strings.Repeat("c", 64)} {
+		if _, err := o.st.PutKeyLease(ctx, store.KeyLease{
+			Group: "/tenant/" + string(rune('a'+index)), AuthKey: authKey, ManifestKey: manifestKey,
+			ExpiresUnix: time.Now().Add(time.Hour).Unix(),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rawAuth, _ := hex.DecodeString(authKey)
+	apiKey, err := apikey.Mint(rawAuth)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := o.resolveAllowed(ctx, apiKey); err == nil {
+		t.Fatal("different node credentials were treated as one lease")
 	}
 }
 

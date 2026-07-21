@@ -204,6 +204,9 @@ func StreamAuthority(ctx context.Context, w io.Writer, flush func(), body io.Rea
 			if err := drainOutbox(); err != nil {
 				return err
 			}
+			if err := r.ValidateExecutionFence(); err != nil {
+				return err
+			}
 			return WriteMsg(w, &Msg{Type: TypeUpsert, Route: &r})
 		}); err != nil {
 			return
@@ -268,9 +271,16 @@ func writeEvent(w io.Writer, ev Event) error {
 	switch ev.Kind {
 	case TypeUpsert:
 		r := ev.Route
+		if err := r.ValidateExecutionFence(); err != nil {
+			return err
+		}
 		m.Route = &r
 	case TypeDelete:
-		m.SID = ev.SID
+		if err := ev.Delete.Validate(); err != nil {
+			return err
+		}
+		d := ev.Delete
+		m.Delete = &d
 	default:
 		return nil
 	}

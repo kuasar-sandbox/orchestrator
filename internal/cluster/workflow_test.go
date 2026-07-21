@@ -105,6 +105,9 @@ func TestDispatchIntentRejectsMutationAndOversize(t *testing.T) {
 	if _, err := NewDispatchIntent([]byte("demand"), []byte(strings.Repeat("x", MaxDispatchSpecBytes+1)), "v1"); err == nil {
 		t.Fatal("oversized dispatch spec accepted")
 	}
+	if _, err := NewDispatchIntent([]byte(strings.Repeat("x", MaxNormalizedDemandBytes+1)), []byte("spec"), "v1"); err == nil {
+		t.Fatal("oversized normalized demand accepted")
+	}
 }
 
 func TestPlacementFailuresDoNotInventExecutionProof(t *testing.T) {
@@ -142,20 +145,6 @@ func TestPlacementFailuresDoNotInventExecutionProof(t *testing.T) {
 	}
 }
 
-func TestDispatchOutcomeRejectsUnknownValue(t *testing.T) {
-	for _, outcome := range []DispatchOutcome{
-		DispatchAcceptedAdmitted, DispatchAcceptedQueued, DispatchDefinitiveReject,
-		DispatchSessionMoved, DispatchConflict, DispatchWrongBinding, DispatchUnknown,
-	} {
-		if err := outcome.Validate(); err != nil {
-			t.Fatalf("%s: %v", outcome, err)
-		}
-	}
-	if err := DispatchOutcome("TIMEOUT").Validate(); err == nil {
-		t.Fatal("unknown dispatch outcome was accepted")
-	}
-}
-
 func TestNewerNodeEpochProofIsBoundToExactExecutionState(t *testing.T) {
 	ready := readyRoute()
 	proof := TerminalProof{
@@ -190,6 +179,20 @@ func TestNewerNodeEpochProofIsBoundToExactExecutionState(t *testing.T) {
 	}
 }
 
+func TestDispatchOutcomeRejectsUnknownValue(t *testing.T) {
+	for _, outcome := range []DispatchOutcome{
+		DispatchAcceptedAdmitted, DispatchAcceptedQueued, DispatchDefinitiveReject,
+		DispatchSessionMoved, DispatchConflict, DispatchWrongBinding, DispatchUnknown,
+	} {
+		if err := outcome.Validate(); err != nil {
+			t.Fatalf("%s: %v", outcome, err)
+		}
+	}
+	if err := DispatchOutcome("TIMEOUT").Validate(); err == nil {
+		t.Fatal("unknown dispatch outcome was accepted")
+	}
+}
+
 func workflowBinding(t *testing.T, kind ExecutionKind, objectID, routeKey string, intent DispatchIntent) ExecutionBindingIntent {
 	t.Helper()
 	var demand, dispatch [sha256.Size]byte
@@ -216,11 +219,15 @@ func workflowBinding(t *testing.T, kind ExecutionKind, objectID, routeKey string
 
 func workflowSandboxIntent(t *testing.T) DispatchIntent {
 	t.Helper()
+	templateRef := "e2b-img-" + strings.Repeat("c", 64)
 	spec, err := MarshalSandboxDispatchSpec(SandboxDispatchSpecV1{
-		Version: DispatchSpecVersionV1, TemplateRef: "e2b-img-" + strings.Repeat("c", 64),
+		Version: DispatchSpecVersionV1, TemplateRef: templateRef,
 		AuthKeyFingerprint: strings.Repeat("a", 24), ManifestKeyFingerprint: strings.Repeat("b", 24),
 		AccessToken: "token", TargetPort: 3000,
-		Request: NodeRequestEnvelopeV1{Version: NodeRequestEnvelopeVersionV1, Method: "POST", Path: "/sandboxes", Body: []byte("{}")},
+		Request: NodeRequestEnvelopeV1{
+			Version: NodeRequestEnvelopeVersionV1, Method: "POST", Path: "/sandboxes",
+			Body: []byte(`{"templateID":"` + templateRef + `"}`),
+		},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -257,7 +264,10 @@ func readyRoute() *ReadyRoute {
 		Version: DispatchSpecVersionV1, TemplateRef: templateRef,
 		AuthKeyFingerprint: strings.Repeat("a", 24), ManifestKeyFingerprint: strings.Repeat("b", 24),
 		AccessToken: "token", TargetPort: 3000,
-		Request: NodeRequestEnvelopeV1{Version: NodeRequestEnvelopeVersionV1, Method: "POST", Path: "/sandboxes", Body: []byte("{}")},
+		Request: NodeRequestEnvelopeV1{
+			Version: NodeRequestEnvelopeVersionV1, Method: "POST", Path: "/sandboxes",
+			Body: []byte(`{"templateID":"` + templateRef + `"}`),
+		},
 	})
 	intent, _ := NewDispatchIntent([]byte("demand"), spec, "provider-v1")
 	return &ReadyRoute{

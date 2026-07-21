@@ -104,6 +104,9 @@ func (r Registration) Validate() error {
 		r.LoadModelVersion == 0 || r.SandboxSlots == 0 {
 		return errors.New("session: incomplete node registration")
 	}
+	if r.LoadModelVersion != placement.LoadModelVersion {
+		return errors.New("session: unsupported placement load model version")
+	}
 	return nil
 }
 
@@ -170,45 +173,48 @@ func (h *Holder) Register(ctx context.Context, registration Registration, endpoi
 	if endpoint == nil {
 		return nil, errors.New("session: node-link endpoint is required")
 	}
-	var old *heldSession
 	err := h.enroll.RunSessionRegistration(ctx, registration, func() error {
-		h.mu.Lock()
-		previous, seen := h.high[registration.NodeID]
-		if seen {
-			if registration.EnrollmentID != previous.EnrollmentID {
+		for {
+			h.mu.Lock()
+			if err := h.validateRegistrationLocked(registration); err != nil {
 				h.mu.Unlock()
-				return ErrEnrollmentChanged
+				return err
 			}
-			if registration.NodeEpoch == previous.NodeEpoch && registration.DataEndpoint != previous.DataEndpoint {
+			current := h.active[registration.NodeID]
+			if current == nil {
+				h.high[registration.NodeID] = registration
+				h.active[registration.NodeID] = newHeldSession(registration, endpoint)
 				h.mu.Unlock()
-				return ErrEndpointChanged
+				break
 			}
-			if registration.NodeEpoch == previous.NodeEpoch && !registrationStableWithinEpoch(registration, previous) {
-				h.mu.Unlock()
-				return ErrRegistrationChanged
-			}
-			if registration.Tuple.Compare(previous.Tuple) <= 0 {
-				h.mu.Unlock()
-				return ErrStaleSession
-			}
-		}
-		if current := h.active[registration.NodeID]; current == nil && len(h.active) >= h.limit {
 			h.mu.Unlock()
-			return ErrHolderLimit
-		} else if current != nil {
-			current.commandMu.Lock()
-			old = current
-		}
-		h.high[registration.NodeID] = registration
-		h.active[registration.NodeID] = &heldSession{
-			registration: registration, endpoint: endpoint,
-			keyLeases: make(map[string]int64), keyLeaseSeq: make(map[string]uint64),
-		}
-		h.mu.Unlock()
 
-		if old != nil {
-			old.endpoint.FenceStaleSession()
-			old.commandMu.Unlock()
+			// A command on this node may be slow. Wait without retaining the
+			// Holder-wide lock, then revalidate before replacing the session.
+			current.commandMu.Lock()
+			next := newHeldSession(registration, endpoint)
+			next.commandMu.Lock()
+			h.mu.Lock()
+			if h.active[registration.NodeID] != current {
+				h.mu.Unlock()
+				next.commandMu.Unlock()
+				current.commandMu.Unlock()
+				continue
+			}
+			if err := h.validateRegistrationLocked(registration); err != nil {
+				h.mu.Unlock()
+				next.commandMu.Unlock()
+				current.commandMu.Unlock()
+				return err
+			}
+			h.high[registration.NodeID] = registration
+			h.active[registration.NodeID] = next
+			h.mu.Unlock()
+
+			current.endpoint.FenceStaleSession()
+			current.commandMu.Unlock()
+			next.commandMu.Unlock()
+			break
 		}
 		h.publish(DirectoryDelta{Entry: h.directoryEntry(registration), Up: true})
 		return nil
@@ -226,30 +232,50 @@ func (h *Holder) RetireIdentity(ctx context.Context, retirement IdentityRetireme
 		return false, err
 	}
 	return h.enroll.RunIdentityRetirement(ctx, retirement, func() (bool, error) {
-		var held *heldSession
-		var registration Registration
-		h.mu.Lock()
-		previous, seen := h.high[retirement.NodeID]
-		if !seen || previous.EnrollmentID != retirement.EnrollmentID || previous.NodeEpoch > retirement.LastNodeEpoch {
+		for {
+			h.mu.Lock()
+			registration, ok := h.retirementRegistrationLocked(retirement)
+			if !ok {
+				_, tracked := h.high[retirement.NodeID]
+				h.mu.Unlock()
+				return !tracked, nil
+			}
+			current := h.active[retirement.NodeID]
+			if current == nil {
+				delete(h.high, retirement.NodeID)
+				h.mu.Unlock()
+				h.publish(DirectoryDelta{Entry: h.directoryEntry(registration), Retired: true})
+				return true, nil
+			}
+			if current.registration.EnrollmentID != retirement.EnrollmentID ||
+				current.registration.NodeEpoch > retirement.LastNodeEpoch {
+				h.mu.Unlock()
+				return false, nil
+			}
 			h.mu.Unlock()
+			current.commandMu.Lock()
+			h.mu.Lock()
+			registration, ok = h.retirementRegistrationLocked(retirement)
+			if !ok {
+				_, tracked := h.high[retirement.NodeID]
+				h.mu.Unlock()
+				current.commandMu.Unlock()
+				return !tracked, nil
+			}
+			if h.active[retirement.NodeID] != current {
+				h.mu.Unlock()
+				current.commandMu.Unlock()
+				continue
+			}
+			delete(h.high, retirement.NodeID)
+			delete(h.active, retirement.NodeID)
+			h.mu.Unlock()
+
+			current.endpoint.FenceStaleSession()
+			current.commandMu.Unlock()
+			h.publish(DirectoryDelta{Entry: h.directoryEntry(registration), Retired: true})
 			return true, nil
 		}
-		registration = previous
-		delete(h.high, retirement.NodeID)
-		if current := h.active[retirement.NodeID]; current != nil &&
-			current.registration.EnrollmentID == retirement.EnrollmentID && current.registration.NodeEpoch <= retirement.LastNodeEpoch {
-			current.commandMu.Lock()
-			held = current
-			delete(h.active, retirement.NodeID)
-		}
-		h.mu.Unlock()
-
-		if held != nil {
-			held.endpoint.FenceStaleSession()
-			held.commandMu.Unlock()
-		}
-		h.publish(DirectoryDelta{Entry: h.directoryEntry(registration), Retired: true})
-		return true, nil
 	})
 }
 
@@ -473,13 +499,21 @@ func (h *Holder) ProbeBatch(ctx context.Context, calls []ProbeCall) []placement.
 }
 
 func (h *Holder) remove(nodeID string, tuple Tuple) {
-	h.mu.Lock()
+	h.mu.RLock()
 	session := h.active[nodeID]
 	if session == nil || tuple.Compare(session.registration.Tuple) != 0 {
-		h.mu.Unlock()
+		h.mu.RUnlock()
 		return
 	}
+	h.mu.RUnlock()
+
 	session.commandMu.Lock()
+	h.mu.Lock()
+	if h.active[nodeID] != session || tuple.Compare(session.registration.Tuple) != 0 {
+		h.mu.Unlock()
+		session.commandMu.Unlock()
+		return
+	}
 	registration := session.registration
 	delete(h.active, nodeID)
 	h.mu.Unlock()
@@ -503,9 +537,61 @@ func (h *Holder) lockCommandSession(
 		h.mu.RUnlock()
 		return nil, ErrSessionUnavailable
 	}
-	held.commandMu.Lock()
 	h.mu.RUnlock()
+
+	held.commandMu.Lock()
+	h.mu.RLock()
+	current := h.active[nodeID]
+	valid := current == held && (expected == nil || current == expected) &&
+		held.registration.NodeEpoch == nodeEpoch && held.registration.DataEndpoint == dataEndpoint
+	h.mu.RUnlock()
+	if !valid {
+		held.commandMu.Unlock()
+		return nil, ErrSessionUnavailable
+	}
 	return held, nil
+}
+
+func newHeldSession(registration Registration, endpoint SessionEndpoint) *heldSession {
+	return &heldSession{
+		registration: registration, endpoint: endpoint,
+		keyLeases: make(map[string]int64), keyLeaseSeq: make(map[string]uint64),
+	}
+}
+
+// validateRegistrationLocked validates against Holder high-watermarks and
+// capacity. The caller holds h.mu.
+func (h *Holder) validateRegistrationLocked(registration Registration) error {
+	previous, seen := h.high[registration.NodeID]
+	if seen {
+		if registration.EnrollmentID != previous.EnrollmentID {
+			return ErrEnrollmentChanged
+		}
+		if registration.NodeEpoch == previous.NodeEpoch && registration.DataEndpoint != previous.DataEndpoint {
+			return ErrEndpointChanged
+		}
+		if registration.NodeEpoch == previous.NodeEpoch && !registrationStableWithinEpoch(registration, previous) {
+			return ErrRegistrationChanged
+		}
+		if registration.Tuple.Compare(previous.Tuple) <= 0 {
+			return ErrStaleSession
+		}
+	}
+	if h.active[registration.NodeID] == nil && len(h.active) >= h.limit {
+		return ErrHolderLimit
+	}
+	return nil
+}
+
+// retirementRegistrationLocked returns the high-watermark covered by a
+// committed retirement. The caller holds h.mu.
+func (h *Holder) retirementRegistrationLocked(retirement IdentityRetirement) (Registration, bool) {
+	registration, found := h.high[retirement.NodeID]
+	if !found || registration.EnrollmentID != retirement.EnrollmentID ||
+		registration.NodeEpoch > retirement.LastNodeEpoch {
+		return Registration{}, false
+	}
+	return registration, true
 }
 
 func (h *Holder) directoryEntry(registration Registration) DirectoryEntry {

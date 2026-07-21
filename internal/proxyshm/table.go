@@ -269,6 +269,16 @@ func (t *Table) Upsert(in routesync.RouteEntry) error {
 		return errors.New("proxyshm: route table full")
 	}
 	rec := &t.records[idx]
+	if current, status, readable := readRecord(rec); readable && status == statusPresent &&
+		sameRouteExecution(current, in) && current.EventSeq > 0 &&
+		(in.EventSeq == 0 || in.EventSeq <= current.EventSeq) {
+		// A replay/full sync may repeat an older event. Keep the newer payload,
+		// but mark it seen in this sync generation so Bookmark does not drop it.
+		startWrite(rec)
+		rec.SyncGen = atomic.LoadUint64(&t.header.SyncGen)
+		finishWrite(rec)
+		return nil
+	}
 	startWrite(rec)
 	rec.Hash = hashSID(in.SandboxID)
 	rec.Status = statusPresent
@@ -304,6 +314,45 @@ func (t *Table) Delete(sid string) bool {
 	}
 	t.deleteRecord(&t.records[idx])
 	return true
+}
+
+// DeleteRoute applies a live delete only when it names the currently cached
+// execution. Full-sync Bookmark cleanup uses Delete directly because absence
+// from that snapshot is already authoritative.
+func (t *Table) DeleteRoute(delete routesync.RouteDelete) bool {
+	if t.readonly || delete.Validate() != nil {
+		return false
+	}
+	idx, ok := t.findSlot(delete.SandboxID, false)
+	if !ok {
+		return false
+	}
+	rec := &t.records[idx]
+	current, status, readable := readRecord(rec)
+	if !readable || status != statusPresent {
+		return false
+	}
+	managed := routeHasExecutionFence(current)
+	if managed != delete.HasExecutionFence() {
+		return false
+	}
+	if managed && (current.NodeID != delete.NodeID || current.NodeEpoch != delete.NodeEpoch ||
+		current.RegistryGeneration != delete.RegistryGeneration || current.BindingDigest != delete.BindingDigest ||
+		delete.EventSeq <= current.EventSeq) {
+		return false
+	}
+	t.deleteRecord(rec)
+	return true
+}
+
+func routeHasExecutionFence(route routesync.RouteEntry) bool {
+	return route.HasExecutionFence()
+}
+
+func sameRouteExecution(left, right routesync.RouteEntry) bool {
+	return routeHasExecutionFence(left) && routeHasExecutionFence(right) &&
+		left.SandboxID == right.SandboxID && left.NodeID == right.NodeID && left.NodeEpoch == right.NodeEpoch &&
+		left.RegistryGeneration == right.RegistryGeneration && left.BindingDigest == right.BindingDigest
 }
 
 func (t *Table) deleteRecord(rec *mmapRecord) {
@@ -508,6 +557,9 @@ func finishHeaderWrite(seqp *uint64) {
 }
 
 func validateRoute(r routesync.RouteEntry) error {
+	if err := r.ValidateExecutionFence(); err != nil {
+		return err
+	}
 	checks := []struct {
 		name string
 		val  string

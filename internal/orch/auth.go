@@ -59,8 +59,7 @@ func (o *Orchestrator) resolveAllowed(ctx context.Context, apiKey string) (store
 	var resolved store.KeyLease
 	for _, lease := range candidates {
 		if raw, err := hex.DecodeString(lease.AuthKey); err == nil && apikey.Verify(p, raw) {
-			if resolved.AuthKey != "" && (resolved.Group != lease.Group ||
-				resolved.AuthKey != lease.AuthKey || resolved.ManifestKey != lease.ManifestKey ||
+			if resolved.AuthKey != "" && (resolved.AuthKey != lease.AuthKey || resolved.ManifestKey != lease.ManifestKey ||
 				resolved.RegistryAuth != lease.RegistryAuth) {
 				return store.KeyLease{}, errors.New("orch: API key matches multiple node key leases")
 			}

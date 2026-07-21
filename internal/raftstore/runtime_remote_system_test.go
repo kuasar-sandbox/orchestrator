@@ -119,4 +119,10 @@ func TestRemoteSystemStateFromAnotherGenerationFailsClosed(t *testing.T) {
 	if _, err := runtime.ReadSystemStrong(context.Background()); err == nil {
 		t.Fatal("remote System state from another generation was accepted")
 	}
+	if _, err := runtime.RefreshPermit(context.Background()); err == nil {
+		t.Fatal("remote Permit from another generation was accepted")
+	}
+	if err := runtime.permitCache.Authorize(state.Identity(), PermitRegistryRead); !errors.Is(err, ErrPermitMissing) {
+		t.Fatalf("foreign Permit poisoned local cache: %v", err)
+	}
 }
