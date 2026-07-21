@@ -12,8 +12,12 @@ make -C src/orchestrator/release-builder test-e2e
 
 ## Revision set
 
-PR 测试把 `github.sha` 对应的候选 merge commit 与其余四仓解析后的 `main` SHA
-写入 `ci-metrics/revisions.tsv`,再按精确 SHA 装配源码。不要从 `src/*` 执行
+同仓 PR 测试把 `github.sha` 对应的候选 merge commit 与其余四仓解析后的 `main`
+SHA 写入 `ci-metrics/revisions.tsv`,再按精确 SHA 装配源码。私有 fork PR 经过评审
+后，由维护者从可信 `main` revision 执行 `workflow_dispatch`,并把 GitHub
+`refs/pull/<number>/merge` 的 SHA 作为独立 `candidate_sha` 输入。工作流验证可信
+workflow SHA、当前 PR 的 merge/base/head SHA 及候选提交的两个父提交后才装配源码。
+不要从 `src/*` 执行
 `git rev-parse`:GitHub tarball 不含 `.git`,该命令会向上找到 runner checkout 并
 报告无关 revision。五仓 `main` revision 通过一次 GitHub GraphQL 查询取得并整体
 校验，避免逐仓 REST 请求造成 revision set 部分成功。
@@ -25,6 +29,8 @@ PR 测试把 `github.sha` 对应的候选 merge commit 与其余四仓解析后�
 使用同一官方 API 的 zipball endpoint，并在本地转换为单根目录 tar cache；不会
 把私有仓库 token 交给第三方代理。revision 查询及源码归档下载均只访问 GitHub
 官方 API。Linux 源码和容器镜像仍分别使用清华 TUNA 与 DaoCloud 国内镜像。
+用于下载五个私有仓库源码的 GitHub App token 只存在于源码装配步骤，并在任何
+候选仓库脚本运行前显式撤销；撤销失败会阻止后续构建和测试。
 
 ## Native artifacts
 
@@ -70,7 +76,8 @@ make -C orchestrator/release-builder test-ci-tools
 
 每个 BMS run 上传 `ci-metadata-<run>-<attempt>`，包含:
 
-- `run.tsv`:event candidate、merge SHA 与 PR head SHA;
+- `run.tsv`:event、candidate repository、PR 编号、候选 integration SHA、base SHA、
+  reviewed head SHA 与 trusted workflow SHA;
 - `revisions.tsv`:五仓精确 revision set;
 - `source-cache.tsv`:源码归档命中与摘要;
 - `native-cache.tsv`:原生制品 key、命中状态与等待/构建耗时;

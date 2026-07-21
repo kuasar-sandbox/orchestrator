@@ -17,12 +17,29 @@ on:
         description: Type run-full-e2e to start the full BMS suite
         required: true
         type: string
+      pull_request_number:
+        description: Upstream pull request number whose merge commit is being tested
+        required: true
+        type: string
+      candidate_sha:
+        description: Exact upstream PR integration commit to test
+        required: true
+        type: string
+      base_sha:
+        description: Current main SHA used as the integration commit's first parent
+        required: true
+        type: string
+      head_sha:
+        description: Reviewed PR head SHA used as the integration commit's second parent
+        required: true
+        type: string
 
 permissions:
   contents: read
+  pull-requests: read
 
 concurrency:
-  group: bms-e2e-${{ github.repository }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  group: bms-e2e-${{ github.repository }}-${{ github.event_name }}-${{ github.event.pull_request.number || inputs.candidate_sha || github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -56,22 +73,68 @@ jobs:
       KUASAR_REVISION_MANIFEST: ${{ github.workspace }}/ci-metrics/${{ github.run_id }}-${{ github.run_attempt }}/revisions.tsv
       KUASAR_SOURCE_CACHE_MAX_ENTRIES: "32"
       KUASAR_NATIVE_CACHE_MAX_ENTRIES: "4"
+      CANDIDATE_REPOSITORY: ${{ github.repository }}
+      CANDIDATE_PR: ${{ github.event_name == 'workflow_dispatch' && inputs.pull_request_number || github.event.pull_request.number || '0' }}
+      CANDIDATE_SHA: ${{ github.event_name == 'workflow_dispatch' && inputs.candidate_sha || github.sha }}
+      CANDIDATE_BASE_SHA: ${{ github.event_name == 'workflow_dispatch' && inputs.base_sha || github.event.pull_request.base.sha || github.sha }}
+      CANDIDATE_HEAD_SHA: ${{ github.event_name == 'workflow_dispatch' && inputs.head_sha || github.event.pull_request.head.sha || github.sha }}
+      TRUSTED_WORKFLOW_SHA: ${{ github.sha }}
 
     steps:
-      - name: Initialize CI metadata
+      - name: Validate trusted dispatch request
+        if: github.event_name == 'workflow_dispatch'
         env:
-          CANDIDATE_REPOSITORY: ${{ github.repository }}
-          CANDIDATE_SHA: ${{ github.sha }}
-          CANDIDATE_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          [ "$GITHUB_REF" = refs/heads/main ] \
+            || { echo "workflow_dispatch must select the trusted main ref" >&2; exit 1; }
+          [[ "$CANDIDATE_PR" =~ ^[1-9][0-9]*$ ]] \
+            || { echo "pull_request_number must be a positive integer" >&2; exit 1; }
+          for variable in CANDIDATE_SHA CANDIDATE_BASE_SHA CANDIDATE_HEAD_SHA TRUSTED_WORKFLOW_SHA; do
+            value=${!variable}
+            [[ "$value" =~ ^[0-9a-f]{40}$ ]] \
+              || { echo "$variable must be a full lowercase commit SHA" >&2; exit 1; }
+          done
+          [ "$TRUSTED_WORKFLOW_SHA" = "$CANDIDATE_BASE_SHA" ] \
+            || { echo "trusted workflow SHA must equal the recorded main/base SHA" >&2; exit 1; }
+
+          pr_response=$(curl --fail --show-error --silent \
+            --retry 4 --retry-all-errors --connect-timeout 10 --max-time 60 \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/pulls/$CANDIDATE_PR")
+          if ! jq -e \
+            --argjson number "$CANDIDATE_PR" \
+            --arg candidate "$CANDIDATE_SHA" \
+            --arg base "$CANDIDATE_BASE_SHA" \
+            --arg head "$CANDIDATE_HEAD_SHA" '
+              .number == $number
+              and .state == "open"
+              and .base.ref == "main"
+              and .base.sha == $base
+              and .head.sha == $head
+              and .merge_commit_sha == $candidate
+            ' <<< "$pr_response" >/dev/null; then
+            echo "candidate metadata no longer matches the current pull request merge" >&2
+            jq -c '{number, state, merge_commit_sha, base: {ref: .base.ref, sha: .base.sha}, head: {sha: .head.sha}}' \
+              <<< "$pr_response" >&2 || true
+            exit 1
+          fi
+
+      - name: Initialize CI metadata
         run: |
           set -euo pipefail
 
           rm -rf "${KUASAR_CI_DIR%/*}"
           mkdir -p "$KUASAR_CI_DIR"
-          printf 'event_name\tcandidate_repository\tcandidate_event_sha\tcandidate_head_sha\n' \
+          printf 'event_name\tcandidate_repository\tpull_request\tcandidate_sha\tbase_sha\thead_sha\ttrusted_workflow_sha\n' \
             > "$KUASAR_CI_DIR/run.tsv"
-          printf '%s\t%s\t%s\t%s\n' \
-            "${{ github.event_name }}" "$CANDIDATE_REPOSITORY" "$CANDIDATE_SHA" "$CANDIDATE_HEAD_SHA" \
+          printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "${{ github.event_name }}" "$CANDIDATE_REPOSITORY" "$CANDIDATE_PR" "$CANDIDATE_SHA" \
+            "$CANDIDATE_BASE_SHA" "$CANDIDATE_HEAD_SHA" "$TRUSTED_WORKFLOW_SHA" \
             >> "$KUASAR_CI_DIR/run.tsv"
 
       - name: Reset interrupted E2E state
@@ -104,13 +167,11 @@ jobs:
           owner: kuasar-sandbox
           repositories: accelerator,connector,guest-runtime,orchestrator,sandboxer
           permission-contents: read
+          skip-token-revoke: true
 
       - name: Assemble the five-repository workspace
         env:
           GH_TOKEN: ${{ steps.source-token.outputs.token }}
-          CANDIDATE_REPOSITORY: ${{ github.repository }}
-          CANDIDATE_SHA: ${{ github.sha }}
-          CANDIDATE_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           set -euo pipefail
 
@@ -164,6 +225,32 @@ jobs:
             echo "GitHub GraphQL did not return the complete five-repository revision set" >&2
             jq -c '{errors, data}' <<< "$revision_response" >&2 || true
             exit 1
+          fi
+
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
+            current_base=$(jq -r '.data.orchestrator.ref.target.oid' <<< "$revision_response")
+            [ "$current_base" = "$CANDIDATE_BASE_SHA" ] \
+              || { echo "main changed after the integration commit was recorded" >&2; exit 1; }
+
+            candidate_response=$(curl --fail --show-error --silent \
+              --retry 4 --retry-all-errors --connect-timeout 10 --max-time 60 \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/repos/$CANDIDATE_REPOSITORY/git/commits/$CANDIDATE_SHA")
+            if ! jq -e \
+              --arg candidate "$CANDIDATE_SHA" \
+              --arg base "$CANDIDATE_BASE_SHA" \
+              --arg head "$CANDIDATE_HEAD_SHA" '
+                .sha == $candidate
+                and (.parents | length) == 2
+                and .parents[0].sha == $base
+                and .parents[1].sha == $head
+              ' <<< "$candidate_response" >/dev/null; then
+              echo "candidate is not the recorded two-parent PR integration commit" >&2
+              jq -c '{sha, parents: [.parents[]?.sha]}' <<< "$candidate_response" >&2 || true
+              exit 1
+            fi
           fi
 
           for repo in "${repos[@]}"; do
@@ -249,6 +336,30 @@ jobs:
               >> "$KUASAR_CI_DIR/source-cache.tsv"
           done
 
+          elapsed=$(awk -v start="$started_ns" -v end="$(date +%s%N)" \
+            'BEGIN { printf "%.3f", (end - start) / 1000000000 }')
+          printf 'stage\tstarted_at\telapsed_seconds\tuser_seconds\tsystem_seconds\tcpu_percent\tmax_rss_kb\tfs_input\tfs_output\texit_code\n' \
+            > "$KUASAR_CI_TIMINGS"
+          printf 'workflow/assemble\t%s\t%s\tunavailable\tunavailable\tunavailable\tunavailable\tunavailable\tunavailable\t0\n' \
+            "$started_at" "$elapsed" >> "$KUASAR_CI_TIMINGS"
+
+      - name: Revoke source token
+        if: ${{ always() && steps.source-token.outputs.token != '' }}
+        env:
+          GH_TOKEN: ${{ steps.source-token.outputs.token }}
+        run: |
+          curl --fail --show-error --silent \
+            --request DELETE \
+            --output /dev/null \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            https://api.github.com/installation/token
+
+      - name: Finalize the five-repository workspace
+        run: |
+          set -euo pipefail
+
           while IFS=$'\t' read -r repository _ resolved_sha _; do
             repo=${repository#kuasar-sandbox/}
             source_dir="/var/cache/kuasar/sources/$repo"
@@ -258,13 +369,6 @@ jobs:
 
           cd src
           go work init ./accelerator ./connector ./guest-runtime ./orchestrator ./sandboxer
-          cd ..
-          elapsed=$(awk -v start="$started_ns" -v end="$(date +%s%N)" \
-            'BEGIN { printf "%.3f", (end - start) / 1000000000 }')
-          printf 'stage\tstarted_at\telapsed_seconds\tuser_seconds\tsystem_seconds\tcpu_percent\tmax_rss_kb\tfs_input\tfs_output\texit_code\n' \
-            > "$KUASAR_CI_TIMINGS"
-          printf 'workflow/assemble\t%s\t%s\tunavailable\tunavailable\tunavailable\tunavailable\tunavailable\tunavailable\t0\n' \
-            "$started_at" "$elapsed" >> "$KUASAR_CI_TIMINGS"
 
       - name: Attach runner caches
         run: |
