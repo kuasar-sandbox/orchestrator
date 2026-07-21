@@ -23,11 +23,12 @@ import (
 )
 
 const (
-	scaleGateEnvironment = "KUASAR_RAFT_SCALE_GATE"
-	scaleGateRootEnv     = "KUASAR_RAFT_GATE_ROOT"
-	scaleGateStartupMax  = 2 * time.Minute
-	scaleGateReadCount   = 20_000
-	scaleGateRSSMax      = uint64(8 << 30)
+	scaleGateEnvironment  = "KUASAR_RAFT_SCALE_GATE"
+	scaleGateRootEnv      = "KUASAR_RAFT_GATE_ROOT"
+	scaleGateStartupMax   = 2 * time.Minute
+	scaleGateOperationMax = 5 * time.Second
+	scaleGateReadCount    = 20_000
+	scaleGateRSSMax       = uint64(8 << 30)
 )
 
 func TestDragonboat4097GroupScaleGate(t *testing.T) {
@@ -158,33 +159,27 @@ func TestDragonboat4097GroupScaleGate(t *testing.T) {
 			if err != nil {
 				return err
 			}
-			startingRaw, err := EncodeDataCommand(DataCommand{
+			startingCommand := DataCommand{
 				Type: DataPutRoute, Identity: identity,
 				Expect: RevisionExpectation{Absent: true}, Route: &starting,
-			})
-			if err != nil {
-				return err
 			}
-			result, err = proposeScaleGate(groupContext, nodeHosts, DataRaftShardID(logicalShardID), startingRaw)
+			applied, err = proposeScaleGateMutation(groupContext, nodeHosts, startingCommand)
 			if err != nil {
 				return fmt.Errorf("start Route on data shard %d: %w", logicalShardID, err)
 			}
-			if err := json.Unmarshal(result.Data, &applied); err != nil || !applied.Applied {
-				return fmt.Errorf("start Route on data shard %d: result=%+v err=%v", logicalShardID, applied, err)
+			if !applied.Applied {
+				return fmt.Errorf("start Route on data shard %d: result=%+v", logicalShardID, applied)
 			}
-			readyRaw, err := EncodeDataCommand(DataCommand{
+			readyCommand := DataCommand{
 				Type: DataPutRoute, Identity: identity,
 				Expect: RevisionExpectation{LogIndex: applied.Revision}, Route: &ready,
-			})
-			if err != nil {
-				return err
 			}
-			result, err = proposeScaleGate(groupContext, nodeHosts, DataRaftShardID(logicalShardID), readyRaw)
+			applied, err = proposeScaleGateMutation(groupContext, nodeHosts, readyCommand)
 			if err != nil {
 				return fmt.Errorf("commit READY on data shard %d: %w", logicalShardID, err)
 			}
-			if err := json.Unmarshal(result.Data, &applied); err != nil || !applied.Applied {
-				return fmt.Errorf("commit READY on data shard %d: result=%+v err=%v", logicalShardID, applied, err)
+			if !applied.Applied {
+				return fmt.Errorf("commit READY on data shard %d: result=%+v", logicalShardID, applied)
 			}
 			return nil
 		})
@@ -336,7 +331,7 @@ func proposeScaleGate(
 	var last error
 	for {
 		for _, nodeHost := range nodeHosts {
-			attemptContext, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+			attemptContext, cancel := context.WithTimeout(ctx, scaleGateOperationMax)
 			result, err := nodeHost.SyncPropose(
 				attemptContext, nodeHost.GetNoOPSession(shardID), command,
 			)
@@ -355,6 +350,94 @@ func proposeScaleGate(
 		case <-time.After(10 * time.Millisecond):
 		}
 	}
+}
+
+func proposeScaleGateMutation(
+	ctx context.Context,
+	nodeHosts []*dragonboat.NodeHost,
+	command DataCommand,
+) (DataApplyResult, error) {
+	raw, err := EncodeDataCommand(command)
+	if err != nil {
+		return DataApplyResult{}, err
+	}
+	shardID := DataRaftShardID(command.Identity.ShardID)
+	var last error
+	for {
+		for _, nodeHost := range nodeHosts {
+			attemptContext, cancel := context.WithTimeout(ctx, scaleGateOperationMax)
+			result, proposeErr := nodeHost.SyncPropose(
+				attemptContext, nodeHost.GetNoOPSession(shardID), raw,
+			)
+			cancel()
+			if proposeErr != nil {
+				last = proposeErr
+				continue
+			}
+			var applied DataApplyResult
+			if err := json.Unmarshal(result.Data, &applied); err != nil {
+				return DataApplyResult{}, err
+			}
+			if applied.Applied {
+				return applied, nil
+			}
+			if !applied.Conflict {
+				return applied, nil
+			}
+			resolved, readErr := resolveScaleGateMutation(ctx, nodeHosts, shardID, command)
+			if readErr != nil {
+				last = readErr
+				break
+			}
+			if resolved.Committed {
+				return DataApplyResult{Applied: true, Revision: resolved.Revision}, nil
+			}
+			return applied, nil
+		}
+
+		resolved, readErr := resolveScaleGateMutation(ctx, nodeHosts, shardID, command)
+		if readErr == nil && resolved.Committed {
+			return DataApplyResult{Applied: true, Revision: resolved.Revision}, nil
+		}
+		if readErr != nil {
+			last = readErr
+		}
+		select {
+		case <-ctx.Done():
+			if last == nil {
+				last = errors.New("no proposal target available")
+			}
+			return DataApplyResult{}, fmt.Errorf("%w: %v", ctx.Err(), last)
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+
+func resolveScaleGateMutation(
+	ctx context.Context,
+	nodeHosts []*dragonboat.NodeHost,
+	shardID uint64,
+	command DataCommand,
+) (DataMutationStatus, error) {
+	var last error
+	for _, nodeHost := range nodeHosts {
+		attemptContext, cancel := context.WithTimeout(ctx, scaleGateOperationMax)
+		value, err := nodeHost.SyncRead(attemptContext, shardID, DataMutationLookup{Command: command})
+		cancel()
+		if err != nil {
+			last = err
+			continue
+		}
+		status, ok := value.(DataMutationStatus)
+		if !ok {
+			return DataMutationStatus{}, errors.New("scale gate received an invalid mutation status")
+		}
+		return status, nil
+	}
+	if last == nil {
+		last = errors.New("no strong-read target available")
+	}
+	return DataMutationStatus{}, last
 }
 
 func percentileDuration(sorted []time.Duration, percentile float64) time.Duration {
