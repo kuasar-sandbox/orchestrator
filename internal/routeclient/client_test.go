@@ -99,6 +99,32 @@ func TestPostJSONPreservesBoundedMemberFailureDetail(t *testing.T) {
 	}
 }
 
+func TestPostJSONTreatsClientRejectionsAsDefinitive(t *testing.T) {
+	for _, test := range []struct {
+		status  int
+		unknown bool
+	}{
+		{status: http.StatusBadRequest},
+		{status: http.StatusForbidden},
+		{status: http.StatusNotFound},
+		{status: http.StatusMethodNotAllowed},
+		{status: http.StatusServiceUnavailable, unknown: true},
+	} {
+		t.Run(http.StatusText(test.status), func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				http.Error(w, "rejected", test.status)
+			}))
+			defer server.Close()
+			err := postJSON(context.Background(), Endpoint{
+				MemberID: "registry-a", BaseURL: server.URL, Client: server.Client(),
+			}, "/mutation", struct{}{}, &struct{}{})
+			if err == nil || requestMayHaveReached(err) != test.unknown {
+				t.Fatalf("status %d error = %v, unknown=%v", test.status, err, requestMayHaveReached(err))
+			}
+		})
+	}
+}
+
 func TestMutationErrorsDistinguishDefinitiveAndUnknownDelivery(t *testing.T) {
 	for _, test := range []struct {
 		name    string

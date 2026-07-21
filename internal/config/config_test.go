@@ -69,6 +69,31 @@ sandbox:
 	}
 }
 
+func TestLoadRejectsPlaintextTCPNodeLinkWithTLSMaterial(t *testing.T) {
+	t.Setenv("NODE_CONFIG_ENCRYPTION_KEY", "")
+	path := writeConfig(t, `
+api:
+  domain: example.test
+encryption_key: test-key
+cluster:
+  node_link:
+    endpoint: http://registry.example.test:9443
+    tls:
+      cert: /run/node.crt
+      key: /run/node.key
+      ca: /run/ca.crt
+sandbox:
+  boot:
+    kernel: /opt/sandbox/vmlinux
+    runtime: /opt/sandbox/sandbox-runtime.erofs
+`)
+
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "must not use plaintext http://") {
+		t.Fatalf("Load error = %v, want plaintext node-link rejection", err)
+	}
+}
+
 func TestLoadRejectsNonPositivePoolWaitTimeout(t *testing.T) {
 	t.Setenv("NODE_CONFIG_ENCRYPTION_KEY", "")
 	for _, value := range []string{"0s", "-1s"} {

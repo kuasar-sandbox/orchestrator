@@ -78,14 +78,16 @@ func startResourceController(
 		if err := os.Remove(resolved.StatePath); err != nil && !os.IsNotExist(err) {
 			return nil, fmt.Errorf("remove prior-epoch resource state: %w", err)
 		}
-		if parent, err := os.Open(filepath.Dir(resolved.StatePath)); err == nil {
-			if syncErr := parent.Sync(); syncErr != nil {
-				parent.Close()
-				return nil, fmt.Errorf("fsync prior-epoch resource state removal: %w", syncErr)
-			}
-			if err := parent.Close(); err != nil {
-				return nil, err
-			}
+		parent, err := os.Open(filepath.Dir(resolved.StatePath))
+		if err != nil {
+			return nil, fmt.Errorf("open prior-epoch resource state directory: %w", err)
+		}
+		if syncErr := parent.Sync(); syncErr != nil {
+			parent.Close()
+			return nil, fmt.Errorf("fsync prior-epoch resource state removal: %w", syncErr)
+		}
+		if err := parent.Close(); err != nil {
+			return nil, fmt.Errorf("close prior-epoch resource state directory: %w", err)
 		}
 	}
 	// Missing state is valid only for a node with no accepted workflow; the

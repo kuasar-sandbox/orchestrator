@@ -702,8 +702,13 @@ func (c *Config) validate() error {
 		if tlsAny && !tlsComplete {
 			return errors.New("config: cluster.node_link.tls requires cert, key, and ca together")
 		}
-		if !strings.HasPrefix(c.Cluster.NodeLink.Endpoint, "/") && !tlsComplete {
-			return errors.New("config: TCP cluster.node_link requires complete mTLS")
+		if !strings.HasPrefix(c.Cluster.NodeLink.Endpoint, "/") {
+			if strings.HasPrefix(strings.ToLower(c.Cluster.NodeLink.Endpoint), "http://") {
+				return errors.New("config: TCP cluster.node_link endpoint must not use plaintext http://")
+			}
+			if !tlsComplete {
+				return errors.New("config: TCP cluster.node_link requires complete mTLS")
+			}
 		}
 		if c.Cluster.DataEndpoint == "" {
 			return fmt.Errorf("config: cluster.data_endpoint is required in cluster mode")

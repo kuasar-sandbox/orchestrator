@@ -831,10 +831,11 @@ func postJSON(ctx context.Context, endpoint Endpoint, path string, input, output
 	if response.StatusCode != http.StatusOK {
 		detail, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
 		message := strings.TrimSpace(string(detail))
+		mayHaveReached := response.StatusCode < http.StatusBadRequest || response.StatusCode >= http.StatusInternalServerError
 		if message == "" {
-			return &requestDeliveryError{err: fmt.Errorf("routeclient: member %s returned %s", endpoint.MemberID, response.Status), mayHaveReached: true}
+			return &requestDeliveryError{err: fmt.Errorf("routeclient: member %s returned %s", endpoint.MemberID, response.Status), mayHaveReached: mayHaveReached}
 		}
-		return &requestDeliveryError{err: fmt.Errorf("routeclient: member %s returned %s: %s", endpoint.MemberID, response.Status, message), mayHaveReached: true}
+		return &requestDeliveryError{err: fmt.Errorf("routeclient: member %s returned %s: %s", endpoint.MemberID, response.Status, message), mayHaveReached: mayHaveReached}
 	}
 	decoder := json.NewDecoder(io.LimitReader(response.Body, maximumResponseBytes+1))
 	decoder.DisallowUnknownFields()

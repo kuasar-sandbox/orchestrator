@@ -490,7 +490,9 @@ func TestPausedSandboxControlResolvesBoundSIDAfterCacheMiss(t *testing.T) {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"sandboxID": "node-local-sandbox", "nested": []string{"node-local-sandbox"},
+			"sandboxID": "node-local-sandbox",
+			"metadata":  map[string]any{"sandboxID": "external-id", "value": "node-local-sandbox"},
+			"nested":    []string{"node-local-sandbox"},
 		})
 	}))
 	defer backend.Close()
@@ -508,9 +510,15 @@ func TestPausedSandboxControlResolvesBoundSIDAfterCacheMiss(t *testing.T) {
 	request.Header.Set(HeaderGroup, "/group")
 	response := httptest.NewRecorder()
 	router.Handler().ServeHTTP(response, request)
-	if response.Code != http.StatusOK || strings.Contains(response.Body.String(), "node-local-sandbox") ||
-		!strings.Contains(response.Body.String(), "route-1") {
+	var body map[string]any
+	if response.Code != http.StatusOK || json.Unmarshal(response.Body.Bytes(), &body) != nil {
 		t.Fatalf("rewritten Sandbox response = %d %s", response.Code, response.Body.String())
+	}
+	metadata, _ := body["metadata"].(map[string]any)
+	nested, _ := body["nested"].([]any)
+	if body["sandboxID"] != "route-1" || metadata["sandboxID"] != "external-id" ||
+		metadata["value"] != "node-local-sandbox" || len(nested) != 1 || nested[0] != "node-local-sandbox" {
+		t.Fatalf("Sandbox identity rewrite changed opaque fields: %+v", body)
 	}
 }
 

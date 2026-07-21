@@ -710,7 +710,7 @@ func (r *Router) forwardNodeControl(w http.ResponseWriter, request *http.Request
 			}
 		}
 		if route != nil && strings.Contains(response.Header.Get("Content-Type"), "application/json") {
-			return rewriteSandboxResponse(response, route.Route.SandboxID, route.RouteKey)
+			return rewriteSandboxResponse(response, route.RouteKey)
 		}
 		return nil
 	}
@@ -731,7 +731,7 @@ func clearDirectFence(header http.Header) {
 	}
 }
 
-func rewriteSandboxResponse(response *http.Response, concreteID, routeKey string) error {
+func rewriteSandboxResponse(response *http.Response, routeKey string) error {
 	if response.Body == nil || response.StatusCode == http.StatusNoContent {
 		return nil
 	}
@@ -744,7 +744,7 @@ func rewriteSandboxResponse(response *http.Response, concreteID, routeKey string
 	if err := json.Unmarshal(raw, &value); err != nil {
 		return err
 	}
-	value = rewriteSandboxJSON(value, concreteID, routeKey)
+	value = rewriteSandboxJSON(value, routeKey)
 	raw, err = json.Marshal(value)
 	if err != nil {
 		return err
@@ -756,26 +756,23 @@ func rewriteSandboxResponse(response *http.Response, concreteID, routeKey string
 	return nil
 }
 
-func rewriteSandboxJSON(value any, concreteID, routeKey string) any {
+func rewriteSandboxJSON(value any, routeKey string) any {
+	rewriteIdentity := func(object map[string]any) {
+		if _, present := object["sandboxID"]; present {
+			object["sandboxID"] = routeKey
+		}
+	}
 	switch typed := value.(type) {
 	case map[string]any:
-		for key, child := range typed {
-			if key == "sandboxID" {
-				typed[key] = routeKey
-			} else {
-				typed[key] = rewriteSandboxJSON(child, concreteID, routeKey)
-			}
-		}
+		rewriteIdentity(typed)
 		return typed
 	case []any:
 		for index := range typed {
-			typed[index] = rewriteSandboxJSON(typed[index], concreteID, routeKey)
+			if object, ok := typed[index].(map[string]any); ok {
+				rewriteIdentity(object)
+			}
 		}
 		return typed
-	case string:
-		if typed == concreteID {
-			return routeKey
-		}
 	}
 	return value
 }
