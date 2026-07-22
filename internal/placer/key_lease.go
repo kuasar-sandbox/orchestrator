@@ -55,7 +55,7 @@ func ResolveNodeKeyLease(
 		return routesync.NodeKeyLeaseV1{}, err
 	}
 	lease := routesync.NodeKeyLeaseV1{
-		Version: routesync.NodeKeyLeaseVersionV1, Group: group,
+		Version: routesync.NodeKeyLeaseVersionV1, Group: group, KeyRevision: groupRecord.KeyRevision,
 		AuthKey: authKey, ManifestKey: manifestKey, RegistryAuth: registryAuth,
 		ExpiresUnix: expiresUnix,
 	}

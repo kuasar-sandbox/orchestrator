@@ -84,6 +84,7 @@ type PlacementCandidate struct {
 	NodeID        string `json:"node_id"`
 	FailureDomain string `json:"failure_domain,omitempty"`
 	RuntimeDigest string `json:"runtime_digest,omitempty"`
+	CatalogDigest string `json:"catalog_digest"`
 }
 
 type DispatchIntent struct {
@@ -1102,6 +1103,9 @@ func validateCandidates(candidates []PlacementCandidate, selected *uint32, rejec
 	for _, candidate := range candidates {
 		if err := ValidateExecutionBindingNodeID(candidate.NodeID); err != nil {
 			return fmt.Errorf("cluster: invalid placement candidate node ID: %w", err)
+		}
+		if !validDigest(candidate.CatalogDigest) {
+			return errors.New("cluster: placement candidate requires a valid Catalog digest")
 		}
 		for name, value := range map[string]string{
 			"failure domain": candidate.FailureDomain,

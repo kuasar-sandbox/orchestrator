@@ -76,9 +76,9 @@ func (d NormalizedDemand) Validate() error {
 	return nil
 }
 
-func (d NormalizedDemand) ProbeRequest(nodeID, runtimeDigest string) PlacementProbeRequest {
+func (d NormalizedDemand) ProbeRequest(nodeID, runtimeDigest, catalogDigest string) PlacementProbeRequest {
 	return PlacementProbeRequest{
 		Kind: d.Kind, NodeID: nodeID, LoadModelVersion: d.Version,
-		RuntimeDigest: runtimeDigest, Sandbox: d.Sandbox, Build: d.Build,
+		RuntimeDigest: runtimeDigest, CatalogDigest: catalogDigest, Sandbox: d.Sandbox, Build: d.Build,
 	}
 }

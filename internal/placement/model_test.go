@@ -6,6 +6,8 @@ import (
 	"time"
 )
 
+const testCatalogDigest = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
 func TestRatioPPMRoundsUpAndSaturates(t *testing.T) {
 	if got := ratioPPM(1, 3); got != 333_334 {
 		t.Fatalf("1/3 PPM = %d", got)
@@ -22,8 +24,8 @@ func TestProjectedSandboxRateAndBuildReservation(t *testing.T) {
 	snapshot := baseSnapshot()
 	request := PlacementProbeRequest{
 		Kind: ObjectSandbox, NodeID: "n1", ExpectedNodeEpoch: 7, ExpectedSessionSeq: 11,
-		LoadModelVersion: LoadModelVersion,
-		Sandbox:          &SandboxDemand{SlotUnits: 1, StartupBudgetMemory: 2 << 30, FloorMemory: 1 << 30, AllocatableAtSnapshot: 512 << 20},
+		LoadModelVersion: LoadModelVersion, CatalogDigest: testCatalogDigest,
+		Sandbox: &SandboxDemand{SlotUnits: 1, StartupBudgetMemory: 2 << 30, FloorMemory: 1 << 30, AllocatableAtSnapshot: 512 << 20},
 	}
 	response := ProbePlacement(snapshot, 100*time.Millisecond, request)
 	if response.Class != ProbeImmediate || response.Components.SlotPPM != 300_000 ||
@@ -55,7 +57,7 @@ func TestProbeFreshnessAndUnknownCapacityFailClosed(t *testing.T) {
 	snapshot := baseSnapshot()
 	request := PlacementProbeRequest{
 		Kind: ObjectBuild, NodeID: "n1", ExpectedNodeEpoch: 7, ExpectedSessionSeq: 11,
-		LoadModelVersion: LoadModelVersion, Build: &BuildDemand{Slots: 1, CPU: 1000},
+		LoadModelVersion: LoadModelVersion, CatalogDigest: testCatalogDigest, Build: &BuildDemand{Slots: 1, CPU: 1000},
 	}
 	if got := ProbePlacement(snapshot, MaximumProbeSampleAge+time.Nanosecond, request); got.Class != ProbeStale {
 		t.Fatalf("stale probe = %+v", got)
@@ -75,13 +77,26 @@ func TestProbeFreshnessAndUnknownCapacityFailClosed(t *testing.T) {
 	}
 }
 
+func TestProbeRejectsChangedCatalogIdentity(t *testing.T) {
+	snapshot := baseSnapshot()
+	request := PlacementProbeRequest{
+		Kind: ObjectSandbox, NodeID: "n1", ExpectedNodeEpoch: 7, ExpectedSessionSeq: 11,
+		LoadModelVersion: LoadModelVersion, CatalogDigest: testCatalogDigest,
+		Sandbox: &SandboxDemand{SlotUnits: 1, StartupBudgetMemory: 1},
+	}
+	snapshot.CatalogDigest = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	if got := ProbePlacement(snapshot, 0, request); got.Class != ProbeReject {
+		t.Fatalf("changed Catalog identity probe = %+v", got)
+	}
+}
+
 func TestQueueFullIsTransientRatherThanDefinitiveRejection(t *testing.T) {
 	snapshot := baseSnapshot()
 	snapshot.SandboxRateTokenAvailable = false
 	snapshot.SandboxQueueDepth = snapshot.SandboxQueueLimit
 	sandbox := PlacementProbeRequest{
 		Kind: ObjectSandbox, NodeID: "n1", ExpectedNodeEpoch: 7, ExpectedSessionSeq: 11,
-		LoadModelVersion: LoadModelVersion, Sandbox: &SandboxDemand{SlotUnits: 1, StartupBudgetMemory: 1},
+		LoadModelVersion: LoadModelVersion, CatalogDigest: testCatalogDigest, Sandbox: &SandboxDemand{SlotUnits: 1, StartupBudgetMemory: 1},
 	}
 	if got := ProbePlacement(snapshot, 0, sandbox); got.Class != ProbeStale {
 		t.Fatalf("full Sandbox queue probe = %+v", got)
@@ -92,7 +107,7 @@ func TestQueueFullIsTransientRatherThanDefinitiveRejection(t *testing.T) {
 	snapshot.BuildQueueDepth = snapshot.BuildQueueLimit
 	build := PlacementProbeRequest{
 		Kind: ObjectBuild, NodeID: "n1", ExpectedNodeEpoch: 7, ExpectedSessionSeq: 11,
-		LoadModelVersion: LoadModelVersion, Build: &BuildDemand{Slots: 1},
+		LoadModelVersion: LoadModelVersion, CatalogDigest: testCatalogDigest, Build: &BuildDemand{Slots: 1},
 	}
 	if got := ProbePlacement(snapshot, 0, build); got.Class != ProbeStale {
 		t.Fatalf("full Build queue probe = %+v", got)
@@ -103,7 +118,7 @@ func TestProbeRejectsUnknownSafetyState(t *testing.T) {
 	snapshot := baseSnapshot()
 	request := PlacementProbeRequest{
 		Kind: ObjectSandbox, NodeID: "n1", ExpectedNodeEpoch: 7, ExpectedSessionSeq: 11,
-		LoadModelVersion: LoadModelVersion, Sandbox: &SandboxDemand{SlotUnits: 1, StartupBudgetMemory: 1},
+		LoadModelVersion: LoadModelVersion, CatalogDigest: testCatalogDigest, Sandbox: &SandboxDemand{SlotUnits: 1, StartupBudgetMemory: 1},
 	}
 	snapshot.WaterZone = "unknown"
 	if got := ProbePlacement(snapshot, 0, request); got.Class != ProbeReject {
@@ -122,7 +137,7 @@ func TestProbeRejectsUnknownSafetyState(t *testing.T) {
 func TestProbeRetriesDynamicSafetyStates(t *testing.T) {
 	request := PlacementProbeRequest{
 		Kind: ObjectSandbox, NodeID: "n1", ExpectedNodeEpoch: 7, ExpectedSessionSeq: 11,
-		LoadModelVersion: LoadModelVersion, Sandbox: &SandboxDemand{SlotUnits: 1, StartupBudgetMemory: 1},
+		LoadModelVersion: LoadModelVersion, CatalogDigest: testCatalogDigest, Sandbox: &SandboxDemand{SlotUnits: 1, StartupBudgetMemory: 1},
 	}
 	for _, zone := range []string{"red", "critical"} {
 		snapshot := baseSnapshot()
@@ -138,7 +153,7 @@ func TestProbeRetriesTemporaryHardLimitSaturation(t *testing.T) {
 	sandboxSnapshot.SandboxSlotHardLimit = 3
 	sandbox := PlacementProbeRequest{
 		Kind: ObjectSandbox, NodeID: "n1", ExpectedNodeEpoch: 7, ExpectedSessionSeq: 11,
-		LoadModelVersion: LoadModelVersion, Sandbox: &SandboxDemand{SlotUnits: 2, StartupBudgetMemory: 1},
+		LoadModelVersion: LoadModelVersion, CatalogDigest: testCatalogDigest, Sandbox: &SandboxDemand{SlotUnits: 2, StartupBudgetMemory: 1},
 	}
 	if got := ProbePlacement(sandboxSnapshot, 0, sandbox); got.Class != ProbeStale {
 		t.Fatalf("temporarily saturated Sandbox hard limit = %+v", got)
@@ -152,7 +167,7 @@ func TestProbeRetriesTemporaryHardLimitSaturation(t *testing.T) {
 	buildSnapshot.BuildSlotHardLimit = 2
 	build := PlacementProbeRequest{
 		Kind: ObjectBuild, NodeID: "n1", ExpectedNodeEpoch: 7, ExpectedSessionSeq: 11,
-		LoadModelVersion: LoadModelVersion, Build: &BuildDemand{Slots: 2},
+		LoadModelVersion: LoadModelVersion, CatalogDigest: testCatalogDigest, Build: &BuildDemand{Slots: 2},
 	}
 	if got := ProbePlacement(buildSnapshot, 0, build); got.Class != ProbeStale {
 		t.Fatalf("temporarily saturated Build hard limit = %+v", got)
@@ -186,7 +201,7 @@ func TestP2CUsesClassRateThenRandomTie(t *testing.T) {
 func baseSnapshot() PlacementLoadSnapshot {
 	return PlacementLoadSnapshot{
 		NodeID: "n1", NodeEpoch: 7, SessionSeq: 11, DataEndpoint: "10.0.0.1:8443",
-		SampleSeq: 3, LoadModelVersion: LoadModelVersion, WaterZone: "green",
+		SampleSeq: 3, LoadModelVersion: LoadModelVersion, CatalogDigest: testCatalogDigest, WaterZone: "green",
 		SandboxSlotCapacity: 10, SandboxSlotHardLimit: 20, SandboxSlotUsed: 2,
 		SandboxQueueLimit: 100, SandboxRateTokenAvailable: true,
 		SandboxResourceController: true, NodeAllocatedMemory: 4 << 30,
