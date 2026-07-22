@@ -292,6 +292,26 @@ type failingFinalizeJournal struct {
 	err error
 }
 
+type failingRecordJournal struct {
+	*store.Store
+	err       error
+	committed bool
+}
+
+func (j *failingRecordJournal) RecordSandboxWorkflow(
+	ctx context.Context,
+	dispatch nodeexec.DispatchRecord,
+	decision nodeexec.AdmissionDecision,
+	sandbox *types.Sandbox,
+) (*nodeexec.WorkflowRecord, error) {
+	if j.committed {
+		if _, err := j.Store.RecordSandboxWorkflow(ctx, dispatch, decision, sandbox); err != nil {
+			return nil, err
+		}
+	}
+	return nil, j.err
+}
+
 func (j *failingFinalizeJournal) FinalizeNodeWorkflow(
 	ctx context.Context,
 	kind clusterstate.ExecutionKind,
@@ -494,6 +514,44 @@ func TestConcurrentConflictingSandboxDispatchKeepsWinningReservation(t *testing.
 	winner, err := st.GetNodeWorkflow(context.Background(), clusterstate.ExecutionKindSandbox, command.ObjectID)
 	if err != nil || winner == nil || winner.ReservationToken != "shared-token" {
 		t.Fatalf("winner = %+v, %v", winner, err)
+	}
+}
+
+func TestSandboxAdmissionReleaseRequiresDefiniteMissingJournal(t *testing.T) {
+	for _, test := range []struct {
+		name          string
+		committed     bool
+		wantReleased  bool
+		wantPersisted bool
+	}{
+		{name: "definite failure", wantReleased: true},
+		{name: "ambiguous committed write", committed: true, wantPersisted: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			st := authorityStore(t)
+			command := authorityCommand(t, clusterstate.ExecutionKindSandbox, "sandbox-journal-failure")
+			sandbox := &sandboxAdmissionFake{
+				prepared: map[string]nodectl.PreparedAdmissionResult{command.ObjectID: {
+					SandboxID: command.ObjectID, DemandDigest: command.Intent.DemandDigest,
+					State: nodectl.PreparedAdmitted, ReservationToken: "reservation-journal-failure",
+				}},
+				wake: make(chan struct{}),
+			}
+			journal := &failingRecordJournal{
+				Store: st, err: errors.New("injected journal result loss"), committed: test.committed,
+			}
+			authority := newAuthority(t, journal, sandbox)
+			if _, err := authority.AdmitAndDispatch(context.Background(), command); err == nil {
+				t.Fatal("journal failure was acknowledged")
+			}
+			if released := len(sandbox.released) != 0; released != test.wantReleased {
+				t.Fatalf("released=%v entries=%v", released, sandbox.released)
+			}
+			record, err := st.GetNodeWorkflow(context.Background(), clusterstate.ExecutionKindSandbox, command.ObjectID)
+			if err != nil || (record != nil) != test.wantPersisted {
+				t.Fatalf("persisted workflow = %+v, %v", record, err)
+			}
+		})
 	}
 }
 

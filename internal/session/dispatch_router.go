@@ -33,7 +33,7 @@ func (d *DirectoryDispatcher) AdmitAndDispatch(ctx context.Context, command Disp
 		return d.classifyUnavailable(ctx, command, "selected NodeEpoch is no longer current")
 	}
 	if entry.NodeEpoch < command.NodeEpoch {
-		return DispatchReply{Outcome: cluster.DispatchSessionMoved, Reason: "Session Directory is behind selected NodeEpoch"}, nil
+		return d.classifyUnavailable(ctx, command, "Session Directory is behind selected NodeEpoch")
 	}
 	command.SessionSeq = entry.SessionSeq
 	reply, err := d.client.AdmitAndDispatchAt(ctx, entry.HolderMemberID, command)
