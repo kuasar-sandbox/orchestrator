@@ -34,7 +34,7 @@ func testOrchCfgAt(t *testing.T, cfg *config.Config, dbPath string) *Orchestrato
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { st.Close() })
-	return New(cfg, st, nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	return New(cfg, st, nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
 }
 
 // TestResolveBuildCreds verifies the precedence: pull token > fromImageRegistry

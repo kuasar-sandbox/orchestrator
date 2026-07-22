@@ -138,8 +138,8 @@ func runProxyMaster(ctx context.Context, cfgPath string, cfg *config.ProxyFileCo
 			MaxDNSAnswers:        epLimits.MaxRelayDNSAnswers,
 			MaxInflightPerKey:    epLimits.MaxRelayInflightPerSandbox,
 			MaxRequestsPerSecond: float64(epLimits.MaxRelayRequestsPerSecond),
-		})
-		endpoints = proxyendpoints.New(relayClient, epLimits.MaxTotalEndpoints, epLimits.ValueWaitTimeoutDur())
+		}, mx)
+		endpoints = proxyendpoints.New(relayClient, epLimits.MaxTotalEndpoints, epLimits.ValueWaitTimeoutDur(), mx)
 	}
 
 	for i := 0; i < cfg.Workers; i++ {
@@ -350,7 +350,7 @@ func runProxyWorkerProcess(ctx context.Context, workerID, cfgPath string, proxyN
 			return cerr
 		}
 		go func() {
-			if err := mmdsrpc.NewServer(endpoints, maxWorkerInflight, log.With("proxy_worker", workerID)).Serve(ctx, rpcConn); err != nil && ctx.Err() == nil {
+			if err := mmdsrpc.NewServer(endpoints, maxWorkerInflight, log.With("proxy_worker", workerID), mx).Serve(ctx, rpcConn); err != nil && ctx.Err() == nil {
 				log.Debug("mmdsrpc: worker connection ended", "worker", workerID, "err", err)
 			}
 		}()

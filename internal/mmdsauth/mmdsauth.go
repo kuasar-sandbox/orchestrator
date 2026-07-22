@@ -26,6 +26,20 @@ type relayFetcher interface {
 	Fetch(ctx context.Context, key, rawURL, headerName, headerValue string) mmdsrelay.Result
 }
 
+// Counter is the narrow metrics surface Authority needs. Add (unlike
+// internal/mmds.Counter's Inc-only surface) is safe here since Authority
+// only ever runs in the conductor process against a real *metrics.M, never
+// through the worker-side metrics pipe.
+type Counter interface {
+	Inc(name string)
+	Add(name string, n int64)
+}
+
+type noopCounter struct{}
+
+func (noopCounter) Inc(string)        {}
+func (noopCounter) Add(string, int64) {}
+
 // Authority reads endpoint definitions/values from st and parks a bounded
 // wait for a never-configured store or relay-auth value, waking waiters as
 // soon as an admin mutation lands (Notify) rather than only on timeout.
@@ -33,6 +47,7 @@ type Authority struct {
 	st      *store.Store
 	relay   relayFetcher  // nil = relay-backend endpoints are unavailable (503)
 	timeout time.Duration // value-wait timeout for a never-configured endpoint (2-5s)
+	mx      Counter
 
 	mu      sync.Mutex
 	waiters map[string]chan struct{} // key = sid+"\x00"+name; closed+recreated to broadcast a change
@@ -42,12 +57,15 @@ type Authority struct {
 // (config.MMDSEndpointsConfig.ValueWaitTimeoutDur()); non-positive falls back
 // to 3s, mirroring that accessor's own default. relay may be nil (relay
 // endpoints unavailable, e.g. before Phase 6's relay config is wired); pass
-// a *mmdsrelay.Client in production.
-func New(st *store.Store, relay relayFetcher, timeout time.Duration) *Authority {
+// a *mmdsrelay.Client in production. mx may be nil (metrics off).
+func New(st *store.Store, relay relayFetcher, timeout time.Duration, mx Counter) *Authority {
 	if timeout <= 0 {
 		timeout = 3 * time.Second
 	}
-	return &Authority{st: st, relay: relay, timeout: timeout, waiters: map[string]chan struct{}{}}
+	if mx == nil {
+		mx = noopCounter{}
+	}
+	return &Authority{st: st, relay: relay, timeout: timeout, mx: mx, waiters: map[string]chan struct{}{}}
 }
 
 // Lookup resolves the exact (sandbox_id, path) to its declared name+backend
@@ -78,7 +96,7 @@ func (a *Authority) ServeStore(ctx context.Context, sandboxID, name string) (val
 		return nil, "", 0, false
 	}
 	if v.Revision == 0 && !v.Present {
-		if !a.wait(ctx, sandboxID, name) {
+		if !a.timedWait(ctx, sandboxID, name) {
 			return nil, "", 0, false // timed out without a PUT landing
 		}
 		if v, ok, err = a.st.GetMMDSStoreValue(ctx, sandboxID, name); err != nil || !ok {
@@ -120,7 +138,7 @@ func (a *Authority) ServeRelay(ctx context.Context, sandboxID, name string) (sta
 		return 0, "", nil, false
 	}
 	if v.Revision == 0 && !v.Present {
-		if !a.wait(ctx, sandboxID, name) {
+		if !a.timedWait(ctx, sandboxID, name) {
 			return 0, "", nil, false // never configured, timed out -> 404, upstream never contacted
 		}
 		if v, found, err = a.st.GetMMDSRelayAuth(ctx, sandboxID, name); err != nil || !found {
@@ -162,6 +180,20 @@ func (a *Authority) Notify(sandboxID, name string) {
 		close(ch)
 		delete(a.waiters, key) // the next waiter creates a fresh channel
 	}
+}
+
+// timedWait wraps wait with mmds_value_wait_seconds observation — only a
+// genuinely parked (never-configured) request reaches this, so the metric
+// reflects real park latency rather than being diluted by already-answered
+// reads. metrics.M has no histogram/float support, so the sum is tracked in
+// milliseconds (mmds_value_wait_seconds_sum_ms), documented via the name
+// itself rather than the doc's literal seconds unit.
+func (a *Authority) timedWait(ctx context.Context, sandboxID, name string) bool {
+	start := time.Now()
+	woke := a.wait(ctx, sandboxID, name)
+	a.mx.Add("mmds_value_wait_seconds_sum_ms", time.Since(start).Milliseconds())
+	a.mx.Inc("mmds_value_wait_seconds_count")
+	return woke
 }
 
 func (a *Authority) wait(ctx context.Context, sandboxID, name string) bool {

@@ -56,7 +56,7 @@ func (f *fakeTable) ServeRelay(context.Context, string, string) (int, string, []
 func harness(t *testing.T, table EndpointTable, maxInflight int) (*Client, func()) {
 	t.Helper()
 	clientConn, serverConn := net.Pipe()
-	srv := NewServer(table, maxInflight, nil)
+	srv := NewServer(table, maxInflight, nil, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
@@ -144,7 +144,7 @@ func TestDuplicateRequestIDRejectedServerSide(t *testing.T) {
 	clientConn, serverConn := net.Pipe()
 	defer clientConn.Close()
 	defer serverConn.Close()
-	srv := NewServer(table, 128, nil)
+	srv := NewServer(table, 128, nil, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go srv.Serve(ctx, serverConn)
@@ -228,7 +228,7 @@ func TestCancellationFreesServerResources(t *testing.T) {
 	clientConn, serverConn := net.Pipe()
 	defer clientConn.Close()
 	defer serverConn.Close()
-	srv := NewServer(table, 1, nil) // cap 1: a second call only succeeds if the first was truly cancelled server-side
+	srv := NewServer(table, 1, nil, nil) // cap 1: a second call only succeeds if the first was truly cancelled server-side
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go srv.Serve(ctx, serverConn)
@@ -257,7 +257,7 @@ func TestClientCloseUnblocksPendingCalls(t *testing.T) {
 	table.block = make(chan struct{})
 
 	clientConn, serverConn := net.Pipe()
-	srv := NewServer(table, 128, nil)
+	srv := NewServer(table, 128, nil, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	go srv.Serve(ctx, serverConn)
 	client := NewClient(clientConn)

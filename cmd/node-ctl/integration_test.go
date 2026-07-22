@@ -59,7 +59,7 @@ func startCtlSocket(t *testing.T) string {
 	}
 	t.Cleanup(func() { st.Close() })
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	core := orch.New(cfg, st, nil, nil, log) // no launcher / vswitch — admin+export don't use them
+	core := orch.New(cfg, st, nil, nil, log, nil) // no launcher / vswitch — admin+export don't use them
 	apiH := api.New(core, cfg.API.Domain, api.Resources{VCPU: cfg.Sandbox.Resources.VCPU, MemoryMB: cfg.Sandbox.Resources.MemoryMiB()}, log).Handler()
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)

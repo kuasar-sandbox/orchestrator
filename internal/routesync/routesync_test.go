@@ -27,10 +27,11 @@ type fakeSink struct {
 	book  chan struct{}
 	pol   chan routesync.Policy
 
-	mmdsBegin chan string
-	mmdsUp    chan routesync.MmdsEndpointEntry
-	mmdsDel   chan routesync.MmdsEndpointKey
-	mmdsBook  chan string
+	mmdsBegin        chan string
+	mmdsUp           chan routesync.MmdsEndpointEntry
+	mmdsDel          chan routesync.MmdsEndpointKey
+	mmdsBook         chan string
+	mmdsDisconnected chan struct{}
 }
 
 func newFakeSink() *fakeSink {
@@ -41,10 +42,11 @@ func newFakeSink() *fakeSink {
 		book:  make(chan struct{}, 4),
 		pol:   make(chan routesync.Policy, 4),
 
-		mmdsBegin: make(chan string, 4),
-		mmdsUp:    make(chan routesync.MmdsEndpointEntry, 4),
-		mmdsDel:   make(chan routesync.MmdsEndpointKey, 4),
-		mmdsBook:  make(chan string, 4),
+		mmdsBegin:        make(chan string, 4),
+		mmdsUp:           make(chan routesync.MmdsEndpointEntry, 4),
+		mmdsDel:          make(chan routesync.MmdsEndpointKey, 4),
+		mmdsBook:         make(chan string, 4),
+		mmdsDisconnected: make(chan struct{}, 4),
 	}
 }
 

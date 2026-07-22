@@ -90,7 +90,24 @@ type Orchestrator struct {
 	mmdsSubSeq int
 	mmdsGenMu  sync.Mutex
 	mmdsGenSeq int64 // MMDS full-sync generation counter; independent of routeSeq/routeFP above
+
+	mx Counter
 }
+
+// Counter is the narrow metrics surface this package needs. Add (unlike
+// internal/mmds.Counter's Inc-only surface) is safe here since this package
+// only ever runs in the conductor process against a real *metrics.M, never
+// through the worker-side metrics pipe.
+type Counter interface {
+	Inc(name string)
+	Add(name string, n int64)
+}
+
+type noopCounter struct{}
+
+func (noopCounter) Add(string, int64) {}
+
+func (noopCounter) Inc(string) {}
 
 // clusterBuild is a registry-driven build's transient image-pull context. Cluster
 // identity remains opaque in Build.Metadata and is never interpreted here.
@@ -99,9 +116,13 @@ type clusterBuild struct {
 	registryAuth string
 }
 
-func New(cfg *config.Config, st *store.Store, lc launcher.Launcher, vs vsClient, log *slog.Logger) *Orchestrator {
+// mx may be nil (metrics off).
+func New(cfg *config.Config, st *store.Store, lc launcher.Launcher, vs vsClient, log *slog.Logger, mx Counter) *Orchestrator {
+	if mx == nil {
+		mx = noopCounter{}
+	}
 	o := &Orchestrator{
-		cfg: cfg, st: st, lc: lc, vs: vs, log: log,
+		cfg: cfg, st: st, lc: lc, vs: vs, log: log, mx: mx,
 		reg:            map[string]*types.Sandbox{},
 		clusterCreates: map[string]struct{}{},
 		subs:           map[int]chan routesync.Event{},
@@ -125,10 +146,10 @@ func New(cfg *config.Config, st *store.Store, lc launcher.Launcher, vs vsClient,
 			MaxDNSAnswers:        cfg.MMDS.Endpoints.MaxRelayDNSAnswers,
 			MaxInflightPerKey:    cfg.MMDS.Endpoints.MaxRelayInflightPerSandbox,
 			MaxRequestsPerSecond: float64(cfg.MMDS.Endpoints.MaxRelayRequestsPerSecond),
-		})
-		o.mmdsAuth = mmdsauth.New(st, relayClient, cfg.MMDS.Endpoints.ValueWaitTimeoutDur())
+		}, mx)
+		o.mmdsAuth = mmdsauth.New(st, relayClient, cfg.MMDS.Endpoints.ValueWaitTimeoutDur(), mx)
 	} else {
-		o.mmdsAuth = mmdsauth.New(st, nil, cfg.MMDS.Endpoints.ValueWaitTimeoutDur())
+		o.mmdsAuth = mmdsauth.New(st, nil, cfg.MMDS.Endpoints.ValueWaitTimeoutDur(), mx)
 	}
 	wait := cfg.Units.PoolWaitDuration()
 	o.runnerPool = newRunPool(runKindSandbox, cfg.Units.RunnerPoolSize, wait, cfg.Paths.RunRoot, lc, o.runnerUnit, log.With("pool", "runner"))

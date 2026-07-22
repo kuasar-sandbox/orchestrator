@@ -49,6 +49,42 @@ type Result struct {
 	Body        []byte
 }
 
+// Counter is the narrow metrics surface Client needs. Add (unlike
+// internal/mmds.Counter's Inc-only surface) is safe here since Client only
+// ever runs in the conductor or proxy-master process against a real
+// *metrics.M, never through the worker-side metrics pipe.
+type Counter interface {
+	Inc(name string)
+	Add(name string, n int64)
+}
+
+type noopCounter struct{}
+
+func (noopCounter) Inc(string)        {}
+func (noopCounter) Add(string, int64) {}
+
+// relayResultLabel is the bounded mmds_relay_requests_total{result} value
+// for a completed Fetch — every distinct value is an enum literal, never
+// derived from caller/upstream-controlled data, since only bounded enums
+// may be used as metric labels. Mirrors internal/mmds.relayResultLabel's
+// bucketing.
+func relayResultLabel(status int) string {
+	switch {
+	case status >= 200 && status < 300:
+		return "ok"
+	case status == http.StatusTooManyRequests:
+		return "rate_limited"
+	case status == http.StatusGatewayTimeout:
+		return "timeout"
+	case status >= 400 && status < 500:
+		return "upstream_4xx"
+	case status >= 500:
+		return "upstream_5xx_or_blocked"
+	default:
+		return "other"
+	}
+}
+
 // Client performs SSRF-hardened relay fetches, rate-limited and
 // concurrency-bounded per (sandbox_id,name) key. Safe for concurrent use;
 // shared across every endpoint on a node — internal mode runs the same
@@ -77,6 +113,8 @@ type Client struct {
 
 	mu       sync.Mutex
 	limiters map[string]*keyLimiter
+
+	mx Counter
 }
 
 // insecureSkipVerifyForTests exists solely so client_test.go can exercise
@@ -84,9 +122,12 @@ type Client struct {
 // self-signed certificate. Never set outside tests.
 var insecureSkipVerifyForTests = false
 
-// New builds a Client bounded by cfg.
-func New(cfg Config) *Client {
-	c := &Client{cfg: cfg, limiters: map[string]*keyLimiter{}, lookupIPAddr: net.DefaultResolver.LookupIPAddr}
+// New builds a Client bounded by cfg. mx may be nil (metrics off).
+func New(cfg Config, mx Counter) *Client {
+	if mx == nil {
+		mx = noopCounter{}
+	}
+	c := &Client{cfg: cfg, limiters: map[string]*keyLimiter{}, lookupIPAddr: net.DefaultResolver.LookupIPAddr, mx: mx}
 	c.resolvePin = c.defaultResolvePin
 	return c
 }
@@ -108,7 +149,17 @@ func (c *Client) limiterFor(key string) *keyLimiter {
 // sandboxID+"\x00"+name. ctx additionally bounds the request; the caller
 // cancels it to abort an in-flight fetch, e.g. on auth revocation/rotation
 // (cancellation on auth revision changes).
-func (c *Client) Fetch(ctx context.Context, key, rawURL, headerName, headerValue string) Result {
+func (c *Client) Fetch(ctx context.Context, key, rawURL, headerName, headerValue string) (result Result) {
+	start := time.Now()
+	defer func() {
+		c.mx.Inc(`mmds_relay_requests_total{result="` + relayResultLabel(result.Status) + `"}`)
+		// metrics.M has no histogram/float support, so the sum is tracked in
+		// milliseconds (mmds_relay_latency_seconds_sum_ms), documented via
+		// the name itself rather than the doc's literal seconds unit.
+		c.mx.Add("mmds_relay_latency_seconds_sum_ms", time.Since(start).Milliseconds())
+		c.mx.Inc("mmds_relay_latency_seconds_count")
+	}()
+
 	limiter := c.limiterFor(key)
 	if !limiter.allowRate() {
 		return Result{Status: http.StatusTooManyRequests}
@@ -299,7 +350,8 @@ func (c *Client) defaultResolvePin(ctx context.Context, host string) (net.IP, er
 		return nil, errors.New("mmdsrelay: too many DNS answers")
 	}
 	for _, a := range addrs {
-		if _, blocked := disallowedIP(a.IP); blocked {
+		if reason, blocked := disallowedIP(a.IP); blocked {
+			c.mx.Inc(`mmds_relay_blocked_total{reason="` + reason + `"}`)
 			return nil, errors.New("mmdsrelay: a DNS answer resolves to a disallowed address")
 		}
 	}

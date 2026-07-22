@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"golang.org/x/net/http2"
@@ -20,6 +21,7 @@ func (f *fakeSink) BeginMmdsSync(generation string)               { f.mmdsBegin 
 func (f *fakeSink) ApplyMmdsUpsert(e routesync.MmdsEndpointEntry) { f.mmdsUp <- e }
 func (f *fakeSink) ApplyMmdsDelete(k routesync.MmdsEndpointKey)   { f.mmdsDel <- k }
 func (f *fakeSink) MmdsBookmark(generation string)                { f.mmdsBook <- generation }
+func (f *fakeSink) Disconnected()                                 { f.mmdsDisconnected <- struct{}{} }
 
 // fakeSource's MmdsSource implementation.
 func (s *fakeSource) MmdsGeneration() string { return s.mmdsGen }
@@ -40,6 +42,17 @@ func (s *fakeSource) SubscribeMmds() (<-chan routesync.MmdsEvent, func()) {
 // as TestRouteSyncRoundtrip, extended with MMDS capability negotiation.
 func mmdsTestHarness(t *testing.T, src *fakeSource, mmdsEndpoints bool) (*fakeSink, *fakeSource) {
 	t.Helper()
+	sink, _, _ := mmdsTestHarnessWithServer(t, src, mmdsEndpoints)
+	return sink, src
+}
+
+// mmdsTestHarnessWithServer is mmdsTestHarness but also returns a closeConn
+// func, for tests (e.g. disconnect handling) that need to force the session
+// to end — closing the server (http.Server.Close) is not reliable for a
+// hijacked h2c/http2 connection, so this closes the client-side net.Conn
+// directly instead.
+func mmdsTestHarnessWithServer(t *testing.T, src *fakeSource, mmdsEndpoints bool) (sink *fakeSink, closeConn func(), _ *fakeSource) {
+	t.Helper()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	sock := filepath.Join(t.TempDir(), "cfg.sock")
 	ln, err := net.Listen("unix", sock)
@@ -59,9 +72,24 @@ func mmdsTestHarness(t *testing.T, src *fakeSource, mmdsEndpoints bool) (*fakeSi
 	go httpSrv.Serve(ln)
 	t.Cleanup(func() { httpSrv.Close() })
 
-	sink := newFakeSink()
+	sink = newFakeSink()
+	var connMu sync.Mutex
+	var lastConn net.Conn
 	dial := func(ctx context.Context) (net.Conn, error) {
-		return (&net.Dialer{}).DialContext(ctx, "unix", sock)
+		c, err := (&net.Dialer{}).DialContext(ctx, "unix", sock)
+		if err == nil {
+			connMu.Lock()
+			lastConn = c
+			connMu.Unlock()
+		}
+		return c, err
+	}
+	closeConn = func() {
+		connMu.Lock()
+		defer connMu.Unlock()
+		if lastConn != nil {
+			lastConn.Close()
+		}
 	}
 	reg := routesync.Register{
 		Subscribe:     &routesync.Subscribe{Kind: routesync.KindRoute},
@@ -75,7 +103,7 @@ func mmdsTestHarness(t *testing.T, src *fakeSource, mmdsEndpoints bool) (*fakeSi
 		mmdsSink = sink
 	}
 	go routesync.NewSubscriber(dial, "px-mmds", reg, sink, mmdsSink, nil, log).Run(ctx)
-	return sink, src
+	return sink, closeConn, src
 }
 
 func TestMmdsSyncFullGenerationStream(t *testing.T) {
@@ -177,4 +205,26 @@ func TestMmdsSyncCapabilityNegotiation(t *testing.T) {
 		t.Fatalf("received an mmds_sync_begin frame (generation %q) despite MmdsEndpoints=false", gen)
 	default:
 	}
+}
+
+// TestMmdsSyncDisconnectNotifiesSink: when the sync session ends, Subscriber
+// calls MmdsSink.Disconnected() before its reconnect attempt — MMDS endpoint
+// secrets must not linger and serve stale during a disconnected window.
+func TestMmdsSyncDisconnectNotifiesSink(t *testing.T) {
+	src := &fakeSource{
+		sub:     make(chan routesync.Event, 4),
+		woke:    make(chan string, 4),
+		mmdsGen: "gen-1",
+		mmdsSub: make(chan routesync.MmdsEvent, 4),
+	}
+	sink, closeConn, _ := mmdsTestHarnessWithServer(t, src, true)
+
+	recv(t, sink.begin, "begin-sync")
+	recv(t, sink.up, "initial route upsert")
+	recv(t, sink.book, "route bookmark")
+	recv(t, sink.mmdsBegin, "mmds sync begin")
+	recv(t, sink.mmdsBook, "mmds bookmark")
+
+	closeConn() // force-closes the live connection, ending the session
+	recv(t, sink.mmdsDisconnected, "mmds disconnected notification")
 }

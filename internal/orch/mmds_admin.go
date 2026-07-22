@@ -24,6 +24,7 @@ func (o *Orchestrator) MMDSAuthority() *mmdsauth.Authority { return o.mmdsAuth }
 
 func (o *Orchestrator) SetMMDSStoreValue(ctx context.Context, sid, name string, value []byte, contentType string, expiresUnix int64) error {
 	err := mapMMDSAdminErr(o.st.SetMMDSStoreValue(ctx, sid, name, value, contentType, expiresUnix))
+	o.mmdsAdminMetric("store", "put", err)
 	if err == nil {
 		o.mmdsAuth.Notify(sid, name)
 		o.publishMmdsEntry(ctx, sid, name)
@@ -33,6 +34,7 @@ func (o *Orchestrator) SetMMDSStoreValue(ctx context.Context, sid, name string, 
 
 func (o *Orchestrator) ClearMMDSStoreValue(ctx context.Context, sid, name string) error {
 	err := mapMMDSAdminErr(o.st.ClearMMDSStoreValue(ctx, sid, name))
+	o.mmdsAdminMetric("store", "delete", err)
 	if err == nil {
 		o.mmdsAuth.Notify(sid, name)
 		o.publishMmdsEntry(ctx, sid, name)
@@ -42,6 +44,7 @@ func (o *Orchestrator) ClearMMDSStoreValue(ctx context.Context, sid, name string
 
 func (o *Orchestrator) SetMMDSRelayAuth(ctx context.Context, sid, name string, value []byte) error {
 	err := mapMMDSAdminErr(o.st.SetMMDSRelayAuth(ctx, sid, name, value))
+	o.mmdsAdminMetric("relay", "put", err)
 	if err == nil {
 		o.mmdsAuth.Notify(sid, name)
 		o.publishMmdsEntry(ctx, sid, name)
@@ -51,11 +54,26 @@ func (o *Orchestrator) SetMMDSRelayAuth(ctx context.Context, sid, name string, v
 
 func (o *Orchestrator) ClearMMDSRelayAuth(ctx context.Context, sid, name string) error {
 	err := mapMMDSAdminErr(o.st.ClearMMDSRelayAuth(ctx, sid, name))
+	o.mmdsAdminMetric("relay", "delete", err)
 	if err == nil {
 		o.mmdsAuth.Notify(sid, name)
 		o.publishMmdsEntry(ctx, sid, name)
 	}
 	return err
+}
+
+// mmdsAdminMetric records one mmds_admin_mutations_total{backend_type,op,result}
+// observation. result is a bounded enum derived from err's shape, never
+// error text (only bounded enums may be used as metric labels).
+func (o *Orchestrator) mmdsAdminMetric(backendType, op string, err error) {
+	result := "ok"
+	switch {
+	case errors.Is(err, configsock.ErrMMDSEndpointNotFound), errors.Is(err, configsock.ErrMMDSEndpointWrongBackend):
+		result = "not_found"
+	case err != nil:
+		result = "error"
+	}
+	o.mx.Inc(`mmds_admin_mutations_total{backend_type="` + backendType + `",op="` + op + `",result="` + result + `"}`)
 }
 
 func mapMMDSAdminErr(err error) error {

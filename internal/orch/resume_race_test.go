@@ -83,7 +83,7 @@ func TestResumeRace_ConnectAndRouteSingleLaunch(t *testing.T) {
 	cfg.Sandbox.Network.Bare.InnerIP = "169.254.1.1/31" // allocInnerIP needs a valid CIDR
 
 	lc := &countingLauncher{}
-	o := New(cfg, st, lc, stubVS{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	o := New(cfg, st, lc, stubVS{}, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
 	lc.orch = o
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)

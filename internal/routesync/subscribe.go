@@ -40,6 +40,14 @@ type MmdsSink interface {
 	// MmdsBookmark marks generation's scan complete: entries not seen since
 	// the matching BeginMmdsSync are dropped.
 	MmdsBookmark(generation string)
+	// Disconnected is called once the sync session ends, for any reason,
+	// before Run's reconnect attempt — MMDS endpoint secrets must not
+	// linger and serve stale during a disconnected window, so the sink is
+	// expected to clear its plaintext state and mark itself unavailable
+	// until a fresh BeginMmdsSync/MmdsBookmark pair completes. Unlike the
+	// route family (which tolerates serving stale routes across a brief
+	// reconnect), this is not optional.
+	Disconnected()
 }
 
 // WakeSource yields sandbox ids the subscriber wants the orchestrator to resume. It
@@ -83,6 +91,9 @@ func (s *Subscriber) Run(ctx context.Context) {
 	backoff := 200 * time.Millisecond
 	for ctx.Err() == nil {
 		err := s.session(ctx, tr)
+		if s.mmdsSink != nil {
+			s.mmdsSink.Disconnected()
+		}
 		if ctx.Err() != nil {
 			return
 		}

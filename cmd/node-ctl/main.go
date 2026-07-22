@@ -134,11 +134,12 @@ func runConductor(args []string, log *slog.Logger) error {
 	}
 	defer lc.Close()
 
+	mx := metrics.New()
 	core := orch.New(cfg, st, lc, vswitch.New(
 		cfg.ConnectorCtl(),
 		cfg.Sandbox.Network.Switch,
 		vswitch.WithTapFDSocket(cfg.Sandbox.Network.TapFDSocket),
-	), log)
+	), log, mx)
 	if err := core.InstallUnits(ctx); err != nil {
 		return err
 	}
@@ -273,7 +274,6 @@ func runConductor(args []string, log *slog.Logger) error {
 	// Data-plane handler depends on proxy_mode: in-process proxy (internal),
 	// proxyForwarder to worker (external), or reject (off). External mode also
 	// starts the route-sync client that pushes the route table to each worker.
-	mx := metrics.New()
 	var proxyNS *netns.NetNS
 	if cfg.Proxy.Mode == config.ProxyInternal && cfg.Proxy.ProxyNetNS != "" {
 		proxyNS, err = openProxyNetNS(cfg.Proxy.ProxyNetNS)

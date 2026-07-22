@@ -62,13 +62,33 @@ type Table struct {
 
 	waitersMu sync.Mutex
 	waiters   map[string]chan struct{} // key = sid+"\x00"+name
+
+	mx Counter
 }
 
+// Counter is the narrow metrics surface Table needs. Add (unlike
+// internal/mmds.Counter's Inc-only surface) is safe here since Table only
+// ever runs in the proxy-master process against a real *metrics.M, never
+// through the worker-side metrics pipe.
+type Counter interface {
+	Inc(name string)
+	Add(name string, n int64)
+}
+
+type noopCounter struct{}
+
+func (noopCounter) Inc(string)        {}
+func (noopCounter) Add(string, int64) {}
+
 // New builds a Table. relay may be nil (relay endpoints unavailable).
-// maxTotal<=0 means unbounded. valueWaitTimeout<=0 defaults to 3s.
-func New(relay relayFetcher, maxTotal int, valueWaitTimeout time.Duration) *Table {
+// maxTotal<=0 means unbounded. valueWaitTimeout<=0 defaults to 3s. mx may
+// be nil (metrics off).
+func New(relay relayFetcher, maxTotal int, valueWaitTimeout time.Duration, mx Counter) *Table {
 	if valueWaitTimeout <= 0 {
 		valueWaitTimeout = 3 * time.Second
+	}
+	if mx == nil {
+		mx = noopCounter{}
 	}
 	return &Table{
 		relay:            relay,
@@ -76,6 +96,7 @@ func New(relay relayFetcher, maxTotal int, valueWaitTimeout time.Duration) *Tabl
 		valueWaitTimeout: valueWaitTimeout,
 		live:             map[string]map[string]routesync.MmdsEndpointEntry{},
 		waiters:          map[string]chan struct{}{},
+		mx:               mx,
 	}
 }
 
@@ -87,10 +108,32 @@ func New(relay relayFetcher, maxTotal int, valueWaitTimeout time.Duration) *Tabl
 // swap only happens atomically at the bookmark.
 func (t *Table) BeginMmdsSync(generation string) {
 	t.mu.Lock()
-	defer t.mu.Unlock()
 	t.available = false
 	t.stagingGen = generation
 	t.staging = map[string]map[string]routesync.MmdsEndpointEntry{}
+	t.mu.Unlock()
+	t.mx.Inc("mmds_sync_connected_total")
+}
+
+// Disconnected implements routesync.MmdsSink: called once the sync session
+// ends, for any reason. Endpoint secrets must not linger and serve stale
+// during a disconnected window, so every live/staged plaintext entry is
+// cleared and the table marked unavailable (503) until a fresh
+// BeginMmdsSync/MmdsBookmark pair completes — any request currently parked
+// in wait()/watch() is woken immediately rather than left to time out.
+func (t *Table) Disconnected() {
+	t.mu.Lock()
+	cleared := t.countLocked(t.live)
+	t.available = false
+	t.live = map[string]map[string]routesync.MmdsEndpointEntry{}
+	t.staging = nil
+	t.stagingGen = ""
+	t.mu.Unlock()
+	t.notifyAll()
+	t.mx.Inc("mmds_sync_disconnected_total")
+	for i := 0; i < cleared; i++ {
+		t.mx.Inc("mmds_cache_entries_completed_total")
+	}
 }
 
 // ApplyMmdsUpsert applies one endpoint's state to whichever table (staging
@@ -113,8 +156,11 @@ func (t *Table) ApplyMmdsUpsert(e routesync.MmdsEndpointEntry) {
 			return // stale
 		}
 		if e.Revision == existing.Revision && existing != e {
-			t.forceResyncLocked()
+			cleared := t.forceResyncLocked()
 			t.mu.Unlock()
+			for i := 0; i < cleared; i++ {
+				t.mx.Inc("mmds_cache_entries_completed_total")
+			}
 			return
 		}
 	} else if t.maxTotal > 0 && t.countLocked(target) >= t.maxTotal {
@@ -131,6 +177,13 @@ func (t *Table) ApplyMmdsUpsert(e routesync.MmdsEndpointEntry) {
 	byName[e.Name] = e
 	live := t.staging == nil
 	t.mu.Unlock()
+	// Only a direct live-table insert (outside a full-generation swap) is
+	// counted here — entries landing in staging aren't yet visible to
+	// Lookup, so they aren't "cached" from an external observer's
+	// perspective until MmdsBookmark's swap counts them.
+	if live && !exists {
+		t.mx.Inc("mmds_cache_entries_started_total")
+	}
 	if live {
 		t.notify(e.SandboxID, e.Name)
 	}
@@ -143,7 +196,11 @@ func (t *Table) ApplyMmdsDelete(k routesync.MmdsEndpointKey) {
 	if t.staging != nil {
 		target = t.staging
 	}
+	deleted := false
 	if byName, ok := target[k.SandboxID]; ok {
+		if _, ok := byName[k.Name]; ok {
+			deleted = true
+		}
 		delete(byName, k.Name)
 		if len(byName) == 0 {
 			delete(target, k.SandboxID)
@@ -151,6 +208,9 @@ func (t *Table) ApplyMmdsDelete(k routesync.MmdsEndpointKey) {
 	}
 	live := t.staging == nil
 	t.mu.Unlock()
+	if live && deleted {
+		t.mx.Inc("mmds_cache_entries_completed_total")
+	}
 	if live {
 		t.notify(k.SandboxID, k.Name)
 	}
@@ -162,25 +222,45 @@ func (t *Table) ApplyMmdsDelete(k routesync.MmdsEndpointKey) {
 // forced resync) is dropped rather than applied.
 func (t *Table) MmdsBookmark(generation string) {
 	t.mu.Lock()
-	if t.staging != nil && t.stagingGen == generation {
+	var oldCount, newCount int
+	swapped := t.staging != nil && t.stagingGen == generation
+	if swapped {
+		oldCount, newCount = t.countLocked(t.live), t.countLocked(t.staging)
 		t.live = t.staging
 		t.staging = nil
 		t.stagingGen = ""
 		t.available = true
 	}
 	t.mu.Unlock()
+	// A full-generation swap atomically replaces the entire live set, so —
+	// for the started/completed counter-pair convention — every prior live
+	// entry is counted as removed and every newly-live entry as added, even
+	// ones byte-identical across generations. Counter is Inc-only (mirrors
+	// internal/mmds.Counter, satisfied by the worker-side metrics pipe too,
+	// which has no Add), so bounded counts are walked one Inc at a time.
+	if swapped {
+		for i := 0; i < oldCount; i++ {
+			t.mx.Inc("mmds_cache_entries_completed_total")
+		}
+		for i := 0; i < newCount; i++ {
+			t.mx.Inc("mmds_cache_entries_started_total")
+		}
+	}
 	t.notifyAll() // every waiter re-checks now that the table may be available
 }
 
 // forceResyncLocked handles an equal-revision-mismatch protocol error:
 // clears both live and any in-progress staging and marks the table
 // unavailable, so every request 503s until the next full generation
-// completes. Caller must hold t.mu.
-func (t *Table) forceResyncLocked() {
+// completes. Caller must hold t.mu. Returns the live entry count cleared,
+// for the caller to report as completed after unlocking.
+func (t *Table) forceResyncLocked() (clearedLive int) {
+	clearedLive = t.countLocked(t.live)
 	t.available = false
 	t.live = map[string]map[string]routesync.MmdsEndpointEntry{}
 	t.staging = nil
 	t.stagingGen = ""
+	return clearedLive
 }
 
 func (t *Table) countLocked(m map[string]map[string]routesync.MmdsEndpointEntry) int {

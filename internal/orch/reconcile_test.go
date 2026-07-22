@@ -71,7 +71,7 @@ func TestReconcileCleansOrphanPoolRunners(t *testing.T) {
 		{Name: orphanUnit, ActiveState: "active"},
 		{Name: failedUnit, ActiveState: "failed"},
 	}}
-	o := New(cfg, st, lc, stubVS{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	o := New(cfg, st, lc, stubVS{}, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
 	if err := o.Reconcile(context.Background()); err != nil {
 		t.Fatal(err)
 	}

@@ -18,7 +18,7 @@ import (
 // redirect rejection, size bounds), per client.go's resolvePin doc comment.
 func newTestClient(t *testing.T, cfg Config) *Client {
 	t.Helper()
-	c := New(cfg)
+	c := New(cfg, nil)
 	c.resolvePin = func(_ context.Context, _ string) (net.IP, error) {
 		return net.ParseIP("127.0.0.1"), nil
 	}
@@ -249,7 +249,7 @@ func TestFetchInflightCapRejectsOverLimit(t *testing.T) {
 }
 
 func TestFetchRejectsIPLiteralURL(t *testing.T) {
-	c := New(testCfg())
+	c := New(testCfg(), nil)
 	res := c.Fetch(context.Background(), "k", "https://169.254.169.254/latest/creds", "X-Auth", "v")
 	if res.Status != http.StatusBadGateway {
 		t.Fatalf("Status = %d, want 502 (IP literal host rejected)", res.Status)
@@ -257,7 +257,7 @@ func TestFetchRejectsIPLiteralURL(t *testing.T) {
 }
 
 func TestFetchRejectsUserinfoQueryFragment(t *testing.T) {
-	c := New(testCfg())
+	c := New(testCfg(), nil)
 	for _, u := range []string{
 		"https://user:pass@example.com/",
 		"https://example.com/?q=1",
@@ -297,7 +297,7 @@ func TestFetchRejectsInvalidAuthHeaderName(t *testing.T) {
 // DNS step, is faked, so disallowedIP's rejection of a malicious DNS answer
 // runs unmodified.
 func TestFetchSSRFBlockedIPFromResolver(t *testing.T) {
-	c := New(testCfg())
+	c := New(testCfg(), nil)
 	c.lookupIPAddr = func(_ context.Context, _ string) ([]net.IPAddr, error) {
 		return []net.IPAddr{{IP: net.ParseIP("169.254.169.254")}}, nil // simulate a DNS answer resolving to the metadata IP
 	}

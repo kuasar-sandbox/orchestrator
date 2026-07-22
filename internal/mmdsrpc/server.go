@@ -19,6 +19,17 @@ type EndpointTable interface {
 	ServeRelay(ctx context.Context, sandboxID, name string) (status int, contentType string, body []byte, ok bool)
 }
 
+// Counter is the narrow metrics surface Server needs, mirroring
+// internal/mmds.Counter so this package does not depend on a concrete
+// metrics type.
+type Counter interface {
+	Inc(name string)
+}
+
+type noopCounter struct{}
+
+func (noopCounter) Inc(string) {}
+
 // Server is the master-side RPC handler for one connected worker — one
 // instance per accepted socketpair connection. It resolves
 // and serves each EndpointRequest against table, enforcing a per-connection
@@ -28,6 +39,7 @@ type Server struct {
 	table       EndpointTable
 	maxInflight int
 	log         *slog.Logger
+	mx          Counter
 
 	writeMu sync.Mutex
 
@@ -35,12 +47,16 @@ type Server struct {
 	inflight map[uint64]context.CancelFunc
 }
 
-// NewServer builds a Server. maxInflight<=0 defaults to 128.
-func NewServer(table EndpointTable, maxInflight int, log *slog.Logger) *Server {
+// NewServer builds a Server. maxInflight<=0 defaults to 128. mx may be nil
+// (metrics off).
+func NewServer(table EndpointTable, maxInflight int, log *slog.Logger, mx Counter) *Server {
 	if maxInflight <= 0 {
 		maxInflight = 128
 	}
-	return &Server{table: table, maxInflight: maxInflight, log: log, inflight: map[uint64]context.CancelFunc{}}
+	if mx == nil {
+		mx = noopCounter{}
+	}
+	return &Server{table: table, maxInflight: maxInflight, log: log, mx: mx, inflight: map[uint64]context.CancelFunc{}}
 }
 
 // Serve runs the request loop on conn until it errors (worker socket
@@ -55,6 +71,9 @@ func (s *Server) Serve(ctx context.Context, conn io.ReadWriteCloser) error {
 	for {
 		m, err := readFrame(conn)
 		if err != nil {
+			if sctx.Err() == nil {
+				s.mx.Inc(`mmds_worker_rpc_errors_total{reason="conn_error"}`)
+			}
 			return err
 		}
 		switch m.Type {
@@ -72,6 +91,7 @@ func (s *Server) handleRequest(ctx context.Context, conn io.ReadWriteCloser, id 
 	s.mu.Lock()
 	if _, dup := s.inflight[id]; dup {
 		s.mu.Unlock()
+		s.mx.Inc(`mmds_worker_rpc_errors_total{reason="duplicate_request_id"}`)
 		if s.log != nil {
 			s.log.Warn("mmdsrpc: duplicate request_id from worker; dropped", "request_id", id)
 		}
@@ -79,6 +99,7 @@ func (s *Server) handleRequest(ctx context.Context, conn io.ReadWriteCloser, id 
 	}
 	if len(s.inflight) >= s.maxInflight {
 		s.mu.Unlock()
+		s.mx.Inc(`mmds_worker_rpc_errors_total{reason="worker_inflight_limit"}`)
 		s.reply(conn, id, &EndpointResponse{ErrorCode: "worker_inflight_limit"})
 		return
 	}
@@ -91,6 +112,7 @@ func (s *Server) handleRequest(ctx context.Context, conn io.ReadWriteCloser, id 
 	}
 	s.inflight[id] = cancel
 	s.mu.Unlock()
+	s.mx.Inc("mmds_worker_rpc_inflight_started_total")
 
 	go func() {
 		defer func() {
@@ -98,6 +120,7 @@ func (s *Server) handleRequest(ctx context.Context, conn io.ReadWriteCloser, id 
 			delete(s.inflight, id)
 			s.mu.Unlock()
 			cancel()
+			s.mx.Inc("mmds_worker_rpc_inflight_completed_total")
 		}()
 		resp := s.resolve(rctx, req)
 		s.reply(conn, id, resp)

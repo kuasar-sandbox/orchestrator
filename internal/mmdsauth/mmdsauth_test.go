@@ -50,7 +50,7 @@ func TestLookupResolvesExactPath(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	a := New(st, nil, time.Second)
+	a := New(st, nil, time.Second, nil)
 	name, backend, found := a.Lookup(ctx, sb.ID, "/latest/meta-data/credentials")
 	if !found || name != "creds" || backend != store.MMDSBackendRelay {
 		t.Fatalf("Lookup = name=%q backend=%q found=%t", name, backend, found)
@@ -69,7 +69,7 @@ func TestServeStoreNeverConfiguredWaitsThenTimesOut(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	a := New(st, nil, 50*time.Millisecond)
+	a := New(st, nil, 50*time.Millisecond, nil)
 	start := time.Now()
 	_, _, _, present := a.ServeStore(ctx, sb.ID, "a")
 	if present {
@@ -89,7 +89,7 @@ func TestServeStorePutDuringWaitWakesImmediately(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	a := New(st, nil, 5*time.Second) // long timeout: the test fails if it's actually waited out
+	a := New(st, nil, 5*time.Second, nil) // long timeout: the test fails if it's actually waited out
 
 	done := make(chan struct{})
 	var value []byte
@@ -131,7 +131,7 @@ func TestServeStoreDeletedReturnsImmediately(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	a := New(st, nil, 2*time.Second)
+	a := New(st, nil, 2*time.Second, nil)
 	start := time.Now()
 	_, _, _, present := a.ServeStore(ctx, sb.ID, "a")
 	if present {
@@ -156,7 +156,7 @@ func TestServeStoreExpiredReturnsImmediately(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	a := New(st, nil, 2*time.Second)
+	a := New(st, nil, 2*time.Second, nil)
 	start := time.Now()
 	_, _, _, present := a.ServeStore(ctx, sb.ID, "a")
 	if present {
@@ -214,7 +214,7 @@ func TestServeRelayReturns503WhenRelayClientNil(t *testing.T) {
 	sb := testSandbox("sb-relay-nil")
 	endpointWithRelayConfig(t, st, sb, "a", "https://example.com/", "X-Auth")
 
-	a := New(st, nil, time.Second)
+	a := New(st, nil, time.Second, nil)
 	status, _, _, ok := a.ServeRelay(context.Background(), sb.ID, "a")
 	if !ok || status != http.StatusServiceUnavailable {
 		t.Fatalf("ServeRelay with nil relay = status=%d ok=%t, want 503/true", status, ok)
@@ -227,7 +227,7 @@ func TestServeRelayNeverConfiguredWaitsThenNotFound(t *testing.T) {
 	endpointWithRelayConfig(t, st, sb, "a", "https://example.com/", "X-Auth")
 
 	fake := &fakeRelayFetcher{}
-	a := New(st, fake, 50*time.Millisecond)
+	a := New(st, fake, 50*time.Millisecond, nil)
 	_, _, _, ok := a.ServeRelay(context.Background(), sb.ID, "a")
 	if ok {
 		t.Fatal("ServeRelay returned ok=true for a never-configured auth")
@@ -250,7 +250,7 @@ func TestServeRelayRevokedReturnsImmediately(t *testing.T) {
 	}
 
 	fake := &fakeRelayFetcher{}
-	a := New(st, fake, 2*time.Second)
+	a := New(st, fake, 2*time.Second, nil)
 	start := time.Now()
 	_, _, _, ok := a.ServeRelay(ctx, sb.ID, "a")
 	if ok {
@@ -274,7 +274,7 @@ func TestServeRelayConfiguredDispatchesFetchWithCorrectArgs(t *testing.T) {
 	}
 
 	fake := &fakeRelayFetcher{result: mmdsrelay.Result{Status: 200, ContentType: "application/json", Body: []byte(`{"ok":true}`)}}
-	a := New(st, fake, 2*time.Second)
+	a := New(st, fake, 2*time.Second, nil)
 	status, contentType, body, ok := a.ServeRelay(ctx, sb.ID, "creds")
 	if !ok || status != 200 || contentType != "application/json" || string(body) != `{"ok":true}` {
 		t.Fatalf("ServeRelay = status=%d contentType=%q body=%q ok=%t", status, contentType, body, ok)
@@ -299,7 +299,7 @@ func TestServeRelayCancelsInFlightFetchOnAuthNotify(t *testing.T) {
 	}
 
 	fake := &fakeRelayFetcher{block: make(chan struct{})} // Fetch blocks until ctx is cancelled
-	a := New(st, fake, 2*time.Second)
+	a := New(st, fake, 2*time.Second, nil)
 
 	done := make(chan mmdsrelay.Result, 1)
 	go func() {
