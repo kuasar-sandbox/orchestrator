@@ -61,8 +61,8 @@ func (v *MasterView) ApplyDelete(delete routesync.RouteDelete) {
 	}
 }
 
-func (v *MasterView) Bookmark() {
-	v.table.Bookmark()
+func (v *MasterView) Bookmark(fullSync bool) {
+	v.table.Bookmark(fullSync)
 	v.notify.Notify()
 }
 
