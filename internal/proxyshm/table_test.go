@@ -152,6 +152,48 @@ func TestFullSyncDoesNotRegressCurrentExecutionEvent(t *testing.T) {
 	}
 }
 
+func TestFullSyncResetsUnchangedRouteAuthorityRevision(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "routes.shm")
+	tbl, err := Create(path, 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tbl.Close()
+	current := routesync.RouteEntry{
+		SandboxID: "s1", NodeID: "n1", NodeEpoch: 7, RegistryGeneration: "g1", BindingDigest: "binding",
+		AuthorityRevision: 100, EventSeq: 2, Profile: "e2b", State: routesync.StateRunning,
+		AccessToken: "current",
+	}
+	tbl.BeginSync()
+	if err := tbl.Upsert(current); err != nil {
+		t.Fatal(err)
+	}
+	tbl.Bookmark(true)
+
+	tbl.BeginSync()
+	snapshot := current
+	snapshot.AuthorityRevision = 0
+	if err := tbl.Upsert(snapshot); err != nil {
+		t.Fatal(err)
+	}
+	tbl.Bookmark(true)
+	if got, ok := tbl.Lookup("s1"); !ok || got.AuthorityRevision != 0 {
+		t.Fatalf("full snapshot retained the previous authority revision: %+v ok=%v", got, ok)
+	}
+
+	delta := current
+	delta.AuthorityRevision = 1
+	delta.EventSeq = 3
+	delta.AccessToken = "new-authority"
+	if err := tbl.Upsert(delta); err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := tbl.Lookup("s1"); !ok || got.AuthorityRevision != 1 || got.EventSeq != 3 ||
+		got.AccessToken != "new-authority" {
+		t.Fatalf("new authority delta was rejected after full sync: %+v ok=%v", got, ok)
+	}
+}
+
 func TestManagedDeleteRequiresCurrentExecutionFence(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "routes.shm")
 	tbl, err := Create(path, 16)
