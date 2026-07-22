@@ -516,15 +516,19 @@ PY
 }
 
 choose_redirect_node_id() {
-    python3 - "http://127.0.0.1:$CONTROL_PORT/node-link/session" <<'PY'
+    local protocol_source="$REPO_ROOT/../internal/routesync/proto.go"
+    local protocol_version
+    protocol_version="$(sed -nE 's/^const Version = ([0-9]+)$/\1/p' "$protocol_source")"
+    [[ "$protocol_version" =~ ^[1-9][0-9]*$ ]] || fail "could not resolve node-link protocol version from $protocol_source"
+    python3 - "http://127.0.0.1:$CONTROL_PORT/node-link/session" "$protocol_version" <<'PY'
 import json, struct, sys, urllib.request
-url = sys.argv[1]
+url, protocol_version = sys.argv[1], int(sys.argv[2])
 for idx in range(1, 80):
     node_id = "real-node-redirect-%02d" % idx
     msg = {
         "type": "node_register",
         "node_register": {
-            "version": 3,
+            "version": protocol_version,
             "node_id": node_id,
             "labels": {"pool": "probe"},
             "data_endpoint": "127.0.0.1:1",
