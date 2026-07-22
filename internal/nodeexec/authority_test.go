@@ -206,6 +206,22 @@ type recordBarrierJournal struct {
 	ready   chan struct{}
 }
 
+type failingFinalizeJournal struct {
+	*store.Store
+	err error
+}
+
+func (j *failingFinalizeJournal) FinalizeNodeWorkflow(
+	ctx context.Context,
+	kind clusterstate.ExecutionKind,
+	objectID, bindingDigest string,
+) error {
+	if j.err != nil {
+		return j.err
+	}
+	return j.Store.FinalizeNodeWorkflow(ctx, kind, objectID, bindingDigest)
+}
+
 func (j *recordBarrierJournal) RecordSandboxWorkflow(
 	ctx context.Context,
 	dispatch nodeexec.DispatchRecord,
@@ -725,6 +741,51 @@ func TestAuthorityFailsClosedWhenActiveControllerStateIsMissing(t *testing.T) {
 	record, err := st.GetNodeWorkflow(context.Background(), clusterstate.ExecutionKindSandbox, "sandbox-missing")
 	if err != nil || record.AdmissionState != nodeexec.AdmissionAdmitted {
 		t.Fatalf("missing state mutated journal = %+v, %v", record, err)
+	}
+}
+
+func TestFinalizeRemovesAdmissionBeforePersistingCompactionMarker(t *testing.T) {
+	st := authorityStore(t)
+	command := authorityCommand(t, clusterstate.ExecutionKindSandbox, "sandbox-finalize-order")
+	dispatch, err := nodeexec.DispatchRecordFromCommand(command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, err := st.RecordSandboxWorkflow(context.Background(), dispatch, nodeexec.AdmissionDecision{
+		State: nodeexec.AdmissionRejected, Result: clusterstate.DispatchDefinitiveReject, Reason: "rejected",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sandbox := &sandboxAdmissionFake{prepared: map[string]nodectl.PreparedAdmissionResult{
+		record.ObjectID: {
+			SandboxID: record.ObjectID, DemandDigest: record.DemandDigest, State: nodectl.PreparedReleased,
+		},
+	}, wake: make(chan struct{})}
+	injected := errors.New("injected workflow finalization failure")
+	journal := &failingFinalizeJournal{Store: st, err: injected}
+	authority := newAuthority(t, journal, sandbox)
+	if err := authority.FinalizeWorkflow(
+		context.Background(), record.Kind, record.ObjectID, record.BindingDigest,
+	); !errors.Is(err, injected) {
+		t.Fatalf("first finalization error = %v", err)
+	}
+	if _, found := sandbox.prepared[record.ObjectID]; found {
+		t.Fatal("Admission survived journal finalization failure")
+	}
+	stored, err := st.GetNodeWorkflow(context.Background(), record.Kind, record.ObjectID)
+	if err != nil || stored == nil || stored.WorkflowFinalized {
+		t.Fatalf("workflow after injected failure = %+v, %v", stored, err)
+	}
+	journal.err = nil
+	if err := authority.FinalizeWorkflow(
+		context.Background(), record.Kind, record.ObjectID, record.BindingDigest,
+	); err != nil {
+		t.Fatal(err)
+	}
+	stored, err = st.GetNodeWorkflow(context.Background(), record.Kind, record.ObjectID)
+	if err != nil || stored == nil || !stored.WorkflowFinalized {
+		t.Fatalf("workflow after retry = %+v, %v", stored, err)
 	}
 }
 

@@ -240,6 +240,43 @@ func TestConcurrentBuildAdmissionDoesNotOversubscribe(t *testing.T) {
 	}
 }
 
+func TestRegisteredBuildIsLaunchableAfterRestart(t *testing.T) {
+	st := testStore(t)
+	dispatch := workflowDispatch(t, clusterstate.ExecutionKindBuild, "build-registered", placement.BuildDemand{Slots: 1})
+	if _, err := st.PrepareBuildWorkflow(
+		context.Background(), dispatch, workflowBuild(dispatch.ObjectID), nodeexec.BuildCapacity{Slots: 1, QueueLimit: 4}, "",
+	); err != nil {
+		t.Fatal(err)
+	}
+	launchable, err := st.LaunchableNodeWorkflows(
+		context.Background(), clusterstate.ExecutionKindBuild, dispatch.NodeID, dispatch.NodeEpoch, "", 10,
+	)
+	if err != nil || len(launchable) != 1 || launchable[0].ObjectID != dispatch.ObjectID ||
+		launchable[0].ObjectState != string(types.BuildRegistered) {
+		t.Fatalf("launchable registered Build = %+v, %v", launchable, err)
+	}
+}
+
+func TestCompactionRemovesFinalizedPriorNodeEpoch(t *testing.T) {
+	st := testStore(t)
+	dispatch := workflowDispatchEpoch(t, clusterstate.ExecutionKindSandbox, "sandbox-old-epoch", placement.BuildDemand{}, 6)
+	record, err := st.RecordSandboxWorkflow(context.Background(), dispatch, nodeexec.AdmissionDecision{
+		State: nodeexec.AdmissionRejected, Result: clusterstate.DispatchDefinitiveReject, Reason: "rejected",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.FinalizeNodeWorkflow(context.Background(), record.Kind, record.ObjectID, record.BindingDigest); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CompactFinalizedNodeWorkflows(context.Background(), record.NodeID, 7, 1); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := st.GetNodeWorkflow(context.Background(), record.Kind, record.ObjectID); err != nil || got != nil {
+		t.Fatalf("prior-epoch workflow after compaction = %+v, %v", got, err)
+	}
+}
+
 func TestBuildAdmissionRollsBackJournalWhenBusinessObjectCannotPersist(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()
@@ -340,13 +377,24 @@ func TestBuildLifecycleIsNodeLocalAndTerminalStateReleasesCapacity(t *testing.T)
 		t.Fatal(err)
 	}
 	build.PersistID = "e2b-img-artifact"
+	build.Kind = types.KindSnp
+	build.StartCmd = "start-v1"
+	build.ReadyCmd = "ready-v1"
 	if _, err := st.CommitClusterBuildState(ctx, build, nodeexec.EventUpdate{
 		State: string(types.BuildReady), ArtifactRef: build.PersistID,
 	}); err != nil {
 		t.Fatal(err)
 	}
+	conflict := cloneBuild(build)
+	conflict.StartCmd = "start-v2"
+	if _, err := st.CommitClusterBuildState(ctx, conflict, nodeexec.EventUpdate{
+		State: string(types.BuildReady), ArtifactRef: build.PersistID,
+	}); !errors.Is(err, ErrNodeWorkflowConflict) {
+		t.Fatalf("duplicate BUILD_READY runtime rewrite error = %v", err)
+	}
 	stored, err := st.GetBuild(ctx, first.ObjectID)
 	if err != nil || stored.Status != types.BuildReady || stored.PersistID != "e2b-img-artifact" ||
+		stored.Kind != types.KindSnp || stored.StartCmd != "start-v1" || stored.ReadyCmd != "ready-v1" ||
 		stored.TemplateID != "transient-"+first.ObjectID ||
 		stored.Metadata[clusterstate.ObjectMetadataKey] != first.OpaqueBinding || stored.Metadata["user"] != "kept" {
 		t.Fatalf("stored Build = %+v, %v", stored, err)
