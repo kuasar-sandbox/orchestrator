@@ -15,6 +15,7 @@ package sandboxcfg
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"strings"
@@ -34,7 +35,21 @@ const (
 	NsMounts   = "kuasar-sandbox.mounts"
 	NsFiles    = "kuasar-sandbox.files"
 	NsMetadata = "kuasar-sandbox.metadata"
+	NsRestore  = "kuasar-sandbox.restore"
 )
+
+// configHeaderNamespaces is the shared HTTP-header-to-metadata contract used by
+// both the direct node API and cluster ingress.
+var configHeaderNamespaces = []struct{ header, metaKey string }{
+	{"X-Kuasar-Sandbox-Resource", NsResource},
+	{"X-Kuasar-Sandbox-Network", NsNetwork},
+	{"X-Kuasar-Sandbox-Launch", NsLaunch},
+	{"X-Kuasar-Sandbox-Init", NsInit},
+	{"X-Kuasar-Sandbox-Mounts", NsMounts},
+	{"X-Kuasar-Sandbox-Files", NsFiles},
+	{"X-Kuasar-Sandbox-Metadata", NsMetadata},
+	{"X-Kuasar-Sandbox-Restore", NsRestore},
+}
 
 // NetworkSpec is the orchestrator's LOGICAL network model — broader than the guest
 // config.NetworkConfig. hostname/nexthop flow into the guest network; inner_ip +
@@ -56,6 +71,12 @@ type NetworkSpec struct {
 type ResourceSpec struct {
 	Capacity    *rtconfig.CapacityConfig    `json:"capacity,omitempty" yaml:"capacity,omitempty"`
 	Allocatable *rtconfig.AllocatableConfig `json:"allocatable,omitempty" yaml:"allocatable,omitempty"`
+}
+
+// RestoreSpec is the tenant-controllable policy for this sandbox's restore.
+// Node-owned restore inputs, such as file_refs, deliberately are not exposed here.
+type RestoreSpec struct {
+	Prefetch string `json:"prefetch,omitempty"`
 }
 
 // TapFD is the node-managed tapfd transport rendered into runtime config.
@@ -86,6 +107,7 @@ type SandboxSpec struct {
 	Mounts   []rtconfig.MountConfig
 	Files    []rtconfig.FileConfig
 	Metadata map[string]string // -> SANDBOX_CONFIG.metadata passthrough (e.g. e2b.start_cmd)
+	Restore  RestoreSpec
 }
 
 // ParseSpec decodes the kuasar-sandbox.<ns> metadata keys. Values are JSON; we parse
@@ -130,10 +152,75 @@ func ParseSpec(meta map[string]string) (SandboxSpec, error) {
 	if err := dec(NsMetadata, &s.Metadata); err != nil {
 		return s, err
 	}
+	if rawValue, present := meta[NsRestore]; present {
+		raw := strings.TrimSpace(rawValue)
+		if raw == "" {
+			return s, fmt.Errorf("sandboxcfg: metadata[%q] must be a JSON object", NsRestore)
+		}
+		restore, err := parseRestoreSpec(raw)
+		if err != nil {
+			return s, err
+		}
+		s.Restore = restore
+	}
 	if err := s.Network.validate(); err != nil {
 		return s, err
 	}
 	return s, nil
+}
+
+// parseRestoreSpec enforces the public restore namespace as one strict JSON
+// object. Unlike the older namespaces, it does not accept YAML, unknown fields,
+// null, or concatenated/trailing JSON values.
+func parseRestoreSpec(raw string) (RestoreSpec, error) {
+	dec := json.NewDecoder(strings.NewReader(raw))
+	dec.DisallowUnknownFields()
+
+	// RawMessage lets us distinguish an omitted prefetch from JSON null and
+	// reject every non-string JSON type explicitly.
+	var wire *struct {
+		Prefetch json.RawMessage `json:"prefetch"`
+	}
+	if err := dec.Decode(&wire); err != nil {
+		return RestoreSpec{}, fmt.Errorf("sandboxcfg: metadata[%q] is not a valid restore JSON object: %w", NsRestore, err)
+	}
+	if wire == nil {
+		return RestoreSpec{}, fmt.Errorf("sandboxcfg: metadata[%q] must be a JSON object, not null", NsRestore)
+	}
+	if err := dec.Decode(&struct{}{}); err != io.EOF {
+		if err == nil {
+			return RestoreSpec{}, fmt.Errorf("sandboxcfg: metadata[%q] must contain exactly one JSON object", NsRestore)
+		}
+		return RestoreSpec{}, fmt.Errorf("sandboxcfg: metadata[%q] has trailing content: %w", NsRestore, err)
+	}
+	// encoding/json matches struct fields case-insensitively. Enforce the public
+	// spelling exactly so variants such as "Prefetch" do not become aliases.
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(raw), &fields); err != nil {
+		return RestoreSpec{}, fmt.Errorf("sandboxcfg: metadata[%q] is not a valid restore JSON object: %w", NsRestore, err)
+	}
+	for name := range fields {
+		if name != "prefetch" {
+			return RestoreSpec{}, fmt.Errorf("sandboxcfg: metadata[%q] contains unknown field %q", NsRestore, name)
+		}
+	}
+
+	var spec RestoreSpec
+	if len(wire.Prefetch) != 0 {
+		var value any
+		if err := json.Unmarshal(wire.Prefetch, &value); err != nil {
+			return RestoreSpec{}, fmt.Errorf("sandboxcfg: metadata[%q].prefetch must be a JSON string: %w", NsRestore, err)
+		}
+		prefetch, ok := value.(string)
+		if !ok {
+			return RestoreSpec{}, fmt.Errorf("sandboxcfg: metadata[%q].prefetch must be a JSON string", NsRestore)
+		}
+		spec.Prefetch = prefetch
+	}
+	if _, err := rtconfig.ParsePrefetchMode(spec.Prefetch); err != nil {
+		return RestoreSpec{}, fmt.Errorf("sandboxcfg: metadata[%q]: %w", NsRestore, err)
+	}
+	return spec, nil
 }
 
 // capacityJSON is the canonical snake_case JSON shape for the resource capacity,
@@ -176,6 +263,27 @@ func SetCapacity(meta map[string]string, cpu, memoryMiB int) map[string]string {
 // create's config namespaces over a template's. Returns nil when both are empty.
 func MergeMetadata(base, over map[string]string) map[string]string {
 	return mergeStr(base, over)
+}
+
+// MergeConfigHeaders normalizes X-Kuasar-Sandbox-<Ns> request headers into
+// namespaced metadata. A non-empty header value overrides metadata of the same
+// namespace. headerValue is normally http.Header.Get; taking a function keeps the
+// shared request contract independent of a specific HTTP server implementation.
+func MergeConfigHeaders(meta map[string]string, headerValue func(string) string) map[string]string {
+	if headerValue == nil {
+		return meta
+	}
+	for _, mapping := range configHeaderNamespaces {
+		value := headerValue(mapping.header)
+		if value == "" {
+			continue
+		}
+		if meta == nil {
+			meta = map[string]string{}
+		}
+		meta[mapping.metaKey] = value
+	}
+	return meta
 }
 
 // validate format-checks the tenant network fields (CIDR / IP / MAC).
@@ -283,6 +391,11 @@ func (p Params) build() (*rtconfig.SandboxConfig, error) {
 	// gets the overlay chain from the snapshot.
 	if p.RestoreRef() == "" && p.OverlayDiffTpl != "" {
 		c.Boot.Root.Overlay.DiffTemplate = "file://" + p.OverlayDiffTpl
+	}
+	// Restore policy is request-scoped and only meaningful when sandbox-ctl will
+	// actually restore. A cold boot must not render it into SANDBOX_CONFIG.
+	if p.RestoreRef() != "" {
+		c.Restore.Prefetch = p.Spec.Restore.Prefetch
 	}
 
 	// --- network (guest side) ---

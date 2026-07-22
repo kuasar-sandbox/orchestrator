@@ -95,7 +95,7 @@ router 不参与 registry 成员健康检测,不订阅 route,也不订阅 node_l
 
 | 请求 | 必需身份 | 行为 |
 |---|---|---|
-| create | group + route_key(可缺省生成) | 定位 route owner 后调用 `ReserveSandbox` |
+| create | group + route_key(可缺省生成) | 归一化 body metadata + `X-Kuasar-Sandbox-*` Header,定位 route owner 后携 create config 调用 `ReserveSandbox` |
 | connect/resume | group + route_key / sandbox_id | 定位 route owner 后调用 `ReserveSandbox` 恢复 |
 | kill | group + route_key + sandbox_id | 定位 route owner 后由 registry 经 node-link 下发 `CmdDelete` |
 | get/connect/pause/timeout/export | group + route_key + sandbox_id | route owner 解析 node 后转发到 node 控制面 |
@@ -105,6 +105,17 @@ router 不参与 registry 成员健康检测,不订阅 route,也不订阅 node_l
 | build status/files | group + build_id | 定位 build node 后转发 |
 
 `route_key` 是稳定会话身份,`sandbox_id` 是当前实例身份。cluster 内部总是同时维护二者。
+
+create body 的 `metadata` 是 `map[string]string`;Header 在 router 边缘归一化为同名
+`kuasar-sandbox.<ns>` key,并覆盖 body 中的同名值。比如单 sandbox 恢复预取:
+
+```http
+X-Kuasar-Sandbox-Restore: {"prefetch":"memory"}
+```
+
+router 在 Reserve 前校验命名空间,非法 `restore` JSON/枚举/字段直接回 **400**。route-link
+重试复用同一份 create config;placer 按 `group sandbox_config ⊕ create config` 合并(create 胜)。
+已有 ready/paused sandbox 的 Reserve 只返回或恢复原实例,新的 create config 不修改其持久策略。
 
 ## 6. 缓存模型
 
@@ -182,7 +193,7 @@ router 校验 API key 与 group 关系时调用 route owner `verify-key`;route o
 
 | 操作 | 行为 |
 |---|---|
-| create/connect | 调 Reserve;READY 后返回 |
+| create/connect | 调 Reserve;新建时携请求级 create config,已有实例只按原配置 connect;READY 后返回 |
 | kill | route owner 精确匹配 group + route_key + sandbox_id,经 node-link 下发 `CmdDelete` |
 | get/connect/pause/timeout/export | route owner 解析 node 后转发 |
 | get/list | 读 group route_link |

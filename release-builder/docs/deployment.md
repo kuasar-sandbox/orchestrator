@@ -298,6 +298,10 @@ cluster-ctl placer
   `auth_key`、沙箱初始化配置、镜像仓库、模板、nodeSelectors)。registry 不实现 group provider,
   只在 Reserve/Place 冷路径把请求转给 ready placer。密钥分发是 create/build 前置条件,drop 或租约过期
   不影响已经运行的 sandbox。
+- **单 sandbox restore Prefetch**:不是 node/cluster 部署开关。调用方仅对目标 create 请求携带
+  `X-Kuasar-Sandbox-Restore: {"prefetch":"memory"}` 或等价 `kuasar-sandbox.restore` metadata;
+  create/template/group 都未声明时关闭。group/template 可提供实例默认,其值在创建时复制为每实例
+  策略;create 的 `off`/`memory` 按命名空间覆盖,不会形成节点或集群统一开关。
 - **成员关系**:registry 成员表由版本化配置分发,通过信号或 API reload。`memberlist` 复用 HTTP 控制面,
   只做 failure detection 和 meta 传播,不维护成员清单,不参与 `LocateN` 分片计算。
 - **成员变更**:registry 可同时持有 active / next membership。受影响的 group/node 逻辑 owner set 为
@@ -480,7 +484,7 @@ Cluster Control Plane:  registry 自聚簇(N 副本,按 group/node 逻辑分片)
 | `cache-ctl shard` | `--config <path>` | `listen: 0.0.0.0:7070`(对外服务)| 源仓 `accelerator/docs/cache.md` §3.3;发布包 `docs/cache.md` |
 | `node-ctl conductor serve(resource_listen)` | `/etc/node-ctl/conductor.yaml` 的内联 `resource_listen` 块 | `socket: /run/sandbox-resource.sock` | 源仓 `orchestrator/docs/node-resource.md` §3;发布包 `docs/node-resource.md` |
 | `cluster-ctl registry` | `--config /etc/cluster-ctl/registry.yaml` | `member.id/listen`;`membership.active/versions[].members[].advertise/node_advertise/owners`;`node_link`、`route_link`、`node_list`、`placer_link` | 源仓 `orchestrator/docs/cluster.md`;发布包 `docs/cluster.md` |
-| `cluster-ctl router` | `--config /etc/cluster-ctl/router.yaml` | `registry.bootstrap` 指向 registry 控制面;router `:443`(LB 后 N 副本);请求必须带 `X-Kuasar-Sandbox-Group` | 源仓 `orchestrator/docs/cluster-router.md`;发布包 `docs/cluster-router.md` |
+| `cluster-ctl router` | `--config /etc/cluster-ctl/router.yaml` | `registry.bootstrap` 指向 registry 控制面;router `:443`(LB 后 N 副本);请求必须带 `X-Kuasar-Sandbox-Group`;单实例 Prefetch 按需带 `X-Kuasar-Sandbox-Restore`,无统一开关 | 源仓 `orchestrator/docs/cluster-router.md`;发布包 `docs/cluster-router.md` |
 | `cluster-ctl placer` | `--config /etc/cluster-ctl/placer.yaml` | `placer.id/listen/advertise/memberlist_label`;`registry.bootstrap`;`import_groups[]`;`placement` | 源仓 `orchestrator/docs/cluster-placer.md`;发布包 `docs/cluster-placer.md` |
 | `sandbox-ctl run` | `--config <path>`(`SANDBOX_CONFIG`)+ `--manifest-config <path>`(`MANIFEST_CONFIG`)| **per-sandbox**,由 `node-ctl` 生成,落在 `/run/sandbox/<sid>/` | 源仓 `sandboxer/docs/sandbox.md` §3;发布包 `docs/sandbox.md` |
 | `manifest-ctl` | `--manifest-config <path>`(`MANIFEST_CONFIG`)| 与 `sandbox-ctl` 共享格式;只连本机 store-ctl + cache-ctl | 源仓 `accelerator/docs/manifest.md` §3;发布包 `docs/manifest.md` |

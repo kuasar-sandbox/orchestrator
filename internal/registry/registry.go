@@ -438,6 +438,15 @@ func (r *Registry) ReserveSandbox(ctx context.Context, group, routeKey string, c
 		}
 		// Definitive node loss: fall through to re-place (dead-node sweep also resets it).
 	}
+	// A repeated create for an existing route is an idempotent lookup/resume, not
+	// a configuration update. If a READY route must be re-placed, retain the
+	// effective config recorded by its original create; PAUSED follows the same
+	// rule if it ever has to fall back from its normal same-node connect path.
+	effectiveCreateConfig := createConfig
+	preserveExistingConfig := found && (rec.State == StateReady || rec.State == StatePaused || rec.State == StateReserved)
+	if preserveExistingConfig {
+		effectiveCreateConfig = cloneStringMap(rec.Config)
+	}
 
 	key := flightKey(group, routeKey)
 	r.mu.Lock()
@@ -445,7 +454,7 @@ func (r *Registry) ReserveSandbox(ctx context.Context, group, routeKey string, c
 		r.mu.Unlock()
 		return waitCall(ctx, call)
 	}
-	call := &reserveCall{done: make(chan struct{}), group: group, routeKey: routeKey, orig: rec, found: found, createConfig: createConfig}
+	call := &reserveCall{done: make(chan struct{}), group: group, routeKey: routeKey, orig: rec, found: found, createConfig: effectiveCreateConfig}
 	r.inflight[key] = call
 	r.mu.Unlock()
 	defer func() {
@@ -454,7 +463,7 @@ func (r *Registry) ReserveSandbox(ctx context.Context, group, routeKey string, c
 		r.mu.Unlock()
 	}()
 
-	if err := r.startReserve(ctx, group, routeKey, rec, rev, found, createConfig); err != nil {
+	if err := r.startReserve(ctx, group, routeKey, rec, rev, found, effectiveCreateConfig, preserveExistingConfig); err != nil {
 		r.finish(key, nil, err)
 		if errors.Is(err, errNodeSandboxIDConflict) {
 			r.rollbackReserveRetainingOwnership(group, routeKey, rec, found)
@@ -551,7 +560,7 @@ func (r *Registry) deleteSandboxAtRevision(ctx context.Context, group, routeKey 
 // startReserve drives the placement + command for the leader of a single-flight.
 // It does not wait — the channel reader signals completion when the node reports
 // the sandbox running (finish, via applyRoute).
-func (r *Registry) startReserve(ctx context.Context, group, routeKey string, rec *SandboxRecord, rev int64, found bool, createConfig map[string]string) error {
+func (r *Registry) startReserve(ctx context.Context, group, routeKey string, rec *SandboxRecord, rev int64, found bool, createConfig map[string]string, preserveExistingConfig bool) error {
 	// PAUSED: resume on the same node (no placement).
 	if found && rec.State == StatePaused && rec.NodeID != "" {
 		if r.nodeOwner == nil {
@@ -593,14 +602,14 @@ func (r *Registry) startReserve(ctx context.Context, group, routeKey string, rec
 		copy := *rec
 		replaceReady = &copy
 	}
-	return r.placeAndCreate(ctx, group, routeKey, createConfig, replaceReady)
+	return r.placeAndCreate(ctx, group, routeKey, createConfig, replaceReady, preserveExistingConfig)
 }
 
 // placeAndCreate places a node and sends the create command, CASing the RESERVED
 // record. node_list is only a catalog: the selected node owner validates its
 // live connection before commit. An unusable candidate is excluded from the next
 // placement request so stale catalog entries cannot prevent a live alternative.
-func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, createConfig map[string]string, replaceReady *SandboxRecord) error {
+func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, createConfig map[string]string, replaceReady *SandboxRecord, preserveExistingConfig bool) error {
 	excluded := placementExclusions{}
 	casConflicts := 0
 	var lastFailure error
@@ -615,9 +624,18 @@ func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, c
 		if curFound && cur.State == StateReady && !sameSandboxGeneration(cur, replaceReady) {
 			return nil // a concurrent replacement already won; the running route finishes the Reserve
 		}
+		requestConfig := createConfig
+		freezeConfig := preserveExistingConfig
+		if curFound && cur.State == StateReserved && !preserveExistingConfig {
+			// A competing owner may have won the first CAS. Preserve that
+			// request's already-materialized per-sandbox config if this caller
+			// has to recover the stranded reservation.
+			requestConfig = cloneStringMap(cur.Config)
+			freezeConfig = true
+		}
 		sid := "sb-" + newID()
 		placement, perr := r.placer.Place(ctx, PlaceRequest{
-			Group: group, RouteKey: routeKey, SandboxID: sid, Config: createConfig,
+			Group: group, RouteKey: routeKey, SandboxID: sid, Config: requestConfig,
 			ExcludeNodeIDs: excluded.values(),
 		})
 		if perr != nil {
@@ -629,7 +647,15 @@ func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, c
 		if placement == nil || placement.NodeID == "" {
 			return ErrNoNode
 		}
-		metadata, err := clusterstate.WithObjectLocation(placement.Config, clusterstate.ObjectLocation{Group: group, RouteKey: routeKey})
+		// Placement may re-evaluate group defaults. That is correct for a new
+		// sandbox, but a READY route being replaced after node loss must retain
+		// the exact effective config captured by its original create, including
+		// the absence of keys added to the group later.
+		effectiveConfig := placement.Config
+		if freezeConfig {
+			effectiveConfig = cloneStringMap(requestConfig)
+		}
+		metadata, err := clusterstate.WithObjectLocation(effectiveConfig, clusterstate.ObjectLocation{Group: group, RouteKey: routeKey})
 		if err != nil {
 			return err
 		}
@@ -659,7 +685,7 @@ func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, c
 		reserved := &SandboxRecord{
 			Group: group, RouteKey: routeKey, SID: sid, State: StateReserved, NodeID: nodeID,
 			TemplateID: placement.TemplateRef, AccessToken: placement.AccessToken,
-			TargetPort: placement.TargetPort,
+			TargetPort: placement.TargetPort, Config: cloneStringMap(effectiveConfig),
 		}
 		reservedRev, ok, cerr := r.stores.CASSandbox(ctx, reserved, expect)
 		if cerr != nil {
@@ -869,6 +895,7 @@ func (r *Registry) tryApplyLiveRoute(ctx context.Context, nodeID string, e *rout
 	if rec.TargetPort == 0 {
 		rec.TargetPort = cur.TargetPort
 	}
+	rec.Config = cloneStringMap(cur.Config)
 	if _, ok, err := r.stores.CASSandbox(ctx, rec, rev); err != nil || !ok {
 		if transientRouteRead(err) {
 			return false

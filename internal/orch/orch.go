@@ -125,6 +125,17 @@ func (o *Orchestrator) StartRunPools(ctx context.Context) error {
 
 // --- api.Core ---
 
+// validateSandboxMetadata keeps tenant config validation at the lifecycle
+// boundary, before a request can create host resources or persist an object.
+// ParseSpec is the single schema/format authority shared with config rendering;
+// wrapping its error lets every API lifecycle surface report a client error.
+func validateSandboxMetadata(meta map[string]string) error {
+	if _, err := sandboxcfg.ParseSpec(meta); err != nil {
+		return fmt.Errorf("%w: %v", api.ErrBadRequest, err)
+	}
+	return nil
+}
+
 func (o *Orchestrator) Create(ctx context.Context, req api.CreateReq) (*types.Sandbox, error) {
 	if req.TimeoutSec <= 0 {
 		req.TimeoutSec = o.cfg.Sandbox.TimeoutSec // default TTL (sandbox.timeout_sec)
@@ -148,14 +159,6 @@ func (o *Orchestrator) Create(ctx context.Context, req api.CreateReq) (*types.Sa
 			return nil, err
 		}
 	}
-	id, err := uuid.NewV7()
-	if err != nil {
-		return nil, fmt.Errorf("orch: new id: %w", err)
-	}
-	sid := id.String()
-	envdTok, _ := keys.MintToken()
-	trafTok, _ := keys.MintToken()
-
 	// Layer the template's declared config (builds.metadata_json) under the create's
 	// own config — create wins per namespace. Best-effort: a self-describing or
 	// foreign template may have no local build record (then it's just the create's).
@@ -163,6 +166,18 @@ func (o *Orchestrator) Create(ctx context.Context, req api.CreateReq) (*types.Sa
 	if tb := o.templateBuild(ctx, req.APIKey, req.TemplateID); tb != nil && len(tb.Metadata) > 0 {
 		meta = sandboxcfg.MergeMetadata(tb.Metadata, req.Metadata)
 	}
+	// Validate the effective template ⊕ create config before launch creates
+	// directories, attaches a port, allocates a runner, or writes a sandbox row.
+	if err := validateSandboxMetadata(meta); err != nil {
+		return nil, err
+	}
+	id, err := uuid.NewV7()
+	if err != nil {
+		return nil, fmt.Errorf("orch: new id: %w", err)
+	}
+	sid := id.String()
+	envdTok, _ := keys.MintToken()
+	trafTok, _ := keys.MintToken()
 
 	sb := &types.Sandbox{
 		ID:                 sid,

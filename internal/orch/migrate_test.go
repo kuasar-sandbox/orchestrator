@@ -15,6 +15,7 @@ import (
 
 	"github.com/kuasar-sandbox/orchestrator/internal/apikey"
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
+	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
@@ -46,7 +47,9 @@ func TestExportImportRoundTrip(t *testing.T) {
 		ID: sid, TemplateID: "e2b-snp-" + strings.Repeat("a", 64), State: types.StatePaused,
 		ManifestKey: mk, SnapshotRef: "manifest://" + strings.Repeat("b", 64),
 		RunDir: dir + "/run/" + sid, BaseDir: dir + "/lib/" + sid,
-		Env: map[string]string{"FOO": "bar"}, Metadata: map[string]string{"k": "v"},
+		Env: map[string]string{"FOO": "bar"}, Metadata: map[string]string{
+			"k": "v", sandboxcfg.NsRestore: `{"prefetch":"memory"}`,
+		},
 		CreatedUnix: 1, EnvdAccessToken: "source-envd-token", TrafficAccessToken: "source-traffic-token",
 	}
 	if err := o.st.Put(ctx, sb); err != nil {
@@ -92,6 +95,9 @@ func TestExportImportRoundTrip(t *testing.T) {
 	got, _ := o.st.Get(ctx, imported)
 	if got == nil || got.State != types.StatePaused || got.Env["FOO"] != "bar" || got.SnapshotRef != sb.SnapshotRef {
 		t.Fatalf("imported row wrong: %+v", got)
+	}
+	if got.Metadata[sandboxcfg.NsRestore] != `{"prefetch":"memory"}` {
+		t.Fatalf("migration lost restore metadata: %+v", got.Metadata)
 	}
 	if got.EnvdAccessToken == "" || got.TrafficAccessToken == "" ||
 		got.EnvdAccessToken == sb.EnvdAccessToken || got.TrafficAccessToken == sb.TrafficAccessToken {

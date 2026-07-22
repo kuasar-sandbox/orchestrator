@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/clusterclient"
+	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
@@ -125,6 +126,55 @@ func TestReserveBuildRequestCarriesStableIDsAcrossRouteLinkRetry(t *testing.T) {
 	}
 	if res.Profile != types.ProfileBare {
 		t.Fatalf("reserve profile=%q, want %q", res.Profile, types.ProfileBare)
+	}
+}
+
+func TestReserveSandboxRequestCarriesStableConfigAcrossRouteLinkRetry(t *testing.T) {
+	var bodies []string
+	transport := func(status int, response string) *http.Client {
+		return &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			body, err := io.ReadAll(req.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			bodies = append(bodies, string(body))
+			if got := req.Header.Get("Content-Type"); got != "application/json" {
+				t.Fatalf("Content-Type=%q, want application/json", got)
+			}
+			return textResponse(status, response), nil
+		})}
+	}
+	first := transport(http.StatusServiceUnavailable, "try next owner")
+	second := transport(http.StatusOK, `{"node_id":"n1","sid":"sb-1","access_token":"tok","data_endpoint":"10.0.0.1:1"}`)
+	rt := &Router{routeRegistry: routeRegistryFunc(func(context.Context, string) ([]clusterclient.Endpoint, error) {
+		return []clusterclient.Endpoint{
+			{MemberID: "r1", BaseURL: "http://r1", Client: first},
+			{MemberID: "r2", BaseURL: "http://r2", Client: second},
+		}, nil
+	})}
+	config := map[string]string{
+		sandboxcfg.NsRestore: `{"prefetch":"memory"}`,
+		"application":        "stable",
+	}
+
+	res, err := rt.routeLinkReserve(context.Background(), "/g", "rk", config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.SID != "sb-1" || len(bodies) != 2 {
+		t.Fatalf("result=%+v bodies=%d", res, len(bodies))
+	}
+	if bodies[0] != bodies[1] {
+		t.Fatalf("reserve retry changed request body: %q then %q", bodies[0], bodies[1])
+	}
+	var wire struct {
+		Config map[string]string `json:"config"`
+	}
+	if err := json.Unmarshal([]byte(bodies[0]), &wire); err != nil {
+		t.Fatal(err)
+	}
+	if wire.Config[sandboxcfg.NsRestore] != config[sandboxcfg.NsRestore] || wire.Config["application"] != "stable" {
+		t.Fatalf("reserve config=%v, want %v", wire.Config, config)
 	}
 }
 

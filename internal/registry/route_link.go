@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
+	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 )
 
 // route_link paths. Routers dial this link for group-scoped route/build
@@ -34,6 +36,14 @@ type RouteResolve struct {
 	TrafficAccessToken string `json:"traffic_access_token,omitempty"`
 	TargetPort         int    `json:"target_port,omitempty"`
 	State              string `json:"state"`
+}
+
+// ReserveSandboxRequest carries per-create sandbox configuration from the
+// cluster router to the route owner. Config is already normalized from request
+// metadata and X-Kuasar-Sandbox-* headers; the route owner validates it again at
+// its own HTTP trust boundary.
+type ReserveSandboxRequest struct {
+	Config map[string]string `json:"config,omitempty"`
 }
 
 // ServeRouteLink mounts the router/admin-facing route_link API.
@@ -136,7 +146,24 @@ func (r *Registry) serveReserve(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, "group and route_key are required", http.StatusBadRequest)
 		return
 	}
-	res, err := r.ReserveSandbox(req.Context(), group, routeKey, nil)
+	var body ReserveSandboxRequest
+	if req.Body != nil {
+		dec := json.NewDecoder(req.Body)
+		if err := dec.Decode(&body); err != nil && err != io.EOF {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		} else if err == nil {
+			if err := dec.Decode(&struct{}{}); err != io.EOF {
+				http.Error(w, "request body contains trailing content", http.StatusBadRequest)
+				return
+			}
+		}
+	}
+	if _, err := sandboxcfg.ParseSpec(body.Config); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	res, err := r.ReserveSandbox(req.Context(), group, routeKey, body.Config)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return

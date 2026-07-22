@@ -69,6 +69,7 @@ type SandboxRecord struct {
 	AccessToken        string                    `json:"access_token,omitempty"`
 	TrafficAccessToken string                    `json:"traffic_access_token,omitempty"`
 	TargetPort         int                       `json:"target_port,omitempty"`
+	Config             map[string]string         `json:"config,omitempty"`
 	LastActive         int64                     `json:"last_active,omitempty"`
 	BuildID            string                    `json:"build_id,omitempty"`
 	BuildState         BuildState                `json:"build_state,omitempty"`

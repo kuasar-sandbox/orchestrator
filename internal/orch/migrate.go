@@ -183,6 +183,12 @@ func (o *Orchestrator) importSandboxWithKey(ctx context.Context, mk, token strin
 				tok.Profile, short(dig), short(tok.RuntimeDigest))
 		}
 	}
+	// A migration token is untrusted request input. Validate its per-sandbox
+	// config after tenant/runtime authorization but before minting identity or
+	// credentials and before inserting the paused row.
+	if err := validateSandboxMetadata(tok.Metadata); err != nil {
+		return "", fmt.Errorf("import-sandbox: %w", err)
+	}
 	id, err := uuid.NewV7()
 	if err != nil {
 		return "", fmt.Errorf("import-sandbox: new id: %w", err)

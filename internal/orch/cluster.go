@@ -164,6 +164,9 @@ func (o *Orchestrator) registerClusterBuild(ctx context.Context, cmd *routesync.
 	if err != nil {
 		return err
 	}
+	if err := validateSandboxMetadata(meta); err != nil {
+		return fmt.Errorf("build_register: %w", err)
+	}
 	if err := o.validateBuildOptions(builderOpts, false); err != nil {
 		return err
 	}
@@ -344,6 +347,9 @@ func (o *Orchestrator) CreateCluster(ctx context.Context, cmd *routesync.Command
 // whose failure is a rejected ack (rather than a slow create that fails only by
 // Reserve timeout).
 func (o *Orchestrator) precheckCluster(ctx context.Context, cmd *routesync.Command) (string, types.TemplateID, error) {
+	if err := validateSandboxMetadata(cmd.Config); err != nil {
+		return "", types.TemplateID{}, fmt.Errorf("cluster create config: %w", err)
+	}
 	manifestKey, err := o.resolveByFingerprint(ctx, cmd.KeyFingerprint)
 	if err != nil {
 		return "", types.TemplateID{}, err

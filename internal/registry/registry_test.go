@@ -24,6 +24,7 @@ import (
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/cluster/shardkv"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
+	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 )
 
 func testRegWithBox(t *testing.T) *Registry {
@@ -1175,17 +1176,111 @@ func TestReserveSandboxCreateUsesPlacementMaterial(t *testing.T) {
 	}
 	reg.addNode(conn)
 
-	if _, err := reg.ReserveSandbox(ctx, "/g", "rk", map[string]string{"b": "2"}); err != nil {
+	if _, err := reg.ReserveSandbox(ctx, "/g", "rk", map[string]string{
+		"a": "2", "b": "2", sandboxcfg.NsRestore: `{"prefetch":"memory"}`,
+	}); err != nil {
 		t.Fatal(err)
 	}
 	if got == nil {
 		t.Fatal("create command not sent")
 	}
-	if got.TemplateRef != "e2b-snp-tmpl" || got.Config["a"] != "1" || got.Config["b"] != "2" {
+	if got.TemplateRef != "e2b-snp-tmpl" || got.Config["a"] != "2" || got.Config["b"] != "2" ||
+		got.Config[sandboxcfg.NsRestore] != `{"prefetch":"memory"}` {
 		t.Fatalf("create command did not use placement config: %+v", got)
 	}
 	if got.KeyFingerprint != keyFingerprint(testMK) {
 		t.Fatalf("key fingerprint=%q, want provider key fp", got.KeyFingerprint)
+	}
+}
+
+func TestReserveSandboxReplacementKeepsExistingConfig(t *testing.T) {
+	ctx := context.Background()
+	reg := testReg(t)
+	reg.SetPlacer(placementWithToken("n1"))
+	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"}); err != nil {
+		t.Fatal(err)
+	}
+	existingConfig := map[string]string{
+		sandboxcfg.NsRestore: `{"prefetch":"off"}`,
+		"application":        "original",
+	}
+	if _, err := reg.stores.PutSandbox(ctx, &SandboxRecord{
+		Group: "/g", RouteKey: "rk", SID: "sb-old", State: StateReady,
+		NodeID: "gone", Config: existingConfig,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var gotConfig map[string]string
+	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(cmd *routesync.Command) {
+		if cmd.Kind != routesync.CmdCreate {
+			return
+		}
+		gotConfig = cloneStringMap(cmd.Config)
+		go reg.ackCommand(&routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted})
+		go reg.applyRoute(context.Background(), "n1", &routesync.RouteEntry{
+			SandboxID: cmd.SID, State: routesync.StateRunning, AccessToken: cmd.AccessToken,
+		})
+	}})
+
+	_, err := reg.ReserveSandbox(ctx, "/g", "rk", map[string]string{
+		sandboxcfg.NsRestore: `{"prefetch":"memory"}`,
+		"new":                "must-not-apply",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotConfig[sandboxcfg.NsRestore] != `{"prefetch":"off"}` || gotConfig["application"] != "original" {
+		t.Fatalf("replacement changed existing config: %v", gotConfig)
+	}
+	if _, ok := gotConfig["new"]; ok {
+		t.Fatalf("replacement accepted config from repeated create: %v", gotConfig)
+	}
+	if _, ok := gotConfig["a"]; ok {
+		t.Fatalf("replacement accepted a group default added after the original create: %v", gotConfig)
+	}
+	rec, _, found, err := reg.stores.GetSandbox(ctx, "/g", "rk")
+	if err != nil || !found || rec.Config[sandboxcfg.NsRestore] != `{"prefetch":"off"}` {
+		t.Fatalf("stored replacement config=%v found=%v err=%v", rec, found, err)
+	}
+}
+
+func TestReserveSandboxStrandedReservationKeepsExistingConfig(t *testing.T) {
+	ctx := context.Background()
+	reg := testReg(t)
+	reg.SetPlacer(placementWithToken("n1"))
+	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"}); err != nil {
+		t.Fatal(err)
+	}
+	existingConfig := map[string]string{
+		sandboxcfg.NsRestore: `{"prefetch":"memory"}`,
+		"application":        "original",
+	}
+	if _, err := reg.stores.PutSandbox(ctx, &SandboxRecord{
+		Group: "/g", RouteKey: "rk", SID: "sb-stranded", State: StateReserved,
+		NodeID: "gone", Config: existingConfig,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var gotConfig map[string]string
+	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(cmd *routesync.Command) {
+		if cmd.Kind != routesync.CmdCreate {
+			return
+		}
+		gotConfig = cloneStringMap(cmd.Config)
+		go reg.ackCommand(&routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted})
+		go reg.applyRoute(context.Background(), "n1", &routesync.RouteEntry{
+			SandboxID: cmd.SID, State: routesync.StateRunning, AccessToken: cmd.AccessToken,
+		})
+	}})
+
+	if _, err := reg.ReserveSandbox(ctx, "/g", "rk", nil); err != nil {
+		t.Fatal(err)
+	}
+	if gotConfig[sandboxcfg.NsRestore] != `{"prefetch":"memory"}` || gotConfig["application"] != "original" {
+		t.Fatalf("recovered reservation changed existing config: %v", gotConfig)
+	}
+	if _, ok := gotConfig["a"]; ok {
+		t.Fatalf("recovered reservation accepted a later group default: %v", gotConfig)
 	}
 }
 
@@ -1763,7 +1858,7 @@ func TestReadyReplacementRetainsOldOwnershipAndRollbackDropsNewRef(t *testing.T)
 			reg.ackCommand(&routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted})
 		}
 	}})
-	if err := reg.placeAndCreate(ctx, "/g", "rk", nil, orig); err != nil {
+	if err := reg.placeAndCreate(ctx, "/g", "rk", nil, orig, true); err != nil {
 		t.Fatalf("placeAndCreate: %v", err)
 	}
 	reserved, _, found, err := reg.stores.GetSandbox(ctx, "/g", "rk")
@@ -2008,11 +2103,13 @@ func TestReservePausedResume(t *testing.T) {
 	// Seed a PAUSED sandbox on n1.
 	reg.stores.PutSandbox(ctx, &SandboxRecord{Group: "/g", RouteKey: "rk", SID: "sb-x", State: StatePaused, NodeID: "n1", AccessToken: want})
 
+	var connectConfig map[string]string
 	conn := &fakeConn{nodeID: "n1"}
 	conn.onCmd = func(cmd *routesync.Command) {
 		if cmd.Kind != routesync.CmdConnect {
 			return
 		}
+		connectConfig = cloneStringMap(cmd.Config)
 		go reg.ackCommand(&routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted})
 		go reg.applyRoute(context.Background(), "n1", &routesync.RouteEntry{
 			SandboxID: "sb-x", State: routesync.StateRunning,
@@ -2020,12 +2117,17 @@ func TestReservePausedResume(t *testing.T) {
 	}
 	reg.addNode(conn)
 
-	res, err := reg.ReserveSandbox(ctx, "/g", "rk", nil)
+	res, err := reg.ReserveSandbox(ctx, "/g", "rk", map[string]string{
+		sandboxcfg.NsRestore: `{"prefetch":"memory"}`,
+	})
 	if err != nil {
 		t.Fatalf("resume reserve: %v", err)
 	}
 	if res.SID != "sb-x" || res.AccessToken != want {
 		t.Fatalf("resume result: %+v", res)
+	}
+	if len(connectConfig) != 0 {
+		t.Fatalf("repeated create changed paused sandbox config: %v", connectConfig)
 	}
 }
 

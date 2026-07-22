@@ -14,6 +14,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/apikey"
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/launcher"
+	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/secretbox"
 	"github.com/kuasar-sandbox/orchestrator/internal/store"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
@@ -103,6 +104,7 @@ func TestResumeRace_ConnectAndRouteSingleLaunch(t *testing.T) {
 	sb := &types.Sandbox{
 		ID: sid, TemplateID: "bare-img-" + strings.Repeat("b", 64), State: types.StatePaused,
 		ManifestKey: mk,
+		Metadata:    map[string]string{sandboxcfg.NsRestore: `{"prefetch":"memory"}`},
 		RunDir:      cfg.Paths.RunRoot + "/" + sid,
 		BaseDir:     cfg.Paths.BaseRoot + "/" + sid,
 		CreatedUnix: 1,
@@ -134,5 +136,8 @@ func TestResumeRace_ConnectAndRouteSingleLaunch(t *testing.T) {
 	got, err := st.Get(ctx, sid)
 	if err != nil || got == nil || got.State != types.StateRunning {
 		t.Fatalf("sandbox should be running after resume: %+v (err=%v)", got, err)
+	}
+	if got.Metadata[sandboxcfg.NsRestore] != `{"prefetch":"memory"}` {
+		t.Fatalf("resume lost restore metadata: %+v", got.Metadata)
 	}
 }

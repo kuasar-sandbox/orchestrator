@@ -38,6 +38,9 @@ func (o *Orchestrator) newRegisteredBuild(ctx context.Context, apiKey string, sp
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
 	}
+	if err := validateSandboxMetadata(metadata); err != nil {
+		return nil, err
+	}
 	if err := o.validateBuildOptions(builderOpts, false); err != nil {
 		return nil, err
 	}
@@ -159,7 +162,11 @@ func (o *Orchestrator) TriggerBuild(ctx context.Context, apiKey, tid, bid string
 	b.Steps = spec.Steps
 	b.StartCmd = spec.StartCmd
 	b.ReadyCmd = spec.ReadyCmd
-	b.Metadata = sandboxcfg.MergeMetadata(b.Metadata, triggerMeta) // trigger overrides register
+	metadata := sandboxcfg.MergeMetadata(b.Metadata, triggerMeta) // trigger overrides register
+	if err := validateSandboxMetadata(metadata); err != nil {
+		return err
+	}
+	b.Metadata = metadata
 	b.Builder = buildcfg.Merge(b.Builder, triggerBuilder)
 	if err := o.validateBuildOptions(b.Builder, b.FromTemplate != ""); err != nil {
 		return err

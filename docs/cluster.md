@@ -587,8 +587,9 @@ node_link 维护以下 recordSet:
 心跳只更新 `profile` recordSet 中的 runtime/liveness 字段,不得重写 `sandbox`、`build`、`manifest_key`
 recordSet。sandbox/build 表由 cluster 在任务下发前写入。build 终态只释放容量,归属记录保留到对应
 build record 删除;manifest_key 由 selector patch 更新。
-node 既不生成也不解析 group,只把 sandbox/build metadata 原样保存。这样高频心跳不会把无关 recordSet
-的 CAS 队列拖慢。
+node 既不生成也不解析 `kuasar-sandbox.cluster` 中的 group 身份;它原样保存全部
+sandbox/build metadata,但会解析其中的 sandbox runtime 配置命名空间(如 `resource`、
+`network`、`restore`)。这样高频心跳不会把无关 recordSet 的 CAS 队列拖慢。
 
 同一 node 内 `sandbox_id` 归属以 CAS 写入:相同 `{group,route_key}` 重放为幂等刷新,不同归属返回冲突且
 不得覆盖旧值。create 在下发 node 命令前遇到该冲突时,仅回滚本次 RESERVED record,生成新 sandbox_id
@@ -690,13 +691,15 @@ ready/paused/reserved -> dead/tombstone
 
 ```text
 router
-  │ ReserveSandbox(group, route_key)
+  │ normalize request metadata/headers
+  │ ReserveSandbox(group, route_key, create_config)
   ▼
 route_link owner
   │ existing ready? return
   │ none/paused? CAS reserved
   ▼
 placer PlaceSandbox
+  │ group sandbox_config ⊕ create_config (create wins)
   │ choose node + access_token + target_port
   ▼
 route owner
@@ -704,7 +707,7 @@ route owner
   │ record node_id/sandbox_id ownership
   ▼
 node owner
-  │ create/connect (metadata is opaque to node)
+  │ create(config) / connect(existing persisted config)
   ▼
 node reports RUNNING/READY
   │
@@ -718,6 +721,10 @@ Reserve returns READY
 `ReserveSandbox` 返回时必须 READY 或失败。若已有 `reserved`,新请求 join 同一 in-flight 状态机。
 node READY 事件到达后,route owner 通过本地 group WATCH 或短周期 quorum read 唤醒 waiter。router 不订阅
 route_link 更新。
+
+create config 只在创建新实例时生效。已有 ready/paused route 的后续请求不得用新的 Header/metadata
+改写实例配置;pause/resume 始终使用 node 已持久化的 sandbox metadata。router 到 route owner 的 failover
+重试必须复用相同 body,避免不同 owner 看到不同策略。
 
 孤儿清理由 nodelink owner 和 route owner 共同收敛:先以 `(node_id,sandbox_id)` 查归属表;表项不存在,
 或表项指向的 `(group,route_key)` 已不存在/被其他实例替换,则下发 delete/kill 到该 node。该过程不经过

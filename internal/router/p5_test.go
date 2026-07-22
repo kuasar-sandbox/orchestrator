@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/envdsign"
+	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 )
 
 func newDataTunnelServer(t *testing.T, h http.HandlerFunc) *httptest.Server {
@@ -129,6 +130,88 @@ func TestCreateGeneratesRouteKeyWhenHeaderMissing(t *testing.T) {
 	}
 	if len(routeKeys) != 2 || routeKeys[0] == "" || routeKeys[1] == "" || routeKeys[0] == routeKeys[1] {
 		t.Fatalf("generated route keys=%v, want two non-empty unique values", routeKeys)
+	}
+}
+
+func TestCreateCarriesMetadataAndRestoreHeaderToRouteLink(t *testing.T) {
+	var gotConfig map[string]string
+	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/route-link/reserve" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		var body struct {
+			Config map[string]string `json:"config"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		gotConfig = body.Config
+		_ = json.NewEncoder(w).Encode(reserveResult{
+			NodeID: "n1", SID: "sb-1", AccessToken: "tok", DataEndpoint: "10.0.0.1:1",
+		})
+	}))
+	defer control.Close()
+	rt := New(strings.TrimPrefix(control.URL, "http://"), "test.local", 0, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	rt.SetAuthMode("off")
+	srv := httptest.NewServer(rt.Handler())
+	defer srv.Close()
+
+	body, err := json.Marshal(map[string]any{"metadata": map[string]string{
+		sandboxcfg.NsRestore: `{"prefetch":"off"}`,
+		"application":        "kept",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/sandboxes", strings.NewReader(string(body)))
+	req.Host = "api.test.local"
+	req.Header.Set(HeaderGroup, "/g")
+	req.Header.Set("X-Kuasar-Sandbox-Restore", `{"prefetch":"memory"}`)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status=%d body=%s", resp.StatusCode, b)
+	}
+	if gotConfig[sandboxcfg.NsRestore] != `{"prefetch":"memory"}` {
+		t.Fatalf("restore config=%q, want header value", gotConfig[sandboxcfg.NsRestore])
+	}
+	if gotConfig["application"] != "kept" {
+		t.Fatalf("create metadata lost: %v", gotConfig)
+	}
+}
+
+func TestCreateRejectsInvalidRestoreBeforeReserve(t *testing.T) {
+	var reserveHits int32
+	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&reserveHits, 1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer control.Close()
+	rt := New(strings.TrimPrefix(control.URL, "http://"), "test.local", 0, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	rt.SetAuthMode("off")
+	srv := httptest.NewServer(rt.Handler())
+	defer srv.Close()
+
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/sandboxes", strings.NewReader(`{"metadata":{}}`))
+	req.Host = "api.test.local"
+	req.Header.Set(HeaderGroup, "/g")
+	req.Header.Set("X-Kuasar-Sandbox-Restore", `{"prefetch":"disk"}`)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status=%d body=%s, want 400", resp.StatusCode, b)
+	}
+	if got := atomic.LoadInt32(&reserveHits); got != 0 {
+		t.Fatalf("invalid restore reached route-link %d times", got)
 	}
 }
 

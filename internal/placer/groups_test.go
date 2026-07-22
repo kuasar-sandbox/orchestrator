@@ -69,18 +69,22 @@ func TestFileGroupSourceAcceptsSecretShorthand(t *testing.T) {
 }
 
 func TestAnswerIncludesGroupMaterial(t *testing.T) {
+	const restoreNS = "kuasar-sandbox.restore"
 	svc := testServiceWithGroups(t, clusterstate.SandboxGroupRecord{
 		Group: "/g", ManifestKey: clusterstate.Secret{Type: clusterstate.SecretInline, Value: testManifestKey},
 		AuthKey:     clusterstate.Secret{Type: clusterstate.SecretInline, Value: testAuthKey},
-		TemplateRef: "tmpl", Config: map[string]string{"a": "1"}, NodeSelectors: []map[string]string{{"pool": "p"}},
+		TemplateRef: "tmpl", Config: map[string]string{"a": "1", restoreNS: `{"prefetch":"off"}`}, NodeSelectors: []map[string]string{{"pool": "p"}},
 	})
 	putNodeList(t, svc, clusterstate.NodeListEntry{NodeID: "n1", Labels: map[string]string{"pool": "p"}})
 
-	res := svc.answer(context.Background(), &routesync.PlaceReq{Group: "/g", RouteKey: "rk", SandboxID: "sb-1", Config: map[string]string{"b": "2"}})
+	res := svc.answer(context.Background(), &routesync.PlaceReq{Group: "/g", RouteKey: "rk", SandboxID: "sb-1", Config: map[string]string{
+		"b": "2", restoreNS: `{"prefetch":"memory"}`,
+	}})
 	if res.NoNode || res.Error != "" {
 		t.Fatalf("answer failed: %+v", res)
 	}
-	if res.NodeID != "n1" || res.TemplateRef != "tmpl" || res.Config["a"] != "1" || res.Config["b"] != "2" {
+	if res.NodeID != "n1" || res.TemplateRef != "tmpl" || res.Config["a"] != "1" || res.Config["b"] != "2" ||
+		res.Config[restoreNS] != `{"prefetch":"memory"}` {
 		t.Fatalf("placement material mismatch: %+v", res)
 	}
 	want, err := clusterstate.DeriveAccessToken(testAuthKey, "sb-1")

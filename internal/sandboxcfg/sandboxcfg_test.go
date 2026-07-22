@@ -25,6 +25,7 @@ func TestParseSpecNamespaces(t *testing.T) {
 		NsFiles:    `[{"path":"/etc/app.conf","content":"k=v","mode":"0644"}]`,
 		NsInit:     `[{"exec":"/bin/setup","args":["--once"]}]`,
 		NsMetadata: `{"e2b.start_cmd":"npm run start"}`,
+		NsRestore:  `{"prefetch":"memory"}`,
 	}
 	s, err := ParseSpec(meta)
 	if err != nil {
@@ -53,6 +54,48 @@ func TestParseSpecNamespaces(t *testing.T) {
 	}
 	if s.Metadata["e2b.start_cmd"] != "npm run start" {
 		t.Fatalf("metadata parsed wrong: %+v", s.Metadata)
+	}
+	if s.Restore.Prefetch != "memory" {
+		t.Fatalf("restore parsed wrong: %+v", s.Restore)
+	}
+}
+
+func TestParseSpecRestoreStrictJSON(t *testing.T) {
+	for name, raw := range map[string]string{
+		"empty":            ``,
+		"whitespace":       `  `,
+		"null-object":      `null`,
+		"yaml":             `prefetch: memory`,
+		"array":            `[]`,
+		"string":           `"memory"`,
+		"unknown-field":    `{"file_refs":"/node-owned"}`,
+		"wrong-field-case": `{"Prefetch":"memory"}`,
+		"invalid-mode":     `{"prefetch":"disk"}`,
+		"null-prefetch":    `{"prefetch":null}`,
+		"numeric-prefetch": `{"prefetch":1}`,
+		"boolean-prefetch": `{"prefetch":true}`,
+		"object-prefetch":  `{"prefetch":{"mode":"memory"}}`,
+		"trailing-object":  `{"prefetch":"memory"}{}`,
+		"trailing-garbage": `{"prefetch":"memory"} nope`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := ParseSpec(map[string]string{NsRestore: raw}); err == nil {
+				t.Fatalf("ParseSpec accepted invalid restore namespace %q", raw)
+			}
+		})
+	}
+
+	for name, raw := range map[string]string{
+		"empty-object":         `{}`,
+		"explicit-empty-value": `{"prefetch":""}`,
+		"explicit-off":         `{"prefetch":"off"}`,
+		"memory":               `{"prefetch":"memory"}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := ParseSpec(map[string]string{NsRestore: raw}); err != nil {
+				t.Fatalf("ParseSpec rejected valid restore namespace %q: %v", raw, err)
+			}
+		})
 	}
 }
 
@@ -163,6 +206,61 @@ func TestMergeMetadataOverWins(t *testing.T) {
 	m := MergeMetadata(base, over)
 	if m[NsNetwork] != "from-create" || m[NsLaunch] != "tmpl-launch" {
 		t.Fatalf("create should win per namespace, template fills the rest: %+v", m)
+	}
+}
+
+func TestMergeConfigHeadersRestoreWins(t *testing.T) {
+	meta := map[string]string{NsRestore: `{"prefetch":"off"}`}
+	headers := map[string]string{"X-Kuasar-Sandbox-Restore": `{"prefetch":"memory"}`}
+	got := MergeConfigHeaders(meta, func(name string) string { return headers[name] })
+	if got[NsRestore] != `{"prefetch":"memory"}` {
+		t.Fatalf("restore header should win over metadata: %+v", got)
+	}
+	if got := MergeConfigHeaders(nil, nil); got != nil {
+		t.Fatalf("nil header getter should be a no-op: %+v", got)
+	}
+}
+
+func TestBuildRestorePrefetchOnlyForRestore(t *testing.T) {
+	tests := []struct {
+		name         string
+		prefetch     string
+		configure    func(*Params)
+		wantPrefetch string
+	}{
+		{name: "cold image", prefetch: "memory"},
+		{name: "snapshot default", configure: func(p *Params) {
+			p.Template.Kind = types.KindSnp
+		}},
+		{name: "snapshot explicit off", prefetch: "off", wantPrefetch: `prefetch: "off"`, configure: func(p *Params) {
+			p.Template.Kind = types.KindSnp
+		}},
+		{name: "snapshot memory", prefetch: "memory", wantPrefetch: "prefetch: memory", configure: func(p *Params) {
+			p.Template.Kind = types.KindSnp
+		}},
+		{name: "paused image", prefetch: "memory", wantPrefetch: "prefetch: memory", configure: func(p *Params) {
+			p.Sandbox.SnapshotRef = "manifest://" + strings.Repeat("b", 64)
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := baseParams(types.ProfileBare)
+			p.Spec.Restore.Prefetch = tt.prefetch
+			if tt.configure != nil {
+				tt.configure(&p)
+			}
+			b, err := p.BuildYAML()
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := string(b)
+			if tt.wantPrefetch == "" && strings.Contains(got, "prefetch:") {
+				t.Fatalf("unexpected restore Prefetch in YAML:\n%s", b)
+			}
+			if tt.wantPrefetch != "" && !strings.Contains(got, tt.wantPrefetch) {
+				t.Fatalf("YAML does not contain %q:\n%s", tt.wantPrefetch, b)
+			}
+		})
 	}
 }
 

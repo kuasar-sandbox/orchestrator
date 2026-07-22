@@ -13,8 +13,10 @@
 #                                exposed as envd.sock; orchestrator waitReady(/health)
 #                                + envdInit(/init). 201 == microVM booted + envd ready.
 #                                The create injects sandbox config via the
-#                                X-Kuasar-Sandbox-Network header (hostname), checked
-#                                in the guest below (§4.6 config passing chain).
+#                                X-Kuasar-Sandbox-Network (hostname) and
+#                                X-Kuasar-Sandbox-Restore (memory Prefetch) headers.
+#                                The restore policy is persisted per sandbox but
+#                                rendered only on pause/resume (§4.6).
 #   exec                       -> run a command in the guest via envd (incl. hostname).
 #   DELETE                     -> teardown.
 #
@@ -126,9 +128,9 @@ allow_proxy_forwarding() {
 req() {
     local method="$1" path="$2" key="$3" body="${4:-}"
     local args=(-sS --noproxy '*' -o "$WORK/resp.body" -w '%{http_code}' -X "$method" -H "Host: api.$DOMAIN" -H "X-API-KEY: $key")
-    # Optional sandbox-config injection header (§4.6): set REQ_NET_HEADER to a JSON
-    # network spec to exercise X-Kuasar-Sandbox-Network on a create.
+    # Optional sandbox-config injection headers (§4.6).
     [ -n "${REQ_NET_HEADER:-}" ] && args+=(-H "X-Kuasar-Sandbox-Network: ${REQ_NET_HEADER}")
+    [ -n "${REQ_RESTORE_HEADER:-}" ] && args+=(-H "X-Kuasar-Sandbox-Restore: ${REQ_RESTORE_HEADER}")
     [ -n "$body" ] && args+=(-H 'Content-Type: application/json' -d "$body")
     curl "${args[@]}" "http://127.0.0.1:$PORT$path"
 }
@@ -313,13 +315,15 @@ done
 echo "==> built template: $TEMPLATE"
 
 # ---- create the sandbox (boots the microVM) -------------------------------
-# Inject sandbox config via the X-Kuasar-Sandbox-Network header (§4.6): the guest
-# hostname should become CFG_HOST, verified by `hostname` in the exec below.
+# Inject sandbox config via request headers (§4.6): the guest hostname should become
+# CFG_HOST, while restore Prefetch must be retained for this sandbox but omitted from
+# its cold-boot SANDBOX_CONFIG until a real snapshot restore occurs.
 CFG_HOST="e2e-cfg-host"
-echo "==> POST /sandboxes (boot microVM from $TEMPLATE; inject hostname=$CFG_HOST via header)"
+echo "==> POST /sandboxes (boot microVM from $TEMPLATE; inject hostname and per-sandbox restore Prefetch)"
 REQ_NET_HEADER="{\"hostname\":\"$CFG_HOST\"}"
+REQ_RESTORE_HEADER='{"prefetch":"memory"}'
 code=$(req POST /sandboxes "$AK" "{\"templateID\":\"$TEMPLATE\",\"timeout\":120}")
-unset REQ_NET_HEADER
+unset REQ_NET_HEADER REQ_RESTORE_HEADER
 if [ "$code" != "201" ]; then
     echo "create=$code body:"; cat "$WORK/resp.body"; echo
     echo "==> orchestrator log:"; sed 's/^/  orch| /' "$WORK/orch.log"
@@ -330,6 +334,12 @@ fi
 SID=$(json_field "$WORK/resp.body" sandboxID)
 ENVD_TOKEN=$(json_field "$WORK/resp.body" envdAccessToken)
 echo "==> PASS: sandbox $SID running (microVM booted + envd ready + /init)"
+SANDBOX_YAML="$WORK/run/$SID/$SID.yaml"
+[ -f "$SANDBOX_YAML" ] || fail "sandbox config not found at $SANDBOX_YAML"
+if grep -q 'prefetch: memory' "$SANDBOX_YAML"; then
+    fail "cold-boot SANDBOX_CONFIG unexpectedly enabled restore Prefetch"
+fi
+echo "==> PASS: per-sandbox restore policy was not rendered into cold-boot YAML"
 
 # ---- list -----------------------------------------------------------------
 code=$(req GET /v2/sandboxes "$AK"); [ "$code" = "200" ] || fail "list=$code"
@@ -417,6 +427,24 @@ if [ "$code" = "204" ]; then
     echo "==> resume via connect"
     code=$(req POST "/sandboxes/$SID/connect" "$AK" '{"timeout":120}')
     [ "$code" = "200" ] || { cat "$WORK/resp.body"; fail "resume(connect)=$code (want 200)"; }
+    grep -q 'prefetch: memory' "$SANDBOX_YAML" \
+        || { sed 's/^/  yaml| /' "$SANDBOX_YAML"; fail "resume YAML did not render restore.prefetch=memory"; }
+    # sandbox-ctl writes restore logs to its process stderr. KUASAR_SANDBOX_ID
+    # tags guest stdio only, so query the exact sandbox-ctl PID retained across
+    # run-sandbox's exec instead of the guest log stream.
+    SANDBOX_PID_FILE="$WORK/run/$SID/$SID.pid"
+    [ -s "$SANDBOX_PID_FILE" ] || fail "sandbox-ctl pidfile not found after resume"
+    SANDBOX_CTL_PID=$(tr -d '[:space:]' < "$SANDBOX_PID_FILE")
+    [ -n "$SANDBOX_CTL_PID" ] || fail "sandbox-ctl pidfile is empty after resume"
+    PREFETCH_LOG=""
+    for _ in $(seq 1 30); do
+        PREFETCH_LOG=$(journalctl -b "_PID=$SANDBOX_CTL_PID" --no-pager 2>/dev/null \
+            | grep 'memory prefetch started mode=memory' || true)
+        [ -n "$PREFETCH_LOG" ] && break
+        sleep 0.2
+    done
+    [ -n "$PREFETCH_LOG" ] || fail "resume did not start remote memory Prefetch"
+    echo "==> PASS: resume rendered and started per-sandbox remote memory Prefetch"
     for _ in $(seq 1 40); do [ -S "$ENVD_SOCK" ] && break; sleep 0.3; done
     python3 "$WORK/envd_exec.py" "$ENVD_SOCK" "$ENVD_TOKEN" "cat /home/user/persist.txt" > "$WORK/exec2.out" 2>&1 || true
     sed 's/^/  guest2| /' "$WORK/exec2.out"

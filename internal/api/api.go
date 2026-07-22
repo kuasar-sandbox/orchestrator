@@ -18,20 +18,6 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
-// configHeaderNs maps each X-Kuasar-Sandbox-<Ns> request header to the namespaced
-// metadata key it normalizes into. Headers are an alternate config-injection surface
-// (create + template build); on conflict with an e2b metadata key of the same
-// namespace the header wins. The header value is the same JSON the metadata key holds.
-var configHeaderNs = []struct{ header, metaKey string }{
-	{"X-Kuasar-Sandbox-Resource", sandboxcfg.NsResource},
-	{"X-Kuasar-Sandbox-Network", sandboxcfg.NsNetwork},
-	{"X-Kuasar-Sandbox-Launch", sandboxcfg.NsLaunch},
-	{"X-Kuasar-Sandbox-Init", sandboxcfg.NsInit},
-	{"X-Kuasar-Sandbox-Mounts", sandboxcfg.NsMounts},
-	{"X-Kuasar-Sandbox-Files", sandboxcfg.NsFiles},
-	{"X-Kuasar-Sandbox-Metadata", sandboxcfg.NsMetadata},
-}
-
 const builderHeader = "X-Kuasar-Sandbox-Builder"
 
 // pickInt returns a if non-zero, else b (camelCase vs snake_case e2b field aliases).
@@ -46,17 +32,7 @@ func pickInt(a, b int) int {
 // overriding an e2b metadata key of the same namespace. Returns the merged map
 // (allocating one only if a header is present and meta was nil).
 func mergeConfigHeaders(meta map[string]string, h http.Header) map[string]string {
-	for _, m := range configHeaderNs {
-		v := h.Get(m.header)
-		if v == "" {
-			continue
-		}
-		if meta == nil {
-			meta = map[string]string{}
-		}
-		meta[m.metaKey] = v
-	}
-	return meta
+	return sandboxcfg.MergeConfigHeaders(meta, h.Get)
 }
 
 func mergeBuildConfigHeaders(meta map[string]string, h http.Header) map[string]string {

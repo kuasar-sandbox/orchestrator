@@ -369,6 +369,10 @@ node-ctl 同目录 → PATH"自动发现。
 | `cluster.data_endpoint` | 空 | 本节点数据面端点(供 router 转发);缺省由 `api.domain` + `proxy`/`api` 监听推导 |
 | `resource_listen` | 缺省(不内置) | 内置资源控制器整块(调参内联,无独立文件):`enabled` 开关、`socket`(控制器 UDS,**唯一权威**;空 = `pkg/resource` 默认,与 sandbox-ctl 一致),其余 `state_path`/`audit_path`/`cgroup_scan_paths`/`resources`/`watermarks`/`rate_limits`/`admission`/`dampening` 均有默认(语义见 node-resource.md §3.2);整块省略或 `enabled: false` = 不内置(沙箱用静态 cgroup) |
 
+远程内存 Prefetch **没有节点统一配置**。`sandbox.restore.file_refs` 只管理节点本地文件引用
+的信任边界;是否 Prefetch 由每个 sandbox 的 `kuasar-sandbox.restore` 请求命名空间决定
+(§4.6),二者不能互相覆盖。
+
 配置自洽校验:`mmds.enabled=false` 时 `proxy.auth` 必须为 `enforce`(envd 非 secure,
 proxy 是唯一数据面闸门);`mmds.enabled=true` 时 `proxy.mode` 不得为 `off`(MMDS 寄宿
 proxy 组件)。`proxy.proxy_netns` 仅在 internal 模式有效;external 模式在 `proxy.yaml`
@@ -390,7 +394,7 @@ gen-apikey`),serve 经 MAC 校验解析出租户——无静态 api_keys 表(§7
 
 | 操作 | 方法 + 路径 | 要点 |
 |---|---|---|
-| create | `POST /sandboxes` → 201 | body `{templateID, timeout, metadata, envVars}`(timeout 缺省取 `sandbox.timeout_sec`,默认 300s);回 `{sandboxID, templateID, clientID, domain, envdVersion, envdAccessToken, trafficAccessToken, alias}` |
+| create | `POST /sandboxes` → 201 | body `{templateID, timeout, metadata, envVars}` + 可选 `X-Kuasar-Sandbox-*` 头(timeout 缺省取 `sandbox.timeout_sec`,默认 300s);回 `{sandboxID, templateID, clientID, domain, envdVersion, envdAccessToken, trafficAccessToken, alias}` |
 | get | `GET /sandboxes/{id}` | 附 `state`/`startedAt`/`endAt`/`metadata` |
 | list | `GET /v2/sandboxes` | 仅本租户;query `state`/`limit`/`nextToken`,分页头 `x-next-token`;每项含 `cpuCount`/`memoryMB`/`diskSizeMB`(节点统一配置值 + overlay 模板尺寸)与 ISO-8601 `startedAt`/`endAt` |
 | kill | `DELETE /sandboxes/{id}` → 204 | 非本租户 ⇒ 404 |
@@ -474,6 +478,23 @@ JSON 对象)注入,零 SDK/API 改动。命名空间是 sandbox-runtime `config.
 | `launch` | `launch.{exec,args,env,workdir,restart,user,stop_signal,plugin}`——**仅 bare**;e2b profile 拒(envd 占用 launch) |
 | `init` / `mounts` / `files` | 直透 `init[]` / `mounts[]` / `files[]` |
 | `metadata` | `SANDBOX_CONFIG.metadata` 透传(如 `e2b.start_cmd`) |
+| `restore` | host restore policy 的 `prefetch`(空/`off`/`memory`);仅 restore 启动渲染,不含节点托管的 `file_refs` |
+
+`restore` 命名空间只接受严格 JSON object。单实例显式启用的两种等价请求形态:
+
+```http
+X-Kuasar-Sandbox-Restore: {"prefetch":"memory"}
+```
+
+```json
+{"metadata":{"kuasar-sandbox.restore":"{\"prefetch\":\"memory\"}"}}
+```
+
+未知字段、非 JSON、非字符串 `prefetch` 和 `file_refs` 均在创建副作用前回 **400**。
+未提供时默认关闭;显式 `{"prefetch":"off"}` 可覆盖模板的 `memory`。
+orchestrator 只传递每个 sandbox 的显式策略,不判断本地/远程、单层/多层或底层能力。
+显式 `memory` 对单层和多层 restore 均会渲染;最终执行资格由 sandboxer 判断。多层顶层更接近
+活动工作集,是推荐场景,不是强制门槛。
 
 `kuasar-sandbox.cluster` 不属于上述租户配置命名空间。cluster registry 在放置后把
 `{group,route_key}` 作为 cluster 自有字段写入普通 sandbox/build metadata,并覆盖请求中
@@ -496,8 +517,9 @@ JSON 对象)注入,零 SDK/API 改动。命名空间是 sandbox-runtime `config.
   快照填),这里只对租户网络做格式校验。
 - **两个注入面**:e2b metadata,与 `X-Kuasar-Sandbox-<Ns>` 请求头(API 边缘归一化进
   metadata,**同名头胜过 metadata 键**)。create 与模板构建(register/trigger)都支持;
-  runtime sandbox 配置存 `builds.metadata_json`,build-only 配置存 `builds.builder_json`。
-  集群下 `create` 命令亦经 metadata 注入 `cluster` 命名空间(§10)。
+  sandbox 最终配置存 `sandboxes.metadata_json`,模板默认配置存 `builds.metadata_json`,
+  build-only 配置存 `builds.builder_json`。集群入口把 create body metadata 和同名 Header
+  一起传入 Reserve;Header 仍胜出(§10 / cluster-router.md)。
 - **优先级**:`节点默认 ⊕ 模板配置 ⊕ create 配置`(create 按命名空间胜)。模板配置:snp
   经快照、img 经 `builds.metadata_json`。构建内 `register ⊕ trigger`(trigger 胜);
   register/trigger 的 `cpuCount`/`memoryMB` → `resource.capacity`(胜过 resource 头),决定
@@ -507,7 +529,10 @@ JSON 对象)注入,零 SDK/API 改动。命名空间是 sandbox-runtime `config.
 - **network 随快照**:渲染时把已解析逻辑网络注入
   `SANDBOX_CONFIG.metadata["kuasar-sandbox.network"]`,随 snapshot.cfg 落盘并跨 restore 继承;
   restore 时 serve 读回,填 create 未指定的网络字段(**显式 create 胜**,§8)。迁移
-  token 同样携带 metadata。其余命名空间只在冷启生效或已冻入快照,故只 network 需随快照。
+  token 同样携带 metadata。
+- **restore policy 不随快照**:`kuasar-sandbox.restore` 留在 sandbox/template metadata 中。
+  image cold boot 不把它渲染进运行 YAML;pause 后 resume、snp create 和 migration import
+  根据各自持久化 metadata 重新渲染。sandboxer 不把该 host policy 写进 snapshot.cfg。
 - **持久化**:`sandboxes.metadata_json` / `builds.metadata_json` / `builds.builder_json`。
 
 ## 5. 进程管理(systemd 模板单元,启动时自动生成安装)
@@ -743,6 +768,8 @@ id 二次注册自动反注册(并断链)前者。鉴权:配 `paths.plugin_pidfi
   §4.6):配置随沙箱持久化(`metadata_json`),resume 时重新解析、全生命周期一致;无白名单
   门(沙箱以完整能力经 sandbox API 发布,平台自身亦经此 API 管理)。**network 另随快照**——
   restore 时 serve 读回快照内的逻辑网络,填 create 未指定的字段(显式 create 胜)。
+  `restore.prefetch` 则只随 orchestrator metadata,不会被快照继承;冷启省略,后续 restore
+  才按该 sandbox 的显式策略渲染。
 
 ### 8.1 暂停态分层、转模板与跨机迁移
 
@@ -1213,7 +1240,7 @@ sandbox-runtime.erofs 等),均已注册为 umbrella make 目标,缺前置则自�
 | `e2e_node.sh` | 单元自动安装 + 控制面(`/health`、401 路径)+ 构建 API 生命周期(register/trigger/status、跨 key 归属 404)+(有 KVM 时)bare create/list/kill | `test-e2e-node` |
 | `e2e_runtask.sh` | run-sandbox/run-builder 启动器(纯用户态,无 root/systemd/KVM):pidfile 锁/双起拒绝、HTTP 取 LaunchSpec、execve、`TASK_*` 剥除;`config` CLI 往返 | `test-e2e-runtask` |
 | `e2e_run_builder.sh` | 三阶段构建流水线(KVM + vswitch + store-ctl + zot,guest 经 mgmt VIP 拉取):fromImage → e2b-img;fromTemplate(img)+steps+startCmd → e2b-snp(manifest:// base、配置合并、snapshot.cfg metadata 断言);fromTemplate(snp)+steps → e2b-snp(start/ready 继承);profile=bare fromImage → bare-img(拒绝 start、bare 网络、image-only);分别从 e2b-snp/bare-img create/list/kill;COPY 与 files 端点 501 | `test-e2e-run-builder` |
-| `e2e_execute.sh` | 从已建模板冷启真实 microVM、guest 内 exec、pause(snapshot)→ resume 全链路;create 经 `X-Kuasar-Sandbox-Network` 注入 hostname 并在 guest 校验(§4.6) | `test-e2e-execute` |
+| `e2e_execute.sh` | 从已建模板冷启真实 microVM、guest 内 exec、pause(remote snapshot)→ resume 全链路;create 经 `X-Kuasar-Sandbox-Network` 注入 hostname,并经 `X-Kuasar-Sandbox-Restore` 持久化 memory Prefetch;断言 cold YAML 省略、resume YAML 渲染且 sandboxer 实际启动 Prefetch(§4.6) | `test-e2e-execute` |
 | `e2e_node_proxy.sh` | `proxy.mode=external` 全链路:serve + proxy master + 多 worker(shm 路由视图 + 继承 listener fd)+ 真实 microVM/envd,数据面经 proxy 走(401/转发/wake/resume/CONNECT 隧道/proxyForwarder relay) | `test-e2e-node-proxy` |
 | `orchestrator/test/e2e/e2e_cluster_stub.sh` | 用 `make build` 产物真实启动 `cluster-ctl registry/router/placer` + `node-stub-ctl`,覆盖 group 导入、key 分发、Reserve→READY→数据面转发、活动路由缓存、build_register、孤儿 route 清理、节点清空和 registry joint/old_grace cutover | `orchestrator: make test-e2e` |
 
