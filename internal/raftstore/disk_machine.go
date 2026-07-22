@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"sort"
 	"sync"
 	"sync/atomic"
 
@@ -612,14 +611,7 @@ func lookupRouteBucketOnDisk(
 	if err := iterator.Error(); err != nil {
 		return RouteBucketResult{}, err
 	}
-	sort.Slice(result.Routes, func(left, right int) bool {
-		return result.Routes[left].RouteKey < result.Routes[right].RouteKey
-	})
-	if len(result.Routes) > int(query.Limit) {
-		result.Routes = result.Routes[:query.Limit]
-		result.NextRouteKey = result.Routes[len(result.Routes)-1].RouteKey
-	}
-	return result, nil
+	return finishRouteBucketPage(result, int(query.Limit))
 }
 
 func lookupRouteChangefeedOnDisk(

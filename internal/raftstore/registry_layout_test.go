@@ -408,6 +408,74 @@ func TestRegistryLayoutGuardRejectsNewReplicaIDOnOccupiedTarget(t *testing.T) {
 	}
 }
 
+func TestRegistryLayoutGuardRejectsHistoricalReplicaIDReuse(t *testing.T) {
+	for _, target := range []string{"system", "data"} {
+		t.Run(target, func(t *testing.T) {
+			first := testRegistryLayout(1, "generation-1")
+			firstDigest, err := first.Digest()
+			if err != nil {
+				t.Fatal(err)
+			}
+			accepted, err := FirstAcceptedRegistryLayout(first, firstDigest)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			second := cloneRegistryLayout(first)
+			second.RegistryLayoutVersion = 2
+			second.PreviousRegistryLayoutVersion = 1
+			second.PreviousRegistryLayoutDigest = firstDigest
+			second.Members = append(second.Members, RegistryMember{
+				MemberID: "registry-d", InternalEndpoint: "https://registry-d:9443", RaftEndpoint: "registry-d:63001",
+			})
+			replacement := ReplicaPlacement{MemberID: "registry-d", ReplicaID: 4}
+			if target == "system" {
+				second.SystemReplicas[2] = replacement
+			} else {
+				second.DataShards[0].Replicas[2] = replacement
+			}
+			secondDigest, err := second.Digest()
+			if err != nil {
+				t.Fatal(err)
+			}
+			accepted, err = accepted.Accept(second, secondDigest)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			guard := RegistryLayoutGuard{Path: filepath.Join(t.TempDir(), "registryLayout.json")}
+			if err := guard.store(accepted); err != nil {
+				t.Fatal(err)
+			}
+			loaded, err := guard.Load()
+			if err != nil || loaded == nil {
+				t.Fatalf("load accepted history = %+v, %v", loaded, err)
+			}
+
+			third := cloneRegistryLayout(second)
+			third.RegistryLayoutVersion = 3
+			third.PreviousRegistryLayoutVersion = 2
+			third.PreviousRegistryLayoutDigest = secondDigest
+			reused := ReplicaPlacement{MemberID: "registry-c", ReplicaID: 3}
+			if target == "system" {
+				third.SystemReplicas[2] = reused
+			} else {
+				third.DataShards[0].Replicas[2] = reused
+			}
+			thirdDigest, err := third.Digest()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := ValidateRegistryLayoutTransition(second, third); err != nil {
+				t.Fatalf("immediate transition should be structurally valid: %v", err)
+			}
+			if _, err := loaded.Accept(third, thirdDigest); err == nil {
+				t.Fatal("retired replica ID was reusable after reloading the durable guard")
+			}
+		})
+	}
+}
+
 func TestRegistryLayoutGuardBindsSuccessorToPredecessorPermitLifetime(t *testing.T) {
 	first := testRegistryLayout(4, "generation-1")
 	firstDigest, _ := first.Digest()

@@ -231,6 +231,12 @@ func (r *Runtime) FinalizeRegistryLayoutTransition(ctx context.Context) (SystemS
 	if err != nil {
 		return SystemState{}, err
 	}
+	if r.registryLayoutActivationFinalized(state) {
+		if err := r.syncLocalRegistryLayout(state); err != nil {
+			return SystemState{}, err
+		}
+		return state, nil
+	}
 	transition, err := r.requireRegistryLayoutTransition(state)
 	if err != nil {
 		return SystemState{}, err

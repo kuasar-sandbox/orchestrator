@@ -248,7 +248,7 @@ func stateScaleReadyRoute(
 		Group: group, RouteKey: routeKey, State: clusterstate.WorkflowRouteStarting,
 		Starting: &clusterstate.RouteStartingState{
 			SandboxID: sandboxID, PlacementRound: 1,
-			CandidatePool:     []clusterstate.PlacementCandidate{{NodeID: nodeID}},
+			CandidatePool:     []clusterstate.PlacementCandidate{testPlacementCandidate(nodeID)},
 			SelectedCandidate: &selected, Intent: intent, Binding: &binding,
 		},
 	}

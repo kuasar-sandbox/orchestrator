@@ -96,8 +96,8 @@ func LookupData(state DataState, query DataLookup) (DataLookupResult, error) {
 		response := lookupWorkflow(state, *query.Workflow)
 		return DataLookupResult{Workflow: &response}, nil
 	case query.RouteBucket != nil:
-		response := lookupRouteBucket(state, *query.RouteBucket)
-		return DataLookupResult{RouteBucket: &response}, nil
+		response, err := lookupRouteBucket(state, *query.RouteBucket)
+		return DataLookupResult{RouteBucket: &response}, err
 	case query.Changefeed != nil:
 		response, err := lookupRouteChangefeed(state, *query.Changefeed)
 		return DataLookupResult{Changefeed: &response}, err
@@ -204,15 +204,15 @@ type RouteBucketResult struct {
 	NextRouteKey     string             `json:"next_route_key,omitempty"`
 }
 
-func lookupRouteBucket(state DataState, query RouteBucketLookup) RouteBucketResult {
+func lookupRouteBucket(state DataState, query RouteBucketLookup) (RouteBucketResult, error) {
 	result := RouteBucketResult{Group: query.Group, Bucket: query.Bucket}
 	if !state.Initialized || !state.Accepts(query.Identity) {
 		result.Reason = "Route shard identity is not available"
-		return result
+		return result, nil
 	}
 	if !routeBucketTargetsShard(state, query.Group, query.Bucket, query.Identity.ShardID) {
 		result.Reason = "Route bucket targets another shard"
-		return result
+		return result, nil
 	}
 	result.Available = true
 	result.SnapshotRevision = state.LastApplied
@@ -230,14 +230,53 @@ func lookupRouteBucket(state DataState, query RouteBucketLookup) RouteBucketResu
 			}
 		}
 	}
+	return finishRouteBucketPage(result, int(query.Limit))
+}
+
+const MaxRouteBucketResponseBytes = 8 << 20
+
+func finishRouteBucketPage(result RouteBucketResult, limit int) (RouteBucketResult, error) {
 	sort.Slice(result.Routes, func(left, right int) bool {
 		return result.Routes[left].RouteKey < result.Routes[right].RouteKey
 	})
-	if len(result.Routes) > int(query.Limit) {
-		result.Routes = result.Routes[:query.Limit]
-		result.NextRouteKey = result.Routes[len(result.Routes)-1].RouteKey
+	candidates := result.Routes
+	result.Routes = make([]RouteBucketEntry, 0, min(limit, len(candidates)))
+	payloadBytes := 0
+	for index, entry := range candidates {
+		if len(result.Routes) == limit {
+			break
+		}
+		encoded, err := json.Marshal(entry)
+		if err != nil {
+			return RouteBucketResult{}, fmt.Errorf("raftstore: encode Route bucket row: %w", err)
+		}
+		nextPayloadBytes := payloadBytes + len(encoded)
+		if len(result.Routes) != 0 {
+			nextPayloadBytes++
+		}
+		hasMore := index+1 < len(candidates)
+		nextRouteKey := ""
+		if hasMore {
+			nextRouteKey = entry.RouteKey
+		}
+		envelope := result
+		envelope.Routes = make([]RouteBucketEntry, 0)
+		envelope.NextRouteKey = nextRouteKey
+		envelopeBytes, err := json.Marshal(DataLookupResult{RouteBucket: &envelope})
+		if err != nil {
+			return RouteBucketResult{}, fmt.Errorf("raftstore: encode Route bucket envelope: %w", err)
+		}
+		if len(envelopeBytes)+nextPayloadBytes > MaxRouteBucketResponseBytes {
+			if len(result.Routes) == 0 {
+				return RouteBucketResult{}, errors.New("raftstore: one Route bucket row exceeds the response byte limit")
+			}
+			return result, nil
+		}
+		payloadBytes = nextPayloadBytes
+		result.Routes = append(result.Routes, entry)
+		result.NextRouteKey = nextRouteKey
 	}
-	return result
+	return result, nil
 }
 
 type routeBucketEntryHeap []RouteBucketEntry
