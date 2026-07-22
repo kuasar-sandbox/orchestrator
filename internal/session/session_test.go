@@ -408,6 +408,20 @@ func TestHolderDropsHighWatermarkOnlyAfterCommittedIdentityRetirement(t *testing
 	if _, err := holder.Register(context.Background(), registration, &testEndpoint{}); err == nil {
 		t.Fatal("retired identity registered again")
 	}
+	removed, err = holder.RetireIdentity(context.Background(), retirement)
+	if err != nil || !removed {
+		t.Fatalf("idempotent retirement removed=%v err=%v", removed, err)
+	}
+
+	other, err := NewHolder("registry-b", 1, nil, testGate(true), nil, authority)
+	if err != nil {
+		t.Fatal(err)
+	}
+	removed, err = other.RetireIdentity(context.Background(), retirement)
+	if err != nil || !removed || other.Active() != 0 || other.TrackedIdentities() != 0 {
+		t.Fatalf("never-owning Holder retirement removed=%v active=%d tracked=%d err=%v",
+			removed, other.Active(), other.TrackedIdentities(), err)
+	}
 }
 
 func TestHolderSerializesRegistrationInstallationWithRetirement(t *testing.T) {
