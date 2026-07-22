@@ -225,7 +225,6 @@ func routeRequest(strong bool) ReadRouteRequest {
 }
 
 func testReadyRoute() *clusterstate.ReadyRoute {
-	digest := sha256.Sum256([]byte("binding"))
 	templateRef := "e2b-img-" + strings.Repeat("c", 64)
 	spec, _ := clusterstate.MarshalSandboxDispatchSpec(clusterstate.SandboxDispatchSpecV1{
 		Version: clusterstate.DispatchSpecVersionV1, TemplateRef: templateRef,
@@ -237,16 +236,16 @@ func testReadyRoute() *clusterstate.ReadyRoute {
 		},
 	})
 	intent, _ := clusterstate.NewDispatchIntent([]byte("demand"), spec, "provider-v1")
+	opaque, digest := testProjectionBinding(clusterstate.ExecutionKindSandbox, "s1", "rk", intent)
 	return &clusterstate.ReadyRoute{
 		SandboxID: "s1", NodeID: "n1", NodeEpoch: 7, DataEndpoint: "10.0.0.1:8443",
 		TargetPort: 3000, AccessToken: "token", TrafficAccessToken: "traffic-token",
 		TemplateRef: templateRef, RegistryGeneration: "g1",
-		BindingDigest: hex.EncodeToString(digest[:]), LastEventSeq: 3, Intent: intent,
+		OpaqueBinding: opaque, BindingDigest: digest, LastEventSeq: 3, Intent: intent,
 	}
 }
 
 func testBuildProjection() *clusterstate.BuildProjection {
-	digest := sha256.Sum256([]byte("build-binding"))
 	spec, _ := clusterstate.MarshalBuildDispatchSpec(clusterstate.BuildDispatchSpecV1{
 		Version: clusterstate.DispatchSpecVersionV1, TemplateID: "template-1",
 		AuthKeyFingerprint: strings.Repeat("b", 24), ManifestKeyFingerprint: strings.Repeat("c", 24),
@@ -254,9 +253,24 @@ func testBuildProjection() *clusterstate.BuildProjection {
 		Request: clusterstate.NodeRequestEnvelopeV1{Version: clusterstate.NodeRequestEnvelopeVersionV1, Method: "POST", Path: "/v3/templates", Body: []byte(`{"cpuCount":1,"memoryMB":512,"metadata":null,"name":"","profile":"bare","tags":null}`)},
 	})
 	intent, _ := clusterstate.NewDispatchIntent([]byte("demand"), spec, "provider-v1")
+	opaque, digest := testProjectionBinding(clusterstate.ExecutionKindBuild, "b1", "", intent)
 	return &clusterstate.BuildProjection{
 		BuildID: "b1", NodeID: "n1", NodeEpoch: 7, DataEndpoint: "10.0.0.1:8443",
-		RegistryGeneration: "g1", BindingDigest: hex.EncodeToString(digest[:]),
+		RegistryGeneration: "g1", OpaqueBinding: opaque, BindingDigest: digest,
 		Intent: intent, TemplateRef: "template-1",
 	}
+}
+
+func testProjectionBinding(kind clusterstate.ExecutionKind, objectID, routeKey string, intent clusterstate.DispatchIntent) (string, string) {
+	var demand, dispatch [sha256.Size]byte
+	demandBytes, _ := hex.DecodeString(intent.DemandDigest)
+	dispatchBytes, _ := hex.DecodeString(intent.DispatchSpecDigest)
+	copy(demand[:], demandBytes)
+	copy(dispatch[:], dispatchBytes)
+	opaque, _ := clusterstate.EncodeExecutionBinding(clusterstate.ExecutionBinding{
+		RegistryGeneration: "g1", Kind: kind, ObjectID: objectID, Group: "/g", RouteKey: routeKey,
+		NodeID: "n1", NodeEpoch: 7, DemandDigest: demand, DispatchSpecDigest: dispatch,
+	})
+	digest, _ := clusterstate.ExecutionBindingDigest(opaque)
+	return opaque, digest
 }

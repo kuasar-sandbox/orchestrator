@@ -93,6 +93,9 @@ func (s BuildDispatchSpecV1) Validate() error {
 	if s.CPUCount <= 0 || s.MemoryMB <= 0 {
 		return errors.New("cluster: Build registration requires positive CPU and memory ceilings")
 	}
+	if len(s.Names) > 1 {
+		return errors.New("cluster: Build dispatch spec supports at most one immutable name")
+	}
 	if _, exists := s.Metadata[ObjectMetadataKey]; exists {
 		return errors.New("cluster: dispatch spec cannot supply system-owned metadata")
 	}
