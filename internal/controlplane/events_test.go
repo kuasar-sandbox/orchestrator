@@ -289,7 +289,9 @@ func newEventFixture(
 			})
 		}
 	} else {
-		normalizedDemand, err = placement.NormalizeBuildDemand(placement.BuildDemand{Slots: 1})
+		normalizedDemand, err = placement.NormalizeBuildDemand(placement.BuildDemand{
+			Slots: 1, CPU: 1000, Memory: 512 << 20,
+		})
 		if err == nil {
 			var request clusterstate.NodeRequestEnvelopeV1
 			request, err = clusterstate.NewNodeRequestEnvelopeV1(http.MethodPost, "/v3/templates", "", nil, []byte(`{"cpuCount":1,"memoryMB":512,"metadata":null,"name":"","profile":"bare","tags":null}`))

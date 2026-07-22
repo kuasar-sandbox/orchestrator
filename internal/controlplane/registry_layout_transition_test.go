@@ -52,8 +52,6 @@ func (s *transitionRuntimeStub) ReconcileRegistryLayoutTransitionShard(
 		case raftstore.TransitionCatchingUp:
 			shard.Stage = raftstore.TransitionPromoted
 		case raftstore.TransitionPromoted:
-			shard.Stage = raftstore.TransitionOldRemoved
-		case raftstore.TransitionOldRemoved:
 			shard.Stage = raftstore.TransitionComplete
 		case raftstore.TransitionComplete:
 			shard.Stage = raftstore.TransitionEpochRetired
