@@ -41,8 +41,9 @@ func (s *Store) CommitBuildTrigger(ctx context.Context, candidate *types.Build, 
 		}
 		return false, nil
 	}
+	manifestKeyConflict := candidate.FromTemplate == "" && current.ManifestKey != candidate.ManifestKey
 	if current.Status != types.BuildRegistered || current.TemplateID != candidate.TemplateID ||
-		current.AuthKey != candidate.AuthKey || current.ManifestKey != candidate.ManifestKey ||
+		current.AuthKey != candidate.AuthKey || manifestKeyConflict ||
 		current.Profile != candidate.Profile || current.CPUCount != candidate.CPUCount ||
 		current.MemoryMB != candidate.MemoryMB ||
 		current.CreatedUnix != candidate.CreatedUnix {

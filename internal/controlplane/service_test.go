@@ -53,6 +53,13 @@ func TestRegistryReserveKeepsCommittedStartingIntentAndBinding(t *testing.T) {
 	if len(calls) != 2 || calls[0].ObjectID != calls[1].ObjectID || calls[0].Binding != calls[1].Binding {
 		t.Fatalf("dispatch retries were not pinned to one execution: %+v", calls)
 	}
+	wantLease, err := serviceKeyLease(request.Group).Ref()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls[0].KeyLeaseRef != wantLease || calls[1].KeyLeaseRef != wantLease {
+		t.Fatalf("dispatch retries were not fenced by the acknowledged key lease: %+v", calls)
+	}
 
 	changed := request
 	changed.Input.Config = map[string]string{"request": "changed"}

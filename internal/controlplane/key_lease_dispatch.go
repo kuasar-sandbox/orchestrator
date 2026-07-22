@@ -50,6 +50,7 @@ func (d keyLeaseDispatcher) AdmitAndDispatch(
 	if !sent || ack != want {
 		return session.DispatchReply{}, errors.New("controlplane: selected node did not durably acknowledge the exact key lease")
 	}
+	command.KeyLeaseRef = want
 	return d.next.AdmitAndDispatch(ctx, command)
 }
 

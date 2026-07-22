@@ -3,6 +3,7 @@ package orch
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
@@ -57,5 +58,45 @@ func TestBuildTriggerCannotIncreaseRegisteredResources(t *testing.T) {
 	}
 	if stored.Metadata[sandboxcfg.NsNetwork] != `{"hostname":"trigger"}` {
 		t.Fatalf("non-resource metadata was not preserved: %+v", stored.Metadata)
+	}
+}
+
+func TestBuildFromTemplateUsesTheBaseManifestKey(t *testing.T) {
+	o := testOrch(t)
+	ctx := context.Background()
+	apiKey := allowlistedBuildIdentity(t, o)
+	currentManifestKey := strings.Repeat("5a", 32)
+	target, err := o.RegisterBuild(ctx, apiKey, api.RegisterSpec{
+		Profile: types.ProfileE2B, CPUCount: 2, MemoryMB: 2048,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseManifestKey := strings.Repeat("6c", 32)
+	base := &types.Build{
+		BuildID: "base-build", TemplateID: "transient-base",
+		PersistID: "e2b-img-" + strings.Repeat("a", 64),
+		AuthKey:   target.AuthKey, ManifestKey: baseManifestKey,
+		Profile: types.ProfileE2B, CPUCount: 2, MemoryMB: 2048,
+		Kind: types.KindImg, Status: types.BuildReady, CreatedUnix: 1,
+	}
+	if err := o.st.PutBuild(ctx, base); err != nil {
+		t.Fatal(err)
+	}
+	if target.ManifestKey != currentManifestKey {
+		t.Fatalf("registered target key = %q, want current key", target.ManifestKey)
+	}
+	if err := o.TriggerBuild(ctx, apiKey, target.TemplateID, target.BuildID, api.TriggerSpec{
+		FromTemplate: base.PersistID,
+		Steps:        []types.TemplateStep{{Type: "RUN", Args: []string{"true"}}},
+	}, api.BuildAuth{}); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := o.st.GetBuild(ctx, target.BuildID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.ManifestKey != baseManifestKey || stored.FromTemplate != base.PersistID {
+		t.Fatalf("derived Build content identity = key %q base %q", stored.ManifestKey, stored.FromTemplate)
 	}
 }

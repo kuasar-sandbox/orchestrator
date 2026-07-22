@@ -168,13 +168,14 @@ type ReadBuildResponse struct {
 // without exposing a node Binding that has not yet been acknowledged. It is a
 // read projection of the existing workflow state, not another lifecycle state.
 type PendingBuildProjection struct {
-	BuildID     string        `json:"build_id"`
-	TemplateRef string        `json:"template_ref"`
-	Profile     types.Profile `json:"profile"`
+	BuildID            string        `json:"build_id"`
+	RegistryGeneration string        `json:"registry_generation"`
+	TemplateRef        string        `json:"template_ref"`
+	Profile            types.Profile `json:"profile"`
 }
 
 func (p PendingBuildProjection) Validate() error {
-	if p.BuildID == "" || p.TemplateRef == "" || !p.Profile.Valid() {
+	if p.BuildID == "" || p.RegistryGeneration == "" || p.TemplateRef == "" || !p.Profile.Valid() {
 		return errors.New("routeapi: incomplete pending Build projection")
 	}
 	return nil
@@ -227,6 +228,7 @@ func (r ReadBuildResponse) ValidateFor(request ReadBuildRequest) error {
 			return nil
 		}
 		if !request.Strong || r.Group != request.Group || r.Pending.BuildID != request.BuildID ||
+			r.Pending.RegistryGeneration != request.RegistryGeneration ||
 			r.BuildState != clusterstate.BuildStarting || r.BuildRevision == 0 || r.BuildRevision < request.MinBuildRevision {
 			return errors.New("routeapi: pending Build read does not satisfy request fence")
 		}

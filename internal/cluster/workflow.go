@@ -105,6 +105,9 @@ func NewDispatchIntent(demand, spec []byte, providerPolicyVersion string) (Dispa
 	if len(demand) > MaxNormalizedDemandBytes {
 		return DispatchIntent{}, fmt.Errorf("cluster: normalized demand exceeds %d bytes", MaxNormalizedDemandBytes)
 	}
+	if len(spec) > MaxDispatchSpecBytes {
+		return DispatchIntent{}, fmt.Errorf("cluster: dispatch spec exceeds %d bytes", MaxDispatchSpecBytes)
+	}
 	intent := DispatchIntent{
 		NormalizedDemand:      append([]byte(nil), demand...),
 		DispatchSpec:          append([]byte(nil), spec...),

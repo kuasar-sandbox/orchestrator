@@ -533,6 +533,15 @@ func (r *Runtime) syncLocalRegistryLayout(system SystemState) error {
 	if r.enrollment.RegistryLayoutVersion == system.ActiveRegistryLayoutVersion {
 		return nil
 	}
+	if _, retained := registryLayoutMember(r.registryLayout, r.member.MemberID); !retained {
+		for _, replica := range r.enrollment.Replicas {
+			if replica.LocalState != ReplicaRemoved {
+				// A removed member must remain restartable from the predecessor
+				// artifact until every local predecessor replica is durably gone.
+				return nil
+			}
+		}
+	}
 	next := r.enrollment
 	next.Replicas = append([]LocalReplicaEnrollment(nil), r.enrollment.Replicas...)
 	next.RegistryLayoutVersion = system.ActiveRegistryLayoutVersion

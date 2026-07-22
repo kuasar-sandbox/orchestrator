@@ -76,6 +76,9 @@ type DispatchCommand struct {
 	DataEndpoint  string
 	Intent        cluster.DispatchIntent
 	Binding       cluster.ExecutionBindingIntent
+	// KeyLeaseRef is the exact current Provider lease acknowledged immediately
+	// before this dispatch. It is a transport prerequisite, not persisted intent.
+	KeyLeaseRef routesync.NodeKeyLeaseRefV1
 }
 
 type DispatchReply struct {
@@ -356,7 +359,7 @@ func (h *Holder) CheckServe(identity ServeIdentity, operation PermitOperation) e
 
 func (h *Holder) AdmitAndDispatch(ctx context.Context, command DispatchCommand) (DispatchReply, error) {
 	if err := ctx.Err(); err != nil {
-		return DispatchReply{}, err
+		return DispatchReply{}, errors.Join(ErrDispatchNotSent, err)
 	}
 	if err := h.CheckServe(command.ServeIdentity, PermitDispatch); err != nil {
 		return DispatchReply{}, errors.Join(ErrDispatchNotSent, err)
@@ -378,20 +381,26 @@ func (h *Holder) AdmitAndDispatch(ctx context.Context, command DispatchCommand) 
 		return DispatchReply{}, ErrSessionUnavailable
 	}
 	defer held.commandMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return DispatchReply{}, errors.Join(ErrDispatchNotSent, err)
+	}
 	keyLeaseID, err := dispatchKeyLeaseID(command)
 	if err != nil {
 		return DispatchReply{}, err
 	}
 	held.leaseMu.RLock()
-	leaseExpires := held.keyLeases[keyLeaseID].ExpiresUnix
+	installed := held.keyLeases[keyLeaseID]
 	held.leaseMu.RUnlock()
-	if leaseExpires <= h.clock().Unix() {
+	if installed.Ref != command.KeyLeaseRef || installed.ExpiresUnix <= h.clock().Unix() {
 		return DispatchReply{}, errors.Join(ErrDispatchNotSent, ErrKeyLeaseUnavailable)
 	}
 	// A command can wait behind another dispatch while its generation Permit
 	// expires. Recheck after acquiring the per-session command fence and just
 	// before handing the command to the transport.
 	if err := h.CheckServe(command.ServeIdentity, PermitDispatch); err != nil {
+		return DispatchReply{}, errors.Join(ErrDispatchNotSent, err)
+	}
+	if err := ctx.Err(); err != nil {
 		return DispatchReply{}, errors.Join(ErrDispatchNotSent, err)
 	}
 	endpoint := held.endpoint

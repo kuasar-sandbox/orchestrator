@@ -76,6 +76,42 @@ func TestLookupIdentityCoversLeaseAndRecoveryQueries(t *testing.T) {
 	}
 }
 
+func TestLeaderHintUsesThePermitRegistryLayout(t *testing.T) {
+	startup := testRegistryLayout(1, "generation-hint")
+	startupDigest, err := startup.Digest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := cloneRegistryLayout(startup)
+	target.RegistryLayoutVersion++
+	target.PreviousRegistryLayoutVersion = startup.RegistryLayoutVersion
+	target.PreviousRegistryLayoutDigest = startupDigest
+	oldLeader := startup.DataShards[0].Replicas[0]
+	target.DataShards[0].Replicas[0].ReplicaID += 100
+	targetDigest, err := target.Digest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	host := newFakeNodeHost()
+	host.leaderID, host.leaderTerm = oldLeader.ReplicaID, 9
+	runtime := &Runtime{
+		registryLayout: target, registryLayoutDigest: targetDigest,
+		startupRegistryLayout: startup, nodeHost: host,
+	}
+	result := DataLookupResult{Route: &routeapi.ReadRouteResponse{Outcome: routeapi.ReadNeedLeader}}
+	runtime.attachLeaderHint(0, ShardRequestIdentity{PermitIdentity: PermitIdentity{
+		RegistryLayoutDigest: startupDigest,
+	}}, &result)
+	member, found := registryLayoutMember(startup, oldLeader.MemberID)
+	if !found {
+		t.Fatal("startup leader member is missing")
+	}
+	if result.Route.LeaderHint == nil || result.Route.LeaderHint.MemberID != member.MemberID ||
+		result.Route.LeaderHint.Endpoint != member.InternalEndpoint || result.Route.LeaderHint.Term != 9 {
+		t.Fatalf("predecessor leader hint = %+v", result.Route.LeaderHint)
+	}
+}
+
 func TestRuntimeResolvesAmbiguousDataMutationByExactStrongRead(t *testing.T) {
 	registryLayout := testRegistryLayout(1, "generation-ambiguous")
 	identity := routeShardIdentity(t, registryLayout, "/g", "rk")

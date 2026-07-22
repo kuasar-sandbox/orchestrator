@@ -256,7 +256,7 @@ func (r *Runtime) ReadData(ctx context.Context, query DataLookup) (DataLookupRes
 		return DataLookupResult{}, errors.New("raftstore: Dragonboat returned an invalid data lookup result")
 	}
 	if !strong {
-		r.attachLeaderHint(logicalShardID, &result)
+		r.attachLeaderHint(logicalShardID, identity, &result)
 	}
 	return result, nil
 }
@@ -322,7 +322,7 @@ func lookupIdentity(query DataLookup) (ShardRequestIdentity, uint32, bool, error
 	}
 }
 
-func (r *Runtime) attachLeaderHint(shardID uint32, result *DataLookupResult) {
+func (r *Runtime) attachLeaderHint(shardID uint32, identity ShardRequestIdentity, result *DataLookupResult) {
 	if result == nil {
 		return
 	}
@@ -337,12 +337,23 @@ func (r *Runtime) attachLeaderHint(shardID uint32, result *DataLookupResult) {
 	if err != nil || !valid || term == 0 {
 		return
 	}
-	placement := r.registryLayout.DataShards[shardID]
+	layout := r.registryLayout
+	if identity.RegistryLayoutDigest != r.registryLayoutDigest {
+		startupDigest, digestErr := r.startupRegistryLayout.Digest()
+		if digestErr != nil || identity.RegistryLayoutDigest != startupDigest {
+			return
+		}
+		layout = r.startupRegistryLayout
+	}
+	if int(shardID) >= len(layout.DataShards) {
+		return
+	}
+	placement := layout.DataShards[shardID]
 	for _, replica := range placement.Replicas {
 		if replica.ReplicaID != leaderID {
 			continue
 		}
-		member, found := registryLayoutMember(r.registryLayout, replica.MemberID)
+		member, found := registryLayoutMember(layout, replica.MemberID)
 		if !found {
 			return
 		}

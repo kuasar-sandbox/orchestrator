@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"sync"
 	"time"
 
 	"golang.org/x/net/http2"
@@ -40,6 +41,7 @@ type WakeSource interface {
 type Subscriber struct {
 	dial  func(ctx context.Context) (net.Conn, error)
 	id    string
+	regMu sync.RWMutex
 	reg   Register
 	sink  Sink
 	wakes WakeSource // nil if this subscriber issues no wakes
@@ -130,7 +132,9 @@ func (s *Subscriber) session(ctx context.Context, tr *http2.Transport) error {
 // writeUp sends the Register frame, then forwards Wakes (route_wake) until ctx ends.
 // With no WakeSource it holds the request body open (the down stream is what matters).
 func (s *Subscriber) writeUp(ctx context.Context, w io.Writer) error {
+	s.regMu.RLock()
 	r := s.reg
+	s.regMu.RUnlock()
 	if err := WriteMsg(w, &Msg{Type: TypeRegister, Register: &r}); err != nil {
 		return err
 	}
@@ -168,6 +172,9 @@ func (s *Subscriber) apply(m *Msg) {
 		}
 		s.sink.ApplyDelete(*m.Delete)
 	case TypeBookmark:
+		s.regMu.Lock()
+		s.reg.ResumeFrom = m.RevToken
+		s.regMu.Unlock()
 		s.sink.Bookmark(m.FullSync)
 	default:
 		s.log.Warn("routesync: unknown message", "type", m.Type)

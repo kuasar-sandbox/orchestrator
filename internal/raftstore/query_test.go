@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/routeapi"
@@ -226,6 +227,21 @@ func TestPendingLookupRecoversCommittedWorkflowIntentOnly(t *testing.T) {
 		default:
 			t.Fatal("pending lookup returned an empty workflow")
 		}
+	}
+}
+
+func TestPendingCursorRoundTripsBinaryStorageKeysAsUTF8(t *testing.T) {
+	raw := "r" + routeMapKey(strings.Repeat("g", 200), strings.Repeat("r", 300))
+	cursor := encodePendingCursor(raw)
+	if !utf8.ValidString(cursor) {
+		t.Fatalf("pending cursor is not valid UTF-8: %q", cursor)
+	}
+	decoded, err := decodePendingCursor(cursor)
+	if err != nil || decoded != raw {
+		t.Fatalf("pending cursor round trip = %q, %v", decoded, err)
+	}
+	if _, err := decodePendingCursor(cursor + "="); err == nil {
+		t.Fatal("noncanonical pending cursor was accepted")
 	}
 }
 
