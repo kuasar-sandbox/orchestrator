@@ -1,6 +1,7 @@
 package routeapi
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -77,7 +78,14 @@ func authorizeInternal(w http.ResponseWriter, r *http.Request, trust TrustVerifi
 }
 
 func decodeRequest(r *http.Request, out any) error {
-	decoder := json.NewDecoder(io.LimitReader(r.Body, maxBodyBytes+1))
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes+1))
+	if err != nil {
+		return err
+	}
+	if len(body) > maxBodyBytes {
+		return errors.New("routeapi: request body exceeds size limit")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(body))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(out); err != nil {
 		return err

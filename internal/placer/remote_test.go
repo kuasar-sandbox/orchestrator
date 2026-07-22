@@ -739,6 +739,13 @@ type pagedFailingGroupSource struct {
 	rangeCalls atomic.Int32
 }
 
+func (s *pagedFailingGroupSource) GetRecord(context.Context, string) (clusterstate.SandboxGroupRecord, bool, error) {
+	return clusterstate.SandboxGroupRecord{
+		Group: "/g1", AuthKey: clusterstate.Secret{Type: clusterstate.SecretInline, Value: testAuthKey},
+		ManifestKey: clusterstate.Secret{Type: clusterstate.SecretInline, Value: testManifestKey},
+	}, true, nil
+}
+
 func (s *pagedFailingGroupSource) Get(context.Context, string) (clusterstate.SandboxGroup, bool, error) {
 	return clusterstate.SandboxGroup{Group: "/g1"}, true, nil
 }
@@ -765,6 +772,13 @@ func (s *pagedFailingGroupSource) Range(_ context.Context, cursor string, _ int)
 
 func newCountingGroupSource(group string) *countingGroupSource {
 	return &countingGroupSource{group: group}
+}
+
+func (s *countingGroupSource) GetRecord(context.Context, string) (clusterstate.SandboxGroupRecord, bool, error) {
+	return clusterstate.SandboxGroupRecord{
+		Group: s.group, AuthKey: clusterstate.Secret{Type: clusterstate.SecretInline, Value: testAuthKey},
+		ManifestKey: clusterstate.Secret{Type: clusterstate.SecretInline, Value: testManifestKey},
+	}, true, nil
 }
 
 func (s *countingGroupSource) Get(context.Context, string) (clusterstate.SandboxGroup, bool, error) {

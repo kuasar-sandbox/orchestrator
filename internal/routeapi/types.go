@@ -45,7 +45,7 @@ func (h LeaderHint) Validate() error {
 	if h.MemberID == "" || h.Endpoint == "" || h.Term == 0 {
 		return errors.New("routeapi: incomplete leader hint")
 	}
-	return nil
+	return clusterstate.ValidateCanonicalHTTPSBaseEndpoint(h.Endpoint)
 }
 
 type ReadRouteRequest struct {

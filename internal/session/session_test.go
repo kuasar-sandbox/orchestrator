@@ -66,6 +66,29 @@ type testGate bool
 
 func (g testGate) AllowSessionWork(ServeIdentity) bool { return bool(g) }
 
+type switchGate struct {
+	mu      sync.RWMutex
+	allowed bool
+	checks  chan struct{}
+}
+
+func (g *switchGate) AllowSessionWork(ServeIdentity) bool {
+	g.mu.RLock()
+	allowed := g.allowed
+	g.mu.RUnlock()
+	select {
+	case g.checks <- struct{}{}:
+	default:
+	}
+	return allowed
+}
+
+func (g *switchGate) set(allowed bool) {
+	g.mu.Lock()
+	g.allowed = allowed
+	g.mu.Unlock()
+}
+
 type allowDirectoryEntries struct{}
 
 func (allowDirectoryEntries) AllowDirectoryEntry(DirectoryEntry) bool { return true }
@@ -928,6 +951,52 @@ func TestHolderDispatchFailsClosedWithoutPermit(t *testing.T) {
 	}
 	if len(endpoint.commands) != 0 {
 		t.Fatal("dispatch reached endpoint with an expired Permit")
+	}
+}
+
+func TestHolderRechecksPermitAfterWaitingForCommandFence(t *testing.T) {
+	registration := testRegistration("node-1", 7, 10, "10.0.0.1:8443")
+	gate := &switchGate{allowed: true, checks: make(chan struct{}, 8)}
+	holder, err := NewHolder("registry-a", 1, nil, gate, nil, newTestEnrollmentAuthority(registration))
+	if err != nil {
+		t.Fatal(err)
+	}
+	endpoint := &testEndpoint{}
+	if _, err := holder.Register(context.Background(), registration, endpoint); err != nil {
+		t.Fatal(err)
+	}
+	if _, sent, err := holder.InstallKeyLease(
+		context.Background(), testServeIdentity(), registration.NodeID, registration.NodeEpoch, registration.DataEndpoint, testKeyLease(),
+	); err != nil || !sent {
+		t.Fatalf("install key lease sent=%v err=%v", sent, err)
+	}
+	for len(gate.checks) > 0 {
+		<-gate.checks
+	}
+
+	holder.mu.RLock()
+	held := holder.active[registration.NodeID]
+	holder.mu.RUnlock()
+	held.commandMu.Lock()
+	command := testDispatchCommand(t, registration)
+	done := make(chan error, 1)
+	go func() {
+		_, err := holder.AdmitAndDispatch(context.Background(), command)
+		done <- err
+	}()
+	select {
+	case <-gate.checks:
+	case <-time.After(time.Second):
+		held.commandMu.Unlock()
+		t.Fatal("dispatch did not perform its initial Permit check")
+	}
+	gate.set(false)
+	held.commandMu.Unlock()
+	if err := <-done; !errors.Is(err, ErrPermitUnavailable) || !errors.Is(err, ErrDispatchNotSent) {
+		t.Fatalf("expired Permit error = %v", err)
+	}
+	if len(endpoint.commands) != 0 {
+		t.Fatal("dispatch reached endpoint after Permit expired while waiting")
 	}
 }
 

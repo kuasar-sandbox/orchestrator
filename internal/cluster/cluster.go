@@ -141,6 +141,7 @@ type GroupPage struct {
 // SandboxGroupProvider is the unified group provider consumed by the cluster
 // kernel.
 type SandboxGroupProvider interface {
+	GetRecord(ctx context.Context, group string) (SandboxGroupRecord, bool, error)
 	Get(ctx context.Context, group string) (SandboxGroup, bool, error)
 	GetPlacementHint(ctx context.Context, group string) (PlacementHint, bool, error)
 	GetManifestKey(ctx context.Context, group string) (Secret, bool, error) // content key, node-facing
