@@ -109,12 +109,13 @@ type Router struct {
 	authMu        sync.Mutex
 	authOK        map[string]time.Time
 
-	routeTTL         time.Duration
-	routeIdleTimeout time.Duration
-	cacheMu          sync.Mutex
-	routes           map[string]*routeEntry
-	minimumRevisions map[string]uint64
-	builds           map[string]*buildEntry
+	routeTTL          time.Duration
+	routeIdleTimeout  time.Duration
+	cacheMu           sync.Mutex
+	routes            map[string]*routeEntry
+	minimumRevisions  map[string]uint64
+	routeRevisionRefs map[string]uint32
+	builds            map[string]*buildEntry
 
 	reserveMu sync.Mutex
 	flights   map[string]*reserveFlight
@@ -137,8 +138,9 @@ func New(control ControlPlane, authorizer CallerAuthorizer, domain string, authT
 		control: control, authorizer: authorizer, domain: domain, log: log, mx: metrics.New(),
 		authMode: "enforce", dataPlaneAuth: "enforce", authTTL: authTTL,
 		authOK: make(map[string]time.Time), routeTTL: 5 * time.Minute, routeIdleTimeout: 2 * time.Minute,
-		routes:           make(map[string]*routeEntry),
-		minimumRevisions: make(map[string]uint64), builds: make(map[string]*buildEntry),
+		routes:            make(map[string]*routeEntry),
+		minimumRevisions:  make(map[string]uint64),
+		routeRevisionRefs: make(map[string]uint32), builds: make(map[string]*buildEntry),
 		flights: make(map[string]*reserveFlight),
 		forward: &http.Transport{
 			MaxIdleConns: 512, MaxIdleConnsPerHost: 64, IdleConnTimeout: 90 * time.Second,
@@ -349,7 +351,9 @@ func (r *Router) reserve(ctx context.Context, group, routeKey string, input rout
 	r.flights[key] = flight
 	r.reserveMu.Unlock()
 
-	result, err := r.control.ReserveSandbox(ctx, group, routeKey, r.minimumRouteRevision(group, routeKey), input)
+	minimum, releaseRevision := r.beginRouteRevision(group, routeKey)
+	defer releaseRevision()
+	result, err := r.control.ReserveSandbox(ctx, group, routeKey, minimum, input)
 	if errors.Is(err, routeclient.ErrMutationOutcomeUnknown) {
 		err = errors.Join(errRoutePending, err)
 	}
@@ -485,8 +489,9 @@ func (r *Router) sandboxControl(w http.ResponseWriter, request *http.Request) {
 			http.Error(w, "DELETE is only valid for the Sandbox resource", http.StatusMethodNotAllowed)
 			return
 		}
-		minimum := r.minimumRouteRevision(group, routeKey)
+		minimum, releaseRevision := r.beginRouteRevision(group, routeKey)
 		result, deleteErr := r.control.DeleteSandbox(request.Context(), group, routeKey, minimum)
+		releaseRevision()
 		if deleteErr != nil {
 			http.Error(w, "delete unavailable", http.StatusServiceUnavailable)
 			return
@@ -509,7 +514,7 @@ func (r *Router) sandboxControl(w http.ResponseWriter, request *http.Request) {
 	var err error
 	connectRouteKey, exactConnect := escapedSandboxAction(request.URL.EscapedPath(), "connect")
 	if request.Method == http.MethodPost && exactConnect && connectRouteKey == routeKey {
-		minimum := r.minimumRouteRevision(group, routeKey)
+		minimum, releaseRevision := r.beginRouteRevision(group, routeKey)
 		result, resumeErr := r.control.ResumeSandbox(request.Context(), group, routeKey, minimum)
 		if resumeErr == nil && result.Response.Outcome == routeapi.MutationReady && result.Response.Route != nil {
 			entry = &routeEntry{Route: *result.Response.Route, Group: group, RouteKey: routeKey,
@@ -521,6 +526,7 @@ func (r *Router) sandboxControl(w http.ResponseWriter, request *http.Request) {
 		} else {
 			err = errors.Join(resumeErr, errors.New("Route resume did not become READY"))
 		}
+		releaseRevision()
 	} else {
 		entry, err = r.resolveControlRoute(request.Context(), group, routeKey)
 	}
@@ -746,6 +752,8 @@ func (r *Router) forwardNodeControl(w http.ResponseWriter, request *http.Request
 	var endpoint, group, objectID, kind, serveIdentity, bindingDigest, nodeID, routeKey string
 	var nodeEpoch uint64
 	if route != nil {
+		_, releaseRevision := r.beginRouteRevision(route.Group, route.RouteKey)
+		defer releaseRevision()
 		if !r.control.CacheAuthorized(route.ServeIdentity) {
 			http.Error(w, "Router Serve Permit expired", http.StatusServiceUnavailable)
 			return
@@ -1016,7 +1024,9 @@ func (r *Router) authorizeDataRequest(
 }
 
 func (r *Router) resumeRoute(ctx context.Context, group, routeKey string) (*routeEntry, error) {
-	result, err := r.control.ResumeSandbox(ctx, group, routeKey, r.minimumRouteRevision(group, routeKey))
+	minimum, releaseRevision := r.beginRouteRevision(group, routeKey)
+	defer releaseRevision()
+	result, err := r.control.ResumeSandbox(ctx, group, routeKey, minimum)
 	if err != nil || result.Response.Outcome != routeapi.MutationReady || result.Response.Route == nil {
 		return nil, errors.Join(err, errors.New("Route resume did not become READY"))
 	}
@@ -1065,6 +1075,8 @@ func (r *Router) forwardData(
 	injectToken bool,
 	consumedProviderHeader string,
 ) {
+	_, releaseRevision := r.beginRouteRevision(entry.Group, entry.RouteKey)
+	defer releaseRevision()
 	if !r.control.CacheAuthorized(entry.ServeIdentity) {
 		http.Error(w, "Router Serve Permit expired", http.StatusServiceUnavailable)
 		return
@@ -1155,7 +1167,9 @@ func (r *Router) resolveRoute(ctx context.Context, group, routeKey string) (*rou
 	if cached := r.cachedRoute(group, routeKey); cached != nil {
 		return cached, nil
 	}
-	result, err := r.control.ReadRoute(ctx, group, routeKey, r.minimumRouteRevision(group, routeKey))
+	minimum, releaseRevision := r.beginRouteRevision(group, routeKey)
+	defer releaseRevision()
+	result, err := r.control.ReadRoute(ctx, group, routeKey, minimum)
 	if err != nil || result.Response.Outcome != routeapi.ReadReady || result.Response.Route == nil {
 		return nil, errors.New("Route is not READY")
 	}
@@ -1176,7 +1190,9 @@ func (r *Router) resolveControlRoute(ctx context.Context, group, routeKey string
 	if cached := r.cachedRoute(group, routeKey); cached != nil {
 		return cached, nil
 	}
-	result, err := r.control.ReadAddressableRoute(ctx, group, routeKey, r.minimumRouteRevision(group, routeKey))
+	minimum, releaseRevision := r.beginRouteRevision(group, routeKey)
+	defer releaseRevision()
+	result, err := r.control.ReadAddressableRoute(ctx, group, routeKey, minimum)
 	if err != nil {
 		return nil, fmt.Errorf("read addressable Route: %w", err)
 	}
@@ -1244,6 +1260,34 @@ func (r *Router) minimumRouteRevision(group, routeKey string) uint64 {
 	return r.minimumRevisions[routeKeyID(group, routeKey)]
 }
 
+func (r *Router) beginRouteRevision(group, routeKey string) (uint64, func()) {
+	key := routeKeyID(group, routeKey)
+	r.cacheMu.Lock()
+	r.routeRevisionRefs[key]++
+	minimum := r.minimumRevisions[key]
+	r.cacheMu.Unlock()
+
+	var once sync.Once
+	return minimum, func() {
+		once.Do(func() {
+			r.cacheMu.Lock()
+			if r.routeRevisionRefs[key] <= 1 {
+				delete(r.routeRevisionRefs, key)
+				r.releaseInactiveRouteRevisionLocked(key)
+			} else {
+				r.routeRevisionRefs[key]--
+			}
+			r.cacheMu.Unlock()
+		})
+	}
+}
+
+func (r *Router) releaseInactiveRouteRevisionLocked(key string) {
+	if r.routes[key] == nil && r.routeRevisionRefs[key] == 0 {
+		delete(r.minimumRevisions, key)
+	}
+}
+
 func (r *Router) rejectStaleRoute(entry *routeEntry) {
 	if entry == nil {
 		return
@@ -1258,6 +1302,7 @@ func (r *Router) rejectStaleRoute(entry *routeEntry) {
 	if minimum > r.minimumRevisions[keyID] {
 		r.minimumRevisions[keyID] = minimum
 	}
+	r.releaseInactiveRouteRevisionLocked(keyID)
 	r.cacheMu.Unlock()
 }
 
@@ -1275,6 +1320,7 @@ func (r *Router) cachedRouteLocked(key string, now time.Time) *routeEntry {
 	if !r.control.CacheAuthorized(entry.ServeIdentity) || now.Sub(entry.CachedAt) > r.routeTTL ||
 		now.Sub(entry.LastUsed) > r.routeIdleTimeout {
 		delete(r.routes, key)
+		r.releaseInactiveRouteRevisionLocked(key)
 		return nil
 	}
 	entry.LastUsed = now
@@ -1286,6 +1332,7 @@ func (r *Router) evictRoute(group, routeKey string) {
 	key := routeKeyID(group, routeKey)
 	r.cacheMu.Lock()
 	delete(r.routes, key)
+	r.releaseInactiveRouteRevisionLocked(key)
 	r.cacheMu.Unlock()
 }
 
@@ -1389,6 +1436,7 @@ func (r *Router) RunCleanup(ctx context.Context) {
 				if !r.control.CacheAuthorized(entry.ServeIdentity) || now.Sub(entry.CachedAt) > r.routeTTL ||
 					now.Sub(entry.LastUsed) > r.routeIdleTimeout {
 					delete(r.routes, key)
+					r.releaseInactiveRouteRevisionLocked(key)
 				}
 			}
 			for key, entry := range r.builds {

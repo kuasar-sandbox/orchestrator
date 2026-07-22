@@ -501,8 +501,17 @@ func TestSandboxJournalPreservesTokenBindingAndMonotonicOutbox(t *testing.T) {
 	if err != nil || retry.EventSeq != 1 {
 		t.Fatalf("ready retry = %+v, %v", retry, err)
 	}
-	if _, err := st.CommitSandboxEvent(ctx, sandbox, sandboxEvent(nodeexec.EventUpdate{State: string(clusterstate.WorkflowRoutePaused)})); err != nil {
+	paused, err := st.CommitSandboxEvent(ctx, sandbox, sandboxEvent(nodeexec.EventUpdate{
+		State: string(clusterstate.WorkflowRoutePaused), SnapshotRef: "snapshot-new",
+	}))
+	if err != nil {
 		t.Fatal(err)
+	}
+	pausedSandbox, err := st.Get(ctx, sandbox.ID)
+	if err != nil || pausedSandbox == nil || pausedSandbox.State != types.StatePaused ||
+		pausedSandbox.SnapshotRef != "snapshot-new" || paused.LatestEvent == nil ||
+		paused.LatestEvent.SnapshotRef != "snapshot-new" || paused.LatestEvent.SnapshotLocation != "local" {
+		t.Fatalf("atomic paused Sandbox/event = %+v, workflow=%+v, %v", pausedSandbox, paused, err)
 	}
 	resumed, err := st.CommitSandboxEvent(ctx, sandbox, ready)
 	if err != nil || resumed.EventSeq != 3 {

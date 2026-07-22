@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -454,6 +455,7 @@ func TestStaleProxyFailureRequiresNewerRouteRevision(t *testing.T) {
 		Route: clusterstate.ReadyRoute{SandboxID: "sandbox-1", NodeID: "node-1", NodeEpoch: 7},
 		Group: "/group", RouteKey: "route-1", Revision: 7, ServeIdentity: serveIdentity,
 	}
+	_, releaseRevision := router.beginRouteRevision(old.Group, old.RouteKey)
 	router.rememberRoute(old)
 	router.rejectStaleRoute(old)
 	if cached := router.cachedRoute(old.Group, old.RouteKey); cached != nil {
@@ -477,14 +479,43 @@ func TestStaleProxyFailureRequiresNewerRouteRevision(t *testing.T) {
 		t.Fatalf("ReadRoute minimums = %v", control.readMins)
 	}
 	if minimum := router.minimumRouteRevision(old.Group, old.RouteKey); minimum != 8 {
-		t.Fatalf("satisfied minimum Route revision = %d, want persistent floor 8", minimum)
+		t.Fatalf("satisfied minimum Route revision = %d, want cached floor 8", minimum)
 	}
+	releaseRevision()
 	router.evictRoute(old.Group, old.RouteKey)
+	if minimum := router.minimumRouteRevision(old.Group, old.RouteKey); minimum != 0 {
+		t.Fatalf("inactive Route revision floor = %d, want released", minimum)
+	}
 	if _, err := router.resolveRoute(context.Background(), old.Group, old.RouteKey); err != nil {
 		t.Fatalf("resolve Route after cache eviction: %v", err)
 	}
-	if len(control.readMins) != 2 || control.readMins[1] != 8 {
+	if len(control.readMins) != 2 || control.readMins[1] != 0 {
 		t.Fatalf("ReadRoute minimums after cache eviction = %v", control.readMins)
+	}
+}
+
+func TestInactiveRouteRevisionFencesAreBoundedByCache(t *testing.T) {
+	serveIdentity := routeapi.RegistryServeIdentity{
+		ClusterID: "cluster-1", RegistryGeneration: "generation-1", SystemEpoch: 1,
+		RegistryLayoutDigest: "registry-layout-1",
+	}
+	router, err := New(&revisionControl{serveIdentity: serveIdentity}, allowCaller{}, "example.test", time.Minute, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index := 0; index < 1000; index++ {
+		routeKey := fmt.Sprintf("route-%d", index)
+		entry := &routeEntry{
+			Route: clusterstate.ReadyRoute{SandboxID: fmt.Sprintf("sandbox-%d", index)},
+			Group: "/group", RouteKey: routeKey, Revision: uint64(index + 1), ServeIdentity: serveIdentity,
+		}
+		if !router.rememberRoute(entry) {
+			t.Fatalf("remember Route %d", index)
+		}
+		router.evictRoute(entry.Group, entry.RouteKey)
+	}
+	if len(router.minimumRevisions) != 0 || len(router.routeRevisionRefs) != 0 {
+		t.Fatalf("inactive revision state leaked: minimums=%d refs=%d", len(router.minimumRevisions), len(router.routeRevisionRefs))
 	}
 }
 

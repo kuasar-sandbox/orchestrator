@@ -733,11 +733,11 @@ func (s *Store) CommitSandboxEvent(
 	if update.TemplateRef == "" {
 		update.TemplateRef = eventSource.TemplateID
 	}
-	if update.SnapshotLocation == "" {
-		update.SnapshotLocation = sandboxSnapshotLocation(eventSource.SnapshotRef)
-	}
 	if update.SnapshotRef == "" {
 		update.SnapshotRef = eventSource.SnapshotRef
+	}
+	if update.SnapshotLocation == "" {
+		update.SnapshotLocation = sandboxSnapshotLocation(update.SnapshotRef)
 	}
 	if err := validateSandboxEventTransition(record, update); err != nil {
 		return nil, err
@@ -758,6 +758,7 @@ func (s *Store) CommitSandboxEvent(
 	stored := cloneSandbox(eventSource)
 	stored.EnvdAccessToken = update.AccessToken
 	stored.TrafficAccessToken = update.TrafficAccessToken
+	stored.SnapshotRef = update.SnapshotRef
 	stored.Metadata, err = clusterstate.WithExecutionBinding(clusterstate.WithoutSystemMetadata(stored.Metadata), record.OpaqueBinding)
 	if err != nil {
 		return nil, err

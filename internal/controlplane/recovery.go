@@ -302,6 +302,7 @@ func (c *RecoveryCoordinator) collectNode(
 	}
 	records := make([]raftstore.RecoveryObjectRecord, 0, len(facts))
 	affectedShards := make(map[uint32]struct{})
+	var affectedShardsMu sync.Mutex
 	for _, fact := range facts {
 		page := routesync.RecoveryReportPage{
 			RecoveryEpoch: recovery.Epoch, SourceClusterID: recovery.SourceClusterID,
@@ -321,7 +322,9 @@ func (c *RecoveryCoordinator) collectNode(
 	}
 	if err := c.forEachRecoveryRecord(ctx, recovery, func(_ context.Context, located locatedRecoveryRecord) error {
 		if located.record.NodeID == progress.NodeID && located.record.NodeEpoch == progress.NodeEpoch {
+			affectedShardsMu.Lock()
 			affectedShards[located.shardID] = struct{}{}
+			affectedShardsMu.Unlock()
 		}
 		return nil
 	}); err != nil {

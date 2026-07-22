@@ -341,19 +341,26 @@ func (o *Orchestrator) pauseSandboxLocked(ctx context.Context, sb *types.Sandbox
 	if err != nil {
 		return err
 	}
-	sb.SnapshotRef = ref
-	sb.State = types.StatePaused
-	_ = o.st.SetSnapshotRef(ctx, sb.ID, ref)
-	_ = o.st.SetState(ctx, sb.ID, types.StatePaused)
-	o.cache(sb)
 	if sb.RunID != "" {
 		_ = o.lc.Stop(ctx, o.runnerUnit(sb.RunID))
 		_ = o.lc.ResetFailed(ctx, o.runnerUnit(sb.RunID))
 	}
 	_ = o.vs.Detach(ctx, sb.VswitchPort)
-	if _, err := o.commitManagedSandboxState(ctx, sb, string(clusterstate.WorkflowRoutePaused), ""); err != nil {
+	sb.SnapshotRef = ref
+	sb.State = types.StatePaused
+	managed, err := o.commitManagedSandboxState(ctx, sb, string(clusterstate.WorkflowRoutePaused), "")
+	if err != nil {
 		return err
 	}
+	if !managed {
+		if err := o.st.SetSnapshotRef(ctx, sb.ID, ref); err != nil {
+			return err
+		}
+		if err := o.st.SetState(ctx, sb.ID, types.StatePaused); err != nil {
+			return err
+		}
+	}
+	o.cache(sb)
 	o.publishUpsert(sb) // proxies keep the (now paused) route so traffic triggers a Wake
 	return nil
 }
@@ -424,23 +431,28 @@ func (o *Orchestrator) Connect(ctx context.Context, id, apiKey, migrationToken s
 }
 
 func (o *Orchestrator) SetTimeout(ctx context.Context, id, apiKey string, timeoutSec int) (bool, error) {
-	sb, err := o.st.Get(ctx, id)
-	if err != nil {
-		return false, err
-	}
-	if !ownsSandbox(sb, apiKey) {
-		return false, nil
-	}
-	sb.DeadlineUnix = time.Now().Add(time.Duration(timeoutSec) * time.Second).Unix()
-	if err := o.st.SetDeadline(ctx, id, sb.DeadlineUnix); err != nil {
-		return true, err
-	}
-	state := string(clusterstate.WorkflowRouteReady)
-	if sb.State == types.StatePaused {
-		state = string(clusterstate.WorkflowRoutePaused)
-	}
-	_, err = o.commitManagedSandboxState(ctx, sb, state, "")
-	return true, err
+	found := false
+	err := o.lifecycle.Do(id, func() error {
+		sb, err := o.st.Get(ctx, id)
+		if err != nil {
+			return err
+		}
+		if !ownsSandbox(sb, apiKey) {
+			return nil
+		}
+		found = true
+		sb.DeadlineUnix = time.Now().Add(time.Duration(timeoutSec) * time.Second).Unix()
+		if err := o.st.SetDeadline(ctx, id, sb.DeadlineUnix); err != nil {
+			return err
+		}
+		state := string(clusterstate.WorkflowRouteReady)
+		if sb.State == types.StatePaused {
+			state = string(clusterstate.WorkflowRoutePaused)
+		}
+		_, err = o.commitManagedSandboxState(ctx, sb, state, "")
+		return err
+	})
+	return found, err
 }
 
 // resume restarts a paused sandbox from its snapshot (no api_key needed: the
@@ -499,7 +511,8 @@ func (o *Orchestrator) commitManagedSandboxState(ctx context.Context, sandbox *t
 		return true, err
 	}
 	_, err = o.st.CommitSandboxEvent(ctx, sandbox, nodeexec.EventUpdate{
-		State: state, TargetPort: spec.TargetPort, Reason: reason, Presentation: &presentation,
+		State: state, TargetPort: spec.TargetPort, SnapshotRef: sandbox.SnapshotRef,
+		Reason: reason, Presentation: &presentation,
 	})
 	return true, err
 }
