@@ -646,28 +646,34 @@ func (o *Orchestrator) rebindClusterExecution(ctx context.Context, cmd *routesyn
 	default:
 		return fmt.Errorf("cluster rebind: exactly one sandbox_id or build_id is required")
 	}
-	if _, err := o.clusterCommandMetadata(ctx, cmd, kind, objectID); err != nil {
-		return err
-	}
-	changed, err := o.st.CASExecutionBinding(ctx, kind, objectID, cmd.OldBindingDigest, cmd.Binding)
-	if err != nil {
-		return err
-	}
-	if !changed {
-		return errWrongExecutionBinding
-	}
-	if kind == clusterstate.ExecutionKindSandbox {
-		sb, err := o.st.Get(ctx, objectID)
+	apply := func() error {
+		if _, err := o.clusterCommandMetadata(ctx, cmd, kind, objectID); err != nil {
+			return err
+		}
+		changed, err := o.st.CASExecutionBinding(ctx, kind, objectID, cmd.OldBindingDigest, cmd.Binding)
 		if err != nil {
 			return err
 		}
-		if sb == nil {
+		if !changed {
 			return errWrongExecutionBinding
 		}
-		o.cache(sb)
-		o.publishUpsert(sb)
+		if kind == clusterstate.ExecutionKindSandbox {
+			sb, err := o.st.Get(ctx, objectID)
+			if err != nil {
+				return err
+			}
+			if sb == nil {
+				return errWrongExecutionBinding
+			}
+			o.cache(sb)
+			o.publishUpsert(sb)
+		}
+		return nil
 	}
-	return nil
+	if kind == clusterstate.ExecutionKindSandbox {
+		return o.lifecycle.Do(objectID, apply)
+	}
+	return apply()
 }
 
 func (o *Orchestrator) resolveByFingerprint(ctx context.Context, fp string) (string, error) {

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxy"
@@ -144,6 +145,63 @@ func TestRebindClusterExecutionUsesDigestCAS(t *testing.T) {
 		SID: "s1", NodeEpoch: 7, RegistryGeneration: "g2", BindingDigest: newDigest,
 	}); err != nil {
 		t.Fatalf("new command fence: %v", err)
+	}
+}
+
+func TestRebindClusterExecutionWaitsForSandboxLifecycle(t *testing.T) {
+	o := testOrch(t)
+	ctx := context.Background()
+	if _, err := o.st.EnrollClusterIdentity(ctx, "n1", "boot-1", "10.0.0.1:8443"); err != nil {
+		t.Fatal(err)
+	}
+	demand := sha256.Sum256([]byte("demand"))
+	dispatch := sha256.Sum256([]byte("dispatch"))
+	makeBinding := func(generation string) string {
+		opaque, err := clusterstate.EncodeExecutionBinding(clusterstate.ExecutionBinding{
+			RegistryGeneration: generation, Kind: clusterstate.ExecutionKindSandbox,
+			ObjectID: "s1", Group: "/g", RouteKey: "rk", NodeID: "n1", NodeEpoch: 7,
+			DemandDigest: demand, DispatchSpecDigest: dispatch,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return opaque
+	}
+	oldOpaque, newOpaque := makeBinding("g1"), makeBinding("g2")
+	oldDigest, _ := clusterstate.ExecutionBindingDigest(oldOpaque)
+	newDigest, _ := clusterstate.ExecutionBindingDigest(newOpaque)
+	if err := o.st.Put(ctx, &types.Sandbox{
+		ID: "s1", State: types.StatePaused, ManifestKey: strings.Repeat("1", 64),
+		Metadata: map[string]string{clusterstate.ObjectMetadataKey: oldOpaque},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	command := &routesync.Command{
+		SID: "s1", NodeEpoch: 7, SessionSeq: 3, RegistryGeneration: "g2",
+		Binding: newOpaque, BindingDigest: newDigest, OldBindingDigest: oldDigest,
+		DemandDigest: hex.EncodeToString(demand[:]), DispatchSpecDigest: hex.EncodeToString(dispatch[:]),
+	}
+
+	held, release := make(chan struct{}), make(chan struct{})
+	go func() {
+		_ = o.lifecycle.Do("s1", func() error {
+			close(held)
+			<-release
+			return nil
+		})
+	}()
+	<-held
+	done := make(chan error, 1)
+	go func() { done <- o.rebindClusterExecution(ctx, command) }()
+	select {
+	case err := <-done:
+		close(release)
+		t.Fatalf("rebind bypassed the in-flight Sandbox lifecycle: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
 	}
 }
 

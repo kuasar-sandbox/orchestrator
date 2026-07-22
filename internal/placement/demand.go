@@ -67,7 +67,7 @@ func (d NormalizedDemand) Validate() error {
 			return errors.New("placement: invalid normalized sandbox demand")
 		}
 	case ObjectBuild:
-		if d.Build == nil || d.Sandbox != nil || d.Build.Slots == 0 {
+		if d.Build == nil || d.Sandbox != nil || d.Build.Slots == 0 || d.Build.CPU == 0 || d.Build.Memory == 0 {
 			return errors.New("placement: invalid normalized build demand")
 		}
 	default:
