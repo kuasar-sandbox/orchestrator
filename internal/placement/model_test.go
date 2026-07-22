@@ -133,6 +133,36 @@ func TestProbeRetriesDynamicSafetyStates(t *testing.T) {
 	}
 }
 
+func TestProbeRetriesTemporaryHardLimitSaturation(t *testing.T) {
+	sandboxSnapshot := baseSnapshot()
+	sandboxSnapshot.SandboxSlotHardLimit = 3
+	sandbox := PlacementProbeRequest{
+		Kind: ObjectSandbox, NodeID: "n1", ExpectedNodeEpoch: 7, ExpectedSessionSeq: 11,
+		LoadModelVersion: LoadModelVersion, Sandbox: &SandboxDemand{SlotUnits: 2, StartupBudgetMemory: 1},
+	}
+	if got := ProbePlacement(sandboxSnapshot, 0, sandbox); got.Class != ProbeStale {
+		t.Fatalf("temporarily saturated Sandbox hard limit = %+v", got)
+	}
+	sandbox.Sandbox.SlotUnits = 4
+	if got := ProbePlacement(sandboxSnapshot, 0, sandbox); got.Class != ProbeReject {
+		t.Fatalf("permanently oversized Sandbox hard-limit demand = %+v", got)
+	}
+
+	buildSnapshot := baseSnapshot()
+	buildSnapshot.BuildSlotHardLimit = 2
+	build := PlacementProbeRequest{
+		Kind: ObjectBuild, NodeID: "n1", ExpectedNodeEpoch: 7, ExpectedSessionSeq: 11,
+		LoadModelVersion: LoadModelVersion, Build: &BuildDemand{Slots: 2},
+	}
+	if got := ProbePlacement(buildSnapshot, 0, build); got.Class != ProbeStale {
+		t.Fatalf("temporarily saturated Build hard limit = %+v", got)
+	}
+	build.Build.Slots = 3
+	if got := ProbePlacement(buildSnapshot, 0, build); got.Class != ProbeReject {
+		t.Fatalf("permanently oversized Build hard-limit demand = %+v", got)
+	}
+}
+
 func TestP2CUsesClassRateThenRandomTie(t *testing.T) {
 	immediate := PlacementProbeResponse{Class: ProbeImmediate, RatePPM: 900_000, NodeID: "z"}
 	queued := PlacementProbeResponse{Class: ProbeWouldQueue, RatePPM: 100_000, NodeID: "a"}
