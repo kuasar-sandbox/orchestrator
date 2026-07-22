@@ -486,7 +486,7 @@ func (c *StartingCoordinator) selectCandidate(ctx context.Context, demand placem
 				continue
 			}
 			candidate := candidates[index]
-			requests = append(requests, demand.ProbeRequest(candidate.NodeID, runtimeDigest))
+			requests = append(requests, demand.ProbeRequest(candidate.NodeID, runtimeDigest, candidate.CatalogDigest))
 			results = append(results, session.ProbeResult{})
 		}
 		if len(indices) == 0 {

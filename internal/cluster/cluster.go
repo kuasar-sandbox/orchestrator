@@ -112,6 +112,7 @@ type SandboxGroup struct {
 // secret material to answer Place and refresh complete node key leases.
 type SandboxGroupRecord struct {
 	Group                 string              `json:"group"`
+	KeyRevision           uint64              `json:"key_revision,omitempty"`
 	ProjectID             string              `json:"project_id,omitempty"`
 	ManifestKey           Secret              `json:"manifest_key,omitempty"`
 	AuthKey               Secret              `json:"auth_key,omitempty"`
