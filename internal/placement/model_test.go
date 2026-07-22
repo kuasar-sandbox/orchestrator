@@ -119,6 +119,20 @@ func TestProbeRejectsUnknownSafetyState(t *testing.T) {
 	}
 }
 
+func TestProbeRetriesDynamicSafetyStates(t *testing.T) {
+	request := PlacementProbeRequest{
+		Kind: ObjectSandbox, NodeID: "n1", ExpectedNodeEpoch: 7, ExpectedSessionSeq: 11,
+		LoadModelVersion: LoadModelVersion, Sandbox: &SandboxDemand{SlotUnits: 1, StartupBudgetMemory: 1},
+	}
+	for _, zone := range []string{"red", "critical"} {
+		snapshot := baseSnapshot()
+		snapshot.WaterZone = zone
+		if got := ProbePlacement(snapshot, 0, request); got.Class != ProbeStale {
+			t.Fatalf("%s safety state = %+v", zone, got)
+		}
+	}
+}
+
 func TestP2CUsesClassRateThenRandomTie(t *testing.T) {
 	immediate := PlacementProbeResponse{Class: ProbeImmediate, RatePPM: 900_000, NodeID: "z"}
 	queued := PlacementProbeResponse{Class: ProbeWouldQueue, RatePPM: 100_000, NodeID: "a"}
