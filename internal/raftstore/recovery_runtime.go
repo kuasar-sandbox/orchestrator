@@ -460,10 +460,13 @@ func (r *Runtime) prepareRecoveryDataShardLocal(
 		previous.RegistryLayoutDigest != next.RegistryLayoutDigest || previous.SystemEpoch+1 != next.SystemEpoch {
 		return DataState{}, errors.New("raftstore: recovery shard does not serve the immediately preceding SystemEpoch")
 	}
-	result, proposeErr := r.proposeDataRaw(ctx, DataCommand{
+	result, submitted, proposeErr := r.proposeDataRaw(ctx, DataCommand{
 		Type: DataPrepareEpoch, Identity: ShardRequestIdentity{PermitIdentity: previous, ShardID: shardID},
 		Epoch: &next, ReplicaIDs: desired,
 	})
+	if proposeErr != nil && !submitted {
+		return DataState{}, proposeErr
+	}
 	if proposeErr == nil && result.Conflict {
 		proposeErr = errors.New(result.Reason)
 	}
@@ -500,9 +503,12 @@ func (r *Runtime) finalizeRecoveryDataShardLocal(
 		return DataState{}, err
 	}
 	previous := state.ServingEpochs[0]
-	result, proposeErr := r.proposeDataRaw(ctx, DataCommand{
+	result, submitted, proposeErr := r.proposeDataRaw(ctx, DataCommand{
 		Type: DataRetireEpoch, Identity: ShardRequestIdentity{PermitIdentity: next, ShardID: shardID}, Epoch: &previous,
 	})
+	if proposeErr != nil && !submitted {
+		return DataState{}, proposeErr
+	}
 	if proposeErr == nil && result.Conflict {
 		proposeErr = errors.New(result.Reason)
 	}

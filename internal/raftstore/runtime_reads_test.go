@@ -122,6 +122,47 @@ func TestRuntimeResolvesAmbiguousDataMutationByExactStrongRead(t *testing.T) {
 	}
 }
 
+func TestRuntimeDoesNotResolveAnUnsubmittedDataMutation(t *testing.T) {
+	registryLayout := testRegistryLayout(1, "generation-unsubmitted")
+	identity := routeShardIdentity(t, registryLayout, "/g", "rk-unsubmitted")
+	state := initializeDataShard(t, registryLayout, identity)
+	starting := routeStarting(t, registryLayout, "/g", "rk-unsubmitted", "sandbox-unsubmitted", 1, false)
+	valid := DataCommand{
+		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{Absent: true}, Route: &starting,
+	}
+	applyDataOK(t, &state, 2, valid)
+	invalid := valid
+	invalid.Build = &clusterstate.BuildRecord{}
+
+	host := newFakeNodeHost()
+	host.propose = func([]byte) (sm.Result, error) {
+		t.Fatal("locally invalid command reached SyncPropose")
+		return sm.Result{}, nil
+	}
+	host.read = func(uint64, any) (any, error) {
+		t.Fatal("locally invalid command entered ambiguity resolution")
+		return nil, nil
+	}
+	digest, _ := registryLayout.Digest()
+	runtime := &Runtime{
+		registryLayout: registryLayout, registryLayoutDigest: digest, nodeHost: host,
+		permitCache: NewPermitCache(time.Now), member: registryLayout.Members[0],
+		enrollment: LocalEnrollment{Replicas: []LocalReplicaEnrollment{{
+			ShardID: DataRaftShardID(identity.ShardID), ReplicaID: 1,
+			StartPlan: ReplicaInitial, LocalState: ReplicaActive,
+		}}},
+	}
+	if err := runtime.permitCache.Install(PermitGrant{
+		PermitIdentity: identity.PermitIdentity, CommitIndex: 1, MaxLifetimeMillis: 1_000,
+		ServeGate: true, WriteGate: true, CutoverGate: true, RecoveryClosed: true,
+	}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if result, err := runtime.ApplyData(context.Background(), invalid); err == nil || result.Applied {
+		t.Fatalf("unsubmitted invalid mutation = %+v, %v", result, err)
+	}
+}
+
 func TestRuntimeResolvesCommittedDataMutationAfterCallerCancellation(t *testing.T) {
 	registryLayout := testRegistryLayout(1, "generation-canceled-mutation")
 	identity := routeShardIdentity(t, registryLayout, "/g", "rk-canceled")

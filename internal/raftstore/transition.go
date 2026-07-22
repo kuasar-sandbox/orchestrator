@@ -406,11 +406,14 @@ func (r *Runtime) prepareDataEpoch(ctx context.Context, system SystemState, raft
 		if err := r.permitCache.Authorize(previous, PermitRegistryWrite); err != nil {
 			return err
 		}
-		result, proposeErr := r.proposeDataRaw(ctx, DataCommand{
+		result, submitted, proposeErr := r.proposeDataRaw(ctx, DataCommand{
 			Type:     DataPrepareEpoch,
 			Identity: ShardRequestIdentity{PermitIdentity: previous, ShardID: logicalID},
 			Epoch:    &next, ReplicaIDs: desired,
 		})
+		if proposeErr != nil && !submitted {
+			return proposeErr
+		}
 		if proposeErr == nil && result.Conflict {
 			proposeErr = errors.New(result.Reason)
 		}
@@ -471,11 +474,14 @@ func (r *Runtime) retireDataEpoch(ctx context.Context, system SystemState, raftS
 		if err := r.permitCache.Authorize(next, PermitRegistryWrite); err != nil {
 			return err
 		}
-		result, proposeErr := r.proposeDataRaw(ctx, DataCommand{
+		result, submitted, proposeErr := r.proposeDataRaw(ctx, DataCommand{
 			Type:     DataRetireEpoch,
 			Identity: ShardRequestIdentity{PermitIdentity: next, ShardID: logicalID},
 			Epoch:    &previous,
 		})
+		if proposeErr != nil && !submitted {
+			return proposeErr
+		}
 		if proposeErr == nil && result.Conflict {
 			proposeErr = errors.New(result.Reason)
 		}

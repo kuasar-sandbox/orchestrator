@@ -749,10 +749,13 @@ func (r *Runtime) initializeDataShard(ctx context.Context, replica LocalReplicaE
 		ClusterID: r.registryLayout.ClusterID, RegistryGeneration: r.registryLayout.RegistryGeneration,
 		SystemEpoch: 1, RegistryLayoutDigest: r.registryLayoutDigest,
 	}, ShardID: shardID}
-	result, err := r.proposeDataRaw(ctx, DataCommand{
+	result, submitted, err := r.proposeDataRaw(ctx, DataCommand{
 		Type: DataInitializeShard, Identity: identity, Bootstrap: &bootstrap,
 		ReplicaIDs: append([]uint64(nil), bootstrap.ReplicaIDs...),
 	})
+	if err != nil && !submitted {
+		return err
+	}
 	if err != nil || result.Conflict {
 		resolveContext, cancelResolve := ambiguityResolutionContext(ctx)
 		defer cancelResolve()
@@ -844,9 +847,12 @@ func (r *Runtime) ApplyData(ctx context.Context, command DataCommand) (DataApply
 }
 
 func (r *Runtime) applyDataMutation(ctx context.Context, command DataCommand) (DataApplyResult, error) {
-	result, err := r.proposeDataRaw(ctx, command)
+	result, submitted, err := r.proposeDataRaw(ctx, command)
 	if err == nil {
 		return result, nil
+	}
+	if !submitted {
+		return DataApplyResult{}, err
 	}
 	resolveContext, cancelResolve := ambiguityResolutionContext(ctx)
 	defer cancelResolve()
@@ -911,24 +917,24 @@ func (r *Runtime) proposeSystem(ctx context.Context, command SystemCommand) (Sys
 	return applied, nil
 }
 
-func (r *Runtime) proposeDataRaw(ctx context.Context, command DataCommand) (DataApplyResult, error) {
+func (r *Runtime) proposeDataRaw(ctx context.Context, command DataCommand) (DataApplyResult, bool, error) {
 	if err := r.removalFenceError(); err != nil {
-		return DataApplyResult{}, err
+		return DataApplyResult{}, false, err
 	}
 	raw, err := EncodeDataCommand(command)
 	if err != nil {
-		return DataApplyResult{}, err
+		return DataApplyResult{}, false, err
 	}
 	shardID := DataRaftShardID(command.Identity.ShardID)
 	result, err := r.nodeHost.SyncPropose(ctx, r.nodeHost.GetNoOPSession(shardID), raw)
 	if err != nil {
-		return DataApplyResult{}, err
+		return DataApplyResult{}, true, err
 	}
 	var applied DataApplyResult
 	if err := json.Unmarshal(result.Data, &applied); err != nil {
-		return DataApplyResult{}, fmt.Errorf("raftstore: decode data apply result: %w", err)
+		return DataApplyResult{}, true, fmt.Errorf("raftstore: decode data apply result: %w", err)
 	}
-	return applied, nil
+	return applied, true, nil
 }
 
 func (r *Runtime) removalFenceError() error {

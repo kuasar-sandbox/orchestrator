@@ -187,9 +187,12 @@ func (r *Runtime) CompactExecutionFence(
 			!proofPermanentlyFenced && outboxAck.validates(*fence),
 		ReplicaApplied: proofs, RetentionProofDigest: retentionDigest,
 	}
-	result, proposeErr := r.proposeDataRaw(ctx, DataCommand{
+	result, submitted, proposeErr := r.proposeDataRaw(ctx, DataCommand{
 		Type: DataCompactFence, Identity: identity, Compaction: &authorization,
 	})
+	if proposeErr != nil && !submitted {
+		return proposeErr
+	}
 	resolveContext, cancelResolve := ambiguityResolutionContext(ctx)
 	defer cancelResolve()
 	remaining, readErr := r.readFenceStrong(resolveContext, query)
