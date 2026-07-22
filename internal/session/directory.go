@@ -129,23 +129,6 @@ func (d *Directory) Apply(delta DirectoryDelta) bool {
 	return false
 }
 
-func (d *Directory) MarkMemberUnavailable(memberID string) int {
-	if memberID == "" {
-		return 0
-	}
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	changed := 0
-	for nodeID, record := range d.records {
-		if record.Entry.HolderMemberID == memberID && record.Available {
-			record.Available = false
-			d.records[nodeID] = record
-			changed++
-		}
-	}
-	return changed
-}
-
 func (d *Directory) Lookup(nodeID string) (DirectoryEntry, bool) {
 	record, found := d.lookupRecord(nodeID)
 	return record.Entry, found && record.Available && !record.Conflict

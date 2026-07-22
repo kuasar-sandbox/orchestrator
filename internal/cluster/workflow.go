@@ -360,17 +360,30 @@ type WorkflowFinalizationIntent struct {
 	NodeEpoch          uint64         `json:"node_epoch"`
 	DataEndpoint       string         `json:"data_endpoint"`
 	RegistryGeneration string         `json:"registry_generation"`
+	OpaqueBinding      string         `json:"opaque_binding"`
 	BindingDigest      string         `json:"binding_digest"`
 	TerminalProof      *TerminalProof `json:"terminal_proof,omitempty"`
 }
 
 func (i WorkflowFinalizationIntent) Validate() error {
 	if i.ObjectID == "" || i.NodeID == "" || i.NodeEpoch == 0 || i.DataEndpoint == "" ||
-		i.RegistryGeneration == "" || !validDigest(i.BindingDigest) {
+		i.RegistryGeneration == "" || i.OpaqueBinding == "" || !validDigest(i.BindingDigest) {
 		return errors.New("cluster: incomplete workflow finalization intent")
 	}
 	if err := ValidateTCPDataEndpoint(i.DataEndpoint); err != nil {
 		return err
+	}
+	binding, err := DecodeExecutionBinding(i.OpaqueBinding)
+	if err != nil {
+		return err
+	}
+	digest, err := ExecutionBindingDigest(i.OpaqueBinding)
+	if err != nil {
+		return err
+	}
+	if binding.ObjectID != i.ObjectID || binding.NodeID != i.NodeID || binding.NodeEpoch != i.NodeEpoch ||
+		binding.RegistryGeneration != i.RegistryGeneration || digest != i.BindingDigest {
+		return errors.New("cluster: workflow finalization does not match its execution Binding")
 	}
 	if i.TerminalProof != nil {
 		if i.TerminalProof.Kind != ProofNodeTerminal || i.TerminalProof.FencedNodeID != i.NodeID ||
@@ -378,6 +391,20 @@ func (i WorkflowFinalizationIntent) Validate() error {
 			return errors.New("cluster: workflow finalization proof identifies another execution")
 		}
 		return i.TerminalProof.Validate()
+	}
+	return nil
+}
+
+func (i WorkflowFinalizationIntent) ValidateFor(kind ExecutionKind, group, routeKey string) error {
+	if err := i.Validate(); err != nil {
+		return err
+	}
+	binding, err := DecodeExecutionBinding(i.OpaqueBinding)
+	if err != nil {
+		return err
+	}
+	if binding.Kind != kind || binding.Group != group || binding.RouteKey != routeKey {
+		return errors.New("cluster: workflow finalization belongs to another workflow")
 	}
 	return nil
 }
@@ -390,7 +417,7 @@ func NewWorkflowFinalizationIntent(
 	intent := WorkflowFinalizationIntent{
 		ObjectID: objectID, NodeID: binding.NodeID, NodeEpoch: binding.NodeEpoch,
 		DataEndpoint: binding.DataEndpoint, RegistryGeneration: binding.RegistryGeneration,
-		BindingDigest: binding.BindingDigest,
+		OpaqueBinding: binding.OpaqueBinding, BindingDigest: binding.BindingDigest,
 	}
 	if proof != nil {
 		copy := *proof
@@ -456,7 +483,15 @@ func (s RouteTombstoneState) Validate() error {
 	if err := s.Proof.Validate(); err != nil {
 		return err
 	}
-	if s.Proof.Kind == ProofNewerNodeEpoch {
+	switch s.Proof.Kind {
+	case ProofNodeTerminal:
+		digest, err := NodeTerminalProofDigest(
+			s.Proof, s.RegistryGeneration, s.SandboxID, s.BindingDigest, s.LastEventSeq,
+		)
+		if err != nil || digest != s.Proof.ProofDigest {
+			return errors.New("cluster: TOMBSTONE node-terminal proof digest mismatch")
+		}
+	case ProofNewerNodeEpoch:
 		digest, err := NewerNodeEpochProofDigest(
 			s.Proof, s.FailureRevision.RegistryGeneration, s.SandboxID, s.BindingDigest, s.LastEventSeq,
 		)
@@ -514,7 +549,8 @@ func (r RouteWorkflowRecord) Validate() error {
 		return err
 	}
 	for _, intent := range r.Finalizations {
-		if intent.RegistryGeneration != r.Revision.RegistryGeneration || intent.TerminalProof != nil {
+		if err := intent.ValidateFor(ExecutionKindSandbox, r.Group, r.RouteKey); err != nil ||
+			intent.RegistryGeneration != r.Revision.RegistryGeneration || intent.TerminalProof != nil {
 			return errors.New("cluster: invalid Route workflow finalization intent")
 		}
 	}
@@ -721,7 +757,8 @@ func (r BuildRecord) Validate() error {
 		return err
 	}
 	for _, intent := range r.Finalizations {
-		if intent.ObjectID != r.BuildID || intent.RegistryGeneration != r.Revision.RegistryGeneration || intent.TerminalProof != nil {
+		if err := intent.ValidateFor(ExecutionKindBuild, r.Group, ""); err != nil || intent.ObjectID != r.BuildID ||
+			intent.RegistryGeneration != r.Revision.RegistryGeneration || intent.TerminalProof != nil {
 			return errors.New("cluster: invalid Build registration finalization")
 		}
 	}
@@ -826,7 +863,15 @@ func (f ExecutionFence) Validate() error {
 	if err := f.Proof.Validate(); err != nil {
 		return err
 	}
-	if f.Proof.Kind == ProofNewerNodeEpoch {
+	switch f.Proof.Kind {
+	case ProofNodeTerminal:
+		digest, err := NodeTerminalProofDigest(
+			f.Proof, f.RegistryGeneration, f.SandboxID, f.BindingDigest, f.LastEventSeq,
+		)
+		if err != nil || digest != f.Proof.ProofDigest {
+			return errors.New("cluster: execution-fence node-terminal proof digest mismatch")
+		}
+	case ProofNewerNodeEpoch:
 		digest, err := NewerNodeEpochProofDigest(
 			f.Proof, f.RegistryGeneration, f.SandboxID, f.BindingDigest, f.LastEventSeq,
 		)
@@ -835,6 +880,38 @@ func (f ExecutionFence) Validate() error {
 		}
 	}
 	return nil
+}
+
+func NodeTerminalProofDigest(
+	proof TerminalProof,
+	registryGeneration string,
+	sandboxID string,
+	bindingDigest string,
+	lastEventSeq uint64,
+) (string, error) {
+	if proof.Kind != ProofNodeTerminal || proof.FencedNodeID == "" || proof.FencedNodeEpoch == 0 ||
+		proof.ObservedNodeEpoch != 0 || proof.SystemEpoch != 0 || proof.SystemCommitIndex != 0 ||
+		proof.EnrollmentID != "" || proof.EnrollmentCommitIndex != 0 || registryGeneration == "" ||
+		sandboxID == "" || !validDigest(bindingDigest) || lastEventSeq == 0 {
+		return "", errors.New("cluster: incomplete node-terminal proof evidence")
+	}
+	value := struct {
+		RegistryGeneration string `json:"registry_generation"`
+		SandboxID          string `json:"sandbox_id"`
+		BindingDigest      string `json:"binding_digest"`
+		LastEventSeq       uint64 `json:"last_event_seq"`
+		FencedNodeID       string `json:"fenced_node_id"`
+		FencedNodeEpoch    uint64 `json:"fenced_node_epoch"`
+	}{
+		RegistryGeneration: registryGeneration, SandboxID: sandboxID, BindingDigest: bindingDigest,
+		LastEventSeq: lastEventSeq, FencedNodeID: proof.FencedNodeID, FencedNodeEpoch: proof.FencedNodeEpoch,
+	}
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return "", err
+	}
+	digest := sha256.Sum256(append([]byte("kuasar-node-terminal-proof-v1\x00"), raw...))
+	return hex.EncodeToString(digest[:]), nil
 }
 
 func NewerNodeEpochProofDigest(

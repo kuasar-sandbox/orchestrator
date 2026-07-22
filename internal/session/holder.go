@@ -106,6 +106,7 @@ type heldSession struct {
 	hasSnapshot  bool
 	keyLeases    map[string]int64
 	keyLeaseSeq  map[string]uint64
+	keyLeaseHigh map[string]int64
 }
 
 type Lease struct {
@@ -458,6 +459,7 @@ func newHeldSession(registration Registration, endpoint SessionEndpoint) *heldSe
 	return &heldSession{
 		registration: registration, endpoint: endpoint,
 		keyLeases: make(map[string]int64), keyLeaseSeq: make(map[string]uint64),
+		keyLeaseHigh: make(map[string]int64),
 	}
 }
 
