@@ -255,7 +255,7 @@ func TestPendingLookupBoundsEncodedResponseBytes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	encoded, err := json.Marshal(result)
+	encoded, err := json.Marshal(DataLookupResult{Pending: &result})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -437,7 +437,7 @@ func TestRouteChangefeedBoundsEncodedResponseWithoutSkippingCursor(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	encoded, err := json.Marshal(page)
+	encoded, err := json.Marshal(DataLookupResult{Changefeed: &page})
 	if err != nil {
 		t.Fatal(err)
 	}
