@@ -279,13 +279,16 @@ func (h *Holder) beginKeyLeaseMutation(
 			return nil, errors.Join(ErrDispatchNotSent, ErrKeyLeaseSuperseded)
 		}
 		held.keyLeaseHigh[sequenceKey] = acknowledgedKeyLease{Ref: ref, ExpiresUnix: desiredExpiry}
-	} else if high.Ref.KeyRevision > ref.KeyRevision ||
-		(high.Ref.KeyRevision == ref.KeyRevision && high.Ref.KeyRevision != 0 && high.Ref != ref) {
-		held.leaseMu.Unlock()
-		h.mu.RUnlock()
-		return nil, errors.Join(ErrDispatchNotSent, ErrKeyLeaseSuperseded)
 	} else {
-		held.keyLeaseHigh[sequenceKey] = acknowledgedKeyLease{Ref: ref, ExpiresUnix: high.ExpiresUnix}
+		installed, found := held.keyLeases[key]
+		if (found && installed.Ref != ref) ||
+			(high.Ref.KeyRevision != 0 && keyLeaseRefID(high.Ref) == key && high.Ref != ref) {
+			held.leaseMu.Unlock()
+			h.mu.RUnlock()
+			return nil, errors.Join(ErrDispatchNotSent, ErrKeyLeaseSuperseded)
+		}
+		// A cleanup hint is not Provider revision evidence. Never advance the
+		// group high-watermark until an exact key put is accepted.
 	}
 	held.keyLeaseSeq[sequenceKey]++
 	sequence := held.keyLeaseSeq[sequenceKey]
