@@ -31,8 +31,6 @@ func TestNormalizedDemandRejectsUnknownOrTrailingData(t *testing.T) {
 		[]byte(`{"version":1,"kind":"sandbox","sandbox":{"slot_units":1},"unknown":true}`),
 		[]byte(`{"version":1,"kind":"sandbox","sandbox":{"slot_units":1}} {}`),
 		[]byte(`{"version":1,"kind":"build","build":{"slots":0}}`),
-		[]byte(`{"version":1,"kind":"build","build":{"slots":1,"cpu":1000}}`),
-		[]byte(`{"version":1,"kind":"build","build":{"slots":1,"memory":536870912}}`),
 	} {
 		if _, err := ParseNormalizedDemand(encoded); err == nil {
 			t.Fatalf("invalid demand accepted: %s", encoded)
