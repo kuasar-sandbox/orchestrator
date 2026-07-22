@@ -96,6 +96,56 @@ func (s *Store) GetNodeWorkflow(
 	return record, nil
 }
 
+// RefreshNodeWorkflowSession records the newest session that may have emitted
+// an otherwise identical dispatch. It keeps finalization compaction from
+// discarding the dedupe marker while that session can still deliver a retry.
+func (s *Store) RefreshNodeWorkflowSession(
+	ctx context.Context,
+	dispatch nodeexec.DispatchRecord,
+) (*nodeexec.WorkflowRecord, error) {
+	if err := dispatch.Validate(); err != nil {
+		return nil, err
+	}
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	record, err := getNodeWorkflowTx(ctx, tx, dispatch.Kind, dispatch.ObjectID)
+	if err != nil {
+		return nil, err
+	}
+	if record == nil {
+		return nil, ErrNodeWorkflowMissing
+	}
+	if !sameDispatch(record, dispatch) {
+		return nil, ErrNodeWorkflowConflict
+	}
+	if dispatch.SessionSeq < record.SessionSeq {
+		return nil, nodeexec.ErrSessionFenced
+	}
+	if dispatch.SessionSeq > record.SessionSeq {
+		record.SessionSeq = dispatch.SessionSeq
+		result, err := tx.ExecContext(ctx, `
+UPDATE node_workflows SET session_seq=?,updated_unix=?
+WHERE object_kind=? AND object_id=?`, encodeUint64(record.SessionSeq), time.Now().Unix(), record.Kind, record.ObjectID)
+		if err != nil {
+			return nil, err
+		}
+		changed, err := result.RowsAffected()
+		if err != nil {
+			return nil, err
+		}
+		if changed != 1 {
+			return nil, ErrNodeWorkflowMissing
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return record, nil
+}
+
 func sameDispatch(existing *nodeexec.WorkflowRecord, dispatch nodeexec.DispatchRecord) bool {
 	return existing.DispatchRecord.SameDispatch(dispatch)
 }

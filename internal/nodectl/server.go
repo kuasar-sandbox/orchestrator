@@ -640,6 +640,9 @@ func (s *Server) handleRelease(req *Message, token string) error {
 	s.State.Unlock()
 
 	s.Admission.PushWake()
+	if s.PreparedAdmission != nil {
+		s.PreparedAdmission.SignalCapacityChange()
+	}
 	s.finishRelease(req, token, &released)
 	return flushErr
 }

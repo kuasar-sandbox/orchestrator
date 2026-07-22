@@ -791,6 +791,50 @@ func TestIdleSweeperWakesPreparedQueueAfterDurableRelease(t *testing.T) {
 	}
 }
 
+func TestOrdinaryReleaseWakesPreparedAdmissionQueue(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	state := preparedTestState()
+	controller := preparedTestController(t, state, path, 4)
+	serverConn, clientConn := net.Pipe()
+	defer serverConn.Close()
+	defer clientConn.Close()
+	server := &Server{
+		State: state, Admission: controller.admission, PreparedAdmission: controller,
+		Allocator: NewAllocator(AllocatorPolicy{}), Persister: controller.persister, Logf: t.Logf,
+	}
+	ordinaryDemand := preparedTestDemand(15 << 30)
+	var token string
+	if result := server.handleAdmit(serverConn, ordinaryDemand.message("sandbox-ordinary"), &token); result == nil || result.Status != StatusAdmitted {
+		t.Fatalf("ordinary admission = %+v", result)
+	}
+	queuedDigest := preparedDigest("prepared-waiter")
+	queued, err := controller.PrepareAdmission("sandbox-prepared", queuedDigest, preparedTestDemand(2<<30))
+	if err != nil || queued.State != PreparedQueued {
+		t.Fatalf("prepared admission = %+v, %v", queued, err)
+	}
+	for {
+		select {
+		case <-controller.Wake():
+			continue
+		default:
+		}
+		break
+	}
+	if err := server.handleRelease(&Message{Reason: "ordinary_done"}, token); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-controller.Wake():
+	case <-time.After(time.Second):
+		t.Fatal("prepared queue was not woken after ordinary capacity release")
+	}
+	promoted, err := controller.PromoteQueued()
+	if err != nil || len(promoted) != 1 || promoted[0].SandboxID != "sandbox-prepared" ||
+		promoted[0].State != PreparedAdmitted {
+		t.Fatalf("promotion after ordinary release = %+v, %v", promoted, err)
+	}
+}
+
 func TestPreparedAdmissionKeepsPublishedStateOnDirectorySyncFailure(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.json")
 	state := preparedTestState()

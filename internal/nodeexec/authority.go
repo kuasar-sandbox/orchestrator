@@ -45,6 +45,7 @@ type SandboxAdmissionOrphanReconciler interface {
 // are deliberately keyed by the business sandbox/build IDs from the RFC.
 type WorkflowJournal interface {
 	GetNodeWorkflow(context.Context, clusterstate.ExecutionKind, string) (*WorkflowRecord, error)
+	RefreshNodeWorkflowSession(context.Context, DispatchRecord) (*WorkflowRecord, error)
 	ExecutionObjectExists(context.Context, clusterstate.ExecutionKind, string) (bool, error)
 	RecordSandboxWorkflow(context.Context, DispatchRecord, AdmissionDecision, *types.Sandbox) (*WorkflowRecord, error)
 	AdmitQueuedSandbox(context.Context, string, string, string) (*WorkflowRecord, error)
@@ -159,6 +160,13 @@ func (a *Authority) AdmitAndDispatch(
 	if existing != nil {
 		if !existing.DispatchRecord.SameDispatch(dispatch) {
 			return session.DispatchReply{Outcome: clusterstate.DispatchConflict, Reason: "object ID is bound to another dispatch"}, nil
+		}
+		existing, err = a.journal.RefreshNodeWorkflowSession(ctx, dispatch)
+		if err != nil {
+			if errors.Is(err, ErrWorkflowConflict) || errors.Is(err, ErrSessionFenced) {
+				return session.DispatchReply{Outcome: clusterstate.DispatchConflict, Reason: err.Error()}, nil
+			}
+			return session.DispatchReply{}, err
 		}
 		return session.DispatchReply{Outcome: existing.Result, Reason: existing.Reason}, nil
 	}

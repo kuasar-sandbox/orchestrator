@@ -392,6 +392,28 @@ func TestAuthorityBuildDispatchIsDurableAndSessionFenced(t *testing.T) {
 	}
 }
 
+func TestAuthorityCrossSessionRetryRefreshesDurableFence(t *testing.T) {
+	st := authorityStore(t)
+	sandbox := &sandboxAdmissionFake{prepared: map[string]nodectl.PreparedAdmissionResult{}, wake: make(chan struct{})}
+	command := authorityCommand(t, clusterstate.ExecutionKindBuild, "build-session-retry")
+	first := newAuthorityAtSession(t, st, sandbox, command.SessionSeq)
+	initial, err := first.AdmitAndDispatch(context.Background(), command)
+	if err != nil || initial.Outcome != clusterstate.DispatchAcceptedAdmitted {
+		t.Fatalf("initial dispatch = %+v, %v", initial, err)
+	}
+
+	command.SessionSeq++
+	reconnected := newAuthorityAtSession(t, st, sandbox, command.SessionSeq)
+	retry, err := reconnected.AdmitAndDispatch(context.Background(), command)
+	if err != nil || retry != initial {
+		t.Fatalf("cross-session retry = %+v, %v; want %+v", retry, err, initial)
+	}
+	stored, err := st.GetNodeWorkflow(context.Background(), clusterstate.ExecutionKindBuild, command.ObjectID)
+	if err != nil || stored == nil || stored.SessionSeq != command.SessionSeq {
+		t.Fatalf("durable retry session = %+v, %v", stored, err)
+	}
+}
+
 func TestAuthorityFencesEverySessionOwnedWorkerEntry(t *testing.T) {
 	st := authorityStore(t)
 	sandbox := &sandboxAdmissionFake{prepared: map[string]nodectl.PreparedAdmissionResult{}, wake: make(chan struct{})}

@@ -96,6 +96,9 @@ func (e NodeRequestEnvelopeV1) Validate() error {
 // deterministic JSON object. This prevents aliases or extensions from changing
 // meaning when an intent is replayed by a different leader.
 func CanonicalJSONObject(encoded []byte) (json.RawMessage, error) {
+	if len(encoded) > MaxNodeRequestBodyBytes {
+		return nil, fmt.Errorf("cluster: node request body exceeds %d bytes", MaxNodeRequestBodyBytes)
+	}
 	if !utf8.Valid(encoded) {
 		return nil, errors.New("cluster: node request body is not valid UTF-8")
 	}
