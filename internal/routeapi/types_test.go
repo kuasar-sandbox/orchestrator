@@ -169,11 +169,18 @@ func TestBuildReadResponseOnlyExposesRegistrationBinding(t *testing.T) {
 	}
 	pending := ReadBuildResponse{
 		Outcome: ReadConflict, Group: "/g", BuildState: clusterstate.BuildStarting, BuildRevision: 2,
-		Pending: &PendingBuildProjection{BuildID: "b1", TemplateRef: "transient-b1", Profile: types.ProfileE2B},
+		Pending: &PendingBuildProjection{
+			BuildID: "b1", RegistryGeneration: "g1", TemplateRef: "transient-b1", Profile: types.ProfileE2B,
+		},
 	}
 	if err := pending.ValidateFor(buildRequest); err != nil {
 		t.Fatalf("strong pending Build projection: %v", err)
 	}
+	pending.Pending.RegistryGeneration = "g2"
+	if err := pending.ValidateFor(buildRequest); err == nil {
+		t.Fatal("pending Build projection from another Registry History Generation was accepted")
+	}
+	pending.Pending.RegistryGeneration = "g1"
 	buildRequest.Strong = false
 	if err := pending.ValidateFor(buildRequest); err == nil {
 		t.Fatal("replica-local read accepted a pending Build projection")
