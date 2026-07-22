@@ -648,7 +648,7 @@ func (s *Store) CommitClusterBuildState(
 		return nil, errors.New("store: accepted Build object is missing")
 	}
 	if record.ObjectState == update.State {
-		if !duplicateBuildUpdateMatches(current, update) {
+		if !duplicateBuildUpdateMatches(current, build, update) {
 			return nil, ErrNodeWorkflowConflict
 		}
 		changed, mergeErr := mergeBuildRuntimeFields(current, build, update)
@@ -1076,10 +1076,11 @@ func mergeBuildRuntimeFields(stored, incoming *types.Build, update nodeexec.Even
 	return changed, nil
 }
 
-func duplicateBuildUpdateMatches(stored *types.Build, update nodeexec.EventUpdate) bool {
+func duplicateBuildUpdateMatches(stored, incoming *types.Build, update nodeexec.EventUpdate) bool {
 	switch update.State {
 	case string(types.BuildReady):
-		return update.ArtifactRef != "" && stored.PersistID == update.ArtifactRef
+		return update.ArtifactRef != "" && stored.PersistID == update.ArtifactRef &&
+			stored.Kind == incoming.Kind && stored.StartCmd == incoming.StartCmd && stored.ReadyCmd == incoming.ReadyCmd
 	case string(types.BuildError):
 		return update.Reason != "" && stored.Reason == update.Reason
 	default:
@@ -1173,8 +1174,8 @@ func (s *Store) LaunchableNodeWorkflows(
 	}
 	stateFilter := ""
 	if kind == clusterstate.ExecutionKindBuild {
-		stateFilter = " AND object_state IN (?,?)"
-		args = append(args, types.BuildWaiting, types.BuildBuilding)
+		stateFilter = " AND object_state IN (?,?,?)"
+		args = append(args, types.BuildRegistered, types.BuildWaiting, types.BuildBuilding)
 	}
 	args = append(args, limit)
 	rows, err := s.db.QueryContext(ctx, `SELECT `+workflowColumns+` FROM node_workflows
@@ -1530,9 +1531,9 @@ func (s *Store) FinalizeNodeWorkflow(
 	return nil
 }
 
-// CompactFinalizedNodeWorkflows removes only markers fenced by a strictly
-// newer durable SessionSeq. Commands from the old session tuple can no longer
-// pass node-link validation at that point.
+// CompactFinalizedNodeWorkflows removes only markers fenced by a newer durable
+// NodeEpoch or SessionSeq. Commands from the old tuple can no longer pass
+// node-link validation at that point.
 func (s *Store) CompactFinalizedNodeWorkflows(
 	ctx context.Context,
 	nodeID string,
@@ -1542,8 +1543,9 @@ func (s *Store) CompactFinalizedNodeWorkflows(
 		return errors.New("store: current node session identity is required for workflow compaction")
 	}
 	_, err := s.db.ExecContext(ctx, `DELETE FROM node_workflows
-WHERE node_id=? AND node_epoch=? AND session_seq<? AND workflow_finalized=1 AND event_seq=acked_event_seq`,
-		nodeID, encodeUint64(nodeEpoch), encodeUint64(currentSessionSeq))
+WHERE node_id=? AND (node_epoch<? OR (node_epoch=? AND session_seq<?))
+AND workflow_finalized=1 AND event_seq=acked_event_seq`,
+		nodeID, encodeUint64(nodeEpoch), encodeUint64(nodeEpoch), encodeUint64(currentSessionSeq))
 	return err
 }
 

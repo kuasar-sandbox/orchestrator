@@ -557,7 +557,8 @@ func TestRuntimeKeepsEnrolledReplicaUntilLocalRemovalIsDurable(t *testing.T) {
 	if result.Conflict || !result.Applied {
 		t.Fatalf("System bootstrap = %+v", result)
 	}
-	if err := runtime.StartDataReplicas(system); err != nil {
+	host.read = func(uint64, any) (any, error) { return system, nil }
+	if err := runtime.StartDataReplicas(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if len(host.starts) != 2 {
@@ -565,10 +566,11 @@ func TestRuntimeKeepsEnrolledReplicaUntilLocalRemovalIsDurable(t *testing.T) {
 	}
 	runtime.enrollment.Replicas[0].LocalState = ReplicaRemoving
 	runtime.enrollment.Replicas[1].LocalState = ReplicaRemoved
+	runtime.systemClient = &testRemoteSystemClient{state: system}
 	if err := runtime.StartSystemReplica(); !errors.Is(err, ErrNoLocalReplica) {
 		t.Fatalf("removing System replica start error = %v", err)
 	}
-	if err := runtime.StartDataReplicas(system); err != nil {
+	if err := runtime.StartDataReplicas(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if len(host.starts) != 2 {
@@ -668,10 +670,11 @@ func TestRuntimeAdvancesEnrollmentRegistryLayoutOnlyAfterConsensusActivation(t *
 	if err != nil {
 		t.Fatal(err)
 	}
+	restartHost := newFakeNodeHost()
 	restarted, err := openRuntime(
 		fixture.config, []SignedRegistryLayout{fixture.signed, signedNext}, fixture.keyring,
 		RuntimeOpenOptions{Mode: RuntimeRestart},
-		func(dbconfig.NodeHostConfig) (raftNodeHost, error) { return newFakeNodeHost(), nil },
+		func(dbconfig.NodeHostConfig) (raftNodeHost, error) { return restartHost, nil },
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -714,7 +717,8 @@ func TestRuntimeAdvancesEnrollmentRegistryLayoutOnlyAfterConsensusActivation(t *
 		}
 	}
 	system, _ = applySystem(t, system, index, SystemCommand{Type: SystemActivateTransition})
-	if err := restarted.SyncLocalRegistryLayout(system); err != nil {
+	restartHost.read = func(uint64, any) (any, error) { return system, nil }
+	if err := restarted.SyncLocalRegistryLayout(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if restarted.enrollment.RegistryLayoutVersion != next.RegistryLayoutVersion ||

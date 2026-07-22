@@ -518,6 +518,13 @@ func (r *Runtime) RemoveOldReplica(ctx context.Context, shardID, replicaID uint6
 }
 
 func (r *Runtime) RemoveJoiningReplica(ctx context.Context, shardID, replicaID uint64) error {
+	placement, err := r.placementForRaftShard(shardID)
+	if err != nil {
+		return err
+	}
+	if placementContainsReplica(placement, replicaID) {
+		return errors.New("raftstore: desired registryLayout learner cannot be removed")
+	}
 	membership, err := r.syncGetShardMembership(ctx, shardID)
 	if err != nil {
 		return err

@@ -146,6 +146,38 @@ func TestPlacementFailuresDoNotInventExecutionProof(t *testing.T) {
 	}
 }
 
+func TestBuildProjectionRequiresCanonicalDataEndpoint(t *testing.T) {
+	build := registeredBuildRecord(t)
+	build.Projection.DataEndpoint = "https://node-1:8443"
+	if err := build.Validate(); err == nil {
+		t.Fatal("non-TCP Build data endpoint accepted")
+	}
+}
+
+func TestBuildFinalizationMustIdentifyContainingBuild(t *testing.T) {
+	build := registeredBuildRecord(t)
+	build.Finalizations = []WorkflowFinalizationIntent{{
+		ObjectID: "another-build", NodeID: "n1", NodeEpoch: 7, DataEndpoint: "10.0.0.1:8443",
+		RegistryGeneration: build.Revision.RegistryGeneration, BindingDigest: hexDigest(sha256.Sum256([]byte("binding"))),
+	}}
+	if err := build.Validate(); err == nil {
+		t.Fatal("Build finalization for another object accepted")
+	}
+}
+
+func registeredBuildRecord(t *testing.T) BuildRecord {
+	t.Helper()
+	return BuildRecord{
+		Group: "/g", BuildID: "b1", State: BuildRegistered,
+		Revision: Revision{RegistryGeneration: "g1", ShardID: 2, LogIndex: 20},
+		Projection: &BuildProjection{
+			BuildID: "b1", NodeID: "n1", NodeEpoch: 7, DataEndpoint: "10.0.0.1:8443",
+			RegistryGeneration: "g1", BindingDigest: hexDigest(sha256.Sum256([]byte("binding"))),
+			Intent: workflowBuildIntent(t), TemplateRef: "template-1",
+		},
+	}
+}
+
 func TestPlacementCandidatePoolIsBoundedBeforePersistence(t *testing.T) {
 	candidates := make([]PlacementCandidate, MaxPlacementCandidates+1)
 	for index := range candidates {

@@ -27,7 +27,7 @@ func (r *Runtime) AwaitOrBeginRegistryLayoutTransition(ctx context.Context) (Sys
 			switch {
 			case state.ActiveRegistryLayoutVersion == r.registryLayout.RegistryLayoutVersion &&
 				state.ActiveRegistryLayoutDigest == r.registryLayoutDigest:
-				if err := r.SyncLocalRegistryLayout(state); err != nil {
+				if err := r.syncLocalRegistryLayout(state); err != nil {
 					return SystemState{}, err
 				}
 				return state, nil
@@ -169,7 +169,7 @@ func (r *Runtime) ActivateRegistryLayoutTransition(ctx context.Context) (SystemS
 	if readErr == nil {
 		if current.Transition != nil && current.Transition.Activated &&
 			current.ActiveRegistryLayoutDigest == r.registryLayoutDigest {
-			if err := r.SyncLocalRegistryLayout(current); err != nil {
+			if err := r.syncLocalRegistryLayout(current); err != nil {
 				return SystemState{}, err
 			}
 			return current, nil
@@ -277,7 +277,7 @@ func (r *Runtime) FinalizeRegistryLayoutTransition(ctx context.Context) (SystemS
 	defer cancelResolve()
 	current, readErr := r.ReadSystemStrong(resolveContext)
 	if readErr == nil && current.Transition == nil && current.ActiveRegistryLayoutDigest == r.registryLayoutDigest {
-		if err := r.SyncLocalRegistryLayout(current); err != nil {
+		if err := r.syncLocalRegistryLayout(current); err != nil {
 			return SystemState{}, err
 		}
 		return current, nil

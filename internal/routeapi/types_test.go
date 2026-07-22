@@ -94,6 +94,35 @@ func TestReplicaLocalRouteReadNeverReturnsFinalNegative(t *testing.T) {
 	}
 }
 
+func TestLeaderHintRequiresCanonicalHTTPSEndpoint(t *testing.T) {
+	hint := LeaderHint{MemberID: "r1", Endpoint: "http://r1.internal", Term: 1}
+	if err := hint.Validate(); err == nil {
+		t.Fatal("non-HTTPS leader endpoint accepted")
+	}
+	hint.Endpoint = "https://r1.internal/"
+	if err := hint.Validate(); err == nil {
+		t.Fatal("non-canonical leader endpoint accepted")
+	}
+	hint.Endpoint = "https://r1.internal"
+	if err := hint.Validate(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestTrustedHandlerRejectsOversizedBodyAfterValidJSON(t *testing.T) {
+	body, err := json.Marshal(routeRequest(false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body = append(body, bytes.Repeat([]byte(" "), maxBodyBytes-len(body)+1)...)
+	request := httptest.NewRequest(http.MethodPost, ReadRoutePath, bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	NewHandler(fakeService{}, func(*http.Request) error { return nil }).ServeHTTP(w, request)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("oversized request status = %d", w.Code)
+	}
+}
+
 func TestTrustedHandlerRequiresInternalTransportIdentity(t *testing.T) {
 	service := fakeService{route: ReadRouteResponse{Outcome: ReadReady, Group: "/g", RouteKey: "rk", State: clusterstate.WorkflowRouteReady, Route: testReadyRoute(), RouteRevision: 12}}
 	body, _ := json.Marshal(routeRequest(false))

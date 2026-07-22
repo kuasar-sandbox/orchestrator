@@ -385,7 +385,7 @@ func openConsensusRuntime(
 		return fail(err)
 	}
 	if system.Transition != nil && system.Transition.Digest == digest {
-		if err := runtime.PlanRegistryLayoutJoins(system); err != nil {
+		if err := runtime.PlanRegistryLayoutJoins(ctx); err != nil {
 			return fail(err)
 		}
 		if runtime.HasLocalSystemReplica() {
@@ -394,11 +394,11 @@ func openConsensusRuntime(
 			}
 		}
 	}
-	if err := runtime.StartDataReplicas(system); err != nil {
+	if err := runtime.StartDataReplicas(ctx); err != nil {
 		return fail(err)
 	}
 	if mode == raftstore.RuntimeBootstrap {
-		if err := runtime.InitializeDataShards(ctx, system, config.Storage.InitializeWorkers); err != nil {
+		if err := runtime.InitializeDataShards(ctx, config.Storage.InitializeWorkers); err != nil {
 			return fail(err)
 		}
 	}

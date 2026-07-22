@@ -191,7 +191,7 @@ func projectSandbox(snapshot PlacementLoadSnapshot, demand SandboxDemand) (Probe
 		return ProbeImmediate, components, ""
 	}
 	if snapshot.SandboxQueueLimit == 0 || snapshot.SandboxQueueDepth >= snapshot.SandboxQueueLimit {
-		return ProbeReject, components, "sandbox queue is full"
+		return ProbeStale, components, "sandbox queue is temporarily full"
 	}
 	return ProbeWouldQueue, components, "sandbox requires queueing"
 }
@@ -225,7 +225,7 @@ func projectBuild(snapshot PlacementLoadSnapshot, demand BuildDemand) (ProbeClas
 		return ProbeImmediate, components, ""
 	}
 	if snapshot.BuildQueueLimit == 0 || snapshot.BuildQueueDepth >= snapshot.BuildQueueLimit {
-		return ProbeReject, components, "build queue is full"
+		return ProbeStale, components, "build queue is temporarily full"
 	}
 	return ProbeWouldQueue, components, "build requires queueing"
 }

@@ -113,6 +113,12 @@ func TestOrderedMembershipChangeRequiresCatchUpBeforeOldReplicaRemoval(t *testin
 	if err := runtime.AddNonVoting(ctx, shardID, 4, "registry-d"); err != nil {
 		t.Fatal(err)
 	}
+	if err := runtime.RemoveJoiningReplica(ctx, shardID, 4); err == nil {
+		t.Fatal("desired learner was removed from consensus membership")
+	}
+	if _, present := host.memberships[shardID].NonVotings[4]; !present {
+		t.Fatal("desired learner disappeared after rejected removal")
+	}
 	if err := runtime.RemoveOldReplica(ctx, shardID, 3); err == nil {
 		t.Fatal("old replica removed before the desired voter was promoted")
 	}

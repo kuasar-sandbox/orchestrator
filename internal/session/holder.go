@@ -384,6 +384,12 @@ func (h *Holder) AdmitAndDispatch(ctx context.Context, command DispatchCommand) 
 	if leaseExpires <= h.clock().Unix() {
 		return DispatchReply{}, errors.Join(ErrDispatchNotSent, ErrKeyLeaseUnavailable)
 	}
+	// A command can wait behind another dispatch while its generation Permit
+	// expires. Recheck after acquiring the per-session command fence and just
+	// before handing the command to the transport.
+	if err := h.CheckServe(command.ServeIdentity, PermitDispatch); err != nil {
+		return DispatchReply{}, errors.Join(ErrDispatchNotSent, err)
+	}
 	endpoint := held.endpoint
 	command.SessionSeq = held.registration.SessionSeq
 	registration := held.registration

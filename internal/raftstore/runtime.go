@@ -313,13 +313,14 @@ func (r *Runtime) HasLocalSystemReplica() bool {
 	}
 }
 
-func (r *Runtime) StartDataReplicas(system SystemState) error {
+func (r *Runtime) StartDataReplicas(ctx context.Context) error {
 	if r.systemEvents != nil {
 		if err := r.systemEvents.Err(); err != nil {
 			return err
 		}
 	}
-	if err := r.authorizeRegistryLayoutState(system); err != nil {
+	system, err := r.readAuthorizedSystemStrong(ctx)
+	if err != nil {
 		return err
 	}
 	r.mu.Lock()
@@ -335,11 +336,12 @@ func (r *Runtime) StartDataReplicas(system SystemState) error {
 		}
 	}
 	r.mu.Unlock()
-	return r.SyncLocalRegistryLayout(system)
+	return r.syncLocalRegistryLayout(system)
 }
 
-func (r *Runtime) PlanRegistryLayoutJoins(system SystemState) error {
-	if err := r.authorizeRegistryLayoutState(system); err != nil {
+func (r *Runtime) PlanRegistryLayoutJoins(ctx context.Context) error {
+	system, err := r.readAuthorizedSystemStrong(ctx)
+	if err != nil {
 		return err
 	}
 	if system.Transition == nil || system.Transition.Digest != r.registryLayoutDigest {
@@ -463,9 +465,17 @@ func (r *Runtime) markReplicaRemoving(shardID, replicaID uint64) error {
 	}
 }
 
-// SyncLocalRegistryLayout advances the enrollment's active-registryLayout fence only
-// after the System Group has committed that exact signed registryLayout as active.
-func (r *Runtime) SyncLocalRegistryLayout(system SystemState) error {
+// SyncLocalRegistryLayout advances the enrollment's active-registryLayout fence
+// only from a linearizable System Group read.
+func (r *Runtime) SyncLocalRegistryLayout(ctx context.Context) error {
+	system, err := r.readAuthorizedSystemStrong(ctx)
+	if err != nil {
+		return err
+	}
+	return r.syncLocalRegistryLayout(system)
+}
+
+func (r *Runtime) syncLocalRegistryLayout(system SystemState) error {
 	if err := r.authorizeRegistryLayoutState(system); err != nil {
 		return err
 	}
@@ -589,19 +599,27 @@ func (r *Runtime) acceptRemoteSystemState(state SystemState) error {
 	return nil
 }
 
+func (r *Runtime) readAuthorizedSystemStrong(ctx context.Context) (SystemState, error) {
+	state, err := r.ReadSystemStrong(ctx)
+	if err != nil {
+		return SystemState{}, err
+	}
+	if err := r.authorizeRegistryLayoutState(state); err != nil {
+		return SystemState{}, err
+	}
+	return state, nil
+}
+
 func (r *Runtime) AwaitSystemRegistryLayout(ctx context.Context) (SystemState, error) {
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
 	for {
-		state, err := r.ReadSystemLocal()
-		if !r.HasLocalSystemReplica() {
-			state, err = r.ReadSystemStrong(ctx)
-		}
+		state, err := r.ReadSystemStrong(ctx)
 		if err == nil && state.Initialized {
 			if err := r.authorizeRegistryLayoutState(state); err != nil {
 				return SystemState{}, err
 			}
-			if err := r.SyncLocalRegistryLayout(state); err != nil {
+			if err := r.syncLocalRegistryLayout(state); err != nil {
 				return SystemState{}, err
 			}
 			return state, nil
@@ -626,7 +644,7 @@ func (r *Runtime) BootstrapSystem(ctx context.Context) (SystemState, error) {
 		if err := r.authorizeRegistryLayoutState(state); err != nil {
 			return false, err
 		}
-		if err := r.SyncLocalRegistryLayout(state); err != nil {
+		if err := r.syncLocalRegistryLayout(state); err != nil {
 			return false, err
 		}
 		committed = state
@@ -669,17 +687,18 @@ func (r *Runtime) BootstrapSystem(ctx context.Context) (SystemState, error) {
 	return committed, err
 }
 
-func (r *Runtime) InitializeDataShards(ctx context.Context, system SystemState, workers int) error {
+func (r *Runtime) InitializeDataShards(ctx context.Context, workers int) error {
 	if r.enrollment.Mode != EnrollmentBootstrap || r.registryLayout.RegistryLayoutVersion != 1 {
 		return ErrBootstrapUnauthorized
 	}
-	if err := r.authorizeRegistryLayoutState(system); err != nil {
+	system, err := r.readAuthorizedSystemStrong(ctx)
+	if err != nil {
 		return err
 	}
 	if system.ActiveRegistryLayoutDigest != r.registryLayoutDigest || system.SystemEpoch != 1 {
 		return errors.New("raftstore: data shards require the initial committed System registryLayout")
 	}
-	if err := r.SyncLocalRegistryLayout(system); err != nil {
+	if err := r.syncLocalRegistryLayout(system); err != nil {
 		return err
 	}
 	if workers <= 0 || workers > 256 {

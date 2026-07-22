@@ -686,6 +686,9 @@ func (p BuildProjection) Validate() error {
 		p.TemplateRef == "" || !validDigest(p.BindingDigest) {
 		return errors.New("cluster: incomplete Build registration projection")
 	}
+	if err := ValidateTCPDataEndpoint(p.DataEndpoint); err != nil {
+		return err
+	}
 	if err := validateBuildDispatchIntent(p.Intent); err != nil {
 		return err
 	}
@@ -766,7 +769,7 @@ func (r BuildRecord) Validate() error {
 		return err
 	}
 	for _, intent := range r.Finalizations {
-		if intent.RegistryGeneration != r.Revision.RegistryGeneration || intent.TerminalProof != nil {
+		if intent.ObjectID != r.BuildID || intent.RegistryGeneration != r.Revision.RegistryGeneration || intent.TerminalProof != nil {
 			return errors.New("cluster: invalid Build registration finalization")
 		}
 	}
