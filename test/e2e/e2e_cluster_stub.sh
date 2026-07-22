@@ -322,7 +322,7 @@ done
 
 mkdir -p "$WORK/groups"
 cat >"$WORK/groups/group.json" <<EOF
-{"group":"$GROUP","manifest_key":"$MANIFEST_KEY","auth_key":"$AUTH_KEY","template_ref":"tmpl-stub","node_selectors":[{"pool":"stub"}],"sandbox_config":{"stub.create_delay_ms":"15","stub.http_status":"204"}}
+{"group":"$GROUP","key_revision":1,"manifest_key":"$MANIFEST_KEY","auth_key":"$AUTH_KEY","template_ref":"tmpl-stub","node_selectors":[{"pool":"stub"}],"sandbox_config":{"stub.create_delay_ms":"15","stub.http_status":"204"}}
 EOF
 
 for i in $(seq 1 "$REGISTRIES"); do

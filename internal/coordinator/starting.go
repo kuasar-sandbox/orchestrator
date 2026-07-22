@@ -296,7 +296,12 @@ func (c *StartingCoordinator) StartRouteAfterPlacementFailure(
 	if round.SandboxID == "" || round.SandboxID == failure.SandboxID || len(round.Candidates) == 0 {
 		return cluster.RouteWorkflowRecord{}, errors.New("coordinator: next placement round requires a new Sandbox ID and candidate pool")
 	}
-	if err := round.Intent.Validate(); err != nil {
+	for _, finalization := range record.Finalizations {
+		if finalization.ObjectID == round.SandboxID {
+			return cluster.RouteWorkflowRecord{}, errors.New("coordinator: next placement round reused a previously dispatched Sandbox ID")
+		}
+	}
+	if _, _, err := sandboxPlacementInputs(round.Intent); err != nil {
 		return cluster.RouteWorkflowRecord{}, err
 	}
 	next := cluster.RouteWorkflowRecord{

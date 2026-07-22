@@ -483,6 +483,58 @@ func TestExhaustedSandboxRoundCommitsNewIDBeforeNewPlacement(t *testing.T) {
 	}
 }
 
+func TestNextSandboxRoundRejectsNonSandboxIntentBeforeCommit(t *testing.T) {
+	starting := routeStartingRecord(t, "s1", 1, candidatePool("n1", "n2"), []uint32{0, 1})
+	record := placementFailureRecord(t, starting)
+	buildDemand, err := placement.NormalizeBuildDemand(placement.BuildDemand{Slots: 1, CPU: 1000, Memory: 512 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	invalid, err := cluster.NewDispatchIntent(
+		buildDemand, starting.Starting.Intent.DispatchSpec, starting.Starting.Intent.ProviderPolicyVersion,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &workflowStoreStub{route: record}
+	rounds := &roundSourceStub{sandboxID: "s2", candidates: candidatePool("n3", "n4"), intent: &invalid}
+	coordinator := newTestCoordinator(t, store, &pairProberStub{}, &dispatcherStub{store: store}, rounds)
+	if _, err := coordinator.StartRouteAfterPlacementFailure(context.Background(), record); err == nil {
+		t.Fatal("next placement round accepted a non-Sandbox demand")
+	}
+	if store.route.State != cluster.WorkflowRouteTombstone {
+		t.Fatalf("invalid next round was committed: %+v", store.route)
+	}
+}
+
+func TestNextSandboxRoundRejectsPreviouslyDispatchedSandboxID(t *testing.T) {
+	starting := routeStartingRecord(t, "s1", 1, candidatePool("n1", "n2"), []uint32{0, 1})
+	record := placementFailureRecord(t, starting)
+	priorBinding, err := makeBinding(
+		"g1", cluster.ExecutionKindSandbox, record.Group, record.RouteKey, "prior-sandbox",
+		starting.Starting.Intent, probeResponse("prior-node", placement.ProbeImmediate, 1),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	finalization, err := cluster.NewWorkflowFinalizationIntent("prior-sandbox", priorBinding, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record.Finalizations = []cluster.WorkflowFinalizationIntent{finalization}
+	store := &workflowStoreStub{route: record}
+	rounds := &roundSourceStub{
+		sandboxID: "prior-sandbox", candidates: candidatePool("n3", "n4"), intent: &starting.Starting.Intent,
+	}
+	coordinator := newTestCoordinator(t, store, &pairProberStub{}, &dispatcherStub{store: store}, rounds)
+	if _, err := coordinator.StartRouteAfterPlacementFailure(context.Background(), record); err == nil {
+		t.Fatal("next placement round reused a previously dispatched Sandbox ID")
+	}
+	if store.route.State != cluster.WorkflowRouteTombstone {
+		t.Fatalf("reused Sandbox ID was committed: %+v", store.route)
+	}
+}
+
 func TestCommitFailurePreventsDispatch(t *testing.T) {
 	record := routeStartingRecord(t, "s1", 1, candidatePool("n1", "n2"), nil)
 	store := &workflowStoreStub{route: record, fail: errors.New("quorum unavailable")}
@@ -577,6 +629,24 @@ func routeStartingRecord(t *testing.T, sandboxID string, round uint64, candidate
 			SandboxID: sandboxID, PlacementRound: round, CandidatePool: candidates,
 			DefinitivelyRejected: rejected, Intent: intent,
 		},
+	}
+	if err := record.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	return record
+}
+
+func placementFailureRecord(t *testing.T, starting cluster.RouteWorkflowRecord) cluster.RouteWorkflowRecord {
+	t.Helper()
+	record := cluster.RouteWorkflowRecord{
+		Group: starting.Group, RouteKey: starting.RouteKey, State: cluster.WorkflowRouteTombstone,
+		Revision: starting.Revision,
+		Tombstone: &cluster.RouteTombstoneState{PlacementFailure: &cluster.RoutePlacementFailureState{
+			SandboxID: starting.Starting.SandboxID, PlacementRound: starting.Starting.PlacementRound,
+			CandidatePool:        append([]cluster.PlacementCandidate(nil), starting.Starting.CandidatePool...),
+			DefinitivelyRejected: append([]uint32(nil), starting.Starting.DefinitivelyRejected...),
+			Intent:               cloneIntent(starting.Starting.Intent), Reason: "placement candidate pool exhausted",
+		}},
 	}
 	if err := record.Validate(); err != nil {
 		t.Fatal(err)

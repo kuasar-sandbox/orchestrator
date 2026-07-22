@@ -385,6 +385,7 @@ write_group_record() {
     cat > "$WORK/g/group.json" <<EOF
 {
   "group": "$GROUP",
+  "key_revision": 1,
   "manifest_key": { "type": "inline", "value": "$MANIFEST_KEY" },
   "auth_key": { "type": "inline", "value": "$AUTH_KEY" },
   "template_ref": "$TEMPLATE_REF",
