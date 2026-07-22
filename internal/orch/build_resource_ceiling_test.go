@@ -7,6 +7,8 @@ import (
 	"testing"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
+	"github.com/kuasar-sandbox/orchestrator/internal/config"
+	"github.com/kuasar-sandbox/orchestrator/internal/regcreds"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
@@ -61,6 +63,20 @@ func TestBuildTriggerCannotIncreaseRegisteredResources(t *testing.T) {
 	}
 }
 
+func TestStandaloneBuildRegistrationFitsNodeCapacity(t *testing.T) {
+	o := testOrchCfg(t, &config.Config{Builder: config.BuilderConfig{VCPU: 2, Memory: "2GiB"}})
+	ctx := context.Background()
+	apiKey := allowlistedBuildIdentity(t, o)
+	for _, request := range []api.RegisterSpec{
+		{Profile: types.ProfileE2B, CPUCount: 3, MemoryMB: 2048},
+		{Profile: types.ProfileE2B, CPUCount: 2, MemoryMB: 2049},
+	} {
+		if _, err := o.RegisterBuild(ctx, apiKey, request); !errors.Is(err, api.ErrBadRequest) {
+			t.Fatalf("oversized registration %+v: %v", request, err)
+		}
+	}
+}
+
 func TestBuildFromTemplateUsesTheBaseManifestKey(t *testing.T) {
 	o := testOrch(t)
 	ctx := context.Background()
@@ -86,17 +102,21 @@ func TestBuildFromTemplateUsesTheBaseManifestKey(t *testing.T) {
 	if target.ManifestKey != currentManifestKey {
 		t.Fatalf("registered target key = %q, want current key", target.ManifestKey)
 	}
+	pullToken, err := regcreds.Seal(currentManifestKey, regcreds.Creds{Username: "unused", Password: "unused"})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := o.TriggerBuild(ctx, apiKey, target.TemplateID, target.BuildID, api.TriggerSpec{
 		FromTemplate: base.PersistID,
 		Steps:        []types.TemplateStep{{Type: "RUN", Args: []string{"true"}}},
-	}, api.BuildAuth{}); err != nil {
+	}, api.BuildAuth{PullToken: pullToken}); err != nil {
 		t.Fatal(err)
 	}
 	stored, err := o.st.GetBuild(ctx, target.BuildID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if stored.ManifestKey != baseManifestKey || stored.FromTemplate != base.PersistID {
+	if stored.ManifestKey != baseManifestKey || stored.FromTemplate != base.PersistID || stored.RegistryAuth != "" {
 		t.Fatalf("derived Build content identity = key %q base %q", stored.ManifestKey, stored.FromTemplate)
 	}
 }
