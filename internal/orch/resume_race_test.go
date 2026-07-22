@@ -725,3 +725,81 @@ func TestSetTimeoutSerializesAndPreservesPausedWorkflowState(t *testing.T) {
 		t.Fatalf("workflow after serialized timeout = %+v, %v", workflow, err)
 	}
 }
+
+func TestConnectTimeoutSerializesAndPreservesPausedWorkflowState(t *testing.T) {
+	o := testOrch(t)
+	ctx := context.Background()
+	sid := "sandbox-connect-timeout-race"
+	templateRef := "bare-img-" + strings.Repeat("e", 64)
+	dispatch := clusterResumeDispatch(t, sid, templateRef)
+	authKey := strings.Repeat("a", 64)
+	rawAuthKey, _ := hex.DecodeString(authKey)
+	apiKey, err := apikey.Mint(rawAuthKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sandbox := &types.Sandbox{
+		ID: sid, TemplateID: templateRef, State: types.StateRunning,
+		AuthKey: authKey, ManifestKey: strings.Repeat("b", 64),
+		EnvdAccessToken: "access-token", TrafficAccessToken: "traffic-token", CreatedUnix: 1,
+	}
+	if _, err := o.st.RecordSandboxWorkflow(ctx, dispatch, nodeexec.AdmissionDecision{
+		State: nodeexec.AdmissionAdmitted, Result: clusterstate.DispatchAcceptedAdmitted,
+		ReservationToken: "reservation-connect-timeout",
+	}, sandbox); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := o.st.Get(ctx, sid)
+	if err != nil || stored == nil {
+		t.Fatalf("stored Sandbox = %+v, %v", stored, err)
+	}
+	if _, err := o.st.CommitSandboxEvent(ctx, stored, sandboxTestEvent(nodeexec.EventUpdate{
+		State: string(clusterstate.WorkflowRouteReady), TargetPort: 49983,
+	})); err != nil {
+		t.Fatal(err)
+	}
+
+	held := make(chan struct{})
+	release := make(chan struct{})
+	go func() {
+		_ = o.lifecycle.Do(sid, func() error {
+			close(held)
+			<-release
+			return nil
+		})
+	}()
+	<-held
+	type connectResult struct {
+		sandbox *types.Sandbox
+		err     error
+	}
+	done := make(chan connectResult, 1)
+	go func() {
+		result, err := o.Connect(ctx, sid, apiKey, "", 60)
+		done <- connectResult{sandbox: result, err: err}
+	}()
+	select {
+	case outcome := <-done:
+		t.Fatalf("Connect timeout bypassed the in-flight lifecycle lock: %+v", outcome)
+	case <-time.After(25 * time.Millisecond):
+	}
+	stored, err = o.st.Get(ctx, sid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := o.st.CommitSandboxEvent(ctx, stored, sandboxTestEvent(nodeexec.EventUpdate{
+		State: string(clusterstate.WorkflowRoutePaused), TargetPort: 49983, SnapshotRef: "snapshot-connect-timeout",
+	})); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	outcome := <-done
+	if outcome.err != nil || outcome.sandbox == nil || outcome.sandbox.State != types.StatePaused {
+		t.Fatalf("Connect timeout result = %+v", outcome)
+	}
+	workflow, err := o.st.GetNodeWorkflow(ctx, clusterstate.ExecutionKindSandbox, sid)
+	if err != nil || workflow == nil || workflow.ObjectState != string(clusterstate.WorkflowRoutePaused) ||
+		workflow.LatestEvent == nil || workflow.LatestEvent.State != string(clusterstate.WorkflowRoutePaused) {
+		t.Fatalf("workflow after serialized connect timeout = %+v, %v", workflow, err)
+	}
+}

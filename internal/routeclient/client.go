@@ -181,8 +181,10 @@ func (c *Client) RefreshPermit(ctx context.Context) (routeapi.RegistryServeIdent
 }
 
 func (c *Client) Run(ctx context.Context) error {
-	if _, err := c.RefreshPermit(ctx); err != nil {
-		return err
+	if _, err := c.currentPermit(); err != nil {
+		if _, err := c.RefreshPermit(ctx); err != nil {
+			return err
+		}
 	}
 	for {
 		remaining := c.permitRemaining()

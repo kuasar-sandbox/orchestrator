@@ -125,6 +125,34 @@ func TestRefreshPermitRejectsLifetimeOutsideSignedLayout(t *testing.T) {
 	}
 }
 
+func TestRunReusesUnexpiredStartupPermit(t *testing.T) {
+	client := testClient(t)
+	now := time.Unix(1_700_000_000, 0)
+	client.now = func() time.Time { return now }
+	client.permit = &cachedPermit{
+		response: routeapi.PermitResponse{
+			ClusterID: client.registryLayout.ClusterID, RegistryGeneration: client.registryLayout.RegistryGeneration,
+			SystemEpoch: 1, RegistryLayoutDigest: client.digest, CommitIndex: 7,
+			MaxLifetimeMillis: client.registryLayout.ServePermitMaxMillis,
+			ServeGate:         true, WriteGate: true, CutoverGate: true, RecoveryClosed: true,
+		},
+		expires: now.Add(time.Minute),
+	}
+	calls := 0
+	for memberID, endpoint := range client.endpoints {
+		endpoint.Client = &http.Client{Transport: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+			calls++
+			return nil, errors.New("unexpected startup refresh")
+		})}
+		client.endpoints[memberID] = endpoint
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := client.Run(ctx); err != nil || calls != 0 {
+		t.Fatalf("Run with startup Permit = %v, refresh calls=%d", err, calls)
+	}
+}
+
 func TestLocalReadsUseReplicaSpreadRendezvousWithoutLeaderBias(t *testing.T) {
 	client := testClient(t)
 	client.leaders[0] = routeapi.LeaderHint{

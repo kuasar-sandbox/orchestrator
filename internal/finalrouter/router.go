@@ -202,7 +202,7 @@ func (r *Router) Handler() http.Handler {
 
 func (r *Router) serveControl(w http.ResponseWriter, request *http.Request) {
 	r.mx.Inc(`router_requests_total{plane="control"}`)
-	path := request.URL.Path
+	path := request.URL.EscapedPath()
 	switch {
 	case request.Method == http.MethodGet && path == "/health":
 		w.WriteHeader(http.StatusNoContent)
@@ -471,7 +471,7 @@ func (r *Router) sandboxControl(w http.ResponseWriter, request *http.Request) {
 	if !ok {
 		return
 	}
-	if strings.Contains(request.URL.Path, "/import") || strings.Contains(request.URL.Path, "/export") {
+	if sandboxMigrationOperation(request.Method, request.URL.EscapedPath()) {
 		http.Error(w, "import/export is reserved for explicit serveIdentity recovery", http.StatusNotImplemented)
 		return
 	}
@@ -756,6 +756,8 @@ func (r *Router) forwardNodeControl(w http.ResponseWriter, request *http.Request
 	}
 	var endpoint, group, objectID, kind, serveIdentity, bindingDigest, nodeID, routeKey string
 	var nodeEpoch uint64
+	providerKey, providerHeader := providerCredential(request)
+	pauseRouteKey, exactPause := escapedSandboxAction(request.URL.EscapedPath(), "pause")
 	if route != nil {
 		_, releaseRevision := r.beginRouteRevision(route.Group, route.RouteKey)
 		defer releaseRevision()
@@ -796,6 +798,9 @@ func (r *Router) forwardNodeControl(w http.ResponseWriter, request *http.Request
 				next.URL.Path, next.URL.RawPath = decoded, escaped
 			}
 		}
+		if providerHeader == "Authorization" {
+			next.Header.Set("Authorization", "Bearer "+providerKey)
+		}
 		next.Header.Del(HeaderAccessTok)
 		clearDirectFence(next.Header)
 		next.Header.Set(clusterstate.DirectHeaderExecutionKind, kind)
@@ -817,6 +822,10 @@ func (r *Router) forwardNodeControl(w http.ResponseWriter, request *http.Request
 			} else {
 				r.evictBuild(build.Group, build.Build.BuildID)
 			}
+		}
+		if route != nil && request.Method == http.MethodPost && exactPause && pauseRouteKey == route.RouteKey &&
+			response.StatusCode == http.StatusNoContent {
+			r.rejectStaleRoute(route)
 		}
 		if route != nil && strings.Contains(response.Header.Get("Content-Type"), "application/json") {
 			return rewriteSandboxResponse(response, route.RouteKey)
@@ -1618,6 +1627,17 @@ func escapedSandboxAction(path, action string) (string, bool) {
 		return decoded, true
 	}
 	return "", false
+}
+
+func sandboxMigrationOperation(method, path string) bool {
+	if method != http.MethodPost {
+		return false
+	}
+	if path == "/sandboxes/import" || path == "/v2/sandboxes/import" {
+		return true
+	}
+	_, export := escapedSandboxAction(path, "export")
+	return export
 }
 
 func validRouteKey(routeKey string) bool {

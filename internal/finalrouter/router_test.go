@@ -729,6 +729,70 @@ func TestEscapedRouteKeyPathRoundTrip(t *testing.T) {
 	}
 }
 
+func TestControlPathClassificationUsesEscapedRouteKeyBoundaries(t *testing.T) {
+	path := "/sandboxes/team%2Ffiles%2Frun"
+	if !sandboxVerb(path) || buildOperation(path) || sandboxMigrationOperation(http.MethodGet, path) {
+		t.Fatalf("escaped Sandbox route was misclassified: sandbox=%v build=%v migration=%v",
+			sandboxVerb(path), buildOperation(path), sandboxMigrationOperation(http.MethodGet, path))
+	}
+	for _, test := range []struct {
+		method string
+		path   string
+		want   bool
+	}{
+		{method: http.MethodGet, path: "/sandboxes/export"},
+		{method: http.MethodGet, path: "/sandboxes/team%2Fexport"},
+		{method: http.MethodPost, path: "/sandboxes/import", want: true},
+		{method: http.MethodPost, path: "/sandboxes/route-1/export", want: true},
+	} {
+		if got := sandboxMigrationOperation(test.method, test.path); got != test.want {
+			t.Errorf("sandboxMigrationOperation(%q, %q) = %v, want %v", test.method, test.path, got, test.want)
+		}
+	}
+}
+
+func TestForwardNodeControlCanonicalizesBearerAndFencesSuccessfulPause(t *testing.T) {
+	var authorization, path string
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		authorization, path = request.Header.Get("Authorization"), request.URL.EscapedPath()
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer backend.Close()
+	serveIdentity := routeapi.RegistryServeIdentity{
+		ClusterID: "cluster-1", RegistryGeneration: "generation-1", SystemEpoch: 1,
+		RegistryLayoutDigest: "registry-layout-1",
+	}
+	router, err := New(&revisionControl{serveIdentity: serveIdentity}, allowCaller{}, "example.test", time.Minute, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := &routeEntry{
+		Group: "/group", RouteKey: "team/route", Revision: 7, ServeIdentity: serveIdentity,
+		Route: clusterstate.ReadyRoute{
+			SandboxID: "node-local-sandbox", NodeID: "node-1", NodeEpoch: 1,
+			DataEndpoint: strings.TrimPrefix(backend.URL, "http://"), RegistryGeneration: "generation-1",
+			BindingDigest: "binding-1",
+		},
+	}
+	if !router.rememberRoute(entry) {
+		t.Fatal("remember Route")
+	}
+	request := httptest.NewRequest(http.MethodPost, "http://api.example.test/sandboxes/team%2Froute/pause", nil)
+	request.Header.Set("Authorization", "bearer provider-secret")
+	response := httptest.NewRecorder()
+	router.forwardNodeControl(response, request, entry, nil)
+	if response.Code != http.StatusNoContent || authorization != "Bearer provider-secret" ||
+		path != "/sandboxes/node-local-sandbox/pause" {
+		t.Fatalf("forwarded pause = %d auth=%q path=%q body=%s", response.Code, authorization, path, response.Body.String())
+	}
+	if cached := router.cachedRoute(entry.Group, entry.RouteKey); cached != nil {
+		t.Fatalf("successful pause retained READY cache: %+v", cached)
+	}
+	if minimum := router.minimumRouteRevision(entry.Group, entry.RouteKey); minimum != entry.Revision+1 {
+		t.Fatalf("pause revision floor = %d, want %d", minimum, entry.Revision+1)
+	}
+}
+
 func TestConcurrentReserveRejectsDifferentImmutableInput(t *testing.T) {
 	serveIdentity := routeapi.RegistryServeIdentity{
 		ClusterID: "cluster-1", RegistryGeneration: "generation-1", SystemEpoch: 1,

@@ -414,17 +414,16 @@ func (o *Orchestrator) Connect(ctx context.Context, id, apiKey, migrationToken s
 		}
 	}
 	if timeoutSec > 0 {
-		dl := time.Now().Add(time.Duration(timeoutSec) * time.Second).Unix()
-		if s := o.mutateCached(id, func(nb *types.Sandbox) { nb.DeadlineUnix = dl }); s != nil {
-			sb = s // cached: published a fresh snapshot with the new deadline
-		} else {
-			sb.DeadlineUnix = dl // not cached (fresh, unpublished) — safe in place
-		}
-		if err := o.st.SetDeadline(ctx, id, dl); err != nil {
+		found, err := o.SetTimeout(ctx, id, apiKey, timeoutSec)
+		if err != nil {
 			return nil, err
 		}
-		if _, err := o.commitManagedSandboxState(ctx, sb, string(clusterstate.WorkflowRouteReady), ""); err != nil {
-			return nil, err
+		if !found {
+			return nil, api.ErrNotFound
+		}
+		sb, err = o.st.Get(ctx, id)
+		if err != nil || sb == nil {
+			return nil, errors.Join(err, api.ErrNotFound)
 		}
 	}
 	return sb, nil
@@ -449,8 +448,11 @@ func (o *Orchestrator) SetTimeout(ctx context.Context, id, apiKey string, timeou
 		if sb.State == types.StatePaused {
 			state = string(clusterstate.WorkflowRoutePaused)
 		}
-		_, err = o.commitManagedSandboxState(ctx, sb, state, "")
-		return err
+		if _, err = o.commitManagedSandboxState(ctx, sb, state, ""); err != nil {
+			return err
+		}
+		o.cache(sb)
+		return nil
 	})
 	return found, err
 }

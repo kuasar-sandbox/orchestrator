@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
@@ -145,7 +146,7 @@ func runRouter(args []string, log *slog.Logger) error {
 	if err != nil {
 		return routerBackgroundError(backgroundErr, err)
 	}
-	server := &http.Server{}
+	server := &http.Server{ReadHeaderTimeout: 10 * time.Second}
 	if config.Ingress.TLS.Enabled() {
 		tlsConfig, tlsErr := config.Ingress.TLS.ServerConfig()
 		if tlsErr != nil {
