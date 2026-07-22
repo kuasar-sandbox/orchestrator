@@ -459,10 +459,11 @@ func buildRegistrationProjection(record cluster.BuildRecord) (cluster.BuildProje
 	projection := cluster.BuildProjection{
 		BuildID: record.BuildID, NodeID: binding.NodeID, NodeEpoch: binding.NodeEpoch,
 		DataEndpoint: binding.DataEndpoint, RegistryGeneration: binding.RegistryGeneration,
-		BindingDigest: binding.BindingDigest, Intent: cloneIntent(record.Starting.Intent),
+		OpaqueBinding: binding.OpaqueBinding, BindingDigest: binding.BindingDigest,
+		Intent:      cloneIntent(record.Starting.Intent),
 		TemplateRef: spec.TemplateID,
 	}
-	return projection, projection.Validate()
+	return projection, projection.ValidateWorkflow(record.Group)
 }
 
 func (c *StartingCoordinator) selectCandidate(ctx context.Context, demand placement.NormalizedDemand, runtimeDigest string, candidates []cluster.PlacementCandidate, rejected []uint32, cache map[uint32]cachedProbe) (uint32, session.ProbeResult, bool, error) {
