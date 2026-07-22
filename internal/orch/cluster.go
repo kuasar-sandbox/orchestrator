@@ -392,7 +392,11 @@ func (o *Orchestrator) bootCluster(ctx context.Context, cmd *routesync.Command, 
 		sb.EnvdUDS = sb.RunDir + "/envd.sock"
 		sb.CiUDS = sb.RunDir + "/ci.sock"
 	}
-	if err := o.launch(ctx, sb, tmpl); err != nil {
+	// MMDS endpoints are explicitly scoped to standalone nodes ("Status:
+	// initial design. Scope: standalone nodes") — the cluster create path
+	// does not validate or persist a kuasar-sandbox.mmds declaration in
+	// cmd.Config.
+	if err := o.launch(ctx, sb, tmpl, nil); err != nil {
 		o.teardown(context.Background(), sb)
 		return nil, err
 	}

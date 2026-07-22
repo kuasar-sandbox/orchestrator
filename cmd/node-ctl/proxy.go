@@ -17,11 +17,16 @@ import (
 	"syscall"
 	"time"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/metrics"
 	"github.com/kuasar-sandbox/orchestrator/internal/mmds"
+	"github.com/kuasar-sandbox/orchestrator/internal/mmdsrelay"
+	"github.com/kuasar-sandbox/orchestrator/internal/mmdsrpc"
 	"github.com/kuasar-sandbox/orchestrator/internal/netns"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxy"
+	"github.com/kuasar-sandbox/orchestrator/internal/proxyendpoints"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxyshm"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 )
@@ -35,6 +40,7 @@ const (
 	envProxyWakeFD    = "KUASAR_PROXY_WAKE_FD"
 	envProxyNotifyFD  = "KUASAR_PROXY_NOTIFY_FD"
 	envProxyMetricsFD = "KUASAR_PROXY_METRICS_FD"
+	envProxyMmdsRpcFD = "KUASAR_PROXY_MMDS_RPC_FD" // worker<->master MMDS endpoint RPC
 	envProxyWorkerID  = "KUASAR_PROXY_WORKER_ID"
 )
 
@@ -109,19 +115,51 @@ func runProxyMaster(ctx context.Context, cfgPath string, cfg *config.ProxyFileCo
 		go serveMetrics(ctx, cfg.MetricsListen, mx, log)
 	}
 
+	// MMDS endpoint table: bounded process memory,
+	// staged-then-atomically-swapped per full-sync generation, shared by
+	// every worker over its own per-worker RPC socketpair.
+	// Endpoint policy (relay timeouts/size bounds/rate limits) is not yet
+	// pushed centrally over the sync connection the way auth_mode/
+	// park_timeout are — this uses the same defaults internal mode falls
+	// back to (config.MMDSEndpointsConfig.ApplyDefaults()) rather than
+	// duplicating a second static config surface in proxy.yaml; a future
+	// phase can wire dynamic policy push the same way SetPolicy already
+	// works for the route family, if tighter operator control over these
+	// external-mode defaults turns out to matter in practice.
+	var epLimits config.MMDSEndpointsConfig
+	epLimits.ApplyDefaults()
+	mmdsEndpointsEnabled := cfg.MMDSListen != ""
+	var endpoints *proxyendpoints.Table
+	if mmdsEndpointsEnabled {
+		relayClient := mmdsrelay.New(mmdsrelay.Config{
+			RequestTimeout:       epLimits.RelayRequestTimeoutDur(),
+			MaxResponseBytes:     int64(epLimits.MaxRelayResponseBytes),
+			MaxDecompressedBytes: int64(epLimits.MaxRelayDecompressedBytes),
+			MaxDNSAnswers:        epLimits.MaxRelayDNSAnswers,
+			MaxInflightPerKey:    epLimits.MaxRelayInflightPerSandbox,
+			MaxRequestsPerSecond: float64(epLimits.MaxRelayRequestsPerSecond),
+		})
+		endpoints = proxyendpoints.New(relayClient, epLimits.MaxTotalEndpoints, epLimits.ValueWaitTimeoutDur())
+	}
+
 	for i := 0; i < cfg.Workers; i++ {
-		go superviseProxyWorker(ctx, i, cfgPath, cfg, proxyNS, dataLn, forwardLn, mmdsLn, view, mx, log)
+		go superviseProxyWorker(ctx, i, cfgPath, cfg, proxyNS, dataLn, forwardLn, mmdsLn, view, endpoints, epLimits.MaxWorkerInflight, mx, log)
 	}
 
 	reg := routesync.Register{
-		Subscribe: &routesync.Subscribe{Kind: routesync.KindRouteWake},
-		Proxy:     &routesync.Proxy{Socket: routesync.Socket{Path: cfg.ProxySocket}},
-		Mmds:      cfg.MMDSListen != "",
+		Subscribe:     &routesync.Subscribe{Kind: routesync.KindRouteWake},
+		Proxy:         &routesync.Proxy{Socket: routesync.Socket{Path: cfg.ProxySocket}},
+		Mmds:          mmdsEndpointsEnabled,
+		MmdsEndpoints: mmdsEndpointsEnabled,
 	}
 	dial := func(ctx context.Context) (net.Conn, error) {
 		return (&net.Dialer{}).DialContext(ctx, "unix", cfg.ConfigSocket)
 	}
-	go routesync.NewSubscriber(dial, proxyPluginID, reg, view, view, log).Run(ctx)
+	var mmdsSink routesync.MmdsSink
+	if mmdsEndpointsEnabled {
+		mmdsSink = endpoints
+	}
+	go routesync.NewSubscriber(dial, proxyPluginID, reg, view, mmdsSink, view, log).Run(ctx)
 
 	log.Info("node-ctl proxy master serving",
 		"workers", cfg.Workers,
@@ -186,7 +224,22 @@ func runProxyWorker(ctx context.Context, cfg *config.ProxyFileConfig, log *slog.
 	if mmdsLn, err := listenerFromFD(fdEnv(envProxyMMDSFD), "proxy-mmds"); err != nil {
 		return err
 	} else if mmdsLn != nil {
-		go func() { errCh <- mmds.New(view, cfg.ParkTimeoutDur(), log).Serve(ctx, mmdsLn) }()
+		// MMDS endpoint dispatch: the RPC channel to the master's
+		// endpoint table, if the master created one (nil when the feature
+		// is disabled — every request then falls through to the built-in
+		// envd token/metadata flow unmodified, exactly as internal mode
+		// does when mmds.endpoints.enabled=false).
+		var mmdsAuth mmds.EndpointAuthority
+		if rpcFD := fdEnv(envProxyMmdsRpcFD); rpcFD >= 0 {
+			rpcFile := os.NewFile(uintptr(rpcFD), "proxy-mmds-rpc")
+			rpcConn, cerr := net.FileConn(rpcFile)
+			rpcFile.Close() // net.FileConn dups the fd; the original is no longer needed
+			if cerr != nil {
+				return fmt.Errorf("proxy worker: mmds rpc conn: %w", cerr)
+			}
+			mmdsAuth = mmdsrpc.NewClient(rpcConn)
+		}
+		go func() { errCh <- mmds.New(view, mmdsAuth, cfg.ParkTimeoutDur(), log, mx).Serve(ctx, mmdsLn) }()
 	}
 
 	log.Info("node-ctl proxy worker serving", "worker", workerID)
@@ -201,10 +254,10 @@ func runProxyWorker(ctx context.Context, cfg *config.ProxyFileConfig, log *slog.
 	}
 }
 
-func superviseProxyWorker(ctx context.Context, idx int, cfgPath string, cfg *config.ProxyFileConfig, proxyNS *netns.NetNS, dataLn, forwardLn, mmdsLn net.Listener, view *proxyshm.MasterView, mx *metrics.M, log *slog.Logger) {
+func superviseProxyWorker(ctx context.Context, idx int, cfgPath string, cfg *config.ProxyFileConfig, proxyNS *netns.NetNS, dataLn, forwardLn, mmdsLn net.Listener, view *proxyshm.MasterView, endpoints *proxyendpoints.Table, maxWorkerInflight int, mx *metrics.M, log *slog.Logger) {
 	workerID := fmt.Sprintf("proxy-%d", idx)
 	for ctx.Err() == nil {
-		err := runProxyWorkerProcess(ctx, workerID, cfgPath, proxyNS, dataLn, forwardLn, mmdsLn, view, mx, log)
+		err := runProxyWorkerProcess(ctx, workerID, cfgPath, proxyNS, dataLn, forwardLn, mmdsLn, view, endpoints, maxWorkerInflight, mx, log)
 		if ctx.Err() != nil {
 			return
 		}
@@ -217,7 +270,7 @@ func superviseProxyWorker(ctx context.Context, idx int, cfgPath string, cfg *con
 	}
 }
 
-func runProxyWorkerProcess(ctx context.Context, workerID, cfgPath string, proxyNS *netns.NetNS, dataLn, forwardLn, mmdsLn net.Listener, view *proxyshm.MasterView, mx *metrics.M, log *slog.Logger) error {
+func runProxyWorkerProcess(ctx context.Context, workerID, cfgPath string, proxyNS *netns.NetNS, dataLn, forwardLn, mmdsLn net.Listener, view *proxyshm.MasterView, endpoints *proxyendpoints.Table, maxWorkerInflight int, mx *metrics.M, log *slog.Logger) error {
 	exe, err := os.Executable()
 	if err != nil {
 		return err
@@ -266,9 +319,42 @@ func runProxyWorkerProcess(ctx context.Context, workerID, cfgPath string, proxyN
 		closeFiles(append(files, dataFile, forwardFile, mmdsFile, wakeR, wakeW, notifyR, notifyW))
 		return err
 	}
+
+	// MMDS endpoint RPC channel: a genuine bidirectional socketpair (unlike
+	// the wake/notify/metrics pipes above, which are each one-directional)
+	// — the worker multiplexes concurrent guest requests over it to the
+	// master's endpoint table (internal/proxyendpoints). nil endpoints
+	// (the feature disabled) still creates the pair so the fd-numbering
+	// stays positionally stable between master and worker, but the worker
+	// end reads -1 and mmds.New gets a nil EndpointAuthority.
+	var rpcMasterFile, rpcWorkerFile *os.File
+	if endpoints != nil {
+		rpcFDs, serr := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
+		if serr != nil {
+			closeFiles(append(files, dataFile, forwardFile, mmdsFile, wakeR, wakeW, notifyR, notifyW, metricsR, metricsW))
+			return serr
+		}
+		rpcMasterFile = os.NewFile(uintptr(rpcFDs[0]), "proxy-mmds-rpc-master")
+		rpcWorkerFile = os.NewFile(uintptr(rpcFDs[1]), "proxy-mmds-rpc-worker")
+	}
+
 	removeNotify := view.RegisterNotifyWriter(notifyW)
 	go proxyshm.ReadWakeLoop(ctx, wakeR, view.Wake)
 	go readMetricsLoop(ctx, metricsR, mx)
+	if rpcMasterFile != nil {
+		rpcConn, cerr := net.FileConn(rpcMasterFile)
+		rpcMasterFile.Close() // net.FileConn dups the fd; the original is no longer needed
+		if cerr != nil {
+			removeNotify()
+			closeFiles(append(files, dataFile, forwardFile, mmdsFile, wakeR, wakeW, notifyR, notifyW, metricsR, metricsW, rpcWorkerFile))
+			return cerr
+		}
+		go func() {
+			if err := mmdsrpc.NewServer(endpoints, maxWorkerInflight, log.With("proxy_worker", workerID)).Serve(ctx, rpcConn); err != nil && ctx.Err() == nil {
+				log.Debug("mmdsrpc: worker connection ended", "worker", workerID, "err", err)
+			}
+		}()
+	}
 
 	addFile(envProxyDataFD, dataFile)
 	addFile(envProxyForwardFD, forwardFile)
@@ -276,6 +362,7 @@ func runProxyWorkerProcess(ctx context.Context, workerID, cfgPath string, proxyN
 	addFile(envProxyWakeFD, wakeW)
 	addFile(envProxyNotifyFD, notifyR)
 	addFile(envProxyMetricsFD, metricsW)
+	addFile(envProxyMmdsRpcFD, rpcWorkerFile)
 	env = append(env, envProxyWorkerID+"="+workerID)
 
 	cmd := exec.CommandContext(ctx, exe, "proxy", "serve", "--config", cfgPath, "--worker")

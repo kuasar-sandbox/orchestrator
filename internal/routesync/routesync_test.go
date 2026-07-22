@@ -16,13 +16,21 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 )
 
-// fakeSink records what the proxy side receives.
+// fakeSink records what the proxy side receives. It also implements MmdsSink
+// (see mmds_sync_test.go) — tests that never set Register.MmdsEndpoints
+// never trigger those code paths, so the extra channels sit unused and
+// harmless.
 type fakeSink struct {
 	begin chan struct{}
 	up    chan routesync.RouteEntry
 	del   chan string
 	book  chan struct{}
 	pol   chan routesync.Policy
+
+	mmdsBegin chan string
+	mmdsUp    chan routesync.MmdsEndpointEntry
+	mmdsDel   chan routesync.MmdsEndpointKey
+	mmdsBook  chan string
 }
 
 func newFakeSink() *fakeSink {
@@ -32,6 +40,11 @@ func newFakeSink() *fakeSink {
 		del:   make(chan string, 4),
 		book:  make(chan struct{}, 4),
 		pol:   make(chan routesync.Policy, 4),
+
+		mmdsBegin: make(chan string, 4),
+		mmdsUp:    make(chan routesync.MmdsEndpointEntry, 4),
+		mmdsDel:   make(chan routesync.MmdsEndpointKey, 4),
+		mmdsBook:  make(chan string, 4),
 	}
 }
 
@@ -52,13 +65,20 @@ func (f *fakeWakes) NextWake(ctx context.Context) (string, bool) {
 	}
 }
 
-// fakeSource is the orchestrator side.
+// fakeSource is the orchestrator side. Its MmdsSource methods (see
+// mmds_sync_test.go) are only exercised by tests that populate mmdsEntries/
+// mmdsSub and set Register.MmdsEndpoints; other tests leave them at their
+// zero value and never trigger those paths.
 type fakeSource struct {
 	sub    chan routesync.Event
 	woke   chan string
 	pol    routesync.Policy
 	fp     string
 	replay []routesync.Event
+
+	mmdsGen     string
+	mmdsEntries []routesync.MmdsEndpointEntry
+	mmdsSub     chan routesync.MmdsEvent
 }
 
 func (s *fakeSource) Range(ctx context.Context, fn func(routesync.RouteEntry) error) error {
@@ -139,7 +159,7 @@ func TestRouteSyncRoundtrip(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go routesync.NewSubscriber(dial, "px0", reg, sink, wakes, log).Run(ctx)
+	go routesync.NewSubscriber(dial, "px0", reg, sink, nil, wakes, log).Run(ctx)
 
 	// Handshake policy, then the initial route set streams as upsert(s1) + bookmark.
 	if p := recv(t, sink.pol, "policy"); p.AuthMode != "enforce" || p.ParkTimeoutMS != 1234 {
@@ -209,7 +229,7 @@ func TestRouteSyncResumeReplay(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go routesync.NewSubscriber(dial, "px-resume", reg, sink, nil, log).Run(ctx)
+	go routesync.NewSubscriber(dial, "px-resume", reg, sink, nil, nil, log).Run(ctx)
 
 	recv(t, sink.begin, "begin-sync")
 	if up := recv(t, sink.up, "replayed upsert"); up.SandboxID != "replayed" {
@@ -257,7 +277,7 @@ func TestRouteSyncResumeFingerprintMismatchFallsBack(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go routesync.NewSubscriber(dial, "px-mismatch", reg, sink, nil, log).Run(ctx)
+	go routesync.NewSubscriber(dial, "px-mismatch", reg, sink, nil, nil, log).Run(ctx)
 
 	recv(t, sink.begin, "begin-sync")
 	if up := recv(t, sink.up, "snapshot upsert"); up.SandboxID != "s1" {

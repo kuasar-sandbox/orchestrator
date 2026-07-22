@@ -227,7 +227,7 @@ func runConductor(args []string, log *slog.Logger) error {
 	// registrations (proxy master, route observers); the external-mode proxyForwarder
 	// reads it to forward fallback data-plane requests to the registered proxy socket.
 	plugins := configsock.NewRegistry()
-	cs := configsock.New(cfg.Paths.ConfigSocket, configsock.Deps{
+	csDeps := configsock.Deps{
 		Provider:      core,
 		Admin:         core,
 		API:           apiH,
@@ -235,7 +235,17 @@ func runConductor(args []string, log *slog.Logger) error {
 		RouteSource:   core,
 		Plugins:       plugins,
 		PluginPidfile: cfg.Paths.PluginPidfile,
-	}, log)
+	}
+	if cfg.MMDS.Endpoints.Enabled {
+		// Admin MMDS routes are registered only when the feature is enabled:
+		// disabled is never silently ignored — Create already rejects the
+		// namespace with 400; the admin plane simply doesn't expose a
+		// mutation surface for it either.
+		csDeps.MmdsEndpoints = core
+		csDeps.MMDSMaxStoreValueBytes = int64(cfg.MMDS.Endpoints.MaxStoreValueBytes)
+		csDeps.MMDSMaxRelayAuthBytes = int64(cfg.MMDS.Endpoints.MaxRelayAuthBytes)
+	}
+	cs := configsock.New(cfg.Paths.ConfigSocket, csDeps, log)
 	configReady := make(chan struct{})
 	configDone := make(chan error, 1)
 	go func() {
@@ -317,8 +327,15 @@ func runConductor(args []string, log *slog.Logger) error {
 			return fmt.Errorf("mmds listen %s: %w", cfg.MMDS.Listen, err)
 		}
 		log.Info("mmds metadata service", "listen", cfg.MMDS.Listen, "proxy_netns", cfg.Proxy.ProxyNetNS)
+		// MMDS endpoint dispatch is only wired when the feature is
+		// enabled; otherwise every request falls through to the built-in
+		// envd behavior unmodified.
+		var mmdsAuth mmds.EndpointAuthority
+		if cfg.MMDS.Endpoints.Enabled {
+			mmdsAuth = core.MMDSAuthority()
+		}
 		go func() {
-			if err := mmds.New(core, cfg.ParkTimeoutDur(), log).Serve(ctx, mln); err != nil {
+			if err := mmds.New(core, mmdsAuth, cfg.ParkTimeoutDur(), log, mx).Serve(ctx, mln); err != nil {
 				log.Error("mmds service", "err", err)
 			}
 		}()

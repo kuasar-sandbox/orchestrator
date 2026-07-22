@@ -139,3 +139,40 @@ func TestMMDSSourceFromSharedTable(t *testing.T) {
 		t.Fatalf("MmdsSecret = %x ok=%v", got, ok)
 	}
 }
+
+func TestCurrentRunIDFromSharedTable(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "routes.shm")
+	tbl, err := Create(path, 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tbl.Close()
+	tbl.BeginSync()
+	if err := tbl.Upsert(routesync.RouteEntry{
+		SandboxID: "s1", State: routesync.StateRunning, RunID: "sr-run-1",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	tbl.Bookmark()
+	view := NewWorkerView(tbl, nil, nil, time.Second)
+
+	if got, ok := view.CurrentRunID("s1"); !ok || got != "sr-run-1" {
+		t.Fatalf("CurrentRunID = %q ok=%v, want sr-run-1", got, ok)
+	}
+	if _, ok := view.CurrentRunID("unknown"); ok {
+		t.Fatal("CurrentRunID found an unknown sandbox")
+	}
+
+	// A resume republishes the route with a new RunID (incarnation binding
+	// relies on this becoming visible immediately).
+	tbl.BeginSync()
+	if err := tbl.Upsert(routesync.RouteEntry{
+		SandboxID: "s1", State: routesync.StateRunning, RunID: "sr-run-2",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	tbl.Bookmark()
+	if got, ok := view.CurrentRunID("s1"); !ok || got != "sr-run-2" {
+		t.Fatalf("CurrentRunID after resume = %q ok=%v, want sr-run-2", got, ok)
+	}
+}

@@ -68,6 +68,17 @@ const (
 	TypeDelete   = "delete"   // orchestrator -> subscriber (one route removed)
 	TypeBookmark = "bookmark" // orchestrator -> subscriber (initial route stream complete; synced)
 	TypeWake     = "wake"     // subscriber -> orchestrator (resume this sandbox)
+
+	// MMDS endpoint sync — a second, independent full+incremental sync
+	// family multiplexed onto the same stream/frame codec as the route
+	// family above, gated by Register.MmdsEndpoints. Its
+	// generation counter (MmdsGeneration) is deliberately separate from the
+	// route family's Rev/RevToken: the two sync streams are independent and
+	// must not be conflated.
+	TypeMmdsSyncBegin = "mmds_sync_begin" // orchestrator -> subscriber (a fresh full-generation scan starts)
+	TypeMmdsUpsert    = "mmds_upsert"     // orchestrator -> subscriber (one endpoint declared/value changed)
+	TypeMmdsDelete    = "mmds_delete"     // orchestrator -> subscriber (one endpoint removed, e.g. sandbox deleted)
+	TypeMmdsBookmark  = "mmds_bookmark"   // orchestrator -> subscriber (this generation's scan complete; synced)
 )
 
 // RouteEntry is the per-sandbox routing + auth state the orchestrator distributes
@@ -95,6 +106,40 @@ type RouteEntry struct {
 	// from the manifest key + id (keys.MmdsSecret) so every proxy worker reads the
 	// same key from the shared route view.
 	MmdsSecret string `json:"mmds_secret,omitempty"`
+	// RunID is the sandbox's current launch/resume incarnation id (its systemd
+	// runner instance). mmds.Source.CurrentRunID reads this to bind/verify an
+	// MMDS session token's incarnation: a resume mints a new RunID, which
+	// must invalidate tokens minted before it, in external mode exactly as it
+	// already does in internal mode.
+	RunID string `json:"run_id,omitempty"`
+}
+
+// MmdsEndpointEntry is one MMDS endpoint's full state for external-mode
+// sync: the immutable declaration plus its current secret value in
+// cleartext. SecretPlaintext exists only on this
+// authenticated local h2c stream and in bounded process buffers — the same
+// trust boundary RouteEntry.MmdsSecret already crosses in the clear today
+// (this is precedent, not a new exception).
+type MmdsEndpointEntry struct {
+	SandboxID        string `json:"sid"`
+	Name             string `json:"name"`
+	Path             string `json:"path"`
+	BackendType      string `json:"backend_type"` // "store" | "relay"
+	PublicConfigJSON string `json:"public_config_json,omitempty"`
+	Revision         int64  `json:"revision"`
+	ValuePresent     bool   `json:"value_present"`
+	ContentType      string `json:"content_type,omitempty"`
+	ExpiresUnix      int64  `json:"expires_unix,omitempty"`
+	// SecretPlaintext is the current store value or relay auth value,
+	// cleartext, present only when ValuePresent is true.
+	SecretPlaintext string `json:"secret_plaintext,omitempty"`
+}
+
+// MmdsEndpointKey identifies one endpoint for MmdsDelete: (sandbox_id,name),
+// the same composite key as the sandbox_mmds_endpoints table's primary key.
+type MmdsEndpointKey struct {
+	SandboxID string `json:"sid"`
+	Name      string `json:"name"`
 }
 
 // Policy is the operational policy the orchestrator pushes to a proxy at handshake
@@ -123,6 +168,12 @@ type Msg struct {
 	RevToken string        `json:"rev_token,omitempty"`
 	FullSync bool          `json:"full_sync,omitempty"`   // bookmark follows a full snapshot, not an incremental replay
 	Build    *BuildEvent   `json:"build_event,omitempty"` // node -> registry build state (§5.1/§7.5)
+
+	// MMDS endpoint sync payload fields (mmds_sync_begin / mmds_upsert
+	// / mmds_delete / mmds_bookmark) — see the Type* constants' doc comments.
+	MmdsEntry      *MmdsEndpointEntry `json:"mmds_entry,omitempty"`
+	MmdsKey        *MmdsEndpointKey   `json:"mmds_key,omitempty"`
+	MmdsGeneration string             `json:"mmds_generation,omitempty"`
 }
 
 // Hello is the orchestrator's first down-frame; it carries the operational Policy.
@@ -141,6 +192,13 @@ type Register struct {
 	Subscribe *Subscribe `json:"subscribe,omitempty"` // route stream; nil = lease only (no routes)
 	Proxy     *Proxy     `json:"proxy,omitempty"`     // accepts proxyForwarder data-plane requests
 	Mmds      bool       `json:"mmds,omitempty"`      // serves MMDS (the per-sandbox secret ships on every entry)
+	// MmdsEndpoints declares this subscriber understands the MMDS endpoint
+	// sync family (mmds_sync_begin/mmds_upsert/mmds_delete/mmds_bookmark) —
+	// independent of Mmds above, which covers only the built-in envd
+	// token/metadata capability. Absence has no downgrade path: the
+	// orchestrator simply never sends MMDS sync frames to a subscriber that
+	// didn't ask for them.
+	MmdsEndpoints bool `json:"mmds_endpoints,omitempty"`
 	// ResumeFrom (opt-in) asks the authority to replay the route changelog strictly
 	// after this token instead of a full re-sync. The token is intentionally a
 	// string so a node owner can embed a source fingerprint and reject incremental

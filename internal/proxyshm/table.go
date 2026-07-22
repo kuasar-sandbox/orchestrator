@@ -40,6 +40,7 @@ const (
 	maxAccessToken = 256
 	maxSnapLoc     = 32
 	maxMmdsSecret  = 128
+	maxRunID       = 64
 )
 
 var (
@@ -80,6 +81,7 @@ type mmapRecord struct {
 	TrafficAccessToken [maxAccessToken]byte
 	SnapshotLocation   [maxSnapLoc]byte
 	MmdsSecret         [maxMmdsSecret]byte
+	RunID              [maxRunID]byte
 }
 
 // Table is a memory-mapped fixed-capacity route table.
@@ -277,6 +279,7 @@ func (t *Table) Upsert(in routesync.RouteEntry) error {
 	_ = putFixed(rec.TrafficAccessToken[:], in.TrafficAccessToken)
 	_ = putFixed(rec.SnapshotLocation[:], in.SnapshotLocation)
 	_ = putFixed(rec.MmdsSecret[:], in.MmdsSecret)
+	_ = putFixed(rec.RunID[:], in.RunID)
 	finishWrite(rec)
 	return nil
 }
@@ -309,6 +312,7 @@ func (t *Table) deleteRecord(rec *mmapRecord) {
 	clearFixed(rec.TrafficAccessToken[:])
 	clearFixed(rec.SnapshotLocation[:])
 	clearFixed(rec.MmdsSecret[:])
+	clearFixed(rec.RunID[:])
 	finishWrite(rec)
 }
 
@@ -381,6 +385,17 @@ func (t *Table) MmdsSecret(sid string) ([]byte, bool) {
 	return b, true
 }
 
+// CurrentRunID returns sid's current launch/resume incarnation id, for the
+// external-mode mmds.Source implementation (WorkerView.CurrentRunID). Not
+// gated on running state, matching MmdsSecret's rationale above.
+func (t *Table) CurrentRunID(sid string) (string, bool) {
+	r, ok := t.Lookup(sid)
+	if !ok || r.RunID == "" {
+		return "", false
+	}
+	return r.RunID, true
+}
+
 func (t *Table) findSlot(sid string, insert bool) (int, bool) {
 	h := hashSID(sid)
 	start := int(h % uint64(len(t.records)))
@@ -443,6 +458,7 @@ func readRecord(rec *mmapRecord) (routesync.RouteEntry, uint32, bool) {
 			TrafficAccessToken: fixedString(rec.TrafficAccessToken[:]),
 			SnapshotLocation:   fixedString(rec.SnapshotLocation[:]),
 			MmdsSecret:         fixedString(rec.MmdsSecret[:]),
+			RunID:              fixedString(rec.RunID[:]),
 		}
 		seq2 := atomic.LoadUint64(&rec.Seq)
 		if seq1 == seq2 && seq2&1 == 0 {
@@ -501,6 +517,7 @@ func validateRoute(r routesync.RouteEntry) error {
 		{"traffic_access_token", r.TrafficAccessToken, maxAccessToken},
 		{"snap_loc", r.SnapshotLocation, maxSnapLoc},
 		{"mmds_secret", r.MmdsSecret, maxMmdsSecret},
+		{"run_id", r.RunID, maxRunID},
 	}
 	for _, c := range checks {
 		if len(c.val) > c.max {

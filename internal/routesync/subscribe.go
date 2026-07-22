@@ -26,6 +26,22 @@ type Sink interface {
 	SetPolicy(p Policy)
 }
 
+// MmdsSink applies inbound MMDS endpoint sync messages — a separate,
+// optional interface from Sink since a route-only observer (e.g. the
+// platform agent) has no use for it and should not be forced to implement
+// no-op methods.
+type MmdsSink interface {
+	// BeginMmdsSync marks the start of a fresh full-generation scan: entries
+	// from a prior generation are tentatively stale until re-applied via
+	// ApplyMmdsUpsert before the matching MmdsBookmark.
+	BeginMmdsSync(generation string)
+	ApplyMmdsUpsert(e MmdsEndpointEntry)
+	ApplyMmdsDelete(key MmdsEndpointKey)
+	// MmdsBookmark marks generation's scan complete: entries not seen since
+	// the matching BeginMmdsSync are dropped.
+	MmdsBookmark(generation string)
+}
+
 // WakeSource yields sandbox ids the subscriber wants the orchestrator to resume. It
 // blocks until a wake is available or ctx is done (ok=false on ctx done). A nil
 // WakeSource means the subscriber issues no wakes (a pure route observer).
@@ -38,18 +54,20 @@ type WakeSource interface {
 // (PUT /internal/plugin/{id}/register) with its caps, and keeps its Sink in sync over
 // a persistent, auto-reconnecting bidi h2c stream — forwarding Wakes up for route_wake.
 type Subscriber struct {
-	dial  func(ctx context.Context) (net.Conn, error)
-	id    string
-	reg   Register
-	sink  Sink
-	wakes WakeSource // nil if this subscriber issues no wakes
-	log   *slog.Logger
+	dial     func(ctx context.Context) (net.Conn, error)
+	id       string
+	reg      Register
+	sink     Sink
+	mmdsSink MmdsSink   // nil if this subscriber does not consume MMDS endpoint sync
+	wakes    WakeSource // nil if this subscriber issues no wakes
+	log      *slog.Logger
 }
 
 // NewSubscriber builds a Subscriber. dial returns a fresh connection to the
-// orchestrator's config-socket (e.g. a unix dial). wakes may be nil.
-func NewSubscriber(dial func(ctx context.Context) (net.Conn, error), id string, reg Register, sink Sink, wakes WakeSource, log *slog.Logger) *Subscriber {
-	return &Subscriber{dial: dial, id: id, reg: reg, sink: sink, wakes: wakes, log: log}
+// orchestrator's config-socket (e.g. a unix dial). wakes and mmdsSink may be
+// nil; reg.MmdsEndpoints should only be set true when mmdsSink is non-nil.
+func NewSubscriber(dial func(ctx context.Context) (net.Conn, error), id string, reg Register, sink Sink, mmdsSink MmdsSink, wakes WakeSource, log *slog.Logger) *Subscriber {
+	return &Subscriber{dial: dial, id: id, reg: reg, sink: sink, mmdsSink: mmdsSink, wakes: wakes, log: log}
 }
 
 // Run keeps a single registration/sync session alive (reconnecting with capped
@@ -148,6 +166,22 @@ func (s *Subscriber) apply(m *Msg) {
 		s.sink.ApplyDelete(m.SID)
 	case TypeBookmark:
 		s.sink.Bookmark()
+	case TypeMmdsSyncBegin:
+		if s.mmdsSink != nil {
+			s.mmdsSink.BeginMmdsSync(m.MmdsGeneration)
+		}
+	case TypeMmdsUpsert:
+		if s.mmdsSink != nil && m.MmdsEntry != nil {
+			s.mmdsSink.ApplyMmdsUpsert(*m.MmdsEntry)
+		}
+	case TypeMmdsDelete:
+		if s.mmdsSink != nil && m.MmdsKey != nil {
+			s.mmdsSink.ApplyMmdsDelete(*m.MmdsKey)
+		}
+	case TypeMmdsBookmark:
+		if s.mmdsSink != nil {
+			s.mmdsSink.MmdsBookmark(m.MmdsGeneration)
+		}
 	default:
 		s.log.Warn("routesync: unknown message", "type", m.Type)
 	}

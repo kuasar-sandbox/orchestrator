@@ -47,6 +47,38 @@ type RevisionSource interface {
 	CurrentRevToken() string
 }
 
+// MmdsEvent is an MMDS endpoint change the source publishes to a live
+// MMDS subscription — parallel to Event, for the independent endpoint sync
+// family.
+type MmdsEvent struct {
+	Kind  string            // TypeMmdsUpsert | TypeMmdsDelete
+	Entry MmdsEndpointEntry // upsert
+	Key   MmdsEndpointKey   // delete
+}
+
+// MmdsSource is an optional Source extension providing MMDS endpoint sync,
+// streamed parallel to (but independently generationed from) the route
+// family above. internal/orch implements it when MMDS endpoints are
+// enabled. StreamAuthority only engages it when the subscriber's
+// Register.MmdsEndpoints is true AND src implements this interface —
+// absence of either is not an error, it just means no MMDS sync frames are
+// ever sent on this connection: there is no downgrade path, it simply keeps
+// configurable endpoints unavailable.
+type MmdsSource interface {
+	// MmdsGeneration returns a fresh generation stamp identifying the full
+	// scan RangeMmds is about to perform. Independent of the route family's
+	// Rev/RevToken (do not conflate the two sync streams).
+	MmdsGeneration() string
+	// RangeMmds streams every currently-declared endpoint (with its current
+	// secret plaintext, if any) through fn. Streaming keeps send-side memory
+	// bounded, matching Source.Range's own rationale.
+	RangeMmds(ctx context.Context, fn func(MmdsEndpointEntry) error) error
+	// SubscribeMmds registers for live endpoint changes, parallel to
+	// Source.Subscribe. The returned channel is closed if the source falls
+	// behind; the subscriber then reconnects and does a fresh full sync.
+	SubscribeMmds() (ch <-chan MmdsEvent, cancel func())
+}
+
 // ReadRegister reads the subscriber's first up-frame (its Register caps). The
 // config-socket plugin handler calls this before ServeAuthority so it can register
 // the subscriber (and its proxy target) before streaming.
@@ -181,6 +213,39 @@ func StreamAuthority(ctx context.Context, w io.Writer, flush func(), body io.Rea
 	}
 	flush()
 
+	// MMDS endpoint sync — independent full+incremental stream multiplexed
+	// onto this same connection, engaged only when both
+	// the subscriber asked for it and src supports it. mmdsCh stays nil
+	// (never selected) otherwise, so the main loop below needs no separate
+	// branch for "MMDS not active".
+	var mmdsCh <-chan MmdsEvent
+	if reg.MmdsEndpoints {
+		if msrc, ok := src.(MmdsSource); ok {
+			// Subscribe before the scan so changes racing the scan are
+			// replayed after this generation's bookmark, not lost — the
+			// authority subscribes to live changes before scanning one
+			// consistent database snapshot.
+			var cancelMmdsSub func()
+			mmdsCh, cancelMmdsSub = msrc.SubscribeMmds()
+			defer cancelMmdsSub()
+
+			generation := msrc.MmdsGeneration()
+			if err := WriteMsg(w, &Msg{Type: TypeMmdsSyncBegin, MmdsGeneration: generation}); err != nil {
+				return
+			}
+			if err := msrc.RangeMmds(sctx, func(e MmdsEndpointEntry) error {
+				entry := e
+				return WriteMsg(w, &Msg{Type: TypeMmdsUpsert, MmdsEntry: &entry})
+			}); err != nil {
+				return
+			}
+			if err := WriteMsg(w, &Msg{Type: TypeMmdsBookmark, MmdsGeneration: generation}); err != nil {
+				return
+			}
+			flush()
+		}
+	}
+
 	for {
 		select {
 		case ev, ok := <-ch:
@@ -188,6 +253,15 @@ func StreamAuthority(ctx context.Context, w io.Writer, flush func(), body io.Rea
 				return // lagged + dropped by the source; the subscriber reconnects + re-syncs
 			}
 			if err := writeEvent(w, ev); err != nil {
+				return
+			}
+			flush()
+			continue
+		case ev, ok := <-mmdsCh:
+			if !ok {
+				return // lagged + dropped by the source; the subscriber reconnects + re-syncs
+			}
+			if err := writeMmdsEvent(w, ev); err != nil {
 				return
 			}
 			flush()
@@ -213,6 +287,14 @@ func StreamAuthority(ctx context.Context, w io.Writer, flush func(), body io.Rea
 				return
 			}
 			flush()
+		case ev, ok := <-mmdsCh:
+			if !ok {
+				return // lagged + dropped by the source; the subscriber reconnects + re-syncs
+			}
+			if err := writeMmdsEvent(w, ev); err != nil {
+				return
+			}
+			flush()
 		}
 	}
 }
@@ -225,6 +307,21 @@ func writeEvent(w io.Writer, ev Event) error {
 		m.Route = &r
 	case TypeDelete:
 		m.SID = ev.SID
+	default:
+		return nil
+	}
+	return WriteMsg(w, m)
+}
+
+func writeMmdsEvent(w io.Writer, ev MmdsEvent) error {
+	m := &Msg{Type: ev.Kind}
+	switch ev.Kind {
+	case TypeMmdsUpsert:
+		e := ev.Entry
+		m.MmdsEntry = &e
+	case TypeMmdsDelete:
+		k := ev.Key
+		m.MmdsKey = &k
 	default:
 		return nil
 	}

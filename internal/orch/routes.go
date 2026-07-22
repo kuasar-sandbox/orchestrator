@@ -39,6 +39,7 @@ func (o *Orchestrator) routeEntry(sb *types.Sandbox) routesync.RouteEntry {
 		TrafficAccessToken: sb.TrafficAccessToken,
 		SnapshotLocation:   snapshotLocation(sb.SnapshotRef),
 		MmdsSecret:         hex.EncodeToString(keys.MmdsSecret(sb.ManifestKey, sb.ID)),
+		RunID:              sb.RunID,
 	}
 	return e
 }

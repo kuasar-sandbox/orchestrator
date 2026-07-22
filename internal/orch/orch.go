@@ -26,6 +26,9 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/filestore"
 	"github.com/kuasar-sandbox/orchestrator/internal/keys"
 	"github.com/kuasar-sandbox/orchestrator/internal/launcher"
+	"github.com/kuasar-sandbox/orchestrator/internal/mmdsauth"
+	"github.com/kuasar-sandbox/orchestrator/internal/mmdscfg"
+	"github.com/kuasar-sandbox/orchestrator/internal/mmdsrelay"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxy"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
@@ -79,6 +82,14 @@ type Orchestrator struct {
 	clusterBuildMu sync.Mutex
 	clusterBuilds  map[string]*clusterBuild   // build_id -> transient cluster image-pull creds (§7.5)
 	buildEvents    chan *routesync.BuildEvent // node -> registry build state, drained by the node-link client
+
+	mmdsAuth *mmdsauth.Authority // internal-mode MMDS endpoint authority
+
+	mmdsSubsMu sync.Mutex
+	mmdsSubs   map[int]chan routesync.MmdsEvent // external-mode MMDS endpoint sync subscribers (routesync.MmdsSource)
+	mmdsSubSeq int
+	mmdsGenMu  sync.Mutex
+	mmdsGenSeq int64 // MMDS full-sync generation counter; independent of routeSeq/routeFP above
 }
 
 // clusterBuild is a registry-driven build's transient image-pull context. Cluster
@@ -98,6 +109,26 @@ func New(cfg *config.Config, st *store.Store, lc launcher.Launcher, vs vsClient,
 		pend:           map[string]*pendingBuild{},
 		clusterBuilds:  map[string]*clusterBuild{},
 		buildEvents:    make(chan *routesync.BuildEvent, 64),
+		mmdsSubs:       map[int]chan routesync.MmdsEvent{},
+	}
+	// mmdsauth.New's relay param is an interface: passing a typed-nil
+	// *mmdsrelay.Client through it would produce a non-nil interface
+	// wrapping a nil pointer (the classic Go nil-interface trap), which
+	// would then panic on first use instead of hitting Authority's nil
+	// check — so the disabled case passes a literal untyped nil, never a
+	// nil *mmdsrelay.Client.
+	if cfg.MMDS.Endpoints.Enabled {
+		relayClient := mmdsrelay.New(mmdsrelay.Config{
+			RequestTimeout:       cfg.MMDS.Endpoints.RelayRequestTimeoutDur(),
+			MaxResponseBytes:     int64(cfg.MMDS.Endpoints.MaxRelayResponseBytes),
+			MaxDecompressedBytes: int64(cfg.MMDS.Endpoints.MaxRelayDecompressedBytes),
+			MaxDNSAnswers:        cfg.MMDS.Endpoints.MaxRelayDNSAnswers,
+			MaxInflightPerKey:    cfg.MMDS.Endpoints.MaxRelayInflightPerSandbox,
+			MaxRequestsPerSecond: float64(cfg.MMDS.Endpoints.MaxRelayRequestsPerSecond),
+		})
+		o.mmdsAuth = mmdsauth.New(st, relayClient, cfg.MMDS.Endpoints.ValueWaitTimeoutDur())
+	} else {
+		o.mmdsAuth = mmdsauth.New(st, nil, cfg.MMDS.Endpoints.ValueWaitTimeoutDur())
 	}
 	wait := cfg.Units.PoolWaitDuration()
 	o.runnerPool = newRunPool(runKindSandbox, cfg.Units.RunnerPoolSize, wait, cfg.Paths.RunRoot, lc, o.runnerUnit, log.With("pool", "runner"))
@@ -172,6 +203,15 @@ func (o *Orchestrator) Create(ctx context.Context, req api.CreateReq) (*types.Sa
 	envdTok, _ := keys.MintToken()
 	trafTok, _ := keys.MintToken()
 
+	// Validate + strip the MMDS endpoint declaration after the common metadata
+	// merge/restore normalization and before any side effect (mkdir, vswitch
+	// attach, unit start). A bad declaration must fail Create outright, and the
+	// guest must never see this namespace through ordinary metadata.
+	var mmdsEndpoints []mmdscfg.EndpointSpec
+	meta, mmdsEndpoints, err = mmdscfg.Extract(meta, o.cfg.MMDS.Endpoints)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
+	}
 	sb := &types.Sandbox{
 		ID:                 sid,
 		TemplateID:         tmpl.String(), // canonical persist id (resolved from a transient/alias ref)
@@ -190,12 +230,54 @@ func (o *Orchestrator) Create(ctx context.Context, req api.CreateReq) (*types.Sa
 		sb.EnvdUDS = sb.RunDir + "/envd.sock"
 		sb.CiUDS = sb.RunDir + "/ci.sock"
 	}
-	if err := o.launch(ctx, sb, tmpl); err != nil {
+	if err := o.launch(ctx, sb, tmpl, mmdsEndpoints); err != nil {
 		o.teardown(context.Background(), sb)
 		return nil, err
 	}
 	o.publishUpsert(sb) // tell external proxies about the new route
+	for _, ep := range mmdsEndpoints {
+		o.publishMmdsEntry(ctx, sb.ID, ep.Name) // tell external proxies about the newly declared endpoints
+	}
 	return sb, nil
+}
+
+// mmdsRelayPublicConfig is the non-secret relay backend config persisted in
+// sandbox_mmds_endpoints.public_config_json — the relay URL and auth header
+// name, which are immutable and declared at Create. The
+// auth value itself is never part of this: it only ever arrives via the
+// admin API.
+type mmdsRelayPublicConfig struct {
+	URL            string `json:"url"`
+	AuthHeaderName string `json:"auth_header_name"`
+}
+
+// mmdsStoreEndpoints converts validated Create-time endpoint declarations
+// into the store's persistence shape. Store backends carry no public config
+// beyond their type (already a column); relay backends carry their
+// (immutable) URL and auth header name.
+func mmdsStoreEndpoints(endpoints []mmdscfg.EndpointSpec) []store.MMDSEndpoint {
+	if len(endpoints) == 0 {
+		return nil
+	}
+	out := make([]store.MMDSEndpoint, len(endpoints))
+	for i, ep := range endpoints {
+		se := store.MMDSEndpoint{Name: ep.Name, Path: ep.Path}
+		switch ep.Backend.Type {
+		case mmdscfg.BackendRelay:
+			se.BackendType = store.MMDSBackendRelay
+			cfg := mmdsRelayPublicConfig{URL: ep.Backend.URL}
+			if ep.Backend.Auth != nil {
+				cfg.AuthHeaderName = ep.Backend.Auth.HeaderName
+			}
+			if b, err := json.Marshal(cfg); err == nil {
+				se.PublicConfigJSON = string(b)
+			}
+		default:
+			se.BackendType = store.MMDSBackendStore
+		}
+		out[i] = se
+	}
+	return out
 }
 
 // launch prepares dirs + network, writes the sandbox config file, starts the unit
@@ -203,7 +285,15 @@ func (o *Orchestrator) Create(ctx context.Context, req api.CreateReq) (*types.Sa
 // envd. The non-secret config lands at <run-dir>/<sid>.yaml; the secret manifest
 // key rides in the run-sandbox LaunchSpec env (LaunchSpecFor). The cgroup is the
 // unit's own (--cgroup-adopt). Used by Create and Connect(resume).
-func (o *Orchestrator) launch(ctx context.Context, sb *types.Sandbox, tmpl types.TemplateID) error {
+//
+// endpoints is the MMDS endpoint declaration, non-nil only on a
+// fresh Create (mmdscfg.Extract already validated + stripped it from
+// sb.Metadata by this point). Every other caller (resume, cluster boot of an
+// already-registered sandbox) MUST pass nil: launch never deletes or
+// replaces existing sandbox_mmds_endpoints rows, only inserts new ones (see
+// store.PutWithMMDSEndpoints), so a nil endpoints leaves prior declarations
+// completely untouched.
+func (o *Orchestrator) launch(ctx context.Context, sb *types.Sandbox, tmpl types.TemplateID, endpoints []mmdscfg.EndpointSpec) error {
 	for _, d := range []string{sb.RunDir, sb.BaseDir} {
 		if err := os.MkdirAll(d, 0o700); err != nil {
 			return fmt.Errorf("orch: mkdir %s: %w", d, err)
@@ -250,7 +340,7 @@ func (o *Orchestrator) launch(ctx context.Context, sb *types.Sandbox, tmpl types
 	}
 	if _, err := o.runnerPool.Assign(ctx, sb.ID, func(runID string) error {
 		sb.RunID = runID
-		if err := o.st.Put(ctx, sb); err != nil {
+		if err := o.st.PutWithMMDSEndpoints(ctx, sb, mmdsStoreEndpoints(endpoints)); err != nil {
 			return err
 		}
 		o.cache(sb)
@@ -307,10 +397,17 @@ func (o *Orchestrator) Kill(ctx context.Context, id, apiKey string) (bool, error
 	if !ownsSandbox(sb, apiKey) {
 		return false, nil
 	}
+	// Snapshot the endpoint name list before the cascading store delete
+	// removes the rows out from under us — there is nothing left to list
+	// afterward (FK ON DELETE CASCADE).
+	mmdsEndpoints, _ := o.st.ListMMDSEndpointStatus(ctx, id)
 	o.teardown(ctx, sb)
 	_ = o.st.Delete(ctx, id)
 	o.uncache(id)
 	o.publishDelete(id) // tell external proxies the route is gone
+	for _, ep := range mmdsEndpoints {
+		o.publishMmdsDelete(id, ep.Name)
+	}
 	return true, nil
 }
 
@@ -431,7 +528,7 @@ func (o *Orchestrator) resume(ctx context.Context, sb *types.Sandbox) error {
 	if o.cfg.Sandbox.TimeoutSec > 0 {
 		nb.DeadlineUnix = time.Now().Add(time.Duration(o.cfg.Sandbox.TimeoutSec) * time.Second).Unix()
 	}
-	if err := o.launch(ctx, &nb, tmpl); err != nil {
+	if err := o.launch(ctx, &nb, tmpl, nil); err != nil {
 		return err
 	}
 	if err := o.st.SetState(ctx, nb.ID, types.StateRunning); err != nil {
@@ -829,6 +926,23 @@ func (o *Orchestrator) SandboxInfo(sid string) (templateID, accessToken string, 
 		return sb.TemplateID, sb.EnvdAccessToken, true
 	}
 	return "", "", false
+}
+
+// CurrentRunID returns sid's current systemd runner instance id (its MMDS
+// "incarnation"): implements mmds.Source. A resume mints a fresh RunID
+// (runpool.go's runnerUnit assignment happens inside launch, called from
+// both Create and resume), so a token bound to a stale RunID fails
+// verification after pause/resume — pause/resume changes it and invalidates
+// old tokens. Not gated on
+// running state, matching MmdsSecret's rationale above.
+func (o *Orchestrator) CurrentRunID(sid string) (runID string, ok bool) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	sb, found := o.reg[sid]
+	if !found || sb.RunID == "" {
+		return "", false
+	}
+	return sb.RunID, true
 }
 
 // MmdsSecret derives sid's per-sandbox MMDS signing key for the in-process MMDS

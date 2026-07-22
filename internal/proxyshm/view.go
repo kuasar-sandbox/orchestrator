@@ -225,6 +225,10 @@ func (v *WorkerView) MmdsSecret(sid string) ([]byte, bool) {
 	return v.table.MmdsSecret(sid)
 }
 
+func (v *WorkerView) CurrentRunID(sid string) (string, bool) {
+	return v.table.CurrentRunID(sid)
+}
+
 func (v *WorkerView) Policy() routesync.Policy {
 	return v.table.Policy()
 }
