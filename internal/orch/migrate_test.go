@@ -87,8 +87,14 @@ func TestExportImportRoundTrip(t *testing.T) {
 	if err := json.Unmarshal(rawToken, &decodedToken); err != nil {
 		t.Fatal(err)
 	}
+	if decodedToken.AuthKeyFingerprint == "" || decodedToken.ManifestKeyFingerprint == "" {
+		t.Fatalf("migration token did not bind both key domains: %+v", decodedToken)
+	}
 	if _, found := decodedToken.Metadata[clusterstate.ObjectMetadataKey]; found {
 		t.Fatal("migration token inherited system-owned cluster metadata")
+	}
+	if _, err := o.importSandboxWithKeys(ctx, strings.Repeat("7", 64), mk, tok); err == nil {
+		t.Fatal("migration token crossed AuthKey owners that share one ManifestKey")
 	}
 
 	// Import allocates a fresh UUIDv7 while preserving the portable snapshot state.

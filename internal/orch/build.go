@@ -157,11 +157,18 @@ func (o *Orchestrator) TriggerBuild(ctx context.Context, apiKey, tid, bid string
 		// Resolve the base template ref to its canonical persist id; the
 		// pipeline extracts the base image (and inherits start/ready) from
 		// its snapshot.cfg.
-		ref := o.resolveTemplateAlias(ctx, apiKey, spec.FromTemplate)
-		if _, perr := types.ParseTemplateID(ref); perr != nil {
+		base := o.templateBuild(ctx, apiKey, spec.FromTemplate)
+		if base == nil {
 			return fmt.Errorf("build: fromTemplate %q: not a known template", spec.FromTemplate)
 		}
-		b.FromTemplate, b.FromImage = ref, ""
+		if _, perr := types.ParseTemplateID(base.PersistID); perr != nil {
+			return fmt.Errorf("build: fromTemplate %q: not a known template", spec.FromTemplate)
+		}
+		b.ManifestKey, err = templateManifestKey(b.ManifestKey, base)
+		if err != nil {
+			return err
+		}
+		b.FromTemplate, b.FromImage = base.PersistID, ""
 		if len(spec.Steps) == 0 && spec.StartCmd == "" {
 			return fmt.Errorf("build: fromTemplate without steps or startCmd has nothing to do")
 		}

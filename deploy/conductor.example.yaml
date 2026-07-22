@@ -35,12 +35,13 @@ proxy:
   # park_timeout: 30s
   # metrics_listen: 127.0.0.1:9095               # serve's own metrics; "" = off
 
-# Secrets-at-rest. Per-tenant manifest keys are stored AES-256-GCM-encrypted under
+# Secrets-at-rest. Per-group AuthKey/ManifestKey leases are stored AES-256-GCM-encrypted under
 # encryption_key: ":"-separated 64-hex keys, first = active (new writes), rest =
 # standby (decrypt during rotation). Prefer the NODE_CONFIG_ENCRYPTION_KEY env
-# (overrides this). Generate one: `openssl rand -hex 32`. Which manifest keys may
-# create/build/import is the manifest_keys table (node-ctl manifest-key …);
-# e2b API keys are derived from a manifest key with `e2b-key-ctl gen-apikey`.
+# (overrides this). Generate one: `openssl rand -hex 32`. Install a lease with
+# `node-ctl key-lease put --group G --auth-key AK --manifest-key MK`.
+# E2B API keys are derived only from AuthKey with `e2b-key-ctl gen-apikey [AK]`;
+# ManifestKey is used only for content manifests, snapshots, and related capabilities.
 encryption_key: "0000000000000000000000000000000000000000000000000000000000000000"
 
 # Shared remote manifest store (manifest.key left empty; the tenant key arrives via
@@ -52,9 +53,9 @@ paths:
   run_root: /run/sandbox                          # tmpfs run state
   base_root: /var/lib/sandbox                     # persistent state
   # Local control socket — one UDS over h2c: run assignment/result, task specs,
-  # manifest-key allowlist (admin), proxy/agent registration + route stream (plugin),
+  # dual-key leases (admin), proxy/agent registration + route stream (plugin),
   # and the e2b api plane (a plain-h2c twin of api.listen, incl. export/import). The
-  # manifest-key / export-sandbox / import-sandbox CLIs and the external proxy master are
+  # key-lease / export-sandbox / import-sandbox CLIs and the external proxy master are
   # clients of this socket — they do not open the DB or read this config.
   config_socket: /run/sandbox/node-ctl.socket
   # db_path: /var/lib/sandbox/node-ctl.db     # default = <base_root>/node-ctl.db

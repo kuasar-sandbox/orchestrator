@@ -627,6 +627,49 @@ func TestHolderDispatchUsesCurrentTupleAndCommittedTarget(t *testing.T) {
 	}
 }
 
+func TestHolderDispatchRequiresTheExactAcknowledgedKeyLease(t *testing.T) {
+	registration := testRegistration("node-1", 7, 10, "10.0.0.1:8443")
+	holder, err := NewHolder("registry-a", 1, nil, testGate(true), nil, newTestEnrollmentAuthority(registration))
+	if err != nil {
+		t.Fatal(err)
+	}
+	endpoint := &testEndpoint{}
+	if _, err := holder.Register(context.Background(), registration, endpoint); err != nil {
+		t.Fatal(err)
+	}
+	old := testKeyLease()
+	oldRef, sent, err := holder.InstallKeyLease(
+		context.Background(), testServeIdentity(), registration.NodeID, registration.NodeEpoch, registration.DataEndpoint, old,
+	)
+	if err != nil || !sent {
+		t.Fatalf("old lease install sent=%v err=%v", sent, err)
+	}
+	current := old
+	current.KeyRevision++
+	current.RegistryAuth.Type = routesync.KeyMaterialInline
+	current.RegistryAuth.Value = "rotated-registry-auth"
+	currentRef, sent, err := holder.InstallKeyLease(
+		context.Background(), testServeIdentity(), registration.NodeID, registration.NodeEpoch, registration.DataEndpoint, current,
+	)
+	if err != nil || !sent {
+		t.Fatalf("current lease install sent=%v err=%v", sent, err)
+	}
+
+	command := testDispatchCommand(t, registration)
+	command.KeyLeaseRef = oldRef
+	if _, err := holder.AdmitAndDispatch(context.Background(), command); !errors.Is(err, ErrKeyLeaseUnavailable) ||
+		!errors.Is(err, ErrDispatchNotSent) {
+		t.Fatalf("dispatch with superseded exact lease = %v", err)
+	}
+	command.KeyLeaseRef = currentRef
+	if _, err := holder.AdmitAndDispatch(context.Background(), command); err != nil {
+		t.Fatalf("dispatch with current exact lease: %v", err)
+	}
+	if len(endpoint.commands) != 1 {
+		t.Fatalf("node received %d dispatches, want one", len(endpoint.commands))
+	}
+}
+
 type blockingDispatchEndpoint struct {
 	dispatchStarted chan struct{}
 	releaseDispatch chan struct{}
@@ -1204,6 +1247,52 @@ func TestHolderRechecksPermitAfterWaitingForCommandFence(t *testing.T) {
 	}
 }
 
+func TestHolderClassifiesCancellationWhileWaitingAsNotSent(t *testing.T) {
+	registration := testRegistration("node-1", 7, 10, "10.0.0.1:8443")
+	gate := &switchGate{allowed: true, checks: make(chan struct{}, 8)}
+	holder, err := NewHolder("registry-a", 1, nil, gate, nil, newTestEnrollmentAuthority(registration))
+	if err != nil {
+		t.Fatal(err)
+	}
+	endpoint := &testEndpoint{}
+	if _, err := holder.Register(context.Background(), registration, endpoint); err != nil {
+		t.Fatal(err)
+	}
+	if _, sent, err := holder.InstallKeyLease(
+		context.Background(), testServeIdentity(), registration.NodeID, registration.NodeEpoch,
+		registration.DataEndpoint, testKeyLease(),
+	); err != nil || !sent {
+		t.Fatalf("install key lease sent=%v err=%v", sent, err)
+	}
+	for len(gate.checks) > 0 {
+		<-gate.checks
+	}
+	holder.mu.RLock()
+	held := holder.active[registration.NodeID]
+	holder.mu.RUnlock()
+	held.commandMu.Lock()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := holder.AdmitAndDispatch(ctx, testDispatchCommand(t, registration))
+		done <- err
+	}()
+	select {
+	case <-gate.checks:
+	case <-time.After(time.Second):
+		held.commandMu.Unlock()
+		t.Fatal("dispatch did not perform its initial Permit check")
+	}
+	cancel()
+	held.commandMu.Unlock()
+	if err := <-done; !errors.Is(err, context.Canceled) || !errors.Is(err, ErrDispatchNotSent) {
+		t.Fatalf("canceled dispatch error = %v", err)
+	}
+	if len(endpoint.commands) != 0 {
+		t.Fatal("canceled dispatch reached the endpoint")
+	}
+}
+
 func TestKeyPutRechecksPermitAfterWaitingForCommandFence(t *testing.T) {
 	registration := testRegistration("node-1", 7, 10, "10.0.0.1:8443")
 	gate := &switchGate{allowed: true, checks: make(chan struct{}, 8)}
@@ -1247,6 +1336,53 @@ func TestKeyPutRechecksPermitAfterWaitingForCommandFence(t *testing.T) {
 	}
 	if len(endpoint.wire) != 0 {
 		t.Fatal("key put reached endpoint after Permit expired while waiting")
+	}
+}
+
+func TestKeyPutRechecksExpiryAfterWaitingForCommandFence(t *testing.T) {
+	registration := testRegistration("node-1", 7, 10, "10.0.0.1:8443")
+	now := time.Unix(1_000, 0)
+	holder, err := NewHolder(
+		"registry-a", 1, func() time.Time { return now }, testGate(true), nil,
+		newTestEnrollmentAuthority(registration),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	endpoint := &testEndpoint{}
+	if _, err := holder.Register(context.Background(), registration, endpoint); err != nil {
+		t.Fatal(err)
+	}
+	holder.mu.RLock()
+	held := holder.active[registration.NodeID]
+	holder.mu.RUnlock()
+	held.commandMu.Lock()
+	lease := testKeyLease()
+	lease.ExpiresUnix = now.Unix() + 1
+	ref := keyLeaseRef(lease)
+	done := make(chan struct {
+		sent bool
+		err  error
+	}, 1)
+	go func() {
+		_, sent, err := holder.InstallKeyLease(
+			context.Background(), testServeIdentity(), registration.NodeID, registration.NodeEpoch,
+			registration.DataEndpoint, lease,
+		)
+		done <- struct {
+			sent bool
+			err  error
+		}{sent: sent, err: err}
+	}()
+	waitForKeyLeaseSequence(t, holder, registration.NodeID, ref, 1)
+	now = now.Add(2 * time.Second)
+	held.commandMu.Unlock()
+	result := <-done
+	if result.sent || !errors.Is(result.err, ErrKeyLeaseUnavailable) || !errors.Is(result.err, ErrDispatchNotSent) {
+		t.Fatalf("expired key put sent=%v err=%v", result.sent, result.err)
+	}
+	if len(endpoint.wire) != 0 {
+		t.Fatal("expired key put reached the endpoint")
 	}
 }
 
@@ -1548,6 +1684,7 @@ func testDispatchCommand(t *testing.T, registration Registration) DispatchComman
 			NodeID: registration.NodeID, NodeEpoch: registration.NodeEpoch, DataEndpoint: registration.DataEndpoint,
 			RegistryGeneration: "g1", OpaqueBinding: opaque, BindingDigest: digest,
 		},
+		KeyLeaseRef: keyLeaseRef(lease),
 	}
 }
 
