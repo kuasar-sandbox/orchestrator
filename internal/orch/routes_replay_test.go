@@ -29,7 +29,8 @@ func TestRouteReplayUsesFingerprintToken(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 1 || got[0].Kind != routesync.TypeDelete || got[0].Delete.SandboxID != "s1" {
+	if len(got) != 1 || got[0].Kind != routesync.TypeDelete || got[0].Delete.SandboxID != "s1" ||
+		got[0].Delete.AuthorityRevision != 2 {
 		t.Fatalf("replay=%+v, want delete s1", got)
 	}
 	if fp := o.SourceFingerprint(); fp != "fp-test" {

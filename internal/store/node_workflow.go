@@ -214,6 +214,7 @@ func (s *Store) RecordSandboxWorkflow(
 	ctx context.Context,
 	dispatch nodeexec.DispatchRecord,
 	decision nodeexec.AdmissionDecision,
+	sandbox *types.Sandbox,
 ) (*nodeexec.WorkflowRecord, error) {
 	if err := dispatch.Validate(); err != nil {
 		return nil, err
@@ -255,6 +256,21 @@ func (s *Store) RecordSandboxWorkflow(
 		Result:         decision.Result, Reason: decision.Reason,
 		ReservationToken: decision.ReservationToken,
 		ResourceClaimed:  decision.State == nodeexec.AdmissionAdmitted,
+	}
+	if record.Result == clusterstate.DispatchAcceptedAdmitted || record.Result == clusterstate.DispatchAcceptedQueued {
+		if sandbox == nil || sandbox.ID != dispatch.ObjectID {
+			return nil, errors.New("store: accepted Sandbox Admission requires a matching Sandbox object")
+		}
+		stored := cloneSandbox(sandbox)
+		stored.Metadata, err = clusterstate.WithExecutionBinding(
+			clusterstate.WithoutSystemMetadata(stored.Metadata), record.OpaqueBinding,
+		)
+		if err != nil {
+			return nil, err
+		}
+		if err := s.putSandbox(ctx, tx, stored); err != nil {
+			return nil, err
+		}
 	}
 	if err := insertNodeWorkflowTx(ctx, tx, record); err != nil {
 		return nil, err

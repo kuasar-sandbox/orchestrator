@@ -262,7 +262,7 @@ func TestCompactionRemovesFinalizedPriorNodeEpoch(t *testing.T) {
 	dispatch := workflowDispatchEpoch(t, clusterstate.ExecutionKindSandbox, "sandbox-old-epoch", placement.BuildDemand{}, 6)
 	record, err := st.RecordSandboxWorkflow(context.Background(), dispatch, nodeexec.AdmissionDecision{
 		State: nodeexec.AdmissionRejected, Result: clusterstate.DispatchDefinitiveReject, Reason: "rejected",
-	})
+	}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -293,6 +293,29 @@ func TestBuildAdmissionRollsBackJournalWhenBusinessObjectCannotPersist(t *testin
 	stored, err := st.GetBuild(ctx, dispatch.ObjectID)
 	if err != nil || stored != nil {
 		t.Fatalf("failed Build left business object = %+v, %v", stored, err)
+	}
+}
+
+func TestSandboxAdmissionRollsBackJournalWhenKeyCopyCannotPersist(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	dispatch := workflowDispatch(t, clusterstate.ExecutionKindSandbox, "sandbox-invalid-key", placement.BuildDemand{})
+	sandbox := workflowSandbox(dispatch.ObjectID)
+	sandbox.ManifestKey = "not-hex"
+	decision := nodeexec.AdmissionDecision{
+		State: nodeexec.AdmissionAdmitted, Result: clusterstate.DispatchAcceptedAdmitted,
+		ReservationToken: "reservation-invalid-key",
+	}
+	if _, err := st.RecordSandboxWorkflow(ctx, dispatch, decision, sandbox); err == nil {
+		t.Fatal("Sandbox Admission succeeded without a persistable key copy")
+	}
+	workflow, err := st.GetNodeWorkflow(ctx, clusterstate.ExecutionKindSandbox, dispatch.ObjectID)
+	if err != nil || workflow != nil {
+		t.Fatalf("failed Sandbox key copy left workflow = %+v, %v", workflow, err)
+	}
+	stored, err := st.Get(ctx, dispatch.ObjectID)
+	if err != nil || stored != nil {
+		t.Fatalf("failed Sandbox key copy left business object = %+v, %v", stored, err)
 	}
 }
 
@@ -429,7 +452,7 @@ func TestSandboxJournalPreservesTokenBindingAndMonotonicOutbox(t *testing.T) {
 		State: nodeexec.AdmissionAdmitted, Result: clusterstate.DispatchAcceptedAdmitted,
 		ReservationToken: "reservation-1",
 	}
-	record, err := st.RecordSandboxWorkflow(ctx, dispatch, decision)
+	record, err := st.RecordSandboxWorkflow(ctx, dispatch, decision, workflowSandbox(dispatch.ObjectID))
 	if err != nil || record.ReservationToken != "reservation-1" {
 		t.Fatalf("record = %+v, %v", record, err)
 	}
@@ -468,7 +491,7 @@ func TestDeletedSandboxRemovesBusinessRowButRetainsDurableEvent(t *testing.T) {
 		State: nodeexec.AdmissionAdmitted, Result: clusterstate.DispatchAcceptedAdmitted,
 		ReservationToken: "reservation-deleted",
 	}
-	if _, err := st.RecordSandboxWorkflow(ctx, dispatch, decision); err != nil {
+	if _, err := st.RecordSandboxWorkflow(ctx, dispatch, decision, workflowSandbox(dispatch.ObjectID)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := st.ClaimSandboxWorkflow(ctx, dispatch.ObjectID, dispatch.DemandDigest, decision.ReservationToken); err != nil {
@@ -512,7 +535,7 @@ func TestSandboxEventPreservesNewerBusinessObjectFields(t *testing.T) {
 		State: nodeexec.AdmissionAdmitted, Result: clusterstate.DispatchAcceptedAdmitted,
 		ReservationToken: "reservation-preserve",
 	}
-	if _, err := st.RecordSandboxWorkflow(ctx, dispatch, decision); err != nil {
+	if _, err := st.RecordSandboxWorkflow(ctx, dispatch, decision, workflowSandbox(dispatch.ObjectID)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := st.ClaimSandboxWorkflow(ctx, dispatch.ObjectID, dispatch.DemandDigest, decision.ReservationToken); err != nil {

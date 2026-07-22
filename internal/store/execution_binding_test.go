@@ -75,7 +75,7 @@ func TestCASExecutionBindingAtomicallyRebindsWorkflowOutbox(t *testing.T) {
 		State: nodeexec.AdmissionAdmitted, Result: clusterstate.DispatchAcceptedAdmitted,
 		ReservationToken: "reservation-rebind",
 	}
-	if _, err := st.RecordSandboxWorkflow(ctx, dispatch, decision); err != nil {
+	if _, err := st.RecordSandboxWorkflow(ctx, dispatch, decision, workflowSandbox(dispatch.ObjectID)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := st.ClaimSandboxWorkflow(ctx, dispatch.ObjectID, dispatch.DemandDigest, decision.ReservationToken); err != nil {
@@ -158,10 +158,10 @@ func TestCASExecutionBindingRebindsWorkflowBeforeBusinessRowExists(t *testing.T)
 	ctx := context.Background()
 	dispatch := workflowDispatch(t, clusterstate.ExecutionKindSandbox, "sandbox-pre-row-rebind", placement.BuildDemand{})
 	decision := nodeexec.AdmissionDecision{
-		State: nodeexec.AdmissionAdmitted, Result: clusterstate.DispatchAcceptedAdmitted,
-		ReservationToken: "reservation-pre-row-rebind",
+		State: nodeexec.AdmissionRejected, Result: clusterstate.DispatchDefinitiveReject,
+		Reason: "capacity unavailable",
 	}
-	if _, err := st.RecordSandboxWorkflow(ctx, dispatch, decision); err != nil {
+	if _, err := st.RecordSandboxWorkflow(ctx, dispatch, decision, nil); err != nil {
 		t.Fatal(err)
 	}
 	if exists, err := st.ExecutionObjectExists(ctx, clusterstate.ExecutionKindSandbox, dispatch.ObjectID); err != nil || exists {
