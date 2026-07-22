@@ -110,6 +110,16 @@ CREATE INDEX IF NOT EXISTS idx_key_leases_auth ON key_leases(auth_key_hash);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_key_leases_exact
   ON key_leases(group_name, auth_key_hash, manifest_key_hash);
 
+CREATE TABLE IF NOT EXISTS key_lease_revision_fences (
+  group_name        TEXT NOT NULL,
+  auth_key_hash     TEXT NOT NULL,
+  manifest_key_hash TEXT NOT NULL,
+  key_revision      BLOB NOT NULL CHECK (length(key_revision) = 8),
+  registry_auth_digest TEXT NOT NULL,
+  expires_unix      INTEGER NOT NULL,
+  PRIMARY KEY (group_name, auth_key_hash, manifest_key_hash)
+);
+
 CREATE TABLE IF NOT EXISTS cluster_identity (
   singleton       INTEGER PRIMARY KEY CHECK (singleton = 1),
   node_id         TEXT NOT NULL UNIQUE,

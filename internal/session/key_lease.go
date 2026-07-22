@@ -261,7 +261,7 @@ func (h *Holder) beginKeyLeaseMutation(
 	}
 	tuple := held.registration.Tuple
 	key := keyLeaseRefID(ref)
-	sequenceKey := ref.Group
+	sequenceKey := key
 	held.leaseMu.Lock()
 	high := held.keyLeaseHigh[sequenceKey]
 	if desiredExpiry > 0 {
@@ -290,14 +290,14 @@ func (h *Holder) beginKeyLeaseMutation(
 			return nil, errors.Join(ErrDispatchNotSent, ErrKeyLeaseSuperseded)
 		}
 		// A cleanup hint is not Provider revision evidence. Never advance the
-		// group high-watermark until an exact key put is accepted.
+		// stream high-watermark until an exact key put is accepted.
 	}
 	held.keyLeaseSeq[sequenceKey]++
 	sequence := held.keyLeaseSeq[sequenceKey]
 	held.leaseMu.Unlock()
 	h.mu.RUnlock()
 
-	operation := h.keyLeaseOperation(nodeID, ref.Group)
+	operation := h.keyLeaseOperation(nodeID, ref)
 	operation.Lock()
 	current, err := h.lockCommandSession(nodeID, nodeEpoch, dataEndpoint, held)
 	if err != nil {
@@ -310,10 +310,10 @@ func (h *Holder) beginKeyLeaseMutation(
 	}, nil
 }
 
-func (h *Holder) keyLeaseOperation(nodeID, group string) *sync.Mutex {
+func (h *Holder) keyLeaseOperation(nodeID string, ref routesync.NodeKeyLeaseRefV1) *sync.Mutex {
 	hash := fnv.New32a()
 	_, _ = hash.Write([]byte(nodeID))
 	_, _ = hash.Write([]byte{0})
-	_, _ = hash.Write([]byte(group))
+	_, _ = hash.Write([]byte(keyLeaseRefID(ref)))
 	return &h.keyOps[hash.Sum32()%uint32(len(h.keyOps))]
 }

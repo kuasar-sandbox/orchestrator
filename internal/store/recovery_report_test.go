@@ -47,9 +47,9 @@ func TestRecoveryExecutionReportRejectsForgedUserMetadataAsAuthority(t *testing.
 		report[0].Object.Binding != managed.OpaqueBinding {
 		t.Fatalf("protected recovery report = %+v", report)
 	}
-	build := workflowDispatch(t, clusterstate.ExecutionKindBuild, "build-managed", placement.BuildDemand{Slots: 1})
+	build := workflowDispatch(t, clusterstate.ExecutionKindBuild, "build-managed", workflowBuildDemand(1))
 	if _, err := store.PrepareBuildWorkflow(ctx, build, workflowBuild(build.ObjectID),
-		nodeexec.BuildCapacity{Slots: 1, QueueLimit: 1}, ""); err != nil {
+		workflowBuildCapacity(1, 1), ""); err != nil {
 		t.Fatal(err)
 	}
 	mixed, err := store.RecoveryExecutionReportPage(ctx, managed.NodeID, managed.NodeEpoch, "generation-1", 0, 2, 1<<20)
@@ -65,9 +65,9 @@ func TestRecoveryExecutionReportRejectsForgedUserMetadataAsAuthority(t *testing.
 func TestRecoveryExecutionReportAcceptsEveryDurableBuildRegistrationWindow(t *testing.T) {
 	store := testStore(t)
 	ctx := context.Background()
-	capacity := nodeexec.BuildCapacity{Slots: 1, QueueLimit: 4}
-	admitted := workflowDispatch(t, clusterstate.ExecutionKindBuild, "build-admitted", placement.BuildDemand{Slots: 1})
-	queued := workflowDispatch(t, clusterstate.ExecutionKindBuild, "build-queued", placement.BuildDemand{Slots: 1})
+	capacity := workflowBuildCapacity(1, 4)
+	admitted := workflowDispatch(t, clusterstate.ExecutionKindBuild, "build-admitted", workflowBuildDemand(1))
+	queued := workflowDispatch(t, clusterstate.ExecutionKindBuild, "build-queued", workflowBuildDemand(1))
 	for _, dispatch := range []nodeexec.DispatchRecord{admitted, queued} {
 		if _, err := store.PrepareBuildWorkflow(ctx, dispatch, workflowBuild(dispatch.ObjectID), capacity, ""); err != nil {
 			t.Fatal(err)

@@ -290,7 +290,7 @@ type BuildCapacity struct {
 }
 
 func (c BuildCapacity) Validate() error {
-	if c.Slots == 0 || c.QueueLimit <= 0 {
+	if c.Slots == 0 || c.CPU == 0 || c.Memory == 0 || c.QueueLimit <= 0 {
 		return errors.New("nodeexec: Build capacity and queue limit are required")
 	}
 	return nil

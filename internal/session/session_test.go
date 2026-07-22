@@ -1030,7 +1030,7 @@ func TestKeyLeaseRevisionFencesRegistryAuthRotation(t *testing.T) {
 	}
 }
 
-func TestKeyLeaseRevisionFencesWholeGroup(t *testing.T) {
+func TestKeyLeaseRevisionIsScopedToExactFingerprintStream(t *testing.T) {
 	registration := testRegistration("node-1", 7, 10, "10.0.0.1:8443")
 	holder, err := NewHolder("registry-a", 1, nil, testGate(true), nil, newTestEnrollmentAuthority(registration))
 	if err != nil {
@@ -1047,19 +1047,19 @@ func TestKeyLeaseRevisionFencesWholeGroup(t *testing.T) {
 	); err != nil || !sent {
 		t.Fatalf("first group lease sent=%v err=%v", sent, err)
 	}
-	conflict := first
-	conflict.AuthKey = testKeyMaterial(strings.Repeat("d", 64))
+	rotated := first
+	rotated.AuthKey = testKeyMaterial(strings.Repeat("d", 64))
 	if _, sent, err := holder.InstallKeyLease(
-		context.Background(), testServeIdentity(), registration.NodeID, registration.NodeEpoch, registration.DataEndpoint, conflict,
-	); sent || !errors.Is(err, ErrKeyLeaseConflict) || !errors.Is(err, ErrDispatchNotSent) {
-		t.Fatalf("equal-revision group conflict sent=%v err=%v", sent, err)
+		context.Background(), testServeIdentity(), registration.NodeID, registration.NodeEpoch, registration.DataEndpoint, rotated,
+	); err != nil || !sent {
+		t.Fatalf("independent rotated lease sent=%v err=%v", sent, err)
 	}
-	if len(endpoint.wire) != 1 {
-		t.Fatalf("conflicting group revision reached node: wire=%d", len(endpoint.wire))
+	if len(endpoint.wire) != 2 {
+		t.Fatalf("independent fingerprint streams sent %d commands, want 2", len(endpoint.wire))
 	}
 }
 
-func TestRejectedKeyDropDoesNotAdvanceGroupRevision(t *testing.T) {
+func TestRejectedKeyDropDoesNotAdvanceStreamRevision(t *testing.T) {
 	registration := testRegistration("node-1", 7, 10, "10.0.0.1:8443")
 	holder, err := NewHolder("registry-a", 1, nil, testGate(true), nil, newTestEnrollmentAuthority(registration))
 	if err != nil {
@@ -1250,7 +1250,7 @@ func TestNewerKeyRefreshSupersedesWaitingDrop(t *testing.T) {
 		t.Fatalf("initial install sent=%v err=%v", sent, err)
 	}
 
-	operation := holder.keyLeaseOperation(registration.NodeID, ref.Group)
+	operation := holder.keyLeaseOperation(registration.NodeID, ref)
 	operation.Lock()
 	dropDone := make(chan struct {
 		sent bool
@@ -1332,7 +1332,7 @@ func TestKeyLeaseRefreshCannotSupersedeInFlightLongerExpiry(t *testing.T) {
 	}
 	lease := testKeyLease()
 	ref := keyLeaseRef(lease)
-	operation := holder.keyLeaseOperation(registration.NodeID, ref.Group)
+	operation := holder.keyLeaseOperation(registration.NodeID, ref)
 	operation.Lock()
 
 	longer := lease
@@ -1370,7 +1370,7 @@ func waitForKeyLeaseSequence(t *testing.T, holder *Holder, nodeID string, ref ro
 		held := holder.active[nodeID]
 		if held != nil {
 			held.leaseMu.RLock()
-			sequence := held.keyLeaseSeq[ref.Group]
+			sequence := held.keyLeaseSeq[keyLeaseRefID(ref)]
 			held.leaseMu.RUnlock()
 			holder.mu.RUnlock()
 			if sequence >= want {

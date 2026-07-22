@@ -42,12 +42,6 @@ func (o *Orchestrator) newRegisteredBuild(ctx context.Context, apiKey string, sp
 	if spec.CPUCount <= 0 || spec.MemoryMB <= 0 {
 		return nil, fmt.Errorf("%w: positive cpuCount and memoryMB are required at build registration", api.ErrBadRequest)
 	}
-	if maximum := o.cfg.Builder.VCPU; maximum > 0 && spec.CPUCount > maximum {
-		return nil, fmt.Errorf("%w: build cpuCount exceeds this node's per-build capacity", api.ErrBadRequest)
-	}
-	if maximum := o.cfg.Builder.MemoryMiB(); maximum > 0 && spec.MemoryMB > maximum {
-		return nil, fmt.Errorf("%w: build memoryMB exceeds this node's per-build capacity", api.ErrBadRequest)
-	}
 	spec.Metadata = sandboxcfg.SetCapacity(spec.Metadata, spec.CPUCount, spec.MemoryMB)
 	metadata, builderOpts, err := buildcfg.Extract(spec.Metadata)
 	if err != nil {

@@ -63,17 +63,23 @@ func TestBuildTriggerCannotIncreaseRegisteredResources(t *testing.T) {
 	}
 }
 
-func TestStandaloneBuildRegistrationFitsNodeCapacity(t *testing.T) {
+func TestStandaloneBuildRegistrationDefinesCapacityAboveNodeDefaults(t *testing.T) {
 	o := testOrchCfg(t, &config.Config{Builder: config.BuilderConfig{VCPU: 2, Memory: "2GiB"}})
 	ctx := context.Background()
 	apiKey := allowlistedBuildIdentity(t, o)
-	for _, request := range []api.RegisterSpec{
-		{Profile: types.ProfileE2B, CPUCount: 3, MemoryMB: 2048},
-		{Profile: types.ProfileE2B, CPUCount: 2, MemoryMB: 2049},
-	} {
-		if _, err := o.RegisterBuild(ctx, apiKey, request); !errors.Is(err, api.ErrBadRequest) {
-			t.Fatalf("oversized registration %+v: %v", request, err)
-		}
+	b, err := o.RegisterBuild(ctx, apiKey, api.RegisterSpec{
+		Profile: types.ProfileE2B, CPUCount: 3, MemoryMB: 3072,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec, err := sandboxcfg.ParseSpec(b.Metadata)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b.CPUCount != 3 || b.MemoryMB != 3072 || spec.Resource.Capacity == nil ||
+		spec.Resource.Capacity.CPU != 3 || spec.Resource.Capacity.Memory != "3072MiB" {
+		t.Fatalf("registered capacity = build(%d,%d) metadata=%+v", b.CPUCount, b.MemoryMB, spec.Resource.Capacity)
 	}
 }
 

@@ -3,10 +3,13 @@ package store
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/kuasar-sandbox/orchestrator/internal/secretbox"
 )
 
 func TestKeyLeaseExactIdentityExpiryAndRotation(t *testing.T) {
@@ -210,5 +213,78 @@ func TestClusterKeyLeaseRevisionAndExactDropAreDurable(t *testing.T) {
 		ctx, "/g", authFP, manifestFP, current.KeyRevision, current.RegistryAuthDigest,
 	); err != nil || !removed {
 		t.Fatalf("current exact drop = %t, %v", removed, err)
+	}
+}
+
+func TestClusterKeyLeaseRevisionFenceSurvivesLeaseRemovalAndRestart(t *testing.T) {
+	ctx := context.Background()
+	box, err := secretbox.NewFromColonHex(strings.Repeat("0", 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "test.db")
+	st, err := Open(path, box)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	now := time.Now().Unix()
+	current := KeyLease{
+		Group: "/g", AuthKey: strings.Repeat("a", 64), ManifestKey: strings.Repeat("b", 64),
+		KeyRevision: 2, RegistryAuthDigest: strings.Repeat("2", 64), ExpiresUnix: now + 600,
+	}
+	authFP, _ := AuthKeyHash(current.AuthKey)
+	manifestFP, _ := ManifestKeyHash(current.ManifestKey)
+	if _, err := st.PutKeyLease(ctx, current); err != nil {
+		t.Fatal(err)
+	}
+	if removed, err := st.DropKeyLeaseRef(
+		ctx, current.Group, authFP, manifestFP, current.KeyRevision, current.RegistryAuthDigest,
+	); err != nil || !removed {
+		t.Fatalf("drop current lease = %t, %v", removed, err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	st, err = Open(path, box)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	stale := current
+	stale.KeyRevision = 1
+	stale.RegistryAuthDigest = strings.Repeat("1", 64)
+	stale.ExpiresUnix = now + 1200
+	if _, err := st.PutKeyLease(ctx, stale); !errors.Is(err, ErrKeyLeaseRevisionRegression) {
+		t.Fatalf("stale lease after restart error = %v", err)
+	}
+	conflict := current
+	conflict.RegistryAuthDigest = strings.Repeat("3", 64)
+	if _, err := st.PutKeyLease(ctx, conflict); !errors.Is(err, ErrKeyLeaseRevisionConflict) {
+		t.Fatalf("same-revision conflict after restart error = %v", err)
+	}
+	renewed := current
+	renewed.ExpiresUnix += 600
+	if added, err := st.PutKeyLease(ctx, renewed); err != nil || !added {
+		t.Fatalf("reinstall exact current lease = %t, %v", added, err)
+	}
+
+	independent := current
+	independent.ManifestKey = strings.Repeat("c", 64)
+	independent.KeyRevision = 1
+	independent.RegistryAuthDigest = strings.Repeat("4", 64)
+	if added, err := st.PutKeyLease(ctx, independent); err != nil || !added {
+		t.Fatalf("independent fingerprint stream = %t, %v", added, err)
+	}
+
+	if _, err := st.db.ExecContext(ctx, `UPDATE key_leases SET expires_unix=?`, now-1); err != nil {
+		t.Fatal(err)
+	}
+	if count, err := st.PruneExpiredKeyLeases(ctx); err != nil || count != 2 {
+		t.Fatalf("prune expired leases = %d, %v", count, err)
+	}
+	if _, err := st.PutKeyLease(ctx, stale); !errors.Is(err, ErrKeyLeaseRevisionRegression) {
+		t.Fatalf("stale lease after prune error = %v", err)
 	}
 }

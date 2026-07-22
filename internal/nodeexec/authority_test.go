@@ -111,7 +111,7 @@ func authorityCommand(
 		err      error
 	)
 	if kind == clusterstate.ExecutionKindBuild {
-		demand, err = placement.NormalizeBuildDemand(placement.BuildDemand{Slots: 1, Memory: 1 << 30})
+		demand, err = placement.NormalizeBuildDemand(placement.BuildDemand{Slots: 1, CPU: 1000, Memory: 1 << 30})
 	} else {
 		demand, err = placement.NormalizeSandboxDemand(placement.SandboxDemand{
 			SlotUnits: 1, StartupBudgetMemory: 1 << 30, FloorMemory: 512 << 20,
@@ -173,7 +173,7 @@ func newAuthorityAtSession(
 			NodeID: "node-1", NodeEpoch: 7, SessionSeq: sessionSeq, DataEndpoint: "10.0.0.1:8443",
 		}, nil
 	}, func(context.Context) (nodeexec.BuildCapacity, string, error) {
-		return nodeexec.BuildCapacity{Slots: 1, Memory: 2 << 30, QueueLimit: 4}, "", nil
+		return nodeexec.BuildCapacity{Slots: 1, CPU: 1000, Memory: 2 << 30, QueueLimit: 4}, "", nil
 	})
 }
 
@@ -255,7 +255,7 @@ func TestAuthorityRejectsMissingExactKeyLeaseBeforeSandboxAdmission(t *testing.T
 			}, nil
 		},
 		func(context.Context) (nodeexec.BuildCapacity, string, error) {
-			return nodeexec.BuildCapacity{Slots: 1, QueueLimit: 1}, "", nil
+			return nodeexec.BuildCapacity{Slots: 1, CPU: 1000, Memory: 2 << 30, QueueLimit: 1}, "", nil
 		},
 		func(context.Context, nodeexec.DispatchRecord) (*types.Build, error) { return nil, nil },
 		func(context.Context, nodeexec.DispatchRecord) (*types.Sandbox, error) { return nil, missingLease },
@@ -493,7 +493,7 @@ func TestBuildSafetyFenceTerminatesExistingQueue(t *testing.T) {
 	authority := newAuthorityWithCapacity(t, st, sandbox, func(context.Context) (nodeexec.BuildCapacity, string, error) {
 		capacityMu.RLock()
 		defer capacityMu.RUnlock()
-		return nodeexec.BuildCapacity{Slots: 1, Memory: 2 << 30, QueueLimit: 4}, safetyReason, nil
+		return nodeexec.BuildCapacity{Slots: 1, CPU: 1000, Memory: 2 << 30, QueueLimit: 4}, safetyReason, nil
 	})
 	first := authorityCommand(t, clusterstate.ExecutionKindBuild, "build-running")
 	second := authorityCommand(t, clusterstate.ExecutionKindBuild, "build-queued")

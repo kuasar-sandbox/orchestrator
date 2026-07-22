@@ -98,6 +98,14 @@ func workflowBuild(id string) *types.Build {
 	}
 }
 
+func workflowBuildDemand(slots uint64) placement.BuildDemand {
+	return placement.BuildDemand{Slots: slots, CPU: slots, Memory: slots}
+}
+
+func workflowBuildCapacity(slots uint64, queueLimit int) nodeexec.BuildCapacity {
+	return nodeexec.BuildCapacity{Slots: slots, CPU: slots, Memory: slots, QueueLimit: queueLimit}
+}
+
 func workflowDispatchEpoch(
 	t *testing.T,
 	kind clusterstate.ExecutionKind,
@@ -147,8 +155,8 @@ func sandboxEvent(update nodeexec.EventUpdate) nodeexec.EventUpdate {
 func TestBuildAdmissionIsIdempotentConflictSafeAndBounded(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()
-	capacity := nodeexec.BuildCapacity{Slots: 1, QueueLimit: 1}
-	first := workflowDispatch(t, clusterstate.ExecutionKindBuild, "build-1", placement.BuildDemand{Slots: 1})
+	capacity := workflowBuildCapacity(1, 1)
+	first := workflowDispatch(t, clusterstate.ExecutionKindBuild, "build-1", workflowBuildDemand(1))
 	admitted, err := st.PrepareBuildWorkflow(ctx, first, workflowBuild(first.ObjectID), capacity, "")
 	if err != nil || admitted.Result != clusterstate.DispatchAcceptedAdmitted || !admitted.ResourceClaimed {
 		t.Fatalf("admitted = %+v, %v", admitted, err)
@@ -162,12 +170,12 @@ func TestBuildAdmissionIsIdempotentConflictSafeAndBounded(t *testing.T) {
 	if err != nil || retry.Result != admitted.Result || retry.AdmissionState != admitted.AdmissionState {
 		t.Fatalf("retry = %+v, %v", retry, err)
 	}
-	conflict := workflowDispatchSpec(t, clusterstate.ExecutionKindBuild, "build-1", placement.BuildDemand{Slots: 1}, "different")
+	conflict := workflowDispatchSpec(t, clusterstate.ExecutionKindBuild, "build-1", workflowBuildDemand(1), "different")
 	if _, err := st.PrepareBuildWorkflow(ctx, conflict, workflowBuild(conflict.ObjectID), capacity, ""); !errors.Is(err, ErrNodeWorkflowConflict) {
 		t.Fatalf("conflicting retry error = %v", err)
 	}
 
-	second := workflowDispatch(t, clusterstate.ExecutionKindBuild, "build-2", placement.BuildDemand{Slots: 1})
+	second := workflowDispatch(t, clusterstate.ExecutionKindBuild, "build-2", workflowBuildDemand(1))
 	queued, err := st.PrepareBuildWorkflow(ctx, second, workflowBuild(second.ObjectID), capacity, "")
 	if err != nil || queued.Result != clusterstate.DispatchAcceptedQueued || queued.EventSeq != 0 ||
 		queued.LatestEvent != nil || queued.ObjectState != string(types.BuildRegistered) {
@@ -178,7 +186,7 @@ func TestBuildAdmissionIsIdempotentConflictSafeAndBounded(t *testing.T) {
 		storedSecond.Metadata[clusterstate.ObjectMetadataKey] != second.OpaqueBinding {
 		t.Fatalf("atomic queued Build = %+v, %v", storedSecond, err)
 	}
-	third := workflowDispatch(t, clusterstate.ExecutionKindBuild, "build-3", placement.BuildDemand{Slots: 1})
+	third := workflowDispatch(t, clusterstate.ExecutionKindBuild, "build-3", workflowBuildDemand(1))
 	rejected, err := st.PrepareBuildWorkflow(ctx, third, workflowBuild(third.ObjectID), capacity, "")
 	if err != nil || rejected.Result != clusterstate.DispatchDefinitiveReject || rejected.Reason != "build_queue_full" {
 		t.Fatalf("rejected = %+v, %v", rejected, err)
@@ -209,10 +217,10 @@ func TestBuildAdmissionIsIdempotentConflictSafeAndBounded(t *testing.T) {
 func TestConcurrentBuildAdmissionDoesNotOversubscribe(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()
-	capacity := nodeexec.BuildCapacity{Slots: 1, QueueLimit: 4}
+	capacity := workflowBuildCapacity(1, 4)
 	dispatches := []nodeexec.DispatchRecord{
-		workflowDispatch(t, clusterstate.ExecutionKindBuild, "build-a", placement.BuildDemand{Slots: 1}),
-		workflowDispatch(t, clusterstate.ExecutionKindBuild, "build-b", placement.BuildDemand{Slots: 1}),
+		workflowDispatch(t, clusterstate.ExecutionKindBuild, "build-a", workflowBuildDemand(1)),
+		workflowDispatch(t, clusterstate.ExecutionKindBuild, "build-b", workflowBuildDemand(1)),
 	}
 	start := make(chan struct{})
 	results := make(chan clusterstate.DispatchOutcome, len(dispatches))
@@ -254,9 +262,9 @@ func TestConcurrentBuildAdmissionDoesNotOversubscribe(t *testing.T) {
 
 func TestRegisteredBuildIsLaunchableAfterRestart(t *testing.T) {
 	st := testStore(t)
-	dispatch := workflowDispatch(t, clusterstate.ExecutionKindBuild, "build-registered", placement.BuildDemand{Slots: 1})
+	dispatch := workflowDispatch(t, clusterstate.ExecutionKindBuild, "build-registered", workflowBuildDemand(1))
 	if _, err := st.PrepareBuildWorkflow(
-		context.Background(), dispatch, workflowBuild(dispatch.ObjectID), nodeexec.BuildCapacity{Slots: 1, QueueLimit: 4}, "",
+		context.Background(), dispatch, workflowBuild(dispatch.ObjectID), workflowBuildCapacity(1, 4), "",
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -292,10 +300,10 @@ func TestCompactionRemovesFinalizedPriorNodeEpoch(t *testing.T) {
 func TestBuildAdmissionRollsBackJournalWhenBusinessObjectCannotPersist(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()
-	dispatch := workflowDispatch(t, clusterstate.ExecutionKindBuild, "build-invalid", placement.BuildDemand{Slots: 1})
+	dispatch := workflowDispatch(t, clusterstate.ExecutionKindBuild, "build-invalid", workflowBuildDemand(1))
 	build := workflowBuild(dispatch.ObjectID)
 	build.ManifestKey = "not-hex"
-	if _, err := st.PrepareBuildWorkflow(ctx, dispatch, build, nodeexec.BuildCapacity{Slots: 1, QueueLimit: 4}, ""); err == nil {
+	if _, err := st.PrepareBuildWorkflow(ctx, dispatch, build, workflowBuildCapacity(1, 4), ""); err == nil {
 		t.Fatal("Build Admission succeeded without a persistable business object")
 	}
 	workflow, err := st.GetNodeWorkflow(ctx, clusterstate.ExecutionKindBuild, dispatch.ObjectID)
@@ -334,14 +342,14 @@ func TestSandboxAdmissionRollsBackJournalWhenKeyCopyCannotPersist(t *testing.T) 
 func TestBuildAdmissionDoesNotOverwriteExistingLocalBuild(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()
-	dispatch := workflowDispatch(t, clusterstate.ExecutionKindBuild, "build-existing", placement.BuildDemand{Slots: 1})
+	dispatch := workflowDispatch(t, clusterstate.ExecutionKindBuild, "build-existing", workflowBuildDemand(1))
 	existing := workflowBuild(dispatch.ObjectID)
 	existing.TemplateID = "local-template"
 	if err := st.PutBuild(ctx, existing); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := st.PrepareBuildWorkflow(ctx, dispatch, workflowBuild(dispatch.ObjectID),
-		nodeexec.BuildCapacity{Slots: 1, QueueLimit: 4}, ""); !errors.Is(err, ErrNodeWorkflowConflict) {
+		workflowBuildCapacity(1, 4), ""); !errors.Is(err, ErrNodeWorkflowConflict) {
 		t.Fatalf("occupied Build error = %v", err)
 	}
 	stored, err := st.GetBuild(ctx, dispatch.ObjectID)
@@ -357,10 +365,10 @@ func TestBuildAdmissionDoesNotOverwriteExistingLocalBuild(t *testing.T) {
 func TestBuildQueueTerminalizesImpossibleHeadAfterCapacityShrink(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()
-	initial := nodeexec.BuildCapacity{Slots: 2, QueueLimit: 4}
-	running := workflowDispatch(t, clusterstate.ExecutionKindBuild, "build-running", placement.BuildDemand{Slots: 2})
-	impossible := workflowDispatch(t, clusterstate.ExecutionKindBuild, "build-impossible", placement.BuildDemand{Slots: 2})
-	following := workflowDispatch(t, clusterstate.ExecutionKindBuild, "build-following", placement.BuildDemand{Slots: 1})
+	initial := workflowBuildCapacity(2, 4)
+	running := workflowDispatch(t, clusterstate.ExecutionKindBuild, "build-running", workflowBuildDemand(2))
+	impossible := workflowDispatch(t, clusterstate.ExecutionKindBuild, "build-impossible", workflowBuildDemand(2))
+	following := workflowDispatch(t, clusterstate.ExecutionKindBuild, "build-following", workflowBuildDemand(1))
 	for _, dispatch := range []nodeexec.DispatchRecord{running, impossible, following} {
 		if _, err := st.PrepareBuildWorkflow(ctx, dispatch, workflowBuild(dispatch.ObjectID), initial, ""); err != nil {
 			t.Fatal(err)
@@ -375,7 +383,7 @@ func TestBuildQueueTerminalizesImpossibleHeadAfterCapacityShrink(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	promoted, err := st.PromoteBuildQueue(ctx, "node-1", 7, nodeexec.BuildCapacity{Slots: 1, QueueLimit: 4}, 4)
+	promoted, err := st.PromoteBuildQueue(ctx, "node-1", 7, workflowBuildCapacity(1, 4), 4)
 	if err != nil || len(promoted) != 1 || promoted[0].ObjectID != following.ObjectID {
 		t.Fatalf("promotion after capacity shrink = %+v, %v", promoted, err)
 	}
@@ -398,9 +406,9 @@ func TestBuildQueueTerminalizesImpossibleHeadAfterCapacityShrink(t *testing.T) {
 func TestBuildLifecycleIsNodeLocalAndTerminalStateReleasesCapacity(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()
-	capacity := nodeexec.BuildCapacity{Slots: 1, QueueLimit: 4}
-	first := workflowDispatch(t, clusterstate.ExecutionKindBuild, "build-1", placement.BuildDemand{Slots: 1})
-	second := workflowDispatch(t, clusterstate.ExecutionKindBuild, "build-2", placement.BuildDemand{Slots: 1})
+	capacity := workflowBuildCapacity(1, 4)
+	first := workflowDispatch(t, clusterstate.ExecutionKindBuild, "build-1", workflowBuildDemand(1))
+	second := workflowDispatch(t, clusterstate.ExecutionKindBuild, "build-2", workflowBuildDemand(1))
 	if _, err := st.PrepareBuildWorkflow(ctx, first, workflowBuild(first.ObjectID), capacity, ""); err != nil {
 		t.Fatal(err)
 	}
@@ -663,9 +671,9 @@ func TestSandboxEventPreservesNewerBusinessObjectFields(t *testing.T) {
 func TestDuplicateBuildStatePersistsLaunchIdentity(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()
-	dispatch := workflowDispatch(t, clusterstate.ExecutionKindBuild, "build-launch-fields", placement.BuildDemand{Slots: 1})
+	dispatch := workflowDispatch(t, clusterstate.ExecutionKindBuild, "build-launch-fields", workflowBuildDemand(1))
 	if _, err := st.PrepareBuildWorkflow(ctx, dispatch, workflowBuild(dispatch.ObjectID),
-		nodeexec.BuildCapacity{Slots: 1, QueueLimit: 4}, ""); err != nil {
+		workflowBuildCapacity(1, 4), ""); err != nil {
 		t.Fatal(err)
 	}
 	callback := workflowBuild(dispatch.ObjectID)
@@ -702,9 +710,9 @@ func TestDuplicateBuildStatePersistsLaunchIdentity(t *testing.T) {
 func TestBuildReadyMayOnlyAppendItsArtifactAlias(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()
-	dispatch := workflowDispatch(t, clusterstate.ExecutionKindBuild, "build-ready-alias", placement.BuildDemand{Slots: 1})
+	dispatch := workflowDispatch(t, clusterstate.ExecutionKindBuild, "build-ready-alias", workflowBuildDemand(1))
 	if _, err := st.PrepareBuildWorkflow(ctx, dispatch, workflowBuild(dispatch.ObjectID),
-		nodeexec.BuildCapacity{Slots: 1, QueueLimit: 4}, ""); err != nil {
+		workflowBuildCapacity(1, 4), ""); err != nil {
 		t.Fatal(err)
 	}
 	registered := workflowBuild(dispatch.ObjectID)
@@ -743,11 +751,11 @@ func TestBuildReadyMayOnlyAppendItsArtifactAlias(t *testing.T) {
 func TestBuildAdmissionAndPromotionExcludePriorNodeEpoch(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()
-	capacity := nodeexec.BuildCapacity{Slots: 1, QueueLimit: 4}
-	oldRunning := workflowDispatchEpoch(t, clusterstate.ExecutionKindBuild, "old-running", placement.BuildDemand{Slots: 1}, 6)
-	oldQueued := workflowDispatchEpoch(t, clusterstate.ExecutionKindBuild, "old-queued", placement.BuildDemand{Slots: 1}, 6)
-	currentRunning := workflowDispatchEpoch(t, clusterstate.ExecutionKindBuild, "current-running", placement.BuildDemand{Slots: 1}, 7)
-	currentQueued := workflowDispatchEpoch(t, clusterstate.ExecutionKindBuild, "current-queued", placement.BuildDemand{Slots: 1}, 7)
+	capacity := workflowBuildCapacity(1, 4)
+	oldRunning := workflowDispatchEpoch(t, clusterstate.ExecutionKindBuild, "old-running", workflowBuildDemand(1), 6)
+	oldQueued := workflowDispatchEpoch(t, clusterstate.ExecutionKindBuild, "old-queued", workflowBuildDemand(1), 6)
+	currentRunning := workflowDispatchEpoch(t, clusterstate.ExecutionKindBuild, "current-running", workflowBuildDemand(1), 7)
+	currentQueued := workflowDispatchEpoch(t, clusterstate.ExecutionKindBuild, "current-queued", workflowBuildDemand(1), 7)
 	for _, dispatch := range []nodeexec.DispatchRecord{oldRunning, oldQueued, currentRunning, currentQueued} {
 		record, err := st.PrepareBuildWorkflow(ctx, dispatch, workflowBuild(dispatch.ObjectID), capacity, "")
 		if err != nil {
@@ -783,10 +791,10 @@ func TestBuildAdmissionAndPromotionExcludePriorNodeEpoch(t *testing.T) {
 func TestBuildQueuePromotionIsStrictFIFO(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()
-	initial := nodeexec.BuildCapacity{Slots: 2, QueueLimit: 4}
-	blocker := workflowDispatch(t, clusterstate.ExecutionKindBuild, "blocker", placement.BuildDemand{Slots: 1})
-	large := workflowDispatch(t, clusterstate.ExecutionKindBuild, "large", placement.BuildDemand{Slots: 2})
-	small := workflowDispatch(t, clusterstate.ExecutionKindBuild, "small", placement.BuildDemand{Slots: 1})
+	initial := workflowBuildCapacity(2, 4)
+	blocker := workflowDispatch(t, clusterstate.ExecutionKindBuild, "blocker", workflowBuildDemand(1))
+	large := workflowDispatch(t, clusterstate.ExecutionKindBuild, "large", workflowBuildDemand(2))
+	small := workflowDispatch(t, clusterstate.ExecutionKindBuild, "small", workflowBuildDemand(1))
 	for _, dispatch := range []nodeexec.DispatchRecord{blocker, large, small} {
 		if _, err := st.PrepareBuildWorkflow(ctx, dispatch, workflowBuild(dispatch.ObjectID), initial, ""); err != nil {
 			t.Fatal(err)
@@ -813,9 +821,9 @@ func TestNodeWorkflowBuildQueueSurvivesStoreRestartWithoutOutbox(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	capacity := nodeexec.BuildCapacity{Slots: 1, QueueLimit: 4}
-	first := workflowDispatch(t, clusterstate.ExecutionKindBuild, "build-running", placement.BuildDemand{Slots: 1})
-	queued := workflowDispatch(t, clusterstate.ExecutionKindBuild, "build-queued", placement.BuildDemand{Slots: 1})
+	capacity := workflowBuildCapacity(1, 4)
+	first := workflowDispatch(t, clusterstate.ExecutionKindBuild, "build-running", workflowBuildDemand(1))
+	queued := workflowDispatch(t, clusterstate.ExecutionKindBuild, "build-queued", workflowBuildDemand(1))
 	if _, err := st.PrepareBuildWorkflow(ctx, first, workflowBuild(first.ObjectID), capacity, ""); err != nil {
 		t.Fatal(err)
 	}
