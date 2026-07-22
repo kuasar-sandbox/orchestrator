@@ -28,6 +28,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -53,6 +54,28 @@ import (
 )
 
 var version = "0.2.0-dev"
+
+type apiHandlerGate struct {
+	mu      sync.RWMutex
+	handler http.Handler
+}
+
+func (g *apiHandlerGate) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	g.mu.RLock()
+	handler := g.handler
+	g.mu.RUnlock()
+	if handler == nil {
+		http.Error(w, "cluster API is not ready", http.StatusServiceUnavailable)
+		return
+	}
+	handler.ServeHTTP(w, r)
+}
+
+func (g *apiHandlerGate) Open(handler http.Handler) {
+	g.mu.Lock()
+	g.handler = handler
+	g.mu.Unlock()
+}
 
 func main() {
 	if len(os.Args) < 2 {
@@ -218,10 +241,16 @@ func runConductor(args []string, log *slog.Logger) error {
 	// registrations (proxy master, route observers); the external-mode proxyForwarder
 	// reads it to forward fallback data-plane requests to the registered proxy socket.
 	plugins := configsock.NewRegistry()
+	configAPI := apiH
+	var clusterAPIGate *apiHandlerGate
+	if clusterMode {
+		clusterAPIGate = &apiHandlerGate{}
+		configAPI = clusterAPIGate
+	}
 	cs := configsock.New(cfg.Paths.ConfigSocket, configsock.Deps{
 		Provider:      core,
 		Admin:         core,
-		API:           apiH,
+		API:           configAPI,
 		AdminPidfile:  cfg.Paths.AdminPidfile,
 		RouteSource:   core,
 		Plugins:       plugins,
@@ -348,6 +377,7 @@ func runConductor(args []string, log *slog.Logger) error {
 			}
 			return fmt.Errorf("start cluster execution authority: %w", err)
 		}
+		clusterAPIGate.Open(apiH)
 		log.Info("node-ctl conductor: final node-link active", "registry", cfg.Cluster.NodeLink.Endpoint,
 			"node_id", clusterStart.NodeID, "node_epoch", clusterStart.NodeEpoch)
 	}

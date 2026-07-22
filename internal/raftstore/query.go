@@ -392,12 +392,13 @@ func buildLeaseBinding(record clusterstate.BuildRecord) (LeaseBinding, bool, err
 }
 
 type RouteBucketLookup struct {
-	Identity      ShardRequestIdentity `json:"identity"`
-	Group         string               `json:"group"`
-	Bucket        uint32               `json:"bucket"`
-	AfterRouteKey string               `json:"after_route_key,omitempty"`
-	Limit         uint32               `json:"limit"`
-	Strong        bool                 `json:"strong,omitempty"`
+	Identity      ShardRequestIdentity            `json:"identity"`
+	Group         string                          `json:"group"`
+	Bucket        uint32                          `json:"bucket"`
+	State         clusterstate.RouteWorkflowState `json:"state,omitempty"`
+	AfterRouteKey string                          `json:"after_route_key,omitempty"`
+	Limit         uint32                          `json:"limit"`
+	Strong        bool                            `json:"strong,omitempty"`
 }
 
 func (q RouteBucketLookup) Validate() error {
@@ -406,6 +407,9 @@ func (q RouteBucketLookup) Validate() error {
 	}
 	if q.Group == "" || q.Limit == 0 || q.Limit > 4096 {
 		return errors.New("raftstore: Route bucket lookup requires a group and a limit between 1 and 4096")
+	}
+	if q.State != "" && q.State != clusterstate.WorkflowRouteReady && q.State != clusterstate.WorkflowRoutePaused {
+		return errors.New("raftstore: Route bucket state must be READY or PAUSED")
 	}
 	return nil
 }
@@ -450,6 +454,9 @@ func lookupRouteBucket(state DataState, query RouteBucketLookup) RouteBucketResu
 		)
 		if err == nil && bucket == query.Bucket {
 			if entry, listed := routeBucketEntry(record); listed {
+				if query.State != "" && entry.State != query.State {
+					continue
+				}
 				addBoundedRouteBucketEntry(&result.Routes, entry, int(query.Limit)+1)
 			}
 		}

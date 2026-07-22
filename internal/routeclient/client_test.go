@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -256,6 +257,74 @@ func TestListRoutesRestartsBucketWhenSnapshotChangesBetweenPages(t *testing.T) {
 	wantCursors := []string{"", "route-a", "", "route-a"}
 	if !reflect.DeepEqual(firstBucketCursors, wantCursors) {
 		t.Fatalf("bucket cursors = %v, want %v", firstBucketCursors, wantCursors)
+	}
+}
+
+func TestListRoutesPageUsesBoundedBucketCursor(t *testing.T) {
+	client := testClient(t)
+	client.permit = &cachedPermit{response: routeapi.PermitResponse{
+		ClusterID: client.registryLayout.ClusterID, RegistryGeneration: client.registryLayout.RegistryGeneration,
+		SystemEpoch: 1, RegistryLayoutDigest: client.digest, CommitIndex: 1, MaxLifetimeMillis: 5000,
+		ServeGate: true, WriteGate: true, CutoverGate: true, RecoveryClosed: true,
+	}, expires: time.Now().Add(time.Minute)}
+	entry := func(key string) routeapi.ListedRoute {
+		return routeapi.ListedRoute{
+			RouteKey: key, State: clusterstate.WorkflowRoutePaused, NodeID: "node-1", TemplateRef: "template-1",
+			Presentation: clusterstate.SandboxPresentationV1{
+				CPUCount: 2, MemoryMB: 2048, DiskSizeMB: 64, EnvdVersion: "0.6.1", StartedAt: 1, EndAt: 2,
+			},
+		}
+	}
+	transport := roundTripperFunc(func(request *http.Request) (*http.Response, error) {
+		var input routeapi.ListRoutesRequest
+		if err := json.NewDecoder(request.Body).Decode(&input); err != nil {
+			return nil, err
+		}
+		if input.State != clusterstate.WorkflowRoutePaused || input.Limit > 3 {
+			return nil, fmt.Errorf("unexpected list request: %+v", input)
+		}
+		response := routeapi.ListRoutesResponse{Bucket: input.Bucket, SnapshotRevision: 11}
+		switch input.Bucket {
+		case 0:
+			if input.AfterRouteKey == "" {
+				response.Routes = []routeapi.ListedRoute{entry("route-a")}
+			}
+		case 1:
+			if input.AfterRouteKey == "" {
+				response.Routes = []routeapi.ListedRoute{entry("route-b"), entry("route-c")}
+			} else if input.AfterRouteKey == "route-b" {
+				response.Routes = []routeapi.ListedRoute{entry("route-c")}
+			}
+		}
+		body, _ := json.Marshal(response)
+		return &http.Response{
+			StatusCode: http.StatusOK, Status: "200 OK", Header: make(http.Header),
+			Body: io.NopCloser(strings.NewReader(string(body))), Request: request,
+		}, nil
+	})
+	for memberID, endpoint := range client.endpoints {
+		endpoint.Client = &http.Client{Transport: transport}
+		client.endpoints[memberID] = endpoint
+	}
+	first, err := client.ListRoutesPage(context.Background(), "/group", clusterstate.WorkflowRoutePaused, 2, "")
+	if err != nil || len(first.Routes) != 2 || first.Routes[0].RouteKey != "route-a" ||
+		first.Routes[1].RouteKey != "route-b" || first.NextToken == "" {
+		t.Fatalf("first Route page = %+v, %v", first, err)
+	}
+	cursor, err := decodeRouteListCursor(first.NextToken)
+	if err != nil || cursor.Bucket != 1 || cursor.AfterRouteKey != "route-b" {
+		t.Fatalf("Route page cursor = %+v, %v", cursor, err)
+	}
+	second, err := client.ListRoutesPage(
+		context.Background(), "/group", clusterstate.WorkflowRoutePaused, 2, first.NextToken,
+	)
+	if err != nil || len(second.Routes) != 1 || second.Routes[0].RouteKey != "route-c" || second.NextToken != "" {
+		t.Fatalf("second Route page = %+v, %v", second, err)
+	}
+	if _, err := client.ListRoutesPage(
+		context.Background(), "/other", clusterstate.WorkflowRoutePaused, 2, first.NextToken,
+	); !errors.Is(err, ErrInvalidRouteListToken) {
+		t.Fatalf("cross-group cursor error = %v", err)
 	}
 }
 

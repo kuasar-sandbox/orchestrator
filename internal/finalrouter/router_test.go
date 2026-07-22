@@ -32,10 +32,17 @@ type revisionControl struct {
 	reserveErr      error
 	resumeCalls     int
 	resume          func(string, string, uint64) (routeclient.RouteMutationResult, error)
+	deleteCalls     int
+	deleteRoute     func(string, string, uint64) (routeclient.RouteMutationResult, error)
+	readRoute       func(string, string, uint64) (routeclient.RouteReadResult, error)
 	readAddressable func(string, string, uint64) (routeclient.RouteReadResult, error)
 	register        func(string, string, routeapi.BuildInput) (routeclient.BuildMutationResult, error)
 	readBuild       func(context.Context, string, string, uint64) (routeclient.BuildReadResult, error)
 	listedRoutes    []routeapi.ListedRoute
+	listNextToken   string
+	listState       clusterstate.RouteWorkflowState
+	listLimit       uint32
+	listToken       string
 }
 
 func (c *revisionControl) CurrentServeIdentity(bool) (routeapi.RegistryServeIdentity, error) {
@@ -69,11 +76,18 @@ func (c *revisionControl) ResumeSandbox(_ context.Context, group, routeKey strin
 		State: clusterstate.WorkflowRouteReady, Route: &c.route, RouteRevision: c.revision,
 	}}, nil
 }
-func (*revisionControl) DeleteSandbox(context.Context, string, string, uint64) (routeclient.RouteMutationResult, error) {
-	return routeclient.RouteMutationResult{}, errors.New("unexpected DeleteSandbox")
+func (c *revisionControl) DeleteSandbox(_ context.Context, group, routeKey string, minimum uint64) (routeclient.RouteMutationResult, error) {
+	c.deleteCalls++
+	if c.deleteRoute == nil {
+		return routeclient.RouteMutationResult{}, errors.New("unexpected DeleteSandbox")
+	}
+	return c.deleteRoute(group, routeKey, minimum)
 }
 func (c *revisionControl) ReadRoute(_ context.Context, group, routeKey string, minimum uint64) (routeclient.RouteReadResult, error) {
 	c.readMins = append(c.readMins, minimum)
+	if c.readRoute != nil {
+		return c.readRoute(group, routeKey, minimum)
+	}
 	if c.routeState == clusterstate.WorkflowRoutePaused {
 		return routeclient.RouteReadResult{ServeIdentity: c.serveIdentity, Response: routeapi.ReadRouteResponse{
 			Outcome: routeapi.ReadConflict, Reason: string(clusterstate.WorkflowRoutePaused),
@@ -146,6 +160,88 @@ func TestSandboxControlDistinguishesDefinitiveNotFoundFromUnavailable(t *testing
 		})
 	}
 }
+
+func TestDeleteRequiresExactSandboxResourcePath(t *testing.T) {
+	serveIdentity := routeapi.RegistryServeIdentity{
+		ClusterID: "cluster-1", RegistryGeneration: "generation-1", SystemEpoch: 1,
+		RegistryLayoutDigest: "registry-layout-1",
+	}
+	control := &revisionControl{serveIdentity: serveIdentity}
+	control.deleteRoute = func(group, routeKey string, _ uint64) (routeclient.RouteMutationResult, error) {
+		return routeclient.RouteMutationResult{ServeIdentity: serveIdentity, Response: routeapi.RouteMutationResponse{
+			Outcome: routeapi.MutationTerminal, Group: group, RouteKey: routeKey,
+		}}, nil
+	}
+	router, err := New(control, allowCaller{}, "example.test", time.Minute, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{
+		"/v2/sandboxes/route-1/pause",
+		"/v2/sandboxes/route-1/connect",
+		"/v2/sandboxes/route-1/timeout",
+	} {
+		request := httptest.NewRequest(http.MethodDelete, "http://api.example.test"+path, nil)
+		request.Host = "api.example.test"
+		request.Header.Set(HeaderGroup, "/group")
+		response := httptest.NewRecorder()
+		router.Handler().ServeHTTP(response, request)
+		if response.Code != http.StatusMethodNotAllowed {
+			t.Fatalf("DELETE %s = %d, want %d", path, response.Code, http.StatusMethodNotAllowed)
+		}
+	}
+	if control.deleteCalls != 0 {
+		t.Fatalf("child-resource DELETE calls = %d, want 0", control.deleteCalls)
+	}
+
+	request := httptest.NewRequest(http.MethodDelete, "http://api.example.test/v2/sandboxes/nested%2Froute", nil)
+	request.Host = "api.example.test"
+	request.Header.Set(HeaderGroup, "/group")
+	response := httptest.NewRecorder()
+	router.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusNoContent || control.deleteCalls != 1 {
+		t.Fatalf("exact DELETE = %d calls=%d body=%s", response.Code, control.deleteCalls, response.Body.String())
+	}
+}
+
+func TestFirstDataRequestUsesCallerAuthorizationForCreatedRoute(t *testing.T) {
+	serveIdentity := routeapi.RegistryServeIdentity{
+		ClusterID: "cluster-1", RegistryGeneration: "generation-1", SystemEpoch: 1,
+		RegistryLayoutDigest: "registry-layout-1",
+	}
+	control := &revisionControl{
+		serveIdentity: serveIdentity, revision: 8,
+		route: clusterstate.ReadyRoute{
+			SandboxID: "sandbox-1", NodeID: "node-1", NodeEpoch: 1, DataEndpoint: "127.0.0.1:0",
+			RegistryGeneration: "generation-1", BindingDigest: "binding-1", AccessToken: "minted-token",
+			TargetPort: 49983,
+		},
+		readRoute: func(group, routeKey string, _ uint64) (routeclient.RouteReadResult, error) {
+			return routeclient.RouteReadResult{ServeIdentity: serveIdentity, Response: routeapi.ReadRouteResponse{
+				Outcome: routeapi.ReadNotFound, Group: group, RouteKey: routeKey,
+			}}, nil
+		},
+		readAddressable: func(group, routeKey string, _ uint64) (routeclient.RouteReadResult, error) {
+			return routeclient.RouteReadResult{ServeIdentity: serveIdentity, Response: routeapi.ReadRouteResponse{
+				Outcome: routeapi.ReadNotFound, Group: group, RouteKey: routeKey,
+			}}, nil
+		},
+	}
+	router, err := New(control, allowCaller{}, "example.test", time.Minute, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodGet, "http://49983-route-1.example.test/", nil)
+	request.Host = "49983-route-1.example.test"
+	request.Header.Set(HeaderGroup, "/group")
+	request.Header.Set(HeaderAPIKey, "caller-key")
+	response := httptest.NewRecorder()
+	router.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusBadGateway || control.reserveCalls != 1 {
+		t.Fatalf("first data request = %d reserves=%d body=%s", response.Code, control.reserveCalls, response.Body.String())
+	}
+}
+
 func (c *revisionControl) RegisterBuild(_ context.Context, group, buildID string, _ uint64, input routeapi.BuildInput) (routeclient.BuildMutationResult, error) {
 	if c.register == nil {
 		return routeclient.BuildMutationResult{}, errors.New("unexpected RegisterBuild")
@@ -158,11 +254,20 @@ func (c *revisionControl) ReadBuild(ctx context.Context, group, buildID string, 
 	}
 	return c.readBuild(ctx, group, buildID, revision)
 }
-func (c *revisionControl) ListRoutes(context.Context, string) (routeclient.RouteListResult, error) {
+func (c *revisionControl) ListRoutesPage(
+	_ context.Context,
+	_ string,
+	state clusterstate.RouteWorkflowState,
+	limit uint32,
+	nextToken string,
+) (routeclient.RouteListPageResult, error) {
 	if c.listedRoutes == nil {
-		return routeclient.RouteListResult{}, errors.New("unexpected ListRoutes")
+		return routeclient.RouteListPageResult{}, errors.New("unexpected ListRoutesPage")
 	}
-	return routeclient.RouteListResult{Routes: c.listedRoutes, ServeIdentity: c.serveIdentity}, nil
+	c.listState, c.listLimit, c.listToken = state, limit, nextToken
+	return routeclient.RouteListPageResult{
+		Routes: c.listedRoutes, NextToken: c.listNextToken, ServeIdentity: c.serveIdentity,
+	}, nil
 }
 
 type allowCaller struct{}
@@ -197,6 +302,12 @@ func TestStaleProxyFailureRequiresNewerRouteRevision(t *testing.T) {
 	router.rejectStaleRoute(old)
 	if cached := router.cachedRoute(old.Group, old.RouteKey); cached != nil {
 		t.Fatalf("stale Route remained cached: %+v", cached)
+	}
+	if router.rememberRoute(old) {
+		t.Fatal("Route below the revision fence was reinstalled")
+	}
+	if cached := router.cachedRoute(old.Group, old.RouteKey); cached != nil {
+		t.Fatalf("fenced Route was reinstalled: %+v", cached)
 	}
 	if minimum := router.minimumRouteRevision(old.Group, old.RouteKey); minimum != 8 {
 		t.Fatalf("minimum Route revision = %d, want 8", minimum)
@@ -326,6 +437,37 @@ func TestListRendersCompleteSDKProjectionWithoutNodeFanout(t *testing.T) {
 		item["envdVersion"] != "0.6.1" || item["startedAt"] != "1970-01-01T00:00:01Z" ||
 		item["endAt"] != "1970-01-01T00:00:02Z" {
 		t.Fatalf("SDK list projection = %+v", item)
+	}
+}
+
+func TestListPassesStateLimitAndContinuation(t *testing.T) {
+	serveIdentity := routeapi.RegistryServeIdentity{
+		ClusterID: "cluster-1", RegistryGeneration: "generation-1", SystemEpoch: 1,
+		RegistryLayoutDigest: "registry-layout-1",
+	}
+	control := &revisionControl{
+		serveIdentity: serveIdentity, listNextToken: "next-page",
+		listedRoutes: []routeapi.ListedRoute{{
+			RouteKey: "route-1", State: clusterstate.WorkflowRoutePaused, NodeID: "node-1",
+			TemplateRef: "template-1", Presentation: routerTestPresentation(),
+		}},
+	}
+	router, err := New(control, allowCaller{}, "example.test", time.Minute, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(
+		http.MethodGet, "http://api.example.test/v2/sandboxes?state=paused&limit=7&nextToken=previous-page", nil,
+	)
+	request.Host = "api.example.test"
+	request.Header.Set(HeaderGroup, "/group")
+	response := httptest.NewRecorder()
+	router.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusOK || response.Header().Get("x-next-token") != "next-page" {
+		t.Fatalf("paged list = %d next=%q body=%s", response.Code, response.Header().Get("x-next-token"), response.Body.String())
+	}
+	if control.listState != clusterstate.WorkflowRoutePaused || control.listLimit != 7 || control.listToken != "previous-page" {
+		t.Fatalf("list query = state=%q limit=%d token=%q", control.listState, control.listLimit, control.listToken)
 	}
 }
 

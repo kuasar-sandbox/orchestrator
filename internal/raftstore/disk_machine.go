@@ -975,6 +975,9 @@ func lookupRouteBucketOnDisk(
 		}
 		if bucket == query.Bucket {
 			if entry, listed := routeBucketEntry(record); listed {
+				if query.State != "" && entry.State != query.State {
+					continue
+				}
 				addBoundedRouteBucketEntry(&result.Routes, entry, int(query.Limit)+1)
 				if len(result.Routes) == int(query.Limit)+1 {
 					break

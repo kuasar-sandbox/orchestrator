@@ -616,6 +616,16 @@ func assertDiskReady(
 		len(bucketResult.Routes) != 1 || bucketResult.Routes[0].RouteKey != routeKey {
 		t.Fatalf("on-disk Route bucket lookup = %+v", bucketResult)
 	}
+	value, err = machine.Lookup(DataLookup{RouteBucket: &RouteBucketLookup{
+		Identity: identity, Group: group, Bucket: bucket, State: clusterstate.WorkflowRoutePaused, Limit: 10,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pausedBucket := value.(DataLookupResult).RouteBucket
+	if pausedBucket == nil || !pausedBucket.Available || len(pausedBucket.Routes) != 0 {
+		t.Fatalf("on-disk paused Route bucket lookup = %+v", pausedBucket)
+	}
 	value, err = machine.Lookup(DataLookup{Changefeed: &RouteChangefeedLookup{
 		Identity: identity, Group: group, Bucket: bucket, AfterRevision: 1, Limit: 10,
 	}})

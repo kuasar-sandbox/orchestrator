@@ -484,7 +484,7 @@ func (s *RegistryService) ListRoutes(ctx context.Context, request routeapi.ListR
 	}
 	routes := make([]routeapi.ListedRoute, 0)
 	result, err := s.store.ReadRouteBucket(
-		ctx, request.Group, request.Bucket, request.AfterRouteKey, request.Limit, request.Strong,
+		ctx, request.Group, request.Bucket, request.State, request.AfterRouteKey, request.Limit, request.Strong,
 	)
 	if err != nil {
 		return routeapi.ListRoutesResponse{}, err

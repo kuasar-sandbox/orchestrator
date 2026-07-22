@@ -783,6 +783,7 @@ func (s *RaftStore) ReadRouteBucket(
 	ctx context.Context,
 	group string,
 	bucket uint32,
+	state clusterstate.RouteWorkflowState,
 	afterRouteKey string,
 	limit uint32,
 	strong bool,
@@ -799,7 +800,7 @@ func (s *RaftStore) ReadRouteBucket(
 		return raftstore.RouteBucketResult{}, err
 	}
 	result, err := s.runtime.ReadData(ctx, raftstore.DataLookup{RouteBucket: &raftstore.RouteBucketLookup{
-		Identity: identity, Group: group, Bucket: bucket,
+		Identity: identity, Group: group, Bucket: bucket, State: state,
 		AfterRouteKey: afterRouteKey, Limit: limit, Strong: strong,
 	}})
 	if err != nil {

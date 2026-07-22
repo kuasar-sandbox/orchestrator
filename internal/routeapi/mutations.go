@@ -261,11 +261,12 @@ func (r BuildMutationResponse) ValidateFor(request RegisterBuildRequest) error {
 
 type ListRoutesRequest struct {
 	RequestIdentity
-	Group         string `json:"group"`
-	Bucket        uint32 `json:"bucket"`
-	AfterRouteKey string `json:"after_route_key,omitempty"`
-	Limit         uint32 `json:"limit"`
-	Strong        bool   `json:"strong,omitempty"`
+	Group         string                          `json:"group"`
+	Bucket        uint32                          `json:"bucket"`
+	State         clusterstate.RouteWorkflowState `json:"state,omitempty"`
+	AfterRouteKey string                          `json:"after_route_key,omitempty"`
+	Limit         uint32                          `json:"limit"`
+	Strong        bool                            `json:"strong,omitempty"`
 }
 
 func (r ListRoutesRequest) Validate() error {
@@ -274,6 +275,9 @@ func (r ListRoutesRequest) Validate() error {
 	}
 	if r.Group == "" || r.Limit == 0 || r.Limit > 4096 {
 		return errors.New("routeapi: Route list requires group and a limit between 1 and 4096")
+	}
+	if r.State != "" && r.State != clusterstate.WorkflowRouteReady && r.State != clusterstate.WorkflowRoutePaused {
+		return errors.New("routeapi: Route list state must be READY or PAUSED")
 	}
 	return nil
 }
@@ -312,6 +316,7 @@ func (r ListRoutesResponse) ValidateFor(request ListRoutesRequest) error {
 		entry := r.Routes[index]
 		if entry.RouteKey <= previous || entry.NodeID == "" || entry.TemplateRef == "" ||
 			(entry.State != clusterstate.WorkflowRouteReady && entry.State != clusterstate.WorkflowRoutePaused) ||
+			(request.State != "" && entry.State != request.State) ||
 			entry.Presentation.Validate() != nil {
 			return errors.New("routeapi: invalid or unsorted Route list projection")
 		}

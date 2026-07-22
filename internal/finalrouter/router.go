@@ -57,7 +57,7 @@ type ControlPlane interface {
 	ReadAddressableRoute(context.Context, string, string, uint64) (routeclient.RouteReadResult, error)
 	RegisterBuild(context.Context, string, string, uint64, routeapi.BuildInput) (routeclient.BuildMutationResult, error)
 	ReadBuild(context.Context, string, string, uint64) (routeclient.BuildReadResult, error)
-	ListRoutes(context.Context, string) (routeclient.RouteListResult, error)
+	ListRoutesPage(context.Context, string, clusterstate.RouteWorkflowState, uint32, string) (routeclient.RouteListPageResult, error)
 }
 
 type CallerAuthorizer interface {
@@ -367,8 +367,9 @@ func (r *Router) reserve(ctx context.Context, group, routeKey string, input rout
 			if !r.control.CacheAuthorized(result.ServeIdentity) {
 				err = errors.New("Router Serve Permit changed before Route cache install")
 				flight.route = nil
-			} else {
-				r.rememberRoute(flight.route)
+			} else if !r.rememberRoute(flight.route) {
+				err = errors.New("Route revision was fenced before cache install")
+				flight.route = nil
 			}
 		}
 	}
@@ -385,7 +386,20 @@ func (r *Router) listSandboxes(w http.ResponseWriter, request *http.Request) {
 	if !ok {
 		return
 	}
-	result, err := r.control.ListRoutes(request.Context(), group)
+	query := request.URL.Query()
+	state, knownState := routeListState(query.Get("state"))
+	if !knownState {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, "[]\n")
+		return
+	}
+	result, err := r.control.ListRoutesPage(
+		request.Context(), group, state, routeListLimit(query.Get("limit")), query.Get("nextToken"),
+	)
+	if errors.Is(err, routeclient.ErrInvalidRouteListToken) {
+		http.Error(w, "invalid nextToken", http.StatusBadRequest)
+		return
+	}
 	if err != nil || !r.control.CacheAuthorized(result.ServeIdentity) {
 		http.Error(w, "Route list unavailable", http.StatusServiceUnavailable)
 		return
@@ -405,8 +419,38 @@ func (r *Router) listSandboxes(w http.ResponseWriter, request *http.Request) {
 			"endAt":     presentationTime(route.Presentation.EndAt), "metadata": route.Presentation.Metadata,
 		})
 	}
+	if result.NextToken != "" {
+		w.Header().Set("x-next-token", result.NextToken)
+	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(items)
+}
+
+func routeListState(value string) (clusterstate.RouteWorkflowState, bool) {
+	switch value {
+	case "":
+		return "", true
+	case "running":
+		return clusterstate.WorkflowRouteReady, true
+	case "paused":
+		return clusterstate.WorkflowRoutePaused, true
+	default:
+		return "", false
+	}
+}
+
+func routeListLimit(value string) uint32 {
+	if value == "" {
+		return 100
+	}
+	parsed, err := strconv.ParseUint(value, 10, 32)
+	if err != nil || parsed == 0 {
+		return 100
+	}
+	if parsed > 1000 {
+		return 1000
+	}
+	return uint32(parsed)
 }
 
 func presentationTime(unixSeconds int64) string {
@@ -436,6 +480,11 @@ func (r *Router) sandboxControl(w http.ResponseWriter, request *http.Request) {
 		return
 	}
 	if request.Method == http.MethodDelete {
+		exactRouteKey, exact := escapedPathObjectIDExact(request.URL.EscapedPath(), "/sandboxes/")
+		if !exact || exactRouteKey != routeKey {
+			http.Error(w, "DELETE is only valid for the Sandbox resource", http.StatusMethodNotAllowed)
+			return
+		}
 		minimum := r.minimumRouteRevision(group, routeKey)
 		result, deleteErr := r.control.DeleteSandbox(request.Context(), group, routeKey, minimum)
 		if deleteErr != nil {
@@ -464,7 +513,10 @@ func (r *Router) sandboxControl(w http.ResponseWriter, request *http.Request) {
 		if resumeErr == nil && result.Response.Outcome == routeapi.MutationReady && result.Response.Route != nil {
 			entry = &routeEntry{Route: *result.Response.Route, Group: group, RouteKey: routeKey,
 				State: clusterstate.WorkflowRouteReady, Revision: result.Response.RouteRevision, ServeIdentity: result.ServeIdentity}
-			r.rememberRoute(entry)
+			if !r.rememberRoute(entry) {
+				entry = nil
+				err = errors.New("resumed Route revision was already fenced")
+			}
 		} else {
 			err = errors.Join(resumeErr, errors.New("Route resume did not become READY"))
 		}
@@ -873,6 +925,17 @@ func (r *Router) serveData(w http.ResponseWriter, request *http.Request, host st
 				err = inputErr
 			} else {
 				entry, err = r.reserve(request.Context(), group, routeKey, input)
+				if err == nil && entry != nil {
+					port, err = requestedPort(request, hostPort, hasHostPort, entry.Route.TargetPort)
+					if err != nil {
+						http.Error(w, err.Error(), http.StatusBadRequest)
+						return
+					}
+					// Provider authorization creates the Route. The caller cannot
+					// pre-present the capability minted by that same mutation, so the
+					// Router injects it for this first trusted forward.
+					injectToken, authenticated = true, true
+				}
 			}
 		}
 	}
@@ -936,7 +999,9 @@ func (r *Router) resumeRoute(ctx context.Context, group, routeKey string) (*rout
 	if !r.control.CacheAuthorized(result.ServeIdentity) {
 		return nil, errors.New("Router Serve Permit changed before resumed Route cache install")
 	}
-	r.rememberRoute(entry)
+	if !r.rememberRoute(entry) {
+		return nil, errors.New("resumed Route revision was already fenced")
+	}
 	return entry, nil
 }
 
@@ -1050,7 +1115,9 @@ func (r *Router) resolveRoute(ctx context.Context, group, routeKey string) (*rou
 	if !r.control.CacheAuthorized(entry.ServeIdentity) {
 		return nil, errors.New("Route serveIdentity is no longer permitted")
 	}
-	r.rememberRoute(entry)
+	if !r.rememberRoute(entry) {
+		return nil, errors.New("Route revision was already fenced")
+	}
 	return entry, nil
 }
 
@@ -1076,30 +1143,48 @@ func (r *Router) resolveControlRoute(ctx context.Context, group, routeKey string
 		return nil, errors.New("Route serveIdentity is no longer permitted")
 	}
 	if result.Response.State == clusterstate.WorkflowRouteReady {
-		r.rememberRoute(entry)
+		if !r.rememberRoute(entry) {
+			return nil, errors.New("Route revision was already fenced")
+		}
+	} else if !r.routeRevisionCurrent(entry) {
+		return nil, errors.New("addressable Route revision was already fenced")
 	}
 	return entry, nil
 }
 
-func (r *Router) rememberRoute(entry *routeEntry) {
+func (r *Router) rememberRoute(entry *routeEntry) bool {
 	if entry == nil || entry.Group == "" || entry.RouteKey == "" || entry.Route.SandboxID == "" {
-		return
+		return false
 	}
 	copy := *entry
 	if copy.State == "" {
 		copy.State = clusterstate.WorkflowRouteReady
 	}
 	if copy.State != clusterstate.WorkflowRouteReady {
-		return
+		return false
 	}
 	copy.CachedAt, copy.LastUsed = time.Now(), time.Now()
 	key := routeKeyID(copy.Group, copy.RouteKey)
 	r.cacheMu.Lock()
+	if copy.Revision < r.minimumRevisions[key] {
+		r.cacheMu.Unlock()
+		return false
+	}
 	r.routes[key] = &copy
 	if copy.Revision > r.minimumRevisions[key] {
 		r.minimumRevisions[key] = copy.Revision
 	}
 	r.cacheMu.Unlock()
+	return true
+}
+
+func (r *Router) routeRevisionCurrent(entry *routeEntry) bool {
+	if entry == nil {
+		return false
+	}
+	r.cacheMu.Lock()
+	defer r.cacheMu.Unlock()
+	return entry.Revision >= r.minimumRevisions[routeKeyID(entry.Group, entry.RouteKey)]
 }
 
 func (r *Router) minimumRouteRevision(group, routeKey string) uint64 {
@@ -1325,6 +1410,22 @@ func pathObjectID(path, marker string) string {
 func escapedPathObjectID(path, marker string) (string, bool) {
 	encoded := pathObjectID(path, marker)
 	if encoded == "" {
+		return "", false
+	}
+	decoded, err := url.PathUnescape(encoded)
+	if err != nil || url.PathEscape(decoded) != encoded {
+		return "", false
+	}
+	return decoded, true
+}
+
+func escapedPathObjectIDExact(path, marker string) (string, bool) {
+	index := strings.Index(path, marker)
+	if index < 0 {
+		return "", false
+	}
+	encoded := path[index+len(marker):]
+	if encoded == "" || strings.Contains(encoded, "/") {
 		return "", false
 	}
 	decoded, err := url.PathUnescape(encoded)

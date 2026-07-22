@@ -224,6 +224,12 @@ func TestRouteBucketSnapshotAndChangefeedUseShardRevisions(t *testing.T) {
 		list.Routes[1].State != clusterstate.WorkflowRoutePaused {
 		t.Fatalf("Route bucket snapshot = %+v", list)
 	}
+	paused := lookupRouteBucket(state, RouteBucketLookup{
+		Identity: identity, Group: group, Bucket: bucket, State: clusterstate.WorkflowRoutePaused, Limit: 10,
+	})
+	if len(paused.Routes) != 1 || paused.Routes[0].RouteKey != secondKey {
+		t.Fatalf("paused Route bucket snapshot = %+v", paused)
+	}
 	page := lookupRouteBucket(state, RouteBucketLookup{
 		Identity: identity, Group: group, Bucket: bucket, Limit: 1,
 	})

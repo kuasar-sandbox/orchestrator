@@ -3,6 +3,7 @@ package routeclient
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -25,6 +26,7 @@ import (
 var (
 	ErrPermitUnavailable      = errors.New("routeclient: matching Serve Permit is unavailable")
 	ErrMutationOutcomeUnknown = errors.New("routeclient: mutation outcome is unknown")
+	ErrInvalidRouteListToken  = errors.New("routeclient: invalid Route list token")
 )
 
 const (
@@ -91,6 +93,12 @@ type RouteListResult struct {
 	Routes          []routeapi.ListedRoute
 	BucketRevisions []uint64
 	ServeIdentity   routeapi.RegistryServeIdentity
+}
+
+type RouteListPageResult struct {
+	Routes        []routeapi.ListedRoute
+	NextToken     string
+	ServeIdentity routeapi.RegistryServeIdentity
 }
 
 type RouteWatchResult struct {
@@ -353,6 +361,162 @@ func (c *Client) ReadBuild(
 	request.Strong = true
 	response, err := c.readBuildStrong(ctx, request)
 	return BuildReadResult{Response: response, ServeIdentity: serveIdentityFromRequest(identity)}, err
+}
+
+type routeListCursorV1 struct {
+	Version       uint8                           `json:"version"`
+	Group         string                          `json:"group"`
+	State         clusterstate.RouteWorkflowState `json:"state,omitempty"`
+	Bucket        uint32                          `json:"bucket"`
+	AfterRouteKey string                          `json:"after_route_key"`
+}
+
+func (c *Client) ListRoutesPage(
+	ctx context.Context,
+	group string,
+	state clusterstate.RouteWorkflowState,
+	limit uint32,
+	nextToken string,
+) (RouteListPageResult, error) {
+	if group == "" || limit == 0 || limit > 1000 ||
+		(state != "" && state != clusterstate.WorkflowRouteReady && state != clusterstate.WorkflowRoutePaused) {
+		return RouteListPageResult{}, errors.New("routeclient: invalid Route list page")
+	}
+	cursor := routeListCursorV1{Version: 1, Group: group, State: state}
+	if nextToken != "" {
+		decoded, err := decodeRouteListCursor(nextToken)
+		if err != nil || decoded.Group != group || decoded.State != state ||
+			decoded.Bucket >= c.registryLayout.RouteBucketCount || decoded.AfterRouteKey == "" {
+			return RouteListPageResult{}, ErrInvalidRouteListToken
+		}
+		cursor = decoded
+	}
+	serveIdentity, err := c.CurrentServeIdentity(false)
+	if err != nil {
+		return RouteListPageResult{}, err
+	}
+	type positionedRoute struct {
+		route  routeapi.ListedRoute
+		bucket uint32
+	}
+	target := int(limit) + 1
+	routes := make([]positionedRoute, 0, target)
+	for bucket := cursor.Bucket; bucket < c.registryLayout.RouteBucketCount && len(routes) < target; bucket++ {
+		if !c.CacheAuthorized(serveIdentity) {
+			return RouteListPageResult{}, ErrPermitUnavailable
+		}
+		identity, err := c.routeBucketIdentity(serveIdentity, group, bucket)
+		if err != nil {
+			return RouteListPageResult{}, err
+		}
+		afterRouteKey := ""
+		if bucket == cursor.Bucket {
+			afterRouteKey = cursor.AfterRouteKey
+		}
+		readKey := group + "\x00" + strconv.FormatUint(uint64(bucket), 10)
+		for len(routes) < target {
+			request := routeapi.ListRoutesRequest{
+				RequestIdentity: identity, Group: group, Bucket: bucket, State: state,
+				AfterRouteKey: afterRouteKey, Limit: uint32(target - len(routes)),
+			}
+			response, err := c.listRouteBucketPage(ctx, readKey, request)
+			if err != nil {
+				return RouteListPageResult{}, err
+			}
+			if !c.CacheAuthorized(serveIdentity) {
+				return RouteListPageResult{}, ErrPermitUnavailable
+			}
+			for _, route := range response.Routes {
+				routes = append(routes, positionedRoute{route: route, bucket: bucket})
+			}
+			if response.NextRouteKey == "" {
+				break
+			}
+			afterRouteKey = response.NextRouteKey
+		}
+	}
+	result := RouteListPageResult{ServeIdentity: serveIdentity}
+	if len(routes) > int(limit) {
+		last := routes[limit-1]
+		result.NextToken, err = encodeRouteListCursor(routeListCursorV1{
+			Version: 1, Group: group, State: state, Bucket: last.bucket, AfterRouteKey: last.route.RouteKey,
+		})
+		if err != nil {
+			return RouteListPageResult{}, err
+		}
+		routes = routes[:limit]
+	}
+	result.Routes = make([]routeapi.ListedRoute, len(routes))
+	for index := range routes {
+		result.Routes[index] = routes[index].route
+	}
+	if !c.CacheAuthorized(serveIdentity) {
+		return RouteListPageResult{}, ErrPermitUnavailable
+	}
+	return result, nil
+}
+
+func (c *Client) listRouteBucketPage(
+	ctx context.Context,
+	readKey string,
+	request routeapi.ListRoutesRequest,
+) (routeapi.ListRoutesResponse, error) {
+	var lastErr error
+	for pass := 0; pass < 2; pass++ {
+		request.Strong = pass == 1
+		endpoints := c.localReadEndpoints(request.ShardID, readKey)
+		if request.Strong {
+			endpoints = c.shardEndpoints(request.ShardID)
+		}
+		for _, endpoint := range endpoints {
+			var response routeapi.ListRoutesResponse
+			if err := postJSONBounded(ctx, endpoint, routeapi.ListRoutesPath, request, &response); err != nil {
+				lastErr = err
+				continue
+			}
+			if err := response.ValidateFor(request); err != nil {
+				lastErr = err
+				continue
+			}
+			if response.Reason != "" {
+				lastErr = fmt.Errorf("routeclient: Route bucket is unavailable: %s", response.Reason)
+				continue
+			}
+			return response, nil
+		}
+	}
+	if lastErr == nil {
+		lastErr = errors.New("routeclient: Route bucket has no serving replica")
+	}
+	return routeapi.ListRoutesResponse{}, lastErr
+}
+
+func encodeRouteListCursor(cursor routeListCursorV1) (string, error) {
+	raw, err := json.Marshal(cursor)
+	if err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(raw), nil
+}
+
+func decodeRouteListCursor(token string) (routeListCursorV1, error) {
+	if len(token) > 16<<10 {
+		return routeListCursorV1{}, ErrInvalidRouteListToken
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(token)
+	if err != nil {
+		return routeListCursorV1{}, ErrInvalidRouteListToken
+	}
+	var cursor routeListCursorV1
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&cursor); err != nil {
+		return routeListCursorV1{}, ErrInvalidRouteListToken
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF || cursor.Version != 1 {
+		return routeListCursorV1{}, ErrInvalidRouteListToken
+	}
+	return cursor, nil
 }
 
 func (c *Client) ListRoutes(ctx context.Context, group string) (RouteListResult, error) {
