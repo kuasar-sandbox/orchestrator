@@ -804,7 +804,9 @@ func (f ExecutionFence) Validate() error {
 		if err := f.PlacementFailure.Validate(); err != nil {
 			return err
 		}
-		digest, err := PlacementFailureProofDigest(*f.PlacementFailure)
+		digest, err := PlacementFailureProofDigest(
+			f.Group, f.RouteKey, f.RegistryGeneration, *f.PlacementFailure,
+		)
 		if err != nil || digest != f.PlacementFailureDigest {
 			return errors.New("cluster: placement-failure fence proof digest mismatch")
 		}
@@ -882,7 +884,7 @@ func NewPlacementFailureFence(group, routeKey, registryGeneration string, failur
 	if err := failure.Validate(); err != nil {
 		return ExecutionFence{}, err
 	}
-	digest, err := PlacementFailureProofDigest(failure)
+	digest, err := PlacementFailureProofDigest(group, routeKey, registryGeneration, failure)
 	if err != nil {
 		return ExecutionFence{}, err
 	}
@@ -898,11 +900,25 @@ func NewPlacementFailureFence(group, routeKey, registryGeneration string, failur
 	}, nil
 }
 
-func PlacementFailureProofDigest(failure RoutePlacementFailureState) (string, error) {
+func PlacementFailureProofDigest(
+	group, routeKey, registryGeneration string,
+	failure RoutePlacementFailureState,
+) (string, error) {
+	if group == "" || routeKey == "" || registryGeneration == "" {
+		return "", errors.New("cluster: incomplete placement-failure proof identity")
+	}
 	if err := failure.Validate(); err != nil {
 		return "", err
 	}
-	raw, err := json.Marshal(failure)
+	value := struct {
+		Group              string                     `json:"group"`
+		RouteKey           string                     `json:"route_key"`
+		RegistryGeneration string                     `json:"registry_generation"`
+		Failure            RoutePlacementFailureState `json:"failure"`
+	}{
+		Group: group, RouteKey: routeKey, RegistryGeneration: registryGeneration, Failure: failure,
+	}
+	raw, err := json.Marshal(value)
 	if err != nil {
 		return "", err
 	}

@@ -168,8 +168,13 @@ func projectSandbox(snapshot PlacementLoadSnapshot, demand SandboxDemand) (Probe
 	if demand.SlotUnits > snapshot.SandboxSlotCapacity {
 		return ProbeReject, components, "sandbox can never fit slot capacity"
 	}
-	if snapshot.SandboxSlotHardLimit > 0 && sumExceeds(snapshot.SandboxSlotUsed, demand.SlotUnits, snapshot.SandboxSlotHardLimit) {
-		return ProbeReject, components, "sandbox slot hard limit reached"
+	if snapshot.SandboxSlotHardLimit > 0 {
+		if demand.SlotUnits > snapshot.SandboxSlotHardLimit {
+			return ProbeReject, components, "sandbox can never fit slot hard limit"
+		}
+		if sumExceeds(snapshot.SandboxSlotUsed, demand.SlotUnits, snapshot.SandboxSlotHardLimit) {
+			return ProbeStale, components, "sandbox slot hard limit is temporarily saturated"
+		}
 	}
 	components.SlotPPM = ratioPPM(saturatingAdd(snapshot.SandboxSlotUsed, demand.SlotUnits), snapshot.SandboxSlotCapacity)
 
@@ -208,8 +213,13 @@ func projectBuild(snapshot PlacementLoadSnapshot, demand BuildDemand) (ProbeClas
 		demand.Memory > snapshot.BuildMemoryCapacity || demand.Storage > snapshot.BuildStorageCapacity {
 		return ProbeReject, components, "build can never fit resource pool"
 	}
-	if snapshot.BuildSlotHardLimit > 0 && sumExceeds(snapshot.BuildSlotsUsed, demand.Slots, snapshot.BuildSlotHardLimit) {
-		return ProbeReject, components, "build slot hard limit reached"
+	if snapshot.BuildSlotHardLimit > 0 {
+		if demand.Slots > snapshot.BuildSlotHardLimit {
+			return ProbeReject, components, "build can never fit slot hard limit"
+		}
+		if sumExceeds(snapshot.BuildSlotsUsed, demand.Slots, snapshot.BuildSlotHardLimit) {
+			return ProbeStale, components, "build slot hard limit is temporarily saturated"
+		}
 	}
 	components.SlotPPM = ratioPPM(saturatingAdd(snapshot.BuildSlotsUsed, demand.Slots), snapshot.BuildSlotCapacity)
 	if demand.CPU > 0 {

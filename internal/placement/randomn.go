@@ -125,6 +125,9 @@ func randomN(nodes []CatalogNode, n int, source IndexSource) ([]cluster.Placemen
 	if n <= 0 {
 		return nil, errors.New("placement: candidate count must be positive")
 	}
+	if n > cluster.MaxPlacementCandidates {
+		n = cluster.MaxPlacementCandidates
+	}
 	if len(nodes) == 0 {
 		return nil, errors.New("placement: no statically eligible node")
 	}

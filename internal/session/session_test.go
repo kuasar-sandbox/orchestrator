@@ -1175,6 +1175,13 @@ func testRegistration(nodeID string, epoch, seq uint64, endpoint string) Registr
 	}
 }
 
+func TestRegistrationRejectsNoncanonicalDataEndpoint(t *testing.T) {
+	registration := testRegistration("node-1", 7, 1, "node-without-port")
+	if err := registration.Validate(); err == nil {
+		t.Fatal("node registration accepted a noncanonical data endpoint")
+	}
+}
+
 func testSnapshot(registration Registration) placement.PlacementLoadSnapshot {
 	return placement.PlacementLoadSnapshot{
 		NodeID: registration.NodeID, NodeEpoch: registration.NodeEpoch, SessionSeq: registration.SessionSeq,

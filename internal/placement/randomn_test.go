@@ -2,6 +2,7 @@ package placement
 
 import (
 	"errors"
+	"fmt"
 	"reflect"
 	"testing"
 
@@ -116,6 +117,23 @@ func TestPlaceNRejectsInvalidRandomSource(t *testing.T) {
 	nodes := []CatalogNode{{NodeID: "n1", SandboxSlotCapacity: 1}}
 	if _, err := PlaceSandboxN(nodes, SandboxDemand{SlotUnits: 1}, StaticPolicy{}, 1, &sequenceSource{values: []int{1}}); err == nil {
 		t.Fatal("out-of-range source was accepted")
+	}
+}
+
+func TestPlaceNCapsCandidatesAtWorkflowProtocolLimit(t *testing.T) {
+	nodes := make([]CatalogNode, cluster.MaxPlacementCandidates+2)
+	values := make([]int, cluster.MaxPlacementCandidates)
+	for index := range nodes {
+		nodes[index] = CatalogNode{NodeID: fmt.Sprintf("n%d", index), SandboxSlotCapacity: 1}
+	}
+	got, err := PlaceSandboxN(
+		nodes, SandboxDemand{SlotUnits: 1}, StaticPolicy{}, len(nodes), &sequenceSource{values: values},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != cluster.MaxPlacementCandidates {
+		t.Fatalf("candidate count = %d, want %d", len(got), cluster.MaxPlacementCandidates)
 	}
 }
 
