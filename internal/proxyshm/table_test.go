@@ -374,16 +374,19 @@ func TestCrossedReplayRevisionReclaimsDeleteTombstone(t *testing.T) {
 	if !tbl.DeleteRoute(routesync.RouteDelete{SandboxID: "s1", AuthorityRevision: 2}) {
 		t.Fatal("delete was not applied")
 	}
-	if err := tbl.Upsert(routesync.RouteEntry{SandboxID: "s2", AuthorityRevision: 3, State: routesync.StateRunning}); err == nil {
-		t.Fatal("replay reused a tombstone before its duplicate window closed")
-	}
-	tbl.Bookmark(false)
 	if err := tbl.Upsert(routesync.RouteEntry{SandboxID: "s2", AuthorityRevision: 3, State: routesync.StateRunning}); err != nil {
-		t.Fatalf("higher live revision did not reclaim crossed tombstone: %v", err)
+		t.Fatalf("higher replay revision did not reclaim crossed tombstone: %v", err)
 	}
 	if got, ok := tbl.Lookup("s2"); !ok || got.AuthorityRevision != 3 {
 		t.Fatalf("replacement route = %+v, ok=%v", got, ok)
 	}
+	if err := tbl.Upsert(routesync.RouteEntry{SandboxID: "s1", AuthorityRevision: 1, State: routesync.StateRunning}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := tbl.Lookup("s1"); ok {
+		t.Fatal("reclaimed tombstone lost the table-wide revision fence")
+	}
+	tbl.Bookmark(false)
 }
 
 func TestWorkerResolveWakesAndWaitsForSharedUpdate(t *testing.T) {
