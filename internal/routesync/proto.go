@@ -34,7 +34,7 @@ import (
 )
 
 // Version is the protocol version exchanged in Hello/Register.
-const Version = 3
+const Version = 4
 
 // PluginRegisterPattern is the config-socket route pattern (Go 1.22 method+wildcard)
 // a subscriber registers + opens its route stream on. PluginRegisterPath builds the
@@ -74,7 +74,11 @@ const (
 // so a proxy can serve the data plane on its own (no per-request callback). State
 // "paused"/missing makes the proxy send a Wake; "running" lets it forward.
 type RouteEntry struct {
-	SandboxID          string `json:"sid"`
+	SandboxID string `json:"sid"`
+	// AuthorityRevision orders route changes across execution replacements. It is
+	// zero only for a full snapshot row; live and replayed deltas are monotonic
+	// within one authority fingerprint.
+	AuthorityRevision  uint64 `json:"authority_revision,omitempty"`
 	NodeID             string `json:"node_id,omitempty"`
 	NodeEpoch          uint64 `json:"node_epoch,omitempty"`
 	RegistryGeneration string `json:"registry_generation,omitempty"`
@@ -107,6 +111,7 @@ type RouteEntry struct {
 // carry the complete identity and event watermark.
 type RouteDelete struct {
 	SandboxID          string `json:"sid"`
+	AuthorityRevision  uint64 `json:"authority_revision,omitempty"`
 	NodeID             string `json:"node_id,omitempty"`
 	NodeEpoch          uint64 `json:"node_epoch,omitempty"`
 	RegistryGeneration string `json:"registry_generation,omitempty"`
