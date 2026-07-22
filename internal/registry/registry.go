@@ -16,6 +16,7 @@ import (
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/cluster/shardkv"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
+	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 )
 
 // ErrNoNode is returned when no eligible node can host a sandbox.
@@ -424,6 +425,11 @@ func (r *Registry) ReserveSandbox(ctx context.Context, group, routeKey string, c
 	if group == "" || routeKey == "" {
 		return nil, fmt.Errorf("registry: group and route_key are required")
 	}
+	var err error
+	createConfig, err = sandboxcfg.NormalizeRestoreMetadata(createConfig)
+	if err != nil {
+		return nil, err
+	}
 	rec, rev, found, err := r.getSandboxForReserve(ctx, group, routeKey)
 	if err != nil {
 		return nil, err
@@ -629,7 +635,11 @@ func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, c
 		if placement == nil || placement.NodeID == "" {
 			return ErrNoNode
 		}
-		metadata, err := clusterstate.WithObjectLocation(placement.Config, clusterstate.ObjectLocation{Group: group, RouteKey: routeKey})
+		config, err := r.effectiveCreateConfig(ctx, group, placement.TemplateRef, placement.Config, createConfig)
+		if err != nil {
+			return err
+		}
+		metadata, err := clusterstate.WithObjectLocation(config, clusterstate.ObjectLocation{Group: group, RouteKey: routeKey})
 		if err != nil {
 			return err
 		}

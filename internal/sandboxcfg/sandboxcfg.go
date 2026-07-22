@@ -34,6 +34,7 @@ const (
 	NsMounts   = "kuasar-sandbox.mounts"
 	NsFiles    = "kuasar-sandbox.files"
 	NsMetadata = "kuasar-sandbox.metadata"
+	NsRestore  = "kuasar-sandbox.restore"
 )
 
 // NetworkSpec is the orchestrator's LOGICAL network model — broader than the guest
@@ -56,6 +57,12 @@ type NetworkSpec struct {
 type ResourceSpec struct {
 	Capacity    *rtconfig.CapacityConfig    `json:"capacity,omitempty" yaml:"capacity,omitempty"`
 	Allocatable *rtconfig.AllocatableConfig `json:"allocatable,omitempty" yaml:"allocatable,omitempty"`
+}
+
+// RestoreSpec is the tenant-selectable subset of the host restore policy. File
+// reference trust remains node-managed and is deliberately not represented here.
+type RestoreSpec struct {
+	Prefetch string `json:"prefetch,omitempty"`
 }
 
 // TapFD is the node-managed tapfd transport rendered into runtime config.
@@ -81,6 +88,7 @@ func (t TapFD) runtime() rtconfig.TapFDConfig {
 type SandboxSpec struct {
 	Resource ResourceSpec
 	Network  NetworkSpec
+	Restore  RestoreSpec
 	Launch   *rtconfig.LaunchConfig // bare profile only; e2b rejects (envd owns launch)
 	Init     []rtconfig.InitConfig
 	Mounts   []rtconfig.MountConfig
@@ -111,6 +119,13 @@ func ParseSpec(meta map[string]string) (SandboxSpec, error) {
 	if err := dec(NsNetwork, &s.Network); err != nil {
 		return s, err
 	}
+	if raw, ok := meta[NsRestore]; ok {
+		var err error
+		s.Restore, err = parseRestore(raw)
+		if err != nil {
+			return s, err
+		}
+	}
 	if raw := strings.TrimSpace(meta[NsLaunch]); raw != "" {
 		var l rtconfig.LaunchConfig
 		if err := yaml.Unmarshal([]byte(raw), &l); err != nil {
@@ -134,6 +149,70 @@ func ParseSpec(meta map[string]string) (SandboxSpec, error) {
 		return s, err
 	}
 	return s, nil
+}
+
+// NormalizeRestoreMetadata validates and canonicalizes only the restore
+// namespace. An absent namespace is left absent. When it is present, the value
+// must be one JSON object containing only an optional prefetch field whose value
+// is "off" or "memory". When the namespace is present, the returned map is a
+// clone so callers never mutate a request, template, or stored record while
+// validating it.
+func NormalizeRestoreMetadata(meta map[string]string) (map[string]string, error) {
+	raw, ok := meta[NsRestore]
+	if !ok {
+		return meta, nil
+	}
+	restore, err := parseRestore(raw)
+	if err != nil {
+		return nil, err
+	}
+	b, err := json.Marshal(restore)
+	if err != nil {
+		return nil, fmt.Errorf("sandboxcfg: metadata[%q]: %w", NsRestore, err)
+	}
+	out := make(map[string]string, len(meta))
+	for k, v := range meta {
+		out[k] = v
+	}
+	out[NsRestore] = string(b)
+	return out, nil
+}
+
+func parseRestore(raw string) (RestoreSpec, error) {
+	var restore RestoreSpec
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" || trimmed[0] != '{' {
+		return restore, fmt.Errorf("sandboxcfg: metadata[%q] must be a JSON object", NsRestore)
+	}
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(trimmed), &object); err != nil {
+		return restore, fmt.Errorf("sandboxcfg: metadata[%q] is not a valid JSON object: %w", NsRestore, err)
+	}
+	for field := range object {
+		if field != "prefetch" {
+			return restore, fmt.Errorf("sandboxcfg: metadata[%q] contains unknown field %q", NsRestore, field)
+		}
+	}
+	prefetch, ok := object["prefetch"]
+	if !ok {
+		return restore, nil
+	}
+	var value any
+	if err := json.Unmarshal(prefetch, &value); err != nil {
+		return restore, fmt.Errorf("sandboxcfg: metadata[%q].prefetch is invalid: %w", NsRestore, err)
+	}
+	mode, ok := value.(string)
+	if !ok {
+		return restore, fmt.Errorf("sandboxcfg: metadata[%q].prefetch must be a string", NsRestore)
+	}
+	if mode == "" {
+		return restore, fmt.Errorf("sandboxcfg: metadata[%q].prefetch %q invalid (want off|memory)", NsRestore, mode)
+	}
+	if _, err := rtconfig.ParsePrefetchMode(mode); err != nil {
+		return restore, fmt.Errorf("sandboxcfg: metadata[%q].prefetch %q invalid (want off|memory)", NsRestore, mode)
+	}
+	restore.Prefetch = mode
+	return restore, nil
 }
 
 // capacityJSON is the canonical snake_case JSON shape for the resource capacity,
@@ -278,6 +357,12 @@ func (p Params) build() (*rtconfig.SandboxConfig, error) {
 	// manifest; restore (snp/resume) lets snapshot.cfg fill it (omit).
 	if p.Template.Kind == types.KindImg {
 		c.Boot.Root.Base = p.Template.ManifestRef()
+	}
+	// Restore policy is host-only and meaningful only when this invocation has a
+	// restore ref. Keep image cold boots free of restore configuration while
+	// retaining the policy in Sandbox.Metadata for a later pause/resume.
+	if p.RestoreRef() != "" {
+		c.Restore.Prefetch = p.Spec.Restore.Prefetch
 	}
 	// Cold boot needs a pre-formatted ext4 source for the writable upper; restore
 	// gets the overlay chain from the snapshot.

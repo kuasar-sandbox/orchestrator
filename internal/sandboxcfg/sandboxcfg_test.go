@@ -20,6 +20,7 @@ func TestParseSpecNamespaces(t *testing.T) {
 	meta := map[string]string{
 		NsNetwork:  `{"hostname":"h1","dns":["1.1.1.1","8.8.8.8"],"inner_ip":"10.0.0.5/30","nexthop":"10.0.0.4","transit_gateway_ip":"172.16.0.1","transit_geneve_vni":4242,"transit_mac":"02:00:00:00:00:09"}`,
 		NsResource: `{"capacity":{"cpu":4,"memory":"8GiB"}}`,
+		NsRestore:  `{"prefetch":"memory"}`,
 		NsLaunch:   `{"exec":"/app","args":["-x"],"restart":"always","stop_signal":"SIGINT","user":"1000:1000"}`,
 		NsMounts:   `[{"target":"/data","type":"tmpfs"}]`,
 		NsFiles:    `[{"path":"/etc/app.conf","content":"k=v","mode":"0644"}]`,
@@ -38,6 +39,9 @@ func TestParseSpecNamespaces(t *testing.T) {
 	if s.Resource.Capacity == nil || s.Resource.Capacity.CPU != 4 || s.Resource.Capacity.Memory != "8GiB" {
 		t.Fatalf("resource parsed wrong: %+v", s.Resource)
 	}
+	if s.Restore.Prefetch != "memory" {
+		t.Fatalf("restore parsed wrong: %+v", s.Restore)
+	}
 	// stop_signal (snake_case) must bind via the runtime config's yaml tags.
 	if s.Launch == nil || s.Launch.Exec != "/app" || s.Launch.StopSignal != "SIGINT" || s.Launch.User != "1000:1000" {
 		t.Fatalf("launch parsed wrong: %+v", s.Launch)
@@ -53,6 +57,49 @@ func TestParseSpecNamespaces(t *testing.T) {
 	}
 	if s.Metadata["e2b.start_cmd"] != "npm run start" {
 		t.Fatalf("metadata parsed wrong: %+v", s.Metadata)
+	}
+}
+
+func TestNormalizeRestoreMetadata(t *testing.T) {
+	if got, err := NormalizeRestoreMetadata(nil); err != nil || got != nil {
+		t.Fatalf("absent restore: got=%v err=%v", got, err)
+	}
+	original := map[string]string{NsRestore: " { \"prefetch\" : \"memory\" } ", "keep": "value"}
+	got, err := NormalizeRestoreMetadata(original)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got[NsRestore] != `{"prefetch":"memory"}` || got["keep"] != "value" {
+		t.Fatalf("normalized metadata = %+v", got)
+	}
+	if original[NsRestore] == got[NsRestore] {
+		t.Fatal("normalization mutated or reused the caller's restore value")
+	}
+	if got, err := NormalizeRestoreMetadata(map[string]string{NsRestore: `{}`}); err != nil || got[NsRestore] != `{}` {
+		t.Fatalf("missing prefetch: got=%v err=%v", got, err)
+	}
+
+	bad := map[string]string{
+		"empty":           ``,
+		"null-object":     `null`,
+		"array":           `[]`,
+		"invalid-json":    `{`,
+		"trailing":        `{"prefetch":"memory"} {}`,
+		"unknown":         `{"other":true}`,
+		"file-refs":       `{"file_refs":"trust"}`,
+		"wrong-case":      `{"Prefetch":"memory"}`,
+		"bad-enum":        `{"prefetch":"disk"}`,
+		"empty-enum":      `{"prefetch":""}`,
+		"non-string":      `{"prefetch":true}`,
+		"null-prefetch":   `{"prefetch":null}`,
+		"object-prefetch": `{"prefetch":{}}`,
+	}
+	for name, raw := range bad {
+		t.Run(name, func(t *testing.T) {
+			if _, err := NormalizeRestoreMetadata(map[string]string{NsRestore: raw}); err == nil {
+				t.Fatalf("accepted invalid restore value %q", raw)
+			}
+		})
 	}
 }
 
@@ -126,6 +173,50 @@ func TestBuildRendersTapFDSocket(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Fatalf("rendered yaml missing %q:\n%s", want, out)
 		}
+	}
+}
+
+func TestBuildRendersPrefetchOnlyForRestore(t *testing.T) {
+	cold := baseParams(types.ProfileE2B)
+	cold.Spec.Restore.Prefetch = "memory"
+	b, err := cold.BuildYAML()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(b), "prefetch:") || strings.Contains(string(b), "restore:") {
+		t.Fatalf("cold boot rendered restore policy:\n%s", b)
+	}
+
+	restore := baseParams(types.ProfileE2B)
+	restore.Template.Kind = types.KindSnp
+	restore.Sandbox.TemplateID = restore.Template.String()
+	restore.Spec.Restore.Prefetch = "memory"
+	b, err = restore.BuildYAML()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), "restore:") || !strings.Contains(string(b), "prefetch: memory") {
+		t.Fatalf("snapshot restore omitted prefetch policy:\n%s", b)
+	}
+
+	resume := baseParams(types.ProfileE2B)
+	resume.Sandbox.SnapshotRef = strings.Repeat("b", 64)
+	resume.Spec.Restore.Prefetch = "memory"
+	b, err = resume.BuildYAML()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), "restore:") || !strings.Contains(string(b), "prefetch: memory") {
+		t.Fatalf("paused image resume omitted prefetch policy:\n%s", b)
+	}
+
+	restore.Spec.Restore.Prefetch = "off"
+	b, err = restore.BuildYAML()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), `prefetch: "off"`) {
+		t.Fatalf("snapshot restore omitted explicit off policy:\n%s", b)
 	}
 }
 

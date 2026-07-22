@@ -148,14 +148,6 @@ func (o *Orchestrator) Create(ctx context.Context, req api.CreateReq) (*types.Sa
 			return nil, err
 		}
 	}
-	id, err := uuid.NewV7()
-	if err != nil {
-		return nil, fmt.Errorf("orch: new id: %w", err)
-	}
-	sid := id.String()
-	envdTok, _ := keys.MintToken()
-	trafTok, _ := keys.MintToken()
-
 	// Layer the template's declared config (builds.metadata_json) under the create's
 	// own config — create wins per namespace. Best-effort: a self-describing or
 	// foreign template may have no local build record (then it's just the create's).
@@ -163,6 +155,22 @@ func (o *Orchestrator) Create(ctx context.Context, req api.CreateReq) (*types.Sa
 	if tb := o.templateBuild(ctx, req.APIKey, req.TemplateID); tb != nil && len(tb.Metadata) > 0 {
 		meta = sandboxcfg.MergeMetadata(tb.Metadata, req.Metadata)
 	}
+	// Validate the final template + create restore policy before allocating an
+	// identity, minting credentials, creating directories, attaching networking,
+	// or starting a process. Normalization also gives every later trust boundary
+	// one canonical value to parse.
+	meta, err = sandboxcfg.NormalizeRestoreMetadata(meta)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
+	}
+
+	id, err := uuid.NewV7()
+	if err != nil {
+		return nil, fmt.Errorf("orch: new id: %w", err)
+	}
+	sid := id.String()
+	envdTok, _ := keys.MintToken()
+	trafTok, _ := keys.MintToken()
 
 	sb := &types.Sandbox{
 		ID:                 sid,

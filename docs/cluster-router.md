@@ -95,16 +95,21 @@ router 不参与 registry 成员健康检测,不订阅 route,也不订阅 node_l
 
 | 请求 | 必需身份 | 行为 |
 |---|---|---|
-| create | group + route_key(可缺省生成) | 定位 route owner 后调用 `ReserveSandbox` |
+| create | group + route_key(可缺省生成) | 提取并校验本次请求的 `kuasar-sandbox.restore`,定位 route owner 后随 `ReserveSandbox` 传递 |
 | connect/resume | group + route_key / sandbox_id | 定位 route owner 后调用 `ReserveSandbox` 恢复 |
 | kill | group + route_key + sandbox_id | 定位 route owner 后由 registry 经 node-link 下发 `CmdDelete` |
 | get/connect/pause/timeout/export | group + route_key + sandbox_id | route owner 解析 node 后转发到 node 控制面 |
 | list/get | group | 读取 group 分片 |
 | data plane | group + route_key + sandbox_id + port | cache 命中后建立一次性 CONNECT;miss Reserve |
-| build register | group + build_id | 生成稳定 id 后调用 `ReserveBuild` |
+| build register | group + build_id | 生成稳定 id,把 `X-Kuasar-Sandbox-Restore` 作为模板默认值随 `ReserveBuild` 传递 |
 | build status/files | group + build_id | 定位 build node 后转发 |
 
 `route_key` 是稳定会话身份,`sandbox_id` 是当前实例身份。cluster 内部总是同时维护二者。
+
+create 可在 body metadata 中携 `kuasar-sandbox.restore`,或使用
+`X-Kuasar-Sandbox-Restore`;同一请求 Header 胜出。router 只提取该命名空间,不会把
+Prefetch 变成 group 或节点统一策略。register/trigger 的最终模板默认值随 READY build
+记录保存;create 未显式声明时按最终 template ID 继承,显式 `off`/`memory` 始终胜出。
 
 ## 6. 缓存模型
 
@@ -182,7 +187,7 @@ router 校验 API key 与 group 关系时调用 route owner `verify-key`;route o
 
 | 操作 | 行为 |
 |---|---|
-| create/connect | 调 Reserve;READY 后返回 |
+| create/connect | 新建 create 随 Reserve 传递请求级 restore policy;已有实例的 connect 读取其持久化 metadata;READY 后返回 |
 | kill | route owner 精确匹配 group + route_key + sandbox_id,经 node-link 下发 `CmdDelete` |
 | get/connect/pause/timeout/export | route owner 解析 node 后转发 |
 | get/list | 读 group route_link |

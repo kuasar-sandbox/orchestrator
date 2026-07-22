@@ -1,6 +1,7 @@
 package registry
 
 import (
+	"bytes"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -26,5 +27,17 @@ func TestServeRouteLinkOmitsRuntimeSnapshotEndpoints(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, RouteLinkListPath, nil)
 	if _, pattern := mux.Handler(req); pattern != RouteLinkListPath {
 		t.Fatalf("normal route-link API pattern=%q, want %q", pattern, RouteLinkListPath)
+	}
+}
+
+func TestServeReserveRejectsInvalidRestoreBeforeReservation(t *testing.T) {
+	mux := http.NewServeMux()
+	New(NewStores(), nil, 0, nil).ServeRouteLink(mux)
+	body := []byte(`{"config":{"kuasar-sandbox.restore":"{\"prefetch\":\"disk\"}"}}`)
+	req := httptest.NewRequest(http.MethodPost, RouteLinkReservePath+"?group=/g&route_key=rk", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d body=%q, want 400", rec.Code, rec.Body.String())
 	}
 }

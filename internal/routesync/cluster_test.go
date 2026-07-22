@@ -54,6 +54,13 @@ func TestNodeLinkCodecRoundTrip(t *testing.T) {
 	if b.Cmd == nil || b.Cmd.BuildID != "build-1" || b.Cmd.Profile != "bare" {
 		t.Fatalf("build_register round-trip: %+v", b.Cmd)
 	}
+	be := roundTrip(t, &Msg{Type: TypeBuildEvent, Build: &BuildEvent{
+		BuildID: "build-1", State: "ready", TemplateID: "bare-img-final",
+		Restore: `{"prefetch":"memory"}`,
+	}})
+	if be.Build == nil || be.Build.TemplateID != "bare-img-final" || be.Build.Restore != `{"prefetch":"memory"}` {
+		t.Fatalf("build_event round-trip: %+v", be.Build)
+	}
 
 	// Sandbox routes carry runtime state only; the node-link owner supplies cluster identity.
 	r := roundTrip(t, &Msg{Type: TypeUpsert, Route: &RouteEntry{

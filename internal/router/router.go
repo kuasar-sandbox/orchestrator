@@ -12,6 +12,7 @@ import (
 	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -29,6 +30,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/metrics"
 	proxypkg "github.com/kuasar-sandbox/orchestrator/internal/proxy"
 	"github.com/kuasar-sandbox/orchestrator/internal/registry"
+	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
@@ -36,6 +38,7 @@ import (
 const (
 	HeaderGroup     = "X-Kuasar-Sandbox-Group"
 	HeaderRouteKey  = "X-Kuasar-Route-Key"
+	HeaderRestore   = "X-Kuasar-Sandbox-Restore"
 	HeaderAPIKey    = "X-API-KEY"
 	HeaderAccessTok = "X-Access-Token"
 )
@@ -269,10 +272,20 @@ func (rt *Router) handleCreate(w http.ResponseWriter, r *http.Request) {
 	if routeKey == "" {
 		routeKey = newRouteKey()
 	}
-	res, err := rt.reserveByKey(r.Context(), group, routeKey)
+	restore, err := createRestoreMetadata(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	res, err := rt.reserveByKey(r.Context(), group, routeKey, restore)
 	if err != nil {
 		rt.log.Warn("router: reserve", "group", group, "err", err)
-		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		status := http.StatusServiceUnavailable
+		var routeErr *routeLinkCallError
+		if errors.As(err, &routeErr) && routeErr.status == http.StatusBadRequest {
+			status = http.StatusBadRequest
+		}
+		http.Error(w, err.Error(), status)
 		return
 	}
 	// Minimal e2b create response (the SDK keys off sandboxID; the data plane uses
@@ -288,6 +301,31 @@ func (rt *Router) handleCreate(w http.ResponseWriter, r *http.Request) {
 		"trafficAccessToken": res.TrafficAccessToken,
 		"domain":             rt.domain,
 	})
+}
+
+// createRestoreMetadata narrows cluster create input to the one supported
+// sandbox policy. Body metadata is read first and the dedicated header wins.
+func createRestoreMetadata(r *http.Request) (map[string]string, error) {
+	var body struct {
+		Metadata map[string]string `json:"metadata"`
+	}
+	if r.Body != nil {
+		err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body)
+		if err != nil && !errors.Is(err, io.EOF) {
+			return nil, fmt.Errorf("bad create body: %w", err)
+		}
+	}
+	var restore map[string]string
+	if raw, ok := body.Metadata[sandboxcfg.NsRestore]; ok {
+		restore = map[string]string{sandboxcfg.NsRestore: raw}
+	}
+	if raw, present := restoreHeaderValue(r.Header); present {
+		if restore == nil {
+			restore = map[string]string{}
+		}
+		restore[sandboxcfg.NsRestore] = raw
+	}
+	return sandboxcfg.NormalizeRestoreMetadata(restore)
 }
 
 // --- build control plane ---
@@ -337,7 +375,12 @@ func (rt *Router) handleBuildRegister(w http.ResponseWriter, r *http.Request) {
 	if body.CPUCount > 0 || body.MemoryMB > 0 {
 		resources = &buildResources{CPU: body.CPUCount * 1000, Mem: int64(body.MemoryMB) << 20}
 	}
-	res, err := rt.routeLinkReserveBuild(r.Context(), group, profile, resources)
+	restore, err := restoreHeaderMetadata(r.Header)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	res, err := rt.routeLinkReserveBuild(r.Context(), group, profile, resources, restore)
 	if err != nil {
 		rt.log.Warn("router: reserve-build", "group", group, "err", err)
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
@@ -353,6 +396,19 @@ func (rt *Router) handleBuildRegister(w http.ResponseWriter, r *http.Request) {
 		"public": false, "names": nonEmptySlice(body.Name), "tags": body.Tags, "aliases": body.Tags,
 		"profile": res.Profile,
 	})
+}
+
+func restoreHeaderMetadata(header http.Header) (map[string]string, error) {
+	raw, present := restoreHeaderValue(header)
+	if !present {
+		return nil, nil
+	}
+	return sandboxcfg.NormalizeRestoreMetadata(map[string]string{sandboxcfg.NsRestore: raw})
+}
+
+func restoreHeaderValue(header http.Header) (string, bool) {
+	_, present := header[http.CanonicalHeaderKey(HeaderRestore)]
+	return header.Get(HeaderRestore), present
 }
 
 // buildResources mirrors routesync.BuildResources for the control request body.
@@ -641,7 +697,7 @@ func (rt *Router) serveData(w http.ResponseWriter, r *http.Request, host string)
 	// Not ready (paused / lagging): data-plane traffic wakes it via Reserve (§1.4),
 	// then forwards to the resumed node.
 	if (rr.State != "ready" || rr.DataEndpoint == "") && rr.Group != "" {
-		if res, err := rt.reserveByKey(r.Context(), rr.Group, rr.RouteKey); err == nil && res.DataEndpoint != "" {
+		if res, err := rt.reserveByKey(r.Context(), rr.Group, rr.RouteKey, nil); err == nil && res.DataEndpoint != "" {
 			rr = &routeResolve{
 				SID: res.SID, Group: rr.Group, RouteKey: rr.RouteKey, NodeID: res.NodeID,
 				DataEndpoint: res.DataEndpoint, AccessToken: res.AccessToken,
@@ -743,7 +799,7 @@ func (rt *Router) serveDataByKey(w http.ResponseWriter, r *http.Request, group, 
 	}
 	rr := rt.cachedRouteByKey(group, routeKey)
 	if rr == nil || rr.State != "ready" || rr.DataEndpoint == "" {
-		res, err := rt.reserveByKey(r.Context(), group, routeKey)
+		res, err := rt.reserveByKey(r.Context(), group, routeKey, nil)
 		if err != nil || res.DataEndpoint == "" {
 			http.Error(w, "reserve failed", http.StatusServiceUnavailable)
 			return
@@ -965,16 +1021,17 @@ func (rt *Router) cachedRouteByKey(group, routeKey string) *routeResolve {
 
 // --- control client ---
 
-func (rt *Router) routeLinkReserve(ctx context.Context, group, routeKey string) (*reserveResult, error) {
+func (rt *Router) routeLinkReserve(ctx context.Context, group, routeKey string, config map[string]string) (*reserveResult, error) {
 	path := fmt.Sprintf("%s?group=%s&route_key=%s", registry.RouteLinkReservePath, url.QueryEscape(group), url.QueryEscape(routeKey))
+	body, _ := json.Marshal(registry.SandboxReserveReq{Config: config})
 	var res reserveResult
-	if err := rt.routeLinkCall(ctx, group, http.MethodPost, path, nil, nil, &res); err != nil {
+	if err := rt.routeLinkCall(ctx, group, http.MethodPost, path, body, map[string]string{"Content-Type": "application/json"}, &res); err != nil {
 		return nil, err
 	}
 	return &res, nil
 }
 
-func (rt *Router) reserveByKey(ctx context.Context, group, routeKey string) (*reserveResult, error) {
+func (rt *Router) reserveByKey(ctx context.Context, group, routeKey string, config map[string]string) (*reserveResult, error) {
 	key := routeCacheKey(group, routeKey)
 	rt.reserveMu.Lock()
 	if f := rt.reserveInFlight[key]; f != nil {
@@ -990,7 +1047,7 @@ func (rt *Router) reserveByKey(ctx context.Context, group, routeKey string) (*re
 	rt.reserveInFlight[key] = f
 	rt.reserveMu.Unlock()
 
-	f.res, f.err = rt.routeLinkReserve(ctx, group, routeKey)
+	f.res, f.err = rt.routeLinkReserve(ctx, group, routeKey, config)
 	if f.err == nil && f.res != nil {
 		rt.rememberRoute(&routeResolve{
 			SID: f.res.SID, Group: group, RouteKey: routeKey, NodeID: f.res.NodeID,
@@ -1007,9 +1064,9 @@ func (rt *Router) reserveByKey(ctx context.Context, group, routeKey string) (*re
 	return f.res, f.err
 }
 
-func (rt *Router) routeLinkReserveBuild(ctx context.Context, group string, profile types.Profile, resources *buildResources) (*buildReserveResult, error) {
+func (rt *Router) routeLinkReserveBuild(ctx context.Context, group string, profile types.Profile, resources *buildResources, metadata map[string]string) (*buildReserveResult, error) {
 	reqBody, _ := json.Marshal(map[string]any{
-		"group": group, "build_id": "bld-" + randomHexID(), "template_id": "transient-" + randomHexID(), "profile": profile, "resources": resources,
+		"group": group, "build_id": "bld-" + randomHexID(), "template_id": "transient-" + randomHexID(), "profile": profile, "resources": resources, "metadata": metadata,
 	})
 	resp, err := rt.routeLinkHTTP(ctx, group, http.MethodPost, registry.RouteLinkReserveBuildPath, reqBody, map[string]string{"Content-Type": "application/json"})
 	if err != nil {
@@ -1064,9 +1121,20 @@ func (rt *Router) routeLinkCall(ctx context.Context, group, method, path string,
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return fmt.Errorf("route_link %s: %s: %s", path, resp.Status, strings.TrimSpace(string(b)))
+		return &routeLinkCallError{status: resp.StatusCode, path: path, response: resp.Status, body: strings.TrimSpace(string(b))}
 	}
 	return json.NewDecoder(resp.Body).Decode(out)
+}
+
+type routeLinkCallError struct {
+	status   int
+	path     string
+	response string
+	body     string
+}
+
+func (e *routeLinkCallError) Error() string {
+	return fmt.Sprintf("route_link %s: %s: %s", e.path, e.response, e.body)
 }
 
 func (rt *Router) routeLinkHTTP(ctx context.Context, group, method, path string, body []byte, headers map[string]string) (*http.Response, error) {

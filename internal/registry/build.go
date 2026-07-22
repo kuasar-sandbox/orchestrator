@@ -8,6 +8,7 @@ import (
 
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
+	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
@@ -45,6 +46,11 @@ const (
 
 var errNodeBuildIDConflict = errors.New("registry: build id is already owned by another group on this node")
 
+// ErrTemplateRestoreConflict rejects an implicit template default when READY
+// builds for the same final template identity disagree. A create-level restore
+// policy bypasses this lookup and therefore always wins.
+var ErrTemplateRestoreConflict = errors.New("registry: conflicting restore defaults for template")
+
 // ReserveBuild places a build on a resource-eligible node and pre-provisions it
 // (cluster.md): the registry assigns the build/template ids, resource-aware
 // PlaceBuild picks a node, the BuildStore commit RESERVES that node's build pool
@@ -58,7 +64,12 @@ func (r *Registry) ReserveBuild(ctx context.Context, req BuildReserveReq) (*Buil
 	if !req.Profile.Valid() {
 		return nil, fmt.Errorf("registry: unknown build profile %q", req.Profile)
 	}
-	metadata, err := clusterstate.WithObjectLocation(req.Metadata, clusterstate.ObjectLocation{Group: req.Group})
+	restoreMetadata, err := sandboxcfg.NormalizeRestoreMetadata(req.Metadata)
+	if err != nil {
+		return nil, err
+	}
+	restore := restoreMetadata[sandboxcfg.NsRestore]
+	metadata, err := clusterstate.WithObjectLocation(restoreMetadata, clusterstate.ObjectLocation{Group: req.Group})
 	if err != nil {
 		return nil, err
 	}
@@ -85,6 +96,19 @@ func (r *Registry) ReserveBuild(ctx context.Context, req BuildReserveReq) (*Buil
 		} else if found {
 			if rec.Profile != req.Profile {
 				return nil, fmt.Errorf("registry: build %s profile is %q, requested %q", req.BuildID, rec.Profile, req.Profile)
+			}
+			if rec.occupies() {
+				existingMode, err := effectiveRestoreMode(rec.Restore)
+				if err != nil {
+					return nil, err
+				}
+				requestedMode, err := effectiveRestoreMode(restore)
+				if err != nil {
+					return nil, err
+				}
+				if existingMode != requestedMode {
+					return nil, fmt.Errorf("registry: build %s restore policy conflicts with existing registration", req.BuildID)
+				}
 			}
 			return r.buildReserveResult(ctx, rec), nil
 		}
@@ -131,7 +155,7 @@ func (r *Registry) ReserveBuild(ctx context.Context, req BuildReserveReq) (*Buil
 			continue
 		}
 		// Commit the group build record after node-owner admission succeeds.
-		rec := &BuildRecord{Group: req.Group, BuildID: buildID, NodeID: id, Profile: req.Profile, Resources: resources, State: BuildRegistered, TemplateID: templateID}
+		rec := &BuildRecord{Group: req.Group, BuildID: buildID, NodeID: id, Profile: req.Profile, Resources: resources, State: BuildRegistered, TemplateID: templateID, Restore: restore}
 		if err := r.stores.PutBuild(ctx, rec); err != nil {
 			r.releaseBuildAdmission(id, req.Group, buildID)
 			return nil, err
@@ -236,10 +260,27 @@ func (r *Registry) applyBuildEvent(ctx context.Context, nodeID string, e *routes
 	if rec.NodeID != "" && nodeID != "" && rec.NodeID != nodeID {
 		return
 	}
-	rec.State = BuildState(e.State)
-	if e.TemplateID != "" {
+	nextState := BuildState(e.State)
+	if nextState == BuildReady {
+		finalTemplate, err := types.ParseTemplateID(e.TemplateID)
+		if err == nil && finalTemplate.Profile != rec.Profile {
+			err = fmt.Errorf("profile %q does not match build profile %q", finalTemplate.Profile, rec.Profile)
+		}
+		if err != nil {
+			r.log.Warn("registry: reject invalid ready build template", "node", nodeID, "build", rec.BuildID, "template", e.TemplateID, "err", err)
+			return
+		}
+		restore, err := normalizeRestoreValue(e.Restore)
+		if err != nil {
+			r.log.Warn("registry: reject invalid build restore policy", "node", nodeID, "build", rec.BuildID, "err", err)
+			return
+		}
+		rec.TemplateID = e.TemplateID
+		rec.Restore = restore
+	} else if e.TemplateID != "" {
 		rec.TemplateID = e.TemplateID
 	}
+	rec.State = nextState
 	rec.Reason = e.Reason
 	terminal := !rec.occupies()
 	if terminal {
@@ -258,6 +299,92 @@ func (r *Registry) applyBuildEvent(ctx context.Context, nodeID string, e *routes
 		r.log.Warn("registry: persist build event", "node", nodeID, "build", rec.BuildID, "state", rec.State, "err", writeErr)
 		return
 	}
+}
+
+func normalizeRestoreValue(raw string) (string, error) {
+	if raw == "" {
+		return "", nil
+	}
+	metadata, err := sandboxcfg.NormalizeRestoreMetadata(map[string]string{sandboxcfg.NsRestore: raw})
+	if err != nil {
+		return "", err
+	}
+	return metadata[sandboxcfg.NsRestore], nil
+}
+
+func effectiveRestoreMode(raw string) (string, error) {
+	normalized, err := normalizeRestoreValue(raw)
+	if err != nil {
+		return "", err
+	}
+	var metadata map[string]string
+	if normalized != "" {
+		metadata = map[string]string{sandboxcfg.NsRestore: normalized}
+	}
+	spec, err := sandboxcfg.ParseSpec(metadata)
+	if err != nil {
+		return "", err
+	}
+	if spec.Restore.Prefetch == "" {
+		return "off", nil
+	}
+	return spec.Restore.Prefetch, nil
+}
+
+// effectiveCreateConfig removes any group-provided restore key and then applies
+// either the explicit create value or the unambiguous READY template default.
+func (r *Registry) effectiveCreateConfig(ctx context.Context, group, templateID string, placed, create map[string]string) (map[string]string, error) {
+	effective := cloneStringMap(placed)
+	delete(effective, sandboxcfg.NsRestore)
+	if raw, ok := create[sandboxcfg.NsRestore]; ok {
+		if effective == nil {
+			effective = map[string]string{}
+		}
+		effective[sandboxcfg.NsRestore] = raw
+		return effective, nil
+	}
+	restore, found, err := r.readyTemplateRestore(ctx, group, templateID)
+	if err != nil {
+		return nil, err
+	}
+	if found && restore != "" {
+		if effective == nil {
+			effective = map[string]string{}
+		}
+		effective[sandboxcfg.NsRestore] = restore
+	}
+	return effective, nil
+}
+
+func (r *Registry) readyTemplateRestore(ctx context.Context, group, templateID string) (string, bool, error) {
+	if templateID == "" {
+		return "", false, nil
+	}
+	var restore string
+	var mode string
+	var found bool
+	err := r.stores.RangeBuildsInGroup(ctx, group, func(build *BuildRecord) error {
+		if build.State != BuildReady || build.TemplateID != templateID {
+			return nil
+		}
+		normalized, err := normalizeRestoreValue(build.Restore)
+		if err != nil {
+			return err
+		}
+		effectiveMode, err := effectiveRestoreMode(normalized)
+		if err != nil {
+			return err
+		}
+		if !found {
+			restore, mode, found = normalized, effectiveMode, true
+			return nil
+		}
+		if mode != effectiveMode {
+			return fmt.Errorf("%w %q in group %q", ErrTemplateRestoreConflict, templateID, group)
+		}
+		return nil
+	})
+	return restore, found, err
 }
 
 func retryTerminalBuildStore(ctx context.Context, operation func(context.Context) error) error {

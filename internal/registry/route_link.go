@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
+	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 )
 
 // route_link paths. Routers dial this link for group-scoped route/build
@@ -34,6 +36,13 @@ type RouteResolve struct {
 	TrafficAccessToken string `json:"traffic_access_token,omitempty"`
 	TargetPort         int    `json:"target_port,omitempty"`
 	State              string `json:"state"`
+}
+
+// SandboxReserveReq is the router-to-registry create payload. Config remains a
+// map because it follows the existing placement command carrier, but cluster
+// ingress currently admits only the restore namespace into it.
+type SandboxReserveReq struct {
+	Config map[string]string `json:"config,omitempty"`
 }
 
 // ServeRouteLink mounts the router/admin-facing route_link API.
@@ -110,6 +119,12 @@ func (r *Registry) serveReserveBuild(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, fmt.Sprintf("unknown build profile %q", br.Profile), http.StatusBadRequest)
 		return
 	}
+	metadata, err := sandboxcfg.NormalizeRestoreMetadata(br.Metadata)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	br.Metadata = metadata
 	res, err := r.ReserveBuild(req.Context(), br)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
@@ -136,9 +151,26 @@ func (r *Registry) serveReserve(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, "group and route_key are required", http.StatusBadRequest)
 		return
 	}
-	res, err := r.ReserveSandbox(req.Context(), group, routeKey, nil)
+	var body SandboxReserveReq
+	if req.Body != nil {
+		err := json.NewDecoder(req.Body).Decode(&body)
+		if err != nil && !errors.Is(err, io.EOF) {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+	}
+	config, err := sandboxcfg.NormalizeRestoreMetadata(body.Config)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	res, err := r.ReserveSandbox(req.Context(), group, routeKey, config)
+	if err != nil {
+		status := http.StatusServiceUnavailable
+		if errors.Is(err, ErrTemplateRestoreConflict) {
+			status = http.StatusBadRequest
+		}
+		http.Error(w, err.Error(), status)
 		return
 	}
 	writeJSON(w, res)

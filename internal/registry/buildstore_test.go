@@ -4,14 +4,20 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/cluster/shardkv"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
+	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
+
+func testFinalTemplateID(profile types.Profile, keyChar string) string {
+	return fmt.Sprintf("%s-snp-%s", profile, strings.Repeat(keyChar, 64))
+}
 
 type recordingNodeOwner struct {
 	allow        bool
@@ -93,9 +99,193 @@ func TestReserveBuildUsesNodeOwnerBoundary(t *testing.T) {
 	if res.Profile != types.ProfileBare || len(admitter.commands) != 1 || admitter.commands[0].Profile != string(types.ProfileBare) {
 		t.Fatalf("profile did not reach build_register: result=%q commands=%+v", res.Profile, admitter.commands)
 	}
-	reg.applyBuildEvent(ctx, "n1", &routesync.BuildEvent{BuildID: res.BuildID, State: string(BuildReady)})
+	reg.applyBuildEvent(ctx, "n1", &routesync.BuildEvent{
+		BuildID: res.BuildID, State: string(BuildReady), TemplateID: testFinalTemplateID(types.ProfileBare, "a"),
+	})
 	if len(admitter.released) != 1 || admitter.released[0] != "n1/"+wantLease {
 		t.Fatalf("released=%v, want n1/%q", admitter.released, wantLease)
+	}
+}
+
+func TestReserveBuildPublishesFinalRestoreWithReadyIdentity(t *testing.T) {
+	ctx := context.Background()
+	reg := testReg(t)
+	reg.SetPlacer(placementWithToken("n1"))
+	owner := &recordingNodeOwner{allow: true}
+	reg.SetNodeOwner(owner)
+
+	res, err := reg.ReserveBuild(ctx, BuildReserveReq{
+		Group: "/g", BuildID: "bld-restore", TemplateID: "transient-restore", Profile: types.ProfileE2B,
+		Metadata: map[string]string{
+			sandboxcfg.NsRestore: ` { "prefetch": "memory" } `,
+			"existing":           "kept",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(owner.commands) != 1 {
+		t.Fatalf("commands=%d, want 1", len(owner.commands))
+	}
+	cmd := owner.commands[0]
+	if cmd.Config[sandboxcfg.NsRestore] != `{"prefetch":"memory"}` || cmd.Config["existing"] != "kept" {
+		t.Fatalf("build register config=%v", cmd.Config)
+	}
+	rec, found, err := reg.stores.GetBuildInGroup(ctx, "/g", res.BuildID)
+	if err != nil || !found || rec.Restore != `{"prefetch":"memory"}` {
+		t.Fatalf("registered build=%+v found=%v err=%v", rec, found, err)
+	}
+
+	finalTemplateID := testFinalTemplateID(types.ProfileE2B, "a")
+	reg.applyBuildEvent(ctx, "n1", &routesync.BuildEvent{
+		BuildID: res.BuildID, State: string(BuildReady), TemplateID: finalTemplateID,
+		Restore: ` { "prefetch": "off" } `,
+	})
+	rec, found, err = reg.stores.GetBuildInGroup(ctx, "/g", res.BuildID)
+	if err != nil || !found {
+		t.Fatalf("ready build found=%v err=%v", found, err)
+	}
+	if rec.State != BuildReady || rec.TemplateID != finalTemplateID || rec.Restore != `{"prefetch":"off"}` {
+		t.Fatalf("ready build did not atomically carry final identity/policy: %+v", rec)
+	}
+}
+
+func TestReserveBuildRejectsInvalidRestoreBeforeAdmission(t *testing.T) {
+	reg := testReg(t)
+	placements := 0
+	reg.SetPlacer(placementFunc(func(context.Context, PlaceRequest) (*Placement, error) {
+		placements++
+		return &Placement{NodeID: "n1"}, nil
+	}))
+	owner := &recordingNodeOwner{allow: true}
+	reg.SetNodeOwner(owner)
+
+	_, err := reg.ReserveBuild(context.Background(), BuildReserveReq{
+		Group: "/g", Profile: types.ProfileE2B,
+		Metadata: map[string]string{sandboxcfg.NsRestore: `{"prefetch":"disk"}`},
+	})
+	if err == nil {
+		t.Fatal("invalid restore should be rejected")
+	}
+	if placements != 0 || len(owner.admitted) != 0 || len(owner.commands) != 0 {
+		t.Fatalf("invalid restore caused side effects: placements=%d admitted=%v commands=%v", placements, owner.admitted, owner.commands)
+	}
+}
+
+func TestReserveBuildRetryTreatsDisabledRestoreFormsAsEquivalent(t *testing.T) {
+	ctx := context.Background()
+	reg := testReg(t)
+	reg.SetPlacer(placementWithToken("n1"))
+	owner := &recordingNodeOwner{allow: true}
+	reg.SetNodeOwner(owner)
+	req := BuildReserveReq{
+		Group: "/g", BuildID: "bld-disabled-retry", TemplateID: "transient-disabled-retry", Profile: types.ProfileE2B,
+	}
+	first, err := reg.ReserveBuild(ctx, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, raw := range []string{`{}`, `{"prefetch":"off"}`} {
+		retry := req
+		retry.Metadata = map[string]string{sandboxcfg.NsRestore: raw}
+		got, err := reg.ReserveBuild(ctx, retry)
+		if err != nil || got.BuildID != first.BuildID {
+			t.Fatalf("disabled retry %s: result=%+v err=%v", raw, got, err)
+		}
+	}
+	req.Metadata = map[string]string{sandboxcfg.NsRestore: `{"prefetch":"memory"}`}
+	if _, err := reg.ReserveBuild(ctx, req); err == nil {
+		t.Fatal("memory retry should conflict with an existing disabled registration")
+	}
+}
+
+func TestReadyBuildRequiresFinalTemplateIdentity(t *testing.T) {
+	ctx := context.Background()
+	reg := testReg(t)
+	reg.SetPlacer(placementWithToken("n1"))
+	owner := &recordingNodeOwner{allow: true}
+	reg.SetNodeOwner(owner)
+	res, err := reg.ReserveBuild(ctx, BuildReserveReq{
+		Group: "/g", BuildID: "bld-final-id", TemplateID: "transient-final-id", Profile: types.ProfileE2B,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, templateID := range []string{"", "transient-not-final", testFinalTemplateID(types.ProfileBare, "a")} {
+		reg.applyBuildEvent(ctx, "n1", &routesync.BuildEvent{
+			BuildID: res.BuildID, State: string(BuildReady), TemplateID: templateID,
+		})
+		rec, found, err := reg.stores.GetBuildInGroup(ctx, "/g", res.BuildID)
+		if err != nil || !found {
+			t.Fatalf("build found=%v err=%v", found, err)
+		}
+		if rec.State != BuildRegistered || rec.TemplateID != "transient-final-id" {
+			t.Fatalf("invalid READY template %q changed build: %+v", templateID, rec)
+		}
+	}
+}
+
+func TestEffectiveCreateConfigRestorePrecedenceAndConflict(t *testing.T) {
+	ctx := context.Background()
+	reg := testReg(t)
+	if err := reg.stores.PutBuild(ctx, &BuildRecord{
+		Group: "/g", BuildID: "b1", State: BuildReady, TemplateID: "e2b-snp-final",
+		Restore: `{"prefetch":"memory"}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	placed := map[string]string{"group-value": "kept", sandboxcfg.NsRestore: `{"prefetch":"off"}`}
+	got, err := reg.effectiveCreateConfig(ctx, "/g", "e2b-snp-final", placed, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got["group-value"] != "kept" || got[sandboxcfg.NsRestore] != `{"prefetch":"memory"}` {
+		t.Fatalf("template default did not replace ignored group restore: %v", got)
+	}
+
+	got, err = reg.effectiveCreateConfig(ctx, "/g", "e2b-snp-final", placed, map[string]string{
+		sandboxcfg.NsRestore: `{"prefetch":"off"}`,
+	})
+	if err != nil || got[sandboxcfg.NsRestore] != `{"prefetch":"off"}` {
+		t.Fatalf("explicit create did not win: got=%v err=%v", got, err)
+	}
+
+	got, err = reg.effectiveCreateConfig(ctx, "/g", "e2b-snp-other", placed, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := got[sandboxcfg.NsRestore]; ok {
+		t.Fatalf("group restore leaked without a matching READY template: %v", got)
+	}
+
+	if err := reg.stores.PutBuild(ctx, &BuildRecord{
+		Group: "/g", BuildID: "b2", State: BuildReady, TemplateID: "e2b-snp-final",
+		Restore: `{"prefetch":"off"}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reg.effectiveCreateConfig(ctx, "/g", "e2b-snp-final", placed, nil); !errors.Is(err, ErrTemplateRestoreConflict) {
+		t.Fatalf("conflicting implicit defaults err=%v, want ErrTemplateRestoreConflict", err)
+	}
+	got, err = reg.effectiveCreateConfig(ctx, "/g", "e2b-snp-final", placed, map[string]string{
+		sandboxcfg.NsRestore: `{"prefetch":"memory"}`,
+	})
+	if err != nil || got[sandboxcfg.NsRestore] != `{"prefetch":"memory"}` {
+		t.Fatalf("explicit restore should bypass template conflict: got=%v err=%v", got, err)
+	}
+
+	offTemplateID := testFinalTemplateID(types.ProfileE2B, "b")
+	for i, restore := range []string{"", `{}`, `{"prefetch":"off"}`} {
+		if err := reg.stores.PutBuild(ctx, &BuildRecord{
+			Group: "/g", BuildID: fmt.Sprintf("off-%d", i), State: BuildReady,
+			TemplateID: offTemplateID, Restore: restore,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, _, err := reg.readyTemplateRestore(ctx, "/g", offTemplateID); err != nil {
+		t.Fatalf("equivalent disabled restore defaults should not conflict: %v", err)
 	}
 }
 
@@ -133,7 +323,9 @@ func TestReserveBuildRejectsSameNodeIDCollisionAcrossGroups(t *testing.T) {
 	if first.NodeID != "n1" {
 		t.Fatalf("first placement=%+v", first)
 	}
-	reg.applyBuildEvent(ctx, "n1", &routesync.BuildEvent{BuildID: buildID, State: string(BuildReady)})
+	reg.applyBuildEvent(ctx, "n1", &routesync.BuildEvent{
+		BuildID: buildID, State: string(BuildReady), TemplateID: testFinalTemplateID(types.ProfileE2B, "c"),
+	})
 	if _, err := reg.ReserveBuild(ctx, BuildReserveReq{Group: "/g2", BuildID: buildID, Profile: types.ProfileE2B}); !errors.Is(err, errNodeBuildIDConflict) {
 		t.Fatalf("second reserve err=%v, want node build-id conflict", err)
 	}
@@ -421,7 +613,9 @@ func TestReserveBuildResourceAware(t *testing.T) {
 	}
 
 	// The first build finishes → releases the pool → a second build now fits.
-	reg.applyBuildEvent(ctx, "n1", &routesync.BuildEvent{BuildID: r1.BuildID, State: "ready", TemplateID: "e2b-img-x"})
+	reg.applyBuildEvent(ctx, "n1", &routesync.BuildEvent{
+		BuildID: r1.BuildID, State: "ready", TemplateID: testFinalTemplateID(types.ProfileE2B, "d"),
+	})
 	if rec, _, _ := reg.stores.GetBuildInGroup(ctx, "/g", r1.BuildID); rec.occupies() {
 		t.Fatal("a ready build should not occupy the pool")
 	}

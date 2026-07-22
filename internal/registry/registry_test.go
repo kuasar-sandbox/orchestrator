@@ -24,6 +24,7 @@ import (
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/cluster/shardkv"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
+	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 )
 
 func testRegWithBox(t *testing.T) *Registry {
@@ -1186,6 +1187,28 @@ func TestReserveSandboxCreateUsesPlacementMaterial(t *testing.T) {
 	}
 	if got.KeyFingerprint != keyFingerprint(testMK) {
 		t.Fatalf("key fingerprint=%q, want provider key fp", got.KeyFingerprint)
+	}
+}
+
+func TestReserveSandboxRejectsInvalidRestoreBeforePlacement(t *testing.T) {
+	placements := 0
+	reg := testReg(t)
+	reg.SetPlacer(placementFunc(func(context.Context, PlaceRequest) (*Placement, error) {
+		placements++
+		return &Placement{NodeID: "n1"}, nil
+	}))
+
+	_, err := reg.ReserveSandbox(context.Background(), "/g", "rk", map[string]string{
+		sandboxcfg.NsRestore: `{"prefetch":"disk"}`,
+	})
+	if err == nil {
+		t.Fatal("invalid restore should be rejected")
+	}
+	if placements != 0 {
+		t.Fatalf("invalid restore reached placement %d times", placements)
+	}
+	if _, _, found, getErr := reg.stores.GetSandbox(context.Background(), "/g", "rk"); getErr != nil || found {
+		t.Fatalf("invalid restore wrote route state: found=%v err=%v", found, getErr)
 	}
 }
 

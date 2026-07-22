@@ -32,6 +32,7 @@ type BuildRecord struct {
 	Resources  *routesync.BuildResources `json:"resources,omitempty"`
 	State      BuildState                `json:"state"`
 	TemplateID string                    `json:"template_id,omitempty"` // assigned template id, refreshed from terminal node events
+	Restore    string                    `json:"restore,omitempty"`     // normalized restore; READY replaces registration with the final policy
 	Reason     string                    `json:"reason,omitempty"`
 	CreatedU   int64                     `json:"created_unix,omitempty"`
 }
