@@ -94,6 +94,20 @@ func TestRouteTombstoneCarriesExactExecutionFence(t *testing.T) {
 	if err := record.Validate(); err != nil {
 		t.Fatal(err)
 	}
+	for name, reason := range map[string]string{
+		"oversized":     strings.Repeat("x", MaxTerminalReasonBytes+1),
+		"invalid UTF-8": string([]byte{0xff}),
+	} {
+		t.Run(name, func(t *testing.T) {
+			invalid := record
+			tombstone := *record.Tombstone
+			tombstone.TerminalReason = reason
+			invalid.Tombstone = &tombstone
+			if err := invalid.Validate(); err == nil {
+				t.Fatal("Route tombstone accepted an invalid terminal reason")
+			}
+		})
+	}
 	record.Tombstone.RegistryGeneration = "g2"
 	if err := record.Validate(); err == nil {
 		t.Fatal("Route tombstone from another Registry History Generation was accepted")
