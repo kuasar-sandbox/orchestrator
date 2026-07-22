@@ -22,7 +22,7 @@ type fakeSink struct {
 	begin chan struct{}
 	up    chan routesync.RouteEntry
 	del   chan routesync.RouteDelete
-	book  chan struct{}
+	book  chan bool
 	pol   chan routesync.Policy
 }
 
@@ -31,7 +31,7 @@ func newFakeSink() *fakeSink {
 		begin: make(chan struct{}, 4),
 		up:    make(chan routesync.RouteEntry, 4),
 		del:   make(chan routesync.RouteDelete, 4),
-		book:  make(chan struct{}, 4),
+		book:  make(chan bool, 4),
 		pol:   make(chan routesync.Policy, 4),
 	}
 }
@@ -39,7 +39,7 @@ func newFakeSink() *fakeSink {
 func (f *fakeSink) BeginSync()                               { f.begin <- struct{}{} }
 func (f *fakeSink) ApplyUpsert(r routesync.RouteEntry)       { f.up <- r }
 func (f *fakeSink) ApplyDelete(delete routesync.RouteDelete) { f.del <- delete }
-func (f *fakeSink) Bookmark()                                { f.book <- struct{}{} }
+func (f *fakeSink) Bookmark(fullSync bool)                   { f.book <- fullSync }
 func (f *fakeSink) SetPolicy(p routesync.Policy)             { f.pol <- p }
 
 type fakeWakes struct{ ch chan routesync.RouteWake }
@@ -232,7 +232,9 @@ func TestRouteSyncRoundtrip(t *testing.T) {
 	if r := recv(t, sink.up, "initial upsert"); r.SandboxID != "s1" {
 		t.Fatalf("initial upsert = %+v", r)
 	}
-	recv(t, sink.book, "bookmark")
+	if full := recv(t, sink.book, "bookmark"); !full {
+		t.Fatal("initial snapshot bookmark was not marked full")
+	}
 
 	// A delta published by the source is delivered as an upsert.
 	src.sub <- routesync.Event{Kind: routesync.TypeUpsert, Route: routesync.RouteEntry{SandboxID: "s2", State: routesync.StateRunning}}
@@ -299,7 +301,9 @@ func TestRouteSyncResumeReplay(t *testing.T) {
 	if up := recv(t, sink.up, "replayed upsert"); up.SandboxID != "replayed" {
 		t.Fatalf("resume upsert = %+v, want replayed delta", up)
 	}
-	recv(t, sink.book, "bookmark")
+	if full := recv(t, sink.book, "bookmark"); full {
+		t.Fatal("incremental replay bookmark was marked full")
+	}
 }
 
 func TestRouteSyncResumeFingerprintMismatchFallsBack(t *testing.T) {

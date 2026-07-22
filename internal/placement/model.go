@@ -123,7 +123,7 @@ func ProbePlacement(snapshot PlacementLoadSnapshot, sampleAge time.Duration, req
 	}
 	switch snapshot.WaterZone {
 	case "red", "critical":
-		return reject("node safety state rejects admission")
+		return stale("node safety state temporarily rejects admission")
 	case "green", "yellow":
 	case "":
 		if snapshot.SandboxResourceController {
