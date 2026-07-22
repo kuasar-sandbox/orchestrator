@@ -12,6 +12,7 @@ import (
 const (
 	MaxDispatchSpecBytes               = 64 << 10
 	MaxNormalizedDemandBytes           = 64 << 10
+	MaxProviderPolicyVersionBytes      = 256
 	MaxPlacementCandidates             = 4
 	MaxPlacementCandidateMetadataBytes = 256
 )
@@ -107,6 +108,9 @@ func NewDispatchIntent(demand, spec []byte, providerPolicyVersion string) (Dispa
 func (i DispatchIntent) Validate() error {
 	if len(i.NormalizedDemand) == 0 || len(i.DispatchSpec) == 0 || i.ProviderPolicyVersion == "" {
 		return errors.New("cluster: normalized demand, dispatch spec, and provider/policy version are required")
+	}
+	if len(i.ProviderPolicyVersion) > MaxProviderPolicyVersionBytes || !utf8.ValidString(i.ProviderPolicyVersion) {
+		return fmt.Errorf("cluster: provider/policy version exceeds %d bytes or is not valid UTF-8", MaxProviderPolicyVersionBytes)
 	}
 	if len(i.NormalizedDemand) > MaxNormalizedDemandBytes {
 		return fmt.Errorf("cluster: normalized demand exceeds %d bytes", MaxNormalizedDemandBytes)
@@ -364,6 +368,9 @@ func (i WorkflowFinalizationIntent) Validate() error {
 	if i.ObjectID == "" || i.NodeID == "" || i.NodeEpoch == 0 || i.DataEndpoint == "" ||
 		i.RegistryGeneration == "" || !validDigest(i.BindingDigest) {
 		return errors.New("cluster: incomplete workflow finalization intent")
+	}
+	if err := ValidateTCPDataEndpoint(i.DataEndpoint); err != nil {
+		return err
 	}
 	if i.TerminalProof != nil {
 		if i.TerminalProof.Kind != ProofNodeTerminal || i.TerminalProof.FencedNodeID != i.NodeID ||

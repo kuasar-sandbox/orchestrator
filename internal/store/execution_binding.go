@@ -45,40 +45,58 @@ func (s *Store) CASExecutionBinding(
 	}
 	defer tx.Rollback()
 
-	var rawMetadata string
-	query := "SELECT metadata_json FROM " + table + " WHERE " + idColumn + "=?"
-	if err := tx.QueryRowContext(ctx, query, objectID).Scan(&rawMetadata); errors.Is(err, sql.ErrNoRows) {
-		return false, nil
-	} else if err != nil {
-		return false, fmt.Errorf("store: read execution Binding: %w", err)
-	}
-	metadata := map[string]string{}
-	if err := json.Unmarshal([]byte(rawMetadata), &metadata); err != nil {
-		return false, fmt.Errorf("store: decode object metadata: %w", err)
-	}
-	oldBinding, oldOpaque, err := clusterstate.ExecutionBindingFromMetadata(metadata)
-	if err != nil {
-		return false, err
-	}
-	if oldBinding.Kind != kind || oldBinding.ObjectID != objectID {
-		return false, errors.New("store: current Binding identifies a different object")
-	}
 	workflow, err := getNodeWorkflowTx(ctx, tx, kind, objectID)
 	if err != nil {
 		return false, err
 	}
-	if oldOpaque == replacement {
-		if err := validateWorkflowBinding(workflow, replacement, newDigest, newBinding.RegistryGeneration); err != nil {
+	var rawMetadata string
+	query := "SELECT metadata_json FROM " + table + " WHERE " + idColumn + "=?"
+	objectFound := true
+	if err := tx.QueryRowContext(ctx, query, objectID).Scan(&rawMetadata); errors.Is(err, sql.ErrNoRows) {
+		objectFound = false
+	} else if err != nil {
+		return false, fmt.Errorf("store: read execution Binding: %w", err)
+	}
+	if !objectFound && workflow == nil {
+		return false, nil
+	}
+
+	var (
+		metadata   map[string]string
+		oldBinding clusterstate.ExecutionBinding
+		oldOpaque  string
+	)
+	if objectFound {
+		metadata = map[string]string{}
+		if err := json.Unmarshal([]byte(rawMetadata), &metadata); err != nil {
+			return false, fmt.Errorf("store: decode object metadata: %w", err)
+		}
+		oldBinding, oldOpaque, err = clusterstate.ExecutionBindingFromMetadata(metadata)
+		if err != nil {
 			return false, err
 		}
-		if err := tx.Commit(); err != nil {
-			return false, fmt.Errorf("store: commit idempotent execution Binding CAS: %w", err)
+	} else {
+		oldOpaque = workflow.OpaqueBinding
+		oldBinding, err = clusterstate.DecodeExecutionBinding(oldOpaque)
+		if err != nil {
+			return false, err
 		}
-		return true, nil
+	}
+	if oldBinding.Kind != kind || oldBinding.ObjectID != objectID {
+		return false, errors.New("store: current Binding identifies a different object")
 	}
 	oldDigest, err := clusterstate.ExecutionBindingDigest(oldOpaque)
 	if err != nil {
 		return false, err
+	}
+	if err := validateWorkflowBinding(workflow, oldOpaque, oldDigest, oldBinding.RegistryGeneration); err != nil {
+		return false, err
+	}
+	if oldOpaque == replacement {
+		if err := tx.Commit(); err != nil {
+			return false, fmt.Errorf("store: commit idempotent execution Binding CAS: %w", err)
+		}
+		return true, nil
 	}
 	if oldDigest != expectedDigest {
 		return false, nil
@@ -89,25 +107,24 @@ func (s *Store) CASExecutionBinding(
 		oldBinding.DispatchSpecDigest != newBinding.DispatchSpecDigest {
 		return false, errors.New("store: replacement Binding changes immutable execution identity")
 	}
-	if err := validateWorkflowBinding(workflow, oldOpaque, oldDigest, oldBinding.RegistryGeneration); err != nil {
-		return false, err
-	}
-	metadata[clusterstate.ObjectMetadataKey] = replacement
-	encoded, err := json.Marshal(metadata)
-	if err != nil {
-		return false, fmt.Errorf("store: encode object metadata: %w", err)
-	}
-	update := "UPDATE " + table + " SET metadata_json=? WHERE " + idColumn + "=? AND metadata_json=?"
-	result, err := tx.ExecContext(ctx, update, string(encoded), objectID, rawMetadata)
-	if err != nil {
-		return false, fmt.Errorf("store: replace execution Binding: %w", err)
-	}
-	changed, err := result.RowsAffected()
-	if err != nil {
-		return false, fmt.Errorf("store: execution Binding CAS result: %w", err)
-	}
-	if changed != 1 {
-		return false, nil
+	if objectFound {
+		metadata[clusterstate.ObjectMetadataKey] = replacement
+		encoded, err := json.Marshal(metadata)
+		if err != nil {
+			return false, fmt.Errorf("store: encode object metadata: %w", err)
+		}
+		update := "UPDATE " + table + " SET metadata_json=? WHERE " + idColumn + "=? AND metadata_json=?"
+		result, err := tx.ExecContext(ctx, update, string(encoded), objectID, rawMetadata)
+		if err != nil {
+			return false, fmt.Errorf("store: replace execution Binding: %w", err)
+		}
+		changed, err := result.RowsAffected()
+		if err != nil {
+			return false, fmt.Errorf("store: execution Binding CAS result: %w", err)
+		}
+		if changed != 1 {
+			return false, nil
+		}
 	}
 	notifyEvent := false
 	if workflow != nil {

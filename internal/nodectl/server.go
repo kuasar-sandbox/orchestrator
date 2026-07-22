@@ -208,20 +208,27 @@ func (s *Server) handleAdmit(conn net.Conn, req *Message, token *string) *Messag
 	if response, handled := s.handlePreparedAdmit(conn, req, token); handled {
 		return response
 	}
-	oc := s.Admission.AnalyzeAndConsume(req)
+	s.State.Lock()
+	oc := s.Admission.analyzeAndConsumeLocked(req)
+	var (
+		admitResponse *Message
+		admitErr      error
+	)
+	if oc.Status == OutcomeAdmitted {
+		admitResponse, admitErr = s.buildAdmitOKLocked(conn, req, token)
+	}
+	s.State.Unlock()
 
 	switch oc.Status {
 	case OutcomeAdmitted:
-		// The Admission decision consumed the request token.
-		resp, err := s.buildAdmitOK(conn, req, token)
-		if err != nil {
+		if admitErr != nil {
 			return &Message{
 				Type:   TypeAdmitResponse,
 				Status: StatusRejected,
-				Msg:    err.Error(),
+				Msg:    admitErr.Error(),
 			}
 		}
-		return resp
+		return admitResponse
 
 	case OutcomePreCheckReject, OutcomeLongTermReject:
 		return &Message{
@@ -356,30 +363,30 @@ func preparedReservationMatches(record *PreparedSandboxAdmission, reservation *R
 	}
 	demand := record.Demand
 	budget := computeEffectiveStartupBudget(demand.message(record.SandboxID))
+	floorCPUMilli, validCPU := admissionFloorCPUMilli(demand.message(record.SandboxID))
 	currentAllocation := reservation.AllocatableNowMem
-	return reservation.Capacity == (Resources{
+	return validCPU && reservation.Capacity == (Resources{
 		MemoryBytes: demand.CapacityMemoryBytes, CPUMilli: uint64(demand.CapacityCPU) * 1000,
 	}) && reservation.Floor == (Resources{
-		MemoryBytes: demand.FloorMemoryBytes, CPUMilli: uint64(demand.FloorCPU * 1000),
+		MemoryBytes: demand.FloorMemoryBytes, CPUMilli: floorCPUMilli,
 	}) && currentAllocation >= reservation.Floor.MemoryBytes &&
 		currentAllocation <= reservation.Capacity.MemoryBytes && reservation.EffectiveStartupBudget == budget
 }
 
-// BuildAdmitOKFromQueue is the adapter the admission worker calls when
-// it pops a queued head that now passes all checks. It bridges the
-// PendingAdmit-shaped argument to the per-request buildAdmitOK path so
-// queued and synchronous admits build reservations identically.
+// BuildAdmitOKFromQueue is called by the admission worker while it holds
+// State.Lock across the final decision and reservation insertion.
 func (s *Server) BuildAdmitOKFromQueue(p *PendingAdmit) (*Message, error) {
-	return s.buildAdmitOK(p.conn, p.req, nil)
+	return s.buildAdmitOKLocked(p.conn, p.req, nil)
 }
 
-// buildAdmitOK builds the Reservation, inserts it into State, returns
-// the AdmitResponse message. Caller has already token-consumed.
-func (s *Server) buildAdmitOK(conn net.Conn, req *Message, token *string) (*Message, error) {
+// buildAdmitOKLocked builds and inserts the reservation. The caller has
+// consumed the token and holds State.Lock from the resource decision.
+func (s *Server) buildAdmitOKLocked(conn net.Conn, req *Message, token *string) (*Message, error) {
 	ebudget := computeEffectiveStartupBudget(req)
-
-	s.State.Lock()
-	defer s.State.Unlock()
+	floorCPUMilli, validCPU := admissionFloorCPUMilli(req)
+	if !validCPU {
+		return nil, errors.New("invalid sandbox CPU demand")
+	}
 
 	t := NewToken()
 	res := &Reservation{
@@ -387,7 +394,7 @@ func (s *Server) buildAdmitOK(conn net.Conn, req *Message, token *string) (*Mess
 		SandboxID:              req.SandboxID,
 		CgroupPath:             req.CgroupPath,
 		Capacity:               Resources{MemoryBytes: req.CapacityMemoryBytes, CPUMilli: uint64(req.CapacityCPU) * 1000},
-		Floor:                  Resources{MemoryBytes: req.FloorMemoryBytes, CPUMilli: uint64(req.FloorCPU * 1000)},
+		Floor:                  Resources{MemoryBytes: req.FloorMemoryBytes, CPUMilli: floorCPUMilli},
 		AllocatableNowMem:      ebudget,
 		EffectiveStartupBudget: ebudget,
 		Stage:                  StageAdmitted,

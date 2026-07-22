@@ -53,6 +53,9 @@ func (s SandboxDispatchSpecV1) Validate() error {
 	if err := validateDispatchRequest(s.Request, "/sandboxes", "/v2/sandboxes"); err != nil {
 		return fmt.Errorf("cluster: Sandbox dispatch request: %w", err)
 	}
+	if err := validateConfigHeaders(s.Request.Header, s.Config, false); err != nil {
+		return fmt.Errorf("cluster: Sandbox dispatch request: %w", err)
+	}
 	if err := validateSandboxTemplateRef(s.Request.Body, s.TemplateRef); err != nil {
 		return fmt.Errorf("cluster: Sandbox dispatch request: %w", err)
 	}
@@ -94,6 +97,9 @@ func (s BuildDispatchSpecV1) Validate() error {
 		return errors.New("cluster: dispatch spec cannot supply system-owned metadata")
 	}
 	if err := validateDispatchRequest(s.Request, "/templates", "/v3/templates"); err != nil {
+		return fmt.Errorf("cluster: Build dispatch request: %w", err)
+	}
+	if err := validateConfigHeaders(s.Request.Header, s.Metadata, true); err != nil {
 		return fmt.Errorf("cluster: Build dispatch request: %w", err)
 	}
 	if err := validateBuildResourceCeilings(s.Request.Body, s.CPUCount, s.MemoryMB); err != nil {
@@ -181,6 +187,42 @@ func validateKeyFingerprints(authFingerprint, manifestFingerprint string) error 
 	}
 	if authFingerprint == manifestFingerprint {
 		return errors.New("AuthKey and ManifestKey must use separate key material")
+	}
+	return nil
+}
+
+var dispatchConfigHeaders = []struct {
+	header      string
+	metadataKey string
+}{
+	{header: "X-Kuasar-Sandbox-Resource", metadataKey: "kuasar-sandbox.resource"},
+	{header: "X-Kuasar-Sandbox-Network", metadataKey: "kuasar-sandbox.network"},
+	{header: "X-Kuasar-Sandbox-Launch", metadataKey: "kuasar-sandbox.launch"},
+	{header: "X-Kuasar-Sandbox-Init", metadataKey: "kuasar-sandbox.init"},
+	{header: "X-Kuasar-Sandbox-Mounts", metadataKey: "kuasar-sandbox.mounts"},
+	{header: "X-Kuasar-Sandbox-Files", metadataKey: "kuasar-sandbox.files"},
+	{header: "X-Kuasar-Sandbox-Metadata", metadataKey: "kuasar-sandbox.metadata"},
+}
+
+func validateConfigHeaders(headers map[string][]string, metadata map[string]string, build bool) error {
+	for _, field := range dispatchConfigHeaders {
+		if err := validateConfigHeader(headers, metadata, field.header, field.metadataKey); err != nil {
+			return err
+		}
+	}
+	if build {
+		return validateConfigHeader(headers, metadata, "X-Kuasar-Sandbox-Builder", "kuasar-sandbox.builder")
+	}
+	return nil
+}
+
+func validateConfigHeader(headers map[string][]string, metadata map[string]string, header, metadataKey string) error {
+	values := headers[header]
+	if len(values) == 0 {
+		return nil
+	}
+	if len(values) != 1 || metadata[metadataKey] != values[0] {
+		return fmt.Errorf("%s must match canonical request metadata", header)
 	}
 	return nil
 }
