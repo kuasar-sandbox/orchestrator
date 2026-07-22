@@ -18,9 +18,15 @@ func (r *Runtime) ApplySystem(ctx context.Context, command SystemCommand) (Syste
 		return SystemApplyResult{}, errors.New("raftstore: System lifecycle command requires its dedicated workflow")
 	}
 	if command.Type == SystemBeginTransition {
+		if _, err := EncodeSystemCommand(command); err != nil {
+			return SystemApplyResult{}, err
+		}
 		if command.Transition == nil || command.Transition.Version != r.registryLayout.RegistryLayoutVersion ||
 			command.Transition.Digest != r.registryLayoutDigest {
 			return SystemApplyResult{}, errors.New("raftstore: transition does not name the verified next registryLayout")
+		}
+		if err := command.Transition.Validate(r.registryLayout.VirtualShardCount); err != nil {
+			return SystemApplyResult{}, err
 		}
 		result, proposeErr := r.proposeSystem(ctx, command)
 		if proposeErr == nil && result.Applied && !result.Conflict {

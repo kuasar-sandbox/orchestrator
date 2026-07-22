@@ -11,6 +11,7 @@ type testRemoteSystemClient struct {
 	state       SystemState
 	applyErr    error
 	permitGrant *PermitGrant
+	applyCalls  int
 }
 
 func (c *testRemoteSystemClient) ReadSystemStrong(context.Context) (SystemState, error) {
@@ -18,6 +19,7 @@ func (c *testRemoteSystemClient) ReadSystemStrong(context.Context) (SystemState,
 }
 
 func (c *testRemoteSystemClient) ApplySystem(_ context.Context, command SystemCommand) (SystemApplyResult, error) {
+	c.applyCalls++
 	var result SystemApplyResult
 	c.state, result = ApplySystemCommand(c.state, c.state.LastApplied+1, command)
 	return result, c.applyErr
@@ -140,6 +142,49 @@ func TestBeginTransitionResolvesCommittedProposalError(t *testing.T) {
 	if err != nil || !result.Applied || client.state.Transition == nil ||
 		!sameTransitionIdentity(client.state.Transition, transition) {
 		t.Fatalf("ambiguous transition start = %+v, state=%+v, err=%v", result, client.state.Transition, err)
+	}
+}
+
+func TestBeginTransitionRejectsInvalidCommandBeforeRetryResolution(t *testing.T) {
+	previous := testRegistryLayout(1, "generation-invalid-transition")
+	previousDigest, _ := previous.Digest()
+	next := previous
+	next.RegistryLayoutVersion = 2
+	next.PreviousRegistryLayoutVersion = previous.RegistryLayoutVersion
+	next.PreviousRegistryLayoutDigest = previousDigest
+	nextDigest, err := next.Digest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, _ := ApplySystemCommand(SystemState{}, 1, SystemCommand{
+		Type: SystemBootstrap, RegistryLayout: &previous, Digest: previousDigest,
+	})
+	committed := &RegistryLayoutTransition{
+		Version: next.RegistryLayoutVersion, Digest: nextDigest,
+		PreviousDigest: previousDigest, NextSystemEpoch: 2,
+		Shards: []ShardTransition{
+			{ShardID: ^uint32(0), Stage: TransitionPending},
+			{ShardID: 0, Stage: TransitionPending},
+		},
+	}
+	state, _ = ApplySystemCommand(state, 2, SystemCommand{
+		Type: SystemBeginTransition, Transition: committed,
+	})
+	client := &testRemoteSystemClient{state: state}
+	runtime := &Runtime{
+		registryLayout: next, registryLayoutDigest: nextDigest, systemClient: client,
+		permitCache: NewPermitCache(time.Now),
+	}
+	invalid := *committed
+	invalid.Shards = nil
+	result, err := runtime.ApplySystem(context.Background(), SystemCommand{
+		Type: SystemBeginTransition, Transition: &invalid,
+	})
+	if err == nil || result.Applied {
+		t.Fatalf("invalid transition retry = %+v, %v", result, err)
+	}
+	if client.applyCalls != 0 {
+		t.Fatalf("invalid transition reached consensus client %d times", client.applyCalls)
 	}
 }
 

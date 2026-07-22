@@ -103,13 +103,17 @@ func (r *Runtime) CompactExecutionFence(
 	query := FenceLookup{
 		Identity: identity, Group: group, RouteKey: routeKey, SandboxID: sandboxID,
 	}
-	fence, err := r.readFenceStrong(ctx, query)
+	fenceStatus, err := r.readFenceStatusStrong(ctx, query)
 	if err != nil {
 		return err
 	}
-	if fence == nil {
+	if fenceStatus.Fence == nil {
+		if fenceStatus.HistoricallyFenced {
+			return nil
+		}
 		return errors.New("raftstore: execution fence is missing")
 	}
+	fence := fenceStatus.Fence
 	placementFailure := fence.PlacementFailure != nil
 	proofPermanentlyFenced := fence.Proof.Kind == clusterstate.ProofNewerNodeEpoch ||
 		fence.Proof.Kind == clusterstate.ProofExternalFence
@@ -260,14 +264,22 @@ func (r *Runtime) requireStableActiveRegistryLayout(
 }
 
 func (r *Runtime) readFenceStrong(ctx context.Context, query FenceLookup) (*clusterstate.ExecutionFence, error) {
-	result, err := r.ReadData(ctx, DataLookup{Fence: &query})
+	result, err := r.readFenceStatusStrong(ctx, query)
 	if err != nil {
 		return nil, err
 	}
-	if result.Fence == nil {
-		return nil, errors.New("raftstore: Dragonboat returned an invalid execution-fence lookup")
+	return result.Fence, nil
+}
+
+func (r *Runtime) readFenceStatusStrong(ctx context.Context, query FenceLookup) (FenceLookupResult, error) {
+	result, err := r.ReadData(ctx, DataLookup{Fence: &query})
+	if err != nil {
+		return FenceLookupResult{}, err
 	}
-	return result.Fence.Fence, nil
+	if result.Fence == nil {
+		return FenceLookupResult{}, errors.New("raftstore: Dragonboat returned an invalid execution-fence lookup")
+	}
+	return *result.Fence, nil
 }
 
 func (r *Runtime) proveFenceAppliedEverywhere(

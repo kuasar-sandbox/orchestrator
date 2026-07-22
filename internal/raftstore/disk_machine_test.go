@@ -89,6 +89,16 @@ func TestPebblePlacementRetryLoadsCommittedFence(t *testing.T) {
 	applyDiskData(t, machine, 5, DataCommand{
 		Type: DataPutFence, Identity: identity, Expect: RevisionExpectation{Absent: true}, Fence: &fence,
 	})
+	value, err := machine.Lookup(DataLookup{Fence: &FenceLookup{
+		Identity: identity, Group: group, RouteKey: routeKey, SandboxID: fence.SandboxID,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fenceStatus := value.(DataLookupResult).Fence
+	if fenceStatus == nil || fenceStatus.Fence == nil || !fenceStatus.HistoricallyFenced {
+		t.Fatalf("on-disk fence history lookup = %+v", fenceStatus)
+	}
 	next := routeStarting(t, registryLayout, group, routeKey, "sandbox-2", 2, false)
 	applyDiskData(t, machine, 6, DataCommand{
 		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{LogIndex: 4}, Route: &next,

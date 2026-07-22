@@ -386,11 +386,12 @@ func TestFenceLookupDeepCopiesPlacementFailure(t *testing.T) {
 	fence.Revision = revisionFor(state, 2)
 	mapKey := fenceMapKey(fence.Group, fence.RouteKey, fence.SandboxID)
 	state.Fences[mapKey] = cloneExecutionFence(fence)
+	state.UsedSandboxIDs[mapKey] = struct{}{}
 
 	result, err := LookupData(state, DataLookup{Fence: &FenceLookup{
 		Identity: identity, Group: fence.Group, RouteKey: fence.RouteKey, SandboxID: fence.SandboxID,
 	}})
-	if err != nil || result.Fence == nil || result.Fence.Fence == nil {
+	if err != nil || result.Fence == nil || result.Fence.Fence == nil || !result.Fence.HistoricallyFenced {
 		t.Fatalf("fence lookup = %+v, %v", result.Fence, err)
 	}
 	result.Fence.Fence.PlacementFailure.CandidatePool[0].NodeID = "mutated"
