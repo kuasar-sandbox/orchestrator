@@ -18,6 +18,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/buildcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/orchestrator/internal/keys"
+	"github.com/kuasar-sandbox/orchestrator/internal/mmdscfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/regcreds"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
@@ -33,6 +34,9 @@ var hexKeyRe = regexp.MustCompile(`^[0-9a-f]{64}$`)
 func (o *Orchestrator) newRegisteredBuild(ctx context.Context, apiKey string, spec api.RegisterSpec) (*types.Build, error) {
 	if !spec.Profile.Valid() {
 		return nil, fmt.Errorf("%w: unknown build profile %q", api.ErrBadRequest, spec.Profile)
+	}
+	if _, ok := spec.Metadata[mmdscfg.Ns]; ok {
+		return nil, fmt.Errorf("%w: %s is not allowed on template register", api.ErrBadRequest, mmdscfg.Ns)
 	}
 	metadata, builderOpts, err := buildcfg.Extract(spec.Metadata)
 	if err != nil {
@@ -102,6 +106,9 @@ func (o *Orchestrator) TriggerBuild(ctx context.Context, apiKey, tid, bid string
 	}
 	if spec.FromImage != "" && spec.FromTemplate != "" {
 		return fmt.Errorf("build: fromImage and fromTemplate are mutually exclusive")
+	}
+	if _, ok := spec.Metadata[mmdscfg.Ns]; ok {
+		return fmt.Errorf("%w: %s is not allowed on template build", api.ErrBadRequest, mmdscfg.Ns)
 	}
 	triggerMeta, triggerBuilder, err := buildcfg.Extract(spec.Metadata)
 	if err != nil {

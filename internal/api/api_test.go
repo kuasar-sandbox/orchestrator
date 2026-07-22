@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/buildcfg"
+	"github.com/kuasar-sandbox/orchestrator/internal/mmdscfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
@@ -74,6 +75,29 @@ func TestMergeConfigHeaders(t *testing.T) {
 	got = mergeConfigHeaders(nil, header("X-Kuasar-Sandbox-Builder", `{"referer":{"enabled":false}}`))
 	if got != nil {
 		t.Fatalf("builder header should not enter sandbox metadata: %+v", got)
+	}
+}
+
+func TestMergeConfigHeadersMMDS(t *testing.T) {
+	// Header populates the mmds namespace.
+	got := mergeConfigHeaders(nil, header("X-Kuasar-Sandbox-MMDS", `{"schema_version":1}`))
+	if got[mmdscfg.Ns] != `{"schema_version":1}` {
+		t.Fatalf("mmds header not normalized: %+v", got)
+	}
+
+	// Header wins over an e2b metadata key of the same namespace.
+	meta := map[string]string{mmdscfg.Ns: `{"schema_version":1,"endpoints":[]}`}
+	got = mergeConfigHeaders(meta, header("X-Kuasar-Sandbox-MMDS", `{"schema_version":1,"endpoints":["from-header"]}`))
+	if got[mmdscfg.Ns] != `{"schema_version":1,"endpoints":["from-header"]}` {
+		t.Fatalf("mmds header should win over metadata: %+v", got)
+	}
+
+	// mergeBuildConfigHeaders also folds the header (orch's build path rejects
+	// its presence explicitly — see orch/build.go), since it shares the same
+	// configHeaderNs precedence table as create.
+	got = mergeBuildConfigHeaders(nil, header("X-Kuasar-Sandbox-MMDS", `{"schema_version":1}`))
+	if got[mmdscfg.Ns] != `{"schema_version":1}` {
+		t.Fatalf("mmds header not normalized via mergeBuildConfigHeaders: %+v", got)
 	}
 }
 

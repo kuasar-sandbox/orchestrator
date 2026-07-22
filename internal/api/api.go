@@ -14,6 +14,7 @@ import (
 
 	"github.com/kuasar-sandbox/orchestrator/internal/apikey"
 	"github.com/kuasar-sandbox/orchestrator/internal/buildcfg"
+	"github.com/kuasar-sandbox/orchestrator/internal/mmdscfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
@@ -30,6 +31,7 @@ var configHeaderNs = []struct{ header, metaKey string }{
 	{"X-Kuasar-Sandbox-Mounts", sandboxcfg.NsMounts},
 	{"X-Kuasar-Sandbox-Files", sandboxcfg.NsFiles},
 	{"X-Kuasar-Sandbox-Metadata", sandboxcfg.NsMetadata},
+	{"X-Kuasar-Sandbox-MMDS", mmdscfg.Ns},
 }
 
 const (
