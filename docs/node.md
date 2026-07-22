@@ -515,11 +515,13 @@ orchestrator 只传递每个 sandbox 的显式策略,不判断本地/远程、�
   网络)再叠租户命名空间,yaml 序列化经 config-socket 交 sandbox-ctl。深校验(ValidateCold)
   在 sandbox-ctl——serve 侧 yaml 是半成品(cgroup_path 经 `--cgroup-adopt`、base 经
   快照填),这里只对租户网络做格式校验。
-- **两个注入面**:e2b metadata,与 `X-Kuasar-Sandbox-<Ns>` 请求头(API 边缘归一化进
-  metadata,**同名头胜过 metadata 键**)。create 与模板构建(register/trigger)都支持;
-  sandbox 最终配置存 `sandboxes.metadata_json`,模板默认配置存 `builds.metadata_json`,
-  build-only 配置存 `builds.builder_json`。集群入口把 create body metadata 和同名 Header
-  一起传入 Reserve;Header 仍胜出(§10 / cluster-router.md)。
+- **配置输入面**:sandbox create 同时支持 e2b body metadata 和
+  `X-Kuasar-Sandbox-<Ns>` Header,API 边缘把 Header 归一化进 metadata,**同名 Header
+  胜过 body metadata**。模板 register/trigger 的现有 body 契约不含 metadata,通过同组 Header
+  保存模板默认;`X-Kuasar-Sandbox-Builder` 仅保存 build-only 配置。sandbox 最终配置存
+  `sandboxes.metadata_json`,模板默认配置存 `builds.metadata_json`,build-only 配置存
+  `builds.builder_json`。集群入口保持相同边界:create 合并 body metadata + Header;
+  register/trigger 传递 Header(§10 / cluster-router.md)。
 - **优先级**:`节点默认 ⊕ 模板配置 ⊕ create 配置`(create 按命名空间胜)。模板配置:snp
   经快照、img 经 `builds.metadata_json`。构建内 `register ⊕ trigger`(trigger 胜);
   register/trigger 的 `cpuCount`/`memoryMB` → `resource.capacity`(胜过 resource 头),决定

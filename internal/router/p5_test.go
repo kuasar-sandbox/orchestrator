@@ -215,6 +215,121 @@ func TestCreateRejectsInvalidRestoreBeforeReserve(t *testing.T) {
 	}
 }
 
+func TestNormalizedConfigSizeBoundary(t *testing.T) {
+	configAtSize := func(size int) map[string]string {
+		const key = "application"
+		empty, err := json.Marshal(map[string]string{key: ""})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return map[string]string{key: strings.Repeat("x", size-len(empty))}
+	}
+	for _, tc := range []struct {
+		name    string
+		size    int
+		wantErr bool
+	}{
+		{name: "at limit", size: maxNormalizedConfigBytes},
+		{name: "over limit", size: maxNormalizedConfigBytes + 1, wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			config := configAtSize(tc.size)
+			wire, err := json.Marshal(config)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(wire) != tc.size {
+				t.Fatalf("wire size=%d, want %d", len(wire), tc.size)
+			}
+			if err := checkNormalizedConfigSize(config); (err != nil) != tc.wantErr {
+				t.Fatalf("checkNormalizedConfigSize() error=%v, wantErr=%v", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestCreateRejectsOversizedConfigBeforeReserve(t *testing.T) {
+	var reserveHits int32
+	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&reserveHits, 1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer control.Close()
+	rt := New(strings.TrimPrefix(control.URL, "http://"), "test.local", 0, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	rt.SetAuthMode("off")
+	srv := httptest.NewServer(rt.Handler())
+	defer srv.Close()
+
+	requests := []struct {
+		name   string
+		body   string
+		header string
+		value  string
+	}{
+		{
+			name: "raw body over 1 MiB",
+			body: `{"metadata":{"application":"` + strings.Repeat("x", maxControlBodyBytes) + `"}}`,
+		},
+		{
+			name:   "header normalized config over 512 KiB",
+			body:   `{}`,
+			header: "X-Kuasar-Sandbox-Metadata",
+			value:  `{"blob":"` + strings.Repeat("x", maxNormalizedConfigBytes) + `"}`,
+		},
+	}
+	for _, tc := range requests {
+		t.Run(tc.name, func(t *testing.T) {
+			req, _ := http.NewRequest(http.MethodPost, srv.URL+"/sandboxes", strings.NewReader(tc.body))
+			req.Host = "api.test.local"
+			req.Header.Set(HeaderGroup, "/g")
+			if tc.header != "" {
+				req.Header.Set(tc.header, tc.value)
+			}
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusBadRequest {
+				b, _ := io.ReadAll(resp.Body)
+				t.Fatalf("status=%d body=%s, want 400", resp.StatusCode, b)
+			}
+		})
+	}
+	if got := atomic.LoadInt32(&reserveHits); got != 0 {
+		t.Fatalf("oversized config reached reserve %d times", got)
+	}
+}
+
+func TestCreatePropagatesRouteLinkConfigRejection(t *testing.T) {
+	var reserveHits int32
+	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&reserveHits, 1)
+		http.Error(w, "effective config exceeds cluster budget", http.StatusBadRequest)
+	}))
+	defer control.Close()
+	rt := New(strings.TrimPrefix(control.URL, "http://"), "test.local", 0, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	rt.SetAuthMode("off")
+	srv := httptest.NewServer(rt.Handler())
+	defer srv.Close()
+
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/sandboxes", strings.NewReader(`{"metadata":{}}`))
+	req.Host = "api.test.local"
+	req.Header.Set(HeaderGroup, "/g")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status=%d body=%s, want 400", resp.StatusCode, b)
+	}
+	if got := atomic.LoadInt32(&reserveHits); got != 1 {
+		t.Fatalf("reserve hits=%d, want 1", got)
+	}
+}
+
 func TestServeDataSidHostDoesNotUseByKeyReserve(t *testing.T) {
 	var reserveHits int
 	var routeHits int

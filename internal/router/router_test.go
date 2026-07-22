@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kuasar-sandbox/orchestrator/internal/buildcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/clusterclient"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
@@ -105,7 +106,8 @@ func TestReserveBuildRequestCarriesStableIDsAcrossRouteLinkRetry(t *testing.T) {
 		}, nil
 	})}
 
-	res, err := rt.routeLinkReserveBuild(context.Background(), "/g", types.ProfileBare, nil)
+	metadata := map[string]string{sandboxcfg.NsRestore: `{"prefetch":"memory"}`}
+	res, err := rt.routeLinkReserveBuild(context.Background(), "/g", types.ProfileBare, nil, metadata)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -120,6 +122,12 @@ func TestReserveBuildRequestCarriesStableIDsAcrossRouteLinkRetry(t *testing.T) {
 	}
 	if bodies[0]["profile"] != string(types.ProfileBare) || bodies[1]["profile"] != string(types.ProfileBare) {
 		t.Fatalf("reserve-build retry lost profile: %v then %v", bodies[0], bodies[1])
+	}
+	for i, body := range bodies {
+		got, ok := body["metadata"].(map[string]any)
+		if !ok || got[sandboxcfg.NsRestore] != metadata[sandboxcfg.NsRestore] {
+			t.Fatalf("reserve-build body %d metadata=%v, want %v", i, got, metadata)
+		}
 	}
 	if res.BuildID != bodies[0]["build_id"] || res.TemplateID != bodies[0]["template_id"] {
 		t.Fatalf("reserve result=%+v bodies=%v", res, bodies)
@@ -414,6 +422,129 @@ func TestBuildRoutingThroughRouter(t *testing.T) {
 	}
 	if triggeredBuild != "b1" {
 		t.Fatalf("node saw build %q, want b1 (router build-id routing)", triggeredBuild)
+	}
+}
+
+func TestBuildRegisterCarriesConfigHeadersToRouteLink(t *testing.T) {
+	var reserveHits int
+	var gotMetadata map[string]string
+	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/route-link/reserve-build" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		reserveHits++
+		var body struct {
+			Metadata map[string]string `json:"metadata"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		gotMetadata = body.Metadata
+		_ = json.NewEncoder(w).Encode(buildReserveResult{
+			BuildID: "b1", TemplateID: "t1", NodeID: "n1", Profile: types.ProfileE2B,
+		})
+	}))
+	defer control.Close()
+
+	rt := New(strings.TrimPrefix(control.URL, "http://"), "test.local", 0, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	rt.SetAuthMode("off")
+	srv := httptest.NewServer(rt.Handler())
+	defer srv.Close()
+
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/v3/templates", strings.NewReader(`{"cpu_count":2,"memory_mb":512}`))
+	req.Host = "api.test.local"
+	req.Header.Set(HeaderGroup, "/g")
+	req.Header.Set("X-Kuasar-Sandbox-Restore", `{"prefetch":"memory"}`)
+	req.Header.Set("X-Kuasar-Sandbox-Resource", `{"capacity":{"cpu":9}}`)
+	req.Header.Set(headerSandboxBuilder, `{"referer":{"enabled":false}}`)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusAccepted {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status=%d body=%s, want 202", resp.StatusCode, b)
+	}
+	if reserveHits != 1 {
+		t.Fatalf("reserve hits=%d, want 1", reserveHits)
+	}
+	if got := gotMetadata[sandboxcfg.NsRestore]; got != `{"prefetch":"memory"}` {
+		t.Fatalf("restore metadata=%q", got)
+	}
+	if got := gotMetadata[buildcfg.NsBuilder]; got != `{"referer":{"enabled":false}}` {
+		t.Fatalf("builder metadata=%q", got)
+	}
+	if got := gotMetadata[sandboxcfg.NsResource]; got != `{"capacity":{"cpu":2,"memory":"512MiB"}}` {
+		t.Fatalf("resource metadata=%q", got)
+	}
+}
+
+func TestBuildRegisterRejectsInvalidConfigBeforeReserve(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		header string
+		value  string
+	}{
+		{name: "restore", header: "X-Kuasar-Sandbox-Restore", value: `{"prefetch":"disk"}`},
+		{name: "builder", header: headerSandboxBuilder, value: `{"referer":{"unknown":true}}`},
+		{name: "oversized", header: "X-Kuasar-Sandbox-Metadata", value: `{"blob":"` + strings.Repeat("x", maxNormalizedConfigBytes) + `"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var reserveHits int
+			control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				reserveHits++
+				w.WriteHeader(http.StatusInternalServerError)
+			}))
+			defer control.Close()
+			rt := New(strings.TrimPrefix(control.URL, "http://"), "test.local", 0, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+			rt.SetAuthMode("off")
+			srv := httptest.NewServer(rt.Handler())
+			defer srv.Close()
+
+			req, _ := http.NewRequest(http.MethodPost, srv.URL+"/v3/templates", nil)
+			req.Host = "api.test.local"
+			req.Header.Set(HeaderGroup, "/g")
+			req.Header.Set(tc.header, tc.value)
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusBadRequest {
+				b, _ := io.ReadAll(resp.Body)
+				t.Fatalf("status=%d body=%s, want 400", resp.StatusCode, b)
+			}
+			if reserveHits != 0 {
+				t.Fatalf("invalid config reached reserve %d times", reserveHits)
+			}
+		})
+	}
+}
+
+func TestBuildRegisterPropagatesRouteLinkConfigRejection(t *testing.T) {
+	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "effective build config exceeds cluster budget", http.StatusBadRequest)
+	}))
+	defer control.Close()
+	rt := New(strings.TrimPrefix(control.URL, "http://"), "test.local", 0, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	rt.SetAuthMode("off")
+	srv := httptest.NewServer(rt.Handler())
+	defer srv.Close()
+
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/v3/templates", strings.NewReader(`{"name":"t"}`))
+	req.Host = "api.test.local"
+	req.Header.Set(HeaderGroup, "/g")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status=%d body=%s, want 400", resp.StatusCode, b)
 	}
 }
 

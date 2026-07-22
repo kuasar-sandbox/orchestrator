@@ -12,6 +12,7 @@ import (
 	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -24,11 +25,13 @@ import (
 	"sync"
 	"time"
 
+	"github.com/kuasar-sandbox/orchestrator/internal/buildcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/clusterclient"
 	"github.com/kuasar-sandbox/orchestrator/internal/envdsign"
 	"github.com/kuasar-sandbox/orchestrator/internal/metrics"
 	proxypkg "github.com/kuasar-sandbox/orchestrator/internal/proxy"
 	"github.com/kuasar-sandbox/orchestrator/internal/registry"
+	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
@@ -39,6 +42,10 @@ const (
 	HeaderRouteKey  = "X-Kuasar-Route-Key"
 	HeaderAPIKey    = "X-API-KEY"
 	HeaderAccessTok = "X-Access-Token"
+
+	headerSandboxBuilder     = "X-Kuasar-Sandbox-Builder"
+	maxControlBodyBytes      = 1 << 20
+	maxNormalizedConfigBytes = registry.MaxSandboxConfigBytes
 )
 
 // reserveResult / routeResolve mirror registry route_link JSON.
@@ -278,7 +285,12 @@ func (rt *Router) handleCreate(w http.ResponseWriter, r *http.Request) {
 	res, err := rt.reserveByKey(r.Context(), group, routeKey, createConfig)
 	if err != nil {
 		rt.log.Warn("router: reserve", "group", group, "err", err)
-		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		status := http.StatusServiceUnavailable
+		var linkErr *routeLinkStatusError
+		if errors.As(err, &linkErr) && linkErr.status == http.StatusBadRequest {
+			status = http.StatusBadRequest
+		}
+		http.Error(w, err.Error(), status)
 		return
 	}
 	// Minimal e2b create response (the SDK keys off sandboxID; the data plane uses
@@ -304,21 +316,55 @@ func createConfigFromRequest(r *http.Request) (map[string]string, error) {
 	var body struct {
 		Metadata map[string]string `json:"metadata"`
 	}
-	if r.Body != nil {
-		dec := json.NewDecoder(r.Body)
-		if err := dec.Decode(&body); err != nil && err != io.EOF {
-			return nil, fmt.Errorf("cluster router: bad create body: %w", err)
-		} else if err == nil {
-			if err := dec.Decode(&struct{}{}); err != io.EOF {
-				return nil, fmt.Errorf("cluster router: bad create body: trailing content")
-			}
-		}
+	if err := decodeControlBody(r.Body, &body); err != nil {
+		return nil, fmt.Errorf("cluster router: bad create body: %w", err)
 	}
 	metadata := sandboxcfg.MergeConfigHeaders(body.Metadata, r.Header.Get)
+	if err := checkNormalizedConfigSize(metadata); err != nil {
+		return nil, fmt.Errorf("cluster router: create config: %w", err)
+	}
 	if _, err := sandboxcfg.ParseSpec(metadata); err != nil {
 		return nil, err
 	}
 	return metadata, nil
+}
+
+// decodeControlBody keeps public control requests within the same 1 MiB bound
+// as the internal placer and shardkv HTTP transports. Empty bodies are valid for
+// the e2b-compatible create/register calls; non-empty bodies must contain exactly
+// one JSON value.
+func decodeControlBody(body io.Reader, into any) error {
+	if body == nil {
+		return nil
+	}
+	b, err := io.ReadAll(io.LimitReader(body, maxControlBodyBytes+1))
+	if err != nil {
+		return err
+	}
+	if len(b) > maxControlBodyBytes {
+		return fmt.Errorf("request body exceeds %d bytes", maxControlBodyBytes)
+	}
+	if len(bytes.TrimSpace(b)) == 0 {
+		return nil
+	}
+	dec := json.NewDecoder(bytes.NewReader(b))
+	if err := dec.Decode(into); err != nil {
+		return err
+	}
+	if err := dec.Decode(&struct{}{}); err != io.EOF {
+		if err == nil {
+			return fmt.Errorf("request body contains trailing JSON value")
+		}
+		return fmt.Errorf("request body contains trailing content: %w", err)
+	}
+	return nil
+}
+
+// checkNormalizedConfigSize leaves headroom inside the 1 MiB internal HTTP and
+// route-frame limit. A config is nested in placement/command envelopes and the
+// persisted SandboxRecord is base64-expanded as shardkv.Record.Value.
+func checkNormalizedConfigSize(config map[string]string) error {
+	return registry.ValidateSandboxConfigSize(config)
 }
 
 // --- build control plane ---
@@ -348,13 +394,18 @@ func (rt *Router) handleBuildRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		Name     string   `json:"name"`
-		Tags     []string `json:"tags"`
-		Profile  string   `json:"profile"`
-		CPUCount int      `json:"cpuCount"`
-		MemoryMB int      `json:"memoryMB"`
+		Name       string   `json:"name"`
+		Tags       []string `json:"tags"`
+		Profile    string   `json:"profile"`
+		CPUCount   int      `json:"cpuCount"`
+		CPUCountSn int      `json:"cpu_count"`
+		MemoryMB   int      `json:"memoryMB"`
+		MemoryMBSn int      `json:"memory_mb"`
 	}
-	_ = json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body)
+	if err := decodeControlBody(r.Body, &body); err != nil {
+		http.Error(w, "cluster router: bad register body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
 	profile := types.ProfileE2B
 	if body.Profile != "" {
 		var err error
@@ -364,14 +415,42 @@ func (rt *Router) handleBuildRegister(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	var resources *buildResources
-	if body.CPUCount > 0 || body.MemoryMB > 0 {
-		resources = &buildResources{CPU: body.CPUCount * 1000, Mem: int64(body.MemoryMB) << 20}
+	metadata := sandboxcfg.MergeConfigHeaders(nil, r.Header.Get)
+	if value := r.Header.Get(headerSandboxBuilder); value != "" {
+		if metadata == nil {
+			metadata = map[string]string{}
+		}
+		metadata[buildcfg.NsBuilder] = value
 	}
-	res, err := rt.routeLinkReserveBuild(r.Context(), group, profile, resources)
+	cpuCount := firstNonzero(body.CPUCount, body.CPUCountSn)
+	memoryMB := firstNonzero(body.MemoryMB, body.MemoryMBSn)
+	metadata = sandboxcfg.SetCapacity(metadata, cpuCount, memoryMB)
+	if err := checkNormalizedConfigSize(metadata); err != nil {
+		http.Error(w, "cluster router: build config: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	sandboxMetadata, _, err := buildcfg.Extract(metadata)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if _, err := sandboxcfg.ParseSpec(sandboxMetadata); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	var resources *routesync.BuildResources
+	if cpuCount > 0 || memoryMB > 0 {
+		resources = &routesync.BuildResources{CPU: cpuCount * 1000, Mem: int64(memoryMB) << 20}
+	}
+	res, err := rt.routeLinkReserveBuild(r.Context(), group, profile, resources, metadata)
 	if err != nil {
 		rt.log.Warn("router: reserve-build", "group", group, "err", err)
-		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		status := http.StatusServiceUnavailable
+		var linkErr *routeLinkStatusError
+		if errors.As(err, &linkErr) && linkErr.status == http.StatusBadRequest {
+			status = http.StatusBadRequest
+		}
+		http.Error(w, err.Error(), status)
 		return
 	}
 	rt.buildsMu.Lock()
@@ -386,18 +465,18 @@ func (rt *Router) handleBuildRegister(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// buildResources mirrors routesync.BuildResources for the control request body.
-type buildResources struct {
-	CPU     int   `json:"cpu,omitempty"`
-	Mem     int64 `json:"mem,omitempty"`
-	Storage int64 `json:"storage,omitempty"`
-}
-
 func nonEmptySlice(s string) []string {
 	if s == "" {
 		return []string{}
 	}
 	return []string{s}
+}
+
+func firstNonzero(a, b int) int {
+	if a != 0 {
+		return a
+	}
+	return b
 }
 
 // handleBuildForward routes a build trigger/status/files call to the node that
@@ -1042,10 +1121,14 @@ func (rt *Router) reserveByKey(ctx context.Context, group, routeKey string, crea
 	return f.res, f.err
 }
 
-func (rt *Router) routeLinkReserveBuild(ctx context.Context, group string, profile types.Profile, resources *buildResources) (*buildReserveResult, error) {
-	reqBody, _ := json.Marshal(map[string]any{
-		"group": group, "build_id": "bld-" + randomHexID(), "template_id": "transient-" + randomHexID(), "profile": profile, "resources": resources,
+func (rt *Router) routeLinkReserveBuild(ctx context.Context, group string, profile types.Profile, resources *routesync.BuildResources, metadata map[string]string) (*buildReserveResult, error) {
+	reqBody, err := json.Marshal(registry.BuildReserveReq{
+		Group: group, BuildID: "bld-" + randomHexID(), TemplateID: "transient-" + randomHexID(),
+		Profile: profile, Resources: resources, Metadata: metadata,
 	})
+	if err != nil {
+		return nil, err
+	}
 	resp, err := rt.routeLinkHTTP(ctx, group, http.MethodPost, registry.RouteLinkReserveBuildPath, reqBody, map[string]string{"Content-Type": "application/json"})
 	if err != nil {
 		return nil, err
@@ -1053,7 +1136,9 @@ func (rt *Router) routeLinkReserveBuild(ctx context.Context, group string, profi
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return nil, fmt.Errorf("route_link reserve-build: %s: %s", resp.Status, strings.TrimSpace(string(b)))
+		return nil, &routeLinkStatusError{
+			path: registry.RouteLinkReserveBuildPath, status: resp.StatusCode, body: strings.TrimSpace(string(b)),
+		}
 	}
 	var res buildReserveResult
 	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
@@ -1091,6 +1176,16 @@ func (rt *Router) routeLinkDelete(ctx context.Context, group, routeKey, sid stri
 	return resp.StatusCode, strings.TrimSpace(string(b)), nil
 }
 
+type routeLinkStatusError struct {
+	path   string
+	status int
+	body   string
+}
+
+func (e *routeLinkStatusError) Error() string {
+	return fmt.Sprintf("route_link %s: %s: %s", e.path, http.StatusText(e.status), e.body)
+}
+
 func (rt *Router) routeLinkCall(ctx context.Context, group, method, path string, body []byte, headers map[string]string, out any) error {
 	resp, err := rt.routeLinkHTTP(ctx, group, method, path, body, headers)
 	if err != nil {
@@ -1099,7 +1194,7 @@ func (rt *Router) routeLinkCall(ctx context.Context, group, method, path string,
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return fmt.Errorf("route_link %s: %s: %s", path, resp.Status, strings.TrimSpace(string(b)))
+		return &routeLinkStatusError{path: path, status: resp.StatusCode, body: strings.TrimSpace(string(b))}
 	}
 	return json.NewDecoder(resp.Body).Decode(out)
 }

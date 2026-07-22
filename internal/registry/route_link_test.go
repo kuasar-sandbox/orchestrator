@@ -82,3 +82,41 @@ func TestServeReserveRejectsInvalidRestore(t *testing.T) {
 		t.Fatalf("status=%d body=%s, want 400", w.Code, w.Body.String())
 	}
 }
+
+func TestRouteLinkRejectsOversizedConfigAtTrustBoundary(t *testing.T) {
+	reg := New(NewStores(), nil, 0, nil)
+	oversized := map[string]string{"application": strings.Repeat("x", MaxSandboxConfigBytes)}
+	reserveBody, err := json.Marshal(ReserveSandboxRequest{Config: oversized})
+	if err != nil {
+		t.Fatal(err)
+	}
+	buildBody, err := json.Marshal(map[string]any{
+		"group": "/g", "profile": "e2b", "metadata": oversized,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		name string
+		path string
+		body []byte
+	}{
+		{name: "sandbox", path: RouteLinkReservePath + "?group=%2Fg&route_key=rk", body: reserveBody},
+		{name: "build", path: RouteLinkReserveBuildPath, body: buildBody},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader(string(tc.body)))
+			w := httptest.NewRecorder()
+			switch tc.name {
+			case "sandbox":
+				reg.serveReserve(w, req)
+			case "build":
+				reg.serveReserveBuild(w, req)
+			}
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("status=%d body=%s, want 400", w.Code, w.Body.String())
+			}
+		})
+	}
+}

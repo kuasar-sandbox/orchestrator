@@ -655,6 +655,12 @@ func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, c
 		if freezeConfig {
 			effectiveConfig = cloneStringMap(requestConfig)
 		}
+		// The placer may have added group defaults after the public ingress
+		// validated the create-time map. Recheck the effective per-sandbox
+		// config before any route CAS, node ownership, or lifecycle command.
+		if err := ValidateSandboxConfigSize(effectiveConfig); err != nil {
+			return err
+		}
 		metadata, err := clusterstate.WithObjectLocation(effectiveConfig, clusterstate.ObjectLocation{Group: group, RouteKey: routeKey})
 		if err != nil {
 			return err

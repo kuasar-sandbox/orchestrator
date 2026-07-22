@@ -24,6 +24,27 @@ const (
 	RouteLinkVerifyKeyPath    = "/route-link/verify-key"    // GET  ?group=&api_key=   -> 200 valid / 403 invalid
 )
 
+// MaxSandboxConfigBytes bounds one normalized per-sandbox config before it is
+// nested in placement/route-command envelopes and base64-encoded as a shardkv
+// Record.Value. The raw public control body has its own, larger limit.
+const MaxSandboxConfigBytes = 512 << 10
+
+var ErrSandboxConfigTooLarge = errors.New("registry: sandbox config too large")
+
+// ValidateSandboxConfigSize is shared by the public router and route owner so
+// Header-only requests, direct route-link calls, and group-merged effective
+// configs all obey the same single-record transport budget.
+func ValidateSandboxConfigSize(config map[string]string) error {
+	wire, err := json.Marshal(config)
+	if err != nil {
+		return err
+	}
+	if len(wire) > MaxSandboxConfigBytes {
+		return fmt.Errorf("%w: %d bytes exceeds %d", ErrSandboxConfigTooLarge, len(wire), MaxSandboxConfigBytes)
+	}
+	return nil
+}
+
 // RouteResolve is the data-plane forwarding target the router needs for a sid
 // (the hot path: client -> router -> node DataEndpoint -> guest).
 type RouteResolve struct {
@@ -120,6 +141,10 @@ func (r *Registry) serveReserveBuild(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, fmt.Sprintf("unknown build profile %q", br.Profile), http.StatusBadRequest)
 		return
 	}
+	if err := ValidateSandboxConfigSize(br.Metadata); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 	res, err := r.ReserveBuild(req.Context(), br)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
@@ -159,13 +184,21 @@ func (r *Registry) serveReserve(w http.ResponseWriter, req *http.Request) {
 			}
 		}
 	}
+	if err := ValidateSandboxConfigSize(body.Config); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 	if _, err := sandboxcfg.ParseSpec(body.Config); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	res, err := r.ReserveSandbox(req.Context(), group, routeKey, body.Config)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		status := http.StatusServiceUnavailable
+		if errors.Is(err, ErrSandboxConfigTooLarge) {
+			status = http.StatusBadRequest
+		}
+		http.Error(w, err.Error(), status)
 		return
 	}
 	writeJSON(w, res)

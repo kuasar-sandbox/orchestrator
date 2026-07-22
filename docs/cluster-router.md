@@ -117,6 +117,17 @@ router 在 Reserve 前校验命名空间,非法 `restore` JSON/枚举/字段直�
 重试复用同一份 create config;placer 按 `group sandbox_config ⊕ create config` 合并(create 胜)。
 已有 ready/paused sandbox 的 Reserve 只返回或恢复原实例,新的 create config 不修改其持久策略。
 
+cluster create 和 build-register 请求原始 body 上限为 1 MiB。Header 覆盖后按
+`map[string]string` JSON 编码计算的
+单实例 config 上限为 512 KiB,为 placer、node command 和 route record 的嵌套编码保留空间;
+route owner 在 group defaults 合并后、写 route record 或发 node command 前再次执行同一校验。
+超限请求返回 **400**,不会创建 RESERVED route。
+
+build register 与 node 直连入口保持同一模板配置语义:`X-Kuasar-Sandbox-*` 和
+`X-Kuasar-Sandbox-Builder` Header 被归一化进 `BuildReserveReq.Metadata`,body 中的
+`cpuCount`/`cpu_count`、`memoryMB`/`memory_mb` 再覆盖 resource Header。非法配置在
+ReserveBuild 前返回 **400**;route-link failover 重试复用相同 build/template ID 和 metadata。
+
 ## 6. 缓存模型
 
 ### 6.1 决策顺序

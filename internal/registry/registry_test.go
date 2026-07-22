@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -1281,6 +1282,115 @@ func TestReserveSandboxStrandedReservationKeepsExistingConfig(t *testing.T) {
 	}
 	if _, ok := gotConfig["a"]; ok {
 		t.Fatalf("recovered reservation accepted a later group default: %v", gotConfig)
+	}
+}
+
+func TestReserveSandboxEmptyConfigDoesNotAdoptLaterDefaults(t *testing.T) {
+	ctx := context.Background()
+	reg := testReg(t)
+	reg.SetPlacer(placementWithToken("n1")) // contributes the simulated later group default a=1
+	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reg.stores.PutSandbox(ctx, &SandboxRecord{
+		Group: "/g", RouteKey: "rk", SID: "sb-old", State: StateReady,
+		NodeID: "gone", Config: nil,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var gotConfig map[string]string
+	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(cmd *routesync.Command) {
+		if cmd.Kind != routesync.CmdCreate {
+			return
+		}
+		gotConfig = cloneStringMap(cmd.Config)
+		go reg.ackCommand(&routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted})
+		go reg.applyRoute(context.Background(), "n1", &routesync.RouteEntry{
+			SandboxID: cmd.SID, State: routesync.StateRunning, AccessToken: cmd.AccessToken,
+		})
+	}})
+
+	if _, err := reg.ReserveSandbox(ctx, "/g", "rk", map[string]string{
+		sandboxcfg.NsRestore: `{"prefetch":"memory"}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := gotConfig["a"]; ok {
+		t.Fatalf("empty frozen config adopted a later group default: %v", gotConfig)
+	}
+	if _, ok := gotConfig[sandboxcfg.NsRestore]; ok {
+		t.Fatalf("empty frozen config adopted repeated-create restore policy: %v", gotConfig)
+	}
+	if len(gotConfig) != 1 || gotConfig[clusterstate.ObjectMetadataKey] == "" {
+		t.Fatalf("replacement command metadata=%v, want only canonical cluster identity", gotConfig)
+	}
+}
+
+func TestReserveSandboxRejectsOversizedEffectiveConfigBeforeSideEffects(t *testing.T) {
+	ctx := context.Background()
+	reg := testReg(t)
+	reg.SetPlacer(placementFunc(func(context.Context, PlaceRequest) (*Placement, error) {
+		return &Placement{
+			NodeID: "n1", TemplateRef: "e2b-snp-tmpl",
+			Config: map[string]string{"group-default": strings.Repeat("x", MaxSandboxConfigBytes)},
+		}, nil
+	}))
+	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"}); err != nil {
+		t.Fatal(err)
+	}
+	var commandHits int
+	reg.addNode(&fakeConn{nodeID: "n1", onCmd: func(*routesync.Command) { commandHits++ }})
+
+	if _, err := reg.ReserveSandbox(ctx, "/g", "rk", nil); !errors.Is(err, ErrSandboxConfigTooLarge) {
+		t.Fatalf("ReserveSandbox error=%v, want ErrSandboxConfigTooLarge", err)
+	}
+	if commandHits != 0 {
+		t.Fatalf("oversized effective config sent %d node commands", commandHits)
+	}
+	if rec, _, found, err := reg.stores.GetSandbox(ctx, "/g", "rk"); err != nil || found {
+		t.Fatalf("oversized effective config persisted route: rec=%+v found=%v err=%v", rec, found, err)
+	}
+}
+
+func TestMaxSandboxConfigFitsSingleRecordTransportEnvelopes(t *testing.T) {
+	const key = "application"
+	empty, err := json.Marshal(map[string]string{key: ""})
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := map[string]string{key: strings.Repeat("x", MaxSandboxConfigBytes-len(empty))}
+	configWire, err := json.Marshal(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(configWire) != MaxSandboxConfigBytes {
+		t.Fatalf("config wire size=%d, want %d", len(configWire), MaxSandboxConfigBytes)
+	}
+
+	recordWire, err := json.Marshal(&SandboxRecord{
+		Group: "/g", RouteKey: "rk", SID: "sb-1", State: StateReserved,
+		NodeID: "n1", TemplateID: "e2b-snp-template", Config: config,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestWire, err := json.Marshal(shardkv.Request{
+		Op: shardkv.OpAccept, Label: "registry", Namespace: "route_link", Shard: "/g",
+		RecordSet: "sandbox", Key: "rk", Record: shardkv.Record{Value: recordWire},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(requestWire) >= 1<<20 {
+		t.Fatalf("single-record shardkv envelope=%d bytes, want below 1 MiB", len(requestWire))
+	}
+
+	var frame bytes.Buffer
+	if err := routesync.WriteMsg(&frame, &routesync.Msg{
+		Type: routesync.TypeCommand,
+		Cmd:  &routesync.Command{CmdID: "c1", Kind: routesync.CmdCreate, SID: "sb-1", Config: config},
+	}); err != nil {
+		t.Fatalf("max config did not fit one node command frame: %v", err)
 	}
 }
 
