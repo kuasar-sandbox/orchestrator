@@ -38,6 +38,11 @@ func TestResolveTemplateAlias(t *testing.T) {
 			t.Errorf("%s: resolveTemplateAlias(%q)=%q want %q", name, ref, got, persist)
 		}
 	}
+	currentManifestKey := strings.Repeat("6", 64)
+	gotManifestKey, err := templateManifestKey(currentManifestKey, o.templateBuild(ctx, apiKey, "my-app"))
+	if err != nil || gotManifestKey != b.ManifestKey {
+		t.Fatalf("rotated group key selected template ManifestKey %q, %v; want %q", gotManifestKey, err, b.ManifestKey)
+	}
 	if got := o.resolveTemplateAlias(ctx, apiKey, "nope"); got != "" {
 		t.Errorf(`unknown ref should be "", got %q`, got)
 	}
@@ -45,5 +50,16 @@ func TestResolveTemplateAlias(t *testing.T) {
 	other, _ := apikey.Mint([]byte(strings.Repeat("\x05", 32)))
 	if got := o.resolveTemplateAlias(ctx, other, "my-app"); got != "" {
 		t.Errorf(`wrong tenant should be "", got %q`, got)
+	}
+}
+
+func TestTemplateManifestKeyFallbackAndValidation(t *testing.T) {
+	currentManifestKey := strings.Repeat("6", 64)
+	got, err := templateManifestKey(currentManifestKey, nil)
+	if err != nil || got != currentManifestKey {
+		t.Fatalf("self-describing template ManifestKey = %q, %v", got, err)
+	}
+	if _, err := templateManifestKey(currentManifestKey, &types.Build{}); err == nil {
+		t.Fatal("ready template without its immutable ManifestKey was accepted")
 	}
 }
