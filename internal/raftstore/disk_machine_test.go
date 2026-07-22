@@ -40,6 +40,55 @@ func TestSnapshotRejectsRouteChangeBeyondLastApplied(t *testing.T) {
 	}
 }
 
+func TestPebblePlacementRetryLoadsCommittedFence(t *testing.T) {
+	engine, err := OpenPebbleStateEngine(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close()
+	registryLayout := testRegistryLayout(4, "generation-placement-retry")
+	group, routeKey := "/g", "rk-placement-retry"
+	identity := routeShardIdentity(t, registryLayout, group, routeKey)
+	machine := engine.NewStateMachine(DataRaftShardID(identity.ShardID), 1)
+	if _, err := machine.Open(make(chan struct{})); err != nil {
+		t.Fatal(err)
+	}
+	bootstrap, _ := NewDataShardBootstrap(registryLayout, identity.ShardID)
+	applyDiskData(t, machine, 1, DataCommand{
+		Type: DataInitializeShard, Identity: identity, Bootstrap: &bootstrap,
+		ReplicaIDs: append([]uint64(nil), bootstrap.ReplicaIDs...),
+	})
+	starting := routeStarting(t, registryLayout, group, routeKey, "sandbox-1", 1, false)
+	starting.Starting.DefinitivelyRejected = []uint32{0, 1}
+	applyDiskData(t, machine, 2, DataCommand{
+		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{Absent: true}, Route: &starting,
+	})
+	failure := clusterstate.RoutePlacementFailureState{
+		SandboxID: starting.Starting.SandboxID, PlacementRound: starting.Starting.PlacementRound,
+		CandidatePool:        append([]clusterstate.PlacementCandidate(nil), starting.Starting.CandidatePool...),
+		DefinitivelyRejected: append([]uint32(nil), starting.Starting.DefinitivelyRejected...),
+		Intent:               starting.Starting.Intent, Reason: "placement candidate pool exhausted",
+	}
+	tombstone := clusterstate.RouteWorkflowRecord{
+		Group: group, RouteKey: routeKey, State: clusterstate.WorkflowRouteTombstone,
+		Tombstone: &clusterstate.RouteTombstoneState{PlacementFailure: &failure},
+	}
+	applyDiskData(t, machine, 3, DataCommand{
+		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{LogIndex: 2}, Route: &tombstone,
+	})
+	fence, err := clusterstate.NewPlacementFailureFence(group, routeKey, registryLayout.RegistryGeneration, failure)
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyDiskData(t, machine, 4, DataCommand{
+		Type: DataPutFence, Identity: identity, Expect: RevisionExpectation{Absent: true}, Fence: &fence,
+	})
+	next := routeStarting(t, registryLayout, group, routeKey, "sandbox-2", 2, false)
+	applyDiskData(t, machine, 5, DataCommand{
+		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{LogIndex: 3}, Route: &next,
+	})
+}
+
 func TestPendingDiskScanSeeksFromQualifiedCursor(t *testing.T) {
 	prefix := []byte("slot/")
 	buildPrefix := stateTablePrefix(prefix, stateBuildTable)
@@ -409,16 +458,35 @@ func TestPebbleSnapshotRecoverySpansMultipleSyncedBatches(t *testing.T) {
 	if err := target.RecoverFromSnapshot(bytes.NewReader(snapshot.Bytes()), make(chan struct{})); err != nil {
 		t.Fatal(err)
 	}
-	value, err := target.Lookup(DataLookup{Pending: &PendingLookup{Identity: identity, Limit: routeCount + 1}})
-	if err != nil {
-		t.Fatal(err)
+	after, recovered := "", 0
+	for {
+		value, err := target.Lookup(DataLookup{Pending: &PendingLookup{
+			Identity: identity, AfterKey: after, Limit: routeCount + 1,
+		}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		pending := value.(DataLookupResult).Pending
+		if pending == nil || len(pending.Workflows) == 0 {
+			t.Fatalf("recovered pending workflows = %+v", pending)
+		}
+		encoded, err := json.Marshal(pending)
+		if err != nil || len(encoded) > MaxPendingLookupResponseBytes {
+			t.Fatalf("pending page bytes = %d, err=%v", len(encoded), err)
+		}
+		for _, workflow := range pending.Workflows {
+			if workflow.Route == nil {
+				t.Fatal("recovered snapshot returned a non-Route workflow")
+			}
+		}
+		recovered += len(pending.Workflows)
+		if pending.NextKey == "" {
+			break
+		}
+		after = pending.NextKey
 	}
-	pending := value.(DataLookupResult).Pending
-	if pending == nil || len(pending.Workflows) != routeCount || pending.NextKey != "" {
-		t.Fatalf("recovered pending workflows = %+v", pending)
-	}
-	if pending.Workflows[0].Route == nil || pending.Workflows[len(pending.Workflows)-1].Route == nil || len(routeKeys) != routeCount {
-		t.Fatal("recovered snapshot lost Route rows")
+	if recovered != routeCount || len(routeKeys) != routeCount {
+		t.Fatalf("recovered %d pending workflows, want %d", recovered, routeCount)
 	}
 }
 

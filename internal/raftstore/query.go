@@ -2,7 +2,9 @@ package raftstore
 
 import (
 	"container/heap"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"sort"
 
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
@@ -103,8 +105,8 @@ func LookupData(state DataState, query DataLookup) (DataLookupResult, error) {
 		response := lookupFence(state, *query.Fence)
 		return DataLookupResult{Fence: &response}, nil
 	default:
-		response := lookupPending(state, *query.Pending)
-		return DataLookupResult{Pending: &response}, nil
+		response, err := lookupPending(state, *query.Pending)
+		return DataLookupResult{Pending: &response}, err
 	}
 }
 
@@ -529,6 +531,8 @@ type PendingLookup struct {
 	Limit    uint32               `json:"limit"`
 }
 
+const MaxPendingLookupResponseBytes = 8 << 20
+
 func (q PendingLookup) Validate() error {
 	if err := q.Identity.Validate(); err != nil {
 		return err
@@ -550,35 +554,96 @@ type PendingLookupResult struct {
 	NextKey   string            `json:"next_key,omitempty"`
 }
 
-func lookupPending(state DataState, query PendingLookup) PendingLookupResult {
-	if !state.Accepts(query.Identity) {
-		return PendingLookupResult{}
+type pendingWorkflowReference struct {
+	key     string
+	mapKey  string
+	isRoute bool
+}
+
+type pendingPageBuilder struct {
+	limit        int
+	payloadBytes int
+	hasMore      bool
+	workflows    []PendingWorkflow
+}
+
+func newPendingPageBuilder(limit uint32) *pendingPageBuilder {
+	return &pendingPageBuilder{limit: int(limit), workflows: make([]PendingWorkflow, 0, limit)}
+}
+
+func (b *pendingPageBuilder) add(workflow PendingWorkflow) (bool, error) {
+	encoded, err := json.Marshal(workflow)
+	if err != nil {
+		return false, fmt.Errorf("raftstore: encode pending workflow: %w", err)
 	}
-	workflows := make([]PendingWorkflow, 0)
+	key, err := json.Marshal(workflow.Key)
+	if err != nil {
+		return false, fmt.Errorf("raftstore: encode pending workflow key: %w", err)
+	}
+	payloadBytes := b.payloadBytes + len(encoded)
+	if len(b.workflows) != 0 {
+		payloadBytes++
+	}
+	// Reserve NextKey even if this turns out to be the final row. A page that
+	// stops on either count or bytes therefore always fits the same bound.
+	responseBytes := len(`{"workflows":[`) + payloadBytes + len(`],"next_key":`) + len(key) + 1
+	if len(b.workflows) >= b.limit || responseBytes > MaxPendingLookupResponseBytes {
+		if len(b.workflows) == 0 {
+			return false, errors.New("raftstore: one pending workflow exceeds the response byte limit")
+		}
+		b.hasMore = true
+		return false, nil
+	}
+	b.payloadBytes = payloadBytes
+	b.workflows = append(b.workflows, workflow)
+	return true, nil
+}
+
+func (b *pendingPageBuilder) result() PendingLookupResult {
+	result := PendingLookupResult{Workflows: b.workflows}
+	if b.hasMore {
+		result.NextKey = b.workflows[len(b.workflows)-1].Key
+	}
+	return result
+}
+
+func lookupPending(state DataState, query PendingLookup) (PendingLookupResult, error) {
+	if !state.Accepts(query.Identity) {
+		return PendingLookupResult{}, nil
+	}
+	references := make([]pendingWorkflowReference, 0)
 	for key, record := range state.Routes {
 		qualified := "r" + key
 		if qualified > query.AfterKey && routeNeedsCoordinator(record) {
-			copy := cloneRouteRecord(record)
-			workflows = append(workflows, PendingWorkflow{Key: qualified, Route: &copy})
+			references = append(references, pendingWorkflowReference{key: qualified, mapKey: key, isRoute: true})
 		}
 	}
 	for key, record := range state.Builds {
 		qualified := "b" + key
 		if qualified > query.AfterKey && buildNeedsCoordinator(record) {
-			copy := cloneBuildRecord(record)
-			workflows = append(workflows, PendingWorkflow{Key: qualified, Build: &copy})
+			references = append(references, pendingWorkflowReference{key: qualified, mapKey: key})
 		}
 	}
-	sort.Slice(workflows, func(i, j int) bool { return workflows[i].Key < workflows[j].Key })
-	hasMore := len(workflows) > int(query.Limit)
-	if hasMore {
-		workflows = workflows[:query.Limit]
+	sort.Slice(references, func(i, j int) bool { return references[i].key < references[j].key })
+	builder := newPendingPageBuilder(query.Limit)
+	for _, reference := range references {
+		workflow := PendingWorkflow{Key: reference.key}
+		if reference.isRoute {
+			record := cloneRouteRecord(state.Routes[reference.mapKey])
+			workflow.Route = &record
+		} else {
+			record := cloneBuildRecord(state.Builds[reference.mapKey])
+			workflow.Build = &record
+		}
+		accepted, err := builder.add(workflow)
+		if err != nil {
+			return PendingLookupResult{}, err
+		}
+		if !accepted {
+			break
+		}
 	}
-	result := PendingLookupResult{Workflows: workflows}
-	if hasMore {
-		result.NextKey = workflows[len(workflows)-1].Key
-	}
-	return result
+	return builder.result(), nil
 }
 
 func routeNeedsCoordinator(record clusterstate.RouteWorkflowRecord) bool {

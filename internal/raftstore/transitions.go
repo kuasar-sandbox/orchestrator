@@ -211,16 +211,21 @@ func validateRouteReplacement(
 ) error {
 	if current.Tombstone.PlacementFailure != nil {
 		failure := current.Tombstone.PlacementFailure
-		key := fenceMapKey(current.Group, current.RouteKey, failure.SandboxID)
-		fence, found := fences[key]
-		if !found || !placementFenceMatchesFailure(fence, current.Group, current.RouteKey, *failure) {
-			return errors.New("raftstore: placement retry has no committed abandoned-SID fence")
-		}
 		if next.Starting.SandboxID == failure.SandboxID ||
 			next.Starting.PlacementRound != failure.PlacementRound+1 ||
 			next.Starting.SelectedCandidate != nil || next.Starting.Binding != nil ||
 			len(next.Starting.DefinitivelyRejected) != 0 || next.Starting.LastEventSeq != 0 {
 			return errors.New("raftstore: placement retry requires a clean next round and a new SID")
+		}
+		if current.Tombstone.FenceCompacted {
+			return nil
+		}
+		key := fenceMapKey(current.Group, current.RouteKey, failure.SandboxID)
+		fence, found := fences[key]
+		if !found || !placementFenceMatchesFailure(
+			fence, current.Group, current.RouteKey, current.Revision.RegistryGeneration, *failure,
+		) {
+			return errors.New("raftstore: placement retry has no committed abandoned-SID fence")
 		}
 		return nil
 	}
@@ -390,7 +395,7 @@ func readyMatchesStarting(starting clusterstate.RouteStartingState, ready cluste
 func validateStartingTombstone(starting clusterstate.RouteStartingState, tombstone clusterstate.RouteTombstoneState) error {
 	if tombstone.PlacementFailure != nil {
 		failure := tombstone.PlacementFailure
-		if starting.SelectedCandidate != nil || starting.Binding != nil ||
+		if tombstone.FenceCompacted || starting.SelectedCandidate != nil || starting.Binding != nil ||
 			len(starting.DefinitivelyRejected) != len(starting.CandidatePool) ||
 			failure.SandboxID != starting.SandboxID || failure.PlacementRound != starting.PlacementRound ||
 			!reflect.DeepEqual(failure.CandidatePool, starting.CandidatePool) ||
@@ -574,17 +579,16 @@ func compactionReplicaIDs(state DataState) []uint64 {
 
 func fenceMatchesRouteTombstone(fence clusterstate.ExecutionFence, route clusterstate.RouteWorkflowRecord) bool {
 	if route.State != clusterstate.WorkflowRouteTombstone || route.Tombstone == nil ||
-		route.Group != fence.Group || route.RouteKey != fence.RouteKey {
+		route.Tombstone.FenceCompacted || route.Group != fence.Group || route.RouteKey != fence.RouteKey {
 		return false
 	}
 	if route.Tombstone.PlacementFailure != nil {
 		return placementFenceMatchesFailure(
-			fence, route.Group, route.RouteKey, *route.Tombstone.PlacementFailure,
+			fence, route.Group, route.RouteKey, route.Revision.RegistryGeneration, *route.Tombstone.PlacementFailure,
 		)
 	}
 	return fence.PlacementFailure == nil && route.Tombstone.SandboxID == fence.SandboxID &&
 		route.Tombstone.NodeID == fence.NodeID && route.Tombstone.NodeEpoch == fence.NodeEpoch &&
-		!route.Tombstone.FenceCompacted &&
 		route.Tombstone.RegistryGeneration == fence.RegistryGeneration &&
 		route.Tombstone.LastEventSeq == fence.LastEventSeq &&
 		route.Tombstone.BindingDigest == fence.BindingDigest && route.Tombstone.Proof == fence.Proof
@@ -594,13 +598,17 @@ func placementFenceMatchesFailure(
 	fence clusterstate.ExecutionFence,
 	group string,
 	routeKey string,
+	registryGeneration string,
 	failure clusterstate.RoutePlacementFailureState,
 ) bool {
 	if fence.Group != group || fence.RouteKey != routeKey || fence.SandboxID != failure.SandboxID ||
+		fence.RegistryGeneration != registryGeneration ||
 		fence.PlacementFailure == nil || !reflect.DeepEqual(*fence.PlacementFailure, failure) {
 		return false
 	}
-	digest, err := clusterstate.PlacementFailureProofDigest(failure)
+	digest, err := clusterstate.PlacementFailureProofDigest(
+		group, routeKey, registryGeneration, failure,
+	)
 	return err == nil && digest == fence.PlacementFailureDigest
 }
 

@@ -439,7 +439,7 @@ type RouteTombstoneState struct {
 func (s RouteTombstoneState) Validate() error {
 	if s.PlacementFailure != nil {
 		if s.SandboxID != "" || s.NodeID != "" || s.NodeEpoch != 0 || s.LastEventSeq != 0 ||
-			s.RegistryGeneration != "" || s.BindingDigest != "" || s.FenceCompacted || s.TerminalReason != "" ||
+			s.RegistryGeneration != "" || s.BindingDigest != "" || s.TerminalReason != "" ||
 			s.Proof != (TerminalProof{}) || s.FailureRevision != (Revision{}) {
 			return errors.New("cluster: placement-failure TOMBSTONE cannot contain an execution proof")
 		}

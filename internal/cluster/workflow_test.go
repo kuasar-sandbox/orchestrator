@@ -126,6 +126,11 @@ func TestPlacementFailuresDoNotInventExecutionProof(t *testing.T) {
 	if err := route.Validate(); err != nil {
 		t.Fatal(err)
 	}
+	route.Tombstone.FenceCompacted = true
+	if err := route.Validate(); err != nil {
+		t.Fatalf("compacted placement-failure tombstone: %v", err)
+	}
+	route.Tombstone.FenceCompacted = false
 	route.Tombstone.PlacementFailure.DefinitivelyRejected = []uint32{0}
 	if err := route.Validate(); err == nil {
 		t.Fatal("Route placement failure accepted a non-exhausted pool")
