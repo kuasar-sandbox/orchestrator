@@ -9,8 +9,11 @@ import (
 	"unicode/utf8"
 )
 
+const maxCanonicalEndpointBytes = 512
+
 func ValidateTCPDataEndpoint(endpoint string) error {
-	if endpoint == "" || !utf8.ValidString(endpoint) || strings.TrimSpace(endpoint) != endpoint {
+	if endpoint == "" || len(endpoint) > maxCanonicalEndpointBytes || !utf8.ValidString(endpoint) ||
+		strings.TrimSpace(endpoint) != endpoint {
 		return errors.New("cluster: data endpoint must be a canonical TCP host:port")
 	}
 	host, portText, err := net.SplitHostPort(endpoint)
@@ -30,7 +33,8 @@ func ValidateTCPDataEndpoint(endpoint string) error {
 }
 
 func ValidateCanonicalHTTPSBaseEndpoint(endpoint string) error {
-	if endpoint == "" || !utf8.ValidString(endpoint) || strings.TrimSpace(endpoint) != endpoint {
+	if endpoint == "" || len(endpoint) > maxCanonicalEndpointBytes || !utf8.ValidString(endpoint) ||
+		strings.TrimSpace(endpoint) != endpoint {
 		return errors.New("cluster: service endpoint must be a canonical HTTPS base URL")
 	}
 	parsed, err := url.Parse(endpoint)
