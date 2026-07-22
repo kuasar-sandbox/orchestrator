@@ -75,6 +75,30 @@ func TestProbeFreshnessAndUnknownCapacityFailClosed(t *testing.T) {
 	}
 }
 
+func TestQueueFullIsTransientRatherThanDefinitiveRejection(t *testing.T) {
+	snapshot := baseSnapshot()
+	snapshot.SandboxRateTokenAvailable = false
+	snapshot.SandboxQueueDepth = snapshot.SandboxQueueLimit
+	sandbox := PlacementProbeRequest{
+		Kind: ObjectSandbox, NodeID: "n1", ExpectedNodeEpoch: 7, ExpectedSessionSeq: 11,
+		LoadModelVersion: LoadModelVersion, Sandbox: &SandboxDemand{SlotUnits: 1, StartupBudgetMemory: 1},
+	}
+	if got := ProbePlacement(snapshot, 0, sandbox); got.Class != ProbeStale {
+		t.Fatalf("full Sandbox queue probe = %+v", got)
+	}
+
+	snapshot = baseSnapshot()
+	snapshot.BuildRateTokenAvailable = false
+	snapshot.BuildQueueDepth = snapshot.BuildQueueLimit
+	build := PlacementProbeRequest{
+		Kind: ObjectBuild, NodeID: "n1", ExpectedNodeEpoch: 7, ExpectedSessionSeq: 11,
+		LoadModelVersion: LoadModelVersion, Build: &BuildDemand{Slots: 1},
+	}
+	if got := ProbePlacement(snapshot, 0, build); got.Class != ProbeStale {
+		t.Fatalf("full Build queue probe = %+v", got)
+	}
+}
+
 func TestProbeRejectsUnknownSafetyState(t *testing.T) {
 	snapshot := baseSnapshot()
 	request := PlacementProbeRequest{

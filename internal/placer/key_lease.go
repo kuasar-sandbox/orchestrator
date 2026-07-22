@@ -29,36 +29,28 @@ func ResolveNodeKeyLease(
 	if provider == nil || group == "" || expiresUnix <= 0 {
 		return routesync.NodeKeyLeaseV1{}, errors.New("placer: Provider, group, and key lease expiry are required")
 	}
-	groupConfig, found, err := provider.Get(ctx, group)
+	groupRecord, found, err := provider.GetRecord(ctx, group)
 	if err != nil {
 		return routesync.NodeKeyLeaseV1{}, err
 	}
-	if !found || groupConfig.Group != group {
+	if !found || groupRecord.Group != group {
 		return routesync.NodeKeyLeaseV1{}, errors.New("placer: group is not present in Provider")
 	}
-	authSecret, found, err := provider.GetAuthKey(ctx, group)
-	if err != nil {
-		return routesync.NodeKeyLeaseV1{}, err
-	}
-	if !found {
+	if groupRecord.AuthKey.Value == "" {
 		return routesync.NodeKeyLeaseV1{}, errors.New("placer: group has no AuthKey")
 	}
-	manifestSecret, found, err := provider.GetManifestKey(ctx, group)
-	if err != nil {
-		return routesync.NodeKeyLeaseV1{}, err
-	}
-	if !found {
+	if groupRecord.ManifestKey.Value == "" {
 		return routesync.NodeKeyLeaseV1{}, errors.New("placer: group has no ManifestKey")
 	}
-	authKey, err := nodeKeyMaterial("AuthKey", authSecret)
+	authKey, err := nodeKeyMaterial("AuthKey", groupRecord.AuthKey)
 	if err != nil {
 		return routesync.NodeKeyLeaseV1{}, err
 	}
-	manifestKey, err := nodeKeyMaterial("ManifestKey", manifestSecret)
+	manifestKey, err := nodeKeyMaterial("ManifestKey", groupRecord.ManifestKey)
 	if err != nil {
 		return routesync.NodeKeyLeaseV1{}, err
 	}
-	registryAuth, err := nodeRegistryAuth(groupConfig.RegistryAuth)
+	registryAuth, err := nodeRegistryAuth(groupRecord.RegistryAuth)
 	if err != nil {
 		return routesync.NodeKeyLeaseV1{}, err
 	}

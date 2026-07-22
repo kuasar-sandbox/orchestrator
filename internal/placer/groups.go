@@ -69,6 +69,10 @@ func NewFileGroupSource(sourceID, dir string) (*fileGroupSource, error) {
 
 type emptyGroupProvider struct{}
 
+func (emptyGroupProvider) GetRecord(context.Context, string) (clusterstate.SandboxGroupRecord, bool, error) {
+	return clusterstate.SandboxGroupRecord{}, false, nil
+}
+
 func (emptyGroupProvider) Get(context.Context, string) (clusterstate.SandboxGroup, bool, error) {
 	return clusterstate.SandboxGroup{}, false, nil
 }
@@ -87,6 +91,26 @@ func (emptyGroupProvider) GetAuthKey(context.Context, string) (clusterstate.Secr
 
 type multiGroupProvider struct {
 	sources []*fileGroupSource
+}
+
+func (m multiGroupProvider) GetRecord(ctx context.Context, group string) (clusterstate.SandboxGroupRecord, bool, error) {
+	var out clusterstate.SandboxGroupRecord
+	foundOne := ""
+	for _, source := range m.sources {
+		record, found, err := source.GetRecord(ctx, group)
+		if err != nil {
+			return clusterstate.SandboxGroupRecord{}, false, err
+		}
+		if !found {
+			continue
+		}
+		if foundOne != "" {
+			return clusterstate.SandboxGroupRecord{}, false, duplicateGroupError(group, foundOne, source.sourceID)
+		}
+		foundOne = source.sourceID
+		out = record
+	}
+	return out, foundOne != "", nil
 }
 
 func (m multiGroupProvider) Get(ctx context.Context, group string) (clusterstate.SandboxGroup, bool, error) {
@@ -176,6 +200,10 @@ func duplicateGroupError(group, firstSource, secondSource string) error {
 type fileGroupSource struct {
 	sourceID string
 	dir      string
+}
+
+func (s *fileGroupSource) GetRecord(ctx context.Context, group string) (clusterstate.SandboxGroupRecord, bool, error) {
+	return s.find(ctx, group)
 }
 
 func (s *fileGroupSource) Get(ctx context.Context, group string) (clusterstate.SandboxGroup, bool, error) {
