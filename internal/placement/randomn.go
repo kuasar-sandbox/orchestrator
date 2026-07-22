@@ -6,6 +6,7 @@ import (
 	"io"
 	"math/big"
 	"sort"
+	"unicode/utf8"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/cluster"
 )
@@ -80,7 +81,7 @@ func filterCatalog(nodes []CatalogNode, policy StaticPolicy, capacity func(Catal
 	eligible := make([]CatalogNode, 0, len(nodes))
 	seen := make(map[string]struct{}, len(nodes))
 	for _, node := range nodes {
-		if node.NodeID == "" || node.Draining || !capacity(node) || !matchesSelectors(node.Labels, policy.Selectors) {
+		if !catalogNodeCanFormCandidate(node) || node.Draining || !capacity(node) || !matchesSelectors(node.Labels, policy.Selectors) {
 			continue
 		}
 		if _, duplicate := seen[node.NodeID]; duplicate {
@@ -116,6 +117,18 @@ func filterCatalog(nodes []CatalogNode, policy StaticPolicy, capacity func(Catal
 		eligible = append(eligible, node)
 	}
 	return eligible
+}
+
+func catalogNodeCanFormCandidate(node CatalogNode) bool {
+	if err := cluster.ValidateExecutionBindingNodeID(node.NodeID); err != nil {
+		return false
+	}
+	for _, value := range []string{node.FailureDomain, node.RuntimeDigest} {
+		if !utf8.ValidString(value) || len(value) > cluster.MaxPlacementCandidateMetadataBytes {
+			return false
+		}
+	}
+	return true
 }
 
 func randomN(nodes []CatalogNode, n int, source IndexSource, exposeRuntimeDigest bool) ([]cluster.PlacementCandidate, error) {

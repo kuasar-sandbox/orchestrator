@@ -54,8 +54,12 @@ func (d SandboxAdmissionDemand) Validate() error {
 	if d.FloorMemoryBytes > d.CapacityMemoryBytes || d.FloorCPU > float64(d.CapacityCPU) {
 		return errors.New("nodectl: sandbox floor exceeds capacity")
 	}
-	if computeEffectiveStartupBudget(d.message("validation")) == 0 {
+	startupBudget := computeEffectiveStartupBudget(d.message("validation"))
+	if startupBudget == 0 {
 		return errors.New("nodectl: sandbox startup demand is empty")
+	}
+	if startupBudget > d.CapacityMemoryBytes {
+		return errors.New("nodectl: sandbox startup demand exceeds capacity")
 	}
 	return nil
 }

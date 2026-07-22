@@ -336,6 +336,32 @@ func TestHolderRejectsStableRegistrationChangesWithinNodeEpoch(t *testing.T) {
 	}
 }
 
+func TestHolderRegistrationDoesNotExposeMutableMaps(t *testing.T) {
+	registration := testRegistration("node-1", 7, 10, "10.0.0.1:8443")
+	registration.Labels = map[string]string{"pool": "default"}
+	registration.Capabilities = map[string]bool{"sandbox": true}
+	authority := newTestEnrollmentAuthority(registration)
+	holder, err := NewHolder("registry-a", 1, nil, testGate(true), nil, authority)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := holder.Register(context.Background(), registration, &testEndpoint{}); err != nil {
+		t.Fatal(err)
+	}
+	registration.Labels["pool"] = "mutated-input"
+	registration.Capabilities["sandbox"] = false
+	stored, ok := holder.Registration(registration.NodeID)
+	if !ok || stored.Labels["pool"] != "default" || !stored.Capabilities["sandbox"] {
+		t.Fatalf("stored registration aliased input maps: %+v", stored)
+	}
+	stored.Labels["pool"] = "mutated-output"
+	stored.Capabilities["sandbox"] = false
+	again, ok := holder.Registration(registration.NodeID)
+	if !ok || again.Labels["pool"] != "default" || !again.Capabilities["sandbox"] {
+		t.Fatalf("stored registration was mutated through returned maps: %+v", again)
+	}
+}
+
 func TestRegistrationRequiresSandboxCapacity(t *testing.T) {
 	registration := testRegistration("builder-1", 1, 1, "10.0.0.2:8443")
 	registration.SandboxSlots = 0
