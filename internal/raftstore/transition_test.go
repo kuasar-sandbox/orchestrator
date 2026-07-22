@@ -185,6 +185,10 @@ func TestRuntimeReconcilesAndFinalizesRegistryLayoutTransition(t *testing.T) {
 	if err != nil || retried.Transition != nil || retried.ActiveRegistryLayoutDigest != nextDigest {
 		t.Fatalf("retry finalized transition = %+v, %v", retried, err)
 	}
+	redrained, err := runtime.ConfirmRegistryLayoutTransitionPermitDrain(ctx)
+	if err != nil || redrained.Transition != nil || redrained.ActiveRegistryLayoutDigest != nextDigest {
+		t.Fatalf("retry drain after finalized transition = %+v, %v", redrained, err)
+	}
 	if err := validateRetiredEpoch(data, activated.Identity(), []uint64{1, 2, 4}); err != nil {
 		t.Fatal(err)
 	}

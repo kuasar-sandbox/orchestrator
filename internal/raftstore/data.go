@@ -429,8 +429,13 @@ func ApplyDataCommand(state *DataState, index uint64, command DataCommand) DataA
 			if err := validateRouteTransition(current, record, state.Fences); err != nil {
 				return conflict(err.Error(), current.Revision.LogIndex)
 			}
-		} else if record.State != clusterstate.WorkflowRouteStarting {
-			return conflict("new Route must begin in STARTING", 0)
+		} else {
+			if record.State != clusterstate.WorkflowRouteStarting {
+				return conflict("new Route must begin in STARTING", 0)
+			}
+			if len(record.Finalizations) != 0 {
+				return conflict("new Route cannot carry workflow finalizations", 0)
+			}
 		}
 		state.Routes[key] = record
 		state.RouteChanges = append(state.RouteChanges, RouteChange{
@@ -461,8 +466,13 @@ func ApplyDataCommand(state *DataState, index uint64, command DataCommand) DataA
 			if err := validateBuildTransition(current, record); err != nil {
 				return conflict(err.Error(), current.Revision.LogIndex)
 			}
-		} else if record.State != clusterstate.BuildStarting {
-			return conflict("new Build must begin in BUILD_STARTING", 0)
+		} else {
+			if record.State != clusterstate.BuildStarting {
+				return conflict("new Build must begin in BUILD_STARTING", 0)
+			}
+			if len(record.Finalizations) != 0 {
+				return conflict("new Build cannot carry workflow finalizations", 0)
+			}
 		}
 		state.Builds[key] = record
 	case DataPutFence:

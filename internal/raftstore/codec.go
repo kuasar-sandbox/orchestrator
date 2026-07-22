@@ -6,11 +6,16 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"reflect"
+	"unicode/utf8"
 )
 
 const MaxRaftCommandBytes = 4 << 20
 
 func EncodeSystemCommand(command SystemCommand) ([]byte, error) {
+	if err := validateUTF8Strings(reflect.ValueOf(command)); err != nil {
+		return nil, err
+	}
 	if err := validateSystemCommandEnvelope(command); err != nil {
 		return nil, err
 	}
@@ -29,6 +34,9 @@ func DecodeSystemCommand(raw []byte) (SystemCommand, error) {
 }
 
 func EncodeDataCommand(command DataCommand) ([]byte, error) {
+	if err := validateUTF8Strings(reflect.ValueOf(command)); err != nil {
+		return nil, err
+	}
 	if err := validateDataCommandEnvelope(command); err != nil {
 		return nil, err
 	}
@@ -174,6 +182,9 @@ func unmarshalStrictBounded(raw []byte, out any, maximum int) error {
 	if len(raw) == 0 || len(raw) > maximum {
 		return fmt.Errorf("raftstore: encoded value must be between 1 and %d bytes", maximum)
 	}
+	if !utf8.Valid(raw) {
+		return errors.New("raftstore: encoded value contains invalid UTF-8")
+	}
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(out); err != nil {
@@ -182,6 +193,49 @@ func unmarshalStrictBounded(raw []byte, out any, maximum int) error {
 	var extra any
 	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
 		return errors.New("raftstore: encoded value contains trailing JSON")
+	}
+	return nil
+}
+
+func validateUTF8Strings(value reflect.Value) error {
+	if !value.IsValid() {
+		return nil
+	}
+	switch value.Kind() {
+	case reflect.Interface, reflect.Pointer:
+		if value.IsNil() {
+			return nil
+		}
+		return validateUTF8Strings(value.Elem())
+	case reflect.String:
+		if !utf8.ValidString(value.String()) {
+			return errors.New("raftstore: command contains invalid UTF-8")
+		}
+	case reflect.Struct:
+		for index := 0; index < value.NumField(); index++ {
+			if err := validateUTF8Strings(value.Field(index)); err != nil {
+				return err
+			}
+		}
+	case reflect.Array, reflect.Slice:
+		if value.Type().Elem().Kind() == reflect.Uint8 {
+			return nil
+		}
+		for index := 0; index < value.Len(); index++ {
+			if err := validateUTF8Strings(value.Index(index)); err != nil {
+				return err
+			}
+		}
+	case reflect.Map:
+		iterator := value.MapRange()
+		for iterator.Next() {
+			if err := validateUTF8Strings(iterator.Key()); err != nil {
+				return err
+			}
+			if err := validateUTF8Strings(iterator.Value()); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
 }

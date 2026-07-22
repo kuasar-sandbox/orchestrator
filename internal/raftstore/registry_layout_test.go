@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -190,6 +191,14 @@ func TestRegistryLayoutRejectsIncompleteOrUnstablePlacement(t *testing.T) {
 				t.Fatalf("invalid Raft endpoint %q accepted", endpoint)
 			}
 		})
+	}
+}
+
+func TestRegistryLayoutFitsRaftCommandEnvelope(t *testing.T) {
+	registryLayout := testRegistryLayout(1, "generation-layout-size")
+	registryLayout.ClusterID = strings.Repeat("c", MaxRegistryLayoutBytes)
+	if err := registryLayout.Validate(); err == nil {
+		t.Fatal("oversized Registry Layout was accepted")
 	}
 }
 
