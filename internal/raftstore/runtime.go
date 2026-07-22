@@ -120,6 +120,7 @@ func openRuntime(
 	if len(registryLayoutChain) == 0 || factory == nil {
 		return nil, errors.New("raftstore: a signed registryLayout chain and NodeHost factory are required")
 	}
+	registryLayoutChain = cloneSignedRegistryLayoutChain(registryLayoutChain)
 	resolvedConfig, err := config.resolvedStoragePaths()
 	if err != nil {
 		return nil, err
@@ -268,6 +269,15 @@ func openRuntime(
 	}
 	systemEvents.bind(runtime)
 	return runtime, nil
+}
+
+func cloneSignedRegistryLayoutChain(source []SignedRegistryLayout) []SignedRegistryLayout {
+	clone := make([]SignedRegistryLayout, len(source))
+	for index, signed := range source {
+		clone[index] = signed
+		clone[index].RegistryLayout = cloneRegistryLayout(signed.RegistryLayout)
+	}
+	return clone
 }
 
 func immediateJoinPredecessor(

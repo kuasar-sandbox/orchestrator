@@ -80,3 +80,26 @@ func TestRuntimeStoragePathsCanonicalizeNonexistentChildren(t *testing.T) {
 		t.Fatalf("resolved NodeHost path = %q, want %q", resolved.NodeHostDir, want)
 	}
 }
+
+func TestRuntimeConfigDigestBindsRegistryLayoutGuardPath(t *testing.T) {
+	root := t.TempDir()
+	registryLayout := testRegistryLayout(1, "generation-guard-path")
+	member := registryLayout.Members[0]
+	config := RuntimeConfig{
+		NodeHostDir: filepath.Join(root, "nodehost"), StateEngineDir: filepath.Join(root, "state"),
+		RegistryLayoutGuardPath: filepath.Join(root, "identity", "registryLayout.json"),
+		Tuning:                  DefaultRuntimeTuning(),
+	}
+	first, err := config.digest(registryLayout, member)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config.RegistryLayoutGuardPath = filepath.Join(root, "other-identity", "registryLayout.json")
+	second, err := config.digest(registryLayout, member)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first == second {
+		t.Fatal("runtime identity digest did not bind the anti-rollback guard path")
+	}
+}

@@ -142,6 +142,47 @@ func TestRegistryLayoutRejectsNetworkEquivalentEndpoints(t *testing.T) {
 	}
 }
 
+func TestRegistryLayoutRejectsNonCanonicalIdentityAndEndpoints(t *testing.T) {
+	invalidUTF8 := string([]byte{0xff})
+	for name, mutate := range map[string]func(*RegistryLayout){
+		"oversized generation": func(layout *RegistryLayout) {
+			layout.RegistryGeneration = strings.Repeat("g", 129)
+		},
+		"spaced generation": func(layout *RegistryLayout) {
+			layout.RegistryGeneration = " generation-1"
+		},
+		"invalid cluster UTF-8": func(layout *RegistryLayout) {
+			layout.ClusterID = invalidUTF8
+		},
+		"invalid member UTF-8": func(layout *RegistryLayout) {
+			layout.Members[0].MemberID = invalidUTF8
+		},
+		"noncanonical internal host": func(layout *RegistryLayout) {
+			layout.Members[0].InternalEndpoint = "https://REGISTRY-A:9443"
+		},
+		"noncanonical internal port": func(layout *RegistryLayout) {
+			layout.Members[0].InternalEndpoint = "https://registry-a:09443"
+		},
+		"noncanonical Raft host": func(layout *RegistryLayout) {
+			layout.Members[0].RaftEndpoint = "REGISTRY-A:63001"
+		},
+		"control character Raft host": func(layout *RegistryLayout) {
+			layout.Members[0].RaftEndpoint = "bad\thost:63001"
+		},
+		"invalid DNS Raft host": func(layout *RegistryLayout) {
+			layout.Members[0].RaftEndpoint = "bad_host:63001"
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			layout := testRegistryLayout(1, "generation-1")
+			mutate(&layout)
+			if err := layout.Validate(); err == nil {
+				t.Fatal("noncanonical Registry Layout was accepted")
+			}
+		})
+	}
+}
+
 func TestRegistryLayoutSignatureAndFixedPlacement(t *testing.T) {
 	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -362,6 +403,27 @@ func TestRegistryLayoutTransitionFreezesMemberAndReplicaIdentity(t *testing.T) {
 				t.Fatal("unsafe transition identity was accepted")
 			}
 		})
+	}
+}
+
+func TestRegistryLayoutTransitionRejectsUnassignedNewMember(t *testing.T) {
+	previous := testRegistryLayout(1, "generation-unassigned-member")
+	previousDigest, err := previous.Digest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	next := cloneRegistryLayout(previous)
+	next.RegistryLayoutVersion = 2
+	next.PreviousRegistryLayoutVersion = 1
+	next.PreviousRegistryLayoutDigest = previousDigest
+	next.Members = append(next.Members, RegistryMember{
+		MemberID: "registry-d", InternalEndpoint: "https://registry-d:9443", RaftEndpoint: "registry-d:63001",
+	})
+	if err := next.Validate(); err != nil {
+		t.Fatalf("standalone target artifact should remain structurally valid: %v", err)
+	}
+	if err := ValidateRegistryLayoutTransition(previous, next); err == nil {
+		t.Fatal("Registry Layout introduced a member with no JOIN replica")
 	}
 }
 
@@ -622,6 +684,41 @@ func TestRegistryLayoutGuardReplaysFullChainFromDurableAnchor(t *testing.T) {
 	}
 	if _, err := guard.EvaluateSignedChain(signed[:2], keyring); err != nil {
 		t.Fatalf("idempotent full-chain replay failed: %v", err)
+	}
+}
+
+func TestFreshRegistryLayoutGuardAcceptsLineageBeyond1024Versions(t *testing.T) {
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyring := map[string]ed25519.PublicKey{"root-1": publicKey}
+	current := testRegistryLayout(1, "generation-long-lineage")
+	chain := make([]SignedRegistryLayout, 0, 1025)
+	for version := uint64(1); version <= 1025; version++ {
+		if version > 1 {
+			previousDigest, digestErr := current.Digest()
+			if digestErr != nil {
+				t.Fatal(digestErr)
+			}
+			current = cloneRegistryLayout(current)
+			current.RegistryLayoutVersion = version
+			current.PreviousRegistryLayoutVersion = version - 1
+			current.PreviousRegistryLayoutDigest = previousDigest
+		}
+		signed, signErr := SignRegistryLayout(current, "root-1", privateKey)
+		if signErr != nil {
+			t.Fatal(signErr)
+		}
+		chain = append(chain, signed)
+	}
+	guard := RegistryLayoutGuard{Path: filepath.Join(t.TempDir(), "registryLayout.json")}
+	accepted, err := guard.EvaluateSignedChain(chain, keyring)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if accepted.RegistryLayoutVersion != 1025 {
+		t.Fatalf("accepted Registry Layout version = %d", accepted.RegistryLayoutVersion)
 	}
 }
 

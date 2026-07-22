@@ -332,8 +332,8 @@ func (g RegistryLayoutGuard) EvaluateSignedChain(
 	chain []SignedRegistryLayout,
 	keyring map[string]ed25519.PublicKey,
 ) (AcceptedRegistryLayout, error) {
-	if len(chain) == 0 || len(chain) > 1024 {
-		return AcceptedRegistryLayout{}, errors.New("raftstore: registryLayout chain must be non-empty and bounded")
+	if len(chain) == 0 {
+		return AcceptedRegistryLayout{}, errors.New("raftstore: registryLayout chain must be non-empty")
 	}
 	current, err := g.Load()
 	if err != nil {

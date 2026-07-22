@@ -14,6 +14,9 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"unicode/utf8"
+
+	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 )
 
 const (
@@ -86,19 +89,30 @@ type RegistryMember struct {
 }
 
 func (m RegistryMember) Validate() error {
-	if m.MemberID == "" {
+	if m.MemberID == "" || !utf8.ValidString(m.MemberID) {
 		return errors.New("raftstore: member identity is required")
 	}
-	if _, err := canonicalInternalEndpoint(m.InternalEndpoint); err != nil {
+	internalEndpoint, err := canonicalInternalEndpoint(m.InternalEndpoint)
+	if err != nil {
 		return err
 	}
-	if _, err := canonicalRaftEndpoint(m.RaftEndpoint); err != nil {
+	if internalEndpoint != m.InternalEndpoint {
+		return errors.New("raftstore: member internal endpoint is not canonical")
+	}
+	raftEndpoint, err := canonicalRaftEndpoint(m.RaftEndpoint)
+	if err != nil {
 		return err
+	}
+	if raftEndpoint != m.RaftEndpoint {
+		return errors.New("raftstore: member Raft endpoint is not canonical")
 	}
 	return nil
 }
 
 func canonicalInternalEndpoint(endpoint string) (string, error) {
+	if !utf8.ValidString(endpoint) || strings.TrimSpace(endpoint) != endpoint {
+		return "", errors.New("raftstore: member internal endpoint must be an HTTPS base URL")
+	}
 	u, err := url.Parse(endpoint)
 	if err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil || u.Path != "" ||
 		u.RawPath != "" || u.RawQuery != "" || u.Fragment != "" || u.ForceQuery || u.Opaque != "" {
@@ -119,6 +133,9 @@ func canonicalInternalEndpoint(endpoint string) (string, error) {
 }
 
 func canonicalRaftEndpoint(endpoint string) (string, error) {
+	if !utf8.ValidString(endpoint) || strings.TrimSpace(endpoint) != endpoint {
+		return "", errors.New("raftstore: invalid member Raft endpoint")
+	}
 	host, portText, err := net.SplitHostPort(endpoint)
 	if err != nil {
 		return "", fmt.Errorf("raftstore: invalid member Raft endpoint: %w", err)
@@ -142,10 +159,29 @@ func canonicalEndpointHost(host string) (string, error) {
 		return address.String(), nil
 	}
 	host = strings.TrimSuffix(strings.ToLower(host), ".")
-	if host == "" || strings.ContainsAny(host, " /?#[]:@") {
+	if !validDNSName(host) {
 		return "", errors.New("invalid endpoint host")
 	}
 	return host, nil
+}
+
+func validDNSName(host string) bool {
+	if host == "" || len(host) > 253 || !utf8.ValidString(host) {
+		return false
+	}
+	for _, character := range []byte(host) {
+		if character >= 'a' && character <= 'z' || character >= '0' && character <= '9' ||
+			character == '-' || character == '.' {
+			continue
+		}
+		return false
+	}
+	for _, label := range strings.Split(host, ".") {
+		if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+	}
+	return true
 }
 
 type ReplicaPlacement struct {
@@ -185,6 +221,9 @@ func (m RegistryLayout) Validate() error {
 }
 
 func (m RegistryLayout) validate(requireRolloverProof bool) error {
+	if err := validateRegistryLayoutStrings(m); err != nil {
+		return err
+	}
 	raw, err := json.Marshal(m)
 	if err != nil || len(raw) > MaxRegistryLayoutBytes {
 		return fmt.Errorf("raftstore: Registry Layout exceeds %d bytes", MaxRegistryLayoutBytes)
@@ -268,6 +307,55 @@ func (m RegistryLayout) validate(requireRolloverProof bool) error {
 		}
 		if err := validateReplicaSet(shard.Replicas, members, m.ReplicationFactor); err != nil {
 			return fmt.Errorf("raftstore: shard %d: %w", shard.ShardID, err)
+		}
+	}
+	return nil
+}
+
+func validateRegistryLayoutStrings(registryLayout RegistryLayout) error {
+	for name, value := range map[string]string{
+		"cluster ID": registryLayout.ClusterID, "Registry History Generation": registryLayout.RegistryGeneration,
+		"hash version": registryLayout.HashVersion, "bootstrap token digest": registryLayout.BootstrapTokenDigest,
+		"previous Registry Layout digest": registryLayout.PreviousRegistryLayoutDigest,
+	} {
+		if !utf8.ValidString(value) {
+			return fmt.Errorf("raftstore: Registry Layout %s is not valid UTF-8", name)
+		}
+	}
+	if err := clusterstate.ValidateExecutionBindingRegistryGeneration(registryLayout.RegistryGeneration); err != nil {
+		return fmt.Errorf("raftstore: invalid Registry History Generation: %w", err)
+	}
+	if registryLayout.Predecessor != nil {
+		for name, value := range map[string]string{
+			"predecessor Registry History Generation": registryLayout.Predecessor.RegistryGeneration,
+			"predecessor Registry Layout digest":      registryLayout.Predecessor.RegistryLayoutDigest,
+			"predecessor target intent digest":        registryLayout.Predecessor.TargetRegistryLayoutIntentDigest,
+			"predecessor proof digest":                registryLayout.Predecessor.ProofDigest,
+		} {
+			if !utf8.ValidString(value) {
+				return fmt.Errorf("raftstore: Registry Layout %s is not valid UTF-8", name)
+			}
+		}
+		if err := clusterstate.ValidateExecutionBindingRegistryGeneration(registryLayout.Predecessor.RegistryGeneration); err != nil {
+			return fmt.Errorf("raftstore: invalid predecessor Registry History Generation: %w", err)
+		}
+	}
+	for _, member := range registryLayout.Members {
+		if !utf8.ValidString(member.MemberID) || !utf8.ValidString(member.InternalEndpoint) ||
+			!utf8.ValidString(member.RaftEndpoint) {
+			return errors.New("raftstore: Registry member identity is not valid UTF-8")
+		}
+	}
+	for _, replica := range registryLayout.SystemReplicas {
+		if !utf8.ValidString(replica.MemberID) {
+			return errors.New("raftstore: System replica member identity is not valid UTF-8")
+		}
+	}
+	for _, shard := range registryLayout.DataShards {
+		for _, replica := range shard.Replicas {
+			if !utf8.ValidString(replica.MemberID) {
+				return errors.New("raftstore: data replica member identity is not valid UTF-8")
+			}
 		}
 	}
 	return nil
@@ -358,6 +446,9 @@ func ValidateRegistryLayoutTransition(previous, next RegistryLayout) error {
 		if previousInternalEndpoints[internalEndpoint] != "" || previousRaftEndpoints[raftEndpoint] != "" {
 			return errors.New("raftstore: replacement Registry member reused a predecessor endpoint")
 		}
+		if !registryMemberHasReplica(next, member.MemberID) {
+			return errors.New("raftstore: newly introduced Registry member has no replica")
+		}
 	}
 	if err := validateReplicaTransition(previous.SystemReplicas, next.SystemReplicas); err != nil {
 		return fmt.Errorf("raftstore: System Group transition: %w", err)
@@ -371,6 +462,18 @@ func ValidateRegistryLayoutTransition(previous, next RegistryLayout) error {
 		}
 	}
 	return nil
+}
+
+func registryMemberHasReplica(registryLayout RegistryLayout, memberID string) bool {
+	if _, found := replicaPlacementForMember(registryLayout.SystemReplicas, memberID); found {
+		return true
+	}
+	for _, shard := range registryLayout.DataShards {
+		if _, found := replicaPlacementForMember(shard.Replicas, memberID); found {
+			return true
+		}
+	}
+	return false
 }
 
 func validateReplicaTransition(previous, next []ReplicaPlacement) error {
