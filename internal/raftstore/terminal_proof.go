@@ -68,10 +68,14 @@ func (r *Runtime) ApplyProvenExecutionMutation(
 	if err := r.authorizeLocalDataReplica(command.Identity); err != nil {
 		return DataApplyResult{}, err
 	}
-	if err := r.permitCache.Authorize(command.Identity.PermitIdentity, PermitRegistryWrite); err != nil {
+	proposalContext, cancelProposal, err := r.permitCache.BoundContext(
+		ctx, command.Identity.PermitIdentity, PermitRegistryWrite,
+	)
+	if err != nil {
 		return DataApplyResult{}, err
 	}
-	return r.applyDataMutation(ctx, command)
+	defer cancelProposal()
+	return r.applyDataMutation(proposalContext, command)
 }
 
 func (r *Runtime) terminalProofRequest(

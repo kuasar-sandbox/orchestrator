@@ -18,7 +18,7 @@ import (
 )
 
 const (
-	stateEngineVersion      = uint32(5)
+	stateEngineVersion      = uint32(6)
 	stateControlTable       = byte(0)
 	stateSlotTable          = byte(1)
 	stateMetadataTable      = byte(0)
@@ -29,6 +29,8 @@ const (
 	stateRecoveryTable      = byte(5)
 	stateRecoveryClaimTable = byte(6)
 	statePendingTable       = byte(7)
+	stateRouteBucketTable   = byte(8)
+	stateSandboxIDTable     = byte(9)
 	stateRecoveryBatch      = 16 << 20
 	stateMaximumKeySize     = MaxRaftCommandBytes
 )
@@ -265,6 +267,7 @@ func (m dataStateMetadata) dataState() DataState {
 		Fences:               make(map[string]clusterstate.ExecutionFence),
 		RecoveryRecords:      make(map[string]RecoveryObjectRecord),
 		RecoveryClaims:       make(map[string]string),
+		UsedSandboxIDs:       make(map[string]struct{}),
 		LastApplied:          m.LastApplied,
 	}
 	if m.Recovery != nil {

@@ -125,6 +125,7 @@ func openRuntime(
 	if len(registryLayoutChain) == 0 || factory == nil {
 		return nil, errors.New("raftstore: a signed registryLayout chain and NodeHost factory are required")
 	}
+	registryLayoutChain = cloneSignedRegistryLayoutChain(registryLayoutChain)
 	resolvedConfig, err := config.resolvedStoragePaths()
 	if err != nil {
 		return nil, err
@@ -273,6 +274,15 @@ func openRuntime(
 	}
 	systemEvents.bind(runtime)
 	return runtime, nil
+}
+
+func cloneSignedRegistryLayoutChain(source []SignedRegistryLayout) []SignedRegistryLayout {
+	clone := make([]SignedRegistryLayout, len(source))
+	for index, signed := range source {
+		clone[index] = signed
+		clone[index].RegistryLayout = cloneRegistryLayout(signed.RegistryLayout)
+	}
+	return clone
 }
 
 func immediateJoinPredecessor(
@@ -804,10 +814,13 @@ func (r *Runtime) initializeDataShard(ctx context.Context, replica LocalReplicaE
 		} else if !dragonboat.IsTempError(readErr) {
 			return false, readErr
 		}
-		result, proposeErr := r.proposeDataRaw(operation, DataCommand{
+		result, submitted, proposeErr := r.proposeDataRaw(operation, DataCommand{
 			Type: DataInitializeShard, Identity: identity, Bootstrap: &bootstrap,
 			ReplicaIDs: append([]uint64(nil), bootstrap.ReplicaIDs...),
 		})
+		if proposeErr != nil && !submitted {
+			return false, proposeErr
+		}
 		resolveContext, cancelResolve := ambiguityResolutionContext(operation)
 		value, readErr = r.syncRead(resolveContext, replica.ShardID, DataStateLookup{})
 		cancelResolve()
@@ -913,22 +926,35 @@ func (r *Runtime) ApplyData(ctx context.Context, command DataCommand) (DataApply
 	if err := r.authorizeLocalDataReplica(command.Identity); err != nil {
 		return DataApplyResult{}, err
 	}
-	if err := r.permitCache.Authorize(command.Identity.PermitIdentity, PermitRegistryWrite); err != nil {
+	proposalContext, cancelProposal, err := r.permitCache.BoundContext(
+		ctx, command.Identity.PermitIdentity, PermitRegistryWrite,
+	)
+	if err != nil {
 		return DataApplyResult{}, err
 	}
-	return r.applyDataMutation(ctx, command)
+	defer cancelProposal()
+	return r.applyDataMutation(proposalContext, command)
 }
 
 func (r *Runtime) applyDataMutation(ctx context.Context, command DataCommand) (DataApplyResult, error) {
-	result, err := r.proposeDataRaw(ctx, command)
+	result, submitted, err := r.proposeDataRaw(ctx, command)
 	if err == nil {
 		return result, nil
+	}
+	if !submitted {
+		return DataApplyResult{}, err
 	}
 	resolveContext, cancelResolve := ambiguityResolutionContext(ctx)
 	defer cancelResolve()
 	resolved, readErr := r.resolveDataMutation(resolveContext, command)
 	if readErr == nil && resolved.Committed {
 		return DataApplyResult{Applied: true, Revision: resolved.Revision}, nil
+	}
+	if readErr == nil && resolved.CurrentRevision != 0 {
+		return DataApplyResult{
+			Conflict: true, CurrentRevision: resolved.CurrentRevision,
+			Reason: "ambiguous data mutation was superseded by committed state",
+		}, nil
 	}
 	if readErr != nil {
 		return DataApplyResult{}, errors.Join(err, fmt.Errorf("raftstore: resolve ambiguous data mutation: %w", readErr))
@@ -994,24 +1020,24 @@ func (r *Runtime) proposeSystem(ctx context.Context, command SystemCommand) (Sys
 	return applied, nil
 }
 
-func (r *Runtime) proposeDataRaw(ctx context.Context, command DataCommand) (DataApplyResult, error) {
+func (r *Runtime) proposeDataRaw(ctx context.Context, command DataCommand) (DataApplyResult, bool, error) {
 	if err := r.removalFenceError(); err != nil {
-		return DataApplyResult{}, err
+		return DataApplyResult{}, false, err
 	}
 	raw, err := EncodeDataCommand(command)
 	if err != nil {
-		return DataApplyResult{}, err
+		return DataApplyResult{}, false, err
 	}
 	shardID := DataRaftShardID(command.Identity.ShardID)
 	result, err := r.syncPropose(ctx, r.nodeHost.GetNoOPSession(shardID), raw)
 	if err != nil {
-		return DataApplyResult{}, err
+		return DataApplyResult{}, true, err
 	}
 	var applied DataApplyResult
 	if err := json.Unmarshal(result.Data, &applied); err != nil {
-		return DataApplyResult{}, fmt.Errorf("raftstore: decode data apply result: %w", err)
+		return DataApplyResult{}, true, fmt.Errorf("raftstore: decode data apply result: %w", err)
 	}
-	return applied, nil
+	return applied, true, nil
 }
 
 func (r *Runtime) removalFenceError() error {

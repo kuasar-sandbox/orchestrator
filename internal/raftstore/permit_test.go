@@ -1,6 +1,7 @@
 package raftstore
 
 import (
+	"context"
 	"errors"
 	"testing"
 	"time"
@@ -194,5 +195,59 @@ func TestPermitCacheRetiresClosedGateGrantAcrossRecoveryEpochs(t *testing.T) {
 	}
 	if err := cache.Authorize(final.PermitIdentity, PermitRegistryWrite); err != nil {
 		t.Fatalf("final identity was not installed: %v", err)
+	}
+}
+
+func TestPermitCacheBoundsProposalContextToRemainingLifetime(t *testing.T) {
+	started := time.Now()
+	now := started.Add(25 * time.Millisecond)
+	identity := PermitIdentity{
+		ClusterID: "cluster", RegistryGeneration: "generation", SystemEpoch: 1,
+		RegistryLayoutDigest: digestFor("layout"),
+	}
+	cache := NewPermitCache(func() time.Time { return now })
+	if err := cache.Install(PermitGrant{
+		PermitIdentity: identity, CommitIndex: 1, MaxLifetimeMillis: 100,
+		ServeGate: true, WriteGate: true, CutoverGate: true, RecoveryClosed: true,
+	}, started); err != nil {
+		t.Fatal(err)
+	}
+	caller, cancelCaller := context.WithTimeout(context.Background(), time.Second)
+	defer cancelCaller()
+	bounded, cancelBounded, err := cache.BoundContext(caller, identity, PermitRegistryWrite)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cancelBounded()
+	deadline, ok := bounded.Deadline()
+	if !ok || !deadline.Equal(started.Add(100*time.Millisecond)) {
+		t.Fatalf("bounded proposal deadline = %v, %v", deadline, ok)
+	}
+}
+
+func TestPermitCachePreservesShorterCallerDeadline(t *testing.T) {
+	started := time.Now()
+	identity := PermitIdentity{
+		ClusterID: "cluster", RegistryGeneration: "generation", SystemEpoch: 1,
+		RegistryLayoutDigest: digestFor("layout"),
+	}
+	cache := NewPermitCache(func() time.Time { return started })
+	if err := cache.Install(PermitGrant{
+		PermitIdentity: identity, CommitIndex: 1, MaxLifetimeMillis: 1_000,
+		ServeGate: true, WriteGate: true, CutoverGate: true, RecoveryClosed: true,
+	}, started); err != nil {
+		t.Fatal(err)
+	}
+	want := started.Add(50 * time.Millisecond)
+	caller, cancelCaller := context.WithDeadline(context.Background(), want)
+	defer cancelCaller()
+	bounded, cancelBounded, err := cache.BoundContext(caller, identity, PermitRegistryWrite)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cancelBounded()
+	deadline, ok := bounded.Deadline()
+	if !ok || !deadline.Equal(want) {
+		t.Fatalf("caller proposal deadline = %v, %v", deadline, ok)
 	}
 }

@@ -3,6 +3,8 @@ package raftstore
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -105,6 +107,94 @@ func TestNewWorkflowsRejectUnprovenFinalizations(t *testing.T) {
 			t.Fatalf("new Build finalization = %+v, builds=%d", result, len(state.Builds))
 		}
 	})
+}
+
+func TestInheritedFinalizationsCannotOverflowStoredRoute(t *testing.T) {
+	registryLayout := testRegistryLayout(4, "generation-row-bound")
+	state, identity := initializedRouteShard(t, registryLayout, "/row-bound", "route")
+	starting := routeStarting(t, registryLayout, "/row-bound", "route", "sandbox-current", 1, true)
+	applyDataOK(t, &state, 2, DataCommand{
+		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{Absent: true}, Route: &starting,
+	})
+	ready := readyRecord(starting, 1)
+	applyDataOK(t, &state, 3, DataCommand{
+		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{LogIndex: 2}, Route: &ready,
+	})
+	current := cloneRouteRecord(state.Routes[routeMapKey(ready.Group, ready.RouteKey)])
+
+	makeFinalization := func(index, padding int) clusterstate.WorkflowFinalizationIntent {
+		objectID := fmt.Sprintf("old-%03d-", index) + strings.Repeat("x", padding)
+		binding := testBinding(
+			t, registryLayout, clusterstate.ExecutionKindSandbox, objectID,
+			current.Group, current.RouteKey, "node-1", current.Ready.Intent,
+		)
+		intent, err := clusterstate.NewWorkflowFinalizationIntent(objectID, binding, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return intent
+	}
+	const fixedPadding = 11_000
+	targetSize := MaxRaftCommandBytes - 1
+	for len(current.Finalizations) < clusterstate.MaxWorkflowFinalizations-1 {
+		candidate := cloneRouteRecord(current)
+		candidate.Finalizations = append(candidate.Finalizations, makeFinalization(len(candidate.Finalizations), fixedPadding))
+		raw, err := json.Marshal(candidate)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(raw) > targetSize {
+			break
+		}
+		current = candidate
+	}
+	low, high := 1, fixedPadding
+	var final *clusterstate.WorkflowFinalizationIntent
+	for low <= high {
+		middle := low + (high-low)/2
+		candidate := makeFinalization(len(current.Finalizations), middle)
+		next := cloneRouteRecord(current)
+		next.Finalizations = append(next.Finalizations, candidate)
+		raw, err := json.Marshal(next)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(raw) <= targetSize {
+			copy := candidate
+			final = &copy
+			low = middle + 1
+		} else {
+			high = middle - 1
+		}
+	}
+	if final == nil {
+		t.Fatal("failed to construct a near-bound valid Route row")
+	}
+	current.Finalizations = append(current.Finalizations, *final)
+	if err := current.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateStoredStateValue(current); err != nil {
+		t.Fatalf("current Route did not fit its state row: %v", err)
+	}
+	state.Routes[routeMapKey(current.Group, current.RouteKey)] = current
+
+	deleting := deletingRecord(current)
+	deleting.Finalizations = nil
+	command := DataCommand{
+		Type: DataPutRoute, Identity: identity,
+		Expect: RevisionExpectation{LogIndex: current.Revision.LogIndex}, Route: &deleting,
+	}
+	if _, err := EncodeDataCommand(command); err != nil {
+		t.Fatalf("small transition command did not fit its Raft envelope: %v", err)
+	}
+	result := ApplyDataCommand(&state, 4, command)
+	if !result.Conflict || !strings.Contains(result.Reason, "storage bound") {
+		t.Fatalf("normalized oversized Route update = %+v", result)
+	}
+	if state.Routes[routeMapKey(current.Group, current.RouteKey)].State != clusterstate.WorkflowRouteReady {
+		t.Fatal("oversized normalized row changed the stored Route")
+	}
 }
 
 func TestCloneRouteRecordDeepCopiesReadyExecutionIntents(t *testing.T) {
@@ -399,8 +489,14 @@ func TestRouteReplacementRejectsAnyRetainedSIDFence(t *testing.T) {
 	fences := map[string]clusterstate.ExecutionFence{
 		fenceMapKey(current.Group, current.RouteKey, retained.SandboxID): retained,
 	}
-	if err := validateRouteReplacement(tombstone, next, fences); err == nil {
+	used := map[string]struct{}{
+		fenceMapKey(current.Group, current.RouteKey, retained.SandboxID): {},
+	}
+	if err := validateRouteReplacement(tombstone, next, fences, used); err == nil {
 		t.Fatal("replacement reused a SID with an older retained fence")
+	}
+	if err := validateRouteReplacement(tombstone, next, nil, used); err == nil {
+		t.Fatal("replacement reused a historically fenced SID after detailed-fence compaction")
 	}
 }
 
@@ -695,6 +791,9 @@ func TestRouteAutoResumeReplacementAndFenceCompaction(t *testing.T) {
 	applyDataOK(t, &state, 14, DataCommand{Type: DataCompactFence, Identity: identity, Compaction: &complete})
 	if _, found := state.Fences[fenceKey]; found {
 		t.Fatal("complete proof did not compact the execution fence")
+	}
+	if _, found := state.UsedSandboxIDs[fenceKey]; !found {
+		t.Fatal("fence compaction discarded the durable Sandbox ID reuse marker")
 	}
 	if err := state.Validate(); err != nil {
 		t.Fatal(err)
@@ -1071,7 +1170,7 @@ func testDispatchIntentNoFail() clusterstate.DispatchIntent {
 
 func testBuildDispatchIntent(t *testing.T) clusterstate.DispatchIntent {
 	t.Helper()
-	demand, err := placement.NormalizeBuildDemand(placement.BuildDemand{Slots: 1})
+	demand, err := placement.NormalizeBuildDemand(placement.BuildDemand{Slots: 1, CPU: 1, Memory: 512})
 	if err != nil {
 		t.Fatal(err)
 	}

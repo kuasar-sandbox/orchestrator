@@ -155,6 +155,47 @@ func TestRuntimeResolvesAmbiguousDataMutationByExactStrongRead(t *testing.T) {
 	}
 }
 
+func TestRuntimeDoesNotResolveAnUnsubmittedDataMutation(t *testing.T) {
+	registryLayout := testRegistryLayout(1, "generation-unsubmitted")
+	identity := routeShardIdentity(t, registryLayout, "/g", "rk-unsubmitted")
+	state := initializeDataShard(t, registryLayout, identity)
+	starting := routeStarting(t, registryLayout, "/g", "rk-unsubmitted", "sandbox-unsubmitted", 1, false)
+	valid := DataCommand{
+		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{Absent: true}, Route: &starting,
+	}
+	applyDataOK(t, &state, 2, valid)
+	invalid := valid
+	invalid.Build = &clusterstate.BuildRecord{}
+
+	host := newFakeNodeHost()
+	host.propose = func([]byte) (sm.Result, error) {
+		t.Fatal("locally invalid command reached SyncPropose")
+		return sm.Result{}, nil
+	}
+	host.read = func(uint64, any) (any, error) {
+		t.Fatal("locally invalid command entered ambiguity resolution")
+		return nil, nil
+	}
+	digest, _ := registryLayout.Digest()
+	runtime := &Runtime{
+		registryLayout: registryLayout, registryLayoutDigest: digest, nodeHost: host,
+		permitCache: NewPermitCache(time.Now), member: registryLayout.Members[0],
+		enrollment: LocalEnrollment{Replicas: []LocalReplicaEnrollment{{
+			ShardID: DataRaftShardID(identity.ShardID), ReplicaID: 1,
+			StartPlan: ReplicaInitial, LocalState: ReplicaActive,
+		}}},
+	}
+	if err := runtime.permitCache.Install(PermitGrant{
+		PermitIdentity: identity.PermitIdentity, CommitIndex: 1, MaxLifetimeMillis: 1_000,
+		ServeGate: true, WriteGate: true, CutoverGate: true, RecoveryClosed: true,
+	}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if result, err := runtime.ApplyData(context.Background(), invalid); err == nil || result.Applied {
+		t.Fatalf("unsubmitted invalid mutation = %+v, %v", result, err)
+	}
+}
+
 func TestRuntimeResolvesCommittedDataMutationAfterCallerCancellation(t *testing.T) {
 	registryLayout := testRegistryLayout(1, "generation-canceled-mutation")
 	identity := routeShardIdentity(t, registryLayout, "/g", "rk-canceled")
@@ -201,6 +242,55 @@ func TestRuntimeResolvesCommittedDataMutationAfterCallerCancellation(t *testing.
 	result, err := runtime.ApplyData(caller, command)
 	if err != nil || !result.Applied || result.Revision != 2 {
 		t.Fatalf("canceled caller ambiguity resolution = %+v, %v", result, err)
+	}
+}
+
+func TestRuntimeReturnsConflictWhenAmbiguousMutationWasSuperseded(t *testing.T) {
+	registryLayout := testRegistryLayout(1, "generation-superseded-mutation")
+	identity := routeShardIdentity(t, registryLayout, "/g", "rk-superseded")
+	state := initializeDataShard(t, registryLayout, identity)
+	starting := routeStarting(t, registryLayout, "/g", "rk-superseded", "sandbox-1", 1, true)
+	command := DataCommand{
+		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{Absent: true}, Route: &starting,
+	}
+	host := newFakeNodeHost()
+	host.propose = func(raw []byte) (sm.Result, error) {
+		committed, err := DecodeDataCommand(raw)
+		if err != nil {
+			return sm.Result{}, err
+		}
+		if result := ApplyDataCommand(&state, 2, committed); !result.Applied {
+			t.Fatalf("ambiguous mutation did not commit: %+v", result)
+		}
+		ready := readyRecord(state.Routes[routeMapKey("/g", "rk-superseded")], 1)
+		if result := ApplyDataCommand(&state, 3, DataCommand{
+			Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{LogIndex: 2}, Route: &ready,
+		}); !result.Applied {
+			t.Fatalf("successor mutation did not commit: %+v", result)
+		}
+		return sm.Result{}, context.DeadlineExceeded
+	}
+	host.read = func(_ uint64, query any) (any, error) {
+		return LookupDataMutation(state, query.(DataMutationLookup))
+	}
+	digest, _ := registryLayout.Digest()
+	runtime := &Runtime{
+		registryLayout: registryLayout, registryLayoutDigest: digest, nodeHost: host,
+		permitCache: NewPermitCache(time.Now), member: registryLayout.Members[0],
+		enrollment: LocalEnrollment{Replicas: []LocalReplicaEnrollment{{
+			ShardID: DataRaftShardID(identity.ShardID), ReplicaID: 1,
+			StartPlan: ReplicaInitial, LocalState: ReplicaActive,
+		}}},
+	}
+	if err := runtime.permitCache.Install(PermitGrant{
+		PermitIdentity: identity.PermitIdentity, CommitIndex: 1, MaxLifetimeMillis: 1_000,
+		ServeGate: true, WriteGate: true, CutoverGate: true, RecoveryClosed: true,
+	}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	result, err := runtime.ApplyData(context.Background(), command)
+	if err != nil || !result.Conflict || result.CurrentRevision != 3 || result.Applied {
+		t.Fatalf("superseded ambiguous mutation = %+v, %v", result, err)
 	}
 }
 

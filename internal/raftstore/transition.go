@@ -106,23 +106,18 @@ func (r *Runtime) ReconcileRegistryLayoutTransitionShard(
 		return r.commitTransitionAdvance(ctx, progress.ShardID, TransitionCatchingUp, TransitionPromoted)
 	case TransitionPromoted:
 		if transition.Activated {
-			return SystemState{}, errors.New("raftstore: old membership remains after registryLayout activation")
+			return SystemState{}, errors.New("raftstore: target membership was not verified before registryLayout activation")
 		}
-		if err := r.removeUndesiredReplicas(ctx, raftShardID); err != nil {
-			return SystemState{}, err
-		}
-		return r.commitTransitionAdvance(ctx, progress.ShardID, TransitionPromoted, TransitionOldRemoved)
-	case TransitionOldRemoved:
-		if transition.Activated {
-			return SystemState{}, errors.New("raftstore: unverified membership remains after registryLayout activation")
-		}
-		if err := r.verifyDesiredMembership(ctx, raftShardID); err != nil {
+		// Keep every predecessor voter reachable while the predecessor Registry
+		// Layout and its bounded Serve Permits remain active. A disjoint target
+		// placement otherwise creates an outage before the atomic layout switch.
+		if err := r.verifyDesiredVoters(ctx, raftShardID); err != nil {
 			return SystemState{}, err
 		}
 		if err := r.verifyPreparedDataEpoch(ctx, system, raftShardID); err != nil {
 			return SystemState{}, err
 		}
-		return r.commitTransitionAdvance(ctx, progress.ShardID, TransitionOldRemoved, TransitionComplete)
+		return r.commitTransitionAdvance(ctx, progress.ShardID, TransitionPromoted, TransitionComplete)
 	case TransitionComplete:
 		if !transition.Activated {
 			return system, nil
@@ -131,6 +126,9 @@ func (r *Runtime) ReconcileRegistryLayoutTransitionShard(
 			return SystemState{}, errors.New("raftstore: previous registryLayout Serve Permits have not drained")
 		}
 		if err := r.retireDataEpoch(ctx, system, raftShardID); err != nil {
+			return SystemState{}, err
+		}
+		if err := r.removeUndesiredReplicas(ctx, raftShardID); err != nil {
 			return SystemState{}, err
 		}
 		if err := r.verifyDesiredMembership(ctx, raftShardID); err != nil {
@@ -431,7 +429,6 @@ func transitionStageAtLeast(current, target TransitionStage) bool {
 		TransitionPending,
 		TransitionCatchingUp,
 		TransitionPromoted,
-		TransitionOldRemoved,
 		TransitionComplete,
 		TransitionEpochRetired,
 	}
@@ -465,14 +462,19 @@ func (r *Runtime) prepareDataEpoch(ctx context.Context, system SystemState, raft
 		if state.ServingEpochs[0] != previous {
 			return errors.New("raftstore: data shard does not serve the active pre-transition epoch")
 		}
-		if err := r.permitCache.Authorize(previous, PermitRegistryWrite); err != nil {
+		proposalContext, cancelProposal, err := r.permitCache.BoundContext(ctx, previous, PermitRegistryWrite)
+		if err != nil {
 			return err
 		}
-		result, proposeErr := r.proposeDataRaw(ctx, DataCommand{
+		result, submitted, proposeErr := r.proposeDataRaw(proposalContext, DataCommand{
 			Type:     DataPrepareEpoch,
 			Identity: ShardRequestIdentity{PermitIdentity: previous, ShardID: logicalID},
 			Epoch:    &next, ReplicaIDs: desired,
 		})
+		cancelProposal()
+		if proposeErr != nil && !submitted {
+			return proposeErr
+		}
 		if proposeErr == nil && result.Conflict {
 			proposeErr = errors.New(result.Reason)
 		}
@@ -530,14 +532,19 @@ func (r *Runtime) retireDataEpoch(ctx context.Context, system SystemState, raftS
 		if err := validatePreparedEpoch(state, previous, next, desired); err != nil {
 			return err
 		}
-		if err := r.permitCache.Authorize(next, PermitRegistryWrite); err != nil {
+		proposalContext, cancelProposal, err := r.permitCache.BoundContext(ctx, next, PermitRegistryWrite)
+		if err != nil {
 			return err
 		}
-		result, proposeErr := r.proposeDataRaw(ctx, DataCommand{
+		result, submitted, proposeErr := r.proposeDataRaw(proposalContext, DataCommand{
 			Type:     DataRetireEpoch,
 			Identity: ShardRequestIdentity{PermitIdentity: next, ShardID: logicalID},
 			Epoch:    &previous,
 		})
+		cancelProposal()
+		if proposeErr != nil && !submitted {
+			return proposeErr
+		}
 		if proposeErr == nil && result.Conflict {
 			proposeErr = errors.New(result.Reason)
 		}

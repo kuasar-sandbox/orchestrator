@@ -471,8 +471,7 @@ func TestRegistryLayoutTransitionActivatesOnlyAfterEveryShardCompletes(t *testin
 		for _, edge := range [][2]TransitionStage{
 			{TransitionPending, TransitionCatchingUp},
 			{TransitionCatchingUp, TransitionPromoted},
-			{TransitionPromoted, TransitionOldRemoved},
-			{TransitionOldRemoved, TransitionComplete},
+			{TransitionPromoted, TransitionComplete},
 		} {
 			state, _ = applySystem(t, state, index, SystemCommand{
 				Type:    SystemAdvanceTransition,

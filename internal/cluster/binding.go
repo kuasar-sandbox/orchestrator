@@ -170,11 +170,13 @@ func WithoutSystemMetadata(metadata map[string]string) map[string]string {
 }
 
 func (b ExecutionBinding) validate() error {
+	if err := ValidateExecutionBindingRegistryGeneration(b.RegistryGeneration); err != nil {
+		return err
+	}
 	for name, value := range map[string]string{
-		"Registry History Generation": b.RegistryGeneration,
-		"object id":                   b.ObjectID,
-		"group":                       b.Group,
-		"node id":                     b.NodeID,
+		"object id": b.ObjectID,
+		"group":     b.Group,
+		"node id":   b.NodeID,
 	} {
 		if value == "" {
 			return fmt.Errorf("cluster: execution binding %s is required", name)
@@ -192,13 +194,7 @@ func (b ExecutionBinding) validate() error {
 	if err := ValidateExecutionBindingNodeID(b.NodeID); err != nil {
 		return err
 	}
-	if len(b.RegistryGeneration) > MaxExecutionBindingRegistryGenerationIDSize {
-		return fmt.Errorf("cluster: execution binding Registry History Generation exceeds %d bytes", MaxExecutionBindingRegistryGenerationIDSize)
-	}
-	for name, value := range map[string]string{
-		"object id":                   b.ObjectID,
-		"Registry History Generation": b.RegistryGeneration,
-	} {
+	for name, value := range map[string]string{"object id": b.ObjectID} {
 		if !validBindingHeaderValue(value) {
 			return fmt.Errorf("cluster: execution binding %s is not a canonical HTTP header value", name)
 		}
@@ -217,6 +213,28 @@ func (b ExecutionBinding) validate() error {
 	}
 	if b.NodeEpoch == 0 {
 		return errors.New("cluster: execution binding node epoch is required")
+	}
+	return nil
+}
+
+// ValidateExecutionBindingRegistryGeneration applies the constraints required
+// before a Registry History Generation is embedded in an execution Binding or
+// an internal HTTP fence.
+func ValidateExecutionBindingRegistryGeneration(registryGeneration string) error {
+	if registryGeneration == "" {
+		return errors.New("cluster: execution binding Registry History Generation is required")
+	}
+	if len(registryGeneration) > MaxExecutionBindingRegistryGenerationIDSize {
+		return fmt.Errorf(
+			"cluster: execution binding Registry History Generation exceeds %d bytes",
+			MaxExecutionBindingRegistryGenerationIDSize,
+		)
+	}
+	if !utf8.ValidString(registryGeneration) {
+		return errors.New("cluster: execution binding Registry History Generation is not valid UTF-8")
+	}
+	if !validBindingHeaderValue(registryGeneration) {
+		return errors.New("cluster: execution binding Registry History Generation is not a canonical HTTP header value")
 	}
 	return nil
 }

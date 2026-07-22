@@ -366,6 +366,29 @@ func TestRuntimeDataShardInitializationRetriesUntilLeaderIsReady(t *testing.T) {
 	}
 }
 
+func TestRuntimeRetainsDeepCloneOfVerifiedRegistryLayout(t *testing.T) {
+	fixture := newRuntimeFixture(t)
+	runtime, err := fixture.open(t, newFakeNodeHost(), RuntimeOpenOptions{
+		Mode: RuntimeBootstrap, BootstrapSecret: fixture.secret,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.Close()
+	originalMember := runtime.registryLayout.Members[0]
+	originalReplica := runtime.registryLayout.DataShards[0].Replicas[0]
+
+	fixture.signed.RegistryLayout.Members[0].InternalEndpoint = "https://mutated:9443"
+	fixture.signed.RegistryLayout.DataShards[0].Replicas[0] = ReplicaPlacement{
+		MemberID: "registry-c", ReplicaID: 999,
+	}
+	if runtime.registryLayout.Members[0] != originalMember ||
+		runtime.registryLayout.DataShards[0].Replicas[0] != originalReplica ||
+		runtime.startupRegistryLayout.Members[0] != originalMember {
+		t.Fatal("runtime retained caller-owned Registry Layout slices")
+	}
+}
+
 func TestRuntimeFailsClosedOnAmbiguousStartAndLostHistory(t *testing.T) {
 	t.Run("ambiguous start", func(t *testing.T) {
 		fixture := newRuntimeFixture(t)
@@ -801,8 +824,7 @@ func TestRuntimeAdvancesEnrollmentRegistryLayoutOnlyAfterConsensusActivation(t *
 		for _, edge := range [][2]TransitionStage{
 			{TransitionPending, TransitionCatchingUp},
 			{TransitionCatchingUp, TransitionPromoted},
-			{TransitionPromoted, TransitionOldRemoved},
-			{TransitionOldRemoved, TransitionComplete},
+			{TransitionPromoted, TransitionComplete},
 		} {
 			system, _ = applySystem(t, system, index, SystemCommand{
 				Type:    SystemAdvanceTransition,

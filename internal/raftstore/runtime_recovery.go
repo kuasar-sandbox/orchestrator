@@ -257,7 +257,8 @@ func (r *Runtime) ApplyRecoveryData(ctx context.Context, command DataCommand) (D
 	if err := r.authorizeLocalDataReplica(command.Identity); err != nil {
 		return DataApplyResult{}, err
 	}
-	return r.proposeDataRaw(ctx, command)
+	result, _, err := r.proposeDataRaw(ctx, command)
+	return result, err
 }
 
 func (r *Runtime) ReadRecoveryData(ctx context.Context, query RecoveryLookup) (RecoveryLookupResult, error) {

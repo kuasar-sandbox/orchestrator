@@ -206,9 +206,19 @@ func (r *Runtime) CompactExecutionFence(
 		NodeEpochFence: nodeEpochFence,
 		ReplicaApplied: proofs, RetentionProofDigest: retentionDigest,
 	}
-	result, proposeErr := r.proposeDataRaw(ctx, DataCommand{
+	proposalContext, cancelProposal, err := r.permitCache.BoundContext(
+		ctx, identity.PermitIdentity, PermitRegistryWrite,
+	)
+	if err != nil {
+		return err
+	}
+	result, submitted, proposeErr := r.proposeDataRaw(proposalContext, DataCommand{
 		Type: DataCompactFence, Identity: identity, Compaction: &authorization,
 	})
+	cancelProposal()
+	if proposeErr != nil && !submitted {
+		return proposeErr
+	}
 	resolveContext, cancelResolve := ambiguityResolutionContext(ctx)
 	defer cancelResolve()
 	remaining, readErr := r.readFenceStrong(resolveContext, query)

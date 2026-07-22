@@ -76,7 +76,7 @@ regular-file type, and non-group-writable permissions before creating a
 | Strong reads | Dragonboat `SyncRead` supplies the leader/read-index path and applied barriers |
 | List and watch | each `(group, route_bucket)` range is read from one Pebble snapshot with its shard revision; durable change rows use committed indexes and a compacted cursor returns reset |
 | Snapshot and catch-up | on-disk snapshot stream plus learner catch-up proof from an exact target replica's linearizable read |
-| Safe membership change | signed next Registry Layout, learner add, applied barrier, promotion confirmation, old-replica removal, epoch activation, old-Permit drain, and epoch retirement |
+| Safe membership change | signed next Registry Layout, learner add, applied barrier, promotion confirmation, target-readiness proof while predecessor voters remain reachable, epoch activation, old-Permit drain, data-epoch retirement, and old-replica removal |
 | Registry History Generation fencing | signed anti-rollback Registry Layout guard, explicit enrollment, System closure proof, and bounded Serve Permit identities |
 | Fence compaction | full monotonic retention wait, durable outbox ACK or permanent NodeEpoch fence, and exact-voter applied-index probes |
 | Encrypted storage | runtime startup requires a platform storage attestor for NodeHost, WAL, Pebble, Registry Layout guard, and enrollment paths |

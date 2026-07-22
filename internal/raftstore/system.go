@@ -231,7 +231,6 @@ const (
 	TransitionPending      TransitionStage = "PENDING"
 	TransitionCatchingUp   TransitionStage = "CATCHING_UP"
 	TransitionPromoted     TransitionStage = "PROMOTED"
-	TransitionOldRemoved   TransitionStage = "OLD_REMOVED"
 	TransitionComplete     TransitionStage = "COMPLETE"
 	TransitionEpochRetired TransitionStage = "EPOCH_RETIRED"
 )
@@ -1015,8 +1014,7 @@ func transitionPosition(shards []ShardTransition, shardID uint32) int {
 func validTransitionAdvance(from, to TransitionStage) bool {
 	return from == TransitionPending && to == TransitionCatchingUp ||
 		from == TransitionCatchingUp && to == TransitionPromoted ||
-		from == TransitionPromoted && to == TransitionOldRemoved ||
-		from == TransitionOldRemoved && to == TransitionComplete ||
+		from == TransitionPromoted && to == TransitionComplete ||
 		from == TransitionComplete && to == TransitionEpochRetired
 }
 
@@ -1066,8 +1064,8 @@ func validateRegistryLayoutTransitionState(transition RegistryLayoutTransition, 
 			return errors.New("raftstore: transition shards are not complete and ordered")
 		}
 		switch shard.Stage {
-		case TransitionPending, TransitionCatchingUp, TransitionPromoted, TransitionOldRemoved,
-			TransitionComplete, TransitionEpochRetired:
+		case TransitionPending, TransitionCatchingUp, TransitionPromoted, TransitionComplete,
+			TransitionEpochRetired:
 		default:
 			return errors.New("raftstore: invalid transition stage")
 		}

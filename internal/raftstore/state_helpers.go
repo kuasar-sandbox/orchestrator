@@ -58,5 +58,9 @@ func cloneDataStateForLookup(state DataState) DataState {
 	for key, fence := range state.Fences {
 		clone.Fences[key] = fence
 	}
+	clone.UsedSandboxIDs = make(map[string]struct{}, len(state.UsedSandboxIDs))
+	for key := range state.UsedSandboxIDs {
+		clone.UsedSandboxIDs[key] = struct{}{}
+	}
 	return clone
 }

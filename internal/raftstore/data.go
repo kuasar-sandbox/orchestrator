@@ -1,10 +1,12 @@
 package raftstore
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"slices"
 	"sort"
+	"unicode/utf8"
 
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 )
@@ -53,6 +55,7 @@ type DataState struct {
 	Recovery             *DataRecoveryState                          `json:"recovery,omitempty"`
 	RecoveryRecords      map[string]RecoveryObjectRecord             `json:"recovery_records"`
 	RecoveryClaims       map[string]string                           `json:"recovery_claims"`
+	UsedSandboxIDs       map[string]struct{}                         `json:"used_sandbox_ids"`
 	LastApplied          uint64                                      `json:"last_applied"`
 }
 
@@ -63,7 +66,8 @@ func (s DataState) Validate() error {
 			s.BuildBucketCount != 0 || s.VirtualShardCount != 0 || len(s.ReplicaIDs) != 0 ||
 			len(s.PreparedReplicaIDs) != 0 || s.RouteChangefeedFloor != 0 || len(s.RouteChanges) != 0 ||
 			s.LastApplied != 0 || len(s.Routes) != 0 || len(s.Builds) != 0 || len(s.Fences) != 0 ||
-			len(s.ServingEpochs) != 0 || s.Recovery != nil || len(s.RecoveryRecords) != 0 || len(s.RecoveryClaims) != 0 {
+			len(s.ServingEpochs) != 0 || s.Recovery != nil || len(s.RecoveryRecords) != 0 ||
+			len(s.RecoveryClaims) != 0 || len(s.UsedSandboxIDs) != 0 {
 			return errors.New("raftstore: uninitialized data shard contains state")
 		}
 		return nil
@@ -98,6 +102,11 @@ func (s DataState) Validate() error {
 	}
 	if err := validateRecoveryClaims(s); err != nil {
 		return err
+	}
+	for key := range s.UsedSandboxIDs {
+		if err := validateUsedSandboxID(s, key); err != nil {
+			return err
+		}
 	}
 	if s.RouteChangefeedFloor > s.LastApplied {
 		return errors.New("raftstore: Route changefeed floor exceeds applied state")
@@ -140,7 +149,7 @@ func validateDataStateIdentity(s DataState) error {
 		s.VirtualShardCount == 0 || !isPowerOfTwo(s.VirtualShardCount) || s.ShardID >= s.VirtualShardCount ||
 		len(s.ReplicaIDs) != int(DefaultReplication) || len(s.ServingEpochs) == 0 || len(s.ServingEpochs) > 2 ||
 		s.Routes == nil || s.Builds == nil || s.Fences == nil || s.RecoveryRecords == nil ||
-		s.RecoveryClaims == nil || s.LastApplied == 0 {
+		s.RecoveryClaims == nil || s.UsedSandboxIDs == nil || s.LastApplied == 0 {
 		return errors.New("raftstore: incomplete data shard identity")
 	}
 	if !sort.SliceIsSorted(s.ReplicaIDs, func(i, j int) bool { return s.ReplicaIDs[i] < s.ReplicaIDs[j] }) {
@@ -412,6 +421,7 @@ func ApplyDataCommand(state *DataState, index uint64, command DataCommand) DataA
 			Builds:            make(map[string]clusterstate.BuildRecord), Fences: make(map[string]clusterstate.ExecutionFence),
 			RecoveryRecords: make(map[string]RecoveryObjectRecord),
 			RecoveryClaims:  make(map[string]string),
+			UsedSandboxIDs:  make(map[string]struct{}),
 		}
 	case DataPrepareEpoch:
 		if !state.Accepts(command.Identity) || command.Epoch == nil || len(state.ServingEpochs) != 1 ||
@@ -464,7 +474,7 @@ func ApplyDataCommand(state *DataState, index uint64, command DataCommand) DataA
 			return conflict("Route newer-NodeEpoch proof belongs to another System epoch", current.Revision.LogIndex)
 		}
 		if found {
-			if err := validateRouteTransition(current, record, state.Fences); err != nil {
+			if err := validateRouteTransition(current, record, state.Fences, state.UsedSandboxIDs); err != nil {
 				return conflict(err.Error(), current.Revision.LogIndex)
 			}
 		} else {
@@ -474,6 +484,9 @@ func ApplyDataCommand(state *DataState, index uint64, command DataCommand) DataA
 			if len(record.Finalizations) != 0 {
 				return conflict("new Route cannot carry workflow finalizations", 0)
 			}
+		}
+		if err := validateStoredStateValue(record); err != nil {
+			return conflict(err.Error(), current.Revision.LogIndex)
 		}
 		state.Routes[key] = record
 		state.RouteChanges = append(state.RouteChanges, RouteChange{
@@ -512,6 +525,9 @@ func ApplyDataCommand(state *DataState, index uint64, command DataCommand) DataA
 				return conflict("new Build cannot carry workflow finalizations", 0)
 			}
 		}
+		if err := validateStoredStateValue(record); err != nil {
+			return conflict(err.Error(), current.Revision.LogIndex)
+		}
 		state.Builds[key] = record
 	case DataPutFence:
 		if !state.Accepts(command.Identity) || command.Fence == nil {
@@ -541,7 +557,11 @@ func ApplyDataCommand(state *DataState, index uint64, command DataCommand) DataA
 				return conflict("new execution fence has no matching Route tombstone", 0)
 			}
 		}
+		if err := validateStoredStateValue(fence); err != nil {
+			return conflict(err.Error(), current.Revision.LogIndex)
+		}
 		state.Fences[key] = fence
+		state.UsedSandboxIDs[key] = struct{}{}
 	case DataCompactFence:
 		if !state.Accepts(command.Identity) || command.Compaction == nil {
 			return conflict("execution fence compaction identity is fenced", 0)
@@ -559,6 +579,9 @@ func ApplyDataCommand(state *DataState, index uint64, command DataCommand) DataA
 		if route, routeFound := state.Routes[routeKey]; routeFound && fenceMatchesRouteTombstone(fence, route) {
 			route = cloneRouteRecord(route)
 			route.Tombstone.FenceCompacted = true
+			if err := validateStoredStateValue(route); err != nil {
+				return conflict(err.Error(), route.Revision.LogIndex)
+			}
 			state.Routes[routeKey] = route
 		}
 		delete(state.Fences, key)
@@ -619,6 +642,13 @@ func ApplyDataCommand(state *DataState, index uint64, command DataCommand) DataA
 		return dataConflict(err.Error(), state.LastApplied)
 	}
 	return DataApplyResult{Applied: true, Revision: index}
+}
+
+func validateStoredStateValue(value any) error {
+	if _, err := marshalBounded(value, MaxRaftCommandBytes); err != nil {
+		return fmt.Errorf("raftstore: normalized state row exceeds its storage bound: %w", err)
+	}
+	return nil
 }
 
 func advanceDataApplied(state *DataState, index uint64) {
@@ -683,6 +713,20 @@ func fenceMapKey(group, routeKey, sandboxID string) string {
 	return lengthKey(group, routeKey, sandboxID)
 }
 
+func validateUsedSandboxID(state DataState, key string) error {
+	fields, err := parseLengthKey(key, 3)
+	if err != nil || fields[0] == "" || fields[1] == "" || fields[2] == "" {
+		return errors.New("raftstore: malformed used Sandbox ID key")
+	}
+	_, shardID, err := clusterstate.RouteShardFor(
+		fields[0], fields[1], state.RouteBucketCount, state.VirtualShardCount,
+	)
+	if err != nil || shardID != state.ShardID {
+		return errors.New("raftstore: used Sandbox ID belongs to another shard")
+	}
+	return nil
+}
+
 func lengthKey(fields ...string) string {
 	var key []byte
 	for _, field := range fields {
@@ -691,4 +735,29 @@ func lengthKey(fields ...string) string {
 		key = append(key, field...)
 	}
 	return string(key)
+}
+
+func parseLengthKey(key string, fieldCount int) ([]string, error) {
+	raw := []byte(key)
+	fields := make([]string, 0, fieldCount)
+	for len(fields) < fieldCount {
+		if len(raw) < 4 {
+			return nil, errors.New("raftstore: truncated length-prefixed key")
+		}
+		length := binary.BigEndian.Uint32(raw[:4])
+		raw = raw[4:]
+		if uint64(length) > uint64(len(raw)) {
+			return nil, errors.New("raftstore: invalid length-prefixed key")
+		}
+		value := raw[:length]
+		if !utf8.Valid(value) {
+			return nil, errors.New("raftstore: length-prefixed key is not valid UTF-8")
+		}
+		fields = append(fields, string(value))
+		raw = raw[length:]
+	}
+	if len(raw) != 0 {
+		return nil, errors.New("raftstore: trailing length-prefixed key bytes")
+	}
+	return fields, nil
 }

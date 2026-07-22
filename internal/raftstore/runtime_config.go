@@ -239,14 +239,15 @@ func (c RuntimeConfig) digest(registryLayout RegistryLayout, member RegistryMemb
 		NodeHostDir    string        `json:"nodehost_dir"`
 		WALDir         string        `json:"wal_dir"`
 		StateEngineDir string        `json:"state_engine_dir"`
+		GuardPath      string        `json:"registry_layout_guard_path"`
 		RuntimeTuning  RuntimeTuning `json:"runtime_tuning"`
 		MutualTLS      bool          `json:"mutual_tls"`
 		StaticRegistry bool          `json:"static_registry"`
 	}{
 		Version: runtimeConfigVersion, DeploymentID: deploymentID(registryLayout.ClusterID, registryLayout.RegistryGeneration),
 		RaftAddress: member.RaftEndpoint, NodeHostDir: c.NodeHostDir, WALDir: c.WALDir,
-		StateEngineDir: c.StateEngineDir,
-		RuntimeTuning:  c.Tuning, MutualTLS: true, StaticRegistry: true,
+		StateEngineDir: c.StateEngineDir, GuardPath: c.RegistryLayoutGuardPath,
+		RuntimeTuning: c.Tuning, MutualTLS: true, StaticRegistry: true,
 	}
 	raw, err := json.Marshal(value)
 	if err != nil {
