@@ -248,6 +248,8 @@ func (h *Holder) RetireIdentity(ctx context.Context, retirement IdentityRetireme
 			if !ok {
 				_, tracked := h.high[retirement.NodeID]
 				h.mu.Unlock()
+				// A never-owning or already-fenced Holder has completed its
+				// local part. A mismatched tracked identity remains a conflict.
 				return !tracked, nil
 			}
 			current := h.active[retirement.NodeID]

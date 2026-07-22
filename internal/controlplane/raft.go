@@ -201,6 +201,25 @@ func (s *RaftStore) AllowDirectoryEntry(entry session.DirectoryEntry) bool {
 	return false
 }
 
+// NodeEpochPermanentlyFenced reports only the #46 execution fence established
+// by an accepted newer NodeEpoch. Enrollment retirement stops Session work but
+// does not prove that executions from the same NodeEpoch cannot continue.
+func (s *RaftStore) NodeEpochPermanentlyFenced(
+	ctx context.Context,
+	nodeID string,
+	nodeEpoch uint64,
+) (bool, error) {
+	if nodeID == "" || nodeEpoch == 0 {
+		return false, errors.New("controlplane: incomplete NodeEpoch fence query")
+	}
+	state, err := s.runtime.ReadSystemStrong(ctx)
+	if err != nil {
+		return false, err
+	}
+	enrollment, found := state.NodeEnrollments[nodeID]
+	return found && enrollment.MaxNodeEpoch > nodeEpoch, nil
+}
+
 func (s *RaftStore) AuthorizeEvent(identity session.ServeIdentity, acknowledge bool) error {
 	operation := raftstore.PermitHolderEvent
 	if acknowledge {

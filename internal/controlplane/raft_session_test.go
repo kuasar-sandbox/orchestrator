@@ -92,6 +92,45 @@ func TestRaftStoreFencesRetiredNodeSessionAtPermitCommit(t *testing.T) {
 	}
 }
 
+func TestNodeEpochFenceRequiresStrictlyNewerCommittedEpoch(t *testing.T) {
+	registryLayout := testControlRegistryLayout()
+	runtime, err := newMemoryConsensus(registryLayout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest, err := registryLayout.Digest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := raftstore.SystemState{
+		Initialized: true, ClusterID: registryLayout.ClusterID, RegistryGeneration: registryLayout.RegistryGeneration,
+		SystemEpoch: 1, ActiveRegistryLayoutDigest: digest, LastApplied: 1,
+		NodeEnrollments: map[string]raftstore.NodeEnrollmentRecord{"node-1": {
+			NodeID: "node-1", EnrollmentID: "enrollment-1", MaxNodeEpoch: 7,
+			EnrollmentIndex: 1, LastAppliedIndex: 1,
+		}},
+	}
+	consensus := &registrationConsensus{memoryConsensus: runtime, state: state}
+	store, err := NewRaftStore(consensus, registryLayout, digest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fenced, err := store.NodeEpochPermanentlyFenced(context.Background(), "node-1", 7); err != nil || fenced {
+		t.Fatalf("current NodeEpoch fenced=%v err=%v", fenced, err)
+	}
+	enrollment := consensus.state.NodeEnrollments["node-1"]
+	enrollment.Retired = true
+	consensus.state.NodeEnrollments["node-1"] = enrollment
+	if fenced, err := store.NodeEpochPermanentlyFenced(context.Background(), "node-1", 7); err != nil || fenced {
+		t.Fatalf("same-epoch enrollment retirement fenced execution=%v err=%v", fenced, err)
+	}
+	enrollment.MaxNodeEpoch = 8
+	consensus.state.NodeEnrollments["node-1"] = enrollment
+	if fenced, err := store.NodeEpochPermanentlyFenced(context.Background(), "node-1", 7); err != nil || !fenced {
+		t.Fatalf("older NodeEpoch fenced=%v err=%v", fenced, err)
+	}
+}
+
 func TestDirectoryRetainsCurrentSessionAcrossClosedServeGates(t *testing.T) {
 	registryLayout := testControlRegistryLayout()
 	runtime, err := newMemoryConsensus(registryLayout)
