@@ -3,6 +3,7 @@ package cluster
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -143,6 +144,44 @@ func TestPlacementFailuresDoNotInventExecutionProof(t *testing.T) {
 	}
 }
 
+func TestPlacementCandidatePoolIsBoundedBeforePersistence(t *testing.T) {
+	candidates := make([]PlacementCandidate, MaxPlacementCandidates+1)
+	for index := range candidates {
+		candidates[index].NodeID = fmt.Sprintf("node-%d", index)
+	}
+	if err := validateCandidates(candidates, nil, nil); err == nil {
+		t.Fatal("oversized candidate pool was accepted")
+	}
+	if err := validateCandidates([]PlacementCandidate{{NodeID: "node-1"}}, nil, make([]uint32, 2)); err == nil {
+		t.Fatal("oversized rejected-candidate set was accepted")
+	}
+	if err := validateCandidates([]PlacementCandidate{{
+		NodeID: "node-1", FailureDomain: strings.Repeat("z", MaxPlacementCandidateMetadataBytes+1),
+	}}, nil, nil); err == nil {
+		t.Fatal("oversized candidate metadata was accepted")
+	}
+}
+
+func TestExecutionFenceRequiresFinalOutboxCoverage(t *testing.T) {
+	proof := TerminalProof{
+		Kind: ProofNodeTerminal, ProofDigest: hexDigest(sha256.Sum256([]byte("proof"))),
+		FencedNodeID: "node-1", FencedNodeEpoch: 7,
+	}
+	fence := ExecutionFence{
+		Group: "/g", RouteKey: "rk", SandboxID: "sandbox-1", NodeID: "node-1", NodeEpoch: 7,
+		RegistryGeneration: "g1", BindingDigest: hexDigest(sha256.Sum256([]byte("binding"))),
+		LastEventSeq: 4, FinalOutboxWatermark: 3, Proof: proof,
+		Revision: Revision{RegistryGeneration: "g1", ShardID: 1, LogIndex: 9},
+	}
+	if err := fence.Validate(); err == nil {
+		t.Fatal("execution fence accepted an outbox watermark below its last event")
+	}
+	fence.FinalOutboxWatermark = fence.LastEventSeq
+	if err := fence.Validate(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestNewerNodeEpochProofIsBoundToExactExecutionState(t *testing.T) {
 	ready := readyRoute()
 	proof := TerminalProof{
@@ -224,7 +263,7 @@ func workflowSandboxIntent(t *testing.T) DispatchIntent {
 		AccessToken: "token", TargetPort: 3000,
 		Request: NodeRequestEnvelopeV1{
 			Version: NodeRequestEnvelopeVersionV1, Method: "POST", Path: "/sandboxes",
-			Body: []byte(`{"templateID":"` + templateRef + `"}`),
+			Body: []byte(`{"metadata":null,"templateID":"` + templateRef + `","timeout":0}`),
 		},
 	})
 	if err != nil {
@@ -243,10 +282,7 @@ func workflowBuildIntent(t *testing.T) DispatchIntent {
 		Version: DispatchSpecVersionV1, TemplateID: "template-1",
 		AuthKeyFingerprint: strings.Repeat("b", 24), ManifestKeyFingerprint: strings.Repeat("c", 24),
 		Profile: types.ProfileBare, CPUCount: 1, MemoryMB: 512,
-		Request: NodeRequestEnvelopeV1{
-			Version: NodeRequestEnvelopeVersionV1, Method: "POST", Path: "/v3/templates",
-			Body: []byte(`{"cpuCount":1,"memoryMB":512}`),
-		},
+		Request: NodeRequestEnvelopeV1{Version: NodeRequestEnvelopeVersionV1, Method: "POST", Path: "/v3/templates", Body: []byte(`{"cpuCount":1,"memoryMB":512,"metadata":null,"name":"","profile":"bare","tags":null}`)},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -267,7 +303,7 @@ func readyRoute() *ReadyRoute {
 		AccessToken: "token", TargetPort: 3000,
 		Request: NodeRequestEnvelopeV1{
 			Version: NodeRequestEnvelopeVersionV1, Method: "POST", Path: "/sandboxes",
-			Body: []byte(`{"templateID":"` + templateRef + `"}`),
+			Body: []byte(`{"metadata":null,"templateID":"` + templateRef + `","timeout":0}`),
 		},
 	})
 	intent, _ := NewDispatchIntent([]byte("demand"), spec, "provider-v1")
