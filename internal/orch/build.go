@@ -37,6 +37,12 @@ func (o *Orchestrator) newRegisteredBuild(ctx context.Context, apiKey string, sp
 	if spec.CPUCount <= 0 || spec.MemoryMB <= 0 {
 		return nil, fmt.Errorf("%w: positive cpuCount and memoryMB are required at build registration", api.ErrBadRequest)
 	}
+	if maximum := o.cfg.Builder.VCPU; maximum > 0 && spec.CPUCount > maximum {
+		return nil, fmt.Errorf("%w: build cpuCount exceeds this node's per-build capacity", api.ErrBadRequest)
+	}
+	if maximum := o.cfg.Builder.MemoryMiB(); maximum > 0 && spec.MemoryMB > maximum {
+		return nil, fmt.Errorf("%w: build memoryMB exceeds this node's per-build capacity", api.ErrBadRequest)
+	}
 	spec.Metadata = sandboxcfg.SetCapacity(spec.Metadata, spec.CPUCount, spec.MemoryMB)
 	metadata, builderOpts, err := buildcfg.Extract(spec.Metadata)
 	if err != nil {
@@ -278,6 +284,12 @@ func (o *Orchestrator) effectiveImportReferer(b *types.Build) (configsock.BuildI
 // pull token (api_headers, opaque, manifest-key-sealed) > the SDK's fromImageRegistry
 // (cleartext username/password) > the default copied from the key lease > anonymous.
 func (o *Orchestrator) resolveBuildCreds(ctx context.Context, b *types.Build, pullToken, regUser, regPass string) (string, error) {
+	if b.FromTemplate != "" {
+		// A derived build restores the base template's content directly and never
+		// pulls a container image. Do not interpret task credentials after the
+		// Build has switched to the base template's ManifestKey.
+		return "", nil
+	}
 	clusterAuth, isCluster := o.clusterBuildCreds(b.BuildID)
 	var creds regcreds.Creds
 	switch {
