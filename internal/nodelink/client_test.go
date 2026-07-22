@@ -518,10 +518,17 @@ func (f *fakeDurableEventOutbox) PendingExecutionEvents(
 	defer f.mu.Unlock()
 	f.queries++
 	f.cursors = append(f.cursors, cursor)
-	if maxCount > len(f.events) {
-		maxCount = len(f.events)
+	start := 0
+	if cursor != (routesync.EventCursor{}) {
+		for index, event := range f.events {
+			if event.ObjectKind == cursor.ObjectKind && event.ObjectID == cursor.ObjectID {
+				start = index + 1
+				break
+			}
+		}
 	}
-	events := append([]routesync.ExecutionEvent(nil), f.events[:maxCount]...)
+	end := min(start+maxCount, len(f.events))
+	events := append([]routesync.ExecutionEvent(nil), f.events[start:end]...)
 	var next routesync.EventCursor
 	if len(events) > 0 {
 		last := events[len(events)-1]
@@ -574,45 +581,24 @@ func TestDurableEventReplayStartsImmediatelyAndIsBatchBounded(t *testing.T) {
 	}
 }
 
-func TestDurableEventReplayForcesBoundedCursorWrap(t *testing.T) {
-	durable := &fakeDurableEventOutbox{
-		wake: make(chan struct{}, 1),
-		events: []routesync.ExecutionEvent{{
-			ObjectKind: "sandbox", ObjectID: "sandbox-tail", NodeID: "node-1", NodeEpoch: 7,
+func TestDurableEventReplayTraversesAllEventsBeforeCursorWrap(t *testing.T) {
+	durable := &fakeDurableEventOutbox{wake: make(chan struct{}, 1)}
+	for index := 0; index < 20; index++ {
+		durable.events = append(durable.events, routesync.ExecutionEvent{
+			ObjectKind: "sandbox", ObjectID: fmt.Sprintf("sandbox-%02d", index), NodeID: "node-1", NodeEpoch: 7,
 			RegistryGeneration: "generation-1", BindingDigest: strings.Repeat("a", 64), EventSeq: 1, State: "READY",
-		}},
+		})
 	}
-	eventOut := make(chan *routesync.Msg, durableReplayBatchesBeforeWrap+4)
+	eventOut := make(chan *routesync.Msg, len(durable.events))
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	go runDurableEventReplay(ctx, durable, "node-1", 7, 1, 1<<20, time.Millisecond, eventOut,
 		slog.New(slog.NewTextHandler(io.Discard, nil)))
-	deadline := time.After(time.Second)
-	for {
-		durable.mu.Lock()
-		queries := durable.queries
-		durable.mu.Unlock()
-		if queries >= durableReplayBatchesBeforeWrap+1 {
-			break
+	for index := range durable.events {
+		message := receiveOutboxMsg(t, eventOut)
+		if message.ExecutionEvent == nil || message.ExecutionEvent.ObjectID != durable.events[index].ObjectID {
+			t.Fatalf("replay[%d] = %+v, want %s", index, message, durable.events[index].ObjectID)
 		}
-		select {
-		case <-eventOut:
-		case <-deadline:
-			cancel()
-			t.Fatal("timeout waiting for bounded replay wrap")
-		}
-	}
-	cancel()
-	durable.mu.Lock()
-	cursors := append([]routesync.EventCursor(nil), durable.cursors...)
-	durable.mu.Unlock()
-	zeroes := 0
-	for _, cursor := range cursors {
-		if cursor == (routesync.EventCursor{}) {
-			zeroes++
-		}
-	}
-	if zeroes < 2 {
-		t.Fatalf("replay cursor never wrapped: %+v", cursors)
 	}
 }
 

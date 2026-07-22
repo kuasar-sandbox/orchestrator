@@ -43,6 +43,10 @@ func (s *RaftStore) CommitNodeTerminalRoute(
 	if err != nil {
 		return clusterstate.RouteWorkflowRecord{}, err
 	}
+	proofDigest, err := terminalEventDigest(event)
+	if err != nil {
+		return clusterstate.RouteWorkflowRecord{}, err
+	}
 	tombstone := next.Tombstone
 	if next.State != clusterstate.WorkflowRouteTombstone || tombstone == nil || tombstone.PlacementFailure != nil ||
 		binding.Kind != clusterstate.ExecutionKindSandbox || binding.Group != next.Group ||
@@ -51,7 +55,8 @@ func (s *RaftStore) CommitNodeTerminalRoute(
 		tombstone.NodeEpoch != event.NodeEpoch || tombstone.RegistryGeneration != event.RegistryGeneration ||
 		tombstone.BindingDigest != event.BindingDigest || tombstone.LastEventSeq != event.EventSeq ||
 		tombstone.Proof.Kind != clusterstate.ProofNodeTerminal ||
-		tombstone.Proof.ProofDigest != terminalEventDigest(event) {
+		tombstone.Proof.FencedNodeID != event.NodeID || tombstone.Proof.FencedNodeEpoch != event.NodeEpoch ||
+		tombstone.Proof.ProofDigest != proofDigest {
 		return clusterstate.RouteWorkflowRecord{}, errors.New("controlplane: node terminal proof does not match the authenticated event")
 	}
 	ctx = withTerminalProofAuthorization(ctx, expected, next)

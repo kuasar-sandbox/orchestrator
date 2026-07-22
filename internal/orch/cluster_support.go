@@ -156,33 +156,39 @@ func (o *Orchestrator) rebindClusterExecution(ctx context.Context, command *rout
 	default:
 		return errors.New("cluster rebind requires exactly one Sandbox or Build ID")
 	}
-	if err := o.validateClusterCommandBinding(ctx, command, kind, objectID); err != nil {
-		return fmt.Errorf("%w: %v", errWrongExecutionBinding, err)
-	}
-	workflow, err := o.st.GetNodeWorkflow(ctx, kind, objectID)
-	if err != nil {
-		return err
-	}
-	if workflow == nil || kind == clusterstate.ExecutionKindSandbox && workflow.LatestEvent == nil {
-		return fmt.Errorf("%w: durable node workflow is missing", errWrongExecutionBinding)
-	}
-	changed, err := o.st.CASExecutionBinding(ctx, kind, objectID, command.OldBindingDigest, command.Binding)
-	if err != nil {
-		return err
-	}
-	if !changed {
-		return errWrongExecutionBinding
-	}
-	if kind == clusterstate.ExecutionKindSandbox {
-		sandbox, err := o.st.Get(ctx, objectID)
+	apply := func() error {
+		if err := o.validateClusterCommandBinding(ctx, command, kind, objectID); err != nil {
+			return fmt.Errorf("%w: %v", errWrongExecutionBinding, err)
+		}
+		workflow, err := o.st.GetNodeWorkflow(ctx, kind, objectID)
 		if err != nil {
 			return err
 		}
-		if sandbox == nil {
+		if workflow == nil || kind == clusterstate.ExecutionKindSandbox && workflow.LatestEvent == nil {
+			return fmt.Errorf("%w: durable node workflow is missing", errWrongExecutionBinding)
+		}
+		changed, err := o.st.CASExecutionBinding(ctx, kind, objectID, command.OldBindingDigest, command.Binding)
+		if err != nil {
+			return err
+		}
+		if !changed {
 			return errWrongExecutionBinding
 		}
-		o.cache(sandbox)
-		return o.publishUpsertContext(ctx, sandbox)
+		if kind == clusterstate.ExecutionKindSandbox {
+			sandbox, err := o.st.Get(ctx, objectID)
+			if err != nil {
+				return err
+			}
+			if sandbox == nil {
+				return errWrongExecutionBinding
+			}
+			o.cache(sandbox)
+			return o.publishUpsertContext(ctx, sandbox)
+		}
+		return nil
 	}
-	return nil
+	if kind == clusterstate.ExecutionKindSandbox {
+		return o.lifecycle.Do(objectID, apply)
+	}
+	return apply()
 }

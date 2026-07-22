@@ -3,7 +3,6 @@ package controlplane
 import (
 	"context"
 	"crypto/sha256"
-	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -363,9 +362,13 @@ func tombstoneFromEvent(
 	event routesync.ExecutionEvent,
 ) (clusterstate.RouteWorkflowRecord, clusterstate.ExecutionFence, error) {
 	proof := clusterstate.TerminalProof{
-		Kind: clusterstate.ProofNodeTerminal, ProofDigest: terminalEventDigest(event),
-		FencedNodeID: event.NodeID, FencedNodeEpoch: event.NodeEpoch,
+		Kind: clusterstate.ProofNodeTerminal, FencedNodeID: event.NodeID, FencedNodeEpoch: event.NodeEpoch,
 	}
+	digest, err := terminalEventDigest(event)
+	if err != nil {
+		return clusterstate.RouteWorkflowRecord{}, clusterstate.ExecutionFence{}, err
+	}
+	proof.ProofDigest = digest
 	reason := event.Reason
 	if reason == "" {
 		reason = event.State
@@ -400,22 +403,8 @@ func fenceFromTombstone(record clusterstate.RouteWorkflowRecord) clusterstate.Ex
 	}
 }
 
-func terminalEventDigest(event routesync.ExecutionEvent) string {
-	hash := sha256.New()
-	_, _ = hash.Write([]byte("kuasar-node-terminal-proof-v1"))
-	for _, field := range []string{
-		event.ObjectKind, event.ObjectID, event.NodeID, event.RegistryGeneration,
-		event.BindingDigest, event.State, event.Reason,
-	} {
-		var length [4]byte
-		binary.BigEndian.PutUint32(length[:], uint32(len(field)))
-		_, _ = hash.Write(length[:])
-		_, _ = hash.Write([]byte(field))
-	}
-	var number [8]byte
-	binary.BigEndian.PutUint64(number[:], event.NodeEpoch)
-	_, _ = hash.Write(number[:])
-	binary.BigEndian.PutUint64(number[:], event.EventSeq)
-	_, _ = hash.Write(number[:])
-	return hex.EncodeToString(hash.Sum(nil))
+func terminalEventDigest(event routesync.ExecutionEvent) (string, error) {
+	return clusterstate.NodeTerminalProofDigest(clusterstate.TerminalProof{
+		Kind: clusterstate.ProofNodeTerminal, FencedNodeID: event.NodeID, FencedNodeEpoch: event.NodeEpoch,
+	}, event.RegistryGeneration, event.ObjectID, event.BindingDigest, event.EventSeq)
 }

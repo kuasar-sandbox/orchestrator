@@ -528,6 +528,51 @@ func TestSandboxPresentationUpdateAdvancesLiveOutbox(t *testing.T) {
 	}
 }
 
+func TestDeletedSandboxRemovesBusinessRowButRetainsDurableEvent(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	dispatch := workflowDispatch(t, clusterstate.ExecutionKindSandbox, "sandbox-deleted", placement.BuildDemand{})
+	decision := nodeexec.AdmissionDecision{
+		State: nodeexec.AdmissionAdmitted, Result: clusterstate.DispatchAcceptedAdmitted,
+		ReservationToken: "reservation-deleted",
+	}
+	sandbox := workflowSandbox(dispatch.ObjectID)
+	if _, err := st.RecordSandboxWorkflow(ctx, dispatch, decision, sandbox); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.ClaimSandboxWorkflow(ctx, dispatch.ObjectID, dispatch.DemandDigest, decision.ReservationToken); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.CommitSandboxEvent(ctx, sandbox, sandboxEvent(nodeexec.EventUpdate{
+		State: string(clusterstate.WorkflowRouteReady),
+	})); err != nil {
+		t.Fatal(err)
+	}
+	deletedUpdate := sandboxEvent(nodeexec.EventUpdate{State: "DELETED"})
+	deleted, err := st.CommitSandboxEvent(ctx, sandbox, deletedUpdate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleted.EventSeq != 2 || deleted.LatestEvent == nil || deleted.LatestEvent.State != "DELETED" {
+		t.Fatalf("deleted workflow = %+v", deleted)
+	}
+	if stored, err := st.Get(ctx, sandbox.ID); err != nil || stored != nil {
+		t.Fatalf("deleted Sandbox business row = %+v, %v", stored, err)
+	}
+	if exists, err := st.ExecutionObjectExists(ctx, clusterstate.ExecutionKindSandbox, sandbox.ID); err != nil || exists {
+		t.Fatalf("deleted Sandbox remains occupied = %v, %v", exists, err)
+	}
+	pending, _, err := st.PendingExecutionEvents(
+		ctx, dispatch.NodeID, dispatch.NodeEpoch, routesync.EventCursor{}, 10, routesync.MaxExecutionEventBytes,
+	)
+	if err != nil || len(pending) != 1 || pending[0].ObjectID != sandbox.ID || pending[0].State != "DELETED" {
+		t.Fatalf("deleted Sandbox outbox = %+v, %v", pending, err)
+	}
+	if _, err := st.CommitSandboxEvent(ctx, sandbox, deletedUpdate); err != nil {
+		t.Fatalf("idempotent deleted event: %v", err)
+	}
+}
+
 func TestSandboxEventPreservesNewerBusinessObjectFields(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()

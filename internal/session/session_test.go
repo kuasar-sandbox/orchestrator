@@ -1242,6 +1242,108 @@ func TestHolderRechecksPermitAfterWaitingForCommandFence(t *testing.T) {
 	}
 }
 
+func TestKeyPutRechecksPermitAfterWaitingForCommandFence(t *testing.T) {
+	registration := testRegistration("node-1", 7, 10, "10.0.0.1:8443")
+	gate := &switchGate{allowed: true, checks: make(chan struct{}, 8)}
+	holder, err := NewHolder("registry-a", 1, nil, gate, nil, newTestEnrollmentAuthority(registration))
+	if err != nil {
+		t.Fatal(err)
+	}
+	endpoint := &testEndpoint{}
+	if _, err := holder.Register(context.Background(), registration, endpoint); err != nil {
+		t.Fatal(err)
+	}
+	holder.mu.RLock()
+	held := holder.active[registration.NodeID]
+	holder.mu.RUnlock()
+	held.commandMu.Lock()
+	done := make(chan struct {
+		sent bool
+		err  error
+	}, 1)
+	go func() {
+		_, sent, err := holder.InstallKeyLease(
+			context.Background(), testServeIdentity(), registration.NodeID, registration.NodeEpoch,
+			registration.DataEndpoint, testKeyLease(),
+		)
+		done <- struct {
+			sent bool
+			err  error
+		}{sent: sent, err: err}
+	}()
+	select {
+	case <-gate.checks:
+	case <-time.After(time.Second):
+		held.commandMu.Unlock()
+		t.Fatal("key put did not perform its initial Permit check")
+	}
+	gate.set(false)
+	held.commandMu.Unlock()
+	result := <-done
+	if result.sent || !errors.Is(result.err, ErrPermitUnavailable) || !errors.Is(result.err, ErrDispatchNotSent) {
+		t.Fatalf("expired Permit key put sent=%v err=%v", result.sent, result.err)
+	}
+	if len(endpoint.wire) != 0 {
+		t.Fatal("key put reached endpoint after Permit expired while waiting")
+	}
+}
+
+func TestKeyDropRechecksPermitAfterWaitingForCommandFence(t *testing.T) {
+	registration := testRegistration("node-1", 7, 10, "10.0.0.1:8443")
+	gate := &switchGate{allowed: true, checks: make(chan struct{}, 8)}
+	holder, err := NewHolder("registry-a", 1, nil, gate, nil, newTestEnrollmentAuthority(registration))
+	if err != nil {
+		t.Fatal(err)
+	}
+	endpoint := &testEndpoint{}
+	if _, err := holder.Register(context.Background(), registration, endpoint); err != nil {
+		t.Fatal(err)
+	}
+	lease := testKeyLease()
+	ref, sent, err := holder.InstallKeyLease(
+		context.Background(), testServeIdentity(), registration.NodeID, registration.NodeEpoch, registration.DataEndpoint, lease,
+	)
+	if err != nil || !sent {
+		t.Fatalf("initial key put sent=%v err=%v", sent, err)
+	}
+	for len(gate.checks) > 0 {
+		<-gate.checks
+	}
+	holder.mu.RLock()
+	held := holder.active[registration.NodeID]
+	holder.mu.RUnlock()
+	held.commandMu.Lock()
+	done := make(chan struct {
+		sent bool
+		err  error
+	}, 1)
+	go func() {
+		sent, err := holder.DropKeyLease(
+			context.Background(), testServeIdentity(), registration.NodeID, registration.NodeEpoch,
+			registration.DataEndpoint, ref,
+		)
+		done <- struct {
+			sent bool
+			err  error
+		}{sent: sent, err: err}
+	}()
+	select {
+	case <-gate.checks:
+	case <-time.After(time.Second):
+		held.commandMu.Unlock()
+		t.Fatal("key drop did not perform its initial Permit check")
+	}
+	gate.set(false)
+	held.commandMu.Unlock()
+	result := <-done
+	if result.sent || !errors.Is(result.err, ErrPermitUnavailable) || !errors.Is(result.err, ErrDispatchNotSent) {
+		t.Fatalf("expired Permit key drop sent=%v err=%v", result.sent, result.err)
+	}
+	if len(endpoint.wire) != 1 {
+		t.Fatal("key drop reached endpoint after Permit expired while waiting")
+	}
+}
+
 func TestDirectoryHighestTupleDownAndConflictAreFailClosed(t *testing.T) {
 	directory := newTestDirectory()
 	e1 := DirectoryEntry{NodeID: "node-1", EnrollmentID: "enrollment-node-1", Tuple: Tuple{NodeEpoch: 7, SessionSeq: 10}, HolderMemberID: "registry-a"}

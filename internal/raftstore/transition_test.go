@@ -206,3 +206,30 @@ func transitionStageForTest(t *testing.T, state SystemState, raftShardID uint64)
 	}
 	return state.Transition.Shards[position].Stage
 }
+
+func TestTransitionAdvanceAmbiguityAcceptsLaterOrFinalizedState(t *testing.T) {
+	const (
+		version = uint64(2)
+		shardID = uint32(0)
+	)
+	digest := digestFor("next-registry-layout")
+	state := SystemState{Transition: &RegistryLayoutTransition{
+		Version: version, Digest: digest,
+		Shards: []ShardTransition{
+			{ShardID: ^uint32(0), Stage: TransitionPending},
+			{ShardID: shardID, Stage: TransitionOldRemoved},
+		},
+	}}
+	if !transitionAdvanceCommitted(state, version, digest, shardID, TransitionCatchingUp) {
+		t.Fatal("later committed shard stage did not resolve the earlier ambiguous advance")
+	}
+	if transitionAdvanceCommitted(state, version, digestFor("other-layout"), shardID, TransitionCatchingUp) {
+		t.Fatal("another Registry Layout resolved the ambiguous advance")
+	}
+	state.Transition = nil
+	state.ActiveRegistryLayoutVersion = version
+	state.ActiveRegistryLayoutDigest = digest
+	if !transitionAdvanceCommitted(state, version, digest, shardID, TransitionCatchingUp) {
+		t.Fatal("finalized target Registry Layout did not resolve the ambiguous advance")
+	}
+}

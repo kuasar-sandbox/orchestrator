@@ -59,7 +59,7 @@ type Orchestrator struct {
 	reg map[string]*types.Sandbox // in-memory cache (hot path: Route/LaunchSpecFor)
 
 	sf        flightGroup // per-sid single-flight for resume (dedup concurrent data-plane wakeups)
-	lifecycle serialGroup // serializes resume/delete side effects for the same SID
+	lifecycle serialGroup // serializes resume, delete, and Binding replacement for the same SID
 
 	subsMu sync.Mutex
 	subs   map[int]chan routesync.Event // route-change subscribers (routesync clients)

@@ -464,8 +464,11 @@ func TestResumeRace_RegistryDeleteWaitsForInFlightResume(t *testing.T) {
 	<-deleteDone
 
 	stored, err = st.Get(ctx, sid)
-	if err != nil || stored == nil || stored.State != types.StateDead {
+	if err != nil || stored != nil {
 		t.Fatalf("sandbox after serialized delete = %+v, %v", stored, err)
+	}
+	if exists, err := st.ExecutionObjectExists(ctx, clusterstate.ExecutionKindSandbox, sid); err != nil || exists {
+		t.Fatalf("deleted Sandbox remains occupied = %v, %v", exists, err)
 	}
 	record, err := st.GetNodeWorkflow(ctx, clusterstate.ExecutionKindSandbox, sid)
 	if err != nil || record == nil || record.ObjectState != "DELETED" {

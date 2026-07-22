@@ -1,6 +1,7 @@
 package raftstore
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"strings"
 	"testing"
@@ -76,38 +77,129 @@ func TestDataCASConflictAdvancesAppliedIndexWithoutChangingRow(t *testing.T) {
 	}
 }
 
-func TestMutationLookupInheritsCommittedWorkflowFinalizations(t *testing.T) {
-	registryLayout := testRegistryLayout(4, "generation-mutation-finalizations")
+func TestCloneRouteRecordDeepCopiesReadyExecutionIntents(t *testing.T) {
+	registryLayout := testRegistryLayout(4, "generation-clone-ready")
+	starting := routeStarting(t, registryLayout, "/g", "rk", "sandbox-1", 1, true)
+	ready := readyRecord(starting, 1)
+	paused := pausedRecord(ready, 2)
+	resuming := clusterstate.RouteWorkflowRecord{
+		Group: ready.Group, RouteKey: ready.RouteKey, State: clusterstate.WorkflowRouteResuming,
+		Resuming: &clusterstate.ResumingRouteState{
+			Execution: paused.Paused.Execution,
+			Intent:    paused.Paused.ResumeIntent,
+		},
+	}
+	deleting := deletingRecord(ready)
+
+	tests := []struct {
+		name   string
+		record clusterstate.RouteWorkflowRecord
+		intent func(*clusterstate.RouteWorkflowRecord) *clusterstate.DispatchIntent
+	}{
+		{name: "ready", record: ready, intent: func(record *clusterstate.RouteWorkflowRecord) *clusterstate.DispatchIntent {
+			return &record.Ready.Intent
+		}},
+		{name: "paused", record: paused, intent: func(record *clusterstate.RouteWorkflowRecord) *clusterstate.DispatchIntent {
+			return &record.Paused.Execution.Intent
+		}},
+		{name: "resuming", record: resuming, intent: func(record *clusterstate.RouteWorkflowRecord) *clusterstate.DispatchIntent {
+			return &record.Resuming.Execution.Intent
+		}},
+		{name: "deleting", record: deleting, intent: func(record *clusterstate.RouteWorkflowRecord) *clusterstate.DispatchIntent {
+			return &record.Deleting.Execution.Intent
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cloned := cloneRouteRecord(test.record)
+			clonedIntent := test.intent(&cloned)
+			wantDemand := append([]byte(nil), clonedIntent.NormalizedDemand...)
+			wantSpec := append([]byte(nil), clonedIntent.DispatchSpec...)
+			sourceIntent := test.intent(&test.record)
+			sourceIntent.NormalizedDemand[0] ^= 0xff
+			sourceIntent.DispatchSpec[0] ^= 0xff
+			if !bytes.Equal(clonedIntent.NormalizedDemand, wantDemand) || !bytes.Equal(clonedIntent.DispatchSpec, wantSpec) {
+				t.Fatal("cloned READY execution retained command-owned dispatch slices")
+			}
+		})
+	}
+}
+
+func TestMutationLookupInheritsFinalizationsAndIgnoresFenceCompaction(t *testing.T) {
+	registryLayout := testRegistryLayout(4, "generation-mutation-lookup")
 	state, identity := initializedRouteShard(t, registryLayout, "/g", "rk")
-	current := routeStarting(t, registryLayout, "/g", "rk", "sandbox-1", 1, false)
-	current.Finalizations = []clusterstate.WorkflowFinalizationIntent{{
-		ObjectID: "sandbox-old", NodeID: "node-1", NodeEpoch: 1, DataEndpoint: "node-1:8443",
-		RegistryGeneration: registryLayout.RegistryGeneration, BindingDigest: digestFor("binding-old"),
-	}}
-	current = withRevision(current, state, 3)
-	state.Routes[routeMapKey(current.Group, current.RouteKey)] = current
-	commandRecord := cloneRouteRecord(current)
-	commandRecord.Revision = clusterstate.Revision{}
-	commandRecord.Finalizations = nil
+	selected := routeStarting(t, registryLayout, "/g", "rk", "sandbox-1", 1, true)
+	applyDataOK(t, &state, 2, DataCommand{
+		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{Absent: true}, Route: &selected,
+	})
+	rejected := cloneRouteRecord(state.Routes[routeMapKey("/g", "rk")])
+	binding := *rejected.Starting.Binding
+	rejected.Starting.SelectedCandidate = nil
+	rejected.Starting.Binding = nil
+	rejected.Starting.DefinitivelyRejected = []uint32{0}
+	rejected.Finalizations = []clusterstate.WorkflowFinalizationIntent{
+		workflowFinalization(t, rejected.Starting.SandboxID, binding, nil),
+	}
+	applyDataOK(t, &state, 3, DataCommand{
+		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{LogIndex: 2}, Route: &rejected,
+	})
+
+	wanted := cloneRouteRecord(rejected)
+	wanted.Finalizations = nil
+	wanted.Revision = clusterstate.Revision{}
 	status, err := LookupDataMutation(state, DataMutationLookup{Command: DataCommand{
-		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{LogIndex: 2}, Route: &commandRecord,
+		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{LogIndex: 2}, Route: &wanted,
 	}})
 	if err != nil || !status.Committed || status.Revision != 3 {
-		t.Fatalf("Route mutation status = %+v, %v", status, err)
+		t.Fatalf("inherited-finalization mutation lookup = %+v, %v", status, err)
+	}
+	buildState, buildIdentity := initializedBuildShard(t, registryLayout, "/g", "build-1")
+	selectedBuild := buildStarting(t, registryLayout, "/g", "build-1", true)
+	applyDataOK(t, &buildState, 2, DataCommand{
+		Type: DataPutBuild, Identity: buildIdentity, Expect: RevisionExpectation{Absent: true}, Build: &selectedBuild,
+	})
+	rejectedBuild := cloneBuildRecord(buildState.Builds[buildMapKey("/g", "build-1")])
+	buildBinding := *rejectedBuild.Starting.Binding
+	rejectedBuild.Starting.SelectedCandidate = nil
+	rejectedBuild.Starting.Binding = nil
+	rejectedBuild.Starting.DefinitivelyRejected = []uint32{0}
+	rejectedBuild.Finalizations = []clusterstate.WorkflowFinalizationIntent{
+		workflowFinalization(t, rejectedBuild.BuildID, buildBinding, nil),
+	}
+	applyDataOK(t, &buildState, 3, DataCommand{
+		Type: DataPutBuild, Identity: buildIdentity, Expect: RevisionExpectation{LogIndex: 2}, Build: &rejectedBuild,
+	})
+	wantedBuild := cloneBuildRecord(rejectedBuild)
+	wantedBuild.Finalizations = nil
+	wantedBuild.Revision = clusterstate.Revision{}
+	status, err = LookupDataMutation(buildState, DataMutationLookup{Command: DataCommand{
+		Type: DataPutBuild, Identity: buildIdentity, Expect: RevisionExpectation{LogIndex: 2}, Build: &wantedBuild,
+	}})
+	if err != nil || !status.Committed || status.Revision != 3 {
+		t.Fatalf("inherited Build finalization mutation lookup = %+v, %v", status, err)
 	}
 
-	build := buildStarting(t, registryLayout, "/g", "build-1", false)
-	build.Finalizations = cloneWorkflowFinalizations(current.Finalizations)
-	build.Revision = revisionFor(state, 4)
-	state.Builds[buildMapKey(build.Group, build.BuildID)] = build
-	commandBuild := cloneBuildRecord(build)
-	commandBuild.Revision = clusterstate.Revision{}
-	commandBuild.Finalizations = nil
+	compacted := cloneRouteRecord(state.Routes[routeMapKey("/g", "rk")])
+	compacted.State = clusterstate.WorkflowRouteTombstone
+	compacted.Starting = nil
+	compacted.Finalizations = nil
+	compacted.Tombstone = &clusterstate.RouteTombstoneState{
+		PlacementFailure: &clusterstate.RoutePlacementFailureState{
+			SandboxID: "sandbox-1", PlacementRound: 1, CandidatePool: selected.Starting.CandidatePool,
+			DefinitivelyRejected: []uint32{0, 1}, Intent: selected.Starting.Intent, Reason: "exhausted",
+		},
+		FenceCompacted: true,
+	}
+	compacted.Revision = revisionFor(state, 5)
+	state.Routes[routeMapKey("/g", "rk")] = compacted
+	wanted = cloneRouteRecord(compacted)
+	wanted.Revision = clusterstate.Revision{}
+	wanted.Tombstone.FenceCompacted = false
 	status, err = LookupDataMutation(state, DataMutationLookup{Command: DataCommand{
-		Type: DataPutBuild, Identity: identity, Expect: RevisionExpectation{LogIndex: 3}, Build: &commandBuild,
+		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{LogIndex: 4}, Route: &wanted,
 	}})
-	if err != nil || !status.Committed || status.Revision != 4 {
-		t.Fatalf("Build mutation status = %+v, %v", status, err)
+	if err != nil || !status.Committed || status.Revision != 5 {
+		t.Fatalf("compacted-tombstone mutation lookup = %+v, %v", status, err)
 	}
 }
 
@@ -660,9 +752,15 @@ func deletingRecord(ready clusterstate.RouteWorkflowRecord) clusterstate.RouteWo
 func terminalRouteAndFence(deleting clusterstate.RouteWorkflowRecord, eventSeq uint64) (clusterstate.RouteWorkflowRecord, clusterstate.ExecutionFence) {
 	execution := deleting.Deleting.Execution
 	proof := clusterstate.TerminalProof{
-		Kind: clusterstate.ProofNodeTerminal, ProofDigest: digestFor("terminal-sandbox-1"),
-		FencedNodeID: execution.NodeID, FencedNodeEpoch: execution.NodeEpoch,
+		Kind: clusterstate.ProofNodeTerminal, FencedNodeID: execution.NodeID, FencedNodeEpoch: execution.NodeEpoch,
 	}
+	digest, err := clusterstate.NodeTerminalProofDigest(
+		proof, execution.RegistryGeneration, execution.SandboxID, execution.BindingDigest, eventSeq,
+	)
+	if err != nil {
+		panic(err)
+	}
+	proof.ProofDigest = digest
 	tombstone := clusterstate.RouteWorkflowRecord{
 		Group: deleting.Group, RouteKey: deleting.RouteKey, State: clusterstate.WorkflowRouteTombstone,
 		Tombstone: &clusterstate.RouteTombstoneState{

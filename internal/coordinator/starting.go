@@ -119,6 +119,42 @@ type cachedProbe struct {
 	observedAt time.Time
 }
 
+func sandboxPlacementInputs(intent cluster.DispatchIntent) (placement.NormalizedDemand, string, error) {
+	demand, err := placement.ParseNormalizedDemand(intent.NormalizedDemand)
+	if err != nil {
+		return placement.NormalizedDemand{}, "", err
+	}
+	if demand.Kind != placement.ObjectSandbox {
+		return placement.NormalizedDemand{}, "", errors.New("coordinator: Route carries a non-Sandbox demand")
+	}
+	spec, err := cluster.ParseSandboxDispatchSpec(intent.DispatchSpec)
+	if err != nil {
+		return placement.NormalizedDemand{}, "", err
+	}
+	return demand, spec.TargetRuntimeDigest, nil
+}
+
+func buildPlacementInputs(intent cluster.DispatchIntent) (placement.NormalizedDemand, string, error) {
+	demand, err := placement.ParseNormalizedDemand(intent.NormalizedDemand)
+	if err != nil {
+		return placement.NormalizedDemand{}, "", err
+	}
+	if demand.Kind != placement.ObjectBuild {
+		return placement.NormalizedDemand{}, "", errors.New("coordinator: Build carries a non-Build demand")
+	}
+	spec, err := cluster.ParseBuildDispatchSpec(intent.DispatchSpec)
+	if err != nil {
+		return placement.NormalizedDemand{}, "", err
+	}
+	maximum := ^uint64(0)
+	if uint64(spec.CPUCount) > maximum/1000 || uint64(spec.MemoryMB) > maximum/(1<<20) ||
+		demand.Build.Slots != 1 || demand.Build.CPU != uint64(spec.CPUCount)*1000 ||
+		demand.Build.Memory != uint64(spec.MemoryMB)*(1<<20) {
+		return placement.NormalizedDemand{}, "", errors.New("coordinator: Build demand does not match immutable CPU/memory ceilings")
+	}
+	return demand, spec.TargetRuntimeDigest, nil
+}
+
 func (c *StartingCoordinator) RunRoute(ctx context.Context, record cluster.RouteWorkflowRecord) (RunResult, error) {
 	if c.routes == nil {
 		return RunResult{}, errors.New("coordinator: Route committer is unavailable")
@@ -129,12 +165,9 @@ func (c *StartingCoordinator) RunRoute(ctx context.Context, record cluster.Route
 	if record.State != cluster.WorkflowRouteStarting || record.Starting == nil {
 		return RunResult{}, errors.New("coordinator: Route is not STARTING")
 	}
-	demand, err := placement.ParseNormalizedDemand(record.Starting.Intent.NormalizedDemand)
+	demand, runtimeDigest, err := sandboxPlacementInputs(record.Starting.Intent)
 	if err != nil {
 		return RunResult{}, err
-	}
-	if demand.Kind != placement.ObjectSandbox {
-		return RunResult{}, errors.New("coordinator: Route carries a non-Sandbox demand")
 	}
 	cache := make(map[uint32]cachedProbe)
 	for {
@@ -190,11 +223,17 @@ func (c *StartingCoordinator) RunRoute(ctx context.Context, record cluster.Route
 			if err != nil {
 				return RunResult{}, err
 			}
+			demand, runtimeDigest, err = sandboxPlacementInputs(record.Starting.Intent)
+			if err != nil {
+				return RunResult{}, err
+			}
 			cache = make(map[uint32]cachedProbe)
 			continue
 		}
 
-		index, probe, found, selectErr := c.selectCandidate(ctx, demand, starting.CandidatePool, starting.DefinitivelyRejected, cache)
+		index, probe, found, selectErr := c.selectCandidate(
+			ctx, demand, runtimeDigest, starting.CandidatePool, starting.DefinitivelyRejected, cache,
+		)
 		if selectErr != nil {
 			return RunResult{}, selectErr
 		}
@@ -304,12 +343,9 @@ func (c *StartingCoordinator) RunBuild(ctx context.Context, record cluster.Build
 	if record.State != cluster.BuildStarting || record.Starting == nil {
 		return RunResult{}, errors.New("coordinator: Build is not BUILD_STARTING")
 	}
-	demand, err := placement.ParseNormalizedDemand(record.Starting.Intent.NormalizedDemand)
+	demand, runtimeDigest, err := buildPlacementInputs(record.Starting.Intent)
 	if err != nil {
 		return RunResult{}, err
-	}
-	if demand.Kind != placement.ObjectBuild {
-		return RunResult{}, errors.New("coordinator: Build carries a non-Build demand")
 	}
 	cache := make(map[uint32]cachedProbe)
 	for {
@@ -376,7 +412,9 @@ func (c *StartingCoordinator) RunBuild(ctx context.Context, record cluster.Build
 			return RunResult{Status: RunTerminal, Reason: "Build candidate pool exhausted", Build: &record}, nil
 		}
 
-		index, probe, found, selectErr := c.selectCandidate(ctx, demand, starting.CandidatePool, starting.DefinitivelyRejected, cache)
+		index, probe, found, selectErr := c.selectCandidate(
+			ctx, demand, runtimeDigest, starting.CandidatePool, starting.DefinitivelyRejected, cache,
+		)
 		if selectErr != nil {
 			return RunResult{}, selectErr
 		}
@@ -427,7 +465,7 @@ func buildRegistrationProjection(record cluster.BuildRecord) (cluster.BuildProje
 	return projection, projection.Validate()
 }
 
-func (c *StartingCoordinator) selectCandidate(ctx context.Context, demand placement.NormalizedDemand, candidates []cluster.PlacementCandidate, rejected []uint32, cache map[uint32]cachedProbe) (uint32, session.ProbeResult, bool, error) {
+func (c *StartingCoordinator) selectCandidate(ctx context.Context, demand placement.NormalizedDemand, runtimeDigest string, candidates []cluster.PlacementCandidate, rejected []uint32, cache map[uint32]cachedProbe) (uint32, session.ProbeResult, bool, error) {
 	rejectedSet := make(map[uint32]struct{}, len(rejected))
 	for _, index := range rejected {
 		rejectedSet[index] = struct{}{}
@@ -447,7 +485,7 @@ func (c *StartingCoordinator) selectCandidate(ctx context.Context, demand placem
 				continue
 			}
 			candidate := candidates[index]
-			requests = append(requests, demand.ProbeRequest(candidate.NodeID, candidate.RuntimeDigest))
+			requests = append(requests, demand.ProbeRequest(candidate.NodeID, runtimeDigest))
 			results = append(results, session.ProbeResult{})
 		}
 		if len(indices) == 0 {

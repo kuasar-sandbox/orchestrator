@@ -22,7 +22,8 @@ type flight struct {
 const sandboxLifecycleLockCount = 256
 
 // serialGroup bounds per-Sandbox lifecycle serialization without retaining a
-// lock for every SID ever observed by the process.
+// lock for every SID ever observed by the process. Different lifecycle
+// operations for one Sandbox are strictly ordered.
 type serialGroup struct {
 	locks [sandboxLifecycleLockCount]sync.Mutex
 }

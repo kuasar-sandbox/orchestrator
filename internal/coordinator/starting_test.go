@@ -96,6 +96,7 @@ func describeBuildCommit(record cluster.BuildRecord) string {
 type pairProberStub struct {
 	responses map[string]placement.PlacementProbeResponse
 	calls     [][]string
+	requests  [][]placement.PlacementProbeRequest
 	events    *[]string
 	after     func()
 }
@@ -112,6 +113,7 @@ func (p *pairProberStub) ProbePair(_ context.Context, _ session.ServeIdentity, r
 		results[index].Response = response
 	}
 	p.calls = append(p.calls, ids)
+	p.requests = append(p.requests, append([]placement.PlacementProbeRequest(nil), requests...))
 	if p.events != nil {
 		*p.events = append(*p.events, "probe:"+strings.Join(ids, ","))
 	}
@@ -359,6 +361,72 @@ func TestBuildAdmissionAckCommitsRegistrationAndCompletesWorkflow(t *testing.T) 
 	}
 }
 
+func TestBuildDemandMustMatchImmutableRegistrationCeilings(t *testing.T) {
+	record := buildStartingRecord(t, "b1", candidatePool("n1", "n2"), nil)
+	mismatched, err := placement.NormalizeBuildDemand(placement.BuildDemand{
+		Slots: 1, CPU: 2000, Memory: 512 << 20,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	record.Starting.Intent, err = cluster.NewDispatchIntent(
+		mismatched, record.Starting.Intent.DispatchSpec, record.Starting.Intent.ProviderPolicyVersion,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &workflowStoreStub{build: record}
+	prober := &pairProberStub{responses: map[string]placement.PlacementProbeResponse{}}
+	dispatcher := &dispatcherStub{store: store, results: map[string][]session.DispatchReply{}}
+	coordinator := newTestCoordinator(t, store, prober, dispatcher, nil)
+	if _, err := coordinator.RunBuild(context.Background(), record); err == nil {
+		t.Fatal("Build demand inconsistent with the immutable registration was accepted")
+	}
+	if len(prober.requests) != 0 || len(dispatcher.requests) != 0 {
+		t.Fatal("inconsistent Build demand reached placement or dispatch")
+	}
+}
+
+func TestProbeRuntimeConstraintComesFromImmutableDispatch(t *testing.T) {
+	record := routeStartingRecord(t, "s1", 1, candidatePool("n1", "n2"), nil)
+	spec, err := cluster.ParseSandboxDispatchSpec(record.Starting.Intent.DispatchSpec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec.TargetRuntimeDigest = "required-runtime"
+	dispatchSpec, err := cluster.MarshalSandboxDispatchSpec(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record.Starting.Intent, err = cluster.NewDispatchIntent(
+		record.Starting.Intent.NormalizedDemand, dispatchSpec, record.Starting.Intent.ProviderPolicyVersion,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index := range record.Starting.CandidatePool {
+		record.Starting.CandidatePool[index].RuntimeDigest = "untrusted-candidate-value"
+	}
+	store := &workflowStoreStub{route: record}
+	prober := &pairProberStub{responses: map[string]placement.PlacementProbeResponse{
+		"n1": probeResponse("n1", placement.ProbeImmediate, 1),
+		"n2": probeResponse("n2", placement.ProbeWouldQueue, 2),
+	}}
+	dispatcher := &dispatcherStub{store: store, results: map[string][]session.DispatchReply{}}
+	coordinator := newTestCoordinator(t, store, prober, dispatcher, nil)
+	if _, err := coordinator.RunRoute(context.Background(), record); err != nil {
+		t.Fatal(err)
+	}
+	if len(prober.requests) == 0 {
+		t.Fatal("placement probe was not sent")
+	}
+	for _, request := range prober.requests[0] {
+		if request.RuntimeDigest != spec.TargetRuntimeDigest {
+			t.Fatalf("probe runtime digest = %q, want %q", request.RuntimeDigest, spec.TargetRuntimeDigest)
+		}
+	}
+}
+
 func TestExhaustedSandboxRoundCommitsNewIDBeforeNewPlacement(t *testing.T) {
 	record := routeStartingRecord(t, "s1", 1, candidatePool("n1", "n2"), []uint32{0, 1})
 	priorBinding, err := makeBinding(
@@ -374,7 +442,17 @@ func TestExhaustedSandboxRoundCommitsNewIDBeforeNewPlacement(t *testing.T) {
 	}
 	record.Finalizations = []cluster.WorkflowFinalizationIntent{priorFinalization}
 	store := &workflowStoreStub{route: record}
-	rounds := &roundSourceStub{sandboxID: "s2", candidates: candidatePool("n3", "n4")}
+	nextDemand, err := placement.NormalizeSandboxDemand(placement.SandboxDemand{SlotUnits: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	nextIntent, err := cluster.NewDispatchIntent(
+		nextDemand, record.Starting.Intent.DispatchSpec, record.Starting.Intent.ProviderPolicyVersion,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rounds := &roundSourceStub{sandboxID: "s2", candidates: candidatePool("n3", "n4"), intent: &nextIntent}
 	prober := &pairProberStub{responses: map[string]placement.PlacementProbeResponse{
 		"n3": probeResponse("n3", placement.ProbeImmediate, 1),
 		"n4": probeResponse("n4", placement.ProbeWouldQueue, 1),
@@ -388,6 +466,10 @@ func TestExhaustedSandboxRoundCommitsNewIDBeforeNewPlacement(t *testing.T) {
 	}
 	if len(dispatcher.requests) != 1 || dispatcher.requests[0].ObjectID != "s2" {
 		t.Fatalf("dispatches = %+v", dispatcher.requests)
+	}
+	if len(prober.requests) == 0 || len(prober.requests[0]) == 0 ||
+		prober.requests[0][0].Sandbox == nil || prober.requests[0][0].Sandbox.SlotUnits != 3 {
+		t.Fatalf("new placement round used stale demand: %+v", prober.requests)
 	}
 	if len(result.Route.Finalizations) != 1 || result.Route.Finalizations[0].BindingDigest != priorFinalization.BindingDigest {
 		t.Fatalf("prior finalization was lost across placement rounds: %+v", result.Route.Finalizations)
@@ -501,7 +583,7 @@ func routeStartingRecord(t *testing.T, sandboxID string, round uint64, candidate
 
 func buildStartingRecord(t *testing.T, buildID string, candidates []cluster.PlacementCandidate, rejected []uint32) cluster.BuildRecord {
 	t.Helper()
-	demand, err := placement.NormalizeBuildDemand(placement.BuildDemand{Slots: 1, CPU: 1000})
+	demand, err := placement.NormalizeBuildDemand(placement.BuildDemand{Slots: 1, CPU: 1000, Memory: 512 << 20})
 	if err != nil {
 		t.Fatal(err)
 	}

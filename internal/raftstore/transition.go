@@ -342,11 +342,10 @@ func (r *Runtime) commitTransitionAdvance(
 	resolveContext, cancelResolve := ambiguityResolutionContext(ctx)
 	defer cancelResolve()
 	current, readErr := r.ReadSystemStrong(resolveContext)
-	if readErr == nil && current.Transition != nil {
-		position := transitionPosition(current.Transition.Shards, shardID)
-		if position >= 0 && current.Transition.Shards[position].Stage == to {
-			return current, nil
-		}
+	if readErr == nil && transitionAdvanceCommitted(
+		current, r.registryLayout.RegistryLayoutVersion, r.registryLayoutDigest, shardID, to,
+	) {
+		return current, nil
 	}
 	if proposeErr != nil {
 		return SystemState{}, proposeErr
@@ -358,6 +357,45 @@ func (r *Runtime) commitTransitionAdvance(
 		return SystemState{}, readErr
 	}
 	return SystemState{}, errors.New("raftstore: transition progress was not visible after commit")
+}
+
+func transitionAdvanceCommitted(
+	state SystemState,
+	registryLayoutVersion uint64,
+	registryLayoutDigest string,
+	shardID uint32,
+	target TransitionStage,
+) bool {
+	if state.Transition == nil {
+		return state.ActiveRegistryLayoutVersion == registryLayoutVersion &&
+			state.ActiveRegistryLayoutDigest == registryLayoutDigest
+	}
+	if state.Transition.Version != registryLayoutVersion || state.Transition.Digest != registryLayoutDigest {
+		return false
+	}
+	position := transitionPosition(state.Transition.Shards, shardID)
+	return position >= 0 && transitionStageAtLeast(state.Transition.Shards[position].Stage, target)
+}
+
+func transitionStageAtLeast(current, target TransitionStage) bool {
+	stages := []TransitionStage{
+		TransitionPending,
+		TransitionCatchingUp,
+		TransitionPromoted,
+		TransitionOldRemoved,
+		TransitionComplete,
+		TransitionEpochRetired,
+	}
+	currentPosition, targetPosition := -1, -1
+	for position, stage := range stages {
+		if stage == current {
+			currentPosition = position
+		}
+		if stage == target {
+			targetPosition = position
+		}
+	}
+	return currentPosition >= targetPosition && targetPosition >= 0
 }
 
 func (r *Runtime) prepareDataEpoch(ctx context.Context, system SystemState, raftShardID uint64) error {

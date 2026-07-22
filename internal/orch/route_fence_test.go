@@ -7,6 +7,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/nodeexec"
@@ -213,6 +214,75 @@ func TestRebindClusterExecutionUsesDigestCAS(t *testing.T) {
 		SID: "s1", NodeEpoch: 7, RegistryGeneration: "generation-2", BindingDigest: newDigest,
 	}); err != nil {
 		t.Fatalf("new command fence: %v", err)
+	}
+}
+
+func TestRebindClusterExecutionWaitsForSandboxLifecycle(t *testing.T) {
+	o := testOrch(t)
+	ctx := context.Background()
+	if _, err := o.st.EnrollClusterIdentity(ctx, "node-1", "boot-1", "10.0.0.1:8443"); err != nil {
+		t.Fatal(err)
+	}
+	templateRef := "e2b-img-" + strings.Repeat("c", 64)
+	dispatch := clusterResumeDispatch(t, "s1", templateRef)
+	oldOpaque := dispatch.OpaqueBinding
+	rebound, err := clusterstate.DecodeExecutionBinding(oldOpaque)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rebound.RegistryGeneration = "generation-2"
+	newOpaque, err := clusterstate.EncodeExecutionBinding(rebound)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldDigest, _ := clusterstate.ExecutionBindingDigest(oldOpaque)
+	newDigest, _ := clusterstate.ExecutionBindingDigest(newOpaque)
+	sandbox := &types.Sandbox{
+		ID: "s1", TemplateID: templateRef, State: types.StatePaused,
+		AuthKey: strings.Repeat("2", 64), ManifestKey: strings.Repeat("1", 64),
+		EnvdAccessToken: "access-token", TrafficAccessToken: "traffic-token",
+	}
+	if _, err := o.st.RecordSandboxWorkflow(ctx, dispatch, nodeexec.AdmissionDecision{
+		State: nodeexec.AdmissionAdmitted, Result: clusterstate.DispatchAcceptedAdmitted,
+		ReservationToken: "reservation-1",
+	}, sandbox); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := o.st.Get(ctx, "s1")
+	if err != nil || stored == nil {
+		t.Fatalf("stored Sandbox = %+v, %v", stored, err)
+	}
+	if _, err := o.st.CommitSandboxEvent(ctx, stored, sandboxTestEvent(nodeexec.EventUpdate{
+		State: string(clusterstate.WorkflowRouteReady), TargetPort: 49983,
+	})); err != nil {
+		t.Fatal(err)
+	}
+	command := &routesync.Command{
+		SID: "s1", NodeEpoch: 7, SessionSeq: 3, RegistryGeneration: "generation-2",
+		Binding: newOpaque, BindingDigest: newDigest, OldBindingDigest: oldDigest,
+		DemandDigest: dispatch.DemandDigest, DispatchSpecDigest: dispatch.DispatchSpecDigest,
+	}
+
+	held, release := make(chan struct{}), make(chan struct{})
+	go func() {
+		_ = o.lifecycle.Do("s1", func() error {
+			close(held)
+			<-release
+			return nil
+		})
+	}()
+	<-held
+	done := make(chan error, 1)
+	go func() { done <- o.rebindClusterExecution(ctx, command) }()
+	select {
+	case err := <-done:
+		close(release)
+		t.Fatalf("rebind bypassed the in-flight Sandbox lifecycle: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
 	}
 }
 

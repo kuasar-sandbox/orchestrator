@@ -41,8 +41,11 @@ func (h *Holder) InstallKeyLease(
 	if !operation.current() {
 		return ref, false, errors.Join(ErrDispatchNotSent, ErrKeyLeaseSuperseded)
 	}
+	if err := h.CheckServe(identity, PermitDispatch); err != nil {
+		return ref, false, errors.Join(ErrDispatchNotSent, err)
+	}
 	if err := h.authorizeNodeSession(identity, operation.held.registration); err != nil {
-		return ref, false, err
+		return ref, false, errors.Join(ErrDispatchNotSent, err)
 	}
 	operation.held.leaseMu.RLock()
 	installedExpiry := operation.held.keyLeases[operation.key]
@@ -107,8 +110,11 @@ func (h *Holder) DropKeyLease(
 	}
 	delete(operation.held.keyLeases, operation.key)
 	operation.held.leaseMu.Unlock()
+	if err := h.CheckServe(identity, PermitDispatch); err != nil {
+		return false, errors.Join(ErrDispatchNotSent, err)
+	}
 	if err := h.authorizeNodeSession(identity, operation.held.registration); err != nil {
-		return false, err
+		return false, errors.Join(ErrDispatchNotSent, err)
 	}
 	command := &routesync.Command{
 		Kind: routesync.CmdKeyDrop, NodeEpoch: nodeEpoch, SessionSeq: operation.tuple.SessionSeq,
