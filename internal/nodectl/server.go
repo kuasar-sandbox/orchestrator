@@ -679,9 +679,9 @@ func (s *Server) handleAdminGrant(req *Message) *Message {
 // cgroup + balloon accordingly.
 func (s *Server) handleAdminReclaim(req *Message) *Message {
 	s.State.Lock()
-	defer s.State.Unlock()
 	res := s.findBySandboxIDLocked(req.SandboxID)
 	if res == nil {
+		s.State.Unlock()
 		return &Message{Type: TypeError, Msg: "no reservation for sandbox " + req.SandboxID}
 	}
 	target := req.TargetAllocatable
@@ -690,12 +690,24 @@ func (s *Server) handleAdminReclaim(req *Message) *Message {
 	}
 	if target > res.AllocatableNowMem {
 		// Reclaim is shrink-only — for grow use admin_grant.
+		s.State.Unlock()
 		return &Message{Type: TypeError, Msg: "target above current allocatable; use admin_grant to grow"}
 	}
 	delta := res.AllocatableNowMem - target
 	res.AllocatableNowMem = target
-	if err := s.Persister.Flush(s.State); err != nil {
-		s.Logf("admin reclaim persist: %v", err)
+	flushErr := s.Persister.Flush(s.State)
+	if flushErr != nil && !FlushPublished(flushErr) {
+		res.AllocatableNowMem += delta
+		s.State.Unlock()
+		s.Logf("admin reclaim persist: %v", flushErr)
+		return &Message{Type: TypeError, Msg: "failed to persist reclaimed capacity"}
+	}
+	s.State.Unlock()
+	if flushErr != nil {
+		s.Logf("admin reclaim persist: %v", flushErr)
+	}
+	if delta != 0 && s.PreparedAdmission != nil {
+		s.PreparedAdmission.SignalCapacityChange()
 	}
 	s.Logf("admin reclaim sid=%s -%d → %d", req.SandboxID, delta, target)
 	return &Message{Type: TypeAck, NewAllocatable: target}
