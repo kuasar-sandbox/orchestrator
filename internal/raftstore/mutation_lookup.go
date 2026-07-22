@@ -13,8 +13,9 @@ type DataMutationLookup struct {
 }
 
 type DataMutationStatus struct {
-	Committed bool
-	Revision  uint64
+	Committed       bool
+	Revision        uint64
+	CurrentRevision uint64
 }
 
 func (q DataMutationLookup) Validate() error {
@@ -54,6 +55,7 @@ func LookupDataMutation(state DataState, query DataMutationLookup) (DataMutation
 		if !found || !mutationRevisionAdvanced(command.Expect, current.Revision.LogIndex) {
 			return DataMutationStatus{}, nil
 		}
+		status := DataMutationStatus{CurrentRevision: current.Revision.LogIndex}
 		wanted := cloneRouteRecord(*command.Route)
 		if wanted.Finalizations == nil {
 			wanted.Finalizations = cloneWorkflowFinalizations(current.Finalizations)
@@ -64,18 +66,27 @@ func LookupDataMutation(state DataState, query DataMutationLookup) (DataMutation
 			current.Tombstone.FenceCompacted {
 			wanted.Tombstone.FenceCompacted = true
 		}
-		return DataMutationStatus{Committed: reflect.DeepEqual(current, wanted), Revision: current.Revision.LogIndex}, nil
+		status.Committed = reflect.DeepEqual(current, wanted)
+		if status.Committed {
+			status.Revision = current.Revision.LogIndex
+		}
+		return status, nil
 	case DataPutBuild:
 		current, found := state.Builds[buildMapKey(command.Build.Group, command.Build.BuildID)]
 		if !found || !mutationRevisionAdvanced(command.Expect, current.Revision.LogIndex) {
 			return DataMutationStatus{}, nil
 		}
+		status := DataMutationStatus{CurrentRevision: current.Revision.LogIndex}
 		wanted := cloneBuildRecord(*command.Build)
 		if wanted.Finalizations == nil {
 			wanted.Finalizations = cloneWorkflowFinalizations(current.Finalizations)
 		}
 		wanted.Revision = current.Revision
-		return DataMutationStatus{Committed: reflect.DeepEqual(current, wanted), Revision: current.Revision.LogIndex}, nil
+		status.Committed = reflect.DeepEqual(current, wanted)
+		if status.Committed {
+			status.Revision = current.Revision.LogIndex
+		}
+		return status, nil
 	default:
 		current, found := state.Fences[fenceMapKey(command.Fence.Group, command.Fence.RouteKey, command.Fence.SandboxID)]
 		if !found || !mutationRevisionAdvanced(command.Expect, current.Revision.LogIndex) {
@@ -83,7 +94,11 @@ func LookupDataMutation(state DataState, query DataMutationLookup) (DataMutation
 		}
 		wanted := cloneExecutionFence(*command.Fence)
 		wanted.Revision = current.Revision
-		return DataMutationStatus{Committed: reflect.DeepEqual(current, wanted), Revision: current.Revision.LogIndex}, nil
+		status := DataMutationStatus{Committed: reflect.DeepEqual(current, wanted), CurrentRevision: current.Revision.LogIndex}
+		if status.Committed {
+			status.Revision = current.Revision.LogIndex
+		}
+		return status, nil
 	}
 }
 

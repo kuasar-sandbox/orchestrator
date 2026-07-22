@@ -21,13 +21,15 @@ func TestRuntimeReconcilesAndFinalizesRegistryLayoutTransition(t *testing.T) {
 	nextRegistryLayout.RegistryLayoutVersion = 2
 	nextRegistryLayout.PreviousRegistryLayoutVersion = 1
 	nextRegistryLayout.PreviousRegistryLayoutDigest = oldDigest
-	nextRegistryLayout.Members = append(append([]RegistryMember(nil), oldRegistryLayout.Members...), RegistryMember{
-		MemberID: "registry-d", InternalEndpoint: "https://registry-d:9443", RaftEndpoint: "registry-d:63001",
-	})
+	nextRegistryLayout.Members = append(append([]RegistryMember(nil), oldRegistryLayout.Members...),
+		RegistryMember{MemberID: "registry-d", InternalEndpoint: "https://registry-d:9443", RaftEndpoint: "registry-d:63001"},
+		RegistryMember{MemberID: "registry-e", InternalEndpoint: "https://registry-e:9443", RaftEndpoint: "registry-e:63001"},
+		RegistryMember{MemberID: "registry-f", InternalEndpoint: "https://registry-f:9443", RaftEndpoint: "registry-f:63001"},
+	)
 	desired := []ReplicaPlacement{
-		{MemberID: "registry-a", ReplicaID: 1},
-		{MemberID: "registry-b", ReplicaID: 2},
 		{MemberID: "registry-d", ReplicaID: 4},
+		{MemberID: "registry-e", ReplicaID: 5},
+		{MemberID: "registry-f", ReplicaID: 6},
 	}
 	nextRegistryLayout.SystemReplicas = append([]ReplicaPlacement(nil), desired...)
 	nextRegistryLayout.DataShards = []ShardPlacement{{ShardID: 0, Replicas: append([]ReplicaPlacement(nil), desired...)}}
@@ -147,12 +149,11 @@ func TestRuntimeReconcilesAndFinalizesRegistryLayoutTransition(t *testing.T) {
 			t.Fatalf("promote shard %d = %v, %v", shardID, state, err)
 		}
 		state, err = runtime.ReconcileRegistryLayoutTransitionShard(ctx, shardID)
-		if err != nil || transitionStageForTest(t, state, shardID) != TransitionOldRemoved {
-			t.Fatalf("remove shard %d = %v, %v", shardID, state, err)
-		}
-		state, err = runtime.ReconcileRegistryLayoutTransitionShard(ctx, shardID)
 		if err != nil || transitionStageForTest(t, state, shardID) != TransitionComplete {
 			t.Fatalf("complete shard %d = %v, %v", shardID, state, err)
+		}
+		if _, reachable := host.memberships[shardID].Nodes[3]; !reachable {
+			t.Fatalf("predecessor replica was removed before layout activation on shard %d", shardID)
 		}
 	}
 
@@ -189,7 +190,7 @@ func TestRuntimeReconcilesAndFinalizesRegistryLayoutTransition(t *testing.T) {
 	if err != nil || redrained.Transition != nil || redrained.ActiveRegistryLayoutDigest != nextDigest {
 		t.Fatalf("retry drain after finalized transition = %+v, %v", redrained, err)
 	}
-	if err := validateRetiredEpoch(data, activated.Identity(), []uint64{1, 2, 4}); err != nil {
+	if err := validateRetiredEpoch(data, activated.Identity(), []uint64{4, 5, 6}); err != nil {
 		t.Fatal(err)
 	}
 	for _, shardID := range []uint64{SystemRaftShardID, DataRaftShardID(0)} {
@@ -225,7 +226,7 @@ func TestTransitionAdvanceAmbiguityAcceptsLaterOrFinalizedState(t *testing.T) {
 		Version: version, Digest: digest,
 		Shards: []ShardTransition{
 			{ShardID: ^uint32(0), Stage: TransitionPending},
-			{ShardID: shardID, Stage: TransitionOldRemoved},
+			{ShardID: shardID, Stage: TransitionComplete},
 		},
 	}}
 	if !transitionAdvanceCommitted(state, version, digest, shardID, TransitionCatchingUp) {

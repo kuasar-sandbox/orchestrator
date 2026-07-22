@@ -1,6 +1,7 @@
 package raftstore
 
 import (
+	"context"
 	"errors"
 	"sync"
 	"time"
@@ -180,17 +181,41 @@ func (c *PermitCache) Install(grant PermitGrant, proposalStarted time.Time) erro
 }
 
 func (c *PermitCache) Authorize(identity PermitIdentity, operation PermitOperation) error {
+	_, err := c.authorize(identity, operation)
+	return err
+}
+
+// BoundContext authorizes an operation and prevents its proposal wait from
+// extending beyond the locally measured Serve Permit lifetime. A shorter
+// caller deadline is preserved.
+func (c *PermitCache) BoundContext(
+	ctx context.Context,
+	identity PermitIdentity,
+	operation PermitOperation,
+) (context.Context, context.CancelFunc, error) {
+	permit, err := c.authorize(identity, operation)
+	if err != nil {
+		return nil, nil, err
+	}
+	bounded, cancel := context.WithDeadline(ctx, permit.expiresAt)
+	return bounded, cancel, nil
+}
+
+func (c *PermitCache) authorize(identity PermitIdentity, operation PermitOperation) (ServePermit, error) {
 	c.mu.RLock()
 	permit, found := c.permits[identity]
 	count := len(c.permits)
 	c.mu.RUnlock()
 	if !found {
 		if count == 0 {
-			return ErrPermitMissing
+			return ServePermit{}, ErrPermitMissing
 		}
-		return ErrPermitMismatch
+		return ServePermit{}, ErrPermitMismatch
 	}
-	return permit.Authorize(c.now(), identity, operation)
+	if err := permit.Authorize(c.now(), identity, operation); err != nil {
+		return ServePermit{}, err
+	}
+	return permit, nil
 }
 
 func (c *PermitCache) Clear() {

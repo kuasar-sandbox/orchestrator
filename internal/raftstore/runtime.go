@@ -840,10 +840,14 @@ func (r *Runtime) ApplyData(ctx context.Context, command DataCommand) (DataApply
 	if err := r.authorizeLocalDataReplica(command.Identity); err != nil {
 		return DataApplyResult{}, err
 	}
-	if err := r.permitCache.Authorize(command.Identity.PermitIdentity, PermitRegistryWrite); err != nil {
+	proposalContext, cancelProposal, err := r.permitCache.BoundContext(
+		ctx, command.Identity.PermitIdentity, PermitRegistryWrite,
+	)
+	if err != nil {
 		return DataApplyResult{}, err
 	}
-	return r.applyDataMutation(ctx, command)
+	defer cancelProposal()
+	return r.applyDataMutation(proposalContext, command)
 }
 
 func (r *Runtime) applyDataMutation(ctx context.Context, command DataCommand) (DataApplyResult, error) {
@@ -859,6 +863,12 @@ func (r *Runtime) applyDataMutation(ctx context.Context, command DataCommand) (D
 	resolved, readErr := r.resolveDataMutation(resolveContext, command)
 	if readErr == nil && resolved.Committed {
 		return DataApplyResult{Applied: true, Revision: resolved.Revision}, nil
+	}
+	if readErr == nil && resolved.CurrentRevision != 0 {
+		return DataApplyResult{
+			Conflict: true, CurrentRevision: resolved.CurrentRevision,
+			Reason: "ambiguous data mutation was superseded by committed state",
+		}, nil
 	}
 	if readErr != nil {
 		return DataApplyResult{}, errors.Join(err, fmt.Errorf("raftstore: resolve ambiguous data mutation: %w", readErr))

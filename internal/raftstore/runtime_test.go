@@ -731,8 +731,7 @@ func TestRuntimeAdvancesEnrollmentRegistryLayoutOnlyAfterConsensusActivation(t *
 		for _, edge := range [][2]TransitionStage{
 			{TransitionPending, TransitionCatchingUp},
 			{TransitionCatchingUp, TransitionPromoted},
-			{TransitionPromoted, TransitionOldRemoved},
-			{TransitionOldRemoved, TransitionComplete},
+			{TransitionPromoted, TransitionComplete},
 		} {
 			system, _ = applySystem(t, system, index, SystemCommand{
 				Type:    SystemAdvanceTransition,

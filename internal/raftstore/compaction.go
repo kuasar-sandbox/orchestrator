@@ -187,9 +187,16 @@ func (r *Runtime) CompactExecutionFence(
 			!proofPermanentlyFenced && outboxAck.validates(*fence),
 		ReplicaApplied: proofs, RetentionProofDigest: retentionDigest,
 	}
-	result, submitted, proposeErr := r.proposeDataRaw(ctx, DataCommand{
+	proposalContext, cancelProposal, err := r.permitCache.BoundContext(
+		ctx, identity.PermitIdentity, PermitRegistryWrite,
+	)
+	if err != nil {
+		return err
+	}
+	result, submitted, proposeErr := r.proposeDataRaw(proposalContext, DataCommand{
 		Type: DataCompactFence, Identity: identity, Compaction: &authorization,
 	})
+	cancelProposal()
 	if proposeErr != nil && !submitted {
 		return proposeErr
 	}
