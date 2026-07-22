@@ -202,7 +202,8 @@ func newClusterDataTunnelServer(t *testing.T, h http.HandlerFunc) *httptest.Serv
 func writeStubGroup(t *testing.T, dir string) {
 	t.Helper()
 	raw, err := json.Marshal(clusterstate.SandboxGroupRecord{
-		Group: testGroup, ManifestKey: clusterstate.Secret{Type: clusterstate.SecretInline, Value: testMK},
+		Group: testGroup, KeyRevision: 1,
+		ManifestKey:   clusterstate.Secret{Type: clusterstate.SecretInline, Value: testMK},
 		AuthKey:       clusterstate.Secret{Type: clusterstate.SecretInline, Value: testAuthKey},
 		TemplateRef:   "tmpl-1",
 		NodeSelectors: []map[string]string{{"pool": "stub"}},

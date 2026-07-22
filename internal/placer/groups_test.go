@@ -20,7 +20,8 @@ const testManifestKey = "00112233445566778899aabbccddeeff00112233445566778899aab
 
 func TestFileGroupSourceProviderMethods(t *testing.T) {
 	src := testGroupSource(t, clusterstate.SandboxGroupRecord{
-		Group: "/g", ManifestKey: clusterstate.Secret{Type: clusterstate.SecretInline, Value: testManifestKey},
+		Group: "/g", KeyRevision: 1,
+		ManifestKey:           clusterstate.Secret{Type: clusterstate.SecretInline, Value: testManifestKey},
 		AuthKey:               clusterstate.Secret{Type: clusterstate.SecretInline, Value: testAuthKey},
 		TemplateRef:           "tmpl",
 		AllowTemplateOverride: true,
@@ -55,7 +56,7 @@ func TestFileGroupSourceProviderMethods(t *testing.T) {
 
 func TestFileGroupSourceAcceptsSecretShorthand(t *testing.T) {
 	dir := t.TempDir()
-	raw := `{"group":"/g","manifest_key":"` + testManifestKey + `","auth_key":"` + testAuthKey + `","node_selectors":[{"pool":"p"}]}`
+	raw := `{"group":"/g","key_revision":1,"manifest_key":"` + testManifestKey + `","auth_key":"` + testAuthKey + `","node_selectors":[{"pool":"p"}]}`
 	if err := os.WriteFile(filepath.Join(dir, "g.json"), []byte(raw), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -71,7 +72,8 @@ func TestFileGroupSourceAcceptsSecretShorthand(t *testing.T) {
 
 func TestAnswerIncludesGroupMaterial(t *testing.T) {
 	svc := testServiceWithGroups(t, clusterstate.SandboxGroupRecord{
-		Group: "/g", ManifestKey: clusterstate.Secret{Type: clusterstate.SecretInline, Value: testManifestKey},
+		Group: "/g", KeyRevision: 1,
+		ManifestKey: clusterstate.Secret{Type: clusterstate.SecretInline, Value: testManifestKey},
 		AuthKey:     clusterstate.Secret{Type: clusterstate.SecretInline, Value: testAuthKey},
 		TemplateRef: "tmpl", Config: map[string]string{"a": "1"}, NodeSelectors: []map[string]string{{"pool": "p"}},
 	})
@@ -96,7 +98,8 @@ func TestAnswerIncludesGroupMaterial(t *testing.T) {
 func TestFileRemovalStopsNewPlacement(t *testing.T) {
 	dir := t.TempDir()
 	writeGroupFile(t, dir, "g.json", clusterstate.SandboxGroupRecord{
-		Group: "/g", ManifestKey: clusterstate.Secret{Type: clusterstate.SecretInline, Value: testManifestKey},
+		Group: "/g", KeyRevision: 1,
+		ManifestKey:   clusterstate.Secret{Type: clusterstate.SecretInline, Value: testManifestKey},
 		AuthKey:       clusterstate.Secret{Type: clusterstate.SecretInline, Value: testAuthKey},
 		TemplateRef:   "tmpl",
 		NodeSelectors: []map[string]string{{"pool": "p"}},
@@ -116,6 +119,21 @@ func TestFileRemovalStopsNewPlacement(t *testing.T) {
 	}
 	if res := svc.answer(context.Background(), &routesync.PlaceReq{Group: "/g", RouteKey: "rk"}); !res.NoNode || res.Error != "" {
 		t.Fatalf("removed group placement=%+v, want NoNode", res)
+	}
+}
+
+func TestFileGroupSourceRejectsKeyMaterialWithoutRevision(t *testing.T) {
+	dir := t.TempDir()
+	writeGroupFile(t, dir, "g.json", clusterstate.SandboxGroupRecord{
+		Group: "/g", AuthKey: clusterstate.Secret{Type: clusterstate.SecretInline, Value: testAuthKey},
+		ManifestKey: clusterstate.Secret{Type: clusterstate.SecretInline, Value: testManifestKey},
+	})
+	src, err := NewFileGroupSource("test", dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := src.GetRecord(context.Background(), "/g"); err == nil {
+		t.Fatal("key-bearing group without key_revision was accepted")
 	}
 }
 

@@ -134,6 +134,7 @@ import_groups:
 ```json
 {
   "group": "/cell/project/app/group",
+  "key_revision": 1,
   "template_ref": "tmpl-1",
   "target_port": 49983,
   "auth_key": {"type": "inline", "value": "<hex>"},
@@ -141,6 +142,9 @@ import_groups:
   "node_selectors": [{"pool": "default"}]
 }
 ```
+
+`key_revision` 是 group key bundle 的单调版本；只要配置了 `auth_key`、`manifest_key` 或
+`registry_auth` 就必须显式填写非零值。轮换其中任一项时必须递增该值。
 
 `target_port` 是数据面强制端口,随 Place 结果返回给 route_link/router。它不参与节点筛选;
 节点筛选仍只由 `node_selectors` 与 shuffle-sharding 配置决定。
