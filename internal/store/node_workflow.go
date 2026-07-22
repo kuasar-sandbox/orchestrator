@@ -715,7 +715,11 @@ func (s *Store) CommitSandboxEvent(
 	if err != nil {
 		return nil, err
 	}
-	if err := s.putSandbox(ctx, tx, stored); err != nil {
+	if update.State == "DELETED" {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM sandboxes WHERE id=?`, sandbox.ID); err != nil {
+			return nil, err
+		}
+	} else if err := s.putSandbox(ctx, tx, stored); err != nil {
 		return nil, err
 	}
 	record.ObjectState = update.State
