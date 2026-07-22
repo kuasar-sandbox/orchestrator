@@ -50,6 +50,21 @@ func preparedTestDemand(memory uint64) SandboxAdmissionDemand {
 	}
 }
 
+func TestPreparedAdmissionRejectsStartupDemandAboveCapacity(t *testing.T) {
+	for name, mutate := range map[string]func(*SandboxAdmissionDemand){
+		"startup budget": func(d *SandboxAdmissionDemand) { d.StartupBudgetMemory = d.CapacityMemoryBytes + 1 },
+		"snapshot":       func(d *SandboxAdmissionDemand) { d.AllocatableAtSnapshot = d.CapacityMemoryBytes + 1 },
+	} {
+		t.Run(name, func(t *testing.T) {
+			demand := preparedTestDemand(1 << 30)
+			mutate(&demand)
+			if err := demand.Validate(); err == nil {
+				t.Fatal("prepared Admission accepted startup memory above Sandbox capacity")
+			}
+		})
+	}
+}
+
 func TestPreparedAdmissionIsDurableIdempotentAndClaimable(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.json")
 	state := preparedTestState()
