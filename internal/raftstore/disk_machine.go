@@ -247,8 +247,12 @@ func loadDataCommandRows(reader pebble.Reader, prefix []byte, state *DataState, 
 		if found {
 			state.Routes[key] = current
 			if current.State == clusterstate.WorkflowRouteTombstone && current.Tombstone != nil &&
-				current.Tombstone.PlacementFailure == nil && command.Route.State == clusterstate.WorkflowRouteStarting {
-				fenceKey := fenceMapKey(current.Group, current.RouteKey, current.Tombstone.SandboxID)
+				!current.Tombstone.FenceCompacted && command.Route.State == clusterstate.WorkflowRouteStarting {
+				sandboxID := current.Tombstone.SandboxID
+				if current.Tombstone.PlacementFailure != nil {
+					sandboxID = current.Tombstone.PlacementFailure.SandboxID
+				}
+				fenceKey := fenceMapKey(current.Group, current.RouteKey, sandboxID)
 				var fence clusterstate.ExecutionFence
 				fenceFound, err := getStateJSON(reader, stateRowKey(prefix, stateFenceTable, fenceKey), &fence)
 				if err != nil {
@@ -1087,7 +1091,8 @@ func lookupPendingOnDisk(
 	if !state.Accepts(query.Identity) {
 		return PendingLookupResult{}, nil
 	}
-	workflows := make([]PendingWorkflow, 0, query.Limit+1)
+	builder := newPendingPageBuilder(query.Limit)
+	pageFull := false
 	tables := []struct {
 		table     byte
 		qualified byte
@@ -1123,7 +1128,15 @@ func lookupPendingOnDisk(
 					return PendingLookupResult{}, err
 				}
 				if buildNeedsCoordinator(record) {
-					workflows = append(workflows, PendingWorkflow{Key: qualified, Build: &record})
+					accepted, addErr := builder.add(PendingWorkflow{Key: qualified, Build: &record})
+					if addErr != nil {
+						iterator.Close()
+						return PendingLookupResult{}, addErr
+					}
+					if !accepted {
+						pageFull = true
+						break
+					}
 				}
 			case stateRouteTable:
 				var record clusterstate.RouteWorkflowRecord
@@ -1136,7 +1149,15 @@ func lookupPendingOnDisk(
 					return PendingLookupResult{}, err
 				}
 				if routeNeedsCoordinator(record) {
-					workflows = append(workflows, PendingWorkflow{Key: qualified, Route: &record})
+					accepted, addErr := builder.add(PendingWorkflow{Key: qualified, Route: &record})
+					if addErr != nil {
+						iterator.Close()
+						return PendingLookupResult{}, addErr
+					}
+					if !accepted {
+						pageFull = true
+						break
+					}
 				}
 			case stateFenceTable:
 				var fence clusterstate.ExecutionFence
@@ -1148,10 +1169,15 @@ func lookupPendingOnDisk(
 					iterator.Close()
 					return PendingLookupResult{}, err
 				}
-				workflows = append(workflows, PendingWorkflow{Key: qualified, Fence: &fence})
-			}
-			if len(workflows) > int(query.Limit) {
-				break
+				accepted, addErr := builder.add(PendingWorkflow{Key: qualified, Fence: &fence})
+				if addErr != nil {
+					iterator.Close()
+					return PendingLookupResult{}, addErr
+				}
+				if !accepted {
+					pageFull = true
+					break
+				}
 			}
 		}
 		err := iterator.Error()
@@ -1162,19 +1188,11 @@ func lookupPendingOnDisk(
 		if closeErr != nil {
 			return PendingLookupResult{}, closeErr
 		}
-		if len(workflows) > int(query.Limit) {
+		if pageFull {
 			break
 		}
 	}
-	hasMore := len(workflows) > int(query.Limit)
-	if hasMore {
-		workflows = workflows[:query.Limit]
-	}
-	result := PendingLookupResult{Workflows: workflows}
-	if hasMore {
-		result.NextKey = workflows[len(workflows)-1].Key
-	}
-	return result, nil
+	return builder.result(), nil
 }
 
 func pendingTableLowerBound(prefix, tablePrefix []byte, table, qualified byte, afterKey string) ([]byte, bool) {

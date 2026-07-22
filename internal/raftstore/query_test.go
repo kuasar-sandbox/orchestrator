@@ -1,6 +1,8 @@
 package raftstore
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"testing"
 
@@ -172,6 +174,30 @@ func TestPendingLookupRecoversCommittedWorkflowIntentOnly(t *testing.T) {
 		default:
 			t.Fatal("pending lookup returned an empty workflow")
 		}
+	}
+}
+
+func TestPendingLookupBoundsEncodedResponseBytes(t *testing.T) {
+	registryLayout := testRegistryLayout(4, "generation-1")
+	state, identity := initializedRouteShard(t, registryLayout, "/g", "rk-page-bytes")
+	record := routeStarting(t, registryLayout, "/g", "rk-page-bytes", "sandbox-1", 1, false)
+	record.Starting.Intent.NormalizedDemand = bytes.Repeat([]byte{'d'}, clusterstate.MaxNormalizedDemandBytes)
+	record.Starting.Intent.DispatchSpec = bytes.Repeat([]byte{'s'}, clusterstate.MaxDispatchSpecBytes)
+	state.Routes = make(map[string]clusterstate.RouteWorkflowRecord)
+	for index := 0; index < 100; index++ {
+		key := routeMapKey("/g", fmt.Sprintf("route-%03d", index))
+		state.Routes[key] = record
+	}
+	result, err := lookupPending(state, PendingLookup{Identity: identity, Limit: 100})
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.NextKey == "" || len(result.Workflows) >= 100 || len(encoded) > MaxPendingLookupResponseBytes {
+		t.Fatalf("bounded pending page: workflows=%d next=%q bytes=%d", len(result.Workflows), result.NextKey, len(encoded))
 	}
 }
 

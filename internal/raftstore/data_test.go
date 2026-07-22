@@ -186,6 +186,63 @@ func TestStartingCandidateRejectionAndSandboxRoundAdvance(t *testing.T) {
 	}
 }
 
+func TestCompactedPlacementFenceStillAuthorizesNextRound(t *testing.T) {
+	registryLayout := testRegistryLayout(4, "generation-1")
+	state, identity := initializedRouteShard(t, registryLayout, "/g", "rk-compacted-placement")
+	starting := routeStarting(t, registryLayout, "/g", "rk-compacted-placement", "sandbox-1", 1, false)
+	starting.Starting.DefinitivelyRejected = []uint32{0, 1}
+	applyDataOK(t, &state, 2, DataCommand{
+		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{Absent: true}, Route: &starting,
+	})
+	failure := clusterstate.RoutePlacementFailureState{
+		SandboxID: starting.Starting.SandboxID, PlacementRound: starting.Starting.PlacementRound,
+		CandidatePool:        append([]clusterstate.PlacementCandidate(nil), starting.Starting.CandidatePool...),
+		DefinitivelyRejected: append([]uint32(nil), starting.Starting.DefinitivelyRejected...),
+		Intent:               starting.Starting.Intent, Reason: "placement candidate pool exhausted",
+	}
+	tombstone := clusterstate.RouteWorkflowRecord{
+		Group: starting.Group, RouteKey: starting.RouteKey, State: clusterstate.WorkflowRouteTombstone,
+		Tombstone: &clusterstate.RouteTombstoneState{PlacementFailure: &failure, FenceCompacted: true},
+	}
+	if result := ApplyDataCommand(&state, 3, DataCommand{
+		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{LogIndex: 2}, Route: &tombstone,
+	}); !result.Conflict {
+		t.Fatal("caller precompacted a placement-failure tombstone")
+	}
+	tombstone.Tombstone.FenceCompacted = false
+	applyDataOK(t, &state, 4, DataCommand{
+		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{LogIndex: 2}, Route: &tombstone,
+	})
+	fence, err := clusterstate.NewPlacementFailureFence(
+		starting.Group, starting.RouteKey, registryLayout.RegistryGeneration, failure,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyDataOK(t, &state, 5, DataCommand{
+		Type: DataPutFence, Identity: identity, Expect: RevisionExpectation{Absent: true}, Fence: &fence,
+	})
+	storedFence := state.Fences[fenceMapKey(starting.Group, starting.RouteKey, failure.SandboxID)]
+	authorization := fenceCompaction(storedFence, state.ReplicaIDs)
+	applyDataOK(t, &state, 6, DataCommand{
+		Type: DataCompactFence, Identity: identity, Compaction: &authorization,
+	})
+	compacted := state.Routes[routeMapKey(starting.Group, starting.RouteKey)]
+	if compacted.Tombstone == nil || !compacted.Tombstone.FenceCompacted || len(state.Fences) != 0 {
+		t.Fatalf("compacted placement state = %+v, fences=%+v", compacted, state.Fences)
+	}
+	if replayed := ApplyDataCommand(&state, 7, DataCommand{
+		Type: DataPutFence, Identity: identity, Expect: RevisionExpectation{Absent: true}, Fence: &storedFence,
+	}); !replayed.Conflict {
+		t.Fatal("compacted placement fence was replayed")
+	}
+	next := routeStarting(t, registryLayout, starting.Group, starting.RouteKey, "sandbox-2", 2, false)
+	applyDataOK(t, &state, 8, DataCommand{
+		Type: DataPutRoute, Identity: identity,
+		Expect: RevisionExpectation{LogIndex: compacted.Revision.LogIndex}, Route: &next,
+	})
+}
+
 func TestBuildStartingCommitsDefinitiveCandidateRejection(t *testing.T) {
 	registryLayout := testRegistryLayout(4, "generation-1")
 	state, identity := initializedBuildShard(t, registryLayout, "/g", "build-reject")
