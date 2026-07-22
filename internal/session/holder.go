@@ -160,11 +160,7 @@ func (h *Holder) Register(ctx context.Context, registration Registration, endpoi
 	if endpoint == nil {
 		return nil, errors.New("session: node-link endpoint is required")
 	}
-	enrollment := NodeEnrollment{
-		NodeID: registration.NodeID, EnrollmentID: registration.EnrollmentID,
-		NodeEpoch: registration.NodeEpoch, DataEndpoint: registration.DataEndpoint,
-	}
-	err := h.enroll.RunSessionRegistration(ctx, enrollment, func() error {
+	err := h.enroll.RunSessionRegistration(ctx, registration, func() error {
 		for {
 			h.mu.Lock()
 			if err := h.validateRegistrationLocked(registration); err != nil {

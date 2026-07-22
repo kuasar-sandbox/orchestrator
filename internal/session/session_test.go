@@ -124,13 +124,13 @@ func (p *testPublisher) PublishSessionDelta(delta DirectoryDelta) {
 
 type testEnrollmentAuthority struct {
 	mu      sync.Mutex
-	active  map[string]NodeEnrollment
+	active  map[string]Registration
 	retired map[string]IdentityRetirement
 }
 
 type serializedEnrollmentAuthority struct {
 	mu                   sync.Mutex
-	enrollment           NodeEnrollment
+	registration         Registration
 	registrationEntered  chan struct{}
 	continueRegistration chan struct{}
 	retired              bool
@@ -138,12 +138,15 @@ type serializedEnrollmentAuthority struct {
 
 func (a *serializedEnrollmentAuthority) RunSessionRegistration(
 	ctx context.Context,
-	enrollment NodeEnrollment,
+	registration Registration,
 	install func() error,
 ) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if a.retired || enrollment != a.enrollment {
+	if a.retired || registration.NodeID != a.registration.NodeID ||
+		registration.EnrollmentID != a.registration.EnrollmentID ||
+		registration.NodeEpoch != a.registration.NodeEpoch ||
+		!registrationStableWithinEpoch(registration, a.registration) {
 		return errors.New("identity is not enrolled")
 	}
 	close(a.registrationEntered)
@@ -162,8 +165,8 @@ func (a *serializedEnrollmentAuthority) RunIdentityRetirement(
 ) (bool, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if retirement.NodeID != a.enrollment.NodeID || retirement.EnrollmentID != a.enrollment.EnrollmentID ||
-		retirement.LastNodeEpoch < a.enrollment.NodeEpoch {
+	if retirement.NodeID != a.registration.NodeID || retirement.EnrollmentID != a.registration.EnrollmentID ||
+		retirement.LastNodeEpoch < a.registration.NodeEpoch {
 		return false, errors.New("identity retirement is not committed")
 	}
 	a.retired = true
@@ -172,7 +175,7 @@ func (a *serializedEnrollmentAuthority) RunIdentityRetirement(
 
 func newTestEnrollmentAuthority(registrations ...Registration) *testEnrollmentAuthority {
 	a := &testEnrollmentAuthority{
-		active: make(map[string]NodeEnrollment), retired: make(map[string]IdentityRetirement),
+		active: make(map[string]Registration), retired: make(map[string]IdentityRetirement),
 	}
 	for _, registration := range registrations {
 		a.enroll(registration)
@@ -183,10 +186,7 @@ func newTestEnrollmentAuthority(registrations ...Registration) *testEnrollmentAu
 func (a *testEnrollmentAuthority) enroll(registration Registration) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	a.active[registration.NodeID] = NodeEnrollment{
-		NodeID: registration.NodeID, EnrollmentID: registration.EnrollmentID,
-		NodeEpoch: registration.NodeEpoch, DataEndpoint: registration.DataEndpoint,
-	}
+	a.active[registration.NodeID] = registration
 }
 
 func (a *testEnrollmentAuthority) retire(retirement IdentityRetirement) {
@@ -196,21 +196,24 @@ func (a *testEnrollmentAuthority) retire(retirement IdentityRetirement) {
 	delete(a.active, retirement.NodeID)
 }
 
-func (a *testEnrollmentAuthority) RunSessionRegistration(_ context.Context, enrollment NodeEnrollment, install func() error) error {
+func (a *testEnrollmentAuthority) RunSessionRegistration(_ context.Context, registration Registration, install func() error) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	current, found := a.active[enrollment.NodeID]
+	current, found := a.active[registration.NodeID]
 	if !found {
 		return errors.New("identity is not enrolled")
 	}
-	if enrollment.EnrollmentID != current.EnrollmentID {
+	if registration.EnrollmentID != current.EnrollmentID {
 		return ErrEnrollmentChanged
 	}
-	if enrollment.NodeEpoch != current.NodeEpoch {
+	if registration.NodeEpoch != current.NodeEpoch {
 		return ErrStaleSession
 	}
-	if enrollment.DataEndpoint != current.DataEndpoint {
+	if registration.DataEndpoint != current.DataEndpoint {
 		return ErrEndpointChanged
+	}
+	if !registrationStableWithinEpoch(registration, current) {
+		return ErrRegistrationChanged
 	}
 	return install()
 }
@@ -345,6 +348,12 @@ func TestHolderUsesSharedEnrollmentFenceAcrossHolderChanges(t *testing.T) {
 	if _, err := second.Register(context.Background(), changed, &testEndpoint{}); !errors.Is(err, ErrEndpointChanged) {
 		t.Fatalf("cross-Holder endpoint change error = %v", err)
 	}
+	changed = registration
+	changed.SessionSeq++
+	changed.RuntimeDigest = "runtime-v2"
+	if _, err := second.Register(context.Background(), changed, &testEndpoint{}); !errors.Is(err, ErrRegistrationChanged) {
+		t.Fatalf("cross-Holder stable registration change error = %v", err)
+	}
 }
 
 func TestHolderDropsHighWatermarkOnlyAfterCommittedIdentityRetirement(t *testing.T) {
@@ -378,10 +387,7 @@ func TestHolderDropsHighWatermarkOnlyAfterCommittedIdentityRetirement(t *testing
 func TestHolderSerializesRegistrationInstallationWithRetirement(t *testing.T) {
 	registration := testRegistration("node-1", 7, 10, "10.0.0.1:8443")
 	authority := &serializedEnrollmentAuthority{
-		enrollment: NodeEnrollment{
-			NodeID: registration.NodeID, EnrollmentID: registration.EnrollmentID,
-			NodeEpoch: registration.NodeEpoch, DataEndpoint: registration.DataEndpoint,
-		},
+		registration:         registration,
 		registrationEntered:  make(chan struct{}),
 		continueRegistration: make(chan struct{}),
 	}
