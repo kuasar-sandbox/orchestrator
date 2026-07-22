@@ -99,8 +99,8 @@ func LookupData(state DataState, query DataLookup) (DataLookupResult, error) {
 		response := lookupRouteBucket(state, *query.RouteBucket)
 		return DataLookupResult{RouteBucket: &response}, nil
 	case query.Changefeed != nil:
-		response := lookupRouteChangefeed(state, *query.Changefeed)
-		return DataLookupResult{Changefeed: &response}, nil
+		response, err := lookupRouteChangefeed(state, *query.Changefeed)
+		return DataLookupResult{Changefeed: &response}, err
 	case query.Fence != nil:
 		response := lookupFence(state, *query.Fence)
 		return DataLookupResult{Fence: &response}, nil
@@ -319,7 +319,42 @@ type RouteChangefeedResult struct {
 	Changes        []RouteChange `json:"changes"`
 }
 
-func lookupRouteChangefeed(state DataState, query RouteChangefeedLookup) RouteChangefeedResult {
+const (
+	MaxRouteChangefeedResponseBytes = 8 << 20
+	maxRouteChangefeedEnvelopeBytes = len(`{"available":true,"reset":false,"floor_revision":18446744073709551615,"head_revision":18446744073709551615,"cursor_revision":18446744073709551615,"changes":[]}`)
+)
+
+type routeChangefeedPageBuilder struct {
+	limit        int
+	payloadBytes int
+	changes      []RouteChange
+}
+
+func newRouteChangefeedPageBuilder(limit uint32) *routeChangefeedPageBuilder {
+	return &routeChangefeedPageBuilder{limit: int(limit), changes: make([]RouteChange, 0, limit)}
+}
+
+func (b *routeChangefeedPageBuilder) add(change RouteChange) (bool, error) {
+	encoded, err := json.Marshal(change)
+	if err != nil {
+		return false, fmt.Errorf("raftstore: encode Route changefeed row: %w", err)
+	}
+	payloadBytes := b.payloadBytes + len(encoded)
+	if len(b.changes) != 0 {
+		payloadBytes++
+	}
+	if len(b.changes) >= b.limit || maxRouteChangefeedEnvelopeBytes+payloadBytes > MaxRouteChangefeedResponseBytes {
+		if len(b.changes) == 0 {
+			return false, errors.New("raftstore: one Route changefeed row exceeds the response byte limit")
+		}
+		return false, nil
+	}
+	b.payloadBytes = payloadBytes
+	b.changes = append(b.changes, change)
+	return true, nil
+}
+
+func lookupRouteChangefeed(state DataState, query RouteChangefeedLookup) (RouteChangefeedResult, error) {
 	result := RouteChangefeedResult{
 		FloorRevision:  state.RouteChangefeedFloor,
 		HeadRevision:   state.LastApplied,
@@ -328,21 +363,21 @@ func lookupRouteChangefeed(state DataState, query RouteChangefeedLookup) RouteCh
 	}
 	if !state.Initialized || !state.Accepts(query.Identity) {
 		result.Reason = "Route shard identity is not available"
-		return result
+		return result, nil
 	}
 	if !routeBucketTargetsShard(state, query.Group, query.Bucket, query.Identity.ShardID) {
 		result.Reason = "Route bucket targets another shard"
-		return result
+		return result, nil
 	}
 	if query.AfterRevision > state.LastApplied {
 		result.Reason = "Route changefeed position is ahead of local applied state"
-		return result
+		return result, nil
 	}
 	result.Available = true
 	if query.AfterRevision < state.RouteChangefeedFloor {
 		result.Reset = true
 		result.CursorRevision = state.LastApplied
-		return result
+		return result, nil
 	}
 
 	scanLimit := int(query.Limit) * 16
@@ -354,25 +389,35 @@ func lookupRouteChangefeed(state DataState, query RouteChangefeedLookup) RouteCh
 	}
 	exhausted := true
 	scanned := 0
+	builder := newRouteChangefeedPageBuilder(query.Limit)
 	for _, change := range state.RouteChanges {
 		if change.Revision <= query.AfterRevision {
 			continue
 		}
-		if scanned == scanLimit || len(result.Changes) == int(query.Limit) {
+		if scanned == scanLimit {
 			exhausted = false
 			break
 		}
 		scanned++
-		result.CursorRevision = change.Revision
 		if change.Bucket != query.Bucket || change.Group != query.Group {
+			result.CursorRevision = change.Revision
 			continue
 		}
-		result.Changes = append(result.Changes, change)
+		added, err := builder.add(change)
+		if err != nil {
+			return RouteChangefeedResult{}, err
+		}
+		if !added {
+			exhausted = false
+			break
+		}
+		result.CursorRevision = change.Revision
 	}
+	result.Changes = builder.changes
 	if exhausted {
 		result.CursorRevision = state.LastApplied
 	}
-	return result
+	return result, nil
 }
 
 func routeBucketTargetsShard(state DataState, group string, bucket, shardID uint32) bool {

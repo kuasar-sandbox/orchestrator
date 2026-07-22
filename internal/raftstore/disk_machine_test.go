@@ -455,8 +455,12 @@ func TestPebbleSnapshotRecoverySpansMultipleSyncedBatches(t *testing.T) {
 	if _, err := target.Open(make(chan struct{})); err != nil {
 		t.Fatal(err)
 	}
+	writesBeforeRecovery := engine.writeGeneration
 	if err := target.RecoverFromSnapshot(bytes.NewReader(snapshot.Bytes()), make(chan struct{})); err != nil {
 		t.Fatal(err)
+	}
+	if writes := engine.writeGeneration - writesBeforeRecovery; writes < 4 {
+		t.Fatalf("large snapshot recovery used %d writes, want slot clear, multiple data batches, and activation", writes)
 	}
 	after, recovered := "", 0
 	for {

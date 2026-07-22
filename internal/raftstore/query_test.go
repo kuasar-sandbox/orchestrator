@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"testing"
 
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
@@ -258,37 +259,80 @@ func TestRouteBucketSnapshotAndChangefeedUseShardRevisions(t *testing.T) {
 		t.Fatalf("second Route bucket page = %+v", listPage)
 	}
 
-	page := lookupRouteChangefeed(state, RouteChangefeedLookup{
+	page, err := lookupRouteChangefeed(state, RouteChangefeedLookup{
 		Identity: identity, Group: group, Bucket: bucket, AfterRevision: 1, Limit: 2,
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !page.Available || page.Reset || len(page.Changes) != 2 || page.Changes[0].Revision != 2 ||
 		page.Changes[0].RouteKey != firstKey || page.Changes[0].State != clusterstate.WorkflowRouteStarting ||
 		page.Changes[1].Revision != 3 || page.Changes[1].State != clusterstate.WorkflowRouteReady ||
 		page.CursorRevision != 3 || page.HeadRevision != 7 {
 		t.Fatalf("first Route changefeed page = %+v", page)
 	}
-	page = lookupRouteChangefeed(state, RouteChangefeedLookup{
+	page, err = lookupRouteChangefeed(state, RouteChangefeedLookup{
 		Identity: identity, Group: group, Bucket: bucket, AfterRevision: page.CursorRevision, Limit: 2,
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !page.Available || len(page.Changes) != 2 || page.Changes[0].Revision != 4 ||
 		page.Changes[1].Revision != 5 || page.Changes[1].State != clusterstate.WorkflowRouteReady ||
 		page.CursorRevision != 5 {
 		t.Fatalf("second Route changefeed page = %+v", page)
 	}
-	page = lookupRouteChangefeed(state, RouteChangefeedLookup{
+	page, err = lookupRouteChangefeed(state, RouteChangefeedLookup{
 		Identity: identity, Group: group, Bucket: bucket, AfterRevision: page.CursorRevision, Limit: 2,
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !page.Available || len(page.Changes) != 1 || page.Changes[0].Revision != 6 ||
 		page.Changes[0].State != clusterstate.WorkflowRoutePaused || page.CursorRevision != 7 {
 		t.Fatalf("third Route changefeed page = %+v", page)
 	}
 
 	advanceDataApplied(&state, RouteChangefeedRetentionRevisions+10)
-	reset := lookupRouteChangefeed(state, RouteChangefeedLookup{
+	reset, err := lookupRouteChangefeed(state, RouteChangefeedLookup{
 		Identity: identity, Group: group, Bucket: bucket, AfterRevision: 1, Limit: 1,
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !reset.Available || !reset.Reset || reset.FloorRevision != 10 || len(reset.Changes) != 0 {
 		t.Fatalf("compacted Route changefeed = %+v", reset)
+	}
+}
+
+func TestRouteChangefeedBoundsEncodedResponseWithoutSkippingCursor(t *testing.T) {
+	identity := ShardRequestIdentity{PermitIdentity: PermitIdentity{
+		ClusterID: "cluster-1", RegistryGeneration: "generation-1", SystemEpoch: 1,
+		RegistryLayoutDigest: digestFor("registry-layout"),
+	}}
+	largeKey := strings.Repeat("k", 3<<20)
+	state := DataState{
+		Initialized: true, ClusterID: identity.ClusterID, RegistryGeneration: identity.RegistryGeneration,
+		ShardID: 0, RouteBucketCount: 1, VirtualShardCount: 1,
+		ServingEpochs: []PermitIdentity{identity.PermitIdentity}, LastApplied: 3,
+		RouteChanges: []RouteChange{
+			{Revision: 1, Group: "/g", RouteKey: largeKey + "1", State: clusterstate.WorkflowRouteStarting},
+			{Revision: 2, Group: "/g", RouteKey: largeKey + "2", State: clusterstate.WorkflowRouteReady},
+			{Revision: 3, Group: "/g", RouteKey: largeKey + "3", State: clusterstate.WorkflowRoutePaused},
+		},
+	}
+	page, err := lookupRouteChangefeed(state, RouteChangefeedLookup{
+		Identity: identity, Group: "/g", Bucket: 0, Limit: 4096,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(page)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(encoded) > MaxRouteChangefeedResponseBytes || len(page.Changes) != 2 || page.CursorRevision != 2 {
+		t.Fatalf("bounded Route changefeed bytes=%d changes=%d cursor=%d", len(encoded), len(page.Changes), page.CursorRevision)
 	}
 }
 
