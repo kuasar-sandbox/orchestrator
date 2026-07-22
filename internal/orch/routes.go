@@ -213,7 +213,7 @@ func (o *Orchestrator) publishDelete(sid string) {
 // publish fans an event out to every subscriber. A full subscriber is dropped +
 // closed (it reconnects and re-snapshots) rather than blocking the caller.
 func (o *Orchestrator) publish(ev routesync.Event) {
-	o.appendRouteLog(ev)
+	ev = o.appendRouteLog(ev)
 	o.subsMu.Lock()
 	defer o.subsMu.Unlock()
 	for id, ch := range o.subs {
@@ -227,13 +227,21 @@ func (o *Orchestrator) publish(ev routesync.Event) {
 	}
 }
 
-func (o *Orchestrator) appendRouteLog(ev routesync.Event) {
+func (o *Orchestrator) appendRouteLog(ev routesync.Event) routesync.Event {
 	o.routeLogMu.Lock()
 	defer o.routeLogMu.Unlock()
 	o.routeSeq++
+	revision := uint64(o.routeSeq)
+	switch ev.Kind {
+	case routesync.TypeUpsert:
+		ev.Route.AuthorityRevision = revision
+	case routesync.TypeDelete:
+		ev.Delete.AuthorityRevision = revision
+	}
 	o.routeLog = append(o.routeLog, routeLogEntry{seq: o.routeSeq, ev: ev})
 	if len(o.routeLog) > routeLogLimit {
 		copy(o.routeLog, o.routeLog[len(o.routeLog)-routeLogLimit:])
 		o.routeLog = o.routeLog[:routeLogLimit]
 	}
+	return ev
 }
