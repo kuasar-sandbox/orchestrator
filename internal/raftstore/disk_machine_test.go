@@ -91,6 +91,37 @@ func TestPebblePlacementRetryLoadsCommittedFence(t *testing.T) {
 	applyDiskData(t, machine, 6, DataCommand{
 		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{LogIndex: 4}, Route: &next,
 	})
+	exhaustedNext := cloneRouteRecord(next)
+	exhaustedNext.Starting.DefinitivelyRejected = []uint32{0, 1}
+	applyDiskData(t, machine, 7, DataCommand{
+		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{LogIndex: 6}, Route: &exhaustedNext,
+	})
+	failureNext := clusterstate.RoutePlacementFailureState{
+		SandboxID: exhaustedNext.Starting.SandboxID, PlacementRound: exhaustedNext.Starting.PlacementRound,
+		CandidatePool:        append([]clusterstate.PlacementCandidate(nil), exhaustedNext.Starting.CandidatePool...),
+		DefinitivelyRejected: append([]uint32(nil), exhaustedNext.Starting.DefinitivelyRejected...),
+		Intent:               exhaustedNext.Starting.Intent, Reason: "placement candidate pool exhausted",
+	}
+	tombstoneNext := clusterstate.RouteWorkflowRecord{
+		Group: group, RouteKey: routeKey, State: clusterstate.WorkflowRouteTombstone,
+		Tombstone: &clusterstate.RouteTombstoneState{PlacementFailure: &failureNext},
+	}
+	applyDiskData(t, machine, 8, DataCommand{
+		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{LogIndex: 7}, Route: &tombstoneNext,
+	})
+	fenceNext, err := clusterstate.NewPlacementFailureFence(group, routeKey, registryLayout.RegistryGeneration, failureNext)
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyDiskData(t, machine, 9, DataCommand{
+		Type: DataPutFence, Identity: identity, Expect: RevisionExpectation{Absent: true}, Fence: &fenceNext,
+	})
+	reused := routeStarting(t, registryLayout, group, routeKey, "sandbox-1", 3, false)
+	if result := applyDiskDataResult(t, machine, 10, DataCommand{
+		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{LogIndex: 8}, Route: &reused,
+	}); !result.Conflict {
+		t.Fatal("Pebble replacement reused a SID with an older retained fence")
+	}
 }
 
 func TestPendingDiskScanSeeksFromQualifiedCursor(t *testing.T) {
@@ -114,6 +145,53 @@ func TestPendingDiskScanSeeksFromQualifiedCursor(t *testing.T) {
 	want = stateRowKey(prefix, stateRouteTable, "route-key")
 	if !scan || !bytes.Equal(lower, want) {
 		t.Fatalf("Route lower bound = %q scan=%t, want %q", lower, scan, want)
+	}
+}
+
+func TestPebblePendingIndexTracksCoordinatorWork(t *testing.T) {
+	engine, err := OpenPebbleStateEngine(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close()
+	registryLayout := testRegistryLayout(4, "generation-pending-index")
+	group, routeKey := "/g", "rk-pending-index"
+	identity := routeShardIdentity(t, registryLayout, group, routeKey)
+	shardID := DataRaftShardID(identity.ShardID)
+	machine := engine.NewStateMachine(shardID, 1)
+	if _, err := machine.Open(make(chan struct{})); err != nil {
+		t.Fatal(err)
+	}
+	bootstrap, _ := NewDataShardBootstrap(registryLayout, identity.ShardID)
+	applyDiskData(t, machine, 1, DataCommand{
+		Type: DataInitializeShard, Identity: identity, Bootstrap: &bootstrap,
+		ReplicaIDs: append([]uint64(nil), bootstrap.ReplicaIDs...),
+	})
+	starting := routeStarting(t, registryLayout, group, routeKey, "sandbox-pending", 1, true)
+	applyDiskData(t, machine, 2, DataCommand{
+		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{Absent: true}, Route: &starting,
+	})
+	indexKey := stateRowKey(
+		stateSlotPrefix(shardID, 1, 1), statePendingTable, "r"+routeMapKey(group, routeKey),
+	)
+	if _, found, err := getStateValue(engine.db, indexKey); err != nil || !found {
+		t.Fatalf("STARTING pending index found=%t err=%v", found, err)
+	}
+	value, err := machine.Lookup(DataLookup{Pending: &PendingLookup{Identity: identity, Limit: 10}})
+	if err != nil || value.(DataLookupResult).Pending == nil || len(value.(DataLookupResult).Pending.Workflows) != 1 {
+		t.Fatalf("STARTING pending lookup = %+v, %v", value, err)
+	}
+
+	ready := readyRecord(starting, 1)
+	applyDiskData(t, machine, 3, DataCommand{
+		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{LogIndex: 2}, Route: &ready,
+	})
+	if _, found, err := getStateValue(engine.db, indexKey); err != nil || found {
+		t.Fatalf("READY pending index found=%t err=%v", found, err)
+	}
+	value, err = machine.Lookup(DataLookup{Pending: &PendingLookup{Identity: identity, Limit: 10}})
+	if err != nil || len(value.(DataLookupResult).Pending.Workflows) != 0 {
+		t.Fatalf("READY pending lookup = %+v, %v", value, err)
 	}
 }
 
@@ -520,6 +598,15 @@ func applyDiskSystem(t *testing.T, machine sm.IOnDiskStateMachine, index uint64,
 
 func applyDiskData(t *testing.T, machine sm.IOnDiskStateMachine, index uint64, command DataCommand) DataApplyResult {
 	t.Helper()
+	result := applyDiskDataResult(t, machine, index, command)
+	if !result.Applied || result.Conflict {
+		t.Fatalf("data command %s at %d = %+v", command.Type, index, result)
+	}
+	return result
+}
+
+func applyDiskDataResult(t *testing.T, machine sm.IOnDiskStateMachine, index uint64, command DataCommand) DataApplyResult {
+	t.Helper()
 	raw, err := EncodeDataCommand(command)
 	if err != nil {
 		t.Fatal(err)
@@ -531,9 +618,6 @@ func applyDiskData(t *testing.T, machine sm.IOnDiskStateMachine, index uint64, c
 	var result DataApplyResult
 	if err := json.Unmarshal(entries[0].Result.Data, &result); err != nil {
 		t.Fatal(err)
-	}
-	if !result.Applied || result.Conflict {
-		t.Fatalf("data command %s at %d = %+v", command.Type, index, result)
 	}
 	return result
 }
