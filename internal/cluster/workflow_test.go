@@ -154,6 +154,28 @@ func TestBuildProjectionRequiresCanonicalDataEndpoint(t *testing.T) {
 	}
 }
 
+func TestWorkflowFinalizationRequiresCanonicalDataEndpoint(t *testing.T) {
+	intent := WorkflowFinalizationIntent{
+		ObjectID: "s1", NodeID: "n1", NodeEpoch: 7, DataEndpoint: "https://node-1:8443",
+		RegistryGeneration: "g1", BindingDigest: hexDigest(sha256.Sum256([]byte("binding"))),
+	}
+	if err := intent.Validate(); err == nil {
+		t.Fatal("non-TCP workflow finalization endpoint accepted")
+	}
+}
+
+func TestDispatchIntentBoundsProviderPolicyVersion(t *testing.T) {
+	intent := workflowSandboxIntent(t)
+	intent.ProviderPolicyVersion = strings.Repeat("v", MaxProviderPolicyVersionBytes+1)
+	if err := intent.Validate(); err == nil {
+		t.Fatal("oversized provider policy version accepted")
+	}
+	intent.ProviderPolicyVersion = string([]byte{'v', 0xff})
+	if err := intent.Validate(); err == nil {
+		t.Fatal("invalid UTF-8 provider policy version accepted")
+	}
+}
+
 func TestBuildFinalizationMustIdentifyContainingBuild(t *testing.T) {
 	build := registeredBuildRecord(t)
 	build.Finalizations = []WorkflowFinalizationIntent{{

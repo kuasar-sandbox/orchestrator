@@ -126,6 +126,33 @@ func TestRegistryLayoutReplicaIdentityIsScopedToEachShard(t *testing.T) {
 	}
 }
 
+func TestRegistryLayoutRejectsNetworkEquivalentEndpoints(t *testing.T) {
+	for name, mutate := range map[string]func(*RegistryLayout){
+		"DNS case internal": func(layout *RegistryLayout) {
+			layout.Members[0].InternalEndpoint = "https://REGISTRY-B:9443"
+		},
+		"DNS case Raft": func(layout *RegistryLayout) {
+			layout.Members[0].RaftEndpoint = "REGISTRY-B:63001"
+		},
+		"IPv6 spelling internal": func(layout *RegistryLayout) {
+			layout.Members[0].InternalEndpoint = "https://[2001:0db8:0:0:0:0:0:1]:9443"
+			layout.Members[1].InternalEndpoint = "https://[2001:db8::1]:9443"
+		},
+		"IPv6 spelling Raft": func(layout *RegistryLayout) {
+			layout.Members[0].RaftEndpoint = "[2001:0db8:0:0:0:0:0:1]:63001"
+			layout.Members[1].RaftEndpoint = "[2001:db8::1]:63001"
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			layout := testRegistryLayout(1, "generation-1")
+			mutate(&layout)
+			if err := layout.Validate(); err == nil {
+				t.Fatal("network-equivalent member endpoints were accepted")
+			}
+		})
+	}
+}
+
 func TestRegistryLayoutSignatureAndFixedPlacement(t *testing.T) {
 	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -376,6 +403,10 @@ func TestRegistryLayoutTransitionFreezesMemberAndReplicaIdentity(t *testing.T) {
 		},
 		"replacement reuses endpoint": func(layout *RegistryLayout) {
 			layout.Members[3].RaftEndpoint = previous.Members[2].RaftEndpoint
+			layout.Members[2].RaftEndpoint = "registry-c-retired:63001"
+		},
+		"replacement reuses endpoint alias": func(layout *RegistryLayout) {
+			layout.Members[3].RaftEndpoint = "REGISTRY-C:63001"
 			layout.Members[2].RaftEndpoint = "registry-c-retired:63001"
 		},
 		"retained member replica changed": func(layout *RegistryLayout) {

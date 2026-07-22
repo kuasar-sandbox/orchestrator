@@ -1,6 +1,7 @@
 package cluster
 
 import (
+	"encoding/json"
 	"net/http"
 	"strings"
 	"testing"
@@ -112,6 +113,38 @@ func TestSandboxDispatchSpecBindsReplayedTimeoutAndMetadata(t *testing.T) {
 	}
 }
 
+func TestSandboxDispatchSpecBindsConfigurationHeaders(t *testing.T) {
+	templateRef := "e2b-img-" + strings.Repeat("c", 64)
+	request, err := NewNodeRequestEnvelopeV1(http.MethodPost, "/sandboxes", "", http.Header{
+		"X-Kuasar-Sandbox-Network": {`{"hostname":"header"}`},
+	}, []byte(`{"templateID":"`+templateRef+`","timeout":0,"metadata":{"kuasar-sandbox.network":"{\"hostname\":\"body\"}"}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec := SandboxDispatchSpecV1{
+		Version: DispatchSpecVersionV1, TemplateRef: templateRef,
+		AuthKeyFingerprint: strings.Repeat("a", 24), ManifestKeyFingerprint: strings.Repeat("b", 24),
+		AccessToken: "capability", Config: map[string]string{"kuasar-sandbox.network": `{"hostname":"body"}`},
+		Request: request,
+	}
+	if _, err := MarshalSandboxDispatchSpec(spec); err == nil {
+		t.Fatal("configuration header differing from canonical metadata accepted")
+	}
+	spec.Config["kuasar-sandbox.network"] = `{"hostname":"header"}`
+	fields, err := DecodeJSONObject(spec.Request.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fields["metadata"], _ = json.Marshal(spec.Config)
+	spec.Request.Body, err = EncodeJSONObject(fields)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := MarshalSandboxDispatchSpec(spec); err != nil {
+		t.Fatalf("matching configuration header rejected: %v", err)
+	}
+}
+
 func TestBuildDispatchSpecRequiresSeparateKeysAndResourceCeiling(t *testing.T) {
 	spec := BuildDispatchSpecV1{
 		Version: DispatchSpecVersionV1, TemplateID: "transient-template",
@@ -192,5 +225,23 @@ func TestBuildDispatchSpecBindsAllReplayedRegistrationFields(t *testing.T) {
 				t.Fatal("mismatched replay field was accepted")
 			}
 		})
+	}
+}
+
+func TestBuildDispatchSpecBindsBuilderHeader(t *testing.T) {
+	request, err := NewNodeRequestEnvelopeV1(http.MethodPost, "/v3/templates", "", http.Header{
+		"X-Kuasar-Sandbox-Builder": {`{"referer":{"enabled":true}}`},
+	}, []byte(`{"cpuCount":2,"memoryMB":1024,"metadata":{"kuasar-sandbox.builder":"{\"referer\":{\"enabled\":false}}"},"name":"","profile":"e2b","tags":null}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec := BuildDispatchSpecV1{
+		Version: DispatchSpecVersionV1, TemplateID: "transient-template",
+		AuthKeyFingerprint: strings.Repeat("a", 24), ManifestKeyFingerprint: strings.Repeat("b", 24),
+		Profile: types.ProfileE2B, CPUCount: 2, MemoryMB: 1024,
+		Metadata: map[string]string{"kuasar-sandbox.builder": `{"referer":{"enabled":false}}`}, Request: request,
+	}
+	if _, err := MarshalBuildDispatchSpec(spec); err == nil {
+		t.Fatal("builder header differing from canonical metadata accepted")
 	}
 }

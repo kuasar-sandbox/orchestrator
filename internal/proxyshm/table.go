@@ -205,15 +205,17 @@ func (t *Table) BeginSync() {
 	atomic.AddUint64(&t.header.SyncGen, 1)
 }
 
-func (t *Table) Bookmark() {
+func (t *Table) Bookmark(fullSync bool) {
 	if t.readonly {
 		return
 	}
-	gen := atomic.LoadUint64(&t.header.SyncGen)
-	for i := range t.records {
-		r := &t.records[i]
-		if atomic.LoadUint32(&r.Status) == statusPresent && atomic.LoadUint64(&r.SyncGen) != gen {
-			t.deleteRecord(r)
+	if fullSync {
+		gen := atomic.LoadUint64(&t.header.SyncGen)
+		for i := range t.records {
+			r := &t.records[i]
+			if atomic.LoadUint32(&r.Status) == statusPresent && atomic.LoadUint64(&r.SyncGen) != gen {
+				t.deleteRecord(r)
+			}
 		}
 	}
 	atomic.StoreUint32(&t.header.Synced, 1)

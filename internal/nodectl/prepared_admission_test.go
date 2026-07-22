@@ -4,9 +4,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
@@ -79,6 +81,88 @@ func TestPreparedAdmissionIsDurableIdempotentAndClaimable(t *testing.T) {
 	if record == nil || record.State != PreparedClaimed || record.ReservationToken != first.ReservationToken ||
 		loaded.Reservations[first.ReservationToken] == nil {
 		t.Fatalf("reloaded admission = %+v reservations=%+v", record, loaded.Reservations)
+	}
+}
+
+func TestPreparedAdmissionEnforcesAggregateCPUFloor(t *testing.T) {
+	state := preparedTestState()
+	controller := preparedTestController(t, state, filepath.Join(t.TempDir(), "state.json"), 4)
+	for index := 0; index < 8; index++ {
+		id := fmt.Sprintf("sandbox-%d", index)
+		result, err := controller.PrepareAdmission(id, preparedDigest(id), preparedTestDemand(1))
+		if err != nil || result.State != PreparedAdmitted {
+			t.Fatalf("prepare %d = %+v, %v", index, result, err)
+		}
+	}
+	blocked, err := controller.PrepareAdmission("sandbox-blocked", preparedDigest("blocked"), preparedTestDemand(1))
+	if err != nil || blocked.State != PreparedQueued {
+		t.Fatalf("CPU-exhausted prepare = %+v, %v", blocked, err)
+	}
+	state.Lock()
+	allocated := state.NodeAllocated()
+	state.Unlock()
+	if allocated.CPUMilli != state.AllocatablePool.CPUMilli {
+		t.Fatalf("allocated CPU = %dm, pool = %dm", allocated.CPUMilli, state.AllocatablePool.CPUMilli)
+	}
+}
+
+func TestPreparedAndOrdinaryAdmissionCommitOneAtomicBudget(t *testing.T) {
+	state := NewState(1<<30, 1000, 0, 0, Resources{}, Watermarks{
+		HighFactor: 0.95, LowFactor: 0.80, StartupFactor: 1,
+	})
+	path := filepath.Join(t.TempDir(), "state.json")
+	controller := preparedTestController(t, state, path, 4)
+	serverConn, clientConn := net.Pipe()
+	defer serverConn.Close()
+	defer clientConn.Close()
+	server := &Server{
+		State: state, Admission: controller.admission, PreparedAdmission: controller,
+		Allocator: NewAllocator(AllocatorPolicy{}), Persister: controller.persister, Logf: t.Logf,
+	}
+	demand := SandboxAdmissionDemand{
+		SlotUnits:           1,
+		CapacityMemoryBytes: 1 << 30, CapacityCPU: 1,
+		FloorMemoryBytes: 1 << 30, FloorCPU: 1, StartupBudgetMemory: 1 << 30,
+	}
+	start := make(chan struct{})
+	var (
+		wg             sync.WaitGroup
+		preparedResult PreparedAdmissionResult
+		preparedErr    error
+		ordinaryResult *Message
+	)
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		<-start
+		preparedResult, preparedErr = controller.PrepareAdmission(
+			"sandbox-prepared", preparedDigest("prepared"), demand,
+		)
+	}()
+	go func() {
+		defer wg.Done()
+		<-start
+		var token string
+		ordinaryResult = server.handleAdmit(serverConn, demand.message("sandbox-ordinary"), &token)
+	}()
+	close(start)
+	wg.Wait()
+	if preparedErr != nil {
+		t.Fatal(preparedErr)
+	}
+	if preparedResult.State != PreparedAdmitted && preparedResult.State != PreparedRejected {
+		t.Fatalf("prepared result = %+v", preparedResult)
+	}
+	if ordinaryResult == nil || ordinaryResult.Status != StatusAdmitted && ordinaryResult.Status != StatusRejected {
+		t.Fatalf("ordinary result = %+v", ordinaryResult)
+	}
+	state.Lock()
+	allocated := state.NodeAllocated()
+	reservationCount := len(state.Reservations)
+	state.Unlock()
+	if reservationCount != 1 || allocated.MemoryBytes > state.AllocatablePool.MemoryBytes ||
+		allocated.CPUMilli > state.AllocatablePool.CPUMilli {
+		t.Fatalf("reservations=%d allocated=%+v pool=%+v", reservationCount, allocated, state.AllocatablePool)
 	}
 }
 

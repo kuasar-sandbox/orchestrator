@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"math"
 	"net"
 	"sync"
 	"time"
@@ -131,9 +132,8 @@ func NewAdmissionController(policy AdmissionPolicy) *AdmissionController {
 // SetWiring connects the controller to the State + audit + admit-builder
 // callback. Must be called before Run.
 //
-// admitBuilder is invoked under queueMu (not under state.Lock — it takes
-// state.Lock internally to insert the reservation, build the admit
-// response message, then returns it for the worker to write to conn).
+// admitBuilder is invoked under queueMu and state.Lock so the final resource
+// decision and reservation insert observe one ledger snapshot.
 func (a *AdmissionController) SetWiring(
 	state *State,
 	auditor *Auditor,
@@ -221,19 +221,20 @@ func (a *AdmissionController) processQueue() {
 	// 2. FIFO admit head
 	for a.queue.Len() > 0 {
 		head := a.queue.Front().Value.(*PendingAdmit)
-		oc := a.analyzeRequest(head.req)
-		switch oc.Status {
-		case OutcomeAdmitted:
-			// Consume token before committing the admit. If another admit
-			// raced us to the last token, fall back to short-term block
-			// behavior (head stays in queue, token-refill timer set).
+		a.state.Lock()
+		oc := a.analyzeRequestLocked(head.req)
+		if oc.Status == OutcomeAdmitted {
+			// Keep the resource ledger locked from the decision through the
+			// reservation insert performed by processFn.
 			if !a.consumeToken() {
+				a.state.Unlock()
 				a.resetTokenTimer()
 				return
 			}
 			a.queue.Remove(a.queue.Front())
 			head.ttlTimer.Stop()
 			resp, err := a.processFn(head)
+			a.state.Unlock()
 			if err != nil {
 				_ = WriteMessage(head.conn, &Message{
 					Type: TypeAdmitResponse, Status: StatusRejected, Msg: err.Error(),
@@ -257,14 +258,10 @@ func (a *AdmissionController) processQueue() {
 						head.req.SandboxID, err.Error())
 				}
 			}
-			// Conn left open on success: caller will continue to use it
-			// for RPC. No separate audit event here — the canonical
-			// `admit token=...` line was already emitted by buildAdmitOK
-			// (via processFn). The fact that this admit came from the
-			// queue is reflected in the response's QueuedForMs metadata
-			// that the client logs.
 			continue
-
+		}
+		a.state.Unlock()
+		switch oc.Status {
 		case OutcomeLongTermReject:
 			a.queue.Remove(a.queue.Front())
 			head.ttlTimer.Stop()
@@ -399,7 +396,9 @@ func (a *AdmissionController) consumeToken() bool {
 // Note: this does NOT consume a token (it only checks). The caller (or
 // the worker) calls ConsumeToken explicitly when ready to admit.
 func (a *AdmissionController) AnalyzeRequest(req *Message) Outcome {
-	return a.analyzeRequest(req)
+	a.state.Lock()
+	defer a.state.Unlock()
+	return a.analyzeRequestLocked(req)
 }
 
 // AnalyzeAndConsume returns ADMITTED only when this caller actually consumed
@@ -407,7 +406,13 @@ func (a *AdmissionController) AnalyzeRequest(req *Message) Outcome {
 // re-running Analyze alone would be unsafe because it could observe a refilled
 // token without charging it.
 func (a *AdmissionController) AnalyzeAndConsume(req *Message) Outcome {
-	outcome := a.analyzeRequest(req)
+	a.state.Lock()
+	defer a.state.Unlock()
+	return a.analyzeAndConsumeLocked(req)
+}
+
+func (a *AdmissionController) analyzeAndConsumeLocked(req *Message) Outcome {
+	outcome := a.analyzeRequestLocked(req)
 	if outcome.Status == OutcomeAdmitted && !a.consumeToken() {
 		return Outcome{Status: OutcomeShortTermBlock, Block: BlockedByTokenBucket}
 	}
@@ -415,6 +420,14 @@ func (a *AdmissionController) AnalyzeAndConsume(req *Message) Outcome {
 }
 
 func (a *AdmissionController) analyzeRequest(req *Message) Outcome {
+	a.state.Lock()
+	defer a.state.Unlock()
+	return a.analyzeRequestLocked(req)
+}
+
+// analyzeRequestLocked evaluates resource headroom against one stable ledger
+// snapshot. The caller holds state.Lock through reservation insertion.
+func (a *AdmissionController) analyzeRequestLocked(req *Message) Outcome {
 	// 1. drain
 	a.drainMu.Lock()
 	drained := a.drained
@@ -437,14 +450,21 @@ func (a *AdmissionController) analyzeRequest(req *Message) Outcome {
 		}
 	}
 
-	a.state.Lock()
-	pool := a.state.AllocatablePool.MemoryBytes
+	poolResources := a.state.AllocatablePool
+	pool := poolResources.MemoryBytes
 	startupPool := a.state.StartupPoolBytes()
 	emerg := uint64(float64(pool) * a.state.Wm.EmergencyFactor)
-	mainAllocated := a.state.NodeAllocated().MemoryBytes
+	allocated := a.state.NodeAllocated()
+	mainAllocated := allocated.MemoryBytes
 	startupInFlight := a.state.StartupInFlightLocked()
 	zone := a.state.MemoryZone()
-	a.state.Unlock()
+	floorCPUMilli, validCPU := admissionFloorCPUMilli(req)
+	if !validCPU {
+		return Outcome{
+			Status: OutcomePreCheckReject, RejectCode: "invalid_cpu",
+			RejectMsg: "sandbox CPU floor/capacity is invalid",
+		}
+	}
 
 	// 3. pre-check absolute capacity
 	if ebudget > pool {
@@ -459,6 +479,13 @@ func (a *AdmissionController) analyzeRequest(req *Message) Outcome {
 			Status:     OutcomePreCheckReject,
 			RejectCode: "exceeds_startup_pool",
 			RejectMsg:  fmt.Sprintf("effective_startup_budget %d > startup_pool %d", ebudget, startupPool),
+		}
+	}
+	if floorCPUMilli > poolResources.CPUMilli {
+		return Outcome{
+			Status:     OutcomePreCheckReject,
+			RejectCode: "exceeds_node_cpu_capacity",
+			RejectMsg:  fmt.Sprintf("floor CPU %dm > pool %dm", floorCPUMilli, poolResources.CPUMilli),
 		}
 	}
 
@@ -481,6 +508,13 @@ func (a *AdmissionController) analyzeRequest(req *Message) Outcome {
 			Status: OutcomeShortTermBlock,
 			Block:  BlockedByMainBudget,
 		}
+	}
+	cpuHeadroom := uint64(0)
+	if poolResources.CPUMilli > allocated.CPUMilli {
+		cpuHeadroom = poolResources.CPUMilli - allocated.CPUMilli
+	}
+	if floorCPUMilli > cpuHeadroom {
+		return Outcome{Status: OutcomeShortTermBlock, Block: BlockedByMainBudget}
 	}
 
 	startupHeadroom := uint64(0)
@@ -507,6 +541,14 @@ func (a *AdmissionController) analyzeRequest(req *Message) Outcome {
 	}
 
 	return Outcome{Status: OutcomeAdmitted}
+}
+
+func admissionFloorCPUMilli(req *Message) (uint64, bool) {
+	if req == nil || req.CapacityCPU < 0 || req.FloorCPU < 0 || math.IsNaN(req.FloorCPU) || math.IsInf(req.FloorCPU, 0) ||
+		req.FloorCPU > float64(req.CapacityCPU) || req.FloorCPU > float64(math.MaxUint64)/1000 {
+		return 0, false
+	}
+	return uint64(math.Ceil(req.FloorCPU * 1000)), true
 }
 
 // computeEffectiveStartupBudget returns max(startup_budget_memory,

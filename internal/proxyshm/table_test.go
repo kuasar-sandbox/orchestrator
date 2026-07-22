@@ -32,7 +32,7 @@ func TestTableSharedLookupAndDelete(t *testing.T) {
 	if err := master.Upsert(entry); err != nil {
 		t.Fatal(err)
 	}
-	master.Bookmark()
+	master.Bookmark(true)
 
 	got, ok := worker.Lookup("s1")
 	if !ok || got.AccessToken != "tok" || got.FloatingIP != "100.100.0.2" {
@@ -59,7 +59,7 @@ func TestBookmarkSweepsMissingRoutes(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	tbl.Bookmark()
+	tbl.Bookmark(true)
 	tbl.BeginSync()
 	if err := tbl.Upsert(routesync.RouteEntry{SandboxID: "s2", State: routesync.StateRunning}); err != nil {
 		t.Fatal(err)
@@ -67,9 +67,37 @@ func TestBookmarkSweepsMissingRoutes(t *testing.T) {
 	if _, ok := tbl.Lookup("s1"); !ok {
 		t.Fatal("route swept before bookmark")
 	}
-	tbl.Bookmark()
+	tbl.Bookmark(true)
 	if _, ok := tbl.Lookup("s1"); ok {
 		t.Fatal("route not swept at bookmark")
+	}
+}
+
+func TestIncrementalBookmarkPreservesUnchangedRoutes(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "routes.shm")
+	tbl, err := Create(path, 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tbl.Close()
+	tbl.BeginSync()
+	for _, sid := range []string{"unchanged", "updated"} {
+		if err := tbl.Upsert(routesync.RouteEntry{SandboxID: sid, State: routesync.StateRunning}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tbl.Bookmark(true)
+
+	tbl.BeginSync()
+	if err := tbl.Upsert(routesync.RouteEntry{SandboxID: "updated", State: routesync.StatePaused}); err != nil {
+		t.Fatal(err)
+	}
+	tbl.Bookmark(false)
+	if _, ok := tbl.Lookup("unchanged"); !ok {
+		t.Fatal("incremental bookmark removed an unchanged route")
+	}
+	if got, ok := tbl.Lookup("updated"); !ok || got.State != routesync.StatePaused {
+		t.Fatalf("updated route = %+v, ok=%v", got, ok)
 	}
 }
 
@@ -88,7 +116,7 @@ func TestFullSyncDoesNotRegressCurrentExecutionEvent(t *testing.T) {
 	if err := tbl.Upsert(current); err != nil {
 		t.Fatal(err)
 	}
-	tbl.Bookmark()
+	tbl.Bookmark(true)
 
 	tbl.BeginSync()
 	stale := current
@@ -98,7 +126,7 @@ func TestFullSyncDoesNotRegressCurrentExecutionEvent(t *testing.T) {
 	if err := tbl.Upsert(stale); err != nil {
 		t.Fatal(err)
 	}
-	tbl.Bookmark()
+	tbl.Bookmark(true)
 	got, ok := tbl.Lookup("s1")
 	if !ok || got.EventSeq != 2 || got.State != routesync.StateRunning || got.AccessToken != "current" {
 		t.Fatalf("route regressed during full sync: %+v ok=%v", got, ok)
@@ -185,7 +213,7 @@ func TestWorkerResolveWakesAndWaitsForSharedUpdate(t *testing.T) {
 		EventSeq: 1, Profile: "e2b", State: routesync.StatePaused,
 	}
 	master.ApplyUpsert(fence)
-	master.Bookmark()
+	master.Bookmark(true)
 
 	done := make(chan proxy.Route, 1)
 	go func() {
@@ -231,7 +259,7 @@ func TestWorkerRejectsStaleFenceWithoutWake(t *testing.T) {
 		SandboxID: "s1", NodeID: "n1", NodeEpoch: 8, RegistryGeneration: "g2", BindingDigest: "new",
 		EventSeq: 1, Profile: "e2b", State: routesync.StatePaused,
 	})
-	master.Bookmark()
+	master.Bookmark(true)
 
 	route, err := worker.Route(context.Background(), proxy.RouteRequest{
 		SandboxID: "s1", Port: 49983, ExpectedNodeID: "n1", ExpectedNodeEpoch: 7,
@@ -262,7 +290,7 @@ func TestWorkerBindingChangeWhileParkedFailsClosed(t *testing.T) {
 		SandboxID: "s1", NodeID: "n1", NodeEpoch: 7, RegistryGeneration: "g1", BindingDigest: "old",
 		EventSeq: 1, Profile: "e2b", State: routesync.StatePaused,
 	})
-	master.Bookmark()
+	master.Bookmark(true)
 
 	done := make(chan proxy.Route, 1)
 	go func() {
@@ -309,7 +337,7 @@ func TestWorkerRechecksRouteAtParkDeadline(t *testing.T) {
 		EventSeq: 1, Profile: "e2b", State: routesync.StatePaused,
 	}
 	master.ApplyUpsert(entry)
-	master.Bookmark()
+	master.Bookmark(true)
 
 	done := make(chan proxy.Route, 1)
 	go func() {
@@ -355,7 +383,7 @@ func TestMMDSSourceFromSharedTable(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	tbl.Bookmark()
+	tbl.Bookmark(true)
 	view := NewWorkerView(tbl, nil, nil, time.Second)
 	if sid, ok := view.ByFloatingIP("100.100.0.3"); !ok || sid != "s1" {
 		t.Fatalf("ByFloatingIP = %q ok=%v", sid, ok)
