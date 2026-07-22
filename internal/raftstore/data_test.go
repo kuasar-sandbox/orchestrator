@@ -567,7 +567,14 @@ func readyRecord(starting clusterstate.RouteWorkflowRecord, eventSeq uint64) clu
 			DataEndpoint: binding.DataEndpoint, TargetPort: spec.TargetPort, AccessToken: spec.AccessToken,
 			TrafficAccessToken: "traffic-token", TemplateRef: spec.TemplateRef, RegistryGeneration: binding.RegistryGeneration,
 			BindingDigest: binding.BindingDigest, LastEventSeq: eventSeq, Intent: starting.Starting.Intent,
+			Presentation: testSandboxPresentation(),
 		},
+	}
+}
+
+func testSandboxPresentation() clusterstate.SandboxPresentationV1 {
+	return clusterstate.SandboxPresentationV1{
+		CPUCount: 2, MemoryMB: 2048, DiskSizeMB: 64, EnvdVersion: "0.6.1", StartedAt: 1, EndAt: 2,
 	}
 }
 

@@ -275,6 +275,7 @@ func stateScaleReadyRoute(
 			TargetPort: spec.TargetPort, AccessToken: spec.AccessToken, TrafficAccessToken: "traffic-token",
 			TemplateRef:        spec.TemplateRef,
 			RegistryGeneration: registryLayout.RegistryGeneration, BindingDigest: bindingDigest, LastEventSeq: 1, Intent: intent,
+			Presentation: testSandboxPresentation(),
 		},
 	}
 	return starting, ready, nil

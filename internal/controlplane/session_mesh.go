@@ -72,8 +72,8 @@ func NewSessionMesh(self string, directory *session.Directory, peers []SessionPe
 	}
 	byID := make(map[string]SessionPeer, len(peers))
 	for _, peer := range peers {
-		peer.Endpoint = strings.TrimRight(peer.Endpoint, "/")
-		if peer.MemberID == "" || peer.MemberID == self || peer.Endpoint == "" || peer.Client == nil {
+		if peer.MemberID == "" || peer.MemberID == self || peer.Endpoint == "" ||
+			strings.HasSuffix(peer.Endpoint, "/") || peer.Client == nil {
 			return nil, errors.New("controlplane: Session mesh peer is incomplete or local")
 		}
 		if _, duplicate := byID[peer.MemberID]; duplicate {

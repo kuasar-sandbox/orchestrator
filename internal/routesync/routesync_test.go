@@ -199,7 +199,9 @@ func TestRouteSyncRoundtrip(t *testing.T) {
 	src := &fakeSource{
 		sub:  make(chan routesync.Event, 4),
 		woke: make(chan routesync.RouteWake, 4),
-		pol:  routesync.Policy{Domain: "d", AuthMode: "enforce", ParkTimeoutMS: 1234},
+		pol: routesync.Policy{
+			Domain: "d", AuthMode: "enforce", ParkTimeoutMS: 1234, RequireRouterMTLS: true,
+		},
 	}
 	httpSrv := &http.Server{Handler: h2c.NewHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		reg, err := routesync.ReadRegister(r.Body)
@@ -227,7 +229,7 @@ func TestRouteSyncRoundtrip(t *testing.T) {
 	go routesync.NewSubscriber(dial, "px0", reg, sink, wakes, log).Run(ctx)
 
 	// Handshake policy, then the initial route set streams as upsert(s1) + bookmark.
-	if p := recv(t, sink.pol, "policy"); p.AuthMode != "enforce" || p.ParkTimeoutMS != 1234 {
+	if p := recv(t, sink.pol, "policy"); p.AuthMode != "enforce" || p.ParkTimeoutMS != 1234 || !p.RequireRouterMTLS {
 		t.Fatalf("policy = %+v", p)
 	}
 	recv(t, sink.begin, "begin-sync")

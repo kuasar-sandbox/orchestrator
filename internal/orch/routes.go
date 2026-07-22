@@ -259,9 +259,10 @@ func (o *Orchestrator) OnWake(ctx context.Context, wake routesync.RouteWake) {
 // Policy is the operational policy pushed to proxies at handshake.
 func (o *Orchestrator) Policy() routesync.Policy {
 	return routesync.Policy{
-		Domain:        o.cfg.API.Domain,
-		AuthMode:      o.cfg.Proxy.Auth,
-		ParkTimeoutMS: int(o.cfg.ParkTimeoutDur() / time.Millisecond),
+		Domain:            o.cfg.API.Domain,
+		AuthMode:          o.cfg.Proxy.Auth,
+		ParkTimeoutMS:     int(o.cfg.ParkTimeoutDur() / time.Millisecond),
+		RequireRouterMTLS: o.cfg.Cluster.NodeLink.Endpoint != "",
 	}
 }
 

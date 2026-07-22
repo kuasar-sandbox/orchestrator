@@ -147,8 +147,7 @@ func NewRemoteSystemClient(peers []SessionPeer) (*RemoteSystemClient, error) {
 	seen := make(map[string]struct{}, len(peers))
 	copyPeers := make([]SessionPeer, len(peers))
 	for index, peer := range peers {
-		peer.Endpoint = strings.TrimRight(peer.Endpoint, "/")
-		if peer.MemberID == "" || peer.Endpoint == "" || peer.Client == nil {
+		if peer.MemberID == "" || peer.Endpoint == "" || strings.HasSuffix(peer.Endpoint, "/") || peer.Client == nil {
 			return nil, errors.New("controlplane: incomplete remote System replica")
 		}
 		if _, duplicate := seen[peer.MemberID]; duplicate {

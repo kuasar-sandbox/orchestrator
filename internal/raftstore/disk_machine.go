@@ -308,7 +308,7 @@ func loadDataCommandRows(reader pebble.Reader, prefix []byte, state *DataState, 
 		if routeFound {
 			state.Routes[routeKey] = route
 		}
-	case DataBeginRecovery, DataFinalizeRecovery:
+	case DataBeginRecovery, DataResetRecoveryNode, DataFinalizeRecovery:
 		return loadAllRecoveryRows(reader, prefix, state)
 	case DataStageRecovery:
 		if command.RecoveryRecord == nil {
@@ -503,6 +503,20 @@ func persistDataCommandRow(batch *pebble.Batch, prefix []byte, state DataState, 
 			return setStateJSON(batch, stateRowKey(prefix, stateRouteTable, routeKey), route)
 		}
 		return nil
+	case DataResetRecoveryNode:
+		if err := batch.DeleteRange(
+			stateTablePrefix(prefix, stateRecoveryTable),
+			prefixUpperBound(stateTablePrefix(prefix, stateRecoveryTable)), nil,
+		); err != nil {
+			return err
+		}
+		if err := batch.DeleteRange(
+			stateTablePrefix(prefix, stateRecoveryClaimTable),
+			prefixUpperBound(stateTablePrefix(prefix, stateRecoveryClaimTable)), nil,
+		); err != nil {
+			return err
+		}
+		return persistRecoveryRows(batch, prefix, state)
 	case DataStageRecovery, DataAckRecovery, DataQuarantineRecovery:
 		return persistRecoveryRows(batch, prefix, state)
 	case DataActivateRecovery:

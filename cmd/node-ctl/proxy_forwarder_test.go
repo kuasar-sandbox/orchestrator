@@ -13,6 +13,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/kuasar-sandbox/orchestrator/internal/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/configsock"
 	"github.com/kuasar-sandbox/orchestrator/internal/metrics"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxy"
@@ -23,6 +24,25 @@ type connectStubRouter struct{ r proxy.Route }
 
 func (s connectStubRouter) Route(ctx context.Context, request proxy.RouteRequest) (proxy.Route, error) {
 	return s.r, nil
+}
+
+func TestExternalProxyClusterPolicyRequiresRouterMTLS(t *testing.T) {
+	policy := routesync.Policy{RequireRouterMTLS: true}
+	for _, test := range []struct {
+		name    string
+		cfg     config.ProxyFileConfig
+		wantErr bool
+	}{
+		{name: "UDS only", cfg: config.ProxyFileConfig{}},
+		{name: "incomplete TCP TLS", cfg: config.ProxyFileConfig{DataListen: ":443", TLS: config.TLSConfig{Cert: "cert", Key: "key"}}, wantErr: true},
+		{name: "Router mTLS", cfg: config.ProxyFileConfig{DataListen: ":443", TLS: config.TLSConfig{Cert: "cert", Key: "key", ClientCA: "ca"}}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if err := validateProxyPolicy(&test.cfg, policy); (err != nil) != test.wantErr {
+				t.Fatalf("validateProxyPolicy() error = %v, wantErr %v", err, test.wantErr)
+			}
+		})
+	}
 }
 
 // TestProxyForwarderConnectRelay drives a chained CONNECT end to end: client ->

@@ -311,8 +311,16 @@ func validateRecoveryDataCommand(state SystemState, command DataCommand) error {
 			start.SourceRegistryLayoutDigest != recovery.SourceRegistryLayoutDigest || start.Target != target {
 			return errors.New("raftstore: invalid data recovery initialization")
 		}
+	case DataResetRecoveryNode:
+		if recovery.Phase != RecoveryCollecting || command.RecoveryReset == nil ||
+			!recoveryCommandMatchesCollectingNode(recovery, command.RecoveryReset.NodeID,
+				command.RecoveryReset.NodeEpoch, command.RecoveryReset.SessionSeq) {
+			return errors.New("raftstore: recovery node staging reset is outside its COLLECTING session")
+		}
 	case DataStageRecovery:
-		if recovery.Phase != RecoveryCollecting || command.RecoveryRecord == nil {
+		if recovery.Phase != RecoveryCollecting || command.RecoveryRecord == nil ||
+			!recoveryCommandMatchesCollectingNode(recovery, command.RecoveryRecord.NodeID,
+				command.RecoveryRecord.NodeEpoch, command.RecoveryRecord.SessionSeq) {
 			return errors.New("raftstore: recovery report staging is outside COLLECTING")
 		}
 	case DataAckRecovery, DataActivateRecovery, DataQuarantineRecovery:
@@ -327,6 +335,12 @@ func validateRecoveryDataCommand(state SystemState, command DataCommand) error {
 		return fmt.Errorf("raftstore: command %q is not a recovery data mutation", command.Type)
 	}
 	return nil
+}
+
+func recoveryCommandMatchesCollectingNode(recovery RecoveryEpoch, nodeID string, nodeEpoch, sessionSeq uint64) bool {
+	progress, found := recovery.Nodes[nodeID]
+	return found && progress.State == RecoveryNodeCollecting && progress.NodeEpoch == nodeEpoch &&
+		progress.SessionSeq == sessionSeq
 }
 
 func recoveryTarget(recovery RecoveryEpoch) PermitIdentity {

@@ -495,6 +495,7 @@ func (s *RegistryService) ListRoutes(ctx context.Context, request routeapi.ListR
 	for _, record := range result.Routes {
 		routes = append(routes, routeapi.ListedRoute{
 			RouteKey: record.RouteKey, State: record.State, NodeID: record.NodeID, TemplateRef: record.TemplateRef,
+			Presentation: record.Presentation.Clone(),
 		})
 	}
 	sort.Slice(routes, func(i, j int) bool { return routes[i].RouteKey < routes[j].RouteKey })

@@ -51,6 +51,7 @@ const (
 	defaultCreateDelay = 10 * time.Millisecond
 	defaultBuildDelay  = 10 * time.Millisecond
 	headerAccessToken  = "X-Access-Token"
+	stubDiskSizeMB     = 1024
 )
 
 func main() {
@@ -1055,13 +1056,47 @@ func (n *stubNode) sandboxObject(ctx context.Context, record nodeexec.DispatchRe
 		!reflect.DeepEqual(create.Metadata, spec.Config) {
 		return nil, errors.Join(err, errors.New("Sandbox request envelope does not match dispatch spec"))
 	}
+	now := time.Now()
+	deadline := now.Unix()
+	if spec.TimeoutSeconds > 0 {
+		deadline = now.Add(time.Duration(spec.TimeoutSeconds) * time.Second).Unix()
+	}
 	return &types.Sandbox{
 		ID: record.ObjectID, TemplateID: spec.TemplateRef, State: types.StateStarting,
 		AuthKey: lease.AuthKey, ManifestKey: lease.ManifestKey,
 		EnvdAccessToken: spec.AccessToken, TrafficAccessToken: "traffic-" + record.ObjectID,
 		Metadata: clusterstate.WithoutSystemMetadata(create.Metadata), Env: create.EnvVars,
-		CreatedUnix: time.Now().Unix(),
+		CreatedUnix: now.Unix(), DeadlineUnix: deadline,
 	}, nil
+}
+
+func stubSandboxPresentation(
+	record *nodeexec.WorkflowRecord,
+	sandbox *types.Sandbox,
+) (*clusterstate.SandboxPresentationV1, error) {
+	if record == nil || sandbox == nil {
+		return nil, errors.New("stub Sandbox presentation requires a workflow and object")
+	}
+	normalized, err := placement.ParseNormalizedDemand(record.NormalizedDemand)
+	if err != nil || normalized.Sandbox == nil {
+		return nil, errors.Join(err, errors.New("stub Sandbox presentation requires normalized demand"))
+	}
+	memoryBytes := max(
+		normalized.Sandbox.StartupBudgetMemory,
+		normalized.Sandbox.FloorMemory,
+		normalized.Sandbox.AllocatableAtSnapshot,
+		uint64(1<<30),
+	)
+	end := sandbox.DeadlineUnix
+	if end < sandbox.CreatedUnix {
+		end = sandbox.CreatedUnix
+	}
+	presentation := &clusterstate.SandboxPresentationV1{
+		CPUCount: 1, MemoryMB: int(memoryBytes >> 20), DiskSizeMB: stubDiskSizeMB,
+		EnvdVersion: api.EnvdVersion(sandbox.Profile()), StartedAt: sandbox.CreatedUnix, EndAt: end,
+		Metadata: clusterstate.WithoutSystemMetadata(sandbox.Metadata),
+	}
+	return presentation, presentation.Validate()
 }
 
 func (n *stubNode) sandboxDemand(ctx context.Context, record nodeexec.DispatchRecord) (nodectl.SandboxAdmissionDemand, error) {
@@ -1184,8 +1219,12 @@ func (n *stubNode) executeSandbox(ctx context.Context, record *nodeexec.Workflow
 		}
 		return n.authority.ReleaseSandboxResources(ctx, terminal, "stub create rejected")
 	}
+	presentation, err := stubSandboxPresentation(claimed, sandbox)
+	if err != nil {
+		return err
+	}
 	committed, err := n.store.CommitSandboxEvent(ctx, sandbox, nodeexec.EventUpdate{
-		State: string(clusterstate.WorkflowRouteReady), TargetPort: spec.TargetPort,
+		State: string(clusterstate.WorkflowRouteReady), TargetPort: spec.TargetPort, Presentation: presentation,
 	})
 	if err != nil {
 		return err
@@ -1473,8 +1512,12 @@ func (n *stubNode) resumeFinalSandbox(ctx context.Context, sandboxID string) err
 	if err != nil {
 		return err
 	}
+	presentation, err := stubSandboxPresentation(record, sandbox)
+	if err != nil {
+		return err
+	}
 	_, err = n.store.CommitSandboxEvent(ctx, sandbox, nodeexec.EventUpdate{
-		State: string(clusterstate.WorkflowRouteReady), TargetPort: spec.TargetPort,
+		State: string(clusterstate.WorkflowRouteReady), TargetPort: spec.TargetPort, Presentation: presentation,
 	})
 	if err == nil {
 		n.mu.Lock()
@@ -1599,7 +1642,16 @@ func recoveryObjectSnapshot(event routesync.ExecutionEvent) routesync.RecoveryOb
 		TrafficAccessToken: event.TrafficAccessToken, TemplateRef: event.TemplateRef,
 		SnapshotRef: event.SnapshotRef, SnapshotLocation: event.SnapshotLocation,
 		ArtifactRef: event.ArtifactRef, Reason: event.Reason,
+		Presentation: cloneStubPresentation(event.Presentation),
 	}
+}
+
+func cloneStubPresentation(source *clusterstate.SandboxPresentationV1) *clusterstate.SandboxPresentationV1 {
+	if source == nil {
+		return nil
+	}
+	clone := source.Clone()
+	return &clone
 }
 
 func (n *stubNode) collectFinalRecovery(ctx context.Context, command *routesync.Command) (*routesync.RecoveryReportPage, error) {

@@ -26,9 +26,9 @@ func TestRecoveryExecutionReportRejectsForgedUserMetadataAsAuthority(t *testing.
 	if _, err := store.ClaimSandboxWorkflow(ctx, managed.ObjectID, managed.DemandDigest, decision.ReservationToken); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.CommitSandboxEvent(ctx, workflowSandbox(managed.ObjectID), nodeexec.EventUpdate{
+	if _, err := store.CommitSandboxEvent(ctx, workflowSandbox(managed.ObjectID), sandboxEvent(nodeexec.EventUpdate{
 		State: string(clusterstate.WorkflowRouteReady),
-	}); err != nil {
+	})); err != nil {
 		t.Fatal(err)
 	}
 

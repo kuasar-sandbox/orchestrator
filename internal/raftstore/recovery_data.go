@@ -211,6 +211,22 @@ type RecoveryFinalization struct {
 	SourceRegistryLayoutDigest string `json:"source_registry_layout_digest"`
 }
 
+// RecoveryNodeStagingReset replaces the uncommitted report projection for one
+// node while the System Group still records that node as COLLECTING.
+type RecoveryNodeStagingReset struct {
+	RecoveryEpoch uint64 `json:"recovery_epoch"`
+	NodeID        string `json:"node_id"`
+	NodeEpoch     uint64 `json:"node_epoch"`
+	SessionSeq    uint64 `json:"session_seq"`
+}
+
+func (r RecoveryNodeStagingReset) Validate(recovery DataRecoveryState) error {
+	if r.RecoveryEpoch != recovery.RecoveryEpoch || r.NodeID == "" || r.NodeEpoch == 0 || r.SessionSeq == 0 {
+		return errors.New("raftstore: incomplete recovery node staging reset")
+	}
+	return nil
+}
+
 func beginDataRecovery(state *DataState, identity ShardRequestIdentity, recovery DataRecoveryState) error {
 	if state != nil && state.Recovery != nil && *state.Recovery == recovery && identity.ShardID == state.ShardID &&
 		identity.PermitIdentity == recovery.Target {
@@ -225,6 +241,54 @@ func beginDataRecovery(state *DataState, identity ShardRequestIdentity, recovery
 	}
 	copy := recovery
 	state.Recovery = &copy
+	return nil
+}
+
+func resetRecoveryNodeStaging(
+	state *DataState,
+	index uint64,
+	identity ShardRequestIdentity,
+	reset RecoveryNodeStagingReset,
+) error {
+	if !dataRecoveryAccepts(state, identity) || reset.Validate(*state.Recovery) != nil {
+		return errors.New("raftstore: invalid recovery node staging reset")
+	}
+	for _, record := range state.RecoveryRecords {
+		if record.State != RecoveryObjectStaged && record.State != RecoveryObjectQuarantined {
+			return errors.New("raftstore: recovery node staging reset follows reconciliation")
+		}
+	}
+	for key, record := range state.RecoveryRecords {
+		if record.NodeID == reset.NodeID && record.NodeEpoch == reset.NodeEpoch {
+			delete(state.RecoveryRecords, key)
+		}
+	}
+
+	// Removing one claimant can resolve quarantines on other nodes. Rebuild all
+	// claims in stable order so every replica derives the same surviving owner.
+	state.RecoveryClaims = make(map[string]string)
+	keys := make([]string, 0, len(state.RecoveryRecords))
+	for key := range state.RecoveryRecords {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		record := cloneRecoveryRecord(state.RecoveryRecords[key])
+		record.State = RecoveryObjectStaged
+		record.QuarantineReason = ""
+		record.ConflictingReportDigests = nil
+		record.Revision = revisionFor(*state, index)
+		state.RecoveryRecords[key] = record
+		claim := recoveryClaimKey(record)
+		ownerKey, found := state.RecoveryClaims[claim]
+		if !found {
+			state.RecoveryClaims[claim] = key
+			continue
+		}
+		owner := state.RecoveryRecords[ownerKey]
+		quarantineRecoveryConflict(state, index, ownerKey, record.ReportDigest, "conflicting claims for one logical object")
+		quarantineRecoveryConflict(state, index, key, owner.ReportDigest, "conflicting claims for one logical object")
+	}
 	return nil
 }
 

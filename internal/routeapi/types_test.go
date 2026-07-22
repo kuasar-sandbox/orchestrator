@@ -312,6 +312,9 @@ func testReadyRoute() *clusterstate.ReadyRoute {
 		TargetPort: 3000, AccessToken: "token", TrafficAccessToken: "traffic-token",
 		TemplateRef: templateRef, RegistryGeneration: "g1",
 		BindingDigest: hex.EncodeToString(digest[:]), LastEventSeq: 3, Intent: intent,
+		Presentation: clusterstate.SandboxPresentationV1{
+			CPUCount: 2, MemoryMB: 2048, DiskSizeMB: 64, EnvdVersion: "0.6.1", StartedAt: 1, EndAt: 2,
+		},
 	}
 }
 

@@ -81,9 +81,9 @@ func TestCASExecutionBindingAtomicallyRebindsWorkflowOutbox(t *testing.T) {
 	if _, err := st.ClaimSandboxWorkflow(ctx, dispatch.ObjectID, dispatch.DemandDigest, decision.ReservationToken); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.CommitSandboxEvent(ctx, workflowSandbox(dispatch.ObjectID), nodeexec.EventUpdate{
+	if _, err := st.CommitSandboxEvent(ctx, workflowSandbox(dispatch.ObjectID), sandboxEvent(nodeexec.EventUpdate{
 		State: string(clusterstate.WorkflowRouteReady),
-	}); err != nil {
+	})); err != nil {
 		t.Fatal(err)
 	}
 	select {

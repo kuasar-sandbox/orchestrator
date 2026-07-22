@@ -45,6 +45,8 @@ const (
 	pendingBuildForwardWait  = 30 * time.Second
 )
 
+var errRouteNotFound = errors.New("finalrouter: Route does not exist")
+
 type ControlPlane interface {
 	CurrentServeIdentity(bool) (routeapi.RegistryServeIdentity, error)
 	CacheAuthorized(routeapi.RegistryServeIdentity) bool
@@ -318,7 +320,7 @@ func (r *Router) createSandbox(w http.ResponseWriter, request *http.Request) {
 		"sandboxID": routeKey, "routeKey": routeKey, "clientID": route.NodeID,
 		"accessToken": route.AccessToken, "envdAccessToken": route.AccessToken,
 		"trafficAccessToken": route.TrafficAccessToken, "domain": r.domain,
-		"templateID": route.TemplateRef,
+		"templateID": route.TemplateRef, "envdVersion": route.Presentation.EnvdVersion,
 	})
 }
 
@@ -397,10 +399,18 @@ func (r *Router) listSandboxes(w http.ResponseWriter, request *http.Request) {
 		items = append(items, map[string]any{
 			"sandboxID": route.RouteKey, "clientID": route.NodeID,
 			"templateID": route.TemplateRef, "state": state,
+			"cpuCount": route.Presentation.CPUCount, "memoryMB": route.Presentation.MemoryMB,
+			"diskSizeMB": route.Presentation.DiskSizeMB, "envdVersion": route.Presentation.EnvdVersion,
+			"startedAt": presentationTime(route.Presentation.StartedAt),
+			"endAt":     presentationTime(route.Presentation.EndAt), "metadata": route.Presentation.Metadata,
 		})
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(items)
+}
+
+func presentationTime(unixSeconds int64) string {
+	return time.Unix(unixSeconds, 0).UTC().Format(time.RFC3339)
 }
 
 func (r *Router) sandboxControl(w http.ResponseWriter, request *http.Request) {
@@ -462,7 +472,11 @@ func (r *Router) sandboxControl(w http.ResponseWriter, request *http.Request) {
 		entry, err = r.resolveControlRoute(request.Context(), group, routeKey)
 	}
 	if err != nil || entry == nil {
-		http.Error(w, "sandbox not found", http.StatusNotFound)
+		if errors.Is(err, errRouteNotFound) {
+			http.Error(w, "sandbox not found", http.StatusNotFound)
+			return
+		}
+		http.Error(w, "sandbox unavailable", http.StatusServiceUnavailable)
 		return
 	}
 	r.forwardNodeControl(w, request, entry, nil)
@@ -1045,7 +1059,13 @@ func (r *Router) resolveControlRoute(ctx context.Context, group, routeKey string
 		return cached, nil
 	}
 	result, err := r.control.ReadAddressableRoute(ctx, group, routeKey, r.minimumRouteRevision(group, routeKey))
-	if err != nil || result.Response.Outcome != routeapi.ReadReady || result.Response.Route == nil {
+	if err != nil {
+		return nil, fmt.Errorf("read addressable Route: %w", err)
+	}
+	if result.Response.Outcome == routeapi.ReadNotFound {
+		return nil, errRouteNotFound
+	}
+	if result.Response.Outcome != routeapi.ReadReady || result.Response.Route == nil {
 		return nil, errors.New("Route has no addressable execution")
 	}
 	entry := &routeEntry{

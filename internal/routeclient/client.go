@@ -109,7 +109,6 @@ func New(registryLayout raftstore.RegistryLayout, digest string, endpoints []End
 	byID := make(map[string]Endpoint, len(endpoints))
 	for _, endpoint := range endpoints {
 		member, found := registryLayoutMember(registryLayout, endpoint.MemberID)
-		endpoint.BaseURL = strings.TrimRight(endpoint.BaseURL, "/")
 		if !found || endpoint.BaseURL != member.InternalEndpoint || endpoint.Client == nil {
 			return nil, errors.New("routeclient: endpoint is not an exact registryLayout member")
 		}

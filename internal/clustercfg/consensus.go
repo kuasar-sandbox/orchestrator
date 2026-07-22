@@ -5,12 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net/url"
 	"os"
 	"path/filepath"
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 )
 
 type RegistryLayoutArtifacts struct {
@@ -47,9 +48,8 @@ func (s EndpointSet) Validate(name string) error {
 	}
 	seen := make(map[string]struct{}, len(s.Endpoints))
 	for _, endpoint := range s.Endpoints {
-		u, err := url.Parse(endpoint.Endpoint)
-		if endpoint.Name == "" || err != nil || u.Scheme != "https" || u.Host == "" {
-			return fmt.Errorf("clustercfg: %s endpoint must have a name and HTTPS URL", name)
+		if endpoint.Name == "" || clusterstate.ValidateCanonicalHTTPSBaseEndpoint(endpoint.Endpoint) != nil {
+			return fmt.Errorf("clustercfg: %s endpoint must have a name and canonical HTTPS base URL", name)
 		}
 		if _, duplicate := seen[endpoint.Name]; duplicate {
 			return fmt.Errorf("clustercfg: duplicate %s endpoint %q", name, endpoint.Name)

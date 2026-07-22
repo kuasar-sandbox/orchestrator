@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"hash"
 
+	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/placementproto"
 )
 
@@ -128,15 +129,16 @@ type RecoveryObjectSnapshot struct {
 	EventSeq           uint64 `json:"event_seq,omitempty"`
 	State              string `json:"state"`
 
-	DataEndpoint       string `json:"data_endpoint,omitempty"`
-	TargetPort         int    `json:"target_port,omitempty"`
-	AccessToken        string `json:"access_token,omitempty"`
-	TrafficAccessToken string `json:"traffic_access_token,omitempty"`
-	TemplateRef        string `json:"template_ref,omitempty"`
-	SnapshotRef        string `json:"snapshot_ref,omitempty"`
-	SnapshotLocation   string `json:"snapshot_location,omitempty"`
-	ArtifactRef        string `json:"artifact_ref,omitempty"`
-	Reason             string `json:"reason,omitempty"`
+	DataEndpoint       string                              `json:"data_endpoint,omitempty"`
+	TargetPort         int                                 `json:"target_port,omitempty"`
+	AccessToken        string                              `json:"access_token,omitempty"`
+	TrafficAccessToken string                              `json:"traffic_access_token,omitempty"`
+	TemplateRef        string                              `json:"template_ref,omitempty"`
+	SnapshotRef        string                              `json:"snapshot_ref,omitempty"`
+	SnapshotLocation   string                              `json:"snapshot_location,omitempty"`
+	ArtifactRef        string                              `json:"artifact_ref,omitempty"`
+	Reason             string                              `json:"reason,omitempty"`
+	Presentation       *clusterstate.SandboxPresentationV1 `json:"presentation,omitempty"`
 }
 
 func (s RecoveryObjectSnapshot) Validate() error {
@@ -148,6 +150,11 @@ func (s RecoveryObjectSnapshot) Validate() error {
 	}
 	if s.ObjectKind == "sandbox" && s.EventSeq == 0 || s.ObjectKind == "build" && s.EventSeq != 0 {
 		return errors.New("routesync: recovery event sequence is valid only for Sandbox snapshots")
+	}
+	if s.ObjectKind == "sandbox" && (s.State == string(clusterstate.WorkflowRouteReady) ||
+		s.State == string(clusterstate.WorkflowRoutePaused)) &&
+		(s.Presentation == nil || s.Presentation.Validate() != nil) {
+		return errors.New("routesync: live Sandbox recovery snapshot requires a valid presentation")
 	}
 	digest, err := hex.DecodeString(s.BindingDigest)
 	if err != nil || len(digest) != sha256.Size || s.Binding == "" {
@@ -338,15 +345,16 @@ type ExecutionEvent struct {
 	EventSeq           uint64 `json:"event_seq"`
 	State              string `json:"state"`
 
-	DataEndpoint       string `json:"data_endpoint,omitempty"`
-	TargetPort         int    `json:"target_port,omitempty"`
-	AccessToken        string `json:"access_token,omitempty"`
-	TrafficAccessToken string `json:"traffic_access_token,omitempty"`
-	TemplateRef        string `json:"template_ref,omitempty"`
-	SnapshotRef        string `json:"snapshot_ref,omitempty"`
-	SnapshotLocation   string `json:"snapshot_location,omitempty"`
-	ArtifactRef        string `json:"artifact_ref,omitempty"`
-	Reason             string `json:"reason,omitempty"`
+	DataEndpoint       string                              `json:"data_endpoint,omitempty"`
+	TargetPort         int                                 `json:"target_port,omitempty"`
+	AccessToken        string                              `json:"access_token,omitempty"`
+	TrafficAccessToken string                              `json:"traffic_access_token,omitempty"`
+	TemplateRef        string                              `json:"template_ref,omitempty"`
+	SnapshotRef        string                              `json:"snapshot_ref,omitempty"`
+	SnapshotLocation   string                              `json:"snapshot_location,omitempty"`
+	ArtifactRef        string                              `json:"artifact_ref,omitempty"`
+	Reason             string                              `json:"reason,omitempty"`
+	Presentation       *clusterstate.SandboxPresentationV1 `json:"presentation,omitempty"`
 }
 
 const MaxExecutionEventBytes = 256 << 10
@@ -358,6 +366,10 @@ func (e ExecutionEvent) Validate() error {
 	}
 	if e.ObjectKind != "sandbox" {
 		return errors.New("routesync: only Sandbox execution events are valid")
+	}
+	if (e.State == string(clusterstate.WorkflowRouteReady) || e.State == string(clusterstate.WorkflowRoutePaused)) &&
+		(e.Presentation == nil || e.Presentation.Validate() != nil) {
+		return errors.New("routesync: live Sandbox event requires a valid presentation")
 	}
 	digest, err := hex.DecodeString(e.BindingDigest)
 	if err != nil || len(digest) != 32 || e.Binding == "" {

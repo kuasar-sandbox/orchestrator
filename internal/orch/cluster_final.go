@@ -455,7 +455,16 @@ func recoveryObjectFromEvent(event routesync.ExecutionEvent) routesync.RecoveryO
 		TrafficAccessToken: event.TrafficAccessToken, TemplateRef: event.TemplateRef,
 		SnapshotRef: event.SnapshotRef, SnapshotLocation: event.SnapshotLocation,
 		ArtifactRef: event.ArtifactRef, Reason: event.Reason,
+		Presentation: cloneSandboxPresentation(event.Presentation),
 	}
+}
+
+func cloneSandboxPresentation(source *clusterstate.SandboxPresentationV1) *clusterstate.SandboxPresentationV1 {
+	if source == nil {
+		return nil
+	}
+	clone := source.Clone()
+	return &clone
 }
 
 func (n *FinalClusterNode) ackRecoveryEvent(ctx context.Context, command *routesync.Command) (*nodeexec.WorkflowRecord, error) {
@@ -616,7 +625,7 @@ func (n *FinalClusterNode) executeSandbox(ctx context.Context, record *nodeexec.
 		return n.failSandbox(ctx, claimed, nil, errors.New("accepted Sandbox object is missing"))
 	}
 	if existing != nil && existing.State == types.StateRunning && existing.RunID != "" && n.core.unitActive(ctx, n.core.runnerUnit(existing.RunID)) {
-		_, err = n.store.CommitSandboxEvent(ctx, existing, nodeexec.EventUpdate{
+		_, err = n.commitSandboxEvent(ctx, existing, nodeexec.EventUpdate{
 			State: string(clusterstate.WorkflowRouteReady), TargetPort: spec.TargetPort,
 		})
 		if err == nil {
@@ -634,7 +643,7 @@ func (n *FinalClusterNode) executeSandbox(ctx context.Context, record *nodeexec.
 		n.core.teardown(context.Background(), sandbox)
 		return n.failSandbox(ctx, claimed, sandbox, err)
 	}
-	if _, err := n.store.CommitSandboxEvent(ctx, sandbox, nodeexec.EventUpdate{
+	if _, err := n.commitSandboxEvent(ctx, sandbox, nodeexec.EventUpdate{
 		State: string(clusterstate.WorkflowRouteReady), TargetPort: spec.TargetPort,
 	}); err != nil {
 		return err
@@ -710,7 +719,7 @@ func (n *FinalClusterNode) failSandbox(ctx context.Context, record *nodeexec.Wor
 		}
 		return cause
 	}
-	terminal, err := n.store.CommitSandboxEvent(ctx, sandbox, nodeexec.EventUpdate{State: "ERROR", Reason: reason})
+	terminal, err := n.commitSandboxEvent(ctx, sandbox, nodeexec.EventUpdate{State: "ERROR", Reason: reason})
 	if err != nil {
 		return errors.Join(cause, err)
 	}
@@ -770,7 +779,7 @@ func (n *FinalClusterNode) resumeSandboxSync(ctx context.Context, command *route
 	}
 	if sandbox.State == types.StatePaused {
 		if err := n.core.resume(ctx, sandbox); err != nil {
-			return n.failSandbox(ctx, record, sandbox, err)
+			return n.failResumedSandbox(ctx, record, sandbox, err)
 		}
 		sandbox, err = n.store.Get(ctx, command.SID)
 		if err != nil {
@@ -781,10 +790,34 @@ func (n *FinalClusterNode) resumeSandboxSync(ctx context.Context, command *route
 	if err != nil {
 		return err
 	}
-	_, err = n.store.CommitSandboxEvent(ctx, sandbox, nodeexec.EventUpdate{
+	_, err = n.commitSandboxEvent(ctx, sandbox, nodeexec.EventUpdate{
 		State: string(clusterstate.WorkflowRouteReady), TargetPort: spec.TargetPort,
 	})
 	return err
+}
+
+func (n *FinalClusterNode) failResumedSandbox(
+	ctx context.Context,
+	record *nodeexec.WorkflowRecord,
+	fallback *types.Sandbox,
+	cause error,
+) error {
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
+	current, loadErr := n.store.Get(cleanupCtx, record.ObjectID)
+	if current == nil {
+		current = n.core.lookup(record.ObjectID)
+	}
+	if current == nil {
+		current = fallback
+	}
+	if current != nil {
+		n.core.teardown(cleanupCtx, current)
+	}
+	if loadErr != nil {
+		cause = errors.Join(cause, fmt.Errorf("reload failed resumed Sandbox: %w", loadErr))
+	}
+	return n.failSandbox(cleanupCtx, record, current, cause)
 }
 
 func (n *FinalClusterNode) deleteSandbox(ctx context.Context, command *routesync.Command) {
@@ -811,7 +844,7 @@ func (n *FinalClusterNode) deleteSandboxSync(ctx context.Context, command *route
 		return errors.Join(err, errWrongExecutionBinding)
 	}
 	n.core.teardown(ctx, sandbox)
-	terminal, err := n.store.CommitSandboxEvent(ctx, sandbox, nodeexec.EventUpdate{State: "DELETED"})
+	terminal, err := n.commitSandboxEvent(ctx, sandbox, nodeexec.EventUpdate{State: "DELETED"})
 	if err != nil {
 		return err
 	}
@@ -819,6 +852,30 @@ func (n *FinalClusterNode) deleteSandboxSync(ctx context.Context, command *route
 	projectionErr := n.core.publishDeleteContext(ctx, command.SID)
 	releaseErr := n.authority.ReleaseSandboxResources(ctx, terminal, "deleted")
 	return errors.Join(projectionErr, releaseErr)
+}
+
+func (n *FinalClusterNode) commitSandboxEvent(
+	ctx context.Context,
+	sandbox *types.Sandbox,
+	update nodeexec.EventUpdate,
+) (*nodeexec.WorkflowRecord, error) {
+	if update.State == string(clusterstate.WorkflowRouteReady) ||
+		update.State == string(clusterstate.WorkflowRoutePaused) {
+		workflow, err := n.store.GetNodeWorkflow(ctx, clusterstate.ExecutionKindSandbox, sandbox.ID)
+		if err != nil || workflow == nil {
+			return nil, errors.Join(err, nodeexec.ErrWorkflowMissing)
+		}
+		var previous *clusterstate.SandboxPresentationV1
+		if workflow.LatestEvent != nil {
+			previous = workflow.LatestEvent.Presentation
+		}
+		presentation, err := n.core.sandboxPresentation(sandbox, previous)
+		if err != nil {
+			return nil, err
+		}
+		update.Presentation = &presentation
+	}
+	return n.store.CommitSandboxEvent(ctx, sandbox, update)
 }
 
 func (n *FinalClusterNode) sandboxDemand(ctx context.Context, record nodeexec.DispatchRecord) (nodectl.SandboxAdmissionDemand, error) {

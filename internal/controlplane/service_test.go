@@ -102,6 +102,9 @@ func TestRegistryReadyPositiveReadStillChecksImmutableSandboxRequest(t *testing.
 		State: string(clusterstate.WorkflowRouteReady), DataEndpoint: binding.DataEndpoint,
 		TargetPort: 3000, AccessToken: "access", TrafficAccessToken: "traffic",
 		TemplateRef: "e2b-img-" + strings.Repeat("c", 64),
+		Presentation: &clusterstate.SandboxPresentationV1{
+			CPUCount: 2, MemoryMB: 2048, DiskSizeMB: 64, EnvdVersion: "0.6.1", StartedAt: 1, EndAt: 2,
+		},
 	}); err != nil {
 		t.Fatal(err)
 	}

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -15,6 +16,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -88,6 +90,24 @@ func runProxyMaster(ctx context.Context, cfgPath string, cfg *config.ProxyFileCo
 	}
 	defer forwardLn.Close()
 
+	reg := routesync.Register{
+		Subscribe: &routesync.Subscribe{Kind: routesync.KindRouteWake},
+		Proxy:     &routesync.Proxy{Socket: routesync.Socket{Path: cfg.ProxySocket}},
+		Mmds:      cfg.MMDSListen != "",
+	}
+	dial := func(ctx context.Context) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, "unix", cfg.ConfigSocket)
+	}
+	policyGate := newProxyPolicyGate(view, cfg)
+	go routesync.NewSubscriber(dial, proxyPluginID, reg, policyGate, view, log).Run(ctx)
+	select {
+	case <-ctx.Done():
+		return nil
+	case err := <-policyGate.fatal:
+		return err
+	case <-policyGate.ready:
+	}
+
 	var dataLn net.Listener
 	if cfg.DataListen != "" {
 		dataLn, err = net.Listen("tcp", cfg.DataListen)
@@ -115,16 +135,6 @@ func runProxyMaster(ctx context.Context, cfgPath string, cfg *config.ProxyFileCo
 		go superviseProxyWorker(ctx, i, cfgPath, cfg, proxyNS, dataLn, forwardLn, mmdsLn, view, mx, log)
 	}
 
-	reg := routesync.Register{
-		Subscribe: &routesync.Subscribe{Kind: routesync.KindRouteWake},
-		Proxy:     &routesync.Proxy{Socket: routesync.Socket{Path: cfg.ProxySocket}},
-		Mmds:      cfg.MMDSListen != "",
-	}
-	dial := func(ctx context.Context) (net.Conn, error) {
-		return (&net.Dialer{}).DialContext(ctx, "unix", cfg.ConfigSocket)
-	}
-	go routesync.NewSubscriber(dial, proxyPluginID, reg, view, view, log).Run(ctx)
-
 	log.Info("node-ctl proxy master serving",
 		"workers", cfg.Workers,
 		"data_listen", cfg.DataListen,
@@ -135,7 +145,48 @@ func runProxyMaster(ctx context.Context, cfgPath string, cfg *config.ProxyFileCo
 		"shm_path", cfg.ShmPath,
 		"route_capacity", cfg.RouteCapacity,
 	)
-	<-ctx.Done()
+	select {
+	case <-ctx.Done():
+		return nil
+	case err := <-policyGate.fatal:
+		return err
+	}
+}
+
+type proxyPolicyGate struct {
+	*proxyshm.MasterView
+	cfg       *config.ProxyFileConfig
+	ready     chan struct{}
+	fatal     chan error
+	readyOnce sync.Once
+	fatalOnce sync.Once
+}
+
+func newProxyPolicyGate(view *proxyshm.MasterView, cfg *config.ProxyFileConfig) *proxyPolicyGate {
+	return &proxyPolicyGate{
+		MasterView: view, cfg: cfg, ready: make(chan struct{}), fatal: make(chan error, 1),
+	}
+}
+
+func (g *proxyPolicyGate) SetPolicy(policy routesync.Policy) {
+	if err := validateProxyPolicy(g.cfg, policy); err != nil {
+		g.fatalOnce.Do(func() { g.fatal <- err })
+		return
+	}
+	g.MasterView.SetPolicy(policy)
+	g.readyOnce.Do(func() { close(g.ready) })
+}
+
+func validateProxyPolicy(cfg *config.ProxyFileConfig, policy routesync.Policy) error {
+	if cfg == nil {
+		return errors.New("proxy: missing proxy configuration")
+	}
+	if !policy.RequireRouterMTLS || cfg.DataListen == "" {
+		return nil
+	}
+	if cfg.TLS.Cert == "" || cfg.TLS.Key == "" || cfg.TLS.ClientCA == "" {
+		return errors.New("proxy: cluster data listener requires TLS cert, key, and Router client CA")
+	}
 	return nil
 }
 

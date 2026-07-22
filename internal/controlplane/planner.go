@@ -61,8 +61,7 @@ func NewHTTPPlacementPlanner(endpoints []PlannerEndpoint) (*HTTPPlacementPlanner
 	seen := make(map[string]struct{}, len(endpoints))
 	copyEndpoints := make([]PlannerEndpoint, len(endpoints))
 	for index, endpoint := range endpoints {
-		endpoint.Endpoint = strings.TrimRight(endpoint.Endpoint, "/")
-		if endpoint.Name == "" || endpoint.Endpoint == "" || endpoint.Client == nil {
+		if endpoint.Name == "" || endpoint.Endpoint == "" || strings.HasSuffix(endpoint.Endpoint, "/") || endpoint.Client == nil {
 			return nil, errors.New("controlplane: incomplete Placer endpoint")
 		}
 		if _, duplicate := seen[endpoint.Name]; duplicate {

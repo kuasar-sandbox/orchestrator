@@ -128,7 +128,8 @@ func validateDataCommandEnvelope(command DataCommand) error {
 	pointers := countPresent(
 		command.Bootstrap != nil, command.Epoch != nil, command.Route != nil, command.Build != nil,
 		command.Fence != nil, command.Compaction != nil, command.RecoveryStart != nil,
-		command.RecoveryRecord != nil, command.RecoveryUpdate != nil, command.RecoveryFinal != nil,
+		command.RecoveryReset != nil, command.RecoveryRecord != nil, command.RecoveryUpdate != nil,
+		command.RecoveryFinal != nil,
 	)
 	hasReplicas := len(command.ReplicaIDs) != 0
 	hasExpectation := command.Expect.Absent || command.Expect.LogIndex != 0
@@ -165,6 +166,10 @@ func validateDataCommandEnvelope(command DataCommand) error {
 	case DataBeginRecovery:
 		if pointers != 1 || command.RecoveryStart == nil || hasReplicas || hasExpectation {
 			return errors.New("raftstore: malformed data recovery start command")
+		}
+	case DataResetRecoveryNode:
+		if pointers != 1 || command.RecoveryReset == nil || hasReplicas || hasExpectation {
+			return errors.New("raftstore: malformed recovery node staging reset command")
 		}
 	case DataStageRecovery:
 		if pointers != 1 || command.RecoveryRecord == nil || hasReplicas || hasExpectation {

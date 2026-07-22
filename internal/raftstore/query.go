@@ -411,10 +411,11 @@ func (q RouteBucketLookup) Validate() error {
 }
 
 type RouteBucketEntry struct {
-	RouteKey    string                          `json:"route_key"`
-	State       clusterstate.RouteWorkflowState `json:"state"`
-	NodeID      string                          `json:"node_id"`
-	TemplateRef string                          `json:"template_ref"`
+	RouteKey     string                             `json:"route_key"`
+	State        clusterstate.RouteWorkflowState    `json:"state"`
+	NodeID       string                             `json:"node_id"`
+	TemplateRef  string                             `json:"template_ref"`
+	Presentation clusterstate.SandboxPresentationV1 `json:"presentation"`
 }
 
 type RouteBucketResult struct {
@@ -507,6 +508,7 @@ func routeBucketEntry(record clusterstate.RouteWorkflowRecord) (RouteBucketEntry
 	return RouteBucketEntry{
 		RouteKey: record.RouteKey, State: record.State,
 		NodeID: execution.NodeID, TemplateRef: execution.TemplateRef,
+		Presentation: execution.Presentation.Clone(),
 	}, true
 }
 

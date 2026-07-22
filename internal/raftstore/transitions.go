@@ -48,6 +48,7 @@ func validateRouteTransition(
 		}
 		if next.State == clusterstate.WorkflowRouteDeleting &&
 			sameReadyExecution(*current.Ready, next.Deleting.Execution) &&
+			sameReadyPresentation(*current.Ready, next.Deleting.Execution) &&
 			next.Deleting.Execution.LastEventSeq >= current.Ready.LastEventSeq {
 			return nil
 		}
@@ -60,12 +61,14 @@ func validateRouteTransition(
 		}
 		if next.State == clusterstate.WorkflowRouteResuming &&
 			sameReadyExecution(current.Paused.Execution, next.Resuming.Execution) &&
+			sameReadyPresentation(current.Paused.Execution, next.Resuming.Execution) &&
 			reflect.DeepEqual(current.Paused.ResumeIntent, next.Resuming.Intent) &&
 			next.Resuming.Execution.LastEventSeq >= current.Paused.Execution.LastEventSeq {
 			return nil
 		}
 		if next.State == clusterstate.WorkflowRouteDeleting &&
 			sameReadyExecution(current.Paused.Execution, next.Deleting.Execution) &&
+			sameReadyPresentation(current.Paused.Execution, next.Deleting.Execution) &&
 			next.Deleting.Execution.LastEventSeq >= current.Paused.Execution.LastEventSeq {
 			return nil
 		}
@@ -85,6 +88,7 @@ func validateRouteTransition(
 		}
 		if next.State == clusterstate.WorkflowRouteDeleting &&
 			sameReadyExecution(current.Resuming.Execution, next.Deleting.Execution) &&
+			sameReadyPresentation(current.Resuming.Execution, next.Deleting.Execution) &&
 			next.Deleting.Execution.LastEventSeq >= current.Resuming.Execution.LastEventSeq {
 			return nil
 		}
@@ -144,6 +148,7 @@ func validateSameRouteState(
 			return errors.New("raftstore: READY appended a workflow finalization")
 		}
 		if !sameReadyExecution(*current.Ready, *next.Ready) ||
+			!validPresentationEventAdvance(*current.Ready, *next.Ready) ||
 			current.Ready.LastEventSeq > next.Ready.LastEventSeq {
 			return errors.New("raftstore: READY execution changed or event sequence regressed")
 		}
@@ -154,7 +159,10 @@ func validateSameRouteState(
 		}
 		currentCopy, nextCopy := *current.Paused, *next.Paused
 		currentCopy.Execution.LastEventSeq, nextCopy.Execution.LastEventSeq = 0, 0
+		currentCopy.Execution.Presentation = clusterstate.SandboxPresentationV1{}
+		nextCopy.Execution.Presentation = clusterstate.SandboxPresentationV1{}
 		if !reflect.DeepEqual(currentCopy, nextCopy) ||
+			!validPresentationEventAdvance(current.Paused.Execution, next.Paused.Execution) ||
 			current.Paused.Execution.LastEventSeq > next.Paused.Execution.LastEventSeq {
 			return errors.New("raftstore: PAUSED execution changed or event sequence regressed")
 		}
@@ -430,7 +438,16 @@ func isPermanentExecutionProof(proof clusterstate.TerminalProof) bool {
 
 func sameReadyExecution(left, right clusterstate.ReadyRoute) bool {
 	left.LastEventSeq, right.LastEventSeq = 0, 0
+	left.Presentation, right.Presentation = clusterstate.SandboxPresentationV1{}, clusterstate.SandboxPresentationV1{}
 	return reflect.DeepEqual(left, right)
+}
+
+func sameReadyPresentation(left, right clusterstate.ReadyRoute) bool {
+	return reflect.DeepEqual(left.Presentation, right.Presentation)
+}
+
+func validPresentationEventAdvance(current, next clusterstate.ReadyRoute) bool {
+	return sameReadyPresentation(current, next) || next.LastEventSeq > current.LastEventSeq
 }
 
 func buildFailureMatchesStarting(starting clusterstate.BuildStartingState, failure clusterstate.BuildPlacementFailureState) bool {

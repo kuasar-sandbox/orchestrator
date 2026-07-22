@@ -11,6 +11,7 @@ import (
 
 	"github.com/google/uuid"
 
+	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/nodectl"
 )
 
@@ -349,6 +350,35 @@ func (s *Store) FinalizeAdmission(sandboxID, demandDigest string) error {
 
 func (s *Store) Wake() <-chan struct{} { return s.slotWake }
 
+// ReconcileOrphanSandboxAdmissions removes controller records whose matching
+// durable Sandbox workflow was never committed before a process crash.
+func (s *Store) ReconcileOrphanSandboxAdmissions(ctx context.Context) error {
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `DELETE FROM sandbox_slot_admissions
+WHERE NOT EXISTS (
+  SELECT 1 FROM node_workflows
+  WHERE object_kind=? AND object_id=sandbox_slot_admissions.sandbox_id
+)`, clusterstate.ExecutionKindSandbox)
+	if err != nil {
+		return err
+	}
+	deleted, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	if deleted > 0 {
+		s.notifySlotAdmission()
+	}
+	return nil
+}
+
 func (s *Store) SandboxSlotAdmissionUsage(ctx context.Context) (nodectl.PreparedAdmissionUsage, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT slot_units,state FROM sandbox_slot_admissions`)
 	if err != nil {
@@ -393,4 +423,5 @@ var _ interface {
 	FinalizeAdmission(string, string) error
 	PromoteQueued() ([]nodectl.PreparedAdmissionResult, error)
 	Wake() <-chan struct{}
+	ReconcileOrphanSandboxAdmissions(context.Context) error
 } = (*Store)(nil)

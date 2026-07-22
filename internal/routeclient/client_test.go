@@ -216,6 +216,9 @@ func TestListRoutesRestartsBucketWhenSnapshotChangesBetweenPages(t *testing.T) {
 				return routeapi.ListedRoute{
 					RouteKey: key, State: clusterstate.WorkflowRouteReady,
 					NodeID: "node-1", TemplateRef: "template-1",
+					Presentation: clusterstate.SandboxPresentationV1{
+						CPUCount: 2, MemoryMB: 2048, DiskSizeMB: 64, EnvdVersion: "0.6.1", StartedAt: 1, EndAt: 2,
+					},
 				}
 			}
 			switch len(firstBucketCursors) {

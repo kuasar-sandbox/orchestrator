@@ -93,6 +93,41 @@ func TestDataRecoveryQuarantinesConflictingLogicalClaims(t *testing.T) {
 	}
 }
 
+func TestDataRecoveryNodeStagingResetReplacesPartialReport(t *testing.T) {
+	source := testRegistryLayout(4, "generation-source-reset")
+	target := testRegistryLayout(4, "generation-target-reset")
+	group, routeKey := "/recovery", "reset"
+	state, initial := initializedRouteShard(t, target, group, routeKey)
+	recovery, identity, _ := beginRecoveryFixture(t, &state, initial, source, target, 2)
+	first := recoveryRouteRecord(t, source, target, recovery, group, routeKey, "sandbox-old-a", "report-old")
+	second := recoveryRouteRecord(t, source, target, recovery, group, routeKey, "sandbox-old-b", "report-old")
+
+	applyDataOK(t, &state, 3, DataCommand{Type: DataStageRecovery, Identity: identity, RecoveryRecord: &first})
+	applyDataOK(t, &state, 4, DataCommand{Type: DataStageRecovery, Identity: identity, RecoveryRecord: &second})
+	applyDataOK(t, &state, 5, DataCommand{
+		Type: DataResetRecoveryNode, Identity: identity,
+		RecoveryReset: &RecoveryNodeStagingReset{
+			RecoveryEpoch: recovery.RecoveryEpoch, NodeID: first.NodeID,
+			NodeEpoch: first.NodeEpoch, SessionSeq: 12,
+		},
+	})
+	if len(state.RecoveryRecords) != 0 || len(state.RecoveryClaims) != 0 {
+		t.Fatalf("staging reset retained partial report: records=%d claims=%d", len(state.RecoveryRecords), len(state.RecoveryClaims))
+	}
+
+	current := first
+	current.SessionSeq = 12
+	current.ReportDigest = digestFor("report-current")
+	applyDataOK(t, &state, 6, DataCommand{Type: DataStageRecovery, Identity: identity, RecoveryRecord: &current})
+	if len(state.RecoveryRecords) != 1 || len(state.RecoveryClaims) != 1 ||
+		state.RecoveryRecords[recoveryRecordKey(current)].ReportDigest != current.ReportDigest {
+		t.Fatalf("replacement report was not staged exactly: %+v", state.RecoveryRecords)
+	}
+	if err := state.Validate(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestDataRecoveryRebindProjectionRetryIsExactlyIdempotent(t *testing.T) {
 	source := testRegistryLayout(4, "generation-source-retry")
 	target := testRegistryLayout(4, "generation-target-retry")
@@ -351,6 +386,7 @@ func recoveryRouteRecord(
 			TrafficAccessToken: "traffic-token", TemplateRef: spec.TemplateRef,
 			RegistryGeneration: targetBinding.RegistryGeneration,
 			BindingDigest:      targetBinding.BindingDigest, LastEventSeq: 9, Intent: intent,
+			Presentation: testSandboxPresentation(),
 		},
 	}
 	return RecoveryObjectRecord{

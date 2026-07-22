@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"strings"
 	"time"
@@ -748,7 +749,11 @@ func (s *Store) CommitSandboxEvent(
 			}
 			return record, nil
 		}
-		return nil, ErrNodeWorkflowConflict
+		if update.State != string(clusterstate.WorkflowRouteReady) &&
+			update.State != string(clusterstate.WorkflowRoutePaused) ||
+			!eventUpdateMatchesExceptPresentation(record.LatestEvent, update) {
+			return nil, ErrNodeWorkflowConflict
+		}
 	}
 	stored := cloneSandbox(eventSource)
 	stored.EnvdAccessToken = update.AccessToken
@@ -983,12 +988,26 @@ func validateSandboxEventTransition(record *nodeexec.WorkflowRecord, update node
 }
 
 func eventUpdateMatches(event *routesync.ExecutionEvent, update nodeexec.EventUpdate) bool {
+	return eventUpdateMatchesExceptPresentation(event, update) &&
+		presentationsEqual(event.Presentation, update.Presentation)
+}
+
+func eventUpdateMatchesExceptPresentation(event *routesync.ExecutionEvent, update nodeexec.EventUpdate) bool {
 	return event != nil && event.State == update.State && event.TargetPort == update.TargetPort &&
 		event.AccessToken == update.AccessToken &&
 		event.TrafficAccessToken == update.TrafficAccessToken && event.TemplateRef == update.TemplateRef &&
 		event.SnapshotRef == update.SnapshotRef && event.SnapshotLocation == update.SnapshotLocation &&
 		event.ArtifactRef == update.ArtifactRef &&
 		event.Reason == update.Reason
+}
+
+func presentationsEqual(left, right *clusterstate.SandboxPresentationV1) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return left.CPUCount == right.CPUCount && left.MemoryMB == right.MemoryMB &&
+		left.DiskSizeMB == right.DiskSizeMB && left.EnvdVersion == right.EnvdVersion &&
+		left.StartedAt == right.StartedAt && left.EndAt == right.EndAt && maps.Equal(left.Metadata, right.Metadata)
 }
 
 func cloneBuild(source *types.Build) *types.Build {
@@ -1636,6 +1655,10 @@ func executionEventFor(
 		TemplateRef: update.TemplateRef, SnapshotRef: update.SnapshotRef,
 		SnapshotLocation: update.SnapshotLocation,
 		ArtifactRef:      update.ArtifactRef, Reason: update.Reason,
+	}
+	if update.Presentation != nil {
+		presentation := update.Presentation.Clone()
+		event.Presentation = &presentation
 	}
 	if err := event.Validate(); err != nil {
 		return nil, err

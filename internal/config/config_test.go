@@ -94,6 +94,19 @@ sandbox:
 	}
 }
 
+func TestClusterConfigRejectsNoncanonicalDataEndpoint(t *testing.T) {
+	cfg := &Config{
+		API:           APIConfig{Domain: "example.test", TLS: TLSConfig{Cert: "cert", Key: "key", ClientCA: "ca"}},
+		Sandbox:       SandboxConfig{Capacity: 1, Boot: BootConfig{Kernel: "kernel", Runtime: "runtime"}},
+		Cluster:       ClusterConfig{NodeLink: ClusterNodeLink{Endpoint: "/run/registry.sock"}, DataEndpoint: "https://node-1:8443"},
+		EncryptionKey: "key",
+	}
+	cfg.applyDefaults()
+	if err := cfg.validate(); err == nil || !strings.Contains(err.Error(), "cluster.data_endpoint") {
+		t.Fatalf("validate error = %v, want canonical data endpoint rejection", err)
+	}
+}
+
 func TestLoadRejectsNonPositivePoolWaitTimeout(t *testing.T) {
 	t.Setenv("NODE_CONFIG_ENCRYPTION_KEY", "")
 	for _, value := range []string{"0s", "-1s"} {

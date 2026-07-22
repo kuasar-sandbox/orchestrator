@@ -7,11 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"net"
-	"strconv"
-	"strings"
 	"time"
-	"unicode/utf8"
 
 	"github.com/google/uuid"
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
@@ -244,24 +240,8 @@ func validateClusterIdentityInput(nodeID, bootID, dataEndpoint string) error {
 }
 
 func validateClusterDataEndpoint(dataEndpoint string) error {
-	if dataEndpoint == "" {
-		return errors.New("store: data endpoint is required")
-	}
-	if !utf8.ValidString(dataEndpoint) || strings.TrimSpace(dataEndpoint) != dataEndpoint {
-		return errors.New("store: data endpoint must be a canonical TCP host:port")
-	}
-	host, portText, err := net.SplitHostPort(dataEndpoint)
-	if err != nil || host == "" || strings.ContainsAny(host, "/?#") {
-		return errors.New("store: data endpoint must be a canonical TCP host:port")
-	}
-	for _, b := range []byte(host) {
-		if b < 0x21 || b == 0x7f {
-			return errors.New("store: data endpoint must be a canonical TCP host:port")
-		}
-	}
-	port, err := strconv.Atoi(portText)
-	if err != nil || port <= 0 || port > 65535 || net.JoinHostPort(host, strconv.Itoa(port)) != dataEndpoint {
-		return errors.New("store: data endpoint must be a canonical TCP host:port")
+	if err := clusterstate.ValidateTCPDataEndpoint(dataEndpoint); err != nil {
+		return fmt.Errorf("store: %w", err)
 	}
 	return nil
 }

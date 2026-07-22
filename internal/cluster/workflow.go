@@ -14,6 +14,11 @@ const (
 	MaxNormalizedDemandBytes           = 64 << 10
 	MaxPlacementCandidates             = 4
 	MaxPlacementCandidateMetadataBytes = 256
+	MaxPresentationMetadataEntries     = 256
+	MaxPresentationMetadataKeyBytes    = 256
+	MaxPresentationMetadataValueBytes  = 16 << 10
+	MaxPresentationMetadataBytes       = 64 << 10
+	MaxPresentationEnvdVersionBytes    = 64
 )
 
 type Revision struct {
@@ -133,6 +138,9 @@ func (i ExecutionBindingIntent) Validate(kind ExecutionKind, objectID string) er
 	if i.NodeID == "" || i.NodeEpoch == 0 || i.DataEndpoint == "" || i.RegistryGeneration == "" || i.OpaqueBinding == "" || i.BindingDigest == "" {
 		return errors.New("cluster: incomplete execution Binding intent")
 	}
+	if err := ValidateTCPDataEndpoint(i.DataEndpoint); err != nil {
+		return err
+	}
 	binding, err := DecodeExecutionBinding(i.OpaqueBinding)
 	if err != nil {
 		return err
@@ -218,12 +226,13 @@ type ReadyRoute struct {
 	AccessToken        string `json:"access_token"`
 	TrafficAccessToken string `json:"traffic_access_token,omitempty"`
 
-	TemplateRef        string         `json:"template_ref"`
-	SnapshotRef        string         `json:"snapshot_ref,omitempty"`
-	RegistryGeneration string         `json:"registry_generation"`
-	BindingDigest      string         `json:"binding_digest"`
-	LastEventSeq       uint64         `json:"last_event_seq"`
-	Intent             DispatchIntent `json:"intent"`
+	TemplateRef        string                `json:"template_ref"`
+	SnapshotRef        string                `json:"snapshot_ref,omitempty"`
+	RegistryGeneration string                `json:"registry_generation"`
+	BindingDigest      string                `json:"binding_digest"`
+	LastEventSeq       uint64                `json:"last_event_seq"`
+	Intent             DispatchIntent        `json:"intent"`
+	Presentation       SandboxPresentationV1 `json:"presentation"`
 }
 
 func (r ReadyRoute) Validate() error {
@@ -232,11 +241,17 @@ func (r ReadyRoute) Validate() error {
 		r.RegistryGeneration == "" || r.LastEventSeq == 0 {
 		return errors.New("cluster: incomplete READY forwarding projection")
 	}
+	if err := ValidateTCPDataEndpoint(r.DataEndpoint); err != nil {
+		return err
+	}
 	if !validDigest(r.BindingDigest) {
 		return errors.New("cluster: invalid READY Binding digest")
 	}
 	if err := validateSandboxDispatchIntent(r.Intent); err != nil {
 		return fmt.Errorf("cluster: READY dispatch intent: %w", err)
+	}
+	if err := r.Presentation.Validate(); err != nil {
+		return fmt.Errorf("cluster: READY presentation: %w", err)
 	}
 	spec, err := ParseSandboxDispatchSpec(r.Intent.DispatchSpec)
 	if err != nil {
@@ -249,6 +264,51 @@ func (r ReadyRoute) Validate() error {
 		return errors.New("cluster: invalid READY target port")
 	}
 	return nil
+}
+
+// SandboxPresentationV1 is a node-authoritative, bounded northbound rendering
+// projection. It is not part of placement, Admission, Binding, or fencing.
+type SandboxPresentationV1 struct {
+	CPUCount    int               `json:"cpu_count"`
+	MemoryMB    int               `json:"memory_mb"`
+	DiskSizeMB  int               `json:"disk_size_mb"`
+	EnvdVersion string            `json:"envd_version"`
+	StartedAt   int64             `json:"started_at"`
+	EndAt       int64             `json:"end_at"`
+	Metadata    map[string]string `json:"metadata,omitempty"`
+}
+
+func (p SandboxPresentationV1) Validate() error {
+	if p.CPUCount <= 0 || p.MemoryMB <= 0 || p.DiskSizeMB < 0 || p.StartedAt <= 0 || p.EndAt < p.StartedAt ||
+		p.EnvdVersion == "" || len(p.EnvdVersion) > MaxPresentationEnvdVersionBytes || !utf8.ValidString(p.EnvdVersion) {
+		return errors.New("cluster: invalid Sandbox presentation resources, version, or timestamps")
+	}
+	if len(p.Metadata) > MaxPresentationMetadataEntries {
+		return errors.New("cluster: Sandbox presentation metadata has too many entries")
+	}
+	total := 0
+	for key, value := range p.Metadata {
+		if key == "" || key == ObjectMetadataKey || !utf8.ValidString(key) || !utf8.ValidString(value) ||
+			len(key) > MaxPresentationMetadataKeyBytes || len(value) > MaxPresentationMetadataValueBytes {
+			return errors.New("cluster: invalid Sandbox presentation metadata")
+		}
+		total += len(key) + len(value)
+		if total > MaxPresentationMetadataBytes {
+			return errors.New("cluster: Sandbox presentation metadata exceeds its byte budget")
+		}
+	}
+	return nil
+}
+
+func (p SandboxPresentationV1) Clone() SandboxPresentationV1 {
+	clone := p
+	if p.Metadata != nil {
+		clone.Metadata = make(map[string]string, len(p.Metadata))
+		for key, value := range p.Metadata {
+			clone.Metadata[key] = value
+		}
+	}
+	return clone
 }
 
 type PausedRouteState struct {

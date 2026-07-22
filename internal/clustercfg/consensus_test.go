@@ -17,3 +17,23 @@ func TestCertificateAuthenticatedRolesRequireTCPListeners(t *testing.T) {
 		t.Fatal("Placer accepted a Unix listener that cannot provide peer certificates")
 	}
 }
+
+func TestEndpointSetRequiresCanonicalBaseURLs(t *testing.T) {
+	valid := EndpointSet{
+		Endpoints: []NamedEndpoint{{Name: "provider-a", Endpoint: "https://provider-a:9443"}},
+		TLS:       TLS{Cert: "cert", Key: "key", CA: "ca"},
+	}
+	if err := valid.Validate("providers"); err != nil {
+		t.Fatal(err)
+	}
+	for _, endpoint := range []string{
+		"https://provider-a:9443/", "https://provider-a:9443/base",
+		"https://provider-a:9443?tenant=a", "https://provider-a:9443#fragment",
+	} {
+		candidate := valid
+		candidate.Endpoints = []NamedEndpoint{{Name: "provider-a", Endpoint: endpoint}}
+		if err := candidate.Validate("providers"); err == nil {
+			t.Fatalf("noncanonical endpoint %q was accepted", endpoint)
+		}
+	}
+}

@@ -34,7 +34,7 @@ import (
 )
 
 // Version is the protocol version exchanged in Hello/Register.
-const Version = 3
+const Version = 4
 
 // PluginRegisterPattern is the config-socket route pattern (Go 1.22 method+wildcard)
 // a subscriber registers + opens its route stream on. PluginRegisterPath builds the
@@ -157,9 +157,10 @@ type RouteWake struct {
 // Policy is the operational policy the orchestrator pushes to a proxy at handshake
 // (central control: the proxy need not be told these locally).
 type Policy struct {
-	Domain        string `json:"domain,omitempty"`
-	AuthMode      string `json:"auth_mode,omitempty"`       // off | log | enforce
-	ParkTimeoutMS int    `json:"park_timeout_ms,omitempty"` // hold a request awaiting route/resume
+	Domain            string `json:"domain,omitempty"`
+	AuthMode          string `json:"auth_mode,omitempty"`           // off | log | enforce
+	ParkTimeoutMS     int    `json:"park_timeout_ms,omitempty"`     // hold a request awaiting route/resume
+	RequireRouterMTLS bool   `json:"require_router_mtls,omitempty"` // external TCP ingress accepts only Router peers
 }
 
 // Msg is one wire message — a tagged union; exactly one payload field is set for a

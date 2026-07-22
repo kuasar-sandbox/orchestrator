@@ -24,6 +24,12 @@ func testOrchCfg(t *testing.T, cfg *config.Config) *Orchestrator {
 
 func testOrchCfgAt(t *testing.T, cfg *config.Config, dbPath string) *Orchestrator {
 	t.Helper()
+	if cfg.Sandbox.Resources.VCPU == 0 {
+		cfg.Sandbox.Resources.VCPU = 2
+	}
+	if cfg.Sandbox.Resources.Memory == "" {
+		cfg.Sandbox.Resources.Memory = "2GiB"
+	}
 	box, err := secretbox.NewFromColonHex(strings.Repeat("0", 64))
 	if err != nil {
 		t.Fatal(err)

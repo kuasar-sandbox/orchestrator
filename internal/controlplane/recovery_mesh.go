@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"strings"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/raftstore"
 )
@@ -32,7 +31,6 @@ func NewRecoveryMesh(self string, store *RaftStore, peers []SessionPeer) (*Recov
 	registryLayout, _ := store.RegistryLayoutSnapshot()
 	byID := make(map[string]SessionPeer, len(peers))
 	for _, peer := range peers {
-		peer.Endpoint = strings.TrimRight(peer.Endpoint, "/")
 		member, found := recoveryRegistryLayoutMember(registryLayout, peer.MemberID)
 		if !found || peer.MemberID == self || peer.Endpoint != member.InternalEndpoint || peer.Client == nil {
 			return nil, errors.New("controlplane: recovery peer is not an exact authenticated registryLayout member")

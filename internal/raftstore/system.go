@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+
+	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 )
 
 type RecoveryPhase string
@@ -204,6 +206,9 @@ func (r NodeEnrollmentRecord) Validate(lastApplied uint64) error {
 		r.EnrollmentIndex == 0 || r.EnrollmentIndex > lastApplied ||
 		r.LastAppliedIndex < r.EnrollmentIndex || r.LastAppliedIndex > lastApplied {
 		return errors.New("raftstore: incomplete node enrollment record")
+	}
+	if err := clusterstate.ValidateTCPDataEndpoint(r.DataEndpoint); err != nil {
+		return err
 	}
 	if r.Catalog != nil {
 		if err := r.Catalog.Validate(lastApplied); err != nil {

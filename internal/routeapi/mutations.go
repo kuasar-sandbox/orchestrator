@@ -279,10 +279,11 @@ func (r ListRoutesRequest) Validate() error {
 }
 
 type ListedRoute struct {
-	RouteKey    string                          `json:"route_key"`
-	State       clusterstate.RouteWorkflowState `json:"state"`
-	NodeID      string                          `json:"node_id"`
-	TemplateRef string                          `json:"template_ref"`
+	RouteKey     string                             `json:"route_key"`
+	State        clusterstate.RouteWorkflowState    `json:"state"`
+	NodeID       string                             `json:"node_id"`
+	TemplateRef  string                             `json:"template_ref"`
+	Presentation clusterstate.SandboxPresentationV1 `json:"presentation"`
 }
 
 type ListRoutesResponse struct {
@@ -310,7 +311,8 @@ func (r ListRoutesResponse) ValidateFor(request ListRoutesRequest) error {
 	for index := range r.Routes {
 		entry := r.Routes[index]
 		if entry.RouteKey <= previous || entry.NodeID == "" || entry.TemplateRef == "" ||
-			(entry.State != clusterstate.WorkflowRouteReady && entry.State != clusterstate.WorkflowRoutePaused) {
+			(entry.State != clusterstate.WorkflowRouteReady && entry.State != clusterstate.WorkflowRoutePaused) ||
+			entry.Presentation.Validate() != nil {
 			return errors.New("routeapi: invalid or unsorted Route list projection")
 		}
 		previous = entry.RouteKey

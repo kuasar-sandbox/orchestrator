@@ -8,9 +8,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"strings"
 	"sync/atomic"
 
+	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/placer"
 )
 
@@ -32,8 +32,7 @@ func New(endpoints []Endpoint) (*Client, error) {
 	seen := make(map[string]struct{}, len(endpoints))
 	copyEndpoints := make([]Endpoint, len(endpoints))
 	for index, endpoint := range endpoints {
-		endpoint.BaseURL = strings.TrimRight(endpoint.BaseURL, "/")
-		if endpoint.Name == "" || endpoint.BaseURL == "" || endpoint.Client == nil {
+		if endpoint.Name == "" || clusterstate.ValidateCanonicalHTTPSBaseEndpoint(endpoint.BaseURL) != nil || endpoint.Client == nil {
 			return nil, errors.New("providerclient: incomplete endpoint")
 		}
 		if _, duplicate := seen[endpoint.Name]; duplicate {

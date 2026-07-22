@@ -40,6 +40,18 @@ func testRegistryLayout(shards uint32, generation string) RegistryLayout {
 	}
 }
 
+func TestRegistryLayoutRejectsNoncanonicalInternalEndpoint(t *testing.T) {
+	for _, endpoint := range []string{
+		"https://registry-a:9443/", "https://registry-a:9443/path", "https://registry-a:9443?query=1",
+	} {
+		layout := testRegistryLayout(4, "generation-endpoint")
+		layout.Members[0].InternalEndpoint = endpoint
+		if err := layout.Validate(); err == nil {
+			t.Fatalf("noncanonical Registry endpoint %q was accepted", endpoint)
+		}
+	}
+}
+
 func finalizeConsensusSuccessor(
 	t *testing.T,
 	predecessor RegistryLayout,

@@ -287,7 +287,16 @@ func recoverySnapshotFromEvent(event routesync.ExecutionEvent) routesync.Recover
 		TrafficAccessToken: event.TrafficAccessToken, TemplateRef: event.TemplateRef,
 		SnapshotRef: event.SnapshotRef, SnapshotLocation: event.SnapshotLocation,
 		ArtifactRef: event.ArtifactRef, Reason: event.Reason,
+		Presentation: cloneRecoveryPresentation(event.Presentation),
 	}
+}
+
+func cloneRecoveryPresentation(source *clusterstate.SandboxPresentationV1) *clusterstate.SandboxPresentationV1 {
+	if source == nil {
+		return nil
+	}
+	clone := source.Clone()
+	return &clone
 }
 
 func (s *Store) recoveryObjectBindingMatchesTx(ctx context.Context, tx *sql.Tx, record *nodeexec.WorkflowRecord) (bool, error) {

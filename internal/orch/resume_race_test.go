@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"io"
 	"log/slog"
 	"path/filepath"
@@ -36,6 +37,7 @@ type countingLauncher struct {
 	startRelease          <-chan struct{}
 	startOnce             sync.Once
 	blockBeforeAssignment bool
+	stopped               sync.Map
 }
 
 func (l *countingLauncher) Start(ctx context.Context, unit string) error {
@@ -73,7 +75,10 @@ func (l *countingLauncher) Start(ctx context.Context, unit string) error {
 	}
 	return nil
 }
-func (l *countingLauncher) Stop(context.Context, string) error        { return nil }
+func (l *countingLauncher) Stop(_ context.Context, unit string) error {
+	l.stopped.Store(unit, struct{}{})
+	return nil
+}
 func (l *countingLauncher) ResetFailed(context.Context, string) error { return nil }
 func (l *countingLauncher) List(context.Context, string) ([]launcher.Unit, error) {
 	return nil, nil
@@ -91,6 +96,14 @@ func (stubVS) Detach(context.Context, string) error { return nil }
 func (stubVS) TapFD(port string) vswitch.TapFD      { return vswitch.TapFD{Exec: []string{"true", port}} }
 
 type releaseAdmissionFake struct{ wake chan struct{} }
+
+func sandboxTestEvent(update nodeexec.EventUpdate) nodeexec.EventUpdate {
+	presentation := clusterstate.SandboxPresentationV1{
+		CPUCount: 1, MemoryMB: 512, DiskSizeMB: 64, EnvdVersion: "0.1.0", StartedAt: 1, EndAt: 2,
+	}
+	update.Presentation = &presentation
+	return update
+}
 
 func (f *releaseAdmissionFake) GetAdmission(id, digest string) (nodectl.PreparedAdmissionResult, error) {
 	return nodectl.PreparedAdmissionResult{SandboxID: id, DemandDigest: digest, State: nodectl.PreparedClaimed}, nil
@@ -134,6 +147,7 @@ func TestResumeRace_ConnectAndRouteSingleLaunch(t *testing.T) {
 	t.Cleanup(func() { _ = st.Close() })
 
 	cfg := &config.Config{}
+	cfg.Sandbox.Resources.VCPU, cfg.Sandbox.Resources.Memory = 1, "512MiB"
 	cfg.Paths.RunRoot = filepath.Join(t.TempDir(), "run")
 	cfg.Paths.BaseRoot = filepath.Join(t.TempDir(), "lib")
 	cfg.Sandbox.Network.Bare.InnerIP = "169.254.1.1/31" // allocInnerIP needs a valid CIDR
@@ -205,6 +219,7 @@ func TestResumeRace_RegistryRetriesShareDataPlaneSingleFlight(t *testing.T) {
 	t.Cleanup(func() { _ = st.Close() })
 
 	cfg := &config.Config{}
+	cfg.Sandbox.Resources.VCPU, cfg.Sandbox.Resources.Memory = 1, "512MiB"
 	cfg.Paths.RunRoot = filepath.Join(t.TempDir(), "run")
 	cfg.Paths.BaseRoot = filepath.Join(t.TempDir(), "lib")
 	cfg.Sandbox.Network.Bare.InnerIP = "169.254.1.1/31"
@@ -238,15 +253,15 @@ func TestResumeRace_RegistryRetriesShareDataPlaneSingleFlight(t *testing.T) {
 	if err != nil || stored == nil {
 		t.Fatalf("stored cluster sandbox = %+v, %v", stored, err)
 	}
-	if _, err := st.CommitSandboxEvent(ctx, stored, nodeexec.EventUpdate{
+	if _, err := st.CommitSandboxEvent(ctx, stored, sandboxTestEvent(nodeexec.EventUpdate{
 		State: string(clusterstate.WorkflowRouteReady), TargetPort: 49983,
-	}); err != nil {
+	})); err != nil {
 		t.Fatal(err)
 	}
 	stored, _ = st.Get(ctx, sid)
-	if _, err := st.CommitSandboxEvent(ctx, stored, nodeexec.EventUpdate{
+	if _, err := st.CommitSandboxEvent(ctx, stored, sandboxTestEvent(nodeexec.EventUpdate{
 		State: string(clusterstate.WorkflowRoutePaused), TargetPort: 49983,
-	}); err != nil {
+	})); err != nil {
 		t.Fatal(err)
 	}
 	stored, _ = st.Get(ctx, sid)
@@ -289,6 +304,7 @@ func TestResumeRace_RegistryDeleteWaitsForInFlightResume(t *testing.T) {
 	t.Cleanup(func() { _ = st.Close() })
 
 	cfg := &config.Config{}
+	cfg.Sandbox.Resources.VCPU, cfg.Sandbox.Resources.Memory = 1, "512MiB"
 	cfg.Paths.RunRoot = filepath.Join(t.TempDir(), "run")
 	cfg.Paths.BaseRoot = filepath.Join(t.TempDir(), "lib")
 	cfg.Sandbox.Network.Bare.InnerIP = "169.254.1.1/31"
@@ -319,15 +335,15 @@ func TestResumeRace_RegistryDeleteWaitsForInFlightResume(t *testing.T) {
 		t.Fatal(err)
 	}
 	stored, _ := st.Get(ctx, sid)
-	if _, err := st.CommitSandboxEvent(ctx, stored, nodeexec.EventUpdate{
+	if _, err := st.CommitSandboxEvent(ctx, stored, sandboxTestEvent(nodeexec.EventUpdate{
 		State: string(clusterstate.WorkflowRouteReady), TargetPort: 49983,
-	}); err != nil {
+	})); err != nil {
 		t.Fatal(err)
 	}
 	stored, _ = st.Get(ctx, sid)
-	if _, err := st.CommitSandboxEvent(ctx, stored, nodeexec.EventUpdate{
+	if _, err := st.CommitSandboxEvent(ctx, stored, sandboxTestEvent(nodeexec.EventUpdate{
 		State: string(clusterstate.WorkflowRoutePaused), TargetPort: 49983,
-	}); err != nil {
+	})); err != nil {
 		t.Fatal(err)
 	}
 
@@ -378,6 +394,84 @@ func TestResumeRace_RegistryDeleteWaitsForInFlightResume(t *testing.T) {
 	record, err := st.GetNodeWorkflow(ctx, clusterstate.ExecutionKindSandbox, sid)
 	if err != nil || record == nil || record.ObjectState != "DELETED" {
 		t.Fatalf("workflow after serialized delete = %+v, %v", record, err)
+	}
+}
+
+func TestFailedResumeStopsDurablyAssignedRuntimeBeforeResourceRelease(t *testing.T) {
+	box, err := secretbox.NewFromColonHex(strings.Repeat("0", 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.Open(filepath.Join(t.TempDir(), "t.db"), box)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	cfg := &config.Config{}
+	cfg.Sandbox.Resources.VCPU, cfg.Sandbox.Resources.Memory = 1, "512MiB"
+	cfg.Paths.RunRoot = filepath.Join(t.TempDir(), "run")
+	cfg.Paths.BaseRoot = filepath.Join(t.TempDir(), "lib")
+	cfg.Units.Runner = "sandbox-runner@.service"
+	lc := &countingLauncher{}
+	o := New(cfg, st, lc, stubVS{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	sid := "sbx-failed-resume-cleanup"
+	dispatch := clusterResumeDispatch(t, sid, "bare-img-"+strings.Repeat("b", 64))
+	paused := &types.Sandbox{
+		ID: sid, TemplateID: "bare-img-" + strings.Repeat("b", 64), State: types.StatePaused,
+		AuthKey: strings.Repeat("a", 64), ManifestKey: strings.Repeat("b", 64),
+		RunDir: cfg.Paths.RunRoot + "/" + sid, BaseDir: cfg.Paths.BaseRoot + "/" + sid,
+		CreatedUnix: 1,
+	}
+	record, err := st.RecordSandboxWorkflow(context.Background(), dispatch, nodeexec.AdmissionDecision{
+		State: nodeexec.AdmissionAdmitted, Result: clusterstate.DispatchAcceptedAdmitted,
+		ReservationToken: "reservation-1",
+	}, paused)
+	if err != nil {
+		t.Fatal(err)
+	}
+	actual := *paused
+	actual.State = types.StateRunning
+	actual.RunID = "run-after-resume"
+	actual.VswitchPort = "new-port"
+	if err := st.Put(context.Background(), &actual); err != nil {
+		t.Fatal(err)
+	}
+	authority, err := nodeexec.NewAuthority(
+		st, &releaseAdmissionFake{wake: make(chan struct{})},
+		func(context.Context) (nodeexec.LocalSessionIdentity, error) {
+			return nodeexec.LocalSessionIdentity{
+				NodeID: "node-1", NodeEpoch: 7, SessionSeq: 1, DataEndpoint: "node-1:8443",
+			}, nil
+		},
+		func(context.Context) (nodeexec.BuildCapacity, string, error) {
+			return nodeexec.BuildCapacity{Slots: 1, QueueLimit: 1}, "", nil
+		},
+		func(context.Context, nodeexec.DispatchRecord) (*types.Build, error) { return nil, nil },
+		func(context.Context, nodeexec.DispatchRecord) (*types.Sandbox, error) { return nil, nil },
+		func(context.Context, nodeexec.DispatchRecord) (nodectl.SandboxAdmissionDemand, error) {
+			return nodectl.SandboxAdmissionDemand{}, nil
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	node := &FinalClusterNode{core: o, store: st, authority: authority}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := node.failResumedSandbox(ctx, record, paused, context.Canceled); !errors.Is(err, context.Canceled) {
+		t.Fatalf("failed resume cleanup error = %v", err)
+	}
+	if _, stopped := lc.stopped.Load(o.runnerUnit(actual.RunID)); !stopped {
+		t.Fatalf("durably assigned runtime %q was not stopped", actual.RunID)
+	}
+	stored, err := st.Get(context.Background(), sid)
+	if err != nil || stored == nil || stored.State != types.StateDead {
+		t.Fatalf("Sandbox after failed resume = %+v, %v", stored, err)
+	}
+	workflow, err := st.GetNodeWorkflow(context.Background(), clusterstate.ExecutionKindSandbox, sid)
+	if err != nil || workflow == nil || workflow.ObjectState != "ERROR" || workflow.ResourceClaimed {
+		t.Fatalf("workflow after failed resume = %+v, %v", workflow, err)
 	}
 }
 

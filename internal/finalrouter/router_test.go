@@ -20,19 +20,22 @@ import (
 )
 
 type revisionControl struct {
-	serveIdentity  routeapi.RegistryServeIdentity
-	route          clusterstate.ReadyRoute
-	routeState     clusterstate.RouteWorkflowState
-	revision       uint64
-	reserveMins    []uint64
-	readMins       []uint64
-	reserveStarted chan struct{}
-	reserveRelease chan struct{}
-	reserveCalls   int
-	reserveErr     error
-	resumeCalls    int
-	register       func(string, string, routeapi.BuildInput) (routeclient.BuildMutationResult, error)
-	readBuild      func(context.Context, string, string, uint64) (routeclient.BuildReadResult, error)
+	serveIdentity   routeapi.RegistryServeIdentity
+	route           clusterstate.ReadyRoute
+	routeState      clusterstate.RouteWorkflowState
+	revision        uint64
+	reserveMins     []uint64
+	readMins        []uint64
+	reserveStarted  chan struct{}
+	reserveRelease  chan struct{}
+	reserveCalls    int
+	reserveErr      error
+	resumeCalls     int
+	resume          func(string, string, uint64) (routeclient.RouteMutationResult, error)
+	readAddressable func(string, string, uint64) (routeclient.RouteReadResult, error)
+	register        func(string, string, routeapi.BuildInput) (routeclient.BuildMutationResult, error)
+	readBuild       func(context.Context, string, string, uint64) (routeclient.BuildReadResult, error)
+	listedRoutes    []routeapi.ListedRoute
 }
 
 func (c *revisionControl) CurrentServeIdentity(bool) (routeapi.RegistryServeIdentity, error) {
@@ -56,8 +59,11 @@ func (c *revisionControl) ReserveSandbox(_ context.Context, group, routeKey stri
 		State: clusterstate.WorkflowRouteReady, Route: &c.route, RouteRevision: c.revision,
 	}}, nil
 }
-func (c *revisionControl) ResumeSandbox(_ context.Context, group, routeKey string, _ uint64) (routeclient.RouteMutationResult, error) {
+func (c *revisionControl) ResumeSandbox(_ context.Context, group, routeKey string, minimum uint64) (routeclient.RouteMutationResult, error) {
 	c.resumeCalls++
+	if c.resume != nil {
+		return c.resume(group, routeKey, minimum)
+	}
 	return routeclient.RouteMutationResult{ServeIdentity: c.serveIdentity, Response: routeapi.RouteMutationResponse{
 		Outcome: routeapi.MutationReady, Group: group, RouteKey: routeKey,
 		State: clusterstate.WorkflowRouteReady, Route: &c.route, RouteRevision: c.revision,
@@ -80,6 +86,9 @@ func (c *revisionControl) ReadRoute(_ context.Context, group, routeKey string, m
 }
 func (c *revisionControl) ReadAddressableRoute(_ context.Context, group, routeKey string, minimum uint64) (routeclient.RouteReadResult, error) {
 	c.readMins = append(c.readMins, minimum)
+	if c.readAddressable != nil {
+		return c.readAddressable(group, routeKey, minimum)
+	}
 	state := c.routeState
 	if state == "" {
 		state = clusterstate.WorkflowRouteReady
@@ -88,6 +97,54 @@ func (c *revisionControl) ReadAddressableRoute(_ context.Context, group, routeKe
 		Outcome: routeapi.ReadReady, Group: group, RouteKey: routeKey,
 		State: state, Route: &c.route, RouteRevision: c.revision,
 	}}, nil
+}
+
+func TestSandboxControlDistinguishesDefinitiveNotFoundFromUnavailable(t *testing.T) {
+	tests := []struct {
+		name    string
+		path    string
+		control *revisionControl
+		status  int
+	}{
+		{
+			name: "strong not found", path: "/sandboxes/missing", status: http.StatusNotFound,
+			control: &revisionControl{readAddressable: func(group, routeKey string, minimum uint64) (routeclient.RouteReadResult, error) {
+				return routeclient.RouteReadResult{Response: routeapi.ReadRouteResponse{
+					Outcome: routeapi.ReadNotFound, Group: group, RouteKey: routeKey,
+				}}, nil
+			}},
+		},
+		{
+			name: "read unavailable", path: "/sandboxes/missing", status: http.StatusServiceUnavailable,
+			control: &revisionControl{readAddressable: func(string, string, uint64) (routeclient.RouteReadResult, error) {
+				return routeclient.RouteReadResult{}, errors.New("permit expired")
+			}},
+		},
+		{
+			name: "resume pending", path: "/sandboxes/paused/connect", status: http.StatusServiceUnavailable,
+			control: &revisionControl{resume: func(group, routeKey string, minimum uint64) (routeclient.RouteMutationResult, error) {
+				return routeclient.RouteMutationResult{Response: routeapi.RouteMutationResponse{
+					Outcome: routeapi.MutationPending, Group: group, RouteKey: routeKey,
+				}}, nil
+			}},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			router, err := New(test.control, allowCaller{}, "example.test", time.Minute, slog.Default())
+			if err != nil {
+				t.Fatal(err)
+			}
+			request := httptest.NewRequest(http.MethodGet, "http://api.example.test"+test.path, nil)
+			request.Host = "api.example.test"
+			request.Header.Set(HeaderGroup, "/group")
+			response := httptest.NewRecorder()
+			router.Handler().ServeHTTP(response, request)
+			if response.Code != test.status {
+				t.Fatalf("status = %d, want %d: %s", response.Code, test.status, response.Body.String())
+			}
+		})
+	}
 }
 func (c *revisionControl) RegisterBuild(_ context.Context, group, buildID string, _ uint64, input routeapi.BuildInput) (routeclient.BuildMutationResult, error) {
 	if c.register == nil {
@@ -101,13 +158,23 @@ func (c *revisionControl) ReadBuild(ctx context.Context, group, buildID string, 
 	}
 	return c.readBuild(ctx, group, buildID, revision)
 }
-func (*revisionControl) ListRoutes(context.Context, string) (routeclient.RouteListResult, error) {
-	return routeclient.RouteListResult{}, errors.New("unexpected ListRoutes")
+func (c *revisionControl) ListRoutes(context.Context, string) (routeclient.RouteListResult, error) {
+	if c.listedRoutes == nil {
+		return routeclient.RouteListResult{}, errors.New("unexpected ListRoutes")
+	}
+	return routeclient.RouteListResult{Routes: c.listedRoutes, ServeIdentity: c.serveIdentity}, nil
 }
 
 type allowCaller struct{}
 
 func (allowCaller) Verify(context.Context, string, string) (bool, error) { return true, nil }
+
+func routerTestPresentation() clusterstate.SandboxPresentationV1 {
+	return clusterstate.SandboxPresentationV1{
+		CPUCount: 2, MemoryMB: 2048, DiskSizeMB: 64, EnvdVersion: "0.6.1",
+		StartedAt: 1, EndAt: 2, Metadata: map[string]string{"tenant": "value"},
+	}
+}
 
 func TestStaleProxyFailureRequiresNewerRouteRevision(t *testing.T) {
 	serveIdentity := routeapi.RegistryServeIdentity{
@@ -207,7 +274,7 @@ func TestCreateExposesRouteKeyInsteadOfConcreteSandboxID(t *testing.T) {
 	control := &revisionControl{serveIdentity: serveIdentity, revision: 8, route: clusterstate.ReadyRoute{
 		SandboxID: "node-local-sandbox", NodeID: "node-1", NodeEpoch: 7,
 		DataEndpoint: "node-1:8443", RegistryGeneration: serveIdentity.RegistryGeneration,
-		BindingDigest: "binding-1", TemplateRef: "template-1",
+		BindingDigest: "binding-1", TemplateRef: "template-1", Presentation: routerTestPresentation(),
 	}}
 	router, err := New(control, allowCaller{}, "example.test", time.Minute, slog.Default())
 	if err != nil {
@@ -223,11 +290,42 @@ func TestCreateExposesRouteKeyInsteadOfConcreteSandboxID(t *testing.T) {
 	if response.Code != http.StatusCreated || json.Unmarshal(response.Body.Bytes(), &body) != nil {
 		t.Fatalf("create = %d %s", response.Code, response.Body.String())
 	}
-	if body["sandboxID"] != "route-1" || body["routeKey"] != "route-1" {
+	if body["sandboxID"] != "route-1" || body["routeKey"] != "route-1" || body["envdVersion"] != "0.6.1" {
 		t.Fatalf("northbound Sandbox identity = %+v", body)
 	}
 	if strings.Contains(response.Body.String(), "node-local-sandbox") {
 		t.Fatalf("create leaked concrete SID: %s", response.Body.String())
+	}
+}
+
+func TestListRendersCompleteSDKProjectionWithoutNodeFanout(t *testing.T) {
+	serveIdentity := routeapi.RegistryServeIdentity{
+		ClusterID: "cluster-1", RegistryGeneration: "generation-1", SystemEpoch: 1,
+		RegistryLayoutDigest: "registry-layout-1",
+	}
+	control := &revisionControl{serveIdentity: serveIdentity, listedRoutes: []routeapi.ListedRoute{{
+		RouteKey: "route-1", State: clusterstate.WorkflowRoutePaused, NodeID: "node-1",
+		TemplateRef: "template-1", Presentation: routerTestPresentation(),
+	}}}
+	router, err := New(control, allowCaller{}, "example.test", time.Minute, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodGet, "http://api.example.test/v2/sandboxes", nil)
+	request.Host = "api.example.test"
+	request.Header.Set(HeaderGroup, "/group")
+	response := httptest.NewRecorder()
+	router.Handler().ServeHTTP(response, request)
+	var body []map[string]any
+	if response.Code != http.StatusOK || json.Unmarshal(response.Body.Bytes(), &body) != nil || len(body) != 1 {
+		t.Fatalf("list = %d %s", response.Code, response.Body.String())
+	}
+	item := body[0]
+	if item["sandboxID"] != "route-1" || item["state"] != "paused" || item["cpuCount"] != float64(2) ||
+		item["memoryMB"] != float64(2048) || item["diskSizeMB"] != float64(64) ||
+		item["envdVersion"] != "0.6.1" || item["startedAt"] != "1970-01-01T00:00:01Z" ||
+		item["endAt"] != "1970-01-01T00:00:02Z" {
+		t.Fatalf("SDK list projection = %+v", item)
 	}
 }
 

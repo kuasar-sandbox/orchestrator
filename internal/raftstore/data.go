@@ -241,6 +241,7 @@ const (
 	DataPutFence           DataCommandType = "PUT_FENCE"
 	DataCompactFence       DataCommandType = "COMPACT_FENCE"
 	DataBeginRecovery      DataCommandType = "BEGIN_RECOVERY"
+	DataResetRecoveryNode  DataCommandType = "RESET_RECOVERY_NODE_STAGING"
 	DataStageRecovery      DataCommandType = "STAGE_RECOVERY_OBJECT"
 	DataAckRecovery        DataCommandType = "ACK_RECOVERY_REBIND"
 	DataActivateRecovery   DataCommandType = "ACTIVATE_RECOVERY_OBJECT"
@@ -357,6 +358,7 @@ type DataCommand struct {
 	Fence          *clusterstate.ExecutionFence      `json:"fence,omitempty"`
 	Compaction     *FenceCompactionAuthorization     `json:"compaction,omitempty"`
 	RecoveryStart  *DataRecoveryState                `json:"recovery_start,omitempty"`
+	RecoveryReset  *RecoveryNodeStagingReset         `json:"recovery_reset,omitempty"`
 	RecoveryRecord *RecoveryObjectRecord             `json:"recovery_record,omitempty"`
 	RecoveryUpdate *RecoveryObjectUpdate             `json:"recovery_update,omitempty"`
 	RecoveryFinal  *RecoveryFinalization             `json:"recovery_final,omitempty"`
@@ -555,6 +557,13 @@ func ApplyDataCommand(state *DataState, index uint64, command DataCommand) DataA
 			return conflict("data recovery start is missing", 0)
 		}
 		if err := beginDataRecovery(state, command.Identity, *command.RecoveryStart); err != nil {
+			return conflict(err.Error(), 0)
+		}
+	case DataResetRecoveryNode:
+		if command.RecoveryReset == nil {
+			return conflict("recovery node staging reset is missing", 0)
+		}
+		if err := resetRecoveryNodeStaging(state, index, command.Identity, *command.RecoveryReset); err != nil {
 			return conflict(err.Error(), 0)
 		}
 	case DataStageRecovery:

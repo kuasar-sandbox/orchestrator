@@ -300,6 +300,8 @@ func (c *RecoveryCoordinator) collectNode(
 	if err != nil || wantDigest != reportDigest {
 		return errors.Join(err, errors.New("node recovery report digest mismatch"))
 	}
+	records := make([]raftstore.RecoveryObjectRecord, 0, len(facts))
+	affectedShards := make(map[uint32]struct{})
 	for _, fact := range facts {
 		page := routesync.RecoveryReportPage{
 			RecoveryEpoch: recovery.Epoch, SourceClusterID: recovery.SourceClusterID,
@@ -314,6 +316,39 @@ func (c *RecoveryCoordinator) collectNode(
 		if err != nil {
 			return err
 		}
+		records = append(records, record)
+		affectedShards[recoveryRecordShard(c.store, record)] = struct{}{}
+	}
+	if err := c.forEachRecoveryRecord(ctx, recovery, func(_ context.Context, located locatedRecoveryRecord) error {
+		if located.record.NodeID == progress.NodeID && located.record.NodeEpoch == progress.NodeEpoch {
+			affectedShards[located.shardID] = struct{}{}
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	shards := make([]uint32, 0, len(affectedShards))
+	for shardID := range affectedShards {
+		shards = append(shards, shardID)
+	}
+	slices.Sort(shards)
+	reset := raftstore.RecoveryNodeStagingReset{
+		RecoveryEpoch: recovery.Epoch, NodeID: progress.NodeID, NodeEpoch: progress.NodeEpoch,
+		SessionSeq: reportSession,
+	}
+	if err := c.forEachRecoveryShard(ctx, shards, func(ctx context.Context, shardID uint32) error {
+		result, err := c.mesh.Apply(ctx, raftstore.DataCommand{
+			Type: raftstore.DataResetRecoveryNode,
+			Identity: raftstore.ShardRequestIdentity{
+				PermitIdentity: recoveryPermitIdentity(recovery), ShardID: shardID,
+			},
+			RecoveryReset: &reset,
+		})
+		return recoveryApplyError(result, err)
+	}); err != nil {
+		return err
+	}
+	for _, record := range records {
 		identity := raftstore.ShardRequestIdentity{
 			PermitIdentity: recoveryPermitIdentity(recovery), ShardID: recoveryRecordShard(c.store, record),
 		}
@@ -666,11 +701,23 @@ func (c *RecoveryCoordinator) quarantineObject(
 }
 
 func (c *RecoveryCoordinator) forEachShard(ctx context.Context, run func(context.Context, uint32) error) error {
+	shards := make([]uint32, c.store.VirtualShardCount())
+	for shardID := range shards {
+		shards[shardID] = uint32(shardID)
+	}
+	return c.forEachRecoveryShard(ctx, shards, run)
+}
+
+func (c *RecoveryCoordinator) forEachRecoveryShard(
+	ctx context.Context,
+	shards []uint32,
+	run func(context.Context, uint32) error,
+) error {
 	sem := make(chan struct{}, c.config.Workers)
 	var workers sync.WaitGroup
 	var resultMu sync.Mutex
 	var joined error
-	for shardID := uint32(0); shardID < c.store.VirtualShardCount(); shardID++ {
+	for _, shardID := range shards {
 		select {
 		case sem <- struct{}{}:
 		case <-ctx.Done():

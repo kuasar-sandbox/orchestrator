@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"gopkg.in/yaml.v3"
 )
 
@@ -712,6 +713,9 @@ func (c *Config) validate() error {
 		}
 		if c.Cluster.DataEndpoint == "" {
 			return fmt.Errorf("config: cluster.data_endpoint is required in cluster mode")
+		}
+		if err := clusterstate.ValidateTCPDataEndpoint(c.Cluster.DataEndpoint); err != nil {
+			return fmt.Errorf("config: cluster.data_endpoint: %w", err)
 		}
 		if c.API.TLS.Cert == "" || c.API.TLS.Key == "" || c.API.TLS.ClientCA == "" {
 			return errors.New("config: cluster mode requires api.tls cert, key, and client_ca for Router mTLS")

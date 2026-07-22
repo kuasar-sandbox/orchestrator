@@ -32,6 +32,12 @@ type SandboxAdmissionController interface {
 	Wake() <-chan struct{}
 }
 
+// SandboxAdmissionOrphanReconciler is implemented only when the Admission
+// controller and workflow journal share a crash-consistent local store.
+type SandboxAdmissionOrphanReconciler interface {
+	ReconcileOrphanSandboxAdmissions(context.Context) error
+}
+
 // WorkflowJournal is implemented by the node-local SQLite store. Its methods
 // are deliberately keyed by the business sandbox/build IDs from the RFC.
 type WorkflowJournal interface {
@@ -341,6 +347,11 @@ func (a *Authority) ReconcileSandboxAdmissions(ctx context.Context, limit int) e
 		return ErrSessionFenced
 	}
 	defer done()
+	if reconciler, ok := a.sandbox.(SandboxAdmissionOrphanReconciler); ok {
+		if err := reconciler.ReconcileOrphanSandboxAdmissions(ctx); err != nil {
+			return fmt.Errorf("nodeexec: reconcile orphan Sandbox Admissions: %w", err)
+		}
+	}
 	identity, err := a.identity(ctx)
 	if err != nil {
 		return err

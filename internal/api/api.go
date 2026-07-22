@@ -676,8 +676,8 @@ func (a *API) failMigrate(w http.ResponseWriter, err error) {
 
 // --- response shaping ---
 
-func (a *API) envdVersion(sb *types.Sandbox) string {
-	if sb.Profile() == types.ProfileE2B {
+func EnvdVersion(profile types.Profile) string {
+	if profile == types.ProfileE2B {
 		return "0.6.1"
 	}
 	return "0.1.0" // bare stub: >=0.1.0 so the SDK does not self-destruct
@@ -689,7 +689,7 @@ func (a *API) sandboxResp(sb *types.Sandbox) map[string]any {
 		"templateID":         sb.TemplateID,
 		"clientID":           "orchestrator",
 		"domain":             a.domain,
-		"envdVersion":        a.envdVersion(sb),
+		"envdVersion":        EnvdVersion(sb.Profile()),
 		"envdAccessToken":    sb.EnvdAccessToken,
 		"trafficAccessToken": sb.TrafficAccessToken,
 		"alias":              "",
@@ -723,7 +723,7 @@ func (a *API) listed(sb *types.Sandbox) map[string]any {
 		"cpuCount":    a.res.VCPU,
 		"memoryMB":    a.res.MemoryMB,
 		"diskSizeMB":  a.res.DiskMB,
-		"envdVersion": a.envdVersion(sb),
+		"envdVersion": EnvdVersion(sb.Profile()),
 		"startedAt":   isoUnix(sb.CreatedUnix),
 		"endAt":       isoUnix(end),
 		"metadata":    clusterstate.WithoutSystemMetadata(sb.Metadata),

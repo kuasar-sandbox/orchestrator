@@ -136,6 +136,7 @@ func (c *EventConverger) convergeSandbox(
 			}
 			execution := *projection
 			execution.LastEventSeq = event.EventSeq
+			execution.Presentation = event.Presentation.Clone()
 			next := clusterstate.RouteWorkflowRecord{
 				Group: record.Group, RouteKey: record.RouteKey, State: clusterstate.WorkflowRoutePaused,
 				Paused: &clusterstate.PausedRouteState{
@@ -297,12 +298,14 @@ func readyFromEvent(
 			NodeEpoch: starting.Binding.NodeEpoch, DataEndpoint: starting.Binding.DataEndpoint,
 			RegistryGeneration: starting.Binding.RegistryGeneration,
 			BindingDigest:      starting.Binding.BindingDigest, Intent: starting.Intent,
+			Presentation: event.Presentation.Clone(),
 		}
 	}
 	if event.DataEndpoint != "" && event.DataEndpoint != ready.DataEndpoint {
 		return clusterstate.RouteWorkflowRecord{}, errors.New("controlplane: READY event changed data endpoint within NodeEpoch")
 	}
 	ready.LastEventSeq = event.EventSeq
+	ready.Presentation = event.Presentation.Clone()
 	if current == nil {
 		ready.TargetPort = event.TargetPort
 		ready.AccessToken = event.AccessToken

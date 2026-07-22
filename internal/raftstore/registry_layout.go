@@ -9,10 +9,11 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"net/url"
 	"reflect"
 	"sort"
 	"strconv"
+
+	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 )
 
 const (
@@ -87,8 +88,7 @@ func (m RegistryMember) Validate() error {
 	if m.MemberID == "" {
 		return errors.New("raftstore: member identity is required")
 	}
-	u, err := url.Parse(m.InternalEndpoint)
-	if err != nil || u.Scheme != "https" || u.Host == "" {
+	if err := clusterstate.ValidateCanonicalHTTPSBaseEndpoint(m.InternalEndpoint); err != nil {
 		return errors.New("raftstore: member internal endpoint must be an HTTPS URL")
 	}
 	host, port, err := net.SplitHostPort(m.RaftEndpoint)

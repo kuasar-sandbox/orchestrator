@@ -136,6 +136,14 @@ func workflowSandbox(id string) *types.Sandbox {
 	}
 }
 
+func sandboxEvent(update nodeexec.EventUpdate) nodeexec.EventUpdate {
+	presentation := clusterstate.SandboxPresentationV1{
+		CPUCount: 2, MemoryMB: 2048, DiskSizeMB: 64, EnvdVersion: "0.6.1", StartedAt: 1, EndAt: 2,
+	}
+	update.Presentation = &presentation
+	return update
+}
+
 func TestBuildAdmissionIsIdempotentConflictSafeAndBounded(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()
@@ -413,7 +421,7 @@ func TestSandboxJournalPreservesTokenBindingAndMonotonicOutbox(t *testing.T) {
 		t.Fatal(err)
 	}
 	sandbox := workflowSandbox(dispatch.ObjectID)
-	ready := nodeexec.EventUpdate{State: string(clusterstate.WorkflowRouteReady)}
+	ready := sandboxEvent(nodeexec.EventUpdate{State: string(clusterstate.WorkflowRouteReady)})
 	first, err := st.CommitSandboxEvent(ctx, sandbox, ready)
 	if err != nil || first.EventSeq != 1 || first.LatestEvent.DataEndpoint != dispatch.DataEndpoint {
 		t.Fatalf("ready = %+v, %v", first, err)
@@ -422,7 +430,7 @@ func TestSandboxJournalPreservesTokenBindingAndMonotonicOutbox(t *testing.T) {
 	if err != nil || retry.EventSeq != 1 {
 		t.Fatalf("ready retry = %+v, %v", retry, err)
 	}
-	if _, err := st.CommitSandboxEvent(ctx, sandbox, nodeexec.EventUpdate{State: string(clusterstate.WorkflowRoutePaused)}); err != nil {
+	if _, err := st.CommitSandboxEvent(ctx, sandbox, sandboxEvent(nodeexec.EventUpdate{State: string(clusterstate.WorkflowRoutePaused)})); err != nil {
 		t.Fatal(err)
 	}
 	resumed, err := st.CommitSandboxEvent(ctx, sandbox, ready)
@@ -433,6 +441,42 @@ func TestSandboxJournalPreservesTokenBindingAndMonotonicOutbox(t *testing.T) {
 	if err != nil || stored.State != types.StateRunning || stored.Metadata[clusterstate.ObjectMetadataKey] != dispatch.OpaqueBinding ||
 		stored.Metadata["user"] != "kept" {
 		t.Fatalf("stored Sandbox = %+v, %v", stored, err)
+	}
+}
+
+func TestSandboxPresentationUpdateAdvancesLiveOutbox(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	dispatch := workflowDispatch(t, clusterstate.ExecutionKindSandbox, "sandbox-presentation", placement.BuildDemand{})
+	decision := nodeexec.AdmissionDecision{
+		State: nodeexec.AdmissionAdmitted, Result: clusterstate.DispatchAcceptedAdmitted,
+		ReservationToken: "reservation-presentation",
+	}
+	if _, err := st.RecordSandboxWorkflow(ctx, dispatch, decision, workflowSandbox(dispatch.ObjectID)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.ClaimSandboxWorkflow(ctx, dispatch.ObjectID, dispatch.DemandDigest, decision.ReservationToken); err != nil {
+		t.Fatal(err)
+	}
+	update := sandboxEvent(nodeexec.EventUpdate{State: string(clusterstate.WorkflowRouteReady)})
+	first, err := st.CommitSandboxEvent(ctx, workflowSandbox(dispatch.ObjectID), update)
+	if err != nil || first.EventSeq != 1 {
+		t.Fatalf("initial presentation event = %+v, %v", first, err)
+	}
+	update.Presentation.EndAt++
+	second, err := st.CommitSandboxEvent(ctx, workflowSandbox(dispatch.ObjectID), update)
+	if err != nil || second.EventSeq != 2 || second.LatestEvent.Presentation.EndAt != update.Presentation.EndAt {
+		t.Fatalf("updated presentation event = %+v, %v", second, err)
+	}
+	update.Presentation.Metadata = map[string]string{"caller-mutated": "yes"}
+	if len(second.LatestEvent.Presentation.Metadata) != 0 {
+		t.Fatal("durable presentation aliases the caller-owned metadata map")
+	}
+	retry := sandboxEvent(nodeexec.EventUpdate{State: string(clusterstate.WorkflowRouteReady)})
+	retry.Presentation.EndAt++
+	third, err := st.CommitSandboxEvent(ctx, workflowSandbox(dispatch.ObjectID), retry)
+	if err != nil || third.EventSeq != 2 {
+		t.Fatalf("exact presentation retry = %+v, %v", third, err)
 	}
 }
 
@@ -451,9 +495,9 @@ func TestSandboxEventPreservesNewerBusinessObjectFields(t *testing.T) {
 		t.Fatal(err)
 	}
 	callback := workflowSandbox(dispatch.ObjectID)
-	if _, err := st.CommitSandboxEvent(ctx, callback, nodeexec.EventUpdate{
+	if _, err := st.CommitSandboxEvent(ctx, callback, sandboxEvent(nodeexec.EventUpdate{
 		State: string(clusterstate.WorkflowRouteReady),
-	}); err != nil {
+	})); err != nil {
 		t.Fatal(err)
 	}
 	current, err := st.Get(ctx, dispatch.ObjectID)
@@ -475,9 +519,9 @@ func TestSandboxEventPreservesNewerBusinessObjectFields(t *testing.T) {
 	stale.SnapshotRef = "stale-snapshot"
 	stale.RunID = "stale-run"
 	stale.Metadata["newer"] = "stale"
-	if _, err := st.CommitSandboxEvent(ctx, stale, nodeexec.EventUpdate{
+	if _, err := st.CommitSandboxEvent(ctx, stale, sandboxEvent(nodeexec.EventUpdate{
 		State: string(clusterstate.WorkflowRoutePaused),
-	}); err != nil {
+	})); err != nil {
 		t.Fatal(err)
 	}
 	stored, err := st.Get(ctx, dispatch.ObjectID)

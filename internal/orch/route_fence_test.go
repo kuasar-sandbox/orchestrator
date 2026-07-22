@@ -60,9 +60,9 @@ func TestManagedRouteSyncUsesDurableEventFence(t *testing.T) {
 	if err != nil || stored == nil {
 		t.Fatalf("stored Sandbox = %+v, %v", stored, err)
 	}
-	record, err := o.st.CommitSandboxEvent(ctx, stored, nodeexec.EventUpdate{
+	record, err := o.st.CommitSandboxEvent(ctx, stored, sandboxTestEvent(nodeexec.EventUpdate{
 		State: string(clusterstate.WorkflowRouteReady), TargetPort: 49983,
-	})
+	}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -173,9 +173,9 @@ func TestRebindClusterExecutionUsesDigestCAS(t *testing.T) {
 	if err != nil || stored == nil {
 		t.Fatalf("stored Sandbox = %+v, %v", stored, err)
 	}
-	if _, err := o.st.CommitSandboxEvent(ctx, stored, nodeexec.EventUpdate{
+	if _, err := o.st.CommitSandboxEvent(ctx, stored, sandboxTestEvent(nodeexec.EventUpdate{
 		State: string(clusterstate.WorkflowRouteReady), TargetPort: 49983,
-	}); err != nil {
+	})); err != nil {
 		t.Fatal(err)
 	}
 	cmd := &routesync.Command{

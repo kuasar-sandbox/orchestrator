@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	rtconfig "github.com/kuasar-sandbox/sandboxer/pkg/config"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
@@ -34,6 +35,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/store"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
+	"github.com/kuasar-sandbox/orchestrator/internal/util"
 	"github.com/kuasar-sandbox/orchestrator/internal/vswitch"
 )
 
@@ -393,7 +395,12 @@ func (o *Orchestrator) Connect(ctx context.Context, id, apiKey, migrationToken s
 		} else {
 			sb.DeadlineUnix = dl // not cached (fresh, unpublished) — safe in place
 		}
-		_ = o.st.SetDeadline(ctx, id, dl)
+		if err := o.st.SetDeadline(ctx, id, dl); err != nil {
+			return nil, err
+		}
+		if _, err := o.commitManagedSandboxState(ctx, sb, string(clusterstate.WorkflowRouteReady), ""); err != nil {
+			return nil, err
+		}
 	}
 	return sb, nil
 }
@@ -407,7 +414,15 @@ func (o *Orchestrator) SetTimeout(ctx context.Context, id, apiKey string, timeou
 		return false, nil
 	}
 	sb.DeadlineUnix = time.Now().Add(time.Duration(timeoutSec) * time.Second).Unix()
-	return true, o.st.SetDeadline(ctx, id, sb.DeadlineUnix)
+	if err := o.st.SetDeadline(ctx, id, sb.DeadlineUnix); err != nil {
+		return true, err
+	}
+	state := string(clusterstate.WorkflowRouteReady)
+	if sb.State == types.StatePaused {
+		state = string(clusterstate.WorkflowRoutePaused)
+	}
+	_, err = o.commitManagedSandboxState(ctx, sb, state, "")
+	return true, err
 }
 
 // resume restarts a paused sandbox from its snapshot (no api_key needed: the
@@ -457,10 +472,85 @@ func (o *Orchestrator) commitManagedSandboxState(ctx context.Context, sandbox *t
 	if err != nil {
 		return true, err
 	}
+	var previous *clusterstate.SandboxPresentationV1
+	if workflow.LatestEvent != nil {
+		previous = workflow.LatestEvent.Presentation
+	}
+	presentation, err := o.sandboxPresentation(sandbox, previous)
+	if err != nil {
+		return true, err
+	}
 	_, err = o.st.CommitSandboxEvent(ctx, sandbox, nodeexec.EventUpdate{
-		State: state, TargetPort: spec.TargetPort, Reason: reason,
+		State: state, TargetPort: spec.TargetPort, Reason: reason, Presentation: &presentation,
 	})
 	return true, err
+}
+
+func (o *Orchestrator) sandboxPresentation(
+	sandbox *types.Sandbox,
+	previous *clusterstate.SandboxPresentationV1,
+) (clusterstate.SandboxPresentationV1, error) {
+	if sandbox == nil || sandbox.ID == "" {
+		return clusterstate.SandboxPresentationV1{}, errors.New("orch: Sandbox presentation requires an object")
+	}
+	cpuCount, memoryMB, diskSizeMB, err := o.sandboxLaunchResources(sandbox)
+	if err != nil {
+		if previous == nil || previous.Validate() != nil {
+			return clusterstate.SandboxPresentationV1{}, err
+		}
+		cpuCount, memoryMB, diskSizeMB = previous.CPUCount, previous.MemoryMB, previous.DiskSizeMB
+	}
+	end := sandbox.DeadlineUnix
+	if end < sandbox.CreatedUnix {
+		end = sandbox.CreatedUnix
+	}
+	presentation := clusterstate.SandboxPresentationV1{
+		CPUCount: cpuCount, MemoryMB: memoryMB, DiskSizeMB: diskSizeMB,
+		EnvdVersion: api.EnvdVersion(sandbox.Profile()),
+		StartedAt:   sandbox.CreatedUnix, EndAt: end,
+		Metadata: clusterstate.WithoutSystemMetadata(sandbox.Metadata),
+	}
+	return presentation, presentation.Validate()
+}
+
+func (o *Orchestrator) sandboxLaunchResources(sandbox *types.Sandbox) (int, int, int, error) {
+	launchConfig, err := rtconfig.Load(o.sandboxConfigPath(sandbox))
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("orch: load Sandbox launch resources: %w", err)
+	}
+	memoryBytes, err := util.ParseSize(launchConfig.Resources.Capacity.Memory)
+	if err != nil || launchConfig.Resources.Capacity.CPU <= 0 || memoryBytes == 0 {
+		return 0, 0, 0, errors.Join(err, errors.New("orch: invalid Sandbox launch capacity"))
+	}
+	diffPath := filepath.Join(sandbox.BaseDir, sandbox.ID+".overlay.diff")
+	var diffURI, diffTemplateURI string
+	if launchConfig.SingleDisk() {
+		diffURI = launchConfig.Boot.Root.Diff
+		diffTemplateURI = launchConfig.Boot.Root.DiffTemplate
+	} else if launchConfig.Boot.Root.Overlay != nil {
+		diffURI = launchConfig.Boot.Root.Overlay.Diff
+		diffTemplateURI = launchConfig.Boot.Root.Overlay.DiffTemplate
+	}
+	if diffURI != "" {
+		scheme, path, ok := rtconfig.SchemeAndPath(diffURI)
+		if !ok || scheme != "file" {
+			return 0, 0, 0, errors.New("orch: Sandbox launch diff is not a local file")
+		}
+		diffPath = path
+	}
+	diffInfo, err := os.Stat(diffPath)
+	if err != nil || diffInfo.Size() <= 0 {
+		diffErr := errors.Join(err, errors.New("orch: Sandbox launch diff is unavailable"))
+		scheme, templatePath, ok := rtconfig.SchemeAndPath(diffTemplateURI)
+		if !ok || scheme != "file" {
+			return 0, 0, 0, diffErr
+		}
+		diffInfo, err = os.Stat(templatePath)
+		if err != nil || diffInfo.Size() <= 0 {
+			return 0, 0, 0, errors.Join(diffErr, err, errors.New("orch: Sandbox launch diff template is unavailable"))
+		}
+	}
+	return launchConfig.Resources.Capacity.CPU, int(memoryBytes >> 20), int(diffInfo.Size() >> 20), nil
 }
 
 // --- proxy.Router (internal mode) ---

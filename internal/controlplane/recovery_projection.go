@@ -100,7 +100,7 @@ func recoveredRoute(
 		AccessToken: event.AccessToken, TrafficAccessToken: event.TrafficAccessToken,
 		TemplateRef: event.TemplateRef, SnapshotRef: event.SnapshotRef,
 		RegistryGeneration: target.RegistryGeneration, BindingDigest: target.BindingDigest,
-		LastEventSeq: event.EventSeq, Intent: intent,
+		LastEventSeq: event.EventSeq, Intent: intent, Presentation: event.Presentation.Clone(),
 	}
 	if err := execution.Validate(); err != nil {
 		return clusterstate.RouteWorkflowRecord{}, err

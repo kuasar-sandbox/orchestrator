@@ -278,6 +278,7 @@ type EventUpdate struct {
 	SnapshotLocation   string
 	ArtifactRef        string
 	Reason             string
+	Presentation       *clusterstate.SandboxPresentationV1
 }
 
 type BuildCapacity struct {
