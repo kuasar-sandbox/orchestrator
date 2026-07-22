@@ -80,7 +80,9 @@ func (f *sandboxAdmissionFake) PromoteQueued() ([]nodectl.PreparedAdmissionResul
 	for _, result := range f.promoted {
 		f.prepared[result.SandboxID] = result
 	}
-	return append([]nodectl.PreparedAdmissionResult(nil), f.promoted...), f.promoteErr
+	changed := append([]nodectl.PreparedAdmissionResult(nil), f.promoted...)
+	f.promoted = nil
+	return changed, f.promoteErr
 }
 
 func (f *sandboxAdmissionFake) Wake() <-chan struct{} { return f.wake }
@@ -297,6 +299,42 @@ type failingRecordJournal struct {
 	*store.Store
 	err       error
 	committed bool
+}
+
+type failingPromotionJournal struct {
+	*store.Store
+	mu             sync.Mutex
+	admitFailures  int
+	rejectFailures int
+}
+
+func (j *failingPromotionJournal) AdmitQueuedSandbox(
+	ctx context.Context,
+	sandboxID, demandDigest, reservationToken string,
+) (*nodeexec.WorkflowRecord, error) {
+	j.mu.Lock()
+	if j.admitFailures > 0 {
+		j.admitFailures--
+		j.mu.Unlock()
+		return nil, errors.New("injected admission journal failure")
+	}
+	j.mu.Unlock()
+	return j.Store.AdmitQueuedSandbox(ctx, sandboxID, demandDigest, reservationToken)
+}
+
+func (j *failingPromotionJournal) FailPendingNodeWorkflow(
+	ctx context.Context,
+	kind clusterstate.ExecutionKind,
+	objectID, demandDigest, reason string,
+) (*nodeexec.WorkflowRecord, error) {
+	j.mu.Lock()
+	if j.rejectFailures > 0 {
+		j.rejectFailures--
+		j.mu.Unlock()
+		return nil, errors.New("injected rejection journal failure")
+	}
+	j.mu.Unlock()
+	return j.Store.FailPendingNodeWorkflow(ctx, kind, objectID, demandDigest, reason)
 }
 
 func (j *failingRecordJournal) RecordSandboxWorkflow(
@@ -666,6 +704,66 @@ func TestAuthoritySandboxQueuePromotionClaimFailureAndOriginalRetry(t *testing.T
 	pending, _, err := st.PendingExecutionEvents(context.Background(), "node-1", 7, routesync.EventCursor{}, 10, 1<<20)
 	if err != nil || len(pending) != 1 || pending[0].State != "ERROR" || pending[0].Reason != "launch_failed" {
 		t.Fatalf("pending failure = %+v, %v", pending, err)
+	}
+}
+
+func TestAuthorityRetriesJournalAfterDurableSandboxPromotion(t *testing.T) {
+	for _, test := range []struct {
+		name          string
+		promotedState string
+		reason        string
+		configure     func(*failingPromotionJournal)
+		wantState     nodeexec.AdmissionState
+	}{
+		{
+			name: "admitted", promotedState: nodectl.PreparedAdmitted,
+			configure: func(journal *failingPromotionJournal) { journal.admitFailures = 1 },
+			wantState: nodeexec.AdmissionAdmitted,
+		},
+		{
+			name: "rejected", promotedState: nodectl.PreparedRejected, reason: "queue_expired",
+			configure: func(journal *failingPromotionJournal) { journal.rejectFailures = 1 },
+			wantState: nodeexec.AdmissionTerminal,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			st := authorityStore(t)
+			journal := &failingPromotionJournal{Store: st}
+			test.configure(journal)
+			command := authorityCommand(t, clusterstate.ExecutionKindSandbox, "sandbox-retry-"+test.name)
+			sandbox := &sandboxAdmissionFake{
+				prepared: map[string]nodectl.PreparedAdmissionResult{
+					command.ObjectID: {
+						SandboxID: command.ObjectID, DemandDigest: command.Intent.DemandDigest,
+						State: nodectl.PreparedQueued, ReservationToken: "token-retry",
+					},
+				},
+				wake: make(chan struct{}),
+			}
+			authority := newAuthority(t, journal, sandbox)
+			if reply, err := authority.AdmitAndDispatch(context.Background(), command); err != nil ||
+				reply.Outcome != clusterstate.DispatchAcceptedQueued {
+				t.Fatalf("queued dispatch = %+v, %v", reply, err)
+			}
+			sandbox.promoted = []nodectl.PreparedAdmissionResult{{
+				SandboxID: command.ObjectID, DemandDigest: command.Intent.DemandDigest,
+				State: test.promotedState, ReservationToken: "token-retry", Reason: test.reason,
+			}}
+			if err := authority.PromoteSandboxQueue(context.Background()); err == nil {
+				t.Fatal("first journal failure was hidden")
+			}
+			queued, err := st.GetNodeWorkflow(context.Background(), clusterstate.ExecutionKindSandbox, command.ObjectID)
+			if err != nil || queued == nil || queued.AdmissionState != nodeexec.AdmissionQueued {
+				t.Fatalf("journal after failed promotion = %+v, %v", queued, err)
+			}
+			if err := authority.PromoteSandboxQueue(context.Background()); err != nil {
+				t.Fatalf("promotion retry = %v", err)
+			}
+			resolved, err := st.GetNodeWorkflow(context.Background(), clusterstate.ExecutionKindSandbox, command.ObjectID)
+			if err != nil || resolved == nil || resolved.AdmissionState != test.wantState {
+				t.Fatalf("journal after retry = %+v, %v", resolved, err)
+			}
+		})
 	}
 }
 

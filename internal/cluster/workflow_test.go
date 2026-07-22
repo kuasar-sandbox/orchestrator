@@ -130,6 +130,18 @@ func TestPausedRouteRetainsBoundExecutionIntent(t *testing.T) {
 	}
 }
 
+func TestResumingRouteRetainsBoundExecutionIntent(t *testing.T) {
+	execution := *readyRoute()
+	resuming := ResumingRouteState{Execution: execution, Intent: execution.Intent}
+	if err := resuming.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	resuming.Intent.ProviderPolicyVersion = "another-policy"
+	if err := resuming.Validate(); err == nil {
+		t.Fatal("RESUMING accepted an intent from another execution plan")
+	}
+}
+
 func TestRouteTombstoneCarriesExactExecutionFence(t *testing.T) {
 	binding := sha256.Sum256([]byte("binding"))
 	proof := TerminalProof{Kind: ProofNodeTerminal, FencedNodeID: "n1", FencedNodeEpoch: 7}

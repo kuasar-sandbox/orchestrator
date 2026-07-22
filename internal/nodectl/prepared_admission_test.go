@@ -260,6 +260,54 @@ func TestPreparedAdmissionOrdinaryAdmitAttachesClaimedReservation(t *testing.T) 
 	}
 }
 
+func TestPreparedAdmissionReattachRequiresExactCgroupAndIdleReservation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	state := preparedTestState()
+	controller := preparedTestController(t, state, path, 4)
+	demand := preparedTestDemand(1 << 30)
+	digest := preparedDigest("reattach-fence")
+	prepared, err := controller.PrepareAdmission("sandbox-reattach", digest, demand)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := controller.ClaimAdmission("sandbox-reattach", digest); err != nil {
+		t.Fatal(err)
+	}
+
+	firstServer, firstClient := net.Pipe()
+	defer firstServer.Close()
+	defer firstClient.Close()
+	secondServer, secondClient := net.Pipe()
+	defer secondServer.Close()
+	defer secondClient.Close()
+	server := &Server{
+		State: state, Admission: controller.admission, PreparedAdmission: controller,
+		Allocator: NewAllocator(AllocatorPolicy{}), Persister: controller.persister, Logf: t.Logf,
+		peerCgroup: func(net.Conn) (string, error) { return demand.CgroupPath, nil },
+	}
+	var token string
+	if response, handled := server.handlePreparedAdmit(firstServer, demand.message("sandbox-reattach"), &token); !handled || response.Status != StatusAdmitted {
+		t.Fatalf("initial attach = %+v, handled=%v", response, handled)
+	}
+
+	token = ""
+	response := server.handleReattach(secondServer, &Message{Type: TypeReattach, Token: prepared.ReservationToken}, &token)
+	if response.Type != TypeError || token != "" {
+		t.Fatalf("active reservation reattach = %+v token=%q", response, token)
+	}
+	server.handleConnDrop(prepared.ReservationToken)
+	server.peerCgroup = func(net.Conn) (string, error) { return "/sys/fs/cgroup/another.service", nil }
+	response = server.handleReattach(secondServer, &Message{Type: TypeReattach, Token: prepared.ReservationToken}, &token)
+	if response.Type != TypeError || token != "" {
+		t.Fatalf("foreign cgroup reattach = %+v token=%q", response, token)
+	}
+	server.peerCgroup = func(net.Conn) (string, error) { return demand.CgroupPath, nil }
+	response = server.handleReattach(secondServer, &Message{Type: TypeReattach, Token: prepared.ReservationToken}, &token)
+	if response.Type != TypeAck || token != prepared.ReservationToken || response.Token != prepared.ReservationToken {
+		t.Fatalf("verified reattach = %+v token=%q", response, token)
+	}
+}
+
 func TestPreparedAdmissionAttachAcceptsAdjustedAllocation(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.json")
 	state := preparedTestState()
@@ -832,6 +880,46 @@ func TestOrdinaryReleaseWakesPreparedAdmissionQueue(t *testing.T) {
 	if err != nil || len(promoted) != 1 || promoted[0].SandboxID != "sandbox-prepared" ||
 		promoted[0].State != PreparedAdmitted {
 		t.Fatalf("promotion after ordinary release = %+v, %v", promoted, err)
+	}
+}
+
+func TestOrdinarySettledWakesPreparedAdmissionQueue(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	state := preparedTestState()
+	controller := preparedTestController(t, state, path, 4)
+	serverConn, clientConn := net.Pipe()
+	defer serverConn.Close()
+	defer clientConn.Close()
+	server := &Server{
+		State: state, Admission: controller.admission, PreparedAdmission: controller,
+		Allocator: NewAllocator(AllocatorPolicy{}), Persister: controller.persister, Logf: t.Logf,
+	}
+	ordinaryDemand := preparedTestDemand(15 << 30)
+	ordinaryDemand.FloorMemoryBytes = 1 << 30
+	var token string
+	if result := server.handleAdmit(serverConn, ordinaryDemand.message("sandbox-ordinary"), &token); result == nil || result.Status != StatusAdmitted {
+		t.Fatalf("ordinary admission = %+v", result)
+	}
+	queuedDigest := preparedDigest("settled-waiter")
+	queued, err := controller.PrepareAdmission("sandbox-prepared", queuedDigest, preparedTestDemand(2<<30))
+	if err != nil || queued.State != PreparedQueued {
+		t.Fatalf("prepared admission = %+v, %v", queued, err)
+	}
+	drainPreparedWake(controller)
+
+	response := server.handleSettled(&Message{CurrentRSS: 1 << 30}, token)
+	if response.Type != TypeAck {
+		t.Fatalf("settled response = %+v", response)
+	}
+	select {
+	case <-controller.Wake():
+	case <-time.After(time.Second):
+		t.Fatal("prepared queue was not woken after ordinary sandbox settled")
+	}
+	promoted, err := controller.PromoteQueued()
+	if err != nil || len(promoted) != 1 || promoted[0].SandboxID != "sandbox-prepared" ||
+		promoted[0].State != PreparedAdmitted {
+		t.Fatalf("promotion after settled = %+v, %v", promoted, err)
 	}
 }
 

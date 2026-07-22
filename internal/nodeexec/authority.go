@@ -77,6 +77,8 @@ type Authority struct {
 	workWake       chan struct{}
 	sessionMu      sync.RWMutex
 	sessionFenced  bool
+	promotionMu    sync.Mutex
+	promotionRetry map[string]nodectl.PreparedAdmissionResult
 	buildBatchSize int
 }
 
@@ -97,7 +99,8 @@ func NewAuthority(
 		journal: journal, sandbox: sandbox, identity: identity,
 		buildCapacity: buildCapacity, buildObject: buildObject,
 		sandboxObject: sandboxObject, sandboxDemand: sandboxDemand,
-		workWake: make(chan struct{}, 1), buildBatchSize: 64,
+		workWake: make(chan struct{}, 1), promotionRetry: make(map[string]nodectl.PreparedAdmissionResult),
+		buildBatchSize: 64,
 	}, nil
 }
 
@@ -336,37 +339,52 @@ func (a *Authority) PromoteSandboxQueue(ctx context.Context) error {
 		return ErrSessionFenced
 	}
 	defer done()
+	a.promotionMu.Lock()
+	defer a.promotionMu.Unlock()
 	changed, promoteErr := a.sandbox.PromoteQueued()
 	joined := promoteErr
 	for _, result := range changed {
-		record, getErr := a.journal.GetNodeWorkflow(ctx, clusterstate.ExecutionKindSandbox, result.SandboxID)
-		if getErr != nil {
-			joined = errors.Join(joined, getErr)
+		a.promotionRetry[result.SandboxID] = result
+	}
+	for sandboxID, result := range a.promotionRetry {
+		if err := a.applySandboxPromotion(ctx, result); err != nil {
+			joined = errors.Join(joined, err)
 			continue
 		}
-		if record == nil || record.DemandDigest != result.DemandDigest {
-			joined = errors.Join(joined, fmt.Errorf("nodeexec: queued Sandbox %s has no matching journal", result.SandboxID))
-			continue
-		}
-		switch result.State {
-		case nodectl.PreparedAdmitted:
-			if _, err := a.journal.AdmitQueuedSandbox(ctx, result.SandboxID, result.DemandDigest, result.ReservationToken); err != nil {
-				joined = errors.Join(joined, err)
-				continue
-			}
-			a.notifyWork()
-		case nodectl.PreparedRejected:
-			reason := result.Reason
-			if reason == "" {
-				reason = "resource_admission_rejected"
-			}
-			if _, err := a.journal.FailPendingNodeWorkflow(ctx, clusterstate.ExecutionKindSandbox,
-				result.SandboxID, result.DemandDigest, reason); err != nil {
-				joined = errors.Join(joined, err)
-			}
-		}
+		delete(a.promotionRetry, sandboxID)
 	}
 	return joined
+}
+
+func (a *Authority) applySandboxPromotion(ctx context.Context, result nodectl.PreparedAdmissionResult) error {
+	record, err := a.journal.GetNodeWorkflow(ctx, clusterstate.ExecutionKindSandbox, result.SandboxID)
+	if err != nil {
+		return err
+	}
+	if record == nil || record.DemandDigest != result.DemandDigest {
+		return fmt.Errorf("nodeexec: queued Sandbox %s has no matching journal", result.SandboxID)
+	}
+	switch result.State {
+	case nodectl.PreparedAdmitted:
+		if _, err := a.journal.AdmitQueuedSandbox(
+			ctx, result.SandboxID, result.DemandDigest, result.ReservationToken,
+		); err != nil {
+			return err
+		}
+		a.notifyWork()
+		return nil
+	case nodectl.PreparedRejected:
+		reason := result.Reason
+		if reason == "" {
+			reason = "resource_admission_rejected"
+		}
+		_, err := a.journal.FailPendingNodeWorkflow(
+			ctx, clusterstate.ExecutionKindSandbox, result.SandboxID, result.DemandDigest, reason,
+		)
+		return err
+	default:
+		return fmt.Errorf("nodeexec: queued Sandbox %s promoted to invalid controller state %s", result.SandboxID, result.State)
+	}
 }
 
 // ReconcileSandboxAdmissions repairs every cross-file crash boundary without
