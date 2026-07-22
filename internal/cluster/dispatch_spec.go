@@ -50,7 +50,7 @@ func (s SandboxDispatchSpecV1) Validate() error {
 	if _, exists := s.RequestedConfig[ObjectMetadataKey]; exists {
 		return errors.New("cluster: requested config cannot supply system-owned metadata")
 	}
-	if err := validateDispatchRequest(s.Request, "/sandboxes", "/v2/sandboxes"); err != nil {
+	if err := validateDispatchRequest(s.Request, "/sandboxes"); err != nil {
 		return fmt.Errorf("cluster: Sandbox dispatch request: %w", err)
 	}
 	if err := validateConfigHeaders(s.Request.Header, s.Config, false); err != nil {
@@ -99,7 +99,7 @@ func (s BuildDispatchSpecV1) Validate() error {
 	if _, exists := s.Metadata[ObjectMetadataKey]; exists {
 		return errors.New("cluster: dispatch spec cannot supply system-owned metadata")
 	}
-	if err := validateDispatchRequest(s.Request, "/templates", "/v3/templates"); err != nil {
+	if err := validateDispatchRequest(s.Request, "/v3/templates"); err != nil {
 		return fmt.Errorf("cluster: Build dispatch request: %w", err)
 	}
 	if err := validateConfigHeaders(s.Request.Header, s.Metadata, true); err != nil {
