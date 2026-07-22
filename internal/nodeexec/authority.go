@@ -16,9 +16,14 @@ type IdentitySource func(context.Context) (LocalSessionIdentity, error)
 
 type BuildCapacitySource func(context.Context) (BuildCapacity, string, error)
 
-type SandboxDemandSource func(DispatchRecord) (nodectl.SandboxAdmissionDemand, error)
+type SandboxDemandSource func(context.Context, DispatchRecord) (nodectl.SandboxAdmissionDemand, error)
 
-type BuildObjectSource func(DispatchRecord) (*types.Build, error)
+// SandboxObjectSource resolves the exact group/AuthKey/ManifestKey lease named
+// by the immutable dispatch and copies that key material into a persistable
+// node-local object before resource Admission can be accepted.
+type SandboxObjectSource func(context.Context, DispatchRecord) (*types.Sandbox, error)
+
+type BuildObjectSource func(context.Context, DispatchRecord) (*types.Build, error)
 
 type SandboxAdmissionController interface {
 	GetAdmission(string, string) (nodectl.PreparedAdmissionResult, error)
@@ -35,7 +40,7 @@ type SandboxAdmissionController interface {
 type WorkflowJournal interface {
 	GetNodeWorkflow(context.Context, clusterstate.ExecutionKind, string) (*WorkflowRecord, error)
 	ExecutionObjectExists(context.Context, clusterstate.ExecutionKind, string) (bool, error)
-	RecordSandboxWorkflow(context.Context, DispatchRecord, AdmissionDecision) (*WorkflowRecord, error)
+	RecordSandboxWorkflow(context.Context, DispatchRecord, AdmissionDecision, *types.Sandbox) (*WorkflowRecord, error)
 	AdmitQueuedSandbox(context.Context, string, string, string) (*WorkflowRecord, error)
 	ClaimSandboxWorkflow(context.Context, string, string, string) (*WorkflowRecord, error)
 	PrepareBuildWorkflow(context.Context, DispatchRecord, *types.Build, BuildCapacity, string) (*WorkflowRecord, error)
@@ -57,6 +62,7 @@ type Authority struct {
 	identity       IdentitySource
 	buildCapacity  BuildCapacitySource
 	buildObject    BuildObjectSource
+	sandboxObject  SandboxObjectSource
 	sandboxDemand  SandboxDemandSource
 	workWake       chan struct{}
 	sessionMu      sync.RWMutex
@@ -70,14 +76,17 @@ func NewAuthority(
 	identity IdentitySource,
 	buildCapacity BuildCapacitySource,
 	buildObject BuildObjectSource,
+	sandboxObject SandboxObjectSource,
 	sandboxDemand SandboxDemandSource,
 ) (*Authority, error) {
-	if journal == nil || sandbox == nil || identity == nil || buildCapacity == nil || buildObject == nil || sandboxDemand == nil {
+	if journal == nil || sandbox == nil || identity == nil || buildCapacity == nil || buildObject == nil ||
+		sandboxObject == nil || sandboxDemand == nil {
 		return nil, errors.New("nodeexec: authority requires journal, Admission, identity, capacity, and demand sources")
 	}
 	return &Authority{
 		journal: journal, sandbox: sandbox, identity: identity,
-		buildCapacity: buildCapacity, buildObject: buildObject, sandboxDemand: sandboxDemand,
+		buildCapacity: buildCapacity, buildObject: buildObject,
+		sandboxObject: sandboxObject, sandboxDemand: sandboxDemand,
 		workWake: make(chan struct{}, 1), buildBatchSize: 64,
 	}, nil
 }
@@ -171,7 +180,11 @@ func (a *Authority) AdmitAndDispatch(
 	var record *WorkflowRecord
 	switch dispatch.Kind {
 	case clusterstate.ExecutionKindSandbox:
-		demand, err := a.sandboxDemand(dispatch)
+		sandboxObject, err := a.sandboxObject(ctx, dispatch)
+		if err != nil {
+			return session.DispatchReply{}, err
+		}
+		demand, err := a.sandboxDemand(ctx, dispatch)
 		if err != nil {
 			return session.DispatchReply{}, err
 		}
@@ -186,7 +199,7 @@ func (a *Authority) AdmitAndDispatch(
 		if err != nil {
 			return session.DispatchReply{}, err
 		}
-		record, err = a.journal.RecordSandboxWorkflow(ctx, dispatch, decision)
+		record, err = a.journal.RecordSandboxWorkflow(ctx, dispatch, decision, sandboxObject)
 		if err != nil {
 			if errors.Is(err, ErrWorkflowConflict) {
 				if decision.ReservationToken != "" {
@@ -216,7 +229,7 @@ func (a *Authority) AdmitAndDispatch(
 			return session.DispatchReply{}, prepareErr
 		}
 	case clusterstate.ExecutionKindBuild:
-		build, err := a.buildObject(dispatch)
+		build, err := a.buildObject(ctx, dispatch)
 		if err != nil {
 			return session.DispatchReply{}, err
 		}

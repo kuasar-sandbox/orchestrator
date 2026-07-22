@@ -179,7 +179,7 @@ func newAuthorityWithCapacity(
 			}, nil
 		},
 		capacity,
-		func(record nodeexec.DispatchRecord) (*types.Build, error) {
+		func(_ context.Context, record nodeexec.DispatchRecord) (*types.Build, error) {
 			return &types.Build{
 				BuildID: record.ObjectID, TemplateID: "transient-" + record.ObjectID,
 				AuthKey: strings.Repeat("3", 64), ManifestKey: strings.Repeat("4", 64),
@@ -187,7 +187,14 @@ func newAuthorityWithCapacity(
 				Kind: types.KindImg, CreatedUnix: time.Now().Unix(),
 			}, nil
 		},
-		func(nodeexec.DispatchRecord) (nodectl.SandboxAdmissionDemand, error) {
+		func(_ context.Context, record nodeexec.DispatchRecord) (*types.Sandbox, error) {
+			return &types.Sandbox{
+				ID: record.ObjectID, TemplateID: "bare-img-" + strings.Repeat("5", 64),
+				AuthKey: strings.Repeat("3", 64), ManifestKey: strings.Repeat("4", 64),
+				CreatedUnix: time.Now().Unix(),
+			}, nil
+		},
+		func(context.Context, nodeexec.DispatchRecord) (nodectl.SandboxAdmissionDemand, error) {
 			return nodectl.SandboxAdmissionDemand{
 				CapacityMemoryBytes: 1 << 30, CapacityCPU: 2, FloorMemoryBytes: 512 << 20,
 				FloorCPU: 1, StartupBudgetMemory: 1 << 30,
@@ -198,6 +205,54 @@ func newAuthorityWithCapacity(
 		t.Fatal(err)
 	}
 	return authority
+}
+
+func TestAuthorityRejectsMissingExactKeyLeaseBeforeSandboxAdmission(t *testing.T) {
+	st := authorityStore(t)
+	command := authorityCommand(t, clusterstate.ExecutionKindSandbox, "sandbox-missing-key-lease")
+	sandbox := &sandboxAdmissionFake{
+		prepared: map[string]nodectl.PreparedAdmissionResult{
+			command.ObjectID: {
+				SandboxID: command.ObjectID, DemandDigest: command.Intent.DemandDigest,
+				State: nodectl.PreparedAdmitted, ReservationToken: "must-not-be-reserved",
+			},
+		},
+		wake: make(chan struct{}),
+	}
+	missingLease := errors.New("exact node key lease is absent or expired")
+	demandCalled := false
+	authority, err := nodeexec.NewAuthority(
+		st, sandbox,
+		func(context.Context) (nodeexec.LocalSessionIdentity, error) {
+			return nodeexec.LocalSessionIdentity{
+				NodeID: "node-1", NodeEpoch: 7, SessionSeq: 11, DataEndpoint: "10.0.0.1:8443",
+			}, nil
+		},
+		func(context.Context) (nodeexec.BuildCapacity, string, error) {
+			return nodeexec.BuildCapacity{Slots: 1, QueueLimit: 1}, "", nil
+		},
+		func(context.Context, nodeexec.DispatchRecord) (*types.Build, error) { return nil, nil },
+		func(context.Context, nodeexec.DispatchRecord) (*types.Sandbox, error) { return nil, missingLease },
+		func(context.Context, nodeexec.DispatchRecord) (nodectl.SandboxAdmissionDemand, error) {
+			demandCalled = true
+			return nodectl.SandboxAdmissionDemand{}, nil
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := authority.AdmitAndDispatch(context.Background(), command); !errors.Is(err, missingLease) {
+		t.Fatalf("dispatch error = %v", err)
+	}
+	if sandbox.prepares != 0 || demandCalled {
+		t.Fatalf("missing lease reached Admission: prepares=%d demand_called=%v", sandbox.prepares, demandCalled)
+	}
+	if record, err := st.GetNodeWorkflow(context.Background(), clusterstate.ExecutionKindSandbox, command.ObjectID); err != nil || record != nil {
+		t.Fatalf("missing lease left workflow = %+v, %v", record, err)
+	}
+	if object, err := st.Get(context.Background(), command.ObjectID); err != nil || object != nil {
+		t.Fatalf("missing lease left Sandbox object = %+v, %v", object, err)
+	}
 }
 
 type recordBarrierJournal struct {
@@ -227,6 +282,7 @@ func (j *recordBarrierJournal) RecordSandboxWorkflow(
 	ctx context.Context,
 	dispatch nodeexec.DispatchRecord,
 	decision nodeexec.AdmissionDecision,
+	sandbox *types.Sandbox,
 ) (*nodeexec.WorkflowRecord, error) {
 	j.mu.Lock()
 	j.arrived++
@@ -241,7 +297,7 @@ func (j *recordBarrierJournal) RecordSandboxWorkflow(
 	}
 	j.mu.Lock()
 	defer j.mu.Unlock()
-	return j.Store.RecordSandboxWorkflow(ctx, dispatch, decision)
+	return j.Store.RecordSandboxWorkflow(ctx, dispatch, decision, sandbox)
 }
 
 type concurrentSandboxAdmission struct {
@@ -785,7 +841,7 @@ func TestFinalizeRemovesAdmissionBeforePersistingCompactionMarker(t *testing.T) 
 	}
 	record, err := st.RecordSandboxWorkflow(context.Background(), dispatch, nodeexec.AdmissionDecision{
 		State: nodeexec.AdmissionRejected, Result: clusterstate.DispatchDefinitiveReject, Reason: "rejected",
-	})
+	}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
