@@ -14,6 +14,8 @@ import (
 
 const DispatchSpecVersionV1 uint16 = 1
 
+const MaxSandboxTimeoutSeconds int64 = (1<<63 - 1) / 1_000_000_000
+
 type SandboxDispatchSpecV1 struct {
 	Version                uint16                `json:"version"`
 	TemplateRef            string                `json:"template_ref"`
@@ -38,7 +40,8 @@ func (s SandboxDispatchSpecV1) Validate() error {
 	if err := validateKeyFingerprints(s.AuthKeyFingerprint, s.ManifestKeyFingerprint); err != nil {
 		return fmt.Errorf("cluster: Sandbox dispatch spec: %w", err)
 	}
-	if s.TargetPort < 0 || s.TargetPort > 65535 || s.TimeoutSeconds < 0 {
+	if s.TargetPort < 0 || s.TargetPort > 65535 || s.TimeoutSeconds < 0 ||
+		int64(s.TimeoutSeconds) > MaxSandboxTimeoutSeconds {
 		return errors.New("cluster: invalid Sandbox target port or timeout")
 	}
 	if _, exists := s.Config[ObjectMetadataKey]; exists {
@@ -51,6 +54,12 @@ func (s SandboxDispatchSpecV1) Validate() error {
 		return fmt.Errorf("cluster: Sandbox dispatch request: %w", err)
 	}
 	if err := validateSandboxTemplateRef(s.Request.Body, s.TemplateRef); err != nil {
+		return fmt.Errorf("cluster: Sandbox dispatch request: %w", err)
+	}
+	if err := validateExactRequestField(s.Request.Body, "timeout", s.TimeoutSeconds); err != nil {
+		return fmt.Errorf("cluster: Sandbox dispatch request: %w", err)
+	}
+	if err := validateExactRequestField(s.Request.Body, "metadata", s.Config); err != nil {
 		return fmt.Errorf("cluster: Sandbox dispatch request: %w", err)
 	}
 	return nil
@@ -89,6 +98,23 @@ func (s BuildDispatchSpecV1) Validate() error {
 	}
 	if err := validateBuildResourceCeilings(s.Request.Body, s.CPUCount, s.MemoryMB); err != nil {
 		return fmt.Errorf("cluster: Build dispatch request: %w", err)
+	}
+	name := ""
+	if len(s.Names) > 0 {
+		name = s.Names[0]
+	}
+	for _, field := range []struct {
+		name  string
+		value any
+	}{
+		{name: "name", value: name},
+		{name: "tags", value: s.Aliases},
+		{name: "profile", value: string(s.Profile)},
+		{name: "metadata", value: s.Metadata},
+	} {
+		if err := validateExactRequestField(s.Request.Body, field.name, field.value); err != nil {
+			return fmt.Errorf("cluster: Build dispatch request: %w", err)
+		}
 	}
 	return nil
 }
@@ -231,25 +257,29 @@ func validateBuildResourceCeilings(body []byte, cpuCount, memoryMB int) error {
 }
 
 func validateSandboxTemplateRef(body []byte, templateRef string) error {
+	return validateExactRequestField(body, "templateID", templateRef)
+}
+
+func validateExactRequestField(body []byte, field string, expected any) error {
 	fields, err := DecodeJSONObject(body)
 	if err != nil {
 		return err
 	}
 	for name := range fields {
-		if strings.EqualFold(name, "templateID") && name != "templateID" {
-			return fmt.Errorf("template field %q must use canonical spelling", name)
+		if strings.EqualFold(name, field) && name != field {
+			return fmt.Errorf("request field %q must use canonical spelling", name)
 		}
 	}
-	raw, ok := fields["templateID"]
-	if !ok {
-		return errors.New("replayed Sandbox request is missing templateID")
+	raw, found := fields[field]
+	if !found {
+		return fmt.Errorf("replayed request is missing %s", field)
 	}
-	var bodyTemplate string
-	if err := json.Unmarshal(raw, &bodyTemplate); err != nil || bodyTemplate == "" {
-		return errors.New("replayed Sandbox templateID must be a non-empty string")
+	encoded, err := json.Marshal(expected)
+	if err != nil {
+		return fmt.Errorf("encode expected %s: %w", field, err)
 	}
-	if bodyTemplate != templateRef {
-		return errors.New("replayed Sandbox templateID differs from TemplateRef")
+	if !bytes.Equal(raw, encoded) {
+		return fmt.Errorf("replayed request %s differs from immutable dispatch value", field)
 	}
 	return nil
 }

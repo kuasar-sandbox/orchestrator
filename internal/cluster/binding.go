@@ -73,9 +73,13 @@ func DecodeExecutionBinding(opaque string) (ExecutionBinding, error) {
 	if !strings.HasPrefix(opaque, ExecutionBindingPrefix) {
 		return ExecutionBinding{}, errors.New("cluster: unsupported execution binding version")
 	}
-	payload, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(opaque, ExecutionBindingPrefix))
+	segment := strings.TrimPrefix(opaque, ExecutionBindingPrefix)
+	payload, err := base64.RawURLEncoding.Strict().DecodeString(segment)
 	if err != nil {
 		return ExecutionBinding{}, fmt.Errorf("cluster: decode execution binding: %w", err)
+	}
+	if base64.RawURLEncoding.EncodeToString(payload) != segment {
+		return ExecutionBinding{}, errors.New("cluster: execution binding is not canonically encoded")
 	}
 	if len(payload) > MaxExecutionBindingSize {
 		return ExecutionBinding{}, fmt.Errorf("cluster: execution binding exceeds %d bytes", MaxExecutionBindingSize)
