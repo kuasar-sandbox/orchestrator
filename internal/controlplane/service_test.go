@@ -120,6 +120,12 @@ func TestRegistryReadyPositiveReadStillChecksImmutableSandboxRequest(t *testing.
 	if err != nil || conflict.Outcome != routeapi.MutationConflict {
 		t.Fatalf("changed READY Reserve = %+v, %v", conflict, err)
 	}
+	changed = request
+	changed.Input.TemplateRef = "e2b-img-" + strings.Repeat("d", 64)
+	conflict, err = service.ReserveSandbox(context.Background(), changed)
+	if err != nil || conflict.Outcome != routeapi.MutationConflict {
+		t.Fatalf("changed template READY Reserve = %+v, %v", conflict, err)
+	}
 	if planner.callCount() != 1 || len(dispatcher.snapshot()) != 1 {
 		t.Fatal("READY positive read invoked placement or dispatch")
 	}

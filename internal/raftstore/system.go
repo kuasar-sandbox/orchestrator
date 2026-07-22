@@ -552,6 +552,17 @@ type NodeRegistrationCommand struct {
 	Draining         bool              `json:"draining,omitempty"`
 }
 
+func catalogStableWithinNodeEpoch(catalog NodeCatalogRecord, registration NodeRegistrationCommand) bool {
+	return catalog.RuntimeDigest == registration.RuntimeDigest &&
+		reflect.DeepEqual(catalog.Labels, registration.Labels) &&
+		reflect.DeepEqual(catalog.Capabilities, registration.Capabilities) &&
+		catalog.FailureDomain == registration.FailureDomain &&
+		catalog.LoadModelVersion == registration.LoadModelVersion &&
+		catalog.SandboxSlots == registration.SandboxSlots && catalog.BuildSlots == registration.BuildSlots &&
+		catalog.BuildCPU == registration.BuildCPU && catalog.BuildMemory == registration.BuildMemory &&
+		catalog.BuildStorage == registration.BuildStorage
+}
+
 type NodeRetirementCommand struct {
 	NodeID        string `json:"node_id"`
 	EnrollmentID  string `json:"enrollment_id"`
@@ -860,7 +871,9 @@ func ApplySystemCommand(state SystemState, index uint64, command SystemCommand) 
 		current, found := state.NodeEnrollments[registration.NodeID]
 		if !found || current.Retired || current.EnrollmentID != registration.EnrollmentID ||
 			registration.NodeEpoch < current.MaxNodeEpoch ||
-			registration.NodeEpoch == current.MaxNodeEpoch && registration.DataEndpoint != current.DataEndpoint {
+			registration.NodeEpoch == current.MaxNodeEpoch && registration.DataEndpoint != current.DataEndpoint ||
+			registration.NodeEpoch == current.MaxNodeEpoch && current.Catalog != nil &&
+				!catalogStableWithinNodeEpoch(*current.Catalog, *registration) {
 			return state, systemConflict("node registration is not authorized by its durable enrollment")
 		}
 		next.NodeEnrollments = cloneNodeEnrollments(state.NodeEnrollments)

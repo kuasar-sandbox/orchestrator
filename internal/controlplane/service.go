@@ -999,7 +999,8 @@ func sandboxInputMatchesIntent(input routeapi.SandboxInput, intent clusterstate.
 	}
 	spec, err := clusterstate.ParseSandboxDispatchSpec(intent.DispatchSpec)
 	if err != nil || spec.TimeoutSeconds != input.TimeoutSeconds ||
-		spec.TargetRuntimeDigest != input.TargetRuntimeDigest {
+		spec.TargetRuntimeDigest != input.TargetRuntimeDigest ||
+		input.TemplateRef != "" && input.TemplateRef != spec.TemplateRef {
 		return false
 	}
 	normalizedRequest, err := api.RewriteSandboxCreateEnvelope(

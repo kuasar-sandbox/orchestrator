@@ -123,6 +123,17 @@ func TestDataRecoveryNodeStagingResetReplacesPartialReport(t *testing.T) {
 		state.RecoveryRecords[recoveryRecordKey(current)].ReportDigest != current.ReportDigest {
 		t.Fatalf("replacement report was not staged exactly: %+v", state.RecoveryRecords)
 	}
+	applyDataOK(t, &state, 7, DataCommand{
+		Type: DataResetRecoveryNode, Identity: identity,
+		RecoveryReset: &RecoveryNodeStagingReset{
+			RecoveryEpoch: recovery.RecoveryEpoch, NodeID: current.NodeID,
+			NodeEpoch: current.NodeEpoch, SessionSeq: current.SessionSeq - 1,
+		},
+	})
+	if len(state.RecoveryRecords) != 1 || len(state.RecoveryClaims) != 1 ||
+		state.RecoveryRecords[recoveryRecordKey(current)].ReportDigest != current.ReportDigest {
+		t.Fatalf("delayed staging reset erased a newer report: %+v", state.RecoveryRecords)
+	}
 	if err := state.Validate(); err != nil {
 		t.Fatal(err)
 	}

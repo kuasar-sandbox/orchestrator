@@ -254,41 +254,65 @@ func TestNodeRegistrationRequiresExplicitEnrollmentAndFencesEpochRollback(t *tes
 	if record.Catalog == nil || record.Catalog.SandboxSlots != 64 || record.MaxNodeEpoch != 1 {
 		t.Fatalf("accepted enrollment = %+v", record)
 	}
+	for name, mutate := range map[string]func(*NodeRegistrationCommand){
+		"runtime":    func(value *NodeRegistrationCommand) { value.RuntimeDigest = "runtime-v2" },
+		"labels":     func(value *NodeRegistrationCommand) { value.Labels = map[string]string{"pool": "other"} },
+		"capability": func(value *NodeRegistrationCommand) { value.Capabilities = map[string]bool{"build": true} },
+		"capacity":   func(value *NodeRegistrationCommand) { value.SandboxSlots++ },
+	} {
+		t.Run(name, func(t *testing.T) {
+			changed := *registration
+			mutate(&changed)
+			if _, result := ApplySystemCommand(state, 5, SystemCommand{
+				Type: SystemAcceptNodeRegistration, Registration: &changed,
+			}); !result.Conflict {
+				t.Fatal("same NodeEpoch changed stable catalog fields")
+			}
+		})
+	}
+	draining := *registration
+	draining.Draining = true
+	state, _ = applySystem(t, state, 5, SystemCommand{
+		Type: SystemAcceptNodeRegistration, Registration: &draining,
+	})
+	if !state.NodeEnrollments[registration.NodeID].Catalog.Draining {
+		t.Fatal("same NodeEpoch could not update the mutable draining hint")
+	}
 
 	wrongEndpoint := *registration
 	wrongEndpoint.DataEndpoint = "10.0.0.2:8443"
-	if _, result := ApplySystemCommand(state, 5, SystemCommand{
+	if _, result := ApplySystemCommand(state, 6, SystemCommand{
 		Type: SystemAcceptNodeRegistration, Registration: &wrongEndpoint,
 	}); !result.Conflict {
 		t.Fatal("same NodeEpoch changed data endpoint")
 	}
 	newEpoch := wrongEndpoint
 	newEpoch.NodeEpoch = 2
-	state, _ = applySystem(t, state, 6, SystemCommand{
+	state, _ = applySystem(t, state, 7, SystemCommand{
 		Type: SystemAcceptNodeRegistration, Registration: &newEpoch,
 	})
 	if state.NodeEnrollments[registration.NodeID].MaxNodeEpoch != 2 ||
 		state.NodeEnrollments[registration.NodeID].DataEndpoint != newEpoch.DataEndpoint {
 		t.Fatalf("new NodeEpoch was not committed: %+v", state.NodeEnrollments[registration.NodeID])
 	}
-	if _, result := ApplySystemCommand(state, 7, SystemCommand{
+	if _, result := ApplySystemCommand(state, 8, SystemCommand{
 		Type: SystemAcceptNodeRegistration, Registration: registration,
 	}); !result.Conflict {
 		t.Fatal("older NodeEpoch registered after a newer epoch")
 	}
-	state, _ = applySystem(t, state, 8, SystemCommand{Type: SystemRetireNode, Retirement: &NodeRetirementCommand{
+	state, _ = applySystem(t, state, 9, SystemCommand{Type: SystemRetireNode, Retirement: &NodeRetirementCommand{
 		NodeID: registration.NodeID, EnrollmentID: registration.EnrollmentID, LastNodeEpoch: 2,
 	}})
 	if !state.NodeEnrollments[registration.NodeID].Retired {
 		t.Fatal("node enrollment retirement was not permanent")
 	}
-	state, result := ApplySystemCommand(state, 9, SystemCommand{Type: SystemRetireNode, Retirement: &NodeRetirementCommand{
+	state, result := ApplySystemCommand(state, 10, SystemCommand{Type: SystemRetireNode, Retirement: &NodeRetirementCommand{
 		NodeID: registration.NodeID, EnrollmentID: registration.EnrollmentID, LastNodeEpoch: 2,
 	}})
 	if result.Conflict || !result.Applied || !state.NodeEnrollments[registration.NodeID].Retired {
 		t.Fatalf("exact node retirement retry = %+v, %+v", state.NodeEnrollments[registration.NodeID], result)
 	}
-	if _, result := ApplySystemCommand(state, 10, SystemCommand{Type: SystemEnrollNode, Enrollment: &NodeEnrollmentCommand{
+	if _, result := ApplySystemCommand(state, 11, SystemCommand{Type: SystemEnrollNode, Enrollment: &NodeEnrollmentCommand{
 		NodeID: registration.NodeID, EnrollmentID: "replacement", NodeEpoch: 1, DataEndpoint: "10.0.0.3:8443",
 	}}); !result.Conflict {
 		t.Fatal("retired node ID was re-enrolled")

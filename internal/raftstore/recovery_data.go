@@ -258,10 +258,15 @@ func resetRecoveryNodeStaging(
 			return errors.New("raftstore: recovery node staging reset follows reconciliation")
 		}
 	}
+	removed := false
 	for key, record := range state.RecoveryRecords {
-		if record.NodeID == reset.NodeID && record.NodeEpoch == reset.NodeEpoch {
+		if record.NodeID == reset.NodeID && record.NodeEpoch == reset.NodeEpoch && record.SessionSeq <= reset.SessionSeq {
 			delete(state.RecoveryRecords, key)
+			removed = true
 		}
+	}
+	if !removed {
+		return nil
 	}
 
 	// Removing one claimant can resolve quarantines on other nodes. Rebuild all
