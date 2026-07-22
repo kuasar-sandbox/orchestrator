@@ -99,8 +99,9 @@ func recoveredRoute(
 		DataEndpoint: event.DataEndpoint, TargetPort: event.TargetPort,
 		AccessToken: event.AccessToken, TrafficAccessToken: event.TrafficAccessToken,
 		TemplateRef: event.TemplateRef, SnapshotRef: event.SnapshotRef,
-		RegistryGeneration: target.RegistryGeneration, BindingDigest: target.BindingDigest,
-		LastEventSeq: event.EventSeq, Intent: intent, Presentation: event.Presentation.Clone(),
+		RegistryGeneration: target.RegistryGeneration, OpaqueBinding: target.OpaqueBinding,
+		BindingDigest: target.BindingDigest,
+		LastEventSeq:  event.EventSeq, Intent: intent, Presentation: event.Presentation.Clone(),
 	}
 	if err := execution.Validate(); err != nil {
 		return clusterstate.RouteWorkflowRecord{}, err
@@ -143,7 +144,8 @@ func recoveredBuild(
 	projection := &clusterstate.BuildProjection{
 		BuildID: source.ObjectID, NodeID: source.NodeID, NodeEpoch: source.NodeEpoch,
 		DataEndpoint: event.DataEndpoint, RegistryGeneration: target.RegistryGeneration,
-		BindingDigest: target.BindingDigest, Intent: intent, TemplateRef: spec.TemplateID,
+		OpaqueBinding: target.OpaqueBinding, BindingDigest: target.BindingDigest,
+		Intent: intent, TemplateRef: spec.TemplateID,
 	}
 	if err := projection.Validate(); err != nil {
 		return clusterstate.BuildRecord{}, err

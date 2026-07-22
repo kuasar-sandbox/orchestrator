@@ -799,9 +799,14 @@ func (r *Runtime) RefreshPermit(ctx context.Context) (PermitGrant, error) {
 		if err != nil {
 			return PermitGrant{}, err
 		}
-		if err := state.Validate(); err != nil || state.LastApplied < grant.CommitIndex || state.Identity() != grant.PermitIdentity ||
-			grant.MaxLifetimeMillis != state.ServePermitMaxMillis {
+		if err := state.Validate(); err != nil {
 			return PermitGrant{}, errors.Join(err, errors.New("raftstore: remote Permit is not covered by the fetched System state"))
+		}
+		if state.LastApplied < grant.CommitIndex || state.Identity() != grant.PermitIdentity ||
+			grant.MaxLifetimeMillis != state.ServePermitMaxMillis ||
+			grant.ServeGate != state.ServeGate || grant.WriteGate != state.WriteGate ||
+			grant.CutoverGate != state.CutoverGate || grant.RecoveryClosed != (state.Recovery == nil) {
+			return PermitGrant{}, errors.New("raftstore: remote Permit is not covered by the fetched System state")
 		}
 		if err := r.authorizeRemoteSystemState(state); err != nil {
 			return PermitGrant{}, err

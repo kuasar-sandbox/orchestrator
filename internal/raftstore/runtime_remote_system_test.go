@@ -78,6 +78,36 @@ func TestRemotePermitLifetimeMustMatchCommittedSystemState(t *testing.T) {
 	}
 }
 
+func TestRemotePermitGatesMustMatchCommittedSystemState(t *testing.T) {
+	registryLayout := testRegistryLayout(1, "generation-1")
+	digest, _ := registryLayout.Digest()
+	state, _ := ApplySystemCommand(SystemState{}, 1, SystemCommand{
+		Type: SystemBootstrap, RegistryLayout: &registryLayout, Digest: digest,
+	})
+	state, _ = ApplySystemCommand(state, 2, SystemCommand{
+		Type: SystemSetGates, Gates: &GateUpdate{Serve: true, Write: true, Cutover: true},
+	})
+	state, result := ApplySystemCommand(state, 3, SystemCommand{Type: SystemRefreshPermit})
+	if result.Conflict || result.PermitGrant == nil {
+		t.Fatalf("refresh Permit = %+v", result)
+	}
+	staleGrant := *result.PermitGrant
+	state, result = ApplySystemCommand(state, 4, SystemCommand{
+		Type: SystemSetGates, Gates: &GateUpdate{},
+	})
+	if result.Conflict || state.ServeGate || state.WriteGate || state.CutoverGate {
+		t.Fatalf("close gates = %+v, state=%+v", result, state)
+	}
+	runtime := &Runtime{
+		registryLayout: registryLayout, registryLayoutDigest: digest,
+		systemClient: &testRemoteSystemClient{state: state, permitGrant: &staleGrant},
+		permitCache:  NewPermitCache(time.Now),
+	}
+	if _, err := runtime.RefreshPermit(context.Background()); err == nil {
+		t.Fatal("stale gate-open remote Permit was accepted after the System state closed its gates")
+	}
+}
+
 func TestBeginTransitionResolvesCommittedProposalError(t *testing.T) {
 	previous := testRegistryLayout(1, "generation-1")
 	previousDigest, _ := previous.Digest()

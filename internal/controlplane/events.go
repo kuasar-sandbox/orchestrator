@@ -297,6 +297,7 @@ func readyFromEvent(
 			SandboxID: starting.SandboxID, NodeID: starting.Binding.NodeID,
 			NodeEpoch: starting.Binding.NodeEpoch, DataEndpoint: starting.Binding.DataEndpoint,
 			RegistryGeneration: starting.Binding.RegistryGeneration,
+			OpaqueBinding:      starting.Binding.OpaqueBinding,
 			BindingDigest:      starting.Binding.BindingDigest, Intent: starting.Intent,
 			Presentation: event.Presentation.Clone(),
 		}

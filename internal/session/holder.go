@@ -355,7 +355,7 @@ func (h *Holder) AdmitAndDispatch(ctx context.Context, command DispatchCommand) 
 		return DispatchReply{}, err
 	}
 	if err := h.CheckServe(command.ServeIdentity, PermitDispatch); err != nil {
-		return DispatchReply{}, err
+		return DispatchReply{}, errors.Join(ErrDispatchNotSent, err)
 	}
 	if command.ServeIdentity.RegistryGeneration == "" || command.ServeIdentity.RegistryGeneration != command.Binding.RegistryGeneration ||
 		command.NodeID == "" || command.NodeID != command.Binding.NodeID || command.NodeEpoch == 0 ||

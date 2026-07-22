@@ -237,6 +237,7 @@ type ReadyRoute struct {
 	TemplateRef        string                `json:"template_ref"`
 	SnapshotRef        string                `json:"snapshot_ref,omitempty"`
 	RegistryGeneration string                `json:"registry_generation"`
+	OpaqueBinding      string                `json:"opaque_binding"`
 	BindingDigest      string                `json:"binding_digest"`
 	LastEventSeq       uint64                `json:"last_event_seq"`
 	Intent             DispatchIntent        `json:"intent"`
@@ -252,9 +253,6 @@ func (r ReadyRoute) Validate() error {
 	if err := ValidateTCPDataEndpoint(r.DataEndpoint); err != nil {
 		return err
 	}
-	if !validDigest(r.BindingDigest) {
-		return errors.New("cluster: invalid READY Binding digest")
-	}
 	for name, value := range map[string]string{
 		"sandbox ID":                  r.SandboxID,
 		"node ID":                     r.NodeID,
@@ -268,6 +266,9 @@ func (r ReadyRoute) Validate() error {
 	}
 	if err := validateSandboxDispatchIntent(r.Intent); err != nil {
 		return fmt.Errorf("cluster: READY dispatch intent: %w", err)
+	}
+	if err := r.bindingIntent().Validate(ExecutionKindSandbox, r.SandboxID); err != nil {
+		return fmt.Errorf("cluster: READY execution Binding: %w", err)
 	}
 	if err := r.Presentation.Validate(); err != nil {
 		return fmt.Errorf("cluster: READY presentation: %w", err)
@@ -328,6 +329,20 @@ func (p SandboxPresentationV1) Clone() SandboxPresentationV1 {
 		}
 	}
 	return clone
+}
+
+func (r ReadyRoute) ValidateWorkflow(group, routeKey string) error {
+	if err := r.Validate(); err != nil {
+		return err
+	}
+	return r.bindingIntent().ValidateWorkflow(ExecutionKindSandbox, r.SandboxID, group, routeKey, r.Intent)
+}
+
+func (r ReadyRoute) bindingIntent() ExecutionBindingIntent {
+	return ExecutionBindingIntent{
+		NodeID: r.NodeID, NodeEpoch: r.NodeEpoch, DataEndpoint: r.DataEndpoint,
+		RegistryGeneration: r.RegistryGeneration, OpaqueBinding: r.OpaqueBinding, BindingDigest: r.BindingDigest,
+	}
 }
 
 type PausedRouteState struct {
@@ -649,7 +664,7 @@ func (r RouteWorkflowRecord) Validate() error {
 		if r.Ready == nil {
 			return errors.New("cluster: missing READY state")
 		}
-		if err := r.Ready.Validate(); err != nil {
+		if err := r.Ready.ValidateWorkflow(r.Group, r.RouteKey); err != nil {
 			return err
 		}
 		return validateProjectionRegistryGeneration(r.Revision, r.Ready.RegistryGeneration)
@@ -660,6 +675,9 @@ func (r RouteWorkflowRecord) Validate() error {
 		if err := r.Paused.Validate(); err != nil {
 			return err
 		}
+		if err := r.Paused.Execution.ValidateWorkflow(r.Group, r.RouteKey); err != nil {
+			return err
+		}
 		return validateProjectionRegistryGeneration(r.Revision, r.Paused.Execution.RegistryGeneration)
 	case WorkflowRouteResuming:
 		if r.Resuming == nil {
@@ -668,12 +686,18 @@ func (r RouteWorkflowRecord) Validate() error {
 		if err := r.Resuming.Validate(); err != nil {
 			return err
 		}
+		if err := r.Resuming.Execution.ValidateWorkflow(r.Group, r.RouteKey); err != nil {
+			return err
+		}
 		return validateProjectionRegistryGeneration(r.Revision, r.Resuming.Execution.RegistryGeneration)
 	case WorkflowRouteDeleting:
 		if r.Deleting == nil {
 			return errors.New("cluster: missing DELETING state")
 		}
 		if err := r.Deleting.Validate(); err != nil {
+			return err
+		}
+		if err := r.Deleting.Execution.ValidateWorkflow(r.Group, r.RouteKey); err != nil {
 			return err
 		}
 		return validateProjectionRegistryGeneration(r.Revision, r.Deleting.Execution.RegistryGeneration)
@@ -737,6 +761,7 @@ type BuildProjection struct {
 	NodeEpoch          uint64         `json:"node_epoch"`
 	DataEndpoint       string         `json:"data_endpoint"`
 	RegistryGeneration string         `json:"registry_generation"`
+	OpaqueBinding      string         `json:"opaque_binding"`
 	BindingDigest      string         `json:"binding_digest"`
 	Intent             DispatchIntent `json:"intent"`
 	TemplateRef        string         `json:"template_ref,omitempty"`
@@ -753,6 +778,9 @@ func (p BuildProjection) Validate() error {
 	if err := validateBuildDispatchIntent(p.Intent); err != nil {
 		return err
 	}
+	if err := p.bindingIntent().Validate(ExecutionKindBuild, p.BuildID); err != nil {
+		return fmt.Errorf("cluster: Build projection execution Binding: %w", err)
+	}
 	spec, err := ParseBuildDispatchSpec(p.Intent.DispatchSpec)
 	if err != nil {
 		return fmt.Errorf("cluster: Build dispatch spec: %w", err)
@@ -761,6 +789,20 @@ func (p BuildProjection) Validate() error {
 		return errors.New("cluster: Build registration does not match immutable dispatch spec")
 	}
 	return nil
+}
+
+func (p BuildProjection) ValidateWorkflow(group string) error {
+	if err := p.Validate(); err != nil {
+		return err
+	}
+	return p.bindingIntent().ValidateWorkflow(ExecutionKindBuild, p.BuildID, group, "", p.Intent)
+}
+
+func (p BuildProjection) bindingIntent() ExecutionBindingIntent {
+	return ExecutionBindingIntent{
+		NodeID: p.NodeID, NodeEpoch: p.NodeEpoch, DataEndpoint: p.DataEndpoint,
+		RegistryGeneration: p.RegistryGeneration, OpaqueBinding: p.OpaqueBinding, BindingDigest: p.BindingDigest,
+	}
 }
 
 type BuildTombstoneState struct {
@@ -860,7 +902,7 @@ func (r BuildRecord) Validate() error {
 		if r.Projection == nil || r.Projection.BuildID != r.BuildID {
 			return errors.New("cluster: missing or mismatched Build registration projection")
 		}
-		if err := r.Projection.Validate(); err != nil {
+		if err := r.Projection.ValidateWorkflow(r.Group); err != nil {
 			return err
 		}
 		if err := validateProjectionRegistryGeneration(r.Revision, r.Projection.RegistryGeneration); err != nil {

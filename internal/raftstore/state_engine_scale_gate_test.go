@@ -274,7 +274,8 @@ func stateScaleReadyRoute(
 			SandboxID: sandboxID, NodeID: nodeID, NodeEpoch: 7, DataEndpoint: nodeID + ":8443",
 			TargetPort: spec.TargetPort, AccessToken: spec.AccessToken, TrafficAccessToken: "traffic-token",
 			TemplateRef:        spec.TemplateRef,
-			RegistryGeneration: registryLayout.RegistryGeneration, BindingDigest: bindingDigest, LastEventSeq: 1, Intent: intent,
+			RegistryGeneration: registryLayout.RegistryGeneration, OpaqueBinding: opaque,
+			BindingDigest: bindingDigest, LastEventSeq: 1, Intent: intent,
 			Presentation: testSandboxPresentation(),
 		},
 	}

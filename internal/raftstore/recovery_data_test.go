@@ -385,6 +385,7 @@ func recoveryRouteRecord(
 			DataEndpoint: targetBinding.DataEndpoint, TargetPort: spec.TargetPort, AccessToken: spec.AccessToken,
 			TrafficAccessToken: "traffic-token", TemplateRef: spec.TemplateRef,
 			RegistryGeneration: targetBinding.RegistryGeneration,
+			OpaqueBinding:      targetBinding.OpaqueBinding,
 			BindingDigest:      targetBinding.BindingDigest, LastEventSeq: 9, Intent: intent,
 			Presentation: testSandboxPresentation(),
 		},

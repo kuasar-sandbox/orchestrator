@@ -174,7 +174,8 @@ func TestBuildLifecycleEventIsRejectedAfterRegistration(t *testing.T) {
 		Projection: &clusterstate.BuildProjection{
 			BuildID: fixture.objectID, NodeID: fixture.binding.NodeID, NodeEpoch: fixture.binding.NodeEpoch,
 			DataEndpoint: fixture.binding.DataEndpoint, RegistryGeneration: fixture.binding.RegistryGeneration,
-			BindingDigest: fixture.binding.BindingDigest, Intent: fixture.intent, TemplateRef: fixture.templateRef,
+			OpaqueBinding: fixture.binding.OpaqueBinding, BindingDigest: fixture.binding.BindingDigest,
+			Intent: fixture.intent, TemplateRef: fixture.templateRef,
 		},
 	}
 	registered, err = store.CommitBuildWorkflow(ctx, created.Revision, registered)

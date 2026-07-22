@@ -1188,7 +1188,7 @@ func TestHolderDispatchFailsClosedWithoutPermit(t *testing.T) {
 	if _, err := holder.Register(context.Background(), registration, endpoint); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := holder.AdmitAndDispatch(context.Background(), testDispatchCommand(t, registration)); !errors.Is(err, ErrPermitUnavailable) {
+	if _, err := holder.AdmitAndDispatch(context.Background(), testDispatchCommand(t, registration)); !errors.Is(err, ErrPermitUnavailable) || !errors.Is(err, ErrDispatchNotSent) {
 		t.Fatalf("expired permit error = %v", err)
 	}
 	if len(endpoint.commands) != 0 {
