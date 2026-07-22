@@ -42,7 +42,7 @@ func validateRouteTransition(
 			return validateProvenRouteTombstone(*current.Ready, *next.Tombstone)
 		}
 		if next.State == clusterstate.WorkflowRoutePaused &&
-			sameReadyExecution(*current.Ready, next.Paused.Execution) &&
+			sameExecutionEnteringPaused(*current.Ready, next.Paused.Execution) &&
 			next.Paused.Execution.LastEventSeq > current.Ready.LastEventSeq {
 			return nil
 		}
@@ -79,7 +79,7 @@ func validateRouteTransition(
 			return nil
 		}
 		if next.State == clusterstate.WorkflowRoutePaused &&
-			sameReadyExecution(current.Resuming.Execution, next.Paused.Execution) &&
+			sameExecutionEnteringPaused(current.Resuming.Execution, next.Paused.Execution) &&
 			next.Paused.Execution.LastEventSeq > current.Resuming.Execution.LastEventSeq {
 			return nil
 		}
@@ -448,6 +448,12 @@ func isPermanentExecutionProof(proof clusterstate.TerminalProof) bool {
 
 func sameReadyExecution(left, right clusterstate.ReadyRoute) bool {
 	left.LastEventSeq, right.LastEventSeq = 0, 0
+	return reflect.DeepEqual(left, right)
+}
+
+func sameExecutionEnteringPaused(left, right clusterstate.ReadyRoute) bool {
+	left.LastEventSeq, right.LastEventSeq = 0, 0
+	left.SnapshotRef = right.SnapshotRef
 	return reflect.DeepEqual(left, right)
 }
 

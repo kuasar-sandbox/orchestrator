@@ -8,6 +8,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 
@@ -733,6 +734,50 @@ func TestRuntimeAdvancesEnrollmentRegistryLayoutOnlyAfterConsensusActivation(t *
 		func(dbconfig.NodeHostConfig) (raftNodeHost, error) { return newFakeNodeHost(), nil },
 	); err != nil {
 		t.Fatalf("full registryLayout chain was not restart-idempotent: %v", err)
+	}
+}
+
+func TestRemovedMemberRetainsStartupLayoutUntilLocalReplicasAreRemoved(t *testing.T) {
+	fixture := newRuntimeFixture(t)
+	runtime, err := fixture.open(t, newFakeNodeHost(), RuntimeOpenOptions{
+		Mode: RuntimeBootstrap, BootstrapSecret: fixture.secret,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.Close()
+	previousVersion := runtime.enrollment.RegistryLayoutVersion
+	next := cloneRegistryLayout(runtime.registryLayout)
+	next.RegistryLayoutVersion++
+	next.Members = slices.DeleteFunc(next.Members, func(member RegistryMember) bool {
+		return member.MemberID == runtime.member.MemberID
+	})
+	nextDigest := digestFor("removed-member-layout")
+	runtime.registryLayout = next
+	runtime.registryLayoutDigest = nextDigest
+
+	system, _ := applySystem(t, SystemState{}, 1, SystemCommand{
+		Type: SystemBootstrap, RegistryLayout: &fixture.signed.RegistryLayout,
+		Digest: runtime.enrollment.RegistryLayoutDigest,
+	})
+	system.ActiveRegistryLayoutVersion = next.RegistryLayoutVersion
+	system.ActiveRegistryLayoutDigest = nextDigest
+	if err := runtime.syncLocalRegistryLayout(system); err != nil {
+		t.Fatal(err)
+	}
+	if runtime.enrollment.RegistryLayoutVersion != previousVersion {
+		t.Fatalf("removed member advanced before cleanup: %+v", runtime.enrollment)
+	}
+
+	for index := range runtime.enrollment.Replicas {
+		runtime.enrollment.Replicas[index].LocalState = ReplicaRemoved
+	}
+	if err := runtime.syncLocalRegistryLayout(system); err != nil {
+		t.Fatal(err)
+	}
+	if runtime.enrollment.RegistryLayoutVersion != next.RegistryLayoutVersion ||
+		runtime.enrollment.RegistryLayoutDigest != nextDigest {
+		t.Fatalf("removed member did not finalize its Layout fence after cleanup: %+v", runtime.enrollment)
 	}
 }
 

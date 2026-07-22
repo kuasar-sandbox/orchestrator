@@ -576,6 +576,7 @@ func TestRouteAutoResumeReplacementAndFenceCompaction(t *testing.T) {
 	})
 
 	wrongResume := readyRecord(starting, 3)
+	wrongResume.Ready.SnapshotRef = paused.Paused.SnapshotRef
 	wrongResume.Ready.NodeEpoch++
 	result := ApplyDataCommand(&state, 5, DataCommand{
 		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{LogIndex: 4}, Route: &wrongResume,
@@ -585,6 +586,7 @@ func TestRouteAutoResumeReplacementAndFenceCompaction(t *testing.T) {
 	}
 
 	resumed := readyRecord(starting, 3)
+	resumed.Ready.SnapshotRef = paused.Paused.SnapshotRef
 	applyDataOK(t, &state, 6, DataCommand{
 		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{LogIndex: 4}, Route: &resumed,
 	})
@@ -826,10 +828,12 @@ func readyRecord(starting clusterstate.RouteWorkflowRecord, eventSeq uint64) clu
 func pausedRecord(ready clusterstate.RouteWorkflowRecord, eventSeq uint64) clusterstate.RouteWorkflowRecord {
 	projection := *ready.Ready
 	projection.LastEventSeq = eventSeq
-	intent := testDispatchIntentNoFail()
+	projection.SnapshotRef = "snapshot-1"
 	return clusterstate.RouteWorkflowRecord{
 		Group: ready.Group, RouteKey: ready.RouteKey, State: clusterstate.WorkflowRoutePaused,
-		Paused: &clusterstate.PausedRouteState{Execution: projection, SnapshotRef: "snapshot-1", ResumeIntent: intent},
+		Paused: &clusterstate.PausedRouteState{
+			Execution: projection, SnapshotRef: projection.SnapshotRef, ResumeIntent: projection.Intent,
+		},
 	}
 }
 

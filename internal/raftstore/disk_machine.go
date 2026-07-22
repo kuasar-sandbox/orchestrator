@@ -714,6 +714,10 @@ func lookupPendingOnDisk(
 	if !state.Accepts(query.Identity) {
 		return PendingLookupResult{}, nil
 	}
+	afterKey, err := decodePendingCursor(query.AfterKey)
+	if err != nil {
+		return PendingLookupResult{}, err
+	}
 	builder := newPendingPageBuilder(query.Limit)
 	pageFull := false
 	tables := []struct {
@@ -725,7 +729,7 @@ func lookupPendingOnDisk(
 	}
 	for _, table := range tables {
 		tablePrefix := stateTablePrefix(prefix, table.table)
-		lowerBound, scan := pendingTableLowerBound(prefix, tablePrefix, table.table, table.qualified, query.AfterKey)
+		lowerBound, scan := pendingTableLowerBound(prefix, tablePrefix, table.table, table.qualified, afterKey)
 		if !scan {
 			continue
 		}
@@ -735,7 +739,7 @@ func lookupPendingOnDisk(
 		for valid := iterator.First(); valid; valid = iterator.Next() {
 			mapKey := string(iterator.Key()[len(tablePrefix):])
 			qualified := string(append([]byte{table.qualified}, []byte(mapKey)...))
-			if qualified <= query.AfterKey {
+			if qualified <= afterKey {
 				continue
 			}
 			switch table.table {
@@ -750,7 +754,7 @@ func lookupPendingOnDisk(
 					return PendingLookupResult{}, err
 				}
 				if buildNeedsCoordinator(record) {
-					accepted, addErr := builder.add(PendingWorkflow{Key: qualified, Build: &record})
+					accepted, addErr := builder.add(PendingWorkflow{Key: encodePendingCursor(qualified), Build: &record})
 					if addErr != nil {
 						iterator.Close()
 						return PendingLookupResult{}, addErr
@@ -771,7 +775,7 @@ func lookupPendingOnDisk(
 					return PendingLookupResult{}, err
 				}
 				if routeNeedsCoordinator(record) {
-					accepted, addErr := builder.add(PendingWorkflow{Key: qualified, Route: &record})
+					accepted, addErr := builder.add(PendingWorkflow{Key: encodePendingCursor(qualified), Route: &record})
 					if addErr != nil {
 						iterator.Close()
 						return PendingLookupResult{}, addErr

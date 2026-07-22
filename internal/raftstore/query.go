@@ -2,6 +2,7 @@ package raftstore
 
 import (
 	"container/heap"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -585,7 +586,8 @@ func lookupBuild(state DataState, request routeapi.ReadBuildRequest) routeapi.Re
 				return routeapi.ReadBuildResponse{
 					Outcome: routeapi.ReadConflict, Group: record.Group,
 					Pending: &routeapi.PendingBuildProjection{
-						BuildID: record.BuildID, TemplateRef: spec.TemplateID, Profile: spec.Profile,
+						BuildID: record.BuildID, RegistryGeneration: record.Revision.RegistryGeneration,
+						TemplateRef: spec.TemplateID, Profile: spec.Profile,
 					},
 					BuildState: clusterstate.BuildStarting, BuildRevision: record.Revision.LogIndex,
 					Reason: string(record.State),
@@ -623,6 +625,9 @@ func (q PendingLookup) Validate() error {
 	}
 	if q.Limit == 0 || q.Limit > 4096 {
 		return errors.New("raftstore: pending lookup limit must be between 1 and 4096")
+	}
+	if _, err := decodePendingCursor(q.AfterKey); err != nil {
+		return err
 	}
 	return nil
 }
@@ -695,23 +700,27 @@ func lookupPending(state DataState, query PendingLookup) (PendingLookupResult, e
 	if !state.Accepts(query.Identity) {
 		return PendingLookupResult{}, nil
 	}
+	afterKey, err := decodePendingCursor(query.AfterKey)
+	if err != nil {
+		return PendingLookupResult{}, err
+	}
 	references := make([]pendingWorkflowReference, 0)
 	for key, record := range state.Routes {
 		qualified := "r" + key
-		if qualified > query.AfterKey && routeNeedsCoordinator(record) {
+		if qualified > afterKey && routeNeedsCoordinator(record) {
 			references = append(references, pendingWorkflowReference{key: qualified, mapKey: key, isRoute: true})
 		}
 	}
 	for key, record := range state.Builds {
 		qualified := "b" + key
-		if qualified > query.AfterKey && buildNeedsCoordinator(record) {
+		if qualified > afterKey && buildNeedsCoordinator(record) {
 			references = append(references, pendingWorkflowReference{key: qualified, mapKey: key})
 		}
 	}
 	sort.Slice(references, func(i, j int) bool { return references[i].key < references[j].key })
 	builder := newPendingPageBuilder(query.Limit)
 	for _, reference := range references {
-		workflow := PendingWorkflow{Key: reference.key}
+		workflow := PendingWorkflow{Key: encodePendingCursor(reference.key)}
 		if reference.isRoute {
 			record := cloneRouteRecord(state.Routes[reference.mapKey])
 			workflow.Route = &record
@@ -728,6 +737,22 @@ func lookupPending(state DataState, query PendingLookup) (PendingLookupResult, e
 		}
 	}
 	return builder.result(), nil
+}
+
+func encodePendingCursor(key string) string {
+	return hex.EncodeToString([]byte(key))
+}
+
+func decodePendingCursor(cursor string) (string, error) {
+	if cursor == "" {
+		return "", nil
+	}
+	raw, err := hex.DecodeString(cursor)
+	if err != nil || len(raw) < 2 || raw[0] != 'b' && raw[0] != 'r' ||
+		hex.EncodeToString(raw) != cursor {
+		return "", errors.New("raftstore: invalid pending workflow cursor")
+	}
+	return string(raw), nil
 }
 
 func routeNeedsCoordinator(record clusterstate.RouteWorkflowRecord) bool {
