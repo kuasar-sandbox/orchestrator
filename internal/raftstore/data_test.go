@@ -641,7 +641,7 @@ func testDispatchIntent(t *testing.T) clusterstate.DispatchIntent {
 		Version: clusterstate.DispatchSpecVersionV1, TemplateRef: templateRef,
 		AuthKeyFingerprint: strings.Repeat("a", 24), ManifestKeyFingerprint: strings.Repeat("b", 24),
 		AccessToken: "access-token", TargetPort: 8080,
-		Request: clusterstate.NodeRequestEnvelopeV1{Version: clusterstate.NodeRequestEnvelopeVersionV1, Method: "POST", Path: "/sandboxes", Body: []byte(`{"templateID":"` + templateRef + `"}`)},
+		Request: clusterstate.NodeRequestEnvelopeV1{Version: clusterstate.NodeRequestEnvelopeVersionV1, Method: "POST", Path: "/sandboxes", Body: []byte(`{"metadata":null,"templateID":"` + templateRef + `","timeout":0}`)},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -663,7 +663,7 @@ func testDispatchIntentNoFail() clusterstate.DispatchIntent {
 		Version: clusterstate.DispatchSpecVersionV1, TemplateRef: templateRef,
 		AuthKeyFingerprint: strings.Repeat("a", 24), ManifestKeyFingerprint: strings.Repeat("b", 24),
 		AccessToken: "access-token", TargetPort: 8080,
-		Request: clusterstate.NodeRequestEnvelopeV1{Version: clusterstate.NodeRequestEnvelopeVersionV1, Method: "POST", Path: "/sandboxes", Body: []byte(`{"templateID":"` + templateRef + `"}`)},
+		Request: clusterstate.NodeRequestEnvelopeV1{Version: clusterstate.NodeRequestEnvelopeVersionV1, Method: "POST", Path: "/sandboxes", Body: []byte(`{"metadata":null,"templateID":"` + templateRef + `","timeout":0}`)},
 	})
 	if err != nil {
 		panic(err)
@@ -685,7 +685,7 @@ func testBuildDispatchIntent(t *testing.T) clusterstate.DispatchIntent {
 		Version: clusterstate.DispatchSpecVersionV1, TemplateID: "template-1",
 		AuthKeyFingerprint: strings.Repeat("b", 24), ManifestKeyFingerprint: strings.Repeat("c", 24),
 		Profile: types.ProfileBare, CPUCount: 1, MemoryMB: 512,
-		Request: clusterstate.NodeRequestEnvelopeV1{Version: clusterstate.NodeRequestEnvelopeVersionV1, Method: "POST", Path: "/v3/templates", Body: []byte(`{"cpuCount":1,"memoryMB":512}`)},
+		Request: clusterstate.NodeRequestEnvelopeV1{Version: clusterstate.NodeRequestEnvelopeVersionV1, Method: "POST", Path: "/v3/templates", Body: []byte(`{"cpuCount":1,"memoryMB":512,"metadata":null,"name":"","profile":"bare","tags":null}`)},
 	})
 	if err != nil {
 		t.Fatal(err)

@@ -329,12 +329,12 @@ func TestPebbleSnapshotRecoverySpansMultipleSyncedBatches(t *testing.T) {
 		ReplicaIDs: append([]uint64(nil), bootstrap.ReplicaIDs...),
 	})
 	baseIntent := testDispatchIntent(t)
-	dispatchSpec, err := clusterstate.ParseSandboxDispatchSpec(baseIntent.DispatchSpec)
+	largeSpec, err := clusterstate.ParseSandboxDispatchSpec(baseIntent.DispatchSpec)
 	if err != nil {
 		t.Fatal(err)
 	}
-	dispatchSpec.Config = map[string]string{"snapshot-padding": strings.Repeat("x", 60<<10)}
-	encodedSpec, err := clusterstate.MarshalSandboxDispatchSpec(dispatchSpec)
+	largeSpec.RequestedConfig = map[string]string{"padding": strings.Repeat("x", clusterstate.MaxDispatchSpecBytes-1024)}
+	encodedSpec, err := clusterstate.MarshalSandboxDispatchSpec(largeSpec)
 	if err != nil {
 		t.Fatal(err)
 	}
