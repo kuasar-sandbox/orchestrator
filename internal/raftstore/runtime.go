@@ -205,6 +205,13 @@ func openRuntime(
 			if registryLayout.RegistryLayoutVersion == 1 {
 				return nil, errors.New("raftstore: a first Registry Layout member must use explicit Registry History Generation bootstrap")
 			}
+			predecessor, predecessorErr := immediateJoinPredecessor(registryLayoutChain, registryLayout, guard)
+			if predecessorErr != nil {
+				return nil, predecessorErr
+			}
+			if joinErr := validateFreshRegistryMemberJoin(predecessor, registryLayout, member); joinErr != nil {
+				return nil, joinErr
+			}
 			mode = EnrollmentJoin
 		}
 		created, createErr := newLocalEnrollment(mode, registryLayout, latestDigest, member, config)
@@ -266,6 +273,39 @@ func openRuntime(
 	}
 	systemEvents.bind(runtime)
 	return runtime, nil
+}
+
+func immediateJoinPredecessor(
+	chain []SignedRegistryLayout,
+	current RegistryLayout,
+	guard RegistryLayoutGuard,
+) (RegistryLayout, error) {
+	for _, signed := range chain {
+		candidate := signed.RegistryLayout
+		if candidate.ClusterID != current.ClusterID ||
+			candidate.RegistryGeneration != current.RegistryGeneration ||
+			candidate.RegistryLayoutVersion != current.PreviousRegistryLayoutVersion {
+			continue
+		}
+		digest, err := candidate.Digest()
+		if err != nil {
+			return RegistryLayout{}, err
+		}
+		if digest == current.PreviousRegistryLayoutDigest {
+			return candidate, nil
+		}
+	}
+	accepted, err := guard.Load()
+	if err != nil {
+		return RegistryLayout{}, err
+	}
+	if accepted != nil && accepted.ClusterID == current.ClusterID &&
+		accepted.RegistryGeneration == current.RegistryGeneration &&
+		accepted.RegistryLayoutVersion == current.PreviousRegistryLayoutVersion &&
+		accepted.RegistryLayoutDigest == current.PreviousRegistryLayoutDigest {
+		return accepted.RegistryLayout, nil
+	}
+	return RegistryLayout{}, fmt.Errorf("%w: exact predecessor Registry Layout is required for JOIN", ErrReplicaHistoryLost)
 }
 
 func (r *Runtime) Close() {

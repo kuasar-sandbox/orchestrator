@@ -35,7 +35,9 @@ func (r IdentityRetirement) Validate() error {
 // EnrollmentAuthority serializes registration installation and permanent
 // retirement for each explicitly enrolled node identity. Implementations must
 // reject unknown or retired identities and an epoch whose data endpoint differs
-// from enrollment. The callback must run at most once while that identity is
+// from enrollment, and must durably fence the complete registration fields that
+// are stable within one NodeEpoch across Holder changes. The callback must run
+// at most once while that identity is
 // protected from the opposite operation; a completed retirement therefore
 // cannot race with a previously validated registration installation. Before a
 // callback starts, the authority may reject without calling it. Once started,

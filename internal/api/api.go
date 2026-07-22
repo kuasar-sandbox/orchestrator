@@ -395,13 +395,14 @@ func (a *API) timeout(w http.ResponseWriter, r *http.Request) {
 
 func (a *API) registerTemplate(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Name       string   `json:"name"`
-		Tags       []string `json:"tags"`
-		Profile    string   `json:"profile"`
-		CPUCount   *int     `json:"cpuCount"`
-		CPUCountSn *int     `json:"cpu_count"`
-		MemoryMB   *int     `json:"memoryMB"`
-		MemoryMBSn *int     `json:"memory_mb"`
+		Name       string            `json:"name"`
+		Tags       []string          `json:"tags"`
+		Profile    string            `json:"profile"`
+		Metadata   map[string]string `json:"metadata"`
+		CPUCount   *int              `json:"cpuCount"`
+		CPUCountSn *int              `json:"cpu_count"`
+		MemoryMB   *int              `json:"memoryMB"`
+		MemoryMBSn *int              `json:"memory_mb"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeErr(w, http.StatusBadRequest, "bad body")
@@ -424,7 +425,7 @@ func (a *API) registerTemplate(w http.ResponseWriter, r *http.Request) {
 	}
 	// Core overwrites the resource namespace with the immutable registration
 	// ceiling, after preserving every other node configuration header.
-	meta := mergeBuildConfigHeaders(nil, r.Header)
+	meta := mergeBuildConfigHeaders(body.Metadata, r.Header)
 	b, err := a.core.RegisterBuild(r.Context(), apiKeyFrom(r.Context()), RegisterSpec{
 		Name: body.Name, Tags: body.Tags, Profile: profile,
 		CPUCount: cpu, MemoryMB: memory, Metadata: meta,

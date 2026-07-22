@@ -24,6 +24,7 @@ const (
 	MaxPresentationMetadataValueBytes  = 16 << 10
 	MaxPresentationMetadataBytes       = 64 << 10
 	MaxPresentationEnvdVersionBytes    = 64
+	MaxTerminalReasonBytes             = 1024
 )
 
 type Revision struct {
@@ -561,6 +562,9 @@ func (s RouteTombstoneState) Validate() error {
 		!validDigest(s.BindingDigest) || s.TerminalReason == "" ||
 		s.LastEventSeq == 0 && s.Proof.Kind == ProofNodeTerminal {
 		return errors.New("cluster: incomplete TOMBSTONE")
+	}
+	if len(s.TerminalReason) > MaxTerminalReasonBytes || !utf8.ValidString(s.TerminalReason) {
+		return fmt.Errorf("cluster: terminal reason exceeds %d bytes or is not valid UTF-8", MaxTerminalReasonBytes)
 	}
 	if s.Proof.FencedNodeID != s.NodeID || s.Proof.FencedNodeEpoch != s.NodeEpoch {
 		return errors.New("cluster: TOMBSTONE proof identifies another execution")

@@ -134,6 +134,57 @@ func TestBuildLookupReturnsOnlyBoundPositiveProjection(t *testing.T) {
 	}
 }
 
+func TestRouteAndBuildLookupsDoNotAliasCommittedState(t *testing.T) {
+	registryLayout := testRegistryLayout(4, "generation-1")
+
+	routeState, routeIdentity := initializedRouteShard(t, registryLayout, "/g", "rk")
+	starting := routeStarting(t, registryLayout, "/g", "rk", "sandbox-1", 1, true)
+	ready := readyRecord(starting, 1)
+	applyDataOK(t, &routeState, 2, DataCommand{
+		Type: DataPutRoute, Identity: routeIdentity, Expect: RevisionExpectation{Absent: true}, Route: &starting,
+	})
+	applyDataOK(t, &routeState, 3, DataCommand{
+		Type: DataPutRoute, Identity: routeIdentity, Expect: RevisionExpectation{LogIndex: 2}, Route: &ready,
+	})
+	routeRequest := routeLookupRequest(routeIdentity, "/g", "rk", false)
+	routeResponse := lookupRouteResult(t, routeState, routeRequest)
+	wantRouteSpec := append([]byte(nil), routeResponse.Route.Intent.DispatchSpec...)
+	routeResponse.Route.Intent.DispatchSpec[0] ^= 0xff
+	if next := lookupRouteResult(t, routeState, routeRequest); !bytes.Equal(next.Route.Intent.DispatchSpec, wantRouteSpec) {
+		t.Fatal("mutating a READY lookup changed committed Route state")
+	}
+
+	paused := pausedRecord(ready, 2)
+	applyDataOK(t, &routeState, 4, DataCommand{
+		Type: DataPutRoute, Identity: routeIdentity, Expect: RevisionExpectation{LogIndex: 3}, Route: &paused,
+	})
+	routeRequest.Strong = true
+	routeRequest.Addressable = true
+	pausedResponse := lookupRouteResult(t, routeState, routeRequest)
+	wantPausedDemand := append([]byte(nil), pausedResponse.Route.Intent.NormalizedDemand...)
+	pausedResponse.Route.Intent.NormalizedDemand[0] ^= 0xff
+	if next := lookupRouteResult(t, routeState, routeRequest); !bytes.Equal(next.Route.Intent.NormalizedDemand, wantPausedDemand) {
+		t.Fatal("mutating a PAUSED lookup changed committed Route state")
+	}
+
+	buildState, buildIdentity := initializedBuildShard(t, registryLayout, "/g", "build-1")
+	buildStarting := buildStarting(t, registryLayout, "/g", "build-1", true)
+	registered := buildRegistrationRecord(buildStarting)
+	applyDataOK(t, &buildState, 2, DataCommand{
+		Type: DataPutBuild, Identity: buildIdentity, Expect: RevisionExpectation{Absent: true}, Build: &buildStarting,
+	})
+	applyDataOK(t, &buildState, 3, DataCommand{
+		Type: DataPutBuild, Identity: buildIdentity, Expect: RevisionExpectation{LogIndex: 2}, Build: &registered,
+	})
+	buildRequest := buildLookupRequest(buildIdentity, "/g", "build-1", false)
+	buildResponse := lookupBuildResult(t, buildState, buildRequest)
+	wantBuildSpec := append([]byte(nil), buildResponse.Build.Intent.DispatchSpec...)
+	buildResponse.Build.Intent.DispatchSpec[0] ^= 0xff
+	if next := lookupBuildResult(t, buildState, buildRequest); !bytes.Equal(next.Build.Intent.DispatchSpec, wantBuildSpec) {
+		t.Fatal("mutating a Build lookup changed committed Build state")
+	}
+}
+
 func TestPendingLookupRecoversCommittedWorkflowIntentOnly(t *testing.T) {
 	registryLayout := testRegistryLayout(4, "generation-1")
 	routeKey := "rk"
