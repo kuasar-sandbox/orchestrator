@@ -56,7 +56,8 @@ type Orchestrator struct {
 	reg            map[string]*types.Sandbox // in-memory cache (hot path: Route/LaunchSpecFor)
 	clusterCreates map[string]struct{}       // cluster creates claimed before async launch
 
-	sf flightGroup // per-sid single-flight for resume (dedup concurrent data-plane wakeups)
+	sf        flightGroup // per-sid single-flight for resume (dedup concurrent data-plane wakeups)
+	lifecycle serialGroup // serializes resume and Binding replacement for the same SID
 
 	subsMu sync.Mutex
 	subs   map[int]chan routesync.Event // route-change subscribers (routesync clients)
@@ -376,7 +377,9 @@ func (o *Orchestrator) Connect(ctx context.Context, id, apiKey, migrationToken s
 		if err != nil {
 			return nil, err
 		}
-		if err := o.sf.Do(id, func() error { return o.resumeIfPaused(ctx, id, resumeRequest) }); err != nil {
+		if err := o.sf.Do(id, func() error {
+			return o.lifecycle.Do(id, func() error { return o.resumeIfPaused(ctx, id, resumeRequest) })
+		}); err != nil {
 			return nil, err
 		}
 		// Re-read the now-running snapshot the flight published; never mutate the
@@ -466,7 +469,9 @@ func (o *Orchestrator) Route(ctx context.Context, request proxy.RouteRequest) (p
 	}
 	if sb.State == types.StatePaused { // auto-resume on data-plane traffic
 		if err := o.sf.Do(request.SandboxID, func() error {
-			return o.resumeIfPaused(ctx, request.SandboxID, request)
+			return o.lifecycle.Do(request.SandboxID, func() error {
+				return o.resumeIfPaused(ctx, request.SandboxID, request)
+			})
 		}); err != nil && !errors.Is(err, errSandboxRouteFenceChanged) {
 			return proxy.Route{}, err
 		}

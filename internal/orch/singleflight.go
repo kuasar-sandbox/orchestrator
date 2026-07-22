@@ -1,6 +1,9 @@
 package orch
 
-import "sync"
+import (
+	"hash/fnv"
+	"sync"
+)
 
 // flightGroup collapses concurrent calls keyed by the same string into one
 // execution; the others wait and observe its result. It is the resume dedupe so a
@@ -14,6 +17,23 @@ type flightGroup struct {
 type flight struct {
 	done chan struct{}
 	err  error
+}
+
+const sandboxLifecycleLockCount = 256
+
+// serialGroup orders different lifecycle operations for one Sandbox without
+// retaining a lock for every SID ever observed by the process.
+type serialGroup struct {
+	locks [sandboxLifecycleLockCount]sync.Mutex
+}
+
+func (g *serialGroup) Do(key string, fn func() error) error {
+	hash := fnv.New32a()
+	_, _ = hash.Write([]byte(key))
+	lock := &g.locks[hash.Sum32()%sandboxLifecycleLockCount]
+	lock.Lock()
+	defer lock.Unlock()
+	return fn()
 }
 
 // Do runs fn unless another Do with the same key is in flight, in which case it

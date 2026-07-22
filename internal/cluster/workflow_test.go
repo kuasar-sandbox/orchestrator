@@ -75,13 +75,19 @@ func TestReadyRouteAndRevisionValidation(t *testing.T) {
 
 func TestRouteTombstoneCarriesExactExecutionFence(t *testing.T) {
 	binding := sha256.Sum256([]byte("binding"))
+	proof := TerminalProof{Kind: ProofNodeTerminal, FencedNodeID: "n1", FencedNodeEpoch: 7}
+	var err error
+	proof.ProofDigest, err = NodeTerminalProofDigest(proof, "g1", "s1", hexDigest(binding), 4)
+	if err != nil {
+		t.Fatal(err)
+	}
 	record := RouteWorkflowRecord{
 		Group: "/g", RouteKey: "rk", State: WorkflowRouteTombstone,
 		Revision: Revision{RegistryGeneration: "g1", ShardID: 9, LogIndex: 101},
 		Tombstone: &RouteTombstoneState{
 			SandboxID: "s1", NodeID: "n1", NodeEpoch: 7, RegistryGeneration: "g1",
 			BindingDigest: hexDigest(binding), LastEventSeq: 4, TerminalReason: "deleted",
-			Proof:           TerminalProof{Kind: ProofNodeTerminal, ProofDigest: hexDigest(sha256.Sum256([]byte("proof"))), FencedNodeID: "n1", FencedNodeEpoch: 7},
+			Proof:           proof,
 			FailureRevision: Revision{RegistryGeneration: "g1", ShardID: 9, LogIndex: 100},
 		},
 	}
@@ -183,12 +189,42 @@ func TestBuildProjectionRequiresCanonicalDataEndpoint(t *testing.T) {
 }
 
 func TestWorkflowFinalizationRequiresCanonicalDataEndpoint(t *testing.T) {
-	intent := WorkflowFinalizationIntent{
-		ObjectID: "s1", NodeID: "n1", NodeEpoch: 7, DataEndpoint: "https://node-1:8443",
-		RegistryGeneration: "g1", BindingDigest: hexDigest(sha256.Sum256([]byte("binding"))),
+	binding := workflowBinding(t, ExecutionKindSandbox, "s1", "rk", workflowSandboxIntent(t))
+	intent, err := NewWorkflowFinalizationIntent("s1", binding, nil)
+	if err != nil {
+		t.Fatal(err)
 	}
+	intent.DataEndpoint = "https://node-1:8443"
 	if err := intent.Validate(); err == nil {
 		t.Fatal("non-TCP workflow finalization endpoint accepted")
+	}
+}
+
+func TestRouteFinalizationIsBoundToOwningWorkflow(t *testing.T) {
+	intent := workflowSandboxIntent(t)
+	priorBinding := workflowBinding(t, ExecutionKindSandbox, "prior-sandbox", "rk", intent)
+	finalization, err := NewWorkflowFinalizationIntent("prior-sandbox", priorBinding, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := RouteWorkflowRecord{
+		Group: "/g", RouteKey: "rk", State: WorkflowRouteReady,
+		Revision:      Revision{RegistryGeneration: "g1", ShardID: 1, LogIndex: 10},
+		Ready:         readyRoute(),
+		Finalizations: []WorkflowFinalizationIntent{finalization},
+	}
+	if err := record.Validate(); err != nil {
+		t.Fatalf("prior execution from the same Route was rejected: %v", err)
+	}
+
+	otherBinding := workflowBinding(t, ExecutionKindSandbox, "prior-sandbox", "other-route", intent)
+	foreign, err := NewWorkflowFinalizationIntent("prior-sandbox", otherBinding, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record.Finalizations = []WorkflowFinalizationIntent{foreign}
+	if err := record.Validate(); err == nil {
+		t.Fatal("finalization from another Route was accepted")
 	}
 }
 
@@ -206,10 +242,12 @@ func TestDispatchIntentBoundsProviderPolicyVersion(t *testing.T) {
 
 func TestBuildFinalizationMustIdentifyContainingBuild(t *testing.T) {
 	build := registeredBuildRecord(t)
-	build.Finalizations = []WorkflowFinalizationIntent{{
-		ObjectID: "another-build", NodeID: "n1", NodeEpoch: 7, DataEndpoint: "10.0.0.1:8443",
-		RegistryGeneration: build.Revision.RegistryGeneration, BindingDigest: hexDigest(sha256.Sum256([]byte("binding"))),
-	}}
+	binding := workflowBinding(t, ExecutionKindBuild, "another-build", "", workflowBuildIntent(t))
+	finalization, err := NewWorkflowFinalizationIntent("another-build", binding, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	build.Finalizations = []WorkflowFinalizationIntent{finalization}
 	if err := build.Validate(); err == nil {
 		t.Fatal("Build finalization for another object accepted")
 	}
@@ -248,12 +286,17 @@ func TestPlacementCandidatePoolIsBoundedBeforePersistence(t *testing.T) {
 
 func TestExecutionFenceRequiresFinalOutboxCoverage(t *testing.T) {
 	proof := TerminalProof{
-		Kind: ProofNodeTerminal, ProofDigest: hexDigest(sha256.Sum256([]byte("proof"))),
-		FencedNodeID: "node-1", FencedNodeEpoch: 7,
+		Kind: ProofNodeTerminal, FencedNodeID: "node-1", FencedNodeEpoch: 7,
+	}
+	bindingDigest := hexDigest(sha256.Sum256([]byte("binding")))
+	var err error
+	proof.ProofDigest, err = NodeTerminalProofDigest(proof, "g1", "sandbox-1", bindingDigest, 4)
+	if err != nil {
+		t.Fatal(err)
 	}
 	fence := ExecutionFence{
 		Group: "/g", RouteKey: "rk", SandboxID: "sandbox-1", NodeID: "node-1", NodeEpoch: 7,
-		RegistryGeneration: "g1", BindingDigest: hexDigest(sha256.Sum256([]byte("binding"))),
+		RegistryGeneration: "g1", BindingDigest: bindingDigest,
 		LastEventSeq: 4, FinalOutboxWatermark: 3, Proof: proof,
 		Revision: Revision{RegistryGeneration: "g1", ShardID: 1, LogIndex: 9},
 	}
@@ -263,6 +306,19 @@ func TestExecutionFenceRequiresFinalOutboxCoverage(t *testing.T) {
 	fence.FinalOutboxWatermark = fence.LastEventSeq
 	if err := fence.Validate(); err != nil {
 		t.Fatal(err)
+	}
+	for name, mutate := range map[string]func(*ExecutionFence){
+		"sandbox":   func(value *ExecutionFence) { value.SandboxID = "sandbox-2" },
+		"binding":   func(value *ExecutionFence) { value.BindingDigest = hexDigest(sha256.Sum256([]byte("other"))) },
+		"watermark": func(value *ExecutionFence) { value.LastEventSeq++ },
+	} {
+		t.Run(name, func(t *testing.T) {
+			changed := fence
+			mutate(&changed)
+			if err := changed.Validate(); err == nil {
+				t.Fatal("node-terminal proof was accepted for another execution")
+			}
+		})
 	}
 }
 
