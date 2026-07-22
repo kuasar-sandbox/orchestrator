@@ -29,6 +29,7 @@ const (
 	registryLayoutSignatureDomain = "kuasar-registry-layout-v1\x00"
 	rolloverIntentDomain          = "kuasar-registry-history-rollover-intent-v1\x00"
 	zeroSHA256                    = "0000000000000000000000000000000000000000000000000000000000000000"
+	MaxRegistryLayoutBytes        = MaxRaftCommandBytes - (64 << 10)
 )
 
 type RolloverProofKind string
@@ -189,6 +190,10 @@ func (m RegistryLayout) Validate() error {
 }
 
 func (m RegistryLayout) validate(requireRolloverProof bool) error {
+	raw, err := json.Marshal(m)
+	if err != nil || len(raw) > MaxRegistryLayoutBytes {
+		return fmt.Errorf("raftstore: Registry Layout exceeds %d bytes", MaxRegistryLayoutBytes)
+	}
 	if m.FormatVersion != RegistryLayoutFormatV1 || m.ClusterID == "" || m.RegistryGeneration == "" ||
 		m.RegistryLayoutVersion == 0 || m.SchemaVersion == 0 || m.ProtocolVersion == 0 {
 		return errors.New("raftstore: incomplete registryLayout identity")

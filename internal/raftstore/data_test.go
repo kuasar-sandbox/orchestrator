@@ -77,6 +77,36 @@ func TestDataCASConflictAdvancesAppliedIndexWithoutChangingRow(t *testing.T) {
 	}
 }
 
+func TestNewWorkflowsRejectUnprovenFinalizations(t *testing.T) {
+	registryLayout := testRegistryLayout(4, "generation-new-finalization")
+	t.Run("Route", func(t *testing.T) {
+		state, identity := initializedRouteShard(t, registryLayout, "/g", "rk-new-finalization")
+		record := routeStarting(t, registryLayout, "/g", "rk-new-finalization", "sandbox-1", 1, true)
+		record.Finalizations = []clusterstate.WorkflowFinalizationIntent{
+			workflowFinalization(t, record.Starting.SandboxID, *record.Starting.Binding, nil),
+		}
+		result := ApplyDataCommand(&state, 2, DataCommand{
+			Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{Absent: true}, Route: &record,
+		})
+		if !result.Conflict || len(state.Routes) != 0 {
+			t.Fatalf("new Route finalization = %+v, routes=%d", result, len(state.Routes))
+		}
+	})
+	t.Run("Build", func(t *testing.T) {
+		state, identity := initializedBuildShard(t, registryLayout, "/g", "build-new-finalization")
+		record := buildStarting(t, registryLayout, "/g", "build-new-finalization", true)
+		record.Finalizations = []clusterstate.WorkflowFinalizationIntent{
+			workflowFinalization(t, record.Starting.BuildID, *record.Starting.Binding, nil),
+		}
+		result := ApplyDataCommand(&state, 2, DataCommand{
+			Type: DataPutBuild, Identity: identity, Expect: RevisionExpectation{Absent: true}, Build: &record,
+		})
+		if !result.Conflict || len(state.Builds) != 0 {
+			t.Fatalf("new Build finalization = %+v, builds=%d", result, len(state.Builds))
+		}
+	})
+}
+
 func TestCloneRouteRecordDeepCopiesReadyExecutionIntents(t *testing.T) {
 	registryLayout := testRegistryLayout(4, "generation-clone-ready")
 	starting := routeStarting(t, registryLayout, "/g", "rk", "sandbox-1", 1, true)

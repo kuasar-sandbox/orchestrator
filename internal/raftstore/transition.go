@@ -226,6 +226,12 @@ func (r *Runtime) ConfirmRegistryLayoutTransitionPermitDrain(ctx context.Context
 	if err != nil {
 		return SystemState{}, err
 	}
+	if r.registryLayoutActivationFinalized(state) {
+		if err := r.syncLocalRegistryLayout(state); err != nil {
+			return SystemState{}, err
+		}
+		return state, nil
+	}
 	transition, err := r.requireRegistryLayoutTransition(state)
 	if err != nil {
 		return SystemState{}, err
@@ -270,8 +276,16 @@ func (r *Runtime) ConfirmRegistryLayoutTransitionPermitDrain(ctx context.Context
 	resolveContext, cancelResolve := ambiguityResolutionContext(ctx)
 	defer cancelResolve()
 	confirmed, readErr := r.ReadSystemStrong(resolveContext)
-	if readErr == nil && confirmed.Transition != nil && confirmed.Transition.PreviousPermitDrainComplete {
-		return confirmed, nil
+	if readErr == nil {
+		if confirmed.Transition != nil && confirmed.Transition.PreviousPermitDrainComplete {
+			return confirmed, nil
+		}
+		if r.registryLayoutActivationFinalized(confirmed) {
+			if err := r.syncLocalRegistryLayout(confirmed); err != nil {
+				return SystemState{}, err
+			}
+			return confirmed, nil
+		}
 	}
 	if proposeErr != nil {
 		return SystemState{}, proposeErr
