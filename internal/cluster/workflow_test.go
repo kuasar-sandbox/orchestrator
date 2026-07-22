@@ -280,15 +280,25 @@ func TestBuildFinalizationMustIdentifyContainingBuild(t *testing.T) {
 	}
 }
 
+func TestBuildProjectionBindingMustCoverContainingWorkflow(t *testing.T) {
+	build := registeredBuildRecord(t)
+	build.Group = "/another-group"
+	if err := build.Validate(); err == nil {
+		t.Fatal("Build projection from another group was accepted")
+	}
+}
+
 func registeredBuildRecord(t *testing.T) BuildRecord {
 	t.Helper()
+	intent := workflowBuildIntent(t)
+	binding := workflowBinding(t, ExecutionKindBuild, "b1", "", intent)
 	return BuildRecord{
 		Group: "/g", BuildID: "b1", State: BuildRegistered,
 		Revision: Revision{RegistryGeneration: "g1", ShardID: 2, LogIndex: 20},
 		Projection: &BuildProjection{
 			BuildID: "b1", NodeID: "n1", NodeEpoch: 7, DataEndpoint: "10.0.0.1:8443",
-			RegistryGeneration: "g1", BindingDigest: hexDigest(sha256.Sum256([]byte("binding"))),
-			Intent: workflowBuildIntent(t), TemplateRef: "template-1",
+			RegistryGeneration: "g1", OpaqueBinding: binding.OpaqueBinding, BindingDigest: binding.BindingDigest,
+			Intent: intent, TemplateRef: "template-1",
 		},
 	}
 }
@@ -462,7 +472,6 @@ func workflowBuildIntent(t *testing.T) DispatchIntent {
 }
 
 func readyRoute() *ReadyRoute {
-	binding := sha256.Sum256([]byte("binding"))
 	templateRef := "e2b-img-" + strings.Repeat("c", 64)
 	spec, _ := MarshalSandboxDispatchSpec(SandboxDispatchSpecV1{
 		Version: DispatchSpecVersionV1, TemplateRef: templateRef,
@@ -474,11 +483,39 @@ func readyRoute() *ReadyRoute {
 		},
 	})
 	intent, _ := NewDispatchIntent([]byte("demand"), spec, "provider-v1")
+	binding := projectionBinding(ExecutionKindSandbox, "s1", "rk", intent)
 	return &ReadyRoute{
 		SandboxID: "s1", NodeID: "n1", NodeEpoch: 7, DataEndpoint: "10.0.0.1:8443",
 		TargetPort: 3000, AccessToken: "token", TrafficAccessToken: "traffic-token",
 		TemplateRef: templateRef, RegistryGeneration: "g1",
-		BindingDigest: hexDigest(binding), LastEventSeq: 3, Intent: intent,
+		OpaqueBinding: binding.OpaqueBinding, BindingDigest: binding.BindingDigest, LastEventSeq: 3, Intent: intent,
+	}
+}
+
+func projectionBinding(kind ExecutionKind, objectID, routeKey string, intent DispatchIntent) ExecutionBindingIntent {
+	var demand, dispatch [sha256.Size]byte
+	demandBytes, _ := hex.DecodeString(intent.DemandDigest)
+	dispatchBytes, _ := hex.DecodeString(intent.DispatchSpecDigest)
+	copy(demand[:], demandBytes)
+	copy(dispatch[:], dispatchBytes)
+	opaque, _ := EncodeExecutionBinding(ExecutionBinding{
+		RegistryGeneration: "g1", Kind: kind, ObjectID: objectID, Group: "/g", RouteKey: routeKey,
+		NodeID: "n1", NodeEpoch: 7, DemandDigest: demand, DispatchSpecDigest: dispatch,
+	})
+	digest, _ := ExecutionBindingDigest(opaque)
+	return ExecutionBindingIntent{
+		NodeID: "n1", NodeEpoch: 7, DataEndpoint: "10.0.0.1:8443",
+		RegistryGeneration: "g1", OpaqueBinding: opaque, BindingDigest: digest,
+	}
+}
+
+func TestReadyRouteBindingMustCoverContainingWorkflow(t *testing.T) {
+	record := RouteWorkflowRecord{
+		Group: "/g", RouteKey: "another-route", State: WorkflowRouteReady,
+		Revision: Revision{RegistryGeneration: "g1", ShardID: 1, LogIndex: 1}, Ready: readyRoute(),
+	}
+	if err := record.Validate(); err == nil {
+		t.Fatal("READY projection from another Route was accepted")
 	}
 }
 
