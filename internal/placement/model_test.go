@@ -148,6 +148,19 @@ func TestProbeRetriesDynamicSafetyStates(t *testing.T) {
 	}
 }
 
+func TestProbeRetriesDrainingCandidate(t *testing.T) {
+	snapshot := baseSnapshot()
+	snapshot.Draining = true
+	request := PlacementProbeRequest{
+		Kind: ObjectSandbox, NodeID: "n1", ExpectedNodeEpoch: 7, ExpectedSessionSeq: 11,
+		LoadModelVersion: LoadModelVersion, CatalogDigest: testCatalogDigest,
+		Sandbox: &SandboxDemand{SlotUnits: 1, StartupBudgetMemory: 1},
+	}
+	if got := ProbePlacement(snapshot, 0, request); got.Class != ProbeStale {
+		t.Fatalf("draining candidate = %+v", got)
+	}
+}
+
 func TestProbeRetriesTemporaryHardLimitSaturation(t *testing.T) {
 	sandboxSnapshot := baseSnapshot()
 	sandboxSnapshot.SandboxSlotHardLimit = 3
