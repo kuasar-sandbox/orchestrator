@@ -92,6 +92,8 @@ CREATE TABLE IF NOT EXISTS key_leases (
   auth_key_enc      TEXT NOT NULL,
   manifest_key_hash TEXT NOT NULL,
   manifest_key_enc  TEXT NOT NULL,
+  key_revision      BLOB NOT NULL CHECK (length(key_revision) = 8),
+  registry_auth_digest TEXT NOT NULL DEFAULT '',
   label             TEXT NOT NULL DEFAULT '',
   created_unix      INTEGER NOT NULL,
   expires_unix      INTEGER NOT NULL DEFAULT 0,

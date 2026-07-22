@@ -25,15 +25,12 @@ func NewDirectoryDispatcher(directory *Directory, client HolderDispatchRPC) (*Di
 
 func (d *DirectoryDispatcher) AdmitAndDispatch(ctx context.Context, command DispatchCommand) (DispatchReply, error) {
 	record, found := d.directory.LookupRecord(command.NodeID)
-	if found && record.Entry.NodeEpoch > command.NodeEpoch {
-		return DispatchReply{Outcome: cluster.DispatchDefinitiveReject, Reason: "selected NodeEpoch is permanently fenced"}, nil
-	}
 	if !found || !record.Available || record.Conflict {
-		return DispatchReply{Outcome: cluster.DispatchSessionMoved, Reason: "node has no current Session Holder"}, nil
+		return d.classifyUnavailable(ctx, command, "node has no current Session Holder")
 	}
 	entry := record.Entry
 	if entry.NodeEpoch > command.NodeEpoch {
-		return DispatchReply{Outcome: cluster.DispatchDefinitiveReject, Reason: "selected NodeEpoch is permanently fenced"}, nil
+		return d.classifyUnavailable(ctx, command, "selected NodeEpoch is no longer current")
 	}
 	if entry.NodeEpoch < command.NodeEpoch {
 		return DispatchReply{Outcome: cluster.DispatchSessionMoved, Reason: "Session Directory is behind selected NodeEpoch"}, nil
@@ -44,4 +41,16 @@ func (d *DirectoryDispatcher) AdmitAndDispatch(ctx context.Context, command Disp
 		return DispatchReply{Outcome: cluster.DispatchSessionMoved, Reason: err.Error()}, nil
 	}
 	return reply, err
+}
+
+func (d *DirectoryDispatcher) classifyUnavailable(
+	ctx context.Context,
+	command DispatchCommand,
+	reason string,
+) (DispatchReply, error) {
+	fenced, err := d.directory.NodeEpochPermanentlyFenced(ctx, command.NodeID, command.NodeEpoch)
+	if err == nil && fenced {
+		return DispatchReply{Outcome: cluster.DispatchDefinitiveReject, Reason: "selected NodeEpoch is permanently fenced"}, nil
+	}
+	return DispatchReply{Outcome: cluster.DispatchSessionMoved, Reason: reason}, nil
 }

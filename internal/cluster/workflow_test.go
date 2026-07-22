@@ -19,7 +19,7 @@ func TestRouteWorkflowTypesValidateFrozenIntent(t *testing.T) {
 		Revision: Revision{RegistryGeneration: "g1", ShardID: 7, LogIndex: 11},
 		Starting: &RouteStartingState{
 			SandboxID: "s1", PlacementRound: 1,
-			CandidatePool:     []PlacementCandidate{{NodeID: "n1"}, {NodeID: "n2"}},
+			CandidatePool:     []PlacementCandidate{testPlacementCandidate("n1"), testPlacementCandidate("n2")},
 			SelectedCandidate: &selected, Intent: intent, Binding: &binding,
 		},
 	}
@@ -77,7 +77,7 @@ func TestRouteTombstoneCarriesExactExecutionFence(t *testing.T) {
 	binding := sha256.Sum256([]byte("binding"))
 	proof := TerminalProof{Kind: ProofNodeTerminal, FencedNodeID: "n1", FencedNodeEpoch: 7}
 	var err error
-	proof.ProofDigest, err = NodeTerminalProofDigest(proof, "g1", "s1", hexDigest(binding), 4)
+	proof.ProofDigest, err = NodeTerminalProofDigest(proof, "/g", "rk", "g1", "s1", hexDigest(binding), 4)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -93,6 +93,18 @@ func TestRouteTombstoneCarriesExactExecutionFence(t *testing.T) {
 	}
 	if err := record.Validate(); err != nil {
 		t.Fatal(err)
+	}
+	for name, mutate := range map[string]func(*RouteWorkflowRecord){
+		"group":     func(value *RouteWorkflowRecord) { value.Group = "/other" },
+		"route key": func(value *RouteWorkflowRecord) { value.RouteKey = "other" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			changed := record
+			mutate(&changed)
+			if err := changed.Validate(); err == nil {
+				t.Fatal("terminal proof was accepted for another Route identity")
+			}
+		})
 	}
 	for name, reason := range map[string]string{
 		"oversized":     strings.Repeat("x", MaxTerminalReasonBytes+1),
@@ -133,7 +145,7 @@ func TestDispatchIntentRejectsMutationAndOversize(t *testing.T) {
 
 func TestPlacementFailuresDoNotInventExecutionProof(t *testing.T) {
 	intent := workflowSandboxIntent(t)
-	candidates := []PlacementCandidate{{NodeID: "n1"}, {NodeID: "n2"}}
+	candidates := []PlacementCandidate{testPlacementCandidate("n1"), testPlacementCandidate("n2")}
 	rejected := []uint32{0, 1}
 	route := RouteWorkflowRecord{
 		Group: "/g", RouteKey: "rk", State: WorkflowRouteTombstone,
@@ -172,11 +184,11 @@ func TestPlacementFailuresDoNotInventExecutionProof(t *testing.T) {
 func TestPlacementFailureReasonIsBoundedUTF8(t *testing.T) {
 	route := RoutePlacementFailureState{
 		SandboxID: "s1", PlacementRound: 1,
-		CandidatePool:        []PlacementCandidate{{NodeID: "n1"}},
+		CandidatePool:        []PlacementCandidate{testPlacementCandidate("n1")},
 		DefinitivelyRejected: []uint32{0}, Intent: workflowSandboxIntent(t), Reason: "exhausted",
 	}
 	build := BuildPlacementFailureState{
-		BuildID: "b1", CandidatePool: []PlacementCandidate{{NodeID: "n1"}},
+		BuildID: "b1", CandidatePool: []PlacementCandidate{testPlacementCandidate("n1")},
 		DefinitivelyRejected: []uint32{0}, Intent: workflowBuildIntent(t), Reason: "exhausted",
 	}
 	for name, reason := range map[string]string{
@@ -199,7 +211,7 @@ func TestPlacementFailureReasonIsBoundedUTF8(t *testing.T) {
 func TestPlacementFailureFenceProofIsBoundToRouteIdentity(t *testing.T) {
 	failure := RoutePlacementFailureState{
 		SandboxID: "s1", PlacementRound: 2,
-		CandidatePool:        []PlacementCandidate{{NodeID: "n1"}, {NodeID: "n2"}},
+		CandidatePool:        []PlacementCandidate{testPlacementCandidate("n1"), testPlacementCandidate("n2")},
 		DefinitivelyRejected: []uint32{0, 1}, Intent: workflowSandboxIntent(t), Reason: "placement exhausted",
 	}
 	fence, err := NewPlacementFailureFence("/g", "rk", "g1", failure)
@@ -326,18 +338,24 @@ func TestPlacementCandidatePoolIsBoundedBeforePersistence(t *testing.T) {
 	candidates := make([]PlacementCandidate, MaxPlacementCandidates+1)
 	for index := range candidates {
 		candidates[index].NodeID = fmt.Sprintf("node-%d", index)
+		candidates[index].CatalogDigest = strings.Repeat("a", 64)
 	}
 	if err := validateCandidates(candidates, nil, nil); err == nil {
 		t.Fatal("oversized candidate pool was accepted")
 	}
-	if err := validateCandidates([]PlacementCandidate{{NodeID: "node-1"}}, nil, make([]uint32, 2)); err == nil {
+	if err := validateCandidates([]PlacementCandidate{testPlacementCandidate("node-1")}, nil, make([]uint32, 2)); err == nil {
 		t.Fatal("oversized rejected-candidate set was accepted")
 	}
 	if err := validateCandidates([]PlacementCandidate{{
 		NodeID: "node-1", FailureDomain: strings.Repeat("z", MaxPlacementCandidateMetadataBytes+1),
+		CatalogDigest: strings.Repeat("a", 64),
 	}}, nil, nil); err == nil {
 		t.Fatal("oversized candidate metadata was accepted")
 	}
+}
+
+func testPlacementCandidate(nodeID string) PlacementCandidate {
+	return PlacementCandidate{NodeID: nodeID, CatalogDigest: strings.Repeat("a", 64)}
 }
 
 func TestExecutionFenceRequiresFinalOutboxCoverage(t *testing.T) {
@@ -346,7 +364,7 @@ func TestExecutionFenceRequiresFinalOutboxCoverage(t *testing.T) {
 	}
 	bindingDigest := hexDigest(sha256.Sum256([]byte("binding")))
 	var err error
-	proof.ProofDigest, err = NodeTerminalProofDigest(proof, "g1", "sandbox-1", bindingDigest, 4)
+	proof.ProofDigest, err = NodeTerminalProofDigest(proof, "/g", "rk", "g1", "sandbox-1", bindingDigest, 4)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -364,6 +382,8 @@ func TestExecutionFenceRequiresFinalOutboxCoverage(t *testing.T) {
 		t.Fatal(err)
 	}
 	for name, mutate := range map[string]func(*ExecutionFence){
+		"group":     func(value *ExecutionFence) { value.Group = "/other" },
+		"route key": func(value *ExecutionFence) { value.RouteKey = "other" },
 		"sandbox":   func(value *ExecutionFence) { value.SandboxID = "sandbox-2" },
 		"binding":   func(value *ExecutionFence) { value.BindingDigest = hexDigest(sha256.Sum256([]byte("other"))) },
 		"watermark": func(value *ExecutionFence) { value.LastEventSeq++ },
@@ -387,7 +407,7 @@ func TestNewerNodeEpochProofIsBoundToExactExecutionState(t *testing.T) {
 	}
 	var err error
 	proof.ProofDigest, err = NewerNodeEpochProofDigest(
-		proof, ready.RegistryGeneration, ready.SandboxID, ready.BindingDigest, ready.LastEventSeq,
+		proof, "/g", "rk", ready.RegistryGeneration, ready.SandboxID, ready.BindingDigest, ready.LastEventSeq,
 	)
 	if err != nil {
 		t.Fatal(err)

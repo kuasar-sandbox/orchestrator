@@ -108,7 +108,14 @@ func (o *Orchestrator) HandleCommand(ctx context.Context, cmd *routesync.Command
 			if err := cmd.KeyLeaseRef.Validate(); err != nil {
 				return reject(cmd, err)
 			}
-			if _, err := o.st.DropKeyLeaseRef(ctx, cmd.KeyLeaseRef.Group, cmd.KeyLeaseRef.AuthKeyFingerprint, cmd.KeyLeaseRef.ManifestKeyFingerprint); err != nil {
+			if _, err := o.st.DropKeyLeaseRef(
+				ctx,
+				cmd.KeyLeaseRef.Group,
+				cmd.KeyLeaseRef.AuthKeyFingerprint,
+				cmd.KeyLeaseRef.ManifestKeyFingerprint,
+				cmd.KeyLeaseRef.KeyRevision,
+				cmd.KeyLeaseRef.RegistryAuthDigest,
+			); err != nil {
 				return reject(cmd, err)
 			}
 			ack := accept(cmd)
@@ -374,7 +381,8 @@ func accept(cmd *routesync.Command) *routesync.CmdAck {
 }
 
 func (o *Orchestrator) putClusterKeyLease(ctx context.Context, wire routesync.NodeKeyLeaseV1) (routesync.NodeKeyLeaseRefV1, error) {
-	if err := wire.Validate(); err != nil {
+	ref, err := wire.Ref()
+	if err != nil {
 		return routesync.NodeKeyLeaseRefV1{}, err
 	}
 	if wire.ExpiresUnix <= time.Now().Unix() {
@@ -394,16 +402,13 @@ func (o *Orchestrator) putClusterKeyLease(ctx context.Context, wire routesync.No
 	}
 	if _, err := o.st.PutKeyLease(ctx, store.KeyLease{
 		Group: wire.Group, AuthKey: authKey, ManifestKey: manifestKey,
-		RegistryAuth: registryAuth, Label: "cluster", ExpiresUnix: wire.ExpiresUnix,
+		KeyRevision: wire.KeyRevision, RegistryAuth: registryAuth,
+		RegistryAuthDigest: ref.RegistryAuthDigest,
+		Label:              "cluster", ExpiresUnix: wire.ExpiresUnix,
 	}); err != nil {
 		return routesync.NodeKeyLeaseRefV1{}, err
 	}
-	ref := routesync.NodeKeyLeaseRefV1{
-		Version: routesync.NodeKeyLeaseVersionV1, Group: wire.Group,
-		AuthKeyFingerprint:     wire.AuthKey.Fingerprint,
-		ManifestKeyFingerprint: wire.ManifestKey.Fingerprint,
-	}
-	return ref, ref.Validate()
+	return ref, nil
 }
 
 func (o *Orchestrator) resolveNodeKeyMaterial(ctx context.Context, material routesync.NodeKeyMaterialV1) (string, error) {

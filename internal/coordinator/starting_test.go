@@ -424,6 +424,9 @@ func TestProbeRuntimeConstraintComesFromImmutableDispatch(t *testing.T) {
 		if request.RuntimeDigest != spec.TargetRuntimeDigest {
 			t.Fatalf("probe runtime digest = %q, want %q", request.RuntimeDigest, spec.TargetRuntimeDigest)
 		}
+		if request.CatalogDigest != strings.Repeat("a", 64) {
+			t.Fatalf("probe Catalog digest = %q", request.CatalogDigest)
+		}
 	}
 }
 
@@ -616,7 +619,9 @@ func buildStartingRecord(t *testing.T, buildID string, candidates []cluster.Plac
 func candidatePool(ids ...string) []cluster.PlacementCandidate {
 	candidates := make([]cluster.PlacementCandidate, len(ids))
 	for index, id := range ids {
-		candidates[index] = cluster.PlacementCandidate{NodeID: id, RuntimeDigest: "runtime-v1"}
+		candidates[index] = cluster.PlacementCandidate{
+			NodeID: id, RuntimeDigest: "runtime-v1", CatalogDigest: strings.Repeat("a", 64),
+		}
 	}
 	return candidates
 }

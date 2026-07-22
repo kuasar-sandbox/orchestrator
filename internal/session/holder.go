@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/hex"
 	"errors"
+	"maps"
 	"sync"
 	"time"
 
@@ -21,6 +22,7 @@ var (
 	ErrPermitUnavailable   = errors.New("session: matching Serve Permit is unavailable")
 	ErrKeyLeaseUnavailable = errors.New("session: exact node key lease is not durably acknowledged")
 	ErrKeyLeaseSuperseded  = errors.New("session: key lease operation was superseded by a newer operation")
+	ErrKeyLeaseConflict    = errors.New("session: equal key revision identifies different registry authorization")
 	ErrDispatchNotSent     = errors.New("session: dispatch was not sent")
 )
 
@@ -73,6 +75,8 @@ type Registration struct {
 	Tuple
 	DataEndpoint     string
 	RuntimeDigest    string
+	Labels           map[string]string
+	Capabilities     map[string]bool
 	LoadModelVersion uint16
 	SandboxSlots     uint64
 	BuildSlots       uint64
@@ -104,9 +108,9 @@ type heldSession struct {
 	snapshot     placement.PlacementLoadSnapshot
 	observedAt   time.Time
 	hasSnapshot  bool
-	keyLeases    map[string]int64
+	keyLeases    map[string]acknowledgedKeyLease
 	keyLeaseSeq  map[string]uint64
-	keyLeaseHigh map[string]int64
+	keyLeaseHigh map[string]acknowledgedKeyLease
 }
 
 type Lease struct {
@@ -286,6 +290,7 @@ func (h *Holder) UpdateSnapshot(tuple Tuple, snapshot placement.PlacementLoadSna
 		snapshot.BuildMemoryCapacity != registration.BuildMemory || snapshot.BuildStorageCapacity != registration.BuildStorage {
 		return errors.New("session: placement snapshot changed stable registration data")
 	}
+	snapshot.CatalogDigest = registrationCatalogDigest(registration)
 	session.snapshot = snapshot
 	session.observedAt = h.clock()
 	session.hasSnapshot = true
@@ -352,12 +357,12 @@ func (h *Holder) AdmitAndDispatch(ctx context.Context, command DispatchCommand) 
 		return DispatchReply{}, ErrSessionUnavailable
 	}
 	defer held.commandMu.Unlock()
-	keyLeaseRef, err := dispatchKeyLeaseRef(command)
+	keyLeaseID, err := dispatchKeyLeaseID(command)
 	if err != nil {
 		return DispatchReply{}, err
 	}
 	held.leaseMu.RLock()
-	leaseExpires := held.keyLeases[keyLeaseRefID(keyLeaseRef)]
+	leaseExpires := held.keyLeases[keyLeaseID].ExpiresUnix
 	held.leaseMu.RUnlock()
 	if leaseExpires <= h.clock().Unix() {
 		return DispatchReply{}, errors.Join(ErrDispatchNotSent, ErrKeyLeaseUnavailable)
@@ -454,8 +459,8 @@ func (h *Holder) lockCommandSession(
 func newHeldSession(registration Registration, endpoint SessionEndpoint) *heldSession {
 	return &heldSession{
 		registration: registration, endpoint: endpoint,
-		keyLeases: make(map[string]int64), keyLeaseSeq: make(map[string]uint64),
-		keyLeaseHigh: make(map[string]int64),
+		keyLeases: make(map[string]acknowledgedKeyLease), keyLeaseSeq: make(map[string]uint64),
+		keyLeaseHigh: make(map[string]acknowledgedKeyLease),
 	}
 }
 
@@ -503,10 +508,21 @@ func (h *Holder) directoryEntry(registration Registration) DirectoryEntry {
 
 func registrationStableWithinEpoch(left, right Registration) bool {
 	return left.EnrollmentID == right.EnrollmentID && left.DataEndpoint == right.DataEndpoint &&
-		left.RuntimeDigest == right.RuntimeDigest && left.LoadModelVersion == right.LoadModelVersion &&
+		left.RuntimeDigest == right.RuntimeDigest && maps.Equal(left.Labels, right.Labels) &&
+		maps.Equal(left.Capabilities, right.Capabilities) && left.LoadModelVersion == right.LoadModelVersion &&
 		left.SandboxSlots == right.SandboxSlots && left.BuildSlots == right.BuildSlots &&
 		left.BuildCPU == right.BuildCPU && left.BuildMemory == right.BuildMemory &&
 		left.BuildStorage == right.BuildStorage && left.FailureDomain == right.FailureDomain
+}
+
+func registrationCatalogDigest(registration Registration) string {
+	return placement.CatalogIdentityDigest(placement.CatalogNode{
+		NodeID: registration.NodeID, Labels: registration.Labels, Capabilities: registration.Capabilities,
+		FailureDomain: registration.FailureDomain, RuntimeDigest: registration.RuntimeDigest,
+		SandboxSlotCapacity: registration.SandboxSlots, BuildSlotCapacity: registration.BuildSlots,
+		BuildCPUCapacity: registration.BuildCPU, BuildMemoryCapacity: registration.BuildMemory,
+		BuildStorageCapacity: registration.BuildStorage,
+	})
 }
 
 func (h *Holder) publish(delta DirectoryDelta) {

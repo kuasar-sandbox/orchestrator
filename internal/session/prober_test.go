@@ -136,7 +136,8 @@ func applyDirectoryUp(t *testing.T, directory *Directory, nodeID, holderID strin
 func probeRequest(nodeID string) placement.PlacementProbeRequest {
 	return placement.PlacementProbeRequest{
 		Kind: placement.ObjectSandbox, NodeID: nodeID, LoadModelVersion: placement.LoadModelVersion,
-		Sandbox: &placement.SandboxDemand{SlotUnits: 1},
+		CatalogDigest: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		Sandbox:       &placement.SandboxDemand{SlotUnits: 1},
 	}
 }
 

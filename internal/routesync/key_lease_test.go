@@ -20,6 +20,7 @@ func TestNodeKeyLeaseRequiresSeparateExactKeyDomains(t *testing.T) {
 	lease := NodeKeyLeaseV1{
 		Version:      NodeKeyLeaseVersionV1,
 		Group:        "group-a",
+		KeyRevision:  7,
 		AuthKey:      inlineKeyMaterial(strings.Repeat("a", 64)),
 		ManifestKey:  inlineKeyMaterial(strings.Repeat("b", 64)),
 		RegistryAuth: NodeRegistryAuthV1{Type: KeyMaterialRef, Ref: "provider://registry/group-a"},
@@ -40,9 +41,14 @@ func TestNodeKeyLeaseRequiresSeparateExactKeyDomains(t *testing.T) {
 }
 
 func TestNodeKeyLeaseRefFencesRotatedDrop(t *testing.T) {
-	ref := NodeKeyLeaseRefV1{
-		Version: NodeKeyLeaseVersionV1, Group: "group-a",
-		AuthKeyFingerprint: strings.Repeat("a", 24), ManifestKeyFingerprint: strings.Repeat("b", 24),
+	lease := NodeKeyLeaseV1{
+		Version: NodeKeyLeaseVersionV1, Group: "group-a", KeyRevision: 7,
+		AuthKey: inlineKeyMaterial(strings.Repeat("a", 64)), ManifestKey: inlineKeyMaterial(strings.Repeat("b", 64)),
+		RegistryAuth: NodeRegistryAuthV1{Type: KeyMaterialInline, Value: "registry-a"}, ExpiresUnix: 1234,
+	}
+	ref, err := lease.Ref()
+	if err != nil {
+		t.Fatal(err)
 	}
 	if err := ref.Validate(); err != nil {
 		t.Fatal(err)
@@ -53,11 +59,45 @@ func TestNodeKeyLeaseRefFencesRotatedDrop(t *testing.T) {
 	}
 }
 
-func TestKeyPutAckCarriesExactLeaseReference(t *testing.T) {
-	ref := &NodeKeyLeaseRefV1{
-		Version: NodeKeyLeaseVersionV1, Group: "group-a",
-		AuthKeyFingerprint: strings.Repeat("a", 24), ManifestKeyFingerprint: strings.Repeat("b", 24),
+func TestNodeKeyLeaseRefBindsRegistryAuthAndRevision(t *testing.T) {
+	lease := NodeKeyLeaseV1{
+		Version: NodeKeyLeaseVersionV1, Group: "group-a", KeyRevision: 7,
+		AuthKey: inlineKeyMaterial(strings.Repeat("a", 64)), ManifestKey: inlineKeyMaterial(strings.Repeat("b", 64)),
+		RegistryAuth: NodeRegistryAuthV1{Type: KeyMaterialInline, Value: "registry-a"}, ExpiresUnix: 1234,
 	}
+	first, err := lease.Ref()
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease.RegistryAuth.Value = "registry-b"
+	second, err := lease.Ref()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.RegistryAuthDigest == second.RegistryAuthDigest {
+		t.Fatal("registry auth rotation did not change the exact lease reference")
+	}
+	lease.KeyRevision++
+	third, err := lease.Ref()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.KeyRevision == third.KeyRevision {
+		t.Fatal("key revision did not change the exact lease reference")
+	}
+}
+
+func TestKeyPutAckCarriesExactLeaseReference(t *testing.T) {
+	lease := NodeKeyLeaseV1{
+		Version: NodeKeyLeaseVersionV1, Group: "group-a", KeyRevision: 7,
+		AuthKey: inlineKeyMaterial(strings.Repeat("a", 64)), ManifestKey: inlineKeyMaterial(strings.Repeat("b", 64)),
+		ExpiresUnix: 1234,
+	}
+	value, err := lease.Ref()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref := &value
 	encoded, err := json.Marshal(CmdAck{CmdID: "cmd-1", Status: AckAccepted, KeyLeaseRef: ref})
 	if err != nil {
 		t.Fatal(err)

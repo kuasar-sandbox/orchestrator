@@ -3,21 +3,30 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"time"
 )
 
+var (
+	ErrKeyLeaseRevisionRegression = errors.New("store: key lease revision regressed")
+	ErrKeyLeaseRevisionConflict   = errors.New("store: key lease revision conflicts with registry auth")
+	ErrKeyLeaseExpiryRegression   = errors.New("store: key lease expiry regressed")
+)
+
 // KeyLease is the node-local, encrypted-at-rest bundle required before a new
 // Sandbox or Build can copy its independent AuthKey and ManifestKey roots.
 type KeyLease struct {
-	Group        string
-	AuthKey      string
-	ManifestKey  string
-	RegistryAuth string
-	Label        string
-	CreatedUnix  int64
-	ExpiresUnix  int64 // 0 is allowed only for explicitly installed local leases
+	Group              string
+	AuthKey            string
+	ManifestKey        string
+	KeyRevision        uint64
+	RegistryAuth       string
+	RegistryAuthDigest string
+	Label              string
+	CreatedUnix        int64
+	ExpiresUnix        int64 // 0 is allowed only for explicitly installed local leases
 }
 
 type KeyLeaseInfo struct {
@@ -32,6 +41,19 @@ type KeyLeaseInfo struct {
 func (s *Store) PutKeyLease(ctx context.Context, lease KeyLease) (bool, error) {
 	if lease.Group == "" {
 		return false, errors.New("store: key lease group is required")
+	}
+	if lease.KeyRevision == 0 {
+		if lease.RegistryAuthDigest != "" {
+			return false, errors.New("store: a local key lease cannot carry a registry auth digest")
+		}
+	} else {
+		digest, err := hex.DecodeString(lease.RegistryAuthDigest)
+		if err != nil || len(digest) != 32 || hex.EncodeToString(digest) != lease.RegistryAuthDigest {
+			return false, errors.New("store: a cluster key lease requires a canonical registry auth digest")
+		}
+		if lease.ExpiresUnix <= 0 {
+			return false, errors.New("store: a cluster key lease requires a positive expiry")
+		}
 	}
 	authHash, authEnc, err := s.encKeyField("AuthKey", lease.AuthKey)
 	if err != nil {
@@ -61,13 +83,41 @@ func (s *Store) PutKeyLease(ctx context.Context, lease KeyLease) (bool, error) {
 		return false, err
 	}
 	if found {
+		var currentRevisionEncoded []byte
+		var currentRegistryAuthDigest string
+		var currentExpiresUnix int64
+		if err := tx.QueryRowContext(ctx, `
+SELECT key_revision,registry_auth_digest,expires_unix
+FROM key_leases WHERE rowid=?`, rowID).Scan(
+			&currentRevisionEncoded, &currentRegistryAuthDigest, &currentExpiresUnix,
+		); err != nil {
+			return false, err
+		}
+		currentRevision, err := decodeUint64(currentRevisionEncoded)
+		if err != nil {
+			return false, fmt.Errorf("store: decode key lease revision: %w", err)
+		}
+		if lease.KeyRevision < currentRevision {
+			return false, ErrKeyLeaseRevisionRegression
+		}
+		if lease.KeyRevision > 0 && lease.KeyRevision == currentRevision {
+			if lease.RegistryAuthDigest != currentRegistryAuthDigest {
+				return false, ErrKeyLeaseRevisionConflict
+			}
+			if lease.ExpiresUnix < currentExpiresUnix {
+				return false, ErrKeyLeaseExpiryRegression
+			}
+		}
+		clusterLease := lease.KeyRevision > 0
 		result, updateErr := tx.ExecContext(ctx, `
 UPDATE key_leases
 SET auth_key_enc=?, manifest_key_enc=?,
-    registry_auth_enc=CASE WHEN ?='' THEN registry_auth_enc ELSE ? END,
+	key_revision=?, registry_auth_digest=?,
+    registry_auth_enc=CASE WHEN ? THEN ? WHEN ?='' THEN registry_auth_enc ELSE ? END,
     expires_unix=?,
     label=CASE WHEN ?='' THEN label ELSE ? END
-WHERE rowid=?`, authEnc, manifestEnc, registryAuthEnc, registryAuthEnc,
+WHERE rowid=?`, authEnc, manifestEnc, encodeUint64(lease.KeyRevision), lease.RegistryAuthDigest,
+			clusterLease, registryAuthEnc, registryAuthEnc, registryAuthEnc,
 			lease.ExpiresUnix, lease.Label, lease.Label, rowID)
 		if updateErr != nil {
 			return false, updateErr
@@ -90,9 +140,11 @@ WHERE rowid=?`, authEnc, manifestEnc, registryAuthEnc, registryAuthEnc,
 	}
 	_, err = tx.ExecContext(ctx, `
 INSERT INTO key_leases
-  (group_name,auth_key_hash,auth_key_enc,manifest_key_hash,manifest_key_enc,label,created_unix,expires_unix,registry_auth_enc)
-VALUES (?,?,?,?,?,?,?,?,?)`,
-		lease.Group, authHash, authEnc, manifestHash, manifestEnc, lease.Label, created, lease.ExpiresUnix, registryAuthEnc)
+  (group_name,auth_key_hash,auth_key_enc,manifest_key_hash,manifest_key_enc,key_revision,registry_auth_digest,
+   label,created_unix,expires_unix,registry_auth_enc)
+VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+		lease.Group, authHash, authEnc, manifestHash, manifestEnc, encodeUint64(lease.KeyRevision),
+		lease.RegistryAuthDigest, lease.Label, created, lease.ExpiresUnix, registryAuthEnc)
 	if err != nil {
 		return false, fmt.Errorf("store: put key lease: %w", err)
 	}
@@ -104,7 +156,7 @@ VALUES (?,?,?,?,?,?,?,?,?)`,
 
 func (s *Store) KeyLeasesByAuthHash(ctx context.Context, authHash string) ([]KeyLease, error) {
 	rows, err := s.db.QueryContext(ctx, `
-SELECT group_name,auth_key_enc,manifest_key_enc,registry_auth_enc,label,created_unix,expires_unix
+SELECT group_name,key_revision,registry_auth_digest,auth_key_enc,manifest_key_enc,registry_auth_enc,label,created_unix,expires_unix
 FROM key_leases
 WHERE auth_key_hash=? AND (expires_unix=0 OR expires_unix>?)
 ORDER BY created_unix`, authHash, time.Now().Unix())
@@ -128,7 +180,7 @@ func (s *Store) KeyLeaseByFingerprints(
 	group, authFingerprint, manifestFingerprint string,
 ) (KeyLease, bool, error) {
 	rows, err := s.db.QueryContext(ctx, `
-SELECT group_name,auth_key_enc,manifest_key_enc,registry_auth_enc,label,created_unix,expires_unix
+SELECT group_name,key_revision,registry_auth_digest,auth_key_enc,manifest_key_enc,registry_auth_enc,label,created_unix,expires_unix
 FROM key_leases
 WHERE group_name=? AND auth_key_hash=? AND manifest_key_hash=?
   AND (expires_unix=0 OR expires_unix>?)`,
@@ -193,10 +245,17 @@ func (s *Store) RemoveKeyLease(ctx context.Context, group, authKey, manifestKey 
 	return count == 1, nil
 }
 
-func (s *Store) DropKeyLeaseRef(ctx context.Context, group, authFingerprint, manifestFingerprint string) (bool, error) {
+func (s *Store) DropKeyLeaseRef(
+	ctx context.Context,
+	group, authFingerprint, manifestFingerprint string,
+	keyRevision uint64,
+	registryAuthDigest string,
+) (bool, error) {
 	result, err := s.db.ExecContext(ctx, `
-DELETE FROM key_leases WHERE group_name=? AND auth_key_hash=? AND manifest_key_hash=?`,
-		group, authFingerprint, manifestFingerprint)
+DELETE FROM key_leases
+WHERE group_name=? AND auth_key_hash=? AND manifest_key_hash=?
+  AND key_revision=? AND registry_auth_digest=?`,
+		group, authFingerprint, manifestFingerprint, encodeUint64(keyRevision), registryAuthDigest)
 	if err != nil {
 		return false, err
 	}
@@ -279,14 +338,19 @@ FROM key_leases WHERE group_name=? AND auth_key_hash=? AND manifest_key_hash=?`,
 
 func (s *Store) scanKeyLease(row interface{ Scan(...any) error }) (KeyLease, error) {
 	var lease KeyLease
+	var revisionEncoded []byte
 	var authEnc, manifestEnc, registryAuthEnc string
 	if err := row.Scan(
-		&lease.Group, &authEnc, &manifestEnc, &registryAuthEnc,
+		&lease.Group, &revisionEncoded, &lease.RegistryAuthDigest, &authEnc, &manifestEnc, &registryAuthEnc,
 		&lease.Label, &lease.CreatedUnix, &lease.ExpiresUnix,
 	); err != nil {
 		return KeyLease{}, err
 	}
 	var err error
+	lease.KeyRevision, err = decodeUint64(revisionEncoded)
+	if err != nil {
+		return KeyLease{}, fmt.Errorf("store: decode key lease revision: %w", err)
+	}
 	lease.AuthKey, err = s.box.DecryptString(authEnc)
 	if err != nil {
 		return KeyLease{}, errors.New("store: decrypt key lease AuthKey")
