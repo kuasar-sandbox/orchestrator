@@ -233,3 +233,48 @@ func TestTransitionAdvanceAmbiguityAcceptsLaterOrFinalizedState(t *testing.T) {
 		t.Fatal("finalized target Registry Layout did not resolve the ambiguous advance")
 	}
 }
+
+func TestRegistryLayoutActivationAcceptsOnlyExactActivatedOrFinalizedTarget(t *testing.T) {
+	previous := testRegistryLayout(1, "generation-activation")
+	previousDigest, err := previous.Digest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := previous
+	target.RegistryLayoutVersion = 2
+	target.PreviousRegistryLayoutVersion = 1
+	target.PreviousRegistryLayoutDigest = previousDigest
+	targetDigest, err := target.Digest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := Runtime{registryLayout: target, registryLayoutDigest: targetDigest}
+	state := SystemState{
+		ActiveRegistryLayoutVersion: 2, ActiveRegistryLayoutDigest: targetDigest,
+		Transition: &RegistryLayoutTransition{
+			Version: 2, Digest: targetDigest, PreviousDigest: previousDigest, Activated: true,
+		},
+	}
+	if !runtime.registryLayoutActivationCommitted(state) {
+		t.Fatal("exact activated target was not recognized")
+	}
+	state.Transition = nil
+	if !runtime.registryLayoutActivationCommitted(state) {
+		t.Fatal("exact finalized target was not recognized")
+	}
+	state.ActiveRegistryLayoutDigest = digestFor("other-layout")
+	if runtime.registryLayoutActivationCommitted(state) {
+		t.Fatal("another finalized Registry Layout was accepted")
+	}
+	initial := testRegistryLayout(1, "generation-initial")
+	initialDigest, err := initial.Digest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime = Runtime{registryLayout: initial, registryLayoutDigest: initialDigest}
+	if runtime.registryLayoutActivationCommitted(SystemState{
+		ActiveRegistryLayoutVersion: 1, ActiveRegistryLayoutDigest: initialDigest,
+	}) {
+		t.Fatal("initial Registry Layout was mistaken for a finalized transition")
+	}
+}

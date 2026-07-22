@@ -73,7 +73,11 @@ const (
 // so a proxy can serve the data plane on its own (no per-request callback). State
 // "paused"/missing makes the proxy send a Wake; "running" lets it forward.
 type RouteEntry struct {
-	SandboxID          string `json:"sid"`
+	SandboxID string `json:"sid"`
+	// AuthorityRevision orders route changes across execution replacements. It is
+	// zero only for a full snapshot row; live and replayed deltas are monotonic
+	// within one authority fingerprint.
+	AuthorityRevision  uint64 `json:"authority_revision,omitempty"`
 	NodeID             string `json:"node_id,omitempty"`
 	NodeEpoch          uint64 `json:"node_epoch,omitempty"`
 	RegistryGeneration string `json:"registry_generation,omitempty"`
@@ -121,6 +125,7 @@ func (r RouteEntry) ValidateExecutionFence() error {
 // carry the complete identity and event watermark.
 type RouteDelete struct {
 	SandboxID          string `json:"sid"`
+	AuthorityRevision  uint64 `json:"authority_revision,omitempty"`
 	NodeID             string `json:"node_id,omitempty"`
 	NodeEpoch          uint64 `json:"node_epoch,omitempty"`
 	RegistryGeneration string `json:"registry_generation,omitempty"`

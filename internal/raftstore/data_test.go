@@ -125,6 +125,21 @@ func TestCloneRouteRecordDeepCopiesReadyExecutionIntents(t *testing.T) {
 	}
 }
 
+func TestCloneBuildRecordDeepCopiesProjectionIntent(t *testing.T) {
+	registryLayout := testRegistryLayout(4, "generation-clone-build")
+	starting := buildStarting(t, registryLayout, "/g", "build-1", true)
+	registered := buildRegistrationRecord(starting)
+	cloned := cloneBuildRecord(registered)
+	wantDemand := append([]byte(nil), cloned.Projection.Intent.NormalizedDemand...)
+	wantSpec := append([]byte(nil), cloned.Projection.Intent.DispatchSpec...)
+	registered.Projection.Intent.NormalizedDemand[0] ^= 0xff
+	registered.Projection.Intent.DispatchSpec[0] ^= 0xff
+	if !bytes.Equal(cloned.Projection.Intent.NormalizedDemand, wantDemand) ||
+		!bytes.Equal(cloned.Projection.Intent.DispatchSpec, wantSpec) {
+		t.Fatal("cloned Build projection retained command-owned dispatch slices")
+	}
+}
+
 func TestMutationLookupInheritsFinalizationsAndIgnoresFenceCompaction(t *testing.T) {
 	registryLayout := testRegistryLayout(4, "generation-mutation-lookup")
 	state, identity := initializedRouteShard(t, registryLayout, "/g", "rk")

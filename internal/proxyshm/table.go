@@ -23,7 +23,7 @@ import (
 
 const (
 	magic  uint64 = 0x6b75736172505831 // "kusarPX1"
-	schema uint32 = 2
+	schema uint32 = 3
 
 	statusEmpty   uint32 = 0
 	statusPresent uint32 = 1
@@ -73,6 +73,9 @@ type mmapRecord struct {
 	Rev       uint64
 	NodeEpoch uint64
 	EventSeq  uint64
+	// AuthorityRevision is the route authority's changelog revision, distinct
+	// from Rev (this table's local notification revision).
+	AuthorityRevision uint64
 
 	SandboxID          [maxSandboxID]byte
 	NodeID             [maxNodeID]byte
@@ -202,6 +205,7 @@ func (t *Table) BeginSync() {
 	if t.readonly {
 		return
 	}
+	atomic.StoreUint32(&t.header.Synced, 0)
 	atomic.AddUint64(&t.header.SyncGen, 1)
 }
 
@@ -213,8 +217,18 @@ func (t *Table) Bookmark(fullSync bool) {
 		gen := atomic.LoadUint64(&t.header.SyncGen)
 		for i := range t.records {
 			r := &t.records[i]
-			if atomic.LoadUint32(&r.Status) == statusPresent && atomic.LoadUint64(&r.SyncGen) != gen {
-				t.deleteRecord(r)
+			switch atomic.LoadUint32(&r.Status) {
+			case statusPresent:
+				if atomic.LoadUint64(&r.SyncGen) != gen {
+					t.deleteRecord(r, 0)
+				}
+			case statusDeleted:
+				// A full snapshot may follow an authority restart whose revision
+				// sequence starts over. Its absent rows must not retain the old
+				// authority's ordering tombstones.
+				startWrite(r)
+				atomic.StoreUint64(&r.AuthorityRevision, 0)
+				finishWrite(r)
 			}
 		}
 	}
@@ -271,8 +285,18 @@ func (t *Table) Upsert(in routesync.RouteEntry) error {
 		return errors.New("proxyshm: route table full")
 	}
 	rec := &t.records[idx]
-	if current, status, readable := readRecord(rec); readable && status == statusPresent &&
-		sameRouteExecution(current, in) && current.EventSeq > 0 &&
+	current, status, readable := readRecord(rec)
+	if readable && (status == statusPresent || status == statusDeleted) &&
+		current.SandboxID == in.SandboxID && current.AuthorityRevision > 0 &&
+		in.AuthorityRevision > 0 && in.AuthorityRevision <= current.AuthorityRevision {
+		if status == statusPresent {
+			startWrite(rec)
+			rec.SyncGen = atomic.LoadUint64(&t.header.SyncGen)
+			finishWrite(rec)
+		}
+		return nil
+	}
+	if readable && status == statusPresent && sameRouteExecution(current, in) && current.EventSeq > 0 &&
 		(in.EventSeq == 0 || in.EventSeq <= current.EventSeq) {
 		// A replay/full sync may repeat an older event. Keep the newer payload,
 		// but mark it seen in this sync generation so Bookmark does not drop it.
@@ -288,6 +312,7 @@ func (t *Table) Upsert(in routesync.RouteEntry) error {
 	rec.Rev = atomic.AddUint64(&t.header.GlobalRev, 1)
 	atomic.StoreUint64(&rec.NodeEpoch, in.NodeEpoch)
 	atomic.StoreUint64(&rec.EventSeq, in.EventSeq)
+	atomic.StoreUint64(&rec.AuthorityRevision, in.AuthorityRevision)
 	_ = putFixed(rec.SandboxID[:], in.SandboxID)
 	_ = putFixed(rec.NodeID[:], in.NodeID)
 	_ = putFixed(rec.RegistryGeneration[:], in.RegistryGeneration)
@@ -314,7 +339,7 @@ func (t *Table) Delete(sid string) bool {
 	if !ok {
 		return false
 	}
-	t.deleteRecord(&t.records[idx])
+	t.deleteRecord(&t.records[idx], 0)
 	return true
 }
 
@@ -334,6 +359,10 @@ func (t *Table) DeleteRoute(delete routesync.RouteDelete) bool {
 	if !readable || status != statusPresent {
 		return false
 	}
+	if current.AuthorityRevision > 0 && delete.AuthorityRevision > 0 &&
+		delete.AuthorityRevision <= current.AuthorityRevision {
+		return false
+	}
 	managed := routeHasExecutionFence(current)
 	if managed != delete.HasExecutionFence() {
 		return false
@@ -343,7 +372,7 @@ func (t *Table) DeleteRoute(delete routesync.RouteDelete) bool {
 		delete.EventSeq <= current.EventSeq) {
 		return false
 	}
-	t.deleteRecord(rec)
+	t.deleteRecord(rec, delete.AuthorityRevision)
 	return true
 }
 
@@ -357,14 +386,17 @@ func sameRouteExecution(left, right routesync.RouteEntry) bool {
 		left.RegistryGeneration == right.RegistryGeneration && left.BindingDigest == right.BindingDigest
 }
 
-func (t *Table) deleteRecord(rec *mmapRecord) {
+func (t *Table) deleteRecord(rec *mmapRecord, authorityRevision uint64) {
 	startWrite(rec)
 	rec.Status = statusDeleted
 	rec.SyncGen = atomic.LoadUint64(&t.header.SyncGen)
 	rec.Rev = atomic.AddUint64(&t.header.GlobalRev, 1)
 	atomic.StoreUint64(&rec.NodeEpoch, 0)
 	atomic.StoreUint64(&rec.EventSeq, 0)
-	clearFixed(rec.SandboxID[:])
+	atomic.StoreUint64(&rec.AuthorityRevision, authorityRevision)
+	// Keep Hash and SandboxID as an ordering tombstone. The slot remains
+	// reusable for another key, but a replayed older change for this key cannot
+	// resurrect it while the tombstone is present.
 	clearFixed(rec.NodeID[:])
 	clearFixed(rec.RegistryGeneration[:])
 	clearFixed(rec.BindingDigest[:])
@@ -468,6 +500,17 @@ func (t *Table) findSlot(sid string, insert bool) (int, bool) {
 			}
 			return idx, true
 		case statusDeleted:
+			if insert && rec.Hash == h {
+				entry, st, ok := readRecord(rec)
+				if !ok {
+					i--
+					runtime.Gosched()
+					continue
+				}
+				if st == statusDeleted && entry.SandboxID == sid {
+					return idx, true
+				}
+			}
 			if insert && firstDeleted < 0 {
 				firstDeleted = idx
 			}
@@ -507,6 +550,7 @@ func readRecord(rec *mmapRecord) (routesync.RouteEntry, uint32, bool) {
 			RegistryGeneration: fixedString(rec.RegistryGeneration[:]),
 			BindingDigest:      fixedString(rec.BindingDigest[:]),
 			EventSeq:           atomic.LoadUint64(&rec.EventSeq),
+			AuthorityRevision:  atomic.LoadUint64(&rec.AuthorityRevision),
 			Profile:            fixedString(rec.Profile[:]),
 			TemplateID:         fixedString(rec.TemplateID[:]),
 			State:              fixedString(rec.State[:]),

@@ -1049,8 +1049,9 @@ func lookupRouteChangefeedOnDisk(
 	defer iterator.Close()
 	exhausted := true
 	scanned := 0
+	builder := newRouteChangefeedPageBuilder(query.Limit)
 	for valid := iterator.First(); valid; valid = iterator.Next() {
-		if scanned == scanLimit || len(result.Changes) == int(query.Limit) {
+		if scanned == scanLimit {
 			exhausted = false
 			break
 		}
@@ -1062,10 +1063,19 @@ func lookupRouteChangefeedOnDisk(
 			return RouteChangefeedResult{}, err
 		}
 		scanned++
-		result.CursorRevision = change.Revision
-		if change.Bucket == query.Bucket && change.Group == query.Group {
-			result.Changes = append(result.Changes, change)
+		if change.Bucket != query.Bucket || change.Group != query.Group {
+			result.CursorRevision = change.Revision
+			continue
 		}
+		added, err := builder.add(change)
+		if err != nil {
+			return RouteChangefeedResult{}, err
+		}
+		if !added {
+			exhausted = false
+			break
+		}
+		result.CursorRevision = change.Revision
 	}
 	if err := iterator.Error(); err != nil {
 		return RouteChangefeedResult{}, err
@@ -1073,6 +1083,7 @@ func lookupRouteChangefeedOnDisk(
 	if exhausted {
 		result.CursorRevision = state.LastApplied
 	}
+	result.Changes = builder.changes
 	return result, nil
 }
 
@@ -1373,7 +1384,7 @@ func (m *diskStateMachine) RecoverFromSnapshot(reader io.Reader, done <-chan str
 		if err := batch.Set(fullKey, value, nil); err != nil {
 			return err
 		}
-		if batch.Len() >= stateRecoveryBatch {
+		if len(batch.Repr()) >= stateRecoveryBatch {
 			if err := m.engine.commitSync(batch); err != nil {
 				return err
 			}

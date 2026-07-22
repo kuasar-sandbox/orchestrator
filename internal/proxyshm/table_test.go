@@ -101,6 +101,24 @@ func TestIncrementalBookmarkPreservesUnchangedRoutes(t *testing.T) {
 	}
 }
 
+func TestBeginSyncFailsClosedUntilBookmark(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "routes.shm")
+	tbl, err := Create(path, 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tbl.Close()
+	tbl.BeginSync()
+	tbl.Bookmark(true)
+	if !tbl.Synced() {
+		t.Fatal("bookmark did not make the table serviceable")
+	}
+	tbl.BeginSync()
+	if tbl.Synced() {
+		t.Fatal("partial resynchronization remained serviceable")
+	}
+}
+
 func TestFullSyncDoesNotRegressCurrentExecutionEvent(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "routes.shm")
 	tbl, err := Create(path, 16)
@@ -179,7 +197,6 @@ func TestManagedUpsertRequiresCompleteExecutionFence(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer tbl.Close()
-
 	for name, route := range map[string]routesync.RouteEntry{
 		"partial identity": {
 			SandboxID: "s1", NodeID: "n1", State: routesync.StateRunning,
@@ -194,6 +211,67 @@ func TestManagedUpsertRequiresCompleteExecutionFence(t *testing.T) {
 				t.Fatal("incomplete managed route was accepted")
 			}
 		})
+	}
+}
+
+func TestAuthorityRevisionRejectsReplayedOlderExecution(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "routes.shm")
+	tbl, err := Create(path, 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tbl.Close()
+
+	old := routesync.RouteEntry{
+		SandboxID: "s1", AuthorityRevision: 1, NodeID: "n1", NodeEpoch: 7,
+		RegistryGeneration: "g1", BindingDigest: "old", EventSeq: 5,
+		Profile: "e2b", State: routesync.StateRunning, AccessToken: "old-token",
+	}
+	current := old
+	current.AuthorityRevision = 2
+	current.NodeID = "n2"
+	current.BindingDigest = "current"
+	current.EventSeq = 1
+	current.AccessToken = "current-token"
+	if err := tbl.Upsert(old); err != nil {
+		t.Fatal(err)
+	}
+	if err := tbl.Upsert(current); err != nil {
+		t.Fatal(err)
+	}
+	if err := tbl.Upsert(old); err != nil {
+		t.Fatal(err)
+	}
+	got, ok := tbl.Lookup("s1")
+	if !ok || got.AuthorityRevision != 2 || got.BindingDigest != "current" || got.AccessToken != "current-token" {
+		t.Fatalf("older execution replaced current route: %+v ok=%v", got, ok)
+	}
+
+	if !tbl.DeleteRoute(routesync.RouteDelete{
+		SandboxID: "s1", AuthorityRevision: 3, NodeID: "n2", NodeEpoch: 7,
+		RegistryGeneration: "g1", BindingDigest: "current", EventSeq: 2,
+	}) {
+		t.Fatal("current execution delete was not applied")
+	}
+	if err := tbl.Upsert(current); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := tbl.Lookup("s1"); ok {
+		t.Fatal("replayed pre-delete upsert resurrected the route")
+	}
+
+	// Full snapshots deliberately carry revision zero and replace ordering state
+	// from a previous authority fingerprint.
+	tbl.BeginSync()
+	replacement := current
+	replacement.AuthorityRevision = 0
+	replacement.BindingDigest = "replacement"
+	if err := tbl.Upsert(replacement); err != nil {
+		t.Fatal(err)
+	}
+	tbl.Bookmark(true)
+	if got, ok := tbl.Lookup("s1"); !ok || got.BindingDigest != "replacement" {
+		t.Fatalf("full snapshot did not replace old authority state: %+v ok=%v", got, ok)
 	}
 }
 

@@ -69,6 +69,7 @@ func cloneBuildRecord(source clusterstate.BuildRecord) clusterstate.BuildRecord 
 	}
 	if source.Projection != nil {
 		projection := *source.Projection
+		projection.Intent = cloneDispatchIntent(source.Projection.Intent)
 		clone.Projection = &projection
 	}
 	if source.Tombstone != nil {

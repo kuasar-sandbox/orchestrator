@@ -157,6 +157,33 @@ func TestPlacementFailuresDoNotInventExecutionProof(t *testing.T) {
 	}
 }
 
+func TestPlacementFailureReasonIsBoundedUTF8(t *testing.T) {
+	route := RoutePlacementFailureState{
+		SandboxID: "s1", PlacementRound: 1,
+		CandidatePool:        []PlacementCandidate{{NodeID: "n1"}},
+		DefinitivelyRejected: []uint32{0}, Intent: workflowSandboxIntent(t), Reason: "exhausted",
+	}
+	build := BuildPlacementFailureState{
+		BuildID: "b1", CandidatePool: []PlacementCandidate{{NodeID: "n1"}},
+		DefinitivelyRejected: []uint32{0}, Intent: workflowBuildIntent(t), Reason: "exhausted",
+	}
+	for name, reason := range map[string]string{
+		"oversized":     strings.Repeat("x", MaxPlacementFailureReasonBytes+1),
+		"invalid UTF-8": string([]byte{0xff}),
+	} {
+		t.Run(name, func(t *testing.T) {
+			route.Reason = reason
+			if err := route.Validate(); err == nil {
+				t.Fatal("Route placement failure accepted an invalid reason")
+			}
+			build.Reason = reason
+			if err := build.Validate(); err == nil {
+				t.Fatal("Build placement failure accepted an invalid reason")
+			}
+		})
+	}
+}
+
 func TestPlacementFailureFenceProofIsBoundToRouteIdentity(t *testing.T) {
 	failure := RoutePlacementFailureState{
 		SandboxID: "s1", PlacementRound: 2,
@@ -470,6 +497,41 @@ func TestReadyRouteRequiresDataPlaneCapability(t *testing.T) {
 	route.AccessToken = ""
 	if err := route.Validate(); err == nil {
 		t.Fatal("READY route without an access token was accepted")
+	}
+}
+
+func TestReadyRouteRejectsInvalidConnectHeaderValues(t *testing.T) {
+	for name, mutate := range map[string]func(*ReadyRoute){
+		"sandbox ID":          func(route *ReadyRoute) { route.SandboxID = "bad\r\nid" },
+		"node ID":             func(route *ReadyRoute) { route.NodeID = "bad\nnode" },
+		"Registry generation": func(route *ReadyRoute) { route.RegistryGeneration = " bad" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			route := readyRoute()
+			mutate(route)
+			if err := route.Validate(); err == nil {
+				t.Fatal("READY accepted a value that cannot be written as a CONNECT header")
+			}
+		})
+	}
+
+	route := readyRoute()
+	spec, err := ParseSandboxDispatchSpec(route.Intent.DispatchSpec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec.AccessToken = "bad\r\ntoken"
+	encoded, err := MarshalSandboxDispatchSpec(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	route.Intent, err = NewDispatchIntent(route.Intent.NormalizedDemand, encoded, route.Intent.ProviderPolicyVersion)
+	if err != nil {
+		t.Fatal(err)
+	}
+	route.AccessToken = spec.AccessToken
+	if err := route.Validate(); err == nil {
+		t.Fatal("READY accepted an access token that cannot be written as a CONNECT header")
 	}
 }
 

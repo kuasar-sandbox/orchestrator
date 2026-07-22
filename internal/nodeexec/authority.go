@@ -18,6 +18,9 @@ type BuildCapacitySource func(context.Context) (BuildCapacity, string, error)
 
 type SandboxDemandSource func(context.Context, DispatchRecord) (nodectl.SandboxAdmissionDemand, error)
 
+// SandboxObjectSource resolves the exact group/AuthKey/ManifestKey lease named
+// by the immutable dispatch and copies that key material into a persistable
+// node-local object before resource Admission can be accepted.
 type SandboxObjectSource func(context.Context, DispatchRecord) (*types.Sandbox, error)
 
 type BuildObjectSource func(context.Context, DispatchRecord) (*types.Build, error)

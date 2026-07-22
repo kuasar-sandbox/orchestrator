@@ -233,6 +233,54 @@ func newAuthorityWithIdentityAndCapacity(
 	return authority
 }
 
+func TestAuthorityRejectsMissingExactKeyLeaseBeforeSandboxAdmission(t *testing.T) {
+	st := authorityStore(t)
+	command := authorityCommand(t, clusterstate.ExecutionKindSandbox, "sandbox-missing-key-lease")
+	sandbox := &sandboxAdmissionFake{
+		prepared: map[string]nodectl.PreparedAdmissionResult{
+			command.ObjectID: {
+				SandboxID: command.ObjectID, DemandDigest: command.Intent.DemandDigest,
+				State: nodectl.PreparedAdmitted, ReservationToken: "must-not-be-reserved",
+			},
+		},
+		wake: make(chan struct{}),
+	}
+	missingLease := errors.New("exact node key lease is absent or expired")
+	demandCalled := false
+	authority, err := nodeexec.NewAuthority(
+		st, sandbox,
+		func(context.Context) (nodeexec.LocalSessionIdentity, error) {
+			return nodeexec.LocalSessionIdentity{
+				NodeID: "node-1", NodeEpoch: 7, SessionSeq: 11, DataEndpoint: "10.0.0.1:8443",
+			}, nil
+		},
+		func(context.Context) (nodeexec.BuildCapacity, string, error) {
+			return nodeexec.BuildCapacity{Slots: 1, QueueLimit: 1}, "", nil
+		},
+		func(context.Context, nodeexec.DispatchRecord) (*types.Build, error) { return nil, nil },
+		func(context.Context, nodeexec.DispatchRecord) (*types.Sandbox, error) { return nil, missingLease },
+		func(context.Context, nodeexec.DispatchRecord) (nodectl.SandboxAdmissionDemand, error) {
+			demandCalled = true
+			return nodectl.SandboxAdmissionDemand{}, nil
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := authority.AdmitAndDispatch(context.Background(), command); !errors.Is(err, missingLease) {
+		t.Fatalf("dispatch error = %v", err)
+	}
+	if sandbox.prepares != 0 || demandCalled {
+		t.Fatalf("missing lease reached Admission: prepares=%d demand_called=%v", sandbox.prepares, demandCalled)
+	}
+	if record, err := st.GetNodeWorkflow(context.Background(), clusterstate.ExecutionKindSandbox, command.ObjectID); err != nil || record != nil {
+		t.Fatalf("missing lease left workflow = %+v, %v", record, err)
+	}
+	if object, err := st.Get(context.Background(), command.ObjectID); err != nil || object != nil {
+		t.Fatalf("missing lease left Sandbox object = %+v, %v", object, err)
+	}
+}
+
 type recordBarrierJournal struct {
 	*store.Store
 	mu      sync.Mutex
@@ -826,10 +874,7 @@ func TestFinalizeRemovesAdmissionBeforePersistingCompactionMarker(t *testing.T) 
 	}
 	record, err := st.RecordSandboxWorkflow(context.Background(), dispatch, nodeexec.AdmissionDecision{
 		State: nodeexec.AdmissionRejected, Result: clusterstate.DispatchDefinitiveReject, Reason: "rejected",
-	}, &types.Sandbox{
-		ID: dispatch.ObjectID, TemplateID: "bare-img-" + strings.Repeat("5", 64), State: types.StateStarting,
-		AuthKey: strings.Repeat("3", 64), ManifestKey: strings.Repeat("4", 64), CreatedUnix: time.Now().Unix(),
-	})
+	}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

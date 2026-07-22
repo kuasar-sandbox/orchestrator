@@ -152,11 +152,20 @@ func (r *Runtime) ActivateRegistryLayoutTransition(ctx context.Context) (SystemS
 	if err != nil {
 		return SystemState{}, err
 	}
+	if r.registryLayoutActivationFinalized(state) {
+		if err := r.syncLocalRegistryLayout(state); err != nil {
+			return SystemState{}, err
+		}
+		return state, nil
+	}
 	transition, err := r.requireRegistryLayoutTransition(state)
 	if err != nil {
 		return SystemState{}, err
 	}
 	if transition.Activated {
+		if err := r.syncLocalRegistryLayout(state); err != nil {
+			return SystemState{}, err
+		}
 		return state, nil
 	}
 	if !allTransitionsComplete(transition.Shards) {
@@ -167,8 +176,7 @@ func (r *Runtime) ActivateRegistryLayoutTransition(ctx context.Context) (SystemS
 	defer cancelResolve()
 	current, readErr := r.ReadSystemStrong(resolveContext)
 	if readErr == nil {
-		if current.Transition != nil && current.Transition.Activated &&
-			current.ActiveRegistryLayoutDigest == r.registryLayoutDigest {
+		if r.registryLayoutActivationCommitted(current) {
 			if err := r.syncLocalRegistryLayout(current); err != nil {
 				return SystemState{}, err
 			}
@@ -185,6 +193,27 @@ func (r *Runtime) ActivateRegistryLayoutTransition(ctx context.Context) (SystemS
 		return SystemState{}, readErr
 	}
 	return SystemState{}, errors.New("raftstore: registryLayout activation was not visible after commit")
+}
+
+func (r *Runtime) registryLayoutActivationCommitted(state SystemState) bool {
+	if state.ActiveRegistryLayoutVersion != r.registryLayout.RegistryLayoutVersion ||
+		state.ActiveRegistryLayoutDigest != r.registryLayoutDigest {
+		return false
+	}
+	if state.Transition == nil {
+		return r.registryLayoutActivationFinalized(state)
+	}
+	return state.Transition.Activated &&
+		state.Transition.Version == r.registryLayout.RegistryLayoutVersion &&
+		state.Transition.Digest == r.registryLayoutDigest &&
+		state.Transition.PreviousDigest == r.registryLayout.PreviousRegistryLayoutDigest
+}
+
+func (r *Runtime) registryLayoutActivationFinalized(state SystemState) bool {
+	return state.Transition == nil && r.registryLayout.RegistryLayoutVersion > 1 &&
+		r.registryLayout.PreviousRegistryLayoutVersion+1 == r.registryLayout.RegistryLayoutVersion &&
+		state.ActiveRegistryLayoutVersion == r.registryLayout.RegistryLayoutVersion &&
+		state.ActiveRegistryLayoutDigest == r.registryLayoutDigest
 }
 
 // ConfirmRegistryLayoutTransitionPermitDrain starts a fresh monotonic wait from a

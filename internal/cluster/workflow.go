@@ -6,7 +6,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"unicode/utf8"
+
+	"golang.org/x/net/http/httpguts"
 )
 
 const (
@@ -15,6 +18,7 @@ const (
 	MaxProviderPolicyVersionBytes      = 256
 	MaxPlacementCandidates             = 4
 	MaxPlacementCandidateMetadataBytes = 256
+	MaxPlacementFailureReasonBytes     = 1024
 	MaxPresentationMetadataEntries     = 256
 	MaxPresentationMetadataKeyBytes    = 256
 	MaxPresentationMetadataValueBytes  = 16 << 10
@@ -250,6 +254,17 @@ func (r ReadyRoute) Validate() error {
 	}
 	if !validDigest(r.BindingDigest) {
 		return errors.New("cluster: invalid READY Binding digest")
+	}
+	for name, value := range map[string]string{
+		"sandbox ID":                  r.SandboxID,
+		"node ID":                     r.NodeID,
+		"Registry History Generation": r.RegistryGeneration,
+		"access token":                r.AccessToken,
+		"Binding digest":              r.BindingDigest,
+	} {
+		if !utf8.ValidString(value) || !httpguts.ValidHeaderFieldValue(value) || strings.TrimSpace(value) != value {
+			return fmt.Errorf("cluster: READY %s is not a canonical CONNECT header value", name)
+		}
 	}
 	if err := validateSandboxDispatchIntent(r.Intent); err != nil {
 		return fmt.Errorf("cluster: READY dispatch intent: %w", err)
@@ -570,6 +585,9 @@ func (s RoutePlacementFailureState) Validate() error {
 	if s.SandboxID == "" || s.PlacementRound == 0 || len(s.CandidatePool) == 0 || s.Reason == "" {
 		return errors.New("cluster: incomplete placement-failure TOMBSTONE")
 	}
+	if len(s.Reason) > MaxPlacementFailureReasonBytes || !utf8.ValidString(s.Reason) {
+		return fmt.Errorf("cluster: placement failure reason exceeds %d bytes or is not valid UTF-8", MaxPlacementFailureReasonBytes)
+	}
 	if err := validateCandidates(s.CandidatePool, nil, s.DefinitivelyRejected); err != nil {
 		return err
 	}
@@ -764,6 +782,9 @@ type BuildPlacementFailureState struct {
 func (s BuildPlacementFailureState) Validate() error {
 	if s.BuildID == "" || len(s.CandidatePool) == 0 || s.Reason == "" {
 		return errors.New("cluster: incomplete Build placement failure")
+	}
+	if len(s.Reason) > MaxPlacementFailureReasonBytes || !utf8.ValidString(s.Reason) {
+		return fmt.Errorf("cluster: Build placement failure reason exceeds %d bytes or is not valid UTF-8", MaxPlacementFailureReasonBytes)
 	}
 	if err := validateCandidates(s.CandidatePool, nil, s.DefinitivelyRejected); err != nil {
 		return err
