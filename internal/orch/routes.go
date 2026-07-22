@@ -213,7 +213,12 @@ func (o *Orchestrator) publishDelete(sid string) {
 // publish fans an event out to every subscriber. A full subscriber is dropped +
 // closed (it reconnects and re-snapshots) rather than blocking the caller.
 func (o *Orchestrator) publish(ev routesync.Event) {
-	ev = o.appendRouteLog(ev)
+	// Keep changelog assignment and fanout in one ordered critical section. The
+	// subscriber may use the revision as a table-wide replay fence, so concurrent
+	// publishers must never deliver revision N+1 before revision N.
+	o.routeLogMu.Lock()
+	defer o.routeLogMu.Unlock()
+	ev = o.appendRouteLogLocked(ev)
 	o.subsMu.Lock()
 	defer o.subsMu.Unlock()
 	for id, ch := range o.subs {
@@ -227,9 +232,7 @@ func (o *Orchestrator) publish(ev routesync.Event) {
 	}
 }
 
-func (o *Orchestrator) appendRouteLog(ev routesync.Event) routesync.Event {
-	o.routeLogMu.Lock()
-	defer o.routeLogMu.Unlock()
+func (o *Orchestrator) appendRouteLogLocked(ev routesync.Event) routesync.Event {
 	o.routeSeq++
 	revision := uint64(o.routeSeq)
 	switch ev.Kind {
