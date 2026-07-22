@@ -37,7 +37,8 @@ func (recordOnlyKeyLeaseProvider) GetAuthKey(context.Context, string) (clusterst
 
 func (p keyLeaseProvider) GetRecord(context.Context, string) (clusterstate.SandboxGroupRecord, bool, error) {
 	return clusterstate.SandboxGroupRecord{
-		Group: p.group.Group, AuthKey: p.auth, ManifestKey: p.manifest,
+		Group: p.group.Group, KeyRevision: 1,
+		AuthKey: p.auth, ManifestKey: p.manifest,
 		RegistryAuth: p.group.RegistryAuth, Config: p.group.Config, ImageRepo: p.group.ImageRepo,
 		TemplateRef: p.group.TemplateRef, AllowTemplateOverride: p.group.AllowTemplateOverride,
 		TargetPort: p.group.TargetPort, Metadata: p.group.Metadata,
@@ -84,6 +85,7 @@ func TestResolveNodeKeyLeaseBuildsCompleteSeparateBundle(t *testing.T) {
 func TestResolveNodeKeyLeaseUsesOneGroupRecordSnapshot(t *testing.T) {
 	provider := recordOnlyKeyLeaseProvider{record: clusterstate.SandboxGroupRecord{
 		Group:       "/group",
+		KeyRevision: 1,
 		AuthKey:     clusterstate.Secret{Type: clusterstate.SecretInline, Value: strings.Repeat("a", 64)},
 		ManifestKey: clusterstate.Secret{Type: clusterstate.SecretInline, Value: strings.Repeat("b", 64)},
 	}}
@@ -123,5 +125,12 @@ func TestResolveNodeKeyLeaseRejectsMissingOrSharedDomains(t *testing.T) {
 	provider.manifest = clusterstate.Secret{}
 	if _, err := ResolveNodeKeyLease(context.Background(), provider, "/group", 1234); err == nil {
 		t.Fatal("missing ManifestKey accepted")
+	}
+	provider.manifest = clusterstate.Secret{Value: strings.Repeat("b", 64)}
+	recordProvider := recordOnlyKeyLeaseProvider{record: clusterstate.SandboxGroupRecord{
+		Group: "/group", AuthKey: provider.auth, ManifestKey: provider.manifest,
+	}}
+	if _, err := ResolveNodeKeyLease(context.Background(), recordProvider, "/group", 1234); err == nil {
+		t.Fatal("key lease without a Provider key revision accepted")
 	}
 }

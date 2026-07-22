@@ -418,6 +418,7 @@ func (n *FinalClusterNode) HandleCommand(ctx context.Context, wire *routesync.Co
 		}
 		if _, err := n.store.DropKeyLeaseRef(
 			ctx, ref.Group, ref.AuthKeyFingerprint, ref.ManifestKeyFingerprint,
+			ref.KeyRevision, ref.RegistryAuthDigest,
 		); err != nil {
 			return finalReject(wire, routesync.DispatchConflict, err)
 		}

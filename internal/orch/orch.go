@@ -125,17 +125,14 @@ func (o *Orchestrator) Create(ctx context.Context, req api.CreateReq) (*types.Sa
 	if lease.AuthKey == "" {
 		return nil, api.ErrNotAllowed
 	}
-	tmpl, err := types.ParseTemplateID(req.TemplateID)
+	templateBuild := o.templateBuild(ctx, req.APIKey, req.TemplateID)
+	resolvedTemplateID := req.TemplateID
+	if templateBuild != nil {
+		resolvedTemplateID = templateBuild.PersistID
+	}
+	tmpl, err := types.ParseTemplateID(resolvedTemplateID)
 	if err != nil {
-		// Not a <profile>-<kind>-<key> id — resolve the transient register id the SDK
-		// reports (BuildInfo.template_id), or a build name/alias, to its persist id.
-		persist := o.resolveTemplateAlias(ctx, req.APIKey, req.TemplateID)
-		if persist == "" {
-			return nil, err
-		}
-		if tmpl, err = types.ParseTemplateID(persist); err != nil {
-			return nil, err
-		}
+		return nil, err
 	}
 	id, err := uuid.NewV7()
 	if err != nil {
@@ -149,10 +146,14 @@ func (o *Orchestrator) Create(ctx context.Context, req api.CreateReq) (*types.Sa
 	// own config — create wins per namespace. Best-effort: a self-describing or
 	// foreign template may have no local build record (then it's just the create's).
 	meta := req.Metadata
-	if tb := o.templateBuild(ctx, req.APIKey, req.TemplateID); tb != nil && len(tb.Metadata) > 0 {
-		meta = sandboxcfg.MergeMetadata(tb.Metadata, req.Metadata)
+	if templateBuild != nil && len(templateBuild.Metadata) > 0 {
+		meta = sandboxcfg.MergeMetadata(templateBuild.Metadata, req.Metadata)
 	}
 	meta = clusterstate.WithoutSystemMetadata(meta)
+	manifestKey, err := templateManifestKey(lease.ManifestKey, templateBuild)
+	if err != nil {
+		return nil, err
+	}
 
 	sb := &types.Sandbox{
 		ID:                 sid,
@@ -161,7 +162,7 @@ func (o *Orchestrator) Create(ctx context.Context, req api.CreateReq) (*types.Sa
 		RunDir:             o.cfg.Paths.RunRoot + "/" + sid,
 		BaseDir:            o.cfg.Paths.BaseRoot + "/" + sid,
 		AuthKey:            lease.AuthKey,
-		ManifestKey:        lease.ManifestKey,
+		ManifestKey:        manifestKey,
 		EnvdAccessToken:    envdTok,
 		TrafficAccessToken: trafTok,
 		Metadata:           meta,
@@ -179,6 +180,16 @@ func (o *Orchestrator) Create(ctx context.Context, req api.CreateReq) (*types.Sa
 	}
 	o.publishUpsert(sb) // tell external proxies about the new route
 	return sb, nil
+}
+
+func templateManifestKey(current string, build *types.Build) (string, error) {
+	if build == nil {
+		return current, nil
+	}
+	if build.ManifestKey == "" {
+		return "", errors.New("orch: ready template build has no ManifestKey")
+	}
+	return build.ManifestKey, nil
 }
 
 // launch prepares dirs + network, writes the sandbox config file, starts the unit

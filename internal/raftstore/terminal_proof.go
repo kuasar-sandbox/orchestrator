@@ -144,7 +144,7 @@ func (r TerminalProofRequest) Validate() error {
 	if tombstoneForValidation.FailureRevision == (clusterstate.Revision{}) {
 		tombstoneForValidation.FailureRevision = r.CurrentRoute.Revision
 	}
-	if err := tombstoneForValidation.Validate(); err != nil {
+	if err := tombstoneForValidation.Validate(r.CurrentRoute.Group, r.CurrentRoute.RouteKey); err != nil {
 		return err
 	}
 	if r.Tombstone.PlacementFailure != nil || r.Tombstone.FenceCompacted ||

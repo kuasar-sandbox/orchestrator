@@ -294,29 +294,41 @@ func TestRouteBucketSnapshotAndChangefeedUseShardRevisions(t *testing.T) {
 		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{Absent: true}, Route: &other,
 	})
 
-	list := lookupRouteBucket(state, RouteBucketLookup{
+	list, err := lookupRouteBucket(state, RouteBucketLookup{
 		Identity: identity, Group: group, Bucket: bucket, Limit: 10,
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !list.Available || list.SnapshotRevision != 7 || len(list.Routes) != 2 ||
 		list.Routes[0].RouteKey != firstKey || list.Routes[1].RouteKey != secondKey ||
 		list.Routes[1].State != clusterstate.WorkflowRoutePaused {
 		t.Fatalf("Route bucket snapshot = %+v", list)
 	}
-	paused := lookupRouteBucket(state, RouteBucketLookup{
+	paused, err := lookupRouteBucket(state, RouteBucketLookup{
 		Identity: identity, Group: group, Bucket: bucket, State: clusterstate.WorkflowRoutePaused, Limit: 10,
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(paused.Routes) != 1 || paused.Routes[0].RouteKey != secondKey {
 		t.Fatalf("paused Route bucket snapshot = %+v", paused)
 	}
-	page := lookupRouteBucket(state, RouteBucketLookup{
+	page, err := lookupRouteBucket(state, RouteBucketLookup{
 		Identity: identity, Group: group, Bucket: bucket, Limit: 1,
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(page.Routes) != 1 || page.NextRouteKey != firstKey {
 		t.Fatalf("first Route bucket page = %+v", page)
 	}
-	page = lookupRouteBucket(state, RouteBucketLookup{
+	page, err = lookupRouteBucket(state, RouteBucketLookup{
 		Identity: identity, Group: group, Bucket: bucket, AfterRouteKey: page.NextRouteKey, Limit: 1,
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(page.Routes) != 1 || page.Routes[0].RouteKey != secondKey || page.NextRouteKey != "" {
 		t.Fatalf("second Route bucket page = %+v", page)
 	}
@@ -374,6 +386,40 @@ func TestRouteBucketSnapshotAndChangefeedUseShardRevisions(t *testing.T) {
 	}
 	if !reset.Available || !reset.Reset || reset.FloorRevision != 10 || len(reset.Changes) != 0 {
 		t.Fatalf("compacted Route changefeed = %+v", reset)
+	}
+}
+
+func TestRouteBucketPageEnforcesSerializedByteLimit(t *testing.T) {
+	largeField := strings.Repeat("x", MaxRouteBucketResponseBytes/2)
+	result := RouteBucketResult{
+		Available: true, Group: "/g", Bucket: 1, SnapshotRevision: 10,
+		Routes: []RouteBucketEntry{
+			{RouteKey: "route-b", State: clusterstate.WorkflowRouteReady, NodeID: largeField, TemplateRef: "template-b"},
+			{RouteKey: "route-a", State: clusterstate.WorkflowRouteReady, NodeID: largeField, TemplateRef: "template-a"},
+		},
+	}
+	page, err := finishRouteBucketPage(result, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Routes) != 1 || page.Routes[0].RouteKey != "route-a" || page.NextRouteKey != "route-a" {
+		t.Fatalf("byte-bounded Route page = routes=%d first=%q next=%q",
+			len(page.Routes), page.Routes[0].RouteKey, page.NextRouteKey)
+	}
+	encoded, err := json.Marshal(DataLookupResult{RouteBucket: &page})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(encoded) > MaxRouteBucketResponseBytes {
+		t.Fatalf("Route page encoded to %d bytes", len(encoded))
+	}
+
+	result.Routes = []RouteBucketEntry{{
+		RouteKey: "route-oversized", State: clusterstate.WorkflowRouteReady,
+		NodeID: strings.Repeat("x", MaxRouteBucketResponseBytes),
+	}}
+	if _, err := finishRouteBucketPage(result, 10); err == nil {
+		t.Fatal("one oversized Route bucket row was accepted")
 	}
 }
 

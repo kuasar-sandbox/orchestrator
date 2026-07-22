@@ -280,7 +280,7 @@ func (t *Table) Upsert(in routesync.RouteEntry) error {
 	if err := validateRoute(in); err != nil {
 		return err
 	}
-	idx, ok := t.findSlot(in.SandboxID, true)
+	idx, ok := t.findSlot(in.SandboxID, true, in.AuthorityRevision)
 	if !ok {
 		return errors.New("proxyshm: route table full")
 	}
@@ -335,7 +335,7 @@ func (t *Table) Delete(sid string) bool {
 	if t.readonly || sid == "" {
 		return false
 	}
-	idx, ok := t.findSlot(sid, false)
+	idx, ok := t.findSlot(sid, false, 0)
 	if !ok {
 		return false
 	}
@@ -350,7 +350,7 @@ func (t *Table) DeleteRoute(delete routesync.RouteDelete) bool {
 	if t.readonly || delete.Validate() != nil {
 		return false
 	}
-	idx, ok := t.findSlot(delete.SandboxID, false)
+	idx, ok := t.findSlot(delete.SandboxID, false, 0)
 	if !ok {
 		return false
 	}
@@ -394,9 +394,9 @@ func (t *Table) deleteRecord(rec *mmapRecord, authorityRevision uint64) {
 	atomic.StoreUint64(&rec.NodeEpoch, 0)
 	atomic.StoreUint64(&rec.EventSeq, 0)
 	atomic.StoreUint64(&rec.AuthorityRevision, authorityRevision)
-	// Keep Hash and SandboxID as an ordering tombstone. The slot remains
-	// reusable for another key, but a replayed older change for this key cannot
-	// resurrect it while the tombstone is present.
+	// Keep Hash and SandboxID as an ordering tombstone. Another key may reuse the
+	// slot only after the stream has crossed this authority revision, so buffered
+	// replay duplicates cannot resurrect the deleted route.
 	clearFixed(rec.NodeID[:])
 	clearFixed(rec.RegistryGeneration[:])
 	clearFixed(rec.BindingDigest[:])
@@ -482,7 +482,7 @@ func (t *Table) MmdsSecret(sid string) ([]byte, bool) {
 	return b, true
 }
 
-func (t *Table) findSlot(sid string, insert bool) (int, bool) {
+func (t *Table) findSlot(sid string, insert bool, incomingAuthorityRevision uint64) (int, bool) {
 	h := hashSID(sid)
 	start := int(h % uint64(len(t.records)))
 	firstDeleted := -1
@@ -500,19 +500,23 @@ func (t *Table) findSlot(sid string, insert bool) (int, bool) {
 			}
 			return idx, true
 		case statusDeleted:
-			if insert && rec.Hash == h {
+			if insert {
 				entry, st, ok := readRecord(rec)
 				if !ok {
 					i--
 					runtime.Gosched()
 					continue
 				}
-				if st == statusDeleted && entry.SandboxID == sid {
+				if st != statusDeleted {
+					i--
+					continue
+				}
+				if rec.Hash == h && entry.SandboxID == sid {
 					return idx, true
 				}
-			}
-			if insert && firstDeleted < 0 {
-				firstDeleted = idx
+				if firstDeleted < 0 && t.canReuseTombstone(entry.AuthorityRevision, incomingAuthorityRevision) {
+					firstDeleted = idx
+				}
 			}
 		case statusPresent:
 			if rec.Hash != h {
@@ -533,6 +537,16 @@ func (t *Table) findSlot(sid string, insert bool) (int, bool) {
 		return firstDeleted, true
 	}
 	return 0, false
+}
+
+func (t *Table) canReuseTombstone(tombstoneRevision, incomingRevision uint64) bool {
+	// Revision zero is full-snapshot/unmanaged state and does not fence the
+	// current authority stream. During replay (Synced=false), revisioned
+	// tombstones remain pinned. Once the bookmark has been crossed, the ordered
+	// stream's next higher revision proves all possible duplicates through the
+	// tombstone revision have already arrived.
+	return tombstoneRevision == 0 || incomingRevision == 0 ||
+		(t.Synced() && incomingRevision > tombstoneRevision)
 }
 
 func readRecord(rec *mmapRecord) (routesync.RouteEntry, uint32, bool) {

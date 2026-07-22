@@ -22,7 +22,7 @@ func TestClusterKeyLeaseDurableExactAckAndDrop(t *testing.T) {
 	authFP, _ := store.AuthKeyHash(authKey)
 	manifestFP, _ := store.ManifestKeyHash(manifestKey)
 	lease := routesync.NodeKeyLeaseV1{
-		Version: routesync.NodeKeyLeaseVersionV1, Group: "/g",
+		Version: routesync.NodeKeyLeaseVersionV1, Group: "/g", KeyRevision: 1,
 		AuthKey:     routesync.NodeKeyMaterialV1{Type: routesync.KeyMaterialInline, Value: authKey, Fingerprint: authFP},
 		ManifestKey: routesync.NodeKeyMaterialV1{Type: routesync.KeyMaterialInline, Value: manifestKey, Fingerprint: manifestFP},
 		ExpiresUnix: time.Now().Add(time.Hour).Unix(),
@@ -61,7 +61,7 @@ func TestClusterKeyLeaseRejectsExpiredInput(t *testing.T) {
 	authFP, _ := store.AuthKeyHash(authKey)
 	manifestFP, _ := store.ManifestKeyHash(manifestKey)
 	lease := routesync.NodeKeyLeaseV1{
-		Version: routesync.NodeKeyLeaseVersionV1, Group: "/g",
+		Version: routesync.NodeKeyLeaseVersionV1, Group: "/g", KeyRevision: 1,
 		AuthKey:     routesync.NodeKeyMaterialV1{Type: routesync.KeyMaterialInline, Value: authKey, Fingerprint: authFP},
 		ManifestKey: routesync.NodeKeyMaterialV1{Type: routesync.KeyMaterialInline, Value: manifestKey, Fingerprint: manifestFP},
 		ExpiresUnix: time.Now().Unix() - 1,
@@ -83,7 +83,7 @@ func TestClusterKeyLeaseRejectsMalformedRegistryAuth(t *testing.T) {
 	authFP, _ := store.AuthKeyHash(authKey)
 	manifestFP, _ := store.ManifestKeyHash(manifestKey)
 	lease := routesync.NodeKeyLeaseV1{
-		Version: routesync.NodeKeyLeaseVersionV1, Group: "/g",
+		Version: routesync.NodeKeyLeaseVersionV1, Group: "/g", KeyRevision: 1,
 		AuthKey:     routesync.NodeKeyMaterialV1{Type: routesync.KeyMaterialInline, Value: authKey, Fingerprint: authFP},
 		ManifestKey: routesync.NodeKeyMaterialV1{Type: routesync.KeyMaterialInline, Value: manifestKey, Fingerprint: manifestFP},
 		RegistryAuth: routesync.NodeRegistryAuthV1{
@@ -99,6 +99,61 @@ func TestClusterKeyLeaseRejectsMalformedRegistryAuth(t *testing.T) {
 	}
 	if _, found, err := o.st.KeyLeaseByFingerprints(context.Background(), "/g", authFP, manifestFP); err != nil || found {
 		t.Fatalf("malformed registry auth lease found=%t err=%v", found, err)
+	}
+}
+
+func TestClusterKeyLeaseRejectsStaleRegistryAuthAfterCurrentAck(t *testing.T) {
+	o := testOrch(t)
+	node := keyLeaseTestNode(o)
+	ctx := context.Background()
+	authKey := strings.Repeat("a", 64)
+	manifestKey := strings.Repeat("b", 64)
+	authFP, _ := store.AuthKeyHash(authKey)
+	manifestFP, _ := store.ManifestKeyHash(manifestKey)
+	old := routesync.NodeKeyLeaseV1{
+		Version: routesync.NodeKeyLeaseVersionV1, Group: "/g", KeyRevision: 1,
+		AuthKey:     routesync.NodeKeyMaterialV1{Type: routesync.KeyMaterialInline, Value: authKey, Fingerprint: authFP},
+		ManifestKey: routesync.NodeKeyMaterialV1{Type: routesync.KeyMaterialInline, Value: manifestKey, Fingerprint: manifestFP},
+		RegistryAuth: routesync.NodeRegistryAuthV1{
+			Type: routesync.KeyMaterialInline, Value: `{"auths":{"*":{"token":"old"}}}`,
+		},
+		ExpiresUnix: time.Now().Add(2 * time.Hour).Unix(),
+	}
+	current := old
+	current.KeyRevision = 2
+	current.RegistryAuth.Value = `{"auths":{"*":{"token":"current"}}}`
+	current.ExpiresUnix = time.Now().Add(time.Hour).Unix()
+	currentAck := node.HandleCommand(ctx, &routesync.Command{
+		CmdID: "current", Kind: routesync.CmdKeyPut, NodeEpoch: 7, SessionSeq: 1,
+		AuthKeyFingerprint: authFP, ManifestKeyFingerprint: manifestFP, KeyLease: &current,
+	})
+	if currentAck.Status != routesync.AckAccepted || currentAck.KeyLeaseRef == nil {
+		t.Fatalf("current key_put ack = %+v", currentAck)
+	}
+	if staleAck := node.HandleCommand(ctx, &routesync.Command{
+		CmdID: "stale", Kind: routesync.CmdKeyPut, NodeEpoch: 7, SessionSeq: 1,
+		AuthKeyFingerprint: authFP, ManifestKeyFingerprint: manifestFP, KeyLease: &old,
+	}); staleAck.Status != routesync.AckRejected {
+		t.Fatalf("stale key_put ack = %+v", staleAck)
+	}
+
+	stored, found, err := o.st.KeyLeaseByFingerprints(ctx, "/g", authFP, manifestFP)
+	if err != nil || !found || stored.KeyRevision != current.KeyRevision || stored.RegistryAuth != current.RegistryAuth.Value {
+		t.Fatalf("stored current lease = %+v, found=%t err=%v", stored, found, err)
+	}
+	oldRef, err := old.Ref()
+	if err != nil {
+		t.Fatal(err)
+	}
+	staleDrop := node.HandleCommand(ctx, &routesync.Command{
+		CmdID: "stale-drop", Kind: routesync.CmdKeyDrop, NodeEpoch: 7, SessionSeq: 1,
+		AuthKeyFingerprint: authFP, ManifestKeyFingerprint: manifestFP, KeyLeaseRef: &oldRef,
+	})
+	if staleDrop.Status != routesync.AckAccepted {
+		t.Fatalf("stale key_drop ack = %+v", staleDrop)
+	}
+	if _, found, err := o.st.KeyLeaseByFingerprints(ctx, "/g", authFP, manifestFP); err != nil || !found {
+		t.Fatalf("stale key_drop removed current lease: found=%t err=%v", found, err)
 	}
 }
 

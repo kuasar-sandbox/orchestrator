@@ -23,8 +23,8 @@ func (h *Holder) InstallKeyLease(
 	dataEndpoint string,
 	lease routesync.NodeKeyLeaseV1,
 ) (routesync.NodeKeyLeaseRefV1, bool, error) {
-	ref := keyLeaseRef(lease)
-	if err := lease.Validate(); err != nil {
+	ref, err := lease.Ref()
+	if err != nil {
 		return ref, false, err
 	}
 	if lease.ExpiresUnix <= h.clock().Unix() {
@@ -48,9 +48,14 @@ func (h *Holder) InstallKeyLease(
 		return ref, false, errors.Join(ErrDispatchNotSent, err)
 	}
 	operation.held.leaseMu.RLock()
-	installedExpiry := operation.held.keyLeases[operation.key]
+	installed := operation.held.keyLeases[operation.key]
 	operation.held.leaseMu.RUnlock()
-	if installedExpiry > lease.ExpiresUnix {
+	if installed.Ref.KeyRevision > ref.KeyRevision ||
+		(installed.Ref.KeyRevision == ref.KeyRevision && installed.Ref.RegistryAuthDigest != "" &&
+			installed.Ref.RegistryAuthDigest != ref.RegistryAuthDigest) {
+		return ref, false, errors.Join(ErrDispatchNotSent, ErrKeyLeaseSuperseded)
+	}
+	if installed.Ref == ref && installed.ExpiresUnix > lease.ExpiresUnix {
 		return ref, false, errors.Join(ErrDispatchNotSent, ErrKeyLeaseSuperseded)
 	}
 	command := &routesync.Command{
@@ -77,7 +82,7 @@ func (h *Holder) InstallKeyLease(
 		operation.held.leaseMu.Unlock()
 		return ref, true, ErrKeyLeaseSuperseded
 	}
-	operation.held.keyLeases[operation.key] = lease.ExpiresUnix
+	operation.held.keyLeases[operation.key] = acknowledgedKeyLease{Ref: ref, ExpiresUnix: lease.ExpiresUnix}
 	operation.held.leaseMu.Unlock()
 	return ref, true, nil
 }
@@ -105,6 +110,10 @@ func (h *Holder) DropKeyLease(
 	defer operation.unlock()
 	operation.held.leaseMu.Lock()
 	if operation.held.keyLeaseSeq[operation.key] != operation.sequence {
+		operation.held.leaseMu.Unlock()
+		return false, ErrKeyLeaseSuperseded
+	}
+	if installed, found := operation.held.keyLeases[operation.key]; found && installed.Ref != ref {
 		operation.held.leaseMu.Unlock()
 		return false, ErrKeyLeaseSuperseded
 	}
@@ -149,43 +158,55 @@ func (h *Holder) HasKeyLease(nodeID string, nodeEpoch uint64, ref routesync.Node
 	}
 	held.leaseMu.RLock()
 	h.mu.RUnlock()
-	available := held.keyLeases[keyLeaseRefID(ref)] > h.clock().Unix()
+	installed := held.keyLeases[keyLeaseRefID(ref)]
+	available := installed.Ref == ref && installed.ExpiresUnix > h.clock().Unix()
 	held.leaseMu.RUnlock()
 	return available
 }
 
-func dispatchKeyLeaseRef(command DispatchCommand) (routesync.NodeKeyLeaseRefV1, error) {
-	ref := routesync.NodeKeyLeaseRefV1{Version: routesync.NodeKeyLeaseVersionV1, Group: command.Group}
+func dispatchKeyLeaseID(command DispatchCommand) (string, error) {
+	authFingerprint := ""
+	manifestFingerprint := ""
 	switch command.Kind {
 	case cluster.ExecutionKindSandbox:
 		spec, err := cluster.ParseSandboxDispatchSpec(command.Intent.DispatchSpec)
 		if err != nil {
-			return ref, err
+			return "", err
 		}
-		ref.AuthKeyFingerprint = spec.AuthKeyFingerprint
-		ref.ManifestKeyFingerprint = spec.ManifestKeyFingerprint
+		authFingerprint = spec.AuthKeyFingerprint
+		manifestFingerprint = spec.ManifestKeyFingerprint
 	case cluster.ExecutionKindBuild:
 		spec, err := cluster.ParseBuildDispatchSpec(command.Intent.DispatchSpec)
 		if err != nil {
-			return ref, err
+			return "", err
 		}
-		ref.AuthKeyFingerprint = spec.AuthKeyFingerprint
-		ref.ManifestKeyFingerprint = spec.ManifestKeyFingerprint
+		authFingerprint = spec.AuthKeyFingerprint
+		manifestFingerprint = spec.ManifestKeyFingerprint
 	default:
-		return ref, errors.New("session: unsupported dispatch execution kind")
+		return "", errors.New("session: unsupported dispatch execution kind")
 	}
-	return ref, ref.Validate()
+	return keyLeaseID(command.Group, authFingerprint, manifestFingerprint), nil
 }
 
 func keyLeaseRef(lease routesync.NodeKeyLeaseV1) routesync.NodeKeyLeaseRefV1 {
-	return routesync.NodeKeyLeaseRefV1{
-		Version: routesync.NodeKeyLeaseVersionV1, Group: lease.Group,
-		AuthKeyFingerprint: lease.AuthKey.Fingerprint, ManifestKeyFingerprint: lease.ManifestKey.Fingerprint,
+	ref, err := lease.Ref()
+	if err != nil {
+		return routesync.NodeKeyLeaseRefV1{}
 	}
+	return ref
 }
 
 func keyLeaseRefID(ref routesync.NodeKeyLeaseRefV1) string {
-	return ref.Group + "\x00" + ref.AuthKeyFingerprint + "\x00" + ref.ManifestKeyFingerprint
+	return keyLeaseID(ref.Group, ref.AuthKeyFingerprint, ref.ManifestKeyFingerprint)
+}
+
+func keyLeaseID(group, authFingerprint, manifestFingerprint string) string {
+	return group + "\x00" + authFingerprint + "\x00" + manifestFingerprint
+}
+
+type acknowledgedKeyLease struct {
+	Ref         routesync.NodeKeyLeaseRefV1
+	ExpiresUnix int64
 }
 
 type keyLeaseMutation struct {
@@ -229,15 +250,32 @@ func (h *Holder) beginKeyLeaseMutation(
 	tuple := held.registration.Tuple
 	key := keyLeaseRefID(ref)
 	held.leaseMu.Lock()
+	high := held.keyLeaseHigh[key]
 	if desiredExpiry > 0 {
-		if held.keyLeaseHigh[key] > desiredExpiry {
+		if high.Ref.KeyRevision > ref.KeyRevision {
 			held.leaseMu.Unlock()
 			h.mu.RUnlock()
 			return nil, errors.Join(ErrDispatchNotSent, ErrKeyLeaseSuperseded)
 		}
-		held.keyLeaseHigh[key] = desiredExpiry
+		if high.Ref.KeyRevision == ref.KeyRevision && high.Ref.RegistryAuthDigest != "" &&
+			high.Ref.RegistryAuthDigest != ref.RegistryAuthDigest {
+			held.leaseMu.Unlock()
+			h.mu.RUnlock()
+			return nil, errors.Join(ErrDispatchNotSent, ErrKeyLeaseConflict)
+		}
+		if high.Ref == ref && high.ExpiresUnix > desiredExpiry {
+			held.leaseMu.Unlock()
+			h.mu.RUnlock()
+			return nil, errors.Join(ErrDispatchNotSent, ErrKeyLeaseSuperseded)
+		}
+		held.keyLeaseHigh[key] = acknowledgedKeyLease{Ref: ref, ExpiresUnix: desiredExpiry}
+	} else if high.Ref.KeyRevision > ref.KeyRevision ||
+		(high.Ref.KeyRevision == ref.KeyRevision && high.Ref.RegistryAuthDigest != "" && high.Ref.RegistryAuthDigest != ref.RegistryAuthDigest) {
+		held.leaseMu.Unlock()
+		h.mu.RUnlock()
+		return nil, errors.Join(ErrDispatchNotSent, ErrKeyLeaseSuperseded)
 	} else {
-		delete(held.keyLeaseHigh, key)
+		held.keyLeaseHigh[key] = acknowledgedKeyLease{Ref: ref, ExpiresUnix: high.ExpiresUnix}
 	}
 	held.keyLeaseSeq[key]++
 	sequence := held.keyLeaseSeq[key]

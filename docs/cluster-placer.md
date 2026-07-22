@@ -155,6 +155,9 @@ group_sources:
 `allow_template_override` 策略。Provider 负责 caller/GROUP authentication 与期望 key lease；Registry 不复制
 AuthCatalog 或秘密材料。正常运行没有 Registry execution importer 或 WATCH_LIST 权威路径。
 
+配置 `auth_key`、`manifest_key` 或 `registry_auth` 时必须同时提供非零 `key_revision`。它是完整 key bundle 的
+单调版本；轮换其中任一项都必须递增，节点按该版本和 registry-auth digest 拒绝回退或同版本冲突。
+
 ## 8. Failure behavior
 
 Placer timeout 或不可用发生在 selection commit 前，因此可安全重试。selection 已提交后，Placer 不可用不

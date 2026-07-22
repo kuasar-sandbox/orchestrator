@@ -287,7 +287,15 @@ func readGroupRecord(path string) (clusterstate.SandboxGroupRecord, error) {
 	if rec.Group == "" {
 		return clusterstate.SandboxGroupRecord{}, fmt.Errorf("parse %s: group is required", path)
 	}
+	if rec.KeyRevision == 0 && groupRecordHasKeyMaterial(rec) {
+		return clusterstate.SandboxGroupRecord{}, fmt.Errorf("parse %s: key_revision is required when key material is configured", path)
+	}
 	return rec, nil
+}
+
+func groupRecordHasKeyMaterial(rec clusterstate.SandboxGroupRecord) bool {
+	return rec.AuthKey != (clusterstate.Secret{}) || rec.ManifestKey != (clusterstate.Secret{}) ||
+		rec.RegistryAuth != (clusterstate.Secret{})
 }
 
 func groupRecordActive(rec clusterstate.SandboxGroupRecord) bool {

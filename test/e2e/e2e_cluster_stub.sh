@@ -172,6 +172,7 @@ mkdir -p "$WORK/groups"
 cat >"$WORK/groups/group.json" <<EOF
 {
   "group": "$GROUP",
+  "key_revision": 1,
   "manifest_key": "$MANIFEST_KEY",
   "auth_key": "$AUTH_KEY",
   "template_ref": "e2b-img-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",

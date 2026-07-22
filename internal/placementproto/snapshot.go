@@ -10,6 +10,7 @@ type PlacementLoadSnapshot struct {
 	SampleSeq        uint64 `json:"sample_seq"`
 	LoadModelVersion uint16 `json:"load_model_version"`
 	RuntimeDigest    string `json:"runtime_digest,omitempty"`
+	CatalogDigest    string `json:"catalog_digest,omitempty"`
 
 	Draining  bool   `json:"draining"`
 	WaterZone string `json:"water_zone"`

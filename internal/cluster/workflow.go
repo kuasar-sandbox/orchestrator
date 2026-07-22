@@ -89,6 +89,7 @@ type PlacementCandidate struct {
 	NodeID        string `json:"node_id"`
 	FailureDomain string `json:"failure_domain,omitempty"`
 	RuntimeDigest string `json:"runtime_digest,omitempty"`
+	CatalogDigest string `json:"catalog_digest"`
 }
 
 type DispatchIntent struct {
@@ -549,7 +550,10 @@ type RouteTombstoneState struct {
 	PlacementFailure   *RoutePlacementFailureState `json:"placement_failure,omitempty"`
 }
 
-func (s RouteTombstoneState) Validate() error {
+func (s RouteTombstoneState) Validate(group, routeKey string) error {
+	if group == "" || routeKey == "" {
+		return errors.New("cluster: TOMBSTONE requires group and route key")
+	}
 	if s.PlacementFailure != nil {
 		if s.SandboxID != "" || s.NodeID != "" || s.NodeEpoch != 0 || s.LastEventSeq != 0 ||
 			s.RegistryGeneration != "" || s.BindingDigest != "" || s.TerminalReason != "" ||
@@ -575,14 +579,14 @@ func (s RouteTombstoneState) Validate() error {
 	switch s.Proof.Kind {
 	case ProofNodeTerminal:
 		digest, err := NodeTerminalProofDigest(
-			s.Proof, s.RegistryGeneration, s.SandboxID, s.BindingDigest, s.LastEventSeq,
+			s.Proof, group, routeKey, s.RegistryGeneration, s.SandboxID, s.BindingDigest, s.LastEventSeq,
 		)
 		if err != nil || digest != s.Proof.ProofDigest {
 			return errors.New("cluster: TOMBSTONE node-terminal proof digest mismatch")
 		}
 	case ProofNewerNodeEpoch:
 		digest, err := NewerNodeEpochProofDigest(
-			s.Proof, s.FailureRevision.RegistryGeneration, s.SandboxID, s.BindingDigest, s.LastEventSeq,
+			s.Proof, group, routeKey, s.FailureRevision.RegistryGeneration, s.SandboxID, s.BindingDigest, s.LastEventSeq,
 		)
 		if err != nil || digest != s.Proof.ProofDigest {
 			return errors.New("cluster: TOMBSTONE newer-NodeEpoch proof digest mismatch")
@@ -709,7 +713,7 @@ func (r RouteWorkflowRecord) Validate() error {
 		if r.Tombstone == nil {
 			return errors.New("cluster: missing TOMBSTONE state")
 		}
-		if err := r.Tombstone.Validate(); err != nil {
+		if err := r.Tombstone.Validate(r.Group, r.RouteKey); err != nil {
 			return err
 		}
 		if r.Tombstone.PlacementFailure == nil {
@@ -988,14 +992,14 @@ func (f ExecutionFence) Validate() error {
 	switch f.Proof.Kind {
 	case ProofNodeTerminal:
 		digest, err := NodeTerminalProofDigest(
-			f.Proof, f.RegistryGeneration, f.SandboxID, f.BindingDigest, f.LastEventSeq,
+			f.Proof, f.Group, f.RouteKey, f.RegistryGeneration, f.SandboxID, f.BindingDigest, f.LastEventSeq,
 		)
 		if err != nil || digest != f.Proof.ProofDigest {
 			return errors.New("cluster: execution-fence node-terminal proof digest mismatch")
 		}
 	case ProofNewerNodeEpoch:
 		digest, err := NewerNodeEpochProofDigest(
-			f.Proof, f.RegistryGeneration, f.SandboxID, f.BindingDigest, f.LastEventSeq,
+			f.Proof, f.Group, f.RouteKey, f.RegistryGeneration, f.SandboxID, f.BindingDigest, f.LastEventSeq,
 		)
 		if err != nil || digest != f.Proof.ProofDigest {
 			return errors.New("cluster: execution-fence newer-NodeEpoch proof digest mismatch")
@@ -1006,6 +1010,8 @@ func (f ExecutionFence) Validate() error {
 
 func NodeTerminalProofDigest(
 	proof TerminalProof,
+	group string,
+	routeKey string,
 	registryGeneration string,
 	sandboxID string,
 	bindingDigest string,
@@ -1013,11 +1019,13 @@ func NodeTerminalProofDigest(
 ) (string, error) {
 	if proof.Kind != ProofNodeTerminal || proof.FencedNodeID == "" || proof.FencedNodeEpoch == 0 ||
 		proof.ObservedNodeEpoch != 0 || proof.SystemEpoch != 0 || proof.SystemCommitIndex != 0 ||
-		proof.EnrollmentID != "" || proof.EnrollmentCommitIndex != 0 || registryGeneration == "" ||
+		proof.EnrollmentID != "" || proof.EnrollmentCommitIndex != 0 || group == "" || routeKey == "" || registryGeneration == "" ||
 		sandboxID == "" || !validDigest(bindingDigest) || lastEventSeq == 0 {
 		return "", errors.New("cluster: incomplete node-terminal proof evidence")
 	}
 	value := struct {
+		Group              string `json:"group"`
+		RouteKey           string `json:"route_key"`
 		RegistryGeneration string `json:"registry_generation"`
 		SandboxID          string `json:"sandbox_id"`
 		BindingDigest      string `json:"binding_digest"`
@@ -1025,19 +1033,22 @@ func NodeTerminalProofDigest(
 		FencedNodeID       string `json:"fenced_node_id"`
 		FencedNodeEpoch    uint64 `json:"fenced_node_epoch"`
 	}{
-		RegistryGeneration: registryGeneration, SandboxID: sandboxID, BindingDigest: bindingDigest,
+		Group: group, RouteKey: routeKey, RegistryGeneration: registryGeneration,
+		SandboxID: sandboxID, BindingDigest: bindingDigest,
 		LastEventSeq: lastEventSeq, FencedNodeID: proof.FencedNodeID, FencedNodeEpoch: proof.FencedNodeEpoch,
 	}
 	raw, err := json.Marshal(value)
 	if err != nil {
 		return "", err
 	}
-	digest := sha256.Sum256(append([]byte("kuasar-node-terminal-proof-v1\x00"), raw...))
+	digest := sha256.Sum256(append([]byte("kuasar-node-terminal-proof-v2\x00"), raw...))
 	return hex.EncodeToString(digest[:]), nil
 }
 
 func NewerNodeEpochProofDigest(
 	proof TerminalProof,
+	group string,
+	routeKey string,
 	registryGeneration string,
 	sandboxID string,
 	bindingDigest string,
@@ -1046,11 +1057,14 @@ func NewerNodeEpochProofDigest(
 	if proof.Kind != ProofNewerNodeEpoch || proof.FencedNodeID == "" || proof.FencedNodeEpoch == 0 ||
 		proof.ObservedNodeEpoch <= proof.FencedNodeEpoch || proof.SystemEpoch == 0 || proof.SystemCommitIndex == 0 ||
 		proof.EnrollmentID == "" || proof.EnrollmentCommitIndex == 0 ||
-		proof.EnrollmentCommitIndex > proof.SystemCommitIndex || registryGeneration == "" || sandboxID == "" ||
+		proof.EnrollmentCommitIndex > proof.SystemCommitIndex || group == "" || routeKey == "" ||
+		registryGeneration == "" || sandboxID == "" ||
 		!validDigest(bindingDigest) {
 		return "", errors.New("cluster: incomplete newer-NodeEpoch proof evidence")
 	}
 	value := struct {
+		Group                 string `json:"group"`
+		RouteKey              string `json:"route_key"`
 		RegistryGeneration    string `json:"registry_generation"`
 		SandboxID             string `json:"sandbox_id"`
 		BindingDigest         string `json:"binding_digest"`
@@ -1063,7 +1077,8 @@ func NewerNodeEpochProofDigest(
 		EnrollmentID          string `json:"enrollment_id"`
 		EnrollmentCommitIndex uint64 `json:"enrollment_commit_index"`
 	}{
-		RegistryGeneration: registryGeneration, SandboxID: sandboxID, BindingDigest: bindingDigest,
+		Group: group, RouteKey: routeKey, RegistryGeneration: registryGeneration,
+		SandboxID: sandboxID, BindingDigest: bindingDigest,
 		LastEventSeq: lastEventSeq, FencedNodeID: proof.FencedNodeID,
 		FencedNodeEpoch: proof.FencedNodeEpoch, ObservedNodeEpoch: proof.ObservedNodeEpoch,
 		SystemEpoch: proof.SystemEpoch, SystemCommitIndex: proof.SystemCommitIndex,
@@ -1073,7 +1088,7 @@ func NewerNodeEpochProofDigest(
 	if err != nil {
 		return "", err
 	}
-	digest := sha256.Sum256(append([]byte("kuasar-newer-node-epoch-proof-v1\x00"), raw...))
+	digest := sha256.Sum256(append([]byte("kuasar-newer-node-epoch-proof-v2\x00"), raw...))
 	return hex.EncodeToString(digest[:]), nil
 }
 
@@ -1144,6 +1159,9 @@ func validateCandidates(candidates []PlacementCandidate, selected *uint32, rejec
 	for _, candidate := range candidates {
 		if err := ValidateExecutionBindingNodeID(candidate.NodeID); err != nil {
 			return fmt.Errorf("cluster: invalid placement candidate node ID: %w", err)
+		}
+		if !validDigest(candidate.CatalogDigest) {
+			return errors.New("cluster: placement candidate requires a valid Catalog digest")
 		}
 		for name, value := range map[string]string{
 			"failure domain": candidate.FailureDomain,

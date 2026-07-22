@@ -152,6 +152,7 @@ func randomN(nodes []CatalogNode, n int, source IndexSource) ([]cluster.Placemen
 		node := pool[i]
 		result = append(result, cluster.PlacementCandidate{
 			NodeID: node.NodeID, FailureDomain: node.FailureDomain, RuntimeDigest: node.RuntimeDigest,
+			CatalogDigest: CatalogIdentityDigest(node),
 		})
 	}
 	return result, nil

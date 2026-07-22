@@ -31,6 +31,10 @@ func (o *Orchestrator) putClusterKeyLease(
 	if wire.ExpiresUnix <= time.Now().Unix() {
 		return routesync.NodeKeyLeaseRefV1{}, errors.New("cluster: key lease is already expired")
 	}
+	ref, err := wire.Ref()
+	if err != nil {
+		return routesync.NodeKeyLeaseRefV1{}, err
+	}
 	authKey, err := o.resolveNodeKeyMaterial(ctx, wire.AuthKey)
 	if err != nil {
 		return routesync.NodeKeyLeaseRefV1{}, fmt.Errorf("cluster: resolve AuthKey: %w", err)
@@ -45,16 +49,12 @@ func (o *Orchestrator) putClusterKeyLease(
 	}
 	if _, err := o.st.PutKeyLease(ctx, store.KeyLease{
 		Group: wire.Group, AuthKey: authKey, ManifestKey: manifestKey,
-		RegistryAuth: registryAuth, Label: "cluster", ExpiresUnix: wire.ExpiresUnix,
+		KeyRevision: wire.KeyRevision, RegistryAuth: registryAuth, RegistryAuthDigest: ref.RegistryAuthDigest,
+		Label: "cluster", ExpiresUnix: wire.ExpiresUnix,
 	}); err != nil {
 		return routesync.NodeKeyLeaseRefV1{}, err
 	}
-	ref := routesync.NodeKeyLeaseRefV1{
-		Version: routesync.NodeKeyLeaseVersionV1, Group: wire.Group,
-		AuthKeyFingerprint:     wire.AuthKey.Fingerprint,
-		ManifestKeyFingerprint: wire.ManifestKey.Fingerprint,
-	}
-	return ref, ref.Validate()
+	return ref, nil
 }
 
 func (o *Orchestrator) resolveNodeKeyMaterial(

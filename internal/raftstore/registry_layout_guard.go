@@ -7,24 +7,31 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 )
 
+type ShardReplicaIDHistory struct {
+	ShardID    uint64   `json:"shard_id"`
+	ReplicaIDs []uint64 `json:"replica_ids"`
+}
+
 type AcceptedRegistryLayout struct {
-	ClusterID             string         `json:"cluster_id"`
-	RegistryGeneration    string         `json:"registry_generation"`
-	RegistryLayoutVersion uint64         `json:"registry_layout_version"`
-	RegistryLayoutDigest  string         `json:"registry_layout_digest"`
-	FormatVersion         uint32         `json:"format_version"`
-	SchemaVersion         uint32         `json:"schema_version"`
-	ProtocolVersion       uint32         `json:"protocol_version"`
-	HashVersion           string         `json:"hash_version"`
-	VirtualShardCount     uint32         `json:"virtual_shard_count"`
-	RouteBucketCount      uint32         `json:"route_bucket_count"`
-	BuildBucketCount      uint32         `json:"build_bucket_count"`
-	ReplicationFactor     uint32         `json:"replication_factor"`
-	ServePermitMaxMillis  uint64         `json:"serve_permit_max_millis"`
-	BootstrapTokenDigest  string         `json:"bootstrap_token_digest"`
-	RegistryLayout        RegistryLayout `json:"registry_layout"`
+	ClusterID             string                  `json:"cluster_id"`
+	RegistryGeneration    string                  `json:"registry_generation"`
+	RegistryLayoutVersion uint64                  `json:"registry_layout_version"`
+	RegistryLayoutDigest  string                  `json:"registry_layout_digest"`
+	FormatVersion         uint32                  `json:"format_version"`
+	SchemaVersion         uint32                  `json:"schema_version"`
+	ProtocolVersion       uint32                  `json:"protocol_version"`
+	HashVersion           string                  `json:"hash_version"`
+	VirtualShardCount     uint32                  `json:"virtual_shard_count"`
+	RouteBucketCount      uint32                  `json:"route_bucket_count"`
+	BuildBucketCount      uint32                  `json:"build_bucket_count"`
+	ReplicationFactor     uint32                  `json:"replication_factor"`
+	ServePermitMaxMillis  uint64                  `json:"serve_permit_max_millis"`
+	BootstrapTokenDigest  string                  `json:"bootstrap_token_digest"`
+	ReplicaIDHistory      []ShardReplicaIDHistory `json:"replica_id_history"`
+	RegistryLayout        RegistryLayout          `json:"registry_layout"`
 }
 
 func (a AcceptedRegistryLayout) Validate() error {
@@ -38,6 +45,9 @@ func (a AcceptedRegistryLayout) Validate() error {
 	}
 	if err := a.RegistryLayout.Validate(); err != nil {
 		return errors.New("raftstore: accepted state lacks its exact registryLayout artifact")
+	}
+	if err := validateReplicaIDHistory(a.RegistryLayout, a.ReplicaIDHistory); err != nil {
+		return err
 	}
 	digest, err := a.RegistryLayout.Digest()
 	if err != nil || digest != a.RegistryLayoutDigest || a.RegistryLayout.ClusterID != a.ClusterID ||
@@ -81,6 +91,7 @@ func acceptedRegistryLayout(registryLayout RegistryLayout, digest string) Accept
 		BuildBucketCount: registryLayout.BuildBucketCount, ReplicationFactor: registryLayout.ReplicationFactor,
 		ServePermitMaxMillis: registryLayout.ServePermitMaxMillis,
 		BootstrapTokenDigest: registryLayout.BootstrapTokenDigest,
+		ReplicaIDHistory:     replicaIDHistoryForLayout(registryLayout),
 		RegistryLayout:       cloneRegistryLayout(registryLayout),
 	}
 }
@@ -115,6 +126,9 @@ func (a AcceptedRegistryLayout) Accept(next RegistryLayout, digest string) (Acce
 		if err := validateRetainedReplicaTargets(a.RegistryLayout, next); err != nil {
 			return AcceptedRegistryLayout{}, err
 		}
+		if err := validateReplicaIDHistoryAdvance(a.RegistryLayout, next, a.ReplicaIDHistory); err != nil {
+			return AcceptedRegistryLayout{}, err
+		}
 	} else {
 		if next.Predecessor == nil || next.Predecessor.RegistryGeneration != a.RegistryGeneration ||
 			next.Predecessor.RegistryLayoutDigest != a.RegistryLayoutDigest ||
@@ -122,7 +136,89 @@ func (a AcceptedRegistryLayout) Accept(next RegistryLayout, digest string) (Acce
 			return AcceptedRegistryLayout{}, errors.New("raftstore: Registry History Generation rollover is not linked to the accepted predecessor")
 		}
 	}
-	return acceptedRegistryLayout(next, digest), nil
+	accepted := acceptedRegistryLayout(next, digest)
+	if next.RegistryGeneration == a.RegistryGeneration {
+		accepted.ReplicaIDHistory = extendReplicaIDHistory(a.ReplicaIDHistory, next)
+	}
+	return accepted, nil
+}
+
+func replicaIDHistoryForLayout(registryLayout RegistryLayout) []ShardReplicaIDHistory {
+	history := make([]ShardReplicaIDHistory, 0, len(registryLayout.DataShards)+1)
+	appendShard := func(shardID uint64, replicas []ReplicaPlacement) {
+		ids := make([]uint64, len(replicas))
+		for index, replica := range replicas {
+			ids[index] = replica.ReplicaID
+		}
+		sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+		history = append(history, ShardReplicaIDHistory{ShardID: shardID, ReplicaIDs: ids})
+	}
+	appendShard(SystemRaftShardID, registryLayout.SystemReplicas)
+	for _, shard := range registryLayout.DataShards {
+		appendShard(DataRaftShardID(shard.ShardID), shard.Replicas)
+	}
+	return history
+}
+
+func validateReplicaIDHistory(registryLayout RegistryLayout, history []ShardReplicaIDHistory) error {
+	current := replicaIDHistoryForLayout(registryLayout)
+	if len(history) != len(current) {
+		return errors.New("raftstore: accepted registryLayout has incomplete replica ID history")
+	}
+	for index, shard := range history {
+		if shard.ShardID != current[index].ShardID || len(shard.ReplicaIDs) < len(current[index].ReplicaIDs) {
+			return errors.New("raftstore: accepted registryLayout has invalid replica ID history")
+		}
+		for position, replicaID := range shard.ReplicaIDs {
+			if replicaID == 0 || position > 0 && replicaID <= shard.ReplicaIDs[position-1] {
+				return errors.New("raftstore: accepted replica ID history is not unique and ordered")
+			}
+		}
+		for _, replicaID := range current[index].ReplicaIDs {
+			position := sort.Search(len(shard.ReplicaIDs), func(i int) bool { return shard.ReplicaIDs[i] >= replicaID })
+			if position == len(shard.ReplicaIDs) || shard.ReplicaIDs[position] != replicaID {
+				return errors.New("raftstore: accepted replica ID history omits an active replica")
+			}
+		}
+	}
+	return nil
+}
+
+func validateReplicaIDHistoryAdvance(previous, next RegistryLayout, history []ShardReplicaIDHistory) error {
+	previousActive := replicaIDHistoryForLayout(previous)
+	nextActive := replicaIDHistoryForLayout(next)
+	for index, shard := range nextActive {
+		for _, replicaID := range shard.ReplicaIDs {
+			if containsReplicaID(previousActive[index].ReplicaIDs, replicaID) {
+				continue
+			}
+			if containsReplicaID(history[index].ReplicaIDs, replicaID) {
+				return fmt.Errorf("raftstore: shard %d reuses retired replica ID %d", shard.ShardID, replicaID)
+			}
+		}
+	}
+	return nil
+}
+
+func extendReplicaIDHistory(history []ShardReplicaIDHistory, registryLayout RegistryLayout) []ShardReplicaIDHistory {
+	active := replicaIDHistoryForLayout(registryLayout)
+	extended := make([]ShardReplicaIDHistory, len(history))
+	for index, shard := range history {
+		ids := append([]uint64(nil), shard.ReplicaIDs...)
+		for _, replicaID := range active[index].ReplicaIDs {
+			if !containsReplicaID(ids, replicaID) {
+				ids = append(ids, replicaID)
+			}
+		}
+		sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+		extended[index] = ShardReplicaIDHistory{ShardID: shard.ShardID, ReplicaIDs: ids}
+	}
+	return extended
+}
+
+func containsReplicaID(replicaIDs []uint64, target uint64) bool {
+	position := sort.Search(len(replicaIDs), func(index int) bool { return replicaIDs[index] >= target })
+	return position < len(replicaIDs) && replicaIDs[position] == target
 }
 
 func validateRetainedReplicaTargets(previous, next RegistryLayout) error {

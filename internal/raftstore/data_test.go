@@ -769,7 +769,7 @@ func applyDataOK(t *testing.T, state *DataState, index uint64, command DataComma
 func routeStarting(t *testing.T, registryLayout RegistryLayout, group, routeKey, sandboxID string, round uint64, selected bool) clusterstate.RouteWorkflowRecord {
 	t.Helper()
 	intent := testDispatchIntent(t)
-	candidates := []clusterstate.PlacementCandidate{{NodeID: "node-1"}, {NodeID: "node-2"}}
+	candidates := []clusterstate.PlacementCandidate{testPlacementCandidate("node-1"), testPlacementCandidate("node-2")}
 	starting := &clusterstate.RouteStartingState{
 		SandboxID: sandboxID, PlacementRound: round, CandidatePool: candidates, Intent: intent,
 	}
@@ -840,7 +840,8 @@ func terminalRouteAndFence(deleting clusterstate.RouteWorkflowRecord, eventSeq u
 		Kind: clusterstate.ProofNodeTerminal, FencedNodeID: execution.NodeID, FencedNodeEpoch: execution.NodeEpoch,
 	}
 	digest, err := clusterstate.NodeTerminalProofDigest(
-		proof, execution.RegistryGeneration, execution.SandboxID, execution.BindingDigest, eventSeq,
+		proof, deleting.Group, deleting.RouteKey, execution.RegistryGeneration,
+		execution.SandboxID, execution.BindingDigest, eventSeq,
 	)
 	if err != nil {
 		panic(err)
@@ -878,7 +879,11 @@ func buildStarting(t *testing.T, registryLayout RegistryLayout, group, buildID s
 	t.Helper()
 	intent := testBuildDispatchIntent(t)
 	starting := &clusterstate.BuildStartingState{
-		BuildID: buildID, CandidatePool: []clusterstate.PlacementCandidate{{NodeID: "node-1"}, {NodeID: "node-2"}}, Intent: intent,
+		BuildID: buildID,
+		CandidatePool: []clusterstate.PlacementCandidate{
+			testPlacementCandidate("node-1"), testPlacementCandidate("node-2"),
+		},
+		Intent: intent,
 	}
 	if selected {
 		index := uint32(0)
@@ -950,6 +955,10 @@ func testDispatchIntent(t *testing.T) clusterstate.DispatchIntent {
 		t.Fatal(err)
 	}
 	return intent
+}
+
+func testPlacementCandidate(nodeID string) clusterstate.PlacementCandidate {
+	return clusterstate.PlacementCandidate{NodeID: nodeID, CatalogDigest: strings.Repeat("d", 64)}
 }
 
 func testDispatchIntentNoFail() clusterstate.DispatchIntent {

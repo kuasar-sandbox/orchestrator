@@ -57,6 +57,7 @@ type PlacementProbeRequest struct {
 	ExpectedSessionSeq uint64         `json:"expected_session_seq"`
 	LoadModelVersion   uint16         `json:"load_model_version"`
 	RuntimeDigest      string         `json:"runtime_digest,omitempty"`
+	CatalogDigest      string         `json:"catalog_digest"`
 	Sandbox            *SandboxDemand `json:"sandbox,omitempty"`
 	Build              *BuildDemand   `json:"build,omitempty"`
 }
@@ -114,6 +115,9 @@ func ProbePlacement(snapshot PlacementLoadSnapshot, sampleAge time.Duration, req
 	}
 	if request.LoadModelVersion != LoadModelVersion || snapshot.LoadModelVersion != request.LoadModelVersion {
 		return stale("load model version mismatch")
+	}
+	if request.CatalogDigest == "" || snapshot.CatalogDigest != request.CatalogDigest {
+		return reject("node catalog identity changed")
 	}
 	if sampleAge < 0 || sampleAge > MaximumProbeSampleAge {
 		return stale("placement sample is stale")

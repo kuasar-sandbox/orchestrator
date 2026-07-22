@@ -62,7 +62,7 @@ func nodeKeyLeaseFromRecord(record clusterstate.SandboxGroupRecord, expiresUnix 
 		return routesync.NodeKeyLeaseV1{}, err
 	}
 	lease := routesync.NodeKeyLeaseV1{
-		Version: routesync.NodeKeyLeaseVersionV1, Group: record.Group,
+		Version: routesync.NodeKeyLeaseVersionV1, Group: record.Group, KeyRevision: record.KeyRevision,
 		AuthKey: authKey, ManifestKey: manifestKey, RegistryAuth: registryAuth,
 		ExpiresUnix: expiresUnix,
 	}

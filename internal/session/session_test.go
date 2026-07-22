@@ -523,8 +523,8 @@ func TestHolderProbeUsesLocalObservationAndPermit(t *testing.T) {
 		Request: placement.PlacementProbeRequest{
 			Kind: placement.ObjectSandbox, NodeID: registration.NodeID,
 			ExpectedNodeEpoch: registration.NodeEpoch, ExpectedSessionSeq: registration.SessionSeq,
-			LoadModelVersion: placement.LoadModelVersion,
-			Sandbox:          &placement.SandboxDemand{SlotUnits: 1},
+			LoadModelVersion: placement.LoadModelVersion, CatalogDigest: registrationCatalogDigest(registration),
+			Sandbox: &placement.SandboxDemand{SlotUnits: 1},
 		},
 	})
 	if err != nil || response.Class != placement.ProbeImmediate || response.SampleAge != 900*time.Millisecond {
@@ -536,8 +536,8 @@ func TestHolderProbeUsesLocalObservationAndPermit(t *testing.T) {
 		Request: placement.PlacementProbeRequest{
 			Kind: placement.ObjectSandbox, NodeID: registration.NodeID,
 			ExpectedNodeEpoch: registration.NodeEpoch, ExpectedSessionSeq: registration.SessionSeq,
-			LoadModelVersion: placement.LoadModelVersion,
-			Sandbox:          &placement.SandboxDemand{SlotUnits: 1},
+			LoadModelVersion: placement.LoadModelVersion, CatalogDigest: registrationCatalogDigest(registration),
+			Sandbox: &placement.SandboxDemand{SlotUnits: 1},
 		},
 	})
 	if err != nil || response.Class != placement.ProbeStale {
@@ -562,10 +562,41 @@ func TestHolderProbeUsesLocalObservationAndPermit(t *testing.T) {
 		Request: placement.PlacementProbeRequest{
 			Kind: placement.ObjectSandbox, NodeID: registration.NodeID,
 			ExpectedNodeEpoch: registration.NodeEpoch, ExpectedSessionSeq: registration.SessionSeq,
-			LoadModelVersion: placement.LoadModelVersion, Sandbox: &placement.SandboxDemand{SlotUnits: 1},
+			LoadModelVersion: placement.LoadModelVersion, CatalogDigest: registrationCatalogDigest(registration),
+			Sandbox: &placement.SandboxDemand{SlotUnits: 1},
 		},
 	}); err == nil {
 		t.Fatal("Probe accepted an incomplete serving identity")
+	}
+}
+
+func TestHolderProbeRejectsCandidateFromChangedStaticCatalog(t *testing.T) {
+	registration := testRegistration("node-1", 8, 1, "10.0.0.1:8443")
+	registration.Labels = map[string]string{"pool": "current"}
+	registration.Capabilities = map[string]bool{"kvm": true}
+	holder, err := NewHolder("registry-a", 1, nil, testGate(true), nil, newTestEnrollmentAuthority(registration))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := holder.Register(context.Background(), registration, &testEndpoint{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := holder.UpdateSnapshot(registration.Tuple, testSnapshot(registration)); err != nil {
+		t.Fatal(err)
+	}
+	oldCatalog := registration
+	oldCatalog.Labels = map[string]string{"pool": "old"}
+	response, err := holder.Probe(context.Background(), ProbeCall{
+		ServeIdentity: testServeIdentity(),
+		Request: placement.PlacementProbeRequest{
+			Kind: placement.ObjectSandbox, NodeID: registration.NodeID,
+			ExpectedNodeEpoch: registration.NodeEpoch, ExpectedSessionSeq: registration.SessionSeq,
+			LoadModelVersion: placement.LoadModelVersion, CatalogDigest: registrationCatalogDigest(oldCatalog),
+			Sandbox: &placement.SandboxDemand{SlotUnits: 1},
+		},
+	})
+	if err != nil || response.Class != placement.ProbeReject {
+		t.Fatalf("changed Catalog Probe = %+v, %v", response, err)
 	}
 }
 
@@ -829,7 +860,8 @@ func TestBlockedSessionReplacementDoesNotBlockOtherNodeProbe(t *testing.T) {
 			Request: placement.PlacementProbeRequest{
 				Kind: placement.ObjectSandbox, NodeID: second.NodeID,
 				ExpectedNodeEpoch: second.NodeEpoch, ExpectedSessionSeq: second.SessionSeq,
-				LoadModelVersion: placement.LoadModelVersion, Sandbox: &placement.SandboxDemand{SlotUnits: 1},
+				LoadModelVersion: placement.LoadModelVersion, CatalogDigest: registrationCatalogDigest(second),
+				Sandbox: &placement.SandboxDemand{SlotUnits: 1},
 			},
 		})
 		probeDone <- probeResult{response: response, err: err}
@@ -884,6 +916,48 @@ func TestHolderRequiresExactKeyLeaseAcknowledgement(t *testing.T) {
 		context.Background(), testServeIdentity(), registration.NodeID, registration.NodeEpoch, registration.DataEndpoint, ref,
 	); err != nil || !sent || holder.HasKeyLease(registration.NodeID, registration.NodeEpoch, ref) {
 		t.Fatalf("key drop sent=%v err=%v", sent, err)
+	}
+}
+
+func TestKeyLeaseRevisionFencesRegistryAuthRotation(t *testing.T) {
+	registration := testRegistration("node-1", 7, 10, "10.0.0.1:8443")
+	holder, err := NewHolder("registry-a", 1, nil, testGate(true), nil, newTestEnrollmentAuthority(registration))
+	if err != nil {
+		t.Fatal(err)
+	}
+	endpoint := &testEndpoint{}
+	if _, err := holder.Register(context.Background(), registration, endpoint); err != nil {
+		t.Fatal(err)
+	}
+
+	old := testKeyLease()
+	old.RegistryAuth = routesync.NodeRegistryAuthV1{Type: routesync.KeyMaterialInline, Value: "old-auth"}
+	current := old
+	current.KeyRevision++
+	current.RegistryAuth.Value = "current-auth"
+	currentRef, sent, err := holder.InstallKeyLease(
+		context.Background(), testServeIdentity(), registration.NodeID, registration.NodeEpoch, registration.DataEndpoint, current,
+	)
+	if err != nil || !sent {
+		t.Fatalf("current key lease sent=%v err=%v", sent, err)
+	}
+	old.ExpiresUnix = current.ExpiresUnix + 60
+	if _, sent, err := holder.InstallKeyLease(
+		context.Background(), testServeIdentity(), registration.NodeID, registration.NodeEpoch, registration.DataEndpoint, old,
+	); sent || !errors.Is(err, ErrKeyLeaseSuperseded) || !errors.Is(err, ErrDispatchNotSent) {
+		t.Fatalf("stale registry auth sent=%v err=%v", sent, err)
+	}
+	if !holder.HasKeyLease(registration.NodeID, registration.NodeEpoch, currentRef) || len(endpoint.wire) != 1 {
+		t.Fatalf("stale rotation changed current lease: current=%v wire=%d",
+			holder.HasKeyLease(registration.NodeID, registration.NodeEpoch, currentRef), len(endpoint.wire))
+	}
+
+	conflict := current
+	conflict.RegistryAuth.Value = "conflicting-auth"
+	if _, sent, err := holder.InstallKeyLease(
+		context.Background(), testServeIdentity(), registration.NodeID, registration.NodeEpoch, registration.DataEndpoint, conflict,
+	); sent || !errors.Is(err, ErrKeyLeaseConflict) || !errors.Is(err, ErrDispatchNotSent) {
+		t.Fatalf("equal-revision registry auth conflict sent=%v err=%v", sent, err)
 	}
 }
 
@@ -1628,7 +1702,8 @@ func testKeyLease() routesync.NodeKeyLeaseV1 {
 	auth := testKeyMaterial(strings.Repeat("a", 64))
 	manifest := testKeyMaterial(strings.Repeat("b", 64))
 	return routesync.NodeKeyLeaseV1{
-		Version: routesync.NodeKeyLeaseVersionV1, Group: "/g", AuthKey: auth, ManifestKey: manifest,
+		Version: routesync.NodeKeyLeaseVersionV1, Group: "/g", KeyRevision: 1,
+		AuthKey: auth, ManifestKey: manifest,
 		ExpiresUnix: time.Now().Add(time.Hour).Unix(),
 	}
 }

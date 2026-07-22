@@ -16,6 +16,16 @@ type holderDispatchRPCStub struct {
 	calls    int
 }
 
+type directoryFenceAuthority struct {
+	fenced map[string]uint64
+}
+
+func (a directoryFenceAuthority) AllowDirectoryEntry(DirectoryEntry) bool { return true }
+
+func (a directoryFenceAuthority) NodeEpochPermanentlyFenced(_ context.Context, nodeID string, nodeEpoch uint64) (bool, error) {
+	return a.fenced[nodeID] >= nodeEpoch, nil
+}
+
 func (s *holderDispatchRPCStub) AdmitAndDispatchAt(_ context.Context, holderID string, command DispatchCommand) (DispatchReply, error) {
 	s.calls++
 	s.holderID = holderID
@@ -41,8 +51,8 @@ func TestDirectoryDispatcherRoutesCurrentTuple(t *testing.T) {
 	}
 }
 
-func TestDirectoryDispatcherNeverTreatsDirectoryAsNoSideEffectProof(t *testing.T) {
-	directory := newTestDirectory()
+func TestDirectoryDispatcherClassifiesOnlySystemProvenNoSideEffect(t *testing.T) {
+	directory := NewDirectory(directoryFenceAuthority{fenced: map[string]uint64{"node-1": 7, "node-2": 7}})
 	applyDirectoryUp(t, directory, "node-1", "registry-b", 8, 1)
 	rpc := &holderDispatchRPCStub{}
 	dispatcher, err := NewDirectoryDispatcher(directory, rpc)
@@ -65,6 +75,19 @@ func TestDirectoryDispatcherNeverTreatsDirectoryAsNoSideEffectProof(t *testing.T
 	reply, err = dispatcher.AdmitAndDispatch(context.Background(), DispatchCommand{NodeID: "node-2", NodeEpoch: 7})
 	if err != nil || reply.Outcome != cluster.DispatchDefinitiveReject || rpc.calls != 0 {
 		t.Fatalf("down newer epoch dispatch = %+v, %v, calls=%d", reply, err, rpc.calls)
+	}
+}
+
+func TestDirectoryDispatcherDoesNotTreatNewerHintAsFenceProof(t *testing.T) {
+	directory := newTestDirectory()
+	applyDirectoryUp(t, directory, "node-1", "registry-b", 8, 1)
+	dispatcher, err := NewDirectoryDispatcher(directory, &holderDispatchRPCStub{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reply, err := dispatcher.AdmitAndDispatch(context.Background(), DispatchCommand{NodeID: "node-1", NodeEpoch: 7})
+	if err != nil || reply.Outcome != cluster.DispatchSessionMoved {
+		t.Fatalf("unproven newer hint dispatch = %+v, %v", reply, err)
 	}
 }
 

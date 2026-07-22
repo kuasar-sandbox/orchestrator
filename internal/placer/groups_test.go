@@ -17,7 +17,8 @@ const testManifestKey = "00112233445566778899aabbccddeeff00112233445566778899aab
 
 func TestFileGroupSourceProviderMethods(t *testing.T) {
 	src := testGroupSource(t, clusterstate.SandboxGroupRecord{
-		Group: "/g", ManifestKey: clusterstate.Secret{Type: clusterstate.SecretInline, Value: testManifestKey},
+		Group: "/g", KeyRevision: 1,
+		ManifestKey:           clusterstate.Secret{Type: clusterstate.SecretInline, Value: testManifestKey},
 		AuthKey:               clusterstate.Secret{Type: clusterstate.SecretInline, Value: testAuthKey},
 		TemplateRef:           "tmpl",
 		AllowTemplateOverride: true,
@@ -48,7 +49,7 @@ func TestFileGroupSourceProviderMethods(t *testing.T) {
 
 func TestFileGroupSourceAcceptsSecretShorthand(t *testing.T) {
 	dir := t.TempDir()
-	raw := `{"group":"/g","manifest_key":"` + testManifestKey + `","auth_key":"` + testAuthKey + `","node_selectors":[{"pool":"p"}]}`
+	raw := `{"group":"/g","key_revision":1,"manifest_key":"` + testManifestKey + `","auth_key":"` + testAuthKey + `","node_selectors":[{"pool":"p"}]}`
 	if err := os.WriteFile(filepath.Join(dir, "g.json"), []byte(raw), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -59,6 +60,21 @@ func TestFileGroupSourceAcceptsSecretShorthand(t *testing.T) {
 	key, found, err := src.GetManifestKey(context.Background(), "/g")
 	if err != nil || !found || key.Type != clusterstate.SecretInline || key.Value != testManifestKey {
 		t.Fatalf("key shorthand=%+v found=%v err=%v", key, found, err)
+	}
+}
+
+func TestFileGroupSourceRejectsKeyMaterialWithoutRevision(t *testing.T) {
+	dir := t.TempDir()
+	writeGroupFile(t, dir, "g.json", clusterstate.SandboxGroupRecord{
+		Group: "/g", AuthKey: clusterstate.Secret{Type: clusterstate.SecretInline, Value: testAuthKey},
+		ManifestKey: clusterstate.Secret{Type: clusterstate.SecretInline, Value: testManifestKey},
+	})
+	src, err := NewFileGroupSource("test", dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := src.GetRecord(context.Background(), "/g"); err == nil {
+		t.Fatal("key-bearing group without key_revision was accepted")
 	}
 }
 

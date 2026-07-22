@@ -2,6 +2,7 @@ package session
 
 import (
 	"container/heap"
+	"context"
 	"sort"
 	"sync"
 )
@@ -61,6 +62,13 @@ type Directory struct {
 // is checked against this authority before it can be installed again.
 type DirectoryIdentityAuthority interface {
 	AllowDirectoryEntry(DirectoryEntry) bool
+}
+
+// NodeEpochFenceAuthority is the committed System Group view used only when a
+// routing hint cannot reach the selected NodeEpoch. Directory state itself is
+// never sufficient proof that dispatch had no side effect.
+type NodeEpochFenceAuthority interface {
+	NodeEpochPermanentlyFenced(context.Context, string, uint64) (bool, error)
 }
 
 func NewDirectory(authority DirectoryIdentityAuthority) *Directory {
@@ -136,10 +144,18 @@ func (d *Directory) Lookup(nodeID string) (DirectoryEntry, bool) {
 }
 
 // LookupRecord returns the retained tuple high-watermark even when its Holder
-// is unavailable. Dispatch uses it to distinguish movement from a permanently
-// fenced older NodeEpoch.
+// is unavailable. The record remains a routing hint; permanent fencing is
+// classified separately through NodeEpochFenceAuthority.
 func (d *Directory) LookupRecord(nodeID string) (DirectoryRecord, bool) {
 	return d.lookupRecord(nodeID)
+}
+
+func (d *Directory) NodeEpochPermanentlyFenced(ctx context.Context, nodeID string, nodeEpoch uint64) (bool, error) {
+	authority, ok := d.authority.(NodeEpochFenceAuthority)
+	if !ok || nodeID == "" || nodeEpoch == 0 {
+		return false, nil
+	}
+	return authority.NodeEpochPermanentlyFenced(ctx, nodeID, nodeEpoch)
 }
 
 func (d *Directory) Snapshot() []DirectoryRecord {

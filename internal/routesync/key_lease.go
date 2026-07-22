@@ -3,6 +3,7 @@ package routesync
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 )
@@ -83,6 +84,7 @@ func (a NodeRegistryAuthV1) validate() error {
 type NodeKeyLeaseV1 struct {
 	Version      uint16             `json:"version"`
 	Group        string             `json:"group"`
+	KeyRevision  uint64             `json:"key_revision"`
 	AuthKey      NodeKeyMaterialV1  `json:"auth_key"`
 	ManifestKey  NodeKeyMaterialV1  `json:"manifest_key"`
 	RegistryAuth NodeRegistryAuthV1 `json:"registry_auth,omitempty"`
@@ -90,8 +92,8 @@ type NodeKeyLeaseV1 struct {
 }
 
 func (l NodeKeyLeaseV1) Validate() error {
-	if l.Version != NodeKeyLeaseVersionV1 || l.Group == "" || l.ExpiresUnix <= 0 {
-		return errors.New("routesync: key lease requires version, group, and positive expiry")
+	if l.Version != NodeKeyLeaseVersionV1 || l.Group == "" || l.KeyRevision == 0 || l.ExpiresUnix <= 0 {
+		return errors.New("routesync: key lease requires version, group, key revision, and positive expiry")
 	}
 	if err := l.AuthKey.validate("AuthKey"); err != nil {
 		return err
@@ -110,14 +112,16 @@ func (l NodeKeyLeaseV1) Validate() error {
 type NodeKeyLeaseRefV1 struct {
 	Version                uint16 `json:"version"`
 	Group                  string `json:"group"`
+	KeyRevision            uint64 `json:"key_revision"`
 	AuthKeyFingerprint     string `json:"auth_key_fingerprint"`
 	ManifestKeyFingerprint string `json:"manifest_key_fingerprint"`
+	RegistryAuthDigest     string `json:"registry_auth_digest"`
 }
 
 func (r NodeKeyLeaseRefV1) Validate() error {
-	if r.Version != NodeKeyLeaseVersionV1 || r.Group == "" ||
+	if r.Version != NodeKeyLeaseVersionV1 || r.Group == "" || r.KeyRevision == 0 ||
 		!validNodeKeyFingerprint(r.AuthKeyFingerprint) ||
-		!validNodeKeyFingerprint(r.ManifestKeyFingerprint) {
+		!validNodeKeyFingerprint(r.ManifestKeyFingerprint) || !validNodeDigest(r.RegistryAuthDigest) {
 		return errors.New("routesync: invalid key lease reference")
 	}
 	if r.AuthKeyFingerprint == r.ManifestKeyFingerprint {
@@ -126,7 +130,33 @@ func (r NodeKeyLeaseRefV1) Validate() error {
 	return nil
 }
 
+func (l NodeKeyLeaseV1) Ref() (NodeKeyLeaseRefV1, error) {
+	if err := l.Validate(); err != nil {
+		return NodeKeyLeaseRefV1{}, err
+	}
+	raw, err := json.Marshal(struct {
+		Type  string `json:"type"`
+		Value string `json:"value,omitempty"`
+		Ref   string `json:"ref,omitempty"`
+	}{Type: l.RegistryAuth.Type, Value: l.RegistryAuth.Value, Ref: l.RegistryAuth.Ref})
+	if err != nil {
+		return NodeKeyLeaseRefV1{}, err
+	}
+	digest := sha256.Sum256(append([]byte("kuasar-registry-auth-v1\x00"), raw...))
+	ref := NodeKeyLeaseRefV1{
+		Version: NodeKeyLeaseVersionV1, Group: l.Group, KeyRevision: l.KeyRevision,
+		AuthKeyFingerprint: l.AuthKey.Fingerprint, ManifestKeyFingerprint: l.ManifestKey.Fingerprint,
+		RegistryAuthDigest: hex.EncodeToString(digest[:]),
+	}
+	return ref, ref.Validate()
+}
+
 func validNodeKeyFingerprint(value string) bool {
 	decoded, err := hex.DecodeString(value)
 	return err == nil && len(decoded) == 12 && hex.EncodeToString(decoded) == value
+}
+
+func validNodeDigest(value string) bool {
+	decoded, err := hex.DecodeString(value)
+	return err == nil && len(decoded) == sha256.Size && hex.EncodeToString(decoded) == value
 }

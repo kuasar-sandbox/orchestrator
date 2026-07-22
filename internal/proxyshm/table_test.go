@@ -3,6 +3,7 @@ package proxyshm
 import (
 	"context"
 	"encoding/hex"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -272,6 +273,74 @@ func TestAuthorityRevisionRejectsReplayedOlderExecution(t *testing.T) {
 	tbl.Bookmark(true)
 	if got, ok := tbl.Lookup("s1"); !ok || got.BindingDigest != "replacement" {
 		t.Fatalf("full snapshot did not replace old authority state: %+v ok=%v", got, ok)
+	}
+}
+
+func TestReplayCollisionPreservesDeleteTombstone(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "routes.shm")
+	tbl, err := Create(path, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tbl.Close()
+
+	s1 := "s1"
+	s2 := ""
+	for i := 0; ; i++ {
+		candidate := fmt.Sprintf("collision-%d", i)
+		if candidate != s1 && hashSID(candidate)%uint64(tbl.Capacity()) == hashSID(s1)%uint64(tbl.Capacity()) {
+			s2 = candidate
+			break
+		}
+	}
+
+	tbl.BeginSync()
+	if err := tbl.Upsert(routesync.RouteEntry{SandboxID: s1, AuthorityRevision: 1, State: routesync.StateRunning}); err != nil {
+		t.Fatal(err)
+	}
+	if !tbl.DeleteRoute(routesync.RouteDelete{SandboxID: s1, AuthorityRevision: 2}) {
+		t.Fatal("delete was not applied")
+	}
+	if err := tbl.Upsert(routesync.RouteEntry{SandboxID: s2, AuthorityRevision: 3, State: routesync.StateRunning}); err != nil {
+		t.Fatal(err)
+	}
+	tbl.Bookmark(false)
+
+	if err := tbl.Upsert(routesync.RouteEntry{SandboxID: s1, AuthorityRevision: 1, State: routesync.StateRunning}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := tbl.Lookup(s1); ok {
+		t.Fatal("buffered pre-delete upsert resurrected a colliding route")
+	}
+	if _, ok := tbl.Lookup(s2); !ok {
+		t.Fatal("colliding current route was lost")
+	}
+}
+
+func TestCrossedReplayRevisionReclaimsDeleteTombstone(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "routes.shm")
+	tbl, err := Create(path, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tbl.Close()
+
+	tbl.BeginSync()
+	if err := tbl.Upsert(routesync.RouteEntry{SandboxID: "s1", AuthorityRevision: 1, State: routesync.StateRunning}); err != nil {
+		t.Fatal(err)
+	}
+	if !tbl.DeleteRoute(routesync.RouteDelete{SandboxID: "s1", AuthorityRevision: 2}) {
+		t.Fatal("delete was not applied")
+	}
+	if err := tbl.Upsert(routesync.RouteEntry{SandboxID: "s2", AuthorityRevision: 3, State: routesync.StateRunning}); err == nil {
+		t.Fatal("replay reused a tombstone before its duplicate window closed")
+	}
+	tbl.Bookmark(false)
+	if err := tbl.Upsert(routesync.RouteEntry{SandboxID: "s2", AuthorityRevision: 3, State: routesync.StateRunning}); err != nil {
+		t.Fatalf("higher live revision did not reclaim crossed tombstone: %v", err)
+	}
+	if got, ok := tbl.Lookup("s2"); !ok || got.AuthorityRevision != 3 {
+		t.Fatalf("replacement route = %+v, ok=%v", got, ok)
 	}
 }
 
