@@ -37,13 +37,22 @@ func (h *Holder) InstallKeyLease(
 	if err := h.CheckServe(identity); err != nil {
 		return ref, false, err
 	}
-	operation, err := h.beginKeyLeaseMutation(nodeID, nodeEpoch, dataEndpoint, ref)
+	operation, err := h.beginKeyLeaseMutation(nodeID, nodeEpoch, dataEndpoint, ref, lease.ExpiresUnix)
 	if err != nil {
 		return ref, false, err
 	}
 	defer operation.unlock()
 	if !operation.current() {
 		return ref, false, errors.Join(ErrDispatchNotSent, ErrKeyLeaseSuperseded)
+	}
+	operation.held.leaseMu.RLock()
+	installedExpiry := operation.held.keyLeases[operation.key]
+	operation.held.leaseMu.RUnlock()
+	if installedExpiry > lease.ExpiresUnix {
+		return ref, false, errors.Join(ErrDispatchNotSent, ErrKeyLeaseSuperseded)
+	}
+	if err := h.CheckServe(identity); err != nil {
+		return ref, false, errors.Join(ErrDispatchNotSent, err)
 	}
 	command := &routesync.Command{
 		Kind: routesync.CmdKeyPut, NodeEpoch: nodeEpoch, SessionSeq: operation.tuple.SessionSeq,
@@ -90,7 +99,7 @@ func (h *Holder) DropKeyLease(
 	if err := h.CheckServe(identity); err != nil {
 		return false, err
 	}
-	operation, err := h.beginKeyLeaseMutation(nodeID, nodeEpoch, dataEndpoint, ref)
+	operation, err := h.beginKeyLeaseMutation(nodeID, nodeEpoch, dataEndpoint, ref, 0)
 	if err != nil {
 		return false, err
 	}
@@ -102,14 +111,20 @@ func (h *Holder) DropKeyLease(
 	}
 	delete(operation.held.keyLeases, operation.key)
 	operation.held.leaseMu.Unlock()
+	if err := h.CheckServe(identity); err != nil {
+		return false, errors.Join(ErrDispatchNotSent, err)
+	}
 	command := &routesync.Command{
 		Kind: routesync.CmdKeyDrop, NodeEpoch: nodeEpoch, SessionSeq: operation.tuple.SessionSeq,
 		RegistryGeneration: identity.RegistryGeneration, KeyLeaseRef: &ref,
 		AuthKeyFingerprint: ref.AuthKeyFingerprint, ManifestKeyFingerprint: ref.ManifestKeyFingerprint,
 	}
 	ack, sent, err := operation.endpoint.SendNodeCommand(ctx, command)
-	if err != nil || !sent {
+	if err != nil {
 		return sent, err
+	}
+	if !sent {
+		return false, ErrSessionUnavailable
 	}
 	if ack.Status != routesync.AckAccepted || ack.KeyLeaseRef == nil || *ack.KeyLeaseRef != ref {
 		return true, errors.New("session: node did not acknowledge the exact dropped key lease")
@@ -196,6 +211,7 @@ func (h *Holder) beginKeyLeaseMutation(
 	nodeEpoch uint64,
 	dataEndpoint string,
 	ref routesync.NodeKeyLeaseRefV1,
+	desiredExpiry int64,
 ) (*keyLeaseMutation, error) {
 	h.mu.RLock()
 	held := h.active[nodeID]
@@ -211,6 +227,16 @@ func (h *Holder) beginKeyLeaseMutation(
 	tuple := held.registration.Tuple
 	key := keyLeaseRefID(ref)
 	held.leaseMu.Lock()
+	if desiredExpiry > 0 {
+		if held.keyLeaseHigh[key] > desiredExpiry {
+			held.leaseMu.Unlock()
+			h.mu.RUnlock()
+			return nil, errors.Join(ErrDispatchNotSent, ErrKeyLeaseSuperseded)
+		}
+		held.keyLeaseHigh[key] = desiredExpiry
+	} else {
+		delete(held.keyLeaseHigh, key)
+	}
 	held.keyLeaseSeq[key]++
 	sequence := held.keyLeaseSeq[key]
 	held.leaseMu.Unlock()

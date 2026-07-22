@@ -55,7 +55,7 @@ func (p *DirectoryProber) ProbePair(ctx context.Context, identity ServeIdentity,
 	for index, request := range requests {
 		entry, found := p.directory.Lookup(request.NodeID)
 		if !found {
-			results[index].Response = unusableProbe(request, placement.ProbeReject, "node has no current Session Holder")
+			results[index].Response = unusableProbe(request, placement.ProbeStale, "node has no current Session Holder")
 			continue
 		}
 		request.ExpectedNodeEpoch = entry.NodeEpoch
