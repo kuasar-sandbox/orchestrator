@@ -61,33 +61,37 @@ func TestPebblePlacementRetryLoadsCommittedFence(t *testing.T) {
 		ReplicaIDs: append([]uint64(nil), bootstrap.ReplicaIDs...),
 	})
 	starting := routeStarting(t, registryLayout, group, routeKey, "sandbox-1", 1, false)
-	starting.Starting.DefinitivelyRejected = []uint32{0, 1}
 	applyDiskData(t, machine, 2, DataCommand{
 		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{Absent: true}, Route: &starting,
 	})
+	exhausted := cloneRouteRecord(starting)
+	exhausted.Starting.DefinitivelyRejected = []uint32{0, 1}
+	applyDiskData(t, machine, 3, DataCommand{
+		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{LogIndex: 2}, Route: &exhausted,
+	})
 	failure := clusterstate.RoutePlacementFailureState{
-		SandboxID: starting.Starting.SandboxID, PlacementRound: starting.Starting.PlacementRound,
-		CandidatePool:        append([]clusterstate.PlacementCandidate(nil), starting.Starting.CandidatePool...),
-		DefinitivelyRejected: append([]uint32(nil), starting.Starting.DefinitivelyRejected...),
-		Intent:               starting.Starting.Intent, Reason: "placement candidate pool exhausted",
+		SandboxID: exhausted.Starting.SandboxID, PlacementRound: exhausted.Starting.PlacementRound,
+		CandidatePool:        append([]clusterstate.PlacementCandidate(nil), exhausted.Starting.CandidatePool...),
+		DefinitivelyRejected: append([]uint32(nil), exhausted.Starting.DefinitivelyRejected...),
+		Intent:               exhausted.Starting.Intent, Reason: "placement candidate pool exhausted",
 	}
 	tombstone := clusterstate.RouteWorkflowRecord{
 		Group: group, RouteKey: routeKey, State: clusterstate.WorkflowRouteTombstone,
 		Tombstone: &clusterstate.RouteTombstoneState{PlacementFailure: &failure},
 	}
-	applyDiskData(t, machine, 3, DataCommand{
-		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{LogIndex: 2}, Route: &tombstone,
+	applyDiskData(t, machine, 4, DataCommand{
+		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{LogIndex: 3}, Route: &tombstone,
 	})
 	fence, err := clusterstate.NewPlacementFailureFence(group, routeKey, registryLayout.RegistryGeneration, failure)
 	if err != nil {
 		t.Fatal(err)
 	}
-	applyDiskData(t, machine, 4, DataCommand{
+	applyDiskData(t, machine, 5, DataCommand{
 		Type: DataPutFence, Identity: identity, Expect: RevisionExpectation{Absent: true}, Fence: &fence,
 	})
 	next := routeStarting(t, registryLayout, group, routeKey, "sandbox-2", 2, false)
-	applyDiskData(t, machine, 5, DataCommand{
-		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{LogIndex: 3}, Route: &next,
+	applyDiskData(t, machine, 6, DataCommand{
+		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{LogIndex: 4}, Route: &next,
 	})
 }
 

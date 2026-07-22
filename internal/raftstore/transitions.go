@@ -344,8 +344,9 @@ func validateStartingCandidateProgress(
 ) error {
 	switch {
 	case currentSelected == nil && nextSelected == nil:
-		if !sameRejectedCandidates(currentRejected, nextRejected) || currentEventSeq != nextEventSeq {
-			return errors.New("raftstore: unselected workflow changed without a candidate result")
+		if currentBinding != nil || nextBinding != nil ||
+			!extendsRejectedCandidates(currentRejected, nextRejected) || currentEventSeq != nextEventSeq {
+			return errors.New("raftstore: unselected workflow changed outside monotonic candidate rejection")
 		}
 	case currentSelected == nil && nextSelected != nil:
 		if !sameRejectedCandidates(currentRejected, nextRejected) || currentEventSeq != nextEventSeq {
@@ -367,6 +368,18 @@ func validateStartingCandidateProgress(
 
 func sameRejectedCandidates(current, next []uint32) bool {
 	if len(current) != len(next) {
+		return false
+	}
+	for index := range current {
+		if current[index] != next[index] {
+			return false
+		}
+	}
+	return true
+}
+
+func extendsRejectedCandidates(current, next []uint32) bool {
+	if len(next) < len(current) {
 		return false
 	}
 	for index := range current {

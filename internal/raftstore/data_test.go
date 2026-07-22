@@ -379,14 +379,45 @@ func TestStartingCandidateRejectionAndSandboxRoundAdvance(t *testing.T) {
 	applyDataOK(t, &state, 8, DataCommand{
 		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{LogIndex: 6}, Route: &nextRound,
 	})
+}
 
-	skipped := cloneRouteRecord(state.Routes[routeMapKey("/g", "rk")])
-	skipped.Starting.DefinitivelyRejected = []uint32{0}
-	result := ApplyDataCommand(&state, 9, DataCommand{
-		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{LogIndex: 8}, Route: &skipped,
+func TestUnselectedProbeRejectionsAdvanceMonotonically(t *testing.T) {
+	registryLayout := testRegistryLayout(4, "generation-probe-rejection")
+
+	routeState, routeIdentity := initializedRouteShard(t, registryLayout, "/g", "rk-probe-rejection")
+	route := routeStarting(t, registryLayout, "/g", "rk-probe-rejection", "sandbox-1", 1, false)
+	applyDataOK(t, &routeState, 2, DataCommand{
+		Type: DataPutRoute, Identity: routeIdentity, Expect: RevisionExpectation{Absent: true}, Route: &route,
 	})
-	if !result.Conflict {
-		t.Fatal("unselected candidate was marked rejected without a dispatch result")
+	rejectedRoute := cloneRouteRecord(routeState.Routes[routeMapKey(route.Group, route.RouteKey)])
+	rejectedRoute.Starting.DefinitivelyRejected = []uint32{0, 1}
+	applyDataOK(t, &routeState, 3, DataCommand{
+		Type: DataPutRoute, Identity: routeIdentity, Expect: RevisionExpectation{LogIndex: 2}, Route: &rejectedRoute,
+	})
+	regressedRoute := cloneRouteRecord(routeState.Routes[routeMapKey(route.Group, route.RouteKey)])
+	regressedRoute.Starting.DefinitivelyRejected = []uint32{0}
+	if result := ApplyDataCommand(&routeState, 4, DataCommand{
+		Type: DataPutRoute, Identity: routeIdentity, Expect: RevisionExpectation{LogIndex: 3}, Route: &regressedRoute,
+	}); !result.Conflict {
+		t.Fatal("Route candidate rejection history regressed")
+	}
+
+	buildState, buildIdentity := initializedBuildShard(t, registryLayout, "/g", "build-probe-rejection")
+	build := buildStarting(t, registryLayout, "/g", "build-probe-rejection", false)
+	applyDataOK(t, &buildState, 2, DataCommand{
+		Type: DataPutBuild, Identity: buildIdentity, Expect: RevisionExpectation{Absent: true}, Build: &build,
+	})
+	rejectedBuild := cloneBuildRecord(buildState.Builds[buildMapKey(build.Group, build.BuildID)])
+	rejectedBuild.Starting.DefinitivelyRejected = []uint32{1, 0}
+	applyDataOK(t, &buildState, 3, DataCommand{
+		Type: DataPutBuild, Identity: buildIdentity, Expect: RevisionExpectation{LogIndex: 2}, Build: &rejectedBuild,
+	})
+	reorderedBuild := cloneBuildRecord(buildState.Builds[buildMapKey(build.Group, build.BuildID)])
+	reorderedBuild.Starting.DefinitivelyRejected = []uint32{0, 1}
+	if result := ApplyDataCommand(&buildState, 4, DataCommand{
+		Type: DataPutBuild, Identity: buildIdentity, Expect: RevisionExpectation{LogIndex: 3}, Build: &reorderedBuild,
+	}); !result.Conflict {
+		t.Fatal("Build candidate rejection history was reordered")
 	}
 }
 
