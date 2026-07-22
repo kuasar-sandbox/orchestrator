@@ -29,6 +29,7 @@ type sandboxAdmissionFake struct {
 	finalized  []string
 	prepares   int
 	prepareErr error
+	claimErr   error
 	promoteErr error
 	wake       chan struct{}
 }
@@ -57,7 +58,7 @@ func (f *sandboxAdmissionFake) ClaimAdmission(id, _ string) (nodectl.PreparedAdm
 	result := f.prepared[id]
 	result.State = nodectl.PreparedClaimed
 	f.prepared[id] = result
-	return result, nil
+	return result, f.claimErr
 }
 
 func (f *sandboxAdmissionFake) ReleaseAdmission(id, _, reason string) (nodectl.PreparedAdmissionResult, error) {
@@ -558,6 +559,37 @@ func TestAuthorityJournalsPublishedAdmissionAndPromotionBeforeReturningFlushErro
 		record, err := st.GetNodeWorkflow(ctx, clusterstate.ExecutionKindSandbox, command.ObjectID)
 		if err != nil || record == nil || record.AdmissionState != nodeexec.AdmissionAdmitted || !record.ResourceClaimed {
 			t.Fatalf("journal after published promotion = %+v, %v", record, err)
+		}
+	})
+
+	t.Run("claim", func(t *testing.T) {
+		st := authorityStore(t)
+		command := authorityCommand(t, clusterstate.ExecutionKindSandbox, "sandbox-published-claim")
+		sandbox := &sandboxAdmissionFake{
+			prepared: map[string]nodectl.PreparedAdmissionResult{
+				command.ObjectID: {
+					SandboxID: command.ObjectID, DemandDigest: command.Intent.DemandDigest,
+					State: nodectl.PreparedAdmitted, ReservationToken: "token-published",
+				},
+			},
+			claimErr: published,
+			wake:     make(chan struct{}),
+		}
+		authority := newAuthority(t, st, sandbox)
+		if reply, err := authority.AdmitAndDispatch(ctx, command); err != nil || reply.Outcome != clusterstate.DispatchAcceptedAdmitted {
+			t.Fatalf("dispatch = %+v, %v", reply, err)
+		}
+		launchable, err := authority.Launchable(ctx, clusterstate.ExecutionKindSandbox, "", 10)
+		if err != nil || len(launchable) != 1 {
+			t.Fatalf("launchable = %+v, %v", launchable, err)
+		}
+		claimed, err := authority.ClaimSandbox(ctx, launchable[0])
+		if !nodectl.FlushPublished(err) || claimed == nil || claimed.AdmissionState != nodeexec.AdmissionLaunching {
+			t.Fatalf("published claim = %+v, %v", claimed, err)
+		}
+		stored, getErr := st.GetNodeWorkflow(ctx, clusterstate.ExecutionKindSandbox, command.ObjectID)
+		if getErr != nil || stored == nil || stored.AdmissionState != nodeexec.AdmissionLaunching {
+			t.Fatalf("journal after published claim = %+v, %v", stored, getErr)
 		}
 	})
 }

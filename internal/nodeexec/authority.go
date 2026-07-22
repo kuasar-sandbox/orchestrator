@@ -506,13 +506,19 @@ func (a *Authority) ClaimSandbox(ctx context.Context, record *WorkflowRecord) (*
 		return nil, errors.New("nodeexec: Sandbox claim requires a Sandbox workflow")
 	}
 	claimed, err := a.sandbox.ClaimAdmission(record.ObjectID, record.DemandDigest)
-	if err != nil {
+	if err != nil && !nodectl.FlushPublished(err) {
 		return nil, err
 	}
 	if claimed.State != nodectl.PreparedClaimed || claimed.ReservationToken != record.ReservationToken {
 		return nil, errors.New("nodeexec: resource controller did not claim the journaled reservation")
 	}
-	return a.journal.ClaimSandboxWorkflow(ctx, record.ObjectID, record.DemandDigest, record.ReservationToken)
+	journaled, journalErr := a.journal.ClaimSandboxWorkflow(
+		ctx, record.ObjectID, record.DemandDigest, record.ReservationToken,
+	)
+	if journalErr != nil {
+		return nil, errors.Join(err, journalErr)
+	}
+	return journaled, err
 }
 
 func (a *Authority) ClaimBuild(ctx context.Context, record *WorkflowRecord) (*WorkflowRecord, error) {

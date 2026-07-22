@@ -153,6 +153,45 @@ func TestCASExecutionBindingAtomicallyRebindsWorkflowOutbox(t *testing.T) {
 	}
 }
 
+func TestCASExecutionBindingRebindsWorkflowBeforeBusinessRowExists(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	dispatch := workflowDispatch(t, clusterstate.ExecutionKindSandbox, "sandbox-pre-row-rebind", placement.BuildDemand{})
+	decision := nodeexec.AdmissionDecision{
+		State: nodeexec.AdmissionAdmitted, Result: clusterstate.DispatchAcceptedAdmitted,
+		ReservationToken: "reservation-pre-row-rebind",
+	}
+	if _, err := st.RecordSandboxWorkflow(ctx, dispatch, decision); err != nil {
+		t.Fatal(err)
+	}
+	if exists, err := st.ExecutionObjectExists(ctx, clusterstate.ExecutionKindSandbox, dispatch.ObjectID); err != nil || exists {
+		t.Fatalf("business object exists=%v, err=%v", exists, err)
+	}
+	rebound, err := clusterstate.DecodeExecutionBinding(dispatch.OpaqueBinding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rebound.RegistryGeneration = "generation-2"
+	replacement, err := clusterstate.EncodeExecutionBinding(rebound)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replacementDigest, err := clusterstate.ExecutionBindingDigest(replacement)
+	if err != nil {
+		t.Fatal(err)
+	}
+	changed, err := st.CASExecutionBinding(
+		ctx, clusterstate.ExecutionKindSandbox, dispatch.ObjectID, dispatch.BindingDigest, replacement,
+	)
+	if err != nil || !changed {
+		t.Fatalf("pre-row rebind changed=%v err=%v", changed, err)
+	}
+	workflow, err := st.GetNodeWorkflow(ctx, clusterstate.ExecutionKindSandbox, dispatch.ObjectID)
+	if err != nil || workflow == nil || workflow.OpaqueBinding != replacement || workflow.BindingDigest != replacementDigest {
+		t.Fatalf("rebound workflow = %+v, %v", workflow, err)
+	}
+}
+
 func testOpaqueBinding(t *testing.T, generation, objectID, nodeID string, nodeEpoch uint64) string {
 	t.Helper()
 	opaque, err := clusterstate.EncodeExecutionBinding(clusterstate.ExecutionBinding{

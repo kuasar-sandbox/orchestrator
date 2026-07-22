@@ -188,16 +188,14 @@ func (c *PreparedAdmissionController) PrepareAdmission(
 		return result, nil
 	}
 	hasQueued := preparedQueueDepthLocked(c.state) > 0
-	c.state.Unlock()
-
 	var outcome Outcome
 	if hasQueued {
-		outcome = c.admission.AnalyzeRequest(demand.message(sandboxID))
+		outcome = c.admission.analyzeRequestLocked(demand.message(sandboxID))
 		if outcome.Status == OutcomeAdmitted {
 			outcome = Outcome{Status: OutcomeShortTermBlock, Block: BlockNone}
 		}
 	} else {
-		outcome = c.admission.AnalyzeAndConsume(demand.message(sandboxID))
+		outcome = c.admission.analyzeAndConsumeLocked(demand.message(sandboxID))
 	}
 	now := c.clock()
 	record := &PreparedSandboxAdmission{
@@ -215,10 +213,10 @@ func (c *PreparedAdmissionController) PrepareAdmission(
 		record.ReservationToken = ""
 		record.Reason = outcome.RejectCode
 	default:
+		c.state.Unlock()
 		return PreparedAdmissionResult{}, errors.New("nodectl: unknown prepared admission outcome")
 	}
 
-	c.state.Lock()
 	if record.State == PreparedQueued {
 		if preparedQueueDepthLocked(c.state) >= c.queueMax {
 			record.State = PreparedRejected
@@ -457,21 +455,22 @@ func (c *PreparedAdmissionController) PromoteQueued() ([]PreparedAdmissionResult
 
 	changed := make([]PreparedAdmissionResult, 0)
 	for _, queued := range queue {
-		var outcome Outcome
-		if c.queueTTL > 0 && c.clock().Sub(queued.QueuedAt) >= c.queueTTL {
-			outcome = Outcome{Status: OutcomeLongTermReject, RejectCode: "queue_expired"}
-		} else {
-			outcome = c.admission.AnalyzeAndConsume(queued.Demand.message(queued.SandboxID))
-			if outcome.Status == OutcomeShortTermBlock {
-				blockedBy = outcome.Block
-				break
-			}
-		}
 		c.state.Lock()
 		record := c.state.PreparedSandboxAdmissions[queued.SandboxID]
 		if record == nil || record.State != PreparedQueued || record.DemandDigest != queued.DemandDigest {
 			c.state.Unlock()
 			continue
+		}
+		var outcome Outcome
+		if c.queueTTL > 0 && c.clock().Sub(record.QueuedAt) >= c.queueTTL {
+			outcome = Outcome{Status: OutcomeLongTermReject, RejectCode: "queue_expired"}
+		} else {
+			outcome = c.admission.analyzeAndConsumeLocked(record.Demand.message(record.SandboxID))
+			if outcome.Status == OutcomeShortTermBlock {
+				blockedBy = outcome.Block
+				c.state.Unlock()
+				break
+			}
 		}
 		previous := *record
 		switch outcome.Status {
@@ -517,11 +516,15 @@ func (c *PreparedAdmissionController) PromoteQueued() ([]PreparedAdmissionResult
 func (c *PreparedAdmissionController) insertReservationLocked(record *PreparedSandboxAdmission) error {
 	demand := record.Demand
 	budget := computeEffectiveStartupBudget(demand.message(record.SandboxID))
+	floorCPUMilli, validCPU := admissionFloorCPUMilli(demand.message(record.SandboxID))
+	if !validCPU {
+		return errors.New("nodectl: invalid prepared CPU demand")
+	}
 	now := c.clock()
 	return c.state.Insert(&Reservation{
 		Token: record.ReservationToken, SandboxID: record.SandboxID, CgroupPath: demand.CgroupPath,
 		Capacity:          Resources{MemoryBytes: demand.CapacityMemoryBytes, CPUMilli: uint64(demand.CapacityCPU) * 1000},
-		Floor:             Resources{MemoryBytes: demand.FloorMemoryBytes, CPUMilli: uint64(demand.FloorCPU * 1000)},
+		Floor:             Resources{MemoryBytes: demand.FloorMemoryBytes, CPUMilli: floorCPUMilli},
 		AllocatableNowMem: budget, EffectiveStartupBudget: budget,
 		Stage: StageAdmitted, StageEnteredAt: now, LastHeartbeatAt: now,
 	})
