@@ -43,6 +43,29 @@ func TestSandboxDispatchSpecRoundTripAndRejectsSystemMetadata(t *testing.T) {
 	}
 }
 
+func TestDispatchSpecAcceptsOnlyReplayableNodePOSTPaths(t *testing.T) {
+	templateRef := "e2b-img-" + strings.Repeat("c", 64)
+	sandbox := SandboxDispatchSpecV1{
+		Version: DispatchSpecVersionV1, TemplateRef: templateRef,
+		AuthKeyFingerprint: strings.Repeat("a", 24), ManifestKeyFingerprint: strings.Repeat("b", 24),
+		AccessToken: "capability",
+		Request:     testNodeRequest(t, "/v2/sandboxes", `{"templateID":"`+templateRef+`","timeout":0,"metadata":null}`),
+	}
+	if _, err := MarshalSandboxDispatchSpec(sandbox); err == nil {
+		t.Fatal("GET-only Sandbox alias accepted as a replayable POST path")
+	}
+
+	build := BuildDispatchSpecV1{
+		Version: DispatchSpecVersionV1, TemplateID: "transient-template",
+		AuthKeyFingerprint: strings.Repeat("a", 24), ManifestKeyFingerprint: strings.Repeat("b", 24),
+		Profile: types.ProfileBare, CPUCount: 1, MemoryMB: 512,
+		Request: testNodeRequest(t, "/templates", `{"cpuCount":1,"memoryMB":512,"metadata":null,"name":"","profile":"bare","tags":null}`),
+	}
+	if _, err := MarshalBuildDispatchSpec(build); err == nil {
+		t.Fatal("GET-only Build alias accepted as a replayable POST path")
+	}
+}
+
 func TestDispatchSpecRejectsReservedRequestMetadata(t *testing.T) {
 	templateRef := "e2b-img-" + strings.Repeat("c", 64)
 	spec := SandboxDispatchSpecV1{

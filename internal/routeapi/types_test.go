@@ -131,6 +131,12 @@ func TestPositiveReadsRequireExactTableKeyIdentity(t *testing.T) {
 	if err := response.ValidateFor(request); err == nil {
 		t.Fatal("READY projection for another Route key was accepted")
 	}
+	response.RouteKey = request.RouteKey
+	request.RouteKey = "another-route"
+	response.RouteKey = request.RouteKey
+	if err := response.ValidateFor(request); err == nil {
+		t.Fatal("READY projection whose Binding names another Route key was accepted")
+	}
 
 	buildRequest := ReadBuildRequest{RequestIdentity: request.RequestIdentity, Group: "/g", BuildID: "b1"}
 	build := testBuildProjection()
@@ -144,6 +150,10 @@ func TestPositiveReadsRequireExactTableKeyIdentity(t *testing.T) {
 	buildResponse.Group = "/another-group"
 	if err := buildResponse.ValidateFor(buildRequest); err == nil {
 		t.Fatal("positive Build projection for another Group was accepted")
+	}
+	buildRequest.Group = "/another-group"
+	if err := buildResponse.ValidateFor(buildRequest); err == nil {
+		t.Fatal("positive Build projection whose Binding names another Group was accepted")
 	}
 }
 
