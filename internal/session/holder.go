@@ -161,6 +161,7 @@ func (h *Holder) Register(ctx context.Context, registration Registration, endpoi
 	if err := registration.Validate(); err != nil {
 		return nil, err
 	}
+	registration = cloneRegistration(registration)
 	if endpoint == nil {
 		return nil, errors.New("session: node-link endpoint is required")
 	}
@@ -173,7 +174,7 @@ func (h *Holder) Register(ctx context.Context, registration Registration, endpoi
 			}
 			current := h.active[registration.NodeID]
 			if current == nil {
-				h.high[registration.NodeID] = registration
+				h.high[registration.NodeID] = cloneRegistration(registration)
 				h.active[registration.NodeID] = newHeldSession(registration, endpoint)
 				h.mu.Unlock()
 				break
@@ -198,7 +199,7 @@ func (h *Holder) Register(ctx context.Context, registration Registration, endpoi
 				current.commandMu.Unlock()
 				return err
 			}
-			h.high[registration.NodeID] = registration
+			h.high[registration.NodeID] = cloneRegistration(registration)
 			h.active[registration.NodeID] = next
 			h.mu.Unlock()
 
@@ -458,10 +459,16 @@ func (h *Holder) lockCommandSession(
 
 func newHeldSession(registration Registration, endpoint SessionEndpoint) *heldSession {
 	return &heldSession{
-		registration: registration, endpoint: endpoint,
+		registration: cloneRegistration(registration), endpoint: endpoint,
 		keyLeases: make(map[string]acknowledgedKeyLease), keyLeaseSeq: make(map[string]uint64),
 		keyLeaseHigh: make(map[string]acknowledgedKeyLease),
 	}
+}
+
+func cloneRegistration(registration Registration) Registration {
+	registration.Labels = maps.Clone(registration.Labels)
+	registration.Capabilities = maps.Clone(registration.Capabilities)
+	return registration
 }
 
 // validateRegistrationLocked validates against Holder high-watermarks and
@@ -550,5 +557,5 @@ func (h *Holder) Registration(nodeID string) (Registration, bool) {
 	if session == nil {
 		return Registration{}, false
 	}
-	return session.registration, true
+	return cloneRegistration(session.registration), true
 }

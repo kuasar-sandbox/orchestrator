@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/cluster"
@@ -118,6 +119,22 @@ func TestPlaceNRejectsInvalidRandomSource(t *testing.T) {
 	nodes := []CatalogNode{{NodeID: "n1", SandboxSlotCapacity: 1}}
 	if _, err := PlaceSandboxN(nodes, SandboxDemand{SlotUnits: 1}, StaticPolicy{}, 1, &sequenceSource{values: []int{1}}); err == nil {
 		t.Fatal("out-of-range source was accepted")
+	}
+}
+
+func TestPlaceNRejectsCatalogRowsThatCannotBePersisted(t *testing.T) {
+	nodes := []CatalogNode{
+		{NodeID: " valid-leading-space", SandboxSlotCapacity: 1},
+		{NodeID: "valid", FailureDomain: string([]byte{0xff}), SandboxSlotCapacity: 1},
+		{NodeID: "oversized", RuntimeDigest: strings.Repeat("r", cluster.MaxPlacementCandidateMetadataBytes+1), SandboxSlotCapacity: 1},
+		{NodeID: "eligible", FailureDomain: "zone-a", RuntimeDigest: "runtime-v1", SandboxSlotCapacity: 1},
+	}
+	got, err := PlaceSandboxN(nodes, SandboxDemand{SlotUnits: 1}, StaticPolicy{}, 4, &sequenceSource{values: []int{0}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ids := candidateIDs(got); !reflect.DeepEqual(ids, []string{"eligible"}) {
+		t.Fatalf("candidates = %v", ids)
 	}
 }
 
