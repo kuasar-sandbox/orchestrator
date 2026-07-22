@@ -321,14 +321,7 @@ func effectiveRestoreMode(raw string) (string, error) {
 	if normalized != "" {
 		metadata = map[string]string{sandboxcfg.NsRestore: normalized}
 	}
-	spec, err := sandboxcfg.ParseSpec(metadata)
-	if err != nil {
-		return "", err
-	}
-	if spec.Restore.Prefetch == "" {
-		return "off", nil
-	}
-	return spec.Restore.Prefetch, nil
+	return sandboxcfg.RestorePrefetchMode(metadata)
 }
 
 // effectiveCreateConfig removes any group-provided restore key and then applies

@@ -110,6 +110,9 @@ create 可在 body metadata 中携 `kuasar-sandbox.restore`,或使用
 `X-Kuasar-Sandbox-Restore`;同一请求 Header 胜出。router 只提取该命名空间,不会把
 Prefetch 变成 group 或节点统一策略。register/trigger 的最终模板默认值随 READY build
 记录保存;create 未显式声明时按最终 template ID 继承,显式 `off`/`memory` 始终胜出。
+同一 `(group,route_key)` 首次创建期间,restore 选择意图相同的并发请求共用 Reserve;
+`inherit`、显式 `off` 与 `memory` 互不合并,不同时回 **409**,避免成功响应对应到
+另一请求抢先选定的策略。
 
 ## 6. 缓存模型
 

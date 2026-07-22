@@ -3,6 +3,7 @@ package router
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/clusterclient"
+	"github.com/kuasar-sandbox/orchestrator/internal/registry"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
@@ -110,6 +112,129 @@ func TestRouteLinkHTTPFailsOverOnServerError(t *testing.T) {
 	}
 }
 
+func TestRouteLinkHTTPDoesNotFailOverRestoreConflict(t *testing.T) {
+	var calls []string
+	first := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls = append(calls, "first")
+		resp := textResponse(http.StatusConflict, "restore conflict")
+		resp.Header.Set(registry.RouteLinkErrorHeader, registry.RouteLinkRestoreConflict)
+		return resp, nil
+	})}
+	second := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls = append(calls, "second")
+		return textResponse(http.StatusOK, `{"ok":true}`), nil
+	})}
+	rt := &Router{routeRegistry: routeRegistryFunc(func(context.Context, string) ([]clusterclient.Endpoint, error) {
+		return []clusterclient.Endpoint{
+			{MemberID: "r1", BaseURL: "http://r1", Client: first},
+			{MemberID: "r2", BaseURL: "http://r2", Client: second},
+		}, nil
+	})}
+	resp, err := rt.routeLinkHTTP(context.Background(), "/g", http.MethodPost, registry.RouteLinkReservePath, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusConflict || strings.Join(calls, ",") != "first" {
+		t.Fatalf("status=%d calls=%v, want marked 409 without failover", resp.StatusCode, calls)
+	}
+}
+
+func TestRouteLinkHTTPStillFailsOverOnUnmarkedConflict(t *testing.T) {
+	var calls []string
+	first := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls = append(calls, "first")
+		return textResponse(http.StatusConflict, "stale owner"), nil
+	})}
+	second := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls = append(calls, "second")
+		return textResponse(http.StatusOK, `{"ok":true}`), nil
+	})}
+	rt := &Router{routeRegistry: routeRegistryFunc(func(context.Context, string) ([]clusterclient.Endpoint, error) {
+		return []clusterclient.Endpoint{
+			{MemberID: "r1", BaseURL: "http://r1", Client: first},
+			{MemberID: "r2", BaseURL: "http://r2", Client: second},
+		}, nil
+	})}
+	resp, err := rt.routeLinkHTTP(context.Background(), "/g", http.MethodPost, registry.RouteLinkReservePath, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || strings.Join(calls, ",") != "first,second" {
+		t.Fatalf("status=%d calls=%v, want unmarked 409 failover", resp.StatusCode, calls)
+	}
+}
+
+func TestHandleCreatePropagatesRestoreConflict(t *testing.T) {
+	reserveCalls := 0
+	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != registry.RouteLinkReservePath {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		reserveCalls++
+		w.Header().Set(registry.RouteLinkErrorHeader, registry.RouteLinkRestoreConflict)
+		http.Error(w, "restore conflict", http.StatusConflict)
+	}))
+	defer control.Close()
+	rt := New(strings.TrimPrefix(control.URL, "http://"), "test.local", 0, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	rt.SetAuthMode("off")
+	srv := httptest.NewServer(rt.Handler())
+	defer srv.Close()
+
+	req, err := http.NewRequest(http.MethodPost, srv.URL+"/sandboxes", strings.NewReader(
+		`{"metadata":{"kuasar-sandbox.restore":"{\"prefetch\":\"memory\"}"}}`,
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Host = "api.test.local"
+	req.Header.Set(HeaderGroup, "/g")
+	req.Header.Set(HeaderRouteKey, "rk")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusConflict || reserveCalls != 1 {
+		t.Fatalf("status=%d reserve calls=%d, want 409 from one reserve", resp.StatusCode, reserveCalls)
+	}
+}
+
+func TestHandleCreateMapsExhaustedUnmarkedConflictToServiceUnavailable(t *testing.T) {
+	reserveCalls := 0
+	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != registry.RouteLinkReservePath {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		reserveCalls++
+		http.Error(w, "stale owner", http.StatusConflict)
+	}))
+	defer control.Close()
+	rt := New(strings.TrimPrefix(control.URL, "http://"), "test.local", 0, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	rt.SetAuthMode("off")
+	srv := httptest.NewServer(rt.Handler())
+	defer srv.Close()
+
+	req, err := http.NewRequest(http.MethodPost, srv.URL+"/sandboxes", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Host = "api.test.local"
+	req.Header.Set(HeaderGroup, "/g")
+	req.Header.Set(HeaderRouteKey, "rk")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable || reserveCalls != 2 {
+		t.Fatalf("status=%d reserve calls=%d, want 503 after two unmarked 409 attempts", resp.StatusCode, reserveCalls)
+	}
+}
+
 func TestRouteLinkHTTPRefreshesMembershipAndRetries(t *testing.T) {
 	var calls []string
 	oldClient := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
@@ -156,6 +281,45 @@ func TestRouteLinkReserveCarriesRestoreConfig(t *testing.T) {
 	}
 	if got.Config["kuasar-sandbox.restore"] != `{"prefetch":"memory"}` {
 		t.Fatalf("route-link reserve config=%v", got.Config)
+	}
+}
+
+func TestReserveByKeyKeepsRestorePolicyDistinctAcrossFlights(t *testing.T) {
+	result := &reserveResult{SID: "s1", NodeID: "n1", DataEndpoint: "node:1"}
+	for _, tc := range []struct {
+		name         string
+		leaderIntent string
+		waiter       map[string]string
+	}{
+		{name: "inherit leader off waiter", leaderIntent: "inherit", waiter: map[string]string{"kuasar-sandbox.restore": `{"prefetch":"off"}`}},
+		{name: "off leader inherit waiter", leaderIntent: "off", waiter: nil},
+		{name: "inherit leader memory waiter", leaderIntent: "inherit", waiter: map[string]string{"kuasar-sandbox.restore": `{"prefetch":"memory"}`}},
+		{name: "memory leader inherit waiter", leaderIntent: "memory", waiter: nil},
+		{name: "off leader memory waiter", leaderIntent: "off", waiter: map[string]string{"kuasar-sandbox.restore": `{"prefetch":"memory"}`}},
+		{name: "memory leader off waiter", leaderIntent: "memory", waiter: map[string]string{"kuasar-sandbox.restore": `{"prefetch":"off"}`}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rt := &Router{reserveInFlight: map[string]*reserveFlight{}}
+			flight := &reserveFlight{
+				done: make(chan struct{}), restoreIntent: tc.leaderIntent, res: result,
+			}
+			close(flight.done)
+			rt.reserveInFlight[routeCacheKey("/g", "rk")] = flight
+			if _, err := rt.reserveByKey(context.Background(), "/g", "rk", tc.waiter); !errors.Is(err, errReserveRestoreConflict) {
+				t.Fatalf("reserveByKey error=%v, want restore conflict", err)
+			}
+		})
+	}
+
+	rt := &Router{reserveInFlight: map[string]*reserveFlight{}}
+	flight := &reserveFlight{done: make(chan struct{}), restoreIntent: "off", res: result}
+	close(flight.done)
+	rt.reserveInFlight[routeCacheKey("/g", "rk")] = flight
+	got, err := rt.reserveByKey(context.Background(), "/g", "rk", map[string]string{
+		"kuasar-sandbox.restore": `{"prefetch":"off"}`,
+	})
+	if err != nil || got != result {
+		t.Fatalf("compatible disabled waiter did not join: result=%+v err=%v", got, err)
 	}
 }
 

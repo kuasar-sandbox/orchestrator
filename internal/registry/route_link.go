@@ -22,6 +22,8 @@ const (
 	RouteLinkBuildPath        = "/route-link/build"         // GET  ?group=&build_id=  -> BuildReserveResult (resolve)
 	RouteLinkListPath         = "/route-link/list"          // GET  ?group=            -> the group's sandbox shard
 	RouteLinkVerifyKeyPath    = "/route-link/verify-key"    // GET  ?group=&api_key=   -> 200 valid / 403 invalid
+	RouteLinkErrorHeader      = "X-Kuasar-Route-Link-Error"
+	RouteLinkRestoreConflict  = "restore-policy-conflict"
 )
 
 // RouteResolve is the data-plane forwarding target the router needs for a sid
@@ -169,6 +171,9 @@ func (r *Registry) serveReserve(w http.ResponseWriter, req *http.Request) {
 		status := http.StatusServiceUnavailable
 		if errors.Is(err, ErrTemplateRestoreConflict) {
 			status = http.StatusBadRequest
+		} else if errors.Is(err, errReserveRestoreConflict) {
+			status = http.StatusConflict
+			w.Header().Set(RouteLinkErrorHeader, RouteLinkRestoreConflict)
 		}
 		http.Error(w, err.Error(), status)
 		return

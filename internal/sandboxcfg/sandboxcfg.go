@@ -178,6 +178,34 @@ func NormalizeRestoreMetadata(meta map[string]string) (map[string]string, error)
 	return out, nil
 }
 
+// RestorePrefetchMode returns the concrete prefetch mode. An absent namespace,
+// an empty object, and explicit off all resolve to the default disabled mode.
+func RestorePrefetchMode(meta map[string]string) (string, error) {
+	raw, ok := meta[NsRestore]
+	if !ok {
+		return string(rtconfig.PrefetchOff), nil
+	}
+	restore, err := parseRestore(raw)
+	if err != nil {
+		return "", err
+	}
+	mode, err := rtconfig.ParsePrefetchMode(restore.Prefetch)
+	if err != nil {
+		return "", err
+	}
+	return string(mode), nil
+}
+
+// RestorePrefetchIntent preserves whether a create request omitted the restore
+// namespace and therefore intends to inherit a template default. A present
+// empty object and explicit off both select the concrete disabled mode.
+func RestorePrefetchIntent(meta map[string]string) (string, error) {
+	if _, ok := meta[NsRestore]; !ok {
+		return "inherit", nil
+	}
+	return RestorePrefetchMode(meta)
+}
+
 func parseRestore(raw string) (RestoreSpec, error) {
 	var restore RestoreSpec
 	trimmed := strings.TrimSpace(raw)

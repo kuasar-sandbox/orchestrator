@@ -43,6 +43,8 @@ const (
 	HeaderAccessTok = "X-Access-Token"
 )
 
+var errReserveRestoreConflict = errors.New("router: concurrent reserve uses a different restore policy")
+
 // reserveResult / routeResolve mirror registry route_link JSON.
 type reserveResult struct {
 	NodeID             string `json:"node_id"`
@@ -115,9 +117,10 @@ type Router struct {
 }
 
 type reserveFlight struct {
-	done chan struct{}
-	res  *reserveResult
-	err  error
+	done          chan struct{}
+	restoreIntent string
+	res           *reserveResult
+	err           error
 }
 
 type routeRegistry interface {
@@ -281,9 +284,16 @@ func (rt *Router) handleCreate(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		rt.log.Warn("router: reserve", "group", group, "err", err)
 		status := http.StatusServiceUnavailable
+		if errors.Is(err, errReserveRestoreConflict) {
+			status = http.StatusConflict
+		}
 		var routeErr *routeLinkCallError
-		if errors.As(err, &routeErr) && routeErr.status == http.StatusBadRequest {
-			status = http.StatusBadRequest
+		if errors.As(err, &routeErr) {
+			if routeErr.status == http.StatusBadRequest {
+				status = http.StatusBadRequest
+			} else if routeErr.status == http.StatusConflict && routeErr.kind == registry.RouteLinkRestoreConflict {
+				status = http.StatusConflict
+			}
 		}
 		http.Error(w, err.Error(), status)
 		return
@@ -1032,9 +1042,17 @@ func (rt *Router) routeLinkReserve(ctx context.Context, group, routeKey string, 
 }
 
 func (rt *Router) reserveByKey(ctx context.Context, group, routeKey string, config map[string]string) (*reserveResult, error) {
+	restoreIntent, err := sandboxcfg.RestorePrefetchIntent(config)
+	if err != nil {
+		return nil, err
+	}
 	key := routeCacheKey(group, routeKey)
 	rt.reserveMu.Lock()
 	if f := rt.reserveInFlight[key]; f != nil {
+		if f.restoreIntent != restoreIntent {
+			rt.reserveMu.Unlock()
+			return nil, errReserveRestoreConflict
+		}
 		rt.reserveMu.Unlock()
 		select {
 		case <-f.done:
@@ -1043,7 +1061,7 @@ func (rt *Router) reserveByKey(ctx context.Context, group, routeKey string, conf
 			return nil, ctx.Err()
 		}
 	}
-	f := &reserveFlight{done: make(chan struct{})}
+	f := &reserveFlight{done: make(chan struct{}), restoreIntent: restoreIntent}
 	rt.reserveInFlight[key] = f
 	rt.reserveMu.Unlock()
 
@@ -1121,13 +1139,17 @@ func (rt *Router) routeLinkCall(ctx context.Context, group, method, path string,
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return &routeLinkCallError{status: resp.StatusCode, path: path, response: resp.Status, body: strings.TrimSpace(string(b))}
+		return &routeLinkCallError{
+			status: resp.StatusCode, kind: resp.Header.Get(registry.RouteLinkErrorHeader),
+			path: path, response: resp.Status, body: strings.TrimSpace(string(b)),
+		}
 	}
 	return json.NewDecoder(resp.Body).Decode(out)
 }
 
 type routeLinkCallError struct {
 	status   int
+	kind     string
 	path     string
 	response string
 	body     string
@@ -1177,7 +1199,7 @@ func (rt *Router) routeLinkHTTPOnce(ctx context.Context, group, method, path str
 			last = err
 			continue
 		}
-		if routeLinkRetryableStatus(resp.StatusCode) {
+		if routeLinkRetryableResponse(resp) {
 			if i+1 >= len(eps) {
 				return resp, nil, true
 			}
@@ -1196,6 +1218,17 @@ func (rt *Router) routeLinkHTTPOnce(ctx context.Context, group, method, path str
 
 func routeLinkRetryableStatus(status int) bool {
 	return status == http.StatusConflict || status >= 500
+}
+
+func routeLinkRetryableResponse(resp *http.Response) bool {
+	if resp == nil {
+		return false
+	}
+	if resp.StatusCode == http.StatusConflict &&
+		resp.Header.Get(registry.RouteLinkErrorHeader) == registry.RouteLinkRestoreConflict {
+		return false
+	}
+	return routeLinkRetryableStatus(resp.StatusCode)
 }
 
 // --- local route cache ---

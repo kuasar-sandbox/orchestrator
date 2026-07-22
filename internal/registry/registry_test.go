@@ -1212,6 +1212,124 @@ func TestReserveSandboxRejectsInvalidRestoreBeforePlacement(t *testing.T) {
 	}
 }
 
+func TestReserveSandboxKeepsRestorePolicyDistinctAcrossFlights(t *testing.T) {
+	result := &ReserveResult{SID: "s1", NodeID: "n1", DataEndpoint: "node:1"}
+	for _, tc := range []struct {
+		name         string
+		leaderIntent string
+		waiter       map[string]string
+	}{
+		{name: "inherit leader off waiter", leaderIntent: "inherit", waiter: map[string]string{sandboxcfg.NsRestore: `{"prefetch":"off"}`}},
+		{name: "off leader inherit waiter", leaderIntent: "off", waiter: nil},
+		{name: "inherit leader memory waiter", leaderIntent: "inherit", waiter: map[string]string{sandboxcfg.NsRestore: `{"prefetch":"memory"}`}},
+		{name: "memory leader inherit waiter", leaderIntent: "memory", waiter: nil},
+		{name: "off leader memory waiter", leaderIntent: "off", waiter: map[string]string{sandboxcfg.NsRestore: `{"prefetch":"memory"}`}},
+		{name: "memory leader off waiter", leaderIntent: "memory", waiter: map[string]string{sandboxcfg.NsRestore: `{"prefetch":"off"}`}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reg := testReg(t)
+			call := &reserveCall{
+				done: make(chan struct{}), restoreIntent: tc.leaderIntent, result: result,
+			}
+			close(call.done)
+			reg.inflight[flightKey("/g", "rk")] = call
+			if _, err := reg.ReserveSandbox(context.Background(), "/g", "rk", tc.waiter); !errors.Is(err, errReserveRestoreConflict) {
+				t.Fatalf("ReserveSandbox error=%v, want restore conflict", err)
+			}
+		})
+	}
+
+	reg := testReg(t)
+	call := &reserveCall{done: make(chan struct{}), restoreIntent: "off", result: result}
+	close(call.done)
+	reg.inflight[flightKey("/g", "rk")] = call
+	got, err := reg.ReserveSandbox(context.Background(), "/g", "rk", map[string]string{
+		sandboxcfg.NsRestore: `{}`,
+	})
+	if err != nil || got != result {
+		t.Fatalf("compatible disabled waiter did not join: result=%+v err=%v", got, err)
+	}
+}
+
+type blockingRuntimeOwner struct {
+	*remoteRouteWriteOwner
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (o *blockingRuntimeOwner) Runtime(ctx context.Context, nodeID string) (*NodeRecord, bool, error) {
+	close(o.entered)
+	select {
+	case <-o.release:
+		return o.remoteRouteWriteOwner.Runtime(ctx, nodeID)
+	case <-ctx.Done():
+		return nil, false, ctx.Err()
+	}
+}
+
+func TestReserveSandboxReadyFastPathRechecksRestoreFlight(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		flightIntent string
+		waiter       map[string]string
+	}{
+		{name: "inherit flight off waiter", flightIntent: "inherit", waiter: map[string]string{sandboxcfg.NsRestore: `{"prefetch":"off"}`}},
+		{name: "off flight inherit waiter", flightIntent: "off", waiter: nil},
+		{name: "inherit flight memory waiter", flightIntent: "inherit", waiter: map[string]string{sandboxcfg.NsRestore: `{"prefetch":"memory"}`}},
+		{name: "memory flight inherit waiter", flightIntent: "memory", waiter: nil},
+		{name: "off flight memory waiter", flightIntent: "off", waiter: map[string]string{sandboxcfg.NsRestore: `{"prefetch":"memory"}`}},
+		{name: "memory flight off waiter", flightIntent: "memory", waiter: map[string]string{sandboxcfg.NsRestore: `{"prefetch":"off"}`}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			reg := testReg(t)
+			if _, err := reg.stores.PutSandbox(ctx, &SandboxRecord{
+				Group: "/g", RouteKey: "rk", SID: "sb-ready", State: StateReady, NodeID: "n1",
+			}); err != nil {
+				t.Fatal(err)
+			}
+			owner := &blockingRuntimeOwner{
+				remoteRouteWriteOwner: &remoteRouteWriteOwner{node: &NodeRecord{NodeID: "n1", DataEndpoint: "node:1"}},
+				entered:               make(chan struct{}),
+				release:               make(chan struct{}),
+			}
+			reg.SetNodeOwner(owner)
+
+			type outcome struct {
+				res *ReserveResult
+				err error
+			}
+			done := make(chan outcome, 1)
+			go func() {
+				res, err := reg.ReserveSandbox(ctx, "/g", "rk", tc.waiter)
+				done <- outcome{res: res, err: err}
+			}()
+
+			select {
+			case <-owner.entered:
+			case <-ctx.Done():
+				t.Fatal("ReserveSandbox did not enter READY runtime check")
+			}
+			reg.mu.Lock()
+			reg.inflight[flightKey("/g", "rk")] = &reserveCall{
+				done: make(chan struct{}), restoreIntent: tc.flightIntent,
+			}
+			reg.mu.Unlock()
+			close(owner.release)
+
+			select {
+			case got := <-done:
+				if got.res != nil || !errors.Is(got.err, errReserveRestoreConflict) {
+					t.Fatalf("ReserveSandbox result=%+v error=%v, want restore conflict", got.res, got.err)
+				}
+			case <-ctx.Done():
+				t.Fatal("ReserveSandbox did not complete after runtime check")
+			}
+		})
+	}
+}
+
 func TestReserveSandboxCreateUsesRemoteNodeOwner(t *testing.T) {
 	ctx := context.Background()
 	reg := New(NewStores(), placementWithToken("n-remote"), time.Second, slog.New(slog.NewTextHandler(io.Discard, nil)))
