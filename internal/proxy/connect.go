@@ -19,6 +19,10 @@ import (
 
 const sandboxConnectHandshakeTimeout = 10 * time.Second
 
+func sandboxConnectHandshakeContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(ctx, sandboxConnectHandshakeTimeout)
+}
+
 // This file adds CONNECT tunneling to the data plane: a client opens a raw TCP
 // stream to a sandbox port. Per the data-plane model the CONNECT target HOST is
 // ignored (it is uniformly the sandbox's floating IP) and only the PORT is honored;
@@ -189,11 +193,13 @@ func WriteSandboxConnect(w io.Writer, request SandboxConnectRequest) error {
 // DialSandboxConnect dials addr and performs WriteSandboxConnect. The caller owns
 // conn and must close it unless it passes the connection to Tunnel/TunnelBuffered.
 func DialSandboxConnect(ctx context.Context, network, addr string, request SandboxConnectRequest) (net.Conn, *bufio.Reader, *http.Response, error) {
-	conn, err := (&net.Dialer{}).DialContext(ctx, network, addr)
+	handshakeCtx, cancel := sandboxConnectHandshakeContext(ctx)
+	defer cancel()
+	conn, err := (&net.Dialer{}).DialContext(handshakeCtx, network, addr)
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	return sandboxConnect(ctx, conn, request)
+	return sandboxConnect(handshakeCtx, conn, request)
 }
 
 func DialSandboxConnectTLS(
@@ -205,7 +211,9 @@ func DialSandboxConnectTLS(
 	if config == nil {
 		return nil, nil, nil, errors.New("proxy: node TLS config is required")
 	}
-	raw, err := (&net.Dialer{}).DialContext(ctx, "tcp", addr)
+	handshakeCtx, cancel := sandboxConnectHandshakeContext(ctx)
+	defer cancel()
+	raw, err := (&net.Dialer{}).DialContext(handshakeCtx, "tcp", addr)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -220,11 +228,11 @@ func DialSandboxConnectTLS(
 		clientConfig.ServerName = host
 	}
 	conn := tls.Client(raw, clientConfig)
-	if err := conn.HandshakeContext(ctx); err != nil {
+	if err := conn.HandshakeContext(handshakeCtx); err != nil {
 		conn.Close()
 		return nil, nil, nil, err
 	}
-	return sandboxConnect(ctx, conn, request)
+	return sandboxConnect(handshakeCtx, conn, request)
 }
 
 func sandboxConnect(ctx context.Context, conn net.Conn, request SandboxConnectRequest) (net.Conn, *bufio.Reader, *http.Response, error) {

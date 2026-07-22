@@ -44,6 +44,9 @@ const (
 	pendingBuildPollInterval = 50 * time.Millisecond
 	pendingBuildForwardWait  = 30 * time.Second
 	maxRouteKeyBytes         = 4 << 10
+	nodeControlDialTimeout   = 5 * time.Second
+	nodeControlTLSTimeout    = 5 * time.Second
+	nodeControlHeaderTimeout = 30 * time.Second
 )
 
 var errRouteNotFound = errors.New("finalrouter: Route does not exist")
@@ -140,6 +143,7 @@ func New(control ControlPlane, authorizer CallerAuthorizer, domain string, authT
 	if log == nil {
 		log = slog.Default()
 	}
+	nodeDialer := &net.Dialer{Timeout: nodeControlDialTimeout, KeepAlive: 30 * time.Second}
 	return &Router{
 		control: control, authorizer: authorizer, domain: domain, log: log, mx: metrics.New(),
 		authMode: "enforce", dataPlaneAuth: "enforce", authTTL: authTTL,
@@ -149,7 +153,10 @@ func New(control ControlPlane, authorizer CallerAuthorizer, domain string, authT
 		routeRevisionRefs: make(map[string]uint32), builds: make(map[string]*buildEntry),
 		flights: make(map[string]*reserveFlight),
 		forward: &http.Transport{
+			DialContext:  nodeDialer.DialContext,
 			MaxIdleConns: 512, MaxIdleConnsPerHost: 64, IdleConnTimeout: 90 * time.Second,
+			TLSHandshakeTimeout: nodeControlTLSTimeout, ResponseHeaderTimeout: nodeControlHeaderTimeout,
+			ExpectContinueTimeout: time.Second,
 		},
 	}, nil
 }
@@ -1449,6 +1456,10 @@ func (r *Router) authorize(w http.ResponseWriter, ctx context.Context, group, ke
 	}
 	ok, err := r.verifyCaller(ctx, group, key)
 	if err != nil {
+		if r.authMode == "log" {
+			r.log.Warn("Router caller authorization unavailable in log mode", "group", group, "error", err)
+			return true
+		}
 		http.Error(w, "caller authorization unavailable", http.StatusServiceUnavailable)
 		return false
 	}

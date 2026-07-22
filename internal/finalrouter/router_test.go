@@ -478,11 +478,51 @@ func (allowCaller) Verify(context.Context, string, string) (bool, error) { retur
 type recordingAuthorizer struct {
 	calls int
 	allow bool
+	err   error
 }
 
 func (a *recordingAuthorizer) Verify(context.Context, string, string) (bool, error) {
 	a.calls++
-	return a.allow, nil
+	return a.allow, a.err
+}
+
+func TestNodeControlTransportHasBoundedPhases(t *testing.T) {
+	router, err := New(&revisionControl{}, allowCaller{}, "example.test", time.Minute, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if router.forward.DialContext == nil || router.forward.TLSHandshakeTimeout != nodeControlTLSTimeout ||
+		router.forward.ResponseHeaderTimeout != nodeControlHeaderTimeout ||
+		router.forward.ExpectContinueTimeout <= 0 {
+		t.Fatalf("unbounded node transport: %+v", router.forward)
+	}
+}
+
+func TestCallerAuthorizationFailureRespectsMode(t *testing.T) {
+	for _, test := range []struct {
+		mode       string
+		wantAllow  bool
+		wantStatus int
+	}{
+		{mode: "log", wantAllow: true, wantStatus: http.StatusOK},
+		{mode: "enforce", wantStatus: http.StatusServiceUnavailable},
+	} {
+		t.Run(test.mode, func(t *testing.T) {
+			authorizer := &recordingAuthorizer{err: errors.New("Provider unavailable")}
+			router, err := New(&revisionControl{}, authorizer, "example.test", time.Minute, slog.Default())
+			if err != nil {
+				t.Fatal(err)
+			}
+			router.SetAuthMode(test.mode)
+			response := httptest.NewRecorder()
+			if got := router.authorize(response, context.Background(), "/group", "key"); got != test.wantAllow {
+				t.Fatalf("authorize = %v, want %v", got, test.wantAllow)
+			}
+			if response.Code != test.wantStatus || authorizer.calls != 1 {
+				t.Fatalf("authorization response = %d calls=%d", response.Code, authorizer.calls)
+			}
+		})
+	}
 }
 
 func routerTestPresentation() clusterstate.SandboxPresentationV1 {
