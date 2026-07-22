@@ -87,6 +87,9 @@ func (r Registration) Validate() error {
 		r.LoadModelVersion == 0 || r.SandboxSlots == 0 {
 		return errors.New("session: incomplete node registration")
 	}
+	if err := cluster.ValidateTCPDataEndpoint(r.DataEndpoint); err != nil {
+		return err
+	}
 	if r.LoadModelVersion != placement.LoadModelVersion {
 		return errors.New("session: unsupported placement load model version")
 	}
