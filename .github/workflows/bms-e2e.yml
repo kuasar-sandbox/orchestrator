@@ -84,9 +84,63 @@ jobs:
           fi
 
           "${privileged[@]}" systemctl stop 'sandbox-runner@*.service' 'sandbox-builder@*.service'
-          if ip link show sb-tap0 >/dev/null 2>&1; then
-            "${privileged[@]}" ip link del sb-tap0
-          fi
+
+          # A cancelled job does not run the shell EXIT traps in the E2E
+          # scripts. Reset only the fixed resources owned by this dedicated
+          # runner slot before the next canonical make test-e2e invocation.
+          suite_netns=(
+            e2e_cluster_sw e2e_proxy e2e_proxy_int e2e_sw e2ebld_sw
+            gw_ns mgmt_ns port_ns port_ns_a port_ns_b sandbox1 sandbox2
+            sw0 sw1 sw-a sw-b sw_ns sw_ns_a sw_ns_b swbld swmix swtap
+          )
+          for ns in "${suite_netns[@]}"; do
+            if "${privileged[@]}" ip netns list | awk '{print $1}' | grep -Fxq "$ns"; then
+              mapfile -t ns_pids < <("${privileged[@]}" ip netns pids "$ns")
+              if [ "${#ns_pids[@]}" -gt 0 ]; then
+                "${privileged[@]}" kill -TERM "${ns_pids[@]}" 2>/dev/null || true
+                sleep 0.2
+                "${privileged[@]}" kill -KILL "${ns_pids[@]}" 2>/dev/null || true
+              fi
+              "${privileged[@]}" ip netns del "$ns" 2>/dev/null || true
+            fi
+          done
+
+          suite_links=(
+            e2eih0 e2eph0 gw-transit sb-tap0 sw-transit sw-transit-a
+            sw-transit-b sw0m0 swbldm0
+          )
+          for link in "${suite_links[@]}"; do
+            if "${privileged[@]}" ip link show "$link" >/dev/null 2>&1; then
+              "${privileged[@]}" ip link del "$link" 2>/dev/null || true
+            fi
+          done
+
+          suite_switches=(sw0 sw1 sw-a sw-b swbld swmix swtap)
+          for switch in "${suite_switches[@]}"; do
+            "${privileged[@]}" rm -rf "/sys/fs/bpf/$switch"
+          done
+
+          reset_failed=0
+          for ns in "${suite_netns[@]}"; do
+            if "${privileged[@]}" ip netns list | awk '{print $1}' | grep -Fxq "$ns"; then
+              echo "failed to reset E2E network namespace: $ns" >&2
+              reset_failed=1
+            fi
+          done
+          for link in "${suite_links[@]}"; do
+            if "${privileged[@]}" ip link show "$link" >/dev/null 2>&1; then
+              echo "failed to reset E2E link: $link" >&2
+              reset_failed=1
+            fi
+          done
+          for switch in "${suite_switches[@]}"; do
+            if "${privileged[@]}" test -e "/sys/fs/bpf/$switch"; then
+              echo "failed to reset E2E BPF pins: $switch" >&2
+              reset_failed=1
+            fi
+          done
+          [ "$reset_failed" -eq 0 ]
+
           "${privileged[@]}" rm -f \
             /run/systemd/system/sandbox-runner@.service \
             /run/systemd/system/sandbox-builder@.service \
