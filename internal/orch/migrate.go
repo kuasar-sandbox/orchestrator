@@ -6,8 +6,8 @@ package orch
 // node. Both ride existing sandbox-ctl primitives (snapshot --upload /
 // upload-snapshot / run --restore) + the e2b CLI (create / resume); nothing about
 // the e2b API/CLI changes. The token carries the sandbox row minus system
-// secrets: the ManifestKey appears only as a fingerprint. The target resolves
-// both independent keys from an active node key lease.
+// secrets: AuthKey and ManifestKey appear only as fingerprints. The target
+// resolves both independent keys from an active node key lease.
 
 import (
 	"context"
@@ -15,6 +15,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -34,17 +35,18 @@ const sandboxTokenVersion = 1
 
 // SandboxToken is the portable, base64-encoded migration handle from export-sandbox.
 // It carries portable snapshot state but no sandbox identity or data-plane
-// credentials. manifest_key is represented by a fingerprint only.
+// credentials. Both key domains are represented by fingerprints only.
 type SandboxToken struct {
-	V             int               `json:"v"`
-	TemplateID    string            `json:"template_id"`
-	SnapshotRef   string            `json:"snapshot_ref"` // manifest://<key> (always remote)
-	Profile       string            `json:"profile"`
-	Env           map[string]string `json:"env,omitempty"`
-	Metadata      map[string]string `json:"metadata,omitempty"`
-	DeadlineUnix  int64             `json:"deadline_unix,omitempty"`
-	MKFingerprint string            `json:"mk_fingerprint"` // hex SHA256(manifest_key)[:12]; NOT the key
-	RuntimeDigest string            `json:"runtime_digest"` // sha256 of the profile's guest runtime erofs
+	V                      int               `json:"v"`
+	TemplateID             string            `json:"template_id"`
+	SnapshotRef            string            `json:"snapshot_ref"` // manifest://<key> (always remote)
+	Profile                string            `json:"profile"`
+	Env                    map[string]string `json:"env,omitempty"`
+	Metadata               map[string]string `json:"metadata,omitempty"`
+	DeadlineUnix           int64             `json:"deadline_unix,omitempty"`
+	AuthKeyFingerprint     string            `json:"auth_key_fingerprint"`
+	ManifestKeyFingerprint string            `json:"manifest_key_fingerprint"`
+	RuntimeDigest          string            `json:"runtime_digest"` // sha256 of the profile's guest runtime erofs
 }
 
 // ExportSandbox authorizes apiKey against the paused sandbox, ensures its snapshot
@@ -122,12 +124,19 @@ func (o *Orchestrator) mintSandboxToken(sb *types.Sandbox, ref string) (string, 
 	if err != nil {
 		return "", fmt.Errorf("mint token: hash runtime: %w", err)
 	}
-	rawMK, _ := hex.DecodeString(sb.ManifestKey)
+	authFingerprint, err := migrationKeyFingerprint(sb.AuthKey)
+	if err != nil {
+		return "", fmt.Errorf("mint token: AuthKey: %w", err)
+	}
+	manifestFingerprint, err := migrationKeyFingerprint(sb.ManifestKey)
+	if err != nil {
+		return "", fmt.Errorf("mint token: ManifestKey: %w", err)
+	}
 	b, err := json.Marshal(SandboxToken{
 		V: sandboxTokenVersion, TemplateID: sb.TemplateID, SnapshotRef: ref,
 		Profile: string(tmpl.Profile), Env: sb.Env, Metadata: clusterstate.WithoutSystemMetadata(sb.Metadata),
-		DeadlineUnix:  sb.DeadlineUnix,
-		MKFingerprint: hex.EncodeToString(apikey.Fingerprint(rawMK)), RuntimeDigest: dig,
+		DeadlineUnix: sb.DeadlineUnix, AuthKeyFingerprint: authFingerprint,
+		ManifestKeyFingerprint: manifestFingerprint, RuntimeDigest: dig,
 	})
 	if err != nil {
 		return "", err
@@ -153,21 +162,26 @@ func (o *Orchestrator) ImportSandbox(ctx context.Context, apiKey, token string) 
 	return o.importSandboxWithKeys(ctx, lease.AuthKey, lease.ManifestKey, token)
 }
 
-// importSandboxWithKeys decodes a migration token, checks its fingerprint against
-// the resolved ManifestKey and that this node's guest runtime matches the
-// snapshot's, then inserts the paused row (the caller resumes). The cluster create
-// path supplies both keys from the predistributed lease; the SDK path resolves it.
+// importSandboxWithKeys decodes a migration token, checks its ownership and
+// content fingerprints against the resolved keys, and verifies that the guest
+// runtime matches the snapshot's. It then inserts the paused row for the caller
+// to resume. The cluster create path supplies both keys from the predistributed
+// lease; the SDK path resolves them.
 func (o *Orchestrator) importSandboxWithKeys(ctx context.Context, authKey, manifestKey, token string) (string, error) {
 	raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(token))
 	if err != nil {
 		return "", fmt.Errorf("import-sandbox: bad token: %w", err)
 	}
 	var tok SandboxToken
-	if err := json.Unmarshal(raw, &tok); err != nil || tok.TemplateID == "" || tok.SnapshotRef == "" || tok.Profile == "" {
+	if err := json.Unmarshal(raw, &tok); err != nil || tok.V != sandboxTokenVersion ||
+		tok.TemplateID == "" || tok.SnapshotRef == "" || tok.Profile == "" {
 		return "", fmt.Errorf("import-sandbox: bad token (template_id/snapshot_ref/profile missing)")
 	}
-	rawMK, _ := hex.DecodeString(manifestKey)
-	if hex.EncodeToString(apikey.Fingerprint(rawMK)) != tok.MKFingerprint {
+	authFingerprint, authErr := migrationKeyFingerprint(authKey)
+	manifestFingerprint, manifestErr := migrationKeyFingerprint(manifestKey)
+	if authErr != nil || manifestErr != nil ||
+		authFingerprint != tok.AuthKeyFingerprint ||
+		manifestFingerprint != tok.ManifestKeyFingerprint {
 		return "", fmt.Errorf("import-sandbox: token is for a different tenant")
 	}
 	// The snapshot is bound to the guest runtime it was captured under; a different
@@ -211,6 +225,14 @@ func (o *Orchestrator) importSandboxWithKeys(ctx context.Context, authKey, manif
 		return "", err
 	}
 	return sb.ID, nil
+}
+
+func migrationKeyFingerprint(value string) (string, error) {
+	raw, err := hex.DecodeString(value)
+	if err != nil || len(raw) != 32 || hex.EncodeToString(raw) != value {
+		return "", errors.New("key must be canonical 32-byte hexadecimal material")
+	}
+	return hex.EncodeToString(apikey.Fingerprint(raw)), nil
 }
 
 // runtimeFileFor returns the guest runtime erofs path.
