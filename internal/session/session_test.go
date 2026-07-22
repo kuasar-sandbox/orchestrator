@@ -1125,7 +1125,7 @@ func testDispatchCommand(t *testing.T, registration Registration) DispatchComman
 		t.Fatal(err)
 	}
 	lease := testKeyLease()
-	request, err := cluster.NewNodeRequestEnvelopeV1(http.MethodPost, "/sandboxes", "", nil, []byte(`{"templateID":"e2b-img-`+strings.Repeat("c", 64)+`"}`))
+	request, err := cluster.NewNodeRequestEnvelopeV1(http.MethodPost, "/sandboxes", "", nil, []byte(`{"metadata":null,"templateID":"e2b-img-`+strings.Repeat("c", 64)+`","timeout":0}`))
 	if err != nil {
 		t.Fatal(err)
 	}
