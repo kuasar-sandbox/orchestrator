@@ -32,7 +32,8 @@ func (h *Holder) InstallKeyLease(
 		return ref, false, err
 	}
 	if lease.ExpiresUnix <= h.clock().Unix() {
-		return ref, false, errors.New("session: cannot install an expired key lease")
+		return ref, false, errors.Join(ErrDispatchNotSent, ErrKeyLeaseUnavailable,
+			errors.New("session: cannot install an expired key lease"))
 	}
 	if err := h.CheckServe(identity); err != nil {
 		return ref, false, err
@@ -44,6 +45,10 @@ func (h *Holder) InstallKeyLease(
 	defer operation.unlock()
 	if !operation.current() {
 		return ref, false, errors.Join(ErrDispatchNotSent, ErrKeyLeaseSuperseded)
+	}
+	if lease.ExpiresUnix <= h.clock().Unix() {
+		return ref, false, errors.Join(ErrDispatchNotSent, ErrKeyLeaseUnavailable,
+			errors.New("session: key lease expired while waiting for the command fence"))
 	}
 	operation.held.leaseMu.RLock()
 	installed := operation.held.keyLeases[operation.key]
@@ -183,7 +188,13 @@ func dispatchKeyLeaseID(command DispatchCommand) (string, error) {
 	default:
 		return "", errors.New("session: unsupported dispatch execution kind")
 	}
-	return keyLeaseID(command.Group, authFingerprint, manifestFingerprint), nil
+	if err := command.KeyLeaseRef.Validate(); err != nil ||
+		command.KeyLeaseRef.Group != command.Group ||
+		command.KeyLeaseRef.AuthKeyFingerprint != authFingerprint ||
+		command.KeyLeaseRef.ManifestKeyFingerprint != manifestFingerprint {
+		return "", errors.New("session: dispatch does not carry its exact acknowledged key lease")
+	}
+	return keyLeaseRefID(command.KeyLeaseRef), nil
 }
 
 func keyLeaseRef(lease routesync.NodeKeyLeaseV1) routesync.NodeKeyLeaseRefV1 {
