@@ -77,7 +77,7 @@ func TestRouteTombstoneCarriesExactExecutionFence(t *testing.T) {
 	binding := sha256.Sum256([]byte("binding"))
 	proof := TerminalProof{Kind: ProofNodeTerminal, FencedNodeID: "n1", FencedNodeEpoch: 7}
 	var err error
-	proof.ProofDigest, err = NodeTerminalProofDigest(proof, "g1", "s1", hexDigest(binding), 4)
+	proof.ProofDigest, err = NodeTerminalProofDigest(proof, "/g", "rk", "g1", "s1", hexDigest(binding), 4)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -93,6 +93,18 @@ func TestRouteTombstoneCarriesExactExecutionFence(t *testing.T) {
 	}
 	if err := record.Validate(); err != nil {
 		t.Fatal(err)
+	}
+	for name, mutate := range map[string]func(*RouteWorkflowRecord){
+		"group":     func(value *RouteWorkflowRecord) { value.Group = "/other" },
+		"route key": func(value *RouteWorkflowRecord) { value.RouteKey = "other" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			changed := record
+			mutate(&changed)
+			if err := changed.Validate(); err == nil {
+				t.Fatal("terminal proof was accepted for another Route identity")
+			}
+		})
 	}
 	for name, reason := range map[string]string{
 		"oversized":     strings.Repeat("x", MaxTerminalReasonBytes+1),
@@ -341,7 +353,7 @@ func TestExecutionFenceRequiresFinalOutboxCoverage(t *testing.T) {
 	}
 	bindingDigest := hexDigest(sha256.Sum256([]byte("binding")))
 	var err error
-	proof.ProofDigest, err = NodeTerminalProofDigest(proof, "g1", "sandbox-1", bindingDigest, 4)
+	proof.ProofDigest, err = NodeTerminalProofDigest(proof, "/g", "rk", "g1", "sandbox-1", bindingDigest, 4)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -359,6 +371,8 @@ func TestExecutionFenceRequiresFinalOutboxCoverage(t *testing.T) {
 		t.Fatal(err)
 	}
 	for name, mutate := range map[string]func(*ExecutionFence){
+		"group":     func(value *ExecutionFence) { value.Group = "/other" },
+		"route key": func(value *ExecutionFence) { value.RouteKey = "other" },
 		"sandbox":   func(value *ExecutionFence) { value.SandboxID = "sandbox-2" },
 		"binding":   func(value *ExecutionFence) { value.BindingDigest = hexDigest(sha256.Sum256([]byte("other"))) },
 		"watermark": func(value *ExecutionFence) { value.LastEventSeq++ },
@@ -382,7 +396,7 @@ func TestNewerNodeEpochProofIsBoundToExactExecutionState(t *testing.T) {
 	}
 	var err error
 	proof.ProofDigest, err = NewerNodeEpochProofDigest(
-		proof, ready.RegistryGeneration, ready.SandboxID, ready.BindingDigest, ready.LastEventSeq,
+		proof, "/g", "rk", ready.RegistryGeneration, ready.SandboxID, ready.BindingDigest, ready.LastEventSeq,
 	)
 	if err != nil {
 		t.Fatal(err)
