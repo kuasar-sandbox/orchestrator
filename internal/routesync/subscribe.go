@@ -20,10 +20,9 @@ type Sink interface {
 	BeginSync()
 	ApplyUpsert(r RouteEntry)
 	ApplyDelete(RouteDelete)
-	// Bookmark marks the initial route stream complete: the table is synced, and
-	// entries not seen since the matching BeginSync are dropped (deleted while
-	// disconnected).
-	Bookmark()
+	// Bookmark marks the initial route stream complete. A full snapshot drops
+	// entries not seen since BeginSync; an incremental replay preserves them.
+	Bookmark(fullSync bool)
 	SetPolicy(p Policy)
 }
 
@@ -167,7 +166,7 @@ func (s *Subscriber) apply(m *Msg) {
 		}
 		s.sink.ApplyDelete(*m.Delete)
 	case TypeBookmark:
-		s.sink.Bookmark()
+		s.sink.Bookmark(m.FullSync)
 	default:
 		s.log.Warn("routesync: unknown message", "type", m.Type)
 	}
