@@ -8,7 +8,9 @@ import (
 )
 
 type testRemoteSystemClient struct {
-	state SystemState
+	state       SystemState
+	applyErr    error
+	permitGrant *PermitGrant
 }
 
 func (c *testRemoteSystemClient) ReadSystemStrong(context.Context) (SystemState, error) {
@@ -18,15 +20,73 @@ func (c *testRemoteSystemClient) ReadSystemStrong(context.Context) (SystemState,
 func (c *testRemoteSystemClient) ApplySystem(_ context.Context, command SystemCommand) (SystemApplyResult, error) {
 	var result SystemApplyResult
 	c.state, result = ApplySystemCommand(c.state, c.state.LastApplied+1, command)
-	return result, nil
+	return result, c.applyErr
 }
 
 func (c *testRemoteSystemClient) RefreshPermit(ctx context.Context) (PermitGrant, error) {
+	if c.permitGrant != nil {
+		return *c.permitGrant, nil
+	}
 	result, err := c.ApplySystem(ctx, SystemCommand{Type: SystemRefreshPermit})
 	if err != nil || result.PermitGrant == nil {
 		return PermitGrant{}, errors.Join(err, errors.New("missing test Permit"))
 	}
 	return *result.PermitGrant, nil
+}
+
+func TestRemotePermitLifetimeMustMatchCommittedSystemState(t *testing.T) {
+	registryLayout := testRegistryLayout(1, "generation-1")
+	digest, _ := registryLayout.Digest()
+	state, _ := ApplySystemCommand(SystemState{}, 1, SystemCommand{
+		Type: SystemBootstrap, RegistryLayout: &registryLayout, Digest: digest,
+	})
+	grant := PermitGrant{
+		PermitIdentity: state.Identity(), CommitIndex: state.LastApplied,
+		MaxLifetimeMillis: state.ServePermitMaxMillis + 1,
+	}
+	runtime := &Runtime{
+		registryLayout: registryLayout, registryLayoutDigest: digest,
+		systemClient: &testRemoteSystemClient{state: state, permitGrant: &grant},
+		permitCache:  NewPermitCache(time.Now),
+	}
+	if _, err := runtime.RefreshPermit(context.Background()); err == nil {
+		t.Fatal("remote Permit with an uncommitted lifetime was accepted")
+	}
+}
+
+func TestBeginTransitionResolvesCommittedProposalError(t *testing.T) {
+	previous := testRegistryLayout(1, "generation-1")
+	previousDigest, _ := previous.Digest()
+	next := previous
+	next.RegistryLayoutVersion = 2
+	next.PreviousRegistryLayoutVersion = previous.RegistryLayoutVersion
+	next.PreviousRegistryLayoutDigest = previousDigest
+	nextDigest, err := next.Digest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, _ := ApplySystemCommand(SystemState{}, 1, SystemCommand{
+		Type: SystemBootstrap, RegistryLayout: &previous, Digest: previousDigest,
+	})
+	client := &testRemoteSystemClient{state: state, applyErr: context.DeadlineExceeded}
+	runtime := &Runtime{
+		registryLayout: next, registryLayoutDigest: nextDigest, systemClient: client,
+		permitCache: NewPermitCache(time.Now),
+	}
+	transition := &RegistryLayoutTransition{
+		Version: next.RegistryLayoutVersion, Digest: nextDigest, PreviousDigest: previousDigest, NextSystemEpoch: 2,
+		Shards: []ShardTransition{
+			{ShardID: ^uint32(0), Stage: TransitionPending},
+			{ShardID: 0, Stage: TransitionPending},
+		},
+	}
+	result, err := runtime.ApplySystem(context.Background(), SystemCommand{
+		Type: SystemBeginTransition, Transition: transition,
+	})
+	if err != nil || !result.Applied || client.state.Transition == nil ||
+		!sameTransitionIdentity(client.state.Transition, transition) {
+		t.Fatalf("ambiguous transition start = %+v, state=%+v, err=%v", result, client.state.Transition, err)
+	}
 }
 
 func TestDataOnlyRegistryUsesRemoteSystemGroupAndLocalBoundedPermit(t *testing.T) {

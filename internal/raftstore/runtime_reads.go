@@ -22,8 +22,35 @@ func (r *Runtime) ApplySystem(ctx context.Context, command SystemCommand) (Syste
 			command.Transition.Digest != r.registryLayoutDigest {
 			return SystemApplyResult{}, errors.New("raftstore: transition does not name the verified next registryLayout")
 		}
+		result, proposeErr := r.proposeSystem(ctx, command)
+		if proposeErr == nil && result.Applied && !result.Conflict {
+			return result, nil
+		}
+		resolveContext, cancelResolve := ambiguityResolutionContext(ctx)
+		defer cancelResolve()
+		current, readErr := r.ReadSystemStrong(resolveContext)
+		if readErr == nil && current.Transition != nil &&
+			sameTransitionIdentity(current.Transition, command.Transition) {
+			return SystemApplyResult{Applied: true}, nil
+		}
+		if proposeErr != nil {
+			return SystemApplyResult{}, proposeErr
+		}
+		if result.Conflict || !result.Applied {
+			return SystemApplyResult{}, errors.New(result.Reason)
+		}
+		if readErr != nil {
+			return SystemApplyResult{}, readErr
+		}
+		return SystemApplyResult{}, errors.New("raftstore: committed registryLayout transition was not visible")
 	}
 	return r.proposeSystem(ctx, command)
+}
+
+func sameTransitionIdentity(current, wanted *RegistryLayoutTransition) bool {
+	return current != nil && wanted != nil && current.Version == wanted.Version &&
+		current.Digest == wanted.Digest && current.PreviousDigest == wanted.PreviousDigest &&
+		current.NextSystemEpoch == wanted.NextSystemEpoch
 }
 
 // ConfigureServiceGates is the only public workflow for changing normal

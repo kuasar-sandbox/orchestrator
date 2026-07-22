@@ -13,6 +13,7 @@ import (
 	"reflect"
 	"sort"
 	"strconv"
+	"strings"
 )
 
 const (
@@ -87,19 +88,63 @@ func (m RegistryMember) Validate() error {
 	if m.MemberID == "" {
 		return errors.New("raftstore: member identity is required")
 	}
-	u, err := url.Parse(m.InternalEndpoint)
-	if err != nil || u.Scheme != "https" || u.Host == "" {
-		return errors.New("raftstore: member internal endpoint must be an HTTPS URL")
+	if _, err := canonicalInternalEndpoint(m.InternalEndpoint); err != nil {
+		return err
 	}
-	host, port, err := net.SplitHostPort(m.RaftEndpoint)
-	if err != nil {
-		return fmt.Errorf("raftstore: invalid member Raft endpoint: %w", err)
-	}
-	value, err := strconv.ParseUint(port, 10, 16)
-	if host == "" || err != nil || value == 0 {
-		return errors.New("raftstore: member Raft endpoint requires a host and numeric nonzero port")
+	if _, err := canonicalRaftEndpoint(m.RaftEndpoint); err != nil {
+		return err
 	}
 	return nil
+}
+
+func canonicalInternalEndpoint(endpoint string) (string, error) {
+	u, err := url.Parse(endpoint)
+	if err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil || u.Path != "" ||
+		u.RawPath != "" || u.RawQuery != "" || u.Fragment != "" || u.ForceQuery || u.Opaque != "" {
+		return "", errors.New("raftstore: member internal endpoint must be an HTTPS base URL")
+	}
+	host, err := canonicalEndpointHost(u.Hostname())
+	if err != nil {
+		return "", errors.New("raftstore: member internal endpoint has an invalid host")
+	}
+	port := uint64(443)
+	if text := u.Port(); text != "" {
+		port, err = strconv.ParseUint(text, 10, 16)
+		if err != nil || port == 0 {
+			return "", errors.New("raftstore: member internal endpoint requires a numeric nonzero port")
+		}
+	}
+	return "https://" + net.JoinHostPort(host, strconv.FormatUint(port, 10)), nil
+}
+
+func canonicalRaftEndpoint(endpoint string) (string, error) {
+	host, portText, err := net.SplitHostPort(endpoint)
+	if err != nil {
+		return "", fmt.Errorf("raftstore: invalid member Raft endpoint: %w", err)
+	}
+	host, err = canonicalEndpointHost(host)
+	if err != nil {
+		return "", errors.New("raftstore: member Raft endpoint has an invalid host")
+	}
+	port, err := strconv.ParseUint(portText, 10, 16)
+	if err != nil || port == 0 {
+		return "", errors.New("raftstore: member Raft endpoint requires a host and numeric nonzero port")
+	}
+	return net.JoinHostPort(host, strconv.FormatUint(port, 10)), nil
+}
+
+func canonicalEndpointHost(host string) (string, error) {
+	if host == "" || strings.Contains(host, "%") {
+		return "", errors.New("invalid endpoint host")
+	}
+	if address := net.ParseIP(host); address != nil {
+		return address.String(), nil
+	}
+	host = strings.TrimSuffix(strings.ToLower(host), ".")
+	if host == "" || strings.ContainsAny(host, " /?#[]:@") {
+		return "", errors.New("invalid endpoint host")
+	}
+	return host, nil
 }
 
 type ReplicaPlacement struct {
@@ -194,15 +239,17 @@ func (m RegistryLayout) validate(requireRolloverProof bool) error {
 		if _, found := members[member.MemberID]; found {
 			return errors.New("raftstore: duplicate member ID")
 		}
-		if _, found := internalEndpoints[member.InternalEndpoint]; found {
+		internalEndpoint, _ := canonicalInternalEndpoint(member.InternalEndpoint)
+		raftEndpoint, _ := canonicalRaftEndpoint(member.RaftEndpoint)
+		if _, found := internalEndpoints[internalEndpoint]; found {
 			return errors.New("raftstore: duplicate member internal endpoint")
 		}
-		if _, found := raftEndpoints[member.RaftEndpoint]; found {
+		if _, found := raftEndpoints[raftEndpoint]; found {
 			return errors.New("raftstore: duplicate member Raft endpoint")
 		}
 		members[member.MemberID] = member
-		internalEndpoints[member.InternalEndpoint] = struct{}{}
-		raftEndpoints[member.RaftEndpoint] = struct{}{}
+		internalEndpoints[internalEndpoint] = struct{}{}
+		raftEndpoints[raftEndpoint] = struct{}{}
 	}
 	if err := validateReplicaSet(m.SystemReplicas, members, m.ReplicationFactor); err != nil {
 		return fmt.Errorf("raftstore: System Group: %w", err)
@@ -288,9 +335,11 @@ func ValidateRegistryLayoutTransition(previous, next RegistryLayout) error {
 	previousInternalEndpoints := make(map[string]string, len(previous.Members))
 	previousRaftEndpoints := make(map[string]string, len(previous.Members))
 	for _, member := range previous.Members {
+		internalEndpoint, _ := canonicalInternalEndpoint(member.InternalEndpoint)
+		raftEndpoint, _ := canonicalRaftEndpoint(member.RaftEndpoint)
 		previousMembers[member.MemberID] = member
-		previousInternalEndpoints[member.InternalEndpoint] = member.MemberID
-		previousRaftEndpoints[member.RaftEndpoint] = member.MemberID
+		previousInternalEndpoints[internalEndpoint] = member.MemberID
+		previousRaftEndpoints[raftEndpoint] = member.MemberID
 	}
 	for _, member := range next.Members {
 		if retained, found := previousMembers[member.MemberID]; found {
@@ -299,7 +348,9 @@ func ValidateRegistryLayoutTransition(previous, next RegistryLayout) error {
 			}
 			continue
 		}
-		if previousInternalEndpoints[member.InternalEndpoint] != "" || previousRaftEndpoints[member.RaftEndpoint] != "" {
+		internalEndpoint, _ := canonicalInternalEndpoint(member.InternalEndpoint)
+		raftEndpoint, _ := canonicalRaftEndpoint(member.RaftEndpoint)
+		if previousInternalEndpoints[internalEndpoint] != "" || previousRaftEndpoints[raftEndpoint] != "" {
 			return errors.New("raftstore: replacement Registry member reused a predecessor endpoint")
 		}
 	}
