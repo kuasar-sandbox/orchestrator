@@ -26,7 +26,7 @@ func TestSandboxDispatchSpecRoundTripAndRejectsSystemMetadata(t *testing.T) {
 		Version: DispatchSpecVersionV1, TemplateRef: templateRef,
 		AuthKeyFingerprint: strings.Repeat("a", 24), ManifestKeyFingerprint: strings.Repeat("b", 24),
 		AccessToken: "capability", Config: map[string]string{"tenant": "value"},
-		Request: testNodeRequest(t, "/sandboxes", `{"templateID":"`+templateRef+`","envVars":{"FUTURE":"kept"},"metadata":{"tenant":"value"}}`),
+		Request: testNodeRequest(t, "/sandboxes", `{"templateID":"`+templateRef+`","timeout":0,"envVars":{"FUTURE":"kept"},"metadata":{"tenant":"value"}}`),
 	}
 	encoded, err := MarshalSandboxDispatchSpec(spec)
 	if err != nil {
@@ -48,12 +48,12 @@ func TestDispatchSpecRejectsReservedRequestMetadata(t *testing.T) {
 		Version: DispatchSpecVersionV1, TemplateRef: templateRef,
 		AuthKeyFingerprint: strings.Repeat("a", 24), ManifestKeyFingerprint: strings.Repeat("b", 24),
 		AccessToken: "capability",
-		Request:     testNodeRequest(t, "/sandboxes", `{"templateID":"`+templateRef+`","metadata":{"kuasar-sandbox.cluster":"forged"}}`),
+		Request:     testNodeRequest(t, "/sandboxes", `{"templateID":"`+templateRef+`","timeout":0,"metadata":{"kuasar-sandbox.cluster":"forged"}}`),
 	}
 	if _, err := MarshalSandboxDispatchSpec(spec); err == nil {
 		t.Fatal("system-owned request metadata accepted")
 	}
-	spec.Request = testNodeRequest(t, "/sandboxes", `{"templateID":"`+templateRef+`","Metadata":{"tenant":"value"}}`)
+	spec.Request = testNodeRequest(t, "/sandboxes", `{"templateID":"`+templateRef+`","timeout":0,"Metadata":{"tenant":"value"}}`)
 	if _, err := MarshalSandboxDispatchSpec(spec); err == nil {
 		t.Fatal("non-canonical metadata field accepted")
 	}
@@ -80,9 +80,35 @@ func TestSandboxDispatchSpecBindsReplayedTemplate(t *testing.T) {
 		})
 	}
 	valid := base
-	valid.Request = testNodeRequest(t, "/sandboxes", `{"templateID":"`+templateRef+`","future":true}`)
+	valid.Request = testNodeRequest(t, "/sandboxes", `{"templateID":"`+templateRef+`","timeout":0,"metadata":null,"future":true}`)
 	if _, err := MarshalSandboxDispatchSpec(valid); err != nil {
 		t.Fatalf("bound replay template: %v", err)
+	}
+}
+
+func TestSandboxDispatchSpecBindsReplayedTimeoutAndMetadata(t *testing.T) {
+	templateRef := "e2b-img-" + strings.Repeat("c", 64)
+	base := SandboxDispatchSpecV1{
+		Version: DispatchSpecVersionV1, TemplateRef: templateRef,
+		AuthKeyFingerprint: strings.Repeat("a", 24), ManifestKeyFingerprint: strings.Repeat("b", 24),
+		AccessToken: "capability", TimeoutSeconds: 30, Config: map[string]string{"tenant": "value"},
+		Request: testNodeRequest(t, "/sandboxes", `{"metadata":{"tenant":"value"},"templateID":"`+templateRef+`","timeout":30}`),
+	}
+	if _, err := MarshalSandboxDispatchSpec(base); err != nil {
+		t.Fatal(err)
+	}
+	for name, mutate := range map[string]func(*SandboxDispatchSpecV1){
+		"timeout":  func(spec *SandboxDispatchSpecV1) { spec.TimeoutSeconds++ },
+		"metadata": func(spec *SandboxDispatchSpecV1) { spec.Config["tenant"] = "changed" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			spec := base
+			spec.Config = map[string]string{"tenant": "value"}
+			mutate(&spec)
+			if _, err := MarshalSandboxDispatchSpec(spec); err == nil {
+				t.Fatal("mismatched replay field was accepted")
+			}
+		})
 	}
 }
 
@@ -91,7 +117,7 @@ func TestBuildDispatchSpecRequiresSeparateKeysAndResourceCeiling(t *testing.T) {
 		Version: DispatchSpecVersionV1, TemplateID: "transient-template",
 		AuthKeyFingerprint: strings.Repeat("a", 24), ManifestKeyFingerprint: strings.Repeat("b", 24),
 		Profile: types.ProfileE2B, CPUCount: 2, MemoryMB: 1024,
-		Request: testNodeRequest(t, "/v3/templates", `{"future":{"mode":"fast"},"cpuCount":2,"memoryMB":1024}`),
+		Request: testNodeRequest(t, "/v3/templates", `{"name":"","tags":null,"profile":"e2b","metadata":null,"future":{"mode":"fast"},"cpuCount":2,"memoryMB":1024}`),
 	}
 	encoded, err := MarshalBuildDispatchSpec(spec)
 	if err != nil {
@@ -136,8 +162,35 @@ func TestBuildDispatchSpecBindsReplayedResourceCeilings(t *testing.T) {
 		})
 	}
 	valid := base
-	valid.Request = testNodeRequest(t, "/v3/templates", `{"cpu_count":2,"memory_mb":1024,"future":true}`)
+	valid.Request = testNodeRequest(t, "/v3/templates", `{"name":"","tags":null,"profile":"e2b","metadata":null,"cpu_count":2,"memory_mb":1024,"future":true}`)
 	if _, err := MarshalBuildDispatchSpec(valid); err != nil {
 		t.Fatalf("canonical snake-case ceilings: %v", err)
+	}
+}
+
+func TestBuildDispatchSpecBindsAllReplayedRegistrationFields(t *testing.T) {
+	base := BuildDispatchSpecV1{
+		Version: DispatchSpecVersionV1, TemplateID: "transient-template",
+		AuthKeyFingerprint: strings.Repeat("a", 24), ManifestKeyFingerprint: strings.Repeat("b", 24),
+		Profile: types.ProfileBare, CPUCount: 2, MemoryMB: 1024,
+		Names: []string{"primary"}, Aliases: []string{"alias"}, Metadata: map[string]string{"tenant": "value"},
+		Request: testNodeRequest(t, "/v3/templates", `{"cpuCount":2,"memoryMB":1024,"metadata":{"tenant":"value"},"name":"primary","profile":"bare","tags":["alias"]}`),
+	}
+	if _, err := MarshalBuildDispatchSpec(base); err != nil {
+		t.Fatal(err)
+	}
+	for name, mutate := range map[string]func(*BuildDispatchSpecV1){
+		"profile":  func(spec *BuildDispatchSpecV1) { spec.Profile = types.ProfileE2B },
+		"name":     func(spec *BuildDispatchSpecV1) { spec.Names = []string{"changed"} },
+		"tags":     func(spec *BuildDispatchSpecV1) { spec.Aliases = []string{"changed"} },
+		"metadata": func(spec *BuildDispatchSpecV1) { spec.Metadata = map[string]string{"tenant": "changed"} },
+	} {
+		t.Run(name, func(t *testing.T) {
+			spec := base
+			mutate(&spec)
+			if _, err := MarshalBuildDispatchSpec(spec); err == nil {
+				t.Fatal("mismatched replay field was accepted")
+			}
+		})
 	}
 }

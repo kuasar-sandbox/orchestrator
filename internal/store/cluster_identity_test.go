@@ -65,6 +65,33 @@ func TestClusterIdentityRejectsNodeIDThatCannotFormBinding(t *testing.T) {
 	}
 }
 
+func TestClusterIdentityRejectsNonCanonicalDataEndpoint(t *testing.T) {
+	for name, endpoint := range map[string]string{
+		"URL":          "https://node.example:8443",
+		"missing port": "node.example",
+		"missing host": ":8443",
+		"zero port":    "node.example:0",
+		"leading zero": "node.example:08443",
+		"whitespace":   " node.example:8443",
+	} {
+		t.Run(name, func(t *testing.T) {
+			st := testStore(t)
+			if _, err := st.EnrollClusterIdentity(context.Background(), "node-1", "boot-1", endpoint); err == nil {
+				t.Fatal("invalid data endpoint was durably enrolled")
+			}
+		})
+	}
+
+	st := testStore(t)
+	ctx := context.Background()
+	if _, err := st.EnrollClusterIdentity(ctx, "node-1", "boot-1", "[2001:db8::1]:8443"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.PrepareClusterStart(ctx, "node-1", "boot-1", "https://node.example:8443", false); err == nil {
+		t.Fatal("invalid changed data endpoint was accepted")
+	}
+}
+
 func TestClusterIdentityEndpointChangeRequiresFence(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()
