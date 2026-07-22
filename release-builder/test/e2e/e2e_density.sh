@@ -365,6 +365,8 @@ resource_listen:
     - /sys/fs/cgroup/sandboxes
   # Sized for DETERMINISTIC creation-rate backpressure (Phase C), independent of
   # startup/settle timing: allocatable_pool = (464-80-64)MiB * (1-0.10) = 288MiB.
+  # CPU is sized independently: (6-0.5-1)*0.90 = 4.05 cores, so the four
+  # 1-core placeholders fit after host, Builder, and operational reservations.
   # Each sandbox commits its 64MiB floor to NodeAllocated at admit, so the 4th
   # leaves the node at 256MiB >= the red water mark (0.85*288 = 244.8MiB) — and
   # the 5th admit is HARD-rejected with "node in zone red" (the zone gate is
@@ -373,7 +375,7 @@ resource_listen:
   # 64MiB startup budgets, so the first four are not startup-blocked.
   resources:
     physical_memory: 464MiB
-    physical_cpu: 5
+    physical_cpu: 6
     host_reserved:
       memory: 80MiB
       cpu: 0.5
