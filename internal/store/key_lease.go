@@ -78,6 +78,9 @@ func (s *Store) PutKeyLease(ctx context.Context, lease KeyLease) (bool, error) {
 		return false, fmt.Errorf("store: begin key lease update: %w", err)
 	}
 	defer tx.Rollback()
+	if err := advanceKeyLeaseRevisionFence(ctx, tx, lease, authHash, manifestHash); err != nil {
+		return false, err
+	}
 	rowID, found, err := s.findKeyLeaseRowWith(ctx, tx, lease.Group, authHash, manifestHash, lease.AuthKey, lease.ManifestKey)
 	if err != nil {
 		return false, err
@@ -152,6 +155,59 @@ VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
 		return false, fmt.Errorf("store: commit key lease insert: %w", err)
 	}
 	return true, nil
+}
+
+func advanceKeyLeaseRevisionFence(
+	ctx context.Context,
+	tx *sql.Tx,
+	lease KeyLease,
+	authHash, manifestHash string,
+) error {
+	if lease.KeyRevision == 0 {
+		return nil
+	}
+	var currentRevisionEncoded []byte
+	var currentRegistryAuthDigest string
+	var currentExpiresUnix int64
+	err := tx.QueryRowContext(ctx, `
+SELECT key_revision,registry_auth_digest,expires_unix
+FROM key_lease_revision_fences
+WHERE group_name=? AND auth_key_hash=? AND manifest_key_hash=?`,
+		lease.Group, authHash, manifestHash,
+	).Scan(&currentRevisionEncoded, &currentRegistryAuthDigest, &currentExpiresUnix)
+	if errors.Is(err, sql.ErrNoRows) {
+		_, err = tx.ExecContext(ctx, `
+INSERT INTO key_lease_revision_fences
+  (group_name,auth_key_hash,manifest_key_hash,key_revision,registry_auth_digest,expires_unix)
+VALUES (?,?,?,?,?,?)`, lease.Group, authHash, manifestHash, encodeUint64(lease.KeyRevision),
+			lease.RegistryAuthDigest, lease.ExpiresUnix)
+		return err
+	}
+	if err != nil {
+		return err
+	}
+	currentRevision, err := decodeUint64(currentRevisionEncoded)
+	if err != nil {
+		return fmt.Errorf("store: decode key lease revision fence: %w", err)
+	}
+	if lease.KeyRevision < currentRevision {
+		return ErrKeyLeaseRevisionRegression
+	}
+	if lease.KeyRevision == currentRevision {
+		if lease.RegistryAuthDigest != currentRegistryAuthDigest {
+			return ErrKeyLeaseRevisionConflict
+		}
+		if lease.ExpiresUnix < currentExpiresUnix {
+			return ErrKeyLeaseExpiryRegression
+		}
+	}
+	_, err = tx.ExecContext(ctx, `
+UPDATE key_lease_revision_fences
+SET key_revision=?,registry_auth_digest=?,expires_unix=?
+WHERE group_name=? AND auth_key_hash=? AND manifest_key_hash=?`,
+		encodeUint64(lease.KeyRevision), lease.RegistryAuthDigest, lease.ExpiresUnix,
+		lease.Group, authHash, manifestHash)
+	return err
 }
 
 func (s *Store) KeyLeasesByAuthHash(ctx context.Context, authHash string) ([]KeyLease, error) {
