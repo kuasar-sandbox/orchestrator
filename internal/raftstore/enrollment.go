@@ -128,6 +128,34 @@ func newLocalEnrollment(
 	return enrollment, nil
 }
 
+func validateFreshRegistryMemberJoin(previous, next RegistryLayout, member RegistryMember) error {
+	if err := ValidateRegistryLayoutTransition(previous, next); err != nil {
+		return err
+	}
+	if _, found := registryLayoutMember(previous, member.MemberID); found {
+		return fmt.Errorf("%w: Registry member %q already exists in the predecessor Registry Layout", ErrReplicaHistoryLost, member.MemberID)
+	}
+
+	previousByShard := make(map[uint64]map[uint64]struct{}, len(previous.DataShards)+1)
+	add := func(shardID uint64, placements []ReplicaPlacement) {
+		replicas := make(map[uint64]struct{}, len(placements))
+		for _, placement := range placements {
+			replicas[placement.ReplicaID] = struct{}{}
+		}
+		previousByShard[shardID] = replicas
+	}
+	add(SystemRaftShardID, previous.SystemReplicas)
+	for _, shard := range previous.DataShards {
+		add(DataRaftShardID(shard.ShardID), shard.Replicas)
+	}
+	for _, target := range localReplicas(next, member, ReplicaJoin, true) {
+		if _, reused := previousByShard[target.ShardID][target.ReplicaID]; reused {
+			return fmt.Errorf("%w: JOIN target reuses predecessor replica %d for shard %d", ErrReplicaHistoryLost, target.ReplicaID, target.ShardID)
+		}
+	}
+	return nil
+}
+
 func (e LocalEnrollment) Matches(registryLayout RegistryLayout, digest string, member RegistryMember, config RuntimeConfig) error {
 	if err := e.Validate(); err != nil {
 		return err

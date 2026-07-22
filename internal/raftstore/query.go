@@ -492,7 +492,7 @@ func lookupRoute(state DataState, request routeapi.ReadRouteRequest) routeapi.Re
 		return routeapi.ReadRouteResponse{Outcome: routeapi.ReadReplicaBehind, Reason: "Route revision is below the requested minimum"}
 	}
 	if record.State == clusterstate.WorkflowRoutePaused && record.Paused != nil && request.Strong && request.Addressable {
-		paused := record.Paused.Execution
+		paused := cloneReadyRoute(record.Paused.Execution)
 		return routeapi.ReadRouteResponse{
 			Outcome: routeapi.ReadReady, Group: record.Group, RouteKey: record.RouteKey,
 			State: clusterstate.WorkflowRoutePaused,
@@ -505,7 +505,7 @@ func lookupRoute(state DataState, request routeapi.ReadRouteRequest) routeapi.Re
 		}
 		return routeapi.ReadRouteResponse{Outcome: routeapi.ReadNeedLeader, Reason: string(record.State)}
 	}
-	ready := *record.Ready
+	ready := cloneReadyRoute(*record.Ready)
 	return routeapi.ReadRouteResponse{
 		Outcome: routeapi.ReadReady, Group: record.Group, RouteKey: record.RouteKey,
 		State: clusterstate.WorkflowRouteReady, Route: &ready, RouteRevision: record.Revision.LogIndex,
@@ -556,9 +556,9 @@ func lookupBuild(state DataState, request routeapi.ReadBuildRequest) routeapi.Re
 		}
 		return routeapi.ReadBuildResponse{Outcome: routeapi.ReadNeedLeader, Reason: string(record.State)}
 	}
-	projection := *record.Projection
+	registered := cloneBuildRecord(record)
 	return routeapi.ReadBuildResponse{
-		Outcome: routeapi.ReadReady, Group: record.Group, Build: &projection,
+		Outcome: routeapi.ReadReady, Group: record.Group, Build: registered.Projection,
 		BuildState: clusterstate.BuildRegistered, BuildRevision: record.Revision.LogIndex,
 	}
 }

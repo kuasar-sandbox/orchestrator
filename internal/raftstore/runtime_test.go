@@ -318,6 +318,100 @@ func TestRuntimeFailsClosedOnAmbiguousStartAndLostHistory(t *testing.T) {
 	})
 }
 
+func TestRuntimeJoinRequiresNewPredecessorIdentity(t *testing.T) {
+	makeTransition := func(t *testing.T, fixture runtimeFixture) SignedRegistryLayout {
+		t.Helper()
+		previous := fixture.signed.RegistryLayout
+		previousDigest, err := previous.Digest()
+		if err != nil {
+			t.Fatal(err)
+		}
+		next := cloneRegistryLayout(previous)
+		next.RegistryLayoutVersion = 2
+		next.PreviousRegistryLayoutVersion = previous.RegistryLayoutVersion
+		next.PreviousRegistryLayoutDigest = previousDigest
+		next.Members = append(next.Members, RegistryMember{
+			MemberID: "registry-d", InternalEndpoint: "https://registry-d:9443", RaftEndpoint: "registry-d:63001",
+		})
+		replacement := []ReplicaPlacement{
+			{MemberID: "registry-a", ReplicaID: 1},
+			{MemberID: "registry-b", ReplicaID: 2},
+			{MemberID: "registry-d", ReplicaID: 4},
+		}
+		next.SystemReplicas = append([]ReplicaPlacement(nil), replacement...)
+		for index := range next.DataShards {
+			next.DataShards[index].Replicas = append([]ReplicaPlacement(nil), replacement...)
+		}
+		signed, err := SignRegistryLayout(next, "root-1", fixture.key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return signed
+	}
+
+	t.Run("new member", func(t *testing.T) {
+		fixture := newRuntimeFixture(t)
+		fixture.config.MemberID = "registry-d"
+		next := makeTransition(t, fixture)
+		runtime, err := openRuntime(
+			fixture.config, []SignedRegistryLayout{fixture.signed, next}, fixture.keyring,
+			RuntimeOpenOptions{Mode: RuntimeJoin},
+			func(dbconfig.NodeHostConfig) (raftNodeHost, error) { return newFakeNodeHost(), nil },
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer runtime.Close()
+		if runtime.enrollment.Mode != EnrollmentJoin {
+			t.Fatalf("new member enrollment mode = %s", runtime.enrollment.Mode)
+		}
+	})
+
+	t.Run("new member with durable predecessor guard", func(t *testing.T) {
+		fixture := newRuntimeFixture(t)
+		fixture.config.MemberID = "registry-d"
+		next := makeTransition(t, fixture)
+		previousDigest, err := fixture.signed.RegistryLayout.Digest()
+		if err != nil {
+			t.Fatal(err)
+		}
+		accepted, err := FirstAcceptedRegistryLayout(fixture.signed.RegistryLayout, previousDigest)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := (RegistryLayoutGuard{Path: fixture.config.RegistryLayoutGuardPath}).store(accepted); err != nil {
+			t.Fatal(err)
+		}
+		runtime, err := openRuntime(
+			fixture.config, []SignedRegistryLayout{next}, fixture.keyring,
+			RuntimeOpenOptions{Mode: RuntimeJoin},
+			func(dbconfig.NodeHostConfig) (raftNodeHost, error) { return newFakeNodeHost(), nil },
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer runtime.Close()
+		if runtime.enrollment.Mode != EnrollmentJoin {
+			t.Fatalf("new member enrollment mode = %s", runtime.enrollment.Mode)
+		}
+	})
+
+	t.Run("lost retained member", func(t *testing.T) {
+		fixture := newRuntimeFixture(t)
+		next := makeTransition(t, fixture)
+		if _, err := openRuntime(
+			fixture.config, []SignedRegistryLayout{fixture.signed, next}, fixture.keyring,
+			RuntimeOpenOptions{Mode: RuntimeJoin},
+			func(dbconfig.NodeHostConfig) (raftNodeHost, error) {
+				t.Fatal("lost predecessor identity created a NodeHost")
+				return nil, nil
+			},
+		); !errors.Is(err, ErrReplicaHistoryLost) {
+			t.Fatalf("lost predecessor identity error = %v", err)
+		}
+	})
+}
+
 func TestCommittedNodeDeletedEventDurablyFencesLocalReplica(t *testing.T) {
 	fixture := newRuntimeFixture(t)
 	runtime, err := fixture.open(t, newFakeNodeHost(), RuntimeOpenOptions{
