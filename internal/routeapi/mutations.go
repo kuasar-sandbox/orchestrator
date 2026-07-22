@@ -133,7 +133,12 @@ func (r RouteMutationResponse) ValidateFor(identity RequestIdentity, group, rout
 			return errors.New("routeapi: PENDING mutation has an invalid projection")
 		}
 		return nil
-	case MutationTerminal, MutationConflict, MutationUnavailable:
+	case MutationTerminal:
+		if r.Route != nil || r.RouteRevision == 0 {
+			return errors.New("routeapi: TERMINAL mutation lacks a committed Route revision")
+		}
+		return nil
+	case MutationConflict, MutationUnavailable:
 		if r.Route != nil {
 			return errors.New("routeapi: failed Route mutation carries a forwarding projection")
 		}

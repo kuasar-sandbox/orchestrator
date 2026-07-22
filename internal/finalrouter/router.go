@@ -495,18 +495,24 @@ func (r *Router) sandboxControl(w http.ResponseWriter, request *http.Request) {
 			return
 		}
 		minimum, releaseRevision := r.beginRouteRevision(group, routeKey)
+		defer releaseRevision()
 		result, deleteErr := r.control.DeleteSandbox(request.Context(), group, routeKey, minimum)
-		releaseRevision()
 		if deleteErr != nil {
 			http.Error(w, "delete unavailable", http.StatusServiceUnavailable)
 			return
 		}
 		switch result.Response.Outcome {
 		case routeapi.MutationTerminal:
-			r.evictRoute(group, routeKey)
+			if !r.fenceRouteRevision(group, routeKey, result.Response.RouteRevision) {
+				http.Error(w, "delete unavailable", http.StatusServiceUnavailable)
+				return
+			}
 			w.WriteHeader(http.StatusNoContent)
 		case routeapi.MutationPending:
-			r.evictRoute(group, routeKey)
+			if !r.fenceRouteRevision(group, routeKey, result.Response.RouteRevision) {
+				http.Error(w, "delete unavailable", http.StatusServiceUnavailable)
+				return
+			}
 			w.WriteHeader(http.StatusAccepted)
 		case routeapi.MutationConflict:
 			http.Error(w, result.Response.Reason, http.StatusConflict)
@@ -1347,6 +1353,25 @@ func (r *Router) rejectStaleRoute(entry *routeEntry) {
 	r.minimumRevisions[keyID] = floor
 	r.releaseInactiveRouteRevisionLocked(keyID, time.Now())
 	r.cacheMu.Unlock()
+}
+
+func (r *Router) fenceRouteRevision(group, routeKey string, revision uint64) bool {
+	if group == "" || routeKey == "" || revision == 0 {
+		return false
+	}
+	keyID := routeKeyID(group, routeKey)
+	now := time.Now()
+	r.cacheMu.Lock()
+	floor := r.routeRevisionFloorLocked(keyID, now)
+	delete(r.routes, keyID)
+	if revision > floor.Revision {
+		floor.Revision = revision
+	}
+	floor.InactiveUntil = time.Time{}
+	r.minimumRevisions[keyID] = floor
+	r.releaseInactiveRouteRevisionLocked(keyID, now)
+	r.cacheMu.Unlock()
+	return true
 }
 
 func (r *Router) cachedRoute(group, routeKey string) *routeEntry {

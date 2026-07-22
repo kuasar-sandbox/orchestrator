@@ -210,6 +210,21 @@ func TestPositiveReadsRequireExactTableKeyIdentity(t *testing.T) {
 	}
 }
 
+func TestTerminalRouteMutationRequiresCommittedRevision(t *testing.T) {
+	request := routeRequest(true)
+	response := RouteMutationResponse{
+		Outcome: MutationTerminal, Group: request.Group, RouteKey: request.RouteKey,
+		State: clusterstate.WorkflowRouteTombstone,
+	}
+	if err := response.ValidateFor(request.RequestIdentity, request.Group, request.RouteKey); err == nil {
+		t.Fatal("TERMINAL mutation without a committed revision was accepted")
+	}
+	response.RouteRevision = 9
+	if err := response.ValidateFor(request.RequestIdentity, request.Group, request.RouteKey); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestPausedProjectionRequiresExplicitStrongAddressableRead(t *testing.T) {
 	request := routeRequest(false)
 	request.Addressable = true

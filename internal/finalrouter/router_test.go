@@ -171,6 +171,7 @@ func TestDeleteRequiresExactSandboxResourcePath(t *testing.T) {
 	control.deleteRoute = func(group, routeKey string, _ uint64) (routeclient.RouteMutationResult, error) {
 		return routeclient.RouteMutationResult{ServeIdentity: serveIdentity, Response: routeapi.RouteMutationResponse{
 			Outcome: routeapi.MutationTerminal, Group: group, RouteKey: routeKey,
+			State: clusterstate.WorkflowRouteTombstone, RouteRevision: 9,
 		}}, nil
 	}
 	router, err := New(control, allowCaller{}, "example.test", time.Minute, slog.Default())
@@ -202,6 +203,59 @@ func TestDeleteRequiresExactSandboxResourcePath(t *testing.T) {
 	router.Handler().ServeHTTP(response, request)
 	if response.Code != http.StatusNoContent || control.deleteCalls != 1 {
 		t.Fatalf("exact DELETE = %d calls=%d body=%s", response.Code, control.deleteCalls, response.Body.String())
+	}
+}
+
+func TestDeleteFencesConcurrentStaleRouteReadAtCommittedRevision(t *testing.T) {
+	serveIdentity := routeapi.RegistryServeIdentity{
+		ClusterID: "cluster-1", RegistryGeneration: "generation-1", SystemEpoch: 1,
+		RegistryLayoutDigest: "registry-layout-1",
+	}
+	for _, test := range []struct {
+		name    string
+		outcome string
+		state   clusterstate.RouteWorkflowState
+		status  int
+	}{
+		{name: "terminal", outcome: routeapi.MutationTerminal, state: clusterstate.WorkflowRouteTombstone, status: http.StatusNoContent},
+		{name: "pending", outcome: routeapi.MutationPending, state: clusterstate.WorkflowRouteDeleting, status: http.StatusAccepted},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			control := &revisionControl{serveIdentity: serveIdentity}
+			control.deleteRoute = func(group, routeKey string, _ uint64) (routeclient.RouteMutationResult, error) {
+				return routeclient.RouteMutationResult{ServeIdentity: serveIdentity, Response: routeapi.RouteMutationResponse{
+					Outcome: test.outcome, Group: group, RouteKey: routeKey,
+					State: test.state, RouteRevision: 9,
+				}}, nil
+			}
+			router, err := New(control, allowCaller{}, "example.test", time.Minute, slog.Default())
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			_, releaseStaleRead := router.beginRouteRevision("/group", "route-1")
+			request := httptest.NewRequest(http.MethodDelete, "http://api.example.test/v2/sandboxes/route-1", nil)
+			request.Host = "api.example.test"
+			request.Header.Set(HeaderGroup, "/group")
+			response := httptest.NewRecorder()
+			router.Handler().ServeHTTP(response, request)
+			if response.Code != test.status {
+				t.Fatalf("DELETE status = %d, want %d: %s", response.Code, test.status, response.Body.String())
+			}
+
+			stale := &routeEntry{
+				Route: clusterstate.ReadyRoute{SandboxID: "sandbox-1"},
+				State: clusterstate.WorkflowRouteReady, Group: "/group", RouteKey: "route-1",
+				Revision: 8, ServeIdentity: serveIdentity,
+			}
+			if router.rememberRoute(stale) {
+				t.Fatal("pre-delete READY read reinstalled below the committed delete revision")
+			}
+			if minimum := router.minimumRouteRevision("/group", "route-1"); minimum != 9 {
+				t.Fatalf("minimum Route revision = %d, want 9", minimum)
+			}
+			releaseStaleRead()
+		})
 	}
 }
 
