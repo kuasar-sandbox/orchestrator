@@ -186,7 +186,7 @@ func runRegistry(args []string, log *slog.Logger) error {
 	if err := runtime.SetOutboxAckVerifier(service); err != nil {
 		return err
 	}
-	operator, err := controlplane.NewOperatorService(store, holder)
+	operator, err := controlplane.NewOperatorService(store, mesh)
 	if err != nil {
 		return err
 	}

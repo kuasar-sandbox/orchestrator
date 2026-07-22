@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"strings"
@@ -166,7 +167,11 @@ type servicePlanner struct {
 	mutate func(placer.PlanRequest, *placer.PlanResponse)
 }
 
-func (p *servicePlanner) Plan(_ context.Context, request placer.PlanRequest) (placer.PlanResponse, error) {
+func (p *servicePlanner) Plan(
+	_ context.Context,
+	_ placement.CatalogSnapshot,
+	request placer.PlanRequest,
+) (placer.PlanResponse, error) {
 	p.mu.Lock()
 	p.calls = append(p.calls, request)
 	p.mu.Unlock()
@@ -257,6 +262,48 @@ func TestRegistryRejectsPlacerRuntimeAndDemandDrift(t *testing.T) {
 			t.Fatal("Placer Build demand that differs from the immutable request was accepted")
 		}
 	})
+}
+
+func TestRouteListResponseIsBoundedBySerializedBytes(t *testing.T) {
+	metadata := make(map[string]string, 4)
+	for index := 0; index < 4; index++ {
+		metadata[fmt.Sprintf("key-%d", index)] = strings.Repeat("\x01", clusterstate.MaxPresentationMetadataBytes/4-8)
+	}
+	routes := make([]routeapi.ListedRoute, 100)
+	for index := range routes {
+		routes[index] = routeapi.ListedRoute{
+			RouteKey: fmt.Sprintf("route-%03d", index), State: clusterstate.WorkflowRouteReady,
+			NodeID: "node-1", TemplateRef: "template-1",
+			Presentation: clusterstate.SandboxPresentationV1{
+				CPUCount: 1, MemoryMB: 512, DiskSizeMB: 64, EnvdVersion: "0.6.1",
+				StartedAt: 1, EndAt: 2, Metadata: metadata,
+			},
+		}
+	}
+	response, err := boundedRouteListResponse(routes, 7, 99, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(response)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(encoded) > routeapi.MaxListRoutesResponseBytes || len(response.Routes) == 0 ||
+		len(response.Routes) >= len(routes) || response.NextRouteKey != response.Routes[len(response.Routes)-1].RouteKey {
+		t.Fatalf("bounded response = bytes=%d routes=%d next=%q", len(encoded), len(response.Routes), response.NextRouteKey)
+	}
+	payloadBytes := 0
+	for index, route := range response.Routes {
+		raw, _ := json.Marshal(route)
+		payloadBytes += len(raw)
+		if index != 0 {
+			payloadBytes++
+		}
+	}
+	calculated, err := routeListResponseBytes(payloadBytes, response.Bucket, response.SnapshotRevision, response.NextRouteKey)
+	if err != nil || calculated != len(encoded) {
+		t.Fatalf("response byte accounting = %d, want %d, err=%v", calculated, len(encoded), err)
+	}
 }
 
 func (p *servicePlanner) ResolveKeyLease(

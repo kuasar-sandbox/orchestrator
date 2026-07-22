@@ -37,6 +37,10 @@ type placementWakeSource interface {
 	PlacementWake() <-chan struct{}
 }
 
+type executionReadiness interface {
+	WaitExecutionReady(context.Context) error
+}
+
 type nodeLinkObserver interface {
 	NodeLinkSession(endpoint string)
 	NodeLinkRedirect(target routesync.NodeLinkTarget)
@@ -175,6 +179,11 @@ func (c *Client) session(ctx context.Context, endpoint string) error {
 	}
 	identity.NodeEpoch = tuple.NodeEpoch
 	identity.SessionSeq = tuple.SessionSeq
+	if readiness, ok := c.node.(executionReadiness); ok {
+		if err := readiness.WaitExecutionReady(ctx); err != nil {
+			return err
+		}
+	}
 	sctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	tr, scheme, host, err := c.transport(endpoint)

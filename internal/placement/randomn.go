@@ -13,18 +13,18 @@ import (
 const DefaultCandidateCount = cluster.MaxPlacementCandidates
 
 type CatalogNode struct {
-	NodeID        string
-	Labels        map[string]string
-	FailureDomain string
-	RuntimeDigest string
-	Capabilities  map[string]bool
-	Draining      bool
+	NodeID        string            `json:"node_id"`
+	Labels        map[string]string `json:"labels,omitempty"`
+	FailureDomain string            `json:"failure_domain,omitempty"`
+	RuntimeDigest string            `json:"runtime_digest,omitempty"`
+	Capabilities  map[string]bool   `json:"capabilities,omitempty"`
+	Draining      bool              `json:"draining,omitempty"`
 
-	SandboxSlotCapacity  uint64
-	BuildSlotCapacity    uint64
-	BuildCPUCapacity     uint64
-	BuildMemoryCapacity  uint64
-	BuildStorageCapacity uint64
+	SandboxSlotCapacity  uint64 `json:"sandbox_slot_capacity"`
+	BuildSlotCapacity    uint64 `json:"build_slot_capacity,omitempty"`
+	BuildCPUCapacity     uint64 `json:"build_cpu_capacity,omitempty"`
+	BuildMemoryCapacity  uint64 `json:"build_memory_capacity,omitempty"`
+	BuildStorageCapacity uint64 `json:"build_storage_capacity,omitempty"`
 }
 
 type StaticPolicy struct {

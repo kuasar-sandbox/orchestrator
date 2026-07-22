@@ -25,6 +25,25 @@ type fakeNode struct {
 	commands chan routesync.Command
 }
 
+type readinessNode struct {
+	*fakeNode
+	ready   <-chan struct{}
+	waiting chan<- struct{}
+}
+
+func (n *readinessNode) WaitExecutionReady(ctx context.Context) error {
+	select {
+	case n.waiting <- struct{}{}:
+	default:
+	}
+	select {
+	case <-n.ready:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 func TestNormalizeEndpointCanonicalizesSchemeCase(t *testing.T) {
 	scheme, host, endpoint, err := normalizeEndpoint("HTTPS://registry.example.test:9443", true)
 	if err != nil || scheme != "https" || host != "registry.example.test:9443" || endpoint != host {
@@ -255,6 +274,76 @@ func TestNodeLinkPersistsAndStampsTupleBeforeDial(t *testing.T) {
 		}
 	case <-ctx.Done():
 		t.Fatal("node registration not received")
+	}
+}
+
+func TestNodeLinkWaitsForExecutionReconciliationBeforeDial(t *testing.T) {
+	registered := make(chan routesync.NodeRegister, 1)
+	mux := http.NewServeMux()
+	mux.HandleFunc(routesync.NodeLinkPath, func(w http.ResponseWriter, req *http.Request) {
+		first, err := routesync.ReadMsg(req.Body)
+		if err != nil || first.NodeReg == nil {
+			http.Error(w, "bad register", http.StatusBadRequest)
+			return
+		}
+		registered <- *first.NodeReg
+		_ = routesync.WriteMsg(w, &routesync.Msg{Type: routesync.TypeHello, Hello: &routesync.Hello{Version: routesync.Version}})
+	})
+	srv := httptest.NewServer(h2c.NewHandler(mux, &http2.Server{}))
+	defer srv.Close()
+
+	ready := make(chan struct{})
+	waiting := make(chan struct{}, 1)
+	dialed := make(chan struct{}, 1)
+	sequencer := &fixedSessionSequencer{tuple: routesync.SessionTuple{NodeEpoch: 7, SessionSeq: 12}}
+	client := New(
+		srv.URL,
+		func(ctx context.Context, endpoint string) (net.Conn, error) {
+			dialed <- struct{}{}
+			return (&net.Dialer{}).DialContext(ctx, "tcp", endpoint)
+		},
+		routesync.NodeRegister{NodeID: "node-1", DataEndpoint: "10.0.0.1:8443"},
+		&readinessNode{fakeNode: newFakeNode(), ready: ready, waiting: waiting}, sequencer,
+		newFakeDurableEventOutbox(), time.Second, nil,
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+	)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- client.session(ctx, srv.URL) }()
+
+	select {
+	case <-waiting:
+	case <-ctx.Done():
+		t.Fatal("node-link did not wait for execution reconciliation")
+	}
+	if !sequencer.called.Load() {
+		t.Fatal("session tuple was not persisted before execution reconciliation")
+	}
+	select {
+	case <-dialed:
+		t.Fatal("node-link dialed before execution reconciliation")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(ready)
+	select {
+	case <-dialed:
+	case <-ctx.Done():
+		t.Fatal("node-link did not dial after execution reconciliation")
+	}
+	select {
+	case got := <-registered:
+		if got.NodeEpoch != 7 || got.SessionSeq != 12 {
+			t.Fatalf("registered identity = %+v", got)
+		}
+	case <-ctx.Done():
+		t.Fatal("node-link did not register after execution reconciliation")
+	}
+	select {
+	case <-done:
+	case <-ctx.Done():
+		t.Fatal("node-link session did not finish")
 	}
 }
 

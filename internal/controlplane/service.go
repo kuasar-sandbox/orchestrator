@@ -11,6 +11,7 @@ import (
 	"reflect"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -499,10 +500,68 @@ func (s *RegistryService) ListRoutes(ctx context.Context, request routeapi.ListR
 		})
 	}
 	sort.Slice(routes, func(i, j int) bool { return routes[i].RouteKey < routes[j].RouteKey })
-	return routeapi.ListRoutesResponse{
-		Routes: routes, Bucket: request.Bucket, SnapshotRevision: result.SnapshotRevision,
-		NextRouteKey: result.NextRouteKey,
-	}, nil
+	return boundedRouteListResponse(
+		routes, request.Bucket, result.SnapshotRevision, result.NextRouteKey,
+	)
+}
+
+func boundedRouteListResponse(
+	routes []routeapi.ListedRoute,
+	bucket uint32,
+	snapshotRevision uint64,
+	storeNextRouteKey string,
+) (routeapi.ListRoutesResponse, error) {
+	result := routeapi.ListRoutesResponse{
+		Routes: make([]routeapi.ListedRoute, 0, len(routes)), Bucket: bucket,
+		SnapshotRevision: snapshotRevision,
+	}
+	payloadBytes := 0
+	for index, route := range routes {
+		encoded, err := json.Marshal(route)
+		if err != nil {
+			return routeapi.ListRoutesResponse{}, err
+		}
+		candidatePayloadBytes := payloadBytes + len(encoded)
+		if len(result.Routes) != 0 {
+			candidatePayloadBytes++
+		}
+		hasMore := index+1 < len(routes) || storeNextRouteKey != ""
+		continuation := ""
+		if hasMore {
+			continuation = route.RouteKey
+		}
+		responseBytes, err := routeListResponseBytes(
+			candidatePayloadBytes, bucket, snapshotRevision, continuation,
+		)
+		if err != nil {
+			return routeapi.ListRoutesResponse{}, err
+		}
+		if responseBytes > routeapi.MaxListRoutesResponseBytes {
+			if len(result.Routes) == 0 {
+				return routeapi.ListRoutesResponse{}, errors.New("controlplane: one Route list projection exceeds the response byte limit")
+			}
+			result.NextRouteKey = result.Routes[len(result.Routes)-1].RouteKey
+			return result, nil
+		}
+		result.Routes = append(result.Routes, route)
+		payloadBytes = candidatePayloadBytes
+	}
+	result.NextRouteKey = storeNextRouteKey
+	return result, nil
+}
+
+func routeListResponseBytes(payloadBytes int, bucket uint32, snapshotRevision uint64, nextRouteKey string) (int, error) {
+	size := len(`{"routes":[`) + payloadBytes + len(`],"bucket":`) +
+		len(strconv.FormatUint(uint64(bucket), 10)) + len(`,"snapshot_revision":`) +
+		len(strconv.FormatUint(snapshotRevision, 10)) + 1
+	if nextRouteKey != "" {
+		encoded, err := json.Marshal(nextRouteKey)
+		if err != nil {
+			return 0, err
+		}
+		size += len(`,"next_route_key":`) + len(encoded)
+	}
+	return size, nil
 }
 
 func (s *RegistryService) WatchRoutes(
@@ -630,12 +689,12 @@ func (s *RegistryService) planSandbox(
 	input routeapi.SandboxInput,
 	excludedNodeIDs []string,
 ) (coordinator.SandboxRound, error) {
-	nodes, err := s.store.Catalog(ctx)
+	catalog, err := s.store.Catalog(ctx)
 	if err != nil {
 		return coordinator.SandboxRound{}, err
 	}
-	response, err := s.planner.Plan(ctx, placer.PlanRequest{
-		Kind: placer.PlanSandbox, Group: group, RouteKey: routeKey, Nodes: nodes,
+	response, err := s.planner.Plan(ctx, catalog, placer.PlanRequest{
+		Kind: placer.PlanSandbox, Group: group, RouteKey: routeKey,
 		ExcludedNodeIDs: excludedNodeIDs, TargetRuntimeDigest: input.TargetRuntimeDigest,
 		Sandbox: &placer.SandboxPlanInput{
 			SandboxID: sandboxID, TemplateRef: input.TemplateRef, Config: cloneStringMap(input.Config),
@@ -674,12 +733,12 @@ func (s *RegistryService) planBuild(
 	buildID string,
 	input routeapi.BuildInput,
 ) (coordinator.SandboxRound, error) {
-	nodes, err := s.store.Catalog(ctx)
+	catalog, err := s.store.Catalog(ctx)
 	if err != nil {
 		return coordinator.SandboxRound{}, err
 	}
-	response, err := s.planner.Plan(ctx, placer.PlanRequest{
-		Kind: placer.PlanBuild, Group: group, Nodes: nodes,
+	response, err := s.planner.Plan(ctx, catalog, placer.PlanRequest{
+		Kind: placer.PlanBuild, Group: group,
 		TargetRuntimeDigest: input.TargetRuntimeDigest,
 		Build: &placer.BuildPlanInput{
 			BuildID: buildID, TemplateID: input.TemplateID, Profile: input.Profile,

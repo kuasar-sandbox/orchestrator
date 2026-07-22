@@ -32,9 +32,9 @@ func TestFinalPlanMintsIndependentCapabilityAndPreservesRequest(t *testing.T) {
 	}
 	request := PlanRequest{
 		Kind: PlanSandbox, Group: "/group", RouteKey: "route-1",
-		Nodes: []placement.CatalogNode{{
+		Catalog: installTestCatalog(t, service, []placement.CatalogNode{{
 			NodeID: "node-1", SandboxSlotCapacity: 1, Capabilities: map[string]bool{"sandbox": true},
-		}},
+		}}),
 		Sandbox: &SandboxPlanInput{
 			SandboxID: "sandbox-1", Demand: placement.SandboxDemand{SlotUnits: 1}, Request: envelope,
 		},
@@ -94,9 +94,9 @@ func TestFinalPlanDerivesSandboxDemandFromEffectiveGroupConfig(t *testing.T) {
 	}
 	response, err := service.Plan(context.Background(), PlanRequest{
 		Kind: PlanSandbox, Group: "/group", RouteKey: "route-1",
-		Nodes: []placement.CatalogNode{{
+		Catalog: installTestCatalog(t, service, []placement.CatalogNode{{
 			NodeID: "node-1", SandboxSlotCapacity: 4, Capabilities: map[string]bool{"sandbox": true},
-		}},
+		}}),
 		Sandbox: &SandboxPlanInput{
 			SandboxID: "sandbox-1", Demand: placement.SandboxDemand{SlotUnits: 1}, Request: envelope,
 		},
@@ -112,6 +112,23 @@ func TestFinalPlanDerivesSandboxDemandFromEffectiveGroupConfig(t *testing.T) {
 		demand.Sandbox.AllocatableAtSnapshot != 0 {
 		t.Fatalf("derived Sandbox demand = %+v", demand.Sandbox)
 	}
+}
+
+func installTestCatalog(t *testing.T, service *FinalService, nodes []placement.CatalogNode) placement.CatalogReference {
+	t.Helper()
+	snapshot, err := placement.NewCatalogSnapshot(
+		"cluster-1", "generation-1", 1, strings.Repeat("d", 64), 1, nodes,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := service.catalogs.install(CatalogSyncRequest{
+		Reference: snapshot.Reference, Nodes: snapshot.Nodes, Final: true,
+	})
+	if err != nil || !response.Installed {
+		t.Fatalf("install test catalog = %+v, %v", response, err)
+	}
+	return snapshot.Reference
 }
 
 func TestShuffleShardingFailsClosedWhenApplicableShardLabelIsAbsent(t *testing.T) {

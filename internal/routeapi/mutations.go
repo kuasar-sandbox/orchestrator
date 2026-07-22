@@ -269,6 +269,10 @@ type ListRoutesRequest struct {
 	Strong        bool                            `json:"strong,omitempty"`
 }
 
+// MaxListRoutesResponseBytes leaves room for writeJSON's trailing newline
+// under routeclient's 4 MiB response decoder limit.
+const MaxListRoutesResponseBytes = (4 << 20) - 1
+
 func (r ListRoutesRequest) Validate() error {
 	if err := r.RequestIdentity.Validate(); err != nil {
 		return err

@@ -242,6 +242,96 @@ func TestFirstDataRequestUsesCallerAuthorizationForCreatedRoute(t *testing.T) {
 	}
 }
 
+func TestExistingDataRouteAcceptsProviderAPIKey(t *testing.T) {
+	serveIdentity := routeapi.RegistryServeIdentity{
+		ClusterID: "cluster-1", RegistryGeneration: "generation-1", SystemEpoch: 1,
+		RegistryLayoutDigest: "registry-layout-1",
+	}
+	control := &revisionControl{serveIdentity: serveIdentity, revision: 8, route: clusterstate.ReadyRoute{
+		SandboxID: "sandbox-1", NodeID: "node-1", NodeEpoch: 1, DataEndpoint: "127.0.0.1:1",
+		RegistryGeneration: "generation-1", BindingDigest: "binding-1", AccessToken: "minted-token",
+		TargetPort: 49983,
+	}}
+	authorizer := &recordingAuthorizer{allow: true}
+	router, err := New(control, authorizer, "example.test", time.Minute, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodGet, "http://49983-route-1.example.test/", nil)
+	request.Host = "49983-route-1.example.test"
+	request.Header.Set(HeaderGroup, "/group")
+	request.Header.Set(HeaderAPIKey, "caller-key")
+	response := httptest.NewRecorder()
+	router.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusBadGateway || authorizer.calls != 1 {
+		t.Fatalf("existing data request = %d auth_calls=%d body=%s", response.Code, authorizer.calls, response.Body.String())
+	}
+}
+
+func TestSandboxResumeRequiresExactPostConnectAction(t *testing.T) {
+	serveIdentity := routeapi.RegistryServeIdentity{
+		ClusterID: "cluster-1", RegistryGeneration: "generation-1", SystemEpoch: 1,
+		RegistryLayoutDigest: "registry-layout-1",
+	}
+	control := &revisionControl{serveIdentity: serveIdentity, revision: 8, route: clusterstate.ReadyRoute{
+		SandboxID: "sandbox-1", NodeID: "node-1", NodeEpoch: 1, DataEndpoint: "127.0.0.1:1",
+		RegistryGeneration: "generation-1", BindingDigest: "binding-1",
+	}}
+	router, err := New(control, allowCaller{}, "example.test", time.Minute, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		method string
+		path   string
+		calls  int
+	}{
+		{method: http.MethodGet, path: "/sandboxes/route-1/connect", calls: 0},
+		{method: http.MethodPost, path: "/sandboxes/route-1/extra/connect", calls: 0},
+		{method: http.MethodPost, path: "/v2/sandboxes/route-1/connect", calls: 1},
+	} {
+		request := httptest.NewRequest(test.method, "http://api.example.test"+test.path, nil)
+		request.Host = "api.example.test"
+		request.Header.Set(HeaderGroup, "/group")
+		response := httptest.NewRecorder()
+		router.Handler().ServeHTTP(response, request)
+		if control.resumeCalls != test.calls {
+			t.Fatalf("%s %s resume calls = %d, want %d", test.method, test.path, control.resumeCalls, test.calls)
+		}
+	}
+}
+
+func TestV2SandboxItemPathIsNormalizedForNodeAPI(t *testing.T) {
+	seenPath := ""
+	node := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		seenPath = request.URL.EscapedPath()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer node.Close()
+	serveIdentity := routeapi.RegistryServeIdentity{
+		ClusterID: "cluster-1", RegistryGeneration: "generation-1", SystemEpoch: 1,
+		RegistryLayoutDigest: "registry-layout-1",
+	}
+	control := &revisionControl{serveIdentity: serveIdentity, revision: 8, route: clusterstate.ReadyRoute{
+		SandboxID: "sandbox-1", NodeID: "node-1", NodeEpoch: 1,
+		DataEndpoint: strings.TrimPrefix(node.URL, "http://"), RegistryGeneration: "generation-1",
+		BindingDigest: "binding-1",
+	}}
+	router, err := New(control, allowCaller{}, "example.test", time.Minute, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodGet, "http://api.example.test/v2/sandboxes/route-1", nil)
+	request.Host = "api.example.test"
+	request.Header.Set(HeaderGroup, "/group")
+	response := httptest.NewRecorder()
+	router.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusOK || seenPath != "/sandboxes/sandbox-1" {
+		t.Fatalf("v2 forward = %d path=%q body=%s", response.Code, seenPath, response.Body.String())
+	}
+}
+
 func (c *revisionControl) RegisterBuild(_ context.Context, group, buildID string, _ uint64, input routeapi.BuildInput) (routeclient.BuildMutationResult, error) {
 	if c.register == nil {
 		return routeclient.BuildMutationResult{}, errors.New("unexpected RegisterBuild")
@@ -273,6 +363,16 @@ func (c *revisionControl) ListRoutesPage(
 type allowCaller struct{}
 
 func (allowCaller) Verify(context.Context, string, string) (bool, error) { return true, nil }
+
+type recordingAuthorizer struct {
+	calls int
+	allow bool
+}
+
+func (a *recordingAuthorizer) Verify(context.Context, string, string) (bool, error) {
+	a.calls++
+	return a.allow, nil
+}
 
 func routerTestPresentation() clusterstate.SandboxPresentationV1 {
 	return clusterstate.SandboxPresentationV1{
@@ -529,9 +629,10 @@ func TestEscapedRouteKeyPathRoundTrip(t *testing.T) {
 		t.Fatalf("decoded Route key = %q, %v", routeKey, ok)
 	}
 	escaped := rewritePathObjectID(
-		"/v2/sandboxes/user1%2Fsession1/connect", "/sandboxes/", "node-local-sandbox",
+		strings.TrimPrefix("/v2/sandboxes/user1%2Fsession1/connect", "/v2"),
+		"/sandboxes/", "node-local-sandbox",
 	)
-	if escaped != "/v2/sandboxes/node-local-sandbox/connect" {
+	if escaped != "/sandboxes/node-local-sandbox/connect" {
 		t.Fatalf("rewritten path = %q", escaped)
 	}
 }

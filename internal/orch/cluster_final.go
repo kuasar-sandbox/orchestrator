@@ -221,9 +221,61 @@ func (n *FinalClusterNode) Start(ctx context.Context) error {
 	if err := n.authority.ReconcileSandboxAdmissions(ctx, 256); err != nil {
 		return fmt.Errorf("reconcile cluster Sandbox Admission: %w", err)
 	}
+	if err := n.reconcileDeadRunningSandboxes(ctx, 256); err != nil {
+		return fmt.Errorf("terminalize dead cluster Sandboxes: %w", err)
+	}
 	n.readyOnce.Do(func() { close(n.executionReady) })
 	go n.run(ctx)
 	return nil
+}
+
+func (n *FinalClusterNode) WaitExecutionReady(ctx context.Context) error {
+	select {
+	case <-n.executionReady:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (n *FinalClusterNode) reconcileDeadRunningSandboxes(ctx context.Context, limit int) error {
+	if limit <= 0 {
+		limit = 256
+	}
+	afterObjectID := ""
+	for {
+		records, err := n.store.SandboxWorkflowsForReconcile(
+			ctx, n.session.nodeID, n.session.nodeEpoch, afterObjectID, limit,
+		)
+		if err != nil {
+			return err
+		}
+		for _, record := range records {
+			if record.AdmissionState != nodeexec.AdmissionRunning {
+				continue
+			}
+			sandbox, err := n.store.Get(ctx, record.ObjectID)
+			if err != nil {
+				return err
+			}
+			reason := ""
+			switch {
+			case sandbox == nil:
+				reason = "running Sandbox object is missing after node-ctl restart"
+			case sandbox.State == types.StateDead:
+				reason = "Sandbox runner is absent after node-ctl restart"
+			}
+			if reason != "" {
+				if err := n.authority.FailSandbox(ctx, record, reason); err != nil {
+					return err
+				}
+			}
+		}
+		if len(records) < limit {
+			return nil
+		}
+		afterObjectID = records[len(records)-1].ObjectID
+	}
 }
 
 func (n *FinalClusterNode) run(ctx context.Context) {

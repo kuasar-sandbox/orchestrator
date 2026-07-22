@@ -31,6 +31,7 @@ var (
 
 const (
 	maximumResponseBytes      = 4 << 20
+	routeListRPCPageSize      = 8
 	nonMutationAttemptTimeout = 6 * time.Second
 )
 
@@ -143,9 +144,9 @@ func (c *Client) RefreshPermit(ctx context.Context) (routeapi.RegistryServeIdent
 		ClusterID: c.registryLayout.ClusterID, RegistryGeneration: c.registryLayout.RegistryGeneration,
 		RegistryLayoutDigest: c.digest,
 	}
-	started := c.now()
 	var lastErr error
 	for _, endpoint := range c.systemEndpoints() {
+		started := c.now()
 		var response routeapi.PermitResponse
 		if err := postJSONBounded(ctx, endpoint, routeapi.PermitPath, request, &response); err != nil {
 			lastErr = err
@@ -155,9 +156,18 @@ func (c *Client) RefreshPermit(ctx context.Context) (routeapi.RegistryServeIdent
 			lastErr = err
 			continue
 		}
+		if response.MaxLifetimeMillis != c.registryLayout.ServePermitMaxMillis {
+			lastErr = errors.New("routeclient: Permit lifetime does not match the signed Registry Layout")
+			continue
+		}
+		expires := started.Add(time.Duration(response.MaxLifetimeMillis) * time.Millisecond)
+		if !c.now().Before(expires) {
+			lastErr = ErrPermitUnavailable
+			continue
+		}
 		permit := &cachedPermit{
 			response: response,
-			expires:  started.Add(time.Duration(response.MaxLifetimeMillis) * time.Millisecond),
+			expires:  expires,
 		}
 		c.mu.Lock()
 		c.permit = permit
@@ -415,9 +425,10 @@ func (c *Client) ListRoutesPage(
 		}
 		readKey := group + "\x00" + strconv.FormatUint(uint64(bucket), 10)
 		for len(routes) < target {
+			requestLimit := min(target-len(routes), routeListRPCPageSize)
 			request := routeapi.ListRoutesRequest{
 				RequestIdentity: identity, Group: group, Bucket: bucket, State: state,
-				AfterRouteKey: afterRouteKey, Limit: uint32(target - len(routes)),
+				AfterRouteKey: afterRouteKey, Limit: uint32(requestLimit),
 			}
 			response, err := c.listRouteBucketPage(ctx, readKey, request)
 			if err != nil {
@@ -521,7 +532,7 @@ func decodeRouteListCursor(token string) (routeListCursorV1, error) {
 
 func (c *Client) ListRoutes(ctx context.Context, group string) (RouteListResult, error) {
 	const (
-		pageLimit               uint32 = 512
+		pageLimit               uint32 = routeListRPCPageSize
 		maximumSnapshotRestarts        = 3
 	)
 

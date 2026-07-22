@@ -507,7 +507,8 @@ func (r *Router) sandboxControl(w http.ResponseWriter, request *http.Request) {
 	}
 	var entry *routeEntry
 	var err error
-	if strings.HasSuffix(request.URL.Path, "/connect") {
+	connectRouteKey, exactConnect := escapedSandboxAction(request.URL.EscapedPath(), "connect")
+	if request.Method == http.MethodPost && exactConnect && connectRouteKey == routeKey {
 		minimum := r.minimumRouteRevision(group, routeKey)
 		result, resumeErr := r.control.ResumeSandbox(request.Context(), group, routeKey, minimum)
 		if resumeErr == nil && result.Response.Outcome == routeapi.MutationReady && result.Response.Route != nil {
@@ -773,7 +774,11 @@ func (r *Router) forwardNodeControl(w http.ResponseWriter, request *http.Request
 		next.URL.Host = endpoint
 		next.Host = "api." + r.domain
 		if route != nil {
-			escaped := rewritePathObjectID(next.URL.EscapedPath(), "/sandboxes/", objectID)
+			escaped := next.URL.EscapedPath()
+			if strings.HasPrefix(escaped, "/v2/sandboxes/") {
+				escaped = strings.TrimPrefix(escaped, "/v2")
+			}
+			escaped = rewritePathObjectID(escaped, "/sandboxes/", objectID)
 			if decoded, err := url.PathUnescape(escaped); err == nil {
 				next.URL.Path, next.URL.RawPath = decoded, escaped
 			}
@@ -906,7 +911,7 @@ func (r *Router) serveData(w http.ResponseWriter, request *http.Request, host st
 		addressable, addressErr := r.resolveControlRoute(request.Context(), group, routeKey)
 		if addressErr == nil && addressable != nil && addressable.State == clusterstate.WorkflowRoutePaused {
 			var ok bool
-			port, injectToken, ok = r.authorizeDataRequest(w, request, addressable.Route, hostPort, hasHostPort)
+			port, injectToken, ok = r.authorizeDataRequest(w, request, group, addressable.Route, hostPort, hasHostPort)
 			if !ok {
 				return
 			}
@@ -915,8 +920,7 @@ func (r *Router) serveData(w http.ResponseWriter, request *http.Request, host st
 		} else if addressErr == nil && addressable != nil && addressable.State == clusterstate.WorkflowRouteReady {
 			entry, err = addressable, nil
 		} else {
-			// Only creation by logical key uses caller authorization. Existing
-			// data traffic is authenticated below by the execution capability.
+			// Creation by logical key always requires caller authorization.
 			if !r.authorize(w, request.Context(), group, apiKey(request)) {
 				return
 			}
@@ -953,7 +957,7 @@ func (r *Router) serveData(w http.ResponseWriter, request *http.Request, host st
 	}
 	if !authenticated {
 		var ok bool
-		port, injectToken, ok = r.authorizeDataRequest(w, request, entry.Route, hostPort, hasHostPort)
+		port, injectToken, ok = r.authorizeDataRequest(w, request, group, entry.Route, hostPort, hasHostPort)
 		if !ok {
 			return
 		}
@@ -964,6 +968,7 @@ func (r *Router) serveData(w http.ResponseWriter, request *http.Request, host st
 func (r *Router) authorizeDataRequest(
 	w http.ResponseWriter,
 	request *http.Request,
+	group string,
 	route clusterstate.ReadyRoute,
 	hostPort int,
 	hasHostPort bool,
@@ -972,6 +977,12 @@ func (r *Router) authorizeDataRequest(
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return 0, false, false
+	}
+	if key := apiKey(request); key != "" {
+		if !r.authorize(w, request.Context(), group, key) {
+			return 0, false, false
+		}
+		return port, true, true
 	}
 	injectToken := true
 	if r.dataPlaneAuth == "enforce" || r.dataPlaneAuth == "log" {
@@ -1433,6 +1444,32 @@ func escapedPathObjectIDExact(path, marker string) (string, bool) {
 		return "", false
 	}
 	return decoded, true
+}
+
+func escapedSandboxAction(path, action string) (string, bool) {
+	if action == "" {
+		return "", false
+	}
+	for _, prefix := range []string{"/sandboxes/", "/v2/sandboxes/"} {
+		if !strings.HasPrefix(path, prefix) {
+			continue
+		}
+		value := strings.TrimPrefix(path, prefix)
+		suffix := "/" + action
+		if !strings.HasSuffix(value, suffix) {
+			return "", false
+		}
+		encoded := strings.TrimSuffix(value, suffix)
+		if encoded == "" || strings.Contains(encoded, "/") {
+			return "", false
+		}
+		decoded, err := url.PathUnescape(encoded)
+		if err != nil || url.PathEscape(decoded) != encoded {
+			return "", false
+		}
+		return decoded, true
+	}
+	return "", false
 }
 
 func validRouteKey(routeKey string) bool {

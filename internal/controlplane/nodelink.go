@@ -257,7 +257,8 @@ func (s *NodeLinkServer) readLoop(
 func (s *NodeLinkServer) convergeEvent(ctx context.Context, endpoint *wireEndpoint, event routesync.ExecutionEvent) {
 	defer func() { <-s.eventSlots }()
 	identity, err := s.store.ServeIdentity()
-	if err != nil || identity.RegistryGeneration != event.RegistryGeneration || s.store.AuthorizeEvent(identity, false) != nil {
+	if err != nil || identity.RegistryGeneration != event.RegistryGeneration ||
+		s.store.AuthorizeEvent(identity, false) != nil || s.store.AuthorizeNodeSession(identity, endpoint.reg) != nil {
 		return
 	}
 	if err := s.events.ConvergeExecutionEvent(ctx, event); err != nil {
@@ -267,7 +268,7 @@ func (s *NodeLinkServer) convergeEvent(ctx context.Context, endpoint *wireEndpoi
 		}
 		return
 	}
-	if s.store.AuthorizeEvent(identity, true) != nil {
+	if s.store.AuthorizeEvent(identity, true) != nil || s.store.AuthorizeNodeSession(identity, endpoint.reg) != nil {
 		return
 	}
 	endpoint.enqueue(&routesync.Msg{Type: routesync.TypeEventAck, EventAck: &routesync.EventAck{

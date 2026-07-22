@@ -52,6 +52,7 @@ func finalPlacerHandler(service http.Handler) http.Handler {
 	mux := http.NewServeMux()
 	registry := transportauth.Middleware(transportauth.RoleRegistry, service)
 	mux.Handle(placer.FinalPlanPath, registry)
+	mux.Handle(placer.FinalCatalogSyncPath, registry)
 	mux.Handle(placer.FinalKeyLeasePath, registry)
 	mux.Handle(placer.FinalVerifyKeyPath, transportauth.Middleware(transportauth.RoleRouter, service))
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })

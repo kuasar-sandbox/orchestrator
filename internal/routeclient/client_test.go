@@ -66,6 +66,65 @@ func TestGenerationAuthorizationRequiresEveryFinalServeGate(t *testing.T) {
 	}
 }
 
+func TestRefreshPermitStartsLifetimeAtEachEndpointAttempt(t *testing.T) {
+	client := testClient(t)
+	now := time.Unix(1_700_000_000, 0)
+	client.now = func() time.Time { return now }
+	calls := 0
+	transport := roundTripperFunc(func(request *http.Request) (*http.Response, error) {
+		calls++
+		if calls == 1 {
+			now = now.Add(6 * time.Second)
+			return nil, errors.New("first System replica timed out")
+		}
+		response := routeapi.PermitResponse{
+			ClusterID: client.registryLayout.ClusterID, RegistryGeneration: client.registryLayout.RegistryGeneration,
+			SystemEpoch: 1, RegistryLayoutDigest: client.digest, CommitIndex: 7, MaxLifetimeMillis: 5000,
+			ServeGate: true, WriteGate: true, CutoverGate: true, RecoveryClosed: true,
+		}
+		body, _ := json.Marshal(response)
+		return &http.Response{
+			StatusCode: http.StatusOK, Status: "200 OK", Header: make(http.Header),
+			Body: io.NopCloser(strings.NewReader(string(body))), Request: request,
+		}, nil
+	})
+	for memberID, endpoint := range client.endpoints {
+		endpoint.Client = &http.Client{Transport: transport}
+		client.endpoints[memberID] = endpoint
+	}
+	identity, err := client.RefreshPermit(context.Background())
+	if err != nil || calls != 2 {
+		t.Fatalf("RefreshPermit = %+v, %v calls=%d", identity, err, calls)
+	}
+	if _, err := client.CurrentServeIdentity(false); err != nil {
+		t.Fatalf("later endpoint installed an expired Permit: %v", err)
+	}
+}
+
+func TestRefreshPermitRejectsLifetimeOutsideSignedLayout(t *testing.T) {
+	client := testClient(t)
+	transport := roundTripperFunc(func(request *http.Request) (*http.Response, error) {
+		response := routeapi.PermitResponse{
+			ClusterID: client.registryLayout.ClusterID, RegistryGeneration: client.registryLayout.RegistryGeneration,
+			SystemEpoch: 1, RegistryLayoutDigest: client.digest, CommitIndex: 7,
+			MaxLifetimeMillis: client.registryLayout.ServePermitMaxMillis + 1,
+			ServeGate:         true, WriteGate: true, CutoverGate: true, RecoveryClosed: true,
+		}
+		body, _ := json.Marshal(response)
+		return &http.Response{
+			StatusCode: http.StatusOK, Status: "200 OK", Header: make(http.Header),
+			Body: io.NopCloser(strings.NewReader(string(body))), Request: request,
+		}, nil
+	})
+	for memberID, endpoint := range client.endpoints {
+		endpoint.Client = &http.Client{Transport: transport}
+		client.endpoints[memberID] = endpoint
+	}
+	if _, err := client.RefreshPermit(context.Background()); err == nil {
+		t.Fatal("Permit with an unsigned lifetime was accepted")
+	}
+}
+
 func TestLocalReadsUseReplicaSpreadRendezvousWithoutLeaderBias(t *testing.T) {
 	client := testClient(t)
 	client.leaders[0] = routeapi.LeaderHint{
@@ -325,6 +384,64 @@ func TestListRoutesPageUsesBoundedBucketCursor(t *testing.T) {
 		context.Background(), "/other", clusterstate.WorkflowRoutePaused, 2, first.NextToken,
 	); !errors.Is(err, ErrInvalidRouteListToken) {
 		t.Fatalf("cross-group cursor error = %v", err)
+	}
+}
+
+func TestListRoutesPageUsesSmallInternalRPCPages(t *testing.T) {
+	client := testClient(t)
+	client.permit = &cachedPermit{response: routeapi.PermitResponse{
+		ClusterID: client.registryLayout.ClusterID, RegistryGeneration: client.registryLayout.RegistryGeneration,
+		SystemEpoch: 1, RegistryLayoutDigest: client.digest, CommitIndex: 1, MaxLifetimeMillis: 5000,
+		ServeGate: true, WriteGate: true, CutoverGate: true, RecoveryClosed: true,
+	}, expires: time.Now().Add(time.Minute)}
+	entry := func(index int) routeapi.ListedRoute {
+		return routeapi.ListedRoute{
+			RouteKey: fmt.Sprintf("route-%03d", index), State: clusterstate.WorkflowRouteReady,
+			NodeID: "node-1", TemplateRef: "template-1",
+			Presentation: clusterstate.SandboxPresentationV1{
+				CPUCount: 1, MemoryMB: 512, DiskSizeMB: 64, EnvdVersion: "0.6.1", StartedAt: 1, EndAt: 2,
+			},
+		}
+	}
+	requests := 0
+	transport := roundTripperFunc(func(request *http.Request) (*http.Response, error) {
+		var input routeapi.ListRoutesRequest
+		if err := json.NewDecoder(request.Body).Decode(&input); err != nil {
+			return nil, err
+		}
+		requests++
+		if input.Limit > routeListRPCPageSize {
+			return nil, fmt.Errorf("internal Route page limit = %d", input.Limit)
+		}
+		response := routeapi.ListRoutesResponse{Bucket: input.Bucket, SnapshotRevision: 11}
+		if input.Bucket == 0 {
+			start := 0
+			if input.AfterRouteKey != "" {
+				if _, err := fmt.Sscanf(input.AfterRouteKey, "route-%03d", &start); err != nil {
+					return nil, err
+				}
+				start++
+			}
+			for index := start; index < 101 && len(response.Routes) < int(input.Limit); index++ {
+				response.Routes = append(response.Routes, entry(index))
+			}
+			if start+len(response.Routes) < 101 {
+				response.NextRouteKey = response.Routes[len(response.Routes)-1].RouteKey
+			}
+		}
+		body, _ := json.Marshal(response)
+		return &http.Response{
+			StatusCode: http.StatusOK, Status: "200 OK", Header: make(http.Header),
+			Body: io.NopCloser(strings.NewReader(string(body))), Request: request,
+		}, nil
+	})
+	for memberID, endpoint := range client.endpoints {
+		endpoint.Client = &http.Client{Transport: transport}
+		client.endpoints[memberID] = endpoint
+	}
+	result, err := client.ListRoutesPage(context.Background(), "/group", "", 100, "")
+	if err != nil || len(result.Routes) != 100 || result.NextToken == "" || requests < 13 {
+		t.Fatalf("Route page = routes=%d token=%q requests=%d err=%v", len(result.Routes), result.NextToken, requests, err)
 	}
 }
 

@@ -84,15 +84,19 @@ type CloseRegistryGenerationResponse struct {
 }
 
 type OperatorService struct {
-	store  *RaftStore
-	holder *session.Holder
+	store   *RaftStore
+	retirer IdentityRetirer
 }
 
-func NewOperatorService(store *RaftStore, holder *session.Holder) (*OperatorService, error) {
-	if store == nil || holder == nil {
-		return nil, errors.New("controlplane: operator service requires consensus and Session Holder")
+type IdentityRetirer interface {
+	RetireIdentity(context.Context, session.IdentityRetirement) (bool, error)
+}
+
+func NewOperatorService(store *RaftStore, retirer IdentityRetirer) (*OperatorService, error) {
+	if store == nil || retirer == nil {
+		return nil, errors.New("controlplane: operator service requires consensus and Session retirement")
 	}
-	return &OperatorService{store: store, holder: holder}, nil
+	return &OperatorService{store: store, retirer: retirer}, nil
 }
 
 func (s *OperatorService) EnrollNode(ctx context.Context, request EnrollNodeRequest) error {
@@ -117,7 +121,7 @@ func (s *OperatorService) RetireNode(ctx context.Context, request RetireNodeRequ
 	if err != nil || current != request.RegistryServeIdentity {
 		return errors.New("controlplane: node retirement targets another serving Registry History Generation")
 	}
-	retired, err := s.holder.RetireIdentity(ctx, session.IdentityRetirement{
+	retired, err := s.retirer.RetireIdentity(ctx, session.IdentityRetirement{
 		NodeID: request.NodeID, EnrollmentID: request.EnrollmentID, LastNodeEpoch: request.LastNodeEpoch,
 	})
 	if err != nil {

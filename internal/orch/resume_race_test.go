@@ -95,7 +95,10 @@ func (stubVS) Attach(context.Context, vswitch.AttachReq) (*vswitch.Port, error) 
 func (stubVS) Detach(context.Context, string) error { return nil }
 func (stubVS) TapFD(port string) vswitch.TapFD      { return vswitch.TapFD{Exec: []string{"true", port}} }
 
-type releaseAdmissionFake struct{ wake chan struct{} }
+type releaseAdmissionFake struct {
+	wake     chan struct{}
+	released []string
+}
 
 func sandboxTestEvent(update nodeexec.EventUpdate) nodeexec.EventUpdate {
 	presentation := clusterstate.SandboxPresentationV1{
@@ -114,10 +117,83 @@ func (f *releaseAdmissionFake) PrepareAdmission(id, digest string, _ nodectl.San
 func (f *releaseAdmissionFake) ClaimAdmission(id, digest string) (nodectl.PreparedAdmissionResult, error) {
 	return f.GetAdmission(id, digest)
 }
-func (*releaseAdmissionFake) ReleaseAdmission(id, digest, reason string) (nodectl.PreparedAdmissionResult, error) {
+func (f *releaseAdmissionFake) ReleaseAdmission(id, digest, reason string) (nodectl.PreparedAdmissionResult, error) {
+	f.released = append(f.released, id+":"+reason)
 	return nodectl.PreparedAdmissionResult{
 		SandboxID: id, DemandDigest: digest, State: nodectl.PreparedReleased, Reason: reason,
 	}, nil
+}
+
+func TestStartupTerminalizesDeadRunningClusterSandbox(t *testing.T) {
+	ctx := context.Background()
+	o := testOrch(t)
+	sid := "sandbox-dead-after-restart"
+	templateRef := "bare-img-" + strings.Repeat("b", 64)
+	dispatch := clusterResumeDispatch(t, sid, templateRef)
+	sandbox := &types.Sandbox{
+		ID: sid, TemplateID: templateRef, State: types.StateStarting,
+		AuthKey: strings.Repeat("a", 64), ManifestKey: strings.Repeat("b", 64),
+		CreatedUnix: 1,
+	}
+	if _, err := o.st.RecordSandboxWorkflow(ctx, dispatch, nodeexec.AdmissionDecision{
+		State: nodeexec.AdmissionAdmitted, Result: clusterstate.DispatchAcceptedAdmitted,
+		ReservationToken: "reservation-dead",
+	}, sandbox); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := o.st.Get(ctx, sid)
+	if err != nil || stored == nil {
+		t.Fatalf("stored Sandbox = %+v, %v", stored, err)
+	}
+	if _, err := o.st.CommitSandboxEvent(ctx, stored, sandboxTestEvent(nodeexec.EventUpdate{
+		State: string(clusterstate.WorkflowRouteReady), TargetPort: 49983,
+	})); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.st.SetState(ctx, sid, types.StateDead); err != nil {
+		t.Fatal(err)
+	}
+	admission := &releaseAdmissionFake{wake: make(chan struct{})}
+	authority, err := nodeexec.NewAuthority(
+		o.st, admission,
+		func(context.Context) (nodeexec.LocalSessionIdentity, error) {
+			return nodeexec.LocalSessionIdentity{
+				NodeID: "node-1", NodeEpoch: 7, SessionSeq: 1, DataEndpoint: "node-1:8443",
+			}, nil
+		},
+		func(context.Context) (nodeexec.BuildCapacity, string, error) {
+			return nodeexec.BuildCapacity{Slots: 1, QueueLimit: 1}, "", nil
+		},
+		func(context.Context, nodeexec.DispatchRecord) (*types.Build, error) { return nil, nil },
+		func(context.Context, nodeexec.DispatchRecord) (*types.Sandbox, error) { return nil, nil },
+		func(context.Context, nodeexec.DispatchRecord) (nodectl.SandboxAdmissionDemand, error) {
+			return nodectl.SandboxAdmissionDemand{}, nil
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	node := &FinalClusterNode{
+		store: o.st, authority: authority,
+		session: &ClusterSession{nodeID: "node-1", nodeEpoch: 7},
+	}
+	if err := node.reconcileDeadRunningSandboxes(ctx, 10); err != nil {
+		t.Fatal(err)
+	}
+	record, err := o.st.GetNodeWorkflow(ctx, clusterstate.ExecutionKindSandbox, sid)
+	if err != nil || record == nil || record.AdmissionState != nodeexec.AdmissionTerminal ||
+		record.ResourceClaimed || record.LatestEvent == nil || record.LatestEvent.State != "ERROR" {
+		t.Fatalf("terminal workflow = %+v, %v", record, err)
+	}
+	if len(admission.released) != 1 || !strings.Contains(admission.released[0], "runner is absent") {
+		t.Fatalf("Admission release = %v", admission.released)
+	}
+	events, _, err := o.st.PendingExecutionEvents(
+		ctx, "node-1", 7, routesync.EventCursor{}, 10, routesync.MaxExecutionEventBytes,
+	)
+	if err != nil || len(events) != 1 || events[0].State != "ERROR" {
+		t.Fatalf("durable terminal outbox = %+v, %v", events, err)
+	}
 }
 func (*releaseAdmissionFake) FinalizeAdmission(string, string) error { return nil }
 func (*releaseAdmissionFake) PromoteQueued() ([]nodectl.PreparedAdmissionResult, error) {

@@ -28,6 +28,7 @@ const (
 	sessionKeyLeasePath = "/internal/session-holder/key-lease"
 	sessionCommandPath  = "/internal/session-holder/command"
 	sessionRecoveryPath = "/internal/session-holder/recovery-command"
+	sessionRetirePath   = "/internal/session-holder/retire"
 	maximumSessionRPC   = 1 << 20
 	sessionSnapshotPage = 256
 )
@@ -164,6 +165,69 @@ func (m *SessionMesh) Mount(mux *http.ServeMux) {
 	mux.HandleFunc(sessionKeyLeasePath, m.serveKeyLease)
 	mux.HandleFunc(sessionCommandPath, m.serveCommand)
 	mux.HandleFunc(sessionRecoveryPath, m.serveRecoveryCommand)
+	mux.HandleFunc(sessionRetirePath, m.serveRetireIdentity)
+}
+
+func (m *SessionMesh) RetireIdentityAt(
+	ctx context.Context,
+	holderID string,
+	retirement session.IdentityRetirement,
+) (bool, error) {
+	if holderID == m.self {
+		holder, err := m.localHolder()
+		if err != nil {
+			return false, err
+		}
+		return holder.RetireIdentity(ctx, retirement)
+	}
+	peer, ok := m.peers[holderID]
+	if !ok {
+		return false, session.ErrSessionUnavailable
+	}
+	var response retireIdentityRPCResponse
+	err := postSessionJSON(ctx, peer, sessionRetirePath, retireIdentityRPCRequest{Retirement: retirement}, &response)
+	if err != nil {
+		return false, err
+	}
+	if response.Error != "" {
+		return false, decodeSessionRPCError(response.Code, response.Error)
+	}
+	return response.Retired, nil
+}
+
+// RetireIdentity commits retirement locally first, then fences every possible
+// Holder. Directory state is only a hint and cannot safely select one peer.
+func (m *SessionMesh) RetireIdentity(
+	ctx context.Context,
+	retirement session.IdentityRetirement,
+) (bool, error) {
+	retired, err := m.RetireIdentityAt(ctx, m.self, retirement)
+	if err != nil || !retired {
+		return retired, err
+	}
+	type result struct {
+		memberID string
+		retired  bool
+		err      error
+	}
+	results := make(chan result, len(m.peers))
+	for memberID := range m.peers {
+		memberID := memberID
+		go func() {
+			removed, callErr := m.RetireIdentityAt(ctx, memberID, retirement)
+			results <- result{memberID: memberID, retired: removed, err: callErr}
+		}()
+	}
+	var joined error
+	for range m.peers {
+		result := <-results
+		if result.err != nil {
+			joined = errors.Join(joined, fmt.Errorf("retire Session Holder %s: %w", result.memberID, result.err))
+		} else if !result.retired {
+			joined = errors.Join(joined, fmt.Errorf("retire Session Holder %s: exact identity was not fenced", result.memberID))
+		}
+	}
+	return joined == nil, joined
 }
 
 func (m *SessionMesh) InstallKeyLeaseAt(
@@ -543,6 +607,28 @@ func (m *SessionMesh) serveRecoveryCommand(w http.ResponseWriter, request *http.
 	writeSessionJSON(w, http.StatusOK, response)
 }
 
+func (m *SessionMesh) serveRetireIdentity(w http.ResponseWriter, request *http.Request) {
+	if request.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var input retireIdentityRPCRequest
+	if err := decodeSessionJSON(request.Body, &input); err != nil || input.Retirement.Validate() != nil {
+		writeSessionJSON(w, http.StatusBadRequest, retireIdentityRPCResponse{Error: "invalid retirement request", Code: "INVALID"})
+		return
+	}
+	holder, err := m.localHolder()
+	retired := false
+	if err == nil {
+		retired, err = holder.RetireIdentity(request.Context(), input.Retirement)
+	}
+	response := retireIdentityRPCResponse{Retired: retired}
+	if err != nil {
+		response.Error, response.Code = err.Error(), sessionErrorCode(err)
+	}
+	writeSessionJSON(w, http.StatusOK, response)
+}
+
 func (m *SessionMesh) broadcastDelta(ctx context.Context, delta session.DirectoryDelta) {
 	for _, peer := range m.peers {
 		peer := peer
@@ -707,6 +793,16 @@ type commandRPCResponse struct {
 	Sent  bool             `json:"sent"`
 	Code  string           `json:"code,omitempty"`
 	Error string           `json:"error,omitempty"`
+}
+
+type retireIdentityRPCRequest struct {
+	Retirement session.IdentityRetirement `json:"retirement"`
+}
+
+type retireIdentityRPCResponse struct {
+	Retired bool   `json:"retired"`
+	Code    string `json:"code,omitempty"`
+	Error   string `json:"error,omitempty"`
 }
 
 func postSessionJSON(ctx context.Context, peer SessionPeer, path string, input, output any) error {

@@ -333,16 +333,19 @@ func (s *RaftStore) nodeLock(nodeID string) *sync.Mutex {
 	return &s.locks[hash.Sum32()%uint32(len(s.locks))]
 }
 
-func (s *RaftStore) Catalog(ctx context.Context) ([]placement.CatalogNode, error) {
+func (s *RaftStore) Catalog(ctx context.Context) (placement.CatalogSnapshot, error) {
 	state, err := s.runtime.ReadSystemStrong(ctx)
 	if err != nil {
-		return nil, err
+		return placement.CatalogSnapshot{}, err
 	}
-	if state.ClusterID != s.registryLayout.ClusterID || state.RegistryGeneration != s.registryLayout.RegistryGeneration {
-		return nil, errors.New("controlplane: Node Catalog belongs to another Registry History Generation")
+	if state.ClusterID != s.registryLayout.ClusterID || state.RegistryGeneration != s.registryLayout.RegistryGeneration ||
+		state.ActiveRegistryLayoutDigest != s.digest {
+		return placement.CatalogSnapshot{}, errors.New("controlplane: Node Catalog belongs to another Registry History Generation")
 	}
 	nodes := make([]placement.CatalogNode, 0, len(state.NodeEnrollments))
+	revision := uint64(0)
 	for _, enrollment := range state.NodeEnrollments {
+		revision = max(revision, enrollment.LastAppliedIndex)
 		if enrollment.Retired || enrollment.Catalog == nil {
 			continue
 		}
@@ -356,7 +359,10 @@ func (s *RaftStore) Catalog(ctx context.Context) ([]placement.CatalogNode, error
 			BuildStorageCapacity: catalog.BuildStorage,
 		})
 	}
-	return nodes, nil
+	return placement.NewCatalogSnapshot(
+		state.ClusterID, state.RegistryGeneration, state.SystemEpoch,
+		state.ActiveRegistryLayoutDigest, revision, nodes,
+	)
 }
 
 func (s *RaftStore) CommitRouteWorkflow(

@@ -79,14 +79,14 @@ type BuildPlanInput struct {
 }
 
 type PlanRequest struct {
-	Kind                PlanKind                `json:"kind"`
-	Group               string                  `json:"group"`
-	RouteKey            string                  `json:"route_key,omitempty"`
-	Nodes               []placement.CatalogNode `json:"nodes"`
-	ExcludedNodeIDs     []string                `json:"excluded_node_ids,omitempty"`
-	TargetRuntimeDigest string                  `json:"target_runtime_digest,omitempty"`
-	Sandbox             *SandboxPlanInput       `json:"sandbox,omitempty"`
-	Build               *BuildPlanInput         `json:"build,omitempty"`
+	Kind                PlanKind                   `json:"kind"`
+	Group               string                     `json:"group"`
+	RouteKey            string                     `json:"route_key,omitempty"`
+	Catalog             placement.CatalogReference `json:"catalog"`
+	ExcludedNodeIDs     []string                   `json:"excluded_node_ids,omitempty"`
+	TargetRuntimeDigest string                     `json:"target_runtime_digest,omitempty"`
+	Sandbox             *SandboxPlanInput          `json:"sandbox,omitempty"`
+	Build               *BuildPlanInput            `json:"build,omitempty"`
 }
 
 type PlanResponse struct {
@@ -94,12 +94,14 @@ type PlanResponse struct {
 	NormalizedDemand      []byte                            `json:"normalized_demand,omitempty"`
 	DispatchSpec          []byte                            `json:"dispatch_spec,omitempty"`
 	ProviderPolicyVersion string                            `json:"provider_policy_version,omitempty"`
+	ErrorCode             string                            `json:"error_code,omitempty"`
 	Error                 string                            `json:"error,omitempty"`
 }
 
 type FinalService struct {
 	provider clusterstate.SandboxGroupProvider
 	config   clustercfg.PlacementConfig
+	catalogs *catalogCache
 }
 
 func NewFinalService(provider clusterstate.SandboxGroupProvider, config clustercfg.PlacementConfig) (*FinalService, error) {
@@ -112,7 +114,7 @@ func NewFinalService(provider clusterstate.SandboxGroupProvider, config clusterc
 	if config.Candidates != placement.DefaultCandidateCount {
 		return nil, fmt.Errorf("placer: initial generation requires exactly %d candidates", placement.DefaultCandidateCount)
 	}
-	return &FinalService{provider: provider, config: config}, nil
+	return &FinalService{provider: provider, config: config, catalogs: newCatalogCache()}, nil
 }
 
 func (s *FinalService) ServeHTTP(w http.ResponseWriter, request *http.Request) {
@@ -128,6 +130,10 @@ func (s *FinalService) ServeHTTP(w http.ResponseWriter, request *http.Request) {
 		s.serveKeyLease(w, request)
 		return
 	}
+	if request.URL.Path == FinalCatalogSyncPath {
+		s.serveCatalogSync(w, request)
+		return
+	}
 	if request.URL.Path != FinalPlanPath {
 		http.NotFound(w, request)
 		return
@@ -140,6 +146,28 @@ func (s *FinalService) ServeHTTP(w http.ResponseWriter, request *http.Request) {
 	response, err := s.Plan(request.Context(), input)
 	if err != nil {
 		response.Error = err.Error()
+		if errors.Is(err, ErrCatalogUnavailable) {
+			response.ErrorCode = PlanErrorCatalogUnavailable
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(response)
+}
+
+func (s *FinalService) serveCatalogSync(w http.ResponseWriter, request *http.Request) {
+	var input CatalogSyncRequest
+	if err := decodeFinalRequest(request, MaximumCatalogSyncRequestBytes, &input); err != nil {
+		http.Error(w, "invalid Node Catalog sync request", http.StatusBadRequest)
+		return
+	}
+	response, err := s.catalogs.install(input)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusConflict)
+		return
+	}
+	if err := response.ValidateFor(input); err != nil {
+		http.Error(w, "invalid Node Catalog sync response", http.StatusInternalServerError)
+		return
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(response)
@@ -218,8 +246,15 @@ func decodeFinalRequest(request *http.Request, limit int64, target any) error {
 }
 
 func (s *FinalService) Plan(ctx context.Context, request PlanRequest) (PlanResponse, error) {
-	if request.Group == "" || len(request.Nodes) == 0 {
-		return PlanResponse{}, errors.New("placer: group and Node Catalog are required")
+	if request.Group == "" {
+		return PlanResponse{}, errors.New("placer: group is required")
+	}
+	nodes, err := s.catalogs.nodes(request.Catalog)
+	if err != nil {
+		return PlanResponse{}, catalogSyncError(request.Catalog, err)
+	}
+	if len(nodes) == 0 {
+		return PlanResponse{}, errors.New("placer: Node Catalog is empty")
 	}
 	record, found, err := s.provider.GetRecord(ctx, request.Group)
 	if err != nil {
@@ -246,7 +281,7 @@ func (s *FinalService) Plan(ctx context.Context, request PlanRequest) (PlanRespo
 	case PlanBuild:
 		policy.RequiredCapabilities = []string{"build"}
 	}
-	if selectors, ok := effectiveCatalogSelectors(request.Group, request.Nodes, hint.NodeSelectors, s.config.ShuffleSharding); ok {
+	if selectors, ok := effectiveCatalogSelectors(request.Group, nodes, hint.NodeSelectors, s.config.ShuffleSharding); ok {
 		if len(selectors) == 0 {
 			return PlanResponse{}, errors.New("placer: applicable shuffle-sharding rule has no eligible shard values")
 		}
@@ -283,7 +318,7 @@ func (s *FinalService) Plan(ctx context.Context, request PlanRequest) (PlanRespo
 			return PlanResponse{}, err
 		}
 		candidates, err := placement.PlaceSandboxN(
-			request.Nodes, sandboxDemand, policy, s.config.Candidates, nil,
+			nodes, sandboxDemand, policy, s.config.Candidates, nil,
 		)
 		if err != nil {
 			return PlanResponse{}, err
@@ -322,7 +357,7 @@ func (s *FinalService) Plan(ctx context.Context, request PlanRequest) (PlanRespo
 		if err != nil {
 			return PlanResponse{}, err
 		}
-		candidates, err := placement.PlaceBuildN(request.Nodes, request.Build.Demand, policy, s.config.Candidates, nil)
+		candidates, err := placement.PlaceBuildN(nodes, request.Build.Demand, policy, s.config.Candidates, nil)
 		if err != nil {
 			return PlanResponse{}, err
 		}
