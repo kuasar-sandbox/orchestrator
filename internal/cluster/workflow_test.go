@@ -47,6 +47,48 @@ func TestRouteWorkflowTypesValidateFrozenIntent(t *testing.T) {
 	}
 }
 
+func TestStartingWorkflowsRequireProjectableExecutionBindings(t *testing.T) {
+	route := RouteWorkflowRecord{
+		Group: "/g", RouteKey: "rk", State: WorkflowRouteStarting,
+		Revision: Revision{RegistryGeneration: "g1", ShardID: 7, LogIndex: 11},
+		Starting: &RouteStartingState{
+			SandboxID: "s1", PlacementRound: 1,
+			CandidatePool: []PlacementCandidate{testPlacementCandidate("n1")},
+			Intent:        workflowSandboxIntent(t),
+		},
+	}
+	if err := route.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	route.Group = strings.Repeat("g", MaxExecutionBindingSize)
+	if err := route.Validate(); err == nil {
+		t.Fatal("STARTING Route with an unencodable group was accepted")
+	}
+	route.Group = "/g"
+	route.Starting.SandboxID = "bad\nobject"
+	if err := route.Validate(); err == nil {
+		t.Fatal("STARTING Route with an invalid Binding object ID was accepted")
+	}
+
+	build := BuildRecord{
+		Group: "/g", BuildID: "b1", State: BuildStarting,
+		Revision: Revision{RegistryGeneration: "g1", ShardID: 8, LogIndex: 12},
+		Starting: &BuildStartingState{
+			BuildID:       "b1",
+			CandidatePool: []PlacementCandidate{testPlacementCandidate("n1")},
+			Intent:        workflowBuildIntent(t),
+		},
+	}
+	if err := build.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	build.BuildID = "bad\nobject"
+	build.Starting.BuildID = build.BuildID
+	if err := build.Validate(); err == nil {
+		t.Fatal("BUILD_STARTING with an invalid Binding object ID was accepted")
+	}
+}
+
 func TestReadyRouteAndRevisionValidation(t *testing.T) {
 	record := RouteWorkflowRecord{
 		Group: "/g", RouteKey: "rk", State: WorkflowRouteReady,

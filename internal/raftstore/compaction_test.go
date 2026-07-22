@@ -180,4 +180,9 @@ func TestRuntimeCompactsFenceOnlyAfterRetentionAndEveryReplicaProof(t *testing.T
 		Type: DataPutRoute, Identity: identity,
 		Expect: RevisionExpectation{LogIndex: compactedRoute.Revision.LogIndex}, Route: &replacement,
 	})
+	if err := runtime.CompactExecutionFence(
+		context.Background(), identity, "/g", "rk", "sandbox-1",
+	); err != nil {
+		t.Fatalf("retry compacted execution fence: %v", err)
+	}
 }

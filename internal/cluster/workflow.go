@@ -616,6 +616,12 @@ func (r RouteWorkflowRecord) Validate() error {
 		if err := r.Starting.Validate(); err != nil {
 			return err
 		}
+		if err := validateProspectiveExecutionBindings(
+			ExecutionKindSandbox, r.Starting.SandboxID, r.Group, r.RouteKey,
+			r.Revision.RegistryGeneration, r.Starting.CandidatePool, r.Starting.Intent,
+		); err != nil {
+			return err
+		}
 		if r.Starting.Binding != nil {
 			if err := r.Starting.Binding.ValidateWorkflow(ExecutionKindSandbox, r.Starting.SandboxID, r.Group, r.RouteKey, r.Starting.Intent); err != nil {
 				return err
@@ -852,6 +858,12 @@ func (r BuildRecord) Validate() error {
 			return errors.New("cluster: missing or mismatched BUILD_STARTING state")
 		}
 		if err := r.Starting.Validate(); err != nil {
+			return err
+		}
+		if err := validateProspectiveExecutionBindings(
+			ExecutionKindBuild, r.BuildID, r.Group, "", r.Revision.RegistryGeneration,
+			r.Starting.CandidatePool, r.Starting.Intent,
+		); err != nil {
 			return err
 		}
 		if r.Starting.Binding != nil {
@@ -1158,6 +1170,41 @@ func validDigest(digest string) bool {
 	}
 	decoded, err := hex.DecodeString(digest)
 	return err == nil && hex.EncodeToString(decoded) == digest
+}
+
+func validateProspectiveExecutionBindings(
+	kind ExecutionKind,
+	objectID string,
+	group string,
+	routeKey string,
+	registryGeneration string,
+	candidates []PlacementCandidate,
+	intent DispatchIntent,
+) error {
+	var demandDigest, dispatchSpecDigest [sha256.Size]byte
+	demand, demandErr := hex.DecodeString(intent.DemandDigest)
+	dispatchSpec, dispatchErr := hex.DecodeString(intent.DispatchSpecDigest)
+	if demandErr != nil || dispatchErr != nil || len(demand) != sha256.Size || len(dispatchSpec) != sha256.Size {
+		return errors.New("cluster: prospective execution Binding has invalid dispatch digests")
+	}
+	copy(demandDigest[:], demand)
+	copy(dispatchSpecDigest[:], dispatchSpec)
+	for _, candidate := range candidates {
+		if _, err := EncodeExecutionBinding(ExecutionBinding{
+			RegistryGeneration: registryGeneration,
+			Kind:               kind,
+			ObjectID:           objectID,
+			Group:              group,
+			RouteKey:           routeKey,
+			NodeID:             candidate.NodeID,
+			NodeEpoch:          1,
+			DemandDigest:       demandDigest,
+			DispatchSpecDigest: dispatchSpecDigest,
+		}); err != nil {
+			return fmt.Errorf("cluster: workflow identity cannot be projected into an execution Binding: %w", err)
+		}
+	}
+	return nil
 }
 
 func digestMatches(digest string, value []byte) bool {

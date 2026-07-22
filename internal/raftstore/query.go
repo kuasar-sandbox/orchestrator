@@ -486,7 +486,8 @@ func (q FenceLookup) Validate() error {
 }
 
 type FenceLookupResult struct {
-	Fence *clusterstate.ExecutionFence `json:"fence,omitempty"`
+	Fence              *clusterstate.ExecutionFence `json:"fence,omitempty"`
+	HistoricallyFenced bool                         `json:"historically_fenced"`
 }
 
 func lookupFence(state DataState, query FenceLookup) FenceLookupResult {
@@ -499,12 +500,14 @@ func lookupFence(state DataState, query FenceLookup) FenceLookupResult {
 	if err != nil || shardID != state.ShardID || query.Identity.ShardID != state.ShardID {
 		return FenceLookupResult{}
 	}
-	fence, found := state.Fences[fenceMapKey(query.Group, query.RouteKey, query.SandboxID)]
+	key := fenceMapKey(query.Group, query.RouteKey, query.SandboxID)
+	_, historicallyFenced := state.UsedSandboxIDs[key]
+	fence, found := state.Fences[key]
 	if !found {
-		return FenceLookupResult{}
+		return FenceLookupResult{HistoricallyFenced: historicallyFenced}
 	}
 	copy := cloneExecutionFence(fence)
-	return FenceLookupResult{Fence: &copy}
+	return FenceLookupResult{Fence: &copy, HistoricallyFenced: historicallyFenced}
 }
 
 func lookupRoute(state DataState, request routeapi.ReadRouteRequest) routeapi.ReadRouteResponse {

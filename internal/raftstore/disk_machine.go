@@ -624,6 +624,16 @@ func (m *diskStateMachine) lookupData(
 		if found {
 			state.Fences[key] = fence
 		}
+		used, found, err := getStateValue(reader, stateRowKey(prefix, stateSandboxIDTable, key))
+		if err != nil {
+			return DataLookupResult{}, err
+		}
+		if found {
+			if len(used) != 1 || used[0] != 1 {
+				return DataLookupResult{}, errors.New("raftstore: malformed used Sandbox ID row")
+			}
+			state.UsedSandboxIDs[key] = struct{}{}
+		}
 	case query.Pending != nil:
 		pending, err := lookupPendingOnDisk(reader, prefix, state, *query.Pending)
 		if err != nil {
