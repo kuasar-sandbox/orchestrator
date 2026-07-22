@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"sync"
 	"testing"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
@@ -35,5 +36,35 @@ func TestRouteReplayUsesFingerprintToken(t *testing.T) {
 	}
 	if fp := o.SourceFingerprint(); fp != "fp-test" {
 		t.Fatalf("fingerprint=%q", fp)
+	}
+}
+
+func TestConcurrentRoutePublishPreservesRevisionOrder(t *testing.T) {
+	const count = 512
+	o := &Orchestrator{
+		routeFP: "fp-test",
+		subs:    map[int]chan routesync.Event{},
+		log:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	events, cancel := o.Subscribe()
+	defer cancel()
+
+	var publishers sync.WaitGroup
+	publishers.Add(count)
+	for i := 0; i < count; i++ {
+		go func() {
+			defer publishers.Done()
+			o.publish(routesync.Event{
+				Kind:  routesync.TypeUpsert,
+				Route: routesync.RouteEntry{SandboxID: "route", State: routesync.StateRunning},
+			})
+		}()
+	}
+	publishers.Wait()
+	for want := uint64(1); want <= count; want++ {
+		event := <-events
+		if event.Route.AuthorityRevision != want {
+			t.Fatalf("delivered authority revision %d, want %d", event.Route.AuthorityRevision, want)
+		}
 	}
 }
