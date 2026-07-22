@@ -569,14 +569,13 @@ func (a *Authority) FinalizeWorkflow(
 	if record.BindingDigest != bindingDigest {
 		return ErrWorkflowConflict
 	}
-	finalizeErr := a.journal.FinalizeNodeWorkflow(ctx, kind, objectID, bindingDigest)
-	if finalizeErr != nil && !errors.Is(finalizeErr, ErrFinalOutboxPending) {
-		return finalizeErr
-	}
 	if kind == clusterstate.ExecutionKindSandbox {
+		if record.AdmissionState != AdmissionRejected && record.AdmissionState != AdmissionTerminal || record.ResourceClaimed {
+			return ErrWorkflowState
+		}
 		if err := a.sandbox.FinalizeAdmission(objectID, record.DemandDigest); err != nil {
 			return err
 		}
 	}
-	return finalizeErr
+	return a.journal.FinalizeNodeWorkflow(ctx, kind, objectID, bindingDigest)
 }
