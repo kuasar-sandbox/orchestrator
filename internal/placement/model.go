@@ -123,7 +123,7 @@ func ProbePlacement(snapshot PlacementLoadSnapshot, sampleAge time.Duration, req
 		return stale("placement sample is stale")
 	}
 	if snapshot.Draining {
-		return reject("node is draining")
+		return stale("node is temporarily draining")
 	}
 	switch snapshot.WaterZone {
 	case "red", "critical":
