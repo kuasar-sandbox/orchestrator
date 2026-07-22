@@ -144,6 +144,36 @@ func TestPlacementFailuresDoNotInventExecutionProof(t *testing.T) {
 	}
 }
 
+func TestPlacementFailureFenceProofIsBoundToRouteIdentity(t *testing.T) {
+	failure := RoutePlacementFailureState{
+		SandboxID: "s1", PlacementRound: 2,
+		CandidatePool:        []PlacementCandidate{{NodeID: "n1"}, {NodeID: "n2"}},
+		DefinitivelyRejected: []uint32{0, 1}, Intent: workflowSandboxIntent(t), Reason: "placement exhausted",
+	}
+	fence, err := NewPlacementFailureFence("/g", "rk", "g1", failure)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fence.Revision = Revision{RegistryGeneration: "g1", ShardID: 1, LogIndex: 10}
+	if err := fence.Validate(); err != nil {
+		t.Fatal(err)
+	}
+
+	for name, mutate := range map[string]func(*ExecutionFence){
+		"group":      func(f *ExecutionFence) { f.Group = "/another-group" },
+		"route key":  func(f *ExecutionFence) { f.RouteKey = "another-route" },
+		"generation": func(f *ExecutionFence) { f.RegistryGeneration, f.Revision.RegistryGeneration = "g2", "g2" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			transplanted := fence
+			mutate(&transplanted)
+			if err := transplanted.Validate(); err == nil {
+				t.Fatal("placement-failure proof was accepted for another Route identity")
+			}
+		})
+	}
+}
+
 func TestBuildProjectionRequiresCanonicalDataEndpoint(t *testing.T) {
 	build := registeredBuildRecord(t)
 	build.Projection.DataEndpoint = "https://node-1:8443"
