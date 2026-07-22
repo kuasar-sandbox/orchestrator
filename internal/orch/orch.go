@@ -679,6 +679,17 @@ type snapInfo struct {
 // yields a zero snapInfo and the launch proceeds with node defaults (the runtime
 // stays the capacity enforcer).
 func (o *Orchestrator) snapshotConfig(ctx context.Context, sb *types.Sandbox, ref string) snapInfo {
+	info, err := o.readSnapshotConfig(ctx, sb, ref)
+	if err != nil {
+		o.log.Warn("snapshot config probe failed; using node defaults", "sid", sb.ID, "ref", ref, "err", err)
+		return snapInfo{}
+	}
+	return info
+}
+
+// readSnapshotConfig is the strict form used before node-local Admission. A
+// restore must not reserve resources until its frozen capacity is known.
+func (o *Orchestrator) readSnapshotConfig(ctx context.Context, sb *types.Sandbox, ref string) (snapInfo, error) {
 	var info snapInfo
 	args := []string{"info", "--json"}
 	if strings.HasPrefix(ref, "manifest://") {
@@ -688,8 +699,7 @@ func (o *Orchestrator) snapshotConfig(ctx context.Context, sb *types.Sandbox, re
 	cmd.Env = append(os.Environ(), "MANIFEST_KEY="+sb.ManifestKey)
 	out, err := cmd.Output()
 	if err != nil {
-		o.log.Warn("snapshot config probe failed; using node defaults", "sid", sb.ID, "ref", ref, "err", err)
-		return info
+		return info, fmt.Errorf("probe snapshot config: %w", err)
 	}
 	// info --json marshals restore.SnapshotCfg by Go field name (capitalized).
 	var cfg struct {
@@ -702,8 +712,7 @@ func (o *Orchestrator) snapshotConfig(ctx context.Context, sb *types.Sandbox, re
 		Metadata map[string]string `json:"Metadata"`
 	}
 	if err := json.Unmarshal(out, &cfg); err != nil {
-		o.log.Warn("snapshot config parse failed; using node defaults", "sid", sb.ID, "ref", ref, "err", err)
-		return info
+		return info, fmt.Errorf("parse snapshot config: %w", err)
 	}
 	if cfg.Resources.Capacity.CPU > 0 && cfg.Resources.Capacity.Memory != "" {
 		info.CapCPU, info.CapMem, info.HasCapacity = cfg.Resources.Capacity.CPU, cfg.Resources.Capacity.Memory, true
@@ -711,7 +720,7 @@ func (o *Orchestrator) snapshotConfig(ctx context.Context, sb *types.Sandbox, re
 	if nraw := strings.TrimSpace(cfg.Metadata[sandboxcfg.NsNetwork]); nraw != "" {
 		_ = json.Unmarshal([]byte(nraw), &info.Network) // best-effort; malformed -> zero network
 	}
-	return info
+	return info, nil
 }
 
 // --- configsock.Provider ---

@@ -89,8 +89,26 @@ func ResolveResourcesWithDefaults(meta map[string]string, defaultCPU int, defaul
 	if err != nil {
 		return ResolvedResources{}, err
 	}
+	return resolveResourceSpec(spec.Resource, defaultCPU, defaultMemoryBytes)
+}
+
+// ResolveRestoreResources derives only caller-controlled allocatable/startup
+// hints. Snapshot capacity is frozen in snapshot.cfg and is resolved by the
+// selected node before Admission, so a request or Group capacity cannot replace
+// it or distort placement.
+func ResolveRestoreResources(meta map[string]string) (ResolvedResources, error) {
+	spec, err := ParseSpec(meta)
+	if err != nil {
+		return ResolvedResources{}, err
+	}
+	spec.Resource.Capacity = nil
+	return resolveResourceSpec(spec.Resource, 0, 0)
+}
+
+func resolveResourceSpec(spec ResourceSpec, defaultCPU int, defaultMemoryBytes uint64) (ResolvedResources, error) {
 	out := ResolvedResources{CapacityCPU: defaultCPU, CapacityMemoryBytes: defaultMemoryBytes}
-	if capacity := spec.Resource.Capacity; capacity != nil {
+	var err error
+	if capacity := spec.Capacity; capacity != nil {
 		if capacity.CPU > 0 {
 			out.CapacityCPU = capacity.CPU
 		}
@@ -103,7 +121,7 @@ func ResolveResourcesWithDefaults(meta map[string]string, defaultCPU int, defaul
 	}
 	out.FloorCPU = float64(out.CapacityCPU)
 	out.FloorMemoryBytes = out.CapacityMemoryBytes
-	if allocatable := spec.Resource.Allocatable; allocatable != nil {
+	if allocatable := spec.Allocatable; allocatable != nil {
 		if allocatable.CPU > 0 {
 			out.FloorCPU = allocatable.CPU
 		}
@@ -121,7 +139,7 @@ func ResolveResourcesWithDefaults(meta map[string]string, defaultCPU int, defaul
 		return ResolvedResources{}, errors.New("sandboxcfg: allocatable CPU exceeds capacity")
 	}
 	out.StartupMemoryBytes = out.FloorMemoryBytes
-	if startup := spec.Resource.Startup; startup != nil && startup.Memory != "" {
+	if startup := spec.Startup; startup != nil && startup.Memory != "" {
 		out.StartupMemoryBytes, err = util.ParseSize(startup.Memory)
 		if err != nil {
 			return ResolvedResources{}, fmt.Errorf("sandboxcfg: resource startup memory: %w", err)

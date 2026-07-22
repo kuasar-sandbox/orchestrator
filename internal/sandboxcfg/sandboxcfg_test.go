@@ -196,6 +196,20 @@ func TestResolveResourcesMatchesRuntimeDefaults(t *testing.T) {
 	}
 }
 
+func TestResolveRestoreResourcesIgnoresCapacityAndKeepsExplicitFloor(t *testing.T) {
+	resources, err := ResolveRestoreResources(map[string]string{
+		NsResource: `{"capacity":{"cpu":8,"memory":"16GiB"},"allocatable":{"memory":"1GiB"},"startup":{"memory":"2GiB"}}`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resources.CapacityCPU != 0 || resources.CapacityMemoryBytes != 0 ||
+		resources.FloorCPU != 0 || resources.FloorMemoryBytes != 1<<30 ||
+		resources.StartupMemoryBytes != 2<<30 {
+		t.Fatalf("restore resources = %+v", resources)
+	}
+}
+
 func TestMergeNetworkExplicitWins(t *testing.T) {
 	// snapshot-inherited network; create explicitly sets only hostname.
 	snap := NetworkSpec{Hostname: "snap-host", Nexthop: "10.0.0.4", TransitGeneveVNI: 100, DNS: []string{"9.9.9.9"}}

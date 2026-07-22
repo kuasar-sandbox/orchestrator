@@ -902,16 +902,19 @@ func (r *Router) serveData(w http.ResponseWriter, request *http.Request, host st
 		return
 	}
 	var (
-		port          int
-		injectToken   bool
-		authenticated bool
+		port                   int
+		injectToken            bool
+		consumedProviderHeader string
+		authenticated          bool
 	)
 	entry, err := r.resolveRoute(request.Context(), group, routeKey)
 	if err != nil {
 		addressable, addressErr := r.resolveControlRoute(request.Context(), group, routeKey)
 		if addressErr == nil && addressable != nil && addressable.State == clusterstate.WorkflowRoutePaused {
 			var ok bool
-			port, injectToken, ok = r.authorizeDataRequest(w, request, group, addressable.Route, hostPort, hasHostPort)
+			port, injectToken, consumedProviderHeader, ok = r.authorizeDataRequest(
+				w, request, group, addressable.Route, hostPort, hasHostPort,
+			)
 			if !ok {
 				return
 			}
@@ -921,9 +924,11 @@ func (r *Router) serveData(w http.ResponseWriter, request *http.Request, host st
 			entry, err = addressable, nil
 		} else {
 			// Creation by logical key always requires caller authorization.
-			if !r.authorize(w, request.Context(), group, apiKey(request)) {
+			key, header := providerCredential(request)
+			if !r.authorize(w, request.Context(), group, key) {
 				return
 			}
+			consumedProviderHeader = header
 			input, inputErr := defaultSandboxInput()
 			if inputErr != nil {
 				err = inputErr
@@ -957,12 +962,14 @@ func (r *Router) serveData(w http.ResponseWriter, request *http.Request, host st
 	}
 	if !authenticated {
 		var ok bool
-		port, injectToken, ok = r.authorizeDataRequest(w, request, group, entry.Route, hostPort, hasHostPort)
+		port, injectToken, consumedProviderHeader, ok = r.authorizeDataRequest(
+			w, request, group, entry.Route, hostPort, hasHostPort,
+		)
 		if !ok {
 			return
 		}
 	}
-	r.forwardData(w, request, entry, port, injectToken)
+	r.forwardData(w, request, entry, port, injectToken, consumedProviderHeader)
 }
 
 func (r *Router) authorizeDataRequest(
@@ -972,30 +979,40 @@ func (r *Router) authorizeDataRequest(
 	route clusterstate.ReadyRoute,
 	hostPort int,
 	hasHostPort bool,
-) (int, bool, bool) {
+) (int, bool, string, bool) {
 	port, err := requestedPort(request, hostPort, hasHostPort, route.TargetPort)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
-		return 0, false, false
+		return 0, false, "", false
 	}
-	if key := apiKey(request); key != "" {
-		if !r.authorize(w, request.Context(), group, key) {
-			return 0, false, false
+	var providerErr error
+	if key, header := providerCredential(request); key != "" {
+		verified, err := r.verifyCaller(request.Context(), group, key)
+		if verified {
+			return port, true, header, true
 		}
-		return port, true, true
+		if err != nil && r.authMode == "enforce" {
+			providerErr = err
+		} else if r.authMode == "log" {
+			r.log.Warn("Router data request Provider authorization rejected in log mode", "group", group, "err", err)
+		}
 	}
 	injectToken := true
 	if r.dataPlaneAuth == "enforce" || r.dataPlaneAuth == "log" {
 		auth := envdsign.CheckDataPlaneAuth(request, port, route.AccessToken, time.Now())
 		if !auth.OK && r.dataPlaneAuth == "enforce" {
+			if providerErr != nil {
+				http.Error(w, "caller authorization unavailable", http.StatusServiceUnavailable)
+				return 0, false, "", false
+			}
 			http.Error(w, "invalid access token", http.StatusUnauthorized)
-			return 0, false, false
+			return 0, false, "", false
 		}
 		if auth.OK {
 			injectToken = !auth.Signed
 		}
 	}
-	return port, injectToken, true
+	return port, injectToken, "", true
 }
 
 func (r *Router) resumeRoute(ctx context.Context, group, routeKey string) (*routeEntry, error) {
@@ -1040,7 +1057,14 @@ func parseDataHost(host, domain, explicitRouteKey string) (string, int, bool, er
 	return routeKey, port, true, nil
 }
 
-func (r *Router) forwardData(w http.ResponseWriter, request *http.Request, entry *routeEntry, port int, injectToken bool) {
+func (r *Router) forwardData(
+	w http.ResponseWriter,
+	request *http.Request,
+	entry *routeEntry,
+	port int,
+	injectToken bool,
+	consumedProviderHeader string,
+) {
 	if !r.control.CacheAuthorized(entry.ServeIdentity) {
 		http.Error(w, "Router Serve Permit expired", http.StatusServiceUnavailable)
 		return
@@ -1085,12 +1109,7 @@ func (r *Router) forwardData(w http.ResponseWriter, request *http.Request, entry
 	}
 	defer backend.Close()
 	response, err = proxypkg.ForwardHTTPOnce(request, backend, reader, func(next *http.Request) {
-		next.Host = host
-		if injectToken {
-			next.Header.Set(HeaderAccessTok, route.AccessToken)
-		} else {
-			next.Header.Del(HeaderAccessTok)
-		}
+		prepareDataBackendRequest(next, host, route.AccessToken, injectToken, consumedProviderHeader)
 	})
 	if err != nil {
 		http.Error(w, "bad gateway", http.StatusBadGateway)
@@ -1098,6 +1117,27 @@ func (r *Router) forwardData(w http.ResponseWriter, request *http.Request, entry
 	}
 	defer response.Body.Close()
 	proxypkg.WriteHTTPResponse(w, response)
+}
+
+func prepareDataBackendRequest(
+	request *http.Request,
+	host string,
+	accessToken string,
+	injectToken bool,
+	consumedProviderHeader string,
+) {
+	request.Host = host
+	// X-API-KEY is Router-reserved and must never reach tenant code, including
+	// when Provider verification is unavailable and access-token auth succeeds.
+	request.Header.Del(HeaderAPIKey)
+	if consumedProviderHeader != "" && !strings.EqualFold(consumedProviderHeader, HeaderAPIKey) {
+		request.Header.Del(consumedProviderHeader)
+	}
+	if injectToken {
+		request.Header.Set(HeaderAccessTok, accessToken)
+	} else {
+		request.Header.Del(HeaderAccessTok)
+	}
 }
 
 func (r *Router) dialSandboxConnect(
@@ -1292,22 +1332,12 @@ func (r *Router) authorize(w http.ResponseWriter, ctx context.Context, group, ke
 	if r.authMode == "off" {
 		return true
 	}
-	cacheKey := group + "\x00" + key
-	r.authMu.Lock()
-	deadline, cached := r.authOK[cacheKey]
-	r.authMu.Unlock()
-	if cached && time.Now().Before(deadline) {
-		return true
-	}
-	ok, err := r.authorizer.Verify(ctx, group, key)
+	ok, err := r.verifyCaller(ctx, group, key)
 	if err != nil {
 		http.Error(w, "caller authorization unavailable", http.StatusServiceUnavailable)
 		return false
 	}
 	if ok {
-		r.authMu.Lock()
-		r.authOK[cacheKey] = time.Now().Add(r.authTTL)
-		r.authMu.Unlock()
 		return true
 	}
 	if r.authMode == "log" {
@@ -1316,6 +1346,27 @@ func (r *Router) authorize(w http.ResponseWriter, ctx context.Context, group, ke
 	}
 	http.Error(w, "forbidden", http.StatusForbidden)
 	return false
+}
+
+func (r *Router) verifyCaller(ctx context.Context, group, key string) (bool, error) {
+	cacheKey := group + "\x00" + key
+	r.authMu.Lock()
+	deadline, cached := r.authOK[cacheKey]
+	r.authMu.Unlock()
+	if cached && time.Now().Before(deadline) {
+		return true, nil
+	}
+	ok, err := r.authorizer.Verify(ctx, group, key)
+	if err != nil {
+		return false, err
+	}
+	if ok {
+		r.authMu.Lock()
+		r.authOK[cacheKey] = time.Now().Add(r.authTTL)
+		r.authMu.Unlock()
+		return true, nil
+	}
+	return false, nil
 }
 
 func (r *Router) RunCleanup(ctx context.Context) {
@@ -1351,13 +1402,18 @@ func (r *Router) RunCleanup(ctx context.Context) {
 }
 
 func apiKey(request *http.Request) string {
+	key, _ := providerCredential(request)
+	return key
+}
+
+func providerCredential(request *http.Request) (string, string) {
 	if key := request.Header.Get(HeaderAPIKey); key != "" {
-		return key
+		return key, HeaderAPIKey
 	}
 	if auth := request.Header.Get("Authorization"); strings.HasPrefix(strings.ToLower(auth), "bearer ") {
-		return strings.TrimSpace(auth[len("bearer "):])
+		return strings.TrimSpace(auth[len("bearer "):]), "Authorization"
 	}
-	return ""
+	return "", ""
 }
 
 func requestedPort(request *http.Request, hostPort int, hasHostPort bool, targetPort int) (int, error) {

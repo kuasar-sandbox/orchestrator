@@ -303,9 +303,18 @@ func (s *FinalService) Plan(ctx context.Context, request PlanRequest) (PlanRespo
 		if err != nil {
 			return PlanResponse{}, err
 		}
+		template, err := types.ParseTemplateID(templateRef)
+		if err != nil {
+			return PlanResponse{}, err
+		}
 		requestedConfig := clusterstate.WithoutSystemMetadata(request.Sandbox.Config)
 		effectiveConfig := clusterstate.WithoutSystemMetadata(mergeConfig(group.Config, requestedConfig))
-		resources, err := sandboxcfg.ResolveResources(effectiveConfig)
+		var resources sandboxcfg.ResolvedResources
+		if template.Kind == types.KindSnp {
+			resources, err = sandboxcfg.ResolveRestoreResources(effectiveConfig)
+		} else {
+			resources, err = sandboxcfg.ResolveResources(effectiveConfig)
+		}
 		if err != nil {
 			return PlanResponse{}, err
 		}

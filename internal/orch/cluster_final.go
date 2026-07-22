@@ -935,9 +935,10 @@ func (n *FinalClusterNode) sandboxDemand(ctx context.Context, record nodeexec.Di
 	if err != nil {
 		return nodectl.SandboxAdmissionDemand{}, err
 	}
-	if _, err := n.core.resolveByFingerprints(
+	lease, err := n.core.resolveByFingerprints(
 		ctx, record.Group, spec.AuthKeyFingerprint, spec.ManifestKeyFingerprint,
-	); err != nil {
+	)
+	if err != nil {
 		return nodectl.SandboxAdmissionDemand{}, err
 	}
 	normalized, err := placement.ParseNormalizedDemand(record.NormalizedDemand)
@@ -954,6 +955,24 @@ func (n *FinalClusterNode) sandboxDemand(ctx context.Context, record nodeexec.Di
 	)
 	if err != nil {
 		return nodectl.SandboxAdmissionDemand{}, err
+	}
+	template, err := types.ParseTemplateID(spec.TemplateRef)
+	if err != nil {
+		return nodectl.SandboxAdmissionDemand{}, err
+	}
+	probe := &types.Sandbox{
+		ID: record.ObjectID, TemplateID: spec.TemplateRef, ManifestKey: lease.ManifestKey,
+		Metadata: clusterstate.WithoutSystemMetadata(spec.Config),
+	}
+	if ref := sandboxcfg.RestoreRefFor(probe, template); ref != "" {
+		snapshot, snapshotErr := n.core.readSnapshotConfig(ctx, probe, ref)
+		if snapshotErr != nil {
+			return nodectl.SandboxAdmissionDemand{}, snapshotErr
+		}
+		resources, err = pinSnapshotAdmissionCapacity(spec.Config, resources, snapshot)
+		if err != nil {
+			return nodectl.SandboxAdmissionDemand{}, err
+		}
 	}
 	if demand.FloorMemory > 0 && resources.FloorMemoryBytes != demand.FloorMemory ||
 		demand.StartupBudgetMemory > 0 && resources.StartupMemoryBytes != demand.StartupBudgetMemory {
@@ -974,6 +993,42 @@ func (n *FinalClusterNode) sandboxDemand(ctx context.Context, record nodeexec.Di
 		StartupBudgetMemory:   resources.StartupMemoryBytes,
 		AllocatableAtSnapshot: demand.AllocatableAtSnapshot,
 	}, nil
+}
+
+func pinSnapshotAdmissionCapacity(
+	metadata map[string]string,
+	resources sandboxcfg.ResolvedResources,
+	snapshot snapInfo,
+) (sandboxcfg.ResolvedResources, error) {
+	if !snapshot.HasCapacity || snapshot.CapCPU <= 0 || snapshot.CapMem == "" {
+		return sandboxcfg.ResolvedResources{}, errors.New("restore snapshot has no frozen capacity")
+	}
+	memory, err := util.ParseSize(snapshot.CapMem)
+	if err != nil || memory == 0 {
+		return sandboxcfg.ResolvedResources{}, errors.Join(err, errors.New("restore snapshot has invalid frozen memory capacity"))
+	}
+	spec, err := sandboxcfg.ParseSpec(metadata)
+	if err != nil {
+		return sandboxcfg.ResolvedResources{}, err
+	}
+	resources.CapacityCPU = snapshot.CapCPU
+	resources.CapacityMemoryBytes = memory
+	if spec.Resource.Allocatable == nil || spec.Resource.Allocatable.CPU <= 0 {
+		resources.FloorCPU = float64(snapshot.CapCPU)
+	}
+	if spec.Resource.Allocatable == nil || spec.Resource.Allocatable.Memory == "" {
+		resources.FloorMemoryBytes = memory
+	}
+	if spec.Resource.Startup == nil || spec.Resource.Startup.Memory == "" {
+		resources.StartupMemoryBytes = resources.FloorMemoryBytes
+	}
+	if resources.FloorCPU > float64(resources.CapacityCPU) || resources.FloorMemoryBytes > resources.CapacityMemoryBytes {
+		return sandboxcfg.ResolvedResources{}, errors.New("restore allocatable resources exceed frozen snapshot capacity")
+	}
+	if resources.StartupMemoryBytes < resources.FloorMemoryBytes || resources.StartupMemoryBytes > resources.CapacityMemoryBytes {
+		return sandboxcfg.ResolvedResources{}, errors.New("restore startup memory is outside frozen snapshot capacity")
+	}
+	return resources, nil
 }
 
 func (n *FinalClusterNode) buildObject(ctx context.Context, record nodeexec.DispatchRecord) (*types.Build, error) {

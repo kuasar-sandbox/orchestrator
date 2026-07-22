@@ -268,6 +268,62 @@ func TestExistingDataRouteAcceptsProviderAPIKey(t *testing.T) {
 	}
 }
 
+func TestDataPlaneEnforceRejectsUnverifiedProviderKey(t *testing.T) {
+	serveIdentity := routeapi.RegistryServeIdentity{
+		ClusterID: "cluster-1", RegistryGeneration: "generation-1", SystemEpoch: 1,
+		RegistryLayoutDigest: "registry-layout-1",
+	}
+	for _, mode := range []string{"off", "log"} {
+		t.Run(mode, func(t *testing.T) {
+			authorizer := &recordingAuthorizer{}
+			router, err := New(&revisionControl{
+				serveIdentity: serveIdentity, revision: 8,
+				route: clusterstate.ReadyRoute{
+					SandboxID: "sandbox-1", NodeID: "node-1", NodeEpoch: 1, DataEndpoint: "127.0.0.1:1",
+					RegistryGeneration: "generation-1", BindingDigest: "binding-1",
+					AccessToken: "minted-token", TargetPort: 49983,
+				},
+			}, authorizer, "example.test", time.Minute, slog.Default())
+			if err != nil {
+				t.Fatal(err)
+			}
+			router.SetAuthMode(mode)
+			request := httptest.NewRequest(http.MethodGet, "http://49983-route-1.example.test/", nil)
+			request.Host = "49983-route-1.example.test"
+			request.Header.Set(HeaderGroup, "/group")
+			request.Header.Set(HeaderAPIKey, "unverified-key")
+			response := httptest.NewRecorder()
+			router.Handler().ServeHTTP(response, request)
+			if response.Code != http.StatusUnauthorized || authorizer.calls != 1 {
+				t.Fatalf("data request = %d auth_calls=%d body=%s", response.Code, authorizer.calls, response.Body.String())
+			}
+		})
+	}
+}
+
+func TestPrepareDataBackendRequestStripsOnlyConsumedProviderCredential(t *testing.T) {
+	request := httptest.NewRequest(http.MethodGet, "http://sandbox.test/", nil)
+	request.Header.Set(HeaderAPIKey, "tenant-wide-secret")
+	request.Header.Set("Authorization", "Bearer application-token")
+	prepareDataBackendRequest(request, "49983-sandbox-1.example.test", "execution-token", true, "")
+	if request.Header.Get(HeaderAPIKey) != "" {
+		t.Fatal("Provider API key was forwarded to the Sandbox")
+	}
+	if request.Header.Get("Authorization") != "Bearer application-token" {
+		t.Fatal("unconsumed application Authorization header was removed")
+	}
+	if request.Header.Get(HeaderAccessTok) != "execution-token" {
+		t.Fatal("execution access token was not injected")
+	}
+
+	bearer := httptest.NewRequest(http.MethodGet, "http://sandbox.test/", nil)
+	bearer.Header.Set("Authorization", "Bearer provider-secret")
+	prepareDataBackendRequest(bearer, "49983-sandbox-1.example.test", "execution-token", true, "Authorization")
+	if bearer.Header.Get("Authorization") != "" {
+		t.Fatal("consumed Provider bearer credential was forwarded to the Sandbox")
+	}
+}
+
 func TestSandboxResumeRequiresExactPostConnectAction(t *testing.T) {
 	serveIdentity := routeapi.RegistryServeIdentity{
 		ClusterID: "cluster-1", RegistryGeneration: "generation-1", SystemEpoch: 1,
