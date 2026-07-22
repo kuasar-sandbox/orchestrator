@@ -328,7 +328,13 @@ func (s ResumingRouteState) Validate() error {
 	if err := s.Execution.Validate(); err != nil {
 		return err
 	}
-	return validateSandboxDispatchIntent(s.Intent)
+	if err := validateSandboxDispatchIntent(s.Intent); err != nil {
+		return err
+	}
+	if !reflect.DeepEqual(s.Intent, s.Execution.Intent) {
+		return errors.New("cluster: RESUMING intent differs from the bound execution")
+	}
+	return nil
 }
 
 type DeletingRouteState struct {
