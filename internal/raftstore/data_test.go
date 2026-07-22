@@ -376,9 +376,32 @@ func TestStartingCandidateRejectionAndSandboxRoundAdvance(t *testing.T) {
 		Type: DataPutFence, Identity: identity, Expect: RevisionExpectation{Absent: true}, Fence: &fence,
 	})
 	nextRound := routeStarting(t, registryLayout, "/g", "rk", "sandbox-2", 2, false)
-	applyDataOK(t, &state, 8, DataCommand{
+	changedIntent := cloneRouteRecord(nextRound)
+	changedIntent.Starting.Intent.ProviderPolicyVersion = "changed-policy"
+	if result := ApplyDataCommand(&state, 8, DataCommand{
+		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{LogIndex: 6}, Route: &changedIntent,
+	}); !result.Conflict {
+		t.Fatal("placement retry replaced the committed dispatch intent")
+	}
+	applyDataOK(t, &state, 9, DataCommand{
 		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{LogIndex: 6}, Route: &nextRound,
 	})
+}
+
+func TestRouteReplacementRejectsAnyRetainedSIDFence(t *testing.T) {
+	registryLayout := testRegistryLayout(4, "generation-retained-sid")
+	current := routeStarting(t, registryLayout, "/g", "rk-retained-sid", "sandbox-2", 2, true)
+	ready := readyRecord(current, 1)
+	deleting := deletingRecord(ready)
+	tombstone, _ := terminalRouteAndFence(deleting, 2)
+	next := routeStarting(t, registryLayout, current.Group, current.RouteKey, "sandbox-1", 3, false)
+	retained := clusterstate.ExecutionFence{Group: current.Group, RouteKey: current.RouteKey, SandboxID: "sandbox-1"}
+	fences := map[string]clusterstate.ExecutionFence{
+		fenceMapKey(current.Group, current.RouteKey, retained.SandboxID): retained,
+	}
+	if err := validateRouteReplacement(tombstone, next, fences); err == nil {
+		t.Fatal("replacement reused a SID with an older retained fence")
+	}
 }
 
 func TestUnselectedProbeRejectionsAdvanceMonotonically(t *testing.T) {

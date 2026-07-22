@@ -15,7 +15,7 @@ import (
 )
 
 var stateSnapshotMagic = [...]byte{
-	'K', 'U', 'A', 'S', 'A', 'R', '-', 'P', 'E', 'B', 'B', 'L', 'E', '-', 'S', 'N', 'A', 'P', 4,
+	'K', 'U', 'A', 'S', 'A', 'R', '-', 'P', 'E', 'B', 'B', 'L', 'E', '-', 'S', 'N', 'A', 'P', 5,
 }
 
 type diskStateMachine struct {
@@ -246,19 +246,30 @@ func loadDataCommandRows(reader pebble.Reader, prefix []byte, state *DataState, 
 		if found {
 			state.Routes[key] = current
 			if current.State == clusterstate.WorkflowRouteTombstone && current.Tombstone != nil &&
-				!current.Tombstone.FenceCompacted && command.Route.State == clusterstate.WorkflowRouteStarting {
-				sandboxID := current.Tombstone.SandboxID
-				if current.Tombstone.PlacementFailure != nil {
-					sandboxID = current.Tombstone.PlacementFailure.SandboxID
+				command.Route.State == clusterstate.WorkflowRouteStarting && command.Route.Starting != nil {
+				loadFence := func(sandboxID string) error {
+					fenceKey := fenceMapKey(current.Group, current.RouteKey, sandboxID)
+					var fence clusterstate.ExecutionFence
+					fenceFound, err := getStateJSON(reader, stateRowKey(prefix, stateFenceTable, fenceKey), &fence)
+					if err != nil {
+						return err
+					}
+					if fenceFound {
+						state.Fences[fenceKey] = fence
+					}
+					return nil
 				}
-				fenceKey := fenceMapKey(current.Group, current.RouteKey, sandboxID)
-				var fence clusterstate.ExecutionFence
-				fenceFound, err := getStateJSON(reader, stateRowKey(prefix, stateFenceTable, fenceKey), &fence)
-				if err != nil {
+				if err := loadFence(command.Route.Starting.SandboxID); err != nil {
 					return err
 				}
-				if fenceFound {
-					state.Fences[fenceKey] = fence
+				if !current.Tombstone.FenceCompacted {
+					sandboxID := current.Tombstone.SandboxID
+					if current.Tombstone.PlacementFailure != nil {
+						sandboxID = current.Tombstone.PlacementFailure.SandboxID
+					}
+					if err := loadFence(sandboxID); err != nil {
+						return err
+					}
 				}
 			}
 		}
@@ -489,16 +500,28 @@ func persistDataCommandRow(batch *pebble.Batch, prefix []byte, state DataState, 
 	switch command.Type {
 	case DataPutRoute:
 		key := routeMapKey(command.Route.Group, command.Route.RouteKey)
-		return setStateJSON(batch, stateRowKey(prefix, stateRouteTable, key), state.Routes[key])
+		if err := setStateJSON(batch, stateRowKey(prefix, stateRouteTable, key), state.Routes[key]); err != nil {
+			return err
+		}
+		return persistPendingIndex(batch, prefix, "r"+key, routeNeedsCoordinator(state.Routes[key]))
 	case DataPutBuild:
 		key := buildMapKey(command.Build.Group, command.Build.BuildID)
-		return setStateJSON(batch, stateRowKey(prefix, stateBuildTable, key), state.Builds[key])
+		if err := setStateJSON(batch, stateRowKey(prefix, stateBuildTable, key), state.Builds[key]); err != nil {
+			return err
+		}
+		return persistPendingIndex(batch, prefix, "b"+key, buildNeedsCoordinator(state.Builds[key]))
 	case DataPutFence:
 		key := fenceMapKey(command.Fence.Group, command.Fence.RouteKey, command.Fence.SandboxID)
-		return setStateJSON(batch, stateRowKey(prefix, stateFenceTable, key), state.Fences[key])
+		if err := setStateJSON(batch, stateRowKey(prefix, stateFenceTable, key), state.Fences[key]); err != nil {
+			return err
+		}
+		return persistPendingIndex(batch, prefix, "f"+key, true)
 	case DataCompactFence:
 		key := fenceMapKey(command.Compaction.Group, command.Compaction.RouteKey, command.Compaction.SandboxID)
 		if err := batch.Delete(stateRowKey(prefix, stateFenceTable, key), nil); err != nil {
+			return err
+		}
+		if err := persistPendingIndex(batch, prefix, "f"+key, false); err != nil {
 			return err
 		}
 		routeKey := routeMapKey(command.Compaction.Group, command.Compaction.RouteKey)
@@ -528,10 +551,16 @@ func persistDataCommandRow(batch *pebble.Batch, prefix []byte, state DataState, 
 		}
 		if command.RecoveryUpdate.Kind == clusterstate.ExecutionKindSandbox {
 			key := routeMapKey(command.RecoveryUpdate.Group, command.RecoveryUpdate.RouteKey)
-			return setStateJSON(batch, stateRowKey(prefix, stateRouteTable, key), state.Routes[key])
+			if err := setStateJSON(batch, stateRowKey(prefix, stateRouteTable, key), state.Routes[key]); err != nil {
+				return err
+			}
+			return persistPendingIndex(batch, prefix, "r"+key, routeNeedsCoordinator(state.Routes[key]))
 		}
 		key := buildMapKey(command.RecoveryUpdate.Group, command.RecoveryUpdate.ObjectID)
-		return setStateJSON(batch, stateRowKey(prefix, stateBuildTable, key), state.Builds[key])
+		if err := setStateJSON(batch, stateRowKey(prefix, stateBuildTable, key), state.Builds[key]); err != nil {
+			return err
+		}
+		return persistPendingIndex(batch, prefix, "b"+key, buildNeedsCoordinator(state.Builds[key]))
 	case DataFinalizeRecovery:
 		if err := batch.DeleteRange(
 			stateTablePrefix(prefix, stateRecoveryTable),
@@ -546,6 +575,14 @@ func persistDataCommandRow(batch *pebble.Batch, prefix []byte, state DataState, 
 	default:
 		return nil
 	}
+}
+
+func persistPendingIndex(batch *pebble.Batch, prefix []byte, qualifiedKey string, pending bool) error {
+	key := stateRowKey(prefix, statePendingTable, qualifiedKey)
+	if !pending {
+		return batch.Delete(key, nil)
+	}
+	return batch.Set(key, []byte{1}, nil)
 }
 
 func clearDataRows(state *DataState) {
@@ -1099,105 +1136,78 @@ func lookupPendingOnDisk(
 		return PendingLookupResult{}, err
 	}
 	builder := newPendingPageBuilder(query.Limit)
-	pageFull := false
-	tables := []struct {
-		table     byte
-		qualified byte
-	}{
-		{stateBuildTable, 'b'},
-		{stateFenceTable, 'f'},
-		{stateRouteTable, 'r'},
+	tablePrefix := stateTablePrefix(prefix, statePendingTable)
+	lowerBound := tablePrefix
+	if afterKey != "" {
+		lowerBound = stateRowKey(prefix, statePendingTable, afterKey)
 	}
-	for _, table := range tables {
-		tablePrefix := stateTablePrefix(prefix, table.table)
-		lowerBound, scan := pendingTableLowerBound(prefix, tablePrefix, table.table, table.qualified, afterKey)
-		if !scan {
+	iterator := reader.NewIter(&pebble.IterOptions{
+		LowerBound: lowerBound, UpperBound: prefixUpperBound(tablePrefix),
+	})
+	defer iterator.Close()
+	for valid := iterator.First(); valid; valid = iterator.Next() {
+		qualified := string(iterator.Key()[len(tablePrefix):])
+		if qualified <= afterKey {
 			continue
 		}
-		iterator := reader.NewIter(&pebble.IterOptions{
-			LowerBound: lowerBound, UpperBound: prefixUpperBound(tablePrefix),
-		})
-		for valid := iterator.First(); valid; valid = iterator.Next() {
-			mapKey := string(iterator.Key()[len(tablePrefix):])
-			qualified := string(append([]byte{table.qualified}, []byte(mapKey)...))
-			if qualified <= afterKey {
-				continue
-			}
-			switch table.table {
-			case stateBuildTable:
-				var record clusterstate.BuildRecord
-				if err := decodeJSONValue(iterator.Value(), &record); err != nil {
-					iterator.Close()
-					return PendingLookupResult{}, err
-				}
-				if err := validateStoredBuild(state, mapKey, record); err != nil {
-					iterator.Close()
-					return PendingLookupResult{}, err
-				}
-				if buildNeedsCoordinator(record) {
-					accepted, addErr := builder.add(PendingWorkflow{Key: encodePendingCursor(qualified), Build: &record})
-					if addErr != nil {
-						iterator.Close()
-						return PendingLookupResult{}, addErr
-					}
-					if !accepted {
-						pageFull = true
-						break
-					}
-				}
-			case stateRouteTable:
-				var record clusterstate.RouteWorkflowRecord
-				if err := decodeJSONValue(iterator.Value(), &record); err != nil {
-					iterator.Close()
-					return PendingLookupResult{}, err
-				}
-				if err := validateStoredRoute(state, mapKey, record); err != nil {
-					iterator.Close()
-					return PendingLookupResult{}, err
-				}
-				if routeNeedsCoordinator(record) {
-					accepted, addErr := builder.add(PendingWorkflow{Key: encodePendingCursor(qualified), Route: &record})
-					if addErr != nil {
-						iterator.Close()
-						return PendingLookupResult{}, addErr
-					}
-					if !accepted {
-						pageFull = true
-						break
-					}
-				}
-			case stateFenceTable:
-				var fence clusterstate.ExecutionFence
-				if err := decodeJSONValue(iterator.Value(), &fence); err != nil {
-					iterator.Close()
-					return PendingLookupResult{}, err
-				}
-				if err := validateStoredFence(state, mapKey, fence); err != nil {
-					iterator.Close()
-					return PendingLookupResult{}, err
-				}
-				accepted, addErr := builder.add(PendingWorkflow{Key: encodePendingCursor(qualified), Fence: &fence})
-				if addErr != nil {
-					iterator.Close()
-					return PendingLookupResult{}, addErr
-				}
-				if !accepted {
-					pageFull = true
-					break
-				}
-			}
+		if len(qualified) < 2 {
+			return PendingLookupResult{}, errors.New("raftstore: malformed pending-workflow index key")
 		}
-		err := iterator.Error()
-		closeErr := iterator.Close()
+		mapKey := qualified[1:]
+		workflow := PendingWorkflow{Key: encodePendingCursor(qualified)}
+		switch qualified[0] {
+		case 'b':
+			var record clusterstate.BuildRecord
+			found, err := getStateJSON(reader, stateRowKey(prefix, stateBuildTable, mapKey), &record)
+			if err != nil {
+				return PendingLookupResult{}, err
+			}
+			if !found || !buildNeedsCoordinator(record) {
+				return PendingLookupResult{}, errors.New("raftstore: pending Build index differs from stored state")
+			}
+			if err := validateStoredBuild(state, mapKey, record); err != nil {
+				return PendingLookupResult{}, err
+			}
+			workflow.Build = &record
+		case 'f':
+			var fence clusterstate.ExecutionFence
+			found, err := getStateJSON(reader, stateRowKey(prefix, stateFenceTable, mapKey), &fence)
+			if err != nil {
+				return PendingLookupResult{}, err
+			}
+			if !found {
+				return PendingLookupResult{}, errors.New("raftstore: pending fence index differs from stored state")
+			}
+			if err := validateStoredFence(state, mapKey, fence); err != nil {
+				return PendingLookupResult{}, err
+			}
+			workflow.Fence = &fence
+		case 'r':
+			var record clusterstate.RouteWorkflowRecord
+			found, err := getStateJSON(reader, stateRowKey(prefix, stateRouteTable, mapKey), &record)
+			if err != nil {
+				return PendingLookupResult{}, err
+			}
+			if !found || !routeNeedsCoordinator(record) {
+				return PendingLookupResult{}, errors.New("raftstore: pending Route index differs from stored state")
+			}
+			if err := validateStoredRoute(state, mapKey, record); err != nil {
+				return PendingLookupResult{}, err
+			}
+			workflow.Route = &record
+		default:
+			return PendingLookupResult{}, errors.New("raftstore: unknown pending-workflow index kind")
+		}
+		accepted, err := builder.add(workflow)
 		if err != nil {
 			return PendingLookupResult{}, err
 		}
-		if closeErr != nil {
-			return PendingLookupResult{}, closeErr
-		}
-		if pageFull {
+		if !accepted {
 			break
 		}
+	}
+	if err := iterator.Error(); err != nil {
+		return PendingLookupResult{}, err
 	}
 	return builder.result(), nil
 }
@@ -1532,6 +1542,12 @@ func (m *diskStateMachine) validateSnapshotRecord(
 			return errors.New("raftstore: duplicate recovery claim snapshot key")
 		}
 		dataState.RecoveryClaims[mapKey] = ownerKey
+		return nil
+	case statePendingTable:
+		if len(mapKey) < 2 || mapKey[0] != 'b' && mapKey[0] != 'f' && mapKey[0] != 'r' ||
+			len(value) != 1 || value[0] != 1 {
+			return errors.New("raftstore: malformed pending-workflow snapshot row")
+		}
 		return nil
 	default:
 		return errors.New("raftstore: data snapshot contains an unknown table")

@@ -217,12 +217,16 @@ func validateRouteReplacement(
 	next clusterstate.RouteWorkflowRecord,
 	fences map[string]clusterstate.ExecutionFence,
 ) error {
+	if _, reused := fences[fenceMapKey(current.Group, current.RouteKey, next.Starting.SandboxID)]; reused {
+		return errors.New("raftstore: replacement reused a SID with a retained execution fence")
+	}
 	if current.Tombstone.PlacementFailure != nil {
 		failure := current.Tombstone.PlacementFailure
 		if next.Starting.SandboxID == failure.SandboxID ||
 			next.Starting.PlacementRound != failure.PlacementRound+1 ||
 			next.Starting.SelectedCandidate != nil || next.Starting.Binding != nil ||
-			len(next.Starting.DefinitivelyRejected) != 0 || next.Starting.LastEventSeq != 0 {
+			len(next.Starting.DefinitivelyRejected) != 0 || next.Starting.LastEventSeq != 0 ||
+			!reflect.DeepEqual(next.Starting.Intent, failure.Intent) {
 			return errors.New("raftstore: placement retry requires a clean next round and a new SID")
 		}
 		if current.Tombstone.FenceCompacted {

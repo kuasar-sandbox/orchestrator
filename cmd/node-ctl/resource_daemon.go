@@ -154,7 +154,8 @@ func startResourceController(
 	go sweeper.Run(ctx)
 
 	reclaimer := &nodectl.ActiveReclaimer{
-		State: state, Persister: persister, Interval: 10 * time.Second, SafetyMargin: 1.25, Auditor: auditor,
+		State: state, Persister: persister, PreparedAdmission: prepared,
+		Interval: 10 * time.Second, SafetyMargin: 1.25, Auditor: auditor,
 		Logf: func(f string, a ...any) { log.Printf("[node-ctl resource reclaim] "+f, a...) },
 	}
 	go reclaimer.Run(ctx)

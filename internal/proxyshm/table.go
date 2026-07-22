@@ -302,6 +302,9 @@ func (t *Table) Upsert(in routesync.RouteEntry) error {
 		// but mark it seen in this sync generation so Bookmark does not drop it.
 		startWrite(rec)
 		rec.SyncGen = atomic.LoadUint64(&t.header.SyncGen)
+		if in.AuthorityRevision == 0 && !t.Synced() {
+			atomic.StoreUint64(&rec.AuthorityRevision, 0)
+		}
 		finishWrite(rec)
 		return nil
 	}

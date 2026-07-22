@@ -18,7 +18,7 @@ import (
 )
 
 const (
-	stateEngineVersion      = uint32(4)
+	stateEngineVersion      = uint32(5)
 	stateControlTable       = byte(0)
 	stateSlotTable          = byte(1)
 	stateMetadataTable      = byte(0)
@@ -28,6 +28,7 @@ const (
 	stateRouteChangeTable   = byte(4)
 	stateRecoveryTable      = byte(5)
 	stateRecoveryClaimTable = byte(6)
+	statePendingTable       = byte(7)
 	stateRecoveryBatch      = 16 << 20
 	stateMaximumKeySize     = MaxRaftCommandBytes
 )
