@@ -463,7 +463,7 @@ func lookupFence(state DataState, query FenceLookup) FenceLookupResult {
 	if !found {
 		return FenceLookupResult{}
 	}
-	copy := fence
+	copy := cloneExecutionFence(fence)
 	return FenceLookupResult{Fence: &copy}
 }
 

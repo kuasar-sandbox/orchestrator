@@ -193,6 +193,73 @@ func TestMutationLookupInheritsFinalizationsAndIgnoresFenceCompaction(t *testing
 	}
 }
 
+func TestPlacementFenceMutationLookupUsesValueEquality(t *testing.T) {
+	registryLayout := testRegistryLayout(4, "generation-fence-lookup")
+	state, identity := initializedRouteShard(t, registryLayout, "/g", "rk-fence-lookup")
+	starting := routeStarting(t, registryLayout, "/g", "rk-fence-lookup", "sandbox-1", 1, false)
+	failure := clusterstate.RoutePlacementFailureState{
+		SandboxID: starting.Starting.SandboxID, PlacementRound: starting.Starting.PlacementRound,
+		CandidatePool:        append([]clusterstate.PlacementCandidate(nil), starting.Starting.CandidatePool...),
+		DefinitivelyRejected: []uint32{0, 1}, Intent: starting.Starting.Intent,
+		Reason: "placement candidate pool exhausted",
+	}
+	fence, err := clusterstate.NewPlacementFailureFence(
+		starting.Group, starting.RouteKey, registryLayout.RegistryGeneration, failure,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored := cloneExecutionFence(fence)
+	stored.Revision = revisionFor(state, 2)
+	state.Fences[fenceMapKey(stored.Group, stored.RouteKey, stored.SandboxID)] = stored
+
+	wanted := cloneExecutionFence(fence)
+	status, err := LookupDataMutation(state, DataMutationLookup{Command: DataCommand{
+		Type: DataPutFence, Identity: identity, Expect: RevisionExpectation{Absent: true}, Fence: &wanted,
+	}})
+	if err != nil || !status.Committed || status.Revision != stored.Revision.LogIndex {
+		t.Fatalf("placement-fence mutation lookup = %+v, %v", status, err)
+	}
+}
+
+func TestFenceLookupDeepCopiesPlacementFailure(t *testing.T) {
+	registryLayout := testRegistryLayout(4, "generation-fence-clone")
+	state, identity := initializedRouteShard(t, registryLayout, "/g", "rk-fence-clone")
+	starting := routeStarting(t, registryLayout, "/g", "rk-fence-clone", "sandbox-1", 1, false)
+	failure := clusterstate.RoutePlacementFailureState{
+		SandboxID: starting.Starting.SandboxID, PlacementRound: starting.Starting.PlacementRound,
+		CandidatePool:        append([]clusterstate.PlacementCandidate(nil), starting.Starting.CandidatePool...),
+		DefinitivelyRejected: []uint32{0, 1}, Intent: starting.Starting.Intent,
+		Reason: "placement candidate pool exhausted",
+	}
+	fence, err := clusterstate.NewPlacementFailureFence(
+		starting.Group, starting.RouteKey, registryLayout.RegistryGeneration, failure,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fence.Revision = revisionFor(state, 2)
+	mapKey := fenceMapKey(fence.Group, fence.RouteKey, fence.SandboxID)
+	state.Fences[mapKey] = cloneExecutionFence(fence)
+
+	result, err := LookupData(state, DataLookup{Fence: &FenceLookup{
+		Identity: identity, Group: fence.Group, RouteKey: fence.RouteKey, SandboxID: fence.SandboxID,
+	}})
+	if err != nil || result.Fence == nil || result.Fence.Fence == nil {
+		t.Fatalf("fence lookup = %+v, %v", result.Fence, err)
+	}
+	result.Fence.Fence.PlacementFailure.CandidatePool[0].NodeID = "mutated"
+	result.Fence.Fence.PlacementFailure.DefinitivelyRejected[0] = 99
+	result.Fence.Fence.PlacementFailure.Intent.NormalizedDemand[0] ^= 0xff
+
+	stored := state.Fences[mapKey]
+	if stored.PlacementFailure.CandidatePool[0].NodeID == "mutated" ||
+		stored.PlacementFailure.DefinitivelyRejected[0] == 99 ||
+		stored.PlacementFailure.Intent.NormalizedDemand[0] == result.Fence.Fence.PlacementFailure.Intent.NormalizedDemand[0] {
+		t.Fatal("fence lookup exposed state-machine-owned placement-failure memory")
+	}
+}
+
 func TestStartingCandidateRejectionAndSandboxRoundAdvance(t *testing.T) {
 	registryLayout := testRegistryLayout(4, "generation-1")
 	state, identity := initializedRouteShard(t, registryLayout, "/g", "rk")
@@ -689,7 +756,8 @@ func readyRecord(starting clusterstate.RouteWorkflowRecord, eventSeq uint64) clu
 			SandboxID: starting.Starting.SandboxID, NodeID: binding.NodeID, NodeEpoch: binding.NodeEpoch,
 			DataEndpoint: binding.DataEndpoint, TargetPort: spec.TargetPort, AccessToken: spec.AccessToken,
 			TrafficAccessToken: "traffic-token", TemplateRef: spec.TemplateRef, RegistryGeneration: binding.RegistryGeneration,
-			BindingDigest: binding.BindingDigest, LastEventSeq: eventSeq, Intent: starting.Starting.Intent,
+			OpaqueBinding: binding.OpaqueBinding, BindingDigest: binding.BindingDigest,
+			LastEventSeq: eventSeq, Intent: starting.Starting.Intent,
 		},
 	}
 }
@@ -780,7 +848,7 @@ func buildRegistrationRecord(starting clusterstate.BuildRecord) clusterstate.Bui
 		Group: starting.Group, BuildID: starting.BuildID, State: clusterstate.BuildRegistered,
 		Projection: &clusterstate.BuildProjection{
 			BuildID: starting.BuildID, NodeID: binding.NodeID, NodeEpoch: binding.NodeEpoch, DataEndpoint: binding.DataEndpoint,
-			RegistryGeneration: binding.RegistryGeneration, BindingDigest: binding.BindingDigest,
+			RegistryGeneration: binding.RegistryGeneration, OpaqueBinding: binding.OpaqueBinding, BindingDigest: binding.BindingDigest,
 			Intent: starting.Starting.Intent, TemplateRef: spec.TemplateID,
 		},
 	}

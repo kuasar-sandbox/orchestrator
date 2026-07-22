@@ -547,3 +547,37 @@ func TestRegistryLayoutGuardReplaysFullChainFromDurableAnchor(t *testing.T) {
 		t.Fatalf("idempotent full-chain replay failed: %v", err)
 	}
 }
+
+func TestRegistryLayoutGuardValidatesContinuationAgainstDurableAnchor(t *testing.T) {
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyring := map[string]ed25519.PublicKey{"root-1": publicKey}
+	first := testRegistryLayout(4, "generation-1")
+	firstDigest, err := first.Digest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	signedFirst, err := SignRegistryLayout(first, "root-1", privateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	guard := RegistryLayoutGuard{Path: filepath.Join(t.TempDir(), "registryLayout.json")}
+	if _, err := guard.AcceptSignedChain([]SignedRegistryLayout{signedFirst}, keyring); err != nil {
+		t.Fatal(err)
+	}
+
+	second := cloneRegistryLayout(first)
+	second.RegistryLayoutVersion = 2
+	second.PreviousRegistryLayoutVersion = 1
+	second.PreviousRegistryLayoutDigest = firstDigest
+	second.Members[0].InternalEndpoint = "https://registry-a-moved:9443"
+	signedSecond, err := SignRegistryLayout(second, "root-1", privateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := guard.EvaluateSignedChain([]SignedRegistryLayout{signedSecond}, keyring); err == nil {
+		t.Fatal("continuation changed a retained member endpoint relative to the durable Registry Layout")
+	}
+}

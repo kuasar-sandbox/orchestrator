@@ -288,8 +288,8 @@ func (g RegistryLayoutGuard) EvaluateSignedChain(
 			current = &accepted
 			continue
 		}
-		if index > 0 && signed.RegistryLayout.RegistryGeneration == chain[index-1].RegistryLayout.RegistryGeneration {
-			if transitionErr := ValidateRegistryLayoutTransition(chain[index-1].RegistryLayout, signed.RegistryLayout); transitionErr != nil {
+		if signed.RegistryLayout.RegistryGeneration == current.RegistryGeneration {
+			if transitionErr := ValidateRegistryLayoutTransition(current.RegistryLayout, signed.RegistryLayout); transitionErr != nil {
 				return AcceptedRegistryLayout{}, fmt.Errorf("raftstore: invalid signed registryLayout transition: %w", transitionErr)
 			}
 		}

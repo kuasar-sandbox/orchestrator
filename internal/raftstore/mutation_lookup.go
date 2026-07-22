@@ -81,9 +81,9 @@ func LookupDataMutation(state DataState, query DataMutationLookup) (DataMutation
 		if !found || !mutationRevisionAdvanced(command.Expect, current.Revision.LogIndex) {
 			return DataMutationStatus{}, nil
 		}
-		wanted := *command.Fence
+		wanted := cloneExecutionFence(*command.Fence)
 		wanted.Revision = current.Revision
-		return DataMutationStatus{Committed: current == wanted, Revision: current.Revision.LogIndex}, nil
+		return DataMutationStatus{Committed: reflect.DeepEqual(current, wanted), Revision: current.Revision.LogIndex}, nil
 	}
 }
 

@@ -257,7 +257,8 @@ func stateScaleReadyRoute(
 		Ready: &clusterstate.ReadyRoute{
 			SandboxID: sandboxID, NodeID: nodeID, NodeEpoch: 7, DataEndpoint: nodeID + ":8443",
 			TargetPort: 8080, AccessToken: "access-token", TemplateRef: "template-1",
-			RegistryGeneration: registryLayout.RegistryGeneration, BindingDigest: bindingDigest, LastEventSeq: 1,
+			RegistryGeneration: registryLayout.RegistryGeneration, OpaqueBinding: opaque,
+			BindingDigest: bindingDigest, LastEventSeq: 1, Intent: intent,
 		},
 	}
 	return starting, ready, nil
