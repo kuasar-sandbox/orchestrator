@@ -100,15 +100,16 @@ func TestPlaceNRequiresSelectorKeyPresence(t *testing.T) {
 
 func TestPlaceNPreservesUnconstrainedRuntimePolicy(t *testing.T) {
 	nodes := []CatalogNode{{NodeID: "n1", RuntimeDigest: "sampled-runtime", SandboxSlotCapacity: 1}}
+	wantCatalogDigest := CatalogIdentityDigest(nodes[0])
 	got, err := PlaceSandboxN(nodes, SandboxDemand{SlotUnits: 1}, StaticPolicy{}, 1, &sequenceSource{values: []int{0}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 1 || got[0].RuntimeDigest != "" {
+	if len(got) != 1 || got[0].RuntimeDigest != "" || got[0].CatalogDigest != wantCatalogDigest {
 		t.Fatalf("unconstrained candidate = %+v", got)
 	}
 	got, err = PlaceSandboxN(nodes, SandboxDemand{SlotUnits: 1}, StaticPolicy{TargetRuntimeDigest: "sampled-runtime"}, 1, &sequenceSource{values: []int{0}})
-	if err != nil || len(got) != 1 || got[0].RuntimeDigest != "sampled-runtime" {
+	if err != nil || len(got) != 1 || got[0].RuntimeDigest != "sampled-runtime" || got[0].CatalogDigest != wantCatalogDigest {
 		t.Fatalf("constrained candidate = %+v, %v", got, err)
 	}
 }

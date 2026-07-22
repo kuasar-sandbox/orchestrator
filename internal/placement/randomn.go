@@ -60,7 +60,7 @@ func PlaceSandboxN(nodes []CatalogNode, demand SandboxDemand, policy StaticPolic
 	eligible := filterCatalog(nodes, policy, func(node CatalogNode) bool {
 		return node.SandboxSlotCapacity > 0 && demand.SlotUnits <= node.SandboxSlotCapacity
 	})
-	return randomN(eligible, n, source)
+	return randomN(eligible, n, source, policy.TargetRuntimeDigest != "")
 }
 
 func PlaceBuildN(nodes []CatalogNode, demand BuildDemand, policy StaticPolicy, n int, source IndexSource) ([]cluster.PlacementCandidate, error) {
@@ -73,7 +73,7 @@ func PlaceBuildN(nodes []CatalogNode, demand BuildDemand, policy StaticPolicy, n
 			(demand.Memory == 0 || demand.Memory <= node.BuildMemoryCapacity) &&
 			(demand.Storage == 0 || demand.Storage <= node.BuildStorageCapacity)
 	})
-	return randomN(eligible, n, source)
+	return randomN(eligible, n, source, policy.TargetRuntimeDigest != "")
 }
 
 func filterCatalog(nodes []CatalogNode, policy StaticPolicy, capacity func(CatalogNode) bool) []CatalogNode {
@@ -113,15 +113,12 @@ func filterCatalog(nodes []CatalogNode, policy StaticPolicy, capacity func(Catal
 			continue
 		}
 		seen[node.NodeID] = struct{}{}
-		if policy.TargetRuntimeDigest == "" {
-			node.RuntimeDigest = ""
-		}
 		eligible = append(eligible, node)
 	}
 	return eligible
 }
 
-func randomN(nodes []CatalogNode, n int, source IndexSource) ([]cluster.PlacementCandidate, error) {
+func randomN(nodes []CatalogNode, n int, source IndexSource, exposeRuntimeDigest bool) ([]cluster.PlacementCandidate, error) {
 	if n <= 0 {
 		return nil, errors.New("placement: candidate count must be positive")
 	}
@@ -150,8 +147,12 @@ func randomN(nodes []CatalogNode, n int, source IndexSource) ([]cluster.Placemen
 		selected := i + offset
 		pool[i], pool[selected] = pool[selected], pool[i]
 		node := pool[i]
+		runtimeDigest := ""
+		if exposeRuntimeDigest {
+			runtimeDigest = node.RuntimeDigest
+		}
 		result = append(result, cluster.PlacementCandidate{
-			NodeID: node.NodeID, FailureDomain: node.FailureDomain, RuntimeDigest: node.RuntimeDigest,
+			NodeID: node.NodeID, FailureDomain: node.FailureDomain, RuntimeDigest: runtimeDigest,
 			CatalogDigest: CatalogIdentityDigest(node),
 		})
 	}
