@@ -233,7 +233,10 @@ func (h *Holder) RetireIdentity(ctx context.Context, retirement IdentityRetireme
 			registration, ok := h.retirementRegistrationLocked(retirement)
 			if !ok {
 				h.mu.Unlock()
-				return false, nil
+				// The shared Enrollment authority has already committed the exact
+				// retirement. A Holder that never owned, or already fenced, this
+				// identity has completed its local part of the cluster-wide drain.
+				return true, nil
 			}
 			current := h.active[retirement.NodeID]
 			if current == nil {
@@ -255,7 +258,7 @@ func (h *Holder) RetireIdentity(ctx context.Context, retirement IdentityRetireme
 			if !ok {
 				h.mu.Unlock()
 				current.commandMu.Unlock()
-				return false, nil
+				return true, nil
 			}
 			if h.active[retirement.NodeID] != current {
 				h.mu.Unlock()
