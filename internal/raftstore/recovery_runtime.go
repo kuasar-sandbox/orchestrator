@@ -217,6 +217,9 @@ func (r *Runtime) AdvanceRecovery(ctx context.Context, to RecoveryPhase) (System
 	if _, err := r.recoveryShardAuthorization(state, stateRecoveryPhase(state)); err != nil {
 		return SystemState{}, err
 	}
+	if to == RecoveryReconciling || to == RecoveryFinalizing {
+		return SystemState{}, errors.New("raftstore: recovery cannot advance without durable node reconstruction proof")
+	}
 	if to == RecoveryCollecting {
 		if state.Recovery.Phase != RecoveryPreparing {
 			return SystemState{}, errors.New("raftstore: recovery enters COLLECTING only from PREPARING")

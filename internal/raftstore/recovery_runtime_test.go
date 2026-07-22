@@ -156,6 +156,36 @@ func TestRecoveryCannotLeavePreparingBeforeEveryShardIsPrepared(t *testing.T) {
 	}
 }
 
+func TestDormantRecoveryCannotAdvanceWithoutReconstructionProof(t *testing.T) {
+	registryLayout := recoveryTestRegistryLayout(t, 1)
+	digest, _ := registryLayout.Digest()
+	state := recoverySystemForTest(t, registryLayout, digest, RecoveryCollecting)
+	host := newFakeNodeHost()
+	host.read = func(shardID uint64, _ any) (any, error) {
+		if shardID != SystemRaftShardID {
+			return nil, errors.New("unexpected data-shard read")
+		}
+		return cloneSystemState(state), nil
+	}
+	proposals := 0
+	host.propose = func([]byte) (sm.Result, error) {
+		proposals++
+		return sm.Result{}, errors.New("unexpected recovery phase proposal")
+	}
+	runtime := &Runtime{
+		registryLayout: registryLayout, registryLayoutDigest: digest, nodeHost: host,
+		enrollment: LocalEnrollment{Replicas: []LocalReplicaEnrollment{{
+			ShardID: SystemRaftShardID, ReplicaID: 1, StartPlan: ReplicaInitial, LocalState: ReplicaActive,
+		}}},
+	}
+	if _, err := runtime.AdvanceRecovery(context.Background(), RecoveryReconciling); err == nil {
+		t.Fatal("dormant recovery advanced without durable node reconstruction proof")
+	}
+	if proposals != 0 {
+		t.Fatalf("recovery phase proposal count = %d, want 0", proposals)
+	}
+}
+
 func TestRecoveryShardAuthorizationMustMatchLiveSystemPhase(t *testing.T) {
 	registryLayout := recoveryTestRegistryLayout(t, 1)
 	digest, _ := registryLayout.Digest()

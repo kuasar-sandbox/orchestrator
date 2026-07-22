@@ -11,21 +11,24 @@ func cloneRouteRecord(source clusterstate.RouteWorkflowRecord) clusterstate.Rout
 		clone.Starting = &starting
 	}
 	if source.Ready != nil {
-		ready := *source.Ready
+		ready := cloneReadyRoute(*source.Ready)
 		clone.Ready = &ready
 	}
 	if source.Paused != nil {
 		paused := *source.Paused
+		paused.Execution = cloneReadyRoute(source.Paused.Execution)
 		paused.ResumeIntent = cloneDispatchIntent(source.Paused.ResumeIntent)
 		clone.Paused = &paused
 	}
 	if source.Resuming != nil {
 		resuming := *source.Resuming
+		resuming.Execution = cloneReadyRoute(source.Resuming.Execution)
 		resuming.Intent = cloneDispatchIntent(source.Resuming.Intent)
 		clone.Resuming = &resuming
 	}
 	if source.Deleting != nil {
 		deleting := *source.Deleting
+		deleting.Execution = cloneReadyRoute(source.Deleting.Execution)
 		deleting.DeleteSpec = append([]byte(nil), source.Deleting.DeleteSpec...)
 		clone.Deleting = &deleting
 	}
@@ -40,6 +43,12 @@ func cloneRouteRecord(source clusterstate.RouteWorkflowRecord) clusterstate.Rout
 		}
 		clone.Tombstone = &tombstone
 	}
+	return clone
+}
+
+func cloneReadyRoute(source clusterstate.ReadyRoute) clusterstate.ReadyRoute {
+	clone := source
+	clone.Intent = cloneDispatchIntent(source.Intent)
 	return clone
 }
 

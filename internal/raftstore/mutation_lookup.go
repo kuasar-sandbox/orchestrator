@@ -55,8 +55,15 @@ func LookupDataMutation(state DataState, query DataMutationLookup) (DataMutation
 			return DataMutationStatus{}, nil
 		}
 		wanted := cloneRouteRecord(*command.Route)
+		if wanted.Finalizations == nil {
+			wanted.Finalizations = cloneWorkflowFinalizations(current.Finalizations)
+		}
 		wanted.Revision = current.Revision
 		normalizeRouteRevision(&wanted)
+		if current.State == wanted.State && current.Tombstone != nil && wanted.Tombstone != nil &&
+			current.Tombstone.FenceCompacted {
+			wanted.Tombstone.FenceCompacted = true
+		}
 		return DataMutationStatus{Committed: reflect.DeepEqual(current, wanted), Revision: current.Revision.LogIndex}, nil
 	case DataPutBuild:
 		current, found := state.Builds[buildMapKey(command.Build.Group, command.Build.BuildID)]
@@ -64,6 +71,9 @@ func LookupDataMutation(state DataState, query DataMutationLookup) (DataMutation
 			return DataMutationStatus{}, nil
 		}
 		wanted := cloneBuildRecord(*command.Build)
+		if wanted.Finalizations == nil {
+			wanted.Finalizations = cloneWorkflowFinalizations(current.Finalizations)
+		}
 		wanted.Revision = current.Revision
 		return DataMutationStatus{Committed: reflect.DeepEqual(current, wanted), Revision: current.Revision.LogIndex}, nil
 	default:
