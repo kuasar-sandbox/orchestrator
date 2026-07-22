@@ -38,7 +38,7 @@ func (d *DirectoryDispatcher) AdmitAndDispatch(ctx context.Context, command Disp
 	command.SessionSeq = entry.SessionSeq
 	reply, err := d.client.AdmitAndDispatchAt(ctx, entry.HolderMemberID, command)
 	if errors.Is(err, ErrStaleSession) || errors.Is(err, ErrSessionUnavailable) {
-		return DispatchReply{Outcome: cluster.DispatchSessionMoved, Reason: err.Error()}, nil
+		return d.classifyUnavailable(ctx, command, err.Error())
 	}
 	return reply, err
 }

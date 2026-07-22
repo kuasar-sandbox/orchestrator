@@ -83,7 +83,7 @@ func (h *Holder) InstallKeyLease(
 		return ref, true, errors.New("session: node ACK did not prove the exact key lease")
 	}
 	operation.held.leaseMu.Lock()
-	if operation.held.keyLeaseSeq[operation.key] != operation.sequence {
+	if operation.held.keyLeaseSeq[operation.sequenceKey] != operation.sequence {
 		operation.held.leaseMu.Unlock()
 		return ref, true, ErrKeyLeaseSuperseded
 	}
@@ -114,7 +114,7 @@ func (h *Holder) DropKeyLease(
 	}
 	defer operation.unlock()
 	operation.held.leaseMu.Lock()
-	if operation.held.keyLeaseSeq[operation.key] != operation.sequence {
+	if operation.held.keyLeaseSeq[operation.sequenceKey] != operation.sequence {
 		operation.held.leaseMu.Unlock()
 		return false, ErrKeyLeaseSuperseded
 	}
@@ -221,18 +221,19 @@ type acknowledgedKeyLease struct {
 }
 
 type keyLeaseMutation struct {
-	held      *heldSession
-	endpoint  commandEndpoint
-	tuple     Tuple
-	key       string
-	sequence  uint64
-	operation *sync.Mutex
+	held        *heldSession
+	endpoint    commandEndpoint
+	tuple       Tuple
+	key         string
+	sequenceKey string
+	sequence    uint64
+	operation   *sync.Mutex
 }
 
 func (m *keyLeaseMutation) current() bool {
 	m.held.leaseMu.RLock()
 	defer m.held.leaseMu.RUnlock()
-	return m.held.keyLeaseSeq[m.key] == m.sequence
+	return m.held.keyLeaseSeq[m.sequenceKey] == m.sequence
 }
 
 func (m *keyLeaseMutation) unlock() {
@@ -260,16 +261,16 @@ func (h *Holder) beginKeyLeaseMutation(
 	}
 	tuple := held.registration.Tuple
 	key := keyLeaseRefID(ref)
+	sequenceKey := ref.Group
 	held.leaseMu.Lock()
-	high := held.keyLeaseHigh[key]
+	high := held.keyLeaseHigh[sequenceKey]
 	if desiredExpiry > 0 {
 		if high.Ref.KeyRevision > ref.KeyRevision {
 			held.leaseMu.Unlock()
 			h.mu.RUnlock()
 			return nil, errors.Join(ErrDispatchNotSent, ErrKeyLeaseSuperseded)
 		}
-		if high.Ref.KeyRevision == ref.KeyRevision && high.Ref.RegistryAuthDigest != "" &&
-			high.Ref.RegistryAuthDigest != ref.RegistryAuthDigest {
+		if high.Ref.KeyRevision == ref.KeyRevision && high.Ref.KeyRevision != 0 && high.Ref != ref {
 			held.leaseMu.Unlock()
 			h.mu.RUnlock()
 			return nil, errors.Join(ErrDispatchNotSent, ErrKeyLeaseConflict)
@@ -279,21 +280,21 @@ func (h *Holder) beginKeyLeaseMutation(
 			h.mu.RUnlock()
 			return nil, errors.Join(ErrDispatchNotSent, ErrKeyLeaseSuperseded)
 		}
-		held.keyLeaseHigh[key] = acknowledgedKeyLease{Ref: ref, ExpiresUnix: desiredExpiry}
+		held.keyLeaseHigh[sequenceKey] = acknowledgedKeyLease{Ref: ref, ExpiresUnix: desiredExpiry}
 	} else if high.Ref.KeyRevision > ref.KeyRevision ||
-		(high.Ref.KeyRevision == ref.KeyRevision && high.Ref.RegistryAuthDigest != "" && high.Ref.RegistryAuthDigest != ref.RegistryAuthDigest) {
+		(high.Ref.KeyRevision == ref.KeyRevision && high.Ref.KeyRevision != 0 && high.Ref != ref) {
 		held.leaseMu.Unlock()
 		h.mu.RUnlock()
 		return nil, errors.Join(ErrDispatchNotSent, ErrKeyLeaseSuperseded)
 	} else {
-		held.keyLeaseHigh[key] = acknowledgedKeyLease{Ref: ref, ExpiresUnix: high.ExpiresUnix}
+		held.keyLeaseHigh[sequenceKey] = acknowledgedKeyLease{Ref: ref, ExpiresUnix: high.ExpiresUnix}
 	}
-	held.keyLeaseSeq[key]++
-	sequence := held.keyLeaseSeq[key]
+	held.keyLeaseSeq[sequenceKey]++
+	sequence := held.keyLeaseSeq[sequenceKey]
 	held.leaseMu.Unlock()
 	h.mu.RUnlock()
 
-	operation := h.keyLeaseOperation(nodeID, ref)
+	operation := h.keyLeaseOperation(nodeID, ref.Group)
 	operation.Lock()
 	current, err := h.lockCommandSession(nodeID, nodeEpoch, dataEndpoint, held)
 	if err != nil {
@@ -301,14 +302,15 @@ func (h *Holder) beginKeyLeaseMutation(
 		return nil, err
 	}
 	return &keyLeaseMutation{
-		held: current, endpoint: endpoint, tuple: tuple, key: key, sequence: sequence, operation: operation,
+		held: current, endpoint: endpoint, tuple: tuple, key: key,
+		sequenceKey: sequenceKey, sequence: sequence, operation: operation,
 	}, nil
 }
 
-func (h *Holder) keyLeaseOperation(nodeID string, ref routesync.NodeKeyLeaseRefV1) *sync.Mutex {
+func (h *Holder) keyLeaseOperation(nodeID, group string) *sync.Mutex {
 	hash := fnv.New32a()
 	_, _ = hash.Write([]byte(nodeID))
 	_, _ = hash.Write([]byte{0})
-	_, _ = hash.Write([]byte(keyLeaseRefID(ref)))
+	_, _ = hash.Write([]byte(group))
 	return &h.keyOps[hash.Sum32()%uint32(len(h.keyOps))]
 }

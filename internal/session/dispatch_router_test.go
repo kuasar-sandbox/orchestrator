@@ -108,3 +108,17 @@ func TestDirectoryDispatcherPreservesAmbiguousTransportFailure(t *testing.T) {
 		t.Fatalf("pre-send stale session = %+v, %v", reply, err)
 	}
 }
+
+func TestDirectoryDispatcherRechecksFenceAfterStaleHolder(t *testing.T) {
+	directory := NewDirectory(directoryFenceAuthority{fenced: map[string]uint64{"node-1": 7}})
+	applyDirectoryUp(t, directory, "node-1", "registry-b", 7, 12)
+	rpc := &holderDispatchRPCStub{err: ErrSessionUnavailable}
+	dispatcher, err := NewDirectoryDispatcher(directory, rpc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reply, err := dispatcher.AdmitAndDispatch(context.Background(), DispatchCommand{NodeID: "node-1", NodeEpoch: 7})
+	if err != nil || reply.Outcome != cluster.DispatchDefinitiveReject || rpc.calls != 1 {
+		t.Fatalf("stale fenced dispatch = %+v, %v, calls=%d", reply, err, rpc.calls)
+	}
+}
