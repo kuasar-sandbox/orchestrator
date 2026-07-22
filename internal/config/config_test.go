@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestLoadRejectsOldRuntimeFields(t *testing.T) {
@@ -322,6 +323,116 @@ func TestLoadProxyAcceptsProxyNetNS(t *testing.T) {
 	}
 	if got := cfg.ProxyNetNS; got != "sw0_mgmt" {
 		t.Fatalf("proxy_netns = %q", got)
+	}
+}
+
+func TestLoadMMDSEndpointsDefaults(t *testing.T) {
+	t.Setenv("NODE_CONFIG_ENCRYPTION_KEY", "")
+	path := writeConfig(t, `
+api:
+  domain: example.test
+encryption_key: test-key
+sandbox:
+  boot:
+    kernel: /opt/sandbox/vmlinux
+    runtime: /opt/sandbox/sandbox-runtime.erofs
+`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+	e := cfg.MMDS.Endpoints
+	if e.Enabled {
+		t.Fatalf("mmds.endpoints.enabled default = true, want false")
+	}
+	if e.MaxEndpointsPerSandbox != 16 {
+		t.Fatalf("max_endpoints_per_sandbox default = %d, want 16", e.MaxEndpointsPerSandbox)
+	}
+	if e.MaxTotalEndpoints != 65536 {
+		t.Fatalf("max_total_endpoints default = %d, want 65536", e.MaxTotalEndpoints)
+	}
+	if e.MaxWorkerRPCFrameBytes != 524288 {
+		t.Fatalf("max_worker_rpc_frame_bytes default = %d, want 524288", e.MaxWorkerRPCFrameBytes)
+	}
+	wantPrefixes := []string{"/latest/api/", "/internal/"}
+	if len(e.ReservedPathPrefixes) != len(wantPrefixes) || e.ReservedPathPrefixes[0] != wantPrefixes[0] || e.ReservedPathPrefixes[1] != wantPrefixes[1] {
+		t.Fatalf("reserved_path_prefixes default = %v, want %v", e.ReservedPathPrefixes, wantPrefixes)
+	}
+	if got := e.ValueWaitTimeoutDur(); got != 3*time.Second {
+		t.Fatalf("value_wait_timeout default = %v, want 3s", got)
+	}
+	if got := e.RelayRequestTimeoutDur(); got != 2*time.Second {
+		t.Fatalf("relay_request_timeout default = %v, want 2s", got)
+	}
+}
+
+func TestLoadRejectsMMDSEndpointsEnabledWithoutMMDSEnabled(t *testing.T) {
+	t.Setenv("NODE_CONFIG_ENCRYPTION_KEY", "")
+	path := writeConfig(t, `
+api:
+  domain: example.test
+encryption_key: test-key
+proxy:
+  auth: enforce
+mmds:
+  enabled: false
+  endpoints:
+    enabled: true
+sandbox:
+  boot:
+    kernel: /opt/sandbox/vmlinux
+    runtime: /opt/sandbox/sandbox-runtime.erofs
+`)
+
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "mmds.endpoints.enabled=true requires mmds.enabled=true") {
+		t.Fatalf("Load error = %v, want mmds.endpoints.enabled validation", err)
+	}
+}
+
+func TestLoadRejectsMMDSEndpointsValueWaitTimeoutOutOfRange(t *testing.T) {
+	t.Setenv("NODE_CONFIG_ENCRYPTION_KEY", "")
+	for _, value := range []string{"1s", "6s"} {
+		t.Run(value, func(t *testing.T) {
+			path := writeConfig(t, `
+api:
+  domain: example.test
+encryption_key: test-key
+mmds:
+  endpoints:
+    value_wait_timeout: `+value+`
+sandbox:
+  boot:
+    kernel: /opt/sandbox/vmlinux
+    runtime: /opt/sandbox/sandbox-runtime.erofs
+`)
+			_, err := Load(path)
+			if err == nil || !strings.Contains(err.Error(), "mmds.endpoints.value_wait_timeout") {
+				t.Fatalf("Load error = %v, want mmds.endpoints.value_wait_timeout validation", err)
+			}
+		})
+	}
+}
+
+func TestLoadRejectsMMDSEndpointsUnknownField(t *testing.T) {
+	t.Setenv("NODE_CONFIG_ENCRYPTION_KEY", "")
+	path := writeConfig(t, `
+api:
+  domain: example.test
+encryption_key: test-key
+mmds:
+  endpoints:
+    max_endpoints_per_box: 5
+sandbox:
+  boot:
+    kernel: /opt/sandbox/vmlinux
+    runtime: /opt/sandbox/sandbox-runtime.erofs
+`)
+
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("Load succeeded with unknown mmds.endpoints field")
 	}
 }
 

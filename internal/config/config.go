@@ -274,6 +274,111 @@ type ProxyConfig struct {
 type MMDSConfig struct {
 	Enabled bool   `yaml:"enabled"` // false (default) => -isnotfc + proxy-only auth
 	Listen  string `yaml:"listen"`  // MMDS listener (the vswitch mgmt-service target); default 127.0.0.1:19254
+	// Endpoints is the MMDS endpoints policy: Create-time store/relay
+	// endpoints, layered on top of the built-in envd token/metadata service
+	// above. Independently gated by its own Enabled flag (requires
+	// MMDS.Enabled=true too — see validateProxy).
+	Endpoints MMDSEndpointsConfig `yaml:"endpoints"`
+}
+
+// MMDSEndpointsConfig is node policy for MMDS endpoints. Enabled=false
+// (default) keeps sandbox Create rejecting the kuasar-sandbox.mmds metadata
+// namespace with 400 and leaves the admin mutation routes unregistered —
+// the feature is never silently ignored when present-but-disabled. Sizes
+// are integer bytes; Create input can never raise these limits.
+type MMDSEndpointsConfig struct {
+	Enabled                    bool     `yaml:"enabled"`
+	MaxEndpointsPerSandbox     int      `yaml:"max_endpoints_per_sandbox"`      // default 16
+	MaxTotalEndpoints          int      `yaml:"max_total_endpoints"`            // default 65536
+	MaxMetadataBytes           int      `yaml:"max_metadata_bytes"`             // default 65536
+	MaxPathBytes               int      `yaml:"max_path_bytes"`                 // default 512
+	ReservedPathPrefixes       []string `yaml:"reserved_path_prefixes"`         // default [/latest/api/, /internal/]
+	ValueWaitTimeout           string   `yaml:"value_wait_timeout"`             // default 3s; hard range 2s..5s
+	MaxStoreValueBytes         int      `yaml:"max_store_value_bytes"`          // default 16384
+	MaxRelayURLBytes           int      `yaml:"max_relay_url_bytes"`            // default 2048
+	MaxRelayAuthBytes          int      `yaml:"max_relay_auth_bytes"`           // default 16384
+	RelayRequestTimeout        string   `yaml:"relay_request_timeout"`          // default 2s; total deadline for a relay fetch
+	MaxRelayResponseBytes      int      `yaml:"max_relay_response_bytes"`       // default 65536
+	MaxRelayDecompressedBytes  int      `yaml:"max_relay_decompressed_bytes"`   // default 262144
+	MaxRelayInflightPerSandbox int      `yaml:"max_relay_inflight_per_sandbox"` // default 4
+	MaxRelayRequestsPerSecond  int      `yaml:"max_relay_requests_per_second"`  // default 2
+	MaxRelayDNSAnswers         int      `yaml:"max_relay_dns_answers"`          // default 16
+	MaxWorkerInflight          int      `yaml:"max_worker_inflight"`            // default 128 (external mode worker RPC)
+	MaxWorkerRPCFrameBytes     int      `yaml:"max_worker_rpc_frame_bytes"`     // default 524288 (external mode worker RPC)
+}
+
+// ApplyDefaults fills the MMDS endpoints policy defaults. Exported so callers building
+// a config block outside config.Load (e.g. tests) can default it directly.
+func (m *MMDSEndpointsConfig) ApplyDefaults() {
+	if m.MaxEndpointsPerSandbox == 0 {
+		m.MaxEndpointsPerSandbox = 16
+	}
+	if m.MaxTotalEndpoints == 0 {
+		m.MaxTotalEndpoints = 65536
+	}
+	if m.MaxMetadataBytes == 0 {
+		m.MaxMetadataBytes = 65536
+	}
+	if m.MaxPathBytes == 0 {
+		m.MaxPathBytes = 512
+	}
+	if len(m.ReservedPathPrefixes) == 0 {
+		m.ReservedPathPrefixes = []string{"/latest/api/", "/internal/"}
+	}
+	if m.ValueWaitTimeout == "" {
+		m.ValueWaitTimeout = "3s"
+	}
+	if m.MaxStoreValueBytes == 0 {
+		m.MaxStoreValueBytes = 16384
+	}
+	if m.MaxRelayURLBytes == 0 {
+		m.MaxRelayURLBytes = 2048
+	}
+	if m.MaxRelayAuthBytes == 0 {
+		m.MaxRelayAuthBytes = 16384
+	}
+	if m.RelayRequestTimeout == "" {
+		m.RelayRequestTimeout = "2s"
+	}
+	if m.MaxRelayResponseBytes == 0 {
+		m.MaxRelayResponseBytes = 65536
+	}
+	if m.MaxRelayDecompressedBytes == 0 {
+		m.MaxRelayDecompressedBytes = 262144
+	}
+	if m.MaxRelayInflightPerSandbox == 0 {
+		m.MaxRelayInflightPerSandbox = 4
+	}
+	if m.MaxRelayRequestsPerSecond == 0 {
+		m.MaxRelayRequestsPerSecond = 2
+	}
+	if m.MaxRelayDNSAnswers == 0 {
+		m.MaxRelayDNSAnswers = 16
+	}
+	if m.MaxWorkerInflight == 0 {
+		m.MaxWorkerInflight = 128
+	}
+	if m.MaxWorkerRPCFrameBytes == 0 {
+		m.MaxWorkerRPCFrameBytes = 524288
+	}
+}
+
+// ValueWaitTimeoutDur parses ValueWaitTimeout (default/fallback 3s).
+func (m MMDSEndpointsConfig) ValueWaitTimeoutDur() time.Duration {
+	d, err := time.ParseDuration(m.ValueWaitTimeout)
+	if err != nil || d <= 0 {
+		return 3 * time.Second
+	}
+	return d
+}
+
+// RelayRequestTimeoutDur parses RelayRequestTimeout (default/fallback 2s).
+func (m MMDSEndpointsConfig) RelayRequestTimeoutDur() time.Duration {
+	d, err := time.ParseDuration(m.RelayRequestTimeout)
+	if err != nil || d <= 0 {
+		return 2 * time.Second
+	}
+	return d
 }
 
 // PathsConfig holds node-local directories and sockets.
@@ -576,6 +681,7 @@ func (c *Config) applyDefaults() {
 	def(&c.Checkpoint.Mode, CheckpointLocal)
 	def(&c.Checkpoint.LocalDir, "/var/lib/sandbox-saved")
 	def(&c.MMDS.Listen, "127.0.0.1:19254")
+	c.MMDS.Endpoints.ApplyDefaults()
 	if c.ResourceListen != nil {
 		c.ResourceListen.ApplyDefaults()
 	}
@@ -702,6 +808,19 @@ func (c *Config) validateProxy() error {
 	}
 	if c.MMDS.Enabled && c.Proxy.Mode == ProxyOff {
 		return fmt.Errorf("config: mmds.enabled=true requires proxy.mode!=off (the MMDS service is hosted by the proxy)")
+	}
+	if c.MMDS.Endpoints.Enabled && !c.MMDS.Enabled {
+		return fmt.Errorf("config: mmds.endpoints.enabled=true requires mmds.enabled=true")
+	}
+	if wait, err := time.ParseDuration(c.MMDS.Endpoints.ValueWaitTimeout); err != nil {
+		return fmt.Errorf("config: mmds.endpoints.value_wait_timeout %q: %w", c.MMDS.Endpoints.ValueWaitTimeout, err)
+	} else if wait < 2*time.Second || wait > 5*time.Second {
+		return fmt.Errorf("config: mmds.endpoints.value_wait_timeout %q (want 2s..5s)", c.MMDS.Endpoints.ValueWaitTimeout)
+	}
+	if rt, err := time.ParseDuration(c.MMDS.Endpoints.RelayRequestTimeout); err != nil {
+		return fmt.Errorf("config: mmds.endpoints.relay_request_timeout %q: %w", c.MMDS.Endpoints.RelayRequestTimeout, err)
+	} else if rt <= 0 {
+		return fmt.Errorf("config: mmds.endpoints.relay_request_timeout must be > 0")
 	}
 	if f := c.Builder.FilesStorage; f != nil && f.Bucket == "" {
 		return fmt.Errorf("config: builder.files_storage.bucket is required when files_storage is set")
