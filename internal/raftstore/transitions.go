@@ -42,7 +42,7 @@ func validateRouteTransition(
 			return validateProvenRouteTombstone(*current.Ready, *next.Tombstone)
 		}
 		if next.State == clusterstate.WorkflowRoutePaused &&
-			sameReadyExecution(*current.Ready, next.Paused.Execution) &&
+			sameReadyExecutionForPause(*current.Ready, next.Paused.Execution) &&
 			next.Paused.Execution.LastEventSeq > current.Ready.LastEventSeq {
 			return nil
 		}
@@ -82,7 +82,7 @@ func validateRouteTransition(
 			return nil
 		}
 		if next.State == clusterstate.WorkflowRoutePaused &&
-			sameReadyExecution(current.Resuming.Execution, next.Paused.Execution) &&
+			sameReadyExecutionForPause(current.Resuming.Execution, next.Paused.Execution) &&
 			next.Paused.Execution.LastEventSeq > current.Resuming.Execution.LastEventSeq {
 			return nil
 		}
@@ -445,6 +445,11 @@ func sameReadyExecution(left, right clusterstate.ReadyRoute) bool {
 	left.LastEventSeq, right.LastEventSeq = 0, 0
 	left.Presentation, right.Presentation = clusterstate.SandboxPresentationV1{}, clusterstate.SandboxPresentationV1{}
 	return reflect.DeepEqual(left, right)
+}
+
+func sameReadyExecutionForPause(left, right clusterstate.ReadyRoute) bool {
+	left.SnapshotRef, right.SnapshotRef = "", ""
+	return sameReadyExecution(left, right)
 }
 
 func sameReadyPresentation(left, right clusterstate.ReadyRoute) bool {

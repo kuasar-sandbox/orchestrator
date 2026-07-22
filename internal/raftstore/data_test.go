@@ -482,6 +482,7 @@ func TestRouteAutoResumeReplacementAndFenceCompaction(t *testing.T) {
 	}
 
 	resumed := readyRecord(starting, 3)
+	resumed.Ready.SnapshotRef = paused.Paused.SnapshotRef
 	applyDataOK(t, &state, 6, DataCommand{
 		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{LogIndex: 4}, Route: &resumed,
 	})
@@ -745,6 +746,7 @@ func testSandboxPresentation() clusterstate.SandboxPresentationV1 {
 func pausedRecord(ready clusterstate.RouteWorkflowRecord, eventSeq uint64) clusterstate.RouteWorkflowRecord {
 	projection := *ready.Ready
 	projection.LastEventSeq = eventSeq
+	projection.SnapshotRef = "snapshot-1"
 	intent := testDispatchIntentNoFail()
 	return clusterstate.RouteWorkflowRecord{
 		Group: ready.Group, RouteKey: ready.RouteKey, State: clusterstate.WorkflowRoutePaused,

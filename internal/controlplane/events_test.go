@@ -41,6 +41,7 @@ func TestSandboxEventsConvergeWithoutProjectionRegression(t *testing.T) {
 		t.Fatal(err)
 	}
 	resumed := fixture.event(3, string(clusterstate.WorkflowRouteReady))
+	resumed.SnapshotRef = paused.SnapshotRef
 	resumed.Presentation.EndAt = 4
 	if err := converger.ConvergeExecutionEvent(ctx, resumed); err != nil {
 		t.Fatal(err)
@@ -55,7 +56,7 @@ func TestSandboxEventsConvergeWithoutProjectionRegression(t *testing.T) {
 	if record == nil || record.State != clusterstate.WorkflowRouteReady || record.Ready == nil ||
 		record.Ready.LastEventSeq != 3 || record.Ready.TargetPort != 3000 ||
 		record.Ready.AccessToken != "access-token" || record.Ready.TemplateRef != fixture.templateRef ||
-		record.Ready.Presentation.EndAt != 4 {
+		record.Ready.SnapshotRef != paused.SnapshotRef || record.Ready.Presentation.EndAt != 4 {
 		t.Fatalf("converged Route = %+v", record)
 	}
 

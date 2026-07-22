@@ -340,8 +340,8 @@ func (s PausedRouteState) Validate() error {
 	if err := s.Execution.Validate(); err != nil {
 		return err
 	}
-	if s.SnapshotRef == "" {
-		return errors.New("cluster: PAUSED requires an authoritative snapshot reference")
+	if s.SnapshotRef == "" || s.Execution.SnapshotRef != s.SnapshotRef {
+		return errors.New("cluster: PAUSED requires one authoritative execution snapshot reference")
 	}
 	return validateSandboxDispatchIntent(s.ResumeIntent)
 }

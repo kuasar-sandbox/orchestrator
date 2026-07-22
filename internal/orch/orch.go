@@ -298,19 +298,37 @@ func (o *Orchestrator) Kill(ctx context.Context, id, apiKey string) (bool, error
 }
 
 func (o *Orchestrator) Pause(ctx context.Context, id, apiKey string) error {
-	sb, err := o.st.Get(ctx, id)
-	if err != nil {
-		return err
-	}
-	if !ownsSandbox(sb, apiKey) {
-		return api.ErrNotFound
-	}
-	return o.pauseSandbox(ctx, sb)
+	return o.lifecycle.Do(id, func() error {
+		sb, err := o.st.Get(ctx, id)
+		if err != nil {
+			return err
+		}
+		if !ownsSandbox(sb, apiKey) {
+			return api.ErrNotFound
+		}
+		return o.pauseSandboxLocked(ctx, sb)
+	})
 }
 
 // pauseSandbox snapshots a running sandbox and stops it — the work behind Pause
 // and the reaper's auto-suspend (no api key: the caller has already authorized).
 func (o *Orchestrator) pauseSandbox(ctx context.Context, sb *types.Sandbox) error {
+	if sb == nil || sb.ID == "" {
+		return api.ErrNotFound
+	}
+	return o.lifecycle.Do(sb.ID, func() error {
+		current, err := o.st.Get(ctx, sb.ID)
+		if err != nil {
+			return err
+		}
+		if current == nil {
+			return api.ErrNotFound
+		}
+		return o.pauseSandboxLocked(ctx, current)
+	})
+}
+
+func (o *Orchestrator) pauseSandboxLocked(ctx context.Context, sb *types.Sandbox) error {
 	if sb.State == types.StatePaused {
 		if managed, err := o.commitManagedSandboxState(ctx, sb, string(clusterstate.WorkflowRoutePaused), ""); err != nil {
 			return err

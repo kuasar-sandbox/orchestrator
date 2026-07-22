@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	"github.com/kuasar-sandbox/orchestrator/internal/apikey"
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
@@ -608,5 +609,41 @@ func TestCacheIfAbsentDoesNotPublishStaleStoreRead(t *testing.T) {
 	}
 	if got := o.lookup(running.ID); got != running {
 		t.Fatalf("cache was overwritten by stale store row: %+v", got)
+	}
+}
+
+func TestPauseSerializesAndRereadsSandboxState(t *testing.T) {
+	o := testOrch(t)
+	ctx := context.Background()
+	sandbox := &types.Sandbox{
+		ID: "sandbox-pause-race", TemplateID: "bare-img-" + strings.Repeat("c", 64),
+		State: types.StateRunning, AuthKey: strings.Repeat("a", 64), ManifestKey: strings.Repeat("b", 64),
+	}
+	if err := o.st.Put(ctx, sandbox); err != nil {
+		t.Fatal(err)
+	}
+	held := make(chan struct{})
+	release := make(chan struct{})
+	go func() {
+		_ = o.lifecycle.Do(sandbox.ID, func() error {
+			close(held)
+			<-release
+			return nil
+		})
+	}()
+	<-held
+	done := make(chan error, 1)
+	go func() { done <- o.pauseSandbox(ctx, sandbox) }()
+	select {
+	case err := <-done:
+		t.Fatalf("pause bypassed the in-flight lifecycle: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+	if err := o.st.SetState(ctx, sandbox.ID, types.StatePaused); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	if err := <-done; !errors.Is(err, api.ErrAlreadyPaused) {
+		t.Fatalf("pause did not use the state committed under the lifecycle lock: %v", err)
 	}
 }

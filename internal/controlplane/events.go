@@ -135,6 +135,7 @@ func (c *EventConverger) convergeSandbox(
 			}
 			execution := *projection
 			execution.LastEventSeq = event.EventSeq
+			execution.SnapshotRef = event.SnapshotRef
 			execution.Presentation = event.Presentation.Clone()
 			next := clusterstate.RouteWorkflowRecord{
 				Group: record.Group, RouteKey: record.RouteKey, State: clusterstate.WorkflowRoutePaused,

@@ -152,6 +152,30 @@ func TestRegistryBuildIDConflictSurvivesRegisteredProjection(t *testing.T) {
 	}
 }
 
+func TestNextSandboxRoundPreservesTargetRuntimeDigest(t *testing.T) {
+	service, store, planner, _ := newRegistryServiceFixture(t, clusterstate.DispatchAcceptedQueued)
+	request := sandboxMutationRequest(t, store)
+	first, err := service.planSandbox(
+		context.Background(), request.Group, request.RouteKey, "sandbox-first", request.Input, nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (sandboxRoundSource{service: service}).NextSandboxRound(
+		context.Background(), request.Group, request.RouteKey, 2, first.Intent, []string{"node-1"},
+	); err != nil {
+		t.Fatal(err)
+	}
+	planner.mu.Lock()
+	defer planner.mu.Unlock()
+	if len(planner.calls) != 2 {
+		t.Fatalf("placement calls = %d, want 2", len(planner.calls))
+	}
+	if got := planner.calls[1].TargetRuntimeDigest; got != request.Input.TargetRuntimeDigest {
+		t.Fatalf("next placement runtime digest = %q, want %q", got, request.Input.TargetRuntimeDigest)
+	}
+}
+
 type serviceConsensus struct {
 	*memoryConsensus
 	system raftstore.SystemState

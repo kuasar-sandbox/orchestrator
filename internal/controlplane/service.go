@@ -823,7 +823,8 @@ func (r sandboxRoundSource) NextSandboxRound(
 	}
 	return r.service.planSandbox(ctx, group, routeKey, sandboxID, routeapi.SandboxInput{
 		TemplateRef: spec.TemplateRef, Config: spec.RequestedConfig,
-		TimeoutSeconds: spec.TimeoutSeconds, Demand: *demand.Sandbox, Request: spec.Request,
+		TimeoutSeconds: spec.TimeoutSeconds, Demand: *demand.Sandbox,
+		TargetRuntimeDigest: spec.TargetRuntimeDigest, Request: spec.Request,
 	}, excludedNodeIDs)
 }
 
