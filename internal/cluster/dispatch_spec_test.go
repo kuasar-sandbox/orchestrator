@@ -228,6 +228,19 @@ func TestBuildDispatchSpecBindsAllReplayedRegistrationFields(t *testing.T) {
 	}
 }
 
+func TestBuildDispatchSpecRejectsAdditionalImmutableNames(t *testing.T) {
+	spec := BuildDispatchSpecV1{
+		Version: DispatchSpecVersionV1, TemplateID: "transient-template",
+		AuthKeyFingerprint: strings.Repeat("a", 24), ManifestKeyFingerprint: strings.Repeat("b", 24),
+		Profile: types.ProfileBare, CPUCount: 2, MemoryMB: 1024,
+		Names:   []string{"primary", "secondary"},
+		Request: testNodeRequest(t, "/v3/templates", `{"cpuCount":2,"memoryMB":1024,"metadata":null,"name":"primary","profile":"bare","tags":null}`),
+	}
+	if _, err := MarshalBuildDispatchSpec(spec); err == nil {
+		t.Fatal("Build dispatch spec accepted names the node request cannot replay")
+	}
+}
+
 func TestBuildDispatchSpecBindsBuilderHeader(t *testing.T) {
 	request, err := NewNodeRequestEnvelopeV1(http.MethodPost, "/v3/templates", "", http.Header{
 		"X-Kuasar-Sandbox-Builder": {`{"referer":{"enabled":true}}`},
