@@ -86,12 +86,44 @@ CREATE TABLE IF NOT EXISTS manifest_keys (
   registry_auth_enc TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_manifest_keys_hash ON manifest_keys(key_hash);
+
+-- MMDS endpoints. Immutable per
+-- (sandbox_id,name) once Create's transaction commits: name/path/backend_type
+-- never change after insert. public_config_json holds validated non-secrets
+-- (e.g. the relay URL + auth header name); secret_ciphertext holds a store
+-- value or relay auth value, AEAD-bound (secretbox.EncryptAAD) to record
+-- type+sandbox_id+name+backend_type+revision so it cannot be replayed into a
+-- different row. revision starts at 0 (never configured) and increments on
+-- every admin PUT/DELETE; value_present distinguishes "deleted" (revision>0,
+-- value_present=false) from "never configured" (revision=0).
+CREATE TABLE IF NOT EXISTS sandbox_mmds_endpoints (
+  sandbox_id          TEXT NOT NULL,
+  name                TEXT NOT NULL,
+  path                TEXT NOT NULL,
+  backend_type        TEXT NOT NULL,
+  public_config_json  TEXT NOT NULL DEFAULT '{}',
+  secret_ciphertext   TEXT NOT NULL DEFAULT '',
+  content_type        TEXT NOT NULL DEFAULT '',
+  expires_unix        INTEGER NOT NULL DEFAULT 0,
+  revision            INTEGER NOT NULL DEFAULT 0,
+  value_present       INTEGER NOT NULL DEFAULT 0,
+  created_unix        INTEGER NOT NULL,
+  updated_unix        INTEGER NOT NULL,
+  PRIMARY KEY (sandbox_id, name),
+  UNIQUE (sandbox_id, path),
+  FOREIGN KEY (sandbox_id) REFERENCES sandboxes(id) ON DELETE CASCADE
+);
 `
 
 // Open opens (creating if needed) the sqlite store with the encryption box used
 // for manifest keys at rest. The file should be 0600.
+//
+// foreign_keys(1) is set in the DSN (not a post-open PRAGMA exec) because
+// sql.DB pools connections: a pragma applied to one connection does not bind
+// connections opened later from the pool. It is required for
+// sandbox_mmds_endpoints' ON DELETE CASCADE to actually fire.
 func Open(path string, box *secretbox.Box) (*Store, error) {
-	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)")
+	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)")
 	if err != nil {
 		return nil, fmt.Errorf("store: open %s: %w", path, err)
 	}

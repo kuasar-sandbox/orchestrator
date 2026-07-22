@@ -70,13 +70,24 @@ func NewFromColonHex(spec string) (*Box, error) {
 }
 
 // Encrypt seals plaintext under the active key and returns the hex record.
-func (b *Box) Encrypt(plaintext []byte) (string, error) {
+func (b *Box) Encrypt(plaintext []byte) (string, error) { return b.EncryptAAD(plaintext, nil) }
+
+// Decrypt opens a hex record produced by Encrypt, selecting the key by its tag.
+func (b *Box) Decrypt(record string) ([]byte, error) { return b.DecryptAAD(record, nil) }
+
+// EncryptAAD seals plaintext under the active key, additionally authenticating
+// (but not encrypting) aad: Decrypt/DecryptAAD only opens the record when given
+// the exact same aad it was sealed with. Use this to bind a ciphertext to the
+// row/context it belongs to (e.g. record type + owner id + revision) so it
+// cannot be replayed into a different row even if the ciphertext were copied.
+// A nil aad behaves exactly like Encrypt.
+func (b *Box) EncryptAAD(plaintext, aad []byte) (string, error) {
 	k := b.keys[0]
 	nonce := make([]byte, k.aead.NonceSize())
 	if _, err := rand.Read(nonce); err != nil {
 		return "", err
 	}
-	ct := k.aead.Seal(nil, nonce, plaintext, nil)
+	ct := k.aead.Seal(nil, nonce, plaintext, aad)
 	blob := make([]byte, 0, tagLen+len(nonce)+len(ct))
 	blob = append(blob, k.tag[:]...)
 	blob = append(blob, nonce...)
@@ -84,8 +95,10 @@ func (b *Box) Encrypt(plaintext []byte) (string, error) {
 	return hex.EncodeToString(blob), nil
 }
 
-// Decrypt opens a hex record produced by Encrypt, selecting the key by its tag.
-func (b *Box) Decrypt(record string) ([]byte, error) {
+// DecryptAAD opens a hex record produced by EncryptAAD/Encrypt, selecting the
+// key by its tag and requiring aad to match the value the record was sealed
+// with. A nil aad behaves exactly like Decrypt.
+func (b *Box) DecryptAAD(record string, aad []byte) ([]byte, error) {
 	blob, err := hex.DecodeString(record)
 	if err != nil {
 		return nil, errors.New("secretbox: record is not hex")
@@ -102,7 +115,7 @@ func (b *Box) Decrypt(record string) ([]byte, error) {
 			}
 			nonce := blob[tagLen : tagLen+ns]
 			ct := blob[tagLen+ns:]
-			return k.aead.Open(nil, nonce, ct, nil)
+			return k.aead.Open(nil, nonce, ct, aad)
 		}
 	}
 	return nil, errors.New("secretbox: no encryption key matches this record (rotated away?)")

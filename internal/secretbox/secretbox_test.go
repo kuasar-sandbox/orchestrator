@@ -70,6 +70,64 @@ func TestBadKeys(t *testing.T) {
 	}
 }
 
+func TestEncryptAADRoundtrip(t *testing.T) {
+	b, err := NewFromColonHex(hexKey(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec, err := b.EncryptAAD([]byte("plaintext"), []byte("sid=abc:name=credentials:rev=0"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := b.DecryptAAD(rec, []byte("sid=abc:name=credentials:rev=0"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "plaintext" {
+		t.Fatalf("decrypt=%q want %q", got, "plaintext")
+	}
+}
+
+func TestDecryptAADRejectsMismatchedAAD(t *testing.T) {
+	b, err := NewFromColonHex(hexKey(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec, err := b.EncryptAAD([]byte("plaintext"), []byte("sid=abc:name=credentials:rev=0"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A record encrypted for one row must not decrypt under another row's AAD —
+	// this is what prevents a ciphertext being replayed into a different
+	// sandbox/name/backend-type/revision if DB rows were swapped.
+	if _, err := b.DecryptAAD(rec, []byte("sid=abc:name=credentials:rev=1")); err == nil {
+		t.Fatal("DecryptAAD succeeded with a mismatched revision in the AAD")
+	}
+	if _, err := b.DecryptAAD(rec, []byte("sid=other:name=credentials:rev=0")); err == nil {
+		t.Fatal("DecryptAAD succeeded with a mismatched sandbox id in the AAD")
+	}
+	if _, err := b.DecryptAAD(rec, nil); err == nil {
+		t.Fatal("DecryptAAD succeeded with no AAD against an AAD-bound record")
+	}
+}
+
+func TestEncryptDecryptDelegateToAADVariantWithNilAAD(t *testing.T) {
+	b, err := NewFromColonHex(hexKey(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec, err := b.Encrypt([]byte("plaintext"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A plain Encrypt/Decrypt record is a nil-AAD record: DecryptAAD with an
+	// explicit nil must open it (proves Decrypt/DecryptAAD share behavior).
+	got, err := b.DecryptAAD(rec, nil)
+	if err != nil || string(got) != "plaintext" {
+		t.Fatalf("DecryptAAD(nil) on a plain Encrypt record: got=%q err=%v", got, err)
+	}
+}
+
 func TestDedupSameKey(t *testing.T) {
 	k := hexKey(t)
 	b, err := NewFromColonHex(k + ":" + k)
