@@ -98,8 +98,11 @@ func (s *Store) PrepareClusterStart(
 	expectedNodeID, bootID, dataEndpoint string,
 	priorEpochFenced bool,
 ) (ClusterStartIdentity, error) {
-	if bootID == "" || dataEndpoint == "" {
-		return ClusterStartIdentity{}, errors.New("store: boot ID and data endpoint are required")
+	if bootID == "" {
+		return ClusterStartIdentity{}, errors.New("store: boot ID is required")
+	}
+	if err := validateClusterDataEndpoint(dataEndpoint); err != nil {
+		return ClusterStartIdentity{}, err
 	}
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
 	if err != nil {
@@ -203,14 +206,17 @@ func validateClusterIdentityInput(nodeID, bootID, dataEndpoint string) error {
 	if err := clusterstate.ValidateExecutionBindingNodeID(nodeID); err != nil {
 		return fmt.Errorf("store: invalid node ID: %w", err)
 	}
-	switch {
-	case bootID == "":
+	if bootID == "" {
 		return errors.New("store: boot ID is required")
-	case dataEndpoint == "":
-		return errors.New("store: data endpoint is required")
-	default:
-		return nil
 	}
+	return validateClusterDataEndpoint(dataEndpoint)
+}
+
+func validateClusterDataEndpoint(dataEndpoint string) error {
+	if err := clusterstate.ValidateTCPDataEndpoint(dataEndpoint); err != nil {
+		return fmt.Errorf("store: %w", err)
+	}
+	return nil
 }
 
 type rowScanner interface {
