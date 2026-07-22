@@ -431,6 +431,9 @@ func (s *Server) buildAdmitOKLocked(conn net.Conn, req *Message, token *string) 
 // handleReattach re-binds a connection to an existing reservation
 // (after sandbox-ctl reconnect or controller restart).
 func (s *Server) handleReattach(conn net.Conn, req *Message, token *string) *Message {
+	if response, handled := s.handlePreparedReattach(conn, req, token); handled {
+		return response
+	}
 	s.State.Lock()
 	defer s.State.Unlock()
 
@@ -444,6 +447,56 @@ func (s *Server) handleReattach(conn net.Conn, req *Message, token *string) *Mes
 	return &Message{Type: TypeAck, Token: req.Token, NewAllocatable: res.AllocatableNowMem}
 }
 
+func (s *Server) handlePreparedReattach(conn net.Conn, req *Message, token *string) (*Message, bool) {
+	prepared := s.PreparedAdmission
+	if prepared == nil {
+		return nil, false
+	}
+	fail := func(message string) (*Message, bool) {
+		return &Message{Type: TypeError, Msg: message}, true
+	}
+
+	prepared.mu.Lock()
+	defer prepared.mu.Unlock()
+	if prepared.state != s.State || prepared.persister != s.Persister {
+		return fail("prepared Admission is not bound to this resource server")
+	}
+	prepared.state.Lock()
+	defer prepared.state.Unlock()
+	reservation := prepared.state.Lookup(req.Token)
+	if reservation == nil {
+		return nil, false
+	}
+	record := prepared.state.PreparedSandboxAdmissions[reservation.SandboxID]
+	if record == nil || record.ReservationToken != req.Token {
+		return nil, false
+	}
+	if record.State != PreparedClaimed || reservation.Token != record.ReservationToken ||
+		reservation.SandboxID != record.SandboxID {
+		return fail("prepared reservation is not claimed by this sandbox")
+	}
+	if reservation.Conn != nil {
+		return fail("prepared reservation already has a runtime connection")
+	}
+	if record.Demand.CgroupPath == "" || reservation.CgroupPath == "" ||
+		record.Demand.CgroupPath != reservation.CgroupPath {
+		return fail("prepared reservation has no verified runtime cgroup")
+	}
+	peerCgroup := s.peerCgroup
+	if peerCgroup == nil {
+		peerCgroup = peerUnifiedCgroup
+	}
+	actualCgroup, err := peerCgroup(conn)
+	if err != nil || actualCgroup != reservation.CgroupPath {
+		return fail("prepared reservation belongs to another runtime cgroup")
+	}
+
+	reservation.Conn = conn
+	*token = reservation.Token
+	s.Logf("reattach prepared %s sid=%s stage=%s", reservation.Token[:8], reservation.SandboxID, reservation.Stage)
+	return &Message{Type: TypeAck, Token: reservation.Token, NewAllocatable: reservation.AllocatableNowMem}, true
+}
+
 func (s *Server) handleSettled(req *Message, token string) *Message {
 	s.State.Lock()
 	res := s.State.Lookup(token)
@@ -455,6 +508,7 @@ func (s *Server) handleSettled(req *Message, token string) *Message {
 	// 1. main-pool release: collapse AllocatableNowMem from the elevated
 	//    startup budget down to max(current_rss, floor). Steady-state grant
 	//    paths will pump it back up if needed.
+	previous := *res
 	floor := res.Floor.MemoryBytes
 	newAlloc := req.CurrentRSS
 	if newAlloc < floor {
@@ -468,16 +522,25 @@ func (s *Server) handleSettled(req *Message, token string) *Message {
 	res.Stage = StageSettled
 	res.StageEnteredAt = time.Now()
 	res.LastHeartbeatAt = time.Now()
-	s.State.Unlock()
-
-	// Wake the admission worker — main + startup pool both just got
-	// headroom back, queued admits may now fit.
-	s.Admission.PushWake()
-
-	if err := s.Persister.Flush(s.State); err != nil {
-		s.Logf("persister flush: %v", err)
+	flushErr := s.Persister.Flush(s.State)
+	if flushErr != nil && !FlushPublished(flushErr) {
+		*res = previous
+		s.State.Unlock()
+		s.Logf("persister flush: %v", flushErr)
+		return &Message{Type: TypeError, Msg: "failed to persist settled reservation"}
 	}
-	s.Logf("settled %s sid=%s rss=%d alloc=%d", token[:8], res.SandboxID, req.CurrentRSS, newAlloc)
+	sandboxID := res.SandboxID
+	s.State.Unlock()
+	if flushErr != nil {
+		s.Logf("persister flush: %v", flushErr)
+	}
+
+	// Wake both Admission paths only after the returned capacity is durable.
+	s.Admission.PushWake()
+	if s.PreparedAdmission != nil {
+		s.PreparedAdmission.SignalCapacityChange()
+	}
+	s.Logf("settled %s sid=%s rss=%d alloc=%d", token[:8], sandboxID, req.CurrentRSS, newAlloc)
 	return &Message{Type: TypeAck}
 }
 
