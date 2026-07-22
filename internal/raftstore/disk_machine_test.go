@@ -195,6 +195,88 @@ func TestPebblePendingIndexTracksCoordinatorWork(t *testing.T) {
 	}
 }
 
+func TestPebbleRouteBucketUsesQualifiedIndex(t *testing.T) {
+	engine, err := OpenPebbleStateEngine(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close()
+	registryLayout := testRegistryLayout(4, "generation-route-bucket-index")
+	group := "/bucket-index"
+	type target struct {
+		key      string
+		bucket   uint32
+		identity ShardRequestIdentity
+	}
+	var targets []target
+	for candidate := 0; len(targets) < 3; candidate++ {
+		routeKey := fmt.Sprintf("route-%06d", candidate)
+		bucket, shardID, hashErr := clusterstate.RouteShardFor(
+			group, routeKey, registryLayout.RouteBucketCount, registryLayout.VirtualShardCount,
+		)
+		if hashErr != nil {
+			t.Fatal(hashErr)
+		}
+		if len(targets) != 0 && (bucket != targets[0].bucket || shardID != targets[0].identity.ShardID) {
+			continue
+		}
+		targets = append(targets, target{key: routeKey, bucket: bucket, identity: registryLayoutShardIdentity(t, registryLayout, shardID)})
+	}
+	identity := targets[0].identity
+	shardID := DataRaftShardID(identity.ShardID)
+	machine := engine.NewStateMachine(shardID, 1)
+	if _, err := machine.Open(make(chan struct{})); err != nil {
+		t.Fatal(err)
+	}
+	bootstrap, _ := NewDataShardBootstrap(registryLayout, identity.ShardID)
+	applyDiskData(t, machine, 1, DataCommand{
+		Type: DataInitializeShard, Identity: identity, Bootstrap: &bootstrap,
+		ReplicaIDs: append([]uint64(nil), bootstrap.ReplicaIDs...),
+	})
+	index := uint64(2)
+	for position, target := range targets {
+		starting := routeStarting(t, registryLayout, group, target.key, fmt.Sprintf("sandbox-%d", position), 1, true)
+		applyDiskData(t, machine, index, DataCommand{
+			Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{Absent: true}, Route: &starting,
+		})
+		index++
+		ready := readyRecord(starting, 1)
+		applyDiskData(t, machine, index, DataCommand{
+			Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{LogIndex: index - 1}, Route: &ready,
+		})
+		index++
+	}
+
+	// An unrelated corrupt primary row would make the old full-group scan fail.
+	// The bucket index must seek only listed rows after the supplied cursor.
+	corruptKey := stateRowKey(
+		stateSlotPrefix(shardID, 1, 1), stateRouteTable, routeMapKey(group, "unindexed-corrupt"),
+	)
+	batch := engine.db.NewBatch()
+	if err := batch.Set(corruptKey, []byte("not-json"), nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := engine.commitNoSync(batch); err != nil {
+		t.Fatal(err)
+	}
+	if err := batch.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	value, err := machine.Lookup(DataLookup{RouteBucket: &RouteBucketLookup{
+		Identity: identity, Group: group, Bucket: targets[0].bucket,
+		AfterRouteKey: targets[0].key, Limit: 1,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	page := value.(DataLookupResult).RouteBucket
+	if page == nil || len(page.Routes) != 1 || page.Routes[0].RouteKey != targets[1].key ||
+		page.NextRouteKey != targets[1].key {
+		t.Fatalf("indexed Route bucket page = %+v", page)
+	}
+}
+
 func TestPebbleStateMachinePersistsAndRestoresAcrossReplicaIDs(t *testing.T) {
 	root := t.TempDir()
 	engine, err := OpenPebbleStateEngine(root)

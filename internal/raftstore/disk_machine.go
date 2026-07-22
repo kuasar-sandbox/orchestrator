@@ -15,7 +15,7 @@ import (
 )
 
 var stateSnapshotMagic = [...]byte{
-	'K', 'U', 'A', 'S', 'A', 'R', '-', 'P', 'E', 'B', 'B', 'L', 'E', '-', 'S', 'N', 'A', 'P', 3,
+	'K', 'U', 'A', 'S', 'A', 'R', '-', 'P', 'E', 'B', 'B', 'L', 'E', '-', 'S', 'N', 'A', 'P', 4,
 }
 
 type diskStateMachine struct {
@@ -148,9 +148,10 @@ func (m *diskStateMachine) updateData(entries []sm.Entry) ([]sm.Entry, error) {
 	batch := m.engine.db.NewIndexedBatch()
 	defer batch.Close()
 	state := DataState{
-		Routes: make(map[string]clusterstate.RouteWorkflowRecord),
-		Builds: make(map[string]clusterstate.BuildRecord),
-		Fences: make(map[string]clusterstate.ExecutionFence),
+		Routes:         make(map[string]clusterstate.RouteWorkflowRecord),
+		Builds:         make(map[string]clusterstate.BuildRecord),
+		Fences:         make(map[string]clusterstate.ExecutionFence),
+		UsedSandboxIDs: make(map[string]struct{}),
 	}
 	if active == 0 {
 		if err := batch.DeleteRange(prefix, prefixUpperBound(prefix), nil); err != nil {
@@ -260,6 +261,12 @@ func loadDataCommandRows(reader pebble.Reader, prefix []byte, state *DataState, 
 				if err := loadFence(command.Route.Starting.SandboxID); err != nil {
 					return err
 				}
+				usedKey := fenceMapKey(current.Group, current.RouteKey, command.Route.Starting.SandboxID)
+				if _, found, err := getStateValue(reader, stateRowKey(prefix, stateSandboxIDTable, usedKey)); err != nil {
+					return err
+				} else if found {
+					state.UsedSandboxIDs[usedKey] = struct{}{}
+				}
 				if !current.Tombstone.FenceCompacted {
 					sandboxID := current.Tombstone.SandboxID
 					if current.Tombstone.PlacementFailure != nil {
@@ -328,10 +335,14 @@ func persistDataCommandRow(batch *pebble.Batch, prefix []byte, state DataState, 
 	switch command.Type {
 	case DataPutRoute:
 		key := routeMapKey(command.Route.Group, command.Route.RouteKey)
-		if err := setStateJSON(batch, stateRowKey(prefix, stateRouteTable, key), state.Routes[key]); err != nil {
+		record := state.Routes[key]
+		if err := setStateJSON(batch, stateRowKey(prefix, stateRouteTable, key), record); err != nil {
 			return err
 		}
-		return persistPendingIndex(batch, prefix, "r"+key, routeNeedsCoordinator(state.Routes[key]))
+		if err := persistRouteBucketIndex(batch, prefix, state, record); err != nil {
+			return err
+		}
+		return persistPendingIndex(batch, prefix, "r"+key, routeNeedsCoordinator(record))
 	case DataPutBuild:
 		key := buildMapKey(command.Build.Group, command.Build.BuildID)
 		if err := setStateJSON(batch, stateRowKey(prefix, stateBuildTable, key), state.Builds[key]); err != nil {
@@ -340,7 +351,10 @@ func persistDataCommandRow(batch *pebble.Batch, prefix []byte, state DataState, 
 		return persistPendingIndex(batch, prefix, "b"+key, buildNeedsCoordinator(state.Builds[key]))
 	case DataPutFence:
 		key := fenceMapKey(command.Fence.Group, command.Fence.RouteKey, command.Fence.SandboxID)
-		return setStateJSON(batch, stateRowKey(prefix, stateFenceTable, key), state.Fences[key])
+		if err := setStateJSON(batch, stateRowKey(prefix, stateFenceTable, key), state.Fences[key]); err != nil {
+			return err
+		}
+		return batch.Set(stateRowKey(prefix, stateSandboxIDTable, key), []byte{1}, nil)
 	case DataCompactFence:
 		key := fenceMapKey(command.Compaction.Group, command.Compaction.RouteKey, command.Compaction.SandboxID)
 		if err := batch.Delete(stateRowKey(prefix, stateFenceTable, key), nil); err != nil {
@@ -364,10 +378,41 @@ func persistPendingIndex(batch *pebble.Batch, prefix []byte, qualifiedKey string
 	return batch.Set(key, []byte{1}, nil)
 }
 
+func persistRouteBucketIndex(
+	batch *pebble.Batch,
+	prefix []byte,
+	state DataState,
+	record clusterstate.RouteWorkflowRecord,
+) error {
+	bucket, shardID, err := clusterstate.RouteShardFor(
+		record.Group, record.RouteKey, state.RouteBucketCount, state.VirtualShardCount,
+	)
+	if err != nil || shardID != state.ShardID {
+		return errors.New("raftstore: Route bucket index belongs to another shard")
+	}
+	key := routeBucketIndexRowKey(prefix, record.Group, bucket, record.RouteKey)
+	if _, listed := routeBucketEntry(record); !listed {
+		return batch.Delete(key, nil)
+	}
+	return batch.Set(key, []byte{1}, nil)
+}
+
+func routeBucketIndexPrefix(prefix []byte, group string, bucket uint32) []byte {
+	key := []byte(lengthKey(group))
+	key = binary.BigEndian.AppendUint32(key, bucket)
+	return stateRowKey(prefix, stateRouteBucketTable, string(key))
+}
+
+func routeBucketIndexRowKey(prefix []byte, group string, bucket uint32, routeKey string) []byte {
+	key := routeBucketIndexPrefix(prefix, group, bucket)
+	return append(key, routeKey...)
+}
+
 func clearDataRows(state *DataState) {
 	clear(state.Routes)
 	clear(state.Builds)
 	clear(state.Fences)
+	clear(state.UsedSandboxIDs)
 	state.RouteChanges = nil
 }
 
@@ -607,30 +652,42 @@ func lookupRouteBucketOnDisk(
 	result.Available = true
 	result.SnapshotRevision = state.LastApplied
 	result.Routes = make([]RouteBucketEntry, 0, int(query.Limit)+1)
-	groupPrefix := stateRowKey(prefix, stateRouteTable, lengthKey(query.Group))
+	indexPrefix := routeBucketIndexPrefix(prefix, query.Group, query.Bucket)
+	lowerBound := indexPrefix
+	if query.AfterRouteKey != "" {
+		lowerBound = append(append([]byte(nil), indexPrefix...), query.AfterRouteKey...)
+	}
 	iterator := reader.NewIter(&pebble.IterOptions{
-		LowerBound: groupPrefix, UpperBound: prefixUpperBound(groupPrefix),
+		LowerBound: lowerBound, UpperBound: prefixUpperBound(indexPrefix),
 	})
 	defer iterator.Close()
 	for valid := iterator.First(); valid; valid = iterator.Next() {
+		if len(iterator.Value()) != 1 || iterator.Value()[0] != 1 {
+			return RouteBucketResult{}, errors.New("raftstore: malformed Route bucket index row")
+		}
+		routeKey := string(iterator.Key()[len(indexPrefix):])
+		if routeKey <= query.AfterRouteKey {
+			continue
+		}
 		var record clusterstate.RouteWorkflowRecord
-		if err := decodeJSONValue(iterator.Value(), &record); err != nil {
+		mapKey := routeMapKey(query.Group, routeKey)
+		found, err := getStateJSON(reader, stateRowKey(prefix, stateRouteTable, mapKey), &record)
+		if err != nil {
 			return RouteBucketResult{}, err
 		}
-		mapKey := string(iterator.Key()[len(stateTablePrefix(prefix, stateRouteTable)):])
-		if err := validateStoredRoute(state, mapKey, record); err != nil {
-			return RouteBucketResult{}, err
+		if !found || validateStoredRoute(state, mapKey, record) != nil || record.RouteKey != routeKey {
+			return RouteBucketResult{}, errors.New("raftstore: Route bucket index differs from stored state")
 		}
 		bucket, _, err := clusterstate.RouteShardFor(
 			record.Group, record.RouteKey, state.RouteBucketCount, state.VirtualShardCount,
 		)
-		if err != nil {
-			return RouteBucketResult{}, err
+		entry, listed := routeBucketEntry(record)
+		if err != nil || bucket != query.Bucket || !listed {
+			return RouteBucketResult{}, errors.New("raftstore: Route bucket index differs from stored Route projection")
 		}
-		if bucket == query.Bucket && record.RouteKey > query.AfterRouteKey {
-			if entry, listed := routeBucketEntry(record); listed {
-				addBoundedRouteBucketEntry(&result.Routes, entry, int(query.Limit)+1)
-			}
+		result.Routes = append(result.Routes, entry)
+		if len(result.Routes) == int(query.Limit)+1 {
+			break
 		}
 	}
 	if err := iterator.Error(); err != nil {
@@ -1100,9 +1157,44 @@ func (m *diskStateMachine) validateSnapshotRecord(
 			return errors.New("raftstore: malformed pending-workflow snapshot row")
 		}
 		return nil
+	case stateRouteBucketTable:
+		group, bucket, routeKey, err := decodeRouteBucketIndexMapKey(mapKey)
+		if err != nil || len(value) != 1 || value[0] != 1 ||
+			!routeBucketTargetsShard(*dataState, group, bucket, logicalShardID) {
+			return errors.New("raftstore: malformed Route bucket index snapshot row")
+		}
+		expectedBucket, shardID, hashErr := clusterstate.RouteShardFor(
+			group, routeKey, dataState.RouteBucketCount, dataState.VirtualShardCount,
+		)
+		if hashErr != nil || expectedBucket != bucket || shardID != logicalShardID {
+			return errors.New("raftstore: Route bucket index snapshot row belongs to another shard")
+		}
+		return nil
+	case stateSandboxIDTable:
+		if len(value) != 1 || value[0] != 1 || validateUsedSandboxID(*dataState, mapKey) != nil {
+			return errors.New("raftstore: malformed used Sandbox ID snapshot row")
+		}
+		return nil
 	default:
 		return errors.New("raftstore: data snapshot contains an unknown table")
 	}
+}
+
+func decodeRouteBucketIndexMapKey(key string) (string, uint32, string, error) {
+	raw := []byte(key)
+	if len(raw) < 8 {
+		return "", 0, "", errors.New("raftstore: truncated Route bucket index key")
+	}
+	groupLength := binary.BigEndian.Uint32(raw[:4])
+	raw = raw[4:]
+	if groupLength == 0 || uint64(groupLength)+4 >= uint64(len(raw)) {
+		return "", 0, "", errors.New("raftstore: malformed Route bucket index key")
+	}
+	group := string(raw[:groupLength])
+	raw = raw[groupLength:]
+	bucket := binary.BigEndian.Uint32(raw[:4])
+	routeKey := string(raw[4:])
+	return group, bucket, routeKey, nil
 }
 
 func (m *diskStateMachine) clearSnapshotSlot(prefix []byte) error {

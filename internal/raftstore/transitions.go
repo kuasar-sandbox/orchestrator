@@ -12,6 +12,7 @@ func validateRouteTransition(
 	current clusterstate.RouteWorkflowRecord,
 	next clusterstate.RouteWorkflowRecord,
 	fences map[string]clusterstate.ExecutionFence,
+	usedSandboxIDs map[string]struct{},
 ) error {
 	if current.Group != next.Group || current.RouteKey != next.RouteKey {
 		return errors.New("raftstore: Route identity changed")
@@ -107,7 +108,7 @@ func validateRouteTransition(
 		}
 	case clusterstate.WorkflowRouteTombstone:
 		if next.State == clusterstate.WorkflowRouteStarting {
-			return validateRouteReplacement(current, next, fences)
+			return validateRouteReplacement(current, next, fences, usedSandboxIDs)
 		}
 	}
 	return errors.New("raftstore: illegal Route state transition")
@@ -208,9 +209,10 @@ func validateRouteReplacement(
 	current clusterstate.RouteWorkflowRecord,
 	next clusterstate.RouteWorkflowRecord,
 	fences map[string]clusterstate.ExecutionFence,
+	usedSandboxIDs map[string]struct{},
 ) error {
-	if _, reused := fences[fenceMapKey(current.Group, current.RouteKey, next.Starting.SandboxID)]; reused {
-		return errors.New("raftstore: replacement reused a SID with a retained execution fence")
+	if _, reused := usedSandboxIDs[fenceMapKey(current.Group, current.RouteKey, next.Starting.SandboxID)]; reused {
+		return errors.New("raftstore: replacement reused a historically fenced SID")
 	}
 	if current.Tombstone.PlacementFailure != nil {
 		failure := current.Tombstone.PlacementFailure

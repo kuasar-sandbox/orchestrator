@@ -18,7 +18,7 @@ import (
 )
 
 const (
-	stateEngineVersion    = uint32(3)
+	stateEngineVersion    = uint32(4)
 	stateControlTable     = byte(0)
 	stateSlotTable        = byte(1)
 	stateMetadataTable    = byte(0)
@@ -27,6 +27,8 @@ const (
 	stateFenceTable       = byte(3)
 	stateRouteChangeTable = byte(4)
 	statePendingTable     = byte(5)
+	stateRouteBucketTable = byte(6)
+	stateSandboxIDTable   = byte(7)
 	stateRecoveryBatch    = 16 << 20
 	stateMaximumKeySize   = MaxRaftCommandBytes
 )
@@ -254,7 +256,8 @@ func (m dataStateMetadata) dataState() DataState {
 		RouteChangefeedFloor: m.RouteChangefeedFloor,
 		Routes:               make(map[string]clusterstate.RouteWorkflowRecord),
 		Builds:               make(map[string]clusterstate.BuildRecord),
-		Fences:               make(map[string]clusterstate.ExecutionFence), LastApplied: m.LastApplied,
+		Fences:               make(map[string]clusterstate.ExecutionFence),
+		UsedSandboxIDs:       make(map[string]struct{}), LastApplied: m.LastApplied,
 	}
 }
 
