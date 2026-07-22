@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"reflect"
@@ -169,10 +170,16 @@ type NodeCatalogRecord struct {
 	LastRegistrationIndex uint64            `json:"last_registration_index"`
 }
 
+const MaxNodeCatalogRecordBytes = 512 << 10
+
 func (c NodeCatalogRecord) Validate(lastApplied uint64) error {
 	if c.LoadModelVersion == 0 || c.SandboxSlots == 0 || c.CatalogVersion == 0 ||
 		c.LastRegistrationIndex == 0 || c.LastRegistrationIndex > lastApplied {
 		return errors.New("raftstore: incomplete node catalog record")
+	}
+	raw, err := json.Marshal(c)
+	if err != nil || len(raw) > MaxNodeCatalogRecordBytes {
+		return fmt.Errorf("raftstore: node catalog record exceeds %d bytes", MaxNodeCatalogRecordBytes)
 	}
 	for key := range c.Labels {
 		if key == "" {
@@ -821,13 +828,21 @@ func ApplySystemCommand(state SystemState, index uint64, command SystemCommand) 
 			next.Recovery = &recovery
 		}
 	case SystemEnrollNode:
-		if !state.Initialized || state.Retired || state.Recovery != nil || command.Enrollment == nil ||
+		if !state.Initialized || command.Enrollment == nil ||
 			command.Enrollment.NodeID == "" || command.Enrollment.EnrollmentID == "" ||
 			command.Enrollment.NodeEpoch == 0 || command.Enrollment.DataEndpoint == "" {
 			return state, systemConflict("invalid explicit node enrollment")
 		}
-		if _, found := state.NodeEnrollments[command.Enrollment.NodeID]; found {
+		if current, found := state.NodeEnrollments[command.Enrollment.NodeID]; found {
+			if !current.Retired && current.EnrollmentID == command.Enrollment.EnrollmentID &&
+				current.MaxNodeEpoch == command.Enrollment.NodeEpoch &&
+				current.DataEndpoint == command.Enrollment.DataEndpoint {
+				break
+			}
 			return state, systemConflict("node identity is already enrolled or retired")
+		}
+		if state.Retired || state.Recovery != nil {
+			return state, systemConflict("invalid explicit node enrollment")
 		}
 		next.NodeEnrollments = cloneNodeEnrollments(state.NodeEnrollments)
 		next.NodeEnrollments[command.Enrollment.NodeID] = NodeEnrollmentRecord{

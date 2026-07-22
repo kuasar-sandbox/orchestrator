@@ -1361,17 +1361,17 @@ func (n *stubNode) HandleCommand(ctx context.Context, cmd *routesync.Command) *r
 		default:
 			return finalStubReject(cmd, routesync.DispatchConflict, errors.New("stub cannot resolve registry auth reference"))
 		}
+		ref, err := cmd.KeyLease.Ref()
+		if err != nil {
+			return finalStubReject(cmd, routesync.DispatchConflict, err)
+		}
 		if _, err := n.store.PutKeyLease(ctx, store.KeyLease{
 			Group: cmd.KeyLease.Group, AuthKey: cmd.KeyLease.AuthKey.Value,
-			ManifestKey: cmd.KeyLease.ManifestKey.Value, RegistryAuth: registryAuth,
+			ManifestKey: cmd.KeyLease.ManifestKey.Value, KeyRevision: cmd.KeyLease.KeyRevision,
+			RegistryAuth: registryAuth, RegistryAuthDigest: ref.RegistryAuthDigest,
 			Label: "cluster", ExpiresUnix: cmd.KeyLease.ExpiresUnix,
 		}); err != nil {
 			return finalStubReject(cmd, routesync.DispatchConflict, err)
-		}
-		ref := routesync.NodeKeyLeaseRefV1{
-			Version: routesync.NodeKeyLeaseVersionV1, Group: cmd.KeyLease.Group,
-			AuthKeyFingerprint:     cmd.KeyLease.AuthKey.Fingerprint,
-			ManifestKeyFingerprint: cmd.KeyLease.ManifestKey.Fingerprint,
 		}
 		return &routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted, KeyLeaseRef: &ref}
 	case routesync.CmdKeyDrop:
@@ -1383,7 +1383,10 @@ func (n *stubNode) HandleCommand(ctx context.Context, cmd *routesync.Command) *r
 			return finalStubReject(cmd, routesync.DispatchConflict, errors.New("invalid key lease reference"))
 		}
 		ref := *cmd.KeyLeaseRef
-		if _, err := n.store.DropKeyLeaseRef(ctx, ref.Group, ref.AuthKeyFingerprint, ref.ManifestKeyFingerprint); err != nil {
+		if _, err := n.store.DropKeyLeaseRef(
+			ctx, ref.Group, ref.AuthKeyFingerprint, ref.ManifestKeyFingerprint,
+			ref.KeyRevision, ref.RegistryAuthDigest,
+		); err != nil {
 			return finalStubReject(cmd, routesync.DispatchConflict, err)
 		}
 		return &routesync.CmdAck{CmdID: cmd.CmdID, Status: routesync.AckAccepted, KeyLeaseRef: &ref}

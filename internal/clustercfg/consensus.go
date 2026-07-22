@@ -292,6 +292,9 @@ func (c ConsensusRouterConfig) Validate() error {
 	if c.Domain == "" || c.Ingress.Listen == "" {
 		return errors.New("clustercfg: Router domain and ingress.listen are required")
 	}
+	if (c.Ingress.TLS.Cert != "" || c.Ingress.TLS.Key != "" || c.Ingress.TLS.CA != "") && !c.Ingress.TLS.Enabled() {
+		return errors.New("clustercfg: Router ingress TLS requires both cert and key when configured")
+	}
 	if err := c.RegistryLayout.Validate(); err != nil {
 		return err
 	}

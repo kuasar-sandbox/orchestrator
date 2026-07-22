@@ -21,7 +21,9 @@ func TestSandboxEventsConvergeWithoutProjectionRegression(t *testing.T) {
 		Group: fixture.group, RouteKey: fixture.routeKey, State: clusterstate.WorkflowRouteStarting,
 		Starting: &clusterstate.RouteStartingState{
 			SandboxID: fixture.objectID, PlacementRound: 1,
-			CandidatePool:     []clusterstate.PlacementCandidate{{NodeID: fixture.binding.NodeID}},
+			CandidatePool: []clusterstate.PlacementCandidate{{
+				NodeID: fixture.binding.NodeID, CatalogDigest: strings.Repeat("a", 64),
+			}},
 			SelectedCandidate: uint32Pointer(0), Intent: fixture.intent, Binding: &fixture.binding,
 		},
 	}
@@ -67,6 +69,33 @@ func TestSandboxEventsConvergeWithoutProjectionRegression(t *testing.T) {
 	}
 }
 
+func TestReadyEventPreservesPendingFinalizations(t *testing.T) {
+	_, _, fixture := newEventFixture(t, clusterstate.ExecutionKindSandbox, "sandbox-1", "route-1")
+	finalization, err := clusterstate.NewWorkflowFinalizationIntent(fixture.objectID, fixture.binding, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := clusterstate.RouteWorkflowRecord{
+		Group: fixture.group, RouteKey: fixture.routeKey, State: clusterstate.WorkflowRouteStarting,
+		Starting: &clusterstate.RouteStartingState{
+			SandboxID: fixture.objectID, PlacementRound: 1,
+			CandidatePool: []clusterstate.PlacementCandidate{{
+				NodeID: fixture.binding.NodeID, CatalogDigest: strings.Repeat("a", 64),
+			}},
+			SelectedCandidate: uint32Pointer(0), Intent: fixture.intent, Binding: &fixture.binding,
+		},
+		Finalizations: []clusterstate.WorkflowFinalizationIntent{finalization},
+	}
+	event := fixture.event(1, string(clusterstate.WorkflowRouteReady))
+	next, err := readyFromEvent(record, nil, event)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(next.Finalizations) != 1 || next.Finalizations[0].BindingDigest != finalization.BindingDigest {
+		t.Fatalf("READY finalizations = %+v", next.Finalizations)
+	}
+}
+
 func TestTerminalReplayRepairsFenceBeforeAcknowledgement(t *testing.T) {
 	store, converger, fixture := newEventFixture(t, clusterstate.ExecutionKindSandbox, "sandbox-1", "route-1")
 	ctx := context.Background()
@@ -74,7 +103,9 @@ func TestTerminalReplayRepairsFenceBeforeAcknowledgement(t *testing.T) {
 		Group: fixture.group, RouteKey: fixture.routeKey, State: clusterstate.WorkflowRouteStarting,
 		Starting: &clusterstate.RouteStartingState{
 			SandboxID: fixture.objectID, PlacementRound: 1,
-			CandidatePool:     []clusterstate.PlacementCandidate{{NodeID: fixture.binding.NodeID}},
+			CandidatePool: []clusterstate.PlacementCandidate{{
+				NodeID: fixture.binding.NodeID, CatalogDigest: strings.Repeat("a", 64),
+			}},
 			SelectedCandidate: uint32Pointer(0), Intent: fixture.intent, Binding: &fixture.binding,
 		},
 	}
@@ -113,7 +144,9 @@ func TestDelayedSandboxEventsAdvanceDeletingWatermarkWithoutStateRegression(t *t
 		Group: fixture.group, RouteKey: fixture.routeKey, State: clusterstate.WorkflowRouteStarting,
 		Starting: &clusterstate.RouteStartingState{
 			SandboxID: fixture.objectID, PlacementRound: 1,
-			CandidatePool:     []clusterstate.PlacementCandidate{{NodeID: fixture.binding.NodeID}},
+			CandidatePool: []clusterstate.PlacementCandidate{{
+				NodeID: fixture.binding.NodeID, CatalogDigest: strings.Repeat("a", 64),
+			}},
 			SelectedCandidate: uint32Pointer(0), Intent: fixture.intent, Binding: &fixture.binding,
 		},
 	}
@@ -160,8 +193,10 @@ func TestBuildLifecycleEventIsRejectedAfterRegistration(t *testing.T) {
 	starting := clusterstate.BuildRecord{
 		Group: fixture.group, BuildID: fixture.objectID, State: clusterstate.BuildStarting,
 		Starting: &clusterstate.BuildStartingState{
-			BuildID:           fixture.objectID,
-			CandidatePool:     []clusterstate.PlacementCandidate{{NodeID: fixture.binding.NodeID}},
+			BuildID: fixture.objectID,
+			CandidatePool: []clusterstate.PlacementCandidate{{
+				NodeID: fixture.binding.NodeID, CatalogDigest: strings.Repeat("a", 64),
+			}},
 			SelectedCandidate: uint32Pointer(0), Intent: fixture.intent, Binding: &fixture.binding,
 		},
 	}

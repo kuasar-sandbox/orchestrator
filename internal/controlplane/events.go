@@ -319,6 +319,7 @@ func readyFromEvent(
 	}
 	return clusterstate.RouteWorkflowRecord{
 		Group: record.Group, RouteKey: record.RouteKey, State: clusterstate.WorkflowRouteReady, Ready: &ready,
+		Finalizations: append([]clusterstate.WorkflowFinalizationIntent(nil), record.Finalizations...),
 	}, nil
 }
 
@@ -366,7 +367,7 @@ func tombstoneFromEvent(
 	proof := clusterstate.TerminalProof{
 		Kind: clusterstate.ProofNodeTerminal, FencedNodeID: event.NodeID, FencedNodeEpoch: event.NodeEpoch,
 	}
-	digest, err := terminalEventDigest(event)
+	digest, err := terminalEventDigest(record.Group, record.RouteKey, event)
 	if err != nil {
 		return clusterstate.RouteWorkflowRecord{}, clusterstate.ExecutionFence{}, err
 	}
@@ -405,8 +406,8 @@ func fenceFromTombstone(record clusterstate.RouteWorkflowRecord) clusterstate.Ex
 	}
 }
 
-func terminalEventDigest(event routesync.ExecutionEvent) (string, error) {
+func terminalEventDigest(group, routeKey string, event routesync.ExecutionEvent) (string, error) {
 	return clusterstate.NodeTerminalProofDigest(clusterstate.TerminalProof{
 		Kind: clusterstate.ProofNodeTerminal, FencedNodeID: event.NodeID, FencedNodeEpoch: event.NodeEpoch,
-	}, event.RegistryGeneration, event.ObjectID, event.BindingDigest, event.EventSeq)
+	}, group, routeKey, event.RegistryGeneration, event.ObjectID, event.BindingDigest, event.EventSeq)
 }

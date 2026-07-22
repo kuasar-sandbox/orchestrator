@@ -2,6 +2,7 @@ package raftstore
 
 import (
 	"errors"
+	"strings"
 	"testing"
 	"time"
 )
@@ -291,6 +292,40 @@ func TestNodeRegistrationRequiresExplicitEnrollmentAndFencesEpochRollback(t *tes
 		NodeID: registration.NodeID, EnrollmentID: "replacement", NodeEpoch: 1, DataEndpoint: "10.0.0.3:8443",
 	}}); !result.Conflict {
 		t.Fatal("retired node ID was re-enrolled")
+	}
+}
+
+func TestExactNodeEnrollmentRetryIsIdempotent(t *testing.T) {
+	registryLayout := testRegistryLayout(1, "generation-enrollment-retry")
+	digest, _ := registryLayout.Digest()
+	state, _ := applySystem(t, SystemState{}, 1, SystemCommand{
+		Type: SystemBootstrap, RegistryLayout: &registryLayout, Digest: digest,
+	})
+	enrollment := &NodeEnrollmentCommand{
+		NodeID: "node-1", EnrollmentID: "enrollment-1", NodeEpoch: 7, DataEndpoint: "10.0.0.1:8443",
+	}
+	state, _ = applySystem(t, state, 2, SystemCommand{Type: SystemEnrollNode, Enrollment: enrollment})
+	original := state.NodeEnrollments[enrollment.NodeID]
+	state, result := ApplySystemCommand(state, 3, SystemCommand{Type: SystemEnrollNode, Enrollment: enrollment})
+	if result.Conflict || !result.Applied || state.NodeEnrollments[enrollment.NodeID] != original {
+		t.Fatalf("exact enrollment retry = %+v, %+v", state.NodeEnrollments[enrollment.NodeID], result)
+	}
+	mismatch := *enrollment
+	mismatch.NodeEpoch++
+	if _, result := ApplySystemCommand(state, 4, SystemCommand{
+		Type: SystemEnrollNode, Enrollment: &mismatch,
+	}); !result.Conflict {
+		t.Fatal("mismatched enrollment retry was accepted")
+	}
+}
+
+func TestNodeCatalogRecordHasSyncableByteBound(t *testing.T) {
+	record := NodeCatalogRecord{
+		LoadModelVersion: 1, SandboxSlots: 1, CatalogVersion: 1, LastRegistrationIndex: 1,
+		Labels: map[string]string{"large": strings.Repeat("x", MaxNodeCatalogRecordBytes)},
+	}
+	if err := record.Validate(1); err == nil {
+		t.Fatal("unsyncable node catalog record was accepted")
 	}
 }
 

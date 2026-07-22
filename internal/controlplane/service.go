@@ -1175,18 +1175,33 @@ func (s *RegistryService) Run(ctx context.Context) error {
 	if _, err := s.store.RefreshPermitGrant(ctx); err != nil {
 		return err
 	}
-	permitTicker := time.NewTicker(s.config.PermitRefreshInterval)
+	permitDone := make(chan struct{})
+	go func() {
+		defer close(permitDone)
+		s.refreshPermitLoop(ctx)
+	}()
+	defer func() { <-permitDone }()
 	recoveryTicker := time.NewTicker(s.config.RecoveryScanInterval)
-	defer permitTicker.Stop()
 	defer recoveryTicker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
-		case <-permitTicker.C:
-			_, _ = s.store.RefreshPermitGrant(ctx)
 		case <-recoveryTicker.C:
 			s.scanRecoveryWindow(ctx)
+		}
+	}
+}
+
+func (s *RegistryService) refreshPermitLoop(ctx context.Context) {
+	ticker := time.NewTicker(s.config.PermitRefreshInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			_, _ = s.store.RefreshPermitGrant(ctx)
 		}
 	}
 }
@@ -1366,10 +1381,9 @@ func (s *RegistryService) renewKeyLease(
 	if lease.ExpiresUnix <= now+int64(placer.NodeKeyLeaseRenewBefore/time.Second) {
 		return errors.New("controlplane: Provider returned a key lease inside the renewal window")
 	}
-	want := routesync.NodeKeyLeaseRefV1{
-		Version: routesync.NodeKeyLeaseVersionV1, Group: binding.Group,
-		AuthKeyFingerprint:     binding.AuthKeyFingerprint,
-		ManifestKeyFingerprint: binding.ManifestKeyFingerprint,
+	want, err := lease.Ref()
+	if err != nil {
+		return err
 	}
 	ack, sent, err := s.commands.InstallKeyLease(
 		ctx, identity, binding.NodeID, binding.NodeEpoch, binding.DataEndpoint, lease,

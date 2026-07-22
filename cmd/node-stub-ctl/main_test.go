@@ -421,7 +421,7 @@ func stubTestKeyLease(group string) routesync.NodeKeyLeaseV1 {
 		}
 	}
 	return routesync.NodeKeyLeaseV1{
-		Version: routesync.NodeKeyLeaseVersionV1, Group: group,
+		Version: routesync.NodeKeyLeaseVersionV1, Group: group, KeyRevision: 1,
 		AuthKey: material(strings.Repeat("a", 64)), ManifestKey: material(strings.Repeat("b", 64)),
 		ExpiresUnix: time.Now().Add(time.Hour).Unix(),
 	}

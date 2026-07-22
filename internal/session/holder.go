@@ -438,6 +438,9 @@ func (h *Holder) SendNodeCommand(
 		return routesync.CmdAck{}, false, ErrSessionUnavailable
 	}
 	defer held.commandMu.Unlock()
+	if err := h.CheckServe(identity, PermitDispatch); err != nil {
+		return routesync.CmdAck{}, false, err
+	}
 	endpoint, ok := held.endpoint.(commandEndpoint)
 	command.NodeEpoch = nodeEpoch
 	command.SessionSeq = held.registration.SessionSeq
@@ -475,6 +478,9 @@ func (h *Holder) SendRecoveryCommand(
 		return routesync.CmdAck{}, false, ErrSessionUnavailable
 	}
 	defer held.commandMu.Unlock()
+	if err := h.CheckServe(identity, PermitRecovery); err != nil {
+		return routesync.CmdAck{}, false, err
+	}
 	endpoint, ok := held.endpoint.(commandEndpoint)
 	command.NodeEpoch = nodeEpoch
 	command.SessionSeq = held.registration.SessionSeq

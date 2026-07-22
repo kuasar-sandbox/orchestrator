@@ -847,6 +847,55 @@ func TestForwardNodeControlCanonicalizesBearerAndFencesSuccessfulPause(t *testin
 	}
 }
 
+func TestForwardNodeControlFencesTypedNotFound(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set(proxy.HeaderProxyError, proxy.ProxyErrorNotFound)
+		http.Error(w, "sandbox not found", http.StatusNotFound)
+	}))
+	defer backend.Close()
+	serveIdentity := routeapi.RegistryServeIdentity{
+		ClusterID: "cluster-1", RegistryGeneration: "generation-1", SystemEpoch: 1,
+		RegistryLayoutDigest: "registry-layout-1",
+	}
+	router, err := New(&revisionControl{serveIdentity: serveIdentity}, allowCaller{}, "example.test", time.Minute, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := &routeEntry{
+		Group: "/group", RouteKey: "route-1", Revision: 7, ServeIdentity: serveIdentity,
+		Route: clusterstate.ReadyRoute{
+			SandboxID: "node-local-sandbox", NodeID: "node-1", NodeEpoch: 1,
+			DataEndpoint: strings.TrimPrefix(backend.URL, "http://"), RegistryGeneration: "generation-1",
+			BindingDigest: "binding-1",
+		},
+	}
+	if !router.rememberRoute(entry) {
+		t.Fatal("remember Route")
+	}
+	request := httptest.NewRequest(http.MethodGet, "http://api.example.test/sandboxes/route-1", nil)
+	request.Header.Set("Authorization", "Bearer provider-secret")
+	response := httptest.NewRecorder()
+	router.forwardNodeControl(response, request, entry, nil)
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("forwarded status = %d, body=%s", response.Code, response.Body.String())
+	}
+	if cached := router.cachedRoute(entry.Group, entry.RouteKey); cached != nil {
+		t.Fatalf("typed NOT_FOUND retained READY cache: %+v", cached)
+	}
+	if minimum := router.minimumRouteRevision(entry.Group, entry.RouteKey); minimum != entry.Revision+1 {
+		t.Fatalf("NOT_FOUND revision floor = %d, want %d", minimum, entry.Revision+1)
+	}
+}
+
+func TestRouteKeyByteBound(t *testing.T) {
+	if !validRouteKey(strings.Repeat("r", maxRouteKeyBytes)) {
+		t.Fatal("Route key at the byte limit was rejected")
+	}
+	if validRouteKey(strings.Repeat("r", maxRouteKeyBytes+1)) {
+		t.Fatal("Route key above the byte limit was accepted")
+	}
+}
+
 func TestConcurrentReserveRejectsDifferentImmutableInput(t *testing.T) {
 	serveIdentity := routeapi.RegistryServeIdentity{
 		ClusterID: "cluster-1", RegistryGeneration: "generation-1", SystemEpoch: 1,

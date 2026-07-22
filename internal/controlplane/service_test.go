@@ -185,6 +185,97 @@ func (s *serviceConsensus) ReadSystemStrong(context.Context) (raftstore.SystemSt
 	return s.system, nil
 }
 
+type blockingRecoveryConsensus struct {
+	*serviceConsensus
+	refreshes   chan struct{}
+	scanStarted chan struct{}
+	scanOnce    sync.Once
+}
+
+func (s *blockingRecoveryConsensus) RefreshPermit(ctx context.Context) (raftstore.PermitGrant, error) {
+	select {
+	case s.refreshes <- struct{}{}:
+	default:
+	}
+	return s.memoryConsensus.RefreshPermit(ctx)
+}
+
+func (s *blockingRecoveryConsensus) ReadData(
+	ctx context.Context,
+	query raftstore.DataLookup,
+) (raftstore.DataLookupResult, error) {
+	if query.Pending != nil {
+		s.scanOnce.Do(func() { close(s.scanStarted) })
+		<-ctx.Done()
+		return raftstore.DataLookupResult{}, ctx.Err()
+	}
+	return s.memoryConsensus.ReadData(ctx, query)
+}
+
+func TestRegistryPermitRefreshIsIndependentOfRecoveryScan(t *testing.T) {
+	registryLayout := testControlRegistryLayout()
+	memory, err := newMemoryConsensus(registryLayout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest, err := registryLayout.Digest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	consensus := &blockingRecoveryConsensus{
+		serviceConsensus: &serviceConsensus{memoryConsensus: memory, system: raftstore.SystemState{
+			Initialized: true, ClusterID: registryLayout.ClusterID, RegistryGeneration: registryLayout.RegistryGeneration,
+			SystemEpoch: 1, ActiveRegistryLayoutDigest: digest, NodeEnrollments: map[string]raftstore.NodeEnrollmentRecord{},
+		}},
+		refreshes: make(chan struct{}, 16), scanStarted: make(chan struct{}),
+	}
+	store, err := NewRaftStore(consensus, registryLayout, digest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := DefaultRegistryServiceConfig()
+	config.PermitRefreshInterval = 10 * time.Millisecond
+	config.RecoveryScanInterval = time.Millisecond
+	config.RecoveryShardsPerScan = 1
+	service, err := NewRegistryService(
+		store, &servicePlanner{}, serviceProber{}, &serviceDispatcher{outcome: clusterstate.DispatchUnknown},
+		serviceCommandSender{}, config,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- service.Run(ctx) }()
+	defer cancel()
+	select {
+	case <-consensus.refreshes:
+	case <-time.After(time.Second):
+		t.Fatal("initial Permit refresh did not run")
+	}
+	select {
+	case <-consensus.scanStarted:
+	case <-time.After(time.Second):
+		t.Fatal("recovery scan did not block")
+	}
+	for refresh := 0; refresh < 2; refresh++ {
+		select {
+		case <-consensus.refreshes:
+		case <-time.After(time.Second):
+			t.Fatal("blocked recovery scan stopped Permit refresh")
+		}
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Registry service did not stop after cancellation")
+	}
+}
+
 type servicePlanner struct {
 	mu     sync.Mutex
 	calls  []placer.PlanRequest
@@ -203,6 +294,7 @@ func (p *servicePlanner) Plan(
 	for index := range candidates {
 		candidates[index] = clusterstate.PlacementCandidate{
 			NodeID: fmt.Sprintf("node-%d", index+1), RuntimeDigest: request.TargetRuntimeDigest,
+			CatalogDigest: strings.Repeat("a", 64),
 		}
 	}
 	switch request.Kind {
@@ -397,10 +489,8 @@ func (serviceCommandSender) InstallKeyLease(
 	_ string,
 	lease routesync.NodeKeyLeaseV1,
 ) (routesync.NodeKeyLeaseRefV1, bool, error) {
-	return routesync.NodeKeyLeaseRefV1{
-		Version: routesync.NodeKeyLeaseVersionV1, Group: lease.Group,
-		AuthKeyFingerprint: lease.AuthKey.Fingerprint, ManifestKeyFingerprint: lease.ManifestKey.Fingerprint,
-	}, true, nil
+	ref, err := lease.Ref()
+	return ref, err == nil, err
 }
 
 type recordingKeyLeaseSender struct {
@@ -425,10 +515,8 @@ func (s *recordingKeyLeaseSender) InstallKeyLease(
 	s.mu.Lock()
 	s.calls++
 	s.mu.Unlock()
-	return routesync.NodeKeyLeaseRefV1{
-		Version: routesync.NodeKeyLeaseVersionV1, Group: lease.Group,
-		AuthKeyFingerprint: lease.AuthKey.Fingerprint, ManifestKeyFingerprint: lease.ManifestKey.Fingerprint,
-	}, true, nil
+	ref, err := lease.Ref()
+	return ref, err == nil, err
 }
 
 func (s *recordingKeyLeaseSender) callCount() int {
@@ -574,7 +662,7 @@ func serviceKeyLease(group string) routesync.NodeKeyLeaseV1 {
 		}
 	}
 	return routesync.NodeKeyLeaseV1{
-		Version: routesync.NodeKeyLeaseVersionV1, Group: group,
+		Version: routesync.NodeKeyLeaseVersionV1, Group: group, KeyRevision: 1,
 		AuthKey: material(strings.Repeat("a", 64)), ManifestKey: material(strings.Repeat("b", 64)),
 		ExpiresUnix: time.Now().Add(placer.DefaultNodeKeyLeaseTTL).Unix(),
 	}

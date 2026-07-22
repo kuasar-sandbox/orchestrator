@@ -41,7 +41,7 @@ func (p plannerTestProvider) GetAuthKey(context.Context, string) (clusterstate.S
 func TestHTTPPlacementPlannerPagesAndRecoversCatalogCache(t *testing.T) {
 	templateRef := "e2b-img-" + strings.Repeat("c", 64)
 	provider := plannerTestProvider{record: clusterstate.SandboxGroupRecord{
-		Group: "/group", TemplateRef: templateRef,
+		Group: "/group", KeyRevision: 1, TemplateRef: templateRef,
 		AuthKey:     clusterstate.Secret{Type: clusterstate.SecretInline, Value: strings.Repeat("a", 64)},
 		ManifestKey: clusterstate.Secret{Type: clusterstate.SecretInline, Value: strings.Repeat("b", 64)},
 	}}

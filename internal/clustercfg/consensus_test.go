@@ -37,3 +37,43 @@ func TestEndpointSetRequiresCanonicalBaseURLs(t *testing.T) {
 		}
 	}
 }
+
+func TestConsensusRouterRejectsPartialIngressTLS(t *testing.T) {
+	valid := ConsensusRouterConfig{
+		Domain: "example.test",
+		RegistryLayout: RegistryLayoutArtifacts{
+			Chain: "/etc/kuasar/registry-layout.json", Keys: "/etc/kuasar/keys.json", Guard: "/var/lib/kuasar/layout.guard",
+		},
+		RegistryTLS: TLS{Cert: "registry.crt", Key: "registry.key", CA: "ca.crt"},
+		NodeTLS:     TLS{Cert: "node.crt", Key: "node.key", CA: "ca.crt"},
+		Providers: EndpointSet{
+			Endpoints: []NamedEndpoint{{Name: "provider-a", Endpoint: "https://provider-a:9443"}},
+			TLS:       TLS{Cert: "provider.crt", Key: "provider.key", CA: "ca.crt"},
+		},
+		Ingress:                 IngressConfig{Listen: ":443"},
+		Auth:                    RouterAuth{APIKey: "enforce", DataPlane: "enforce", CacheTTL: "60s"},
+		Cache:                   RouterCache{RouteTTL: "5m", IdleTimeout: "2m"},
+		RegistryResponseTimeout: "35s",
+	}
+	if err := valid.Validate(); err != nil {
+		t.Fatalf("plaintext test config = %v", err)
+	}
+	withTLS := valid
+	withTLS.Ingress.TLS = TLS{Cert: "ingress.crt", Key: "ingress.key"}
+	if err := withTLS.Validate(); err != nil {
+		t.Fatalf("complete ingress TLS = %v", err)
+	}
+	for name, material := range map[string]TLS{
+		"cert only": {Cert: "ingress.crt"},
+		"key only":  {Key: "ingress.key"},
+		"CA only":   {CA: "ca.crt"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			candidate := valid
+			candidate.Ingress.TLS = material
+			if err := candidate.Validate(); err == nil {
+				t.Fatal("partial ingress TLS was accepted")
+			}
+		})
+	}
+}

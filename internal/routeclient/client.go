@@ -144,11 +144,29 @@ func (c *Client) RefreshPermit(ctx context.Context) (routeapi.RegistryServeIdent
 		ClusterID: c.registryLayout.ClusterID, RegistryGeneration: c.registryLayout.RegistryGeneration,
 		RegistryLayoutDigest: c.digest,
 	}
+	endpoints := c.systemEndpoints()
+	budget := time.Duration(c.registryLayout.ServePermitMaxMillis) * time.Millisecond
+	if remaining := c.permitRemaining(); remaining > 0 && remaining < budget {
+		budget = remaining
+	}
+	refreshDeadline := time.Now().Add(budget)
 	var lastErr error
-	for _, endpoint := range c.systemEndpoints() {
+	for index, endpoint := range endpoints {
+		remaining := time.Until(refreshDeadline)
+		if remaining <= 0 {
+			lastErr = ErrPermitUnavailable
+			break
+		}
+		attemptTimeout := remaining / time.Duration(len(endpoints)-index)
+		if attemptTimeout > nonMutationAttemptTimeout {
+			attemptTimeout = nonMutationAttemptTimeout
+		}
+		attemptCtx, cancel := context.WithTimeout(ctx, attemptTimeout)
 		started := c.now()
 		var response routeapi.PermitResponse
-		if err := postJSONBounded(ctx, endpoint, routeapi.PermitPath, request, &response); err != nil {
+		err := postJSON(attemptCtx, endpoint, routeapi.PermitPath, request, &response)
+		cancel()
+		if err != nil {
 			lastErr = err
 			continue
 		}

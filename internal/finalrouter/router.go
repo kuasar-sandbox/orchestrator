@@ -43,6 +43,7 @@ const (
 
 	pendingBuildPollInterval = 50 * time.Millisecond
 	pendingBuildForwardWait  = 30 * time.Second
+	maxRouteKeyBytes         = 4 << 10
 )
 
 var errRouteNotFound = errors.New("finalrouter: Route does not exist")
@@ -822,12 +823,11 @@ func (r *Router) forwardNodeControl(w http.ResponseWriter, request *http.Request
 	}
 	proxy.ModifyResponse = func(response *http.Response) error {
 		proxyError := response.Header.Get(proxypkg.HeaderProxyError)
-		if proxyError == proxypkg.ProxyErrorWrongBinding || proxyError == proxypkg.ProxyErrorWrongNodeEpoch {
-			if route != nil {
-				r.rejectStaleRoute(route)
-			} else {
-				r.evictBuild(build.Group, build.Build.BuildID)
-			}
+		if route != nil && proxyErrorRequiresNewerRoute(proxyError) {
+			r.rejectStaleRoute(route)
+		} else if build != nil && (proxyError == proxypkg.ProxyErrorNotFound ||
+			proxyError == proxypkg.ProxyErrorWrongBinding || proxyError == proxypkg.ProxyErrorWrongNodeEpoch) {
+			r.evictBuild(build.Group, build.Build.BuildID)
 		}
 		if route != nil && request.Method == http.MethodPost && exactPause && pauseRouteKey == route.RouteKey &&
 			response.StatusCode == http.StatusNoContent {
@@ -1666,7 +1666,7 @@ func sandboxMigrationOperation(method, path string) bool {
 }
 
 func validRouteKey(routeKey string) bool {
-	if routeKey == "" || routeKey == "." || routeKey == ".." || !utf8.ValidString(routeKey) {
+	if routeKey == "" || len(routeKey) > maxRouteKeyBytes || routeKey == "." || routeKey == ".." || !utf8.ValidString(routeKey) {
 		return false
 	}
 	for _, value := range routeKey {

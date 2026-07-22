@@ -16,6 +16,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/envdsign"
 	"github.com/kuasar-sandbox/orchestrator/internal/proxy"
@@ -214,6 +215,41 @@ func TestSandboxConnectCarriesCompleteFence(t *testing.T) {
 				t.Fatal("unsafe CONNECT header value accepted")
 			}
 		})
+	}
+}
+
+func TestSandboxConnectHandshakeHonorsContextCancellation(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		conn, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			return
+		}
+		defer conn.Close()
+		_, _ = io.Copy(io.Discard, conn)
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	_, _, _, err = proxy.DialSandboxConnect(ctx, "tcp", listener.Addr().String(), proxy.SandboxConnectRequest{
+		RouteRequest: proxy.RouteRequest{SandboxID: "sandbox-1", Port: 3000},
+	})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("stalled CONNECT error = %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("stalled CONNECT ignored context for %s", elapsed)
+	}
+	select {
+	case <-serverDone:
+	case <-time.After(time.Second):
+		t.Fatal("canceled CONNECT did not close the backend socket")
 	}
 }
 

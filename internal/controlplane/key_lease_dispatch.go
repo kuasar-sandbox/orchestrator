@@ -8,7 +8,6 @@ import (
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/coordinator"
 	"github.com/kuasar-sandbox/orchestrator/internal/placer"
-	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/session"
 )
 
@@ -22,24 +21,25 @@ func (d keyLeaseDispatcher) AdmitAndDispatch(
 	ctx context.Context,
 	command session.DispatchCommand,
 ) (session.DispatchReply, error) {
-	ref, err := dispatchLeaseRef(command)
+	expected, err := dispatchLeaseRequest(command)
 	if err != nil {
 		return session.DispatchReply{}, err
 	}
-	lease, err := d.planner.ResolveKeyLease(ctx, placer.KeyLeaseRequest{
-		Group: command.Group, AuthKeyFingerprint: ref.AuthKeyFingerprint,
-		ManifestKeyFingerprint: ref.ManifestKeyFingerprint,
-	})
+	lease, err := d.planner.ResolveKeyLease(ctx, expected)
 	if err != nil {
 		return session.DispatchReply{}, err
 	}
-	if err := lease.Validate(); err != nil || lease.Group != ref.Group ||
-		lease.AuthKey.Fingerprint != ref.AuthKeyFingerprint ||
-		lease.ManifestKey.Fingerprint != ref.ManifestKeyFingerprint {
+	if err := lease.Validate(); err != nil || lease.Group != expected.Group ||
+		lease.AuthKey.Fingerprint != expected.AuthKeyFingerprint ||
+		lease.ManifestKey.Fingerprint != expected.ManifestKeyFingerprint {
 		return session.DispatchReply{}, errors.New("controlplane: Provider returned a mismatched key lease")
 	}
 	if lease.ExpiresUnix <= time.Now().Unix() {
 		return session.DispatchReply{}, errors.New("controlplane: Provider returned an expired key lease")
+	}
+	want, err := lease.Ref()
+	if err != nil {
+		return session.DispatchReply{}, err
 	}
 	ack, sent, err := d.installer.InstallKeyLease(
 		ctx, command.ServeIdentity, command.NodeID, command.NodeEpoch, command.DataEndpoint, lease,
@@ -47,31 +47,31 @@ func (d keyLeaseDispatcher) AdmitAndDispatch(
 	if err != nil {
 		return session.DispatchReply{}, err
 	}
-	if !sent || ack != ref {
+	if !sent || ack != want {
 		return session.DispatchReply{}, errors.New("controlplane: selected node did not durably acknowledge the exact key lease")
 	}
 	return d.next.AdmitAndDispatch(ctx, command)
 }
 
-func dispatchLeaseRef(command session.DispatchCommand) (routesync.NodeKeyLeaseRefV1, error) {
-	ref := routesync.NodeKeyLeaseRefV1{Version: routesync.NodeKeyLeaseVersionV1, Group: command.Group}
+func dispatchLeaseRequest(command session.DispatchCommand) (placer.KeyLeaseRequest, error) {
+	request := placer.KeyLeaseRequest{Group: command.Group}
 	switch command.Kind {
 	case clusterstate.ExecutionKindSandbox:
 		spec, err := clusterstate.ParseSandboxDispatchSpec(command.Intent.DispatchSpec)
 		if err != nil {
-			return ref, err
+			return request, err
 		}
-		ref.AuthKeyFingerprint = spec.AuthKeyFingerprint
-		ref.ManifestKeyFingerprint = spec.ManifestKeyFingerprint
+		request.AuthKeyFingerprint = spec.AuthKeyFingerprint
+		request.ManifestKeyFingerprint = spec.ManifestKeyFingerprint
 	case clusterstate.ExecutionKindBuild:
 		spec, err := clusterstate.ParseBuildDispatchSpec(command.Intent.DispatchSpec)
 		if err != nil {
-			return ref, err
+			return request, err
 		}
-		ref.AuthKeyFingerprint = spec.AuthKeyFingerprint
-		ref.ManifestKeyFingerprint = spec.ManifestKeyFingerprint
+		request.AuthKeyFingerprint = spec.AuthKeyFingerprint
+		request.ManifestKeyFingerprint = spec.ManifestKeyFingerprint
 	default:
-		return ref, errors.New("controlplane: unsupported dispatch execution kind")
+		return request, errors.New("controlplane: unsupported dispatch execution kind")
 	}
-	return ref, ref.Validate()
+	return request, nil
 }

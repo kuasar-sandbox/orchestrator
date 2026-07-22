@@ -77,10 +77,8 @@ func (s *acceptingCommandSender) InstallKeyLease(
 	_ string,
 	lease routesync.NodeKeyLeaseV1,
 ) (routesync.NodeKeyLeaseRefV1, bool, error) {
-	return routesync.NodeKeyLeaseRefV1{
-		Version: routesync.NodeKeyLeaseVersionV1, Group: lease.Group,
-		AuthKeyFingerprint: lease.AuthKey.Fingerprint, ManifestKeyFingerprint: lease.ManifestKey.Fingerprint,
-	}, true, nil
+	ref, err := lease.Ref()
+	return ref, err == nil, err
 }
 
 func (s *acceptingCommandSender) snapshot() []routesync.Command {

@@ -1314,6 +1314,71 @@ func TestHolderRechecksPermitAfterWaitingForCommandFence(t *testing.T) {
 	}
 }
 
+func TestLifecycleAndRecoveryCommandsRecheckPermitAfterCommandFence(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		send func(*Holder, Registration) (bool, error)
+	}{
+		{name: "lifecycle", send: func(holder *Holder, registration Registration) (bool, error) {
+			_, sent, err := holder.SendNodeCommand(
+				context.Background(), testServeIdentity(), registration.NodeID, registration.NodeEpoch,
+				registration.DataEndpoint, &routesync.Command{CmdID: "lifecycle-1", Kind: routesync.CmdSandboxDelete},
+			)
+			return sent, err
+		}},
+		{name: "recovery", send: func(holder *Holder, registration Registration) (bool, error) {
+			_, sent, err := holder.SendRecoveryCommand(
+				context.Background(), testServeIdentity(), registration.NodeID, registration.NodeEpoch,
+				registration.DataEndpoint, &routesync.Command{CmdID: "recovery-1", Kind: routesync.CmdCollectRecovery},
+			)
+			return sent, err
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			registration := testRegistration("node-1", 7, 10, "10.0.0.1:8443")
+			gate := &switchGate{allowed: true, checks: make(chan struct{}, 8)}
+			holder, err := NewHolder("registry-a", 1, nil, gate, nil, newTestEnrollmentAuthority(registration))
+			if err != nil {
+				t.Fatal(err)
+			}
+			endpoint := &testEndpoint{}
+			if _, err := holder.Register(context.Background(), registration, endpoint); err != nil {
+				t.Fatal(err)
+			}
+			holder.mu.RLock()
+			held := holder.active[registration.NodeID]
+			holder.mu.RUnlock()
+			held.commandMu.Lock()
+			done := make(chan struct {
+				sent bool
+				err  error
+			}, 1)
+			go func() {
+				sent, err := test.send(holder, registration)
+				done <- struct {
+					sent bool
+					err  error
+				}{sent: sent, err: err}
+			}()
+			select {
+			case <-gate.checks:
+			case <-time.After(time.Second):
+				held.commandMu.Unlock()
+				t.Fatal("command did not perform its initial Permit check")
+			}
+			gate.set(false)
+			held.commandMu.Unlock()
+			result := <-done
+			if result.sent || !errors.Is(result.err, ErrPermitUnavailable) {
+				t.Fatalf("expired Permit command sent=%v err=%v", result.sent, result.err)
+			}
+			if len(endpoint.wire) != 0 {
+				t.Fatal("command reached endpoint after Permit expired while waiting")
+			}
+		})
+	}
+}
+
 func TestKeyPutRechecksPermitAfterWaitingForCommandFence(t *testing.T) {
 	registration := testRegistration("node-1", 7, 10, "10.0.0.1:8443")
 	gate := &switchGate{allowed: true, checks: make(chan struct{}, 8)}

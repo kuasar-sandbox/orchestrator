@@ -43,7 +43,7 @@ func (s *RaftStore) CommitNodeTerminalRoute(
 	if err != nil {
 		return clusterstate.RouteWorkflowRecord{}, err
 	}
-	proofDigest, err := terminalEventDigest(event)
+	proofDigest, err := terminalEventDigest(next.Group, next.RouteKey, event)
 	if err != nil {
 		return clusterstate.RouteWorkflowRecord{}, err
 	}

@@ -151,7 +151,8 @@ func newerNodeEpochRouteProof(
 		EnrollmentID: enrollment.EnrollmentID, EnrollmentCommitIndex: enrollment.LastAppliedIndex,
 	}
 	digest, err := clusterstate.NewerNodeEpochProofDigest(
-		proof, execution.RegistryGeneration, execution.SandboxID, execution.BindingDigest, execution.LastEventSeq,
+		proof, record.Group, record.RouteKey, execution.RegistryGeneration,
+		execution.SandboxID, execution.BindingDigest, execution.LastEventSeq,
 	)
 	if err != nil {
 		return clusterstate.TerminalProof{}, false, err

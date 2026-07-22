@@ -12,9 +12,12 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	"golang.org/x/net/http/httpguts"
 )
+
+const sandboxConnectHandshakeTimeout = 10 * time.Second
 
 // This file adds CONNECT tunneling to the data plane: a client opens a raw TCP
 // stream to a sandbox port. Per the data-plane model the CONNECT target HOST is
@@ -190,7 +193,7 @@ func DialSandboxConnect(ctx context.Context, network, addr string, request Sandb
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	return sandboxConnect(conn, request)
+	return sandboxConnect(ctx, conn, request)
 }
 
 func DialSandboxConnectTLS(
@@ -221,19 +224,43 @@ func DialSandboxConnectTLS(
 		conn.Close()
 		return nil, nil, nil, err
 	}
-	return sandboxConnect(conn, request)
+	return sandboxConnect(ctx, conn, request)
 }
 
-func sandboxConnect(conn net.Conn, request SandboxConnectRequest) (net.Conn, *bufio.Reader, *http.Response, error) {
-	if err := WriteSandboxConnect(conn, request); err != nil {
+func sandboxConnect(ctx context.Context, conn net.Conn, request SandboxConnectRequest) (net.Conn, *bufio.Reader, *http.Response, error) {
+	deadline := time.Now().Add(sandboxConnectHandshakeTimeout)
+	if err := conn.SetDeadline(deadline); err != nil {
 		conn.Close()
 		return nil, nil, nil, err
+	}
+	stopCancellation := context.AfterFunc(ctx, func() {
+		_ = conn.SetDeadline(time.Now())
+	})
+	fail := func(err error) (net.Conn, *bufio.Reader, *http.Response, error) {
+		stopCancellation()
+		conn.Close()
+		if contextErr := ctx.Err(); contextErr != nil {
+			err = contextErr
+		}
+		return nil, nil, nil, err
+	}
+	if err := WriteSandboxConnect(conn, request); err != nil {
+		return fail(err)
 	}
 	br := bufio.NewReader(conn)
 	resp, err := http.ReadResponse(br, &http.Request{Method: http.MethodConnect})
 	if err != nil {
-		conn.Close()
-		return nil, nil, nil, err
+		return fail(err)
+	}
+	if !stopCancellation() || ctx.Err() != nil {
+		resp.Body.Close()
+		return fail(ctx.Err())
+	}
+	if resp.StatusCode == http.StatusOK {
+		if err := conn.SetDeadline(time.Time{}); err != nil {
+			resp.Body.Close()
+			return fail(err)
+		}
 	}
 	return conn, br, resp, nil
 }

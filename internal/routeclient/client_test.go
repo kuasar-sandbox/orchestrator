@@ -125,6 +125,43 @@ func TestRefreshPermitRejectsLifetimeOutsideSignedLayout(t *testing.T) {
 	}
 }
 
+func TestRefreshPermitSharesRemainingLifetimeAcrossReplicas(t *testing.T) {
+	client := testClient(t)
+	client.registryLayout.ServePermitMaxMillis = 300
+	var calls []string
+	transport := roundTripperFunc(func(request *http.Request) (*http.Response, error) {
+		calls = append(calls, request.URL.Hostname())
+		if request.URL.Hostname() == "registry-a.test" {
+			<-request.Context().Done()
+			return nil, request.Context().Err()
+		}
+		response := routeapi.PermitResponse{
+			ClusterID: client.registryLayout.ClusterID, RegistryGeneration: client.registryLayout.RegistryGeneration,
+			SystemEpoch: 1, RegistryLayoutDigest: client.digest, CommitIndex: 7, MaxLifetimeMillis: 300,
+			ServeGate: true, WriteGate: true, CutoverGate: true, RecoveryClosed: true,
+		}
+		body, _ := json.Marshal(response)
+		return &http.Response{
+			StatusCode: http.StatusOK, Status: "200 OK", Header: make(http.Header),
+			Body: io.NopCloser(strings.NewReader(string(body))), Request: request,
+		}, nil
+	})
+	for memberID, endpoint := range client.endpoints {
+		endpoint.Client = &http.Client{Transport: transport}
+		client.endpoints[memberID] = endpoint
+	}
+	started := time.Now()
+	if _, err := client.RefreshPermit(context.Background()); err != nil {
+		t.Fatalf("RefreshPermit after stalled replica = %v", err)
+	}
+	if len(calls) != 2 || calls[0] != "registry-a.test" || calls[1] != "registry-b.test" {
+		t.Fatalf("Permit attempts = %v", calls)
+	}
+	if elapsed := time.Since(started); elapsed >= 300*time.Millisecond {
+		t.Fatalf("healthy replica was not attempted within Permit lifetime: %s", elapsed)
+	}
+}
+
 func TestRunReusesUnexpiredStartupPermit(t *testing.T) {
 	client := testClient(t)
 	now := time.Unix(1_700_000_000, 0)
