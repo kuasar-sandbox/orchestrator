@@ -483,9 +483,10 @@ func TestStaleProxyFailureRequiresNewerRouteRevision(t *testing.T) {
 	}
 	releaseRevision()
 	router.evictRoute(old.Group, old.RouteKey)
-	if minimum := router.minimumRouteRevision(old.Group, old.RouteKey); minimum != 0 {
-		t.Fatalf("inactive Route revision floor = %d, want released", minimum)
+	if minimum := router.minimumRouteRevision(old.Group, old.RouteKey); minimum != 8 {
+		t.Fatalf("inactive Route revision floor = %d, want retained during grace period", minimum)
 	}
+	router.cleanupCaches(time.Now().Add(router.routeTTL + time.Second))
 	if _, err := router.resolveRoute(context.Background(), old.Group, old.RouteKey); err != nil {
 		t.Fatalf("resolve Route after cache eviction: %v", err)
 	}
@@ -514,6 +515,10 @@ func TestInactiveRouteRevisionFencesAreBoundedByCache(t *testing.T) {
 		}
 		router.evictRoute(entry.Group, entry.RouteKey)
 	}
+	if len(router.minimumRevisions) != 1000 {
+		t.Fatalf("inactive revision floors were not retained during grace period: %d", len(router.minimumRevisions))
+	}
+	router.cleanupCaches(time.Now().Add(router.routeTTL + time.Second))
 	if len(router.minimumRevisions) != 0 || len(router.routeRevisionRefs) != 0 {
 		t.Fatalf("inactive revision state leaked: minimums=%d refs=%d", len(router.minimumRevisions), len(router.routeRevisionRefs))
 	}

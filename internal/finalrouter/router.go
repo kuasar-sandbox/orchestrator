@@ -75,6 +75,11 @@ type routeEntry struct {
 	LastUsed      time.Time
 }
 
+type routeRevisionFloor struct {
+	Revision      uint64
+	InactiveUntil time.Time
+}
+
 type buildEntry struct {
 	Build         clusterstate.BuildProjection
 	Group         string
@@ -113,7 +118,7 @@ type Router struct {
 	routeIdleTimeout  time.Duration
 	cacheMu           sync.Mutex
 	routes            map[string]*routeEntry
-	minimumRevisions  map[string]uint64
+	minimumRevisions  map[string]routeRevisionFloor
 	routeRevisionRefs map[string]uint32
 	builds            map[string]*buildEntry
 
@@ -139,7 +144,7 @@ func New(control ControlPlane, authorizer CallerAuthorizer, domain string, authT
 		authMode: "enforce", dataPlaneAuth: "enforce", authTTL: authTTL,
 		authOK: make(map[string]time.Time), routeTTL: 5 * time.Minute, routeIdleTimeout: 2 * time.Minute,
 		routes:            make(map[string]*routeEntry),
-		minimumRevisions:  make(map[string]uint64),
+		minimumRevisions:  make(map[string]routeRevisionFloor),
 		routeRevisionRefs: make(map[string]uint32), builds: make(map[string]*buildEntry),
 		flights: make(map[string]*reserveFlight),
 		forward: &http.Transport{
@@ -1233,14 +1238,17 @@ func (r *Router) rememberRoute(entry *routeEntry) bool {
 	copy.CachedAt, copy.LastUsed = time.Now(), time.Now()
 	key := routeKeyID(copy.Group, copy.RouteKey)
 	r.cacheMu.Lock()
-	if copy.Revision < r.minimumRevisions[key] {
+	floor := r.routeRevisionFloorLocked(key, copy.CachedAt)
+	if copy.Revision < floor.Revision {
 		r.cacheMu.Unlock()
 		return false
 	}
 	r.routes[key] = &copy
-	if copy.Revision > r.minimumRevisions[key] {
-		r.minimumRevisions[key] = copy.Revision
+	if copy.Revision > floor.Revision {
+		floor.Revision = copy.Revision
 	}
+	floor.InactiveUntil = time.Time{}
+	r.minimumRevisions[key] = floor
 	r.cacheMu.Unlock()
 	return true
 }
@@ -1251,20 +1259,27 @@ func (r *Router) routeRevisionCurrent(entry *routeEntry) bool {
 	}
 	r.cacheMu.Lock()
 	defer r.cacheMu.Unlock()
-	return entry.Revision >= r.minimumRevisions[routeKeyID(entry.Group, entry.RouteKey)]
+	return entry.Revision >= r.routeRevisionFloorLocked(
+		routeKeyID(entry.Group, entry.RouteKey), time.Now(),
+	).Revision
 }
 
 func (r *Router) minimumRouteRevision(group, routeKey string) uint64 {
 	r.cacheMu.Lock()
 	defer r.cacheMu.Unlock()
-	return r.minimumRevisions[routeKeyID(group, routeKey)]
+	return r.routeRevisionFloorLocked(routeKeyID(group, routeKey), time.Now()).Revision
 }
 
 func (r *Router) beginRouteRevision(group, routeKey string) (uint64, func()) {
 	key := routeKeyID(group, routeKey)
 	r.cacheMu.Lock()
+	floor := r.routeRevisionFloorLocked(key, time.Now())
 	r.routeRevisionRefs[key]++
-	minimum := r.minimumRevisions[key]
+	minimum := floor.Revision
+	if floor.Revision != 0 {
+		floor.InactiveUntil = time.Time{}
+		r.minimumRevisions[key] = floor
+	}
 	r.cacheMu.Unlock()
 
 	var once sync.Once
@@ -1273,7 +1288,7 @@ func (r *Router) beginRouteRevision(group, routeKey string) (uint64, func()) {
 			r.cacheMu.Lock()
 			if r.routeRevisionRefs[key] <= 1 {
 				delete(r.routeRevisionRefs, key)
-				r.releaseInactiveRouteRevisionLocked(key)
+				r.releaseInactiveRouteRevisionLocked(key, time.Now())
 			} else {
 				r.routeRevisionRefs[key]--
 			}
@@ -1282,10 +1297,26 @@ func (r *Router) beginRouteRevision(group, routeKey string) (uint64, func()) {
 	}
 }
 
-func (r *Router) releaseInactiveRouteRevisionLocked(key string) {
-	if r.routes[key] == nil && r.routeRevisionRefs[key] == 0 {
-		delete(r.minimumRevisions, key)
+func (r *Router) releaseInactiveRouteRevisionLocked(key string, now time.Time) {
+	if r.routes[key] != nil || r.routeRevisionRefs[key] != 0 {
+		return
 	}
+	floor, found := r.minimumRevisions[key]
+	if !found {
+		return
+	}
+	floor.InactiveUntil = now.Add(r.routeTTL)
+	r.minimumRevisions[key] = floor
+}
+
+func (r *Router) routeRevisionFloorLocked(key string, now time.Time) routeRevisionFloor {
+	floor, found := r.minimumRevisions[key]
+	if found && r.routes[key] == nil && r.routeRevisionRefs[key] == 0 &&
+		!floor.InactiveUntil.IsZero() && !now.Before(floor.InactiveUntil) {
+		delete(r.minimumRevisions, key)
+		return routeRevisionFloor{}
+	}
+	return floor
 }
 
 func (r *Router) rejectStaleRoute(entry *routeEntry) {
@@ -1298,11 +1329,14 @@ func (r *Router) rejectStaleRoute(entry *routeEntry) {
 	}
 	keyID := routeKeyID(entry.Group, entry.RouteKey)
 	r.cacheMu.Lock()
+	floor := r.routeRevisionFloorLocked(keyID, time.Now())
 	delete(r.routes, keyID)
-	if minimum > r.minimumRevisions[keyID] {
-		r.minimumRevisions[keyID] = minimum
+	if minimum > floor.Revision {
+		floor.Revision = minimum
 	}
-	r.releaseInactiveRouteRevisionLocked(keyID)
+	floor.InactiveUntil = time.Time{}
+	r.minimumRevisions[keyID] = floor
+	r.releaseInactiveRouteRevisionLocked(keyID, time.Now())
 	r.cacheMu.Unlock()
 }
 
@@ -1320,7 +1354,7 @@ func (r *Router) cachedRouteLocked(key string, now time.Time) *routeEntry {
 	if !r.control.CacheAuthorized(entry.ServeIdentity) || now.Sub(entry.CachedAt) > r.routeTTL ||
 		now.Sub(entry.LastUsed) > r.routeIdleTimeout {
 		delete(r.routes, key)
-		r.releaseInactiveRouteRevisionLocked(key)
+		r.releaseInactiveRouteRevisionLocked(key, now)
 		return nil
 	}
 	entry.LastUsed = now
@@ -1332,7 +1366,7 @@ func (r *Router) evictRoute(group, routeKey string) {
 	key := routeKeyID(group, routeKey)
 	r.cacheMu.Lock()
 	delete(r.routes, key)
-	r.releaseInactiveRouteRevisionLocked(key)
+	r.releaseInactiveRouteRevisionLocked(key, time.Now())
 	r.cacheMu.Unlock()
 }
 
@@ -1424,29 +1458,39 @@ func (r *Router) RunCleanup(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case now := <-ticker.C:
-			r.authMu.Lock()
-			for key, deadline := range r.authOK {
-				if !now.Before(deadline) {
-					delete(r.authOK, key)
-				}
-			}
-			r.authMu.Unlock()
-			r.cacheMu.Lock()
-			for key, entry := range r.routes {
-				if !r.control.CacheAuthorized(entry.ServeIdentity) || now.Sub(entry.CachedAt) > r.routeTTL ||
-					now.Sub(entry.LastUsed) > r.routeIdleTimeout {
-					delete(r.routes, key)
-					r.releaseInactiveRouteRevisionLocked(key)
-				}
-			}
-			for key, entry := range r.builds {
-				if !r.control.CacheAuthorized(entry.ServeIdentity) || now.Sub(entry.CachedAt) > time.Hour {
-					delete(r.builds, key)
-				}
-			}
-			r.cacheMu.Unlock()
+			r.cleanupCaches(now)
 		}
 	}
+}
+
+func (r *Router) cleanupCaches(now time.Time) {
+	r.authMu.Lock()
+	for key, deadline := range r.authOK {
+		if !now.Before(deadline) {
+			delete(r.authOK, key)
+		}
+	}
+	r.authMu.Unlock()
+	r.cacheMu.Lock()
+	for key, entry := range r.routes {
+		if !r.control.CacheAuthorized(entry.ServeIdentity) || now.Sub(entry.CachedAt) > r.routeTTL ||
+			now.Sub(entry.LastUsed) > r.routeIdleTimeout {
+			delete(r.routes, key)
+			r.releaseInactiveRouteRevisionLocked(key, now)
+		}
+	}
+	for key, floor := range r.minimumRevisions {
+		if r.routes[key] == nil && r.routeRevisionRefs[key] == 0 &&
+			!floor.InactiveUntil.IsZero() && !now.Before(floor.InactiveUntil) {
+			delete(r.minimumRevisions, key)
+		}
+	}
+	for key, entry := range r.builds {
+		if !r.control.CacheAuthorized(entry.ServeIdentity) || now.Sub(entry.CachedAt) > time.Hour {
+			delete(r.builds, key)
+		}
+	}
+	r.cacheMu.Unlock()
 }
 
 func apiKey(request *http.Request) string {
