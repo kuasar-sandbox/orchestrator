@@ -232,8 +232,7 @@ func validateClusterIdentityInput(nodeID, bootID, dataEndpoint string) error {
 	if err := clusterstate.ValidateExecutionBindingNodeID(nodeID); err != nil {
 		return fmt.Errorf("store: invalid node ID: %w", err)
 	}
-	switch {
-	case bootID == "":
+	if bootID == "" {
 		return errors.New("store: boot ID is required")
 	}
 	return validateClusterDataEndpoint(dataEndpoint)
