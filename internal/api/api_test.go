@@ -1,7 +1,10 @@
 package api
 
 import (
+	"context"
 	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/buildcfg"
@@ -9,6 +12,16 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
+
+type registerCaptureCore struct {
+	Core
+	spec RegisterSpec
+}
+
+func (c *registerCaptureCore) RegisterBuild(_ context.Context, _ string, spec RegisterSpec) (*types.Build, error) {
+	c.spec = spec
+	return &types.Build{TemplateID: "template-1", BuildID: "build-1"}, nil
+}
 
 func TestRequestedBuildProfile(t *testing.T) {
 	tests := []struct {
@@ -70,6 +83,23 @@ func TestMergeBuildConfigHeaders(t *testing.T) {
 	}
 	if got[sandboxcfg.NsNetwork] != `{"hostname":"build"}` {
 		t.Fatalf("sandbox build header not normalized: %+v", got)
+	}
+}
+
+func TestRegisterTemplatePreservesBodyMetadata(t *testing.T) {
+	core := &registerCaptureCore{}
+	a := &API{core: core}
+	request := httptest.NewRequest(http.MethodPost, "/v3/templates", strings.NewReader(
+		`{"name":"template","metadata":{"tenant":"value","kuasar-sandbox.network":"from-body"}}`,
+	))
+	request.Header.Set("X-Kuasar-Sandbox-Network", "from-header")
+	response := httptest.NewRecorder()
+	a.registerTemplate(response, request)
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("register status = %d: %s", response.Code, response.Body.String())
+	}
+	if core.spec.Metadata["tenant"] != "value" || core.spec.Metadata[sandboxcfg.NsNetwork] != "from-header" {
+		t.Fatalf("registered metadata = %#v", core.spec.Metadata)
 	}
 }
 
