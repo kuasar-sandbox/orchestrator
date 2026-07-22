@@ -926,6 +926,43 @@ func TestKeyLeaseRevisionFencesWholeGroup(t *testing.T) {
 	}
 }
 
+func TestRejectedKeyDropDoesNotAdvanceGroupRevision(t *testing.T) {
+	registration := testRegistration("node-1", 7, 10, "10.0.0.1:8443")
+	holder, err := NewHolder("registry-a", 1, nil, testGate(true), nil, newTestEnrollmentAuthority(registration))
+	if err != nil {
+		t.Fatal(err)
+	}
+	endpoint := &testEndpoint{}
+	if _, err := holder.Register(context.Background(), registration, endpoint); err != nil {
+		t.Fatal(err)
+	}
+	first := testKeyLease()
+	firstRef, sent, err := holder.InstallKeyLease(
+		context.Background(), testServeIdentity(), registration.NodeID, registration.NodeEpoch, registration.DataEndpoint, first,
+	)
+	if err != nil || !sent {
+		t.Fatalf("first group lease sent=%v err=%v", sent, err)
+	}
+
+	rejectedDrop := firstRef
+	rejectedDrop.KeyRevision = 3
+	if sent, err := holder.DropKeyLease(
+		context.Background(), testServeIdentity(), registration.NodeID, registration.NodeEpoch, registration.DataEndpoint, rejectedDrop,
+	); sent || !errors.Is(err, ErrKeyLeaseSuperseded) {
+		t.Fatalf("mismatched future drop sent=%v err=%v", sent, err)
+	}
+	middle := first
+	middle.KeyRevision = 2
+	if _, sent, err := holder.InstallKeyLease(
+		context.Background(), testServeIdentity(), registration.NodeID, registration.NodeEpoch, registration.DataEndpoint, middle,
+	); err != nil || !sent {
+		t.Fatalf("intermediate revision after rejected drop sent=%v err=%v", sent, err)
+	}
+	if len(endpoint.wire) != 2 {
+		t.Fatalf("wire commands = %d, want two key puts and no rejected drop", len(endpoint.wire))
+	}
+}
+
 func TestAmbiguousKeyDropInvalidatesLocalAcknowledgement(t *testing.T) {
 	registration := testRegistration("node-1", 7, 10, "10.0.0.1:8443")
 	authority := newTestEnrollmentAuthority(registration)
