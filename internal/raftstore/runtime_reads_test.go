@@ -259,6 +259,73 @@ func TestRuntimeRejectsTerminalMutationWhenTrustedSourceDisagrees(t *testing.T) 
 	}
 }
 
+func TestRuntimeCommitsPlacementFailureFenceWithoutExecutionProof(t *testing.T) {
+	registryLayout := testRegistryLayout(1, "generation-placement-fence")
+	identity := routeShardIdentity(t, registryLayout, "/g", "rk-placement-fence")
+	state := initializeDataShard(t, registryLayout, identity)
+	starting := routeStarting(t, registryLayout, "/g", "rk-placement-fence", "sandbox-abandoned", 1, true)
+	applyDataOK(t, &state, 2, DataCommand{
+		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{Absent: true}, Route: &starting,
+	})
+	rejectedFirst := cloneRouteRecord(state.Routes[routeMapKey("/g", "rk-placement-fence")])
+	firstBinding := *rejectedFirst.Starting.Binding
+	rejectedFirst.Starting.SelectedCandidate = nil
+	rejectedFirst.Starting.Binding = nil
+	rejectedFirst.Starting.DefinitivelyRejected = []uint32{0}
+	rejectedFirst.Finalizations = []clusterstate.WorkflowFinalizationIntent{
+		workflowFinalization(t, rejectedFirst.Starting.SandboxID, firstBinding, nil),
+	}
+	applyDataOK(t, &state, 3, DataCommand{
+		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{LogIndex: 2}, Route: &rejectedFirst,
+	})
+	selectedSecond := cloneRouteRecord(state.Routes[routeMapKey("/g", "rk-placement-fence")])
+	second := uint32(1)
+	secondBinding := testBinding(
+		t, registryLayout, clusterstate.ExecutionKindSandbox, selectedSecond.Starting.SandboxID,
+		selectedSecond.Group, selectedSecond.RouteKey, "node-2", selectedSecond.Starting.Intent,
+	)
+	selectedSecond.Starting.SelectedCandidate = &second
+	selectedSecond.Starting.Binding = &secondBinding
+	applyDataOK(t, &state, 4, DataCommand{
+		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{LogIndex: 3}, Route: &selectedSecond,
+	})
+	exhausted := cloneRouteRecord(state.Routes[routeMapKey("/g", "rk-placement-fence")])
+	exhausted.Starting.SelectedCandidate = nil
+	exhausted.Starting.Binding = nil
+	exhausted.Starting.DefinitivelyRejected = []uint32{0, 1}
+	exhausted.Finalizations = append(exhausted.Finalizations,
+		workflowFinalization(t, exhausted.Starting.SandboxID, secondBinding, nil))
+	applyDataOK(t, &state, 5, DataCommand{
+		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{LogIndex: 4}, Route: &exhausted,
+	})
+	failure := clusterstate.RoutePlacementFailureState{
+		SandboxID: exhausted.Starting.SandboxID, PlacementRound: exhausted.Starting.PlacementRound,
+		CandidatePool:        append([]clusterstate.PlacementCandidate(nil), exhausted.Starting.CandidatePool...),
+		DefinitivelyRejected: append([]uint32(nil), exhausted.Starting.DefinitivelyRejected...),
+		Intent:               exhausted.Starting.Intent, Reason: "placement candidate pool exhausted",
+	}
+	tombstone := clusterstate.RouteWorkflowRecord{
+		Group: exhausted.Group, RouteKey: exhausted.RouteKey, State: clusterstate.WorkflowRouteTombstone,
+		Tombstone: &clusterstate.RouteTombstoneState{PlacementFailure: &failure},
+	}
+	applyDataOK(t, &state, 6, DataCommand{
+		Type: DataPutRoute, Identity: identity, Expect: RevisionExpectation{LogIndex: 5}, Route: &tombstone,
+	})
+	fence, err := clusterstate.NewPlacementFailureFence(
+		exhausted.Group, exhausted.RouteKey, registryLayout.RegistryGeneration, failure,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := runtimeWithDataState(t, registryLayout, identity, &state)
+	result, err := runtime.ApplyData(context.Background(), DataCommand{
+		Type: DataPutFence, Identity: identity, Expect: RevisionExpectation{Absent: true}, Fence: &fence,
+	})
+	if err != nil || !result.Applied || len(state.Fences) != 1 {
+		t.Fatalf("placement-failure fence = %+v, %v", result, err)
+	}
+}
+
 func runtimeWithDataState(
 	t *testing.T,
 	registryLayout RegistryLayout,
