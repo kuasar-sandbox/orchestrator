@@ -595,7 +595,7 @@ type RouteChangefeedResult struct {
 
 const (
 	MaxRouteChangefeedResponseBytes = 8 << 20
-	maxRouteChangefeedEnvelopeBytes = len(`{"available":true,"reset":false,"floor_revision":18446744073709551615,"head_revision":18446744073709551615,"cursor_revision":18446744073709551615,"changes":[]}`)
+	maxRouteChangefeedEnvelopeBytes = len(`{"changefeed":{"available":true,"reset":false,"floor_revision":18446744073709551615,"head_revision":18446744073709551615,"cursor_revision":18446744073709551615,"changes":[]}}`)
 )
 
 type routeChangefeedPageBuilder struct {
@@ -854,7 +854,10 @@ type PendingLookup struct {
 	Limit    uint32               `json:"limit"`
 }
 
-const MaxPendingLookupResponseBytes = 8 << 20
+const (
+	MaxPendingLookupResponseBytes   = 8 << 20
+	pendingLookupOuterEnvelopeBytes = len(`{"pending":`) + 1
+)
 
 func (q PendingLookup) Validate() error {
 	if err := q.Identity.Validate(); err != nil {
@@ -913,7 +916,8 @@ func (b *pendingPageBuilder) add(workflow PendingWorkflow) (bool, error) {
 	}
 	// Reserve NextKey even if this turns out to be the final row. A page that
 	// stops on either count or bytes therefore always fits the same bound.
-	responseBytes := len(`{"workflows":[`) + payloadBytes + len(`],"next_key":`) + len(key) + 1
+	responseBytes := pendingLookupOuterEnvelopeBytes + len(`{"workflows":[`) + payloadBytes +
+		len(`],"next_key":`) + len(key) + 1
 	if len(b.workflows) >= b.limit || responseBytes > MaxPendingLookupResponseBytes {
 		if len(b.workflows) == 0 {
 			return false, errors.New("raftstore: one pending workflow exceeds the response byte limit")

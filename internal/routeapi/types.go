@@ -87,7 +87,7 @@ func (r ReadRouteResponse) ValidateFor(request ReadRouteRequest) error {
 		if r.Route == nil || r.RouteRevision == 0 {
 			return errors.New("routeapi: READY requires route and revision")
 		}
-		if err := r.Route.Validate(); err != nil {
+		if err := r.Route.ValidateWorkflow(request.Group, request.RouteKey); err != nil {
 			return err
 		}
 		if r.Group != request.Group || r.RouteKey != request.RouteKey ||
@@ -188,7 +188,7 @@ func (r ReadBuildResponse) ValidateFor(request ReadBuildRequest) error {
 			r.Build.RegistryGeneration != request.RegistryGeneration || r.BuildRevision < request.MinBuildRevision {
 			return errors.New("routeapi: positive Build read does not satisfy request fence")
 		}
-		if err := r.Build.Validate(); err != nil {
+		if err := r.Build.ValidateWorkflow(request.Group); err != nil {
 			return err
 		}
 		if r.LeaderHint != nil {

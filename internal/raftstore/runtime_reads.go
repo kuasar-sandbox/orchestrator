@@ -343,32 +343,63 @@ func (r *Runtime) attachLeaderHint(shardID uint32, identity ShardRequestIdentity
 	if err != nil || !valid || term == 0 {
 		return
 	}
-	layout := r.registryLayout
-	if identity.RegistryLayoutDigest != r.registryLayoutDigest {
-		startupDigest, digestErr := r.startupRegistryLayout.Digest()
-		if digestErr != nil || identity.RegistryLayoutDigest != startupDigest {
-			return
-		}
-		layout = r.startupRegistryLayout
-	}
-	if int(shardID) >= len(layout.DataShards) {
+	layouts := r.leaderHintLayouts(identity.RegistryLayoutDigest)
+	hint := leaderHintFromLayouts(layouts, shardID, leaderID, term)
+	if hint == nil {
 		return
 	}
-	placement := layout.DataShards[shardID]
-	for _, replica := range placement.Replicas {
-		if replica.ReplicaID != leaderID {
+	if result.Route != nil {
+		result.Route.LeaderHint = hint
+	} else {
+		result.Build.LeaderHint = hint
+	}
+}
+
+func (r *Runtime) leaderHintLayouts(requestDigest string) []RegistryLayout {
+	if requestDigest == r.registryLayoutDigest {
+		layouts := []RegistryLayout{r.registryLayout}
+		startupDigest, err := r.startupRegistryLayout.Digest()
+		if err == nil && startupDigest != r.registryLayoutDigest {
+			layouts = append(layouts, r.startupRegistryLayout)
+		}
+		return layouts
+	}
+	startupDigest, err := r.startupRegistryLayout.Digest()
+	if err != nil {
+		return nil
+	}
+	if requestDigest == startupDigest {
+		return []RegistryLayout{r.startupRegistryLayout, r.registryLayout}
+	}
+	return nil
+}
+
+func leaderHintFromLayouts(
+	layouts []RegistryLayout,
+	shardID uint32,
+	leaderID, term uint64,
+) *routeapi.LeaderHint {
+	var hint *routeapi.LeaderHint
+	for _, layout := range layouts {
+		if int(shardID) >= len(layout.DataShards) {
 			continue
 		}
-		member, found := registryLayoutMember(layout, replica.MemberID)
-		if !found {
-			return
+		for _, replica := range layout.DataShards[shardID].Replicas {
+			if replica.ReplicaID != leaderID {
+				continue
+			}
+			member, found := registryLayoutMember(layout, replica.MemberID)
+			if !found {
+				return nil
+			}
+			candidate := routeapi.LeaderHint{
+				MemberID: member.MemberID, Endpoint: member.InternalEndpoint, Term: term,
+			}
+			if hint != nil && *hint != candidate {
+				return nil
+			}
+			hint = &candidate
 		}
-		hint := &routeapi.LeaderHint{MemberID: member.MemberID, Endpoint: member.InternalEndpoint, Term: term}
-		if result.Route != nil {
-			result.Route.LeaderHint = hint
-		} else {
-			result.Build.LeaderHint = hint
-		}
-		return
 	}
+	return hint
 }

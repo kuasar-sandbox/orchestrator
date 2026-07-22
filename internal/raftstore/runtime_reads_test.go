@@ -110,6 +110,28 @@ func TestLeaderHintUsesThePermitRegistryLayout(t *testing.T) {
 		result.Route.LeaderHint.Endpoint != member.InternalEndpoint || result.Route.LeaderHint.Term != 9 {
 		t.Fatalf("predecessor leader hint = %+v", result.Route.LeaderHint)
 	}
+
+	targetLeader := target.DataShards[0].Replicas[0]
+	host.leaderID = targetLeader.ReplicaID
+	result.Route.LeaderHint = nil
+	runtime.attachLeaderHint(0, ShardRequestIdentity{PermitIdentity: PermitIdentity{
+		RegistryLayoutDigest: startupDigest,
+	}}, &result)
+	targetMember, found := registryLayoutMember(target, targetLeader.MemberID)
+	if !found || result.Route.LeaderHint == nil || result.Route.LeaderHint.MemberID != targetMember.MemberID ||
+		result.Route.LeaderHint.Endpoint != targetMember.InternalEndpoint {
+		t.Fatalf("target-only leader hint for predecessor request = %+v", result.Route.LeaderHint)
+	}
+
+	host.leaderID = oldLeader.ReplicaID
+	result.Route.LeaderHint = nil
+	runtime.attachLeaderHint(0, ShardRequestIdentity{PermitIdentity: PermitIdentity{
+		RegistryLayoutDigest: targetDigest,
+	}}, &result)
+	if result.Route.LeaderHint == nil || result.Route.LeaderHint.MemberID != member.MemberID ||
+		result.Route.LeaderHint.Endpoint != member.InternalEndpoint {
+		t.Fatalf("predecessor-only leader hint for target request = %+v", result.Route.LeaderHint)
+	}
 }
 
 func TestRuntimeResolvesAmbiguousDataMutationByExactStrongRead(t *testing.T) {

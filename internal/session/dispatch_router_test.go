@@ -52,7 +52,7 @@ func TestDirectoryDispatcherRoutesCurrentTuple(t *testing.T) {
 }
 
 func TestDirectoryDispatcherClassifiesOnlySystemProvenNoSideEffect(t *testing.T) {
-	directory := NewDirectory(directoryFenceAuthority{fenced: map[string]uint64{"node-1": 7, "node-2": 7}})
+	directory := NewDirectory(directoryFenceAuthority{fenced: map[string]uint64{"node-1": 7, "node-2": 7, "node-3": 7}})
 	applyDirectoryUp(t, directory, "node-1", "registry-b", 8, 1)
 	rpc := &holderDispatchRPCStub{}
 	dispatcher, err := NewDirectoryDispatcher(directory, rpc)
@@ -75,6 +75,11 @@ func TestDirectoryDispatcherClassifiesOnlySystemProvenNoSideEffect(t *testing.T)
 	reply, err = dispatcher.AdmitAndDispatch(context.Background(), DispatchCommand{NodeID: "node-2", NodeEpoch: 7})
 	if err != nil || reply.Outcome != cluster.DispatchDefinitiveReject || rpc.calls != 0 {
 		t.Fatalf("down newer epoch dispatch = %+v, %v, calls=%d", reply, err, rpc.calls)
+	}
+	applyDirectoryUp(t, directory, "node-3", "registry-b", 6, 1)
+	reply, err = dispatcher.AdmitAndDispatch(context.Background(), DispatchCommand{NodeID: "node-3", NodeEpoch: 7})
+	if err != nil || reply.Outcome != cluster.DispatchDefinitiveReject || rpc.calls != 0 {
+		t.Fatalf("lagging Directory dispatch = %+v, %v, calls=%d", reply, err, rpc.calls)
 	}
 }
 

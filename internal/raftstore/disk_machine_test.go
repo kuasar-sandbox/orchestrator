@@ -757,7 +757,7 @@ func TestPebbleSnapshotRecoverySpansMultipleSyncedBatches(t *testing.T) {
 		if pending == nil || len(pending.Workflows) == 0 {
 			t.Fatalf("recovered pending workflows = %+v", pending)
 		}
-		encoded, err := json.Marshal(pending)
+		encoded, err := json.Marshal(DataLookupResult{Pending: pending})
 		if err != nil || len(encoded) > MaxPendingLookupResponseBytes {
 			t.Fatalf("pending page bytes = %d, err=%v", len(encoded), err)
 		}
