@@ -43,6 +43,59 @@ func TestActiveReclaimer_ShrinksOverAllocated(t *testing.T) {
 	}
 }
 
+func TestActiveReclaimerWakesPreparedAdmissionsAfterDurableReclaim(t *testing.T) {
+	state := preparedTestState()
+	controller := preparedTestController(t, state, filepath.Join(t.TempDir(), "state.json"), 8)
+	state.Lock()
+	state.Reservations["running"] = &Reservation{
+		Token: "running", SandboxID: "running", Stage: StageSettled,
+		LastReportedRSS: 256 << 20, AllocatableNowMem: 2 << 30,
+		Floor: Resources{MemoryBytes: 128 << 20}, Capacity: Resources{MemoryBytes: 4 << 30},
+	}
+	state.Unlock()
+	for len(controller.Wake()) > 0 {
+		<-controller.Wake()
+	}
+
+	reclaimer := &ActiveReclaimer{
+		State: state, Persister: controller.persister, PreparedAdmission: controller,
+		SafetyMargin: 1.25, Logf: t.Logf,
+	}
+	reclaimer.sweep()
+	select {
+	case <-controller.Wake():
+	default:
+		t.Fatal("durable reclaim did not wake prepared admissions")
+	}
+}
+
+func TestAdminReclaimWakesPreparedAdmissionsAfterDurableReclaim(t *testing.T) {
+	state := preparedTestState()
+	controller := preparedTestController(t, state, filepath.Join(t.TempDir(), "state.json"), 8)
+	state.Lock()
+	state.Reservations["running"] = &Reservation{
+		Token: "running", SandboxID: "running", Stage: StageSettled,
+		AllocatableNowMem: 2 << 30, Floor: Resources{MemoryBytes: 128 << 20},
+		Capacity: Resources{MemoryBytes: 4 << 30},
+	}
+	state.Unlock()
+	for len(controller.Wake()) > 0 {
+		<-controller.Wake()
+	}
+	server := &Server{
+		State: state, Persister: controller.persister, PreparedAdmission: controller, Logf: t.Logf,
+	}
+	response := server.handleAdminReclaim(&Message{SandboxID: "running", TargetAllocatable: 1 << 30})
+	if response.Type != TypeAck {
+		t.Fatalf("admin reclaim = %+v", response)
+	}
+	select {
+	case <-controller.Wake():
+	default:
+		t.Fatal("durable admin reclaim did not wake prepared admissions")
+	}
+}
+
 func TestActiveReclaimer_RespectsFloor(t *testing.T) {
 	state := makeState(8<<30, 1<<30)
 	persister := &Persister{Path: filepath.Join(t.TempDir(), "state.json")}

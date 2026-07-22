@@ -15,12 +15,13 @@ import (
 // In yellow / red zones the safety margin is tightened so headroom
 // is recovered faster.
 type ActiveReclaimer struct {
-	State        *State
-	Persister    *Persister
-	Interval     time.Duration // 10s default
-	SafetyMargin float64       // 1.25 default (working set + 25%)
-	Logf         func(string, ...any)
-	Auditor      *Auditor // optional
+	State             *State
+	Persister         *Persister
+	PreparedAdmission *PreparedAdmissionController
+	Interval          time.Duration // 10s default
+	SafetyMargin      float64       // 1.25 default (working set + 25%)
+	Logf              func(string, ...any)
+	Auditor           *Auditor // optional
 }
 
 // Run is the periodic sweep loop. Returns when ctx is cancelled.
@@ -48,7 +49,6 @@ func (r *ActiveReclaimer) Run(ctx context.Context) {
 
 func (r *ActiveReclaimer) sweep() {
 	r.State.Lock()
-	defer r.State.Unlock()
 
 	zone := r.State.MemoryZone()
 	margin := r.SafetyMargin
@@ -61,8 +61,8 @@ func (r *ActiveReclaimer) sweep() {
 		margin = 1.00
 	}
 
-	any := false
-	for _, res := range r.State.Reservations {
+	previous := make(map[string]uint64)
+	for token, res := range r.State.Reservations {
 		if res.Stage != StageSettled {
 			continue
 		}
@@ -84,12 +84,27 @@ func (r *ActiveReclaimer) sweep() {
 			r.Auditor.Logf("reclaim sid=%s zone=%s rss=%d alloc=%d→%d delta=%d",
 				res.SandboxID, zone, ws, res.AllocatableNowMem, target, delta)
 		}
+		previous[token] = res.AllocatableNowMem
 		res.AllocatableNowMem = target
-		any = true
 	}
-	if any {
-		if err := r.Persister.Flush(r.State); err != nil {
-			r.Logf("reclaim persist: %v", err)
+	if len(previous) == 0 {
+		r.State.Unlock()
+		return
+	}
+	flushErr := r.Persister.Flush(r.State)
+	if flushErr != nil && !FlushPublished(flushErr) {
+		for token, allocatable := range previous {
+			r.State.Reservations[token].AllocatableNowMem = allocatable
 		}
+		r.State.Unlock()
+		r.Logf("reclaim persist: %v", flushErr)
+		return
+	}
+	r.State.Unlock()
+	if flushErr != nil {
+		r.Logf("reclaim persist: %v", flushErr)
+	}
+	if r.PreparedAdmission != nil {
+		r.PreparedAdmission.SignalCapacityChange()
 	}
 }
