@@ -148,6 +148,13 @@ func StreamAuthority(ctx context.Context, w io.Writer, flush func(), body io.Rea
 		return
 	}
 
+	// Freeze the bookmark cutoff before subscribing. Every later mutation is then
+	// either represented by Range/Replay, buffered on the subscription, or safely
+	// replayable after this cutoff if the peer disconnects at the bookmark.
+	bookmarkRevision := ""
+	if rev, ok := src.(RevisionSource); ok {
+		bookmarkRevision = rev.CurrentRevToken()
+	}
 	// Subscribe before the range so events racing the initial stream are buffered
 	// and replayed as idempotent upserts.
 	ch, cancelSub := src.Subscribe()
@@ -212,10 +219,7 @@ func StreamAuthority(ctx context.Context, w io.Writer, flush func(), body io.Rea
 	if err := drainOutbox(); err != nil {
 		return
 	}
-	bookmark := &Msg{Type: TypeBookmark, FullSync: !resumed}
-	if rev, ok := src.(RevisionSource); ok {
-		bookmark.RevToken = rev.CurrentRevToken()
-	}
+	bookmark := &Msg{Type: TypeBookmark, FullSync: !resumed, RevToken: bookmarkRevision}
 	if err := WriteMsg(w, bookmark); err != nil {
 		return
 	}

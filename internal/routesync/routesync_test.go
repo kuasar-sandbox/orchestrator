@@ -53,6 +53,32 @@ func (f *fakeWakes) NextWake(ctx context.Context) (routesync.RouteWake, bool) {
 	}
 }
 
+type advancingSource struct {
+	sub chan routesync.Event
+	seq int64
+}
+
+func (s *advancingSource) Range(_ context.Context, fn func(routesync.RouteEntry) error) error {
+	s.seq++
+	s.sub <- routesync.Event{
+		Kind: routesync.TypeUpsert,
+		Route: routesync.RouteEntry{
+			SandboxID: "racing", AuthorityRevision: uint64(s.seq), State: routesync.StateRunning,
+		},
+	}
+	return fn(routesync.RouteEntry{SandboxID: "snapshot", State: routesync.StateRunning})
+}
+
+func (s *advancingSource) Subscribe() (<-chan routesync.Event, func()) {
+	return s.sub, func() {}
+}
+
+func (s *advancingSource) OnWake(context.Context, routesync.RouteWake) {}
+func (s *advancingSource) Policy() routesync.Policy                    { return routesync.Policy{} }
+func (s *advancingSource) CurrentRevToken() string {
+	return routesync.MakeRevToken("advancing", s.seq)
+}
+
 // fakeSource is the orchestrator side.
 type fakeSource struct {
 	sub    chan routesync.Event
@@ -178,6 +204,51 @@ func TestStreamAuthorityBoundsRouteBurstBeforeOutbox(t *testing.T) {
 			}
 			return
 		}
+	}
+}
+
+func TestBookmarkDoesNotAcknowledgeBufferedMutation(t *testing.T) {
+	src := &advancingSource{sub: make(chan routesync.Event, 1), seq: 10}
+	downR, downW := io.Pipe()
+	upR, upW := io.Pipe()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		routesync.StreamAuthority(ctx, downW, func() {}, upR, src, routesync.Register{
+			Subscribe: &routesync.Subscribe{Kind: routesync.KindRoute},
+		}, nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+		close(done)
+	}()
+
+	first, err := routesync.ReadMsg(downR)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Type != routesync.TypeUpsert || first.Route == nil || first.Route.SandboxID != "snapshot" {
+		t.Fatalf("first frame = %+v", first)
+	}
+	bookmark, err := routesync.ReadMsg(downR)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bookmark.Type != routesync.TypeBookmark || bookmark.RevToken != routesync.MakeRevToken("advancing", 10) {
+		t.Fatalf("bookmark = %+v; buffered revision 11 must remain replayable", bookmark)
+	}
+	delta, err := routesync.ReadMsg(downR)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if delta.Type != routesync.TypeUpsert || delta.Route == nil || delta.Route.AuthorityRevision != 11 {
+		t.Fatalf("buffered delta = %+v", delta)
+	}
+
+	cancel()
+	_ = upW.Close()
+	_ = downR.Close()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("stream did not stop")
 	}
 }
 

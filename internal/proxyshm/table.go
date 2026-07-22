@@ -23,7 +23,7 @@ import (
 
 const (
 	magic  uint64 = 0x6b75736172505831 // "kusarPX1"
-	schema uint32 = 3
+	schema uint32 = 4
 
 	statusEmpty   uint32 = 0
 	statusPresent uint32 = 1
@@ -51,17 +51,21 @@ var (
 )
 
 type mmapHeader struct {
-	Magic        uint64
-	Schema       uint32
-	Capacity     uint32
-	Synced       uint32
-	_            uint32
-	GlobalRev    uint64
-	SyncGen      uint64
-	PolicySeq    uint64
-	PolicyParkMS int64
-	PolicyAuth   [maxProfile]byte
-	_            [32]byte
+	Magic     uint64
+	Schema    uint32
+	Capacity  uint32
+	Synced    uint32
+	_         uint32
+	GlobalRev uint64
+	SyncGen   uint64
+	// AuthorityRevision is the highest ordered route mutation successfully
+	// consumed from the current authority fingerprint. It remains valid across
+	// incremental reconnects and resets only after a full snapshot bookmark.
+	AuthorityRevision uint64
+	PolicySeq         uint64
+	PolicyParkMS      int64
+	PolicyAuth        [maxProfile]byte
+	_                 [24]byte
 }
 
 type mmapRecord struct {
@@ -231,6 +235,7 @@ func (t *Table) Bookmark(fullSync bool) {
 				finishWrite(r)
 			}
 		}
+		atomic.StoreUint64(&t.header.AuthorityRevision, 0)
 	}
 	atomic.StoreUint32(&t.header.Synced, 1)
 	atomic.AddUint64(&t.header.GlobalRev, 1)
@@ -280,6 +285,9 @@ func (t *Table) Upsert(in routesync.RouteEntry) error {
 	if err := validateRoute(in); err != nil {
 		return err
 	}
+	if t.authorityRevisionApplied(in.AuthorityRevision) {
+		return nil
+	}
 	idx, ok := t.findSlot(in.SandboxID, true, in.AuthorityRevision)
 	if !ok {
 		return errors.New("proxyshm: route table full")
@@ -304,8 +312,11 @@ func (t *Table) Upsert(in routesync.RouteEntry) error {
 		rec.SyncGen = atomic.LoadUint64(&t.header.SyncGen)
 		if in.AuthorityRevision == 0 && !t.Synced() {
 			atomic.StoreUint64(&rec.AuthorityRevision, 0)
+		} else if in.AuthorityRevision > current.AuthorityRevision {
+			atomic.StoreUint64(&rec.AuthorityRevision, in.AuthorityRevision)
 		}
 		finishWrite(rec)
+		t.advanceAuthorityRevision(in.AuthorityRevision)
 		return nil
 	}
 	startWrite(rec)
@@ -331,6 +342,7 @@ func (t *Table) Upsert(in routesync.RouteEntry) error {
 	_ = putFixed(rec.SnapshotLocation[:], in.SnapshotLocation)
 	_ = putFixed(rec.MmdsSecret[:], in.MmdsSecret)
 	finishWrite(rec)
+	t.advanceAuthorityRevision(in.AuthorityRevision)
 	return nil
 }
 
@@ -351,6 +363,9 @@ func (t *Table) Delete(sid string) bool {
 // from that snapshot is already authoritative.
 func (t *Table) DeleteRoute(delete routesync.RouteDelete) bool {
 	if t.readonly || delete.Validate() != nil {
+		return false
+	}
+	if t.authorityRevisionApplied(delete.AuthorityRevision) {
 		return false
 	}
 	idx, ok := t.findSlot(delete.SandboxID, false, 0)
@@ -376,6 +391,7 @@ func (t *Table) DeleteRoute(delete routesync.RouteDelete) bool {
 		return false
 	}
 	t.deleteRecord(rec, delete.AuthorityRevision)
+	t.advanceAuthorityRevision(delete.AuthorityRevision)
 	return true
 }
 
@@ -544,12 +560,27 @@ func (t *Table) findSlot(sid string, insert bool, incomingAuthorityRevision uint
 
 func (t *Table) canReuseTombstone(tombstoneRevision, incomingRevision uint64) bool {
 	// Revision zero is full-snapshot/unmanaged state and does not fence the
-	// current authority stream. During replay (Synced=false), revisioned
-	// tombstones remain pinned. Once the bookmark has been crossed, the ordered
-	// stream's next higher revision proves all possible duplicates through the
-	// tombstone revision have already arrived.
+	// current authority stream. A higher ordered mutation may reclaim a crossed
+	// tombstone even during replay: the table-wide applied revision preserves the
+	// ordering fence after the record slot is reused.
 	return tombstoneRevision == 0 || incomingRevision == 0 ||
-		(t.Synced() && incomingRevision > tombstoneRevision)
+		incomingRevision > tombstoneRevision
+}
+
+func (t *Table) authorityRevisionApplied(revision uint64) bool {
+	return revision > 0 && revision <= atomic.LoadUint64(&t.header.AuthorityRevision)
+}
+
+func (t *Table) advanceAuthorityRevision(revision uint64) {
+	if revision == 0 {
+		return
+	}
+	for {
+		current := atomic.LoadUint64(&t.header.AuthorityRevision)
+		if revision <= current || atomic.CompareAndSwapUint64(&t.header.AuthorityRevision, current, revision) {
+			return
+		}
+	}
 }
 
 func readRecord(rec *mmapRecord) (routesync.RouteEntry, uint32, bool) {
