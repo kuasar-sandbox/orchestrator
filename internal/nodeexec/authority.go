@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/nodectl"
@@ -24,6 +25,8 @@ type SandboxDemandSource func(context.Context, DispatchRecord) (nodectl.SandboxA
 type SandboxObjectSource func(context.Context, DispatchRecord) (*types.Sandbox, error)
 
 type BuildObjectSource func(context.Context, DispatchRecord) (*types.Build, error)
+
+const journalAmbiguityResolutionTimeout = time.Second
 
 type SandboxAdmissionController interface {
 	GetAdmission(string, string) (nodectl.PreparedAdmissionResult, error)
@@ -209,24 +212,20 @@ func (a *Authority) AdmitAndDispatch(
 		}
 		record, err = a.journal.RecordSandboxWorkflow(ctx, dispatch, decision, sandboxObject)
 		if err != nil {
+			cleanupReason := "journal_record_failed"
 			if errors.Is(err, ErrWorkflowConflict) {
-				if decision.ReservationToken != "" {
-					owned, ownerErr := a.workflowOwnsSandboxReservation(ctx, dispatch, decision.ReservationToken)
-					if ownerErr != nil {
-						return session.DispatchReply{}, errors.Join(prepareErr, err, ownerErr)
-					}
-					if !owned {
-						if _, releaseErr := a.sandbox.ReleaseAdmission(dispatch.ObjectID, dispatch.DemandDigest, "object_id_conflict"); releaseErr != nil {
-							return session.DispatchReply{}, errors.Join(prepareErr, err, releaseErr)
-						}
-					}
-				}
-				if prepareErr != nil {
-					return session.DispatchReply{}, errors.Join(prepareErr, err)
+				cleanupReason = "object_id_conflict"
+			}
+			cleanupErr := a.releaseUnjournaledSandboxAdmission(
+				ctx, dispatch, decision.ReservationToken, cleanupReason,
+			)
+			if errors.Is(err, ErrWorkflowConflict) {
+				if prepareErr != nil || cleanupErr != nil {
+					return session.DispatchReply{}, errors.Join(prepareErr, err, cleanupErr)
 				}
 				return session.DispatchReply{Outcome: clusterstate.DispatchConflict, Reason: err.Error()}, nil
 			}
-			return session.DispatchReply{}, errors.Join(prepareErr, err)
+			return session.DispatchReply{}, errors.Join(prepareErr, err, cleanupErr)
 		}
 		if prepareErr != nil {
 			// The state-file rename published this Admission, so the journal must
@@ -259,6 +258,27 @@ func (a *Authority) AdmitAndDispatch(
 		a.notifyWork()
 	}
 	return session.DispatchReply{Outcome: record.Result, Reason: record.Reason}, nil
+}
+
+func (a *Authority) releaseUnjournaledSandboxAdmission(
+	ctx context.Context,
+	dispatch DispatchRecord,
+	reservationToken, reason string,
+) error {
+	if reservationToken == "" {
+		return nil
+	}
+	resolveCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), journalAmbiguityResolutionTimeout)
+	defer cancel()
+	owned, err := a.workflowOwnsSandboxReservation(resolveCtx, dispatch, reservationToken)
+	if err != nil {
+		return fmt.Errorf("nodeexec: resolve Sandbox journal write: %w", err)
+	}
+	if owned {
+		return nil
+	}
+	_, err = a.sandbox.ReleaseAdmission(dispatch.ObjectID, dispatch.DemandDigest, reason)
+	return err
 }
 
 func (a *Authority) workflowOwnsSandboxReservation(
