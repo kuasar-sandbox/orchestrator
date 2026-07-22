@@ -265,6 +265,14 @@ type Deps struct {
 	RouteSource   routesync.Source // plugin plane: route authority a subscriber streams from (nil => plane off)
 	Plugins       *Registry        // plugin plane: live registration registry (shared with proxyForwarder)
 	PluginPidfile string           // optional PID allowlist gating the plugin plane ("" => socket perms only)
+
+	// MmdsEndpoints wires the MMDS endpoint admin plane (nil => routes not
+	// registered at all: disabled is never silently ignored, it simply
+	// doesn't expose the surface). Gated by the same AdminPidfile as the
+	// manifest-key admin plane above.
+	MmdsEndpoints          MmdsEndpointsAdmin
+	MMDSMaxStoreValueBytes int64 // <=0 => defaultMMDSValueLimit
+	MMDSMaxRelayAuthBytes  int64 // <=0 => defaultMMDSValueLimit
 }
 
 type Server struct {
@@ -336,6 +344,12 @@ func (s *Server) router() http.Handler {
 	mux.HandleFunc("POST "+PathRunAssignment, s.handleRunAssignment)
 	mux.HandleFunc("POST "+PathRunBuildResult, s.handleBuildResult)
 	mux.HandleFunc(PathAdminManifestKey, s.handleAdminKeys) // GET=list, POST=add/remove/check
+	if s.deps.MmdsEndpoints != nil {
+		mux.HandleFunc("PUT "+PathAdminMmdsStore, s.handleMmdsStorePut)
+		mux.HandleFunc("DELETE "+PathAdminMmdsStore, s.handleMmdsStoreDelete)
+		mux.HandleFunc("PUT "+PathAdminMmdsAuth, s.handleMmdsRelayAuthPut)
+		mux.HandleFunc("DELETE "+PathAdminMmdsAuth, s.handleMmdsRelayAuthDelete)
+	}
 	if s.deps.RouteSource != nil && s.deps.Plugins != nil {
 		mux.HandleFunc(routesync.PluginRegisterPattern, s.handlePluginRegister) // plugin plane: register + route stream
 	}
