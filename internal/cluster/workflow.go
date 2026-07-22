@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"unicode/utf8"
 
@@ -303,10 +304,16 @@ func (s PausedRouteState) Validate() error {
 	if err := s.Execution.Validate(); err != nil {
 		return err
 	}
-	if s.SnapshotRef == "" {
-		return errors.New("cluster: PAUSED requires an authoritative snapshot reference")
+	if s.SnapshotRef == "" || s.Execution.SnapshotRef != s.SnapshotRef {
+		return errors.New("cluster: PAUSED requires one authoritative execution snapshot reference")
 	}
-	return validateSandboxDispatchIntent(s.ResumeIntent)
+	if err := validateSandboxDispatchIntent(s.ResumeIntent); err != nil {
+		return err
+	}
+	if !reflect.DeepEqual(s.ResumeIntent, s.Execution.Intent) {
+		return errors.New("cluster: PAUSED resume intent differs from the bound execution")
+	}
+	return nil
 }
 
 type ResumingRouteState struct {

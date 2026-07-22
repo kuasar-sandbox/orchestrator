@@ -73,6 +73,21 @@ func TestReadyRouteAndRevisionValidation(t *testing.T) {
 	}
 }
 
+func TestPausedRouteRetainsBoundExecutionIntent(t *testing.T) {
+	execution := *readyRoute()
+	execution.SnapshotRef = "snapshot-1"
+	paused := PausedRouteState{
+		Execution: execution, SnapshotRef: execution.SnapshotRef, ResumeIntent: execution.Intent,
+	}
+	if err := paused.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	paused.ResumeIntent.ProviderPolicyVersion = "another-policy"
+	if err := paused.Validate(); err == nil {
+		t.Fatal("PAUSED accepted a resume intent from another execution plan")
+	}
+}
+
 func TestRouteTombstoneCarriesExactExecutionFence(t *testing.T) {
 	binding := sha256.Sum256([]byte("binding"))
 	proof := TerminalProof{Kind: ProofNodeTerminal, FencedNodeID: "n1", FencedNodeEpoch: 7}
