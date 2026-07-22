@@ -194,11 +194,23 @@ func TestBuildAdmissionIsIdempotentConflictSafeAndBounded(t *testing.T) {
 		got == nil || !got.WorkflowFinalized {
 		t.Fatalf("finalized rejection marker = %+v, %v", got, err)
 	}
-	if err := st.CompactFinalizedNodeWorkflows(ctx, third.NodeID, third.NodeEpoch, third.SessionSeq+1); err != nil {
+	refreshedDispatch := third
+	refreshedDispatch.SessionSeq++
+	refreshed, err := st.RefreshNodeWorkflowSession(ctx, refreshedDispatch)
+	if err != nil || refreshed.SessionSeq != refreshedDispatch.SessionSeq {
+		t.Fatalf("cross-session retry fence = %+v, %v", refreshed, err)
+	}
+	if err := st.CompactFinalizedNodeWorkflows(ctx, third.NodeID, third.NodeEpoch, refreshedDispatch.SessionSeq); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := st.GetNodeWorkflow(ctx, clusterstate.ExecutionKindBuild, third.ObjectID); err != nil || got == nil {
+		t.Fatalf("active-session marker = %+v, %v", got, err)
+	}
+	if err := st.CompactFinalizedNodeWorkflows(ctx, third.NodeID, third.NodeEpoch, refreshedDispatch.SessionSeq+1); err != nil {
 		t.Fatal(err)
 	}
 	if got, err := st.GetNodeWorkflow(ctx, clusterstate.ExecutionKindBuild, third.ObjectID); err != nil || got != nil {
-		t.Fatalf("new-session compacted rejection = %+v, %v", got, err)
+		t.Fatalf("later-session compacted rejection = %+v, %v", got, err)
 	}
 }
 

@@ -158,7 +158,21 @@ func newAuthority(
 	sandbox nodeexec.SandboxAdmissionController,
 ) *nodeexec.Authority {
 	t.Helper()
-	return newAuthorityWithCapacity(t, journal, sandbox, func(context.Context) (nodeexec.BuildCapacity, string, error) {
+	return newAuthorityAtSession(t, journal, sandbox, 11)
+}
+
+func newAuthorityAtSession(
+	t *testing.T,
+	journal nodeexec.WorkflowJournal,
+	sandbox nodeexec.SandboxAdmissionController,
+	sessionSeq uint64,
+) *nodeexec.Authority {
+	t.Helper()
+	return newAuthorityWithIdentityAndCapacity(t, journal, sandbox, func(context.Context) (nodeexec.LocalSessionIdentity, error) {
+		return nodeexec.LocalSessionIdentity{
+			NodeID: "node-1", NodeEpoch: 7, SessionSeq: sessionSeq, DataEndpoint: "10.0.0.1:8443",
+		}, nil
+	}, func(context.Context) (nodeexec.BuildCapacity, string, error) {
 		return nodeexec.BuildCapacity{Slots: 1, CPU: 1000, Memory: 2 << 30, QueueLimit: 4}, "", nil
 	})
 }
@@ -170,14 +184,25 @@ func newAuthorityWithCapacity(
 	capacity nodeexec.BuildCapacitySource,
 ) *nodeexec.Authority {
 	t.Helper()
+	return newAuthorityWithIdentityAndCapacity(t, journal, sandbox, func(context.Context) (nodeexec.LocalSessionIdentity, error) {
+		return nodeexec.LocalSessionIdentity{
+			NodeID: "node-1", NodeEpoch: 7, SessionSeq: 11, DataEndpoint: "10.0.0.1:8443",
+		}, nil
+	}, capacity)
+}
+
+func newAuthorityWithIdentityAndCapacity(
+	t *testing.T,
+	journal nodeexec.WorkflowJournal,
+	sandbox nodeexec.SandboxAdmissionController,
+	identity nodeexec.IdentitySource,
+	capacity nodeexec.BuildCapacitySource,
+) *nodeexec.Authority {
+	t.Helper()
 	authority, err := nodeexec.NewAuthority(
 		journal,
 		sandbox,
-		func(context.Context) (nodeexec.LocalSessionIdentity, error) {
-			return nodeexec.LocalSessionIdentity{
-				NodeID: "node-1", NodeEpoch: 7, SessionSeq: 11, DataEndpoint: "10.0.0.1:8443",
-			}, nil
-		},
+		identity,
 		capacity,
 		func(_ context.Context, record nodeexec.DispatchRecord) (*types.Build, error) {
 			return &types.Build{
@@ -356,6 +381,28 @@ func TestAuthorityBuildDispatchIsDurableAndSessionFenced(t *testing.T) {
 	fenced, err := authority.AdmitAndDispatch(context.Background(), command)
 	if err != nil || fenced.Outcome != clusterstate.DispatchSessionMoved {
 		t.Fatalf("fenced session = %+v, %v", fenced, err)
+	}
+}
+
+func TestAuthorityCrossSessionRetryRefreshesDurableFence(t *testing.T) {
+	st := authorityStore(t)
+	sandbox := &sandboxAdmissionFake{prepared: map[string]nodectl.PreparedAdmissionResult{}, wake: make(chan struct{})}
+	command := authorityCommand(t, clusterstate.ExecutionKindBuild, "build-session-retry")
+	first := newAuthorityAtSession(t, st, sandbox, command.SessionSeq)
+	initial, err := first.AdmitAndDispatch(context.Background(), command)
+	if err != nil || initial.Outcome != clusterstate.DispatchAcceptedAdmitted {
+		t.Fatalf("initial dispatch = %+v, %v", initial, err)
+	}
+
+	command.SessionSeq++
+	reconnected := newAuthorityAtSession(t, st, sandbox, command.SessionSeq)
+	retry, err := reconnected.AdmitAndDispatch(context.Background(), command)
+	if err != nil || retry != initial {
+		t.Fatalf("cross-session retry = %+v, %v; want %+v", retry, err, initial)
+	}
+	stored, err := st.GetNodeWorkflow(context.Background(), clusterstate.ExecutionKindBuild, command.ObjectID)
+	if err != nil || stored == nil || stored.SessionSeq != command.SessionSeq {
+		t.Fatalf("durable retry session = %+v, %v", stored, err)
 	}
 }
 
