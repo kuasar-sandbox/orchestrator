@@ -148,14 +148,14 @@ func (o *Orchestrator) Create(ctx context.Context, req api.CreateReq) (*types.Sa
 			return nil, err
 		}
 	}
-	// Layer the template's declared config (builds.metadata_json) under the create's
-	// own config — create wins per namespace. Best-effort: a self-describing or
-	// foreign template may have no local build record (then it's just the create's).
-	meta := req.Metadata
+	// Layer the template's declared config under this create request. Restore is
+	// deliberately request-scoped, so a template metadata value is not inherited.
+	var templateMetadata map[string]string
 	if tb := o.templateBuild(ctx, req.APIKey, req.TemplateID); tb != nil && len(tb.Metadata) > 0 {
-		meta = sandboxcfg.MergeMetadata(tb.Metadata, req.Metadata)
+		templateMetadata = tb.Metadata
 	}
-	// Validate the final template + create restore policy before allocating an
+	meta := sandboxcfg.MergeCreateMetadata(templateMetadata, req.Metadata)
+	// Validate the create restore policy before allocating an
 	// identity, minting credentials, creating directories, attaching networking,
 	// or starting a process. Normalization also gives every later trust boundary
 	// one canonical value to parse.

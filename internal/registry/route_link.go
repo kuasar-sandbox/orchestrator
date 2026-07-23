@@ -121,12 +121,6 @@ func (r *Registry) serveReserveBuild(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, fmt.Sprintf("unknown build profile %q", br.Profile), http.StatusBadRequest)
 		return
 	}
-	metadata, err := sandboxcfg.NormalizeRestoreMetadata(br.Metadata)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	br.Metadata = metadata
 	res, err := r.ReserveBuild(req.Context(), br)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
@@ -161,6 +155,12 @@ func (r *Registry) serveReserve(w http.ResponseWriter, req *http.Request) {
 			return
 		}
 	}
+	for key := range body.Config {
+		if key != sandboxcfg.NsRestore {
+			http.Error(w, fmt.Sprintf("unsupported sandbox reserve config %q", key), http.StatusBadRequest)
+			return
+		}
+	}
 	config, err := sandboxcfg.NormalizeRestoreMetadata(body.Config)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -169,9 +169,7 @@ func (r *Registry) serveReserve(w http.ResponseWriter, req *http.Request) {
 	res, err := r.ReserveSandbox(req.Context(), group, routeKey, config)
 	if err != nil {
 		status := http.StatusServiceUnavailable
-		if errors.Is(err, ErrTemplateRestoreConflict) {
-			status = http.StatusBadRequest
-		} else if errors.Is(err, errReserveRestoreConflict) {
+		if errors.Is(err, errReserveRestoreConflict) {
 			status = http.StatusConflict
 			w.Header().Set(RouteLinkErrorHeader, RouteLinkRestoreConflict)
 		}

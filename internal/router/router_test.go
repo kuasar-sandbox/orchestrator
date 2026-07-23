@@ -66,26 +66,6 @@ func TestCreateRestoreMetadataEmptyHeaderOverridesBodyAndRejects(t *testing.T) {
 	}
 }
 
-func TestRestoreHeaderMetadata(t *testing.T) {
-	header := http.Header{}
-	header.Set(HeaderRestore, ` { "prefetch": "memory" } `)
-	got, err := restoreHeaderMetadata(header)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(got) != 1 || got["kuasar-sandbox.restore"] != `{"prefetch":"memory"}` {
-		t.Fatalf("restore metadata=%v", got)
-	}
-	header.Set(HeaderRestore, `{"file_refs":"trust"}`)
-	if _, err := restoreHeaderMetadata(header); err == nil {
-		t.Fatal("file_refs should be rejected at cluster ingress")
-	}
-	header.Set(HeaderRestore, "")
-	if _, err := restoreHeaderMetadata(header); err == nil {
-		t.Fatal("an explicitly empty restore header should be rejected")
-	}
-}
-
 func TestRouteLinkHTTPFailsOverOnServerError(t *testing.T) {
 	var calls []string
 	first := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
@@ -287,21 +267,17 @@ func TestRouteLinkReserveCarriesRestoreConfig(t *testing.T) {
 func TestReserveByKeyKeepsRestorePolicyDistinctAcrossFlights(t *testing.T) {
 	result := &reserveResult{SID: "s1", NodeID: "n1", DataEndpoint: "node:1"}
 	for _, tc := range []struct {
-		name         string
-		leaderIntent string
-		waiter       map[string]string
+		name       string
+		leaderMode string
+		waiter     map[string]string
 	}{
-		{name: "inherit leader off waiter", leaderIntent: "inherit", waiter: map[string]string{"kuasar-sandbox.restore": `{"prefetch":"off"}`}},
-		{name: "off leader inherit waiter", leaderIntent: "off", waiter: nil},
-		{name: "inherit leader memory waiter", leaderIntent: "inherit", waiter: map[string]string{"kuasar-sandbox.restore": `{"prefetch":"memory"}`}},
-		{name: "memory leader inherit waiter", leaderIntent: "memory", waiter: nil},
-		{name: "off leader memory waiter", leaderIntent: "off", waiter: map[string]string{"kuasar-sandbox.restore": `{"prefetch":"memory"}`}},
-		{name: "memory leader off waiter", leaderIntent: "memory", waiter: map[string]string{"kuasar-sandbox.restore": `{"prefetch":"off"}`}},
+		{name: "off leader memory waiter", leaderMode: "off", waiter: map[string]string{"kuasar-sandbox.restore": `{"prefetch":"memory"}`}},
+		{name: "memory leader off waiter", leaderMode: "memory", waiter: nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			rt := &Router{reserveInFlight: map[string]*reserveFlight{}}
 			flight := &reserveFlight{
-				done: make(chan struct{}), restoreIntent: tc.leaderIntent, res: result,
+				done: make(chan struct{}), restoreMode: tc.leaderMode, res: result,
 			}
 			close(flight.done)
 			rt.reserveInFlight[routeCacheKey("/g", "rk")] = flight
@@ -311,15 +287,26 @@ func TestReserveByKeyKeepsRestorePolicyDistinctAcrossFlights(t *testing.T) {
 		})
 	}
 
-	rt := &Router{reserveInFlight: map[string]*reserveFlight{}}
-	flight := &reserveFlight{done: make(chan struct{}), restoreIntent: "off", res: result}
-	close(flight.done)
-	rt.reserveInFlight[routeCacheKey("/g", "rk")] = flight
-	got, err := rt.reserveByKey(context.Background(), "/g", "rk", map[string]string{
-		"kuasar-sandbox.restore": `{"prefetch":"off"}`,
-	})
-	if err != nil || got != result {
-		t.Fatalf("compatible disabled waiter did not join: result=%+v err=%v", got, err)
+	for _, tc := range []struct {
+		name       string
+		leaderMode string
+		waiter     map[string]string
+	}{
+		{name: "absent", leaderMode: "off"},
+		{name: "object", leaderMode: "off", waiter: map[string]string{"kuasar-sandbox.restore": `{}`}},
+		{name: "off", leaderMode: "off", waiter: map[string]string{"kuasar-sandbox.restore": `{"prefetch":"off"}`}},
+		{name: "memory", leaderMode: "memory", waiter: map[string]string{"kuasar-sandbox.restore": `{"prefetch":"memory"}`}},
+	} {
+		t.Run("compatible "+tc.name, func(t *testing.T) {
+			rt := &Router{reserveInFlight: map[string]*reserveFlight{}}
+			flight := &reserveFlight{done: make(chan struct{}), restoreMode: tc.leaderMode, res: result}
+			close(flight.done)
+			rt.reserveInFlight[routeCacheKey("/g", "rk")] = flight
+			got, err := rt.reserveByKey(context.Background(), "/g", "rk", tc.waiter)
+			if err != nil || got != result {
+				t.Fatalf("compatible disabled waiter did not join: result=%+v err=%v", got, err)
+			}
+		})
 	}
 }
 
@@ -348,8 +335,7 @@ func TestReserveBuildRequestCarriesStableIDsAcrossRouteLinkRetry(t *testing.T) {
 		}, nil
 	})}
 
-	restore := map[string]string{"kuasar-sandbox.restore": `{"prefetch":"memory"}`}
-	res, err := rt.routeLinkReserveBuild(context.Background(), "/g", types.ProfileBare, nil, restore)
+	res, err := rt.routeLinkReserveBuild(context.Background(), "/g", types.ProfileBare, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -364,12 +350,6 @@ func TestReserveBuildRequestCarriesStableIDsAcrossRouteLinkRetry(t *testing.T) {
 	}
 	if bodies[0]["profile"] != string(types.ProfileBare) || bodies[1]["profile"] != string(types.ProfileBare) {
 		t.Fatalf("reserve-build retry lost profile: %v then %v", bodies[0], bodies[1])
-	}
-	for i, body := range bodies {
-		metadata, ok := body["metadata"].(map[string]any)
-		if !ok || metadata["kuasar-sandbox.restore"] != `{"prefetch":"memory"}` {
-			t.Fatalf("reserve-build body %d restore metadata=%v", i, body["metadata"])
-		}
 	}
 	if res.BuildID != bodies[0]["build_id"] || res.TemplateID != bodies[0]["template_id"] {
 		t.Fatalf("reserve result=%+v bodies=%v", res, bodies)

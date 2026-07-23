@@ -101,18 +101,17 @@ router 不参与 registry 成员健康检测,不订阅 route,也不订阅 node_l
 | get/connect/pause/timeout/export | group + route_key + sandbox_id | route owner 解析 node 后转发到 node 控制面 |
 | list/get | group | 读取 group 分片 |
 | data plane | group + route_key + sandbox_id + port | cache 命中后建立一次性 CONNECT;miss Reserve |
-| build register | group + build_id | 生成稳定 id,把 `X-Kuasar-Sandbox-Restore` 作为模板默认值随 `ReserveBuild` 传递 |
+| build register | group + build_id | 生成稳定 id 后调用 `ReserveBuild` |
 | build status/files | group + build_id | 定位 build node 后转发 |
 
 `route_key` 是稳定会话身份,`sandbox_id` 是当前实例身份。cluster 内部总是同时维护二者。
 
 create 可在 body metadata 中携 `kuasar-sandbox.restore`,或使用
 `X-Kuasar-Sandbox-Restore`;同一请求 Header 胜出。router 只提取该命名空间,不会把
-Prefetch 变成 group 或节点统一策略。register/trigger 的最终模板默认值随 READY build
-记录保存;create 未显式声明时按最终 template ID 继承,显式 `off`/`memory` 始终胜出。
-同一 `(group,route_key)` 首次创建期间,restore 选择意图相同的并发请求共用 Reserve;
-`inherit`、显式 `off` 与 `memory` 互不合并,不同时回 **409**,避免成功响应对应到
-另一请求抢先选定的策略。
+Prefetch 变成 template、group 或节点统一策略。未提供、`{}` 与显式 `off` 均为关闭;
+只有本次 create 显式提供 `memory` 才启用。同一 `(group,route_key)` 首次创建期间,
+有效 mode 相同的并发请求共用 Reserve;`off` 与 `memory` 不同时回 **409**,避免成功
+响应对应到另一请求抢先选定的策略。
 
 ## 6. 缓存模型
 

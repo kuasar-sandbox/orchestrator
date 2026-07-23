@@ -165,10 +165,6 @@ func (o *Orchestrator) registerClusterBuild(ctx context.Context, cmd *routesync.
 	if err != nil {
 		return err
 	}
-	meta, err = sandboxcfg.NormalizeRestoreMetadata(meta)
-	if err != nil {
-		return err
-	}
 	if err := o.validateBuildOptions(builderOpts, false); err != nil {
 		return err
 	}
@@ -205,7 +201,7 @@ func (o *Orchestrator) registerClusterBuild(ctx context.Context, cmd *routesync.
 	o.clusterBuildMu.Lock()
 	o.clusterBuilds[cmd.BuildID] = &clusterBuild{imageRepo: cmd.ImageRepo, registryAuth: cmd.RegistryAuth}
 	o.clusterBuildMu.Unlock()
-	o.publishBuildState(cmd.BuildID, "registered", "", "", "")
+	o.publishBuildState(cmd.BuildID, "registered", "", "")
 	return nil
 }
 
@@ -216,14 +212,14 @@ func (o *Orchestrator) BuildEvents() <-chan *routesync.BuildEvent { return o.bui
 // publishBuildState emits a build event for a cluster build (no-op for a non-
 // cluster, e.g. single-node, build). Non-blocking: a full buffer drops the event
 // (the registry reconverges from the next transition / the router's status).
-func (o *Orchestrator) publishBuildState(buildID, state, templateID, restore, reason string) {
+func (o *Orchestrator) publishBuildState(buildID, state, templateID, reason string) {
 	o.clusterBuildMu.Lock()
 	cb := o.clusterBuilds[buildID]
 	o.clusterBuildMu.Unlock()
 	if cb == nil {
 		return // not a cluster-driven build
 	}
-	ev := &routesync.BuildEvent{BuildID: buildID, State: state, TemplateID: templateID, Restore: restore, Reason: reason}
+	ev := &routesync.BuildEvent{BuildID: buildID, State: state, TemplateID: templateID, Reason: reason}
 	select {
 	case o.buildEvents <- ev:
 	default:

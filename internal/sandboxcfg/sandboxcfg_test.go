@@ -122,25 +122,6 @@ func TestRestorePrefetchMode(t *testing.T) {
 	}
 }
 
-func TestRestorePrefetchIntent(t *testing.T) {
-	for name, tc := range map[string]struct {
-		meta map[string]string
-		want string
-	}{
-		"absent": {want: "inherit"},
-		"object": {meta: map[string]string{NsRestore: `{}`}, want: "off"},
-		"off":    {meta: map[string]string{NsRestore: `{"prefetch":"off"}`}, want: "off"},
-		"memory": {meta: map[string]string{NsRestore: `{"prefetch":"memory"}`}, want: "memory"},
-	} {
-		t.Run(name, func(t *testing.T) {
-			got, err := RestorePrefetchIntent(tc.meta)
-			if err != nil || got != tc.want {
-				t.Fatalf("RestorePrefetchIntent() = %q, %v; want %q", got, err, tc.want)
-			}
-		})
-	}
-}
-
 func TestParseSpecNetworkValidation(t *testing.T) {
 	for name, bad := range map[string]string{
 		"bad-json":    `{not json`,
@@ -292,6 +273,23 @@ func TestMergeMetadataOverWins(t *testing.T) {
 	m := MergeMetadata(base, over)
 	if m[NsNetwork] != "from-create" || m[NsLaunch] != "tmpl-launch" {
 		t.Fatalf("create should win per namespace, template fills the rest: %+v", m)
+	}
+}
+
+func TestMergeCreateMetadataKeepsRestoreRequestScoped(t *testing.T) {
+	defaults := map[string]string{
+		NsNetwork: "from-defaults", NsRestore: `{"prefetch":"memory"}`,
+	}
+	withoutRestore := MergeCreateMetadata(defaults, map[string]string{NsLaunch: "from-request"})
+	if withoutRestore[NsNetwork] != "from-defaults" || withoutRestore[NsLaunch] != "from-request" {
+		t.Fatalf("normal create metadata did not merge: %+v", withoutRestore)
+	}
+	if _, ok := withoutRestore[NsRestore]; ok {
+		t.Fatalf("restore leaked from defaults: %+v", withoutRestore)
+	}
+	withRestore := MergeCreateMetadata(defaults, map[string]string{NsRestore: `{"prefetch":"off"}`})
+	if withRestore[NsRestore] != `{"prefetch":"off"}` {
+		t.Fatalf("explicit create restore did not win: %+v", withRestore)
 	}
 }
 

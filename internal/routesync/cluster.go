@@ -90,7 +90,6 @@ type BuildEvent struct {
 	BuildID    string `json:"build_id"`
 	State      string `json:"state"`
 	TemplateID string `json:"template_id,omitempty"`
-	Restore    string `json:"restore,omitempty"`
 	Reason     string `json:"reason,omitempty"`
 }
 

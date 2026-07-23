@@ -150,7 +150,7 @@ type reserveCall struct {
 	orig            *SandboxRecord
 	found           bool
 	createConfig    map[string]string
-	restoreIntent   string
+	restoreMode     string
 }
 
 // ReserveResult is what a satisfied ReserveSandbox returns (cluster.md). The
@@ -432,12 +432,12 @@ func (r *Registry) ReserveSandbox(ctx context.Context, group, routeKey string, c
 	if err != nil {
 		return nil, err
 	}
-	restoreIntent, err := sandboxcfg.RestorePrefetchIntent(createConfig)
+	restoreMode, err := sandboxcfg.RestorePrefetchMode(createConfig)
 	if err != nil {
 		return nil, err
 	}
 	key := flightKey(group, routeKey)
-	if res, joined, err := r.waitCompatibleReserve(ctx, key, restoreIntent); joined {
+	if res, joined, err := r.waitCompatibleReserve(ctx, key, restoreMode); joined {
 		return res, err
 	}
 	rec, rev, found, err := r.getSandboxForReserve(ctx, group, routeKey)
@@ -453,7 +453,7 @@ func (r *Registry) ReserveSandbox(ctx context.Context, group, routeKey string, c
 			// The quorum read and node-liveness check can overlap a flight that
 			// was installed after the first check. Recheck immediately before
 			// returning READY so a different policy never joins it implicitly.
-			if flightRes, joined, err := r.waitCompatibleReserve(ctx, key, restoreIntent); joined {
+			if flightRes, joined, err := r.waitCompatibleReserve(ctx, key, restoreMode); joined {
 				return flightRes, err
 			}
 			return res, nil
@@ -463,7 +463,7 @@ func (r *Registry) ReserveSandbox(ctx context.Context, group, routeKey string, c
 
 	r.mu.Lock()
 	if call, ok := r.inflight[key]; ok {
-		if call.restoreIntent != restoreIntent {
+		if call.restoreMode != restoreMode {
 			r.mu.Unlock()
 			return nil, errReserveRestoreConflict
 		}
@@ -472,7 +472,7 @@ func (r *Registry) ReserveSandbox(ctx context.Context, group, routeKey string, c
 	}
 	call := &reserveCall{
 		done: make(chan struct{}), group: group, routeKey: routeKey, orig: rec, found: found,
-		createConfig: createConfig, restoreIntent: restoreIntent,
+		createConfig: createConfig, restoreMode: restoreMode,
 	}
 	r.inflight[key] = call
 	r.mu.Unlock()
@@ -508,16 +508,16 @@ func (r *Registry) ReserveSandbox(ctx context.Context, group, routeKey string, c
 }
 
 // waitCompatibleReserve joins the current flight only when it represents the
-// same restore selection intent. joined is true for both a successful join and
+// same effective restore mode. joined is true for both a successful join and
 // a policy conflict, so callers return the accompanying result/error directly.
-func (r *Registry) waitCompatibleReserve(ctx context.Context, key, restoreIntent string) (*ReserveResult, bool, error) {
+func (r *Registry) waitCompatibleReserve(ctx context.Context, key, restoreMode string) (*ReserveResult, bool, error) {
 	r.mu.Lock()
 	call := r.inflight[key]
 	if call == nil {
 		r.mu.Unlock()
 		return nil, false, nil
 	}
-	if call.restoreIntent != restoreIntent {
+	if call.restoreMode != restoreMode {
 		r.mu.Unlock()
 		return nil, true, errReserveRestoreConflict
 	}
@@ -676,10 +676,7 @@ func (r *Registry) placeAndCreate(ctx context.Context, group, routeKey string, c
 		if placement == nil || placement.NodeID == "" {
 			return ErrNoNode
 		}
-		config, err := r.effectiveCreateConfig(ctx, group, placement.TemplateRef, placement.Config, createConfig)
-		if err != nil {
-			return err
-		}
+		config := sandboxcfg.MergeCreateMetadata(placement.Config, createConfig)
 		metadata, err := clusterstate.WithObjectLocation(config, clusterstate.ObjectLocation{Group: group, RouteKey: routeKey})
 		if err != nil {
 			return err

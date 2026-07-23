@@ -1157,7 +1157,15 @@ func TestReadyRouteUsesDerivedAccessToken(t *testing.T) {
 func TestReserveSandboxCreateUsesPlacementMaterial(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
-	reg.SetPlacer(placementWithToken("n1"))
+	basePlacer := placementWithToken("n1")
+	reg.SetPlacer(placementFunc(func(ctx context.Context, req PlaceRequest) (*Placement, error) {
+		placement, err := basePlacer.Place(ctx, req)
+		if err != nil {
+			return nil, err
+		}
+		placement.Config[sandboxcfg.NsRestore] = `{"prefetch":"memory"}`
+		return placement, nil
+	}))
 	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"}); err != nil {
 		t.Fatal(err)
 	}
@@ -1185,8 +1193,23 @@ func TestReserveSandboxCreateUsesPlacementMaterial(t *testing.T) {
 	if got.TemplateRef != "e2b-snp-tmpl" || got.Config["a"] != "1" || got.Config["b"] != "2" {
 		t.Fatalf("create command did not use placement config: %+v", got)
 	}
+	if _, ok := got.Config[sandboxcfg.NsRestore]; ok {
+		t.Fatalf("placement restore leaked without an explicit create value: %+v", got.Config)
+	}
 	if got.KeyFingerprint != keyFingerprint(testMK) {
 		t.Fatalf("key fingerprint=%q, want provider key fp", got.KeyFingerprint)
+	}
+
+	for _, mode := range []string{"off", "memory"} {
+		got = nil
+		if _, err := reg.ReserveSandbox(ctx, "/g", "rk-"+mode, map[string]string{
+			sandboxcfg.NsRestore: `{"prefetch":"` + mode + `"}`,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if got == nil || got.Config[sandboxcfg.NsRestore] != `{"prefetch":"`+mode+`"}` {
+			t.Fatalf("explicit create restore %q did not reach command: %+v", mode, got)
+		}
 	}
 }
 
@@ -1215,21 +1238,17 @@ func TestReserveSandboxRejectsInvalidRestoreBeforePlacement(t *testing.T) {
 func TestReserveSandboxKeepsRestorePolicyDistinctAcrossFlights(t *testing.T) {
 	result := &ReserveResult{SID: "s1", NodeID: "n1", DataEndpoint: "node:1"}
 	for _, tc := range []struct {
-		name         string
-		leaderIntent string
-		waiter       map[string]string
+		name       string
+		leaderMode string
+		waiter     map[string]string
 	}{
-		{name: "inherit leader off waiter", leaderIntent: "inherit", waiter: map[string]string{sandboxcfg.NsRestore: `{"prefetch":"off"}`}},
-		{name: "off leader inherit waiter", leaderIntent: "off", waiter: nil},
-		{name: "inherit leader memory waiter", leaderIntent: "inherit", waiter: map[string]string{sandboxcfg.NsRestore: `{"prefetch":"memory"}`}},
-		{name: "memory leader inherit waiter", leaderIntent: "memory", waiter: nil},
-		{name: "off leader memory waiter", leaderIntent: "off", waiter: map[string]string{sandboxcfg.NsRestore: `{"prefetch":"memory"}`}},
-		{name: "memory leader off waiter", leaderIntent: "memory", waiter: map[string]string{sandboxcfg.NsRestore: `{"prefetch":"off"}`}},
+		{name: "off leader memory waiter", leaderMode: "off", waiter: map[string]string{sandboxcfg.NsRestore: `{"prefetch":"memory"}`}},
+		{name: "memory leader off waiter", leaderMode: "memory", waiter: nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			reg := testReg(t)
 			call := &reserveCall{
-				done: make(chan struct{}), restoreIntent: tc.leaderIntent, result: result,
+				done: make(chan struct{}), restoreMode: tc.leaderMode, result: result,
 			}
 			close(call.done)
 			reg.inflight[flightKey("/g", "rk")] = call
@@ -1239,15 +1258,26 @@ func TestReserveSandboxKeepsRestorePolicyDistinctAcrossFlights(t *testing.T) {
 		})
 	}
 
-	reg := testReg(t)
-	call := &reserveCall{done: make(chan struct{}), restoreIntent: "off", result: result}
-	close(call.done)
-	reg.inflight[flightKey("/g", "rk")] = call
-	got, err := reg.ReserveSandbox(context.Background(), "/g", "rk", map[string]string{
-		sandboxcfg.NsRestore: `{}`,
-	})
-	if err != nil || got != result {
-		t.Fatalf("compatible disabled waiter did not join: result=%+v err=%v", got, err)
+	for _, tc := range []struct {
+		name       string
+		leaderMode string
+		waiter     map[string]string
+	}{
+		{name: "absent", leaderMode: "off"},
+		{name: "object", leaderMode: "off", waiter: map[string]string{sandboxcfg.NsRestore: `{}`}},
+		{name: "off", leaderMode: "off", waiter: map[string]string{sandboxcfg.NsRestore: `{"prefetch":"off"}`}},
+		{name: "memory", leaderMode: "memory", waiter: map[string]string{sandboxcfg.NsRestore: `{"prefetch":"memory"}`}},
+	} {
+		t.Run("compatible "+tc.name, func(t *testing.T) {
+			reg := testReg(t)
+			call := &reserveCall{done: make(chan struct{}), restoreMode: tc.leaderMode, result: result}
+			close(call.done)
+			reg.inflight[flightKey("/g", "rk")] = call
+			got, err := reg.ReserveSandbox(context.Background(), "/g", "rk", tc.waiter)
+			if err != nil || got != result {
+				t.Fatalf("compatible disabled waiter did not join: result=%+v err=%v", got, err)
+			}
+		})
 	}
 }
 
@@ -1269,16 +1299,12 @@ func (o *blockingRuntimeOwner) Runtime(ctx context.Context, nodeID string) (*Nod
 
 func TestReserveSandboxReadyFastPathRechecksRestoreFlight(t *testing.T) {
 	for _, tc := range []struct {
-		name         string
-		flightIntent string
-		waiter       map[string]string
+		name       string
+		flightMode string
+		waiter     map[string]string
 	}{
-		{name: "inherit flight off waiter", flightIntent: "inherit", waiter: map[string]string{sandboxcfg.NsRestore: `{"prefetch":"off"}`}},
-		{name: "off flight inherit waiter", flightIntent: "off", waiter: nil},
-		{name: "inherit flight memory waiter", flightIntent: "inherit", waiter: map[string]string{sandboxcfg.NsRestore: `{"prefetch":"memory"}`}},
-		{name: "memory flight inherit waiter", flightIntent: "memory", waiter: nil},
-		{name: "off flight memory waiter", flightIntent: "off", waiter: map[string]string{sandboxcfg.NsRestore: `{"prefetch":"memory"}`}},
-		{name: "memory flight off waiter", flightIntent: "memory", waiter: map[string]string{sandboxcfg.NsRestore: `{"prefetch":"off"}`}},
+		{name: "off flight memory waiter", flightMode: "off", waiter: map[string]string{sandboxcfg.NsRestore: `{"prefetch":"memory"}`}},
+		{name: "memory flight off waiter", flightMode: "memory", waiter: nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
@@ -1313,7 +1339,7 @@ func TestReserveSandboxReadyFastPathRechecksRestoreFlight(t *testing.T) {
 			}
 			reg.mu.Lock()
 			reg.inflight[flightKey("/g", "rk")] = &reserveCall{
-				done: make(chan struct{}), restoreIntent: tc.flightIntent,
+				done: make(chan struct{}), restoreMode: tc.flightMode,
 			}
 			reg.mu.Unlock()
 			close(owner.release)

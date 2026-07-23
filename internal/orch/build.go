@@ -38,10 +38,6 @@ func (o *Orchestrator) newRegisteredBuild(ctx context.Context, apiKey string, sp
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
 	}
-	metadata, err = sandboxcfg.NormalizeRestoreMetadata(metadata)
-	if err != nil {
-		return nil, fmt.Errorf("%w: %v", api.ErrBadRequest, err)
-	}
 	if err := o.validateBuildOptions(builderOpts, false); err != nil {
 		return nil, err
 	}
@@ -111,15 +107,6 @@ func (o *Orchestrator) TriggerBuild(ctx context.Context, apiKey, tid, bid string
 	if err != nil {
 		return fmt.Errorf("%w: %v", api.ErrBadRequest, err)
 	}
-	triggerMeta, err = sandboxcfg.NormalizeRestoreMetadata(triggerMeta)
-	if err != nil {
-		return fmt.Errorf("%w: %v", api.ErrBadRequest, err)
-	}
-	finalMeta := sandboxcfg.MergeMetadata(b.Metadata, triggerMeta) // trigger overrides register
-	finalMeta, err = sandboxcfg.NormalizeRestoreMetadata(finalMeta)
-	if err != nil {
-		return fmt.Errorf("%w: %v", api.ErrBadRequest, err)
-	}
 	// COPY steps need files_storage configured AND the referenced context
 	// already uploaded (client → files endpoint → bucket). Verify both up
 	// front so the build fails fast instead of mid-pipeline.
@@ -172,7 +159,7 @@ func (o *Orchestrator) TriggerBuild(ctx context.Context, apiKey, tid, bid string
 	b.Steps = spec.Steps
 	b.StartCmd = spec.StartCmd
 	b.ReadyCmd = spec.ReadyCmd
-	b.Metadata = finalMeta
+	b.Metadata = sandboxcfg.MergeMetadata(b.Metadata, triggerMeta) // trigger overrides register
 	b.Builder = buildcfg.Merge(b.Builder, triggerBuilder)
 	if err := o.validateBuildOptions(b.Builder, b.FromTemplate != ""); err != nil {
 		return err
@@ -380,7 +367,7 @@ func (o *Orchestrator) BuildPool(ctx context.Context, interval time.Duration) {
 					<-sem
 					continue
 				}
-				o.publishBuildState(b.BuildID, "building", "", "", "")
+				o.publishBuildState(b.BuildID, "building", "", "")
 				go func(b *types.Build) {
 					defer func() { <-sem }()
 					o.executeBuild(ctx, b)
@@ -443,7 +430,7 @@ func (o *Orchestrator) executeBuild(ctx context.Context, b *types.Build) {
 		// and the detail lives in the log, not a duplicated BuildException tail.
 		b.Status, b.Reason = types.BuildError, "build failed; see build logs"
 		_ = o.st.PutBuild(ctx, b)
-		o.publishBuildState(b.BuildID, "error", "", "", b.Reason)
+		o.publishBuildState(b.BuildID, "error", "", b.Reason)
 		o.log.Warn("build failed", "bid", b.BuildID, "err", res.Error)
 		return
 	case err != nil:
@@ -452,14 +439,14 @@ func (o *Orchestrator) executeBuild(ctx context.Context, b *types.Build) {
 		// side error directly, it is the only signal.
 		b.Status, b.Reason = types.BuildError, err.Error()
 		_ = o.st.PutBuild(ctx, b)
-		o.publishBuildState(b.BuildID, "error", "", "", b.Reason)
+		o.publishBuildState(b.BuildID, "error", "", b.Reason)
 		o.log.Warn("build failed", "bid", b.BuildID, "err", err)
 		return
 	}
 	if b.Profile == types.ProfileBare && (res.SnapshotKey != "" || res.StartCmd != "" || res.ReadyCmd != "") {
 		b.Status, b.Reason = types.BuildError, "bare build produced non-image output"
 		_ = o.st.PutBuild(ctx, b)
-		o.publishBuildState(b.BuildID, "error", "", "", b.Reason)
+		o.publishBuildState(b.BuildID, "error", "", b.Reason)
 		return
 	}
 	switch {
@@ -472,7 +459,7 @@ func (o *Orchestrator) executeBuild(ctx context.Context, b *types.Build) {
 	default:
 		b.Status, b.Reason = types.BuildError, "build produced no artifact"
 		_ = o.st.PutBuild(ctx, b)
-		o.publishBuildState(b.BuildID, "error", "", "", b.Reason)
+		o.publishBuildState(b.BuildID, "error", "", b.Reason)
 		return
 	}
 	b.StartCmd, b.ReadyCmd = res.StartCmd, res.ReadyCmd
@@ -480,7 +467,7 @@ func (o *Orchestrator) executeBuild(ctx context.Context, b *types.Build) {
 	b.Names = appendUnique(b.Names, b.PersistID)
 	b.Aliases = appendUnique(b.Aliases, b.PersistID)
 	_ = o.st.PutBuild(ctx, b)
-	o.publishBuildState(b.BuildID, "ready", b.PersistID, b.Metadata[sandboxcfg.NsRestore], "")
+	o.publishBuildState(b.BuildID, "ready", b.PersistID, "")
 	o.log.Info("build ready", "bid", b.BuildID, "template", b.PersistID)
 }
 

@@ -196,16 +196,6 @@ func RestorePrefetchMode(meta map[string]string) (string, error) {
 	return string(mode), nil
 }
 
-// RestorePrefetchIntent preserves whether a create request omitted the restore
-// namespace and therefore intends to inherit a template default. A present
-// empty object and explicit off both select the concrete disabled mode.
-func RestorePrefetchIntent(meta map[string]string) (string, error) {
-	if _, ok := meta[NsRestore]; !ok {
-		return "inherit", nil
-	}
-	return RestorePrefetchMode(meta)
-}
-
 func parseRestore(raw string) (RestoreSpec, error) {
 	var restore RestoreSpec
 	trimmed := strings.TrimSpace(raw)
@@ -283,6 +273,21 @@ func SetCapacity(meta map[string]string, cpu, memoryMiB int) map[string]string {
 // create's config namespaces over a template's. Returns nil when both are empty.
 func MergeMetadata(base, over map[string]string) map[string]string {
 	return mergeStr(base, over)
+}
+
+// MergeCreateMetadata layers request configuration over template, group, or
+// placement defaults while keeping the host restore policy request-scoped.
+// Only an explicitly present restore namespace in request is admitted.
+func MergeCreateMetadata(defaults, request map[string]string) map[string]string {
+	out := mergeStr(defaults, request)
+	delete(out, NsRestore)
+	if raw, ok := request[NsRestore]; ok {
+		if out == nil {
+			out = map[string]string{}
+		}
+		out[NsRestore] = raw
+	}
+	return out
 }
 
 // validate format-checks the tenant network fields (CIDR / IP / MAC).

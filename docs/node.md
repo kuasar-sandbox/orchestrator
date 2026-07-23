@@ -516,8 +516,9 @@ metadata。orchestrator 不判断本地/远程、单层/多层或底层 Prefetch
   快照填),这里只对租户网络做格式校验。
 - **两个注入面**:e2b metadata,与 `X-Kuasar-Sandbox-<Ns>` 请求头(API 边缘归一化进
   metadata,**同名头胜过 metadata 键**)。create 与模板构建(register/trigger)都支持;
-  runtime sandbox 配置存 `sandboxes.metadata_json`,模板默认配置存
+  create 的 runtime sandbox 配置存 `sandboxes.metadata_json`,模板构建的普通 runtime 配置存
   `builds.metadata_json`,build-only 配置存 `builds.builder_json`。
+  `restore` 是例外:只接受 create 请求,不进入模板构建。
   集群下 `create` 命令亦经 metadata 注入 `cluster` 命名空间(§10)。
 - **优先级**:`节点默认 ⊕ 模板配置 ⊕ create 配置`(create 按命名空间胜)。模板配置:snp
   经快照、img 经 `builds.metadata_json`。构建内 `register ⊕ trigger`(trigger 胜);
@@ -528,11 +529,11 @@ metadata。orchestrator 不判断本地/远程、单层/多层或底层 Prefetch
 - **network 随快照**:渲染时把已解析逻辑网络注入
   `SANDBOX_CONFIG.metadata["kuasar-sandbox.network"]`,随 snapshot.cfg 落盘并跨 restore 继承;
   restore 时 serve 读回,填 create 未指定的网络字段(**显式 create 胜**,§8)。迁移
-  token 同样携带 metadata。
-- **restore policy 不随快照**:`kuasar-sandbox.restore` 保存在 sandbox/template metadata。
-  image cold boot 不把它渲染进运行 YAML;snp template create、pause 后 resume 和 migration
-  import 在存在 restore ref 时重新渲染。构建内 `register ⊕ trigger`,实例创建时
-  `template ⊕ create metadata ⊕ create Header`(越靠后优先)。connect/resume 不提供临时覆盖。
+  token 同样携带 metadata。除 host-side restore policy 外,其余命名空间只在冷启生效或
+  已冻入快照,故只 network 需随快照。
+- **restore policy 不随快照或模板**:`kuasar-sandbox.restore` 只由 create 请求写入
+  sandbox metadata。image cold boot 不把它渲染进运行 YAML;snp create、pause 后 resume
+  和 migration import 在存在 restore ref 时重新渲染。connect/resume 不提供临时覆盖。
 - **持久化**:`sandboxes.metadata_json` / `builds.metadata_json` / `builds.builder_json`。
 
 ## 5. 进程管理(systemd 模板单元,启动时自动生成安装)

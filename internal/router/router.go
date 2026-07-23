@@ -117,10 +117,10 @@ type Router struct {
 }
 
 type reserveFlight struct {
-	done          chan struct{}
-	restoreIntent string
-	res           *reserveResult
-	err           error
+	done        chan struct{}
+	restoreMode string
+	res         *reserveResult
+	err         error
 }
 
 type routeRegistry interface {
@@ -338,6 +338,11 @@ func createRestoreMetadata(r *http.Request) (map[string]string, error) {
 	return sandboxcfg.NormalizeRestoreMetadata(restore)
 }
 
+func restoreHeaderValue(header http.Header) (string, bool) {
+	_, present := header[http.CanonicalHeaderKey(HeaderRestore)]
+	return header.Get(HeaderRestore), present
+}
+
 // --- build control plane ---
 
 // buildReserveResult mirrors registry.BuildReserveResult (the registry assigns the
@@ -385,12 +390,7 @@ func (rt *Router) handleBuildRegister(w http.ResponseWriter, r *http.Request) {
 	if body.CPUCount > 0 || body.MemoryMB > 0 {
 		resources = &buildResources{CPU: body.CPUCount * 1000, Mem: int64(body.MemoryMB) << 20}
 	}
-	restore, err := restoreHeaderMetadata(r.Header)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	res, err := rt.routeLinkReserveBuild(r.Context(), group, profile, resources, restore)
+	res, err := rt.routeLinkReserveBuild(r.Context(), group, profile, resources)
 	if err != nil {
 		rt.log.Warn("router: reserve-build", "group", group, "err", err)
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
@@ -406,19 +406,6 @@ func (rt *Router) handleBuildRegister(w http.ResponseWriter, r *http.Request) {
 		"public": false, "names": nonEmptySlice(body.Name), "tags": body.Tags, "aliases": body.Tags,
 		"profile": res.Profile,
 	})
-}
-
-func restoreHeaderMetadata(header http.Header) (map[string]string, error) {
-	raw, present := restoreHeaderValue(header)
-	if !present {
-		return nil, nil
-	}
-	return sandboxcfg.NormalizeRestoreMetadata(map[string]string{sandboxcfg.NsRestore: raw})
-}
-
-func restoreHeaderValue(header http.Header) (string, bool) {
-	_, present := header[http.CanonicalHeaderKey(HeaderRestore)]
-	return header.Get(HeaderRestore), present
 }
 
 // buildResources mirrors routesync.BuildResources for the control request body.
@@ -1042,14 +1029,14 @@ func (rt *Router) routeLinkReserve(ctx context.Context, group, routeKey string, 
 }
 
 func (rt *Router) reserveByKey(ctx context.Context, group, routeKey string, config map[string]string) (*reserveResult, error) {
-	restoreIntent, err := sandboxcfg.RestorePrefetchIntent(config)
+	restoreMode, err := sandboxcfg.RestorePrefetchMode(config)
 	if err != nil {
 		return nil, err
 	}
 	key := routeCacheKey(group, routeKey)
 	rt.reserveMu.Lock()
 	if f := rt.reserveInFlight[key]; f != nil {
-		if f.restoreIntent != restoreIntent {
+		if f.restoreMode != restoreMode {
 			rt.reserveMu.Unlock()
 			return nil, errReserveRestoreConflict
 		}
@@ -1061,7 +1048,7 @@ func (rt *Router) reserveByKey(ctx context.Context, group, routeKey string, conf
 			return nil, ctx.Err()
 		}
 	}
-	f := &reserveFlight{done: make(chan struct{}), restoreIntent: restoreIntent}
+	f := &reserveFlight{done: make(chan struct{}), restoreMode: restoreMode}
 	rt.reserveInFlight[key] = f
 	rt.reserveMu.Unlock()
 
@@ -1082,9 +1069,9 @@ func (rt *Router) reserveByKey(ctx context.Context, group, routeKey string, conf
 	return f.res, f.err
 }
 
-func (rt *Router) routeLinkReserveBuild(ctx context.Context, group string, profile types.Profile, resources *buildResources, metadata map[string]string) (*buildReserveResult, error) {
+func (rt *Router) routeLinkReserveBuild(ctx context.Context, group string, profile types.Profile, resources *buildResources) (*buildReserveResult, error) {
 	reqBody, _ := json.Marshal(map[string]any{
-		"group": group, "build_id": "bld-" + randomHexID(), "template_id": "transient-" + randomHexID(), "profile": profile, "resources": resources, "metadata": metadata,
+		"group": group, "build_id": "bld-" + randomHexID(), "template_id": "transient-" + randomHexID(), "profile": profile, "resources": resources,
 	})
 	resp, err := rt.routeLinkHTTP(ctx, group, http.MethodPost, registry.RouteLinkReserveBuildPath, reqBody, map[string]string{"Content-Type": "application/json"})
 	if err != nil {

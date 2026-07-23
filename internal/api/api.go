@@ -30,10 +30,12 @@ var configHeaderNs = []struct{ header, metaKey string }{
 	{"X-Kuasar-Sandbox-Mounts", sandboxcfg.NsMounts},
 	{"X-Kuasar-Sandbox-Files", sandboxcfg.NsFiles},
 	{"X-Kuasar-Sandbox-Metadata", sandboxcfg.NsMetadata},
-	{"X-Kuasar-Sandbox-Restore", sandboxcfg.NsRestore},
 }
 
-const builderHeader = "X-Kuasar-Sandbox-Builder"
+const (
+	builderHeader = "X-Kuasar-Sandbox-Builder"
+	restoreHeader = "X-Kuasar-Sandbox-Restore"
+)
 
 // pickInt returns a if non-zero, else b (camelCase vs snake_case e2b field aliases).
 func pickInt(a, b int) int {
@@ -50,19 +52,26 @@ func mergeConfigHeaders(meta map[string]string, h http.Header) map[string]string
 	for _, m := range configHeaderNs {
 		v := h.Get(m.header)
 		if v == "" {
-			// An explicitly present restore header is still an input value: carry
-			// an empty value to the strict restore parser so it is rejected rather
-			// than silently falling back to body metadata or a template default.
-			_, present := h[http.CanonicalHeaderKey(m.header)]
-			if m.metaKey != sandboxcfg.NsRestore || !present {
-				continue
-			}
+			continue
 		}
 		if meta == nil {
 			meta = map[string]string{}
 		}
 		meta[m.metaKey] = v
 	}
+	return meta
+}
+
+func mergeCreateConfigHeaders(meta map[string]string, h http.Header) map[string]string {
+	meta = mergeConfigHeaders(meta, h)
+	_, present := h[http.CanonicalHeaderKey(restoreHeader)]
+	if !present {
+		return meta
+	}
+	if meta == nil {
+		meta = map[string]string{}
+	}
+	meta[sandboxcfg.NsRestore] = h.Get(restoreHeader)
 	return meta
 }
 
@@ -274,7 +283,7 @@ func (a *API) create(w http.ResponseWriter, r *http.Request) {
 	req.APIKey = apiKeyFrom(r.Context())
 	// Headers are an alternate config-injection surface; fold them into the e2b
 	// metadata (header wins) so the orchestrator sees one uniform carrier.
-	req.Metadata = mergeConfigHeaders(req.Metadata, r.Header)
+	req.Metadata = mergeCreateConfigHeaders(req.Metadata, r.Header)
 	sb, err := a.core.Create(r.Context(), req)
 	if err != nil {
 		a.fail(w, err)
