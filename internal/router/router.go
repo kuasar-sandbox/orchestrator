@@ -41,6 +41,8 @@ const (
 	HeaderRestore   = "X-Kuasar-Sandbox-Restore"
 	HeaderAPIKey    = "X-API-KEY"
 	HeaderAccessTok = "X-Access-Token"
+
+	maxClusterCreateBodyBytes int64 = 16 << 20
 )
 
 // reserveResult / routeResolve mirror registry route_link JSON.
@@ -272,9 +274,14 @@ func (rt *Router) handleCreate(w http.ResponseWriter, r *http.Request) {
 	if routeKey == "" {
 		routeKey = newRouteKey()
 	}
-	restore, err := createRestoreMetadata(r)
+	restore, err := createRestoreMetadata(w, r)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		status := http.StatusBadRequest
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			status = http.StatusRequestEntityTooLarge
+		}
+		http.Error(w, err.Error(), status)
 		return
 	}
 	res, err := rt.reserveByKey(r.Context(), group, routeKey, restore)
@@ -304,26 +311,34 @@ func (rt *Router) handleCreate(w http.ResponseWriter, r *http.Request) {
 }
 
 // createRestoreMetadata narrows cluster create input to the one supported
-// sandbox policy. Body metadata is read first and the dedicated header wins.
-func createRestoreMetadata(r *http.Request) (map[string]string, error) {
+// sandbox policy. The dedicated header is a no-body-read fast path; without it,
+// body metadata is inspected within the cluster create body limit.
+func createRestoreMetadata(w http.ResponseWriter, r *http.Request) (map[string]string, error) {
+	if raw, present := restoreHeaderValue(r.Header); present {
+		return sandboxcfg.NormalizeRestoreMetadata(map[string]string{sandboxcfg.NsRestore: raw})
+	}
 	var body struct {
 		Metadata map[string]string `json:"metadata"`
 	}
 	if r.Body != nil {
+		if r.ContentLength > maxClusterCreateBodyBytes {
+			return nil, &http.MaxBytesError{Limit: maxClusterCreateBodyBytes}
+		}
+		r.Body = http.MaxBytesReader(w, r.Body, maxClusterCreateBodyBytes)
 		err := json.NewDecoder(r.Body).Decode(&body)
 		if err != nil && !errors.Is(err, io.EOF) {
+			return nil, fmt.Errorf("bad create body: %w", err)
+		}
+		// Decode stops after the first complete JSON value. Drain the bounded
+		// reader so trailing bytes count toward the advertised body limit while
+		// preserving the endpoint's existing single-value decode semantics.
+		if _, err := io.Copy(io.Discard, r.Body); err != nil {
 			return nil, fmt.Errorf("bad create body: %w", err)
 		}
 	}
 	var restore map[string]string
 	if raw, ok := body.Metadata[sandboxcfg.NsRestore]; ok {
 		restore = map[string]string{sandboxcfg.NsRestore: raw}
-	}
-	if raw, present := restoreHeaderValue(r.Header); present {
-		if restore == nil {
-			restore = map[string]string{}
-		}
-		restore[sandboxcfg.NsRestore] = raw
 	}
 	return sandboxcfg.NormalizeRestoreMetadata(restore)
 }

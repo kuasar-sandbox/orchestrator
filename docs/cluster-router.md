@@ -109,7 +109,8 @@ router 不参与 registry 成员健康检测,不订阅 route,也不订阅 node_l
 create 可在 body metadata 中携 `kuasar-sandbox.restore`,或使用
 `X-Kuasar-Sandbox-Restore`;同一请求 Header 胜出。router 只提取该命名空间,不会把
 Prefetch 变成 template、group 或节点统一策略。未提供、`{}` 与显式 `off` 均为关闭;
-只有本次 create 显式提供 `memory` 才启用。
+只有本次 create 显式提供 `memory` 才启用。Header 存在时 router 不读取 create body;
+未提供 Header 时 create body 上限为 16 MiB,超限返回 **413**。
 
 ## 6. 缓存模型
 

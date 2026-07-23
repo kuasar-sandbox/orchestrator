@@ -3,6 +3,7 @@ package router
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -36,7 +37,7 @@ func TestCreateRestoreMetadataHeaderWinsAndNarrows(t *testing.T) {
 	))
 	req.Header.Set(HeaderRestore, ` { "prefetch": "off" } `)
 
-	got, err := createRestoreMetadata(req)
+	got, err := createRestoreMetadata(httptest.NewRecorder(), req)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -49,7 +50,7 @@ func TestCreateRestoreMetadataRejectsInvalidPolicy(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/sandboxes", strings.NewReader(
 		`{"metadata":{"kuasar-sandbox.restore":"{\"prefetch\":\"disk\"}"}}`,
 	))
-	if _, err := createRestoreMetadata(req); err == nil {
+	if _, err := createRestoreMetadata(httptest.NewRecorder(), req); err == nil {
 		t.Fatal("invalid restore prefetch should be rejected")
 	}
 }
@@ -59,7 +60,7 @@ func TestCreateRestoreMetadataEmptyHeaderOverridesBodyAndRejects(t *testing.T) {
 		`{"metadata":{"kuasar-sandbox.restore":"{\"prefetch\":\"memory\"}"}}`,
 	))
 	req.Header.Set(HeaderRestore, "")
-	if _, err := createRestoreMetadata(req); err == nil {
+	if _, err := createRestoreMetadata(httptest.NewRecorder(), req); err == nil {
 		t.Fatal("an explicitly empty restore header should override body metadata and be rejected")
 	}
 }
@@ -71,12 +72,91 @@ func TestCreateRestoreMetadataAcceptsBodyPastOneMiB(t *testing.T) {
 		t.Fatal("test body must be valid JSON with restore metadata after 1 MiB")
 	}
 	req := httptest.NewRequest(http.MethodPost, "/sandboxes", strings.NewReader(body))
-	got, err := createRestoreMetadata(req)
+	got, err := createRestoreMetadata(httptest.NewRecorder(), req)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(got) != 1 || got["kuasar-sandbox.restore"] != `{"prefetch":"memory"}` {
 		t.Fatalf("restore metadata=%v", got)
+	}
+}
+
+type failOnRead struct{ read bool }
+
+func (r *failOnRead) Read([]byte) (int, error) {
+	r.read = true
+	return 0, errors.New("body must not be read")
+}
+
+type fillReader byte
+
+func (r fillReader) Read(p []byte) (int, error) {
+	for i := range p {
+		p[i] = byte(r)
+	}
+	return len(p), nil
+}
+
+func TestCreateRestoreMetadataHeaderBypassesBody(t *testing.T) {
+	body := &failOnRead{}
+	req := httptest.NewRequest(http.MethodPost, "/sandboxes", nil)
+	req.Body = io.NopCloser(body)
+	req.ContentLength = maxClusterCreateBodyBytes + 1
+	req.Header.Set(HeaderRestore, `{"prefetch":"memory"}`)
+
+	got, err := createRestoreMetadata(httptest.NewRecorder(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if body.read {
+		t.Fatal("restore header path read the create body")
+	}
+	if len(got) != 1 || got["kuasar-sandbox.restore"] != `{"prefetch":"memory"}` {
+		t.Fatalf("restore metadata=%v", got)
+	}
+}
+
+func TestHandleCreateRejectsBodyPast16MiBWithoutHeader(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/sandboxes", strings.NewReader(`{}`))
+	req.ContentLength = maxClusterCreateBodyBytes + 1
+	req.Header.Set(HeaderGroup, "/g")
+	rec := httptest.NewRecorder()
+
+	(&Router{authMode: "off"}).handleCreate(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status=%d body=%q, want 413", rec.Code, rec.Body.String())
+	}
+}
+
+func sizedJSONBody(size int64) io.Reader {
+	return io.MultiReader(
+		strings.NewReader(`{}`),
+		io.LimitReader(fillReader(' '), size-2),
+	)
+}
+
+func TestCreateRestoreMetadataAcceptsExact16MiBChunkedBody(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/sandboxes", nil)
+	req.Body = io.NopCloser(sizedJSONBody(maxClusterCreateBodyBytes))
+	req.ContentLength = -1
+
+	if _, err := createRestoreMetadata(httptest.NewRecorder(), req); err != nil {
+		t.Fatalf("exact-limit body rejected: %v", err)
+	}
+}
+
+func TestHandleCreateRejectsChunkedBodyPast16MiBWithoutHeader(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/sandboxes", nil)
+	req.Body = io.NopCloser(sizedJSONBody(maxClusterCreateBodyBytes + 1))
+	req.ContentLength = -1
+	req.Header.Set(HeaderGroup, "/g")
+	rec := httptest.NewRecorder()
+
+	(&Router{authMode: "off"}).handleCreate(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status=%d body=%q, want 413", rec.Code, rec.Body.String())
 	}
 }
 
