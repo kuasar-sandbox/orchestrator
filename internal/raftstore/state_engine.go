@@ -247,6 +247,7 @@ func metadataFromDataState(state DataState) dataStateMetadata {
 	}
 	if state.Recovery != nil {
 		recovery := *state.Recovery
+		recovery.TerminalResetSessions = cloneUint64Map(state.Recovery.TerminalResetSessions)
 		metadata.Recovery = &recovery
 	}
 	return metadata
@@ -272,6 +273,7 @@ func (m dataStateMetadata) dataState() DataState {
 	}
 	if m.Recovery != nil {
 		recovery := *m.Recovery
+		recovery.TerminalResetSessions = cloneUint64Map(m.Recovery.TerminalResetSessions)
 		state.Recovery = &recovery
 	}
 	return state

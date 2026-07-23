@@ -139,6 +139,44 @@ func TestDataRecoveryNodeStagingResetReplacesPartialReport(t *testing.T) {
 	}
 }
 
+func TestTerminalRecoveryResetRejectsLateReportSession(t *testing.T) {
+	source := testRegistryLayout(4, "generation-source-terminal-reset")
+	target := testRegistryLayout(4, "generation-target-terminal-reset")
+	group, routeKey := "/recovery", "terminal-reset"
+	state, initial := initializedRouteShard(t, target, group, routeKey)
+	recovery, identity, _ := beginRecoveryFixture(t, &state, initial, source, target, 2)
+	record := recoveryRouteRecord(t, source, target, recovery, group, routeKey, "sandbox-old", "report-old")
+	applyDataOK(t, &state, 3, DataCommand{Type: DataStageRecovery, Identity: identity, RecoveryRecord: &record})
+	applyDataOK(t, &state, 4, DataCommand{
+		Type: DataResetRecoveryNode, Identity: identity,
+		RecoveryReset: &RecoveryNodeStagingReset{
+			RecoveryEpoch: recovery.RecoveryEpoch, NodeID: record.NodeID,
+			NodeEpoch: record.NodeEpoch, SessionSeq: record.SessionSeq, Terminal: true,
+		},
+	})
+	if len(state.RecoveryRecords) != 0 ||
+		state.Recovery.TerminalResetSessions[recoveryNodeIdentityKey(record.NodeID, record.NodeEpoch)] != record.SessionSeq {
+		t.Fatalf("terminal reset state = %+v", state.Recovery)
+	}
+	late := ApplyDataCommand(&state, 5, DataCommand{
+		Type: DataStageRecovery, Identity: identity, RecoveryRecord: &record,
+	})
+	if !late.Conflict || len(state.RecoveryRecords) != 0 {
+		t.Fatalf("late terminally reset report = %+v, records=%d", late, len(state.RecoveryRecords))
+	}
+
+	newer := record
+	newer.SessionSeq++
+	newer.ReportDigest = digestFor("report-newer")
+	applyDataOK(t, &state, 6, DataCommand{Type: DataStageRecovery, Identity: identity, RecoveryRecord: &newer})
+	if len(state.RecoveryRecords) != 1 {
+		t.Fatalf("newer report was not staged: %+v", state.RecoveryRecords)
+	}
+	if err := state.Validate(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestDataRecoveryRebindProjectionRetryIsExactlyIdempotent(t *testing.T) {
 	source := testRegistryLayout(4, "generation-source-retry")
 	target := testRegistryLayout(4, "generation-target-retry")

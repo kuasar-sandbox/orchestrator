@@ -42,12 +42,13 @@ func DefaultRecoveryCoordinatorConfig() RecoveryCoordinatorConfig {
 }
 
 type RecoveryCoordinator struct {
-	store     *RaftStore
-	mesh      *RecoveryMesh
-	directory *session.Directory
-	commands  RecoveryCommandSender
-	config    RecoveryCoordinatorConfig
-	log       *slog.Logger
+	store       *RaftStore
+	mesh        *RecoveryMesh
+	directory   *session.Directory
+	commands    RecoveryCommandSender
+	config      RecoveryCoordinatorConfig
+	log         *slog.Logger
+	operationMu sync.Mutex
 }
 
 func NewRecoveryCoordinator(
@@ -110,6 +111,12 @@ func (c *RecoveryCoordinator) Run(ctx context.Context) error {
 }
 
 func (c *RecoveryCoordinator) Step(ctx context.Context) error {
+	c.operationMu.Lock()
+	defer c.operationMu.Unlock()
+	return c.step(ctx)
+}
+
+func (c *RecoveryCoordinator) step(ctx context.Context) error {
 	leader, err := c.store.LocalRecoveryCoordinator()
 	if err != nil || !leader {
 		return err
@@ -131,6 +138,162 @@ func (c *RecoveryCoordinator) Step(ctx context.Context) error {
 	default:
 		return errors.New("controlplane: unknown recovery phase")
 	}
+}
+
+func (c *RecoveryCoordinator) ResolveRecoveryNode(ctx context.Context, request ResolveRecoveryNodeRequest) error {
+	c.operationMu.Lock()
+	defer c.operationMu.Unlock()
+
+	leader, err := c.store.LocalRecoveryCoordinator()
+	if err != nil {
+		return err
+	}
+	if !leader {
+		return errors.New("controlplane: recovery node resolution requires the local System Group leader")
+	}
+	state, err := c.store.ReadSystem(ctx)
+	if err != nil {
+		return err
+	}
+	if !operatorRegistryServeIdentityMatches(state, request.RegistryServeIdentity) || state.Recovery == nil {
+		return errors.New("controlplane: recovery node resolution targets another epoch")
+	}
+	progress, found := state.Recovery.Nodes[request.NodeID]
+	if !found {
+		return errors.New("controlplane: recovery node is not expected")
+	}
+
+	switch request.Resolution {
+	case string(raftstore.RecoveryNodeMissing):
+		return c.resolveRecoveryNodeMissing(ctx, *state.Recovery, progress, request)
+	case string(raftstore.RecoveryNodeQuarantined):
+		return c.resolveRecoveryNodeQuarantined(ctx, *state.Recovery, progress, request)
+	default:
+		return errors.New("controlplane: recovery resolution must be MISSING or QUARANTINED")
+	}
+}
+
+func (c *RecoveryCoordinator) resolveRecoveryNodeMissing(
+	ctx context.Context,
+	recovery raftstore.RecoveryEpoch,
+	progress raftstore.RecoveryNodeProgress,
+	request ResolveRecoveryNodeRequest,
+) error {
+	if progress.State == raftstore.RecoveryNodeMissing {
+		if progress.ResolutionProofDigest == request.ProofDigest && progress.ResolutionReason == request.Reason {
+			return nil
+		}
+		return errors.New("controlplane: recovery node was resolved MISSING with different evidence")
+	}
+	if progress.State != raftstore.RecoveryNodeExpected && progress.State != raftstore.RecoveryNodeCollecting {
+		return errors.New("controlplane: only an unreported node can be resolved MISSING")
+	}
+	if progress.State == raftstore.RecoveryNodeCollecting {
+		reset := raftstore.RecoveryNodeStagingReset{
+			RecoveryEpoch: recovery.Epoch, NodeID: progress.NodeID, NodeEpoch: progress.NodeEpoch,
+			SessionSeq: progress.SessionSeq, Terminal: true,
+		}
+		if err := c.forEachShard(ctx, func(ctx context.Context, shardID uint32) error {
+			result, err := c.mesh.Apply(ctx, raftstore.DataCommand{
+				Type: raftstore.DataResetRecoveryNode,
+				Identity: raftstore.ShardRequestIdentity{
+					PermitIdentity: recoveryPermitIdentity(recovery), ShardID: shardID,
+				},
+				RecoveryReset: &reset,
+			})
+			return recoveryApplyError(result, err)
+		}); err != nil {
+			return err
+		}
+	}
+	if err := c.verifyRecoveryNodeProgress(ctx, recovery, progress); err != nil {
+		return err
+	}
+	return c.store.UpdateRecoveryNode(ctx, raftstore.RecoveryNodeUpdate{
+		NodeID: progress.NodeID, EnrollmentID: progress.EnrollmentID, NodeEpoch: progress.NodeEpoch,
+		From: progress.State, To: raftstore.RecoveryNodeMissing,
+		ResolutionProofDigest: request.ProofDigest, ResolutionReason: request.Reason,
+	})
+}
+
+func (c *RecoveryCoordinator) resolveRecoveryNodeQuarantined(
+	ctx context.Context,
+	recovery raftstore.RecoveryEpoch,
+	progress raftstore.RecoveryNodeProgress,
+	request ResolveRecoveryNodeRequest,
+) error {
+	if progress.State == raftstore.RecoveryNodeQuarantined {
+		if progress.ResolutionProofDigest == request.ProofDigest && progress.ResolutionReason == request.Reason {
+			return nil
+		}
+		return errors.New("controlplane: recovery node was resolved QUARANTINED with different evidence")
+	}
+	if progress.State != raftstore.RecoveryNodeReported {
+		return errors.New("controlplane: only a complete report can be quarantined")
+	}
+	records := make([]locatedRecoveryRecord, 0)
+	var recordsMu sync.Mutex
+	if err := c.forEachRecoveryRecord(ctx, recovery, func(_ context.Context, located locatedRecoveryRecord) error {
+		if located.record.NodeID != progress.NodeID {
+			return nil
+		}
+		if located.record.NodeEpoch != progress.NodeEpoch || located.record.SessionSeq != progress.SessionSeq ||
+			located.record.ReportDigest != progress.ReportDigest {
+			return errors.New("recovery record does not match the reported node identity")
+		}
+		if located.record.State == raftstore.RecoveryObjectActivated {
+			return errors.New("an activated recovery projection cannot be retracted by node quarantine")
+		}
+		recordsMu.Lock()
+		records = append(records, located)
+		recordsMu.Unlock()
+		return nil
+	}); err != nil {
+		return err
+	}
+	if uint64(len(records)) != progress.ReportedObjects {
+		return fmt.Errorf(
+			"controlplane: recovery node report contains %d objects but %d exact records were found",
+			progress.ReportedObjects,
+			len(records),
+		)
+	}
+	for _, located := range records {
+		if err := c.quarantineObject(ctx, recovery, located, request.Reason); err != nil {
+			return err
+		}
+	}
+	if err := c.verifyRecoveryNodeProgress(ctx, recovery, progress); err != nil {
+		return err
+	}
+	return c.store.UpdateRecoveryNode(ctx, raftstore.RecoveryNodeUpdate{
+		NodeID: progress.NodeID, EnrollmentID: progress.EnrollmentID, NodeEpoch: progress.NodeEpoch,
+		From: raftstore.RecoveryNodeReported, To: raftstore.RecoveryNodeQuarantined,
+		SessionSeq: progress.SessionSeq, ReportDigest: progress.ReportDigest,
+		ReportedObjects: progress.ReportedObjects, ConflictObjects: progress.ReportedObjects,
+		ResolutionProofDigest: request.ProofDigest, ResolutionReason: request.Reason,
+	})
+}
+
+func (c *RecoveryCoordinator) verifyRecoveryNodeProgress(
+	ctx context.Context,
+	recovery raftstore.RecoveryEpoch,
+	want raftstore.RecoveryNodeProgress,
+) error {
+	state, err := c.store.ReadSystem(ctx)
+	if err != nil {
+		return err
+	}
+	if state.Recovery == nil || state.Recovery.Epoch != recovery.Epoch {
+		return errors.New("controlplane: recovery epoch changed during node resolution")
+	}
+	current, found := state.Recovery.Nodes[want.NodeID]
+	if !found || current.NodeID != want.NodeID || current.EnrollmentID != want.EnrollmentID ||
+		current.NodeEpoch != want.NodeEpoch || current.SessionSeq != want.SessionSeq || current.State != want.State ||
+		current.ReportDigest != want.ReportDigest || current.ReportedObjects != want.ReportedObjects {
+		return errors.New("controlplane: recovery node progress changed during resolution")
+	}
+	return nil
 }
 
 func (c *RecoveryCoordinator) prepare(ctx context.Context, recovery raftstore.RecoveryEpoch) error {

@@ -186,7 +186,20 @@ func runRegistry(args []string, log *slog.Logger) error {
 	if err := runtime.SetOutboxAckVerifier(service); err != nil {
 		return err
 	}
-	operator, err := controlplane.NewOperatorService(store, mesh)
+	recoveryConfig := controlplane.DefaultRecoveryCoordinatorConfig()
+	recoveryConfig.Interval = recoveryScan
+	recoveryConfig.Workers = config.Workflow.RecoveryWorkers
+	recoveryConfig.PerNodeWorkers = config.Workflow.RecoveryPerNodeWorkers
+	recoveryConfig.PageObjects = config.Workflow.RecoveryPageObjects
+	recoveryConfig.PageBytes = config.Workflow.RecoveryPageBytes
+	recoveryConfig.MaxNodeReportBytes = config.Workflow.RecoveryMaxReportBytes
+	recoveryConfig.BytesPerSecond = config.Workflow.RecoveryBytesPerSecond
+	recoveryConfig.LookupPage = config.Workflow.RecoveryLookupPage
+	recovery, err := controlplane.NewRecoveryCoordinator(store, recoveryMesh, directory, mesh, recoveryConfig, log)
+	if err != nil {
+		return err
+	}
+	operator, err := controlplane.NewOperatorService(store, mesh, recovery)
 	if err != nil {
 		return err
 	}
@@ -230,19 +243,6 @@ func runRegistry(args []string, log *slog.Logger) error {
 	mux.Handle(routesync.NodeLinkPath, transportauth.Middleware(transportauth.RoleNode, nodeLink))
 
 	go mesh.Run(ctx, config.AntiEntropyDuration())
-	recoveryConfig := controlplane.DefaultRecoveryCoordinatorConfig()
-	recoveryConfig.Interval = recoveryScan
-	recoveryConfig.Workers = config.Workflow.RecoveryWorkers
-	recoveryConfig.PerNodeWorkers = config.Workflow.RecoveryPerNodeWorkers
-	recoveryConfig.PageObjects = config.Workflow.RecoveryPageObjects
-	recoveryConfig.PageBytes = config.Workflow.RecoveryPageBytes
-	recoveryConfig.MaxNodeReportBytes = config.Workflow.RecoveryMaxReportBytes
-	recoveryConfig.BytesPerSecond = config.Workflow.RecoveryBytesPerSecond
-	recoveryConfig.LookupPage = config.Workflow.RecoveryLookupPage
-	recovery, err := controlplane.NewRecoveryCoordinator(store, recoveryMesh, directory, mesh, recoveryConfig, log)
-	if err != nil {
-		return err
-	}
 	reportBackgroundError := func(component string, runErr error) {
 		if ctx.Err() != nil {
 			return

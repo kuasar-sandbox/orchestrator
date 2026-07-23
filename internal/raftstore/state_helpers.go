@@ -46,6 +46,19 @@ func cloneDataStateForLookup(state DataState) DataState {
 	clone.PreparedReplicaIDs = append([]uint64(nil), state.PreparedReplicaIDs...)
 	clone.ServingEpochs = append([]PermitIdentity(nil), state.ServingEpochs...)
 	clone.RouteChanges = append([]RouteChange(nil), state.RouteChanges...)
+	if state.Recovery != nil {
+		recovery := *state.Recovery
+		recovery.TerminalResetSessions = cloneUint64Map(state.Recovery.TerminalResetSessions)
+		clone.Recovery = &recovery
+	}
+	clone.RecoveryRecords = make(map[string]RecoveryObjectRecord, len(state.RecoveryRecords))
+	for key, record := range state.RecoveryRecords {
+		clone.RecoveryRecords[key] = cloneRecoveryRecord(record)
+	}
+	clone.RecoveryClaims = make(map[string]string, len(state.RecoveryClaims))
+	for key, owner := range state.RecoveryClaims {
+		clone.RecoveryClaims[key] = owner
+	}
 	clone.Routes = make(map[string]clusterstate.RouteWorkflowRecord, len(state.Routes))
 	for key, record := range state.Routes {
 		clone.Routes[key] = cloneRouteRecord(record)

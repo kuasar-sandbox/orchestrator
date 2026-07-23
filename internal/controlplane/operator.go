@@ -84,19 +84,28 @@ type CloseRegistryGenerationResponse struct {
 }
 
 type OperatorService struct {
-	store   *RaftStore
-	retirer IdentityRetirer
+	store            *RaftStore
+	retirer          IdentityRetirer
+	recoveryResolver RecoveryNodeResolver
 }
 
 type IdentityRetirer interface {
 	RetireIdentity(context.Context, session.IdentityRetirement) (bool, error)
 }
 
-func NewOperatorService(store *RaftStore, retirer IdentityRetirer) (*OperatorService, error) {
-	if store == nil || retirer == nil {
-		return nil, errors.New("controlplane: operator service requires consensus and Session retirement")
+type RecoveryNodeResolver interface {
+	ResolveRecoveryNode(context.Context, ResolveRecoveryNodeRequest) error
+}
+
+func NewOperatorService(
+	store *RaftStore,
+	retirer IdentityRetirer,
+	recoveryResolver RecoveryNodeResolver,
+) (*OperatorService, error) {
+	if store == nil || retirer == nil || recoveryResolver == nil {
+		return nil, errors.New("controlplane: operator service requires consensus, Session retirement, and recovery resolution")
 	}
-	return &OperatorService{store: store, retirer: retirer}, nil
+	return &OperatorService{store: store, retirer: retirer, recoveryResolver: recoveryResolver}, nil
 }
 
 func (s *OperatorService) EnrollNode(ctx context.Context, request EnrollNodeRequest) error {
@@ -153,38 +162,12 @@ func (s *OperatorService) ResolveRecoveryNode(ctx context.Context, request Resol
 		request.ProofDigest == "" || request.Reason == "" {
 		return errors.New("controlplane: incomplete recovery node resolution")
 	}
-	state, err := s.store.ReadSystem(ctx)
-	if err != nil {
-		return err
-	}
-	if !operatorRegistryServeIdentityMatches(state, request.RegistryServeIdentity) || state.Recovery == nil {
-		return errors.New("controlplane: recovery node resolution targets another epoch")
-	}
-	progress, found := state.Recovery.Nodes[request.NodeID]
-	if !found {
-		return errors.New("controlplane: recovery node is not expected")
-	}
-	update := raftstore.RecoveryNodeUpdate{
-		NodeID: progress.NodeID, EnrollmentID: progress.EnrollmentID, NodeEpoch: progress.NodeEpoch,
-		From: progress.State, ResolutionProofDigest: request.ProofDigest, ResolutionReason: request.Reason,
-	}
 	switch request.Resolution {
-	case string(raftstore.RecoveryNodeMissing):
-		if progress.State != raftstore.RecoveryNodeExpected && progress.State != raftstore.RecoveryNodeCollecting {
-			return errors.New("controlplane: only an unreported node can be resolved MISSING")
-		}
-		update.To = raftstore.RecoveryNodeMissing
-	case string(raftstore.RecoveryNodeQuarantined):
-		if progress.State != raftstore.RecoveryNodeReported {
-			return errors.New("controlplane: only a complete report can be quarantined")
-		}
-		update.To = raftstore.RecoveryNodeQuarantined
-		update.SessionSeq, update.ReportDigest = progress.SessionSeq, progress.ReportDigest
-		update.ReportedObjects, update.ConflictObjects = progress.ReportedObjects, progress.ReportedObjects
+	case string(raftstore.RecoveryNodeMissing), string(raftstore.RecoveryNodeQuarantined):
 	default:
 		return errors.New("controlplane: recovery resolution must be MISSING or QUARANTINED")
 	}
-	return s.store.UpdateRecoveryNode(ctx, update)
+	return s.recoveryResolver.ResolveRecoveryNode(ctx, request)
 }
 
 func (s *OperatorService) FenceRoute(ctx context.Context, request FenceRouteRequest) error {

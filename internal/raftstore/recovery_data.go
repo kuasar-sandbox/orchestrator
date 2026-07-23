@@ -5,16 +5,19 @@ import (
 	"fmt"
 	"reflect"
 	"sort"
+	"strconv"
+	"strings"
 
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 )
 
 type DataRecoveryState struct {
-	RecoveryEpoch              uint64         `json:"recovery_epoch"`
-	SourceClusterID            string         `json:"source_cluster_id"`
-	SourceRegistryGeneration   string         `json:"source_registry_generation"`
-	SourceRegistryLayoutDigest string         `json:"source_registry_layout_digest"`
-	Target                     PermitIdentity `json:"target"`
+	RecoveryEpoch              uint64            `json:"recovery_epoch"`
+	SourceClusterID            string            `json:"source_cluster_id"`
+	SourceRegistryGeneration   string            `json:"source_registry_generation"`
+	SourceRegistryLayoutDigest string            `json:"source_registry_layout_digest"`
+	Target                     PermitIdentity    `json:"target"`
+	TerminalResetSessions      map[string]uint64 `json:"terminal_reset_sessions,omitempty"`
 }
 
 func (r DataRecoveryState) Validate(state DataState) error {
@@ -27,6 +30,12 @@ func (r DataRecoveryState) Validate(state DataState) error {
 	if len(state.ServingEpochs) != 1 || r.RecoveryEpoch != state.ServingEpochs[0].SystemEpoch+1 ||
 		r.Target.RegistryLayoutDigest != state.ServingEpochs[0].RegistryLayoutDigest {
 		return errors.New("raftstore: data-shard recovery does not follow its initialized target Registry History Generation")
+	}
+	for key, sessionSeq := range r.TerminalResetSessions {
+		nodeID, nodeEpoch, ok := parseRecoveryNodeIdentityKey(key)
+		if !ok || nodeID == "" || nodeEpoch == 0 || sessionSeq == 0 {
+			return errors.New("raftstore: invalid terminal recovery reset watermark")
+		}
 	}
 	return nil
 }
@@ -218,6 +227,7 @@ type RecoveryNodeStagingReset struct {
 	NodeID        string `json:"node_id"`
 	NodeEpoch     uint64 `json:"node_epoch"`
 	SessionSeq    uint64 `json:"session_seq"`
+	Terminal      bool   `json:"terminal,omitempty"`
 }
 
 func (r RecoveryNodeStagingReset) Validate(recovery DataRecoveryState) error {
@@ -228,7 +238,7 @@ func (r RecoveryNodeStagingReset) Validate(recovery DataRecoveryState) error {
 }
 
 func beginDataRecovery(state *DataState, identity ShardRequestIdentity, recovery DataRecoveryState) error {
-	if state != nil && state.Recovery != nil && *state.Recovery == recovery && identity.ShardID == state.ShardID &&
+	if state != nil && state.Recovery != nil && reflect.DeepEqual(*state.Recovery, recovery) && identity.ShardID == state.ShardID &&
 		identity.PermitIdentity == recovery.Target {
 		return nil
 	}
@@ -240,6 +250,7 @@ func beginDataRecovery(state *DataState, identity ShardRequestIdentity, recovery
 		return err
 	}
 	copy := recovery
+	copy.TerminalResetSessions = cloneUint64Map(recovery.TerminalResetSessions)
 	state.Recovery = &copy
 	return nil
 }
@@ -257,6 +268,16 @@ func resetRecoveryNodeStaging(
 		if record.State != RecoveryObjectStaged && record.State != RecoveryObjectQuarantined {
 			return errors.New("raftstore: recovery node staging reset follows reconciliation")
 		}
+	}
+	if reset.Terminal {
+		recovery := *state.Recovery
+		recovery.TerminalResetSessions = cloneUint64Map(recovery.TerminalResetSessions)
+		if recovery.TerminalResetSessions == nil {
+			recovery.TerminalResetSessions = make(map[string]uint64)
+		}
+		key := recoveryNodeIdentityKey(reset.NodeID, reset.NodeEpoch)
+		recovery.TerminalResetSessions[key] = max(recovery.TerminalResetSessions[key], reset.SessionSeq)
+		state.Recovery = &recovery
 	}
 	removed := false
 	for key, record := range state.RecoveryRecords {
@@ -303,6 +324,9 @@ func stageRecoveryObject(state *DataState, index uint64, identity ShardRequestId
 		len(input.ConflictingReportDigests) != 0 {
 		return errors.New("raftstore: invalid staged recovery object")
 	}
+	if state.Recovery.TerminalResetSessions[recoveryNodeIdentityKey(input.NodeID, input.NodeEpoch)] >= input.SessionSeq {
+		return errors.New("raftstore: recovery report session was terminally reset")
+	}
 	record := cloneRecoveryRecord(input)
 	record.Revision = revisionFor(*state, index)
 	if record.Route != nil {
@@ -336,6 +360,30 @@ func stageRecoveryObject(state *DataState, index uint64, identity ShardRequestId
 	state.RecoveryClaims[claim] = key
 	state.RecoveryRecords[key] = record
 	return nil
+}
+
+func recoveryNodeIdentityKey(nodeID string, nodeEpoch uint64) string {
+	return nodeID + "\x00" + strconv.FormatUint(nodeEpoch, 10)
+}
+
+func parseRecoveryNodeIdentityKey(key string) (string, uint64, bool) {
+	separator := strings.LastIndexByte(key, 0)
+	if separator <= 0 || separator == len(key)-1 {
+		return "", 0, false
+	}
+	epoch, err := strconv.ParseUint(key[separator+1:], 10, 64)
+	return key[:separator], epoch, err == nil && epoch != 0
+}
+
+func cloneUint64Map(source map[string]uint64) map[string]uint64 {
+	if source == nil {
+		return nil
+	}
+	clone := make(map[string]uint64, len(source)+1)
+	for key, value := range source {
+		clone[key] = value
+	}
+	return clone
 }
 
 func sameRecoveryReport(left, right RecoveryObjectRecord) bool {
