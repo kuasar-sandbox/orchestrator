@@ -2,8 +2,11 @@ package orch
 
 import (
 	"context"
+	"strings"
 	"testing"
 
+	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
+	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
@@ -34,5 +37,20 @@ func TestClaimClusterCreateRejectsInflightAndStoredSandboxIDs(t *testing.T) {
 	}
 	if _, claimed := o.clusterCreates["stored"]; claimed {
 		t.Fatal("failed stored-id claim leaked its in-flight marker")
+	}
+}
+
+func TestPrecheckClusterRejectsInvalidRestore(t *testing.T) {
+	o := testOrch(t)
+	_, _, fingerprint := allowlistedBuildIdentity(t, o)
+	cmd := &routesync.Command{
+		TemplateRef:    "bare-img-" + strings.Repeat("a", 64),
+		KeyFingerprint: fingerprint,
+		Config: map[string]string{
+			sandboxcfg.NsRestore: `{"prefetch":"disk"}`,
+		},
+	}
+	if _, _, err := o.precheckCluster(context.Background(), cmd); err == nil {
+		t.Fatal("cluster create accepted invalid restore policy")
 	}
 }

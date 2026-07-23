@@ -24,6 +24,7 @@ import (
 	clusterstate "github.com/kuasar-sandbox/orchestrator/internal/cluster"
 	"github.com/kuasar-sandbox/orchestrator/internal/cluster/shardkv"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
+	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 )
 
 func testRegWithBox(t *testing.T) *Registry {
@@ -1156,7 +1157,15 @@ func TestReadyRouteUsesDerivedAccessToken(t *testing.T) {
 func TestReserveSandboxCreateUsesPlacementMaterial(t *testing.T) {
 	ctx := context.Background()
 	reg := testReg(t)
-	reg.SetPlacer(placementWithToken("n1"))
+	basePlacer := placementWithToken("n1")
+	reg.SetPlacer(placementFunc(func(ctx context.Context, req PlaceRequest) (*Placement, error) {
+		placement, err := basePlacer.Place(ctx, req)
+		if err != nil {
+			return nil, err
+		}
+		placement.Config[sandboxcfg.NsRestore] = `{"prefetch":"memory"}`
+		return placement, nil
+	}))
 	if err := reg.stores.PutNode(ctx, &NodeRecord{NodeID: "n1"}); err != nil {
 		t.Fatal(err)
 	}
@@ -1184,8 +1193,60 @@ func TestReserveSandboxCreateUsesPlacementMaterial(t *testing.T) {
 	if got.TemplateRef != "e2b-snp-tmpl" || got.Config["a"] != "1" || got.Config["b"] != "2" {
 		t.Fatalf("create command did not use placement config: %+v", got)
 	}
+	if _, ok := got.Config[sandboxcfg.NsRestore]; ok {
+		t.Fatalf("placement restore leaked without an explicit create value: %+v", got.Config)
+	}
 	if got.KeyFingerprint != keyFingerprint(testMK) {
 		t.Fatalf("key fingerprint=%q, want provider key fp", got.KeyFingerprint)
+	}
+
+	for _, mode := range []string{"off", "memory"} {
+		got = nil
+		if _, err := reg.ReserveSandbox(ctx, "/g", "rk-"+mode, map[string]string{
+			sandboxcfg.NsRestore: `{"prefetch":"` + mode + `"}`,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if got == nil || got.Config[sandboxcfg.NsRestore] != `{"prefetch":"`+mode+`"}` {
+			t.Fatalf("explicit create restore %q did not reach command: %+v", mode, got)
+		}
+	}
+}
+
+func TestReserveSandboxRejectsInvalidRestoreBeforePlacement(t *testing.T) {
+	placements := 0
+	reg := testReg(t)
+	reg.SetPlacer(placementFunc(func(context.Context, PlaceRequest) (*Placement, error) {
+		placements++
+		return &Placement{NodeID: "n1"}, nil
+	}))
+
+	_, err := reg.ReserveSandbox(context.Background(), "/g", "rk", map[string]string{
+		sandboxcfg.NsRestore: `{"prefetch":"disk"}`,
+	})
+	if err == nil {
+		t.Fatal("invalid restore should be rejected")
+	}
+	if placements != 0 {
+		t.Fatalf("invalid restore reached placement %d times", placements)
+	}
+	if _, _, found, getErr := reg.stores.GetSandbox(context.Background(), "/g", "rk"); getErr != nil || found {
+		t.Fatalf("invalid restore wrote route state: found=%v err=%v", found, getErr)
+	}
+}
+
+func TestReserveSandboxJoinsExistingRouteFlight(t *testing.T) {
+	result := &ReserveResult{SID: "s1", NodeID: "n1", DataEndpoint: "node:1"}
+	call := &reserveCall{done: make(chan struct{}), result: result}
+	close(call.done)
+	reg := testReg(t)
+	reg.inflight[flightKey("/g", "rk")] = call
+
+	got, err := reg.ReserveSandbox(context.Background(), "/g", "rk", map[string]string{
+		sandboxcfg.NsRestore: `{"prefetch":"memory"}`,
+	})
+	if err != nil || got != result {
+		t.Fatalf("existing route flight result=%+v err=%v", got, err)
 	}
 }
 

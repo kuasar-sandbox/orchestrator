@@ -11,6 +11,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/buildcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/keys"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
+	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
@@ -352,6 +353,11 @@ func (o *Orchestrator) precheckCluster(ctx context.Context, cmd *routesync.Comma
 	if err != nil {
 		return "", types.TemplateID{}, fmt.Errorf("cluster create: template %q: %w", cmd.TemplateRef, err)
 	}
+	config, err := sandboxcfg.NormalizeRestoreMetadata(cmd.Config)
+	if err != nil {
+		return "", types.TemplateID{}, fmt.Errorf("cluster create: %w", err)
+	}
+	cmd.Config = config
 	return manifestKey, tmpl, nil
 }
 

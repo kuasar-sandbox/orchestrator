@@ -40,9 +40,16 @@ func TestMergeConfigHeaders(t *testing.T) {
 	h := http.Header{}
 	h.Set("X-Kuasar-Sandbox-Network", `{"hostname":"h1"}`)
 	h.Set("X-Kuasar-Sandbox-Resource", `{"capacity":{"cpu":4}}`)
+	h.Set("X-Kuasar-Sandbox-Restore", `{"prefetch":"memory"}`)
 	m := mergeConfigHeaders(nil, h)
 	if m[sandboxcfg.NsNetwork] != `{"hostname":"h1"}` || m[sandboxcfg.NsResource] != `{"capacity":{"cpu":4}}` {
 		t.Fatalf("headers not normalized: %+v", m)
+	}
+	if _, ok := m[sandboxcfg.NsRestore]; ok {
+		t.Fatalf("generic/template headers admitted request-scoped restore: %+v", m)
+	}
+	if got := mergeCreateConfigHeaders(nil, h); got[sandboxcfg.NsRestore] != `{"prefetch":"memory"}` {
+		t.Fatalf("create restore header not normalized: %+v", got)
 	}
 
 	// Header wins over an e2b metadata key of the same namespace.
@@ -50,6 +57,17 @@ func TestMergeConfigHeaders(t *testing.T) {
 	got := mergeConfigHeaders(meta, header("X-Kuasar-Sandbox-Network", `{"hostname":"from-header"}`))
 	if got[sandboxcfg.NsNetwork] != `{"hostname":"from-header"}` {
 		t.Fatalf("header should win over metadata: %+v", got)
+	}
+	meta = map[string]string{sandboxcfg.NsRestore: `{"prefetch":"memory"}`}
+	got = mergeCreateConfigHeaders(meta, header("X-Kuasar-Sandbox-Restore", `{"prefetch":"off"}`))
+	if got[sandboxcfg.NsRestore] != `{"prefetch":"off"}` {
+		t.Fatalf("restore header should win over metadata: %+v", got)
+	}
+	emptyRestore := http.Header{}
+	emptyRestore.Set("X-Kuasar-Sandbox-Restore", "")
+	got = mergeCreateConfigHeaders(nil, emptyRestore)
+	if _, ok := got[sandboxcfg.NsRestore]; !ok {
+		t.Fatalf("present empty restore header must reach strict validation: %+v", got)
 	}
 
 	// Builder is build-only and is not folded by the generic sandbox header path.

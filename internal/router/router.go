@@ -12,6 +12,7 @@ import (
 	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -29,6 +30,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/metrics"
 	proxypkg "github.com/kuasar-sandbox/orchestrator/internal/proxy"
 	"github.com/kuasar-sandbox/orchestrator/internal/registry"
+	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
@@ -36,8 +38,11 @@ import (
 const (
 	HeaderGroup     = "X-Kuasar-Sandbox-Group"
 	HeaderRouteKey  = "X-Kuasar-Route-Key"
+	HeaderRestore   = "X-Kuasar-Sandbox-Restore"
 	HeaderAPIKey    = "X-API-KEY"
 	HeaderAccessTok = "X-Access-Token"
+
+	maxClusterCreateBodyBytes int64 = 16 << 20
 )
 
 // reserveResult / routeResolve mirror registry route_link JSON.
@@ -269,10 +274,25 @@ func (rt *Router) handleCreate(w http.ResponseWriter, r *http.Request) {
 	if routeKey == "" {
 		routeKey = newRouteKey()
 	}
-	res, err := rt.reserveByKey(r.Context(), group, routeKey)
+	restore, err := createRestoreMetadata(w, r)
+	if err != nil {
+		status := http.StatusBadRequest
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			status = http.StatusRequestEntityTooLarge
+		}
+		http.Error(w, err.Error(), status)
+		return
+	}
+	res, err := rt.reserveByKey(r.Context(), group, routeKey, restore)
 	if err != nil {
 		rt.log.Warn("router: reserve", "group", group, "err", err)
-		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		status := http.StatusServiceUnavailable
+		var routeErr *routeLinkCallError
+		if errors.As(err, &routeErr) && routeErr.status == http.StatusBadRequest {
+			status = http.StatusBadRequest
+		}
+		http.Error(w, err.Error(), status)
 		return
 	}
 	// Minimal e2b create response (the SDK keys off sandboxID; the data plane uses
@@ -288,6 +308,44 @@ func (rt *Router) handleCreate(w http.ResponseWriter, r *http.Request) {
 		"trafficAccessToken": res.TrafficAccessToken,
 		"domain":             rt.domain,
 	})
+}
+
+// createRestoreMetadata narrows cluster create input to the one supported
+// sandbox policy. The dedicated header is a no-body-read fast path; without it,
+// body metadata is inspected within the cluster create body limit.
+func createRestoreMetadata(w http.ResponseWriter, r *http.Request) (map[string]string, error) {
+	if raw, present := restoreHeaderValue(r.Header); present {
+		return sandboxcfg.NormalizeRestoreMetadata(map[string]string{sandboxcfg.NsRestore: raw})
+	}
+	var body struct {
+		Metadata map[string]string `json:"metadata"`
+	}
+	if r.Body != nil {
+		if r.ContentLength > maxClusterCreateBodyBytes {
+			return nil, &http.MaxBytesError{Limit: maxClusterCreateBodyBytes}
+		}
+		r.Body = http.MaxBytesReader(w, r.Body, maxClusterCreateBodyBytes)
+		err := json.NewDecoder(r.Body).Decode(&body)
+		if err != nil && !errors.Is(err, io.EOF) {
+			return nil, fmt.Errorf("bad create body: %w", err)
+		}
+		// Decode stops after the first complete JSON value. Drain the bounded
+		// reader so trailing bytes count toward the advertised body limit while
+		// preserving the endpoint's existing single-value decode semantics.
+		if _, err := io.Copy(io.Discard, r.Body); err != nil {
+			return nil, fmt.Errorf("bad create body: %w", err)
+		}
+	}
+	var restore map[string]string
+	if raw, ok := body.Metadata[sandboxcfg.NsRestore]; ok {
+		restore = map[string]string{sandboxcfg.NsRestore: raw}
+	}
+	return sandboxcfg.NormalizeRestoreMetadata(restore)
+}
+
+func restoreHeaderValue(header http.Header) (string, bool) {
+	_, present := header[http.CanonicalHeaderKey(HeaderRestore)]
+	return header.Get(HeaderRestore), present
 }
 
 // --- build control plane ---
@@ -641,7 +699,7 @@ func (rt *Router) serveData(w http.ResponseWriter, r *http.Request, host string)
 	// Not ready (paused / lagging): data-plane traffic wakes it via Reserve (§1.4),
 	// then forwards to the resumed node.
 	if (rr.State != "ready" || rr.DataEndpoint == "") && rr.Group != "" {
-		if res, err := rt.reserveByKey(r.Context(), rr.Group, rr.RouteKey); err == nil && res.DataEndpoint != "" {
+		if res, err := rt.reserveByKey(r.Context(), rr.Group, rr.RouteKey, nil); err == nil && res.DataEndpoint != "" {
 			rr = &routeResolve{
 				SID: res.SID, Group: rr.Group, RouteKey: rr.RouteKey, NodeID: res.NodeID,
 				DataEndpoint: res.DataEndpoint, AccessToken: res.AccessToken,
@@ -743,7 +801,7 @@ func (rt *Router) serveDataByKey(w http.ResponseWriter, r *http.Request, group, 
 	}
 	rr := rt.cachedRouteByKey(group, routeKey)
 	if rr == nil || rr.State != "ready" || rr.DataEndpoint == "" {
-		res, err := rt.reserveByKey(r.Context(), group, routeKey)
+		res, err := rt.reserveByKey(r.Context(), group, routeKey, nil)
 		if err != nil || res.DataEndpoint == "" {
 			http.Error(w, "reserve failed", http.StatusServiceUnavailable)
 			return
@@ -965,16 +1023,17 @@ func (rt *Router) cachedRouteByKey(group, routeKey string) *routeResolve {
 
 // --- control client ---
 
-func (rt *Router) routeLinkReserve(ctx context.Context, group, routeKey string) (*reserveResult, error) {
+func (rt *Router) routeLinkReserve(ctx context.Context, group, routeKey string, config map[string]string) (*reserveResult, error) {
 	path := fmt.Sprintf("%s?group=%s&route_key=%s", registry.RouteLinkReservePath, url.QueryEscape(group), url.QueryEscape(routeKey))
+	body, _ := json.Marshal(registry.SandboxReserveReq{Config: config})
 	var res reserveResult
-	if err := rt.routeLinkCall(ctx, group, http.MethodPost, path, nil, nil, &res); err != nil {
+	if err := rt.routeLinkCall(ctx, group, http.MethodPost, path, body, map[string]string{"Content-Type": "application/json"}, &res); err != nil {
 		return nil, err
 	}
 	return &res, nil
 }
 
-func (rt *Router) reserveByKey(ctx context.Context, group, routeKey string) (*reserveResult, error) {
+func (rt *Router) reserveByKey(ctx context.Context, group, routeKey string, config map[string]string) (*reserveResult, error) {
 	key := routeCacheKey(group, routeKey)
 	rt.reserveMu.Lock()
 	if f := rt.reserveInFlight[key]; f != nil {
@@ -990,7 +1049,7 @@ func (rt *Router) reserveByKey(ctx context.Context, group, routeKey string) (*re
 	rt.reserveInFlight[key] = f
 	rt.reserveMu.Unlock()
 
-	f.res, f.err = rt.routeLinkReserve(ctx, group, routeKey)
+	f.res, f.err = rt.routeLinkReserve(ctx, group, routeKey, config)
 	if f.err == nil && f.res != nil {
 		rt.rememberRoute(&routeResolve{
 			SID: f.res.SID, Group: group, RouteKey: routeKey, NodeID: f.res.NodeID,
@@ -1064,9 +1123,20 @@ func (rt *Router) routeLinkCall(ctx context.Context, group, method, path string,
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return fmt.Errorf("route_link %s: %s: %s", path, resp.Status, strings.TrimSpace(string(b)))
+		return &routeLinkCallError{status: resp.StatusCode, path: path, response: resp.Status, body: strings.TrimSpace(string(b))}
 	}
 	return json.NewDecoder(resp.Body).Decode(out)
+}
+
+type routeLinkCallError struct {
+	status   int
+	path     string
+	response string
+	body     string
+}
+
+func (e *routeLinkCallError) Error() string {
+	return fmt.Sprintf("route_link %s: %s: %s", e.path, e.response, e.body)
 }
 
 func (rt *Router) routeLinkHTTP(ctx context.Context, group, method, path string, body []byte, headers map[string]string) (*http.Response, error) {

@@ -3,6 +3,7 @@ package router
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -27,6 +28,135 @@ func TestExtractBuildID(t *testing.T) {
 		if got := extractBuildID(path); got != want {
 			t.Errorf("extractBuildID(%q)=%q want %q", path, got, want)
 		}
+	}
+}
+
+func TestCreateRestoreMetadataHeaderWinsAndNarrows(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/sandboxes", strings.NewReader(
+		`{"metadata":{"kuasar-sandbox.restore":"{\"prefetch\":\"memory\"}","ignored":"value"}}`,
+	))
+	req.Header.Set(HeaderRestore, ` { "prefetch": "off" } `)
+
+	got, err := createRestoreMetadata(httptest.NewRecorder(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got["kuasar-sandbox.restore"] != `{"prefetch":"off"}` {
+		t.Fatalf("restore metadata=%v", got)
+	}
+}
+
+func TestCreateRestoreMetadataRejectsInvalidPolicy(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/sandboxes", strings.NewReader(
+		`{"metadata":{"kuasar-sandbox.restore":"{\"prefetch\":\"disk\"}"}}`,
+	))
+	if _, err := createRestoreMetadata(httptest.NewRecorder(), req); err == nil {
+		t.Fatal("invalid restore prefetch should be rejected")
+	}
+}
+
+func TestCreateRestoreMetadataEmptyHeaderOverridesBodyAndRejects(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/sandboxes", strings.NewReader(
+		`{"metadata":{"kuasar-sandbox.restore":"{\"prefetch\":\"memory\"}"}}`,
+	))
+	req.Header.Set(HeaderRestore, "")
+	if _, err := createRestoreMetadata(httptest.NewRecorder(), req); err == nil {
+		t.Fatal("an explicitly empty restore header should override body metadata and be rejected")
+	}
+}
+
+func TestCreateRestoreMetadataAcceptsBodyPastOneMiB(t *testing.T) {
+	body := `{"envVars":{"BIG":"` + strings.Repeat("x", (1<<20)+64) +
+		`"},"metadata":{"kuasar-sandbox.restore":"{\"prefetch\":\"memory\"}"}}`
+	if len(body) <= 1<<20 || strings.Index(body, `"metadata"`) <= 1<<20 || !json.Valid([]byte(body)) {
+		t.Fatal("test body must be valid JSON with restore metadata after 1 MiB")
+	}
+	req := httptest.NewRequest(http.MethodPost, "/sandboxes", strings.NewReader(body))
+	got, err := createRestoreMetadata(httptest.NewRecorder(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got["kuasar-sandbox.restore"] != `{"prefetch":"memory"}` {
+		t.Fatalf("restore metadata=%v", got)
+	}
+}
+
+type failOnRead struct{ read bool }
+
+func (r *failOnRead) Read([]byte) (int, error) {
+	r.read = true
+	return 0, errors.New("body must not be read")
+}
+
+type fillReader byte
+
+func (r fillReader) Read(p []byte) (int, error) {
+	for i := range p {
+		p[i] = byte(r)
+	}
+	return len(p), nil
+}
+
+func TestCreateRestoreMetadataHeaderBypassesBody(t *testing.T) {
+	body := &failOnRead{}
+	req := httptest.NewRequest(http.MethodPost, "/sandboxes", nil)
+	req.Body = io.NopCloser(body)
+	req.ContentLength = maxClusterCreateBodyBytes + 1
+	req.Header.Set(HeaderRestore, `{"prefetch":"memory"}`)
+
+	got, err := createRestoreMetadata(httptest.NewRecorder(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if body.read {
+		t.Fatal("restore header path read the create body")
+	}
+	if len(got) != 1 || got["kuasar-sandbox.restore"] != `{"prefetch":"memory"}` {
+		t.Fatalf("restore metadata=%v", got)
+	}
+}
+
+func TestHandleCreateRejectsBodyPast16MiBWithoutHeader(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/sandboxes", strings.NewReader(`{}`))
+	req.ContentLength = maxClusterCreateBodyBytes + 1
+	req.Header.Set(HeaderGroup, "/g")
+	rec := httptest.NewRecorder()
+
+	(&Router{authMode: "off"}).handleCreate(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status=%d body=%q, want 413", rec.Code, rec.Body.String())
+	}
+}
+
+func sizedJSONBody(size int64) io.Reader {
+	return io.MultiReader(
+		strings.NewReader(`{}`),
+		io.LimitReader(fillReader(' '), size-2),
+	)
+}
+
+func TestCreateRestoreMetadataAcceptsExact16MiBChunkedBody(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/sandboxes", nil)
+	req.Body = io.NopCloser(sizedJSONBody(maxClusterCreateBodyBytes))
+	req.ContentLength = -1
+
+	if _, err := createRestoreMetadata(httptest.NewRecorder(), req); err != nil {
+		t.Fatalf("exact-limit body rejected: %v", err)
+	}
+}
+
+func TestHandleCreateRejectsChunkedBodyPast16MiBWithoutHeader(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/sandboxes", nil)
+	req.Body = io.NopCloser(sizedJSONBody(maxClusterCreateBodyBytes + 1))
+	req.ContentLength = -1
+	req.Header.Set(HeaderGroup, "/g")
+	rec := httptest.NewRecorder()
+
+	(&Router{authMode: "off"}).handleCreate(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status=%d body=%q, want 413", rec.Code, rec.Body.String())
 	}
 }
 
@@ -76,6 +206,48 @@ func TestRouteLinkHTTPRefreshesMembershipAndRetries(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK || reg.refreshes != 1 || strings.Join(calls, ",") != "old,new" {
 		t.Fatalf("status=%d refreshes=%d calls=%v", resp.StatusCode, reg.refreshes, calls)
+	}
+}
+
+func TestRouteLinkReserveCarriesRestoreConfig(t *testing.T) {
+	var got struct {
+		Config map[string]string `json:"config"`
+	}
+	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.URL.Path != "/route-link/reserve" || req.URL.Query().Get("group") != "/g" || req.URL.Query().Get("route_key") != "rk" {
+			t.Fatalf("reserve request path=%q query=%q", req.URL.Path, req.URL.RawQuery)
+		}
+		if err := json.NewDecoder(req.Body).Decode(&got); err != nil {
+			t.Fatal(err)
+		}
+		return textResponse(http.StatusOK, `{"node_id":"n1","sid":"s1","data_endpoint":"node:1"}`), nil
+	})}
+	rt := &Router{routeRegistry: routeRegistryFunc(func(context.Context, string) ([]clusterclient.Endpoint, error) {
+		return []clusterclient.Endpoint{{MemberID: "r1", BaseURL: "http://r1", Client: client}}, nil
+	})}
+
+	config := map[string]string{"kuasar-sandbox.restore": `{"prefetch":"memory"}`}
+	if _, err := rt.routeLinkReserve(context.Background(), "/g", "rk", config); err != nil {
+		t.Fatal(err)
+	}
+	if got.Config["kuasar-sandbox.restore"] != `{"prefetch":"memory"}` {
+		t.Fatalf("route-link reserve config=%v", got.Config)
+	}
+}
+
+func TestReserveByKeyJoinsExistingRouteFlight(t *testing.T) {
+	result := &reserveResult{SID: "s1", NodeID: "n1", DataEndpoint: "node:1"}
+	flight := &reserveFlight{done: make(chan struct{}), res: result}
+	close(flight.done)
+	rt := &Router{reserveInFlight: map[string]*reserveFlight{
+		routeCacheKey("/g", "rk"): flight,
+	}}
+
+	got, err := rt.reserveByKey(context.Background(), "/g", "rk", map[string]string{
+		"kuasar-sandbox.restore": `{"prefetch":"memory"}`,
+	})
+	if err != nil || got != result {
+		t.Fatalf("existing route flight result=%+v err=%v", got, err)
 	}
 }
 
