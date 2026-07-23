@@ -203,21 +203,15 @@ func requestTargetPathAndQuery(target string) string {
 	return target
 }
 
-// requestHasBody reports whether r carries any request body — a
-// Content-Length-declared body is checked directly; a chunked/unknown-length
-// body is checked by attempting to read one byte (non-blocking: the server
-// has already fully read the request off the wire before invoking the
-// handler chain, so this never waits on the network).
+// requestHasBody reports whether r carries any request body, from headers
+// alone — never by reading r.Body. A chunked/unknown-length body is NOT
+// pre-read off the wire before the handler runs (net/http reads only the
+// request line and headers before dispatch); a Read here would block this
+// handler goroutine on the network if a guest sends a body-bearing header
+// and then stalls, and the MMDS http.Server sets no read timeout to bound
+// that wait.
 func requestHasBody(r *http.Request) bool {
-	if r.ContentLength > 0 {
-		return true
-	}
-	if r.Body == nil {
-		return false
-	}
-	var buf [1]byte
-	n, _ := r.Body.Read(buf[:])
-	return n > 0
+	return r.ContentLength != 0 || len(r.TransferEncoding) > 0
 }
 
 // Serve runs the MMDS HTTP/1.1 server on ln until ctx is cancelled.

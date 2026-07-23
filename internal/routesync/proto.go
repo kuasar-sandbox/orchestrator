@@ -131,8 +131,12 @@ type MmdsEndpointEntry struct {
 	ContentType      string `json:"content_type,omitempty"`
 	ExpiresUnix      int64  `json:"expires_unix,omitempty"`
 	// SecretPlaintext is the current store value or relay auth value,
-	// cleartext, present only when ValuePresent is true.
-	SecretPlaintext string `json:"secret_plaintext,omitempty"`
+	// cleartext, present only when ValuePresent is true. []byte (base64 on
+	// the wire) rather than string: the admin API accepts opaque byte
+	// bodies, and encoding/json would silently replace invalid UTF-8 with
+	// U+FFFD if this were a string, corrupting any value/auth secret that
+	// isn't valid UTF-8.
+	SecretPlaintext []byte `json:"secret_plaintext,omitempty"`
 }
 
 // MmdsEndpointKey identifies one endpoint for MmdsDelete: (sandbox_id,name),

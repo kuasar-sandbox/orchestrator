@@ -102,10 +102,10 @@ func TestEqualRevisionMismatchForcesResync(t *testing.T) {
 func TestLowerRevisionIgnored(t *testing.T) {
 	tb := New(nil, 0, testRuntime(time.Second), nil)
 	tb.BeginMmdsSync("gen-1")
-	tb.ApplyMmdsUpsert(routesync.MmdsEndpointEntry{SandboxID: "s1", Name: "a", Path: "/latest/a", BackendType: "store", Revision: 5, ValuePresent: true, SecretPlaintext: "new"})
+	tb.ApplyMmdsUpsert(routesync.MmdsEndpointEntry{SandboxID: "s1", Name: "a", Path: "/latest/a", BackendType: "store", Revision: 5, ValuePresent: true, SecretPlaintext: []byte("new")})
 	tb.MmdsBookmark("gen-1")
 
-	tb.ApplyMmdsUpsert(routesync.MmdsEndpointEntry{SandboxID: "s1", Name: "a", Path: "/latest/a", BackendType: "store", Revision: 3, ValuePresent: true, SecretPlaintext: "stale"})
+	tb.ApplyMmdsUpsert(routesync.MmdsEndpointEntry{SandboxID: "s1", Name: "a", Path: "/latest/a", BackendType: "store", Revision: 3, ValuePresent: true, SecretPlaintext: []byte("stale")})
 
 	value, _, revision, present, _ := tb.ServeStore(context.Background(), "s1", "a")
 	if !present || revision != 5 || string(value) != "new" {
@@ -128,7 +128,7 @@ func TestApplyMmdsDeleteRemovesEntry(t *testing.T) {
 func TestDisconnectedClearsLiveAndMarksUnavailable(t *testing.T) {
 	tb := New(nil, 0, testRuntime(time.Second), nil)
 	tb.BeginMmdsSync("gen-1")
-	tb.ApplyMmdsUpsert(routesync.MmdsEndpointEntry{SandboxID: "s1", Name: "a", Path: "/latest/a", BackendType: "store", Revision: 1, ValuePresent: true, SecretPlaintext: "hello"})
+	tb.ApplyMmdsUpsert(routesync.MmdsEndpointEntry{SandboxID: "s1", Name: "a", Path: "/latest/a", BackendType: "store", Revision: 1, ValuePresent: true, SecretPlaintext: []byte("hello")})
 	tb.MmdsBookmark("gen-1")
 	if _, _, found, _ := tb.Lookup(context.Background(), "s1", "/latest/a"); !found {
 		t.Fatal("setup: entry should be visible after the first bookmark")
@@ -224,7 +224,7 @@ func TestServeStoreWakesOnLiveUpsert(t *testing.T) {
 	}()
 
 	time.Sleep(20 * time.Millisecond)
-	tb.ApplyMmdsUpsert(routesync.MmdsEndpointEntry{SandboxID: "s1", Name: "a", Path: "/latest/a", BackendType: "store", Revision: 1, ValuePresent: true, SecretPlaintext: "hello"})
+	tb.ApplyMmdsUpsert(routesync.MmdsEndpointEntry{SandboxID: "s1", Name: "a", Path: "/latest/a", BackendType: "store", Revision: 1, ValuePresent: true, SecretPlaintext: []byte("hello")})
 
 	select {
 	case <-done:
@@ -277,7 +277,7 @@ func TestServeRelayDispatchesConfiguredEndpoint(t *testing.T) {
 	tb.ApplyMmdsUpsert(routesync.MmdsEndpointEntry{
 		SandboxID: "s1", Name: "creds", Path: "/latest/creds", BackendType: "relay",
 		PublicConfigJSON: `{"url":"https://example.com/creds","auth_header_name":"X-Auth"}`,
-		Revision:         1, ValuePresent: true, SecretPlaintext: "secret",
+		Revision:         1, ValuePresent: true, SecretPlaintext: []byte("secret"),
 	})
 	tb.MmdsBookmark("gen-1")
 
@@ -297,7 +297,7 @@ func TestServeRelayCancelsOnLiveUpsert(t *testing.T) {
 	tb.ApplyMmdsUpsert(routesync.MmdsEndpointEntry{
 		SandboxID: "s1", Name: "creds", Path: "/latest/creds", BackendType: "relay",
 		PublicConfigJSON: `{"url":"https://example.com/creds","auth_header_name":"X-Auth"}`,
-		Revision:         1, ValuePresent: true, SecretPlaintext: "old",
+		Revision:         1, ValuePresent: true, SecretPlaintext: []byte("old"),
 	})
 	tb.MmdsBookmark("gen-1")
 
@@ -311,7 +311,7 @@ func TestServeRelayCancelsOnLiveUpsert(t *testing.T) {
 	tb.ApplyMmdsUpsert(routesync.MmdsEndpointEntry{
 		SandboxID: "s1", Name: "creds", Path: "/latest/creds", BackendType: "relay",
 		PublicConfigJSON: `{"url":"https://example.com/creds","auth_header_name":"X-Auth"}`,
-		Revision:         2, ValuePresent: true, SecretPlaintext: "new",
+		Revision:         2, ValuePresent: true, SecretPlaintext: []byte("new"),
 	})
 
 	select {

@@ -16,6 +16,7 @@
 package proxyendpoints
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -159,6 +160,21 @@ func (t *Table) Disconnected() {
 	}
 }
 
+// mmdsEntryEqual reports whether a and b are identical. MmdsEndpointEntry is
+// not comparable with == since SecretPlaintext is a []byte.
+func mmdsEntryEqual(a, b routesync.MmdsEndpointEntry) bool {
+	return a.SandboxID == b.SandboxID &&
+		a.Name == b.Name &&
+		a.Path == b.Path &&
+		a.BackendType == b.BackendType &&
+		a.PublicConfigJSON == b.PublicConfigJSON &&
+		a.Revision == b.Revision &&
+		a.ValuePresent == b.ValuePresent &&
+		a.ContentType == b.ContentType &&
+		a.ExpiresUnix == b.ExpiresUnix &&
+		bytes.Equal(a.SecretPlaintext, b.SecretPlaintext)
+}
+
 // ApplyMmdsUpsert applies one endpoint's state to whichever table (staging
 // mid-generation, live otherwise) is currently active. A lower revision
 // than what's already recorded is ignored; an equal revision
@@ -185,7 +201,7 @@ func (t *Table) ApplyMmdsUpsert(e routesync.MmdsEndpointEntry) {
 			t.mu.Unlock()
 			return // stale
 		}
-		if e.Revision == existing.Revision && existing != e {
+		if e.Revision == existing.Revision && !mmdsEntryEqual(existing, e) {
 			cleared := t.forceResyncLocked()
 			t.mu.Unlock()
 			for i := 0; i < cleared; i++ {
@@ -356,7 +372,7 @@ func (t *Table) ServeStore(ctx context.Context, sandboxID, name string) (value [
 	if e.ExpiresUnix > 0 && time.Now().Unix() >= e.ExpiresUnix {
 		return nil, "", e.Revision, false, nil
 	}
-	return []byte(e.SecretPlaintext), e.ContentType, e.Revision, true, nil
+	return e.SecretPlaintext, e.ContentType, e.Revision, true, nil
 }
 
 // ServeRelay answers a relay-backend GET, applying the same bounded
@@ -394,7 +410,7 @@ func (t *Table) ServeRelay(ctx context.Context, sandboxID, name string) (status 
 
 	watchCtx, cancel := t.watch(ctx, sandboxID, name)
 	defer cancel()
-	res := t.relay.Fetch(watchCtx, sandboxID+"\x00"+name, cfg.URL, cfg.AuthHeaderName, e.SecretPlaintext)
+	res := t.relay.Fetch(watchCtx, sandboxID+"\x00"+name, cfg.URL, cfg.AuthHeaderName, string(e.SecretPlaintext))
 	return res.Status, res.ContentType, res.Body, true, nil
 }
 

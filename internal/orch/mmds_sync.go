@@ -29,7 +29,7 @@ func mmdsWireEntry(e store.MMDSEndpointFull) routesync.MmdsEndpointEntry {
 		ValuePresent:     e.ValuePresent,
 		ContentType:      e.ContentType,
 		ExpiresUnix:      e.ExpiresUnix,
-		SecretPlaintext:  string(e.SecretPlaintext),
+		SecretPlaintext:  e.SecretPlaintext,
 	}
 }
 

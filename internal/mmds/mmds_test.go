@@ -3,6 +3,7 @@ package mmds
 import (
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -613,6 +614,37 @@ func TestGuardRejectsRequestBody(t *testing.T) {
 	h.ServeHTTP(w, req)
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("PUT token with a body: code=%d, want 400", w.Code)
+	}
+}
+
+// TestGuardRejectsStalledChunkedBodyWithoutBlocking is the regression case
+// for the bug this guard used to have: a body of unknown length (no
+// Content-Length, e.g. a real chunked request) whose sender never delivers
+// any bytes must be rejected from headers alone. An io.Pipe with no writer
+// stands in for a guest that sends body-bearing headers and then stalls —
+// if the guard ever goes back to reading r.Body to decide this, this test
+// hangs instead of failing fast.
+func TestGuardRejectsStalledChunkedBodyWithoutBlocking(t *testing.T) {
+	src := testSourceWithRunID()
+	h := New(src, nil, 50*time.Millisecond, nil, nil).Handler()
+
+	pr, pw := io.Pipe()
+	t.Cleanup(func() { _ = pw.Close() })
+
+	done := make(chan int, 1)
+	go func() {
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, httptest.NewRequest("GET", "http://169.254.169.254/", pr))
+		done <- w.Code
+	}()
+
+	select {
+	case code := <-done:
+		if code != http.StatusBadRequest {
+			t.Fatalf("GET with a stalled unknown-length body: code=%d, want 400", code)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("guard blocked on a stalled body instead of rejecting it from headers")
 	}
 }
 

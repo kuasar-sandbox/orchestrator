@@ -255,10 +255,15 @@ func (o *Orchestrator) Create(ctx context.Context, req api.CreateReq) (*types.Sa
 		o.teardown(context.Background(), sb)
 		return nil, err
 	}
-	o.publishUpsert(sb) // tell external proxies about the new route
+	// Publish the declared MMDS endpoints before the route: once the route is
+	// reachable, a guest can obtain a token and request its declared path
+	// immediately, and external mode's Lookup must already see the
+	// endpoint — otherwise it falls through to the built-in metadata
+	// response instead of the declared endpoint/503 for that window.
 	for _, ep := range mmdsEndpoints {
 		o.publishMmdsEntry(ctx, sb.ID, ep.Name) // tell external proxies about the newly declared endpoints
 	}
+	o.publishUpsert(sb) // tell external proxies about the new route
 	return sb, nil
 }
 

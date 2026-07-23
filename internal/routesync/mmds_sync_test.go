@@ -112,7 +112,7 @@ func TestMmdsSyncFullGenerationStream(t *testing.T) {
 		woke:    make(chan string, 4),
 		mmdsGen: "gen-1",
 		mmdsEntries: []routesync.MmdsEndpointEntry{
-			{SandboxID: "s1", Name: "creds", Path: "/latest/meta-data/credentials", BackendType: "relay", Revision: 1, ValuePresent: true, SecretPlaintext: "auth-value"},
+			{SandboxID: "s1", Name: "creds", Path: "/latest/meta-data/credentials", BackendType: "relay", Revision: 1, ValuePresent: true, SecretPlaintext: []byte("auth-value")},
 			{SandboxID: "s1", Name: "user-data", Path: "/latest/user-data", BackendType: "store", Revision: 0, ValuePresent: false},
 		},
 		mmdsSub: make(chan routesync.MmdsEvent, 4),
@@ -132,7 +132,7 @@ func TestMmdsSyncFullGenerationStream(t *testing.T) {
 	e1 := recv(t, sink.mmdsUp, "mmds upsert 1")
 	e2 := recv(t, sink.mmdsUp, "mmds upsert 2")
 	got := map[string]routesync.MmdsEndpointEntry{e1.Name: e1, e2.Name: e2}
-	if got["creds"].BackendType != "relay" || got["creds"].SecretPlaintext != "auth-value" {
+	if got["creds"].BackendType != "relay" || string(got["creds"].SecretPlaintext) != "auth-value" {
 		t.Fatalf("creds entry = %+v", got["creds"])
 	}
 	if got["user-data"].BackendType != "store" || got["user-data"].ValuePresent {
@@ -161,10 +161,10 @@ func TestMmdsSyncLiveUpsertAndDelete(t *testing.T) {
 
 	src.mmdsSub <- routesync.MmdsEvent{
 		Kind:  routesync.TypeMmdsUpsert,
-		Entry: routesync.MmdsEndpointEntry{SandboxID: "s2", Name: "a", Revision: 1, ValuePresent: true, SecretPlaintext: "v"},
+		Entry: routesync.MmdsEndpointEntry{SandboxID: "s2", Name: "a", Revision: 1, ValuePresent: true, SecretPlaintext: []byte("v")},
 	}
 	up := recv(t, sink.mmdsUp, "live mmds upsert")
-	if up.SandboxID != "s2" || up.Name != "a" || up.SecretPlaintext != "v" {
+	if up.SandboxID != "s2" || up.Name != "a" || string(up.SecretPlaintext) != "v" {
 		t.Fatalf("live upsert = %+v", up)
 	}
 
