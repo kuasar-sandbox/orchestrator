@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -39,6 +40,7 @@ type countingLauncher struct {
 	startOnce             sync.Once
 	blockBeforeAssignment bool
 	stopped               sync.Map
+	stopErr               error
 }
 
 func (l *countingLauncher) Start(ctx context.Context, unit string) error {
@@ -78,7 +80,7 @@ func (l *countingLauncher) Start(ctx context.Context, unit string) error {
 }
 func (l *countingLauncher) Stop(_ context.Context, unit string) error {
 	l.stopped.Store(unit, struct{}{})
-	return nil
+	return l.stopErr
 }
 func (l *countingLauncher) ResetFailed(context.Context, string) error { return nil }
 func (l *countingLauncher) List(context.Context, string) ([]launcher.Unit, error) {
@@ -474,6 +476,92 @@ func TestResumeRace_RegistryDeleteWaitsForInFlightResume(t *testing.T) {
 	record, err := st.GetNodeWorkflow(ctx, clusterstate.ExecutionKindSandbox, sid)
 	if err != nil || record == nil || record.ObjectState != "DELETED" {
 		t.Fatalf("workflow after serialized delete = %+v, %v", record, err)
+	}
+}
+
+func TestClusterDeleteDoesNotTerminalizeWhenRunnerStopFails(t *testing.T) {
+	box, err := secretbox.NewFromColonHex(strings.Repeat("0", 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.Open(filepath.Join(t.TempDir(), "t.db"), box)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	runDir := filepath.Join(t.TempDir(), "run", "sandbox-stop-failure")
+	if err := os.MkdirAll(runDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	stopErr := errors.New("systemd stop job failed")
+	lc := &countingLauncher{stopErr: stopErr}
+	cfg := &config.Config{}
+	cfg.Units.Runner = "kuasar-sandbox-runner@.service"
+	o := New(cfg, st, lc, stubVS{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ctx := context.Background()
+	sid := "sandbox-stop-failure"
+	dispatch := clusterResumeDispatch(t, sid, "bare-img-"+strings.Repeat("b", 64))
+	sandbox := &types.Sandbox{
+		ID: sid, TemplateID: "bare-img-" + strings.Repeat("b", 64), State: types.StateRunning,
+		AuthKey: strings.Repeat("a", 64), ManifestKey: strings.Repeat("b", 64),
+		RunID: "run-stop-failure", RunDir: runDir, VswitchPort: "port-1", CreatedUnix: 1,
+	}
+	if _, err := st.RecordSandboxWorkflow(ctx, dispatch, nodeexec.AdmissionDecision{
+		State: nodeexec.AdmissionAdmitted, Result: clusterstate.DispatchAcceptedAdmitted,
+		ReservationToken: "reservation-stop-failure",
+	}, sandbox); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := st.Get(ctx, sid)
+	if err != nil || stored == nil {
+		t.Fatalf("stored Sandbox = %+v, %v", stored, err)
+	}
+	if _, err := st.CommitSandboxEvent(ctx, stored, sandboxTestEvent(nodeexec.EventUpdate{
+		State: string(clusterstate.WorkflowRouteReady), TargetPort: 49983,
+	})); err != nil {
+		t.Fatal(err)
+	}
+	admission := &releaseAdmissionFake{wake: make(chan struct{})}
+	authority, err := nodeexec.NewAuthority(
+		st, admission,
+		func(context.Context) (nodeexec.LocalSessionIdentity, error) {
+			return nodeexec.LocalSessionIdentity{
+				NodeID: "node-1", NodeEpoch: 7, SessionSeq: 1, DataEndpoint: "node-1:8443",
+			}, nil
+		},
+		func(context.Context) (nodeexec.BuildCapacity, string, error) {
+			return nodeexec.BuildCapacity{Slots: 1, QueueLimit: 1}, "", nil
+		},
+		func(context.Context, nodeexec.DispatchRecord) (*types.Build, error) { return nil, nil },
+		func(context.Context, nodeexec.DispatchRecord) (*types.Sandbox, error) { return nil, nil },
+		func(context.Context, nodeexec.DispatchRecord) (nodectl.SandboxAdmissionDemand, error) {
+			return nodectl.SandboxAdmissionDemand{}, nil
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	node := &FinalClusterNode{
+		core: o, store: st, authority: authority,
+		log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	if err := node.deleteSandboxSync(ctx, &routesync.Command{SID: sid}); !errors.Is(err, stopErr) {
+		t.Fatalf("delete error = %v", err)
+	}
+	stored, err = st.Get(ctx, sid)
+	if err != nil || stored == nil {
+		t.Fatalf("Sandbox was removed after unconfirmed stop: %+v, %v", stored, err)
+	}
+	record, err := st.GetNodeWorkflow(ctx, clusterstate.ExecutionKindSandbox, sid)
+	if err != nil || record == nil || record.ObjectState == "DELETED" || record.AdmissionState == nodeexec.AdmissionTerminal {
+		t.Fatalf("workflow terminalized after unconfirmed stop: %+v, %v", record, err)
+	}
+	if len(admission.released) != 0 {
+		t.Fatalf("Admission released after unconfirmed stop: %v", admission.released)
+	}
+	if _, err := os.Stat(runDir); err != nil {
+		t.Fatalf("run directory removed after unconfirmed stop: %v", err)
 	}
 }
 

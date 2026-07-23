@@ -83,8 +83,7 @@ func (o *Orchestrator) FencePriorClusterEpoch(ctx context.Context, identity stor
 			return err
 		}
 		if sandbox != nil {
-			o.teardown(ctx, sandbox)
-			o.uncache(sandbox.ID)
+			o.cleanupStoppedSandbox(ctx, sandbox)
 		}
 	}
 	if err := o.st.ResetPriorNodeEpoch(ctx, identity.NodeID, identity.NodeEpoch); err != nil {
@@ -693,7 +692,9 @@ func (n *FinalClusterNode) executeSandbox(ctx context.Context, record *nodeexec.
 	sandbox := existing
 	sandbox.State = types.StateRunning
 	if err := n.core.launch(ctx, sandbox, template); err != nil {
-		n.core.teardown(context.Background(), sandbox)
+		if cleanupErr := n.core.teardown(context.Background(), sandbox); cleanupErr != nil {
+			return errors.Join(err, cleanupErr)
+		}
 		return n.failSandbox(ctx, claimed, sandbox, err)
 	}
 	if _, err := n.commitSandboxEvent(ctx, sandbox, nodeexec.EventUpdate{
@@ -865,7 +866,9 @@ func (n *FinalClusterNode) failResumedSandbox(
 		current = fallback
 	}
 	if current != nil {
-		n.core.teardown(cleanupCtx, current)
+		if cleanupErr := n.core.teardown(cleanupCtx, current); cleanupErr != nil {
+			return errors.Join(cause, cleanupErr)
+		}
 	}
 	if loadErr != nil {
 		cause = errors.Join(cause, fmt.Errorf("reload failed resumed Sandbox: %w", loadErr))
@@ -896,7 +899,9 @@ func (n *FinalClusterNode) deleteSandboxSync(ctx context.Context, command *route
 	if err != nil || sandbox == nil {
 		return errors.Join(err, errWrongExecutionBinding)
 	}
-	n.core.teardown(ctx, sandbox)
+	if err := n.core.teardown(ctx, sandbox); err != nil {
+		return err
+	}
 	terminal, err := n.commitSandboxEvent(ctx, sandbox, nodeexec.EventUpdate{State: "DELETED"})
 	if err != nil {
 		return err

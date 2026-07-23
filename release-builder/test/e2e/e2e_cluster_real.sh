@@ -191,6 +191,17 @@ wait_https() {
     fail "$name did not become healthy at $url"
 }
 
+wait_operator_get() {
+    local path="$1" output="$2" name="$3"
+    for _ in $(seq 1 900); do
+        if operator_curl --max-time 1 -f -o "$output" "$REGISTRY_BASE$path" 2>/dev/null; then
+            return 0
+        fi
+        sleep 0.1
+    done
+    fail "$name did not become available at $path"
+}
+
 post_operator() {
     local path="$1" body="$2" output="$3" code=""
     for _ in $(seq 1 100); do
@@ -619,7 +630,7 @@ start_cluster_control_plane() {
     done
 
     REGISTRY_BASE="https://127.0.0.1:$CONTROL_PORT"
-    operator_curl -f "$REGISTRY_BASE/internal/operator/system/state" >"$WORK/system-before.json"
+    wait_operator_get /internal/operator/system/state "$WORK/system-before.json" "System Group leader"
     python3 - "$WORK/system-before.json" "$WORK/generation.json" <<'PY'
 import json, sys
 state = json.load(open(sys.argv[1]))

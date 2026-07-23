@@ -19,6 +19,7 @@ type resourceRuntime struct {
 	admission *nodectl.AdmissionController
 	prepared  *nodectl.PreparedAdmissionController
 	socket    string
+	queueMax  uint64
 }
 
 func (r *resourceRuntime) clusterLoad() orch.ClusterResourceLoad {
@@ -173,5 +174,6 @@ func startResourceController(
 	}()
 	return &resourceRuntime{
 		state: state, admission: admission, prepared: prepared, socket: resolved.Listen,
+		queueMax: uint64(resolved.Admission.QueueMaxDepth),
 	}, nil
 }

@@ -175,8 +175,8 @@ func (o *Orchestrator) Create(ctx context.Context, req api.CreateReq) (*types.Sa
 		sb.CiUDS = sb.RunDir + "/ci.sock"
 	}
 	if err := o.launch(ctx, sb, tmpl); err != nil {
-		o.teardown(context.Background(), sb)
-		return nil, err
+		cleanupErr := o.teardown(context.Background(), sb)
+		return nil, errors.Join(err, cleanupErr)
 	}
 	o.publishUpsert(sb) // tell external proxies about the new route
 	return sb, nil
@@ -301,7 +301,9 @@ func (o *Orchestrator) Kill(ctx context.Context, id, apiKey string) (bool, error
 	if !ownsSandbox(sb, apiKey) {
 		return false, nil
 	}
-	o.teardown(ctx, sb)
+	if err := o.teardown(ctx, sb); err != nil {
+		return false, err
+	}
 	_ = o.st.Delete(ctx, id)
 	o.uncache(id)
 	o.publishDelete(id) // tell external proxies the route is gone
@@ -988,8 +990,10 @@ func (o *Orchestrator) Reconcile(ctx context.Context) error {
 	}
 	for _, sb := range dead {
 		o.log.Info("reconcile: dead sandbox", "sid", sb.ID)
-		o.teardown(ctx, sb)
-		_ = o.st.SetState(ctx, sb.ID, types.StateDead)
+		o.cleanupStoppedSandbox(ctx, sb)
+		if err := o.st.SetState(ctx, sb.ID, types.StateDead); err != nil {
+			return err
+		}
 	}
 	// Idle prestarted units have no sandbox row. They cannot be adopted by a new
 	// pool instance because their old WaitAssignment request belonged to the
@@ -1114,16 +1118,30 @@ func (o *Orchestrator) MmdsSecret(sid string) (secret []byte, ok bool) {
 	return s, s != nil
 }
 
-func (o *Orchestrator) teardown(ctx context.Context, sb *types.Sandbox) {
+func (o *Orchestrator) teardown(ctx context.Context, sb *types.Sandbox) error {
 	// The sandbox runs in its systemd unit's own cgroup (sandbox-ctl --cgroup-adopt),
 	// and the unit is KillMode=control-group, so StopUnit SIGKILLs every straggler
 	// (cloud-hypervisor included). No separate cgroup drain/rmdir is needed.
 	if sb.RunID != "" {
-		_ = o.lc.Stop(ctx, o.runnerUnit(sb.RunID))
-		_ = o.lc.ResetFailed(ctx, o.runnerUnit(sb.RunID))
+		unit := o.runnerUnit(sb.RunID)
+		if err := o.lc.Stop(ctx, unit); err != nil {
+			return fmt.Errorf("stop Sandbox unit %q: %w", unit, err)
+		}
+		if err := o.lc.ResetFailed(ctx, unit); err != nil {
+			o.log.Warn("reset stopped Sandbox unit", "sid", sb.ID, "unit", unit, "err", err)
+		}
 	}
-	_ = o.vs.Detach(ctx, sb.VswitchPort)
-	_ = os.RemoveAll(sb.RunDir)
+	o.cleanupStoppedSandbox(ctx, sb)
+	return nil
+}
+
+func (o *Orchestrator) cleanupStoppedSandbox(ctx context.Context, sb *types.Sandbox) {
+	if err := o.vs.Detach(ctx, sb.VswitchPort); err != nil {
+		o.log.Warn("detach stopped Sandbox vswitch port", "sid", sb.ID, "port", sb.VswitchPort, "err", err)
+	}
+	if err := os.RemoveAll(sb.RunDir); err != nil {
+		o.log.Warn("remove stopped Sandbox run directory", "sid", sb.ID, "run_dir", sb.RunDir, "err", err)
+	}
 	o.uncache(sb.ID)
 }
 

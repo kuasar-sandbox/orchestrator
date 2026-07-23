@@ -282,6 +282,7 @@ func runConductor(args []string, log *slog.Logger) error {
 		var sandboxAdmission nodeexec.SandboxAdmissionController
 		var sandboxUsage func(context.Context) (nodectl.PreparedAdmissionUsage, error)
 		var resourceLoad func() orch.ClusterResourceLoad
+		sandboxQueueLimit := effectiveSandboxQueueLimit(uint64(cfg.Cluster.SandboxQueueLimit), clusterResource)
 		if clusterResource != nil {
 			if clusterResource.prepared == nil {
 				return errors.New("cluster resource controller has no durable prepared Admission path")
@@ -315,7 +316,7 @@ func runConductor(args []string, log *slog.Logger) error {
 		finalNode, err := orch.NewFinalClusterNode(core, st, orch.ClusterNodeOptions{
 			Session: sessionRuntime, SandboxAdmission: sandboxAdmission,
 			SandboxUsage: sandboxUsage, ResourceLoad: resourceLoad,
-			SandboxSlotCapacity: uint64(capacity), SandboxQueueLimit: uint64(cfg.Cluster.SandboxQueueLimit),
+			SandboxSlotCapacity: uint64(capacity), SandboxQueueLimit: sandboxQueueLimit,
 			BuildCapacity: buildCapacity, SandboxWorkers: cfg.Cluster.SandboxWorkers,
 			BuildWorkers: cfg.Cluster.BuildWorkers,
 		}, log)
@@ -348,7 +349,7 @@ func runConductor(args []string, log *slog.Logger) error {
 		registration := routesync.NodeRegister{
 			NodeID: clusterStart.NodeID, EnrollmentID: clusterStart.EnrollmentID,
 			LoadModelVersion: placement.LoadModelVersion,
-			Labels:           cfg.Cluster.Labels, Capabilities: map[string]bool{"sandbox": true, "build": true},
+			Labels:           cfg.Cluster.Labels, Capabilities: clusterNodeCapabilities(cfg.Proxy.Mode),
 			Draining: load.Draining, Capacity: capacity, BuildCapacity: buildResources,
 			DataEndpoint: clusterStart.DataEndpoint, RuntimeDigest: runtimeDigest,
 			FailureDomain: cfg.Cluster.Labels["zone"],
@@ -462,6 +463,21 @@ func runConductor(args []string, log *slog.Logger) error {
 }
 
 // buildDataPlane wires the data-plane handler for the configured proxy_mode.
+func effectiveSandboxQueueLimit(configured uint64, resource *resourceRuntime) uint64 {
+	if resource != nil {
+		return resource.queueMax
+	}
+	return configured
+}
+
+func clusterNodeCapabilities(proxyMode string) map[string]bool {
+	capabilities := map[string]bool{"build": true}
+	if proxyMode != config.ProxyOff {
+		capabilities["sandbox"] = true
+	}
+	return capabilities
+}
+
 func buildDataPlane(cfg *config.Config, core *orch.Orchestrator, plugins *configsock.Registry, mx *metrics.M, log *slog.Logger, proxyNS *netns.NetNS) http.Handler {
 	switch cfg.Proxy.Mode {
 	case config.ProxyOff:
