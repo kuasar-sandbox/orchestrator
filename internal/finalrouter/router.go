@@ -22,6 +22,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
@@ -43,6 +44,7 @@ const (
 
 	pendingBuildPollInterval = 50 * time.Millisecond
 	pendingBuildForwardWait  = 30 * time.Second
+	maxGroupBytes            = 4 << 10
 	maxRouteKeyBytes         = 4 << 10
 	nodeControlDialTimeout   = 5 * time.Second
 	nodeControlTLSTimeout    = 5 * time.Second
@@ -374,6 +376,8 @@ func (r *Router) reserve(ctx context.Context, group, routeKey string, input rout
 		response := result.Response
 		if response.Outcome == routeapi.MutationPending {
 			err = errRoutePending
+		} else if response.Outcome == routeapi.MutationConflict {
+			err = errRouteInputConflict
 		} else if response.Outcome != routeapi.MutationReady || response.Route == nil {
 			err = fmt.Errorf("Route mutation ended as %s: %s", response.Outcome, response.Reason)
 		} else {
@@ -773,8 +777,12 @@ func (r *Router) forwardNodeControl(w http.ResponseWriter, request *http.Request
 	providerKey, providerHeader := providerCredential(request)
 	pauseRouteKey, exactPause := escapedSandboxAction(request.URL.EscapedPath(), "pause")
 	if route != nil {
-		_, releaseRevision := r.beginRouteRevision(route.Group, route.RouteKey)
+		minimum, releaseRevision := r.beginRouteRevision(route.Group, route.RouteKey)
 		defer releaseRevision()
+		if route.Revision < minimum {
+			http.Error(w, "Sandbox Route revision is stale", http.StatusServiceUnavailable)
+			return
+		}
 		if !r.control.CacheAuthorized(route.ServeIdentity) {
 			http.Error(w, "Router Serve Permit expired", http.StatusServiceUnavailable)
 			return
@@ -910,8 +918,8 @@ func rewriteSandboxJSON(value any, routeKey string) any {
 
 func (r *Router) serveData(w http.ResponseWriter, request *http.Request, host string) {
 	group := request.Header.Get(HeaderGroup)
-	if group == "" {
-		http.Error(w, HeaderGroup+" is required", http.StatusBadRequest)
+	if !validGroup(group) {
+		http.Error(w, "invalid "+HeaderGroup, http.StatusBadRequest)
 		return
 	}
 	routeKey, hostPort, hasHostPort, err := parseDataHost(
@@ -1102,8 +1110,12 @@ func (r *Router) forwardData(
 	injectToken bool,
 	consumedProviderHeader string,
 ) {
-	_, releaseRevision := r.beginRouteRevision(entry.Group, entry.RouteKey)
+	minimum, releaseRevision := r.beginRouteRevision(entry.Group, entry.RouteKey)
 	defer releaseRevision()
+	if entry.Revision < minimum {
+		http.Error(w, "Sandbox Route revision is stale", http.StatusServiceUnavailable)
+		return
+	}
 	if !r.control.CacheAuthorized(entry.ServeIdentity) {
 		http.Error(w, "Router Serve Permit expired", http.StatusServiceUnavailable)
 		return
@@ -1443,11 +1455,23 @@ func (r *Router) evictBuild(group, id string) {
 
 func (r *Router) authorizedGroup(w http.ResponseWriter, request *http.Request) (string, bool) {
 	group := request.Header.Get(HeaderGroup)
-	if group == "" {
-		http.Error(w, HeaderGroup+" required", http.StatusBadRequest)
+	if !validGroup(group) {
+		http.Error(w, "invalid "+HeaderGroup, http.StatusBadRequest)
 		return "", false
 	}
 	return group, r.authorize(w, request.Context(), group, apiKey(request))
+}
+
+func validGroup(group string) bool {
+	if group == "" || len(group) > maxGroupBytes || !utf8.ValidString(group) {
+		return false
+	}
+	for _, character := range group {
+		if unicode.IsControl(character) {
+			return false
+		}
+	}
+	return true
 }
 
 func (r *Router) authorize(w http.ResponseWriter, ctx context.Context, group, key string) bool {

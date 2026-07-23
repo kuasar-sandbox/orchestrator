@@ -35,6 +35,17 @@ func TestBuildInitialRegistryLayoutBalancesAndValidatesReplicaSets(t *testing.T)
 	}
 }
 
+func TestValidateBootstrapVirtualShardsRejectsUnallocatableLayout(t *testing.T) {
+	if err := validateBootstrapVirtualShards(4096); err != nil {
+		t.Fatalf("canonical shard count rejected: %v", err)
+	}
+	for _, value := range []uint64{0, 3, maximumBootstrapVirtualShards << 1, 1 << 31} {
+		if err := validateBootstrapVirtualShards(value); err == nil {
+			t.Fatalf("unallocatable shard count %d was accepted", value)
+		}
+	}
+}
+
 func TestRegistryLayoutBootstrapWritesVerifiableArtifacts(t *testing.T) {
 	dir := t.TempDir()
 	membersPath := filepath.Join(dir, "members.json")

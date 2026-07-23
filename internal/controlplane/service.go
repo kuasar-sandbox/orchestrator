@@ -210,15 +210,6 @@ func (s *RegistryService) ReserveSandbox(
 		RequestIdentity: request.RequestIdentity, Group: request.Group, RouteKey: request.RouteKey,
 		MinRouteRevision: request.MinRouteRevision,
 	})
-	if err == nil && local.Outcome == routeapi.ReadReady {
-		if local.Route == nil || !sandboxInputMatchesIntent(request.Input, local.Route.Intent) {
-			return routeConflict(request.Group, request.RouteKey, errors.New("route key is bound to a different Sandbox request")), nil
-		}
-		return routeapi.RouteMutationResponse{
-			Outcome: routeapi.MutationReady, Group: request.Group, RouteKey: request.RouteKey,
-			State: clusterstate.WorkflowRouteReady, Route: local.Route, RouteRevision: local.RouteRevision,
-		}, nil
-	}
 	leader, leaderErr := s.store.LocalCoordinator(request.ShardID)
 	if leaderErr != nil || !leader {
 		response := routeapi.RouteMutationResponse{
@@ -1173,8 +1164,11 @@ func cloneStringMap(source map[string]string) map[string]string {
 // by the workflow CAS and exact node Binding.
 func (s *RegistryService) Run(ctx context.Context) error {
 	defer s.stopCompaction()
-	if _, err := s.store.RefreshPermitGrant(ctx); err != nil {
-		return err
+	identity, err := s.store.ServeIdentity()
+	if err != nil || !s.store.AllowSessionWork(identity, session.PermitProbe) {
+		if _, err := s.store.RefreshPermitGrant(ctx); err != nil {
+			return err
+		}
 	}
 	permitDone := make(chan struct{})
 	go func() {

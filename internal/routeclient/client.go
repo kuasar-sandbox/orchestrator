@@ -439,13 +439,17 @@ func (c *Client) ListRoutesPage(
 		if err != nil {
 			return RouteListPageResult{}, err
 		}
-		afterRouteKey := ""
+		bucketStartAfter := ""
 		if bucket == cursor.Bucket {
-			afterRouteKey = cursor.AfterRouteKey
+			bucketStartAfter = cursor.AfterRouteKey
 		}
+		afterRouteKey := bucketStartAfter
 		readKey := group + "\x00" + strconv.FormatUint(uint64(bucket), 10)
-		for len(routes) < target {
-			requestLimit := min(target-len(routes), routeListRPCPageSize)
+		bucketRoutes := make([]positionedRoute, 0, target-len(routes))
+		snapshotRevision := uint64(0)
+		restarts := 0
+		for len(routes)+len(bucketRoutes) < target {
+			requestLimit := min(target-len(routes)-len(bucketRoutes), routeListRPCPageSize)
 			request := routeapi.ListRoutesRequest{
 				RequestIdentity: identity, Group: group, Bucket: bucket, State: state,
 				AfterRouteKey: afterRouteKey, Limit: uint32(requestLimit),
@@ -457,14 +461,28 @@ func (c *Client) ListRoutesPage(
 			if !c.CacheAuthorized(serveIdentity) {
 				return RouteListPageResult{}, ErrPermitUnavailable
 			}
+			if snapshotRevision != 0 && response.SnapshotRevision != snapshotRevision {
+				restarts++
+				if restarts > 3 {
+					return RouteListPageResult{}, errors.New("routeclient: Route bucket snapshot changed repeatedly during pagination")
+				}
+				bucketRoutes = bucketRoutes[:0]
+				snapshotRevision = 0
+				afterRouteKey = bucketStartAfter
+				continue
+			}
+			if snapshotRevision == 0 {
+				snapshotRevision = response.SnapshotRevision
+			}
 			for _, route := range response.Routes {
-				routes = append(routes, positionedRoute{route: route, bucket: bucket})
+				bucketRoutes = append(bucketRoutes, positionedRoute{route: route, bucket: bucket})
 			}
 			if response.NextRouteKey == "" {
 				break
 			}
 			afterRouteKey = response.NextRouteKey
 		}
+		routes = append(routes, bucketRoutes...)
 	}
 	result := RouteListPageResult{ServeIdentity: serveIdentity}
 	if len(routes) > int(limit) {

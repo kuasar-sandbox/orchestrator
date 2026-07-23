@@ -31,6 +31,7 @@ type revisionControl struct {
 	reserveRelease  chan struct{}
 	reserveCalls    int
 	reserveErr      error
+	reserveOutcome  string
 	resumeCalls     int
 	resume          func(string, string, uint64) (routeclient.RouteMutationResult, error)
 	deleteCalls     int
@@ -62,8 +63,12 @@ func (c *revisionControl) ReserveSandbox(_ context.Context, group, routeKey stri
 	if c.reserveErr != nil {
 		return routeclient.RouteMutationResult{}, c.reserveErr
 	}
+	outcome := c.reserveOutcome
+	if outcome == "" {
+		outcome = routeapi.MutationReady
+	}
 	return routeclient.RouteMutationResult{ServeIdentity: c.serveIdentity, Response: routeapi.RouteMutationResponse{
-		Outcome: routeapi.MutationReady, Group: group, RouteKey: routeKey,
+		Outcome: outcome, Group: group, RouteKey: routeKey,
 		State: clusterstate.WorkflowRouteReady, Route: &c.route, RouteRevision: c.revision,
 	}}, nil
 }
@@ -933,6 +938,67 @@ func TestRouteKeyByteBound(t *testing.T) {
 	}
 	if validRouteKey(strings.Repeat("r", maxRouteKeyBytes+1)) {
 		t.Fatal("Route key above the byte limit was accepted")
+	}
+}
+
+func TestGroupByteAndCharacterBound(t *testing.T) {
+	if !validGroup(strings.Repeat("g", maxGroupBytes)) {
+		t.Fatal("group at the byte limit was rejected")
+	}
+	for _, group := range []string{"", strings.Repeat("g", maxGroupBytes+1), "/group\nother", string([]byte{0xff})} {
+		if validGroup(group) {
+			t.Fatalf("invalid group %q was accepted", group)
+		}
+	}
+}
+
+func TestReservePreservesRegistryInputConflict(t *testing.T) {
+	serveIdentity := routeapi.RegistryServeIdentity{
+		ClusterID: "cluster-1", RegistryGeneration: "generation-1", SystemEpoch: 1,
+		RegistryLayoutDigest: "registry-layout-1",
+	}
+	control := &revisionControl{serveIdentity: serveIdentity, reserveOutcome: routeapi.MutationConflict}
+	router, err := New(control, allowCaller{}, "example.test", time.Minute, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := router.reserve(context.Background(), "/group", "route-1", routeapi.SandboxInput{}); !errors.Is(err, errRouteInputConflict) {
+		t.Fatalf("reserve conflict = %v", err)
+	}
+}
+
+func TestForwardingRejectsEntryBelowConcurrentRevisionFence(t *testing.T) {
+	serveIdentity := routeapi.RegistryServeIdentity{
+		ClusterID: "cluster-1", RegistryGeneration: "generation-1", SystemEpoch: 1,
+		RegistryLayoutDigest: "registry-layout-1",
+	}
+	router, err := New(&revisionControl{serveIdentity: serveIdentity}, allowCaller{}, "example.test", time.Minute, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := &routeEntry{
+		Group: "/group", RouteKey: "route-1", Revision: 7, ServeIdentity: serveIdentity,
+		Route: clusterstate.ReadyRoute{
+			SandboxID: "sandbox-1", NodeID: "node-1", NodeEpoch: 1,
+			DataEndpoint: "127.0.0.1:1", RegistryGeneration: "generation-1", BindingDigest: "binding-1",
+		},
+	}
+	if !router.fenceRouteRevision(entry.Group, entry.RouteKey, entry.Revision+1) {
+		t.Fatal("failed to establish newer Route revision fence")
+	}
+
+	controlRequest := httptest.NewRequest(http.MethodGet, "http://api.example.test/sandboxes/route-1", nil)
+	controlResponse := httptest.NewRecorder()
+	router.forwardNodeControl(controlResponse, controlRequest, entry, nil)
+	if controlResponse.Code != http.StatusServiceUnavailable {
+		t.Fatalf("stale control forwarding status = %d", controlResponse.Code)
+	}
+
+	dataRequest := httptest.NewRequest(http.MethodGet, "http://data.example.test/", nil)
+	dataResponse := httptest.NewRecorder()
+	router.forwardData(dataResponse, dataRequest, entry, 3000, false, "")
+	if dataResponse.Code != http.StatusServiceUnavailable {
+		t.Fatalf("stale data forwarding status = %d", dataResponse.Code)
 	}
 }
 

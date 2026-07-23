@@ -12,12 +12,16 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/net/http/httpguts"
 )
 
-const sandboxConnectHandshakeTimeout = 10 * time.Second
+const (
+	sandboxConnectHandshakeTimeout = 10 * time.Second
+	forwardHTTPHeaderTimeout       = 30 * time.Second
+)
 
 func sandboxConnectHandshakeContext(ctx context.Context) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(ctx, sandboxConnectHandshakeTimeout)
@@ -298,10 +302,55 @@ func ForwardHTTPOnce(r *http.Request, backend net.Conn, br *bufio.Reader, mutate
 	if mutate != nil {
 		mutate(out)
 	}
-	if err := out.Write(backend); err != nil {
+	deadline := time.Now().Add(forwardHTTPHeaderTimeout)
+	contextDeadline, hasContextDeadline := r.Context().Deadline()
+	if hasContextDeadline && contextDeadline.Before(deadline) {
+		deadline = contextDeadline
+	}
+	if err := backend.SetDeadline(deadline); err != nil {
 		return nil, err
 	}
-	return http.ReadResponse(br, out)
+	stopCancellation := context.AfterFunc(r.Context(), func() {
+		_ = backend.SetDeadline(time.Now())
+	})
+	fail := func(err error) (*http.Response, error) {
+		stopCancellation()
+		if contextErr := r.Context().Err(); contextErr != nil {
+			err = contextErr
+		} else if hasContextDeadline && !time.Now().Before(contextDeadline) {
+			err = context.DeadlineExceeded
+		}
+		return nil, err
+	}
+	if err := out.Write(backend); err != nil {
+		return fail(err)
+	}
+	response, err := http.ReadResponse(br, out)
+	if err != nil {
+		return fail(err)
+	}
+	if err := backend.SetDeadline(time.Time{}); err != nil &&
+		!errors.Is(err, net.ErrClosed) && !errors.Is(err, io.ErrClosedPipe) {
+		response.Body.Close()
+		return fail(err)
+	}
+	if contextErr := r.Context().Err(); contextErr != nil {
+		response.Body.Close()
+		return fail(contextErr)
+	}
+	response.Body = &contextBoundResponseBody{ReadCloser: response.Body, stopCancellation: stopCancellation}
+	return response, nil
+}
+
+type contextBoundResponseBody struct {
+	io.ReadCloser
+	stopCancellation func() bool
+	once             sync.Once
+}
+
+func (b *contextBoundResponseBody) Close() error {
+	b.once.Do(func() { b.stopCancellation() })
+	return b.ReadCloser.Close()
 }
 
 func removeHopHeaders(h http.Header) {

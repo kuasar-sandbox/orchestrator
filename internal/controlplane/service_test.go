@@ -138,6 +138,47 @@ func TestRegistryReadyPositiveReadStillChecksImmutableSandboxRequest(t *testing.
 	}
 }
 
+func TestRegistryFollowerDoesNotReserveFromLocalReadyProjection(t *testing.T) {
+	service, store, planner, dispatcher := newRegistryServiceFixture(t, clusterstate.DispatchAcceptedAdmitted)
+	request := sandboxMutationRequest(t, store)
+	if _, err := service.ReserveSandbox(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	record, err := store.ReadRouteWorkflow(context.Background(), request.Group, request.RouteKey)
+	if err != nil || record == nil || record.Starting == nil || record.Starting.Binding == nil {
+		t.Fatalf("STARTING = %+v, %v", record, err)
+	}
+	binding := *record.Starting.Binding
+	converger, err := NewEventConverger(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := converger.ConvergeExecutionEvent(context.Background(), routesync.ExecutionEvent{
+		ObjectKind: "sandbox", ObjectID: record.Starting.SandboxID,
+		NodeID: binding.NodeID, NodeEpoch: binding.NodeEpoch,
+		RegistryGeneration: binding.RegistryGeneration, Binding: binding.OpaqueBinding,
+		BindingDigest: binding.BindingDigest, EventSeq: 1,
+		State: string(clusterstate.WorkflowRouteReady), DataEndpoint: binding.DataEndpoint,
+		TargetPort: 3000, AccessToken: "access", TrafficAccessToken: "traffic",
+		TemplateRef: "e2b-img-" + strings.Repeat("c", 64),
+		Presentation: &clusterstate.SandboxPresentationV1{
+			CPUCount: 2, MemoryMB: 2048, DiskSizeMB: 64, EnvdVersion: "0.6.1", StartedAt: 1, EndAt: 2,
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	leader := false
+	store.runtime.(*serviceConsensus).localDataLeader = &leader
+
+	response, err := service.ReserveSandbox(context.Background(), request)
+	if err != nil || response.Outcome != routeapi.MutationNeedLeader {
+		t.Fatalf("follower Reserve = %+v, %v", response, err)
+	}
+	if planner.callCount() != 1 || len(dispatcher.snapshot()) != 1 {
+		t.Fatal("follower performed placement or dispatch from its local READY projection")
+	}
+}
+
 func TestRegistryBuildIDConflictSurvivesRegisteredProjection(t *testing.T) {
 	service, store, planner, _ := newRegistryServiceFixture(t, clusterstate.DispatchAcceptedQueued)
 	request := buildMutationRequest(t, store)
@@ -191,11 +232,38 @@ func TestNextSandboxRoundPreservesTargetRuntimeDigest(t *testing.T) {
 
 type serviceConsensus struct {
 	*memoryConsensus
-	system raftstore.SystemState
+	system          raftstore.SystemState
+	localDataLeader *bool
 }
 
 func (s *serviceConsensus) ReadSystemStrong(context.Context) (raftstore.SystemState, error) {
 	return s.system, nil
+}
+
+func (s *serviceConsensus) LocalDataShardLeader(uint32) (bool, error) {
+	if s.localDataLeader == nil {
+		return true, nil
+	}
+	return *s.localDataLeader, nil
+}
+
+type countingPermitConsensus struct {
+	*serviceConsensus
+	mu        sync.Mutex
+	refreshes int
+}
+
+func (s *countingPermitConsensus) RefreshPermit(ctx context.Context) (raftstore.PermitGrant, error) {
+	s.mu.Lock()
+	s.refreshes++
+	s.mu.Unlock()
+	return s.memoryConsensus.RefreshPermit(ctx)
+}
+
+func (s *countingPermitConsensus) refreshCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.refreshes
 }
 
 type blockingRecoveryConsensus struct {
@@ -277,6 +345,67 @@ func TestRegistryPermitRefreshIsIndependentOfRecoveryScan(t *testing.T) {
 		case <-time.After(time.Second):
 			t.Fatal("blocked recovery scan stopped Permit refresh")
 		}
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Registry service did not stop after cancellation")
+	}
+}
+
+func TestRegistryRunReusesValidStartupPermit(t *testing.T) {
+	registryLayout := testControlRegistryLayout()
+	memory, err := newMemoryConsensus(registryLayout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest, err := registryLayout.Digest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	consensus := &countingPermitConsensus{serviceConsensus: &serviceConsensus{
+		memoryConsensus: memory,
+		system: raftstore.SystemState{
+			Initialized: true, ClusterID: registryLayout.ClusterID,
+			RegistryGeneration: registryLayout.RegistryGeneration, SystemEpoch: 1,
+			ActiveRegistryLayoutDigest: digest, NodeEnrollments: map[string]raftstore.NodeEnrollmentRecord{},
+		},
+	}}
+	store, err := NewRaftStore(consensus, registryLayout, digest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.RefreshPermitGrant(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	config := DefaultRegistryServiceConfig()
+	config.PermitRefreshInterval = 4 * time.Second
+	config.RecoveryScanInterval = time.Hour
+	service, err := NewRegistryService(
+		store,
+		&servicePlanner{},
+		serviceProber{},
+		&serviceDispatcher{outcome: clusterstate.DispatchUnknown},
+		serviceCommandSender{},
+		config,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- service.Run(ctx) }()
+	select {
+	case err := <-done:
+		t.Fatalf("Registry service stopped during startup: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+	if got := consensus.refreshCount(); got != 1 {
+		t.Fatalf("Permit refreshes = %d, want only the preloaded startup Permit", got)
 	}
 	cancel()
 	select {

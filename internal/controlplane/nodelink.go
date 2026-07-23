@@ -21,6 +21,7 @@ const (
 	defaultDispatchTimeout = 5 * time.Second
 	defaultEventWorkers    = 32
 	defaultReconnectRate   = 200
+	initialRegistrationTTL = 5 * time.Second
 )
 
 // ExecutionEventSink converges one node-authoritative fact through its owning
@@ -82,8 +83,8 @@ func (s *NodeLinkServer) ServeHTTP(w http.ResponseWriter, request *http.Request)
 		http.Error(w, "node-link requires a flushable HTTP/2 response", http.StatusInternalServerError)
 		return
 	}
-	first, err := routesync.ReadMsg(request.Body)
-	if err != nil || first.Type != routesync.TypeNodeRegister || first.NodeReg == nil {
+	first, err := readInitialNodeRegistration(request.Context(), request.Body)
+	if err != nil || first == nil || first.Type != routesync.TypeNodeRegister || first.NodeReg == nil {
 		http.Error(w, "node-link requires node_register as its first frame", http.StatusBadRequest)
 		return
 	}
@@ -152,6 +153,19 @@ func (s *NodeLinkServer) ServeHTTP(w http.ResponseWriter, request *http.Request)
 		}
 	default:
 	}
+}
+
+func readInitialNodeRegistration(ctx context.Context, body io.ReadCloser) (*routesync.Msg, error) {
+	readCtx, cancel := context.WithTimeout(ctx, initialRegistrationTTL)
+	defer cancel()
+	stopCancellation := context.AfterFunc(readCtx, func() { _ = body.Close() })
+	message, err := routesync.ReadMsg(body)
+	if !stopCancellation() || readCtx.Err() != nil {
+		if contextErr := readCtx.Err(); contextErr != nil {
+			return nil, contextErr
+		}
+	}
+	return message, err
 }
 
 type reconnectLimiter struct {

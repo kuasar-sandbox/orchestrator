@@ -510,6 +510,69 @@ func TestListRoutesPageUsesSmallInternalRPCPages(t *testing.T) {
 	}
 }
 
+func TestListRoutesPageRestartsBucketWhenSnapshotChanges(t *testing.T) {
+	client := testClient(t)
+	client.permit = &cachedPermit{response: routeapi.PermitResponse{
+		ClusterID: client.registryLayout.ClusterID, RegistryGeneration: client.registryLayout.RegistryGeneration,
+		SystemEpoch: 1, RegistryLayoutDigest: client.digest, CommitIndex: 1, MaxLifetimeMillis: 5000,
+		ServeGate: true, WriteGate: true, CutoverGate: true, RecoveryClosed: true,
+	}, expires: time.Now().Add(time.Minute)}
+	entry := func(index int) routeapi.ListedRoute {
+		return routeapi.ListedRoute{
+			RouteKey: fmt.Sprintf("route-%03d", index), State: clusterstate.WorkflowRouteReady,
+			NodeID: "node-1", TemplateRef: "template-1",
+			Presentation: clusterstate.SandboxPresentationV1{
+				CPUCount: 1, MemoryMB: 512, DiskSizeMB: 64, EnvdVersion: "0.6.1", StartedAt: 1, EndAt: 2,
+			},
+		}
+	}
+	var cursors []string
+	transport := roundTripperFunc(func(request *http.Request) (*http.Response, error) {
+		var input routeapi.ListRoutesRequest
+		if err := json.NewDecoder(request.Body).Decode(&input); err != nil {
+			return nil, err
+		}
+		response := routeapi.ListRoutesResponse{Bucket: input.Bucket, SnapshotRevision: 11}
+		if input.Bucket == 0 {
+			cursors = append(cursors, input.AfterRouteKey)
+			start := 0
+			if input.AfterRouteKey != "" {
+				if _, err := fmt.Sscanf(input.AfterRouteKey, "route-%03d", &start); err != nil {
+					return nil, err
+				}
+				start++
+			}
+			if len(cursors) == 1 {
+				response.SnapshotRevision = 10
+			}
+			for index := start; index < 11 && len(response.Routes) < int(input.Limit); index++ {
+				response.Routes = append(response.Routes, entry(index))
+			}
+			if start+len(response.Routes) < 11 {
+				response.NextRouteKey = response.Routes[len(response.Routes)-1].RouteKey
+			}
+		}
+		body, _ := json.Marshal(response)
+		return &http.Response{
+			StatusCode: http.StatusOK, Status: "200 OK", Header: make(http.Header),
+			Body: io.NopCloser(strings.NewReader(string(body))), Request: request,
+		}, nil
+	})
+	for memberID, endpoint := range client.endpoints {
+		endpoint.Client = &http.Client{Transport: transport}
+		client.endpoints[memberID] = endpoint
+	}
+	result, err := client.ListRoutesPage(context.Background(), "/group", "", 10, "")
+	if err != nil || len(result.Routes) != 10 || result.Routes[0].RouteKey != "route-000" ||
+		result.Routes[9].RouteKey != "route-009" || result.NextToken == "" {
+		t.Fatalf("stable Route page = %+v, %v", result, err)
+	}
+	wantCursors := []string{"", "route-007", "", "route-007"}
+	if !reflect.DeepEqual(cursors, wantCursors) {
+		t.Fatalf("bucket cursors = %v, want %v", cursors, wantCursors)
+	}
+}
+
 func testClient(t *testing.T) *Client {
 	t.Helper()
 	registryLayout := testRouteRegistryLayout()

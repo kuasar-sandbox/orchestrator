@@ -21,7 +21,13 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/raftstore"
 )
 
-const maximumInitialRegistryLayoutMembers = 128
+const (
+	maximumInitialRegistryLayoutMembers = 128
+	// A three-replica shard row occupies at least 124 JSON bytes. The largest
+	// power of two that can possibly fit MaxRegistryLayoutBytes is therefore
+	// 32768; larger values cannot produce a valid signed artifact.
+	maximumBootstrapVirtualShards = uint64(1 << 15)
+)
 
 func registryLayoutCmd(args []string) error {
 	if len(args) == 0 {
@@ -57,8 +63,8 @@ func registryLayoutBootstrapCmd(args []string) error {
 		*secretPath == "" || *signingKeyPath == "" || *keyID == "" || *chainOut == "" || *keyringOut == "" {
 		return errors.New("registry-layout bootstrap: all identity, member, secret, signing, and output flags are required")
 	}
-	if *virtualShards == 0 || uint64(*virtualShards) > uint64(^uint32(0)) {
-		return errors.New("registry-layout bootstrap: virtual shard count is outside uint32")
+	if err := validateBootstrapVirtualShards(uint64(*virtualShards)); err != nil {
+		return err
 	}
 	permitMillis := *permitLifetime / time.Millisecond
 	if permitMillis <= 0 || time.Duration(permitMillis)*time.Millisecond != *permitLifetime ||
@@ -111,6 +117,19 @@ func registryLayoutBootstrapCmd(args []string) error {
 	if err := writeNewArtifact(*keyringOut, append(keyring, '\n'), 0o644); err != nil {
 		_ = os.Remove(*chainOut)
 		return err
+	}
+	return nil
+}
+
+func validateBootstrapVirtualShards(value uint64) error {
+	if value == 0 || value > uint64(^uint32(0)) || value&(value-1) != 0 {
+		return errors.New("registry-layout bootstrap: virtual shard count must be a power of two in uint32")
+	}
+	if value > maximumBootstrapVirtualShards {
+		return fmt.Errorf(
+			"registry-layout bootstrap: virtual shard count exceeds artifact capacity (%d)",
+			maximumBootstrapVirtualShards,
+		)
 	}
 	return nil
 }

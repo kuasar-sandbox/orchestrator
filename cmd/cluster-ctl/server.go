@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
@@ -24,6 +25,8 @@ type clusterHTTPServer struct {
 	listener net.Listener
 }
 
+const clusterReadHeaderTimeout = 10 * time.Second
+
 func newClusterHTTPServer(name, addr string, tlsMaterial clustercfg.TLS, handler http.Handler) (*clusterHTTPServer, error) {
 	if strings.HasPrefix(addr, "/") && tlsMaterial.Enabled() {
 		return nil, fmt.Errorf("cluster: %s certificate-authenticated listener requires TCP", name)
@@ -32,7 +35,9 @@ func newClusterHTTPServer(name, addr string, tlsMaterial clustercfg.TLS, handler
 	if err != nil {
 		return nil, fmt.Errorf("cluster: %s listen %s: %w", name, addr, err)
 	}
-	server := &http.Server{Handler: h2c.NewHandler(handler, &http2.Server{})}
+	server := &http.Server{
+		Handler: h2c.NewHandler(handler, &http2.Server{}), ReadHeaderTimeout: clusterReadHeaderTimeout,
+	}
 	useTLS := tlsMaterial.Enabled()
 	if useTLS {
 		tlsConfig, err := tlsMaterial.ServerConfig()
@@ -40,7 +45,7 @@ func newClusterHTTPServer(name, addr string, tlsMaterial clustercfg.TLS, handler
 			_ = listener.Close()
 			return nil, fmt.Errorf("cluster: %s tls: %w", name, err)
 		}
-		server = &http.Server{Handler: handler, TLSConfig: tlsConfig}
+		server = &http.Server{Handler: handler, TLSConfig: tlsConfig, ReadHeaderTimeout: clusterReadHeaderTimeout}
 	}
 	return &clusterHTTPServer{
 		name: name, addr: addr, useTLS: useTLS, server: server, listener: listener,

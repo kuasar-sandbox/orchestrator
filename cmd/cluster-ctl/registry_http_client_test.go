@@ -76,3 +76,19 @@ func TestCertificateAuthenticatedServerRejectsUnixListener(t *testing.T) {
 		t.Fatal("certificate-authenticated Unix listener was accepted")
 	}
 }
+
+func TestClusterHTTPServerBoundsRequestHeaders(t *testing.T) {
+	server, err := newClusterHTTPServer(
+		"registry",
+		filepath.Join(t.TempDir(), "registry.sock"),
+		clustercfg.TLS{},
+		http.NotFoundHandler(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.listener.Close()
+	if server.server.ReadHeaderTimeout != clusterReadHeaderTimeout || server.server.ReadHeaderTimeout <= 0 {
+		t.Fatalf("ReadHeaderTimeout = %s", server.server.ReadHeaderTimeout)
+	}
+}

@@ -697,6 +697,9 @@ func (c *Config) validate() error {
 		return fmt.Errorf("config: units.builder_pool_size must be >= 0")
 	}
 	if c.Cluster.NodeLink.Endpoint != "" {
+		if err := validateNodeLinkEndpoint(c.Cluster.NodeLink.Endpoint); err != nil {
+			return err
+		}
 		tls := c.Cluster.NodeLink.TLS
 		tlsAny := tls.Cert != "" || tls.Key != "" || tls.CA != ""
 		tlsComplete := tls.Cert != "" && tls.Key != "" && tls.CA != ""
@@ -704,9 +707,6 @@ func (c *Config) validate() error {
 			return errors.New("config: cluster.node_link.tls requires cert, key, and ca together")
 		}
 		if !strings.HasPrefix(c.Cluster.NodeLink.Endpoint, "/") {
-			if strings.HasPrefix(strings.ToLower(c.Cluster.NodeLink.Endpoint), "http://") {
-				return errors.New("config: TCP cluster.node_link endpoint must not use plaintext http://")
-			}
 			if !tlsComplete {
 				return errors.New("config: TCP cluster.node_link requires complete mTLS")
 			}
@@ -787,6 +787,29 @@ func (c *Config) validateProxy() error {
 	}
 	if f := c.Builder.FilesStorage; f != nil && f.Bucket == "" {
 		return fmt.Errorf("config: builder.files_storage.bucket is required when files_storage is set")
+	}
+	return nil
+}
+
+func validateNodeLinkEndpoint(endpoint string) error {
+	if strings.HasPrefix(endpoint, "/") {
+		if !filepath.IsAbs(endpoint) || filepath.Clean(endpoint) != endpoint || endpoint == "/" ||
+			strings.IndexByte(endpoint, 0) >= 0 {
+			return errors.New("config: cluster.node_link endpoint must be a canonical absolute Unix socket path")
+		}
+		return nil
+	}
+	if strings.HasPrefix(strings.ToLower(endpoint), "http://") {
+		return errors.New("config: TCP cluster.node_link endpoint must not use plaintext http://")
+	}
+	if strings.Contains(endpoint, "://") {
+		if err := clusterstate.ValidateCanonicalHTTPSBaseEndpoint(endpoint); err != nil {
+			return fmt.Errorf("config: cluster.node_link endpoint: %w", err)
+		}
+		return nil
+	}
+	if err := clusterstate.ValidateTCPDataEndpoint(endpoint); err != nil {
+		return fmt.Errorf("config: cluster.node_link endpoint: %w", err)
 	}
 	return nil
 }

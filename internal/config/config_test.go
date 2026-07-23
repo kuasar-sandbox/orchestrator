@@ -94,6 +94,33 @@ sandbox:
 	}
 }
 
+func TestValidateNodeLinkEndpointRequiresCanonicalTransport(t *testing.T) {
+	for _, endpoint := range []string{
+		"ftp://registry.example.test:9443",
+		"registry.example.test:9443/path",
+		"/run/../run/registry.sock",
+		"/run/registry\x00.sock",
+		"https://Registry.example.test:9443",
+	} {
+		t.Run(endpoint, func(t *testing.T) {
+			if err := validateNodeLinkEndpoint(endpoint); err == nil {
+				t.Fatalf("accepted malformed node-link endpoint %q", endpoint)
+			}
+		})
+	}
+	for _, endpoint := range []string{
+		"registry.example.test:9443",
+		"https://registry.example.test:9443",
+		"/run/kuasar/registry.sock",
+	} {
+		t.Run(endpoint, func(t *testing.T) {
+			if err := validateNodeLinkEndpoint(endpoint); err != nil {
+				t.Fatalf("canonical node-link endpoint %q: %v", endpoint, err)
+			}
+		})
+	}
+}
+
 func TestClusterConfigRejectsNoncanonicalDataEndpoint(t *testing.T) {
 	cfg := &Config{
 		API:           APIConfig{Domain: "example.test", TLS: TLSConfig{Cert: "cert", Key: "key", ClientCA: "ca"}},
