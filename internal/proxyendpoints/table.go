@@ -18,6 +18,7 @@ package proxyendpoints
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"sync"
 	"time"
@@ -271,91 +272,112 @@ func (t *Table) countLocked(m map[string]map[string]routesync.MmdsEndpointEntry)
 	return n
 }
 
-// --- internal/mmds.EndpointAuthority-compatible dispatch ---
+// --- internal/mmds.EndpointAuthority-compatible dispatch (via
+// internal/mmdsrpc.EndpointTable) ---
+
+// ErrUnavailable is returned by Lookup/ServeStore/ServeRelay when the table
+// itself is not currently usable (no full generation has completed yet, or
+// a disconnect/protocol error cleared it) — distinct from a legitimate
+// "this sandbox has no such endpoint" negative result. On a sync
+// disconnect/protocol error the guest must get 503 until a valid full
+// generation/bookmark arrives, never a silent fallthrough to the built-in
+// envd response.
+var ErrUnavailable = errors.New("proxyendpoints: table unavailable")
 
 // Lookup resolves the exact (sandbox_id, path) to its declared name+backend
-// type. found=false when the table is unavailable or no endpoint owns that
-// path.
-func (t *Table) Lookup(_ context.Context, sandboxID, path string) (name, backendType string, found bool) {
+// type. found=false (err=nil) means no endpoint owns that path. A non-nil
+// err (table unavailable) must never be treated the same as found=false.
+func (t *Table) Lookup(_ context.Context, sandboxID, path string) (name, backendType string, found bool, err error) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	if !t.available {
-		return "", "", false
+		return "", "", false, ErrUnavailable
 	}
 	for n, e := range t.live[sandboxID] {
 		if e.Path == path {
-			return n, e.BackendType, true
+			return n, e.BackendType, true, nil
 		}
 	}
-	return "", "", false
+	return "", "", false, nil
 }
 
 // ServeStore answers a store-backend GET, applying the same bounded
 // never-configured wait as internal/mmdsauth.Authority.ServeStore.
-func (t *Table) ServeStore(ctx context.Context, sandboxID, name string) (value []byte, contentType string, revision int64, present bool) {
-	e, ok := t.get(sandboxID, name)
+func (t *Table) ServeStore(ctx context.Context, sandboxID, name string) (value []byte, contentType string, revision int64, present bool, err error) {
+	e, ok, unavailable := t.get(sandboxID, name)
+	if unavailable {
+		return nil, "", 0, false, ErrUnavailable
+	}
 	if !ok {
-		return nil, "", 0, false
+		return nil, "", 0, false, nil
 	}
 	if e.Revision == 0 && !e.ValuePresent {
 		if !t.wait(ctx, sandboxID, name) {
-			return nil, "", 0, false
+			return nil, "", 0, false, nil
 		}
-		if e, ok = t.get(sandboxID, name); !ok {
-			return nil, "", 0, false
+		if e, ok, unavailable = t.get(sandboxID, name); unavailable {
+			return nil, "", 0, false, ErrUnavailable
+		} else if !ok {
+			return nil, "", 0, false, nil
 		}
 	}
 	if !e.ValuePresent {
-		return nil, "", e.Revision, false
+		return nil, "", e.Revision, false, nil
 	}
 	if e.ExpiresUnix > 0 && time.Now().Unix() >= e.ExpiresUnix {
-		return nil, "", e.Revision, false
+		return nil, "", e.Revision, false, nil
 	}
-	return []byte(e.SecretPlaintext), e.ContentType, e.Revision, true
+	return []byte(e.SecretPlaintext), e.ContentType, e.Revision, true, nil
 }
 
 // ServeRelay answers a relay-backend GET, applying the same bounded
 // never-configured wait and cancellation-on-change as
 // internal/mmdsauth.Authority.ServeRelay.
-func (t *Table) ServeRelay(ctx context.Context, sandboxID, name string) (status int, contentType string, body []byte, ok bool) {
+func (t *Table) ServeRelay(ctx context.Context, sandboxID, name string) (status int, contentType string, body []byte, ok bool, err error) {
 	if t.relay == nil {
-		return http.StatusServiceUnavailable, "", nil, true
+		return http.StatusServiceUnavailable, "", nil, true, nil
 	}
-	e, found := t.get(sandboxID, name)
+	e, found, unavailable := t.get(sandboxID, name)
+	if unavailable {
+		return 0, "", nil, false, ErrUnavailable
+	}
 	if !found {
-		return 0, "", nil, false
+		return 0, "", nil, false, nil
 	}
 	if e.Revision == 0 && !e.ValuePresent {
 		if !t.wait(ctx, sandboxID, name) {
-			return 0, "", nil, false
+			return 0, "", nil, false, nil
 		}
-		if e, found = t.get(sandboxID, name); !found {
-			return 0, "", nil, false
+		if e, found, unavailable = t.get(sandboxID, name); unavailable {
+			return 0, "", nil, false, ErrUnavailable
+		} else if !found {
+			return 0, "", nil, false, nil
 		}
 	}
 	if !e.ValuePresent {
-		return 0, "", nil, false
+		return 0, "", nil, false, nil
 	}
 
 	var cfg relayPublicConfig
 	if err := json.Unmarshal([]byte(e.PublicConfigJSON), &cfg); err != nil || cfg.URL == "" || cfg.AuthHeaderName == "" {
-		return http.StatusBadGateway, "", nil, true
+		return http.StatusBadGateway, "", nil, true, nil
 	}
 
 	watchCtx, cancel := t.watch(ctx, sandboxID, name)
 	defer cancel()
 	res := t.relay.Fetch(watchCtx, sandboxID+"\x00"+name, cfg.URL, cfg.AuthHeaderName, e.SecretPlaintext)
-	return res.Status, res.ContentType, res.Body, true
+	return res.Status, res.ContentType, res.Body, true, nil
 }
 
-// get returns the current entry for (sandboxID,name), or ok=false if the
-// table is unavailable or the endpoint is unknown.
-func (t *Table) get(sandboxID, name string) (routesync.MmdsEndpointEntry, bool) {
+// get returns the current entry for (sandboxID,name). found=false means the
+// table is available but has no such entry; unavailable=true means the
+// table itself is not usable right now (found is meaningless in that case).
+func (t *Table) get(sandboxID, name string) (entry routesync.MmdsEndpointEntry, found, unavailable bool) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	if !t.available {
-		return routesync.MmdsEndpointEntry{}, false
+		return routesync.MmdsEndpointEntry{}, false, true
 	}
 	e, ok := t.live[sandboxID][name]
-	return e, ok
+	return e, ok, false
 }

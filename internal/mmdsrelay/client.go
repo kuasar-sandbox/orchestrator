@@ -111,6 +111,13 @@ type Client struct {
 	// altogether. Defaults to net.DefaultResolver.LookupIPAddr.
 	lookupIPAddr func(ctx context.Context, host string) ([]net.IPAddr, error)
 
+	// dial is doFetch's TCP connect step, factored out so tests can return a
+	// connection whose RemoteAddr() disagrees with the pinned IP — exercising
+	// the post-dial TOCTOU peer-verification check with unmodified production
+	// code, the same way lookupIPAddr lets tests exercise disallowedIP.
+	// Defaults to (&net.Dialer{}).DialContext.
+	dial func(ctx context.Context, network, addr string) (net.Conn, error)
+
 	mu       sync.Mutex
 	limiters map[string]*keyLimiter
 
@@ -129,6 +136,7 @@ func New(cfg Config, mx Counter) *Client {
 	}
 	c := &Client{cfg: cfg, limiters: map[string]*keyLimiter{}, lookupIPAddr: net.DefaultResolver.LookupIPAddr, mx: mx}
 	c.resolvePin = c.defaultResolvePin
+	c.dial = (&net.Dialer{}).DialContext
 	return c
 }
 
@@ -215,7 +223,6 @@ func (c *Client) Fetch(ctx context.Context, key, rawURL, headerName, headerValue
 }
 
 func (c *Client) doFetch(ctx context.Context, u *url.URL, host, port string, pinned net.IP, headerName, headerValue string) (Result, error) {
-	dialer := &net.Dialer{}
 	pinnedAddr := net.JoinHostPort(pinned.String(), port)
 	transport := &http.Transport{
 		Proxy: nil, // never honor environment proxies
@@ -223,7 +230,7 @@ func (c *Client) doFetch(ctx context.Context, u *url.URL, host, port string, pin
 			// Connect directly to the pinned IP, never re-resolving — dctx's
 			// network/addr (derived from the request URL's host) are
 			// ignored; the pinned literal is authoritative.
-			conn, derr := dialer.DialContext(dctx, "tcp", pinnedAddr)
+			conn, derr := c.dial(dctx, "tcp", pinnedAddr)
 			if derr != nil {
 				return nil, derr
 			}

@@ -2,6 +2,7 @@ package proxyendpoints
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"sync"
 	"testing"
@@ -12,11 +13,22 @@ import (
 )
 
 func TestLookupUnavailableBeforeFirstBookmark(t *testing.T) {
-	tb := New(nil, 0, time.Second, nil)
+	// A non-nil relay so ServeRelay's own relay==nil early-503 doesn't mask
+	// the availability check this test targets.
+	tb := New(&fakeRelayFetcher{}, 0, time.Second, nil)
 	tb.BeginMmdsSync("gen-1")
 	tb.ApplyMmdsUpsert(routesync.MmdsEndpointEntry{SandboxID: "s1", Name: "a", Path: "/latest/a", BackendType: "store"})
-	if _, _, found := tb.Lookup(context.Background(), "s1", "/latest/a"); found {
-		t.Fatal("Lookup found an entry before the generation's bookmark")
+	// Before the first bookmark, the table is unavailable — this must
+	// surface as ErrUnavailable, never a plain found=false the caller could
+	// confuse with "no such endpoint" and silently fall through on.
+	if _, _, found, err := tb.Lookup(context.Background(), "s1", "/latest/a"); found || !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("Lookup before bookmark = found=%t err=%v, want found=false err=ErrUnavailable", found, err)
+	}
+	if _, _, _, present, err := tb.ServeStore(context.Background(), "s1", "a"); present || !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("ServeStore before bookmark = present=%t err=%v, want present=false err=ErrUnavailable", present, err)
+	}
+	if _, _, _, ok, err := tb.ServeRelay(context.Background(), "s1", "a"); ok || !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("ServeRelay before bookmark = ok=%t err=%v, want ok=false err=ErrUnavailable", ok, err)
 	}
 }
 
@@ -26,7 +38,7 @@ func TestBeginBookmarkStagesThenSwapsAtomically(t *testing.T) {
 	tb.ApplyMmdsUpsert(routesync.MmdsEndpointEntry{SandboxID: "s1", Name: "a", Path: "/latest/a", BackendType: "store"})
 	tb.MmdsBookmark("gen-1")
 
-	name, backend, found := tb.Lookup(context.Background(), "s1", "/latest/a")
+	name, backend, found, _ := tb.Lookup(context.Background(), "s1", "/latest/a")
 	if !found || name != "a" || backend != "store" {
 		t.Fatalf("Lookup after bookmark = name=%q backend=%q found=%t", name, backend, found)
 	}
@@ -38,7 +50,7 @@ func TestBookmarkWithMismatchedGenerationIsDropped(t *testing.T) {
 	tb.ApplyMmdsUpsert(routesync.MmdsEndpointEntry{SandboxID: "s1", Name: "a", Path: "/latest/a", BackendType: "store"})
 	tb.MmdsBookmark("gen-stale") // does not match "gen-1"
 
-	if _, _, found := tb.Lookup(context.Background(), "s1", "/latest/a"); found {
+	if _, _, found, _ := tb.Lookup(context.Background(), "s1", "/latest/a"); found {
 		t.Fatal("Lookup found an entry staged under a mismatched bookmark generation")
 	}
 }
@@ -55,10 +67,10 @@ func TestBookmarkSweepsEntriesNotSeenThisGeneration(t *testing.T) {
 	tb.ApplyMmdsUpsert(routesync.MmdsEndpointEntry{SandboxID: "s1", Name: "new", Path: "/latest/new", BackendType: "store"})
 	tb.MmdsBookmark("gen-2")
 
-	if _, _, found := tb.Lookup(context.Background(), "s1", "/latest/old"); found {
+	if _, _, found, _ := tb.Lookup(context.Background(), "s1", "/latest/old"); found {
 		t.Fatal("Lookup found an entry not re-declared in the latest full generation")
 	}
-	if _, _, found := tb.Lookup(context.Background(), "s1", "/latest/new"); !found {
+	if _, _, found, _ := tb.Lookup(context.Background(), "s1", "/latest/new"); !found {
 		t.Fatal("Lookup did not find the latest generation's entry")
 	}
 }
@@ -68,14 +80,14 @@ func TestEqualRevisionMismatchForcesResync(t *testing.T) {
 	tb.BeginMmdsSync("gen-1")
 	tb.ApplyMmdsUpsert(routesync.MmdsEndpointEntry{SandboxID: "s1", Name: "a", Path: "/latest/a", BackendType: "store", Revision: 1, ContentType: "text/plain"})
 	tb.MmdsBookmark("gen-1")
-	if _, _, found := tb.Lookup(context.Background(), "s1", "/latest/a"); !found {
+	if _, _, found, _ := tb.Lookup(context.Background(), "s1", "/latest/a"); !found {
 		t.Fatal("setup: entry should be visible after the first bookmark")
 	}
 
 	// Same revision, different payload (a protocol error).
 	tb.ApplyMmdsUpsert(routesync.MmdsEndpointEntry{SandboxID: "s1", Name: "a", Path: "/latest/a", BackendType: "store", Revision: 1, ContentType: "application/json"})
 
-	if _, _, found := tb.Lookup(context.Background(), "s1", "/latest/a"); found {
+	if _, _, found, _ := tb.Lookup(context.Background(), "s1", "/latest/a"); found {
 		t.Fatal("Lookup still found an entry after an equal-revision mismatch forced a resync")
 	}
 }
@@ -88,7 +100,7 @@ func TestLowerRevisionIgnored(t *testing.T) {
 
 	tb.ApplyMmdsUpsert(routesync.MmdsEndpointEntry{SandboxID: "s1", Name: "a", Path: "/latest/a", BackendType: "store", Revision: 3, ValuePresent: true, SecretPlaintext: "stale"})
 
-	value, _, revision, present := tb.ServeStore(context.Background(), "s1", "a")
+	value, _, revision, present, _ := tb.ServeStore(context.Background(), "s1", "a")
 	if !present || revision != 5 || string(value) != "new" {
 		t.Fatalf("ServeStore after a stale lower-revision upsert = value=%q revision=%d present=%t", value, revision, present)
 	}
@@ -101,7 +113,7 @@ func TestApplyMmdsDeleteRemovesEntry(t *testing.T) {
 	tb.MmdsBookmark("gen-1")
 
 	tb.ApplyMmdsDelete(routesync.MmdsEndpointKey{SandboxID: "s1", Name: "a"})
-	if _, _, found := tb.Lookup(context.Background(), "s1", "/latest/a"); found {
+	if _, _, found, _ := tb.Lookup(context.Background(), "s1", "/latest/a"); found {
 		t.Fatal("Lookup found an entry after ApplyMmdsDelete")
 	}
 }
@@ -111,16 +123,16 @@ func TestDisconnectedClearsLiveAndMarksUnavailable(t *testing.T) {
 	tb.BeginMmdsSync("gen-1")
 	tb.ApplyMmdsUpsert(routesync.MmdsEndpointEntry{SandboxID: "s1", Name: "a", Path: "/latest/a", BackendType: "store", Revision: 1, ValuePresent: true, SecretPlaintext: "hello"})
 	tb.MmdsBookmark("gen-1")
-	if _, _, found := tb.Lookup(context.Background(), "s1", "/latest/a"); !found {
+	if _, _, found, _ := tb.Lookup(context.Background(), "s1", "/latest/a"); !found {
 		t.Fatal("setup: entry should be visible after the first bookmark")
 	}
 
 	tb.Disconnected()
 
-	if _, _, found := tb.Lookup(context.Background(), "s1", "/latest/a"); found {
+	if _, _, found, _ := tb.Lookup(context.Background(), "s1", "/latest/a"); found {
 		t.Fatal("Lookup still found an entry after Disconnected")
 	}
-	if _, _, _, present := tb.ServeStore(context.Background(), "s1", "a"); present {
+	if _, _, _, present, _ := tb.ServeStore(context.Background(), "s1", "a"); present {
 		t.Fatal("ServeStore still returned present=true after Disconnected")
 	}
 }
@@ -134,7 +146,7 @@ func TestDisconnectedWakesParkedWaitEarly(t *testing.T) {
 	done := make(chan struct{})
 	var present bool
 	go func() {
-		_, _, _, present = tb.ServeStore(context.Background(), "s1", "a")
+		_, _, _, present, _ = tb.ServeStore(context.Background(), "s1", "a")
 		close(done)
 	}()
 
@@ -165,7 +177,7 @@ func TestCapacityBoundRejectsOverLimit(t *testing.T) {
 
 	count := 0
 	for _, path := range []string{"/latest/a", "/latest/b", "/latest/c"} {
-		if _, _, found := tb.Lookup(context.Background(), "s1", path); found {
+		if _, _, found, _ := tb.Lookup(context.Background(), "s1", path); found {
 			count++
 		}
 	}
@@ -181,7 +193,7 @@ func TestServeStoreNeverConfiguredWaitsThenNotPresent(t *testing.T) {
 	tb.MmdsBookmark("gen-1")
 
 	start := time.Now()
-	_, _, _, present := tb.ServeStore(context.Background(), "s1", "a")
+	_, _, _, present, _ := tb.ServeStore(context.Background(), "s1", "a")
 	if present {
 		t.Fatal("ServeStore returned present=true for a never-configured endpoint")
 	}
@@ -200,7 +212,7 @@ func TestServeStoreWakesOnLiveUpsert(t *testing.T) {
 	var value []byte
 	var present bool
 	go func() {
-		value, _, _, present = tb.ServeStore(context.Background(), "s1", "a")
+		value, _, _, present, _ = tb.ServeStore(context.Background(), "s1", "a")
 		close(done)
 	}()
 
@@ -245,7 +257,7 @@ func TestServeRelayNilClientReturns503(t *testing.T) {
 	tb.ApplyMmdsUpsert(routesync.MmdsEndpointEntry{SandboxID: "s1", Name: "a", Path: "/latest/a", BackendType: "relay"})
 	tb.MmdsBookmark("gen-1")
 
-	status, _, _, ok := tb.ServeRelay(context.Background(), "s1", "a")
+	status, _, _, ok, _ := tb.ServeRelay(context.Background(), "s1", "a")
 	if !ok || status != http.StatusServiceUnavailable {
 		t.Fatalf("ServeRelay with nil relay = status=%d ok=%t, want 503/true", status, ok)
 	}
@@ -262,7 +274,7 @@ func TestServeRelayDispatchesConfiguredEndpoint(t *testing.T) {
 	})
 	tb.MmdsBookmark("gen-1")
 
-	status, contentType, body, ok := tb.ServeRelay(context.Background(), "s1", "creds")
+	status, contentType, body, ok, _ := tb.ServeRelay(context.Background(), "s1", "creds")
 	if !ok || status != 200 || contentType != "application/json" || string(body) != "{}" {
 		t.Fatalf("ServeRelay = status=%d contentType=%q body=%q ok=%t", status, contentType, body, ok)
 	}
@@ -284,7 +296,7 @@ func TestServeRelayCancelsOnLiveUpsert(t *testing.T) {
 
 	done := make(chan mmdsrelay.Result, 1)
 	go func() {
-		status, _, _, _ := tb.ServeRelay(context.Background(), "s1", "creds")
+		status, _, _, _, _ := tb.ServeRelay(context.Background(), "s1", "creds")
 		done <- mmdsrelay.Result{Status: status}
 	}()
 

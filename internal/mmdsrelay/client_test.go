@@ -307,6 +307,50 @@ func TestFetchSSRFBlockedIPFromResolver(t *testing.T) {
 	}
 }
 
+// fakeRemoteAddrConn wraps a real net.Conn but reports a different
+// RemoteAddr(), so a test can simulate the connected peer disagreeing with
+// the pinned IP without actually being able to make that happen over a real
+// network stack.
+type fakeRemoteAddrConn struct {
+	net.Conn
+	remote net.Addr
+}
+
+func (c *fakeRemoteAddrConn) RemoteAddr() net.Addr { return c.remote }
+
+// TestFetchAbortsOnPinnedPeerMismatch exercises doFetch's post-dial TOCTOU
+// defense (a peer differing from the pinned IP must abort before auth) —
+// c.dial is overridden to return a real connection whose RemoteAddr()
+// disagrees with the pinned IP resolvePin chose, which must abort the
+// request before the auth header is ever attached (the request never
+// reaches the upstream handler at all).
+func TestFetchAbortsOnPinnedPeerMismatch(t *testing.T) {
+	reached := false
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reached = true
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	c := newTestClient(t, testCfg()) // resolvePin returns 127.0.0.1, the server's real address
+	realDial := c.dial
+	c.dial = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		conn, err := realDial(ctx, network, addr)
+		if err != nil {
+			return nil, err
+		}
+		return &fakeRemoteAddrConn{Conn: conn, remote: &net.TCPAddr{IP: net.ParseIP("127.0.0.2"), Port: 443}}, nil
+	}
+
+	res := c.fetchInsecureForTest(t, "k-mismatch", relayURLFor(t, srv, "/"), "X-Auth", "v")
+	if res.Status != http.StatusBadGateway {
+		t.Fatalf("Status = %d, want 502 (peer mismatch aborted before auth)", res.Status)
+	}
+	if reached {
+		t.Fatal("upstream handler was reached despite the pinned-peer mismatch — auth header was sent")
+	}
+}
+
 func TestFetchTimeout(t *testing.T) {
 	block := make(chan struct{})
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

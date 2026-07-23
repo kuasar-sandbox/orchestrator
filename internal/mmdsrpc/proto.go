@@ -63,8 +63,20 @@ type EndpointResponse struct {
 	ContentType string `json:"content_type,omitempty"`
 	Body        []byte `json:"body,omitempty"`
 	Revision    int64  `json:"revision,omitempty"` // store only
-	ErrorCode   string `json:"error_code,omitempty"`
+	// ErrorCode, when non-empty, means the master itself failed to resolve
+	// or serve the request (as opposed to Found/Present=false, a legitimate
+	// negative result) — the worker must map this to 503/504, never treat
+	// it as "not found". One of the ErrCode* constants below.
+	ErrorCode string `json:"error_code,omitempty"`
 }
+
+// ErrorCode values EndpointResponse.ErrorCode carries — a bounded enum, not
+// free text, so the worker can classify without string-matching arbitrary
+// error messages.
+const (
+	ErrCodeWorkerInflightLimit = "worker_inflight_limit" // per-connection inflight cap exceeded
+	ErrCodeUnavailable         = "unavailable"           // master's endpoint table itself is unavailable
+)
 
 func writeFrame(w io.Writer, m *wireMsg) error {
 	b, err := json.Marshal(m)

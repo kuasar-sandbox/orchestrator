@@ -29,6 +29,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -70,18 +71,26 @@ type Source interface {
 // mmds.endpoints.enabled is true.
 type EndpointAuthority interface {
 	// Lookup resolves the exact (sandbox_id, path) to its declared name +
-	// backend type. found=false means no endpoint owns that path.
-	Lookup(ctx context.Context, sandboxID, path string) (name, backendType string, found bool)
+	// backend type. found=false (err=nil) means no endpoint owns that
+	// path — fall through to the built-in envd response. A non-nil err
+	// means the authority itself failed (store read error, worker RPC
+	// timeout/close/backpressure) and must never be treated the same as
+	// found=false: the guest gets 503/504, classified via
+	// authorityErrStatus, not a silent fallthrough.
+	Lookup(ctx context.Context, sandboxID, path string) (name, backendType string, found bool, err error)
 	// ServeStore answers a store-backend GET, applying the bounded
-	// never-configured wait. present=false means 404.
-	ServeStore(ctx context.Context, sandboxID, name string) (value []byte, contentType string, revision int64, present bool)
+	// never-configured wait. present=false (err=nil) means 404. A non-nil
+	// err means the authority itself failed — see Lookup.
+	ServeStore(ctx context.Context, sandboxID, name string) (value []byte, contentType string, revision int64, present bool, err error)
 	// ServeRelay answers a relay-backend GET, applying the same bounded
-	// never-configured wait. ok=false means 404 (never
+	// never-configured wait. ok=false (err=nil) means 404 (never
 	// configured after the wait, or revoked — the upstream is never
 	// contacted in either case). ok=true means status is the exact response
 	// code to use (a passthrough upstream 2xx/4xx/5xx, or a relay-specific
-	// 429/502/503/504).
-	ServeRelay(ctx context.Context, sandboxID, name string) (status int, contentType string, body []byte, ok bool)
+	// 429/502/503/504). A non-nil err means the authority itself failed
+	// (distinct from a relay upstream failure, which is already classified
+	// into status) — see Lookup.
+	ServeRelay(ctx context.Context, sandboxID, name string) (status int, contentType string, body []byte, ok bool, err error)
 }
 
 // Counter is the narrow metrics surface mmds needs, mirroring
@@ -206,9 +215,17 @@ func (s *Server) getMeta(w http.ResponseWriter, r *http.Request) {
 	// wins over the built-in envd metadata response below.
 	// No match (or auth==nil, i.e. the feature is disabled/not wired for
 	// this deployment mode) falls straight through, preserving the built-in
-	// route unconditionally.
+	// route unconditionally. An authority failure (err!=nil) is NOT a "no
+	// match" — it must return 503/504, never a silent fallthrough to the
+	// built-in response.
 	if s.auth != nil {
-		if name, backendType, found := s.auth.Lookup(r.Context(), sid, r.URL.Path); found {
+		name, backendType, found, err := s.auth.Lookup(r.Context(), sid, r.URL.Path)
+		if err != nil {
+			s.mx.Inc(`mmds_requests_total{backend_type="unknown",result="unavailable"}`)
+			http.Error(w, "", authorityErrStatus(err))
+			return
+		}
+		if found {
 			s.serveEndpoint(w, r, sid, name, backendType)
 			return
 		}
@@ -240,7 +257,12 @@ func setMMDSResponseHeaders(w http.ResponseWriter) {
 func (s *Server) serveEndpoint(w http.ResponseWriter, r *http.Request, sid, name, backendType string) {
 	switch backendType {
 	case BackendStore:
-		value, contentType, revision, present := s.auth.ServeStore(r.Context(), sid, name)
+		value, contentType, revision, present, err := s.auth.ServeStore(r.Context(), sid, name)
+		if err != nil {
+			s.mx.Inc(`mmds_requests_total{backend_type="store",result="unavailable"}`)
+			http.Error(w, "", authorityErrStatus(err))
+			return
+		}
 		if !present {
 			s.mx.Inc(`mmds_requests_total{backend_type="store",result="not_found"}`)
 			http.Error(w, "", http.StatusNotFound)
@@ -254,7 +276,12 @@ func (s *Server) serveEndpoint(w http.ResponseWriter, r *http.Request, sid, name
 		w.Header().Set(MMDSRevisionHeader, strconv.FormatInt(revision, 10))
 		_, _ = w.Write(value)
 	case BackendRelay:
-		status, contentType, body, ok := s.auth.ServeRelay(r.Context(), sid, name)
+		status, contentType, body, ok, err := s.auth.ServeRelay(r.Context(), sid, name)
+		if err != nil {
+			s.mx.Inc(`mmds_requests_total{backend_type="relay",result="unavailable"}`)
+			http.Error(w, "", authorityErrStatus(err))
+			return
+		}
 		if !ok {
 			s.mx.Inc(`mmds_requests_total{backend_type="relay",result="not_found"}`)
 			http.Error(w, "", http.StatusNotFound)
@@ -269,6 +296,18 @@ func (s *Server) serveEndpoint(w http.ResponseWriter, r *http.Request, sid, name
 	default:
 		http.Error(w, "", http.StatusNotFound)
 	}
+}
+
+// authorityErrStatus classifies an EndpointAuthority failure (store read
+// error, worker RPC timeout/close/backpressure) into the guest-visible
+// status: a deadline exceeded (relay timeout, RPC deadline) becomes 504;
+// every other authority failure (DB error, RPC connection closed, worker
+// inflight cap) becomes 503.
+func authorityErrStatus(err error) int {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return http.StatusGatewayTimeout
+	}
+	return http.StatusServiceUnavailable
 }
 
 // relayResultLabel is the bounded mmds_requests_total{result} value for a

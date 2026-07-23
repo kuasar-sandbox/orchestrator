@@ -3,6 +3,7 @@ package mmdsrpc
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"sync"
 )
@@ -145,18 +146,31 @@ func (c *Client) call(ctx context.Context, req *EndpointRequest) (*EndpointRespo
 // Lookup resolves the exact (sandbox_id, path) to its declared name+backend
 // type, performing the full resolve+serve round trip and caching the result
 // for the immediately-following ServeStore/ServeRelay call. found=false
-// means no endpoint owns that path (or the RPC itself failed — the caller
-// falls through to the built-in envd response either way).
-func (c *Client) Lookup(ctx context.Context, sandboxID, path string) (name, backendType string, found bool) {
+// (err=nil) means no endpoint owns that path. A non-nil err — the RPC
+// itself failed (deadline exceeded, connection closed) or the master
+// reported ErrCodeUnavailable/ErrCodeWorkerInflightLimit — must never be
+// treated the same as found=false: the caller must respond 503/504
+// (classified via errors.Is(err, context.DeadlineExceeded)), never fall
+// through to the built-in envd response.
+func (c *Client) Lookup(ctx context.Context, sandboxID, path string) (name, backendType string, found bool, err error) {
 	resp, err := c.call(ctx, &EndpointRequest{SandboxID: sandboxID, Path: path})
-	if err != nil || resp == nil || !resp.Found {
-		return "", "", false
+	if err != nil {
+		return "", "", false, err
+	}
+	if resp == nil {
+		return "", "", false, errors.New("mmdsrpc: nil response")
+	}
+	if resp.ErrorCode != "" {
+		return "", "", false, fmt.Errorf("mmdsrpc: master reported %s", resp.ErrorCode)
+	}
+	if !resp.Found {
+		return "", "", false, nil
 	}
 	key := sandboxID + "\x00" + resp.Name
 	c.cacheMu.Lock()
 	c.cache[key] = resp
 	c.cacheMu.Unlock()
-	return resp.Name, resp.BackendType, true
+	return resp.Name, resp.BackendType, true, nil
 }
 
 func (c *Client) take(sandboxID, name string) *EndpointResponse {
@@ -169,24 +183,26 @@ func (c *Client) take(sandboxID, name string) *EndpointResponse {
 }
 
 // ServeStore returns the store value from the round trip Lookup already
-// performed for this (sandboxID,name).
-func (c *Client) ServeStore(_ context.Context, sandboxID, name string) (value []byte, contentType string, revision int64, present bool) {
+// performed for this (sandboxID,name) — that round trip already surfaced
+// any master-side failure via Lookup's own err, so this never fails on its
+// own.
+func (c *Client) ServeStore(_ context.Context, sandboxID, name string) (value []byte, contentType string, revision int64, present bool, err error) {
 	resp := c.take(sandboxID, name)
 	if resp == nil || !resp.Present {
 		if resp != nil {
-			return nil, "", resp.Revision, false
+			return nil, "", resp.Revision, false, nil
 		}
-		return nil, "", 0, false
+		return nil, "", 0, false, nil
 	}
-	return resp.Body, resp.ContentType, resp.Revision, true
+	return resp.Body, resp.ContentType, resp.Revision, true, nil
 }
 
 // ServeRelay returns the relay result from the round trip Lookup already
-// performed for this (sandboxID,name).
-func (c *Client) ServeRelay(_ context.Context, sandboxID, name string) (status int, contentType string, body []byte, ok bool) {
+// performed for this (sandboxID,name) — see ServeStore.
+func (c *Client) ServeRelay(_ context.Context, sandboxID, name string) (status int, contentType string, body []byte, ok bool, err error) {
 	resp := c.take(sandboxID, name)
 	if resp == nil || !resp.Present {
-		return 0, "", nil, false
+		return 0, "", nil, false, nil
 	}
-	return resp.Status, resp.ContentType, resp.Body, true
+	return resp.Status, resp.ContentType, resp.Body, true, nil
 }

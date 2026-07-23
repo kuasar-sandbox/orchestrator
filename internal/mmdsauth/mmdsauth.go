@@ -69,15 +69,13 @@ func New(st *store.Store, relay relayFetcher, timeout time.Duration, mx Counter)
 }
 
 // Lookup resolves the exact (sandbox_id, path) to its declared name+backend
-// type. found=false means no endpoint owns that exact path for that
-// sandbox — the caller (internal/mmds) falls through to the built-in envd
-// token/metadata response.
-func (a *Authority) Lookup(ctx context.Context, sandboxID, path string) (name, backendType string, found bool) {
-	name, backendType, found, err := a.st.MMDSEndpointByPath(ctx, sandboxID, path)
-	if err != nil {
-		return "", "", false
-	}
-	return name, backendType, found
+// type. found=false (err=nil) means no endpoint owns that exact path for
+// that sandbox — the caller (internal/mmds) falls through to the built-in
+// envd token/metadata response. A non-nil err (the store read itself
+// failed) must never be treated the same as found=false: the caller must
+// respond 503, not silently fall through.
+func (a *Authority) Lookup(ctx context.Context, sandboxID, path string) (name, backendType string, found bool, err error) {
+	return a.st.MMDSEndpointByPath(ctx, sandboxID, path)
 }
 
 // ServeStore answers a store-backend GET. Only a never-configured endpoint
@@ -89,27 +87,33 @@ func (a *Authority) Lookup(ctx context.Context, sandboxID, path string) (name, b
 // from "expired", and is not required to.
 // revision is returned even when present=false is not used by the caller,
 // but is needed on the present=true path for the X-Kuasar-MMDS-Revision
-// response header.
-func (a *Authority) ServeStore(ctx context.Context, sandboxID, name string) (value []byte, contentType string, revision int64, present bool) {
+// response header. A non-nil err (the store read itself failed) must never
+// be treated the same as present=false: the caller must respond 503.
+func (a *Authority) ServeStore(ctx context.Context, sandboxID, name string) (value []byte, contentType string, revision int64, present bool, err error) {
 	v, ok, err := a.st.GetMMDSStoreValue(ctx, sandboxID, name)
-	if err != nil || !ok {
-		return nil, "", 0, false
+	if err != nil {
+		return nil, "", 0, false, err
+	}
+	if !ok {
+		return nil, "", 0, false, nil
 	}
 	if v.Revision == 0 && !v.Present {
 		if !a.timedWait(ctx, sandboxID, name) {
-			return nil, "", 0, false // timed out without a PUT landing
+			return nil, "", 0, false, nil // timed out without a PUT landing
 		}
-		if v, ok, err = a.st.GetMMDSStoreValue(ctx, sandboxID, name); err != nil || !ok {
-			return nil, "", 0, false
+		if v, ok, err = a.st.GetMMDSStoreValue(ctx, sandboxID, name); err != nil {
+			return nil, "", 0, false, err
+		} else if !ok {
+			return nil, "", 0, false, nil
 		}
 	}
 	if !v.Present {
-		return nil, "", v.Revision, false
+		return nil, "", v.Revision, false, nil
 	}
 	if v.ExpiresUnix > 0 && time.Now().Unix() >= v.ExpiresUnix {
-		return nil, "", v.Revision, false
+		return nil, "", v.Revision, false, nil
 	}
-	return v.Value, v.ContentType, v.Revision, true
+	return v.Value, v.ContentType, v.Revision, true, nil
 }
 
 // relayPublicConfig mirrors the JSON shape internal/orch's
@@ -123,39 +127,48 @@ type relayPublicConfig struct {
 
 // ServeRelay answers a relay-backend GET, applying the same never-configured
 // bounded-wait rule as ServeStore (the same uniform node-policy value
-// timeout used by store). ok=false means "treat as
+// timeout used by store). ok=false (err=nil) means "treat as
 // absent" — the caller responds 404 without ever having contacted the
 // upstream (never-configured-then-timed-out, or revoked auth). ok=true
 // means status is the exact code to return: the relay's own classification
 // (a passthrough 2xx/4xx/5xx, or 429/502/504) — a real upstream attempt was
-// made.
-func (a *Authority) ServeRelay(ctx context.Context, sandboxID, name string) (status int, contentType string, body []byte, ok bool) {
+// made. A non-nil err (the store read itself failed) must never be treated
+// the same as ok=false: the caller must respond 503.
+func (a *Authority) ServeRelay(ctx context.Context, sandboxID, name string) (status int, contentType string, body []byte, ok bool, err error) {
 	if a.relay == nil {
-		return http.StatusServiceUnavailable, "", nil, true
+		return http.StatusServiceUnavailable, "", nil, true, nil
 	}
 	v, found, err := a.st.GetMMDSRelayAuth(ctx, sandboxID, name)
-	if err != nil || !found {
-		return 0, "", nil, false
+	if err != nil {
+		return 0, "", nil, false, err
+	}
+	if !found {
+		return 0, "", nil, false, nil
 	}
 	if v.Revision == 0 && !v.Present {
 		if !a.timedWait(ctx, sandboxID, name) {
-			return 0, "", nil, false // never configured, timed out -> 404, upstream never contacted
+			return 0, "", nil, false, nil // never configured, timed out -> 404, upstream never contacted
 		}
-		if v, found, err = a.st.GetMMDSRelayAuth(ctx, sandboxID, name); err != nil || !found {
-			return 0, "", nil, false
+		if v, found, err = a.st.GetMMDSRelayAuth(ctx, sandboxID, name); err != nil {
+			return 0, "", nil, false, err
+		} else if !found {
+			return 0, "", nil, false, nil
 		}
 	}
 	if !v.Present {
-		return 0, "", nil, false // revoked -> 404, upstream never contacted
+		return 0, "", nil, false, nil // revoked -> 404, upstream never contacted
 	}
 
 	cfgJSON, _, cfgFound, err := a.st.GetMMDSEndpointPublicConfig(ctx, sandboxID, name)
-	if err != nil || !cfgFound {
-		return 0, "", nil, false
+	if err != nil {
+		return 0, "", nil, false, err
+	}
+	if !cfgFound {
+		return 0, "", nil, false, nil
 	}
 	var cfg relayPublicConfig
 	if err := json.Unmarshal([]byte(cfgJSON), &cfg); err != nil || cfg.URL == "" || cfg.AuthHeaderName == "" {
-		return http.StatusBadGateway, "", nil, true
+		return http.StatusBadGateway, "", nil, true, nil
 	}
 
 	// Cancel the fetch if this endpoint's auth is rotated/revoked while the
@@ -164,7 +177,7 @@ func (a *Authority) ServeRelay(ctx context.Context, sandboxID, name string) (sta
 	defer cancel()
 
 	res := a.relay.Fetch(watchCtx, waitKey(sandboxID, name), cfg.URL, cfg.AuthHeaderName, string(v.Value))
-	return res.Status, res.ContentType, res.Body, true
+	return res.Status, res.ContentType, res.Body, true, nil
 }
 
 // Notify wakes any goroutine currently parked in wait() for (sid,name) — the

@@ -2,6 +2,7 @@ package mmdsrpc
 
 import (
 	"context"
+	"errors"
 	"net"
 	"sync"
 	"testing"
@@ -16,21 +17,26 @@ type fakeTable struct {
 
 	byPath map[string][2]string // sid+"\x00"+path -> {name, backendType}
 	store  map[string][]byte    // sid+"\x00"+name -> value ("store" backend)
+
+	lookupErr error // if set, Lookup returns this error unconditionally
 }
 
 func newFakeTable() *fakeTable {
 	return &fakeTable{byPath: map[string][2]string{}, store: map[string][]byte{}}
 }
 
-func (f *fakeTable) Lookup(_ context.Context, sid, path string) (string, string, bool) {
+func (f *fakeTable) Lookup(_ context.Context, sid, path string) (string, string, bool, error) {
+	if f.lookupErr != nil {
+		return "", "", false, f.lookupErr
+	}
 	v, ok := f.byPath[sid+"\x00"+path]
 	if !ok {
-		return "", "", false
+		return "", "", false, nil
 	}
-	return v[0], v[1], true
+	return v[0], v[1], true, nil
 }
 
-func (f *fakeTable) ServeStore(ctx context.Context, sid, name string) ([]byte, string, int64, bool) {
+func (f *fakeTable) ServeStore(ctx context.Context, sid, name string) ([]byte, string, int64, bool, error) {
 	f.mu.Lock()
 	f.calls++
 	block := f.block
@@ -39,15 +45,15 @@ func (f *fakeTable) ServeStore(ctx context.Context, sid, name string) ([]byte, s
 		select {
 		case <-block:
 		case <-ctx.Done():
-			return nil, "", 0, false
+			return nil, "", 0, false, nil
 		}
 	}
 	v, ok := f.store[sid+"\x00"+name]
-	return v, "text/plain", 1, ok
+	return v, "text/plain", 1, ok, nil
 }
 
-func (f *fakeTable) ServeRelay(context.Context, string, string) (int, string, []byte, bool) {
-	return 0, "", nil, false
+func (f *fakeTable) ServeRelay(context.Context, string, string) (int, string, []byte, bool, error) {
+	return 0, "", nil, false, nil
 }
 
 // harness wires a real Client (worker side) to a real Server (master side)
@@ -81,13 +87,13 @@ func TestLookupServeStoreRoundTrip(t *testing.T) {
 	client, cleanup := harness(t, table, 128)
 	defer cleanup()
 
-	name, backend, found := client.Lookup(context.Background(), "s1", "/latest/a")
-	if !found || name != "a" || backend != "store" {
-		t.Fatalf("Lookup = name=%q backend=%q found=%t", name, backend, found)
+	name, backend, found, err := client.Lookup(context.Background(), "s1", "/latest/a")
+	if err != nil || !found || name != "a" || backend != "store" {
+		t.Fatalf("Lookup = name=%q backend=%q found=%t err=%v", name, backend, found, err)
 	}
-	value, contentType, revision, present := client.ServeStore(context.Background(), "s1", "a")
-	if !present || string(value) != "hello" || contentType != "text/plain" || revision != 1 {
-		t.Fatalf("ServeStore = value=%q contentType=%q revision=%d present=%t", value, contentType, revision, present)
+	value, contentType, revision, present, err := client.ServeStore(context.Background(), "s1", "a")
+	if err != nil || !present || string(value) != "hello" || contentType != "text/plain" || revision != 1 {
+		t.Fatalf("ServeStore = value=%q contentType=%q revision=%d present=%t err=%v", value, contentType, revision, present, err)
 	}
 }
 
@@ -96,8 +102,26 @@ func TestLookupNotFound(t *testing.T) {
 	client, cleanup := harness(t, table, 128)
 	defer cleanup()
 
-	if _, _, found := client.Lookup(context.Background(), "s1", "/latest/nope"); found {
-		t.Fatal("Lookup found an undeclared path")
+	if _, _, found, err := client.Lookup(context.Background(), "s1", "/latest/nope"); found || err != nil {
+		t.Fatalf("Lookup found an undeclared path or errored: found=%t err=%v", found, err)
+	}
+}
+
+// TestLookupPropagatesTableUnavailable covers the requirement that a worker
+// RPC failure return 503/504 as classified: when the master's table itself
+// fails (e.g. internal/proxyendpoints.ErrUnavailable), resolve() must respond with
+// ErrorCode: ErrCodeUnavailable, and the client must surface it as a
+// distinct error — never collapsed into an ordinary "not found" the caller
+// could silently fall through on.
+func TestLookupPropagatesTableUnavailable(t *testing.T) {
+	table := newFakeTable()
+	table.lookupErr = errors.New("table unavailable")
+	client, cleanup := harness(t, table, 128)
+	defer cleanup()
+
+	name, _, found, err := client.Lookup(context.Background(), "s1", "/latest/a")
+	if err == nil || found || name != "" {
+		t.Fatalf("Lookup with an unavailable table = name=%q found=%t err=%v, want a non-nil error and not found", name, found, err)
 	}
 }
 
@@ -118,13 +142,13 @@ func TestConcurrentRequestsMultiplex(t *testing.T) {
 		wg.Add(1)
 		go func(name string) {
 			defer wg.Done()
-			gotName, _, found := client.Lookup(context.Background(), "s1", "/latest/"+name)
-			if !found || gotName != name {
+			gotName, _, found, err := client.Lookup(context.Background(), "s1", "/latest/"+name)
+			if err != nil || !found || gotName != name {
 				errs <- "lookup mismatch for " + name
 				return
 			}
-			value, _, _, present := client.ServeStore(context.Background(), "s1", name)
-			if !present || string(value) != name+"-value" {
+			value, _, _, present, err := client.ServeStore(context.Background(), "s1", name)
+			if err != nil || !present || string(value) != name+"-value" {
 				errs <- "serve mismatch for " + name
 			}
 		}(name)
@@ -202,9 +226,13 @@ func TestInflightLimitRejectsOverCap(t *testing.T) {
 	}()
 	time.Sleep(50 * time.Millisecond)
 
-	name, _, found := client.Lookup(context.Background(), "s1", "/latest/a")
-	if found || name != "" {
-		t.Fatalf("Lookup over the inflight cap = name=%q found=%t, want not found", name, found)
+	// Over the cap must be a distinct failure (a worker RPC
+	// close/timeout/backpressure must return 503/504 as classified), never
+	// silently collapsed into an ordinary "not found" — the caller must not
+	// fall through to the built-in envd response for this sandbox/path.
+	name, _, found, err := client.Lookup(context.Background(), "s1", "/latest/a")
+	if err == nil || found || name != "" {
+		t.Fatalf("Lookup over the inflight cap = name=%q found=%t err=%v, want a non-nil error and not found", name, found, err)
 	}
 
 	table.mu.Lock()
@@ -236,8 +264,8 @@ func TestCancellationFreesServerResources(t *testing.T) {
 
 	callCtx, callCancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
 	defer callCancel()
-	if _, _, found := client.Lookup(callCtx, "s1", "/latest/a"); found {
-		t.Fatal("Lookup should have been cancelled by its own context timeout")
+	if _, _, found, err := client.Lookup(callCtx, "s1", "/latest/a"); found || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Lookup should have been cancelled by its own context timeout: found=%t err=%v", found, err)
 	}
 
 	// Give the server a moment to process the Cancel frame the client sent.
@@ -246,8 +274,8 @@ func TestCancellationFreesServerResources(t *testing.T) {
 	table.mu.Lock()
 	table.block = nil // let subsequent calls return immediately
 	table.mu.Unlock()
-	if _, _, found := client.Lookup(context.Background(), "s1", "/latest/a"); !found {
-		t.Fatal("Lookup after cancellation freed the inflight slot should have succeeded")
+	if _, _, found, err := client.Lookup(context.Background(), "s1", "/latest/a"); !found || err != nil {
+		t.Fatalf("Lookup after cancellation freed the inflight slot should have succeeded: found=%t err=%v", found, err)
 	}
 }
 

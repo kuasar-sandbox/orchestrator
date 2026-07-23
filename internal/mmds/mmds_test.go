@@ -2,6 +2,7 @@ package mmds
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -252,6 +253,15 @@ type fakeAuthority struct {
 	byPath      map[string][2]string // sid+"\x00"+path -> {name, backendType}
 	values      map[string]fakeStoreValue
 	relayValues map[string]fakeRelayResult
+
+	// lookupErr/serveStoreErr/serveRelayErr, when set, make the
+	// corresponding method return this error unconditionally instead of
+	// consulting the maps above — simulating an authority failure (store
+	// read error, worker RPC timeout/close/backpressure) distinct from a
+	// legitimate not-found/not-present/not-ok result.
+	lookupErr     error
+	serveStoreErr error
+	serveRelayErr error
 }
 
 type fakeStoreValue struct {
@@ -268,22 +278,31 @@ type fakeRelayResult struct {
 	ok          bool
 }
 
-func (f *fakeAuthority) Lookup(_ context.Context, sid, path string) (string, string, bool) {
+func (f *fakeAuthority) Lookup(_ context.Context, sid, path string) (string, string, bool, error) {
+	if f.lookupErr != nil {
+		return "", "", false, f.lookupErr
+	}
 	v, ok := f.byPath[sid+"\x00"+path]
 	if !ok {
-		return "", "", false
+		return "", "", false, nil
 	}
-	return v[0], v[1], true
+	return v[0], v[1], true, nil
 }
 
-func (f *fakeAuthority) ServeStore(_ context.Context, sid, name string) ([]byte, string, int64, bool) {
+func (f *fakeAuthority) ServeStore(_ context.Context, sid, name string) ([]byte, string, int64, bool, error) {
+	if f.serveStoreErr != nil {
+		return nil, "", 0, false, f.serveStoreErr
+	}
 	v := f.values[sid+"\x00"+name]
-	return v.value, v.contentType, v.revision, v.present
+	return v.value, v.contentType, v.revision, v.present, nil
 }
 
-func (f *fakeAuthority) ServeRelay(_ context.Context, sid, name string) (int, string, []byte, bool) {
+func (f *fakeAuthority) ServeRelay(_ context.Context, sid, name string) (int, string, []byte, bool, error) {
+	if f.serveRelayErr != nil {
+		return 0, "", nil, false, f.serveRelayErr
+	}
 	v := f.relayValues[sid+"\x00"+name]
-	return v.status, v.contentType, v.body, v.ok
+	return v.status, v.contentType, v.body, v.ok, nil
 }
 
 func TestGetMetaDispatchesDeclaredStoreEndpoint(t *testing.T) {
@@ -341,6 +360,101 @@ func TestGetMetaFallsThroughWhenNoEndpointMatches(t *testing.T) {
 	h.ServeHTTP(w, req)
 	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"instanceID":"sbx-1"`) {
 		t.Fatalf("fallback GET: code=%d body=%q, want the built-in envd response", w.Code, w.Body.String())
+	}
+}
+
+// TestGetMetaLookupFailureReturns503 covers a worker RPC
+// close/timeout/backpressure (and its internal-mode analogue, a store read
+// failure), which must return 503/504 as classified: an EndpointAuthority
+// failure during Lookup must never be treated the same as "no such
+// endpoint" — the guest must get 503, not the built-in envd fallback.
+func TestGetMetaLookupFailureReturns503(t *testing.T) {
+	src := testSourceWithRunID()
+	auth := &fakeAuthority{lookupErr: errors.New("store unavailable")}
+	h := New(src, auth, 50*time.Millisecond, nil, nil).Handler()
+
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, putTokenReq("100.100.96.5:1", "60"))
+	token := w.Body.String()
+
+	req := httptest.NewRequest("GET", "http://169.254.169.254/latest/user-data", nil)
+	req.Header.Set("X-metadata-token", token)
+	req.RemoteAddr = "100.100.96.5:1"
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("GET after a Lookup failure: code=%d, want 503 (never the built-in fallback)", w.Code)
+	}
+}
+
+// TestGetMetaLookupTimeoutReturns504 is TestGetMetaLookupFailureReturns503's
+// timeout variant: a context.DeadlineExceeded-classified authority failure
+// (worker RPC deadline, relay-style timeout) must map to 504, not 503.
+func TestGetMetaLookupTimeoutReturns504(t *testing.T) {
+	src := testSourceWithRunID()
+	auth := &fakeAuthority{lookupErr: context.DeadlineExceeded}
+	h := New(src, auth, 50*time.Millisecond, nil, nil).Handler()
+
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, putTokenReq("100.100.96.5:1", "60"))
+	token := w.Body.String()
+
+	req := httptest.NewRequest("GET", "http://169.254.169.254/latest/user-data", nil)
+	req.Header.Set("X-metadata-token", token)
+	req.RemoteAddr = "100.100.96.5:1"
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusGatewayTimeout {
+		t.Fatalf("GET after a Lookup timeout: code=%d, want 504", w.Code)
+	}
+}
+
+// TestGetMetaServeStoreFailureReturns503 is TestGetMetaLookupFailureReturns503
+// for the second dispatch hop: Lookup succeeds (the endpoint exists) but
+// ServeStore itself fails.
+func TestGetMetaServeStoreFailureReturns503(t *testing.T) {
+	src := testSourceWithRunID()
+	auth := &fakeAuthority{
+		byPath:        map[string][2]string{"sbx-1\x00/latest/user-data": {"user-data", BackendStore}},
+		serveStoreErr: errors.New("store unavailable"),
+	}
+	h := New(src, auth, 50*time.Millisecond, nil, nil).Handler()
+
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, putTokenReq("100.100.96.5:1", "60"))
+	token := w.Body.String()
+
+	req := httptest.NewRequest("GET", "http://169.254.169.254/latest/user-data", nil)
+	req.Header.Set("X-metadata-token", token)
+	req.RemoteAddr = "100.100.96.5:1"
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("GET after a ServeStore failure: code=%d, want 503", w.Code)
+	}
+}
+
+// TestGetMetaServeRelayFailureReturns503 is the relay-backend analogue of
+// TestGetMetaServeStoreFailureReturns503.
+func TestGetMetaServeRelayFailureReturns503(t *testing.T) {
+	src := testSourceWithRunID()
+	auth := &fakeAuthority{
+		byPath:        map[string][2]string{"sbx-1\x00/latest/creds": {"creds", BackendRelay}},
+		serveRelayErr: errors.New("relay unavailable"),
+	}
+	h := New(src, auth, 50*time.Millisecond, nil, nil).Handler()
+
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, putTokenReq("100.100.96.5:1", "60"))
+	token := w.Body.String()
+
+	req := httptest.NewRequest("GET", "http://169.254.169.254/latest/creds", nil)
+	req.Header.Set("X-metadata-token", token)
+	req.RemoteAddr = "100.100.96.5:1"
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("GET after a ServeRelay failure: code=%d, want 503", w.Code)
 	}
 }
 

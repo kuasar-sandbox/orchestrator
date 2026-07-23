@@ -3,10 +3,12 @@ package store
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/kuasar-sandbox/orchestrator/internal/secretbox"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
 
@@ -163,6 +165,53 @@ func TestSetAndClearMMDSStoreValue(t *testing.T) {
 	v, ok, err = st.GetMMDSStoreValue(ctx, sb.ID, "a")
 	if err != nil || !ok || v.Present || v.Revision != 2 || len(v.Value) != 0 {
 		t.Fatalf("deleted state = %+v ok=%t err=%v", v, ok, err)
+	}
+}
+
+// TestSetMMDSStoreValuePersistenceFailureLeavesOldRevisionIntact covers the
+// failure-semantics requirement that a store encryption/persistence failure
+// fail the mutation and leave the old revision in place. mutateMMDSSecret only issues its
+// UPDATE after successfully encrypting, and never applies a partial write,
+// so any failure — simulated here by closing the store, the reliable way to
+// force the UPDATE to fail — must leave the previously-committed
+// value/revision completely unchanged.
+func TestSetMMDSStoreValuePersistenceFailureLeavesOldRevisionIntact(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.db")
+	box, err := secretbox.NewFromColonHex(strings.Repeat("0", 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := Open(path, box)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	sb := testSandbox("sb-persist-fail")
+	if err := st.PutWithMMDSEndpoints(ctx, sb, []MMDSEndpoint{
+		{Name: "a", Path: "/latest/a", BackendType: MMDSBackendStore},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetMMDSStoreValue(ctx, sb.ID, "a", []byte("hello"), "text/plain", 0); err != nil {
+		t.Fatalf("SetMMDSStoreValue: %v", err)
+	}
+
+	st.Close() // force every subsequent DB operation on this handle to fail
+	if err := st.SetMMDSStoreValue(ctx, sb.ID, "a", []byte("tampered"), "text/plain", 0); err == nil {
+		t.Fatal("SetMMDSStoreValue on a closed store returned nil error, want a persistence failure")
+	}
+
+	// Reopen a fresh connection to the same on-disk file and confirm the
+	// failed mutation left the previously-committed value/revision intact.
+	st2, err := Open(path, box)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st2.Close()
+	v, ok, err := st2.GetMMDSStoreValue(ctx, sb.ID, "a")
+	if err != nil || !ok || !v.Present || v.Revision != 1 || string(v.Value) != "hello" {
+		t.Fatalf("state after failed mutation = %+v ok=%t err=%v, want the original revision 1 value unchanged", v, ok, err)
 	}
 }
 

@@ -14,9 +14,13 @@ import (
 // this package free to be tested without that package's full dependency
 // tree and avoids a needless import-graph edge.
 type EndpointTable interface {
-	Lookup(ctx context.Context, sandboxID, path string) (name, backendType string, found bool)
-	ServeStore(ctx context.Context, sandboxID, name string) (value []byte, contentType string, revision int64, present bool)
-	ServeRelay(ctx context.Context, sandboxID, name string) (status int, contentType string, body []byte, ok bool)
+	// Lookup, ServeStore, ServeRelay: a non-nil err means the table itself
+	// failed/is unavailable — distinct from a legitimate found/present/
+	// ok=false negative result. resolve() maps a non-nil err to
+	// ErrCodeUnavailable, never to Found=false.
+	Lookup(ctx context.Context, sandboxID, path string) (name, backendType string, found bool, err error)
+	ServeStore(ctx context.Context, sandboxID, name string) (value []byte, contentType string, revision int64, present bool, err error)
+	ServeRelay(ctx context.Context, sandboxID, name string) (status int, contentType string, body []byte, ok bool, err error)
 }
 
 // Counter is the narrow metrics surface Server needs, mirroring
@@ -100,7 +104,7 @@ func (s *Server) handleRequest(ctx context.Context, conn io.ReadWriteCloser, id 
 	if len(s.inflight) >= s.maxInflight {
 		s.mu.Unlock()
 		s.mx.Inc(`mmds_worker_rpc_errors_total{reason="worker_inflight_limit"}`)
-		s.reply(conn, id, &EndpointResponse{ErrorCode: "worker_inflight_limit"})
+		s.reply(conn, id, &EndpointResponse{ErrorCode: ErrCodeWorkerInflightLimit})
 		return
 	}
 	var rctx context.Context
@@ -131,16 +135,25 @@ func (s *Server) handleRequest(ctx context.Context, conn io.ReadWriteCloser, id 
 // EndpointRequest — see Client's doc comment for why this is one round
 // trip rather than three.
 func (s *Server) resolve(ctx context.Context, req *EndpointRequest) *EndpointResponse {
-	name, backendType, found := s.table.Lookup(ctx, req.SandboxID, req.Path)
+	name, backendType, found, err := s.table.Lookup(ctx, req.SandboxID, req.Path)
+	if err != nil {
+		return &EndpointResponse{ErrorCode: ErrCodeUnavailable}
+	}
 	if !found {
 		return &EndpointResponse{Found: false}
 	}
 	switch backendType {
 	case "store":
-		value, contentType, revision, present := s.table.ServeStore(ctx, req.SandboxID, name)
+		value, contentType, revision, present, err := s.table.ServeStore(ctx, req.SandboxID, name)
+		if err != nil {
+			return &EndpointResponse{ErrorCode: ErrCodeUnavailable}
+		}
 		return &EndpointResponse{Found: true, Name: name, BackendType: backendType, Present: present, Body: value, ContentType: contentType, Revision: revision}
 	case "relay":
-		status, contentType, body, ok := s.table.ServeRelay(ctx, req.SandboxID, name)
+		status, contentType, body, ok, err := s.table.ServeRelay(ctx, req.SandboxID, name)
+		if err != nil {
+			return &EndpointResponse{ErrorCode: ErrCodeUnavailable}
+		}
 		if !ok {
 			return &EndpointResponse{Found: true, Name: name, BackendType: backendType, Present: false}
 		}

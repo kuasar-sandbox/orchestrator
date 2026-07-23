@@ -51,12 +51,12 @@ func TestLookupResolvesExactPath(t *testing.T) {
 		t.Fatal(err)
 	}
 	a := New(st, nil, time.Second, nil)
-	name, backend, found := a.Lookup(ctx, sb.ID, "/latest/meta-data/credentials")
-	if !found || name != "creds" || backend != store.MMDSBackendRelay {
-		t.Fatalf("Lookup = name=%q backend=%q found=%t", name, backend, found)
+	name, backend, found, err := a.Lookup(ctx, sb.ID, "/latest/meta-data/credentials")
+	if err != nil || !found || name != "creds" || backend != store.MMDSBackendRelay {
+		t.Fatalf("Lookup = name=%q backend=%q found=%t err=%v", name, backend, found, err)
 	}
-	if _, _, found := a.Lookup(ctx, sb.ID, "/latest/nope"); found {
-		t.Fatal("Lookup found an undeclared path")
+	if _, _, found, err := a.Lookup(ctx, sb.ID, "/latest/nope"); found || err != nil {
+		t.Fatalf("Lookup found an undeclared path or errored: found=%t err=%v", found, err)
 	}
 }
 
@@ -71,9 +71,9 @@ func TestServeStoreNeverConfiguredWaitsThenTimesOut(t *testing.T) {
 	}
 	a := New(st, nil, 50*time.Millisecond, nil)
 	start := time.Now()
-	_, _, _, present := a.ServeStore(ctx, sb.ID, "a")
-	if present {
-		t.Fatal("ServeStore returned present=true for a never-configured endpoint")
+	_, _, _, present, err := a.ServeStore(ctx, sb.ID, "a")
+	if err != nil || present {
+		t.Fatalf("ServeStore returned present=%t err=%v for a never-configured endpoint", present, err)
 	}
 	if elapsed := time.Since(start); elapsed < 40*time.Millisecond {
 		t.Fatalf("ServeStore returned too fast (%v), want it to have waited out the timeout", elapsed)
@@ -94,8 +94,9 @@ func TestServeStorePutDuringWaitWakesImmediately(t *testing.T) {
 	done := make(chan struct{})
 	var value []byte
 	var present bool
+	var serveErr error
 	go func() {
-		value, _, _, present = a.ServeStore(ctx, sb.ID, "a")
+		value, _, _, present, serveErr = a.ServeStore(ctx, sb.ID, "a")
 		close(done)
 	}()
 
@@ -110,8 +111,8 @@ func TestServeStorePutDuringWaitWakesImmediately(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("ServeStore did not wake up after Notify")
 	}
-	if !present || string(value) != "hello" {
-		t.Fatalf("ServeStore after wake = present=%t value=%q", present, value)
+	if serveErr != nil || !present || string(value) != "hello" {
+		t.Fatalf("ServeStore after wake = present=%t value=%q err=%v", present, value, serveErr)
 	}
 }
 
@@ -133,9 +134,9 @@ func TestServeStoreDeletedReturnsImmediately(t *testing.T) {
 
 	a := New(st, nil, 2*time.Second, nil)
 	start := time.Now()
-	_, _, _, present := a.ServeStore(ctx, sb.ID, "a")
-	if present {
-		t.Fatal("ServeStore returned present=true for a deleted value")
+	_, _, _, present, err := a.ServeStore(ctx, sb.ID, "a")
+	if err != nil || present {
+		t.Fatalf("ServeStore returned present=%t err=%v for a deleted value", present, err)
 	}
 	if elapsed := time.Since(start); elapsed > 200*time.Millisecond {
 		t.Fatalf("ServeStore waited for a deleted (revision>0) value: %v", elapsed)
@@ -158,9 +159,9 @@ func TestServeStoreExpiredReturnsImmediately(t *testing.T) {
 
 	a := New(st, nil, 2*time.Second, nil)
 	start := time.Now()
-	_, _, _, present := a.ServeStore(ctx, sb.ID, "a")
-	if present {
-		t.Fatal("ServeStore returned present=true for an expired value")
+	_, _, _, present, err := a.ServeStore(ctx, sb.ID, "a")
+	if err != nil || present {
+		t.Fatalf("ServeStore returned present=%t err=%v for an expired value", present, err)
 	}
 	if elapsed := time.Since(start); elapsed > 200*time.Millisecond {
 		t.Fatalf("ServeStore waited for an expired value: %v", elapsed)
@@ -215,9 +216,9 @@ func TestServeRelayReturns503WhenRelayClientNil(t *testing.T) {
 	endpointWithRelayConfig(t, st, sb, "a", "https://example.com/", "X-Auth")
 
 	a := New(st, nil, time.Second, nil)
-	status, _, _, ok := a.ServeRelay(context.Background(), sb.ID, "a")
-	if !ok || status != http.StatusServiceUnavailable {
-		t.Fatalf("ServeRelay with nil relay = status=%d ok=%t, want 503/true", status, ok)
+	status, _, _, ok, err := a.ServeRelay(context.Background(), sb.ID, "a")
+	if err != nil || !ok || status != http.StatusServiceUnavailable {
+		t.Fatalf("ServeRelay with nil relay = status=%d ok=%t err=%v, want 503/true/nil", status, ok, err)
 	}
 }
 
@@ -228,9 +229,9 @@ func TestServeRelayNeverConfiguredWaitsThenNotFound(t *testing.T) {
 
 	fake := &fakeRelayFetcher{}
 	a := New(st, fake, 50*time.Millisecond, nil)
-	_, _, _, ok := a.ServeRelay(context.Background(), sb.ID, "a")
-	if ok {
-		t.Fatal("ServeRelay returned ok=true for a never-configured auth")
+	_, _, _, ok, err := a.ServeRelay(context.Background(), sb.ID, "a")
+	if err != nil || ok {
+		t.Fatalf("ServeRelay returned ok=%t err=%v for a never-configured auth", ok, err)
 	}
 	if fake.callCount() != 0 {
 		t.Fatal("ServeRelay contacted the upstream for a never-configured auth")
@@ -252,9 +253,9 @@ func TestServeRelayRevokedReturnsImmediately(t *testing.T) {
 	fake := &fakeRelayFetcher{}
 	a := New(st, fake, 2*time.Second, nil)
 	start := time.Now()
-	_, _, _, ok := a.ServeRelay(ctx, sb.ID, "a")
-	if ok {
-		t.Fatal("ServeRelay returned ok=true for revoked auth")
+	_, _, _, ok, err := a.ServeRelay(ctx, sb.ID, "a")
+	if err != nil || ok {
+		t.Fatalf("ServeRelay returned ok=%t err=%v for revoked auth", ok, err)
 	}
 	if elapsed := time.Since(start); elapsed > 200*time.Millisecond {
 		t.Fatalf("ServeRelay waited for revoked (revision>0) auth: %v", elapsed)
@@ -275,9 +276,9 @@ func TestServeRelayConfiguredDispatchesFetchWithCorrectArgs(t *testing.T) {
 
 	fake := &fakeRelayFetcher{result: mmdsrelay.Result{Status: 200, ContentType: "application/json", Body: []byte(`{"ok":true}`)}}
 	a := New(st, fake, 2*time.Second, nil)
-	status, contentType, body, ok := a.ServeRelay(ctx, sb.ID, "creds")
-	if !ok || status != 200 || contentType != "application/json" || string(body) != `{"ok":true}` {
-		t.Fatalf("ServeRelay = status=%d contentType=%q body=%q ok=%t", status, contentType, body, ok)
+	status, contentType, body, ok, err := a.ServeRelay(ctx, sb.ID, "creds")
+	if err != nil || !ok || status != 200 || contentType != "application/json" || string(body) != `{"ok":true}` {
+		t.Fatalf("ServeRelay = status=%d contentType=%q body=%q ok=%t err=%v", status, contentType, body, ok, err)
 	}
 	if len(fake.calls) != 1 {
 		t.Fatalf("got %d Fetch calls, want 1", len(fake.calls))
@@ -303,7 +304,7 @@ func TestServeRelayCancelsInFlightFetchOnAuthNotify(t *testing.T) {
 
 	done := make(chan mmdsrelay.Result, 1)
 	go func() {
-		status, _, _, _ := a.ServeRelay(ctx, sb.ID, "a")
+		status, _, _, _, _ := a.ServeRelay(ctx, sb.ID, "a")
 		done <- mmdsrelay.Result{Status: status}
 	}()
 
