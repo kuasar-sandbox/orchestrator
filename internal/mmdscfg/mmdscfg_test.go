@@ -84,6 +84,41 @@ func TestExtractDisabledRejectsPresentNamespace(t *testing.T) {
 	}
 }
 
+// TestExtractDisabledRejectsBlankNamespace: a present-but-whitespace-only
+// namespace value must be rejected exactly like a non-blank one when
+// disabled — trimming to empty must never be treated the same as the key
+// being absent (which is the one case allowed to pass through silently).
+func TestExtractDisabledRejectsBlankNamespace(t *testing.T) {
+	limits := testLimits()
+	limits.Enabled = false
+	_, _, err := Extract(map[string]string{Ns: "   "}, limits)
+	if err == nil || !strings.Contains(err.Error(), "enabled=false") {
+		t.Fatalf("Extract error = %v, want enabled=false rejection for a blank-but-present namespace", err)
+	}
+}
+
+// TestExtractBlankNamespaceIsStrippedWhenEnabled: a present-but-blank
+// namespace, when enabled, is not a validation error (mirrors "no endpoints
+// declared") — but unlike a genuinely absent key, the raw key must still be
+// stripped from the returned metadata; returning the original map here
+// would leak the (blank) key into guest-visible metadata.
+func TestExtractBlankNamespaceIsStrippedWhenEnabled(t *testing.T) {
+	meta := map[string]string{Ns: "   ", "other.metadata": "keep-me"}
+	clean, eps, err := Extract(meta, testLimits())
+	if err != nil {
+		t.Fatalf("Extract failed: %v", err)
+	}
+	if len(eps) != 0 {
+		t.Fatalf("got %d endpoints, want 0", len(eps))
+	}
+	if _, present := clean[Ns]; present {
+		t.Fatalf("clean metadata still carries %q: %+v", Ns, clean)
+	}
+	if clean["other.metadata"] != "keep-me" {
+		t.Fatalf("metadata mutated: %+v", clean)
+	}
+}
+
 func TestExtractRejectsMissingSchemaVersion(t *testing.T) {
 	raw := `
 endpoints:

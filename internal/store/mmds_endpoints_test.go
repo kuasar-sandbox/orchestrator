@@ -116,7 +116,7 @@ func TestPutWithMMDSEndpointsResumeLeavesExistingRowsUntouched(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("initial PutWithMMDSEndpoints: %v", err)
 	}
-	if err := st.SetMMDSStoreValue(ctx, sb.ID, "a", []byte("v1"), "", 0); err != nil {
+	if _, err := st.SetMMDSStoreValue(ctx, sb.ID, "a", []byte("v1"), "", 0); err != nil {
 		t.Fatalf("SetMMDSStoreValue: %v", err)
 	}
 
@@ -151,7 +151,7 @@ func TestSetAndClearMMDSStoreValue(t *testing.T) {
 		t.Fatalf("never-configured state = %+v ok=%t err=%v", v, ok, err)
 	}
 
-	if err := st.SetMMDSStoreValue(ctx, sb.ID, "a", []byte("hello"), "text/plain", 0); err != nil {
+	if _, err := st.SetMMDSStoreValue(ctx, sb.ID, "a", []byte("hello"), "text/plain", 0); err != nil {
 		t.Fatalf("SetMMDSStoreValue: %v", err)
 	}
 	v, ok, err := st.GetMMDSStoreValue(ctx, sb.ID, "a")
@@ -159,7 +159,7 @@ func TestSetAndClearMMDSStoreValue(t *testing.T) {
 		t.Fatalf("configured state = %+v ok=%t err=%v", v, ok, err)
 	}
 
-	if err := st.ClearMMDSStoreValue(ctx, sb.ID, "a"); err != nil {
+	if _, err := st.ClearMMDSStoreValue(ctx, sb.ID, "a"); err != nil {
 		t.Fatalf("ClearMMDSStoreValue: %v", err)
 	}
 	v, ok, err = st.GetMMDSStoreValue(ctx, sb.ID, "a")
@@ -193,12 +193,12 @@ func TestSetMMDSStoreValuePersistenceFailureLeavesOldRevisionIntact(t *testing.T
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.SetMMDSStoreValue(ctx, sb.ID, "a", []byte("hello"), "text/plain", 0); err != nil {
+	if _, err := st.SetMMDSStoreValue(ctx, sb.ID, "a", []byte("hello"), "text/plain", 0); err != nil {
 		t.Fatalf("SetMMDSStoreValue: %v", err)
 	}
 
 	st.Close() // force every subsequent DB operation on this handle to fail
-	if err := st.SetMMDSStoreValue(ctx, sb.ID, "a", []byte("tampered"), "text/plain", 0); err == nil {
+	if _, err := st.SetMMDSStoreValue(ctx, sb.ID, "a", []byte("tampered"), "text/plain", 0); err == nil {
 		t.Fatal("SetMMDSStoreValue on a closed store returned nil error, want a persistence failure")
 	}
 
@@ -225,13 +225,13 @@ func TestSetMMDSStoreValueRejectsWrongBackendAndUnknownEndpoint(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := st.SetMMDSStoreValue(ctx, sb.ID, "relay-ep", []byte("x"), "", 0); !errors.Is(err, ErrMMDSEndpointWrongBackend) {
+	if _, err := st.SetMMDSStoreValue(ctx, sb.ID, "relay-ep", []byte("x"), "", 0); !errors.Is(err, ErrMMDSEndpointWrongBackend) {
 		t.Fatalf("SetMMDSStoreValue on a relay endpoint = %v, want ErrMMDSEndpointWrongBackend", err)
 	}
-	if err := st.SetMMDSRelayAuth(ctx, sb.ID, "relay-ep", []byte("secret")); err != nil {
+	if _, err := st.SetMMDSRelayAuth(ctx, sb.ID, "relay-ep", []byte("secret")); err != nil {
 		t.Fatalf("SetMMDSRelayAuth: %v", err)
 	}
-	if err := st.SetMMDSStoreValue(ctx, sb.ID, "does-not-exist", []byte("x"), "", 0); !errors.Is(err, ErrMMDSEndpointNotFound) {
+	if _, err := st.SetMMDSStoreValue(ctx, sb.ID, "does-not-exist", []byte("x"), "", 0); !errors.Is(err, ErrMMDSEndpointNotFound) {
 		t.Fatalf("SetMMDSStoreValue on an unknown endpoint = %v, want ErrMMDSEndpointNotFound", err)
 	}
 }
@@ -246,10 +246,10 @@ func TestGetMMDSRelayAuthDecryptFailsUnderWrongAAD(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.SetMMDSRelayAuth(ctx, sb.ID, "a", []byte("auth-a")); err != nil {
+	if _, err := st.SetMMDSRelayAuth(ctx, sb.ID, "a", []byte("auth-a")); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.SetMMDSRelayAuth(ctx, sb.ID, "b", []byte("auth-b")); err != nil {
+	if _, err := st.SetMMDSRelayAuth(ctx, sb.ID, "b", []byte("auth-b")); err != nil {
 		t.Fatal(err)
 	}
 
@@ -283,7 +283,7 @@ func TestListMMDSEndpointStatusReflectsExpiry(t *testing.T) {
 		t.Fatal(err)
 	}
 	past := time.Now().Add(-time.Hour).Unix()
-	if err := st.SetMMDSStoreValue(ctx, sb.ID, "a", []byte("v"), "", past); err != nil {
+	if _, err := st.SetMMDSStoreValue(ctx, sb.ID, "a", []byte("v"), "", past); err != nil {
 		t.Fatal(err)
 	}
 	statuses, err := st.ListMMDSEndpointStatus(ctx, sb.ID)
@@ -334,7 +334,7 @@ func TestGetMMDSEndpointFull(t *testing.T) {
 		t.Fatalf("GetMMDSEndpointFull declaration fields = %+v", e)
 	}
 
-	if err := st.SetMMDSRelayAuth(ctx, sb.ID, "creds", []byte("secret-token")); err != nil {
+	if _, err := st.SetMMDSRelayAuth(ctx, sb.ID, "creds", []byte("secret-token")); err != nil {
 		t.Fatal(err)
 	}
 	e, found, err = st.GetMMDSEndpointFull(ctx, sb.ID, "creds")
@@ -362,7 +362,7 @@ func TestRangeMMDSEndpoints(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.SetMMDSStoreValue(ctx, sb1.ID, "a", []byte("val-a"), "", 0); err != nil {
+	if _, err := st.SetMMDSStoreValue(ctx, sb1.ID, "a", []byte("val-a"), "", 0); err != nil {
 		t.Fatal(err)
 	}
 
@@ -385,6 +385,37 @@ func TestRangeMMDSEndpoints(t *testing.T) {
 	}
 	if e := bySandbox[sb2.ID]; e.ValuePresent || e.BackendType != MMDSBackendRelay {
 		t.Fatalf("sb2 endpoint = %+v", e)
+	}
+}
+
+// TestRangeMMDSEndpointsFailsOnUndecryptableValue: RangeMMDSEndpoints must
+// surface a decrypt failure as an error and stop, not skip the bad row and
+// continue — the caller (e.g. orch.ValidatePersistedMMDSEndpoints) relies on
+// this so an undecryptable present value fails startup.
+func TestRangeMMDSEndpointsFailsOnUndecryptableValue(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	sb := testSandbox("sb-range-corrupt")
+	if err := st.PutWithMMDSEndpoints(ctx, sb, []MMDSEndpoint{
+		{Name: "a", Path: "/latest/a", BackendType: MMDSBackendStore},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.SetMMDSStoreValue(ctx, sb.ID, "a", []byte("val-a"), "", 0); err != nil {
+		t.Fatal(err)
+	}
+	// Corrupt the ciphertext directly (simulating bit rot / a botched
+	// migration) so decryption fails.
+	if _, err := st.db.ExecContext(ctx, `UPDATE sandbox_mmds_endpoints SET secret_ciphertext='deadbeef' WHERE sandbox_id=? AND name='a'`, sb.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	err := st.RangeMMDSEndpoints(ctx, func(MMDSEndpointFull) error { return nil })
+	if err == nil {
+		t.Fatal("RangeMMDSEndpoints succeeded over a row with undecryptable ciphertext, want an error")
+	}
+	if strings.Contains(err.Error(), "val-a") {
+		t.Fatalf("error leaked plaintext: %v", err)
 	}
 }
 

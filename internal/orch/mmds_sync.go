@@ -48,7 +48,17 @@ func (o *Orchestrator) MmdsGeneration() string {
 
 // RangeMmds streams every currently-declared endpoint across every sandbox,
 // each carrying its current secret plaintext (if configured), through fn.
+// A disabled node policy (mmds.endpoints.enabled=false) streams nothing,
+// regardless of what sandbox_mmds_endpoints still holds from before the
+// feature was disabled — a subscriber's own local config (e.g. a proxy
+// master inferring "enabled" only from whether mmds_listen is set) must
+// never be the thing that decides whether historical ciphertext gets synced
+// into external process memory; the conductor's own flag is authoritative
+// and always wins.
 func (o *Orchestrator) RangeMmds(ctx context.Context, fn func(routesync.MmdsEndpointEntry) error) error {
+	if !o.cfg.MMDS.Endpoints.Enabled {
+		return nil
+	}
 	return o.st.RangeMMDSEndpoints(ctx, func(e store.MMDSEndpointFull) error {
 		return fn(mmdsWireEntry(e))
 	})
@@ -56,8 +66,15 @@ func (o *Orchestrator) RangeMmds(ctx context.Context, fn func(routesync.MmdsEndp
 
 // SubscribeMmds registers a live MMDS-endpoint-change listener, parallel to
 // Subscribe() for the route family (same lagged-subscriber drop policy: a
-// full channel is closed rather than blocking the publisher).
+// full channel is closed rather than blocking the publisher). Disabled
+// (mmds.endpoints.enabled=false) returns a channel that is never written to
+// — see RangeMmds; Create/admin mutations are already unreachable when
+// disabled, so nothing would publish to it in practice, but the guard is
+// kept here too rather than relying solely on those upstream gates.
 func (o *Orchestrator) SubscribeMmds() (<-chan routesync.MmdsEvent, func()) {
+	if !o.cfg.MMDS.Endpoints.Enabled {
+		return make(chan routesync.MmdsEvent), func() {}
+	}
 	ch := make(chan routesync.MmdsEvent, 1024)
 	o.mmdsSubsMu.Lock()
 	id := o.mmdsSubSeq

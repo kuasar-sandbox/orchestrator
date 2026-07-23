@@ -44,21 +44,40 @@ This namespace is accepted only by sandbox Create; template register/build endpo
 
 Node policy owns resource limits:
 
+This is the conductor's node policy — declaration/persistence policy plus the conductor's own internal-mode relay-serving runtime:
+
 ~~~yaml
 mmds:
   endpoints:
     enabled: false
     max_endpoints_per_sandbox: 16
-    max_total_endpoints: 65536
     max_metadata_bytes: 65536
     max_path_bytes: 512
     reserved_path_prefixes:
       - /latest/api/
       - /internal/
-    value_wait_timeout: 3s
     max_store_value_bytes: 16384
     max_relay_url_bytes: 2048
     max_relay_auth_bytes: 16384
+    # relay-serving runtime (shared shape with the external proxy's own copy below)
+    value_wait_timeout: 3s
+    relay_request_timeout: 2s
+    max_relay_response_bytes: 65536
+    max_relay_decompressed_bytes: 262144
+    max_relay_inflight_per_sandbox: 4
+    max_relay_requests_per_second: 2
+    max_relay_dns_answers: 16
+~~~
+
+The conductor is always the sole owner of declaration/persistence policy (name/path rules, endpoint counts, store/relay-url/auth size caps), regardless of `proxy.mode`. In external mode, the proxy master's own config carries a second, independently maintained copy of only the relay-serving runtime subset, plus its own worker-RPC settings — declaration/persistence policy has no meaning there, since the proxy master never validates a declaration itself; it trusts and mirrors whatever the conductor already validated and decided to sync:
+
+~~~yaml
+mmds:
+  enabled: true
+  listen: 127.0.0.1:19254
+  endpoints:
+    enabled: false
+    value_wait_timeout: 3s
     relay_request_timeout: 2s
     max_relay_response_bytes: 65536
     max_relay_decompressed_bytes: 262144
@@ -69,7 +88,9 @@ mmds:
     max_worker_rpc_frame_bytes: 524288
 ~~~
 
-Sizes are integer bytes. Create input cannot raise these limits. When `enabled` is false, Create requests containing the MMDS namespace fail 400 and Admin MMDS routes are not registered; the configuration is never silently ignored. Built-in MMDS token/metadata behavior remains enabled by its existing setting. Existing endpoint ciphertext remains persisted but is neither loaded nor served until re-enabled. At startup, enabled mode validates every persisted definition against current limits and reserved prefixes; any conflict or undecryptable present value fails startup with a non-secret diagnostic rather than truncating, grandfathering, or silently dropping data. `relay_request_timeout` is the total deadline; implementation phase limits must fit inside it.
+The proxy master's in-memory endpoint table capacity (bounding how many endpoints' decrypted secret plaintext it holds in process memory at once) is not operator-configurable — an internal, fixed safety ceiling, since the conductor is the sole source of truth for how many endpoints legitimately exist.
+
+Sizes are integer bytes. Create input cannot raise these limits. When `enabled` is false, Create requests containing the MMDS namespace fail 400 and Admin MMDS routes are not registered; the configuration is never silently ignored. Built-in MMDS token/metadata behavior remains enabled by its existing setting. Existing endpoint ciphertext remains persisted but is neither loaded nor served until re-enabled. At startup, enabled mode validates every persisted definition's name/path against current limits and reserved prefixes, and every sandbox's declared endpoint count against `max_endpoints_per_sandbox`; any conflict or undecryptable present value fails conductor startup with a non-secret diagnostic rather than truncating, grandfathering, or silently dropping data. `relay_request_timeout` is the total deadline; implementation phase limits must fit inside it.
 
 Name is the stable control-plane identifier, is guest-invisible, case-sensitive lowercase, and matches `[a-z][a-z0-9_-]{0,62}`. Name and path are immutable and unique per sandbox. A path may be any validated absolute path, but it must not equal or fall under a built-in route or an operator-configured reserved prefix. Reserved-prefix matching is segment-aware. Conflicts fail Create before launch. Path segments use bounded lowercase ASCII `[a-z0-9._-]`; percent escapes, empty segments, dot segments, backslashes, query, fragments, trailing slash, wildcards, and host patterns are rejected before ServeMux canonicalization. Guest access is exact GET only: no body, query, method list, or automatic redirect.
 

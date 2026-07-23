@@ -19,10 +19,13 @@ import (
 	"io"
 )
 
-// maxFrame bounds one frame — matches internal/routesync.maxFrame (1 MiB),
-// comfortably above the ~512KiB default max_worker_rpc_frame_bytes node
-// policy.
-const maxFrame = 1 << 20
+// defaultMaxFrame bounds one frame when the caller passes maxFrame<=0 — the
+// same absolute ceiling as internal/routesync.maxFrame (1 MiB), comfortably
+// above the ~512KiB default max_worker_rpc_frame_bytes node policy. Actual
+// Client/Server instances take max_worker_rpc_frame_bytes as their own
+// maxFrame (clamped to this ceiling), so the node-policy value is honored
+// rather than silently overridden by a fixed constant.
+const defaultMaxFrame = 1 << 20
 
 const (
 	typeRequest  = "request"
@@ -78,7 +81,18 @@ const (
 	ErrCodeUnavailable         = "unavailable"           // master's endpoint table itself is unavailable
 )
 
-func writeFrame(w io.Writer, m *wireMsg) error {
+// clampMaxFrame normalizes a configured max_worker_rpc_frame_bytes value:
+// <=0 falls back to defaultMaxFrame; anything above defaultMaxFrame is
+// clamped down to it (the absolute ceiling internal/routesync's own framing
+// uses, kept consistent across both packages' wire formats).
+func clampMaxFrame(n int) int {
+	if n <= 0 || n > defaultMaxFrame {
+		return defaultMaxFrame
+	}
+	return n
+}
+
+func writeFrame(w io.Writer, m *wireMsg, maxFrame int) error {
 	b, err := json.Marshal(m)
 	if err != nil {
 		return err
@@ -95,13 +109,13 @@ func writeFrame(w io.Writer, m *wireMsg) error {
 	return err
 }
 
-func readFrame(r io.Reader) (*wireMsg, error) {
+func readFrame(r io.Reader, maxFrame int) (*wireMsg, error) {
 	var hdr [4]byte
 	if _, err := io.ReadFull(r, hdr[:]); err != nil {
 		return nil, err
 	}
 	n := binary.LittleEndian.Uint32(hdr[:])
-	if n == 0 || n > maxFrame {
+	if n == 0 || n > uint32(maxFrame) {
 		return nil, errors.New("mmdsrpc: bad frame length")
 	}
 	buf := make([]byte, n)

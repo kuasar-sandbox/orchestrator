@@ -3,6 +3,7 @@ package mmdsrpc
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"sync"
 	"testing"
@@ -62,14 +63,14 @@ func (f *fakeTable) ServeRelay(context.Context, string, string) (int, string, []
 func harness(t *testing.T, table EndpointTable, maxInflight int) (*Client, func()) {
 	t.Helper()
 	clientConn, serverConn := net.Pipe()
-	srv := NewServer(table, maxInflight, nil, nil)
+	srv := NewServer(table, maxInflight, nil, nil, 0)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
 		_ = srv.Serve(ctx, serverConn)
 		close(done)
 	}()
-	client := NewClient(clientConn)
+	client := NewClient(clientConn, 0)
 	cleanup := func() {
 		cancel()
 		_ = clientConn.Close()
@@ -77,6 +78,40 @@ func harness(t *testing.T, table EndpointTable, maxInflight int) (*Client, func(
 		<-done
 	}
 	return client, cleanup
+}
+
+func TestClampMaxFrame(t *testing.T) {
+	cases := []struct {
+		in   int
+		want int
+	}{
+		{0, defaultMaxFrame},
+		{-1, defaultMaxFrame},
+		{defaultMaxFrame + 1, defaultMaxFrame},
+		{512 * 1024, 512 * 1024}, // the node-policy default: honored as-is, not silently overridden
+	}
+	for _, c := range cases {
+		if got := clampMaxFrame(c.in); got != c.want {
+			t.Errorf("clampMaxFrame(%d) = %d, want %d", c.in, got, c.want)
+		}
+	}
+}
+
+// TestClientMaxFrameIsEnforced proves max_worker_rpc_frame_bytes actually
+// reaches the wire codec rather than every Client/Server silently using the
+// package's 1 MiB default regardless of what's configured: a Client built
+// with a small maxFrame must refuse to write a request frame that exceeds
+// it, before ever touching the connection.
+func TestClientMaxFrameIsEnforced(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+	defer serverConn.Close()
+	client := NewClient(clientConn, 64) // tiny — any real EndpointRequest JSON exceeds this
+
+	_, _, _, err := client.Lookup(context.Background(), "s1", "/latest/a-path-long-enough-to-exceed-64-bytes-of-json-envelope")
+	if err == nil {
+		t.Fatal("Lookup with an oversize request under a 64-byte maxFrame returned nil error, want a size-limit error")
+	}
 }
 
 func TestLookupServeStoreRoundTrip(t *testing.T) {
@@ -160,6 +195,62 @@ func TestConcurrentRequestsMultiplex(t *testing.T) {
 	}
 }
 
+// TestConcurrentRequestsToSameEndpointDoNotRace covers the case
+// TestConcurrentRequestsMultiplex doesn't: many concurrent guest requests
+// for the *same* (sandbox_id,name), each with its own context (as
+// internal/mmds.getMeta's r.Context() naturally is, per incoming HTTP
+// request). Client's single-slot response cache used to be keyed only by
+// (sandbox_id,name), so concurrent Lookup calls for the same key could
+// overwrite or race-delete each other's cached response, making some
+// callers' ServeStore spuriously see "not present" even though their own
+// Lookup succeeded moments earlier.
+func TestConcurrentRequestsToSameEndpointDoNotRace(t *testing.T) {
+	table := newFakeTable()
+	table.byPath["s1\x00/latest/shared"] = [2]string{"shared", "store"}
+	table.store["s1\x00shared"] = []byte("shared-value")
+
+	client, cleanup := harness(t, table, 256)
+	defer cleanup()
+
+	// Two-phase, barrier-synchronized: every goroutine's Lookup must land
+	// in the cache before any of them proceeds to ServeStore/take(). With
+	// the old single-slot-per-(sandbox_id,name) cache, N concurrent Lookups
+	// for the same key overwrite each other down to at most one surviving
+	// entry — a phase-1 barrier forces exactly this worst case instead of
+	// leaving it to scheduler luck (which the unbarriered version of this
+	// test found is too unreliable to catch the bug).
+	const n = 64
+	var lookupWG, doneWG sync.WaitGroup
+	lookupWG.Add(n)
+	doneWG.Add(n)
+	errs := make(chan string, n)
+	for i := 0; i < n; i++ {
+		go func(i int) {
+			defer doneWG.Done()
+			// A distinct context per goroutine, mirroring a distinct
+			// r.Context() per incoming guest HTTP request.
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			name, _, found, err := client.Lookup(ctx, "s1", "/latest/shared")
+			lookupWG.Done()
+			if err != nil || !found || name != "shared" {
+				errs <- fmt.Sprintf("goroutine %d: Lookup = name=%q found=%t err=%v", i, name, found, err)
+				return
+			}
+			lookupWG.Wait() // hold every ServeStore/take() until all N Lookups have landed
+			value, _, _, present, err := client.ServeStore(ctx, "s1", "shared")
+			if err != nil || !present || string(value) != "shared-value" {
+				errs <- fmt.Sprintf("goroutine %d: ServeStore = value=%q present=%t err=%v", i, value, present, err)
+			}
+		}(i)
+	}
+	doneWG.Wait()
+	close(errs)
+	for e := range errs {
+		t.Error(e)
+	}
+}
+
 func TestDuplicateRequestIDRejectedServerSide(t *testing.T) {
 	table := newFakeTable()
 	table.byPath["s1\x00/latest/a"] = [2]string{"a", "store"}
@@ -168,7 +259,7 @@ func TestDuplicateRequestIDRejectedServerSide(t *testing.T) {
 	clientConn, serverConn := net.Pipe()
 	defer clientConn.Close()
 	defer serverConn.Close()
-	srv := NewServer(table, 128, nil, nil)
+	srv := NewServer(table, 128, nil, nil, 0)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go srv.Serve(ctx, serverConn)
@@ -176,10 +267,10 @@ func TestDuplicateRequestIDRejectedServerSide(t *testing.T) {
 	// Send the same request_id twice directly on the wire (bypassing
 	// Client, which always mints fresh IDs) to exercise the server's
 	// duplicate-ID guard.
-	if err := writeFrame(clientConn, &wireMsg{Type: typeRequest, RequestID: 1, Request: &EndpointRequest{SandboxID: "s1", Path: "/latest/a"}}); err != nil {
+	if err := writeFrame(clientConn, &wireMsg{Type: typeRequest, RequestID: 1, Request: &EndpointRequest{SandboxID: "s1", Path: "/latest/a"}}, defaultMaxFrame); err != nil {
 		t.Fatal(err)
 	}
-	first, err := readFrame(clientConn)
+	first, err := readFrame(clientConn, defaultMaxFrame)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -193,16 +284,16 @@ func TestDuplicateRequestIDRejectedServerSide(t *testing.T) {
 	table.mu.Lock()
 	table.block = make(chan struct{})
 	table.mu.Unlock()
-	if err := writeFrame(clientConn, &wireMsg{Type: typeRequest, RequestID: 2, Request: &EndpointRequest{SandboxID: "s1", Path: "/latest/a"}}); err != nil {
+	if err := writeFrame(clientConn, &wireMsg{Type: typeRequest, RequestID: 2, Request: &EndpointRequest{SandboxID: "s1", Path: "/latest/a"}}, defaultMaxFrame); err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(20 * time.Millisecond) // let request_id 2 register as inflight
-	if err := writeFrame(clientConn, &wireMsg{Type: typeRequest, RequestID: 2, Request: &EndpointRequest{SandboxID: "s1", Path: "/latest/a"}}); err != nil {
+	if err := writeFrame(clientConn, &wireMsg{Type: typeRequest, RequestID: 2, Request: &EndpointRequest{SandboxID: "s1", Path: "/latest/a"}}, defaultMaxFrame); err != nil {
 		t.Fatal(err)
 	}
 	close(table.block)
 
-	resp, err := readFrame(clientConn)
+	resp, err := readFrame(clientConn, defaultMaxFrame)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -256,11 +347,11 @@ func TestCancellationFreesServerResources(t *testing.T) {
 	clientConn, serverConn := net.Pipe()
 	defer clientConn.Close()
 	defer serverConn.Close()
-	srv := NewServer(table, 1, nil, nil) // cap 1: a second call only succeeds if the first was truly cancelled server-side
+	srv := NewServer(table, 1, nil, nil, 0) // cap 1: a second call only succeeds if the first was truly cancelled server-side
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go srv.Serve(ctx, serverConn)
-	client := NewClient(clientConn)
+	client := NewClient(clientConn, 0)
 
 	callCtx, callCancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
 	defer callCancel()
@@ -285,10 +376,10 @@ func TestClientCloseUnblocksPendingCalls(t *testing.T) {
 	table.block = make(chan struct{})
 
 	clientConn, serverConn := net.Pipe()
-	srv := NewServer(table, 128, nil, nil)
+	srv := NewServer(table, 128, nil, nil, 0)
 	ctx, cancel := context.WithCancel(context.Background())
 	go srv.Serve(ctx, serverConn)
-	client := NewClient(clientConn)
+	client := NewClient(clientConn, 0)
 
 	done := make(chan struct{})
 	go func() {

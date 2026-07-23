@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -23,26 +24,47 @@ type stubMmdsAdmin struct {
 	// err, if set, is returned by every mutation (used to simulate not-found /
 	// wrong-backend / a generic failure).
 	err error
+	// revision is returned on every successful mutation, incremented each
+	// call — lets tests assert the handler actually threads it through to
+	// the audit log rather than always seeing a zero value.
+	revision int64
 }
 
-func (a *stubMmdsAdmin) SetMMDSStoreValue(_ context.Context, sid, name string, value []byte, contentType string, expiresUnix int64) error {
+func (a *stubMmdsAdmin) nextRevision() int64 {
+	a.revision++
+	return a.revision
+}
+
+func (a *stubMmdsAdmin) SetMMDSStoreValue(_ context.Context, sid, name string, value []byte, contentType string, expiresUnix int64) (int64, error) {
 	a.calls = append(a.calls, mmdsCall{op: "set_store", sid: sid, name: name, value: value, contentType: contentType, expiresUnix: expiresUnix})
-	return a.err
+	if a.err != nil {
+		return 0, a.err
+	}
+	return a.nextRevision(), nil
 }
 
-func (a *stubMmdsAdmin) ClearMMDSStoreValue(_ context.Context, sid, name string) error {
+func (a *stubMmdsAdmin) ClearMMDSStoreValue(_ context.Context, sid, name string) (int64, error) {
 	a.calls = append(a.calls, mmdsCall{op: "clear_store", sid: sid, name: name})
-	return a.err
+	if a.err != nil {
+		return 0, a.err
+	}
+	return a.nextRevision(), nil
 }
 
-func (a *stubMmdsAdmin) SetMMDSRelayAuth(_ context.Context, sid, name string, value []byte) error {
+func (a *stubMmdsAdmin) SetMMDSRelayAuth(_ context.Context, sid, name string, value []byte) (int64, error) {
 	a.calls = append(a.calls, mmdsCall{op: "set_relay_auth", sid: sid, name: name, value: value})
-	return a.err
+	if a.err != nil {
+		return 0, a.err
+	}
+	return a.nextRevision(), nil
 }
 
-func (a *stubMmdsAdmin) ClearMMDSRelayAuth(_ context.Context, sid, name string) error {
+func (a *stubMmdsAdmin) ClearMMDSRelayAuth(_ context.Context, sid, name string) (int64, error) {
 	a.calls = append(a.calls, mmdsCall{op: "clear_relay_auth", sid: sid, name: name})
-	return a.err
+	if a.err != nil {
+		return 0, a.err
+	}
+	return a.nextRevision(), nil
 }
 
 func rawPutDelete(t *testing.T, client *http.Client, method, path string, headers map[string]string, body []byte) int {
@@ -187,6 +209,75 @@ func TestMmdsAdminRoutesNotRegisteredWhenNilDeps(t *testing.T) {
 	// bare ServeMux (no handler registered for this path at all).
 	if code != http.StatusNotFound {
 		t.Fatalf("PUT with mmds admin disabled = %d, want 404 (route not registered)", code)
+	}
+}
+
+func TestMmdsAdminStorePutRejectsInvalidContentType(t *testing.T) {
+	adm := &stubMmdsAdmin{}
+	_, client := startTestServer(t, Deps{MmdsEndpoints: adm})
+
+	code := rawPutDelete(t, client, http.MethodPut, "/internal/admin/sandboxes/sb-1/mmds/a",
+		map[string]string{"Content-Type": "not-a-media-type"}, []byte("v"))
+	if code != http.StatusBadRequest {
+		t.Fatalf("PUT with unparseable content-type = %d, want 400", code)
+	}
+	if len(adm.calls) != 0 {
+		t.Fatalf("admin was called despite invalid content-type: %+v", adm.calls)
+	}
+
+	code = rawPutDelete(t, client, http.MethodPut, "/internal/admin/sandboxes/sb-1/mmds/a",
+		map[string]string{"Content-Type": "text/plain; charset=utf-8"}, []byte("v"))
+	if code != http.StatusNoContent {
+		t.Fatalf("PUT with a valid content-type = %d, want 204", code)
+	}
+}
+
+func TestMmdsAdminStorePutRejectsOversizedContentType(t *testing.T) {
+	adm := &stubMmdsAdmin{}
+	_, client := startTestServer(t, Deps{MmdsEndpoints: adm})
+
+	huge := "text/plain; x=" + strings.Repeat("a", maxMMDSContentTypeBytes)
+	code := rawPutDelete(t, client, http.MethodPut, "/internal/admin/sandboxes/sb-1/mmds/a",
+		map[string]string{"Content-Type": huge}, []byte("v"))
+	if code != http.StatusBadRequest {
+		t.Fatalf("PUT with oversized content-type = %d, want 400", code)
+	}
+}
+
+func TestMmdsAdminStorePutRejectsNegativeExpires(t *testing.T) {
+	adm := &stubMmdsAdmin{}
+	_, client := startTestServer(t, Deps{MmdsEndpoints: adm})
+
+	code := rawPutDelete(t, client, http.MethodPut, "/internal/admin/sandboxes/sb-1/mmds/a",
+		map[string]string{MMDSExpiresHeader: "-1"}, []byte("v"))
+	if code != http.StatusBadRequest {
+		t.Fatalf("PUT with negative expires = %d, want 400", code)
+	}
+	if len(adm.calls) != 0 {
+		t.Fatalf("admin was called despite negative expires: %+v", adm.calls)
+	}
+}
+
+func TestMmdsAdminRelayAuthPutRejectsCRLFAndNUL(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		value []byte
+	}{
+		{"CR", []byte("secret\rinjected")},
+		{"LF", []byte("secret\ninjected")},
+		{"NUL", []byte("secret\x00injected")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			adm := &stubMmdsAdmin{}
+			_, client := startTestServer(t, Deps{MmdsEndpoints: adm})
+			code := rawPutDelete(t, client, http.MethodPut, "/internal/admin/sandboxes/sb-1/mmds/a/auth", nil, tc.value)
+			if code != http.StatusBadRequest {
+				t.Fatalf("PUT relay auth containing %s = %d, want 400", tc.name, code)
+			}
+			if len(adm.calls) != 0 {
+				t.Fatalf("admin was called despite a %s in the value: %+v", tc.name, adm.calls)
+			}
+		})
 	}
 }
 

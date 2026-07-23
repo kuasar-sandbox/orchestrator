@@ -140,6 +140,13 @@ func runConductor(args []string, log *slog.Logger) error {
 		cfg.Sandbox.Network.Switch,
 		vswitch.WithTapFDSocket(cfg.Sandbox.Network.TapFDSocket),
 	), log, mx)
+	// A persisted endpoint that no longer satisfies current node policy (or
+	// whose value fails to decrypt) must fail conductor startup with a
+	// non-secret diagnostic, never be silently dropped or grandfathered in.
+	// A no-op when mmds.endpoints.enabled=false.
+	if err := core.ValidatePersistedMMDSEndpoints(ctx); err != nil {
+		return err
+	}
 	if err := core.InstallUnits(ctx); err != nil {
 		return err
 	}

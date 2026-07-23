@@ -23,9 +23,20 @@ import (
 	"sync"
 	"time"
 
+	"github.com/kuasar-sandbox/orchestrator/internal/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/mmdsrelay"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 )
+
+// defaultMaxTotalEndpoints bounds Table's live in-memory footprint (the
+// decrypted secret plaintext of every currently-declared endpoint across
+// every sandbox on this node). Not operator-configurable — declaration/
+// persistence policy, including any count limit, is conductor-only; this
+// process only ever trusts and mirrors what the conductor already
+// validated and decided to sync. A hardcoded ceiling still exists here
+// purely as an implementation-level safety net against unbounded process
+// memory growth, independent of any config surface.
+const defaultMaxTotalEndpoints = 65536
 
 // relayFetcher is the narrow relay surface Table needs — satisfied by
 // *mmdsrelay.Client in production, stubbable in tests. Mirrors
@@ -52,7 +63,7 @@ type relayPublicConfig struct {
 // matching bookmark.
 type Table struct {
 	relay            relayFetcher // nil = relay-backend endpoints are unavailable (503), mirrors mmdsauth.Authority
-	maxTotal         int          // 0 = unbounded
+	maxTotal         int          // defaultMaxTotalEndpoints; not operator-configurable, see that const's doc
 	valueWaitTimeout time.Duration
 
 	mu         sync.RWMutex
@@ -82,9 +93,20 @@ func (noopCounter) Inc(string)        {}
 func (noopCounter) Add(string, int64) {}
 
 // New builds a Table. relay may be nil (relay endpoints unavailable).
-// maxTotal<=0 means unbounded. valueWaitTimeout<=0 defaults to 3s. mx may
-// be nil (metrics off).
-func New(relay relayFetcher, maxTotal int, valueWaitTimeout time.Duration, mx Counter) *Table {
+// maxTotal<=0 uses defaultMaxTotalEndpoints — a Go-level constructor
+// parameter (tests use a small value to exercise the capacity bound) that
+// is deliberately NOT sourced from any YAML config surface in production;
+// see defaultMaxTotalEndpoints's own doc. runtime is this process's own
+// relay-serving policy (proxy.yaml's mmds.endpoints block — an
+// independently configured value, not necessarily identical to the
+// conductor's mmds.endpoints; see config.ProxyFileConfig's doc comment).
+// runtime.ValueWaitTimeoutDur()<=0 defaults to 3s. mx may be nil (metrics
+// off).
+func New(relay relayFetcher, maxTotal int, runtime config.MMDSRuntimeConfig, mx Counter) *Table {
+	if maxTotal <= 0 {
+		maxTotal = defaultMaxTotalEndpoints
+	}
+	valueWaitTimeout := runtime.ValueWaitTimeoutDur()
 	if valueWaitTimeout <= 0 {
 		valueWaitTimeout = 3 * time.Second
 	}
@@ -142,7 +164,14 @@ func (t *Table) Disconnected() {
 // than what's already recorded is ignored; an equal revision
 // is idempotent only if the payload is byte-identical, otherwise it's a
 // protocol error that forces a resync (the table is marked unavailable and
-// cleared — the next BeginMmdsSync/Bookmark pair recovers it).
+// cleared — the next BeginMmdsSync/Bookmark pair recovers it). Name/path
+// declaration rules are NOT re-checked here: that is exclusively
+// conductor-owned policy (see config.ProxyMMDSEndpointsConfig's doc
+// comment) — this process trusts and mirrors whatever the conductor, which
+// already validated it, decided to sync verbatim. Only capacity
+// (max_total_endpoints, the actual local resource this process owns) is
+// enforced locally, below — routine backpressure as the node fills up, so
+// it drops only the marginal entry rather than forcing a resync.
 func (t *Table) ApplyMmdsUpsert(e routesync.MmdsEndpointEntry) {
 	t.mu.Lock()
 	target := t.live

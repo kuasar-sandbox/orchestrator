@@ -21,13 +21,20 @@ import (
 // a single connection safely.
 //
 // Lookup performs the FULL resolve+serve round trip (not just a lookup) and
-// caches the result keyed by (sandbox_id,name); the immediately-following
+// caches the result keyed by (ctx,sandbox_id,name); the immediately-following
 // ServeStore/ServeRelay call internal/mmds.go always makes for the same
-// request consumes that cached result instead of a second round trip. This
-// coupling is safe only because of that exact calling convention — it is
-// not a general-purpose cache.
+// request consumes that cached result instead of a second round trip. ctx is
+// part of the key — not just (sandbox_id,name) — because mmds.go's dispatch
+// runs one HTTP request per goroutine and reuses that request's ctx
+// (r.Context(), pointer-identical across the Lookup+ServeStore/ServeRelay
+// pair) for both calls: two concurrent guest requests hitting the *same*
+// (sandbox_id,name) would otherwise race on a single shared slot, and one
+// could observe the other's cached response — or find it already deleted —
+// producing a spurious 404. This coupling is safe only because of that exact
+// calling convention — it is not a general-purpose cache.
 type Client struct {
-	conn io.ReadWriteCloser
+	conn     io.ReadWriteCloser
+	maxFrame int
 
 	writeMu sync.Mutex
 
@@ -38,18 +45,27 @@ type Client struct {
 	closeErr error
 
 	cacheMu sync.Mutex
-	cache   map[string]*EndpointResponse
+	cache   map[cacheKey]*EndpointResponse
+}
+
+// cacheKey scopes a cached Lookup result to the calling request's context in
+// addition to (sandbox_id,name) — see Client's doc comment.
+type cacheKey struct {
+	ctx  context.Context
+	skey string // sandbox_id + "\x00" + name
 }
 
 // NewClient wraps conn (a socketpair-derived net.Conn in production) and
 // starts its reader pump. The caller owns conn's lifetime otherwise; Client
 // closes it once the reader pump observes an error (EOF on worker restart,
-// etc).
-func NewClient(conn io.ReadWriteCloser) *Client {
+// etc). maxFrame is the node-policy max_worker_rpc_frame_bytes; <=0 or
+// above the absolute ceiling falls back to/clamps to defaultMaxFrame.
+func NewClient(conn io.ReadWriteCloser, maxFrame int) *Client {
 	c := &Client{
-		conn:    conn,
-		pending: map[uint64]chan *EndpointResponse{},
-		cache:   map[string]*EndpointResponse{},
+		conn:     conn,
+		maxFrame: clampMaxFrame(maxFrame),
+		pending:  map[uint64]chan *EndpointResponse{},
+		cache:    map[cacheKey]*EndpointResponse{},
 	}
 	go c.readLoop()
 	return c
@@ -57,7 +73,7 @@ func NewClient(conn io.ReadWriteCloser) *Client {
 
 func (c *Client) readLoop() {
 	for {
-		m, err := readFrame(c.conn)
+		m, err := readFrame(c.conn, c.maxFrame)
 		if err != nil {
 			c.closeWith(err)
 			return
@@ -117,7 +133,7 @@ func (c *Client) call(ctx context.Context, req *EndpointRequest) (*EndpointRespo
 		req.DeadlineUnixMS = dl.UnixMilli()
 	}
 	c.writeMu.Lock()
-	err := writeFrame(c.conn, &wireMsg{Type: typeRequest, RequestID: id, Request: req})
+	err := writeFrame(c.conn, &wireMsg{Type: typeRequest, RequestID: id, Request: req}, c.maxFrame)
 	c.writeMu.Unlock()
 	if err != nil {
 		c.mu.Lock()
@@ -137,7 +153,7 @@ func (c *Client) call(ctx context.Context, req *EndpointRequest) (*EndpointRespo
 		delete(c.pending, id)
 		c.mu.Unlock()
 		c.writeMu.Lock()
-		_ = writeFrame(c.conn, &wireMsg{Type: typeCancel, RequestID: id})
+		_ = writeFrame(c.conn, &wireMsg{Type: typeCancel, RequestID: id}, c.maxFrame)
 		c.writeMu.Unlock()
 		return nil, ctx.Err()
 	}
@@ -166,15 +182,15 @@ func (c *Client) Lookup(ctx context.Context, sandboxID, path string) (name, back
 	if !resp.Found {
 		return "", "", false, nil
 	}
-	key := sandboxID + "\x00" + resp.Name
+	key := cacheKey{ctx, sandboxID + "\x00" + resp.Name}
 	c.cacheMu.Lock()
 	c.cache[key] = resp
 	c.cacheMu.Unlock()
 	return resp.Name, resp.BackendType, true, nil
 }
 
-func (c *Client) take(sandboxID, name string) *EndpointResponse {
-	key := sandboxID + "\x00" + name
+func (c *Client) take(ctx context.Context, sandboxID, name string) *EndpointResponse {
+	key := cacheKey{ctx, sandboxID + "\x00" + name}
 	c.cacheMu.Lock()
 	defer c.cacheMu.Unlock()
 	resp := c.cache[key]
@@ -183,11 +199,13 @@ func (c *Client) take(sandboxID, name string) *EndpointResponse {
 }
 
 // ServeStore returns the store value from the round trip Lookup already
-// performed for this (sandboxID,name) — that round trip already surfaced
-// any master-side failure via Lookup's own err, so this never fails on its
-// own.
-func (c *Client) ServeStore(_ context.Context, sandboxID, name string) (value []byte, contentType string, revision int64, present bool, err error) {
-	resp := c.take(sandboxID, name)
+// performed for this (ctx,sandboxID,name) — that round trip already
+// surfaced any master-side failure via Lookup's own err, so this never
+// fails on its own. ctx must be the same context.Context value (e.g.
+// r.Context()) passed to the immediately-preceding Lookup call — see
+// Client's doc comment.
+func (c *Client) ServeStore(ctx context.Context, sandboxID, name string) (value []byte, contentType string, revision int64, present bool, err error) {
+	resp := c.take(ctx, sandboxID, name)
 	if resp == nil || !resp.Present {
 		if resp != nil {
 			return nil, "", resp.Revision, false, nil
@@ -198,9 +216,9 @@ func (c *Client) ServeStore(_ context.Context, sandboxID, name string) (value []
 }
 
 // ServeRelay returns the relay result from the round trip Lookup already
-// performed for this (sandboxID,name) — see ServeStore.
-func (c *Client) ServeRelay(_ context.Context, sandboxID, name string) (status int, contentType string, body []byte, ok bool, err error) {
-	resp := c.take(sandboxID, name)
+// performed for this (ctx,sandboxID,name) — see ServeStore.
+func (c *Client) ServeRelay(ctx context.Context, sandboxID, name string) (status int, contentType string, body []byte, ok bool, err error) {
+	resp := c.take(ctx, sandboxID, name)
 	if resp == nil || !resp.Present {
 		return 0, "", nil, false, nil
 	}

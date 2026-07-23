@@ -101,7 +101,7 @@ func TestServeStorePutDuringWaitWakesImmediately(t *testing.T) {
 	}()
 
 	time.Sleep(20 * time.Millisecond) // let ServeStore park before the PUT lands
-	if err := st.SetMMDSStoreValue(ctx, sb.ID, "a", []byte("hello"), "", 0); err != nil {
+	if _, err := st.SetMMDSStoreValue(ctx, sb.ID, "a", []byte("hello"), "", 0); err != nil {
 		t.Fatal(err)
 	}
 	a.Notify(sb.ID, "a")
@@ -125,10 +125,10 @@ func TestServeStoreDeletedReturnsImmediately(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.SetMMDSStoreValue(ctx, sb.ID, "a", []byte("v"), "", 0); err != nil {
+	if _, err := st.SetMMDSStoreValue(ctx, sb.ID, "a", []byte("v"), "", 0); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.ClearMMDSStoreValue(ctx, sb.ID, "a"); err != nil {
+	if _, err := st.ClearMMDSStoreValue(ctx, sb.ID, "a"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -153,7 +153,7 @@ func TestServeStoreExpiredReturnsImmediately(t *testing.T) {
 		t.Fatal(err)
 	}
 	past := time.Now().Add(-time.Hour).Unix()
-	if err := st.SetMMDSStoreValue(ctx, sb.ID, "a", []byte("v"), "", past); err != nil {
+	if _, err := st.SetMMDSStoreValue(ctx, sb.ID, "a", []byte("v"), "", past); err != nil {
 		t.Fatal(err)
 	}
 
@@ -243,10 +243,10 @@ func TestServeRelayRevokedReturnsImmediately(t *testing.T) {
 	ctx := context.Background()
 	sb := testSandbox("sb-relay-revoked")
 	endpointWithRelayConfig(t, st, sb, "a", "https://example.com/", "X-Auth")
-	if err := st.SetMMDSRelayAuth(ctx, sb.ID, "a", []byte("secret")); err != nil {
+	if _, err := st.SetMMDSRelayAuth(ctx, sb.ID, "a", []byte("secret")); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.ClearMMDSRelayAuth(ctx, sb.ID, "a"); err != nil {
+	if _, err := st.ClearMMDSRelayAuth(ctx, sb.ID, "a"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -270,7 +270,7 @@ func TestServeRelayConfiguredDispatchesFetchWithCorrectArgs(t *testing.T) {
 	ctx := context.Background()
 	sb := testSandbox("sb-relay-ok")
 	endpointWithRelayConfig(t, st, sb, "creds", "https://identity.example.com/creds", "X-Upstream-Assertion")
-	if err := st.SetMMDSRelayAuth(ctx, sb.ID, "creds", []byte("secret-token")); err != nil {
+	if _, err := st.SetMMDSRelayAuth(ctx, sb.ID, "creds", []byte("secret-token")); err != nil {
 		t.Fatal(err)
 	}
 
@@ -295,7 +295,7 @@ func TestServeRelayCancelsInFlightFetchOnAuthNotify(t *testing.T) {
 	ctx := context.Background()
 	sb := testSandbox("sb-relay-cancel")
 	endpointWithRelayConfig(t, st, sb, "a", "https://example.com/", "X-Auth")
-	if err := st.SetMMDSRelayAuth(ctx, sb.ID, "a", []byte("old-secret")); err != nil {
+	if _, err := st.SetMMDSRelayAuth(ctx, sb.ID, "a", []byte("old-secret")); err != nil {
 		t.Fatal(err)
 	}
 
@@ -309,7 +309,7 @@ func TestServeRelayCancelsInFlightFetchOnAuthNotify(t *testing.T) {
 	}()
 
 	time.Sleep(50 * time.Millisecond) // let ServeRelay reach the blocked Fetch call
-	if err := st.SetMMDSRelayAuth(ctx, sb.ID, "a", []byte("new-secret")); err != nil {
+	if _, err := st.SetMMDSRelayAuth(ctx, sb.ID, "a", []byte("new-secret")); err != nil {
 		t.Fatal(err)
 	}
 	a.Notify(sb.ID, "a") // simulate what orch's admin mutation path does after a successful write

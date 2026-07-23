@@ -42,6 +42,7 @@ func (noopCounter) Inc(string) {}
 type Server struct {
 	table       EndpointTable
 	maxInflight int
+	maxFrame    int
 	log         *slog.Logger
 	mx          Counter
 
@@ -52,15 +53,16 @@ type Server struct {
 }
 
 // NewServer builds a Server. maxInflight<=0 defaults to 128. mx may be nil
-// (metrics off).
-func NewServer(table EndpointTable, maxInflight int, log *slog.Logger, mx Counter) *Server {
+// (metrics off). maxFrame is the node-policy max_worker_rpc_frame_bytes;
+// <=0 or above the absolute ceiling falls back to/clamps to defaultMaxFrame.
+func NewServer(table EndpointTable, maxInflight int, log *slog.Logger, mx Counter, maxFrame int) *Server {
 	if maxInflight <= 0 {
 		maxInflight = 128
 	}
 	if mx == nil {
 		mx = noopCounter{}
 	}
-	return &Server{table: table, maxInflight: maxInflight, log: log, mx: mx, inflight: map[uint64]context.CancelFunc{}}
+	return &Server{table: table, maxInflight: maxInflight, maxFrame: clampMaxFrame(maxFrame), log: log, mx: mx, inflight: map[uint64]context.CancelFunc{}}
 }
 
 // Serve runs the request loop on conn until it errors (worker socket
@@ -73,7 +75,7 @@ func (s *Server) Serve(ctx context.Context, conn io.ReadWriteCloser) error {
 	defer s.cancelAllInflight()
 
 	for {
-		m, err := readFrame(conn)
+		m, err := readFrame(conn, s.maxFrame)
 		if err != nil {
 			if sctx.Err() == nil {
 				s.mx.Inc(`mmds_worker_rpc_errors_total{reason="conn_error"}`)
@@ -166,7 +168,7 @@ func (s *Server) resolve(ctx context.Context, req *EndpointRequest) *EndpointRes
 func (s *Server) reply(conn io.ReadWriteCloser, id uint64, resp *EndpointResponse) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	if err := writeFrame(conn, &wireMsg{Type: typeResponse, RequestID: id, Response: resp}); err != nil && s.log != nil {
+	if err := writeFrame(conn, &wireMsg{Type: typeResponse, RequestID: id, Response: resp}, s.maxFrame); err != nil && s.log != nil {
 		s.log.Debug("mmdsrpc: write response", "request_id", id, "err", err)
 	}
 }

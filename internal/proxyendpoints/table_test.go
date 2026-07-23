@@ -8,14 +8,21 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kuasar-sandbox/orchestrator/internal/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/mmdsrelay"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 )
 
+// testRuntime builds a minimal MMDSRuntimeConfig for New(), carrying only
+// what these tests vary (value-wait timeout).
+func testRuntime(valueWaitTimeout time.Duration) config.MMDSRuntimeConfig {
+	return config.MMDSRuntimeConfig{ValueWaitTimeout: valueWaitTimeout.String()}
+}
+
 func TestLookupUnavailableBeforeFirstBookmark(t *testing.T) {
 	// A non-nil relay so ServeRelay's own relay==nil early-503 doesn't mask
 	// the availability check this test targets.
-	tb := New(&fakeRelayFetcher{}, 0, time.Second, nil)
+	tb := New(&fakeRelayFetcher{}, 0, testRuntime(time.Second), nil)
 	tb.BeginMmdsSync("gen-1")
 	tb.ApplyMmdsUpsert(routesync.MmdsEndpointEntry{SandboxID: "s1", Name: "a", Path: "/latest/a", BackendType: "store"})
 	// Before the first bookmark, the table is unavailable — this must
@@ -33,7 +40,7 @@ func TestLookupUnavailableBeforeFirstBookmark(t *testing.T) {
 }
 
 func TestBeginBookmarkStagesThenSwapsAtomically(t *testing.T) {
-	tb := New(nil, 0, time.Second, nil)
+	tb := New(nil, 0, testRuntime(time.Second), nil)
 	tb.BeginMmdsSync("gen-1")
 	tb.ApplyMmdsUpsert(routesync.MmdsEndpointEntry{SandboxID: "s1", Name: "a", Path: "/latest/a", BackendType: "store"})
 	tb.MmdsBookmark("gen-1")
@@ -45,7 +52,7 @@ func TestBeginBookmarkStagesThenSwapsAtomically(t *testing.T) {
 }
 
 func TestBookmarkWithMismatchedGenerationIsDropped(t *testing.T) {
-	tb := New(nil, 0, time.Second, nil)
+	tb := New(nil, 0, testRuntime(time.Second), nil)
 	tb.BeginMmdsSync("gen-1")
 	tb.ApplyMmdsUpsert(routesync.MmdsEndpointEntry{SandboxID: "s1", Name: "a", Path: "/latest/a", BackendType: "store"})
 	tb.MmdsBookmark("gen-stale") // does not match "gen-1"
@@ -56,7 +63,7 @@ func TestBookmarkWithMismatchedGenerationIsDropped(t *testing.T) {
 }
 
 func TestBookmarkSweepsEntriesNotSeenThisGeneration(t *testing.T) {
-	tb := New(nil, 0, time.Second, nil)
+	tb := New(nil, 0, testRuntime(time.Second), nil)
 	tb.BeginMmdsSync("gen-1")
 	tb.ApplyMmdsUpsert(routesync.MmdsEndpointEntry{SandboxID: "s1", Name: "old", Path: "/latest/old", BackendType: "store"})
 	tb.MmdsBookmark("gen-1")
@@ -76,7 +83,7 @@ func TestBookmarkSweepsEntriesNotSeenThisGeneration(t *testing.T) {
 }
 
 func TestEqualRevisionMismatchForcesResync(t *testing.T) {
-	tb := New(nil, 0, time.Second, nil)
+	tb := New(nil, 0, testRuntime(time.Second), nil)
 	tb.BeginMmdsSync("gen-1")
 	tb.ApplyMmdsUpsert(routesync.MmdsEndpointEntry{SandboxID: "s1", Name: "a", Path: "/latest/a", BackendType: "store", Revision: 1, ContentType: "text/plain"})
 	tb.MmdsBookmark("gen-1")
@@ -93,7 +100,7 @@ func TestEqualRevisionMismatchForcesResync(t *testing.T) {
 }
 
 func TestLowerRevisionIgnored(t *testing.T) {
-	tb := New(nil, 0, time.Second, nil)
+	tb := New(nil, 0, testRuntime(time.Second), nil)
 	tb.BeginMmdsSync("gen-1")
 	tb.ApplyMmdsUpsert(routesync.MmdsEndpointEntry{SandboxID: "s1", Name: "a", Path: "/latest/a", BackendType: "store", Revision: 5, ValuePresent: true, SecretPlaintext: "new"})
 	tb.MmdsBookmark("gen-1")
@@ -107,7 +114,7 @@ func TestLowerRevisionIgnored(t *testing.T) {
 }
 
 func TestApplyMmdsDeleteRemovesEntry(t *testing.T) {
-	tb := New(nil, 0, time.Second, nil)
+	tb := New(nil, 0, testRuntime(time.Second), nil)
 	tb.BeginMmdsSync("gen-1")
 	tb.ApplyMmdsUpsert(routesync.MmdsEndpointEntry{SandboxID: "s1", Name: "a", Path: "/latest/a", BackendType: "store"})
 	tb.MmdsBookmark("gen-1")
@@ -119,7 +126,7 @@ func TestApplyMmdsDeleteRemovesEntry(t *testing.T) {
 }
 
 func TestDisconnectedClearsLiveAndMarksUnavailable(t *testing.T) {
-	tb := New(nil, 0, time.Second, nil)
+	tb := New(nil, 0, testRuntime(time.Second), nil)
 	tb.BeginMmdsSync("gen-1")
 	tb.ApplyMmdsUpsert(routesync.MmdsEndpointEntry{SandboxID: "s1", Name: "a", Path: "/latest/a", BackendType: "store", Revision: 1, ValuePresent: true, SecretPlaintext: "hello"})
 	tb.MmdsBookmark("gen-1")
@@ -138,7 +145,7 @@ func TestDisconnectedClearsLiveAndMarksUnavailable(t *testing.T) {
 }
 
 func TestDisconnectedWakesParkedWaitEarly(t *testing.T) {
-	tb := New(nil, 0, 5*time.Second, nil) // long timeout: the test fails if it actually waits it out
+	tb := New(nil, 0, testRuntime(5*time.Second), nil) // long timeout: the test fails if it actually waits it out
 	tb.BeginMmdsSync("gen-1")
 	tb.ApplyMmdsUpsert(routesync.MmdsEndpointEntry{SandboxID: "s1", Name: "a", Path: "/latest/a", BackendType: "store"})
 	tb.MmdsBookmark("gen-1")
@@ -168,7 +175,7 @@ func TestDisconnectedWakesParkedWaitEarly(t *testing.T) {
 }
 
 func TestCapacityBoundRejectsOverLimit(t *testing.T) {
-	tb := New(nil, 2, time.Second, nil)
+	tb := New(nil, 2, testRuntime(time.Second), nil)
 	tb.BeginMmdsSync("gen-1")
 	tb.ApplyMmdsUpsert(routesync.MmdsEndpointEntry{SandboxID: "s1", Name: "a", Path: "/latest/a", BackendType: "store"})
 	tb.ApplyMmdsUpsert(routesync.MmdsEndpointEntry{SandboxID: "s1", Name: "b", Path: "/latest/b", BackendType: "store"})
@@ -187,7 +194,7 @@ func TestCapacityBoundRejectsOverLimit(t *testing.T) {
 }
 
 func TestServeStoreNeverConfiguredWaitsThenNotPresent(t *testing.T) {
-	tb := New(nil, 0, 50*time.Millisecond, nil)
+	tb := New(nil, 0, testRuntime(50*time.Millisecond), nil)
 	tb.BeginMmdsSync("gen-1")
 	tb.ApplyMmdsUpsert(routesync.MmdsEndpointEntry{SandboxID: "s1", Name: "a", Path: "/latest/a", BackendType: "store"})
 	tb.MmdsBookmark("gen-1")
@@ -203,7 +210,7 @@ func TestServeStoreNeverConfiguredWaitsThenNotPresent(t *testing.T) {
 }
 
 func TestServeStoreWakesOnLiveUpsert(t *testing.T) {
-	tb := New(nil, 0, 5*time.Second, nil)
+	tb := New(nil, 0, testRuntime(5*time.Second), nil)
 	tb.BeginMmdsSync("gen-1")
 	tb.ApplyMmdsUpsert(routesync.MmdsEndpointEntry{SandboxID: "s1", Name: "a", Path: "/latest/a", BackendType: "store"})
 	tb.MmdsBookmark("gen-1")
@@ -252,7 +259,7 @@ func (f *fakeRelayFetcher) Fetch(ctx context.Context, key, rawURL, headerName, h
 }
 
 func TestServeRelayNilClientReturns503(t *testing.T) {
-	tb := New(nil, 0, time.Second, nil)
+	tb := New(nil, 0, testRuntime(time.Second), nil)
 	tb.BeginMmdsSync("gen-1")
 	tb.ApplyMmdsUpsert(routesync.MmdsEndpointEntry{SandboxID: "s1", Name: "a", Path: "/latest/a", BackendType: "relay"})
 	tb.MmdsBookmark("gen-1")
@@ -265,7 +272,7 @@ func TestServeRelayNilClientReturns503(t *testing.T) {
 
 func TestServeRelayDispatchesConfiguredEndpoint(t *testing.T) {
 	fake := &fakeRelayFetcher{result: mmdsrelay.Result{Status: 200, ContentType: "application/json", Body: []byte(`{}`)}}
-	tb := New(fake, 0, time.Second, nil)
+	tb := New(fake, 0, testRuntime(time.Second), nil)
 	tb.BeginMmdsSync("gen-1")
 	tb.ApplyMmdsUpsert(routesync.MmdsEndpointEntry{
 		SandboxID: "s1", Name: "creds", Path: "/latest/creds", BackendType: "relay",
@@ -285,7 +292,7 @@ func TestServeRelayDispatchesConfiguredEndpoint(t *testing.T) {
 
 func TestServeRelayCancelsOnLiveUpsert(t *testing.T) {
 	fake := &fakeRelayFetcher{block: make(chan struct{})}
-	tb := New(fake, 0, 5*time.Second, nil)
+	tb := New(fake, 0, testRuntime(5*time.Second), nil)
 	tb.BeginMmdsSync("gen-1")
 	tb.ApplyMmdsUpsert(routesync.MmdsEndpointEntry{
 		SandboxID: "s1", Name: "creds", Path: "/latest/creds", BackendType: "relay",

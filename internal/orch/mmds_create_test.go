@@ -9,6 +9,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/api"
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/mmdscfg"
+	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
 	"github.com/kuasar-sandbox/orchestrator/internal/store"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
@@ -68,6 +69,54 @@ func TestCreateRejectsMalformedMMDSBeforeLaunch(t *testing.T) {
 // Create cannot run past validation into launch without panicking — the same
 // limitation documented on internal/orch/orch.go's launch/Create path (no
 // end-to-end harness exists here; see build_creds_test.go's testOrchCfg).
+
+// TestRangeMmdsIgnoresPersistedEndpointsWhenDisabled covers the case where
+// mmds.endpoints.enabled is toggled false after endpoints were already
+// persisted (created while it was true): RangeMmds/SubscribeMmds must not
+// expose those rows to an external proxy master's sync stream — a
+// subscriber's own local inference of "enabled" (e.g. a proxy master that
+// only checks whether mmds_listen is configured) must never be able to
+// reactivate historical ciphertext the conductor itself now considers off.
+func TestRangeMmdsIgnoresPersistedEndpointsWhenDisabled(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.MMDS.Endpoints.Enabled = true
+	o := testOrchCfg(t, cfg)
+	ctx := context.Background()
+	sb := &types.Sandbox{ID: "sb-gate", State: types.StateRunning, ManifestKey: strings.Repeat("7", 64), CreatedUnix: 1}
+	if err := o.st.PutWithMMDSEndpoints(ctx, sb, []store.MMDSEndpoint{
+		{Name: "creds", Path: "/latest/creds", BackendType: store.MMDSBackendStore},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Sanity: with the flag on, the row is visible.
+	var seen int
+	if err := o.RangeMmds(ctx, func(routesync.MmdsEndpointEntry) error { seen++; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if seen != 1 {
+		t.Fatalf("RangeMmds with endpoints enabled saw %d entries, want 1", seen)
+	}
+
+	// Flip the flag off (as if the operator disabled it after Create) — the
+	// row is still in the DB, but RangeMmds must now see nothing.
+	o.cfg.MMDS.Endpoints.Enabled = false
+	seen = 0
+	if err := o.RangeMmds(ctx, func(routesync.MmdsEndpointEntry) error { seen++; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if seen != 0 {
+		t.Fatalf("RangeMmds with endpoints disabled saw %d entries, want 0 (must not reactivate historical ciphertext)", seen)
+	}
+
+	ch, cancel := o.SubscribeMmds()
+	defer cancel()
+	select {
+	case ev := <-ch:
+		t.Fatalf("SubscribeMmds with endpoints disabled delivered an event: %+v", ev)
+	default:
+	}
+}
 
 func TestCurrentRunIDReflectsCachedRunID(t *testing.T) {
 	o := testOrch(t)

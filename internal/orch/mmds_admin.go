@@ -22,44 +22,48 @@ import (
 // is parked must wake it immediately, not just on timeout.
 func (o *Orchestrator) MMDSAuthority() *mmdsauth.Authority { return o.mmdsAuth }
 
-func (o *Orchestrator) SetMMDSStoreValue(ctx context.Context, sid, name string, value []byte, contentType string, expiresUnix int64) error {
-	err := mapMMDSAdminErr(o.st.SetMMDSStoreValue(ctx, sid, name, value, contentType, expiresUnix))
+func (o *Orchestrator) SetMMDSStoreValue(ctx context.Context, sid, name string, value []byte, contentType string, expiresUnix int64) (int64, error) {
+	revision, err := o.st.SetMMDSStoreValue(ctx, sid, name, value, contentType, expiresUnix)
+	err = mapMMDSAdminErr(err)
 	o.mmdsAdminMetric("store", "put", err)
 	if err == nil {
 		o.mmdsAuth.Notify(sid, name)
 		o.publishMmdsEntry(ctx, sid, name)
 	}
-	return err
+	return revision, err
 }
 
-func (o *Orchestrator) ClearMMDSStoreValue(ctx context.Context, sid, name string) error {
-	err := mapMMDSAdminErr(o.st.ClearMMDSStoreValue(ctx, sid, name))
+func (o *Orchestrator) ClearMMDSStoreValue(ctx context.Context, sid, name string) (int64, error) {
+	revision, err := o.st.ClearMMDSStoreValue(ctx, sid, name)
+	err = mapMMDSAdminErr(err)
 	o.mmdsAdminMetric("store", "delete", err)
 	if err == nil {
 		o.mmdsAuth.Notify(sid, name)
 		o.publishMmdsEntry(ctx, sid, name)
 	}
-	return err
+	return revision, err
 }
 
-func (o *Orchestrator) SetMMDSRelayAuth(ctx context.Context, sid, name string, value []byte) error {
-	err := mapMMDSAdminErr(o.st.SetMMDSRelayAuth(ctx, sid, name, value))
+func (o *Orchestrator) SetMMDSRelayAuth(ctx context.Context, sid, name string, value []byte) (int64, error) {
+	revision, err := o.st.SetMMDSRelayAuth(ctx, sid, name, value)
+	err = mapMMDSAdminErr(err)
 	o.mmdsAdminMetric("relay", "put", err)
 	if err == nil {
 		o.mmdsAuth.Notify(sid, name)
 		o.publishMmdsEntry(ctx, sid, name)
 	}
-	return err
+	return revision, err
 }
 
-func (o *Orchestrator) ClearMMDSRelayAuth(ctx context.Context, sid, name string) error {
-	err := mapMMDSAdminErr(o.st.ClearMMDSRelayAuth(ctx, sid, name))
+func (o *Orchestrator) ClearMMDSRelayAuth(ctx context.Context, sid, name string) (int64, error) {
+	revision, err := o.st.ClearMMDSRelayAuth(ctx, sid, name)
+	err = mapMMDSAdminErr(err)
 	o.mmdsAdminMetric("relay", "delete", err)
 	if err == nil {
 		o.mmdsAuth.Notify(sid, name)
 		o.publishMmdsEntry(ctx, sid, name)
 	}
-	return err
+	return revision, err
 }
 
 // mmdsAdminMetric records one mmds_admin_mutations_total{backend_type,op,result}

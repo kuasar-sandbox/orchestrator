@@ -326,6 +326,62 @@ func TestLoadProxyAcceptsProxyNetNS(t *testing.T) {
 	}
 }
 
+func TestLoadProxyMMDSEndpointsDefaults(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "proxy.yaml")
+	if err := os.WriteFile(path, []byte("mmds:\n  enabled: true\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := LoadProxy(path)
+	if err != nil {
+		t.Fatalf("LoadProxy failed: %v", err)
+	}
+	if got := cfg.MMDS.Listen; got != "127.0.0.1:19254" {
+		t.Fatalf("mmds.listen default = %q, want 127.0.0.1:19254", got)
+	}
+	e := cfg.MMDS.Endpoints
+	if e.Enabled {
+		t.Fatalf("mmds.endpoints.enabled default = true, want false")
+	}
+	if e.MaxWorkerInflight != 128 {
+		t.Fatalf("max_worker_inflight default = %d, want 128", e.MaxWorkerInflight)
+	}
+	if e.MaxWorkerRPCFrameBytes != 524288 {
+		t.Fatalf("max_worker_rpc_frame_bytes default = %d, want 524288", e.MaxWorkerRPCFrameBytes)
+	}
+	if got := e.ValueWaitTimeoutDur(); got != 3*time.Second {
+		t.Fatalf("value_wait_timeout default = %v, want 3s", got)
+	}
+}
+
+func TestLoadProxyRejectsEndpointsEnabledWithoutMMDSEnabled(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "proxy.yaml")
+	if err := os.WriteFile(path, []byte("mmds:\n  endpoints:\n    enabled: true\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := LoadProxy(path)
+	if err == nil || !strings.Contains(err.Error(), "mmds.endpoints.enabled=true requires mmds.enabled=true") {
+		t.Fatalf("LoadProxy error = %v, want an mmds.endpoints.enabled-without-mmds.enabled rejection", err)
+	}
+}
+
+// TestLoadProxyRejectsEndpointsValueWaitTimeoutOutOfRange proves
+// ProxyMMDSEndpointsConfig and config.Config's MMDSEndpointsConfig share the
+// same embedded MMDSRuntimeConfig — the two config surfaces can never
+// silently drift apart on what counts as a valid runtime value.
+func TestLoadProxyRejectsEndpointsValueWaitTimeoutOutOfRange(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "proxy.yaml")
+	if err := os.WriteFile(path, []byte("mmds:\n  enabled: true\n  endpoints:\n    value_wait_timeout: 1s\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := LoadProxy(path)
+	if err == nil || !strings.Contains(err.Error(), "mmds.endpoints.value_wait_timeout") {
+		t.Fatalf("LoadProxy error = %v, want an mmds.endpoints.value_wait_timeout range rejection", err)
+	}
+}
+
 func TestLoadMMDSEndpointsDefaults(t *testing.T) {
 	t.Setenv("NODE_CONFIG_ENCRYPTION_KEY", "")
 	path := writeConfig(t, `
@@ -348,12 +404,6 @@ sandbox:
 	}
 	if e.MaxEndpointsPerSandbox != 16 {
 		t.Fatalf("max_endpoints_per_sandbox default = %d, want 16", e.MaxEndpointsPerSandbox)
-	}
-	if e.MaxTotalEndpoints != 65536 {
-		t.Fatalf("max_total_endpoints default = %d, want 65536", e.MaxTotalEndpoints)
-	}
-	if e.MaxWorkerRPCFrameBytes != 524288 {
-		t.Fatalf("max_worker_rpc_frame_bytes default = %d, want 524288", e.MaxWorkerRPCFrameBytes)
 	}
 	wantPrefixes := []string{"/latest/api/", "/internal/"}
 	if len(e.ReservedPathPrefixes) != len(wantPrefixes) || e.ReservedPathPrefixes[0] != wantPrefixes[0] || e.ReservedPathPrefixes[1] != wantPrefixes[1] {

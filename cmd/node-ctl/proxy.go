@@ -34,14 +34,15 @@ import (
 const (
 	proxyPluginID = "proxy"
 
-	envProxyDataFD    = "KUASAR_PROXY_DATA_FD"
-	envProxyForwardFD = "KUASAR_PROXY_FORWARD_FD"
-	envProxyMMDSFD    = "KUASAR_PROXY_MMDS_FD"
-	envProxyWakeFD    = "KUASAR_PROXY_WAKE_FD"
-	envProxyNotifyFD  = "KUASAR_PROXY_NOTIFY_FD"
-	envProxyMetricsFD = "KUASAR_PROXY_METRICS_FD"
-	envProxyMmdsRpcFD = "KUASAR_PROXY_MMDS_RPC_FD" // worker<->master MMDS endpoint RPC
-	envProxyWorkerID  = "KUASAR_PROXY_WORKER_ID"
+	envProxyDataFD       = "KUASAR_PROXY_DATA_FD"
+	envProxyForwardFD    = "KUASAR_PROXY_FORWARD_FD"
+	envProxyMMDSFD       = "KUASAR_PROXY_MMDS_FD"
+	envProxyWakeFD       = "KUASAR_PROXY_WAKE_FD"
+	envProxyNotifyFD     = "KUASAR_PROXY_NOTIFY_FD"
+	envProxyMetricsFD    = "KUASAR_PROXY_METRICS_FD"
+	envProxyMmdsRpcFD    = "KUASAR_PROXY_MMDS_RPC_FD" // worker<->master MMDS endpoint RPC
+	envProxyMmdsMaxFrame = "KUASAR_PROXY_MMDS_MAX_FRAME_BYTES"
+	envProxyWorkerID     = "KUASAR_PROXY_WORKER_ID"
 )
 
 // runProxy is the external data-plane proxy master. It is the only process that
@@ -102,10 +103,10 @@ func runProxyMaster(ctx context.Context, cfgPath string, cfg *config.ProxyFileCo
 	}
 
 	var mmdsLn net.Listener
-	if cfg.MMDSListen != "" {
-		mmdsLn, err = listenTCPInNetNS(proxyNS, cfg.MMDSListen)
+	if cfg.MMDS.Enabled {
+		mmdsLn, err = listenTCPInNetNS(proxyNS, cfg.MMDS.Listen)
 		if err != nil {
-			return fmt.Errorf("proxy: listen mmds_listen %s: %w", cfg.MMDSListen, err)
+			return fmt.Errorf("proxy: listen mmds.listen %s: %w", cfg.MMDS.Listen, err)
 		}
 		defer mmdsLn.Close()
 	}
@@ -117,18 +118,21 @@ func runProxyMaster(ctx context.Context, cfgPath string, cfg *config.ProxyFileCo
 
 	// MMDS endpoint table: bounded process memory,
 	// staged-then-atomically-swapped per full-sync generation, shared by
-	// every worker over its own per-worker RPC socketpair.
-	// Endpoint policy (relay timeouts/size bounds/rate limits) is not yet
-	// pushed centrally over the sync connection the way auth_mode/
-	// park_timeout are — this uses the same defaults internal mode falls
-	// back to (config.MMDSEndpointsConfig.ApplyDefaults()) rather than
-	// duplicating a second static config surface in proxy.yaml; a future
-	// phase can wire dynamic policy push the same way SetPolicy already
-	// works for the route family, if tighter operator control over these
-	// external-mode defaults turns out to matter in practice.
-	var epLimits config.MMDSEndpointsConfig
-	epLimits.ApplyDefaults()
-	mmdsEndpointsEnabled := cfg.MMDSListen != ""
+	// every worker over its own per-worker RPC socketpair. Endpoint policy
+	// (relay timeouts/size bounds/rate limits) comes from this file's own
+	// mmds.endpoints block — a bootstrap-fallback local value, the same
+	// kind Auth/ParkTimeout above are, just without their push-and-override
+	// wiring yet. Unlike the conductor's mmds.endpoints, this block owns no
+	// declaration/persistence policy at all (name/path rules, endpoint
+	// counts, size caps) — this process trusts and mirrors whatever the
+	// conductor already validated and decided to sync; see
+	// config.ProxyMMDSEndpointsConfig's doc comment. Both
+	// cfg.MMDS.Endpoints.Enabled AND cfg.MMDS.Enabled must be set for
+	// endpoints to activate — mmds.enabled alone is the base MMDS (envd
+	// token/metadata) listener and must not be read as implying the
+	// endpoints feature too.
+	epLimits := cfg.MMDS.Endpoints
+	mmdsEndpointsEnabled := cfg.MMDS.Enabled && cfg.MMDS.Endpoints.Enabled
 	var endpoints *proxyendpoints.Table
 	if mmdsEndpointsEnabled {
 		relayClient := mmdsrelay.New(mmdsrelay.Config{
@@ -139,11 +143,11 @@ func runProxyMaster(ctx context.Context, cfgPath string, cfg *config.ProxyFileCo
 			MaxInflightPerKey:    epLimits.MaxRelayInflightPerSandbox,
 			MaxRequestsPerSecond: float64(epLimits.MaxRelayRequestsPerSecond),
 		}, mx)
-		endpoints = proxyendpoints.New(relayClient, epLimits.MaxTotalEndpoints, epLimits.ValueWaitTimeoutDur(), mx)
+		endpoints = proxyendpoints.New(relayClient, 0, epLimits.MMDSRuntimeConfig, mx)
 	}
 
 	for i := 0; i < cfg.Workers; i++ {
-		go superviseProxyWorker(ctx, i, cfgPath, cfg, proxyNS, dataLn, forwardLn, mmdsLn, view, endpoints, epLimits.MaxWorkerInflight, mx, log)
+		go superviseProxyWorker(ctx, i, cfgPath, cfg, proxyNS, dataLn, forwardLn, mmdsLn, view, endpoints, epLimits.MaxWorkerInflight, epLimits.MaxWorkerRPCFrameBytes, mx, log)
 	}
 
 	reg := routesync.Register{
@@ -165,7 +169,7 @@ func runProxyMaster(ctx context.Context, cfgPath string, cfg *config.ProxyFileCo
 		"workers", cfg.Workers,
 		"data_listen", cfg.DataListen,
 		"proxy_socket", cfg.ProxySocket,
-		"mmds_listen", cfg.MMDSListen,
+		"mmds_listen", cfg.MMDS.Listen,
 		"proxy_netns", cfg.ProxyNetNS,
 		"config_socket", cfg.ConfigSocket,
 		"shm_path", cfg.ShmPath,
@@ -180,6 +184,7 @@ func runProxyWorker(ctx context.Context, cfg *config.ProxyFileConfig, log *slog.
 	if workerID == "" {
 		workerID = "worker"
 	}
+	maxRPCFrameBytes, _ := strconv.Atoi(os.Getenv(envProxyMmdsMaxFrame)) // "" / malformed -> 0 -> mmdsrpc default
 	table, err := proxyshm.Open(cfg.ShmPath)
 	if err != nil {
 		return fmt.Errorf("proxy worker: open shared route table: %w", err)
@@ -237,7 +242,7 @@ func runProxyWorker(ctx context.Context, cfg *config.ProxyFileConfig, log *slog.
 			if cerr != nil {
 				return fmt.Errorf("proxy worker: mmds rpc conn: %w", cerr)
 			}
-			mmdsAuth = mmdsrpc.NewClient(rpcConn)
+			mmdsAuth = mmdsrpc.NewClient(rpcConn, maxRPCFrameBytes)
 		}
 		go func() { errCh <- mmds.New(view, mmdsAuth, cfg.ParkTimeoutDur(), log, mx).Serve(ctx, mmdsLn) }()
 	}
@@ -254,10 +259,10 @@ func runProxyWorker(ctx context.Context, cfg *config.ProxyFileConfig, log *slog.
 	}
 }
 
-func superviseProxyWorker(ctx context.Context, idx int, cfgPath string, cfg *config.ProxyFileConfig, proxyNS *netns.NetNS, dataLn, forwardLn, mmdsLn net.Listener, view *proxyshm.MasterView, endpoints *proxyendpoints.Table, maxWorkerInflight int, mx *metrics.M, log *slog.Logger) {
+func superviseProxyWorker(ctx context.Context, idx int, cfgPath string, cfg *config.ProxyFileConfig, proxyNS *netns.NetNS, dataLn, forwardLn, mmdsLn net.Listener, view *proxyshm.MasterView, endpoints *proxyendpoints.Table, maxWorkerInflight, maxRPCFrameBytes int, mx *metrics.M, log *slog.Logger) {
 	workerID := fmt.Sprintf("proxy-%d", idx)
 	for ctx.Err() == nil {
-		err := runProxyWorkerProcess(ctx, workerID, cfgPath, proxyNS, dataLn, forwardLn, mmdsLn, view, endpoints, maxWorkerInflight, mx, log)
+		err := runProxyWorkerProcess(ctx, workerID, cfgPath, proxyNS, dataLn, forwardLn, mmdsLn, view, endpoints, maxWorkerInflight, maxRPCFrameBytes, mx, log)
 		if ctx.Err() != nil {
 			return
 		}
@@ -270,7 +275,7 @@ func superviseProxyWorker(ctx context.Context, idx int, cfgPath string, cfg *con
 	}
 }
 
-func runProxyWorkerProcess(ctx context.Context, workerID, cfgPath string, proxyNS *netns.NetNS, dataLn, forwardLn, mmdsLn net.Listener, view *proxyshm.MasterView, endpoints *proxyendpoints.Table, maxWorkerInflight int, mx *metrics.M, log *slog.Logger) error {
+func runProxyWorkerProcess(ctx context.Context, workerID, cfgPath string, proxyNS *netns.NetNS, dataLn, forwardLn, mmdsLn net.Listener, view *proxyshm.MasterView, endpoints *proxyendpoints.Table, maxWorkerInflight, maxRPCFrameBytes int, mx *metrics.M, log *slog.Logger) error {
 	exe, err := os.Executable()
 	if err != nil {
 		return err
@@ -350,7 +355,7 @@ func runProxyWorkerProcess(ctx context.Context, workerID, cfgPath string, proxyN
 			return cerr
 		}
 		go func() {
-			if err := mmdsrpc.NewServer(endpoints, maxWorkerInflight, log.With("proxy_worker", workerID), mx).Serve(ctx, rpcConn); err != nil && ctx.Err() == nil {
+			if err := mmdsrpc.NewServer(endpoints, maxWorkerInflight, log.With("proxy_worker", workerID), mx, maxRPCFrameBytes).Serve(ctx, rpcConn); err != nil && ctx.Err() == nil {
 				log.Debug("mmdsrpc: worker connection ended", "worker", workerID, "err", err)
 			}
 		}()
@@ -364,6 +369,13 @@ func runProxyWorkerProcess(ctx context.Context, workerID, cfgPath string, proxyN
 	addFile(envProxyMetricsFD, metricsW)
 	addFile(envProxyMmdsRpcFD, rpcWorkerFile)
 	env = append(env, envProxyWorkerID+"="+workerID)
+	// The worker subprocess has no access to the master's in-memory
+	// epLimits (it only re-reads ProxyFileConfig, which carries no MMDS
+	// endpoint policy fields today) — passed as a plain env var, the same
+	// mechanism already used for envProxyWorkerID, so mmdsrpc.NewClient's
+	// maxFrame actually reflects the node policy instead of silently using
+	// a fixed default independent of what the master enforces.
+	env = append(env, envProxyMmdsMaxFrame+"="+strconv.Itoa(maxRPCFrameBytes))
 
 	cmd := exec.CommandContext(ctx, exe, "proxy", "serve", "--config", cfgPath, "--worker")
 	cmd.Env = env

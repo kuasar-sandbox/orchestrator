@@ -80,17 +80,28 @@ type rawEndpoint struct {
 }
 
 // Extract removes the mmds namespace from meta and decodes+validates it into
-// EndpointSpecs, bounded by limits. An absent/empty namespace returns meta
-// unchanged and a nil endpoint slice — not an error. A present namespace when
-// limits.Enabled is false is always an error — the configuration is never
-// silently ignored — independent of whether it would otherwise validate.
+// EndpointSpecs, bounded by limits. A namespace key absent from meta
+// entirely returns meta unchanged and a nil endpoint slice — not an error.
+// A namespace key that is *present* — even if blank/whitespace-only — is a
+// declaration attempt: when limits.Enabled is false it is always an error
+// (the configuration is never silently ignored, independent of whether it
+// would otherwise validate), and either way the key is always stripped from
+// the returned map so a blank value can never leak into guest-visible
+// metadata the way returning the original, unstripped meta would.
 func Extract(meta map[string]string, limits config.MMDSEndpointsConfig) (map[string]string, []EndpointSpec, error) {
-	raw := strings.TrimSpace(meta[Ns])
-	if raw == "" {
+	rawVal, present := meta[Ns]
+	if !present {
 		return meta, nil, nil
 	}
 	if !limits.Enabled {
 		return nil, nil, fmt.Errorf("mmdscfg: metadata[%q] present but mmds.endpoints.enabled=false", Ns)
+	}
+	raw := strings.TrimSpace(rawVal)
+	if raw == "" {
+		// Blank is not a validation error (mirrors an absent namespace's
+		// "no endpoints declared" outcome) but the key must still never
+		// survive into the returned map.
+		return stripNamespace(meta), nil, nil
 	}
 	if limits.MaxMetadataBytes > 0 && len(raw) > limits.MaxMetadataBytes {
 		return nil, nil, fmt.Errorf("mmdscfg: metadata[%q] is %d bytes, exceeds max_metadata_bytes %d", Ns, len(raw), limits.MaxMetadataBytes)
@@ -131,13 +142,19 @@ func Extract(meta map[string]string, limits config.MMDSEndpointsConfig) (map[str
 		out = append(out, ep)
 	}
 
+	return stripNamespace(meta), out, nil
+}
+
+// stripNamespace returns a copy of meta with the mmds namespace key removed
+// — the guest must never see it, blank or not.
+func stripNamespace(meta map[string]string) map[string]string {
 	clean := make(map[string]string, len(meta))
 	for k, v := range meta {
 		if k != Ns {
 			clean[k] = v
 		}
 	}
-	return clean, out, nil
+	return clean
 }
 
 func parseEndpoint(re rawEndpoint, limits config.MMDSEndpointsConfig) (EndpointSpec, error) {
@@ -153,6 +170,22 @@ func parseEndpoint(re rawEndpoint, limits config.MMDSEndpointsConfig) (EndpointS
 		return EndpointSpec{}, err
 	}
 	return EndpointSpec{Name: re.Name, Path: path, Backend: backend}, nil
+}
+
+// ValidateNameAndPath re-checks an already-persisted endpoint's name and
+// path against limits — the same rules Extract applies to a fresh Create
+// declaration, exported for callers revalidating existing declarations
+// against node policy that may have changed since they were created (at
+// startup, enabled mode validates every persisted definition against
+// current limits and reserved prefixes). Does not touch backend fields —
+// those never change after insert and are not derived from anything an
+// operator's config edit could invalidate.
+func ValidateNameAndPath(name, path string, limits config.MMDSEndpointsConfig) error {
+	if !nameRE.MatchString(name) {
+		return fmt.Errorf("name %q invalid (want %s)", name, nameRE.String())
+	}
+	_, err := validatePath(path, limits)
+	return err
 }
 
 // validatePath enforces the path rules: absolute, bounded lowercase-ASCII

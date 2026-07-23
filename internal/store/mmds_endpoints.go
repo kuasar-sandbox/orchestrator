@@ -164,19 +164,21 @@ func (s *Store) getMMDSEndpointRevision(ctx context.Context, sid, name string) (
 // matches what actually lands in the row — a plain read-then-write could
 // otherwise race a concurrent mutation and persist a ciphertext whose AAD
 // revision doesn't match the row's real revision. plaintext==nil clears the
-// value (DELETE); non-nil (including empty) sets it (PUT).
-func (s *Store) mutateMMDSSecret(ctx context.Context, sid, name, wantBackend, recordType string, plaintext []byte, contentType string, expiresUnix int64) error {
+// value (DELETE); non-nil (including empty) sets it (PUT). Returns the new
+// revision on success, surfaced up through orch to configsock's admin audit
+// log (operation, revision, and result).
+func (s *Store) mutateMMDSSecret(ctx context.Context, sid, name, wantBackend, recordType string, plaintext []byte, contentType string, expiresUnix int64) (int64, error) {
 	const maxAttempts = 8
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		backendType, revision, found, err := s.getMMDSEndpointRevision(ctx, sid, name)
 		if err != nil {
-			return fmt.Errorf("store: mutate mmds %s for %s/%s: %w", recordType, sid, name, err)
+			return 0, fmt.Errorf("store: mutate mmds %s for %s/%s: %w", recordType, sid, name, err)
 		}
 		if !found {
-			return ErrMMDSEndpointNotFound
+			return 0, ErrMMDSEndpointNotFound
 		}
 		if backendType != wantBackend {
-			return ErrMMDSEndpointWrongBackend
+			return 0, ErrMMDSEndpointWrongBackend
 		}
 
 		newRevision := revision + 1
@@ -184,7 +186,7 @@ func (s *Store) mutateMMDSSecret(ctx context.Context, sid, name, wantBackend, re
 		valuePresent := 0
 		if plaintext != nil {
 			if ciphertext, err = s.box.EncryptAAD(plaintext, mmdsAAD(recordType, sid, name, backendType, newRevision)); err != nil {
-				return fmt.Errorf("store: encrypt mmds %s for %s/%s: %w", recordType, sid, name, err)
+				return 0, fmt.Errorf("store: encrypt mmds %s for %s/%s: %w", recordType, sid, name, err)
 			}
 			valuePresent = 1
 		}
@@ -196,19 +198,19 @@ WHERE sandbox_id=? AND name=? AND revision=?`,
 			ciphertext, contentType, expiresUnix, newRevision, valuePresent, time.Now().Unix(),
 			sid, name, revision)
 		if err != nil {
-			return fmt.Errorf("store: update mmds %s for %s/%s: %w", recordType, sid, name, err)
+			return 0, fmt.Errorf("store: update mmds %s for %s/%s: %w", recordType, sid, name, err)
 		}
 		if n, _ := res.RowsAffected(); n == 1 {
-			return nil
+			return newRevision, nil
 		}
 		// Lost the CAS race to a concurrent mutation on the same endpoint; retry.
 	}
-	return fmt.Errorf("store: update mmds %s for %s/%s: too much contention after %d attempts", recordType, sid, name, maxAttempts)
+	return 0, fmt.Errorf("store: update mmds %s for %s/%s: too much contention after %d attempts", recordType, sid, name, maxAttempts)
 }
 
 // SetMMDSStoreValue replaces the complete value for a store-backend endpoint.
 // An omitted contentType resets to application/octet-stream.
-func (s *Store) SetMMDSStoreValue(ctx context.Context, sid, name string, value []byte, contentType string, expiresUnix int64) error {
+func (s *Store) SetMMDSStoreValue(ctx context.Context, sid, name string, value []byte, contentType string, expiresUnix int64) (int64, error) {
 	if value == nil {
 		value = []byte{}
 	}
@@ -220,13 +222,13 @@ func (s *Store) SetMMDSStoreValue(ctx context.Context, sid, name string, value [
 
 // ClearMMDSStoreValue clears the value, Content-Type, and expiration for a
 // store-backend endpoint and increments its revision.
-func (s *Store) ClearMMDSStoreValue(ctx context.Context, sid, name string) error {
+func (s *Store) ClearMMDSStoreValue(ctx context.Context, sid, name string) (int64, error) {
 	return s.mutateMMDSSecret(ctx, sid, name, MMDSBackendStore, mmdsRecordStore, nil, "", 0)
 }
 
 // SetMMDSRelayAuth replaces the complete auth value for a relay-backend
 // endpoint.
-func (s *Store) SetMMDSRelayAuth(ctx context.Context, sid, name string, value []byte) error {
+func (s *Store) SetMMDSRelayAuth(ctx context.Context, sid, name string, value []byte) (int64, error) {
 	if value == nil {
 		value = []byte{}
 	}
@@ -235,7 +237,7 @@ func (s *Store) SetMMDSRelayAuth(ctx context.Context, sid, name string, value []
 
 // ClearMMDSRelayAuth clears the auth value for a relay-backend endpoint and
 // increments its revision.
-func (s *Store) ClearMMDSRelayAuth(ctx context.Context, sid, name string) error {
+func (s *Store) ClearMMDSRelayAuth(ctx context.Context, sid, name string) (int64, error) {
 	return s.mutateMMDSSecret(ctx, sid, name, MMDSBackendRelay, mmdsRecordRelayAuth, nil, "", 0)
 }
 

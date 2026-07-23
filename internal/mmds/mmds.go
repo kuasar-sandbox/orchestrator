@@ -34,6 +34,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"path"
 	"strconv"
 	"strings"
 	"time"
@@ -149,7 +150,74 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("PUT /latest/api/token", s.putToken)
 	mux.HandleFunc("GET /", s.getMeta)
-	return mux
+	return guardRawRequest(mux)
+}
+
+// guardRawRequest rejects a malformed or non-canonical request before it
+// ever reaches ServeMux: an outer raw-path guard rejects malformed/encoded
+// paths before ServeMux canonicalization, and guest access is exact GET
+// only — no body, query, method list, or automatic redirect. net/http's
+// ServeMux, left to see these requests itself, would
+// 301-redirect a non-canonical path (dot segments, doubled slashes, a
+// trailing slash) to its cleaned form instead of rejecting it — that
+// redirect is itself the "automatic redirect" the doc rules out, so it must
+// never happen; rejecting here, on the raw wire-form request target, before
+// routing, is what prevents it.
+func guardRawRequest(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		target := requestTargetPathAndQuery(r.RequestURI)
+		rawPath := target
+		if i := strings.IndexAny(target, "?#"); i >= 0 {
+			rawPath = target[:i]
+		}
+		if rawPath != target || strings.Contains(rawPath, "%") || path.Clean(rawPath) != rawPath {
+			http.Error(w, "", http.StatusBadRequest)
+			return
+		}
+		if requestHasBody(r) {
+			http.Error(w, "", http.StatusBadRequest)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// requestTargetPathAndQuery returns the path[?query] portion of a raw
+// request-target. Origin-form (the only form a direct-connecting guest ever
+// sends: "/latest/api/token?...") passes through unchanged. Absolute-form
+// ("http://host/latest/...", valid per RFC 7230 3.1.1 and what
+// httptest.NewRequest's convenience API produces) has its scheme+authority
+// stripped first so the guard validates the same path/query bytes either
+// way, rather than tripping over the "//" in "http://".
+func requestTargetPathAndQuery(target string) string {
+	if strings.HasPrefix(target, "/") {
+		return target
+	}
+	if i := strings.Index(target, "://"); i >= 0 {
+		rest := target[i+len("://"):]
+		if j := strings.IndexByte(rest, '/'); j >= 0 {
+			return rest[j:]
+		}
+		return "/"
+	}
+	return target
+}
+
+// requestHasBody reports whether r carries any request body — a
+// Content-Length-declared body is checked directly; a chunked/unknown-length
+// body is checked by attempting to read one byte (non-blocking: the server
+// has already fully read the request off the wire before invoking the
+// handler chain, so this never waits on the network).
+func requestHasBody(r *http.Request) bool {
+	if r.ContentLength > 0 {
+		return true
+	}
+	if r.Body == nil {
+		return false
+	}
+	var buf [1]byte
+	n, _ := r.Body.Read(buf[:])
+	return n > 0
 }
 
 // Serve runs the MMDS HTTP/1.1 server on ln until ctx is cancelled.

@@ -281,61 +281,30 @@ type MMDSConfig struct {
 	Endpoints MMDSEndpointsConfig `yaml:"endpoints"`
 }
 
-// MMDSEndpointsConfig is node policy for MMDS endpoints. Enabled=false
-// (default) keeps sandbox Create rejecting the kuasar-sandbox.mmds metadata
-// namespace with 400 and leaves the admin mutation routes unregistered —
-// the feature is never silently ignored when present-but-disabled. Sizes
-// are integer bytes; Create input can never raise these limits.
-type MMDSEndpointsConfig struct {
-	Enabled                    bool     `yaml:"enabled"`
-	MaxEndpointsPerSandbox     int      `yaml:"max_endpoints_per_sandbox"`      // default 16
-	MaxTotalEndpoints          int      `yaml:"max_total_endpoints"`            // default 65536
-	MaxMetadataBytes           int      `yaml:"max_metadata_bytes"`             // default 65536
-	MaxPathBytes               int      `yaml:"max_path_bytes"`                 // default 512
-	ReservedPathPrefixes       []string `yaml:"reserved_path_prefixes"`         // default [/latest/api/, /internal/]
-	ValueWaitTimeout           string   `yaml:"value_wait_timeout"`             // default 3s; hard range 2s..5s
-	MaxStoreValueBytes         int      `yaml:"max_store_value_bytes"`          // default 16384
-	MaxRelayURLBytes           int      `yaml:"max_relay_url_bytes"`            // default 2048
-	MaxRelayAuthBytes          int      `yaml:"max_relay_auth_bytes"`           // default 16384
-	RelayRequestTimeout        string   `yaml:"relay_request_timeout"`          // default 2s; total deadline for a relay fetch
-	MaxRelayResponseBytes      int      `yaml:"max_relay_response_bytes"`       // default 65536
-	MaxRelayDecompressedBytes  int      `yaml:"max_relay_decompressed_bytes"`   // default 262144
-	MaxRelayInflightPerSandbox int      `yaml:"max_relay_inflight_per_sandbox"` // default 4
-	MaxRelayRequestsPerSecond  int      `yaml:"max_relay_requests_per_second"`  // default 2
-	MaxRelayDNSAnswers         int      `yaml:"max_relay_dns_answers"`          // default 16
-	MaxWorkerInflight          int      `yaml:"max_worker_inflight"`            // default 128 (external mode worker RPC)
-	MaxWorkerRPCFrameBytes     int      `yaml:"max_worker_rpc_frame_bytes"`     // default 524288 (external mode worker RPC)
+// MMDSRuntimeConfig is the relay-serving runtime policy both deployment
+// modes' MMDS endpoint dispatch path need — conductor's own
+// MMDSEndpointsConfig (internal mode) and the external proxy master's
+// ProxyMMDSEndpointsConfig each embed this one definition, so the fields
+// the two config surfaces genuinely share (everything about how a relay
+// fetch behaves, and how long a never-configured value is worth waiting
+// for) can never be defaulted or validated differently between them.
+// Declaration/persistence policy (name/path rules, per-sandbox/node
+// endpoint counts, store/relay-url/auth size caps) is NOT here — that is
+// conductor-only, since the conductor is the sole source of truth for what
+// was ever declared; see MMDSEndpointsConfig's own fields for those.
+type MMDSRuntimeConfig struct {
+	ValueWaitTimeout           string `yaml:"value_wait_timeout"`             // default 3s; hard range 2s..5s
+	RelayRequestTimeout        string `yaml:"relay_request_timeout"`          // default 2s; total deadline for a relay fetch
+	MaxRelayResponseBytes      int    `yaml:"max_relay_response_bytes"`       // default 65536
+	MaxRelayDecompressedBytes  int    `yaml:"max_relay_decompressed_bytes"`   // default 262144
+	MaxRelayInflightPerSandbox int    `yaml:"max_relay_inflight_per_sandbox"` // default 4
+	MaxRelayRequestsPerSecond  int    `yaml:"max_relay_requests_per_second"`  // default 2
+	MaxRelayDNSAnswers         int    `yaml:"max_relay_dns_answers"`          // default 16
 }
 
-// ApplyDefaults fills the MMDS endpoints policy defaults. Exported so callers building
-// a config block outside config.Load (e.g. tests) can default it directly.
-func (m *MMDSEndpointsConfig) ApplyDefaults() {
-	if m.MaxEndpointsPerSandbox == 0 {
-		m.MaxEndpointsPerSandbox = 16
-	}
-	if m.MaxTotalEndpoints == 0 {
-		m.MaxTotalEndpoints = 65536
-	}
-	if m.MaxMetadataBytes == 0 {
-		m.MaxMetadataBytes = 65536
-	}
-	if m.MaxPathBytes == 0 {
-		m.MaxPathBytes = 512
-	}
-	if len(m.ReservedPathPrefixes) == 0 {
-		m.ReservedPathPrefixes = []string{"/latest/api/", "/internal/"}
-	}
+func (m *MMDSRuntimeConfig) applyDefaults() {
 	if m.ValueWaitTimeout == "" {
 		m.ValueWaitTimeout = "3s"
-	}
-	if m.MaxStoreValueBytes == 0 {
-		m.MaxStoreValueBytes = 16384
-	}
-	if m.MaxRelayURLBytes == 0 {
-		m.MaxRelayURLBytes = 2048
-	}
-	if m.MaxRelayAuthBytes == 0 {
-		m.MaxRelayAuthBytes = 16384
 	}
 	if m.RelayRequestTimeout == "" {
 		m.RelayRequestTimeout = "2s"
@@ -355,16 +324,30 @@ func (m *MMDSEndpointsConfig) ApplyDefaults() {
 	if m.MaxRelayDNSAnswers == 0 {
 		m.MaxRelayDNSAnswers = 16
 	}
-	if m.MaxWorkerInflight == 0 {
-		m.MaxWorkerInflight = 128
+}
+
+// validate checks the fields applyDefaults doesn't unconditionally fill to
+// a valid value (durations, whose zero/malformed string can't be defaulted
+// away the same way an int's zero can). prefix names the field's position
+// in whichever parent config embeds it (e.g. "mmds.endpoints" for
+// config.Config, "mmds.endpoints" for ProxyFileConfig too — both now use
+// the same YAML shape) so error messages point at the right file/key.
+func (m MMDSRuntimeConfig) validate(prefix string) error {
+	if wait, err := time.ParseDuration(m.ValueWaitTimeout); err != nil {
+		return fmt.Errorf("config: %s.value_wait_timeout %q: %w", prefix, m.ValueWaitTimeout, err)
+	} else if wait < 2*time.Second || wait > 5*time.Second {
+		return fmt.Errorf("config: %s.value_wait_timeout %q (want 2s..5s)", prefix, m.ValueWaitTimeout)
 	}
-	if m.MaxWorkerRPCFrameBytes == 0 {
-		m.MaxWorkerRPCFrameBytes = 524288
+	if rt, err := time.ParseDuration(m.RelayRequestTimeout); err != nil {
+		return fmt.Errorf("config: %s.relay_request_timeout %q: %w", prefix, m.RelayRequestTimeout, err)
+	} else if rt <= 0 {
+		return fmt.Errorf("config: %s.relay_request_timeout must be > 0", prefix)
 	}
+	return nil
 }
 
 // ValueWaitTimeoutDur parses ValueWaitTimeout (default/fallback 3s).
-func (m MMDSEndpointsConfig) ValueWaitTimeoutDur() time.Duration {
+func (m MMDSRuntimeConfig) ValueWaitTimeoutDur() time.Duration {
 	d, err := time.ParseDuration(m.ValueWaitTimeout)
 	if err != nil || d <= 0 {
 		return 3 * time.Second
@@ -373,12 +356,68 @@ func (m MMDSEndpointsConfig) ValueWaitTimeoutDur() time.Duration {
 }
 
 // RelayRequestTimeoutDur parses RelayRequestTimeout (default/fallback 2s).
-func (m MMDSEndpointsConfig) RelayRequestTimeoutDur() time.Duration {
+func (m MMDSRuntimeConfig) RelayRequestTimeoutDur() time.Duration {
 	d, err := time.ParseDuration(m.RelayRequestTimeout)
 	if err != nil || d <= 0 {
 		return 2 * time.Second
 	}
 	return d
+}
+
+// MMDSEndpointsConfig is the conductor's node policy for MMDS endpoints:
+// always the sole owner of declaration/persistence policy (regardless of
+// proxy.mode), plus its own internal-mode relay-serving runtime policy
+// (MMDSRuntimeConfig). Enabled=false (default) keeps sandbox Create
+// rejecting the kuasar-sandbox.mmds metadata namespace with 400 and leaves
+// the admin mutation routes unregistered — the feature is never silently
+// ignored when present-but-disabled. Sizes are integer bytes; Create input
+// can never raise these limits.
+type MMDSEndpointsConfig struct {
+	Enabled                bool     `yaml:"enabled"`
+	MaxEndpointsPerSandbox int      `yaml:"max_endpoints_per_sandbox"` // default 16
+	MaxMetadataBytes       int      `yaml:"max_metadata_bytes"`        // default 65536
+	MaxPathBytes           int      `yaml:"max_path_bytes"`            // default 512
+	ReservedPathPrefixes   []string `yaml:"reserved_path_prefixes"`    // default [/latest/api/, /internal/]
+	MaxStoreValueBytes     int      `yaml:"max_store_value_bytes"`     // default 16384
+	MaxRelayURLBytes       int      `yaml:"max_relay_url_bytes"`       // default 2048
+	MaxRelayAuthBytes      int      `yaml:"max_relay_auth_bytes"`      // default 16384
+	MMDSRuntimeConfig      `yaml:",inline"`
+}
+
+// ApplyDefaults fills the MMDS endpoints policy defaults. Exported so callers building
+// a config block outside config.Load (e.g. tests) can default it directly.
+func (m *MMDSEndpointsConfig) ApplyDefaults() {
+	if m.MaxEndpointsPerSandbox == 0 {
+		m.MaxEndpointsPerSandbox = 16
+	}
+	if m.MaxMetadataBytes == 0 {
+		m.MaxMetadataBytes = 65536
+	}
+	if m.MaxPathBytes == 0 {
+		m.MaxPathBytes = 512
+	}
+	if len(m.ReservedPathPrefixes) == 0 {
+		m.ReservedPathPrefixes = []string{"/latest/api/", "/internal/"}
+	}
+	if m.MaxStoreValueBytes == 0 {
+		m.MaxStoreValueBytes = 16384
+	}
+	if m.MaxRelayURLBytes == 0 {
+		m.MaxRelayURLBytes = 2048
+	}
+	if m.MaxRelayAuthBytes == 0 {
+		m.MaxRelayAuthBytes = 16384
+	}
+	m.MMDSRuntimeConfig.applyDefaults()
+}
+
+// Validate checks the fields ApplyDefaults doesn't unconditionally fill to
+// a valid value. prefix names the field's position for error messages (see
+// MMDSRuntimeConfig.validate). ValueWaitTimeoutDur/RelayRequestTimeoutDur
+// are not redefined here — they're promoted directly from the embedded
+// MMDSRuntimeConfig.
+func (m MMDSEndpointsConfig) Validate(prefix string) error {
+	return m.MMDSRuntimeConfig.validate(prefix)
 }
 
 // PathsConfig holds node-local directories and sockets.
@@ -812,15 +851,8 @@ func (c *Config) validateProxy() error {
 	if c.MMDS.Endpoints.Enabled && !c.MMDS.Enabled {
 		return fmt.Errorf("config: mmds.endpoints.enabled=true requires mmds.enabled=true")
 	}
-	if wait, err := time.ParseDuration(c.MMDS.Endpoints.ValueWaitTimeout); err != nil {
-		return fmt.Errorf("config: mmds.endpoints.value_wait_timeout %q: %w", c.MMDS.Endpoints.ValueWaitTimeout, err)
-	} else if wait < 2*time.Second || wait > 5*time.Second {
-		return fmt.Errorf("config: mmds.endpoints.value_wait_timeout %q (want 2s..5s)", c.MMDS.Endpoints.ValueWaitTimeout)
-	}
-	if rt, err := time.ParseDuration(c.MMDS.Endpoints.RelayRequestTimeout); err != nil {
-		return fmt.Errorf("config: mmds.endpoints.relay_request_timeout %q: %w", c.MMDS.Endpoints.RelayRequestTimeout, err)
-	} else if rt <= 0 {
-		return fmt.Errorf("config: mmds.endpoints.relay_request_timeout must be > 0")
+	if err := c.MMDS.Endpoints.Validate("mmds.endpoints"); err != nil {
+		return err
 	}
 	if f := c.Builder.FilesStorage; f != nil && f.Bucket == "" {
 		return fmt.Errorf("config: builder.files_storage.bucket is required when files_storage is set")
@@ -828,24 +860,63 @@ func (c *Config) validateProxy() error {
 	return nil
 }
 
+// ProxyMMDSEndpointsConfig is the external proxy master's own MMDS endpoint
+// serving-runtime policy — deliberately narrower than the conductor's
+// MMDSEndpointsConfig: declaration/persistence policy (name/path rules,
+// per-sandbox/node endpoint counts, store/relay-url/auth size caps) is
+// conductor-only, since the conductor is the sole source of truth for what
+// was ever declared and the proxy master trusts whatever it syncs verbatim.
+// MaxWorkerInflight/MaxWorkerRPCFrameBytes are proxy-only: internal mode has
+// no worker RPC channel at all.
+type ProxyMMDSEndpointsConfig struct {
+	Enabled                bool `yaml:"enabled"`
+	MaxWorkerInflight      int  `yaml:"max_worker_inflight"`        // default 128
+	MaxWorkerRPCFrameBytes int  `yaml:"max_worker_rpc_frame_bytes"` // default 524288
+	MMDSRuntimeConfig      `yaml:",inline"`
+}
+
+func (m *ProxyMMDSEndpointsConfig) applyDefaults() {
+	if m.MaxWorkerInflight == 0 {
+		m.MaxWorkerInflight = 128
+	}
+	if m.MaxWorkerRPCFrameBytes == 0 {
+		m.MaxWorkerRPCFrameBytes = 524288
+	}
+	m.MMDSRuntimeConfig.applyDefaults()
+}
+
+// ProxyMMDSConfig is the external proxy master's MMDS section, mirroring
+// config.MMDSConfig's Enabled/Listen/Endpoints shape.
+type ProxyMMDSConfig struct {
+	Enabled   bool                     `yaml:"enabled"`   // false (default); must be true (with mmds.listen set) to host the FC MMDS service at all
+	Listen    string                   `yaml:"listen"`    // FC MMDS service addr workers share; required when enabled
+	Endpoints ProxyMMDSEndpointsConfig `yaml:"endpoints"` // Endpoints.Enabled must ALSO be true (in addition to mmds.enabled) to activate MMDS endpoints specifically
+}
+
 // ProxyFileConfig is the external data-plane proxy master's config
 // (node-ctl proxy serve --config <this>). The master owns the routesync
-// subscription, shared route table, listener fds, and worker supervision. Serve
-// still pushes the authoritative auth/park policy over the registration stream;
-// local values are bootstrap fallbacks until that handshake completes.
+// subscription, shared route table, listener fds, and worker supervision.
+// Serve still pushes the authoritative auth/park policy over the
+// registration stream; local values are bootstrap fallbacks until that
+// handshake completes. MMDS is the same kind of bootstrap-fallback value —
+// there is no push-and-override wiring for it yet (unlike Auth/ParkTimeout,
+// which routesync.Policy does override post-handshake), so today it is
+// simply this file's own, independently maintained policy: the proxy
+// master's serving-runtime settings, separate from (and not required to
+// match) the conductor's own mmds.endpoints.
 type ProxyFileConfig struct {
-	ConfigSocket  string    `yaml:"config_socket"`  // serve control socket to register + sync on (= serve paths.config_socket)
-	DataListen    string    `yaml:"data_listen"`    // data-plane ingress; "" = UDS-only proxyForwarder
-	ProxyNetNS    string    `yaml:"proxy_netns"`    // optional forwarding netns for floatingip TCP dials and MMDS listen
-	ProxySocket   string    `yaml:"proxy_socket"`   // UDS registered for conductor proxyForwarder; default <dir(config_socket)>/proxy.sock
-	ShmPath       string    `yaml:"shm_path"`       // shared route table path; default <dir(config_socket)>/proxy-routes.shm
-	RouteCapacity int       `yaml:"route_capacity"` // fixed shared route slots; default 65536
-	Workers       int       `yaml:"workers"`        // worker processes supervised by this master; default 1
-	TLS           TLSConfig `yaml:"tls"`            // data-plane listener cert (= serve's wildcard); "" = h2c
-	Auth          string    `yaml:"auth"`           // bootstrap fallback until serve pushes policy: off|log|enforce (default enforce)
-	ParkTimeout   string    `yaml:"park_timeout"`   // bootstrap fallback; default 30s
-	MMDSListen    string    `yaml:"mmds_listen"`    // FC MMDS service addr workers share; empty = disabled
-	MetricsListen string    `yaml:"metrics_listen"` // master metrics endpoint; aggregates worker data-plane counters
+	ConfigSocket  string          `yaml:"config_socket"`  // serve control socket to register + sync on (= serve paths.config_socket)
+	DataListen    string          `yaml:"data_listen"`    // data-plane ingress; "" = UDS-only proxyForwarder
+	ProxyNetNS    string          `yaml:"proxy_netns"`    // optional forwarding netns for floatingip TCP dials and MMDS listen
+	ProxySocket   string          `yaml:"proxy_socket"`   // UDS registered for conductor proxyForwarder; default <dir(config_socket)>/proxy.sock
+	ShmPath       string          `yaml:"shm_path"`       // shared route table path; default <dir(config_socket)>/proxy-routes.shm
+	RouteCapacity int             `yaml:"route_capacity"` // fixed shared route slots; default 65536
+	Workers       int             `yaml:"workers"`        // worker processes supervised by this master; default 1
+	TLS           TLSConfig       `yaml:"tls"`            // data-plane listener cert (= serve's wildcard); "" = h2c
+	Auth          string          `yaml:"auth"`           // bootstrap fallback until serve pushes policy: off|log|enforce (default enforce)
+	ParkTimeout   string          `yaml:"park_timeout"`   // bootstrap fallback; default 30s
+	MMDS          ProxyMMDSConfig `yaml:"mmds"`           // FC MMDS service + endpoint policy
+	MetricsListen string          `yaml:"metrics_listen"` // master metrics endpoint; aggregates worker data-plane counters
 }
 
 // LoadProxy reads the proxy master config, applies defaults, and validates.
@@ -884,6 +955,10 @@ func (p *ProxyFileConfig) applyDefaults() {
 	if p.ParkTimeout == "" {
 		p.ParkTimeout = "30s"
 	}
+	if p.MMDS.Listen == "" {
+		p.MMDS.Listen = "127.0.0.1:19254"
+	}
+	p.MMDS.Endpoints.applyDefaults()
 }
 
 func (p *ProxyFileConfig) validate() error {
@@ -900,6 +975,12 @@ func (p *ProxyFileConfig) validate() error {
 	}
 	if p.RouteCapacity <= 0 {
 		return fmt.Errorf("proxy config: route_capacity must be positive")
+	}
+	if p.MMDS.Endpoints.Enabled && !p.MMDS.Enabled {
+		return fmt.Errorf("proxy config: mmds.endpoints.enabled=true requires mmds.enabled=true")
+	}
+	if err := p.MMDS.Endpoints.MMDSRuntimeConfig.validate("mmds.endpoints"); err != nil {
+		return err
 	}
 	return nil
 }

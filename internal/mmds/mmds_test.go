@@ -554,6 +554,68 @@ func TestGetMetaRelayEndpointNeverConfiguredReturns404(t *testing.T) {
 	}
 }
 
+func TestGuardRejectsQueryString(t *testing.T) {
+	src := testSourceWithRunID()
+	h := New(src, nil, 50*time.Millisecond, nil, nil).Handler()
+
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, httptest.NewRequest("GET", "http://169.254.169.254/?x=1", nil))
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("GET with a query string: code=%d, want 400", w.Code)
+	}
+}
+
+func TestGuardRejectsPercentEncodedPath(t *testing.T) {
+	src := testSourceWithRunID()
+	h := New(src, nil, 50*time.Millisecond, nil, nil).Handler()
+
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, httptest.NewRequest("GET", "http://169.254.169.254/latest%2Fuser-data", nil))
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("GET with a percent-escaped path: code=%d, want 400", w.Code)
+	}
+}
+
+func TestGuardRejectsNonCanonicalPath(t *testing.T) {
+	src := testSourceWithRunID()
+	h := New(src, nil, 50*time.Millisecond, nil, nil).Handler()
+
+	for _, target := range []string{
+		"http://169.254.169.254/../latest",
+		"http://169.254.169.254//latest",
+		"http://169.254.169.254/latest/",
+	} {
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, httptest.NewRequest("GET", target, nil))
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("GET %s: code=%d, want 400 (and no redirect)", target, w.Code)
+		}
+		if loc := w.Header().Get("Location"); loc != "" {
+			t.Fatalf("GET %s: got a redirect Location=%q, want none (no automatic redirect)", target, loc)
+		}
+	}
+}
+
+func TestGuardRejectsRequestBody(t *testing.T) {
+	src := testSourceWithRunID()
+	h := New(src, nil, 50*time.Millisecond, nil, nil).Handler()
+
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, httptest.NewRequest("GET", "http://169.254.169.254/", strings.NewReader("x")))
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("GET with a body: code=%d, want 400", w.Code)
+	}
+
+	w = httptest.NewRecorder()
+	req := httptest.NewRequest("PUT", "http://169.254.169.254/latest/api/token", strings.NewReader("x"))
+	req.RemoteAddr = "100.100.96.5:1"
+	req.Header.Set(TTLHeader, "60")
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("PUT token with a body: code=%d, want 400", w.Code)
+	}
+}
+
 func TestHashToken(t *testing.T) {
 	h := HashToken("hello")
 	if len(h) != 128 { // keys.HashAccessTokenBytes = hex(sha512) = 64 bytes = 128 hex chars
