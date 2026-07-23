@@ -178,24 +178,6 @@ func NormalizeRestoreMetadata(meta map[string]string) (map[string]string, error)
 	return out, nil
 }
 
-// RestorePrefetchMode returns the concrete prefetch mode. An absent namespace,
-// an empty object, and explicit off all resolve to the default disabled mode.
-func RestorePrefetchMode(meta map[string]string) (string, error) {
-	raw, ok := meta[NsRestore]
-	if !ok {
-		return string(rtconfig.PrefetchOff), nil
-	}
-	restore, err := parseRestore(raw)
-	if err != nil {
-		return "", err
-	}
-	mode, err := rtconfig.ParsePrefetchMode(restore.Prefetch)
-	if err != nil {
-		return "", err
-	}
-	return string(mode), nil
-}
-
 func parseRestore(raw string) (RestoreSpec, error) {
 	var restore RestoreSpec
 	trimmed := strings.TrimSpace(raw)

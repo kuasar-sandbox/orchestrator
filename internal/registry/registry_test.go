@@ -1235,124 +1235,18 @@ func TestReserveSandboxRejectsInvalidRestoreBeforePlacement(t *testing.T) {
 	}
 }
 
-func TestReserveSandboxKeepsRestorePolicyDistinctAcrossFlights(t *testing.T) {
+func TestReserveSandboxJoinsExistingRouteFlight(t *testing.T) {
 	result := &ReserveResult{SID: "s1", NodeID: "n1", DataEndpoint: "node:1"}
-	for _, tc := range []struct {
-		name       string
-		leaderMode string
-		waiter     map[string]string
-	}{
-		{name: "off leader memory waiter", leaderMode: "off", waiter: map[string]string{sandboxcfg.NsRestore: `{"prefetch":"memory"}`}},
-		{name: "memory leader off waiter", leaderMode: "memory", waiter: nil},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			reg := testReg(t)
-			call := &reserveCall{
-				done: make(chan struct{}), restoreMode: tc.leaderMode, result: result,
-			}
-			close(call.done)
-			reg.inflight[flightKey("/g", "rk")] = call
-			if _, err := reg.ReserveSandbox(context.Background(), "/g", "rk", tc.waiter); !errors.Is(err, errReserveRestoreConflict) {
-				t.Fatalf("ReserveSandbox error=%v, want restore conflict", err)
-			}
-		})
-	}
+	call := &reserveCall{done: make(chan struct{}), result: result}
+	close(call.done)
+	reg := testReg(t)
+	reg.inflight[flightKey("/g", "rk")] = call
 
-	for _, tc := range []struct {
-		name       string
-		leaderMode string
-		waiter     map[string]string
-	}{
-		{name: "absent", leaderMode: "off"},
-		{name: "object", leaderMode: "off", waiter: map[string]string{sandboxcfg.NsRestore: `{}`}},
-		{name: "off", leaderMode: "off", waiter: map[string]string{sandboxcfg.NsRestore: `{"prefetch":"off"}`}},
-		{name: "memory", leaderMode: "memory", waiter: map[string]string{sandboxcfg.NsRestore: `{"prefetch":"memory"}`}},
-	} {
-		t.Run("compatible "+tc.name, func(t *testing.T) {
-			reg := testReg(t)
-			call := &reserveCall{done: make(chan struct{}), restoreMode: tc.leaderMode, result: result}
-			close(call.done)
-			reg.inflight[flightKey("/g", "rk")] = call
-			got, err := reg.ReserveSandbox(context.Background(), "/g", "rk", tc.waiter)
-			if err != nil || got != result {
-				t.Fatalf("compatible disabled waiter did not join: result=%+v err=%v", got, err)
-			}
-		})
-	}
-}
-
-type blockingRuntimeOwner struct {
-	*remoteRouteWriteOwner
-	entered chan struct{}
-	release chan struct{}
-}
-
-func (o *blockingRuntimeOwner) Runtime(ctx context.Context, nodeID string) (*NodeRecord, bool, error) {
-	close(o.entered)
-	select {
-	case <-o.release:
-		return o.remoteRouteWriteOwner.Runtime(ctx, nodeID)
-	case <-ctx.Done():
-		return nil, false, ctx.Err()
-	}
-}
-
-func TestReserveSandboxReadyFastPathRechecksRestoreFlight(t *testing.T) {
-	for _, tc := range []struct {
-		name       string
-		flightMode string
-		waiter     map[string]string
-	}{
-		{name: "off flight memory waiter", flightMode: "off", waiter: map[string]string{sandboxcfg.NsRestore: `{"prefetch":"memory"}`}},
-		{name: "memory flight off waiter", flightMode: "memory", waiter: nil},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-			defer cancel()
-			reg := testReg(t)
-			if _, err := reg.stores.PutSandbox(ctx, &SandboxRecord{
-				Group: "/g", RouteKey: "rk", SID: "sb-ready", State: StateReady, NodeID: "n1",
-			}); err != nil {
-				t.Fatal(err)
-			}
-			owner := &blockingRuntimeOwner{
-				remoteRouteWriteOwner: &remoteRouteWriteOwner{node: &NodeRecord{NodeID: "n1", DataEndpoint: "node:1"}},
-				entered:               make(chan struct{}),
-				release:               make(chan struct{}),
-			}
-			reg.SetNodeOwner(owner)
-
-			type outcome struct {
-				res *ReserveResult
-				err error
-			}
-			done := make(chan outcome, 1)
-			go func() {
-				res, err := reg.ReserveSandbox(ctx, "/g", "rk", tc.waiter)
-				done <- outcome{res: res, err: err}
-			}()
-
-			select {
-			case <-owner.entered:
-			case <-ctx.Done():
-				t.Fatal("ReserveSandbox did not enter READY runtime check")
-			}
-			reg.mu.Lock()
-			reg.inflight[flightKey("/g", "rk")] = &reserveCall{
-				done: make(chan struct{}), restoreMode: tc.flightMode,
-			}
-			reg.mu.Unlock()
-			close(owner.release)
-
-			select {
-			case got := <-done:
-				if got.res != nil || !errors.Is(got.err, errReserveRestoreConflict) {
-					t.Fatalf("ReserveSandbox result=%+v error=%v, want restore conflict", got.res, got.err)
-				}
-			case <-ctx.Done():
-				t.Fatal("ReserveSandbox did not complete after runtime check")
-			}
-		})
+	got, err := reg.ReserveSandbox(context.Background(), "/g", "rk", map[string]string{
+		sandboxcfg.NsRestore: `{"prefetch":"memory"}`,
+	})
+	if err != nil || got != result {
+		t.Fatalf("existing route flight result=%+v err=%v", got, err)
 	}
 }
 

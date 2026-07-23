@@ -109,9 +109,7 @@ router 不参与 registry 成员健康检测,不订阅 route,也不订阅 node_l
 create 可在 body metadata 中携 `kuasar-sandbox.restore`,或使用
 `X-Kuasar-Sandbox-Restore`;同一请求 Header 胜出。router 只提取该命名空间,不会把
 Prefetch 变成 template、group 或节点统一策略。未提供、`{}` 与显式 `off` 均为关闭;
-只有本次 create 显式提供 `memory` 才启用。同一 `(group,route_key)` 首次创建期间,
-有效 mode 相同的并发请求共用 Reserve;`off` 与 `memory` 不同时回 **409**,避免成功
-响应对应到另一请求抢先选定的策略。
+只有本次 create 显式提供 `memory` 才启用。
 
 ## 6. 缓存模型
 

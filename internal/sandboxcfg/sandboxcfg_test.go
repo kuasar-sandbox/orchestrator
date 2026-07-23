@@ -103,25 +103,6 @@ func TestNormalizeRestoreMetadata(t *testing.T) {
 	}
 }
 
-func TestRestorePrefetchMode(t *testing.T) {
-	for name, tc := range map[string]struct {
-		meta map[string]string
-		want string
-	}{
-		"absent": {want: "off"},
-		"object": {meta: map[string]string{NsRestore: `{}`}, want: "off"},
-		"off":    {meta: map[string]string{NsRestore: `{"prefetch":"off"}`}, want: "off"},
-		"memory": {meta: map[string]string{NsRestore: `{"prefetch":"memory"}`}, want: "memory"},
-	} {
-		t.Run(name, func(t *testing.T) {
-			got, err := RestorePrefetchMode(tc.meta)
-			if err != nil || got != tc.want {
-				t.Fatalf("RestorePrefetchMode() = %q, %v; want %q", got, err, tc.want)
-			}
-		})
-	}
-}
-
 func TestParseSpecNetworkValidation(t *testing.T) {
 	for name, bad := range map[string]string{
 		"bad-json":    `{not json`,

@@ -65,22 +65,3 @@ func TestServeReserveRejectsNonRestoreConfigBeforeReservation(t *testing.T) {
 		t.Fatalf("unsupported config wrote route state: found=%v err=%v", found, err)
 	}
 }
-
-func TestServeReserveReportsConcurrentRestoreConflict(t *testing.T) {
-	reg := New(NewStores(), nil, 0, nil)
-	call := &reserveCall{done: make(chan struct{}), restoreMode: "off"}
-	close(call.done)
-	reg.inflight[flightKey("/g", "rk")] = call
-	mux := http.NewServeMux()
-	reg.ServeRouteLink(mux)
-	body := []byte(`{"config":{"kuasar-sandbox.restore":"{\"prefetch\":\"memory\"}"}}`)
-	req := httptest.NewRequest(http.MethodPost, RouteLinkReservePath+"?group=/g&route_key=rk", bytes.NewReader(body))
-	rec := httptest.NewRecorder()
-	mux.ServeHTTP(rec, req)
-	if rec.Code != http.StatusConflict {
-		t.Fatalf("status=%d body=%q, want 409", rec.Code, rec.Body.String())
-	}
-	if got := rec.Header().Get(RouteLinkErrorHeader); got != RouteLinkRestoreConflict {
-		t.Fatalf("%s=%q, want %q", RouteLinkErrorHeader, got, RouteLinkRestoreConflict)
-	}
-}
