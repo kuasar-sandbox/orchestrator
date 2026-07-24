@@ -14,7 +14,6 @@ func testLimits() config.MMDSEndpointsConfig {
 }
 
 const docExample = `
-schema_version: 1
 endpoints:
   - name: credentials
     path: /latest/meta-data/credentials
@@ -119,39 +118,9 @@ func TestExtractBlankNamespaceIsStrippedWhenEnabled(t *testing.T) {
 	}
 }
 
-func TestExtractRejectsMissingSchemaVersion(t *testing.T) {
-	raw := `
-endpoints:
-  - name: a
-    path: /latest/user-data
-    backend:
-      type: store
-`
-	_, _, err := Extract(map[string]string{Ns: raw}, testLimits())
-	if err == nil || !strings.Contains(err.Error(), "schema_version") {
-		t.Fatalf("Extract error = %v, want schema_version rejection", err)
-	}
-}
-
-func TestExtractRejectsUnknownSchemaVersion(t *testing.T) {
-	raw := `
-schema_version: 2
-endpoints:
-  - name: a
-    path: /latest/user-data
-    backend:
-      type: store
-`
-	_, _, err := Extract(map[string]string{Ns: raw}, testLimits())
-	if err == nil || !strings.Contains(err.Error(), "schema_version") {
-		t.Fatalf("Extract error = %v, want schema_version rejection", err)
-	}
-}
-
 func TestExtractBackendFieldLeakage(t *testing.T) {
 	cases := map[string]string{
 		"store with url": `
-schema_version: 1
 endpoints:
   - name: a
     path: /latest/a
@@ -160,7 +129,6 @@ endpoints:
       url: https://example.com
 `,
 		"relay missing auth": `
-schema_version: 1
 endpoints:
   - name: a
     path: /latest/a
@@ -169,7 +137,6 @@ endpoints:
       url: https://example.com
 `,
 		"relay null auth": `
-schema_version: 1
 endpoints:
   - name: a
     path: /latest/a
@@ -179,7 +146,6 @@ endpoints:
       auth:
 `,
 		"relay extra field": `
-schema_version: 1
 endpoints:
   - name: a
     path: /latest/a
@@ -191,7 +157,6 @@ endpoints:
       extra: 1
 `,
 		"relay auth extra field": `
-schema_version: 1
 endpoints:
   - name: a
     path: /latest/a
@@ -203,7 +168,6 @@ endpoints:
         extra: 1
 `,
 		"relay missing url": `
-schema_version: 1
 endpoints:
   - name: a
     path: /latest/a
@@ -213,7 +177,6 @@ endpoints:
         header_name: X-Auth
 `,
 		"unknown backend type": `
-schema_version: 1
 endpoints:
   - name: a
     path: /latest/a
@@ -221,7 +184,6 @@ endpoints:
       type: proxy
 `,
 		"missing backend type": `
-schema_version: 1
 endpoints:
   - name: a
     path: /latest/a
@@ -241,7 +203,7 @@ endpoints:
 
 func TestExtractPathValidationMatrix(t *testing.T) {
 	base := func(path string) string {
-		return "schema_version: 1\nendpoints:\n  - name: a\n    path: " + path + "\n    backend:\n      type: store\n"
+		return "endpoints:\n  - name: a\n    path: " + path + "\n    backend:\n      type: store\n"
 	}
 	cases := []struct {
 		name    string
@@ -276,7 +238,7 @@ func TestExtractPathValidationMatrix(t *testing.T) {
 
 func TestExtractNameBoundaries(t *testing.T) {
 	doc := func(name string) string {
-		return "schema_version: 1\nendpoints:\n  - name: \"" + name + "\"\n    path: /latest/user-data\n    backend:\n      type: store\n"
+		return "endpoints:\n  - name: \"" + name + "\"\n    path: /latest/user-data\n    backend:\n      type: store\n"
 	}
 	cases := []struct {
 		name    string
@@ -304,7 +266,6 @@ func TestExtractNameBoundaries(t *testing.T) {
 
 func TestExtractRejectsDuplicateNameAndPath(t *testing.T) {
 	dupName := `
-schema_version: 1
 endpoints:
   - name: a
     path: /latest/a
@@ -320,7 +281,6 @@ endpoints:
 	}
 
 	dupPath := `
-schema_version: 1
 endpoints:
   - name: a
     path: /latest/a
@@ -341,7 +301,7 @@ func TestExtractEndpointCountLimit(t *testing.T) {
 	limits.MaxEndpointsPerSandbox = 2
 
 	var sb strings.Builder
-	sb.WriteString("schema_version: 1\nendpoints:\n")
+	sb.WriteString("endpoints:\n")
 	for i := 0; i < 2; i++ {
 		sb.WriteString("  - name: ep" + string(rune('a'+i)) + "\n    path: /latest/ep" + string(rune('a'+i)) + "\n    backend:\n      type: store\n")
 	}
@@ -357,7 +317,6 @@ func TestExtractEndpointCountLimit(t *testing.T) {
 
 func TestExtractRejectsUnknownTopLevelField(t *testing.T) {
 	raw := `
-schema_version: 1
 unexpected_field: true
 endpoints:
   - name: a
@@ -371,7 +330,7 @@ endpoints:
 }
 
 func TestExtractRejectsEmptyEndpointsList(t *testing.T) {
-	raw := "schema_version: 1\nendpoints: []\n"
+	raw := "endpoints: []\n"
 	if _, _, err := Extract(map[string]string{Ns: raw}, testLimits()); err == nil {
 		t.Fatal("Extract succeeded with an empty endpoints list, want error")
 	}

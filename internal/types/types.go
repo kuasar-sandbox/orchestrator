@@ -104,6 +104,18 @@ type Sandbox struct {
 	CreatedUnix        int64
 }
 
+// MMDSEndpointStatus is the redacted status of one endpoint exposed by the
+// sandbox detail API. It deliberately contains neither endpoint public
+// configuration nor any store/relay secret.
+type MMDSEndpointStatus struct {
+	Name        string `json:"name"`
+	Path        string `json:"path"`
+	BackendType string `json:"backend_type"`
+	Configured  bool   `json:"configured"`
+	Revision    int64  `json:"revision"`
+	Expired     bool   `json:"expired"`
+}
+
 func (s *Sandbox) Profile() Profile {
 	t, err := ParseTemplateID(s.TemplateID)
 	if err != nil {

@@ -2,6 +2,7 @@ package orch
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -10,6 +11,7 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
 	"github.com/kuasar-sandbox/orchestrator/internal/mmdscfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/routesync"
+	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/store"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
@@ -18,6 +20,41 @@ import (
 // Create's MMDS validation runs (and must fail fast) before any template/
 // launch machinery is touched, so no matching template needs to actually exist.
 var validTemplateID = "e2b-img-" + strings.Repeat("1", 64)
+
+func TestGetIncludesRedactedMMDSSnapshotInMetadata(t *testing.T) {
+	o := testOrch(t)
+	ctx := context.Background()
+	apiKey, manifestKey, _ := allowlistedBuildIdentity(t, o)
+	sb := &types.Sandbox{ID: "sb-get-mmds", State: types.StateRunning, ManifestKey: manifestKey, Metadata: map[string]string{sandboxcfg.NsNetwork: `{"hostname":"h1"}`}}
+	if err := o.st.PutWithMMDSEndpoints(ctx, sb, []store.MMDSEndpoint{
+		{Name: "credentials", Path: "/latest/credentials", BackendType: store.MMDSBackendRelay, PublicConfigJSON: `{"url":"https://upstream.example","auth_header_name":"X-Upstream-Auth"}`},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := o.Get(ctx, sb.ID, apiKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var status struct {
+		Endpoints []struct {
+			Name        string `json:"name"`
+			BackendType string `json:"backend_type"`
+			Configured  bool   `json:"configured"`
+		} `json:"endpoints"`
+	}
+	if err := json.Unmarshal([]byte(got.Metadata[mmdscfg.Ns]), &status); err != nil {
+		t.Fatal(err)
+	}
+	if len(status.Endpoints) != 1 || status.Endpoints[0].Name != "credentials" || status.Endpoints[0].BackendType != store.MMDSBackendRelay || status.Endpoints[0].Configured {
+		t.Fatalf("MMDS metadata status = %+v, want one unconfigured relay endpoint", status)
+	}
+	for _, leaked := range []string{"https://upstream.example", "X-Upstream-Auth"} {
+		if strings.Contains(got.Metadata[mmdscfg.Ns], leaked) {
+			t.Fatalf("MMDS metadata leaked %q: %s", leaked, got.Metadata[mmdscfg.Ns])
+		}
+	}
+}
 
 func TestCreateRejectsMMDSWhenEndpointsDisabled(t *testing.T) {
 	o := testOrch(t) // default config: mmds.endpoints.enabled=false
@@ -28,7 +65,7 @@ func TestCreateRejectsMMDSWhenEndpointsDisabled(t *testing.T) {
 		APIKey:     apiKey,
 		TemplateID: validTemplateID,
 		Metadata: map[string]string{
-			mmdscfg.Ns: "schema_version: 1\nendpoints:\n  - name: a\n    path: /latest/a\n    backend:\n      type: store\n",
+			mmdscfg.Ns: "endpoints:\n  - name: a\n    path: /latest/a\n    backend:\n      type: store\n",
 		},
 	})
 	if !errors.Is(err, api.ErrBadRequest) {
@@ -52,14 +89,14 @@ func TestCreateRejectsMalformedMMDSBeforeLaunch(t *testing.T) {
 		APIKey:     apiKey,
 		TemplateID: validTemplateID,
 		Metadata: map[string]string{
-			mmdscfg.Ns: "schema_version: 2\nendpoints: []\n", // unsupported schema_version
+			mmdscfg.Ns: "unknown_field: 2\nendpoints: []\n",
 		},
 	})
 	if !errors.Is(err, api.ErrBadRequest) {
 		t.Fatalf("Create error = %v, want ErrBadRequest", err)
 	}
-	if !strings.Contains(err.Error(), "schema_version") {
-		t.Fatalf("Create error = %v, want it to mention schema_version", err)
+	if !strings.Contains(err.Error(), "unknown_field") {
+		t.Fatalf("Create error = %v, want it to mention unknown_field", err)
 	}
 }
 
@@ -185,7 +222,7 @@ func TestRegisterBuildRejectsMMDSNamespace(t *testing.T) {
 	_, err := o.RegisterBuild(ctx, apiKey, api.RegisterSpec{
 		Profile: types.ProfileE2B,
 		Metadata: map[string]string{
-			mmdscfg.Ns: "schema_version: 1\nendpoints: []\n",
+			mmdscfg.Ns: "endpoints: []\n",
 		},
 	})
 	if !errors.Is(err, api.ErrBadRequest) {
@@ -208,7 +245,7 @@ func TestTriggerBuildRejectsMMDSNamespace(t *testing.T) {
 	err = o.TriggerBuild(ctx, apiKey, b.TemplateID, b.BuildID, api.TriggerSpec{
 		FromImage: "registry.test/base:latest",
 		Metadata: map[string]string{
-			mmdscfg.Ns: "schema_version: 1\nendpoints: []\n",
+			mmdscfg.Ns: "endpoints: []\n",
 		},
 	}, api.BuildAuth{})
 	if !errors.Is(err, api.ErrBadRequest) {

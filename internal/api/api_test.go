@@ -1,7 +1,9 @@
 package api
 
 import (
+	"encoding/json"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/buildcfg"
@@ -9,6 +11,53 @@ import (
 	"github.com/kuasar-sandbox/orchestrator/internal/sandboxcfg"
 	"github.com/kuasar-sandbox/orchestrator/internal/types"
 )
+
+func TestSandboxDetailIncludesRedactedMMDSEndpoints(t *testing.T) {
+	a := &API{}
+	detail := &types.Sandbox{
+		ID: "sb-1", TemplateID: "e2b-img-" + strings.Repeat("1", 64),
+		State: types.StateRunning, Metadata: map[string]string{
+			mmdscfg.Ns: `{"endpoints":[{"name":"credentials","path":"/latest/credentials","backend_type":"relay","configured":true,"revision":2,"expired":false},{"name":"user-data","path":"/latest/user-data","backend_type":"store","configured":false,"revision":0,"expired":false}]}`,
+		},
+	}
+
+	body, err := json.Marshal(a.sandboxDetail(detail))
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw := string(body)
+	if !strings.Contains(raw, `"kuasar-sandbox.mmds"`) ||
+		!strings.Contains(raw, `"backend_type":"relay"`) ||
+		!strings.Contains(raw, `"configured":true`) {
+		t.Fatalf("sandbox detail omitted MMDS status: %s", raw)
+	}
+	for _, secret := range []string{"https://upstream.example", "X-Upstream-Auth", "secret-value"} {
+		if strings.Contains(raw, secret) {
+			t.Fatalf("sandbox detail leaked %q: %s", secret, raw)
+		}
+	}
+
+	var got map[string]any
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatal(err)
+	}
+	metadata, ok := got["metadata"].(map[string]any)
+	if !ok || !strings.Contains(metadata[mmdscfg.Ns].(string), `"endpoints":[`) {
+		t.Fatalf("metadata = %#v, want redacted MMDS status", got["metadata"])
+	}
+}
+
+func TestSandboxDetailOmitsMMDSEndpointMetadataWhenUnset(t *testing.T) {
+	a := &API{}
+	detail := &types.Sandbox{ID: "sb-1", Metadata: map[string]string{}}
+	body, err := json.Marshal(a.sandboxDetail(detail))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(body), mmdscfg.Ns) {
+		t.Fatalf("sandbox detail unexpectedly returned MMDS metadata: %s", body)
+	}
+}
 
 func TestRequestedBuildProfile(t *testing.T) {
 	tests := []struct {
@@ -80,23 +129,23 @@ func TestMergeConfigHeaders(t *testing.T) {
 
 func TestMergeConfigHeadersMMDS(t *testing.T) {
 	// Header populates the mmds namespace.
-	got := mergeConfigHeaders(nil, header("X-Kuasar-Sandbox-MMDS", `{"schema_version":1}`))
-	if got[mmdscfg.Ns] != `{"schema_version":1}` {
+	got := mergeConfigHeaders(nil, header("X-Kuasar-Sandbox-MMDS", `{}`))
+	if got[mmdscfg.Ns] != `{}` {
 		t.Fatalf("mmds header not normalized: %+v", got)
 	}
 
 	// Header wins over an e2b metadata key of the same namespace.
-	meta := map[string]string{mmdscfg.Ns: `{"schema_version":1,"endpoints":[]}`}
-	got = mergeConfigHeaders(meta, header("X-Kuasar-Sandbox-MMDS", `{"schema_version":1,"endpoints":["from-header"]}`))
-	if got[mmdscfg.Ns] != `{"schema_version":1,"endpoints":["from-header"]}` {
+	meta := map[string]string{mmdscfg.Ns: `{"endpoints":[]}`}
+	got = mergeConfigHeaders(meta, header("X-Kuasar-Sandbox-MMDS", `{"endpoints":["from-header"]}`))
+	if got[mmdscfg.Ns] != `{"endpoints":["from-header"]}` {
 		t.Fatalf("mmds header should win over metadata: %+v", got)
 	}
 
 	// mergeBuildConfigHeaders also folds the header (orch's build path rejects
 	// its presence explicitly — see orch/build.go), since it shares the same
 	// configHeaderNs precedence table as create.
-	got = mergeBuildConfigHeaders(nil, header("X-Kuasar-Sandbox-MMDS", `{"schema_version":1}`))
-	if got[mmdscfg.Ns] != `{"schema_version":1}` {
+	got = mergeBuildConfigHeaders(nil, header("X-Kuasar-Sandbox-MMDS", `{}`))
+	if got[mmdscfg.Ns] != `{}` {
 		t.Fatalf("mmds header not normalized via mergeBuildConfigHeaders: %+v", got)
 	}
 }

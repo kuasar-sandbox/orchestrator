@@ -388,14 +388,50 @@ func (o *Orchestrator) launch(ctx context.Context, sb *types.Sandbox, tmpl types
 	return nil
 }
 
+type mmdsMetadataResponse struct {
+	Endpoints []types.MMDSEndpointStatus `json:"endpoints"`
+}
+
+// Get returns a sandbox with its redacted MMDS endpoint status represented in
+// the same metadata namespace shape used by the Create request. Endpoint
+// secrets and public relay configuration are intentionally not included.
 func (o *Orchestrator) Get(ctx context.Context, id, apiKey string) (*types.Sandbox, error) {
 	sb, err := o.st.Get(ctx, id)
 	if err != nil {
 		return nil, err
 	}
-	if !ownsSandbox(sb, apiKey) {
+	if sb == nil || !ownsSandbox(sb, apiKey) {
 		return nil, api.ErrNotFound
 	}
+	rows, err := o.st.ListMMDSEndpointStatus(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if len(rows) == 0 {
+		return sb, nil
+	}
+
+	endpoints := make([]types.MMDSEndpointStatus, len(rows))
+	for i, ep := range rows {
+		endpoints[i] = types.MMDSEndpointStatus{
+			Name:        ep.Name,
+			Path:        ep.Path,
+			BackendType: ep.BackendType,
+			Configured:  ep.Configured,
+			Revision:    ep.Revision,
+			Expired:     ep.Expired,
+		}
+	}
+	b, err := json.Marshal(mmdsMetadataResponse{Endpoints: endpoints})
+	if err != nil {
+		return nil, fmt.Errorf("orch: marshal mmds metadata for %s: %w", id, err)
+	}
+	meta := make(map[string]string, len(sb.Metadata)+1)
+	for k, v := range sb.Metadata {
+		meta[k] = v
+	}
+	meta[mmdscfg.Ns] = string(b)
+	sb.Metadata = meta
 	return sb, nil
 }
 

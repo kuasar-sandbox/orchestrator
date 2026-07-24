@@ -22,10 +22,6 @@ import (
 // reject its presence outright (see orch/build.go).
 const Ns = "kuasar-sandbox.mmds"
 
-// SchemaVersion is the only schema_version value Extract accepts. Unknown
-// values fail Create and do not imply a product-version roadmap.
-const SchemaVersion = 1
-
 // Backend type tags.
 const (
 	BackendStore = "store"
@@ -69,8 +65,7 @@ var (
 // map so parseBackend can positively assert "no extra keys for this variant" —
 // a tagged union KnownFields(true) alone can't express across Go struct tags.
 type rawDoc struct {
-	SchemaVersion int           `yaml:"schema_version"`
-	Endpoints     []rawEndpoint `yaml:"endpoints"`
+	Endpoints []rawEndpoint `yaml:"endpoints"`
 }
 
 type rawEndpoint struct {
@@ -112,9 +107,6 @@ func Extract(meta map[string]string, limits config.MMDSEndpointsConfig) (map[str
 	dec.KnownFields(true)
 	if err := dec.Decode(&doc); err != nil {
 		return nil, nil, fmt.Errorf("mmdscfg: metadata[%q] is not valid JSON: %w", Ns, err)
-	}
-	if doc.SchemaVersion != SchemaVersion {
-		return nil, nil, fmt.Errorf("mmdscfg: schema_version %d unsupported (want %d)", doc.SchemaVersion, SchemaVersion)
 	}
 	if len(doc.Endpoints) == 0 {
 		return nil, nil, fmt.Errorf("mmdscfg: endpoints must declare at least one entry")
