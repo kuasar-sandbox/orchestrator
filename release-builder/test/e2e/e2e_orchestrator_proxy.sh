@@ -9,7 +9,7 @@
 #   serve(proxy_mode=external)                          # control plane on :PORT
 #   proxy serve --config <proxy.yaml>                    # data-plane on :PROXY_PORT
 #         # one master plugin registration + N workers sharing inherited listeners;
-#         # workers run in PROXY_NETNS, and mmds_listen is bound there
+#         # workers run in PROXY_NETNS, and mmds.listen is bound there
 #   POST /sandboxes  -> real VM + envd ; serve streams the route to the proxy
 #   GET <proxy>/health (Host 49983-<sid>): no token -> 401 (enforce);
 #                                          right X-Access-Token -> forwarded to envd
@@ -317,7 +317,9 @@ route_capacity: 1024
 workers: 2
 auth: enforce
 park_timeout: 2s
-mmds_listen: $PROXY_NS_IP:$MMDS_PORT
+mmds:
+  enabled: true
+  listen: $PROXY_NS_IP:$MMDS_PORT
 metrics_listen: 127.0.0.1:$METRICS_PORT
 EOF
 "$BIN/node-ctl" proxy serve --config "$WORK/proxy.yaml" >"$WORK/proxy.log" 2>&1 &
@@ -327,7 +329,7 @@ wait_port 127.0.0.1 "$PROXY_PORT" proxy
 wait_mmds_listener
 wait_proxy_workers_in_netns "$PROXY_MASTER_PID"
 echo "==> control plane up; proxy master registered on the config-socket plugin plane"
-echo "==> PASS: external proxy workers and mmds_listen are in proxy_netns=$PROXY_NETNS"
+echo "==> PASS: external proxy workers and mmds.listen are in proxy_netns=$PROXY_NETNS"
 
 # ---- build a ready e2b template (native v3) --------------------------------
 code=$(req POST /v3/templates "$AK" '{"name":"proxy-tmpl"}')

@@ -206,7 +206,7 @@ node-ctl proxy serve --config /etc/node-ctl/proxy.yaml
 ```
 
 策略与端点(`config_socket`/`data_listen`/`proxy_netns`/`proxy_socket`/`shm_path`/`workers`/`tls`/
-`auth`/`park_timeout`/`mmds_listen`)在 `proxy.yaml`;master 在 plugin 平面注册一次,
+`auth`/`park_timeout`/`mmds.listen`)在 `proxy.yaml`;master 在 plugin 平面注册一次,
 维护共享路由视图并把 listener fd 传给 worker。部署模式与拓扑见
 node-proxy.md §2、§5——转发层自成一文,本仓控制面只在 §9 讲如何按 `proxy.mode` 装配它。
 

@@ -157,7 +157,7 @@ checkpoint:
 #   enabled — envd runs in FC mode and is re-keyed to a fresh per-identity token at /init
 #     via a Firecracker MMDS v2 service hosted in the proxy component. The vswitch
 #     translates the metadata VIP to the listener (connector-ctl vswitch start --mgmt-service ...).
-#     Requires proxy.mode != off; external mode serves it from proxy.yaml mmds_listen.
+#     Requires proxy.mode != off; external mode serves it from proxy.yaml mmds.listen.
 # mmds:
 #   enabled: false
 #   listen: 127.0.0.1:19254

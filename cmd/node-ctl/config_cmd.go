@@ -230,7 +230,7 @@ const proxyConfigSkeleton = `# node-ctl proxy master config — node-ctl proxy s
 # read a shared-memory route table.
 config_socket: /run/sandbox/node-ctl.socket      # serve's control socket (= serve paths.config_socket)
 data_listen: ":443"                              # master-bound ingress passed to workers; "" = UDS-only proxyForwarder
-# proxy_netns: sw0_mgmt                          # forwarding netns for workers' floatingip dials + mmds_listen; "" = current netns
+# proxy_netns: sw0_mgmt                          # forwarding netns for workers' floatingip dials + mmds.listen; "" = current netns
 proxy_socket: /run/sandbox/proxy.sock            # UDS registered for conductor proxyForwarder
 shm_path: /run/sandbox/proxy-routes.shm           # shared route table path
 route_capacity: 65536                            # fixed route slots
@@ -238,6 +238,8 @@ workers: 2                                       # worker processes supervised b
 tls: { cert: /etc/node-ctl/tls/fullchain.pem, key: /etc/node-ctl/tls/privkey.pem }   # = serve's wildcard cert; omit = h2c
 auth: enforce                                    # bootstrap fallback until serve pushes policy: off | log | enforce
 park_timeout: 30s                                # bootstrap fallback
-# mmds_listen: 127.0.0.1:19254                    # FC MMDS addr workers share when serve has mmds.enabled
+# mmds:
+#   enabled: true
+#   listen: 127.0.0.1:19254                       # FC MMDS addr workers share when serve has mmds.enabled
 # metrics_listen: 127.0.0.1:9095                  # master metrics endpoint (aggregates worker counters)
 `

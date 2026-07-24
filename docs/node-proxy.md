@@ -53,7 +53,7 @@ master 内部 reexec 当前 `node-ctl` 二进制启动 worker;内部 worker 模�
 |---|---|---|
 | `config_socket` | `/run/sandbox/node-ctl.socket` | conductor config-socket;master 在 plugin 平面注册并同步路由 |
 | `data_listen` | 空 | 数据面入口;空 = 只接受 conductor proxyForwarder 兜底 UDS |
-| `proxy_netns` | 空 | 转发平面 netns;空 = 当前 netns。非空时 external worker 在该 netns 内运行,`mmds_listen` 也在该 netns 绑定;`data_listen` 仍在 master 当前 netns |
+| `proxy_netns` | 空 | 转发平面 netns;空 = 当前 netns。非空时 external worker 在该 netns 内运行,`mmds.listen` 也在该 netns 绑定;`data_listen` 仍在 master 当前 netns |
 | `proxy_socket` | `<dir(config_socket)>/proxy.sock` | master 注册给 conductor proxyForwarder 的 UDS |
 | `shm_path` | `<dir(config_socket)>/proxy-routes.shm` | 共享路由表 mmap 文件 |
 | `route_capacity` | `65536` | 固定路由槽位数;满时新路由写入失败并告警 |
@@ -61,7 +61,8 @@ master 内部 reexec 当前 `node-ctl` 二进制启动 worker;内部 worker 模�
 | `tls` | 空 | 数据面 TLS `{cert,key}`;空 = h2c |
 | `auth` | `enforce` | routesync policy 到达前的数据面鉴权回退值 |
 | `park_timeout` | `30s` | routesync policy 到达前的 park 回退值 |
-| `mmds_listen` | 空 | external MMDS 监听;空 = 不启动 MMDS |
+| `mmds.enabled` | `false` | 是否启用 external MMDS 服务；关闭时不绑定 `mmds.listen` |
+| `mmds.listen` | `127.0.0.1:19254` | external MMDS 监听地址；仅在 `mmds.enabled=true` 时生效 |
 | `metrics_listen` | 空 | master Prometheus 文本端点,聚合 worker 数据面计数 |
 
 ## 3. 部署模式
@@ -183,7 +184,7 @@ proxy 逐请求常数时间比较请求 token 与 route 中的 `access_token`。
 
 `mmds.enabled=true` 时,envd 在 FC 模式下通过 Firecracker MMDS v2 获取当前身份的
 access-token hash。internal 模式由 conductor 进程内服务;external 模式由 proxy
-worker 层服务。配置 `proxy_netns` 时,`mmds.listen` / `mmds_listen` 在该 netns 绑定;
+worker 层服务。配置 `proxy_netns` 时,`mmds.listen` 在该 netns 绑定;
 external 模式由 master 绑定后把同一个 listener fd 传给所有 worker。
 
 ```text
@@ -191,7 +192,7 @@ guest envd
   │ 169.254.169.254:80
   ▼
 connector mgmt-extract
-  │ mmds_listen
+  │ mmds.listen
   ▼
 proxy worker ─► shared route view
 ```

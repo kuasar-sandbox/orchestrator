@@ -267,7 +267,7 @@ type ProxyConfig struct {
 // to a fresh per-identity value at /init — required for snapshot-fork data-plane auth.
 // enabled=false keeps envd in -isnotfc (non-secure); the proxy then enforces
 // X-Access-Token as the sole gate. The MMDS is hosted by the proxy component
-// (internal: serve binds Listen; external: proxy workers share the master's mmds_listen fd). envd
+// (internal: serve binds Listen; external: proxy workers share the master's mmds.listen fd). envd
 // hard-codes 169.254.169.254:80, so the vswitch's --mgmt-service translates that VIP to
 // Listen in its datapath (no iptables); a loopback Listen needs route_localnet=1 on the
 // mgmt dev.

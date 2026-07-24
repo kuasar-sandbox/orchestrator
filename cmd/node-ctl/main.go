@@ -326,7 +326,7 @@ func runConductor(args []string, log *slog.Logger) error {
 	// MMDS metadata service (mmds.enabled): re-keys envd (launched in FC mode) to fresh
 	// per-identity tokens at /init. Internal mode serves it here from the orchestrator's
 	// live sandbox set; external mode's proxy workers serve it from the shared
-	// route table on the master's mmds_listen. The host must redirect
+	// route table on the master's mmds.listen. The host must redirect
 	// 169.254.169.254:80 -> mmds.listen.
 	if cfg.MMDS.Enabled && cfg.Proxy.Mode == config.ProxyInternal {
 		mln, err := listenTCPInNetNS(proxyNS, cfg.MMDS.Listen)

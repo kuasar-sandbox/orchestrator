@@ -75,7 +75,7 @@ func TestCreateRejectsMalformedMMDSBeforeLaunch(t *testing.T) {
 // persisted (created while it was true): RangeMmds/SubscribeMmds must not
 // expose those rows to an external proxy master's sync stream — a
 // subscriber's own local inference of "enabled" (e.g. a proxy master that
-// only checks whether mmds_listen is configured) must never be able to
+// only checks whether mmds.listen is configured) must never be able to
 // reactivate historical ciphertext the conductor itself now considers off.
 func TestRangeMmdsIgnoresPersistedEndpointsWhenDisabled(t *testing.T) {
 	cfg := &config.Config{}

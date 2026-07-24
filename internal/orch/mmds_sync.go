@@ -51,7 +51,7 @@ func (o *Orchestrator) MmdsGeneration() string {
 // A disabled node policy (mmds.endpoints.enabled=false) streams nothing,
 // regardless of what sandbox_mmds_endpoints still holds from before the
 // feature was disabled — a subscriber's own local config (e.g. a proxy
-// master inferring "enabled" only from whether mmds_listen is set) must
+// master inferring "enabled" only from whether mmds.listen is set) must
 // never be the thing that decides whether historical ciphertext gets synced
 // into external process memory; the conductor's own flag is authoritative
 // and always wins.
