@@ -101,11 +101,17 @@ func (o *Orchestrator) ExportSandbox(ctx context.Context, apiKey, sid string, to
 		return "", err
 	}
 	if !keepSource {
+		// Snapshot before Delete's cascading FK removes the rows out from
+		// under us — mirrors Kill's identical snapshot in orch.go. This is a
+		// second sandbox-row-delete site outside Kill, so it needs the same
+		// MMDS endpoint cleanup Kill does.
+		mmdsEndpoints, _ := o.st.ListMMDSEndpointStatus(ctx, sid)
 		if err := o.st.Delete(ctx, sid); err != nil { // move: remote snapshot persists
 			return "", fmt.Errorf("export-sandbox: delete source %s: %w", sid, err)
 		}
 		o.uncache(sid)
 		o.publishDelete(sid)
+		o.releaseMmdsEndpoints(sid, mmdsEndpoints)
 	}
 	return tok, nil
 }

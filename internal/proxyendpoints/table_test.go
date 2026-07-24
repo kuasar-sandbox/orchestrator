@@ -99,6 +99,81 @@ func TestEqualRevisionMismatchForcesResync(t *testing.T) {
 	}
 }
 
+// TestMmdsBookmarkForgetsRelayStateForSandboxesDroppedFromNewGeneration
+// covers the gap ApplyMmdsDelete's own ForgetSandbox hook cannot: a sandbox
+// deleted while this table was disconnected generates no individual delete
+// event and is only ever discovered missing when the next full generation
+// completes — MmdsBookmark's swap must reconcile the shared relay client's
+// limiter state itself in that case, forgetting only the sandbox that
+// actually dropped out, not one that merely changed shape across
+// generations.
+func TestMmdsBookmarkForgetsRelayStateForSandboxesDroppedFromNewGeneration(t *testing.T) {
+	relay := &fakeRelayForgetter{}
+	tb := New(relay, 0, testRuntime(time.Second), nil)
+	tb.BeginMmdsSync("gen-1")
+	tb.ApplyMmdsUpsert(routesync.MmdsEndpointEntry{SandboxID: "s1", Name: "a", Path: "/latest/a", BackendType: "relay"})
+	tb.ApplyMmdsUpsert(routesync.MmdsEndpointEntry{SandboxID: "s-gone", Name: "b", Path: "/latest/b", BackendType: "relay"})
+	tb.MmdsBookmark("gen-1")
+
+	// The second full generation still declares s1 (under a different
+	// endpoint name — the sandbox itself did not go away) but omits
+	// "s-gone" entirely, as if it were deleted while disconnected.
+	tb.BeginMmdsSync("gen-2")
+	tb.ApplyMmdsUpsert(routesync.MmdsEndpointEntry{SandboxID: "s1", Name: "a2", Path: "/latest/a2", BackendType: "relay"})
+	tb.MmdsBookmark("gen-2")
+
+	relay.mu.Lock()
+	forgotten := append([]string(nil), relay.forgotten...)
+	relay.mu.Unlock()
+	if len(forgotten) != 1 || forgotten[0] != "s-gone" {
+		t.Fatalf("ForgetSandbox calls = %v, want exactly [\"s-gone\"] (s1 is still live, just reshaped)", forgotten)
+	}
+}
+
+func TestDisconnectedForgetsRelayStateForEveryLiveSandbox(t *testing.T) {
+	relay := &fakeRelayForgetter{}
+	tb := New(relay, 0, testRuntime(time.Second), nil)
+	tb.BeginMmdsSync("gen-1")
+	tb.ApplyMmdsUpsert(routesync.MmdsEndpointEntry{SandboxID: "s1", Name: "a", Path: "/latest/a", BackendType: "relay"})
+	tb.ApplyMmdsUpsert(routesync.MmdsEndpointEntry{SandboxID: "s2", Name: "b", Path: "/latest/b", BackendType: "relay"})
+	tb.MmdsBookmark("gen-1")
+
+	tb.Disconnected()
+
+	relay.mu.Lock()
+	forgotten := map[string]bool{}
+	for _, sid := range relay.forgotten {
+		forgotten[sid] = true
+	}
+	relay.mu.Unlock()
+	if !forgotten["s1"] || !forgotten["s2"] || len(forgotten) != 2 {
+		t.Fatalf("ForgetSandbox calls = %v, want exactly {s1, s2}", relay.forgotten)
+	}
+}
+
+func TestEqualRevisionMismatchForgetsRelayStateForEveryLiveSandbox(t *testing.T) {
+	relay := &fakeRelayForgetter{}
+	tb := New(relay, 0, testRuntime(time.Second), nil)
+	tb.BeginMmdsSync("gen-1")
+	tb.ApplyMmdsUpsert(routesync.MmdsEndpointEntry{SandboxID: "s1", Name: "a", Path: "/latest/a", BackendType: "relay", Revision: 1, ContentType: "text/plain"})
+	tb.ApplyMmdsUpsert(routesync.MmdsEndpointEntry{SandboxID: "s2", Name: "b", Path: "/latest/b", BackendType: "relay"})
+	tb.MmdsBookmark("gen-1")
+
+	// Same revision, different payload on s1/a — a protocol error that
+	// force-resyncs (clears) the entire live table, not just s1's entry.
+	tb.ApplyMmdsUpsert(routesync.MmdsEndpointEntry{SandboxID: "s1", Name: "a", Path: "/latest/a", BackendType: "relay", Revision: 1, ContentType: "application/json"})
+
+	relay.mu.Lock()
+	forgotten := map[string]bool{}
+	for _, sid := range relay.forgotten {
+		forgotten[sid] = true
+	}
+	relay.mu.Unlock()
+	if !forgotten["s1"] || !forgotten["s2"] || len(forgotten) != 2 {
+		t.Fatalf("ForgetSandbox calls = %v, want exactly {s1, s2} (the whole live table was force-cleared)", relay.forgotten)
+	}
+}
+
 func TestLowerRevisionIgnored(t *testing.T) {
 	tb := New(nil, 0, testRuntime(time.Second), nil)
 	tb.BeginMmdsSync("gen-1")
@@ -122,6 +197,47 @@ func TestApplyMmdsDeleteRemovesEntry(t *testing.T) {
 	tb.ApplyMmdsDelete(routesync.MmdsEndpointKey{SandboxID: "s1", Name: "a"})
 	if _, _, found, _ := tb.Lookup(context.Background(), "s1", "/latest/a"); found {
 		t.Fatal("Lookup found an entry after ApplyMmdsDelete")
+	}
+}
+
+// fakeRelayForgetter extends fakeRelayFetcher with ForgetSandbox, so tests
+// can observe whether ApplyMmdsDelete asserts for and calls it — mirroring
+// the interface *mmdsrelay.Client actually implements in production, which
+// relayFetcher alone (Fetch-only) does not expose.
+type fakeRelayForgetter struct {
+	fakeRelayFetcher
+	mu        sync.Mutex
+	forgotten []string
+}
+
+func (f *fakeRelayForgetter) ForgetSandbox(sandboxID string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.forgotten = append(f.forgotten, sandboxID)
+}
+
+func TestApplyMmdsDeleteForgetsRelayStateOnceSandboxIsEmptied(t *testing.T) {
+	relay := &fakeRelayForgetter{}
+	tb := New(relay, 0, testRuntime(time.Second), nil)
+	tb.BeginMmdsSync("gen-1")
+	tb.ApplyMmdsUpsert(routesync.MmdsEndpointEntry{SandboxID: "s1", Name: "a", Path: "/latest/a", BackendType: "relay"})
+	tb.ApplyMmdsUpsert(routesync.MmdsEndpointEntry{SandboxID: "s1", Name: "b", Path: "/latest/b", BackendType: "relay"})
+	tb.MmdsBookmark("gen-1")
+
+	tb.ApplyMmdsDelete(routesync.MmdsEndpointKey{SandboxID: "s1", Name: "a"})
+	relay.mu.Lock()
+	forgottenAfterFirst := len(relay.forgotten)
+	relay.mu.Unlock()
+	if forgottenAfterFirst != 0 {
+		t.Fatalf("ForgetSandbox called after deleting one of two sibling endpoints; want it deferred until the sandbox has none left")
+	}
+
+	tb.ApplyMmdsDelete(routesync.MmdsEndpointKey{SandboxID: "s1", Name: "b"})
+	relay.mu.Lock()
+	forgotten := append([]string(nil), relay.forgotten...)
+	relay.mu.Unlock()
+	if len(forgotten) != 1 || forgotten[0] != "s1" {
+		t.Fatalf("ForgetSandbox calls = %v, want exactly [\"s1\"] once the sandbox's last entry was deleted", forgotten)
 	}
 }
 

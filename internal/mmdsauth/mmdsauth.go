@@ -12,6 +12,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -259,3 +260,25 @@ func (a *Authority) watch(parent context.Context, sandboxID, name string) (conte
 }
 
 func waitKey(sandboxID, name string) string { return sandboxID + "\x00" + name }
+
+// ForgetSandbox releases every waiter entry for sandboxID. waiters is
+// otherwise only ever pruned by Notify — which requires a future admin
+// mutation on the exact same (sandboxID,name) to fire — so a deleted
+// sandbox's entries (created by any wait()/watch() call, not only ones that
+// actually parked) would otherwise persist in this map for the rest of the
+// process's lifetime, since no admin mutation can ever target a deleted
+// sandbox again. Callers must invoke this once a sandbox is permanently
+// gone (see orch.Kill). Any goroutine still parked in wait()/watch() for
+// sandboxID (this should not normally happen — Kill only proceeds after
+// teardown) is woken immediately rather than left to time out.
+func (a *Authority) ForgetSandbox(sandboxID string) {
+	prefix := sandboxID + "\x00"
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for key, ch := range a.waiters {
+		if strings.HasPrefix(key, prefix) {
+			close(ch)
+			delete(a.waiters, key)
+		}
+	}
+}

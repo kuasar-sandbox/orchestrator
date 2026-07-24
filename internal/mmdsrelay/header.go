@@ -31,9 +31,13 @@ var deniedHeaderNames = map[string]bool{
 	"via":                 true,
 }
 
-// validAuthHeaderName reports whether name is a syntactically valid HTTP
-// field name and not one of the denied transport/routing headers.
-func validAuthHeaderName(name string) bool {
+// ValidAuthHeaderName reports whether name is a syntactically valid HTTP
+// field name and not one of the denied transport/routing headers. Exported
+// so mmdscfg can reject an invalid backend.auth.header_name at Create time
+// with the exact same rule Fetch enforces at request time — otherwise a
+// declaration that will always be rejected here (and so always fetch as a
+// permanent 502) would be silently accepted at Create.
+func ValidAuthHeaderName(name string) bool {
 	if name == "" || !tokenRE.MatchString(name) {
 		return false
 	}

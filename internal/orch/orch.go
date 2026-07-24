@@ -83,7 +83,8 @@ type Orchestrator struct {
 	clusterBuilds  map[string]*clusterBuild   // build_id -> transient cluster image-pull creds (§7.5)
 	buildEvents    chan *routesync.BuildEvent // node -> registry build state, drained by the node-link client
 
-	mmdsAuth *mmdsauth.Authority // internal-mode MMDS endpoint authority
+	mmdsAuth  *mmdsauth.Authority // internal-mode MMDS endpoint authority
+	mmdsRelay *mmdsrelay.Client   // nil when mmds.endpoints.enabled=false; shared node-wide, keyed by (sandbox_id,name)
 
 	mmdsSubsMu sync.Mutex
 	mmdsSubs   map[int]chan routesync.MmdsEvent // external-mode MMDS endpoint sync subscribers (routesync.MmdsSource)
@@ -147,6 +148,7 @@ func New(cfg *config.Config, st *store.Store, lc launcher.Launcher, vs vsClient,
 			MaxInflightPerKey:    cfg.MMDS.Endpoints.MaxRelayInflightPerSandbox,
 			MaxRequestsPerSecond: float64(cfg.MMDS.Endpoints.MaxRelayRequestsPerSecond),
 		}, mx)
+		o.mmdsRelay = relayClient
 		o.mmdsAuth = mmdsauth.New(st, relayClient, cfg.MMDS.Endpoints.ValueWaitTimeoutDur(), mx)
 	} else {
 		o.mmdsAuth = mmdsauth.New(st, nil, cfg.MMDS.Endpoints.ValueWaitTimeoutDur(), mx)
@@ -467,9 +469,7 @@ func (o *Orchestrator) Kill(ctx context.Context, id, apiKey string) (bool, error
 	_ = o.st.Delete(ctx, id)
 	o.uncache(id)
 	o.publishDelete(id) // tell external proxies the route is gone
-	for _, ep := range mmdsEndpoints {
-		o.publishMmdsDelete(id, ep.Name)
-	}
+	o.releaseMmdsEndpoints(id, mmdsEndpoints)
 	return true, nil
 }
 

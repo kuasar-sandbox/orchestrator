@@ -23,6 +23,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -151,6 +152,23 @@ func (c *Client) limiterFor(key string) *keyLimiter {
 	return l
 }
 
+// ForgetSandbox evicts every limiter keyed under sandboxID (the
+// sandboxID+"\x00"+name convention Fetch's key parameter follows). limiters
+// is otherwise never pruned — entries persist for the life of the process —
+// so callers must invoke this once a sandbox is permanently gone (e.g. from
+// Kill, or an external-mode endpoint table dropping the sandbox's last
+// entry) or this node-wide map grows without bound as sandboxes churn.
+func (c *Client) ForgetSandbox(sandboxID string) {
+	prefix := sandboxID + "\x00"
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for key := range c.limiters {
+		if strings.HasPrefix(key, prefix) {
+			delete(c.limiters, key)
+		}
+	}
+}
+
 // Fetch performs one SSRF-hardened GET to rawURL, injecting headerValue
 // under headerName only after URL/DNS/peer/header-name validation succeeds.
 // key scopes rate limiting and inflight concurrency — the caller passes
@@ -178,7 +196,7 @@ func (c *Client) Fetch(ctx context.Context, key, rawURL, headerName, headerValue
 	}
 	defer release()
 
-	if !validAuthHeaderName(headerName) {
+	if !ValidAuthHeaderName(headerName) {
 		return Result{Status: http.StatusBadGateway}
 	}
 
@@ -239,7 +257,8 @@ func (c *Client) doFetch(ctx context.Context, u *url.URL, host, port string, pin
 			// header) — a TOCTOU defense against resolution changing
 			// between validation and connect.
 			remoteHost, _, serr := net.SplitHostPort(conn.RemoteAddr().String())
-			if serr != nil || net.ParseIP(remoteHost) == nil || !net.ParseIP(remoteHost).Equal(pinned) {
+			remoteIP := net.ParseIP(remoteHost)
+			if serr != nil || remoteIP == nil || !remoteIP.Equal(pinned) {
 				conn.Close()
 				return nil, errors.New("mmdsrelay: connected peer does not match the pinned IP")
 			}

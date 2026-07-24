@@ -201,6 +201,25 @@ endpoints:
 	}
 }
 
+// TestExtractRejectsDeniedRelayAuthHeaderName covers the gap where Extract
+// used to accept a syntactically-valid but semantically-denied
+// header_name (e.g. "Host") — mmdsrelay.Client.Fetch rejects it via the
+// same deny-list at request time, so a declaration Extract let through
+// would always 502. header_name must be validated against the exact same
+// rule mmdsrelay enforces so a bad declaration fails Create outright,
+// matching every other endpoint validation rule.
+func TestExtractRejectsDeniedRelayAuthHeaderName(t *testing.T) {
+	denied := []string{"Host", "host", "Transfer-Encoding", "Content-Length", "X-Forwarded-For", "Proxy-Authorization"}
+	for _, hn := range denied {
+		t.Run(hn, func(t *testing.T) {
+			raw := "endpoints:\n  - name: a\n    path: /latest/a\n    backend:\n      type: relay\n      url: https://example.com\n      auth:\n        header_name: " + hn + "\n"
+			if _, _, err := Extract(map[string]string{Ns: raw}, testLimits()); err == nil {
+				t.Fatalf("Extract accepted denied header_name %q, want a validation error", hn)
+			}
+		})
+	}
+}
+
 func TestExtractPathValidationMatrix(t *testing.T) {
 	base := func(path string) string {
 		return "endpoints:\n  - name: a\n    path: " + path + "\n    backend:\n      type: store\n"

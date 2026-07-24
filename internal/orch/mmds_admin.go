@@ -22,6 +22,29 @@ import (
 // is parked must wake it immediately, not just on timeout.
 func (o *Orchestrator) MMDSAuthority() *mmdsauth.Authority { return o.mmdsAuth }
 
+// releaseMmdsEndpoints tells external proxies that sandboxID's declared MMDS
+// endpoints are gone and releases their (sandbox_id,name) state from
+// mmdsAuth/mmdsRelay — the common cleanup every sandbox-row-delete site
+// (Kill, ExportSandbox's move path) needs once sandboxID's
+// sandbox_mmds_endpoints rows are gone for good (via FK cascade): without
+// the publish, an external proxy's cached secret plaintext for this
+// sandbox_id only gets swept on some later, unrelated full resync; without
+// the release, sandboxID can never again receive the admin mutation that
+// would otherwise be the only thing able to free it from those two
+// node-wide, otherwise-unpruned maps. mmdsEndpoints is the endpoint list
+// snapshotted before the delete (nothing is left to list afterward).
+func (o *Orchestrator) releaseMmdsEndpoints(sandboxID string, mmdsEndpoints []store.MMDSEndpointStatus) {
+	for _, ep := range mmdsEndpoints {
+		o.publishMmdsDelete(sandboxID, ep.Name)
+	}
+	if len(mmdsEndpoints) > 0 {
+		o.mmdsAuth.ForgetSandbox(sandboxID)
+		if o.mmdsRelay != nil {
+			o.mmdsRelay.ForgetSandbox(sandboxID)
+		}
+	}
+}
+
 func (o *Orchestrator) SetMMDSStoreValue(ctx context.Context, sid, name string, value []byte, contentType string, expiresUnix int64) (int64, error) {
 	revision, err := o.st.SetMMDSStoreValue(ctx, sid, name, value, contentType, expiresUnix)
 	err = mapMMDSAdminErr(err)

@@ -148,12 +148,14 @@ func (t *Table) BeginMmdsSync(generation string) {
 func (t *Table) Disconnected() {
 	t.mu.Lock()
 	cleared := t.countLocked(t.live)
+	oldSandboxes := sandboxIDSet(t.live)
 	t.available = false
 	t.live = map[string]map[string]routesync.MmdsEndpointEntry{}
 	t.staging = nil
 	t.stagingGen = ""
 	t.mu.Unlock()
 	t.notifyAll()
+	t.forgetRelayForSandboxes(oldSandboxes, nil)
 	t.mx.Inc("mmds_sync_disconnected_total")
 	for i := 0; i < cleared; i++ {
 		t.mx.Inc("mmds_cache_entries_completed_total")
@@ -202,11 +204,12 @@ func (t *Table) ApplyMmdsUpsert(e routesync.MmdsEndpointEntry) {
 			return // stale
 		}
 		if e.Revision == existing.Revision && !mmdsEntryEqual(existing, e) {
-			cleared := t.forceResyncLocked()
+			cleared, oldSandboxes := t.forceResyncLocked()
 			t.mu.Unlock()
 			for i := 0; i < cleared; i++ {
 				t.mx.Inc("mmds_cache_entries_completed_total")
 			}
+			t.forgetRelayForSandboxes(oldSandboxes, nil)
 			return
 		}
 	} else if t.maxTotal > 0 && t.countLocked(target) >= t.maxTotal {
@@ -235,6 +238,15 @@ func (t *Table) ApplyMmdsUpsert(e routesync.MmdsEndpointEntry) {
 	}
 }
 
+// relayForgetter is an optional extension of relayFetcher — implemented by
+// *mmdsrelay.Client to evict the rate/inflight limiter state it otherwise
+// keeps forever for every (sandbox_id,name) it has ever fetched. Asserted
+// for rather than folded into relayFetcher itself so relayFetcher test
+// stubs need not implement it.
+type relayForgetter interface {
+	ForgetSandbox(sandboxID string)
+}
+
 // ApplyMmdsDelete removes one endpoint from whichever table is active.
 func (t *Table) ApplyMmdsDelete(k routesync.MmdsEndpointKey) {
 	t.mu.Lock()
@@ -243,6 +255,7 @@ func (t *Table) ApplyMmdsDelete(k routesync.MmdsEndpointKey) {
 		target = t.staging
 	}
 	deleted := false
+	sandboxEmptied := false
 	if byName, ok := target[k.SandboxID]; ok {
 		if _, ok := byName[k.Name]; ok {
 			deleted = true
@@ -250,6 +263,7 @@ func (t *Table) ApplyMmdsDelete(k routesync.MmdsEndpointKey) {
 		delete(byName, k.Name)
 		if len(byName) == 0 {
 			delete(target, k.SandboxID)
+			sandboxEmptied = true
 		}
 	}
 	live := t.staging == nil
@@ -259,6 +273,52 @@ func (t *Table) ApplyMmdsDelete(k routesync.MmdsEndpointKey) {
 	}
 	if live {
 		t.notify(k.SandboxID, k.Name)
+		// Only once the sandbox has no remaining live entries — deleting one
+		// of several declared endpoints must not evict limiter state a
+		// sibling endpoint on the same sandbox still needs.
+		if sandboxEmptied {
+			t.forgetRelayForOneSandbox(k.SandboxID)
+		}
+	}
+}
+
+// forgetRelayForOneSandbox evicts the shared relay client's rate/inflight
+// limiter state for sandboxID, if the configured relay implements
+// relayForgetter (only *mmdsrelay.Client does in production; test stubs need
+// not). Safe to call with a nil t.relay (relay-backend endpoints disabled).
+func (t *Table) forgetRelayForOneSandbox(sandboxID string) {
+	if f, ok := t.relay.(relayForgetter); ok {
+		f.ForgetSandbox(sandboxID)
+	}
+}
+
+// sandboxIDSet snapshots m's sandbox_id keys into an independent set. The
+// caller takes this snapshot while still holding t.mu and reads it only
+// after releasing the lock (see forgetRelayForSandboxes) — it must never
+// alias a live/staging map field itself, which a concurrent Table method
+// can mutate the moment t.mu is released.
+func sandboxIDSet(m map[string]map[string]routesync.MmdsEndpointEntry) map[string]struct{} {
+	out := make(map[string]struct{}, len(m))
+	for sid := range m {
+		out[sid] = struct{}{}
+	}
+	return out
+}
+
+// forgetRelayForSandboxes calls forgetRelayForOneSandbox for every sandboxID
+// in before but not in after — used wherever a full-generation swap or clear
+// drops sandboxes in bulk without an individual ApplyMmdsDelete per endpoint
+// (Disconnected, MmdsBookmark, forceResyncLocked's caller): those sandboxes
+// can never generate that per-entry delete event, so without this their
+// relay limiter state would persist in the shared, otherwise-never-pruned
+// mmdsrelay.Client.limiters map for the rest of the process's lifetime.
+// before/after must be sandboxIDSet snapshots, not the live/staging maps
+// themselves — this always runs after t.mu has been released.
+func (t *Table) forgetRelayForSandboxes(before, after map[string]struct{}) {
+	for sid := range before {
+		if _, stillLive := after[sid]; !stillLive {
+			t.forgetRelayForOneSandbox(sid)
+		}
 	}
 }
 
@@ -269,8 +329,10 @@ func (t *Table) ApplyMmdsDelete(k routesync.MmdsEndpointKey) {
 func (t *Table) MmdsBookmark(generation string) {
 	t.mu.Lock()
 	var oldCount, newCount int
+	var oldSandboxes, newSandboxes map[string]struct{}
 	swapped := t.staging != nil && t.stagingGen == generation
 	if swapped {
+		oldSandboxes, newSandboxes = sandboxIDSet(t.live), sandboxIDSet(t.staging)
 		oldCount, newCount = t.countLocked(t.live), t.countLocked(t.staging)
 		t.live = t.staging
 		t.staging = nil
@@ -291,6 +353,12 @@ func (t *Table) MmdsBookmark(generation string) {
 		for i := 0; i < newCount; i++ {
 			t.mx.Inc("mmds_cache_entries_started_total")
 		}
+		// A sandbox declared in the old generation but not re-declared in
+		// this one (e.g. deleted while this table was disconnected, so no
+		// individual ApplyMmdsDelete for it was ever delivered) needs its
+		// relay limiter state released here — this is the only place that
+		// ever observes its absence.
+		t.forgetRelayForSandboxes(oldSandboxes, newSandboxes)
 	}
 	t.notifyAll() // every waiter re-checks now that the table may be available
 }
@@ -299,14 +367,18 @@ func (t *Table) MmdsBookmark(generation string) {
 // clears both live and any in-progress staging and marks the table
 // unavailable, so every request 503s until the next full generation
 // completes. Caller must hold t.mu. Returns the live entry count cleared,
-// for the caller to report as completed after unlocking.
-func (t *Table) forceResyncLocked() (clearedLive int) {
+// for the caller to report as completed after unlocking, and an independent
+// snapshot of the cleared live set's sandbox_id keys, for the caller to
+// reconcile relay limiter state against (see forgetRelayForSandboxes) —
+// also after unlocking.
+func (t *Table) forceResyncLocked() (clearedLive int, oldSandboxes map[string]struct{}) {
 	clearedLive = t.countLocked(t.live)
+	oldSandboxes = sandboxIDSet(t.live)
 	t.available = false
 	t.live = map[string]map[string]routesync.MmdsEndpointEntry{}
 	t.staging = nil
 	t.stagingGen = ""
-	return clearedLive
+	return clearedLive, oldSandboxes
 }
 
 func (t *Table) countLocked(m map[string]map[string]routesync.MmdsEndpointEntry) int {

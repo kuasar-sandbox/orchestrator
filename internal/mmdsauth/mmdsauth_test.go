@@ -323,3 +323,68 @@ func TestServeRelayCancelsInFlightFetchOnAuthNotify(t *testing.T) {
 		t.Fatal("ServeRelay did not cancel its in-flight Fetch after Notify")
 	}
 }
+
+func TestForgetSandboxReleasesWaiters(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	sb := testSandbox("sb-forget")
+	endpointWithRelayConfig(t, st, sb, "a", "https://example.com/", "X-Auth")
+	if _, err := st.SetMMDSRelayAuth(ctx, sb.ID, "a", []byte("secret")); err != nil {
+		t.Fatal(err)
+	}
+
+	fake := &fakeRelayFetcher{result: mmdsrelay.Result{Status: 200}}
+	a := New(st, fake, 2*time.Second, nil)
+
+	// A configured (revision>0, present=true) ServeRelay call never waits,
+	// but it still unconditionally calls watch() — which, before
+	// ForgetSandbox existed, left a permanent entry in a.waiters with no
+	// other way to ever remove it once the sandbox is gone.
+	if _, _, _, ok, err := a.ServeRelay(ctx, sb.ID, "a"); err != nil || !ok {
+		t.Fatalf("ServeRelay = ok=%t err=%v", ok, err)
+	}
+
+	a.mu.Lock()
+	_, present := a.waiters[waitKey(sb.ID, "a")]
+	a.mu.Unlock()
+	if !present {
+		t.Fatal("setup: expected ServeRelay's watch() to have left a waiters entry")
+	}
+
+	a.ForgetSandbox(sb.ID)
+
+	a.mu.Lock()
+	_, present = a.waiters[waitKey(sb.ID, "a")]
+	n := len(a.waiters)
+	a.mu.Unlock()
+	if present || n != 0 {
+		t.Fatalf("ForgetSandbox left %d waiters entries, want 0 (present=%t)", n, present)
+	}
+}
+
+func TestForgetSandboxWakesAParkedWaiter(t *testing.T) {
+	st := testStore(t)
+	sb := testSandbox("sb-forget-parked")
+	endpointWithRelayConfig(t, st, sb, "a", "https://example.com/", "X-Auth")
+
+	fake := &fakeRelayFetcher{}
+	a := New(st, fake, 2*time.Second, nil) // long timeout: only ForgetSandbox should end the wait
+
+	done := make(chan bool, 1)
+	go func() {
+		_, _, _, ok, _ := a.ServeRelay(context.Background(), sb.ID, "a")
+		done <- ok
+	}()
+
+	time.Sleep(50 * time.Millisecond) // let ServeRelay reach the never-configured wait
+	a.ForgetSandbox(sb.ID)
+
+	select {
+	case ok := <-done:
+		if ok {
+			t.Fatal("ServeRelay reported ok=true after ForgetSandbox; want the wait to end as not-found")
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("ForgetSandbox did not wake the parked ServeRelay call")
+	}
+}

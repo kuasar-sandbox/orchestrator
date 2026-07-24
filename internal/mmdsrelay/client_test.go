@@ -248,6 +248,73 @@ func TestFetchInflightCapRejectsOverLimit(t *testing.T) {
 	}
 }
 
+func TestForgetSandboxEvictsLimiterAndResetsItsBudget(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	cfg := testCfg()
+	cfg.MaxRequestsPerSecond = 1
+	c := newTestClient(t, cfg)
+	u := relayURLFor(t, srv, "/")
+	key := "sb-forget\x00rl-key" // sandboxID+"\x00"+name, the convention Fetch's key parameter follows
+
+	if res := c.fetchInsecureForTest(t, key, u, "X-Auth", "v"); res.Status != http.StatusOK {
+		t.Fatalf("first request Status = %d, want 200", res.Status)
+	}
+	if res := c.fetchInsecureForTest(t, key, u, "X-Auth", "v"); res.Status != http.StatusTooManyRequests {
+		t.Fatalf("second immediate request Status = %d, want 429 (rate limited)", res.Status)
+	}
+
+	c.mu.Lock()
+	n := len(c.limiters)
+	c.mu.Unlock()
+	if n != 1 {
+		t.Fatalf("setup: got %d limiters, want 1", n)
+	}
+
+	c.ForgetSandbox("sb-forget")
+
+	c.mu.Lock()
+	n = len(c.limiters)
+	c.mu.Unlock()
+	if n != 0 {
+		t.Fatalf("ForgetSandbox left %d limiters, want 0", n)
+	}
+
+	// A fresh limiter is allocated on next use, so the rate budget is reset
+	// rather than still 429ing from the evicted limiter's exhausted tokens.
+	if res := c.fetchInsecureForTest(t, key, u, "X-Auth", "v"); res.Status != http.StatusOK {
+		t.Fatalf("request after ForgetSandbox Status = %d, want 200 (fresh limiter)", res.Status)
+	}
+}
+
+func TestForgetSandboxOnlyEvictsMatchingPrefix(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	c := newTestClient(t, testCfg())
+	u := relayURLFor(t, srv, "/")
+	c.fetchInsecureForTest(t, "sb-a\x00ep", u, "X-Auth", "v")
+	c.fetchInsecureForTest(t, "sb-ab\x00ep", u, "X-Auth", "v") // shares "sb-a" as a raw string prefix, but not as sid+"\x00"
+
+	c.ForgetSandbox("sb-a")
+
+	c.mu.Lock()
+	_, aGone := c.limiters["sb-a\x00ep"]
+	_, abStillThere := c.limiters["sb-ab\x00ep"]
+	c.mu.Unlock()
+	if aGone {
+		t.Fatal("ForgetSandbox(\"sb-a\") left sb-a's own limiter behind")
+	}
+	if !abStillThere {
+		t.Fatal("ForgetSandbox(\"sb-a\") evicted sb-ab's limiter too (prefix must include the \\x00 separator)")
+	}
+}
+
 func TestFetchRejectsIPLiteralURL(t *testing.T) {
 	c := New(testCfg(), nil)
 	res := c.Fetch(context.Background(), "k", "https://169.254.169.254/latest/creds", "X-Auth", "v")

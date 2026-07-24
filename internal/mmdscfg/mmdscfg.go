@@ -14,6 +14,7 @@ import (
 	"strings"
 
 	"github.com/kuasar-sandbox/orchestrator/internal/config"
+	"github.com/kuasar-sandbox/orchestrator/internal/mmdsrelay"
 	"gopkg.in/yaml.v3"
 )
 
@@ -55,9 +56,8 @@ type RelayAuthSpec struct {
 }
 
 var (
-	nameRE       = regexp.MustCompile(`^[a-z][a-z0-9_-]{0,62}$`)
-	pathSegRE    = regexp.MustCompile(`^[a-z0-9._-]+$`)
-	headerNameRE = regexp.MustCompile("^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
+	nameRE    = regexp.MustCompile(`^[a-z][a-z0-9_-]{0,62}$`)
+	pathSegRE = regexp.MustCompile(`^[a-z0-9._-]+$`)
 )
 
 // rawDoc / rawEndpoint mirror the YAML shape decoded with KnownFields(true) so
@@ -317,7 +317,7 @@ func parseRelayBackend(m map[string]any, limits config.MMDSEndpointsConfig) (Bac
 		return BackendSpec{}, fmt.Errorf("backend.auth.header_name is required")
 	}
 	hn, ok := hnRaw.(string)
-	if !ok || !headerNameRE.MatchString(hn) {
+	if !ok || !mmdsrelay.ValidAuthHeaderName(hn) {
 		return BackendSpec{}, fmt.Errorf("backend.auth.header_name %q is invalid", hnRaw)
 	}
 	return BackendSpec{Type: BackendRelay, URL: url, Auth: &RelayAuthSpec{HeaderName: hn}}, nil
