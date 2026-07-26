@@ -23,7 +23,7 @@ func TestClusterStoresRouteAndNodeUseLocatedOwners(t *testing.T) {
 	stores := cluster["a"]
 
 	group, routeKey := "/cluster/located/group", "rk"
-	if _, err := stores.PutSandbox(ctx, &SandboxRecord{Profile: "e2b", Group: group, RouteKey: routeKey, SID: "sb", State: StateReady}); err != nil {
+	if _, err := stores.PutSandbox(ctx, testSandboxIdentityRecord(group, routeKey, "sb", "n1", StateReady)); err != nil {
 		t.Fatalf("PutSandbox: %v", err)
 	}
 	routeOwners, err := view.Owners(group, 2)
@@ -46,9 +46,9 @@ func TestClusterStoresRouteAndNodeUseLocatedOwners(t *testing.T) {
 func TestSandboxRouteRequiresValidProfile(t *testing.T) {
 	stores := NewStores()
 	for _, profile := range []string{"", "other"} {
-		if _, err := stores.PutSandbox(context.Background(), &SandboxRecord{
-			Group: "/g", RouteKey: "rk", SID: "sb", State: StateReady, Profile: profile,
-		}); err == nil {
+		record := testSandboxIdentityRecord("/g", "rk", "sb", "n1", StateReady)
+		record.Profile = profile
+		if _, err := stores.PutSandbox(context.Background(), record); err == nil {
 			t.Fatalf("PutSandbox accepted profile %q", profile)
 		}
 	}
@@ -71,14 +71,12 @@ func TestNodeSandboxSnapshotsRejectInvalidCredentialFingerprint(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			ref := clusterstate.NodeSandboxRef{Profile: "e2b",
-				Group: "/g", RouteKey: "rk", SandboxID: "sb", APISecretFingerprint: fingerprint,
-			}
+			ref := testNodeSandboxRef("/g", "rk", "sb", "e2b", fingerprint)
 			value, err := clusterstate.EncodeShardValue(ref)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if _, ok, err := set.CAS(ctx, clusterstate.NodeSandboxRecordKey(ref.SandboxID), 0, value); err != nil || !ok {
+			if _, ok, err := set.CAS(ctx, clusterstate.NodeSandboxRecordKey(ref.NodeSandboxID), 0, value); err != nil || !ok {
 				t.Fatalf("seed invalid ref ok=%v err=%v", ok, err)
 			}
 			if _, _, err := stores.GetNode(ctx, nodeID); err == nil {
@@ -95,19 +93,13 @@ func TestNodeSandboxRefsRequireValidProfile(t *testing.T) {
 	ctx := context.Background()
 	stores := NewStores()
 	for _, profile := range []string{"", "unknown"} {
-		ref := clusterstate.NodeSandboxRef{
-			Group: "/g", RouteKey: "rk", SandboxID: "sb-" + profile,
-			Profile: profile, APISecretFingerprint: testAPIFingerprint,
-		}
+		ref := testNodeSandboxRef("/g", "rk", "sb-"+profile, profile, testAPIFingerprint)
 		if err := stores.AddNodeSandboxRef(ctx, "n1", ref); err == nil {
 			t.Fatalf("AddNodeSandboxRef accepted profile %q", profile)
 		}
 	}
 
-	e2b := clusterstate.NodeSandboxRef{
-		Group: "/g", RouteKey: "rk", SandboxID: "sb", Profile: "e2b",
-		APISecretFingerprint: testAPIFingerprint,
-	}
+	e2b := testNodeSandboxRef("/g", "rk", "sb", "e2b", testAPIFingerprint)
 	if err := stores.AddNodeSandboxRef(ctx, "n1", e2b); err != nil {
 		t.Fatal(err)
 	}
@@ -164,9 +156,7 @@ func TestNodeLinkShardRecordsAssembleNodeView(t *testing.T) {
 	if err := stores.putNodeProfileShard(ctx, node); err != nil {
 		t.Fatalf("putNodeProfileShard: %v", err)
 	}
-	if err := stores.addNodeSandboxRefShard(ctx, "n1", clusterstate.NodeSandboxRef{Profile: "e2b",
-		Group: "/g", RouteKey: "rk", SandboxID: "sb", APISecretFingerprint: testAPIFingerprint,
-	}); err != nil {
+	if err := stores.addNodeSandboxRefShard(ctx, "n1", testNodeSandboxRef("/g", "rk", "sb", "e2b", testAPIFingerprint)); err != nil {
 		t.Fatalf("addNodeSandboxRefShard: %v", err)
 	}
 	if err := stores.addNodeBuildRefShard(ctx, "n1", clusterstate.NodeBuildRef{Group: "/g", BuildID: "b1"}); err != nil {
@@ -232,9 +222,7 @@ func TestNodeReapClaimPreservesReconnectStateAcrossOwners(t *testing.T) {
 	ctx := context.Background()
 	cluster := newShardStoreCluster(t, []string{"a", "b", "c"}, 1, 3, 1, 3)
 	const nodeID = "node-reap-wins"
-	oldRef := clusterstate.NodeSandboxRef{Profile: "e2b",
-		Group: "/g", RouteKey: "rk", SandboxID: "sb", APISecretFingerprint: testAPIFingerprint,
-	}
+	oldRef := testNodeSandboxRef("/g", "rk", "sb", "e2b", testAPIFingerprint)
 	if err := cluster["a"].PutNode(ctx, &NodeRecord{
 		NodeID: nodeID, DataEndpoint: "old", LastHeartbeatUnix: time.Now().Add(-time.Hour).Unix(),
 		LinkOwner: "a", Sandboxes: []clusterstate.NodeSandboxRef{oldRef},
@@ -308,9 +296,7 @@ func TestNodeReapSnapshotDoesNotDeleteNewChildRevisions(t *testing.T) {
 	if err := stores.PutNode(ctx, &NodeRecord{NodeID: nodeID, LastHeartbeatUnix: time.Now().Add(-time.Hour).Unix()}); err != nil {
 		t.Fatal(err)
 	}
-	sandboxRef := clusterstate.NodeSandboxRef{Profile: "e2b",
-		Group: "/g", RouteKey: "rk", SandboxID: "sb", APISecretFingerprint: testAPIFingerprint,
-	}
+	sandboxRef := testNodeSandboxRef("/g", "rk", "sb", "e2b", testAPIFingerprint)
 	buildRef := clusterstate.NodeBuildRef{Group: "/g", BuildID: "build"}
 	pair := testNodeKeyPair(strings.Repeat("a", 64), strings.Repeat("b", 64), 100)
 	replacementSandboxRef := sandboxRef
@@ -336,7 +322,7 @@ func TestNodeReapSnapshotDoesNotDeleteNewChildRevisions(t *testing.T) {
 	if err != nil || !claimed {
 		t.Fatalf("claim=%v err=%v", claimed, err)
 	}
-	if err := stores.RemoveNodeSandboxRef(ctx, nodeID, sandboxRef.SandboxID); err != nil {
+	if err := stores.RemoveNodeSandboxRef(ctx, nodeID, sandboxRef.NodeSandboxID); err != nil {
 		t.Fatal(err)
 	}
 	if err := stores.AddNodeSandboxRef(ctx, nodeID, replacementSandboxRef); err != nil {
@@ -349,7 +335,7 @@ func TestNodeReapSnapshotDoesNotDeleteNewChildRevisions(t *testing.T) {
 	if err := stores.UpsertNodeKeyPair(ctx, nodeID, pair); err != nil {
 		t.Fatal(err)
 	}
-	if deleted, err := stores.removeNodeSandboxRefShardAtRevision(ctx, nodeID, sandboxRef.SandboxID, snapshot.Sandboxes[0].Revision); err != nil || deleted {
+	if deleted, err := stores.removeNodeSandboxRefShardAtRevision(ctx, nodeID, sandboxRef.NodeSandboxID, snapshot.Sandboxes[0].Revision); err != nil || deleted {
 		t.Fatalf("old sandbox cleanup deleted replacement: deleted=%v err=%v", deleted, err)
 	}
 	if deleted, err := stores.removeNodeBuildRefShardAtRevision(ctx, nodeID, buildRef.BuildID, snapshot.Builds[0].Revision); err != nil || deleted {
@@ -358,7 +344,7 @@ func TestNodeReapSnapshotDoesNotDeleteNewChildRevisions(t *testing.T) {
 	if deleted, err := stores.dropNodeKeyPairShardAtRevision(ctx, nodeID, pair.APISecretFingerprint, snapshot.KeyPairs[0].Revision); err != nil || deleted {
 		t.Fatalf("old key cleanup deleted replacement: deleted=%v err=%v", deleted, err)
 	}
-	if ref, found, err := stores.GetNodeSandboxRef(ctx, nodeID, sandboxRef.SandboxID); err != nil || !found ||
+	if ref, found, err := stores.GetNodeSandboxRef(ctx, nodeID, sandboxRef.NodeSandboxID); err != nil || !found ||
 		ref.APISecretFingerprint != replacementSandboxRef.APISecretFingerprint {
 		t.Fatalf("replacement sandbox ref=%+v found=%v err=%v", ref, found, err)
 	}
@@ -374,15 +360,11 @@ func TestNodeReapSnapshotDoesNotDeleteNewChildRevisions(t *testing.T) {
 func TestNodeObjectRefsAreScopedByNodeID(t *testing.T) {
 	ctx := context.Background()
 	stores := NewStores()
-	n1Ref := clusterstate.NodeSandboxRef{Profile: "e2b",
-		SandboxID: "same", Group: "/g1", RouteKey: "rk1", APISecretFingerprint: testAPIFingerprint,
-	}
+	n1Ref := testNodeSandboxRef("/g1", "rk1", "same", "e2b", testAPIFingerprint)
 	if err := stores.AddNodeSandboxRef(ctx, "n1", n1Ref); err != nil {
 		t.Fatal(err)
 	}
-	if err := stores.AddNodeSandboxRef(ctx, "n2", clusterstate.NodeSandboxRef{Profile: "e2b",
-		SandboxID: "same", Group: "/g2", RouteKey: "rk2", APISecretFingerprint: testAPIFingerprint,
-	}); err != nil {
+	if err := stores.AddNodeSandboxRef(ctx, "n2", testNodeSandboxRef("/g2", "rk2", "same", "e2b", testAPIFingerprint)); err != nil {
 		t.Fatal(err)
 	}
 	for _, tc := range []struct {
@@ -391,7 +373,7 @@ func TestNodeObjectRefsAreScopedByNodeID(t *testing.T) {
 		{node: "n1", group: "/g1"},
 		{node: "n2", group: "/g2"},
 	} {
-		ref, found, err := stores.GetNodeSandboxRef(ctx, tc.node, "same")
+		ref, found, err := stores.GetNodeSandboxRef(ctx, tc.node, EncodeNodeSandboxID("same", 0))
 		if err != nil || !found || ref.Group != tc.group {
 			t.Fatalf("node %s ref=%+v found=%v err=%v", tc.node, ref, found, err)
 		}
@@ -399,12 +381,10 @@ func TestNodeObjectRefsAreScopedByNodeID(t *testing.T) {
 	if err := stores.AddNodeSandboxRef(ctx, "n1", n1Ref); err != nil {
 		t.Fatalf("idempotent same-node sandbox ref: %v", err)
 	}
-	if err := stores.AddNodeSandboxRef(ctx, "n1", clusterstate.NodeSandboxRef{Profile: "e2b",
-		SandboxID: "same", Group: "/other", RouteKey: "other", APISecretFingerprint: testAPIFingerprint,
-	}); !errors.Is(err, errNodeSandboxIDConflict) {
+	if err := stores.AddNodeSandboxRef(ctx, "n1", testNodeSandboxRef("/other", "other", "same", "e2b", testAPIFingerprint)); !errors.Is(err, errNodeSandboxIDConflict) {
 		t.Fatalf("same-node ownership collision err=%v", err)
 	}
-	if ref, found, err := stores.GetNodeSandboxRef(ctx, "n1", "same"); err != nil || !found || ref != n1Ref {
+	if ref, found, err := stores.GetNodeSandboxRef(ctx, "n1", n1Ref.NodeSandboxID); err != nil || !found || ref != n1Ref {
 		t.Fatalf("original sandbox ref=%+v found=%v err=%v", ref, found, err)
 	}
 	if err := stores.AddNodeSandboxRef(ctx, "n1", clusterstate.NodeSandboxRef{Profile: "e2b", Group: "/g"}); err == nil {
@@ -418,14 +398,14 @@ func TestNodeObjectRefsAreScopedByNodeID(t *testing.T) {
 func TestRouteLinkShardSeparatesSandboxesAndBuilds(t *testing.T) {
 	ctx := context.Background()
 	stores := NewStores()
-	if _, err := stores.putRouteSandboxShard(ctx, &SandboxRecord{Profile: "e2b", Group: "/g", RouteKey: "rk", SID: "sb", State: StateReady}); err != nil {
+	if _, err := stores.putRouteSandboxShard(ctx, testSandboxIdentityRecord("/g", "rk", "sb", "n1", StateReady)); err != nil {
 		t.Fatalf("putRouteSandboxShard: %v", err)
 	}
 	if _, err := stores.putRouteBuildShard(ctx, &BuildRecord{Group: "/g", BuildID: "b1", NodeID: "n1", State: BuildRegistered}); err != nil {
 		t.Fatalf("putRouteBuildShard: %v", err)
 	}
 	route, _, found, err := stores.getRouteSandboxShard(ctx, "/g", "rk")
-	if err != nil || !found || route.SID != "sb" {
+	if err != nil || !found || route.SandboxID != "sb" || route.NodeSandboxID != EncodeNodeSandboxID("sb", 0) {
 		t.Fatalf("getRouteSandboxShard route=%+v found=%v err=%v", route, found, err)
 	}
 	build, _, found, err := stores.getRouteBuildShard(ctx, "/g", "b1")
@@ -478,10 +458,9 @@ func TestProtectedRouteCredentialsStayInsideInternalStoreReads(t *testing.T) {
 		!sameRouteCredentials(stored, route) {
 		t.Fatalf("internal store read=%+v found=%v err=%v", stored, found, err)
 	}
-	if _, err := stores.PutSandbox(ctx, &SandboxRecord{
-		Profile: "e2b", Group: "/g", RouteKey: "empty", SID: "sb-empty", State: StateReserved,
-		CreateCredentials: &sandboxcfg.Credentials{},
-	}); err != nil {
+	emptyRoute := testSandboxIdentityRecord("/g", "empty", "sb-empty", "n1", StateReserved)
+	emptyRoute.CreateCredentials = &sandboxcfg.Credentials{}
+	if _, err := stores.PutSandbox(ctx, emptyRoute); err != nil {
 		t.Fatal(err)
 	}
 	empty, _, found, err := stores.GetSandbox(ctx, "/g", "empty")
@@ -643,7 +622,7 @@ func TestClusterStoresJointMembershipWritesBothOwnerSets(t *testing.T) {
 	stores := cluster["a"]
 
 	group, routeKey := "/cluster/joint/group", "rk"
-	if _, err := stores.PutSandbox(ctx, &SandboxRecord{Profile: "e2b", Group: group, RouteKey: routeKey, SID: "sb", State: StateReady}); err != nil {
+	if _, err := stores.PutSandbox(ctx, testSandboxIdentityRecord(group, routeKey, "sb", "n1", StateReady)); err != nil {
 		t.Fatalf("PutSandbox: %v", err)
 	}
 	for _, view := range []clusterstate.MemberView{active, next} {
@@ -673,7 +652,7 @@ func TestClusterStoresCutoverReadsColdOldGraceRoute(t *testing.T) {
 	newView := clusterstate.MemberView{Version: 2, Label: "v2", Members: []string{"c", "d", "e"}}
 	cluster := newShardStoreClusterWithViews(t, []clusterstate.MemberView{oldView}, 3, 3, 3, 3)
 	group, routeKey := "/cluster/cold-cutover/group", "rk"
-	if _, err := cluster["a"].PutSandbox(ctx, &SandboxRecord{Profile: "e2b", Group: group, RouteKey: routeKey, SID: "sb-old", State: StateReady}); err != nil {
+	if _, err := cluster["a"].PutSandbox(ctx, testSandboxIdentityRecord(group, routeKey, "sb-old", "n1", StateReady)); err != nil {
 		t.Fatalf("old PutSandbox: %v", err)
 	}
 
@@ -697,7 +676,7 @@ func TestClusterStoresCutoverReadsColdOldGraceRoute(t *testing.T) {
 	}
 
 	got, _, found, err := cluster["d"].GetSandbox(ctx, group, routeKey)
-	if err != nil || !found || got.SID != "sb-old" {
+	if err != nil || !found || got.SandboxID != "sb-old" || got.NodeSandboxID != EncodeNodeSandboxID("sb-old", 0) {
 		t.Fatalf("cold old_grace GetSandbox got=%+v found=%v err=%v", got, found, err)
 	}
 	newOwners, err := newView.Owners(group, 3)

@@ -38,7 +38,8 @@ func TestServeRouteReturnsProtectedExplicitCredentials(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
 		t.Fatal(err)
 	}
-	if got.SID != want.SID || got.Profile != want.Profile || got.DataEndpoint != "127.0.0.1:8443" ||
+	if got.SandboxID != want.SandboxID || got.NodeSandboxID != want.NodeSandboxID ||
+		got.Profile != want.Profile || got.DataEndpoint != "127.0.0.1:8443" ||
 		got.AuthSandboxID != want.AuthSandboxID || got.APISecret != want.APISecret ||
 		got.APISecretFingerprint != want.APISecretFingerprint ||
 		got.ManifestKeyFingerprint != want.ManifestKeyFingerprint ||

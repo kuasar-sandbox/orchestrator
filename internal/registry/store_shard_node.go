@@ -105,7 +105,8 @@ func (s *Stores) putNodeShard(ctx context.Context, n *NodeRecord) (uint64, error
 }
 
 func (s *Stores) addNodeSandboxRefShard(ctx context.Context, nodeID string, ref clusterstate.NodeSandboxRef) error {
-	if nodeID == "" || ref.SandboxID == "" || ref.Group == "" || ref.RouteKey == "" ||
+	if nodeID == "" || ref.Group == "" || ref.RouteKey == "" ||
+		!validNodeSandboxIdentity(ref.SandboxID, ref.NodeSandboxID, ref.SandboxGeneration) ||
 		!validFullFingerprint(ref.APISecretFingerprint) || !types.Profile(ref.Profile).Valid() {
 		return errors.New("registry: invalid node sandbox ref")
 	}
@@ -117,7 +118,7 @@ func (s *Stores) addNodeSandboxRefShard(ctx context.Context, nodeID string, ref 
 	if err != nil {
 		return err
 	}
-	key := clusterstate.NodeSandboxRecordKey(ref.SandboxID)
+	key := clusterstate.NodeSandboxRecordKey(ref.NodeSandboxID)
 	for attempt := 0; attempt < 5; attempt++ {
 		cur, found, err := sh.Get(ctx, key)
 		if err != nil {
@@ -128,11 +129,14 @@ func (s *Stores) addNodeSandboxRefShard(ctx context.Context, nodeID string, ref 
 			if err != nil {
 				return err
 			}
-			if existing.SandboxID != ref.SandboxID || existing.Group == "" || existing.RouteKey == "" ||
+			if existing.Group == "" || existing.RouteKey == "" ||
+				!validNodeSandboxIdentity(existing.SandboxID, existing.NodeSandboxID, existing.SandboxGeneration) ||
 				!validFullFingerprint(existing.APISecretFingerprint) || !types.Profile(existing.Profile).Valid() {
 				return errors.New("registry: invalid node sandbox ref")
 			}
 			if existing.Group != ref.Group || existing.RouteKey != ref.RouteKey ||
+				existing.SandboxID != ref.SandboxID || existing.SandboxGeneration != ref.SandboxGeneration ||
+				existing.NodeSandboxID != ref.NodeSandboxID ||
 				existing.Profile != ref.Profile || existing.APISecretFingerprint != ref.APISecretFingerprint {
 				return errNodeSandboxIDConflict
 			}
@@ -152,15 +156,15 @@ func (s *Stores) addNodeSandboxRefShard(ctx context.Context, nodeID string, ref 
 	return shardkv.ErrConflict
 }
 
-func (s *Stores) getNodeSandboxRefShard(ctx context.Context, nodeID, sandboxID string) (clusterstate.NodeSandboxRef, bool, error) {
-	if nodeID == "" || sandboxID == "" {
+func (s *Stores) getNodeSandboxRefShard(ctx context.Context, nodeID, nodeSandboxID string) (clusterstate.NodeSandboxRef, bool, error) {
+	if nodeID == "" || nodeSandboxID == "" {
 		return clusterstate.NodeSandboxRef{}, false, nil
 	}
 	sh, err := s.nodeLinkRecordSet(nodeID, clusterstate.RecordSetNodeSandbox)
 	if err != nil {
 		return clusterstate.NodeSandboxRef{}, false, err
 	}
-	rec, found, err := sh.Get(ctx, clusterstate.NodeSandboxRecordKey(sandboxID))
+	rec, found, err := sh.Get(ctx, clusterstate.NodeSandboxRecordKey(nodeSandboxID))
 	if err != nil || !found {
 		return clusterstate.NodeSandboxRef{}, found, err
 	}
@@ -168,33 +172,34 @@ func (s *Stores) getNodeSandboxRefShard(ctx context.Context, nodeID, sandboxID s
 	if err != nil {
 		return clusterstate.NodeSandboxRef{}, false, err
 	}
-	if ref.SandboxID != sandboxID || ref.Group == "" || ref.RouteKey == "" ||
+	if ref.NodeSandboxID != nodeSandboxID || ref.Group == "" || ref.RouteKey == "" ||
+		!validNodeSandboxIdentity(ref.SandboxID, ref.NodeSandboxID, ref.SandboxGeneration) ||
 		!validFullFingerprint(ref.APISecretFingerprint) || !types.Profile(ref.Profile).Valid() {
 		return clusterstate.NodeSandboxRef{}, false, errors.New("registry: invalid node sandbox ref")
 	}
 	return ref, true, nil
 }
 
-func (s *Stores) removeNodeSandboxRefShard(ctx context.Context, nodeID, sandboxID string) error {
-	if nodeID == "" || sandboxID == "" {
+func (s *Stores) removeNodeSandboxRefShard(ctx context.Context, nodeID, nodeSandboxID string) error {
+	if nodeID == "" || nodeSandboxID == "" {
 		return nil
 	}
 	sh, err := s.nodeLinkRecordSet(nodeID, clusterstate.RecordSetNodeSandbox)
 	if err != nil {
 		return err
 	}
-	return shardDeleteIfFound(ctx, sh, clusterstate.NodeSandboxRecordKey(sandboxID))
+	return shardDeleteIfFound(ctx, sh, clusterstate.NodeSandboxRecordKey(nodeSandboxID))
 }
 
-func (s *Stores) removeNodeSandboxRefShardAtRevision(ctx context.Context, nodeID, sandboxID string, expectRev uint64) (bool, error) {
-	if nodeID == "" || sandboxID == "" || expectRev == 0 {
+func (s *Stores) removeNodeSandboxRefShardAtRevision(ctx context.Context, nodeID, nodeSandboxID string, expectRev uint64) (bool, error) {
+	if nodeID == "" || nodeSandboxID == "" || expectRev == 0 {
 		return false, nil
 	}
 	sh, err := s.nodeLinkRecordSet(nodeID, clusterstate.RecordSetNodeSandbox)
 	if err != nil {
 		return false, err
 	}
-	_, ok, err := sh.Delete(ctx, clusterstate.NodeSandboxRecordKey(sandboxID), expectRev)
+	_, ok, err := sh.Delete(ctx, clusterstate.NodeSandboxRecordKey(nodeSandboxID), expectRev)
 	return ok, err
 }
 
@@ -425,8 +430,9 @@ func (s *Stores) snapshotNodeReapShard(ctx context.Context, nodeID string) (*nod
 		if err != nil {
 			return nil, err
 		}
-		sandboxID, ok := clusterstate.ParseNodeSandboxRecordKey(rec.Key)
-		if !ok || ref.SandboxID != sandboxID || ref.Group == "" || ref.RouteKey == "" ||
+		nodeSandboxID, ok := clusterstate.ParseNodeSandboxRecordKey(rec.Key)
+		if !ok || ref.NodeSandboxID != nodeSandboxID || ref.Group == "" || ref.RouteKey == "" ||
+			!validNodeSandboxIdentity(ref.SandboxID, ref.NodeSandboxID, ref.SandboxGeneration) ||
 			!validFullFingerprint(ref.APISecretFingerprint) || !types.Profile(ref.Profile).Valid() {
 			return nil, errors.New("registry: invalid node sandbox ref")
 		}
@@ -470,7 +476,9 @@ func (s *Stores) snapshotNodeReapShard(ctx context.Context, nodeID string) (*nod
 		}
 		out.KeyPairs = append(out.KeyPairs, nodeReapKeyPair{APISecretFingerprint: fingerprint, Revision: rec.Meta.Rev})
 	}
-	sort.Slice(out.Sandboxes, func(i, j int) bool { return out.Sandboxes[i].Ref.SandboxID < out.Sandboxes[j].Ref.SandboxID })
+	sort.Slice(out.Sandboxes, func(i, j int) bool {
+		return out.Sandboxes[i].Ref.NodeSandboxID < out.Sandboxes[j].Ref.NodeSandboxID
+	})
 	sort.Slice(out.Builds, func(i, j int) bool { return out.Builds[i].Ref.BuildID < out.Builds[j].Ref.BuildID })
 	sort.Slice(out.KeyPairs, func(i, j int) bool {
 		return out.KeyPairs[i].APISecretFingerprint < out.KeyPairs[j].APISecretFingerprint
@@ -511,8 +519,9 @@ func (s *Stores) getNodeShard(ctx context.Context, nodeID string) (*NodeRecord, 
 		if err != nil {
 			return nil, false, err
 		}
-		sandboxID, ok := clusterstate.ParseNodeSandboxRecordKey(rec.Key)
-		if !ok || ref.SandboxID != sandboxID || ref.Group == "" || ref.RouteKey == "" ||
+		nodeSandboxID, ok := clusterstate.ParseNodeSandboxRecordKey(rec.Key)
+		if !ok || ref.NodeSandboxID != nodeSandboxID || ref.Group == "" || ref.RouteKey == "" ||
+			!validNodeSandboxIdentity(ref.SandboxID, ref.NodeSandboxID, ref.SandboxGeneration) ||
 			!validFullFingerprint(ref.APISecretFingerprint) || !types.Profile(ref.Profile).Valid() {
 			return nil, false, errors.New("registry: invalid node sandbox ref")
 		}
@@ -552,7 +561,7 @@ func (s *Stores) getNodeShard(ctx context.Context, nodeID string) (*NodeRecord, 
 		}
 		out.KeyPairs = append(out.KeyPairs, pair)
 	}
-	sort.Slice(out.Sandboxes, func(i, j int) bool { return out.Sandboxes[i].SandboxID < out.Sandboxes[j].SandboxID })
+	sort.Slice(out.Sandboxes, func(i, j int) bool { return out.Sandboxes[i].NodeSandboxID < out.Sandboxes[j].NodeSandboxID })
 	sort.Slice(out.Builds, func(i, j int) bool {
 		return out.Builds[i].BuildID < out.Builds[j].BuildID
 	})

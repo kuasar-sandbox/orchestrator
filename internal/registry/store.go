@@ -66,7 +66,10 @@ type NodeRecord struct {
 type SandboxRecord struct {
 	Group                  string                    `json:"group"`
 	RouteKey               string                    `json:"route_key"`
-	SID                    string                    `json:"sid,omitempty"`
+	SandboxID              string                    `json:"sandbox_id,omitempty"`
+	NodeSandboxID          string                    `json:"node_sandbox_id,omitempty"`
+	SandboxGeneration      uint64                    `json:"sandbox_generation"`
+	NextSandboxGeneration  uint64                    `json:"next_sandbox_generation"`
 	State                  SandboxState              `json:"state"`
 	NodeID                 string                    `json:"node_id,omitempty"`
 	SnapLoc                string                    `json:"snap_loc,omitempty"`
@@ -479,19 +482,20 @@ func (s *Stores) PutNodeList(ctx context.Context, n *NodeRecord) error {
 }
 
 func (s *Stores) AddNodeSandboxRef(ctx context.Context, nodeID string, ref clusterstate.NodeSandboxRef) error {
-	if nodeID == "" || ref.SandboxID == "" || ref.Group == "" || ref.RouteKey == "" ||
+	if nodeID == "" || ref.Group == "" || ref.RouteKey == "" ||
+		!validNodeSandboxIdentity(ref.SandboxID, ref.NodeSandboxID, ref.SandboxGeneration) ||
 		!validFullFingerprint(ref.APISecretFingerprint) {
-		return errors.New("registry: node sandbox ref requires node_id, sandbox_id, group, route_key, and API secret fingerprint")
+		return errors.New("registry: node sandbox ref requires a canonical stable/node identity, group, route_key, and API secret fingerprint")
 	}
 	return s.addNodeSandboxRefShard(ctx, nodeID, ref)
 }
 
-func (s *Stores) GetNodeSandboxRef(ctx context.Context, nodeID, sandboxID string) (clusterstate.NodeSandboxRef, bool, error) {
-	return s.getNodeSandboxRefShard(ctx, nodeID, sandboxID)
+func (s *Stores) GetNodeSandboxRef(ctx context.Context, nodeID, nodeSandboxID string) (clusterstate.NodeSandboxRef, bool, error) {
+	return s.getNodeSandboxRefShard(ctx, nodeID, nodeSandboxID)
 }
 
-func (s *Stores) RemoveNodeSandboxRef(ctx context.Context, nodeID, sandboxID string) error {
-	return s.removeNodeSandboxRefShard(ctx, nodeID, sandboxID)
+func (s *Stores) RemoveNodeSandboxRef(ctx context.Context, nodeID, nodeSandboxID string) error {
+	return s.removeNodeSandboxRefShard(ctx, nodeID, nodeSandboxID)
 }
 
 func (s *Stores) AddNodeBuildRef(ctx context.Context, nodeID string, ref clusterstate.NodeBuildRef) error {

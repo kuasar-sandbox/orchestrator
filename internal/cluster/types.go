@@ -88,6 +88,8 @@ type NodeSandboxRef struct {
 	Group                string `json:"group"`
 	RouteKey             string `json:"route_key"`
 	SandboxID            string `json:"sandbox_id"`
+	SandboxGeneration    uint64 `json:"sandbox_generation"`
+	NodeSandboxID        string `json:"node_sandbox_id"`
 	Profile              string `json:"profile"`
 	APISecretFingerprint string `json:"api_secret_fingerprint"`
 }

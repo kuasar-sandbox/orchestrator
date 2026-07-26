@@ -27,7 +27,8 @@ const (
 // RouteResolve is the data-plane forwarding target the router needs for a sid
 // (the hot path: client -> router -> node DataEndpoint -> guest).
 type RouteResolve struct {
-	SID                    string `json:"sid"`
+	SandboxID              string `json:"sandbox_id"`
+	NodeSandboxID          string `json:"node_sandbox_id"`
 	Group                  string `json:"group"`
 	RouteKey               string `json:"route_key"`
 	NodeID                 string `json:"node_id"`
@@ -99,7 +100,7 @@ func (r *Registry) serveList(w http.ResponseWriter, req *http.Request) {
 	out := []ListItem{}
 	if err := r.stores.RangeSandboxes(req.Context(), group, func(s *SandboxRecord) error {
 		if s.State == StateReady || s.State == StatePaused {
-			out = append(out, ListItem{SandboxID: s.SID, State: string(s.State), TemplateID: s.TemplateID, ClientID: s.NodeID})
+			out = append(out, ListItem{SandboxID: s.SandboxID, State: string(s.State), TemplateID: s.TemplateID, ClientID: s.NodeID})
 		}
 		return nil
 	}); err != nil {
@@ -221,7 +222,7 @@ func (r *Registry) ResolveSID(ctx context.Context, group, routeKey, sid string) 
 	if err != nil || !found {
 		return nil, found, err
 	}
-	if rec.SID != sid {
+	if rec.SandboxID != sid {
 		return nil, false, nil
 	}
 	if rec.State == StateReady || rec.State == StatePaused || hasRouteCredentials(rec) {
@@ -230,7 +231,8 @@ func (r *Registry) ResolveSID(ctx context.Context, group, routeKey, sid string) 
 		}
 	}
 	return &RouteResolve{
-		SID: rec.SID, Group: rec.Group, RouteKey: rec.RouteKey, NodeID: rec.NodeID,
+		SandboxID: rec.SandboxID, NodeSandboxID: rec.NodeSandboxID,
+		Group: rec.Group, RouteKey: rec.RouteKey, NodeID: rec.NodeID,
 		DataEndpoint: r.nodeDataEndpoint(ctx, rec.NodeID), Profile: rec.Profile,
 		AuthSandboxID: rec.AuthSandboxID, APISecret: rec.APISecret,
 		APISecretFingerprint: rec.APISecretFingerprint, ManifestKeyFingerprint: rec.ManifestKeyFingerprint,
